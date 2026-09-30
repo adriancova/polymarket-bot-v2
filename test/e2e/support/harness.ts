@@ -54,6 +54,7 @@ import {
   createPaperTrader,
   type CreateTraderResult,
   type PaperTrader,
+  type TraderStore,
 } from "@polymarket-bot/trader";
 import { ManualClock, MemoryEventFeed, MemoryTraderStore } from "@polymarket-bot/trader/testing";
 
@@ -82,6 +83,13 @@ export interface AssembleOptions {
    * venue keeps its own defaults (`DEFAULT_VENUE_RETENTION`).
    */
   readonly venueRetention?: SimulatedVenueOptions["retention"];
+  /**
+   * `DURABLE-1`: the store the TRADER is handed, built around the harness's
+   * in-memory store (the integration fixture's `wrapStore`, carried here).
+   * Absent — as in every golden run — the trader writes to that store
+   * directly. `parts.store` is always the in-memory store itself.
+   */
+  readonly wrapStore?: (store: MemoryTraderStore) => TraderStore;
 }
 
 /** A string field of an unparsed document, or a stated fallback. */
@@ -157,7 +165,7 @@ export function assemble(options: AssembleOptions = {}): {
     config: document,
     clock,
     venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
-    store,
+    store: options.wrapStore === undefined ? store : options.wrapStore(store),
     idNamespace: options.idNamespace ?? scenario.idNamespace,
     // `FOLD-1` (orchestrator call O1): this harness checks the loop's held
     // ledger view AND its held PnL streams against their rebuilds from zero

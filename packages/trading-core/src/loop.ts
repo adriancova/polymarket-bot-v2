@@ -470,6 +470,21 @@ export class DecisionOutboxBuffer {
     return { decisions, checkpoints };
   }
 
+  /**
+   * `DURABLE-1`: drains the DECISIONS only, leaving every checkpoint where it
+   * is. The loop's durability boundary before a placement
+   * ({@link CoreLoop}'s `#persistDecisionsBeforePlacement`) makes the pending
+   * decisions durable there and then; the checkpoints stay for the flush that
+   * always wrote them, so each is written with exactly the `capturedAt` it
+   * always had (the flush's instant, which inside a venue frame is the
+   * frame's last event, not the event a mid-frame callback fired at).
+   */
+  drainDecisions(): readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[] {
+    const decisions = this.#decisions;
+    this.#decisions = [];
+    return decisions;
+  }
+
   get depth(): number {
     return this.#decisions.length + this.#checkpoints.length;
   }
@@ -715,6 +730,14 @@ export class CoreLoop {
   #commitRequested = false;
   /** `THROUGHPUT-1a`: a group commit failed; nothing is committed after it. */
   #groupCommitFailed = false;
+  /**
+   * `DURABLE-1`: the decision whose intents are being routed could not be
+   * made durable at the boundary before its first placement. Every LATER
+   * placement of the SAME decision is then refused at the boundary as well
+   * (its CANCELs still route). Reset for each DECIDED outcome, so it never
+   * outlives the decision it is about.
+   */
+  #routingUndurableDecision = false;
   /**
    * `THROUGHPUT-2` (ADR-024): the venue frame being applied — set by its first
    * event when the frame is longer than one, cleared by its closing event. It
@@ -1750,6 +1773,7 @@ export class CoreLoop {
       case "DECIDED": {
         this.#options.health.countLoop("decisionsPersisted");
         this.#recordDecision(instance, outcome, eventId);
+        this.#routingUndurableDecision = false;
         for (const intent of outcome.record.decision.intents) {
           await this.#routeIntent({
             instance,
@@ -1840,12 +1864,28 @@ export class CoreLoop {
       this.#options.health.countExecution("observeOnlyIntents");
       return;
     }
-    // `THROUGHPUT-1a`: every earlier decision is durable before an intent is
-    // routed toward the venue — as it was when each was written at its own
-    // event. A failed commit halts, and the risk check below then refuses
-    // (`runStatePermitsIntent`). A store without group commit has nothing
-    // staged, and this path is unchanged for it.
-    if (this.#options.store.groupCommit !== undefined) await this.#commitStaged();
+    if (input.intent.type === "CANCEL") {
+      // `THROUGHPUT-1a`: every earlier decision is durable before an intent
+      // is routed toward the venue — as it was when each was written at its
+      // own event. A failed commit halts; a CANCEL is still routed (§6
+      // invariant 13: the risk seam never blocks one). A store without group
+      // commit has nothing staged, and this path is unchanged for it.
+      //
+      // `DURABLE-1`: a CANCEL does NOT wait for its OWN decision to be
+      // written. It places nothing — no allocation, no reservation, no fill,
+      // no ledger posting — so no economic effect can precede its decision's
+      // record, and a safety exit must not queue behind one more store round
+      // trip (or a store that hangs). Its decision is written by the flush
+      // that follows the callback, as always, and a failure there halts.
+      if (this.#options.store.groupCommit !== undefined) await this.#commitStaged();
+    } else if (!(await this.#persistDecisionsBeforePlacement())) {
+      // `DURABLE-1` (handoff §8.1, §6 invariants 3-4, WP-230 #4): the decision
+      // that emitted this placement could not be made durable. The GLOBAL
+      // `STORE_UNAVAILABLE` halt is latched; the intent is refused HERE,
+      // before an id is minted or the allocator is asked — no allocation, no
+      // reservation, no submission, and so no fill and no ledger posting.
+      return;
+    }
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
     const projection = this.#held.view;
@@ -3467,6 +3507,89 @@ export class CoreLoop {
         return;
       }
     }
+  }
+
+  /**
+   * `DURABLE-1` — the durability boundary before a NEW placement (handoff
+   * §8.1: "persist DecisionResults → allocate capital → run risk checks →
+   * create execution plans → … submit"; §6 invariants 3 and 4; ADR-005 §2).
+   *
+   * Every decision the outbox holds — INCLUDING the one whose intent is being
+   * routed, which the runtime appended during this very callback — is made
+   * durable before the caller allocates, reserves or submits anything:
+   *
+   * - with group commit, the pending decisions are STAGED (as one staging,
+   *   exactly the rows `#stageOutbox` would have staged for them) and the
+   *   loop waits until EVERYTHING staged is committed (`#commitStaged`), so
+   *   the durable rows stay a prefix of the run's;
+   * - without it, each pending decision is written by `persistDecision`, in
+   *   evaluation order, exactly as `#flushOutbox` would have written it.
+   *
+   * Checkpoints are NOT drained here ({@link DecisionOutboxBuffer.drainDecisions}):
+   * the flush that follows the callback writes them, with the instant it
+   * always gave them. So the fix changes WHEN a decision row is written, never
+   * WHAT is written.
+   *
+   * Answers `false` — with a GLOBAL `STORE_UNAVAILABLE` halt latched, the same
+   * halt a failed flush latches — when the decisions are not durable. The
+   * caller then makes no venue and no ledger effect. On a per-row write or a
+   * staging failure the rest of the outbox is dropped, as a failed flush
+   * drops what it drained: nothing is written after the failure the halt
+   * reports (a failed group COMMIT already guarantees that,
+   * `#groupCommitFailed`).
+   *
+   * Free when the outbox holds no decision and nothing is staged: a decision
+   * with several placement intents pays for this once. Once it has answered
+   * `false` for a decision, it answers `false` for that decision's every later
+   * placement without asking the store again (`#routingUndurableDecision`),
+   * so the refusal never depends on the risk seam reading the halt.
+   */
+  async #persistDecisionsBeforePlacement(): Promise<boolean> {
+    if (this.#routingUndurableDecision) return false;
+    const durable = await this.#persistPendingDecisions();
+    if (!durable) this.#routingUndurableDecision = true;
+    return durable;
+  }
+
+  async #persistPendingDecisions(): Promise<boolean> {
+    const group = this.#options.store.groupCommit;
+    const decisions = this.#options.outbox.drainDecisions();
+    if (group !== undefined) {
+      if (decisions.length > 0) {
+        const staged = group.stage({ decisions, checkpoints: [] });
+        if (!staged.ok) {
+          this.#options.outbox.drain();
+          this.#options.halts.halt(
+            { kind: "GLOBAL" },
+            "STORE_UNAVAILABLE",
+            `the decision that emitted a placement could not be staged for the durable store ` +
+              `(${staged.failure.kind}): ${staged.failure.detail}; §6 invariant 3 requires the ` +
+              "decision to be PERSISTED before its placement, so nothing is placed and the process " +
+              "makes no further trading decision",
+            this.#lastInstant,
+          );
+          return false;
+        }
+      }
+      await this.#commitStaged();
+      return !this.#groupCommitFailed;
+    }
+    for (const entry of decisions) {
+      const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
+      if (!written.ok) {
+        this.#options.outbox.drain();
+        this.#options.halts.halt(
+          { kind: "GLOBAL" },
+          "STORE_UNAVAILABLE",
+          `a decision record could not be persisted (${written.failure.kind}): ` +
+            `${written.failure.detail}; §6 invariant 3 requires the decision to be PERSISTED before ` +
+            "its placement, so nothing is placed and the process makes no further trading decision",
+          this.#lastInstant,
+        );
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

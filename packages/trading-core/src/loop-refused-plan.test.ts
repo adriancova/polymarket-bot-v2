@@ -148,7 +148,7 @@ import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
-import type { IngestedEvent } from "./ports.js";
+import { portFailed, portOk, type GroupCommit, type IngestedEvent, type StagedEvaluations, type TraderStore } from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
 
@@ -322,6 +322,8 @@ function oneShotStrategy(entry: {
   readonly maximumTotalCost: string;
   /** Replaces the resting BUY with another intent (the BASKET case). */
   readonly intent?: (ctx: StrategyContext) => Intent;
+  /** `DURABLE-1`: replaces the entry decision's ONE intent with this list (several intents, one decision). */
+  readonly intents?: (ctx: StrategyContext) => readonly Intent[];
   /** SIM1-R2-1: ONE follow-up intent (a cancel), emitted on the next `onFeatures` after the entry. */
   readonly followUp?: (ctx: StrategyContext) => Intent;
   /** SIM1-R3-1: the intents a DELIVERY callback emits (none: hold); see {@link DeliveryScript}. */
@@ -387,7 +389,7 @@ function oneShotStrategy(entry: {
         reasonCodes: ["TRDR4R1.ENTER"],
         featureSnapshotRef: ctx.features().snapshotRef,
         statePatch: { placed: true },
-        intents: [entry.intent?.(ctx) ?? buy],
+        intents: entry.intents === undefined ? [entry.intent?.(ctx) ?? buy] : [...entry.intents(ctx)],
       };
     },
   };
@@ -535,6 +537,10 @@ function assemble(
     readonly venueDouble?: (inner: SimulatedVenue) => TraderVenue;
     /** Replaces the one-shot's resting BUY (the BASKET case). */
     readonly intent?: (ctx: StrategyContext) => Intent;
+    /** `DURABLE-1`: the entry decision's intents, several in one decision. */
+    readonly intents?: (ctx: StrategyContext) => readonly Intent[];
+    /** `DURABLE-1`: the store the loop writes to (a fresh `MemoryTraderStore` when absent). */
+    readonly store?: TraderStore;
     /** SIM1-R2-1: the one-shot's ONE follow-up intent (a cancel), on the next `onFeatures`. */
     readonly followUp?: (ctx: StrategyContext) => Intent;
     /** SIM1-R3-1: what the one-shot emits from its `onFill` / `onOrderUpdate` deliveries. */
@@ -584,6 +590,7 @@ function assemble(
       targetShares: input.targetShares ?? "50",
       maximumTotalCost: input.maximumTotalCost ?? "18",
       ...(input.intent === undefined ? {} : { intent: input.intent }),
+      ...(input.intents === undefined ? {} : { intents: input.intents }),
       ...(input.followUp === undefined ? {} : { followUp: input.followUp }),
       ...(input.onDelivery === undefined ? {} : { onDelivery: input.onDelivery }),
     }),
@@ -706,7 +713,7 @@ function assemble(
     allocator: new AllocatorGate({ caps: caps.value, markets: allocationMarkets, tokenAssetIds }),
     clock,
     venue: traderVenue,
-    store: new MemoryTraderStore(),
+    store: input.store ?? new MemoryTraderStore(),
     registry,
     markets,
     instanceConfigs: new Map(),
@@ -1745,5 +1752,152 @@ describe("SIM-2 r1 — a WATCHED basket's settled leg stays answerable until the
       awaitingAcknowledgment: 0,
       orders: { retained: 1, maximumRetained: 1, evicted: 3 },
     });
+  });
+});
+
+/**
+ * `DURABLE-1` (closeout blocker X1): the durability boundary before a
+ * placement, on the branches the Static Bracket fixture cannot reach — a
+ * decision with SEVERAL intents, a CANCEL beside a placement, and a staging
+ * failure. The store refuses (as data) every decision that carries an intent;
+ * everything else is the real loop, risk, allocator, planner and venue.
+ */
+describe("DURABLE-1: a placement waits for its decision to be durable", () => {
+  /** A per-row store that refuses every intent-bearing decision, counting what it was asked. */
+  function refusingStore(): { readonly store: TraderStore; readonly inner: MemoryTraderStore; readonly refused: number[] } {
+    const inner = new MemoryTraderStore();
+    const refused: number[] = [];
+    const store: TraderStore = {
+      persistDecision: async (record, telemetry) => {
+        if (record.decision.intents.length > 0) {
+          refused.push(record.evaluationSeq);
+          return portFailed<null>("UNAVAILABLE", "durable-1: the store refuses this decision");
+        }
+        return await inner.persistDecision(record, telemetry);
+      },
+      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
+      writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
+      replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+      close: () => inner.close(),
+    };
+    return { store, inner, refused };
+  }
+
+  /** `open`, split before its fourth event (the one the entry is decided at). */
+  async function openUntilEntry(harness: Harness): Promise<void> {
+    await feed(harness, envelope(1, "ReferenceTradeObserved", { venue: "binance", symbol: "BTCUSDT", price: "64000", size: "0.5" }, "binance"));
+    await feed(harness, envelope(2, "MarketOpened", { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, openedAt: T_OPEN }));
+    await feed(harness, envelope(3, "BookSnapshot", {
+      internalMarketId: MARKET_ID,
+      tokenId: NO_TOKEN,
+      bids: [{ price: "0.65", size: "5000" }],
+      asks: [{ price: "0.66", size: "5000" }],
+    }));
+  }
+
+  it("a decision with TWO placements whose record is refused: the store is asked ONCE, neither placement is allocated, risk-checked or submitted, and nothing of that event is written afterwards", async () => {
+    const { store, inner, refused } = refusingStore();
+    const harness = assemble({ store, intents: (ctx) => [followOnBuy(ctx), { ...followOnBuy(ctx), intentId: "durable-1-second-buy" }] });
+    await openUntilEntry(harness);
+    const before = { decisions: inner.decisions.length, checkpoints: inner.checkpoints.length };
+    await feed(harness, yesBook(4));
+    // The control: with a store that accepts, the same event DOES write a
+    // checkpoint (the entry's state patch) — so the equality below is not vacuous.
+    const accepting = new MemoryTraderStore();
+    const control = assemble({ store: accepting, intents: (ctx) => [followOnBuy(ctx), { ...followOnBuy(ctx), intentId: "durable-1-second-buy" }] });
+    await openUntilEntry(control);
+    const controlBefore = accepting.checkpoints.length;
+    await feed(control, yesBook(4));
+    expect(accepting.checkpoints.length).toBeGreaterThan(controlBefore);
+    // Nothing of the failing event reached the store after the failure — not
+    // its checkpoint either (a failed flush drops what it drained).
+    expect({ decisions: inner.decisions.length, checkpoints: inner.checkpoints.length }).toEqual(before);
+
+    expect(refused).toHaveLength(1);
+    expect(harness.submitted).toEqual([]);
+    const health = harness.loop.health();
+    expect(health.risk.evaluations).toBe(0);
+    expect(health.seams.allocator.applied).toBe(0);
+    expect(health.seams.reservations.taken).toBe(0);
+    expect(harness.venue.fills).toHaveLength(0);
+    expect(inner.transactions).toHaveLength(0);
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
+    // The decision itself was emitted, with both intents on it.
+    expect(harness.loop.decisions().filter((decision) => decision.intentIds.length === 2)).toHaveLength(1);
+  });
+
+  it("a CANCEL beside a placement, the record refused: the CANCEL is still routed (never held for its record); the placement is not", async () => {
+    const { store, refused } = refusingStore();
+    const harness = assemble({ store, intents: (ctx) => [MARKET_CANCEL, followOnBuy(ctx)] });
+    await open(harness);
+
+    expect(refused).toHaveLength(1);
+    // The CANCEL reached risk (approved: §6 invariant 13) and was requested;
+    // the placement never reached the allocator or the venue.
+    const health = harness.loop.health();
+    expect(health.risk.evaluations).toBe(1);
+    expect(health.execution.cancelsRequested).toBe(1);
+    expect(planKinds(harness)).toEqual(["CANCEL"]);
+    expect(health.seams.allocator.applied).toBe(0);
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
+  });
+
+  it("group commit, a STAGING failure at the boundary: nothing is placed, and nothing of that event is committed afterwards", async () => {
+    const inner = new MemoryTraderStore();
+    const staged: StagedEvaluations[] = [];
+    const group: GroupCommit = {
+      stage(evaluations) {
+        if (evaluations.decisions.some((entry) => entry.record.decision.intents.length > 0)) {
+          return portFailed<null>("UNAVAILABLE", "durable-1: this decision cannot be staged");
+        }
+        staged.push(evaluations);
+        return portOk(null);
+      },
+      get stagedEvents() {
+        return staged.length;
+      },
+      async commit() {
+        const batch = staged.splice(0, staged.length);
+        let decisions = 0;
+        let checkpoints = 0;
+        for (const evaluation of batch) {
+          for (const entry of evaluation.decisions) {
+            await inner.persistDecision(entry.record, entry.telemetry);
+            decisions += 1;
+          }
+          for (const entry of evaluation.checkpoints) {
+            await inner.saveCheckpoint(entry.checkpoint, entry.capturedAt);
+            checkpoints += 1;
+          }
+        }
+        return portOk({ decisions, checkpoints });
+      },
+    };
+    const store: TraderStore = {
+      persistDecision: (record, telemetry) => inner.persistDecision(record, telemetry),
+      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
+      writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
+      replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+      close: () => inner.close(),
+      groupCommit: group,
+    };
+    const harness = assemble({ store, intents: (ctx) => [followOnBuy(ctx)] });
+    await openUntilEntry(harness);
+    const before = { decisions: inner.decisions.length, checkpoints: inner.checkpoints.length };
+    await feed(harness, yesBook(4));
+
+    expect(harness.submitted).toEqual([]);
+    const health = harness.loop.health();
+    expect(health.risk.evaluations).toBe(0);
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
+    expect(health.halts[0]?.detail).toContain("could not be staged");
+    // The entry decision was emitted at the fourth event; neither it nor that
+    // event's checkpoint became durable after the failure.
+    expect(harness.loop.decisions().some((decision) => decision.intentIds.length > 0)).toBe(true);
+    expect({ decisions: inner.decisions.length, checkpoints: inner.checkpoints.length }).toEqual(before);
+    expect(await harness.loop.durabilityMark()).toBe(true);
+    expect({ decisions: inner.decisions.length, checkpoints: inner.checkpoints.length }).toEqual(before);
   });
 });
