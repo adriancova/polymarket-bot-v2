@@ -105,6 +105,35 @@
  * A transport without `publishBatch` (the in-memory doubles that opt out, the
  * startup-outage transport) gets batches of one and the per-envelope code
  * path, unchanged.
+ *
+ * ## Frame-atomic runs (`THROUGHPUT-2`, ADR-024)
+ *
+ * The trader evaluates once per venue FRAME: the events the gateway derived
+ * from one recorded raw frame, which share its `causationId`
+ * (`dispatcher.ts`, `rawFrameCausationId`). Its feed can tell a frame is
+ * complete without waiting on the next event only because a frame is never
+ * split across two transport calls, and one batched call is one atomic
+ * script call at the Redis transport. Two rules make that so:
+ *
+ * - a feed driver dispatches all of one raw frame's events in ONE synchronous
+ *   turn (`feeds/polymarket.ts` `onEvent`, called in a loop by the adapter), so
+ *   when the pump STARTS on an envelope that names a raw frame, it first yields
+ *   one microtask, letting the rest of that frame be admitted before the run is
+ *   cut. (A pump that is already running dequeues only in a later turn, when
+ *   every frame then queued is complete.) An envelope with no `causationId`
+ *   starts the pump synchronously, exactly as before;
+ * - a run is never CUT between two consecutive envelopes that share a
+ *   `causationId`: the envelope and byte bounds end a run only at a frame
+ *   boundary, and a frame longer than the bounds is taken whole up to
+ *   {@link FRAME_RUN_MAX_ENVELOPES}, the Redis transport's own limit for one
+ *   script call. Only a frame beyond that limit is split (it would be a
+ *   single venue message of over a thousand normalized events).
+ *
+ * Neither rule changes what is published or in what order — only how the
+ * queued envelopes are grouped into transport calls. A halt still suppresses
+ * everything queued, so a frame is either published whole or, from the halt
+ * on, not at all; the one exception, stated rather than hidden, is an
+ * envelope REFUSED inside a run, which publishes the run's prefix and halts.
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
@@ -156,6 +185,21 @@ export const DEFAULT_PUBLISH_BATCH_MAX_ENVELOPES = 256;
  * larger than this still goes, alone.
  */
 export const DEFAULT_PUBLISH_BATCH_MAX_BYTES = 1024 * 1024;
+
+/**
+ * `THROUGHPUT-2`: the most envelopes a run may grow to so as not to split one
+ * raw frame (see "Frame-atomic runs"). Equal to the Redis Streams transport's
+ * limit for one atomic script call (`MAX_PUBLISH_BATCH_ENVELOPES` in
+ * `packages/event-bus/src/redis/transport.ts`), which refuses a larger batch
+ * whole — so this bound is what keeps a frame-completing run acceptable.
+ */
+export const FRAME_RUN_MAX_ENVELOPES = 1024;
+
+/** The raw frame an envelope derives from, or `undefined` (see "Frame-atomic runs"). */
+function frameOf(envelope: EventEnvelope<unknown>): string | undefined {
+  const causation = envelope.causationId;
+  return typeof causation === "string" && causation.length > 0 ? causation : undefined;
+}
 
 /**
  * The first envelope of a batch the transport did NOT publish, and why.
@@ -608,21 +652,43 @@ export class GatewayPublisher {
   #startPump(): void {
     if (this.#pumping) return;
     this.#pumping = true;
-    this.#pump = this.#drainQueue();
+    const head = this.#queue[this.#head];
+    // `THROUGHPUT-2`: an envelope that names a raw frame waits one microtask,
+    // so the rest of its frame — admitted in this same synchronous turn — is
+    // queued before the first run is cut ("Frame-atomic runs").
+    this.#pump =
+      head !== undefined && frameOf(head.envelope) !== undefined
+        ? Promise.resolve().then(async () => await this.#drainQueue())
+        : this.#drainQueue();
   }
 
   /**
    * Takes the consecutive run at the head of the queue: at least one entry
-   * when any is queued, then more while the batch bounds allow. With no batch
-   * capability the envelope bound is 1, so this is the old single dequeue.
+   * when any is queued, then more while the batch bounds allow — and, with the
+   * batch capability, on past them to the end of a raw frame the run has
+   * started (`THROUGHPUT-2`). With no batch capability the envelope bound is
+   * 1, so this is the old single dequeue.
    */
   #dequeueRun(): QueuedPublication[] {
     const run: QueuedPublication[] = [];
     let bytes = 0;
-    while (run.length < this.#maxBatchEnvelopes) {
+    for (;;) {
       const entry = this.#queue[this.#head];
       if (entry === undefined) break;
-      if (run.length > 0 && bytes + entry.bytes > this.#maxBatchBytes) break;
+      const previous = run[run.length - 1];
+      // `THROUGHPUT-2`: never cut inside a raw frame ("Frame-atomic runs").
+      // A transport without the batch capability takes one envelope per call
+      // (the per-envelope path submits `run[0]` only), so there is no run to grow.
+      const continuesFrame =
+        this.#batch !== undefined &&
+        previous !== undefined &&
+        run.length < FRAME_RUN_MAX_ENVELOPES &&
+        frameOf(entry.envelope) !== undefined &&
+        frameOf(entry.envelope) === frameOf(previous.envelope);
+      if (!continuesFrame) {
+        if (run.length >= this.#maxBatchEnvelopes) break;
+        if (run.length > 0 && bytes + entry.bytes > this.#maxBatchBytes) break;
+      }
       this.#head += 1;
       this.#queueBytes -= entry.bytes;
       bytes += entry.bytes;

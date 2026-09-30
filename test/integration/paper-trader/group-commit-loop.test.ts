@@ -31,7 +31,7 @@ import { describe, expect, it } from "vitest";
 
 import { pump } from "../../../apps/trader/src/pump.js";
 import { GROUP_COMMIT_EARLY_START_EVENTS, GROUP_COMMIT_MAX_EVENTS } from "../../../packages/trading-core/src/loop.js";
-import { assemble, ingested, MARKET_ID, recordedEvents, YES_TOKEN } from "./support/fixture.js";
+import { assemble, GATEWAY_EPOCH, ingested, MARKET_ID, recordedEvents, YES_TOKEN } from "./support/fixture.js";
 
 /** A group commit over the fixture's in-memory store: a commit writes its batch through the per-row methods. */
 class MemoryGroupCommit implements GroupCommit {
@@ -280,6 +280,74 @@ describe("group commit in the core loop (THROUGHPUT-1a)", () => {
     expect(run.group.batches[0]).toBe(GROUP_COMMIT_EARLY_START_EVENTS);
     expect(Math.max(...run.group.batches)).toBeLessThanOrEqual(GROUP_COMMIT_MAX_EVENTS);
     expect(durableContent(run.store)).toBe(durableContent(plain.parts.store));
+  });
+
+  it("THROUGHPUT-2 r1 (TP2-R1-M2): the bounds count STAGINGS — one per venue frame — so a stall holds 128 FRAMES, not 128 events", async () => {
+    // As above, but 600 reference prints arrive as 300 two-trade frames
+    // (one `causationId` each). The loop flushes once per frame, so each
+    // staging is one frame: the hard bound stops the loop at 128 staged
+    // FRAMES — 256 events — and the early start takes 32 frames. What each
+    // staging holds in decisions is what one lone event's did: one.
+    const events = (): ReturnType<typeof recordedEvents> => [
+      ...recordedEvents().slice(0, 3),
+      ingested(
+        "BookSnapshot",
+        {
+          internalMarketId: MARKET_ID,
+          tokenId: YES_TOKEN,
+          bids: [{ price: "0.58", size: "200" }],
+          asks: [{ price: "0.6", size: "200" }],
+        },
+        { receivedAt: "2026-03-04T12:00:01.000Z", ingestSeq: 4 },
+      ),
+      ...Array.from({ length: 600 }, (_, index) => {
+        const event = ingested(
+          "ReferenceTradeObserved",
+          { venue: "binance", symbol: "BTCUSDT", price: String(100_000 + index), size: "0.1" },
+          {
+            receivedAt: new Date(Date.parse("2026-03-04T12:00:01.000Z") + 1 + Math.floor(index / 2)).toISOString(),
+            ingestSeq: 10 + index,
+            source: "binance",
+          },
+        );
+        return {
+          envelope: { ...event.envelope, causationId: `raw:${GATEWAY_EPOCH}:${String(1_000 + Math.floor(index / 2))}` },
+          identity: event.identity,
+        };
+      }),
+    ];
+    const run = assembleGroupCommitting();
+    let open: () => void = () => undefined;
+    run.group.gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const stream = events();
+    for (const event of stream) run.trader.loop.ingest(event);
+    const drain = run.trader.loop.drain({ awaitDurable: false });
+    for (let turn = 0; turn < 100; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+
+    expect(run.group.stagedEvents).toBe(GROUP_COMMIT_MAX_EVENTS);
+    expect(run.group.staged.every((staging) => staging.decisions.length === 1)).toBe(true);
+    const processedAtStall = run.trader.loop.health().loop.eventsProcessed;
+    expect(run.store.decisions).toHaveLength(0);
+
+    open();
+    await drain;
+    expect(await run.trader.loop.durabilityMark()).toBe(true);
+    // The committing batch was the first 32 stagings: the opening's (those of
+    // its 4 events that decided) and the first frames'. Every other staging
+    // is one frame of 2 events, so at the stall 4 + 2 × (32 − opening + 128)
+    // events had been processed — 2 × 128 = 256 events in the 128 staged
+    // frames, twice the bound's number.
+    expect(run.group.batches[0]).toBe(GROUP_COMMIT_EARLY_START_EVENTS);
+    const openingIds = new Set(stream.slice(0, 4).map((event) => event.envelope.eventId));
+    const openingStagings = run.store.decisions.filter((entry) => openingIds.has(entry.record.sourceEvent?.eventId ?? "")).length;
+    expect(openingStagings).toBeGreaterThan(0);
+    expect(processedAtStall).toBe(
+      4 + 2 * (GROUP_COMMIT_EARLY_START_EVENTS - openingStagings + GROUP_COMMIT_MAX_EVENTS),
+    );
+    expect(Math.max(...run.group.batches)).toBeLessThanOrEqual(GROUP_COMMIT_MAX_EVENTS);
+    expect(run.store.decisions).toHaveLength(openingStagings + 300);
   });
 
   it("the default drain returns only once everything staged is durable", async () => {

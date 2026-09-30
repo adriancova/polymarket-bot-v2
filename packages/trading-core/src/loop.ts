@@ -117,6 +117,7 @@ import { CancelLedger } from "./cancels.js";
 import type { InstanceConfig, MarketConfig, TraderConfig } from "./config.js";
 import { readEventEnvelope } from "./event-door.js";
 import { FillDeduplicator } from "./fills.js";
+import { sameFrame } from "./frames.js";
 import { HeldAccounting, type AccountingChecks, type FoldHealth } from "./folds.js";
 import { haltOnLedgerProjection, type HaltController } from "./halt.js";
 import type { HealthSnapshot, HealthState } from "./health.js";
@@ -498,6 +499,18 @@ export class DecisionOutboxBuffer {
  * `2 × GROUP_COMMIT_MAX_EVENTS` events have decisions that are not yet
  * durable (one committing batch, one staged).
  *
+ * `THROUGHPUT-2` r1 (ADR-024 D5, `TP2-R1-M2`): the UNIT these bounds count is
+ * one STAGING — one outbox flush that carried a decision or a checkpoint
+ * (`GroupCommit.stagedEvents`). Before ADR-024 a flush followed each event,
+ * so the unit was an event; the loop now flushes once per venue FRAME, so
+ * every "event" in these bounds (COUNT, the hard bound, the `2 ×` window)
+ * reads "frame": at most 128 frames staged, at most 256 frames with
+ * decisions not yet durable. A frame of one event is an event, as before; a
+ * longer frame is one unit however many events it holds (H1: 1.76 events
+ * per frame on average, up to 65). What one unit holds in DECISIONS is not
+ * wider than before: a frame's flush carries one decision per market it
+ * owed (plus any lifecycle callback), as a lone event's flush does.
+ *
  * And the loop WAITS until everything staged is durable:
  *
  * - at the end of a drain, unless the caller asked otherwise (the pump's
@@ -513,8 +526,8 @@ export class DecisionOutboxBuffer {
 export const GROUP_COMMIT_MAX_EVENTS = 128;
 export const GROUP_COMMIT_MAX_AGE_MS = 50;
 /**
- * Once this many events are staged, a commit is REQUESTED without waiting for
- * it, and evaluation continues while the database works. Commits never overlap
+ * Once this many events (frames since ADR-024: see above) are staged, a
+ * commit is REQUESTED without waiting for it, and evaluation continues while the database works. Commits never overlap
  * one another (they form one chain), so batches become durable one at a time,
  * in stage order.
  */
@@ -702,6 +715,12 @@ export class CoreLoop {
   #commitRequested = false;
   /** `THROUGHPUT-1a`: a group commit failed; nothing is committed after it. */
   #groupCommitFailed = false;
+  /**
+   * `THROUGHPUT-2` (ADR-024): the venue frame being applied — set by its first
+   * event when the frame is longer than one, cleared by its closing event. It
+   * never outlives a drain (see `drain`).
+   */
+  #frame: OpenFrame | undefined;
 
   constructor(options: CoreLoopOptions) {
     this.#options = options;
@@ -963,7 +982,16 @@ export class CoreLoop {
     for (;;) {
       const event = this.#queue.take();
       if (event === undefined) break;
-      await this.#processEvent(event);
+      // `THROUGHPUT-2` (ADR-024): an event CLOSES its venue frame when the
+      // next queued event belongs to another frame, or when nothing is queued
+      // after it. The second half is the producers' obligation, which every
+      // feed of this loop meets: a batch handed to one drain never ends in
+      // the middle of a frame (`frames.ts`; ADR-024 §2). So no frame is ever
+      // open across two drains, and a stream position recorded after a drain
+      // is always at a frame boundary.
+      const next = this.#queue.peek();
+      const closesFrame = next === undefined || !sameFrame(event.envelope, next.envelope);
+      await this.#processEvent(event, closesFrame);
     }
     // Only a group-committing store has anything staged; every other store's
     // drain returns exactly as it always did. `awaitDurable: false` (the
@@ -979,7 +1007,22 @@ export class CoreLoop {
     await this.#commitStaged();
   }
 
-  async #processEvent(event: IngestedEvent): Promise<void> {
+  /**
+   * One event, §8.1 steps 1-9.
+   *
+   * `THROUGHPUT-2` (ADR-024): `closesFrame` says whether this is the LAST event
+   * of its venue frame (`drain`). A frame of ONE event — every reference tick,
+   * trade, snapshot, lifecycle event and incident that arrived alone — takes
+   * exactly the path it always took. An event of a LONGER frame updates every
+   * piece of state exactly as before (steps 1-2: the door, the instant, the
+   * venue's position, the basket judgement, the cancel sweep, the books, trades
+   * and reference prices), but its `onFeatures` evaluations, the fill harvest
+   * and the outbox flush wait for the frame's closing event, which evaluates
+   * each market the frame touched ONCE, on the fully applied frame
+   * ({@link CoreLoop.#closeFrame}). No event is skipped; only WHEN the
+   * callback fires changes.
+   */
+  async #processEvent(event: IngestedEvent, closesFrame: boolean): Promise<void> {
     // --- step 1: validate schema ------------------------------------------
     const read = readEventEnvelope(event.envelope);
     if (!read.ok) {
@@ -998,6 +1041,9 @@ export class CoreLoop {
           this.#lastInstant,
         );
       }
+      // A refused event that closes a frame still closes it: the events
+      // before it were applied and are owed their evaluation.
+      if (closesFrame) await this.#closeFrame();
       return;
     }
     const envelope = read.envelope;
@@ -1012,6 +1058,7 @@ export class CoreLoop {
         `the event's receivedAt could not be normalised: ${instant.problem}`,
         this.#lastInstant,
       );
+      if (closesFrame) await this.#closeFrame();
       return;
     }
     this.#lastInstant = instant.instant;
@@ -1029,6 +1076,16 @@ export class CoreLoop {
     // DELAYED order's disposition and a GTD's expiry, so a watched basket is
     // judged here — before this event evaluates any strategy.
     this.#judgeBasketWatches(instant.instant);
+
+    // `THROUGHPUT-2` (ADR-024): an event inside a longer frame — not its
+    // last, or its last with earlier events already applied — is applied now
+    // and evaluated at the frame's close. A frame of one continues below,
+    // exactly as every event did before.
+    if (!closesFrame || this.#frame !== undefined) {
+      await this.#applyWithinFrame(event, envelope, instant.instant, instant.epochMs);
+      if (closesFrame) await this.#closeFrame();
+      return;
+    }
 
     // --- step 2: update local market/account state -------------------------
     //
@@ -1099,6 +1156,109 @@ export class CoreLoop {
     await this.#harvestFills(instant.instant);
 
     // --- persist decisions and checkpoints (§4.2 halts on a store failure) --
+    await this.#flushOutbox();
+  }
+
+  /**
+   * `THROUGHPUT-2` (ADR-024) — step 2 for one event of a frame longer than one
+   * event: EXACTLY the state updates the single-event path makes, in the same
+   * order, with each `onFeatures` evaluation recorded as OWED rather than run.
+   * A callback that is not `onFeatures` (a lifecycle transition) still fires
+   * here, in place, as it always did: coalescing changes only when a market's
+   * features are evaluated, never whether a lifecycle callback is delivered.
+   */
+  async #applyWithinFrame(
+    event: IngestedEvent,
+    envelope: EventEnvelopeOf,
+    instant: string,
+    epochMs: number,
+  ): Promise<void> {
+    const frame = (this.#frame ??= { owed: new Map(), harvestAt: undefined });
+    // r1 (`TP2-R1-M1`): what an event contributes is recorded only where it
+    // would have acted alone — an owed evaluation names THIS event, and the
+    // harvest instant moves only for an event that reaches the harvest point.
+    // An event for a market this trader does not run changes neither.
+    const at: OwedEvaluation["at"] = { eventId: envelope.eventId, instant, epochMs };
+
+    if (envelope.eventType === "ReferenceTradeObserved") {
+      const venue = readString(envelope.payload, "venue");
+      const symbol = readString(envelope.payload, "symbol");
+      const price = readString(envelope.payload, "price");
+      if (
+        (venue === "binance" || venue === "coinbase") &&
+        symbol !== undefined &&
+        price !== undefined
+      ) {
+        this.#reference.observe({
+          venue,
+          symbol,
+          price,
+          observedAt: instant,
+          observedAtEpochMs: epochMs,
+        });
+      }
+      this.#sweepCancels(instant, epochMs);
+      for (const [marketId, market] of this.#options.markets) {
+        if (this.#options.halts.isMarketHalted(marketId)) continue;
+        market.observeInstant(instant, epochMs);
+        oweEvaluation(frame, marketId, market, at);
+      }
+      frame.harvestAt = instant;
+      return;
+    }
+
+    const affected = affectedMarketIds(envelope.payload);
+    const known = affected.filter((marketId) => this.#options.markets.has(marketId));
+    if (known.length === 0) return;
+
+    this.#sweepCancels(instant, epochMs);
+    for (const marketId of known) {
+      const market = this.#options.markets.get(marketId);
+      if (market === undefined) continue;
+      market.observeInstant(instant, epochMs);
+      const callback = this.#applyEvent(market, envelope, event, instant, epochMs);
+      if (callback === undefined) continue;
+      if (this.#options.halts.isMarketHalted(marketId)) continue;
+      if (callback.kind === "onFeatures") {
+        oweEvaluation(frame, marketId, market, at);
+        continue;
+      }
+      await this.#evaluateMarket(market, envelope, callback, instant, epochMs);
+    }
+    frame.harvestAt = instant;
+  }
+
+  /**
+   * `THROUGHPUT-2` (ADR-024) — the frame's close: every market the frame owes
+   * an `onFeatures` evaluation is evaluated ONCE, on the fully applied frame,
+   * with — as its source event and instant — the LAST event of the frame that
+   * owed THAT market an evaluation: exactly the event whose own evaluation of
+   * that market base ran last. The markets are evaluated in the order of
+   * those events (r1, `TP2-R1-M1`), so a frame's decisions are a subsequence
+   * of the per-event cadence's, in its order. Then the fill harvest and the
+   * outbox flush run, at the instant of the frame's last event that reached
+   * the harvest point, as they do after a single event. A market halted
+   * meanwhile is not evaluated (the same gate as always). A frame none of
+   * whose events reached the harvest point (no configured market, no
+   * reference price) harvests nothing, as each of those events alone would
+   * not have.
+   */
+  async #closeFrame(): Promise<void> {
+    const frame = this.#frame;
+    if (frame === undefined) return;
+    this.#frame = undefined;
+    for (const [marketId, owed] of frame.owed) {
+      if (this.#options.halts.isMarketHalted(marketId)) continue;
+      await this.#evaluateMarket(
+        owed.market,
+        { eventId: owed.at.eventId },
+        { kind: "onFeatures" },
+        owed.at.instant,
+        owed.at.epochMs,
+      );
+    }
+    if (frame.harvestAt === undefined) return;
+    await this.#harvestFills(frame.harvestAt);
     await this.#flushOutbox();
   }
 
@@ -3646,6 +3806,46 @@ type TriggeredCallback =
   | { readonly kind: "onMarketResolved"; readonly outcome: string; readonly resolvedAt: string }
   | { readonly kind: "onFill"; readonly fill: StrategyFill }
   | { readonly kind: "onOrderUpdate"; readonly order: StrategyOrderView };
+
+/** The door-read envelope `#processEvent` works on. */
+type EventEnvelopeOf = Extract<ReturnType<typeof readEventEnvelope>, { readonly ok: true }>["envelope"];
+
+/** `THROUGHPUT-2` (ADR-024): a venue frame between its first and its closing event. */
+interface OpenFrame {
+  /**
+   * Markets owed ONE `onFeatures` evaluation at the close, in the order of the
+   * events that last owed them (see {@link oweEvaluation}).
+   */
+  readonly owed: Map<string, OwedEvaluation>;
+  /**
+   * The instant of the frame's last event that reached the point where a lone
+   * event harvests fills and flushes; `undefined` when none did.
+   */
+  harvestAt: string | undefined;
+}
+
+/** One market's owed evaluation: the market, and the last frame event that owed it. */
+interface OwedEvaluation {
+  readonly market: MarketState;
+  readonly at: { readonly eventId: string; readonly instant: string; readonly epochMs: number };
+}
+
+/**
+ * `THROUGHPUT-2` r1 (`TP2-R1-M1`): records that `at` owes `marketId` an
+ * evaluation. A market owed again moves to the END of the order, keyed to
+ * the later event: the close then evaluates each market at the last event
+ * that owed it, in the order of those events — the order the per-event
+ * cadence ran those same evaluations in.
+ */
+function oweEvaluation(
+  frame: OpenFrame,
+  marketId: string,
+  market: MarketState,
+  at: OwedEvaluation["at"],
+): void {
+  frame.owed.delete(marketId);
+  frame.owed.set(marketId, { market, at });
+}
 
 const ZERO_UUID = "00000000-0000-7000-8000-000000000000";
 

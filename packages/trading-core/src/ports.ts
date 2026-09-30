@@ -224,7 +224,11 @@ export interface StagedEvaluations {
  */
 export interface GroupCommit {
   stage(evaluations: StagedEvaluations): PortResult<null>;
-  /** Events staged and not yet committed. */
+  /**
+   * Stagings not yet committed: one per `stage` call. The loop stages once
+   * per outbox flush — once per event before ADR-024, once per venue FRAME
+   * since (`THROUGHPUT-2` r1, `TP2-R1-M2`; `loop.ts` states the bounds).
+   */
   readonly stagedEvents: number;
   commit(): Promise<PortResult<{ readonly decisions: number; readonly checkpoints: number }>>;
 }

@@ -86,6 +86,8 @@ export {
 
 export { BoundedQueue, type OfferOutcome, type QueueMetrics } from "./queue.js";
 
+export { frameKeyOf, sameFrame, type FrameKey } from "./frames.js";
+
 export {
   HaltController,
   haltOnLedgerProjection,
