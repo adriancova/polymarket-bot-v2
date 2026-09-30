@@ -123,23 +123,28 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:fault
 
-      # CI-2 (CI1-L5): the four `test:contract` suites, one step each (see
-      # the note above the typecheck steps). All four read offline fixtures.
-      - name: Venue contract tests 1/4 - Polymarket public market feed and REST (offline fixtures)
+      # CI-2 (CI1-L5): the `test:contract` suites, one step each (see the note
+      # above the typecheck steps). All read offline fixtures. CI-3 added 5/5
+      # (WP-260's secure-SDK contract suite, WP260-L1).
+      - name: Venue contract tests 1/5 - Polymarket public market feed and REST (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/polymarket-public test:contract
 
-      - name: Venue contract tests 2/4 - Polymarket RTDS (offline fixtures)
+      - name: Venue contract tests 2/5 - Polymarket RTDS (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/polymarket-public test:contract:rtds
 
-      - name: Venue contract tests 3/4 - Binance (offline fixtures)
+      - name: Venue contract tests 3/5 - Binance (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/binance-adapter test:contract
 
-      - name: Venue contract tests 4/4 - Coinbase (offline fixtures)
+      - name: Venue contract tests 4/5 - Coinbase (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/coinbase-adapter test:contract
+
+      - name: Venue contract tests 5/5 - Polymarket secure SDK (offline fixtures; no network, no credential)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/polymarket-secure test:contract
 
       - name: Recorder soak-harness smoke (bounded, loopback-only; no elapsed-evidence claim)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
