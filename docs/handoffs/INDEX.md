@@ -102,3 +102,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [LOGS-1.md](LOGS-1.md) | `LOGS-1`: `IMPLEMENTATION_STATUS.md` becomes a brief; history archived verbatim | Round | Complete (2026-09-30) | `7ac7985` | 13 KB |
 | 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |
 | 2026-09-30 | [DURABLE-1.md](DURABLE-1.md) | `DURABLE-1`: a decision is durable before its order and ledger effects (`X1`) | Round | Complete (2026-09-30) | `6e01228` | 23 KB |
+| 2026-09-30 | [CLOSEOUT-2B-wave-2-regrade.md](CLOSEOUT-2B-wave-2-regrade.md) | `CLOSEOUT-2B`: focused re-grade of Wave 2 after `DURABLE-1` | Audit | WAVE 2 CLOSED WITH QUALIFICATIONS (with the user's CANCEL ruling) | — (an audit) | 13 KB |
