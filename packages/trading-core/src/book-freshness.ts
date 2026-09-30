@@ -77,9 +77,14 @@
  * - the confirmation is moved back by `lag` before it is compared with the
  *   last change, so its event-time age equals its process-time age.
  *
- * A lagging trader therefore gets at most what `LAST_CHANGE` gives it (the
- * answer never moves before the last change), and an unreadable process clock
- * turns the extension off. Under a replay clock positioned at each recorded
+ * A lagging trader therefore never gets more than the unguarded
+ * `CONNECTION_CONFIRMED` rule would give it at its own process instant. That
+ * is not `LAST_CHANGE` parity at every lag (last change 0, confirmation 5000,
+ * event 5200, lag 1700: age 1900, fresh, where `LAST_CHANGE` reads 5200); the
+ * answer EQUALS `LAST_CHANGE` once the shifted confirmation no longer leads
+ * the last change (it never moves before it) or another fallback applies (rule
+ * 6, a tainted epoch, no confirmation), and an unreadable process clock turns
+ * the extension off. Under a replay clock positioned at each recorded
  * event (the backtest), `lag` is 0 and the answer is the recorded one.
  *
  * PURE STATE, NO CLOCK READ HERE. Every instant arrives from an event's own

@@ -18,7 +18,10 @@
   documentation (X7) and `CO2-N1` (X9). r2 (2026-09-30), after review
   round 2: the process-lag guard (D7, X9 option (a), pending its ruling),
   the heartbeat wording (D5, Option B) and the replay-parity qualification
-  (D8).
+  (D8). r3 (2026-09-30), wording only: the guard's bound is unguarded
+  `CONNECTION_CONFIRMED`, not `LAST_CHANGE` (D7), and the process lag
+  reaches feature snapshot refs, so opted-in live records have no guaranteed
+  byte parity with replay (D8).
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
@@ -409,7 +412,15 @@ process clock that was measured against event time before. `now` for every
 age, the `LAST_CHANGE` path (which reads no clock), admission, the risk
 gates' inputs and N1 are all unchanged. The process clock can only REMOVE
 extension this ADR added; it can never make a book fresher than the
-pre-guard rule or than `LAST_CHANGE`. A process clock that runs BEHIND event
+unguarded `CONNECTION_CONFIRMED` rule. It is NOT a promise of `LAST_CHANGE`
+parity at every lag: while the shifted confirmation still leads the last
+change, the answer is fresher than `LAST_CHANGE` (last change 0,
+confirmation 5 000, event 5 200, lag 1 700: age 1 900, fresh, against 5 200,
+stale, under `LAST_CHANGE`; that is the extension this ADR adds, bounded by
+the process's own instant). The answer EQUALS `LAST_CHANGE` once the shifted
+confirmation no longer leads the last change, or once another fallback
+(rule 6's ceiling, an unreadable process clock, a tainted epoch, no session
+confirmation) applies. A process clock that runs BEHIND event
 time (skew between the gateway host and the trader host) reads as lag 0, the
 pre-guard answer.
 
@@ -441,9 +452,12 @@ second removes the double count; both directions are fail-closed).
 
 ### D8. Replay and backtest determinism
 
-`confirmedAt` is a pure function of the consumed event sequence: the session
-table is fed in stream order, uses only envelope fields, and its eviction is
-insertion-ordered. The backtest CLI runs the same `CoreLoop` behind the same
+`confirmedAt` is a pure function of the consumed event sequence and, under an
+opted-in `CONNECTION_CONFIRMED` basis only, of the caller's process-clock
+reading (the D7 guard's `lag`): the session table is fed in stream order,
+uses only envelope fields, and its eviction is insertion-ordered; the lag is
+the one non-event input, and it is 0 under a replay clock positioned at each
+event. The backtest CLI runs the same `CoreLoop` behind the same
 configuration door (ADR-022), so replay and backtest reproduce live decisions
 over the same events, PROVIDED the replay starts from the same point and
 the process is not restarted in between: the epoch taint is state of the
@@ -457,7 +471,16 @@ through it. The process-lag guard (D7) is the other qualification: a
 backtest's replay clock sits at each event (lag 0), so it reproduces a live
 process that kept up; a live process that ran behind by more than a few
 milliseconds may have read a book stale that the replay reads fresh, never
-the reverse (the guard only removes extension). ADR-024's frame grouping is unaffected: a frame's events
+the reverse (the guard only removes extension). The lag also reaches the
+records, not only the verdicts: under an opted-in `CONNECTION_CONFIRMED`
+basis, the shifted instant is what the loop hands to features as the book's
+confirmation, so a live process's feed ages and its `featureSnapshotRef`
+hashes carry its process lag, and byte parity of those records with a replay
+is NOT guaranteed even where every stale/fresh outcome matches (review probe:
+a 3 ms lag changed 12 of 13 decision records with identical outcomes);
+evaluations that fall back (`LAST_CHANGE`, rule 6, a tainted epoch) can
+still match byte for byte. Under the default `LAST_CHANGE` basis no clock is
+read and parity is as before. ADR-024's frame grouping is unaffected: a frame's events
 all update the table before its closing evaluation, which is the live order.
 Inside one frame a later event's `receivedAt` may sit a millisecond after the
 instant the frame's evaluation of a market uses; the age is then negative,
@@ -608,3 +631,14 @@ r2 adds these pins (`book-freshness.test.ts`, "r2 X9"):
   live process 1 700 ms behind is fresh and 1 900 ms behind is stale at the
   same event; a per-event replay clock decides byte-identically to the
   unlagged run.
+
+r3 adds two pins that state the corrected wording as behaviour (no code
+changed in r3):
+- `bookConfirmedAt`: the reviewers' counterexample (last change 0,
+  confirmation 5 000, event 5 200, lag 1 700 gives age 1 900 where
+  `LAST_CHANGE` gives 5 200), and, over a sweep of lags, an answer between
+  the last change and the unguarded confirmation, equal to the last change
+  once the lag covers the lead;
+- the composition: a 3 ms lag leaves every stale/fresh verdict unchanged but
+  changes the decision records, while under `LAST_CHANGE` the lag changes
+  nothing.

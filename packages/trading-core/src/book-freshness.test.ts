@@ -910,7 +910,7 @@ describe("§9.8 check 7 measures the same confirmed age (risk freshness)", () =>
 // the backlog (the process-lag guard, ADR-023 D7)
 // ---------------------------------------------------------------------------
 
-describe("r2 X9: a lagging trader or a live replay of old data gets no more than LAST_CHANGE", () => {
+describe("r2 X9: a lagging trader or a live replay of old data gets no more than unguarded CONNECTION_CONFIRMED at its own instant", () => {
   /** The reviewers' check-7 timeline (YES 09:00:01, NO snapshot 09:00:04.100 on the same session). */
   function checkSevenTimeline(): Recorded[] {
     const cheapAsks = [
@@ -958,6 +958,20 @@ describe("r2 X9: a lagging trader or a live replay of old data gets no more than
     const records = (parts: Run) => JSON.stringify(parts.store.decisions.map((recorded) => recorded.record));
     expect(records(positioned)).toBe(records(unlagged));
     expect(evaluations(positioned).filter((evaluation) => evaluation.stale)).toEqual([]);
+  });
+
+  it("r3 O-L1: a 3 ms process lag leaves every stale/fresh outcome unchanged but changes the decision records (no byte parity with replay)", async () => {
+    const lagged = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 3 }, quietYesTimeline());
+    const unlagged = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 0 }, quietYesTimeline());
+    const verdicts = (parts: Run) => evaluations(parts).map((evaluation) => evaluation.stale);
+    expect(verdicts(lagged)).toEqual(verdicts(unlagged));
+    const records = (parts: Run) => parts.store.decisions.map((recorded) => JSON.stringify(recorded.record));
+    expect(records(lagged)).toHaveLength(records(unlagged).length);
+    expect(records(lagged)).not.toEqual(records(unlagged));
+    // Under LAST_CHANGE no clock is read: the lag leaves the records byte-identical.
+    const lastChangeLagged = await run({ basis: "LAST_CHANGE", processLagMs: 3 }, quietYesTimeline());
+    const lastChangeUnlagged = await run({ basis: "LAST_CHANGE", processLagMs: 0 }, quietYesTimeline());
+    expect(records(lastChangeLagged)).toEqual(records(lastChangeUnlagged));
   });
 });
 
@@ -1148,6 +1162,38 @@ describe("book-freshness.ts", () => {
     ).toEqual(at(1_000));
     // LAST_CHANGE never needs the process clock.
     expect(bookConfirmedAt({ ...common, basis: "LAST_CHANGE", processNowEpochMs: undefined })).toEqual(at(1_000));
+  });
+
+  it("r3 R3-L1: the guard is bounded by unguarded CONNECTION_CONFIRMED, not by LAST_CHANGE, until the shifted confirmation stops leading", () => {
+    const liveness = new DeliverySessionLiveness();
+    const key = sessionKeyOf(bookEvent(A1)) as string;
+    liveness.observe(bookEvent(A1), at(5_000));
+    const common = {
+      basis: "CONNECTION_CONFIRMED" as const,
+      sessionKey: key,
+      marketHasActiveIncident: false,
+      liveness,
+      lastChange: at(0),
+      nowEpochMs: 5_200,
+      maximumLastChangeAgeMs: 30_000,
+    };
+    // The reviewers' counterexample: lag 1 700 leaves the book 1 900 ms old
+    // (fresh at 2 000), where LAST_CHANGE reads it 5 200 ms old (stale).
+    const guarded = bookConfirmedAt({ ...common, processNowEpochMs: 6_900 });
+    expect(guarded).toEqual({ iso: "1970-01-01T00:00:03.300Z", epochMs: 3_300 });
+    expect(5_200 - (guarded?.epochMs ?? Number.NaN)).toBe(1_900);
+    const lastChange = bookConfirmedAt({ ...common, basis: "LAST_CHANGE", processNowEpochMs: 6_900 });
+    expect(lastChange).toEqual(at(0));
+    // At every lag the guarded instant is between LAST_CHANGE and the unguarded
+    // confirmation, and equals LAST_CHANGE once the lag covers the lead.
+    const unguarded = bookConfirmedAt({ ...common, processNowEpochMs: 5_200 });
+    expect(unguarded).toEqual(at(5_000));
+    for (const lag of [0, 1, 3, 1_700, 4_999, 5_000, 5_001, 60_000]) {
+      const answer = bookConfirmedAt({ ...common, processNowEpochMs: 5_200 + lag })?.epochMs ?? Number.NaN;
+      expect(answer).toBeLessThanOrEqual(5_000);
+      expect(answer).toBeGreaterThanOrEqual(0);
+      expect(answer).toBe(Math.max(0, 5_000 - lag));
+    }
   });
 
   it("an epoch taint covers sessions seen before and after it, and no other epoch", () => {
