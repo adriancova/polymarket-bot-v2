@@ -947,18 +947,79 @@ function checkCoherence(params: StaticBracketParams): Outcome<null> {
  * renders it into its `PARAMS_REJECTED` refusal.
  */
 export const staticBracketParamsSchema = Object.freeze({
-  safeParse(
-    value: unknown,
-  ):
-    | { readonly success: true; readonly data: StaticBracketParams }
-    | { readonly success: false; readonly error: { readonly message: string } } {
-    const result = validateStaticBracketParams(value);
-    if (result.ok) {
-      return Object.freeze({ success: true as const, data: result.value });
+  safeParse(value: unknown): ParamsParseResult {
+    // `THROUGHPUT-2`: the same answer for the same immutable object — see
+    // `PARSED_BY_OBJECT`.
+    const cacheable = typeof value === "object" && value !== null;
+    if (cacheable) {
+      const cached = PARSED_BY_OBJECT.get(value);
+      if (cached !== undefined) return cached;
     }
-    return Object.freeze({
-      success: false as const,
-      error: Object.freeze({ message: result.problem }),
-    });
+    const result = validateStaticBracketParams(value);
+    const parsed: ParamsParseResult = result.ok
+      ? Object.freeze({ success: true as const, data: result.value })
+      : Object.freeze({
+          success: false as const,
+          error: Object.freeze({ message: result.problem }),
+        });
+    if (cacheable && isImmutablePlainData(value)) PARSED_BY_OBJECT.set(value, parsed);
+    return parsed;
   },
 });
+
+type ParamsParseResult =
+  | { readonly success: true; readonly data: StaticBracketParams }
+  | { readonly success: false; readonly error: { readonly message: string } };
+
+/**
+ * `THROUGHPUT-2` — the parse of each IMMUTABLE params object, by identity.
+ *
+ * `prepare` (`strategy.ts`) re-validates `ctx.params()` on every callback, and
+ * the WP-170 runtime answers `ctx.params()` with ONE object for the run's whole
+ * life: its own materialized, deep-frozen, plain-data copy (`packages/strategy-runtime`
+ * `context.ts`). Validation is a pure function of the object's contents, and
+ * contents that are deep-frozen plain data can never change, so the answer for
+ * such an object is computed once and returned again — the same frozen answer,
+ * with the same fields and values, that a fresh validation would build.
+ *
+ * Cached ONLY when {@link isImmutablePlainData} holds, which it checks after
+ * validating (so a first sight reads the object exactly as before): every
+ * reachable object is frozen, has a plain prototype, and holds only DATA
+ * properties. A mutable object, an accessor, a `Map`, or anything the check
+ * cannot read is validated afresh on every call, as before. A `WeakMap`, so
+ * the cache keeps nothing alive; its size is bounded by the live params
+ * objects (one per strategy instance).
+ */
+const PARSED_BY_OBJECT = new WeakMap<object, ParamsParseResult>();
+
+/**
+ * `true` when `value` is a finite tree of frozen, plain-prototype objects and
+ * arrays holding only data properties — contents that cannot change. Never
+ * throws: a value that cannot be read answers `false`.
+ */
+export function isImmutablePlainData(value: unknown): boolean {
+  try {
+    return immutableAt(value, new Set());
+  } catch {
+    return false;
+  }
+}
+
+function immutableAt(value: unknown, visiting: Set<object>): boolean {
+  if (value === null || typeof value !== "object") return typeof value !== "function";
+  if (visiting.has(value)) return true;
+  if (!Object.isFrozen(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  const plain =
+    prototype === null ||
+    prototype === Object.prototype ||
+    (prototype === Array.prototype && Array.isArray(value));
+  if (!plain) return false;
+  visiting.add(value);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return false;
+    if (!immutableAt(descriptor.value, visiting)) return false;
+  }
+  return true;
+}
