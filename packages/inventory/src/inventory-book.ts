@@ -44,6 +44,22 @@
  * from `reserved` to `pendingOut`; {@link InventoryBook.release} then frees
  * only the unused remainder (work plan WP-270 acceptance "Partial fills release
  * only unused reservations"; §16.2).
+ *
+ * PENDING IDS ARE SINGLE-USE FOR THE BOOK'S LIFETIME. A settled (APPLIED or
+ * VOIDED) pending id is retained: it can be neither settled again nor reused
+ * by {@link InventoryBook.consume} or {@link InventoryBook.expectInflow}, so a
+ * replayed settlement can never count a receipt or a debit twice.
+ *
+ * THE RECOGNITION BOUNDARY between authoritative balance reads and operation
+ * effects. A balance read says what the line holds NOW; it cannot say whether
+ * an in-flight effect is already inside it. So a read is refused
+ * (`INVENTORY_PENDING_UNRESOLVED`, `INVENTORY_OPERATION_IN_FLIGHT`) on any line
+ * that has an unresolved pending entry or an in-flight operation hold
+ * ({@link InventoryBook.holdForOperation}): an effect is recognised exactly
+ * once, either as a settled delta before the read or inside the read after
+ * the operation has resolved, never both. This covers ledger-derived refreshes
+ * ({@link InventoryBook.seedFromLedgerBalances}) as well as reconciliation
+ * reads.
  */
 
 import { addDecimal, compareDecimal, isNegativeDecimal, subDecimal, type DecimalString } from "@polymarket-bot/decimal";
@@ -171,6 +187,12 @@ interface Pending {
   readonly reservationId: string | null;
 }
 
+interface OperationHold {
+  readonly holdId: string;
+  readonly accountRef: string;
+  readonly assetIds: readonly string[];
+}
+
 const ZERO: DecimalString = "0";
 
 export class InventoryBook {
@@ -179,6 +201,9 @@ export class InventoryBook {
   readonly #reservations = new Map<string, Reservation>();
   readonly #activeByHolder = new Map<string, string>();
   readonly #pending = new Map<string, Pending>();
+  /** Settled pending ids, retained for the book's lifetime (single-use). */
+  readonly #settled = new Map<string, PendingSettlement>();
+  readonly #holds = new Map<string, OperationHold>();
 
   constructor(registry: AssetRegistry) {
     this.#registry = registry;
@@ -235,7 +260,8 @@ export class InventoryBook {
 
   /**
    * Record an authoritative balance read (reconciliation, §9.17 step 4).
-   * Refused while the line has unresolved pending amounts: the reconciler
+   * Refused while the line has unresolved pending amounts or an in-flight
+   * operation hold (the recognition boundary; see the header): the reconciler
    * settles or voids them first, so a receipt can never be counted twice
    * (once in the observation and once when its pending entry settles).
    */
@@ -350,9 +376,8 @@ export class InventoryBook {
         status: reservation.status,
       });
     }
-    if (this.#pending.has(pendingId)) {
-      return refuse("INVENTORY_DUPLICATE_PENDING_ID", "pending ids are single-use", { pendingId });
-    }
+    const taken = this.#pendingIdTaken(pendingId);
+    if (taken !== undefined) return taken;
     const remaining = remainingOf(reservation);
     if (compareDecimal(amount, remaining) > 0) {
       return refuse("INVENTORY_OVER_CONSUMPTION", "cannot consume more than the reservation's remainder", {
@@ -423,9 +448,8 @@ export class InventoryBook {
     if (registration === undefined) {
       return refuse("INVENTORY_UNKNOWN_ASSET", "inflow names an unregistered asset", { assetId });
     }
-    if (this.#pending.has(pendingId)) {
-      return refuse("INVENTORY_DUPLICATE_PENDING_ID", "pending ids are single-use", { pendingId });
-    }
+    const taken = this.#pendingIdTaken(pendingId);
+    if (taken !== undefined) return taken;
     const line = this.#line(accountRef, assetId, registration.assetKind);
     line.pendingIn = addDecimal(line.pendingIn, amount);
     const entry: Pending = { pendingId, direction: "IN", accountRef, assetId, amount, reservationId: null };
@@ -448,6 +472,13 @@ export class InventoryBook {
     if (pendingId === undefined || (settlement !== "APPLIED" && settlement !== "VOIDED")) {
       return refuse("INVENTORY_INVALID_INPUT", "settlePending needs pendingId and settlement APPLIED|VOIDED");
     }
+    const earlier = this.#settled.get(pendingId);
+    if (earlier !== undefined) {
+      return refuse("INVENTORY_PENDING_ALREADY_SETTLED", "this pending entry was already settled; a settlement is never replayed", {
+        pendingId,
+        settlement: earlier,
+      });
+    }
     const entry = this.#pending.get(pendingId);
     if (entry === undefined) return refuse("INVENTORY_PENDING_NOT_FOUND", "no such pending entry", { pendingId });
     const line = this.#mustLine(entry.accountRef, entry.assetId);
@@ -466,6 +497,7 @@ export class InventoryBook {
       if (settlement === "APPLIED") line.actual = addDecimal(line.actual, entry.amount);
     }
     this.#pending.delete(pendingId);
+    this.#settled.set(pendingId, settlement);
     return ok(viewPending(entry));
   }
 
@@ -482,6 +514,55 @@ export class InventoryBook {
     const line = this.#line(accountRef, assetId, registration.assetKind);
     if (line.blocked === null) line.blocked = "AWAITING_OBSERVATION";
     return ok(viewLine(line));
+  }
+
+  /**
+   * Mark lines as touched by an in-flight operation (a submitted wallet
+   * operation). Until {@link releaseOperationHold}, an authoritative balance
+   * read or a ledger refresh of any of these lines is refused
+   * (`INVENTORY_OPERATION_IN_FLIGHT`): whether the read already contains the
+   * operation's effect is unknowable, so accepting it could count the effect
+   * twice (once in the read, once when the operation confirms). Reservations
+   * are unaffected. Hold ids are single-use while held.
+   */
+  holdForOperation(input: {
+    readonly holdId: string;
+    readonly accountRef: string;
+    readonly assetIds: readonly string[];
+  }): InventoryResult<{ readonly holdId: string }> {
+    const holdId = ownNonEmptyString(input, "holdId");
+    const accountRef = ownNonEmptyString(input, "accountRef");
+    const rawAssets = ownData(input, "assetIds");
+    if (holdId === undefined || accountRef === undefined || !Array.isArray(rawAssets)) {
+      return refuse("INVENTORY_INVALID_INPUT", "hold needs holdId, accountRef and assetIds");
+    }
+    const assetIds: string[] = [];
+    for (const assetId of rawAssets as readonly unknown[]) {
+      if (typeof assetId !== "string" || this.#registry.lookup(assetId) === undefined) {
+        return refuse("INVENTORY_UNKNOWN_ASSET", "hold names an unregistered asset", {
+          assetId: typeof assetId === "string" ? assetId : null,
+        });
+      }
+      assetIds.push(assetId);
+    }
+    if (this.#holds.has(holdId)) {
+      return refuse("INVENTORY_DUPLICATE_HOLD_ID", "this operation hold is already in place", { holdId });
+    }
+    this.#holds.set(holdId, Object.freeze({ holdId, accountRef, assetIds: Object.freeze(assetIds) }));
+    return ok(Object.freeze({ holdId }));
+  }
+
+  /** End an operation hold (the operation resolved). Idempotent: false if none was held. */
+  releaseOperationHold(holdId: string): boolean {
+    return this.#holds.delete(holdId);
+  }
+
+  /** Whether a line is under an in-flight operation hold. */
+  isHeldForOperation(accountRef: string, assetId: string): boolean {
+    for (const hold of this.#holds.values()) {
+      if (hold.accountRef === accountRef && hold.assetIds.includes(assetId)) return true;
+    }
+    return false;
   }
 
   // ----------------------------------------------------------------- views --
@@ -614,6 +695,25 @@ export class InventoryBook {
           { accountRef, assetId, pendingId: entry.pendingId },
         );
       }
+    }
+    for (const hold of this.#holds.values()) {
+      if (hold.accountRef === accountRef && hold.assetIds.includes(assetId)) {
+        return refuse(
+          "INVENTORY_OPERATION_IN_FLIGHT",
+          "an in-flight operation touches this line; a balance read cannot say whether its effect is included, so it is refused until the operation resolves",
+          { accountRef, assetId, holdId: hold.holdId },
+        );
+      }
+    }
+    return undefined;
+  }
+
+  #pendingIdTaken(pendingId: string): InventoryResult<never> | undefined {
+    if (this.#pending.has(pendingId) || this.#settled.has(pendingId)) {
+      return refuse("INVENTORY_DUPLICATE_PENDING_ID", "pending ids are single-use for the book's lifetime", {
+        pendingId,
+        settled: this.#settled.has(pendingId),
+      });
     }
     return undefined;
   }

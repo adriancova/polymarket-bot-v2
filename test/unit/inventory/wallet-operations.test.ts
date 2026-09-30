@@ -94,7 +94,13 @@ describe("split / merge / redeem / wrap / unwrap lifecycles", () => {
     expect(executor.submitted).toHaveLength(1);
     expect(manager.observe("op-split-1", { status: "MINED", transactionHash: TX }).ok).toBe(true);
     const confirmed = manager.observe("op-split-1", { status: "CONFIRMED", transactionHash: TX, transactionId: null });
-    expect(confirmed.ok && confirmed.value).toMatchObject({ state: "CONFIRMED", effectsApplied: true, transactionId: null });
+    // A null relayer id in the confirmation is legal and never clears the known one (WP300-R1-03).
+    expect(confirmed.ok && confirmed.value).toMatchObject({
+      state: "CONFIRMED",
+      effectsApplied: true,
+      transactionHash: TX,
+      transactionId: "sanitized-transaction-id-0501",
+    });
     expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "75", reserved: "0", available: "75" });
     expect(book.line(ACCOUNT, YES)?.actual).toBe("45");
     expect(book.line(ACCOUNT, NO)?.actual).toBe("45");
@@ -116,7 +122,7 @@ describe("split / merge / redeem / wrap / unwrap lifecycles", () => {
     expect(book.line(ACCOUNT, YES)?.reserved).toBe("0"); // the YES half was rolled back
     expect(manager.plan({ type: "MERGE", operationId: "m2", accountRef: ACCOUNT, conditionId: CONDITION, amount: "3" }).ok).toBe(true);
     await manager.submit("m2");
-    manager.observe("m2", { status: "CONFIRMED", transactionHash: TX, transactionId: "sanitized-transaction-id-0502" });
+    manager.observe("m2", { status: "CONFIRMED", transactionHash: TX, transactionId: "sanitized-transaction-id-0501" });
     expect(book.line(ACCOUNT, YES)?.actual).toBe("7");
     expect(book.line(ACCOUNT, NO)?.actual).toBe("0");
     expect(book.line(ACCOUNT, PUSD)?.actual).toBe("3");
@@ -317,16 +323,20 @@ describe("an unknown wallet operation triggers reconciliation (acceptance 3)", (
     expect(reconciler.requests).toHaveLength(1);
   });
 
-  it("a confirmed operation whose deltas no longer fit the book requests a balance-discrepancy reconciliation", async () => {
+  it("an in-flight operation's lines refuse a balance read, so a read can never undercut its confirmed debit", async () => {
+    // (Round 0 let this read through and then fell back to a
+    // balance-discrepancy reconciliation; the recognition boundary of
+    // WP300-R1-02 now refuses the read while the operation is in flight.)
     const { book, manager, reconciler } = harness();
     manager.plan(split("s", "25"));
     await manager.submit("s");
-    // An authoritative read lowers pUSD below the operation's debit.
-    expect(book.observeActual({ accountRef: ACCOUNT, assetId: PUSD, balance: "20" }).ok).toBe(true);
+    const read = book.observeActual({ accountRef: ACCOUNT, assetId: PUSD, balance: "20" });
+    expect(read.ok).toBe(false);
+    if (!read.ok) expect(read.refusal.code).toBe("INVENTORY_OPERATION_IN_FLIGHT");
     manager.observe("s", { status: "CONFIRMED", transactionHash: TX, transactionId: null });
-    expect(manager.operation("s")).toMatchObject({ state: "CONFIRMED", effectsApplied: false });
-    expect(reconciler.requests).toEqual([expect.objectContaining({ trigger: "POSITION_BALANCE_DISCREPANCY" })]);
-    expect(book.line(ACCOUNT, YES)?.blocked).toBe("AWAITING_OBSERVATION");
+    expect(manager.operation("s")).toMatchObject({ state: "CONFIRMED", effectsApplied: true });
+    expect(reconciler.requests).toEqual([]);
+    expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "75", reserved: "0" });
   });
 });
 

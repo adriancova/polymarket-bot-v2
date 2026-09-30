@@ -11,6 +11,10 @@
  * - on every unblocked line, reserved + pendingOut <= actual (no negative
  *   available, §10.7), and no holder has two ACTIVE reservations on one asset.
  *
+ * Pending ids are single-use for the book's lifetime (WP300-R1-01): the oracle
+ * retains settled ids, and the generator deliberately replays settlements and
+ * reuses settled ids for both consumes and inflows.
+ *
  * fast-check is not a root dependency, and this packet may add none, so the
  * generator is a seeded PRNG: every failure reproduces from its seed.
  */
@@ -55,6 +59,7 @@ class Oracle {
   readonly lines = new Map<string, OracleLine>();
   readonly reservations = new Map<string, OracleReservation>();
   readonly pending = new Map<string, OraclePending>();
+  readonly settled = new Set<string>();
 
   line(asset: string): OracleLine {
     let line = this.lines.get(asset);
@@ -82,7 +87,7 @@ class Oracle {
   }
   consume(id: string, amount: bigint, pendingId: string): boolean {
     const r = this.reservations.get(id);
-    if (r === undefined || !r.active || this.pending.has(pendingId) || amount > r.amount - r.used) return false;
+    if (r === undefined || !r.active || this.idTaken(pendingId) || amount > r.amount - r.used) return false;
     r.used += amount;
     this.line(r.asset).pendingOut += amount;
     this.pending.set(pendingId, { asset: r.asset, amount, direction: "OUT" });
@@ -97,7 +102,7 @@ class Oracle {
     return true;
   }
   inflow(pendingId: string, asset: string, amount: bigint): boolean {
-    if (this.pending.has(pendingId)) return false;
+    if (this.idTaken(pendingId)) return false;
     this.line(asset).pendingIn += amount;
     this.pending.set(pendingId, { asset, amount, direction: "IN" });
     return true;
@@ -115,7 +120,11 @@ class Oracle {
       if (applied) line.actual += p.amount;
     }
     this.pending.delete(pendingId);
+    this.settled.add(pendingId);
     return true;
+  }
+  idTaken(pendingId: string): boolean {
+    return this.pending.has(pendingId) || this.settled.has(pendingId);
   }
   observe(asset: string, balance: bigint): boolean {
     for (const p of this.pending.values()) if (p.asset === asset) return false;
@@ -188,7 +197,8 @@ function runSeed(seed: number, steps: number): Set<string> {
       const id = pick(random, reservationIds);
       expect(track(book.release({ reservationId: id })), `${context} release`).toBe(oracle.release(id));
     } else if (roll < 0.8) {
-      const pendingId = `p${nextId++}`;
+      // Sometimes reuse an id on purpose (live or already settled).
+      const pendingId = random() < 0.15 && pendingIds.length > 0 ? pick(random, pendingIds) : `p${nextId++}`;
       const asset = pick(random, ASSETS);
       const amount = randomAmount(random, 5);
       const got = track(book.expectInflow({ pendingId, accountRef: ACCOUNT, assetId: asset, amount }));
@@ -229,6 +239,8 @@ describe("double reservation is impossible (seeded property run against an exact
       "INVENTORY_RESERVATION_NOT_ACTIVE",
       "INVENTORY_OVER_CONSUMPTION",
       "INVENTORY_PENDING_UNRESOLVED",
+      "INVENTORY_DUPLICATE_PENDING_ID",
+      "INVENTORY_PENDING_ALREADY_SETTLED",
     ]) {
       expect(seen.has(code), code).toBe(true);
     }

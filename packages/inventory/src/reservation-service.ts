@@ -18,12 +18,20 @@
  * asserts no over-reservation, no second active reservation per holder and
  * asset, one grant per reservation id, and journal order = grant order.
  *
- * FAILURE. If the journal rejects, the in-memory effect has already happened
- * and may or may not be persisted. The service does not guess: it FAULTS, and
- * every later call is refused (`INVENTORY_FAULTED`) until the composition root
- * rebuilds it from the journal and a reconciliation read. A faulted service
- * holds whatever it held — the fail-closed direction (more reserved, never
- * less).
+ * FAILURE. If the journal rejects (or `append` throws), the in-memory effect
+ * has already happened and may or may not be persisted. The service does not
+ * guess: it FAULTS, and every later call is refused (`INVENTORY_FAULTED`) until
+ * the composition root rebuilds it from the journal and a reconciliation read.
+ * A faulted service holds whatever it held — the fail-closed direction (more
+ * reserved, never less).
+ *
+ * ORDERED ACKNOWLEDGEMENT. Each mutation depends on every mutation decided
+ * before it (a reservation may exist only because an earlier release freed
+ * the amount). So a mutation is acknowledged (`ok: true`) only once its own
+ * append AND every earlier append have succeeded, and only if the service has
+ * not faulted meanwhile. The acknowledgement chain slot is registered BEFORE
+ * `append` is invoked, so a mutation made reentrantly from inside a
+ * synchronous `append` also depends on the outer one and fails with it.
  *
  * The caller must await a reservation before acting on it (for example,
  * before submitting the order it protects).
@@ -60,6 +68,8 @@ export class ReservationService {
   readonly #book: InventoryBook;
   readonly #journal: ReservationJournal;
   #faulted = false;
+  /** Resolves true iff every append decided so far has succeeded. Never rejects. */
+  #acknowledged: Promise<boolean> = Promise.resolve(true);
 
   constructor(book: InventoryBook, journal: ReservationJournal) {
     this.#book = book;
@@ -154,19 +164,29 @@ export class ReservationService {
     // Check and apply: one synchronous step. NO await may precede this line.
     const result = apply();
     if (!result.ok) return result;
-    let appended: Promise<void>;
+    // Register this mutation's slot in the acknowledgement chain BEFORE the
+    // journal is invoked (a reentrant mutation made inside `append` must
+    // depend on this one).
+    let settle: (persisted: boolean) => void = () => undefined;
+    const own = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    const chained = Promise.all([this.#acknowledged, own]).then(([before, mine]) => before && mine);
+    this.#acknowledged = chained;
     try {
-      appended = this.#journal.append(toEvent(result.value));
+      Promise.resolve(this.#journal.append(toEvent(result.value))).then(
+        () => settle(true),
+        () => {
+          this.#faulted = true;
+          settle(false);
+        },
+      );
     } catch {
       this.#faulted = true;
-      return journalFailed();
+      settle(false);
     }
-    try {
-      await appended;
-    } catch {
-      this.#faulted = true;
-      return journalFailed();
-    }
+    const persisted = await chained;
+    if (!persisted || this.#faulted) return journalFailed();
     return result;
   }
 }
@@ -174,6 +194,6 @@ export class ReservationService {
 function journalFailed<T>(): InventoryResult<T> {
   return refuse(
     "INVENTORY_JOURNAL_FAILED",
-    "the journal rejected the event; the in-memory effect stands (fail-closed) and the service is now faulted",
+    "the journal rejected this or an earlier event (or the service faulted meanwhile); the in-memory effect stands (fail-closed) and the service is faulted",
   );
 }

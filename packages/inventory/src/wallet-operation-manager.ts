@@ -42,7 +42,33 @@
  * RECONCILING. While UNKNOWN or RECONCILING the operation's reservations stay
  * held and its effects are not asserted (ADR-006 §8). Only
  * {@link WalletOperationManager.resolveByReconciliation} with authoritative
- * evidence leaves RECONCILING; there is no timeout.
+ * evidence leaves RECONCILING; there is no timeout. The manager is ready to
+ * accept that evidence DURING the request call itself, so a requester that
+ * answers synchronously is honoured (the operation passes through RECONCILING
+ * to the answer); if the request cannot be delivered and nothing answered it,
+ * the operation stays UNKNOWN with the request queued for
+ * {@link WalletOperationManager.retryReconciliationRequests}.
+ *
+ * OBSERVATIONS DURING SUBMISSION. An observation that arrives while the
+ * executor call is still pending is buffered (classified on arrival) and
+ * applied, in arrival order, once the executor answers SUBMITTED. If the
+ * executor answers NOT_SENT but observations arrived meanwhile, the evidence
+ * conflicts and the operation goes UNKNOWN (never FAILED).
+ *
+ * TRANSACTION IDENTITY. The first known transaction hash and relayer id are
+ * the operation's identity. Any later observation or reconciliation evidence
+ * naming a DIFFERENT hash or id is conflicting evidence: an observation moves
+ * the operation to UNKNOWN (reconciliation requested, holds kept), and
+ * reconciliation evidence is refused (`WALLET_OP_EVIDENCE_CONFLICT`), leaving
+ * the operation RECONCILING. A known identity is never overwritten or cleared.
+ *
+ * RECOGNITION BOUNDARY. From submission until the operation resolves
+ * (CONFIRMED or FAILED), every line it touches is under an in-flight hold in
+ * the book ({@link InventoryBook.holdForOperation}), so an authoritative
+ * balance read of those lines is refused and the operation's effect is
+ * recognised exactly once: as deltas on confirmation, or — after a
+ * reconciled confirmation, which applies no deltas — inside the next balance
+ * read.
  */
 
 import { compareDecimal, type DecimalString } from "@polymarket-bot/decimal";
@@ -173,6 +199,10 @@ export interface WalletOperationView {
   readonly transactionId: string | null;
   /** Whether confirmed effects were applied as deltas (false: lines await an observation). */
   readonly effectsApplied: boolean;
+  /** Whether the executor call is still pending. */
+  readonly submitting: boolean;
+  /** Observations received during submission and not yet applied. */
+  readonly bufferedObservations: number;
 }
 
 interface Operation {
@@ -183,20 +213,25 @@ interface Operation {
   transactionId: string | null;
   effectsApplied: boolean;
   submitting: boolean;
+  /** A reconciliation request for this operation is being delivered right now. */
+  requesting: boolean;
+  /** The in-flight hold id while one is in place in the book. */
+  holdId: string | null;
+  readonly buffered: Classified[];
   ordinal: number;
 }
 
 type Classified =
   | { readonly kind: "NOT_SENT" }
   | { readonly kind: "SUBMITTED"; readonly transactionHash: string | null; readonly transactionId: string | null }
-  | { readonly kind: "MINED"; readonly transactionHash: string }
+  | { readonly kind: "MINED"; readonly transactionHash: string; readonly transactionId: string | null }
   | {
       readonly kind: "CONFIRMED";
       readonly transactionHash: string;
       readonly transactionId: string | null;
       readonly credited: DecimalString | null;
     }
-  | { readonly kind: "FAILED" }
+  | { readonly kind: "FAILED"; readonly transactionHash: string | null; readonly transactionId: string | null }
   | { readonly kind: "UNRECOGNISED"; readonly why: string };
 
 const CREDIT_EVIDENCE_TYPES: readonly WalletOperationType[] = ["REDEEM", "WRAP_COLLATERAL", "UNWRAP_COLLATERAL"];
@@ -265,6 +300,9 @@ export class WalletOperationManager {
       transactionId: null,
       effectsApplied: false,
       submitting: false,
+      requesting: false,
+      holdId: null,
+      buffered: [],
       ordinal: 0,
     };
     this.#operations.set(plan.operationId, operation);
@@ -284,25 +322,44 @@ export class WalletOperationManager {
     }
     // Claimed synchronously: a concurrent second submit is refused above.
     operation.submitting = true;
+    // From here the operation may leave the process: its lines are in flight.
+    this.#beginHold(operation);
     let raw: unknown;
     try {
       raw = await this.#executor.submit(operation.plan);
     } catch {
       operation.submitting = false;
-      this.#toUnknown(operation, "the executor threw; the submission's fate is unknown");
+      this.#toUnknown(operation, `the executor threw; the submission's fate is unknown${this.#bufferedNote(operation)}`);
       return ok(view(operation));
     }
     operation.submitting = false;
     const result = classifySubmit(raw);
     if (result.kind === "NOT_SENT") {
-      this.#transition(operation, "FAILED", "executor: NOT_SENT (nothing left the process)");
-      this.#releaseAll(operation);
+      if (operation.buffered.length > 0) {
+        // Something was observed about this operation while the executor said
+        // nothing left the process: conflicting evidence, never assumed.
+        this.#toUnknown(operation, `executor: NOT_SENT contradicted${this.#bufferedNote(operation)}`);
+      } else {
+        this.#transition(operation, "FAILED", "executor: NOT_SENT (nothing left the process)");
+        this.#releaseAll(operation);
+        this.#endHold(operation);
+      }
     } else if (result.kind === "SUBMITTED") {
       operation.transactionHash = result.transactionHash;
       operation.transactionId = result.transactionId;
       this.#transition(operation, "SUBMITTED", "executor: SUBMITTED");
+      const buffered = operation.buffered.splice(0);
+      for (const outcome of buffered) {
+        // Re-read the state: each applied outcome may have moved it.
+        const current: WalletOperationState = stateOf(operation);
+        if (current !== "SUBMITTED" && current !== "MINED") break;
+        this.#applyOutcome(operation, outcome, "observation (received during submission)");
+      }
     } else {
-      this.#toUnknown(operation, `unrecognised executor result: ${result.kind === "UNRECOGNISED" ? result.why : result.kind}`);
+      this.#toUnknown(
+        operation,
+        `unrecognised executor result: ${result.kind === "UNRECOGNISED" ? result.why : result.kind}${this.#bufferedNote(operation)}`,
+      );
     }
     return ok(view(operation));
   }
@@ -315,6 +372,12 @@ export class WalletOperationManager {
   observe(operationId: string, observation: unknown): InventoryResult<WalletOperationView> {
     const operation = this.#operations.get(operationId);
     if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
+    if (operation.state === "PLANNED" && operation.submitting) {
+      // The executor has not answered yet; the observation is kept, classified
+      // now, and applied once it does (see the header).
+      operation.buffered.push(classifyObservation(observation));
+      return ok(view(operation));
+    }
     if (operation.state !== "SUBMITTED" && operation.state !== "MINED") {
       return refuse(
         "WALLET_OP_ILLEGAL_TRANSITION",
@@ -337,7 +400,10 @@ export class WalletOperationManager {
   resolveByReconciliation(operationId: string, evidence: unknown): InventoryResult<WalletOperationView> {
     const operation = this.#operations.get(operationId);
     if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
-    if (operation.state !== "RECONCILING") {
+    // An UNKNOWN operation whose reconciliation request is being delivered
+    // right now is ready for the answer (a synchronous requester).
+    const answeringRequest = operation.state === "UNKNOWN" && operation.requesting;
+    if (operation.state !== "RECONCILING" && !answeringRequest) {
       return refuse("WALLET_OP_ILLEGAL_TRANSITION", "only a RECONCILING operation is resolved by reconciliation", {
         operationId,
         state: operation.state,
@@ -350,33 +416,41 @@ export class WalletOperationManager {
     }
     const state = ownData(evidence, "state");
     const classified = classifyObservation({ ...plainCopy(evidence), status: state });
-    if (classified.kind === "SUBMITTED" || classified.kind === "MINED") {
-      if (classified.kind === "MINED") operation.transactionHash = classified.transactionHash;
-      else {
-        operation.transactionHash = classified.transactionHash;
-        operation.transactionId = classified.transactionId;
-      }
-      this.#transition(operation, classified.kind, "reconciliation: still in flight");
-      return ok(view(operation));
+    if (classified.kind === "NOT_SENT" || classified.kind === "UNRECOGNISED") {
+      return refuse("WALLET_OP_EVIDENCE_REQUIRED", "evidence is inconclusive; the operation stays RECONCILING", {
+        operationId,
+        state: typeof state === "string" ? state : null,
+      });
     }
-    if (classified.kind === "FAILED") {
-      this.#transition(operation, "FAILED", "reconciliation: FAILED");
-      this.#releaseAll(operation);
-      return ok(view(operation));
+    const conflict = identityConflict(operation, classified.transactionHash, classified.transactionId);
+    if (conflict !== null) {
+      return refuse(
+        "WALLET_OP_EVIDENCE_CONFLICT",
+        "reconciliation evidence names a different transaction than the one known; the operation stays under reconciliation and its holds stay",
+        { operationId, field: conflict },
+      );
     }
-    if (classified.kind === "CONFIRMED") {
-      operation.transactionHash = classified.transactionHash;
-      operation.transactionId = classified.transactionId;
-      this.#transition(operation, "CONFIRMED", "reconciliation: CONFIRMED");
-      this.#recordApprovalIfAny(operation);
-      this.#releaseAll(operation);
-      this.#awaitObservation(operation);
-      return ok(view(operation));
+    if (answeringRequest) this.#transition(operation, "RECONCILING", "reconciliation requested (answered synchronously)");
+    adoptIdentity(operation, classified.transactionHash, classified.transactionId);
+    switch (classified.kind) {
+      case "SUBMITTED":
+      case "MINED":
+        this.#transition(operation, classified.kind, "reconciliation: still in flight");
+        break;
+      case "FAILED":
+        this.#transition(operation, "FAILED", "reconciliation: FAILED");
+        this.#releaseAll(operation);
+        this.#endHold(operation);
+        break;
+      case "CONFIRMED":
+        this.#transition(operation, "CONFIRMED", "reconciliation: CONFIRMED");
+        this.#recordApprovalIfAny(operation);
+        this.#releaseAll(operation);
+        this.#awaitObservation(operation);
+        this.#endHold(operation);
+        break;
     }
-    return refuse("WALLET_OP_EVIDENCE_REQUIRED", "evidence is inconclusive; the operation stays RECONCILING", {
-      operationId,
-      state: typeof state === "string" ? state : null,
-    });
+    return ok(view(operation));
   }
 
   /** Retry reconciliation requests the requester refused earlier. */
@@ -384,13 +458,14 @@ export class WalletOperationManager {
     const pending = this.#outstandingRequests.splice(0);
     let delivered = 0;
     for (const request of pending) {
-      if (this.#request(request)) {
-        delivered += 1;
-        const operation = this.#operations.get(request.walletOperationId);
-        if (request.trigger === WALLET_OPERATION_UNKNOWN_TRIGGER && operation?.state === "UNKNOWN") {
-          this.#transition(operation, "RECONCILING", "reconciliation requested (retry)");
-        }
+      const operation = this.#operations.get(request.walletOperationId);
+      if (request.trigger === WALLET_OPERATION_UNKNOWN_TRIGGER && operation !== undefined) {
+        if (operation.state !== "UNKNOWN") continue; // already answered
+        if (this.#requestReconciliation(operation, request, "reconciliation requested (retry)")) delivered += 1;
+        continue;
       }
+      if (this.#deliver(request)) delivered += 1;
+      else this.#outstandingRequests.push(request);
     }
     return delivered;
   }
@@ -413,25 +488,32 @@ export class WalletOperationManager {
   // -------------------------------------------------------------- internal --
 
   #applyOutcome(operation: Operation, outcome: Classified, via: string): void {
+    if (outcome.kind === "SUBMITTED" || outcome.kind === "MINED" || outcome.kind === "CONFIRMED" || outcome.kind === "FAILED") {
+      const conflict = identityConflict(operation, outcome.transactionHash, outcome.transactionId);
+      if (conflict !== null) {
+        this.#toUnknown(operation, `${via}: ${outcome.kind} under a different ${conflict}; conflicting evidence is never assumed`);
+        return;
+      }
+    }
     switch (outcome.kind) {
       case "MINED":
-        if (operation.state === "MINED") {
-          // A repeated MINED report is idempotent only for the same transaction.
-          if (operation.transactionHash !== outcome.transactionHash) {
-            this.#toUnknown(operation, `${via}: MINED under a different transaction hash`);
-          }
-          return;
-        }
-        operation.transactionHash = outcome.transactionHash;
-        this.#transition(operation, "MINED", `${via}: MINED`);
+        adoptIdentity(operation, outcome.transactionHash, outcome.transactionId);
+        // A repeated MINED report (same identity, checked above) changes nothing.
+        if (operation.state !== "MINED") this.#transition(operation, "MINED", `${via}: MINED`);
         return;
       case "SUBMITTED":
         // A repeated SUBMITTED report changes nothing; after MINED it is a regression.
-        if (operation.state !== "SUBMITTED") this.#toUnknown(operation, `${via}: SUBMITTED after MINED`);
+        if (operation.state !== "SUBMITTED") {
+          this.#toUnknown(operation, `${via}: SUBMITTED after MINED`);
+          return;
+        }
+        adoptIdentity(operation, outcome.transactionHash, outcome.transactionId);
         return;
       case "FAILED":
+        adoptIdentity(operation, outcome.transactionHash, outcome.transactionId);
         this.#transition(operation, "FAILED", `${via}: FAILED`);
         this.#releaseAll(operation);
+        this.#endHold(operation);
         return;
       case "CONFIRMED": {
         const needsCredit = CREDIT_EVIDENCE_TYPES.includes(operation.plan.type);
@@ -439,20 +521,25 @@ export class WalletOperationManager {
           this.#toUnknown(operation, `${via}: CONFIRMED without the observed credited amount; not assumed`);
           return;
         }
-        operation.transactionHash = outcome.transactionHash;
-        operation.transactionId = outcome.transactionId;
+        adoptIdentity(operation, outcome.transactionHash, outcome.transactionId);
         this.#transition(operation, "CONFIRMED", `${via}: CONFIRMED`);
         this.#recordApprovalIfAny(operation);
         if (!this.#applyConfirmedDeltas(operation, outcome.credited)) {
+          // Defensive: while the operation is in flight its lines refuse
+          // balance reads, so its debits should always fit.
           this.#releaseAll(operation);
           this.#awaitObservation(operation);
-          this.#request({
+          this.#endHold(operation);
+          const request: ReconciliationRequest = {
             trigger: "POSITION_BALANCE_DISCREPANCY",
             walletOperationId: operation.plan.operationId,
             accountRef: operation.plan.accountRef,
             reason: "confirmed wallet operation's deltas do not fit the book; lines await an authoritative read",
-          });
+          };
+          if (!this.#deliver(request)) this.#outstandingRequests.push(request);
+          return;
         }
+        this.#endHold(operation);
         return;
       }
       default:
@@ -585,23 +672,67 @@ export class WalletOperationManager {
 
   #toUnknown(operation: Operation, reason: string): void {
     this.#transition(operation, "UNKNOWN", reason);
-    const delivered = this.#request({
-      trigger: WALLET_OPERATION_UNKNOWN_TRIGGER,
-      walletOperationId: operation.plan.operationId,
-      accountRef: operation.plan.accountRef,
-      reason,
-    });
-    if (delivered) this.#transition(operation, "RECONCILING", "reconciliation requested");
+    this.#requestReconciliation(
+      operation,
+      {
+        trigger: WALLET_OPERATION_UNKNOWN_TRIGGER,
+        walletOperationId: operation.plan.operationId,
+        accountRef: operation.plan.accountRef,
+        reason,
+      },
+      "reconciliation requested",
+    );
   }
 
-  #request(request: ReconciliationRequest): boolean {
+  /**
+   * Deliver an UNKNOWN operation's reconciliation request. While the call is
+   * in progress the operation accepts {@link resolveByReconciliation} (a
+   * synchronous answer). Afterwards, if nothing answered it: delivered →
+   * RECONCILING; not delivered → stays UNKNOWN with the request queued.
+   */
+  #requestReconciliation(operation: Operation, request: ReconciliationRequest, reason: string): boolean {
+    operation.requesting = true;
+    let delivered: boolean;
+    try {
+      delivered = this.#deliver(request);
+    } finally {
+      operation.requesting = false;
+    }
+    if (operation.state !== "UNKNOWN") return delivered; // answered during the call
+    if (delivered) this.#transition(operation, "RECONCILING", reason);
+    else this.#outstandingRequests.push(request);
+    return delivered;
+  }
+
+  #deliver(request: ReconciliationRequest): boolean {
     try {
       this.#reconciler.request(Object.freeze({ ...request }));
       return true;
     } catch {
-      this.#outstandingRequests.push(request);
       return false;
     }
+  }
+
+  #beginHold(operation: Operation): void {
+    const assetIds = this.#touchedAssets(operation);
+    if (assetIds.length === 0) return;
+    const holdId = compositeKey("wallet-op", operation.plan.operationId);
+    const held = this.#book.holdForOperation({ holdId, accountRef: operation.plan.accountRef, assetIds });
+    if (!held.ok) throw new Error(`wallet-operation invariant: hold refused (${held.refusal.code})`);
+    operation.holdId = holdId;
+  }
+
+  #endHold(operation: Operation): void {
+    if (operation.holdId === null) return;
+    this.#book.releaseOperationHold(operation.holdId);
+    operation.holdId = null;
+  }
+
+  #bufferedNote(operation: Operation): string {
+    const count = operation.buffered.length;
+    if (count === 0) return "";
+    operation.buffered.length = 0;
+    return ` (${String(count)} observation(s) received during submission; not applied)`;
   }
 
   #transition(operation: Operation, to: WalletOperationState, reason: string): void {
@@ -801,6 +932,41 @@ function nullableString(source: unknown, key: string): string | null | undefined
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/**
+ * An optional identity field: absent or null → null; a non-empty string →
+ * itself; anything else (malformed) → undefined.
+ */
+function optionalIdentity(source: unknown, key: string): string | null | undefined {
+  const descriptor =
+    source !== null && typeof source === "object" ? Object.getOwnPropertyDescriptor(source, key) : undefined;
+  if (descriptor === undefined) return null;
+  if (!("value" in descriptor)) return undefined;
+  const value: unknown = descriptor.value;
+  if (value === null || value === undefined) return null;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Which known identity field the evidence contradicts, if any. */
+function identityConflict(
+  operation: Operation,
+  transactionHash: string | null,
+  transactionId: string | null,
+): "transaction hash" | "relayer transaction id" | null {
+  if (transactionHash !== null && operation.transactionHash !== null && transactionHash !== operation.transactionHash) {
+    return "transaction hash";
+  }
+  if (transactionId !== null && operation.transactionId !== null && transactionId !== operation.transactionId) {
+    return "relayer transaction id";
+  }
+  return null;
+}
+
+/** Learn identity fields not yet known; a known field is never overwritten or cleared. */
+function adoptIdentity(operation: Operation, transactionHash: string | null, transactionId: string | null): void {
+  if (operation.transactionHash === null && transactionHash !== null) operation.transactionHash = transactionHash;
+  if (operation.transactionId === null && transactionId !== null) operation.transactionId = transactionId;
+}
+
 /** Classify an executor `submit` result. Only two shapes are recognised. */
 export function classifySubmit(raw: unknown): Classified {
   const status = ownData(raw, "status");
@@ -827,24 +993,32 @@ export function classifyObservation(raw: unknown): Classified {
       return classifySubmit(raw);
     case "MINED": {
       const transactionHash = nullableString(raw, "transactionHash");
-      return typeof transactionHash === "string"
-        ? { kind: "MINED", transactionHash }
-        : { kind: "UNRECOGNISED", why: "MINED without a transaction hash" };
+      const transactionId = optionalIdentity(raw, "transactionId");
+      if (typeof transactionHash !== "string") return { kind: "UNRECOGNISED", why: "MINED without a transaction hash" };
+      if (transactionId === undefined) return { kind: "UNRECOGNISED", why: "MINED with a malformed transactionId" };
+      return { kind: "MINED", transactionHash, transactionId };
     }
     case "CONFIRMED": {
       // TransactionOutcome: transactionHash: TxHash; transactionId: TransactionId | null.
       const transactionHash = nullableString(raw, "transactionHash");
-      const transactionIdRaw = nullableString(raw, "transactionId");
+      const transactionIdRaw = optionalIdentity(raw, "transactionId");
       if (typeof transactionHash !== "string") {
         return { kind: "UNRECOGNISED", why: "CONFIRMED without a transaction hash" };
       }
+      if (transactionIdRaw === undefined) return { kind: "UNRECOGNISED", why: "CONFIRMED with a malformed transactionId" };
       const creditedRaw = ownData(raw, "credited");
       const credited = creditedRaw === undefined ? null : ownNonNegativeAmount(raw, "credited");
       if (credited === undefined) return { kind: "UNRECOGNISED", why: "CONFIRMED with a malformed credited amount" };
-      return { kind: "CONFIRMED", transactionHash, transactionId: transactionIdRaw ?? null, credited };
+      return { kind: "CONFIRMED", transactionHash, transactionId: transactionIdRaw, credited };
     }
-    case "FAILED":
-      return { kind: "FAILED" };
+    case "FAILED": {
+      const transactionHash = optionalIdentity(raw, "transactionHash");
+      const transactionId = optionalIdentity(raw, "transactionId");
+      if (transactionHash === undefined || transactionId === undefined) {
+        return { kind: "UNRECOGNISED", why: "FAILED with a malformed transaction identity" };
+      }
+      return { kind: "FAILED", transactionHash, transactionId };
+    }
     default:
       return { kind: "UNRECOGNISED", why: typeof status === "string" ? `status ${status}` : "no status" };
   }
@@ -860,6 +1034,10 @@ function plainCopy(source: unknown): Record<string, unknown> {
   return copy;
 }
 
+function stateOf(operation: Operation): WalletOperationState {
+  return operation.state;
+}
+
 function view(operation: Operation): WalletOperationView {
   return Object.freeze({
     operationId: operation.plan.operationId,
@@ -871,5 +1049,7 @@ function view(operation: Operation): WalletOperationView {
     transactionHash: operation.transactionHash,
     transactionId: operation.transactionId,
     effectsApplied: operation.effectsApplied,
+    submitting: operation.submitting,
+    bufferedObservations: operation.buffered.length,
   });
 }
