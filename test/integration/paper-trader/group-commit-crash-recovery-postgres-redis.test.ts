@@ -312,7 +312,10 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
     referenceProcess.child.kill("SIGKILL");
     await referenceProcess.exit;
     const referenceRows = await durableRows(reference.databaseUrl, reference.runId, mintedIds(reference.document));
-    expect(referenceRows.decisions.length).toBeGreaterThan(1_000);
+    // `THROUGHPUT-2` (ADR-024): one decision per venue frame — the sample's 928
+    // (`throughput-bench-harness-postgres-redis.test.ts` pins the same count;
+    // before frames it was one per event, 1,837, and this line read "> 1,000").
+    expect(referenceRows.decisions.length).toBe(928);
     await reference.publisher.close();
 
     // --- 2. the crash run: A consumed and recorded, B in flight -----------------

@@ -240,8 +240,19 @@ describe("fail-closed on the real transport is intact (THROUGHPUT-1b)", () => {
     // halted, so the published prefix is at most envelopes 0..300 (index 300
     // is the admission that froze the hop, which may itself have been the
     // run in flight). Exactly where in that range it ends is timing.
+    //
+    // `THROUGHPUT-2` (ADR-024, frame-atomic runs): a run is never cut inside a
+    // raw frame, so the run in flight may carry index 300's WHOLE frame —
+    // here indices 300 and 301 share one `causationId` (the recorded
+    // two-token `price_change`). The bound is therefore the end of that frame
+    // (302 envelopes, 0..301), still before anything admitted after it.
+    let frameEnd = 301;
+    while (envelopes[frameEnd]?.causationId !== undefined && envelopes[frameEnd]?.causationId === envelopes[300]?.causationId) {
+      frameEnd += 1;
+    }
+    expect(frameEnd).toBe(302);
     expect(result.published).toBeGreaterThan(200);
-    expect(result.published).toBeLessThanOrEqual(301);
+    expect(result.published).toBeLessThanOrEqual(frameEnd);
     expect(BigInt(ingestSeqsOf(entries).at(-1) ?? "0") < BigInt(halt.haltedAtIngestSeq)).toBe(true);
   }, 60_000);
 
@@ -261,13 +272,17 @@ describe("fail-closed on the real transport is intact (THROUGHPUT-1b)", () => {
     });
 
     // Admitted in one synchronous turn, as the dispatcher admits a frame's
-    // events: the first starts the pump and goes out alone; the other seven
-    // queue behind its round trip and go as ONE batch when it lands.
+    // events. `THROUGHPUT-1b`: the first started the pump and went out alone,
+    // and the other seven went as ONE batch behind it. `THROUGHPUT-2`
+    // (ADR-024, frame-atomic runs): the first envelope names a raw frame, so
+    // the pump waits one microtask before cutting its first run, and all
+    // eight — everything admitted in the turn — go as ONE batch. The refusal
+    // inside it behaves exactly as before.
     const outcomes = envelopes.map((envelope) => publisher.enqueue(envelope));
     const settled = await Promise.all(outcomes);
     await publisher.settle();
 
-    expect(publisher.metrics().largestSubmission).toBe(7);
+    expect(publisher.metrics().largestSubmission).toBe(8);
     expect(settled.map((outcome) => (outcome.published ? "published" : outcome.reason))).toStrictEqual([
       "published",
       "published",
