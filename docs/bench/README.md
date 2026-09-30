@@ -1,0 +1,3 @@
+# Benchmark results
+
+This directory holds measured results from a named host, one Markdown file per measurement campaign: `host-bench-laptop-<YYYY-MM-DD>.md` from [`docs/runbooks/laptop-host-bench.md`](../runbooks/laptop-host-bench.md), with any small raw summaries it cites in a sibling directory of the same name. Each file records the exact code commit, the commands (redacted) and the host, and it is written on a `host-bench-results-<YYYY-MM-DD>` branch that the orchestrator reviews before merging. Full raw outputs stay on the measuring host (`~/pmb-host-bench/`) and are never committed; the tools that produce them are in [`tools/bench/host/`](../../tools/bench/host/README.md) and [`tools/bench/trader-throughput/`](../../tools/bench/trader-throughput/README.md).
