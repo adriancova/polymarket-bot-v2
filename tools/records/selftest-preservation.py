@@ -234,7 +234,7 @@ MUTATIONS = [
     ("queue a BOOT-1 residual under an id the brief does not name", f"{ARCH}/REWRITES.md",
      lambda t: t.replace("`BOOT1-R6`, `BOOT1-R11`; listed", "`BOOT1-R99`, `BOOT1-R11`; listed", 1), "C", "C12: BOOT-1: queued 'BOOT1-R99'"),
     ("close REGISTER-1's residual by a package that is not Complete", f"{ARCH}/REWRITES.md",
-     lambda t: t.replace("complete-row `REGISTER-1` — closed-by `OUTAGE-2`", "complete-row `REGISTER-1` — closed-by `THROUGHPUT-2`", 1),
+     lambda t: t.replace("complete-row `REGISTER-1` — closed-by `OUTAGE-2`", "complete-row `REGISTER-1` — closed-by `THROUGHPUT-1c`", 1),
      "C", "not a Complete package in the brief"),
     ("point SER-2's disposition at an entry with no excerpt of its row", f"{ARCH}/REWRITES.md",
      lambda t: t.replace("73-73 complete-row `SER-2` — carried RW-123\n", "73-73 complete-row `SER-2` — carried RW-124\n", 1),
@@ -298,9 +298,9 @@ MUTATIONS = [
     ("delete the drop line that names SER-1's handoff path", f"{ARCH}/REWRITES.md",
      drop_line(r"^Residuals \(owned, `docs/handoffs/SER-1.md`\) => "), "C", "C16: complete-row SER-1 (72-72)"),
     ("the WP-110 completion record back to 'archive only' in the move map (CX-R5-03)", f"{ARCH}/MOVE-MAP.md",
-     lambda t: re.sub(r"(\| ### WP-110 completion record \(2026-08-31\) \| 1142 \| \[[^]]+\]\([^)]+\) \| )[^\n]*",
+     lambda t: re.sub(r"(\| ### WP-110 completion record \(2026-08-31\) \| 1151 \| \[[^]]+\]\([^)]+\) \| )[^\n]*",
                       lambda m: m.group(1) + "archive only |", t, count=1),
-     "C", "C5: MOVE-MAP.md's line for the heading at line 1142 does not name RW-132"),
+     "C", "C5: MOVE-MAP.md's line for the heading at line 1151 does not name RW-132"),
     ("the ALLOC-1 row without its brief entry in the move map (CX-R5-03)", f"{ARCH}/MOVE-MAP.md",
      lambda t: t.replace("| Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-115) |",
                          "| Work packages (own row) |", 1),
@@ -317,8 +317,8 @@ BRIEF_MUTATIONS = [
      lambda t: t.replace("| a tooling round |", "| — |", 1), "K5:"),
     ("a completed track in the residual table", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("| `§5 item 6` |", "| `H8 track` | Complete (B3 closed). | the user |\n| `§5 item 6` |", 1), "K9:"),
-    ("drop the green CI gate from VENUE-3", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("  - Gate: the Fable adversarial review (re-fetch) and a green CI run on GitHub.\n", "", 1), "K13:"),
+    ("drop the green CI gate from THROUGHPUT-1c", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace(", the user's ADR-023 ratification, and a green CI run on GitHub.\n", ", and the user's ADR-023 ratification.\n", 1), "K13:"),
     ("AGENTS.md without 'frozen'", "AGENTS.md",
      lambda t: t.replace("archived, verbatim and frozen, under", "archived verbatim under", 1), "K11:"),
     ("README rule 10 back to 'add one line'", "docs/handoffs/README.md",
@@ -333,8 +333,8 @@ BRIEF_MUTATIONS = [
      lambda t: t.replace("the evidence gate is unmet until the ≥24h soak (H4) |",
                          "evidence pending: the ≥24h soak (H4); the gate is open |", 1), "K15:"),
     ("a ruling that does not say what it ruled", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("The user ruled on 2026-09-30 that `THROUGHPUT-2` evaluates once per frame.",
-                         "Ruled by the user 2026-09-30.", 1), "K16:"),
+     lambda t: t.replace("- **H5**: ruled 2026-09-28: one demonstrated run.",
+                         "- **H5**: Ruled by the user 2026-09-28.", 1), "K16:"),
     ("B5 narrates the record", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("No test validates the scrape fragment (`infra/prometheus/control-api-scrape.yaml`).",
                          "The row also records that no test validates the scrape fragment.", 1), "K17:"),
@@ -351,8 +351,8 @@ BRIEF_MUTATIONS = [
     ("the Wave 3 intro says 'starts' (a commitment) instead of 'may start'", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("The orchestrator may start `WP-260` first,", "The orchestrator starts `WP-260` first,", 1), "K19:"),
     ("the Archive intro back to 'Everything below was moved verbatim'", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("The whole file at `f43efe6` is archived verbatim in these files.",
-                         "Everything below was moved verbatim from this file at `f43efe6`.", 1), "K20:"),
+     lambda t: t.replace("The whole file at `8fde4df` is archived verbatim in these files.",
+                         "Everything below was moved verbatim from this file at `8fde4df`.", 1), "K20:"),
     ("REWRITES.md's intro without C11", f"{ARCH}/REWRITES.md",
      lambda t: t.replace("- each archive file named in a Facts account holds at least one of that entry's old or excerpt lines (C11);\n", "", 1), "K21:"),
     ("REWRITES.md's intro without C14 and C15", f"{ARCH}/REWRITES.md",
@@ -374,7 +374,7 @@ BRIEF_MUTATIONS = [
     ("the SER-3 bullet writes a bare N4 again", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("SER-3's N4, the one sentence owed", "**N4**, the one sentence owed", 1), "K24:"),
     ("the Complete-row subsection intro without its citation pin", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("under Work packages. File:line citations are as of `f43efe6`. The disposition", "under Work packages. The disposition", 1), "K25:"),
+     lambda t: t.replace("under Work packages. File:line citations are as of `8fde4df`. The disposition", "under Work packages. The disposition", 1), "K25:"),
     # r5
     ("the WP-110 bullet lists the payoff_model divergence as owed again (CX-R5-02)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace(" A `MarketClosed`-equivalent venue signal remains unconfirmed.",
@@ -423,7 +423,7 @@ BRIEF_MUTATIONS = [
                          " predicted-vs-actual (WP-290/phase-4) and markout (a future simulation/research grant). ", "", 1), "K32:"),
     # r7
     ("the FOLD-PNL2TOKEN cite back at loop.ts about :2607-2612 (D3)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("(`packages/trading-core/src/loop.ts:2958-2962`, in `#stagePnlSnapshot`)", "(`loop.ts` about :2607-2612)", 1), "K33:"),
+     lambda t: t.replace("(`packages/trading-core/src/loop.ts:3118-3122`, in `#stagePnlSnapshot`)", "(`loop.ts` about :2607-2612)", 1), "K33:"),
     ("the N2 cite back at book.ts:191 and :265 (D3)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("`book.ts:284` and `:361`", "`book.ts:191` and `:265`", 1), "K33:"),
     ("an unregistered file:line citation (D3)", "IMPLEMENTATION_STATUS.md",
@@ -478,6 +478,32 @@ def git(repo, *args, env=None, stdin=None):
                           env=env, input=stdin).stdout.strip()
 
 
+def rebase_blocks(text, old_cut, new_cut, at=5):
+    """Move the blocks that name the current cut to the synthetic cut, one line lower from line `at` on.
+
+    This is what a maintainer does at a real re-cut for blocks that name an earlier
+    re-cut (README, "Re-cutting after edits on `main`"): only the rewrites-base
+    blocks keep their numbers.
+    """
+    shift = lambda n: n + 1 if n >= at else n  # noqa: E731
+    out, in_decl = [], False
+    for line in text.split("\n"):
+        m = re.match(r"^~~~(old|excerpt|drop|unpaired) base=" + old_cut + r"(?: lines=(\d+)-(\d+))?$", line)
+        if m:
+            line = f"~~~{m.group(1)} base={new_cut}"
+            if m.group(2):
+                line += f" lines={shift(int(m.group(2)))}-{shift(int(m.group(3)))}"
+            in_decl = m.group(1) == "unpaired"
+        elif in_decl and line == "~~~":
+            in_decl = False
+        elif in_decl:
+            d = re.match(r"^(\d+)-(\d+)( .*)$", line)
+            if d:
+                line = f"{shift(int(d.group(1)))}-{shift(int(d.group(2)))}{d.group(3)}"
+        out.append(line)
+    return "\n".join(out)
+
+
 def recut(repo, tmp, base, declare):
     """A synthetic re-cut: insert one line above the first rewritten region, then re-split and re-map.
 
@@ -503,6 +529,9 @@ def recut(repo, tmp, base, declare):
     shadow(repo, root)
     subprocess.run([sys.executable, SPLIT, "--base", cut, "--repo", clone, "--out", os.path.join(root, ARCH)],
                    check=True, capture_output=True)
+    full = git(clone, "rev-parse", base)
+    if f"base={full}" in open(os.path.join(root, ARCH, "REWRITES.md"), encoding="utf-8").read():
+        edit(os.path.join(root, ARCH, "REWRITES.md"), lambda t: rebase_blocks(t, full, cut))
     subprocess.run([sys.executable, MOVEMAP, "--base", cut, "--repo", clone, "--root", root], check=True, capture_output=True)
     if declare:
         edit(os.path.join(root, ARCH, "REWRITES.md"),

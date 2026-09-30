@@ -52,7 +52,7 @@ A row that names owned or carried residuals needs more than `none:` (C12). A `re
 
 **Closed in the base.** For a `closed-row`, C8 takes the base row as closed when a one-line row's last cell begins with a bold closure word (CLOSED, COMPLETE, DONE, RULED, DISCHARGED, MOOT, RATIFIED, SUPERSEDED), when a multi-line row holds such a bold phrase, or when the id is a package that is Complete in the base.
 
-A row that is closed in part and still carries such a marker can pass this test while open. For example, `H1R1-FRAME-ATOMICITY` is RULED, yet open until `THROUGHPUT-2`. The brief's open tables and the pairing rule catch it only if the brief still lists it. That remains a review question.
+A row that is closed in part and still carries such a marker can pass this test while open. For example, at the first cut `H1R1-FRAME-ATOMICITY` was RULED, yet open until `THROUGHPUT-2` merged. The brief's open tables and the pairing rule catch it only if the brief still lists it. That remains a review question.
 
 ~~~unpaired
 1-1 verbatim
@@ -320,6 +320,16 @@ A row that is closed in part and still carries such a marker can pass this test 
 2935-2940 verbatim
 ~~~
 
+**The re-cut at `8fde4df`.** After the first cut, `main` edited the old file in three commits: `8fc0eb1` (the `LOGS-1` row), `9d270a9` (`VENUE-3` Complete, and four `V3-*` residual rows) and `d2ab6dc` (`THROUGHPUT-2` Complete). Each inserted or changed line is covered at the re-cut:
+
+- RW-144 pairs the `VENUE-3` row, RW-145 the `LOGS-1` row, and RW-146 to RW-149 the four `V3-*` rows;
+- the block below declares the `THROUGHPUT-2` row, whose live residuals RW-143 carries;
+- no completion record was added or changed, so no new `record-item` is owed (C14).
+
+~~~unpaired base=8fde4dffa9546dc7570f1e53653242c568669c58
+738-755 complete-row `THROUGHPUT-2` — carried RW-143
+~~~
+
 - New navigation text with no old counterpart: the brief's intro paragraph, the "Authorized now" intro, the Work packages intro, the Open blockers pointers, the Venue drift intro and the Archive section.
 
 ## RW-01: Header: "Last updated"
@@ -333,10 +343,10 @@ Last updated: 2026-09-15
 New:
 
 ~~~new
-Last updated: 2026-09-30 (content as of `f43efe6`; restructured by LOGS-1)  
+Last updated: 2026-09-30 (content as of `8fde4df`; restructured by LOGS-1)  
 ~~~
 
-**Facts.** The date is refreshed to the restructure date, 2026-09-30. The old header date (2026-09-15) was stale: the file holds records dated up to 2026-09-30. "content as of `f43efe6`" names the cut.
+**Facts.** The date is refreshed to the restructure date, 2026-09-30. The old header date (2026-09-15) was stale: the file holds records dated up to 2026-09-30. "content as of `8fde4df`" names the cut: the first cut was `f43efe6`, and the archive was re-cut at `8fde4df` when LOGS-1 merged.
 
 ## RW-02: Header: current phase (line 5) -> Current phase
 
@@ -360,7 +370,7 @@ New:
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** item 1 stays OPEN until a fresh closeout grades it. Items 4 and 5 stay NOT MET on their human halves: H1, the live-data paper run, and H3, the dashboards' infrastructure.
-- **Next:** `THROUGHPUT-2`, then the H1 re-run, then the fresh read-only closeout audit (after H1 and H3).
+- **Next:** H1 run 2, then the fresh read-only closeout audit (after H1 and H3). `THROUGHPUT-2` has merged (`7d59fd3`), below its throughput targets.
 - **Deferred:** `WP-260` and the eight remaining phase-3 packages wait for Wave 3 ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
 ~~~
@@ -378,7 +388,7 @@ Items 4 and 5 stay NOT MET on their human halves
 - The blocker-to-package list (B1 `TRDR-2`, B2 `RISK-2`, B6/B7 `GATE-1`, B8 `GOV-2C`, B9 `BOOT-1`, B5's code half `TRDR-3`, G-01 `VENUE-2`, B10 `UNIV-4`): the table and the Closed list under Closeout blockers. "As of 2026-09-17" is kept as "all but B3 were closed by 2026-09-17".
 - Archive only: "(`main` at the `UNIV-4` flip)", and B3's interim narrowing by `BACKTEST-1` ("NARROWED", "needs ruling H8"); B3 has since closed.
 - The H1 run 1 details: Human items > H1 (the `B4` row points there). H3: the `B5` row and Human items. H2 (`CI-1`, PR #1 run `36282501033`), H4, H5, H7, H8 and §5 item 6's owner: Human items.
-- "re-run after `THROUGHPUT-1`" (2026-09-29) is superseded inside the base file by the `THROUGHPUT-2` row (2026-09-30: "H1 is re-run afterwards"); the brief says "after `THROUGHPUT-2`".
+- "re-run after `THROUGHPUT-1`" (2026-09-29) is superseded inside the base file by the `THROUGHPUT-2` row (2026-09-30: "H1 is re-run afterwards"); the brief says "after `THROUGHPUT-2`". At the re-cut (`8fde4df`) `THROUGHPUT-2` is Complete, so "Next" names H1 run 2; its missed targets are in RW-143.
 - Not carried: the italic note on how the sentence was rewritten on 2026-09-17 (process history, in `header-and-phase.md`).
 
 ## RW-03: Header: maximum run mode
@@ -491,7 +501,7 @@ The user ratifies it before merge
 
 **Facts.** Kept: authorized 2026-09-29 by the user; moved off the critical path 2026-09-30; runs after the Wave 2 closeout, alongside the start of Wave 3; the finding with its numbers and mechanism (`now − book.asOf`, stale after 2 s, `venueBookMaxAgeMs`); scope (1)-(3) with the ONLY-documented-behaviour rule, parameter and version discipline, and all three evidence items; HARDENING LOOP; the Fable verifier; the full gate, including the green CI run on GitHub. Not carried: the user's quoted words, the earlier orders (after `THROUGHPUT-2`; originally after `THROUGHPUT-1a`/`-1b`), the dependencies (`THROUGHPUT-1a`, `THROUGHPUT-1b`, both complete) and the allowed paths (archive).
 
-## RW-07: Work packages: `THROUGHPUT-2` (live: Ready)
+## RW-07: Work packages: `THROUGHPUT-2` (live at `f43efe6`; Complete at the re-cut)
 
 Old, lines 738-755:
 
@@ -519,35 +529,12 @@ Old, lines 738-755:
 New:
 
 ~~~new
-| `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | **Ready (authorized)** 2026-09-30 | — | — |
-- **`THROUGHPUT-2`**: Ready (authorized) by the user, 2026-09-30.
-  - Goal: evaluate once per venue frame, so no half-applied book state is evaluated (`H1R1-FRAME-ATOMICITY`), and reach the H1 burst rate. After `THROUGHPUT-1a`, evaluation is about 82% of CPU.
-  - Kept: exactly one persisted decision per callback (handoff §7.5, ADR-005); every event is still applied and recorded, and none is dropped. Changed: the callback fires once per frame, after the frame's last event.
-  - Scope (1): ADR-024, Proposed. It covers frame completeness without waiting on the next event, the per-source frame meaning grounded in `docs/venue/verified-*.md`, replay/backtest parity (ADR-022), crash recovery mid-frame, and determinism.
-  - Scope (2)-(3): the implementation, plus two semantics-preserving extras only: a static-bracket parameter-validation cache, and an exact incremental EWMA only if proven bit-identical.
-  - Evidence (4): catch-up ≥ 943 events/s, paced max lag ≤ 5 s, no halt; a pin that half-applied states are gone; a fixture proof that no event is dropped; a base-vs-candidate decision characterization; every golden change explained.
-  - Base `229d58a`. HARDENING LOOP; verifier: a Fable adversarial-reviewer. Runs before `THROUGHPUT-1c`. H1 is re-run afterwards.
-  - Gate: automated checks, the Fable adversarial review, a green CI run on GitHub, and the user's ADR-024 ratification.
-  - Ratification may follow the merge (user ruling, 2026-09-30): on reviewer ACCEPT the round merges, with ADR-024 marked *Accepted provisionally (orchestrator, pending user ratification)*. The user ratifies afterwards; a rejection is reverted by a follow-up round.
+| `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Complete (2026-09-30) | `7d59fd3` | [THROUGHPUT-2](docs/handoffs/THROUGHPUT-2.md) |
 ~~~
 
-Keep (in both texts):
+**Facts.** Re-cut at `8fde4df`: the row went Complete on 2026-09-30 (merged `7d59fd3`), so its Ready-state bullet left "Authorized now" and the one-line row now reads Complete. Its live residuals at the cut are carried by RW-143. Until the re-cut the brief kept: Ready (authorized) 2026-09-30; the goal and both "Why" facts (`H1R1-FRAME-ATOMICITY`; evaluation about 82% of CPU); kept and changed semantics; scope (1)-(4) item by item, with "ONLY" and "only if proven bit-identical"; the targets; base `229d58a`; HARDENING LOOP; the Fable verifier; before `THROUGHPUT-1c`; H1 afterwards; the full gate, including the green CI run on GitHub; the 2026-09-30 merge-on-ACCEPT ruling, which moves only the ratification after the merge. Not carried then: the user's quoted words, the dependencies (both complete), and the allowed and forbidden paths (the archived row).
 
-~~~keep
-about 82% of CPU
-frame completeness without waiting on the next event
-crash recovery mid-frame
-only if proven bit-identical
-a fixture proof that no event is dropped
-a base-vs-candidate decision characterization
-catch-up ≥ 943 events/s
-a green CI run on GitHub
-Accepted provisionally (orchestrator, pending user ratification)
-~~~
-
-**Facts.** Kept: Ready (authorized) 2026-09-30; the goal and both "Why" facts (`H1R1-FRAME-ATOMICITY`; evaluation about 82% of CPU); kept and changed semantics; scope (1)-(4) item by item, with "ONLY" and "only if proven bit-identical"; the targets; base `229d58a`; HARDENING LOOP; the Fable verifier; before `THROUGHPUT-1c`; H1 afterwards; the full gate, including the green CI run on GitHub; the 2026-09-30 merge-on-ACCEPT ruling, which moves only the ratification after the merge. Not carried: the user's quoted words, the dependencies (both complete), and the allowed and forbidden paths (the archived row, which the "Authorized now" intro points to).
-
-## RW-08: Work packages: `VENUE-3` (live: Ready)
+## RW-08: Work packages: `VENUE-3` (live at `f43efe6`; Complete at the re-cut)
 
 Old, lines 756-768:
 
@@ -570,27 +557,10 @@ Old, lines 756-768:
 New:
 
 ~~~new
-| `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | **Ready (authorized)** 2026-09-30 | — | — |
-- **`VENUE-3`**: Ready (authorized) by the user, 2026-09-30.
-  - Goal: the phase-3 venue gate, i.e. the Wave 3 start re-verification. It is `VENUE-2`'s shape for phase 3: the full handoff §1.2 re-verification against `verified-2026-09-16.md`, with every drift row quoted, sourced, and given a consequence and an owner.
-  - Emphasis, the Wave 3 surfaces. The unified secure SDK: its current commit and version, what changed since `983a10a7…`, and the U-7 / D-02 pin check for `WP-260`. Also L1/L2 authentication; order placement, cancel and error codes (U-4); the user WebSocket channel (`WP-280`); heartbeats (`WP-320`). Geoblock, documentary only (the endpoint is NOT called). Rate limits and matching-engine modes (`WP-310`); collateral, pUSD and the settlement-contract addresses (U-5, `WP-300`); C-4.
-  - Documentary only: unauthenticated GETs of the documentation and the SDK source. No credential, wallet, signer, authenticated endpoint, order or WebSocket.
-  - Runs in parallel with `THROUGHPUT-2` (disjoint paths). Implementer: the `venue-verifier` agent. HARDENING LOOP; verifier: a Fable adversarial-reviewer that re-fetches every source.
-  - Gate: the Fable adversarial review (re-fetch) and a green CI run on GitHub.
+| `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
 ~~~
 
-Keep (in both texts):
-
-~~~keep
-with every drift row quoted, sourced, and given a consequence and an owner
-what changed since 983a10a7…
-the endpoint is NOT called
-No credential, wallet, signer, authenticated endpoint, order or WebSocket
-collateral, pUSD and the settlement-contract addresses
-a green CI run on GitHub
-~~~
-
-**Facts.** Kept: Ready (authorized) 2026-09-30; `VENUE-2`'s shape; the full §1.2 re-verification against `verified-2026-09-16.md` with every drift row quoted, sourced, and given a consequence and an owner; every Wave 3 surface in the list; the documentary-only rule, including that the geoblock endpoint is not called; parallel with `THROUGHPUT-2`; the `venue-verifier` implementer; the re-fetching Fable verifier; the gate, including the green CI run on GitHub. Not carried: the user's quoted words, the dependency (`THROUGHPUT-1a`, complete), and the allowed and forbidden paths (archive).
+**Facts.** Re-cut at `8fde4df`: the row went Complete on 2026-09-30 (merged `6a15131`), so its Ready-state bullet left "Authorized now"; the Complete row's live facts are paired by RW-144. Until the re-cut the brief kept: Ready (authorized) 2026-09-30; `VENUE-2`'s shape; the full §1.2 re-verification against `verified-2026-09-16.md` with every drift row quoted, sourced, and given a consequence and an owner; every Wave 3 surface in the list; the documentary-only rule, including that the geoblock endpoint is not called; parallel with `THROUGHPUT-2`; the `venue-verifier` implementer; the re-fetching Fable verifier; the gate, including the green CI run on GitHub. Not carried then: the user's quoted words, the dependency (`THROUGHPUT-1a`, complete), and the allowed and forbidden paths (archive).
 
 ## RW-09: Work packages: `WP-260` and "All other packages"
 
@@ -630,13 +600,12 @@ New:
 `verified-2026-09-16.md` fed these to later rounds; they have no row of their own. Owners are from `docs/handoffs/VENUE-2.md` follow_up and the report's §16.3.
 - D-13: a per-market `feeSchedule {rate, exponent, takerOnly, rebateRate}`, while `packages/simulation/src/fees.ts` models only `exponent = 1`. Owner: `packages/simulation` (ADR-012) and fee/reward accounting.
 - D-17: the minimum-order-size unit conflict (market details say "USDC notional", place-orders says "shares"; static-bracket `decide.ts` compares shares). Register conflict C-7. Owner: `packages/strategies/static-bracket` and `packages/universe`, with venue evidence.
-- D-02: SDK 0.6.0 → 0.10.0 with breaking changes (`WP-260`; `VENUE-3` re-checks the pin).
+- D-02: SDK 0.6.0 → 0.10.0 with breaking changes (`WP-260`). `VENUE-3` re-checked the pin: `@polymarket/client` **0.11.0** exactly, npm `latest`. Do NOT pin the unreleased head `6842ffa4`. The five-step fresh check is in `verified-2026-09-30.md` §W.1.
 - D-15 and D-20: see [Pending external evidence](#pending-external-evidence). D-30 is B10's basis (closed).
-- The offline gate does not consume the phase-2 report: `apps/ops-cli`'s validator pins the frozen report only (`checks.ts:69`) and pins `effective_date` to 2026-08-24 (`checks.ts:249-252`), as of `f43efe6`. Report §15 items 1-4. Owner: the `apps/ops-cli/**` package (`WP-330` or an earlier authorized packet).
+- The offline gate does not consume the phase-2 report: `apps/ops-cli`'s validator pins the frozen report only (`checks.ts:69`) and pins `effective_date` to 2026-08-24 (`checks.ts:249-252`), as of `8fde4df`. Report §15 items 1-4. Owner: the `apps/ops-cli/**` package (`WP-330` or an earlier authorized packet).
 - U-17 and U-16: the semantics of `feeSchedule.exponent ≠ 1` and the rounding direction are still undocumented. Owner: as D-13; `roundingMode` stays caller-declared.
 - U-15: Protocol V2 is documented only in SDK source. Owners: `WP-260`, `WP-300`, and the universe/data-gateway line that first reads Gamma `version`.
 - Handoff §24 has three redirecting links (D-07, D-11, D-25). Owner: the orchestrator or register owner (update or annotate them).
-- The phase-3 start gate owes its own report: `VENUE-3`.
 ~~~
 
 Keep (in both texts):
@@ -652,10 +621,9 @@ U-17
 U-16
 documented only in SDK source
 three redirecting links (D-07, D-11, D-25)
-the phase-3 start gate owes its own report
 ~~~
 
-**Facts.** `VENUE-2` is a Complete row, but two of its parts are live and have no residual row: the "Facts that feed the next rounds" and the "Residuals (owned, `docs/handoffs/VENUE-2.md` follow_up 1-10 and §16.3)". The brief carries D-13, D-17 (C-7) and D-02, and points D-15/D-20 at Pending external evidence. It carries every owned residual: the `apps/ops-cli` validator pins (`checks.ts:69`; `effective_date` 2026-08-24 at `:249-252`; report §15 items 1-4), U-17 and U-16 undocumented, U-15 (Protocol V2 only in SDK source), handoff §24's three redirecting links (D-07, D-11, D-25), and the phase-3 start gate's own report (`VENUE-3`). The owners come from `VENUE-2.md` follow_up 1, 3-6, 9 and 10 and report §16.3 items 3-6 and 8; the row names only those two sources. Not carried: the rest of the row (the chain, the review, the 31 drift rows, the source index, the gates, the superseded authorization text), which is history in `work-packages-rounds.md`.
+**Facts.** `VENUE-2` is a Complete row, but two of its parts are live and have no residual row: the "Facts that feed the next rounds" and the "Residuals (owned, `docs/handoffs/VENUE-2.md` follow_up 1-10 and §16.3)". The brief carries D-13, D-17 (C-7) and D-02, and points D-15/D-20 at Pending external evidence. It carries every owned residual: the `apps/ops-cli` validator pins (`checks.ts:69`; `effective_date` 2026-08-24 at `:249-252`; report §15 items 1-4), U-17 and U-16 undocumented, U-15 (Protocol V2 only in SDK source), and handoff §24's three redirecting links (D-07, D-11, D-25). The phase-3 start gate's own report was owed at `f43efe6`; `VENUE-3` delivered it (Complete at the re-cut, `8fde4df`), so the brief drops that bullet, and the D-02 line states the pin `VENUE-3` checked (RW-144). The owners come from `VENUE-2.md` follow_up 1, 3-6, 9 and 10 and report §16.3 items 3-6 and 8; the row names only those two sources. Not carried: the rest of the row (the chain, the review, the 31 drift rows, the source index, the gates, the superseded authorization text), which is history in `work-packages-rounds.md`.
 
 ## RW-11: Open blockers: intro
 
@@ -888,13 +856,13 @@ New:
 
 ~~~new
 ### Residual queue
-Open rows only, one line each. An owner beginning "row:" is quoted from the archived row and may be stale; the cell says why. File:line citations are as of `f43efe6`.
+Open rows only, one line each. An owner beginning "row:" is quoted from the archived row and may be stale; the cell says why. File:line citations are as of `8fde4df`.
 | Id | Residual | Owner |
 ~~~
 
-**Facts.** The heading's parenthetical is dropped. The Evidence column is dropped: each archived row keeps it. New: the "row:" owner convention and the rule that file:line cites are as of `f43efe6`.
+**Facts.** The heading's parenthetical is dropped. The Evidence column is dropped: each archived row keeps it. New: the "row:" owner convention and the rule that file:line cites are as of the cut (`f43efe6`, then `8fde4df` after the re-cut; K33 checks each one there).
 
-## RW-19: Residual `H1R1-FRAME-ATOMICITY`
+## RW-19: Residual `H1R1-FRAME-ATOMICITY` (closed at the re-cut)
 
 Old, lines 2607-2607:
 
@@ -902,22 +870,7 @@ Old, lines 2607-2607:
 | **H1R1-FRAME-ATOMICITY** | Every venue market-channel frame in the H1 burst produced exactly TWO `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames), and the trader evaluates after EACH. So half of all evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) would be truer and halve the work, but it changes "one decision per event" (WP-170's exactly-one-decision criteria) | `docs/handoffs/H1-RUN-1.md` finding 2 | **RULED 2026-09-30** (the user): `THROUGHPUT-2` evaluates once per frame |
 ~~~
 
-New:
-
-~~~new
-| `H1R1-FRAME-ATOMICITY` | In the H1 burst every venue market-channel frame produced exactly two `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames). The trader evaluates after each, so half the evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) is truer and halves the work, but changes WP-170's exactly-one-decision-per-event criteria. The user ruled on 2026-09-30 that `THROUGHPUT-2` evaluates once per frame. | `THROUGHPUT-2` (evaluate once per frame) |
-~~~
-
-Keep (in both texts):
-
-~~~keep
-85,547 events from 42,774 frames
-a book state that never existed at the venue
-per causationId
-THROUGHPUT-2 evaluates once per frame
-~~~
-
-**Facts.** Kept: two events per frame, one per token; 85,547 events from 42,774 frames; the half-applied book; once per `causationId`; the WP-170 criterion it changes; the 2026-09-30 ruling and what it ruled (`THROUGHPUT-2` evaluates once per frame). Archive only: the evidence cite (`H1-RUN-1.md` finding 2). Carried as open because the ruled fix is in flight in `THROUGHPUT-2`.
+**Facts.** Kept: two events per frame, one per token; 85,547 events from 42,774 frames; the half-applied book; once per `causationId`; the WP-170 criterion it changes; the 2026-09-30 ruling and what it ruled (`THROUGHPUT-2` evaluates once per frame). Archive only: the evidence cite (`H1-RUN-1.md` finding 2). Until the re-cut it was carried as open, because the ruled fix was in flight in `THROUGHPUT-2`. At `8fde4df` `THROUGHPUT-2` is Complete (`7d59fd3`): on the H1 burst all 42,955 half-applied-state decisions are gone. So the brief moves the id to the closed list under Residual queue, and this entry has no new block.
 
 ## RW-20: Residual `OUT1-R1-HALT-NOT-DURABLE`
 
@@ -1111,7 +1064,7 @@ Old, lines 2528-2528:
 New:
 
 ~~~new
-| `FOLD-PNL2TOKEN` | A silent PnL gap: when an instance holds both tokens of a market, only the filled token is marked (`packages/trading-core/src/loop.ts:2958-2962`, in `#stagePnlSnapshot`). | a PnL correctness round (unreachable with a single-token Static Bracket) |
+| `FOLD-PNL2TOKEN` | A silent PnL gap: when an instance holds both tokens of a market, only the filled token is marked (`packages/trading-core/src/loop.ts:3118-3122`, in `#stagePnlSnapshot`). | a PnL correctness round (unreachable with a single-token Static Bracket) |
 ~~~
 
 Keep (in both texts):
@@ -1121,7 +1074,7 @@ only the filled token is marked
 unreachable with a single-token Static Bracket
 ~~~
 
-**Facts.** Kept verbatim in substance, with the single-token unreachability in the owner cell. r7 corrects the approximate cite `loop.ts` about :2607-2612 (unowned-fill code at `f43efe6`) to `packages/trading-core/src/loop.ts` lines 2958-2962, where `#stagePnlSnapshot` marks only the filled token (verifier finding D3). Archive only: the evidence cite (FOLD-1 scoping).
+**Facts.** Kept verbatim in substance, with the single-token unreachability in the owner cell. r7 corrects the approximate cite `loop.ts` about :2607-2612 (unowned-fill code at `f43efe6`) to `packages/trading-core/src/loop.ts` lines 2958-2962, where `#stagePnlSnapshot` marks only the filled token (verifier finding D3). `THROUGHPUT-2` moved that code; at the re-cut (`8fde4df`) the lines are 3118-3122. Archive only: the evidence cite (FOLD-1 scoping).
 
 ## RW-28: Residual `FOLD-OVERSELL`
 
@@ -1719,7 +1672,7 @@ Old, lines 2573-2573:
 New:
 
 ~~~new
-| `UNIV4-R4/R5` | (R4) A hold-back caused by a failed confirmation write, with a healthy publisher, is released only by the next epoch (two PAGEs raised); a same-epoch retry when not halted would release it. (R5) Poll latency is up to one `pollIntervalMs`: a market closed between polls is seen late, and one closed and reopened within one interval is unseen. The venue's `endDate`/`startDate` are deliberately not used: they have no documented semantics and are a schedule, not an observation. `apps/data-gateway/src/publisher.ts:589`'s halt detail "the event remains in the WAL" is false for derived lifecycle events (the feed's own incident states the truth). | the next `apps/data-gateway` round |
+| `UNIV4-R4/R5` | (R4) A hold-back caused by a failed confirmation write, with a healthy publisher, is released only by the next epoch (two PAGEs raised); a same-epoch retry when not halted would release it. (R5) Poll latency is up to one `pollIntervalMs`: a market closed between polls is seen late, and one closed and reopened within one interval is unseen. The venue's `endDate`/`startDate` are deliberately not used: they have no documented semantics and are a schedule, not an observation. `apps/data-gateway/src/publisher.ts:633`'s halt detail "the event remains in the WAL" is false for derived lifecycle events (the feed's own incident states the truth). | the next `apps/data-gateway` round |
 ~~~
 
 Keep (in both texts):
@@ -1732,7 +1685,7 @@ deliberately not used
 a schedule, not an observation
 ~~~
 
-**Facts.** Kept: R4's hold-back with a healthy publisher, two PAGEs, and the same-epoch retry remedy; R5's latency bound, the late close, the unseen close-and-reopen, and why `endDate`/`startDate` are deliberately unused; the false WAL halt detail. r7 corrects its cite from `publisher.ts:461` (a blank line at `f43efe6`) to `apps/data-gateway/src/publisher.ts:589` (verifier finding D3). Archive only: "owner's wording".
+**Facts.** Kept: R4's hold-back with a healthy publisher, two PAGEs, and the same-epoch retry remedy; R5's latency bound, the late close, the unseen close-and-reopen, and why `endDate`/`startDate` are deliberately unused; the false WAL halt detail. r7 corrects its cite from `publisher.ts:461` (a blank line at `f43efe6`) to `apps/data-gateway/src/publisher.ts:589` (verifier finding D3). `THROUGHPUT-2` moved the line; at the re-cut (`8fde4df`) it is `:633`. Archive only: "owner's wording".
 
 ## RW-54: Residual `N8`
 
@@ -2368,7 +2321,7 @@ New:
 
 ~~~new
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
-Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
+Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `H1R1-FRAME-ATOMICITY` (closed by `THROUGHPUT-2`, `7d59fd3`: it evaluates once per frame), `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
 ~~~
 
 Keep (in both texts):
@@ -2430,7 +2383,7 @@ New:
 ~~~new
 The user authorized Wave 3 on 2026-09-30. The orchestrator may start `WP-260` first, then the work-plan chain, only when both hold:
 - the fresh Wave 2 closeout audit grades Wave 2 CLOSED;
-- `VENUE-3` has merged (the phase-3 start gate).
+- `VENUE-3` has merged (the phase-3 start gate): met on 2026-09-30 (`6a15131`).
 Every Wave 3 package stays PAPER-only, built with fixtures, mocks and fault injection (runbook §8, "Critical rule"): no production wallet, signer, API credential or real-order test. If the closeout does not grade Wave 2 CLOSED, only the agent-closable blockers it names are worked, and Wave 3 does not start.
 ~~~
 
@@ -2444,7 +2397,7 @@ no production wallet, signer, API credential or real-order test
 Wave 3 does not start
 ~~~
 
-**Facts.** Kept: the permission ("may start", not a commitment), both conditions, the order (`WP-260` first), PAPER-only with fixtures, mocks and fault injection, every prohibition, and the fallback. Archive only: the user's quoted words. "(runbook :906)" moved to the closeout-audit line under Human items, pinned to `f43efe6`.
+**Facts.** Kept: the permission ("may start", not a commitment), both conditions, the order (`WP-260` first), PAPER-only with fixtures, mocks and fault injection, every prohibition, and the fallback. Archive only: the user's quoted words. "(runbook :906)" moved to the closeout-audit line under Human items, pinned to `f43efe6`. At the re-cut (`8fde4df`) `VENUE-3` is Complete, so its condition is marked met; the closeout condition is still open.
 
 ## RW-82: Cross-package record, reconciled (still-live list)
 
@@ -4549,3 +4502,216 @@ Review round 1 dispatched. => history: the review ran; `WP-080` is Complete
 ~~~
 
 **Facts.** The base mentions the register only in this in-flight record item, and the `WP-080` row carries no residual, so r1-r6 declared the range history (verifier finding D1, r7). The register is live at `f43efe6`: `packages/binance-adapter/src/venue.ts` line 236 lists `BNC-U1`, `BNC-U2`, `BNC-U3`, `BNC-U4` and `BNC-U6` in `BINANCE_UNVERIFIED`, and `BINANCE_RESOLVED` holds only `BNC-U5` (ADR-014). `docs/handoffs/WP-080.md` lines 457-460 (follow_up 3) give `BNC-U1`'s observation to the first `WP-120` connectivity work, and lines 2274-2276 list it as still open. No later record closes it. History: `wave-1-batch-1b-in-flight.md`.
+
+## RW-143: Complete row `THROUGHPUT-2` (re-cut at `8fde4df`): the missed targets and the provisional ADR
+
+Excerpts, lines 738-755 of the re-cut `8fde4df`:
+
+~~~excerpt base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=738-755
+**Throughput:** 1.4×, 764–808 events/s; paced max lag 9–38 s (median about 19 s; base about 45 s).
+**The targets were NOT met** (943 events/s, 5 s); the ranked options are in the record.
+ADR-024 is **accepted provisionally**, pending the user's ratification.
+The user ratifies afterwards, and a rejection is reverted by a follow-up round.
+~~~
+
+New:
+
+~~~new
+- `THROUGHPUT-2`: **the targets were NOT met** (943 events/s, 5 s). Throughput rose 1.4×, to 764–808 events/s; the paced max lag was 9–38 s (median about 19 s; base about 45 s). The ranked options are in the record. ADR-024 is **accepted provisionally**, pending the user's ratification; a rejection is reverted by a follow-up round.
+- **ADR-024** (`THROUGHPUT-2`): accepted provisionally on 2026-09-30, pending the user's ratification.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+764–808 events/s
+median about 19 s; base about 45 s
+The targets were NOT met
+the ranked options are in the record
+ADR-024 is accepted provisionally, pending the user's ratification
+a rejection is reverted by a follow-up round
+~~~
+
+**Facts.** `THROUGHPUT-2` went Complete on `main` after the first cut (`d2ab6dc`), so it is declared at the re-cut. Its row names two live items: the missed throughput targets, and ADR-024's provisional acceptance. Both are carried under "Residuals recorded in Complete package rows", with the measured range (1.4×, 764–808 events/s; paced max lag 9–38 s, median about 19 s, base about 45 s) and the targets (943 events/s, 5 s). The ratification is also a Human items bullet. The row's correctness result (all 42,955 half-applied-state decisions gone, the 46,666 remaining equal to base) closes `H1R1-FRAME-ATOMICITY` (RW-19). The merge (`7d59fd3`) and the record link are in the Work packages row (RW-07). Not carried: the chain (`6be3eae` → `3b3f752`), the review findings, the CI run (PR #27 run `36686967040`) and the superseded authorization text, which are history in `work-packages-rounds.md`.
+
+## RW-144: Complete row `VENUE-3` (re-cut at `8fde4df`)
+
+Old, lines 756-768 of the re-cut `8fde4df`:
+
+~~~old base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=756-768
+| `VENUE-3` (the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check) | **Complete (2026-09-30)**: merged `6a15131` (`--no-ff`; `8375f2d` → `3625a66`). Fable r1 CHANGES REQUIRED (1 MEDIUM: the §14 index omitted four fetches; 3 LOW) → r2 **ACCEPT** (1 LOW). CI: PR #26 run `36675617008`. Report: `docs/venue/verified-2026-09-30.md`. The twelve §1.2 items: 7 UNCHANGED, 5 DRIFT (SDK, fees, matching engine, geoblock, RTDS). There are 17 drift rows E-01…E-17, conflicts C-9…C-14, and unverified items U-18…U-22, from 120 fetches, each SHA-256-indexed. **The phase-3 venue gate is OPEN.** **WP-260 SDK pin:** `@polymarket/client` **0.11.0** exactly, npm `latest`, whose build attestation names commit `d527956f47cf…`. Do NOT pin the unreleased head `6842ffa4`. The five-step fresh check is in §W.1. C-4 is still not reproduced. Record: `docs/handoffs/VENUE-3.md`. *(As authorized:* **Ready (authorized) 2026-09-30.**) The user: "Just in case you end up finishing wave 3 blockers, please proceed with orchestrating wave 3 work itself." It runs in parallel with `THROUGHPUT-2`, because its paths are disjoint. The implementer is the `venue-verifier` agent. HARDENING LOOP; verifier: a Fable adversarial-reviewer that re-fetches every source.
+
+**Scope:** VENUE-2's shape, for phase 3. It is the full handoff §1.2 re-verification against `verified-2026-09-16.md`, with every drift row quoted, sourced, and given a consequence and an owner. The emphasis is on the Wave 3 surfaces:
+  - the unified secure SDK: the current commit and version, what changed since `983a10a7…`, and the U-7 / D-02 pin check for `WP-260`;
+  - L1/L2 authentication;
+  - order placement and cancel, and the error codes (U-4);
+  - the user WebSocket channel (`WP-280`);
+  - heartbeats (`WP-320`);
+  - geoblock, documentary only: the endpoint is NOT called;
+  - rate limits and matching-engine modes (`WP-310`);
+  - collateral, pUSD and the settlement-contract addresses (U-5, `WP-300`);
+  - C-4.
+**Documentary only:** unauthenticated GETs of the documentation and the SDK source. No credential, wallet, signer, authenticated endpoint, order or WebSocket. | THROUGHPUT-1a ✓ | docs/venue/verified-<fetch-date>.md (new), test/fixtures/venue/README.md (append-only dated section), docs/contracts/protected-contracts.md (the C-4, U-4, U-5 and U-7 rows' dated annotations only). Forbidden: the frozen report, every earlier `verified-*.md`, packages/**, apps/**, fixture payloads. Gate: Fable adversarial review (re-fetch) + a green CI run on GitHub. |
+~~~
+
+New:
+
+~~~new
+| `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
+- `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
+- D-02: SDK 0.6.0 → 0.10.0 with breaking changes (`WP-260`). `VENUE-3` re-checked the pin: `@polymarket/client` **0.11.0** exactly, npm `latest`. Do NOT pin the unreleased head `6842ffa4`. The five-step fresh check is in `verified-2026-09-30.md` §W.1.
+- The phase-3 report, `docs/venue/verified-2026-09-30.md` (`VENUE-3`), has its own drift rows E-01…E-17, conflicts C-9…C-14 and unverified items U-18…U-22, each with an owner in the report. The four with a residual row are the `V3-*` rows above. C-4 is still not reproduced.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+0.11.0
+npm latest
+Do NOT pin the unreleased head 6842ffa4
+five-step fresh check
+E-01…E-17
+C-4 is still not reproduced
+~~~
+
+**Facts.** `VENUE-3` went Complete on `main` after the first cut (`9d270a9`). It names no residual clause, so it needs no C12 disposition; it is paired here because the brief carries its live facts. Kept: Complete (2026-09-30), merged `6a15131` with its record link; the WP-260 pin (`@polymarket/client` 0.11.0 exactly, npm `latest`; not the unreleased head `6842ffa4`); the five-step fresh check in §W.1; the drift rows, conflicts and unverified items, each owned in the report; C-4 still not reproduced. The gate result is stated as met, not "OPEN" (K15). The four residual rows it produced are RW-146 to RW-149. Not carried: the chain (`8375f2d` → `3625a66`), the review, the CI run (PR #26 run `36675617008`), the per-item verdict counts, the 120 fetches, the attestation commit, and the superseded authorization text and scope, which are history in `work-packages-rounds.md`.
+
+## RW-145: Work packages: `LOGS-1` (live: in merge; re-cut at `8fde4df`)
+
+Old, lines 769-777 of the re-cut `8fde4df`:
+
+~~~old base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=769-777
+| `LOGS-1` (records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim) | **Ready (authorized) 2026-09-30** by the user: "an audit on this files and your recommendation and implementation of said recommendation … perhaps we want a full detail file, and then some sort of brief".
+
+**Design (the orchestrator's recommendation):**
+  - historical records are evidence, so they MOVE verbatim to `docs/status-archive/` and are never rewritten;
+  - this file keeps its name, becomes the brief, and has its LIVE text rewritten plainly;
+  - `docs/handoffs/INDEX.md` and a writing standard `docs/handoffs/README.md`;
+  - a committed preservation proof (`tools/records/`).
+
+Base `f43efe6`, loop `wf_57d03812-d59`: a read-only audit, then an Opus implementer, then a Fable reviewer. **At merge, the orchestrator re-applies every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`.** | — | IMPLEMENTATION_STATUS.md, docs/status-archive/**, docs/handoffs/{INDEX,README}.md (new), tools/records/**, one sentence each in AGENTS.md/CLAUDE.md. Forbidden: existing handoffs, docs/spec, docs/adr, docs/venue, docs/contracts, code. | Fable review (preservation) + green CI |
+~~~
+
+New:
+
+~~~new
+| `LOGS-1` | records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim | **Ready (authorized)** 2026-09-30; in merge | — | — |
+- **`LOGS-1`**: Ready (authorized) by the user, 2026-09-30; now in merge.
+  - Goal: make this file a brief. Historical records are evidence, so they move verbatim to `docs/status-archive/` and are never rewritten. It adds `docs/handoffs/INDEX.md`, a writing standard (`docs/handoffs/README.md`) and a committed preservation proof (`tools/records/`).
+  - Base `f43efe6`. At merge, the orchestrator re-applies every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`: this re-cut is at `8fde4df`.
+  - Gate: a review of the preservation, and a green CI run on GitHub.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+historical records are evidence
+a committed preservation proof
+re-applies every governance edit made on main since f43efe6, using MOVE-MAP.md
+~~~
+
+**Facts.** The `LOGS-1` row was added on `main` after the first cut (`8fc0eb1`), so it is paired at the re-cut. Kept: Ready (authorized) 2026-09-30, now in merge; the design (historical records move verbatim and are never rewritten; this file becomes the brief; the handoff index and writing standard; a committed preservation proof); base `f43efe6`; the re-application of every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`; the gate (a preservation review and a green CI run). Not carried: the user's quoted words, the loop id `wf_57d03812-d59`, the audit-implementer-reviewer order, and the allowed and forbidden paths (the archived row).
+
+## RW-146: Residual `V3-C13-REFERENCE-TWAP` (added after the first cut; re-cut at `8fde4df`)
+
+Old, lines 2619-2623 of the re-cut `8fde4df`:
+
+~~~old base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=2619-2623
+| **V3-C13-REFERENCE-TWAP** | **A ruling is needed (the user).** The venue moved its reference/TWAP prices from the public RTDS feed to an AUTHENTICATED service, PolyBolt (`wss://ws-live-v2.polymarket.com/ws`), which requires CLOB API credentials. The PAPER rules forbid those credentials.
+  - The 30-second TWAP window has no replacement, and prices are now decimal strings.
+  - The old RTDS price topics are due for removal "one month after 0.11.0", about 2026-10-23 by the verifier's arithmetic (U-20; not a venue statement).
+  - Nothing running today uses RTDS: the trader's reference venue is Binance, and the example configs do not enable RTDS.
+  - Affected: the RTDS adapter, the data gateway's `rtds` block, the settlement ADR-009 §6 30-second window, and the `rtds/twap-update` fixture. | `docs/venue/verified-2026-09-30.md` E-09…E-12, C-13 | the user rules; then the owners act on E-09…E-12 |
+~~~
+
+New:
+
+~~~new
+| `V3-C13-REFERENCE-TWAP` | A ruling is needed from the user. The venue moved its reference/TWAP prices from the public RTDS feed to an authenticated service, PolyBolt (`wss://ws-live-v2.polymarket.com/ws`), which requires CLOB API credentials; the PAPER rules forbid those credentials. The 30-second TWAP window has no replacement, and prices are now decimal strings. The old RTDS price topics are due for removal "one month after 0.11.0": about 2026-10-23 by the verifier's arithmetic (U-20; not a venue statement). Nothing running today uses RTDS: the trader's reference venue is Binance, and the example configs do not enable RTDS. Affected: the RTDS adapter, the data gateway's `rtds` block, ADR-009 §6's 30-second window, and the `rtds/twap-update` fixture. | the user rules; then the owners act on E-09…E-12 (`verified-2026-09-30.md` C-13) |
+~~~
+
+Keep (in both texts):
+
+~~~keep
+PolyBolt
+The 30-second TWAP window has no replacement
+about 2026-10-23 by the verifier's arithmetic
+Nothing running today uses RTDS
+the rtds/twap-update fixture
+~~~
+
+**Facts.** Added on `main` by `9d270a9` (from `VENUE-3`). Kept: the ruling the user owes; the move to PolyBolt (`wss://ws-live-v2.polymarket.com/ws`) and its CLOB API credentials, which PAPER forbids; the lost 30-second window and the decimal-string prices; the removal date as the verifier's arithmetic (U-20), not a venue statement; that nothing running uses RTDS; every affected surface. The owner cell adds the report's conflict id (C-13). Archive only: the evidence cite (`verified-2026-09-30.md` E-09…E-12).
+
+## RW-147: Residual `V3-E15-DATA-API-V1-SUNSET` (added after the first cut; re-cut at `8fde4df`)
+
+Old, lines 2624-2624 of the re-cut `8fde4df`:
+
+~~~old base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=2624-2624
+| **V3-E15-DATA-API-V1-SUNSET** | The Data API v1 shuts down **2026-10-24**. `WP-290` (reconciliation) and `WP-330` (the ops CLI) must use the `/v2` routes. Check whether any current code calls v1 | `verified-2026-09-30.md` E-15 | WP-290/WP-330 packets; the orchestrator greps for v1 use before 2026-10-24 |
+~~~
+
+New:
+
+~~~new
+| `V3-E15-DATA-API-V1-SUNSET` | The Data API v1 shuts down 2026-10-24. `WP-290` (reconciliation) and `WP-330` (the ops CLI) must use the `/v2` routes. Whether any current code calls v1 is not yet checked. | the `WP-290` and `WP-330` packets; the orchestrator greps for v1 use before 2026-10-24 |
+~~~
+
+Keep (in both texts):
+
+~~~keep
+Data API v1 shuts down
+2026-10-24
+must use the /v2 routes
+~~~
+
+**Facts.** Added on `main` by `9d270a9` (from `VENUE-3`). Kept: the shutdown date, both packages and their `/v2` obligation, the unchecked v1 use, and the orchestrator's grep before the date. Archive only: the evidence cite (E-15).
+
+## RW-148: Residual `V3-C12-HEARTBEAT-ADR` (added after the first cut; re-cut at `8fde4df`)
+
+Old, lines 2625-2625 of the re-cut `8fde4df`:
+
+~~~old base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=2625-2625
+| **V3-C12-HEARTBEAT-ADR** | The SDK has no order-heartbeat method, but the handoff says both to wrap only the SDK AND to send order heartbeats. This needs an ADR before `WP-320` | `verified-2026-09-30.md` C-12, E-17 | the orchestrator, before WP-320 |
+~~~
+
+New:
+
+~~~new
+| `V3-C12-HEARTBEAT-ADR` | The SDK has no order-heartbeat method, but the handoff says both to wrap only the SDK and to send order heartbeats. This needs an ADR before `WP-320` (`verified-2026-09-30.md` C-12, E-17). | the orchestrator, before `WP-320` |
+~~~
+
+Keep (in both texts):
+
+~~~keep
+no order-heartbeat method
+to wrap only the SDK
+before WP-320
+~~~
+
+**Facts.** Added on `main` by `9d270a9` (from `VENUE-3`). Kept: the missing SDK heartbeat method, the handoff's two instructions, the ADR it needs, and the owner (the orchestrator, before `WP-320`). The evidence cite (C-12, E-17) moved into the residual cell.
+
+## RW-149: Residual `V3-FIXTURES` (added after the first cut; re-cut at `8fde4df`)
+
+Old, lines 2626-2626 of the re-cut `8fde4df`:
+
+~~~old base=8fde4dffa9546dc7570f1e53653242c568669c58 lines=2626-2626
+| **V3-FIXTURES** | Three venue fixtures are stale or contested: `fees` (`samples_per_epoch` 10080, now 1,440/day), `restricted-modes` (the 503 cancel-only text changed; C-9) and `rtds/twap-update` (a deprecated source). `ops:verify-venue` still passes, because it pins the 2026-08-24 snapshot. Also C-11: the batch-cancel limit (1,000 vs 3,000); use ≤ 1,000 | `verified-2026-09-30.md` §15, C-9, C-11 | the fixture owner, and the WP-270 packet |
+~~~
+
+New:
+
+~~~new
+| `V3-FIXTURES` | Three venue fixtures are stale or contested: `fees` (`samples_per_epoch` 10080; now 1,440 a day), `restricted-modes` (the 503 cancel-only text changed; C-9) and `rtds/twap-update` (a deprecated source). `ops:verify-venue` still passes, because it pins the 2026-08-24 snapshot. C-11: the batch-cancel limit is contested (1,000 vs 3,000); use ≤ 1,000. | the fixture owner, and the `WP-270` packet |
+~~~
+
+Keep (in both texts):
+
+~~~keep
+Three venue fixtures are stale or contested
+samples_per_epoch
+ops:verify-venue still passes
+because it pins the 2026-08-24 snapshot
+use ≤ 1,000
+~~~
+
+**Facts.** Added on `main` by `9d270a9` (from `VENUE-3`). Kept: the three fixtures and why each is stale or contested (C-9 included); why `ops:verify-venue` still passes; C-11 and the ≤ 1,000 rule; both owners. Archive only: the evidence cite (§15, C-9, C-11).

@@ -22,7 +22,7 @@ SECTIONS = [
     ("work-packages-waves-0-2.md", "Work packages: Waves 0-2 rows", "eq", "## Work packages",
      "the work-package table header and the full rows `WP-000` to `WP-250`"),
     ("work-packages-rounds.md", "Work packages: rounds since 2026-09-06", "prefix", "| `WP-180-FU3`",
-     "the full rows `WP-180-FU3` to `VENUE-3`, `WP-260`, \"All other packages\" and the authorization vocabulary"),
+     "the full rows `WP-180-FU3` to `LOGS-1`, `WP-260`, \"All other packages\" and the authorization vocabulary"),
     ("completion-records-wave-1.md", "Completion records: Wave 1 and Wave 2 batch 2A", "prefix", "### WP-170 completion record",
      "completion records `WP-170` to `WP-100` and the Wave 1 batch 1B phase-gate record"),
     ("wave-1-batch-1b-in-flight.md", "Wave 1 batch 1B in-flight records", "prefix", "### Wave 1 batch 1B in-flight records",

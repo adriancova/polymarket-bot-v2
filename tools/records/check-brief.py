@@ -170,8 +170,8 @@ CARRIED_FACTS = [
 # (literal as it occurs in the brief, [(path, first line, last line, needle)]); first line None = a
 # "quote": the needle (a stale cite) must be somewhere in that file at the cut.
 CITATIONS = [
-    ("`packages/trading-core/src/loop.ts:2958-2962`",
-     [("packages/trading-core/src/loop.ts", 2958, 2962, "marks: { [tokenAssetId]: { midpoint: fill.price } }")]),
+    ("`packages/trading-core/src/loop.ts:3118-3122`",
+     [("packages/trading-core/src/loop.ts", 3118, 3122, "marks: { [tokenAssetId]: { midpoint: fill.price } }")]),
     ("cites stale lines `health-door.ts:181` and `:77`",
      [("test/unit/control-api/response-encoder-bound.test.ts", None, None, "(`apps/control-api/src/health-door.ts:181`)"),
       ("test/unit/control-api/response-encoder-bound.test.ts", None, None, "(`health-door.ts:77`)")]),
@@ -185,8 +185,8 @@ CITATIONS = [
      [("apps/trader/README.md", 144, 160, "`WP-220`'s accepted residual")]),
     ("`apps/control-api/src/health-door.ts:238`",
      [("apps/control-api/src/health-door.ts", 238, 238, "Bounded: at most 4096 instances")]),
-    ("`apps/data-gateway/src/publisher.ts:589`",
-     [("apps/data-gateway/src/publisher.ts", 589, 589, "the event remains in the WAL")]),
+    ("`apps/data-gateway/src/publisher.ts:633`",
+     [("apps/data-gateway/src/publisher.ts", 633, 633, "the event remains in the WAL")]),
     ("`packages/execution-planner/src/refusals.ts:178-187`",
      [("packages/execution-planner/src/refusals.ts", 178, 187, "Every public entry point of this package promises a typed result")]),
     ("`book.ts:284` and `:361`",

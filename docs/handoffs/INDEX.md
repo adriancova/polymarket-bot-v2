@@ -96,3 +96,5 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-29 | [REGISTER-1.md](REGISTER-1.md) | `REGISTER-1`: pre-H1: an operator registration command | Round | Complete (2026-09-29) | `7f1ebc0` | 64 KB |
 | 2026-09-29 | [THROUGHPUT-1a.md](THROUGHPUT-1a.md) | `THROUGHPUT-1a`: the trader keeps pace with a live 15-minute market; its stream lag is visible | Round | Complete (2026-09-30) | `229d58a` | 18 KB |
 | 2026-09-29 | [THROUGHPUT-1b.md](THROUGHPUT-1b.md) | `THROUGHPUT-1b`: the gateway publishes a window-open burst without overflowing; the example config subscribes to books | Round | Complete (2026-09-30) | `c179095` | 17 KB |
+| 2026-09-30 | [THROUGHPUT-2.md](THROUGHPUT-2.md) | `THROUGHPUT-2`: evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Round | Complete (2026-09-30) | `7d59fd3` | 30 KB |
+| 2026-09-30 | [VENUE-3.md](VENUE-3.md) | `VENUE-3`: the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Round | Complete (2026-09-30) | `6a15131` | 15 KB |
