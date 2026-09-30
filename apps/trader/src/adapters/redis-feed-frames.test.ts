@@ -41,6 +41,14 @@ class ScriptedSubscription {
   readonly checkpoints: string[] = [];
   #position = 0;
 
+  /** A subscription resuming after a recorded checkpoint (`cp:<ingestSeq>`), as a restart does. */
+  static resumingAfter(entries: readonly EventEnvelope<unknown>[], checkpoint: string): ScriptedSubscription {
+    const resumed = new ScriptedSubscription();
+    resumed.append(...entries);
+    resumed.#position = entries.findIndex((entry) => `cp:${entry.ingestSeq}` === checkpoint) + 1;
+    return resumed;
+  }
+
   append(...envelopes: EventEnvelope<unknown>[]): void {
     this.entries.push(...envelopes);
   }
@@ -163,6 +171,25 @@ describe("RedisMarketEventFeed — frame-aligned batches (THROUGHPUT-2)", () => 
     expect(await pollSeqs(feed)).toEqual(["2", "3"]);
     expect((await feed.commit()).ok).toBe(true);
     expect(subscription.checkpoints).toEqual(["cp:1", "cp:3"]);
+  });
+
+  it("a crash while a partial frame is CARRIED: the recorded position precedes the frame, and a restart reads it whole", async () => {
+    const subscription = new ScriptedSubscription();
+    const stream = [envelope(1, "a"), envelope(2, "a"), envelope(3, "b"), envelope(4, "b"), envelope(5, "c")];
+    subscription.append(...stream);
+    const feed = feedOver(subscription, 3);
+    // Read [1,2,3]: frame b is cut by the COUNT; [1,2] handed out, 3 carried.
+    expect(await pollSeqs(feed)).toEqual(["1", "2"]);
+    expect(feed.carried).toBe(1);
+    expect((await feed.commit(feed.mark())).ok).toBe(true);
+    // The process dies here, mid-frame b (3 read, 4 not yet).
+    const recorded = subscription.checkpoints.at(-1);
+    expect(recorded).toBe("cp:2");
+    // The restarted consumer resumes after the recorded position: frame b whole.
+    const restarted = feedOver(ScriptedSubscription.resumingAfter(stream, recorded ?? ""), 3);
+    // (A full read of [3,4,5] carries the trailing [5] in turn.)
+    expect(await pollSeqs(restarted)).toEqual(["3", "4"]);
+    expect(await pollSeqs(restarted)).toEqual(["5"]);
   });
 
   it("delivery ordinals count handed-out events in stream order, exactly as before", async () => {

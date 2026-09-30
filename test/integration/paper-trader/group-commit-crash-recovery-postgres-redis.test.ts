@@ -38,6 +38,13 @@
  * stored position: it decides exactly the events after it — every one of
  * them, and none before it.
  *
+ * `THROUGHPUT-2` (ADR-024): every publication here is frame-atomic, as the
+ * gateway's is, and the file pins that the stored position is a frame
+ * boundary although the crash came while the feed's 128-entry reads were
+ * cutting two-token frames — the mid-frame case: the partial frame was never
+ * handed to the loop, its position never recorded, and the new run re-reads
+ * it whole and decides exactly what the uninterrupted run decided after A.
+ *
  * NON-VACUITY: with the pump changed to record a batch's position BEFORE its
  * decisions are durable, this file fails (the stored position runs past the
  * durable rows) — the planted-bug run is recorded in the THROUGHPUT-1a
@@ -59,6 +66,8 @@ import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus
 import { createDatabase, createPostgresPool, createRepositories, migrateUp } from "@polymarket-bot/storage-postgres";
 import { createIsolatedDatabase, startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+import { sameFrame } from "@polymarket-bot/trader";
 
 import { H1_MARKET_ID, readEnvelope, readEnvelopes, remapMarketId, withMarketOpened } from "./support/throughput/fixture.js";
 import { benchEnvironment, registerForBench } from "./support/throughput/harness.js";
@@ -213,8 +222,28 @@ async function startTrader(run: Scenario, document: Record<string, unknown>, lab
   return { child, exit, output: () => Buffer.concat(chunks).toString("utf8") };
 }
 
+/**
+ * `THROUGHPUT-2` (ADR-024): published as the gateway publishes — every raw
+ * frame (a run of consecutive envelopes sharing a `causationId`) in ONE
+ * atomic `publishBatch` call — so the trader's feed can close a frame at a
+ * short read. `from`/`to` must fall on frame boundaries (asserted).
+ */
 async function publish(run: Scenario, from: number, to: number): Promise<void> {
-  for (const envelope of run.envelopes.slice(from, to)) await run.publisher.publish(run.stream, envelope);
+  expect(onFrameBoundary(run.envelopes, from) && onFrameBoundary(run.envelopes, to)).toBe(true);
+  for (let start = from; start < to; ) {
+    let end = start + 1;
+    while (end < to && sameFrame(run.envelopes[start], run.envelopes[end])) end += 1;
+    const frame = run.envelopes.slice(start, end);
+    const result = await run.publisher.publishBatch(run.stream, frame);
+    expect(result.failure).toBeUndefined();
+    expect(result.receipts).toHaveLength(frame.length);
+    start = end;
+  }
+}
+
+/** Is `index` a frame boundary: no frame has events on both sides of it? */
+function onFrameBoundary(envelopes: readonly EventEnvelope<unknown>[], index: number): boolean {
+  return index <= 0 || index >= envelopes.length || !sameFrame(envelopes[index - 1], envelopes[index]);
 }
 
 /** The consumer position the trader RECORDED in Redis (publication ordinal), or undefined before any. */
@@ -333,6 +362,19 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
     expect(k).toBe(referenceA.length);
     // The stored position agrees: exactly the end of A, never past a decision that is not durable.
     expect(await recordedPosition(crash)).toBe(BATCH_A);
+    // `THROUGHPUT-2` (ADR-024 D5): and never inside a venue frame. The trader
+    // was killed mid-B with B's frames read in 128-entry batches — whose
+    // boundaries cut two-token frames (checked below), so the feed was
+    // carrying partial frames — and the position it had recorded is still a
+    // frame boundary: a restart re-reads every frame whole.
+    expect(onFrameBoundary(crash.envelopes, BATCH_A)).toBe(true);
+    const receiveBatch = Number(
+      (crash.document["infrastructure"] as Record<string, unknown>)["receiveBatchSize"],
+    );
+    const cutFrames = Array.from({ length: Math.floor((crash.envelopes.length - BATCH_A) / receiveBatch) }, (_, n) =>
+      BATCH_A + (n + 1) * receiveBatch,
+    ).filter((boundary) => !onFrameBoundary(crash.envelopes, boundary));
+    expect(cutFrames.length).toBeGreaterThan(0);
 
     // --- 3. restart ---------------------------------------------------------------
     const sameRun = await startTrader(crash, crash.document, "restart-same-run");
