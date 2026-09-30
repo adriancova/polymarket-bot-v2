@@ -58,10 +58,27 @@ Proof C (facts and navigation):
      excerpt block (~~~excerpt lines=a-b) quotes part of base lines a..b; each
      of its lines must occur in one of them (C6). It adds no coverage;
   C13 a Facts reference "<brief heading> (RW-NN)" points at an entry whose new
-     lines sit under that heading in the brief.
+     lines sit under that heading in the brief;
+  C14 record items. A history declaration may not hold a record item (a bullet
+     or paragraph of the base text) that matches OBLIG: such an item is
+     declared "record-item" over exactly its lines, with a disposition in the
+     C12 grammar. An item that matches OWNED_REC needs more than "none";
+  C15 clause accounting (a partial carry fails). Each residual clause must be
+     accounted for: every clause of an excerpt block; every clause of a marker
+     sentence (MARK: "Known risks:", "Residuals (owned ...):", "Carried
+     follow-ups:" ...) of a dispositioned complete-row; and every clause of a
+     record item that is carried, and of each marker sentence of any other
+     dispositioned record item. A clause is accounted for when
+     it contains a keep phrase of an entry the disposition carries, an id the
+     disposition queues or lists, a package it is closed by, or the fragment
+     of a drop line inside the same base lines. A drop block
+     (~~~drop lines=a-b) holds "<verbatim fragment> => <reason>" lines; the
+     reason is "closed-by `PKG` ..." (PKG Complete in the brief), "brief:
+     <heading> ..." (a heading of the brief) or "history: ...".
 
-C6, C10 and C12 authenticate what REWRITES.md says; they cannot judge whether
-a rewrite or a disposition kept every fact. That remains a review question.
+C6, C10, C12 and C15 authenticate what REWRITES.md says; they cannot judge
+whether a rewrite, a disposition or a drop reason is true. That remains a
+review question.
 
 Exit 0 when every selected proof passes, 1 otherwise. Stdlib only, no network.
 """
@@ -179,9 +196,9 @@ def parse_rewrites(text):
             if line.startswith("## "):
                 entry = facts = None
                 continue
-            mo = re.match(r"^~~~(old|excerpt|unpaired)(?: base=([0-9a-f]{40}))?(?: lines=(\d+)-(\d+))?$", line)
+            mo = re.match(r"^~~~(old|excerpt|drop|unpaired)(?: base=([0-9a-f]{40}))?(?: lines=(\d+)-(\d+))?$", line)
             if mo:
-                if mo.group(1) in ("old", "excerpt") and not mo.group(3):
+                if mo.group(1) in ("old", "excerpt", "drop") and not mo.group(3):
                     raise ValueError(f"REWRITES.md: an {mo.group(1)} block needs lines=a-b: {line!r}")
                 cur = {"kind": mo.group(1), "base": mo.group(2), "a": int(mo.group(3) or 0),
                        "b": int(mo.group(4) or 0), "lines": [], "entry": entry}
@@ -243,6 +260,84 @@ OWNED = re.compile(r"(?i)residuals? \(owned|residuals? owned|residual owners|res
                    r"|carried follow-ups|carried low|carried: \*\*|accepted disclosed residuals|open contract items carried"
                    r"|known risks|new residuals?:|residual queued|queued:|queued as `|owned follow-ups"
                    r"|registered as a bounded follow-up")
+# C14: a record item (bullet or paragraph) in a history range that matches OBLIG must be declared record-item ...
+OBLIG = re.compile(r"(?i)carried|follow[-_ ]?ups?\b|obligations?\b|\bmust\b|\bowe[sd]?\b|human review|deferred"
+                   r"|registered for later|open items|reasoned-not-profiled|unconfirmed|unmeasured|\bbinds?\b"
+                   r"|next re-check|\bqueued\b|residual|\bkeeps\b|remains? (?:open|owed)")
+# ... and one that matches OWNED_REC needs more than "none".
+OWNED_REC = re.compile(r"(?i)carried (?:follow-ups|to|forward|residuals?)|follow-ups carried|(?:LOW|NOTE),? carried"
+                       r"|obligations (?:recorded|carried|on consumers)|open items|items deferred|human review|must not be"
+                       r"|\b[A-Z]{2,}-\d+ keeps\b|remains? (?:owed|unconfirmed|an unmeasured)")
+# C15: the phrase that opens a residual sentence in a package row.
+MARK = re.compile(r"(?i)(?:^|(?<=\*\*)|(?<=\. )|(?<=; )|(?<=\| )|(?<=— )|(?<=\()|(?<=\n))(?:\*\*)?(?:[\w-]+ ){0,3}"
+                  r"(?:known risks?|residuals?|residual risks|carried|follow-ups?)(?:[ /][\w/-]+){0,5}(?:\*\*)? ?"
+                  r"(?:\([^()]*\))?(?:, [\w ]+)?(?:\*\*)?:(?:\*\*)?(?=\s)")
+
+
+def record_units(lines):
+    """[(a, b)] 1-based: each bullet or paragraph of a text, and each heading line."""
+    out, cur = [], None
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            if cur:
+                out.append(tuple(cur))
+            cur = None
+            continue
+        if line.startswith("#") or line.startswith("- ") or line.startswith("| "):
+            if cur:
+                out.append(tuple(cur))
+            cur = [n, n]
+            if line.startswith("#"):
+                out.append(tuple(cur))
+                cur = None
+            continue
+        if cur is None:
+            cur = [n, n]
+        else:
+            cur[1] = n
+    if cur:
+        out.append(tuple(cur))
+    return out
+
+
+def split_top(text, seps):
+    """Split text at any of seps when outside parentheses and brackets."""
+    out, depth, start, i = [], 0, 0, 0
+    while i < len(text):
+        c = text[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            hit = next((s for s in seps if text.startswith(s, i)), None)
+            if hit:
+                out.append(text[start:i])
+                i += len(hit)
+                start = i
+                continue
+        i += 1
+    out.append(text[start:])
+    return [p.strip(" ;") for p in out if p.strip(" ;")]
+
+
+SENTENCE_END = [". ", " | ", " Prior:", "<br>", "\n"]
+
+
+def clauses_of(text):
+    """Every top-level clause of text: sentences split at '; '."""
+    return [c for s in split_top(text, SENTENCE_END) for c in split_top(s, ["; "])]
+
+
+def marker_clauses(text):
+    """The clauses of every residual sentence (one opened by MARK) in a package row."""
+    out = []
+    for m in MARK.finditer(text):
+        rest = text[m.end():]
+        sent = split_top(rest, SENTENCE_END)
+        if sent:
+            out.extend((m.group(0), c) for c in split_top(sent[0], ["; "]))
+    return out
 
 
 def base_status_complete(line):
@@ -529,6 +624,8 @@ def proof_c(root, repo, sha, base, report):
     # C6
     news_by_entry, olds_by_entry, keeps_by_entry = collections.defaultdict(list), collections.defaultdict(list), collections.defaultdict(list)
     excerpts_by_entry = collections.defaultdict(list)
+    drops = []  # (base, a, b, normalized fragment)
+    drop_reasons = []
     for blk in blocks:
         if blk["kind"] == "old" and blk["base"]:
             if blk["lines"] != texts[blk["base"]][blk["a"] - 1:blk["b"]]:
@@ -547,6 +644,41 @@ def proof_c(root, repo, sha, base, report):
                     fails.append(f"C6: REWRITES new line is not in the brief: {line[:100]!r}")
         elif blk["kind"] == "keep":
             keeps_by_entry[blk["entry"]].extend(l for l in blk["lines"] if l.strip())
+        elif blk["kind"] == "drop" and blk["base"]:
+            src = texts[blk["base"]][blk["a"] - 1:blk["b"]]
+            for line in blk["lines"]:
+                if not line.strip():
+                    continue
+                frag, sep, reason = line.partition(" => ")
+                if not sep or not frag.strip():
+                    fails.append(f"C15: drop line lines={blk['a']}-{blk['b']} is not '<fragment> => <reason>': {line[:80]!r}")
+                    continue
+                if not any(frag in x for x in src):
+                    fails.append(f"C6: REWRITES drop fragment lines={blk['a']}-{blk['b']} is not text of {blk['base'][:12]}: {frag[:80]!r}")
+                drop_reasons.append((blk["a"], blk["b"], reason.strip()))
+                drops.append((blk["base"], blk["a"], blk["b"], norm(frag)))
+
+    # C15 drop reasons: closed-by a Complete package, a brief heading, or history
+    brief_heads = {re.sub(r"\s*\(.*\)$", "", re.sub(r"^#+ ", "", l)).strip().lower()
+                   for l in brief_lines if re.match(r"^#{2,3} ", l)}
+    _pkgs_early = collections.defaultdict(list)
+    for pid, status in brief_tables(brief_lines)[1]:
+        _pkgs_early[pid].append(status)
+    for a, b, reason in drop_reasons:
+        mr = re.match(r"^(closed-by|brief:|history:)\s*(.*)$", reason)
+        if not mr or not mr.group(2).strip():
+            fails.append(f"C15: drop lines={a}-{b}: the reason must be 'closed-by `PKG`', 'brief: <heading>' or 'history: <why>': {reason[:80]!r}")
+        elif mr.group(1) == "closed-by":
+            pkgs_named = re.findall(r"`([^`]+)`", mr.group(2))
+            if not pkgs_named:
+                fails.append(f"C15: drop lines={a}-{b}: 'closed-by' names no `package`: {reason[:80]!r}")
+            for i in pkgs_named:
+                if not any(st.startswith("Complete") for st in _pkgs_early.get(i, [])):
+                    fails.append(f"C15: drop lines={a}-{b}: closed-by {i!r}, which is not a Complete package in the brief")
+        elif mr.group(1) == "brief:":
+            head = re.split(r" — | \(", mr.group(2), maxsplit=1)[0].strip().lower()
+            if head not in brief_heads:
+                fails.append(f"C15: drop lines={a}-{b}: 'brief: {head}' is not a heading of the brief")
 
     # C8
     scoped_all, h2 = [], ""
@@ -563,19 +695,27 @@ def proof_c(root, repo, sha, base, report):
 
     scoped_named = set(re.findall(r"`([^`]+)`", "\n".join(scoped_all)))
     ndisp = [0]
+    nrec = [0]
 
-    def disposition(sha, a, b, ident, disp, lines):
-        """C12: a Complete row that mentions residuals carries a checked disposition."""
+    dispositions = []  # (sha, a, b, ident, kind, {carried: [RW], ids: [..], closed: [..], kinds: [..]})
+
+    def disposition(sha, a, b, ident, disp, lines, kind="complete-row"):
+        """C12/C14: a Complete row that mentions residuals, or a record item, carries a checked disposition."""
         row = "\n".join(lines[a - 1:b])
-        if not TRIGGER.search(row):
+        if kind == "complete-row" and not TRIGGER.search(row):
             if disp:
                 fails.append(f"C12: {ident}: a disposition on a row that mentions no residual")
             return
         if not disp:
-            fails.append(f"C12: complete-row {ident!r} mentions a residual or follow-up in the base row but has no disposition")
+            if kind == "complete-row":
+                fails.append(f"C12: complete-row {ident!r} mentions a residual or follow-up in the base row but has no disposition")
+            else:
+                fails.append(f"C14: record-item {a}-{b} has no disposition")
             return
         ndisp[0] += 1
         kinds = []
+        info = {"carried": [], "ids": [], "closed": [], "kinds": kinds}
+        dispositions.append((sha, a, b, ident, kind, info))
         for clause in disp.split("; "):
             mc = re.match(r"^(carried|queued|listed|closed-by|none:)\s*(.*)$", clause)
             if not mc:
@@ -588,6 +728,7 @@ def proof_c(root, repo, sha, base, report):
                 if not me or me.group(1) not in entries:
                     fails.append(f"C12: {ident}: 'carried' names no existing entry: {clause!r}")
                     continue
+                info["carried"].append(me.group(1))
                 ex = [x for x in excerpts_by_entry.get(me.group(1), []) if x["base"] == sha and a <= x["a"] and x["b"] <= b]
                 if not ex:
                     fails.append(f"C12: {ident}: {me.group(1)} has no excerpt block inside base lines {a}-{b}")
@@ -600,20 +741,26 @@ def proof_c(root, repo, sha, base, report):
                 ids = re.findall(r"`([^`]+)`", rest)
                 if not ids:
                     fails.append(f"C12: {ident}: '{k}' names no `id`")
+                info["closed" if k == "closed-by" else "ids"].extend(ids)
                 for i in ids:
                     if k == "closed-by":
                         if not any(s.startswith("Complete") for s in pkg_status.get(i, [])):
                             fails.append(f"C12: {ident}: closed-by {i!r}, which is not a Complete package in the brief")
                     elif i not in scoped_named:
                         fails.append(f"C12: {ident}: {k} {i!r}, which the brief's Open blockers, Human items and Deviations do not name")
-        if OWNED.search(row) and kinds and all(k == "none:" for k in kinds):
-            fails.append(f"C12: complete-row {ident!r} names owned or carried residuals; 'none' alone is not a disposition")
+        if kinds and all(k == "none:" for k in kinds):
+            if kind == "complete-row" and OWNED.search(row):
+                fails.append(f"C12: complete-row {ident!r} names owned or carried residuals; 'none' alone is not a disposition")
+            elif kind == "record-item" and OWNED_REC.search(row):
+                fails.append(f"C14: record-item {a}-{b} names carried items or obligations; 'none' alone is not a disposition")
 
     def coverage(sha, need):
         """Check coverage of the 1-based line numbers `need` of text `sha`; validate its declarations."""
         lines = texts[sha]
         starts = row_starts(lines)
         start_of = {n: key for key, n in starts.items()}
+        units = record_units(lines)
+        unit_set = set(units)
         covered = set()
         for blk in blocks:
             if blk["base"] == sha and blk["kind"] == "old":
@@ -624,7 +771,7 @@ def proof_c(root, repo, sha, base, report):
             for decl in blk["lines"]:
                 if not decl.strip():
                     continue
-                m = re.match(r"^(\d+)-(\d+) (verbatim|complete-row|closed-row|history)(?: (.*))?$", decl)
+                m = re.match(r"^(\d+)-(\d+) (verbatim|complete-row|closed-row|history|record-item)(?: (.*))?$", decl)
                 if not m:
                     fails.append(f"C8: malformed unpaired declaration {decl!r}")
                     continue
@@ -651,7 +798,18 @@ def proof_c(root, repo, sha, base, report):
                     elif kind == "closed-row" and f"`{ident}`" not in closed:
                         fails.append(f"C8: unpaired {a}-{b}: {ident!r} is not in the brief's closed lists")
                 elif inside:
-                    fails.append(f"C8: unpaired {a}-{b} is declared history but holds the row {inside[0][1]!r}")
+                    fails.append(f"C8: unpaired {a}-{b} is declared {kind} but holds the row {inside[0][1]!r}")
+                elif kind == "record-item":
+                    nrec[0] += 1
+                    md = re.match(r"^— (.+)$", detail)
+                    if (a, b) not in unit_set:
+                        fails.append(f"C14: record-item {a}-{b} is not exactly one bullet or paragraph of {sha[:12]}")
+                    disposition(sha, a, b, f"{a}-{b}", md.group(1) if md else None, lines, kind="record-item")
+                else:  # history: no obligation-bearing record item inside (C14)
+                    for ua, ub in units:
+                        if ua >= a and ub <= b and OBLIG.search("\n".join(lines[ua - 1:ub])):
+                            fails.append(f"C14: history {a}-{b} holds the record item {ua}-{ub}, which matches OBLIG; "
+                                         "declare it record-item with a disposition")
                 covered.update(range(a, b + 1))
         missing = sorted(n for n in need if n not in covered)
         if missing:
@@ -734,6 +892,46 @@ def proof_c(root, repo, sha, base, report):
             pairs_open = any(b["base"] == rwbase and any(b["a"] <= n <= b["b"] for n in paired_rw_starts) for b in olds)
             if pairs_open and not keeps_by_entry.get(entry):
                 fails.append(f"C10: {entry} pairs an open or live row but has no keep phrase")
+    # C15: clause accounting, so a partial carry fails
+    nclause = 0
+    carried_ranges = collections.defaultdict(list)
+    for dsha, a, b, ident, kind, info in dispositions:
+        for e in info["carried"]:
+            carried_ranges[e].append((dsha, a, b))
+    for entry, exs in excerpts_by_entry.items():
+        for x in exs:
+            if not any(x["base"] == dsha and a <= x["a"] and x["b"] <= b for dsha, a, b in carried_ranges.get(entry, [])):
+                fails.append(f"C15: {entry}'s excerpt lines={x['a']}-{x['b']} is inside no declaration that carries {entry}")
+
+    def named(ident, text):
+        return re.search(r"(?<![\w-])" + re.escape(norm(ident)) + r"(?![\w-])", text) is not None
+
+    for dsha, a, b, ident, kind, info in dispositions:
+        lines = texts[dsha]
+        keeps = [norm(k) for e in info["carried"] for k in keeps_by_entry.get(e, [])]
+        frags = [f for bs, da, db, f in drops if bs == dsha and a <= da and db <= b]
+        targets = []
+        if kind == "complete-row":
+            targets += [c for _m, c in marker_clauses("\n".join(lines[a - 1:b]))]
+        elif info["carried"]:
+            targets += clauses_of(" ".join(l.strip() for l in lines[a - 1:b]))
+        else:
+            targets += [c for _m, c in marker_clauses(" ".join(l.strip() for l in lines[a - 1:b]))]
+        for e in info["carried"]:
+            for x in excerpts_by_entry.get(e, []):
+                if x["base"] == dsha and a <= x["a"] and x["b"] <= b:
+                    targets += clauses_of(" ".join(l.strip() for l in x["lines"]))
+        for c in dict.fromkeys(targets):
+            n = norm(c)
+            if not n:
+                continue
+            nclause += 1
+            ok = (any(k in n or n in k for k in keeps) or any(f in n or n in f for f in frags)
+                  or any(named(i, n) for i in info["ids"] + info["closed"]))
+            if not ok:
+                fails.append(f"C15: {kind} {ident} ({a}-{b}): a residual clause is not accounted for "
+                             f"(no keep phrase, id, closing package or drop line): {c[:110]!r}")
+
     # C9
     seen = collections.defaultdict(list)
     for entry, flines in entries.items():
@@ -796,7 +994,8 @@ def proof_c(root, repo, sha, base, report):
     report.append(f"Proof C: {'FAIL' if fails else 'PASS'} ({len(rows)} package rows, {len(ids)} blocker/residual ids, "
                   f"{len(hexes)} hex tokens, {nlinks} links + {narch} archive links, {len(present)} handoffs indexed, "
                   f"{len(entries)} REWRITES entries with {nold} old blocks, {npaired} open or live rows paired, "
-                  f"{nkeep} keep phrases, {ndisp[0]} complete-row dispositions, {nxref} entry cross-references; rewrites-base {(rwbase or 'none')[:12]}, cut {cut[:12]})")
+                  f"{nkeep} keep phrases, {ndisp[0]} dispositions ({nrec[0]} record items), {nclause} residual clauses accounted for, "
+                  f"{len(drops)} drop lines, {nxref} entry cross-references; rewrites-base {(rwbase or 'none')[:12]}, cut {cut[:12]})")
     report.extend("  " + f for f in fails[:MAX_REPORT[0]])
     if len(fails) > MAX_REPORT[0]:
         report.append(f"  ... and {len(fails) - MAX_REPORT[0]} more")

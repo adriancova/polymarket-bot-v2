@@ -10,13 +10,14 @@ Each entry has:
 - a `new` block: the brief's lines.
 - a `keep` block (for every open or live row): phrases that must occur in both the old and the new text.
 - a **Facts** account. It identifies the facts the new text keeps, and locates each omitted fact in another brief section or the archive. "Row" means the archived row; "archive only" means the fact is only in the archive.
-- `excerpt` blocks (in place of `old`, entries RW-97 onward): part of a base line, verbatim. They pair the live residuals of a Complete package row whose line stays declared `complete-row` below.
+- `excerpt` blocks (in place of `old`, entries RW-97 onward): part of a base line, verbatim. They pair the live residuals of a Complete package row whose line stays declared `complete-row` below, or of a completion-record item declared `record-item`.
+- `drop` blocks (r4): `<verbatim fragment> => <reason>` lines, one per residual clause the brief does not carry. The reason is `closed-by` a Complete package, `brief:` the brief heading where the fact already is, or `history:` with why it owes nothing.
 
-What the checks prove, and what they do not: `tools/records/check-preservation.py` checks that each old block is verbatim and each excerpt is base text, each new line is in the brief, each keep phrase is in both texts (C6, C10), every base line is paired or declared below (C8), and no two entries share a Facts account (C9). Each archive file named in a Facts account contains at least one of that entry's old or excerpt lines (C11). A `complete-row` whose base row mentions a residual or follow-up carries a checked disposition (C12). A Facts reference "<brief heading> (RW-NN)" points at an entry whose new lines sit under that heading (C13). Whether a rewrite or a disposition kept every fact is a review question; the checks do not decide it.
+What the checks prove, and what they do not: `tools/records/check-preservation.py` checks that each old block is verbatim and each excerpt is base text, each new line is in the brief, each keep phrase is in both texts (C6, C10), every base line is paired or declared below (C8), and no two entries share a Facts account (C9). Each archive file named in a Facts account contains at least one of that entry's old or excerpt lines (C11). A `complete-row` whose base row mentions a residual or follow-up carries a checked disposition (C12). A Facts reference "<brief heading> (RW-NN)" points at an entry whose new lines sit under that heading (C13). A history range holds no completion-record item that names an obligation; each such item is declared `record-item` with a disposition (C14). Every residual clause of a dispositioned row or record item, and of every excerpt, contains a keep phrase, a queued or listed id, a closing package, or a drop fragment (C15), so a partial carry fails. Whether a rewrite, a disposition or a drop reason is true is a review question; the checks do not decide it.
 
 ## Coverage: base lines not included in a rewrite pair
 
-Every non-blank base line is either in an entry's old block or declared here. Kinds: `verbatim` (the line is in the brief unchanged), `complete-row` (a Complete or Superseded package row; its one-line brief row is derived as the table-header entry says), `closed-row` (a closed, done or ruled residual or blocker row, named in the brief's closed lists), and `history` (no live content; the range holds no package or blocker row). A `complete-row` whose base row mentions a residual, a follow-up, or a queued, owed, carried or deferred item ends with a disposition after " — ": `carried RW-NN` (an entry below pairs an excerpt of its live residuals), `queued` or `listed` ids (named in the brief's Open blockers, Human items or Deviations), `closed-by` packages (Complete in the brief), or `none:` with a reason; a row that names owned or carried residuals needs more than `none:` (C12). C8 checks each kind against both texts: a `verbatim` line must be in the brief; a `complete-row` must be exactly that package row, Complete or Superseded in the base row's status cell and in the brief; a `closed-row` must be exactly that row, named in the brief's closed lists, and closed in the base: a one-line row's last cell begins with a bold closure word (CLOSED, COMPLETE, DONE, RULED, DISCHARGED, MOOT, RATIFIED, SUPERSEDED), a multi-line row holds such a bold phrase, or the id is a package that is Complete in the base. A row that is closed in part and still carries such a marker (for example `H1R1-FRAME-ATOMICITY`, RULED yet open until `THROUGHPUT-2`) can pass the base test while open; the brief's open tables and the pairing rule catch it only if the brief still lists it. That remains a review question.
+Every non-blank base line is either in an entry's old block or declared here. Kinds: `verbatim` (the line is in the brief unchanged), `complete-row` (a Complete or Superseded package row; its one-line brief row is derived as the table-header entry says), `closed-row` (a closed, done or ruled residual or blocker row, named in the brief's closed lists), `history` (no live content; the range holds no package or blocker row, and no record item that matches C14's obligation pattern), and `record-item` (exactly one bullet or paragraph of a completion record that names an obligation, with a disposition in the grammar below; it may not be `none:` alone when it names carried items or obligations). A `complete-row` whose base row mentions a residual, a follow-up, or a queued, owed, carried or deferred item ends with a disposition after " — ": `carried RW-NN` (an entry below pairs an excerpt of its live residuals), `queued` or `listed` ids (named in the brief's Open blockers, Human items or Deviations), `closed-by` packages (Complete in the brief), or `none:` with a reason; a row that names owned or carried residuals needs more than `none:` (C12). C8 checks each kind against both texts: a `verbatim` line must be in the brief; a `complete-row` must be exactly that package row, Complete or Superseded in the base row's status cell and in the brief; a `closed-row` must be exactly that row, named in the brief's closed lists, and closed in the base: a one-line row's last cell begins with a bold closure word (CLOSED, COMPLETE, DONE, RULED, DISCHARGED, MOOT, RATIFIED, SUPERSEDED), a multi-line row holds such a bold phrase, or the id is a package that is Complete in the base. A row that is closed in part and still carries such a marker (for example `H1R1-FRAME-ATOMICITY`, RULED yet open until `THROUGHPUT-2`) can pass the base test while open; the brief's open tables and the pairing rule catch it only if the brief still lists it. That remains a review question.
 
 ~~~unpaired
 1-1 verbatim
@@ -51,7 +52,7 @@ Every non-blank base line is either in an entry's old block or declared here. Ki
 48-48 complete-row `WP-200-FU1` — carried RW-104; closed-by `WP-020-FU1`
 49-49 complete-row `GOV-2A` — carried RW-105
 50-50 complete-row `GOV-1D` — closed-by `GOV-2A` (C-2 ratification against 7e75f9a, and F12/F17/F18/F19 reassigned)
-51-51 complete-row `WP-160` — closed-by `WP-160` (the packet carried WP-150's follow-ups into this package)
+51-51 complete-row `WP-160` — carried RW-138; listed `§5 item 6`; closed-by `WP-160` (the packet carried WP-150's follow-ups into this package), `WP-160-FU1` (R1-L3), `GOV-2A` (R1-N1)
 52-53 complete-row `WP-190` — carried RW-106; queued `N3`; closed-by `WP-180-FU2` (R1-N4), `GOV-2A` (R1-N2)
 54-54 complete-row `WP-020-FU1` — carried RW-107; closed-by `WP-180-FU3`, `WP-200-FU2`, `GOV-2C`
 55-55 complete-row `WP-230` — carried RW-108; closed-by `ALLOC-1`, `TRDR-1`, `RISK-2`
@@ -79,9 +80,9 @@ Every non-blank base line is either in an entry's old block or declared here. Ki
 77-77 complete-row `RISK-2` — queued `RISK-2 item 7`; closed-by `BRACKET-1a` (residual 5)
 78-78 complete-row `GATE-1` — carried RW-126; queued `GATE1-M1`, `GATE1-R3`
 79-79 complete-row `BOOT-1` — queued `B9`, `BOOT1 unchecked shared facts`, `BOOT1 pool leak`, `BOOT1-R6`, `BOOT1-R11`; listed `BOOT1-R7`; closed-by `REGISTER-1` (the registration CLI)
-80-80 complete-row `BACKTEST-1` — listed `B3`, `BT1-R1..R4`
+80-80 complete-row `BACKTEST-1` — carried RW-139; listed `B3`, `BT1-R1..R4`
 81-81 complete-row `GOV-2C` — listed `N3`; none: the header-strike note is moot, because LOGS-1 replaced the header
-83-83 complete-row `UNIV-4` — queued `UNIV4-R1`, `UNIV4-R2`, `UNIV4-R4/R5`
+83-83 complete-row `UNIV-4` — carried RW-140; queued `UNIV4-R1`, `UNIV4-R2`, `UNIV4-R4/R5`
 84-84 complete-row `TRDR-3` — queued `TRDR3-R1`, `TRDR3-R2`, `TRDR3-R3`, `TRDR3-R4/R5/R7`
 85-85 complete-row `CI-1` — listed `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`
 86-86 complete-row `RECON-1` — listed `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`
@@ -109,12 +110,121 @@ Every non-blank base line is either in an entry's old block or declared here. Ki
 718-725 complete-row `THROUGHPUT-1b` — none: the match is a design sentence ("consecutive queued envelopes"), not a residual
 737-737 complete-row `DEPS-1` — queued `DEPS1-VITEST`
 772-774 verbatim
-776-1257 history completion-records-wave-1.md
-1259-1762 history wave-1-batch-1b-in-flight.md
-1764-2087 history completion-records-wave-0.md
-2089-2318 history wave-0-closeout-and-reviews.md
-2322-2354 history wave-2-qualification.md
-2366-2399 history wave-2-qualification.md
+776-801 history completion-records-wave-1.md
+802-805 record-item — carried RW-99
+806-815 record-item — carried RW-99; closed-by `WP-230`, `WP-220`
+816-823 history completion-records-wave-1.md
+824-831 record-item — none: the seven HIGH were closed before the merge
+832-837 history completion-records-wave-1.md
+838-842 record-item — closed-by `WP-200-FU1` (the memoisation LOW)
+843-845 record-item — closed-by `WP-230` (halt enforcement at the composition root)
+846-853 history completion-records-wave-1.md
+854-871 record-item — none: review rounds, M1 closed and r3 ACCEPT
+872-877 record-item — none: orchestrator reproductions (evidence)
+878-891 record-item — none: what shipped, its obligations are the next record item (892-901)
+892-901 record-item — carried RW-127; closed-by `WP-160`, `WP-210`
+902-919 history completion-records-wave-1.md
+920-936 record-item — listed `§5 item 6`; none: what shipped, F15/F16 checker enforcement is the listed item's
+937-945 record-item — carried RW-128; closed-by `WP-220`, `WP-210`, `WP-230`
+946-951 history completion-records-wave-1.md
+952-954 record-item — none: closeout checklist evidence
+955-981 history completion-records-wave-1.md
+982-992 record-item — listed `VENUE-3`; none: the phase-2 re-check was executed, the phase-3 one is VENUE-3's
+993-1018 history completion-records-wave-1.md
+1019-1021 record-item — carried RW-129
+1022-1030 record-item — carried RW-129
+1031-1038 history completion-records-wave-1.md
+1039-1045 record-item — none: a design description
+1046-1083 history completion-records-wave-1.md
+1084-1092 record-item — carried RW-130
+1093-1130 history completion-records-wave-1.md
+1131-1140 record-item — carried RW-131
+1141-1143 history completion-records-wave-1.md
+1144-1151 record-item — none: the implementation record
+1152-1165 record-item — none: fixes shipped, each residual pinned as a passing test
+1166-1169 history completion-records-wave-1.md
+1170-1173 record-item — none: the round-8 judgments
+1174-1178 history completion-records-wave-1.md
+1179-1187 record-item — carried RW-132
+1188-1190 history completion-records-wave-1.md
+1191-1198 record-item — none: the implementation record
+1199-1203 record-item — none: review round 1, remediated
+1204-1214 record-item — none: review round 2 ACCEPT, the residual NOTE is documented behaviour
+1215-1221 history completion-records-wave-1.md
+1222-1226 record-item — closed-by `WP-120` (the binding obligations it carried)
+1227-1235 history completion-records-wave-1.md
+1236-1245 record-item — none: the phase-start re-check was executed, and the next one ran on 2026-09-02
+1246-1247 history completion-records-wave-1.md
+1248-1257 record-item — closed-by `WP-070` (its packet carried these obligations)
+1259-1362 history wave-1-batch-1b-in-flight.md
+1363-1379 record-item — closed-by `GOV-1B` (the takerSide ruling, ADR-014)
+1380-1403 record-item — closed-by `WP-120` (its identity obligation)
+1404-1421 record-item — closed-by `WP-120` (the unique-id and registration contract)
+1422-1441 history wave-1-batch-1b-in-flight.md
+1442-1458 record-item — closed-by `WP-120` (the four-part identity contract)
+1459-1479 record-item — closed-by `WP-120` (the unresolved-attempt deadline)
+1480-1494 history wave-1-batch-1b-in-flight.md
+1495-1511 record-item — closed-by `WP-120` (the NONE-after-FeedDisconnected reading)
+1512-1526 record-item — closed-by `WP-120` (the failed-attempt reading)
+1527-1545 record-item — closed-by `WP-120` (the rejected-PENDING-CLOSE accounting)
+1546-1555 history wave-1-batch-1b-in-flight.md
+1556-1568 record-item — closed-by `WP-120` (the binding obligations)
+1569-1578 record-item — closed-by `GOV-1B` (ADR-014), `WP-080-FU1` (the adapters converged)
+1579-1582 history wave-1-batch-1b-in-flight.md
+1583-1596 record-item — closed-by `GOV-1B` (ADR-013 ratified C-1/U-1)
+1597-1618 history wave-1-batch-1b-in-flight.md
+1619-1645 record-item — closed-by `GOV-1B` (contract-owner item 3, ADR-015), `WP-150` (robust to the recorded GET /book ordering contradiction)
+1646-1670 history wave-1-batch-1b-in-flight.md
+1671-1692 record-item — closed-by `WP-120` (recovery keys off feed.openGap)
+1693-1710 record-item — none: review round 3, remediated
+1711-1731 history wave-1-batch-1b-in-flight.md
+1732-1744 record-item — none: the NOTE's stale comment is gone, at f43efe6 git grep finds "never carried by an event" only in docs
+1745-1755 record-item — closed-by `GOV-1B` (contract-owner items 1-3)
+1756-1762 record-item — closed-by `GOV-1B` (ADR-013, ADR-014, ADR-015)
+1764-1793 history completion-records-wave-0.md
+1794-1803 record-item — carried RW-133; closed-by `WP-120`
+1804-1812 history completion-records-wave-0.md
+1813-1831 record-item — closed-by `WP-120` (its durable-consumer obligations)
+1832-1849 record-item — closed-by `WP-120` (its obligations, now explicit)
+1850-1912 history completion-records-wave-0.md
+1913-1916 record-item — carried RW-134; closed-by `WP-200`
+1917-1948 history completion-records-wave-0.md
+1949-1955 record-item — carried RW-135
+1956-1963 record-item — closed-by `GOV-1C` (it ruled the §6.1 items, and its item-1 tripwire is carried in RW-128)
+1964-1986 history completion-records-wave-0.md
+1987-1991 record-item — carried RW-136; closed-by `WP-120`, `WP-130`
+1992-1996 history completion-records-wave-0.md
+1997-2002 record-item — none: the implementation record
+2003-2008 record-item — none: review rounds, ACCEPT
+2009-2019 history completion-records-wave-0.md
+2020-2023 record-item — carried RW-137
+2024-2031 history completion-records-wave-0.md
+2032-2035 record-item — carried RW-137
+2036-2044 history completion-records-wave-0.md
+2045-2049 record-item — carried RW-137
+2050-2057 history completion-records-wave-0.md
+2058-2062 record-item — closed-by `WP-030` (the venue payload-key NOTE)
+2063-2072 history completion-records-wave-0.md
+2073-2077 record-item — closed-by `WP-030` (the deferred ADR items)
+2078-2087 history completion-records-wave-0.md
+2089-2116 history wave-0-closeout-and-reviews.md
+2117-2128 record-item — none: fixed by the Wave 0 closeout remediation, merged as b8e5eab
+2129-2136 history wave-0-closeout-and-reviews.md
+2137-2175 record-item — none: review history, WP-030 merged
+2177-2222 record-item — none: review history, WP-020 merged
+2224-2309 record-item — none: review history, WP-000 merged
+2310-2313 history wave-0-closeout-and-reviews.md
+2314-2316 record-item — none: superseded by the WP-000 completion record
+2317-2318 history wave-0-closeout-and-reviews.md
+2322-2345 history wave-2-qualification.md
+2346-2346 record-item — none: a superseded header quote
+2347-2349 history wave-2-qualification.md
+2350-2350 record-item — none: a superseded header quote
+2351-2353 history wave-2-qualification.md
+2354-2354 record-item — none: a superseded header quote
+2366-2368 history wave-2-qualification.md
+2369-2391 record-item — none: the brief's Current phase and Wave 2 qualification state what is still open (§7 items 1, 4 and 5, B4, B5)
+2392-2399 history wave-2-qualification.md
 2488-2488 closed-row `RISK-2 residual 5`
 2489-2489 closed-row `RISK2-R6`
 2490-2490 closed-row `RISK2-R2`
@@ -149,7 +259,25 @@ Every non-blank base line is either in an entry's old block or declared here. Ki
 2604-2604 closed-row `DC1-R1-L1`
 2613-2613 closed-row `B1-R1-REDIS-UNCAUGHT`
 2623-2623 closed-row `BRACKET-1c`
-2693-2911 history cross-package-schema-risk.md
+2693-2736 history cross-package-schema-risk.md
+2737-2741 record-item — listed `R8-1`
+2742-2763 history cross-package-schema-risk.md
+2764-2772 record-item — closed-by `GOV-2A` (the round-9/10 classes were folded into it)
+2773-2802 history cross-package-schema-risk.md
+2803-2809 record-item — closed-by `WP-160-FU1`
+2810-2815 record-item — listed `R8-1`
+2816-2820 history cross-package-schema-risk.md
+2821-2823 record-item — listed `§5 item 6`
+2824-2833 record-item — listed `N3`
+2835-2846 record-item — closed-by `WP-200-FU1`, `WP-170-FU1`, `REC-1`, `WP-160-FU1`, `CLOB-1`, `SETL-2`, `UNIV-3`, `WP-060-FU1`; listed `§5 item 6`
+2847-2851 history cross-package-schema-risk.md
+2852-2855 record-item — closed-by `WP-200-FU1`
+2856-2860 history cross-package-schema-risk.md
+2861-2863 record-item — closed-by `REC-1`
+2864-2877 history cross-package-schema-risk.md
+2878-2883 record-item — none: what a probe result means, not an obligation
+2885-2897 record-item — none: the ADR-020 ruling, whose live items are under Schema boundary
+2898-2911 history cross-package-schema-risk.md
 2913-2913 verbatim
 2924-2924 verbatim
 2930-2930 verbatim
@@ -409,7 +537,7 @@ New:
 | `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | **Ready (authorized)** 2026-09-30 | — | — |
 - **`VENUE-3`**: Ready (authorized) by the user, 2026-09-30.
   - Goal: the phase-3 venue gate, i.e. the Wave 3 start re-verification. It is `VENUE-2`'s shape for phase 3: the full handoff §1.2 re-verification against `verified-2026-09-16.md`, with every drift row quoted, sourced, and given a consequence and an owner.
-  - Emphasis, the Wave 3 surfaces: the unified secure SDK (its current commit and version, what changed since `983a10a7…`, and the U-7 / D-02 pin check for `WP-260`); L1/L2 authentication; order placement, cancel and error codes (U-4); the user WebSocket channel (`WP-280`); heartbeats (`WP-320`); geoblock, documentary only (the endpoint is NOT called); rate limits and matching-engine modes (`WP-310`); collateral, pUSD and the settlement-contract addresses (U-5, `WP-300`); C-4.
+  - Emphasis, the Wave 3 surfaces. The unified secure SDK: its current commit and version, what changed since `983a10a7…`, and the U-7 / D-02 pin check for `WP-260`. Also L1/L2 authentication; order placement, cancel and error codes (U-4); the user WebSocket channel (`WP-280`); heartbeats (`WP-320`). Geoblock, documentary only (the endpoint is NOT called). Rate limits and matching-engine modes (`WP-310`); collateral, pUSD and the settlement-contract addresses (U-5, `WP-300`); C-4.
   - Documentary only: unauthenticated GETs of the documentation and the SDK source. No credential, wallet, signer, authenticated endpoint, order or WebSocket.
   - Runs in parallel with `THROUGHPUT-2` (disjoint paths). Implementer: the `venue-verifier` agent. HARDENING LOOP; verifier: a Fable adversarial-reviewer that re-fetches every source.
   - Gate: the Fable adversarial review (re-fetch) and a green CI run on GitHub.
@@ -463,8 +591,7 @@ Old, lines 82-82:
 New:
 
 ~~~new
-`verified-2026-09-16.md` fed these to later rounds; they have no row of their own.
-Owners are from `docs/handoffs/VENUE-2.md` follow_up and the report's §16.3.
+`verified-2026-09-16.md` fed these to later rounds; they have no row of their own. Owners are from `docs/handoffs/VENUE-2.md` follow_up and the report's §16.3.
 - D-13: a per-market `feeSchedule {rate, exponent, takerOnly, rebateRate}`, while `packages/simulation/src/fees.ts` models only `exponent = 1`. Owner: `packages/simulation` (ADR-012) and fee/reward accounting.
 - D-17: the minimum-order-size unit conflict (market details say "USDC notional", place-orders says "shares"; static-bracket `decide.ts` compares shares). Register conflict C-7. Owner: `packages/strategies/static-bracket` and `packages/universe`, with venue evidence.
 - D-02: SDK 0.6.0 → 0.10.0 with breaking changes (`WP-260`; `VENUE-3` re-checks the pin).
@@ -518,15 +645,7 @@ reconciled against what has since merged. Each item names its evidence.
 New:
 
 ~~~new
-Open items are closeout blockers, residual rows, venue drift carried forward,
-residuals recorded in Complete package rows, and human items
-([below](#human-items)). Full rows, evidence and history:
-[`open-blockers-2026-09.md`](docs/status-archive/open-blockers-2026-09.md)
-(search for the id). The cross-package schema-boundary findings (zod adoption and
-loss) are in
-[`cross-package-schema-risk.md`](docs/status-archive/cross-package-schema-risk.md);
-what is still live from them is listed under
-[Schema boundary](#schema-boundary-still-live).
+Open items are closeout blockers, residual rows, venue drift carried forward, residuals recorded in Complete package rows, obligations in completion records, and human items ([below](#human-items)). Full rows, evidence and history: [`open-blockers-2026-09.md`](docs/status-archive/open-blockers-2026-09.md) (search for the id). The cross-package schema-boundary findings (zod adoption and loss) are in [`cross-package-schema-risk.md`](docs/status-archive/cross-package-schema-risk.md); what is still live from them is listed under [Schema boundary](#schema-boundary-still-live).
 ~~~
 
 **Facts.** Reorganized, not copied: the old intro listed closeout blockers, the residual queue and the reconciled cross-package findings; the brief lists closeout blockers, residual rows, carried-forward venue drift, residuals recorded in Complete package rows and human items, and moves the cross-package findings to the Schema boundary subsection. The correction note (GOV-2C, 2026-09-15: the section once read "None.") is history in `open-blockers-2026-09.md`.
@@ -657,7 +776,7 @@ wrong again; N5 is in the residual queue below.)*
 New:
 
 ~~~new
-| `H7` | **Ratified** by the user, 2026-09-28 ("Ratify all"): the N6 field format; four root-wiring commits without recorded reviewer sign-off (`5b73461`, `af059d7`, `80126e8`, `da37a0c`); the SER confirming reviews run by Claude after Codex's content filter refused the packet; N11; the Fable verifiers for container- and spawn-heavy rounds (`BRACKET-1c`, `BUNDLE-1`, `DEPCHECK-1`; the `CI-2` precedent); the `DEPCHECK-1` grant widening (`CI2-L5-2/3`) and the `DOCS-1` authorization. The archived state cell reads "PARTLY DONE"; it predates the ruling. | no open owner: the archived owner (human/orchestrator, for three questions) became historical at ratification |
+| `H7` | **Ratified** by the user, 2026-09-28 ("Ratify all"). It covers the N6 field format; four root-wiring commits without recorded reviewer sign-off (`5b73461`, `af059d7`, `80126e8`, `da37a0c`); the SER confirming reviews run by Claude after Codex's content filter refused the packet; N11. Also the Fable verifiers for container- and spawn-heavy rounds (`BRACKET-1c`, `BUNDLE-1`, `DEPCHECK-1`; the `CI-2` precedent), the `DEPCHECK-1` grant widening (`CI2-L5-2/3`) and the `DOCS-1` authorization. The archived state cell reads "PARTLY DONE"; it predates the ruling. | no open owner: the archived owner (human/orchestrator, for three questions) became historical at ratification |
 ~~~
 
 Keep (in both texts):
@@ -713,12 +832,7 @@ wrong again; N5 is in the residual queue below.)*
 New:
 
 ~~~new
-Closed: `B3` (`BACKTEST-2` `fd12be0`, 2026-09-28), `B10` (`UNIV-4` `7c08af7`),
-`G-01` (`VENUE-2` `d6aedee`), `H5` (ruled 2026-09-28: one demonstrated run).
-Closed earlier: `B1`'s cause (`TRDR-2` `f3da220`), `B2` (`RISK-2` `133eac1`),
-`B6`, `B7` and N4 (`GATE-1` `0434c82`), `B8` with N2 (the contract correction;
-the `N2` measurement is open), N3 (features), N6, N7, N9, N10 and G-13
-(`GOV-2C`). N5 closed later (`CI-1`).
+Closed: `B3` (`BACKTEST-2` `fd12be0`, 2026-09-28), `B10` (`UNIV-4` `7c08af7`), `G-01` (`VENUE-2` `d6aedee`), `H5` (ruled 2026-09-28: one demonstrated run). Closed earlier: `B1`'s cause (`TRDR-2` `f3da220`), `B2` (`RISK-2` `133eac1`), `B6`, `B7` and N4 (`GATE-1` `0434c82`), `B8` with N2 (the contract correction; the `N2` measurement is open), N3 (features), N6, N7, N9, N10 and G-13 (`GOV-2C`). N5 closed later (`CI-1`).
 ~~~
 
 **Facts.** All closed or ruled; the brief keeps the id, the closing package and SHA. Archive only: B3's narrowing history and interim "accepted as qualified" wording, B10's defect detail, G-01's source list, and the GOV2C-2 correction note about N5. G-01's surfaced items: D-15 and D-20 are under Pending external evidence, D-13, D-17 and D-02 under Venue drift carried forward (RW-10), D-30 is B10's closed basis. H5's ruling text is under Human items. `B8`'s SHA is in the table (`GOV-2C` `33c36f9`).
@@ -738,9 +852,7 @@ New:
 
 ~~~new
 ### Residual queue
-Open rows only, one line each. An owner beginning "row:" is quoted from the
-archived row and may be stale; the cell says why. File:line citations are as of
-`f43efe6`.
+Open rows only, one line each. An owner beginning "row:" is quoted from the archived row and may be stale; the cell says why. File:line citations are as of `f43efe6`.
 | Id | Residual | Owner |
 ~~~
 
@@ -1060,7 +1172,7 @@ The loud path already covers a late fill in the meantime | `docs/handoffs/TRDR-4
 New:
 
 ~~~new
-| `TRDR4-LIVESETTLE` | A live-adapter obligation, outside PAPER. `TRDR-4` settles an order when it is terminal and its booked shares equal its filled shares. At a real venue, trades settle asynchronously (MATCHED → MINED → CONFIRMED, or RETRYING → FAILED; `verified-2026-09-16.md`). Before a live adapter exists: settlement must also require every trade of the order to be CONFIRMED or FAILED, and a §9.17 reconciliation to have passed; and the adapter must surface the orders a refused plan left behind (in `ordersSnapshot()` or in the refused result), carrying `plannedOrderId`. Meanwhile the loud path covers a late fill. | the live-adapter work package |
+| `TRDR4-LIVESETTLE` | A live-adapter obligation, outside PAPER. `TRDR-4` settles an order when it is terminal and its booked shares equal its filled shares. At a real venue, trades settle asynchronously (MATCHED → MINED → CONFIRMED, or RETRYING → FAILED; `verified-2026-09-16.md`). Before a live adapter exists: settlement must also require every trade of the order to be CONFIRMED or FAILED, and a §9.17 reconciliation to have passed. The adapter must also surface the orders a refused plan left behind (in `ordersSnapshot()` or in the refused result), carrying `plannedOrderId`. Meanwhile the loud path covers a late fill. | the live-adapter work package |
 ~~~
 
 Keep (in both texts):
@@ -1858,7 +1970,7 @@ It needs an edge or a ruling. One option: exit settlement does not move into `OP
 New:
 
 ~~~new
-| `BRACKET1-TPRACE` | Pre-existing; disclosed in the static-bracket README by `BRACKET-1a`. The `(PARTIALLY_OPEN\|OPEN, *_FILL)` family. (a) A take-profit is still live when a late entry fill resizes it, and the resize's cancel loses the race to a fill: the fill is refused with `SB.ILLEGAL_TRANSITION`, and the instance pauses, fail-closed, with the fill unfolded (at base the view-first order gave `UNATTRIBUTED_FILL`; either way it pauses). (b) A live entry's fill arrives while the bracket is `OPEN`. It needs an edge or a ruling; one option: exit settlement does not move into `OPEN` while the entry is still live. | the next static-bracket round |
+| `BRACKET1-TPRACE` | Pre-existing; disclosed in the static-bracket README by `BRACKET-1a`. The `(PARTIALLY_OPEN\|OPEN, *_FILL)` family. (a) A take-profit is still live when a late entry fill resizes it, and the resize's cancel loses the race to a fill. The fill is refused with `SB.ILLEGAL_TRANSITION`, and the instance pauses, fail-closed, with the fill unfolded (at base the view-first order gave `UNATTRIBUTED_FILL`; either way it pauses). (b) A live entry's fill arrives while the bracket is `OPEN`. It needs an edge or a ruling; one option: exit settlement does not move into `OPEN` while the entry is still live. | the next static-bracket round |
 ~~~
 
 Keep (in both texts):
@@ -1936,7 +2048,7 @@ Old, lines 2587-2592:
 New:
 
 ~~~new
-| `BRACKET1B-RECON` | Disclosed limits of the per-bracket reconciler (`BRACKET-1b`), each loud rather than silent where it matters: fee records are not individually tied to their fills (fee totals are compared through fills and snapshots); the single-bracket path does not check the PnL stream's order (no single-bracket row reads it); same-event fill ties keep the fill-id convention; there is no per-bracket engine checkpoint in the artifact; two internal guards are unreachable and unpinned. | the next `test/e2e/**` round |
+| `BRACKET1B-RECON` | Disclosed limits of the per-bracket reconciler (`BRACKET-1b`), each loud rather than silent where it matters. Fee records are not individually tied to their fills (fee totals are compared through fills and snapshots). The single-bracket path does not check the PnL stream's order (no single-bracket row reads it). Same-event fill ties keep the fill-id convention. There is no per-bracket engine checkpoint in the artifact. Two internal guards are unreachable and unpinned. | the next `test/e2e/**` round |
 ~~~
 
 Keep (in both texts):
@@ -2253,7 +2365,7 @@ New:
 
 ~~~new
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
-`BRACKET-1c`. The `H8 track` is complete; its rulings still in force are under
+Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`. The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
 ~~~
 
 Keep (in both texts):
@@ -2282,7 +2394,7 @@ New:
 - **H2**, a real CI run: discharged 2026-09-26 by `CI-1` (PR #1 run `36282501033`, every gate green).
 - **H3**, a real Prometheus and Grafana: performed 2026-09-29 with H1 run 1. The fresh closeout grades it.
 - **H4**, elapsed soak evidence: open. It is the `WP-140` gate, which closes only through the runbook §7 governance procedure after a real ≥24h soak.
-- **H5**: ruled 2026-09-28: one demonstrated run. The runbook §7 "Wave 2 closeout" check "Static Bracket runs in replay and live-data paper mode through the same code" (`:509` at `f43efe6`) is discharged by one supervised live-data paper session through the real stack (gateway → Redis → trader → PostgreSQL) that produces decisions and reads back clean. Sustained accumulation is the post-closeout activity the same section describes next (`:514` at `f43efe6`).
+- **H5**: ruled 2026-09-28: one demonstrated run. The runbook §7 "Wave 2 closeout" check "Static Bracket runs in replay and live-data paper mode through the same code" (`:509` at `f43efe6`) is discharged by one supervised live-data paper session. That session runs through the real stack (gateway → Redis → trader → PostgreSQL), produces decisions and reads back clean. Sustained accumulation is the post-closeout activity the same section describes next (`:514` at `f43efe6`).
 - **H6**, the authorization rows and round order: the orchestrator's, ongoing.
 - **H7**: ratified 2026-09-28 (`H7` above).
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
@@ -2313,14 +2425,10 @@ Every Wave 3 package stays PAPER-only, built with fixtures, mocks and fault inje
 New:
 
 ~~~new
-The user authorized Wave 3 on 2026-09-30. The orchestrator may start `WP-260` first,
-then the work-plan chain, only when both hold:
+The user authorized Wave 3 on 2026-09-30. The orchestrator may start `WP-260` first, then the work-plan chain, only when both hold:
 - the fresh Wave 2 closeout audit grades Wave 2 CLOSED;
 - `VENUE-3` has merged (the phase-3 start gate).
-Every Wave 3 package stays PAPER-only, built with fixtures, mocks and fault
-injection (runbook §8, "Critical rule"): no production wallet, signer, API
-credential or real-order test. If the closeout does not grade Wave 2 CLOSED, only
-the agent-closable blockers it names are worked, and Wave 3 does not start.
+Every Wave 3 package stays PAPER-only, built with fixtures, mocks and fault injection (runbook §8, "Critical rule"): no production wallet, signer, API credential or real-order test. If the closeout does not grade Wave 2 CLOSED, only the agent-closable blockers it names are worked, and Wave 3 does not start.
 ~~~
 
 Keep (in both texts):
@@ -2384,14 +2492,12 @@ round).
 New:
 
 ~~~new
-The authority is `docs/contracts/schema-boundary.md` §3 (2 LIVE / 13 CLOSED / 5
-outside, recounted 2026-09-11). Still live from the cross-package record
-(reconciled 2026-09-15):
+The authority is `docs/contracts/schema-boundary.md` §3 (2 LIVE / 13 CLOSED / 5 outside, recounted 2026-09-11). Still live from the cross-package record (reconciled 2026-09-15):
 - `packages/domain`: the frozen root cause. It is closed at each door (ADR-020 §3) and never edited, by design.
 - `packages/order-book`: live by inheritance, and `N2`.
 - The `features` INPUT-side records: prototype-bearing, no live consumer route (`WP-160-FU1` r1 N2).
 - `R8-1`, `§5 item 6`, and the open totality claim `N3`.
-- Each closed door's disclosed residuals, owned in its handoff: `REC-1` (D2 not performed; the `config-door` format check), `CLOB-1` (`Array.prototype` arrays; the shared-materializer question, for ADR-020 governance), `UNIV-3` (the direct-export caller-input round), `SETL-2` (follow-up hardening), `WP-060-FU1` (the `redis/transport.ts` epoch cursor), the `isFreshOrdinaryContainer` round (zod's own array assembly), and the strategy-runtime `modelOutputs` split collapse.
+- Each closed door's disclosed residuals, owned in its handoff: `REC-1` (D2 not performed; the `config-door` format check), `CLOB-1` (`Array.prototype` arrays; the shared-materializer question, for ADR-020 governance), `UNIV-3` (the direct-export caller-input round). Also `SETL-2` (follow-up hardening), `WP-060-FU1` (the `redis/transport.ts` epoch cursor), the `isFreshOrdinaryContainer` round (zod's own array assembly), and the strategy-runtime `modelOutputs` split collapse.
 ~~~
 
 Keep (in both texts):
@@ -2470,15 +2576,7 @@ and "Follow-ups (owned)".
 New:
 
 ~~~new
-A Wave 2 row that reads "Complete" means the package met its own acceptance
-criteria (re-verified by `GOV-2B` on 2026-09-15). It does not mean the paper core
-works end to end. Closing Wave 2 releases no new package: the four packages
-outside Wave 2 that depend directly on a Wave 2 package (`WP-270`, `WP-290`,
-`WP-300`, `WP-360`) all also depend on `WP-260`, directly or transitively.
-`WP-260` itself is held by wave ordering and the signer boundary. Gate counts in
-rows dated before 2026-09-26 come from one laptop; CI first ran with `CI-1`.
-Full text:
-[`wave-2-qualification.md`](docs/status-archive/wave-2-qualification.md).
+A Wave 2 row that reads "Complete" means the package met its own acceptance criteria (re-verified by `GOV-2B` on 2026-09-15). It does not mean the paper core works end to end. Closing Wave 2 releases no new package: the four packages outside Wave 2 that depend directly on a Wave 2 package (`WP-270`, `WP-290`, `WP-300`, `WP-360`) all also depend on `WP-260`, directly or transitively. `WP-260` itself is held by wave ordering and the signer boundary. Gate counts in rows dated before 2026-09-26 come from one laptop; CI first ran with `CI-1`. Full text: [`wave-2-qualification.md`](docs/status-archive/wave-2-qualification.md).
 ~~~
 
 Keep (in both texts):
@@ -2778,7 +2876,7 @@ Carried follow-ups: optional §1 parser span-scoping; the packages/domain ADR-01
 New:
 
 ~~~new
-- `WP-080-FU1`: §1's biconditional parser remains whole-document (LOW; an optional follow-up span-scopes it to `### 1`–`### 2`). A cross-venue aggressor-imbalance comparison is owed once two adapters' trades land in one store; it bears on WP-090's open U-CB-3.
+- `WP-080-FU1`: §1's biconditional parser remains whole-document (LOW; optional follow-up: §1 parser span-scoping, to `### 1`–`### 2`). A cross-venue aggressor-imbalance comparison is owed once two adapters' trades land in one store; it bears on WP-090's open U-CB-3.
 ~~~
 
 Keep (in both texts):
@@ -2787,9 +2885,17 @@ Keep (in both texts):
 biconditional parser remains whole-document
 cross-venue aggressor-imbalance comparison
 U-CB-3
+§1 parser span-scoping
 ~~~
 
-**Facts.** Kept: the LOW §1 parser residual with its optional span-scoping follow-up, and the cross-venue comparison tied to U-CB-3. Not carried: the NOTE on the §7-duplicate precondition (a deliberate coupling, not an obligation) and the packages/domain ADR-014 comment pointer, which `GOV-1C` added (its scope item 2). The rest of the row is history in `work-packages-waves-0-2.md`.
+Not carried:
+
+~~~drop lines=37-37
+NOTE — §7-duplicate precondition intentionally couples the historical probe suite to the ADR wording => history: a deliberate coupling, not an obligation
+the packages/domain ADR-014 comment pointer remains owed by the next bounded package owning packages/domain/** => closed-by `GOV-1C` (its scope item 2 added the pointer)
+~~~
+
+**Facts.** Kept: the LOW §1 parser residual with its optional follow-up, §1 parser span-scoping (r4 names it as the row does), and the cross-venue comparison tied to U-CB-3. The drop lines give the rest: the NOTE on the §7-duplicate precondition is a deliberate coupling, and `GOV-1C` added the packages/domain ADR-014 comment pointer (its scope item 2). The rest of the row is history in `work-packages-waves-0-2.md`.
 
 ## RW-98: Complete row `GOV-1C`: residuals still owned
 
@@ -2813,32 +2919,40 @@ machine rule keeps accepted alias F-OPAQUE
 tool+suite swap
 ~~~
 
-**Facts.** Kept: deviation D1's open half, the machine `rule` alias and the registered tool+suite swap. The completion record's own carried follow-ups (lines 937-945) name the same swap plus F15/F16, which sit in `§5 item 6` and `DEPCHECK-1`. The eight scope items were this round's work and are history in `work-packages-waves-0-2.md`.
+**Facts.** Kept: deviation D1's open half, the machine `rule` alias and the registered tool+suite swap. The completion record's own carried follow-ups (lines 937-945) are a record item with their own entry, RW-128. The eight scope items were this round's work and are history in `work-packages-waves-0-2.md`.
 
 ## RW-99: Complete row `WP-170`: residuals still owned
 
-Excerpt of base line 42, and lines 802-810:
+Excerpt of base line 42, and the completion record's items at lines 802-805 and 806-815:
 
 ~~~excerpt lines=42-42
 Two LOW residuals carried — see completion record.
 ~~~
 
-~~~excerpt lines=802-810
+~~~excerpt lines=802-805
 - **Residuals (LOW)**: the depth-memo's refusal-WORDING precision is observable but
   unfixtured; and one refusal branch documented as unreachable is reachable from a compiling
   fixture (`interface Callable { (value: unknown): string }`) though the mechanism FAILED
   CLOSED and hid nothing — taxonomy corrected pre-merge by disclosed edit `ef2368e`.
+~~~
+
+~~~excerpt lines=806-815
 - **Carried follow-ups** (owners): fixture those two branches (next toucher of the
   derivation); prove each battery adapter calls the callable it names; enumerate callables
   handed out as ARGUMENTS (frontier confirmed correctly drawn but open); the refined
   read-discipline rule distinguishing caller data from stateful ports, total predicates and
   explicitly partial APIs; WP-230 must supply fresh-or-copied views, pass plain checkpoint
+  documents, not swallow `StrategyContextRevokedError`, and surface
+  `PARAMS_NOT_MATERIALIZABLE` / `EVALUATION_SEQ_EXHAUSTED`; WP-220 authors must know the
+  context is invocation-scoped, state deeper than 64 containers is refused, and derived
+  structures belong on the strategy object; consider promoting the derivation to shared
+  test infrastructure.
 ~~~
 
 New:
 
 ~~~new
-- `WP-170`: two LOW residuals. The depth-memo's refusal-wording precision is observable but unfixtured, and one refusal branch documented as unreachable is reachable from a compiling fixture (it fails closed). Owed by the next toucher of the derivation: fixture those two branches; prove each battery adapter calls the callable it names; enumerate callables handed out as arguments.
+- `WP-170`: two LOW residuals. The depth-memo's refusal-wording precision is observable but unfixtured, and one refusal branch documented as unreachable is reachable from a compiling fixture (it fails closed). Owed by the next toucher of the derivation: fixture those two branches; prove each battery adapter calls the callable it names; enumerate callables handed out as arguments. Also owed: the refined read-discipline rule (caller data vs stateful ports, total predicates, explicitly partial APIs). Optional: promote the derivation to shared test infrastructure.
 ~~~
 
 Keep (in both texts):
@@ -2848,13 +2962,17 @@ refusal-wording precision is observable but unfixtured
 reachable from a compiling fixture
 fixture those two branches
 prove each battery adapter calls the callable it names
+two LOW residuals
+enumerate callables handed out as arguments
+read-discipline rule
+shared test infrastructure
 ~~~
 
-**Facts.** The row defers to its completion record, so the entry quotes both. Kept: the two LOW residuals and the follow-ups owed by the next toucher of the derivation. Not carried: the obligations addressed to `WP-230` and `WP-220` (those packages are Complete) and the read-discipline and shared-infrastructure suggestions. History: `completion-records-wave-1.md` and `work-packages-waves-0-2.md`.
+**Facts.** The row defers to its completion record, so the entry quotes both. Kept: the two LOW residuals, the follow-ups owed by the next toucher of the derivation, the refined read-discipline rule and the optional promotion to shared test infrastructure (r4 carries the last two, which r3 left out). The obligations addressed to `WP-230` and `WP-220` are closed by those packages (the record item's disposition). History: `completion-records-wave-1.md` and `work-packages-waves-0-2.md`.
 
 ## RW-100: Complete row `WP-180`: residuals still owned
 
-Excerpt of base line 43:
+Excerpts of base line 43:
 
 ~~~excerpt lines=43-43
 **Genuine residual (contract gap, for a future contract-owner round):** annotate which identifier `OpenOrderCommitmentSchema.orderId` and `PortfolioOpenOrderSchema.orderId` carry, so this is settled as a fact rather than a reading.
@@ -2864,16 +2982,36 @@ Excerpt of base line 43:
 New:
 
 ~~~new
-- `WP-180`: a contract gap for a future contract-owner round: annotate which identifier `OpenOrderCommitmentSchema.orderId` and `PortfolioOpenOrderSchema.orderId` carry. R8-1, R8-2 and R9-1 are in `R8-1` and `§5 item 6` above.
+- `WP-180`: a contract gap for a future contract-owner round: annotate which identifier `OpenOrderCommitmentSchema.orderId` and `PortfolioOpenOrderSchema.orderId` carry. A disclosed known risk: `QuoteIntent` has no expected-edge field, so under the default `requirePositiveNetEdgeForEntries: true` every quote intent is refused with `RISK_EDGE_INPUTS_MISSING`. R8-1, R8-2 and R9-1 are in `R8-1` and `§5 item 6` above.
 ~~~
 
 Keep (in both texts):
 
 ~~~keep
 annotate which identifier OpenOrderCommitmentSchema.orderId and PortfolioOpenOrderSchema.orderId carry
+QuoteIntent has no expected-edge field
+every quote intent is refused with RISK_EDGE_INPUTS_MISSING
 ~~~
 
-**Facts.** Kept: the orderId contract gap. R8-1, R8-2 and R9-1 are the brief's `R8-1` and `§5 item 6` rows. Not carried: R6-1 and R5-1 (a layer-1 package importing a Node built-in), answered by `GOV-2A`'s §2.2 built-in allowlist, and the round-9/10 classes, folded into the `GOV-2A` governance round. The ten-round review record is history in `work-packages-waves-0-2.md`.
+~~~excerpt lines=43-43
+Disclosed known risk: `QuoteIntent` has no expected-edge field, so under the default `requirePositiveNetEdgeForEntries: true` every quote intent is refused with `RISK_EDGE_INPUTS_MISSING`.
+~~~
+
+Not carried:
+
+~~~drop lines=43-43
+R6-1 layer-1 `node:util` import (open, non-blocking) => closed-by `GOV-2A` (its §2.2 built-in allowlist)
+R8-2 dotted-write syntactic gate => brief: Residual queue — `§5 item 6`
+R9-1 census indirection detector (alias/cast) for scope item 8 => brief: Residual queue — `§5 item 6`
+**R9-2 + L10-1 + N10-1/N10-2 — fold the round-9/10 residual classes => closed-by `GOV-2A` (the cross-package schema-boundary governance round)
+N10-3 (M7 not independently re-run => history: a review note on how a mutant was killed; no owner
+N10-4 (cold-worker coldness rests on vitest per-file isolation => history: a disclosed test-method note; no owner
+whether layer 1 may import Node built-ins at all => closed-by `GOV-2A` (the §2.2 built-in allowlist)
+a digit-leading UUID `strategyInstanceId` refuses as `RISK_INPUT_INVALID` => closed-by `ALLOC-1`, `TRDR-1` (ADR-021, discharged end to end)
+a cancel cannot bypass input validation itself, so a cancel whose `approvedIntentId` violates ADR-016 => history: review round 3 recorded "the reported `approvedIntentId` case CLOSED"
+~~~
+
+**Facts.** Kept: the orderId contract gap, and the disclosed known risk that every default-policy quote intent is refused with `RISK_EDGE_INPUTS_MISSING` (r4 restores it). R8-1, R8-2 and R9-1 are the brief's `R8-1` and `§5 item 6` rows. The drop lines give each other residual's closure: R6-1/R5-1 and the round-9/10 classes went to `GOV-2A`; the digit-leading `strategyInstanceId` to `ALLOC-1` and `TRDR-1`; the `approvedIntentId` cancel case closed in review round 3; two review notes have no owner. The ten-round review record is history in `work-packages-waves-0-2.md`.
 
 ## RW-101: Complete row `WP-210`: residuals still owned
 
@@ -2896,6 +3034,12 @@ LoadedDataset container mutability
 the unvalidated atEvent anchor
 segmentFileSha256 + compacted-object registration
 §12.1 port-interface landing
+~~~
+
+Not carried:
+
+~~~drop lines=45-45
+fee rounding direction → venue verification => brief: Venue drift carried forward — U-16
 ~~~
 
 **Facts.** Kept: every carried residual and its owner. `WP-230`'s row records observeTrade wired and cashBalance parsed-not-coerced, and the dataset freeze and atEvent carried forward, so the brief names the next bounded simulation grant for those. Fee rounding direction is U-16 under Venue drift. History: `work-packages-waves-0-2.md`.
@@ -2947,7 +3091,7 @@ ReducePositionIntent.direction
 
 ## RW-104: Complete row `WP-200-FU1`: residuals still owned
 
-Excerpt of base line 48:
+Excerpts of base line 48:
 
 ~~~excerpt lines=48-48
 Follow-ups routed: the packages/risk GRANT-AND-WIDEN round (next in queue, carries this round's base/tip measurements), the packages/decimal round (r1 NOTE-1 + WP-220 r1 M2 + GOV-2A follow-up 5), the schema-boundary §3 LIVE→CLOSED row flips (contract-owner ride, EXECUTED 2026-09-05: `7d798f5` + corrective `e060f70` after a Codex confirming round on gpt-6-astra — the first Astra round of this run — returned exactly one MEDIUM, two remaining stale mirror-shape sites, closed with the reviewer's own site list; arithmetic, ADR-020 framing, and closure support all independently confirmed), the pnl helper census, r2's two doc-wording LOWs.
@@ -2957,7 +3101,7 @@ Rulings: availability class GRANT-AND-WIDEN (the packages/risk grant should cove
 New:
 
 ~~~new
-- `WP-200-FU1`: routed follow-ups still owed: the pnl helper census, and r2's two doc-wording LOWs. The `applyPnlRecord` state is accepted as a residual.
+- `WP-200-FU1`: routed follow-ups still owed: the pnl helper census, and r2's two doc-wording LOWs. The `applyPnlRecord` state is accepted as a residual. Known risks: the `…OfValidated` cores are an internal pre-D1 surface (not re-exported; internal use unpinned). The ports guard is a text guard, which a dynamic specifier evades.
 ~~~
 
 Keep (in both texts):
@@ -2965,9 +3109,25 @@ Keep (in both texts):
 ~~~keep
 the pnl helper census
 r2's two doc-wording LOWs
+applyPnlRecord state
+OfValidated cores are an internal pre-D1 surface
+internal use unpinned
+ports guard is a text guard
 ~~~
 
-**Facts.** Kept: the two routed follow-ups no later row records, and the accepted `applyPnlRecord` state residual. Closed elsewhere: the risk GRANT-AND-WIDEN round, the decimal round and NOTE-1 (`WP-020-FU1` (a)-(d)); the §3 row flips were executed (`7d798f5`, `e060f70`). History: `work-packages-waves-0-2.md`.
+~~~excerpt lines=48-48
+Known risks for r2: the `…OfValidated` cores are an internal pre-D1 surface (pinned not-re-exported, internal use unpinned); ports guard is a text guard (dynamic-specifier evasion, S3/S4-precedent shape).
+~~~
+
+Not carried:
+
+~~~drop lines=48-48
+completion record with residuals and owned follow-ups: `docs/handoffs/WP-200-FU1.md`) => history: the completion record's path
+Rulings: availability class GRANT-AND-WIDEN => closed-by `WP-020-FU1` (its (d): the whole append surface)
+transitive node:util RESIDUAL, no governance note owed => history: a ruling that owes nothing
+~~~
+
+**Facts.** Kept: the two routed follow-ups no later row records, the accepted `applyPnlRecord` state residual, and the two r2 known risks: the internal `…OfValidated` surface and the text-only ports guard (r4 restores both; `docs/handoffs/WP-200-FU1.md` lines 83-87 keep them). Closed elsewhere: the risk GRANT-AND-WIDEN round, the decimal round and NOTE-1 (`WP-020-FU1` (a)-(d)); the §3 row flips were executed (`7d798f5`, `e060f70`). History: `work-packages-waves-0-2.md`.
 
 ## RW-105: Complete row `GOV-2A`: residuals still owned
 
@@ -3013,6 +3173,14 @@ Keep (in both texts):
 defensively-dead CANCEL arm in build.ts:707-712
 ~~~
 
+Not carried:
+
+~~~drop lines=52-52
+**R1-L1** deferred LOW — exported `buyLimitPrice`/`sellLimitPrice` => brief: Residual queue — `N3`
+**R1-N2** `node:util` now in a third package AND a new file => closed-by `GOV-2A` (the §2.2 built-in allowlist)
+**R1-N4** third mirror duplication => closed-by `WP-180-FU2` (it discharged R1-N4)
+~~~
+
 **Facts.** Kept: R1-N3. R1-L1 is the brief's `N3` row. Closed elsewhere: R1-N4 (`WP-180-FU2` discharged it) and R1-N2 (`node:util`, the `GOV-2A` built-in allowlist). History: `work-packages-waves-0-2.md`.
 
 ## RW-107: Complete row `WP-020-FU1`: residuals still owned
@@ -3037,6 +3205,14 @@ the double-guard on two delegating entry points
 the 10.3s ledger battery file
 ~~~
 
+Not carried:
+
+~~~drop lines=54-54
+one coverage LOW — the dual-intrinsic refusal-restoration pin — owed to the risk remainder round => closed-by `WP-180-FU3` (the risk remainder round)
+Completion record with residuals and owned follow-ups: `docs/handoffs/WP-020-FU1.md` => history: the completion record's path
+risk-remainder round, ledger/pnl accumulators, schema-boundary §2 index-name row (contract-owner) => closed-by `WP-180-FU3`, `WP-200-FU2`, `GOV-2C`
+~~~
+
 **Facts.** Kept: the three residual risks. Closed elsewhere: the dual-intrinsic pin (`WP-180-FU3`), the ledger/pnl accumulators (`WP-200-FU2`), and the schema-boundary row updates (the contract-owner docs round, `GOV-2C`). History: `work-packages-waves-0-2.md`.
 
 ## RW-108: Complete row `WP-230`: residuals still owned
@@ -3054,7 +3230,7 @@ Follow-ups: the flake budget (WP-200 owner), `shadowExposureSnapshotCovering` (c
 New:
 
 ~~~new
-- `WP-230`: follow-ups: the flake budget (WP-200 owner); `shadowExposureSnapshotCovering` (capital-allocator); a §7.7 QuoteLevel outcome-token ADR; live-owner attribution for history-loaded positions; the arena-error-construction schema-boundary §2 candidate row. Known risks: SHADOW has no execution semantics until an independent-book design lands (README follow-up 4); the ownership gate is structural, not typed, with the LIVE arm as backstop; an unknown submission holds both reservations deliberately; the partial-fill double-count between posting and terminal state (fail-closed). N3: the first BASKET emitter owes the probe.
+- `WP-230` follow-ups: the flake budget (WP-200 owner); `shadowExposureSnapshotCovering` (capital-allocator); a §7.7 QuoteLevel outcome-token ADR. Also: live-owner attribution for history-loaded positions, and the arena-error-construction schema-boundary §2 candidate row. Known risks: SHADOW has no execution semantics until an independent-book design lands (README follow-up 4). The ownership gate is structural, not typed, with the LIVE arm as backstop. An unknown submission holds both reservations deliberately. The partial-fill double-count between posting and terminal state fails closed. N3: the first BASKET emitter owes the probe.
 ~~~
 
 Keep (in both texts):
@@ -3067,6 +3243,18 @@ SHADOW has no execution semantics until an independent-book design lands
 the first BASKET emitter owes the probe
 arena-error-construction schema-boundary §2 candidate row
 partial-fill double-count between posting and terminal state
+with the LIVE arm as backstop
+holds both reservations deliberately
+~~~
+
+Not carried:
+
+~~~drop lines=55-55
+the SHADOW covering snapshot built locally from `EXPOSURE_ZERO` => brief: Residuals recorded in Complete package rows — WP-230 (`shadowExposureSnapshotCovering`, the same follow-up)
+the ledger schema-boundary battery timeout flake CHARACTERIZED => brief: Residuals recorded in Complete package rows — WP-230 (the flake budget)
+observeTrade WIRED, cashBalance parsed-not-coerced, dataset-freeze/atEvent carried forward => brief: Residuals recorded in Complete package rows — WP-210 (R5-L1 and R5-L3, the next bounded simulation grant)
+WP-200 halt-enforcement reads BOTH ledger sections together => history: done by this package
+`immediate_order_type` RESOLVED => history: resolved by this package
 ~~~
 
 **Facts.** Kept: every follow-up and known risk the row names. Closed elsewhere: the strategyInstanceId ruling (`ALLOC-1`, `TRDR-1`), the risk-seam ENTRY disposition (`RISK-2`), and r3 LOW-1/NOTE-1 (carried by `WP-240`, below). The flake characterization and the packet are history in `work-packages-waves-0-2.md`.
@@ -3096,6 +3284,12 @@ input-snapshot __proto__ permission decision is a named future round
 reaches the persisted record.sourceEvent verbatim
 ~~~
 
+Not carried:
+
+~~~drop lines=56-56
+DECISION_VIEW/EVALUATION_VIEW differ on exactly one axis, pinned both directions => history: a pinned design fact, not an obligation
+~~~
+
 **Facts.** Kept: the open `values` defeat with its closing condition, and the `__proto__` permission decision with the fact it rests on. The schema-boundary §3 row flip rode the docs round. The review rounds are history in `work-packages-waves-0-2.md`.
 
 ## RW-110: Complete row `WP-240`: residuals still owned
@@ -3105,13 +3299,13 @@ Excerpt of base line 57:
 ~~~excerpt lines=57-57
 D3 a second exposition renderer (WP-140's is closure-bound; collapse is a follow-up);
 REPORTED-NOT-PATCHED: WP-230 r3 LOW-1/NOTE-1 stay carried (the packet ruled apps/trader read-only — they move to the future apps/trader grant that also serves the health endpoint + safety-table collapse);
-an engaged kill switch does not reach a running trader (no IPC seam in-repo — composition obligation, seam design queued); in-memory audit log not durable
+KNOWN RISKS (disclosed, honest): postgres audit sink typecheck-pinned ONLY (no Docker; NO integration evidence claimed; `randomUUID()` v4 vs `internal.uuid_v7` domain conflict documented in code — durable composition must use `uuidV7()`); the trader-health seam is caller/wire input NOT wired to a trader (apps/trader exposes no HTTP health endpoint; `control_trader_health_available` reads 0 and the first panel says so); an engaged kill switch does not reach a running trader (no IPC seam in-repo — composition obligation, seam design queued); in-memory audit log not durable (correct for PAPER-no-database; Postgres port ready); bearer-token model loopback-PAPER-sized (no rotation/expiry; off-host needs TLS + stronger credentials); dashboards never imported into a real Grafana (validated as JSON only).
 ~~~
 
 New:
 
 ~~~new
-- `WP-240`, beyond `N8`: D3, a second exposition renderer (collapse is a follow-up); an engaged kill switch does not reach a running trader (no IPC seam in-repo; seam design queued); the in-memory audit log not durable (correct for PAPER without a database). WP-230 r3 LOW-1/NOTE-1 stay carried, to the future apps/trader grant.
+- `WP-240`, beyond `N8`: D3, a second exposition renderer (collapse is a follow-up). An engaged kill switch does not reach a running trader (no IPC seam in-repo; seam design queued). The in-memory audit log is not durable (correct for PAPER without a database). The postgres audit sink is typecheck-pinned only, with no integration evidence. It mints ids with `randomUUID()` (v4), which conflicts with the `internal.uuid_v7` domain, so durable composition must use `uuidV7()` (`apps/control-api/src/main.ts:80-90`). The bearer-token model is sized for loopback PAPER: no rotation or expiry; off-host needs TLS and stronger credentials. WP-230 r3 LOW-1/NOTE-1 stay carried, to the future apps/trader grant.
 ~~~
 
 Keep (in both texts):
@@ -3120,15 +3314,29 @@ Keep (in both texts):
 collapse is a follow-up
 an engaged kill switch does not reach a running trader
 seam design queued
-in-memory audit log not durable
+in-memory audit log
+correct for PAPER
 WP-230 r3 LOW-1/NOTE-1 stay carried
+typecheck-pinned
+randomUUID()
+internal.uuid_v7
+durable composition must use uuidV7()
+bearer-token model
+off-host needs TLS
 ~~~
 
-**Facts.** Kept: the design follow-ups outside `N8`. M-1, M-3, the LOWs and N-4 are the brief's `N8` row; M-2 closed with `TRDR-3`. Not carried: N-1 (the family count, reconciled in the record) and the deferred root wiring (ratified at merge). History: `work-packages-waves-0-2.md`.
+Not carried:
+
+~~~drop lines=57-57
+the trader-health seam is caller/wire input NOT wired to a trader => closed-by `TRDR-3` (the trader health endpoint; M-2 closed)
+dashboards never imported into a real Grafana => brief: Human items — H3 (a real Grafana imported and rendered the dashboards, 2026-09-29)
+~~~
+
+**Facts.** Kept: the design follow-ups outside `N8`, and every open known risk: the in-memory audit log; the typecheck-pinned postgres sink with its `randomUUID()` v4 vs `internal.uuid_v7` conflict (at `f43efe6`, `apps/control-api/src/main.ts` lines 80-90 still mint ids with `randomUUID()`); and the loopback-PAPER bearer-token model. r4 restores the last two. M-1, M-3, the LOWs and N-4 are the brief's `N8` row. M-2 and the unwired trader-health seam closed with `TRDR-3`, and H3 imported the dashboards into a real Grafana. Not carried: N-1 (the family count, reconciled in the record) and the deferred root wiring (ratified at merge). History: `work-packages-waves-0-2.md`.
 
 ## RW-111: Complete row `WP-250`: residuals still owned
 
-Excerpt of base line 58:
+Excerpts of base line 58:
 
 ~~~excerpt lines=58-58
 F2 the replay-determinism panel's producer stays PENDING with its named owner. Completion record: `docs/handoffs/WP-250.md` (incl. the next-e2e-touch pin follow-ups: exact-count assertions — this round PROVED prose can desynchronize — the `"50"` pin, the LOW-3 tightening).
@@ -3137,7 +3345,7 @@ F2 the replay-determinism panel's producer stays PENDING with its named owner. C
 New:
 
 ~~~new
-- `WP-250`: F2, the replay-determinism panel's producer stays PENDING with its named owner. The next-e2e-touch pin follow-ups in `docs/handoffs/WP-250.md`: exact-count assertions, the `"50"` pin, the LOW-3 tightening.
+- `WP-250`: F2, the replay-determinism panel's producer stays PENDING with its named owner. The next-e2e-touch pin follow-ups in `docs/handoffs/WP-250.md`: exact-count assertions, the `"50"` pin, the LOW-3 tightening. A disclosed known risk: the `SHARED_BOOK_ACCOUNTING_MODE` backstop is read-in-source only.
 ~~~
 
 Keep (in both texts):
@@ -3146,9 +3354,22 @@ Keep (in both texts):
 replay-determinism panel's producer stays PENDING
 next-e2e-touch pin follow-ups
 the LOW-3 tightening
+stays PENDING with its named owner
+SHARED_BOOK_ACCOUNTING_MODE backstop
+read-in-source only
 ~~~
 
-**Facts.** Kept: F2 and the next-e2e-touch pin follow-ups. F1 (no realized round trip) closed with `RISK-2` and `BRACKET-1a`. The golden, the scenario and the review are history in `work-packages-waves-0-2.md`.
+~~~excerpt lines=58-58
+Known risks: F1 no realized round trip reachable (above); F2 the replay-determinism dashboard panel still has no producer (hard-forbidden paths — stays PENDING with its named owner); the `SHARED_BOOK_ACCOUNTING_MODE` backstop read-in-source only, disclosed.
+~~~
+
+Not carried:
+
+~~~drop lines=58-58
+F1 no realized round trip reachable (above) => closed-by `RISK-2`, `BRACKET-1a`
+~~~
+
+**Facts.** Kept: F2, the next-e2e-touch pin follow-ups, and the known risk that the `SHARED_BOOK_ACCOUNTING_MODE` backstop is read-in-source only (r4 restores it). F1 (no realized round trip) closed with `RISK-2` and `BRACKET-1a`. The golden, the scenario and the review are history in `work-packages-waves-0-2.md`.
 
 ## RW-112: Complete row `WP-180-FU3`: residuals still owned
 
@@ -3161,7 +3382,7 @@ Residuals owned (docs/handoffs/WP-180-FU3.md): zod array-assembly availability r
 New:
 
 ~~~new
-- `WP-180-FU3`: r1 N1, the ownEntry guard untested (pre-existing); r1 N2, the `lots.ts:151` sort sentence; r1 N4, the approved-intent five identity fields as one deferred decision. The zod array-assembly residual is the `isFreshOrdinaryContainer` round (Schema boundary above).
+- `WP-180-FU3`: r1 N1, the ownEntry guard untested (pre-existing); r1 N2, the `lots.ts:151` sort sentence; r1 N4, the approved-intent five identity fields as one deferred decision. The zod array-assembly availability residual (18 rows/intrinsic, fail-closed) is the `isFreshOrdinaryContainer` round (Schema boundary above). That widening is a designed round with capital-allocator/ledger/pnl/strategy-runtime in scope.
 ~~~
 
 Keep (in both texts):
@@ -3170,9 +3391,18 @@ Keep (in both texts):
 ownEntry guard untested
 lots.ts:151 sort sentence
 approved-intent five identity fields as one deferred decision
+zod array-assembly availability residual
+18 rows/intrinsic, fail-closed
+capital-allocator/ledger/pnl/strategy-runtime in scope
 ~~~
 
-**Facts.** Kept: N1, N2 and N4. The zod array-assembly residual is the `isFreshOrdinaryContainer` round under Schema boundary; N3's ADR-016 amendment is recorded. The queued doc follow-ups went to the contract-owner docs round (`GOV-2C`). History: `work-packages-rounds.md`.
+Not carried:
+
+~~~drop lines=59-59
+r1 N3 ADR-016 §2 evidence shape for this one field now issues-based => history: ADR-016's dated amendment is recorded, and no live consumer loses anything
+~~~
+
+**Facts.** Kept: N1, N2 and N4, and the zod array-assembly availability residual with its size (18 rows/intrinsic, fail-closed) and the `isFreshOrdinaryContainer` round's four-package scope (r4 restores both). N3's ADR-016 amendment is recorded. The queued doc follow-ups went to the contract-owner docs round (`GOV-2C`). History: `work-packages-rounds.md`.
 
 ## RW-113: Complete row `WP-160-FU1`: residuals still owned
 
@@ -3185,7 +3415,7 @@ Residuals with owners: R1-L1 the `snapshotReference` `as`-cast weakens the base 
 New:
 
 ~~~new
-- `WP-160-FU1`: R1-L1, the `snapshotReference` `as`-cast weakens the base structural typecheck (a typed intermediate is owned by the next features round). R1-L2, deep-vs-shallow unpinned: a non-aliasing assertion is owed when a consumer starts indexing. R1-N1, the returned array keeps Array.prototype; owner: the future WP indexing selected values into PostgreSQL.
+- `WP-160-FU1`: R1-L1, the `snapshotReference` `as`-cast weakens the base structural typecheck (a typed intermediate is owned by the next features round). R1-L2, deep-vs-shallow unpinned: a non-aliasing assertion is owed when a consumer starts indexing. R1-N1, the returned array keeps Array.prototype; owner: the future WP indexing selected values into PostgreSQL. R1-N2: the input-side/control-flow records remain prototype-bearing (the SUCCESS wrapper, validateFeatureInput, materializeInput, parseUtcTimestamp). Owner: the shallow own-property emitter design, owned by a bounded GOV-2A successor round.
 ~~~
 
 Keep (in both texts):
@@ -3194,9 +3424,19 @@ Keep (in both texts):
 snapshotReference as-cast weakens the base structural typecheck
 deep-vs-shallow unpinned
 the future WP indexing selected values into PostgreSQL
+remain prototype-bearing
+SUCCESS wrapper, validateFeatureInput, materializeInput, parseUtcTimestamp
+shallow own-property emitter design
+bounded GOV-2A successor round
 ~~~
 
-**Facts.** Kept: R1-L1, R1-L2 and R1-N1 with owners. R1-N2 is the input-side line under Schema boundary. The doc flip went to the docs round (`GOV-2C`); the sequencing note was discharged when `REC-1` ran. History: `work-packages-rounds.md`.
+Not carried:
+
+~~~drop lines=60-60
+flip schema-boundary §3 `packages/features` (output side) + GOV-2A §5 item 4 to executed => closed-by `GOV-2C` (the doc flip)
+~~~
+
+**Facts.** Kept: R1-L1, R1-L2 and R1-N1 with owners, and R1-N2 with its four named records and its owner, the shallow own-property emitter design in a bounded GOV-2A successor round (r4 restores them; the Schema boundary line keeps only a summary). The doc flip went to the docs round (`GOV-2C`); the sequencing note was discharged when `REC-1` ran. History: `work-packages-rounds.md`.
 
 ## RW-114: Complete row `REC-1`: residuals still owned
 
@@ -3220,6 +3460,12 @@ ownControlId absent/malformed conflation
 8 downstream uncontained .safeParse
 no coinbase/rtds byte cap
 four near-parallel doors
+~~~
+
+Not carried:
+
+~~~drop lines=61-61
+§3 recorder rows + tally + §5 item 3 EXECUTED + the CLOB grant entry => closed-by `GOV-2C` (the docs round)
 ~~~
 
 **Facts.** Kept: all eight owned residuals. D2-not-performed and the config-door check are also under Schema boundary. The CLOB grant ran as `CLOB-1`; the doc follow-ups went to `GOV-2C`. History: `work-packages-rounds.md`.
@@ -3246,6 +3492,13 @@ unparsed withLiveOwner surfaces
 the arena/skipChecks pin gap
 ~~~
 
+Not carried:
+
+~~~drop lines=62-62
+ADR-021 second amendment (allocator corrected; evidence-shape non-change; the cap-evasion finding) => closed-by `GOV-2C` (the docs round)
+WP-180-FU3 follow-up 1 done => history: done
+~~~
+
 **Facts.** Kept: N1-N4. L1 and L2 were `TRDR-1`'s obligations, and `TRDR-1` is Complete. The ADR-021 doc follow-ups went to `GOV-2C`. History: `work-packages-rounds.md`.
 
 ## RW-116: Complete row `TRDR-1`: residuals still owned
@@ -3268,6 +3521,7 @@ Keep (in both texts):
 phase-2 report R1 narrative addendum
 docs/adr/README.md:102
 local Uuid version-blindness asymmetry for runId/configId/marketId
+the comment-staleness round's fixtures/scenario prose
 ~~~
 
 **Facts.** Kept: all four owned residuals. The tripwire retirement is history in `work-packages-rounds.md`.
@@ -3294,6 +3548,15 @@ LOW-3 unfrozen lists
 NOTE-2 the decimal throw escaping the function
 ~~~
 
+Not carried:
+
+~~~drop lines=64-64
+**r1 MED-1 the projection-side dot-read class** => closed-by `UNIV-3` (the 9c state-side round)
+r1 MED-2 (header corrected pre-merge) => history: corrected before the merge
+the un-doored envelope layer => closed-by `UNIV-2`
+**the registry registration doors, newly measured and reviewer-reproduced** => closed-by `UNIV-2`
+~~~
+
 **Facts.** Kept: the LOW and NOTE items. Closed elsewhere: MED-1, the projection dot-read class (`UNIV-3`, the 9c queue); the envelope layer and the registration doors (`UNIV-2`); MED-2 was corrected before merge. History: `work-packages-rounds.md`.
 
 ## RW-118: Complete row `SETL-1`: residuals still owned
@@ -3316,6 +3579,14 @@ Keep (in both texts):
 cold-lazy poisoning contained-not-cured
 zod facts for the §2 class table
 grammar-corpus sweeps for future door reviews
+~~~
+
+Not carried:
+
+~~~drop lines=65-65
+the observation/evaluation door (evaluateSettlement dot-reads; un-doored SettlementObservationSchema — next grant) => closed-by `SETL-2`
+one corpus value for single-group case drift => closed-by `SETL-2` (it added six)
+r1 N3 left alone with an argued call => history: left alone with an argued call
 ~~~
 
 **Facts.** Kept: the contained poisoning, the three zod facts and the method gap. The observation/evaluation door closed with `SETL-2`; the case-drift corpus value too (`SETL-2` added six). r1 N3 was left alone with an argued call. History: `work-packages-rounds.md`.
@@ -3341,6 +3612,12 @@ do not discriminate base from tip
 follow-up hardening
 ~~~
 
+Not carried:
+
+~~~drop lines=66-66
+own `__proto__` is JSON-REACHABLE (fail-closed refusal, relabelled) => history: a review correction on the record
+~~~
+
 **Facts.** Kept: the non-discriminating tests and the hardening they are owed. The `Array.prototype` arrays and the shared-materializer question are under Schema boundary. History: `work-packages-rounds.md`.
 
 ## RW-120: Complete row `UNIV-2`: residuals still owned
@@ -3364,6 +3641,12 @@ cold-discriminatedUnion cache poisoning
 ADR-020 governance
 ~~~
 
+Not carried:
+
+~~~drop lines=67-67
+the `parameters.ts` output-side adoption (r1 MED-1) => closed-by `UNIV-3` (the item 9c state-side round)
+~~~
+
 **Facts.** Kept: the permanent cache poisoning for ADR-020 governance. The other four residuals went to the item 9c state-side round, `UNIV-3`, which closed that queue. History: `work-packages-rounds.md`.
 
 ## RW-121: Complete row `WP-060-FU1`: residuals still owned
@@ -3377,7 +3660,7 @@ Residuals (owned, in `docs/handoffs/WP-060-FU1.md`): an inherited `venue` fail-c
 New:
 
 ~~~new
-- `WP-060-FU1`: an inherited `venue` fail-closes an array-payload envelope via zod's refinement; the door's per-byte copy cost; the new fail-closed refusals (depth 16+, non-plain payload members); `encodeWireJson` is guarded by a differential corpus.
+- `WP-060-FU1`: `redis/transport.ts` still keys the epoch cursor on the caller's object (no live route). An inherited `venue` fail-closes an array-payload envelope via zod's refinement. Also: the door's per-byte copy cost; the new fail-closed refusals (depth 16+, non-plain payload members). `encodeWireJson` is guarded by a differential corpus.
 ~~~
 
 Keep (in both texts):
@@ -3387,9 +3670,10 @@ an inherited venue fail-closes an array-payload envelope via zod's refinement
 per-byte copy cost
 depth 16+, non-plain payload members
 encodeWireJson is guarded by a differential corpus
+keys the epoch cursor on the caller's object (no live route)
 ~~~
 
-**Facts.** Kept: all five owned residuals; the `redis/transport.ts` epoch cursor is the line under Schema boundary. The implementer and reviewer list is history in `work-packages-rounds.md`.
+**Facts.** Kept: all five owned residuals, including the `redis/transport.ts` epoch cursor keyed on the caller's object (no live route), which r3 had left to the Schema boundary summary. The implementer and reviewer list is history in `work-packages-rounds.md`.
 
 ## RW-122: Complete row `SER-1`: residuals still owned
 
@@ -3414,6 +3698,12 @@ the ceiling is a stack-budget argument
 explicit-undefined oracle text preserved
 ~~~
 
+Not carried:
+
+~~~drop lines=72-72
+the reviewer's sandbox could not run the root suite (EPERM) — orchestrator-reproduced => history: a process fact, orchestrator-reproduced
+~~~
+
 **Facts.** Kept: the four design residuals. Not carried: the reviewer's sandbox EPERM note (a process fact, orchestrator-reproduced). History: `work-packages-rounds.md`.
 
 ## RW-123: Complete row `SER-2`: residuals still owned
@@ -3427,7 +3717,7 @@ Residuals (owned, `docs/handoffs/SER-2.md`): the `details.record` format change 
 New:
 
 ~~~new
-- `SER-2` (`docs/handoffs/SER-2.md`): the `details.record` format change for malformed segments is disclosed, and nothing pinned the old shape. `excludedSegments[].gatewayEpoch` stays unbounded (pre-existing, size only, never a refusal); owner: a later `storage-parquet` round. `parseDatasetManifest`'s cast (`dataset-manifest.ts:457`) is the one hole in the compiler-checked claim; owner: `packages/storage-parquet`. `storage-wal`'s `SegmentIssue.details` still holds the raw discriminator. It is safe today: a fatally-issued segment gets no manifest. The trigger: any consumer that routes `SegmentIssue.details` or `WalError.details` through `encodePlainJson`; owner: whoever adds it. The shape vocabulary is imitable by the text it describes.
+- `SER-2` (`docs/handoffs/SER-2.md`): the `details.record` format change for malformed segments is disclosed, and nothing pinned the old shape. `excludedSegments[].gatewayEpoch` stays unbounded (pre-existing, size only, never a refusal). Owner: a later `storage-parquet` round. `parseDatasetManifest`'s cast (`dataset-manifest.ts:457`) is the one hole in the compiler-checked claim. Owner: `packages/storage-parquet`. `storage-wal`'s `SegmentIssue.details` still holds the raw discriminator. It is safe today: a fatally-issued segment gets no manifest. The trigger is any consumer that routes `SegmentIssue.details` or `WalError.details` through `encodePlainJson`. Owner: whoever adds it. The shape vocabulary is imitable by the text it describes.
 ~~~
 
 Keep (in both texts):
@@ -3457,7 +3747,7 @@ Seven residuals owned (`docs/handoffs/SER-3.md`), all accepted with reasons: `ru
 New:
 
 ~~~new
-- `SER-3` (`docs/handoffs/SER-3.md`), seven residuals, all accepted with reasons: `runtime.ts` `jsonBody`; `TraderHealthSource`, where a foreign source skipping the door yields 500 where base answered 200 (the closure is a brand in `observability`: brand `TraderHealthReportInput`, `metric-shapes.ts:196`, outside SER-3's paths); the audit sink's direct-caller path; `enqueue` (verdict-equivalent under both transports); the RTDS hole divergence; the iterator-vs-index VALUES divergence at `control-plane.ts:440` (ordinary species, encoder satisfied, diagnostics not decisions; **N4**, the one sentence owed at the site by the docs round, was added by `GOV-2C`); `encodePlainJson`'s `Proxy` residual.
+- `SER-3` (`docs/handoffs/SER-3.md`) has seven residuals, all accepted with reasons. (1) `runtime.ts` `jsonBody`. (2) `TraderHealthSource`: a foreign source skipping the door yields 500 where base answered 200. The closure is a brand in `observability`: brand `TraderHealthReportInput` (`metric-shapes.ts:196`), outside SER-3's paths. (3) The audit sink's direct-caller path. (4) `enqueue`, verdict-equivalent under both transports. (5) The RTDS hole divergence. (6) The iterator-vs-index VALUES divergence at `control-plane.ts:440`: ordinary species, encoder satisfied, diagnostics not decisions. SER-3's N4, the one sentence owed at that site by the docs round, was added by `GOV-2C`. (7) `encodePlainJson`'s `Proxy` residual.
 ~~~
 
 Keep (in both texts):
@@ -3474,7 +3764,7 @@ ordinary species, encoder satisfied, diagnostics not decisions
 encodePlainJson's Proxy residual
 ~~~
 
-**Facts.** Kept: all seven residuals. N4 is closed: the row says it "owes one sentence at the site, carried by the docs round", and `GOV-2C`'s row records "N4's one sentence at `control-plane.ts:440`" as shipped (the comment is in `apps/control-api/src/control-plane.ts` at `f43efe6`). From `docs/handoffs/SER-3.md` residual 2 and its follow-up, the brief adds the brand's target, `TraderHealthReportInput`, at `packages/observability/src/control/metric-shapes.ts:196`. Not carried: the M2/N1-N3 review chain, the eight container shapes, and the gates. The Codex process deviation is ratified under `H7`. History: `work-packages-rounds.md`.
+**Facts.** Kept: all seven residuals, one short sentence each (r4 splits the r3 clause chain). N4 is closed: the row says it "owes one sentence at the site, carried by the docs round", and `GOV-2C`'s row records "N4's one sentence at `control-plane.ts:440`" as shipped (the comment is in `apps/control-api/src/control-plane.ts` at `f43efe6`). The brief writes "SER-3's N4" to tell it from `GOV-2B`'s `test:replay` N4. From `docs/handoffs/SER-3.md` residual 2 and its follow-up, the brief adds the brand's target, `TraderHealthReportInput`, at `packages/observability/src/control/metric-shapes.ts:196`. Not carried: the M2/N1-N3 review chain, the eight container shapes, and the gates. The Codex process deviation is ratified under `H7`. History: `work-packages-rounds.md`.
 
 ## RW-125: Complete row `TRDR-2`: residuals still owned
 
@@ -3496,6 +3786,12 @@ Keep (in both texts):
 main.ts:292's cast
 DB domain constraints invisible to the compiler
 two census holes disclosed and pinned
+~~~
+
+Not carried:
+
+~~~drop lines=76-76
+**three** of six integration suites now need Docker so GATE-1's N5 label (which says two) is stale => closed-by `CI-1` (N5)
 ~~~
 
 **Facts.** Kept: the three residuals no other row carries. `TRDR2-R8` is its own residual row; B9 closed with `BOOT-1`; the N5 label went stale and closed with `CI-1`. History: `work-packages-rounds.md`.
@@ -3521,4 +3817,621 @@ B7's STRUCTURAL cause survives its instance
 both gate homes are editable by future packages
 ~~~
 
+Not carried:
+
+~~~drop lines=78-78
+the vitest `projects` route existed and was declined for root-count stability, not impossible => history: a recorded choice, not an obligation
+js-yaml 4.3.2 first executes on the merge CI run => brief: Residual queue — `GATE1-R3`
+~~~
+
 **Facts.** Kept: the fail-fast chain and the unguarded gate homes. `GATE1-M1` and `GATE1-R3` are residual rows; the declined vitest `projects` route is a recorded choice, not an obligation. History: `work-packages-rounds.md`.
+
+## RW-127: Completion record `WP-150`: obligations still owed
+
+Excerpt of the record item at base lines 892-901:
+
+~~~excerpt lines=892-901
+- **Carried follow-ups** (owners): root devDependency + bare-specifier import
+  for the golden test (orchestrator, at a future bounded root-wiring grant —
+  the current relative import tests the public entry, not package-specifier
+  resolution); WP-120 composition root MUST stamp gap-closing REST snapshots
+  via the fetcher context (pinned by test name); WP-160 notes (division
+  options; absent-vs-zero on empty sides); WP-210 reuses serializeBook
+  (versioned polymarket-bot/order-book/v1) rather than inventing a second
+  canonical form; WP-070 follow_up 6 (best_bid/best_ask carriage) open,
+  unblocked; the renamed obligation test's long name is load-bearing
+  documentation — future renames must preserve the recorded obligation.
+~~~
+
+New:
+
+~~~new
+- `WP-150`: owed by the orchestrator, at a future bounded root-wiring grant: a root devDependency + bare-specifier import for the golden test. A WP-120 composition root MUST stamp gap-closing REST snapshots via the fetcher context (pinned by test name). WP-070 follow_up 6 (best_bid/best_ask carriage) is open and unblocked. The renamed obligation test's long name is load-bearing: future renames must preserve the recorded obligation.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+root devDependency + bare-specifier import for the golden test
+MUST stamp gap-closing REST snapshots via the fetcher context
+WP-070 follow_up 6 (best_bid/best_ask carriage)
+future renames must preserve the recorded obligation
+~~~
+
+**Facts.** Kept: the bare-specifier golden import (orchestrator), the gap-closing snapshot stamping obligation, WP-070 follow_up 6, and the load-bearing test name. The WP-160 notes and WP-210's reuse of `serializeBook` went to those packages, both Complete. New in r4 (J-01): r3 declared this record history. History: `completion-records-wave-1.md`.
+
+## RW-128: Completion record `GOV-1C`: obligations still owed
+
+Excerpt of the record item at base lines 937-945:
+
+~~~excerpt lines=937-945
+- **Carried follow-ups** (owners): bounded tooling package swapping the
+  machine `rule` field to F14 together with the pinned suite assertions,
+  and implementing F15/F16 (future bounded grant, tool + test/unit/tooling
+  in one change); WP-220 brings tests inside the purity scan; the §6.1
+  item-1 callee-resolution tripwire binds future reviewers; next full
+  venue verification round adds the resolution page + market-by-id to the
+  source index; first market-by-id consumer treats U-11 as opaque; WP-300
+  keeps the U-10 CANCELLED refusal; apps/trader builds per ADR-018;
+  WP-210/WP-230 parse causationId per domain.md §11 only.
+~~~
+
+New:
+
+~~~new
+- `GOV-1C`: the §6.1 item-1 callee-resolution tripwire binds future reviewers. The first market-by-id consumer treats U-11 as opaque. WP-300 keeps the U-10 CANCELLED refusal.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+callee-resolution tripwire binds future reviewers
+first market-by-id consumer treats U-11 as opaque
+WP-300 keeps the U-10 CANCELLED refusal
+~~~
+
+Not carried:
+
+~~~drop lines=937-945
+bounded tooling package swapping the => brief: Residuals recorded in Complete package rows — GOV-1C (the tool+suite swap); F15/F16 are `§5 item 6`'s
+venue verification round adds the resolution page + market-by-id to the => closed-by `VENUE-2` (verified-2026-09-16.md indexes both)
+apps/trader builds per ADR-018 => closed-by `WP-230`, `BUNDLE-1` (the trader bundle; BUNDLE1-LOWS (1) holds the open ADR-018 note)
+~~~
+
+**Facts.** Kept: the §6.1 item-1 tripwire, U-11 opaque for a market-by-id consumer, and WP-300's U-10 CANCELLED refusal (the verifiers named the last two; r3 declared this record history). The tool swap is the brief's GOV-1C bullet, and F15/F16 are `§5 item 6`. `VENUE-2` indexed the resolution page and market-by-id. WP-220's purity-scan item and the causationId parsing rule went to Complete packages. History: `completion-records-wave-1.md`.
+
+## RW-129: Completion record `WP-140`: obligations still owed
+
+Excerpts of the record items at base lines 1019-1021 and 1022-1030:
+
+~~~excerpt lines=1019-1021
+- Residual (LOW, disclosed): the guarantee-wording denylist is a
+  four-pattern heuristic narrowed by positive pins — novel promissory
+  phrasing needs human review at doc-change time.
+~~~
+
+~~~excerpt lines=1022-1030
+- **Follow-ups carried**: wire the exporter into the processes (apps
+  owner — loopback listeners rendering `renderRecorderMetrics`); trim
+  the compose README's duplicated restart procedure; observability
+  manifest wiring (barrel re-export, vitest devDep hygiene); the REAL
+  soak after deployment (then size admission bounds, profile compactor
+  memory, benchmark §9.1 p99 from its evidence); the 24h threshold and
+  window-composition rule remain orchestrator-ratifiable if a different
+  bar is intended; `data.raw_segments` → WP-210 (operator decision
+  2026-09-02).
+~~~
+
+New:
+
+~~~new
+- `WP-140`: a LOW residual. The guarantee-wording denylist is a four-pattern heuristic, so novel promissory phrasing needs human review at doc-change time. Follow-ups: wire the exporter into the processes (apps owner: loopback listeners rendering `renderRecorderMetrics`); trim the compose README's duplicated restart procedure; observability manifest wiring (barrel re-export, vitest devDep hygiene). After the REAL soak (H4): size admission bounds, profile compactor memory, benchmark §9.1 p99 from its evidence. The 24h threshold and window-composition rule remain orchestrator-ratifiable.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+four-pattern heuristic
+novel promissory phrasing needs human review at doc-change time
+wire the exporter into the processes
+trim the compose README's duplicated restart procedure
+observability manifest wiring (barrel re-export, vitest devDep hygiene)
+size admission bounds, profile compactor memory, benchmark §9.1 p99
+24h threshold and window-composition rule remain orchestrator-ratifiable
+~~~
+
+Not carried:
+
+~~~drop lines=1022-1030
+`data.raw_segments` → WP-210 (operator decision => brief: Residuals recorded in Complete package rows — WP-210 (the segmentFileSha256 + compacted-object registration, owned by the migration owner)
+~~~
+
+**Facts.** Kept: the LOW residual (novel promissory wording needs human review) and every carried follow-up, including the post-soak sizing, profiling and §9.1 p99 work. `data.raw_segments` passed to WP-210, whose row routes the registration to the migration owner. New in r4 (J-01). History: `completion-records-wave-1.md`.
+
+## RW-130: Completion record `WP-120`: obligations still owed
+
+Excerpt of the record item at base lines 1084-1092:
+
+~~~excerpt lines=1084-1092
+- **Follow-ups carried**: WP-140 recorder runbook (bidirectional exit
+  contract; deadline and `[disposal]` operator signals; liveness alarming;
+  queue metrics charting; admission-bound sizing from soak data);
+  `GATEWAY_RETENTION_EVENTS` fail-closed parsing; adapter-level
+  `socket.close()` guards (packages/polymarket-public, packages/
+  coinbase-adapter — outside WP-120 paths); `runGatewaySequence` reuse for
+  any future composition root; the `causationId` format's contract
+  registration; `docker compose config` validation of the compose fragment
+  (Docker unavailable in this environment — never claimed run).
+~~~
+
+New:
+
+~~~new
+- `WP-120`: the WP-140 recorder runbook still owes the bidirectional exit contract, the deadline and `[disposal]` operator signals, liveness alarming, queue metrics charting, and admission-bound sizing from soak data. Also owed: `GATEWAY_RETENTION_EVENTS` fail-closed parsing; adapter-level `socket.close()` guards (`packages/polymarket-public`, `packages/coinbase-adapter`); `runGatewaySequence` reuse for any future composition root. `docker compose config` validation of the compose fragment has never run.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+bidirectional exit contract
+admission-bound sizing from soak data
+GATEWAY_RETENTION_EVENTS fail-closed parsing
+adapter-level socket.close() guards
+runGatewaySequence reuse for any future composition root
+docker compose config validation of the compose fragment
+~~~
+
+Not carried:
+
+~~~drop lines=1084-1092
+the `causationId` format's contract => closed-by `GOV-1C` (domain.md §11, the causationId contract)
+~~~
+
+**Facts.** Kept: the recorder-runbook items, fail-closed `GATEWAY_RETENTION_EVENTS` parsing, the adapter `socket.close()` guards, `runGatewaySequence` reuse, and the never-run compose validation. `GOV-1C` registered the `causationId` contract. New in r4 (J-01). History: `completion-records-wave-1.md`.
+
+## RW-131: Completion record `WP-130`: obligations still owed
+
+Excerpt of the record item at base lines 1131-1140:
+
+~~~excerpt lines=1131-1140
+- **Follow-ups carried**: WAL contract owner must define cross-epoch
+  chronology or rule mixed-epoch directories out (compactor refuses
+  until then); a dataset-manifest ADR pinning the two digest roles,
+  `nullable` = repetition semantics, and the strict-JSON profile
+  (UTF-8-only, RFC 8259 literals, unique keys); WP-140 memory/deletion
+  profiling; replace the operator incident file with the
+  `data_quality_incidents` query; persist `CompactionResult.manifest`
+  to `data.*`; repo-wide runtime-build convention (esbuild precedent);
+  periodic dependency review + ADR before any upgrade that changes
+  archived bytes.
+~~~
+
+New:
+
+~~~new
+- `WP-130`: WP-140 memory/deletion profiling is owed, in the soak. Also owed: replace the operator incident file with the `data_quality_incidents` query; persist `CompactionResult.manifest` to `data.*`; periodic dependency review + ADR before any upgrade that changes archived bytes.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+WP-140 memory/deletion profiling
+replace the operator incident file with the data_quality_incidents query
+persist CompactionResult.manifest to data.*
+periodic dependency review + ADR before any upgrade that changes archived bytes
+~~~
+
+Not carried:
+
+~~~drop lines=1131-1140
+WAL contract owner must define cross-epoch => closed-by `GOV-1C` (wal-format §12.1: epochs are identity, single-epoch compaction ratified)
+a dataset-manifest ADR pinning the two digest roles => closed-by `GOV-1C` (ADR-017)
+repo-wide runtime-build convention (esbuild precedent) => closed-by `GOV-1C` (ADR-018)
+~~~
+
+**Facts.** Kept: the memory/deletion profiling, the incident query, persisting the compaction manifest, and the dependency-review rule. `GOV-1C` settled the cross-epoch chronology, the dataset-manifest ADR and the runtime-build convention. New in r4 (J-01). History: `completion-records-wave-1.md`.
+
+## RW-132: Completion record `WP-110`: obligations still owed
+
+Excerpt of the record item at base lines 1179-1187:
+
+~~~excerpt lines=1179-1187
+- **Follow-ups carried**: composition root (WP-120/WP-160/WP-170) must
+  narrow `SettlementActivationVerdict` into the discriminated view (the
+  wiring site is where assignability becomes a type error);
+  `catalog.settlement_specs.payoff_model NOT NULL` divergence owned by
+  the migration owner; venue-register rows for WP-110's non-confirmations;
+  a `MarketClosed`-equivalent venue signal remains unconfirmed; seed
+  loader and a human-reviewed spec for `btc-15m-updown` before any
+  model-dependent use; matcher fixture U+200B escapes must not be
+  reformatted to literals.
+~~~
+
+New:
+
+~~~new
+- `WP-110`: a composition root must narrow `SettlementActivationVerdict` into the discriminated view at its wiring site. The `catalog.settlement_specs.payoff_model NOT NULL` divergence is owned by the migration owner. A `MarketClosed`-equivalent venue signal remains unconfirmed. A seed loader and a human-reviewed spec for `btc-15m-updown` come before any model-dependent use. Matcher fixture U+200B escapes must not be reformatted to literals.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+narrow SettlementActivationVerdict into the discriminated view
+payoff_model NOT NULL divergence
+MarketClosed-equivalent venue signal remains unconfirmed
+human-reviewed spec for btc-15m-updown
+U+200B escapes must not be reformatted to literals
+~~~
+
+Not carried:
+
+~~~drop lines=1179-1187
+venue-register rows for WP-110's non-confirmations => closed-by `GOV-1C` (register rows U-10, U-11 and U-12)
+~~~
+
+**Facts.** Kept: the verdict narrowing, the `payoff_model` divergence and its owner, the unconfirmed `MarketClosed`-equivalent signal (`VENUE-2`'s D-30 says the push-signal gap stands), the human-reviewed spec before model use, and the U+200B fixture rule (the verifiers named it). `GOV-1C` added the register rows. New in r4 (J-01). History: `completion-records-wave-1.md`.
+
+## RW-133: Completion record `WP-060`: the unmeasured p99 target
+
+Excerpt of the record item at base lines 1794-1803:
+
+~~~excerpt lines=1794-1803
+- Binding obligations recorded for consumers (WP-060 handoff follow_up):
+  WP-120 must dedup on `(gatewayEpoch, ingestSeq)` (NOT `eventId`), keep one
+  stable durable consumer id per role, publish each epoch from one process
+  sequentially, route `resync-required` to the halt path with a
+  `DataQualityIncidentOpened` + authoritative snapshot, treat
+  `EVENT_BUS_PUBLISH_QUEUE_FULL`/`EventBusUnavailableError` as
+  halt-plus-incident signals, and size `maxQueuedPublishes`/retention
+  deliberately (retention sizing belongs in the operational runbook). WP-140
+  exports queue depth/max/oldest-age pairs from process memory. The 5 ms p99
+  gateway-to-trader target remains an unmeasured target (ADR-003 §5).
+~~~
+
+New:
+
+~~~new
+- `WP-060`: the 5 ms p99 gateway-to-trader target remains an unmeasured target (ADR-003 §5).
+~~~
+
+Keep (in both texts):
+
+~~~keep
+5 ms p99 gateway-to-trader target remains an unmeasured target
+~~~
+
+Not carried:
+
+~~~drop lines=1794-1803
+exports queue depth/max/oldest-age pairs from process memory => history: `WP-140` shipped the exporter (its row reads implementation complete)
+~~~
+
+**Facts.** Kept: the unmeasured 5 ms p99 target (ADR-003 §5). The consumer obligations were `WP-120`'s, and WP-140 shipped the queue exporter. New in r4 (J-01). History: `completion-records-wave-0.md`.
+
+## RW-134: Completion record `WP-040`: the attempt-row obligation
+
+Excerpt of the record item at base lines 1913-1916:
+
+~~~excerpt lines=1913-1916
+- Obligations recorded for consumers: F13/F16-F20 (WP-200: carry the market on
+  ledger postings; resolve wallet-operation market before insert; net positions
+  from ledger_entries.account_ref; attempt row before SIGNED order — WP-320
+  same); R9-R21 risk register accurate and owned.
+~~~
+
+New:
+
+~~~new
+- `WP-040`: `WP-320` writes the attempt row before a SIGNED order (WP-040's consumer obligations F13/F16-F20).
+~~~
+
+Keep (in both texts):
+
+~~~keep
+attempt row before
+SIGNED order
+WP-320
+~~~
+
+Not carried:
+
+~~~drop lines=1913-1916
+R9-R21 risk register accurate and owned => history: the register's state at the merge
+~~~
+
+**Facts.** Kept: the attempt row before a SIGNED order, which binds `WP-320`. The other F13/F16-F20 obligations were `WP-200`'s. New in r4 (J-01). History: `completion-records-wave-0.md`.
+
+## RW-135: Completion record `WP-015`: the checker's documented limits
+
+Excerpt of the record item at base lines 1949-1955:
+
+~~~excerpt lines=1949-1955
+- **Honest terminal position** (WP-015 handoff, re-affirmed at merge): a
+  name-enumeration static scanner is provably non-total. After ten rounds no
+  ORDINARY-CODE (non-reflective, single-file, statically-named, plausibly-
+  accidental) silent synchronous forbidden-load route is known; the remaining
+  residuals — reflective acquisition (`Reflect.get`), runtime-computed member
+  names, and cross-file capability injection — are inherent to the architecture
+  and documented, not one-more-spelling gaps.
+~~~
+
+New:
+
+~~~new
+- `WP-015`: the dependency checker is a name-enumeration static scanner, so it is provably non-total. Its remaining residuals are documented: reflective acquisition (`Reflect.get`), runtime-computed member names, and cross-file capability injection.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+provably non-total
+reflective acquisition (Reflect.get), runtime-computed member names, and cross-file capability injection
+~~~
+
+Not carried:
+
+~~~drop lines=1949-1955
+After ten rounds no => history: the review outcome at the merge (no ordinary-code route was known)
+~~~
+
+**Facts.** Kept: the scanner is provably non-total, and its three documented residual classes. The ten-round outcome is history. New in r4 (J-01). History: `completion-records-wave-0.md`.
+
+## RW-136: Completion record `WP-050`: unprofiled retention memory
+
+Excerpt of the record item at base lines 1987-1991:
+
+~~~excerpt lines=1987-1991
+- **Binding obligations on consumers** (carry into WP-120/WP-130 packets):
+  dedup on `(gatewayEpoch, ingestSeq)` is MANDATORY (duplicates are the normal
+  fault-boundary outcome by design); the gateway drives `drain()`/`tick()` and
+  routes refusals/faults to incidents; retention memory (one segment's records,
+  64 MiB default bound) is reasoned-not-profiled — profile in WP-140 soak.
+~~~
+
+New:
+
+~~~new
+- `WP-050`: WAL retention memory (one segment's records, 64 MiB default bound) is reasoned-not-profiled; profile it in the WP-140 soak.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+reasoned-not-profiled
+64 MiB default bound
+~~~
+
+Not carried:
+
+~~~drop lines=1987-1991
+the gateway drives `drain()`/`tick()` and => closed-by `WP-120` (the gateway)
+~~~
+
+**Facts.** Kept: the retention memory bound is reasoned, not profiled, and belongs in the soak. The dedup and drive obligations were `WP-120`'s and `WP-130`'s. New in r4 (J-01). History: `completion-records-wave-0.md`.
+
+## RW-137: Completion records `WP-030`, `WP-000`: venue items still owed
+
+Excerpts of the record items at base lines 2020-2023, 2032-2035 and 2045-2049:
+
+~~~excerpt lines=2020-2023
+- Open items registered for later packages: dependency-check CI owner; venue-fact
+  gaps (same-account matching, shared-bucket arbitration, Binance/Coinbase
+  framing → WP-080/WP-090, U-6 50/50 mechanics → WP-110, U-7 SDK pin → WP-260,
+  C-1/U-1 → WP-070, C-2 → ledger/fees, C-3 → WP-280).
+~~~
+
+~~~excerpt lines=2032-2035
+- Independent adversarial reviews (fresh Codex session per round): rounds 1–5
+  CHANGES REQUIRED, round 6 **ACCEPT** (session `01a03d73-8ad1-7b23-929d-9f93703b67ef`;
+  0 blocker/high/medium; residual LOW: `conditionId` 31/32-byte fixture narrowing —
+  runtime parsers must NOT inherit it; NOTE: report §17 wording, self-corrected).
+~~~
+
+~~~excerpt lines=2045-2049
+- Open venue conflicts/unverified items carried to WP-030/later packages:
+  C-1/U-1 (price_change zero-removal semantics → WP-070), C-2 (USDC vs pUSD
+  denomination → ledger/fee packages), C-3 (MATCHED_NOT_BROADCASTED layering →
+  WP-280), U-7 (npm version pin → WP-260), plus fixture-only narrowings that
+  runtime adapters must not inherit (SDK `.nullish()` fields, conditionId length).
+~~~
+
+New:
+
+~~~new
+- `WP-000`, `WP-030`: C-3 (MATCHED_NOT_BROADCASTED layering) goes to `WP-280`, and U-7 (the npm version pin) to `WP-260`. Two venue-fact gaps stay registered: same-account matching and shared-bucket arbitration. Runtime parsers must NOT inherit the fixture-only narrowings (SDK `.nullish()` fields, the 31/32-byte `conditionId`).
+~~~
+
+Keep (in both texts):
+
+~~~keep
+same-account matching
+shared-bucket arbitration
+C-3 (MATCHED_NOT_BROADCASTED layering
+runtime parsers must NOT inherit
+U-7
+~~~
+
+Not carried:
+
+~~~drop lines=2020-2023
+Open items registered for later packages: dependency-check CI owner => closed-by `WP-015`
+~~~
+
+**Facts.** Kept: C-3 for `WP-280`, U-7 for `WP-260`, the two registered venue-fact gaps, and the rule that runtime parsers do not inherit the fixture-only narrowings. Closed elsewhere: the dependency-check owner (`WP-015`), the Binance and Coinbase framing (`WP-080`, `WP-090`), U-6 (`WP-110`) and C-1/U-1 (`WP-070`, then ADR-013); C-2 is under Pending external evidence. New in r4 (J-01). History: `completion-records-wave-0.md`.
+
+## RW-138: Complete row `WP-160`: residuals still owned
+
+Excerpt of base line 51:
+
+~~~excerpt lines=51-51
+Carried: **R1-L1** contract doc overclaims timestamp canonicality (0-3 fractional digits accepted → up to four spellings of one instant, DISTINCT addresses; determinism holds, dedupe misses); **R1-L2** exported `validateFeatureInput` "never throws" unenforced on non-materialized trees (composed entry IS total); **R1-L3 the substantive one** — `selectIndexedValues` members are ordinary literals, measured ADOPTION under pollution, destined for PostgreSQL indexing — close before any consumer indexes values; **R1-N1** node:crypto layer-1 (third built-in instance, governance round); **R1-N2** Array.prototype pollution fails CLOSED; **R1-N3** regex wall-clock scan dodgeable in principle (compensated; same class as WP-180 R9-1).
+~~~
+
+New:
+
+~~~new
+- `WP-160`: R1-L1, the contract doc overclaims timestamp canonicality: 0-3 fractional digits are accepted, so one instant has up to four spellings and DISTINCT addresses (determinism holds, dedupe misses). R1-L2: exported `validateFeatureInput`'s "never throws" is unenforced on non-materialized trees (the composed entry is total).
+~~~
+
+Keep (in both texts):
+
+~~~keep
+overclaims timestamp canonicality
+determinism holds, dedupe misses
+never throws
+unenforced on non-materialized trees
+~~~
+
+Not carried:
+
+~~~drop lines=51-51
+**R1-L3 the substantive one** => closed-by `WP-160-FU1` (features output-side hardening)
+**R1-N1** node:crypto layer-1 => closed-by `GOV-2A` (the §2.2 built-in allowlist)
+**R1-N2** Array.prototype pollution fails CLOSED => history: it fails closed; no owner
+**R1-N3** regex wall-clock scan dodgeable in principle => brief: Residual queue — `§5 item 6` (it folds in WP-160 R1-N3)
+~~~
+
+**Facts.** Kept: R1-L1 (the timestamp canonicality overclaim) and R1-L2 (the unenforced "never throws"). r3 disposed of this row as closed by its own packet, which carried only WP-150's follow-ups; C15 found these two. Closed elsewhere: R1-L3 (`WP-160-FU1`), R1-N1 (`GOV-2A`); R1-N3 is `§5 item 6`. History: `work-packages-waves-0-2.md`.
+
+## RW-139: Complete row `BACKTEST-1`: the run-mode label
+
+Excerpt of base line 80:
+
+~~~excerpt lines=80-80
+Residuals (owned, `docs/handoffs/BACKTEST-1.md`, written by the orchestrator at merge since the grant carried no handoff path — N6 class): BT1-R1 a stale README sentence; BT1-R2 run pins are asserted against the core's config, not derived from it; BT1-R3 the driver keeps delivering after a halt where the pump exits — unpinned; BT1-R4 the normalizer states no §4 item 5 pollution battery (the reviewer ran one: sound); the `run_mode=BACKTEST` label names the ROOT while the core it drives is hard-wired PAPER.
+~~~
+
+New:
+
+~~~new
+- `BACKTEST-1`: the `run_mode=BACKTEST` label names the ROOT, while the core it drives is hard-wired PAPER.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+run_mode=BACKTEST label names the ROOT
+hard-wired PAPER
+~~~
+
+Not carried:
+
+~~~drop lines=80-80
+BT1-R1 a stale README sentence => brief: Residual queue — the closed list (`BT1-R1..R4`)
+BT1-R2 run pins are asserted against the core's config => brief: Residual queue — the closed list (`BT1-R1..R4`)
+BT1-R3 the driver keeps delivering after a halt => brief: Residual queue — the closed list (`BT1-R1..R4`)
+BT1-R4 the normalizer states no §4 item 5 pollution battery => brief: Residual queue — the closed list (`BT1-R1..R4`)
+the instance ends PAUSED after its exit, which the round must report rather than hide => closed-by `BRACKET-1a`
+~~~
+
+**Facts.** Kept: the `run_mode=BACKTEST` label names the root while the core is hard-wired PAPER; C15 found it. BT1-R1..R4 are closed, and `BRACKET-1a` closed residual 5. History: `work-packages-rounds.md`.
+
+## RW-140: Complete row `UNIV-4`: residuals still owned
+
+Excerpt of base line 83:
+
+~~~excerpt lines=83-83
+Residuals (owned, `docs/handoffs/UNIV-4.md` + the residual queue below): **UNIV4-R1** the polled body is never checked to belong to the configured market (D-30 does not record `conditionId` on the response — a mis-pointed `gammaMarketId` opens THIS market on ANOTHER's readiness, silently; the next venue round must record S-D34's `{id}` semantics and example body, then a mismatch refuses the poll); **UNIV4-R2** the trader's `markLifecycle` is unguarded — a same-instant replayed `MarketOpened`, or an R4 `MarketClosing` landing up to one interval after the WebSocket's `MarketResolved`, regresses RESOLVED to OPEN/CLOSING → ACTIVE/CLOSE_ONLY instead of HALTED (the universe fold is correct; trader owner: rank-guard it); **UNIV4-R3** the strategy receives `onMarketClosing` with `secondsRemaining ≈ 0` (its cutoffs read configuration); **UNIV4-R4** a hold-back caused by a failed CONFIRMATION write with a healthy publisher is released only by the next epoch (loud: two PAGEs); **UNIV4-R5** poll latency ≤ one interval (a market closed between polls is seen late; closed-and-reopened within an interval unseen); the venue's `endDate` deliberately NOT used (no documented semantics); an existing config with `polymarket` markets and no `lifecycle` block reproduces B10 — now a NOTIFY incident at start; the operator runbook for ledger repair; `test/fixtures/venue/markets/**` stays empty; `publisher.ts:461`'s "remains in the WAL" wording is false for derived events (owner's wording; the feed's incident states the truth).
+~~~
+
+New:
+
+~~~new
+- `UNIV-4`: an existing config with `polymarket` markets and no `lifecycle` block reproduces B10; it is now a NOTIFY incident at start. Owed: the operator runbook for ledger repair. `test/fixtures/venue/markets/**` stays empty. UNIV4-R1 to R5 are in the residual queue.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+no lifecycle block reproduces B10
+now a NOTIFY incident at start
+the operator runbook for ledger repair
+test/fixtures/venue/markets/** stays empty
+~~~
+
+Not carried:
+
+~~~drop lines=83-83
+**UNIV4-R3** the strategy receives `onMarketClosing` => brief: Residual queue — `UNIV4-R2` (its row names UNIV4-R3)
+**UNIV4-R4** a hold-back caused by a failed CONFIRMATION write => brief: Residual queue — `UNIV4-R4/R5`
+**UNIV4-R5** poll latency ≤ one interval => brief: Residual queue — `UNIV4-R4/R5`
+the venue's `endDate` deliberately NOT used => brief: Residual queue — `UNIV4-R4/R5`
+`publisher.ts:461`'s "remains in the WAL" wording is false for derived events => brief: Residual queue — `UNIV4-R4/R5`
+~~~
+
+**Facts.** Kept: the B10-reproducing config (now a NOTIFY incident), the owed ledger-repair runbook, and the empty venue-markets fixture directory; C15 found them. UNIV4-R1 to R5 are the brief's residual rows. History: `work-packages-rounds.md`.
+
+## RW-141: Residual clauses not carried, for rows whose disposition carries nothing
+
+Drop lines for Complete rows and record items that carry no entry of their own. Each names where the clause went.
+
+Not carried:
+
+~~~drop lines=35-35
+ADR-016 UUID boundary rule for future external input => closed-by `GOV-1C` (its scope item 1)
+GOV-1B follow-ups 2-6 (ADR-014 comment pointers => closed-by `GOV-1C` (its scope items 2-6)
+~~~
+
+~~~drop lines=44-44
+the deep-freeze memoisation set is added to BEFORE the freeze succeeds => closed-by `WP-200-FU1` (the memoisation LOW)
+owner: the next bounded grant touching `packages/{ledger,pnl}/src/immutable.ts` => closed-by `WP-200-FU1`
+halt enforcement is an INTEGRATION obligation => closed-by `WP-230` (it reads both ledger sections)
+the composition-root convention is owed by whoever builds it => closed-by `WP-230`
+~~~
+
+~~~drop lines=50-50
+WP-200's C-2 conformance ratification is DEFERRED => closed-by `GOV-2A` (C-2 ratified against 7e75f9a)
+~~~
+
+~~~drop lines=71-71
+every functional `.push(` in `packages/ledger/src` (35 sites) => history: the work this package did
+~~~
+
+~~~drop lines=79-79
+a `PAUSED` instance with a RUNNING run passes => brief: Residual queue — `BOOT1 unchecked shared facts`
+no registration CLI — two-step operator registration => closed-by `REGISTER-1`
+the R10 read path would turn `RUN_NOT_RESUMABLE` into a resume => brief: Closeout blockers — `B9` (resume, R10, is Wave 3's)
+the `createMigratedContext.close()` pool leak => brief: Residual queue — `BOOT1 pool leak`
+R6/R7/R11 (out of grant, in the residual queue) => brief: Residual queue — `BOOT1-R6`, `BOOT1-R11`; `BOOT1-R7` is closed
+~~~
+
+~~~drop lines=81-81
+header line 5 carries two strikes and two dated notes => history: moot, LOGS-1 replaced the header
+~~~
+
+~~~drop lines=84-84
+**TRDR3-R4** the operations dashboard lacks the `current` stat => brief: Residual queue — `TRDR3-R4/R5/R7`
+**TRDR3-R5** the 9465 port collision => brief: Residual queue — `TRDR3-R4/R5/R7`
+**TRDR3-R7** a door comment claims a 4096-instance bound => brief: Residual queue — `TRDR3-R4/R5/R7`
+**TRDR3-R8/R9** WP-240 L-9 => brief: Residual queue — `N8` (L-9 is load-bearing, TRDR3-R8/R9)
+~~~
+
+~~~drop lines=228-290
+the protective reduce gets an order track, so an instance survives its own exit) => history: the package's own scope title
+~~~
+
+~~~drop lines=838-842
+the deep-freeze memoisation set is added to BEFORE the freeze => closed-by `WP-200-FU1` (the memoisation LOW)
+it does not reach monetary state today and the helper is not exported => closed-by `WP-200-FU1`
+~~~
+
+~~~drop lines=843-845
+halt enforcement is an INTEGRATION obligation => closed-by `WP-230` (it reads both ledger sections)
+the composition-root convention is owed by whoever builds it => closed-by `WP-230`
+~~~
+
+~~~drop lines=1204-1214
+series eviction clears an outstanding gap obligation => history: documented behaviour with no owner
+reappearance reports => history: documented behaviour with no owner
+~~~
+
+~~~drop lines=1222-1226
+handle both interval fields => closed-by `WP-120` (the binding obligations)
+acknowledgement is never an authoritative resync downstream => closed-by `WP-120`
+~~~
+
+~~~drop lines=1956-1963
+follow_up 8 — replace the => closed-by `GOV-1C` (it ruled the §6.1 items, including follow_up 8)
+~~~
+
+**Facts.** C15 needs every residual clause of a dispositioned row accounted for. These rows carry no entry, so their clauses are dropped here, each with its closing package or its line in the brief. Added in r4 (J-02).

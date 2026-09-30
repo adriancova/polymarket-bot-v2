@@ -26,10 +26,16 @@ K19 the Wave 3 authorization intro is at most 24 words, names the date and `WP-2
     orchestrator "may start" (a permission, as the base row grants), and is followed by exactly
     two condition bullets.
 K20 the brief's Archive intro does not claim the text "below" was moved: it lists files.
-K21 REWRITES.md's intro names every check that concerns it (C6, C8, C9, C10, C11, C12, C13)
+K21 REWRITES.md's intro names every check that concerns it (C6, C8-C15)
     and does not use the old Facts wording "and what it does not carry and where that lives".
 K22 AGENTS.md's archive sentence has no nested aside ("verbatim, and frozen,").
-K2 also requires the "Residuals recorded in Complete package rows" subsection.
+K23 no sentence in the brief runs over 45 words (README rule 3), except the closed-id lists.
+K24 the SER-3 bullet of the Complete-row residual subsection writes "SER-3's N4": GOV-2B's
+    `test:replay` N4 is a different item.
+K25 every brief section that cites a file line (`name.ext:NNN`) states the commit its citations
+    are valid at ("as of `<sha>`" or "at `<sha>`"), in the section or on the citing line.
+K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
+records" subsections.
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -53,7 +59,8 @@ SAFETY = [
     "- Human live-micro approval: **Not granted**",
 ]
 SECTIONS = ["## Safety state", "## Current phase", "## Authorized now", "## Work packages", "## Open blockers",
-            "### Closeout blockers", "### Residual queue", "### Residuals recorded in Complete package rows", "## Human items", "### Wave 3 authorization (conditional)",
+            "### Closeout blockers", "### Residual queue", "### Residuals recorded in Complete package rows",
+            "### Obligations in completion records", "## Human items", "### Wave 3 authorization (conditional)",
             "## Pending external evidence", "## Human and operational gates"]
 
 
@@ -221,7 +228,7 @@ def main() -> int:
         fails.append("K20: the Archive intro says 'Everything below was moved verbatim', but a file list follows")
     # K21
     intro = rw.split("\n## Coverage:", 1)[0]
-    missing = [c for c in ("C6", "C8", "C9", "C10", "C11", "C12", "C13") if f"({c}" not in intro and f" {c})" not in intro and f"{c}," not in intro]
+    missing = [c for c in ("C6", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15") if f"({c}" not in intro and f" {c})" not in intro and f"{c}," not in intro]
     if missing:
         fails.append(f"K21: REWRITES.md's intro does not name {', '.join(missing)}")
     if "and what it does not carry and where that lives" in intro:
@@ -229,6 +236,44 @@ def main() -> int:
     # K22
     if "verbatim, and frozen," in agents:
         fails.append("K22: AGENTS.md nests 'and frozen,' inside its and-chain; use a colon and a semicolon")
+
+    # K23
+    for n, l in enumerate(lines, 1):
+        if l.startswith("#") or not l.strip() or l.startswith(("Closed: `", "Closed, done or ruled")):
+            continue
+        cells = re.split(r"(?<!\\)\|", l)[1:-1] if l.startswith("|") else [l]
+        for cell in cells:
+            for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z(`*\[])", cell.strip()):
+                if len(sent.split()) > 45:
+                    fails.append(f"K23: line {n}: a {len(sent.split())}-word sentence (max 45): {sent[:70]!r}")
+    # K24
+    h = "### Residuals recorded in Complete package rows"
+    if h in lines:
+        i = lines.index(h) + 1
+        while i < len(lines) and not lines[i].startswith("#"):
+            if lines[i].startswith("- `SER-3`"):
+                hits = list(re.finditer(r"\bN4\b", lines[i]))
+                if not hits or any(not lines[i][:m.start()].endswith("SER-3's ") for m in hits):
+                    fails.append(f"K24: line {i + 1}: the SER-3 bullet must write \"SER-3's N4\", not a bare N4 "
+                                 "(GOV-2B's test:replay N4 is a different item)")
+            i += 1
+    # K25
+    sec, sec_lines = None, []
+    def k25(sec, sec_lines):
+        pinned = any(re.search(r"(?:as of|at) `[0-9a-f]{7,40}`", l) for _n, l in sec_lines)
+        for n, l in sec_lines:
+            if re.search(r"[\w./-]+\.(?:ts|md|yaml|yml|json|sql|py|mjs):\d+", l) and not pinned:
+                fails.append(f"K25: line {n}: a file:line citation in section {sec!r}, which states no commit")
+                return
+    for n, l in enumerate(lines, 1):
+        if re.match(r"^#{2,3} ", l):
+            if sec:
+                k25(sec, sec_lines)
+            sec, sec_lines = l, []
+        elif sec:
+            sec_lines.append((n, l))
+    if sec:
+        k25(sec, sec_lines)
 
     print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]})")
     print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}")
