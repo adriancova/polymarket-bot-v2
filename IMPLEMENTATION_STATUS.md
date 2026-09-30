@@ -30,7 +30,8 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260` (the signer boundary), under dual verification. Then the work-plan chain. `THROUGHPUT-1c` runs alongside.
+- **Next:** `WP-260` and `THROUGHPUT-1c` (running). Then the `LEAN-1` track: `LEAN-GOV` (the ADRs), `STORAGE-1`, `HOST-BENCH`, then the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
 
@@ -40,6 +41,8 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
 - **`WP-260`**: Ready (authorized) 2026-09-30, under the user's Wave 3 authorization; both conditions hold. Goal: the secure unified-SDK adapter and signer boundary, pinned to `@polymarket/client` 0.11.0. PAPER only: no real key, signer or credential. Verifiers: Opus and gpt-6-astra, reconciled (user rule, 2026-09-30). Gate: the work plan's security review, and a green CI run on GitHub.
+- **`LEAN-GOV`**: Ready (authorized) 2026-09-30, from the user's `LEAN-1` rulings (H, A1-A5). Docs only: ADR-025 onward (the laptop host profile, evaluation cadence, checkpoint-on-change, raw retention with pins, the approximate dataset class, series auto-admission), plus work-plan rows for the `LEAN-1` rounds. Verifiers: Opus and gpt-6-astra, reconciled (a docs round).
+- **`STORAGE-1`** and **`HOST-BENCH`**: authorized 2026-09-30; they start after `LEAN-GOV` merges.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29; startable now, because the Wave 2 closeout is done. It runs alongside Wave 3.
   - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
   - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
@@ -150,6 +153,10 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | Complete (2026-09-30) | `6e01228` | [DURABLE-1](docs/handoffs/DURABLE-1.md) |
 | `CLOSEOUT-2B` | focused re-grade of Wave 2 after `DURABLE-1` | Complete (2026-09-30): WAVE 2 CLOSED WITH QUALIFICATIONS, after the user's CANCEL ruling | — (an audit; no merge) | [CLOSEOUT-2B](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md) |
 | `WP-260` | Secure unified-SDK adapter and signer boundary | **Ready (authorized)** 2026-09-30 | — | — |
+| `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
+| `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
+| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics | Authorized; after `LEAN-GOV` | — | — |
+| `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Authorized; after `LEAN-GOV` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
