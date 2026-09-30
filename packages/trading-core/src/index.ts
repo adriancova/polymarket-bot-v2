@@ -139,6 +139,9 @@ export {
   type PortResult,
   type RecordedEventIdentity,
   type TraderStore,
+  type GroupCommit,
+  type StagedEvaluations,
+  type FeedMark,
 } from "./ports.js";
 
 export {

@@ -90,7 +90,9 @@ import { unreplacedPnlSnapshotProblem } from "@polymarket-bot/trading-core";
 import {
   portFailed,
   portOk,
+  type GroupCommit,
   type PortResult,
+  type StagedEvaluations,
   type TraderStore,
 } from "@polymarket-bot/trading-core";
 
@@ -138,15 +140,204 @@ export interface PostgresTraderStoreOptions {
   readonly decisionContractVersion: number;
 }
 
+/**
+ * The `strategy.decisions` row of one persisted decision — the ONE binding
+ * both {@link PostgresTraderStore.persistDecision} and the group commit
+ * ({@link PostgresGroupCommit}) insert, so the two paths cannot bind a column
+ * differently. Throws what `encodeJsonbText` throws for a document it refuses.
+ */
+function decisionRow(record: DecisionRecord, telemetry: DecisionTelemetry, decisionContractVersion: number) {
+  const modelOutputs = encodeJsonbText(record.decision.modelOutputs ?? null, "decisions.model_outputs");
+  const statePatch = encodeJsonbText(record.decision.statePatch ?? null, "decisions.state_patch");
+  return {
+    run_id: record.runId,
+    instance_id: record.instanceId,
+    market_id: record.marketId,
+    evaluation_seq: String(record.evaluationSeq),
+    callback: record.callback,
+    decision_type: record.decision.decisionType,
+    decision_contract_version: decisionContractVersion,
+    reason_codes: [...record.decision.reasonCodes],
+    feature_snapshot_ref: record.decision.featureSnapshotRef,
+    feature_snapshot_id: null,
+    model_outputs: modelOutputs,
+    state_patch: statePatch,
+    next_wakeup_at: record.decision.nextWakeupAt ?? null,
+    source_event_id: record.sourceEvent?.eventId ?? null,
+    gateway_epoch: record.sourceEvent?.gatewayEpoch ?? null,
+    ingest_seq: record.sourceEvent?.ingestSeq ?? null,
+    intent_count: record.decision.intents.length,
+    evaluation_duration_us:
+      telemetry.evaluationDurationUs === null ? null : String(telemetry.evaluationDurationUs),
+    evaluated_at: record.evaluatedAt,
+  };
+}
+
+/** The `strategy.state_checkpoints` row of one checkpoint — shared the same way as {@link decisionRow}. */
+function checkpointRow(checkpoint: StrategyStateCheckpoint, capturedAt: string) {
+  return {
+    run_id: checkpoint.runId,
+    instance_id: checkpoint.instanceId,
+    market_id: null,
+    checkpoint_seq: String(checkpoint.checkpointSeq),
+    state_schema_version: checkpoint.stateSchemaVersion,
+    state: checkpoint.stateJson,
+    state_hash: createHash("sha256").update(checkpoint.stateJson, "utf8").digest("hex"),
+    captured_at: capturedAt,
+  };
+}
+
+/**
+ * Rows per statement: 1,000 rows of at most 19 bind parameters each is far
+ * below PostgreSQL's 65,535. A batch is at most 128 events (the loop's hard
+ * bound, `GROUP_COMMIT_MAX_EVENTS`), and an event's evaluations write one
+ * decision and one checkpoint each, so a batch fits one statement unless an
+ * event evaluates unusually many callbacks — which the transaction path below
+ * still handles.
+ */
+const GROUP_COMMIT_ROWS_PER_STATEMENT = 1_000;
+
+/**
+ * `THROUGHPUT-1a` — the store's GROUP COMMIT ({@link GroupCommit}).
+ *
+ * `stage` builds each event's rows with {@link decisionRow} /
+ * {@link checkpointRow} — the values the per-row methods bind — and keeps
+ * them in memory. `commit` inserts every staged decision and every staged
+ * checkpoint, in stage order, ATOMICALLY, and answers only once PostgreSQL
+ * has committed them:
+ *
+ * - normally as ONE statement — a multi-row insert of the decisions in a
+ *   data-modifying CTE, feeding a multi-row insert of the checkpoints — which
+ *   is one implicit transaction and ONE round trip (PostgreSQL runs every
+ *   data-modifying `WITH` member to completion whether or not its output is
+ *   read);
+ * - a batch of only decisions, or only checkpoints, as one multi-row insert;
+ * - a batch past {@link GROUP_COMMIT_ROWS_PER_STATEMENT} rows as chunked
+ *   inserts inside one explicit transaction (`db.transaction()`).
+ *
+ * A failure rolls the whole batch back and is answered as `UNAVAILABLE` port
+ * data, as `#contained` answers every other failure. The staged rows are
+ * released either way.
+ *
+ * WHAT THIS CHANGES AND WHAT IT DOES NOT. Every row, every column value and
+ * the `(run_id, evaluation_seq)` / `(run_id, checkpoint_seq)` uniqueness are
+ * exactly the per-row path's. What changes is WHEN they become durable: at the
+ * batch's commit (`loop.ts` states the bounds) instead of at each insert, in
+ * one commit per batch instead of two per decision — which H1 run 1 measured
+ * as the store's whole cost (~1.2 ms per autocommit on its host). The
+ * database-assigned columns follow: `recorded_at` is `now()`, the batch
+ * statement's (or transaction's) start, for every row of a batch.
+ */
+export class PostgresGroupCommit implements GroupCommit {
+  readonly #db: PolymarketBotDatabase;
+  readonly #decisionContractVersion: number;
+  #decisions: ReturnType<typeof decisionRow>[] = [];
+  #checkpoints: ReturnType<typeof checkpointRow>[] = [];
+  #events = 0;
+
+  constructor(db: PolymarketBotDatabase, decisionContractVersion: number) {
+    this.#db = db;
+    this.#decisionContractVersion = decisionContractVersion;
+  }
+
+  get stagedEvents(): number {
+    return this.#events;
+  }
+
+  stage(evaluations: StagedEvaluations): PortResult<null> {
+    let decisions: ReturnType<typeof decisionRow>[];
+    let checkpoints: ReturnType<typeof checkpointRow>[];
+    try {
+      decisions = evaluations.decisions.map((entry) =>
+        decisionRow(entry.record, entry.telemetry, this.#decisionContractVersion),
+      );
+      checkpoints = evaluations.checkpoints.map((entry) => checkpointRow(entry.checkpoint, entry.capturedAt));
+    } catch (cause) {
+      return portFailed("UNAVAILABLE", `the durable store could not stage a decision or checkpoint: ${describeCause(cause)}`);
+    }
+    this.#decisions.push(...decisions);
+    this.#checkpoints.push(...checkpoints);
+    this.#events += 1;
+    return portOk(null);
+  }
+
+  async commit(): Promise<PortResult<{ readonly decisions: number; readonly checkpoints: number }>> {
+    const decisions = this.#decisions;
+    const checkpoints = this.#checkpoints;
+    const events = this.#events;
+    this.#decisions = [];
+    this.#checkpoints = [];
+    this.#events = 0;
+    if (decisions.length === 0 && checkpoints.length === 0) {
+      return portOk({ decisions: 0, checkpoints: 0 });
+    }
+    try {
+      if (
+        decisions.length > 0 &&
+        checkpoints.length > 0 &&
+        decisions.length + checkpoints.length <= GROUP_COMMIT_ROWS_PER_STATEMENT
+      ) {
+        // ONE statement — a data-modifying CTE — so ONE implicit transaction
+        // and ONE round trip: both inserts commit together or not at all, and
+        // the database does the batch's work while the loop keeps evaluating
+        // (a multi-statement transaction would need four round trips, and the
+        // loop reads a reply only when it yields).
+        await this.#db
+          .with("staged_decisions", (db) =>
+            db.insertInto("strategy.decisions").values(decisions).returning("decision_id"),
+          )
+          .insertInto("strategy.state_checkpoints")
+          .values(checkpoints)
+          .execute();
+      } else if (checkpoints.length === 0 && decisions.length <= GROUP_COMMIT_ROWS_PER_STATEMENT) {
+        await this.#db.insertInto("strategy.decisions").values(decisions).execute();
+      } else if (decisions.length === 0 && checkpoints.length <= GROUP_COMMIT_ROWS_PER_STATEMENT) {
+        await this.#db.insertInto("strategy.state_checkpoints").values(checkpoints).execute();
+      } else {
+        // A batch too large for one statement's parameters: one transaction.
+        await this.#db.transaction().execute(async (trx) => {
+          for (let start = 0; start < decisions.length; start += GROUP_COMMIT_ROWS_PER_STATEMENT) {
+            await trx
+              .insertInto("strategy.decisions")
+              .values(decisions.slice(start, start + GROUP_COMMIT_ROWS_PER_STATEMENT))
+              .execute();
+          }
+          for (let start = 0; start < checkpoints.length; start += GROUP_COMMIT_ROWS_PER_STATEMENT) {
+            await trx
+              .insertInto("strategy.state_checkpoints")
+              .values(checkpoints.slice(start, start + GROUP_COMMIT_ROWS_PER_STATEMENT))
+              .execute();
+          }
+        });
+      }
+    } catch (cause) {
+      return portFailed(
+        "UNAVAILABLE",
+        `the durable store could not commit a batch of ${String(decisions.length)} decision(s) and ` +
+          `${String(checkpoints.length)} checkpoint(s) from ${String(events)} event(s); nothing of it ` +
+          `was committed: ${describeCause(cause)}`,
+      );
+    }
+    return portOk({ decisions: decisions.length, checkpoints: checkpoints.length });
+  }
+}
+
+function describeCause(cause: unknown): string {
+  return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+}
+
 export class PostgresTraderStore implements TraderStore {
   readonly #db: PolymarketBotDatabase;
   readonly #ledger: ReturnType<typeof createLedgerRepository>;
   readonly #decisionContractVersion: number;
+  /** `THROUGHPUT-1a`: the store's group commit (see {@link PostgresGroupCommit}). */
+  readonly groupCommit: PostgresGroupCommit;
 
   constructor(options: PostgresTraderStoreOptions) {
     this.#db = options.db;
     this.#ledger = createLedgerRepository(options.db);
     this.#decisionContractVersion = options.decisionContractVersion;
+    this.groupCommit = new PostgresGroupCommit(options.db, options.decisionContractVersion);
   }
 
   /**
@@ -174,40 +365,9 @@ export class PostgresTraderStore implements TraderStore {
     telemetry: DecisionTelemetry,
   ): Promise<PortResult<null>> {
     return await this.#contained("persist a decision", async () => {
-      const modelOutputs = encodeJsonbText(
-        record.decision.modelOutputs ?? null,
-        "decisions.model_outputs",
-      );
-      const statePatch = encodeJsonbText(
-        record.decision.statePatch ?? null,
-        "decisions.state_patch",
-      );
       await this.#db
         .insertInto("strategy.decisions")
-        .values({
-          run_id: record.runId,
-          instance_id: record.instanceId,
-          market_id: record.marketId,
-          evaluation_seq: String(record.evaluationSeq),
-          callback: record.callback,
-          decision_type: record.decision.decisionType,
-          decision_contract_version: this.#decisionContractVersion,
-          reason_codes: [...record.decision.reasonCodes],
-          feature_snapshot_ref: record.decision.featureSnapshotRef,
-          feature_snapshot_id: null,
-          model_outputs: modelOutputs,
-          state_patch: statePatch,
-          next_wakeup_at: record.decision.nextWakeupAt ?? null,
-          source_event_id: record.sourceEvent?.eventId ?? null,
-          gateway_epoch: record.sourceEvent?.gatewayEpoch ?? null,
-          ingest_seq: record.sourceEvent?.ingestSeq ?? null,
-          intent_count: record.decision.intents.length,
-          evaluation_duration_us:
-            telemetry.evaluationDurationUs === null
-              ? null
-              : String(telemetry.evaluationDurationUs),
-          evaluated_at: record.evaluatedAt,
-        })
+        .values(decisionRow(record, telemetry, this.#decisionContractVersion))
         .execute();
     });
   }
@@ -233,16 +393,7 @@ export class PostgresTraderStore implements TraderStore {
     return await this.#contained("save a strategy checkpoint", async () => {
       await this.#db
         .insertInto("strategy.state_checkpoints")
-        .values({
-          run_id: checkpoint.runId,
-          instance_id: checkpoint.instanceId,
-          market_id: null,
-          checkpoint_seq: String(checkpoint.checkpointSeq),
-          state_schema_version: checkpoint.stateSchemaVersion,
-          state: checkpoint.stateJson,
-          state_hash: createHash("sha256").update(checkpoint.stateJson, "utf8").digest("hex"),
-          captured_at: capturedAt,
-        })
+        .values(checkpointRow(checkpoint, capturedAt))
         .execute();
     });
   }

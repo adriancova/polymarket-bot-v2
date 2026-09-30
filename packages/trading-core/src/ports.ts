@@ -108,9 +108,27 @@ export interface MarketEventFeed {
    * before affected markets resume, so the loop halts and says so.
    */
   poll(): Promise<PortResult<readonly IngestedEvent[]>>;
-  /** Records that everything delivered so far is consumed. */
-  commit(): Promise<PortResult<null>>;
+  /**
+   * Records that everything delivered so far is consumed — or, given a
+   * {@link FeedMark} from {@link MarketEventFeed.mark}, everything delivered
+   * up to that mark (`THROUGHPUT-1a`: the pump's pipelined path records a
+   * batch's position once the batch's decisions are durable, which it learns
+   * after the NEXT batch was delivered).
+   */
+  commit(upTo?: FeedMark): Promise<PortResult<null>>;
+  /**
+   * `THROUGHPUT-1a`, optional: an opaque mark of the position delivered so
+   * far, for a later `commit(mark)`. `undefined` when nothing was delivered
+   * since the last commit. A feed without it is committed as before: right
+   * after each drain.
+   */
+  mark?(): FeedMark | undefined;
   close(): Promise<void>;
+}
+
+/** `THROUGHPUT-1a`: an opaque delivered position of one {@link MarketEventFeed}. */
+export interface FeedMark {
+  readonly feedMark: true;
 }
 
 /**
@@ -160,6 +178,55 @@ export interface TraderStore {
    */
   replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>>;
   close(): Promise<void>;
+  /**
+   * `THROUGHPUT-1a` — GROUP COMMIT, optional. A store that offers it lets the
+   * loop write the decisions and checkpoints of SEVERAL consecutive events in
+   * ONE transaction instead of two autocommits per decision; a store without
+   * it (every in-memory one) is written exactly as before. See
+   * {@link GroupCommit} for the contract and `loop.ts` for when the loop
+   * commits.
+   */
+  readonly groupCommit?: GroupCommit;
+}
+
+/**
+ * `THROUGHPUT-1a` — one event's decisions and checkpoints, as the loop's
+ * outbox drained them (decisions in evaluation order, then checkpoints in the
+ * same order), each checkpoint with the instant `saveCheckpoint` would have
+ * been given.
+ */
+export interface StagedEvaluations {
+  readonly decisions: readonly { readonly record: DecisionRecord; readonly telemetry: DecisionTelemetry }[];
+  readonly checkpoints: readonly { readonly checkpoint: StrategyStateCheckpoint; readonly capturedAt: string }[];
+}
+
+/**
+ * `THROUGHPUT-1a` — the group-commit capability of a {@link TraderStore}.
+ *
+ * The contract, which the durable trader's crash-recovery proof tests:
+ *
+ * - {@link GroupCommit.stage} is synchronous and does no I/O. It turns one
+ *   event's rows into the exact column values `persistDecision` /
+ *   `saveCheckpoint` would bind, or answers the failure those would have
+ *   answered (then nothing of that event is staged);
+ * - {@link GroupCommit.commit} writes EVERYTHING staged, in stage order, in
+ *   ONE database transaction, and resolves only once that transaction
+ *   committed — or answers the failure, having committed nothing. Either way
+ *   the staged rows are gone afterwards: a failed batch is not retried (the
+ *   loop halts, as it does on any store failure);
+ * - nothing is committed except by `commit`.
+ *
+ * So the durable rows are always a whole number of committed batches — a
+ * PREFIX of the run's decisions and checkpoints, never a gap — and a crash
+ * loses at most the staged, uncommitted tail, whose events the transport
+ * still holds: the pump records the stream position only after the drain,
+ * and the drain ends with a commit (`loop.ts`).
+ */
+export interface GroupCommit {
+  stage(evaluations: StagedEvaluations): PortResult<null>;
+  /** Events staged and not yet committed. */
+  readonly stagedEvents: number;
+  commit(): Promise<PortResult<{ readonly decisions: number; readonly checkpoints: number }>>;
 }
 
 /**

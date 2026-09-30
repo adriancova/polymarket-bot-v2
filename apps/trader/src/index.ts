@@ -166,6 +166,9 @@ export {
   type PortResult,
   type RecordedEventIdentity,
   type TraderStore,
+  type FeedMark,
+  type GroupCommit,
+  type StagedEvaluations,
 } from "@polymarket-bot/trading-core";
 
 export {

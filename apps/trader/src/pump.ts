@@ -42,7 +42,7 @@
 
 import type { HaltController } from "@polymarket-bot/trading-core";
 import type { CoreLoop } from "@polymarket-bot/trading-core";
-import type { MarketEventFeed } from "@polymarket-bot/trading-core";
+import type { FeedMark, MarketEventFeed } from "@polymarket-bot/trading-core";
 
 export interface PumpResult {
   /** Batches polled, including the one that failed. */
@@ -77,6 +77,9 @@ export interface PumpOptions {
  * operator can read.
  */
 export async function pump(options: PumpOptions): Promise<PumpResult> {
+  if (options.loop.groupCommits && options.feed.mark !== undefined) {
+    return await pumpPipelined(options);
+  }
   let polls = 0;
   let ingested = 0;
 
@@ -143,5 +146,113 @@ export async function pump(options: PumpOptions): Promise<PumpResult> {
     }
   }
 
+  return { polls, ingested, stopped: "MAX_POLLS" };
+}
+
+/**
+ * `THROUGHPUT-1a` — the pump for a GROUP-COMMITTING loop over a feed that can
+ * mark positions: durability is PIPELINED one batch deep.
+ *
+ * The per-row path wrote every decision at its event, so a batch's rows were
+ * durable when its drain returned, and the pump recorded its position right
+ * then. A group-committing loop commits a batch's rows in a few transactions
+ * (`loop.ts`, `GROUP_COMMIT_*`); waiting for them at every drain would leave
+ * the process idle while PostgreSQL works. So this loop:
+ *
+ * 1. drains batch k WITHOUT waiting for its rows (the commits are requested,
+ *    and run in one serialized chain while the next batch is read and
+ *    evaluated);
+ * 2. marks batch k's position and takes the loop's `durabilityMark()`;
+ * 3. and only then — after reading and draining batch k+1 — waits for batch
+ *    k's mark and records batch k's position.
+ *
+ * The rule the per-row path had is unchanged: A POSITION IS RECORDED ONLY
+ * AFTER EVERY DECISION OF THE EVENTS BEFORE IT IS DURABLE. What changes is how
+ * far behind the rows the recorded position may be — one batch more — which
+ * after a crash means one more batch is read again (at-least-once, as before;
+ * a restart is a new run, `BOOT-1`). Nothing is recorded after a halt; an
+ * idle poll drains durably and records at once, so a quiet stream's position
+ * catches up immediately; and every return other than `HALTED` records the
+ * last batch first, so a caller sees what it always saw.
+ */
+async function pumpPipelined(options: PumpOptions): Promise<PumpResult> {
+  const { loop, feed, halts } = options;
+  let polls = 0;
+  let ingested = 0;
+  let pending: { readonly durable: Promise<boolean>; readonly mark: FeedMark } | undefined;
+
+  /** Records the pending batch's position once its rows are durable. `false`: halted. */
+  const settle = async (): Promise<boolean> => {
+    if (pending === undefined) return true;
+    const { durable, mark } = pending;
+    pending = undefined;
+    if (!(await durable) || halts.anyHalt) return false;
+    const committed = await feed.commit(mark);
+    if (!committed.ok) {
+      halts.halt(
+        { kind: "GLOBAL" },
+        "TRANSPORT_UNAVAILABLE",
+        `the event transport could not record the consumed position ` +
+          `(${committed.failure.detail}); a consumer that cannot checkpoint would resume from ` +
+          "an unknown position, which ADR-003 §3.4 rules out",
+        loop.health().asOf,
+      );
+      return false;
+    }
+    return true;
+  };
+
+  for (let iteration = 0; iteration < options.maxPolls; iteration += 1) {
+    if (halts.anyHalt) {
+      return { polls, ingested, stopped: "HALTED" };
+    }
+    polls += 1;
+    const batch = await feed.poll();
+    if (!batch.ok) {
+      halts.halt(
+        { kind: "GLOBAL" },
+        batch.failure.kind === "RESYNC_REQUIRED" ? "TRANSPORT_RESYNC_REQUIRED" : "TRANSPORT_UNAVAILABLE",
+        batch.failure.kind === "RESYNC_REQUIRED"
+          ? `the event transport requires a hard resync (${batch.failure.detail}); ADR-003 §3.3 ` +
+            "forbids silent catch-up from an incomplete stream and §7.1 requires a new " +
+            "authoritative snapshot before affected markets resume, so trading halts"
+          : `the event transport is unavailable (${batch.failure.detail}); §4.2 makes a Redis ` +
+            "outage a trading halt — no decision may be made on state that is no longer arriving",
+        loop.health().asOf,
+      );
+      return { polls, ingested, stopped: "HALTED" };
+    }
+
+    if (batch.value.length === 0) {
+      // An idle poll drains DURABLY (the default), then records any pending
+      // batch: a quiet stream's rows and position are never left waiting.
+      await loop.drain();
+      if (!(await settle())) return { polls, ingested, stopped: "HALTED" };
+      if (options.untilIdle === true) {
+        return { polls, ingested, stopped: "IDLE" };
+      }
+      continue;
+    }
+
+    for (const event of batch.value) {
+      if (!loop.ingest(event)) {
+        return { polls, ingested, stopped: "HALTED" };
+      }
+      ingested += 1;
+    }
+
+    await loop.drain({ awaitDurable: false });
+    if (halts.anyHalt) {
+      return { polls, ingested, stopped: "HALTED" };
+    }
+    const mark = feed.mark?.();
+    const durable = loop.durabilityMark();
+    // The PREVIOUS batch: its rows have had this whole batch's read and drain
+    // to become durable.
+    if (!(await settle())) return { polls, ingested, stopped: "HALTED" };
+    pending = mark === undefined ? undefined : { durable, mark };
+  }
+
+  if (!(await settle())) return { polls, ingested, stopped: "HALTED" };
   return { polls, ingested, stopped: "MAX_POLLS" };
 }
