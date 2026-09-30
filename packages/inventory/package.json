@@ -3,13 +3,18 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Collateral inventory and wallet operations (WP-300, handoff §9.14): account-level pUSD and outcome-token inventory with available/reserved/pending amounts, a serialized reservation service that makes double reservation impossible, and a wallet-operation state machine (approvals, split, merge, redeem, pUSD wrap/unwrap) whose UNKNOWN outcomes trigger reconciliation. Layer-1 logic: no I/O, no clock, no key, no RPC, no credential; wallet operations execute only through an injected port. No bridge, withdrawal, deposit or transfer path exists.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/contract/wallet-operations/tsconfig.json",
+    "test:contract": "vitest run --config ../../test/contract/wallet-operations/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
