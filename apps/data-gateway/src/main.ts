@@ -94,12 +94,14 @@ import { readFile } from "node:fs/promises";
 
 import { createWebSocketFactory } from "@polymarket-bot/binance-adapter";
 import { nodeWebSocketFactory } from "@polymarket-bot/coinbase-adapter";
+import type { MarketEventTransport } from "@polymarket-bot/event-bus";
 import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 import { globalHttpClient, globalWebSocketFactory } from "@polymarket-bot/polymarket-public";
 import { nodeWalFileSystem } from "@polymarket-bot/storage-wal";
 
 import { parseGatewayConfig } from "./config.js";
 import { GatewayConfigurationError } from "./errors.js";
+import type { BatchPublishCapability } from "./publisher.js";
 import { parseCleanupDeadlineMs, runGatewaySequence } from "./run.js";
 import {
   systemGatewayClock,
@@ -129,11 +131,15 @@ async function main(): Promise<void> {
   await runGatewaySequence({
     config,
     cleanupDeadlineMs,
+    // THROUGHPUT-1b: the publisher submits in batches when the transport has
+    // `publishBatch`. `satisfies` makes the compiler check, here where the
+    // real transport is wired, that it has the capability with the contract
+    // the publisher's `BatchPublishCapability` states.
     connectTransport: () =>
       RedisStreamsEventTransport.connect({
         connection: { url: redisUrl },
         retention: { maxEvents: retentionEvents },
-      }),
+      }) satisfies Promise<MarketEventTransport & BatchPublishCapability>,
     retentionEvents,
     ports: {
       clock: systemGatewayClock(),

@@ -16,7 +16,11 @@
  * - `setUnavailable()` makes every publish throw `EventBusUnavailableError`;
  *   `failNextPublishWithQueueFull()` throws the `EVENT_BUS_PUBLISH_QUEUE_FULL`
  *   subclass exactly once — the two §4.2/§8.3 failure shapes the gateway must
- *   halt on.
+ *   halt on;
+ * - `publishBatch` (`THROUGHPUT-1b`) is offered, so a gateway built on this
+ *   double submits in batches exactly as it does on the Redis transport; a
+ *   test that needs the per-envelope path wraps the double in an object
+ *   without that method.
  *
  * The consumer side implements enough for tests that read back what the
  * gateway published; hard-resync conditions are out of scope here (the
@@ -60,6 +64,7 @@ export class MemoryEventTransport implements MarketEventTransport {
   #closed = false;
   #beforePublish: ((envelope: EventEnvelope<unknown>) => void) | undefined;
   #publishCalls = 0;
+  #batchCalls = 0;
   #subscribeCalls = 0;
   #stallGate: { promise: Promise<void>; release: () => void } | undefined;
 
@@ -145,6 +150,47 @@ export class MemoryEventTransport implements MarketEventTransport {
       await stall.promise;
     }
     return this.#publishNow(stream, envelope);
+  }
+
+  /** How many batched submissions were made (`THROUGHPUT-1b`). */
+  get batchCalls(): number {
+    return this.#batchCalls;
+  }
+
+  /**
+   * The batch capability the gateway's publisher uses (`THROUGHPUT-1b`), with
+   * the contract of `RedisStreamsEventTransport.publishBatch`: the published
+   * PREFIX gets receipts, the first envelope that is not published is the
+   * failure, and nothing after it is attempted. Every envelope counts as one
+   * `publish` entry in {@link publishCalls} and passes the publish observer,
+   * so the per-envelope assertions read the same either way; the injected
+   * failures (`setUnavailable`, `failNextPublishWithQueueFull`) strike the
+   * first envelope, which — as with the real transport's all-or-nothing
+   * script — publishes nothing of the batch.
+   */
+  async publishBatch(
+    stream: EventStreamName,
+    envelopes: readonly EventEnvelope<unknown>[],
+  ): Promise<{
+    readonly receipts: readonly PublishReceipt[];
+    readonly failure: { readonly index: number; readonly error: unknown } | undefined;
+  }> {
+    this.#batchCalls += 1;
+    this.#publishCalls += envelopes.length;
+    for (const envelope of envelopes) this.#beforePublish?.(envelope);
+    const stall = this.#stallGate;
+    if (stall !== undefined) {
+      await stall.promise;
+    }
+    const receipts: PublishReceipt[] = [];
+    for (let index = 0; index < envelopes.length; index += 1) {
+      try {
+        receipts.push(await this.#publishNow(stream, envelopes[index] as EventEnvelope<unknown>));
+      } catch (error) {
+        return { receipts, failure: { index, error } };
+      }
+    }
+    return { receipts, failure: undefined };
   }
 
   #publishNow(

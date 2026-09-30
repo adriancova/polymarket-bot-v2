@@ -7,13 +7,17 @@
  * `pnpm --filter @polymarket-bot/data-gateway test:integration`. Root-script
  * wiring is orchestrator-owned at merge.
  *
- * **No Docker, no network.** Acceptance 4 ("Redis outage stops publication
- * but not WAL recording") is exercised against the WP-060 transport
- * INTERFACE via an in-memory implementation with failure injection; the WAL
- * runs on the WP-050 in-memory filesystem; every socket is a scripted double
- * on the adapters' own injected transport ports. Redis itself is covered by
- * the event-bus package's Testcontainers suite and provided for local
- * operation by `infra/compose/data-gateway/`.
+ * **No network; Docker for ONE file.** Acceptance 4 ("Redis outage stops
+ * publication but not WAL recording") is exercised against the WP-060
+ * transport INTERFACE via an in-memory implementation with failure injection;
+ * the WAL runs on the WP-050 in-memory filesystem; every socket is a scripted
+ * double on the adapters' own injected transport ports. Redis itself is
+ * covered by the event-bus package's Testcontainers suite and provided for
+ * local operation by `infra/compose/data-gateway/`. The exception
+ * (`THROUGHPUT-1b`) is `publish-throughput.test.ts`: it starts its own
+ * throwaway Redis in `beforeAll` (Testcontainers, the pinned image, a
+ * generated loopback port) to drive the real publisher over the real
+ * transport, so this suite now needs a Docker daemon for that file.
  *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map

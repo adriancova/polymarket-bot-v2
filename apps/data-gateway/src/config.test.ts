@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -375,5 +377,27 @@ describe("parseGatewayConfig — the lifecycle feed (UNIV-4)", () => {
         lifecycle: { apiKey: "sk-something" },
       }),
     ).toThrow(GatewayConfigurationError);
+  });
+});
+
+/**
+ * `THROUGHPUT-1b` item 3. H1 run 1's first attempt ran this example as
+ * shipped, and it had no `polymarket` block: the gateway recorded no order
+ * book at all. The example must pass the door AND subscribe to books.
+ */
+describe("the shipped example configuration (infra/compose/data-gateway)", () => {
+  it("passes the configuration door and carries the polymarket block, so books are recorded", async () => {
+    const path = new URL(
+      "../../../infra/compose/data-gateway/gateway.config.example.json",
+      import.meta.url,
+    );
+    const example: unknown = JSON.parse(await readFile(path, "utf8"));
+    const config = parseGatewayConfig(example);
+    expect(config.polymarket).toEqual({ feedId: "polymarket-market" });
+    expect(config.markets).toHaveLength(1);
+    // The other feeds the example already carried are still there.
+    expect(config.lifecycle?.feedId).toBe("polymarket-lifecycle");
+    expect(config.binance?.feedId).toBe("binance-reference");
+    expect(config.coinbase?.feedId).toBe("coinbase-reference");
   });
 });

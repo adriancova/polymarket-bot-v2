@@ -30,6 +30,12 @@
  *   an entry that never existed, one from another server or key namespace, or
  *   one in the future — and resuming after any of those would skip retained
  *   events without a word.
+ * - **A batch is consecutive publishes in one round trip** (`THROUGHPUT-1b`).
+ *   `publishBatch` runs the same door and the same per-epoch ordering check
+ *   on every envelope, in order, inside the same serialized section, and
+ *   writes the same entries through one atomic script call. It reports the
+ *   published prefix and the first envelope that was not published; nothing
+ *   after that one is attempted.
  * - **An outage stops publication.** ADR-003 §4: a transport outage halts
  *   trading by design. `publish` raises {@link EventBusUnavailableError} rather
  *   than buffering indefinitely, so the caller's halt path runs.
@@ -98,6 +104,37 @@ export const REDIS_STREAMS_TRANSPORT_ID: TransportId = "redis-streams";
 
 /** Largest retention bound this implementation accepts. */
 export const MAX_RETENTION_EVENTS = 100_000_000;
+
+/**
+ * Most envelopes {@link RedisStreamsEventTransport.publishBatch} takes in one
+ * call. A larger call is refused whole, before anything is attempted: it is a
+ * caller defect, and one script call must stay short enough not to stall the
+ * server for every other client.
+ */
+export const MAX_PUBLISH_BATCH_ENVELOPES = 1024;
+
+/** The first envelope of a batch that was NOT published, and why. */
+export type PublishBatchFailure = {
+  /** Its position in the batch. Every envelope before it was published. */
+  readonly index: number;
+  /** What `publish` would have thrown for it. */
+  readonly error: unknown;
+};
+
+/**
+ * What {@link RedisStreamsEventTransport.publishBatch} reports.
+ *
+ * Exactly one of two shapes, and never anything in between: every envelope
+ * was published (`failure` is `undefined` and there is one receipt per
+ * envelope), or a PREFIX was published — possibly empty — and `failure`
+ * names the first envelope that was not. `receipts.length === failure.index`
+ * always holds, and nothing after `failure.index` was attempted.
+ */
+export type PublishBatchResult = {
+  /** One per published envelope, in batch order: the published prefix. */
+  readonly receipts: readonly PublishReceipt[];
+  readonly failure: PublishBatchFailure | undefined;
+};
 
 export type RedisStreamsTransportOptions = {
   readonly connection: RedisConnectionOptions;
@@ -229,6 +266,244 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     } finally {
       context.producerBlockedTimeMs += performance.now() - startedAt;
     }
+  }
+
+  /**
+   * Publishes a run of envelopes in ONE round trip, with the outcome
+   * consecutive {@link publish} calls would have had if the caller stopped at
+   * the first failure (`THROUGHPUT-1b`).
+   *
+   * Not part of `MarketEventTransport` (that interface is unchanged); the
+   * gateway's publisher uses it when the transport it was given has it.
+   *
+   * ## Same checks, same entries, same order
+   *
+   * - The envelope door ({@link encodeEnvelope}) runs on every envelope, in
+   *   order, exactly as `publish` runs it. The first refusal ends the run
+   *   there.
+   * - A batch carries ONE `gatewayEpoch` (ADR-003 §2: two epochs are never
+   *   merged into one apparent sequence). The first envelope of another epoch
+   *   ends the run there, refused as an ordering error.
+   * - Inside the epoch's serialized section — the same one `publish` uses, so
+   *   a batch and a single publish can never interleave — each `ingestSeq`
+   *   must advance past the previous one, starting from the epoch's cursor,
+   *   exactly as `publish` checks it. The first that does not ends the run.
+   * - The envelopes before the end are appended by ONE server-side script
+   *   call (`PUBLISH_BATCH_SCRIPT`), atomically: the entries are the ones the
+   *   same number of single publishes would have written, the ordinals are
+   *   contiguous, and the retention bound is applied exactly, once, after.
+   *
+   * ## Failure is a position, never a guess
+   *
+   * The result never leaves a caller wondering which envelopes landed. Every
+   * failure is reported as the index of the first envelope NOT published;
+   * everything before it IS in the stream and has a receipt, and nothing after
+   * it was attempted:
+   *
+   * - a door, epoch or ordering refusal at index `k`: envelopes `0..k-1` are
+   *   published (in one script call), `k` is the failure;
+   * - a script refusal, an unreachable server, or a queue refusal: the script
+   *   either ran completely or not at all (it undoes its own appends on
+   *   failure), so NOTHING of the run was published, and the failure is at
+   *   index 0.
+   *
+   * The one ambiguity is the one `publish` already has: a reply that never
+   * arrives. A script that ran on the server after the caller stopped waiting
+   * (the response deadline, a severed connection) may have published the
+   * run, and the call reports index 0 — a publisher that halts on it has at
+   * most that run in the stream after its boundary, as it had at most one
+   * envelope before.
+   *
+   * It never rejects: every outcome, including a closed transport, is a
+   * result.
+   */
+  async publishBatch(
+    stream: EventStreamName,
+    envelopes: readonly EventEnvelope<unknown>[],
+  ): Promise<PublishBatchResult> {
+    if (envelopes.length === 0) {
+      return { receipts: [], failure: undefined };
+    }
+    let context: StreamContext;
+    try {
+      this.#assertOpen();
+      context = this.#context(stream);
+    } catch (error) {
+      return { receipts: [], failure: { index: 0, error } };
+    }
+    if (envelopes.length > MAX_PUBLISH_BATCH_ENVELOPES) {
+      context.publishFailures += 1;
+      return {
+        receipts: [],
+        failure: {
+          index: 0,
+          error: new EventBusConfigurationError(
+            `a batch publishes at most ${String(MAX_PUBLISH_BATCH_ENVELOPES)} envelopes; ` +
+              `${String(envelopes.length)} were offered and none was attempted`,
+            { stream, batchSize: envelopes.length },
+          ),
+        },
+      };
+    }
+
+    // The door, in order, outside the serialized section as in `publish`: a
+    // caller that hands over something unpublishable learns it without
+    // waiting behind the queue. Stops at the first refusal.
+    const encoded: string[] = [];
+    let refusal: PublishBatchFailure | undefined;
+    let epoch: string | undefined;
+    for (let index = 0; index < envelopes.length; index += 1) {
+      const envelope = envelopes[index] as EventEnvelope<unknown>;
+      let wire: string;
+      try {
+        wire = encodeEnvelope(envelope);
+      } catch (error) {
+        refusal = { index, error };
+        break;
+      }
+      if (epoch === undefined) {
+        epoch = envelope.gatewayEpoch;
+      } else if (envelope.gatewayEpoch !== epoch) {
+        refusal = {
+          index,
+          error: new EventBusOrderingError(
+            "a batch publishes one gatewayEpoch; an envelope of another epoch ends it " +
+              "(ADR-003 §2: two epochs are never merged into one apparent sequence)",
+            {
+              gatewayEpoch: envelope.gatewayEpoch,
+              batchEpoch: epoch,
+              ingestSeq: envelope.ingestSeq,
+              eventId: envelope.eventId,
+            },
+          ),
+        };
+        break;
+      }
+      encoded.push(wire);
+    }
+    if (epoch === undefined || encoded.length === 0) {
+      // A refusal of the very first envelope: nothing waited on the
+      // transport, so, as in `publish`, no producer blocked time.
+      context.publishFailures += 1;
+      return { receipts: [], failure: refusal ?? { index: 0, error: new Error("empty batch") } };
+    }
+
+    const batchEpoch = epoch;
+    const startedAt = performance.now();
+    try {
+      return await context.publishQueue.run(
+        batchEpoch,
+        async () =>
+          await this.#publishBatchInEpochOrder(context, stream, batchEpoch, envelopes, encoded, refusal),
+      );
+    } catch (error) {
+      // Only the queue's own admission refusal reaches here (the section
+      // itself returns every outcome): nothing was attempted.
+      context.publishFailures += 1;
+      return { receipts: [], failure: { index: 0, error } };
+    } finally {
+      context.producerBlockedTimeMs += performance.now() - startedAt;
+    }
+  }
+
+  /**
+   * The serialized half of {@link publishBatch}. Returns every outcome;
+   * counts exactly one publish failure when it reports one, as `publish`
+   * counts one per failed call.
+   */
+  async #publishBatchInEpochOrder(
+    context: StreamContext,
+    stream: EventStreamName,
+    epoch: string,
+    envelopes: readonly EventEnvelope<unknown>[],
+    encoded: readonly string[],
+    doorRefusal: PublishBatchFailure | undefined,
+  ): Promise<PublishBatchResult> {
+    const failed = (failure: PublishBatchFailure): PublishBatchResult => {
+      context.publishFailures += 1;
+      return { receipts: [], failure };
+    };
+    try {
+      // Re-checked here, as in `publish`: the transport may have closed while
+      // this batch waited behind another publish.
+      this.#assertOpen();
+    } catch (error) {
+      return failed({ index: 0, error });
+    }
+
+    // The ordering check `publish` makes, envelope by envelope, from the
+    // epoch's cursor. The first non-advancing identity ends the run.
+    let submitted = encoded.length;
+    let failure = doorRefusal;
+    let previous = context.order.lastIngestSeq(epoch);
+    for (let index = 0; index < encoded.length; index += 1) {
+      const envelope = envelopes[index] as EventEnvelope<unknown>;
+      const current = parseIngestSeq(envelope.ingestSeq);
+      if (previous !== undefined && current <= previous) {
+        submitted = index;
+        failure = {
+          index,
+          error: new EventBusOrderingError(
+            "ingestSeq did not advance within its gatewayEpoch; the event has no position in the stream " +
+              "(ADR-002 §2)",
+            {
+              gatewayEpoch: envelope.gatewayEpoch,
+              previousIngestSeq: previous.toString(),
+              ingestSeq: envelope.ingestSeq,
+              eventId: envelope.eventId,
+            },
+          ),
+        };
+        break;
+      }
+      previous = current;
+    }
+    const first = envelopes[0] as EventEnvelope<unknown>;
+    if (submitted === 0) {
+      return failed(failure ?? { index: 0, error: new Error("empty batch") });
+    }
+
+    let reply: string[];
+    try {
+      reply = await this.#client.ebPublishBatch(
+        context.keys.events,
+        context.keys.published,
+        String(this.retention.maxEvents),
+        ...encoded.slice(0, submitted),
+      );
+    } catch (cause) {
+      return failed({
+        index: 0,
+        error: new EventBusUnavailableError(
+          "could not publish to the event transport; publication stops and trading halts (ADR-003 §4)",
+          { stream, eventId: first.eventId, batchSize: submitted },
+          cause,
+        ),
+      });
+    }
+
+    let outcome: PublishBatchOutcome;
+    try {
+      outcome = readPublishBatchReply(reply, stream, first.eventId, submitted);
+    } catch (error) {
+      return failed({ index: 0, error });
+    }
+    if (outcome.trimFailed) {
+      // As in `publish`: the run is published and its ordinals are
+      // consistent; only the bound was not applied. Counted, not raised.
+      context.retentionTrimFailures += 1;
+    }
+    // Recorded only after the run is in the stream, as in `publish`. The last
+    // identity of the run is the cursor: the run advanced strictly.
+    context.order.observe(epoch, (envelopes[submitted - 1] as EventEnvelope<unknown>).ingestSeq);
+    const receipts: PublishReceipt[] = [];
+    for (let index = 0; index < submitted; index += 1) {
+      receipts.push({ stream, sequence: outcome.firstSequence + index });
+    }
+    if (failure !== undefined) {
+      context.publishFailures += 1;
+    }
+    return { receipts, failure };
   }
 
   async #publishInEpochOrder(
@@ -663,6 +938,59 @@ export function readPublishReply(
     );
   }
   return { sequence, trimFailed: third !== undefined && third !== "" };
+}
+
+/** What the batch publish script reported about one accepted run. */
+export type PublishBatchOutcome = {
+  /** The first envelope's ordinal; the run's are contiguous from it. */
+  readonly firstSequence: number;
+  /** As in {@link PublishOutcome}: landed, but the bound was not applied. */
+  readonly trimFailed: boolean;
+};
+
+/**
+ * Reads the batch publish script's reply for a run of `count` envelopes.
+ *
+ * A refusal means NOTHING of the run was appended (`./scripts.ts`): it was
+ * refused before any mutation, or its appends were undone. An `ok` must carry
+ * exactly `count` contiguous ordinals; anything else is treated as an
+ * unreadable reply, which the caller halts on.
+ */
+export function readPublishBatchReply(
+  reply: readonly string[],
+  stream: EventStreamName,
+  eventId: string,
+  count: number,
+): PublishBatchOutcome {
+  const [status, first, second, third] = reply;
+  if (status === "err") {
+    throw publishRefusal(first ?? "unknown", second ?? "", stream, eventId);
+  }
+  if (status !== "ok" || first === undefined || second === undefined) {
+    throw new EventBusUnavailableError("the transport did not return publication ordinals", {
+      stream,
+      eventId,
+    });
+  }
+  const firstSequence = Number(first);
+  const lastSequence = Number(second);
+  if (
+    !Number.isSafeInteger(firstSequence) ||
+    !Number.isSafeInteger(lastSequence) ||
+    firstSequence < 1
+  ) {
+    throw new EventBusUnavailableError(
+      "the stream's publication counter has exceeded what this process can represent exactly",
+      { stream, firstSequence: first, lastSequence: second },
+    );
+  }
+  if (lastSequence - firstSequence + 1 !== count) {
+    throw new EventBusUnavailableError(
+      "the transport returned publication ordinals that do not cover the published run",
+      { stream, eventId, firstSequence: first, lastSequence: second, count },
+    );
+  }
+  return { firstSequence, trimFailed: third !== undefined && third !== "" };
 }
 
 function publishRefusal(

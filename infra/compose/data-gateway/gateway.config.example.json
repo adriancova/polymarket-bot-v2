@@ -26,6 +26,9 @@
       "observedAt": "2026-09-01T00:00:00.000Z"
     }
   ],
+  "polymarket": {
+    "feedId": "polymarket-market"
+  },
   "lifecycle": {
     "feedId": "polymarket-lifecycle",
     "pollIntervalMs": 10000,

@@ -3,15 +3,21 @@
 Owner: `WP-120` (`apps/data-gateway`).
 
 This directory holds the compose fragment and an example configuration for
-running the Market Data Gateway and Recorder on a developer machine. It is
-**not** used by any test: the gateway's integration suite runs entirely
-offline against injected in-memory transports and scripted sockets.
+running the Market Data Gateway and Recorder on a developer machine. The
+compose fragment is not used by any test. The example configuration is: two
+tests parse it through the configuration door and build a gateway from it
+(`apps/data-gateway/src/config.test.ts`,
+`test/integration/data-gateway/book-feed-absent.test.ts`). The gateway's
+integration suite runs offline against injected in-memory transports and
+scripted sockets, except `publish-throughput.test.ts`, which starts its own
+throwaway Redis (Testcontainers) to drive the real publisher over the real
+transport (`THROUGHPUT-1b`).
 
 ## What runs where
 
 | Concern | Local operation | Tests |
 | --- | --- | --- |
-| Event-bus transport | Redis, from `compose.yaml` (or the root `docker-compose.yml`) | in-memory `MarketEventTransport` with failure injection |
+| Event-bus transport | Redis, from `compose.yaml` (or the root `docker-compose.yml`) | in-memory `MarketEventTransport` with failure injection; a Testcontainers Redis in `publish-throughput.test.ts` |
 | WAL | a real directory under `wal.rootPath` | the `WP-050` in-memory filesystem |
 | Venue sockets | the real public endpoints | scripted doubles on the adapters' injected ports |
 
@@ -71,6 +77,16 @@ such values are refused before any resource is acquired.
   consumer checkpoints, resync state, and lag metrics by it; a per-boot name
   would orphan every checkpoint on every restart. The schema refuses a
   UUID-shaped name for that reason.
+- **Order books need the `polymarket` block.** It is the CLOB market-channel
+  feed: without it the gateway subscribes to NO order book, so no
+  `BookSnapshot` or `BookLevelChanged` is ever produced, whatever `markets`
+  says, and a trader computes no feature snapshot and makes no decision. The
+  example carries `"polymarket": {"feedId": "polymarket-market"}`; keep it.
+  (H1 run 1's first attempt ran an example without it and recorded zero
+  book events.) A configuration with markets and no `polymarket` block is
+  still accepted (a lifecycle- or reference-only gateway is legitimate), and
+  is announced at start as a NOTIFY incident, `GATEWAY_BOOK_FEED_ABSENT`, in
+  the stream and in the `[incident]` log (`THROUGHPUT-1b`).
 - `markets` is **reviewed configuration**, not discovery (§9.2). A market
   announced on the wire that is not configured here is observed, counted, and
   reported — never adopted: the venue documents no pairing rule between
@@ -136,6 +152,16 @@ such values are refused before any resource is acquired.
   throughput knobs**: raising them buys tolerance for a longer transport stall
   and costs memory plus a longer window of events that exist only in the WAL.
   Crossing either bound is a terminal publication halt, never a drop.
+- The publisher submits in **batches** when the transport offers it (the Redis
+  Streams transport does; `THROUGHPUT-1b`). The pump takes the consecutive run
+  of envelopes at the head of the admission queue (at most 256 envelopes and
+  1 MiB) and publishes it in one round trip, through one atomic server-side
+  script that writes exactly the entries the same number of single publishes
+  would. The bounds above are unchanged and still count admitted, not yet
+  submitted envelopes; at most one batch is in flight. An envelope the
+  transport refuses inside a batch halts publication exactly as a refused
+  single publish did, and nothing after it is appended. Measurements:
+  `tools/bench/gateway/README.md`.
 
 ## When publication halts: the operator procedure
 

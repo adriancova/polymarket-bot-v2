@@ -701,6 +701,23 @@ export class DataGateway {
           detail: `${String(this.#config.markets.length)} Polymarket market(s) are configured but no \`lifecycle\` feed is: MarketOpened/MarketClosing will never be produced, every consumer stays PENDING and every paper entry is refused (§9.8) — configure the \`lifecycle\` block (UNIV-4)`,
         });
       }
+      if (this.#config.markets.length > 0 && this.#config.polymarket === undefined) {
+        // THROUGHPUT-1b: the mirror image of the case above. H1 run 1's first
+        // attempt configured a market (and its lifecycle feed) but no
+        // `polymarket` block, so the gateway never subscribed to the CLOB
+        // market channel: it recorded the lifecycle and the reference feeds,
+        // produced ZERO order-book events, and nothing said so. The trader
+        // then made no decision at all, because no feature snapshot could be
+        // computed without a book. That configuration stays accepted (a
+        // lifecycle- or reference-only gateway is legitimate), and is
+        // announced here, at start, in the stream and in the operator's log.
+        this.#dispatcher.openIncident({
+          scope: "books",
+          reasonCode: "GATEWAY_BOOK_FEED_ABSENT",
+          severity: "NOTIFY",
+          detail: `${String(this.#config.markets.length)} Polymarket market(s) are configured but no \`polymarket\` feed is: the gateway subscribes to no order book, so no BookSnapshot/BookLevelChanged is ever produced and a consumer that needs a book computes no feature snapshot — configure the \`polymarket\` block (for example {"feedId": "polymarket-market"}) to record books`,
+        });
+      }
       if (this.#polymarketFeed !== undefined) {
         this.#polymarketFeed.subscribe(this.#plan.polymarketTokenIds);
         this.#polymarketFeed.start();

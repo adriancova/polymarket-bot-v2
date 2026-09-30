@@ -301,6 +301,110 @@ return { 'ok', appended, sequence, trimError }
 `;
 
 /**
+ * Undoes this call's own appends, newest first.
+ *
+ * Only ever given ids the calling script appended itself in the same call, so
+ * everything it removes is something the script created: the "no
+ * irreversible mutation before the reversible ones succeeded" rule above
+ * holds, because the batch script trims only after this can no longer run.
+ */
+const LUA_UNDO_APPENDS = `
+local function undoAppends(streamKey, ids)
+  for index = #ids, 1, -1 do
+    local removed = redis.pcall('XDEL', streamKey, ids[index])
+    if failed(removed) then return false end
+  end
+  return true
+end
+`;
+
+/**
+ * Appends a RUN of envelopes, in argument order, as one atomic publication
+ * (`THROUGHPUT-1b`).
+ *
+ * The same contract as {@link PUBLISH_SCRIPT}, applied to N envelopes at
+ * once, with the SAME stream entries as N consecutive single publishes: entry
+ * `i` carries `seq` = counter + i and `env` = the i-th envelope, in that field
+ * order, and nothing else. What changes is the number of round trips, not a
+ * byte of what is stored.
+ *
+ * All or nothing. Everything that can be checked is checked before anything
+ * is mutated — key types, the counter's format, and the safe-integer ceiling
+ * for the WHOLE run (counter + N) — so a refusal consumes no ordinal. If an
+ * append or the counter write then fails, every entry this call appended is
+ * removed again (`undoAppends`), so the stream and the counter are exactly as
+ * the call found them: the caller learns that none of the run was published,
+ * never that some unknown part of it was. (If the undo itself fails, the reply
+ * says the keys are desynchronized; the caller halts either way.)
+ *
+ * The trim is the last step, once, exactly (`MAXLEN` with no `~`), for the
+ * same reason and with the same bound as the single publish: it is
+ * irreversible, so it runs only after the run and its ordinals agree. The
+ * retained entries afterwards are exactly those N single publishes would have
+ * left, because an exact trim to the newest `retention` entries does not
+ * depend on how many appends preceded it. A trim that fails is reported, not
+ * turned into a failure: the run IS published.
+ *
+ * KEYS: `[1]` stream, `[2]` publication counter.
+ * ARGV: `[1]` retention bound, `[2..N+1]` the encoded envelopes, in order.
+ * Returns: `{ 'ok', firstSequence, lastSequence, trimError }` or
+ * `{ 'err', code, detail }`.
+ */
+export const PUBLISH_BATCH_SCRIPT = `
+${LUA_FAILED}
+${LUA_UNDO_APPENDS}
+local count = #ARGV - 1
+if count < 1 then
+  return { 'err', 'empty-batch', '' }
+end
+local streamType = redis.call('TYPE', KEYS[1])['ok']
+if streamType ~= 'stream' and streamType ~= 'none' then
+  return { 'err', 'stream-key-type', streamType }
+end
+local counterType = redis.call('TYPE', KEYS[2])['ok']
+if counterType ~= 'string' and counterType ~= 'none' then
+  return { 'err', 'counter-key-type', counterType }
+end
+local currentRaw = redis.call('GET', KEYS[2])
+if currentRaw == false then currentRaw = '0' end
+if not string.match(currentRaw, '^%d+$') then
+  return { 'err', 'counter-unreadable', currentRaw }
+end
+local current = tonumber(currentRaw)
+if current > ${MAX_PUBLICATION_ORDINAL} - count then
+  return { 'err', 'counter-ceiling', currentRaw }
+end
+local appended = {}
+for index = 1, count do
+  local sequence = string.format('%d', current + index)
+  local id = redis.pcall(
+    'XADD', KEYS[1], '*',
+    '${FIELD_SEQUENCE}', sequence,
+    '${FIELD_ENVELOPE}', ARGV[index + 1]
+  )
+  if failed(id) then
+    if not undoAppends(KEYS[1], appended) then
+      return { 'err', 'append-desynchronized', tostring(id['err']) }
+    end
+    return { 'err', 'append-failed', tostring(id['err']) }
+  end
+  appended[index] = id
+end
+local last = string.format('%d', current + count)
+local stored = redis.pcall('SET', KEYS[2], last)
+if failed(stored) then
+  if not undoAppends(KEYS[1], appended) then
+    return { 'err', 'counter-desynchronized', tostring(stored['err']) }
+  end
+  return { 'err', 'counter-write-failed', tostring(stored['err']) }
+end
+local trimmed = redis.pcall('XTRIM', KEYS[1], 'MAXLEN', ARGV[1])
+local trimError = ''
+if failed(trimmed) then trimError = tostring(trimmed['err']) end
+return { 'ok', string.format('%d', current + 1), last, trimError }
+`;
+
+/**
  * Reads everything needed to judge continuity and report §8.3 metrics.
  *
  * One atomic snapshot: a consumer that read the depth, the counter, and the

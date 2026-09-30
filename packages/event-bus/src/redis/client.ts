@@ -20,6 +20,7 @@ import { EventBusConfigurationError, EventBusUnavailableError } from "../errors.
 import { withDeadline } from "./deadline.js";
 import {
   ENSURE_ORIGIN_SCRIPT,
+  PUBLISH_BATCH_SCRIPT,
   PUBLISH_SCRIPT,
   RESOLVE_POSITION_SCRIPT,
   STORE_CHECKPOINT_SCRIPT,
@@ -98,6 +99,13 @@ export type RedisScriptCommands = {
     counterKey: string,
     retention: string,
     envelope: string,
+  ): Promise<string[]>;
+  /** `PUBLISH_BATCH_SCRIPT`: the envelopes follow the retention bound, in order. */
+  ebPublishBatch(
+    streamKey: string,
+    counterKey: string,
+    retention: string,
+    ...envelopes: string[]
   ): Promise<string[]>;
   ebStreamState(streamKey: string, counterKey: string, originKey: string): Promise<string[]>;
   ebEnsureOrigin(originKey: string, candidate: string): Promise<string[]>;
@@ -186,6 +194,7 @@ export async function createRedisClient(
   client.on("error", () => {});
 
   client.defineCommand("ebPublish", { numberOfKeys: 2, lua: PUBLISH_SCRIPT });
+  client.defineCommand("ebPublishBatch", { numberOfKeys: 2, lua: PUBLISH_BATCH_SCRIPT });
   client.defineCommand("ebStreamState", { numberOfKeys: 3, lua: STREAM_STATE_SCRIPT });
   client.defineCommand("ebEnsureOrigin", { numberOfKeys: 1, lua: ENSURE_ORIGIN_SCRIPT });
   client.defineCommand("ebResolvePosition", { numberOfKeys: 3, lua: RESOLVE_POSITION_SCRIPT });
