@@ -128,7 +128,7 @@ was signed that the caller holds, so nothing can have been posted.
 | Outcome | Meaning | OMS consequence (ADR-007) |
 | --- | --- | --- |
 | `NOT_SENT` | Nothing left the process: local validation, SDK input validation or signing failed. | The attempt does not exist at the venue. |
-| `REFUSED` | The venue returned a documented refusal: 425 or 401 with no code, or 503 with `post_only_mode`. (A 429 through the pinned SDK is `UNKNOWN`; see §2.2.) | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
+| `REFUSED` | The venue returned a documented refusal whose code the pinned SDK could only have kept because the venue sent it: 503 with `post_only_mode`. (401, 425 and 429 are always `UNKNOWN`; see §2.2.) | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
 | `REJECTED` | The SDK classified a venue rejection. The reasons are the eight named `OrderResponseErrorCode` members. | Not placed. |
 | `UNKNOWN` | The order may exist. | `SUBMISSION_UNKNOWN`: reconcile by the signed identity before any new salt (§2 step 10, §3). |
 | `ACCEPTED` / `DELAYED` | The order was placed, but `DELAYED` is never a fill: its amounts are `"0"` (§5). | Track the order as pending. |
@@ -143,19 +143,34 @@ Errors are classified by HTTP status and **documented** code. The venue's
 | `UserInputError` | `INVALID_REQUEST` | `NOT_SENT` | — |
 | `SigningError`, `CancelledSigningError` | `SIGNING_FAILED` | `NOT_SENT` | — |
 | `RateLimitError` (429; the pinned SDK's ONLY 429) | `RATE_LIMITED` | **`UNKNOWN`** (the SDK discards the body) | — |
-| 425, no code | `ENGINE_RESTARTING` | `NOT_APPLIED` | `UNKNOWN` |
+| 425, with or without a code | `ENGINE_RESTARTING` | **`UNKNOWN`** (the SDK can drop the code) | `UNKNOWN` |
 | 503 + `code: "post_only_mode"` | `POST_ONLY_MODE` | `NOT_APPLIED` | `YES` (documented) |
 | 503, any other or no code | `TRADING_UNAVAILABLE` | `UNKNOWN` | `UNKNOWN` (C-9) |
-| 401, no code | `AUTHENTICATION_REJECTED` | `NOT_APPLIED` | — |
-| 401, 425 or 429 **with any code** (documented or not), including a `code` that is an accessor (present but unreadable) | by status, as above | **`UNKNOWN`** (ADR-007 §6) | as above |
+| 401, with or without a code | `AUTHENTICATION_REJECTED` | **`UNKNOWN`** (the SDK can drop the code) | — |
+| 401, 425 or 429 with any code (documented or not), including a `code` that is an accessor (present but unreadable) | by status, as above | **`UNKNOWN`** (ADR-007 §6) | as above |
 | any other status | `REQUEST_REJECTED` | `UNKNOWN` (U-4) | — |
 | `TransportError` / `TimeoutError` / `UnexpectedResponseError` | `TRANSPORT_FAILURE` / `TIMEOUT` / `UNEXPECTED_RESPONSE` | `UNKNOWN` | — |
 | anything else, including an SDK look-alike that is not an instance, and any value whose reflection throws | `UNKNOWN` | `UNKNOWN` | — |
 
-`NOT_APPLIED` (outcome `REFUSED`) is given **only** to the exact documented
-pairs: 401 or 425 with no code, and 503 with `post_only_mode`. ADR-007 §6:
-"an unrecognized code is surfaced as UNKNOWN and never … silently treated as a
-rejection". The kind still follows the status, so a caller can back off.
+`NOT_APPLIED` (outcome `REFUSED`) is given **only** to 503 with the
+documented `post_only_mode`. ADR-007 §6: "an unrecognized code is surfaced as
+UNKNOWN and never … silently treated as a rejection". The kind still follows
+the status, so a caller can back off.
+
+**401 and 425 are `UNKNOWN` even with no code (CX-R3-01).** The pinned SDK's
+`ServiceClient` keeps a JSON body's `code` only when the body's `error` is
+truthy and the code is a non-empty string (`if (error) return { message,
+...(typeof code === "string" && code !== "" ? { code } : {}) }`). A body such
+as `{"code": "x"}`, `{"error": "", "code": "x"}` or `{"error": null, "code":
+"x"}`, a non-string code, or a text or HTML body all reach this package with
+no code. So "no code" can never be established, and a code-less 401 or 425
+may be a venue answer that carried an undocumented code. The SDK's message
+text is never used to tell these cases apart. For a placement this means a
+425 (engine restart) forces reconciliation by signed identity before any new
+salt. How the venue's documented 425 handling ("resubmit the signed
+request" after backoff) composes with that reconciliation is for WP-310 and
+WP-270 to decide under ADR-007; this package only reports the effect as
+`UNKNOWN`, with kind `ENGINE_RESTARTING` and any `retryAfterSeconds`.
 
 **Every 429 is `UNKNOWN`.** The pinned SDK's `ServiceClient` throws
 `RateLimitError` for every 429 before it parses the body
@@ -164,8 +179,8 @@ so any `code` the venue sent is discarded and "no code" can never be
 established. A 429 therefore forces reconciliation of a placement, like any
 other `UNKNOWN`. The kind stays `RATE_LIMITED` (with `retryAfterSeconds` when
 the `Retry-After` header was an integer), so backoff still works. (A
-`RequestRejectedError` with status 429 and no code would still be
-`NOT_APPLIED`, but the pinned SDK never builds one.)
+`RequestRejectedError` with status 429, which the pinned SDK never builds, is
+`UNKNOWN` too.)
 
 **Closed vocabularies.** Every field of a `SecureVenueError` is checked on
 every construction: the kind, operation, effect, source and cancel flag

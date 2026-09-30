@@ -67,11 +67,13 @@ describe("HTTP rejections are classified by status and DOCUMENTED code only", ()
   const rejected = (status: number, extra: { code?: string; retryAfter?: number; restriction?: TradingRestriction } = {}): RequestRejectedError =>
     new RequestRejectedError("venue text (https://clob.polymarket.com/order)", { status, ...extra });
 
-  it("425 → ENGINE_RESTARTING, not applied, cancels unknown (E-06)", () => {
+  // CX-R3-01: effect UNKNOWN, not NOT_APPLIED — the pinned SDK drops a 425
+  // body's code unless the body's `error` is truthy, so "no code" is unproven.
+  it("425 → ENGINE_RESTARTING, effect UNKNOWN, cancels unknown (E-06; CX-R3-01)", () => {
     expect(data(rejected(425, { restriction: TradingRestriction.RESTARTING, retryAfter: 1 }))).toEqual({
       kind: "ENGINE_RESTARTING",
       operation: "POST_ORDER",
-      effect: "NOT_APPLIED",
+      effect: "UNKNOWN",
       httpStatus: 425,
       venueCode: null,
       undocumentedVenueCode: false,
@@ -133,8 +135,9 @@ describe("HTTP rejections are classified by status and DOCUMENTED code only", ()
     });
   });
 
-  it("401 → AUTHENTICATION_REJECTED, not applied", () => {
-    expect(data(rejected(401))).toMatchObject({ kind: "AUTHENTICATION_REJECTED", effect: "NOT_APPLIED" });
+  // CX-R3-01: effect UNKNOWN, not NOT_APPLIED (the SDK can drop the body's code).
+  it("401 → AUTHENTICATION_REJECTED, effect UNKNOWN (CX-R3-01)", () => {
+    expect(data(rejected(401))).toMatchObject({ kind: "AUTHENTICATION_REJECTED", effect: "UNKNOWN" });
   });
 
   it.each([400, 403, 404, 409, 422, 500, 502, 504, 200])("status %i with no documented code → REQUEST_REJECTED, effect UNKNOWN (U-4)", (status) => {
@@ -177,8 +180,9 @@ describe("HTTP rejections are classified by status and DOCUMENTED code only", ()
     expect(invoked).toBe(false);
   });
 
-  it("classifyHttpRejection covers 429 for an HTTP rejection that is not a RateLimitError", () => {
-    expect(classifyHttpRejection(429, { venueCode: null, undocumentedVenueCode: false })).toEqual({ kind: "RATE_LIMITED", effect: "NOT_APPLIED", cancelsAvailable: null });
+  // I-R3-1 (folded into CX-R3-01): a code-less RequestRejectedError 429 is UNKNOWN too.
+  it("classifyHttpRejection covers 429 for an HTTP rejection that is not a RateLimitError (effect UNKNOWN)", () => {
+    expect(classifyHttpRejection(429, { venueCode: null, undocumentedVenueCode: false })).toEqual({ kind: "RATE_LIMITED", effect: "UNKNOWN", cancelsAvailable: null });
   });
 });
 

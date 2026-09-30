@@ -271,9 +271,10 @@ describe("CX-R2-03: an accessor `code` is present-but-unreadable, never 'no code
     expect(mapped.toData()).toMatchObject({ effect: "UNKNOWN", undocumentedVenueCode: true, venueCode: null, httpStatus: status });
   });
 
-  it("control: RequestRejectedError 401 with no `code` property at all stays NOT_APPLIED", () => {
+  // CX-R3-01 superseded this r2 control: no `code` at all is UNKNOWN too.
+  it("RequestRejectedError 401 with no `code` property at all is also effect UNKNOWN (CX-R3-01)", () => {
     expect(mapVenueError(new RequestRejectedError("venue text", { status: 401 }), "POST_ORDER").toData()).toMatchObject({
-      effect: "NOT_APPLIED",
+      effect: "UNKNOWN",
       undocumentedVenueCode: false,
     });
   });

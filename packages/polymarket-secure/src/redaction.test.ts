@@ -54,6 +54,8 @@ import {
 const LIVE_SHAPED_CONTEXT = Object.freeze({ runMode: "LIVE_MICRO", maximumRunMode: "LIVE_MICRO", allowRealOrders: true });
 const CASES = 120;
 const SEED = 0x260_2026;
+/** L-R3-1: an explicit budget for the seeded property tests (≈0.2–2 s in isolation). */
+const PROPERTY_TIMEOUT_MS = 60_000;
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -246,7 +248,11 @@ const OPERATIONS: readonly SecureOperation[] = [
 // ---------------------------------------------------------------------------
 
 describe("property: no fake secret survives any mapping path or serialiser", () => {
-  it(`direct mapping paths (${CASES} seeded cases × ${OPERATIONS.length} operations)`, () => {
+  // L-R3-1: partitioned by operation (the same SEED regenerates the same
+  // CASES hostile errors for each operation, so coverage is unchanged:
+  // CASES × OPERATIONS × 4 results in total) and given an explicit budget,
+  // so a loaded root run cannot time it out at the 5 s default.
+  it.each(OPERATIONS)(`direct mapping paths, operation %s (${CASES} seeded cases)`, (operation) => {
     const g = generator(SEED);
     let checked = 0;
     for (let n = 0; n < CASES; n += 1) {
@@ -254,18 +260,16 @@ describe("property: no fake secret survives any mapping path or serialiser", () 
       const error = hostileError(g, secrets);
       // Positive control: the detector sees the raw error's secrets.
       expect(leaksIn(error, secrets).length).toBeGreaterThan(0);
-      for (const operation of OPERATIONS) {
-        const mapped = mapVenueError(error, operation);
-        expect(mapped).toBeInstanceOf(SecureVenueError);
-        expect(mapped.cause).toBeUndefined();
-        for (const result of [mapped, placementOutcomeFromError(mapped), cancelOutcomeFromError(mapped), mapped.toData()]) {
-          expect(leaksIn(result, secrets)).toEqual([]);
-          checked += 1;
-        }
+      const mapped = mapVenueError(error, operation);
+      expect(mapped).toBeInstanceOf(SecureVenueError);
+      expect(mapped.cause).toBeUndefined();
+      for (const result of [mapped, placementOutcomeFromError(mapped), cancelOutcomeFromError(mapped), mapped.toData()]) {
+        expect(leaksIn(result, secrets)).toEqual([]);
+        checked += 1;
       }
     }
-    expect(checked).toBe(CASES * OPERATIONS.length * 4);
-  });
+    expect(checked).toBe(CASES * 4);
+  }, PROPERTY_TIMEOUT_MS);
 
   it(`every client method, and construction (${CASES} seeded cases)`, async () => {
     const g = generator(SEED ^ 0xffff);
@@ -322,7 +326,7 @@ describe("property: no fake secret survives any mapping path or serialiser", () 
       for (const result of results) expect(leaksIn(result, secrets)).toEqual([]);
       expect(leaksIn(client, secrets)).toEqual([]);
     }
-  });
+  }, PROPERTY_TIMEOUT_MS);
 
   it("NON-VACUOUS: a leaky mapper that forwards message and cause is caught on every case", () => {
     const g = generator(SEED);
@@ -336,7 +340,7 @@ describe("property: no fake secret survives any mapping path or serialiser", () 
       const error = hostileError(g, secrets);
       expect(leaksIn(leakyMapper(error), secrets).length).toBeGreaterThan(0);
     }
-  });
+  }, PROPERTY_TIMEOUT_MS);
 });
 
 describe("the secure client, envelopes and snapshots never render held secrets", () => {

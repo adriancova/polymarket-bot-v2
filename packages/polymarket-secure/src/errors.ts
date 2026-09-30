@@ -49,11 +49,12 @@ export type SecureVenueErrorKind =
  * What the failed request did at the venue, as far as this package can know.
  *
  * - `NOT_SENT`: nothing left the process.
- * - `NOT_APPLIED`: the venue answered with a documented refusal: 425 or 401
- *   with NO code, or 503 with `post_only_mode`. Any code on 429/425/401
- *   makes the effect `UNKNOWN` (ADR-007 §6). A 429 from the pinned SDK
- *   (`RateLimitError`) is always `UNKNOWN`: the SDK throws it before reading
- *   the body, so "no code" cannot be established.
+ * - `NOT_APPLIED`: the venue answered with a documented refusal whose code
+ *   the pinned SDK could only have kept because the venue sent it: 503 with
+ *   `post_only_mode`. 401, 425 and 429 are always `UNKNOWN`: the pinned SDK
+ *   discards the body of every 429, and drops a 401/425 body's `code`
+ *   whenever the body's `error` is missing, empty or null (or the body is
+ *   not JSON), so "no code" can never be established (ADR-007 §6; CX-R3-01).
  * - `UNKNOWN`: the request may have been applied. For a placement this is
  *   `SUBMISSION_UNKNOWN` territory: reconcile before any retry with a new
  *   salt (ADR-007 §2 step 10, §3).

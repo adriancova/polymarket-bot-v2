@@ -377,8 +377,10 @@ describe("CX-R1-04: any code on 401/425/429 makes the effect UNKNOWN (ADR-007 §
     expect(mapVenueError(rejected(status, "post_only_mode"), "POST_ORDER").toData()).toMatchObject({ effect: "UNKNOWN" });
   });
 
-  it.each([401, 425, 429])("control: status %i with NO code stays a documented refusal (NOT_APPLIED)", (status) => {
-    expect(mapVenueError(rejected(status), "POST_ORDER").toData()).toMatchObject({ effect: "NOT_APPLIED", undocumentedVenueCode: false });
+  // CX-R3-01 superseded this r1 control: with NO code the effect is UNKNOWN
+  // too, because the pinned SDK can drop a code the venue sent.
+  it.each([401, 425, 429])("status %i with NO code is also effect UNKNOWN (CX-R3-01), code fields unset", (status) => {
+    expect(mapVenueError(rejected(status), "POST_ORDER").toData()).toMatchObject({ effect: "UNKNOWN", venueCode: null, undocumentedVenueCode: false });
   });
 
   it("a RateLimitError carrying a code is treated the same way", () => {

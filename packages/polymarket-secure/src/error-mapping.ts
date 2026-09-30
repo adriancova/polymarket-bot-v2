@@ -17,18 +17,28 @@
  *    `retryAfter`). A getter is never invoked. An own ACCESSOR `code` is not
  *    "no code": it is a code that is present but unreadable, and reads as an
  *    undocumented code (so the effect is `UNKNOWN`, rule 4).
- * 4. `NOT_APPLIED` (a documented refusal) is given ONLY to the exact
- *    documented pairs: 425 or 401 with NO code (and a `RequestRejectedError`
- *    429 with no code), and 503 with `post_only_mode`. Any code on
- *    425/429/401, documented or not, makes the effect `UNKNOWN` (ADR-007 §6:
- *    "an unrecognized code is surfaced as UNKNOWN and never ... silently
- *    treated as a rejection").
- * 4a. A `RateLimitError` is ALWAYS effect `UNKNOWN` (kind `RATE_LIMITED`, so
+ * 4. `NOT_APPLIED` (a documented refusal) is given ONLY to 503 with the
+ *    documented code `post_only_mode`: a code the pinned SDK could only have
+ *    kept because the venue sent it. 401, 425 and 429 are ALWAYS effect
+ *    `UNKNOWN` (the kind still follows the status, so a caller can back off),
+ *    whether or not a code is present. ADR-007 §6: "an unrecognized code is
+ *    surfaced as UNKNOWN and never ... silently treated as a rejection" — and
+ *    with the pinned SDK the ABSENCE of a code can never be established:
+ * 4a. The pinned `@polymarket/client@0.11.0` `ServiceClient` keeps a JSON
+ *    body's `code` only when the body's `error` is truthy AND the code is a
+ *    non-empty string (`if (error) return {message, ...(typeof code ==
+ *    "string" && code !== "" ? {code} : {})}`); a text or HTML body, or a
+ *    missing, empty or null `error`, discards the code entirely (CX-R3-01).
+ *    So a code-less `RequestRejectedError` may still be a venue answer that
+ *    carried an undocumented code, and it is UNKNOWN. The SDK message text is
+ *    never consulted to tell these apart (rule 2).
+ * 4b. A `RateLimitError` is ALWAYS effect `UNKNOWN` (kind `RATE_LIMITED`, so
  *    a caller still backs off). The pinned SDK throws it for EVERY 429
  *    BEFORE it reads the response body (`ServiceClient`: `if (status === 429)
  *    throw new RateLimitError(...)` precedes the body parse), so the venue's
- *    code, if any, is discarded and "no code" can never be established. This
- *    is the only 429 the pinned SDK produces.
+ *    code, if any, is discarded. This is the only 429 the pinned SDK
+ *    produces; a `RequestRejectedError` 429 (which it never builds) is
+ *    UNKNOWN too, by rule 4.
  * 5. Reflection is contained. `instanceof` and property descriptors can run
  *    foreign code (a proxy trap); if any of it throws, the result is a fresh
  *    `UNKNOWN` error, and the thrown value is dropped unread.
@@ -118,15 +128,14 @@ interface Classified {
 /**
  * HTTP status + code reading → kind and effect. The `error` text is never
  * consulted. The kind follows the status (so a caller can still back off on
- * a 425 or 429); the effect is `NOT_APPLIED` only for an exact documented
- * pair (rule 4 above), and `UNKNOWN` whenever any code accompanies 425, 429
- * or 401.
+ * a 425 or 429); the effect is `NOT_APPLIED` only for 503 with the
+ * documented `post_only_mode` (rule 4 above). 401, 425 and 429 are `UNKNOWN`
+ * with or without a code: the pinned SDK can drop a code the venue sent
+ * (rule 4a), so "no code" is never evidence of a clean refusal.
  */
 export function classifyHttpRejection(status: number | null, code: CodeReading): Classified {
-  const codePresent = code.venueCode !== null || code.undocumentedVenueCode;
-  const refusal: RequestEffect = codePresent ? "UNKNOWN" : "NOT_APPLIED";
   if (status === 425) {
-    return { kind: "ENGINE_RESTARTING", effect: refusal, cancelsAvailable: "UNKNOWN" };
+    return { kind: "ENGINE_RESTARTING", effect: "UNKNOWN", cancelsAvailable: "UNKNOWN" };
   }
   if (status === 503) {
     return code.venueCode === "post_only_mode"
@@ -137,10 +146,10 @@ export function classifyHttpRejection(status: number | null, code: CodeReading):
         { kind: "TRADING_UNAVAILABLE", effect: "UNKNOWN", cancelsAvailable: "UNKNOWN" };
   }
   if (status === 429) {
-    return { kind: "RATE_LIMITED", effect: refusal, cancelsAvailable: null };
+    return { kind: "RATE_LIMITED", effect: "UNKNOWN", cancelsAvailable: null };
   }
   if (status === 401) {
-    return { kind: "AUTHENTICATION_REJECTED", effect: refusal, cancelsAvailable: null };
+    return { kind: "AUTHENTICATION_REJECTED", effect: "UNKNOWN", cancelsAvailable: null };
   }
   // U-4 / ADR-007 §6: an unrecognised status or code is never mapped to a
   // look-alike and never treated as a clean rejection.
@@ -199,7 +208,7 @@ function classifyThrown(error: unknown, operation: SecureOperation): SecureVenue
   } as const;
 
   if (error instanceof RateLimitError) {
-    // Rule 4a: the pinned SDK discarded the body, so whether the venue sent a
+    // Rule 4b: the pinned SDK discarded the body, so whether the venue sent a
     // code is unknowable; the effect is UNKNOWN whatever this object carries.
     // A code that IS present is still recorded the usual way (documented
     // value, or the bare fact that an undocumented one was there).

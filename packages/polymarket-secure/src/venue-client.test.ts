@@ -201,7 +201,8 @@ describe("postOrder maps without optimism (ADR-007 §5–§6)", () => {
   });
 
   it.each([
-    ["425", () => new RequestRejectedError("restart", { status: 425 }), "REFUSED"],
+    // CX-R3-01: a code-less 425 is UNKNOWN (the pinned SDK can drop the code).
+    ["425", () => new RequestRejectedError("restart", { status: 425 }), "UNKNOWN"],
     ["503 post_only_mode", () => new RequestRejectedError("po", { status: 503, code: "post_only_mode" }), "REFUSED"],
     ["503 without code (C-9)", () => new RequestRejectedError("trading is disabled", { status: 503 }), "UNKNOWN"],
     ["400 without code (U-4)", () => new RequestRejectedError("Invalid order payload", { status: 400 }), "UNKNOWN"],
@@ -317,7 +318,7 @@ describe("cancellation", () => {
     expect(await client.cancelAll()).toEqual({ kind: "UNKNOWN", error: null });
   });
 
-  it("C-9: a cancel meeting a bare 503 is UNKNOWN; a 425 is REFUSED", async () => {
+  it("C-9: a cancel meeting a bare 503 is UNKNOWN; a 425 is UNKNOWN too (CX-R3-01)", async () => {
     const bare = await setup({
       cancelOrder: () => {
         throw new RequestRejectedError("Trading is currently disabled. Check polymarket.com for updates", { status: 503 });
@@ -329,7 +330,7 @@ describe("cancellation", () => {
         throw new RequestRejectedError("", { status: 425 });
       },
     });
-    expect(await restart.client.cancelOrder("0x1")).toMatchObject({ kind: "REFUSED", error: { kind: "ENGINE_RESTARTING" } });
+    expect(await restart.client.cancelOrder("0x1")).toMatchObject({ kind: "UNKNOWN", error: { kind: "ENGINE_RESTARTING", effect: "UNKNOWN" } });
   });
 
   it("cancelMarketOrders needs a well-formed market or asset id", async () => {

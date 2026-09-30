@@ -103,13 +103,16 @@ describe("orders/restricted-modes fixture through the pinned SDK's HTTP layer", 
     ]);
   });
 
-  it("425 with no body (U-9) → REFUSED / ENGINE_RESTARTING, cancels UNKNOWN", async () => {
+  // CX-R3-01: UNKNOWN, not REFUSED. The pinned SDK drops a 425 body's code
+  // unless its `error` is truthy, so a code-less 425 does not prove the venue
+  // sent no code (ADR-007 §6). The kind still says ENGINE_RESTARTING.
+  it("425 with no body (U-9) → UNKNOWN / ENGINE_RESTARTING, cancels UNKNOWN (CX-R3-01)", async () => {
     const { outcome, sdkRequests, requestUrls } = await outcomeFor(example("http-425-engine-restarting-body-undocumented"));
     expect(sdkRequests).toBe(1);
     expect(requestUrls[0]?.startsWith(CLOB_ORIGIN)).toBe(true);
     expect(outcome).toMatchObject({
-      kind: "REFUSED",
-      error: { kind: "ENGINE_RESTARTING", httpStatus: 425, effect: "NOT_APPLIED", cancelsAvailable: "UNKNOWN" },
+      kind: "UNKNOWN",
+      error: { kind: "ENGINE_RESTARTING", httpStatus: 425, effect: "UNKNOWN", cancelsAvailable: "UNKNOWN" },
     });
   });
 
@@ -176,6 +179,20 @@ describe("orders/restricted-modes fixture through the pinned SDK's HTTP layer", 
   it("429 with an undocumented code in the body → UNKNOWN / RATE_LIMITED (never REFUSED)", async () => {
     const { outcome } = await outcomeFor({ http_status: 429, body: { error: "x", code: "future_undocumented_code" } });
     expect(outcome).toMatchObject({ kind: "UNKNOWN", error: { kind: "RATE_LIMITED", effect: "UNKNOWN" } });
+  });
+
+  // WP-260 r3 (CX-R3-01): the pinned SDK keeps a JSON body's `code` only
+  // when the body's `error` is truthy, so these 401/425 answers reach the
+  // adapter WITHOUT their code. "No code" is unproven: the effect is UNKNOWN.
+  describe.each([401, 425])("%i whose body code the pinned SDK drops → UNKNOWN (never REFUSED)", (status) => {
+    it.each([
+      ["no `error`", { code: "future_undocumented_code" }],
+      ["an empty `error`", { error: "", code: "future_undocumented_code" }],
+      ["a null `error`", { error: null, code: "future_undocumented_code" }],
+    ])("body with %s and an undocumented code", async (_label, body) => {
+      const { outcome } = await outcomeFor({ http_status: status, body });
+      expect(outcome).toMatchObject({ kind: "UNKNOWN", error: { httpStatus: status, effect: "UNKNOWN" } });
+    });
   });
 
   it("with no responder the SDK's request is refused by the tripwire and surfaces as a transport failure", async () => {
