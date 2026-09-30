@@ -155,8 +155,9 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
+| `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
 | `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics | Authorized; after `LEAN-GOV` | — | — |
-| `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Authorized; after `LEAN-GOV` | — | — |
+| `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
