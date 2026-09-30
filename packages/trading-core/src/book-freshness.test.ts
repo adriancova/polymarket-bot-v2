@@ -42,7 +42,7 @@ import {
   bookConfirmedAt,
   sessionKeyOf,
 } from "./book-freshness.js";
-import { bookFreshnessBasisOf, parseTraderConfig } from "./config.js";
+import { bookFreshnessBasisOf, bookFreshnessCeilingMsOf, parseTraderConfig } from "./config.js";
 import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import type { IngestedEvent } from "./ports.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
@@ -91,6 +91,12 @@ function feeSnapshot(): FeeScheduleSnapshot {
 interface ConfigOptions {
   /** `undefined`: no `bookFreshness` block at all (the pre-ADR-023 document). */
   readonly basis?: "LAST_CHANGE" | "CONNECTION_CONFIRMED";
+  /**
+   * `CONNECTION_CONFIRMED`'s REQUIRED per-book ceiling on the last-change age
+   * (ADR-023 D2 rule 6; r1 finding X1). Defaults to 30 000 ms, well past every
+   * timeline below except the ones that test the ceiling itself.
+   */
+  readonly ceilingMs?: number;
   /** Static Bracket grammar version; 2 adds `book_age_feature_key`. */
   readonly paramsVersion?: 1 | 2;
   readonly strategyMaxAgeMs?: number;
@@ -159,7 +165,14 @@ function traderConfig(options: ConfigOptions = {}): Record<string, unknown> {
       { scenarioId: "time.decay", kind: "TIME", yesPriceShock: "-0.02" },
       { scenarioId: "liq.thin", kind: "LIQUIDITY", yesPriceShock: "-0.03" },
     ],
-    ...(options.basis === undefined ? {} : { bookFreshness: { basis: options.basis } }),
+    ...(options.basis === undefined
+      ? {}
+      : {
+          bookFreshness:
+            options.basis === "CONNECTION_CONFIRMED"
+              ? { basis: options.basis, maximumLastChangeAgeMs: options.ceilingMs ?? 30_000 }
+              : { basis: options.basis },
+        }),
     infrastructure: {
       eventStream: "polymarket.normalized",
       consumerId: "throughput-1c-book-freshness",
@@ -719,6 +732,119 @@ describe("the fallbacks to the last change (fail closed)", () => {
   });
 });
 
+describe("r1 X5: a REST snapshot replaces a socket-delivered book's session", () => {
+  it("socket book on A1, then a REST snapshot, then A1 keeps flowing: the book ages from the REST snapshot", async () => {
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1), noSnapshot(1.1, A1)];
+    // A1 is busy, and the YES book is re-fetched over REST at 2.000 s.
+    events.push(yesSnapshot(2, undefined));
+    for (let step = 0; step < 8; step += 1) events.push(noChange(2.5 + step * 0.5, A1, String(700 + step)));
+    events.push(tick(6.2));
+    const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    // A1's frames (the last at 6.000 s) confirm nothing about a book whose
+    // last update came over REST: its age is its own, 4 200 ms. Mutant M6
+    // (keep the previous session when an update carries none) reads fresh.
+    const after = evaluationAt(parts, 6.2);
+    expect(after.stale).toBe(true);
+    expect(after.bookAgeMs).toBe("4200");
+  });
+
+  it("a socket frame for the same asset after the REST snapshot restores the session", async () => {
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1), noSnapshot(1.1, A1), yesSnapshot(2, undefined)];
+    events.push(yesSnapshot(2.4, A1));
+    for (let step = 0; step < 8; step += 1) events.push(noChange(2.5 + step * 0.5, A1, String(710 + step)));
+    events.push(tick(6.2));
+    const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    expect(evaluationAt(parts, 6.2).stale).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// r1 finding X1 — the per-book ceiling on the last-change age (D2 rule 6)
+// ---------------------------------------------------------------------------
+
+describe("r1 X1: a book whose OWN delivery stalls is bounded by the per-book ceiling", () => {
+  /**
+   * The YES snapshot at 1.000 s on A1, then ONLY another market's frames on
+   * the same session, every 500 ms, until `until` s: a busy session whose YES
+   * token is never delivered again (a per-asset stall no signal reports).
+   */
+  function stalledYes(until: number, ticks: readonly number[]): Recorded[] {
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1), noSnapshot(1.1, A1)];
+    for (let at = 1.5; at <= until + 1e-9; at += 0.5) events.push(otherMarketSnapshot(Math.round(at * 1000) / 1000, A1));
+    const sorted = [...events];
+    for (const [index, at] of ticks.entries()) {
+      // Insert each tick after every frame at or before its instant.
+      const position = sorted.findIndex((recorded) => recorded.at > at);
+      sorted.splice(position === -1 ? sorted.length : position, 0, tick(at, String(64000 + index)));
+    }
+    return sorted;
+  }
+
+  it("the verifiers' reproduction: at 121 s the book is STALE with its own 120 000 ms age (it read fresh at f341d5f)", async () => {
+    const parts = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 30_000 }, stalledYes(121, [121]));
+    const at121 = evaluationAt(parts, 121);
+    expect(at121.stale).toBe(true);
+    expect(at121.bookAgeMs).toBe("120000");
+  });
+
+  it("fresh while the last change is within the ceiling, stale 1 ms past it (ceiling 5 000 ms)", async () => {
+    const parts = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 5_000 }, stalledYes(7, [5.9, 6, 6.001, 6.5]));
+    // 4 900 ms and exactly 5 000 ms since the YES book's own change: vouched for.
+    expect(evaluationAt(parts, 5.9).stale).toBe(false);
+    expect(evaluationAt(parts, 6).stale).toBe(false);
+    // 5 001 ms: the ceiling is passed, so the book ages by its own last change.
+    const past = evaluationAt(parts, 6.001);
+    expect(past.stale).toBe(true);
+    expect(past.bookAgeMs).toBe("5001");
+    expect(evaluationAt(parts, 6.5).bookAgeMs).toBe("5500");
+  });
+
+  it("§9.8 check 7 honours the same ceiling: a stalled YES book is refused by risk too", async () => {
+    // The strategy's bound is moved out of the way so only check 7 gates.
+    const cheapAsks = [
+      { price: "0.34", size: "100" },
+      { price: "0.35", size: "100" },
+    ];
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1, cheapAsks)];
+    for (let step = 0; step < 16; step += 1) events.push(otherMarketSnapshot(1.5 + step * 0.5, A1));
+    events.push(noSnapshot(9.1, A1));
+    const within = await run(
+      { basis: "CONNECTION_CONFIRMED", ceilingMs: 10_000, paramsVersion: 1, strategyMaxAgeMs: 600_000, riskMaxAgeMs: 2_000 },
+      events,
+    );
+    expect(within.trader.loop.orderProvenance().length).toBeGreaterThan(0);
+    const past = await run(
+      { basis: "CONNECTION_CONFIRMED", ceilingMs: 5_000, paramsVersion: 1, strategyMaxAgeMs: 600_000, riskMaxAgeMs: 2_000 },
+      events,
+    );
+    expect(past.trader.loop.orderProvenance()).toHaveLength(0);
+    expect(past.trader.loop.health().risk.refusalsByCode["RISK_BOOK_STALE"] ?? 0).toBeGreaterThan(0);
+  });
+
+  /**
+   * r1 finding X2, the documented gap: the epoch taint lives in process
+   * memory, and the gateway deduplicates its incidents, so a trader that
+   * starts (or restarts) AFTER an epoch's incident never learns of it. What
+   * bounds that trader is the ceiling: it cannot vouch for a book past it.
+   */
+  it("r1 X2: a process that missed the epoch's incident is still bounded by the ceiling", async () => {
+    const afterIncident = stalledYes(40, [20, 31.5]);
+    // The process that consumed the incident falls back at once...
+    const consumed = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 30_000 }, [
+      incident(0.5, "gw-polymarket-market-1"),
+      ...afterIncident,
+    ]);
+    expect(evaluationAt(consumed, 20).stale).toBe(true);
+    // ...the one that started after it cannot see the taint (the gap)...
+    const late = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 30_000 }, afterIncident);
+    expect(evaluationAt(late, 20).stale).toBe(false);
+    // ...but past the ceiling it ages by the book's own last change.
+    const bounded = evaluationAt(late, 31.5);
+    expect(bounded.stale).toBe(true);
+    expect(bounded.bookAgeMs).toBe("30500");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // §9.8 check 7 — the risk engine's VENUE_BOOK measurement
 // ---------------------------------------------------------------------------
@@ -815,6 +941,25 @@ describe("backward compatibility: a document with no bookFreshness block", () =>
     expect(parseTraderConfig(withBlock({})).ok).toBe(false);
   });
 
+  it("r1 X1: CONNECTION_CONFIRMED REQUIRES a bounded integer ceiling; LAST_CHANGE refuses one", () => {
+    const withBlock = (block: unknown) => ({ ...traderConfig({ paramsVersion: 1 }), bookFreshness: block });
+    const accepted = parseTraderConfig(withBlock({ basis: "CONNECTION_CONFIRMED", maximumLastChangeAgeMs: 600_000 }));
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) {
+      expect(bookFreshnessBasisOf(accepted.config)).toBe("CONNECTION_CONFIRMED");
+      expect(bookFreshnessCeilingMsOf(accepted.config)).toBe(600_000);
+    }
+    // No ceiling, a zero, a fraction, past the ten-minute cap, a string.
+    for (const ceiling of [undefined, 0, -1, 1.5, 600_001, "30000"]) {
+      const block = ceiling === undefined ? { basis: "CONNECTION_CONFIRMED" } : { basis: "CONNECTION_CONFIRMED", maximumLastChangeAgeMs: ceiling };
+      expect(parseTraderConfig(withBlock(block)).ok, String(ceiling)).toBe(false);
+    }
+    expect(parseTraderConfig(withBlock({ basis: "LAST_CHANGE", maximumLastChangeAgeMs: 30_000 })).ok).toBe(false);
+    const lastChange = parseTraderConfig(withBlock({ basis: "LAST_CHANGE" }));
+    expect(lastChange.ok).toBe(true);
+    if (lastChange.ok) expect(bookFreshnessCeilingMsOf(lastChange.config)).toBeUndefined();
+  });
+
   it("does not adopt an inherited bookFreshness (D1: own data only)", () => {
     const polluted = Object.create({ bookFreshness: { basis: "CONNECTION_CONFIRMED" } }) as Record<string, unknown>;
     Object.assign(polluted, traderConfig({ paramsVersion: 1 }));
@@ -862,7 +1007,7 @@ describe("book-freshness.ts", () => {
     const liveness = new DeliverySessionLiveness();
     const key = sessionKeyOf(bookEvent(A1)) as string;
     liveness.observe(bookEvent(A1), at(5_000));
-    const common = { sessionKey: key, marketHasActiveIncident: false, liveness };
+    const common = { sessionKey: key, marketHasActiveIncident: false, liveness, nowEpochMs: 9_500, maximumLastChangeAgeMs: 30_000 };
     expect(bookConfirmedAt({ ...common, basis: "CONNECTION_CONFIRMED", lastChange: at(1_000) })?.epochMs).toBe(5_000);
     // A confirmation stamped before the change (a clock step) cannot move it back.
     expect(bookConfirmedAt({ ...common, basis: "CONNECTION_CONFIRMED", lastChange: at(9_000) })?.epochMs).toBe(9_000);
@@ -875,6 +1020,19 @@ describe("book-freshness.ts", () => {
     expect(
       bookConfirmedAt({ ...common, basis: "CONNECTION_CONFIRMED", lastChange: at(1_000), sessionKey: undefined })?.epochMs,
     ).toBe(1_000);
+  });
+
+  it("r1 X1: past the per-book ceiling the answer is the last change; at it, still the confirmation", () => {
+    const liveness = new DeliverySessionLiveness();
+    const key = sessionKeyOf(bookEvent(A1)) as string;
+    liveness.observe(bookEvent(A1), at(40_000));
+    const common = { basis: "CONNECTION_CONFIRMED" as const, sessionKey: key, marketHasActiveIncident: false, liveness, lastChange: at(10_000) };
+    expect(bookConfirmedAt({ ...common, nowEpochMs: 40_000, maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(40_000);
+    expect(bookConfirmedAt({ ...common, nowEpochMs: 40_001, maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(10_000);
+    // No ceiling (the door never allows it under this basis): the extension is off.
+    expect(bookConfirmedAt({ ...common, nowEpochMs: 11_000, maximumLastChangeAgeMs: undefined })?.epochMs).toBe(10_000);
+    // A non-finite instant cannot pass the ceiling check.
+    expect(bookConfirmedAt({ ...common, nowEpochMs: Number.NaN, maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(10_000);
   });
 
   it("an epoch taint covers sessions seen before and after it, and no other epoch", () => {

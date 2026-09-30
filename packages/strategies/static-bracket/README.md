@@ -45,11 +45,14 @@ key, `data_quality.book_age_feature_key`, which must be exactly
 `quality.input_feed_ages@polymarket.book`: the gate then reads the book age the
 composition root measured for the configured direction's book, which under the
 root's `bookFreshness.basis: CONNECTION_CONFIRMED` may vouch for a quiet book
-on a live delivery session (ADR-023). An absent, missing or malformed
+on a live delivery session, never past the root's per-book ceiling
+`maximumLastChangeAgeMs` on the book's own last change (ADR-023). An absent, missing or malformed
 measurement is a stale book. A complement-leg bracket's other book keeps the
 version-1 age, because the feature snapshot says nothing about it. The code
 version (`STATIC_BRACKET_VERSION`) is unchanged: a version-1 run's behaviour is
 byte-identical, and a version-2 configuration is a new configuration identity.
+The root's `bookFreshness` block lives in the TRADER configuration, not in these
+parameters, so it is not part of that identity (ADR-023 D6).
 
 Two §13.2 fields have a wider role than their names suggest, and it is stated
 rather than implied: `exit.stop.minimum_sell_price` and `exit.stop.urgency` are

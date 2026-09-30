@@ -1,0 +1,265 @@
+/**
+ * `THROUGHPUT-1c` review round 1, finding X8 — a partially malformed venue
+ * frame must not vouch for a stale book, gateway to trader.
+ *
+ * ADR-023 lets a market-channel frame on a delivery session vouch for every
+ * book delivered on that session. A frame the gateway could only PARTLY
+ * normalize lost part of what the venue sent, and the gateway reports that
+ * loss as a `DataQualityIncidentOpened` naming no market, which taints the
+ * gateway epoch in the trader (ADR-023 D2 rule 4). The candidate at `f341d5f`
+ * published that incident AFTER the frame's accepted sibling events, so the
+ * sibling closed its own evaluation with the stale book still vouched for:
+ * two orders were approved on a YES book 3.1 s old against 2 s bounds, where
+ * the last-change rule approved none.
+ *
+ * This file drives the REAL gateway composition (the data-gateway suite's
+ * in-memory harness: the real WebSocket adapter, normalizer, driver,
+ * dispatcher, incident registry and sequencer) and feeds EVERYTHING it
+ * published, unchanged and in its order, to the REAL assembled paper trader
+ * (`UNIV-4`'s pattern, `univ-4-gateway-opens-trader.test.ts`). The ONE
+ * hand-written input is the reference feed: two `ReferenceTradeObserved`
+ * envelopes in the fixture's own shape, ingested first. The gateway runs
+ * WITHOUT its Binance feed on purpose: the Binance adapter reports every
+ * subscription start as a `BINANCE_SUBSCRIPTION_START_NO_REPLAY` incident
+ * naming no market, which taints the whole gateway epoch (ADR-023 D2 rule 4)
+ * and would make both scenarios fall back to the last change for a reason
+ * that has nothing to do with the frame under test (see the r1 handoff's
+ * known risks). Only the second venue frame differs between the two
+ * scenarios:
+ *
+ * - WELL-FORMED: `[NO book]` — the NO snapshot's frame vouches for the quiet
+ *   YES book on the same session, so under `CONNECTION_CONFIRMED` the entry
+ *   passes both freshness gates (the control: the timeline really does admit
+ *   an entry when nothing is lost);
+ * - PARTLY MALFORMED: `[a YES price_change with an unknown side, NO book]` —
+ *   the gateway now reports the frame's problem FIRST, so the incident is
+ *   sequenced ahead of the NO snapshot, the epoch is tainted before any
+ *   evaluation, and the YES book is judged by its own last change (3.1 s):
+ *   nothing is admitted, under either basis.
+ *
+ * PAPER only. No network, no credential, no signer, no real order.
+ */
+
+import type { EventEnvelope } from "@polymarket-bot/domain";
+import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
+import { describe, expect, it } from "vitest";
+
+import { buildHarness } from "../data-gateway/support/harness.js";
+import {
+  CONDITION_ID,
+  MARKET_ID,
+  NO_TOKEN,
+  T_CLOSE,
+  T_OPEN,
+  YES_TOKEN,
+  ingested,
+  resetEventIds,
+  riskPolicy,
+  strategyParams,
+  traderConfig,
+} from "./support/fixture.js";
+import { assembleOrThrow } from "./support/run.js";
+
+const GAMMA_BASE = "http://gamma.stub";
+const BOOK_AGE_KEY = "quality.input_feed_ages@polymarket.book";
+
+const GATEWAY_MARKET = {
+  internalMarketId: MARKET_ID,
+  conditionId: CONDITION_ID,
+  yesTokenId: YES_TOKEN,
+  noTokenId: NO_TOKEN,
+  gammaMarketId: "900001",
+  parameters: {
+    tickSize: "0.01",
+    minimumOrderSize: "5",
+    negRisk: false,
+    tradingDelaySeconds: 0,
+    status: "OPEN",
+    openTime: T_OPEN,
+    closeTime: T_CLOSE,
+  },
+  observedAt: "2026-03-04T11:00:00.000Z",
+} as const;
+
+const READY_MARKET = {
+  conditionId: CONDITION_ID,
+  question: "Synthetic market (stub)",
+  active: true,
+  closed: false,
+  archived: false,
+  acceptingOrders: true,
+  restricted: false,
+  enableOrderBook: true,
+  negRisk: false,
+  startDate: "2026-03-04T12:00:00Z",
+  endDate: "2026-03-04T12:15:00Z",
+  closedTime: null,
+  gameStartTime: null,
+};
+
+function bookEntry(tokenId: string, bids: readonly [string, string][], asks: readonly [string, string][]): unknown {
+  return {
+    event_type: "book",
+    market: CONDITION_ID,
+    asset_id: tokenId,
+    bids: bids.map(([price, size]) => ({ price, size })),
+    asks: asks.map(([price, size]) => ({ price, size })),
+    hash: `hash-${tokenId}`,
+    timestamp: "1772625600000",
+  };
+}
+
+/** A `price_change` for the YES token whose one change has an undocumented side. */
+function malformedYesChange(atMs: number): unknown {
+  return {
+    event_type: "price_change",
+    market: CONDITION_ID,
+    timestamp: String(atMs),
+    price_changes: [{ asset_id: YES_TOKEN, price: "0.34", size: "0", side: "SIDEWAYS", hash: "h-bad" }],
+  };
+}
+
+type Basis = "LAST_CHANGE" | "CONNECTION_CONFIRMED";
+
+/** The fixture document with both freshness gates at 2 000 ms and the given basis. */
+function config(basis: Basis): Record<string, unknown> {
+  const params = strategyParams() as { data_quality: Record<string, unknown> } & Record<string, unknown>;
+  const policy = riskPolicy() as { freshness: Record<string, unknown> } & Record<string, unknown>;
+  const document = traderConfig({
+    riskPolicy: { ...policy, freshness: { ...policy.freshness, venueBookMaxAgeMs: 2_000 } },
+    bookFreshness:
+      basis === "CONNECTION_CONFIRMED"
+        ? { basis, maximumLastChangeAgeMs: 30_000 }
+        : { basis },
+  });
+  const instances = document["instances"] as Record<string, unknown>[];
+  const instance = instances[0] as Record<string, unknown>;
+  instance["params"] = {
+    ...params,
+    version: 2,
+    data_quality: { ...params.data_quality, maximum_book_age_ms: 2_000, book_age_feature_key: BOOK_AGE_KEY },
+  };
+  return document;
+}
+
+/**
+ * The gateway timeline: the lifecycle's `MarketOpened` at the open; the YES book (asks under the 0.35 trigger) at +1.000 s; then
+ * nothing for the YES token, and the second frame at +4.100 s.
+ */
+async function gatewayStream(secondFrame: readonly unknown[]): Promise<readonly EventEnvelope<unknown>[]> {
+  const route = (request: PublicHttpRequest): PublicHttpResponse => {
+    if (request.url.startsWith(`${GAMMA_BASE}/markets/`)) {
+      return { status: 200, body: JSON.stringify(READY_MARKET) };
+    }
+    throw new Error(`unexpected request ${request.url}`);
+  };
+  const gateway = await buildHarness({
+    config: {
+      markets: [GATEWAY_MARKET],
+      polymarket: { feedId: "polymarket-market" },
+      lifecycle: { feedId: "polymarket-lifecycle", baseUrl: GAMMA_BASE, pollIntervalMs: 10_000 },
+    },
+    http: route,
+  });
+  gateway.timers.advance(Date.parse(T_OPEN) - gateway.clock.nowMs());
+  gateway.gateway.start();
+  await gateway.settle();
+  const socket = gateway.polymarketSockets.current;
+  socket.open();
+  await gateway.settle();
+  gateway.timers.advance(1_000);
+  socket.message(JSON.stringify([bookEntry(YES_TOKEN, [["0.32", "200"], ["0.31", "300"]], [["0.34", "200"], ["0.35", "300"]])]));
+  await gateway.settle();
+  gateway.timers.advance(3_100);
+  socket.message(JSON.stringify(secondFrame));
+  await gateway.settle();
+  await gateway.gateway.stop();
+  return gateway.published();
+}
+
+const noBook = (): unknown => bookEntry(NO_TOKEN, [["0.65", "200"]], [["0.66", "200"]]);
+
+interface Outcome {
+  readonly orders: number;
+  readonly approvals: number;
+  readonly staleBookPauses: number;
+}
+
+async function trade(published: readonly EventEnvelope<unknown>[], basis: Basis): Promise<Outcome> {
+  const run = assembleOrThrow({ config: config(basis) });
+  resetEventIds();
+  // The reference feed (hand-written, see the header), just before the open.
+  run.trader.loop.ingest(
+    ingested(
+      "ReferenceTradeObserved",
+      { venue: "binance", symbol: "BTCUSDT", price: "100000", size: "0.5" },
+      { receivedAt: "2026-03-04T11:59:58.000Z", ingestSeq: 1, source: "binance" },
+    ),
+  );
+  run.trader.loop.ingest(
+    ingested(
+      "ReferenceTradeObserved",
+      { venue: "binance", symbol: "BTCUSDT", price: "100100", size: "0.25" },
+      { receivedAt: "2026-03-04T11:59:59.000Z", ingestSeq: 2, source: "binance" },
+    ),
+  );
+  for (const [index, envelope] of published.entries()) {
+    run.trader.loop.ingest({
+      envelope,
+      identity: {
+        gatewayEpoch: envelope.gatewayEpoch,
+        ingestSeq: envelope.ingestSeq,
+        receivedAt: envelope.receivedAt,
+        datasetRowOrdinal: index + 1,
+      },
+    });
+  }
+  await run.trader.loop.drain();
+  const health = run.trader.loop.health();
+  expect(health.halts).toEqual([]);
+  expect(run.trader.markets.get(MARKET_ID)?.lifecycle).toBe("OPEN");
+  return {
+    orders: run.trader.loop.orderProvenance().length,
+    approvals: health.risk.approvals,
+    staleBookPauses: run.parts.store.decisions.filter((recorded) =>
+      recorded.record.decision.reasonCodes.includes("SB.STALE_BOOK"),
+    ).length,
+  };
+}
+
+describe("THROUGHPUT-1c r1 (X8) — a partly malformed frame cannot vouch for a stale book, gateway to trader", () => {
+  it("control: a well-formed sibling frame vouches for the quiet YES book under CONNECTION_CONFIRMED only", async () => {
+    const published = await gatewayStream([noBook()]);
+    expect(published.filter((envelope) => envelope.eventType === "DataQualityIncidentOpened")).toHaveLength(0);
+    const confirmed = await trade(published, "CONNECTION_CONFIRMED");
+    expect(confirmed.approvals).toBeGreaterThan(0);
+    expect(confirmed.orders).toBeGreaterThan(0);
+    const lastChange = await trade(published, "LAST_CHANGE");
+    expect(lastChange.orders).toBe(0);
+    expect(lastChange.staleBookPauses).toBeGreaterThan(0);
+  });
+
+  it("the frame's incident is sequenced BEFORE its accepted sibling events", async () => {
+    const published = await gatewayStream([malformedYesChange(Date.parse(T_OPEN) + 4_100), noBook()]);
+    const types = published.map((envelope) => envelope.eventType);
+    const incident = types.indexOf("DataQualityIncidentOpened");
+    const lastSnapshot = types.lastIndexOf("BookSnapshot");
+    expect(incident).toBeGreaterThan(-1);
+    expect(lastSnapshot).toBeGreaterThan(-1);
+    // The NO snapshot is the frame's sibling; the incident precedes it.
+    expect(incident).toBeLessThan(lastSnapshot);
+    const payload = published[incident]?.payload as { reasonCode?: unknown; affectedMarketIds?: unknown };
+    expect(payload.reasonCode).toBe("UNKNOWN_SIDE");
+    expect(payload.affectedMarketIds).toBeUndefined();
+  });
+
+  it("no order is admitted after a frame loses a YES update, under either basis", async () => {
+    const published = await gatewayStream([malformedYesChange(Date.parse(T_OPEN) + 4_100), noBook()]);
+    const confirmed = await trade(published, "CONNECTION_CONFIRMED");
+    const lastChange = await trade(published, "LAST_CHANGE");
+    expect([confirmed.orders, lastChange.orders], "orders after a frame lost a YES update").toEqual([0, 0]);
+    expect([confirmed.approvals, lastChange.approvals]).toEqual([0, 0]);
+    // Refused for the right reason: the YES book is judged by its own 3.1 s.
+    expect(confirmed.staleBookPauses).toBeGreaterThan(0);
+  });
+});

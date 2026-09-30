@@ -828,11 +828,19 @@ export class PublicMarketFeed {
       subscriptionGeneration: session.generation,
     };
     const normalized = normalizeMarketEvents(frame.values, context);
-    for (const event of normalized.events) {
-      this.#handlers.onEvent(event);
-    }
+    // A frame's PROBLEMS are reported BEFORE its accepted events
+    // (`THROUGHPUT-1c` r1, finding X8). A partially malformed frame lost
+    // part of what the venue sent, so a consumer that reads the frame's
+    // accepted siblings as evidence that the delivery path is whole (ADR-023)
+    // must learn of the loss FIRST: the gateway turns a problem into its
+    // data-quality incident synchronously, so that incident is sequenced
+    // ahead of every sibling event of the same frame. Nothing is dropped or
+    // reordered within either list.
     for (const problem of normalized.problems) {
       this.#handlers.onProblem(problem);
+    }
+    for (const event of normalized.events) {
+      this.#handlers.onEvent(event);
     }
   }
 

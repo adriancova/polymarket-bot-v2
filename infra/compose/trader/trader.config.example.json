@@ -71,7 +71,7 @@
     { "scenarioId": "time.decay", "kind": "TIME", "yesPriceShock": "-0.02" },
     { "scenarioId": "liq.thin", "kind": "LIQUIDITY", "yesPriceShock": "-0.03" }
   ],
-  "bookFreshness": { "basis": "CONNECTION_CONFIRMED" },
+  "bookFreshness": { "basis": "CONNECTION_CONFIRMED", "maximumLastChangeAgeMs": 30000 },
   "infrastructure": {
     "eventStream": "polymarket.normalized",
     "consumerId": "trader-local-1",

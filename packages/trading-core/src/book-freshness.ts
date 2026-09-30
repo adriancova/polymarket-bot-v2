@@ -20,9 +20,11 @@
  * socket → gateway → stream → this process) delivered a frame at that
  * instant; it does NOT prove that the venue had no unsent change for this
  * token (no official source states cross-asset ordering or delivery
- * completeness for the market channel; ADR-023 §2). The bound
- * (`maximum_book_age_ms`, `venueBookMaxAgeMs`) is what limits that residual,
- * exactly as it limited the same residual under the last-change rule.
+ * completeness for the market channel; ADR-023 §2). That residual is limited
+ * by the per-book ceiling `maximumLastChangeAgeMs` (rule 6 below): the
+ * extension never vouches for a book whose own last change is older than it.
+ * The ordinary bound (`maximum_book_age_ms`, `venueBookMaxAgeMs`) still
+ * judges the confirmed age.
  *
  * ## When the basis falls back to the last change (fail closed)
  *
@@ -45,8 +47,18 @@
  *    per `(scope, reasonCode)` and closes almost none, so a repeat after a
  *    reconnect publishes nothing and a per-session taint would leave the new
  *    session looking clean while its frames are suppressed (ADR-023 D2.4). Only
- *    a new gateway epoch (a restart) starts clean;
- * 5. the market has an active data-quality incident of its own.
+ *    a new gateway epoch (a restart) starts clean. "Never lifted" is WITHIN
+ *    THIS PROCESS: a process that starts or restarts inside an epoch whose
+ *    incident it did not consume cannot know of the taint (an accepted gap,
+ *    ADR-023 D2.4, r1 finding X2), and rule 6's ceiling is what bounds it;
+ * 5. the market has an active data-quality incident of its own;
+ * 6. the book's OWN last change is older than the configured ceiling
+ *    `maximumLastChangeAgeMs` (review round 1, finding X1). Session traffic
+ *    proves the session delivers; it never proves that THIS asset's changes
+ *    are being delivered (no documented cross-asset ordering or completeness,
+ *    ADR-023 §2 N-A/N-B). Without a ceiling, a book whose own delivery
+ *    stalled read fresh for as long as sibling assets kept the session busy;
+ *    with it, that exposure is at most the ceiling, per book.
  *
  * A disconnection, a lost heartbeat, a gateway stall or a gateway restart
  * needs no rule of its own: each one stops the confirmations, so the book ages
@@ -194,6 +206,13 @@ export class DeliverySessionLiveness {
  * The instant a book is vouched for, under a basis. `lastChange` is the book's
  * own last applied update; `undefined` when the book has none (the caller
  * keeps its existing fallback).
+ *
+ * `nowEpochMs` is the evaluating instant (event time, exactly the `now` every
+ * age is measured against) and `maximumLastChangeAgeMs` the configured
+ * per-book ceiling (rule 6): once the book's own last change is MORE than the
+ * ceiling before `now`, the answer is the last change itself, so the book's
+ * age is its last-change age and the ordinary bound judges it — the
+ * pre-ADR-023 rule, never looser.
  */
 export function bookConfirmedAt(input: {
   readonly basis: BookFreshnessBasis;
@@ -201,10 +220,16 @@ export function bookConfirmedAt(input: {
   readonly sessionKey: string | undefined;
   readonly marketHasActiveIncident: boolean;
   readonly liveness: DeliverySessionLiveness;
+  readonly nowEpochMs: number;
+  readonly maximumLastChangeAgeMs: number | undefined;
 }): ConfirmedInstant | undefined {
   const { lastChange } = input;
   if (lastChange === undefined) return undefined;
   if (input.basis !== "CONNECTION_CONFIRMED") return lastChange;
+  // Rule 6. An absent ceiling cannot occur under `CONNECTION_CONFIRMED` (the
+  // configuration door requires it); if it ever did, the extension is off.
+  const ceiling = input.maximumLastChangeAgeMs;
+  if (ceiling === undefined || !(input.nowEpochMs - lastChange.epochMs <= ceiling)) return lastChange;
   if (input.marketHasActiveIncident) return lastChange;
   if (input.sessionKey === undefined) return lastChange;
   const confirmed = input.liveness.confirmation(input.sessionKey);

@@ -5,13 +5,30 @@
 - **Recorded by:** `THROUGHPUT-1c`, which also implements it.
 - **Supersedes / Superseded by:** none. It changes how a venue book's AGE is
   measured, when a configuration opts in. It does not change any bound, any
-  gate's direction, the §9.9 stale-book response, or the clock semantics.
+  gate's direction, the §9.9 stale-book response, or the clock semantics. It
+  adds one bound of its own: the per-book ceiling on the last-change age
+  (D2 rule 6).
+- **Revision:** r1 (2026-09-30), after review round 1 (findings X1–X9): the
+  per-book ceiling (X1), the gateway reporting a frame's problems before its
+  accepted events (X8), and corrected statements on the taint's lifetime
+  (X2), the H1 evidence (X3), the configuration identity (X6), the venue
+  documentation (X7) and `CO2-N1` (X9).
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
   shared core), ADR-024 (evaluate once per venue frame).
-- **Finding it resolves:** H1 run 1, finding 5 (`docs/handoffs/H1-RUN-1.md:76`):
-  20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`.
+- **Finding it addresses (not a claim that it resolves it):** H1 run 1,
+  finding 5 (`docs/handoffs/H1-RUN-1.md:76`): 20,367 of 37,546 decisions (54%)
+  paused on `SB.STALE_BOOK`. The evidence for this rule is a MECHANISM CHECK
+  only. On the recorded H1 burst fixture, base and candidate both pause 0
+  times, because the traded YES book's last-change age never exceeds 493 ms
+  there. The 21.9% → 0 figure in the `THROUGHPUT-1c` handoff comes from a
+  DERIVED stream that deletes the YES token's changes, not from a recording.
+  No claim is made about the whole H1 run: the paired-frame observation of
+  `H1-RUN-1.md:71-72` describes the burst only. Measuring the real effect
+  needs a live-data paper run. That run must also measure the epoch taint:
+  in a gateway with a Binance feed, which H1's is, the Binance adapter's
+  subscription-start incident taints the epoch at its start (§5).
 
 ## 1. Context
 
@@ -31,10 +48,11 @@
      `freshness.venueBookMaxAgeMs` (`packages/risk/src/freshness.ts`).
    `now` is the triggering event's `receivedAt` everywhere (event time;
    `loop.ts` `#processEvent`).
-2. **Why that misreads a live book.** The venue sends a book's events only when
-   that book changes (§2, V2–V4). A quiet book on a healthy connection
-   therefore produces no frames, and its age grows while the connection keeps
-   delivering other books' frames. In H1 run 1 the example bounds were 2 000 ms
+2. **Why that misreads a live book.** The documentation names the triggers of
+   a book's events: an order placed or cancelled, a trade, a subscription
+   (§2, V2–V4). It does not promise periodic updates, so a book with none of
+   those triggers may receive no frame for a long time. Its age then grows
+   while the connection keeps delivering other books' frames. In H1 run 1 the example bounds were 2 000 ms
    (`infra/compose/trader/trader.config.example.json`), and 54% of all
    decisions paused on `SB.STALE_BOOK`; in runs 3–8 it was about 9%
    (`docs/handoffs/H1-RUNS-2-8.md`).
@@ -111,13 +129,21 @@ byte-identical to the digests `verified-2026-09-30.md` §14 indexes (lines
   undocumented (`verified-2026-09-30.md` §12, line 643).
 
 **Therefore:** the documentation does NOT guarantee that "a live connection
-with no message means no change". It documents that an unchanged book produces
-no frames (V2–V4, read together), and nothing that bounds how late a change may
-arrive (N-A, N-B). No rule available to this repository can prove that a book
-is current. What CAN be proved is narrower, and it is exactly what the
-last-change rule already relied on: **that the delivery path was delivering,
-recently.** A book whose own frame arrived 1.9 s ago was never proved current
-either (N-A); it was proved to sit on a path that delivered 1.9 s ago.
+with no message means no change". The documentation identifies event triggers
+but does not guarantee periodic updates, delivery completeness, bounded
+latency, or that silence means no change (V2–V5; N-A, N-B). No rule available
+to this repository can prove that a book is current. What CAN be proved is
+narrower: **that the delivery path was delivering, recently.** A book whose
+own frame arrived 1.9 s ago was never proved current either (N-A); it was
+proved to sit on a path that delivered 1.9 s ago.
+
+A sibling asset's frame proves LESS than the book's own frame, and this
+rule must not pretend otherwise. It proves that the session delivers. It does
+not prove that THIS asset's changes are being delivered: nothing documents
+per-asset completeness or cross-asset ordering (N-A, N-B). So the extension
+this ADR grants is bounded per book, by a ceiling on the book's OWN
+last-change age (D2 rule 6). Past that ceiling, session traffic stops
+vouching for the book, whatever it shows.
 
 ## 3. Decision
 
@@ -165,7 +191,7 @@ latest confirmation of that session. The book is FRESH iff
 same `now` (event time).
 
 `confirmedAt` falls back to `lastChange(book)` — the pre-ADR-023 rule, never
-more permissive than it — whenever:
+more permissive than it — whenever any of rules 1–6 applies:
 
 1. the configured basis is `LAST_CHANGE` (D4);
 2. the book's last update carried no `connectionId` or no
@@ -189,14 +215,50 @@ more permissive than it — whenever:
    problem after a reconnect publishes NOTHING, so a per-session taint would
    leave the new session looking clean while its frames are being suppressed.
    A gateway restart (a new epoch) starts clean. Every severity taints, `LOG`
-   included (when in doubt, stale);
-5. the market has an active data-quality incident of its own.
+   included (when in doubt, stale).
+   A frame the gateway could only partly normalize is reported BEFORE its
+   accepted events. The adapter calls `onProblem` for the frame's problems
+   before `onEvent` for its events (`connection.ts` `#onMessage`), and the
+   gateway opens the incident synchronously, so the incident is sequenced
+   ahead of every sibling event of that frame, and the epoch is tainted
+   before any sibling can close an evaluation (r1, X8).
+   **What "never lifted" covers, and what it does not (r1, X2).** The taint
+   is state of THIS PROCESS, fed by the incidents it consumed. A trader that
+   starts, restarts or resumes from its checkpoint inside an epoch whose
+   incident it did not consume does not know the epoch is tainted: the
+   incident is deduplicated and will not be published again, and neither
+   the transport's resume point nor its oldest retained event guarantees a
+   replay of it. No sound signal exists today by which the trader could tell
+   that it consumed an epoch from its start. `ingestSeq` does not work,
+   because the published sequence has holes by design (`dispatcher.ts`).
+   Neither does any other published event: none reliably marks an epoch's
+   start. This gap is ACCEPTED and bounded, not closed. Such a trader can
+   vouch for a book past its last change for at most the ceiling of rule 6,
+   which is the same exposure every untainted epoch already carries under
+   N-B. A retention gap inside a running process is not part of this gap:
+   the transport reports it as a hard resync, which halts the trader
+   (`apps/trader/src/pump.ts`). Closing the gap needs a new gateway signal
+   (see §5);
+5. the market has an active data-quality incident of its own;
+6. **the per-book ceiling (r1, X1):** `now − lastChange(book)` is more than
+   `maximumLastChangeAgeMs`. The configuration requires this ceiling with
+   `CONNECTION_CONFIRMED` (D4). It is an integer from 1 to 600 000 ms, and
+   the example configuration sets 30 000 ms. Once a book's own last change is
+   older than the ceiling, the book ages by that last change, and the
+   ordinary bound judges it. So a book whose own delivery stalled while its
+   session stayed busy is stale at `lastChange + max(ceiling, bound)` at the
+   latest. It no longer stays fresh for as long as sibling assets keep
+   arriving. The ceiling is an operator's choice, not a venue fact: no
+   documented venue period bounds how long a live book may stay quiet (§2).
 
 ### D3. When a book is stale
 
 | Case | What happens | Detected by |
 | --- | --- | --- |
-| Quiet book, live session (the H1 case) | other assets' frames keep confirming the session: FRESH | D2 |
+| Quiet book, live session (the H1 case) | other assets' frames keep confirming the session: FRESH, until the book's own last change is older than the ceiling | D2, rule 6 |
+| One asset's delivery stalls while the session stays busy (N-B) | FRESH until the ceiling, then aged by its own last change: STALE at `lastChange + max(ceiling, bound)` at the latest | D2 rule 6 |
+| A frame the gateway could only partly normalize | the frame's incident is sequenced before its accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r1, X8) |
+| A trader that starts or restarts inside an epoch whose incident it did not consume | the taint is unknown to it (an accepted gap): bounded by the ceiling | D2.4, rule 6 (r1, X2) |
 | Silent session, socket still open | no confirmations: STALE at `lastConfirmation + bound` | D2 (no rule needed) |
 | Disconnection (`FeedDisconnected`), reconnect | the old session gets no more frames; the new session's frames do not confirm a book delivered on the old one: STALE within the bound. A book re-delivered on the new session is confirmed by it | D1 key |
 | Missed `PONG` (`FeedStale`), heartbeat loss | the gateway reconnects (`reconnectWhenStale`), so as above; and its `GATEWAY_FEED_STALL` incident taints the gateway epoch | D2.4 |
@@ -206,15 +268,20 @@ more permissive than it — whenever:
 | Gateway WAL refusal, unparsable frame | the gateway's incident names no market: the epoch is tainted, fallback to the last change for the rest of the gateway's life (repeats are deduplicated, D2.4) | D2.4 |
 | Market data-quality incident | fallback to the last change | D2.5 |
 | REST recovery snapshot | no session: last change only, until a socket frame for that asset lands on a session | D2.2 |
-| Trader lagging the stream | ages are measured in event time, exactly as before; a lagging trader is not detected here (N1, D7) | — |
+| Trader lagging the stream | ages are measured in event time, exactly as before, and a lagging trader is not detected here. `CONNECTION_CONFIRMED` admits MORE lagged cases than `LAST_CHANGE` does (D7) | — (open ruling, D7) |
 | Replay of old data | deterministic (D6); data without session fields ages by the last change | D2.2 |
 
 ### D4. The opt-in, and backward compatibility of configurations
 
-The trader configuration gains ONE optional block:
-`bookFreshness: { basis: "LAST_CHANGE" | "CONNECTION_CONFIRMED" }`. An absent
-block means `LAST_CHANGE` (`packages/trading-core/src/config.ts`
-`bookFreshnessBasisOf`). This is the document's only optional key, and it is
+The trader configuration gains ONE optional block, in one of two shapes:
+`bookFreshness: { basis: "LAST_CHANGE" }` or
+`bookFreshness: { basis: "CONNECTION_CONFIRMED", maximumLastChangeAgeMs: <1..600000> }`.
+The ceiling is REQUIRED with `CONNECTION_CONFIRMED` and refused with
+`LAST_CHANGE`. It has no default, because a safety bound nobody chose is not a
+bound. Its ten-minute cap stops the extension from being configured into a
+disguised "freshness off". An absent block means `LAST_CHANGE`
+(`packages/trading-core/src/config.ts` `bookFreshnessBasisOf`,
+`bookFreshnessCeilingMsOf`). This is the document's only optional key, and it is
 disclosed there: absence selects the STRICTER rule (the confirmed instant is
 never earlier than the last change), there is no `.default()` (absence is read
 as an own-property absence on the prototype-free D1 tree, ADR-020), and every
@@ -226,8 +293,13 @@ absent block and an explicit `LAST_CHANGE`.
 
 ### D5. How the signal flows
 
-- **Gateway: unchanged.** No new event type. The session fields every
-  market-data envelope already carries are the signal. A `PONG`-derived
+- **Gateway: no new event type; one ordering change (r1, X8).** The session
+  fields every market-data envelope already carries are the signal. The
+  market-channel adapter now reports a frame's normalization problems BEFORE
+  its accepted events (`packages/polymarket-public/src/feed/connection.ts`),
+  so the gateway's incident for a partly malformed frame precedes the
+  frame's siblings in the stream (D2.4). Nothing is dropped, and neither list
+  is reordered internally. A `PONG`-derived
   liveness event was considered and not built (Option B): at the configured
   2 000 ms bounds a 10 s heartbeat (V5) can never confirm within the bound, and
   N-E means a `PONG` proves less than a data frame. It becomes worth building
@@ -268,22 +340,58 @@ is unchanged and still loads: its gate is `now − book.asOf`, whatever the
 root's basis.
 
 `STATIC_BRACKET_VERSION` stays `1.1.0`: a version-1 run's behaviour is
-byte-identical, so no run can straddle a behaviour change, and a version-2
-configuration is a new configuration identity (a new `configId`). The code
-version is pinned by the registration command (`apps/trader/src/register`,
-not this round's path); if the user wants the code version bumped as well, it
-must move there in the same change.
+byte-identical, and a version-2 configuration is a new configuration identity
+(a new `configId`). The code version is pinned by the registration command
+(`apps/trader/src/register`, not this round's path); if the user wants the
+code version bumped as well, it must move there in the same change.
+
+**What the configuration identity does NOT cover (r1, X6).** The
+`bookFreshness` block (its basis and ceiling) lives in the TRADER
+configuration document, not in the strategy parameters. The registration
+command hashes and persists only the parameters (`register/template.ts`,
+`register/registration.ts`), so the `configId` does not bind the basis. One
+`configId` can therefore run under `LAST_CHANGE` in one process and under
+`CONNECTION_CONFIRMED` in another. Reproducing or auditing a run's freshness
+behaviour needs the trader configuration file that process was started with,
+as external provenance: the operator's deployed
+`infra/compose/trader/trader.config.json`, or the configuration a backtest
+was invoked with. Binding the basis to the registered identity would need the
+registration path, which is outside this round's allowed paths (§5).
 
 ### D7. Clock semantics, and `CO2-N1`
 
 Unchanged. Both `now` and every confirmation instant are event `receivedAt`
-values; nothing reads a wall clock. This ADR does not address `CO2-N1` (live
-admission runs on event time, so a stale backlog can be admitted late): a
-trader lagging the stream judges a book fresh relative to the event it is
-processing, under either basis. The two interact in one way that matters: a
-future N1 rule that measures ages against a wall clock can use `confirmedAt`
-unchanged, because it is an event-time instant of the same kind as the last
-change it replaces.
+values; nothing reads a wall clock. This ADR does not address `CO2-N1`: live
+admission runs on event time, so a stale backlog can be admitted late.
+
+**This ADR WIDENS the set of backlog cases N1 admits (r1, X9).** A trader
+lagging the stream judges a book fresh relative to the event it is
+processing. Under `CONNECTION_CONFIRMED` more lagged states read fresh than
+under `LAST_CHANGE`, because a sibling frame in the backlog vouches for a
+book whose own change is older. Reproduced in review: process clock 09:30,
+YES book changed 09:00:01, NO snapshot 09:00:04.100 on the same session.
+`LAST_CHANGE` gives 0 approvals and `CONNECTION_CONFIRMED` gives 2. Each
+admitted case is the event-time image of a case this ADR admits live, and
+rule 6's ceiling bounds it in event time. It is still a real widening, and
+it conflicts with review criterion B ("a trader lagging behind the stream; a
+replay of old data" must not read fresh while the feed is not provably
+live). This ADR does not resolve that conflict. It changes no clock
+semantics silently, and the packet forbade changing them. **A ruling is owed
+before ratification**, on one of these:
+
+- (a) **a live-admission guard:** in a live-data process, `CONNECTION_CONFIRMED`
+  vouches past the last change only while the evaluating event's
+  `receivedAt` is within a bound of the process clock. This is a clock
+  semantics change, which is `CO2-N1`'s territory;
+- (b) **narrowing criterion B** for this rule: accept that event-time
+  freshness is judged in event time under both bases until N1 lands;
+- (c) **deferring the opt-in:** leave `CONNECTION_CONFIRMED` unused (absent
+  block) until N1 lands.
+
+The two also interact in one way that matters: a future N1 rule that
+measures ages against a wall clock can use `confirmedAt` unchanged. It is an
+event-time instant of the same kind as the last change it replaces, and it
+can close this widening.
 
 ### D8. Replay and backtest determinism
 
@@ -303,8 +411,11 @@ old recording can never read fresher than it did.
 
 ## 4. Options considered
 
-- **A. Keep the last-change rule.** Rejected by the finding: 54% of H1
-  decisions paused on books that were quiet, not stale.
+- **A. Keep the last-change rule.** Not chosen, because of the finding: 54%
+  of H1 run 1's decisions paused on `SB.STALE_BOOK`. This ADR's evidence
+  shows the mechanism on a derived stream. It does not show that those
+  pauses were quiet books (see the header). Keeping the rule remains the
+  fallback (D4: absent block).
 - **B. A gateway liveness event from `PING`/`PONG`.** A new domain event per
   `PONG`, consumed by the trader as a session confirmation. Not built: the
   heartbeat period (10 s, V5) exceeds the bounds in use (2 s), so it would
@@ -316,10 +427,13 @@ old recording can never read fresher than it did.
   negative signal is not provable liveness (a stalled gateway publishes
   nothing, including its disconnect), and the trader does not consume
   feed-health events.
-- **D. Session confirmations by consumed data frames (chosen).** Uses only
-  fields every envelope already carries, needs no gateway or contract change,
-  fails closed on every missing piece, and is exactly as strong as the proof
-  the last-change rule had (§2, "Therefore").
+- **D. Session confirmations by consumed data frames, with a per-book
+  ceiling (chosen).** It uses only fields every envelope already carries. It
+  needs no new event type or contract change, only the adapter's
+  problems-first order (D5). It fails closed on every missing piece. It is
+  WEAKER per book than the last-change rule's proof, because a sibling's
+  frame says nothing about this asset's delivery (§2, "Therefore"). The
+  ceiling (D2 rule 6) bounds that weakness.
 - **E. Raise `maximum_book_age_ms`.** Rejected: it loosens the bound for books
   on dead sessions too; D keeps the bound and changes only what counts as
   evidence.
@@ -327,22 +441,49 @@ old recording can never read fresher than it did.
 ## 5. Consequences
 
 - A quiet book on a busy session no longer pauses the strategy or fails
-  check 7. The H1-fixture effect and the throughput cost are measured in the
-  `THROUGHPUT-1c` handoff.
+  check 7, until its own last change is older than the ceiling. The
+  throughput cost, and the H1-fixture mechanism check (§ header: no reduction
+  on the recording, 21.9% → 0 on a derived stream), are in the
+  `THROUGHPUT-1c` handoffs.
+- **The epoch taint, measured (r1).** The Binance adapter reports every
+  subscription start as `BINANCE_SUBSCRIPTION_START_NO_REPLAY`, an incident
+  naming no market (`packages/binance-adapter/src/incidents.ts`). In a
+  gateway that runs a Binance feed, which H1's does
+  (`gateway.config.json`), that incident taints the epoch from its start. So
+  a trader that consumed the epoch from its start falls back to
+  `LAST_CHANGE` for the whole epoch. This is fail-closed, and it is why the
+  r1 gateway-to-trader test runs its gateway without a Binance feed. It also
+  means this rule changes nothing in an H1-like deployment until the taint is
+  narrowed. Narrowing it, for example by not tainting on incidents whose
+  envelope `source` is a reference venue, would loosen a fail-closed rule, so
+  it is left to the user's ruling rather than made here.
 - A book on a session whose only traffic is its own changes behaves exactly as
   before. A whole quiet subscription (no asset changing) goes stale after the
   bound, as before (Option B would be needed to change that).
-- **Residual risk, stated:** N-B. If the venue delays one asset's changes
-  while another asset's frames flow, the delayed asset reads fresh for up to the
-  bound after the last frame of its session — where the last-change rule would
-  have read it stale 2 s after its own last change. The bound limits the
-  exposure to the same number of milliseconds as before, but measured from a
-  different instant. This is the one way this rule is more permissive than the
-  last-change rule, and it is permitted only because both rules rest on the same
-  undocumented assumption (N-A): neither proves the book current.
+- **Residual risk, stated (corrected in r1, X1):** N-B. If the venue delays
+  or stops one asset's changes while other assets' frames keep the session
+  busy, that asset keeps reading fresh until its own last change is older than
+  the ceiling. It then ages by its own last change, and is stale at
+  `lastChange + max(ceiling, bound)` at the latest. The last-change rule would
+  have read it stale at `lastChange + bound`. The r0 text said this exposure
+  was "the same number of milliseconds as before", which was false: without
+  a ceiling it was unbounded on a busy session. With the ceiling the extra
+  exposure is at most `ceiling − bound` per book, by the operator's choice
+  (28 s with the example's 30 000 ms and 2 000 ms). This is how this rule is
+  more permissive than the last-change rule. It rests on an undocumented
+  assumption (N-A, N-B), and the ceiling is what bounds it. The same bound
+  covers the two accepted gaps: a taint this process never consumed (D2.4, X2)
+  and the widened `CO2-N1` backlog (D7, X9).
 - **For the venue register (not this round's paths):** N-B deserves an
   unknown row of its own (no documented cross-asset ordering on the market
   channel), next to U-2 and U-3.
+- **Closing the X2 gap (a gateway change, not this round's):** a signal from
+  which a trader can tell that it consumed an epoch from its start, for
+  example an epoch-start event, or incidents attributed to a session and
+  re-announced per connection. Until then, the ceiling bounds the gap.
+- **Binding the basis to the configuration identity (X6, not this round's
+  paths):** the registration command could hash and persist the
+  `bookFreshness` block beside the parameters.
 - **Contract text (not this round's paths):** `docs/contracts/features-v1.md`
   §2 could say that the book section's `lastEventAt` is the root's vouched-for
   instant; `docs/adr/README.md` needs this ADR's index row.
@@ -372,3 +513,17 @@ within its bound; the epoch taint (later sessions included, a new epoch clean), 
 measurement in both bases; byte-identical replay; byte-identical behaviour
 with no `bookFreshness` block; grammar version 1 unchanged and version 2's key
 required, pinned and refused in version 1.
+
+r1 adds these pins:
+- the per-book ceiling: stale at 121 s with age 120 000 ms on a busy session,
+  fresh exactly at the ceiling and stale 1 ms past it, and check 7 honouring
+  it;
+- the ceiling bounding a process that missed its epoch's incident (X2);
+- a REST snapshot replacing a socket-delivered book's session (X5);
+- the configuration door (ceiling required, capped, refused with
+  `LAST_CHANGE`);
+- `connection.test.ts`: a frame's problems before its events;
+- `test/integration/paper-trader/throughput-1c-partial-frame-taint.test.ts`:
+  the REAL gateway to the REAL trader. A partly malformed frame admits 0
+  orders under both bases (2 at `f341d5f`), and a well-formed control frame
+  admits the entry under `CONNECTION_CONFIRMED` only.

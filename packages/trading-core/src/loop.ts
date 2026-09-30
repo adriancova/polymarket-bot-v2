@@ -123,6 +123,7 @@ import {
 import { CancelLedger } from "./cancels.js";
 import {
   bookFreshnessBasisOf,
+  bookFreshnessCeilingMsOf,
   type InstanceConfig,
   type MarketConfig,
   type TraderConfig,
@@ -590,6 +591,8 @@ export class CoreLoop {
    * (`book-freshness.ts`). Fed every consumed event, in stream order.
    */
   readonly #freshnessBasis: BookFreshnessBasis;
+  /** ADR-023 D2 rule 6: the per-book ceiling on the last-change age (r1, X1). */
+  readonly #freshnessCeilingMs: number | undefined;
   readonly #liveness = new DeliverySessionLiveness();
 
   // --- the per-order state (`TRDR-4`) ---------------------------------------
@@ -783,6 +786,7 @@ export class CoreLoop {
     this.#cash = options.config.accounting.startingCash;
     this.#lastInstant = options.clock.now();
     this.#freshnessBasis = bookFreshnessBasisOf(options.config);
+    this.#freshnessCeilingMs = bookFreshnessCeilingMsOf(options.config);
     this.#reference = new ReferenceState({
       windowMs: options.config.features.tradeWindowMs,
       maximumPoints: 512,
@@ -1591,7 +1595,7 @@ export class CoreLoop {
     // (exactly the pre-ADR-023 value), the confirmed instant under
     // `CONNECTION_CONFIRMED`. `quality.input_feed_ages` reports its age.
     const bookEventAt =
-      this.#bookConfirmedAt(market, outcome)?.iso ??
+      this.#bookConfirmedAt(market, outcome, epochMs)?.iso ??
       market.bookFor(outcome).lastUpdate()?.receivedAt ??
       instant;
     const computed = computeFeatureSnapshot({
@@ -3996,7 +4000,7 @@ export class CoreLoop {
     // from the instant the book is vouched for — under `LAST_CHANGE` exactly
     // the pre-ADR-023 value. Which book is measured (YES) is unchanged.
     const at =
-      this.#bookConfirmedAt(market, "YES")?.epochMs ??
+      this.#bookConfirmedAt(market, "YES", epochMs)?.epochMs ??
       market.bookFor("YES").lastUpdate()?.receivedAtEpochMs;
     return at === undefined ? 0 : Math.max(0, epochMs - at);
   }
@@ -4006,7 +4010,7 @@ export class CoreLoop {
    * or `undefined` when its last update carries no receipt instant (callers
    * keep their pre-ADR-023 fallbacks).
    */
-  #bookConfirmedAt(market: MarketState, outcome: "YES" | "NO"): ConfirmedInstant | undefined {
+  #bookConfirmedAt(market: MarketState, outcome: "YES" | "NO", nowEpochMs: number): ConfirmedInstant | undefined {
     const lastUpdate = market.bookFor(outcome).lastUpdate();
     const lastChange =
       lastUpdate?.receivedAt !== undefined && lastUpdate.receivedAtEpochMs !== undefined
@@ -4018,6 +4022,8 @@ export class CoreLoop {
       sessionKey: market.bookSession(outcome),
       marketHasActiveIncident: market.hasActiveIncident(),
       liveness: this.#liveness,
+      nowEpochMs,
+      maximumLastChangeAgeMs: this.#freshnessCeilingMs,
     });
   }
 

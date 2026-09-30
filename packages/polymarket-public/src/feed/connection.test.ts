@@ -1137,6 +1137,43 @@ describe("inbound frames", () => {
       venueTimestamp: "2026-06-29T17:15:57.257Z",
     });
   });
+
+  it("reports a partly malformed frame's problems BEFORE its accepted events (THROUGHPUT-1c r1, X8)", () => {
+    // Every handler call, in the order the feed makes it.
+    const order: string[] = [];
+    const subject = harness(
+      {},
+      {},
+      {
+        onEvent: (event) => order.push(`event:${event.eventType}`),
+        onProblem: (problem) => order.push(`problem:${problem.code}`),
+      },
+    );
+    subject.feed.subscribe([MARKET.yesTokenId, MARKET.noTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    order.length = 0;
+    subject.sockets.latest().emitJson([
+      {
+        event_type: "book",
+        market: MARKET.conditionId,
+        asset_id: MARKET.noTokenId,
+        timestamp: "1782753357257",
+        bids: [{ price: "0.58", size: "1" }],
+        asks: [{ price: "0.6", size: "2" }],
+      },
+      {
+        event_type: "price_change",
+        market: MARKET.conditionId,
+        timestamp: "1782753357258",
+        price_changes: [{ asset_id: MARKET.yesTokenId, price: "0.4", size: "0", side: "SIDEWAYS" }],
+      },
+    ]);
+
+    // The problem comes from the frame's SECOND entry, yet it is reported
+    // first: a consumer learns of the loss before any sibling can act.
+    expect(order).toEqual(["problem:UNKNOWN_SIDE", "event:BookSnapshot"]);
+  });
 });
 
 describe("computeReconnectDelayMs", () => {
