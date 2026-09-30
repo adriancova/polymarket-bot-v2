@@ -121,7 +121,8 @@ to the rule above and explains each change. It also searches for others.
   reads the last checkpoint, so `CKPT-1` checks it too.
 - `test/integration/paper-trader/redis-outage-halts-postgres-redis.test.ts`
   (`OUTAGE-2`): its settle compares checkpoints 1:1 with decisions.
-- The `DURABLE-1` tests: `test/integration/paper-trader/durable-decision-before-placement.test.ts`,
+- The `DURABLE-1` tests:
+  `test/integration/paper-trader/durable-decision-before-placement.test.ts`,
   `test/integration/paper-trader/durable-decision-before-placement-postgres.test.ts`,
   `test/e2e/durable-decision-protective-reduce.test.ts`, and the `DURABLE-1`
   block of `packages/trading-core/src/loop-refused-plan.test.ts`.

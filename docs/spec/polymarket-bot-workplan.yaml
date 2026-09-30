@@ -1302,6 +1302,9 @@ work_packages:
   # apps/trader/src/**. They run one at a time, never concurrently (AGENTS.md).
   # STORAGE-1 holds packages/simulation/src/** for the manifest version bump
   # (ADR-029); no other LEAN-1 round holds it.
+  # THROUGHPUT-1c's grant includes test/**. Every LEAN-1 round that grants a
+  # test path therefore depends on THROUGHPUT-1c, STORAGE-1 included. Only a
+  # governance commit that records disjoint test-path ownership may lift this.
   - id: LEAN-GOV
     phase: phase-3
     title: LEAN-1 rulings as ADRs and work-plan entries
@@ -1345,7 +1348,7 @@ work_packages:
     phase: phase-3
     title: Research tier, pinned windows, verified raw expiry, and disk metrics
     goal: Keep a downsampled research tier and exact pinned windows, and delete raw WAL after 72 h only once both are verified (ADR-028, ADR-029).
-    depends_on: [LEAN-GOV, WP-130]
+    depends_on: [LEAN-GOV, WP-130, THROUGHPUT-1c]
     allowed_paths:
       # The window classifier reads decision, order, fill and halt rows through
       # a read-only adapter inside apps/research-worker; packages/storage-postgres

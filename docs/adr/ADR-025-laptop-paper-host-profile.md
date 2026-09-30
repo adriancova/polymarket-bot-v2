@@ -111,7 +111,8 @@ WAL keeps, and for how long, is ADR-028.
 2. Before any step whose forecast exceeds $80 a month, the orchestrator stops
    and brings the options to the user (`LEAN-1` §5.3).
 3. Evidence is never deleted to meet a budget.
-4. Electricity is not counted against the budget, by the user's ruling.
+4. The user said electricity cost is not a concern. No electricity exemption
+   from the budget was recorded.
 
 ### 7. Security on this host
 
@@ -155,9 +156,9 @@ WAL keeps, and for how long, is ADR-028.
 
 ## Consequences
 
-- **Compute costs nothing.** `LEAN-1` §5.1 forecasts about $3-20 a month at
-  1-2 markets, almost all of it electricity. The user does not count
-  electricity, so the counted cost is B2, about $0-1 a month.
+- **The running cost is small.** `LEAN-1` estimates $3-20/month at 1-2
+  markets, including electricity. These remain estimates; `HOST-BENCH`
+  measures host consumption.
 - **A home host has more outages than a data centre.** Windows Update, power,
   the ISP and WSL all cause gaps. Expect several restarts a month.
 - **Every trader start is a new run,** as today. A gap shows in the run list and

@@ -5,9 +5,9 @@
 - **Recorded by:** `LEAN-GOV`
 - **Implemented by:** `CADENCE-1`, after `THROUGHPUT-1c` merges. Not yet
   implemented.
-- **Supersedes / Superseded by:** none. It **amends** ADR-024 D3 (two
-  sentences, named in "What it amends") and its Consequences, and handoff
-  §8.1.
+- **Supersedes / Superseded by:** none. It **amends** ADR-024 D3 (its
+  cadence clause and three sentences, named in "What it amends") and its
+  Consequences, and handoff §8.1.
 - **Handoff sections:** §6 (invariants 3, 4 and 15), §7.5, §8.1, §9.6, §12.4,
   §12.5. **ADRs:** ADR-005, ADR-022, ADR-024.
 
