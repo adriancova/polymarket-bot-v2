@@ -22,8 +22,14 @@ K15 no "gate is open": main uses "gate is OPEN" for a passed gate, so say met or
 K16 a ruling states what was ruled: no bare "Ruled by the user <date>.".
 K17 state the fact, do not narrate the record: no "the row (also) records that".
 K18 REWRITES.md's coverage heading reads "Coverage: base lines not included in a rewrite pair".
-K19 the Wave 3 authorization intro is at most 24 words, names the date and `WP-260`, and is
-    followed by exactly two condition bullets.
+K19 the Wave 3 authorization intro is at most 24 words, names the date and `WP-260`, says the
+    orchestrator "may start" (a permission, as the base row grants), and is followed by exactly
+    two condition bullets.
+K20 the brief's Archive intro does not claim the text "below" was moved: it lists files.
+K21 REWRITES.md's intro names every check that concerns it (C6, C8, C9, C10, C11, C12, C13)
+    and does not use the old Facts wording "and what it does not carry and where that lives".
+K22 AGENTS.md's archive sentence has no nested aside ("verbatim, and frozen,").
+K2 also requires the "Residuals recorded in Complete package rows" subsection.
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -47,7 +53,7 @@ SAFETY = [
     "- Human live-micro approval: **Not granted**",
 ]
 SECTIONS = ["## Safety state", "## Current phase", "## Authorized now", "## Work packages", "## Open blockers",
-            "### Closeout blockers", "### Residual queue", "## Human items", "### Wave 3 authorization (conditional)",
+            "### Closeout blockers", "### Residual queue", "### Residuals recorded in Complete package rows", "## Human items", "### Wave 3 authorization (conditional)",
             "## Pending external evidence", "## Human and operational gates"]
 
 
@@ -207,9 +213,22 @@ def main() -> int:
             i += 1
         intro = " ".join(para)
         words = len(intro.split())
-        if words > 24 or "2026-09-30" not in intro or "`WP-260`" not in intro or bullets != 2:
+        if words > 24 or "2026-09-30" not in intro or "`WP-260`" not in intro or bullets != 2 or "may start" not in intro:
             fails.append(f"K19: the Wave 3 intro has {words} words (max 24) and {bullets} condition bullets (need 2), "
-                         "and must name 2026-09-30 and `WP-260`")
+                         "and must name 2026-09-30 and `WP-260` and say the orchestrator 'may start'")
+    # K20
+    if "Everything below was moved verbatim" in brief:
+        fails.append("K20: the Archive intro says 'Everything below was moved verbatim', but a file list follows")
+    # K21
+    intro = rw.split("\n## Coverage:", 1)[0]
+    missing = [c for c in ("C6", "C8", "C9", "C10", "C11", "C12", "C13") if f"({c}" not in intro and f" {c})" not in intro and f"{c}," not in intro]
+    if missing:
+        fails.append(f"K21: REWRITES.md's intro does not name {', '.join(missing)}")
+    if "and what it does not carry and where that lives" in intro:
+        fails.append("K21: REWRITES.md's Facts bullet uses the old wording")
+    # K22
+    if "verbatim, and frozen," in agents:
+        fails.append("K22: AGENTS.md nests 'and frozen,' inside its and-chain; use a colon and a semicolon")
 
     print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]})")
     print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}")
