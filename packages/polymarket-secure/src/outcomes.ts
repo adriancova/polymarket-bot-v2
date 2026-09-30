@@ -65,7 +65,11 @@ export type PlacementOutcome =
   | { readonly kind: "REJECTED"; readonly reason: PlacementRejectionReason }
   /** Nothing left the process (validation or signing failed). */
   | { readonly kind: "NOT_SENT"; readonly error: SecureVenueError }
-  /** The venue refused with a documented condition (429/425/401 with no code, 503 post-only). Not placed. */
+  /**
+   * The venue refused with a documented condition (425/401 with no code, 503
+   * post-only). Not placed. A 429 through the pinned SDK is never REFUSED: its
+   * code was discarded by the SDK, so it is UNKNOWN (kind `RATE_LIMITED`).
+   */
   | { readonly kind: "REFUSED"; readonly error: SecureVenueError }
   /** The order may exist. ADR-007 §3: SUBMISSION_UNKNOWN; reconcile before any new salt. */
   | { readonly kind: "UNKNOWN"; readonly reason: PlacementUnknownReason; readonly error: SecureVenueError | null };

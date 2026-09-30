@@ -78,25 +78,47 @@ that throws or a revoked proxy makes the input invalid (`NOT_SENT`), and the
 thrown value is dropped unread. Arrays are copied once, index by index, from
 own data properties, so what is validated is exactly what is sent. An invalid
 batch returns one `NOT_SENT` per request entry, bounded at 16, so a hostile
-`length` cannot exhaust memory.
+`length` cannot exhaust memory. Callers must not pair outcomes with inputs by
+position on a refused batch.
+
+The SDK's own RESPONSES are read the same way. A `postOrders` answer is never
+used through its own methods (`map`, an iterator, a species constructor): its
+entries are copied from own data properties into a fresh plain array with one
+slot per SUBMITTED order. A non-array, a wrong length, or a reflection failure
+makes every outcome `UNKNOWN` (`UNRECOGNISED_RESPONSE`). A hole or an
+accessor entry makes that one outcome `UNKNOWN`.
 
 `createLimitOrder` accepts a price strictly between 0 and 1 only. Before it
 hands out an envelope, it checks the SDK's signed order against the request:
 
 - token, side, post-only, expiration and order type (`GTC`, or `GTD` when an
   expiration was given) must match exactly;
+- maker, signer and signature type must be what the pinned SDK derives from
+  the client's account (its `Tr`/`Ee` functions): the signature type equals
+  the wallet type (0 EOA, 1 proxy, 2 Safe, 3 deposit wallet/POLY_1271), the
+  maker is the account wallet, and the signer is the wallet for type 3 and the
+  account signer otherwise (addresses compared case-insensitively);
+- `builder` and `metadata` must both be `bytes32(0)`, because this package
+  never passes a builder code;
 - the share amount must be the requested size rounded **down** by less than
   0.01 share, the pinned SDK's share precision;
 - the quote amount must be price × shares rounded **down** by less than
   0.001 pUSD, the pinned SDK's coarsest quote precision.
 
 These are exact integer comparisons, never floats. A mismatch is `FAILED`
-(`UNKNOWN`), and nothing is transmitted. A change in the SDK's rounding
+(`UNKNOWN`), and the order is not transmitted. A change in the SDK's rounding
 therefore fails closed.
+
+`createLimitOrder` never transmits the ORDER, but it is not free of I/O: the
+pinned SDK's `prepareLimitOrder` makes public, unauthenticated reads (market
+metadata and tick size, `actions/orders/cache.ts`). A `FAILED` sign outcome can
+therefore carry an HTTP-derived kind (a transport failure, a 429). Whatever
+its kind or effect, a `FAILED` sign outcome means **no order exists**: nothing
+was signed that the caller holds, so nothing can have been posted.
 
 | Method | Outcome kinds |
 | --- | --- |
-| `createLimitOrder` (signs locally; transmits nothing) | `SIGNED` (a `SignedOrderEnvelope`) / `FAILED` |
+| `createLimitOrder` (signs locally; the order is never transmitted, but the SDK reads public market metadata) | `SIGNED` (a `SignedOrderEnvelope`) / `FAILED` |
 | `postOrder`, `postOrders` (1…15 orders) | `ACCEPTED` (`LIVE` / `MATCHED` / `DELAYED`) / `REJECTED` / `NOT_SENT` / `REFUSED` / `UNKNOWN` |
 | `cancelOrder`, `cancelOrders` (1…1,000 ids; C-11), `cancelMarketOrders`, `cancelAll` | `COMPLETED` / `NOT_SENT` / `REFUSED` / `UNKNOWN` |
 | `fetchOrder` | `FOUND` / `FAILED` |
@@ -106,7 +128,7 @@ therefore fails closed.
 | Outcome | Meaning | OMS consequence (ADR-007) |
 | --- | --- | --- |
 | `NOT_SENT` | Nothing left the process: local validation, SDK input validation or signing failed. | The attempt does not exist at the venue. |
-| `REFUSED` | The venue returned a documented refusal: 429, 425 or 401 with no code, or 503 with `post_only_mode`. | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
+| `REFUSED` | The venue returned a documented refusal: 425 or 401 with no code, or 503 with `post_only_mode`. (A 429 through the pinned SDK is `UNKNOWN`; see §2.2.) | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
 | `REJECTED` | The SDK classified a venue rejection. The reasons are the eight named `OrderResponseErrorCode` members. | Not placed. |
 | `UNKNOWN` | The order may exist. | `SUBMISSION_UNKNOWN`: reconcile by the signed identity before any new salt (§2 step 10, §3). |
 | `ACCEPTED` / `DELAYED` | The order was placed, but `DELAYED` is never a fill: its amounts are `"0"` (§5). | Track the order as pending. |
@@ -120,20 +142,30 @@ Errors are classified by HTTP status and **documented** code. The venue's
 | --- | --- | --- | --- |
 | `UserInputError` | `INVALID_REQUEST` | `NOT_SENT` | — |
 | `SigningError`, `CancelledSigningError` | `SIGNING_FAILED` | `NOT_SENT` | — |
-| `RateLimitError` (429), no code | `RATE_LIMITED` | `NOT_APPLIED` | — |
+| `RateLimitError` (429; the pinned SDK's ONLY 429) | `RATE_LIMITED` | **`UNKNOWN`** (the SDK discards the body) | — |
 | 425, no code | `ENGINE_RESTARTING` | `NOT_APPLIED` | `UNKNOWN` |
 | 503 + `code: "post_only_mode"` | `POST_ONLY_MODE` | `NOT_APPLIED` | `YES` (documented) |
 | 503, any other or no code | `TRADING_UNAVAILABLE` | `UNKNOWN` | `UNKNOWN` (C-9) |
 | 401, no code | `AUTHENTICATION_REJECTED` | `NOT_APPLIED` | — |
-| 401, 425 or 429 **with any code** (documented or not) | by status, as above | **`UNKNOWN`** (ADR-007 §6) | as above |
+| 401, 425 or 429 **with any code** (documented or not), including a `code` that is an accessor (present but unreadable) | by status, as above | **`UNKNOWN`** (ADR-007 §6) | as above |
 | any other status | `REQUEST_REJECTED` | `UNKNOWN` (U-4) | — |
 | `TransportError` / `TimeoutError` / `UnexpectedResponseError` | `TRANSPORT_FAILURE` / `TIMEOUT` / `UNEXPECTED_RESPONSE` | `UNKNOWN` | — |
 | anything else, including an SDK look-alike that is not an instance, and any value whose reflection throws | `UNKNOWN` | `UNKNOWN` | — |
 
 `NOT_APPLIED` (outcome `REFUSED`) is given **only** to the exact documented
-pairs: 401, 425 or 429 with no code, and 503 with `post_only_mode`. ADR-007 §6:
+pairs: 401 or 425 with no code, and 503 with `post_only_mode`. ADR-007 §6:
 "an unrecognized code is surfaced as UNKNOWN and never … silently treated as a
 rejection". The kind still follows the status, so a caller can back off.
+
+**Every 429 is `UNKNOWN`.** The pinned SDK's `ServiceClient` throws
+`RateLimitError` for every 429 before it parses the body
+(`if (status === 429) throw new RateLimitError(...)` precedes the body read),
+so any `code` the venue sent is discarded and "no code" can never be
+established. A 429 therefore forces reconciliation of a placement, like any
+other `UNKNOWN`. The kind stays `RATE_LIMITED` (with `retryAfterSeconds` when
+the `Retry-After` header was an integer), so backoff still works. (A
+`RequestRejectedError` with status 429 and no code would still be
+`NOT_APPLIED`, but the pinned SDK never builds one.)
 
 **Closed vocabularies.** Every field of a `SecureVenueError` is checked on
 every construction: the kind, operation, effect, source and cancel flag
@@ -282,17 +314,20 @@ caught on every case.
 
 | Suite | Runs in | Contents |
 | --- | --- | --- |
-| `packages/polymarket-secure/src/**/*.test.ts` | root `pnpm test` (CI) | the gate, the boundary, the error mapping, redaction, the client, the repository-wide SDK import scan, source hygiene, the round-1 review pins (`hardening-r1.test.ts`), and the tripwire's own self-test (`testing/network-tripwire.test.ts`) |
+| `packages/polymarket-secure/src/**/*.test.ts` | root `pnpm test` (CI) | the gate, the boundary, the error mapping, redaction, the client, the repository-wide SDK import scan, source hygiene, the review pins (`hardening-r1.test.ts`, `hardening-r2.test.ts`), and the tripwire's own self-test (`testing/network-tripwire.test.ts`) |
 | `test/contract/polymarket-secure/*.test.ts` | `pnpm --filter @polymarket-bot/polymarket-secure test:contract` | the venue fixtures run through the pinned SDK's own response parser and HTTP error construction, then through the client |
 
 Every test installs the **network tripwire**. It replaces `globalThis.fetch`,
 `globalThis.WebSocket` and `net.Socket.prototype.connect`, the path under
-every Node TCP and TLS client. Any attempt throws and is recorded, and the
+every Node TCP and TLS client. It also refuses DNS (every `lookup*`,
+`resolve*` and `reverse` function of `node:dns` and `node:dns/promises`, and
+the `Resolver` classes' methods) and UDP (`dgram.Socket` `send` and
+`connect`). Any attempt throws and is recorded, and the
 test fails in `afterEach` if the attempt list is not empty. The contract suite
 serves sanitized HTTP fixtures to the SDK from an in-memory responder. It uses
 only one unauthenticated public-client request, and every other request is
 refused. `testing/network-tripwire.test.ts` exercises every leg (fetch,
-WebSocket, TCP and TLS, and restoration), so removing a leg fails the root
+WebSocket, TCP and TLS, DNS, UDP, and restoration), so removing a leg fails the root
 `pnpm test`.
 
 No test uses a real key, a credential, an authenticated endpoint or a

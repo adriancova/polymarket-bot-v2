@@ -81,21 +81,32 @@ function fixtureAmounts(request: Parameters<Port["createLimitOrder"]>[0]): { mak
   return { makerAmount: maker.toString(10), takerAmount: taker.toString(10) };
 }
 
+/**
+ * The maker, signer and signature type the pinned SDK derives from its
+ * account (`Tr` / `Ee` in `@polymarket/client@0.11.0`): signature type =
+ * wallet type, maker = wallet, signer = wallet for POLY_1271 (3) else signer.
+ */
+function fixtureParties(account: Readonly<Record<string, unknown>>): { maker: string; signer: string; signatureType: number } {
+  const wallet = typeof account["wallet"] === "string" ? account["wallet"] : MOCK_SIGNER_ADDRESS;
+  const signer = typeof account["signer"] === "string" ? account["signer"] : MOCK_SIGNER_ADDRESS;
+  const signatureType = typeof account["walletType"] === "number" ? account["walletType"] : 0;
+  return { maker: wallet, signer: signatureType === 3 ? wallet : signer, signatureType };
+}
+
 /** Build and mock-sign an in-memory fixture order. */
 async function defaultCreateLimitOrder(
   request: Parameters<Port["createLimitOrder"]>[0],
   signer: SdkSigner,
+  account: Readonly<Record<string, unknown>>,
 ): Promise<SdkSignedOrder> {
   fixtureSalt += 1;
   const tokenId = "assetId" in request && typeof request.assetId === "string" ? request.assetId : "1";
   const message = {
     salt: String(fixtureSalt),
-    maker: MOCK_SIGNER_ADDRESS,
-    signer: MOCK_SIGNER_ADDRESS,
+    ...fixtureParties(account),
     tokenId,
     ...fixtureAmounts(request),
     side: request.side,
-    signatureType: 0,
     timestamp: "1767225600000",
     metadata: `0x${"0".repeat(64)}`,
     builder: `0x${"0".repeat(64)}`,
@@ -148,7 +159,7 @@ export function createFakeSdkFactory(script: FakeSdkScript = {}): {
           "createLimitOrder",
           script.createLimitOrder === undefined ? undefined : (r: never) => script.createLimitOrder?.(r, signer),
           [request],
-          () => defaultCreateLimitOrder(request, signer),
+          () => defaultCreateLimitOrder(request, signer, script.account ?? DEFAULT_FAKE_ACCOUNT),
         ),
       postOrder: (order: SdkSignedOrder) =>
         answer("postOrder", script.postOrder as never, [order], () => ({

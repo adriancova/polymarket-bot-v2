@@ -38,7 +38,9 @@ describe("SDK error classes → kinds and effects", () => {
     [new UserInputError("bad"), "INVALID_REQUEST", "NOT_SENT"],
     [new SigningError("no sig"), "SIGNING_FAILED", "NOT_SENT"],
     [new CancelledSigningError("user said no"), "SIGNING_FAILED", "NOT_SENT"],
-    [new RateLimitError("slow down", { retryAfter: 3 }), "RATE_LIMITED", "NOT_APPLIED"],
+    // WP-260 r2 (CX-R2-02): the pinned SDK throws RateLimitError for every
+    // 429 before reading the body, so "no code" is unknowable: UNKNOWN.
+    [new RateLimitError("slow down", { retryAfter: 3 }), "RATE_LIMITED", "UNKNOWN"],
     [new TransportError("socket hang up"), "TRANSPORT_FAILURE", "UNKNOWN"],
     [new TimeoutError("waited"), "TIMEOUT", "UNKNOWN"],
     [new UnexpectedResponseError("shape"), "UNEXPECTED_RESPONSE", "UNKNOWN"],

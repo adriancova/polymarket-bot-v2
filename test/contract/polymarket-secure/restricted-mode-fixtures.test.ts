@@ -164,9 +164,18 @@ describe("orders/restricted-modes fixture through the pinned SDK's HTTP layer", 
     });
   });
 
-  it("429 → REFUSED / RATE_LIMITED", async () => {
+  // WP-260 r2 (CX-R2-02): the pinned SDK throws RateLimitError for every 429
+  // BEFORE it reads the body, so any venue code is discarded and "no code"
+  // cannot be established: the effect is UNKNOWN (ADR-007 §6); the kind stays
+  // RATE_LIMITED so a caller still backs off.
+  it("429 → UNKNOWN / RATE_LIMITED (the SDK discards the body)", async () => {
     const { outcome } = await outcomeFor({ http_status: 429, headers: { "Retry-After": "2" } });
-    expect(outcome).toMatchObject({ kind: "REFUSED", error: { kind: "RATE_LIMITED", effect: "NOT_APPLIED" } });
+    expect(outcome).toMatchObject({ kind: "UNKNOWN", error: { kind: "RATE_LIMITED", effect: "UNKNOWN", retryAfterSeconds: 2 } });
+  });
+
+  it("429 with an undocumented code in the body → UNKNOWN / RATE_LIMITED (never REFUSED)", async () => {
+    const { outcome } = await outcomeFor({ http_status: 429, body: { error: "x", code: "future_undocumented_code" } });
+    expect(outcome).toMatchObject({ kind: "UNKNOWN", error: { kind: "RATE_LIMITED", effect: "UNKNOWN" } });
   });
 
   it("with no responder the SDK's request is refused by the tripwire and surfaces as a transport failure", async () => {

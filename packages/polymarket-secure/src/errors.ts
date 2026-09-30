@@ -17,7 +17,10 @@ export type SecureVenueErrorKind =
   | "INVALID_REQUEST"
   /** The SDK could not produce a signature or auth payload (`SigningError`, `CancelledSigningError`). */
   | "SIGNING_FAILED"
-  /** HTTP 429 (`RateLimitError`). */
+  /**
+   * HTTP 429 (`RateLimitError`). Back off. Through the pinned SDK its effect
+   * is always `UNKNOWN`: the SDK discards a 429's body, so its code is unknowable.
+   */
   | "RATE_LIMITED"
   /** HTTP 425: the matching engine is restarting (venue report §9, E-06). */
   | "ENGINE_RESTARTING"
@@ -46,9 +49,11 @@ export type SecureVenueErrorKind =
  * What the failed request did at the venue, as far as this package can know.
  *
  * - `NOT_SENT`: nothing left the process.
- * - `NOT_APPLIED`: the venue answered with a documented refusal: 429, 425 or
- *   401 with NO code, or 503 with `post_only_mode`. Any code on 429/425/401
- *   makes the effect `UNKNOWN` (ADR-007 §6).
+ * - `NOT_APPLIED`: the venue answered with a documented refusal: 425 or 401
+ *   with NO code, or 503 with `post_only_mode`. Any code on 429/425/401
+ *   makes the effect `UNKNOWN` (ADR-007 §6). A 429 from the pinned SDK
+ *   (`RateLimitError`) is always `UNKNOWN`: the SDK throws it before reading
+ *   the body, so "no code" cannot be established.
  * - `UNKNOWN`: the request may have been applied. For a placement this is
  *   `SUBMISSION_UNKNOWN` territory: reconcile before any retry with a new
  *   salt (ADR-007 §2 step 10, §3).

@@ -9,7 +9,14 @@
  * - `globalThis.fetch` (the SDK's HTTP client, `ky`, calls it);
  * - `globalThis.WebSocket` (the SDK's realtime managers construct it);
  * - `net.Socket.prototype.connect`, which every TCP and TLS client in Node
- *   (`http`, `https`, `tls`, `ws`, database drivers) goes through.
+ *   (`http`, `https`, `tls`, `ws`, database drivers) goes through;
+ * - DNS: every `lookup*`, `resolve*` and `reverse` function of `node:dns` and
+ *   `node:dns/promises`, and the same methods of both `Resolver` classes
+ *   (a name lookup is itself a network query, and can leak the name);
+ * - UDP: `dgram.Socket.prototype.send` and `.connect`.
+ *
+ * Named ESM imports of `node:dns` see the replacements too:
+ * `module.syncBuiltinESMExports()` runs after installing and after restoring.
  *
  * A test asserts `attempts()` is empty at the end, so a stray call fails the
  * test even when the caller swallowed the thrown error.
@@ -19,10 +26,13 @@
  * is still recorded; it never delegates to the real `fetch`.
  */
 
+import dgram from "node:dgram";
+import dns from "node:dns";
+import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 
 export interface NetworkAttempt {
-  readonly via: "fetch" | "WebSocket" | "net.Socket.connect";
+  readonly via: "fetch" | "WebSocket" | "net.Socket.connect" | "dns" | "dgram";
   readonly target: string;
 }
 
@@ -46,6 +56,35 @@ function describeTarget(input: unknown): string {
   if (input instanceof URL) return input.href;
   if (typeof Request !== "undefined" && input instanceof Request) return input.url;
   return "[unrecognised fetch input]";
+}
+
+/** A DNS function name the tripwire refuses (every query-making function). */
+const DNS_QUERY = /^(?:lookup|lookupService|resolve[A-Za-z0-9]*|reverse)$/u;
+
+interface Patched {
+  readonly target: Record<string, unknown>;
+  readonly key: string;
+  /** The original OWN descriptor, or `undefined` when the method was inherited. */
+  readonly original: PropertyDescriptor | undefined;
+}
+
+/**
+ * Replace `target[key]` with a refusing function, remembering how to restore
+ * it exactly (an inherited method is shadowed, then the shadow is deleted).
+ */
+function patch(patched: Patched[], target: Record<string, unknown>, key: string, refuse: (...args: unknown[]) => never): void {
+  patched.push({ target, key, original: Object.getOwnPropertyDescriptor(target, key) });
+  Object.defineProperty(target, key, { configurable: true, enumerable: true, writable: true, value: refuse });
+}
+
+function dnsQueryKeys(target: object): string[] {
+  const keys = new Set<string>();
+  for (let object: object | null = target; object !== null && object !== Object.prototype; object = Object.getPrototypeOf(object) as object | null) {
+    for (const key of Object.getOwnPropertyNames(object)) {
+      if (DNS_QUERY.test(key) && typeof (target as Record<string, unknown>)[key] === "function") keys.add(key);
+    }
+  }
+  return [...keys];
 }
 
 /**
@@ -94,6 +133,32 @@ export function installNetworkTripwire(options: { readonly responder?: FetchResp
     throw new NetworkTripwireError(`network tripwire: net.Socket.connect(${target}) refused`);
   };
 
+  const patched: Patched[] = [];
+  const dnsTargets: Record<string, unknown>[] = [
+    dns as unknown as Record<string, unknown>,
+    dns.promises as unknown as Record<string, unknown>,
+    dns.Resolver.prototype as unknown as Record<string, unknown>,
+    dns.promises.Resolver.prototype as unknown as Record<string, unknown>,
+  ];
+  for (const target of dnsTargets) {
+    for (const key of dnsQueryKeys(target)) {
+      patch(patched, target, key, (...args: unknown[]): never => {
+        const description = `${key}(${typeof args[0] === "string" ? args[0] : typeof args[0]})`;
+        refused.push({ via: "dns", target: description });
+        throw new NetworkTripwireError(`network tripwire: dns ${description} refused`);
+      });
+    }
+  }
+  const udpPrototype = dgram.Socket.prototype as unknown as Record<string, unknown>;
+  for (const key of ["send", "connect"]) {
+    patch(patched, udpPrototype, key, (...args: unknown[]): never => {
+      const description = `${key}(${args.map((arg) => (typeof arg === "string" || typeof arg === "number" ? String(arg) : typeof arg)).join(",")})`;
+      refused.push({ via: "dgram", target: description });
+      throw new NetworkTripwireError(`network tripwire: dgram ${description} refused`);
+    });
+  }
+  syncBuiltinESMExports();
+
   let installed = true;
   return {
     refused: () => [...refused],
@@ -108,6 +173,14 @@ export function installNetworkTripwire(options: { readonly responder?: FetchResp
         delete (globalThis as { WebSocket?: unknown }).WebSocket;
       }
       socketPrototype.connect = originalConnect;
+      for (const { target, key, original } of patched.reverse()) {
+        if (original === undefined) {
+          delete target[key];
+        } else {
+          Object.defineProperty(target, key, original);
+        }
+      }
+      syncBuiltinESMExports();
     },
   };
 }

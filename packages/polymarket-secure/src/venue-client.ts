@@ -110,10 +110,19 @@ export const MAX_CANCEL_IDS_PER_REQUEST = 1_000;
 export interface SecureVenueClient {
   readonly identity: VenueAccountIdentity;
   /**
-   * Create and sign an order LOCALLY. Nothing is transmitted (ADR-007 §2
-   * step 2). The SDK's signed order is checked against the request (token,
-   * side, post-only, expiration and order type, and amounts within the pinned
-   * SDK's round-down precision) before it is wrapped; a mismatch is `FAILED`.
+   * Create and sign an order LOCALLY. The ORDER is never transmitted here
+   * (ADR-007 §2 step 2), but the pinned SDK's `prepareLimitOrder` does make
+   * PUBLIC, unauthenticated reads to build it (market metadata and tick size,
+   * `actions/orders/cache.ts`), so a `FAILED` outcome can carry an
+   * HTTP-derived kind (a transport failure, a 429). Whatever its kind or
+   * effect, a `FAILED` sign outcome means NO ORDER EXISTS: nothing was signed
+   * that the caller can hold, so nothing can have been posted.
+   *
+   * The SDK's signed order is checked against the request (token, side,
+   * post-only, expiration and order type, and amounts within the pinned
+   * SDK's round-down precision) and against the client's account (maker,
+   * signer and signature type as the pinned SDK derives them, and zero
+   * `builder` and `metadata`) before it is wrapped; a mismatch is `FAILED`.
    */
   createLimitOrder(request: LimitOrderRequest): Promise<SignOutcome>;
   /** Transmit a previously signed order (ADR-007 §2 step 5). */
@@ -193,6 +202,31 @@ function readList(value: unknown, max: number): ListReading {
   return reading ?? refused(1);
 }
 
+/**
+ * Copy a batch response's entries from its own DATA properties into a fresh
+ * plain array of exactly `expected` slots. A non-array, a length other than
+ * `expected`, or any reflection failure leaves EVERY slot `undefined`; a hole
+ * or an accessor leaves ITS slot `undefined`. An `undefined` slot maps to an
+ * UNKNOWN (`UNRECOGNISED_RESPONSE`) outcome: the order may exist and must be
+ * reconciled. No method of the foreign array (`map`, an iterator, a species
+ * constructor) runs, and nothing thrown by a trap escapes.
+ */
+function readResponseEntries(value: unknown, expected: number): readonly unknown[] {
+  const entries: unknown[] = new Array<unknown>(expected).fill(undefined);
+  const copied = contained((): boolean => {
+    if (!Array.isArray(value)) return false;
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    const length: unknown = lengthDescriptor !== undefined && "value" in lengthDescriptor ? lengthDescriptor.value : undefined;
+    if (length !== expected) return false;
+    for (let index = 0; index < expected; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      entries[index] = descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+    }
+    return true;
+  });
+  return copied === true ? entries : new Array<unknown>(expected).fill(undefined);
+}
+
 /** The validated request, kept in this package's own terms for the cross-check. */
 interface ValidatedLimitOrder {
   readonly assetId: string;
@@ -269,6 +303,43 @@ function rational(decimal: string): { readonly numerator: bigint; readonly denom
 function roundedDownFrom(actual: bigint, numerator: bigint, denominator: bigint, granularity: bigint): boolean {
   const scaled = actual * denominator;
   return scaled <= numerator && numerator - scaled < granularity * denominator;
+}
+
+/** `bytes32(0)`: the pinned SDK's `builder` and `metadata` when no builder code is given (this package never gives one). */
+const BYTES32_ZERO = `0x${"0".repeat(64)}`;
+/** The pinned SDK's `SignatureType.POLY_1271`, used for `WalletType.DEPOSIT_WALLET` (= 3). */
+const SIGNATURE_TYPE_POLY_1271 = 3;
+
+/**
+ * Is the signed order's maker/signer/signature type the one the pinned SDK
+ * derives from the client's account? From `@polymarket/client@0.11.0`
+ * (`Tr` / `Ee` in its bundle): `signatureType` is the account's `walletType`
+ * (EOA 0, POLY_PROXY 1, GNOSIS_SAFE 2, DEPOSIT_WALLET 3 map to signature
+ * types 0, 1, 2, 3); `maker` is the account's `wallet`; `signer` is the
+ * `wallet` for signature type 3 (POLY_1271) and the account's `signer`
+ * otherwise. Addresses compare case-insensitively (an EVM address is a
+ * number). Anything else fails closed.
+ */
+function signedOrderMatchesAccount(identity: SignedOrderEnvelope["identity"], account: VenueAccountIdentity): boolean {
+  const same = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+  if (!Number.isInteger(account.walletType) || account.walletType < 0 || account.walletType > 3) return false;
+  if (identity.signatureType !== account.walletType) return false;
+  if (!same(identity.maker, account.walletAddress)) return false;
+  const expectedSigner = identity.signatureType === SIGNATURE_TYPE_POLY_1271 ? account.walletAddress : account.signerAddress;
+  return same(identity.signer, expectedSigner);
+}
+
+/** `builder` and `metadata` must be `bytes32(0)`: this package never asks for a builder code or metadata. */
+function signedOrderHasNoAttribution(envelope: SignedOrderEnvelope): boolean {
+  const payload = envelope.revealPayloadForEncryptedPersistence();
+  const builder = payload["builder"];
+  const metadata = payload["metadata"];
+  return (
+    typeof builder === "string" &&
+    builder.toLowerCase() === BYTES32_ZERO &&
+    typeof metadata === "string" &&
+    metadata.toLowerCase() === BYTES32_ZERO
+  );
 }
 
 /** Does the SDK's signed order say what the caller asked for? */
@@ -350,7 +421,10 @@ class SdkBackedSecureVenueClient implements SecureVenueClient {
       const envelope = SignedOrderEnvelope.fromSdkSignedOrder(signed);
       // A signed order outside the pinned shape, or one that does not say
       // what was asked, is never handed out (it is not transmitted either).
-      return envelope === undefined || !signedOrderMatchesRequest(envelope.identity, validated)
+      return envelope === undefined ||
+        !signedOrderMatchesRequest(envelope.identity, validated) ||
+        !signedOrderMatchesAccount(envelope.identity, this.identity) ||
+        !signedOrderHasNoAttribution(envelope)
         ? Object.freeze({ kind: "FAILED", error: mapVenueError(undefined, operation) })
         : Object.freeze({ kind: "SIGNED", order: envelope });
     } catch (error) {
@@ -378,10 +452,15 @@ class SdkBackedSecureVenueClient implements SecureVenueClient {
     const envelopes = list.items as readonly SignedOrderEnvelope[];
     try {
       const responses: unknown = await this.port().postOrders(envelopes.map((envelope) => SignedOrderEnvelope.toSdkSignedOrder(envelope)));
-      if (!Array.isArray(responses) || responses.length !== envelopes.length) {
-        return Object.freeze(envelopes.map(() => mapOrderResponse(undefined)));
+      // The response array is FOREIGN: none of its methods, iterators or
+      // species is ever used. Its entries are copied into a fresh plain array,
+      // one per SUBMITTED position, and anything unreadable is UNKNOWN.
+      const entries = readResponseEntries(responses, envelopes.length);
+      const outcomes: PlacementOutcome[] = [];
+      for (let index = 0; index < envelopes.length; index += 1) {
+        outcomes.push(mapOrderResponse(entries[index]));
       }
-      return Object.freeze((responses as unknown[]).map((response) => mapOrderResponse(response)));
+      return Object.freeze(outcomes);
     } catch (error) {
       const outcome = placementOutcomeFromError(mapVenueError(error, operation));
       return Object.freeze(envelopes.map(() => outcome));

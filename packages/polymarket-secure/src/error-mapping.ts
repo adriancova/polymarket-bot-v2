@@ -14,12 +14,21 @@
  *    different strings for the same cancel-only/disabled condition (C-9), and
  *    its codes are examples, not an enumeration (U-4).
  * 3. Only own DATA properties of the SDK error are read (`status`, `code`,
- *    `retryAfter`). A getter is never invoked.
+ *    `retryAfter`). A getter is never invoked. An own ACCESSOR `code` is not
+ *    "no code": it is a code that is present but unreadable, and reads as an
+ *    undocumented code (so the effect is `UNKNOWN`, rule 4).
  * 4. `NOT_APPLIED` (a documented refusal) is given ONLY to the exact
- *    documented pairs: 425, 429 or 401 with NO code, and 503 with
- *    `post_only_mode`. Any code on 425/429/401, documented or not, makes the
- *    effect `UNKNOWN` (ADR-007 §6: "an unrecognized code is surfaced as
- *    UNKNOWN and never ... silently treated as a rejection").
+ *    documented pairs: 425 or 401 with NO code (and a `RequestRejectedError`
+ *    429 with no code), and 503 with `post_only_mode`. Any code on
+ *    425/429/401, documented or not, makes the effect `UNKNOWN` (ADR-007 §6:
+ *    "an unrecognized code is surfaced as UNKNOWN and never ... silently
+ *    treated as a rejection").
+ * 4a. A `RateLimitError` is ALWAYS effect `UNKNOWN` (kind `RATE_LIMITED`, so
+ *    a caller still backs off). The pinned SDK throws it for EVERY 429
+ *    BEFORE it reads the response body (`ServiceClient`: `if (status === 429)
+ *    throw new RateLimitError(...)` precedes the body parse), so the venue's
+ *    code, if any, is discarded and "no code" can never be established. This
+ *    is the only 429 the pinned SDK produces.
  * 5. Reflection is contained. `instanceof` and property descriptors can run
  *    foreign code (a proxy trap); if any of it throws, the result is a fresh
  *    `UNKNOWN` error, and the thrown value is dropped unread.
@@ -54,10 +63,23 @@ import {
   type SecureVenueErrorKind,
 } from "./errors.js";
 
-/** Read an own data property without invoking a getter. */
+/** Read an own data property without invoking a getter (an accessor reads as `undefined`). */
 function ownData(target: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(target, key);
   return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+/**
+ * The venue code of an SDK error, read from its own DATA property. An own
+ * ACCESSOR is present but unreadable (the getter is never invoked): it reads
+ * as an undocumented code, never as "no code".
+ */
+function ownCode(target: object): CodeReading {
+  const descriptor = Object.getOwnPropertyDescriptor(target, "code");
+  if (descriptor !== undefined && !("value" in descriptor)) {
+    return { venueCode: null, undocumentedVenueCode: true };
+  }
+  return codeOf(descriptor?.value);
 }
 
 function httpStatusOf(value: unknown): number | null {
@@ -177,12 +199,16 @@ function classifyThrown(error: unknown, operation: SecureOperation): SecureVenue
   } as const;
 
   if (error instanceof RateLimitError) {
-    // The pinned `RateLimitError` has no `code` field; if one is ever
-    // present it is treated like a code on any 429 (rule 4).
-    const code = codeOf(ownData(error, "code"));
+    // Rule 4a: the pinned SDK discarded the body, so whether the venue sent a
+    // code is unknowable; the effect is UNKNOWN whatever this object carries.
+    // A code that IS present is still recorded the usual way (documented
+    // value, or the bare fact that an undocumented one was there).
+    const code = ownCode(error);
     return new SecureVenueError({
       ...base,
-      ...classifyHttpRejection(429, code),
+      kind: "RATE_LIMITED",
+      effect: "UNKNOWN",
+      cancelsAvailable: null,
       ...code,
       httpStatus: 429,
       retryAfterSeconds: retryAfterOf(ownData(error, "retryAfter")),
@@ -191,7 +217,7 @@ function classifyThrown(error: unknown, operation: SecureOperation): SecureVenue
   }
   if (error instanceof RequestRejectedError) {
     const status = httpStatusOf(ownData(error, "status"));
-    const code = codeOf(ownData(error, "code"));
+    const code = ownCode(error);
     return new SecureVenueError({
       ...base,
       ...classifyHttpRejection(status, code),
