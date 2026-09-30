@@ -3,15 +3,23 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Secure unified-SDK adapter and signer boundary (WP-260). The ONLY package that may import @polymarket/client. PAPER-only: ships an interface, a run-mode-gated factory and a test-only mock signer; no real signer, key or credential.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/contract/polymarket-secure/tsconfig.json",
+    "test:contract": "vitest run --config ../../test/contract/polymarket-secure/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket/client": "0.11.0"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
