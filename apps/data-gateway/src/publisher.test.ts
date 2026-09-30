@@ -584,3 +584,96 @@ describe("GatewayPublisher — a transport without publishBatch (per-envelope pa
     expect(memory.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1"]);
   });
 });
+
+/**
+ * `THROUGHPUT-2` (ADR-024) — frame-atomic runs. The trader's feed can tell a
+ * venue frame is complete without waiting on the next event only if every
+ * envelope of one raw frame (one `causationId`) reaches the stream in ONE
+ * transport call. These pin the two rules in the publisher's header.
+ */
+describe("GatewayPublisher — frame-atomic runs (THROUGHPUT-2)", () => {
+  const frameOf = (causation: string, ...seqs: string[]): EventEnvelope<unknown>[] =>
+    seqs.map((seq) => ({ ...envelopeAt(seq), causationId: `raw:${EPOCH}:${causation}` }));
+
+  it("an idle pump waits one microtask on a frame-named envelope: a frame admitted in one turn is ONE call", async () => {
+    const { transport, publisher } = build();
+    // Dispatched as the gateway dispatches one raw frame: synchronously, in one turn.
+    const outcomes = frameOf("10", "11", "12", "13").map((envelope) => publisher.enqueue(envelope));
+    await Promise.all(outcomes);
+    expect(transport.batchCalls).toBe(1);
+    expect(publisher.metrics()).toMatchObject({ submissions: 1, largestSubmission: 3, published: 3 });
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["11", "12", "13"]);
+  });
+
+  it("non-vacuous: envelopes WITHOUT a causationId still start the pump synchronously (the first goes alone)", async () => {
+    const { transport, publisher } = build();
+    const outcomes = ["1", "2", "3"].map((seq) => publisher.enqueue(envelopeAt(seq)));
+    await Promise.all(outcomes);
+    expect(transport.batchCalls).toBe(2);
+    expect(publisher.metrics()).toMatchObject({ submissions: 2, largestSubmission: 2, published: 3 });
+  });
+
+  it("a run is never cut inside a frame: the envelope bound ends a run only at a frame boundary", async () => {
+    const { transport, publisher } = build({ maxBatchEnvelopes: 2 });
+    transport.stallPublishes();
+    const held = publisher.enqueue(envelopeAt("1"));
+    // Behind the held envelope: a frame of three, a frame of two, a frame of three.
+    const queued = [...frameOf("2", "3", "4", "5"), ...frameOf("6", "7", "8"), ...frameOf("9", "10", "11", "12")].map(
+      (envelope) => publisher.enqueue(envelope),
+    );
+    transport.resumePublishes();
+    await Promise.all([held, ...queued]);
+    // [1], then [3,4,5] (grown past 2 to finish its frame), [7,8], [10,11,12].
+    expect(transport.batchCalls).toBe(4);
+    expect(publisher.metrics()).toMatchObject({ submissions: 4, largestSubmission: 3, published: 9 });
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual([
+      "1", "3", "4", "5", "7", "8", "10", "11", "12",
+    ]);
+  });
+
+  it("the byte bound, too, ends a run only at a frame boundary", async () => {
+    const oneEnvelopeBytes = JSON.stringify(frameOf("2", "3")[0]).length;
+    const { transport, publisher } = build({ maxBatchBytes: oneEnvelopeBytes + 1 });
+    transport.stallPublishes();
+    const held = publisher.enqueue(envelopeAt("1"));
+    const queued = frameOf("2", "3", "4", "5").map((envelope) => publisher.enqueue(envelope));
+    transport.resumePublishes();
+    await Promise.all([held, ...queued]);
+    expect(publisher.metrics()).toMatchObject({ submissions: 2, largestSubmission: 3, published: 4 });
+  });
+
+  it("a frame beyond FRAME_RUN_MAX_ENVELOPES is the one case that splits, at that bound", async () => {
+    const { FRAME_RUN_MAX_ENVELOPES } = await import("./publisher.js");
+    const { transport, publisher } = build({ maxQueueDepth: 4_096, maxQueueBytes: 64 * 1024 * 1024 });
+    const seqs = Array.from({ length: FRAME_RUN_MAX_ENVELOPES + 5 }, (_, index) => String(index + 1));
+    const outcomes = frameOf("0", ...seqs).map((envelope) => publisher.enqueue(envelope));
+    await Promise.all(outcomes);
+    expect(transport.batchCalls).toBe(2);
+    expect(publisher.metrics()).toMatchObject({
+      submissions: 2,
+      largestSubmission: FRAME_RUN_MAX_ENVELOPES,
+      published: FRAME_RUN_MAX_ENVELOPES + 5,
+    });
+  });
+
+  it("without the batch capability nothing changes: one envelope per call, even inside a frame", async () => {
+    const memory = new MemoryEventTransport();
+    const publisher = new GatewayPublisher({
+      transport: {
+        transportId: memory.transportId,
+        retention: memory.retention,
+        publish: (stream, envelope) => memory.publish(stream, envelope),
+        subscribe: (options) => memory.subscribe(options),
+        streamMetrics: (stream) => memory.streamMetrics(stream),
+        close: () => memory.close(),
+      },
+      stream: "market",
+      clock: new ManualGatewayClock(),
+    });
+    const outcomes = frameOf("0", "1", "2", "3").map((envelope) => publisher.enqueue(envelope));
+    await Promise.all(outcomes);
+    expect(memory.batchCalls).toBe(0);
+    expect(memory.publishCalls).toBe(3);
+    expect(memory.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3"]);
+  });
+});
