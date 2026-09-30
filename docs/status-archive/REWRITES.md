@@ -346,7 +346,7 @@ New:
 Last updated: 2026-09-30 (content as of `8fde4df`; restructured by LOGS-1)  
 ~~~
 
-**Facts.** The date is refreshed to the restructure date, 2026-09-30. The old header date (2026-09-15) was stale: the file holds records dated up to 2026-09-30. "content as of `8fde4df`" names the cut: the first cut was `f43efe6`, and the archive was re-cut at `8fde4df` when LOGS-1 merged.
+**Facts.** The date is refreshed to the restructure date, 2026-09-30. The old header date (2026-09-15) was stale: the file holds records dated up to 2026-09-30. "content as of `8fde4df`" names the cut: the first cut was `f43efe6`, and the archive was re-cut at `8fde4df` for LOGS-1's pending merge.
 
 ## RW-02: Header: current phase (line 5) -> Current phase
 
@@ -370,7 +370,7 @@ New:
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** item 1 stays OPEN until a fresh closeout grades it. Items 4 and 5 stay NOT MET on their human halves: H1, the live-data paper run, and H3, the dashboards' infrastructure.
-- **Next:** H1 run 2, then the fresh read-only closeout audit (after H1 and H3). `THROUGHPUT-2` has merged (`7d59fd3`), below its throughput targets.
+- **Next:** H1 run 2, then the fresh read-only closeout audit (after H1 and H3). `THROUGHPUT-2` is Complete (`7d59fd3`), but it missed its throughput targets.
 - **Deferred:** `WP-260` and the eight remaining phase-3 packages wait for Wave 3 ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
 ~~~
@@ -870,7 +870,7 @@ Old, lines 2607-2607:
 | **H1R1-FRAME-ATOMICITY** | Every venue market-channel frame in the H1 burst produced exactly TWO `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames), and the trader evaluates after EACH. So half of all evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) would be truer and halve the work, but it changes "one decision per event" (WP-170's exactly-one-decision criteria) | `docs/handoffs/H1-RUN-1.md` finding 2 | **RULED 2026-09-30** (the user): `THROUGHPUT-2` evaluates once per frame |
 ~~~
 
-**Facts.** Kept: two events per frame, one per token; 85,547 events from 42,774 frames; the half-applied book; once per `causationId`; the WP-170 criterion it changes; the 2026-09-30 ruling and what it ruled (`THROUGHPUT-2` evaluates once per frame). Archive only: the evidence cite (`H1-RUN-1.md` finding 2). Until the re-cut it was carried as open, because the ruled fix was in flight in `THROUGHPUT-2`. At `8fde4df` `THROUGHPUT-2` is Complete (`7d59fd3`): on the H1 burst all 42,955 half-applied-state decisions are gone. So the brief moves the id to the closed list under Residual queue, and this entry has no new block.
+**Facts.** Kept: two events per frame, one per token; 85,547 events from 42,774 frames; the half-applied book; once per `causationId`; the WP-170 criterion it changes; the 2026-09-30 ruling and what it ruled (`THROUGHPUT-2` evaluates once per frame). Archive only: the evidence cite (`H1-RUN-1.md` finding 2). Until the re-cut it was carried as open, because the ruled fix was in flight in `THROUGHPUT-2`. At `8fde4df` `THROUGHPUT-2` is Complete (`7d59fd3`): on the H1 burst all 42,955 half-applied-state decisions are gone. So the brief moves the id to the closed list under Residual queue, and this entry has no new block. The closed-list entry carries the closure's two qualifiers: ADR-024 is accepted only provisionally, pending the user's ratification, and its D2 exception still evaluates a stream prefix truncated inside a frame once, half-applied, before the trader halts.
 
 ## RW-20: Residual `OUT1-R1-HALT-NOT-DURABLE`
 
@@ -1234,7 +1234,7 @@ Old, lines 2513-2513:
 New:
 
 ~~~new
-| `TRDR4-CITES` | `test/unit/control-api/response-encoder-bound.test.ts` cites stale lines `health-door.ts:181` and `:77`. At `f43efe6` they are `:301` (`readTraderHealthReport`) and `:83` (the first `z.record(`). Its "one `z.record(`" wording is stale too: `FOLD-1` found that the door now nests records two levels deeper, to a fixed depth. | the next round touching `test/unit/control-api/**` (documentation only) |
+| `TRDR4-CITES` | `test/unit/control-api/response-encoder-bound.test.ts` cites stale lines `health-door.ts:181` and `:77`. At `8fde4df` they are `:301` (`readTraderHealthReport`) and `:83` (the first `z.record(`). Its "one `z.record(`" wording is stale too: `FOLD-1` found that the door now nests records two levels deeper, to a fixed depth. | the next round touching `test/unit/control-api/**` (documentation only) |
 ~~~
 
 Keep (in both texts):
@@ -1244,7 +1244,7 @@ response-encoder-bound.test.ts
 (documentation only)
 ~~~
 
-**Facts.** Kept: the test file, both drifted cites, and the documentation-only owner. r7 gives the cites' lines at `f43efe6` (`:301` and `:83`); the row's `:242` and `:82` were the lines at `TRDR-4`'s time (verifier finding D3). r7 drops "The claim itself still holds": `docs/handoffs/FOLD-1.md` line 261 found the "one `z.record(`" wording stale, because the door now nests records. Archive only: "(`:181` had already drifted at base)".
+**Facts.** Kept: the test file, both drifted cites, and the documentation-only owner. r7 gives the cites' lines at `f43efe6` (`:301` and `:83`); the re-cut pins them at `8fde4df`, where `health-door.ts` is unchanged, so the lines are the same. The row's `:242` and `:82` were the lines at `TRDR-4`'s time (verifier finding D3). r7 drops "The claim itself still holds": `docs/handoffs/FOLD-1.md` line 261 found the "one `z.record(`" wording stale, because the door now nests records. Archive only: "(`:181` had already drifted at base)".
 
 ## RW-35: Residual `RISK2-R1`: closed before the cut (r7)
 
@@ -2321,7 +2321,7 @@ New:
 
 ~~~new
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
-Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `H1R1-FRAME-ATOMICITY` (closed by `THROUGHPUT-2`, `7d59fd3`: it evaluates once per frame), `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
+Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `H1R1-FRAME-ATOMICITY` (closed by `THROUGHPUT-2`, `7d59fd3`: it evaluates once per frame. ADR-024 is accepted provisionally, pending the user's ratification. Its D2 exception remains: a stream prefix truncated inside a frame, a corruption path, is evaluated once, half-applied, and the trader then halts), `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
 ~~~
 
 Keep (in both texts):
@@ -4517,7 +4517,7 @@ The user ratifies afterwards, and a rejection is reverted by a follow-up round.
 New:
 
 ~~~new
-- `THROUGHPUT-2`: **the targets were NOT met** (943 events/s, 5 s). Throughput rose 1.4×, to 764–808 events/s; the paced max lag was 9–38 s (median about 19 s; base about 45 s). The ranked options are in the record. ADR-024 is **accepted provisionally**, pending the user's ratification; a rejection is reverted by a follow-up round.
+- `THROUGHPUT-2`: **the targets were NOT met** (943 events/s, 5 s). Throughput rose 1.4×, to 764–808 events/s; the paced max lag was 9–38 s (median about 19 s; base about 45 s). The ranked options are in the record, and so are the review's two LOWs, `TP2-R2-L1` and `TP2-R2-L2`. ADR-024 is **accepted provisionally**, pending the user's ratification; a rejection is reverted by a follow-up round.
 - **ADR-024** (`THROUGHPUT-2`): accepted provisionally on 2026-09-30, pending the user's ratification.
 ~~~
 
@@ -4532,7 +4532,7 @@ ADR-024 is accepted provisionally, pending the user's ratification
 a rejection is reverted by a follow-up round
 ~~~
 
-**Facts.** `THROUGHPUT-2` went Complete on `main` after the first cut (`d2ab6dc`), so it is declared at the re-cut. Its row names two live items: the missed throughput targets, and ADR-024's provisional acceptance. Both are carried under "Residuals recorded in Complete package rows", with the measured range (1.4×, 764–808 events/s; paced max lag 9–38 s, median about 19 s, base about 45 s) and the targets (943 events/s, 5 s). The ratification is also a Human items bullet. The row's correctness result (all 42,955 half-applied-state decisions gone, the 46,666 remaining equal to base) closes `H1R1-FRAME-ATOMICITY` (RW-19). The merge (`7d59fd3`) and the record link are in the Work packages row (RW-07). Not carried: the chain (`6be3eae` → `3b3f752`), the review findings, the CI run (PR #27 run `36686967040`) and the superseded authorization text, which are history in `work-packages-rounds.md`.
+**Facts.** `THROUGHPUT-2` went Complete on `main` after the first cut (`d2ab6dc`), so it is declared at the re-cut. Its row names two live items: the missed throughput targets, and ADR-024's provisional acceptance. Both are carried under "Residuals recorded in Complete package rows", with the measured range (1.4×, 764–808 events/s; paced max lag 9–38 s, median about 19 s, base about 45 s) and the targets (943 events/s, 5 s). The ratification is also a Human items bullet. The row's correctness result (all 42,955 half-applied-state decisions gone, the 46,666 remaining equal to base) closes `H1R1-FRAME-ATOMICITY` (RW-19). The merge (`7d59fd3`) and the record link are in the Work packages row (RW-07). The brief points to the review's two LOWs, `TP2-R2-L1` and `TP2-R2-L2`, which the record carries to its follow-up. Not carried: the chain (`6be3eae` → `3b3f752`), the review findings' text, the CI run (PR #27 run `36686967040`) and the superseded authorization text, which are history in `work-packages-rounds.md`.
 
 ## RW-144: Complete row `VENUE-3` (re-cut at `8fde4df`)
 
@@ -4599,7 +4599,7 @@ New:
 - **`LOGS-1`**: Ready (authorized) by the user, 2026-09-30; now in merge.
   - Goal: make this file a brief. Historical records are evidence, so they move verbatim to `docs/status-archive/` and are never rewritten. It adds `docs/handoffs/INDEX.md`, a writing standard (`docs/handoffs/README.md`) and a committed preservation proof (`tools/records/`).
   - Base `f43efe6`. At merge, the orchestrator re-applies every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`: this re-cut is at `8fde4df`.
-  - Gate: a review of the preservation, and a green CI run on GitHub.
+  - Gate: a Fable review of the preservation, and a green CI run on GitHub.
 ~~~
 
 Keep (in both texts):
@@ -4607,10 +4607,11 @@ Keep (in both texts):
 ~~~keep
 historical records are evidence
 a committed preservation proof
+Fable review
 re-applies every governance edit made on main since f43efe6, using MOVE-MAP.md
 ~~~
 
-**Facts.** The `LOGS-1` row was added on `main` after the first cut (`8fc0eb1`), so it is paired at the re-cut. Kept: Ready (authorized) 2026-09-30, now in merge; the design (historical records move verbatim and are never rewritten; this file becomes the brief; the handoff index and writing standard; a committed preservation proof); base `f43efe6`; the re-application of every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`; the gate (a preservation review and a green CI run). Not carried: the user's quoted words, the loop id `wf_57d03812-d59`, the audit-implementer-reviewer order, and the allowed and forbidden paths (the archived row).
+**Facts.** The `LOGS-1` row was added on `main` after the first cut (`8fc0eb1`), so it is paired at the re-cut. Kept: Ready (authorized) 2026-09-30, now in merge; the design (historical records move verbatim and are never rewritten; this file becomes the brief; the handoff index and writing standard; a committed preservation proof); base `f43efe6`; the re-application of every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`; the gate, with its reviewer (the base's "Fable review (preservation) + green CI": a Fable review of the preservation, and a green CI run on GitHub). Not carried: the user's quoted words, the loop id `wf_57d03812-d59`, the audit-implementer-reviewer order, and the allowed and forbidden paths (the archived row).
 
 ## RW-146: Residual `V3-C13-REFERENCE-TWAP` (added after the first cut; re-cut at `8fde4df`)
 
@@ -4653,7 +4654,7 @@ Old, lines 2624-2624 of the re-cut `8fde4df`:
 New:
 
 ~~~new
-| `V3-E15-DATA-API-V1-SUNSET` | The Data API v1 shuts down 2026-10-24. `WP-290` (reconciliation) and `WP-330` (the ops CLI) must use the `/v2` routes. Whether any current code calls v1 is not yet checked. | the `WP-290` and `WP-330` packets; the orchestrator greps for v1 use before 2026-10-24 |
+| `V3-E15-DATA-API-V1-SUNSET` | The Data API v1 shuts down 2026-10-24. `WP-290` (reconciliation) and `WP-330` (the ops CLI) must use the `/v2` routes. Check whether any current code calls v1. | the `WP-290` and `WP-330` packets; the orchestrator greps for v1 use before 2026-10-24 |
 ~~~
 
 Keep (in both texts):
@@ -4664,7 +4665,7 @@ Data API v1 shuts down
 must use the /v2 routes
 ~~~
 
-**Facts.** Added on `main` by `9d270a9` (from `VENUE-3`). Kept: the shutdown date, both packages and their `/v2` obligation, the unchecked v1 use, and the orchestrator's grep before the date. Archive only: the evidence cite (E-15).
+**Facts.** Added on `main` by `9d270a9` (from `VENUE-3`). Kept: the shutdown date, both packages and their `/v2` obligation, the instruction to check whether any current code calls v1 (kept as an instruction, not a status), and the orchestrator's grep before the date. Archive only: the evidence cite (E-15).
 
 ## RW-148: Residual `V3-C12-HEARTBEAT-ADR` (added after the first cut; re-cut at `8fde4df`)
 

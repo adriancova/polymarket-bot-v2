@@ -64,6 +64,10 @@ K35 the archive README describes K31 as regression checks for exactly len(CLOSED
 K36 carried qualifiers (r8): each CARRIED_FACTS rule names a brief row or bullet (by its line prefix),
     the words it must hold, and the source text that states the fact AT THE CUT; if the source text
     is gone, the rule fails too. Like K31, it is a fixed list, not a detector.
+K37 re-cut consistency (LOGS-1-RECUT r1): in a section whose intro says its citations are "as of
+    `<sha>`", no line that cites a file line pins another commit ("at `<other>`") unless it says the
+    file is "unchanged" there; and RECUT_REFUSED, a fixed list of wordings review refused at the
+    re-cut (brief or REWRITES.md), does not come back.
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
 records" subsections. K21 also requires C16, refuses the claim "so a partial carry fails" in
 REWRITES.md and the archive README, and requires both to say reviewers check the rest of a clause.
@@ -165,6 +169,31 @@ CARRIED_FACTS = [
     ("WP-250 F2: the replay-determinism panel's named owner (CX-R8-02)", "- `WP-250`:",
      ["`packages/simulation`", "`apps/backtest-cli`"],
      "packages/observability/src/control/dashboards.ts", "a future packages/simulation or apps/backtest-cli grant"),
+    # LOGS-1-RECUT r1
+    ("LOGS-1's gate names its reviewer, Fable (CX-RECUT-01)", "  - Gate: a Fable",
+     ["Fable review", "preservation", "green CI run on GitHub"],
+     "IMPLEMENTATION_STATUS.md", "Fable review (preservation) + green CI"),
+    ("H1R1-FRAME-ATOMICITY's closure carries ADR-024's qualifiers (L1)", "Closed, done or ruled",
+     ["accepted provisionally", "ratification", "D2 exception", "half-applied"],
+     "docs/adr/ADR-024-evaluate-once-per-venue-frame.md", "evaluated once, half-applied"),
+    ("Wave 3's second condition is the CLOSED grade, not the audit (L3)", "- Wave 3 is authorized",
+     ["must grade Wave 2 CLOSED"],
+     "IMPLEMENTATION_STATUS.md", "grades Wave 2 CLOSED"),
+    ("V3-E15 keeps the imperative check (L3)", "| `V3-E15-DATA-API-V1-SUNSET` |",
+     ["Check whether any current code calls v1."],
+     "IMPLEMENTATION_STATUS.md", "Check whether any current code calls v1"),
+    ("the THROUGHPUT-2 bullet points to the review's two LOWs (L4)", "- `THROUGHPUT-2`:",
+     ["`TP2-R2-L1`", "`TP2-R2-L2`"],
+     "docs/handoffs/THROUGHPUT-2.md", "TP2-R2-L2"),
+]
+# K37: (label, path, refused wording)
+RECUT_REFUSED = [
+    ("LOGS-1's gate without its reviewer (CX-RECUT-01)", "IMPLEMENTATION_STATUS.md", "Gate: a review of the preservation"),
+    ("RW-145's Facts without the reviewer (CX-RECUT-01)", "docs/status-archive/REWRITES.md", "the gate (a preservation review and a green CI run)"),
+    ("RW-01 says LOGS-1 merged while it is in merge (CX-RECUT-02)", "docs/status-archive/REWRITES.md", "when LOGS-1 merged"),
+    ("'has merged ..., below its throughput targets' (L3)", "IMPLEMENTATION_STATUS.md", "below its throughput targets"),
+    ("V3-E15 as a status claim (L3)", "IMPLEMENTATION_STATUS.md", "calls v1 is not yet checked"),
+    ("the audit, not its grade, as Wave 3's condition (L3)", "IMPLEMENTATION_STATUS.md", "closeout audit is the other"),
 ]
 # K33: every file:line citation in the brief, checked at the cut.
 # (literal as it occurs in the brief, [(path, first line, last line, needle)]); first line None = a
@@ -536,6 +565,25 @@ def main() -> int:
         missing = [w for w in words if w not in hits[0]]
         if missing:
             fails.append(f"K36: {label}: the brief line {prefix!r} lacks {', '.join(repr(w) for w in missing)}")
+    # K37
+    cite = re.compile(r"[\w./-]+\.(?:ts|md|yaml|yml|json|sql|py|mjs):\d+|`:\d+`")
+    sec, pin = None, None
+    for n, l in enumerate(lines, 1):
+        if re.match(r"^#{2,3} ", l):
+            sec, pin = l, None
+            continue
+        m = re.search(r"as of `([0-9a-f]{7,40})`", l)
+        if m and pin is None:
+            pin = m.group(1)
+            continue
+        if pin and cite.search(l):
+            for o in re.findall(r"\b[Aa]t `([0-9a-f]{7,40})`", l):
+                if not (o.startswith(pin) or pin.startswith(o)) and "unchanged" not in l:
+                    fails.append(f"K37: line {n}: {sec!r} pins its citations as of `{pin}`, but this line pins `{o}`")
+    for label, rel, bad in RECUT_REFUSED:
+        text = brief if rel == "IMPLEMENTATION_STATUS.md" else read(root, rel)
+        if bad in text:
+            fails.append(f"K37: {label}: {rel} has {bad!r} again")
     # K25
     sec, sec_lines = None, []
     def k25(sec, sec_lines):

@@ -67,6 +67,7 @@ repository root.
   - K31 is a set of regression checks for 17 specific closures that review found. Each rule reads its evidence at the cut. K31 is not a detector: an item closed before the cut that no rule names still passes.
   - K32 checks the pending dashboard panels against the code. K33 checks every file:line citation in the brief against the file at the cut. K34 checks that the brief names every id still in `BINANCE_UNVERIFIED`.
   - K36 checks that facts review found dropped are carried: each rule names a brief row or bullet, the words it must hold, and the source text at the cut.
+  - K37 checks that a section's file:line citations are pinned to the commit its intro names, unless a line says the file is unchanged there. It also refuses a fixed list of wordings that review refused at the re-cut.
 - `python3 tools/records/selftest-preservation.py` shows the proofs are not vacuous: it mutates a scratch copy, including a synthetic re-cut, and checks that each mutation fails and each re-cut passes.
 
 ## Re-cutting after edits on `main`
