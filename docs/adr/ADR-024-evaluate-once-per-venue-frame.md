@@ -337,6 +337,14 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
   | base, paced | 566.1 | 1,776 | 89,621 | 44.46 s | 44.04 s | none |
   | candidate, paced | 709.0 | 1,366 | 46,666 | 9.26 s | 8.83 s | none |
 
+  Base `bf1ee89`, candidate `ead59be`. A second session at the final tip
+  (`510ba20`, whose product code differs only by an equivalent loop in the
+  feed adapter), with base re-run beside it: catch-up 545.6 → 764.4 events/s
+  (1,866 → 1,402 µs/event), paced max lag 48.6 s → 11.8 s (p99 48.3 → 11.5 s).
+  The host is shared and was about 5% slower in that session; the ratio is the
+  same (~1.4×). Decision and checkpoint content at the tip equals the first
+  session's, in both modes.
+
   The targets (catch-up ≥ 943 events/s, paced max lag ≤ 5 s) are NOT met;
   the remaining cost is outside this package's paths (feature-input
   validation and serialization, the decimal guard, strategy-runtime view
