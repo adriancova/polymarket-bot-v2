@@ -239,24 +239,27 @@ describe("WP300-R2-01: a ledger refresh clears balances the complete snapshot no
 // ----------------------------------------------------------------- R2-02 --
 
 describe("WP300-R2-02: uncertainty observed during submission is reconciled at once and never discarded", () => {
-  it("UNKNOWN while the executor is pending: reconciliation is requested immediately, without the executor answering", () => {
+  it("UNKNOWN while the executor is pending: reconciliation is requested immediately, without the executor answering", async () => {
     const answer = deferred<unknown>();
     const { book, manager, reconciler } = harness(() => answer.promise);
     manager.plan(split("s", "10"));
-    void manager.submit("s");
+    const submitting = manager.submit("s");
     const observed = manager.observe("s", { status: "UNKNOWN" });
     expect(observed.ok).toBe(true);
     expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", submitting: true });
     expect(reconciler.requests).toEqual([expect.objectContaining({ trigger: "WALLET_OPERATION_UNKNOWN", walletOperationId: "s" })]);
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
-    // Reconciliation may conclude CONFIRMED while the executor is still silent.
-    const resolved = manager.resolveByReconciliation("s", {
-      source: "AUTHORITATIVE_READ",
-      state: "CONFIRMED",
-      transactionHash: TX_A,
-      transactionId: null,
-    });
-    expect(resolved.ok).toBe(true);
+    // Since r3 (WP300-R3-02) no terminal conclusion is drawn while the executor
+    // is still silent: CONFIRMED is deferred like FAILED, and asked for again.
+    const evidence = { source: "AUTHORITATIVE_READ", state: "CONFIRMED", transactionHash: TX_A, transactionId: null };
+    const early = manager.resolveByReconciliation("s", evidence);
+    expect(early.ok).toBe(false);
+    if (!early.ok) expect(early.refusal.code).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
+    answer.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
+    await submitting;
+    expect(reconciler.requests).toHaveLength(2);
+    expect(manager.resolveByReconciliation("s", evidence).ok).toBe(true);
     expect(manager.operation("s")?.state).toBe("CONFIRMED");
   });
 
@@ -345,9 +348,11 @@ describe("WP300-R2-02: uncertainty observed during submission is reconciled at o
     manager.observe("s", { status: "DROPPED" });
     manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     expect(manager.operation("s")?.state).toBe("SUBMITTED");
-    // A FAILED observation is refused while the executor is still pending.
+    // A FAILED observation is not concluded while the executor is still pending
+    // (since r3 it is kept, unapplied, and weighed with the executor's answer).
     const failed = manager.observe("s", { status: "FAILED", transactionHash: TX_A });
-    expect(failed.ok).toBe(false);
+    expect(failed.ok && failed.value).toMatchObject({ state: "SUBMITTED", bufferedObservations: 1 });
+    expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_B, transactionId: null });
     await submitting;
     expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", transactionHash: TX_A });
