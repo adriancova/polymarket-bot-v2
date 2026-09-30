@@ -29,6 +29,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   endOfRunBoundTo,
+  recordFraming,
   replayDrivenCoreLoop,
   type ReplayDrivenLoop,
   type ReplayIngestedEvent,
@@ -479,5 +480,86 @@ describe("normalizedEnvelopeNormalizer — a recording of the §7.4 stream", () 
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.reason).toContain("§7.1 event sources");
+  });
+});
+
+/**
+ * `THROUGHPUT-2` (ADR-024): the driver drains once per RECORDED FRAME. A
+ * normalizer may derive several envelopes from one record (a two-token
+ * `price_change`); the core evaluates the frame once, at its last envelope,
+ * only if one drain is handed the whole record.
+ */
+describe("replayDrivenCoreLoop — one drain per recorded frame (THROUGHPUT-2)", () => {
+  function withEventId(context: ReplayEventContext, eventId: string): ReplayEventContext {
+    return { ...context, envelope: { ...context.envelope, eventId } };
+  }
+
+  it("ingests every envelope of a record but drains only at its LAST; a one-envelope record drains at once", async () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) throw new Error("clock");
+    const loop = loopDouble();
+    loop.bind(clock.value);
+    const framing = recordFraming();
+    const driver = replayDrivenCoreLoop({ loop, clock: clock.value, framing });
+
+    const two = record({ ingestSeq: "1", receivedAt: "2026-05-01T09:00:00.000Z", receivedMonotonicNs: "1000000", payloadUtf8: "{}" });
+    const one = record({ ingestSeq: "2", receivedAt: "2026-05-01T09:00:01.000Z", receivedMonotonicNs: "2000000", payloadUtf8: "{}" });
+    const ids = ["019b1e00-0000-7000-8000-000000000101", "019b1e00-0000-7000-8000-000000000102", "019b1e00-0000-7000-8000-000000000201"];
+    // The wrapped normalizer answers first, as `DatasetEventSource.events()` calls it
+    // before it yields any of the record's envelopes.
+    const answers = new Map([
+      ["1", [withEventId(contextOf(two), ids[0] as string).envelope, withEventId(contextOf(two), ids[1] as string).envelope]],
+      ["2", [withEventId(contextOf(one), ids[2] as string).envelope]],
+    ]);
+    const inner = {
+      normalizerVersion: "test-normalizer@1",
+      normalize: (replayRecord: ReplayRecord) => ({ ok: true as const, envelopes: answers.get(replayRecord.frame.ingestSeq) ?? [] }),
+    };
+    const wrapped = framing.wrap(inner);
+    expect(wrapped.normalizerVersion).toBe("test-normalizer@1");
+    const answered = wrapped.normalize(two);
+    expect(answered).toEqual(inner.normalize(two));
+
+    expect((await driver.coreLoop(withEventId(contextOf(two), ids[0] as string))).ok).toBe(true);
+    expect(loop.drains).toBe(0);
+    expect(loop.drainedAfterIngest).toBe(false);
+    expect((await driver.coreLoop(withEventId(contextOf(two), ids[1] as string))).ok).toBe(true);
+    expect(loop.drains).toBe(1);
+
+    wrapped.normalize(one);
+    expect((await driver.coreLoop(withEventId(contextOf(one), ids[2] as string))).ok).toBe(true);
+    expect(loop.drains).toBe(2);
+    expect(loop.drainedAfterIngest).toBe(true);
+    expect(driver.observations()).toEqual({ eventsIngested: 3, drains: 2 });
+  });
+
+  it("an envelope of a record the wrapped normalizer never answered for is drained at once (nothing is held back unaccounted)", async () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) throw new Error("clock");
+    const loop = loopDouble();
+    loop.bind(clock.value);
+    const driver = replayDrivenCoreLoop({ loop, clock: clock.value, framing: recordFraming() });
+    const lone = record({ ingestSeq: "1", receivedAt: "2026-05-01T09:00:00.000Z", receivedMonotonicNs: "1000000", payloadUtf8: "{}" });
+    expect((await driver.coreLoop(contextOf(lone))).ok).toBe(true);
+    expect(loop.drains).toBe(1);
+  });
+
+  it("the shipped normalized-envelope normalizer is one envelope per record: framing changes no drain", async () => {
+    const framing = recordFraming();
+    const wrapped = framing.wrap(normalizedEnvelopeNormalizer(sha256Hex));
+    expect(wrapped.normalizerVersion).toBe(NORMALIZED_ENVELOPE_NORMALIZER_VERSION);
+    const payloadUtf8 = JSON.stringify({
+      eventType: "MarketOpened",
+      schemaVersion: 1,
+      sourceChannel: "market",
+      payload: { internalMarketId: MARKET_ID, conditionId: "0xcondition", openedAt: "2026-05-01T09:00:00.000Z" },
+    });
+    const opened = record({ ingestSeq: "1", receivedAt: "2026-05-01T09:00:00.000Z", receivedMonotonicNs: "1000000", payloadUtf8 });
+    const outcome = wrapped.normalize(opened);
+    if (!outcome.ok) throw new Error(outcome.reason);
+    expect(outcome.envelopes).toHaveLength(1);
+    const envelope = outcome.envelopes[0];
+    if (envelope === undefined) throw new Error("no envelope");
+    expect(framing.closesFrame({ ...contextOf(opened), envelope })).toBe(true);
   });
 });

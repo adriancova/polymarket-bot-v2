@@ -29,8 +29,11 @@ One run:
    the fixture's `payload.internalMarketId` (H1's
    `01a0eed4-9faf-7911-bb58-c8e64ab55859`) to the minted id — the only change
    made to any envelope;
-4. publishes through the real `RedisStreamsEventTransport.publish`, one
-   envelope per call, in stream order;
+4. publishes through the real `RedisStreamsEventTransport`, in stream order:
+   since `THROUGHPUT-2` (ADR-024) each raw frame — a run of consecutive
+   envelopes sharing a `causationId` — goes out in ONE atomic `publishBatch`
+   call, as the gateway's publisher now writes it, and a single envelope by
+   `publish`;
 5. runs the trader exactly as `apps/trader/src/main.ts` `startup()` does —
    `RedisStreamsEventTransport.connect`, `assembleDurableTrader` (the real
    `PostgresTraderStore`, the `BOOT-1` registration check, the simulated venue,
@@ -52,8 +55,15 @@ One run:
 - `--mode catch-up`: everything is published first, then the trader drains the
   backlog. The ceiling: events/s and decisions/s.
 - `--mode paced`: the trader subscribes first; a SEPARATE Node process (the
-  gateway is one) publishes each envelope at its recorded `receivedAt` spacing
-  (136 s for the H1 burst). Whether the trader keeps up: the lag.
+  gateway is one) publishes each frame at its first envelope's recorded
+  `receivedAt` spacing (136 s for the H1 burst). Whether the trader keeps up:
+  the lag.
+
+The report's `framesSplit` counts the frames the trader's feed had to hand out
+across two batches because one frame filled a whole batch (ADR-024 D2); it is
+`0` on the H1 burst. Comparing a `THROUGHPUT-2` run with an earlier commit's:
+the earlier harness publishes one envelope per call, which only changes when
+the envelopes land in paced mode, never what they are.
 
 Lag is the host-clock time from an envelope's `publish` resolving to the moment
 the trader recorded a stream position covering it — which the pump does only

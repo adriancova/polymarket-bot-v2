@@ -228,7 +228,7 @@ function printReport(report: ThroughputReport, log: (line: string) => void): voi
   log(`  decision content sha256 ${report.durable.decisionContentSha256} (normalized ${report.durable.normalizedDecisionContentSha256})`);
   log(`  checkpoint content sha256 ${report.durable.checkpointContentSha256} (normalized ${report.durable.normalizedCheckpointContentSha256})`);
   log(`  halts: ${report.halts.length === 0 ? "none" : report.halts.map((h) => `${h.scope} ${h.code}: ${h.detail}`).join(" | ")}`);
-  log(`  polls ${String(report.polls)} (idle ${String(report.idlePolls)}); publish wall ${(report.publish.wallMs / 1000).toFixed(2)} s, max schedule slip ${report.publish.maxScheduleSlipMs.toFixed(1)} ms`);
+  log(`  polls ${String(report.polls)} (idle ${String(report.idlePolls)}; frames split ${String(report.framesSplit)}); publish wall ${(report.publish.wallMs / 1000).toFixed(2)} s, max schedule slip ${report.publish.maxScheduleSlipMs.toFixed(1)} ms`);
 }
 
 async function main(argv: readonly string[]): Promise<number> {

@@ -37,6 +37,32 @@
  * per-process delivery ordinal: the live path has no dataset row, and inventing
  * a row number that matched one would be worse than an honest counter.
  *
+ * ## Frame-aligned batches (`THROUGHPUT-2`, ADR-024)
+ *
+ * The core loop evaluates once per venue FRAME, and treats the end of a batch
+ * as the end of a frame (`packages/trading-core` `drain`). So a batch this
+ * feed hands out must never end in the middle of one. Two facts make that
+ * checkable without waiting on the next event:
+ *
+ * 1. the gateway writes every envelope of one raw frame in ONE atomic script
+ *    call (`apps/data-gateway/src/publisher.ts`, frame-atomic runs), so a
+ *    reader sees all of a frame's entries or none of them;
+ * 2. a read that returned FEWER entries than its `COUNT` reached the end of
+ *    the stream at that instant.
+ *
+ * Hence: a SHORT read ends at a frame boundary (every frame in it is whole,
+ * by 1), and is handed out whole. A FULL read may have cut its last frame at
+ * the `COUNT` boundary, so its trailing run of one frame key is CARRIED —
+ * held back, undelivered — and handed out at the front of the next poll, which
+ * reads on until that frame is closed by a different key or by a short read.
+ * Nothing waits for the NEXT event: a quiet stream answers the very next read
+ * short. A batch never exceeds `maxEvents` (the read asks for what the carry
+ * leaves room for); a single frame of `maxEvents` or more cannot be aligned
+ * and is handed out as it stands (counted in {@link RedisMarketEventFeed.framesSplit}).
+ *
+ * Positions follow DELIVERY: `mark`/`commit` name the last event handed OUT,
+ * never a carried one, so a crash re-reads a carried partial frame whole.
+ *
  * NO CREDENTIAL. A Redis connection is not a venue credential and this module
  * holds none; it takes an already-constructed subscription, so it cannot even
  * name a connection string.
@@ -45,6 +71,7 @@
 import type { EventSubscription } from "@polymarket-bot/event-bus";
 
 import {
+  frameKeyOf,
   portFailed,
   portOk,
   type FeedMark,
@@ -52,6 +79,9 @@ import {
   type MarketEventFeed,
   type PortResult,
 } from "@polymarket-bot/trading-core";
+
+type Received = Awaited<ReturnType<EventSubscription<unknown>["receive"]>>;
+type Delivered = Extract<Received, { readonly status: "events" }>["events"][number];
 
 export interface RedisMarketEventFeedOptions {
   /** An already-subscribed `packages/event-bus` subscription. */
@@ -68,6 +98,9 @@ export class RedisMarketEventFeed implements MarketEventFeed {
   #pendingCheckpoint: Parameters<EventSubscription["checkpoint"]>[0] | undefined;
   /** `THROUGHPUT-1a`: the checkpoint each handed-out {@link FeedMark} names. */
   readonly #marks = new WeakMap<FeedMark, Parameters<EventSubscription["checkpoint"]>[0]>();
+  /** `THROUGHPUT-2`: read but not yet handed out — the trailing run of a full read. */
+  #carry: readonly Delivered[] = [];
+  #framesSplit = 0;
 
   constructor(options: RedisMarketEventFeedOptions) {
     this.#subscription = options.subscription;
@@ -75,9 +108,54 @@ export class RedisMarketEventFeed implements MarketEventFeed {
   }
 
   async poll(): Promise<PortResult<readonly IngestedEvent[]>> {
-    let received: Awaited<ReturnType<EventSubscription<unknown>["receive"]>>;
+    // The carry is always shorter than `maxEvents` (it is the tail of a batch
+    // of `maxEvents` that has a frame boundary before it), so this read asks
+    // for at least one entry and a batch never exceeds `maxEvents`.
+    const room = this.#maxEvents - this.#carry.length;
+    const received = await this.#receive(room);
+    if (!received.ok) return received;
+    const fresh = received.value;
+    const buffer = this.#carry.length === 0 ? fresh : [...this.#carry, ...fresh];
+    this.#carry = [];
+    if (fresh.length < room) {
+      // A SHORT read (an idle one included) reached the stream's end: every
+      // frame in the buffer — a carried one included — is whole (module
+      // header, fact 1), so it is handed out whole.
+      return portOk(this.#deliver(buffer));
+    }
+    // A FULL read (the buffer now holds exactly `maxEvents`) may have cut its
+    // last frame: carry the trailing run of one frame key.
+    const tail = trailingFrameStart(buffer);
+    if (tail === 0) {
+      // One frame fills the whole batch: it cannot be aligned. Handed out as
+      // it stands — never dropped, never held without bound — and counted.
+      this.#framesSplit += 1;
+      return portOk(this.#deliver(buffer));
+    }
+    this.#carry = buffer.slice(tail);
+    return portOk(this.#deliver(buffer.slice(0, tail)));
+  }
+
+  /**
+   * `THROUGHPUT-2`: how many times a single frame of `maxEvents` or more
+   * events had to be handed out across two batches (see the module header).
+   * `0` in every run measured; a non-zero value means some evaluation saw a
+   * partially applied frame.
+   */
+  get framesSplit(): number {
+    return this.#framesSplit;
+  }
+
+  /** Events read from the stream and not yet handed out (the carried partial frame). */
+  get carried(): number {
+    return this.#carry.length;
+  }
+
+  /** One read, converted to the port's data surface. */
+  async #receive(maxEvents: number): Promise<PortResult<readonly Delivered[]>> {
+    let received: Received;
     try {
-      received = await this.#subscription.receive({ maxEvents: this.#maxEvents });
+      received = await this.#subscription.receive({ maxEvents });
     } catch (cause) {
       return portFailed(
         "UNAVAILABLE",
@@ -94,24 +172,28 @@ export class RedisMarketEventFeed implements MarketEventFeed {
       );
     }
     if (received.status === "idle") {
-      return portOk(Object.freeze([]));
+      return portOk([]);
     }
+    return portOk(received.events);
+  }
 
+  /** Hands events OUT: ordinals and the recordable position advance only here. */
+  #deliver(delivered: readonly Delivered[]): readonly IngestedEvent[] {
     const events: IngestedEvent[] = [];
-    for (const delivered of received.events) {
+    for (const entry of delivered) {
       this.#ordinal += 1;
-      this.#pendingCheckpoint = delivered.checkpoint;
+      this.#pendingCheckpoint = entry.checkpoint;
       events.push({
-        envelope: delivered.envelope,
+        envelope: entry.envelope,
         identity: {
-          gatewayEpoch: delivered.envelope.gatewayEpoch,
-          ingestSeq: delivered.envelope.ingestSeq,
-          receivedAt: delivered.envelope.receivedAt,
+          gatewayEpoch: entry.envelope.gatewayEpoch,
+          ingestSeq: entry.envelope.ingestSeq,
+          receivedAt: entry.envelope.receivedAt,
           datasetRowOrdinal: this.#ordinal,
         },
       });
     }
-    return portOk(Object.freeze(events));
+    return Object.freeze(events);
   }
 
   /**
@@ -157,6 +239,24 @@ export class RedisMarketEventFeed implements MarketEventFeed {
       // Closing is best-effort: the process is stopping either way, and a throw
       // here would replace a clean shutdown with a stack trace.
     }
+  }
+}
+
+/**
+ * `THROUGHPUT-2`: the index where the trailing run of one frame key begins
+ * (`0` when the whole buffer is one frame). An event with no frame key is a
+ * complete frame of its own, so nothing is carried after it (`buffer.length`).
+ */
+function trailingFrameStart(buffer: readonly Delivered[]): number {
+  const last = buffer[buffer.length - 1];
+  if (last === undefined) return 0;
+  const key = frameKeyOf(last.envelope);
+  if (key === undefined) return buffer.length;
+  let start = buffer.length - 1;
+  for (;;) {
+    const previous = start > 0 ? buffer[start - 1] : undefined;
+    if (previous === undefined || frameKeyOf(previous.envelope) !== key) return start;
+    start -= 1;
   }
 }
 

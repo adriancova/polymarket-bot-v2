@@ -153,6 +153,11 @@ export interface ThroughputReport {
   };
   readonly polls: number;
   readonly idlePolls: number;
+  /**
+   * `THROUGHPUT-2`: how many times the feed had to hand out one frame across
+   * two batches because it filled a whole batch (`RedisMarketEventFeed.framesSplit`).
+   */
+  readonly framesSplit: number;
   readonly halts: readonly { readonly scope: string; readonly code: string; readonly detail: string }[];
   readonly durable: {
     readonly decisions: number;
@@ -496,6 +501,7 @@ export async function runTraderThroughput(options: ThroughputRunOptions): Promis
       },
       polls,
       idlePolls,
+      framesSplit: feed.framesSplit,
       halts: health.halts.map((halt) => ({ scope: halt.scope.kind, code: halt.code, detail: halt.detail })),
       durable: { ...durable, xactCommitDelta: xactAfter - xactBefore },
       health: {

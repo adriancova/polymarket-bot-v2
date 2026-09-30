@@ -95,6 +95,9 @@ export {
 
 export { BoundedQueue, type OfferOutcome, type QueueMetrics } from "@polymarket-bot/trading-core";
 
+// `THROUGHPUT-2` (ADR-024): what one venue frame is, for the process's feeds and harnesses.
+export { frameKeyOf, sameFrame, type FrameKey } from "@polymarket-bot/trading-core";
+
 export {
   HaltController,
   haltOnLedgerProjection,

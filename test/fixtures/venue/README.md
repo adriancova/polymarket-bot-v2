@@ -217,3 +217,25 @@ newly documented parameter therefore cannot pass `verify-venue` without an
 values are recorded in the dated report instead, with their sources and
 digests, so the owning packages can freeze them once the validator admits
 dated snapshots.
+
+## Re-verification 2026-09-30 (VENUE-3, the phase-3 venue gate)
+
+Added by `VENUE-3`; everything above this heading is unchanged (the frozen
+WP-000 text and the dated VENUE-2 section). Full evidence, drift rows and
+source digests are in
+[`docs/venue/verified-2026-09-30.md`](../../../docs/venue/verified-2026-09-30.md)
+(every fetch performed 2026-09-30 UTC).
+
+**Outcome: no fixture payload was edited, but three fixtures are affected by
+drift in the shapes or values they encode.** Each is a finding for the
+fixture set's owner (and for `apps/ops-cli`, whose validator pins
+`effective_date: "2026-08-24"` and asserts some of these strings verbatim).
+The payloads remain true records of what the venue documented on
+2026-08-24.
+
+| Fixture | Verdict 2026-09-30 | Note (report row) |
+| --- | --- | --- |
+| `rtds/twap-update.json` | **deprecated source** | The cited page `market-data/chainlink-twap` is gone (308 to `market-data/realtime-data#twap-prices`; the `.md` source no longer exists — E-09). Reference prices moved to the authenticated PolyBolt service `wss://ws-live-v2.polymarket.com/ws`: channel `price.crypto.twap` with `filter` `{"symbol":"btcusd","window_seconds":60}`, a `{"v":1,"channel","seq","ts","snapshot"?,"dropped"?,"payload"}` envelope, `window_seconds` instead of `window_s`, a decimal-string price ("Do not apply that E18 conversion"), and **no 30-second window** (E-10). Legacy RTDS price topics are deprecated, removal "planned one month after the `0.11.0` release" (E-11). The replacement needs CLOB API credentials — conflict C-13 must be ruled on before any replacement fixture is written. |
+| `fees/fee-reward-parameters.json` | **stale field** | `liquidity-rewards-market-settings.samples_per_epoch: 10080` — the page now says "An epoch is one UTC day … up to 1,440 samples" (E-04). All fee rates, rebate shares and tiers are unchanged. |
+| `orders/restricted-modes.json` | **contested** | `http-503-cancel-only`: the matching-engine guide now shows `{"error": "trading is disabled"}` for both cancel-only and fully disabled trading and says the response "does not establish whether cancels are available" (E-05); the CLOB OpenAPI still shows this fixture's string (conflict C-9). The post-only example's `Retry-After: 79`, marked illustrative above, now matches the guide's own example. The 425 example stays valid; a `Retry-After` header is now documented as optional on 425 (E-06). |
+| every other fixture | valid, unchanged | The market-stream section, both AsyncAPI pages, manage-orders, rate-limit, geoblock (response shape), positions and contracts pages are byte-identical or identical after table-format normalization; the SDK's `subscriptions/clob.ts`, `shared.ts`, `clob/account.ts` and `clob/order-response.ts` are byte-identical to VENUE-2's. `orders/rest-trades.json`'s prefixed statuses are now also what the CLOB OpenAPI enumerates for `GET /data/trades` (E-13). |

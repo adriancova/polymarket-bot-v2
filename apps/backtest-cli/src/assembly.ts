@@ -77,9 +77,11 @@ import {
 
 import { readManifestBytes, sha256Hex } from "./archive.js";
 import {
+  recordFraming,
   replayDrivenCoreLoop,
   type ReplayDrivenCoreLoop,
   type ReplayDriverObservations,
+  type ReplayFraming,
 } from "./core-loop.js";
 import { NORMALIZED_ENVELOPE_NORMALIZER_VERSION, normalizedEnvelopeNormalizer } from "./normalizer.js";
 import { DATASET_MANIFEST_OBJECT_NAME, runBacktest, type BacktestOutcome } from "./run.js";
@@ -216,6 +218,11 @@ export interface BacktestCore {
   /** The driver over `trader.loop`, bound to its clock and its halt latch. */
   readonly driver: ReplayDrivenCoreLoop;
   readonly idNamespace: string;
+  /**
+   * `THROUGHPUT-2`: the driver's record framing; a run hands the replay
+   * `framing.wrap(normalizer)` so the driver drains once per recorded frame.
+   */
+  readonly framing: ReplayFraming;
 }
 
 export type BacktestCoreAssembly =
@@ -290,15 +297,19 @@ export function assembleBacktestCore(options: BacktestCoreOptions): BacktestCore
   }
   built.wiring.trader = created.trader;
 
+  // `THROUGHPUT-2` (ADR-024): the driver drains once per recorded frame; the
+  // run hands the replay `framing.wrap(normalizer)` so the framing can tell.
+  const framing = recordFraming();
   const driver = replayDrivenCoreLoop({
     loop: created.trader.loop,
     clock: clock.value,
     // BT1-R3: the core's own halt latch, as `pump.ts` is handed it.
     halts: created.trader.halts,
+    framing,
   });
   return {
     ok: true,
-    core: { trader: created.trader, venue: built.venue, store, clock: clock.value, driver, idNamespace },
+    core: { trader: created.trader, venue: built.venue, store, clock: clock.value, driver, idNamespace, framing },
   };
 }
 
@@ -393,7 +404,7 @@ export async function runBacktestCore(options: BacktestCoreRunOptions): Promise<
   const outcome = await runBacktest({
     datasetDirectory: options.datasetDirectory,
     ...(options.manifestFileName === undefined ? {} : { manifestFileName: options.manifestFileName }),
-    normalizer: normalizedEnvelopeNormalizer(sha256Hex),
+    normalizer: core.framing.wrap(normalizedEnvelopeNormalizer(sha256Hex)),
     runPins: options.runPins,
     environment: options.environment,
     coreLoop: core.driver.coreLoop,
