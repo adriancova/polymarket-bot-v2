@@ -269,17 +269,32 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
 
 ## Consequences
 
-- **The decision cadence changes.** On the H1 burst, evaluations fall from
-  89,621 to MEASURED (see Verification): one per closed frame that reaches a
-  configured market or a reference price. Every decision base made on a
-  half-applied state is absent; decisions on single-event frames match base
-  (the bench comparison below characterizes every difference).
-- **Throughput.** See Verification.
+- **The decision cadence changes.** On the H1 burst (99,669 envelopes from
+  index 332, 56,714 frames, 42,753 of them multi-event), decisions fall from
+  89,621 to 46,666: one per closed frame that reaches a configured market or a
+  reference price. The 42,955 decisions base made on the first event of a
+  multi-event frame (42,627 two-token `price_change` frames, 328 reference
+  trades inside multi-trade frames) are gone. Each of the other 46,666 is
+  equal to base's decision at the same source event in every exported column —
+  feature snapshot address, reason codes, state patch, `evaluated_at` — and so
+  is its checkpoint; only the sequence numbers are renumbered. On this burst,
+  skipping the half-applied evaluations changed no later decision.
+- **Throughput rises, but not to the H1 burst rate.** Catch-up 572.6 → 807.9
+  events/s (CPU 1,784 → 1,292 µs per event); paced max lag 44.5 s → 9.3 s.
+  The removed evaluations were the cheap half of each pair (the second
+  evaluation of a pair hit `THROUGHPUT-1a`'s memos), so the gain is about 1.4×,
+  not the 2.1× `THROUGHPUT-1a` modelled; the `THROUGHPUT-2` handoff records
+  the ranked options for the rest.
 - **Recorded data and goldens need no migration.** The frame key is a field
   every recorded market-data envelope already carries (`causationId`), or
   the replay's own record identity. A stream or dataset without either
   evaluates per event, exactly as before. No committed golden has a
-  multi-event frame, so none changes (Verification).
+  multi-event frame, so none changes: the paper-e2e scenarios number
+  `ingestSeq` by position and carry no `causationId`, the backtest golden has
+  eight one-envelope records, and the order-book and simulation goldens do not
+  drive the core loop. The one pinned decision baseline that changes is the
+  throughput harness's 2,000-event sample (1,837 → 928 decisions, the 909
+  half-applied ones removed; `throughput-bench-harness-postgres-redis.test.ts`).
 - **Operational.** Health counters keep their meaning: `eventsProcessed` still
   counts every event; `evaluations` and `decisionsPersisted` now count
   per-frame callbacks. The feed's `framesSplit` is exposed on the adapter and
@@ -306,5 +321,29 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
   release on a short or idle read, the batch bound, `framesSplit`, positions
   never naming a carried event, ordinals unchanged.
 - `apps/backtest-cli/src/core-loop.test.ts` — one drain per recorded frame.
-- The throughput benchmark, base `bf1ee89` against the candidate on one
-  registered clone: MEASURED.
+- `test/integration/paper-trader/group-commit-crash-recovery-postgres-redis.test.ts`
+  — the SIGKILL case now publishes frame-atomically and pins that the stored
+  position is a frame boundary although the feed's reads were cutting
+  two-token frames when the process died; a new run decides exactly what the
+  uninterrupted run decided after it. The feed tests pin the same with a
+  carried partial frame.
+- The throughput benchmark (`tools/bench/trader-throughput`), base `bf1ee89`
+  against the candidate on one registered clone, full H1 burst:
+
+  | Run | Events/s | CPU µs/event | Decisions | Max lag | p99 lag | Halts |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | base, catch-up | 572.6 | 1,784 | 89,621 | — | — | none |
+  | candidate, catch-up | 807.9 | 1,292 | 46,666 | — | — | none |
+  | base, paced | 566.1 | 1,776 | 89,621 | 44.46 s | 44.04 s | none |
+  | candidate, paced | 709.0 | 1,366 | 46,666 | 9.26 s | 8.83 s | none |
+
+  The targets (catch-up ≥ 943 events/s, paced max lag ≤ 5 s) are NOT met;
+  the remaining cost is outside this package's paths (feature-input
+  validation and serialization, the decimal guard, strategy-runtime view
+  acquisition — the `THROUGHPUT-2` handoff ranks them).
+- An in-process proof over the same burst (the assembled core, in memory):
+  the state of BOTH outcome books and the trade window at each of the 56,714
+  frame closes equals base's state after the same event; the final state is
+  equal; `eventsProcessed` / `eventsRefused` are base's (89,622 / 10,047); and
+  the candidate code handed ONE event per drain reproduces base's 89,621
+  decisions byte for byte.
