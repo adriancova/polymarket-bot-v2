@@ -102,6 +102,14 @@ interface ConfigOptions {
   readonly strategyMaxAgeMs?: number;
   readonly riskMaxAgeMs?: number;
   readonly triggerPriceLte?: string;
+  /**
+   * r2 X9: the process clock (the `Clock` port the loop reads for the
+   * process-lag guard). `processClockAt` pins it at one instant (default
+   * `T_OPEN`, before every event: no lag); `processLagMs` repositions it at
+   * each event's `receivedAt` plus that lag, a live process running behind.
+   */
+  readonly processClockAt?: string;
+  readonly processLagMs?: number;
 }
 
 function traderConfig(options: ConfigOptions = {}): Record<string, unknown> {
@@ -452,13 +460,14 @@ function ingested(recorded: Recorded, ordinal: number): IngestedEvent {
 interface Run {
   readonly trader: PaperTrader;
   readonly store: MemoryTraderStore;
+  readonly clock: ManualClock;
 }
 
 function assemble(options: ConfigOptions): Run {
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error(`fee snapshot refused: ${fees.refusal.code}`);
   const wiring: VenueWiring = { trader: undefined };
-  const clock = new ManualClock(T_OPEN);
+  const clock = new ManualClock(options.processClockAt ?? T_OPEN);
   const venue = new SimulatedVenue({
     clock,
     runMode: "PAPER",
@@ -506,7 +515,7 @@ function assemble(options: ConfigOptions): Run {
   });
   if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.detail} ${result.refusal.issues.join("; ")}`);
   wiring.trader = result.trader;
-  return { trader: result.trader, store };
+  return { trader: result.trader, store, clock };
 }
 
 async function run(options: ConfigOptions, events: readonly Recorded[]): Promise<Run> {
@@ -514,6 +523,9 @@ async function run(options: ConfigOptions, events: readonly Recorded[]): Promise
   let ordinal = 0;
   for (const recorded of events) {
     ordinal += 1;
+    if (options.processLagMs !== undefined) {
+      parts.clock.positionAt(iso(recorded.at + options.processLagMs / 1000), BigInt(ordinal) * 1_000_000n);
+    }
     if (!parts.trader.loop.ingest(ingested(recorded, ordinal))) {
       throw new Error(`the ingest queue refused event ${String(ordinal)}`);
     }
@@ -894,6 +906,62 @@ describe("§9.8 check 7 measures the same confirmed age (risk freshness)", () =>
 });
 
 // ---------------------------------------------------------------------------
+// r2 X9: a lagging trader, or a replay of old data, is not vouched for by
+// the backlog (the process-lag guard, ADR-023 D7)
+// ---------------------------------------------------------------------------
+
+describe("r2 X9: a lagging trader or a live replay of old data gets no more than LAST_CHANGE", () => {
+  /** The reviewers' check-7 timeline (YES 09:00:01, NO snapshot 09:00:04.100 on the same session). */
+  function checkSevenTimeline(): Recorded[] {
+    const cheapAsks = [
+      { price: "0.34", size: "100" },
+      { price: "0.35", size: "100" },
+    ];
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1, cheapAsks)];
+    for (let step = 0; step < 6; step += 1) events.push(otherMarketSnapshot(1.5 + step * 0.5, A1));
+    events.push(noSnapshot(4.1, A1));
+    return events;
+  }
+  const checkSeven = { paramsVersion: 1 as const, strategyMaxAgeMs: 600_000, riskMaxAgeMs: 2_000 };
+  const BACKLOG_CLOCK = "2026-05-01T09:30:00.000Z";
+
+  it("the reviewers' reproduction: 09:00 events processed at 09:30 admit 0 orders, as under LAST_CHANGE (2 at a0a5f24)", async () => {
+    const confirmed = await run(
+      { ...checkSeven, basis: "CONNECTION_CONFIRMED", processClockAt: BACKLOG_CLOCK },
+      checkSevenTimeline(),
+    );
+    const lastChange = await run({ ...checkSeven, basis: "LAST_CHANGE", processClockAt: BACKLOG_CLOCK }, checkSevenTimeline());
+    for (const parts of [confirmed, lastChange]) {
+      expect(parts.trader.loop.orderProvenance()).toHaveLength(0);
+      expect(parts.trader.loop.health().risk.approvals).toBe(0);
+      expect(parts.trader.loop.health().risk.refusalsByCode["RISK_BOOK_STALE"] ?? 0).toBeGreaterThan(0);
+    }
+  });
+
+  it("the quiet-YES timeline replayed 30 minutes late: every evaluation is exactly the LAST_CHANGE one", async () => {
+    const confirmed = await run({ basis: "CONNECTION_CONFIRMED", processClockAt: BACKLOG_CLOCK }, quietYesTimeline());
+    const lastChange = await run({ basis: "LAST_CHANGE", processClockAt: BACKLOG_CLOCK }, quietYesTimeline());
+    expect(evaluations(confirmed)).toEqual(evaluations(lastChange));
+    expect(evaluationAt(confirmed, 6.2)).toMatchObject({ stale: true, bookAgeMs: "5200" });
+  });
+
+  it("a live process 1 700 ms behind is still vouched for at 6.200 s (1 900 ms); 1 900 ms behind, it is stale (2 100 ms)", async () => {
+    const within = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 1_700 }, quietYesTimeline());
+    expect(evaluationAt(within, 6.2).stale).toBe(false);
+    const beyond = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 1_900 }, quietYesTimeline());
+    expect(evaluationAt(beyond, 6.2)).toMatchObject({ stale: true, bookAgeMs: "2100" });
+  });
+
+  it("a replay clock positioned at each event (no lag) decides exactly as the unlagged run", async () => {
+    const positioned = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 0 }, quietYesTimeline());
+    const unlagged = await run({ basis: "CONNECTION_CONFIRMED" }, quietYesTimeline());
+    const records = (parts: Run) => JSON.stringify(parts.store.decisions.map((recorded) => recorded.record));
+    expect(records(positioned)).toBe(records(unlagged));
+    expect(evaluations(positioned).filter((evaluation) => evaluation.stale)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 4. Replay determinism, and backward compatibility
 // ---------------------------------------------------------------------------
 
@@ -1007,7 +1075,14 @@ describe("book-freshness.ts", () => {
     const liveness = new DeliverySessionLiveness();
     const key = sessionKeyOf(bookEvent(A1)) as string;
     liveness.observe(bookEvent(A1), at(5_000));
-    const common = { sessionKey: key, marketHasActiveIncident: false, liveness, nowEpochMs: 9_500, maximumLastChangeAgeMs: 30_000 };
+    const common = {
+      sessionKey: key,
+      marketHasActiveIncident: false,
+      liveness,
+      nowEpochMs: 9_500,
+      processNowEpochMs: 9_500,
+      maximumLastChangeAgeMs: 30_000,
+    };
     expect(bookConfirmedAt({ ...common, basis: "CONNECTION_CONFIRMED", lastChange: at(1_000) })?.epochMs).toBe(5_000);
     // A confirmation stamped before the change (a clock step) cannot move it back.
     expect(bookConfirmedAt({ ...common, basis: "CONNECTION_CONFIRMED", lastChange: at(9_000) })?.epochMs).toBe(9_000);
@@ -1027,12 +1102,52 @@ describe("book-freshness.ts", () => {
     const key = sessionKeyOf(bookEvent(A1)) as string;
     liveness.observe(bookEvent(A1), at(40_000));
     const common = { basis: "CONNECTION_CONFIRMED" as const, sessionKey: key, marketHasActiveIncident: false, liveness, lastChange: at(10_000) };
-    expect(bookConfirmedAt({ ...common, nowEpochMs: 40_000, maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(40_000);
-    expect(bookConfirmedAt({ ...common, nowEpochMs: 40_001, maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(10_000);
+    const at_ = (nowEpochMs: number) => ({ nowEpochMs, processNowEpochMs: nowEpochMs });
+    expect(bookConfirmedAt({ ...common, ...at_(40_000), maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(40_000);
+    expect(bookConfirmedAt({ ...common, ...at_(40_001), maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(10_000);
     // No ceiling (the door never allows it under this basis): the extension is off.
-    expect(bookConfirmedAt({ ...common, nowEpochMs: 11_000, maximumLastChangeAgeMs: undefined })?.epochMs).toBe(10_000);
+    expect(bookConfirmedAt({ ...common, ...at_(11_000), maximumLastChangeAgeMs: undefined })?.epochMs).toBe(10_000);
     // A non-finite instant cannot pass the ceiling check.
-    expect(bookConfirmedAt({ ...common, nowEpochMs: Number.NaN, maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(10_000);
+    expect(bookConfirmedAt({ ...common, ...at_(Number.NaN), maximumLastChangeAgeMs: 30_000 })?.epochMs).toBe(10_000);
+  });
+
+  it("r2 X9: the process-lag guard moves a confirmation back by the lag, never before the last change", () => {
+    const liveness = new DeliverySessionLiveness();
+    const key = sessionKeyOf(bookEvent(A1)) as string;
+    liveness.observe(bookEvent(A1), at(5_000));
+    const common = {
+      basis: "CONNECTION_CONFIRMED" as const,
+      sessionKey: key,
+      marketHasActiveIncident: false,
+      liveness,
+      lastChange: at(1_000),
+      nowEpochMs: 5_000,
+      maximumLastChangeAgeMs: 30_000,
+    };
+    // No lag (a replay clock at the event), and a process clock BEHIND event
+    // time (never read as a negative lag): the confirmation itself.
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: 5_000 })).toEqual(at(5_000));
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: 4_000 })).toEqual(at(5_000));
+    // 1 500 ms behind: the confirmation moves back 1 500 ms, in both forms.
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: 6_500 })).toEqual({
+      iso: "1970-01-01T00:00:03.500Z",
+      epochMs: 3_500,
+    });
+    // Behind by the confirmation's whole lead over the last change, or more
+    // (the reviewers' backlog: 30 minutes): exactly the last change.
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: 9_000 })).toEqual(at(1_000));
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: 5_000 + 1_800_000 })).toEqual(at(1_000));
+    // An unreadable process clock is doubt: the extension is off.
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: undefined })).toEqual(at(1_000));
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: Number.NaN })).toEqual(at(1_000));
+    expect(bookConfirmedAt({ ...common, processNowEpochMs: Number.POSITIVE_INFINITY })).toEqual(at(1_000));
+    // The ceiling is judged at the process's instant: 29 000 ms of event-time
+    // age plus 1 001 ms of lag is past a 30 000 ms ceiling.
+    expect(
+      bookConfirmedAt({ ...common, nowEpochMs: 30_000, processNowEpochMs: 31_001, lastChange: at(1_000) }),
+    ).toEqual(at(1_000));
+    // LAST_CHANGE never needs the process clock.
+    expect(bookConfirmedAt({ ...common, basis: "LAST_CHANGE", processNowEpochMs: undefined })).toEqual(at(1_000));
   });
 
   it("an epoch taint covers sessions seen before and after it, and no other epoch", () => {

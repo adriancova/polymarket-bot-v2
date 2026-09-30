@@ -5,14 +5,20 @@
 - **Recorded by:** `THROUGHPUT-1c`, which also implements it.
 - **Supersedes / Superseded by:** none. It changes how a venue book's AGE is
   measured, when a configuration opts in. It does not change any bound, any
-  gate's direction, the §9.9 stale-book response, or the clock semantics. It
+  gate's direction, the §9.9 stale-book response, or the clock semantics
+  (every age is still measured in event time; `CO2-N1` is unchanged). It
   adds one bound of its own: the per-book ceiling on the last-change age
-  (D2 rule 6).
+  (D2 rule 6). Under `CONNECTION_CONFIRMED` only, it reads the process's
+  `Clock` port to NARROW its own extension for a lagging trader (the
+  process-lag guard, D7, r2).
 - **Revision:** r1 (2026-09-30), after review round 1 (findings X1–X9): the
   per-book ceiling (X1), the gateway reporting a frame's problems before its
   accepted events (X8), and corrected statements on the taint's lifetime
   (X2), the H1 evidence (X3), the configuration identity (X6), the venue
-  documentation (X7) and `CO2-N1` (X9).
+  documentation (X7) and `CO2-N1` (X9). r2 (2026-09-30), after review
+  round 2: the process-lag guard (D7, X9 option (a), pending its ruling),
+  the heartbeat wording (D5, Option B) and the replay-parity qualification
+  (D8).
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
@@ -188,7 +194,10 @@ where `session(book)` is the session of the update that last CHANGED the book
 latest confirmation of that session. The book is FRESH iff
 `now − confirmedAt ≤ bound`, with the same bounds as before
 (`data_quality.maximum_book_age_ms`, `freshness.venueBookMaxAgeMs`) and the
-same `now` (event time).
+same `now` (event time). Under `CONNECTION_CONFIRMED` the latest
+confirmation is first moved back by the process lag, and rule 6 is judged
+at the process's instant (the process-lag guard, D7, r2); with no lag, as
+in a backtest, the formula above is exact.
 
 `confirmedAt` falls back to `lastChange(book)` — the pre-ADR-023 rule, never
 more permissive than it — whenever any of rules 1–6 applies:
@@ -268,8 +277,8 @@ more permissive than it — whenever any of rules 1–6 applies:
 | Gateway WAL refusal, unparsable frame | the gateway's incident names no market: the epoch is tainted, fallback to the last change for the rest of the gateway's life (repeats are deduplicated, D2.4) | D2.4 |
 | Market data-quality incident | fallback to the last change | D2.5 |
 | REST recovery snapshot | no session: last change only, until a socket frame for that asset lands on a session | D2.2 |
-| Trader lagging the stream | ages are measured in event time, exactly as before, and a lagging trader is not detected here. `CONNECTION_CONFIRMED` admits MORE lagged cases than `LAST_CHANGE` does (D7) | — (open ruling, D7) |
-| Replay of old data | deterministic (D6); data without session fields ages by the last change | D2.2 |
+| Trader lagging the stream | ages are measured in event time, exactly as before (`CO2-N1` unchanged). The EXTENSION is narrowed by the process lag: a confirmation is moved back by `max(0, processNow − eventNow)` and the ceiling is judged at the later instant, so a trader behind by more than a confirmation's lead over the last change gets exactly `LAST_CHANGE` (r2) | D7 (process-lag guard) |
+| Replay of old data | in a backtest (replay clock at each event) deterministic, lag 0 (D8); in a live-clock process (a late trader, a catch-up bench) the guard gives `LAST_CHANGE` once the lag exceeds the confirmation's lead; data without session fields ages by the last change | D2.2, D7, D8 |
 
 ### D4. The opt-in, and backward compatibility of configurations
 
@@ -300,8 +309,10 @@ absent block and an explicit `LAST_CHANGE`.
   so the gateway's incident for a partly malformed frame precedes the
   frame's siblings in the stream (D2.4). Nothing is dropped, and neither list
   is reordered internally. A `PONG`-derived
-  liveness event was considered and not built (Option B): at the configured
-  2 000 ms bounds a 10 s heartbeat (V5) can never confirm within the bound, and
+  liveness event was considered and not built (Option B): a `PONG` confirmation
+  has age 0 when it arrives, so it would satisfy a 2 000 ms bound briefly,
+  but a 10 s heartbeat (V5) cannot maintain continuous freshness under a
+  2-second bound (it would leave at least 8 s of every 10 s unconfirmed), and
   N-E means a `PONG` proves less than a data frame. It becomes worth building
   only if an operator wants bounds above the heartbeat period for a whole
   quiet subscription.
@@ -358,40 +369,75 @@ as external provenance: the operator's deployed
 was invoked with. Binding the basis to the registered identity would need the
 registration path, which is outside this round's allowed paths (§5).
 
-### D7. Clock semantics, and `CO2-N1`
+### D7. Clock semantics, `CO2-N1`, and the process-lag guard
 
-Unchanged. Both `now` and every confirmation instant are event `receivedAt`
-values; nothing reads a wall clock. This ADR does not address `CO2-N1`: live
-admission runs on event time, so a stale backlog can be admitted late.
+**Clock semantics: unchanged.** Both `now` and every confirmation instant are
+event `receivedAt` values, and every age is measured in event time, as
+before. This ADR does not address `CO2-N1`: live admission runs on event
+time, so a stale backlog can be admitted late, under `LAST_CHANGE` exactly as
+before this ADR.
 
-**This ADR WIDENS the set of backlog cases N1 admits (r1, X9).** A trader
-lagging the stream judges a book fresh relative to the event it is
-processing. Under `CONNECTION_CONFIRMED` more lagged states read fresh than
-under `LAST_CHANGE`, because a sibling frame in the backlog vouches for a
-book whose own change is older. Reproduced in review: process clock 09:30,
-YES book changed 09:00:01, NO snapshot 09:00:04.100 on the same session.
-`LAST_CHANGE` gives 0 approvals and `CONNECTION_CONFIRMED` gives 2. Each
-admitted case is the event-time image of a case this ADR admits live, and
-rule 6's ceiling bounds it in event time. It is still a real widening, and
-it conflicts with review criterion B ("a trader lagging behind the stream; a
-replay of old data" must not read fresh while the feed is not provably
-live). This ADR does not resolve that conflict. It changes no clock
-semantics silently, and the packet forbade changing them. **A ruling is owed
-before ratification**, on one of these:
+**The widening r1 found (X9), and how r2 removes it.** A trader lagging the
+stream judges a book fresh relative to the event it is processing. Without a
+guard, `CONNECTION_CONFIRMED` admitted MORE lagged states than `LAST_CHANGE`,
+because a sibling frame in the backlog vouched for a book whose own change
+was older. Reproduced in review against `a0a5f24`: process clock 09:30, YES
+book changed 09:00:01, NO snapshot 09:00:04.100 on the same session;
+`LAST_CHANGE` gave 0 approvals and `CONNECTION_CONFIRMED` gave 2. That
+conflicts with review criterion B ("a trader lagging behind the stream; a
+replay of old data" must not read fresh while the feed is not provably live).
 
-- (a) **a live-admission guard:** in a live-data process, `CONNECTION_CONFIRMED`
-  vouches past the last change only while the evaluating event's
-  `receivedAt` is within a bound of the process clock. This is a clock
-  semantics change, which is `CO2-N1`'s territory;
+r2 implements option (a) below, the **process-lag guard**, as the narrowest
+change that removes the widening without touching `CO2-N1`
+(`book-freshness.ts` `bookConfirmedAt`, `loop.ts` `#processNowEpochMs`):
+
+- under `CONNECTION_CONFIRMED` only, the loop reads its `Clock` port (the
+  §12.1 port it already holds: `SystemPaperClock` in a PAPER process, the
+  replay clock in a backtest) when it asks for a book's vouched-for instant;
+- `lag = max(0, processNow − eventNow)`. Rule 6's ceiling is judged at
+  `eventNow + lag`, and the session confirmation is moved back by `lag`
+  before it is compared with the last change, so its event-time age equals
+  its age at the process's own instant;
+- the answer is never earlier than the book's last change, so a lag of at
+  least the confirmation's lead over the last change (the reviewers' 30
+  minutes, or any catch-up of recorded data) gives EXACTLY the
+  `LAST_CHANGE` answer; an unreadable or non-finite process reading turns
+  the extension off.
+
+Why this is not a clock-semantics change: nothing is measured against the
+process clock that was measured against event time before. `now` for every
+age, the `LAST_CHANGE` path (which reads no clock), admission, the risk
+gates' inputs and N1 are all unchanged. The process clock can only REMOVE
+extension this ADR added; it can never make a book fresher than the
+pre-guard rule or than `LAST_CHANGE`. A process clock that runs BEHIND event
+time (skew between the gateway host and the trader host) reads as lag 0, the
+pre-guard answer.
+
+What it does not do: it does not make `LAST_CHANGE` lag-aware (that is N1),
+and a trader behind by less than the bound is still judged in event time for
+the part of the age that is its own last change. Pinned by
+`book-freshness.test.ts` › "r2 X9": the reviewers' reproduction (0 orders
+under both bases), a 30-minute replay equal to `LAST_CHANGE` evaluation by
+evaluation, a live process 1 700 ms behind fresh and 1 900 ms behind stale
+at the same event, and a per-event replay clock equal to the unlagged run.
+
+**A ruling is still owed before ratification**, because round 1 asked the
+orchestrator or the user to choose, and the choice is recorded in
+`IMPLEMENTATION_STATUS.md`, not here:
+
+- (a) **the live-admission guard:** implemented in r2 as above. Accepting
+  it closes the conflict with criterion B for this rule;
 - (b) **narrowing criterion B** for this rule: accept that event-time
-  freshness is judged in event time under both bases until N1 lands;
+  freshness is judged in event time under both bases until N1 lands. The
+  guard would then be stricter than required, never looser, and can stay;
 - (c) **deferring the opt-in:** leave `CONNECTION_CONFIRMED` unused (absent
-  block) until N1 lands.
+  block) until N1 lands. Compatible with the code as it stands.
 
-The two also interact in one way that matters: a future N1 rule that
-measures ages against a wall clock can use `confirmedAt` unchanged. It is an
-event-time instant of the same kind as the last change it replaces, and it
-can close this widening.
+The two interact in one further way: a future N1 rule that measures ages
+against a wall clock can use `confirmedAt` unchanged. With such a rule the
+guard's shift and N1's measurement would count the same lag, so N1 must
+measure ages from the UNSHIFTED instant, or drop the guard (whichever lands
+second removes the double count; both directions are fail-closed).
 
 ### D8. Replay and backtest determinism
 
@@ -399,7 +445,19 @@ can close this widening.
 table is fed in stream order, uses only envelope fields, and its eviction is
 insertion-ordered. The backtest CLI runs the same `CoreLoop` behind the same
 configuration door (ADR-022), so replay and backtest reproduce live decisions
-over the same events. ADR-024's frame grouping is unaffected: a frame's events
+over the same events, PROVIDED the replay starts from the same point and
+the process is not restarted in between: the epoch taint is state of the
+process (D2.4). A process that consumed an epoch's incident reads a later
+book by its last change, and a process started after that incident reads it
+by its confirmation (review probe: a continuous process stale at 3 100 ms,
+a restarted one fresh at 0 ms after the same later events), so parity holds
+for the same initialization and restart boundaries, and a replay that
+starts mid-epoch reproduces a trader that started there, not one that ran
+through it. The process-lag guard (D7) is the other qualification: a
+backtest's replay clock sits at each event (lag 0), so it reproduces a live
+process that kept up; a live process that ran behind by more than a few
+milliseconds may have read a book stale that the replay reads fresh, never
+the reverse (the guard only removes extension). ADR-024's frame grouping is unaffected: a frame's events
 all update the table before its closing evaluation, which is the live order.
 Inside one frame a later event's `receivedAt` may sit a millisecond after the
 instant the frame's evaluation of a market uses; the age is then negative,
@@ -418,9 +476,14 @@ old recording can never read fresher than it did.
   fallback (D4: absent block).
 - **B. A gateway liveness event from `PING`/`PONG`.** A new domain event per
   `PONG`, consumed by the trader as a session confirmation. Not built: the
-  heartbeat period (10 s, V5) exceeds the bounds in use (2 s), so it would
-  confirm nothing, and a `PONG` proves less than a data frame (N-E). It needs a
-  new event contract (schema discipline) for no benefit at current bounds.
+  heartbeat period (10 s, V5) exceeds the bounds in use (2 s). A `PONG`
+  confirmation would satisfy a 2 s bound for up to 2 s after it arrived, but it
+  cannot maintain continuous freshness under a 2-second bound: a fully quiet
+  subscription would still read stale for at least 8 s of every 10 s. And a
+  `PONG` proves less than a data frame (N-E). It needs a new event contract
+  (schema discipline) for little benefit at current bounds: for a whole quiet
+  subscription, a brief fresh window after each heartbeat; for a busy
+  session, nothing the data frames do not already give.
   Kept as the documented extension if bounds above 10 s are ever wanted for a
   fully quiet subscription.
 - **C. "Connected and no disconnect seen" means live.** Rejected: absence of a
@@ -456,7 +519,12 @@ old recording can never read fresher than it did.
   means this rule changes nothing in an H1-like deployment until the taint is
   narrowed. Narrowing it, for example by not tainting on incidents whose
   envelope `source` is a reference venue, would loosen a fail-closed rule, so
-  it is left to the user's ruling rather than made here.
+  it is left to the user's ruling rather than made here. **A ruling is owed
+  before ratification** (review round 2, O-I1(ii)): today the taint applies
+  no source filter (`loop.ts` `#observeDeliverySession`), so the rule's
+  intended effect is unproven in any H1-like deployment until either the
+  narrowing is ruled in or a live run without reference-venue incidents
+  measures it.
 - A book on a session whose only traffic is its own changes behaves exactly as
   before. A whole quiet subscription (no asset changing) goes stale after the
   bound, as before (Option B would be needed to change that).
@@ -472,8 +540,9 @@ old recording can never read fresher than it did.
   (28 s with the example's 30 000 ms and 2 000 ms). This is how this rule is
   more permissive than the last-change rule. It rests on an undocumented
   assumption (N-A, N-B), and the ceiling is what bounds it. The same bound
-  covers the two accepted gaps: a taint this process never consumed (D2.4, X2)
-  and the widened `CO2-N1` backlog (D7, X9).
+  covers the accepted gap of a taint this process never consumed (D2.4, X2).
+  The widened `CO2-N1` backlog (D7, X9) is removed by the process-lag guard
+  (r2), subject to its ruling.
 - **For the venue register (not this round's paths):** N-B deserves an
   unknown row of its own (no documented cross-asset ordering on the market
   channel), next to U-2 and U-3.
@@ -527,3 +596,15 @@ r1 adds these pins:
   the REAL gateway to the REAL trader. A partly malformed frame admits 0
   orders under both bases (2 at `f341d5f`), and a well-formed control frame
   admits the entry under `CONNECTION_CONFIRMED` only.
+
+r2 adds these pins (`book-freshness.test.ts`, "r2 X9"):
+- `bookConfirmedAt`'s process-lag guard: no lag and a process clock behind
+  event time leave the confirmation; 1 500 ms of lag moves it back
+  1 500 ms; a lag past its lead, or 30 minutes, gives the last change; an
+  unreadable reading turns the extension off; the ceiling is judged at the
+  process's instant;
+- the composition: the reviewers' 09:30 backlog admits 0 orders (2 at
+  `a0a5f24`); a 30-minute-late replay evaluates exactly as `LAST_CHANGE`; a
+  live process 1 700 ms behind is fresh and 1 900 ms behind is stale at the
+  same event; a per-event replay clock decides byte-identically to the
+  unlagged run.

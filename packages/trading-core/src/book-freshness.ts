@@ -64,9 +64,30 @@
  * needs no rule of its own: each one stops the confirmations, so the book ages
  * out within its bound (ADR-023 D3).
  *
- * PURE STATE, NO CLOCK. Every instant arrives from an event's own `receivedAt`,
- * already normalised to strict UTC by `time.ts`; replay reproduces it exactly.
+ * ## The process-lag guard (review round 2, finding X9; ADR-023 D7)
+ *
+ * Every age is still measured in EVENT time, against the evaluating event's
+ * `receivedAt` (`CO2-N1` unchanged). But a sibling frame in a BACKLOG proves
+ * nothing about the present: a trader processing 09:00 events at 09:30 must
+ * not be vouched for by a 09:00 confirmation. So the extension is measured
+ * against the LATER of event time and the process clock (the `Clock` port the
+ * caller reads): with `lag = max(0, processNow − eventNow)`,
+ *
+ * - rule 6's ceiling is judged at `eventNow + lag`, and
+ * - the confirmation is moved back by `lag` before it is compared with the
+ *   last change, so its event-time age equals its process-time age.
+ *
+ * A lagging trader therefore gets at most what `LAST_CHANGE` gives it (the
+ * answer never moves before the last change), and an unreadable process clock
+ * turns the extension off. Under a replay clock positioned at each recorded
+ * event (the backtest), `lag` is 0 and the answer is the recorded one.
+ *
+ * PURE STATE, NO CLOCK READ HERE. Every instant arrives from an event's own
+ * `receivedAt`, already normalised to strict UTC by `time.ts`, or from the
+ * caller's reading of its `Clock` port; replay reproduces both exactly.
  */
+
+import { formatStrictUtc } from "./time.js";
 
 /** ADR-023 D4: the two freshness bases a trader configuration may name. */
 export const BOOK_FRESHNESS_BASES = Object.freeze(["LAST_CHANGE", "CONNECTION_CONFIRMED"] as const);
@@ -213,6 +234,10 @@ export class DeliverySessionLiveness {
  * ceiling before `now`, the answer is the last change itself, so the book's
  * age is its last-change age and the ordinary bound judges it — the
  * pre-ADR-023 rule, never looser.
+ *
+ * `processNowEpochMs` is the caller's reading of its `Clock` port (the
+ * process-lag guard, r2 X9, above): `undefined` or non-finite turns the
+ * extension off. It is read only under `CONNECTION_CONFIRMED`.
  */
 export function bookConfirmedAt(input: {
   readonly basis: BookFreshnessBasis;
@@ -221,20 +246,30 @@ export function bookConfirmedAt(input: {
   readonly marketHasActiveIncident: boolean;
   readonly liveness: DeliverySessionLiveness;
   readonly nowEpochMs: number;
+  readonly processNowEpochMs: number | undefined;
   readonly maximumLastChangeAgeMs: number | undefined;
 }): ConfirmedInstant | undefined {
   const { lastChange } = input;
   if (lastChange === undefined) return undefined;
   if (input.basis !== "CONNECTION_CONFIRMED") return lastChange;
-  // Rule 6. An absent ceiling cannot occur under `CONNECTION_CONFIRMED` (the
-  // configuration door requires it); if it ever did, the extension is off.
+  // The process-lag guard (r2, X9). An unreadable process clock is doubt.
+  const processNow = input.processNowEpochMs;
+  if (processNow === undefined || !Number.isFinite(processNow)) return lastChange;
+  const lagMs = Math.max(0, processNow - input.nowEpochMs);
+  // Rule 6, judged at the later of event time and process time. An absent
+  // ceiling cannot occur under `CONNECTION_CONFIRMED` (the configuration door
+  // requires it); if it ever did, the extension is off.
   const ceiling = input.maximumLastChangeAgeMs;
-  if (ceiling === undefined || !(input.nowEpochMs - lastChange.epochMs <= ceiling)) return lastChange;
+  if (ceiling === undefined || !(input.nowEpochMs + lagMs - lastChange.epochMs <= ceiling)) return lastChange;
   if (input.marketHasActiveIncident) return lastChange;
   if (input.sessionKey === undefined) return lastChange;
   const confirmed = input.liveness.confirmation(input.sessionKey);
   if (confirmed === undefined) return lastChange;
-  // The later of the two. A confirmation recorded under a clock that stepped
-  // backwards cannot move the answer before the book's own update.
-  return confirmed.epochMs > lastChange.epochMs ? confirmed : lastChange;
+  // The confirmation, moved back by the lag: its event-time age is then its
+  // process-time age. The later of that and the last change — a confirmation
+  // recorded under a clock that stepped backwards, or one the lag moves
+  // before the book's own update, cannot move the answer before that update.
+  const guardedMs = confirmed.epochMs - lagMs;
+  if (!(guardedMs > lastChange.epochMs)) return lastChange;
+  return lagMs === 0 ? confirmed : { iso: formatStrictUtc(guardedMs), epochMs: guardedMs };
 }

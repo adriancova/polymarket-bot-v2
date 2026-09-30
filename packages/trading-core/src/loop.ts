@@ -4023,8 +4023,21 @@ export class CoreLoop {
       marketHasActiveIncident: market.hasActiveIncident(),
       liveness: this.#liveness,
       nowEpochMs,
+      processNowEpochMs: this.#processNowEpochMs(),
       maximumLastChangeAgeMs: this.#freshnessCeilingMs,
     });
+  }
+
+  /**
+   * `THROUGHPUT-1c` r2 (X9, ADR-023 D7): the process clock, read ONLY under
+   * `CONNECTION_CONFIRMED` and only to bound the extension (the process-lag
+   * guard, `book-freshness.ts`). `LAST_CHANGE` reads no clock here. A reading
+   * that does not normalise is `undefined`, which turns the extension off.
+   */
+  #processNowEpochMs(): number | undefined {
+    if (this.#freshnessBasis !== "CONNECTION_CONFIRMED") return undefined;
+    const reading = normalizeToStrictUtc(this.#options.clock.now());
+    return reading.ok ? reading.epochMs : undefined;
   }
 
   /**
