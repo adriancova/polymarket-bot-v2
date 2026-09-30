@@ -19,6 +19,7 @@ import type { SdkClientFactory } from "../sdk-port.js";
 export {
   createMockSignerHandle,
   MOCK_FIXTURE_DOMAIN_NAME,
+  MOCK_SIGNATURE_R,
   MOCK_SIGNER_ADDRESS,
   MockSignerRefusal,
   type MockSignerProbe,

@@ -15,6 +15,14 @@
  *    its codes are examples, not an enumeration (U-4).
  * 3. Only own DATA properties of the SDK error are read (`status`, `code`,
  *    `retryAfter`). A getter is never invoked.
+ * 4. `NOT_APPLIED` (a documented refusal) is given ONLY to the exact
+ *    documented pairs: 425, 429 or 401 with NO code, and 503 with
+ *    `post_only_mode`. Any code on 425/429/401, documented or not, makes the
+ *    effect `UNKNOWN` (ADR-007 §6: "an unrecognized code is surfaced as
+ *    UNKNOWN and never ... silently treated as a rejection").
+ * 5. Reflection is contained. `instanceof` and property descriptors can run
+ *    foreign code (a proxy trap); if any of it throws, the result is a fresh
+ *    `UNKNOWN` error, and the thrown value is dropped unread.
  *
  * NOTHING FREE-TEXT CROSSES. The SDK's message embeds the venue's `error`
  * text and the request URL (`ServiceClient`: `${error} (${url})`), and its
@@ -37,15 +45,14 @@ import {
 
 import {
   DOCUMENTED_VENUE_ERROR_CODES,
+  MAX_RETRY_AFTER_SECONDS,
+  readSecureVenueErrorData,
   SecureVenueError,
   type CancelsAvailability,
   type RequestEffect,
   type SecureOperation,
   type SecureVenueErrorKind,
 } from "./errors.js";
-
-/** The largest retry delay carried; anything larger or malformed becomes `null`. */
-const MAX_RETRY_AFTER_SECONDS = 86_400;
 
 /** Read an own data property without invoking a getter. */
 function ownData(target: object, key: string): unknown {
@@ -63,12 +70,12 @@ function retryAfterOf(value: unknown): number | null {
     : null;
 }
 
-interface CodeReading {
+export interface CodeReading {
   readonly venueCode: string | null;
   readonly undocumentedVenueCode: boolean;
 }
 
-function codeOf(value: unknown): CodeReading {
+export function codeOf(value: unknown): CodeReading {
   if (value === undefined || value === null || value === "") {
     return { venueCode: null, undocumentedVenueCode: false };
   }
@@ -86,13 +93,21 @@ interface Classified {
   readonly cancelsAvailable: CancelsAvailability;
 }
 
-/** HTTP status + documented code → kind. The `error` text is never consulted. */
-export function classifyHttpRejection(status: number | null, documentedCode: string | null): Classified {
+/**
+ * HTTP status + code reading → kind and effect. The `error` text is never
+ * consulted. The kind follows the status (so a caller can still back off on
+ * a 425 or 429); the effect is `NOT_APPLIED` only for an exact documented
+ * pair (rule 4 above), and `UNKNOWN` whenever any code accompanies 425, 429
+ * or 401.
+ */
+export function classifyHttpRejection(status: number | null, code: CodeReading): Classified {
+  const codePresent = code.venueCode !== null || code.undocumentedVenueCode;
+  const refusal: RequestEffect = codePresent ? "UNKNOWN" : "NOT_APPLIED";
   if (status === 425) {
-    return { kind: "ENGINE_RESTARTING", effect: "NOT_APPLIED", cancelsAvailable: "UNKNOWN" };
+    return { kind: "ENGINE_RESTARTING", effect: refusal, cancelsAvailable: "UNKNOWN" };
   }
   if (status === 503) {
-    return documentedCode === "post_only_mode"
+    return code.venueCode === "post_only_mode"
       ? { kind: "POST_ONLY_MODE", effect: "NOT_APPLIED", cancelsAvailable: "YES" }
       : // C-9: cancel-only and fully-disabled are indistinguishable, and a
         // bare 503 may not even come from the matching engine. The request
@@ -100,25 +115,56 @@ export function classifyHttpRejection(status: number | null, documentedCode: str
         { kind: "TRADING_UNAVAILABLE", effect: "UNKNOWN", cancelsAvailable: "UNKNOWN" };
   }
   if (status === 429) {
-    return { kind: "RATE_LIMITED", effect: "NOT_APPLIED", cancelsAvailable: null };
+    return { kind: "RATE_LIMITED", effect: refusal, cancelsAvailable: null };
   }
   if (status === 401) {
-    return { kind: "AUTHENTICATION_REJECTED", effect: "NOT_APPLIED", cancelsAvailable: null };
+    return { kind: "AUTHENTICATION_REJECTED", effect: refusal, cancelsAvailable: null };
   }
   // U-4 / ADR-007 §6: an unrecognised status or code is never mapped to a
   // look-alike and never treated as a clean rejection.
   return { kind: "REQUEST_REJECTED", effect: "UNKNOWN", cancelsAvailable: null };
 }
 
+/** The value-free result every uncontained or unreadable input falls to. */
+function unknownError(operation: SecureOperation): SecureVenueError {
+  return new SecureVenueError({
+    kind: "UNKNOWN",
+    operation,
+    effect: "UNKNOWN",
+    httpStatus: null,
+    venueCode: null,
+    undocumentedVenueCode: false,
+    retryAfterSeconds: null,
+    cancelsAvailable: null,
+    source: "non-SDK",
+  });
+}
+
 /**
  * Map anything thrown by the SDK (or by code around it) to a redacted,
- * typed {@link SecureVenueError}. Never throws; never returns the input.
+ * typed {@link SecureVenueError}. Never throws for any `error` value, and
+ * never returns the input: a reflection failure while classifying it (a
+ * proxy trap that throws, a revoked proxy) yields a fresh `UNKNOWN` error
+ * and the thrown value is dropped unread.
+ *
+ * `operation` is a package-internal literal at every call site (this
+ * function is not exported from the package entry points).
  */
 export function mapVenueError(error: unknown, operation: SecureOperation): SecureVenueError {
+  try {
+    return classifyThrown(error, operation);
+  } catch {
+    return unknownError(operation);
+  }
+}
+
+function classifyThrown(error: unknown, operation: SecureOperation): SecureVenueError {
   if (error instanceof SecureVenueError) {
-    // Already mapped by this package; rebuild from its data so no foreign
-    // subclass or attached property survives.
-    return new SecureVenueError({ ...error.toData(), operation });
+    // Already mapped by this package. Rebuild from its own DATA fields,
+    // re-validated against the closed vocabularies: never via a method a
+    // subclass could override, and never trusting a field it could redefine.
+    const prior = readSecureVenueErrorData(error);
+    return prior === undefined ? unknownError(operation) : new SecureVenueError({ ...prior, operation });
   }
 
   const base = {
@@ -131,10 +177,13 @@ export function mapVenueError(error: unknown, operation: SecureOperation): Secur
   } as const;
 
   if (error instanceof RateLimitError) {
+    // The pinned `RateLimitError` has no `code` field; if one is ever
+    // present it is treated like a code on any 429 (rule 4).
+    const code = codeOf(ownData(error, "code"));
     return new SecureVenueError({
       ...base,
-      kind: "RATE_LIMITED",
-      effect: "NOT_APPLIED",
+      ...classifyHttpRejection(429, code),
+      ...code,
       httpStatus: 429,
       retryAfterSeconds: retryAfterOf(ownData(error, "retryAfter")),
       source: "RateLimitError",
@@ -143,10 +192,9 @@ export function mapVenueError(error: unknown, operation: SecureOperation): Secur
   if (error instanceof RequestRejectedError) {
     const status = httpStatusOf(ownData(error, "status"));
     const code = codeOf(ownData(error, "code"));
-    const classified = classifyHttpRejection(status, code.venueCode);
     return new SecureVenueError({
       ...base,
-      ...classified,
+      ...classifyHttpRejection(status, code),
       ...code,
       httpStatus: status,
       retryAfterSeconds: retryAfterOf(ownData(error, "retryAfter")),
@@ -183,7 +231,7 @@ export function mapVenueError(error: unknown, operation: SecureOperation): Secur
       source: "CancelledSigningError",
     });
   }
-  return new SecureVenueError({ ...base, kind: "UNKNOWN", effect: "UNKNOWN", source: "non-SDK" });
+  return unknownError(operation);
 }
 
 /** A local validation failure of this package's own interface: nothing was sent. */

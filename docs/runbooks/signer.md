@@ -45,8 +45,18 @@ A failed step throws, and nothing after it runs.
 
    Every other case throws `SignerBoundaryRefusal` with reason codes only.
    That covers `BACKTEST`, `PAPER`, `SHADOW`, `REPLAY`, a lower-case mode, a
-   missing mode, the string `"true"`, a getter, a proxy, an extra key and an
-   inherited field.
+   missing mode, the string `"true"`, a getter, an extra key, an inherited
+   field, and any context whose reflection throws (a revoked proxy, a proxy
+   trap that throws): the exception is caught, dropped unread, and the
+   context refuses as `CONTEXT_UNREADABLE`.
+
+   **A proxy is not refused as such.** JavaScript cannot tell a proxy from a
+   plain object, so a proxy whose traps report exactly the three own data
+   properties is read like the object it imitates. That is safe: each value
+   is read once and copied, and the verdict is computed from the copies, so a
+   trap cannot answer differently afterwards. The options object itself is
+   read the same way: a throwing getter or trap on it refuses as
+   `CONTEXT_UNREADABLE`, never as the raw error.
 2. **The handle is checked.** It must be a `SignerHandle` that this package
    sealed; the check is a module-private `WeakMap` lookup. A forged object, a
    `SignerHandle.prototype` look-alike or `Reflect.construct` is refused
@@ -63,6 +73,26 @@ A failed step throws, and nothing after it runs.
    never returned, serialised or inspected.
 
 After construction **no method throws**. Each method returns an outcome.
+Caller input is read by contained reflection: a getter, a hole, a proxy trap
+that throws or a revoked proxy makes the input invalid (`NOT_SENT`), and the
+thrown value is dropped unread. Arrays are copied once, index by index, from
+own data properties, so what is validated is exactly what is sent. An invalid
+batch returns one `NOT_SENT` per request entry, bounded at 16, so a hostile
+`length` cannot exhaust memory.
+
+`createLimitOrder` accepts a price strictly between 0 and 1 only. Before it
+hands out an envelope, it checks the SDK's signed order against the request:
+
+- token, side, post-only, expiration and order type (`GTC`, or `GTD` when an
+  expiration was given) must match exactly;
+- the share amount must be the requested size rounded **down** by less than
+  0.01 share, the pinned SDK's share precision;
+- the quote amount must be price × shares rounded **down** by less than
+  0.001 pUSD, the pinned SDK's coarsest quote precision.
+
+These are exact integer comparisons, never floats. A mismatch is `FAILED`
+(`UNKNOWN`), and nothing is transmitted. A change in the SDK's rounding
+therefore fails closed.
 
 | Method | Outcome kinds |
 | --- | --- |
@@ -76,7 +106,7 @@ After construction **no method throws**. Each method returns an outcome.
 | Outcome | Meaning | OMS consequence (ADR-007) |
 | --- | --- | --- |
 | `NOT_SENT` | Nothing left the process: local validation, SDK input validation or signing failed. | The attempt does not exist at the venue. |
-| `REFUSED` | The venue returned a documented refusal: 429, 425, 503 with `post_only_mode`, or 401. | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
+| `REFUSED` | The venue returned a documented refusal: 429, 425 or 401 with no code, or 503 with `post_only_mode`. | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
 | `REJECTED` | The SDK classified a venue rejection. The reasons are the eight named `OrderResponseErrorCode` members. | Not placed. |
 | `UNKNOWN` | The order may exist. | `SUBMISSION_UNKNOWN`: reconcile by the signed identity before any new salt (§2 step 10, §3). |
 | `ACCEPTED` / `DELAYED` | The order was placed, but `DELAYED` is never a fill: its amounts are `"0"` (§5). | Track the order as pending. |
@@ -90,14 +120,30 @@ Errors are classified by HTTP status and **documented** code. The venue's
 | --- | --- | --- | --- |
 | `UserInputError` | `INVALID_REQUEST` | `NOT_SENT` | — |
 | `SigningError`, `CancelledSigningError` | `SIGNING_FAILED` | `NOT_SENT` | — |
-| `RateLimitError` (429) | `RATE_LIMITED` | `NOT_APPLIED` | — |
-| 425 | `ENGINE_RESTARTING` | `NOT_APPLIED` | `UNKNOWN` |
+| `RateLimitError` (429), no code | `RATE_LIMITED` | `NOT_APPLIED` | — |
+| 425, no code | `ENGINE_RESTARTING` | `NOT_APPLIED` | `UNKNOWN` |
 | 503 + `code: "post_only_mode"` | `POST_ONLY_MODE` | `NOT_APPLIED` | `YES` (documented) |
 | 503, any other or no code | `TRADING_UNAVAILABLE` | `UNKNOWN` | `UNKNOWN` (C-9) |
-| 401 | `AUTHENTICATION_REJECTED` | `NOT_APPLIED` | — |
+| 401, no code | `AUTHENTICATION_REJECTED` | `NOT_APPLIED` | — |
+| 401, 425 or 429 **with any code** (documented or not) | by status, as above | **`UNKNOWN`** (ADR-007 §6) | as above |
 | any other status | `REQUEST_REJECTED` | `UNKNOWN` (U-4) | — |
 | `TransportError` / `TimeoutError` / `UnexpectedResponseError` | `TRANSPORT_FAILURE` / `TIMEOUT` / `UNEXPECTED_RESPONSE` | `UNKNOWN` | — |
-| anything else, including an SDK look-alike that is not an instance | `UNKNOWN` | `UNKNOWN` | — |
+| anything else, including an SDK look-alike that is not an instance, and any value whose reflection throws | `UNKNOWN` | `UNKNOWN` | — |
+
+`NOT_APPLIED` (outcome `REFUSED`) is given **only** to the exact documented
+pairs: 401, 425 or 429 with no code, and 503 with `post_only_mode`. ADR-007 §6:
+"an unrecognized code is surfaced as UNKNOWN and never … silently treated as a
+rejection". The kind still follows the status, so a caller can back off.
+
+**Closed vocabularies.** Every field of a `SecureVenueError` is checked on
+every construction: the kind, operation, effect, source and cancel flag
+against fixed lists; the status as an integer from 100 to 599; the code
+against the documented codes; and the retry delay against 0–86,400 s. Only own
+data properties are read. The constructor throws a fixed, value-free
+`TypeError` on anything else, and the instance is frozen. Re-mapping an
+existing `SecureVenueError` re-reads and re-validates its own data fields; it
+never calls a method a subclass could override. `SignerBoundaryRefusal`
+accepts only its known reason codes.
 
 **C-9.** The venue publishes three strings for one condition:
 
@@ -136,9 +182,18 @@ Six independent layers stop it. Each is tested.
 2. **No real signer exists.** The only sealed handle this package can produce
    is the `TEST_MOCK` mock. The mock holds no key. It signs only payloads in
    its own fixture domain (`WP-260 TEST FIXTURE - NOT A VENUE DOMAIN`), and it
-   refuses `ClobAuthDomain` and every venue domain. Its "signature" is two
-   SHA-256 digests plus recovery byte `0x00`, which is invalid for secp256k1.
+   refuses `ClobAuthDomain` and every venue domain. Its 65-byte "signature"
+   has `r = 0`, `s` = a SHA-256 digest of the payload, and a `0x00` parity
+   byte. ECDSA requires `1 ≤ r ≤ n − 1`, so it is not a secp256k1 signature:
+   the pinned SDK's own `ox` parses the bytes but refuses to recover any
+   address ("expected valid r"). `signer-boundary.test.ts` shows this.
    `signMessage` and `sendTransaction` always refuse.
+
+   *Correction (review r1).* An earlier version used a non-zero `r`, and this
+   runbook said the `0x00` byte alone made the signature invalid. That was
+   wrong: `0x00` is a valid y-parity, and `ox` recovered an address from it.
+   The safety conclusion did not depend on it (no key exists, and the mock
+   cannot reach the real SDK), but the claim is now true.
 3. **The gate refuses every non-live mode and the repository defaults.**
    `MAX_RUN_MODE=PAPER` and `ALLOW_REAL_ORDERS=false` fail two conditions at
    once. A test reads this test process's real environment and asserts the
@@ -153,7 +208,13 @@ Six independent layers stop it. Each is tested.
    `WP-260` does not touch `apps/trader`. The control API asserts the same
    for itself (`test/integration/control-api/acceptance-3-no-signer.test.ts`).
    No other package may import the SDK: `check:deps` F6, and this package's
-   repository-wide scan, `sdk-import-boundary.test.ts`.
+   repository-wide scan, `sdk-import-boundary.test.ts`. The same scan applies
+   a `TEST-ONLY` rule: `@polymarket-bot/polymarket-secure/testing` (the mock
+   signer, the fake SDK and `createSecureVenueClientForTesting`) may be
+   imported only by test files (under `test/`, or `*.test.*` / `*.spec.*`).
+   A relative import into `src/testing/` counts the same. F12 does allow a
+   layer-3 app to import this layer-2 package; the rule narrows only the test
+   subpath.
 6. **The trader's startup veto.** A paper process that merely *references* a
    production secret name refuses to start (`packages/trading-core/src/safety.ts`;
    ADR-010 §3).
@@ -194,9 +255,13 @@ Other values are protected in the same way:
 - **Documented cancel failure reasons** are carried verbatim. Any other reason
   becomes `UNDOCUMENTED`.
 - **`redactForLog`** is a second line of defence, for logging arbitrary
-  objects. It redacts values under sensitive key names, never invokes
-  getters, and reduces an `Error` to its name. It is cycle-safe and bounded in
-  depth.
+  objects. It redacts values under sensitive key names and never invokes a
+  getter: object keys and array indices are read as own data properties, and
+  `Map`/`Set` through the built-in iterators, never an own override. It
+  reduces an `Error` to its name, and keeps the name only when it is a
+  standard, SDK or package error name; any other name becomes `"Error"`. It is
+  cycle-safe, bounded in depth and in collection size, and never throws: an
+  unreadable object becomes `"[unreadable]"`.
 
 `redaction.test.ts` is the property test. Using a fixed seed, it builds 120
 hostile errors of every SDK class, with fake secrets in:
@@ -217,7 +282,7 @@ caught on every case.
 
 | Suite | Runs in | Contents |
 | --- | --- | --- |
-| `packages/polymarket-secure/src/*.test.ts` | root `pnpm test` (CI) | the gate, the boundary, the error mapping, redaction, the client, the repository-wide SDK import scan, source hygiene |
+| `packages/polymarket-secure/src/**/*.test.ts` | root `pnpm test` (CI) | the gate, the boundary, the error mapping, redaction, the client, the repository-wide SDK import scan, source hygiene, the round-1 review pins (`hardening-r1.test.ts`), and the tripwire's own self-test (`testing/network-tripwire.test.ts`) |
 | `test/contract/polymarket-secure/*.test.ts` | `pnpm --filter @polymarket-bot/polymarket-secure test:contract` | the venue fixtures run through the pinned SDK's own response parser and HTTP error construction, then through the client |
 
 Every test installs the **network tripwire**. It replaces `globalThis.fetch`,
@@ -226,7 +291,9 @@ every Node TCP and TLS client. Any attempt throws and is recorded, and the
 test fails in `afterEach` if the attempt list is not empty. The contract suite
 serves sanitized HTTP fixtures to the SDK from an in-memory responder. It uses
 only one unauthenticated public-client request, and every other request is
-refused.
+refused. `testing/network-tripwire.test.ts` exercises every leg (fetch,
+WebSocket, TCP and TLS, and restoration), so removing a leg fails the root
+`pnpm test`.
 
 No test uses a real key, a credential, an authenticated endpoint or a
 WebSocket connection. No test places an order.

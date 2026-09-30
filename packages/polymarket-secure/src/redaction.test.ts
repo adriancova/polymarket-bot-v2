@@ -360,8 +360,12 @@ describe("the secure client, envelopes and snapshots never render held secrets",
     if (signed.kind !== "SIGNED") throw new Error("fixture signing failed");
     const signature = String(signed.order.revealPayloadForEncryptedPersistence()["signature"]);
     expect(signature).toMatch(/^0x[0-9a-f]{130}$/u);
-    for (const text of renderings(signed)) expect(text).not.toContain(signature.slice(2, 34));
-    for (const text of renderings(signed.order)) expect(text).not.toContain(signature.slice(2, 34));
+    // The mock's `r` is 32 zero bytes (never a valid signature), so the
+    // distinctive part of the signature is `s`: bytes 33…64.
+    const distinctive = signature.slice(66, 98);
+    expect(distinctive).not.toMatch(/^0+$/u);
+    for (const text of renderings(signed)) expect(text).not.toContain(distinctive);
+    for (const text of renderings(signed.order)) expect(text).not.toContain(distinctive);
     expect(Reflect.ownKeys(signed.order)).toEqual(["identity"]);
     // The persisted payload round-trips to an equal identity (ADR-007 §2 step 9).
     const again = SignedOrderEnvelope.fromPersistedPayload({ ...signed.order.revealPayloadForEncryptedPersistence() });

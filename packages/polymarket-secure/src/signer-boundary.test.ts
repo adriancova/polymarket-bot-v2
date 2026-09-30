@@ -5,6 +5,8 @@
  * real SDK; and the mock itself cannot sign anything but an in-memory fixture.
  */
 
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 
 import { TransportError } from "@polymarket/client";
@@ -20,6 +22,7 @@ import {
   createSecureVenueClientForTesting,
   installNetworkTripwire,
   MOCK_FIXTURE_DOMAIN_NAME,
+  MOCK_SIGNATURE_R,
   MOCK_SIGNER_ADDRESS,
   MockSignerRefusal,
   type NetworkTripwire,
@@ -169,7 +172,7 @@ describe("the mock signer (TEST ONLY) cannot sign a real order", () => {
     expect(probe.refusals).toBe(3);
   });
 
-  it("signs an in-memory fixture with a structurally invalid signature (recovery byte 0x00)", async () => {
+  it("signs an in-memory fixture with r = 0, which is not a secp256k1 signature", async () => {
     const { handle } = createMockSignerHandle();
     const signature = await unsealSigner(handle)?.signer.signTypedData({
       domain: { name: MOCK_FIXTURE_DOMAIN_NAME, version: "0", chainId: 31337 },
@@ -178,6 +181,29 @@ describe("the mock signer (TEST ONLY) cannot sign a real order", () => {
       message: { salt: "1" },
     });
     expect(signature).toMatch(/^0x[0-9a-f]{128}00$/u);
+    expect(String(signature).slice(0, 66)).toBe(MOCK_SIGNATURE_R);
+  });
+
+  it("L2: the pinned SDK's own ox parses a mock signature but refuses to recover ANY address from it", async () => {
+    // ox is the SDK's pinned signature library; it is located from the SDK's
+    // own resolution root, as the contract hooks locate its bindings.
+    const sdkEntry = createRequire(import.meta.url).resolve("@polymarket/client");
+    const ox = (await import(pathToFileURL(createRequire(sdkEntry).resolve("ox")).href)) as {
+      Signature: { fromHex(hex: string): { r: bigint; s: bigint; yParity: number } };
+      Secp256k1: { recoverAddress(options: { payload: string; signature: unknown }): string };
+    };
+    const { handle } = createMockSignerHandle();
+    const signature = String(
+      await unsealSigner(handle)?.signer.signTypedData({
+        domain: { name: MOCK_FIXTURE_DOMAIN_NAME, version: "0", chainId: 31337 },
+        primaryType: "FixtureOrder",
+        types: { FixtureOrder: [{ name: "salt", type: "uint256" }] },
+        message: { salt: "2" },
+      }),
+    );
+    const parsed = ox.Signature.fromHex(signature);
+    expect(parsed.r).toBe(0n);
+    expect(() => ox.Secp256k1.recoverAddress({ payload: `0x${"22".repeat(32)}`, signature: parsed })).toThrow(/valid r/u);
   });
 });
 

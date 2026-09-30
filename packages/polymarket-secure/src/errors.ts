@@ -46,8 +46,9 @@ export type SecureVenueErrorKind =
  * What the failed request did at the venue, as far as this package can know.
  *
  * - `NOT_SENT`: nothing left the process.
- * - `NOT_APPLIED`: the venue answered with a documented refusal (429, 425,
- *   503 `post_only_mode`, 401).
+ * - `NOT_APPLIED`: the venue answered with a documented refusal: 429, 425 or
+ *   401 with NO code, or 503 with `post_only_mode`. Any code on 429/425/401
+ *   makes the effect `UNKNOWN` (ADR-007 §6).
  * - `UNKNOWN`: the request may have been applied. For a placement this is
  *   `SUBMISSION_UNKNOWN` territory: reconcile before any retry with a new
  *   salt (ADR-007 §2 step 10, §3).
@@ -109,7 +110,140 @@ export interface SecureVenueErrorData {
   readonly retryAfterSeconds: number | null;
   readonly cancelsAvailable: CancelsAvailability;
   /** The SDK error class name when it is one of the known SDK classes, else `"non-SDK"`. */
-  readonly source: string;
+  readonly source: SecureVenueErrorSource;
+}
+
+/**
+ * Where a mapped error came from: one of the pinned SDK's error classes this
+ * package classifies, `"non-SDK"` for anything else, or `"polymarket-secure"`
+ * for this package's own validation.
+ */
+export type SecureVenueErrorSource =
+  | "RateLimitError"
+  | "RequestRejectedError"
+  | "TransportError"
+  | "TimeoutError"
+  | "UnexpectedResponseError"
+  | "UserInputError"
+  | "SigningError"
+  | "CancelledSigningError"
+  | "non-SDK"
+  | "polymarket-secure";
+
+// ---------------------------------------------------------------------------
+// Closed vocabularies. Every field of a SecureVenueError is checked against
+// these on EVERY construction, so no caller, subclass or mutated instance can
+// put a value outside them into an error this package emits.
+
+const KINDS: ReadonlySet<string> = new Set<SecureVenueErrorKind>([
+  "INVALID_REQUEST",
+  "SIGNING_FAILED",
+  "RATE_LIMITED",
+  "ENGINE_RESTARTING",
+  "POST_ONLY_MODE",
+  "TRADING_UNAVAILABLE",
+  "AUTHENTICATION_REJECTED",
+  "REQUEST_REJECTED",
+  "TRANSPORT_FAILURE",
+  "TIMEOUT",
+  "UNEXPECTED_RESPONSE",
+  "UNKNOWN",
+]);
+const OPERATIONS: ReadonlySet<string> = new Set<SecureOperation>([
+  "CREATE_CLIENT",
+  "CREATE_LIMIT_ORDER",
+  "POST_ORDER",
+  "POST_ORDERS",
+  "CANCEL_ORDER",
+  "CANCEL_ORDERS",
+  "CANCEL_MARKET_ORDERS",
+  "CANCEL_ALL",
+  "FETCH_ORDER",
+  "CLOSE",
+]);
+const EFFECTS: ReadonlySet<string> = new Set<RequestEffect>(["NOT_SENT", "NOT_APPLIED", "UNKNOWN"]);
+const SOURCES: ReadonlySet<string> = new Set<SecureVenueErrorSource>([
+  "RateLimitError",
+  "RequestRejectedError",
+  "TransportError",
+  "TimeoutError",
+  "UnexpectedResponseError",
+  "UserInputError",
+  "SigningError",
+  "CancelledSigningError",
+  "non-SDK",
+  "polymarket-secure",
+]);
+
+/** The largest retry delay carried (one day). */
+export const MAX_RETRY_AFTER_SECONDS = 86_400;
+
+const FIELD_NAMES = [
+  "kind",
+  "operation",
+  "effect",
+  "httpStatus",
+  "venueCode",
+  "undocumentedVenueCode",
+  "retryAfterSeconds",
+  "cancelsAvailable",
+  "source",
+] as const;
+
+export function isSecureOperation(value: unknown): value is SecureOperation {
+  return typeof value === "string" && OPERATIONS.has(value);
+}
+
+/**
+ * Read `candidate` as {@link SecureVenueErrorData}: own DATA properties only
+ * (a getter is never invoked), every value inside its closed vocabulary.
+ * Returns `undefined` for anything else, including a candidate whose
+ * reflection throws (a revoked proxy, a throwing trap). Never throws.
+ */
+export function readSecureVenueErrorData(candidate: unknown): SecureVenueErrorData | undefined {
+  try {
+    if (typeof candidate !== "object" || candidate === null) return undefined;
+    const values: Record<string, unknown> = {};
+    for (const key of FIELD_NAMES) {
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+      if (descriptor === undefined || !("value" in descriptor)) return undefined;
+      values[key] = descriptor.value;
+    }
+    const { kind, operation, effect, httpStatus, venueCode, undocumentedVenueCode, retryAfterSeconds, cancelsAvailable, source } =
+      values;
+    const valid =
+      typeof kind === "string" &&
+      KINDS.has(kind) &&
+      isSecureOperation(operation) &&
+      typeof effect === "string" &&
+      EFFECTS.has(effect) &&
+      (httpStatus === null ||
+        (typeof httpStatus === "number" && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599)) &&
+      (venueCode === null || (typeof venueCode === "string" && DOCUMENTED_VENUE_ERROR_CODES.includes(venueCode))) &&
+      typeof undocumentedVenueCode === "boolean" &&
+      (retryAfterSeconds === null ||
+        (typeof retryAfterSeconds === "number" &&
+          Number.isFinite(retryAfterSeconds) &&
+          retryAfterSeconds >= 0 &&
+          retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS)) &&
+      (cancelsAvailable === null || cancelsAvailable === "YES" || cancelsAvailable === "UNKNOWN") &&
+      typeof source === "string" &&
+      SOURCES.has(source);
+    if (!valid) return undefined;
+    return Object.freeze({
+      kind: kind as SecureVenueErrorKind,
+      operation,
+      effect: effect as RequestEffect,
+      httpStatus: httpStatus as number | null,
+      venueCode: venueCode as string | null,
+      undocumentedVenueCode,
+      retryAfterSeconds: retryAfterSeconds as number | null,
+      cancelsAvailable: cancelsAvailable as CancelsAvailability,
+      source: source as SecureVenueErrorSource,
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -118,6 +252,11 @@ export interface SecureVenueErrorData {
  * It has no `cause`, and its `message` is one of the fixed sentences above
  * plus the kind and operation. `toJSON()` and `util.inspect` both render only
  * {@link SecureVenueErrorData}.
+ *
+ * The constructor VALIDATES its input with {@link readSecureVenueErrorData}
+ * (own data properties, closed vocabularies) and throws a `TypeError` with a
+ * fixed, value-free message on anything else. The instance is frozen, so its
+ * fields cannot be changed after the check.
  */
 export class SecureVenueError extends Error implements SecureVenueErrorData {
   override readonly name = "SecureVenueError";
@@ -129,19 +268,25 @@ export class SecureVenueError extends Error implements SecureVenueErrorData {
   readonly undocumentedVenueCode: boolean;
   readonly retryAfterSeconds: number | null;
   readonly cancelsAvailable: CancelsAvailability;
-  readonly source: string;
+  readonly source: SecureVenueErrorSource;
 
   constructor(data: SecureVenueErrorData) {
-    super(`${data.operation}: ${data.kind}: ${KIND_SENTENCES[data.kind]}`);
-    this.kind = data.kind;
-    this.operation = data.operation;
-    this.effect = data.effect;
-    this.httpStatus = data.httpStatus;
-    this.venueCode = data.venueCode;
-    this.undocumentedVenueCode = data.undocumentedVenueCode;
-    this.retryAfterSeconds = data.retryAfterSeconds;
-    this.cancelsAvailable = data.cancelsAvailable;
-    this.source = data.source;
+    const valid = readSecureVenueErrorData(data);
+    if (valid === undefined) {
+      // Fixed text: the rejected input is never echoed.
+      throw new TypeError("SecureVenueError: data outside the closed vocabularies");
+    }
+    super(`${valid.operation}: ${valid.kind}: ${KIND_SENTENCES[valid.kind]}`);
+    this.kind = valid.kind;
+    this.operation = valid.operation;
+    this.effect = valid.effect;
+    this.httpStatus = valid.httpStatus;
+    this.venueCode = valid.venueCode;
+    this.undocumentedVenueCode = valid.undocumentedVenueCode;
+    this.retryAfterSeconds = valid.retryAfterSeconds;
+    this.cancelsAvailable = valid.cancelsAvailable;
+    this.source = valid.source;
+    Object.freeze(this);
   }
 
   /** The allow-listed fields only. */
@@ -189,17 +334,56 @@ export type SignerRefusalReason =
   /** A non-mock signer was handed to the test-only factory. */
   | "REAL_SIGNER_REJECTED_BY_TEST_FACTORY";
 
+const REFUSAL_REASONS: ReadonlySet<string> = new Set<SignerRefusalReason>([
+  "CONTEXT_UNREADABLE",
+  "RUN_MODE_UNKNOWN",
+  "RUN_MODE_REQUIRES_NO_SIGNER",
+  "MAXIMUM_RUN_MODE_UNKNOWN",
+  "RUN_MODE_ABOVE_MAXIMUM",
+  "REAL_ORDERS_NOT_ALLOWED",
+  "SIGNER_NOT_SEALED",
+  "MOCK_SIGNER_REJECTED_BY_REAL_SDK",
+  "REAL_SIGNER_REJECTED_BY_TEST_FACTORY",
+]);
+
+/** A copy of 1…9 known reasons, or `undefined`. Own data entries only; never throws. */
+function readRefusalReasons(candidate: unknown): readonly SignerRefusalReason[] | undefined {
+  try {
+    if (!Array.isArray(candidate)) return undefined;
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(candidate, "length");
+    const length: unknown = lengthDescriptor !== undefined && "value" in lengthDescriptor ? lengthDescriptor.value : undefined;
+    if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 1 || length > REFUSAL_REASONS.size) return undefined;
+    const out: SignerRefusalReason[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(candidate, String(index));
+      const value: unknown = descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+      if (typeof value !== "string" || !REFUSAL_REASONS.has(value)) return undefined;
+      out.push(value as SignerRefusalReason);
+    }
+    return Object.freeze(out);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The signer boundary refused to construct a secure client. Carries reason
- * codes only; never a value from the context it refused.
+ * codes only; never a value from the context it refused. The constructor
+ * accepts only 1…9 known {@link SignerRefusalReason} codes and throws a
+ * `TypeError` with a fixed, value-free message on anything else.
  */
 export class SignerBoundaryRefusal extends Error {
   override readonly name = "SignerBoundaryRefusal";
   readonly reasons: readonly SignerRefusalReason[];
 
   constructor(reasons: readonly SignerRefusalReason[]) {
-    super(`the signer boundary refused to construct a secure venue client: ${reasons.join(", ")}`);
-    this.reasons = Object.freeze([...reasons]);
+    const valid = readRefusalReasons(reasons);
+    if (valid === undefined) {
+      throw new TypeError("SignerBoundaryRefusal: reasons outside the closed vocabulary");
+    }
+    super(`the signer boundary refused to construct a secure venue client: ${valid.join(", ")}`);
+    this.reasons = valid;
+    Object.freeze(this);
   }
 
   toJSON(): { readonly name: string; readonly message: string; readonly reasons: readonly SignerRefusalReason[] } {

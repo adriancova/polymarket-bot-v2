@@ -62,6 +62,25 @@ export const DEFAULT_FAKE_ACCOUNT = Object.freeze({
 
 let fixtureSalt = 1_000_000;
 
+/**
+ * The amounts the pinned SDK would sign for a limit order at tick 0.01:
+ * shares rounded DOWN to 2 decimals, the quote (price × shares) rounded DOWN
+ * to 4 decimals, both in 6-decimal base units. Exact integer arithmetic.
+ */
+function fixtureAmounts(request: Parameters<Port["createLimitOrder"]>[0]): { makerAmount: string; takerAmount: string } {
+  const rational = (value: unknown): { n: bigint; d: bigint } => {
+    const text = String(value);
+    const [whole = "0", fraction = ""] = text.split(".");
+    return { n: BigInt(`${whole}${fraction}`), d: 10n ** BigInt(fraction.length) };
+  };
+  const size = rational("size" in request ? request.size : "0");
+  const price = rational(request.price);
+  const shares = ((size.n * 1_000_000n) / size.d / 10_000n) * 10_000n;
+  const quote = ((price.n * shares) / price.d / 100n) * 100n;
+  const [maker, taker] = request.side === "BUY" ? [quote, shares] : [shares, quote];
+  return { makerAmount: maker.toString(10), takerAmount: taker.toString(10) };
+}
+
 /** Build and mock-sign an in-memory fixture order. */
 async function defaultCreateLimitOrder(
   request: Parameters<Port["createLimitOrder"]>[0],
@@ -74,8 +93,7 @@ async function defaultCreateLimitOrder(
     maker: MOCK_SIGNER_ADDRESS,
     signer: MOCK_SIGNER_ADDRESS,
     tokenId,
-    makerAmount: "5200000",
-    takerAmount: "10000000",
+    ...fixtureAmounts(request),
     side: request.side,
     signatureType: 0,
     timestamp: "1767225600000",

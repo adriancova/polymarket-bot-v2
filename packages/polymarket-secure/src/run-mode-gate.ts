@@ -62,21 +62,33 @@ function isRunMode(value: unknown): value is RunMode {
 /**
  * Read the context as exactly three own data properties of a plain object.
  * A getter, a proxy trap result that is not a data descriptor, an inherited
- * field, an extra field or a non-plain prototype makes it unreadable.
+ * field, an extra field or a non-plain prototype makes it unreadable; so does
+ * ANY exception during the reflection (a revoked proxy, a trap that throws):
+ * it is caught, dropped unread, and the context is refused.
+ *
+ * A PROXY IS NOT REFUSED AS SUCH. JavaScript cannot tell a proxy from a plain
+ * object, so a proxy whose traps report exactly the three own data
+ * properties is read like the object it imitates. That is safe because each
+ * value is read ONCE, here, and copied; the verdict and the permitted context
+ * are computed from the copies, so a trap cannot answer differently later.
  */
 function readContext(input: unknown): Readonly<Record<(typeof CONTEXT_KEYS)[number], unknown>> | undefined {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
-  const prototype: unknown = Object.getPrototypeOf(input);
-  if (prototype !== Object.prototype && prototype !== null) return undefined;
-  const keys = Reflect.ownKeys(input);
-  if (keys.length !== CONTEXT_KEYS.length) return undefined;
-  const values: Record<string, unknown> = {};
-  for (const key of CONTEXT_KEYS) {
-    const descriptor = Object.getOwnPropertyDescriptor(input, key);
-    if (descriptor === undefined || !("value" in descriptor)) return undefined;
-    values[key] = descriptor.value;
+  try {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+    const prototype: unknown = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const keys = Reflect.ownKeys(input);
+    if (keys.length !== CONTEXT_KEYS.length) return undefined;
+    const values: Record<string, unknown> = {};
+    for (const key of CONTEXT_KEYS) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined || !("value" in descriptor)) return undefined;
+      values[key] = descriptor.value;
+    }
+    return values as Readonly<Record<(typeof CONTEXT_KEYS)[number], unknown>>;
+  } catch {
+    return undefined;
   }
-  return values as Readonly<Record<(typeof CONTEXT_KEYS)[number], unknown>>;
 }
 
 /** Evaluate the gate without throwing. Collects every reason that applies. */
@@ -145,11 +157,17 @@ export function signerGateContextFromSafetyFlags(flags: Readonly<Record<string, 
   readonly maximumRunMode: string;
   readonly allowRealOrders: boolean;
 } {
+  // A reflection failure (a revoked proxy, a throwing trap) reads as absent,
+  // which the gate then refuses; the thrown value is dropped unread.
   const read = (name: string): string | undefined => {
-    const descriptor = Object.getOwnPropertyDescriptor(flags, name);
-    return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string"
-      ? descriptor.value
-      : undefined;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(flags, name);
+      return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string"
+        ? descriptor.value
+        : undefined;
+    } catch {
+      return undefined;
+    }
   };
   return {
     runMode: read("RUN_MODE"),

@@ -83,7 +83,9 @@ export function installNetworkTripwire(options: { readonly responder?: FetchResp
   (globalThis as { WebSocket?: unknown }).WebSocket = TrippedWebSocket;
 
   socketPrototype.connect = function trippedConnect(...args: unknown[]): never {
-    const first = args[0];
+    // `net.connect` / `tls.connect` pass Node's normalised `[options, cb]`
+    // array as the first argument; a direct call passes the options.
+    const first = Array.isArray(args[0]) ? (args[0] as unknown[])[0] : args[0];
     const target =
       typeof first === "object" && first !== null
         ? `${String((first as { host?: unknown }).host ?? "")}:${String((first as { port?: unknown }).port ?? (first as { path?: unknown }).path ?? "")}`

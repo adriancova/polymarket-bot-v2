@@ -4,9 +4,14 @@
  * Why it cannot sign a real order, three independent ways:
  *
  * 1. THERE IS NO KEY. Nothing here is a private key, a seed or a mnemonic;
- *    no elliptic-curve operation is performed. The "signature" is two
- *    SHA-256 digests of the payload plus a recovery byte of `0x00`, which is
- *    not a valid secp256k1 recovery id (27/28), so no verifier accepts it.
+ *    no elliptic-curve operation is performed. The 65-byte "signature" is
+ *    `r = 0` (32 zero bytes), `s` = a SHA-256 digest of the payload, and a
+ *    parity byte of `0x00`. ECDSA requires `1 ≤ r ≤ n − 1`, so the value is
+ *    not a secp256k1 signature at all: the pinned SDK's own `ox` parses the
+ *    bytes but refuses to recover any address from them ("expected valid r"),
+ *    as `signer-boundary.test.ts` shows. (An earlier version used a non-zero
+ *    `r` and claimed the `0x00` byte alone made it invalid; that was wrong,
+ *    since `0x00` is a valid y-parity and `ox` recovered an address.)
  * 2. IT SIGNS ONLY IN-MEMORY FIXTURES. `signTypedData` refuses any payload
  *    whose EIP-712 domain name is not {@link MOCK_FIXTURE_DOMAIN_NAME}, a
  *    name no venue contract uses (the venue's are `ClobAuthDomain` and the
@@ -49,12 +54,14 @@ function canonical(value: unknown): string {
   return JSON.stringify(value, (_key, entry: unknown) => (typeof entry === "bigint" ? `${entry.toString(10)}n` : entry));
 }
 
-/** A fake, structurally invalid 65-byte signature (recovery byte 0x00). */
+/** The fixed `r` of every mock signature: zero, which no ECDSA signature can have. */
+export const MOCK_SIGNATURE_R = `0x${"00".repeat(32)}` as const;
+
+/** A fake 65-byte signature with `r = 0`: never a valid secp256k1 signature. */
 function fakeSignature(payload: unknown): string {
   const text = canonical(payload);
-  const first = createHash("sha256").update(`WP-260-MOCK-R:${text}`).digest("hex");
-  const second = createHash("sha256").update(`WP-260-MOCK-S:${text}`).digest("hex");
-  return `0x${first}${second}00`;
+  const s = createHash("sha256").update(`WP-260-MOCK-S:${text}`).digest("hex");
+  return `${MOCK_SIGNATURE_R}${s}00`;
 }
 
 /**

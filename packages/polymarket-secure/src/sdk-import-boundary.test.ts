@@ -22,6 +22,15 @@
  *
  * NON-VACUOUS: the scan must find this package's own SDK imports (positive
  * control), and it must flag planted violations of every kind.
+ *
+ * TEST-ONLY SUBPATH (review r1, finding L4). The same scan also enforces that
+ * `@polymarket-bot/polymarket-secure/testing` (the mock signer, the fake SDK
+ * and `createSecureVenueClientForTesting`) is imported only by TEST files: a
+ * file under `test/`, or a `*.test.*` / `*.spec.*` file. A relative import
+ * that resolves into `packages/polymarket-secure/src/testing/` counts the
+ * same. The testing directory itself may import its own siblings. Rule
+ * label: `TEST-ONLY`. (`check:deps` F12 legitimately allows a layer-3 app to
+ * import this layer-2 package; this rule narrows only the test subpath.)
  */
 
 import { readdir, readFile } from "node:fs/promises";
@@ -45,6 +54,8 @@ const ARCHIVED_CLIENTS = [
 const SOURCE_EXTENSIONS = new Set([".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"]);
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "coverage", "python", ".venv"]);
 const DEPENDENCY_FIELDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies", "bundleDependencies"];
+const TESTING_SUBPATH = "@polymarket-bot/polymarket-secure/testing";
+const TESTING_DIR = `${OWNER_DIR}/src/testing`;
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -62,7 +73,7 @@ interface RepoFile {
 
 interface Finding {
   readonly path: string;
-  readonly rule: "F6" | "F7";
+  readonly rule: "F6" | "F7" | "TEST-ONLY";
   readonly via: "import" | "manifest" | "lockfile";
   readonly specifier: string;
 }
@@ -80,6 +91,23 @@ function judge(file: string, specifier: string, via: Finding["via"]): Finding[] 
   if (ARCHIVED_CLIENTS.some((name) => matches(specifier, name))) out.push({ path: file, rule: "F7", via, specifier });
   if (matches(specifier, UNIFIED_SDK) && !isOwned(file)) out.push({ path: file, rule: "F6", via, specifier });
   return out;
+}
+
+/** A test file: under `test/`, or named `*.test.*` / `*.spec.*`. */
+function isTestFile(file: string): boolean {
+  return file.startsWith("test/") || /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(file);
+}
+
+/** Does this import specifier, written in `file`, reach the test-only subpath? */
+function reachesTestingSubpath(file: string, specifier: string): boolean {
+  if (matches(specifier, TESTING_SUBPATH)) return true;
+  if (!specifier.startsWith(".")) return false;
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), specifier));
+  return resolved === TESTING_DIR || resolved.startsWith(`${TESTING_DIR}/`);
+}
+
+function isInsideTestingDir(file: string): boolean {
+  return file.startsWith(`${TESTING_DIR}/`);
 }
 
 /**
@@ -115,9 +143,10 @@ function importSpecifiers(text: string, fileName: string): string[] {
 }
 
 /** The scan itself: pure over a file list, so it can be tested on planted inputs. */
-function scanSdkBoundary(files: readonly RepoFile[]): { findings: Finding[]; ownedSdkImports: string[] } {
+function scanSdkBoundary(files: readonly RepoFile[]): { findings: Finding[]; ownedSdkImports: string[]; testingImports: string[] } {
   const findings: Finding[] = [];
   const ownedSdkImports: string[] = [];
+  const testingImports: string[] = [];
   for (const file of files) {
     const base = path.posix.basename(file.path);
     if (base === "package.json") {
@@ -147,9 +176,13 @@ function scanSdkBoundary(files: readonly RepoFile[]): { findings: Finding[]; own
     for (const specifier of importSpecifiers(file.text, file.path)) {
       findings.push(...judge(file.path, specifier, "import"));
       if (isOwned(file.path) && matches(specifier, UNIFIED_SDK)) ownedSdkImports.push(`${file.path} -> ${specifier}`);
+      if (reachesTestingSubpath(file.path, specifier) && !isInsideTestingDir(file.path)) {
+        testingImports.push(`${file.path} -> ${specifier}`);
+        if (!isTestFile(file.path)) findings.push({ path: file.path, rule: "TEST-ONLY", via: "import", specifier });
+      }
     }
   }
-  return { findings, ownedSdkImports };
+  return { findings, ownedSdkImports, testingImports };
 }
 
 async function collect(dir: string, out: RepoFile[]): Promise<void> {
@@ -175,8 +208,12 @@ describe("the repository: only packages/polymarket-secure imports @polymarket/cl
       expect(files.some((file) => file.path.startsWith(prefix))).toBe(true);
     }
     expect(files.some((file) => file.path === "pnpm-lock.yaml")).toBe(true);
-    const { findings, ownedSdkImports } = scanSdkBoundary(files);
+    const { findings, ownedSdkImports, testingImports } = scanSdkBoundary(files);
     expect(findings).toEqual([]);
+    // Positive control for TEST-ONLY: the test files that do use the test
+    // subpath are seen (and allowed).
+    expect(testingImports).toContain(`${OWNER_DIR}/src/venue-client.test.ts -> ./testing/index.js`);
+    expect(testingImports.some((entry) => entry.startsWith("test/contract/polymarket-secure/"))).toBe(true);
     // Positive control: the owner package's real imports are seen.
     expect(ownedSdkImports).toContain(`${OWNER_DIR}/src/error-mapping.ts -> ${UNIFIED_SDK}`);
     expect(ownedSdkImports).toContain(`${OWNER_DIR}/src/sdk-port.ts -> ${UNIFIED_SDK}`);
@@ -199,6 +236,10 @@ describe("NON-VACUOUS: planted violations are caught", () => {
     { path: "tools/escaped.mjs", text: 'import sdk from "\\u0040polymarket/client";\nexport default sdk;\n' },
     { path: "packages/risk/package.json", text: JSON.stringify({ dependencies: { "@polymarket/client": "0.11.0" } }) },
     { path: "packages/polymarket-secure/src/old.ts", text: 'import { ClobClient } from "@polymarket/clob-client";\n' },
+    { path: "apps/trader/src/wire.ts", text: 'import { createSecureVenueClientForTesting } from "@polymarket-bot/polymarket-secure/testing";\n' },
+    { path: "packages/oms/src/mock.ts", text: 'export { createMockSignerHandle } from "@polymarket-bot/polymarket-secure/testing";\n' },
+    { path: "packages/polymarket-secure/src/leak.ts", text: 'import { createMockSignerHandle } from "./testing/index.js";\n' },
+    { path: "tools/relative.ts", text: 'import { createFakeSdkFactory } from "../packages/polymarket-secure/src/testing/fake-sdk.js";\n' },
     {
       path: "pnpm-lock.yaml",
       text: "importers:\n\n  packages/oms:\n    dependencies:\n      '@polymarket/client':\n        specifier: 0.11.0\n        version: 0.11.0\n\npackages:\n\n  '@polymarket/client@0.11.0':\n    resolution: {}\n",
@@ -222,6 +263,10 @@ describe("NON-VACUOUS: planted violations are caught", () => {
         "F6:manifest:packages/risk/package.json",
         "F7:import:packages/polymarket-secure/src/old.ts",
         "F6:lockfile:packages/oms",
+        "TEST-ONLY:import:apps/trader/src/wire.ts",
+        "TEST-ONLY:import:packages/oms/src/mock.ts",
+        "TEST-ONLY:import:packages/polymarket-secure/src/leak.ts",
+        "TEST-ONLY:import:tools/relative.ts",
       ].sort(),
     );
   });
@@ -231,6 +276,12 @@ describe("NON-VACUOUS: planted violations are caught", () => {
       { path: "test/unit/tooling/example.test.ts", text: 'const note = "import { x } from \\"@polymarket/client\\"";\n// import "@polymarket/client"\nexport { note };\n' },
       { path: "packages/polymarket-secure/src/ok.ts", text: 'import { createSecureClient } from "@polymarket/client";\nexport { createSecureClient };\n' },
       { path: "packages/polymarket-secure/package.json", text: JSON.stringify({ dependencies: { "@polymarket/client": "0.11.0" } }) },
+      // Test files may use the test-only subpath; so may the testing directory itself.
+      { path: "apps/trader/src/wire.test.ts", text: 'import { createMockSignerHandle } from "@polymarket-bot/polymarket-secure/testing";\n' },
+      { path: "test/unit/secure/x.test.ts", text: 'import { createMockSignerHandle } from "../../../packages/polymarket-secure/src/testing/index.js";\n' },
+      { path: "packages/polymarket-secure/src/testing/index.ts", text: 'export { createMockSignerHandle } from "./mock-signer.js";\n' },
+      // The main entry point is not the test subpath.
+      { path: "apps/trader/src/live.ts", text: 'import { createSecureVenueClient } from "@polymarket-bot/polymarket-secure";\n' },
     ]);
     expect(findings).toEqual([]);
   });

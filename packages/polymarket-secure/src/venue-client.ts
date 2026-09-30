@@ -17,7 +17,11 @@
  * redacted {@link SecureVenueError}.
  *
  * AFTER CONSTRUCTION NOTHING THROWS. Every method returns an outcome; every
- * SDK failure is mapped by `error-mapping.ts`. The SDK client (whose
+ * SDK failure is mapped by `error-mapping.ts`. Caller input is read by
+ * reflection that is CONTAINED: a getter, a hole, a proxy trap that throws or
+ * a revoked proxy makes the input invalid (`NOT_SENT`), and the thrown value
+ * is dropped unread. Arrays are copied once, index by index, from own data
+ * properties, so what is validated is exactly what is sent. The SDK client (whose
  * `credentials` getter returns the L2 secret) is held in a private field and
  * is never returned, serialised or inspected.
  */
@@ -52,7 +56,7 @@ export interface LimitOrderRequest {
   /** CTF token id (decimal) or Polymarket V2 position id. */
   readonly assetId: string;
   readonly side: "BUY" | "SELL";
-  /** Exact decimal string, e.g. `"0.52"`. Never a `number`. */
+  /** Exact decimal string strictly between 0 and 1, e.g. `"0.52"`. Never a `number`. */
   readonly price: string;
   /** Outcome shares, exact decimal string, e.g. `"10"`. */
   readonly size: string;
@@ -105,11 +109,21 @@ export const MAX_CANCEL_IDS_PER_REQUEST = 1_000;
  */
 export interface SecureVenueClient {
   readonly identity: VenueAccountIdentity;
-  /** Create and sign an order LOCALLY. Nothing is transmitted (ADR-007 §2 step 2). */
+  /**
+   * Create and sign an order LOCALLY. Nothing is transmitted (ADR-007 §2
+   * step 2). The SDK's signed order is checked against the request (token,
+   * side, post-only, expiration and order type, and amounts within the pinned
+   * SDK's round-down precision) before it is wrapped; a mismatch is `FAILED`.
+   */
   createLimitOrder(request: LimitOrderRequest): Promise<SignOutcome>;
   /** Transmit a previously signed order (ADR-007 §2 step 5). */
   postOrder(order: SignedOrderEnvelope): Promise<PlacementOutcome>;
-  /** Transmit 1…15 signed orders; one outcome per order, in request order. */
+  /**
+   * Transmit 1…15 signed orders; one outcome per order, in request order. An
+   * invalid batch is refused whole: every outcome is the same `NOT_SENT`, one
+   * per request entry, at most {@link MAX_ORDERS_PER_BATCH} + 1 (bounded, so a
+   * hostile `length` cannot exhaust memory).
+   */
   postOrders(orders: readonly SignedOrderEnvelope[]): Promise<readonly PlacementOutcome[]>;
   cancelOrder(orderId: string): Promise<CancelOutcome>;
   /** 1…1,000 order ids (C-11). */
@@ -128,6 +142,8 @@ type PrepareLimitOrderRequest = Parameters<SdkSecureClientPort["createLimitOrder
 // Input validation (this package's own contract; nothing is sent on failure).
 
 const DECIMAL = /^(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,30})?$/u;
+/** A price strictly between 0 and 1 (a probability price; venue report §2.3). */
+const UNIT_PRICE = /^0\.[0-9]{1,30}$/u;
 const ASSET_ID = /^(?:[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
 const ORDER_ID = /^[A-Za-z0-9_\-:.]{1,200}$/u;
 const CONDITION_ID = /^0x[0-9a-fA-F]{64}$/u;
@@ -137,7 +153,61 @@ function isPositiveDecimal(value: unknown): value is string {
   return typeof value === "string" && DECIMAL.test(value) && /[1-9]/u.test(value);
 }
 
-function readLimitOrder(request: unknown): PrepareLimitOrderRequest | undefined {
+/**
+ * Run a reflection over caller input. Any exception (a throwing getter or
+ * proxy trap, a revoked proxy) reads as `undefined`; the thrown value is
+ * dropped unread, so nothing it carries can reach an outcome.
+ */
+function contained<T>(read: () => T): T | undefined {
+  try {
+    return read();
+  } catch {
+    return undefined;
+  }
+}
+
+type ListReading = { readonly ok: true; readonly items: readonly unknown[] } | { readonly ok: false; readonly length: number };
+
+/**
+ * Copy an array of 1…`max` entries from its own DATA properties, once. A
+ * non-array, a length outside 1…`max`, a hole, an accessor entry or any
+ * reflection failure is a refusal, reported with the best-known entry count
+ * (at least 1, at most `max + 1`).
+ */
+function readList(value: unknown, max: number): ListReading {
+  const refused = (length: number): ListReading => ({ ok: false, length: Math.min(Math.max(length, 1), max + 1) });
+  const reading = contained((): ListReading => {
+    if (!Array.isArray(value)) return refused(1);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    const length: unknown = lengthDescriptor !== undefined && "value" in lengthDescriptor ? lengthDescriptor.value : undefined;
+    if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) return refused(1);
+    if (length < 1 || length > max) return refused(length);
+    const items: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !("value" in descriptor)) return refused(length);
+      items.push(descriptor.value);
+    }
+    return { ok: true, items: Object.freeze(items) };
+  });
+  return reading ?? refused(1);
+}
+
+/** The validated request, kept in this package's own terms for the cross-check. */
+interface ValidatedLimitOrder {
+  readonly assetId: string;
+  readonly side: "BUY" | "SELL";
+  readonly price: string;
+  readonly size: string;
+  readonly postOnly: boolean | undefined;
+  readonly expiration: number | undefined;
+}
+
+function readLimitOrder(request: unknown): ValidatedLimitOrder | undefined {
+  return contained(() => readLimitOrderUncontained(request));
+}
+
+function readLimitOrderUncontained(request: unknown): ValidatedLimitOrder | undefined {
   if (typeof request !== "object" || request === null) return undefined;
   const get = (key: string): unknown => {
     const descriptor = Object.getOwnPropertyDescriptor(request, key);
@@ -151,19 +221,73 @@ function readLimitOrder(request: unknown): PrepareLimitOrderRequest | undefined 
   const expiration = get("expirationUnixSeconds");
   if (typeof assetId !== "string" || !ASSET_ID.test(assetId)) return undefined;
   if (side !== "BUY" && side !== "SELL") return undefined;
-  if (!isPositiveDecimal(price) || !isPositiveDecimal(size)) return undefined;
+  if (!isPositiveDecimal(price) || !UNIT_PRICE.test(price) || !isPositiveDecimal(size)) return undefined;
   if (postOnly !== undefined && typeof postOnly !== "boolean") return undefined;
   if (expiration !== undefined && !(typeof expiration === "number" && Number.isSafeInteger(expiration) && expiration > 0)) {
     return undefined;
   }
+  return Object.freeze({ assetId, side, price, size, postOnly, expiration });
+}
+
+function toSdkLimitOrder(order: ValidatedLimitOrder): PrepareLimitOrderRequest {
   return {
-    assetId,
-    side: side === "BUY" ? OrderSide.BUY : OrderSide.SELL,
-    price,
-    size,
-    ...(postOnly === undefined ? {} : { postOnly }),
-    ...(expiration === undefined ? {} : { expiration }),
+    assetId: order.assetId,
+    side: order.side === "BUY" ? OrderSide.BUY : OrderSide.SELL,
+    price: order.price,
+    size: order.size,
+    ...(order.postOnly === undefined ? {} : { postOnly: order.postOnly }),
+    ...(order.expiration === undefined ? {} : { expiration: order.expiration }),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The signed-order cross-check (exact integer arithmetic; never a float).
+
+/** Base units per share and per pUSD/USDC unit: both have 6 decimals. */
+const BASE_UNITS = 1_000_000n;
+/**
+ * The pinned SDK's limit-order rounding (`@polymarket/client@0.11.0`, its
+ * tick-size table): the share amount is rounded DOWN to 2 decimals (10^4 base
+ * units) for every tick size, and the quote amount is rounded DOWN to at
+ * least 3 decimals (10^3 base units, tick 0.1; finer ticks round finer).
+ * A signed order is accepted only within these bounds; a change in the SDK's
+ * rounding therefore fails closed (`FAILED`), never open.
+ */
+const SHARE_ROUNDING_BASE_UNITS = 10_000n;
+const QUOTE_ROUNDING_MAX_BASE_UNITS = 1_000n;
+
+/** An exact decimal string as `numerator / 10^scale`. The input is pre-validated. */
+function rational(decimal: string): { readonly numerator: bigint; readonly denominator: bigint } {
+  const [whole = "0", fraction = ""] = decimal.split(".");
+  return { numerator: BigInt(`${whole}${fraction}`), denominator: 10n ** BigInt(fraction.length) };
+}
+
+/**
+ * True when `actual` (base units) is `exact` rounded DOWN by less than
+ * `granularity` base units, where `exact = numerator / denominator` base units.
+ */
+function roundedDownFrom(actual: bigint, numerator: bigint, denominator: bigint, granularity: bigint): boolean {
+  const scaled = actual * denominator;
+  return scaled <= numerator && numerator - scaled < granularity * denominator;
+}
+
+/** Does the SDK's signed order say what the caller asked for? */
+function signedOrderMatchesRequest(identity: SignedOrderEnvelope["identity"], request: ValidatedLimitOrder): boolean {
+  if (identity.tokenId !== request.assetId || identity.side !== request.side) return false;
+  if (identity.postOnly !== (request.postOnly === true)) return false;
+  if (identity.expiration !== (request.expiration ?? 0)) return false;
+  if (identity.orderType !== (request.expiration === undefined ? "GTC" : "GTD")) return false;
+  const makerAmount = BigInt(identity.makerAmount);
+  const takerAmount = BigInt(identity.takerAmount);
+  const [shares, quote] = request.side === "BUY" ? [takerAmount, makerAmount] : [makerAmount, takerAmount];
+  const size = rational(request.size);
+  const price = rational(request.price);
+  if (shares <= 0n) return false;
+  // shares ≈ size × 10^6, rounded down to the share precision.
+  if (!roundedDownFrom(shares, size.numerator * BASE_UNITS, size.denominator, SHARE_ROUNDING_BASE_UNITS)) return false;
+  // quote ≈ price × shares, rounded down to the quote precision. For a BUY
+  // this bounds what is paid; for a SELL it bounds what is received.
+  return roundedDownFrom(quote, price.numerator * shares, price.denominator, QUOTE_ROUNDING_MAX_BASE_UNITS);
 }
 
 function isOrderId(value: unknown): value is string {
@@ -176,12 +300,11 @@ function isOrderId(value: unknown): value is string {
 const SDK = new WeakMap<SdkBackedSecureVenueClient, SdkSecureClientPort>();
 
 function readIdentity(port: SdkSecureClientPort): VenueAccountIdentity | undefined {
-  let account: unknown;
-  try {
-    account = port.account;
-  } catch {
-    return undefined;
-  }
+  return contained(() => readIdentityUncontained(port));
+}
+
+function readIdentityUncontained(port: SdkSecureClientPort): VenueAccountIdentity | undefined {
+  const account: unknown = port.account;
   if (typeof account !== "object" || account === null) return undefined;
   const get = (key: string): unknown => (account as Record<string, unknown>)[key];
   const signerAddress = get("signer");
@@ -220,12 +343,14 @@ class SdkBackedSecureVenueClient implements SecureVenueClient {
 
   async createLimitOrder(request: LimitOrderRequest): Promise<SignOutcome> {
     const operation: SecureOperation = "CREATE_LIMIT_ORDER";
-    const prepared = readLimitOrder(request);
-    if (prepared === undefined) return Object.freeze({ kind: "FAILED", error: invalidRequest(operation) });
+    const validated = readLimitOrder(request);
+    if (validated === undefined) return Object.freeze({ kind: "FAILED", error: invalidRequest(operation) });
     try {
-      const signed = await this.port().createLimitOrder(prepared);
+      const signed = await this.port().createLimitOrder(toSdkLimitOrder(validated));
       const envelope = SignedOrderEnvelope.fromSdkSignedOrder(signed);
-      return envelope === undefined
+      // A signed order outside the pinned shape, or one that does not say
+      // what was asked, is never handed out (it is not transmitted either).
+      return envelope === undefined || !signedOrderMatchesRequest(envelope.identity, validated)
         ? Object.freeze({ kind: "FAILED", error: mapVenueError(undefined, operation) })
         : Object.freeze({ kind: "SIGNED", order: envelope });
     } catch (error) {
@@ -245,16 +370,12 @@ class SdkBackedSecureVenueClient implements SecureVenueClient {
 
   async postOrders(orders: readonly SignedOrderEnvelope[]): Promise<readonly PlacementOutcome[]> {
     const operation: SecureOperation = "POST_ORDERS";
-    const list: readonly unknown[] = Array.isArray(orders) ? (orders as readonly unknown[]) : [];
-    if (
-      list.length < 1 ||
-      list.length > MAX_ORDERS_PER_BATCH ||
-      !list.every((entry): entry is SignedOrderEnvelope => SignedOrderEnvelope.isEnvelope(entry))
-    ) {
+    const list = readList(orders, MAX_ORDERS_PER_BATCH);
+    if (!list.ok || !list.items.every((entry) => SignedOrderEnvelope.isEnvelope(entry))) {
       const outcome = placementOutcomeFromError(invalidRequest(operation));
-      return Object.freeze(Array.from({ length: Math.max(list.length, 1) }, () => outcome));
+      return Object.freeze(Array.from({ length: list.ok ? list.items.length : list.length }, () => outcome));
     }
-    const envelopes = list as readonly SignedOrderEnvelope[];
+    const envelopes = list.items as readonly SignedOrderEnvelope[];
     try {
       const responses: unknown = await this.port().postOrders(envelopes.map((envelope) => SignedOrderEnvelope.toSdkSignedOrder(envelope)));
       if (!Array.isArray(responses) || responses.length !== envelopes.length) {
@@ -281,19 +402,24 @@ class SdkBackedSecureVenueClient implements SecureVenueClient {
   }
 
   async cancelOrders(orderIds: readonly string[]): Promise<CancelOutcome> {
-    const list: readonly unknown[] = Array.isArray(orderIds) ? (orderIds as readonly unknown[]) : [];
-    if (list.length < 1 || list.length > MAX_CANCEL_IDS_PER_REQUEST || !list.every(isOrderId)) {
+    const list = readList(orderIds, MAX_CANCEL_IDS_PER_REQUEST);
+    if (!list.ok || !list.items.every(isOrderId)) {
       return cancelOutcomeFromError(invalidRequest("CANCEL_ORDERS"));
     }
-    const ids = [...(list as readonly string[])];
+    const ids = [...(list.items as readonly string[])];
     return this.cancel("CANCEL_ORDERS", () => this.port().cancelOrders({ orderIds: ids }));
   }
 
   async cancelMarketOrders(filter: CancelMarketFilter): Promise<CancelOutcome> {
     const operation: SecureOperation = "CANCEL_MARKET_ORDERS";
     if (typeof filter !== "object" || filter === null) return cancelOutcomeFromError(invalidRequest(operation));
-    const market: unknown = Object.getOwnPropertyDescriptor(filter, "market")?.value;
-    const assetId: unknown = Object.getOwnPropertyDescriptor(filter, "assetId")?.value;
+    const read = (key: string): unknown => {
+      const descriptor = Object.getOwnPropertyDescriptor(filter, key);
+      return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+    };
+    const fields = contained(() => ({ market: read("market"), assetId: read("assetId") }));
+    if (fields === undefined) return cancelOutcomeFromError(invalidRequest(operation));
+    const { market, assetId } = fields;
     const marketOk = market === undefined || (typeof market === "string" && CONDITION_ID.test(market));
     const assetOk = assetId === undefined || (typeof assetId === "string" && ASSET_ID.test(assetId));
     // A filter with neither field would cancel nothing selective; refuse it
@@ -381,11 +507,21 @@ export async function buildSecureVenueClient(
   if (typeof options !== "object" || options === null) {
     throw new SignerBoundaryRefusal(["CONTEXT_UNREADABLE"]);
   }
+  // Each option is read once. A throwing getter or proxy trap is contained:
+  // it refuses as CONTEXT_UNREADABLE and its thrown value is dropped unread.
+  const option = (key: keyof CreateSecureVenueClientOptions): unknown => {
+    try {
+      return (options as unknown as Record<string, unknown>)[key];
+    } catch {
+      throw new SignerBoundaryRefusal(["CONTEXT_UNREADABLE"]);
+    }
+  };
+
   // 1. The run-mode gate, before anything touches the signer or the SDK.
-  assertSignerGate(options.runModeContext);
+  assertSignerGate(option("runModeContext"));
 
   // 2. The handle and its provenance.
-  const sealed = unsealSigner(options.signer);
+  const sealed = unsealSigner(option("signer"));
   if (sealed === undefined) throw new SignerBoundaryRefusal(["SIGNER_NOT_SEALED"]);
   if (acceptedProvenance === "REAL" && sealed.provenance === "TEST_MOCK") {
     throw new SignerBoundaryRefusal(["MOCK_SIGNER_REJECTED_BY_REAL_SDK"]);
@@ -394,13 +530,14 @@ export async function buildSecureVenueClient(
     throw new SignerBoundaryRefusal(["REAL_SIGNER_REJECTED_BY_TEST_FACTORY"]);
   }
 
-  const wallet = options.wallet;
+  const wallet = option("wallet");
   if (wallet !== undefined && !(typeof wallet === "string" && ADDRESS.test(wallet))) {
     throw invalidRequest("CREATE_CLIENT");
   }
-  const listener = options.onRateLimitUpdate;
+  const listenerOption = option("onRateLimitUpdate");
+  const listener = typeof listenerOption === "function" ? (listenerOption as (observation: RateLimitObservation) => void) : undefined;
   const onRateLimitUpdate =
-    typeof listener === "function"
+    listener !== undefined
       ? (update: RateLimitUpdate): void => {
           try {
             listener(toRateLimitObservation(update));

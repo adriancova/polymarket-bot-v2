@@ -78,18 +78,59 @@ const MAX_DEPTH = 16;
  *
  * - Values under a sensitive key (see {@link isSensitiveKey}) become
  *   {@link REDACTED}, whatever their type.
- * - Getters are never invoked: an accessor property becomes `"[accessor]"`,
- *   so a hostile getter cannot compute a secret at log time.
- * - An `Error` becomes `{ name }` only. Its message, stack and cause are
- *   dropped, because they are free text this function cannot vet.
- * - `Map` keys are treated like object keys; `Set`s become arrays.
- * - Cycles become `"[circular]"`; depth beyond 16 becomes `"[depth]"`.
+ * - Getters are never invoked: an accessor property (an object key or an
+ *   array index) becomes `"[accessor]"`, so a hostile getter cannot compute
+ *   a secret at log time. Arrays are read index by index from own data
+ *   properties (a hole becomes `undefined`); no iterator is called.
+ * - An `Error` becomes `{ name }` only, and the name only when it is one of
+ *   the fixed names in {@link LOGGABLE_ERROR_NAMES} (anything else becomes
+ *   `"Error"`). Its message, stack and cause are dropped, because they are
+ *   free text this function cannot vet.
+ * - `Map` keys are treated like object keys; `Set`s become arrays. Both are
+ *   read through the built-in `Map`/`Set` iterators, never an own override.
+ * - Cycles become `"[circular]"`; depth beyond 16 becomes `"[depth]"`;
+ *   collections longer than 10,000 entries become `"[too large]"`.
  * - Functions and symbols become `"[function]"` / `"[symbol]"`; a `bigint`
  *   becomes its decimal string (exact, never a float).
+ * - Never throws. An object whose reflection throws (a revoked proxy, a
+ *   throwing trap) becomes `"[unreadable]"`; the thrown value is dropped.
  */
 export function redactForLog(value: unknown): unknown {
   return redactValue(value, new WeakSet<object>(), 0);
 }
+
+/**
+ * The error names {@link redactForLog} keeps: the standard ECMAScript error
+ * classes, this package's own, and the pinned SDK's. A name is free text an
+ * error's creator chooses, so only these fixed values are carried.
+ */
+export const LOGGABLE_ERROR_NAMES: ReadonlySet<string> = new Set([
+  "Error",
+  "AggregateError",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+  "SecureVenueError",
+  "SignerBoundaryRefusal",
+  "PolymarketError",
+  "UserInputError",
+  "UnexpectedResponseError",
+  "TransportError",
+  "ConnectionLostError",
+  "RequestRejectedError",
+  "RateLimitError",
+  "TimeoutError",
+  "TransactionFailedError",
+  "CancelledSigningError",
+  "InsufficientLiquidityError",
+  "AutoCancelDailyLimitError",
+  "SigningError",
+]);
+
+const MAX_ENTRIES = 10_000;
 
 function redactValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
   if (value === null || value === undefined) return value;
@@ -112,48 +153,88 @@ function redactValue(value: unknown, seen: WeakSet<object>, depth: number): unkn
   if (depth >= MAX_DEPTH) return "[depth]";
   seen.add(object);
   try {
-    if (object instanceof Error) {
-      return { name: safeErrorName(object) };
-    }
-    if (Array.isArray(object)) {
-      return object.map((entry) => redactValue(entry, seen, depth + 1));
-    }
-    if (object instanceof Map) {
-      const out: Record<string, unknown> = {};
-      for (const [key, entry] of object) {
-        const name = typeof key === "string" ? key : String(redactValue(key, seen, depth + 1));
-        out[name] = isSensitiveKey(name) ? REDACTED : redactValue(entry, seen, depth + 1);
-      }
-      return out;
-    }
-    if (object instanceof Set) {
-      return [...object].map((entry) => redactValue(entry, seen, depth + 1));
-    }
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(object)) {
-      const descriptor = Object.getOwnPropertyDescriptor(object, key);
-      if (descriptor === undefined) continue;
-      if (isSensitiveKey(key)) {
-        out[key] = REDACTED;
-      } else if (!("value" in descriptor)) {
-        out[key] = "[accessor]";
-      } else {
-        out[key] = redactValue(descriptor.value, seen, depth + 1);
-      }
-    }
-    return out;
+    return redactObject(object, seen, depth);
+  } catch {
+    // A revoked proxy or a throwing trap: nothing it threw is carried.
+    return "[unreadable]";
   } finally {
     seen.delete(object);
   }
 }
 
-/** An error's `name` when it is a plain own or prototype data string, else `"Error"`. */
+function redactObject(object: object, seen: WeakSet<object>, depth: number): unknown {
+  if (object instanceof Error) {
+    return { name: safeErrorName(object) };
+  }
+  if (Array.isArray(object)) {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(object, "length");
+    const length: unknown = lengthDescriptor !== undefined && "value" in lengthDescriptor ? lengthDescriptor.value : undefined;
+    if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) return "[unreadable]";
+    if (length > MAX_ENTRIES) return "[too large]";
+    const out: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, String(index));
+      if (descriptor === undefined) {
+        out.push(undefined);
+      } else if (!("value" in descriptor)) {
+        out.push("[accessor]");
+      } else {
+        out.push(redactValue(descriptor.value, seen, depth + 1));
+      }
+    }
+    return out;
+  }
+  if (object instanceof Map) {
+    const size = Reflect.apply(sizeOf(Map.prototype), object, []) as number;
+    if (size > MAX_ENTRIES) return "[too large]";
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Reflect.apply(Map.prototype.entries, object, []) as IterableIterator<[unknown, unknown]>) {
+      const name = typeof key === "string" ? key : String(redactValue(key, seen, depth + 1));
+      out[name] = isSensitiveKey(name) ? REDACTED : redactValue(entry, seen, depth + 1);
+    }
+    return out;
+  }
+  if (object instanceof Set) {
+    const size = Reflect.apply(sizeOf(Set.prototype), object, []) as number;
+    if (size > MAX_ENTRIES) return "[too large]";
+    const out: unknown[] = [];
+    for (const entry of Reflect.apply(Set.prototype.values, object, []) as IterableIterator<unknown>) {
+      out.push(redactValue(entry, seen, depth + 1));
+    }
+    return out;
+  }
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (descriptor === undefined) continue;
+    if (isSensitiveKey(key)) {
+      out[key] = REDACTED;
+    } else if (!("value" in descriptor)) {
+      out[key] = "[accessor]";
+    } else {
+      out[key] = redactValue(descriptor.value, seen, depth + 1);
+    }
+  }
+  return out;
+}
+
+/** The built-in `size` getter of `Map.prototype` / `Set.prototype`. */
+function sizeOf(prototype: object): () => number {
+  const getter = Object.getOwnPropertyDescriptor(prototype, "size")?.get;
+  if (getter === undefined) throw new TypeError("size");
+  return getter as () => number;
+}
+
+/**
+ * An error's `name` when it is a plain own or prototype DATA string AND one of
+ * {@link LOGGABLE_ERROR_NAMES}; otherwise `"Error"`.
+ */
 function safeErrorName(error: Error): string {
   let target: object | null = error;
-  while (target !== null) {
+  for (let hops = 0; target !== null && hops < MAX_DEPTH; hops += 1) {
     const descriptor = Object.getOwnPropertyDescriptor(target, "name");
     if (descriptor !== undefined) {
-      return "value" in descriptor && typeof descriptor.value === "string" && /^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(descriptor.value)
+      return "value" in descriptor && typeof descriptor.value === "string" && LOGGABLE_ERROR_NAMES.has(descriptor.value)
         ? descriptor.value
         : "Error";
     }

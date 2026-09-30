@@ -65,7 +65,7 @@ export type PlacementOutcome =
   | { readonly kind: "REJECTED"; readonly reason: PlacementRejectionReason }
   /** Nothing left the process (validation or signing failed). */
   | { readonly kind: "NOT_SENT"; readonly error: SecureVenueError }
-  /** The venue refused with a documented condition (429, 425, 503 post-only, 401). Not placed. */
+  /** The venue refused with a documented condition (429/425/401 with no code, 503 post-only). Not placed. */
   | { readonly kind: "REFUSED"; readonly error: SecureVenueError }
   /** The order may exist. ADR-007 §3: SUBMISSION_UNKNOWN; reconcile before any new salt. */
   | { readonly kind: "UNKNOWN"; readonly reason: PlacementUnknownReason; readonly error: SecureVenueError | null };
@@ -105,10 +105,17 @@ function ownData(target: object, key: string): unknown {
   return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
 }
 
+/** Upper bound on an id list carried from one response; a longer list is not recognised (UNKNOWN: reconcile). */
+const MAX_ID_LIST = 100_000;
+
+/** An array of safe ids, read index by index from own DATA properties (no iterator, no getter). */
 function stringArray(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value)) return undefined;
+  const length = ownData(value, "length");
+  if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0 || length > MAX_ID_LIST) return undefined;
   const out: string[] = [];
-  for (const entry of value as unknown[]) {
+  for (let index = 0; index < length; index += 1) {
+    const entry = ownData(value, String(index));
     if (typeof entry !== "string" || !SAFE_ID.test(entry)) return undefined;
     out.push(entry);
   }
@@ -128,6 +135,16 @@ const UNRECOGNISED: PlacementOutcome = Object.freeze({
  * message is never carried (free text; U-4).
  */
 export function mapOrderResponse(response: SdkOrderResponse | unknown): PlacementOutcome {
+  // Reflection over the response is contained: if it throws, the response is
+  // unrecognised and the thrown value is dropped unread.
+  try {
+    return mapOrderResponseUncontained(response);
+  } catch {
+    return UNRECOGNISED;
+  }
+}
+
+function mapOrderResponseUncontained(response: unknown): PlacementOutcome {
   if (typeof response !== "object" || response === null) return UNRECOGNISED;
   const ok = ownData(response, "ok");
   if (ok === true) {
@@ -137,7 +154,8 @@ export function mapOrderResponse(response: SdkOrderResponse | unknown): Placemen
     const takingAmount = ownData(response, "takingAmount");
     const tradeIds = stringArray(ownData(response, "tradeIds"));
     const transactionHashes = stringArray(ownData(response, "transactionsHashes"));
-    const mapped = typeof status === "string" ? STATUS_BY_SDK_STATUS[status] : undefined;
+    // Own keys only: an inherited name ("constructor", "toString") is not a status.
+    const mapped = typeof status === "string" && Object.hasOwn(STATUS_BY_SDK_STATUS, status) ? STATUS_BY_SDK_STATUS[status] : undefined;
     if (
       typeof orderId !== "string" ||
       !SAFE_ID.test(orderId) ||
@@ -217,8 +235,19 @@ export type CancelOutcome =
   /** Some or all of the cancels may have been applied. Reconcile. */
   | { readonly kind: "UNKNOWN"; readonly error: SecureVenueError | null };
 
+const UNKNOWN_CANCEL: CancelOutcome = Object.freeze({ kind: "UNKNOWN", error: null });
+
 export function mapCancelResponse(response: SdkCancelOrdersResponse | unknown): CancelOutcome {
-  const unknownOutcome: CancelOutcome = Object.freeze({ kind: "UNKNOWN", error: null });
+  // Contained, as for placements: a reflection failure is UNKNOWN.
+  try {
+    return mapCancelResponseUncontained(response);
+  } catch {
+    return UNKNOWN_CANCEL;
+  }
+}
+
+function mapCancelResponseUncontained(response: unknown): CancelOutcome {
+  const unknownOutcome = UNKNOWN_CANCEL;
   if (typeof response !== "object" || response === null) return unknownOutcome;
   const canceled = stringArray(ownData(response, "canceled"));
   const notCanceledRaw = ownData(response, "notCanceled");
@@ -276,8 +305,19 @@ export type QueryOutcome<T> =
 const UPPER_TOKEN = /^[A-Z][A-Z_]{0,63}$/u;
 const ISO_LIKE = /^[0-9TZ:.+-]{1,40}$/u;
 
+const FAILED_QUERY: QueryOutcome<VenueOrderSnapshot> = Object.freeze({ kind: "FAILED", error: null });
+
 export function mapOpenOrder(order: SdkOpenOrder | unknown): QueryOutcome<VenueOrderSnapshot> {
-  const failed: QueryOutcome<VenueOrderSnapshot> = Object.freeze({ kind: "FAILED", error: null });
+  // Contained, as for placements: a reflection failure is FAILED.
+  try {
+    return mapOpenOrderUncontained(order);
+  } catch {
+    return FAILED_QUERY;
+  }
+}
+
+function mapOpenOrderUncontained(order: unknown): QueryOutcome<VenueOrderSnapshot> {
+  const failed = FAILED_QUERY;
   if (typeof order !== "object" || order === null) return failed;
   const text = (key: string, pattern: RegExp): string | undefined => {
     const value = ownData(order, key);

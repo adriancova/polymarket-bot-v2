@@ -159,7 +159,14 @@ export class SignedOrderEnvelope {
    * anything that is not exactly that shape.
    */
   static fromPersistedPayload(payload: unknown): SignedOrderEnvelope | undefined {
-    const read = readPayload(payload);
+    let read: PayloadRecord | undefined;
+    try {
+      read = readPayload(payload);
+    } catch {
+      // A reflection failure (a revoked proxy, a throwing trap) is "not that
+      // shape"; the thrown value is dropped unread.
+      return undefined;
+    }
     return read === undefined ? undefined : SignedOrderEnvelope.wrap(read);
   }
 
@@ -168,9 +175,13 @@ export class SignedOrderEnvelope {
     // Copy the SDK object's own data into a plain record first, so the
     // envelope never holds a reference into the SDK's object graph.
     const plain: Record<string, unknown> = {};
-    for (const key of Object.keys(order)) {
-      const descriptor = Object.getOwnPropertyDescriptor(order, key);
-      if (descriptor !== undefined && "value" in descriptor) plain[key] = descriptor.value;
+    try {
+      for (const key of Object.keys(order)) {
+        const descriptor = Object.getOwnPropertyDescriptor(order, key);
+        if (descriptor !== undefined && "value" in descriptor) plain[key] = descriptor.value;
+      }
+    } catch {
+      return undefined;
     }
     return SignedOrderEnvelope.fromPersistedPayload(plain);
   }

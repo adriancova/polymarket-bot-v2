@@ -176,7 +176,7 @@ describe("HTTP rejections are classified by status and DOCUMENTED code only", ()
   });
 
   it("classifyHttpRejection covers 429 for an HTTP rejection that is not a RateLimitError", () => {
-    expect(classifyHttpRejection(429, null)).toEqual({ kind: "RATE_LIMITED", effect: "NOT_APPLIED", cancelsAvailable: null });
+    expect(classifyHttpRejection(429, { venueCode: null, undocumentedVenueCode: false })).toEqual({ kind: "RATE_LIMITED", effect: "NOT_APPLIED", cancelsAvailable: null });
   });
 });
 
