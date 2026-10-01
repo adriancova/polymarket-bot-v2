@@ -39,7 +39,11 @@ One run does, in order:
    its decisions' dispatch position (`H1R1-PROVENANCE`), no trader-responsible window
    classifies, so nothing it overlaps expires.** While a window is unclassified, whatever its
    durable rows already show is held as well: the range its pin would hold now, the whole
-   segment of every source event already located included. Those holds are **durable**
+   segment of every source event already located included. Once it is classified with
+   evidence, its whole pin range is held for as long as that pin is not extracted and
+   verified with its whole chain inside: while the pin waits for the extraction batch or for
+   the pin catalog to read, after a failed pin write, and when the re-decision just before a
+   deletion is the first to see the evidence. Those holds are **durable**
    (`<state dir>/evidence-holds.json`): a later cycle keeps them whether or not it can read
    the trader's rows, and whether or not the window is still registered, until the window
    is classified and its pin — verified, with its whole chain inside — covers them. A window
@@ -80,9 +84,11 @@ reported as `walOrphanSidecars` and never planned; it may be removed by hand.
 
 It prints one JSON report and exits. Run it on a timer.
 
-`<state dir>/evidence-holds.json` is never edited by hand in normal operation. Removing it
-releases every hold without verifying anything, so do that only as a deliberate decision,
-after checking that every window it names is pinned or has no evidence.
+`<state dir>/evidence-holds.json` is never edited by hand in normal operation. Removing it,
+or a window's entry in it, releases those holds without verifying anything, so do that only
+as a deliberate decision, after checking that every window it names is pinned or has no
+evidence. A file that exists but cannot be read (any error but "no such file") keeps every
+segment and is never overwritten.
 
 ### Configuration
 
@@ -148,8 +154,16 @@ window — a trader can act before the window opens — and defaults to `windowS
 gateway-only one. Until the window classifies, every segment from it (less the lead-in) to
 the window's end is kept.
 
-The registry may be pruned of windows whose segments have all expired: a segment that
-names a pruned window's market is then unclassified and kept, never deleted.
+The registry may be pruned of a window once it is settled — its pin extracted and
+verified with its whole chain inside, or classified with no evidence — and its segments
+have all expired. Pruning it earlier releases nothing already known: its durable holds (what
+its rows showed while it was unclassified, and its whole pin range while it was classified
+and not yet pinned) and a failed read of its rows stay in `evidence-holds.json`, and keep
+those segments until the window is registered again and pinned, or its entry there is
+removed deliberately. What is not yet known is not held: evidence its trader makes after the
+last cycle that read its rows. A segment of the pruned window's range outside its holds is
+then decided without it: kept when it names a market no registered window names, but
+expired like any other segment when another window of the same market is still registered.
 
 ### Operator pins
 

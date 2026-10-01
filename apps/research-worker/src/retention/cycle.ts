@@ -17,8 +17,10 @@
  *    existing pin already fulfils it is bound to that pin, not re-pinned. No
  *    window pin is extracted while the pin catalog does not read in full: the
  *    binding could not see the pin it should bind to.
- * 4b. **Hold**: make every hold the classifications show durable, and release
- *    the holds of every window this cycle settles (`evidence-holds.ts`).
+ * 4b. **Hold**: make every hold the classifications show durable — an
+ *    unclassified window's, and a classified window's whole pin extent while
+ *    its pin is not settled — and release the holds of every window this
+ *    cycle settles (`evidence-holds.ts`).
  * 5. **Plan**: decide every sealed segment, with every reason it is kept
  *    (`plan.ts`), against the pins this cycle derives AND every pin already
  *    extracted into the store, and against the durable holds.
@@ -60,8 +62,16 @@ import type { StorageMetrics } from "./metrics.js";
 import { diskMetrics, storageMetrics } from "./metrics.js";
 import type { OperatorPinLock } from "./operator-pin-lock.js";
 import { noOperatorPinLock } from "./operator-pin-lock.js";
-import type { EvidenceHoldState } from "./evidence-holds.js";
-import { persistEvidenceHolds, readEvidenceHolds, rememberEvidence, sameEvidenceHolds, settledWindowIds } from "./evidence-holds.js";
+import type { EvidenceHoldState, EvidenceHoldsFileSystem } from "./evidence-holds.js";
+import {
+  nodeEvidenceHoldsFileSystem,
+  persistEvidenceHolds,
+  readEvidenceHolds,
+  recordedWindowIds,
+  rememberEvidence,
+  sameEvidenceHolds,
+  settledWindowIds,
+} from "./evidence-holds.js";
 import type { ExtractedPins, PinOutcome, PinRecord, PinSpec } from "./pins.js";
 import { bindWindowPins, extractPin, overlaps, ownPinSources, pinSpecs, readExtractedPins, readPinRecord } from "./pins.js";
 import type { SegmentDecision } from "./plan.js";
@@ -110,6 +120,8 @@ export type StorageCycleDependencies = {
   readonly bootClock?: BootClock | null;
   /** Serializes operator-pin publication with each deletion (`operator-pin-lock.ts`). */
   readonly operatorPinLock?: OperatorPinLock;
+  /** The evidence holds file's operations; the real filesystem when absent. A test substitutes them to fail each step. */
+  readonly evidenceHoldsFileSystem?: EvidenceHoldsFileSystem;
 };
 
 export type StorageCycleReport = {
@@ -322,19 +334,26 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     }
   }
 
-  // -- 4b. Hold: what the classifications show is durable before any plan, and
-  // a window this cycle settles releases its holds. A dry run reads the holds
-  // but never writes them: it deletes nothing, and must not race the timer's
-  // read-modify-write of the file. ---------------------------------------------
-  const previousHolds = await readEvidenceHolds(dependencies.stateDirectory);
+  // -- 4b. Hold: what the classifications show is durable before any plan — a
+  // classified window whose pin this cycle did not settle holds its whole pin
+  // extent — and a window this cycle settles releases its holds. A dry run
+  // reads the holds but never writes them: it deletes nothing, and must not
+  // race the timer's read-modify-write of the file. ----------------------------
+  const holdsFileSystem = dependencies.evidenceHoldsFileSystem ?? nodeEvidenceHoldsFileSystem;
+  const previousHolds = await readEvidenceHolds(dependencies.stateDirectory, holdsFileSystem);
   const rememberedHolds = rememberEvidence({
     state: previousHolds,
     classifications: classifications.values(),
-    settled: settledWindowIds({ classifications: classifications.values(), specs, outcomes: pins, state: previousHolds }),
+    pass: {
+      kind: "cycle",
+      settled: settledWindowIds({ classifications: classifications.values(), specs, outcomes: pins, state: previousHolds }),
+    },
     registeredWindowIds: new Set(windows.map((window) => window.windowId)),
   });
   let holds: EvidenceHoldState =
-    dependencies.mode === "execute" ? await persistEvidenceHolds(dependencies.stateDirectory, rememberedHolds) : rememberedHolds;
+    dependencies.mode === "execute"
+      ? await persistEvidenceHolds(dependencies.stateDirectory, rememberedHolds, holdsFileSystem)
+      : rememberedHolds;
 
   // -- 5. Plan. ---------------------------------------------------------------
   const pinRecords = await readPinRecords(objectStore, specs);
@@ -388,16 +407,23 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
           wal,
           await ownPinSources(objectStore, freshPins.records, traderWindowIds(freshWindows)),
         );
-        // What the fresh rows show is durable before this deletion (a recheck
-        // settles nothing: it extracts no pin).
+        const freshSpecs = bindWindowPins(pinSpecs([...freshClassifications.values()], freshOperatorPins), freshPins.records);
+        // What the fresh rows show is durable before this deletion. A recheck
+        // extracts no pin, so it settles and releases nothing; a classified
+        // window gains its whole pin extent as a hold unless a pin record
+        // already in the store holds it.
         const freshHolds = rememberEvidence({
           state: holds,
           classifications: freshClassifications.values(),
-          settled: null,
+          pass: {
+            kind: "recheck",
+            recorded: recordedWindowIds({ classifications: freshClassifications.values(), specs: freshSpecs, records: freshPins.records }),
+          },
           registeredWindowIds: new Set(freshWindows.map((window) => window.windowId)),
         });
-        if (!sameEvidenceHolds(freshHolds, holds)) holds = await persistEvidenceHolds(dependencies.stateDirectory, freshHolds);
-        const freshSpecs = bindWindowPins(pinSpecs([...freshClassifications.values()], freshOperatorPins), freshPins.records);
+        if (!sameEvidenceHolds(freshHolds, holds)) {
+          holds = await persistEvidenceHolds(dependencies.stateDirectory, freshHolds, holdsFileSystem);
+        }
         const segment = allSegments.find((candidate) => candidate.segmentId === entry.request.segmentId);
         if (segment === undefined) return ["the segment is no longer in the inventory"];
         const [fresh] = await planExpiry({

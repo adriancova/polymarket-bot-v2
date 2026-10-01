@@ -1,22 +1,33 @@
 /**
- * Durable evidence holds (`STORAGE-1` round 3, L1; ADR-028 Decisions 2.3,
- * 3.4 and 6).
+ * Durable evidence holds (`STORAGE-1` rounds 3 and 4, L1 and M1; ADR-028
+ * Decisions 2.3, 3.4, 3.5 and 6).
  *
- * While a trader window is unclassified, the range its durable rows already
- * show to hold chain evidence — above all, the segment of every source event
- * already located — is HELD (`classify.ts`, `holdRanges`). A hold seen in one
- * cycle must still hold in every later one until the window's pin holds that
- * evidence: a later cycle may not be able to read the trader's rows at all (a
- * database restart, a refused connection, a timeout), or may no longer have
- * the window in its registry. So the holds live in the state directory, one
- * small file:
+ * Whatever a trader window's durable rows have shown to be chain evidence is
+ * HELD until the window's pin holds it:
+ *
+ * - while the window is unclassified, the range its rows already show
+ *   (`classify.ts`, `holdRanges`) — above all, the segment of every source
+ *   event already located;
+ * - once it is classified with evidence, its WHOLE pin extent (the window,
+ *   widened to every evidence instant and every located source's segment,
+ *   then the lead-in) for as long as that pin is not extracted, verified and
+ *   trace-complete: while it waits on the extraction batch or the pin
+ *   catalog, after a failed pin write, or when a recheck first learns it
+ *   (round 4, M1).
+ *
+ * A hold seen in one cycle must still hold in every later one until the
+ * window's pin holds that evidence: a later cycle may not be able to read the
+ * trader's rows at all (a database restart, a refused connection, a timeout),
+ * or may no longer have the window in its registry. So the holds live in the
+ * state directory, one small file:
  *
  * - **Every cycle unions what it learns into the file, durably, before it
  *   plans** (and each recheck before its deletion). A hold is never shrunk.
  * - **A hold is released only when the window is settled**: classified, and
  *   its pin — extracted, its manifests verified, every source event of its
- *   chain inside — covers every held range (or it is classified with no
- *   evidence and nothing was ever held).
+ *   chain inside — covers every held range and its own extent (or it is
+ *   classified with no evidence and nothing was ever held). A recheck
+ *   releases nothing.
  * - **A window whose rows cannot be read and that is not settled keeps EVERY
  *   segment** (`evidence-unreadable`, `plan.ts`): what it holds is unknown,
  *   and a chain source can lie in any earlier segment. That includes the very
@@ -44,7 +55,7 @@ import { dirname, join } from "node:path";
 import { parseStrictJsonBytes, sha256Hex } from "@polymarket-bot/storage-parquet";
 
 import type { WindowClassification } from "./classify.js";
-import type { PinOutcome, PinSpec } from "./pins.js";
+import type { PinOutcome, PinRecord, PinSpec } from "./pins.js";
 import type { Span } from "./wal-index.js";
 
 /** The holds file in the state directory. */
@@ -55,7 +66,11 @@ export const EVIDENCE_HOLDS_VERSION = 1;
 
 /** What is durably known of one window's chain evidence. */
 export type WindowEvidenceState = {
-  /** Ranges its rows have shown to hold chain evidence, merged; kept until it is settled. */
+  /**
+   * Ranges its rows have shown to hold chain evidence, merged: what it held
+   * while unclassified, and its whole pin extent while classified and not
+   * settled. Kept until it is settled.
+   */
   readonly holds: readonly Span[];
   /** Classified, and its pin holds its evidence (or it has none): a later read failure hides nothing. */
   readonly settled: boolean;
@@ -103,6 +118,80 @@ export function mergeSpans(spans: readonly Span[]): readonly Span[] {
   return merged;
 }
 
+/** The file operations the holds need; a test substitutes them to prove each one matters. */
+export type EvidenceHoldsFileSystem = {
+  /** Write a file durably: temporary file, fsync, atomic rename, fsync of the directory. */
+  writeDurably(path: string, bytes: Uint8Array): Promise<void>;
+  readFile(path: string): Promise<Uint8Array>;
+};
+
+/** An open file, as the durable writer uses it. */
+export type EvidenceHoldsFileHandle = {
+  writeFile(bytes: Uint8Array): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+};
+
+/**
+ * The `node:fs/promises` calls the holds file is written and read with, and
+ * nothing more. A test wraps them to record, and to fail, each step of the
+ * REAL writer (`evidenceHoldsFileSystem`), as `execute.test.ts` does for the
+ * expiry plan (round 4, M2).
+ */
+export type EvidenceHoldsFileOperations = {
+  mkdir(path: string): Promise<void>;
+  open(path: string, flags: number, mode?: number): Promise<EvidenceHoldsFileHandle>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  readFile(path: string): Promise<Uint8Array>;
+};
+
+/** The real calls. */
+export const nodeEvidenceHoldsFileOperations: EvidenceHoldsFileOperations = {
+  async mkdir(path) {
+    await mkdir(path, { recursive: true });
+  },
+  open: async (path, flags, mode) => await open(path, flags, mode),
+  rename: async (oldPath, newPath) => {
+    await rename(oldPath, newPath);
+  },
+  readFile: async (path) => await readFile(path),
+};
+
+/**
+ * The holds file's reader and durable writer over `operations`: the bytes
+ * reach the disk (`fsync`) before the temporary file takes the name, and the
+ * new name reaches the disk (`fsync` of the directory) before the write
+ * returns. Every failure propagates: the caller then keeps every segment.
+ */
+export function evidenceHoldsFileSystem(operations: EvidenceHoldsFileOperations): EvidenceHoldsFileSystem {
+  return {
+    async writeDurably(path, bytes) {
+      await operations.mkdir(dirname(path));
+      const temporary = `${path}.${process.pid.toString(36)}.tmp`;
+      const handle = await operations.open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC, 0o600);
+      try {
+        await handle.writeFile(bytes);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await operations.rename(temporary, path);
+      const directory = await operations.open(dirname(path), fsConstants.O_RDONLY);
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    },
+    async readFile(path) {
+      return await operations.readFile(path);
+    },
+  };
+}
+
+/** The real filesystem. */
+export const nodeEvidenceHoldsFileSystem: EvidenceHoldsFileSystem = evidenceHoldsFileSystem(nodeEvidenceHoldsFileOperations);
+
 function parseHolds(bytes: Uint8Array, path: string): ReadonlyMap<string, WindowEvidenceState> {
   const fail = (what: string): never => {
     throw new Error(`the evidence holds ${path} are not ones this build reads: ${what}`);
@@ -146,15 +235,19 @@ function parseHolds(bytes: Uint8Array, path: string): ReadonlyMap<string, Window
 
 /**
  * Read the durable holds. No state directory (a dry run): nothing is durable,
- * and nothing is settled. No file yet: none. A file that does not read: its
- * `failure` keeps every segment, and it is never overwritten.
+ * and nothing is settled. No file yet (`ENOENT`, and only that): none. A file
+ * that does not read — any other read error, or bytes that do not parse — is
+ * a `failure` that keeps every segment, and it is never overwritten.
  */
-export async function readEvidenceHolds(stateDirectory: string | null): Promise<EvidenceHoldState> {
+export async function readEvidenceHolds(
+  stateDirectory: string | null,
+  fileSystem: EvidenceHoldsFileSystem = nodeEvidenceHoldsFileSystem,
+): Promise<EvidenceHoldState> {
   if (stateDirectory === null) return emptyEvidenceHolds();
   const path = evidenceHoldsPath(stateDirectory);
   let bytes: Uint8Array;
   try {
-    bytes = await readFile(path);
+    bytes = await fileSystem.readFile(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyEvidenceHolds();
     return { windows: new Map(), failure: `the evidence holds ${path} could not be read: ${error instanceof Error ? error.message : String(error)}` };
@@ -178,38 +271,6 @@ export function encodeEvidenceHolds(state: EvidenceHoldState): Uint8Array {
     }));
   return Buffer.from(`${JSON.stringify({ evidenceHoldsVersion: EVIDENCE_HOLDS_VERSION, windows }, null, 2)}\n`, "utf8");
 }
-
-/** The file operations the holds need; a test substitutes them to prove each one matters. */
-export type EvidenceHoldsFileSystem = {
-  /** Write a file durably: temporary file, fsync, atomic rename, fsync of the directory. */
-  writeDurably(path: string, bytes: Uint8Array): Promise<void>;
-  readFile(path: string): Promise<Uint8Array>;
-};
-
-/** The real filesystem. */
-export const nodeEvidenceHoldsFileSystem: EvidenceHoldsFileSystem = {
-  async writeDurably(path, bytes) {
-    await mkdir(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid.toString(36)}.tmp`;
-    const handle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC, 0o600);
-    try {
-      await handle.writeFile(bytes);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await rename(temporary, path);
-    const directory = await open(dirname(path), fsConstants.O_RDONLY);
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  },
-  async readFile(path) {
-    return await readFile(path);
-  },
-};
 
 /**
  * Make the holds durable and read them back. Never called on a state whose
@@ -239,11 +300,35 @@ export async function persistEvidenceHolds(
 }
 
 /**
+ * The range a classified window's pin must hold — the window, widened to
+ * every evidence instant and every located chain source's segment, then the
+ * lead-in (`classify.ts`) — or none, for a window with no evidence or one not
+ * classified.
+ */
+export function pinExtent(classification: WindowClassification): readonly Span[] {
+  // A window classified with no evidence has no range (`classify.ts`).
+  if (classification.state !== "classified" || classification.pinFromMs === null || classification.pinToMs === null) return [];
+  return [{ fromMs: classification.pinFromMs, toMs: classification.pinToMs }];
+}
+
+/** Whether a pin record's range covers every range. */
+function recordCovers(record: PinRecord, spans: readonly Span[]): boolean {
+  const fromMs = Date.parse(record.from);
+  const toMs = Date.parse(record.to);
+  return spans.every((span) => fromMs <= span.fromMs && span.toMs <= toMs);
+}
+
+/** The window pin spec this cycle derives (or binds) for a window. */
+function windowSpecOf(specs: readonly PinSpec[], windowId: string): PinSpec | undefined {
+  return specs.find((candidate) => candidate.origin === "window" && candidate.windowId === windowId);
+}
+
+/**
  * The windows this cycle settles: classified, and either its pin — this
  * cycle's outcome for the window's (bound) spec, extracted or already
  * extracted, so its manifests verified — has a complete trace and a range
- * covering every range the window holds, or it is classified with no evidence
- * and holds nothing.
+ * covering every range the window holds AND its own pin extent, or it is
+ * classified with no evidence and holds nothing.
  */
 export function settledWindowIds(input: {
   readonly classifications: Iterable<WindowClassification>;
@@ -254,34 +339,73 @@ export function settledWindowIds(input: {
   const settled = new Set<string>();
   for (const classification of input.classifications) {
     if (classification.state !== "classified") continue;
-    const held = input.state.windows.get(classification.windowId)?.holds ?? [];
+    const held = [...(input.state.windows.get(classification.windowId)?.holds ?? []), ...pinExtent(classification)];
     if (classification.pinClass === null) {
       // Classified with no evidence. A window that once held evidence and now
       // shows none is not settled: the hold stays (rows only ever grow).
       if (held.length === 0) settled.add(classification.windowId);
       continue;
     }
-    const spec = input.specs.find((candidate) => candidate.origin === "window" && candidate.windowId === classification.windowId);
+    const spec = windowSpecOf(input.specs, classification.windowId);
     if (spec === undefined) continue;
     const outcome = input.outcomes.find((candidate) => candidate.pinId === spec.pinId);
     if (outcome === undefined || outcome.status === "waiting" || !outcome.record.sourceEventsInside) continue;
-    const fromMs = Date.parse(outcome.record.from);
-    const toMs = Date.parse(outcome.record.to);
-    if (held.every((span) => fromMs <= span.fromMs && span.toMs <= toMs)) settled.add(classification.windowId);
+    if (recordCovers(outcome.record, held)) settled.add(classification.windowId);
   }
   return settled;
 }
 
 /**
- * The holds after this cycle's classifications.
+ * For a recheck, which extracts no pin and verifies none: the classified
+ * windows whose pin extent a pin record ALREADY in the store holds — the
+ * record the window's (bound) spec names, with a complete trace, its range
+ * covering the extent. Such a window gains no hold in the recheck: the record
+ * is a durable fact the planner obliges every segment it covers to, whatever
+ * the registry says. Every other classified window with evidence gains its
+ * whole extent as a hold (round 4, M1).
+ */
+export function recordedWindowIds(input: {
+  readonly classifications: Iterable<WindowClassification>;
+  readonly specs: readonly PinSpec[];
+  readonly records: readonly PinRecord[];
+}): ReadonlySet<string> {
+  const recorded = new Set<string>();
+  for (const classification of input.classifications) {
+    // A window with no evidence has no window spec (`pinSpecs`), and so is never named.
+    const spec = windowSpecOf(input.specs, classification.windowId);
+    if (spec === undefined) continue;
+    const extent = pinExtent(classification);
+    const record = input.records.find((candidate) => candidate.pinId === spec.pinId);
+    if (record === undefined || !record.sourceEventsInside) continue;
+    if (recordCovers(record, extent)) recorded.add(classification.windowId);
+  }
+  return recorded;
+}
+
+/**
+ * How this pass may change a classified window: a cycle settles the windows
+ * `settledWindowIds` names; a recheck settles and releases nothing, and adds
+ * no hold for the windows `recordedWindowIds` names.
+ */
+export type EvidencePass =
+  | { readonly kind: "cycle"; readonly settled: ReadonlySet<string> }
+  | { readonly kind: "recheck"; readonly recorded: ReadonlySet<string> };
+
+/**
+ * The holds after this pass's classifications.
  *
  * - An unclassified window whose rows read adds its `holdRanges` and is not
  *   settled; one whose rows did not read keeps its holds and settlement and is
  *   marked `unreadable` (nothing is learned). Any read that succeeds clears
  *   `unreadable`.
- * - A classified window is settled exactly when `settled` names it, and a
- *   settled window's holds are released. `settled` `null` (a recheck, which
- *   extracts no pin) changes no classified window's holds or settlement.
+ * - A classified window a cycle settles is settled, and its holds are
+ *   released.
+ * - Every other classified window with evidence adds its whole pin extent and
+ *   is not settled (round 4, M1) — its pin waits on the extraction batch or
+ *   the pin catalog, its extraction failed, or a recheck first learned it —
+ *   except, in a recheck, one whose pin record already holds that extent,
+ *   which is unchanged. A classified window with no evidence that is not
+ *   settled keeps what it holds.
  * - Settlement is forgotten for a window no longer in the registry; holds,
  *   and a failed read of an unsettled window, are kept whatever the registry
  *   says.
@@ -289,7 +413,7 @@ export function settledWindowIds(input: {
 export function rememberEvidence(input: {
   readonly state: EvidenceHoldState;
   readonly classifications: Iterable<WindowClassification>;
-  readonly settled: ReadonlySet<string> | null;
+  readonly pass: EvidencePass;
   readonly registeredWindowIds: ReadonlySet<string>;
 }): EvidenceHoldState {
   const next = new Map(input.state.windows);
@@ -305,16 +429,22 @@ export function rememberEvidence(input: {
         settled: false,
         unreadable: false,
       });
-    } else if (input.settled !== null) {
-      next.set(
-        classification.windowId,
-        input.settled.has(classification.windowId)
-          ? { holds: [], settled: true, unreadable: false }
-          : { holds: previous.holds, settled: false, unreadable: false },
-      );
-    } else {
-      next.set(classification.windowId, { ...previous, unreadable: false });
+      continue;
     }
+    if (input.pass.kind === "cycle" && input.pass.settled.has(classification.windowId)) {
+      next.set(classification.windowId, { holds: [], settled: true, unreadable: false });
+      continue;
+    }
+    const extent = pinExtent(classification);
+    if (input.pass.kind === "recheck" && (extent.length === 0 || input.pass.recorded.has(classification.windowId))) {
+      next.set(classification.windowId, { ...previous, unreadable: false });
+      continue;
+    }
+    next.set(classification.windowId, {
+      holds: mergeSpans([...previous.holds, ...extent]),
+      settled: false,
+      unreadable: false,
+    });
   }
   for (const [windowId, entry] of next) {
     if (entry.holds.length > 0 || (entry.unreadable && !entry.settled)) continue;

@@ -20,8 +20,9 @@
  * | a sidecar left without its segment | J13 |
  * | a segment the extract path refuses | J14 |
  *
- * Rounds 2 and 3 add their own sections below (K1-K6, L1-L4), each case a
- * real deletion the review showed, or a liveness failure it showed.
+ * Rounds 2, 3 and 4 add their own sections below (K1-K6, L1-L4, M1-M2),
+ * each case a real deletion the review showed, or a liveness failure it
+ * showed.
  */
 
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -54,7 +55,14 @@ import type { ManualBootClock, StorageFixture } from "../testing/storage-fixture
 import type { MarketEvidence, TraderEvidenceSource } from "./classify.js";
 import { dispatchFrontier, staticEvidenceSource } from "./classify.js";
 import { runStorageCycle } from "./cycle.js";
-import { EVIDENCE_HOLDS_FILE_NAME, readEvidenceHolds } from "./evidence-holds.js";
+import type { EvidenceHoldsFileOperations } from "./evidence-holds.js";
+import {
+  EVIDENCE_HOLDS_FILE_NAME,
+  evidenceHoldsFileSystem,
+  evidenceHoldsPath,
+  nodeEvidenceHoldsFileOperations,
+  readEvidenceHolds,
+} from "./evidence-holds.js";
 import { listExpiryPlanIds } from "./execute.js";
 import type { StorageCycleDependencies, StorageCycleReport } from "./cycle.js";
 import { fileOperatorPinLock, operatorPinLockPath, publishOperatorPin } from "./operator-pin-lock.js";
@@ -1232,5 +1240,267 @@ describe("L4: no window pin is extracted while the pin catalog does not read in 
     expect(deletionPins(third, f.segments[2]?.segmentId)).toStrictEqual([pinId]);
     expect(await walFiles(f)).not.toContain(f.segments[2]?.segmentFileName);
     expect(await windowPinDirectories(f)).toStrictEqual([pinId]);
+  });
+});
+
+// -- Round 4 ------------------------------------------------------------------
+
+describe("M1: a classified window's whole pin extent is held, durably, until its pin is settled, whatever the registry says", () => {
+  // As L1: S0 holds the located source (EPOCH, "2"), a reference-feed frame
+  // two hours before the window, which names no market; S1 is the window's
+  // own book; S2 lies after the window, outside every range it could pin; S3
+  // is young, and carries the WAL past the range.
+  const located = { evaluatedAtMs: OLD, sourceEventId: "located", gatewayEpoch: EPOCH, ingestSeq: "2" };
+  const evidence: MarketEvidence = { ...NONE, fillsAtMs: [OLD + MIN], intents: [located] };
+  const window = MARKET_WINDOW(OLD, OLD + 15 * MIN);
+  const EXTENT = { fromMs: OLD - 2 * HOUR - 15 * MIN, toMs: OLD + 15 * MIN };
+  const segments = () => [
+    [tradeFrame({ ingestSeq: "1", atMs: OLD - 2 * HOUR })],
+    [tokBook("3", OLD)],
+    [tradeFrame({ ingestSeq: "5", atMs: OLD + 20 * MIN })],
+    [tradeFrame({ ingestSeq: "7", atMs: NOW - HOUR })],
+  ];
+
+  /** A store whose pin writes, or whose first pin listing, fail while `armed`. */
+  function faultyStore(store: ObjectStore, fault: "pin-write" | "catalog-listing"): { store: ObjectStore; disarm(): void } {
+    let armed = true;
+    return {
+      disarm() {
+        armed = false;
+      },
+      store: {
+        async put(key, bytes) {
+          if (armed && fault === "pin-write" && key.startsWith("pins/")) {
+            throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+          }
+          await store.put(key, bytes);
+        },
+        head: (key) => store.head(key),
+        get: (key) => store.get(key),
+        async list(prefix) {
+          if (armed && fault === "catalog-listing" && prefix === "pins") {
+            armed = false;
+            throw Object.assign(new Error("EIO: i/o error, scandir"), { code: "EIO" });
+          }
+          if (store.list === undefined) throw new Error("the fixture store lists");
+          return await store.list(prefix);
+        },
+      },
+    };
+  }
+
+  type Trigger = "batch-delay" | "pin-write" | "catalog-listing" | "recheck-learned";
+  /**
+   * Cycle 1 classifies w1 with a fill, but settles no pin for it. Returns the
+   * dependencies for later cycles, with the trigger cleared.
+   */
+  async function classifiedUnsettled(trigger: Trigger): Promise<{
+    f: StorageFixture;
+    first: StorageCycleReport;
+    later: (extra: Partial<StorageCycleDependencies>) => StorageCycleDependencies;
+  }> {
+    const f = await fixture(segments());
+    const bootClock = manualBootClock();
+    let store: ObjectStore = f.objectStore;
+    let source: TraderEvidenceSource = frontierAt("100", evidence);
+    let batchDelayMs = 0;
+    let disarm = (): void => undefined;
+    if (trigger === "batch-delay") {
+      // The production default batch delay, and no fault: every segment above
+      // is extracted, and one sealed ten minutes ago waits for its batch, so
+      // the window's pin waits on it.
+      await f.extract();
+      const young = buildSegmentFixture({
+        gatewayEpoch: EPOCH,
+        segmentIndex: 4,
+        frames: [tradeFrame({ ingestSeq: "9", atMs: NOW - 12 * MIN })],
+        createdAt: new Date(NOW - 15 * MIN).toISOString(),
+        closedAt: new Date(NOW - 10 * MIN).toISOString(),
+      });
+      await writeFile(join(f.walDir, young.segmentFileName), young.segmentBytes);
+      await writeFile(join(f.walDir, young.manifestFileName), young.manifestBytes);
+      batchDelayMs = HOUR;
+    } else if (trigger === "pin-write" || trigger === "catalog-listing") {
+      const faulty = faultyStore(f.objectStore, trigger);
+      store = faulty.store;
+      disarm = () => faulty.disarm();
+    } else {
+      // The plan reads no evidence (the window classifies with none); every
+      // recheck, and every later cycle, reads the fill.
+      let reads = 0;
+      source = {
+        dispatchFrontiers: (instanceIds) => frontierAt("100", evidence).dispatchFrontiers(instanceIds),
+        async marketEvidence() {
+          reads += 1;
+          return reads === 1 ? NONE : evidence;
+        },
+      };
+    }
+    const deps = (extra: Partial<StorageCycleDependencies>): StorageCycleDependencies => {
+      const base = dependencies(f, { bootClock, objectStore: store, loadWindows: async () => [window], evidence: source });
+      return { ...base, ...extra, settings: { ...base.settings, extractionBatchDelayMs: batchDelayMs } };
+    };
+    const first = await runStorageCycle(deps({}));
+    expect(first.classifications[0]).toMatchObject({ state: "classified", pinClass: trigger === "recheck-learned" ? null : "fill" });
+    expect(first.pins.filter((outcome) => outcome.status !== "waiting")).toStrictEqual([]);
+    if (trigger === "pin-write") expect(first.pinFailures).toStrictEqual([{ pinId: expect.stringMatching(/^window-w1-/u), detail: expect.stringMatching(/ENOSPC/u) }]);
+    if (trigger === "recheck-learned") {
+      expect(first.expiry?.failures).toContainEqual({ segmentId: f.segments[0]?.segmentId, detail: expect.stringMatching(/^kept on recheck: /u) });
+    }
+    // Only the segment after the window went.
+    expect(first.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[2]?.segmentId]);
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    expect(await walFiles(f)).toContain(f.segments[1]?.segmentFileName);
+    disarm();
+    bootClock.advance(HOUR);
+    f.clock.setNowMs(NOW + HOUR);
+    return { f, first, later: deps };
+  }
+
+  const triggers: Trigger[] = ["batch-delay", "pin-write", "catalog-listing", "recheck-learned"];
+  const registries: [string, readonly MarketWindow[]][] = [
+    ["with no window of its market registered", []],
+    ["with another window of the same market still registered", [LATER_SAME_MARKET]],
+  ];
+  const removals = triggers.flatMap((trigger) => registries.map(([name, windows]) => [trigger, name, windows] as const));
+
+  it.each(removals)("(%s) keeps the chain source's segment and the window's own, %s, once the window leaves the registry", async (trigger, _name, windows) => {
+    const { f, first, later } = await classifiedUnsettled(trigger);
+    const second = await runStorageCycle(later({ loadWindows: async () => windows }));
+    expect(deletionPins(second, f.segments[0]?.segmentId)).toBeNull();
+    expect(deletionPins(second, f.segments[1]?.segmentId)).toBeNull();
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    expect(await walFiles(f)).toContain(f.segments[1]?.segmentFileName);
+    for (const segment of [f.segments[0], f.segments[1]]) {
+      expect(reasonsOf(second, segment?.segmentId ?? "")).toContainEqual(
+        expect.stringMatching(/^evidence-hold: w1 holds chain evidence in this segment until its pin holds it/u),
+      );
+    }
+    // Cycle 1 made w1's whole pin extent, the located source's segment
+    // included, durable — in the recheck, before its deletion — and it stays
+    // durable after the removal, and in the cycle after.
+    if (trigger === "recheck-learned") {
+      expect(first.expiry?.failures).toContainEqual({
+        segmentId: f.segments[0]?.segmentId,
+        detail: expect.stringMatching(/^kept on recheck: .*evidence-hold: w1 holds chain evidence in this segment/u),
+      });
+    }
+    expect((await readEvidenceHolds(f.stateDir)).windows.get("w1")).toStrictEqual({ holds: [EXTENT], settled: false, unreadable: false });
+    f.clock.setNowMs(NOW + 2 * HOUR);
+    await runStorageCycle(later({ loadWindows: async () => windows, bootClock: null, mode: "dry-run", deletion: null }));
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+  });
+
+  it.each(triggers)("(%s) releases the hold once the window's pin is extracted: the source and the window then expire under it", async (trigger) => {
+    const { f, later } = await classifiedUnsettled(trigger);
+    const second = await runStorageCycle(later({}));
+    const outcome = second.pins[0];
+    if (outcome === undefined || outcome.status !== "extracted") throw new Error(`expected an extracted pin, got ${JSON.stringify(second.pins)}`);
+    expect(outcome.record.sourceEventsInside).toBe(true);
+    expect(deletionPins(second, f.segments[0]?.segmentId)).toStrictEqual([outcome.pinId]);
+    expect(deletionPins(second, f.segments[1]?.segmentId)).toStrictEqual([outcome.pinId]);
+    expect((await readEvidenceHolds(f.stateDir)).windows.get("w1")).toStrictEqual({ holds: [], settled: true, unreadable: false });
+  });
+
+  it("control: a window pinned in the cycle it classifies holds nothing; its segments expire under the pin, and its removal changes nothing", async () => {
+    const f = await fixture(segments());
+    const bootClock = manualBootClock();
+    const first = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: frontierAt("100", evidence) }));
+    const outcome = first.pins[0];
+    if (outcome === undefined || outcome.status !== "extracted") throw new Error("expected an extracted pin");
+    expect(deletionPins(first, f.segments[0]?.segmentId)).toStrictEqual([outcome.pinId]);
+    expect(deletionPins(first, f.segments[1]?.segmentId)).toStrictEqual([outcome.pinId]);
+    expect((await readEvidenceHolds(f.stateDir)).windows.get("w1")).toStrictEqual({ holds: [], settled: true, unreadable: false });
+    bootClock.advance(HOUR);
+    f.clock.setNowMs(NOW + HOUR);
+    await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [LATER_SAME_MARKET], evidence: frontierAt("100", evidence) }));
+    expect((await readEvidenceHolds(f.stateDir)).windows.has("w1")).toBe(false);
+    expect(await windowPinDirectories(f)).toStrictEqual([outcome.pinId]);
+  });
+});
+
+describe("M2: the holds file's own guards, with the real writer and reader, in a real cycle", () => {
+  /** The real calls, the holds file's first read, or one sync, failing once. */
+  function failingOnce(fault: "read" | "file-sync" | "directory-sync", path: string): { operations: EvidenceHoldsFileOperations; failures: () => number } {
+    const real = nodeEvidenceHoldsFileOperations;
+    let failures = 0;
+    const fail = (step: string): never => {
+      failures += 1;
+      throw Object.assign(new Error(`EIO: i/o error, ${step}`), { code: "EIO" });
+    };
+    return {
+      failures: () => failures,
+      operations: {
+        mkdir: (directory) => real.mkdir(directory),
+        async open(target, flags, mode) {
+          const handle = await real.open(target, flags, mode);
+          const directory = target !== `${path}.${process.pid.toString(36)}.tmp`;
+          return {
+            writeFile: (bytes) => handle.writeFile(bytes),
+            async sync() {
+              if (failures === 0 && fault === (directory ? "directory-sync" : "file-sync")) fail(fault);
+              await handle.sync();
+            },
+            close: () => handle.close(),
+          };
+        },
+        rename: (oldPath, newPath) => real.rename(oldPath, newPath),
+        async readFile(target) {
+          if (failures === 0 && fault === "read" && target === path) fail("read");
+          return await real.readFile(target);
+        },
+      },
+    };
+  }
+
+  it("a holds file the cycle cannot read (EIO, not ENOENT) keeps every segment, and is never overwritten: the hold survives", async () => {
+    // Cycle 1 holds w1's located source (L1); then w1 leaves the registry.
+    const located = { evaluatedAtMs: OLD, sourceEventId: "located", gatewayEpoch: EPOCH, ingestSeq: "2" };
+    const pending = { evaluatedAtMs: OLD + MIN, sourceEventId: "pending", gatewayEpoch: E2, ingestSeq: "2" };
+    const f = await fixture([
+      [tradeFrame({ ingestSeq: "1", atMs: OLD - 2 * HOUR })],
+      [tokBook("3", OLD)],
+      [tradeFrame({ ingestSeq: "5", atMs: OLD + 20 * MIN })],
+      [tradeFrame({ ingestSeq: "7", atMs: NOW - HOUR })],
+    ]);
+    const bootClock = manualBootClock();
+    await runStorageCycle(
+      dependencies(f, { bootClock, loadWindows: async () => [MARKET_WINDOW(OLD, OLD + 15 * MIN)], evidence: frontierAt("100", { ...NONE, fillsAtMs: [OLD + MIN], intents: [located, pending] }) }),
+    );
+    const before = await readFile(evidenceHoldsPath(f.stateDir));
+    expect((await readEvidenceHolds(f.stateDir)).windows.get("w1")?.holds.length).toBe(1);
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + 30 * MIN);
+    const transient = failingOnce("read", evidenceHoldsPath(f.stateDir));
+    const second = await runStorageCycle(
+      dependencies(f, { bootClock, loadWindows: async () => [LATER_SAME_MARKET], evidenceHoldsFileSystem: evidenceHoldsFileSystem(transient.operations) }),
+    );
+    expect(transient.failures()).toBe(1);
+    expect(second.expiry).toBeNull();
+    for (const decision of second.decisions) {
+      expect(decision.reasons).toContainEqual(expect.stringMatching(/^evidence-holds-unknown: the evidence holds .* could not be read: EIO/u));
+    }
+    expect(await readFile(evidenceHoldsPath(f.stateDir))).toStrictEqual(before);
+    // The read works again: the hold is still there, and still keeps the source.
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + HOUR);
+    const third = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [LATER_SAME_MARKET] }));
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    expect(reasonsOf(third, f.segments[0]?.segmentId ?? "")).toStrictEqual([expect.stringMatching(/^evidence-hold: w1 holds chain evidence/u)]);
+  });
+
+  it.each(["file-sync", "directory-sync"] as const)("a %s of the holds that fails keeps every segment; the control expires", async (fault) => {
+    const f = await fixture([[tradeFrame({ ingestSeq: "1", atMs: OLD })], [tradeFrame({ ingestSeq: "2", atMs: NOW - HOUR })]]);
+    const failing = failingOnce(fault, evidenceHoldsPath(f.stateDir));
+    const report = await runStorageCycle(dependencies(f, { evidenceHoldsFileSystem: evidenceHoldsFileSystem(failing.operations) }));
+    expect(failing.failures()).toBe(1);
+    expect(report.expiry).toBeNull();
+    expect(await walFiles(f)).toHaveLength(2);
+    expect(reasonsOf(report, f.segments[0]?.segmentId ?? "")).toStrictEqual([
+      expect.stringMatching(new RegExp(`^evidence-holds-unknown: .*could not be made durable: EIO: i/o error, ${fault}`, "u")),
+    ]);
+    // Control: the same cycle once the sync works.
+    const control = await runStorageCycle(dependencies(f, { evidenceHoldsFileSystem: evidenceHoldsFileSystem(failing.operations) }));
+    expect(control.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[0]?.segmentId]);
   });
 });
