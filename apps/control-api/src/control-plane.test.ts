@@ -195,6 +195,81 @@ describe("ACCEPTANCE 2: audit first, then apply", () => {
   });
 });
 
+describe("CONTROL-1 (M-1): an instance the control plane never knew is REFUSED, not fabricated", () => {
+  it.each([
+    ["pause", "STRATEGY_PAUSE"],
+    ["resume", "STRATEGY_RESUME"],
+  ] as const)("refuses a %s of an unregistered instance, audits the refusal, and inserts nothing", async (verb, action) => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    const result =
+      verb === "pause"
+        ? await control.pauseStrategy("never-registered", context())
+        : await control.resumeStrategy("never-registered", context());
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_UNKNOWN_INSTANCE" });
+    expect(control.strategies()).toEqual([]);
+    expect(audit.records()).toHaveLength(1);
+    expect(audit.records()[0]).toMatchObject({
+      action,
+      outcome: "REFUSED",
+      scope: "STRATEGY_INSTANCE",
+      scopeRef: "never-registered",
+    });
+    expect(audit.records()[0]?.priorState).toEqual({ known: "false", instanceId: "never-registered" });
+    expect(audit.records()[0]?.resultingState).toMatchObject({
+      known: "false",
+      refusalCode: "CONTROL_UNKNOWN_INSTANCE",
+    });
+  });
+
+  it("an unknown id never grows the instance map, however many are tried (L-8)", async () => {
+    const control = plane(new InMemoryControlAuditLog(1_000));
+    for (let index = 0; index < 200; index += 1) {
+      await control.pauseStrategy(`unknown-${String(index)}`, context());
+    }
+    expect(control.strategies()).toEqual([]);
+  });
+});
+
+describe("CONTROL-1 (L-6): an unauditable mutation is counted NOT_AUDITED, never APPLIED", () => {
+  it("counts the refused append under its own outcome", async () => {
+    const control = plane(new RefusingSink());
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    await control.pauseStrategy("sb-1", context());
+    await control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, context());
+    expect(control.mutationCounts()).toEqual([
+      { action: "KILL_SWITCH_ENGAGE", outcome: "NOT_AUDITED", count: 1 },
+      { action: "STRATEGY_PAUSE", outcome: "NOT_AUDITED", count: 1 },
+    ]);
+    expect(control.auditAppendFailures).toBe(2);
+    expect(control.killSwitches()).toEqual([]);
+  });
+});
+
+describe("CONTROL-1 (M-3): the mode-raise record says whether it was written", () => {
+  it("returns audited: true when the sink accepted the record", async () => {
+    const control = plane(new InMemoryControlAuditLog(8));
+    expect(await control.refuseModeRaise(["runMode"], context())).toEqual({ audited: true });
+  });
+
+  it("returns audited: false, with the refusal, when the sink refused it — and still counts the attempt", async () => {
+    const control = plane(new RefusingSink());
+    const outcome = await control.refuseModeRaise(["runMode"], context());
+    expect(outcome).toMatchObject({ audited: false, code: "CONTROL_NOT_AUDITABLE" });
+    expect(control.modeRaiseAttemptsRefused).toBe(1);
+  });
+
+  it("countModeRaiseWithoutAudit counts and writes NOTHING", () => {
+    const sink = new RefusingSink();
+    const control = plane(sink);
+    control.countModeRaiseWithoutAudit();
+    control.countModeRaiseWithoutAudit();
+    expect(control.modeRaiseAttemptsRefused).toBe(2);
+    expect(sink.seen).toEqual([]);
+    expect(control.mutationCounts()).toEqual([]);
+  });
+});
+
 describe("ACCEPTANCE 1: a mode-raise attempt is recorded and changes nothing", () => {
   it("records the attempt, names the keys, and leaves the ceiling alone", async () => {
     const audit = new InMemoryControlAuditLog(8);

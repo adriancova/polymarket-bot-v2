@@ -20,12 +20,32 @@
  * `control-plane.test.ts` proves it by injecting a sink that refuses and
  * observing that the state did not move.
  *
- * REFUSALS ARE AUDITED TOO. A refused mutation is an operator fact — someone
- * tried and the system said no — and an audit log that records only successes
- * cannot answer "who has been probing this". The one exception is stated and
- * bounded: a request that never authenticated never reaches this class, so it
- * writes no record; it is counted instead, on
- * `control_authentication_failures_total`, which is why that counter exists.
+ * REFUSALS ARE AUDITED TOO — for an actor with MUTATION AUTHORITY. A refused
+ * mutation is an operator fact — someone tried and the system said no — and an
+ * audit log that records only successes cannot answer "who has been probing
+ * this". Every refusal this class writes is for a caller `api.ts` has already
+ * authorized for the mutation's grant, or — for {@link ControlPlane.refuseModeRaise}
+ * — for a caller holding at least one mutation grant. A caller with NO
+ * mutation authority writes nothing here at all (`CONTROL-1`, closing
+ * `WP-240` r1 M-3): an unauthenticated request never reaches this class, an
+ * unauthorized one is refused before it, and a READ-only operator's mode-raise
+ * attempt is COUNTED through {@link ControlPlane.countModeRaiseWithoutAudit}
+ * and never appended. An audit log a caller without mutation authority could
+ * append to is one it could exhaust, and this one refuses mutations — the kill
+ * switch included — when it is full. `README.md`, "The audit budget", states
+ * the whole design; `audit-budget.ts` is its second half.
+ *
+ * ## Unknown instances are refused, not fabricated (`CONTROL-1`, M-1)
+ *
+ * A pause or resume of an instance this control plane has never registered is
+ * refused `CONTROL_UNKNOWN_INSTANCE` and audited as `REFUSED`, the way a release
+ * of a switch nobody engaged is refused `CONTROL_NOT_ENGAGED`. At `WP-240` the
+ * plane synthesized a `RUNNING` prior for such an id and answered `200
+ * PAUSED`; the shipped composition registers no instance at all, so every
+ * pause it served was a halt of nothing that an operator would read as a halt
+ * that took effect. An unknown id now inserts nothing, so the instance map —
+ * and the `control_strategy_*` metric cardinality — grows only through
+ * {@link ControlPlane.register}, which is composition (`WP-240` r1 L-8).
  *
  * ## Acceptance 1: there is nothing here that raises a mode
  *
@@ -50,6 +70,7 @@ import {
   type ControlAuditSink,
 } from "@polymarket-bot/observability";
 
+import { instanceIdProblem } from "./instance-id.js";
 import { CONTROL_ACTOR_KIND, type ControlKillSwitchAction, type ControlKillSwitchScope } from "./vocabulary.js";
 
 /** A strategy instance's run state, as the control plane holds it. */
@@ -100,7 +121,22 @@ export type MutationRefusalCode =
   /** No such kill switch is engaged. */
   | "CONTROL_NOT_ENGAGED"
   /** A release without the evidence a release requires. */
-  | "CONTROL_RELEASE_EVIDENCE_MISSING";
+  | "CONTROL_RELEASE_EVIDENCE_MISSING"
+  /**
+   * No such strategy instance is registered (`CONTROL-1`, M-1). The strategy
+   * twin of {@link MutationRefusalCode} `CONTROL_NOT_ENGAGED`.
+   */
+  | "CONTROL_UNKNOWN_INSTANCE";
+
+/**
+ * Whether a refused mode-raise attempt reached the audit log.
+ *
+ * `api.ts` words its `403` from this, so the refusal never CLAIMS an audit
+ * record that the sink refused to write.
+ */
+export type ModeRaiseAuditOutcome =
+  | { readonly audited: true }
+  | { readonly audited: false; readonly code: string; readonly detail: string };
 
 export type MutationResult<T> =
   | { readonly ok: true; readonly value: T }
@@ -176,8 +212,22 @@ export class ControlPlane {
    * because nothing changed for an operator: an instance the control plane does
    * not know is an instance it cannot pause, and registering it grants no one
    * anything.
+   *
+   * The id must satisfy the route parameter's grammar (`instance-id.ts`), so
+   * every registered instance is one `POST /v1/strategies/:instanceId/…` can
+   * address. An id it cannot is a composition defect, and it THROWS at startup
+   * rather than registering an instance no operator could ever pause.
+   *
+   * The shipped composition (`main.ts`) registers NONE: no seam reaches a
+   * running trader's strategies yet (`README.md`, "the composition
+   * obligation"), and registering an id this process cannot control would make
+   * a `200 PAUSED` a claim about nothing (`CONTROL-1`, M-1).
    */
   register(instanceId: string, at: string): void {
+    const problem = instanceIdProblem(instanceId);
+    if (problem !== undefined) {
+      throw new RangeError(`cannot register strategy instance: ${problem}`);
+    }
     if (this.#strategies.has(instanceId)) return;
     this.#strategies.set(
       instanceId,
@@ -266,13 +316,19 @@ export class ControlPlane {
     action: ControlAuditAction,
     context: MutationContext,
   ): Promise<MutationResult<StrategyInstanceState>> {
-    const prior: StrategyInstanceState = this.#strategies.get(instanceId) ?? {
-      instanceId,
-      state: "RUNNING",
-      reason: "not previously known to the control plane",
-      since: context.at,
-      actor: "system",
-    };
+    const prior = this.#strategies.get(instanceId);
+    if (prior === undefined) {
+      // `CONTROL-1`, M-1: REFUSE, exactly as `releaseKillSwitch` refuses a
+      // switch nobody engaged. No prior is fabricated and nothing is inserted.
+      return this.#refuse(action, context, "STRATEGY_INSTANCE", instanceId, strategyUnknown(instanceId), {
+        code: "CONTROL_UNKNOWN_INSTANCE",
+        detail:
+          `strategy instance ${instanceId} is not registered with this control plane; answering ` +
+          `'${next}' here would let an operator mistake a change to an instance nothing runs for a ` +
+          "change that took effect (the shipped composition registers no instance until a seam " +
+          "reaches a running trader's strategies — README, 'the composition obligation')",
+      });
+    }
 
     if (prior.state === next) {
       return this.#refuse(action, context, "STRATEGY_INSTANCE", instanceId, strategyDocument(prior), {
@@ -422,14 +478,21 @@ export class ControlPlane {
    * makes the attempt EVIDENCE (§14.1's append-only audit) and increments the
    * counter the operations dashboard shows. Acceptance 1's "refused by name and
    * audited" is this method plus `vocabulary.ts`'s key list.
+   *
+   * Its caller holds at least one MUTATION grant: `api.ts` routes an attempt
+   * from a caller without one to {@link ControlPlane.countModeRaiseWithoutAudit}
+   * instead (`CONTROL-1`, M-3). It RETURNS whether the record was written, so
+   * the refusal an operator reads never claims an audit the sink refused — an
+   * ordinary record is refused once the audit budget's ordinary tier is full
+   * (`audit-budget.ts`), and the request is refused by name either way.
    */
   async refuseModeRaise(
     keys: readonly string[],
     context: MutationContext,
-  ): Promise<void> {
+  ): Promise<ModeRaiseAuditOutcome> {
     this.#modeRaiseAttemptsRefused += 1;
     const ceiling = runStateDocument(this.runState());
-    await this.#append(
+    const appended = await this.#append(
       "MODE_RAISE_ATTEMPT",
       "REFUSED",
       context,
@@ -461,6 +524,25 @@ export class ControlPlane {
       // outbound protocol frame.
       { attemptedKeys: [...keys] },
     );
+    return appended.ok
+      ? { audited: true }
+      : { audited: false, code: appended.refusal.code, detail: appended.refusal.detail };
+  }
+
+  /**
+   * Counts a refused mode-raise attempt from a caller WITHOUT mutation
+   * authority, and writes NOTHING (`CONTROL-1`, closing `WP-240` r1 M-3).
+   *
+   * The HTTP layer has already refused the request by name. The attempt still
+   * moves `control_mode_raise_attempts_refused_total`, so a reader repeatedly
+   * trying is visible; it is not appended, because a READ-only credential that
+   * could append could fill the log, and a full log refuses every mutation,
+   * the kill switch included. The difference between that counter and
+   * `control_mutations_total{action="MODE_RAISE_ATTEMPT"}` is exactly the
+   * attempts this method counted.
+   */
+  countModeRaiseWithoutAudit(): void {
+    this.#modeRaiseAttemptsRefused += 1;
   }
 
   // --- the audit path -------------------------------------------------------
@@ -564,6 +646,11 @@ function strategyDocument(state: StrategyInstanceState): AuditStateDocument {
     since: state.since,
     actor: state.actor,
   };
+}
+
+/** The prior state of an instance the control plane does not know (M-1). */
+function strategyUnknown(instanceId: string): AuditStateDocument {
+  return { known: "false", instanceId };
 }
 
 function killSwitchDocument(state: KillSwitchState): AuditStateDocument {

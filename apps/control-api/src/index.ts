@@ -61,6 +61,7 @@ export type {
   ControlPlaneOptions,
   KillSwitchRelease,
   KillSwitchState,
+  ModeRaiseAuditOutcome,
   MutationContext,
   MutationRefusalCode,
   MutationResult,
@@ -84,8 +85,36 @@ export type {
   TraderHealthSource,
 } from "./health-source.js";
 
-export { CONTROL_API_ROUTES, ControlApi } from "./api.js";
-export type { ApiEnvironment, ApiRequest, ApiResponse, ControlApiOptions } from "./api.js";
+export {
+  CONTROL_API_ROUTE_TABLE,
+  CONTROL_API_ROUTES,
+  ControlApi,
+  MUTATION_GRANTS,
+  holdsMutationAuthority,
+} from "./api.js";
+export type {
+  ApiEnvironment,
+  ApiRequest,
+  ApiResponse,
+  ControlApiOptions,
+  ControlApiRoute,
+} from "./api.js";
 
-export { startControlHttpServer } from "./http.js";
-export type { ControlHttpServerOptions, RunningControlHttpServer } from "./http.js";
+export {
+  AUDIT_BUDGET_TIERS,
+  SafetyReservedAuditSink,
+  auditBudgetProblem,
+  auditBudgetTier,
+  createBudgetedAuditLog,
+} from "./audit-budget.js";
+export type { AuditBudgetOptions, AuditBudgetTier } from "./audit-budget.js";
+
+export { MAX_INSTANCE_ID_LENGTH, instanceIdProblem, readInstanceIdParameter } from "./instance-id.js";
+export type { InstanceIdParameter } from "./instance-id.js";
+
+export { CONTROL_HTTP_TIMEOUTS, isJsonContentType, startControlHttpServer } from "./http.js";
+export type {
+  ControlHttpServerOptions,
+  ControlHttpTimeouts,
+  RunningControlHttpServer,
+} from "./http.js";

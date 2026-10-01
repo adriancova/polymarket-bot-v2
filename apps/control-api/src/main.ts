@@ -11,7 +11,7 @@
  * ```text
  * 1. checkControlApiSafety(env)      ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration ← ADR-020 D1-D4, §15 loopback
- * 3. construct the audit sink         ← in-memory, or the WP-040 ops tables
+ * 3. construct the audit sink         ← in-memory, behind the audit budget
  * 4. construct the control plane      ← audits before it applies
  * 5. bind loopback and serve
  * ```
@@ -39,9 +39,8 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
-import { InMemoryControlAuditLog, type ControlAuditSink } from "@polymarket-bot/observability";
-
 import { ControlApi, type ApiEnvironment } from "./api.js";
+import { createBudgetedAuditLog } from "./audit-budget.js";
 import { OperatorRegistry } from "./auth.js";
 import { ControlPlane } from "./control-plane.js";
 import { parseControlApiConfig, type ControlApiConfig } from "./config.js";
@@ -154,7 +153,9 @@ export async function startup(
 
   ports.log(
     `control API configuration accepted: ${String(config.operators.length)} operator(s), ` +
-      `audit bound ${String(config.auditCapacity)}, trader health source ${config.traderHealth.kind}`,
+      `audit bound ${String(config.auditCapacity)} (the last ${String(config.auditSafetyReserve)} ` +
+      `for kill-switch engages, the ${String(config.auditSafetyReserve)} before them for ` +
+      `safety-direction actions), trader health source ${config.traderHealth.kind}`,
   );
 
   if (!options.serve) {
@@ -163,8 +164,16 @@ export async function startup(
   }
 
   const environment = processEnvironment();
-  const audit = new InMemoryControlAuditLog(config.auditCapacity);
-  const sink: ControlAuditSink = audit;
+  // `CONTROL-1` (closing `WP-240` r1 M-3): the log sits behind the audit budget,
+  // so only a halt can use the capacity a halt needs (`audit-budget.ts`). No
+  // strategy instance is REGISTERED: no seam reaches a running trader's
+  // strategies yet, so the control plane knows none and refuses a pause or
+  // resume of any id `CONTROL_UNKNOWN_INSTANCE` rather than answering for an
+  // instance it cannot control (M-1; README, "the composition obligation").
+  const { log: audit, sink } = createBudgetedAuditLog({
+    capacity: config.auditCapacity,
+    safetyReserve: config.auditSafetyReserve,
+  });
   const controlPlane = new ControlPlane({
     audit: sink,
     runMode: CONTROL_API_RUN_MODE,
@@ -202,6 +211,12 @@ export async function startup(
   ports.log(
     `control API listening on ${config.bindHost}:${String(server.port)} — PAPER, no signer, ` +
       "no venue connection, no route that raises a run mode",
+  );
+  ports.log(
+    `server timeouts: headers ${String(server.timeouts.headersTimeoutMs)}ms, request ` +
+      `${String(server.timeouts.requestTimeoutMs)}ms, keep-alive ${String(server.timeouts.keepAliveTimeoutMs)}ms; ` +
+      "no strategy instance is registered (no seam reaches a running trader's strategies), so a " +
+      "pause or resume is refused CONTROL_UNKNOWN_INSTANCE",
   );
   ports.log(
     config.traderHealth.kind === "http"

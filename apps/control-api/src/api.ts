@@ -28,12 +28,33 @@
  *    when it is full.
  * 2. **Read the body through the door** (D1-D4), bounded in size by the
  *    transport before it ever gets here.
- * 3. **Refuse a mode-raise attempt BY NAME**, and audit it. This runs before
- *    authorization on purpose: an authenticated operator who lacks
- *    `KILL_SWITCH` and sends `{"runMode":"LIVE"}` should be recorded as having
- *    attempted the mode raise, which is the more interesting fact.
- * 4. **Authorize** against the route's explicit grant (§15).
- * 5. **Act**, through the control plane, which audits before it applies.
+ * 3. **Refuse a mode-raise attempt BY NAME** — from every authenticated
+ *    caller, on every route, known or not. It is AUDITED only when the caller
+ *    holds a MUTATION grant ({@link MUTATION_GRANTS}); a caller without one is
+ *    refused identically and COUNTED (`control_mode_raise_attempts_refused_total`)
+ *    but writes no record. This runs before authorization on purpose: an
+ *    operator holding `STRATEGY_CONTROL` who sends `{"runMode":"LIVE"}` to the
+ *    kill-switch route should be recorded as having attempted the mode raise,
+ *    which is the more interesting fact. It is NOT audited for a READ-only
+ *    caller because that is `WP-240` r1 M-3: a reader whose refusals were
+ *    appended could fill the audit log, and a full log refuses every mutation,
+ *    the kill switch included (`CONTROL-1`; `README.md`, "The audit budget").
+ * 4. **Resolve the route** in {@link CONTROL_API_ROUTE_TABLE}: an unknown path
+ *    is `404`, a known path under the wrong method is `405` with an `Allow`
+ *    header (`CONTROL-1`, L-4).
+ * 5. **Authorize** against the route's explicit grant (§15).
+ * 6. **Read the route parameter and the body through their doors**, then
+ *    **act**, through the control plane, which audits before it applies.
+ *
+ * ## The route table IS the router (`CONTROL-1`, L-5)
+ *
+ * Dispatch looks a request up in {@link CONTROL_API_ROUTE_TABLE} and nowhere
+ * else, and an exhaustive `switch` over the table's `kind` names the handler —
+ * so a route cannot be served without being listed, nor listed without being
+ * served (a missing handler is a type error). {@link CONTROL_API_ROUTES} and
+ * {@link MUTATION_GRANTS} are DERIVED from the table, so the README's route
+ * list, the route-inventory test and the audit gate in step 3 all read the
+ * router itself rather than a hand-kept copy of it.
  *
  * ## What is NOT here, and cannot be
  *
@@ -91,6 +112,7 @@ import {
   type DoorResult,
 } from "./doors.js";
 import type { TraderHealthCache } from "./health-source.js";
+import { readInstanceIdParameter } from "./instance-id.js";
 import {
   CONTROL_KILL_SWITCH_ACTIONS,
   CONTROL_KILL_SWITCH_SCOPES,
@@ -114,6 +136,11 @@ export interface ApiResponse {
   readonly status: number;
   readonly contentType: string;
   readonly body: string;
+  /**
+   * The `Allow` header, on a `405` only (RFC 9110 §15.5.6 requires it there).
+   * `http.ts` writes it; every other response leaves it absent.
+   */
+  readonly allow?: string;
 }
 
 /** The clock and id source the API refuses to invent. */
@@ -224,6 +251,136 @@ const releaseDoor = buildDoor(
   }),
 );
 
+// --- the route table ----------------------------------------------------------
+
+/** What a route does; the exhaustive `switch` in `ControlApi` maps each to its handler. */
+type RouteKind =
+  | "RUN_STATE"
+  | "STRATEGIES"
+  | "KILL_SWITCHES"
+  | "HEALTH"
+  | "METRICS"
+  | "STRATEGY_PAUSE"
+  | "STRATEGY_RESUME"
+  | "KILL_SWITCH_ENGAGE"
+  | "KILL_SWITCH_RELEASE";
+
+/** One route this API serves. */
+export interface ControlApiRoute {
+  readonly method: "GET" | "POST";
+  /** The path template; `:instanceId` is the one parameter. */
+  readonly path: string;
+  /** The explicit §15 grant the route requires. */
+  readonly grant: OperatorGrant;
+  /** True when the route can change control-plane state. */
+  readonly mutates: boolean;
+}
+
+interface RouteDefinition extends ControlApiRoute {
+  readonly kind: RouteKind;
+}
+
+const ROUTE_DEFINITIONS: readonly RouteDefinition[] = Object.freeze(
+  (
+    [
+      { kind: "RUN_STATE", method: "GET", path: "/v1/run-state", grant: "READ", mutates: false },
+      { kind: "STRATEGIES", method: "GET", path: "/v1/strategies", grant: "READ", mutates: false },
+      { kind: "KILL_SWITCHES", method: "GET", path: "/v1/kill-switch", grant: "READ", mutates: false },
+      { kind: "HEALTH", method: "GET", path: "/v1/health", grant: "READ", mutates: false },
+      { kind: "METRICS", method: "GET", path: "/v1/metrics", grant: "READ", mutates: false },
+      {
+        kind: "STRATEGY_PAUSE",
+        method: "POST",
+        path: "/v1/strategies/:instanceId/pause",
+        grant: "STRATEGY_CONTROL",
+        mutates: true,
+      },
+      {
+        kind: "STRATEGY_RESUME",
+        method: "POST",
+        path: "/v1/strategies/:instanceId/resume",
+        grant: "STRATEGY_CONTROL",
+        mutates: true,
+      },
+      { kind: "KILL_SWITCH_ENGAGE", method: "POST", path: "/v1/kill-switch", grant: "KILL_SWITCH", mutates: true },
+      {
+        kind: "KILL_SWITCH_RELEASE",
+        method: "POST",
+        path: "/v1/kill-switch/release",
+        grant: "KILL_SWITCH",
+        mutates: true,
+      },
+    ] as const satisfies readonly RouteDefinition[]
+  ).map((route): RouteDefinition => Object.freeze({ ...route })),
+);
+
+/** The route table, as the README and the inventory tests read it. Derived from the router. */
+export const CONTROL_API_ROUTE_TABLE: readonly ControlApiRoute[] = Object.freeze(
+  ROUTE_DEFINITIONS.map(({ method, path, grant, mutates }) => Object.freeze({ method, path, grant, mutates })),
+);
+
+/** The routes this API serves, `"METHOD /path"`. Derived from the router (`CONTROL-1`, L-5). */
+export const CONTROL_API_ROUTES: readonly string[] = Object.freeze(
+  ROUTE_DEFINITIONS.map((route) => `${route.method} ${route.path}`),
+);
+
+/**
+ * The grants some MUTATING route requires — what "mutation authority" means
+ * for step 3's audit gate. Derived from the router, sorted.
+ */
+export const MUTATION_GRANTS: readonly OperatorGrant[] = Object.freeze(
+  [...new Set(ROUTE_DEFINITIONS.filter((route) => route.mutates).map((route) => route.grant))].sort(),
+);
+
+/** True when the operator holds at least one {@link MUTATION_GRANTS} grant. */
+export function holdsMutationAuthority(operator: OperatorCredential): boolean {
+  return MUTATION_GRANTS.some((grant) => hasGrant(operator, grant));
+}
+
+type RouteResolution =
+  | { readonly found: "ROUTE"; readonly route: RouteDefinition; readonly rawInstanceId: string | undefined }
+  | { readonly found: "METHOD_NOT_ALLOWED"; readonly allow: readonly string[] }
+  | { readonly found: "NONE" };
+
+/**
+ * Matches a path against a template segment by segment. A `:parameter`
+ * segment matches one NON-EMPTY raw segment (still percent-encoded); every
+ * other segment matches itself exactly — case, and all.
+ */
+function matchTemplate(
+  template: string,
+  path: string,
+): { readonly rawInstanceId: string | undefined } | undefined {
+  const want = template.split("/");
+  const got = path.split("/");
+  if (want.length !== got.length) return undefined;
+  let rawInstanceId: string | undefined;
+  for (let index = 0; index < want.length; index += 1) {
+    const expected = want[index] ?? "";
+    const actual = got[index] ?? "";
+    if (expected.startsWith(":")) {
+      if (actual === "") return undefined;
+      rawInstanceId = actual;
+    } else if (expected !== actual) {
+      return undefined;
+    }
+  }
+  return { rawInstanceId };
+}
+
+function resolveRoute(method: string, path: string): RouteResolution {
+  const allow = new Set<string>();
+  for (const route of ROUTE_DEFINITIONS) {
+    const matched = matchTemplate(route.path, path);
+    if (matched === undefined) continue;
+    if (route.method === method) {
+      return { found: "ROUTE", route, rawInstanceId: matched.rawInstanceId };
+    }
+    allow.add(route.method);
+  }
+  return allow.size > 0 ? { found: "METHOD_NOT_ALLOWED", allow: [...allow].sort() } : { found: "NONE" };
+}
+
 // --- responses --------------------------------------------------------------
 
 /**
@@ -286,7 +443,7 @@ export class ControlApi {
   readonly #options: ControlApiOptions;
   readonly #authenticationFailures = new Map<string, number>();
   readonly #authorizationFailures = new Map<string, number>();
-  /** The one refresh in flight, shared by concurrent authorized reads (`#readFresh`). */
+  /** The one refresh in flight, shared by concurrent authorized reads (`#fresh`). */
   #refreshInFlight: Promise<unknown> | undefined;
 
   constructor(options: ControlApiOptions) {
@@ -340,90 +497,121 @@ export class ControlApi {
     }
     const operator = authenticated.operator;
 
-    // 3 (pre-empting authorization, deliberately — see the module header).
+    // 3 (pre-empting routing and authorization, deliberately — module header).
     if (request.body !== undefined) {
       const forbidden = forbiddenControlKeysIn(request.body);
-      if (forbidden.length > 0) {
-        await this.#options.controlPlane.refuseModeRaise(forbidden, {
-          actor: operator.operatorId,
-          at: this.#options.environment.now(),
-          auditRecordId: this.#options.environment.nextAuditRecordId(),
-          reason: `request to ${request.method} ${request.path} named ${forbidden.join(", ")}`,
-        });
-        return problem(
-          403,
-          "CONTROL_MODE_RAISE_REFUSED",
-          "this API cannot raise a run mode, enable real orders, raise a live-micro cap, or " +
-            "reference a signer: §11's ceiling is a startup value and is not writable here, and " +
-            "§4.1 gives this process no signing key. The request named " +
-            `${forbidden.join(", ")} and is refused by name; the attempt has been audited.`,
-          forbidden,
-        );
-      }
+      if (forbidden.length > 0) return this.#refuseModeRaise(operator, request, forbidden);
     }
 
-    const route = `${request.method} ${request.path}`;
+    // 4. RESOLVE the route in the table — the only router there is.
+    const resolved = resolveRoute(request.method, request.path);
+    if (resolved.found === "NONE") {
+      return problem(
+        404,
+        "CONTROL_NO_SUCH_ROUTE",
+        `${request.method} ${request.path} is not a route this API serves. It serves run-state reads, ` +
+          "strategy pause/resume, §14.1 kill-switch engage/release, the health read and the metrics " +
+          "surface — and nothing that places an order, moves a wallet, or changes a run mode.",
+      );
+    }
+    if (resolved.found === "METHOD_NOT_ALLOWED") {
+      const allow = resolved.allow.join(", ");
+      return {
+        ...problem(
+          405,
+          "CONTROL_METHOD_NOT_ALLOWED",
+          `${request.path} is served for ${allow} only; ${request.method} is not a method this API ` +
+            "accepts there, and nothing that places an order, moves a wallet, or changes a run mode is " +
+            "served anywhere.",
+        ),
+        allow,
+      };
+    }
+    const route = resolved.route;
 
-    switch (route) {
-      case "GET /v1/run-state":
-        return this.#read(operator, () => json(200, this.#options.controlPlane.runState()));
+    // 5. AUTHORIZE against the route's explicit grant. An unauthorized caller
+    //    reaches no door, no trader refresh and no control plane.
+    const refusal = this.#authorize(operator, route.grant);
+    if (refusal !== undefined) return refusal;
 
-      case "GET /v1/strategies":
-        return this.#read(operator, () =>
-          json(200, { strategies: this.#options.controlPlane.strategies() }),
-        );
-
-      case "GET /v1/kill-switch":
-        return this.#read(operator, () =>
-          json(200, { killSwitches: this.#options.controlPlane.killSwitches() }),
-        );
-
-      case "GET /v1/health":
-        return await this.#readFresh(operator, () => this.#health());
-
-      case "GET /v1/metrics":
-        return await this.#readFresh(operator, () => this.#metrics());
-
-      case "POST /v1/kill-switch":
+    // 6. Read and act.
+    switch (route.kind) {
+      case "RUN_STATE":
+        return json(200, this.#options.controlPlane.runState());
+      case "STRATEGIES":
+        return json(200, { strategies: this.#options.controlPlane.strategies() });
+      case "KILL_SWITCHES":
+        return json(200, { killSwitches: this.#options.controlPlane.killSwitches() });
+      case "HEALTH":
+        return this.#fresh(() => this.#health());
+      case "METRICS":
+        return this.#fresh(() => this.#metrics());
+      case "STRATEGY_PAUSE":
+        return this.#strategy(operator, request, resolved.rawInstanceId ?? "", true);
+      case "STRATEGY_RESUME":
+        return this.#strategy(operator, request, resolved.rawInstanceId ?? "", false);
+      case "KILL_SWITCH_ENGAGE":
         return this.#engage(operator, request);
-
-      case "POST /v1/kill-switch/release":
+      case "KILL_SWITCH_RELEASE":
         return this.#release(operator, request);
-
-      default:
-        break;
     }
-
-    const strategy = /^\/v1\/strategies\/([^/]+)\/(pause|resume)$/u.exec(request.path);
-    if (strategy !== null && request.method === "POST") {
-      return this.#strategy(operator, request, decodeURIComponent(strategy[1] ?? ""), strategy[2] === "pause");
-    }
-
-    return problem(
-      404,
-      "CONTROL_NO_SUCH_ROUTE",
-      `${route} is not a route this API serves. It serves run-state reads, strategy pause/resume, ` +
-        "§14.1 kill-switch engage/release, the health read and the metrics surface — and nothing " +
-        "that places an order, moves a wallet, or changes a run mode.",
-    );
   }
 
-  #read(operator: OperatorCredential, produce: () => ApiResponse): ApiResponse {
-    const refusal = this.#authorize(operator, "READ");
-    return refusal ?? produce();
+  /**
+   * Step 3: the by-name refusal of a mode-raise attempt (acceptance 1), and
+   * whether it is AUDITED (`CONTROL-1`, closing `WP-240` r1 M-3).
+   *
+   * Every authenticated caller gets the same `403` and the same counter. Only a
+   * caller holding a MUTATION grant gets an audit record — and the refusal says
+   * which happened, including when the audit budget refused the record, so it
+   * never claims an audit that was not written.
+   */
+  async #refuseModeRaise(
+    operator: OperatorCredential,
+    request: ApiRequest,
+    forbidden: readonly string[],
+  ): Promise<ApiResponse> {
+    const named = forbidden.join(", ");
+    let recorded: string;
+    if (holdsMutationAuthority(operator)) {
+      const outcome = await this.#options.controlPlane.refuseModeRaise(forbidden, {
+        actor: operator.operatorId,
+        at: this.#options.environment.now(),
+        auditRecordId: this.#options.environment.nextAuditRecordId(),
+        reason: `request to ${request.method} ${request.path} named ${named}`,
+      });
+      recorded = outcome.audited
+        ? "the attempt has been audited."
+        : `the attempt has been counted; it could NOT be audited (${outcome.code}), and nothing changed.`;
+    } else {
+      this.#options.controlPlane.countModeRaiseWithoutAudit();
+      recorded =
+        `the attempt has been counted and NOT audited: operator ${operator.operatorId} holds no ` +
+        `mutation grant (${MUTATION_GRANTS.join(", ")}), and an audit log a caller without mutation ` +
+        "authority could append to is one it could exhaust, refusing every mutation, the kill switch " +
+        "included (README, 'The audit budget').";
+    }
+    return problem(
+      403,
+      "CONTROL_MODE_RAISE_REFUSED",
+      "this API cannot raise a run mode, enable real orders, raise a live-micro cap, or " +
+        "reference a signer: §11's ceiling is a startup value and is not writable here, and " +
+        "§4.1 gives this process no signing key. The request named " +
+        `${named} and is refused by name; ${recorded}`,
+      forbidden,
+    );
   }
 
   /**
    * An authorized read that REFRESHES the trader health cache first when the
-   * composition asked for it (module header, "Refresh-on-read"). The refusal
-   * path is `#read`'s: an unauthorized operator triggers no trader request.
-   * Single-flight: concurrent reads share one in-flight refresh, so a burst of
-   * scrapes is one loopback GET. A refresh never throws — the cache answers
-   * every failure as data and counts it — so `produce` always runs.
+   * composition asked for it (module header, "Refresh-on-read"). Authorization
+   * has already happened in `#handle`, so an unauthorized operator triggers no
+   * trader request. Single-flight: concurrent reads share one in-flight
+   * refresh, so a burst of scrapes is one loopback GET. A refresh never throws
+   * — the cache answers every failure as data and counts it — so `produce`
+   * always runs.
    */
-  async #readFresh(operator: OperatorCredential, produce: () => ApiResponse): Promise<ApiResponse> {
-    const refusal = this.#authorize(operator, "READ");
-    if (refusal !== undefined) return refusal;
+  async #fresh(produce: () => ApiResponse): Promise<ApiResponse> {
     if (this.#options.refreshHealthOnRead === true) {
       this.#refreshInFlight ??= this.#options.health.refresh().finally(() => {
         this.#refreshInFlight = undefined;
@@ -456,17 +644,20 @@ export class ControlApi {
   async #strategy(
     operator: OperatorCredential,
     request: ApiRequest,
-    instanceId: string,
+    rawInstanceId: string,
     pause: boolean,
   ): Promise<ApiResponse> {
-    const refusal = this.#authorize(operator, "STRATEGY_CONTROL");
-    if (refusal !== undefined) return refusal;
+    // The route parameter through ITS door (`instance-id.ts`): total, so a
+    // malformed escape is a 400 rather than a contained 500 (L-1), and the
+    // grammar is applied to the DECODED id, so `%2F` cannot re-admit `/` (L-2).
+    const parameter = readInstanceIdParameter(rawInstanceId);
+    if (!parameter.ok) {
+      return problem(400, "CONTROL_INVALID_ROUTE_PARAMETER", parameter.detail);
+    }
+    const instanceId = parameter.value;
 
     const parsed: DoorResult<StrategyRequest> = strategyDoor(request.body);
     if (!parsed.ok) return doorProblem(parsed.refusal);
-    if (instanceId === "") {
-      return problem(400, "CONTROL_INVALID_ROUTE_PARAMETER", "the strategy instance id is empty");
-    }
 
     const context = this.#context(operator, parsed.value.reason);
     const result = pause
@@ -478,9 +669,6 @@ export class ControlApi {
   }
 
   async #engage(operator: OperatorCredential, request: ApiRequest): Promise<ApiResponse> {
-    const refusal = this.#authorize(operator, "KILL_SWITCH");
-    if (refusal !== undefined) return refusal;
-
     const parsed: DoorResult<KillSwitchEngageRequest> = engageDoor(request.body);
     if (!parsed.ok) return doorProblem(parsed.refusal);
 
@@ -495,9 +683,6 @@ export class ControlApi {
   }
 
   async #release(operator: OperatorCredential, request: ApiRequest): Promise<ApiResponse> {
-    const refusal = this.#authorize(operator, "KILL_SWITCH");
-    if (refusal !== undefined) return refusal;
-
     const parsed: DoorResult<KillSwitchReleaseRequest> = releaseDoor(request.body);
     if (!parsed.ok) return doorProblem(parsed.refusal);
 
@@ -608,19 +793,8 @@ function doorProblem(refusal: {
 function mutationProblem(code: string, detail: string): ApiResponse {
   // A mutation the control plane refused because it could not be AUDITED is a
   // 503, not a 400: the request was well-formed and the system is unable to
-  // serve it safely. Everything else the caller can fix.
+  // serve it safely. Everything else — including `CONTROL_UNKNOWN_INSTANCE`,
+  // the strategy twin of `CONTROL_NOT_ENGAGED` (`CONTROL-1`, M-1) — is a 409
+  // the caller can act on.
   return problem(code === "CONTROL_NOT_AUDITABLE" ? 503 : 409, code, detail);
 }
-
-/** The routes this API serves, for the README and the route-inventory test. */
-export const CONTROL_API_ROUTES: readonly string[] = Object.freeze([
-  "GET /v1/run-state",
-  "GET /v1/strategies",
-  "GET /v1/kill-switch",
-  "GET /v1/health",
-  "GET /v1/metrics",
-  "POST /v1/strategies/:instanceId/pause",
-  "POST /v1/strategies/:instanceId/resume",
-  "POST /v1/kill-switch",
-  "POST /v1/kill-switch/release",
-]);

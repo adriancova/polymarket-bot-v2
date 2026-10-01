@@ -2,7 +2,8 @@
  * WP-240 ACCEPTANCE 3 — "No signer is loaded."
  *
  * Asserted by ABSENCE, over the shipped source of both trees `WP-240` owns,
- * plus the manifests. This is the `apps/trader` precedent
+ * plus the manifests — and, for imports, over the control API's own test
+ * suites and `infra/grafana/**` too (`CONTROL-1`, closing `WP-240` r1 N-4). This is the `apps/trader` precedent
  * (`test/integration/paper-trader/compose-and-example-config.test.ts`'s scans),
  * applied to a package whose §4.1 description is literally "never has the
  * signing key".
@@ -28,12 +29,20 @@ import { ALL_PRODUCTION_NAMES, CREDENTIAL_NAME_PATTERNS } from "@polymarket-bot/
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
 
+/**
+ * Every file a module loader could execute, and JSON. `CONTROL-1` (N-4) widened
+ * this from `.ts`/`.json`: the newly scanned trees are allowed to hold a
+ * script, and a `.mjs` under `infra/grafana/**` importing a signing library
+ * would otherwise be walked past.
+ */
+const SCANNED_EXTENSIONS = [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"] as const;
+
 function walk(directory: string): readonly string[] {
   const out: string[] = [];
   for (const entry of readdirSync(directory)) {
     const path = join(directory, entry);
     if (statSync(path).isDirectory()) out.push(...walk(path));
-    else if (path.endsWith(".ts") || path.endsWith(".json")) out.push(path);
+    else if (SCANNED_EXTENSIONS.some((extension) => path.endsWith(extension))) out.push(path);
   }
   return out;
 }
@@ -46,6 +55,22 @@ const OWNED_TREES = [
 const FILES = OWNED_TREES.flatMap((tree) => walk(tree));
 const PRODUCTION_FILES = FILES.filter((path) => !path.endsWith(".test.ts"));
 
+/**
+ * `CONTROL-1`, closing `WP-240` r1 N-4: the IMPORT scan also covers the
+ * control API's own test suites and the dashboards it feeds. A signing library
+ * imported by a test of a process that "never has the signing key" would load
+ * one into the very worker that proves it is absent; and a dashboard tree is
+ * JSON today, so the scan's job there is to keep it that way. These trees are
+ * READ here, never written — `infra/grafana/**` is outside `CONTROL-1`'s grant.
+ */
+const IMPORT_SCAN_TREES = [
+  ...OWNED_TREES,
+  resolve(repoRoot, "test/integration/control-api"),
+  resolve(repoRoot, "test/unit/control-api"),
+  resolve(repoRoot, "infra/grafana"),
+];
+const IMPORT_SCAN_FILES = IMPORT_SCAN_TREES.flatMap((tree) => walk(tree));
+
 function read(path: string): string {
   return readFileSync(path, "utf8");
 }
@@ -54,6 +79,18 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
   it("scans a non-trivial number of files (the scan is not vacuous)", () => {
     expect(FILES.length).toBeGreaterThan(20);
     expect(PRODUCTION_FILES.length).toBeGreaterThan(12);
+  });
+
+  it("N-4: the import scan reaches every tree it names (not vacuous per tree)", () => {
+    for (const tree of IMPORT_SCAN_TREES) {
+      expect(
+        IMPORT_SCAN_FILES.filter((path) => path.startsWith(`${tree}/`)).length,
+        `${tree} contributes no file to the import scan`,
+      ).toBeGreaterThan(0);
+    }
+    // The suites include THIS file and the dashboards their JSON.
+    expect(IMPORT_SCAN_FILES).toContain(resolve(repoRoot, "test/integration/control-api/acceptance-3-no-signer.test.ts"));
+    expect(IMPORT_SCAN_FILES).toContain(resolve(repoRoot, "infra/grafana/control/operations-dashboard.json"));
   });
 
   it("imports NO secure adapter, venue client or signing library, anywhere", () => {
@@ -68,11 +105,13 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       "web3",
       "@ethersproject",
     ];
-    for (const path of FILES) {
+    for (const path of IMPORT_SCAN_FILES) {
       const source = read(path);
       for (const specifier of forbiddenSpecifiers) {
         expect(source, `${path} imports ${specifier}`).not.toContain(`from "${specifier}`);
         expect(source, `${path} imports ${specifier}`).not.toContain(`require("${specifier}`);
+        expect(source, `${path} imports ${specifier}`).not.toContain(`import("${specifier}`);
+        expect(source, `${path} imports ${specifier}`).not.toContain(`import "${specifier}`);
       }
     }
   });

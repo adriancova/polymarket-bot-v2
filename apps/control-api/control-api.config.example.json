@@ -3,6 +3,7 @@
   "bindPort": 9465,
   "maxRequestBodyBytes": 65536,
   "auditCapacity": 65536,
+  "auditSafetyReserve": 1024,
   "traderHealth": { "kind": "none" },
   "operators": [
     {

@@ -9,10 +9,13 @@
  * what the middle group of tests measures: with the log at its bound, and with
  * a record id reused, the state does not move.
  *
- * The ONE documented exception is asserted rather than glossed: an
+ * The documented exceptions are asserted rather than glossed: an
  * unauthenticated request writes no audit record, because it never reaches the
  * control plane. An audit log an anonymous caller can fill is an audit log an
  * anonymous caller can exhaust — and this one refuses mutations when full.
+ * (`CONTROL-1` extended the same reasoning to every caller WITHOUT mutation
+ * authority — `README.md`, "The audit budget"; pinned in
+ * `m3-audit-exhaustion.test.ts` and `audit-budget-adversarial.test.ts`.)
  */
 
 import { afterEach, describe, expect, it } from "vitest";
