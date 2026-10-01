@@ -114,3 +114,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-01 | [CI-4.md](CI-4.md) | `CI-4`: run the wallet-operations contract suite in CI | Round | Complete (2026-10-01) | `4628541` | 2 KB |
 | 2026-10-01 | [STORAGE-GOV.md](STORAGE-GOV.md) | `STORAGE-GOV`: ADR-028 Amendment 1 | Governance | Complete (2026-10-01) | `1f75ac0` | 3 KB |
 | 2026-10-01 | [STORAGE-1b.md](STORAGE-1b.md) | `STORAGE-1b`: the storage cycle lock's round-6 LOWs | Round | Complete (2026-10-01) | `7b6499e` | 4 KB |
+| 2026-10-01 | [WP-300b.md](WP-300b.md) | `WP-300b`: WP300-R10-01 and the contract suite fetch tripwire | Round | Complete (2026-10-01) | `05535ae` | 4 KB |

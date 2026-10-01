@@ -109,6 +109,28 @@
  *   "re-entry" warm-up returns to flight through the one trigger that weighs
  *   nothing (a SUBMITTED after MINED).
  *
+ * WP-300b (WP300-R10-01) extends both again:
+ * - while the executor call is pending (the operation still PLANNED, or
+ *   already sent back to reconciliation), reads are often bound to a request
+ *   never issued for the operation: a foreign id, another operation's request
+ *   id, or an unknown id, from the authority, the relayer or hearsay; and a
+ *   seeded "unissued-pending" warm-up delivers such a TERMINAL answer while
+ *   the operation is still PLANNED (sometimes after an observation was kept),
+ *   then lets the executor answer SUBMITTED consistently;
+ * - the oracle decides, from the requests the reconciler actually received,
+ *   whether an answer names a request issued for the operation. While the
+ *   operation is still PLANNED none has been issued, so a TERMINAL answer
+ *   naming any request is a read the manager may never keep or apply: the
+ *   oracle predicts that it is refused as superseded, sends the operation to
+ *   reconciliation with nothing kept, and is recorded as a claim WEIGHED
+ *   there (out of flight), after every claim kept until then — so its new
+ *   identifiers, its success claim and the end of simple mode create the
+ *   obligations P1 and P2 check. An answer naming no request is current and
+ *   is kept like the same observation; one that is not terminal is kept too.
+ *   (Before WP-300b the oracle predicted such a bound terminal answer was kept
+ *   like an observation, and the manager then applied it after the executor's
+ *   SUBMITTED — concluding, releasing, or readying an approval.)
+ *
  * fast-check is not a dependency (no new dependency may be added); the
  * generator is the suite's seeded PRNG, so every failure reproduces from its
  * seed, printed with the trace. Executors and reconcilers are in-memory mocks.
@@ -337,6 +359,16 @@ interface Coverage {
   drainConflicts: number;
   drainPartlyApplied: number;
   executorContradictionsOfBuffer: number;
+  /** WP300-R10-01: a terminal answer naming a request never issued, delivered while PLANNED with the executor pending. */
+  unissuedTerminalWhilePlanned: number;
+  /** ... the same after a claim was kept (the kept claims are weighed with it). */
+  unissuedTerminalAfterKept: number;
+  /** ... naming a request never issued, not terminal, while PLANNED with the executor pending (kept). */
+  unissuedNonTerminalWhilePlanned: number;
+  /** ... naming a request never issued, while the executor is pending and the operation already left PLANNED. */
+  unissuedWhilePendingOutOfPlanned: number;
+  /** ... a terminal answer naming NO request while PLANNED with the executor pending (current: kept). */
+  unboundTerminalKeptWhilePlanned: number;
 }
 
 function newCoverage(): Coverage {
@@ -374,11 +406,23 @@ function newCoverage(): Coverage {
     drainConflicts: 0,
     drainPartlyApplied: 0,
     executorContradictionsOfBuffer: 0,
+    unissuedTerminalWhilePlanned: 0,
+    unissuedTerminalAfterKept: 0,
+    unissuedNonTerminalWhilePlanned: 0,
+    unissuedWhilePendingOutOfPlanned: 0,
+    unboundTerminalKeptWhilePlanned: 0,
   };
 }
 
 /** A request id never issued for the operation (WP300-R8-01: a foreign or pre-restart id). */
 const FOREIGN_REQUEST = "wallet-op:foreign:reconciliation:1";
+
+/**
+ * WP300-R10-01: request ids never issued for the operation, bound to reads made
+ * while its executor call is pending: the foreign id, the id another operation's
+ * first request would carry (the manager's own id format), and an unknown id.
+ */
+const UNISSUED_REQUESTS = [FOREIGN_REQUEST, "9:wallet-op;3:op2;14:reconciliation;1:1;", "a-request-of-another-operation"] as const;
 
 /** A member (70%), a value never named (when one is left), or nothing. */
 function chooseValue(random: () => number, members: readonly string[], pool: readonly string[]): string | null {
@@ -545,7 +589,9 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
    * manager handles like one) once the manager has taken it (WP300-R9-01):
    * kept while the executor is pending (checked against the view); weighed out
    * of flight if it sent the operation back from PLANNED or from flight — with
-   * every claim kept until then.
+   * every claim kept until then. `unissuedAnswer`: the claim is a refused answer
+   * naming a request the reconciler never received for this operation
+   * (WP300-R10-01).
    */
   function settleClaim(
     claimKind: ClaimKind,
@@ -554,10 +600,26 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     credited: string | null,
     before: WalletOperationView,
     after: WalletOperationView,
+    unissuedAnswer = false,
   ): void {
     if (before.state === "PLANNED" && executorPending) {
       const recognised = claimKind === "SUBMITTED" || claimKind === "MINED" || claimKind === "CONFIRMED" || claimKind === "FAILED";
+      if (unissuedAnswer && (claimKind === "CONFIRMED" || claimKind === "FAILED")) {
+        // WP300-R10-01: no request has been issued while PLANNED, so a terminal answer naming one is a
+        // read that may never be kept or applied: it sends the operation to reconciliation, where it is
+        // weighed after every claim kept until then.
+        if (!OUT_OF_FLIGHT_UNCONCLUDED.has(after.state) || after.bufferedObservations !== 0) {
+          fail(`R10: a ${claimKind} answer naming a request never issued, while PLANNED, should send the operation to reconciliation with nothing kept; the view says ${after.state} / ${String(after.bufferedObservations)} kept`);
+        }
+        if (kept.length > 0) coverage.unissuedTerminalAfterKept += 1;
+        for (const item of kept.splice(0)) reweigh(item);
+        recordClaim("observation", claimKind, hash, id, before, "UNKNOWN");
+        coverage.unissuedTerminalWhilePlanned += 1;
+        coverage.triggersWeighed += 1;
+        return;
+      }
       if (recognised) {
+        if (unissuedAnswer) coverage.unissuedNonTerminalWhilePlanned += 1;
         recordClaim("observation", claimKind, hash, id, before, "PLANNED");
         kept.push({ claim: oracle.claims.at(-1) as Claim, credited });
         if (after.state !== "PLANNED" || after.bufferedObservations !== kept.length) {
@@ -619,11 +681,15 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     const before = current();
     const evidence: Record<string, unknown> = { source, state, transactionHash: hash, transactionId: id };
     if (requestId !== null) evidence["requestId"] = requestId;
+    // WP300-R10-01: decided, before delivery, from what the reconciler actually received for this
+    // operation (the only one).
+    const issuedBefore = reconciler.requests.map((request) => request.requestId);
+    const unissued = requestId !== null && !issuedBefore.includes(requestId);
     const result = manager.resolveByReconciliation("op", evidence);
     const olderRequest = requestId !== null && requestId !== latestRequestId();
     const foreign = requestId === FOREIGN_REQUEST;
     trace.push(
-      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) read t${String(readAt)} for ${requestId === null ? "no request" : foreign ? "a foreign request" : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
+      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""}${executorPending ? ",pending" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) read t${String(readAt)} for ${requestId === null ? "no request" : foreign ? "a foreign request" : unissued ? `a request never issued (${requestId})` : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
     );
     if (foreign) {
       coverage.unknownRequestAnswers += 1;
@@ -631,7 +697,19 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
     if (readAt < t) coverage.delayedDeliveries += 1;
     const named = keysOf(hash, id);
+    const claimKind = classify({ status: state, transactionHash: hash, transactionId: id });
+    const terminalClaim = claimKind === "CONFIRMED" || claimKind === "FAILED";
+    if (unissued && executorPending) {
+      if (before.state === "PLANNED") {
+        if (issuedBefore.length > 0) fail("R10: a request was issued while the operation was still PLANNED");
+      } else {
+        coverage.unissuedWhilePendingOutOfPlanned += 1;
+      }
+    }
+    if (requestId === null && executorPending && before.state === "PLANNED" && terminalClaim) coverage.unboundTerminalKeptWhilePlanned += 1;
     if (result.ok) {
+      // WP300-R10-01 (and WP300-R7-X3): an answer naming a request never issued for the operation is never accepted.
+      if (unissued) fail(`R10: an answer naming a request never issued (${String(requestId)}) was accepted`);
       oracle.answers.push({ t: readAt, named });
       if (state === "CONFIRMED") oracle.validations.push(readAt);
       if (state === "CONFIRMED" || state === "FAILED") for (const key of named) oracle.lastAccepted.set(key, state);
@@ -684,7 +762,10 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     // A superseded answer in flight is weighed out of flight (WP300-R8-01); so is any refused answer that
     // sends the operation back, and one kept while the executor is pending is weighed when it goes back
     // (WP300-R9-01).
-    settleClaim(classify({ status: state, transactionHash: hash, transactionId: id }), hash, id, null, before, after);
+    if (unissued && executorPending && before.state === "PLANNED" && terminalClaim && code !== "WALLET_OP_EVIDENCE_SUPERSEDED") {
+      fail(`R10: a ${claimKind} answer naming a request never issued, while PLANNED, should be refused as superseded, not ${code}`);
+    }
+    settleClaim(claimKind, hash, id, null, before, after, unissued);
     for (const value of [hash, id]) {
       if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
         fail(`identifier ${value} named by a refused answer is not in the identity set`);
@@ -826,8 +907,32 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     "late-contradiction",
     "buffered",
     "buffered",
+    "unissued-pending",
   ] as const);
-  if (warmUp === "buffered") {
+  if (warmUp === "unissued-pending") {
+    // WP300-R10-01: while the executor call is pending (still PLANNED, sometimes after an observation was
+    // kept), a TERMINAL answer naming a request never issued for the operation arrives; then the executor
+    // answers SUBMITTED consistently. Before WP-300b the answer was kept and applied after that SUBMITTED.
+    if (executorPending) {
+      if (random() < 0.5) await step(() => observe("MINED", firstHash, firstId, null));
+      // Sometimes first a NON-terminal answer naming a request never issued: kept like the same observation.
+      if (random() < 0.3) await step(() => deliver(read("MINED", firstHash, firstId, "AUTHORITATIVE_READ", pick(random, UNISSUED_REQUESTS))));
+      // A CONFIRMED needs no credited amount for SPLIT and approvals; a WRAP's would lack it (FAILED instead).
+      const outcome = isApproval || (kind === "SPLIT" && random() < 0.5) ? "CONFIRMED" : "FAILED";
+      const hash = outcome === "CONFIRMED" ? firstHash : pick(random, [firstHash, null]);
+      const id = random() < 0.5 ? firstId : null;
+      const source = pick(random, ["AUTHORITATIVE_READ", "AUTHORITATIVE_READ", "RELAYER_STATUS", "HEARSAY"] as const);
+      const binding = pick(random, UNISSUED_REQUESTS);
+      await step(() => deliver(read(outcome, hash, id, source, binding)));
+      // Sometimes another one while the executor is still pending, the operation now out of PLANNED.
+      if (random() < 0.4) {
+        const again = pick(random, ["CONFIRMED", "FAILED"] as const);
+        await step(() => deliver(read(again, firstHash, null, "AUTHORITATIVE_READ", pick(random, UNISSUED_REQUESTS))));
+      }
+      await step(async () => void (await executorAnswers("SUBMITTED", firstHash, firstId)));
+      if (isApproval) await step(sync);
+    }
+  } else if (warmUp === "buffered") {
     // WP300-R9-01: a terminal claim kept while the executor is pending, a trigger sending the operation
     // back, then one identifier answered (for the latest request).
     if (executorPending) {
@@ -940,6 +1045,8 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   /** The request a read is made for: usually the latest delivered one, sometimes an older one, sometimes none named. */
   function requestFor(): string | null {
     const roll = random();
+    // WP300-R10-01: while the executor call is pending, often a request never issued for the operation.
+    if (executorPending && roll < 0.3) return pick(random, UNISSUED_REQUESTS);
     if (roll < 0.035) return FOREIGN_REQUEST; // WP300-R8-01: a request not issued for this operation
     if (roll < 0.1 || reconciler.requests.length === 0) return null;
     if (roll < 0.25) return pick(random, reconciler.requests).requestId;
