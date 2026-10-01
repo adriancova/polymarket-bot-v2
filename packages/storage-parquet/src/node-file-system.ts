@@ -184,6 +184,17 @@ export function fileSystemObjectStore(rootDirectory: string): ObjectStore {
     async get(key: string): Promise<Uint8Array> {
       return await readFile(pathFor(key));
     },
+
+    async list(prefix: string): Promise<readonly string[]> {
+      try {
+        return (await readdir(pathFor(prefix))).sort();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+    },
   };
 }
 

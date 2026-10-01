@@ -13,9 +13,12 @@
  * - "Every source event in a fill's chain lies inside its pin."
  */
 
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
-import { nodeCompactionFileSystem } from "@polymarket-bot/storage-parquet";
+import { manifestDigestSidecarKey, nodeCompactionFileSystem, sha256Hex } from "@polymarket-bot/storage-parquet";
 
 import { readResearchPointer, researchPointerKey } from "../research-tier/extract.js";
 import { inventoryWalRoot } from "../research-tier/inventory.js";
@@ -24,7 +27,7 @@ import { EPOCH, HOUR, bookFrame, polymarketFrame, storageFixture, tradeFrame } f
 import type { StorageFixture } from "../testing/storage-fixture.js";
 import type { DispatchFrontier, MarketEvidence, WindowClassification } from "./classify.js";
 import { classifyWindow, dispatchFrontier, staticEvidenceSource } from "./classify.js";
-import { extractPin, pinSpecs, readPinRecord, windowPinId } from "./pins.js";
+import { extractPin, pinRecordKey, pinSpecs, readExtractedPins, readPinRecord, windowPinId } from "./pins.js";
 import type { PinRecord } from "./pins.js";
 import { RAW_RETENTION_MS, planExpiry } from "./plan.js";
 import type { SegmentDecision } from "./plan.js";
@@ -140,6 +143,7 @@ async function decide(input: {
     operatorPins,
     pinSpecs: specs,
     pinRecords: records,
+    extractedPins: await readExtractedPins(fixture.objectStore),
   });
 }
 
@@ -306,7 +310,7 @@ describe("pins: every overlapping pin extracted and verified; operator pins keep
     if (fixture === null) throw new Error("no fixture");
     const record = await readPinRecord(
       fixture.objectStore,
-      windowPinId("w1", "fill", classification.pinFromMs ?? 0, classification.pinToMs ?? 0),
+      windowPinId("w1", "fill", classification.pinFromMs ?? 0, classification.pinToMs ?? 0, classification.sourceEvents),
     );
     expect(record?.sourceEventsInside).toBe(true);
     expect(record?.keepUntil).toBeNull();
@@ -357,6 +361,143 @@ describe("pins: every overlapping pin extracted and verified; operator pins keep
     expect(classification).toMatchObject({ state: "classified", pinClass: null });
     const decisions = await decide({ inventory, windows: [gatewayOnly], classifications: new Map([["w1", classification]]) });
     expect(bySegmentIndex(decisions, 0).eligible).toBe(true);
+  });
+});
+
+describe("a pin already extracted is honoured whatever this cycle derives (round 2, K3)", () => {
+  const gatewayOnly: MarketWindow = { ...WINDOW, responsibility: { kind: "gateway-only" } };
+  const unpinned: WindowClassification = {
+    windowId: "w1",
+    state: "classified",
+    pinClass: null,
+    pinFromMs: null,
+    pinToMs: null,
+    keepUntilMs: null,
+    sourceEvents: [],
+    evidenceCounts: { fills: 0, intents: 0, refusals: 0, halts: 0 },
+  };
+
+  async function pinnedThenUnpinned(): Promise<{ inventory: WalInventory; pinId: string }> {
+    const { inventory } = await threeSegments();
+    const evidence: MarketEvidence = { ...NO_EVIDENCE, fillsAtMs: [OLD + 40 * 60 * 1000] };
+    const pinned = await decide({ inventory, classifications: await classifyWith(WINDOW, PASSED, evidence), extractPins: true });
+    const pinId = bySegmentIndex(pinned, 0).request?.pins[0]?.pinId;
+    if (pinId === undefined) throw new Error("expected a pin");
+    return { inventory, pinId };
+  }
+
+  it("verifies and names a pin no derived spec names (the window re-registered gateway-only)", async () => {
+    const { inventory, pinId } = await pinnedThenUnpinned();
+    const decisions = await decide({ inventory, windows: [gatewayOnly], classifications: new Map([["w1", unpinned]]) });
+    const old = bySegmentIndex(decisions, 0);
+    expect(old.eligible).toBe(true);
+    expect(old.request?.pins.map((pin) => pin.pinId)).toStrictEqual([pinId]);
+  });
+
+  it("keeps the segment when that pin no longer verifies", async () => {
+    const { inventory, pinId } = await pinnedThenUnpinned();
+    if (fixture === null) throw new Error("no fixture");
+    const record = await readPinRecord(fixture.objectStore, pinId);
+    const manifestKey = record?.datasets[0]?.manifestObjectKey ?? "";
+    const manifest = Buffer.from(await fixture.objectStore.get(manifestKey));
+    await writeFile(join(fixture.root, "objects", manifestKey), Buffer.concat([manifest, Buffer.from(" ")]));
+    const decisions = await decide({ inventory, windows: [gatewayOnly], classifications: new Map([["w1", unpinned]]) });
+    expect(bySegmentIndex(decisions, 0).reasons).toContainEqual(expect.stringMatching(new RegExp(`^pin-not-verified: ${pinId}`, "u")));
+  });
+
+  it("keeps a segment whose derived spec names source events its pin record was not extracted to hold", async () => {
+    const { inventory, pinId } = await pinnedThenUnpinned();
+    if (fixture === null) throw new Error("no fixture");
+    const record = await readPinRecord(fixture.objectStore, pinId);
+    if (record === null) throw new Error("expected a record");
+    // The same id, as a hash collision would give it, for a chain naming one more event.
+    const spec = {
+      pinId,
+      origin: "window" as const,
+      pinClass: "fill" as const,
+      windowId: "w1",
+      fromMs: Date.parse(record.from),
+      toMs: Date.parse(record.to),
+      keepUntilMs: null,
+      sourceEvents: [...record.sourceEvents, { evaluatedAtMs: OLD, sourceEventId: "new", gatewayEpoch: EPOCH, ingestSeq: "2" }],
+      reason: "test",
+    };
+    const decisions = await planExpiry({
+      nowMs: NOW,
+      retentionMs: RAW_RETENTION_MS,
+      leadInMs: LEAD_IN,
+      durabilityGraceMs: GRACE,
+      inventory,
+      objectStore: fixture.objectStore,
+      windows: [gatewayOnly],
+      classifications: new Map([["w1", unpinned]]),
+      operatorPins: [],
+      pinSpecs: [spec],
+      pinRecords: new Map([[pinId, record]]),
+      extractedPins: await readExtractedPins(fixture.objectStore),
+    });
+    expect(bySegmentIndex(decisions, 0).reasons).toContainEqual(
+      `pin-range-mismatch: ${pinId}'s record was extracted for other source events than its spec`,
+    );
+  });
+
+  it("keeps a segment that an extracted pin lists with other digests, or does not list in its record", async () => {
+    const { inventory, pinId } = await pinnedThenUnpinned();
+    if (fixture === null) throw new Error("no fixture");
+    const store = fixture.objectStore;
+    const record = await readPinRecord(store, pinId);
+    const dataset = record?.datasets[0];
+    if (record === null || dataset === undefined) throw new Error("expected a pin");
+    const segmentId = bySegmentIndex(await decide({ inventory, windows: [gatewayOnly], classifications: new Map([["w1", unpinned]]) }), 0)
+      .segment.segmentId;
+    // A pin whose (self-consistent) manifest lists the segment with another digest.
+    const manifest = JSON.parse(Buffer.from(await store.get(dataset.manifestObjectKey)).toString("utf8")) as {
+      segments: { segmentId: string; segmentSha256: string }[];
+    };
+    for (const entry of manifest.segments) if (entry.segmentId === segmentId) entry.segmentSha256 = "e".repeat(64);
+    const forgedBytes = Buffer.from(JSON.stringify(manifest));
+    const forgedKey = `pins/window-w1-otherdigest/${EPOCH}/manifest.json`;
+    await store.put(forgedKey, forgedBytes);
+    await store.put(manifestDigestSidecarKey(forgedKey), Buffer.from(sha256Hex(forgedBytes)));
+    const otherDigest = { ...record, pinId: "window-w1-otherdigest", datasets: [{ ...dataset, manifestObjectKey: forgedKey, manifestSha256: sha256Hex(forgedBytes) }] };
+    await store.put(pinRecordKey("window-w1-otherdigest"), Buffer.from(JSON.stringify(otherDigest)));
+    // A pin whose record does not list the segment its manifest holds.
+    const unlisted = { ...record, pinId: "window-w1-unlisted", datasets: [{ ...dataset, segmentIds: [] }] };
+    await store.put(pinRecordKey("window-w1-unlisted"), Buffer.from(JSON.stringify(unlisted)));
+    const decisions = await decide({ inventory, windows: [gatewayOnly], classifications: new Map([["w1", unpinned]]) });
+    expect(bySegmentIndex(decisions, 0).reasons).toStrictEqual([
+      "pin-does-not-hold-segment: window-w1-otherdigest",
+      "pin-does-not-hold-segment: window-w1-unlisted",
+    ]);
+  });
+
+  it("keeps every segment while a pin record does not read: its range is unknown", async () => {
+    const { inventory } = await threeSegments();
+    if (fixture === null) throw new Error("no fixture");
+    await fixture.objectStore.put("pins/window-w9-000000000000/pin.json", Buffer.from("{"));
+    const decisions = await decide({ inventory, windows: [gatewayOnly], classifications: new Map([["w1", unpinned]]) });
+    for (const decision of decisions) {
+      expect(decision.reasons).toContainEqual(expect.stringMatching(/^pin-record-unreadable: window-w9-000000000000/u));
+    }
+  });
+});
+
+describe("an unclassified window holds the chain evidence its rows already show (round 2, K1)", () => {
+  it("keeps a segment outside the potential range that a hold range covers, and only that one", async () => {
+    const { inventory } = await threeSegments();
+    const unclassified: WindowClassification = {
+      windowId: "w1",
+      state: "unclassified",
+      reason: "a source event is pending",
+      // Segment 1 (the 71 h / 73 h one) is far outside the window's potential range.
+      holdRanges: [{ fromMs: NOW - 74 * HOUR, toMs: NOW - 72 * HOUR }],
+    };
+    const decisions = await decide({ inventory, classifications: new Map([["w1", unclassified]]) });
+    expect(bySegmentIndex(decisions, 1).reasons).toContainEqual(
+      "unclassified-window: w1 holds chain evidence in this segment (a source event is pending)",
+    );
+    const without = await decide({ inventory, classifications: new Map([["w1", { ...unclassified, holdRanges: [] }]]) });
+    expect(bySegmentIndex(without, 1).reasons.filter((reason) => reason.startsWith("unclassified-window"))).toStrictEqual([]);
   });
 });
 

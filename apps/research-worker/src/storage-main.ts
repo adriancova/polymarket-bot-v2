@@ -37,14 +37,13 @@ import { systemBootClock } from "./retention/clock-guard.js";
 import { runStorageCycle } from "./retention/cycle.js";
 import type { StorageCycleReport } from "./retention/cycle.js";
 import { postgresTraderEvidence } from "./retention/evidence-postgres.js";
-import {
-  fileOperatorPinLock,
-  noOperatorPinLock,
-  operatorPinLockPath,
-  publishOperatorPin,
-} from "./retention/operator-pin-lock.js";
+import { noOperatorPinLock, operatorPinFile, publishOperatorPin } from "./retention/operator-pin-lock.js";
 import { loadOperatorPins, loadWindowRegistry } from "./retention/windows.js";
 import { loadStorageConfig } from "./storage-config.js";
+
+function lockOptions(options: StorageMainOptions): { readonly timeoutMs?: number } {
+  return options.operatorPinLockTimeoutMs === undefined ? {} : { timeoutMs: options.operatorPinLockTimeoutMs };
+}
 
 /** The report, reduced to what an operator reads: no record bodies. */
 export function summarizeStorageReport(report: StorageCycleReport): Record<string, unknown> {
@@ -106,11 +105,24 @@ export function summarizeStorageReport(report: StorageCycleReport): Record<strin
   };
 }
 
+/** What a test may shorten in the composition root; the command passes nothing. */
+export type StorageMainOptions = {
+  /** How long to wait for the operator-pin lock (default 120 s). */
+  readonly operatorPinLockTimeoutMs?: number;
+};
+
 /** Run one storage cycle and print its report. */
-export async function storageMain(): Promise<number> {
+export async function storageMain(options: StorageMainOptions = {}): Promise<number> {
   const config = loadStorageConfig();
   const objectStore = fileSystemObjectStore(config.objectStoreRoot);
   await ensureDirectory(config.objectStoreRoot);
+
+  // The operator's pin file by its canonical path, and the lock beside it:
+  // the same lock the `storage pin` command takes, however either spells it.
+  const pinFile =
+    config.operatorPinsPath === null
+      ? null
+      : await operatorPinFile(config.operatorPinsPath, lockOptions(options));
 
   let evidence: TraderEvidenceSource;
   let close: () => Promise<void> = async () => {};
@@ -144,7 +156,7 @@ export async function storageMain(): Promise<number> {
       clock: systemCompactionClock(),
       evidence,
       loadWindows: () => loadWindowRegistry(config.windowRegistryPath),
-      loadOperatorPins: () => loadOperatorPins(config.operatorPinsPath),
+      loadOperatorPins: () => loadOperatorPins(pinFile === null ? null : pinFile.path),
       settings: {
         retentionMs: config.retentionMs,
         leadInMs: config.leadInMs,
@@ -160,8 +172,7 @@ export async function storageMain(): Promise<number> {
       deletion,
       stateDirectory: config.stateDirectory,
       bootClock: systemBootClock(),
-      operatorPinLock:
-        config.operatorPinsPath === null ? noOperatorPinLock() : fileOperatorPinLock(operatorPinLockPath(config.operatorPinsPath)),
+      operatorPinLock: pinFile === null ? noOperatorPinLock() : pinFile.lock,
     });
     console.log(JSON.stringify(summarizeStorageReport(report)));
     return report.expiry !== null && report.expiry.failures.length > 0 ? 1 : 0;
@@ -177,7 +188,7 @@ export async function storageMain(): Promise<number> {
  * A pin added by editing the file by hand is re-read before each unlink, but
  * only this command is serialized with the unlink itself.
  */
-export async function storagePinMain(argv: readonly string[]): Promise<number> {
+export async function storagePinMain(argv: readonly string[], options: StorageMainOptions = {}): Promise<number> {
   const [pinId, from, to, ...reasonWords] = argv;
   const path = process.env["RESEARCH_WORKER_OPERATOR_PINS"]?.trim() ?? "";
   if (pinId === undefined || from === undefined || to === undefined || reasonWords.length === 0 || path.length === 0) {
@@ -186,9 +197,10 @@ export async function storagePinMain(argv: readonly string[]): Promise<number> {
     );
     return 2;
   }
+  const pinFile = await operatorPinFile(path, lockOptions(options));
   const pins = await publishOperatorPin({
-    operatorPinsPath: path,
-    lock: fileOperatorPinLock(operatorPinLockPath(path)),
+    operatorPinsPath: pinFile.path,
+    lock: pinFile.lock,
     pin: { pinId, from, to, reason: reasonWords.join(" ") },
   });
   console.log(JSON.stringify({ event: "operator-pin-published", pinId, pins: pins.length }));

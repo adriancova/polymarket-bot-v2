@@ -67,6 +67,17 @@ export interface ObjectStore {
   head(key: string): Promise<ObjectHead | null>;
   /** Fetch an object's bytes. Rejects when the key does not exist. */
   get(key: string): Promise<Uint8Array>;
+  /**
+   * The names directly under a key prefix: every `name` for which some key is
+   * `${prefix}/${name}` or starts with `${prefix}/${name}/`, sorted; `[]` when
+   * nothing is under it.
+   *
+   * Optional, and used by no compactor path: `STORAGE-1`'s expiry needs it to
+   * enumerate EVERY extracted pin, not only the pins one cycle derives
+   * (ADR-028 Decision 2.4). A store without it cannot back that expiry: the
+   * planner keeps every segment.
+   */
+  list?(prefix: string): Promise<readonly string[]>;
 }
 
 /**

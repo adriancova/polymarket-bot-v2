@@ -18,12 +18,20 @@
  *    Polymarket token, condition and Gamma market its frames name belongs to a
  *    registered window (an unknown market is unclassified by definition), no
  *    frame could name a market the inventory cannot read, and no registered,
- *    unclassified window could still pin a range overlapping it. The names are
- *    read from the VERIFIED research-tier manifest (`marketIdentities`, taken
- *    from every frame), never from the unverified pointer.
+ *    unclassified window could still pin a range overlapping it — its
+ *    potential range, or a range its durable rows already show holds chain
+ *    evidence (`holdRanges`). The names are read from the VERIFIED
+ *    research-tier manifest (`marketIdentities`, taken from every frame),
+ *    never from the unverified pointer.
  * 4. **Every pin whose range overlaps it is extracted and verified** (2.4):
- *    its record exists, its manifests verify, every source event it had to
- *    hold lies inside it, and it holds this segment with the same two digests.
+ *    every pin this cycle derives AND every pin already extracted into the
+ *    store (`readExtractedPins`) — a pin is a durable fact, so a window that
+ *    is unclassified this cycle, re-derived with another range or removed
+ *    from the registry still has its pin verified and named. Each such pin's
+ *    record exists, its manifests verify, every source event it had to hold
+ *    lies inside it, and it holds this segment with the same two digests. A
+ *    pin record that exists but does not read keeps every segment: its range
+ *    is unknown.
  * 5. **No operator pin covers it** (2.5).
  *
  * Decisions 2.6 and 2.7 — the bytes are the ones extracted, and the file is
@@ -48,8 +56,8 @@ import type { InventoriedSegment, WalInventory } from "../research-tier/inventor
 import { epochMsOf } from "../research-tier/sampler.js";
 import type { WindowClassification } from "./classify.js";
 import { potentialRange } from "./classify.js";
-import type { PinRecord } from "./pins.js";
-import { overlaps, verifyPinManifests } from "./pins.js";
+import type { ExtractedPins, PinRecord } from "./pins.js";
+import { overlaps, recordHoldsSourceEvents, verifyPinManifests } from "./pins.js";
 import type { PinSpec } from "./pins.js";
 import { cachedResearchVerifier } from "./wal-index.js";
 import type { MarketWindow, OperatorPin } from "./windows.js";
@@ -93,6 +101,8 @@ export type ExpiryPlanningInput = {
   readonly pinSpecs: readonly PinSpec[];
   /** Pin records by pin id; absent or `null` means not extracted. */
   readonly pinRecords: ReadonlyMap<string, PinRecord | null>;
+  /** Every pin already extracted into the store, whatever this cycle derives (`readExtractedPins`). */
+  readonly extractedPins: ExtractedPins;
   /** A shared cache of verified research-tier datasets; one is made when absent. */
   readonly verifiedResearch?: (manifestObjectKey: string) => Promise<VerifiedResearchTierDataset | Error>;
 };
@@ -130,6 +140,36 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     }
     return cached;
   };
+
+  // Every pin a segment must be verified against: the window pins this cycle
+  // derives (operator pins keep the raw segment itself: guard 5), then every
+  // pin record already in the store that no derived spec names.
+  type PinObligation = {
+    readonly pinId: string;
+    readonly fromMs: number;
+    readonly toMs: number;
+    readonly record: PinRecord | null;
+    /** A derived spec's source events, which its record must have been extracted to hold. */
+    readonly sourceEvents: PinSpec["sourceEvents"];
+  };
+  const obligations: PinObligation[] = [];
+  const obliged = new Set<string>();
+  for (const spec of input.pinSpecs) {
+    if (spec.origin === "operator" || obliged.has(spec.pinId)) continue;
+    obliged.add(spec.pinId);
+    obligations.push({
+      pinId: spec.pinId,
+      fromMs: spec.fromMs,
+      toMs: spec.toMs,
+      record: input.pinRecords.get(spec.pinId) ?? null,
+      sourceEvents: spec.sourceEvents,
+    });
+  }
+  for (const record of input.extractedPins.records) {
+    if (obliged.has(record.pinId)) continue;
+    obliged.add(record.pinId);
+    obligations.push({ pinId: record.pinId, fromMs: Date.parse(record.from), toMs: Date.parse(record.to), record, sourceEvents: [] });
+  }
 
   const decisions: SegmentDecision[] = [];
   for (const segments of input.inventory.byEpoch.values()) {
@@ -227,51 +267,61 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     for (const window of input.windows) {
       const classification = input.classifications.get(window.windowId);
       if (classification === undefined || classification.state === "unclassified") {
+        const why = classification === undefined ? "" : ` (${classification.reason})`;
         if (overlaps(span, potentialRange(window, input.leadInMs, input.durabilityGraceMs))) {
-          reasons.push(
-            `unclassified-window: ${window.windowId}${classification === undefined ? "" : ` (${classification.reason})`}`,
-          );
+          reasons.push(`unclassified-window: ${window.windowId}${why}`);
+        } else if (classification !== undefined && classification.holdRanges.some((range) => overlaps(span, range))) {
+          // Its durable rows already show chain evidence here (a located source
+          // event's segment, say): held whatever else is still unknown.
+          reasons.push(`unclassified-window: ${window.windowId} holds chain evidence in this segment${why}`);
         }
       }
     }
 
     // -- 4. Every overlapping pin extracted and verified, holding it. -------
+    // The pins this cycle derives, and every pin already in the store.
+    for (const unreadable of input.extractedPins.unreadable) {
+      reasons.push(`pin-record-unreadable: ${unreadable.pinId}: ${unreadable.detail}`);
+    }
     const pins: ExpiryDeletionRequest["pins"][number][] = [];
-    for (const spec of input.pinSpecs) {
-      if (!overlaps(span, { fromMs: spec.fromMs, toMs: spec.toMs })) continue;
-      // Operator pins keep the segment itself: guard 5, below.
-      if (spec.origin === "operator") continue;
-      const record = input.pinRecords.get(spec.pinId) ?? null;
+    for (const obligation of obligations) {
+      if (!overlaps(span, { fromMs: obligation.fromMs, toMs: obligation.toMs })) continue;
+      const record = obligation.record;
       if (record === null) {
-        reasons.push(`pin-not-extracted: ${spec.pinId}`);
+        reasons.push(`pin-not-extracted: ${obligation.pinId}`);
         continue;
       }
-      if (record.from !== new Date(spec.fromMs).toISOString() || record.to !== new Date(spec.toMs).toISOString()) {
+      if (record.from !== new Date(obligation.fromMs).toISOString() || record.to !== new Date(obligation.toMs).toISOString()) {
         // Unreachable while pin ids carry their range's digest; kept fail-closed.
-        reasons.push(`pin-range-mismatch: ${spec.pinId}'s record holds a different range than its spec`);
+        reasons.push(`pin-range-mismatch: ${obligation.pinId}'s record holds a different range than its spec`);
+        continue;
+      }
+      if (!recordHoldsSourceEvents(record, obligation.sourceEvents)) {
+        // Unreachable while pin ids carry their source events' digest; kept fail-closed.
+        reasons.push(`pin-range-mismatch: ${obligation.pinId}'s record was extracted for other source events than its spec`);
         continue;
       }
       if (!record.sourceEventsInside) {
-        reasons.push(`pin-trace-incomplete: ${spec.pinId} does not hold every source event of its chain`);
+        reasons.push(`pin-trace-incomplete: ${obligation.pinId} does not hold every source event of its chain`);
         continue;
       }
       const verified = await verifiedPin(record);
       if (verified instanceof Error) {
-        reasons.push(`pin-not-verified: ${spec.pinId}: ${verified.message}`);
+        reasons.push(`pin-not-verified: ${obligation.pinId}: ${verified.message}`);
         continue;
       }
       const digests = verified.segmentDigests.get(segment.segmentId);
       if (digests === undefined || digests.sha !== entry.segmentSha256 || digests.file !== entry.segmentFileSha256) {
-        reasons.push(`pin-does-not-hold-segment: ${spec.pinId}`);
+        reasons.push(`pin-does-not-hold-segment: ${obligation.pinId}`);
         continue;
       }
       const dataset = record.datasets.find((candidate) => candidate.segmentIds.includes(segment.segmentId));
       if (dataset === undefined) {
-        reasons.push(`pin-does-not-hold-segment: ${spec.pinId}`);
+        reasons.push(`pin-does-not-hold-segment: ${obligation.pinId}`);
         continue;
       }
       pins.push({
-        pinId: spec.pinId,
+        pinId: obligation.pinId,
         datasetId: dataset.datasetId,
         manifestObjectKey: dataset.manifestObjectKey,
         manifestSha256: dataset.manifestSha256,

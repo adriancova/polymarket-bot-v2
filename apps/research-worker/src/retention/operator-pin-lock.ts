@@ -28,11 +28,22 @@
  * it safely would need a second protocol): expiry refuses to delete while it
  * is held, and the error names the file and its holder, for the operator to
  * remove once no storage or pin process runs.
+ *
+ * ## One file, one lock
+ *
+ * The timer and the `storage pin` command each derive the lock from the path
+ * they are given, so both must reach the SAME lock for every spelling of the
+ * same file. The lock sits beside the file's canonical path
+ * (`canonicalOperatorPinsPath`): symbolic links are resolved, and a pin file
+ * with a second hard link is refused, since no path can name the lock its
+ * other name would use (and the durable rename that publishes a pin would
+ * split the two names into two files). Publication writes to the canonical
+ * path too, so it never replaces a symbolic link with a file.
  */
 
 import { constants as fsConstants } from "node:fs";
-import { open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 import { parseOperatorPins } from "./windows.js";
 import type { OperatorPin } from "./windows.js";
@@ -51,9 +62,52 @@ export class OperatorPinLockError extends Error {
   }
 }
 
-/** The lock file of an operator-pin file. */
-export function operatorPinLockPath(operatorPinsPath: string): string {
-  return `${operatorPinsPath}.lock`;
+/**
+ * The canonical path of an operator-pin file: every symbolic link resolved
+ * (the file's, or — while it does not exist yet — its directory's). Refuses a
+ * dangling symbolic link (its target cannot be resolved, so its lock could
+ * not be the target's) and a file with more than one hard link.
+ */
+export async function canonicalOperatorPinsPath(operatorPinsPath: string): Promise<string> {
+  let canonical: string;
+  try {
+    canonical = await realpath(operatorPinsPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const link = await lstat(operatorPinsPath).catch(() => null);
+    if (link !== null) {
+      throw new OperatorPinLockError(`the operator-pin file ${operatorPinsPath} is a symbolic link to a missing file`);
+    }
+    canonical = join(await realpath(dirname(operatorPinsPath)), basename(operatorPinsPath));
+  }
+  const stats = await stat(canonical).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (stats !== null && stats.nlink > 1) {
+    throw new OperatorPinLockError(
+      `the operator-pin file ${canonical} has ${String(stats.nlink)} hard links; give it exactly one name, so the pin command and expiry share one lock`,
+    );
+  }
+  return canonical;
+}
+
+/** The lock file of an operator-pin file: beside its canonical path, for every spelling of the file. */
+export async function operatorPinLockPath(operatorPinsPath: string): Promise<string> {
+  return `${await canonicalOperatorPinsPath(operatorPinsPath)}.lock`;
+}
+
+/**
+ * The canonical pin file and its lock, as the timer and the `storage pin`
+ * command both derive them (`storage-main.ts`).
+ */
+export async function operatorPinFile(
+  operatorPinsPath: string,
+  options: { readonly timeoutMs?: number; readonly pollMs?: number } = {},
+): Promise<{ readonly path: string; readonly lockPath: string; readonly lock: OperatorPinLock }> {
+  const path = await canonicalOperatorPinsPath(operatorPinsPath);
+  const lockPath = `${path}.lock`;
+  return { path, lockPath, lock: fileOperatorPinLock(lockPath, options) };
 }
 
 /** No pin file is configured, so no pin can be published: nothing to serialize with. */

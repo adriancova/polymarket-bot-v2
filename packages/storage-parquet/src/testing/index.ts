@@ -96,6 +96,15 @@ export function memoryObjectStore(): MemoryObjectStore {
       }
       return Uint8Array.from(stored);
     },
+    async list(prefix: string): Promise<readonly string[]> {
+      const names = new Set<string>();
+      for (const key of objects.keys()) {
+        if (!key.startsWith(`${prefix}/`)) continue;
+        const name = key.slice(prefix.length + 1).split("/")[0];
+        if (name !== undefined && name.length > 0) names.add(name);
+      }
+      return [...names].sort();
+    },
     keys(): readonly string[] {
       return [...objects.keys()].sort();
     },

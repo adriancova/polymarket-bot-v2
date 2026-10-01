@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import type { RawFrameRecord } from "@polymarket-bot/storage-parquet";
 
-import { MarketIdentityInventory, frameMarketIdentity, gammaMarketIdOf } from "./identity.js";
+import { MAX_DEPTH, MarketIdentityInventory, frameMarketIdentity, gammaMarketIdOf } from "./identity.js";
 
 function record(source: string, endpoint: string, payloadUtf8: string): RawFrameRecord {
   return {
@@ -75,13 +75,100 @@ describe("frameMarketIdentity", () => {
     expect(frameMarketIdentity(gamma)).toStrictEqual({ tokens: [], conditions: [], gammaMarkets: ["5121169"], unidentified: false });
   });
 
-  it("names nothing for the reference feeds", () => {
-    for (const source of ["binance", "coinbase", "rtds"]) {
+  it("names nothing for the other venues' reference feeds", () => {
+    for (const source of ["binance", "coinbase"]) {
       expect(frameMarketIdentity(record(source, "wss://x", JSON.stringify({ market: "m", asset_id: "a" })))).toMatchObject({
         tokens: [],
         unidentified: false,
       });
     }
+  });
+});
+
+/** An object whose innermost object, `{ asset_id }`, sits `depth` levels below the entry. */
+function nestedEntry(depth: number, tokenId: string): Record<string, unknown> {
+  let inner: Record<string, unknown> = { asset_id: tokenId };
+  for (let level = 1; level < depth; level += 1) inner = { nested: inner };
+  return { event_type: "future_event", market: "0xc", asset_id: "t", hidden: inner };
+}
+
+describe("an inventory that could not read the whole frame is unidentified (round 2, K2)", () => {
+  const RTDS = "wss://ws-live-data.polymarket.com";
+  const rtds = (payload: unknown): RawFrameRecord => record("rtds", RTDS, typeof payload === "string" ? payload : JSON.stringify(payload));
+
+  it("reads names down to MAX_DEPTH, and counts a frame nesting deeper as unidentified, whatever it names above", () => {
+    // The entry is level 1; `hidden` is level 2; its innermost object is level depth + 1.
+    const atLimit = frameMarketIdentity(market([nestedEntry(MAX_DEPTH - 1, "deep")]));
+    expect(atLimit).toMatchObject({ tokens: ["t", "deep"], unidentified: false });
+    const beyond = frameMarketIdentity(market([nestedEntry(MAX_DEPTH, "deep")]));
+    expect(beyond).toMatchObject({ tokens: ["t"], conditions: ["0xc"], unidentified: true });
+    // The probe's shapes: an unknown token 14 levels down is named; 18 levels down, the frame is unidentified.
+    expect(frameMarketIdentity(market(nestedEntry(14, "unknown-token")))).toMatchObject({ unidentified: false });
+    expect(frameMarketIdentity(market(nestedEntry(14, "unknown-token"))).tokens).toContain("unknown-token");
+    expect(frameMarketIdentity(market(nestedEntry(18, "unknown-token")))).toMatchObject({ unidentified: true });
+    // Another endpoint's body is read the same way.
+    let deep: unknown = { condition_id: "0xdeep" };
+    for (let level = 0; level < MAX_DEPTH + 1; level += 1) deep = [deep];
+    expect(frameMarketIdentity(record("polymarket", "https://clob.polymarket.com/book?token_id=t9", JSON.stringify(deep))).unidentified).toBe(true);
+  });
+
+  it("counts a frame with a duplicate key as unidentified: last-wins would drop the first spelling's names", () => {
+    const duplicate = '[{"event_type":"book","market":"UNKNOWN-COND","asset_id":"UNKNOWN-TOK","market":"0xc","asset_id":"t"}]';
+    expect(frameMarketIdentity(market(duplicate))).toMatchObject({ unidentified: true });
+    // A duplicate of a key that is not an identity key hides names too.
+    const hidden = '[{"market":"0xc","asset_id":"t","x":{"asset_id":"UNKNOWN"},"x":{}}]';
+    expect(frameMarketIdentity(market(hidden))).toMatchObject({ unidentified: true });
+    expect(
+      frameMarketIdentity(record("polymarket", "https://clob.polymarket.com/book?token_id=t9", '{"market":"UNKNOWN","market":"0xc"}')),
+    ).toMatchObject({ tokens: ["t9"], unidentified: true });
+    // The same frames without the duplicate are identified.
+    expect(frameMarketIdentity(market('[{"event_type":"book","market":"0xc","asset_id":"t"}]'))).toMatchObject({ unidentified: false });
+  });
+
+  it("counts an identity key holding something that is not a name as unidentified", () => {
+    expect(frameMarketIdentity(market([{ market: "0xc", price_changes: [{ asset_id: 123456789 }] }]))).toMatchObject({ unidentified: true });
+    expect(frameMarketIdentity(market([{ market: "0xc", asset_id: "" }]))).toMatchObject({ unidentified: true });
+    expect(frameMarketIdentity(market([{ market: "0xc", assets_ids: ["a", 7] }]))).toMatchObject({ unidentified: true });
+    expect(frameMarketIdentity(market([{ market: { id: "0xc" }, asset_id: "t" }]))).toMatchObject({ unidentified: true });
+  });
+
+  it("counts an unparsable body of another endpoint as unidentified, whatever its query names", () => {
+    expect(frameMarketIdentity(record("polymarket", "https://clob.polymarket.com/book?token_id=t9", "<html>"))).toMatchObject({
+      tokens: ["t9"],
+      unidentified: true,
+    });
+    expect(frameMarketIdentity(record("polymarket", "https://clob.polymarket.com/book?token_id=t9", ""))).toMatchObject({
+      tokens: ["t9"],
+      unidentified: false,
+    });
+  });
+
+  it("reads RTDS: a heartbeat and a TWAP-topic envelope name nothing; another topic, or a frame that does not parse, is unidentified", () => {
+    expect(frameMarketIdentity(rtds("PONG"))).toStrictEqual({ tokens: [], conditions: [], gammaMarkets: [], unidentified: false });
+    expect(frameMarketIdentity(rtds("PING"))).toMatchObject({ unidentified: false });
+    const twap = {
+      topic: "crypto_prices_twap_sixty",
+      type: "update",
+      timestamp: 1,
+      payload: { symbol: "btc/usd", full_accuracy_value: "1", timestamp: 1, window_s: 60 },
+    };
+    expect(frameMarketIdentity(rtds(twap))).toStrictEqual({ tokens: [], conditions: [], gammaMarkets: [], unidentified: false });
+    expect(frameMarketIdentity(rtds([twap, { ...twap, topic: "crypto_prices_twap_thirty" }]))).toMatchObject({ unidentified: false });
+    // The probe's frame: another topic naming a market.
+    expect(frameMarketIdentity(rtds({ topic: "activity", payload: { conditionId: "UNKNOWN", asset: "X" } }))).toMatchObject({
+      conditions: ["UNKNOWN"],
+      unidentified: true,
+    });
+    expect(frameMarketIdentity(rtds({ topic: "comments", payload: {} }))).toMatchObject({ unidentified: true });
+    expect(frameMarketIdentity(rtds({ topic: 7 }))).toMatchObject({ unidentified: true });
+    expect(frameMarketIdentity(rtds("{not json")).unidentified).toBe(true);
+    expect(frameMarketIdentity(rtds([42])).unidentified).toBe(true);
+    expect(frameMarketIdentity(rtds('{"topic":"crypto_prices_twap_sixty","topic":"activity"}')).unidentified).toBe(true);
+    // An identity key on RTDS names its market, which must then be registered.
+    expect(frameMarketIdentity(rtds({ topic: "crypto_prices_twap_sixty", payload: { market: "0xc" } }))).toMatchObject({
+      conditions: ["0xc"],
+      unidentified: false,
+    });
   });
 });
 

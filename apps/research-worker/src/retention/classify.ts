@@ -26,9 +26,14 @@
  * named by its dispatch identity widens the pin to the whole span of the
  * sealed segment that holds it; one whose segment is not sealed and verified
  * yet keeps the window unclassified.
+ *
+ * While a trader window is unclassified, whatever its durable rows already
+ * show is held (`holdRanges`): a source event that is pending never releases
+ * the segment of one that is located, and neither does a frontier that has not
+ * passed the window yet.
  */
 
-import type { DispatchFrontier, WalIndex } from "./wal-index.js";
+import type { DispatchFrontier, Span, WalIndex } from "./wal-index.js";
 import { dispatchRequirements, locateSourceEvent, meetsRequirement } from "./wal-index.js";
 import type { MarketWindow } from "./windows.js";
 
@@ -79,7 +84,22 @@ export function pinRetentionMs(pinClass: PinClass): number | null {
 
 /** A window's classification. */
 export type WindowClassification =
-  | { readonly windowId: string; readonly state: "unclassified"; readonly reason: string }
+  | {
+      readonly windowId: string;
+      readonly state: "unclassified";
+      readonly reason: string;
+      /**
+       * Ranges the trader's durable rows, read so far, already show hold chain
+       * evidence: the range the window's pin would hold now — every evidence
+       * instant and the whole span of every LOCATED source event's segment,
+       * then the lead-in. The planner keeps every segment overlapping them, as
+       * well as the window's potential range (`potentialRange`), so a source
+       * event that is still pending, an instance that has not passed the
+       * window yet, or a window that has not closed never releases a segment
+       * already known to hold its evidence. Empty when no row could be read.
+       */
+      readonly holdRanges: readonly Span[];
+    }
   | {
       readonly windowId: string;
       readonly state: "classified";
@@ -113,11 +133,101 @@ export type ClassifyOptions = {
   readonly wal: WalIndex;
 };
 
+/** The strongest evidence class of a market's rows, or `null` when it has none. */
+function pinClassOf(evidence: MarketEvidence): PinClass | null {
+  return evidence.fillsAtMs.length > 0
+    ? "fill"
+    : evidence.haltsAtMs.length > 0
+      ? "halt"
+      : evidence.refusalsAtMs.length > 0
+        ? "refusal"
+        : evidence.intents.length > 0
+          ? "intent"
+          : null;
+}
+
+/**
+ * The extent of a window's evidence (Decision 3.2, 3.4): the whole window,
+ * widened to hold every evidence instant — every decision with intents, whose
+ * source event could be in a fill's chain — and the whole span of every
+ * sealed segment holding a source event named by its dispatch identity.
+ * Every source event is examined, whatever comes before it: one still pending
+ * is reported, and never stops the widening for the others.
+ */
+function chainExtent(
+  window: MarketWindow,
+  evidence: MarketEvidence,
+  wal: WalIndex,
+): { readonly fromMs: number; readonly toMs: number; readonly pending: string | null } {
+  let fromMs = window.windowStartMs;
+  let toMs = window.windowEndMs;
+  const widen = (atMs: number): void => {
+    if (atMs < fromMs) fromMs = atMs;
+    if (atMs > toMs) toMs = atMs;
+  };
+  for (const atMs of evidence.fillsAtMs) widen(atMs);
+  for (const atMs of evidence.refusalsAtMs) widen(atMs);
+  for (const atMs of evidence.haltsAtMs) widen(atMs);
+  let pending: string | null = null;
+  for (const intent of evidence.intents) {
+    widen(intent.evaluatedAtMs);
+    if (intent.gatewayEpoch === null || intent.ingestSeq === null) continue;
+    const location = locateSourceEvent(wal, intent.gatewayEpoch, intent.ingestSeq);
+    if (location.status === "pending") {
+      pending ??= `the source event (${intent.gatewayEpoch}, ${intent.ingestSeq}) of a decision in its chain is not sealed and verified yet: ${location.reason}`;
+      continue;
+    }
+    if (location.status === "located") {
+      widen(location.span.fromMs);
+      widen(location.span.toMs);
+    }
+    // "lost": the pin records it as outside, and the planner keeps every
+    // segment the pin overlaps (`pin-trace-incomplete`).
+  }
+  return { fromMs, toMs, pending };
+}
+
+/**
+ * Why a trader window cannot be classified yet, or `null` when its rows are
+ * durable: it has closed, the grace after its end has passed, and every
+ * responsible instance's durable frontier has passed every sealed frame that
+ * could be stamped inside its range, in dispatch order.
+ */
+async function classificationBlocker(
+  window: MarketWindow,
+  instanceIds: readonly string[],
+  options: ClassifyOptions,
+): Promise<string | null> {
+  if (options.nowMs < window.windowEndMs) return "the window has not closed";
+  const range = potentialRange(window, options.leadInMs, options.durabilityGraceMs);
+  if (options.nowMs < range.toMs) return "the durability grace after the window's end has not passed";
+  const required = dispatchRequirements(options.wal, range);
+  if (!required.ok) return required.reason;
+  const frontiers = await options.evidence.dispatchFrontiers(instanceIds);
+  for (const instanceId of instanceIds) {
+    const frontier = frontiers.get(instanceId);
+    if (frontier === undefined) {
+      return `instance ${instanceId} has no durable decision carrying a dispatch position (gatewayEpoch, ingestSeq): its processing of the window cannot be established`;
+    }
+    for (const requirement of required.requirements) {
+      if (!meetsRequirement(frontier, requirement)) {
+        return `instance ${instanceId} has not durably processed epoch ${requirement.gatewayEpoch} past ingestSeq ${requirement.ingestSeq}`;
+      }
+    }
+  }
+  return null;
+}
+
 /** Classify one window. */
 export async function classifyWindow(window: MarketWindow, options: ClassifyOptions): Promise<WindowClassification> {
-  const unclassified = (reason: string): WindowClassification => ({ windowId: window.windowId, state: "unclassified", reason });
-  if (options.nowMs < window.windowEndMs) return unclassified("the window has not closed");
+  const unclassified = (reason: string, holdRanges: readonly Span[] = []): WindowClassification => ({
+    windowId: window.windowId,
+    state: "unclassified",
+    reason,
+    holdRanges,
+  });
   if (window.responsibility.kind === "gateway-only") {
+    if (options.nowMs < window.windowEndMs) return unclassified("the window has not closed");
     return {
       windowId: window.windowId,
       state: "classified",
@@ -129,41 +239,28 @@ export async function classifyWindow(window: MarketWindow, options: ClassifyOpti
       evidenceCounts: { fills: 0, intents: 0, refusals: 0, halts: 0 },
     };
   }
-  const range = potentialRange(window, options.leadInMs, options.durabilityGraceMs);
-  if (options.nowMs < range.toMs) return unclassified("the durability grace after the window's end has not passed");
+  // No trader could have acted in the window yet: there is nothing to hold.
+  if (options.nowMs < window.responsibleFromMs) return unclassified("the window has not closed");
+  const instanceIds = window.responsibility.instanceIds;
 
   // -- The trader's rows are durable: established in dispatch order. --------
-  const required = dispatchRequirements(options.wal, range);
-  if (!required.ok) return unclassified(required.reason);
-  const instanceIds = window.responsibility.instanceIds;
-  const frontiers = await options.evidence.dispatchFrontiers(instanceIds);
-  for (const instanceId of instanceIds) {
-    const frontier = frontiers.get(instanceId);
-    if (frontier === undefined) {
-      return unclassified(
-        `instance ${instanceId} has no durable decision carrying a dispatch position (gatewayEpoch, ingestSeq): its processing of the window cannot be established`,
-      );
-    }
-    for (const requirement of required.requirements) {
-      if (!meetsRequirement(frontier, requirement)) {
-        return unclassified(
-          `instance ${instanceId} has not durably processed epoch ${requirement.gatewayEpoch} past ingestSeq ${requirement.ingestSeq}`,
-        );
-      }
-    }
-  }
+  const blocker = await classificationBlocker(window, instanceIds, options);
 
-  const evidence = await options.evidence.marketEvidence(window, instanceIds);
-  const pinClass: PinClass | null =
-    evidence.fillsAtMs.length > 0
-      ? "fill"
-      : evidence.haltsAtMs.length > 0
-        ? "halt"
-        : evidence.refusalsAtMs.length > 0
-          ? "refusal"
-          : evidence.intents.length > 0
-            ? "intent"
-            : null;
+  // -- The durable rows: they classify the window or, while it cannot be
+  // classified yet, name the evidence already known, which is HELD. ---------
+  let evidence: MarketEvidence;
+  try {
+    evidence = await options.evidence.marketEvidence(window, instanceIds);
+  } catch (error) {
+    if (blocker !== null) return unclassified(blocker);
+    throw error;
+  }
+  const pinClass = pinClassOf(evidence);
+  const extent = chainExtent(window, evidence, options.wal);
+  const pinRange: Span = { fromMs: extent.fromMs - options.leadInMs, toMs: extent.toMs };
+  if (blocker !== null) return unclassified(blocker, pinClass === null ? [] : [pinRange]);
+  if (extent.pending !== null) return unclassified(extent.pending, [pinRange]);
+
   const evidenceCounts = {
     fills: evidence.fillsAtMs.length,
     intents: evidence.intents.length,
@@ -182,42 +279,13 @@ export async function classifyWindow(window: MarketWindow, options: ClassifyOpti
       evidenceCounts,
     };
   }
-  // The whole window, widened to hold every evidence instant — every decision
-  // with intents, whose source event could be in a fill's chain — and the
-  // whole span of every segment that holds a source event named by its
-  // dispatch identity; then preceded by the lead-in (Decision 3.2, 3.4).
-  let fromMs = window.windowStartMs;
-  let toMs = window.windowEndMs;
-  const widen = (atMs: number): void => {
-    if (atMs < fromMs) fromMs = atMs;
-    if (atMs > toMs) toMs = atMs;
-  };
-  for (const atMs of evidence.fillsAtMs) widen(atMs);
-  for (const atMs of evidence.refusalsAtMs) widen(atMs);
-  for (const atMs of evidence.haltsAtMs) widen(atMs);
-  for (const intent of evidence.intents) {
-    widen(intent.evaluatedAtMs);
-    if (intent.gatewayEpoch === null || intent.ingestSeq === null) continue;
-    const location = locateSourceEvent(options.wal, intent.gatewayEpoch, intent.ingestSeq);
-    if (location.status === "pending") {
-      return unclassified(
-        `the source event (${intent.gatewayEpoch}, ${intent.ingestSeq}) of a decision in its chain is not sealed and verified yet: ${location.reason}`,
-      );
-    }
-    if (location.status === "located") {
-      widen(location.span.fromMs);
-      widen(location.span.toMs);
-    }
-    // "lost": the pin records it as outside, and the planner keeps every
-    // segment the pin overlaps (`pin-trace-incomplete`).
-  }
   const retention = pinRetentionMs(pinClass);
   return {
     windowId: window.windowId,
     state: "classified",
     pinClass,
-    pinFromMs: fromMs - options.leadInMs,
-    pinToMs: toMs,
+    pinFromMs: pinRange.fromMs,
+    pinToMs: pinRange.toMs,
     keepUntilMs: retention === null ? null : window.windowEndMs + retention,
     sourceEvents: evidence.intents,
     evidenceCounts,

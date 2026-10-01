@@ -20,6 +20,22 @@
  * only after every dataset verified, so a record is the statement "this pin
  * is extracted and verified"; the deletion guard still re-verifies the bytes.
  *
+ * ## A pin is a durable fact, not a per-cycle derivation
+ *
+ * Once a record exists, the pin exists, whatever later cycles derive. The
+ * planner treats EVERY record in the store whose range overlaps a segment as
+ * an overlapping pin (`readExtractedPins`; ADR-028 Decision 2.4): a window
+ * that is unclassified for a cycle (the trader's database unreachable, a
+ * source event pending), removed from the registry, or re-derived with
+ * another range still has its pin verified and named before a segment it
+ * covers expires.
+ *
+ * A window whose existing pin already fulfils what the window now requires is
+ * **bound** to it (`bindWindowPins`) rather than re-pinned. That is what keeps
+ * a window's pin stable after its chain-source segment expires under it: the
+ * source event can no longer be located in the WAL, but the record names it
+ * among the events it holds, so it is still inside the pin.
+ *
  * ## What a pin never does
  *
  * Nothing here deletes, evicts or shrinks a pin. A fill pin lasts forever
@@ -94,6 +110,8 @@ export type PinRecord = {
   readonly keepUntil: string | null;
   readonly reason: string;
   readonly datasets: readonly PinDataset[];
+  /** The source events the pin had to hold (Decision 3.4): its spec's, as extracted. */
+  readonly sourceEvents: readonly IntentEvidence[];
   /** Every source event that had to lie inside the pin did (Decision 3.4). */
   readonly sourceEventsInside: boolean;
   readonly sourceEventsOutside: readonly IntentEvidence[];
@@ -110,7 +128,13 @@ export function pinSpecs(
     if (classification.state !== "classified" || classification.pinClass === null) continue;
     if (classification.pinFromMs === null || classification.pinToMs === null) continue;
     specs.push({
-      pinId: windowPinId(classification.windowId, classification.pinClass, classification.pinFromMs, classification.pinToMs),
+      pinId: windowPinId(
+        classification.windowId,
+        classification.pinClass,
+        classification.pinFromMs,
+        classification.pinToMs,
+        classification.sourceEvents,
+      ),
       origin: "window",
       pinClass: classification.pinClass,
       windowId: classification.windowId,
@@ -138,15 +162,28 @@ export function pinSpecs(
 }
 
 /**
- * A window pin's id: the window, and a short digest of what the pin holds.
+ * A window pin's id: the window, and a short digest of what the pin holds —
+ * its class, its range and the source events it must hold. The events are
+ * part of it because the record's `sourceEventsInside` is a statement about
+ * exactly those events: a chain that names another event is another pin,
+ * whose trace is checked anew, never an old record's verdict reused.
  *
- * A pin record is immutable. Should a window's evidence ever imply a
- * different range or class after its pin was extracted, the new range is a
- * new pin with its own id — extracted beside the old one, which is kept —
- * rather than a stuck expiry or a rewritten record.
+ * A pin record is immutable. A window whose existing pin still fulfils what
+ * it requires is bound to that pin (`bindWindowPins`). Should its evidence
+ * ever imply more — a different class, a wider range, another source event —
+ * the new range is a new pin with its own id, extracted beside the old one,
+ * which is kept and still honoured (`readExtractedPins`), rather than a stuck
+ * expiry or a rewritten record.
  */
-export function windowPinId(windowId: string, pinClass: PinClass, fromMs: number, toMs: number): string {
-  const digest = sha256Hex(JSON.stringify([pinClass, fromMs, toMs])).slice(0, 12);
+export function windowPinId(
+  windowId: string,
+  pinClass: PinClass,
+  fromMs: number,
+  toMs: number,
+  sourceEvents: readonly IntentEvidence[],
+): string {
+  const events = [...new Set(sourceEvents.map(sourceEventKey))].sort();
+  const digest = sha256Hex(JSON.stringify([pinClass, fromMs, toMs, events])).slice(0, 12);
   return `window-${windowId}-${digest}`;
 }
 
@@ -175,6 +212,27 @@ export function parsePinRecord(bytes: Uint8Array, key: string): PinRecord {
     typeof raw === "string" && raw.length > 0 && (pattern === undefined || pattern.test(raw)) ? raw : fail(`${what} is malformed`);
   const count = (raw: unknown, what: string): number =>
     typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : fail(`${what} is malformed`);
+  const nullableText = (raw: unknown, what: string): string | null => (raw === null ? null : text(raw, what));
+  // Every instant is one this build wrote: canonical, so its range is exactly
+  // the one the planner compares (an instant that does not read would be no
+  // range at all, and overlap nothing).
+  const instant = (raw: unknown, what: string): string => {
+    const value = text(raw, what, ISO_INSTANT);
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) && new Date(ms).toISOString() === value ? value : fail(`${what} is not a canonical instant`);
+  };
+  const events = (raw: unknown, what: string): IntentEvidence[] =>
+    (Array.isArray(raw) ? (raw as unknown[]) : fail(`${what} is not an array`)).map((item, index) => {
+      const event = object(item, `${what}[${String(index)}]`);
+      const evaluatedAtMs = event["evaluatedAtMs"];
+      if (typeof evaluatedAtMs !== "number" || !Number.isSafeInteger(evaluatedAtMs)) fail(`${what}[${String(index)}].evaluatedAtMs is malformed`);
+      return {
+        evaluatedAtMs: evaluatedAtMs as number,
+        sourceEventId: nullableText(event["sourceEventId"], `${what}[${String(index)}].sourceEventId`),
+        gatewayEpoch: nullableText(event["gatewayEpoch"], `${what}[${String(index)}].gatewayEpoch`),
+        ingestSeq: nullableText(event["ingestSeq"], `${what}[${String(index)}].ingestSeq`),
+      };
+    });
   const root = object(value, "the record");
   if (root["pinRecordVersion"] !== PIN_RECORD_VERSION) fail("an unknown pinRecordVersion");
   const origin = root["origin"];
@@ -182,17 +240,22 @@ export function parsePinRecord(bytes: Uint8Array, key: string): PinRecord {
   const pinClass = root["pinClass"];
   if (!["fill", "halt", "refusal", "intent", "operator"].includes(String(pinClass))) fail("pinClass is malformed");
   const datasets = Array.isArray(root["datasets"]) ? (root["datasets"] as unknown[]) : fail("datasets is not an array");
-  const outside = Array.isArray(root["sourceEventsOutside"]) ? (root["sourceEventsOutside"] as unknown[]) : fail("sourceEventsOutside is not an array");
+  const sourceEvents = events(root["sourceEvents"], "sourceEvents");
+  const outside = events(root["sourceEventsOutside"], "sourceEventsOutside");
   if (typeof root["sourceEventsInside"] !== "boolean") fail("sourceEventsInside is not a boolean");
+  if ((root["sourceEventsInside"] === true) !== (outside.length === 0)) fail("sourceEventsInside contradicts sourceEventsOutside");
+  const from = instant(root["from"], "from");
+  const to = instant(root["to"], "to");
+  if (Date.parse(to) < Date.parse(from)) fail("the range ends before it starts");
   return {
     pinRecordVersion: PIN_RECORD_VERSION,
     pinId: text(root["pinId"], "pinId"),
     origin: origin as PinRecord["origin"],
     pinClass: pinClass as PinRecord["pinClass"],
     windowId: root["windowId"] === null ? null : text(root["windowId"], "windowId"),
-    from: text(root["from"], "from", ISO_INSTANT),
-    to: text(root["to"], "to", ISO_INSTANT),
-    keepUntil: root["keepUntil"] === null ? null : text(root["keepUntil"], "keepUntil", ISO_INSTANT),
+    from,
+    to,
+    keepUntil: root["keepUntil"] === null ? null : instant(root["keepUntil"], "keepUntil"),
     reason: text(root["reason"], "reason"),
     datasets: datasets.map((raw, index) => {
       const dataset = object(raw, `datasets[${String(index)}]`);
@@ -206,9 +269,10 @@ export function parsePinRecord(bytes: Uint8Array, key: string): PinRecord {
         objectBytes: count(dataset["objectBytes"], "objectBytes"),
       };
     }),
+    sourceEvents,
     sourceEventsInside: root["sourceEventsInside"] as boolean,
-    sourceEventsOutside: outside as IntentEvidence[],
-    createdAt: text(root["createdAt"], "createdAt", ISO_INSTANT),
+    sourceEventsOutside: outside,
+    createdAt: instant(root["createdAt"], "createdAt"),
   };
 }
 
@@ -219,6 +283,114 @@ export async function readPinRecord(objectStore: ObjectStore, pinId: string): Pr
   const record = parsePinRecord(await objectStore.get(key), key);
   if (record.pinId !== pinId) throw new Error(`pin record ${key} names another pin`);
   return record;
+}
+
+/**
+ * Every pin extracted into the store: the records that read, and the ones
+ * that exist but do not (their range is unknown, so the planner keeps every
+ * segment while any exists).
+ */
+export type ExtractedPins = {
+  readonly records: readonly PinRecord[];
+  readonly unreadable: readonly { readonly pinId: string; readonly detail: string }[];
+};
+
+/**
+ * Enumerate every extracted pin (`pins/<pinId>/pin.json`), whatever this
+ * cycle derives. A pin directory without a record is an extraction that did
+ * not finish: nothing was ever deleted under it, and it is skipped. A store
+ * that cannot list its keys, or a listing that fails, is ONE unreadable entry,
+ * which keeps every segment.
+ */
+export async function readExtractedPins(objectStore: ObjectStore): Promise<ExtractedPins> {
+  if (objectStore.list === undefined) {
+    return { records: [], unreadable: [{ pinId: "(pin catalog)", detail: "the object store cannot list its keys" }] };
+  }
+  let names: readonly string[];
+  try {
+    names = await objectStore.list(PIN_KEY_PREFIX);
+  } catch (error) {
+    return {
+      records: [],
+      unreadable: [{ pinId: "(pin catalog)", detail: `the pins could not be listed: ${error instanceof Error ? error.message : String(error)}` }],
+    };
+  }
+  const records: PinRecord[] = [];
+  const unreadable: { pinId: string; detail: string }[] = [];
+  for (const name of names) {
+    try {
+      const record = await readPinRecord(objectStore, name);
+      if (record !== null) records.push(record);
+    } catch (error) {
+      unreadable.push({ pinId: name, detail: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { records, unreadable };
+}
+
+/** A source event's identity, for comparing the events a pin holds. */
+function sourceEventKey(event: IntentEvidence): string {
+  return JSON.stringify([event.evaluatedAtMs, event.sourceEventId, event.gatewayEpoch, event.ingestSeq]);
+}
+
+/** Whether a pin was extracted to hold every one of these source events. */
+export function recordHoldsSourceEvents(record: PinRecord, events: readonly IntentEvidence[]): boolean {
+  const held = new Set(record.sourceEvents.map(sourceEventKey));
+  return events.every((event) => held.has(sourceEventKey(event)));
+}
+
+/**
+ * Bind each window spec to the window's existing pin when that pin already
+ * fulfils it, rather than derive a new pin.
+ *
+ * An existing record fulfils a spec when it is the same window's pin, of the
+ * same class and lapse, its trace was complete (`sourceEventsInside`), its
+ * range contains the spec's range, and it was extracted to hold every source
+ * event the spec names. Then everything the spec must hold, the record holds.
+ *
+ * This is what keeps a window's pin stable over its life: once the segment
+ * holding a chain source event expires under the pin (ADR-028 Decision 2.4),
+ * the event can no longer be located in the WAL, so the window's freshly
+ * derived range no longer reaches it — but the pin that holds it does.
+ * Without the binding the window would be re-pinned with a narrower range
+ * and an incomplete trace, and its remaining raw segments kept forever.
+ *
+ * A spec no record fulfils (new evidence, another class, a registry edit) is
+ * kept as derived: a new pin, extracted beside the old one, which the planner
+ * still honours (`readExtractedPins`).
+ */
+export function bindWindowPins(specs: readonly PinSpec[], records: readonly PinRecord[]): readonly PinSpec[] {
+  const byId = new Set(records.map((record) => record.pinId));
+  return specs.map((spec) => {
+    if (spec.origin !== "window" || byId.has(spec.pinId)) return spec;
+    const keepUntil = spec.keepUntilMs === null ? null : new Date(spec.keepUntilMs).toISOString();
+    const candidates = records.filter((record) => {
+      if (
+        record.origin !== "window" ||
+        record.windowId !== spec.windowId ||
+        record.pinClass !== spec.pinClass ||
+        record.keepUntil !== keepUntil ||
+        !record.sourceEventsInside
+      ) {
+        return false;
+      }
+      const fromMs = Date.parse(record.from);
+      const toMs = Date.parse(record.to);
+      if (!(fromMs <= spec.fromMs && spec.toMs <= toMs)) return false;
+      return recordHoldsSourceEvents(record, spec.sourceEvents);
+    });
+    const chosen = candidates.sort((left, right) =>
+      left.createdAt !== right.createdAt ? (left.createdAt < right.createdAt ? -1 : 1) : left.pinId < right.pinId ? -1 : 1,
+    )[0];
+    if (chosen === undefined) return spec;
+    return {
+      ...spec,
+      pinId: chosen.pinId,
+      fromMs: Date.parse(chosen.from),
+      toMs: Date.parse(chosen.to),
+      sourceEvents: chosen.sourceEvents,
+    };
+  });
 }
 
 /** Whether a segment's receipt span overlaps a range. */
@@ -447,6 +619,7 @@ export async function extractPin(spec: PinSpec, context: PinExtractionContext): 
     keepUntil: spec.keepUntilMs === null ? null : new Date(spec.keepUntilMs).toISOString(),
     reason: spec.reason,
     datasets,
+    sourceEvents: spec.sourceEvents,
     sourceEventsInside: outside.length === 0,
     sourceEventsOutside: outside,
     createdAt: new Date(context.clock.nowMs()).toISOString(),

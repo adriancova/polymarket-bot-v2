@@ -12,9 +12,11 @@
  *    trader's durable rows read-only, against the sealed WAL in dispatch
  *    order (`wal-index.ts`).
  * 4. **Pin** every classified window with evidence, and every operator pin
- *    (`pins.ts`), once the WAL has moved past its range.
+ *    (`pins.ts`), once the WAL has moved past its range. A window whose
+ *    existing pin already fulfils it is bound to that pin, not re-pinned.
  * 5. **Plan**: decide every sealed segment, with every reason it is kept
- *    (`plan.ts`).
+ *    (`plan.ts`), against the pins this cycle derives AND every pin already
+ *    extracted into the store.
  * 6. **Expire**, only in `execute` mode: make the plan durable, then — under
  *    the operator-pin lock — re-decide, prove, re-read the operator's pins and
  *    delete one segment at a time, then write the receipt (`execute.ts`). The
@@ -53,8 +55,8 @@ import type { StorageMetrics } from "./metrics.js";
 import { diskMetrics, storageMetrics } from "./metrics.js";
 import type { OperatorPinLock } from "./operator-pin-lock.js";
 import { noOperatorPinLock } from "./operator-pin-lock.js";
-import type { PinOutcome, PinRecord, PinSpec } from "./pins.js";
-import { extractPin, overlaps, pinSpecs, readPinRecord } from "./pins.js";
+import type { ExtractedPins, PinOutcome, PinRecord, PinSpec } from "./pins.js";
+import { bindWindowPins, extractPin, overlaps, pinSpecs, readExtractedPins, readPinRecord } from "./pins.js";
 import type { SegmentDecision } from "./plan.js";
 import { planExpiry } from "./plan.js";
 import type { WalIndex } from "./wal-index.js";
@@ -139,6 +141,9 @@ async function classifyAll(
         windowId: window.windowId,
         state: "unclassified",
         reason: `the trader's rows could not be read: ${error instanceof Error ? error.message : String(error)}`,
+        // Nothing is known of its evidence this cycle; its extracted pins are
+        // still honoured from the store (`readExtractedPins`).
+        holdRanges: [],
       });
     }
   }
@@ -259,7 +264,8 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
   const classifications = await classifyAll(windows, dependencies, clock, wal);
 
   // -- 4. Pin. ----------------------------------------------------------------
-  const specs = pinSpecs([...classifications.values()], operatorPins);
+  // A window whose existing pin fulfils it is bound to that pin.
+  const specs = bindWindowPins(pinSpecs([...classifications.values()], operatorPins), (await readExtractedPins(objectStore)).records);
   const allSegments = [...inventory.byEpoch.values()].flat();
   const pins: PinOutcome[] = [];
   const pinFailures: { pinId: string; detail: string }[] = [];
@@ -283,6 +289,8 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
 
   // -- 5. Plan. ---------------------------------------------------------------
   const pinRecords = await readPinRecords(objectStore, specs);
+  // Every pin in the store, this cycle's new ones included.
+  const extractedPins: ExtractedPins = await readExtractedPins(objectStore);
   const decisions = await planExpiry({
     nowMs: clock.nowMs(),
     retentionMs: settings.retentionMs,
@@ -295,6 +303,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     operatorPins,
     pinSpecs: specs,
     pinRecords,
+    extractedPins,
     verifiedResearch,
   });
 
@@ -322,7 +331,8 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
         const freshWindows = await dependencies.loadWindows();
         const freshOperatorPins = await dependencies.loadOperatorPins();
         const freshClassifications = await classifyAll(freshWindows, dependencies, clock, wal);
-        const freshSpecs = pinSpecs([...freshClassifications.values()], freshOperatorPins);
+        const freshPins = await readExtractedPins(objectStore);
+        const freshSpecs = bindWindowPins(pinSpecs([...freshClassifications.values()], freshOperatorPins), freshPins.records);
         const segment = allSegments.find((candidate) => candidate.segmentId === entry.request.segmentId);
         if (segment === undefined) return ["the segment is no longer in the inventory"];
         const [fresh] = await planExpiry({
@@ -337,6 +347,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
           operatorPins: freshOperatorPins,
           pinSpecs: freshSpecs,
           pinRecords: await readPinRecords(objectStore, freshSpecs),
+          extractedPins: freshPins,
         });
         if (fresh === undefined) return ["the segment could not be re-decided"];
         if (!fresh.eligible) return fresh.reasons;
@@ -372,7 +383,10 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
   }
   const afterInventory = await inventoryWalRoot(fileSystem, dependencies.walRootPath);
   const written = await epochWrittenBytes(afterInventory, dependencies.stateDirectory);
-  const allPinRecords = [...pinRecords.values()].filter((record): record is PinRecord => record !== null);
+  // Every pin in the store: the budget counts what was recorded today, whichever window it is for.
+  const allPinRecords = new Map<string, PinRecord>();
+  for (const record of extractedPins.records) allPinRecords.set(record.pinId, record);
+  for (const record of pinRecords.values()) if (record !== null) allPinRecords.set(record.pinId, record);
   const metrics = storageMetrics({
     nowMs: clock.nowMs(),
     decisions,
@@ -383,7 +397,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     expiryPlansUnreadable: written.unreadablePlans,
     disk: await diskMetrics(dependencies.walRootPath),
     walMaxTotalBytes: settings.walMaxTotalBytes,
-    pinRecords: allPinRecords,
+    pinRecords: [...allPinRecords.values()],
     pinBudgetBytesPerDay: settings.pinBudgetBytesPerDay,
     expiryStuckAfterMs: settings.expiryStuckAfterMs,
     expiryPlansWithoutReceipt: plansWithoutReceipt,

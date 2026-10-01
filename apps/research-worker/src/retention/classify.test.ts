@@ -298,6 +298,99 @@ describe("a fill chain's source event named by its dispatch identity (ADR-028 De
   });
 });
 
+describe("an unclassified trader window holds the evidence its durable rows already show (round 2, K1)", () => {
+  const withEarlySource = wal([
+    seg({ index: 0, first: "1", last: "2", fromMs: START - 61 * MIN, toMs: START - 60 * MIN }),
+    seg({ index: 1, first: "3", last: "3", fromMs: START - 30 * MIN, toMs: START - 30 * MIN }),
+    seg({ index: 2, first: "4", last: "13", fromMs: START - 20 * MIN, toMs: START + 5 * MIN }),
+    seg({ index: 3, first: "14", last: "23", fromMs: START + 5 * MIN, toMs: END + 30_000 }),
+    seg({ index: 4, first: "24", last: "33", fromMs: END + 2 * MIN, toMs: END + 10 * MIN }),
+  ]);
+  const frontier = dispatchFrontier({ [E]: "33" });
+  const located = { evaluatedAtMs: START + 3 * MIN, sourceEventId: "located", gatewayEpoch: E, ingestSeq: "2" };
+  const pending = { evaluatedAtMs: START + 4 * MIN, sourceEventId: "pending", gatewayEpoch: "epoch-unsealed", ingestSeq: "2" };
+  // The range the pin would hold: the located source's whole segment, then the lead-in.
+  const held = { fromMs: START - 61 * MIN - LEAD_IN, toMs: END };
+
+  it.each([
+    ["located, then pending", [located, pending]],
+    ["pending, then located", [pending, located]],
+  ])("keeps the located source's range while another is pending (%s)", async (_order, intents) => {
+    const classification = await classify({
+      wal: withEarlySource,
+      frontiers: { a: frontier, b: frontier },
+      evidence: { ...NONE, fillsAtMs: [START + MIN], intents },
+    });
+    expect(classification).toStrictEqual({
+      windowId: "w",
+      state: "unclassified",
+      reason: expect.stringMatching(/the source event \(epoch-unsealed, 2\) .* not sealed and verified yet/u),
+      holdRanges: [held],
+    });
+  });
+
+  it.each([
+    // Its segment is sealed but not extracted yet.
+    ["its segment is not extracted yet", "35", [seg({ index: 5, first: "34", last: "40", fromMs: END + 180 * MIN, toMs: END + 190 * MIN, verified: false })]],
+    // It lies after the newest sealed segment of a live epoch.
+    ["it may be in the open segment", "99", []],
+  ] as const)("keeps the located source's range whatever makes another pending: %s", async (_why, ingestSeq, extra) => {
+    const walWithMore = wal([...(withEarlySource.byEpoch.get(E) ?? []), ...extra]);
+    const other = { evaluatedAtMs: START + 4 * MIN, sourceEventId: "other", gatewayEpoch: E, ingestSeq };
+    expect(locateSourceEvent(walWithMore, E, ingestSeq)).toMatchObject({ status: "pending" });
+    const classification = await classify({
+      wal: walWithMore,
+      frontiers: { a: dispatchFrontier({ [E]: "40" }), b: dispatchFrontier({ [E]: "40" }) },
+      evidence: { ...NONE, fillsAtMs: [START + MIN], intents: [located, other] },
+    });
+    expect(classification).toMatchObject({
+      state: "unclassified",
+      reason: expect.stringMatching(/not sealed and verified yet/u),
+      holdRanges: [held],
+    });
+  });
+
+  it("holds the same range while an instance has not passed the window, or while it is still open", async () => {
+    const evidence: MarketEvidence = { ...NONE, fillsAtMs: [START + MIN], intents: [located] };
+    const lagging = await classify({ wal: withEarlySource, frontiers: { a: frontier, b: dispatchFrontier({ [E]: "5" }) }, evidence });
+    expect(lagging).toMatchObject({ state: "unclassified", reason: expect.stringMatching(/instance b has not durably processed/u), holdRanges: [held] });
+    const open = await classify({ wal: withEarlySource, nowMs: END - 1, evidence });
+    expect(open).toMatchObject({ state: "unclassified", reason: "the window has not closed", holdRanges: [held] });
+    // No evidence yet: nothing beyond the potential range to hold.
+    expect(await classify({ wal: withEarlySource, frontiers: { a: frontier, b: dispatchFrontier({ [E]: "5" }) } })).toMatchObject({
+      state: "unclassified",
+      holdRanges: [],
+    });
+    // Before any trader could act, nothing is read.
+    let reads = 0;
+    const counting = {
+      ...staticEvidenceSource({ frontiers: new Map(), evidence: new Map() }),
+      async marketEvidence(): Promise<MarketEvidence> {
+        reads += 1;
+        return evidence;
+      },
+    };
+    const early = await classifyWindow(WINDOW, { nowMs: START - 1, leadInMs: LEAD_IN, durabilityGraceMs: GRACE, evidence: counting, wal: withEarlySource });
+    expect(early).toMatchObject({ state: "unclassified", holdRanges: [] });
+    expect(reads).toBe(0);
+  });
+
+  it("stays unclassified, holding nothing more, when the rows cannot be read while it is blocked; a read failure of a classifiable window propagates", async () => {
+    const failing = {
+      ...staticEvidenceSource({ frontiers: new Map([["a", frontier], ["b", dispatchFrontier({ [E]: "5" })]]), evidence: new Map() }),
+      async marketEvidence(): Promise<MarketEvidence> {
+        throw new Error("connect ECONNREFUSED");
+      },
+    };
+    const blocked = await classifyWindow(WINDOW, { nowMs: END + 10 * MIN, leadInMs: LEAD_IN, durabilityGraceMs: GRACE, evidence: failing, wal: withEarlySource });
+    expect(blocked).toMatchObject({ state: "unclassified", reason: expect.stringMatching(/instance b/u), holdRanges: [] });
+    const passed = { ...failing, dispatchFrontiers: staticEvidenceSource({ frontiers: new Map([["a", frontier], ["b", frontier]]), evidence: new Map() }).dispatchFrontiers };
+    await expect(
+      classifyWindow(WINDOW, { nowMs: END + 10 * MIN, leadInMs: LEAD_IN, durabilityGraceMs: GRACE, evidence: passed, wal: withEarlySource }),
+    ).rejects.toThrow(/ECONNREFUSED/u);
+  });
+});
+
 describe("pin classes and lifetimes (ADR-028 Decision 3)", () => {
   it("pins a window with a fill forever, and with an intent, a refusal or a halt for 30 days", async () => {
     const fill = await classify({ evidence: { ...NONE, fillsAtMs: [START + 1] } });
@@ -348,6 +441,7 @@ describe("the pin budget only alarms (ADR-028 Decision 3.6, 3.7)", () => {
     keepUntil: pinClass === "fill" ? null : "2026-01-31T00:30:00.000Z",
     reason: "test",
     datasets: [{ gatewayEpoch: "e", datasetId: pinId, manifestObjectKey: `pins/${pinId}/e/manifest.json`, manifestSha256: "0".repeat(64), segmentIds: ["s"], objectBytes: bytes }],
+    sourceEvents: [],
     sourceEventsInside: true,
     sourceEventsOutside: [],
     createdAt: `${day}T12:00:00.000Z`,

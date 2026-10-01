@@ -532,3 +532,16 @@ describe("expireAfterExtractDeletion: impossible to point at a directory by defa
     expect(await readdir(walDir)).toHaveLength(2);
   });
 });
+
+describe("ObjectStore.list: the names directly under a prefix (STORAGE-1 round 2, every extracted pin)", () => {
+  it("lists the filesystem store's names under a prefix, sorted, and nothing for an absent prefix", async () => {
+    const store = fileSystemObjectStore(join(root, "listing"));
+    expect(await store.list?.("pins")).toStrictEqual([]);
+    await store.put("pins/window-b/pin.json", Buffer.from("{}"));
+    await store.put("pins/window-a/epoch/manifest.json", Buffer.from("{}"));
+    await store.put("pinsx/other/pin.json", Buffer.from("{}"));
+    expect(await store.list?.("pins")).toStrictEqual(["window-a", "window-b"]);
+    expect(await store.list?.("pins/window-a")).toStrictEqual(["epoch"]);
+    await expect(store.list?.("../escape")).rejects.toThrow(/path traversal/u);
+  });
+});

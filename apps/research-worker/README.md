@@ -26,22 +26,33 @@ One run does, in order:
    into a version 2 `approximate` dataset under `research/<gatewayEpoch>/` in the object
    store. A segment that fails verification is never extracted, so it never expires. Each
    source segment's entry in the checksummed manifest also lists every Polymarket market its
-   frames name, read from every frame whatever the sampler keeps (`marketIdentities`).
+   frames name, read from every frame whatever the sampler keeps (`marketIdentities`). A
+   frame the inventory cannot read in full — one that does not parse strictly (a duplicate
+   key, say), nests deeper than 16 levels, holds a non-name under an identity key, or is an
+   RTDS envelope on a topic other than the Chainlink TWAP ones — counts as unidentified, and
+   keeps its segment.
 2. **Classification.** Every registered market window is classified: a trader-responsible
    window once the trader has durably processed, **in dispatch order**, every sealed frame
    that could be stamped inside the window (its decisions' `gateway_epoch` / `ingest_seq`,
    read **read-only** from PostgreSQL); a gateway-only window at its close. Receipt
    instants are not used for this: they can step backwards. **Until the trader persists
    its decisions' dispatch position (`H1R1-PROVENANCE`), no trader-responsible window
-   classifies, so nothing it overlaps expires.**
+   classifies, so nothing it overlaps expires.** While a window is unclassified, whatever its
+   durable rows already show is held as well: the range its pin would hold now, the whole
+   segment of every source event already located included.
 3. **Pins.** A window with a fill (kept forever), an intent, a refusal or a halt (30 days),
    and every operator pin, is copied exactly — whole WAL segments, through the `WP-130`
-   compactor — under `pins/<pinId>/`.
+   compactor — under `pins/<pinId>/`. A pin, once extracted, is a durable fact: a window
+   whose existing pin already holds everything it requires stays bound to that pin, even
+   after the segment holding its chain's source event has expired under it.
 4. **Plan.** Every sealed segment is decided, with every reason it is kept. A segment may
    expire only when its newest frame is at least 72 h old, its research tier verifies,
    every market it names is registered and every frame could be identified, every window it
    could overlap is classified, every overlapping pin is extracted and verified, and no
-   operator pin covers it.
+   operator pin covers it. "Every overlapping pin" is every pin in the store, not only the
+   ones this cycle derives: a window that is unclassified this cycle (the trader database
+   unreachable, say), re-derived or re-registered still has its pin verified and named in
+   the receipt. A pin record that does not read keeps every segment.
 5. **Expiry**, only in `execute` mode: the plan is written durably to the state directory
    first (never replacing an existing plan), then, under the operator-pin lock, each segment
    is re-decided, its bytes proved against the research tier and the pins, the operator pins
@@ -134,7 +145,9 @@ names a pruned window's market is then unclassified and kept, never deleted.
 ```
 
 An operator pin keeps the raw WAL it covers, and an exact copy is extracted too. It lasts
-until the operator removes it from the file.
+until the operator removes it from the file. Its extracted copy is never deleted: once the
+pin is removed, a segment it covers may expire, and that copy is then verified and named in
+the receipt like any other pin's.
 
 Publish a pin with the command, not by editing the file:
 
@@ -143,9 +156,11 @@ RESEARCH_WORKER_OPERATOR_PINS=/var/lib/polymarket-bot/operator-pins.json \
   node dist/main.mjs storage pin incident-42 2026-09-30T10:00:00Z 2026-09-30T11:00:00Z "review"
 ```
 
-It takes the lock `<pins file>.lock`, which expiry also holds from each segment's final
-decision through its unlink, so a published pin holds every segment that has not already
-been deleted. A pin added by hand is re-read just before each unlink, but only the command
+It takes the lock `<pins file>.lock`, beside the file's canonical path (symbolic links
+resolved), which expiry also holds from each segment's final decision through its unlink,
+so a published pin holds every segment that has not already been deleted. Every spelling of
+the file reaches the same lock; a pin file with a second hard link, or a symbolic link to a
+missing file, is refused. A pin added by hand is re-read just before each unlink, but only the command
 is serialized with the unlink itself. A lock left by a crashed process is never broken
 automatically: expiry refuses to delete while it is held, and the error names the holder.
 

@@ -33,6 +33,7 @@ import {
 } from "./execute.js";
 import type { ExpiryPlan, PlanFileSystem } from "./execute.js";
 import type { OperatorPinLock } from "./operator-pin-lock.js";
+import { readExtractedPins } from "./pins.js";
 import { RAW_RETENTION_MS, planExpiry } from "./plan.js";
 
 const NOW = Date.parse("2026-01-10T00:00:00.000Z");
@@ -62,6 +63,7 @@ async function eligiblePlan(): Promise<{ fixture: StorageFixture; plan: ExpiryPl
     operatorPins: [],
     pinSpecs: [],
     pinRecords: new Map(),
+    extractedPins: await readExtractedPins(fixture.objectStore),
   });
   const plan = buildExpiryPlan({ planId: "plan-1", nowMs: NOW, retentionMs: RAW_RETENTION_MS, walRootPath: fixture.walRoot, decisions });
   expect(plan.entries).toHaveLength(1);
