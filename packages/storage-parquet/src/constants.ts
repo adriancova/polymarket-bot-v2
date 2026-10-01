@@ -49,11 +49,44 @@ export const PARQUET_LAYOUT_ID = "polymarket-bot/parquet-raw-frames/v1";
 /** Version number of {@link PARQUET_LAYOUT_ID}, pinned in every dataset manifest. */
 export const PARQUET_LAYOUT_VERSION = 1;
 
-/** Identity of the dataset manifest document. */
+/**
+ * Identity of the dataset manifest document.
+ *
+ * **It does not move with the version** (`STORAGE-1`, answering ADR-029
+ * Decision 1.2). The rule is the one `docs/contracts/wal-format.md` §12 states
+ * for the WAL's own `formatId`: the id is the *coarse discriminator* and
+ * changes only for a wholesale format replacement; a new field set is a
+ * `datasetManifestVersion` change. Version 2 adds the `fidelity` field and an
+ * approximate (research-tier) body under the same document family, so the id
+ * stays `polymarket-bot/dataset-manifest/v1` and the version carries the change.
+ */
 export const DATASET_MANIFEST_FORMAT_ID = "polymarket-bot/dataset-manifest/v1";
 
-/** Document version of the dataset manifest, independent of the layout version. */
-export const DATASET_MANIFEST_VERSION = 1;
+/**
+ * Document version of the dataset manifest this build **writes**.
+ *
+ * Version 2 (ADR-029 Decision 1) adds the required `fidelity` field: `exact`
+ * for a dataset compacted losslessly from raw WAL, `approximate` for a
+ * research-tier dataset. Version 1 has no such field and reads as `exact`
+ * (ADR-029 Decision 1.3), because every version 1 dataset was compacted from
+ * raw WAL.
+ */
+export const DATASET_MANIFEST_VERSION = 2;
+
+/** The legacy version: no `fidelity` field; read as `exact`. */
+export const DATASET_MANIFEST_VERSION_1 = 1;
+
+/**
+ * Every dataset-manifest version this build reads. ADR-029 Consequences:
+ * every reader accepts both before any version 2 manifest is written.
+ */
+export const READABLE_DATASET_MANIFEST_VERSIONS: readonly number[] = [1, 2];
+
+/** The two dataset classes of ADR-029 Decision 1. */
+export const DATASET_FIDELITIES = ["exact", "approximate"] as const;
+
+/** A dataset's class (ADR-029 Decision 1.1). */
+export type DatasetFidelity = (typeof DATASET_FIDELITIES)[number];
 
 /**
  * Default object-key suffix of a dataset manifest.
@@ -79,11 +112,26 @@ export const DATASET_MANIFEST_DIGEST_OBJECT_NAME = "manifest.sha256";
  */
 export const DATASET_RETENTION_RECEIPT_OBJECT_NAME = "retention-receipt.json";
 
-/** Identity of the retention receipt document. */
+/**
+ * Identity of the retention receipt document. Like the dataset manifest's id,
+ * it is the coarse discriminator and does not move with the version.
+ */
 export const RETENTION_RECEIPT_FORMAT_ID = "polymarket-bot/retention-receipt/v1";
 
-/** Document version of the retention receipt. */
-export const RETENTION_RECEIPT_VERSION = 1;
+/**
+ * Document version of the retention receipt this build **writes**.
+ *
+ * Version 2 (ADR-028 Decision 4.3) gives every deletion entry a `basis`:
+ * `verified-upload` (the `WP-130` basis: every deleted record is inside the
+ * verified object named) or `expired-after-extract` (the ADR-028 basis: the
+ * segment's records are kept only as the verified research tier and the
+ * verified pins it names). A reader must still accept version 1, whose
+ * entries are all `verified-upload` by construction.
+ */
+export const RETENTION_RECEIPT_VERSION = 2;
+
+/** Every retention-receipt version this build reads. */
+export const READABLE_RETENTION_RECEIPT_VERSIONS: readonly number[] = [1, 2];
 
 /** File extension of a compacted data object. */
 export const PARQUET_OBJECT_SUFFIX = ".parquet";

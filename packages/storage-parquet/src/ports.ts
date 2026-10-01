@@ -10,6 +10,8 @@
  * adapter against {@link ObjectStore}.
  */
 
+import type { ExpiryDeletionRequest, ExpiryProofOutcome } from "./expiry-proof.js";
+
 /** Time source. Wall clock for timestamps, monotonic clock for durations. */
 export interface CompactionClock {
   /** Wall-clock milliseconds since the Unix epoch. */
@@ -158,6 +160,34 @@ export function retainAllWalSegments(): WalSegmentRetention {
       // Intentionally empty: this policy retains.
     },
   };
+}
+
+/**
+ * Deletion of WAL segments under ADR-028's **expired-after-extract** basis.
+ *
+ * A separate capability from {@link WalSegmentRetention}, on purpose: the
+ * `WP-130` basis deletes a segment whose every record is in a verified object,
+ * while this one deletes a segment whose records are kept only as the
+ * research tier and the pins that overlap it. A deployment grants each
+ * explicitly, and neither is the default.
+ *
+ * An implementation must apply `verifyExpiryProof` (`expiry-proof.ts`) to the
+ * exact bytes it is about to unlink, and must refuse a WAL directory that has
+ * not opted in (`node-file-system.ts`). It removes the segment, then its
+ * sidecar manifest, as `deleteAfterVerifiedUploadRetention` does.
+ */
+export interface ExpiredSegmentDeletion {
+  /** Recorded in the retention receipt. */
+  readonly policyName: string;
+  /**
+   * Re-verify the proof against the store and the file, then delete the
+   * segment and its sidecar manifest. Throws `RetentionGuardError` (and
+   * deletes nothing) when the proof fails.
+   */
+  deleteExpiredSegment(
+    walDirectoryPath: string,
+    request: ExpiryDeletionRequest,
+  ): Promise<ExpiryProofOutcome>;
 }
 
 /** A segment was read and fully verified. */

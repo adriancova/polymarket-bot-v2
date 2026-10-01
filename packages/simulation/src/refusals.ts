@@ -41,6 +41,12 @@ export const SIMULATION_REFUSAL_CODES = [
   "REPLAY_MANIFEST_INVALID",
   /** The manifest's format id or version is not one this build replays. */
   "REPLAY_MANIFEST_UNSUPPORTED",
+  /**
+   * The manifest describes an APPROXIMATE (research-tier) dataset. This door
+   * replays exact data only: an approximate dataset is never determinism,
+   * calibration, promotion or soak evidence (ADR-029 Decisions 2 and 4.3).
+   */
+  "REPLAY_MANIFEST_APPROXIMATE",
   /** A run-scoped §12.5 pin is missing, so the run is not reproducible. */
   "REPLAY_MANIFEST_PIN_MISSING",
   /** A run-scoped pin disagrees with the component that would be used. */

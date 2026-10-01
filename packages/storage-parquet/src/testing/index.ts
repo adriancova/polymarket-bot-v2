@@ -29,6 +29,9 @@ import type {
   WalSegmentRetention,
 } from "../ports.js";
 import { verifyRetentionProof } from "../retention-proof.js";
+import { verifyExpiryProof } from "../expiry-proof.js";
+import type { ExpiryDeletionRequest, ExpiryProofOutcome } from "../expiry-proof.js";
+import type { ExpiredSegmentDeletion } from "../ports.js";
 import { sha256Hex } from "../wal-format.js";
 
 /** A clock that advances only when a test says so. */
@@ -205,6 +208,45 @@ export function recordingRetention(options: {
         options.walDirectoryPath,
         `${request.segmentId}.wal.manifest.json`,
       );
+    },
+  };
+}
+
+/** An expiry deletion that records what it removed. */
+export type RecordingExpiryDeletion = ExpiredSegmentDeletion & {
+  readonly deleted: readonly { readonly walDirectoryPath: string; readonly request: ExpiryDeletionRequest }[];
+};
+
+/**
+ * Expiry deletion from a {@link MemoryFileSystem}, applying the **same proof
+ * the real implementation applies** (`verifyExpiryProof`) to the exact bytes
+ * it then removes. The opt-in marker is the real implementation's concern;
+ * this double stands for a WAL root that has opted in.
+ */
+export function recordingExpiryDeletion(options: {
+  readonly fileSystem: MemoryFileSystem;
+  readonly objectStore: ObjectStore;
+}): RecordingExpiryDeletion {
+  const deleted: { walDirectoryPath: string; request: ExpiryDeletionRequest }[] = [];
+  return {
+    policyName: "expire-after-extract",
+    deleted,
+    async deleteExpiredSegment(
+      walDirectoryPath: string,
+      request: ExpiryDeletionRequest,
+    ): Promise<ExpiryProofOutcome> {
+      const segmentPath = options.fileSystem.joinPath(walDirectoryPath, `${request.segmentId}.wal.jsonl`);
+      const outcome = await verifyExpiryProof(
+        {
+          objectStore: options.objectStore,
+          readSegmentFile: () => options.fileSystem.readWholeFile(segmentPath),
+        },
+        request,
+      );
+      deleted.push({ walDirectoryPath, request });
+      options.fileSystem.remove(walDirectoryPath, `${request.segmentId}.wal.jsonl`);
+      options.fileSystem.remove(walDirectoryPath, `${request.segmentId}.wal.manifest.json`);
+      return outcome;
     },
   };
 }

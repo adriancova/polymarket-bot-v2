@@ -46,11 +46,16 @@
  */
 
 export {
+  DATASET_FIDELITIES,
   DATASET_MANIFEST_DIGEST_OBJECT_NAME,
   DATASET_MANIFEST_FORMAT_ID,
   DATASET_MANIFEST_OBJECT_NAME,
   DATASET_MANIFEST_VERSION,
+  DATASET_MANIFEST_VERSION_1,
   DATASET_RETENTION_RECEIPT_OBJECT_NAME,
+  READABLE_DATASET_MANIFEST_VERSIONS,
+  READABLE_RETENTION_RECEIPT_VERSIONS,
+  type DatasetFidelity,
   DEFAULT_MAX_LISTED_DUPLICATE_KEYS,
   DEFAULT_MAX_RECORD_BYTES,
   DEFAULT_MAX_SEGMENT_BYTES,
@@ -84,11 +89,72 @@ export {
 export {
   buildRetentionReceipt,
   encodeRetentionReceipt,
+  parseRetentionReceipt,
   retentionReceiptDigest,
+  type ExpiredAfterExtractDeletion,
+  type ReliedOnDataset,
   type RetentionReceipt,
   type RetentionReceiptDeletion,
+  type RetentionReceiptDeletionInput,
   type RetentionReceiptFailure,
+  type RetentionReceiptInput,
+  type VerifiedUploadDeletion,
 } from "./retention-receipt.js";
+
+export {
+  verifyExpiryProof,
+  type ExpiryDeletionRequest,
+  type ExpiryProofContext,
+  type ExpiryProofOutcome,
+} from "./expiry-proof.js";
+
+export {
+  RESEARCH_DEPTH_LEVELS,
+  RESEARCH_RELEASE_COLUMNS,
+  RESEARCH_TABLES,
+  RESEARCH_TABLE_NAMES,
+  RESEARCH_TIER_LAYOUT_ID,
+  RESEARCH_TIER_LAYOUT_VERSION,
+  researchTableSpec,
+  type ResearchColumnPhysicalType,
+  type ResearchColumnSpec,
+  type ResearchRow,
+  type ResearchSampleClass,
+  type ResearchTableName,
+  type ResearchTableSpec,
+} from "./research-tier-layout.js";
+
+export { readResearchTableObject, writeResearchTableObject } from "./research-tier-object.js";
+
+export {
+  APPROXIMATE_ADMISSIBILITY_NOTE,
+  RESEARCH_SOURCE_VERIFICATION,
+  encodeResearchTierManifest,
+  parseAnyDatasetManifest,
+  parseResearchTierManifest,
+  researchTierManifestDigest,
+  researchTierSchemaVersions,
+  type AnyDatasetManifest,
+  type ResearchDownsampling,
+  type ResearchObjectEntry,
+  type ResearchRecordCounts,
+  type ResearchReleaseIdentity,
+  type ResearchSamplerState,
+  type ResearchSourceSegment,
+  type ResearchStateObject,
+  type ResearchTableEntry,
+  type ResearchTierManifest,
+} from "./research-tier-manifest.js";
+
+export {
+  RESEARCH_SAMPLER_STATE_OBJECT_NAME,
+  manifestDigestSidecarKey,
+  verifyResearchTierDataset,
+  writeResearchTierDataset,
+  type ResearchTierWriteOptions,
+  type ResearchTierWriteResult,
+  type VerifiedResearchTierDataset,
+} from "./research-tier-writer.js";
 
 export {
   verifyRetentionProof,
@@ -164,6 +230,7 @@ export {
   emptyReplayPins,
   encodeDatasetManifest,
   parseDatasetManifest,
+  readDatasetManifestFidelity,
   REPLAY_PINS_NOTE,
   type DatasetColumnPin,
   type DatasetManifest,
@@ -189,8 +256,12 @@ export {
 } from "./compactor.js";
 
 export {
+  EXPIRY_OPT_IN_MARKER_CONTENT,
+  EXPIRY_OPT_IN_MARKER_FILE_NAME,
   deleteAfterVerifiedUploadRetention,
   ensureDirectory,
+  expireAfterExtractDeletion,
+  hasExpiryOptInMarker,
   fileSystemObjectStore,
   isoFromEpochMs,
   nodeCompactionFileSystem,
@@ -205,6 +276,7 @@ export type {
   CompactionFileSystem,
   CompactionObserver,
   DatasetManifestWrittenEvent,
+  ExpiredSegmentDeletion,
   ObjectHead,
   ObjectStore,
   ObjectUploadedEvent,
