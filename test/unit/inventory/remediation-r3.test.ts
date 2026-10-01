@@ -291,7 +291,8 @@ describe("WP300-R3-02: nothing concludes while the executor is pending, so late 
     expect(reserveAll(book, "100").ok).toBe(true);
     expect(book.release({ reservationId: "probe" }).ok).toBe(true);
     expect(manager.observe("s", { status: "MINED", transactionHash: TX_A }).ok).toBe(false);
-    expect(book.line(ACCOUNT, PUSD)?.blocked).toBe("AWAITING_OBSERVATION");
+    // r4 (WP300-R4-01): a quarantine, which a balance read does not lift (was AWAITING_OBSERVATION).
+    expect(book.line(ACCOUNT, PUSD)?.blocked).toBe("QUARANTINED");
     expect(reserveAll(book, "1", "probe-2").ok).toBe(false);
     expect(reconciler.requests).toEqual([
       expect.objectContaining({ trigger: "POSITION_BALANCE_DISCREPANCY", transactionHashes: [TX_A] }),

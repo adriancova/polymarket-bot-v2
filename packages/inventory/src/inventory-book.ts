@@ -64,6 +64,16 @@
  * the operation has resolved, never both. This covers ledger-derived refreshes
  * ({@link InventoryBook.seedFromLedgerBalances}) as well as reconciliation
  * reads.
+ *
+ * QUARANTINE (WP300-R4-01). A line can also be QUARANTINED by a wallet
+ * operation whose terminal outcome is contradicted by later evidence (a
+ * transaction nobody had named, or a different outcome under the same
+ * transaction). A quarantined line refuses new reservations. Unlike
+ * `AWAITING_OBSERVATION`, a balance read does NOT lift it: a read says what
+ * the line holds now, not whether the unresolved transaction will still land.
+ * Only its owner lifts it ({@link InventoryBook.releaseQuarantine}), after an
+ * authoritative resolution of every contested transaction. Reads stay
+ * accepted while it is in place; they update `actual` and nothing else.
  */
 
 import { addDecimal, compareDecimal, isNegativeDecimal, subDecimal, type DecimalString } from "@polymarket-bot/decimal";
@@ -150,8 +160,14 @@ export interface ActualObservation {
  *   reconciliation, or its deltas did not fit the book), so only a fresh
  *   authoritative balance read may say what the line holds.
  * Both clear only on the next {@link InventoryBook.observeActual}.
+ * - `QUARANTINED`: a wallet operation's terminal outcome is contested by later
+ *   evidence (see the header). Reported in preference to the others; a balance
+ *   read never clears it — only {@link InventoryBook.releaseQuarantine}.
  */
-export type LineBlock = "OVER_COMMITTED" | "AWAITING_OBSERVATION";
+export type LineBlock = "OVER_COMMITTED" | "AWAITING_OBSERVATION" | "QUARANTINED";
+
+/** The blocks a balance read clears. */
+type ReadClearableBlock = Exclude<LineBlock, "QUARANTINED">;
 
 export interface InvariantViolation {
   readonly accountRef: string;
@@ -168,7 +184,7 @@ interface Line {
   reserved: DecimalString;
   pendingOut: DecimalString;
   pendingIn: DecimalString;
-  blocked: LineBlock | null;
+  blocked: ReadClearableBlock | null;
 }
 
 interface Reservation {
@@ -209,6 +225,8 @@ export class InventoryBook {
   /** Settled pending ids, retained for the book's lifetime (single-use). */
   readonly #settled = new Map<string, PendingSettlement>();
   readonly #holds = new Map<string, OperationHold>();
+  /** Quarantines by id (WP300-R4-01): lines refusing reservations until released. */
+  readonly #quarantines = new Map<string, OperationHold>();
 
   constructor(registry: AssetRegistry) {
     this.#registry = registry;
@@ -385,13 +403,14 @@ export class InventoryBook {
     }
     const line = this.#line(accountRef, assetId, registration.assetKind);
     const available = availableOf(line);
-    if (line.blocked !== null || compareDecimal(available, amount) < 0) {
+    const blocked = this.#effectiveBlock(line);
+    if (blocked !== null || compareDecimal(available, amount) < 0) {
       return refuse("INVENTORY_INSUFFICIENT_AVAILABLE", "not enough available inventory for this reservation", {
         accountRef,
         assetId,
         requested: amount,
         available,
-        blocked: line.blocked,
+        blocked,
       });
     }
     const reservation: Reservation = {
@@ -575,7 +594,64 @@ export class InventoryBook {
     }
     const line = this.#line(accountRef, assetId, registration.assetKind);
     if (line.blocked === null) line.blocked = "AWAITING_OBSERVATION";
-    return ok(viewLine(line));
+    return ok(this.#view(line));
+  }
+
+  /**
+   * Quarantine lines (see the header): new reservations on them are refused
+   * until {@link releaseQuarantine}; a balance read does not lift it.
+   * Re-quarantining under the same id widens it to the union of the assets.
+   */
+  quarantineLines(input: {
+    readonly quarantineId: string;
+    readonly accountRef: string;
+    readonly assetIds: readonly string[];
+  }): InventoryResult<{ readonly quarantineId: string }> {
+    const quarantineId = ownNonEmptyString(input, "quarantineId");
+    const accountRef = ownNonEmptyString(input, "accountRef");
+    const rawAssets = ownData(input, "assetIds");
+    if (quarantineId === undefined || accountRef === undefined || !Array.isArray(rawAssets)) {
+      return refuse("INVENTORY_INVALID_INPUT", "quarantine needs quarantineId, accountRef and assetIds");
+    }
+    const assetIds = new Set<string>();
+    const kinds = new Map<string, AssetKind>();
+    for (const assetId of rawAssets as readonly unknown[]) {
+      const registration = typeof assetId === "string" ? this.#registry.lookup(assetId) : undefined;
+      if (typeof assetId !== "string" || registration === undefined) {
+        return refuse("INVENTORY_UNKNOWN_ASSET", "quarantine names an unregistered asset", {
+          assetId: typeof assetId === "string" ? assetId : null,
+        });
+      }
+      assetIds.add(assetId);
+      kinds.set(assetId, registration.assetKind);
+    }
+    const existing = this.#quarantines.get(quarantineId);
+    if (existing !== undefined) {
+      if (existing.accountRef !== accountRef) {
+        return refuse("INVENTORY_INVALID_INPUT", "this quarantine id is in place for another account", { quarantineId });
+      }
+      for (const assetId of existing.assetIds) assetIds.add(assetId);
+    }
+    // The lines exist from here on, so their views report the quarantine.
+    for (const [assetId, kind] of kinds) this.#line(accountRef, assetId, kind);
+    this.#quarantines.set(
+      quarantineId,
+      Object.freeze({ holdId: quarantineId, accountRef, assetIds: Object.freeze([...assetIds]) }),
+    );
+    return ok(Object.freeze({ quarantineId }));
+  }
+
+  /** Lift a quarantine. False if none was in place under this id. */
+  releaseQuarantine(quarantineId: string): boolean {
+    return this.#quarantines.delete(quarantineId);
+  }
+
+  /** Whether a line is quarantined. */
+  isQuarantined(accountRef: string, assetId: string): boolean {
+    for (const quarantine of this.#quarantines.values()) {
+      if (quarantine.accountRef === accountRef && quarantine.assetIds.includes(assetId)) return true;
+    }
+    return false;
   }
 
   /**
@@ -631,7 +707,7 @@ export class InventoryBook {
 
   line(accountRef: string, assetId: string): InventoryLineView | undefined {
     const line = this.#lines.get(compositeKey(accountRef, assetId));
-    return line === undefined ? undefined : viewLine(line);
+    return line === undefined ? undefined : this.#view(line);
   }
 
   /** Available amount; `"0"` for a line the book has never seen. */
@@ -665,7 +741,7 @@ export class InventoryBook {
   }
 
   lines(): readonly InventoryLineView[] {
-    return Object.freeze([...this.#lines.values()].map(viewLine));
+    return Object.freeze([...this.#lines.values()].map((line) => this.#view(line)));
   }
 
   reservations(): readonly ReservationView[] {
@@ -732,6 +808,15 @@ export class InventoryBook {
       this.#lines.set(key, line);
     }
     return line;
+  }
+
+  /** The block a reservation meets: a quarantine first, then the read-clearable block. */
+  #effectiveBlock(line: Line): LineBlock | null {
+    return this.isQuarantined(line.accountRef, line.assetId) ? "QUARANTINED" : line.blocked;
+  }
+
+  #view(line: Line): InventoryLineView {
+    return viewLine(line, this.#effectiveBlock(line));
   }
 
   #mustLine(accountRef: string, assetId: string): Line {
@@ -829,7 +914,7 @@ function viewPending(p: Pending): PendingView {
   });
 }
 
-function viewLine(line: Line): InventoryLineView {
+function viewLine(line: Line, blocked: LineBlock | null): InventoryLineView {
   return Object.freeze({
     accountRef: line.accountRef,
     assetId: line.assetId,
@@ -839,6 +924,6 @@ function viewLine(line: Line): InventoryLineView {
     pendingOut: line.pendingOut,
     pendingIn: line.pendingIn,
     available: availableOf(line),
-    blocked: line.blocked,
+    blocked,
   });
 }

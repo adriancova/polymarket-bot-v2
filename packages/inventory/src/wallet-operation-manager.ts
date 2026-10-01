@@ -88,9 +88,32 @@
  * are witnessed, the operation stays RECONCILING until EACH has a terminal
  * authoritative resolution naming it; then it concludes CONFIRMED if any was
  * confirmed (lines await a read), else FAILED. Every reconciliation request
- * carries the witnessed sets. After a terminal state, an observation naming an
- * unwitnessed transaction blocks the operation's lines until an authoritative
- * read and reports a `POSITION_BALANCE_DISCREPANCY`.
+ * carries the witnessed sets.
+ *
+ * AFTER A TERMINAL STATE (WP300-R4-01). CONFIRMED and FAILED have no exit, but
+ * evidence can still arrive. Each observation is weighed against what the
+ * operation concluded for the transaction it names (the per-transaction
+ * reconciliation resolution if there is one, else the terminal state):
+ * - an exact repeat of the recorded outcome, or a stale SUBMITTED/MINED report
+ *   of a witnessed transaction (every mined or failed transaction was once
+ *   submitted), changes nothing;
+ * - a transaction nobody had named, a different terminal outcome under the same
+ *   transaction (FAILED(A) then CONFIRMED(A), or the reverse), a CONFIRMED with
+ *   a different credited amount, or an unrecognised observation CONTESTS the
+ *   outcome. The contested transactions (`hash:<h>` / `id:<i>`; the witnessed
+ *   ones when the evidence names none; `operation` when none was ever
+ *   witnessed) are QUARANTINED: the operation's lines are quarantined in the
+ *   book ({@link InventoryBook.quarantineLines}), which refuses reservations
+ *   and which no balance read lifts, and a `POSITION_BALANCE_DISCREPANCY`
+ *   request carrying `unresolvedTransactions` is sent.
+ * The recovery path is {@link WalletOperationManager.resolveByReconciliation}:
+ * on a quarantined terminal operation it accepts a terminal authoritative
+ * answer (CONFIRMED or FAILED) for each contested transaction, by name. When
+ * none remains unresolved the quarantine is lifted and the lines await a
+ * fresh authoritative read (the answer may mean an effect this book never
+ * applied, or applied wrongly). The operation's state does not change; the
+ * answers are recorded per transaction and later evidence is weighed against
+ * them.
  *
  * RECOGNITION BOUNDARY. From submission until the operation resolves
  * (CONFIRMED or FAILED), every line it touches is under an in-flight hold in
@@ -217,6 +240,12 @@ export interface ReconciliationRequest {
    */
   readonly transactionHashes: readonly string[];
   readonly transactionIds: readonly string[];
+  /**
+   * The transactions the reconciler must resolve, by name, before the
+   * operation (or, after a terminal state, its quarantine) can be released
+   * (`hash:<h>` / `id:<i>`, or `operation` when no transaction was ever named).
+   */
+  readonly unresolvedTransactions: readonly string[];
 }
 
 /** Hands a reconciliation request to the reconciler (§9.17; WP-290). */
@@ -255,9 +284,13 @@ export interface WalletOperationView {
   readonly transactionIds: readonly string[];
   /**
    * With conflicting identities: those still lacking a terminal authoritative
-   * resolution (`hash:<h>` / `id:<i>`). The operation cannot resolve while any remain.
+   * resolution (`hash:<h>` / `id:<i>`). The operation cannot resolve while any
+   * remain. After a terminal state: the contested transactions whose
+   * quarantine is not yet resolved (WP300-R4-01).
    */
   readonly unresolvedTransactions: readonly string[];
+  /** A terminal operation whose outcome is contested; its lines are quarantined. */
+  readonly quarantined: boolean;
 }
 
 interface Operation {
@@ -277,6 +310,13 @@ interface Operation {
   holdId: string | null;
   /** A terminal reconciliation answer was refused because the executor call was pending. */
   terminalDeferred: boolean;
+  /**
+   * After a terminal state: contested transactions (`hash:`/`id:`/`operation`)
+   * → their authoritative resolution, null while unresolved (WP300-R4-01).
+   */
+  readonly quarantine: Map<string, "FAILED" | "CONFIRMED" | null>;
+  /** The credited amount of the CONFIRMED observation whose deltas were applied. */
+  confirmedCredited: DecimalString | null;
   readonly buffered: Classified[];
   ordinal: number;
 }
@@ -381,6 +421,8 @@ export class WalletOperationManager {
       requesting: false,
       holdId: null,
       terminalDeferred: false,
+      quarantine: new Map(),
+      confirmedCredited: null,
       buffered: [],
       ordinal: 0,
     };
@@ -474,7 +516,8 @@ export class WalletOperationManager {
       return ok(view(operation));
     }
     if (operation.state !== "SUBMITTED" && operation.state !== "MINED") {
-      this.#identityOutsideObservation(operation, hints);
+      if (isTerminalState(operation.state)) this.#postTerminalObservation(operation, observation, hints);
+      else this.#identityOutsideObservation(operation, hints);
       return refuse(
         "WALLET_OP_ILLEGAL_TRANSITION",
         "observations apply only to SUBMITTED or MINED operations; UNKNOWN/RECONCILING resolve only by reconciliation",
@@ -512,6 +555,17 @@ export class WalletOperationManager {
   resolveByReconciliation(operationId: string, evidence: unknown): InventoryResult<WalletOperationView> {
     const operation = this.#operations.get(operationId);
     if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
+    if (isTerminalState(operation.state)) {
+      // WP300-R4-01: the recovery path for a contested terminal outcome.
+      if (quarantineUnresolved(operation).length === 0) {
+        return refuse(
+          "WALLET_OP_ILLEGAL_TRANSITION",
+          "a terminal operation is resolved by reconciliation only while its outcome is contested (quarantined)",
+          { operationId, state: operation.state },
+        );
+      }
+      return this.#resolveQuarantine(operation, evidence);
+    }
     // An UNKNOWN operation whose reconciliation request is being delivered
     // right now is ready for the answer (a synchronous requester).
     const answeringRequest = operation.state === "UNKNOWN" && operation.requesting;
@@ -672,6 +726,7 @@ export class WalletOperationManager {
           return;
         }
         this.#transition(operation, "CONFIRMED", `${via}: CONFIRMED`);
+        operation.confirmedCredited = outcome.credited;
         this.#recordApprovalIfAny(operation);
         if (!this.#applyConfirmedDeltas(operation, outcome.credited)) {
           // Defensive: while the operation is in flight its lines refuse
@@ -885,31 +940,138 @@ export class WalletOperationManager {
   }
 
   /**
-   * An observation arrived for an operation that does not accept observations
-   * (UNKNOWN, RECONCILING, CONFIRMED, FAILED). It is refused, but a
-   * transaction identity it names that no evidence has named before is not
-   * dropped (WP300-R3-01/R3-02): under reconciliation it becomes one more
-   * transaction to resolve; after a terminal state the operation's lines are
-   * blocked until an authoritative read and a discrepancy is reported.
+   * An observation arrived for an UNKNOWN or RECONCILING operation. It is
+   * refused, but a transaction identity it names that no evidence has named
+   * before is not dropped (WP300-R3-01): it becomes one more transaction to
+   * resolve. (Terminal operations: {@link #postTerminalObservation}.)
    */
   #identityOutsideObservation(operation: Operation, hints: Identity): void {
     const state = operation.state;
-    if (state === "PLANNED") return;
+    if (state !== "UNKNOWN" && state !== "RECONCILING") return;
     if (!isNewIdentity(operation, hints)) return;
     witness(operation, hints.transactionHash, hints.transactionId);
-    if (state === "UNKNOWN" || state === "RECONCILING") {
-      this.#deliverOrQueue(
-        requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, "an observation named a transaction not known before; it must be resolved too"),
-      );
-      return;
-    }
-    this.#blockAfterTerminal(operation, `an observation named a transaction not known before, after the operation was ${state}`);
+    this.#deliverOrQueue(
+      requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, "an observation named a transaction not known before; it must be resolved too"),
+    );
   }
 
-  /** Contradictory evidence about a terminal operation: its lines wait for an authoritative read. */
-  #blockAfterTerminal(operation: Operation, reason: string): void {
+  /**
+   * An observation about a CONFIRMED or FAILED operation (see the header,
+   * "AFTER A TERMINAL STATE"). A repeat or a stale lifecycle report changes
+   * nothing; anything that contests the recorded outcome quarantines the
+   * contested transactions.
+   */
+  #postTerminalObservation(operation: Operation, raw: unknown, hints: Identity): void {
+    const state = operation.state;
+    if (isNewIdentity(operation, hints)) {
+      const fresh = newIdentityKeys(operation, hints);
+      witness(operation, hints.transactionHash, hints.transactionId);
+      this.#quarantine(operation, fresh, `an observation named a transaction not known before, after the operation was ${state}`);
+      return;
+    }
+    const classified = classifyObservation(raw);
+    // A stale lifecycle report of a witnessed transaction: no new fact.
+    if (classified.kind === "SUBMITTED" || classified.kind === "MINED") return;
+    const named = identityKeys(hints);
+    const targets = named.length > 0 ? named : witnessedKeys(operation);
+    if (classified.kind !== "FAILED" && classified.kind !== "CONFIRMED") {
+      const why = classified.kind === "UNRECOGNISED" ? classified.why : classified.kind;
+      this.#quarantine(operation, targets, `an unrecognised observation (${why}) after the operation was ${state}`);
+      return;
+    }
+    const contested = targets.filter((key) => contradicts(operation, key, classified));
+    if (contested.length === 0) return; // an exact repeat of the recorded outcome
+    this.#quarantine(
+      operation,
+      contested,
+      `observation: ${classified.kind} contradicts the recorded outcome of ${contested.join(",")} (operation is ${state})`,
+    );
+  }
+
+  /**
+   * Quarantine contested transactions of a terminal operation: its lines refuse
+   * reservations until every contested transaction is resolved authoritatively
+   * ({@link #resolveQuarantine}); a balance read does not lift it.
+   */
+  #quarantine(operation: Operation, keys: readonly string[], reason: string): void {
+    let opened = false;
+    for (const key of keys) {
+      if (operation.quarantine.get(key) !== null) {
+        operation.quarantine.set(key, null);
+        opened = true;
+      }
+    }
+    const placed = this.#book.quarantineLines({
+      quarantineId: quarantineIdOf(operation.plan.operationId),
+      accountRef: operation.plan.accountRef,
+      assetIds: this.#touchedAssets(operation),
+    });
+    // Defensive (the ids are validated at plan time and the assets are registered).
+    if (!placed.ok) this.#awaitObservation(operation);
+    if (!opened) return; // already contested: the outstanding request covers it
+    this.#deliverOrQueue(
+      requestFor(
+        operation,
+        "POSITION_BALANCE_DISCREPANCY",
+        `${reason}; the lines are quarantined until every unresolved transaction is resolved authoritatively`,
+      ),
+    );
+  }
+
+  /** The recovery path for a quarantined terminal operation (WP300-R4-01). */
+  #resolveQuarantine(operation: Operation, evidence: unknown): InventoryResult<WalletOperationView> {
+    const operationId = operation.plan.operationId;
+    if (ownData(evidence, "source") !== "AUTHORITATIVE_READ") {
+      return refuse("WALLET_OP_EVIDENCE_REQUIRED", "reconciliation evidence must be an authoritative read", {
+        operationId,
+      });
+    }
+    const state = ownData(evidence, "state");
+    const classified = classifyObservation({ ...plainCopy(evidence), status: state });
+    if (classified.kind !== "FAILED" && classified.kind !== "CONFIRMED") {
+      return refuse(
+        "WALLET_OP_EVIDENCE_REQUIRED",
+        "a contested terminal outcome is released only by a terminal authoritative answer (CONFIRMED or FAILED) per transaction; the quarantine stays",
+        { operationId, state: typeof state === "string" ? state : null, unresolved: quarantineUnresolved(operation).join(",") },
+      );
+    }
+    const conflict = identityConflict(operation, classified.transactionHash, classified.transactionId);
+    if (conflict !== null) {
+      return refuse(
+        "WALLET_OP_EVIDENCE_CONFLICT",
+        "reconciliation evidence names a transaction no evidence has named for this operation; the quarantine stays",
+        { operationId, field: conflict },
+      );
+    }
+    const named = identityKeys(classified);
+    for (const key of named) {
+      const previous = operation.quarantine.get(key);
+      if (previous !== undefined && previous !== null && previous !== classified.kind) {
+        return refuse("WALLET_OP_EVIDENCE_CONFLICT", "this transaction was already resolved differently", {
+          operationId,
+          transaction: key,
+          previous,
+        });
+      }
+    }
+    const keys = named.filter((key) => operation.quarantine.get(key) === null);
+    if (operation.quarantine.get(OPERATION_KEY) === null) keys.push(OPERATION_KEY);
+    if (keys.length === 0) {
+      return refuse(
+        "WALLET_OP_EVIDENCE_REQUIRED",
+        "the evidence names no contested transaction; each must be resolved by name",
+        { operationId, unresolved: quarantineUnresolved(operation).join(",") },
+      );
+    }
+    witness(operation, classified.transactionHash, classified.transactionId);
+    for (const key of keys) operation.quarantine.set(key, classified.kind);
+    if (quarantineUnresolved(operation).length > 0) return ok(view(operation));
+    // Every contested transaction is resolved: lift the quarantine. Whatever
+    // the answers were, the book's lines may not reflect them (an effect never
+    // applied, or applied wrongly), so they await a fresh authoritative read.
+    this.#book.releaseQuarantine(quarantineIdOf(operationId));
     this.#awaitObservation(operation);
-    this.#deliverOrQueue(requestFor(operation, "POSITION_BALANCE_DISCREPANCY", `${reason}; lines await an authoritative read`));
+    return ok(view(operation));
   }
 
   /**
@@ -953,7 +1115,7 @@ export class WalletOperationManager {
 
   /** Every identifier this plan will hand the book, so it can be validated up front. */
   #derivedIdentifiers(plan: WalletOperationPlan, reservedAssetIds: readonly string[]): readonly string[] {
-    const ids = [holderRefOf(plan.operationId)];
+    const ids = [holderRefOf(plan.operationId), quarantineIdOf(plan.operationId)];
     for (const assetId of reservedAssetIds) {
       const reservationId = reservationIdOf(plan.operationId, assetId);
       ids.push(reservationId, debitPendingIdOf(reservationId));
@@ -1003,8 +1165,15 @@ export class WalletOperationManager {
     }
     if (state === "CONFIRMED" || state === "FAILED") {
       // Unreachable by construction (nothing concludes while the executor is
-      // pending — WP300-R3-02); fail closed if it ever happens.
-      if (contradiction !== null) this.#blockAfterTerminal(operation, `${contradiction} (operation is ${state})`);
+      // pending — WP300-R3-02); fail closed (quarantine) if it ever happens.
+      if (contradiction !== null) {
+        const named = identityKeys(hints);
+        this.#quarantine(
+          operation,
+          named.length > 0 ? named : witnessedKeys(operation),
+          `${contradiction} (operation is ${state})`,
+        );
+      }
       return;
     }
     if (contradiction === null && !deferred) return;
@@ -1236,6 +1405,10 @@ function creditPendingIdOf(operationId: string, assetId: string): string {
   return compositeKey("wallet-op", operationId, assetId, "in");
 }
 
+function quarantineIdOf(operationId: string): string {
+  return compositeKey("wallet-op", operationId, "quarantine");
+}
+
 /**
  * Why the observations buffered during submission, read together with the
  * executor's SUBMITTED answer, are not one consistent story — or null.
@@ -1360,6 +1533,73 @@ function resolutionKeys(operation: Operation, transactionHash: string | null, tr
   return keys;
 }
 
+/** The quarantine key for contested evidence about an operation that never named a transaction. */
+const OPERATION_KEY = "operation";
+
+function isTerminalState(state: WalletOperationState): state is "CONFIRMED" | "FAILED" {
+  return state === "CONFIRMED" || state === "FAILED";
+}
+
+/** The `hash:`/`id:` keys an identity names. */
+function identityKeys(identity: Identity): string[] {
+  const keys: string[] = [];
+  if (identity.transactionHash !== null) keys.push(hashKey(identity.transactionHash));
+  if (identity.transactionId !== null) keys.push(idKey(identity.transactionId));
+  return keys;
+}
+
+/** The keys of the identity values not yet witnessed. */
+function newIdentityKeys(operation: Operation, identity: Identity): string[] {
+  const keys: string[] = [];
+  if (identity.transactionHash !== null && !operation.hashes.includes(identity.transactionHash)) {
+    keys.push(hashKey(identity.transactionHash));
+  }
+  if (identity.transactionId !== null && !operation.ids.includes(identity.transactionId)) {
+    keys.push(idKey(identity.transactionId));
+  }
+  return keys;
+}
+
+/** Every witnessed transaction's key, or the operation key when none was ever witnessed. */
+function witnessedKeys(operation: Operation): string[] {
+  const keys = [...operation.hashes.map(hashKey), ...operation.ids.map(idKey)];
+  return keys.length > 0 ? keys : [OPERATION_KEY];
+}
+
+/** Contested transactions of a terminal operation still awaiting an authoritative resolution. */
+function quarantineUnresolved(operation: Operation): string[] {
+  return [...operation.quarantine].filter(([, resolution]) => resolution === null).map(([key]) => key);
+}
+
+/**
+ * Whether a terminal observation contradicts what the operation concluded for
+ * this transaction: the latest authoritative answer about it (quarantine, then
+ * reconciliation), else the terminal state. A transaction already under
+ * quarantine has no conclusion to contradict.
+ */
+function contradicts(
+  operation: Operation,
+  key: string,
+  outcome: Extract<Classified, { kind: "FAILED" | "CONFIRMED" }>,
+): boolean {
+  let expected: "FAILED" | "CONFIRMED" | null;
+  if (operation.quarantine.has(key)) expected = operation.quarantine.get(key) ?? null;
+  else expected = operation.resolutions.get(key) ?? (isTerminalState(operation.state) ? operation.state : null);
+  if (expected === null) return false;
+  if (expected !== outcome.kind) return true;
+  return (
+    outcome.kind === "CONFIRMED" &&
+    outcome.credited !== null &&
+    operation.confirmedCredited !== null &&
+    compareDecimal(outcome.credited, operation.confirmedCredited) !== 0
+  );
+}
+
+/** What remains to resolve: the quarantine after a terminal state, else the conflicted identities. */
+function unresolvedKeys(operation: Operation): string[] {
+  return isTerminalState(operation.state) ? quarantineUnresolved(operation) : unresolvedOf(operation);
+}
+
 /** Conflicted identities still lacking a terminal authoritative resolution. */
 function unresolvedOf(operation: Operation): string[] {
   if (!isConflicted(operation)) return [];
@@ -1389,6 +1629,7 @@ function requestFor(operation: Operation, trigger: ReconciliationTrigger, reason
     reason,
     transactionHashes: Object.freeze([...operation.hashes]),
     transactionIds: Object.freeze([...operation.ids]),
+    unresolvedTransactions: Object.freeze(unresolvedKeys(operation)),
   };
 }
 
@@ -1478,6 +1719,7 @@ function view(operation: Operation): WalletOperationView {
     bufferedObservations: operation.buffered.length,
     transactionHashes: Object.freeze([...operation.hashes]),
     transactionIds: Object.freeze([...operation.ids]),
-    unresolvedTransactions: Object.freeze(unresolvedOf(operation)),
+    unresolvedTransactions: Object.freeze(unresolvedKeys(operation)),
+    quarantined: isTerminalState(operation.state) && quarantineUnresolved(operation).length > 0,
   });
 }
