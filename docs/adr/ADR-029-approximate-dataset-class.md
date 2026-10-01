@@ -3,8 +3,9 @@
 - **Status:** Accepted. The user ruled on 2026-09-30 (`LEAN-1`, ruling A4).
 - **Date:** 2026-09-30
 - **Recorded by:** `LEAN-GOV`
-- **Implemented by:** `STORAGE-1` (the research tier and its manifest) and
-  `APPROX-REPLAY-1` (the replay source). Not yet implemented.
+- **Implemented by:** `STORAGE-1` (the research tier and its manifest),
+  merged `a22502b`. `APPROX-REPLAY-1` (the replay source) is not yet
+  implemented.
 - **Supersedes / Superseded by:** none. It **amends** handoff §8.4, §12.4 and
   §12.5, and the ADR-017 manifest format (a version bump). It adds a rank
   below ADR-012's tiers.

@@ -143,8 +143,8 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
 - **A window settled only by dry runs, then pruned from the registry, keeps its holds.** They stay until it is re-registered and settled by `execute`.
 - **Pin volume.** About 3.4 GB/day at H1's intent rate, above the 3 GB/day alarm. Segments shared between overlapping pins are stored twice, and SNAPPY is about 3× larger than ZSTD.
 - **One unreadable pin record, or an unreadable `evidence-holds.json`, stalls every expiry.** It fails closed.
-- **R6-LOCK-OPEN-ERROR-UNTESTED (LOW).** The refusal on an `open()` error other than EEXIST is correct but unpinned.
-- **R6-LOCK-NAME-FALLBACK (LOW).** If the boot id cannot be read, the lock name falls back to `storage-cycle.lock`. Two participants that derive different names do not exclude each other. One trigger: `/proc` mounted with `subset=pid`, as under systemd `ProcSubset=pid`.
+- **R6-LOCK-OPEN-ERROR-UNTESTED (LOW): closed by `STORAGE-1b` (`7b6499e`).** The refusal on an `open()` error other than EEXIST is correct but unpinned.
+- **R6-LOCK-NAME-FALLBACK (LOW): closed by `STORAGE-1b` (`7b6499e`); an unreadable boot id now refuses, and `ProcSubset=pid` is unsupported.** If the boot id cannot be read, the lock name falls back to `storage-cycle.lock`. Two participants that derive different names do not exclude each other. One trigger: `/proc` mounted with `subset=pid`, as under systemd `ProcSubset=pid`.
 
 ## follow_up
 
@@ -165,12 +165,12 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
    - add alerts for a non-zero storage exit, long-lived holds or unreadable marks, and clock skew;
    - back up `evidence-holds.json`;
    - export the storage metrics to Prometheus.
-   - Avoid `ProcSubset=pid`, or close R6-LOCK-NAME-FALLBACK first.
+   - Leave `ProcSubset` unset: the cycle refuses under `ProcSubset=pid` (`STORAGE-1b`).
 5. **A pin-storage ruling or round:** share segments between overlapping pins, and/or add a ZSTD codec.
 6. **Deleting lapsed non-fill pins** deletes evidence, so it needs its own dual-verified round.
 7. **`APPROX-REPLAY-1`** can now consume the research tier.
 8. **Before `SCALE-8`:** add a durable classification cache, or prune the registry.
-9. **Close the two round-6 LOWs** in a research-worker round.
+9. The two round-6 LOWs: closed by `STORAGE-1b` (`7b6499e`).
 
 ## commit_sha
 
