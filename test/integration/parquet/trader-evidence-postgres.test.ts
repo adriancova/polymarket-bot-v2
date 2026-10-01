@@ -46,6 +46,7 @@ function windowFor(chain: TradingChain): MarketWindow {
     windowId: "w",
     marketId: chain.marketId,
     conditionId: "condition",
+    gammaMarketId: null,
     tokenIds: [chain.tokenId],
     windowStartMs: Date.parse(fixtureTimestamp(-600)),
     windowEndMs: Date.parse(fixtureTimestamp(600)),

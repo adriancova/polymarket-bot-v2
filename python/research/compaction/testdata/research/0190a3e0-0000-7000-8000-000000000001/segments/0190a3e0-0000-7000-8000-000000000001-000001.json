@@ -13,6 +13,7 @@
   "maxIngestSeq": "18446744073709551617",
   "polymarketTokenIds": [],
   "conditionIds": [],
+  "gammaMarketIds": [],
   "datasetId": "research-0190a3e0-0000-7000-8000-000000000001-000000-000001",
   "manifestObjectKey": "research/0190a3e0-0000-7000-8000-000000000001/research-0190a3e0-0000-7000-8000-000000000001-000000-000001/manifest.json",
   "manifestSha256": "8a90531c7110486a4d28e14bd2cd4cef815e558b0acf5f40208b027409c4c8fb"

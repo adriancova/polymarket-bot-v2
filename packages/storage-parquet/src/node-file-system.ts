@@ -14,6 +14,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -295,20 +296,21 @@ export function expireAfterExtractDeletion(options: {
   readonly fileSystem?: CompactionFileSystem;
 }): ExpiredSegmentDeletion {
   const fileSystem = options.fileSystem ?? nodeCompactionFileSystem();
-  const root = resolve(options.walRootPath);
   return {
     policyName: "expire-after-extract",
     async deleteExpiredSegment(
       walDirectoryPath: string,
       request: ExpiryDeletionRequest,
     ): Promise<ExpiryProofOutcome> {
+      // Real paths, so a symbolic link cannot carry a deletion out of the root.
+      const root = await realpath(options.walRootPath).catch(() => resolve(options.walRootPath));
       if (!(await hasExpiryOptInMarker(root))) {
         throw new RetentionGuardError(
           "refusing to expire a WAL segment: the WAL root has not opted in to expiry",
           { walRootPath: root, marker: EXPIRY_OPT_IN_MARKER_FILE_NAME, segmentId: request.segmentId },
         );
       }
-      const directory = resolve(walDirectoryPath);
+      const directory = await realpath(walDirectoryPath).catch(() => resolve(walDirectoryPath));
       if (directory !== root && !directory.startsWith(root + sep)) {
         throw new RetentionGuardError(
           "refusing to expire a WAL segment: its directory is outside the opted-in WAL root",

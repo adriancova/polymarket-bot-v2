@@ -82,6 +82,7 @@ kept elsewhere must never carry it.
       "windowId": "btc-updown-15m-1790764200",
       "marketId": "<catalog.markets.market_id>",
       "conditionId": "0x…",
+      "gammaMarketId": "5121169",
       "tokenIds": ["<yes token>", "<no token>"],
       "windowStart": "2026-09-30T10:30:00Z",
       "windowEnd": "2026-09-30T10:45:00Z",
@@ -93,9 +94,16 @@ kept elsewhere must never carry it.
 ```
 
 `responsibility` is `{ "kind": "gateway-only" }` for a market only the gateway records.
-`responsibleFrom` (optional; defaults to `windowStart`) is the earliest instant the trader
-could have acted on the market. Until the window classifies, every segment from it (less
-the lead-in) to the window's end is kept.
+`gammaMarketId` (optional) is the id the gateway's lifecycle feed polls; a segment whose
+polls name an unregistered Gamma id is kept, as one naming an unregistered token is.
+`responsibleFrom` is the earliest instant the trader could have acted on the market (its
+admission, or the market's open for orders). It is **required** for a trader-responsible
+window — a trader can act before the window opens — and defaults to `windowStart` for a
+gateway-only one. Until the window classifies, every segment from it (less the lead-in) to
+the window's end is kept.
+
+The registry may be pruned of windows whose segments have all expired: a segment that
+names a pruned window's market is then unclassified and kept, never deleted.
 
 ### Operator pins
 

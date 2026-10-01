@@ -14,7 +14,7 @@
  *   real deletion refuses a WAL root without its opt-in marker.
  */
 
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -348,6 +348,20 @@ describe("expireAfterExtractDeletion: impossible to point at a directory by defa
     await mkdir(join(root, "elsewhere"), { recursive: true });
     await writeFile(join(root, "elsewhere", EXPIRY_OPT_IN_MARKER_FILE_NAME), EXPIRY_OPT_IN_MARKER_CONTENT);
     await expect(deletion.deleteExpiredSegment(walDir, request)).rejects.toThrow(/outside the opted-in WAL root/u);
+    expect(await readdir(walDir)).toHaveLength(2);
+  });
+
+  it("refuses a directory that only looks inside the root through a symbolic link", async () => {
+    const { request } = await setUp();
+    // The opted-in root holds a link to the real WAL directory, which lies outside it.
+    const optedIn = join(root, "opted-in");
+    await mkdir(optedIn, { recursive: true });
+    await writeFile(join(optedIn, EXPIRY_OPT_IN_MARKER_FILE_NAME), EXPIRY_OPT_IN_MARKER_CONTENT);
+    await symlink(walDir, join(optedIn, "link"));
+    const deletion = expireAfterExtractDeletion({ walRootPath: optedIn, objectStore });
+    await expect(deletion.deleteExpiredSegment(join(optedIn, "link"), request)).rejects.toThrow(
+      /outside the opted-in WAL root/u,
+    );
     expect(await readdir(walDir)).toHaveLength(2);
   });
 

@@ -43,7 +43,7 @@ import {
   writeResearchTierDataset,
 } from "@polymarket-bot/storage-parquet";
 
-import { FrameInterpreter } from "./interpret.js";
+import { FrameInterpreter, gammaMarketIdOf } from "./interpret.js";
 import type { InventoriedSegment } from "./inventory.js";
 import {
   RESEARCH_DOWNSAMPLING,
@@ -80,6 +80,8 @@ export type ResearchPointer = {
   readonly polymarketTokenIds: readonly string[];
   /** Polymarket condition ids the segment's frames name. */
   readonly conditionIds: readonly string[];
+  /** Gamma market ids the segment's lifecycle polls name (from their endpoints). */
+  readonly gammaMarketIds: readonly string[];
   readonly datasetId: string;
   readonly manifestObjectKey: string;
   readonly manifestSha256: string;
@@ -152,7 +154,7 @@ type Batch = {
   readonly interpreter: FrameInterpreter;
   readonly stateIn: (ResearchStateObject & { readonly datasetId: string }) | null;
   readonly segments: VerifiedSegment[];
-  readonly tokens: Map<string, { tokens: Set<string>; conditions: Set<string> }>;
+  readonly tokens: Map<string, { tokens: Set<string>; conditions: Set<string>; gammaMarkets: Set<string> }>;
   framesRead: number;
   segmentDeclared: number;
 };
@@ -291,9 +293,11 @@ export async function extractResearchTier(options: ExtractionOptions): Promise<E
       }
       const active = batch as Batch | null;
       if (active === null) throw new Error("unreachable: no extraction batch is open");
-      const names = { tokens: new Set<string>(), conditions: new Set<string>() };
+      const names = { tokens: new Set<string>(), conditions: new Set<string>(), gammaMarkets: new Set<string>() };
       for (const entry of verified.records) {
         const interpretation = active.interpreter.interpret(entry.record);
+        const gammaMarketId = gammaMarketIdOf(entry.record);
+        if (gammaMarketId !== null) names.gammaMarkets.add(gammaMarketId);
         for (const observation of interpretation.observations) {
           if ("tokenId" in observation && observation.tokenId !== null) names.tokens.add(observation.tokenId);
           if ("conditionId" in observation && observation.conditionId !== null) {
@@ -394,7 +398,11 @@ async function writeBatch(options: ExtractionOptions, batch: Batch): Promise<Ext
   }
 
   for (const segment of batch.segments) {
-    const names = batch.tokens.get(segment.segmentId) ?? { tokens: new Set<string>(), conditions: new Set<string>() };
+    const names = batch.tokens.get(segment.segmentId) ?? {
+      tokens: new Set<string>(),
+      conditions: new Set<string>(),
+      gammaMarkets: new Set<string>(),
+    };
     const pointer: ResearchPointer = {
       pointerVersion: RESEARCH_POINTER_VERSION,
       segmentId: segment.segmentId,
@@ -410,6 +418,7 @@ async function writeBatch(options: ExtractionOptions, batch: Batch): Promise<Ext
       maxIngestSeq: segment.maxIngestSeq,
       polymarketTokenIds: [...names.tokens].sort(),
       conditionIds: [...names.conditions].sort(),
+      gammaMarketIds: [...names.gammaMarkets].sort(),
       datasetId,
       manifestObjectKey,
       manifestSha256,

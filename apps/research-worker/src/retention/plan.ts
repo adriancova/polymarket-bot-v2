@@ -99,6 +99,9 @@ async function loadVerifiedPin(objectStore: ObjectStore, record: PinRecord): Pro
 export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly SegmentDecision[]> {
   const knownTokens = new Set(input.windows.flatMap((window) => window.tokenIds));
   const knownConditions = new Set(input.windows.map((window) => window.conditionId));
+  const knownGammaMarkets = new Set(
+    input.windows.map((window) => window.gammaMarketId).filter((id): id is string => id !== null),
+  );
   const researchCache = new Map<string, Promise<VerifiedResearchTierDataset | Error>>();
   const pinCache = new Map<string, Promise<VerifiedPin | Error>>();
 
@@ -194,6 +197,11 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     for (const condition of pointer.conditionIds) {
       if (!knownConditions.has(condition)) {
         reasons.push(`unknown-market: condition ${condition} belongs to no registered window`);
+      }
+    }
+    for (const gammaMarketId of pointer.gammaMarketIds) {
+      if (!knownGammaMarkets.has(gammaMarketId)) {
+        reasons.push(`unknown-market: Gamma market ${gammaMarketId} belongs to no registered window`);
       }
     }
     for (const window of input.windows) {

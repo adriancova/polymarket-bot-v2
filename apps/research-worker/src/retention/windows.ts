@@ -41,14 +41,23 @@ export type MarketWindow = {
   readonly marketId: string;
   readonly conditionId: string;
   readonly tokenIds: readonly string[];
+  /**
+   * The Gamma market id the gateway's lifecycle feed polls for this market,
+   * when it polls one. A segment whose polls name an unregistered Gamma id is
+   * unclassified, as one naming an unregistered token is.
+   */
+  readonly gammaMarketId: string | null;
   readonly windowStartMs: number;
   readonly windowEndMs: number;
   /**
    * The earliest instant a responsible trader could have acted on the market
-   * (its admission, or the market's open for orders). Defaults to the window
-   * start. Until the window is classified, every segment from here (less the
-   * lead-in) to the window's end is held, because a decision in that span
-   * could widen the window's pin (Decision 3.4).
+   * (its admission, or the market's open for orders). Until the window is
+   * classified, every segment from here (less the lead-in) to the window's end
+   * is held, because a decision in that span could widen the window's pin
+   * (Decision 3.4). REQUIRED for a trader-responsible window — a trader can
+   * act before the window opens (H1's trader evaluated each market from about
+   * 14 minutes before its start), so no default would be safe; a gateway-only
+   * window defaults it to the window's start.
    */
   readonly responsibleFromMs: number;
   readonly responsibility: WindowResponsibility;
@@ -121,12 +130,17 @@ export function parseWindowRegistry(value: unknown): readonly MarketWindow[] {
     const windowStartMs = instant(entry["windowStart"], `${where}.windowStart`);
     const windowEndMs = instant(entry["windowEnd"], `${where}.windowEnd`);
     if (windowEndMs <= windowStartMs) throw new WindowRegistryError(`${where} ends before it starts`);
+    const responsibilityRaw = object(entry["responsibility"], `${where}.responsibility`);
+    if (responsibilityRaw["kind"] === "trader" && entry["responsibleFrom"] === undefined) {
+      throw new WindowRegistryError(
+        `${where}.responsibleFrom is required for a trader-responsible window: a trader can act before the window opens`,
+      );
+    }
     const responsibleFromMs =
       entry["responsibleFrom"] === undefined ? windowStartMs : instant(entry["responsibleFrom"], `${where}.responsibleFrom`);
     if (responsibleFromMs > windowStartMs) {
       throw new WindowRegistryError(`${where}.responsibleFrom must not be after windowStart`);
     }
-    const responsibilityRaw = object(entry["responsibility"], `${where}.responsibility`);
     let responsibility: WindowResponsibility;
     if (responsibilityRaw["kind"] === "gateway-only") {
       responsibility = { kind: "gateway-only" };
@@ -146,6 +160,7 @@ export function parseWindowRegistry(value: unknown): readonly MarketWindow[] {
       windowId,
       marketId: text(entry["marketId"], `${where}.marketId`),
       conditionId: text(entry["conditionId"], `${where}.conditionId`),
+      gammaMarketId: entry["gammaMarketId"] === undefined ? null : text(entry["gammaMarketId"], `${where}.gammaMarketId`),
       tokenIds: tokenIds.map((token, tokenIndex) => text(token, `${where}.tokenIds[${String(tokenIndex)}]`)),
       windowStartMs,
       windowEndMs,

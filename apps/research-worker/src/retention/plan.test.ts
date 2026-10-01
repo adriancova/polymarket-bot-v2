@@ -37,6 +37,7 @@ const WINDOW: MarketWindow = {
   windowId: "w1",
   marketId: "m1",
   conditionId: "0xc1",
+  gammaMarketId: "5121169",
   tokenIds: ["tokA"],
   windowStartMs: OLD + 30 * 60 * 1000,
   windowEndMs: OLD + 45 * 60 * 1000,
@@ -189,6 +190,29 @@ describe("classification holds every segment it could overlap (ADR-028 Decision 
     const { inventory } = await threeSegments([{ ingestSeq: "3", atMs: OLD + 36 * 60 * 1000, tokenId: "tokZ", conditionId: "0xcZ" }]);
     const decisions = await decide({ inventory, classifications: await classifyWith(WINDOW, NOW) });
     expect(bySegmentIndex(decisions, 0).reasons).toContainEqual(expect.stringMatching(/^unknown-market: token tokZ/u));
+  });
+
+  it("identifies a Gamma poll by its endpoint: a registered id is known, another is unclassified", async () => {
+    const gammaPoll = (ingestSeq: string, id: string) => ({
+      ingestSeq,
+      receivedAt: new Date(OLD + 37 * 60 * 1000).toISOString(),
+      source: "polymarket",
+      endpoint: `https://gamma-api.polymarket.com/markets/${id}`,
+      // A body naming another condition: the body is never read for identity.
+      payloadUtf8: JSON.stringify({ id, conditionId: "0xNOT-REGISTERED", active: true, closed: false, acceptingOrders: true }),
+    });
+    fixture = await storageFixture({
+      nowMs: NOW,
+      segments: [
+        [tradeFrame({ ingestSeq: "1", atMs: OLD }), gammaPoll("2", "5121169")],
+        [tradeFrame({ ingestSeq: "3", atMs: OLD + 50 * 60 * 1000 }), gammaPoll("4", "999")],
+        [tradeFrame({ ingestSeq: "5", atMs: NOW - HOUR })],
+      ],
+    });
+    const inventory = await fixture.extract();
+    const decisions = await decide({ inventory, classifications: await classifyWith(WINDOW, NOW) });
+    expect(bySegmentIndex(decisions, 0).reasons).toStrictEqual([]);
+    expect(bySegmentIndex(decisions, 1).reasons).toStrictEqual(["unknown-market: Gamma market 999 belongs to no registered window"]);
   });
 
   it("keeps everything Polymarket names when no registry is configured", async () => {

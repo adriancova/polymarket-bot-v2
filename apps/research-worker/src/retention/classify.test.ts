@@ -27,6 +27,7 @@ const WINDOW: MarketWindow = {
   windowId: "w",
   marketId: "m",
   conditionId: "0xc",
+  gammaMarketId: null,
   tokenIds: ["t"],
   windowStartMs: START,
   windowEndMs: END,
@@ -205,10 +206,14 @@ describe("the operator's files", () => {
         },
       ],
     };
-    expect(parseWindowRegistry(valid)[0]).toMatchObject({ windowStartMs: START, responsibleFromMs: START });
-    expect(() => parseWindowRegistry({ ...valid, windows: [{ ...valid.windows[0], windowId: "../escape" }] })).toThrow(/short identifier/u);
+    expect(() => parseWindowRegistry(valid)).toThrow(/responsibleFrom is required for a trader-responsible window/u);
+    const withFrom = { ...valid, windows: [{ ...valid.windows[0], responsibleFrom: "2026-01-01T10:16:00Z" }] };
+    expect(parseWindowRegistry(withFrom)[0]).toMatchObject({ windowStartMs: START, responsibleFromMs: Date.parse("2026-01-01T10:16:00Z") });
+    const gatewayOnly = { ...valid, windows: [{ ...valid.windows[0], responsibility: { kind: "gateway-only" } }] };
+    expect(parseWindowRegistry(gatewayOnly)[0]).toMatchObject({ responsibleFromMs: START });
+    expect(() => parseWindowRegistry({ ...withFrom, windows: [{ ...withFrom.windows[0], windowId: "../escape" }] })).toThrow(/short identifier/u);
     expect(() =>
-      parseWindowRegistry({ ...valid, windows: [{ ...valid.windows[0], windowEnd: "2026-01-01T10:00:00Z" }] }),
+      parseWindowRegistry({ ...withFrom, windows: [{ ...withFrom.windows[0], windowEnd: "2026-01-01T10:00:00Z" }] }),
     ).toThrow(/ends before it starts/u);
     expect(() => parseWindowRegistry({ windowRegistryVersion: 2, windows: [] })).toThrow(/windowRegistryVersion 1/u);
   });

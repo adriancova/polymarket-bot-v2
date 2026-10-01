@@ -49,6 +49,7 @@ const WINDOW: MarketWindow = {
   windowId: "btc-updown-15m-test",
   marketId: "m1",
   conditionId: "0xc1",
+  gammaMarketId: null,
   tokenIds: ["tokA"],
   windowStartMs: OLD + 10 * 60 * 1000,
   windowEndMs: OLD + 25 * 60 * 1000,

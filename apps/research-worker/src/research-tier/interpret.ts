@@ -316,10 +316,21 @@ function interpretPolymarketMarket(payload: string): Interpretation {
   return result("polymarket-market", observations, problems);
 }
 
+/**
+ * The Gamma market id a lifecycle poll names, from the request URL the
+ * gateway recorded as the frame's endpoint — never from the body: the door's
+ * `recorded` scalars are "NOT an authority: nothing in this repository may
+ * derive behaviour from a key it holds" (`market-state/door.ts`).
+ */
+export function gammaMarketIdOf(record: RawFrameRecord): string | null {
+  if (record.source !== "polymarket" || !record.endpoint.startsWith(GAMMA_MARKET_ENDPOINT_PREFIX)) return null;
+  const id = record.endpoint.slice(GAMMA_MARKET_ENDPOINT_PREFIX.length);
+  return /^[0-9A-Za-z_-]{1,64}$/u.test(id) ? id : null;
+}
+
 function interpretGamma(payload: string): Interpretation {
   const verdict = readGammaMarketBody(payload);
   if (verdict.status !== "ok") return result("gamma-invalid", [], [verdict.issues.join("; ")]);
-  const conditionId = verdict.state.recorded["conditionId"];
   return result(
     "gamma-market",
     [
@@ -327,7 +338,9 @@ function interpretGamma(payload: string): Interpretation {
         kind: "pm-lifecycle",
         entryIndex: 0,
         eventType: "gamma-market",
-        conditionId: typeof conditionId === "string" ? conditionId : null,
+        // The poll is identified by its endpoint (kept in the row), not by a
+        // body scalar the door does not interpret.
+        conditionId: null,
         tokenId: null,
         active: verdict.state.active,
         closed: verdict.state.closed,
