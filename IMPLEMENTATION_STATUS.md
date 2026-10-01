@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260`, `WP-300` and `STORAGE-1` are Complete. `THROUGHPUT-1c` and `CI-4` are running; `STORAGE-GOV` (the ADR-028 amendment) follows. Wave 3 continues with `WP-270`; `CO2-N1` must be fixed before it. Then `HOST-BENCH` and the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Next:** `WP-260`, `WP-300` and `STORAGE-1` are Complete. `CI-4` is Complete. `THROUGHPUT-1c` and `STORAGE-GOV` (the ADR-028 amendment) are running. Wave 3 continues with `WP-270`; `CO2-N1` must be fixed before it. Then `HOST-BENCH` and the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -41,7 +41,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
 - `WP-300` is Complete (2026-10-01); see [Work packages](#work-packages).
-- **`CI-4`**: Ready (authorized) 2026-10-01 by the orchestrator, as for `CI-3`. It runs WP-300's wallet-operations contract suite in the root `test:contract` chain and in CI (`WP300-R1-07`). It may edit the protected root `package.json`, but only the `test:contract` value. It may also edit the contract steps in `.github/workflows/ci.yml` and the drift pin `test/unit/tooling/ci-step-split.test.ts`. Verifier: astra.
+- `CI-4` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `STORAGE-1` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`STORAGE-GOV`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: an ADR-028 amendment that records the retention-safety rules `STORAGE-1` implemented and its reviewers accepted, and where it stops short of the ADR (`STORAGE-1` follow_up 1). It may edit only `docs/adr/ADR-028-*.md` and, if needed, the ADR-028 row of `docs/adr/README.md`. It decides nothing new. Verifiers: Opus and gpt-6-astra, reconciled.
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
@@ -163,7 +163,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
 | `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
 | `WP-300` | Collateral inventory and wallet operations | Complete (2026-10-01) | `9cdbf32` | [WP-300](docs/handoffs/WP-300.md) |
-| `CI-4` | run WP-300's wallet-operations contract suite in CI (`WP300-R1-07`) | **Ready (authorized)** 2026-10-01 | — | — |
+| `CI-4` | run WP-300's wallet-operations contract suite in CI (`WP300-R1-07`) | Complete (2026-10-01) | `4628541` | [CI-4](docs/handoffs/CI-4.md) |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | Complete (2026-09-30) | `78ba39b` | [LEAN-GOV](docs/handoffs/LEAN-GOV.md) |
 | `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
