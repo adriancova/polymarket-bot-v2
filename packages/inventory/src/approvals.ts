@@ -18,6 +18,13 @@
  * reports, so readiness takes the required spenders as caller input. The
  * tracker only accepts documented venue contracts as spenders
  * (`venue-facts.ts`).
+ *
+ * CONTESTED APPROVALS (WP300-R5-02). Approvals are kept per wallet operation.
+ * When the operation's outcome is contested the manager SUSPENDS its approval
+ * (readiness treats it as missing); an authoritative answer either DISCARDS
+ * it (no transaction of the operation confirmed) or re-records it, which gives
+ * it a fresh sequence, so readiness again needs a CLOB allowance sync recorded
+ * after it. No earlier sync can re-validate a suspended or restored approval.
  */
 
 import { compositeKey } from "./guards.js";
@@ -46,7 +53,8 @@ export type ReadinessVerdict =
     };
 
 export class ApprovalTracker {
-  readonly #approvals = new Map<string, ConfirmedApproval>();
+  /** walletOperationId → its approval (and whether it is suspended). */
+  readonly #approvals = new Map<string, { readonly key: string; readonly approval: ConfirmedApproval; suspended: boolean }>();
   readonly #collateralSync = new Map<string, number>();
   readonly #conditionalSync = new Map<string, number>();
   #sequence = 0;
@@ -74,8 +82,37 @@ export class ApprovalTracker {
       walletOperationId: input.walletOperationId,
       sequence: this.#sequence,
     });
-    this.#approvals.set(approvalKey(input.accountRef, input.standard, approval.assetId, spender), approval);
+    // Re-recording an operation's approval replaces it (fresh sequence, not suspended).
+    this.#approvals.set(input.walletOperationId, {
+      key: approvalKey(input.accountRef, input.standard, approval.assetId, spender),
+      approval,
+      suspended: false,
+    });
     return ok(approval);
+  }
+
+  /**
+   * The operation's approval is contested: readiness treats it as missing
+   * until it is re-recorded (authoritatively confirmed) or discarded. True if
+   * there was one to suspend.
+   */
+  suspendApproval(walletOperationId: string): boolean {
+    const entry = this.#approvals.get(walletOperationId);
+    if (entry === undefined) return false;
+    entry.suspended = true;
+    return true;
+  }
+
+  /** The operation's approval was authoritatively disproved: forget it. True if there was one. */
+  discardApproval(walletOperationId: string): boolean {
+    return this.#approvals.delete(walletOperationId);
+  }
+
+  /** Whether the operation has a recorded approval, and whether it is suspended. */
+  approvalStatus(walletOperationId: string): "NONE" | "ACTIVE" | "SUSPENDED" {
+    const entry = this.#approvals.get(walletOperationId);
+    if (entry === undefined) return "NONE";
+    return entry.suspended ? "SUSPENDED" : "ACTIVE";
   }
 
   /** Record a CLOB allowance-cache sync reported by the secure adapter. */
@@ -131,7 +168,7 @@ export class ApprovalTracker {
     let latest = 0;
     for (const raw of requiredSpenders) {
       const spender = raw.toLowerCase();
-      const approval = this.#approvals.get(approvalKey(accountRef, standard, assetId, spender));
+      const approval = this.#latestValid(approvalKey(accountRef, standard, assetId, spender));
       if (approval === undefined) missing.push(spender);
       else latest = Math.max(latest, approval.sequence);
     }
@@ -146,6 +183,16 @@ export class ApprovalTracker {
       missingApprovals: Object.freeze(missing),
       clobSyncRequired: !syncOk,
     });
+  }
+
+  /** The most recently recorded approval under this key that is not suspended. */
+  #latestValid(key: string): ConfirmedApproval | undefined {
+    let latest: ConfirmedApproval | undefined;
+    for (const entry of this.#approvals.values()) {
+      if (entry.key !== key || entry.suspended) continue;
+      if (latest === undefined || entry.approval.sequence > latest.sequence) latest = entry.approval;
+    }
+    return latest;
   }
 }
 
