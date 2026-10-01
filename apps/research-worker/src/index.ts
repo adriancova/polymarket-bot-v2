@@ -160,11 +160,16 @@ export {
 } from "./retention/clock-guard.js";
 export {
   DEFAULT_STORAGE_CYCLE_LOCK_TIMEOUT_MS,
+  KERNEL_BOOT_ID_PATH,
+  LEGACY_STORAGE_CYCLE_LOCK_FILE_NAME,
   STORAGE_CYCLE_LOCK_NAME,
   StorageCycleLockError,
   hostBootId,
+  isBootId,
+  nodeStorageCycleLockFileSystem,
   storageCycleLockPath,
   withStorageCycleLock,
+  type StorageCycleLockFileSystem,
   type StorageCycleLockOptions,
 } from "./retention/cycle-lock.js";
 export {
