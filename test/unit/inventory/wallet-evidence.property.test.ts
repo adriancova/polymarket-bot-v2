@@ -131,6 +131,29 @@
  *   like an observation, and the manager then applied it after the executor's
  *   SUBMITTED — concluding, releasing, or readying an approval.)
  *
+ * WP-300c (WP300B-R1-01, WP300B-R1-02, predictable request ids) extends both
+ * again:
+ * - hostile evidence: in the random phase, an answer or an observation is
+ *   sometimes a Proxy that reports the generated values on the FIRST read of
+ *   each field and different ones (another state, hash, relayer id or binding)
+ *   on every later read; and sometimes one of its fields is present but not
+ *   own data (a getter, or an inherited property). The oracle decides on the
+ *   generated values — what each field said first — and reads evidence with a
+ *   field that is not own data as UNRECOGNISED, naming only its own data. It
+ *   asserts that no field was read twice, that no getter ran, and that no such
+ *   answer is ever accepted;
+ * - pre-named ids: a read is sometimes bound to an id the reconciler has not
+ *   received — the operation's own next id (by the documented format), or a
+ *   request still queued — and such a read is sometimes delivered again later
+ *   (a replay). The oracle records every id an answer named before the
+ *   reconciler received it, and asserts that the reconciler never receives
+ *   one (so no replay is ever bound to it), besides the existing rule that an
+ *   answer naming a request never received is never accepted. A read HELD
+ *   BACK is never bound to such an id: one made for a request that does not
+ *   exist yet and first delivered after the reconciler received it cannot be
+ *   told from a read made after receipt (the request contract forbids it; the
+ *   manager's header, "REQUEST IDS", states this limit).
+ *
  * fast-check is not a dependency (no new dependency may be added); the
  * generator is the suite's seeded PRNG, so every failure reproduces from its
  * seed, printed with the trace. Executors and reconcilers are in-memory mocks.
@@ -258,6 +281,88 @@ function classify(raw: Readonly<Record<string, unknown>>): ClaimKind {
   }
 }
 
+/**
+ * WP-300c: how a piece of evidence is handed to the manager. `plain`: an
+ * ordinary object. `proxy`: a Proxy reporting the generated values on the FIRST
+ * read of each field and `later` on every read after it (so a manager reading a
+ * field twice decides on something the oracle never generated). `opaque`: the
+ * generated object with one field present but not own data (a getter that must
+ * never run, or an inherited property); the oracle reads it as unrecognised.
+ */
+type Presentation =
+  | { readonly kind: "plain" }
+  | { readonly kind: "proxy"; readonly later: Readonly<Record<string, unknown>> }
+  | { readonly kind: "opaque"; readonly field: string; readonly how: "getter" | "inherited"; readonly value: unknown };
+
+const PLAIN: Presentation = { kind: "plain" };
+
+interface Presented {
+  readonly evidence: object;
+  /** Per field: how many times the manager read its descriptor, and asked whether it is present. */
+  readonly reads: Record<string, number>;
+  readonly presenceChecks: Record<string, number>;
+  readonly getterCalls: () => number;
+}
+
+function present(generated: Readonly<Record<string, unknown>>, presentation: Presentation): Presented {
+  const reads: Record<string, number> = {};
+  const presenceChecks: Record<string, number> = {};
+  switch (presentation.kind) {
+    case "plain":
+      return { evidence: { ...generated }, reads, presenceChecks, getterCalls: () => 0 };
+    case "proxy": {
+      const proxy = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor(_target, key) {
+            if (typeof key !== "string") return undefined;
+            reads[key] = (reads[key] ?? 0) + 1;
+            const source = reads[key] === 1 ? generated : presentation.later;
+            if (!Object.prototype.hasOwnProperty.call(source, key)) return undefined;
+            return { value: source[key], writable: true, enumerable: true, configurable: true };
+          },
+          has(_target, key) {
+            if (typeof key === "string") presenceChecks[key] = (presenceChecks[key] ?? 0) + 1;
+            return false;
+          },
+        },
+      );
+      return { evidence: proxy, reads, presenceChecks, getterCalls: () => 0 };
+    }
+    case "opaque": {
+      const own: Record<string, unknown> = { ...generated };
+      delete own[presentation.field];
+      if (presentation.how === "inherited") {
+        return {
+          evidence: Object.assign(Object.create({ [presentation.field]: presentation.value }) as object, own),
+          reads,
+          presenceChecks,
+          getterCalls: () => 0,
+        };
+      }
+      let calls = 0;
+      Object.defineProperty(own, presentation.field, {
+        get: () => {
+          calls += 1;
+          return presentation.value;
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      return { evidence: own, reads, presenceChecks, getterCalls: () => calls };
+    }
+  }
+}
+
+/** The id the manager gives operation "op"'s `n`-th reconciliation request (the documented format). */
+const ownRequestIdOf = (n: number): string => `9:wallet-op;2:op;14:reconciliation;${String(String(n).length)}:${String(n)};`;
+
+/** The ordinal of one of operation "op"'s request ids, or null. */
+function ordinalOf(requestId: string): number | null {
+  const match = /^9:wallet-op;2:op;14:reconciliation;\d+:(\d+);$/.exec(requestId);
+  return match === null ? null : Number(match[1]);
+}
+
 class ClaimsOracle {
   readonly claims: Claim[] = [];
   readonly answers: AcceptedAnswer[] = [];
@@ -369,6 +474,26 @@ interface Coverage {
   unissuedWhilePendingOutOfPlanned: number;
   /** ... a terminal answer naming NO request while PLANNED with the executor pending (current: kept). */
   unboundTerminalKeptWhilePlanned: number;
+  /** WP-300c: answers / observations handed over as a Proxy that changes after the first read of each field. */
+  proxyAnswers: number;
+  proxyObservations: number;
+  /** ... answers with a field present but not own data (any field; the requestId; an identity field). */
+  opaqueAnswers: number;
+  opaqueAnswerRequestIds: number;
+  opaqueAnswerIdentityFields: number;
+  /** ... observations with a field present but not own data. */
+  opaqueObservations: number;
+  /** ... such evidence (an answer or an observation) while PLANNED with the executor pending. */
+  opaqueWhilePlannedPending: number;
+  /** ... answers naming the operation's own next id, before the reconciler received it. */
+  preNamedOwnIds: number;
+  /** ... answers naming a request still queued (never received). */
+  preNamedQueuedIds: number;
+  /** ... a pre-named read delivered again; and again after the request counter passed its id. */
+  preNamedReplays: number;
+  preNamedReplaysAfterPassed: number;
+  /** ... an id named before receipt that the request counter passed without issuing it. */
+  namedIdsSkipped: number;
 }
 
 function newCoverage(): Coverage {
@@ -411,6 +536,18 @@ function newCoverage(): Coverage {
     unissuedNonTerminalWhilePlanned: 0,
     unissuedWhilePendingOutOfPlanned: 0,
     unboundTerminalKeptWhilePlanned: 0,
+    proxyAnswers: 0,
+    proxyObservations: 0,
+    opaqueAnswers: 0,
+    opaqueAnswerRequestIds: 0,
+    opaqueAnswerIdentityFields: 0,
+    opaqueObservations: 0,
+    opaqueWhilePlannedPending: 0,
+    preNamedOwnIds: 0,
+    preNamedQueuedIds: 0,
+    preNamedReplays: 0,
+    preNamedReplaysAfterPassed: 0,
+    namedIdsSkipped: 0,
   };
 }
 
@@ -569,6 +706,11 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   /** WP300-R9-01: the claims the oracle predicts are kept while the executor call is pending, in arrival order. */
   const kept: Kept[] = [];
 
+  /** WP-300c: every id an answer named (as own data) before the reconciler received a request with it. */
+  const namedBeforeReceipt = new Set<string>();
+  /** WP-300c: reads bound to such an id (the operation's own format, or a queued request), for replays. */
+  const preNamedReads: PendingAnswer[] = [];
+
   /** WP300-R9-01: a claim kept while the executor was pending, weighed now (out of flight) that the operation went back. */
   function reweigh(item: Kept): void {
     const { claim } = item;
@@ -644,7 +786,46 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     recordClaim("observation", claimKind, hash, id, before);
   }
 
-  function observe(statusChoice: string, hash: string | null, id: string | null, credited: string | null): void {
+  /** WP-300c: a value for a field made opaque that the generated evidence did not carry. */
+  function opaqueValue(field: string): unknown {
+    switch (field) {
+      case "requestId":
+        return latestRequestId() ?? FOREIGN_REQUEST;
+      case "transactionHash":
+        return firstHash;
+      case "transactionId":
+        return firstId ?? IDS[0];
+      case "credited":
+        return "10";
+      case "source":
+        return "AUTHORITATIVE_READ";
+      default:
+        return "FAILED";
+    }
+  }
+
+  /** WP-300c: sometimes a Proxy changing after the first read of each field, sometimes one field not own data. */
+  function choosePresentation(generated: Readonly<Record<string, unknown>>, fields: readonly string[], later: () => Record<string, unknown>): Presentation {
+    const roll = random();
+    if (roll < 0.1) return { kind: "proxy", later: later() };
+    if (roll < 0.18) {
+      const field = pick(random, fields);
+      const value = Object.prototype.hasOwnProperty.call(generated, field) ? generated[field] : opaqueValue(field);
+      return { kind: "opaque", field, how: random() < 0.5 ? "getter" : "inherited", value };
+    }
+    return PLAIN;
+  }
+
+  /** WP300B-R1-01 / R1-02: each field read at most once (and asked about at most once); no getter ran. */
+  function checkReads(presented: Presented, what: string): void {
+    for (const [key, count] of Object.entries(presented.reads)) if (count > 1) fail(`WP300B-R1-01: the ${what}'s ${key} was read ${String(count)} times`);
+    for (const [key, count] of Object.entries(presented.presenceChecks)) {
+      if (count > 1) fail(`WP300B-R1-01: the ${what}'s ${key} was checked for presence ${String(count)} times`);
+    }
+    if (presented.getterCalls() > 0) fail(`WP300B-R1-02: a getter on the ${what} ran`);
+  }
+
+  function observe(statusChoice: string, hash: string | null, id: string | null, credited: string | null, hostile = false): void {
     const before = current();
     const raw: Record<string, unknown> = { status: statusChoice };
     if (statusChoice === "SUBMITTED" || statusChoice === "CONFIRMED" || statusChoice === "FAILED") {
@@ -655,12 +836,32 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       if (id !== null) raw["transactionId"] = id;
     }
     if (credited !== null) raw["credited"] = credited;
-    const claimKind = classify(raw);
-    trace.push(`t${String(t)} [${before.state}] observe ${JSON.stringify(raw)} (${claimKind})`);
-    manager.observe("op", raw);
+    const presentation = hostile
+      ? choosePresentation(raw, ["status", "transactionHash", "transactionHash", "transactionId", "credited"], () => ({
+          status: statusChoice === "FAILED" ? "CONFIRMED" : "FAILED",
+          transactionHash: hash === firstHash ? otherHash : firstHash,
+          transactionId: id === null ? (firstId ?? IDS[0]) : null,
+          credited: "12",
+        }))
+      : PLAIN;
+    // WP300B-R1-02: a field that is not own data makes the observation unrecognised; it names only its own data.
+    const opaque = presentation.kind === "opaque" ? presentation.field : null;
+    const ownHash = opaque === "transactionHash" ? null : hash;
+    const ownId = opaque === "transactionId" ? null : id;
+    const claimKind = opaque === null ? classify(raw) : "UNRECOGNISED";
+    if (presentation.kind === "proxy") coverage.proxyObservations += 1;
+    if (opaque !== null) {
+      coverage.opaqueObservations += 1;
+      if (before.state === "PLANNED" && executorPending) coverage.opaqueWhilePlannedPending += 1;
+    }
+    const shown = presentation.kind === "plain" ? "" : presentation.kind === "proxy" ? " as a changing Proxy" : ` with ${presentation.field} ${presentation.how}`;
+    trace.push(`t${String(t)} [${before.state}] observe ${JSON.stringify(raw)}${shown} (${claimKind})`);
+    const presented = present(raw, presentation);
+    manager.observe("op", presented.evidence);
+    checkReads(presented, "observation");
     const after = current();
-    settleClaim(claimKind, hash, id, credited, before, after);
-    for (const value of [hash, id]) {
+    settleClaim(claimKind, ownHash, ownId, opaque === null ? credited : null, before, after);
+    for (const value of [ownHash, ownId]) {
       if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
         fail(`identifier ${value} named by an observation is not in the identity set`);
       }
@@ -676,20 +877,56 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   }
 
   /** Deliver an answer. Accepted: stamped at its READ time. Refused: a claim at delivery (WP300-R7-X1). */
-  function deliver(pending: PendingAnswer): boolean {
-    const { state, hash, id, source, requestId, readAt } = pending;
+  function deliver(pending: PendingAnswer, hostile = false): boolean {
+    const { state, source, readAt } = pending;
     const before = current();
-    const evidence: Record<string, unknown> = { source, state, transactionHash: hash, transactionId: id };
-    if (requestId !== null) evidence["requestId"] = requestId;
+    const evidence: Record<string, unknown> = { source, state, transactionHash: pending.hash, transactionId: pending.id };
+    if (pending.requestId !== null) evidence["requestId"] = pending.requestId;
+    // WP-300c: sometimes a Proxy changing after the first read of each field, sometimes a field not own data.
+    const presentation = hostile
+      ? choosePresentation(evidence, ["requestId", "requestId", "transactionHash", "transactionId", "state", "source", "credited"], () => ({
+          source: "AUTHORITATIVE_READ",
+          state: state === "FAILED" ? "CONFIRMED" : "FAILED",
+          transactionHash: pending.hash === firstHash ? otherHash : firstHash,
+          transactionId: pending.id === null ? (firstId ?? IDS[0]) : null,
+          ...(pending.requestId === null ? { requestId: latestRequestId() ?? FOREIGN_REQUEST } : {}),
+          credited: "12",
+        }))
+      : PLAIN;
+    // WP300B-R1-02: an answer with a field that is not own data is unrecognised (never accepted, never current);
+    // it names only its own data — its requestId included.
+    const opaque = presentation.kind === "opaque" ? presentation.field : null;
+    const hash = opaque === "transactionHash" ? null : pending.hash;
+    const id = opaque === "transactionId" ? null : pending.id;
+    const requestId = opaque === "requestId" ? null : pending.requestId;
     // WP300-R10-01: decided, before delivery, from what the reconciler actually received for this
     // operation (the only one).
     const issuedBefore = reconciler.requests.map((request) => request.requestId);
     const unissued = requestId !== null && !issuedBefore.includes(requestId);
-    const result = manager.resolveByReconciliation("op", evidence);
+    // WP-300c: an id named before the reconciler received it must never be issued (checked after every step).
+    if (unissued) {
+      namedBeforeReceipt.add(requestId);
+      const queuedNow = manager.outstandingReconciliationRequests().some((request) => request.requestId === requestId);
+      if (queuedNow) coverage.preNamedQueuedIds += 1;
+      else if (ordinalOf(requestId) !== null) coverage.preNamedOwnIds += 1;
+      if ((queuedNow || ordinalOf(requestId) !== null) && !preNamedReads.includes(pending)) preNamedReads.push(pending);
+    }
+    if (presentation.kind === "proxy") coverage.proxyAnswers += 1;
+    if (opaque !== null) {
+      coverage.opaqueAnswers += 1;
+      if (opaque === "requestId") coverage.opaqueAnswerRequestIds += 1;
+      if (opaque === "transactionHash" || opaque === "transactionId") coverage.opaqueAnswerIdentityFields += 1;
+      if (before.state === "PLANNED" && executorPending) coverage.opaqueWhilePlannedPending += 1;
+    }
+    const presented = present(evidence, presentation);
+    const result = manager.resolveByReconciliation("op", presented.evidence);
+    checkReads(presented, "answer");
+    if (opaque !== null && result.ok) fail(`WP300B-R1-02: an answer whose ${opaque} is not own data was accepted`);
     const olderRequest = requestId !== null && requestId !== latestRequestId();
     const foreign = requestId === FOREIGN_REQUEST;
+    const shown = presentation.kind === "plain" ? "" : presentation.kind === "proxy" ? " as a changing Proxy" : ` with ${presentation.field} ${presentation.how}`;
     trace.push(
-      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""}${executorPending ? ",pending" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) read t${String(readAt)} for ${requestId === null ? "no request" : foreign ? "a foreign request" : unissued ? `a request never issued (${requestId})` : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
+      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""}${executorPending ? ",pending" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(pending.hash)},${String(pending.id)})${shown} read t${String(readAt)} for ${requestId === null ? "no request" : foreign ? "a foreign request" : unissued ? `a request never issued (${requestId})` : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
     );
     if (foreign) {
       coverage.unknownRequestAnswers += 1;
@@ -697,7 +934,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
     if (readAt < t) coverage.delayedDeliveries += 1;
     const named = keysOf(hash, id);
-    const claimKind = classify({ status: state, transactionHash: hash, transactionId: id });
+    const claimKind = opaque === null ? classify({ status: state, transactionHash: hash, transactionId: id }) : "UNRECOGNISED";
     const terminalClaim = claimKind === "CONFIRMED" || claimKind === "FAILED";
     if (unissued && executorPending) {
       if (before.state === "PLANNED") {
@@ -735,6 +972,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     // claim — unless it repeats, for every identifier it names, the latest accepted
     // outcome for an identifier that is still resolved (no new fact).
     const repeat =
+      opaque === null &&
       source === "AUTHORITATIVE_READ" &&
       (state === "FAILED" || (state === "CONFIRMED" && hash !== null)) &&
       named.length > 0 &&
@@ -822,6 +1060,10 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     if (after.submitting !== executorPending) fail(`the view says submitting=${String(after.submitting)}`);
     if (executorPending && (after.state === "SUBMITTED" || after.state === "MINED")) fail("in flight while the executor call is pending");
     if (executorPending && after.bufferedObservations !== kept.length) fail(`R9: ${String(after.bufferedObservations)} kept, the oracle predicts ${String(kept.length)}`);
+    // WP-300c: no request the reconciler receives carries an id an answer named before it was received.
+    for (const request of reconciler.requests) {
+      if (namedBeforeReceipt.has(request.requestId)) fail(`predictable ids: the reconciler received ${request.requestId}, which an answer named before`);
+    }
     if (!viaAnswer && IN_FLIGHT.has(before.state) && after.state === "CONFIRMED") oracle.validations.push(t);
     // The identity set only grows.
     if (before.transactionHashes.some((h, i) => after.transactionHashes[i] !== h)) fail("the hash set shrank or reordered");
@@ -1042,8 +1284,31 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     return { state, hash, id, source: random() < 0.94 ? "AUTHORITATIVE_READ" : "HEARSAY" };
   }
 
-  /** The request a read is made for: usually the latest delivered one, sometimes an older one, sometimes none named. */
-  function requestFor(): string | null {
+  /**
+   * WP-300c: an id the reconciler has not received: "op"'s own next id (one or
+   * two ahead of every id seen), or a request still queued.
+   */
+  function preNamedId(): string {
+    const queued = manager
+      .outstandingReconciliationRequests()
+      .filter((request) => request.walletOperationId === "op")
+      .map((request) => request.requestId);
+    if (queued.length > 0 && random() < 0.5) return pick(random, queued);
+    const seen = [...reconciler.requests.map((request) => request.requestId), ...queued]
+      .map(ordinalOf)
+      .filter((n): n is number => n !== null);
+    return ownRequestIdOf(Math.max(0, ...seen) + (random() < 0.7 ? 1 : 2));
+  }
+
+  /**
+   * The request a read is made for: usually the latest delivered one, sometimes an older one, sometimes none named.
+   * `preNamed` (a read delivered at once): sometimes an id the reconciler has not received (WP-300c). A read
+   * held back is never bound to one: a read made for a request that does not exist yet, delivered after the
+   * reconciler received it, cannot be told from a read made after receipt (the request contract forbids it;
+   * the header's REQUEST IDS covers what the manager can see — an id named in an answer it receives first).
+   */
+  function requestFor(preNamed = false): string | null {
+    if (preNamed && random() < 0.07) return preNamedId(); // WP-300c: a predictable id, named before it is received
     const roll = random();
     // WP300-R10-01: while the executor call is pending, often a request never issued for the operation.
     if (executorPending && roll < 0.3) return pick(random, UNISSUED_REQUESTS);
@@ -1055,6 +1320,17 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
 
   const steps = 12 + Math.floor(random() * 28);
   for (let i = 0; i < steps; i += 1) {
+    if (preNamedReads.length > 0 && random() < 0.08) {
+      // WP-300c: a replay of a read bound to an id named before the reconciler received it.
+      const replay = pick(random, preNamedReads);
+      const ordinal = replay.requestId === null ? null : ordinalOf(replay.requestId);
+      const passed = ordinal !== null && reconciler.requests.some((request) => (ordinalOf(request.requestId) ?? 0) > ordinal);
+      coverage.preNamedReplays += 1;
+      if (passed) coverage.preNamedReplaysAfterPassed += 1;
+      trace.push(`t${String(t + 1)} replay of the read made at t${String(replay.readAt)} for ${String(replay.requestId)}`);
+      await step(() => deliver(replay));
+      continue;
+    }
     const view = current();
     const roll = random();
     if (executorPending && roll < 0.14) {
@@ -1068,12 +1344,12 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       const hash = chooseValue(random, view.transactionHashes, HASHES);
       const id = chooseValue(random, view.transactionIds, IDS);
       const credited = status === "CONFIRMED" && kind === "WRAP_COLLATERAL" ? pick(random, ["10", "10", "12"]) : null;
-      await step(() => observe(status, hash, id, credited));
+      await step(() => observe(status, hash, id, credited, true));
     } else if (roll < 0.66) {
       // Read and delivered at once.
       const { state, hash, id, source } = choose();
-      const requestId = requestFor();
-      await step(() => deliver(read(state, hash, id, source, requestId)));
+      const requestId = requestFor(true);
+      await step(() => deliver(read(state, hash, id, source, requestId), true));
     } else if (roll < 0.76 && reconciler.requests.length > 0) {
       // A read, delivered later (WP300-R7-X3).
       const { state, hash, id, source } = choose();
@@ -1087,7 +1363,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       const index = Math.floor(random() * pendingAnswers.length);
       const [pending] = pendingAnswers.splice(index, 1);
       if (pending === undefined) fail("no pending answer");
-      await step(() => deliver(pending as PendingAnswer));
+      await step(() => deliver(pending as PendingAnswer, true));
     } else if (roll < 0.95 && isApproval) {
       await step(sync);
     } else {
@@ -1142,6 +1418,12 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   }
   const final = current();
   if (final.state !== "CONFIRMED" && final.state !== "FAILED") fail(`liveness: the operation did not conclude (${final.state})`);
+  // WP-300c: the request counter passed an id an answer had named, without ever issuing it.
+  const received = reconciler.requests.map((request) => ordinalOf(request.requestId) ?? 0);
+  for (const id of namedBeforeReceipt) {
+    const ordinal = ordinalOf(id);
+    if (ordinal !== null && received.some((n) => n > ordinal)) coverage.namedIdsSkipped += 1;
+  }
   if (final.quarantined || final.unresolvedTransactions.length > 0) fail("liveness: a quarantine remains after every identifier was answered");
 }
 

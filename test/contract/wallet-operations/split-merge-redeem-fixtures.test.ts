@@ -19,14 +19,17 @@
  * - the neg-risk conversion is recorded, not modelled (ADR-009 §7): no such
  *   operation type exists.
  *
- * OFFLINE: a tripwire replaces `fetch` for every test and fails if it is used.
+ * OFFLINE: the suite's setup file (`network-tripwire.setup.ts`, WP300B-R1-04)
+ * replaces `fetch` before this module loads and fails each test, and the file,
+ * if it is used (module load included). The first test below pins that the
+ * `fetch` this module saw at load is that tripwire.
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { divDecimalExact } from "../../../packages/decimal/src/index.js";
 import {
@@ -40,6 +43,9 @@ import {
   type VenueContractRole,
   type WalletOperationSubmission,
 } from "../../../packages/inventory/src/index.js";
+
+/** `fetch` as this module saw it while loading: the setup file's tripwire, installed before (WP300B-R1-04). */
+const fetchAtModuleLoad: unknown = globalThis.fetch;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, "../../fixtures/venue/positions/split-merge-redeem.json");
@@ -75,19 +81,13 @@ const PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 const YES = "fixture-yes-token";
 const NO = "fixture-no-token";
 
-let originalFetch: typeof globalThis.fetch;
-let fetchCalls = 0;
-beforeEach(() => {
-  originalFetch = globalThis.fetch;
-  fetchCalls = 0;
-  globalThis.fetch = (() => {
-    fetchCalls += 1;
-    throw new Error("network tripwire: the wallet-operations contract suite is offline");
-  }) as typeof globalThis.fetch;
-});
-afterEach(() => {
-  globalThis.fetch = originalFetch;
-  expect(fetchCalls).toBe(0);
+describe("offline", () => {
+  it("the network tripwire was installed before this module loaded (module-level code is covered)", () => {
+    const mark = Symbol.for("polymarket-bot.contract.wallet-operations.network-tripwire");
+    expect(typeof fetchAtModuleLoad).toBe("function");
+    expect(Reflect.get(fetchAtModuleLoad as object, mark)).toBe(true);
+    expect(globalThis.fetch).toBe(fetchAtModuleLoad);
+  });
 });
 
 function harness(conditionId: string, balances: Readonly<Record<string, string>>, outcome: Record<string, unknown>) {

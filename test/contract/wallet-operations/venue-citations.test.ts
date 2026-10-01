@@ -4,17 +4,19 @@
  * report changes an address or a fact, this suite is where the drift shows.
  * Offline: reads repository files only.
  *
- * OFFLINE, enforced: a tripwire replaces `fetch` for every test, throws if it
- * is called, and each test fails unless it was called 0 times (the same
- * tripwire as `split-merge-redeem-fixtures.test.ts`; CI-4's "no network" step
- * name rests on both files — WP-300b).
+ * OFFLINE, enforced: the suite's setup file (`network-tripwire.setup.ts`,
+ * WP300B-R1-04) replaces `fetch` BEFORE this module loads, throws if it is
+ * called, and fails each test, and the file, unless it was called 0 times
+ * since module load. The first test below pins that the `fetch` this module
+ * saw at load is that tripwire. CI-4's "no network" step name rests on both
+ * files of the suite (WP-300b, WP-300c).
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   APPROVAL_SPENDER_ROLES,
@@ -22,6 +24,9 @@ import {
   PUSD_DECIMALS,
   VENUE_FACTS_SOURCE,
 } from "../../../packages/inventory/src/index.js";
+
+/** `fetch` as this module saw it while loading: the setup file's tripwire, installed before (WP300B-R1-04). */
+const fetchAtModuleLoad: unknown = globalThis.fetch;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "../../..");
@@ -31,19 +36,13 @@ const baseline = readFileSync(resolve(repo, VENUE_FACTS_SOURCE.baseline), "utf8"
 const reportText = report.replace(/\s+/g, " ");
 const baselineText = baseline.replace(/\s+/g, " ");
 
-let originalFetch: typeof globalThis.fetch;
-let fetchCalls = 0;
-beforeEach(() => {
-  originalFetch = globalThis.fetch;
-  fetchCalls = 0;
-  globalThis.fetch = (() => {
-    fetchCalls += 1;
-    throw new Error("network tripwire: the wallet-operations contract suite is offline");
-  }) as typeof globalThis.fetch;
-});
-afterEach(() => {
-  globalThis.fetch = originalFetch;
-  expect(fetchCalls).toBe(0);
+describe("offline", () => {
+  it("the network tripwire was installed before this module loaded (module-level code is covered)", () => {
+    const mark = Symbol.for("polymarket-bot.contract.wallet-operations.network-tripwire");
+    expect(typeof fetchAtModuleLoad).toBe("function");
+    expect(Reflect.get(fetchAtModuleLoad as object, mark)).toBe(true);
+    expect(globalThis.fetch).toBe(fetchAtModuleLoad);
+  });
 });
 
 describe("documented venue contracts", () => {
