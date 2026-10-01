@@ -44,7 +44,7 @@ The implementer ran these, and the verifier repeated them:
 - None.
 
 ## known_risks
-- Only one of the suite's two files enforces "no network" with a fetch tripwire.
+- Only one of the suite's two files enforced "no network" with a fetch tripwire. Closed by `WP-300b` (`05535ae`).
 
 ## follow_up
 - Optionally, add the same fetch tripwire to `venue-citations.test.ts`, in an inventory or contract-test round.

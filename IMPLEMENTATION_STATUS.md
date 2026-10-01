@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260`, `WP-300`, `STORAGE-1`, `CI-4` and `STORAGE-GOV` are Complete. `THROUGHPUT-1c` is accepted and waits only for the user's ADR-023 ratification. `STORAGE-1b` is Complete; `WP-300b` and `CONTROL-1` are running. After `THROUGHPUT-1c` merges: `PROVENANCE-1` (it blocks `BURN-IN`), `CO2-N1` then `WP-270`, `CADENCE-1`, `ROLLOVER-1`, `REFDIET`, `APPROX-REPLAY-1`. `HOST-BENCH` is run by the laptop agent ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Next:** `WP-260`, `WP-300`, `STORAGE-1`, `CI-4` and `STORAGE-GOV` are Complete. `THROUGHPUT-1c` is accepted and waits only for the user's ADR-023 ratification. `STORAGE-1b` and `WP-300b` are Complete; `CONTROL-1` and `STORAGE-GOV2` are running. After `THROUGHPUT-1c` merges: `PROVENANCE-1` (it blocks `BURN-IN`), `CO2-N1` then `WP-270`, `CADENCE-1`, `ROLLOVER-1`, `REFDIET`, `APPROX-REPLAY-1`. `HOST-BENCH` is run by the laptop agent ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -45,7 +45,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `STORAGE-1` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `STORAGE-GOV` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `STORAGE-1b` is Complete (2026-10-01); see [Work packages](#work-packages).
-- **`WP-300b`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `WP300-R10-01` and adds the fetch tripwire to `venue-citations.test.ts` (`CI-4` follow-up). Paths: `packages/inventory/**` (not its `package.json`), `test/unit/inventory/**`, `test/contract/wallet-operations/**`. Verifiers: Opus and gpt-6-astra, reconciled (collateral reservations).
+- `WP-300b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`CONTROL-1`**: Ready (authorized) 2026-10-01 by the orchestrator, under the Wave 3 authorization. It closes `CO2-N8`: `WP-240`'s M-1 (pausing an unknown instance) and M-3 (audit-log exhaustion can disable the kill switch), plus `WP-240`'s owned LOWs L-1..L-6, L-8, L-9 and N-4. Paths: `apps/control-api/**`, `test/integration/control-api/**`, `test/unit/control-api/**`. Verifiers: Opus and gpt-6-astra, reconciled (the kill switch). `CADENCE-1` also owns `apps/control-api/src/**`, so it starts only after `CONTROL-1` merges.
 - **`STORAGE-GOV2`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: dated corrections to ADR-028 Amendment 1 (rule 3, after `STORAGE-1b`; rule 1 item 6, `S-GOV-R3-01`) and ADR-029's stale "not yet implemented" header and README row. Verifiers: Opus and gpt-6-astra, reconciled.
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
@@ -174,7 +174,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | Complete (2026-10-01) | `a22502b` | [STORAGE-1](docs/handoffs/STORAGE-1.md) |
 | `STORAGE-GOV` | ADR-028 amendment: the retention-safety rules as implemented | Complete (2026-10-01) | `1f75ac0` | [STORAGE-GOV](docs/handoffs/STORAGE-GOV.md) |
 | `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Complete (2026-10-01) | `7b6499e` | [STORAGE-1b](docs/handoffs/STORAGE-1b.md) |
-| `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | **Ready (authorized)** 2026-10-01 | — | — |
+| `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | **Ready (authorized)** 2026-10-01 | — | — |
 | `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | **Ready (authorized)** 2026-10-01 | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
@@ -207,7 +207,7 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | --- | --- | --- |
 | `DURABLE1-LOWS` | LOW-3: in group mode a decision and its checkpoint can commit in separate transactions (no production `restoreFrom` caller yet). LOW-6: the commit cost on placement-heavy bursts is unmeasured. R2-LOW-7: a CANCEL from a later decision can wait on an earlier decision's placement write. | the first production `restoreFrom` round; a throughput round |
 | `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 twice: PR #29 attempt 1 and PR #39 attempt 1 (run `36881820439`). TP1B-R1-L5 flagged it. | a data-gateway test round |
-| `WP300-R10-01` | A terminal reconciliation answer bound to a request never issued for the operation, arriving while the executor call is pending, is buffered and applied after SUBMITTED. The package header says it is refused. LOW: the observe() control behaves the same way. | an inventory round, or the first `WP-290` grant |
+| `WP300B-LOWS` | `WP-300b`'s four open LOWs (WP300B-R1-01..04: a double read of evidence `state` under a Proxy; a getter `requestId` read as none; refusal-code doc precision; tripwires do not cover module load) and predictable request ids. | an optional inventory round, or the first `WP-290` grant |
 | `WP300-PERSIST` | WP-300's identity sets, kept observations, quarantines and request map are in memory only; no journal rebuild exists. Needed before restart-safe composition. | `WP-290` or the composition round |
 | `STORAGE1-MAXBYTES` | ADR-028 D5's `maxTotalBytes` hard stop is reported, not enforced. The WAL writer's capacity counter is not relieved by expiry (`J10`). | a data-gateway round, after `THROUGHPUT-1c` |
 | `STORAGE1-PIN-VOLUME` | Pins project to about 3.4 GB/day at H1's intent rate, above the 3 GB/day alarm. Overlapping pins store segments twice, and the codec is SNAPPY, not ZSTD. | a pin-storage ruling or round |
