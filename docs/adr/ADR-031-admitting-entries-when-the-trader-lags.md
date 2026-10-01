@@ -40,9 +40,9 @@ lifted and before `WP-270`". `CLOSEOUT-2` (N1) adds two points:
   depend on feed activity does not help when the book and the evaluation are
   both old.
 
-### 1.2 Three instants
+### 1.2 Terms
 
-This ADR uses three terms throughout.
+This ADR uses these terms throughout.
 
 - **Event instant** (`eventNow`): the `receivedAt` of the event an evaluation
   runs on. §7.1 calls it "wall-clock". The gateway stamps it from its own
@@ -51,6 +51,16 @@ This ADR uses three terms throughout.
   (§12.1) at admission.
 - **Lag:** `max(0, processNow − eventNow)`, in milliseconds. A process clock
   behind the event instant reads as lag 0.
+- **Entry** and **exit:** risk's disposition, not the strategy's label.
+  `buildIntentView` (`packages/risk/src/intent-view.ts`) derives it from the
+  intent's shape and the supplied portfolio, which the loop builds per
+  instance (`CoreLoop.#positionsFor`):
+  - any BUY leg makes an `ENTRY`, and so does every `QUOTE` and `BASKET`;
+  - a `REDUCE_POSITION` is an `EXIT`, and so is a `POSITION` that sells no
+    more than the instance holds;
+  - a `CANCEL` is neither.
+
+  Section 2(a) gives the consequences for this ADR.
 
 ### 1.3 Where admission reads time
 
@@ -113,8 +123,8 @@ yet.
   `#processEvent`). So a paper fill is priced against the old book.
 - `TransportLagSampler` (`apps/trader/src/transport-lag.ts`) measures this lag
   as `eventTimeLagMs`, for the health surface only.
-- H1 runs 2-8 show the lag is real. The maximum event-time lag per run was
-  between 18 s and 153 s. The peak backlog was 93,084 of 100,000 retained
+- H1 runs 2-8 show the lag is real. The maximum in-window event-time lag per
+  run was between 18 s and 153 s. The peak backlog was 93,084 of 100,000 retained
   events (run 8; `docs/handoffs/H1-RUNS-2-8.md`).
 - Runs 7 and 8 each produced one live entry intent. The settlement veto refused
   both.
@@ -135,7 +145,7 @@ repository. The implementation round turns it into a test (section 7, T1).
 
 ### 1.6 Why nothing catches it today
 
-- **The settlement veto.** §9.8 check 6 refuses every live entry,
+- **The settlement veto.** §9.8 check 6 refuses every live `ENTRY`,
   `RISK_SETTLEMENT_UNVERIFIED`. No reviewed `btc-15m-updown` settlement spec
   exists (`CLOSEOUT-2` N2). The fixture's readiness permits activation, which
   is why the probe reaches a fill.
@@ -218,15 +228,31 @@ ADR-026, and what it changes in the code, the tests and the goldens.
 
 ### (a) An entry guard on the process clock
 
-**The rule.** At admission, the loop reads its `Clock` port once and refuses an
-ENTRY when either holds:
+**The rule.** At admission, the loop reads its `Clock` port once per placement
+and refuses an `ENTRY` when either holds:
 
 1. **lag criterion:** the lag exceeds a bound;
 2. **close criterion:** the process instant is inside the entry cutoff, that is,
    the whole seconds from `max(eventNow, processNow)` to the configured close
    are at most `entryCutoffSeconds`.
 
-Exits and cancels are not judged by the guard.
+**Which intents it judges.** The guard follows risk's disposition (1.2), not
+the strategy's label:
+
+- an `EXIT` and a `CANCEL` are not judged. Static Bracket's direct-leg exits,
+  the only exits it can emit today, are covered SELLs, so `EXIT`s;
+- an exit shaped as a BUY is an `ENTRY`, so the guard judges it. Static
+  Bracket closes a complement-leg bracket that way (`legPosture`,
+  `exitSide: "BUY"`). Every entry check already applies to it today, the
+  settlement veto included;
+- a covered SELL that opens exposure is an `EXIT`, so the guard does not judge
+  it. Static Bracket's complement-leg entry is one (`chooseLeg`,
+  `side: "SELL"`). Checks 6, 7's features row and 20 already pass it today;
+- neither shape is reachable today. Positions are per instance, and a Static
+  Bracket instance buys only its direction token, so it never holds its
+  complement. The example configuration is `DIRECT_ONLY`
+  (`infra/compose/trader/trader.config.example.json`). Both shapes belong to
+  the `RISK-2 item 7` residual, which this ADR does not change.
 
 **Where it can live.** The loop measures; `packages/risk` classifies. Two
 placements are possible:
@@ -235,8 +261,9 @@ placements are possible:
   feature snapshot's age at the process instant. Today that field is the
   constant 0, so check 7's features row can never fire. The loop supplies
   `secondsToClose` measured from `max(eventNow, processNow)`. Both rows already
-  apply to entries only. No new reason code, policy field or risk change is
-  needed. The bound is `freshness.featuresMaxAgeMs`, 2,000 ms in
+  apply to `ENTRY`s only (`isEntry` in `evaluateIntentInner`). No new reason
+  code, policy field or risk change is needed. The bound is
+  `freshness.featuresMaxAgeMs`, 2,000 ms in
   `infra/compose/trader/trader.config.example.json`;
 - **through a dedicated measurement.** A new freshness feed, a new policy
   bound and a new reason code in `packages/risk`. The signal is more specific
@@ -251,19 +278,32 @@ clamps to 0 and nothing changes either.
 
 A live run is not reproduced by replay when the guard refused in live. The
 divergence has one direction: live refuses what replay admits, never the
-reverse. The refusal's detail carries the lag, so the divergence is
-attributable.
+reverse. What the loop keeps of a refusal is its codes:
+`CoreLoop.#routeIntent` passes only those to `HealthState.countRiskRefusal`,
+and risk's `ageMs` and `limitMs` detail is dropped.
+
+- A `RISK_FEATURES_STALE` count is attributable to lag. Under (a), that row's
+  only input is the lag: the field is the constant 0 today.
+- A close-criterion refusal is not attributable. It shares
+  `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` with an ordinary event-time cutoff
+  refusal (Q1).
 
 **Live behaviour.**
 
 - A trader behind by more than the bound refuses every entry until it catches
   up. Nothing latches: the first entry routed below the bound is judged as
   today.
-- A restarted trader resumes from its checkpoint, behind the stream's head
-  (ADR-003 §3.4). It refuses entries until it has caught up.
+- After a restart, `BOOT-1` requires a new run: a run that holds decisions is
+  refused, `TRADER_REGISTRATION_RUN_NOT_RESUMABLE` (`verifyRegisteredRows`).
+  The stream consumer is resumed, though. `apps/trader/src/main.ts` subscribes
+  with no `start`, so the consumer resumes its stored position
+  (`SubscribeOptions.start`, default `stored-checkpoint`; ADR-003 §3.4).
+  That position is behind the head if events arrived while it was down. The
+  new run refuses entries while its lag exceeds the bound or the close
+  criterion applies. A restart that meets no backlog refuses nothing extra.
 - Inside the bound, the close criterion refuses an entry whose process instant
   is inside the cutoff, even when its event instant is not.
-- Exits and cancels behave as today.
+- `EXIT`s and `CANCEL`s behave as today.
 - Every event is still applied and evaluated, and every decision is still
   persisted (§6 invariant 3, §8.3).
 
@@ -271,10 +311,17 @@ attributable.
 
 - **Fail-closed by construction.** Both criteria only add refusals; the
   process clock can never admit what event time refuses.
-- **Coarse, not exact.** The book row and the lag row are judged separately.
-  An entry is admitted with a book up to `venueBookMaxAgeMs` old in event time,
-  at a lag up to the bound. At the process instant, that book can be up to the
-  sum of the two bounds old: 4,000 ms with the example's values.
+- **Coarse, not exact.** Each age is judged in event time, and the lag
+  separately. So at the process instant, an admitted entry can carry:
+  - a book up to `venueBookMaxAgeMs` plus the bound old: 4,000 ms with the
+    example's values (2,000 ms each);
+  - a reference price up to `referenceFeedMaxAgeMs` plus the bound old:
+    7,000 ms with the example's values (5,000 ms and 2,000 ms);
+  - an intent deadline (`validUntil`, `RISK_INTENT_EXPIRED`) already passed by
+    up to the bound. R6 keeps `evaluatedAt`, which that check reads, on event
+    time.
+
+  Option (b-entry) removes the first two.
 - **Two hosts, gateway clock ahead by S.** The lag reads S low. Up to S of real
   lag is invisible to the lag criterion. The close criterion is still safe,
   because it takes the later instant.
@@ -357,6 +404,70 @@ reading of `bookConfirmedAt` on the 1c branch.
 `loop.ts`; the second confirmation reading; new exit cases; the same test
 migrations as (a); no golden change expected.
 
+### (b-entry) Ages at the later instant, for entries only
+
+**The rule.** Option (a), and in addition an `ENTRY`'s `venueBookAgeMs` and
+`referenceFeedAgeMs` are measured from `max(eventNow, processNow)`. An
+`EXIT`'s and a `CANCEL`'s inputs stay on event time, as today. This is (b)'s
+entry half without its exit half.
+
+**Determinism.** As in (a): the lag is 0 in a backtest, so nothing changes.
+Live and replay verdicts differ whenever a live entry's age crossed a bound
+because of lag.
+
+**Live behaviour.** Exact for entries. At the process instant, an admitted
+entry's book is at most `venueBookMaxAgeMs` old and its reference price at
+most `referenceFeedMaxAgeMs`. That removes the additive allowance of (a)'s
+"Coarse, not exact". It refuses every entry (a) refuses, and more. `EXIT`s
+and `CANCEL`s behave as today.
+
+**Failure shape.**
+
+- Fail-closed, as (a): it only adds refusals.
+- Every normal lag, even milliseconds, is added to an entry's book and
+  reference ages. So a book near its bound turns stale slightly sooner. The
+  skew cases of (a) apply to those ages too.
+- The intent deadline is still judged in event time. Moving an entry's
+  `evaluatedAt` to the later instant would close that gap too. But risk writes
+  `evaluatedAt` into the approved-intent record's `approvedAt`, so a live
+  record would then carry the process instant under lag.
+
+**The classification it needs.** The loop must know an intent's disposition
+before it measures, and risk derives it. There are three ways:
+
+- call `buildIntentView`, which `packages/risk/src/index.ts` exports, on the
+  risk input's intent and portfolio. That needs no risk change, but the
+  disposition is then derived twice per placement: by the loop, and again
+  inside `evaluateIntentInner`;
+- duplicate the rule in the loop. `allocation.ts` already mirrors
+  `buildIntentView`'s legs, held together by tests. A test would have to hold
+  the two dispositions together too;
+- pass both measurements to risk and let risk choose by disposition. That
+  changes risk's input schema, which (a) leaves alone.
+
+The rule is easy to get wrong: an exit shaped as a BUY is an `ENTRY`, and a
+covered SELL is an `EXIT` (2(a)).
+
+**ADR-023 D7.** As (b): under `CONNECTION_CONFIRMED`, an entry's book age at
+the process instant would count D7's shift a second time. So risk's book age
+must start from the unshifted confirmation, which needs a second reading of
+`bookConfirmedAt` on the 1c branch. The reference age has no ADR-023
+interaction.
+
+**ADR-026.** As in (a).
+
+**Code, tests and goldens.**
+
+- Code: (a)'s changes, the classification and, once ADR-023 lands, the
+  unshifted reading.
+- Goldens: no change expected.
+- Tests beyond (a)'s:
+  - an entry whose book, or reference, is fresh in event time but stale at the
+    process instant is refused (`RISK_BOOK_STALE`, `RISK_REFERENCE_FEED_STALE`);
+  - a covered direct-leg SELL exit with the same ages is judged as today;
+  - if the rule is duplicated, the loop's disposition equals risk's for every
+    intent shape.
+
 ### (c) A lag pause or a lag halt
 
 **The rule.** The loop latches a state when the lag exceeds a bound. Two
@@ -407,7 +518,7 @@ in PAPER, with an owner and a deadline.
 
 **Determinism.** Unchanged.
 
-**Live behaviour.** Unchanged. While the settlement veto holds, no entry is
+**Live behaviour.** Unchanged. While the settlement veto holds, no `ENTRY` is
 admitted, late or not. The deadline must come before the first settlement veto
 is lifted for any run used as evidence, and before `WP-270`. That is the
 residual's own deadline today.
@@ -427,18 +538,31 @@ open.
 for each routed intent. A replay that reproduces a live run reads those
 recorded instants instead of its own clock.
 
-**Determinism.** A reproduction replay matches the live verdicts even where the
-live trader lagged. That is the only option that gives live-to-replay
-equivalence under lag. The auditor's E-02 report proposed it ("recording the
-relevant admission observations"). That report is `CLOSEOUT-2`'s source
-report `E-architecture.md`, outside the repository.
+**Determinism.** Recording admission instants reproduces ADR-031's checks
+only when the pre-admission state and the intents match the live run. Three
+things can make them differ, and none is an admission reading:
+
+- under ADR-023's `CONNECTION_CONFIRMED`, the loop reads the clock for every
+  evaluation's feature snapshot, before any intent exists. At `d5dda21`,
+  `#computeSnapshot` calls `#bookConfirmedAt`, which calls
+  `#processNowEpochMs`. ADR-023 D8 records "a 3 ms lag changed 12 of 13
+  decision records with identical outcomes";
+- ADR-023 D8 limits parity to "the same initialization and restart
+  boundaries";
+- frame grouping is live-only (`CO2-N4`).
+
+So full live-to-replay equivalence under lag needs more than (e) records: D7's
+per-evaluation readings, the live framing, and a replay that starts where the
+live process started. The auditor's E-02 report proposed recording
+("recording the relevant admission observations"). That report is
+`CLOSEOUT-2`'s source report `E-architecture.md`, outside the repository.
 
 **Cost.** The gateway's dataset does not hold trader readings. So the
 reproduction needs a second, trader-side input beside the dataset, which the
 ADR-017 manifest does not describe. It needs a persisted shape for the
-readings and a second replay mode. Not recommended now. It can be added on top
-of (a) later, if live-to-replay equivalence under lag becomes a requirement
-(see `CO2-N4`).
+readings and a second replay mode. Full equivalence would add D7's readings
+and `CO2-N4`'s framing work. Not recommended now. It can be added on top of
+(a) later, if live-to-replay equivalence under lag becomes a requirement.
 
 ### Options set aside
 
@@ -447,27 +571,47 @@ of (a) later, if live-to-replay equivalence under lag becomes a requirement
 - **A wall-clock lifecycle timer** that flips a market to `CLOSE_ONLY` at
   `closeTime`. It changes market state on a timer, not on an event. The loop
   has no timer (ADR-026, Context 6), and replay could not say when it fired.
+- **Rely on the venue to refuse late orders.** This ADR uses no venue
+  behaviour at or after the close (1.7). Before the close, nothing at the
+  venue tells it that an entry was decided on old data. In PAPER, the
+  simulated venue is positioned at the recorded event (1.4).
 
 ### Comparison
 
-| | (a) entry guard | (b) ages at the later instant | (c) pause or halt | (d) accept | (e) record and replay |
-| --- | --- | --- | --- | --- | --- |
-| Refuses a late entry live | yes | yes | yes, while latched | no | yes |
-| Changes exits | no | yes, under lag | halt: yes; pause: no | no | as (a) |
-| Changes cancels | no | no | no | no | no |
-| Replay goldens | unchanged | unchanged | unchanged | unchanged | unchanged |
-| Live vs replay verdicts | differ by lag refusals only | differ by lag-inflated ages | differ while latched | equal | equal |
-| ADR-023 D7 | independent | needs the unshifted instant | independent | unchanged | as (a) |
-| New configuration or codes | none, via existing inputs | none | bounds, a code, a health counter | none | a persisted shape |
-| Code | `trading-core` only | `trading-core`, including the 1c freshness code | `trading-core`, `apps/control-api` | none | `trading-core`, the backtest, storage |
+"Entry" and "exit" are risk's dispositions (1.2). In every option, a covered
+SELL that opens exposure is an `EXIT`, and an exit shaped as a BUY is an
+`ENTRY` (2(a)).
+
+| | (a) entry guard | (b) ages at the later instant | (b-entry) the same, entries only | (c) pause or halt | (d) accept | (e) record and replay |
+| --- | --- | --- | --- | --- | --- | --- |
+| Refuses a late entry live | yes | yes | yes | yes, while latched | no | yes |
+| Changes exits | no | yes, under lag | no | halt: yes; pause: no | no | as (a) |
+| Changes cancels | no | no | no | no | no | no |
+| Replay goldens | unchanged | unchanged | unchanged | unchanged | unchanged | unchanged |
+| Live vs replay: the divergence it adds | lag refusals, one direction | lag-inflated ages | lag-inflated entry ages | while latched | none | none in ADR-031's checks, when the pre-admission state and intents match |
+| ADR-023 D7 | independent | needs the unshifted instant | needs the unshifted instant | independent | unchanged | as (a); full reproduction also records D7's per-evaluation reads |
+| New configuration or codes | none, via existing inputs | none | none, unless risk chooses the measurement | bounds, a code, a health counter | none | a persisted shape |
+| Code | admission logic in `trading-core`; one `apps/trader` comment | `trading-core`, including the 1c freshness code; one `apps/trader` comment | as (a), plus the classification and the 1c freshness code | `trading-core`, `apps/control-api`; one `apps/trader` comment | none | as (a), plus the backtest and storage |
+| Test migrations (1.8) | yes | yes | yes | yes | none | yes |
+
+No option removes the divergences that exist today. Frame grouping is
+live-only (`CO2-N4`). Under ADR-023's `CONNECTION_CONFIRMED`, D7 reads the
+clock at every evaluation, and D8 limits parity to the same initialization and
+restart boundaries.
 
 ## 3. The decision the user is asked to make
 
-1. **Which option:** (a), (b), (c), (d) or (e).
+1. **Which option:** (a), (b), (b-entry), (c), (d) or (e).
 2. **Q1, under (a):** existing inputs, or a dedicated measurement and code.
+   Under existing inputs, a lag refusal is attributable by its code,
+   `RISK_FEATURES_STALE`. A close-criterion refusal is not: it shares
+   `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` with an ordinary cutoff refusal. A
+   dedicated code per criterion would make close-criterion refusals
+   distinguishable too, at the cost of more risk inputs.
 3. **Q2, reductions under lag.** Should a lagging trader's protective exit be
    refused, as §6 invariant 12 and §13.3 suggest, or taken, as today? Option
-   (b) answers "refused" now. Options (a) and (c-pause) leave exits as today.
+   (b) answers "refused" now. Options (a), (b-entry) and (c-pause) leave
+   `EXIT`s as today.
 4. **Q3, ADR-023's O-R6-I2.** Whether `CO2-N1` must also close it (6.2).
 
 ## 4. Recommendation: option (a), through existing inputs, entries only
@@ -475,15 +619,20 @@ of (a) later, if live-to-replay equivalence under lag becomes a requirement
 The user rules. The reasons for this recommendation:
 
 1. **It closes the residual as written.** The closeout's probe is refused twice
-   over (T1). Every late entry is refused at the process instant.
+   over (T1). Every late `ENTRY` is refused at the process instant. A covered
+   SELL that opens exposure is an `EXIT` and is not judged, but Static Bracket
+   cannot emit one today (2(a)).
 2. **Replay is untouched.** The lag is 0 wherever the clock is positioned per
    event. So no golden is expected to change, and no replay mode is added.
-3. **It is the smallest change.** One clock read per routed placement, two
-   inputs, `trading-core` only. No new policy field or reason code.
+3. **It is the smallest change.** One clock read per routed placement and two
+   inputs. The admission logic is in `trading-core`. Outside it, one
+   `apps/trader` comment changes and the 1.8 tests migrate. No new policy
+   field or reason code.
 4. **It does not obstruct safety exits.** Cancels are untouched (§6 invariant
-   13). Reductions keep today's path. The auditor's E-02 report asked for
-   exactly this: "Gate stale new entries without obstructing safety
-   cancellation."
+   13). `EXIT`s keep today's path. An exit shaped as a BUY is an `ENTRY`.
+   Every entry check already judges it, and the guard judges it too. Static
+   Bracket cannot emit one today (2(a)). The auditor's E-02 report asked for
+   this: "Gate stale new entries without obstructing safety cancellation."
 5. **It is independent of ADR-023.** No book age changes, so there is no
    double count, and it works whether or not ADR-023 is ratified.
 6. **It makes check 7's features row honest.** `featuresAgeMs: 0` is not a
@@ -497,18 +646,26 @@ Why not the others:
   But it changes protective exits in PAPER before any Incident Controller
   exists. It also needs a second confirmation reading once ADR-023 lands.
   Q2 can adopt its exit half later, on top of (a).
+- **(b-entry)** is exact for entries and leaves exits alone. But it needs the
+  disposition before risk runs: a second derivation, a duplicated rule, or a
+  change to risk's input. It also needs the unshifted confirmation once
+  ADR-023 lands. What it removes is bounded: under (a), an admitted entry's
+  book or reference is at most the lag bound older than its own bound allows.
+  It only adds refusals, so it can be added on top of (a) later.
 - **(c-halt)** would have ended every H1 run 2-8. **(c-pause)** adds state,
   configuration and control-API surface for no gain over (a), and still needs
   the close criterion.
 - **(d)** leaves the seam for `WP-270` and makes post-veto paper evidence
   unreliable.
-- **(e)** buys live-to-replay equivalence at the cost of a second replay
-  input. Nothing requires that yet.
+- **(e)** reproduces ADR-031's own refusals in a replay, at the cost of a
+  second replay input. Full equivalence would also need D7's readings, the
+  live framing (`CO2-N4`) and the same start point. Nothing requires that yet.
 
 On the sub-questions, this ADR recommends:
 
 - **Q1:** existing inputs. A dedicated code is a later, additive change if
-  operators need it.
+  operators need it. Until then, a close-criterion refusal cannot be told
+  from an ordinary cutoff refusal.
 - **Q2:** exits as today, in this round. The question is recorded for the
   round that builds the §9.9 Incident Controller, and in any case before any
   run mode above PAPER.
@@ -519,14 +676,24 @@ On the sub-questions, this ADR recommends:
 If the user rules for option (a) through existing inputs:
 
 1. **R1.** For each routed placement intent, `CoreLoop.#routeIntent` reads
-   `clock.now()` once, after `#persistDecisionsBeforePlacement` and before it
-   builds the risk input. A CANCEL reads nothing; its path is unchanged.
+   `clock.now()` once. The read comes after `#persistDecisionsBeforePlacement`
+   has resolved, and before the risk input is built. So the time a slow
+   commit takes counts as lag. A CANCEL gets no such read; its path is
+   unchanged. Under ADR-023's `CONNECTION_CONFIRMED`, D7's own book-age read
+   still happens for every routed intent, a CANCEL included.
+   - Each placement is measured at its own admission. So two placements from
+     one decision can get different verdicts, if a bound is crossed between
+     the reads.
+   - That is deliberate. One read per decision would judge later placements
+     at an older instant, which is less fail-closed.
+   - Static Bracket's entry, take-profit and reduction plans each emit one
+     intent today.
 2. **R2.** `lag = max(0, processNow − eventNow)`, in whole milliseconds, where
    `eventNow` is the instant the decision names (`input.epochMs`).
-3. **R3.** The risk input's `featuresAgeMs` is the lag. Check 7 refuses an entry
-   when it exceeds `freshness.featuresMaxAgeMs` (`RISK_FEATURES_STALE`).
+3. **R3.** The risk input's `featuresAgeMs` is the lag. Check 7 refuses an
+   `ENTRY` when it exceeds `freshness.featuresMaxAgeMs` (`RISK_FEATURES_STALE`).
 4. **R4.** The risk input's `secondsToClose` is measured from
-   `max(eventNow, processNow)`. Check 20 refuses an entry when it is at most
+   `max(eventNow, processNow)`. Check 20 refuses an `ENTRY` when it is at most
    `entryCutoffSeconds` (`RISK_TIME_TO_CLOSE_ENTRY_BLOCKED`).
 5. **R5.** A process reading that does not normalize to strict UTC omits the
    features measurement. Check 7 then refuses the entry
@@ -566,9 +733,9 @@ ADR-024's did for ADR-026. That edit is outside this round's grant.
   affected.
 - D7, on O-R6-I2: "Not closed here: it needs a monotonic receipt basis, which
   is the clock-semantics question `CO2-N1` owns." **No option here closes it
-  where ADR-023 leaves it open:** one host, or two clocks stepping together.
-  Every option compares the process clock with the stamps, and both stepped by
-  the same amount. A monotonic basis is possible within one gateway epoch.
+  in the cases ADR-023 leaves open:** one host, or two hosts whose clocks step
+  together. Every option compares the process clock with the stamps, and both
+  stepped by the same amount. A monotonic basis is possible within one gateway epoch.
   `receivedMonotonicNs` is the gateway's per-process monotonic reading (§7.1;
   `packages/simulation/src/clock.ts`), so the difference between two stamps of
   one epoch does not step. Using it would change how every event-time age is
@@ -597,31 +764,35 @@ Under option (a) through existing inputs:
 
 | Id | Case | Expected |
 | --- | --- | --- |
-| T1 | The closeout probe as a test: the paper-trader fixture's `recordedEvents`, `ManualClock` at `12:30:00.000Z`, close `12:15:00`, last event `12:00:03` | No entry is approved and nothing fills. Every entry refusal carries `RISK_FEATURES_STALE`, a lag of about 30 minutes against the fixture's 600,000 ms bound, and `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` |
-| T2 | The close criterion alone: the lag below the bound; the event instant outside the entry cutoff; the process instant inside it | Refused with `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` only. With the process instant one second earlier: approved |
+| T1 | The closeout probe as a test: the paper-trader fixture's `recordedEvents`, `ManualClock` at `12:30:00.000Z`, close `12:15:00`, last event `12:00:03`. The lag is at least 1,797,000 ms, against the fixture's 600,000 ms features bound | `health().risk.approvals` is 0, and nothing fills. In `health().risk.refusalsByCode`, `RISK_FEATURES_STALE` and `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` each count every refusal (each equals `risk.refusals`, at least 1). No surface exposes the lag's value, so the test asserts codes |
+| T2 | The close criterion alone: the lag below the bound; the event instant outside the entry cutoff | Process instant at exactly `close − entryCutoffSeconds`: refused, `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` only. At `close − (entryCutoffSeconds + 1) s`: approved, every other check passing. `#secondsToClose` floors, so only this boundary pair is exact |
 | T3 | A lagging trader: the clock positioned at each event's instant plus L | L equal to the bound: approved. L one millisecond above: refused, `RISK_FEATURES_STALE`. A backlog whose lag falls below the bound: refused, then approved at the first entry below it |
 | T4 | The shipped clock: `assembleDurableTrader` with `SystemPaperClock`. The fixture's instants, open and close are shifted together relative to the host clock | Shifted so the lag exceeds the configured features bound: refused at admission. Shifted to within it: approved |
-| T5 | Exits and cancels under lag: a position opened at lag 0, then the clock moved 30 minutes ahead; a protective reduce and a CANCEL are routed | Both are judged exactly as at lag 0 |
+| T5 | Exits and cancels under lag: a direct-leg position opened at lag 0, then the clock moved 30 minutes ahead. A protective covered SELL of that leg (an `EXIT`) and a CANCEL are routed | Both are judged exactly as at lag 0. An exit shaped as a BUY is an `ENTRY` and would be judged (2(a)); Static Bracket cannot emit one today, so no case routes one |
 | T6 | Replay parity | `test:replay` and the e2e determinism goldens pass with no regeneration. `git diff --quiet <base> -- test/replay-golden` holds, where `<base>` is the round's base. The fixture with its clock positioned at each event matches the same run at `<base>`, byte for byte |
 | T7 | A clock behind the event instant | Lag 0: entries and exits are judged as today |
 | T8 | An unreadable process reading | The entry is refused, `RISK_FRESHNESS_UNKNOWN`. A CANCEL still routes |
 | T9 | If `THROUGHPUT-1c` has merged: `CONNECTION_CONFIRMED`, with a lag inside D7's range | The risk input's `venueBookAgeMs` equals its value without ADR-031 |
+| T10 | Durability held across a bound: group commit, with the entry decision's commit held open (`run.group.gate`, as `test/integration/paper-trader/group-commit-loop.test.ts` does). While it is held, the clock moves from inside the lag bound to beyond it. A second case moves it from outside the entry cutoff to inside it, with the lag still inside the bound. Then the commit is released | Refused: `RISK_FEATURES_STALE` in the first case, `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` in the second. Nothing is submitted |
+| T11 | Clock reads: a `ManualClock` that counts `now()` calls, positioned at each event (lag 0), under ADR-023's default `LAST_CHANGE` basis if `THROUGHPUT-1c` has merged. One CANCEL and one placement are routed. The counts are compared with the same run at `<base>` | The CANCEL adds no `now()` read. The placement adds exactly one |
 
 Mutants the round runs and tabulates (observed results go in its handoff):
 
 | Mutant | Expected failure |
 | --- | --- |
-| `featuresAgeMs` back to `0` | T3 and T4; T1 loses its `RISK_FEATURES_STALE` code |
+| `featuresAgeMs` back to `0` | T3 and T4; T1 loses its `RISK_FEATURES_STALE` count |
 | `secondsToClose` from the event instant only | T2 |
 | `min` instead of `max` for the close instant | T2 |
 | The lag not clamped at 0 | T7: risk's input door refuses a negative age, `RISK_INPUT_INVALID` |
-| The guard applied to reductions or cancels | T5 |
+| The loop refuses any placement whose lag exceeds the bound, whatever its disposition | T5 |
+| A CANCEL reads the clock | T11 |
+| The clock read before `#persistDecisionsBeforePlacement` resolves | T10 |
 | The clock read once, at construction | T3 |
 | An unreadable reading taken as lag 0 | T8 |
 
-The test changes 1.8 lists are listed in the round's handoff. Each one is
-re-pinned, never deleted. The round also re-runs the throughput bench and
-reports any change to its decision digests.
+The implementation handoff lists each affected test from section 1.8 and its
+new clock setup or expected refusal. Keep every test. The round also re-runs
+the throughput bench and reports any change to its decision digests.
 
 ## 8. Consequences
 
@@ -635,14 +806,25 @@ reports any change to its decision digests.
   `CO2-N3` is fixed.
 - **Paper fills still carry no decision latency** (Tier 0, §12.2). That is
   ADR-012's Tier 1 question, not this one.
-- **The settlement veto can then be lifted** on this residual's account. Other
-  preconditions, such as a reviewed settlement spec, are unaffected.
-- **Under (b), (c) or (d)** the consequences are those in their sections.
+- **The settlement veto can then be lifted** on this residual's account, for
+  every `ENTRY`. Today every entry Static Bracket can emit through the core is
+  a BUY, so an `ENTRY` (2(a)):
+  - positions are per instance, so its complement-leg entry, a covered SELL,
+    cannot occur;
+  - the shipped configurations are `DIRECT_ONLY` (the example, the throughput
+    template, the replay golden, and the e2e and paper-trader fixtures).
+
+  If that shape ever becomes reachable, it is an `EXIT`. No lag rule judges
+  it, and check 6 does not refuse it either. That is the `RISK-2 item 7`
+  question, not this ADR's. Other preconditions, such as a reviewed
+  settlement spec, are unaffected.
+- **Under (b), (b-entry), (c), (d) or (e)** the consequences are those in
+  their sections.
 
 ## 9. Evidence
 
 - `IMPLEMENTATION_STATUS.md`: Residual queue, `CO2-N1`, `CO2-N3`, `CO2-N4`,
-  `CO2-N7`; Authorized now, `THROUGHPUT-1c`, "Interim rulings".
+  `CO2-N7`, `RISK-2 item 7`; Authorized now, `THROUGHPUT-1c`, "Interim rulings".
 - `docs/handoffs/CLOSEOUT-2-wave-2-closeout.md`: N1, N2, "Where the auditors
   disagreed" item 1. `docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md`: "[INFO] N1
   (E-02) still reproduces on `9ce53a1`", "The user's ruling (2026-09-30)".
@@ -653,12 +835,18 @@ reports any change to its decision digests.
   ADR-025; ADR-026 Context 5 and 6, D2.10, D3, D6 and D7; ADR-029 §5.
 - ADR-023 D2, D7 and D8, on the `THROUGHPUT-1c` branch at `d5dda21`
   (`docs/adr/ADR-023-book-freshness-by-delivery-session-liveness.md`;
-  `packages/trading-core/src/loop.ts` `#processNowEpochMs`;
-  `book-freshness.ts` `bookConfirmedAt`).
+  `packages/trading-core/src/loop.ts` `#computeSnapshot`, `#bookConfirmedAt`
+  and `#processNowEpochMs`; `book-freshness.ts` `bookConfirmedAt`).
 - Code at `3615560`:
   - `packages/trading-core/src/loop.ts`: `CoreLoop.#processEvent`,
-    `#routeIntent`, `#bookAgeMs`, `#secondsToClose`, `#availableRequests`,
-    `#stageOutbox`, `#applyEvent`, the constructor;
+    `#routeIntent`, `#persistDecisionsBeforePlacement`,
+    `#persistPendingDecisions`, `#bookAgeMs`, `#secondsToClose`,
+    `#availableRequests`, `#positionsFor`, `#stageOutbox`, `#applyEvent`, the
+    constructor;
+  - `packages/trading-core/src/health.ts`: `HealthState.countRiskRefusal`,
+    `risk.refusalsByCode`;
+  - `packages/trading-core/src/allocation.ts`: the comment on mirroring
+    `buildIntentView`;
   - `packages/trading-core/src/pipeline.ts`: `RiskInputContext`,
     `buildRiskEvaluationInput`, `marketStatusOf`;
   - `packages/trading-core/src/reference-state.ts`: `ReferenceState.ageMs`;
@@ -666,19 +854,31 @@ reports any change to its decision digests.
     holders of the `Clock` port;
   - `apps/data-gateway/src/ports.ts`: `takeReceipt`;
   - `packages/trading-core/src/testing/index.ts`: `ManualClock`;
-  - `packages/risk/src/engine.ts`: `evaluateIntentInner`, checks 6, 7 and 20;
+  - `packages/risk/src/engine.ts`: `evaluateIntentInner` (`isEntry`, the
+    intent-deadline pre-check, checks 6, 7 and 20, `approvedAt`);
   - `packages/risk/src/freshness.ts`: `assessFreshness`;
-  - `packages/risk/src/intent-view.ts`: the `EXIT` disposition;
+  - `packages/risk/src/intent-view.ts`: `buildIntentView` and its disposition
+    table; `packages/risk/src/index.ts`, which exports it;
   - `packages/simulation/src/clock.ts`: `ReplayClock`;
   - `apps/backtest-cli/src/core-loop.ts`: `replayDrivenCoreLoop`;
     `apps/backtest-cli/src/normalizer.ts`: `envelopeFrom`;
-  - `apps/trader/src/main.ts`: `SystemPaperClock`;
-    `apps/trader/src/transport-lag.ts`: `transportHealthOf`;
+  - `apps/trader/src/main.ts`: `SystemPaperClock`, and the subscription
+    with no `start`; `apps/trader/src/transport-lag.ts`: `transportHealthOf`;
     `apps/trader/src/pump.ts`;
+  - `apps/trader/src/adapters/postgres-registration.ts`:
+    `verifyRegisteredRows`; `packages/event-bus/src/transport.ts`:
+    `SubscribeOptions.start`;
   - `packages/strategy-sdk/src/context.ts`: `now()`;
-  - `packages/strategies/static-bracket/src/decide.ts` and `observe.ts`;
+  - `packages/strategies/static-bracket/src/decide.ts` (`legPosture`,
+    `chooseLeg`) and `observe.ts`;
+  - `infra/compose/trader/trader.config.example.json`,
+    `test/fixtures/trader-throughput/template.json` and
+    `test/replay-golden/backtest/static-bracket/trader-config.json`:
+    `economic_leg_policy`;
   - `test/integration/paper-trader/support/fixture.ts` and
-    `test/e2e/support/harness.ts`: the test clocks and risk policies.
+    `test/e2e/support/harness.ts`: the test clocks and risk policies;
+    `test/integration/paper-trader/group-commit-loop.test.ts`: the held
+    commit (`run.group.gate`).
 - Venue: `docs/contracts/protected-contracts.md` §8, U-12;
   `docs/venue/verified-2026-09-16.md` D-30 and its U-12 row;
   `docs/venue/verified-2026-09-30.md`, the U-12 row. No other venue fact is
