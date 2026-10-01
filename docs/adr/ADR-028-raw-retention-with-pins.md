@@ -4,7 +4,9 @@
   Ruling A3b was not taken.
 - **Date:** 2026-09-30
 - **Recorded by:** `LEAN-GOV`
-- **Implemented by:** `STORAGE-1`. Not yet implemented.
+- **Implemented by:** `STORAGE-1`, merged `a22502b`.
+  [Amendment 1](#amendment-1-2026-10-01-storage-1) (2026-10-01) records its
+  retention-safety rules and where it stops short of this ADR.
 - **Supersedes / Superseded by:** none. It **amends** handoff §2 ("Raw
   archive"), §8.4, §9.1, §12.4 and §12.5, ADR-004 §5, ADR-017 §4 and one
   clause of ADR-017 §1, and the `WP-130` acceptance. It must be
@@ -246,3 +248,262 @@ Under this ADR the pinning manifest may be the research-tier manifest.
 - `packages/storage-wal/src/writer.ts` (`maxTotalBytes`);
   `docs/contracts/wal-format.md` (the hard capacity threshold).
 - No venue fact is used.
+
+## Amendment 1 (2026-10-01, STORAGE-1)
+
+- **Recorded by:** `STORAGE-GOV`, from `STORAGE-1`'s follow_up 1.
+- **Source:** `STORAGE-1`, merged `a22502b` after a joint ACCEPT at
+  `162fcfe`. Its record is `docs/handoffs/STORAGE-1.md`.
+- **Scope:** five retention-safety rules that `STORAGE-1` implemented and its
+  reviewers accepted (rules 1-5), and where `STORAGE-1` stops short of this
+  ADR (rule 6). It decides nothing new.
+
+Each rule names the decision it refines and why it fails closed. Code is
+cited by symbol. A path without a package is under
+`apps/research-worker/src/`. The rules are numbered within this amendment.
+From outside it, cite one as "ADR-028 Amendment 1, rule 3".
+
+### Rule 1. Unreadable trader evidence is never an empty read
+
+**Refines:** Decision 2.3, and Decision 3.1 (which windows are pinned).
+
+1. To classify a trader-responsible window, the worker reads the trader's
+   rows through `TraderEvidenceSource`: each instance's dispatch frontier,
+   and the market's evidence.
+2. If a read fails, the window is unclassified with `evidenceUnreadable` set
+   (`classifyWindow`). Any other error while classifying a window does the
+   same (`classifyAll` in `retention/cycle.ts`).
+3. With no trader database configured, the command reads through
+   `unavailableEvidenceSource` (`storageMain`). Every read through it fails.
+4. So a trader database that is missing, not configured or unreadable gives
+   a failed read, never an empty one.
+5. While such a window is not settled (rule 2), every sealed segment is
+   kept, not only those the window overlaps. The planner's reason is
+   `evidence-unreadable` (`planExpiry`).
+6. The failed read is marked in the holds file (rule 2). Only a later read
+   that succeeds, in an execute cycle, clears the mark.
+7. A window that leaves the registry while marked and not settled still
+   keeps every segment.
+8. A settled window's failed read does not keep every segment. The code
+   treats its evidence as final: its rows were durable when it classified,
+   and its pin, if it needed one, holds them. Like any unclassified window,
+   it still keeps the segments its potential range overlaps.
+9. A gateway-only window never reads the trader's rows. A registry of
+   gateway-only windows needs no trader database.
+
+**Why it fails closed:** an empty read would look like a window with no
+evidence. When the rows cannot be read, what the window holds is unknown. A
+chain's source event can lie in any earlier segment (Decision 3.4), so every
+segment is kept.
+
+### Rule 2. Evidence holds are durable, and only an execute cycle releases them
+
+**Refines:** Decisions 2.3, 2.4 and 3.4.
+
+1. A hold protects a time range containing chain evidence found in a trader
+   window's durable rows (`WindowEvidenceState` in
+   `retention/evidence-holds.ts`).
+   - While the window is unclassified and its rows show evidence, it holds
+     the range its pin would hold now (`holdRanges`). That is the window,
+     widened to every evidence instant and to the span of every located
+     source event's segment, with the lead-in before it.
+   - While it is classified with evidence and not settled, it holds its
+     whole pin extent (`pinExtent`).
+2. The holds live in one file in the state directory,
+   `evidence-holds.json`. A hold is kept whatever the registry says.
+3. Every cycle with a state directory makes what it read durable before it
+   plans, in dry run as in execute mode (`runStorageCycle`). Each write goes
+   to a temporary file, is synced, is renamed into place, and is read back
+   (`persistEvidenceHolds`).
+4. A dry run only adds (`accumulateEvidenceHolds`):
+   - its holds are the union of the file's and what it read;
+   - it never settles a window;
+   - it never releases a hold or clears a failed read.
+5. Only an execute cycle settles a window and releases its holds
+   (`rememberEvidence`, `settledWindowIds`). A window is settled when it is
+   classified and one of these is true:
+   - Its pin was extracted in this cycle, or already was. Either way, its
+     manifests were verified. The pin holds every source event of its chain
+     (`sourceEventsInside`). Its range covers every held range and the
+     window's pin extent.
+   - It has no evidence and holds nothing.
+6. The recheck before each deletion may add holds. It settles and releases
+   nothing.
+7. Only a missing file reads as "no holds". A file that does not read keeps
+   every segment and is never overwritten. A cycle that cannot write the
+   file durably also keeps every segment. The planner's reason is
+   `evidence-holds-unknown`.
+8. Removing the file, or an entry in it, can release holds without
+   verifying anything. The code never removes the file, or an entry that
+   still holds a range or an unsettled failed read (`rememberEvidence`).
+   Doing so is an operator's deliberate act.
+9. A dry run plans with the holds an execute cycle would write, so its
+   report says what execute would do. If its own write failed, it reports
+   every segment kept. It deletes nothing.
+
+**Why it fails closed:** a later cycle may not read the rows, or may no
+longer register the window. A hold built from one cycle's state alone would
+then be lost, and an unlink could follow. `STORAGE-1` rounds 2-5 kept
+finding that defect. Round 5 closed it: the holds became durable, and only
+an execute cycle that settles a window releases them.
+
+### Rule 3. One storage cycle at a time per state directory
+
+**Refines:** Decision 2. The lock protects the durable state that Decision
+2's conditions rely on: rule 2's holds, and the clock guard's state behind
+Decision 2.1's age check.
+
+1. A cycle with a state directory runs whole under that directory's cycle
+   lock (`withStorageCycleLock`, called by `runStorageCycle`). It takes the
+   lock before it reads the clock, and keeps it until the cycle ends.
+2. The lock is a file created with `O_EXCL`, named
+   `storage-cycle.<boot id>.lock`. The boot id comes from
+   `/proc/sys/kernel/random/boot_id`. The file names the holder's pid and
+   boot, and when it took the lock.
+3. A cycle removes its lock when it ends, whether it succeeded or failed.
+4. A cycle that finds the lock held retries for up to 5 minutes by default
+   (`DEFAULT_STORAGE_CYCLE_LOCK_TIMEOUT_MS`).
+   - If it takes the lock in that time, it runs.
+   - If the lock is still held at the timeout, it throws
+     `StorageCycleLockError`. That cycle never started: it read no trader
+     rows, changed no holds and deleted nothing.
+5. Any other error creating the lock file is thrown at once, and the cycle
+   does not run. No test covers that path yet
+   (`R6-LOCK-OPEN-ERROR-UNTESTED`).
+6. A lock left by a process that a reboot ended has another boot's name. It
+   holds nothing after the reboot.
+7. A lock left in the same boot, by a killed process, is never broken
+   automatically. Every later cycle waits, refuses and deletes nothing. The
+   operator removes the lock after checking that no cycle runs.
+8. If the boot id cannot be read, the lock is named `storage-cycle.lock`.
+   - That name is not scoped to a boot, so a lock left under it survives a
+     reboot. It still blocks every cycle that uses that name, and nothing
+     breaks it automatically.
+   - A process that cannot read the boot id and one that can use different
+     names, so neither excludes the other (`R6-LOCK-NAME-FALLBACK`).
+   - Owner of both lock residuals (items 5 and 8): a research-worker round,
+     before `HOST-1` (`STORAGE1-LOCK-LOWS`).
+9. The lock serializes cycles on one host. A state directory shared between
+   hosts is not supported.
+
+**Why it fails closed:** each cycle rewrites the whole holds file from what
+it read. Two cycles at once could lose one's new hold to the other's write.
+A cycle that cannot take the lock does nothing. A stale lock stalls expiry,
+but it never causes a deletion.
+
+### Rule 4. The storage command needs a state directory in every mode
+
+**Refines:** Decision 4.5, which keeps the expiry plan in durable state,
+and, through rule 2, Decisions 2.3 and 3.4.
+
+1. The command refuses to start without `RESEARCH_WORKER_STATE_DIR`, in dry
+   run as in execute mode (`loadStorageConfig`).
+2. In execute mode, the expiry plan is made durable there before any
+   deletion (`persistExpiryPlan`), as Decision 4.5 requires.
+3. In both modes, rule 2's holds and rule 3's lock live there.
+4. The library function `runStorageCycle` refuses execute mode without a
+   state directory. It still accepts a dry run without one. That run makes
+   no hold durable and takes no lock. The command never runs one.
+5. `STORAGE-1` assumes one state directory for each WAL root. A dry run
+   given another directory protects nothing for the scheduled execute
+   cycles.
+
+**Why it fails closed:** a dry run reads the trader's rows like any cycle.
+Without a state directory, what it read would be lost when it exits. The
+window could then leave the registry before an execute cycle reads it again.
+
+### Rule 5. A window leaves the registry only after an execute cycle settles it
+
+**Refines:** Decision 2.3, which keeps a segment until every window that
+overlaps it is classified.
+
+1. The windows come from an operator-supplied registry file
+   (`loadWindowRegistry`). The host configuration and the window admission
+   that Decision 2.3 names do not exist yet (`retention/windows.ts`).
+2. The planner sees only registered windows. A window may leave the
+   registry only after an execute cycle has settled it (rule 2).
+3. This is an operator rule. The code cannot enforce it, because it never
+   sees a window that is not registered.
+4. If a window leaves earlier, its recorded holds and any unsettled
+   failed-read mark stay durable (rules 1 and 2). Re-registering it lets an
+   execute cycle read its evidence again. Holds remain until an execute
+   cycle settles the window. A successful execute-mode read clears the
+   failed-read mark even if the window remains unclassified.
+5. What no cycle has read is not held:
+   - rows the trader writes after the last read;
+   - the potential range of a window that was unclassified with no evidence
+     yet (`potentialRange`).
+6. The worker's README adds a second condition: the window's segments have
+   all expired. If the window leaves sooner, a segment that names its market
+   is kept as `unknown-market`, unless a registered window names that
+   market.
+
+**Why it fails closed:** once a window is settled, its evidence is final and
+any pin it needs is in the store. The planner checks every stored pin,
+whatever the registry says (`readExtractedPins`). Before that, only a
+registered window has its rows read again and its potential range held. So
+pruning waits for settlement.
+
+### Rule 6. Where `STORAGE-1` stops short of this ADR
+
+1. **Decision 5.1 is not enforced.** It requires `maxTotalBytes` on this
+   profile and refuses `null`.
+   - The gateway's `WalConfigSchema` still accepts `null` or no value.
+     `apps/data-gateway` was outside `STORAGE-1`'s grant.
+   - The worker only reports headroom against the value, with a 90% alarm.
+     It does so only when `RESEARCH_WORKER_WAL_MAX_TOTAL_BYTES` is set
+     (`storageMetrics`).
+   - Owner: a data-gateway round, after `THROUGHPUT-1c`
+     (`STORAGE1-MAXBYTES`). `STORAGE-1`'s follow_up 4 also asks `HOST-1` to
+     require the value.
+2. **Expiry does not relieve the WAL writer's capacity count (`J10`).**
+   - A running `WalWriter` adds every byte it writes to
+     `#totalSegmentBytes` (`packages/storage-wal`). It never subtracts a
+     deleted segment.
+   - So segments expired while it runs still count against
+     `maxTotalBytes`. At the limit the writer refuses new frames and deletes
+     nothing (Decision 5.3).
+   - Owner: the same data-gateway round (`STORAGE1-MAXBYTES`).
+3. **Pins and the research tier are written with SNAPPY, not ZSTD.**
+   - `DatasetCodec` offers only `UNCOMPRESSED` and `SNAPPY`
+     (`packages/storage-parquet`). The pinned `hyparquet-writer` 0.16.6 has
+     no built-in ZSTD codec.
+   - Decision 3.3 names no codec. The gap is against Decision 3.6's sizing
+     basis: its budget comes from `LEAN-1` §4, which assumed 3× compression.
+   - `STORAGE-1` projects pins at about 3.4 GB a day at H1's intent rate.
+     That is above the 3 GB alarm, which only notifies (Decision 3.6).
+   - `STORAGE-1`'s record names two causes of that volume:
+     - SNAPPY output is about 3× larger than ZSTD's;
+     - overlapping pins each store the segments they share, since
+       `extractPin` writes every pin's segments under its own prefix.
+   - Owner: a pin-storage ruling or round (`STORAGE1-PIN-VOLUME`).
+     `STORAGE-1`'s follow_up 5 asks it to share segments between
+     overlapping pins, add a ZSTD codec, or both.
+4. **A lapsed non-fill pin is never deleted.**
+   - Decision 3.5 lets an intent, refusal or halt pin lapse after 30 days.
+   - The pin record carries that instant as `keepUntil`: the window's end
+     plus `NON_FILL_PIN_RETENTION_MS`. Nothing acts on it, so more is kept,
+     never less.
+   - Owner: its own dual-verified round, because deleting a pin deletes
+     evidence (`STORAGE-1` follow_up 6). No round is named yet.
+
+Two limits come from the trader, not from this worker.
+
+- **No decision carries its dispatch position yet (`H1R1-PROVENANCE`).**
+  - `CoreLoop` (`packages/trading-core`) gives a decision's `sourceEvent`
+    only its `eventId`. So `decisionRow` (`apps/trader`) writes every
+    decision's `gateway_epoch` and `ingest_seq` as NULL.
+  - `dispatchFrontiers` (`retention/evidence-postgres.ts`) skips those
+    rows, so no instance has a dispatch frontier.
+  - `classificationBlocker` (`retention/classify.ts`) refuses a window with
+    no frontier. So no trader-responsible window classifies today, and no
+    segment it could overlap expires. This keeps more, never less.
+- **Nothing writes refusal or halt rows yet (`OUT1-R1-HALT-NOT-DURABLE`).**
+  - `postgresTraderEvidence` reads both tables, but they are empty.
+  - Today every trader-responsible window stays unclassified anyway (the
+    item above), so every segment it could overlap is kept.
+  - Once those windows can classify, the missing rows can leave an
+    otherwise evidence-free window unpinned. Decision 3.1 would pin a
+    window with a refusal or a halt for 30 days.
+- Owner of both: a trader/storage round that persists decision provenance,
+  halts and refusals (`STORAGE-1` follow_up 3).
