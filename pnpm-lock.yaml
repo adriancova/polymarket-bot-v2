@@ -155,13 +155,28 @@ importers:
 
   apps/research-worker:
     dependencies:
+      '@polymarket-bot/binance-adapter':
+        specifier: workspace:*
+        version: link:../../packages/binance-adapter
+      '@polymarket-bot/coinbase-adapter':
+        specifier: workspace:*
+        version: link:../../packages/coinbase-adapter
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../../packages/decimal
+      '@polymarket-bot/polymarket-public':
+        specifier: workspace:*
+        version: link:../../packages/polymarket-public
       '@polymarket-bot/storage-parquet':
         specifier: workspace:*
         version: link:../../packages/storage-parquet
-    devDependencies:
+      '@polymarket-bot/storage-postgres':
+        specifier: workspace:*
+        version: link:../../packages/storage-postgres
       '@polymarket-bot/storage-wal':
         specifier: workspace:*
         version: link:../../packages/storage-wal
+    devDependencies:
       '@types/node':
         specifier: ^24.13.3
         version: 24.13.3

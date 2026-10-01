@@ -25,6 +25,26 @@
  * That is safe precisely because the format is versioned — `datasetManifestVersion`
  * is pinned below, so a future field arrives with a version this build refuses
  * by name instead of silently ignoring.
+ *
+ * ## Versions 1 and 2, and the approximate class (`STORAGE-1`, ADR-029)
+ *
+ * The door reads version 1 and version 2 of the same document family
+ * (`polymarket-bot/dataset-manifest/v1`; the id is the coarse discriminator
+ * and does not move with the version). Version 2 adds the required
+ * `fidelity` field (ADR-029 Decision 1):
+ *
+ * - **version 1** has no `fidelity` field and reads as `exact` (Decision 1.3).
+ *   Its strict key list is unchanged, so a version 1 document that carries a
+ *   `fidelity` key is refused as an unknown key;
+ * - **version 2 `exact`** is the version 1 field set plus `fidelity`, read
+ *   exactly as version 1 is;
+ * - **version 2 `approximate`** is a research-tier dataset. This is the EXACT
+ *   replay door: it refuses it with `REPLAY_MANIFEST_APPROXIMATE` before any
+ *   other field is read (Decision 4.3: "A tool that builds evidence for §2's
+ *   uses refuses an approximate input"). An approximate replay is
+ *   `APPROX-REPLAY-1`'s, through its own source;
+ * - **version 2 without `fidelity`**, or with any other value, is refused
+ *   (Decision 1.6).
  */
 
 import {
@@ -50,8 +70,13 @@ import { parseStrictJsonBytes, parseStrictJsonText } from "./strict-json.js";
 
 /** The dataset-manifest format this build replays (`WP-130` `constants.ts`). */
 export const SUPPORTED_DATASET_MANIFEST_FORMAT_ID = "polymarket-bot/dataset-manifest/v1";
-/** The dataset-manifest version this build replays. */
-export const SUPPORTED_DATASET_MANIFEST_VERSION = 1;
+/**
+ * The newest dataset-manifest version this build replays. Version 1 is still
+ * read ({@link SUPPORTED_DATASET_MANIFEST_VERSIONS}).
+ */
+export const SUPPORTED_DATASET_MANIFEST_VERSION = 2;
+/** Every dataset-manifest version this door reads (ADR-029 Consequences). */
+export const SUPPORTED_DATASET_MANIFEST_VERSIONS: readonly number[] = [1, 2];
 /** The Parquet row layout this build's decoders read. */
 export const SUPPORTED_PARQUET_LAYOUT_ID = "polymarket-bot/parquet-raw-frames/v1";
 /** The WAL format whose frames the archived rows carry. */
@@ -141,6 +166,7 @@ export interface ReplayManifestPins {
 export interface ReplayDataset {
   readonly datasetId: string;
   readonly datasetManifestFormatId: string;
+  /** 1 or 2; either way the dataset is exact — the door refuses an approximate one. */
   readonly datasetManifestVersion: number;
   readonly walFormatId: string;
   readonly parquetLayoutId: string;
@@ -249,13 +275,25 @@ export function readDatasetManifestText(text: string): SimulationResult<ReplayDa
   });
 }
 
-function validateDatasetManifest(tree: unknown): SimulationResult<ReplayDataset> {
-  const keys = requireStrictKeys(tree, "the dataset manifest", MANIFEST_KEYS);
-  if (!keys.ok) return keys;
+/** The version 2 strict key list: version 1's, plus `fidelity` (ADR-029 Decision 1). */
+const MANIFEST_KEYS_V2: readonly string[] = [
+  "datasetManifestFormatId",
+  "datasetManifestVersion",
+  "fidelity",
+  ...MANIFEST_KEYS.slice(2),
+];
 
+function validateDatasetManifest(tree: unknown): SimulationResult<ReplayDataset> {
+  if (!isRecord(tree)) return invalid("the dataset manifest must be a JSON object");
+  // Identity first: which version's strict key list applies depends on it,
+  // and an approximate manifest is refused before any other field is read.
   const formatId = readField(tree, "datasetManifestFormatId");
   const version = readField(tree, "datasetManifestVersion");
-  if (formatId !== SUPPORTED_DATASET_MANIFEST_FORMAT_ID || version !== SUPPORTED_DATASET_MANIFEST_VERSION) {
+  if (
+    formatId !== SUPPORTED_DATASET_MANIFEST_FORMAT_ID ||
+    typeof version !== "number" ||
+    !SUPPORTED_DATASET_MANIFEST_VERSIONS.includes(version)
+  ) {
     return simulationFailure(
       "REPLAY_MANIFEST_UNSUPPORTED",
       "the dataset manifest names a format this build does not replay",
@@ -267,6 +305,36 @@ function validateDatasetManifest(tree: unknown): SimulationResult<ReplayDataset>
       },
     );
   }
+  if (version === 2) {
+    const observedKeys = recordKeys(tree);
+    if (!observedKeys.includes("fidelity")) {
+      return invalid(
+        "a version 2 dataset manifest must state its fidelity (ADR-029 Decision 1.6)",
+        { version },
+      );
+    }
+    const fidelity = readField(tree, "fidelity");
+    if (fidelity === "approximate") {
+      return simulationFailure(
+        "REPLAY_MANIFEST_APPROXIMATE",
+        "the dataset manifest describes an approximate (research-tier) dataset; this is the exact " +
+          "replay door, and an approximate dataset is never determinism, calibration, promotion or " +
+          "soak evidence (ADR-029 Decisions 2 and 4.3)",
+        { fidelity },
+      );
+    }
+    if (fidelity !== "exact") {
+      return invalid("the dataset manifest declares an unknown fidelity (ADR-029 Decision 1.1)", {
+        fidelity: typeof fidelity === "string" ? fidelity : "(not a string)",
+      });
+    }
+  }
+  const keys = requireStrictKeys(
+    tree,
+    "the dataset manifest",
+    version === 2 ? MANIFEST_KEYS_V2 : MANIFEST_KEYS,
+  );
+  if (!keys.ok) return keys;
 
   const datasetId = readField(tree, "datasetId");
   if (!isNonEmptyString(datasetId)) return invalid("datasetId must be a bounded non-empty string");
@@ -361,7 +429,7 @@ function validateDatasetManifest(tree: unknown): SimulationResult<ReplayDataset>
     ownFrozenTree<ReplayDataset>({
       datasetId,
       datasetManifestFormatId: SUPPORTED_DATASET_MANIFEST_FORMAT_ID,
-      datasetManifestVersion: SUPPORTED_DATASET_MANIFEST_VERSION,
+      datasetManifestVersion: version,
       walFormatId: SUPPORTED_WAL_FORMAT_ID,
       parquetLayoutId: SUPPORTED_PARQUET_LAYOUT_ID,
       parquetLayoutVersion: 1,

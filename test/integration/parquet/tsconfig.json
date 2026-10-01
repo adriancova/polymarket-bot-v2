@@ -11,7 +11,9 @@
       ],
       "@polymarket-bot/storage-wal": ["packages/storage-wal/src/index.ts"],
       "@polymarket-bot/storage-wal/testing": ["packages/storage-wal/src/testing/index.ts"],
-      "@polymarket-bot/research-worker": ["apps/research-worker/src/index.ts"]
+      "@polymarket-bot/research-worker": ["apps/research-worker/src/index.ts"],
+      "@polymarket-bot/storage-postgres": ["packages/storage-postgres/src/index.ts"],
+      "@polymarket-bot/storage-postgres/testing": ["packages/storage-postgres/src/testing/index.ts"]
     }
   },
   "include": ["."]
