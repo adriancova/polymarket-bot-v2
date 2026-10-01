@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260`, `WP-300` and `STORAGE-1` are Complete. `CI-4` is Complete. `THROUGHPUT-1c` and `STORAGE-GOV` (the ADR-028 amendment) are running. Wave 3 continues with `WP-270`; `CO2-N1` must be fixed before it. Then `HOST-BENCH` and the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Next:** `WP-260`, `WP-300` and `STORAGE-1` are Complete. `CI-4` is Complete. `THROUGHPUT-1c` is accepted and waits only for the user's ADR-023 ratification. `STORAGE-GOV` (the ADR-028 amendment) is running. Wave 3 continues with `WP-270`; `CO2-N1` must be fixed before it. Then `HOST-BENCH` and the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -45,7 +45,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `STORAGE-1` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`STORAGE-GOV`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: an ADR-028 amendment that records the retention-safety rules `STORAGE-1` implemented and its reviewers accepted, and where it stops short of the ADR (`STORAGE-1` follow_up 1). It may edit only `docs/adr/ADR-028-*.md` and, if needed, the ADR-028 row of `docs/adr/README.md`. It decides nothing new. Verifiers: Opus and gpt-6-astra, reconciled.
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
-- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. In review rounds 9-12 (tip `298199d`); verifiers Opus and gpt-6-astra. It merges only after the user ratifies ADR-023.
+- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`. It merges only after the user ratifies ADR-023. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
   - **Interim rulings (orchestrator, 2026-10-01), each the most conservative option, pending the user's ADR-023 ratification:**
     - **ADR-023 D7: option (a)**, the process-lag guard, as implemented. Not (b), narrowing criterion B, and not (c), deferring the opt-in.
     - **The Clock-port reading:** the guard's use of the `Clock` port is NOT a clock-semantics change. Every age stays in event time; the process clock can only remove the extension ADR-023 adds, never make a book fresher (ADR-023 D7). `CO2-N1` is unchanged.
@@ -151,7 +151,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `OUTAGE-2` | make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt | Complete (2026-09-29) | `a618752` | [OUTAGE-2](docs/handoffs/OUTAGE-2.md) |
 | `THROUGHPUT-1a` | the trader keeps pace with a live 15-minute market; its stream lag is visible | Complete (2026-09-30) | `229d58a` | [THROUGHPUT-1a](docs/handoffs/THROUGHPUT-1a.md) |
 | `THROUGHPUT-1b` | the gateway publishes a window-open burst without overflowing; the example config subscribes to books | Complete (2026-09-30) | `c179095` | [THROUGHPUT-1b](docs/handoffs/THROUGHPUT-1b.md) |
-| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | **In review** (authorized 2026-09-29); merges after the user ratifies ADR-023 | — | — |
+| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | **Accepted, awaiting the user's ADR-023 ratification** (joint ACCEPT r9, `d997d39`; draft PR #38) | — | — |
 | `DEPS-1` | CI health: new high advisories in dev/test-only transitive dependencies | Complete (2026-09-30) | `f6a2714` | the archived row |
 | `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Complete (2026-09-30) | `7d59fd3` | [THROUGHPUT-2](docs/handoffs/THROUGHPUT-2.md) |
 | `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
