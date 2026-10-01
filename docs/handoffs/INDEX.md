@@ -109,3 +109,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [HOST-BENCH-PREP.md](HOST-BENCH-PREP.md) | `HOST-BENCH-PREP`: the laptop guide and host measurement tools | Round | Complete (2026-09-30) | `1710a86` | 23 KB |
 | 2026-09-30 | [CI-3.md](CI-3.md) | `CI-3`: run the secure-SDK contract suite in CI | Round | Complete (2026-09-30) | `a145fa4` | 1 KB |
 | 2026-09-30 | [LEAN-GOV.md](LEAN-GOV.md) | `LEAN-GOV`: ADR-025..030 and work-plan rows for the LEAN-1 rulings | Governance | Complete (2026-09-30) | `78ba39b` | 6 KB |
+| 2026-10-01 | [WP-300.md](WP-300.md) | `WP-300`: collateral inventory and wallet operations | WP | Complete (2026-10-01) | `9cdbf32` | 9 KB |
