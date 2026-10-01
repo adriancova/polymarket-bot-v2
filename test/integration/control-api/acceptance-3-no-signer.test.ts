@@ -3,16 +3,20 @@
  *
  * Asserted by ABSENCE, over the shipped source of both trees `WP-240` owns,
  * plus the manifests — and, for imports, over the control API's own test
- * suites and `infra/grafana/**` too (`CONTROL-1`, closing `WP-240` r1 N-4),
- * in every spelling an import can take (`CONTROL-1` r1, closing
- * `CONTROL1-J-L1`). This is the `apps/trader` precedent
+ * suites and `infra/grafana/**` too (`CONTROL-1`, closing `WP-240` r1 N-4).
+ * Imports are read from each file's SYNTAX TREE, as the evaluated literal,
+ * and whatever the scan cannot read fails it (`CONTROL-1b`, closing
+ * `CONTROL1-R2-J-L1`: the regular expression of `CONTROL-1` r1 missed a line
+ * comment and an escaped specifier; `support/module-loads.ts`). This is the
+ * `apps/trader` precedent
  * (`test/integration/paper-trader/compose-and-example-config.test.ts`'s scans),
  * applied to a package whose §4.1 description is literally "never has the
  * signing key".
  *
  * Three independent claims:
  *
- * 1. **No import** of the secure adapter, a venue client, or a signing library.
+ * 1. **No import** of the secure adapter, a venue client, or a signing library
+ *    — and none of them even resolves from a scanned tree.
  * 2. **No identifier** naming a signer, a wallet key or a credential in
  *    production source — and the exceptions are enumerated, not waived: the
  *    words appear only where the code REFUSES them.
@@ -20,26 +24,32 @@
  *    credential-shaped value in the shipped example configuration.
  */
 
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
 import { ALL_PRODUCTION_NAMES, CREDENTIAL_NAME_PATTERNS } from "@polymarket-bot/observability";
 
+import {
+  COMPUTED,
+  LOADER_MODULES,
+  SCANNED_EXTENSIONS,
+  UNPARSEABLE,
+  loaderFinding,
+  moduleLoadsIn,
+  type ModuleLoad,
+} from "./support/module-loads.js";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
 
 /**
- * Every file a module loader could execute, and JSON. `CONTROL-1` (N-4) widened
- * this from `.ts`/`.json`: the newly scanned trees are allowed to hold a
- * script, and a `.mjs` under `infra/grafana/**` importing a signing library
- * would otherwise be walked past.
+ * Every file a module loader could execute, and JSON (`CONTROL-1`, N-4). Each
+ * is read with its own extension's grammar (`support/module-loads.ts`).
  */
-const SCANNED_EXTENSIONS = [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"] as const;
-
 function walk(directory: string): readonly string[] {
   const out: string[] = [];
   for (const entry of readdirSync(directory)) {
@@ -64,7 +74,7 @@ const PRODUCTION_FILES = FILES.filter((path) => !path.endsWith(".test.ts"));
  * imported by a test of a process that "never has the signing key" would load
  * one into the very worker that proves it is absent; and a dashboard tree is
  * JSON today, so the scan's job there is to keep it that way. These trees are
- * READ here, never written — `infra/grafana/**` is outside `CONTROL-1`'s grant.
+ * READ here, never written — `infra/grafana/**` is outside this round's grant.
  */
 const IMPORT_SCAN_TREES = [
   ...OWNED_TREES,
@@ -76,28 +86,6 @@ const IMPORT_SCAN_FILES = IMPORT_SCAN_TREES.flatMap((tree) => walk(tree));
 
 function read(path: string): string {
   return readFileSync(path, "utf8");
-}
-
-/**
- * The module specifiers `source` names in an import position, WHATEVER the
- * spelling (`CONTROL-1` r1, closing `CONTROL1-J-L1`): `from`, a bare
- * `import`, a dynamic `import(…)` and `require(…)`, with any of the three
- * quote characters, with or without whitespace — or a block comment — between
- * the keyword, the parenthesis and the specifier.
- *
- * Round 0's scan matched four DOUBLE-quoted literals by substring, so a
- * single-quoted specifier, a space before a dynamic import's parenthesis, no
- * space after `from`, and a template-literal specifier all passed it; both
- * verifiers planted such a file and it went unseen. (This comment names no
- * spelling literally: the scan reads this file too.) It deliberately over-matches rather than parsing: a comment that
- * reads like an import is reported too, and that is the safe side of a scan
- * that proves an absence.
- */
-const IMPORT_SPECIFIER =
-  /\b(?:from|import|require)\s*(?:\/\*[\s\S]*?\*\/\s*)*\(?\s*(?:\/\*[\s\S]*?\*\/\s*)*(['"`])([^'"`\r\n]*)\1/gu;
-
-function importedSpecifiers(source: string): readonly string[] {
-  return [...source.matchAll(IMPORT_SPECIFIER)].map((match) => match[2] ?? "");
 }
 
 const FORBIDDEN_SPECIFIERS = [
@@ -112,38 +100,190 @@ const FORBIDDEN_SPECIFIERS = [
   "@ethersproject",
 ] as const;
 
-/** The forbidden specifiers `source` imports — a PREFIX match, so `viem/accounts` counts. */
-function forbiddenImportsIn(source: string): readonly string[] {
-  return importedSpecifiers(source).filter((specifier) =>
-    FORBIDDEN_SPECIFIERS.some((forbidden) => specifier.startsWith(forbidden)),
+/** A signing library or the secure adapter — a PREFIX match, so `viem/accounts` counts. Never excusable. */
+function isForbiddenSpecifier(specifier: string): boolean {
+  return FORBIDDEN_SPECIFIERS.some((forbidden) => specifier.startsWith(forbidden));
+}
+
+/**
+ * A finding the scan cannot READ as a literal it can judge: a computed
+ * specifier, a named loader, a loader module, or an unparseable file
+ * (`support/module-loads.ts`, "What cannot be read FAILS"). Each is a
+ * violation unless {@link LOAD_ALLOWLIST} covers it.
+ */
+function isUnreadable(load: ModuleLoad): boolean {
+  return (
+    load.specifier === COMPUTED ||
+    load.specifier === UNPARSEABLE ||
+    load.specifier.startsWith("<loader:") ||
+    LOADER_MODULES.includes(load.specifier)
   );
 }
 
 /**
- * Every spelling of an import of `specifier` the scan must catch. Built at
- * RUN time from parts, so this file's own source — which the scan reads —
- * spells none of them.
+ * The EXPLICIT allowlist for unreadable findings (`CONTROL-1b`): one entry per
+ * repository-relative file and finding, with the exact number of occurrences
+ * and why each is safe. A forbidden literal is never allowlistable, and an
+ * entry that no longer matches its file exactly is itself a failure, so the
+ * list cannot go stale.
+ *
+ * EMPTY, and measured to be: nothing in the scanned trees today computes a
+ * specifier, names a loader, imports a loader module or fails to parse.
  */
-function plantedSpellings(specifier: string): readonly string[] {
-  const spellings: string[] = [];
+interface LoadAllowlistEntry {
+  readonly file: string;
+  readonly finding: string;
+  readonly count: number;
+  readonly justification: string;
+}
+const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([]);
+
+/**
+ * Every violation in one file: each forbidden literal, and each unreadable
+ * finding the allowlist does not cover EXACTLY.
+ */
+function violationsIn(
+  path: string,
+  text: string,
+  allowlist: readonly LoadAllowlistEntry[] = LOAD_ALLOWLIST,
+): readonly string[] {
+  const file = relative(repoRoot, path);
+  const loads = moduleLoadsIn(text, path);
+  const violations: string[] = [];
+  const unreadable = new Map<string, number>();
+  for (const load of loads) {
+    if (isForbiddenSpecifier(load.specifier)) {
+      violations.push(`${file}:${String(load.line)} ${load.kind} ${load.specifier}`);
+    } else if (isUnreadable(load)) {
+      unreadable.set(load.specifier, (unreadable.get(load.specifier) ?? 0) + 1);
+    }
+  }
+  const entries = allowlist.filter((entry) => entry.file === file);
+  for (const [finding, count] of unreadable) {
+    const entry = entries.find((candidate) => candidate.finding === finding);
+    if (entry === undefined) violations.push(`${file} ${finding} x${String(count)} (not allowlisted)`);
+    else if (entry.count !== count) {
+      violations.push(`${file} ${finding} x${String(count)} (the allowlist expects ${String(entry.count)})`);
+    }
+  }
+  for (const entry of entries) {
+    if (!unreadable.has(entry.finding)) violations.push(`${file} ${entry.finding} (a stale allowlist entry)`);
+  }
+  return violations;
+}
+
+/** The specifiers `text` loads, as `path`'s grammar reads them. */
+function specifiersIn(text: string, path: string): readonly string[] {
+  return moduleLoadsIn(text, path).map((load) => load.specifier);
+}
+
+/**
+ * Every spelling of a LOAD of `specifier` the scan must read as that
+ * specifier: each import, export, require and type form, with every comment
+ * placement and every escape the verifiers used (`CONTROL1-J-L1`,
+ * `CONTROL1-R2-J-L1`). Built at RUN time from parts, so this file names none
+ * of them in a load position — and the scan reads this file too. `ts` marks a
+ * spelling that only the TypeScript grammar has; in a JavaScript file it is
+ * refused as unparseable, which fails the scan as well.
+ */
+function plantedSpellings(specifier: string): readonly { readonly text: string; readonly ts: boolean }[] {
+  const out: { text: string; ts: boolean }[] = [];
+  const escaped = [
+    // `\x76`, `v`, `\u{76}` and a line continuation, for every letter the
+    // escape replaces — the evaluated literal is the specifier itself.
+    [...specifier].map((c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`).join(""),
+    [...specifier].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""),
+    [...specifier].map((c) => `\\u{${c.charCodeAt(0).toString(16)}}`).join(""),
+    `${specifier.slice(0, 1)}\\\n${specifier.slice(1)}`,
+  ];
   for (const quote of ["'", '"', "`"]) {
     const q = (text: string): string => `${quote}${text}${quote}`;
-    spellings.push(
-      `import x from ${q(specifier)};`,
-      `import { y } from${q(specifier)};`,
-      `export * from ${q(specifier)};`,
-      `import ${q(specifier)};`,
-      `import${q(specifier)};`,
-      `const m = await import(${q(specifier)});`,
-      `const m = await import ( ${q(specifier)} );`,
-      `const m = await import(/* lazy */ ${q(specifier)});`,
-      `const m = require(${q(specifier)});`,
-      `const m = require (\n  ${q(specifier)}\n);`,
-      `import z = require(${q(specifier)});`,
-      `type T = typeof import(${q(specifier)});`,
-    );
+    const plain = q(specifier);
+    const both = (text: string): void => {
+      out.push({ text, ts: false });
+    };
+    const tsOnly = (text: string): void => {
+      out.push({ text, ts: true });
+    };
+    if (quote !== "`") {
+      // Static forms take a string literal only; a template is a syntax error there.
+      both(`import x from ${plain};`);
+      both(`import { y } from${plain};`);
+      both(`import * as ns from ${plain};`);
+      tsOnly(`import type { T } from ${plain};`);
+      both(`import ${plain};`);
+      both(`import${plain};`);
+      both(`export * from ${plain};`);
+      both(`export * as ns from ${plain};`);
+      both(`export { y } from ${plain};`);
+      tsOnly(`export type { T } from ${plain};`);
+      both(`export * from // reviewer plant\n${plain};`); // astra, CONTROL1-R2-J-L1
+      both(`import x from /* plant */ ${plain};`);
+      both(`import x from\n// plant\n${plain};`);
+      both(`import x from ${plain} with { type: "json" };`);
+      tsOnly(`import z = require(${plain});`);
+      tsOnly(`export import z = require(${plain});`);
+      tsOnly(`type T = typeof import(${plain});`);
+      tsOnly(`declare module ${plain} { export const z: number; }`);
+      both(`/// <reference types=${plain} />\nexport {};`);
+      both(`/// <amd-dependency path=${plain} />\nexport {};`);
+      both(`/** @import { X } from ${plain} */\nexport const y = 1;`);
+      for (const form of escaped) {
+        both(`import ${q(form)};`); // astra's escaped bare import
+        both(`export * from ${q(form)};`);
+        both(`const m = await import(${q(form)});`);
+        both(`const m = require(${q(form)});`);
+      }
+    }
+    both(`const m = await import(${plain});`);
+    both(`const m = await import ( ${plain} );`);
+    both(`const m = await import(/* lazy */ ${plain});`);
+    both(`const m = await import( // lazy\n ${plain});`); // Opus, CONTROL1-R2-J-L1
+    both(`const m = await import(${plain}, { with: { type: "json" } });`);
+    both(`void import(${plain}).then(() => undefined);`);
+    both(`const m = require(${plain});`);
+    both(`const m = require (\n  ${plain}\n);`);
+    both(`const m = require( // c\n ${plain});`);
+    both(`const m = require?.(${plain});`);
+    both(`const m = (require)(${plain});`);
+    both(`const m = \\u0072equire(${plain});`);
+    both(`const m = module.require(${plain});`);
+    if (quote === "`") {
+      for (const form of escaped) both(`const m = await import(${q(form)});`);
+    }
   }
-  return spellings;
+  return out;
+}
+
+/**
+ * Spellings whose specifier the scan CANNOT read, and which must therefore
+ * fail it: computed specifiers, named loaders and loader modules. Built from
+ * parts, as above.
+ */
+function unreadableSpellings(specifier: string): readonly string[] {
+  const head = specifier.slice(0, 2);
+  const tail = specifier.slice(2);
+  return [
+    `const m = await import("${head}" + "${tail}");`,
+    `const m = await import(\`\${"${head}"}${tail}\`);`,
+    `const name = "${specifier}"; const m = await import(name);`,
+    `const m = require("${head}" + "${tail}");`,
+    `const r = require; const m = r("${specifier}");`,
+    `const m = module["require"]("${specifier}");`,
+    `import { createRequire } from "node:module"; const m = createRequire(import.meta.url)("${specifier}");`,
+    `const m = await eval("import('${specifier}')");`,
+    `const m = await (0, eval)("import('${specifier}')");`,
+    `const m = await globalThis["eval"]("import('${specifier}')");`,
+    `const m = await new Function("return import('${specifier}')")();`,
+    `const m = await Function("return import('${specifier}')")();`,
+    `const m = Module._load("${specifier}");`,
+    `import vm from "node:vm"; vm.runInThisContext("0");`,
+  ];
+}
+
+/** Text that does not parse — an escaped keyword is a syntax error — and so fails the scan. */
+function unparseableSpellings(specifier: string): readonly string[] {
+  return [`\\u0069mport("${specifier}");`, `import x from "${specifier}" ((;`, `export * from;`];
 }
 
 describe("ACCEPTANCE 3: no signer is loaded", () => {
@@ -164,56 +304,187 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     expect(IMPORT_SCAN_FILES).toContain(resolve(repoRoot, "infra/grafana/control/operations-dashboard.json"));
   });
 
-  it("imports NO secure adapter, venue client or signing library, anywhere", () => {
+  it("imports NO secure adapter, venue client or signing library, anywhere — and reads every load it finds", () => {
+    let loads = 0;
     for (const path of IMPORT_SCAN_FILES) {
-      expect(forbiddenImportsIn(read(path)), `${path} imports a forbidden module`).toEqual([]);
+      expect(violationsIn(path, read(path)), `${path} loads a forbidden or unreadable module`).toEqual([]);
+      loads += moduleLoadsIn(read(path), path).length;
     }
+    // Non-vacuity: the parser really did read the trees' imports.
+    expect(loads).toBeGreaterThan(200);
   });
 
-  it("CONTROL-1 r1 (J-L1): the scan catches EVERY spelling of a forbidden import, and no clean one", () => {
+  it("CONTROL-1b: the allowlist is exact — every entry names a scanned file, a finding it really has, and why", () => {
+    for (const entry of LOAD_ALLOWLIST) {
+      const path = resolve(repoRoot, entry.file);
+      expect(IMPORT_SCAN_FILES, entry.file).toContain(path);
+      expect(entry.justification.length, entry.file).toBeGreaterThanOrEqual(40);
+      expect(isForbiddenSpecifier(entry.finding), entry.finding).toBe(false);
+    }
+    // The mechanism, on a synthetic file: an entry excuses EXACTLY its count,
+    // a wrong count or a stale entry fails, and a forbidden literal is never
+    // excused, whatever the allowlist says.
+    const path = resolve(repoRoot, "test/integration/control-api/synthetic.ts");
+    const text = 'const a = await import(x);\nconst b = await import(y);\n';
+    const entry = (count: number, finding = COMPUTED): LoadAllowlistEntry => ({
+      file: "test/integration/control-api/synthetic.ts",
+      finding,
+      count,
+      justification: "a synthetic entry exercising the allowlist mechanism itself",
+    });
+    expect(violationsIn(path, text, [])).toEqual(["test/integration/control-api/synthetic.ts <computed> x2 (not allowlisted)"]);
+    expect(violationsIn(path, text, [entry(2)])).toEqual([]);
+    expect(violationsIn(path, text, [entry(1)])).toHaveLength(1);
+    expect(violationsIn(path, text, [entry(3)])).toHaveLength(1);
+    expect(violationsIn(path, "export const clean = 1;\n", [entry(2)])).toEqual([
+      "test/integration/control-api/synthetic.ts <computed> (a stale allowlist entry)",
+    ]);
+    const forbidden = `${text}import "${FORBIDDEN_SPECIFIERS[6]}";\n`;
+    expect(violationsIn(path, forbidden, [entry(2), entry(1, FORBIDDEN_SPECIFIERS[6])])).toContain(
+      "test/integration/control-api/synthetic.ts:3 import viem",
+    );
+  });
+
+  it("CONTROL-1b (R2-J-L1): every spelling of a load is read as its EVALUATED specifier — comments and escapes included", () => {
     for (const specifier of FORBIDDEN_SPECIFIERS) {
       for (const spelling of plantedSpellings(specifier)) {
-        expect(forbiddenImportsIn(spelling), spelling).toEqual([specifier]);
+        const path = resolve(repoRoot, "test/integration/control-api/planted.ts");
+        expect(specifiersIn(spelling.text, path), spelling.text).toContain(specifier);
+        expect(violationsIn(path, spelling.text).length, spelling.text).toBeGreaterThan(0);
       }
     }
-    // A subpath is an import of the package.
-    expect(forbiddenImportsIn(plantedSpellings("viem/accounts")[0] ?? "")).toEqual(["viem/accounts"]);
-    // Negative controls: a permitted import in every spelling, and the words
-    // as plain text, are not reported.
-    for (const spelling of plantedSpellings("@polymarket-bot/observability")) {
-      expect(forbiddenImportsIn(spelling), spelling).toEqual([]);
+    // A subpath is a load of the package.
+    const subpath = plantedSpellings("viem/accounts")[0]?.text ?? "";
+    expect(violationsIn(resolve(repoRoot, "planted.ts"), subpath)).toEqual(["planted.ts:1 import viem/accounts"]);
+    // The verifiers' three round-2 plants, exactly as reported.
+    const reported = [
+      ["export * from // c\n", "'viem';"].join(""),
+      ["import '", "\\x76iem';"].join(""),
+      ["const m = await import( // c\n ", '"ethers");'].join(""),
+    ];
+    for (const plant of reported) {
+      expect(violationsIn(resolve(repoRoot, "planted.ts"), plant).length, plant).toBe(1);
     }
-    expect(forbiddenImportsIn('const words = ["viem", "ethers"]; // no import here')).toEqual([]);
   });
 
-  it("CONTROL-1 r1 (J-L1): a planted import is caught in EVERY scanned tree, in a file the walk really reaches", () => {
+  it("CONTROL-1b (R2-J-L1): a specifier the scan cannot read, a named loader, a loader module or a parse error FAILS it", () => {
+    const path = resolve(repoRoot, "test/integration/control-api/planted.ts");
+    for (const specifier of ["viem", "ethers", "@polymarket-bot/polymarket-secure"]) {
+      for (const spelling of unreadableSpellings(specifier)) {
+        const violations = violationsIn(path, spelling);
+        expect(violations.length, spelling).toBeGreaterThan(0);
+        // …and not by accident: nothing here names the specifier as a literal.
+        expect(specifiersIn(spelling, path), spelling).not.toContain(specifier);
+      }
+      for (const spelling of unparseableSpellings(specifier)) {
+        // Whatever the parser's recovery read, the file did not parse — fail.
+        expect(violationsIn(path, spelling).length, spelling).toBeGreaterThan(0);
+        expect(specifiersIn(spelling, path), spelling).toContain(UNPARSEABLE);
+      }
+    }
+    expect(specifiersIn("const r = require;", path)).toEqual([loaderFinding("require")]);
+    expect(specifiersIn("\\u0069mport('x');", path)).toContain(UNPARSEABLE);
+  });
+
+  it("CONTROL-1b: negative controls — permitted modules, and the words as data, comments or types, are not reported", () => {
+    const path = resolve(repoRoot, "test/integration/control-api/planted.ts");
+    for (const spelling of plantedSpellings("@polymarket-bot/observability")) {
+      expect(violationsIn(path, spelling.text), spelling.text).toEqual([]);
+    }
+    for (const clean of [
+      'const words = ["viem", "ethers"]; // import "viem" in a comment\n',
+      '/* const m = require("viem"); */ export const required = true;\n',
+      'const label = `import("viem")`;\nexport const t = label;\n',
+      "export function call(f: Function): unknown { return f; }\n",
+      'export const options = { required: ["web3"] };\n',
+    ]) {
+      expect(violationsIn(path, clean), clean).toEqual([]);
+    }
+    expect(violationsIn(resolve(repoRoot, "planted.json"), '{ "import": "viem", "from": "ethers" }')).toEqual([]);
+  });
+
+  it("CONTROL-1b: a planted load is caught in EVERY scanned tree, in a real file the walk reaches and in every extension", () => {
     const spellings = plantedSpellings("viem");
     for (const tree of IMPORT_SCAN_TREES) {
-      // The tree's own first file, as the walk found it, with an import
-      // appended in memory — the tree itself is only READ (infra/** is outside
-      // CONTROL-1's grant).
+      // The tree's own first file, as the walk found it, with a load appended
+      // in memory — the trees are only READ (infra/** is outside the grant).
       const reached = IMPORT_SCAN_FILES.find((path) => path.startsWith(`${tree}/`));
       expect(reached, `${tree} contributes no file`).toBeDefined();
-      const source = read(reached ?? "");
-      expect(forbiddenImportsIn(source), `${reached ?? ""} is not clean to begin with`).toEqual([]);
+      const path = reached ?? "";
+      const source = read(path);
+      expect(violationsIn(path, source), `${path} is not clean to begin with`).toEqual([]);
       for (const spelling of spellings) {
-        expect(forbiddenImportsIn(`${source}\n${spelling}\n`), `${tree}: ${spelling}`).toEqual(["viem"]);
+        // A triple-slash directive is one only at the TOP of a file (further
+        // down it is an inert comment, to TypeScript and to the runtime), so
+        // it is planted first; every other load is planted after the source.
+        const planted = spelling.text.startsWith("///")
+          ? `${spelling.text}\n${source}`
+          : `${source}\n${spelling.text}\n`;
+        expect(violationsIn(path, planted).length, `${tree}: ${spelling.text}`).toBeGreaterThan(0);
+      }
+      // A file of EVERY scanned extension in this tree, read with its grammar:
+      // a code file names the specifier; JSON cannot hold a load at all.
+      for (const extension of SCANNED_EXTENSIONS) {
+        const virtual = join(tree, `planted${extension}`);
+        for (const spelling of spellings) {
+          const loads = specifiersIn(spelling.text, virtual);
+          expect(violationsIn(virtual, spelling.text).length, `${virtual}: ${spelling.text}`).toBeGreaterThan(0);
+          if (extension === ".json") expect(loads).toEqual([UNPARSEABLE]);
+          else if (!spelling.ts || [".ts", ".mts", ".cts"].includes(extension)) expect(loads, spelling.text).toContain("viem");
+        }
       }
     }
   });
 
-  it("CONTROL-1 r1 (J-L1): the walk reaches a planted file of EVERY scanned extension, and the scan reports each", () => {
-    const directory = mkdtempSync(join(tmpdir(), "control-1-r1-n4-"));
+  it("CONTROL-1b: the walk reaches a planted FILE of every scanned extension, and the scan reports each", () => {
+    const directory = mkdtempSync(join(tmpdir(), "control-1b-l1-"));
     try {
-      const spellings = plantedSpellings("ethers");
+      const reported = [
+        ["export * from // c\n", "'ethers';"].join(""),
+        ["import '", "\\x65thers';"].join(""),
+        ["const m = await import( // c\n ", '"ethers");'].join(""),
+      ];
       SCANNED_EXTENSIONS.forEach((extension, index) => {
-        writeFileSync(join(directory, `planted${extension}`), spellings[index % spellings.length] ?? "", "utf8");
+        writeFileSync(join(directory, `planted${extension}`), reported[index % reported.length] ?? "", "utf8");
       });
       const walked = walk(directory);
       expect(walked).toHaveLength(SCANNED_EXTENSIONS.length);
-      for (const path of walked) expect(forbiddenImportsIn(read(path)), path).toEqual(["ethers"]);
+      for (const path of walked) {
+        expect(violationsIn(path, read(path)).length, path).toBe(1);
+        expect(specifiersIn(read(path), path), path).toEqual(path.endsWith(".json") ? [UNPARSEABLE] : ["ethers"]);
+      }
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("CONTROL-1b: the layer behind the scan — no forbidden package even RESOLVES from a scanned tree", () => {
+    // Node's lookup for a bare specifier: `node_modules/<package>` in the
+    // importing directory and every ancestor. A load spelled in a way no
+    // static scan can read would still have nothing to load.
+    const packageOf = (specifier: string): string =>
+      specifier.startsWith("@") ? specifier.split("/").slice(0, 2).join("/") : (specifier.split("/")[0] ?? specifier);
+    const resolvable = (from: string, specifier: string): boolean => {
+      for (let directory = from; ; directory = dirname(directory)) {
+        if (existsSync(join(directory, "node_modules", packageOf(specifier)))) return true;
+        if (dirname(directory) === directory) return false;
+      }
+    };
+    const scopeOnly = (specifier: string): boolean => specifier.startsWith("@") && !specifier.includes("/");
+    for (const tree of IMPORT_SCAN_TREES) {
+      for (const specifier of FORBIDDEN_SPECIFIERS) {
+        if (scopeOnly(specifier)) {
+          // `@ethersproject` is a SCOPE: no package of it may be reachable.
+          for (let directory = tree; ; directory = dirname(directory)) {
+            expect(existsSync(join(directory, "node_modules", specifier)), `${directory}: ${specifier}`).toBe(false);
+            if (dirname(directory) === directory) break;
+          }
+        } else {
+          expect(resolvable(tree, specifier), `${tree}: ${specifier}`).toBe(false);
+        }
+      }
+      // Positive control: the lookup does find a package that IS reachable.
+      expect(resolvable(tree, "typescript"), `${tree}: typescript`).toBe(true);
     }
   });
 

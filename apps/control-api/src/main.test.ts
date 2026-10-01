@@ -7,10 +7,17 @@
  * over a real one in the integration suite.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { EXIT_CODES, startup, type StartupPorts } from "./main.js";
-import { FAKE_OPERATOR_TOKEN } from "./testing/index.js";
+import {
+  InMemoryControlAuditLog,
+  type AuditAppendResult,
+  type ControlAuditSink,
+} from "@polymarket-bot/observability";
+
+import { AUDIT_APPEND_TIMEOUT_MS, CONTROL_PLANE_VOID_ACTOR } from "./control-plane.js";
+import { EXIT_CODES, composeControlPlane, startup, type StartupPorts } from "./main.js";
+import { FAKE_OPERATOR_TOKEN, ScriptedEnvironment } from "./testing/index.js";
 
 function validConfig(): string {
   return JSON.stringify({
@@ -153,5 +160,52 @@ describe("exit codes", () => {
       unsafeEnvironment: 78,
       configurationRefused: 78,
     });
+  });
+});
+
+describe("CONTROL-1b: the control plane the shipped process composes", () => {
+  it("bounds every append at the default, and VOIDS a record that lands late with the environment's instant and id", async () => {
+    vi.useFakeTimers();
+    try {
+      const log = new InMemoryControlAuditLog(16);
+      const held: (() => void)[] = [];
+      // The first APPLIED append is held — a durable sink that answers late.
+      const sink: ControlAuditSink = {
+        append: (record) =>
+          record.outcome === "APPLIED" && held.length === 0
+            ? new Promise<AuditAppendResult>((resolve) => {
+                held.push(() => {
+                  void log.append(record).then(resolve);
+                });
+              })
+            : log.append(record),
+      };
+      const environment = new ScriptedEnvironment();
+      const plane = composeControlPlane(sink, environment);
+      expect(plane.auditAppendTimeoutMs).toBe(AUDIT_APPEND_TIMEOUT_MS);
+
+      const engaged = plane.engageKillSwitch(
+        { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" },
+        { actor: "operator-a", at: environment.now(), auditRecordId: environment.nextAuditRecordId(), reason: "halt now" },
+      );
+      await vi.advanceTimersByTimeAsync(AUDIT_APPEND_TIMEOUT_MS);
+      expect(await engaged).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+
+      held[0]?.();
+      for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+      const records = log.records();
+      expect(records.map((record) => `${record.actor}/${record.outcome}`)).toEqual([
+        "operator-a/APPLIED",
+        `${CONTROL_PLANE_VOID_ACTOR}/REFUSED`,
+      ]);
+      // The void's id and instant are the ENVIRONMENT's next ones.
+      expect(records[1]).toMatchObject({
+        recordId: "01930000-0000-7000-8000-000000000002",
+        at: "2026-09-05T00:00:02.000Z",
+      });
+      expect(plane.killSwitches()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

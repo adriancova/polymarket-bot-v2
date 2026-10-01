@@ -10,9 +10,10 @@
  *
  * **No Docker, no external network, no credential.** Every server this suite
  * starts binds `127.0.0.1` on an ephemeral port and is closed afterwards. The
- * PostgreSQL audit sink is typecheck-pinned only and is not exercised here; the
- * acceptance-2 evidence is against the real control plane and the real
- * append-only log.
+ * PostgreSQL audit sink is not exercised HERE; the acceptance-2 evidence is
+ * against the real control plane and the real append-only log. (`CONTROL-1b`:
+ * `postgres/` holds the sink's real-PostgreSQL suite, excluded below and run by
+ * its own config, so this suite still starts no container.)
  *
  * ## Why this config aliases `apps/trader`
  *
@@ -33,7 +34,7 @@
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -63,6 +64,10 @@ export default defineConfig({
   test: {
     root: repoRoot,
     include: ["test/integration/control-api/**/*.test.ts"],
+    // `CONTROL-1b`: the real-PostgreSQL files start a container, and this suite
+    // starts none (CI's "control-api (no container)" step). They run through
+    // `postgres/vitest.config.ts` and `test:integration:postgres` instead.
+    exclude: [...configDefaults.exclude, "test/integration/control-api/postgres/**"],
     testTimeout: 60_000,
     hookTimeout: 60_000,
     passWithNoTests: false,

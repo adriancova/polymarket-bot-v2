@@ -11,14 +11,20 @@ import { describe, expect, it } from "vitest";
 import {
   CONTROL_API_ROUTE_TABLE,
   CONTROL_API_ROUTES,
+  ControlApi,
+  MODE_RAISE_REASON_MAX_PATH,
   MUTATION_GRANTS,
   holdsMutationAuthority,
   type ApiRequest,
   type ApiResponse,
 } from "./api.js";
+import { OperatorRegistry } from "./auth.js";
+import { ControlPlane, REFUSAL_AUDIT_MAX_ISSUES, REFUSAL_AUDIT_MAX_TEXT } from "./control-plane.js";
+import { InMemoryTraderHealthSource, TraderHealthCache } from "./health-source.js";
 import {
   FAKE_OPERATOR_TOKEN,
   FAKE_READER_TOKEN,
+  ScriptedEnvironment,
   bearer,
   createHarness,
   healthDocument,
@@ -671,5 +677,79 @@ describe("totality", () => {
         }
       }
     }
+  });
+});
+
+describe("CONTROL-1b (follow-up 3b): a mode-raise attempt's audit record is bounded at the API too", () => {
+  /** Distinct spellings of `runMode` — each a key the by-name refusal finds. */
+  function caseVariants(count: number): readonly string[] {
+    const out: string[] = [];
+    for (let mask = 0; out.length < count; mask += 1) {
+      out.push([..."runmode"].map((c, index) => ((mask >> index) & 1 ? c.toUpperCase() : c)).join(""));
+    }
+    return out;
+  }
+
+  it("keeps a bounded path and at most eight keys, then says how many more; the 403 still names them all", async () => {
+    const { api, audit } = createHarness();
+    const keys = caseVariants(20);
+    const body: Record<string, unknown> = { reason: "ok reason" };
+    for (const key of keys) body[key] = "LIVE";
+    const path = `/v1/${"p".repeat(5_000)}`;
+    const response = await api.handle(request({ method: "POST", path, body }));
+    expect(response.status).toBe(403);
+    expect(parse(response)["issues"]).toHaveLength(20);
+
+    const record = audit.records()[0];
+    expect(record?.action).toBe("MODE_RAISE_ATTEMPT");
+    expect(record?.reason.length).toBeLessThanOrEqual(REFUSAL_AUDIT_MAX_TEXT);
+    expect(record?.reason).toMatch(/^request to POST \/v1\/p+… named /u);
+    expect(record?.reason).toContain(` and ${String(20 - REFUSAL_AUDIT_MAX_ISSUES)} more`);
+    expect(record?.reason).not.toContain("p".repeat(MODE_RAISE_REASON_MAX_PATH));
+    const document = record?.resultingState as Record<string, unknown>;
+    expect(document["attemptedKeys"]).toEqual([...keys].sort().slice(0, REFUSAL_AUDIT_MAX_ISSUES));
+    expect(document["attemptedKeyCount"]).toBe("20");
+  });
+
+  it("an ordinary attempt's reason is unchanged: the method, the path and every key", async () => {
+    const { api, audit } = createHarness();
+    await api.handle(request({ method: "POST", path: "/v1/kill-switch", body: { runMode: "LIVE", allowRealOrders: true, reason: "x" } }));
+    expect(audit.records()[0]?.reason).toBe("request to POST /v1/kill-switch named allowRealOrders, runMode");
+  });
+
+  it("an audit record the sink did not confirm within the bound is answered 'NOT confirmed … may still land', never 'audited'", async () => {
+    const environment = new ScriptedEnvironment();
+    const controlPlane = new ControlPlane({
+      audit: { append: () => new Promise(() => undefined) },
+      runMode: "PAPER",
+      maximumRunMode: "PAPER",
+      repositoryMaximumRunMode: "PAPER",
+      auditAppendTimeoutMs: 20,
+      auditRecordSource: environment,
+    });
+    const api = new ControlApi({
+      operators: new OperatorRegistry([
+        { operatorId: "operator-a", token: FAKE_OPERATOR_TOKEN, grants: ["READ", "STRATEGY_CONTROL", "KILL_SWITCH"] },
+      ]),
+      controlPlane,
+      health: new TraderHealthCache(new InMemoryTraderHealthSource()),
+      environment,
+      auditCapacity: 8,
+      auditSize: () => 0,
+    });
+    const response = await api.handle(request({ method: "POST", path: "/v1/kill-switch", body: { runMode: "LIVE", reason: "x" } }));
+    expect(response.status).toBe(403);
+    const detail = String(parse(response)["detail"]);
+    expect(detail).toContain("its audit record was NOT confirmed within the append bound (CONTROL_NOT_AUDITABLE)");
+    expect(detail).toContain("may still land");
+    expect(detail).not.toContain("has been audited");
+
+    // And a mutation over the same stalled sink is a 503 with the state unmoved.
+    const engage = await api.handle(
+      request({ method: "POST", path: "/v1/kill-switch", body: { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", reason: "halt now" } }),
+    );
+    expect(engage.status).toBe(503);
+    expect(parse(engage)["code"]).toBe("CONTROL_NOT_AUDITABLE");
+    expect(controlPlane.killSwitches()).toEqual([]);
   });
 });

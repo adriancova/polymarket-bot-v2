@@ -124,13 +124,15 @@ import {
 } from "@polymarket-bot/observability";
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 
+import { boundAuditText } from "./audit-text.js";
 import { hasGrant, type OperatorCredential, type OperatorGrant, type OperatorRegistry } from "./auth.js";
-import type {
-  ControlPlane,
-  KillSwitchRelease,
-  MutatingAuditAction,
-  MutationContext,
-  RequestRefusalStage,
+import {
+  REFUSAL_AUDIT_MAX_ISSUES,
+  type ControlPlane,
+  type KillSwitchRelease,
+  type MutatingAuditAction,
+  type MutationContext,
+  type RequestRefusalStage,
 } from "./control-plane.js";
 import {
   buildDoor,
@@ -672,11 +674,14 @@ export class ControlApi {
         actor: operator.operatorId,
         at: this.#options.environment.now(),
         auditRecordId: this.#options.environment.nextAuditRecordId(),
-        reason: `request to ${request.method} ${request.path} named ${named}`,
+        reason: modeRaiseReason(request.method, request.path, forbidden),
       });
       recorded = outcome.audited
         ? "the attempt has been audited."
-        : `the attempt has been counted; it could NOT be audited (${outcome.code}), and nothing changed.`;
+        : outcome.unconfirmed
+          ? `the attempt has been counted; its audit record was NOT confirmed within the append bound ` +
+            `(${outcome.code}) and may still land, and nothing changed.`
+          : `the attempt has been counted; it could NOT be audited (${outcome.code}), and nothing changed.`;
     } else {
       this.#options.controlPlane.countModeRaiseWithoutAudit();
       recorded =
@@ -946,6 +951,29 @@ function sortedCounts(counts: ReadonlyMap<string, number>): Readonly<Record<stri
   const out: Record<string, number> = Object.create(null) as Record<string, number>;
   for (const key of [...counts.keys()].sort()) out[key] = counts.get(key) ?? 0;
   return Object.freeze(out);
+}
+
+/** How much of a request's method and path a mode-raise record's reason keeps. */
+export const MODE_RAISE_REASON_MAX_METHOD = 16;
+export const MODE_RAISE_REASON_MAX_PATH = 128;
+
+/**
+ * The reason a mode-raise attempt's audit record carries (`CONTROL-1b`,
+ * closing `CONTROL-1` follow-up 3b): the method and path, each BOUNDED, and the
+ * forbidden keys — at most `REFUSAL_AUDIT_MAX_ISSUES` of them, then how many
+ * more. At `CONTROL-1` it held the whole path and every key, so its size was
+ * the caller's choice up to the transport's limits. The control plane cuts the
+ * whole reason to `REFUSAL_AUDIT_MAX_TEXT` again, and escapes it, so this is
+ * the legible bound and that is the fence.
+ */
+function modeRaiseReason(method: string, path: string, forbidden: readonly string[]): string {
+  const shown = forbidden.slice(0, REFUSAL_AUDIT_MAX_ISSUES);
+  const more = forbidden.length - shown.length;
+  return (
+    `request to ${boundAuditText(method, MODE_RAISE_REASON_MAX_METHOD)} ` +
+    `${boundAuditText(path, MODE_RAISE_REASON_MAX_PATH)} named ${shown.join(", ")}` +
+    (more > 0 ? ` and ${String(more)} more` : "")
+  );
 }
 
 function doorProblem(refusal: {

@@ -16,15 +16,15 @@ import {
   ControlPlane,
   InMemoryTraderHealthSource,
   OperatorRegistry,
+  SafetyReservedAuditSink,
   TraderHealthCache,
   createBudgetedAuditLog,
   startControlHttpServer,
   type ControlHttpTimeouts,
   type RunningControlHttpServer,
-  type SafetyReservedAuditSink,
 } from "@polymarket-bot/control-api";
 import { ScriptedEnvironment } from "@polymarket-bot/control-api/testing";
-import type { InMemoryControlAuditLog } from "@polymarket-bot/observability";
+import { InMemoryControlAuditLog, type ControlAuditSink } from "@polymarket-bot/observability";
 
 export interface HttpResponse {
   readonly status: number;
@@ -73,6 +73,14 @@ export interface ServeOptions {
     readonly token: string;
     readonly grants: readonly ("READ" | "STRATEGY_CONTROL" | "KILL_SWITCH")[];
   }[];
+  /**
+   * `CONTROL-1b`: a sink placed BETWEEN the audit budget and the log — a slow,
+   * stalling or late-answering durable sink, as a test needs one. Absent: the
+   * shipped composition exactly (`createBudgetedAuditLog`).
+   */
+  readonly auditInner?: (log: InMemoryControlAuditLog) => ControlAuditSink;
+  /** `CONTROL-1b`: the control plane's append bound. Absent: its default. */
+  readonly auditAppendTimeoutMs?: number;
 }
 
 /**
@@ -81,15 +89,24 @@ export interface ServeOptions {
  * builds).
  */
 export async function serveControlApi(options: ServeOptions = {}): Promise<ServedApi> {
-  const { log: audit, sink: auditBudget } = createBudgetedAuditLog({
-    capacity: options.auditCapacity ?? 64,
-    safetyReserve: options.auditSafetyReserve ?? 0,
-  });
+  const budget = { capacity: options.auditCapacity ?? 64, safetyReserve: options.auditSafetyReserve ?? 0 };
+  let audit: InMemoryControlAuditLog;
+  let auditBudget: SafetyReservedAuditSink;
+  if (options.auditInner === undefined) {
+    ({ log: audit, sink: auditBudget } = createBudgetedAuditLog(budget));
+  } else {
+    audit = new InMemoryControlAuditLog(budget.capacity);
+    auditBudget = new SafetyReservedAuditSink(options.auditInner(audit), budget);
+  }
+  const environment = new ScriptedEnvironment();
   const controlPlane = new ControlPlane({
     audit: auditBudget,
     runMode: "PAPER",
     maximumRunMode: "PAPER",
     repositoryMaximumRunMode: "PAPER",
+    // As `main.ts` (`CONTROL-1b`): a void record's instant and id.
+    auditRecordSource: environment,
+    ...(options.auditAppendTimeoutMs === undefined ? {} : { auditAppendTimeoutMs: options.auditAppendTimeoutMs }),
   });
   const healthSource = new InMemoryTraderHealthSource();
   const health = new TraderHealthCache(healthSource);
@@ -97,7 +114,7 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
     operators: new OperatorRegistry([...(options.operators ?? [])]),
     controlPlane,
     health,
-    environment: new ScriptedEnvironment(),
+    environment,
     auditCapacity: options.auditCapacity ?? 64,
     auditSize: () => audit.size,
   });

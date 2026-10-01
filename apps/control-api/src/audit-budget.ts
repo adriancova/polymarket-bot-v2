@@ -49,8 +49,19 @@
  *   they are refused `503`, and an engage that would relax a `FULL_HALT` is
  *   refused whatever the tier. So the platform can still be halted, a switch
  *   can still be escalated to `FULL_HALT`, and nothing can be released or
- *   relaxed until the log is rotated. That is the fail-closed direction §14.1
- *   wants from a kill switch.
+ *   relaxed until the log is rotated — WHILE THE RESERVE HAS ROOM. That is the
+ *   fail-closed direction §14.1 wants from a kill switch. (A `KILL_SWITCH`
+ *   holder's real halts at many distinct scopes can spend the reserve, and a
+ *   further engage — a GLOBAL `FULL_HALT` included — is then refused `503`:
+ *   the joint INFO `CONTROL1-R2-J-I1`. The invariant concerns actors WITHOUT
+ *   mutation authority. No slot is held back for one final GLOBAL halt; that
+ *   would be a policy change, not made here.)
+ * - **A timed-out append keeps its slot** (`CONTROL-1b`): the control plane's
+ *   append bound races OUTSIDE this decorator, so an append it gave up on is
+ *   still in flight here until the inner sink settles it, and is counted
+ *   against its tier until then — the budget never admits more than its
+ *   capacity, and a timed-out ordinary append cannot reach the reserve
+ *   (`control-plane.ts`, "An append is bounded").
  * - **Nothing here weakens "audit first, then apply".** A record the budget
  *   refuses is a refusal of the APPEND (`AUDIT_CAPACITY_EXHAUSTED`), and the
  *   control plane turns it into `503 CONTROL_NOT_AUDITABLE` with the state

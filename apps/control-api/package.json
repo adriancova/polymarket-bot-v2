@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/control-api/tsconfig.json",
     "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
     "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
-    "test:integration": "vitest run --config ../../test/integration/control-api/vitest.config.ts"
+    "test:integration": "vitest run --config ../../test/integration/control-api/vitest.config.ts",
+    "test:integration:postgres": "vitest run --config ../../test/integration/control-api/postgres/vitest.config.ts"
   },
   "dependencies": {
     "@polymarket-bot/domain": "workspace:*",

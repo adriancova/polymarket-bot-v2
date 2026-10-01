@@ -123,7 +123,10 @@ happens (`CONTROL-1` r1, closing `CONTROL1-J-M2`):
 
 Each is one `REFUSED` record for the route's action, in the audit budget's
 ORDINARY tier, carrying the refusal code, its detail and at most eight issues
-of at most 256 characters, and nothing the caller spelled beyond them.
+of at most 256 characters, and nothing the caller spelled beyond them. Since
+`CONTROL-1b` the 256 is measured on the STORED, escaped text and the cut falls
+only between code points, and a mutation-grant holder's mode-raise record is
+bounded the same way (below).
 
 What writes NOTHING, exhaustively:
 
@@ -151,6 +154,67 @@ r1 M-3).
 A refusal whose record the audit budget refuses is still a refusal: nothing
 changed, the caller gets the same answer, and it is counted
 `control_mutations_total{outcome="NOT_AUDITED"}`.
+
+### An append is bounded (`CONTROL-1b`)
+
+With a durable sink, an append that never settled used to hold its instance's
+or switch's lock for ever, queueing every later mutation of it — the kill
+switch included. Each append is now raced against a bound,
+`ControlPlaneOptions.auditAppendTimeoutMs` (default `AUDIT_APPEND_TIMEOUT_MS`,
+5 s; 1 ms to 60 s):
+
+- **The bound expires first.** The record is UNCONFIRMED and treated as
+  unwritten: the mutation is refused `503 CONTROL_NOT_AUDITABLE`, its state is
+  unmoved, it is counted `NOT_AUDITED`, and its lock is released. A refusal
+  whose record times out still stands with its own answer; a mode-raise
+  attempt's `403` then says its record was "NOT confirmed … and may still
+  land" rather than claiming either outcome.
+- **The sink answers later.** Nothing is ever applied late. A late failure
+  leaves the audit true (nothing landed); a late REFUSED record is a true
+  record of a refusal. A late APPLIED record would say a change happened that
+  did not, so the control plane appends a **void record** beside it:
+  `REFUSED`, the same action and target, actor `control-api` (`AUTOMATED`), the
+  voided record's prior state unchanged, and `voidsRecordId` naming it. Both are
+  counted — `control_mutations_total{outcome="LANDED_LATE"}` and
+  `{outcome="VOIDED"}` — so an APPLIED record with no void beside it (the void
+  could not be written, or the composition supplied no record source) is
+  visible as their difference. A durable reader joins on `voidsRecordId`: the
+  late row is in `ops.kill_switch_events` (or `ops.config_change_audit`), its
+  void in `ops.config_change_audit`.
+- **The budget sits behind the race.** A timed-out append keeps its budget slot
+  until the sink settles it, so the budget never admits more than its capacity.
+  A timed-out ordinary or safety-direction append occupies only its own tier
+  and cannot reach the kill-switch reserve. A timed-out STRENGTHENING engage
+  holds a reserved slot while in flight and, if it lands late, spends that
+  reserved record for good (its void is ordinary) — one reserved record per
+  engage that times out and lands, as a real halt would cost. An append whose
+  sink never answers keeps its slot for the life of the process
+  (`ControlPlane.unsettledAuditAppends` counts them).
+
+`main.ts`, the test harness and the integration client pass the API's clock and
+id source as the void records' `auditRecordSource`. The shipped in-memory log
+answers at once, so neither path is reachable in the shipped process today; a
+durable sink bound later inherits both.
+
+### What an audit record's text can hold (`CONTROL-1b`)
+
+Every record — mutation, refusal, mode-raise attempt or void — passes through
+`audit-text.ts`'s `auditSafeRecord` before any sink sees it:
+
+- NUL, lone surrogates and every control, format or line/paragraph separator
+  code point (`\p{Cc}`, `\p{Cf}`, `\p{Cs}`, U+2028, U+2029) become a visible
+  `\u{HEX}` escape — so a caller's bytes can never make a `jsonb` append fail,
+  and `U+202E` or a terminal escape cannot make a record read as something it
+  is not. The escape is INJECTIVE: a backslash typed before `u{` is itself
+  written `\u{5C}`, so every record can be read back exactly.
+- `actor` and `scopeRef` are cut to the `internal.identifier` domain (200) and
+  `reason` to `internal.detail` (2000), measured after escaping, because escaping
+  lengthens text; the state documents (unbounded `jsonb`) keep the whole value.
+  Nothing an ordinary request carries is cut.
+
+The in-memory log and PostgreSQL receive the same record object, so they hold
+the same text. The STATE the control plane holds is not rewritten: the record
+presents it.
 
 ## The audit budget (`CONTROL-1`, closing `WP-240` r1 M-3)
 
@@ -216,7 +280,12 @@ refused. The design has two layers.
      and unordered action changes are ordinary, and relaxing a `FULL_HALT` by
      engage is refused whatever the tier. So the platform can still be halted,
      a switch can still be escalated to `FULL_HALT`, and nothing can be
-     released or relaxed until the log is rotated.
+     released or relaxed until the log is rotated — **while the reserve has
+     room**. A `KILL_SWITCH` holder's real halts at many distinct scopes can
+     spend the reserve, and a further engage (a GLOBAL `FULL_HALT` included)
+     is then `503` (`CONTROL1-R2-J-I1`). The invariant above concerns actors
+     WITHOUT mutation authority, and it holds; no slot is held back for one
+     final GLOBAL halt, which would be a policy change, not made here.
 
 The pins:
 
@@ -236,18 +305,19 @@ The pins:
 - `src/audit-budget.test.ts` pins the tiers; `src/control-plane.test.ts` pins
   the engage rules and the per-key serialization.
 
-**What the budget does not do.** It bounds records, not bytes: a mutation-
-authorized caller's mode-raise record carries its request path and the
-forbidden keys it named, and both are bounded only by the transport
-(`maxRequestBodyBytes`, Node's header limit). (The refusal records `CONTROL-1`
-r1 added are bounded: the route's template, a refusal code and detail, and at
-most eight issues of at most 256 characters.) It does not make the in-memory
-log durable. Neither has changed in this round; both are follow-ups in the
-`CONTROL-1` handoff.
+**What the budget does not do.** It bounds records, not bytes — but since
+`CONTROL-1b` every record's caller-chosen content is bounded where it is
+built. A mutation-authorized caller's mode-raise record keeps at most eight of
+the forbidden keys it named (and `attemptedKeyCount` when there were more), and
+a reason holding at most 128 characters of the path, cut to 256 overall; the
+refusal records `CONTROL-1` r1 added keep the route's template, a refusal code
+and detail, and at most eight issues of at most 256 characters. It does not
+make the in-memory log durable: no composition binds the PostgreSQL sink yet.
 
 Durable home: `WP-040`'s §10.6 `ops.kill_switch_events` (engage/release) and
 `ops.config_change_audit` (strategy control, refusals, mode-raise attempts).
-That binding is **typecheck-pinned only** — see "no database was reached" below.
+That binding is exercised against a real PostgreSQL by an opt-in suite, and is
+bound by no composition — see "The PostgreSQL sink" below.
 
 ### 3. "No signer is loaded."
 
@@ -257,10 +327,26 @@ adapter. `test/integration/control-api/acceptance-3-no-signer.test.ts` asserts
 that by scanning the shipped source of both trees, and additionally asserts that
 `packages/polymarket-secure` is absent from this package's dependency manifest.
 Its import scan also covers this package's test suites and `infra/grafana/**`
-(`CONTROL-1`, N-4), and since `CONTROL-1` r1 it extracts the specifier from
-every spelling an import can take — any quote character, with or without
-whitespace or a comment around the keyword — with planted controls for each
-spelling and each scanned tree.
+(`CONTROL-1`, N-4). Since `CONTROL-1b` it reads each file's SYNTAX TREE with
+TypeScript's own parser (`test/integration/control-api/support/module-loads.ts`)
+instead of a regular expression — which a line comment or an escaped specifier
+had walked past (`CONTROL1-R2-J-L1`):
+
+- every load form — static and type-only imports, re-exports, `import x =
+  require()`, `import()` types, dynamic `import()`, `require()` in any calling
+  spelling, triple-slash and AMD references, JSDoc `@import`, and `declare
+  module` — is read as the EVALUATED string literal, so comments are inert and
+  escapes resolve as the runtime resolves them;
+- whatever it cannot read FAILS: a computed specifier, a named loader
+  (`require` aliased, `createRequire`, `eval`, `Function`, `Module._load`), a
+  loader module (`node:module`, `node:vm`) or a file that does not parse under
+  its extension's grammar — unless an explicit, justified allowlist entry
+  covers it exactly (the allowlist is empty);
+- planted controls cover every spelling the verifiers used, each escape and
+  comment form, each scanned tree and each file extension;
+- behind the scan, none of the forbidden packages even RESOLVES from a scanned
+  tree, so a load spelled in a way no static scan can read would still find
+  nothing to load.
 
 ## Authentication (§15) — the INTERPRETATION
 
@@ -305,15 +391,26 @@ same `authoritativeSnapshotApplied: true` evidence this API demands). That
 wiring is a documented composition obligation, not something this package
 claims.
 
-## No database was reached (disclosed)
+## The PostgreSQL sink: reached by an opt-in suite, bound by no composition (disclosed)
 
-Docker is absent from the environment this package was built in, exactly as
-`WP-210` and `WP-230` recorded. `src/adapters/postgres-audit-sink.ts` is
-**typecheck-pinned only**: its table and column names come from
-`packages/storage-postgres`'s shipped types, so a rename upstream fails
-`pnpm typecheck` — but nothing in it has been executed against a live database
-and no integration evidence is claimed for it. Acceptance 2's evidence is at the
-port, against the real control plane and the real append-only log.
+Until `CONTROL-1b` this section read "No database was reached": Docker was
+absent from the environment this package was built in, and
+`src/adapters/postgres-audit-sink.ts` was typecheck-pinned only.
+
+Since `CONTROL-1b`, `test/integration/control-api/postgres/audit-sink-postgres.test.ts`
+drives the sink against a Testcontainers PostgreSQL with every migration
+applied. It measures that the `ops` tables refuse a RAW record carrying NUL, a
+lone surrogate in `jsonb`, or text over the `internal.detail`/`internal.identifier`
+domains (and silently replace a lone surrogate in `text`), and that every record
+the control plane writes lands, equal field for field to the in-memory log's.
+
+It is **opt-in**: `pnpm --filter @polymarket-bot/control-api
+test:integration:postgres`, with Docker. The main integration suite
+(`test:integration`, CI's "control-api (no container)" step) excludes it and
+starts no container, and CI does not run it yet. **No composition binds the
+durable sink**: `main.ts` writes to the in-memory log only, so acceptance 2's
+evidence for the shipped process is still at the port, against the real control
+plane and the real append-only log.
 
 ## Configuration
 
