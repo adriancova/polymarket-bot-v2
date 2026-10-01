@@ -158,8 +158,18 @@ function config(basis: Basis): Record<string, unknown> {
 /**
  * The gateway timeline: the lifecycle's `MarketOpened` at the open; the YES book (asks under the 0.35 trigger) at +1.000 s; then
  * nothing for the YES token, and the second frame at +4.100 s.
+ *
+ * Review round 8 (R8-H1): the trader now takes a frame's session
+ * confirmations only once a LATER event of the same gateway epoch proves the
+ * frame whole, so a frame that ends the stream never vouches. A test whose
+ * outcome turns on the second frame therefore passes a `successor`: one more
+ * socket message, 100 ms later, which proves the second frame whole. Then
+ * the frame is proven, and only the taint (or its absence) decides.
  */
-async function gatewayStream(secondFrame: readonly unknown[]): Promise<readonly EventEnvelope<unknown>[]> {
+async function gatewayStream(
+  secondFrame: readonly unknown[],
+  successor?: readonly unknown[],
+): Promise<readonly EventEnvelope<unknown>[]> {
   const route = (request: PublicHttpRequest): PublicHttpResponse => {
     if (request.url.startsWith(`${GAMMA_BASE}/markets/`)) {
       return { status: 200, body: JSON.stringify(READY_MARKET) };
@@ -186,11 +196,18 @@ async function gatewayStream(secondFrame: readonly unknown[]): Promise<readonly 
   gateway.timers.advance(3_100);
   socket.message(JSON.stringify(secondFrame));
   await gateway.settle();
+  if (successor !== undefined) {
+    gateway.timers.advance(100);
+    socket.message(JSON.stringify(successor));
+    await gateway.settle();
+  }
   await gateway.gateway.stop();
   return gateway.published();
 }
 
 const noBook = (): unknown => bookEntry(NO_TOKEN, [["0.65", "200"]], [["0.66", "200"]]);
+/** r8: the successor frame, a NO book 100 ms after the second frame (see `gatewayStream`). */
+const SUCCESSOR: readonly unknown[] = [bookEntry(NO_TOKEN, [["0.64", "200"]], [["0.66", "200"]])];
 
 interface Outcome {
   readonly orders: number;
@@ -242,7 +259,8 @@ async function trade(published: readonly EventEnvelope<unknown>[], basis: Basis)
 
 describe("THROUGHPUT-1c r1 (X8) — a partly malformed frame cannot vouch for a stale book, gateway to trader", () => {
   it("control: a well-formed sibling frame vouches for the quiet YES book under CONNECTION_CONFIRMED only", async () => {
-    const published = await gatewayStream([noBook()]);
+    // r8: followed by a successor frame, which proves the sibling frame whole.
+    const published = await gatewayStream([noBook()], SUCCESSOR);
     expect(published.filter((envelope) => envelope.eventType === "DataQualityIncidentOpened")).toHaveLength(0);
     const confirmed = await trade(published, "CONNECTION_CONFIRMED");
     expect(confirmed.approvals).toBeGreaterThan(0);
@@ -267,7 +285,8 @@ describe("THROUGHPUT-1c r1 (X8) — a partly malformed frame cannot vouch for a 
   });
 
   it("no order is admitted after a frame loses a YES update, under either basis", async () => {
-    const published = await gatewayStream([malformedYesChange(Date.parse(T_OPEN) + 4_100), noBook()]);
+    // r8: with a successor, the frame is proven whole, so the taint decides.
+    const published = await gatewayStream([malformedYesChange(Date.parse(T_OPEN) + 4_100), noBook()], SUCCESSOR);
     const confirmed = await trade(published, "CONNECTION_CONFIRMED");
     const lastChange = await trade(published, "LAST_CHANGE");
     expect([confirmed.orders, lastChange.orders], "orders after a frame lost a YES update").toEqual([0, 0]);
@@ -341,7 +360,8 @@ describe("THROUGHPUT-1c r6 (R6-H1) — an event the gateway's envelope contract 
       });
 
       it(`${label}, ${order}: no order is admitted under either basis`, async () => {
-        const published = await gatewayStream(frame(oddTimestampYesChange(timestamp)));
+        // r8: with a successor, the frame is proven whole, so the taint decides.
+        const published = await gatewayStream(frame(oddTimestampYesChange(timestamp)), SUCCESSOR);
         const confirmed = await trade(published, "CONNECTION_CONFIRMED");
         const lastChange = await trade(published, "LAST_CHANGE");
         expect([confirmed.orders, lastChange.orders], "orders after the gateway refused a YES update").toEqual([0, 0]);

@@ -67,6 +67,55 @@
  * needs no rule of its own: each one stops the confirmations, so the book ages
  * out within its bound (ADR-023 D3).
  *
+ * ## A confirmation counts only from a frame proven WHOLE (review round 8)
+ *
+ * Rounds 6, 7 and 8 each found a new place where one venue frame could be
+ * cut so that its delivered PREFIX confirmed the session while a change in
+ * its lost or unread TAIL was not applied: an envelope refused mid-frame
+ * (R6-H1), a frame published across two transport calls with an outage
+ * between them (R7-H1), and a frame the trader's feed hands out across two
+ * polls (R8-H1: `RedisMarketEventFeed` reads at most `receiveBatchSize`
+ * events, and the loop closes a frame at the end of what one drain was
+ * handed). Each was closed where it happened, and the next round found
+ * another. So the rule is now enforced HERE, at the consumer, whatever any
+ * upstream boundary does ({@link FrameCompletionGate}):
+ *
+ * > No evaluation takes a confirmation from a frame this process has not
+ * > PROVEN whole. A frame is proven whole when this process has PROCESSED an
+ * > event of the SAME gateway epoch that belongs to ANOTHER frame after it.
+ * > Until then the frame's confirmations are held back, never used, and a
+ * > frame that is never followed is never used at all (fail closed).
+ *
+ * Why a later event of the same epoch proves the earlier frame whole, and
+ * why nothing weaker is trusted (ADR-023 D2.4, r8):
+ *
+ * - the gateway submits all of one frame's envelopes CONSECUTIVELY: one
+ *   socket message is one synchronous `dispatchFrame` call into ONE FIFO
+ *   publisher queue, and the publisher submits in queue order
+ *   (`apps/data-gateway/src/publisher.ts`, "Submission order is assignment
+ *   order");
+ * - EVERY unsuccessful submission halts the epoch's publication for good
+ *   ("Every unsuccessful submission halts": no later identity of the epoch
+ *   is ever published after a rejection, an outage or an overflow), and a
+ *   loss the gateway survives (a WAL refusal, a normalization problem, a
+ *   refused envelope, a frame too large for one call) is published as a
+ *   no-market incident AHEAD of the frame, which taints the epoch (rule 4);
+ * - the stream is read in order and without gaps: a retention gap is a hard
+ *   resync, which halts the trader (`apps/trader/src/pump.ts`).
+ *
+ * So an event of epoch E that follows frame F in this process's delivery
+ * order was published after ALL of F, and everything between was delivered
+ * to and processed by this loop first. Nothing else is trusted: not a short
+ * read, not the end of a batch, not a transport call's size, not the feed's
+ * carry. A frame read across two polls, a frame whose tail an outage or a
+ * refusal cut off, and a frame at the very end of the stream are all simply
+ * NOT YET PROVEN, so their confirmations do not exist for any evaluation.
+ *
+ * The proof is a pure function of the consumed event SEQUENCE, never of how
+ * it was batched, polled or drained, so live, replay and backtest agree on
+ * it (ADR-023 D8). The cost is one frame: an evaluation at frame k is vouched
+ * for by frame k-1 at the latest, never by frame k itself (ADR-023 §5).
+ *
  * ## The process-lag guard (review round 2, finding X9; ADR-023 D7)
  *
  * Every age is still measured in EVENT time, against the evaluating event's
@@ -114,6 +163,7 @@
  * tracked here, so replay parity is as it was before ADR-023.
  */
 
+import { frameKeyOf } from "./frames.js";
 import { formatStrictUtc } from "./time.js";
 
 /** ADR-023 D4: the two freshness bases a trader configuration may name. */
@@ -155,6 +205,15 @@ export const MAXIMUM_TRACKED_SESSIONS = 1_024;
  */
 export const MAXIMUM_TAINTED_EPOCHS = 1_024;
 
+/**
+ * Review round 8: how many gateway epochs may each hold one frame not yet
+ * proven whole ({@link FrameCompletionGate}). A healthy stream has one epoch
+ * at a time. Past the bound the OLDEST held frame is forgotten, and its
+ * confirmations are never used — the bound can only make the answer
+ * stricter.
+ */
+export const MAXIMUM_UNPROVEN_FRAMES = 1_024;
+
 /** One instant, in both of the forms the loop carries. */
 export interface ConfirmedInstant {
   readonly iso: string;
@@ -189,8 +248,13 @@ export function sessionKeyOf(envelope: SessionFields): string | undefined {
 }
 
 /**
- * Per-session confirmations and per-epoch taints. One per process; fed every
- * consumed event in stream order.
+ * Per-session confirmations and per-epoch taints. One per process.
+ *
+ * Review round 8: {@link DeliverySessionLiveness.observe} records a
+ * confirmation that may be USED at once, so the loop never calls it
+ * directly. It feeds every consumed event to a {@link FrameCompletionGate},
+ * which hands a frame's confirmations to this table only once the frame is
+ * proven whole (module header).
  */
 export class DeliverySessionLiveness {
   readonly #sessions = new Map<string, SessionRecord>();
@@ -247,6 +311,113 @@ export class DeliverySessionLiveness {
   /** How many sessions are remembered (diagnostics and tests). */
   get size(): number {
     return this.#sessions.size;
+  }
+}
+
+/**
+ * The fields of a consumed envelope the gate reads: its session fields, and
+ * the identity `frames.ts` groups frames by (`causationId`, or the dispatch
+ * identity `(gatewayEpoch, ingestSeq)`).
+ */
+export interface FramedSessionFields extends SessionFields {
+  readonly ingestSeq: string;
+  readonly causationId?: string;
+}
+
+/** One frame of one gateway epoch, not yet proven whole, and the confirmations it holds back. */
+interface UnprovenFrame {
+  readonly frameKey: string;
+  /** By session key: the latest confirmation the frame carries for that session. */
+  readonly held: Map<string, { readonly fields: SessionFields; readonly at: ConfirmedInstant }>;
+}
+
+/**
+ * Review round 8 (R8-H1, and the class R6-H1 and R7-H1 belong to): a frame's
+ * confirmations reach the {@link DeliverySessionLiveness} table only once the
+ * frame is PROVEN WHOLE — when this process processes an event of the SAME
+ * gateway epoch that belongs to ANOTHER frame (module header: why that proves
+ * it, and why nothing weaker is trusted).
+ *
+ * Fed EVERY event the loop consumes, in delivery order, right after the event
+ * door. For each one, in this order:
+ *
+ * 1. if the event's gateway epoch holds a frame that is not this event's
+ *    frame, that frame is now proven whole: its held confirmations are
+ *    recorded in the table;
+ * 2. if the event is a confirmation (type, source and both session fields,
+ *    as {@link DeliverySessionLiveness.observe} judges them), it is HELD
+ *    against its own frame, which is not yet proven.
+ *
+ * So an evaluation never sees a confirmation from the frame it is evaluating,
+ * nor from any frame not followed by another of its epoch: not one read
+ * across two polls (R8-H1), not one whose tail a transport outage or a refused
+ * envelope cut off (R7-H1, R6-H1), and not the last frame of a stream that
+ * stopped. An event that names no frame (impossible behind the event door,
+ * which requires `gatewayEpoch` and `ingestSeq`) neither proves nor
+ * confirms. Bounded: one held frame per epoch, at most
+ * {@link MAXIMUM_UNPROVEN_FRAMES} epochs, and at most
+ * {@link MAXIMUM_TRACKED_SESSIONS} sessions per frame; a forgotten frame
+ * confirms nothing (stricter, never looser).
+ */
+export class FrameCompletionGate {
+  readonly #liveness: DeliverySessionLiveness;
+  /** By gateway epoch, in insertion order (the oldest is forgotten first). */
+  readonly #unproven = new Map<string, UnprovenFrame>();
+
+  constructor(liveness: DeliverySessionLiveness) {
+    this.#liveness = liveness;
+  }
+
+  /** One consumed event, in delivery order (see the class comment). */
+  offer(envelope: FramedSessionFields, at: ConfirmedInstant): void {
+    const frameKey = frameKeyOf(envelope);
+    if (frameKey === undefined) return;
+    const epoch = envelope.gatewayEpoch;
+    const open = this.#unproven.get(epoch);
+    if (open !== undefined && open.frameKey !== frameKey) {
+      // A later event of the same epoch, from another frame: everything of
+      // `open` was published before it and processed before it (step 1).
+      this.#unproven.delete(epoch);
+      for (const { fields, at: confirmedAt } of open.held.values()) {
+        this.#liveness.observe(fields, confirmedAt);
+      }
+    }
+    if (!CONFIRMING_EVENT_TYPES.has(envelope.eventType)) return;
+    if (envelope.source !== CONFIRMING_SOURCE) return;
+    const sessionKey = sessionKeyOf(envelope);
+    if (sessionKey === undefined) return;
+    let frame = this.#unproven.get(epoch);
+    if (frame === undefined) {
+      frame = { frameKey, held: new Map() };
+      this.#unproven.set(epoch, frame);
+      if (this.#unproven.size > MAXIMUM_UNPROVEN_FRAMES) {
+        const oldest = this.#unproven.keys().next();
+        if (oldest.done !== true) this.#unproven.delete(oldest.value);
+      }
+    }
+    // Step 2: held, not recorded. Only what the table reads is kept.
+    frame.held.delete(sessionKey);
+    frame.held.set(sessionKey, {
+      fields: {
+        eventType: envelope.eventType,
+        source: envelope.source,
+        gatewayEpoch: envelope.gatewayEpoch,
+        ...(envelope.connectionId === undefined ? {} : { connectionId: envelope.connectionId }),
+        ...(envelope.subscriptionGeneration === undefined
+          ? {}
+          : { subscriptionGeneration: envelope.subscriptionGeneration }),
+      },
+      at,
+    });
+    if (frame.held.size > MAXIMUM_TRACKED_SESSIONS) {
+      const oldest = frame.held.keys().next();
+      if (oldest.done !== true) frame.held.delete(oldest.value);
+    }
+  }
+
+  /** How many frames are held, not yet proven whole (diagnostics and tests). */
+  get unprovenFrames(): number {
+    return this.#unproven.size;
   }
 }
 

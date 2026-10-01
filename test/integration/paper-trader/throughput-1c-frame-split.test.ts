@@ -125,6 +125,9 @@ const noTopOfBook = (): unknown => ({
   timestamp: String(LATE_MS),
 });
 
+/** r8: the successor message (see `Timeline.successor`): a NO book 100 ms after the late messages. */
+const SUCCESSOR: readonly unknown[] = [bookEntry(NO_TOKEN, [["0.64", "200"]], [["0.66", "200"]])];
+
 function repeat(count: number, entry: () => unknown): unknown[] {
   return Array.from({ length: count }, entry);
 }
@@ -165,6 +168,14 @@ interface Timeline {
   readonly backlog: boolean;
   /** Take the transport down when the call carrying the late YES snapshot starts. */
   readonly loseTheYesCall: boolean;
+  /**
+   * Review round 8 (R8-H1): one more socket message, 100 ms after the late
+   * messages. The trader takes a frame's session confirmations only once a
+   * later event of the same gateway epoch proves the frame whole, so a test
+   * whose outcome turns on a WHOLE frame vouching (or on its taint) needs
+   * this successor; without it the frame never vouches at all.
+   */
+  readonly successor?: readonly unknown[];
 }
 
 interface GatewayRun {
@@ -231,6 +242,11 @@ async function gatewayRun(timeline: Timeline): Promise<GatewayRun> {
   for (const message of rest) socket.message(JSON.stringify(message));
   if (timeline.backlog) transport.resumePublishes();
   await gateway.settle();
+  if (timeline.successor !== undefined) {
+    gateway.timers.advance(100);
+    socket.message(JSON.stringify(timeline.successor));
+    await gateway.settle();
+  }
   const beforeStop = calls.map((call) => [...call]);
   await gateway.gateway.stop();
   return { published: gateway.published(), halts: [...gateway.halts], calls: beforeStop };
@@ -338,32 +354,36 @@ describe("THROUGHPUT-1c r7 (R7-H1) — a frame split across transport calls cann
     // for the quiet YES book under CONNECTION_CONFIRMED and admitted the
     // entry. The split marker now turns the extension off for the epoch
     // (fail-closed): the YES book is judged by its own last change.
+    // r8: the successor proves the frame whole, so the taint is what refuses.
     const run = await gatewayRun({
       maxQueueDepth: 4_096,
       lateMessages: [repeat(ONE_CALL + 1, noBook)],
       backlog: false,
       loseTheYesCall: false,
+      successor: SUCCESSOR,
     });
     expect(run.halts).toEqual([]);
     const stream = late(run.published);
     expect(stream.map(label)[0]).toBe("INCIDENT:GATEWAY_FRAME_SPLIT");
-    expect(count(stream, "NO")).toBe(ONE_CALL + 1);
-    expect(run.calls.map((call) => call.length)).toEqual([1, ONE_CALL, 1]);
+    expect(count(stream, "NO")).toBe(ONE_CALL + 2);
+    expect(run.calls.map((call) => call.length)).toEqual([1, ONE_CALL, 1, 1]);
     const confirmed = await trade(run.published, "CONNECTION_CONFIRMED");
     expect([confirmed.orders, confirmed.approvals]).toEqual([0, 0]);
     expect(confirmed.staleBookPauses).toBeGreaterThan(0);
   });
 
   it("control: a frame of exactly the limit is one call, carries no incident, and still vouches under CONNECTION_CONFIRMED only", async () => {
+    // r8: the successor (its own call) proves the frame whole.
     const run = await gatewayRun({
       maxQueueDepth: 4_096,
       lateMessages: [repeat(ONE_CALL, noBook)],
       backlog: false,
       loseTheYesCall: false,
+      successor: SUCCESSOR,
     });
     const stream = late(run.published);
     expect(stream.filter((envelope) => envelope.eventType === "DataQualityIncidentOpened")).toHaveLength(0);
-    expect(run.calls.map((call) => call.length)).toEqual([ONE_CALL]);
+    expect(run.calls.map((call) => call.length)).toEqual([ONE_CALL, 1]);
     const confirmed = await trade(run.published, "CONNECTION_CONFIRMED");
     const lastChange = await trade(run.published, "LAST_CHANGE");
     expect(confirmed.orders).toBeGreaterThan(0);

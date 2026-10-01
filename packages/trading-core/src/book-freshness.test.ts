@@ -37,8 +37,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   DeliverySessionLiveness,
+  FrameCompletionGate,
   MAXIMUM_TAINTED_EPOCHS,
   MAXIMUM_TRACKED_SESSIONS,
+  MAXIMUM_UNPROVEN_FRAMES,
   bookConfirmedAt,
   sessionKeyOf,
 } from "./book-freshness.js";
@@ -310,6 +312,13 @@ interface Recorded {
    * gateway's recovery path, `apps/data-gateway` `polymarket.ts`).
    */
   readonly restGeneration?: number;
+  /**
+   * r8: the raw frame this event was derived from. Events that name the same
+   * frame share the gateway's `causationId` (`raw:<epoch>:<frame>`), so the
+   * loop groups them into one venue frame (`frames.ts`). Absent: a frame of
+   * its own, as before.
+   */
+  readonly frame?: string;
 }
 
 function iso(at: number): string {
@@ -438,6 +447,7 @@ function ingested(recorded: Recorded, ordinal: number): IngestedEvent {
     receivedMonotonicNs: String(ordinal * 1_000_000),
     gatewayEpoch: epoch,
     ingestSeq: String(ordinal),
+    ...(recorded.frame === undefined ? {} : { causationId: `raw:${epoch}:${recorded.frame}` }),
     ...(recorded.restGeneration === undefined ? {} : { subscriptionGeneration: recorded.restGeneration }),
     ...(recorded.session === undefined
       ? {}
@@ -528,6 +538,29 @@ async function run(options: ConfigOptions, events: readonly Recorded[]): Promise
     }
     if (!parts.trader.loop.ingest(ingested(recorded, ordinal))) {
       throw new Error(`the ingest queue refused event ${String(ordinal)}`);
+    }
+    await parts.trader.loop.drain();
+  }
+  return parts;
+}
+
+/**
+ * r8 (R8-H1): the same events, drained in the given BATCHES (each a count of
+ * events handed to one drain, as a feed hands them out). A batch may end in
+ * the middle of a frame, exactly as `RedisMarketEventFeed` hands out a frame
+ * longer than its `maxEvents`. The counts must cover every event.
+ */
+async function runInBatches(options: ConfigOptions, events: readonly Recorded[], batches: readonly number[]): Promise<Run> {
+  expect(batches.reduce((sum, size) => sum + size, 0), "the batches cover every event").toBe(events.length);
+  const parts = assemble(options);
+  let ordinal = 0;
+  for (const size of batches) {
+    for (let index = 0; index < size; index += 1) {
+      const recorded = events[ordinal] as Recorded;
+      ordinal += 1;
+      if (!parts.trader.loop.ingest(ingested(recorded, ordinal))) {
+        throw new Error(`the ingest queue refused event ${String(ordinal)}`);
+      }
     }
     await parts.trader.loop.drain();
   }
@@ -998,6 +1031,144 @@ describe("4. replay is deterministic", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// r8 (R8-H1, and the class R6-H1 and R7-H1 belong to): a frame vouches for
+// a book only once this process has PROVEN it whole
+// ---------------------------------------------------------------------------
+
+describe("r8 R8-H1: no evaluation takes a confirmation from a frame this loop has not proven whole", () => {
+  const CHEAP_ASKS = [
+    { price: "0.34", size: "100" },
+    { price: "0.35", size: "100" },
+  ];
+  /** Both freshness gates at 2 000 ms: the strategy's (version 2) and check 7's. */
+  const BOTH_GATES = { basis: "CONNECTION_CONFIRMED" as const, riskMaxAgeMs: 2_000 };
+
+  /**
+   * The R8-H1 shape at the loop. The YES book (asks under the 0.35 trigger)
+   * at 1.000 s, then nothing on the session until 4.100 s, when ONE venue
+   * frame carries `noCount` NO snapshots and then the YES change that moves
+   * the YES asks above the trigger. Static Bracket can enter only once the
+   * NO book exists, so the only evaluations that could enter are the ones
+   * this frame closes: an entry means the frame vouched for a YES book its
+   * own change had not reached yet.
+   */
+  function splitFrameTimeline(noCount: number): Recorded[] {
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1, CHEAP_ASKS)];
+    for (let index = 0; index < noCount; index += 1) events.push({ ...noSnapshot(4.1, A1), frame: "late" });
+    events.push({ ...yesSnapshot(4.1, A1), frame: "late" });
+    return events;
+  }
+
+  it("the R8-H1 reproduction at the loop: a frame handed out in two batches, its YES change in the second, admits nothing (2 orders at 298199d)", async () => {
+    const events = splitFrameTimeline(3);
+    // Everything up to the frame's three NO snapshots, then the YES change:
+    // `RedisMarketEventFeed` at `receiveBatchSize` 6 hands this frame out so.
+    const confirmed = await runInBatches(BOTH_GATES, events, [6, 1]);
+    expect(confirmed.trader.loop.orderProvenance(), "orders on a book whose change was in the unread part").toHaveLength(0);
+    expect(confirmed.trader.loop.health().risk.approvals).toBe(0);
+    // Refused for the right reason: at the first batch's close the YES book
+    // is 3 100 ms old, because the frame it sits in is not yet proven.
+    const headClose = evaluations(confirmed).filter((evaluation) => Date.parse(evaluation.at) === Date.parse(iso(4.1)));
+    expect(headClose.length).toBeGreaterThan(0);
+    expect(headClose[0]).toMatchObject({ stale: true, bookAgeMs: "3100" });
+    const lastChange = await runInBatches({ ...BOTH_GATES, basis: "LAST_CHANGE" }, events, [6, 1]);
+    expect(lastChange.trader.loop.orderProvenance()).toHaveLength(0);
+  });
+
+  it("wherever the batch ends inside the frame, and at every batch size down to 1, nothing is admitted", async () => {
+    const events = splitFrameTimeline(4);
+    const partitions: number[][] = [];
+    // A cut after each of the frame's NO snapshots.
+    for (let head = 1; head <= 4; head += 1) partitions.push([3 + head, 4 - head + 1]);
+    // `receiveBatchSize` 1, 2 and 3: batches of that size, the last one short.
+    for (const size of [1, 2, 3]) {
+      const sizes: number[] = [];
+      for (let left = events.length; left > 0; left -= size) sizes.push(Math.min(size, left));
+      partitions.push(sizes);
+    }
+    for (const batches of partitions) {
+      const parts = await runInBatches(BOTH_GATES, events, batches);
+      expect(parts.trader.loop.orderProvenance(), `batches ${JSON.stringify(batches)}`).toHaveLength(0);
+      expect(parts.trader.loop.health().risk.approvals, `batches ${JSON.stringify(batches)}`).toBe(0);
+    }
+  });
+
+  it("a frame vouches from the next frame of its epoch on, never at its own close", async () => {
+    // A single NO snapshot at 4.100 s (a frame of one), then a NO change at
+    // 4.200 s. At 298199d the NO snapshot vouched for the YES book at its own
+    // close and the entry was admitted at 4.100 s.
+    const events: Recorded[] = [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_ASKS),
+      noSnapshot(4.1, A1),
+      noChange(4.2, A1, "250"),
+    ];
+    const parts = await run(BOTH_GATES, events);
+    expect(evaluationAt(parts, 4.1)).toMatchObject({ stale: true, bookAgeMs: "3100" });
+    // At 4.200 s the entry is evaluated first (the fill's callbacks follow it
+    // at the same instant), on a YES book vouched for by the 4.100 s frame.
+    const at42 = evaluations(parts).filter((evaluation) => Date.parse(evaluation.at) === Date.parse(iso(4.2)));
+    expect(at42[0]?.stale).toBe(false);
+    const provenance = parts.trader.loop.orderProvenance();
+    expect(provenance.length).toBeGreaterThan(0);
+    // The entry is the 4.200 s event's evaluation: ordinal 5.
+    expect(provenance[0]?.sourceEventId).toBe(`018f5c20-9000-7a90-8b00-${String(5).padStart(12, "0")}`);
+  });
+
+  it("a frame that nothing follows never vouches (fail closed), and a later frame of ANOTHER epoch does not prove it", async () => {
+    const lastFrame: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1, CHEAP_ASKS), noSnapshot(4.1, A1)];
+    const alone = await run(BOTH_GATES, lastFrame);
+    expect(alone.trader.loop.orderProvenance()).toHaveLength(0);
+    // A gateway restart: its first frame is epoch B's, so the epoch-A frame
+    // at 4.100 s stays unproven (its tail may have been lost in the restart).
+    const restarted = await run(BOTH_GATES, [...lastFrame, noChange(4.2, B1, "250")]);
+    expect(restarted.trader.loop.orderProvenance()).toHaveLength(0);
+    // A reference tick of epoch A, by contrast, follows it in the same stream.
+    const followed = await run(BOTH_GATES, [...lastFrame, tick(4.2, "64001")]);
+    expect(followed.trader.loop.orderProvenance().length).toBeGreaterThan(0);
+  });
+
+  it("the answer is a function of the event sequence, not of the batches: every partition admits the same entry, at the same event", async () => {
+    // A frame of five NO snapshots at 4.100 s and no YES change, then frames
+    // of one at 4.200 s and 4.300 s. Under r8 the entry is the 4.200 s
+    // event's whatever the batches; at 298199d a batch ending inside the
+    // frame moved it earlier, onto the frame's own unproven head.
+    const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1, CHEAP_ASKS)];
+    for (let index = 0; index < 5; index += 1) events.push({ ...noSnapshot(4.1, A1), frame: "late" });
+    events.push(noChange(4.2, A1, "250"), noChange(4.3, A1, "251"));
+    const partitions: number[][] = [[events.length], Array.from({ length: events.length }, () => 1), [4, 6], [5, 2, 3], [7, 1, 2]];
+    const sources: string[][] = [];
+    for (const batches of partitions) {
+      const parts = await runInBatches(BOTH_GATES, events, batches);
+      sources.push(parts.trader.loop.orderProvenance().map((link) => link.sourceEventId));
+    }
+    expect(sources[0]?.length).toBeGreaterThan(0);
+    for (const [index, found] of sources.entries()) expect(found, `partition ${String(index)}`).toEqual(sources[0]);
+    // The entry is the 4.200 s event's evaluation (ordinal 9), in every partition.
+    expect(sources[0]?.[0]).toBe(`018f5c20-9000-7a90-8b00-${String(9).padStart(12, "0")}`);
+  });
+
+  it("an incident that FOLLOWS a frame (the pre-r6 order) proves the frame and taints its epoch in the same step: nothing is admitted", async () => {
+    // What `74e17ca`'s gateway published for R6-H1 and `f341d5f`'s for X8:
+    // the frame's accepted NO snapshot, then the incident for the event it
+    // lost. The frame's confirmation is released only by the incident, which
+    // taints the epoch before any evaluation can read it.
+    const events: Recorded[] = [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_ASKS),
+      { ...noSnapshot(4.1, A1), frame: "late" },
+      incident(4.1, "gw-polymarket-market-r6"),
+      noChange(4.2, A1, "250"),
+    ];
+    const parts = await run(BOTH_GATES, events);
+    expect(parts.trader.loop.orderProvenance()).toHaveLength(0);
+    expect(evaluationAt(parts, 4.2)).toMatchObject({ stale: true, bookAgeMs: "3200" });
+  });
+});
+
 describe("backward compatibility: a document with no bookFreshness block", () => {
   it("parses, and selects LAST_CHANGE", () => {
     const parsed = parseTraderConfig(traderConfig({ paramsVersion: 1 }));
@@ -1237,6 +1408,103 @@ describe("book-freshness.ts", () => {
     liveness.taintGatewayEpoch("018f5c20-5000-7a50-8b00-ffffffffffff");
     expect(liveness.isEpochTainted(EPOCH_B)).toBe(true);
     expect(liveness.confirmation(sessionKeyOf(bookEvent(B1)) as string)).toBeUndefined();
+  });
+
+  describe("r8 FrameCompletionGate", () => {
+    const framed = (
+      session: Session,
+      ingestSeq: string,
+      frame: string | undefined,
+      eventType = "BookSnapshot",
+      source = "polymarket",
+    ) => ({
+      ...bookEvent(session, eventType, source),
+      ingestSeq,
+      ...(frame === undefined ? {} : { causationId: `raw:${session.epoch}:${frame}` }),
+    });
+
+    it("holds a frame's confirmations until a later event of the SAME epoch from ANOTHER frame proves the frame whole", () => {
+      const liveness = new DeliverySessionLiveness();
+      const gate = new FrameCompletionGate(liveness);
+      const a1 = sessionKeyOf(bookEvent(A1)) as string;
+      const b1 = sessionKeyOf(bookEvent(B1)) as string;
+      gate.offer(framed(A1, "10", "f1"), at(1_000));
+      gate.offer(framed(A1, "11", "f1"), at(1_001));
+      // More of the same frame (a second batch of it) proves nothing.
+      expect(liveness.confirmation(a1)).toBeUndefined();
+      expect(gate.unprovenFrames).toBe(1);
+      // An event of ANOTHER epoch proves nothing (a restart may have lost the tail).
+      gate.offer(framed(B1, "12", "g1"), at(1_002));
+      expect(liveness.confirmation(a1)).toBeUndefined();
+      expect(liveness.confirmation(b1)).toBeUndefined();
+      expect(gate.unprovenFrames).toBe(2);
+      // A later event of epoch A from another frame, even one that confirms
+      // nothing itself, proves f1 whole: its LATEST confirmation is released.
+      gate.offer({ eventType: "ReferenceTradeObserved", source: "binance", gatewayEpoch: EPOCH_A, ingestSeq: "13" }, at(1_500));
+      expect(liveness.confirmation(a1)?.epochMs).toBe(1_001);
+      expect(liveness.confirmation(b1)).toBeUndefined();
+      expect(gate.unprovenFrames).toBe(1);
+      // A frame of one, without a causation, is its own frame: held, then
+      // proven by the next event of its epoch.
+      gate.offer(framed(A1, "14", undefined), at(2_000));
+      expect(liveness.confirmation(a1)?.epochMs).toBe(1_001);
+      gate.offer(framed(A1, "15", undefined), at(2_100));
+      expect(liveness.confirmation(a1)?.epochMs).toBe(2_000);
+    });
+
+    it("releases every session a proven frame carried, and holds back what the next frame carries", () => {
+      const liveness = new DeliverySessionLiveness();
+      const gate = new FrameCompletionGate(liveness);
+      gate.offer(framed(A1, "20", "f2"), at(3_000));
+      gate.offer(framed(A2, "21", "f2"), at(3_001));
+      gate.offer(framed(A1_GEN2, "22", "f3"), at(3_100));
+      expect(liveness.confirmation(sessionKeyOf(bookEvent(A1)) as string)?.epochMs).toBe(3_000);
+      expect(liveness.confirmation(sessionKeyOf(bookEvent(A2)) as string)?.epochMs).toBe(3_001);
+      expect(liveness.confirmation(sessionKeyOf(bookEvent(A1_GEN2)) as string)).toBeUndefined();
+    });
+
+    it("an event that confirms nothing still proves the frame before it, and an event naming no frame neither proves nor confirms", () => {
+      const liveness = new DeliverySessionLiveness();
+      const gate = new FrameCompletionGate(liveness);
+      const a1 = sessionKeyOf(bookEvent(A1)) as string;
+      gate.offer(framed(A1, "30", "f4"), at(4_000));
+      // No `ingestSeq` and no causation: no frame key (unreachable behind the
+      // event door, which requires both identity fields).
+      gate.offer({ ...bookEvent(A1), ingestSeq: "" }, at(4_100));
+      expect(liveness.confirmation(a1)).toBeUndefined();
+      expect(gate.unprovenFrames).toBe(1);
+      // A binance-sourced book event confirms nothing, but it is a later
+      // event of the epoch from another frame.
+      gate.offer(framed(A1, "31", "f5", "BookLevelChanged", "binance"), at(4_200));
+      expect(liveness.confirmation(a1)?.epochMs).toBe(4_000);
+      expect(gate.unprovenFrames).toBe(0);
+    });
+
+    it("is bounded: past MAXIMUM_UNPROVEN_FRAMES epochs the oldest held frame is forgotten, and confirms nothing (stricter, never looser)", () => {
+      const liveness = new DeliverySessionLiveness();
+      const gate = new FrameCompletionGate(liveness);
+      const epochOf = (index: number) => `018f5c20-5000-7a50-8b00-${String(index).padStart(12, "0")}`;
+      const sessionOf = (index: number): Session => ({ epoch: epochOf(index), connectionId: "c", generation: 1 });
+      for (let index = 0; index <= MAXIMUM_UNPROVEN_FRAMES; index += 1) {
+        gate.offer(framed(sessionOf(index), "1", "f"), at(5_000));
+      }
+      expect(gate.unprovenFrames).toBe(MAXIMUM_UNPROVEN_FRAMES);
+      // A later event of each epoch from another frame (a reference tick: it
+      // proves, and holds nothing of its own).
+      const nextOf = (index: number) => ({
+        eventType: "ReferenceTradeObserved",
+        source: "binance",
+        gatewayEpoch: epochOf(index),
+        ingestSeq: "2",
+      });
+      // Epoch 0's frame was forgotten: its epoch's next event releases nothing.
+      gate.offer(nextOf(0), at(5_100));
+      expect(liveness.confirmation(sessionKeyOf(bookEvent(sessionOf(0))) as string)).toBeUndefined();
+      // Epoch 1's is still held, and its epoch's next event releases it.
+      gate.offer(nextOf(1), at(5_100));
+      expect(liveness.confirmation(sessionKeyOf(bookEvent(sessionOf(1))) as string)?.epochMs).toBe(5_000);
+      expect(gate.unprovenFrames).toBe(MAXIMUM_UNPROVEN_FRAMES - 1);
+    });
   });
 
   it("the table is bounded; a forgotten session confirms nothing (stricter, never looser)", () => {

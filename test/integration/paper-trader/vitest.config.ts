@@ -68,6 +68,13 @@
  * (`BRACKET1C-SNAPKEY`) — and (`SNAP-1` r1) a variant with two harvests at
  * one instant. The rule is unchanged.
  *
+ * **Dated note (`THROUGHPUT-1c` r8, 2026-10-01): one more Redis file.**
+ * `throughput-1c-consumer-frame-proof-redis.test.ts` starts a
+ * `redis:7.4.2-alpine` container in its own `beforeAll` and feeds the REAL
+ * gateway composition's transport calls, through the real
+ * `RedisStreamsEventTransport`, to the process's own `RedisMarketEventFeed`
+ * and `pump`. The rule is unchanged.
+ *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each
  * package this suite uses to its source.

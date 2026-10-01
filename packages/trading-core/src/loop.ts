@@ -116,6 +116,7 @@ import { judgeBasketExecution } from "./basket-execution.js";
 import {
   bookConfirmedAt,
   DeliverySessionLiveness,
+  FrameCompletionGate,
   sessionKeyOf,
   type BookFreshnessBasis,
   type ConfirmedInstant,
@@ -594,6 +595,14 @@ export class CoreLoop {
   /** ADR-023 D2 rule 6: the per-book ceiling on the last-change age (r1, X1). */
   readonly #freshnessCeilingMs: number | undefined;
   readonly #liveness = new DeliverySessionLiveness();
+  /**
+   * `THROUGHPUT-1c` r8 (R8-H1, ADR-023 D2.4): every consumed event reaches the
+   * table above only through this gate, which holds a frame's confirmations
+   * back until a later event of the same gateway epoch proves the frame
+   * whole. No evaluation can take a confirmation from a frame this loop has
+   * not applied in full, however the frame was published, batched or cut.
+   */
+  readonly #frameGate = new FrameCompletionGate(this.#liveness);
 
   // --- the per-order state (`TRDR-4`) ---------------------------------------
   //
@@ -1039,11 +1048,16 @@ export class CoreLoop {
       if (event === undefined) break;
       // `THROUGHPUT-2` (ADR-024): an event CLOSES its venue frame when the
       // next queued event belongs to another frame, or when nothing is queued
-      // after it. The second half is the producers' obligation, which every
-      // feed of this loop meets: a batch handed to one drain never ends in
-      // the middle of a frame (`frames.ts`; ADR-024 §2). So no frame is ever
-      // open across two drains, and a stream position recorded after a drain
-      // is always at a frame boundary.
+      // after it. The second half is the producers' obligation: a batch
+      // handed to one drain should never end in the middle of a frame
+      // (`frames.ts`; ADR-024 §2), so no frame is open across two drains.
+      // One case cannot meet it: a single frame larger than the live feed's
+      // batch is handed out in parts (`RedisMarketEventFeed.framesSplit`),
+      // and each part closes here as if it were the frame. `THROUGHPUT-1c`
+      // r8 (R8-H1): book freshness does NOT rely on this obligation. A
+      // frame's session confirmations are used only once a later event of
+      // its epoch has been processed (`#frameGate`), so a part closed here
+      // cannot vouch for any book.
       const next = this.#queue.peek();
       const closesFrame = next === undefined || !sameFrame(event.envelope, next.envelope);
       await this.#processEvent(event, closesFrame);
@@ -4045,10 +4059,16 @@ export class CoreLoop {
    * delivery-session table, and applies rule 4 — a data-quality incident that
    * names NO market taints its gateway epoch, every session of it, for good.
    * Nothing is recorded under `LAST_CHANGE`, which reads none of it.
+   *
+   * r8 (R8-H1): the event goes through the frame gate, never straight to the
+   * table. Its own confirmation is HELD until a later event of its epoch from
+   * another frame is processed here; that later event first releases the
+   * frames before it. So the evaluations of this event's own frame are
+   * vouched for by earlier, proven frames only (`book-freshness.ts`).
    */
   #observeDeliverySession(envelope: EventEnvelopeOf, iso: string, epochMs: number): void {
     if (this.#freshnessBasis !== "CONNECTION_CONFIRMED") return;
-    this.#liveness.observe(envelope, { iso, epochMs });
+    this.#frameGate.offer(envelope, { iso, epochMs });
     if (
       envelope.eventType === "DataQualityIncidentOpened" &&
       affectedMarketIds(envelope.payload).length === 0

@@ -40,6 +40,14 @@
   The publisher now never starts a frame in a run that cannot hold it
   whole, and the gateway publishes a `GATEWAY_FRAME_SPLIT` taint ahead of
   every frame too large for one call (D2.4, D3, D5, D8, §4, §5, §6).
+  r8 (2026-10-01), after review round 8 (R8-H1): r7's account of the
+  trader's side was incomplete. `RedisMarketEventFeed` hands a frame longer
+  than `receiveBatchSize` out across two polls, and the first part vouched
+  for a book whose change was in the unread part. Rounds 6, 7 and 8 each
+  found a new place where a frame could be cut, so r8 closes the CLASS at
+  the consumer: a frame's confirmations are used only once the trader has
+  processed a later event of the same gateway epoch from another frame
+  (D1, D2, D2.4, D3, D5, D8, §4, §5, §6).
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
@@ -202,6 +210,17 @@ events (`FeedConnected`, `FeedStale`, …, which the trader does not consume);
 an event type the trader does not consume; the venue's `PONG` (the gateway
 publishes nothing for it; see D5).
 
+**A confirmation counts only from a frame proven WHOLE (r8, R8-H1).** The
+events of one venue frame share a frame key (ADR-024: the gateway's
+`causationId`, else the dispatch identity). A confirmation is HELD, and is
+not a confirmation any evaluation can read, until the trader has PROCESSED
+an event of the SAME gateway epoch with ANOTHER frame key after it. Then
+the frame's latest confirmation per session is released
+(`packages/trading-core/src/book-freshness.ts` `FrameCompletionGate`). A
+frame that nothing of its epoch follows never confirms anything. Why that
+event proves the frame whole, and why nothing weaker is trusted, is D2.4,
+"A frame the trader has not proven whole".
+
 ### D2. When a book is fresh
 
 A book is vouched for as of `confirmedAt`:
@@ -212,7 +231,9 @@ confirmedAt(book) = max(lastChange(book), latestConfirmation(session(book)))
 
 where `session(book)` is the session of the update that last CHANGED the book
 (recorded only after the book accepted it), and `latestConfirmation` is the
-latest confirmation of that session. The book is FRESH iff
+latest confirmation of that session from a frame the trader has proven
+whole (D1, r8). So an evaluation is never vouched for by the frame it is
+evaluating: frame k is vouched for by frame k−1 at the latest. The book is FRESH iff
 `now − confirmedAt ≤ bound`, with the same bounds as before
 (`data_quality.maximum_book_age_ms`, `freshness.venueBookMaxAgeMs`) and the
 same `now` (event time). Under `CONNECTION_CONFIRMED` the latest
@@ -343,7 +364,78 @@ more permissive than it — whenever any of rules 1–6 applies:
    pass the door (above). One gateway process publishes one epoch. The
    publisher admits only sequences above its high-water mark, in assignment
    order. So none of these refusals is expected, and each one would halt
-   publication loudly.
+   publication loudly. (r8: that case no longer reaches book freshness; see
+   the next paragraph.)
+   **A frame the trader has not proven whole (r8, R8-H1: the class).** The
+   r7 text above, and handoff-r7, said a frame of up to 1 024 events is
+   published whole or not at all, and treated that as closing the route.
+   It did not, because the READ side cuts frames too. The trader's feed
+   (`apps/trader/src/adapters/redis-feed.ts` `RedisMarketEventFeed.poll`)
+   reads at most `receiveBatchSize` events (1 to 10 000; the example
+   configuration ships 128 next to `CONNECTION_CONFIRMED`). A frame longer
+   than that is handed out across two polls, counted only in `framesSplit`.
+   `loop.ts` closes a frame at the end of what one drain was handed, so the
+   first part closed as if it were the frame, and its events confirmed the
+   session while the change in the unread part was not yet applied. Review
+   reproduced 2 approved orders under `CONNECTION_CONFIRMED` (0 under
+   `LAST_CHANGE`) through real Redis, with no outage and no backlog: a frame
+   of 129, 200 or 1 024 events at `receiveBatchSize` 128, and of 2 events at
+   `receiveBatchSize` 1. Rounds 6, 7 and 8 each found a new boundary of this
+   kind (a refused envelope, a transport call, a poll), so r8 does not close
+   one more boundary. It moves the rule to the CONSUMER, where it holds
+   whatever any upstream boundary does:
+   - **The invariant.** No evaluation takes a confirmation from a frame the
+     trader has not applied in full, and a frame the trader cannot PROVE
+     complete is non-confirming (fail closed). A frame is proven complete
+     when the trader processes an event of the same gateway epoch that
+     belongs to another frame. Until then its confirmations are held, and
+     a frame that is never followed never confirms
+     (`book-freshness.ts` `FrameCompletionGate`, fed every consumed event
+     by `loop.ts` `#observeDeliverySession`).
+   - **Why that event proves the frame whole.** Three properties of the
+     path, each already relied on and pinned elsewhere:
+     (P1) the gateway submits a frame's envelopes CONSECUTIVELY: one socket
+     message is one synchronous `dispatchFrame` call into ONE FIFO publisher
+     queue, and the publisher submits in queue order (`publisher.ts`,
+     "Submission order is assignment order"; `feeds/polymarket.ts`: the
+     adapter emits only market-data events inside a message, so nothing
+     else is dispatched between two of them);
+     (P2) a loss inside an epoch is final or announced: EVERY unsuccessful
+     submission halts that epoch's publication for good (`publisher.ts`,
+     "Every unsuccessful submission halts": an outage, an overflow, a
+     refusal), and every loss the gateway survives (a WAL refusal, a
+     normalization problem, a refused envelope, a frame too large for one
+     call) is a no-market incident sequenced AHEAD of the frame, which taints
+     the epoch (rule 4 above);
+     (P3) the trader reads its stream in order and without gaps: a retention
+     gap is a hard resync, which halts (`pump.ts`).
+     So an event of epoch E that the trader processes after frame F was
+     published after ALL of F, and everything between them was delivered to
+     the loop and processed first. An event of ANOTHER epoch proves nothing:
+     a gateway restart may have lost F's tail.
+   - **What is no longer trusted.** A short read, the end of a batch, the
+     size of a transport call, the feed's carry, the r7 look-ahead. A frame
+     read across two polls, a frame whose tail an outage or a transport
+     refusal cut off, and a frame at the end of the stream are all simply
+     not yet proven. The gateway's own orderings (r1, r6, r7) stay, as
+     defence in depth: under r8 an incident published right AFTER its frame
+     (the pre-r6 order) would also be safe, because that incident is the
+     very event that proves the frame, and it taints the epoch in the same
+     step, before any evaluation reads the confirmation.
+   - **Bounded buffering.** The feed still hands a long frame out in parts,
+     at any `receiveBatchSize`, so its buffering stays bounded by it. The
+     gate holds one frame per gateway epoch (at most 1 024 epochs, then the
+     oldest is forgotten and confirms nothing) and keeps one instant per
+     session of that frame. No configuration is refused: the rule needs no
+     carry rule and no ingest-depth argument, because it does not depend on
+     how the events were batched, polled or queued.
+   - **What it costs.** One frame: an evaluation at frame k is vouched for
+     by frame k−1 at the latest, never by frame k itself, and the last frame
+     before a quiet spell vouches only once the next event of its epoch
+     arrives (§5).
+   Every boundary on a frame's path, from the venue socket to the loop's
+   evaluation, with what it does to a frame and the pin for each, is listed
+   in the `THROUGHPUT-1c` r8 handoff ("Every boundary").
    **What "never lifted" covers, and what it does not (r1, X2).** The taint
    is state of THIS PROCESS, fed by the incidents it consumed. A trader that
    starts, restarts or resumes from its checkpoint inside an epoch whose
@@ -381,14 +473,18 @@ more permissive than it — whenever any of rules 1–6 applies:
 | One asset's delivery stalls while the session stays busy (N-B) | FRESH until the ceiling, then aged by its own last change: STALE at `lastChange + max(ceiling, bound)` at the latest | D2 rule 6 |
 | A frame the gateway could only partly normalize | the frame's incident is sequenced before its accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r1, X8) |
 | A frame one of whose events the gateway's envelope contract refuses (an adapter-accepted `timestamp` whose ISO year has five digits, e.g. one sent in microseconds) | every envelope of the frame is validated before any is published; `GATEWAY_ENVELOPE_REJECTED` (no market) is published ahead of the frame's accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r6, R6-H1) |
-| A frame published across two transport calls, with an outage between them (a frame queued behind a backlog, or one larger than the transport's 1 024-envelope call) | a frame of up to 1 024 events is now one call, so an outage publishes all of it or none; a larger frame is preceded by `GATEWAY_FRAME_SPLIT` (no market), so the epoch is tainted before any of its events evaluates, whether or not its tail is lost | D2.4 (r7, R7-H1) |
+| A frame published across two transport calls, with an outage between them (a frame queued behind a backlog, or one larger than the transport's 1 024-envelope call) | a frame of up to 1 024 events is now one call, so an outage publishes all of it or none; a larger frame is preceded by `GATEWAY_FRAME_SPLIT` (no market), so the epoch is tainted before any of its events evaluates, whether or not its tail is lost. Since r8 the trader holds either way: a prefix that nothing of its epoch follows is never proven whole, so it never confirms | D2.4 (r7, R7-H1; r8) |
+| A frame read across two polls (longer than `receiveBatchSize`, 1 to 10 000; the example ships 128), with no outage at all (R8-H1) | the first part closes an evaluation, but the frame is not proven whole, so its confirmations are held: the book is judged by earlier, proven frames. They are released only when an event of the same epoch from another frame is processed, after the whole frame is applied | D1, D2.4 (r8, R8-H1) |
+| A frame whose tail never arrives, for any reason (an outage between calls, a transport refusal inside a call that publishes the call's prefix, an admission overflow, a crash) | nothing of the epoch follows the prefix (P2), so the frame is never proven and never confirms; the session ages from its last proven frame and goes STALE within the bound | D2.4 (r8) |
+| The newest frame, before anything else of its epoch arrives | not yet proven: it does not vouch, even for the evaluations at its own close. The cost of the rule (§5) | D1 (r8) |
+| A trader that resumes inside a frame (a restart after a commit that fell inside a split frame) | it sees the frame's tail as a frame of its own, held until the next frame of the epoch; the books it knows were all built from events it applied after its resume point, so no unapplied change of that frame belongs to a book it holds | D2.4 (r8) |
 | A trader that starts or restarts inside an epoch whose incident it did not consume | the taint is unknown to it (an accepted gap): bounded by the ceiling | D2.4, rule 6 (r1, X2) |
 | Silent session, socket still open | no confirmations: STALE at `lastConfirmation + bound` | D2 (no rule needed) |
 | Disconnection (`FeedDisconnected`), reconnect | the old session gets no more frames; the new session's frames do not confirm a book delivered on the old one: STALE within the bound. A book re-delivered on the new session is confirmed by it | D1 key |
 | Missed `PONG` (`FeedStale`), heartbeat loss | the gateway reconnects (`reconnectWhenStale`), so as above; and its `GATEWAY_FEED_STALL` incident taints the gateway epoch | D2.4 |
 | Subscription change (new generation) | a new session; books of the old generation are not confirmed by it | D1 key |
 | Gateway restart | new `gatewayEpoch`: a new session even though `connectionId` repeats | D1 key |
-| Gateway publication halt / overflow (`CO2-N6`) | nothing more is published, so no confirmations: STALE within the bound — IF any other event still advances the trader's event time; if nothing arrives at all, nothing is evaluated. A halt cannot leave part of a frame of up to 1 024 events in the stream, and a larger frame is preceded by its taint (r7) | D2 (and N1, D7); D2.4 |
+| Gateway publication halt / overflow (`CO2-N6`) | nothing more is published, so no confirmations: STALE within the bound — IF any other event still advances the trader's event time; if nothing arrives at all, nothing is evaluated. A halt cannot leave part of a frame of up to 1 024 events in the stream, and a larger frame is preceded by its taint (r7); and whatever a halt leaves, the last frame before it is never proven whole, so it never confirms (r8) | D2 (and N1, D7); D2.4 |
 | Gateway WAL refusal, unparsable frame | the gateway's incident names no market: the epoch is tainted, fallback to the last change for the rest of the gateway's life (repeats are deduplicated, D2.4) | D2.4 |
 | Market data-quality incident | fallback to the last change | D2.5 |
 | REST recovery snapshot | no session: last change only, until a socket frame for that asset lands on a session | D2.2 |
@@ -448,9 +544,15 @@ under an absent block or `LAST_CHANGE` (review round 6, O-R6-I1).)
 - **Stream: unchanged.** ADR-002 ordering; the session fields ride on the
   envelope (§7.1).
 - **Trader (`packages/trading-core/src/book-freshness.ts`, `loop.ts`):** every
-  consumed event is offered to the session table right after the event door,
-  before the event is applied or evaluated; the loop records each applied
-  book update's session per outcome (`market-state.ts` `noteBookSession`).
+  consumed event is offered right after the event door, before the event is
+  applied or evaluated, to the frame gate (r8), which first releases the
+  previous frame of the event's gateway epoch into the session table when
+  the event belongs to another frame, and then holds the event's own
+  confirmation against its frame; the loop records each applied book
+  update's session per outcome (`market-state.ts` `noteBookSession`). The
+  feed (`RedisMarketEventFeed`) is unchanged: it still hands a frame longer
+  than `receiveBatchSize` out in parts, and its `framesSplit` note points
+  here.
 - **Features:** the book section's `lastEventAt` is `confirmedAt` (under
   `LAST_CHANGE`, the pre-ADR-023 value). No feature definition changes:
   `quality.input_feed_ages` still reports `asOf − lastEventAt`
@@ -632,13 +734,27 @@ is NOT guaranteed even where every stale/fresh outcome matches (review probe:
 a 3 ms lag changed 12 of 13 decision records with identical outcomes);
 evaluations that fall back (`LAST_CHANGE`, rule 6, a tainted epoch) can
 still match byte for byte. Under the default `LAST_CHANGE` basis no clock is
-read and parity is as before. ADR-024's frame grouping is unaffected: a frame's events
-all update the table before its closing evaluation, which is the live order.
+read and parity is as before. ADR-024's frame grouping is unaffected. The
+frame gate (r8) is a pure function of the consumed event SEQUENCE: a frame
+is released when the next event of its epoch from another frame is
+processed, whatever the batches, polls or drains were. So a live process, a
+replay that drains once per recorded frame and a backtest that drains once
+per event release every frame at the same event, and the confirmation an
+evaluation at a given event can read does not depend on `receiveBatchSize`.
+What can still depend on the batching is ADR-024's cadence: when a feed
+hands a frame out in parts, each part's close is an evaluation of its own,
+and that evaluation is vouched for by earlier, proven frames only. Pinned:
+the same events in five partitions, cuts inside the frame included, admit
+the same entry at the same event. A raw-frame replay through the
+verification-only normalizer releases a recorded frame at the next record's
+first event, as live does.
 Inside one frame a later event's `receivedAt` may sit a millisecond after the
-instant the frame's evaluation of a market uses; the age is then negative,
-which every gate reads as fresh — exactly as a book update stamped after the
-evaluating event always was (`features-v1.md` §2: feed stamps "may sit after
-`asOf`"; the order-book never-clamp rule).
+instant the frame's evaluation of a market uses; a book that later event
+changed then has a negative age, which every gate reads as fresh — exactly
+as a book update stamped after the evaluating event always was
+(`features-v1.md` §2: feed stamps "may sit after `asOf`"; the order-book
+never-clamp rule). Since r8 that comes from the book's own last change only:
+a frame's confirmations are never read inside the frame.
 Recorded data without session fields replays under the last-change rule, so an
 old recording can never read fresher than it did. A backward step of the
 gateway's wall clock (D7, O-R6-I2) is in the recorded `receivedAt` values, so
@@ -683,7 +799,9 @@ a reproduction of the gateway.
   ceiling (chosen).** It uses only fields every envelope already carries. It
   needs no new event type or contract change, only the losses-first order
   of D5 (the adapter's problems, r1; the gateway's envelope refusals, r6;
-  whole-frame transport calls and the split-frame taint, r7).
+  whole-frame transport calls and the split-frame taint, r7) and, since r8,
+  the consumer's own rule that a frame confirms only once a later frame of
+  its epoch proves it whole (D1, D2.4).
   It fails closed on every missing piece. It is WEAKER per book than the last-change rule's proof, because a sibling's
   frame says nothing about this asset's delivery (§2, "Therefore"). The
   ceiling (D2 rule 6) bounds that weakness.
@@ -773,7 +891,18 @@ a reproduction of the gateway.
   events).
   A narrower answer, such as a per-frame completeness marker the trader
   could check, needs a stream or contract change, which is not this
-  round's.
+  round's. (Since r8 the trader no longer needs the taint to stay safe
+  through a cut frame: D2.4's consumer rule covers it. Removing or
+  narrowing the taint would loosen a fail-closed rule, so it is kept, and
+  the choice is left to ratification.)
+- **The frame proof costs one frame (r8, R8-H1).** A frame vouches only from
+  the next event of its gateway epoch on. On a busy session the delay is the
+  gap between two frames (milliseconds in H1's burst). A quiet session's
+  last frame before a pause vouches only when the pause ends, so a book the
+  r7 rule held fresh through a pause of up to the bound can now read stale
+  for that pause. That is the fail-closed direction. The H1 burst and the
+  derived quiet-YES stream are re-measured in the `THROUGHPUT-1c` r8
+  handoff.
 
 ## 6. Verification
 
@@ -880,3 +1009,36 @@ r7 adds these pins (review round 7, R7-H1):
   own incident; none is opened once publication has halted; without the
   batch capability a frame of two is marked; an oversized frame that also
   loses an event has both incidents ahead of its accepted events.
+
+r8 adds these pins (review round 8, R8-H1, and the class):
+- `test/integration/paper-trader/throughput-1c-consumer-frame-proof-redis.test.ts`:
+  real Redis, the REAL `RedisMarketEventFeed` and the REAL `pump`, fed the
+  REAL gateway composition's calls one by one. Named regressions, each 2
+  orders under `CONNECTION_CONFIRMED` at `298199d` and 0 now: R8-H1 at
+  `receiveBatchSize` 128 with frames of 129, 200 and 1 024 events and at
+  `receiveBatchSize` 1 with a frame of 2, with and without a successor;
+  R7-H1's prefix (the shape `2d29b2d` published) read in one short read;
+  the real Redis transport refusing an envelope inside the frame's call;
+  R6-H1's and X8's incident published AFTER its frame (the shapes `74e17ca`
+  and `f341d5f` published). Controls: a whole frame and a successor DOES
+  vouch at `receiveBatchSize` 1, 2, 128 and 4 096, and without the
+  successor it never does. A seeded randomized property per boundary of
+  the frame's path (feed batching and carry, a transport-call outage, a
+  refused envelope, a malformed entry, a WAL refusal, a refusal by the real
+  Redis transport, a restart from the committed position, a failed read, a
+  retention trim): frames of 1 to 2 048 events, `receiveBatchSize` from 1
+  upward, admission and ingest depths, and how far the trader reads between
+  calls; no order and no approval is ever admitted when the frame carries
+  the YES book's latest change;
+- `packages/trading-core/src/book-freshness.test.ts`, "r8": the gate
+  (released only by a later event of the same epoch from another frame;
+  another epoch proves nothing; an event that confirms nothing still proves;
+  bounded, and a forgotten frame confirms nothing), and the composition (the
+  R8-H1 shape at every cut and batch size admits nothing; a frame vouches
+  from the next frame on, never at its own close; a frame nothing follows
+  never vouches; five partitions of the same events admit the same entry at
+  the same event; an incident right after its frame proves and taints in
+  one step);
+- the r1, r6 and r7 end-to-end tests whose outcome turns on a whole frame
+  vouching (or on its taint) now send a successor message, so the frame is
+  proven and the taint, not the r8 rule, decides.
