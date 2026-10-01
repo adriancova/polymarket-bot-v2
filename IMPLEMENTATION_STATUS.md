@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260`, `WP-300`, `STORAGE-1`, `CI-4` and `STORAGE-GOV` are Complete. `THROUGHPUT-1c` is accepted and waits only for the user's ADR-023 ratification. `STORAGE-1b`, `WP-300b`, `STORAGE-GOV2` and `CONTROL-1` are Complete; `CO2-N1-ADR` (ADR-031, Proposed) is running. After `THROUGHPUT-1c` merges: `PROVENANCE-1` (it blocks `BURN-IN`), `CO2-N1` then `WP-270`, `CADENCE-1`, `ROLLOVER-1`, `REFDIET`, `APPROX-REPLAY-1`. `HOST-BENCH` is run by the laptop agent ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Next:** `WP-260`, `WP-300`, `STORAGE-1`, `CI-4` and `STORAGE-GOV` are Complete. `THROUGHPUT-1c` is accepted and waits only for the user's ADR-023 ratification. `STORAGE-1b`, `WP-300b`, `STORAGE-GOV2` and `CONTROL-1` are Complete. ADR-031 (`CO2-N1`) is Proposed and awaits the user. `CONTROL-1b` is running. After `THROUGHPUT-1c` merges: `PROVENANCE-1` (it blocks `BURN-IN`), `CO2-N1` then `WP-270`, `CADENCE-1`, `ROLLOVER-1`, `REFDIET`, `APPROX-REPLAY-1`. `HOST-BENCH` is run by the laptop agent ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -47,7 +47,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `STORAGE-1b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `WP-300b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `CONTROL-1` is Complete (2026-10-01); see [Work packages](#work-packages). `CADENCE-1`, which also owns `apps/control-api/src/**`, starts from its merge.
-- **`CO2-N1-ADR`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: ADR-031, **Proposed**, framing the design decision `CO2-N1` needs (live admission runs on event time) with options and a recommendation, for the user to rule. Paths: `docs/adr/ADR-031-*.md` (new) and its `docs/adr/README.md` row. Verifiers: Opus and gpt-6-astra, reconciled.
+- `CO2-N1-ADR` is Complete (2026-10-01): ADR-031 is merged as **Proposed**; the user rules (Human items).
 - **`CONTROL-1b`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `CONTROL1-LOWS`: an AST-based no-signer scan, a pinned kill-switch lock key, and the durable-audit-sink prerequisites (an append timeout, bounded mode-raise records, refusal bytes safe for `jsonb`). Paths: `apps/control-api/**`, `test/integration/control-api/**`. Verifiers: Opus and gpt-6-astra, reconciled.
 - `STORAGE-GOV2` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
@@ -178,7 +178,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Complete (2026-10-01) | `7b6499e` | [STORAGE-1b](docs/handoffs/STORAGE-1b.md) |
 | `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
-| `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | **Ready (authorized)** 2026-10-01 | — | — |
+| `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | Complete (2026-10-01): ADR-031 Proposed, awaiting the user's ruling | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
 | `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | **Ready (authorized)** 2026-10-01 | — | — |
 | `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | Complete (2026-10-01) | `a428ba3` | [STORAGE-GOV2](docs/handoffs/STORAGE-GOV2.md) |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
@@ -216,7 +216,7 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | `WP300-PERSIST` | WP-300's identity sets, kept observations, quarantines and request map are in memory only; no journal rebuild exists. Needed before restart-safe composition. | `WP-290` or the composition round |
 | `STORAGE1-MAXBYTES` | ADR-028 D5's `maxTotalBytes` hard stop is reported, not enforced. The WAL writer's capacity counter is not relieved by expiry (`J10`). | a data-gateway round, after `THROUGHPUT-1c` |
 | `STORAGE1-PIN-VOLUME` | Pins project to about 3.4 GB/day at H1's intent rate, above the 3 GB/day alarm. Overlapping pins store segments twice, and the codec is SNAPPY, not ZSTD. | a pin-storage ruling or round |
-| `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | an ADR and a trading-core round, before any settlement veto is lifted and before `WP-270` |
+| `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | ADR-031 (Proposed, recommends option (a)) awaits the user's ruling; then a trading-core round, after `THROUGHPUT-1c` merges, before any settlement veto is lifted and before `WP-270` |
 | `CO2-N3` | The per-code risk-veto panel cannot show a code's first veto: its series is born at 1, and `increase()` reads 0. The refused-exit and recommendation families have the same problem. | a control-api / dashboard round |
 | `CO2-N4` | Live and replay are not decision-equivalent on real data: frame grouping is live-only, and the backtest CLI refuses raw normalizers (TP2-R1-L4, TP2-R2-L2). | a backtest-cli round |
 | `CO2-N6` | After the gateway's terminal publication overflow (H1 run 4), the trader reported healthy for 13+ minutes. The overflow's cause is not diagnosed. | a gateway/trader health round |
@@ -377,6 +377,7 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
 - **ADR-023 ratification** (`THROUGHPUT-1c`): the user ratifies it, and either confirms or replaces the three interim rulings under [Authorized now](#authorized-now). The open choice: whether to narrow the epoch taint so the rule takes effect in a deployment with a Binance feed.
+- **ADR-031 ruling** (`CO2-N1`): choose an option. The recommendation is (a), an entry guard on the process clock, through existing inputs, entries only. Also answer Q1 (the refusal code), Q2 (exits while the trader lags) and Q3 (ADR-023's O-R6-I2). See ADR-031 sections 3 and 4.
 - **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
 
 ### Wave 3 authorization (conditional)
