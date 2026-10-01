@@ -5,11 +5,17 @@
  * ## Deleting is never the default
  *
  * - `RESEARCH_WORKER_EXPIRY_MODE` defaults to **`dry-run`**: extract, classify,
- *   pin, plan and report, and delete nothing. `execute` is an explicit word.
+ *   pin, plan and report, and delete nothing. Given a state directory, a dry
+ *   run also makes the evidence holds it learned durable, releasing none
+ *   (`evidence-holds.ts`). `execute` is an explicit word.
  * - Even in `execute`, the deletion capability refuses a WAL root that has not
  *   opted in with its marker file (`expireAfterExtractDeletion`), so pointing
  *   this command at a directory by mistake deletes nothing.
  * - The retention cannot be shortened below ADR-028's 72 hours.
+ * - A state directory is required in EITHER mode (round 5, N2): what a dry
+ *   run reads of the trader's rows is made durable there too, so a window
+ *   pruned from the registry before the first `execute` cycle loses nothing
+ *   a dry run already read.
  *
  * This process holds no signer, no venue credential and places no order; it
  * reads, writes datasets, and — only as above — deletes expired WAL segments.
@@ -26,7 +32,8 @@ import type { ExpiryMode } from "./retention/cycle.js";
 export type StorageConfig = {
   readonly walRootPath: string;
   readonly objectStoreRoot: string;
-  readonly stateDirectory: string | null;
+  /** Required in either mode (round 5, N2): every cycle's evidence holds are made durable there. */
+  readonly stateDirectory: string;
   readonly windowRegistryPath: string | null;
   readonly operatorPinsPath: string | null;
   readonly traderDatabaseUrl: string | null;
@@ -72,11 +79,15 @@ export function loadStorageConfig(env: NodeJS.ProcessEnv = process.env): Storage
   if (mode !== "dry-run" && mode !== "execute") {
     throw new ResearchWorkerConfigurationError("RESEARCH_WORKER_EXPIRY_MODE", "must be dry-run or execute");
   }
+  const walRootPath = required(env, "RESEARCH_WORKER_WAL_ROOT");
+  const objectStoreRoot = required(env, "RESEARCH_WORKER_OBJECT_STORE_ROOT");
   const stateDirectory = value(env, "RESEARCH_WORKER_STATE_DIR");
-  if (mode === "execute" && stateDirectory === null) {
+  if (stateDirectory === null) {
     throw new ResearchWorkerConfigurationError(
       "RESEARCH_WORKER_STATE_DIR",
-      "is required in execute mode: the expiry plan is made durable there before any deletion",
+      mode === "execute"
+        ? "is required in execute mode: the expiry plan is made durable there before any deletion, and the evidence holds every cycle reads"
+        : "is required in dry-run mode too: the evidence holds a dry run reads are made durable there, so a window pruned before the first execute cycle loses nothing already read",
     );
   }
   const traderEnvironment = value(env, "RESEARCH_WORKER_TRADER_ENVIRONMENT") ?? "PAPER";
@@ -85,8 +96,8 @@ export function loadStorageConfig(env: NodeJS.ProcessEnv = process.env): Storage
   }
   const walMaxTotal = value(env, "RESEARCH_WORKER_WAL_MAX_TOTAL_BYTES");
   return {
-    walRootPath: required(env, "RESEARCH_WORKER_WAL_ROOT"),
-    objectStoreRoot: required(env, "RESEARCH_WORKER_OBJECT_STORE_ROOT"),
+    walRootPath,
+    objectStoreRoot,
     stateDirectory,
     windowRegistryPath: value(env, "RESEARCH_WORKER_WINDOW_REGISTRY"),
     operatorPinsPath: value(env, "RESEARCH_WORKER_OPERATOR_PINS"),

@@ -1,5 +1,5 @@
 /**
- * Durable evidence holds (`STORAGE-1` rounds 3 and 4, L1 and M1; ADR-028
+ * Durable evidence holds (`STORAGE-1` rounds 3 to 5, L1, M1 and N2; ADR-028
  * Decisions 2.3, 3.4, 3.5 and 6).
  *
  * Whatever a trader window's durable rows have shown to be chain evidence is
@@ -23,6 +23,13 @@
  *
  * - **Every cycle unions what it learns into the file, durably, before it
  *   plans** (and each recheck before its deletion). A hold is never shrunk.
+ *   That includes a DRY RUN with a state directory (round 5, N2), which only
+ *   ever adds (`accumulateEvidenceHolds`): it never releases a hold, settles
+ *   a window or clears a failed read. (A dry run with no state directory has
+ *   nowhere durable to write: it is a report only. The storage command
+ *   requires one in either mode.) Every cycle with a state directory runs
+ *   under its lock (`cycle-lock.ts`), so no two read-modify-writes of the
+ *   file interleave.
  * - **A hold is released only when the window is settled**: classified, and
  *   its pin — extracted, its manifests verified, every source event of its
  *   chain inside — covers every held range and its own extent (or it is
@@ -234,8 +241,8 @@ function parseHolds(bytes: Uint8Array, path: string): ReadonlyMap<string, Window
 }
 
 /**
- * Read the durable holds. No state directory (a dry run): nothing is durable,
- * and nothing is settled. No file yet (`ENOENT`, and only that): none. A file
+ * Read the durable holds. No state directory (a dry run given none): nothing
+ * is durable, and nothing is settled. No file yet (`ENOENT`, and only that): none. A file
  * that does not read — any other read error, or bytes that do not parse — is
  * a `failure` that keeps every segment, and it is never overwritten.
  */
@@ -451,6 +458,45 @@ export function rememberEvidence(input: {
     if (!entry.settled || !input.registeredWindowIds.has(windowId)) next.delete(windowId);
   }
   return { windows: next, failure: input.state.failure };
+}
+
+/**
+ * What a DRY RUN makes durable (round 5, N2): everything the durable state
+ * holds and everything this pass learned, with nothing released. A dry run
+ * reads the trader's rows like any cycle, and what it read must outlive it —
+ * the window may leave the registry before an `execute` cycle reads them
+ * again — but it deletes nothing, so it settles nothing either. Per window:
+ *
+ * - `holds`: the union of both, merged; never shrunk;
+ * - `unreadable`: marked when either marks it; a dry run never clears a
+ *   failed read;
+ * - `settled`: only when the durable state settled it AND this pass did; a
+ *   dry run never settles a window;
+ * - a window the durable state names and this pass dropped (settled and no
+ *   longer registered) is kept as it was;
+ * - a window new to the file is recorded only when it holds something or its
+ *   read failed.
+ *
+ * Only an `execute` cycle releases a hold, under the same rules as ever
+ * (`rememberEvidence`). A dry run still PLANS with what an `execute` cycle
+ * would make durable, so its report says what `execute` would do.
+ */
+export function accumulateEvidenceHolds(durable: EvidenceHoldState, learned: EvidenceHoldState): EvidenceHoldState {
+  const next = new Map(durable.windows);
+  for (const [windowId, entry] of learned.windows) {
+    const previous = durable.windows.get(windowId);
+    if (previous === undefined) {
+      if (entry.holds.length === 0 && !entry.unreadable) continue;
+      next.set(windowId, { holds: mergeSpans(entry.holds), settled: false, unreadable: entry.unreadable });
+      continue;
+    }
+    next.set(windowId, {
+      holds: mergeSpans([...previous.holds, ...entry.holds]),
+      settled: previous.settled && entry.settled,
+      unreadable: previous.unreadable || entry.unreadable,
+    });
+  }
+  return { windows: next, failure: durable.failure };
 }
 
 /** Whether two states hold and settle the same. */

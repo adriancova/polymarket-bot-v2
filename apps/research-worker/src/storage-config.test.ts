@@ -8,7 +8,8 @@ import { describe, expect, it } from "vitest";
 import { RAW_RETENTION_MS } from "./retention/plan.js";
 import { loadStorageConfig } from "./storage-config.js";
 
-const BASE = { RESEARCH_WORKER_WAL_ROOT: "/wal", RESEARCH_WORKER_OBJECT_STORE_ROOT: "/objects" };
+const BASE = { RESEARCH_WORKER_WAL_ROOT: "/wal", RESEARCH_WORKER_OBJECT_STORE_ROOT: "/objects", RESEARCH_WORKER_STATE_DIR: "/state" };
+const NO_STATE = { RESEARCH_WORKER_WAL_ROOT: "/wal", RESEARCH_WORKER_OBJECT_STORE_ROOT: "/objects" };
 
 describe("loadStorageConfig", () => {
   it("is a dry run unless execute is spelled out", () => {
@@ -21,12 +22,16 @@ describe("loadStorageConfig", () => {
   });
 
   it("refuses execute without a state directory for the durable plan", () => {
-    expect(() => loadStorageConfig({ ...BASE, RESEARCH_WORKER_EXPIRY_MODE: "execute" })).toThrow(
-      /RESEARCH_WORKER_STATE_DIR/u,
+    expect(() => loadStorageConfig({ ...NO_STATE, RESEARCH_WORKER_EXPIRY_MODE: "execute" })).toThrow(
+      /RESEARCH_WORKER_STATE_DIR: is required in execute mode/u,
     );
-    expect(
-      loadStorageConfig({ ...BASE, RESEARCH_WORKER_EXPIRY_MODE: "execute", RESEARCH_WORKER_STATE_DIR: "/state" }).mode,
-    ).toBe("execute");
+    expect(loadStorageConfig({ ...BASE, RESEARCH_WORKER_EXPIRY_MODE: "execute" }).mode).toBe("execute");
+  });
+
+  it("(round 5, N2) refuses a dry run without a state directory too: what it reads is made durable there", () => {
+    expect(() => loadStorageConfig(NO_STATE)).toThrow(/RESEARCH_WORKER_STATE_DIR: is required in dry-run mode too/u);
+    expect(() => loadStorageConfig({ ...NO_STATE, RESEARCH_WORKER_EXPIRY_MODE: "dry-run" })).toThrow(/RESEARCH_WORKER_STATE_DIR/u);
+    expect(loadStorageConfig(BASE).stateDirectory).toBe("/state");
   });
 
   it("refuses a raw retention shorter than 72 hours", () => {

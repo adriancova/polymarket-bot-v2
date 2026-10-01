@@ -357,7 +357,35 @@ export function potentialRange(
   return { fromMs: window.responsibleFromMs - leadInMs, toMs: window.windowEndMs + durabilityGraceMs };
 }
 
-/** An in-memory evidence source, for tests and for a deployment with no trader. */
+/**
+ * The source when no trader database is configured (`storage-main.ts`; round
+ * 5, N1): every read FAILS, naming `reason`. A trader-responsible window is
+ * then unclassified with `evidenceUnreadable`, exactly as when the database is
+ * down: what its rows hold is unknown, so the planner keeps every segment
+ * until its evidence is settled, and a failed read marked durably earlier
+ * stays marked. A missing database is never "no rows". A gateway-only window
+ * never reads the source, so a deployment with no trader window loses
+ * nothing.
+ */
+export function unavailableEvidenceSource(reason: string): TraderEvidenceSource {
+  const fail = (): never => {
+    throw new Error(reason);
+  };
+  return {
+    async dispatchFrontiers(): Promise<ReadonlyMap<string, DispatchFrontier>> {
+      return fail();
+    },
+    async marketEvidence(): Promise<MarketEvidence> {
+      return fail();
+    },
+  };
+}
+
+/**
+ * An in-memory evidence source, for tests. A composition root with no trader
+ * database uses `unavailableEvidenceSource`, never this: an empty static
+ * source would read as "no rows", not "rows unknown".
+ */
 export function staticEvidenceSource(input: {
   /** Each instance's dispatch frontier; an absent instance has none. */
   readonly frontiers: ReadonlyMap<string, DispatchFrontier>;

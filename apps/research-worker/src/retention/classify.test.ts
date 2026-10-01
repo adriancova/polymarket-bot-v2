@@ -24,6 +24,7 @@ import {
   pinRetentionMs,
   potentialRange,
   staticEvidenceSource,
+  unavailableEvidenceSource,
 } from "./classify.js";
 import { pinBudget, storageMetrics } from "./metrics.js";
 import type { PinRecord } from "./pins.js";
@@ -449,6 +450,30 @@ describe("a source event whose segment is gone is resolved through the window's 
       pinnedSource: () => false,
     });
     expect(unresolved).toMatchObject({ state: "unclassified" });
+  });
+});
+
+describe("no trader database configured (round 5, N1): every trader window's rows are unreadable, never empty", () => {
+  const options = (nowMs: number, sealed: WalIndex = USUAL) => ({
+    nowMs,
+    leadInMs: LEAD_IN,
+    durabilityGraceMs: GRACE,
+    evidence: unavailableEvidenceSource("no trader database is configured"),
+    wal: sealed,
+  });
+  const unreadable = { state: "unclassified", holdRanges: [], evidenceUnreadable: "no trader database is configured" };
+
+  it.each([
+    ["closed, the WAL sealed past its range (the frontier is read)", END + 10 * MIN, USUAL],
+    ["not closed yet (no frontier is read)", END - 1, USUAL],
+    ["closed, the WAL not sealed past its range yet (no frontier is read)", END + 10 * MIN, wal([seg({ index: 0, first: "1", last: "10", fromMs: START - 20 * MIN, toMs: START + 5 * MIN })])],
+  ] as const)("a trader window %s is unclassified with its rows unreadable", async (_name, nowMs, sealed) => {
+    expect(await classifyWindow(WINDOW, options(nowMs, sealed))).toMatchObject(unreadable);
+  });
+
+  it("a gateway-only window never reads the source: it classifies at its close; a trader window before anyone could act holds nothing", async () => {
+    expect(await classifyWindow({ ...WINDOW, responsibility: { kind: "gateway-only" } }, options(END))).toMatchObject({ state: "classified", pinClass: null });
+    expect(await classifyWindow(WINDOW, options(START - 1))).toStrictEqual({ windowId: "w", state: "unclassified", reason: "the window has not closed", holdRanges: [] });
   });
 });
 

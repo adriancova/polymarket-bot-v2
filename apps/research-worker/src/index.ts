@@ -124,6 +124,7 @@ export {
   pinRetentionMs,
   potentialRange,
   staticEvidenceSource,
+  unavailableEvidenceSource,
   type ClassifyOptions,
   type DispatchFrontier,
   type IntentEvidence,
@@ -157,6 +158,15 @@ export {
   type BootClock,
   type ClockAssessment,
 } from "./retention/clock-guard.js";
+export {
+  DEFAULT_STORAGE_CYCLE_LOCK_TIMEOUT_MS,
+  STORAGE_CYCLE_LOCK_NAME,
+  StorageCycleLockError,
+  hostBootId,
+  storageCycleLockPath,
+  withStorageCycleLock,
+  type StorageCycleLockOptions,
+} from "./retention/cycle-lock.js";
 export {
   OperatorPinLockError,
   canonicalOperatorPinsPath,

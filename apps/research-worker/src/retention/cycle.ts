@@ -20,7 +20,8 @@
  * 4b. **Hold**: make every hold the classifications show durable — an
  *    unclassified window's, and a classified window's whole pin extent while
  *    its pin is not settled — and release the holds of every window this
- *    cycle settles (`evidence-holds.ts`).
+ *    cycle settles (`evidence-holds.ts`). A dry run with a state directory
+ *    makes what it learned durable too, but releases nothing (round 5, N2).
  * 5. **Plan**: decide every sealed segment, with every reason it is kept
  *    (`plan.ts`), against the pins this cycle derives AND every pin already
  *    extracted into the store, and against the durable holds.
@@ -30,6 +31,10 @@
  *    default mode is `dry-run`, which deletes nothing and writes no plan.
  * 7. **Measure**: disk, WAL capacity, pin budget, expiry lag and the clock
  *    (`metrics.ts`).
+ *
+ * A cycle with a state directory runs whole under that directory's cycle lock
+ * (`cycle-lock.ts`): the timer and a dry run never interleave their reads and
+ * writes of the holds or the clock state.
  */
 
 import type {
@@ -49,6 +54,8 @@ import type { IntentEvidence, TraderEvidenceSource, WindowClassification } from 
 import { classifyWindow } from "./classify.js";
 import type { BootClock, ClockAssessment } from "./clock-guard.js";
 import { DEFAULT_CLOCK_STEP_TOLERANCE_MS, assessClock, guardedClock } from "./clock-guard.js";
+import type { StorageCycleLockOptions } from "./cycle-lock.js";
+import { withStorageCycleLock } from "./cycle-lock.js";
 import type { ExpiryPlanEntry, ExpiryRunResult } from "./execute.js";
 import {
   buildExpiryPlan,
@@ -64,6 +71,7 @@ import type { OperatorPinLock } from "./operator-pin-lock.js";
 import { noOperatorPinLock } from "./operator-pin-lock.js";
 import type { EvidenceHoldState, EvidenceHoldsFileSystem } from "./evidence-holds.js";
 import {
+  accumulateEvidenceHolds,
   nodeEvidenceHoldsFileSystem,
   persistEvidenceHolds,
   readEvidenceHolds,
@@ -114,7 +122,13 @@ export type StorageCycleDependencies = {
   readonly mode: ExpiryMode;
   /** Required in `execute` mode; never consulted in `dry-run`. */
   readonly deletion: ExpiredSegmentDeletion | null;
-  /** Where durable expiry plans and the clock guard's state live. Required in `execute` mode. */
+  /**
+   * Where durable expiry plans, the clock guard's state and the evidence holds
+   * live, and its cycle lock. Required in `execute` mode. A dry run given one
+   * makes what it learned durable (never releasing anything); one given none
+   * is a report only. The storage command always gives one, in either mode
+   * (`storage-config.ts`).
+   */
   readonly stateDirectory: string | null;
   /** The time since boot, for the clock guard. Required in `execute` mode. */
   readonly bootClock?: BootClock | null;
@@ -122,6 +136,8 @@ export type StorageCycleDependencies = {
   readonly operatorPinLock?: OperatorPinLock;
   /** The evidence holds file's operations; the real filesystem when absent. A test substitutes them to fail each step. */
   readonly evidenceHoldsFileSystem?: EvidenceHoldsFileSystem;
+  /** The state directory's cycle lock: how long to wait for a running cycle (`cycle-lock.ts`). */
+  readonly cycleLock?: StorageCycleLockOptions;
 };
 
 export type StorageCycleReport = {
@@ -243,9 +259,12 @@ async function epochWrittenBytes(
   return { counted, unreadablePlans };
 }
 
-/** Run one storage cycle. In `dry-run` (the default), nothing is deleted. */
+/**
+ * Run one storage cycle. In `dry-run` (the default), nothing is deleted. With
+ * a state directory, the whole cycle holds that directory's cycle lock; a
+ * cycle that cannot take it in time refuses, having done nothing.
+ */
 export async function runStorageCycle(dependencies: StorageCycleDependencies): Promise<StorageCycleReport> {
-  const { objectStore, fileSystem, settings } = dependencies;
   if (
     dependencies.mode === "execute" &&
     (dependencies.deletion === null ||
@@ -255,6 +274,13 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
   ) {
     throw new Error("execute mode needs a deletion capability, a state directory and a boot clock; nothing was done");
   }
+  if (dependencies.stateDirectory === null) return await runCycle(dependencies);
+  return await withStorageCycleLock(dependencies.stateDirectory, dependencies.cycleLock ?? {}, () => runCycle(dependencies));
+}
+
+/** One cycle, its state directory's lock (if any) held by the caller. */
+async function runCycle(dependencies: StorageCycleDependencies): Promise<StorageCycleReport> {
+  const { objectStore, fileSystem, settings } = dependencies;
 
   // -- 0. The clock: a forward step is subtracted, never trusted. -----------
   const toleranceMs = settings.clockStepToleranceMs ?? DEFAULT_CLOCK_STEP_TOLERANCE_MS;
@@ -337,8 +363,10 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
   // -- 4b. Hold: what the classifications show is durable before any plan — a
   // classified window whose pin this cycle did not settle holds its whole pin
   // extent — and a window this cycle settles releases its holds. A dry run
-  // reads the holds but never writes them: it deletes nothing, and must not
-  // race the timer's read-modify-write of the file. ----------------------------
+  // with a state directory makes what it learned durable too, releasing
+  // nothing (round 5, N2): the window may leave the registry before an
+  // execute cycle reads its rows again. The cycle lock keeps both from
+  // racing each other's read-modify-write. --------------------------------------
   const holdsFileSystem = dependencies.evidenceHoldsFileSystem ?? nodeEvidenceHoldsFileSystem;
   const previousHolds = await readEvidenceHolds(dependencies.stateDirectory, holdsFileSystem);
   const rememberedHolds = rememberEvidence({
@@ -350,10 +378,20 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     },
     registeredWindowIds: new Set(windows.map((window) => window.windowId)),
   });
-  let holds: EvidenceHoldState =
-    dependencies.mode === "execute"
-      ? await persistEvidenceHolds(dependencies.stateDirectory, rememberedHolds, holdsFileSystem)
-      : rememberedHolds;
+  let holds: EvidenceHoldState;
+  if (dependencies.mode === "execute") {
+    holds = await persistEvidenceHolds(dependencies.stateDirectory, rememberedHolds, holdsFileSystem);
+  } else {
+    // Durable: everything held before and everything learned, nothing
+    // released. Planned: what an execute cycle would make durable, so the
+    // report says what execute would do — unless the write failed, when every
+    // segment is reported kept, as execute would keep it.
+    const learned = accumulateEvidenceHolds(previousHolds, rememberedHolds);
+    const durable = sameEvidenceHolds(learned, previousHolds)
+      ? learned
+      : await persistEvidenceHolds(dependencies.stateDirectory, learned, holdsFileSystem);
+    holds = { windows: rememberedHolds.windows, failure: durable.failure };
+  }
 
   // -- 5. Plan. ---------------------------------------------------------------
   const pinRecords = await readPinRecords(objectStore, specs);

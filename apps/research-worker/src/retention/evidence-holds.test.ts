@@ -17,6 +17,7 @@ import type { WindowClassification } from "./classify.js";
 import type { EvidenceHoldState, EvidenceHoldsFileOperations, EvidenceHoldsFileSystem, EvidencePass } from "./evidence-holds.js";
 import {
   EVIDENCE_HOLDS_FILE_NAME,
+  accumulateEvidenceHolds,
   emptyEvidenceHolds,
   encodeEvidenceHolds,
   evidenceHoldsFileSystem,
@@ -194,6 +195,58 @@ describe("rememberEvidence", () => {
     expect([...after.windows.keys()].sort()).toStrictEqual(["gone-held", "w1"]);
     // The failure of the state it came from is carried.
     expect(rememberEvidence({ state: state([], "bad"), classifications: [], pass: recheck(), registeredWindowIds: registered }).failure).toBe("bad");
+  });
+});
+
+describe("accumulateEvidenceHolds (round 5, N2): what a dry run makes durable — everything held or learned, nothing released", () => {
+  const OTHER = { fromMs: 5_000, toMs: 6_000 };
+
+  it("records what a dry run learned for a window the file does not name: its holds, and a failed read", () => {
+    const learned = state([
+      ["w1", { holds: [HELD], settled: false }],
+      ["w2", { holds: [], settled: false, unreadable: true }],
+    ]);
+    const after = accumulateEvidenceHolds(emptyEvidenceHolds(), learned);
+    expect(after.windows.get("w1")).toStrictEqual(entry([HELD], false));
+    expect(after.windows.get("w2")).toStrictEqual(entry([], false, true));
+  });
+
+  it("never settles a window: one the dry run settled is not recorded, and one the file holds stays held", () => {
+    // New to the file and settled by the dry run (its pin extracted): nothing to record.
+    expect(accumulateEvidenceHolds(emptyEvidenceHolds(), state([["w1", { holds: [], settled: true }]])).windows.has("w1")).toBe(false);
+    // Held in the file; the dry run would release it: still held, not settled.
+    const durable = state([["w1", { holds: [HELD], settled: false }]]);
+    expect(accumulateEvidenceHolds(durable, state([["w1", { holds: [], settled: true }]])).windows.get("w1")).toStrictEqual(entry([HELD], false));
+  });
+
+  it("never shrinks a hold: the union of what the file holds and what the dry run learned", () => {
+    const durable = state([["w1", { holds: [HELD], settled: false }]]);
+    expect(accumulateEvidenceHolds(durable, state([["w1", { holds: [OTHER], settled: false }]])).windows.get("w1")).toStrictEqual(entry([HELD, OTHER], false));
+    expect(accumulateEvidenceHolds(durable, state([["w1", { holds: [], settled: false }]])).windows.get("w1")).toStrictEqual(entry([HELD], false));
+  });
+
+  it("never clears a failed read, and marks one the dry run saw", () => {
+    const marked = state([["w1", { holds: [], settled: false, unreadable: true }]]);
+    expect(accumulateEvidenceHolds(marked, state([["w1", { holds: [OTHER], settled: false }]])).windows.get("w1")).toStrictEqual(entry([OTHER], false, true));
+    const settled = state([["w1", { holds: [], settled: true }]]);
+    expect(accumulateEvidenceHolds(settled, state([["w1", { holds: [], settled: true, unreadable: true }]])).windows.get("w1")).toStrictEqual(entry([], true, true));
+  });
+
+  it("unsettles a settled window the dry run found holding more, and keeps a settled one it found settled", () => {
+    const settled = state([["w1", { holds: [], settled: true }]]);
+    expect(accumulateEvidenceHolds(settled, state([["w1", { holds: [OTHER], settled: false }]])).windows.get("w1")).toStrictEqual(entry([OTHER], false));
+    expect(accumulateEvidenceHolds(settled, state([["w1", { holds: [], settled: true }]])).windows.get("w1")).toStrictEqual(entry([], true));
+  });
+
+  it("forgets nothing: a window the dry run dropped (it left the registry) is kept as the file has it, and so is the file's failure", () => {
+    const durable = state([
+      ["gone-held", { holds: [HELD], settled: false }],
+      ["gone-settled", { holds: [], settled: true }],
+      ["gone-unreadable", { holds: [], settled: false, unreadable: true }],
+    ]);
+    const after = accumulateEvidenceHolds(durable, emptyEvidenceHolds());
+    expect(sameEvidenceHolds(after, durable)).toBe(true);
+    expect(accumulateEvidenceHolds(state([], "bad"), emptyEvidenceHolds()).failure).toBe("bad");
   });
 });
 

@@ -44,13 +44,16 @@ One run does, in order:
    verified with its whole chain inside: while the pin waits for the extraction batch or for
    the pin catalog to read, after a failed pin write, and when the re-decision just before a
    deletion is the first to see the evidence. Those holds are **durable**
-   (`<state dir>/evidence-holds.json`): a later cycle keeps them whether or not it can read
-   the trader's rows, and whether or not the window is still registered, until the window
-   is classified and its pin — verified, with its whole chain inside — covers them. A window
-   whose rows cannot be read (the database down, a timeout) and whose evidence is not yet
-   settled that way keeps **every** segment: what it holds is unknown. A source event whose
-   segment, or whole gateway epoch, has expired under the window's own pin is found through
-   that pin's verified manifests.
+   (`<state dir>/evidence-holds.json`, which is why the command requires a state directory
+   in either mode), made so by every cycle, **a dry run included**: a dry run only ever adds
+   to them — it never releases a hold, settles a window or clears a failed read; only an
+   `execute` cycle does. A later cycle keeps them whether or not it can read the trader's
+   rows, and whether or not the window is still registered, until an `execute` cycle finds
+   the window classified and its pin — verified, with its whole chain inside — covering
+   them. A window whose rows cannot be read (the database down, a timeout, or no database
+   configured) and whose evidence is not yet settled that way keeps **every** segment: what
+   it holds is unknown. A source event whose segment, or whole gateway epoch, has expired
+   under the window's own pin is found through that pin's verified manifests.
 3. **Pins.** A window with a fill (kept forever), an intent, a refusal or a halt (30 days),
    and every operator pin, is copied exactly — whole WAL segments, through the `WP-130`
    compactor — under `pins/<pinId>/`. A pin, once extracted, is a durable fact: a window
@@ -84,6 +87,17 @@ reported as `walOrphanSidecars` and never planned; it may be removed by hand.
 
 It prints one JSON report and exits. Run it on a timer.
 
+**One cycle at a time.** Every cycle holds the lock
+`<state dir>/storage-cycle.<boot id>.lock` from its start to its end, in either mode, so an
+operator's dry run and the timer's cycle never interleave their reads and writes of the
+holds or the clock state. A cycle that finds the lock held waits up to 5 minutes, then exits
+non-zero having done nothing; the error names the holder. A lock left by a process that a
+reboot ended carries the old boot's id and holds nothing after the reboot; it may be
+removed. A lock left in the same boot by a killed process (`kill -9`, or a service stopped
+mid-cycle) is never broken automatically: every later cycle refuses, deleting nothing, until
+it is removed after checking that no storage cycle runs. The lock serializes cycles on one
+host; a state directory shared between hosts is not supported.
+
 `<state dir>/evidence-holds.json` is never edited by hand in normal operation. Removing it,
 or a window's entry in it, releases those holds without verifying anything, so do that only
 as a deliberate decision, after checking that every window it names is pinned or has no
@@ -97,10 +111,10 @@ segment and is never overwritten.
 | `RESEARCH_WORKER_WAL_ROOT` | required | The gateway's WAL root (`<root>/<gatewayEpoch>/…`) |
 | `RESEARCH_WORKER_OBJECT_STORE_ROOT` | required | The filesystem object store |
 | `RESEARCH_WORKER_EXPIRY_MODE` | `dry-run` | `execute` deletes, subject to the marker |
-| `RESEARCH_WORKER_STATE_DIR` | none | Where durable expiry plans, the clock guard's state and the evidence holds live; required for `execute` |
+| `RESEARCH_WORKER_STATE_DIR` | required | Where durable expiry plans, the clock guard's state, the evidence holds and the cycle lock live. Required in **either** mode: a dry run makes the evidence holds it learns durable there too (releasing none), so a window pruned from the registry before the first `execute` cycle loses nothing a dry run already read. Give every run against the same WAL root the same state directory: what a cycle reads is held only in its own |
 | `RESEARCH_WORKER_WINDOW_REGISTRY` | none | The market windows (below). With none, every segment that names a Polymarket market is kept |
 | `RESEARCH_WORKER_OPERATOR_PINS` | none | Operator pins (below) |
-| `RESEARCH_WORKER_TRADER_DATABASE_URL` | none | The trader's PostgreSQL, read-only. With none, no trader window classifies |
+| `RESEARCH_WORKER_TRADER_DATABASE_URL` | none | The trader's PostgreSQL, read-only. With none, a trader-responsible window's rows count as **unreadable**, as when the database is down: no trader window classifies, and while one's evidence is not settled every segment is kept, in either mode. A registry of gateway-only windows needs none |
 | `RESEARCH_WORKER_TRADER_ENVIRONMENT` | `PAPER` | The run mode whose rows are read |
 | `RESEARCH_WORKER_RAW_RETENTION_MS` | 72 h | At least 72 h; shorter is refused |
 | `RESEARCH_WORKER_PIN_LEAD_IN_MS` | 15 min | The reference lead-in before a pinned window |
@@ -154,15 +168,18 @@ window — a trader can act before the window opens — and defaults to `windowS
 gateway-only one. Until the window classifies, every segment from it (less the lead-in) to
 the window's end is kept.
 
-The registry may be pruned of a window once it is settled — its pin extracted and
-verified with its whole chain inside, or classified with no evidence — and its segments
-have all expired. Pruning it earlier releases nothing already known: its durable holds (what
-its rows showed while it was unclassified, and its whole pin range while it was classified
-and not yet pinned) and a failed read of its rows stay in `evidence-holds.json`, and keep
-those segments until the window is registered again and pinned, or its entry there is
-removed deliberately. What is not yet known is not held: evidence its trader makes after the
-last cycle that read its rows. A segment of the pruned window's range outside its holds is
-then decided without it: kept when it names a market no registered window names, but
+The registry may be pruned of a window once an `execute` cycle has settled it — its pin
+extracted and verified with its whole chain inside, or classified with no evidence — and its
+segments have all expired. A dry run never settles a window durably: it reports what
+`execute` would do, and keeps the window's holds. Pruning a window earlier releases nothing
+that a cycle, in either mode, has already read: its durable holds
+(what its rows showed while it was unclassified, and its whole pin range while it was
+classified and not yet settled) and a failed read of its rows stay in `evidence-holds.json`,
+and keep those segments until the window is registered again and settled by an `execute`
+cycle, or its entry there is removed deliberately. What is not yet known is not held:
+evidence its trader makes after the last cycle read its rows, and the potential range of a
+window that was unclassified with no evidence yet (its trader lagging). A segment of the pruned window's range outside its holds
+is then decided without it: kept when it names a market no registered window names, but
 expired like any other segment when another window of the same market is still registered.
 
 ### Operator pins

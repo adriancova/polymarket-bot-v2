@@ -6,6 +6,7 @@
  * ```text
  * RESEARCH_WORKER_WAL_ROOT=/var/lib/polymarket-bot/wal
  * RESEARCH_WORKER_OBJECT_STORE_ROOT=/var/lib/polymarket-bot/objects
+ * RESEARCH_WORKER_STATE_DIR=/var/lib/polymarket-bot/storage-state
  * pnpm --filter @polymarket-bot/research-worker start storage
  * ```
  *
@@ -13,8 +14,10 @@
  * only when that command is given; `main.ts` dispatches to it.
  *
  * **Dry run by default**: nothing is deleted and no plan is written unless
- * `RESEARCH_WORKER_EXPIRY_MODE=execute`, a state directory is configured, and
- * the WAL root holds the expiry opt-in marker (`storage-config.ts`).
+ * `RESEARCH_WORKER_EXPIRY_MODE=execute` and the WAL root holds the expiry
+ * opt-in marker (`storage-config.ts`). A state directory is required in either
+ * mode: a dry run makes the evidence holds it learned durable there, releasing
+ * nothing (`evidence-holds.ts`), under the directory's cycle lock.
  *
  * The composition root: the only place that reads the environment, opens the
  * filesystem and the trader database (read-only), and chooses the deletion
@@ -32,7 +35,7 @@ import {
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import type { TraderEvidenceSource } from "./retention/classify.js";
-import { staticEvidenceSource } from "./retention/classify.js";
+import { unavailableEvidenceSource } from "./retention/classify.js";
 import { systemBootClock } from "./retention/clock-guard.js";
 import { runStorageCycle } from "./retention/cycle.js";
 import type { StorageCycleReport } from "./retention/cycle.js";
@@ -114,6 +117,8 @@ export function summarizeStorageReport(report: StorageCycleReport): Record<strin
 export type StorageMainOptions = {
   /** How long to wait for the operator-pin lock (default 120 s). */
   readonly operatorPinLockTimeoutMs?: number;
+  /** How long to wait for another storage cycle's lock on the state directory (default 5 min). */
+  readonly cycleLockTimeoutMs?: number;
 };
 
 /** Run one storage cycle and print its report. */
@@ -132,9 +137,15 @@ export async function storageMain(options: StorageMainOptions = {}): Promise<num
   let evidence: TraderEvidenceSource;
   let close: () => Promise<void> = async () => {};
   if (config.traderDatabaseUrl === null) {
-    // No trader database: no trader-responsible window can be classified, so
-    // none of the segments it overlaps can expire. Fail closed.
-    evidence = staticEvidenceSource({ frontiers: new Map(), evidence: new Map() });
+    // No trader database: a trader-responsible window's rows cannot be read.
+    // That is a failed read, never an empty one (round 5, N1): such a window
+    // is unclassified with its evidence unreadable, so — in either mode —
+    // every segment is kept while its evidence is not settled, and a failed
+    // read already marked in the holds stays marked. A gateway-only window
+    // never reads the source, so gateway-only operation is unchanged.
+    evidence = unavailableEvidenceSource(
+      "no trader database is configured (RESEARCH_WORKER_TRADER_DATABASE_URL), so the trader's rows cannot be read",
+    );
   } else {
     const pool = createPostgresPool({
       connectionString: config.traderDatabaseUrl,
@@ -178,6 +189,7 @@ export async function storageMain(options: StorageMainOptions = {}): Promise<num
       stateDirectory: config.stateDirectory,
       bootClock: systemBootClock(),
       operatorPinLock: pinFile === null ? noOperatorPinLock() : pinFile.lock,
+      cycleLock: options.cycleLockTimeoutMs === undefined ? {} : { timeoutMs: options.cycleLockTimeoutMs },
     });
     console.log(JSON.stringify(summarizeStorageReport(report)));
     return report.expiry !== null && report.expiry.failures.length > 0 ? 1 : 0;
