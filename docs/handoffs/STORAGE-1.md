@@ -133,9 +133,11 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
 
 ## known_risks
 
-- **Classification and chain containment are supersets until `H1R1-PROVENANCE`.**
-  - The trader's `gateway_epoch` and `ingest_seq` columns are NULL, so a source event is located by its instant, `evaluated_at`.
-  - This keeps more raw data, never less.
+- **No trader-responsible window classifies until `H1R1-PROVENANCE`, so raw WAL that such a window could overlap never expires.**
+  - `CoreLoop` gives a decision only its `eventId`, so the trader writes `gateway_epoch` and `ingest_seq` as NULL.
+  - `dispatchFrontiers` skips those rows, and `classificationBlocker` refuses a window with no dispatch frontier.
+  - This keeps more, never less. But wherever a trader runs, the 72 h expiry does not run, so `BURN-IN`'s criterion "Raw expiry, pins and backups ran and were verified" cannot be met until it is fixed (`PROVENANCE-1`).
+  - Corrected 2026-10-01 (STORAGE-GOV review): was 'Classification and chain containment are supersets until `H1R1-PROVENANCE`… This keeps more raw data, never less.'
 - **A stale cycle lock blocks expiry.** A cycle killed mid-run leaves its lock, and every later cycle refuses and deletes nothing until the operator removes it. A reboot clears it.
 - **No trader database while an unsettled trader window is registered: nothing expires.**
 - **A window settled only by dry runs, then pruned from the registry, keeps its holds.** They stay until it is re-registered and settled by `execute`.
@@ -155,7 +157,7 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
 2. **A data-gateway round:**
    - enforce `maxTotalBytes`;
    - make the WAL writer's capacity counter account for expired segments (J10).
-3. **`H1R1-PROVENANCE` and trader persistence:** persist decision provenance, halts, refusals and the execution chain. Classification and chain containment then become exact rather than supersets.
+3. **`PROVENANCE-1` (`H1R1-PROVENANCE`, `OUT1-R1-HALT-NOT-DURABLE`):** persist decision provenance (`gateway_epoch`, `ingest_seq`, `feature_snapshot_id`), halts and refusals. Until then no trader-responsible window classifies, and raw WAL under it never expires. It blocks `BURN-IN`.
 4. **`HOST-1`:**
    - run the storage timer in `execute` mode, with `RESEARCH_WORKER_STATE_DIR` set and the opt-in marker on the live WAL root only;
    - produce the window registry;

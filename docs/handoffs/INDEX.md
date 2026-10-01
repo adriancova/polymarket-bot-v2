@@ -112,3 +112,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-01 | [WP-300.md](WP-300.md) | `WP-300`: collateral inventory and wallet operations | WP | Complete (2026-10-01) | `9cdbf32` | 9 KB |
 | 2026-10-01 | [STORAGE-1.md](STORAGE-1.md) | `STORAGE-1`: research tier, pinned windows, verified raw expiry, disk metrics | WP | Complete (2026-10-01) | `a22502b` | 10 KB |
 | 2026-10-01 | [CI-4.md](CI-4.md) | `CI-4`: run the wallet-operations contract suite in CI | Round | Complete (2026-10-01) | `4628541` | 2 KB |
+| 2026-10-01 | [STORAGE-GOV.md](STORAGE-GOV.md) | `STORAGE-GOV`: ADR-028 Amendment 1 | Governance | Complete (2026-10-01) | `1f75ac0` | 3 KB |
