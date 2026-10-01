@@ -14,6 +14,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -21,10 +22,14 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 
-import { ObjectImmutabilityError } from "./errors.js";
+import { ObjectImmutabilityError, RetentionGuardError } from "./errors.js";
+import { verifyExpiryProof } from "./expiry-proof.js";
+import type { ExpiryDeletionRequest, ExpiryProofOutcome } from "./expiry-proof.js";
 import type {
   CompactionClock,
   CompactionFileSystem,
+  ExpiredSegmentDeletion,
+  ExpiredSegmentDeletionOptions,
   ObjectHead,
   ObjectStore,
   SegmentDeletionRequest,
@@ -179,6 +184,17 @@ export function fileSystemObjectStore(rootDirectory: string): ObjectStore {
     async get(key: string): Promise<Uint8Array> {
       return await readFile(pathFor(key));
     },
+
+    async list(prefix: string): Promise<readonly string[]> {
+      try {
+        return (await readdir(pathFor(prefix))).sort();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+    },
   };
 }
 
@@ -238,6 +254,106 @@ export function deleteAfterVerifiedUploadRetention(options: {
 
       await rm(segmentPath, { force: true });
       await rm(manifestPath, { force: true });
+    },
+  };
+}
+
+/**
+ * The file an operator creates in a WAL root to permit expiry there.
+ *
+ * Raw-WAL expiry deletes evidence that is not all kept anywhere else (ADR-028
+ * Decision 4.2), so it must be **impossible to point at a directory by
+ * default**: a WAL root without this file, holding exactly
+ * {@link EXPIRY_OPT_IN_MARKER_CONTENT}, refuses every deletion, whatever the
+ * caller's configuration says. Creating it is a deliberate operator act on
+ * the one host directory that should expire (`docs/handoffs/STORAGE-1.md`).
+ */
+export const EXPIRY_OPT_IN_MARKER_FILE_NAME = ".polymarket-bot-raw-wal-expiry-opt-in";
+
+/** The exact content of {@link EXPIRY_OPT_IN_MARKER_FILE_NAME}. */
+export const EXPIRY_OPT_IN_MARKER_CONTENT =
+  "polymarket-bot: raw WAL in this directory may expire after a verified extract (ADR-028).\n";
+
+/** Whether `walRootPath` holds a valid expiry opt-in marker. */
+export async function hasExpiryOptInMarker(walRootPath: string): Promise<boolean> {
+  try {
+    const content = await readFile(join(walRootPath, EXPIRY_OPT_IN_MARKER_FILE_NAME), "utf8");
+    return content === EXPIRY_OPT_IN_MARKER_CONTENT;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+/**
+ * Deletion under ADR-028's expired-after-extract basis, against a real disk.
+ *
+ * Three guards, all re-checked on every call:
+ *
+ * 1. **The WAL root opted in.** {@link EXPIRY_OPT_IN_MARKER_FILE_NAME} must
+ *    exist in `walRootPath` with its exact content; otherwise nothing is
+ *    deleted (`RetentionGuardError`).
+ * 2. **The directory is inside that root.** A request cannot reach a path the
+ *    capability was not granted.
+ * 3. **The proof holds for the bytes about to go** ({@link verifyExpiryProof}):
+ *    the research tier and every named pin verified from the store, and the
+ *    file hashing to both digests they pin.
+ * 4. **The caller's final check** (`options.beforeUnlink`) runs after the
+ *    proof and immediately before the unlink, so a condition that can change
+ *    while the proof reads the store (an operator pin) is re-read last.
+ *
+ * Then it removes the segment and its sidecar manifest, in that order (the
+ * reasoning on {@link deleteAfterVerifiedUploadRetention}). A crash between
+ * the two leaves a sidecar with no segment, which the research worker's
+ * inventory reports as an orphan and never plans again.
+ */
+export function expireAfterExtractDeletion(options: {
+  readonly walRootPath: string;
+  readonly objectStore: ObjectStore;
+  readonly fileSystem?: CompactionFileSystem;
+}): ExpiredSegmentDeletion {
+  const fileSystem = options.fileSystem ?? nodeCompactionFileSystem();
+  return {
+    policyName: "expire-after-extract",
+    async deleteExpiredSegment(
+      walDirectoryPath: string,
+      request: ExpiryDeletionRequest,
+      deletionOptions?: ExpiredSegmentDeletionOptions,
+    ): Promise<ExpiryProofOutcome> {
+      // Real paths, so a symbolic link cannot carry a deletion out of the root.
+      const root = await realpath(options.walRootPath).catch(() => resolve(options.walRootPath));
+      if (!(await hasExpiryOptInMarker(root))) {
+        throw new RetentionGuardError(
+          "refusing to expire a WAL segment: the WAL root has not opted in to expiry",
+          { walRootPath: root, marker: EXPIRY_OPT_IN_MARKER_FILE_NAME, segmentId: request.segmentId },
+        );
+      }
+      const directory = await realpath(walDirectoryPath).catch(() => resolve(walDirectoryPath));
+      if (directory !== root && !directory.startsWith(root + sep)) {
+        throw new RetentionGuardError(
+          "refusing to expire a WAL segment: its directory is outside the opted-in WAL root",
+          { walRootPath: root, walDirectoryPath: directory, segmentId: request.segmentId },
+        );
+      }
+      const segmentPath = fileSystem.joinPath(directory, walSegmentFileName(request.segmentId));
+      const manifestPath = fileSystem.joinPath(directory, walManifestFileName(request.segmentId));
+      const outcome = await verifyExpiryProof(
+        { objectStore: options.objectStore, readSegmentFile: () => fileSystem.readWholeFile(segmentPath) },
+        request,
+      );
+      if (deletionOptions?.beforeUnlink !== undefined) {
+        try {
+          await deletionOptions.beforeUnlink();
+        } catch (error) {
+          throw new RetentionGuardError(
+            `refusing to expire a WAL segment: the final check before the unlink failed: ${error instanceof Error ? error.message : String(error)}`,
+            { segmentId: request.segmentId },
+          );
+        }
+      }
+      await rm(segmentPath, { force: true });
+      await rm(manifestPath, { force: true });
+      return outcome;
     },
   };
 }

@@ -1,0 +1,17 @@
+{
+  "pointerVersion": 1,
+  "segmentId": "0190a3e0-0000-7000-8000-000000000001-000000",
+  "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+  "segmentIndex": 0,
+  "segmentSha256": "6b4e0b4e03c233cdf9dadde27b2a2dbc3841c735c462f59f66faa786c714ea5a",
+  "segmentFileSha256": "11c76adccad22fee6ff8b2feca6744b17e7a2d849b3818a2cac69cb91ffe75a4",
+  "byteSize": 2301,
+  "recordCount": 4,
+  "minReceivedAt": "2026-01-01T00:00:00.000Z",
+  "maxReceivedAt": "2026-01-01T00:00:03.000Z",
+  "minIngestSeq": "1",
+  "maxIngestSeq": "4",
+  "datasetId": "research-0190a3e0-0000-7000-8000-000000000001-000000-000001",
+  "manifestObjectKey": "research/0190a3e0-0000-7000-8000-000000000001/research-0190a3e0-0000-7000-8000-000000000001-000000-000001/manifest.json",
+  "manifestSha256": "30095088abac566514dd87c742142bb9924cd4d8afd5dd4a7d584449b7d34eec"
+}

@@ -32,10 +32,16 @@ import { dirname, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { compactWalDirectory, nodeCompactionFileSystem } from "@polymarket-bot/storage-parquet";
+import {
+  compactWalDirectory,
+  nodeCompactionFileSystem,
+  parseAnyDatasetManifest,
+  parseStrictJsonBytes,
+} from "@polymarket-bot/storage-parquet";
 import { memoryObjectStore } from "@polymarket-bot/storage-parquet/testing";
 import type { MemoryObjectStore } from "@polymarket-bot/storage-parquet/testing";
 import type { CompactionClock, IncidentWindow } from "@polymarket-bot/storage-parquet";
+import { extractResearchTier, inventoryWalRoot } from "@polymarket-bot/research-worker";
 
 import { createWorkspace, frame, GATEWAY_EPOCH, recordFrames } from "./context.js";
 import type { TemporaryWorkspace } from "./context.js";
@@ -95,7 +101,20 @@ afterEach(async () => {
   await workspace.cleanup();
 });
 
-async function buildFixture(): Promise<MemoryObjectStore> {
+/**
+ * Which committed fixture to build (`STORAGE-1`):
+ *
+ * - `v1` — the `WP-130` fixture, still written as dataset-manifest version 1
+ *   (ADR-029 Consequences: "Version 1 fixtures and goldens stay version 1 and
+ *   keep passing"). Its bytes are unchanged;
+ * - `v2` — the same frames, compacted as version 2 `exact`, what the compactor
+ *   now writes by default;
+ * - `research` — the same WAL through the research-tier extractor: a version 2
+ *   `approximate` dataset for the Python reader.
+ */
+type FixtureKind = "v1" | "v2" | "research";
+
+async function buildFixture(kind: FixtureKind = "v1"): Promise<MemoryObjectStore> {
   const frames = FIXTURE_FRAMES.map((input, index) =>
     frame({
       ingestSeq: input.ingestSeq,
@@ -109,14 +128,22 @@ async function buildFixture(): Promise<MemoryObjectStore> {
   await recordFrames(workspace.walDirectoryPath, frames, { maxSegmentBytes: 2200 });
 
   const objectStore = memoryObjectStore();
+  if (kind === "research") {
+    const fileSystem = nodeCompactionFileSystem();
+    const inventory = await inventoryWalRoot(fileSystem, workspace.walDirectoryPath);
+    await extractResearchTier({ fileSystem, objectStore, clock: frozenClock(), byEpoch: inventory.byEpoch });
+    return objectStore;
+  }
+  const datasetId = kind === "v1" ? FIXTURE_DATASET_ID : `${FIXTURE_DATASET_ID}-v2`;
   await compactWalDirectory({
     walDirectoryPath: workspace.walDirectoryPath,
-    datasetId: FIXTURE_DATASET_ID,
-    objectKeyPrefix: FIXTURE_PREFIX,
+    datasetId,
+    objectKeyPrefix: `datasets/${datasetId}`,
     objectStore,
     fileSystem: nodeCompactionFileSystem(),
     clock: frozenClock(),
     incidentWindows: [FIXTURE_WINDOW],
+    ...(kind === "v1" ? { datasetManifestVersion: 1 as const } : {}),
   });
   return objectStore;
 }
@@ -136,8 +163,8 @@ describe("the Python validator's committed fixture", () => {
     }
   });
 
-  it("matches the committed files under python/research/compaction/testdata", async () => {
-    const objectStore = await buildFixture();
+  it.each(["v1", "v2", "research"] as const)("matches the committed %s files under python/research/compaction/testdata", async (kind) => {
+    const objectStore = await buildFixture(kind);
     const keys = objectStore.keys();
     expect(keys.length).toBeGreaterThan(2);
 
@@ -184,5 +211,28 @@ describe("the Python validator's committed fixture", () => {
     expect(manifest.recordCounts["replayEligible"]).toBe(FIXTURE_FRAMES.length - 2);
     expect(manifest.excludedIncidentWindows).toHaveLength(1);
     expect(manifest.segments.length).toBeGreaterThan(1);
+  });
+});
+
+describe("the shared malformed manifests (ADR-017 §3; STORAGE-1 round 1, J3)", () => {
+  // The same files `python/research/compaction/tests/test_storage1_versions.py`
+  // refuses: the TypeScript and Python readers must agree on malformed bytes.
+  it.each([
+    "research-duplicate-fidelity.json",
+    "research-invalid-utf8.json",
+    "research-nan-literal.json",
+    "research-lone-surrogate.json",
+    "research-without-market-identities.json",
+  ])("refuses %s", async (name) => {
+    const bytes = await readFile(join(FIXTURE_ROOT, "malformed", name));
+    expect(() => parseAnyDatasetManifest(parseStrictJsonBytes(bytes))).toThrow();
+  });
+
+  it("reads the unchanged research-tier manifest, as the Python reader does", async () => {
+    const objectStore = await buildFixture("research");
+    const key = objectStore.keys().find((candidate) => candidate.endsWith("/manifest.json"));
+    if (key === undefined) throw new Error("no research manifest");
+    const committed = await readFile(join(FIXTURE_ROOT, key));
+    expect(parseAnyDatasetManifest(parseStrictJsonBytes(committed)).fidelity).toBe("approximate");
   });
 });

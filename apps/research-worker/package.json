@@ -3,23 +3,28 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Research worker (WP-130): compacts verified WAL segments into checksummed Parquet objects and immutable dataset manifests. Holds no credential, opens no venue connection, and places no order.",
+  "description": "Research worker (WP-130, STORAGE-1): compacts verified WAL segments into checksummed Parquet and immutable dataset manifests; keeps the approximate research tier and exact pinned windows; and, only when explicitly executed, expires raw WAL after a verified extract (ADR-028, ADR-029). Holds no credential, opens no venue connection, and places no order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/parquet/tsconfig.json",
-    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 \"--banner:js=import { createRequire as __bundleCreateRequire } from 'node:module'; const require = __bundleCreateRequire(import.meta.url);\" --outfile=dist/main.mjs",
     "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
     "test:integration": "vitest run --config ../../test/integration/parquet/vitest.config.ts",
     "fixture:python": "UPDATE_PYTHON_FIXTURE=1 vitest run --config ../../test/integration/parquet/vitest.config.ts"
   },
   "dependencies": {
-    "@polymarket-bot/storage-parquet": "workspace:*"
+    "@polymarket-bot/binance-adapter": "workspace:*",
+    "@polymarket-bot/coinbase-adapter": "workspace:*",
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/polymarket-public": "workspace:*",
+    "@polymarket-bot/storage-parquet": "workspace:*",
+    "@polymarket-bot/storage-postgres": "workspace:*",
+    "@polymarket-bot/storage-wal": "workspace:*"
   },
   "devDependencies": {
-    "@polymarket-bot/storage-wal": "workspace:*",
     "@types/node": "^24.13.3",
     "esbuild": "^0.28.2",
     "typescript": "^5.9.2",

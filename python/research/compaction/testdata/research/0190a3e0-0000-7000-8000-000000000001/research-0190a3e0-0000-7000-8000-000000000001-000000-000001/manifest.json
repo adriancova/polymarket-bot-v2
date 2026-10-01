@@ -1,0 +1,791 @@
+{
+  "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
+  "datasetManifestVersion": 2,
+  "fidelity": "approximate",
+  "datasetId": "research-0190a3e0-0000-7000-8000-000000000001-000000-000001",
+  "createdAt": "2026-01-01T12:00:00.000Z",
+  "admissibility": "approximate: a research-tier dataset, downsampled from raw WAL. It cannot show queue position or moves inside one second (ADR-028 Decision 7). It is never admissible as determinism, calibration, promotion or soak evidence, and any result computed from it ranks below every ADR-012 tier (ADR-029 Decisions 2 and 3).",
+  "schemaVersions": {
+    "walFormatId": "polymarket-bot/wal/v1",
+    "walSchemaVersion": 1,
+    "walManifestVersion": 1,
+    "researchTierLayoutId": "polymarket-bot/research-tier/v1",
+    "researchTierLayoutVersion": 1,
+    "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
+    "datasetManifestVersion": 2
+  },
+  "downsampling": {
+    "downsamplingId": "polymarket-bot/research-downsampling/v1",
+    "downsamplingVersion": 1,
+    "parameters": {
+      "depthLevels": 5,
+      "fullBookSpanMs": 60000,
+      "referenceTradeDedupeWindow": 512,
+      "spanMs": 1000
+    },
+    "tieOrder": "release frame ingestSeq; then span samples by span boundary, at one boundary by kind (pm_top_of_book, pm_depth, pm_full_book, ref_trade_bars) and within a kind by token id or source|instrument; then the release frame's own feed_events, then its trades, lifecycle events and ticks in frame order"
+  },
+  "writer": {
+    "library": "hyparquet-writer",
+    "libraryVersion": "0.16.6",
+    "codec": "SNAPPY",
+    "rowGroupSize": 10000
+  },
+  "tables": [
+    {
+      "table": "pm_top_of_book",
+      "sampleClass": "span",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "spanStartMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "spanEndMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "conditionId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "tokenId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "bestBidPrice",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bestBidSize",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bestAskPrice",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bestAskSize",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "table": "pm_depth",
+      "sampleClass": "span",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "spanStartMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "spanEndMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "conditionId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "tokenId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "bid1Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid1Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid2Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid2Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid3Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid3Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid4Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid4Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid5Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "bid5Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask1Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask1Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask2Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask2Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask3Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask3Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask4Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask4Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask5Price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "ask5Size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "table": "pm_full_book",
+      "sampleClass": "span",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "spanStartMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "spanEndMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "conditionId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "tokenId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "bidLevelCount",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "askLevelCount",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "bidsJson",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "asksJson",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "table": "ref_trade_bars",
+      "sampleClass": "span",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "spanStartMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "spanEndMs",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "source",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "instrument",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "open",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "high",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "low",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "close",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "volume",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "tradeCount",
+          "physicalType": "INT64",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "table": "feed_events",
+      "sampleClass": "on-change",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "source",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "endpoint",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "connectionId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "subscriptionGeneration",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "eventKind",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "detail",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "payloadSha256",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "table": "pm_lifecycle",
+      "sampleClass": "on-change",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "source",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "endpoint",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "eventType",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "entryIndex",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "conditionId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "tokenId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "active",
+          "physicalType": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "closed",
+          "physicalType": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "acceptingOrders",
+          "physicalType": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "archived",
+          "physicalType": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "restricted",
+          "physicalType": "BOOLEAN",
+          "nullable": true
+        },
+        {
+          "name": "detailJson",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "payloadSha256",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "table": "pm_trades",
+      "sampleClass": "on-change",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "conditionId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "tokenId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "entryIndex",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "price",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "size",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "side",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "feeRateBps",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "venueTimestamp",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        },
+        {
+          "name": "transactionHash",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "table": "chainlink_ticks",
+      "sampleClass": "on-change",
+      "columns": [
+        {
+          "name": "sampleOrdinal",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "gatewayEpoch",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseIngestSeq",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "availableAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "releaseSegmentId",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "topic",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "symbol",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "entryIndex",
+          "physicalType": "INT64",
+          "nullable": false
+        },
+        {
+          "name": "value",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": false
+        },
+        {
+          "name": "observedAt",
+          "physicalType": "BYTE_ARRAY_UTF8",
+          "nullable": true
+        }
+      ]
+    }
+  ],
+  "gatewayEpochs": [
+    "0190a3e0-0000-7000-8000-000000000001"
+  ],
+  "releaseRange": {
+    "first": {
+      "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+      "ingestSeq": "1",
+      "availableAt": "2026-01-01T00:00:00.000Z",
+      "sampleOrdinal": 0
+    },
+    "last": {
+      "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+      "ingestSeq": "18446744073709551617",
+      "availableAt": "2026-01-01T00:00:06.000Z",
+      "sampleOrdinal": 7
+    }
+  },
+  "recordCounts": {
+    "segmentDeclared": 7,
+    "framesRead": 7,
+    "framesInterpreted": 0,
+    "framesUninterpreted": 7,
+    "samplesWritten": 8
+  },
+  "samplerState": {
+    "stateIn": null,
+    "stateOut": {
+      "objectKey": "research/0190a3e0-0000-7000-8000-000000000001/research-0190a3e0-0000-7000-8000-000000000001-000000-000001/sampler-state-out.json",
+      "byteLength": 532,
+      "sha256": "8711849bfff5a9fdf55b6a512a3ed5531f2a77914c3f3022bfcd386223608c2b"
+    }
+  },
+  "sourceSegments": [
+    {
+      "segmentId": "0190a3e0-0000-7000-8000-000000000001-000000",
+      "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+      "segmentIndex": 0,
+      "segmentSha256": "6b4e0b4e03c233cdf9dadde27b2a2dbc3841c735c462f59f66faa786c714ea5a",
+      "segmentFileSha256": "11c76adccad22fee6ff8b2feca6744b17e7a2d849b3818a2cac69cb91ffe75a4",
+      "checksummedByteLength": 1917,
+      "byteSize": 2301,
+      "recordCount": 4,
+      "firstIngestSeq": "1",
+      "lastIngestSeq": "4",
+      "minReceivedAt": "2026-01-01T00:00:00.000Z",
+      "maxReceivedAt": "2026-01-01T00:00:03.000Z",
+      "verification": "storage-wal.validateSegment+storage-parquet.readWalSegment over one in-memory read",
+      "marketIdentities": {
+        "polymarketTokenIds": [],
+        "conditionIds": [],
+        "gammaMarketIds": [],
+        "unidentifiedFrames": 4
+      }
+    },
+    {
+      "segmentId": "0190a3e0-0000-7000-8000-000000000001-000001",
+      "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+      "segmentIndex": 1,
+      "segmentSha256": "6fa5051c0d2df842acf1e0dd264a14c7b194ebcf246f6877a4bb9bc32738513a",
+      "segmentFileSha256": "d565cdeb03471e2da780ef5186ce297069e9bf59eddaf65e00c28e176364fc41",
+      "checksummedByteLength": 1539,
+      "byteSize": 1918,
+      "recordCount": 3,
+      "firstIngestSeq": "5",
+      "lastIngestSeq": "18446744073709551617",
+      "minReceivedAt": "2026-01-01T00:00:04.000Z",
+      "maxReceivedAt": "2026-01-01T00:00:06.000Z",
+      "verification": "storage-wal.validateSegment+storage-parquet.readWalSegment over one in-memory read",
+      "marketIdentities": {
+        "polymarketTokenIds": [],
+        "conditionIds": [],
+        "gammaMarketIds": [],
+        "unidentifiedFrames": 3
+      }
+    }
+  ],
+  "objects": [
+    {
+      "objectKey": "research/0190a3e0-0000-7000-8000-000000000001/research-0190a3e0-0000-7000-8000-000000000001-000000-000001/feed_events.parquet",
+      "table": "feed_events",
+      "byteLength": 3112,
+      "sha256": "cd393bb265e688bcd29c488bd9d2949dbb3986c5962890c54b99e214dce14012",
+      "rowCount": 8,
+      "firstSampleOrdinal": 0,
+      "lastSampleOrdinal": 7
+    }
+  ]
+}
