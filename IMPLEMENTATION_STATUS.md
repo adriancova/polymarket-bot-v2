@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260` is Complete. `THROUGHPUT-1c` is running. Wave 3 continues with `WP-270` and `WP-300`; `CO2-N1` must be fixed before `WP-270`. Then the `LEAN-1` track: `LEAN-GOV` (the ADRs), `STORAGE-1`, `HOST-BENCH`, then the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Next:** `WP-260` and `WP-300` are Complete. `THROUGHPUT-1c` and `STORAGE-1` are running; `CI-4` follows when a slot frees. Wave 3 continues with `WP-270`; `CO2-N1` must be fixed before it. Then `HOST-BENCH` and the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -40,9 +40,10 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
-- **`WP-300`**: Ready (authorized) 2026-09-30 under the Wave 3 authorization. Collateral inventory, reservations and a wallet-operation state machine, PAPER only (modelled; no signing, no transaction, no bridge or withdrawal). It reached its 6-round cap with astra alone (a new HIGH each round, in the wallet-operation state machine), so from 2026-10-01 it continues under dual verification (Opus and gpt-6-astra, reconciled): a stricter choice than the dual-scope rule requires.
+- `WP-300` is Complete (2026-10-01); see [Work packages](#work-packages).
+- **`CI-4`**: Ready (authorized) 2026-10-01 by the orchestrator, as for `CI-3`. It runs WP-300's wallet-operations contract suite in the root `test:contract` chain and in CI (`WP300-R1-07`). It may edit the protected root `package.json`, but only the `test:contract` value. It may also edit the contract steps in `.github/workflows/ci.yml` and the drift pin `test/unit/tooling/ci-step-split.test.ts`. Verifier: astra.
 - **`STORAGE-1`**: Ready (authorized) 2026-09-30 (ADR-028 retention with pins, ADR-029 the approximate dataset class). Its dependency on `THROUGHPUT-1c` is lifted (disjoint test paths, recorded above); it starts now, under dual verification (it deletes raw evidence). **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
-- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. In its final review round (tip `26d1e91`); verifiers Opus and gpt-6-astra. It merges only after the user ratifies ADR-023.
+- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. In review rounds 9-12 (tip `298199d`); verifiers Opus and gpt-6-astra. It merges only after the user ratifies ADR-023.
   - **Interim rulings (orchestrator, 2026-10-01), each the most conservative option, pending the user's ADR-023 ratification:**
     - **ADR-023 D7: option (a)**, the process-lag guard, as implemented. Not (b), narrowing criterion B, and not (c), deferring the opt-in.
     - **The Clock-port reading:** the guard's use of the `Clock` port is NOT a clock-semantics change. Every age stays in event time; the process clock can only remove the extension ADR-023 adds, never make a book fresher (ADR-023 D7). `CO2-N1` is unchanged.
@@ -148,7 +149,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `OUTAGE-2` | make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt | Complete (2026-09-29) | `a618752` | [OUTAGE-2](docs/handoffs/OUTAGE-2.md) |
 | `THROUGHPUT-1a` | the trader keeps pace with a live 15-minute market; its stream lag is visible | Complete (2026-09-30) | `229d58a` | [THROUGHPUT-1a](docs/handoffs/THROUGHPUT-1a.md) |
 | `THROUGHPUT-1b` | the gateway publishes a window-open burst without overflowing; the example config subscribes to books | Complete (2026-09-30) | `c179095` | [THROUGHPUT-1b](docs/handoffs/THROUGHPUT-1b.md) |
-| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | Authorized; runs after the Wave 2 closeout | — | — |
+| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | **In review** (authorized 2026-09-29); merges after the user ratifies ADR-023 | — | — |
 | `DEPS-1` | CI health: new high advisories in dev/test-only transitive dependencies | Complete (2026-09-30) | `f6a2714` | the archived row |
 | `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Complete (2026-09-30) | `7d59fd3` | [THROUGHPUT-2](docs/handoffs/THROUGHPUT-2.md) |
 | `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
@@ -159,11 +160,12 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-260` | Secure unified-SDK adapter and signer boundary | Complete (2026-09-30) | `32d10be` | [WP-260](docs/handoffs/WP-260.md) |
 | `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
 | `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
-| `WP-300` | Collateral inventory and wallet operations | **Ready (authorized)** 2026-09-30 (Wave 3) | — | — |
+| `WP-300` | Collateral inventory and wallet operations | Complete (2026-10-01) | `9cdbf32` | [WP-300](docs/handoffs/WP-300.md) |
+| `CI-4` | run WP-300's wallet-operations contract suite in CI (`WP300-R1-07`) | **Ready (authorized)** 2026-10-01 | — | — |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | Complete (2026-09-30) | `78ba39b` | [LEAN-GOV](docs/handoffs/LEAN-GOV.md) |
 | `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
-| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | **Ready (authorized)** 2026-09-30 | — | — |
+| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | **In review** (authorized 2026-09-30) | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
@@ -194,6 +196,8 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | --- | --- | --- |
 | `DURABLE1-LOWS` | LOW-3: in group mode a decision and its checkpoint can commit in separate transactions (no production `restoreFrom` caller yet). LOW-6: the commit cost on placement-heavy bursts is unmeasured. R2-LOW-7: a CANCEL from a later decision can wait on an earlier decision's placement write. | the first production `restoreFrom` round; a throughput round |
 | `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 once (PR #29 attempt 1). TP1B-R1-L5 flagged it. | a data-gateway test round |
+| `WP300-R10-01` | A terminal reconciliation answer bound to a request never issued for the operation, arriving while the executor call is pending, is buffered and applied after SUBMITTED. The package header says it is refused. LOW: the observe() control behaves the same way. | an inventory round, or the first `WP-290` grant |
+| `WP300-PERSIST` | WP-300's identity sets, kept observations, quarantines and request map are in memory only; no journal rebuild exists. Needed before restart-safe composition. | `WP-290` or the composition round |
 | `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | an ADR and a trading-core round, before any settlement veto is lifted and before `WP-270` |
 | `CO2-N3` | The per-code risk-veto panel cannot show a code's first veto: its series is born at 1, and `increase()` reads 0. The refused-exit and recommendation families have the same problem. | a control-api / dashboard round |
 | `CO2-N4` | Live and replay are not decision-equivalent on real data: frame grouping is live-only, and the backtest CLI refuses raw normalizers (TP2-R1-L4, TP2-R2-L2). | a backtest-cli round |
