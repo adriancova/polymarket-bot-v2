@@ -6,7 +6,10 @@
  * imports, no aliases. OFFLINE: the suite reads sanitized fixtures from
  * `test/fixtures/venue/`; nothing is signed or sent. The network tripwire is
  * a setup file (WP300B-R1-04): it is installed before each test module loads,
- * so module-level code is covered too (`network-tripwire.setup.ts`).
+ * so module-level code is covered too (`network-tripwire.setup.ts`). Its
+ * self-test, `network-tripwire.test.ts`, runs this config with `include`
+ * narrowed to planted files (`network-tripwire.plants.config.ts`), so keep
+ * this config importable as it is.
  *
  * Run it with:
  *   pnpm --filter @polymarket-bot/inventory test:contract

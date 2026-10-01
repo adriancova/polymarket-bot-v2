@@ -8,8 +8,9 @@
  * WP300B-R1-04) replaces `fetch` BEFORE this module loads, throws if it is
  * called, and fails each test, and the file, unless it was called 0 times
  * since module load. The first test below pins that the `fetch` this module
- * saw at load is that tripwire. CI-4's "no network" step name rests on both
- * files of the suite (WP-300b, WP-300c).
+ * saw at load is that tripwire. CI-4's "no network" step name rests on the
+ * suite's test files and on `network-tripwire.test.ts`, which proves that a
+ * swallowed call fails a file (WP-300b, WP-300c).
  */
 
 import { readFileSync } from "node:fs";

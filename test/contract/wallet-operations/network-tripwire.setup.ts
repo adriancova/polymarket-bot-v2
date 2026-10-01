@@ -15,7 +15,14 @@
  * tripwire (its mark), so the suite fails if this file stops being loaded
  * first.
  *
- * It guards `fetch` only; neither test file imports another transport.
+ * Both 0-call assertions are load-bearing: `network-tripwire.test.ts` runs
+ * this suite's config over planted test files (`tripwire-plants/`) in a child
+ * process, and fails unless each swallowed call fails its plant, with the
+ * labels below (WP-300c, mutant C-24). Keep the labels and the error message
+ * in step with that file.
+ *
+ * It guards `fetch` only. No test file or plant uses another network
+ * transport; the self-test spawns a local vitest process, which is not one.
  */
 
 import { afterAll, afterEach, expect } from "vitest";
