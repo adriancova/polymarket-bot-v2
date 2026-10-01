@@ -47,6 +47,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `STORAGE-1b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`WP-300b`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `WP300-R10-01` and adds the fetch tripwire to `venue-citations.test.ts` (`CI-4` follow-up). Paths: `packages/inventory/**` (not its `package.json`), `test/unit/inventory/**`, `test/contract/wallet-operations/**`. Verifiers: Opus and gpt-6-astra, reconciled (collateral reservations).
 - **`CONTROL-1`**: Ready (authorized) 2026-10-01 by the orchestrator, under the Wave 3 authorization. It closes `CO2-N8`: `WP-240`'s M-1 (pausing an unknown instance) and M-3 (audit-log exhaustion can disable the kill switch), plus `WP-240`'s owned LOWs L-1..L-6, L-8, L-9 and N-4. Paths: `apps/control-api/**`, `test/integration/control-api/**`, `test/unit/control-api/**`. Verifiers: Opus and gpt-6-astra, reconciled (the kill switch). `CADENCE-1` also owns `apps/control-api/src/**`, so it starts only after `CONTROL-1` merges.
+- **`STORAGE-GOV2`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: dated corrections to ADR-028 Amendment 1 (rule 3, after `STORAGE-1b`; rule 1 item 6, `S-GOV-R3-01`) and ADR-029's stale "not yet implemented" header and README row. Verifiers: Opus and gpt-6-astra, reconciled.
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`; its merge-ref CI is green (run `36874368278`). It merges only after the user ratifies ADR-023. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
   - **Interim rulings (orchestrator, 2026-10-01), each the most conservative option, pending the user's ADR-023 ratification:**
@@ -175,6 +176,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Complete (2026-10-01) | `7b6499e` | [STORAGE-1b](docs/handoffs/STORAGE-1b.md) |
 | `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | **Ready (authorized)** 2026-10-01 | — | — |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | **Ready (authorized)** 2026-10-01 | — | — |
+| `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | **Ready (authorized)** 2026-10-01 | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
