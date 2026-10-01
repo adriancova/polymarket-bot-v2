@@ -40,9 +40,14 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
-- **`WP-300`**: Ready (authorized) 2026-09-30 under the Wave 3 authorization. Collateral inventory, reservations and a wallet-operation state machine, PAPER only (modelled; no signing, no transaction, no bridge or withdrawal). Verifier: gpt-6-astra. Loop `wf_7bc7e519-3c5`.
-- **`STORAGE-1`**: Ready (authorized) 2026-09-30 (ADR-028 retention with pins, ADR-029 the approximate dataset class). **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
-- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29; startable now, because the Wave 2 closeout is done. It runs alongside Wave 3.
+- **`WP-300`**: Ready (authorized) 2026-09-30 under the Wave 3 authorization. Collateral inventory, reservations and a wallet-operation state machine, PAPER only (modelled; no signing, no transaction, no bridge or withdrawal). It reached its 6-round cap with astra alone (a new HIGH each round, in the wallet-operation state machine), so from 2026-10-01 it continues under dual verification (Opus and gpt-6-astra, reconciled): a stricter choice than the dual-scope rule requires.
+- **`STORAGE-1`**: Ready (authorized) 2026-09-30 (ADR-028 retention with pins, ADR-029 the approximate dataset class). Its dependency on `THROUGHPUT-1c` is lifted (disjoint test paths, recorded above); it starts now, under dual verification (it deletes raw evidence). **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
+- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. In its final review round (tip `26d1e91`); verifiers Opus and gpt-6-astra. It merges only after the user ratifies ADR-023.
+  - **Interim rulings (orchestrator, 2026-10-01), each the most conservative option, pending the user's ADR-023 ratification:**
+    - **ADR-023 D7: option (a)**, the process-lag guard, as implemented. Not (b), narrowing criterion B, and not (c), deferring the opt-in.
+    - **The Clock-port reading:** the guard's use of the `Clock` port is NOT a clock-semantics change. Every age stays in event time; the process clock can only remove the extension ADR-023 adds, never make a book fresher (ADR-023 D7). `CO2-N1` is unchanged.
+    - **The epoch taint (O-I1(ii)): kept coarse and fail-closed.** Any market-less incident taints the gateway epoch, with no source filter. Narrowing it, for example ignoring reference-venue incidents, would LOOSEN a fail-closed rule, so it is left to the user. Consequence: with a Binance feed the rule changes nothing until narrowed (ADR-023 §5).
+  - **Test-path ownership (2026-10-01):** `THROUGHPUT-1c`'s test grant is narrowed to the paths it has touched: `test/integration/paper-trader/**` and `test/unit/strategies/**` (plus tests inside its packages). This lifts `STORAGE-1`'s dependency on it, per the work plan's own clause; their test paths are disjoint.
   - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
   - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
   - Scope (2): end to end: a gateway liveness signal if one is needed, then features, strategy and risk freshness, with the strategy's parameter and version discipline.
@@ -349,6 +354,7 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
+- **ADR-023 ratification** (`THROUGHPUT-1c`): the user ratifies it, and either confirms or replaces the three interim rulings under [Authorized now](#authorized-now). The open choice: whether to narrow the epoch taint so the rule takes effect in a deployment with a Binance feed.
 - **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
 
 ### Wave 3 authorization (conditional)

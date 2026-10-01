@@ -1355,7 +1355,10 @@ work_packages:
     phase: phase-3
     title: Research tier, pinned windows, verified raw expiry, and disk metrics
     goal: Keep a downsampled research tier and exact pinned windows, and delete raw WAL after 72 h only once both are verified (ADR-028, ADR-029).
-    depends_on: [LEAN-GOV, WP-130, THROUGHPUT-1c]
+    # 2026-10-01 governance: THROUGHPUT-1c dependency lifted. Disjoint test-path
+    # ownership is recorded in IMPLEMENTATION_STATUS.md (THROUGHPUT-1c's test grant
+    # narrowed to test/integration/paper-trader/** and test/unit/strategies/**).
+    depends_on: [LEAN-GOV, WP-130]
     allowed_paths:
       # The window classifier reads decision, order, fill and halt rows through
       # a read-only adapter inside apps/research-worker; packages/storage-postgres
