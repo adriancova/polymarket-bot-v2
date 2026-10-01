@@ -90,6 +90,22 @@ export const CONTROL_KILL_SWITCH_ACTIONS = [
 export type ControlKillSwitchAction = (typeof CONTROL_KILL_SWITCH_ACTIONS)[number];
 
 /**
+ * The one §14.1 action this package ORDERS above the others (`CONTROL-1` r1,
+ * closing `CONTROL1-J-M1`).
+ *
+ * §14.1 lists five actions and orders none of them. `FULL_HALT` is the only
+ * one whose name claims to subsume the rest, so it is the only strengthening
+ * this package recognizes: an engage over an engaged switch STRENGTHENS it
+ * exactly when it changes the action to `FULL_HALT`. Every other pair of
+ * distinct actions is treated as UNORDERED — neither provably stronger nor
+ * provably weaker. `control-plane.ts` refuses an engage that would move a
+ * switch away from `FULL_HALT` (that is a release, and a release needs
+ * evidence); `audit-budget.ts` lets only a new switch or an escalation to
+ * `FULL_HALT` use the kill-switch reserve.
+ */
+export const STRONGEST_KILL_SWITCH_ACTION = "FULL_HALT" as const satisfies ControlKillSwitchAction;
+
+/**
  * A control-API caller is a human operator.
  *
  * §10.6's `actor_kind` also admits `AUTOMATED`, and this API does not offer it:

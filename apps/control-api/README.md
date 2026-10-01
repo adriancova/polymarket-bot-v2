@@ -53,8 +53,14 @@ composition seam for the future wiring that knows the trader's instance set.
   character.
 - **A request body must be declared** `Content-Type: application/json`
   (optionally `charset=utf-8`), or it is refused `415
-  CONTROL_UNSUPPORTED_MEDIA_TYPE` before it is parsed. A body-less request needs
-  no content type.
+  CONTROL_UNSUPPORTED_MEDIA_TYPE` and never acted on. A body-less request needs
+  no content type. Like the `413` (too large) and the `400` (not JSON), the
+  `415` is DECIDED by the transport but ANSWERED by the API, after
+  authentication and the route's authorization (`CONTROL-1` r1): an anonymous
+  caller gets `401` whatever its body, and an authorized operator's refusal on
+  a mutating route is audited (see "2. Every mutation is audited"). An
+  undeclared body that parses as JSON is still read for one purpose — the
+  by-name refusal of a forbidden key below.
 - **The server's timeouts are explicit** (`CONTROL_HTTP_TIMEOUTS` in
   `http.ts`): 10 s for the headers, 30 s for the whole request, 5 s keep-alive,
   checked every second. Node's defaults are not relied on.
@@ -73,7 +79,8 @@ Two halves, and the first is the strong one:
   `allowRealOrders`, either live-micro cap, `signer`, or any other key in
   `FORBIDDEN_CONTROL_KEYS` (at any depth) is refused `403
   CONTROL_MODE_RAISE_REFUSED` with a message that says why, and an increment of
-  `control_mode_raise_attempts_refused_total`, for EVERY authenticated caller.
+  `control_mode_raise_attempts_refused_total`, for EVERY authenticated caller —
+  whatever content type the body declared, as long as it parses as JSON.
   When the caller holds a mutation grant (`STRATEGY_CONTROL` or `KILL_SWITCH`),
   the attempt is also an audit record (`MODE_RAISE_ATTEMPT` / `REFUSED`). When
   it holds none, it is counted and not audited; the refusal says so (see
@@ -102,21 +109,48 @@ unreachable durable sink each stop the mutation (`503 CONTROL_NOT_AUDITABLE`).
 would lose are the ones from the incident that filled it.
 
 REFUSALS are audited too, for a caller with mutation authority: a refused
-mutation is an operator fact. Three documented exceptions write nothing:
+mutation is an operator fact. **Every refusal of a request an authenticated
+operator was authorized to send to a mutating route is audited**, wherever it
+happens (`CONTROL-1` r1, closing `CONTROL1-J-M2`):
 
-1. a request that never authenticated (counted on
+- at the transport: `413` too large, `415` undeclared, `400` not JSON;
+- at the route parameter: `400 CONTROL_INVALID_ROUTE_PARAMETER`, recorded with
+  NO `scopeRef` (an id that failed its door is never written as one);
+- at the body door: `400 CONTROL_REQUEST_INVALID` / `CONTROL_REQUEST_NOT_DATA`
+  — including a release with `authoritativeSnapshotApplied: false` or without
+  it, whose record's `refusalIssues` name the field;
+- at the control plane: `409` and `503`.
+
+Each is one `REFUSED` record for the route's action, in the audit budget's
+ORDINARY tier, carrying the refusal code, its detail and at most eight issues
+of at most 256 characters, and nothing the caller spelled beyond them.
+
+What writes NOTHING, exhaustively:
+
+1. a request that never authenticated (`401`; counted on
    `control_authentication_failures_total`);
-2. an authenticated request whose grants do not cover the route (counted on
-   `control_authorization_failures_total`);
-3. a mode-raise attempt from a caller that holds **no mutation grant** (counted
-   on `control_mode_raise_attempts_refused_total`).
+2. a request the router does not serve (`404`, `405`): authorization is per
+   route, and there is no route;
+3. an authenticated request whose grants do not cover the route (`403
+   CONTROL_UNAUTHORIZED`; counted on `control_authorization_failures_total`);
+4. a mode-raise attempt from a caller that holds **no mutation grant** (counted
+   on `control_mode_raise_attempts_refused_total`);
+5. a transport refusal (`413`/`415`/`400`) on a READ route: a read is never
+   audited, accepted or refused;
+6. a request the HTTP server refuses before any handler runs: Node's own `408`
+   (the timeouts above) or `400` for a malformed HTTP message, and a client
+   that disconnects before its body arrives.
 
-None of the three attempted a mutation at the plane. A caller who could append
-the audit log's records without mutation authority could fill it, and a full
-log refuses every mutation, the kill switch included (`WP-240` r1 M-3).
+A mutation-grant holder's mode-raise attempt is the one thing audited before
+routing: it is recorded whatever route it named, so items 2 and 5 never apply
+to it. None of the six attempted a mutation an authorized operator could make. A caller
+who could append the audit log's records without mutation authority could fill
+it, and a full log refuses every mutation, the kill switch included (`WP-240`
+r1 M-3).
 
 A refusal whose record the audit budget refuses is still a refusal: nothing
-changed, and it is counted `control_mutations_total{outcome="NOT_AUDITED"}`.
+changed, the caller gets the same answer, and it is counted
+`control_mutations_total{outcome="NOT_AUDITED"}`.
 
 ## The audit budget (`CONTROL-1`, closing `WP-240` r1 M-3)
 
@@ -147,34 +181,67 @@ refused. The design has two layers.
 
    | Record | May fill the log up to |
    | --- | --- |
-   | `KILL_SWITCH_ENGAGE` / `APPLIED` | `C` |
-   | `STRATEGY_PAUSE` / `APPLIED` | `C − R` |
-   | every other record: each refusal, resume and release | `C − 2R` |
+   | `KILL_SWITCH_ENGAGE` / `APPLIED` that engages a switch where none was, or escalates one to `FULL_HALT` | `C` |
+   | `STRATEGY_PAUSE` / `APPLIED` that moves an instance from `RUNNING` to `PAUSED` | `C − R` |
+   | every other record: each refusal, resume and release, and an engage that changes a switch between two actions §14.1 does not order | `C − 2R` |
 
-   The tier is read from the record the control plane builds, never from a
-   request. Consequences:
-   - Nothing but an applied kill-switch engage can use the last `R` records.
-     So even an operator holding `STRATEGY_CONTROL` (a mutation grant, but not
-     the kill switch's) cannot disable the kill switch by filling the log.
+   The tier is read from the record the control plane builds — its action, its
+   outcome and its prior and resulting states — never from a request. A
+   protected tier is EARNED by the state change the record shows. Consequences:
+   - Nothing but a STRENGTHENING engage can use the last `R` records. So even
+     an operator holding `STRATEGY_CONTROL` (a mutation grant, but not the kill
+     switch's) cannot disable the kill switch by filling the log — and a
+     `KILL_SWITCH` holder cannot spend the reserve on no-ops either.
+   - **An engage never repeats and never weakens** (`CONTROL-1` r1, closing
+     `CONTROL1-J-M1`). An engage of the action already engaged at that scope is
+     refused `409 CONTROL_ALREADY_IN_STATE`; one that would move a switch away
+     from `FULL_HALT` is refused `409 CONTROL_ENGAGE_WOULD_WEAKEN` — relaxing a
+     full halt is a release, and a release needs evidence. Both refusals are
+     ordinary records. §14.1 orders none of its five actions; this package
+     orders only `FULL_HALT` above the rest (`vocabulary.ts`,
+     `STRONGEST_KILL_SWITCH_ACTION`), so a change between two of the other
+     four is applied as it was at `WP-240`, but in the ordinary tier. Once the
+     ordinary tier is full, one scope can therefore take at most TWO reserved
+     records — an engage and an escalation — until a release, and a release is
+     ordinary.
    - Once the ordinary tier is full, a pause can take at most one reserved
-     record per registered instance, and each one is a real halt.
-   - **A full ordinary tier fails in the SAFE direction.** Resumes and releases
-     are ordinary, so the platform can still be halted and cannot be un-halted
-     until the log is rotated.
+     record per registered instance, and each one is a real halt. That holds
+     under concurrency: the control plane SERIALIZES the mutations of each
+     instance and each switch (`CONTROL-1` r1, closing `CONTROL1-J-L2`), so two
+     pauses sent at once are one `APPLIED` pause and one
+     `CONTROL_ALREADY_IN_STATE`, whatever the audit sink's latency. Different
+     instances and switches still proceed concurrently, so a slow append for
+     one instance never queues a kill-switch engage behind it.
+   - **A full ordinary tier fails in the SAFE direction.** Resumes, releases
+     and unordered action changes are ordinary, and relaxing a `FULL_HALT` by
+     engage is refused whatever the tier. So the platform can still be halted,
+     a switch can still be escalated to `FULL_HALT`, and nothing can be
+     released or relaxed until the log is rotated.
 
 The pins:
 
 - `test/integration/control-api/m3-audit-exhaustion.test.ts` is the
   reproduction, and it fails at base.
 - `audit-budget-adversarial.test.ts` runs a seeded randomized adversary over
-  every actor class, with acceptance 2 checked after every request.
+  every actor class, with acceptance 2 checked after every request — and,
+  since `CONTROL-1` r1, a `KILL_SWITCH` holder's random engages and releases,
+  with an independent check that only a strengthening sits in the reserved
+  band.
+- `engage-reserve.test.ts` and `shipped-root-engage-reserve.test.ts` are the
+  verifiers' three `CONTROL1-J-M1` sequences, over HTTP and through the shipped
+  `main.ts`; each fails at the round-0 commit.
+- `authorized-refusals-audited.test.ts` is `CONTROL1-J-M2`: every refusal of
+  an authorized request is audited, and nothing else is.
 - `shipped-root-control-1.test.ts` drives the shipped `main.ts`.
-- `src/audit-budget.test.ts` pins the tiers.
+- `src/audit-budget.test.ts` pins the tiers; `src/control-plane.test.ts` pins
+  the engage rules and the per-key serialization.
 
 **What the budget does not do.** It bounds records, not bytes: a mutation-
 authorized caller's mode-raise record carries its request path and the
 forbidden keys it named, and both are bounded only by the transport
-(`maxRequestBodyBytes`, Node's header limit). It does not make the in-memory
+(`maxRequestBodyBytes`, Node's header limit). (The refusal records `CONTROL-1`
+r1 added are bounded: the route's template, a refusal code and detail, and at
+most eight issues of at most 256 characters.) It does not make the in-memory
 log durable. Neither has changed in this round; both are follow-ups in the
 `CONTROL-1` handoff.
 
@@ -189,6 +256,11 @@ references or configures a signer, a wallet, a private key or the secure venue
 adapter. `test/integration/control-api/acceptance-3-no-signer.test.ts` asserts
 that by scanning the shipped source of both trees, and additionally asserts that
 `packages/polymarket-secure` is absent from this package's dependency manifest.
+Its import scan also covers this package's test suites and `infra/grafana/**`
+(`CONTROL-1`, N-4), and since `CONTROL-1` r1 it extracts the specifier from
+every spelling an import can take — any quote character, with or without
+whitespace or a comment around the keyword — with planted controls for each
+spelling and each scanned tree.
 
 ## Authentication (§15) — the INTERPRETATION
 

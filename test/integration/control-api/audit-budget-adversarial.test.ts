@@ -28,6 +28,14 @@
  *    state changed only if exactly one `APPLIED` record was appended for it,
  *    a `200` mutation's `auditRecordId` is that record, and no actor without
  *    mutation authority ever appended anything.
+ * 4. **A `KILL_SWITCH` holder's own engages cannot spend the reserve on a
+ *    repeat or a weakening** (`CONTROL-1` r1, closing `CONTROL1-J-M1`). The
+ *    switcher engages random actions at two scopes, releases them, and the
+ *    other actors fill the ordinary tier. After every request an INDEPENDENT
+ *    oracle checks that only a strengthening (a new switch, an escalation to
+ *    `FULL_HALT`, a `RUNNING → PAUSED` pause) sits in the reserved band, and
+ *    that no `FULL_HALT` was relaxed except by a release; at the end a new
+ *    switch still engages.
  *
  * Driven through the handler seam for volume (thousands of requests), and one
  * seed again over REAL HTTP so the transport is shown to change no answer.
@@ -327,6 +335,114 @@ describe("the budget: even actors WITH mutation grants cannot use the kill-switc
     expect(harness.auditBudget.admitted).toBe(6);
     await engageAsAuthorizedOperator(harness, "worst case");
     expect(harness.auditBudget.admitted).toBe(7);
+  });
+});
+
+/**
+ * `CONTROL-1` r1, closing `CONTROL1-J-M1` — an INDEPENDENT oracle for what may
+ * occupy the reserved band: an applied engage that engaged a switch where
+ * none was or escalated one to `FULL_HALT`, or an applied pause of a `RUNNING`
+ * instance. Written from the documents, not by calling `auditBudgetTier`, so a
+ * tier function that admitted a repeat or a weakening would be caught here.
+ */
+function earnsTheReserve(record: { action: string; outcome: string; priorState: unknown; resultingState: unknown }): boolean {
+  if (record.outcome !== "APPLIED") return false;
+  const prior = record.priorState as Record<string, unknown>;
+  const resulting = record.resultingState as Record<string, unknown>;
+  if (record.action === "KILL_SWITCH_ENGAGE") {
+    if (prior["engaged"] === "false") return true;
+    return prior["action"] !== "FULL_HALT" && resulting["action"] === "FULL_HALT";
+  }
+  if (record.action === "STRATEGY_PAUSE") return prior["state"] === "RUNNING" && resulting["state"] === "PAUSED";
+  return false;
+}
+
+const SWITCH_ACTIONS = ["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY", "FULL_HALT"] as const;
+const SWITCH_SCOPES: readonly (readonly [string, string | null])[] = [
+  ["GLOBAL", null],
+  ["MARKET", "market-1"],
+];
+
+describe("CONTROL1-J-M1: a KILL_SWITCH holder's own engages and releases cannot spend the reserve on a repeat or a weakening", () => {
+  it.each(SEEDS)("seed %i: 400 random engages, releases and refusals; the band holds only strengthenings; a new halt still engages", async (seed) => {
+    const random = prng(seed ^ 0x3c3c3c3c);
+    // Capacity 20, reserve 6: ordinary ≤ 8. Once it is full, two scopes can
+    // take at most 2 + 2 strengthening engages and three registered instances
+    // at most 3 pauses — 15 < 20, so a NEW switch must still fit at the end.
+    const harness = createHarness({ auditCapacity: 20, auditSafetyReserve: 6, operators: OPERATORS });
+    for (const id of REGISTERED) harness.controlPlane.register(id, "2026-10-01T00:00:00.000Z");
+    const switcher = WITH_AUTHORITY[1] as Adversary;
+    let refusedNonStrengthening = 0;
+
+    for (let step = 0; step < 400; step += 1) {
+      const label = `seed ${String(seed)} step ${String(step)}`;
+      const roll = random();
+      const [scope, scopeRef] = pick(random, SWITCH_SCOPES);
+      let request: ApiRequest;
+      let adversary: Adversary;
+      if (roll < 0.5) {
+        adversary = switcher;
+        request = {
+          method: "POST",
+          path: "/v1/kill-switch",
+          authorization: bearer(KILL_SWITCH_TOKEN),
+          body: { scope, scopeRef, action: pick(random, SWITCH_ACTIONS), reason: "adversarial engage" },
+        };
+      } else if (roll < 0.62) {
+        adversary = switcher;
+        request = {
+          method: "POST",
+          path: "/v1/kill-switch/release",
+          authorization: bearer(KILL_SWITCH_TOKEN),
+          body: { scope, scopeRef, authoritativeSnapshotApplied: true, reason: "adversarial release" },
+        };
+      } else {
+        ({ request, adversary } = randomRequest(random, [...NO_AUTHORITY, ...WITH_AUTHORITY]));
+      }
+
+      const before = new Map(harness.controlPlane.killSwitches().map((entry) => [`${entry.scope}:${entry.scopeRef ?? ""}`, entry.action]));
+      const response = await sendChecked(harness, request, adversary, label);
+      const after = new Map(harness.controlPlane.killSwitches().map((entry) => [`${entry.scope}:${entry.scopeRef ?? ""}`, entry.action]));
+      const code = response.status === 200 ? "" : String((JSON.parse(response.body) as Record<string, unknown>)["code"]);
+      if (code === "CONTROL_ALREADY_IN_STATE" || code === "CONTROL_ENGAGE_WOULD_WEAKEN") refusedNonStrengthening += 1;
+
+      // A FULL_HALT is never RELAXED by an engage: it stays, or a 200 release removed it.
+      for (const [key, action] of before) {
+        if (action !== "FULL_HALT") continue;
+        const now = after.get(key);
+        if (now === undefined) {
+          expect(request.path, `${label}: ${key} left FULL_HALT other than by a release`).toBe("/v1/kill-switch/release");
+          expect(response.status, label).toBe(200);
+        } else {
+          expect(now, `${label}: ${key} was relaxed from FULL_HALT by an engage`).toBe("FULL_HALT");
+        }
+      }
+      // Nothing but a strengthening sits in the reserved band (the oracle above).
+      const band = harness.audit.records().slice(harness.auditBudget.limitFor("ORDINARY"));
+      for (const record of band) {
+        expect(earnsTheReserve(record), `${label}: ${record.action}|${record.outcome} is in the reserved band`).toBe(true);
+      }
+    }
+
+    // NOT VACUOUS: the ordinary tier was exhausted, and the switcher really did
+    // send repeats and weakenings that were refused.
+    expect(harness.auditBudget.admitted, `seed ${String(seed)}`).toBeGreaterThanOrEqual(harness.auditBudget.limitFor("ORDINARY"));
+    expect(refusedNonStrengthening, `seed ${String(seed)}`).toBeGreaterThan(20);
+
+    // A NEW switch still engages and is audited.
+    const fresh = await sendChecked(
+      harness,
+      {
+        method: "POST",
+        path: "/v1/kill-switch",
+        authorization: bearer(FAKE_OPERATOR_TOKEN),
+        body: { scope: "MARKET", scopeRef: "market-final", action: "FULL_HALT", reason: "incident: a new halt" },
+      },
+      { name: "operator-a", mutationAuthority: true, header: () => bearer(FAKE_OPERATOR_TOKEN) },
+      `seed ${String(seed)} final engage`,
+    );
+    expect(fresh.status, `seed ${String(seed)}: the new halt was not executed`).toBe(200);
+    expect(harness.audit.records().at(-1)).toMatchObject({ action: "KILL_SWITCH_ENGAGE", outcome: "APPLIED", scopeRef: "market-final" });
   });
 });
 

@@ -192,7 +192,11 @@ describe("transport-level hostility", () => {
     });
     expect(response.status).toBe(413);
     expect((response.json() as Record<string, unknown>)["code"]).toBe("CONTROL_BODY_TOO_LARGE");
-    expect(api.audit.records()).toEqual([]);
+    // Nothing changed. Since `CONTROL-1` r1 (CONTROL1-J-M2) the AUTHORIZED
+    // operator's refusal is audited — one REFUSED record, none of the body in it.
+    expect(api.controlPlane.strategies()[0]?.state).toBe("RUNNING");
+    expect(api.audit.records().map((record) => `${record.action}|${record.outcome}`)).toEqual(["STRATEGY_PAUSE|REFUSED"]);
+    expect(JSON.stringify(api.audit.records())).not.toContain("xxxx");
   });
 
   it("REFUSES a non-JSON body at 400", async () => {

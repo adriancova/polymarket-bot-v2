@@ -3,7 +3,9 @@
  *
  * Asserted by ABSENCE, over the shipped source of both trees `WP-240` owns,
  * plus the manifests — and, for imports, over the control API's own test
- * suites and `infra/grafana/**` too (`CONTROL-1`, closing `WP-240` r1 N-4). This is the `apps/trader` precedent
+ * suites and `infra/grafana/**` too (`CONTROL-1`, closing `WP-240` r1 N-4),
+ * in every spelling an import can take (`CONTROL-1` r1, closing
+ * `CONTROL1-J-L1`). This is the `apps/trader` precedent
  * (`test/integration/paper-trader/compose-and-example-config.test.ts`'s scans),
  * applied to a package whose §4.1 description is literally "never has the
  * signing key".
@@ -18,7 +20,8 @@
  *    credential-shaped value in the shipped example configuration.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -75,6 +78,74 @@ function read(path: string): string {
   return readFileSync(path, "utf8");
 }
 
+/**
+ * The module specifiers `source` names in an import position, WHATEVER the
+ * spelling (`CONTROL-1` r1, closing `CONTROL1-J-L1`): `from`, a bare
+ * `import`, a dynamic `import(…)` and `require(…)`, with any of the three
+ * quote characters, with or without whitespace — or a block comment — between
+ * the keyword, the parenthesis and the specifier.
+ *
+ * Round 0's scan matched four DOUBLE-quoted literals by substring, so a
+ * single-quoted specifier, a space before a dynamic import's parenthesis, no
+ * space after `from`, and a template-literal specifier all passed it; both
+ * verifiers planted such a file and it went unseen. (This comment names no
+ * spelling literally: the scan reads this file too.) It deliberately over-matches rather than parsing: a comment that
+ * reads like an import is reported too, and that is the safe side of a scan
+ * that proves an absence.
+ */
+const IMPORT_SPECIFIER =
+  /\b(?:from|import|require)\s*(?:\/\*[\s\S]*?\*\/\s*)*\(?\s*(?:\/\*[\s\S]*?\*\/\s*)*(['"`])([^'"`\r\n]*)\1/gu;
+
+function importedSpecifiers(source: string): readonly string[] {
+  return [...source.matchAll(IMPORT_SPECIFIER)].map((match) => match[2] ?? "");
+}
+
+const FORBIDDEN_SPECIFIERS = [
+  "@polymarket-bot/polymarket-secure",
+  "@polymarket/client",
+  "@polymarket/clob-client",
+  "@polymarket/builder-signing-sdk",
+  "@polymarket/builder-relayer-client",
+  "ethers",
+  "viem",
+  "web3",
+  "@ethersproject",
+] as const;
+
+/** The forbidden specifiers `source` imports — a PREFIX match, so `viem/accounts` counts. */
+function forbiddenImportsIn(source: string): readonly string[] {
+  return importedSpecifiers(source).filter((specifier) =>
+    FORBIDDEN_SPECIFIERS.some((forbidden) => specifier.startsWith(forbidden)),
+  );
+}
+
+/**
+ * Every spelling of an import of `specifier` the scan must catch. Built at
+ * RUN time from parts, so this file's own source — which the scan reads —
+ * spells none of them.
+ */
+function plantedSpellings(specifier: string): readonly string[] {
+  const spellings: string[] = [];
+  for (const quote of ["'", '"', "`"]) {
+    const q = (text: string): string => `${quote}${text}${quote}`;
+    spellings.push(
+      `import x from ${q(specifier)};`,
+      `import { y } from${q(specifier)};`,
+      `export * from ${q(specifier)};`,
+      `import ${q(specifier)};`,
+      `import${q(specifier)};`,
+      `const m = await import(${q(specifier)});`,
+      `const m = await import ( ${q(specifier)} );`,
+      `const m = await import(/* lazy */ ${q(specifier)});`,
+      `const m = require(${q(specifier)});`,
+      `const m = require (\n  ${q(specifier)}\n);`,
+      `import z = require(${q(specifier)});`,
+      `type T = typeof import(${q(specifier)});`,
+    );
+  }
+  return spellings;
+}
+
 describe("ACCEPTANCE 3: no signer is loaded", () => {
   it("scans a non-trivial number of files (the scan is not vacuous)", () => {
     expect(FILES.length).toBeGreaterThan(20);
@@ -94,25 +165,55 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
   });
 
   it("imports NO secure adapter, venue client or signing library, anywhere", () => {
-    const forbiddenSpecifiers = [
-      "@polymarket-bot/polymarket-secure",
-      "@polymarket/client",
-      "@polymarket/clob-client",
-      "@polymarket/builder-signing-sdk",
-      "@polymarket/builder-relayer-client",
-      "ethers",
-      "viem",
-      "web3",
-      "@ethersproject",
-    ];
     for (const path of IMPORT_SCAN_FILES) {
-      const source = read(path);
-      for (const specifier of forbiddenSpecifiers) {
-        expect(source, `${path} imports ${specifier}`).not.toContain(`from "${specifier}`);
-        expect(source, `${path} imports ${specifier}`).not.toContain(`require("${specifier}`);
-        expect(source, `${path} imports ${specifier}`).not.toContain(`import("${specifier}`);
-        expect(source, `${path} imports ${specifier}`).not.toContain(`import "${specifier}`);
+      expect(forbiddenImportsIn(read(path)), `${path} imports a forbidden module`).toEqual([]);
+    }
+  });
+
+  it("CONTROL-1 r1 (J-L1): the scan catches EVERY spelling of a forbidden import, and no clean one", () => {
+    for (const specifier of FORBIDDEN_SPECIFIERS) {
+      for (const spelling of plantedSpellings(specifier)) {
+        expect(forbiddenImportsIn(spelling), spelling).toEqual([specifier]);
       }
+    }
+    // A subpath is an import of the package.
+    expect(forbiddenImportsIn(plantedSpellings("viem/accounts")[0] ?? "")).toEqual(["viem/accounts"]);
+    // Negative controls: a permitted import in every spelling, and the words
+    // as plain text, are not reported.
+    for (const spelling of plantedSpellings("@polymarket-bot/observability")) {
+      expect(forbiddenImportsIn(spelling), spelling).toEqual([]);
+    }
+    expect(forbiddenImportsIn('const words = ["viem", "ethers"]; // no import here')).toEqual([]);
+  });
+
+  it("CONTROL-1 r1 (J-L1): a planted import is caught in EVERY scanned tree, in a file the walk really reaches", () => {
+    const spellings = plantedSpellings("viem");
+    for (const tree of IMPORT_SCAN_TREES) {
+      // The tree's own first file, as the walk found it, with an import
+      // appended in memory — the tree itself is only READ (infra/** is outside
+      // CONTROL-1's grant).
+      const reached = IMPORT_SCAN_FILES.find((path) => path.startsWith(`${tree}/`));
+      expect(reached, `${tree} contributes no file`).toBeDefined();
+      const source = read(reached ?? "");
+      expect(forbiddenImportsIn(source), `${reached ?? ""} is not clean to begin with`).toEqual([]);
+      for (const spelling of spellings) {
+        expect(forbiddenImportsIn(`${source}\n${spelling}\n`), `${tree}: ${spelling}`).toEqual(["viem"]);
+      }
+    }
+  });
+
+  it("CONTROL-1 r1 (J-L1): the walk reaches a planted file of EVERY scanned extension, and the scan reports each", () => {
+    const directory = mkdtempSync(join(tmpdir(), "control-1-r1-n4-"));
+    try {
+      const spellings = plantedSpellings("ethers");
+      SCANNED_EXTENSIONS.forEach((extension, index) => {
+        writeFileSync(join(directory, `planted${extension}`), spellings[index % spellings.length] ?? "", "utf8");
+      });
+      const walked = walk(directory);
+      expect(walked).toHaveLength(SCANNED_EXTENSIONS.length);
+      for (const path of walked) expect(forbiddenImportsIn(read(path)), path).toEqual(["ethers"]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 

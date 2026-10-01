@@ -25,8 +25,12 @@
  * audit log that records only successes cannot answer "who has been probing
  * this". Every refusal this class writes is for a caller `api.ts` has already
  * authorized for the mutation's grant, or — for {@link ControlPlane.refuseModeRaise}
- * — for a caller holding at least one mutation grant. A caller with NO
- * mutation authority writes nothing here at all (`CONTROL-1`, closing
+ * — for a caller holding at least one mutation grant. That includes a request
+ * refused BEFORE it reached a mutation method — at the transport, the route
+ * parameter or the body door — which `api.ts` records through
+ * {@link ControlPlane.refuseRequest} once authentication and the route's
+ * authorization have passed (`CONTROL-1` r1, closing `CONTROL1-J-M2`). A caller
+ * with NO mutation authority writes nothing here at all (`CONTROL-1`, closing
  * `WP-240` r1 M-3): an unauthenticated request never reaches this class, an
  * unauthorized one is refused before it, and a READ-only operator's mode-raise
  * attempt is COUNTED through {@link ControlPlane.countModeRaiseWithoutAudit}
@@ -34,6 +38,35 @@
  * append to is one it could exhaust, and this one refuses mutations — the kill
  * switch included — when it is full. `README.md`, "The audit budget", states
  * the whole design; `audit-budget.ts` is its second half.
+ *
+ * ## An engage never repeats and never weakens (`CONTROL-1` r1, `CONTROL1-J-M1`)
+ *
+ * An engage over a switch that is already engaged at the same scope:
+ *
+ * - with the SAME action is refused `CONTROL_ALREADY_IN_STATE`, as a repeated
+ *   pause is — an audit log full of no-ops is one nobody reads, and a no-op
+ *   must not spend the capacity a real halt needs;
+ * - that would move the switch AWAY from `FULL_HALT` is refused
+ *   `CONTROL_ENGAGE_WOULD_WEAKEN`: relaxing a full halt is a release, and a
+ *   release requires evidence (§9.17), so it goes through
+ *   {@link ControlPlane.releaseKillSwitch};
+ * - that changes it TO `FULL_HALT` is an escalation, applied;
+ * - that changes it between two actions §14.1 does not order is applied, as at
+ *   `WP-240` — but the audit budget admits it in the ORDINARY tier, so it can
+ *   never use the reserve (`vocabulary.ts`, `STRONGEST_KILL_SWITCH_ACTION`).
+ *
+ * ## Mutations are serialized per state key (`CONTROL-1` r1, `CONTROL1-J-L2`)
+ *
+ * "Audit first, then apply" reads the prior, AWAITS the append, then applies.
+ * With a sink that does I/O, two mutations of one instance could otherwise
+ * both read the same prior and both be audited as the change — two `APPLIED`
+ * pauses of one `RUNNING` instance, the second a no-op recorded as a halt.
+ * Every mutation therefore runs under a per-key lock (`strategy:<id>`,
+ * `kill-switch:<scope>:<ref>`): mutations of one instance or one switch run one
+ * at a time, in arrival order, and mutations of different keys still proceed
+ * concurrently, so a slow append for one instance never queues a kill-switch
+ * engage behind it. A lock entry exists only while a mutation of its key is in
+ * flight, so the map cannot grow with the ids callers try.
  *
  * ## Unknown instances are refused, not fabricated (`CONTROL-1`, M-1)
  *
@@ -71,7 +104,12 @@ import {
 } from "@polymarket-bot/observability";
 
 import { instanceIdProblem } from "./instance-id.js";
-import { CONTROL_ACTOR_KIND, type ControlKillSwitchAction, type ControlKillSwitchScope } from "./vocabulary.js";
+import {
+  CONTROL_ACTOR_KIND,
+  STRONGEST_KILL_SWITCH_ACTION,
+  type ControlKillSwitchAction,
+  type ControlKillSwitchScope,
+} from "./vocabulary.js";
 
 /** A strategy instance's run state, as the control plane holds it. */
 export type StrategyRunState = "RUNNING" | "PAUSED";
@@ -126,17 +164,52 @@ export type MutationRefusalCode =
    * No such strategy instance is registered (`CONTROL-1`, M-1). The strategy
    * twin of {@link MutationRefusalCode} `CONTROL_NOT_ENGAGED`.
    */
-  | "CONTROL_UNKNOWN_INSTANCE";
+  | "CONTROL_UNKNOWN_INSTANCE"
+  /**
+   * The engage would move an engaged switch away from `FULL_HALT`
+   * (`CONTROL-1` r1, `CONTROL1-J-M1`): relaxing a full halt is a release, and a
+   * release requires evidence.
+   */
+  | "CONTROL_ENGAGE_WOULD_WEAKEN";
 
 /**
- * Whether a refused mode-raise attempt reached the audit log.
+ * Whether a refusal's record reached the audit log.
  *
- * `api.ts` words its `403` from this, so the refusal never CLAIMS an audit
- * record that the sink refused to write.
+ * `api.ts` words its mode-raise `403` from this, so that refusal never CLAIMS
+ * an audit record that the sink refused to write.
  */
 export type ModeRaiseAuditOutcome =
   | { readonly audited: true }
   | { readonly audited: false; readonly code: string; readonly detail: string };
+
+/** The same answer, for {@link ControlPlane.refuseRequest}. */
+export type RefusalAuditOutcome = ModeRaiseAuditOutcome;
+
+/**
+ * Where a request to a mutating route was refused before it reached a
+ * mutation method (`CONTROL-1` r1, `CONTROL1-J-M2`).
+ *
+ * - `TRANSPORT` — `http.ts`'s `413`, `415` or `400` (not JSON);
+ * - `ROUTE_PARAMETER` — the `:instanceId` door (`instance-id.ts`);
+ * - `REQUEST_BODY` — the route's body door (`api.ts`, `doors.ts`).
+ */
+export type RequestRefusalStage = "TRANSPORT" | "ROUTE_PARAMETER" | "REQUEST_BODY";
+
+/** What {@link ControlPlane.refuseRequest} records about one such refusal. */
+export interface RequestRefusal {
+  /** The refusal code the caller received, e.g. `CONTROL_REQUEST_INVALID`. */
+  readonly code: string;
+  readonly detail: string;
+  /** The issues the caller received; the record keeps a bounded prefix. */
+  readonly issues: readonly string[];
+}
+
+/** The mutating audit actions — every action except `MODE_RAISE_ATTEMPT`. */
+export type MutatingAuditAction = Exclude<ControlAuditAction, "MODE_RAISE_ATTEMPT">;
+
+/** How many of a refusal's issues its audit record keeps, and how long each may be. */
+export const REFUSAL_AUDIT_MAX_ISSUES = 8;
+export const REFUSAL_AUDIT_MAX_TEXT = 256;
 
 export type MutationResult<T> =
   | { readonly ok: true; readonly value: T }
@@ -196,6 +269,13 @@ export class ControlPlane {
   #modeRaiseAttemptsRefused = 0;
   #auditAppendFailures = 0;
   readonly #mutations = new Map<string, number>();
+
+  /**
+   * The tail of each state key's mutation queue (module header, "Mutations are
+   * serialized per state key"). An entry exists only while a mutation of its
+   * key is in flight.
+   */
+  readonly #locks = new Map<string, Promise<void>>();
 
   constructor(options: ControlPlaneOptions) {
     this.#audit = options.audit;
@@ -299,7 +379,9 @@ export class ControlPlane {
     instanceId: string,
     context: MutationContext,
   ): Promise<MutationResult<StrategyInstanceState>> {
-    return this.#setStrategyState(instanceId, "PAUSED", "STRATEGY_PAUSE", context);
+    return this.#serialized(strategyLockKey(instanceId), () =>
+      this.#setStrategyState(instanceId, "PAUSED", "STRATEGY_PAUSE", context),
+    );
   }
 
   /** Resumes a strategy instance. */
@@ -307,7 +389,37 @@ export class ControlPlane {
     instanceId: string,
     context: MutationContext,
   ): Promise<MutationResult<StrategyInstanceState>> {
-    return this.#setStrategyState(instanceId, "RUNNING", "STRATEGY_RESUME", context);
+    return this.#serialized(strategyLockKey(instanceId), () =>
+      this.#setStrategyState(instanceId, "RUNNING", "STRATEGY_RESUME", context),
+    );
+  }
+
+  /**
+   * Runs `mutation` after every earlier mutation of the same `key` has
+   * settled, and before any later one starts (module header). The queue's
+   * links never reject — each is a promise this method resolves in `finally`
+   * — so one failed mutation cannot wedge its key.
+   */
+  async #serialized<T>(key: string, mutation: () => Promise<T>): Promise<T> {
+    const previous = this.#locks.get(key) ?? Promise.resolve();
+    let release: () => void = () => undefined;
+    const settled = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => settled);
+    this.#locks.set(key, tail);
+    try {
+      await previous;
+      return await mutation();
+    } finally {
+      release();
+      if (this.#locks.get(key) === tail) this.#locks.delete(key);
+    }
+  }
+
+  /** How many state keys have a mutation in flight (`CONTROL-1` r1; for tests). */
+  get mutationsInFlight(): number {
+    return this.#locks.size;
   }
 
   async #setStrategyState(
@@ -372,6 +484,18 @@ export class ControlPlane {
     context: MutationContext,
   ): Promise<MutationResult<KillSwitchState>> {
     const key = scopeKey(request.scope, request.scopeRef);
+    return this.#serialized(killSwitchLockKey(key), () => this.#engage(key, request, context));
+  }
+
+  async #engage(
+    key: string,
+    request: {
+      readonly scope: ControlKillSwitchScope;
+      readonly scopeRef: string | null;
+      readonly action: ControlKillSwitchAction;
+    },
+    context: MutationContext,
+  ): Promise<MutationResult<KillSwitchState>> {
     const prior = this.#killSwitches.get(key);
     const priorDocument = prior === undefined ? killSwitchAbsent(request.scope, request.scopeRef) : killSwitchDocument(prior);
 
@@ -395,6 +519,30 @@ export class ControlPlane {
             : `a ${request.scope} kill switch must name what it is scoped to (§10.6 kill_switch_events_scope_ref)`,
         },
       );
+    }
+
+    // `CONTROL-1` r1, `CONTROL1-J-M1` (module header, "An engage never repeats
+    // and never weakens"): the two overwrites that are not engages are refused,
+    // in the ORDINARY tier, before anything is recorded as applied.
+    if (prior !== undefined && prior.action === request.action) {
+      return this.#refuse("KILL_SWITCH_ENGAGE", context, request.scope, request.scopeRef, priorDocument, {
+        code: "CONTROL_ALREADY_IN_STATE",
+        detail:
+          `the ${request.scope} kill switch for ${request.scopeRef ?? "the global scope"} is already ` +
+          `engaged at ${request.action}; the request is refused rather than recorded as a change, because ` +
+          "an audit log full of no-ops is an audit log nobody reads — and a no-op must not spend the " +
+          "audit capacity a real halt needs",
+      });
+    }
+    if (prior?.action === STRONGEST_KILL_SWITCH_ACTION) {
+      return this.#refuse("KILL_SWITCH_ENGAGE", context, request.scope, request.scopeRef, priorDocument, {
+        code: "CONTROL_ENGAGE_WOULD_WEAKEN",
+        detail:
+          `the ${request.scope} kill switch for ${request.scopeRef ?? "the global scope"} is engaged at ` +
+          `${STRONGEST_KILL_SWITCH_ACTION}; engaging ${request.action} over it would RELAX it, and relaxing a ` +
+          "full halt is a release: POST /v1/kill-switch/release with authoritativeSnapshotApplied: true " +
+          "(§9.17), then engage the action wanted",
+      });
     }
 
     const resulting: KillSwitchState = Object.freeze({
@@ -431,6 +579,18 @@ export class ControlPlane {
     context: MutationContext,
   ): Promise<MutationResult<{ readonly released: KillSwitchState }>> {
     const key = scopeKey(request.scope, request.scopeRef);
+    return this.#serialized(killSwitchLockKey(key), () => this.#release(key, request, context));
+  }
+
+  async #release(
+    key: string,
+    request: {
+      readonly scope: ControlKillSwitchScope;
+      readonly scopeRef: string | null;
+      readonly release: KillSwitchRelease;
+    },
+    context: MutationContext,
+  ): Promise<MutationResult<{ readonly released: KillSwitchState }>> {
     const prior = this.#killSwitches.get(key);
     const priorDocument =
       prior === undefined ? killSwitchAbsent(request.scope, request.scopeRef) : killSwitchDocument(prior);
@@ -545,6 +705,47 @@ export class ControlPlane {
     this.#modeRaiseAttemptsRefused += 1;
   }
 
+  /**
+   * Records a request to a MUTATING route that was refused before it reached
+   * a mutation method — at the transport, the route parameter or the body door
+   * (`CONTROL-1` r1, closing `CONTROL1-J-M2`).
+   *
+   * It changes nothing and reads no state: the request never named a change
+   * this class could evaluate. `api.ts` calls it only AFTER authentication and
+   * the route's authorization, so its caller holds the route's mutation grant
+   * and an actor without mutation authority still writes nothing (`WP-240` r1
+   * M-3). The record is `REFUSED`, so the audit budget admits it in the
+   * ORDINARY tier; a record the budget or the sink refuses is counted
+   * `NOT_AUDITED`, the refusal stands, and the return value says which
+   * happened.
+   *
+   * What the record keeps is bounded whatever the request carried: the
+   * operator's id, the route's action, the target the route parameter named
+   * when it passed its door (never a caller's undecoded bytes), the refusal
+   * code and detail, and at most {@link REFUSAL_AUDIT_MAX_ISSUES} issues of at
+   * most {@link REFUSAL_AUDIT_MAX_TEXT} characters each.
+   */
+  async refuseRequest(
+    action: MutatingAuditAction,
+    target: { readonly scope: string; readonly scopeRef: string | null },
+    stage: RequestRefusalStage,
+    refusal: RequestRefusal,
+    context: MutationContext,
+  ): Promise<RefusalAuditOutcome> {
+    // Nothing was read and nothing changed, so prior and resulting are one
+    // document saying so.
+    const state: AuditStateDocument = { refusedAt: stage, stateRead: "false" };
+    const appended = await this.#append(action, "REFUSED", context, target.scope, target.scopeRef, state, state, {
+      refusalCode: bounded(refusal.code),
+      refusalDetail: bounded(refusal.detail),
+      refusalIssues: boundedIssues(refusal.issues),
+      refusalIssueCount: String(refusal.issues.length),
+    });
+    return appended.ok
+      ? { audited: true }
+      : { audited: false, code: appended.refusal.code, detail: appended.refusal.detail };
+  }
+
   // --- the audit path -------------------------------------------------------
 
   async #refuse(
@@ -626,6 +827,33 @@ export class ControlPlane {
       },
     };
   }
+}
+
+function strategyLockKey(instanceId: string): string {
+  return `strategy:${instanceId}`;
+}
+
+function killSwitchLockKey(key: string): string {
+  return `kill-switch:${key}`;
+}
+
+/** At most {@link REFUSAL_AUDIT_MAX_TEXT} characters of `text`, marked when cut. */
+function bounded(text: string): string {
+  return text.length <= REFUSAL_AUDIT_MAX_TEXT ? text : `${text.slice(0, REFUSAL_AUDIT_MAX_TEXT - 1)}…`;
+}
+
+/**
+ * A bounded prefix of `issues`, as an ORDINARY array of strings whatever
+ * species the caller passed — an index walk into a literal, for the reason
+ * {@link ControlPlane.refuseModeRaise}'s `[...keys]` comment gives (a foreign
+ * container species in a §14.1 document would make the Postgres sink refuse
+ * the record).
+ */
+function boundedIssues(issues: readonly string[]): readonly string[] {
+  const out: string[] = [];
+  const count = Math.min(issues.length, REFUSAL_AUDIT_MAX_ISSUES);
+  for (let index = 0; index < count; index += 1) out.push(bounded(String(issues[index])));
+  return out;
 }
 
 function mergeDocuments(

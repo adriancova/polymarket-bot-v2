@@ -23,24 +23,34 @@
  *
  * | Record | May fill the log up to |
  * | --- | --- |
- * | `KILL_SWITCH_ENGAGE` / `APPLIED` | `C` |
- * | `STRATEGY_PAUSE` / `APPLIED` | `C − R` |
- * | everything else — every `REFUSED` record, every resume, every release | `C − 2R` |
+ * | `KILL_SWITCH_ENGAGE` / `APPLIED` that engages a switch where none was, or escalates one to `FULL_HALT` | `C` |
+ * | `STRATEGY_PAUSE` / `APPLIED` that moves an instance from `RUNNING` to `PAUSED` | `C − R` |
+ * | everything else — every `REFUSED` record, every resume, every release, and an engage that changes an engaged switch between two actions §14.1 does not order | `C − 2R` |
  *
  * So:
  *
- * - **Nothing but an applied kill-switch engage can use the last `R` records.**
- *   Only an operator holding `KILL_SWITCH` can produce one, and each one is a
- *   switch that really engaged.
- * - **Nothing but an applied safety-direction action can use the `R` before
- *   those.** A pause applies only to a registered `RUNNING` instance, and
- *   pausing it again is a refusal (ordinary tier), so once the ordinary tier is
- *   full a `STRATEGY_CONTROL` holder can consume at most one reserved record per
- *   registered instance — and each one is a halt that took effect.
- * - **The direction a full ordinary tier fails in is SAFE.** Resumes and
- *   releases are ordinary: once it is full they are refused `503`, so the
- *   platform can still be halted and cannot be un-halted until the log is
- *   rotated. That is the fail-closed direction §14.1 wants from a kill switch.
+ * - **Nothing but a STRENGTHENING engage can use the last `R` records.** Only
+ *   an operator holding `KILL_SWITCH` can produce one, and each one either
+ *   engaged a switch where none was or escalated one to `FULL_HALT`. A
+ *   repeated engage and an engage that would move a switch away from
+ *   `FULL_HALT` are REFUSED by the control plane (`CONTROL_ALREADY_IN_STATE`,
+ *   `CONTROL_ENGAGE_WOULD_WEAKEN`), and their records are ordinary
+ *   (`CONTROL-1` r1, closing `CONTROL1-J-M1`). At one scope that bounds the
+ *   reserved records to two — an engage and an escalation — until a release,
+ *   and a release is ordinary.
+ * - **Nothing but a halt that took effect can use the `R` before those.** A
+ *   pause applies only to a registered `RUNNING` instance, pausing it again is
+ *   a refusal (ordinary), and mutations of one instance are SERIALIZED by the
+ *   control plane (`CONTROL1-J-L2`) — so once the ordinary tier is full a
+ *   `STRATEGY_CONTROL` holder can consume at most one reserved record per
+ *   registered instance, however many requests it sends at once.
+ * - **The direction a full ordinary tier fails in is SAFE.** Resumes,
+ *   releases and unordered action changes are ordinary: once the tier is full
+ *   they are refused `503`, and an engage that would relax a `FULL_HALT` is
+ *   refused whatever the tier. So the platform can still be halted, a switch
+ *   can still be escalated to `FULL_HALT`, and nothing can be released or
+ *   relaxed until the log is rotated. That is the fail-closed direction §14.1
+ *   wants from a kill switch.
  * - **Nothing here weakens "audit first, then apply".** A record the budget
  *   refuses is a refusal of the APPEND (`AUDIT_CAPACITY_EXHAUSTED`), and the
  *   control plane turns it into `503 CONTROL_NOT_AUDITABLE` with the state
@@ -48,9 +58,15 @@
  *   is counted `NOT_AUDITED` — and nothing changed, so nothing happened
  *   unaudited.
  *
- * The tier is read from the RECORD (`action`, `outcome`), which the control
- * plane builds from the method it is executing; a request body cannot choose
- * it. `#admitted` counts appends the inner sink ACCEPTED; an append in flight
+ * The tier is read from the RECORD — its `action`, its `outcome`, and the
+ * prior and resulting state documents — which the control plane builds from
+ * the method it is executing and the state it holds; a request body cannot
+ * choose it. A protected tier is EARNED by the state change the record itself
+ * shows, so even a record the control plane should never write (an applied
+ * engage that repeats its prior, a pause of a paused instance) would be
+ * admitted only as ordinary.
+ *
+ * `#admitted` counts appends the inner sink ACCEPTED; an append in flight
  * holds its slot from before the inner call until it settles, so concurrent
  * appends cannot overshoot a tier, and an inner refusal or throw releases it.
  *
@@ -65,23 +81,66 @@
 import {
   InMemoryControlAuditLog,
   type AuditAppendResult,
+  type AuditStateDocument,
   type ControlAuditRecord,
   type ControlAuditSink,
 } from "@polymarket-bot/observability";
+
+import { STRONGEST_KILL_SWITCH_ACTION } from "./vocabulary.js";
 
 /** The three tiers, from the most protected to the least. */
 export const AUDIT_BUDGET_TIERS = ["KILL_SWITCH_ENGAGE", "SAFETY_DIRECTION", "ORDINARY"] as const;
 export type AuditBudgetTier = (typeof AUDIT_BUDGET_TIERS)[number];
 
+/** The parts of a record its tier is read from. */
+export type AuditBudgetTierInput = Pick<ControlAuditRecord, "action" | "outcome" | "priorState" | "resultingState">;
+
 /**
  * The tier a record is admitted under. Read from the record the control plane
- * built, never from a request.
+ * built, never from a request — and EARNED by the state change the record's
+ * own documents show (module header).
  */
-export function auditBudgetTier(record: Pick<ControlAuditRecord, "action" | "outcome">): AuditBudgetTier {
+export function auditBudgetTier(record: AuditBudgetTierInput): AuditBudgetTier {
   if (record.outcome !== "APPLIED") return "ORDINARY";
-  if (record.action === "KILL_SWITCH_ENGAGE") return "KILL_SWITCH_ENGAGE";
-  if (record.action === "STRATEGY_PAUSE") return "SAFETY_DIRECTION";
+  if (record.action === "KILL_SWITCH_ENGAGE") {
+    return engageStrengthens(record.priorState, record.resultingState) ? "KILL_SWITCH_ENGAGE" : "ORDINARY";
+  }
+  if (record.action === "STRATEGY_PAUSE") {
+    return pauseHalts(record.priorState, record.resultingState) ? "SAFETY_DIRECTION" : "ORDINARY";
+  }
   return "ORDINARY";
+}
+
+/** An own string field of an object document, or `undefined`. TOTAL. */
+function field(document: AuditStateDocument, key: string): string | undefined {
+  if (typeof document !== "object" || document === null || Array.isArray(document)) return undefined;
+  if (!Object.hasOwn(document, key)) return undefined;
+  const value = (document as Readonly<Record<string, AuditStateDocument>>)[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * A switch engaged where none was, or an engaged switch escalated to
+ * `FULL_HALT` (`CONTROL-1` r1, closing `CONTROL1-J-M1`). A repeat, a change
+ * away from `FULL_HALT`, a change between two unordered actions, and any
+ * document this cannot read are not.
+ */
+function engageStrengthens(prior: AuditStateDocument, resulting: AuditStateDocument): boolean {
+  if (field(resulting, "engaged") !== "true") return false;
+  const priorEngaged = field(prior, "engaged");
+  if (priorEngaged === "false") return true;
+  if (priorEngaged !== "true") return false;
+  const priorAction = field(prior, "action");
+  return (
+    field(resulting, "action") === STRONGEST_KILL_SWITCH_ACTION &&
+    priorAction !== undefined &&
+    priorAction !== STRONGEST_KILL_SWITCH_ACTION
+  );
+}
+
+/** An instance that was `RUNNING` and is now `PAUSED`: a halt that took effect. */
+function pauseHalts(prior: AuditStateDocument, resulting: AuditStateDocument): boolean {
+  return field(prior, "state") === "RUNNING" && field(resulting, "state") === "PAUSED";
 }
 
 export interface AuditBudgetOptions {

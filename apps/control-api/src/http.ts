@@ -23,13 +23,34 @@
  *
  * A request with a non-empty body must carry `Content-Type: application/json`,
  * optionally with `charset=utf-8` and no other parameter; anything else is
- * refused `415` before the body is parsed. The body is decoded as UTF-8 and
- * parsed as JSON, so a request that declares something else is a request this
- * process would be reading as something its sender did not mean. (It was never
- * a CSRF path — the credential is a bearer header and the bind is loopback —
- * but a control surface that accepts any declared type is one whose input
- * grammar is narrower than its own documentation says.) A body-less request
- * needs no content type.
+ * refused `415` and never acted on. The body is decoded as UTF-8 and parsed as
+ * JSON, so a request that declares something else is a request this process
+ * would be reading as something its sender did not mean. (It was never a CSRF
+ * path — the credential is a bearer header and the bind is loopback — but a
+ * control surface that accepts any declared type is one whose input grammar is
+ * narrower than its own documentation says.) A body-less request needs no
+ * content type.
+ *
+ * ## The transport DECIDES its refusals; the API ANSWERS them (`CONTROL-1` r1)
+ *
+ * The three refusals this module makes while reading a body — `413` too large,
+ * `415` undeclared, `400` not JSON — are not written here. Each is handed to
+ * {@link ControlApi.handle} as a typed {@link TransportRefusal}, carrying the
+ * exact response rendered here, and the API answers it only after
+ * authentication, the by-name mode-raise refusal, routing and the route's
+ * authorization (`api.ts`, module header). So an anonymous caller learns
+ * nothing about its body (`401`); an authorized caller's refusal on a mutating
+ * route is AUDITED (`CONTROL1-J-M2`: at round 0 these three were written here,
+ * before authentication, and an authorized operator's refusal left no record);
+ * and a caller without mutation authority still writes nothing (`WP-240` r1
+ * M-3). An undeclared body that nonetheless parses as JSON is passed along for
+ * ONE purpose — so that a body naming `runMode` is still refused BY NAME, and
+ * audited for a mutation-grant holder, as it was before L-3 — and is never
+ * acted on.
+ *
+ * Two things still never reach the API, and so are never audited: a request
+ * whose body never arrived whole (the client went away; Node's own `408`), and
+ * anything Node's HTTP parser refuses itself.
  *
  * ## Explicit timeouts (`CONTROL-1`, `WP-240` r1 L-9)
  *
@@ -42,7 +63,7 @@
  *
  * ## Every byte this server writes is encoded from own data
  *
- * The three refusal bodies written here (`413`, `415`, `400`) are built by
+ * The three refusal bodies rendered here (`413`, `415`, `400`) are built by
  * `encodePlainJson` for the same reason `api.ts`'s `json()` is (`SER-3`,
  * `docs/handoffs/SER-0-sweep.md` `control-http-refusal-bodies`): they are
  * message-only at base, but a server whose ordinary bodies are own-data
@@ -54,7 +75,7 @@
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import type { ApiRequest, ControlApi } from "./api.js";
+import type { ApiRequest, ApiResponse, ControlApi, TransportRefusal, TransportRefusalCode } from "./api.js";
 
 /** The server's timeouts, in milliseconds. */
 export interface ControlHttpTimeouts {
@@ -123,10 +144,17 @@ export function isJsonContentType(header: string | undefined): boolean {
   return true;
 }
 
-function readBody(
-  request: IncomingMessage,
-  maxBytes: number,
-): Promise<{ readonly ok: true; readonly text: string } | { readonly ok: false }> {
+type BodyRead =
+  | { readonly ok: true; readonly text: string }
+  /**
+   * `TOO_LARGE`: the bound was crossed, and the request is answered `413`
+   * through the API. `ABORTED`: the request errored before its body arrived
+   * whole — it is not a request anyone can be answered for, so the API never
+   * sees it.
+   */
+  | { readonly ok: false; readonly reason: "TOO_LARGE" | "ABORTED" };
+
+function readBody(request: IncomingMessage, maxBytes: number): Promise<BodyRead> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let bytes = 0;
@@ -142,7 +170,7 @@ function readBody(
         // destroyed after it has been flushed (see `send`).
         refused = true;
         chunks.length = 0;
-        resolve({ ok: false });
+        resolve({ ok: false, reason: "TOO_LARGE" });
         return;
       }
       chunks.push(chunk);
@@ -152,9 +180,38 @@ function readBody(
       resolve({ ok: true, text: Buffer.concat(chunks).toString("utf8") });
     });
     request.on("error", () => {
-      resolve({ ok: false });
+      resolve({ ok: false, reason: "ABORTED" });
     });
   });
+}
+
+const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
+
+/**
+ * A transport refusal, typed, with the exact response this module renders for
+ * it — the API returns that response verbatim once the request is authorized.
+ */
+function transportRefusal(
+  status: 400 | 413 | 415,
+  code: TransportRefusalCode,
+  detail: string,
+  issues: readonly string[],
+): TransportRefusal {
+  const response: ApiResponse = {
+    status,
+    contentType: JSON_CONTENT_TYPE,
+    body: controlRefusalBody(code, detail, issues),
+  };
+  return { code, detail, issues, response };
+}
+
+/** `JSON.parse`, as data. TOTAL. */
+function parseJson(text: string): { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly message: string } {
+  try {
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch (cause) {
+    return { ok: false, message: cause instanceof Error ? cause.message : String(cause) };
+  }
 }
 
 /**
@@ -164,7 +221,8 @@ function readBody(
  * its literal: a polluted window may not span socket I/O (an inherited
  * `toJSON` installed across a macrotask corrupts vitest's own worker IPC —
  * measured), so the wire-level suites cannot hold one open across a request.
- * The three call sites below (`413`, `415`, `400`) are its only callers.
+ * Its callers are the three refusals below (`413`, `415`, `400`), all through
+ * `transportRefusal`, and the aborted-body answer.
  *
  * The record is plain, so the encoder cannot refuse it.
  */
@@ -217,49 +275,35 @@ export function startControlHttpServer(
         const method = request.method ?? "GET";
 
         const raw = await readBody(request, options.maxRequestBodyBytes);
-        if (!raw.ok) {
-          send(
-            response,
-            413,
-            "application/json; charset=utf-8",
-            controlRefusalBody(
-              "CONTROL_BODY_TOO_LARGE",
-              `a request body may not exceed ${String(options.maxRequestBodyBytes)} bytes`,
-              [],
-            ),
-            true,
-          );
+        const tooLargeDetail = `a request body may not exceed ${String(options.maxRequestBodyBytes)} bytes`;
+        if (!raw.ok && raw.reason === "ABORTED") {
+          // The body never arrived whole, so there is no request to answer
+          // (module header): nothing reaches the API, and the socket is closed.
+          send(response, 413, JSON_CONTENT_TYPE, controlRefusalBody("CONTROL_BODY_TOO_LARGE", tooLargeDetail, []), true);
           return;
         }
 
+        // The transport DECIDES; the API answers, after authorization (module header).
         let body: unknown;
-        if (raw.text !== "") {
+        let refused: TransportRefusal | undefined;
+        if (!raw.ok) {
+          refused = transportRefusal(413, "CONTROL_BODY_TOO_LARGE", tooLargeDetail, []);
+        } else if (raw.text !== "") {
+          const parsed = parseJson(raw.text);
           if (!isJsonContentType(request.headers["content-type"])) {
-            send(
-              response,
+            refused = transportRefusal(
               415,
-              "application/json; charset=utf-8",
-              controlRefusalBody(
-                "CONTROL_UNSUPPORTED_MEDIA_TYPE",
-                "a request body must be declared Content-Type: application/json (charset utf-8 or none); " +
-                  "it is read as UTF-8 JSON and as nothing else",
-                [],
-              ),
+              "CONTROL_UNSUPPORTED_MEDIA_TYPE",
+              "a request body must be declared Content-Type: application/json (charset utf-8 or none); " +
+                "it is read as UTF-8 JSON and as nothing else",
+              [],
             );
-            return;
-          }
-          try {
-            body = JSON.parse(raw.text);
-          } catch (cause) {
-            send(
-              response,
-              400,
-              "application/json; charset=utf-8",
-              controlRefusalBody("CONTROL_BODY_NOT_JSON", "the request body is not JSON", [
-                cause instanceof Error ? cause.message : String(cause),
-              ]),
-            );
-            return;
+            // Carried ONLY for the by-name mode-raise refusal; never acted on.
+            if (parsed.ok) body = parsed.value;
+          } else if (!parsed.ok) {
+            refused = transportRefusal(400, "CONTROL_BODY_NOT_JSON", "the request body is not JSON", [parsed.message]);
+          } else {
+            body = parsed.value;
           }
         }
 
@@ -268,9 +312,12 @@ export function startControlHttpServer(
           path,
           authorization: request.headers.authorization,
           body,
+          ...(refused === undefined ? {} : { transportRefusal: refused }),
         };
         const answer = await options.api.handle(apiRequest);
-        send(response, answer.status, answer.contentType, answer.body, false, answer.allow);
+        // A body refused for its SIZE was never drained: whatever the answer,
+        // the connection closes once it is flushed.
+        send(response, answer.status, answer.contentType, answer.body, !raw.ok, answer.allow);
       })();
     },
   );

@@ -13,6 +13,7 @@ import {
   CONTROL_AUDIT_OUTCOMES,
   InMemoryControlAuditLog,
   type AuditAppendResult,
+  type AuditStateDocument,
   type ControlAuditAction,
   type ControlAuditOutcome,
   type ControlAuditRecord,
@@ -26,8 +27,32 @@ import {
   createBudgetedAuditLog,
 } from "./audit-budget.js";
 
+/** The documents the control plane writes for the state change each action makes when it STRENGTHENS. */
+const SWITCH_ABSENT: AuditStateDocument = { engaged: "false", scope: "GLOBAL", scopeRef: null };
+const switchAt = (action: string): AuditStateDocument => ({
+  engaged: "true",
+  scope: "GLOBAL",
+  scopeRef: null,
+  action,
+  reason: "a stated reason",
+  since: "2026-10-01T00:00:00.000Z",
+  actor: "operator-a",
+});
+const instanceIn = (state: string): AuditStateDocument => ({
+  instanceId: "sb-1",
+  state,
+  reason: "a stated reason",
+  since: "2026-10-01T00:00:00.000Z",
+  actor: "operator-a",
+});
+
 let sequence = 0;
-function record(action: ControlAuditAction, outcome: ControlAuditOutcome): ControlAuditRecord {
+function record(
+  action: ControlAuditAction,
+  outcome: ControlAuditOutcome,
+  priorState: AuditStateDocument = SWITCH_ABSENT,
+  resultingState: AuditStateDocument = switchAt("FULL_HALT"),
+): ControlAuditRecord {
   sequence += 1;
   return {
     recordId: `01930000-0000-7000-8000-${String(sequence).padStart(12, "0")}`,
@@ -38,22 +63,33 @@ function record(action: ControlAuditAction, outcome: ControlAuditOutcome): Contr
     scope: "GLOBAL",
     scopeRef: null,
     reason: "a stated reason",
-    priorState: { engaged: "false" },
-    resultingState: { engaged: "true" },
+    priorState,
+    resultingState,
     at: "2026-10-01T00:00:00.000Z",
   };
 }
 
 const engage = (): ControlAuditRecord => record("KILL_SWITCH_ENGAGE", "APPLIED");
-const pause = (): ControlAuditRecord => record("STRATEGY_PAUSE", "APPLIED");
+const pause = (): ControlAuditRecord =>
+  record("STRATEGY_PAUSE", "APPLIED", instanceIn("RUNNING"), instanceIn("PAUSED"));
 const ordinary = (): ControlAuditRecord => record("MODE_RAISE_ATTEMPT", "REFUSED");
 
 describe("the tier is read from the record's action and outcome", () => {
   it("classifies EVERY action × outcome pair, and only two pairs are protected", () => {
+    // Each pair carries the documents of the strengthening change its action
+    // makes — a new switch, a RUNNING → PAUSED instance — so the table isolates
+    // the action and the outcome.
+    const strengthening = (action: ControlAuditAction): readonly [AuditStateDocument, AuditStateDocument] =>
+      action === "STRATEGY_PAUSE"
+        ? [instanceIn("RUNNING"), instanceIn("PAUSED")]
+        : action === "STRATEGY_RESUME"
+          ? [instanceIn("PAUSED"), instanceIn("RUNNING")]
+          : [SWITCH_ABSENT, switchAt("FULL_HALT")];
     const table: Record<string, string> = {};
     for (const action of CONTROL_AUDIT_ACTIONS) {
       for (const outcome of CONTROL_AUDIT_OUTCOMES) {
-        table[`${action}|${outcome}`] = auditBudgetTier({ action, outcome });
+        const [priorState, resultingState] = strengthening(action);
+        table[`${action}|${outcome}`] = auditBudgetTier({ action, outcome, priorState, resultingState });
       }
     }
     expect(table).toEqual({
@@ -68,6 +104,81 @@ describe("the tier is read from the record's action and outcome", () => {
       "MODE_RAISE_ATTEMPT|APPLIED": "ORDINARY",
       "MODE_RAISE_ATTEMPT|REFUSED": "ORDINARY",
     });
+  });
+});
+
+describe("CONTROL-1 r1 (CONTROL1-J-M1): a protected tier is EARNED by the change the record shows", () => {
+  const engageTier = (prior: AuditStateDocument, resulting: AuditStateDocument): string =>
+    auditBudgetTier({ action: "KILL_SWITCH_ENGAGE", outcome: "APPLIED", priorState: prior, resultingState: resulting });
+
+  it("a switch engaged where none was is a KILL_SWITCH_ENGAGE record, at every action", () => {
+    for (const action of ["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY", "FULL_HALT"]) {
+      expect(engageTier(SWITCH_ABSENT, switchAt(action)), action).toBe("KILL_SWITCH_ENGAGE");
+    }
+  });
+
+  it("an escalation to FULL_HALT is a KILL_SWITCH_ENGAGE record", () => {
+    for (const from of ["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY"]) {
+      expect(engageTier(switchAt(from), switchAt("FULL_HALT")), from).toBe("KILL_SWITCH_ENGAGE");
+    }
+  });
+
+  it("a REPEAT is ORDINARY, at every action — a no-op cannot spend the reserve", () => {
+    for (const action of ["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY", "FULL_HALT"]) {
+      expect(engageTier(switchAt(action), switchAt(action)), action).toBe("ORDINARY");
+    }
+  });
+
+  it("a change AWAY from FULL_HALT is ORDINARY — a weakening cannot spend the reserve", () => {
+    for (const to of ["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY"]) {
+      expect(engageTier(switchAt("FULL_HALT"), switchAt(to)), to).toBe("ORDINARY");
+    }
+  });
+
+  it("a change between two actions §14.1 does not order is ORDINARY", () => {
+    const unordered = ["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY"];
+    for (const from of unordered) {
+      for (const to of unordered) {
+        if (from !== to) expect(engageTier(switchAt(from), switchAt(to)), `${from} → ${to}`).toBe("ORDINARY");
+      }
+    }
+  });
+
+  it("an unreadable document earns nothing", () => {
+    expect(engageTier(null, switchAt("FULL_HALT"))).toBe("ORDINARY");
+    expect(engageTier("engaged", switchAt("FULL_HALT"))).toBe("ORDINARY");
+    expect(engageTier(SWITCH_ABSENT, SWITCH_ABSENT)).toBe("ORDINARY");
+    expect(engageTier({ engaged: "true" }, switchAt("FULL_HALT"))).toBe("ORDINARY");
+    expect(engageTier([SWITCH_ABSENT], switchAt("FULL_HALT"))).toBe("ORDINARY");
+    // A prior that names an action but does not say the switch was engaged is
+    // not an escalation either.
+    expect(engageTier({ engaged: "maybe", action: "HALT_NEW_ENTRIES" }, switchAt("FULL_HALT"))).toBe("ORDINARY");
+    expect(engageTier({ action: "HALT_NEW_ENTRIES" }, switchAt("FULL_HALT"))).toBe("ORDINARY");
+  });
+
+  it("only a RUNNING → PAUSED pause is a SAFETY_DIRECTION record", () => {
+    const pauseTier = (prior: AuditStateDocument, resulting: AuditStateDocument): string =>
+      auditBudgetTier({ action: "STRATEGY_PAUSE", outcome: "APPLIED", priorState: prior, resultingState: resulting });
+    expect(pauseTier(instanceIn("RUNNING"), instanceIn("PAUSED"))).toBe("SAFETY_DIRECTION");
+    expect(pauseTier(instanceIn("PAUSED"), instanceIn("PAUSED"))).toBe("ORDINARY");
+    expect(pauseTier({ known: "false", instanceId: "sb-1" }, instanceIn("PAUSED"))).toBe("ORDINARY");
+    expect(pauseTier(instanceIn("RUNNING"), instanceIn("RUNNING"))).toBe("ORDINARY");
+  });
+
+  it("through the sink: once the ordinary tier is full, a repeat or a weakening engage is REFUSED while an escalation and a new switch still fit", async () => {
+    const { log, sink } = createBudgetedAuditLog({ capacity: 6, safetyReserve: 2 });
+    for (let index = 0; index < 2; index += 1) expect((await sink.append(ordinary())).ok).toBe(true);
+    // The ordinary tier (C − 2R = 2) is full.
+    const repeat = record("KILL_SWITCH_ENGAGE", "APPLIED", switchAt("HALT_NEW_ENTRIES"), switchAt("HALT_NEW_ENTRIES"));
+    const weakening = record("KILL_SWITCH_ENGAGE", "APPLIED", switchAt("FULL_HALT"), switchAt("CANCEL_ALL"));
+    const unordered = record("KILL_SWITCH_ENGAGE", "APPLIED", switchAt("CANCEL_ALL"), switchAt("HALT_NEW_ENTRIES"));
+    for (const refused of [repeat, weakening, unordered]) {
+      expect(await sink.append(refused)).toMatchObject({ ok: false, code: "AUDIT_CAPACITY_EXHAUSTED" });
+    }
+    const escalation = record("KILL_SWITCH_ENGAGE", "APPLIED", switchAt("HALT_NEW_ENTRIES"), switchAt("FULL_HALT"));
+    expect((await sink.append(escalation)).ok).toBe(true);
+    expect((await sink.append(engage())).ok).toBe(true);
+    expect(log.size).toBe(4);
   });
 });
 

@@ -9,7 +9,9 @@
  * - **L-2** `POST /v1/strategies/a%2Fb/pause` answered `200` and audited the
  *   `scopeRef` `a/b`.
  * - **L-3** a body declared `text/plain`, or with no content type at all, was
- *   parsed as JSON and acted on.
+ *   parsed as JSON and acted on. (`CONTROL-1` r1 moved the 415's ANSWER behind
+ *   authorization, so an authorized operator's refusal is audited —
+ *   `authorized-refusals-audited.test.ts`.)
  * - **L-4** `POST /v1/run-state` answered `404 CONTROL_NO_SUCH_ROUTE`.
  * - **L-6** `NOT_AUDITED` was never asserted on the wire (`WP-240` r1's
  *   mutation M5 survived every unit test).
@@ -60,12 +62,16 @@ describe("L-1: a malformed route parameter is a 400, not a contained 500", () =>
     });
     expect(response.status).toBe(400);
     expect((response.json() as Record<string, unknown>)["code"]).toBe("CONTROL_INVALID_ROUTE_PARAMETER");
-    expect(api.audit.records()).toEqual([]);
+    // `CONTROL-1` r1 (CONTROL1-J-M2): the authorized operator's refusal is
+    // audited, against NO scopeRef — the id never passed its door.
+    expect(api.audit.records().map((record) => `${record.action}|${record.outcome}|${String(record.scopeRef)}`)).toEqual([
+      "STRATEGY_PAUSE|REFUSED|null",
+    ]);
   });
 });
 
 describe("L-2: %2F cannot re-admit '/' into an instance id or an audit scopeRef", () => {
-  it("POST /v1/strategies/a%2Fb/pause → 400, nothing audited, nothing inserted", async () => {
+  it("POST /v1/strategies/a%2Fb/pause → 400, audited with NO scopeRef (never 'a/b'), nothing inserted", async () => {
     const api = await start();
     api.controlPlane.register("a", "2026-09-05T00:00:00.000Z");
     const response = await api.call("POST", "/v1/strategies/a%2Fb/pause", {
@@ -74,7 +80,8 @@ describe("L-2: %2F cannot re-admit '/' into an instance id or an audit scopeRef"
     });
     expect(response.status).toBe(400);
     expect(String((response.json() as Record<string, unknown>)["detail"])).toContain("'/'");
-    expect(api.audit.records()).toEqual([]);
+    expect(api.audit.records().map((record) => record.scopeRef)).toEqual([null]);
+    expect(JSON.stringify(api.audit.records())).not.toContain("a/b");
     expect(api.controlPlane.strategies().every((entry) => !entry.instanceId.includes("/"))).toBe(true);
     expect(api.controlPlane.strategies().map((entry) => `${entry.instanceId}:${entry.state}`)).toEqual([
       "a:RUNNING",
@@ -110,7 +117,15 @@ describe("L-3: a body must be declared application/json", () => {
     expect(response.status).toBe(415);
     expect((response.json() as Record<string, unknown>)["code"]).toBe("CONTROL_UNSUPPORTED_MEDIA_TYPE");
     expect(api.controlPlane.strategies()[0]?.state).toBe("RUNNING");
-    expect(api.audit.records()).toEqual([]);
+    // `CONTROL-1` r1 (CONTROL1-J-M2): the 415 is answered after authorization,
+    // and the authorized operator's refusal is audited.
+    expect(api.audit.records().map((record) => `${record.action}|${record.outcome}|${String(record.scopeRef)}`)).toEqual([
+      "STRATEGY_PAUSE|REFUSED|sb-1",
+    ]);
+    expect(api.audit.records()[0]?.resultingState).toMatchObject({
+      refusedAt: "TRANSPORT",
+      refusalCode: "CONTROL_UNSUPPORTED_MEDIA_TYPE",
+    });
   });
 
   it.each([

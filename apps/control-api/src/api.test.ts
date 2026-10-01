@@ -333,14 +333,27 @@ describe("strategy controls", () => {
     expect(parse(paused)["auditRecordId"]).toBe(audit.records()[0]?.recordId);
   });
 
-  it("REFUSES a request with no reason: §14.1 requires one", async () => {
-    const { api, audit } = createHarness();
+  it("REFUSES a request with no reason: §14.1 requires one — and AUDITS the refusal (CONTROL-1 r1)", async () => {
+    const { api, audit, controlPlane } = createHarness();
+    controlPlane.register("sb-1", "2026-09-05T00:00:00.000Z");
     const response = await api.handle(
       request({ method: "POST", path: "/v1/strategies/sb-1/pause", body: {} }),
     );
     expect(response.status).toBe(400);
     expect(parse(response)["code"]).toBe("CONTROL_REQUEST_INVALID");
-    expect(audit.records()).toEqual([]);
+    // `CONTROL1-J-M2`: the caller authenticated and holds STRATEGY_CONTROL, so
+    // its refusal is an operator fact — recorded, and nothing changed.
+    expect(audit.records()).toHaveLength(1);
+    expect(audit.records()[0]).toMatchObject({
+      action: "STRATEGY_PAUSE",
+      outcome: "REFUSED",
+      actor: "operator-a",
+      scope: "STRATEGY_INSTANCE",
+      scopeRef: "sb-1",
+      priorState: { refusedAt: "REQUEST_BODY", stateRead: "false" },
+      resultingState: { refusedAt: "REQUEST_BODY", refusalCode: "CONTROL_REQUEST_INVALID" },
+    });
+    expect(controlPlane.strategies()[0]?.state).toBe("RUNNING");
   });
 
   it("REFUSES an unknown key in the body: the grammar is closed", async () => {
@@ -377,17 +390,27 @@ describe("CONTROL-1: the strategy route parameter goes through its own door", ()
     );
     expect(response.status).toBe(400);
     expect(parse(response)["code"]).toBe("CONTROL_INVALID_ROUTE_PARAMETER");
-    expect(audit.records()).toEqual([]);
+    // `CONTROL-1` r1 (CONTROL1-J-M2): an AUTHORIZED caller's refusal is audited —
+    // against no scopeRef, since the id never passed its door.
+    expect(audit.records()).toHaveLength(1);
+    expect(audit.records()[0]).toMatchObject({
+      action: "STRATEGY_PAUSE",
+      outcome: "REFUSED",
+      scope: "STRATEGY_INSTANCE",
+      scopeRef: null,
+      resultingState: { refusedAt: "ROUTE_PARAMETER", refusalCode: "CONTROL_INVALID_ROUTE_PARAMETER" },
+    });
   });
 
-  it("L-2: refuses an id whose %2F decodes to '/', and writes nothing — not even a refusal with that scopeRef", async () => {
+  it("L-2: refuses an id whose %2F decodes to '/' — its refusal is audited with NO scopeRef, never 'a/b'", async () => {
     const { api, audit, controlPlane } = createHarness();
     const response = await api.handle(
       request({ method: "POST", path: "/v1/strategies/a%2Fb/pause", body: { reason: "slash" } }),
     );
     expect(response.status).toBe(400);
     expect(parse(response)["code"]).toBe("CONTROL_INVALID_ROUTE_PARAMETER");
-    expect(audit.records()).toEqual([]);
+    expect(audit.records().map((record) => record.scopeRef)).toEqual([null]);
+    expect(JSON.stringify(audit.records())).not.toContain("a/b");
     expect(controlPlane.strategies()).toEqual([]);
   });
 
