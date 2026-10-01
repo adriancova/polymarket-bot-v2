@@ -58,6 +58,7 @@
 import {
   DATASET_MANIFEST_DIGEST_OBJECT_NAME,
   DATASET_MANIFEST_OBJECT_NAME,
+  DATASET_MANIFEST_VERSION,
   DATASET_RETENTION_RECEIPT_OBJECT_NAME,
   DEFAULT_MAX_LISTED_DUPLICATE_KEYS,
   DEFAULT_MAX_RECORD_BYTES,
@@ -162,6 +163,17 @@ export type CompactionOptions = {
   readonly maxTotalBatchBytes?: number;
   readonly maxListedDuplicateKeys?: number;
   /**
+   * The dataset-manifest version to write. Defaults to the version this build
+   * writes (2, with `fidelity: "exact"`; ADR-029 Decision 1).
+   *
+   * Version 1 is accepted **only** so a committed version 1 fixture stays
+   * reproducible byte for byte (ADR-029 Consequences: "Version 1 fixtures and
+   * goldens stay version 1 and keep passing"). Its bytes are exactly what
+   * `WP-130` wrote; it reads as exact (Decision 1.3). A production caller
+   * never sets it.
+   */
+  readonly datasetManifestVersion?: 1 | 2;
+  /**
    * Segments to consider. Defaults to every segment with a sidecar manifest.
    *
    * A caller that compacts incrementally passes the segments it has not
@@ -249,6 +261,13 @@ export async function compactWalDirectory(
     options.maxListedDuplicateKeys ?? DEFAULT_MAX_LISTED_DUPLICATE_KEYS;
   const codec: DatasetCodec = options.codec ?? "UNCOMPRESSED";
   const rowGroupSize = options.rowGroupSize ?? DEFAULT_ROW_GROUP_SIZE;
+  const datasetManifestVersion = options.datasetManifestVersion ?? DATASET_MANIFEST_VERSION;
+  if (datasetManifestVersion !== 1 && datasetManifestVersion !== DATASET_MANIFEST_VERSION) {
+    throw new CompactionConfigurationError("datasetManifestVersion must be 1 or 2", {
+      datasetManifestVersion,
+    });
+  }
+  const schemaVersions = currentSchemaVersions(datasetManifestVersion);
 
   if (options.datasetId.length === 0) {
     throw new CompactionConfigurationError("datasetId must not be empty");
@@ -464,10 +483,10 @@ export async function compactWalDirectory(
       rowGroupSize,
       keyValueMetadata: {
         "polymarket-bot.datasetId": options.datasetId,
-        "polymarket-bot.parquetLayoutId": currentSchemaVersions().parquetLayoutId,
+        "polymarket-bot.parquetLayoutId": schemaVersions.parquetLayoutId,
         "polymarket-bot.segmentId": segment.segmentId,
         "polymarket-bot.segmentSha256": segment.manifest.segmentSha256,
-        "polymarket-bot.walFormatId": currentSchemaVersions().walFormatId,
+        "polymarket-bot.walFormatId": schemaVersions.walFormatId,
       },
     });
 
@@ -563,11 +582,14 @@ export async function compactWalDirectory(
   ].sort();
 
   const manifest: DatasetManifest = {
-    datasetManifestFormatId: currentSchemaVersions().datasetManifestFormatId,
-    datasetManifestVersion: currentSchemaVersions().datasetManifestVersion,
+    datasetManifestFormatId: schemaVersions.datasetManifestFormatId,
+    datasetManifestVersion: schemaVersions.datasetManifestVersion,
+    // ADR-029 Decision 1: a compaction of raw WAL is exact. Written into the
+    // document for version 2; implied for version 1.
+    fidelity: "exact",
     datasetId: options.datasetId,
     createdAt: new Date(options.clock.nowMs()).toISOString(),
-    schemaVersions: currentSchemaVersions(),
+    schemaVersions,
     writer: {
       library: PARQUET_WRITER_LIBRARY,
       libraryVersion: PARQUET_WRITER_LIBRARY_VERSION,
@@ -669,6 +691,7 @@ export async function compactWalDirectory(
         });
         deletedSegmentIds.push(entry.segmentId);
         deletions.push({
+          basis: "verified-upload",
           segmentId: entry.segmentId,
           verifiedObjectKey: verifiedObject.key,
           verifiedObjectSha256: verifiedObject.sha256,
@@ -700,6 +723,8 @@ export async function compactWalDirectory(
       datasetId: options.datasetId,
       datasetManifestObjectKey: manifestObjectKey,
       datasetManifestSha256: manifestSha256,
+      expiryPlanId: null,
+      expiryPlanSha256: null,
       walRetentionPolicy: retention.policyName,
       completedAt: new Date(options.clock.nowMs()).toISOString(),
       deletedSegments: deletions,

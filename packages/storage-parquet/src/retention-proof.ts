@@ -46,6 +46,7 @@ import type { DatasetManifest } from "./dataset-manifest.js";
 import { RetentionGuardError } from "./errors.js";
 import { readParquetObject } from "./parquet-object.js";
 import type { ObjectStore, SegmentDeletionRequest } from "./ports.js";
+import { parseStrictJsonBytes } from "./strict-json.js";
 import { encodeFrameLine, sha256Hex } from "./wal-format.js";
 
 /** What {@link verifyRetentionProof} needs beyond the request itself. */
@@ -104,7 +105,9 @@ async function fetchVerifiedManifest(
   }
 
   try {
-    return parseDatasetManifest(JSON.parse(Buffer.from(manifestBytes).toString("utf8")));
+    // ADR-017 §3: the strict-JSON profile. This guard also re-reads every pin
+    // manifest on the expired-after-extract path (`expiry-proof.ts`).
+    return parseDatasetManifest(parseStrictJsonBytes(manifestBytes));
   } catch (error) {
     return refuse("the persisted dataset manifest could not be parsed", {
       segmentId: request.segmentId,

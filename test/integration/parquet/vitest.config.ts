@@ -10,9 +10,12 @@
  *     through two independent implementations, so it is slower than the unit
  *     suite and must not run inside `pnpm test`.
  *
- * **It needs no Docker.** The object-storage boundary is an injected port and
- * its v1 implementation is a local directory, so there is nothing to emulate —
- * adding a container here would buy a slower suite and no additional assurance.
+ * **It needs no Docker, except one file.** The object-storage boundary is an
+ * injected port and its v1 implementation is a local directory, so there is
+ * nothing to emulate. The exception (`STORAGE-1`) is
+ * `trader-evidence-postgres.test.ts`: the window classifier reads the
+ * trader's rows through a read-only PostgreSQL adapter, and only a real,
+ * migrated PostgreSQL can reject a wrong column name.
  *
  * Files under `test/` sit outside every workspace package, so a bare workspace
  * import has no `node_modules` to resolve through. The aliases below map the
@@ -63,13 +66,24 @@ export default defineConfig({
         find: /^@polymarket-bot\/research-worker$/u,
         replacement: resolve(repoRoot, "apps/research-worker/src/index.ts"),
       },
+      // STORAGE-1: the classifier's read-only PostgreSQL adapter is tested
+      // against a real, migrated PostgreSQL (one file of this suite).
+      {
+        find: /^@polymarket-bot\/storage-postgres\/testing$/u,
+        replacement: resolve(repoRoot, "packages/storage-postgres/src/testing/index.ts"),
+      },
+      {
+        find: /^@polymarket-bot\/storage-postgres$/u,
+        replacement: resolve(repoRoot, "packages/storage-postgres/src/index.ts"),
+      },
     ],
   },
   test: {
     root: repoRoot,
     include: ["test/integration/parquet/**/*.test.ts"],
     testTimeout: 60_000,
-    hookTimeout: 60_000,
+    // The PostgreSQL container of `trader-evidence-postgres.test.ts`.
+    hookTimeout: 180_000,
     passWithNoTests: false,
   },
 });

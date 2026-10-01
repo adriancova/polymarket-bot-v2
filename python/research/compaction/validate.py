@@ -115,11 +115,14 @@ from research.compaction.manifest import (
     ManifestError,
     PARQUET_LAYOUT_ID,
     PARQUET_LAYOUT_VERSION,
+    READABLE_RETENTION_RECEIPT_VERSIONS,
+    RESEARCH_TIER_LAYOUT_ID,
+    RESEARCH_TIER_LAYOUT_VERSION,
     RETENTION_RECEIPT_FORMAT_ID,
     RETENTION_RECEIPT_OBJECT_NAME,
-    RETENTION_RECEIPT_VERSION,
+    ResearchTierManifest,
     decode_utf8,
-    load_manifest,
+    load_any_manifest,
     parse_strict_json,
 )
 
@@ -1488,10 +1491,15 @@ def _check_retention_receipt(
             {"formatId": document.get("retentionReceiptFormatId")},
         )
         return
-    if document.get("retentionReceiptVersion") != RETENTION_RECEIPT_VERSION:
+    receipt_version = document.get("retentionReceiptVersion")
+    if (
+        not isinstance(receipt_version, int)
+        or isinstance(receipt_version, bool)
+        or receipt_version not in READABLE_RETENTION_RECEIPT_VERSIONS
+    ):
         broken(
             "retention receipt version is not readable by this build",
-            {"version": document.get("retentionReceiptVersion")},
+            {"version": receipt_version},
         )
         return
     if document.get("datasetId") != manifest.dataset_id:
@@ -1525,6 +1533,25 @@ def _check_retention_receipt(
             broken("retention receipt lists a malformed deletion entry", {"entry": str(entry)})
             continue
         segment_id = entry["segmentId"]
+        # ADR-028 Decision 4: a version 2 entry names its basis; a version 1
+        # entry has none and reads as `verified-upload`. A compacted dataset's
+        # own receipt can only report deletions licensed by the dataset's
+        # verified objects — `expired-after-extract` deletions are reported
+        # by an expiry run's receipt, which names its plan, not a dataset.
+        basis = entry.get("basis") if receipt_version == 2 else "verified-upload"
+        if receipt_version == 1 and "basis" in entry:
+            broken(
+                "a version 1 retention receipt entry carries a basis field",
+                {"segmentId": segment_id},
+            )
+            continue
+        if basis != "verified-upload":
+            broken(
+                f"retention receipt entry for segment {segment_id} has basis {basis!r}; "
+                "a compacted dataset's receipt reports verified-upload deletions only",
+                {"segmentId": segment_id, "basis": basis},
+            )
+            continue
         segment = pinned_segments.get(segment_id)
         if segment is None:
             broken(
@@ -1579,6 +1606,202 @@ def _check_retention_receipt(
                     details={"objectKey": segment.object_key},
                 )
             )
+
+
+def _validate_research_tier(
+    manifest_file: Path, manifest: ResearchTierManifest, root: Path
+) -> ValidationReport:
+    """Validate an approximate (research-tier) dataset (``STORAGE-1``).
+
+    The checks that apply to every dataset apply here too — every pinned
+    object present with its pinned length and digest, the digest sidecar
+    backing the manifest's bytes — plus what an approximate dataset promises:
+
+    - **its class is stated** (ADR-029 Decision 4.2): ``fidelity`` is
+      ``approximate`` and the admissibility statement says so;
+    - **its layout is the pinned one**: each object holds exactly its table's
+      pinned columns, in order, with the pinned types and repetitions, and the
+      declared row count;
+    - **every source segment pins both digests** in their grammar (Decision
+      1.5; the values describe files that may since have expired, so they are
+      carried, never re-verified here);
+    - **it replays in arrival order** (Decision 5.3): sample ordinals are
+      dense and unique across all objects, every sample carries the dataset's
+      one epoch, and, read in ordinal order, the release frames' ``ingestSeq``
+      never goes backwards — compared as canonical decimal strings, never
+      cast.
+    """
+    findings: list[ValidationFinding] = []
+
+    def error(check: str, message: str, details: dict[str, Any] | None = None) -> None:
+        findings.append(ValidationFinding(check, "error", message, details or {}))
+
+    if manifest.fidelity != "approximate" or not manifest.admissibility.startswith("approximate"):
+        error(
+            "fidelity-label",
+            "a research-tier manifest must state fidelity approximate and an approximate "
+            "admissibility statement (ADR-029 Decision 4.2)",
+        )
+    if (
+        manifest.layout_id != RESEARCH_TIER_LAYOUT_ID
+        or manifest.layout_version != RESEARCH_TIER_LAYOUT_VERSION
+    ):
+        error(
+            "layout-id",
+            "manifest pins a research-tier layout this validator does not implement",
+            {"layoutId": manifest.layout_id, "layoutVersion": manifest.layout_version},
+        )
+    _check_manifest_digest(manifest_file, findings)
+    for segment in manifest.source_segments:
+        for name, value in (
+            ("segmentSha256", segment.segment_sha256),
+            ("segmentFileSha256", segment.segment_file_sha256),
+        ):
+            if not _SHA256_HEX.match(value):
+                error(
+                    "source-segment-digest-grammar",
+                    f"source segment {segment.segment_id} pins a malformed {name}",
+                    {"segmentId": segment.segment_id, "field": name},
+                )
+        if segment.gateway_epoch != manifest.gateway_epoch:
+            error(
+                "source-segment-epoch",
+                f"source segment {segment.segment_id} belongs to another gateway epoch",
+                {"segmentId": segment.segment_id},
+            )
+
+    pinned_files = [
+        (entry.object_key, entry.byte_length, entry.sha256) for entry in manifest.objects
+    ] + [
+        (
+            manifest.sampler_state_out.object_key,
+            manifest.sampler_state_out.byte_length,
+            manifest.sampler_state_out.sha256,
+        )
+    ]
+    available: set[str] = set()
+    for object_key, byte_length, sha256 in pinned_files:
+        path = _object_path(root, object_key)
+        if not path.is_file():
+            error("object-present", f"pinned object is missing: {object_key}", {"objectKey": object_key})
+            continue
+        try:
+            observed_length = path.stat().st_size
+            observed_digest = _sha256_file(path)
+        except OSError as failure:
+            error("object-read", f"pinned object could not be read: {object_key}", {"error": str(failure)})
+            continue
+        if observed_length != byte_length:
+            error("object-length", f"object length differs from the manifest: {object_key}")
+        if observed_digest != sha256:
+            error("object-checksum", f"object SHA-256 differs from the manifest: {object_key}")
+        available.add(object_key)
+
+    tables = {table.table: table for table in manifest.tables}
+    rows_checked = 0
+    connection = duckdb.connect()
+    try:
+        ordinal_paths: list[str] = []
+        for entry in manifest.objects:
+            if entry.object_key not in available:
+                continue
+            table = tables.get(entry.table)
+            if table is None:
+                error("layout-table", f"object {entry.object_key} names an unpinned table {entry.table}")
+                continue
+            path = str(_object_path(root, entry.object_key))
+            try:
+                described = connection.execute(
+                    "describe select * from read_parquet($path)", {"path": path}
+                ).fetchall()
+            except duckdb.Error as failure:
+                error("object-parquet", f"pinned object does not decode as Parquet: {entry.object_key}", {"error": str(failure)})
+                continue
+            unknown = sorted({t for _n, t, _x in table.columns if t not in _DUCKDB_TYPE_BY_PHYSICAL_TYPE})
+            if unknown:
+                error("layout-column-type", "a table pins an unknown physical type", {"unknown": unknown})
+                continue
+            observed = [(row[0], row[1]) for row in described]
+            expected = [(n, _DUCKDB_TYPE_BY_PHYSICAL_TYPE[t]) for n, t, _x in table.columns]
+            if observed != expected:
+                error(
+                    "layout-columns",
+                    f"object {entry.object_key} does not carry its table's pinned columns",
+                    {"expected": expected, "observed": observed},
+                )
+                continue
+            leaves = connection.execute(
+                "select name, repetition_type from parquet_schema($path) where num_children is null",
+                {"path": path},
+            ).fetchall()
+            pinned_nullable = {n: x for n, _t, x in table.columns}
+            for name, repetition in leaves:
+                wanted = "OPTIONAL" if pinned_nullable.get(name) else "REQUIRED"
+                if name in pinned_nullable and repetition != wanted:
+                    error(
+                        "layout-column-nullability",
+                        f"object {entry.object_key} column {name} is {repetition}, pinned {wanted}",
+                    )
+            row_count = connection.execute(
+                "select count(*) from read_parquet($path)", {"path": path}
+            ).fetchone()[0]
+            rows_checked += row_count
+            if row_count != entry.row_count:
+                error(
+                    "object-row-count",
+                    f"object row count differs from the manifest: {entry.object_key}",
+                    {"expected": entry.row_count, "observed": row_count},
+                )
+            ordinal_paths.append(path)
+
+        if ordinal_paths and not any(f.check.startswith("layout-") for f in findings):
+            union = " union all ".join(
+                f"select sampleOrdinal, gatewayEpoch, releaseIngestSeq from read_parquet($p{i})"
+                for i in range(len(ordinal_paths))
+            )
+            parameters = {f"p{i}": path for i, path in enumerate(ordinal_paths)}
+            rows = connection.execute(
+                f"select sampleOrdinal, gatewayEpoch, releaseIngestSeq from ({union}) order by sampleOrdinal",
+                parameters,
+            ).fetchall()
+            if len(rows) != manifest.samples_written:
+                error(
+                    "sample-count",
+                    "samples differ from recordCounts.samplesWritten",
+                    {"expected": manifest.samples_written, "observed": len(rows)},
+                )
+            previous: str | None = None
+            for index, (ordinal, epoch, seq) in enumerate(rows):
+                if ordinal != index:
+                    error("sample-ordinals", "sample ordinals are not dense and unique", {"at": index, "observed": ordinal})
+                    break
+                if epoch != manifest.gateway_epoch:
+                    error("sample-epoch", "a sample carries another gateway epoch", {"sampleOrdinal": ordinal})
+                    break
+                if not isinstance(seq, str) or not _CANONICAL_UNSIGNED.match(seq) or len(seq) > _MAX_SEQ_DIGITS:
+                    error("sample-release-grammar", "a sample's releaseIngestSeq is not canonical", {"sampleOrdinal": ordinal})
+                    break
+                if previous is not None and (len(seq), seq) < (len(previous), previous):
+                    error(
+                        "sample-release-order",
+                        "samples would replay out of release order (ADR-029 Decision 5.3)",
+                        {"sampleOrdinal": ordinal, "releaseIngestSeq": seq, "previous": previous},
+                    )
+                    break
+                previous = seq
+    except duckdb.Error as failure:
+        error("validator-query", "a DuckDB query failed during research-tier validation", {"error": str(failure)})
+    finally:
+        connection.close()
+
+    return ValidationReport(
+        dataset_id=manifest.dataset_id,
+        manifest_path=str(manifest_file),
+        object_root=str(root),
+        objects_checked=len(available),
+        rows_checked=rows_checked,
+        findings=tuple(findings),
+    )
 
 
 def _infer_object_root(manifest_file: Path, manifest: DatasetManifest) -> Path:
@@ -1643,7 +1866,18 @@ def validate_dataset(
     compactor wrote into.
     """
     manifest_file = Path(manifest_path).resolve()
-    manifest = load_manifest(manifest_file)
+    any_manifest = load_any_manifest(manifest_file)
+
+    if isinstance(any_manifest, ResearchTierManifest):
+        if object_root is None:
+            prefix_parts = Path(any_manifest.sampler_state_out.object_key).parent.parts
+            research_root = manifest_file.parent
+            for _ in prefix_parts:
+                research_root = research_root.parent
+        else:
+            research_root = Path(object_root).resolve()
+        return _validate_research_tier(manifest_file, any_manifest, research_root)
+    manifest = any_manifest
 
     if object_root is None:
         root = _infer_object_root(manifest_file, manifest)

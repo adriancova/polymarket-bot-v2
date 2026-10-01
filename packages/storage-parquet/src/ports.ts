@@ -10,6 +10,8 @@
  * adapter against {@link ObjectStore}.
  */
 
+import type { ExpiryDeletionRequest, ExpiryProofOutcome } from "./expiry-proof.js";
+
 /** Time source. Wall clock for timestamps, monotonic clock for durations. */
 export interface CompactionClock {
   /** Wall-clock milliseconds since the Unix epoch. */
@@ -65,6 +67,17 @@ export interface ObjectStore {
   head(key: string): Promise<ObjectHead | null>;
   /** Fetch an object's bytes. Rejects when the key does not exist. */
   get(key: string): Promise<Uint8Array>;
+  /**
+   * The names directly under a key prefix: every `name` for which some key is
+   * `${prefix}/${name}` or starts with `${prefix}/${name}/`, sorted; `[]` when
+   * nothing is under it.
+   *
+   * Optional, and used by no compactor path: `STORAGE-1`'s expiry needs it to
+   * enumerate EVERY extracted pin, not only the pins one cycle derives
+   * (ADR-028 Decision 2.4). A store without it cannot back that expiry: the
+   * planner keeps every segment.
+   */
+  list?(prefix: string): Promise<readonly string[]>;
 }
 
 /**
@@ -159,6 +172,47 @@ export function retainAllWalSegments(): WalSegmentRetention {
     },
   };
 }
+
+/**
+ * Deletion of WAL segments under ADR-028's **expired-after-extract** basis.
+ *
+ * A separate capability from {@link WalSegmentRetention}, on purpose: the
+ * `WP-130` basis deletes a segment whose every record is in a verified object,
+ * while this one deletes a segment whose records are kept only as the
+ * research tier and the pins that overlap it. A deployment grants each
+ * explicitly, and neither is the default.
+ *
+ * An implementation must apply `verifyExpiryProof` (`expiry-proof.ts`) to the
+ * exact bytes it is about to unlink, and must refuse a WAL directory that has
+ * not opted in (`node-file-system.ts`). It removes the segment, then its
+ * sidecar manifest, as `deleteAfterVerifiedUploadRetention` does.
+ */
+export interface ExpiredSegmentDeletion {
+  /** Recorded in the retention receipt. */
+  readonly policyName: string;
+  /**
+   * Re-verify the proof against the store and the file, then delete the
+   * segment and its sidecar manifest. Throws `RetentionGuardError` (and
+   * deletes nothing) when the proof fails.
+   */
+  deleteExpiredSegment(
+    walDirectoryPath: string,
+    request: ExpiryDeletionRequest,
+    options?: ExpiredSegmentDeletionOptions,
+  ): Promise<ExpiryProofOutcome>;
+}
+
+/** What a caller may add to one expired-after-extract deletion. */
+export type ExpiredSegmentDeletionOptions = {
+  /**
+   * The caller's last word, run AFTER the proof has verified and
+   * IMMEDIATELY before the unlink, with nothing awaited in between: it throws
+   * (and nothing is deleted) when the segment must now be kept. The research
+   * worker re-reads the operator's pins here (ADR-028 Decision 2.5 must hold
+   * at the unlink, not only when the plan was made).
+   */
+  readonly beforeUnlink?: () => Promise<void>;
+};
 
 /** A segment was read and fully verified. */
 export type SegmentVerifiedEvent = {

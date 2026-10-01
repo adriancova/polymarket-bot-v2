@@ -53,14 +53,18 @@
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 
 import {
+  DATASET_FIDELITIES,
   DATASET_MANIFEST_FORMAT_ID,
   DATASET_MANIFEST_VERSION,
+  DATASET_MANIFEST_VERSION_1,
   PARQUET_LAYOUT_ID,
+  READABLE_DATASET_MANIFEST_VERSIONS,
   PARQUET_LAYOUT_VERSION,
   SUPPORTED_WAL_MANIFEST_VERSION,
   SUPPORTED_WAL_SCHEMA_VERSION,
   WAL_FORMAT_ID,
 } from "./constants.js";
+import type { DatasetFidelity } from "./constants.js";
 import { DatasetManifestError } from "./errors.js";
 import type { IncidentWindow } from "./incidents.js";
 import { DATASET_COLUMNS } from "./parquet-layout.js";
@@ -210,10 +214,20 @@ export type DatasetColumnPin = {
   readonly nullable: boolean;
 };
 
-/** The immutable description of one compacted dataset. */
+/**
+ * The immutable description of one compacted (exact) dataset.
+ *
+ * `fidelity` is always `exact` here. A version 2 document states it; a
+ * version 1 document has no such field, and {@link parseDatasetManifest}
+ * reads it as `exact` (ADR-029 Decision 1.3), so in memory the field is always
+ * present. {@link encodeDatasetManifest} writes it only for version 2, which is
+ * what keeps a version 1 manifest's bytes — and therefore its digest — exactly
+ * what `WP-130` wrote.
+ */
 export type DatasetManifest = {
   readonly datasetManifestFormatId: string;
   readonly datasetManifestVersion: number;
+  readonly fidelity: "exact";
   readonly datasetId: string;
   readonly createdAt: string;
   readonly schemaVersions: DatasetSchemaVersions;
@@ -259,8 +273,18 @@ export function emptyReplayPins(overrides: Partial<ReplayPins> = {}): ReplayPins
   };
 }
 
-/** The schema versions this build pins. */
-export function currentSchemaVersions(): DatasetSchemaVersions {
+/**
+ * The schema versions this build pins.
+ *
+ * `datasetManifestVersion` defaults to the version this build writes. The
+ * compactor can still be asked for version 1 (`CompactionOptions`), which
+ * exists only so a committed version 1 fixture stays reproducible byte for
+ * byte (ADR-029 Consequences: "Version 1 fixtures and goldens stay version 1
+ * and keep passing").
+ */
+export function currentSchemaVersions(
+  datasetManifestVersion: 1 | 2 = DATASET_MANIFEST_VERSION,
+): DatasetSchemaVersions {
   return {
     walFormatId: WAL_FORMAT_ID,
     walSchemaVersion: SUPPORTED_WAL_SCHEMA_VERSION,
@@ -268,7 +292,7 @@ export function currentSchemaVersions(): DatasetSchemaVersions {
     parquetLayoutId: PARQUET_LAYOUT_ID,
     parquetLayoutVersion: PARQUET_LAYOUT_VERSION,
     datasetManifestFormatId: DATASET_MANIFEST_FORMAT_ID,
-    datasetManifestVersion: DATASET_MANIFEST_VERSION,
+    datasetManifestVersion,
   };
 }
 
@@ -288,9 +312,27 @@ export function currentColumnPins(): readonly DatasetColumnPin[] {
  * so a refactor cannot silently change the bytes and therefore the digest.
  */
 export function encodeDatasetManifest(manifest: DatasetManifest): Uint8Array {
+  if (
+    manifest.datasetManifestVersion !== DATASET_MANIFEST_VERSION_1 &&
+    manifest.datasetManifestVersion !== DATASET_MANIFEST_VERSION
+  ) {
+    throw new DatasetManifestError("refusing to encode a dataset manifest version this build does not write", {
+      version: manifest.datasetManifestVersion,
+    });
+  }
+  if (manifest.fidelity !== "exact") {
+    throw new DatasetManifestError("an exact dataset manifest must state fidelity exact", {
+      fidelity: String(manifest.fidelity),
+    });
+  }
   const ordered = {
     datasetManifestFormatId: manifest.datasetManifestFormatId,
     datasetManifestVersion: manifest.datasetManifestVersion,
+    // ADR-029 Decision 1.1/1.6: required in version 2, absent in version 1
+    // (whose bytes must stay exactly what `WP-130` wrote).
+    ...(manifest.datasetManifestVersion === DATASET_MANIFEST_VERSION_1
+      ? {}
+      : { fidelity: manifest.fidelity }),
     datasetId: manifest.datasetId,
     createdAt: manifest.createdAt,
     schemaVersions: {
@@ -433,26 +475,85 @@ function requireObject(value: unknown, what: string): Record<string, unknown> {
 }
 
 /**
- * Parse a manifest document, refusing a format or version this build cannot
- * read.
+ * The fidelity a dataset-manifest document declares, after the version rules
+ * of ADR-029 Decision 1:
  *
- * Deliberately shallow: it re-checks the identity fields and then trusts the
- * structure, because the caller who needs strong validation of the *contents*
- * is the DuckDB job in `python/research/compaction`, which checks the manifest
- * against the actual Parquet rather than against itself.
+ * - version 1 has **no** `fidelity` field and reads as `exact` (1.3); a
+ *   version 1 document that carries one is not a version 1 document and is
+ *   refused, because a reader that honoured it could be told that a raw-WAL
+ *   compaction is approximate, or worse, the reverse;
+ * - version 2 **requires** it (1.6), and it must be `exact` or `approximate`;
+ * - any other format id or version is refused by name.
+ *
+ * Exported so every reader in this package — and the retention guards that
+ * must refuse an approximate manifest as proof of a lossless archive — apply
+ * one rule.
  */
-export function parseDatasetManifest(value: unknown): DatasetManifest {
+export function readDatasetManifestFidelity(value: unknown): DatasetFidelity {
   const source = requireObject(value, "dataset manifest");
   const formatId = source["datasetManifestFormatId"];
   if (formatId !== DATASET_MANIFEST_FORMAT_ID) {
     throw new DatasetManifestError("dataset manifest declares an unknown format", { formatId });
   }
   const version = source["datasetManifestVersion"];
-  if (version !== DATASET_MANIFEST_VERSION) {
+  if (typeof version !== "number" || !READABLE_DATASET_MANIFEST_VERSIONS.includes(version)) {
     throw new DatasetManifestError("dataset manifest version is not readable by this build", {
       version,
-      supported: DATASET_MANIFEST_VERSION,
+      supported: [...READABLE_DATASET_MANIFEST_VERSIONS],
     });
   }
-  return source as unknown as DatasetManifest;
+  const hasFidelity = Object.prototype.hasOwnProperty.call(source, "fidelity");
+  if (version === DATASET_MANIFEST_VERSION_1) {
+    if (hasFidelity) {
+      throw new DatasetManifestError(
+        "a version 1 dataset manifest has no fidelity field; one that carries it is refused",
+        { version },
+      );
+    }
+    return "exact";
+  }
+  if (!hasFidelity) {
+    throw new DatasetManifestError(
+      "a version 2 dataset manifest must state its fidelity (ADR-029 Decision 1.6)",
+      { version },
+    );
+  }
+  const fidelity = source["fidelity"];
+  if (typeof fidelity !== "string" || !(DATASET_FIDELITIES as readonly string[]).includes(fidelity)) {
+    throw new DatasetManifestError("dataset manifest declares an unknown fidelity", {
+      fidelity: typeof fidelity === "string" ? fidelity : `(${typeof fidelity})`,
+      supported: [...DATASET_FIDELITIES],
+    });
+  }
+  return fidelity as DatasetFidelity;
+}
+
+/**
+ * Parse an **exact** dataset manifest — version 1 or version 2 — refusing a
+ * format or version this build cannot read, and refusing an approximate
+ * (research-tier) manifest.
+ *
+ * The refusal of `approximate` is deliberate: every caller of this function
+ * consumes a lossless archive — the retention guard proves a deletion against
+ * it, and an approximate dataset can prove nothing about bytes it does not
+ * hold (ADR-029 Decision 2). A caller that reads either class uses
+ * {@link parseAnyDatasetManifest}.
+ *
+ * Deliberately shallow beyond the identity and class fields: it re-checks them
+ * and then trusts the structure, because the caller who needs strong
+ * validation of the *contents* is the DuckDB job in
+ * `python/research/compaction`, which checks the manifest against the actual
+ * Parquet rather than against itself. A version 1 document is returned with
+ * `fidelity: "exact"` filled in, which is how it reads (ADR-029 Decision 1.3).
+ */
+export function parseDatasetManifest(value: unknown): DatasetManifest {
+  const fidelity = readDatasetManifestFidelity(value);
+  if (fidelity !== "exact") {
+    throw new DatasetManifestError(
+      "an approximate (research-tier) dataset manifest is not an exact dataset and cannot be read as one",
+      { fidelity },
+    );
+  }
+  const source = value as Record<string, unknown>;
+  return { ...source, fidelity: "exact" } as unknown as DatasetManifest;
 }
