@@ -47,6 +47,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `STORAGE-1b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `WP-300b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`CONTROL-1`**: Ready (authorized) 2026-10-01 by the orchestrator, under the Wave 3 authorization. It closes `CO2-N8`: `WP-240`'s M-1 (pausing an unknown instance) and M-3 (audit-log exhaustion can disable the kill switch), plus `WP-240`'s owned LOWs L-1..L-6, L-8, L-9 and N-4. Paths: `apps/control-api/**`, `test/integration/control-api/**`, `test/unit/control-api/**`. Verifiers: Opus and gpt-6-astra, reconciled (the kill switch). `CADENCE-1` also owns `apps/control-api/src/**`, so it starts only after `CONTROL-1` merges.
+- **`CO2-N1-ADR`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: ADR-031, **Proposed**, framing the design decision `CO2-N1` needs (live admission runs on event time) with options and a recommendation, for the user to rule. Paths: `docs/adr/ADR-031-*.md` (new) and its `docs/adr/README.md` row. Verifiers: Opus and gpt-6-astra, reconciled.
 - `STORAGE-GOV2` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`; its merge-ref CI is green (run `36874368278`). It merges only after the user ratifies ADR-023. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
@@ -176,6 +177,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Complete (2026-10-01) | `7b6499e` | [STORAGE-1b](docs/handoffs/STORAGE-1b.md) |
 | `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | **Ready (authorized)** 2026-10-01 | — | — |
+| `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | **Ready (authorized)** 2026-10-01 | — | — |
 | `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | Complete (2026-10-01) | `a428ba3` | [STORAGE-GOV2](docs/handoffs/STORAGE-GOV2.md) |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
