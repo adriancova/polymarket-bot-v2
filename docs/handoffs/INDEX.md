@@ -103,3 +103,9 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |
 | 2026-09-30 | [DURABLE-1.md](DURABLE-1.md) | `DURABLE-1`: a decision is durable before its order and ledger effects (`X1`) | Round | Complete (2026-09-30) | `6e01228` | 23 KB |
 | 2026-09-30 | [CLOSEOUT-2B-wave-2-regrade.md](CLOSEOUT-2B-wave-2-regrade.md) | `CLOSEOUT-2B`: focused re-grade of Wave 2 after `DURABLE-1` | Audit | WAVE 2 CLOSED WITH QUALIFICATIONS (with the user's CANCEL ruling) | — (an audit) | 13 KB |
+| 2026-09-30 | [LEAN-1.md](LEAN-1.md) | `LEAN-1`: a sub-$100/mo first deployment (plan and the user's rulings) | Governance | Planned; ruled H, A1-A5 | — (a plan) | 26 KB |
+| 2026-09-30 | [DEPS-2.md](DEPS-2.md) | `DEPS-2`: patch `@grpc/grpc-js` for GHSA-m9gg-hp2v-232j | Round | Complete (2026-09-30) | `c5967b4` | 1 KB |
+| 2026-09-30 | [WP-260.md](WP-260.md) | `WP-260`: secure unified-SDK adapter and signer boundary | WP | Complete (2026-09-30) | `32d10be` | 38 KB |
+| 2026-09-30 | [HOST-BENCH-PREP.md](HOST-BENCH-PREP.md) | `HOST-BENCH-PREP`: the laptop guide and host measurement tools | Round | Complete (2026-09-30) | `1710a86` | 23 KB |
+| 2026-09-30 | [CI-3.md](CI-3.md) | `CI-3`: run the secure-SDK contract suite in CI | Round | Complete (2026-09-30) | `a145fa4` | 1 KB |
+| 2026-09-30 | [LEAN-GOV.md](LEAN-GOV.md) | `LEAN-GOV`: ADR-025..030 and work-plan rows for the LEAN-1 rulings | Governance | Complete (2026-09-30) | `78ba39b` | 6 KB |

@@ -30,7 +30,8 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260` (the signer boundary), under dual verification. Then the work-plan chain. `THROUGHPUT-1c` runs alongside.
+- **Next:** `WP-260` is Complete. `THROUGHPUT-1c` is running. Wave 3 continues with `WP-270` and `WP-300`; `CO2-N1` must be fixed before `WP-270`. Then the `LEAN-1` track: `LEAN-GOV` (the ADRs), `STORAGE-1`, `HOST-BENCH`, then the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
 
@@ -39,8 +40,14 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
-- **`WP-260`**: Ready (authorized) 2026-09-30, under the user's Wave 3 authorization; both conditions hold. Goal: the secure unified-SDK adapter and signer boundary, pinned to `@polymarket/client` 0.11.0. PAPER only: no real key, signer or credential. Verifiers: Opus and gpt-6-astra, reconciled (user rule, 2026-09-30). Gate: the work plan's security review, and a green CI run on GitHub.
-- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29; startable now, because the Wave 2 closeout is done. It runs alongside Wave 3.
+- **`WP-300`**: Ready (authorized) 2026-09-30 under the Wave 3 authorization. Collateral inventory, reservations and a wallet-operation state machine, PAPER only (modelled; no signing, no transaction, no bridge or withdrawal). It reached its 6-round cap with astra alone (a new HIGH each round, in the wallet-operation state machine), so from 2026-10-01 it continues under dual verification (Opus and gpt-6-astra, reconciled): a stricter choice than the dual-scope rule requires.
+- **`STORAGE-1`**: Ready (authorized) 2026-09-30 (ADR-028 retention with pins, ADR-029 the approximate dataset class). Its dependency on `THROUGHPUT-1c` is lifted (disjoint test paths, recorded above); it starts now, under dual verification (it deletes raw evidence). **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
+- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. In its final review round (tip `26d1e91`); verifiers Opus and gpt-6-astra. It merges only after the user ratifies ADR-023.
+  - **Interim rulings (orchestrator, 2026-10-01), each the most conservative option, pending the user's ADR-023 ratification:**
+    - **ADR-023 D7: option (a)**, the process-lag guard, as implemented. Not (b), narrowing criterion B, and not (c), deferring the opt-in.
+    - **The Clock-port reading:** the guard's use of the `Clock` port is NOT a clock-semantics change. Every age stays in event time; the process clock can only remove the extension ADR-023 adds, never make a book fresher (ADR-023 D7). `CO2-N1` is unchanged.
+    - **The epoch taint (O-I1(ii)): kept coarse and fail-closed.** Any market-less incident taints the gateway epoch, with no source filter. Narrowing it, for example ignoring reference-venue incidents, would LOOSEN a fail-closed rule, so it is left to the user. Consequence: with a Binance feed the rule changes nothing until narrowed (ADR-023 §5).
+  - **Test-path ownership (2026-10-01):** `THROUGHPUT-1c`'s test grant is narrowed to the paths it has touched: `test/integration/paper-trader/**` and `test/unit/strategies/**` (plus tests inside its packages). This lifts `STORAGE-1`'s dependency on it, per the work plan's own clause; their test paths are disjoint.
   - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
   - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
   - Scope (2): end to end: a gateway liveness signal if one is needed, then features, strategy and risk freshness, with the strategy's parameter and version discipline.
@@ -149,7 +156,15 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CLOSEOUT-2` | fresh Wave 2 closeout audit (runbook §10) | Complete (2026-09-30): WAVE 2 NOT CLOSED, blocker `X1` | — (an audit; no merge) | [CLOSEOUT-2](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md) |
 | `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | Complete (2026-09-30) | `6e01228` | [DURABLE-1](docs/handoffs/DURABLE-1.md) |
 | `CLOSEOUT-2B` | focused re-grade of Wave 2 after `DURABLE-1` | Complete (2026-09-30): WAVE 2 CLOSED WITH QUALIFICATIONS, after the user's CANCEL ruling | — (an audit; no merge) | [CLOSEOUT-2B](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md) |
-| `WP-260` | Secure unified-SDK adapter and signer boundary | **Ready (authorized)** 2026-09-30 | — | — |
+| `WP-260` | Secure unified-SDK adapter and signer boundary | Complete (2026-09-30) | `32d10be` | [WP-260](docs/handoffs/WP-260.md) |
+| `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
+| `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
+| `WP-300` | Collateral inventory and wallet operations | **Ready (authorized)** 2026-09-30 (Wave 3) | — | — |
+| `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
+| `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | Complete (2026-09-30) | `78ba39b` | [LEAN-GOV](docs/handoffs/LEAN-GOV.md) |
+| `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
+| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | **Ready (authorized)** 2026-09-30 | — | — |
+| `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
@@ -247,7 +262,7 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | `R8-1` | Every `Object.defineProperty` outside `packages/risk`/`capital-allocator` still passes an ordinary descriptor literal, which throws under an inherited `get`. | the detector/tooling round (`§5 item 6`) |
 | `§5 item 6` | The detector/tooling round: a `.safeParse`-on-unmaterialized-value detector; alias/cast/indirection hardening for the census and source scans (folding in `WP-160` R1-N3, `WP-180` R9-1 and R8-2); and the F15/F16/F17 checker. Deliberately last, and deliberately not a CI gate today. | unassigned; the orchestrator authorizes it |
 
-Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `H1R1-FRAME-ATOMICITY` (closed by `THROUGHPUT-2`, `7d59fd3`: it evaluates once per frame. ADR-024 is accepted provisionally, pending the user's ratification. Its D2 exception remains: a stream prefix truncated inside a frame, a corruption path, is evaluated once, half-applied, and the trader then halts), `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
+Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `H1R1-FRAME-ATOMICITY` (closed by `THROUGHPUT-2`, `7d59fd3`: it evaluates once per frame. ADR-024 is accepted (ratified by the user 2026-09-30). Its D2 exception remains: a stream prefix truncated inside a frame, a corruption path, is evaluated once, half-applied, and the trader then halts), `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
 
 ### Venue drift carried forward (from `VENUE-2`)
 
@@ -308,7 +323,7 @@ These packages are Complete, but their archived rows name residuals or follow-up
 - `GATE-1`: both gate homes are editable by future packages. No test pins which suites `test/vitest.config.ts` includes. `ci.yml` is partly pinned since `CI-2`: `test/unit/tooling/ci-step-split.test.ts` fails when a gate that runs a root script is deleted or loses its `if:` condition.
 - `BACKTEST-1`: the `run_mode=BACKTEST` label names the ROOT, while the core it drives is hard-wired PAPER.
 - `UNIV-4`: an existing config with `polymarket` markets and no `lifecycle` block reproduces B10; it is now a NOTIFY incident at start. Owed: the operator runbook for ledger repair. `test/fixtures/venue/markets/**` stays empty. UNIV4-R1 to R5 are in the residual queue.
-- `THROUGHPUT-2`: **the targets were NOT met** (943 events/s, 5 s). Throughput rose 1.4×, to 764–808 events/s; the paced max lag was 9–38 s (median about 19 s; base about 45 s). The ranked options are in the record, and so are the review's two LOWs, `TP2-R2-L1` and `TP2-R2-L2`. ADR-024 is **accepted provisionally**, pending the user's ratification; a rejection is reverted by a follow-up round.
+- `THROUGHPUT-2`: **the targets were NOT met** (943 events/s, 5 s). Throughput rose 1.4×, to 764–808 events/s; the paced max lag was 9–38 s (median about 19 s; base about 45 s). The ranked options are in the record, and so are the review's two LOWs, `TP2-R2-L1` and `TP2-R2-L2`. ADR-024 is **accepted** (ratified by the user 2026-09-30).
 
 ### Obligations in completion records
 
@@ -335,11 +350,11 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H4**, elapsed soak evidence: open. It is the `WP-140` gate, which closes only through the runbook §7 governance procedure after a real ≥24h soak.
 - **H5**: ruled 2026-09-28: one demonstrated run. The runbook §7 "Wave 2 closeout" check "Static Bracket runs in replay and live-data paper mode through the same code" (`:509` at `f43efe6`) is discharged by one supervised live-data paper session. That session runs through the real stack (gateway → Redis → trader → PostgreSQL), produces decisions and reads back clean. Sustained accumulation is the post-closeout activity the same section describes next (`:514` at `f43efe6`).
 - **H6**, the authorization rows and round order: the orchestrator's, ongoing.
-- **ADR-024** (`THROUGHPUT-2`): accepted provisionally on 2026-09-30, pending the user's ratification.
 - **H7**: ratified 2026-09-28 (`H7` above).
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
+- **ADR-023 ratification** (`THROUGHPUT-1c`): the user ratifies it, and either confirms or replaces the three interim rulings under [Authorized now](#authorized-now). The open choice: whether to narrow the epoch taint so the rule takes effect in a deployment with a Binance feed.
 - **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
 
 ### Wave 3 authorization (conditional)

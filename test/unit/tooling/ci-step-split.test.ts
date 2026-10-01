@@ -258,12 +258,12 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
     expect(splitStepDrift(workflow, packageJson)).toEqual([]);
   });
 
-  it("non-vacuity: 4 + 4 + 6 chained commands, each run by exactly one gated step, in chain order", async () => {
+  it("non-vacuity: 4 + 5 + 6 chained commands, each run by exactly one gated step, in chain order", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const chains = chainCommands(packageJson);
-    expect(SPLIT_CHAINS.map(({ script }) => chains.get(script)?.length)).toEqual([4, 4, 6]);
+    expect(SPLIT_CHAINS.map(({ script }) => chains.get(script)?.length)).toEqual([4, 5, 6]);
     const gateSteps = gates(workflow);
-    expect(gateSteps).toHaveLength(22);
+    expect(gateSteps).toHaveLength(23);
     for (const step of gateSteps) expect(step.condition, step.label).toBe(GATE_IF);
     for (const { script, label } of SPLIT_CHAINS) {
       const commands = chains.get(script) ?? [];
@@ -277,7 +277,7 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
       });
       expect(indices, script).toEqual([...indices].sort((a, b) => a - b));
     }
-    expect(splitSteps(workflow, packageJson)).toHaveLength(14);
+    expect(splitSteps(workflow, packageJson)).toHaveLength(15);
   });
 
   it("normalizes exactly one thing: a bare binary runs through `pnpm exec`, a pnpm command runs verbatim", () => {

@@ -1,6 +1,8 @@
 # ADR-024: The trader evaluates once per venue frame
 
-- **Status:** Accepted provisionally, 2026-09-30, by the orchestrator under the user's ruling "Merge on reviewer ACCEPT": `THROUGHPUT-2` merged `7d59fd3` after Fable r2 ACCEPT. **Pending the user's ratification;** a rejection is reverted by a follow-up round. (It read: "Proposed. The user ratifies it before `THROUGHPUT-2` merges (ruling 2026-09-30, "Yes, round before re-run").")
+- **Status:** Accepted. Ratified by the user on 2026-09-30 ("yes let's accept as is").
+  Corrected 2026-09-30 (ratification): was 'Accepted provisionally, 2026-09-30, by the orchestrator under the user's ruling "Merge on reviewer ACCEPT": `THROUGHPUT-2` merged `7d59fd3` after Fable r2 ACCEP…'.
+  Amended 2026-09-30 by ADR-026 (evaluation cadence).
 - **Date:** 2026-09-30
 - **Recorded by:** `THROUGHPUT-2`, which also implements it.
 - **Supersedes / Superseded by:** none. It refines WHEN the §8.1 loop invokes
