@@ -49,6 +49,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `CONTROL-1` is Complete (2026-10-01); see [Work packages](#work-packages). `CADENCE-1`, which also owns `apps/control-api/src/**`, starts from its merge.
 - `CO2-N1-ADR` is Complete (2026-10-01): ADR-031 is merged as **Proposed**; the user rules (Human items).
 - **`CONTROL-1b`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `CONTROL1-LOWS`: an AST-based no-signer scan, a pinned kill-switch lock key, and the durable-audit-sink prerequisites (an append timeout, bounded mode-raise records, refusal bytes safe for `jsonb`). Paths: `apps/control-api/**`, `test/integration/control-api/**`. Verifiers: Opus and gpt-6-astra, reconciled.
+- **`WP-300c`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `WP300B-LOWS`: the Proxy double read, getter or inherited ids, refusal-code docs, tripwires at module load, and predictable request ids. Paths: `packages/inventory/**` (not its `package.json`), `test/unit/inventory/**`, `test/contract/wallet-operations/**`. Verifiers: Opus and gpt-6-astra, reconciled.
 - `STORAGE-GOV2` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`; its merge-ref CI is green (run `36874368278`). It merges only after the user ratifies ADR-023. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
@@ -180,6 +181,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
 | `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | Complete (2026-10-01): ADR-031 Proposed, awaiting the user's ruling | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
 | `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | **Ready (authorized)** 2026-10-01 | — | — |
+| `WP-300c` | `WP300B-LOWS`: hostile evidence, refusal-code docs, module-load tripwires, predictable ids | **Ready (authorized)** 2026-10-01 | — | — |
 | `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | Complete (2026-10-01) | `a428ba3` | [STORAGE-GOV2](docs/handoffs/STORAGE-GOV2.md) |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
