@@ -280,8 +280,16 @@ From outside it, cite one as "ADR-028 Amendment 1, rule 3".
 5. While such a window is not settled (rule 2), every sealed segment is
    kept, not only those the window overlaps. The planner's reason is
    `evidence-unreadable` (`planExpiry`).
-6. The failed read is marked in the holds file (rule 2). Only a later read
-   that succeeds, in an execute cycle, clears the mark.
+6. The failed read is marked in the holds file (rule 2). Only an execute
+   cycle clears the mark, including the recheck before each deletion
+   (`rememberEvidence`). A dry run never clears it (rule 2, item 4).
+   - An execute cycle clears the mark when the window's classification, in
+     that cycle or recheck, does not have `evidenceUnreadable` set.
+   - It also drops the entry of a window that is settled, holds nothing and
+     is no longer registered. The mark goes with it, without a read. A
+     settled window's mark does not keep every segment (item 8).
+   - Corrected 2026-10-01 (STORAGE-GOV2, `S-GOV-R3-01`): was 'Only a later
+     read that succeeds, in an execute cycle, clears the mark'.
 7. A window that leaves the registry while marked and not settled still
    keeps every segment.
 8. A settled window's failed read does not keep every segment. The code
@@ -367,22 +375,50 @@ Decision 2.1's age check.
    - If the lock is still held at the timeout, it throws
      `StorageCycleLockError`. That cycle never started: it read no trader
      rows, changed no holds and deleted nothing.
-5. Any other error creating the lock file is thrown at once, and the cycle
-   does not run. No test covers that path yet
-   (`R6-LOCK-OPEN-ERROR-UNTESTED`).
+5. Any `open()` error other than EEXIST refuses at once. The cycle throws
+   `StorageCycleLockError`, with that error as its `cause`. It runs nothing
+   and removes nothing.
+   - Tests inject nine errno values through
+     `StorageCycleLockOptions.fileSystem`. A further test, skipped as root,
+     uses a real EACCES (`retention/cycle-lock.test.ts`).
+   - `STORAGE-1b` (merge `7b6499e`) closed `R6-LOCK-OPEN-ERROR-UNTESTED`.
+   - Corrected 2026-10-01 (STORAGE-GOV2): was 'Any other error creating the
+     lock file is thrown at once, and the cycle does not run. No test covers
+     that path yet (`R6-LOCK-OPEN-ERROR-UNTESTED`)'.
 6. A lock left by a process that a reboot ended has another boot's name. It
    holds nothing after the reboot.
 7. A lock left in the same boot, by a killed process, is never broken
    automatically. Every later cycle waits, refuses and deletes nothing. The
    operator removes the lock after checking that no cycle runs.
-8. If the boot id cannot be read, the lock is named `storage-cycle.lock`.
-   - That name is not scoped to a boot, so a lock left under it survives a
-     reboot. It still blocks every cycle that uses that name, and nothing
-     breaks it automatically.
-   - A process that cannot read the boot id and one that can use different
-     names, so neither excludes the other (`R6-LOCK-NAME-FALLBACK`).
-   - Owner of both lock residuals (items 5 and 8): a research-worker round,
-     before `HOST-1` (`STORAGE1-LOCK-LOWS`).
+8. A cycle that cannot read the kernel boot id, or reads one that is not a
+   lowercase UUID, refuses (`thisBoot`, called first by
+   `withStorageCycleLock`).
+   - It throws `StorageCycleLockError` before it creates the state
+     directory or the lock. The cycle never starts, as in item 4.
+   - The `storage` command then prints `storage-cycle-fatal` and exits 1.
+   - There is no fallback name. No cycle takes `storage-cycle.lock` any
+     more.
+   - A leftover `storage-cycle.lock` in the state directory, from an
+     earlier version, counts as held. A cycle waits up to the timeout
+     (item 4), then refuses and names it.
+   - No cycle removes that file. The operator removes it by hand, after
+     checking that no storage cycle of an earlier version runs.
+   - If the check for that file fails with any error but ENOENT, the cycle
+     refuses at once and removes nothing.
+   - systemd's `ProcSubset=pid` is unsupported. It hides `/proc/sys`, so
+     every cycle under it refuses.
+   - `STORAGE-1b` (merge `7b6499e`) closed `R6-LOCK-NAME-FALLBACK`. With
+     item 5, both lock residuals are closed (`STORAGE1-LOCK-LOWS`).
+   - Both were closed under route (a): a cycle refuses, and never removes a
+     lock it does not hold.
+   - Corrected 2026-10-01 (STORAGE-GOV2): was 'If the boot id cannot be
+     read, the lock is named `storage-cycle.lock`. That name is not scoped
+     to a boot, so a lock left under it survives a reboot. It still blocks
+     every cycle that uses that name, and nothing breaks it automatically. A
+     process that cannot read the boot id and one that can use different
+     names, so neither excludes the other (`R6-LOCK-NAME-FALLBACK`). Owner
+     of both lock residuals (items 5 and 8): a research-worker round, before
+     `HOST-1` (`STORAGE1-LOCK-LOWS`)'.
 9. The lock serializes cycles on one host. A state directory shared between
    hosts is not supported.
 
