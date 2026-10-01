@@ -43,6 +43,8 @@ export const INVENTORY_REFUSAL_CODES = [
   "WALLET_OP_ILLEGAL_TRANSITION",
   "WALLET_OP_EVIDENCE_REQUIRED",
   "WALLET_OP_EVIDENCE_CONFLICT",
+  // A reconciliation answer read for a request issued before superseding evidence (WP300-R7-X3).
+  "WALLET_OP_EVIDENCE_SUPERSEDED",
 ] as const;
 
 export type InventoryRefusalCode = (typeof INVENTORY_REFUSAL_CODES)[number];

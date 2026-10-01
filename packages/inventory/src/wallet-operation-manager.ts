@@ -47,7 +47,11 @@
  * answers synchronously is honoured (the operation passes through RECONCILING
  * to the answer); if the request cannot be delivered and nothing answered it,
  * the operation stays UNKNOWN with the request queued for
- * {@link WalletOperationManager.retryReconciliationRequests}.
+ * {@link WalletOperationManager.retryReconciliationRequests}. A request raised
+ * WHILE another is being delivered (a synchronous requester's answer raising
+ * one) is queued too, never delivered re-entrantly, so no requester can drive
+ * unbounded recursion; retry never delivers a queued request that a newer
+ * request for the same operation supersedes (WP300-R7-X3).
  *
  * OBSERVATIONS DURING SUBMISSION (WP300-R1-05, WP300-R2-02). While the
  * executor call is still pending:
@@ -82,20 +86,37 @@
  * or refused because the operation is under reconciliation or terminal),
  * reconciliation evidence — is a member of the operation's ONE identity set
  * ({@link OperationIdentity}, `operation-identity.ts`), and is never
- * forgotten. No verified report documents how a relayer id relates to hashes,
- * so no pairing is assumed. The first member of each field is the operation's
- * identity. In flight (SUBMITTED/MINED), evidence naming a value outside a
- * non-empty field is conflicting: an observation moves the operation to
- * UNKNOWN (and joins the set); reconciliation evidence is refused
- * (`WALLET_OP_EVIDENCE_CONFLICT`). Every reconciliation request carries the set
- * and the members still unresolved.
+ * forgotten. No verified report documents how a relayer id relates to hashes.
+ * The first member of each field is the operation's identity. In flight
+ * (SUBMITTED/MINED), evidence naming a value outside a non-empty field is
+ * conflicting: an observation moves the operation to UNKNOWN (and joins the
+ * set); reconciliation evidence is refused (`WALLET_OP_EVIDENCE_CONFLICT`) and
+ * weighed. Every reconciliation request carries the set and the members still
+ * unresolved.
+ *
+ * WHERE A PAIRING OF HASH AND RELAYER ID IS STILL ASSUMED (WP300-R7-X4). Not
+ * everywhere is free of it; two places treat the identifiers as one
+ * transaction, by design:
+ * - in flight (SUBMITTED/MINED), the first hash and the first relayer id any
+ *   evidence names are learned as the operation's identity, and an in-flight
+ *   FAILED naming only a first relayer id (or nothing) concludes, exactly as
+ *   the in-flight trust boundary has always concluded on an unnamed FAILED;
+ * - before the conclusion, in SIMPLE MODE — at most one hash and one relayer
+ *   id, nothing weighed under reconciliation — one terminal answer naming ANY
+ *   member concludes for the whole set: `FAILED(null, R)` concludes an
+ *   operation submitted as `(A, R)`, with A never answered by name.
+ * Once anything is weighed under reconciliation (an observation, refused
+ * reconciliation evidence, a late contradiction), or the set holds two hashes
+ * or two relayer ids, no pairing is assumed: every member is answered by name.
  *
  * Per member there is ONE standing outcome (CONFIRMED or FAILED), written by
  * an authoritative answer — for EVERY member the answer names — or by the
  * operation's conclusion; an answer is refused while any member it names
- * stands under a different outcome that nothing contested.
+ * stands under a different outcome that nothing contested (and is then
+ * weighed: the contradiction contests that outcome — WP300-R7-X1).
  *
- * EVIDENCE OUTSIDE FLIGHT (UNKNOWN, RECONCILING, CONFIRMED, FAILED) is weighed
+ * EVIDENCE OUTSIDE FLIGHT (UNKNOWN, RECONCILING, CONFIRMED, FAILED) — an
+ * observation, or reconciliation evidence not recorded as a resolution — is weighed
  * against the WHOLE set, contradictions first and then admission, so no
  * observation evades invalidation by naming another identifier:
  * - a different terminal outcome, a CONFIRMED with a different credited amount,
@@ -113,7 +134,9 @@
  * hash or relayer id was named: the operation stays RECONCILING (reservations
  * and the in-flight hold kept) until every member stands; it then concludes
  * CONFIRMED if any stands CONFIRMED (the lines await a read), else FAILED. A
- * fresh request carrying the new unresolved members is sent.
+ * fresh request carrying the new unresolved members is sent — and one is sent
+ * whenever the weighing supersedes earlier reads (WP300-R7-X3), so a current
+ * answer always has a request to name.
  *
  * AFTER A TERMINAL STATE. CONFIRMED and FAILED have no exit, but evidence can
  * still arrive. Whatever the weighing leaves unresolved is QUARANTINED: the
@@ -133,6 +156,34 @@
  * by an authoritative answer, or stands CONFIRMED and no authoritative answer
  * says FAILED; otherwise it is DISCARDED (fail-closed). The operation's state
  * does not change.
+ *
+ * RECONCILIATION ANSWERS (WP300-R7-X3, WP300-R7-X1). Every request carries a
+ * `requestId`, and the manager records the evidence generation it was issued
+ * at (`operation-identity.ts`, "EVIDENCE GENERATION"). An answer echoes the
+ * request it reports a read for (`requestId`; none named = read before any
+ * evidence was weighed). It is SUPERSEDED, and refused
+ * (`WALLET_OP_EVIDENCE_SUPERSEDED`) before it changes any standing evidence,
+ * when evidence weighed after that request was issued could make the read
+ * wrong: a doubt for a CONFIRMED answer, a success claim about a member it
+ * names for a FAILED answer, a set-aside or first naming of a member it names
+ * for any answer, or the operation re-entering reconciliation. Agreeing
+ * evidence does not supersede. An answer naming a request not issued for the
+ * operation is refused (`WALLET_OP_EVIDENCE_REQUIRED`). A superseded answer
+ * never concludes anything: delivered in flight it sends the operation back to
+ * reconciliation.
+ *
+ * Reconciliation evidence that is not RECORDED as a resolution — whatever the
+ * reason: not authoritative, inconclusive, superseded, unwitnessed, refused
+ * while the executor is pending, contradicting standing evidence, or arriving
+ * after a terminal state — is never thrown away: it is handled exactly as the
+ * same observation would be (weighed against the whole set outside flight,
+ * quarantining after a terminal state and suspending an approval; applied in
+ * flight). The one exception is an authoritative answer that repeats, for
+ * every member it names, an outcome the authority already gave and that still
+ * stands: it carries no new fact (directive 3 would otherwise let a reconciler
+ * that answers every member on every request reopen its own answers forever).
+ * While the executor call is pending, weighed reconciliation evidence raises
+ * no request; the executor's answer sends the one owed.
  *
  * RECOGNITION BOUNDARY. From submission until the operation resolves
  * (CONFIRMED or FAILED), every line it touches is under an in-flight hold in
@@ -163,9 +214,10 @@ import {
   OperationIdentity,
   type AnswerCheck,
   type IdentityValues,
+  type TerminalOutcome,
   type WeighedEvidence,
 } from "./operation-identity.js";
-import { ok, refuse, type InventoryResult } from "./refusals.js";
+import { ok, refuse, type EvidenceValue, type InventoryRefusalCode, type InventoryResult } from "./refusals.js";
 import { isDocumentedApprovalSpender } from "./venue-facts.js";
 import {
   isLegalWalletTransition,
@@ -253,6 +305,15 @@ export interface WalletOperationExecutor {
 export type ReconciliationTrigger = typeof WALLET_OPERATION_UNKNOWN_TRIGGER | "POSITION_BALANCE_DISCREPANCY";
 
 export interface ReconciliationRequest {
+  /**
+   * This request's id (WP300-R7-X3). An answer echoes it as `requestId`, and
+   * must report a read made AFTER the request was received: the manager
+   * refuses (`WALLET_OP_EVIDENCE_SUPERSEDED`) an answer whose request was
+   * issued before evidence that could make that read wrong. An answer that
+   * echoes no request is taken as read before any such evidence (it is current
+   * only while none has been weighed).
+   */
+  readonly requestId: string;
   /** A WP-040 `internal.reconciliation_trigger` value. */
   readonly trigger: ReconciliationTrigger;
   readonly walletOperationId: string;
@@ -335,8 +396,17 @@ interface Operation {
   requesting: boolean;
   /** The in-flight hold id while one is in place in the book. */
   holdId: string | null;
-  /** A terminal reconciliation answer was refused because the executor call was pending. */
-  terminalDeferred: boolean;
+  /**
+   * A reconciliation request is owed once the executor answers: a terminal
+   * answer was refused, or refused evidence was weighed without a request,
+   * while the executor call was pending.
+   */
+  requestOwed: boolean;
+  /** Every request issued for this operation: request id → the evidence generation it was issued at. */
+  readonly requests: Map<string, number>;
+  requestCount: number;
+  /** The id of the newest request issued for this operation. */
+  latestRequestId: string | null;
   /** The credited amount of the CONFIRMED observation whose deltas were applied. */
   confirmedCredited: DecimalString | null;
   readonly buffered: Classified[];
@@ -374,6 +444,12 @@ export class WalletOperationManager {
    * carries more evidence for an operation already under reconciliation.
    */
   readonly #outstandingRequests: { readonly request: ReconciliationRequest; readonly advances: boolean }[] = [];
+  /**
+   * How many request deliveries are in progress. A request raised while one is
+   * (a synchronous requester answering from inside `request()`) is queued, not
+   * delivered re-entrantly, so no requester can drive unbounded recursion.
+   */
+  #delivering = 0;
 
   constructor(deps: {
     readonly book: InventoryBook;
@@ -440,7 +516,10 @@ export class WalletOperationManager {
       submitting: false,
       requesting: false,
       holdId: null,
-      terminalDeferred: false,
+      requestOwed: false,
+      requests: new Map(),
+      requestCount: 0,
+      latestRequestId: null,
       confirmedCredited: null,
       buffered: [],
       ordinal: 0,
@@ -515,6 +594,48 @@ export class WalletOperationManager {
   observe(operationId: string, observation: unknown): InventoryResult<WalletOperationView> {
     const operation = this.#operations.get(operationId);
     if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
+    return this.#observeEvidence(operation, observation, "observation");
+  }
+
+  /**
+   * Resolve a RECONCILING operation from an authoritative read (§9.17 step 4),
+   * or recover a quarantined terminal one. Evidence must carry `source:
+   * "AUTHORITATIVE_READ"`, a recognised state, and (optionally) the
+   * `requestId` of the request it answers; it is refused if that request was
+   * issued before evidence that supersedes it (see the header, "RECONCILIATION
+   * ANSWERS"). A CONFIRMED resolution releases the reservations and blocks the
+   * affected lines until an authoritative balance observation (the
+   * reconciler's read already reflects the operation, so its deltas are not
+   * re-applied).
+   *
+   * WP300-R7-X1: evidence this method does not RECORD as a resolution is never
+   * thrown away. It is handled exactly as the same fact delivered through
+   * {@link observe} would be — weighed against the whole identity set outside
+   * flight (contesting what it contradicts, admitting what it names, requiring
+   * every member by name, quarantining after a terminal state), applied in
+   * flight — and the call still returns the refusal. The one exception is an
+   * authoritative answer that repeats, for every member it names, what the
+   * authority already said and still stands: it carries no new fact.
+   */
+  resolveByReconciliation(operationId: string, evidence: unknown): InventoryResult<WalletOperationView> {
+    const operation = this.#operations.get(operationId);
+    if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
+    const answered = this.#answer(operation, evidence);
+    if (answered.weigh) this.#observeEvidence(operation, answerAsObservation(evidence), "answer");
+    return answered.result;
+  }
+
+  /**
+   * One piece of evidence about an operation, from an observation or from
+   * reconciliation evidence that was not recorded as a resolution (WP300-R7-X1:
+   * both are handled alike).
+   */
+  #observeEvidence(
+    operation: Operation,
+    observation: unknown,
+    from: "observation" | "answer",
+  ): InventoryResult<WalletOperationView> {
+    const operationId = operation.plan.operationId;
     const hints = identityHints(observation);
     if (operation.state === "PLANNED" && operation.submitting) {
       // Witnessed on arrival: the identity survives whatever happens to the
@@ -536,7 +657,16 @@ export class WalletOperationManager {
     }
     if (operation.state !== "SUBMITTED" && operation.state !== "MINED") {
       // Refused as a transition, never dropped: weighed against the whole identity set (WP300-R6).
-      if (operation.state !== "PLANNED") this.#weighOutsideFlight(operation, weighedEvidence(observation, hints), "an observation");
+      if (operation.state !== "PLANNED") {
+        this.#weighOutsideFlight(
+          operation,
+          weighedEvidence(observation, hints),
+          from === "observation" ? "an observation" : "reconciliation evidence not recorded as a resolution",
+          // WP300-R7-X1: while the executor call is pending, weighed reconciliation
+          // evidence raises no request (the executor's answer sends the one owed).
+          from === "answer" && operation.submitting,
+        );
+      }
       return refuse(
         "WALLET_OP_ILLEGAL_TRANSITION",
         "observations apply only to SUBMITTED or MINED operations; UNKNOWN/RECONCILING resolve only by reconciliation",
@@ -559,125 +689,196 @@ export class WalletOperationManager {
       return ok(view(operation));
     }
     if (classified.kind === "UNRECOGNISED") operation.identity.admit(hints);
-    this.#applyOutcome(operation, classified, "observation");
+    this.#applyOutcome(operation, classified, from === "observation" ? "observation" : "reconciliation evidence (handled as an observation)");
     return ok(view(operation));
   }
 
   /**
-   * Resolve a RECONCILING operation from an authoritative read (§9.17 step 4).
-   * Evidence must carry `source: "AUTHORITATIVE_READ"` and a recognised state;
-   * anything else — including "not found" — leaves the operation RECONCILING.
-   * A CONFIRMED resolution releases the reservations and blocks the affected
-   * lines until an authoritative balance observation (the reconciler's read
-   * already reflects the operation, so its deltas are not re-applied).
+   * Decide whether reconciliation evidence is RECORDED as a resolution (see
+   * {@link resolveByReconciliation}). `weigh` says whether a refused piece is
+   * then handled as an observation.
    */
-  resolveByReconciliation(operationId: string, evidence: unknown): InventoryResult<WalletOperationView> {
-    const operation = this.#operations.get(operationId);
-    if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
-    if (isTerminalState(operation.state)) {
-      // WP300-R4-01: the recovery path for a contested terminal outcome.
-      if (unresolvedKeys(operation).length === 0) {
-        return refuse(
-          "WALLET_OP_ILLEGAL_TRANSITION",
-          "a terminal operation is resolved by reconciliation only while its outcome is contested (quarantined)",
-          { operationId, state: operation.state },
-        );
-      }
-      return this.#resolveQuarantine(operation, evidence);
+  #answer(operation: Operation, evidence: unknown): Answered {
+    const operationId = operation.plan.operationId;
+    const authoritative = ownData(evidence, "source") === "AUTHORITATIVE_READ";
+    const state = ownData(evidence, "state");
+    const classified = classifyObservation({ ...plainCopy(evidence), status: state });
+    const outcome: TerminalOutcome | null =
+      classified.kind === "FAILED" || classified.kind === "CONFIRMED" ? classified.kind : null;
+    const identity: IdentityValues =
+      classified.kind === "NOT_SENT" || classified.kind === "UNRECOGNISED"
+        ? { transactionHash: null, transactionId: null }
+        : { transactionHash: classified.transactionHash, transactionId: classified.transactionId };
+    // A repeat of what the authority already said, and still stands, carries no new fact.
+    const repeat =
+      authoritative &&
+      outcome !== null &&
+      operation.identity.isAuthoritativeRepeat(
+        outcome,
+        identity,
+        classified.kind === "CONFIRMED" ? classified.credited : null,
+        operation.confirmedCredited,
+      );
+    const refused = (
+      code: InventoryRefusalCode,
+      message: string,
+      details: Readonly<Record<string, EvidenceValue>> = {},
+    ): Answered => ({ result: refuse(code, message, { operationId, ...details }), weigh: !repeat });
+    const unresolvedNow = (): string => unresolvedKeys(operation).join(",");
+
+    const terminalState = isTerminalState(operation.state);
+    if (terminalState && unresolvedKeys(operation).length === 0) {
+      // WP300-R4-01: the recovery path exists only for a contested terminal outcome.
+      return refused(
+        "WALLET_OP_ILLEGAL_TRANSITION",
+        "a terminal operation is resolved by reconciliation only while its outcome is contested (quarantined); the evidence is weighed like an observation",
+        { state: operation.state },
+      );
     }
     // An UNKNOWN operation whose reconciliation request is being delivered
     // right now is ready for the answer (a synchronous requester).
     const answeringRequest = operation.state === "UNKNOWN" && operation.requesting;
-    if (operation.state !== "RECONCILING" && !answeringRequest) {
-      return refuse("WALLET_OP_ILLEGAL_TRANSITION", "only a RECONCILING operation is resolved by reconciliation", {
-        operationId,
-        state: operation.state,
-      });
+    // WP300-R7-X3: the request the answer reports a read for (none named: before any evidence was weighed).
+    const binding = ownData(evidence, "requestId");
+    const issuedAt =
+      binding === undefined || binding === null ? 0 : typeof binding === "string" ? operation.requests.get(binding) : undefined;
+    if (!terminalState && operation.state !== "RECONCILING" && !answeringRequest) {
+      if (authoritative && outcome !== null && (operation.state === "SUBMITTED" || operation.state === "MINED")) {
+        // In flight a refused answer is applied like an observation — unless it
+        // is superseded: an old read never concludes anything. It sends the
+        // operation back to reconciliation instead (nothing applied or released).
+        const superseded =
+          issuedAt === undefined ? "a reconciliation request not issued for this operation" : operation.identity.supersededFor(outcome, identity, issuedAt);
+        if (superseded !== null) {
+          this.#toUnknown(
+            operation,
+            `a superseded ${outcome} reconciliation answer arrived in flight (${superseded}); nothing is assumed${this.#bufferedNote(operation)}`,
+          );
+          return {
+            result: refuse("WALLET_OP_EVIDENCE_SUPERSEDED", "a superseded answer arrived in flight; the operation is under reconciliation again", {
+              operationId,
+              supersededBy: superseded,
+            }),
+            weigh: false,
+          };
+        }
+      }
+      return refused(
+        "WALLET_OP_ILLEGAL_TRANSITION",
+        "only a RECONCILING operation is resolved by reconciliation; the evidence is handled like an observation",
+        { state: operation.state },
+      );
     }
-    if (ownData(evidence, "source") !== "AUTHORITATIVE_READ") {
-      return refuse("WALLET_OP_EVIDENCE_REQUIRED", "reconciliation evidence must be an authoritative read", {
-        operationId,
-      });
+    if (!authoritative) {
+      return refused("WALLET_OP_EVIDENCE_REQUIRED", "reconciliation evidence must be an authoritative read");
     }
-    const state = ownData(evidence, "state");
-    const classified = classifyObservation({ ...plainCopy(evidence), status: state });
     if (classified.kind === "NOT_SENT" || classified.kind === "UNRECOGNISED") {
-      return refuse("WALLET_OP_EVIDENCE_REQUIRED", "evidence is inconclusive; the operation stays RECONCILING", {
-        operationId,
+      return refused("WALLET_OP_EVIDENCE_REQUIRED", "evidence is inconclusive; the operation stays under reconciliation", {
         state: typeof state === "string" ? state : null,
       });
     }
-    const identity: IdentityValues = { transactionHash: classified.transactionHash, transactionId: classified.transactionId };
+    if (terminalState && outcome === null) {
+      return refused(
+        "WALLET_OP_EVIDENCE_REQUIRED",
+        "a contested terminal outcome is released only by a terminal authoritative answer (CONFIRMED or FAILED) per transaction; the quarantine stays",
+        { state: typeof state === "string" ? state : null, unresolved: unresolvedNow() },
+      );
+    }
+    if (outcome === null && operation.identity.requiresEveryKey()) {
+      // WP300-R3-01, WP300-R6: the whole identity set is answered by name, terminally.
+      return refused(
+        "WALLET_OP_EVIDENCE_REQUIRED",
+        "every transaction of this operation must be resolved terminally (CONFIRMED or FAILED) by name",
+        { unresolved: unresolvedNow() },
+      );
+    }
+    // WP300-R7-X3: the answer is bound to the request it answers.
+    if (issuedAt === undefined) {
+      return refused(
+        "WALLET_OP_EVIDENCE_REQUIRED",
+        "the evidence names a reconciliation request that was not issued for this operation",
+        { requestId: typeof binding === "string" ? binding : null },
+      );
+    }
+    const superseded = operation.identity.supersededFor(outcome ?? "IN_FLIGHT", identity, issuedAt);
+    if (superseded !== null) {
+      return refused(
+        "WALLET_OP_EVIDENCE_SUPERSEDED",
+        "the answer reports a read made for a request issued before evidence that supersedes it; answer the latest request",
+        { supersededBy: superseded, unresolved: unresolvedNow() },
+      );
+    }
     const conflict = operation.identity.fieldConflict(identity);
     if (conflict !== null) {
-      return refuse(
+      return refused(
         "WALLET_OP_EVIDENCE_CONFLICT",
-        "reconciliation evidence names a transaction no evidence has named for this operation; the operation stays under reconciliation and its holds stay",
-        { operationId, field: conflict },
+        terminalState
+          ? "reconciliation evidence names a transaction no evidence has named for this operation; the quarantine stays"
+          : "reconciliation evidence names a transaction no evidence has named for this operation; the operation stays under reconciliation and its holds stay",
+        { field: conflict },
       );
     }
-    const terminal = classified.kind === "FAILED" || classified.kind === "CONFIRMED";
-    if (terminal && operation.submitting) {
+    if (terminalState && outcome !== null) return this.#resolveQuarantine(operation, outcome, identity, repeat);
+    if (outcome !== null && operation.submitting) {
       // WP300-R3-02: the executor's answer may still name another transaction;
       // no conclusion (release, recognition) before it has answered.
-      operation.identity.admit(identity);
-      operation.terminalDeferred = true;
-      return refuse(
+      operation.requestOwed = true;
+      return refused(
         "WALLET_OP_EVIDENCE_REQUIRED",
-        `a ${classified.kind} resolution is not accepted while the executor call is pending; the reconciler is asked again once it answers`,
-        { operationId },
+        `a ${outcome} resolution is not accepted while the executor call is pending; the reconciler is asked again once it answers`,
       );
     }
-    if (operation.identity.requiresEveryKey()) {
+    if (outcome !== null && operation.identity.requiresEveryKey()) {
       // WP300-R3-01, WP300-R6: the whole identity set is answered by name;
       // nothing is released before every member stands.
-      if (!terminal) {
-        return refuse(
-          "WALLET_OP_EVIDENCE_REQUIRED",
-          "every transaction of this operation must be resolved terminally (CONFIRMED or FAILED) by name",
-          { operationId, unresolved: unresolvedKeys(operation).join(",") },
-        );
-      }
-      const outcome = classified.kind;
       const checked = operation.identity.checkAnswer(outcome, identity);
-      if (!checked.ok) return answerRefusal(operationId, checked, unresolvedKeys(operation));
+      if (!checked.ok) return { result: answerRefusal(operationId, checked, unresolvedKeys(operation)), weigh: !repeat };
       if (answeringRequest) this.#transition(operation, "RECONCILING", "reconciliation requested (answered synchronously)");
       operation.identity.recordAnswer(outcome, identity, checked.keys);
-      if (unresolvedKeys(operation).length > 0) return ok(view(operation));
+      if (unresolvedKeys(operation).length > 0) return { result: ok(view(operation)), weigh: false };
       this.#concludeByReconciliation(operation, operation.identity.anyConfirmed() ? "CONFIRMED" : "FAILED");
-      return ok(view(operation));
+      return { result: ok(view(operation)), weigh: false };
     }
-    // One identity, nothing contested: one answer naming the operation's
-    // transaction (any member of the set, or nothing if the set is empty) concludes.
+    // One identity, nothing weighed under reconciliation: one answer naming the
+    // operation's transaction (any member of the set, or nothing if the set is
+    // empty) concludes — the simple-mode pairing the header discloses.
     const members = operation.identity.keys();
     if (members.length > 0 && !identityKeys(identity).some((key) => members.includes(key))) {
-      return refuse("WALLET_OP_EVIDENCE_REQUIRED", "the evidence must name the operation's transaction", {
-        operationId,
+      return refused("WALLET_OP_EVIDENCE_REQUIRED", "the evidence must name the operation's transaction", {
         transactions: members.join(","),
       });
     }
     if (answeringRequest) this.#transition(operation, "RECONCILING", "reconciliation requested (answered synchronously)");
-    switch (classified.kind) {
-      case "SUBMITTED":
-      case "MINED":
-        operation.identity.admit(identity);
-        this.#transition(operation, classified.kind, "reconciliation: still in flight");
-        break;
-      case "FAILED":
-      case "CONFIRMED":
-        operation.identity.recordAnswer(classified.kind, identity, identityKeys(identity));
-        this.#concludeByReconciliation(operation, classified.kind);
-        break;
+    if (outcome === null) {
+      operation.identity.admit(identity);
+      this.#transition(operation, classified.kind === "MINED" ? "MINED" : "SUBMITTED", "reconciliation: still in flight");
+      return { result: ok(view(operation)), weigh: false };
     }
-    return ok(view(operation));
+    operation.identity.recordAnswer(outcome, identity, identityKeys(identity));
+    this.#concludeByReconciliation(operation, outcome);
+    return { result: ok(view(operation)), weigh: false };
   }
 
-  /** Retry reconciliation requests the requester refused earlier. */
+  /**
+   * Retry reconciliation requests the requester refused earlier. A queued
+   * request that a newer request for the same operation supersedes is never
+   * delivered late (WP300-R7-X3: answers to it could only be superseded): it
+   * is dropped, or, if it would still move an UNKNOWN operation to
+   * RECONCILING, re-issued as a fresh request.
+   */
   retryReconciliationRequests(): number {
+    if (this.#delivering > 0) return 0; // never re-entrantly (see #delivering)
     const pending = this.#outstandingRequests.splice(0);
     let delivered = 0;
     for (const { request, advances } of pending) {
       const operation = this.#operations.get(request.walletOperationId);
+      if (operation !== undefined && request.requestId !== operation.latestRequestId) {
+        if (advances && operation.state === "UNKNOWN") {
+          const fresh = requestFor(operation, request.trigger, request.reason);
+          if (this.#requestReconciliation(operation, fresh, "reconciliation requested (retry)")) delivered += 1;
+        }
+        continue;
+      }
       if (advances && operation !== undefined) {
         if (operation.state !== "UNKNOWN") continue; // already answered
         if (this.#requestReconciliation(operation, request, "reconciliation requested (retry)")) delivered += 1;
@@ -904,6 +1105,9 @@ export class WalletOperationManager {
   }
 
   #toUnknown(operation: Operation, reason: string): void {
+    // WP300-R7-X3: re-entering reconciliation after a request was issued — the
+    // evidence that sent the operation back is newer than any earlier read.
+    if (operation.requestCount > 0) operation.identity.supersedeEverything();
     this.#transition(operation, "UNKNOWN", reason);
     this.#requestReconciliation(
       operation,
@@ -961,7 +1165,7 @@ export class WalletOperationManager {
    * a fresh reconciliation request before the conclusion, a quarantine after
    * it.
    */
-  #weighOutsideFlight(operation: Operation, evidence: WeighedEvidence, what: string): void {
+  #weighOutsideFlight(operation: Operation, evidence: WeighedEvidence, what: string, deferRequest = false): void {
     const terminal = isTerminalState(operation.state);
     const before = new Set(unresolvedKeys(operation));
     const weighed = operation.identity.weigh(evidence, operation.confirmedCredited);
@@ -971,15 +1175,24 @@ export class WalletOperationManager {
       // reconciliation: the whole set is answered by name from now on.
       operation.identity.requireEveryKey();
     }
-    const opened = unresolvedKeys(operation).filter((key) => !before.has(key));
-    if (opened.length === 0) return; // nothing new to resolve: an outstanding request covers it
+    const unresolved = unresolvedKeys(operation);
+    const opened = unresolved.filter((key) => !before.has(key));
+    // WP300-R7-X3: evidence that supersedes reads made for earlier requests
+    // needs a request that a current answer can name — always before the
+    // conclusion, and after it while anything is unresolved (quarantined).
+    const superseding = weighed.marked && (!terminal || unresolved.length > 0);
+    if (opened.length === 0 && !superseding) return; // nothing new to resolve: an outstanding request covers it
     const changes = [
       weighed.setAside.length > 0 ? `sets aside the outcome standing under ${weighed.setAside.join(",")}` : null,
       weighed.admitted.length > 0 ? `names ${weighed.admitted.join(",")} for the first time` : null,
     ].filter((part): part is string => part !== null);
-    const reason = `${what} (${evidence.kind}) ${changes.length > 0 ? changes.join(" and ") : "must be resolved by name"}; unresolved: ${opened.join(",")}`;
+    const reason = `${what} (${evidence.kind}) ${changes.length > 0 ? changes.join(" and ") : opened.length > 0 ? "must be resolved by name" : "supersedes earlier reads"}; unresolved: ${unresolved.join(",")}`;
     if (terminal) {
       this.#quarantine(operation, `${reason} (operation is ${operation.state})`);
+      return;
+    }
+    if (deferRequest) {
+      operation.requestOwed = true;
       return;
     }
     this.#deliverOrQueue(requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, reason));
@@ -1010,36 +1223,17 @@ export class WalletOperationManager {
     );
   }
 
-  /** The recovery path for a quarantined terminal operation (WP300-R4-01, WP300-R6). */
-  #resolveQuarantine(operation: Operation, evidence: unknown): InventoryResult<WalletOperationView> {
+  /**
+   * The recovery path for a quarantined terminal operation (WP300-R4-01,
+   * WP300-R6): a current, terminal, authoritative answer naming only witnessed
+   * transactions (checked by {@link #answer}) is recorded per member.
+   */
+  #resolveQuarantine(operation: Operation, outcome: TerminalOutcome, identity: IdentityValues, repeat: boolean): Answered {
     const operationId = operation.plan.operationId;
-    if (ownData(evidence, "source") !== "AUTHORITATIVE_READ") {
-      return refuse("WALLET_OP_EVIDENCE_REQUIRED", "reconciliation evidence must be an authoritative read", {
-        operationId,
-      });
-    }
-    const state = ownData(evidence, "state");
-    const classified = classifyObservation({ ...plainCopy(evidence), status: state });
-    if (classified.kind !== "FAILED" && classified.kind !== "CONFIRMED") {
-      return refuse(
-        "WALLET_OP_EVIDENCE_REQUIRED",
-        "a contested terminal outcome is released only by a terminal authoritative answer (CONFIRMED or FAILED) per transaction; the quarantine stays",
-        { operationId, state: typeof state === "string" ? state : null, unresolved: unresolvedKeys(operation).join(",") },
-      );
-    }
-    const identity: IdentityValues = { transactionHash: classified.transactionHash, transactionId: classified.transactionId };
-    const conflict = operation.identity.fieldConflict(identity);
-    if (conflict !== null) {
-      return refuse(
-        "WALLET_OP_EVIDENCE_CONFLICT",
-        "reconciliation evidence names a transaction no evidence has named for this operation; the quarantine stays",
-        { operationId, field: conflict },
-      );
-    }
-    const checked = operation.identity.checkAnswer(classified.kind, identity);
-    if (!checked.ok) return answerRefusal(operationId, checked, unresolvedKeys(operation));
-    operation.identity.recordAnswer(classified.kind, identity, checked.keys);
-    if (unresolvedKeys(operation).length > 0) return ok(view(operation));
+    const checked = operation.identity.checkAnswer(outcome, identity);
+    if (!checked.ok) return { result: answerRefusal(operationId, checked, unresolvedKeys(operation)), weigh: !repeat };
+    operation.identity.recordAnswer(outcome, identity, checked.keys);
+    if (unresolvedKeys(operation).length > 0) return { result: ok(view(operation)), weigh: false };
     // Every member stands again: lift the quarantine. Whatever the answers
     // were, the book's lines may not reflect them (an effect never applied, or
     // applied wrongly), so they await a fresh authoritative read.
@@ -1051,7 +1245,7 @@ export class WalletOperationManager {
       if (operation.identity.approvalStands()) this.#recordApprovalIfAny(operation);
       else this.#approvals.discardApproval(operationId);
     }
-    return ok(view(operation));
+    return { result: ok(view(operation)), weigh: false };
   }
 
   /**
@@ -1061,6 +1255,11 @@ export class WalletOperationManager {
    * RECONCILING; not delivered → stays UNKNOWN with the request queued.
    */
   #requestReconciliation(operation: Operation, request: ReconciliationRequest, reason: string): boolean {
+    if (this.#delivering > 0) {
+      // Raised from inside another request's delivery: queued, never re-entrant.
+      this.#outstandingRequests.push({ request, advances: true });
+      return false;
+    }
     operation.requesting = true;
     let delivered: boolean;
     try {
@@ -1075,11 +1274,14 @@ export class WalletOperationManager {
   }
 
   #deliver(request: ReconciliationRequest): boolean {
+    this.#delivering += 1;
     try {
       this.#reconciler.request(Object.freeze({ ...request }));
       return true;
     } catch {
       return false;
+    } finally {
+      this.#delivering -= 1;
     }
   }
 
@@ -1107,7 +1309,8 @@ export class WalletOperationManager {
   }
 
   #deliverOrQueue(request: ReconciliationRequest): void {
-    if (!this.#deliver(request)) this.#outstandingRequests.push({ request, advances: false });
+    // Raised from inside another request's delivery: queued, never re-entrant.
+    if (this.#delivering > 0 || !this.#deliver(request)) this.#outstandingRequests.push({ request, advances: false });
   }
 
   /**
@@ -1129,8 +1332,8 @@ export class WalletOperationManager {
       contradiction = `the executor's late answer is unrecognised (${result.kind === "UNRECOGNISED" ? result.why : result.kind})`;
     }
     const state = operation.state;
-    const deferred = operation.terminalDeferred;
-    operation.terminalDeferred = false;
+    const owed = operation.requestOwed;
+    operation.requestOwed = false;
     if (isTerminalState(state)) {
       // Unreachable by construction (nothing concludes while the executor is
       // pending — WP300-R3-02); weighed like any evidence after a terminal
@@ -1144,7 +1347,15 @@ export class WalletOperationManager {
     }
     // Witnessed whatever it says: a second transaction stays explicit (WP300-R3-01).
     const unresolvedBefore = new Set(unresolvedKeys(operation));
-    operation.identity.admit(hints);
+    if (state !== "SUBMITTED" && state !== "MINED" && contradiction !== null) {
+      // WP300-R7-X3: outside flight a contradiction is a doubt, weighed (and
+      // marked) like an unrecognised observation: reads made before it are
+      // superseded. Nothing stands while the executor was pending, so it
+      // contests nothing.
+      operation.identity.weigh({ kind: "UNRECOGNISED", ...hints, credited: null }, operation.confirmedCredited);
+    } else {
+      operation.identity.admit(hints);
+    }
     if (state === "SUBMITTED" || state === "MINED") {
       // Reconciliation said "still in flight" while the executor was pending.
       if (contradiction !== null) {
@@ -1160,7 +1371,7 @@ export class WalletOperationManager {
     }
     // A member the whole set must now answer for is news to the reconciler too.
     const opened = unresolvedKeys(operation).filter((key) => !unresolvedBefore.has(key));
-    if (contradiction === null && !deferred && opened.length === 0) return;
+    if (contradiction === null && !owed && opened.length === 0) return;
     this.#deliverOrQueue(
       requestFor(
         operation,
@@ -1478,6 +1689,21 @@ function unresolvedKeys(operation: Operation): string[] {
   return operation.identity.unresolved(isTerminalState(operation.state));
 }
 
+/** What {@link WalletOperationManager.resolveByReconciliation} decided, and whether a refusal is weighed. */
+interface Answered {
+  readonly result: InventoryResult<WalletOperationView>;
+  readonly weigh: boolean;
+}
+
+/**
+ * Reconciliation evidence as the observation of the same fact (WP300-R7-X1):
+ * its state is the status; its identity and credited amount are copied as own
+ * data (whatever they are; the observation classifier judges them).
+ */
+function answerAsObservation(evidence: unknown): Record<string, unknown> {
+  return { ...plainCopy(evidence), status: ownData(evidence, "state") };
+}
+
 /** A refusal for an authoritative answer the identity set did not accept. */
 function answerRefusal(
   operationId: string,
@@ -1522,7 +1748,13 @@ function identityHints(raw: unknown): Identity {
 }
 
 function requestFor(operation: Operation, trigger: ReconciliationTrigger, reason: string): ReconciliationRequest {
+  // WP300-R7-X3: every request is recorded with the evidence generation it was issued at.
+  operation.requestCount += 1;
+  const requestId = compositeKey("wallet-op", operation.plan.operationId, "reconciliation", String(operation.requestCount));
+  operation.requests.set(requestId, operation.identity.generation);
+  operation.latestRequestId = requestId;
   return {
+    requestId,
     trigger,
     walletOperationId: operation.plan.operationId,
     accountRef: operation.plan.accountRef,

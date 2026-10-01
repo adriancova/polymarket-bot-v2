@@ -34,10 +34,23 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
+/**
+ * WP300-R7-X3: a reconciliation answer names the request it answers. The
+ * answers in this suite were written as CURRENT answers, so each is bound to
+ * the latest request this test's reconciler received (what a reconciler that
+ * re-reads on every request sends). Stale and unbound answers are pinned in
+ * `remediation-r7.test.ts` and the property suite.
+ */
+let latestRequestId: string | undefined;
+
 class Reconciler {
   readonly requests: ReconciliationRequest[] = [];
+  constructor() {
+    latestRequestId = undefined;
+  }
   request(request: ReconciliationRequest): void {
     this.requests.push(request);
+    latestRequestId = request.requestId;
   }
 }
 
@@ -80,6 +93,7 @@ const authoritative = (state: string, transactionHash: string | null, transactio
   state,
   transactionHash,
   transactionId,
+  requestId: latestRequestId,
 });
 
 // ----------------------------------------------------------------- R3-01 --
@@ -181,8 +195,13 @@ describe("WP300-R3-01: transaction identities named before UNKNOWN survive it an
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.refusal.code).toBe("WALLET_OP_EVIDENCE_CONFLICT");
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
-    // Control: the witnessed transaction resolves it.
+    // Amended in r7 (WP300-R7-X1): the refused FAILED(B) is weighed, not thrown
+    // away, so B joined the set and must be resolved by name too.
+    expect(manager.operation("s")?.unresolvedTransactions).toEqual([`hash:${TX_A}`, `hash:${TX_B}`]);
     expect(manager.resolveByReconciliation("s", authoritative("FAILED", TX_A)).ok).toBe(true);
+    expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
+    // Control: both witnessed transactions resolved: released.
+    expect(manager.resolveByReconciliation("s", authoritative("FAILED", TX_B)).ok).toBe(true);
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("0");
   });
 

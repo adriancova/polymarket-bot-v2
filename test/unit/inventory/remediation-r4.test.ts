@@ -21,10 +21,23 @@ const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
 const TX_C = "0x00000000000000000000000000000000000000000000000000000000000000c3";
 
+/**
+ * WP300-R7-X3: a reconciliation answer names the request it answers. The
+ * answers in this suite were written as CURRENT answers, so each is bound to
+ * the latest request this test's reconciler received (what a reconciler that
+ * re-reads on every request sends). Stale and unbound answers are pinned in
+ * `remediation-r7.test.ts` and the property suite.
+ */
+let latestRequestId: string | undefined;
+
 class Reconciler {
   readonly requests: ReconciliationRequest[] = [];
+  constructor() {
+    latestRequestId = undefined;
+  }
   request(request: ReconciliationRequest): void {
     this.requests.push(request);
+    latestRequestId = request.requestId;
   }
 }
 
@@ -60,6 +73,7 @@ const authoritative = (state: string, transactionHash: string | null, transactio
   state,
   transactionHash,
   transactionId,
+  requestId: latestRequestId,
 });
 
 // ----------------------------------------------------------------- R4-01 --
@@ -95,10 +109,14 @@ describe("WP300-R4-01: contested terminal evidence quarantines the lines; a bala
     ]);
     expect(manager.operation("s")).toMatchObject({ state: "FAILED", quarantined: true, unresolvedTransactions: [`hash:${TX_B}`] });
 
-    // Step 5: CONFIRMED(B) is refused as a transition; the quarantine stays (already contested: no duplicate request).
+    // Step 5: CONFIRMED(B) is refused as a transition; the quarantine stays.
     expect(manager.observe("s", { status: "CONFIRMED", transactionHash: TX_B, transactionId: null }).ok).toBe(false);
     expect(book.line(ACCOUNT, PUSD)?.blocked).toBe("QUARANTINED");
-    expect(reconciler.requests).toHaveLength(1);
+    // Amended in r7 (WP300-R7-X3): a CONFIRMED fact about B supersedes FAILED
+    // reads of B made for the first request, so a second request (one a current
+    // answer can name) is sent; it was "no duplicate request" before r7.
+    expect(reconciler.requests).toHaveLength(2);
+    expect(reconciler.requests[1]).toMatchObject({ trigger: "POSITION_BALANCE_DISCREPANCY", unresolvedTransactions: [`hash:${TX_B}`] });
 
     // The authoritative recovery path: B resolved by name.
     const resolved = manager.resolveByReconciliation("s", authoritative("CONFIRMED", TX_B));
@@ -220,10 +238,18 @@ describe("WP300-R4-01: contested terminal evidence quarantines the lines; a bala
     expect(code(authoritative("FAILED", TX_A))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expect(code(authoritative("FAILED", null))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expect(code(authoritative("FAILED", TX_B))).toBe("ok");
-    expect(manager.operation("s")).toMatchObject({ quarantined: true, unresolvedTransactions: [`hash:${TX_C}`] });
+    // Amended in r7 (WP300-R7-X1): the refused FAILED("0xdead") was weighed, not
+    // thrown away: the hash it named joined the set and must be resolved too.
+    expect(manager.operation("s")).toMatchObject({ quarantined: true, unresolvedTransactions: [`hash:${TX_C}`, "hash:0xdead"] });
     expect(book.line(ACCOUNT, PUSD)?.blocked).toBe("QUARANTINED");
     expect(code(authoritative("CONFIRMED", TX_B))).toBe("WALLET_OP_EVIDENCE_CONFLICT");
+    // r7 (WP300-R7-X1): the authority contradicting its own recorded answer is
+    // weighed too: B's answer is set aside and B must be answered again.
+    expect(manager.operation("s")?.unresolvedTransactions).toEqual([`hash:${TX_B}`, `hash:${TX_C}`, "hash:0xdead"]);
     expect(code(authoritative("FAILED", TX_C))).toBe("ok");
+    expect(manager.operation("s")).toMatchObject({ quarantined: true, unresolvedTransactions: [`hash:${TX_B}`, "hash:0xdead"] });
+    expect(code(authoritative("FAILED", "0xdead"))).toBe("ok");
+    expect(code(authoritative("FAILED", TX_B))).toBe("ok");
     expect(manager.operation("s")?.quarantined).toBe(false);
     expect(book.line(ACCOUNT, PUSD)?.blocked).toBe("AWAITING_OBSERVATION");
   });

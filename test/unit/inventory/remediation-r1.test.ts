@@ -260,27 +260,55 @@ describe("WP300-R1-03: evidence naming a different transaction is conflicting, n
   }
 
   it("reconciliation evidence naming another transaction is refused and the operation stays RECONCILING", async () => {
-    const { book, manager } = harness();
+    // Amended in r7 (WP300-R7-X1, the joint report's required amendment): this
+    // pin used to end with the matching FAILED(TX_A) releasing the collateral
+    // right after the refusals, i.e. it pinned refused evidence being thrown
+    // away. Refused evidence is now weighed like an observation: what it names
+    // joins the identity set and must be resolved by name before anything is
+    // released.
+    const { book, manager, reconciler } = harness();
     manager.plan(split("s", "10"));
     await manager.submit("s");
     manager.observe("s", { status: "DROPPED" });
-    for (const evidence of [
-      { source: "AUTHORITATIVE_READ", state: "CONFIRMED", transactionHash: TX_B, transactionId: null },
-      { source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash: TX_B },
-      { source: "AUTHORITATIVE_READ", state: "MINED", transactionHash: TX_A, transactionId: ID_B },
-    ]) {
+    for (const [evidence, code] of [
+      [{ source: "AUTHORITATIVE_READ", state: "CONFIRMED", transactionHash: TX_B, transactionId: null }, "WALLET_OP_EVIDENCE_CONFLICT"],
+      // TX_B is now a member (the refusal above was weighed), named after the
+      // only request this unbound answer could have been read for: superseded.
+      [{ source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash: TX_B }, "WALLET_OP_EVIDENCE_SUPERSEDED"],
+      // Every member must now be answered terminally by name: an in-flight answer is refused for its shape.
+      [{ source: "AUTHORITATIVE_READ", state: "MINED", transactionHash: TX_A, transactionId: ID_B }, "WALLET_OP_EVIDENCE_REQUIRED"],
+    ] as const) {
       const refused = manager.resolveByReconciliation("s", evidence);
       expect(refused.ok).toBe(false);
-      if (!refused.ok) expect(refused.refusal.code).toBe("WALLET_OP_EVIDENCE_CONFLICT");
+      if (!refused.ok) expect(refused.refusal.code).toBe(code);
       expect(manager.operation("s")?.state).toBe("RECONCILING");
       expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
     }
+    expect(manager.operation("s")).toMatchObject({
+      transactionHashes: [TX_A, TX_B],
+      transactionIds: [ID_A, ID_B],
+      unresolvedTransactions: [`hash:${TX_A}`, `hash:${TX_B}`, `id:${ID_A}`, `id:${ID_B}`],
+    });
+    // The matching FAILED(TX_A) is accepted, but no longer releases anything.
     const matching = manager.resolveByReconciliation("s", {
       source: "AUTHORITATIVE_READ",
       state: "FAILED",
       transactionHash: TX_A,
     });
-    expect(matching.ok && matching.value.state).toBe("FAILED");
+    expect(matching.ok && matching.value.state).toBe("RECONCILING");
+    expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
+    // Recovery: every other member answered by name, for the latest request.
+    const requestId = reconciler.requests.at(-1)?.requestId;
+    for (const [transactionHash, transactionId] of [
+      [TX_B, null],
+      [null, ID_A],
+      [null, ID_B],
+    ] as const) {
+      expect(
+        manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash, transactionId, requestId }).ok,
+      ).toBe(true);
+    }
+    expect(manager.operation("s")?.state).toBe("FAILED");
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("0");
   });
 
@@ -544,12 +572,24 @@ describe("WP300-R1-06: a reconciliation answer given synchronously inside the re
     await manager.submit("s");
     expect(manager.operation("s")?.state).toBe("UNKNOWN");
     expect(manager.outstandingReconciliationRequests()).toHaveLength(1);
-    // Outside a request call, UNKNOWN still refuses evidence.
+    // Outside a request call, UNKNOWN still refuses evidence as a resolution.
     expect(manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "FAILED" }).ok).toBe(false);
+    // Amended in r7 (WP300-R7-X1/X3): the refused FAILED is weighed like an
+    // observation of the UNKNOWN operation. It is a doubt, which supersedes
+    // CONFIRMED reads made for the queued request, so a second request (one a
+    // current answer can name) is queued too.
+    expect(manager.outstandingReconciliationRequests()).toHaveLength(2);
     reconciler.failing = false;
     reconciler.onRequest = (request) => {
-      manager.resolveByReconciliation(request.walletOperationId, { source: "AUTHORITATIVE_READ", state: "FAILED" });
+      manager.resolveByReconciliation(request.walletOperationId, {
+        source: "AUTHORITATIVE_READ",
+        state: "FAILED",
+        requestId: request.requestId,
+      });
     };
+    // Neither queued request is delivered late: the superseded advancing one is
+    // re-issued fresh (and answered synchronously); the plain one it supersedes
+    // in turn is dropped.
     expect(manager.retryReconciliationRequests()).toBe(1);
     expect(manager.operation("s")?.state).toBe("FAILED");
     expect(manager.outstandingReconciliationRequests()).toEqual([]);

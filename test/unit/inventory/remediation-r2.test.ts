@@ -259,7 +259,10 @@ describe("WP300-R2-02: uncertainty observed during submission is reconciled at o
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     await submitting;
     expect(reconciler.requests).toHaveLength(2);
-    expect(manager.resolveByReconciliation("s", evidence).ok).toBe(true);
+    // r7 (WP300-R7-X3): the answer is given again for the follow-up request. (The
+    // deferred CONFIRMED was weighed, naming A outside flight, so a read made
+    // for the first request no longer counts for A.)
+    expect(manager.resolveByReconciliation("s", { ...evidence, requestId: reconciler.requests[1]?.requestId }).ok).toBe(true);
     expect(manager.operation("s")?.state).toBe("CONFIRMED");
   });
 
@@ -336,7 +339,12 @@ describe("WP300-R2-02: uncertainty observed during submission is reconciled at o
     await submitting;
     expect(reconciler.requests).toHaveLength(2);
     expect(reconciler.requests[1]?.reason).toMatch(/NOT_SENT/);
-    expect(manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "FAILED" }).ok).toBe(true);
+    // r7 (WP300-R7-X3): the answer names the follow-up request. (The late NOT_SENT
+    // is a contradiction, weighed like an unrecognised observation: a read made
+    // for the first request no longer counts.)
+    expect(
+      manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "FAILED", requestId: reconciler.requests[1]?.requestId }).ok,
+    ).toBe(true);
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("0");
   });
 

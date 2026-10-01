@@ -29,10 +29,23 @@ const ID_R = "sanitized-relayer-id-r";
 const ID_S = "sanitized-relayer-id-s";
 const ID_T = "sanitized-relayer-id-t";
 
+/**
+ * WP300-R7-X3: a reconciliation answer names the request it answers. The
+ * answers in this suite were written as CURRENT answers, so each is bound to
+ * the latest request this test's reconciler received (what a reconciler that
+ * re-reads on every request sends). Stale and unbound answers are pinned in
+ * `remediation-r7.test.ts` and the property suite.
+ */
+let latestRequestId: string | undefined;
+
 class Reconciler {
   readonly requests: ReconciliationRequest[] = [];
+  constructor() {
+    latestRequestId = undefined;
+  }
   request(request: ReconciliationRequest): void {
     this.requests.push(request);
+    latestRequestId = request.requestId;
   }
 }
 
@@ -50,6 +63,7 @@ const authoritative = (state: string, transactionHash: string | null, transactio
   state,
   transactionHash,
   transactionId,
+  requestId: latestRequestId,
 });
 
 const reserve = (book: ReturnType<typeof seededBook>, amount: string, id: string) =>
@@ -268,8 +282,15 @@ describe("WP300-R6 class guards: every identifier of the set is answered for", (
     expect(h.manager.operation("s")?.state).toBe("RECONCILING");
     expect(code(h.manager.resolveByReconciliation("s", authoritative("FAILED", null, ID_R)))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expectHeld(h.book);
-    expect(h.manager.operation("s")).toMatchObject({ state: "RECONCILING", transactionIds: [] });
-    // Control: naming the operation's transaction (with or without a relayer id) concludes it.
+    // Amended in r7 (WP300-R7-X1): the refused answer is weighed, not thrown away,
+    // so the relayer id it named joined the set (it was `transactionIds: []`
+    // before r7) and, like every member, must be answered by name.
+    expect(h.manager.operation("s")).toMatchObject({
+      state: "RECONCILING",
+      transactionIds: [ID_R],
+      unresolvedTransactions: [`hash:${TX_A}`, `id:${ID_R}`],
+    });
+    // Control: naming the operation's transaction and the relayer id concludes it.
     expect(code(h.manager.resolveByReconciliation("s", authoritative("FAILED", TX_A, ID_R)))).toBe("ok");
     expect(h.manager.operation("s")?.state).toBe("FAILED");
   });

@@ -2,17 +2,29 @@
  * One wallet operation's transaction identity set and the evidence standing
  * under it (WP300-R6: the class fix for rounds 3-6, in which evidence keyed by
  * one identifier missed contradicting or superseding evidence held under an
- * associated identifier).
+ * associated identifier), and the evidence generation that tells a current
+ * reconciliation answer from a superseded one (WP300-R7-X3).
  *
  * VENUE FACTS. A position transaction's outcome carries `transactionHash:
  * TxHash` and `transactionId: TransactionId | null` (verified-2026-09-16 §10.2,
  * S-D29 lines 166–167, 361–362, 561–562; re-confirmed unchanged by
  * verified-2026-09-30 §10.2). No verified report documents how a relayer
  * transaction id relates to transaction hashes (whether one id can be
- * broadcast under several hashes, or which hash belongs to which id). So
- * nothing here assumes a pairing: every hash and every relayer id any evidence
- * has ever named for the operation is a member of ONE set, and evidence about
- * any member is weighed against the whole set.
+ * broadcast under several hashes, or which hash belongs to which id). So every
+ * hash and every relayer id any evidence has ever named for the operation is a
+ * member of ONE set, and evidence about any member OUTSIDE FLIGHT is weighed
+ * against the whole set.
+ *
+ * WHERE A PAIRING IS STILL ASSUMED (WP300-R7-X4; the manager's header has the
+ * detail). Two places treat identifiers as belonging together, by design:
+ * - in flight (SUBMITTED/MINED), the first hash and the first relayer id are
+ *   learned as the operation's own identity (the in-flight trust boundary);
+ * - before the conclusion, while the set has at most one hash and one relayer
+ *   id and nothing has been weighed under reconciliation, one terminal answer
+ *   naming ANY member concludes the operation for the whole set (so
+ *   `FAILED(null, R)` concludes an operation submitted as `(A, R)`).
+ * Once anything is weighed under reconciliation, or the set is conflicted,
+ * every member must be answered by name and no pairing is assumed.
  *
  * KEYS. `hash:<h>` and `id:<i>` per member, in order of arrival; `operation`
  * for an operation that concluded before any transaction was named.
@@ -38,11 +50,39 @@
  *    in the `reopened` history.
  * 4. Admission: members not seen before join the set, unresolved.
  *
+ * EVIDENCE GENERATION (WP300-R7-X3). A reconciliation answer reports a read
+ * the reconciler made AFTER receiving a request; the manager knows when it
+ * issued that request, not when the read happened. So every request records
+ * the generation current when it was issued, and every weighing that could
+ * make an earlier read wrong advances the generation and MARKS what it
+ * concerns:
+ * - a DOUBT (a FAILED or unrecognised fact, or any contradiction) marks the
+ *   whole operation: a CONFIRMED answer read for an earlier request is
+ *   superseded (a doubt under any member doubts every CONFIRMED, rule 2);
+ * - a SUCCESS CLAIM (a CONFIRMED or unrecognised fact) marks each key it
+ *   names that does not already stand CONFIRMED (every member, and the
+ *   `operation` key, when it names none): a FAILED answer read for an earlier
+ *   request is superseded;
+ * - a key that is SET ASIDE or ADMITTED is marked outright: any answer naming
+ *   it read for an earlier request is superseded;
+ * - re-entering reconciliation (UNKNOWN after a request was issued) marks
+ *   everything ({@link OperationIdentity.supersedeEverything}).
+ * An answer is SUPERSEDED when a mark that concerns it is newer than its
+ * request ({@link OperationIdentity.supersededFor}); the `operation` key's
+ * marks concern every answer (evidence naming no transaction concerns every
+ * transaction, including those named later). A superseded answer is refused before it
+ * changes standing evidence, and the manager then weighs it like an
+ * observation. Agreeing evidence does not supersede an answer (a CONFIRMED
+ * fact does not supersede a CONFIRMED answer), so a reconciler that keeps
+ * answering the latest request with the truth converges.
+ *
  * ANSWERS ({@link OperationIdentity.checkAnswer}). An authoritative terminal
  * answer names keys; it is refused if ANY named key stands under a different
  * outcome (an answer cannot overwrite standing evidence that nothing
  * contested), and if it names no unresolved (or new) key. Accepted, it stands
- * for EVERY key it names.
+ * for EVERY key it names. An answer that repeats, for every key it names, an
+ * outcome the authority already gave and that still stands carries no new
+ * fact ({@link OperationIdentity.isAuthoritativeRepeat}).
  *
  * UNRESOLVED. After a terminal state, every member without standing evidence
  * (the operation is quarantined while any remain). Before it, the same once
@@ -85,7 +125,12 @@ export interface Weighing {
   readonly setAside: readonly string[];
   /** Keys admitted to the set by this evidence. */
   readonly admitted: readonly string[];
+  /** The evidence advanced the generation: answers read for earlier requests may be superseded. */
+  readonly marked: boolean;
 }
+
+/** What an answer resolves: a terminal outcome, or "still in flight" (SUBMITTED/MINED). */
+export type AnswerOutcome = TerminalOutcome | "IN_FLIGHT";
 
 export type AnswerCheck =
   | { readonly ok: true; readonly keys: readonly string[] }
@@ -114,6 +159,21 @@ export class OperationIdentity {
   #anonymous = false;
   /** Every member must be answered by name before a conclusion. */
   #everyKey = false;
+  /** The evidence generation (see the header, "EVIDENCE GENERATION"). */
+  #generation = 0;
+  /** The generation of the latest doubt: supersedes CONFIRMED answers read for earlier requests. */
+  #doubtMark = 0;
+  /** The generation of the latest re-entry into reconciliation: supersedes every earlier answer. */
+  #everythingMark = 0;
+  /** Per key, the latest success claim: supersedes FAILED answers read for earlier requests. */
+  readonly #successMarks = new Map<string, number>();
+  /** Per key, the latest set-aside or admission: supersedes any answer read for an earlier request. */
+  readonly #resetMarks = new Map<string, number>();
+
+  /** The current evidence generation; a reconciliation request records it when issued. */
+  get generation(): number {
+    return this.#generation;
+  }
 
   /** Every hash any evidence has named, in order of arrival. Never shrinks. */
   get hashes(): readonly string[] {
@@ -208,7 +268,7 @@ export class OperationIdentity {
 
   /**
    * Weigh a non-authoritative piece of evidence against the WHOLE set:
-   * contradictions first, then admission (see the header).
+   * contradictions first, then admission, then the marks (see the header).
    */
   weigh(evidence: WeighedEvidence, appliedCredit: DecimalString | null): Weighing {
     const members = this.keys();
@@ -220,7 +280,8 @@ export class OperationIdentity {
       if (standing === undefined) continue;
       if (evidence.kind === "UNRECOGNISED" || contradicts(standing, evidence, appliedCredit)) contested.add(key);
     }
-    if (contested.size > 0 || evidence.kind === "FAILED" || evidence.kind === "UNRECOGNISED") {
+    const doubt = contested.size > 0 || evidence.kind === "FAILED" || evidence.kind === "UNRECOGNISED";
+    if (doubt) {
       for (const [key, standing] of this.#standing) if (standing.outcome === "CONFIRMED") contested.add(key);
     }
     const setAside = members.filter((key) => contested.has(key));
@@ -228,7 +289,83 @@ export class OperationIdentity {
       this.#standing.delete(key);
       this.#reopened.push(key);
     }
-    return { setAside, admitted: this.admit(evidence) };
+    const admitted = this.admit(evidence);
+    const successClaim = evidence.kind === "CONFIRMED" || evidence.kind === "UNRECOGNISED";
+    const success = successClaim
+      ? [
+          ...targets.filter((key) => this.#standing.get(key)?.outcome !== "CONFIRMED"),
+          ...admitted,
+          ...(named.length === 0 ? [OPERATION_KEY] : []),
+        ]
+      : [];
+    const marked = this.#mark(doubt, success, [...setAside, ...admitted]);
+    return { setAside, admitted, marked };
+  }
+
+  /**
+   * The operation re-enters reconciliation after a request was issued: every
+   * answer read for an earlier request is superseded (the evidence that sent
+   * it back is newer than any of those reads).
+   */
+  supersedeEverything(): void {
+    this.#generation += 1;
+    this.#everythingMark = this.#generation;
+  }
+
+  /**
+   * Why an answer of `outcome` naming `identity`, read for a request issued
+   * at generation `issuedAt`, is superseded — or null if it is current (see
+   * the header, "EVIDENCE GENERATION"). Every answer also concerns the
+   * `operation` key: evidence naming no transaction concerns every
+   * transaction of the operation, including those named later.
+   */
+  supersededFor(outcome: AnswerOutcome, identity: IdentityValues, issuedAt: number): string | null {
+    if (this.#everythingMark > issuedAt) return "the operation re-entered reconciliation after the request was issued";
+    if (outcome !== "FAILED" && this.#doubtMark > issuedAt) {
+      return "a FAILED or unrecognised fact, or a contradiction, was weighed after the request was issued";
+    }
+    for (const key of [...identityKeys(identity), OPERATION_KEY]) {
+      if ((this.#resetMarks.get(key) ?? 0) > issuedAt) {
+        return `${key} was set aside or first named after the request was issued`;
+      }
+      if (outcome !== "CONFIRMED" && (this.#successMarks.get(key) ?? 0) > issuedAt) {
+        return `a CONFIRMED or unrecognised fact about ${key} was weighed after the request was issued`;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Whether an authoritative terminal answer repeats, for every key it names,
+   * an outcome an authoritative answer already gave and that still stands (a
+   * CONFIRMED with a credited amount must also match the applied one). Such
+   * an answer carries no new fact. An answer naming nothing never is one.
+   */
+  isAuthoritativeRepeat(
+    outcome: TerminalOutcome,
+    identity: IdentityValues,
+    credited: DecimalString | null,
+    appliedCredit: DecimalString | null,
+  ): boolean {
+    const keys = identityKeys(identity);
+    if (keys.length === 0) return false;
+    if (outcome === "CONFIRMED" && credited !== null && appliedCredit !== null && compareDecimal(credited, appliedCredit) !== 0) {
+      return false;
+    }
+    return keys.every((key) => {
+      const standing = this.#standing.get(key);
+      return standing !== undefined && standing.authoritative && standing.outcome === outcome;
+    });
+  }
+
+  /** Advance the generation and mark what the evidence concerns. True if anything was marked. */
+  #mark(doubt: boolean, success: readonly string[], reset: readonly string[]): boolean {
+    if (!doubt && success.length === 0 && reset.length === 0) return false;
+    this.#generation += 1;
+    if (doubt) this.#doubtMark = this.#generation;
+    for (const key of success) this.#successMarks.set(key, this.#generation);
+    for (const key of reset) this.#resetMarks.set(key, this.#generation);
+    return true;
   }
 
   /**

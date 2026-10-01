@@ -22,10 +22,23 @@ import { ACCOUNT, CONDITION, CTF_EXCHANGE, PUSD, YES, seededBook } from "./helpe
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
 
+/**
+ * WP300-R7-X3: a reconciliation answer names the request it answers. The
+ * answers in this suite were written as CURRENT answers, so each is bound to
+ * the latest request this test's reconciler received (what a reconciler that
+ * re-reads on every request sends). Stale and unbound answers are pinned in
+ * `remediation-r7.test.ts` and the property suite.
+ */
+let latestRequestId: string | undefined;
+
 class Reconciler {
   readonly requests: ReconciliationRequest[] = [];
+  constructor() {
+    latestRequestId = undefined;
+  }
   request(request: ReconciliationRequest): void {
     this.requests.push(request);
+    latestRequestId = request.requestId;
   }
 }
 
@@ -45,6 +58,7 @@ const authoritative = (state: string, transactionHash: string | null, transactio
   state,
   transactionHash,
   transactionId,
+  requestId: latestRequestId,
 });
 
 const reserve = (book: ReturnType<typeof seededBook>, amount: string, id: string) =>
@@ -143,7 +157,12 @@ describe("WP300-R5-01: contradictory evidence during partial reconciliation sets
     ]) {
       expect(manager.observe("s", observation).ok).toBe(false);
     }
-    expect(reconciler.requests).toHaveLength(before);
+    // Amended in r7 (WP300-R7-X3): no standing evidence changes, but the FAILED
+    // repeat is a doubt, which supersedes CONFIRMED reads made for earlier
+    // requests, so exactly one request (one a current answer can name) is sent.
+    // The stale MINED/SUBMITTED reports send none.
+    expect(reconciler.requests).toHaveLength(before + 1);
+    expect(reconciler.requests.at(-1)?.unresolvedTransactions).toEqual([`hash:${TX_B}`]);
     expect(manager.operation("s")?.unresolvedTransactions).toEqual([`hash:${TX_B}`]);
     expect(code(manager.resolveByReconciliation("s", authoritative("FAILED", TX_B)))).toBe("ok");
     expect(manager.operation("s")?.state).toBe("FAILED");

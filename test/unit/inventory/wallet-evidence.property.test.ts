@@ -43,6 +43,24 @@
  * run, answering every unresolved identifier FAILED by name always concludes
  * the operation and lifts any quarantine (liveness).
  *
+ * WP-300 remediation round 7 (WP300-R7-X3, WP300-R7-X1) extends the generator
+ * and the oracle:
+ * - request issuance, the reconciler's READ, and the answer's DELIVERY are
+ *   separate events that interleave freely with everything else: a read
+ *   captures what it says (state and identifiers) at read time, for a request
+ *   already delivered (usually the latest, sometimes an older one); a pending
+ *   answer is delivered later, in any order. Some answers name their request,
+ *   some name none, and some are read and delivered at once;
+ * - an ACCEPTED answer is stamped at its READ time, not its delivery time: it
+ *   is only as fresh as the read it reports (it used to be stamped at
+ *   delivery, which treated an old read as fresh);
+ * - a REFUSED answer is a claim (delivered at its delivery time, like an
+ *   observation), because the manager weighs it like one; the only exception
+ *   is an authoritative answer repeating, for every identifier it names, the
+ *   outcome of the latest accepted answer for it while it is still resolved
+ *   (it carries no new fact);
+ * - every identifier a refused answer names must be in the identity set.
+ *
  * fast-check is not a dependency (no new dependency may be added); the
  * generator is the suite's seeded PRNG, so every failure reproduces from its
  * seed, printed with the trace. Executors and reconcilers are in-memory mocks.
@@ -80,8 +98,19 @@ interface Claim {
 }
 
 interface AcceptedAnswer {
+  /** The step at which the reconciler READ what the answer reports (not its delivery). */
   readonly t: number;
   readonly named: readonly string[];
+}
+
+/** A reconciler read awaiting delivery (WP300-R7-X3: issue, read and delivery are separate events). */
+interface PendingAnswer {
+  readonly readAt: number;
+  readonly requestId: string | null;
+  readonly state: string;
+  readonly hash: string | null;
+  readonly id: string | null;
+  readonly source: string;
 }
 
 const IN_FLIGHT = new Set(["PLANNED", "SUBMITTED", "MINED"]);
@@ -114,6 +143,8 @@ function classify(raw: Readonly<Record<string, unknown>>): ClaimKind {
 class ClaimsOracle {
   readonly claims: Claim[] = [];
   readonly answers: AcceptedAnswer[] = [];
+  /** Per identifier, the outcome of the latest accepted terminal answer naming it. */
+  readonly lastAccepted = new Map<string, string>();
   readonly doubts: number[] = [];
   readonly validations: number[] = [];
   readonly syncs: number[] = [];
@@ -177,6 +208,14 @@ interface Coverage {
   refusedAfterConclusion: number;
   lateExecutorAnswers: number;
   queuedRequests: number;
+  supersededRefusals: number;
+  refusedAnswersAsClaims: number;
+  refusedAnswersInFlight: number;
+  repeatsWithoutNewFact: number;
+  delayedDeliveries: number;
+  acceptedForOlderRequest: number;
+  unboundAccepted: number;
+  unboundRefused: number;
 }
 
 function newCoverage(): Coverage {
@@ -194,6 +233,14 @@ function newCoverage(): Coverage {
     refusedAfterConclusion: 0,
     lateExecutorAnswers: 0,
     queuedRequests: 0,
+    supersededRefusals: 0,
+    refusedAnswersAsClaims: 0,
+    refusedAnswersInFlight: 0,
+    repeatsWithoutNewFact: 0,
+    delayedDeliveries: 0,
+    acceptedForOlderRequest: 0,
+    unboundAccepted: 0,
+    unboundRefused: 0,
   };
 }
 
@@ -231,6 +278,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   const random = prng(seed);
   const book = seededBook({ [PUSD]: "100", [USDC_E]: "50" });
   const approvals = new ApprovalTracker();
+  let t = 0;
   const reconciler = {
     failing: false,
     requests: [] as ReconciliationRequest[],
@@ -239,6 +287,8 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       this.requests.push(request);
     },
   };
+  /** Reads made and not yet delivered, in read order. */
+  const pendingAnswers: PendingAnswer[] = [];
   const mode = pick(random, ["immediate", "immediate", "unrecognised", "pending", "pending"] as const);
   const firstHash = pick(random, HASHES);
   const firstId = random() < 0.5 ? pick(random, IDS) : null;
@@ -264,7 +314,6 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   const isApproval = kind === "APPROVE_ERC20" || kind === "APPROVE_ERC1155";
   const oracle = new ClaimsOracle();
   const trace: string[] = [`seed ${String(seed)} ${kind} executor ${mode}`];
-  let t = 0;
   let wasReady = false;
   let wrapCredit: string | null = null;
 
@@ -332,28 +381,81 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
   }
 
-  function answer(state: string, hash: string | null, id: string | null, source = "AUTHORITATIVE_READ"): boolean {
+  /** The latest request the reconciler received, if any. */
+  const latestRequestId = (): string | null => reconciler.requests.at(-1)?.requestId ?? null;
+
+  /** The reconciler reads now, for `requestId`, what it will answer (WP300-R7-X3). */
+  function read(state: string, hash: string | null, id: string | null, source: string, requestId: string | null): PendingAnswer {
+    return { readAt: t, requestId, state, hash, id, source };
+  }
+
+  /** Deliver an answer. Accepted: stamped at its READ time. Refused: a claim at delivery (WP300-R7-X1). */
+  function deliver(pending: PendingAnswer): boolean {
+    const { state, hash, id, source, requestId, readAt } = pending;
     const before = current();
-    const result = manager.resolveByReconciliation("op", { source, state, transactionHash: hash, transactionId: id });
+    const evidence: Record<string, unknown> = { source, state, transactionHash: hash, transactionId: id };
+    if (requestId !== null) evidence["requestId"] = requestId;
+    const result = manager.resolveByReconciliation("op", evidence);
+    const olderRequest = requestId !== null && requestId !== latestRequestId();
     trace.push(
-      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) → ${result.ok ? "ok" : result.refusal.code}`,
+      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) read t${String(readAt)} for ${requestId === null ? "no request" : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
     );
+    if (readAt < t) coverage.delayedDeliveries += 1;
+    const named = keysOf(hash, id);
     if (result.ok) {
-      oracle.answers.push({ t, named: keysOf(hash, id) });
-      if (state === "CONFIRMED") oracle.validations.push(t);
+      oracle.answers.push({ t: readAt, named });
+      if (state === "CONFIRMED") oracle.validations.push(readAt);
+      if (state === "CONFIRMED" || state === "FAILED") for (const key of named) oracle.lastAccepted.set(key, state);
       if (hash !== null && id !== null) coverage.multiIdentifierAnswers += 1;
+      if (olderRequest) coverage.acceptedForOlderRequest += 1;
+      if (requestId === null) coverage.unboundAccepted += 1;
       const after = current();
       for (const value of [hash, id]) {
         if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
           fail(`identifier ${value} named by an accepted answer is not in the identity set`);
         }
       }
-    } else if (result.refusal.code === "WALLET_OP_EVIDENCE_CONFLICT") {
-      coverage.refusedConflict += 1;
-    } else if (result.refusal.code === "WALLET_OP_ILLEGAL_TRANSITION" && (before.state === "CONFIRMED" || before.state === "FAILED")) {
+      return true;
+    }
+    const code = result.refusal.code;
+    if (code === "WALLET_OP_EVIDENCE_CONFLICT") coverage.refusedConflict += 1;
+    else if (code === "WALLET_OP_EVIDENCE_SUPERSEDED") coverage.supersededRefusals += 1;
+    else if (code === "WALLET_OP_ILLEGAL_TRANSITION" && (before.state === "CONFIRMED" || before.state === "FAILED")) {
       coverage.refusedAfterConclusion += 1;
     }
-    return result.ok;
+    if (requestId === null) coverage.unboundRefused += 1;
+    // A refused answer is weighed like an observation, so the oracle counts it as a
+    // claim — unless it repeats, for every identifier it names, the latest accepted
+    // outcome for an identifier that is still resolved (no new fact).
+    const repeat =
+      source === "AUTHORITATIVE_READ" &&
+      (state === "FAILED" || (state === "CONFIRMED" && hash !== null)) &&
+      named.length > 0 &&
+      named.every(
+        (key) =>
+          oracle.lastAccepted.get(key) === state &&
+          !before.unresolvedTransactions.includes(key) &&
+          (before.transactionHashes.some((h) => `hash:${h}` === key) || before.transactionIds.some((i) => `id:${i}` === key)),
+      );
+    if (repeat) {
+      coverage.repeatsWithoutNewFact += 1;
+      return false;
+    }
+    coverage.refusedAnswersAsClaims += 1;
+    if (IN_FLIGHT.has(before.state)) coverage.refusedAnswersInFlight += 1;
+    recordClaim("observation", classify({ status: state, transactionHash: hash, transactionId: id }), hash, id, before);
+    const after = current();
+    for (const value of [hash, id]) {
+      if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
+        fail(`identifier ${value} named by a refused answer is not in the identity set`);
+      }
+    }
+    return false;
+  }
+
+  /** Read and deliver at once, for the latest request. */
+  function answer(state: string, hash: string | null, id: string | null, source = "AUTHORITATIVE_READ"): boolean {
+    return deliver(read(state, hash, id, source, latestRequestId()));
   }
 
   async function executorAnswers(choice: "SUBMITTED" | "NOT_SENT" | "???" | "THROW", hash: string | null, id: string | null): Promise<void> {
@@ -429,12 +531,13 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
   }
 
-  async function step(action: () => void | Promise<void>, viaAnswer = false): Promise<void> {
+  /** One step. `action` returns true when an answer was ACCEPTED (its validation is stamped at read time). */
+  async function step(action: () => unknown): Promise<void> {
     t += 1;
     const before = current();
     const releasedBefore = isApproval ? false : released();
-    await action();
-    check(before, releasedBefore, viaAnswer);
+    const accepted = (await action()) === true;
+    check(before, releasedBefore, accepted);
   }
 
   function sync(): void {
@@ -449,18 +552,44 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   const otherId = pick(random, IDS.filter((id) => id !== firstId));
   const warmUp = pick(random, ["none", "confirmed", "per-key", "per-key"] as const);
   if (warmUp !== "none") {
-    if (executorPending) await step(() => executorAnswers("SUBMITTED", firstHash, firstId));
+    if (executorPending) await step(async () => void (await executorAnswers("SUBMITTED", firstHash, firstId)));
     if (current().state === "SUBMITTED" && warmUp === "confirmed") {
       await step(() => observe("CONFIRMED", firstHash, firstId, kind === "WRAP_COLLATERAL" ? "10" : null));
     } else if (current().state === "SUBMITTED") {
       // The verifier's setup: another transaction is named, so every identifier is resolved by name.
       await step(() => observe("MINED", otherHash, random() < 0.5 ? otherId : null, null));
       const first = random() < 0.5 ? "CONFIRMED" : "FAILED";
-      await step(() => void answer(first, firstHash, random() < 0.5 ? firstId : null), true);
+      await step(() => answer(first, firstHash, random() < 0.5 ? firstId : null));
     } else if (current().state === "RECONCILING" && warmUp === "confirmed") {
-      await step(() => void answer("CONFIRMED", firstHash, firstId), true);
+      await step(() => answer("CONFIRMED", firstHash, firstId));
     }
     if (isApproval) await step(sync);
+  }
+
+  /** What a read says, chosen from the operation as it is at read time. */
+  function choose(): { state: string; hash: string | null; id: string | null; source: string } {
+    const view = current();
+    const state = pick(random, ["SUBMITTED", "MINED", "CONFIRMED", "CONFIRMED", "FAILED", "FAILED", "FAILED", "NOT_FOUND"]);
+    let hash: string | null;
+    let id: string | null;
+    if (view.unresolvedTransactions.length > 0 && random() < 0.6) {
+      // Answer unresolved identifiers by name: one, or two at once.
+      const named = [pick(random, view.unresolvedTransactions), ...(random() < 0.4 ? [pick(random, view.unresolvedTransactions)] : [])];
+      hash = named.find((key) => key.startsWith("hash:"))?.slice(5) ?? null;
+      id = named.find((key) => key.startsWith("id:"))?.slice(3) ?? null;
+    } else {
+      hash = chooseValue(random, view.transactionHashes, HASHES);
+      id = chooseValue(random, view.transactionIds, IDS);
+    }
+    return { state, hash, id, source: random() < 0.94 ? "AUTHORITATIVE_READ" : "HEARSAY" };
+  }
+
+  /** The request a read is made for: usually the latest delivered one, sometimes an older one, sometimes none named. */
+  function requestFor(): string | null {
+    const roll = random();
+    if (roll < 0.1 || reconciler.requests.length === 0) return null;
+    if (roll < 0.25) return pick(random, reconciler.requests).requestId;
+    return latestRequestId();
   }
 
   const steps = 12 + Math.floor(random() * 28);
@@ -472,28 +601,32 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       let hash = chooseValue(random, view.transactionHashes, HASHES);
       const id = chooseValue(random, view.transactionIds, IDS);
       if (choice === "SUBMITTED" && hash === null && id === null) hash = firstHash;
-      await step(() => executorAnswers(choice, hash, id));
-    } else if (roll < 0.56) {
+      await step(async () => void (await executorAnswers(choice, hash, id)));
+    } else if (roll < 0.5) {
       const status = pick(random, ["SUBMITTED", "MINED", "MINED", "CONFIRMED", "CONFIRMED", "FAILED", "FAILED", "UNKNOWN", "DROPPED"]);
       const hash = chooseValue(random, view.transactionHashes, HASHES);
       const id = chooseValue(random, view.transactionIds, IDS);
       const credited = status === "CONFIRMED" && kind === "WRAP_COLLATERAL" ? pick(random, ["10", "10", "12"]) : null;
       await step(() => observe(status, hash, id, credited));
-    } else if (roll < 0.86) {
-      const state = pick(random, ["SUBMITTED", "MINED", "CONFIRMED", "CONFIRMED", "FAILED", "FAILED", "FAILED", "NOT_FOUND"]);
-      let hash: string | null;
-      let id: string | null;
-      if (view.unresolvedTransactions.length > 0 && random() < 0.6) {
-        // Answer unresolved identifiers by name: one, or two at once.
-        const named = [pick(random, view.unresolvedTransactions), ...(random() < 0.4 ? [pick(random, view.unresolvedTransactions)] : [])];
-        hash = named.find((key) => key.startsWith("hash:"))?.slice(5) ?? null;
-        id = named.find((key) => key.startsWith("id:"))?.slice(3) ?? null;
-      } else {
-        hash = chooseValue(random, view.transactionHashes, HASHES);
-        id = chooseValue(random, view.transactionIds, IDS);
-      }
-      const source = random() < 0.94 ? "AUTHORITATIVE_READ" : "HEARSAY";
-      await step(() => void answer(state, hash, id, source), true);
+    } else if (roll < 0.66) {
+      // Read and delivered at once.
+      const { state, hash, id, source } = choose();
+      const requestId = requestFor();
+      await step(() => deliver(read(state, hash, id, source, requestId)));
+    } else if (roll < 0.76 && reconciler.requests.length > 0) {
+      // A read, delivered later (WP300-R7-X3).
+      const { state, hash, id, source } = choose();
+      const requestId = requestFor();
+      await step(() => {
+        pendingAnswers.push(read(state, hash, id, source, requestId));
+        trace.push(`t${String(t)} reconciler reads ${state}(${String(hash)},${String(id)}) for ${requestId === null ? "no request" : "a request"}`);
+      });
+    } else if (roll < 0.86 && pendingAnswers.length > 0) {
+      // A delivery, in any order.
+      const index = Math.floor(random() * pendingAnswers.length);
+      const [pending] = pendingAnswers.splice(index, 1);
+      if (pending === undefined) fail("no pending answer");
+      await step(() => deliver(pending as PendingAnswer));
     } else if (roll < 0.95 && isApproval) {
       await step(sync);
     } else {
@@ -506,16 +639,22 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
   }
 
-  // Liveness: answer every unresolved identifier FAILED by name; the operation concludes and no quarantine remains.
-  if (executorPending) await step(() => executorAnswers("SUBMITTED", current().transactionHash ?? firstHash, null));
+  // Liveness: every read still in transit is delivered; then every unresolved
+  // identifier is answered FAILED by name, for the latest request; the
+  // operation concludes and no quarantine remains.
+  if (executorPending) await step(async () => void (await executorAnswers("SUBMITTED", current().transactionHash ?? firstHash, null)));
   reconciler.failing = false;
+  while (pendingAnswers.length > 0) {
+    const pending = pendingAnswers.shift() as PendingAnswer;
+    await step(() => deliver(pending));
+  }
   for (let i = 0; i < 24; i += 1) {
     const view = current();
     if (view.state === "SUBMITTED" || view.state === "MINED") {
       await step(() => observe("FAILED", view.transactionHash, null, null));
       continue;
     }
-    if (view.state === "UNKNOWN") {
+    if (manager.outstandingReconciliationRequests().length > 0) {
       await step(() => void manager.retryReconciliationRequests());
       continue;
     }
@@ -533,7 +672,8 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       let accepted = false;
       await step(() => {
         accepted = answer("FAILED", hash, id);
-      }, true);
+        return accepted;
+      });
       if (!accepted) fail(`liveness: the answer FAILED(${String(hash)},${String(id)}) for an unresolved identifier was refused`);
       continue;
     }
