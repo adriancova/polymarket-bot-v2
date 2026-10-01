@@ -125,26 +125,31 @@ jobs:
 
       # CI-2 (CI1-L5): the `test:contract` suites, one step each (see the note
       # above the typecheck steps). All read offline fixtures. CI-3 added 5/5
-      # (WP-260's secure-SDK contract suite, WP260-L1).
-      - name: Venue contract tests 1/5 - Polymarket public market feed and REST (offline fixtures)
+      # (WP-260's secure-SDK contract suite, WP260-L1). CI-4 added 6/6 (WP-300's
+      # wallet-operations contract suite, WP300-R1-07).
+      - name: Venue contract tests 1/6 - Polymarket public market feed and REST (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/polymarket-public test:contract
 
-      - name: Venue contract tests 2/5 - Polymarket RTDS (offline fixtures)
+      - name: Venue contract tests 2/6 - Polymarket RTDS (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/polymarket-public test:contract:rtds
 
-      - name: Venue contract tests 3/5 - Binance (offline fixtures)
+      - name: Venue contract tests 3/6 - Binance (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/binance-adapter test:contract
 
-      - name: Venue contract tests 4/5 - Coinbase (offline fixtures)
+      - name: Venue contract tests 4/6 - Coinbase (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/coinbase-adapter test:contract
 
-      - name: Venue contract tests 5/5 - Polymarket secure SDK (offline fixtures; no network, no credential)
+      - name: Venue contract tests 5/6 - Polymarket secure SDK (offline fixtures; no network, no credential)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/polymarket-secure test:contract
+
+      - name: Venue contract tests 6/6 - Wallet operations (offline fixtures; no network, no credential)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/inventory test:contract
 
       - name: Recorder soak-harness smoke (bounded, loopback-only; no elapsed-evidence claim)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
