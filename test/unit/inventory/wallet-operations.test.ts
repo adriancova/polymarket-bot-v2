@@ -24,7 +24,7 @@ import {
   type WalletOperationExecutor,
   type WalletOperationSubmission,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, USDC_E, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, USDC_E, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX = "0x0000000000000000000000000000000000000000000000000000000000000501";
 
@@ -58,7 +58,7 @@ function harness(
   const approvals = new ApprovalTracker();
   const executor = new MockExecutor(respond);
   const reconciler = new RecordingReconciler();
-  const manager = new WalletOperationManager({ book, approvals, executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals, executor, reconciler });
   return { book, approvals, executor, reconciler, manager };
 }
 
@@ -166,6 +166,7 @@ describe("split / merge / redeem / wrap / unwrap lifecycles", () => {
 
     const bare = seededBook({ [PUSD]: "100" }, { withUsdcE: false });
     const manager2 = new WalletOperationManager({
+      requestToken: requestTokens(),
       book: bare,
       approvals: new ApprovalTracker(),
       executor: new MockExecutor(() => ({})),

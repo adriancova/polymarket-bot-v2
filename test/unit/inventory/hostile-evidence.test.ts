@@ -21,7 +21,14 @@
  * The fix reads every field ONCE, at the door, and decides on that snapshot; a
  * field that is present but not own data is OPAQUE and makes the evidence
  * unrecognised. Pins marked "(control)" pass on the base too; every other pin
- * fails on the base (`28d542a`).
+ * fails on the base (`28d542a`), except where a title says it is held there
+ * too.
+ *
+ * WP-300c round 1 adds pins the round-1 verifiers found missing (the guards
+ * worked, but removing them failed no test): WP300C-J4, the executor's
+ * NOT_SENT with an identity field that is not own data (only the classifier's
+ * OPAQUE guard stops it on the executor route; mutant V-01), and WP300C-J5, a
+ * presence check (`has` trap) that throws (mutant V-05).
  *
  * All executors and reconcilers are in-memory mocks. Nothing is signed or sent.
  */
@@ -35,7 +42,7 @@ import {
   type WalletOperationExecutor,
   type WalletOperationView,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, NO, PUSD, USDC_E, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, NO, PUSD, USDC_E, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TX_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -84,7 +91,7 @@ async function harness(route: Route, executorAnswer: unknown = { status: "SUBMIT
                 release = resolve;
               }),
   };
-  const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals: new ApprovalTracker(), executor, reconciler });
   expect(manager.plan({ type: "WRAP_COLLATERAL", operationId: "op2", accountRef: ACCOUNT, amount: "10" }).ok).toBe(true);
   await manager.submit("op2");
   const r2 = reconciler.latest("op2");
@@ -445,6 +452,7 @@ describe("WP300B-R1-02: a requestId that is present but not own data is unrecogn
     const book = seededBook({ [PUSD]: "100", [USDC_E]: "50" });
     const reconciler = new Reconciler();
     const manager = new WalletOperationManager({
+      requestToken: requestTokens(),
       book,
       approvals: new ApprovalTracker(),
       reconciler,
@@ -467,10 +475,62 @@ describe("WP300B-R1-02: a requestId that is present but not own data is unrecogn
     expect(h.wholeReservable()).toBe(false);
   });
 
+  // WP300C-J4 (round 1): on the executor route only the OPAQUE guard in the classifier stops these. The base
+  // read a NOT_SENT whose identity field is inherited as naming nothing, and concluded FAILED, releasing.
+  for (const field of ["transactionHash", "transactionId"] as const) {
+    const value = field === "transactionHash" ? TX_A : ID_R;
+    for (const form of ["inherited", "getter"] as const) {
+      it(`WP300C-J4: the executor's NOT_SENT whose ${field} is ${form} is unrecognised: never FAILED, nothing released, the getter never run${form === "getter" ? " (held on the base too)" : ""}`, async () => {
+        const made = form === "getter" ? withGetter({ status: "NOT_SENT" }, field, value) : { evidence: inherited({ status: "NOT_SENT" }, field, value), calls: () => 0 };
+        const h = await harness("in-flight", made.evidence);
+        expect(h.view()).toMatchObject({ state: "RECONCILING", transactionHashes: [], transactionIds: [], effectsApplied: false });
+        expect(h.wholeReservable()).toBe(false);
+        expect(h.book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "10" });
+        expect(made.calls()).toBe(0);
+        // Liveness: the reconciler's FAILED for the request it received concludes.
+        expect(code(h.manager.resolveByReconciliation("op", answer({ state: "FAILED", requestId: h.reconciler.latest() })))).toBe("ok");
+        expect(h.view().state).toBe("FAILED");
+      });
+    }
+  }
+
+  it("(control) a NOT_SENT whose identity fields are own data and null is the plain NOT_SENT: FAILED, released", async () => {
+    const h = await harness("in-flight", { status: "NOT_SENT", transactionHash: null, transactionId: null });
+    expect(h.view().state).toBe("FAILED");
+    expect(h.wholeReservable()).toBe(true);
+  });
+
   it("(control) an executor answer whose transactionHash is inherited is unrecognised (it already was)", async () => {
     const h = await harness("in-flight", inherited({ status: "SUBMITTED", transactionId: null }, "transactionHash", TX_A));
     expect(h.view()).toMatchObject({ state: "RECONCILING", transactionHashes: [] });
   });
+
+  // WP300C-J5 (round 1): readField asks `has` only when there is no own property; a `has` that throws is OPAQUE,
+  // never "absent". The base read such a requestId as naming no request (current), and concluded FAILED.
+  for (const field of ["requestId", "transactionHash"] as const) {
+    it(`WP300C-J5: a Proxy FAILED with no own ${field} whose presence check (the has trap) throws is unrecognised: refused, held`, async () => {
+      const h = await harness("threw");
+      const fields: Record<string, unknown> = { source: "AUTHORITATIVE_READ", state: "FAILED", transactionId: null };
+      if (field !== "requestId") fields["requestId"] = h.reconciler.latest();
+      let hasCalls = 0;
+      const hostile = new Proxy(fields, {
+        has(target, key) {
+          if (key === field) {
+            hasCalls += 1;
+            throw new Error("hostile has trap");
+          }
+          return Reflect.has(target, key);
+        },
+      });
+      expect(code(h.manager.resolveByReconciliation("op", hostile))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+      expect(hasCalls).toBe(1);
+      expect(h.view().state).toBe("RECONCILING");
+      expect(h.wholeReservable()).toBe(false);
+      // Liveness: a plain FAILED for the latest request concludes.
+      expect(code(h.manager.resolveByReconciliation("op", answer({ state: "FAILED", requestId: h.reconciler.latest() })))).toBe("ok");
+      expect(h.view().state).toBe("FAILED");
+    });
+  }
 
   it("(control) frozen and sealed answers are own data: read like plain ones", async () => {
     for (const seal of [(o: object): object => Object.freeze(o), (o: object): object => Object.seal(o)]) {

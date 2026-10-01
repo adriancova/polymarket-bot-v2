@@ -21,8 +21,11 @@
  * labels below (WP-300c, mutant C-24). Keep the labels and the error message
  * in step with that file.
  *
- * It guards `fetch` only. No test file or plant uses another network
- * transport; the self-test spawns a local vitest process, which is not one.
+ * It guards `fetch` only. Node 24's global `WebSocket`, and `node:http`,
+ * `node:net` and undici, are not trapped (WP300C-J9): no test file or plant
+ * in this suite uses one, and the self-test spawns a local vitest process,
+ * which is not a network transport. A file that starts using one needs its
+ * own tripwire here first.
  */
 
 import { afterAll, afterEach, expect } from "vitest";

@@ -29,7 +29,8 @@
  * The child is awaited, never run synchronously (`CI-1`,
  * `test/unit/tooling/no-synchronous-spawn.test.ts`), and reports through
  * vitest's JSON reporter on its stdout. It runs vitest from the repository's
- * own `node_modules`; nothing is installed or fetched.
+ * own `node_modules`; nothing is installed or fetched. It inherits only an
+ * allow-list of environment variables (WP300C-J8).
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -84,12 +85,20 @@ interface ChildRun {
   readonly error: Error | undefined;
 }
 
-/** The child's environment: this worker's, minus the variables that describe THIS vitest run to it. */
+/**
+ * The only variables the child inherits (WP300C-J8): what a local, offline
+ * vitest run needs to find its tools and a home and temporary directory, and
+ * whether it runs in CI. Nothing else in this worker's environment — a token,
+ * a key, an RPC URL, this vitest run's own `VITEST*` variables — reaches it.
+ */
+const CHILD_ENVIRONMENT_ALLOWED = ["PATH", "HOME", "CI", "TMPDIR", "TMP", "TEMP", "SystemRoot"] as const;
+
+/** The child's environment: the allow-list above, as this worker has it, plus `NO_COLOR=1`. */
 function childEnvironment(): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith("VITEST") || key === "FORCE_COLOR") continue;
-    environment[key] = value;
+  for (const key of CHILD_ENVIRONMENT_ALLOWED) {
+    const value = process.env[key];
+    if (value !== undefined) environment[key] = value;
   }
   environment["NO_COLOR"] = "1";
   return environment;
@@ -225,6 +234,21 @@ function expectCaughtByBothCounts(name: string): void {
 }
 
 describe("offline", () => {
+  it("WP300C-J8: the child inherits only the allow-listed variables, never the rest of this worker's environment", () => {
+    const sentinel = "PMB_WP300C_J8_SENTINEL";
+    const previous = process.env[sentinel];
+    process.env[sentinel] = "must-not-reach-the-child";
+    try {
+      const environment = childEnvironment();
+      expect(environment[sentinel]).toBeUndefined();
+      expect(Object.keys(environment).filter((key) => key !== "NO_COLOR" && !(CHILD_ENVIRONMENT_ALLOWED as readonly string[]).includes(key))).toEqual([]);
+      expect(environment["NO_COLOR"]).toBe("1");
+    } finally {
+      if (previous === undefined) delete process.env[sentinel];
+      else process.env[sentinel] = previous;
+    }
+  });
+
   it("the network tripwire was installed before this module loaded (module-level code is covered)", () => {
     const mark = Symbol.for("polymarket-bot.contract.wallet-operations.network-tripwire");
     expect(typeof fetchAtModuleLoad).toBe("function");

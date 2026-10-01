@@ -36,7 +36,7 @@ import {
   type ReconciliationRequest,
   type WalletOperationExecutor,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, NO, PUSD, USDC_E, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, NO, PUSD, RequestTokens, USDC_E, YES, requestIdOf, requestOrdinalOf, seededBook } from "./helpers.js";
 
 const MANAGER = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages/inventory/src/wallet-operation-manager.ts");
 
@@ -133,8 +133,6 @@ class Reconciler {
   }
 }
 
-/** The request id the manager gives operation "op"'s `n`-th request. */
-const opId = (n: number): string => `9:wallet-op;2:op;14:reconciliation;${String(String(n).length)}:${String(n)};`;
 
 type Executor = "pending" | "threw" | Readonly<Record<string, unknown>>;
 
@@ -172,13 +170,27 @@ async function world(executor: Executor) {
             ? Promise.reject(new Error("socket closed"))
             : Promise.resolve(executor),
   };
-  const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor: port, reconciler });
+  const tokens = new RequestTokens();
+  const manager = new WalletOperationManager({ requestToken: tokens.next, book, approvals: new ApprovalTracker(), executor: port, reconciler });
   expect(manager.plan({ type: "WRAP_COLLATERAL", operationId: "op2", accountRef: ACCOUNT, amount: "10" }).ok).toBe(true);
   await manager.submit("op2");
   const r2 = reconciler.ids("op2").at(-1);
   if (r2 === undefined) throw new Error("op2 has no request");
   expect(manager.plan({ type: "SPLIT", operationId: "op", accountRef: ACCOUNT, conditionId: CONDITION, amount: "10" }).ok).toBe(true);
-  const issued = (): number => reconciler.ids().length + manager.outstandingReconciliationRequests().filter((r) => r.walletOperationId === "op").length;
+  /** Every id issued for "op": received, or queued. */
+  const issued = (): string[] => [
+    ...reconciler.ids(),
+    ...manager
+      .outstandingReconciliationRequests()
+      .filter((request) => request.walletOperationId === "op")
+      .map((request) => request.requestId),
+  ];
+  /** The id of "op"'s `n`-th request (received or queued). */
+  const id = (n: number): string => {
+    const found = issued().find((requestId) => requestOrdinalOf(requestId) === n);
+    if (found === undefined) throw new Error(`"op" has no request ${String(n)}`);
+    return found;
+  };
   const unissued = (extra: readonly string[] = []): (() => readonly Binding[]) => () => [
     named(r2),
     named("wallet-op:foreign:reconciliation:1"),
@@ -187,11 +199,11 @@ async function world(executor: Executor) {
     named(7),
     named({ requestId: "x" }),
     named(Symbol("request")),
-    // "op"'s own next id, named before it exists.
-    named(opId(issued() + 1)),
+    // "op"'s own next id, named before it exists: the exact id, token included (a reconciler that knows the source).
+    named(requestIdOf("op", Math.max(0, ...issued().map((requestId) => requestOrdinalOf(requestId) ?? 0)) + 1, tokens.peek())),
     ...extra.map(named),
   ];
-  return { manager, reconciler, release: (value: unknown) => release(value), unissued };
+  return { manager, reconciler, release: (value: unknown) => release(value), unissued, id };
 }
 
 const ANSWER = (source: string, state: string, hash: string | null, id: string | null = null, extra: Binding = {}) => ({
@@ -213,7 +225,7 @@ async function backInFlight() {
   const w = await world({ status: "NOT_SENT", transactionHash: TX_A });
   await w.manager.submit("op");
   expect(w.manager.operation("op")?.state).toBe("RECONCILING");
-  expect(code(w.manager.resolveByReconciliation("op", ANSWER("AUTHORITATIVE_READ", "MINED", TX_A, null, named(opId(1)))))).toBe("ok");
+  expect(code(w.manager.resolveByReconciliation("op", ANSWER("AUTHORITATIVE_READ", "MINED", TX_A, null, named(w.id(1)))))).toBe("ok");
   expect(w.manager.operation("op")?.state).toBe("MINED");
   return w;
 }
@@ -235,9 +247,9 @@ async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> 
       const w = await backInFlight();
       w.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
       expect(w.manager.operation("op")?.state).toBe("RECONCILING");
-      expect(code(w.manager.resolveByReconciliation("op", ANSWER("AUTHORITATIVE_READ", "MINED", TX_A, null, named(opId(2)))))).toBe("ok");
+      expect(code(w.manager.resolveByReconciliation("op", ANSWER("AUTHORITATIVE_READ", "MINED", TX_A, null, named(w.id(2)))))).toBe("ok");
       expect(w.manager.operation("op")?.state).toBe("MINED");
-      return { ...w, current: () => named(opId(2)), superseded: () => [named(opId(1)), NONE], unissued: w.unissued() };
+      return { ...w, current: () => named(w.id(2)), superseded: () => [named(w.id(1)), NONE], unissued: w.unissued() };
     }
     case "UNKNOWN, no request being delivered": {
       if (column === "N.c" || column === "T.c") {
@@ -246,28 +258,28 @@ async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> 
         w.reconciler.failing = true;
         await w.manager.submit("op");
         expect(w.manager.operation("op")?.state).toBe("UNKNOWN");
-        return { ...w, current: () => NONE, superseded: () => [], unissued: w.unissued([opId(1)]) };
+        return { ...w, current: () => NONE, superseded: () => [], unissued: w.unissued([w.id(1)]) };
       }
       // A re-entry with the reconciler down: request 2 queued (never received), request 1 superseded.
       const w = await backInFlight();
       w.reconciler.failing = true;
       w.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
       expect(w.manager.operation("op")?.state).toBe("UNKNOWN");
-      return { ...w, current: () => undefined, superseded: () => [named(opId(1)), NONE], unissued: w.unissued([opId(2)]) };
+      return { ...w, current: () => undefined, superseded: () => [named(w.id(1)), NONE], unissued: w.unissued([w.id(2)]) };
     }
     case "RECONCILING, simple mode": {
       // A re-entry that weighs nothing (a SUBMITTED after MINED): simple mode, request 2 current.
       const w = await backInFlight();
       const trigger = (): void => void w.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
       if (!sync) trigger();
-      return { ...w, current: () => named(opId(2)), superseded: () => [named(opId(1)), NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
+      return { ...w, current: () => named(w.id(2)), superseded: () => [named(w.id(1)), NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
     }
     case "RECONCILING, every member by name": {
       // A re-entry that weighs an unrecognised observation: every member by name, request 2 current.
       const w = await backInFlight();
       const trigger = (): void => void w.manager.observe("op", { status: "DROPPED", transactionHash: TX_A });
       if (!sync) trigger();
-      return { ...w, current: () => named(opId(2)), superseded: () => [named(opId(1)), NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
+      return { ...w, current: () => named(w.id(2)), superseded: () => [named(w.id(1)), NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
     }
     case "RECONCILING, executor pending": {
       // Out of PLANNED while the executor call is pending: the observation that moved it was weighed.
@@ -275,24 +287,24 @@ async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> 
       void w.manager.submit("op");
       const trigger = (): void => void w.manager.observe("op", { status: "DROPPED", transactionHash: TX_A });
       if (!sync) trigger();
-      return { ...w, current: () => named(opId(1)), superseded: () => [NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
+      return { ...w, current: () => named(w.id(1)), superseded: () => [NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
     }
     case "CONFIRMED or FAILED, not quarantined":
     case "CONFIRMED or FAILED, quarantined": {
       const w = await backInFlight();
       w.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
-      expect(code(w.manager.resolveByReconciliation("op", ANSWER("AUTHORITATIVE_READ", "FAILED", TX_A, null, named(opId(2)))))).toBe("ok");
+      expect(code(w.manager.resolveByReconciliation("op", ANSWER("AUTHORITATIVE_READ", "FAILED", TX_A, null, named(w.id(2)))))).toBe("ok");
       expect(w.manager.operation("op")?.state).toBe("FAILED");
       if (row === "CONFIRMED or FAILED, not quarantined") {
-        return { ...w, current: () => named(opId(2)), superseded: () => [named(opId(1)), NONE], unissued: w.unissued() };
+        return { ...w, current: () => named(w.id(2)), superseded: () => [named(w.id(1)), NONE], unissued: w.unissued() };
       }
       // A contradicting observation after the conclusion: quarantined, request 3 (A must be answered by name).
       w.manager.observe("op", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
       expect(w.manager.operation("op")).toMatchObject({ quarantined: true, unresolvedTransactions: [`hash:${TX_A}`] });
       return {
         ...w,
-        current: () => named(opId(3)),
-        superseded: () => [named(opId(2)), named(opId(1)), NONE],
+        current: () => named(w.id(3)),
+        superseded: () => [named(w.id(2)), named(w.id(1)), NONE],
         unissued: w.unissued(),
       };
     }

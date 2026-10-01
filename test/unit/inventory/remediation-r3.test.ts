@@ -15,7 +15,7 @@ import {
   type WalletOperationExecutor,
   type WalletOperationSubmission,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, NO, PUSD, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, NO, PUSD, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
@@ -65,6 +65,7 @@ function harness(respond: (s: WalletOperationSubmission) => Promise<unknown>) {
   const book = seededBook({ [PUSD]: "100" });
   const reconciler = new Reconciler();
   const manager = new WalletOperationManager({
+    requestToken: requestTokens(),
     book,
     approvals: new ApprovalTracker(),
     executor: new ScriptedExecutor(respond),

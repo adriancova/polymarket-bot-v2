@@ -20,7 +20,7 @@ import {
   type WalletOperationExecutor,
   type WalletOperationSubmission,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, NO, PUSD, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, NO, PUSD, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
@@ -71,7 +71,7 @@ function harness(
   const book = seededBook(balances);
   const executor = new ScriptedExecutor(respond);
   const reconciler = new Reconciler();
-  const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals: new ApprovalTracker(), executor, reconciler });
   return { book, executor, reconciler, manager };
 }
 

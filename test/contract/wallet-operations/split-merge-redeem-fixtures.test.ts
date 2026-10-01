@@ -44,6 +44,18 @@ import {
   type WalletOperationSubmission,
 } from "../../../packages/inventory/src/index.js";
 
+/**
+ * The manager's request-token source (WP300C-J1). Production binds a CSPRNG;
+ * this suite never names a request id ahead of time, so a counter will do.
+ */
+function requestTokens(): () => string {
+  let drawn = 0;
+  return () => {
+    drawn += 1;
+    return `contract-token-${String(drawn)}`;
+  };
+}
+
 /** `fetch` as this module saw it while loading: the setup file's tripwire, installed before (WP300B-R1-04). */
 const fetchAtModuleLoad: unknown = globalThis.fetch;
 
@@ -103,6 +115,7 @@ function harness(conditionId: string, balances: Readonly<Record<string, string>>
   const submitted: WalletOperationSubmission[] = [];
   const reconciliations: ReconciliationRequest[] = [];
   const manager = new WalletOperationManager({
+    requestToken: requestTokens(),
     book,
     approvals: new ApprovalTracker(),
     executor: {
