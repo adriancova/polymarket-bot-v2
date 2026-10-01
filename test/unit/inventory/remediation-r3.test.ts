@@ -211,7 +211,10 @@ describe("WP300-R3-01: transaction identities named before UNKNOWN survive it an
     manager.observe("s", { status: "UNKNOWN" });
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     await submitting;
-    expect(manager.operation("s")).toMatchObject({ transactionHashes: [TX_A], unresolvedTransactions: [] });
+    // Amended in r9: since WP300-R9-01 the buffered MINED(A) and the UNKNOWN that sent the operation back
+    // are weighed under reconciliation, so the one member is named in the request (it was `[]`, simple
+    // mode, before r9). One answer naming it still resolves the operation.
+    expect(manager.operation("s")).toMatchObject({ transactionHashes: [TX_A], unresolvedTransactions: [`hash:${TX_A}`] });
     expect(manager.resolveByReconciliation("s", authoritative("FAILED", TX_A)).ok).toBe(true);
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("0");
   });
@@ -263,12 +266,19 @@ describe("WP300-R3-02: nothing concludes while the executor is pending, so late 
     });
   }
 
-  it("a CONFIRMED observation after reconciliation's SUBMITTED is kept until the executor answers; a contradiction then sends it to reconciliation", async () => {
+  it("a CONFIRMED observation after a refused 'still in flight' answer is weighed, never applied, while the executor is pending; a contradiction keeps it under reconciliation [amended in r9]", async () => {
+    // Amended in r9: this pin used to return the operation to flight while the executor was pending (a
+    // "still in flight" answer after the DROPPED) and keep the CONFIRMED observation there. Since
+    // WP300-R9-01 the DROPPED that sent the operation back is weighed under reconciliation, so the
+    // "still in flight" answer is refused (and weighed): that route is closed. The pin now checks the
+    // same promise on the route that remains — nothing concludes, nothing is applied, the holds stay.
     const { book, manager, answer, submitting } = pendingHarness();
     manager.observe("s", { status: "DROPPED" });
-    manager.resolveByReconciliation("s", authoritative("SUBMITTED", TX_A));
-    const kept = manager.observe("s", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
-    expect(kept.ok && kept.value).toMatchObject({ state: "SUBMITTED", bufferedObservations: 1, effectsApplied: false });
+    const inFlight = manager.resolveByReconciliation("s", authoritative("SUBMITTED", TX_A));
+    expect(!inFlight.ok && inFlight.refusal.code).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    const weighed = manager.observe("s", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
+    expect(!weighed.ok && weighed.refusal.code).toBe("WALLET_OP_ILLEGAL_TRANSITION");
+    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", bufferedObservations: 0, effectsApplied: false });
     expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "10" });
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_B, transactionId: null });
     await submitting;
@@ -277,7 +287,12 @@ describe("WP300-R3-02: nothing concludes while the executor is pending, so late 
   });
 
   for (const late of [{ status: "NOT_SENT" }, { status: "???" }] as const) {
-    it(`a late ${late.status} after reconciliation's SUBMITTED sends the operation back to reconciliation (kept CONFIRMED not applied)`, async () => {
+    it(`a late ${late.status} after a refused 'still in flight' answer keeps the operation under reconciliation (the CONFIRMED observation not applied) [amended in r9]`, async () => {
+      // Amended in r9: this pin used to return the operation to flight while the executor was pending (a
+      // "still in flight" answer after the DROPPED) and keep the CONFIRMED observation there. Since
+      // WP300-R9-01 the DROPPED that sent the operation back is weighed under reconciliation, so the
+      // "still in flight" answer is refused (and weighed): that route is closed. The pin now checks the
+      // same promise on the route that remains — nothing concludes, nothing is applied, the holds stay.
       const { book, manager, reconciler, answer, submitting } = pendingHarness();
       manager.observe("s", { status: "DROPPED" });
       manager.resolveByReconciliation("s", authoritative("SUBMITTED", TX_A));
@@ -285,21 +300,33 @@ describe("WP300-R3-02: nothing concludes while the executor is pending, so late 
       answer.resolve(late);
       await submitting;
       expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", effectsApplied: false, bufferedObservations: 0 });
-      expect(reconciler.requests).toHaveLength(2);
+      // Request 1 (the DROPPED), 2 (the CONFIRMED observation, weighed outside flight) and 3 (the late
+      // contradiction, which also carries the request owed for the answer refused while it was pending).
+      expect(reconciler.requests).toHaveLength(3);
+      expect(reconciler.requests.at(-1)?.unresolvedTransactions).toEqual([`hash:${TX_A}`]);
       expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "10" });
     });
   }
 
-  it("control: the kept CONFIRMED is applied once when the executor's answer agrees", async () => {
+  it("control: when the executor's answer agrees, the operation concludes by reconciliation, its CONFIRMED observation never applied [amended in r9]", async () => {
+    // Amended in r9: this pin used to return the operation to flight while the executor was pending (a
+    // "still in flight" answer after the DROPPED) and keep the CONFIRMED observation there. Since
+    // WP300-R9-01 the DROPPED that sent the operation back is weighed under reconciliation, so the
+    // "still in flight" answer is refused (and weighed): that route is closed. The pin now checks the
+    // same promise on the route that remains — nothing concludes, nothing is applied, the holds stay.
+    // (Observations kept while the operation is PLANNED are still applied when the executor agrees: the
+    // WP300-R1-05 pins.)
     const { book, manager, answer, submitting } = pendingHarness();
     manager.observe("s", { status: "DROPPED" });
     manager.resolveByReconciliation("s", authoritative("SUBMITTED", TX_A));
     manager.observe("s", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     await submitting;
-    expect(manager.operation("s")).toMatchObject({ state: "CONFIRMED", effectsApplied: true });
-    expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "90", reserved: "0" });
-    expect(book.line(ACCOUNT, YES)?.actual).toBe("10");
+    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", effectsApplied: false });
+    expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "10" });
+    expect(manager.resolveByReconciliation("s", authoritative("CONFIRMED", TX_A)).ok).toBe(true);
+    expect(manager.operation("s")).toMatchObject({ state: "CONFIRMED", effectsApplied: false });
+    expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "0", blocked: "AWAITING_OBSERVATION" });
   });
 
   it("after a terminal state, an observation naming another transaction blocks the lines and reports a discrepancy", async () => {

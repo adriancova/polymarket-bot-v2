@@ -252,7 +252,10 @@ describe("WP300-R2-02: uncertainty observed during submission is reconciled at o
     // Since r3 (WP300-R3-02) no terminal conclusion is drawn while the executor
     // is still silent: CONFIRMED is deferred like FAILED, and asked for again.
     const evidence = { source: "AUTHORITATIVE_READ", state: "CONFIRMED", transactionHash: TX_A, transactionId: null };
-    const early = manager.resolveByReconciliation("s", evidence);
+    // Amended in r9: the early answer echoes request 1. Since WP300-R9-01 the UNKNOWN that sent the
+    // operation back is weighed, so an answer echoing no request is taken as read before it (superseded);
+    // the refusal while the executor is pending is checked with a current answer.
+    const early = manager.resolveByReconciliation("s", { ...evidence, requestId: reconciler.requests[0]?.requestId });
     expect(early.ok).toBe(false);
     if (!early.ok) expect(early.refusal.code).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
@@ -331,7 +334,14 @@ describe("WP300-R2-02: uncertainty observed during submission is reconciled at o
     manager.plan(split("s", "10"));
     const submitting = manager.submit("s");
     manager.observe("s", { status: "DROPPED" });
-    const early = manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "FAILED" });
+    // Amended in r9: the early answer echoes request 1. Since WP300-R9-01 the DROPPED that sent the
+    // operation back is weighed, so an answer echoing no request is taken as read before it (superseded);
+    // the refusal while the executor is pending is checked with a current answer.
+    const early = manager.resolveByReconciliation("s", {
+      source: "AUTHORITATIVE_READ",
+      state: "FAILED",
+      requestId: reconciler.requests[0]?.requestId,
+    });
     expect(early.ok).toBe(false);
     if (!early.ok) expect(early.refusal.code).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
@@ -348,23 +358,35 @@ describe("WP300-R2-02: uncertainty observed during submission is reconciled at o
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("0");
   });
 
-  it("a late executor answer that contradicts reconciliation's SUBMITTED sends the operation back to UNKNOWN", async () => {
+  it("a late executor answer that contradicts reconciliation's SUBMITTED keeps the operation under reconciliation [amended in r9]", async () => {
+    // Amended in r9: this pin used to return the operation to flight while the executor was pending (a
+    // "still in flight" answer after the DROPPED) and keep the FAILED observation there. Since
+    // WP300-R9-01 the DROPPED that sent the operation back is weighed under reconciliation, so the
+    // "still in flight" answer is refused (and weighed): that route is closed. The FAILED observation is
+    // weighed outside flight, and the late contradiction keeps everything under reconciliation.
     const answer = deferred<unknown>();
     const { book, manager, reconciler } = harness(() => answer.promise);
     manager.plan(split("s", "10"));
     const submitting = manager.submit("s");
     manager.observe("s", { status: "DROPPED" });
-    manager.resolveByReconciliation("s", { source: "AUTHORITATIVE_READ", state: "SUBMITTED", transactionHash: TX_A, transactionId: null });
-    expect(manager.operation("s")?.state).toBe("SUBMITTED");
-    // A FAILED observation is not concluded while the executor is still pending
-    // (since r3 it is kept, unapplied, and weighed with the executor's answer).
+    const inFlight = manager.resolveByReconciliation("s", {
+      source: "AUTHORITATIVE_READ",
+      state: "SUBMITTED",
+      transactionHash: TX_A,
+      transactionId: null,
+    });
+    expect(!inFlight.ok && inFlight.refusal.code).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(manager.operation("s")?.state).toBe("RECONCILING");
+    // A FAILED observation is not concluded while the executor is still pending: it is weighed.
     const failed = manager.observe("s", { status: "FAILED", transactionHash: TX_A });
-    expect(failed.ok && failed.value).toMatchObject({ state: "SUBMITTED", bufferedObservations: 1 });
+    expect(!failed.ok && failed.refusal.code).toBe("WALLET_OP_ILLEGAL_TRANSITION");
+    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", bufferedObservations: 0 });
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_B, transactionId: null });
     await submitting;
-    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", transactionHash: TX_A });
-    expect(reconciler.requests).toHaveLength(2);
+    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", transactionHash: TX_A, transactionHashes: [TX_A, TX_B] });
+    // Request 1 (the DROPPED), 2 (the FAILED observation) and 3 (the late contradiction).
+    expect(reconciler.requests).toHaveLength(3);
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
   });
 });

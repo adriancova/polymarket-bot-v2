@@ -83,6 +83,32 @@
  *   identifiers, and a late executor contradiction in simple mode, each then
  *   answered for one identifier only.
  *
+ * WP-300 remediation round 9 (WP300-R9-01) extends both again:
+ * - the oracle predicts, independently, which observation-source claims the
+ *   manager keeps while the executor call is pending (a recognised one while
+ *   the operation is PLANNED; an unrecognised one sends it to UNKNOWN), and
+ *   checks the view's `bufferedObservations` against that prediction;
+ * - when the operation goes back to UNKNOWN, every claim still buffered is
+ *   recorded again as a claim WEIGHED at that step (out of flight), and so is
+ *   the claim that sent it back — an observation or a refused answer that took
+ *   it out of PLANNED or out of flight, or the executor's NOT_SENT /
+ *   unrecognised answer contradicting a non-empty buffer. When the executor
+ *   answers SUBMITTED, the documented drain is simulated: a conflict (more
+ *   than one hash or relayer id, or anything after a terminal claim other than
+ *   an exact repeat) weighs the whole buffer; otherwise the claims are applied
+ *   in order until one sends the operation back (a SUBMITTED after MINED, a
+ *   CONFIRMED lacking the credited amount the type needs), which is weighed
+ *   with the rest. The simulation's verdict (back to UNKNOWN or not) is checked
+ *   against the manager. (The executor's own SUBMITTED, weighed too when the
+ *   drain conflicts, needs no new rule: an identifier it names that conflicts
+ *   with a known one is already due by name, after it);
+ * - an operation is never in flight while the executor call is pending (since
+ *   WP300-R9-01 no route reaches it): asserted after every step;
+ * - a seeded "buffered" warm-up keeps a CONFIRMED (value) or FAILED (approval)
+ *   claim, fires one of the triggers, then answers one identifier only; the
+ *   "re-entry" warm-up returns to flight through the one trigger that weighs
+ *   nothing (a SUBMITTED after MINED).
+ *
  * fast-check is not a dependency (no new dependency may be added); the
  * generator is the suite's seeded PRNG, so every failure reproduces from its
  * seed, printed with the trace. Executors and reconcilers are in-memory mocks.
@@ -136,6 +162,54 @@ interface PendingAnswer {
 }
 
 const IN_FLIGHT = new Set(["PLANNED", "SUBMITTED", "MINED"]);
+
+const OUT_OF_FLIGHT_UNCONCLUDED = new Set(["UNKNOWN", "RECONCILING"]);
+
+/** WP300-R9-01: a claim the oracle predicts the manager keeps while the executor call is pending. */
+interface Kept {
+  readonly claim: Claim;
+  readonly credited: string | null;
+}
+
+/**
+ * WP300-R9-01: the documented drain, simulated. When the executor answers
+ * SUBMITTED, the kept claims are checked as a whole — more than one hash or
+ * relayer id named (the executor's answer included), or anything after a
+ * terminal claim other than an exact repeat of it, is a conflict and every one
+ * is weighed (0) — otherwise applied in order until one sends the operation
+ * back (a SUBMITTED after MINED, a CONFIRMED lacking the credited amount the
+ * type needs), which is weighed with the rest. Returns the index of the first
+ * weighed claim (the length if none is: all applied, or the rest repeat a
+ * conclusion).
+ */
+function drainWeighedFrom(
+  seed: { readonly hash: string | null; readonly id: string | null },
+  kept: readonly Kept[],
+  before: WalletOperationView,
+  needsCredit: boolean,
+): number {
+  const hashes = new Set([...before.transactionHashes, ...(seed.hash === null ? [] : [seed.hash])]);
+  const ids = new Set([...before.transactionIds, ...(seed.id === null ? [] : [seed.id])]);
+  if (hashes.size > 1 || ids.size > 1) return 0;
+  let terminal: Kept | null = null;
+  for (const item of kept) {
+    if (terminal !== null) {
+      const repeat = item.claim.kind === terminal.claim.kind && (item.claim.kind !== "CONFIRMED" || item.credited === terminal.credited);
+      if (!repeat) return 0;
+    } else if (item.claim.kind === "CONFIRMED" || item.claim.kind === "FAILED") {
+      terminal = item;
+    }
+  }
+  let mined = false;
+  for (const [index, item] of kept.entries()) {
+    const kind = item.claim.kind;
+    if (kind === "SUBMITTED" && mined) return index;
+    if (kind === "MINED") mined = true;
+    if (kind === "CONFIRMED") return needsCredit && item.credited === null ? index : kept.length;
+    if (kind === "FAILED") return kept.length;
+  }
+  return kept.length;
+}
 
 const keysOf = (hash: string | null, id: string | null): string[] => [
   ...(hash === null ? [] : [`hash:${hash}`]),
@@ -257,6 +331,12 @@ interface Coverage {
   unknownRequestInFlight: number;
   namedAfterEmptyWeighing: number;
   lateContradictionsWeighed: number;
+  bufferedClaimsWeighed: number;
+  bufferedTerminalClaimsWeighed: number;
+  triggersWeighed: number;
+  drainConflicts: number;
+  drainPartlyApplied: number;
+  executorContradictionsOfBuffer: number;
 }
 
 function newCoverage(): Coverage {
@@ -288,6 +368,12 @@ function newCoverage(): Coverage {
     unknownRequestInFlight: 0,
     namedAfterEmptyWeighing: 0,
     lateContradictionsWeighed: 0,
+    bufferedClaimsWeighed: 0,
+    bufferedTerminalClaimsWeighed: 0,
+    triggersWeighed: 0,
+    drainConflicts: 0,
+    drainPartlyApplied: 0,
+    executorContradictionsOfBuffer: 0,
   };
 }
 
@@ -423,7 +509,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       source === "observation"
         ? !staleReport
         : executorChoice === "NOT_SENT" || executorChoice === "???" || (executorChoice === "SUBMITTED" && conflicting);
-    if (source === "executor" && (stateBefore === "UNKNOWN" || stateBefore === "RECONCILING") && weighed) {
+    if (source === "executor" && (before.state === "UNKNOWN" || before.state === "RECONCILING") && weighed) {
       coverage.lateContradictionsWeighed += 1;
     }
     if ((stateBefore === "UNKNOWN" || stateBefore === "RECONCILING") && weighed && oracle.everyKeyFrom === null) {
@@ -434,6 +520,66 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       oracle.doubts.push(t);
     }
     if (id !== null && fresh.includes(`id:${id}`) && !IN_FLIGHT.has(before.state)) coverage.relayerIdsLearnedOutsideFlight += 1;
+  }
+
+  /** WP300-R9-01: the claims the oracle predicts are kept while the executor call is pending, in arrival order. */
+  const kept: Kept[] = [];
+
+  /** WP300-R9-01: a claim kept while the executor was pending, weighed now (out of flight) that the operation went back. */
+  function reweigh(item: Kept): void {
+    const { claim } = item;
+    oracle.claims.push({ ...claim, t, stateBefore: "UNKNOWN" });
+    const staleReport = (claim.kind === "SUBMITTED" || claim.kind === "MINED") && claim.fresh.length === 0;
+    if (!staleReport && oracle.everyKeyFrom === null) {
+      oracle.everyKeyFrom = t;
+      everyKeyFromEmpty = false;
+    }
+    if (claim.kind === "FAILED" || claim.kind === "UNRECOGNISED") oracle.doubts.push(t);
+    coverage.bufferedClaimsWeighed += 1;
+    if (claim.kind === "CONFIRMED" || claim.kind === "FAILED") coverage.bufferedTerminalClaimsWeighed += 1;
+    trace.push(`t${String(t)}   weighed (kept since t${String(claim.t)}): ${claim.kind}(${claim.named.join(",")})`);
+  }
+
+  /**
+   * Record an observation-source claim (an observation, or a refused answer the
+   * manager handles like one) once the manager has taken it (WP300-R9-01):
+   * kept while the executor is pending (checked against the view); weighed out
+   * of flight if it sent the operation back from PLANNED or from flight — with
+   * every claim kept until then.
+   */
+  function settleClaim(
+    claimKind: ClaimKind,
+    hash: string | null,
+    id: string | null,
+    credited: string | null,
+    before: WalletOperationView,
+    after: WalletOperationView,
+  ): void {
+    if (before.state === "PLANNED" && executorPending) {
+      const recognised = claimKind === "SUBMITTED" || claimKind === "MINED" || claimKind === "CONFIRMED" || claimKind === "FAILED";
+      if (recognised) {
+        recordClaim("observation", claimKind, hash, id, before, "PLANNED");
+        kept.push({ claim: oracle.claims.at(-1) as Claim, credited });
+        if (after.state !== "PLANNED" || after.bufferedObservations !== kept.length) {
+          fail(`R9: a ${claimKind} claim while the executor is pending should be kept (${String(kept.length)}), the view says ${after.state} / ${String(after.bufferedObservations)}`);
+        }
+        return;
+      }
+      if (!OUT_OF_FLIGHT_UNCONCLUDED.has(after.state) || after.bufferedObservations !== 0) {
+        fail(`R9: an unrecognised claim while the executor is pending should send the operation back, the view says ${after.state}`);
+      }
+      for (const item of kept.splice(0)) reweigh(item);
+      recordClaim("observation", claimKind, hash, id, before, "UNKNOWN");
+      coverage.triggersWeighed += 1;
+      return;
+    }
+    if ((before.state === "SUBMITTED" || before.state === "MINED") && OUT_OF_FLIGHT_UNCONCLUDED.has(after.state)) {
+      // It sent the operation back to reconciliation, where it is weighed (WP300-R8-01, WP300-R9-01).
+      recordClaim("observation", claimKind, hash, id, before, "UNKNOWN");
+      coverage.triggersWeighed += 1;
+      return;
+    }
+    recordClaim("observation", claimKind, hash, id, before);
   }
 
   function observe(statusChoice: string, hash: string | null, id: string | null, credited: string | null): void {
@@ -448,10 +594,10 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
     if (credited !== null) raw["credited"] = credited;
     const claimKind = classify(raw);
-    recordClaim("observation", claimKind, hash, id, before);
     trace.push(`t${String(t)} [${before.state}] observe ${JSON.stringify(raw)} (${claimKind})`);
     manager.observe("op", raw);
     const after = current();
+    settleClaim(claimKind, hash, id, credited, before, after);
     for (const value of [hash, id]) {
       if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
         fail(`identifier ${value} named by an observation is not in the identity set`);
@@ -534,15 +680,11 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
       const known = [...before.transactionHashes.map((h) => `hash:${h}`), ...before.transactionIds.map((i) => `id:${i}`)];
       if (named.some((key) => !known.includes(key))) coverage.supersededInFlightNamingNew += 1;
     }
-    recordClaim(
-      "observation",
-      classify({ status: state, transactionHash: hash, transactionId: id }),
-      hash,
-      id,
-      before,
-      supersededInFlight ? "UNKNOWN" : before.state,
-    );
     const after = current();
+    // A superseded answer in flight is weighed out of flight (WP300-R8-01); so is any refused answer that
+    // sends the operation back, and one kept while the executor is pending is weighed when it goes back
+    // (WP300-R9-01).
+    settleClaim(classify({ status: state, transactionHash: hash, transactionId: id }), hash, id, null, before, after);
     for (const value of [hash, id]) {
       if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
         fail(`identifier ${value} named by a refused answer is not in the identity set`);
@@ -560,7 +702,10 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     const before = current();
     const claimKind: ClaimKind =
       choice === "SUBMITTED" ? (hash !== null || id !== null ? "SUBMITTED" : "UNRECOGNISED") : choice === "NOT_SENT" ? "NOT_SENT" : "UNRECOGNISED";
-    recordClaim("executor", claimKind, choice === "SUBMITTED" ? hash : null, choice === "SUBMITTED" ? id : null, before, before.state, choice);
+    const named = choice === "SUBMITTED" ? { hash, id } : { hash: null, id: null };
+    // WP300-R9-01: from PLANNED, a NOT_SENT or unrecognised answer contradicting what was kept is weighed with it.
+    const contradictsKept = before.state === "PLANNED" && kept.length > 0 && (choice === "NOT_SENT" || choice === "???");
+    recordClaim("executor", claimKind, named.hash, named.id, before, contradictsKept ? "UNKNOWN" : before.state, choice);
     trace.push(`t${String(t)} [${before.state}] executor ${choice}(${String(hash)},${String(id)})`);
     if (before.state !== "PLANNED") coverage.lateExecutorAnswers += 1;
     if (choice === "THROW") rejectExecutor(new Error("socket closed"));
@@ -568,11 +713,34 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     else resolveExecutor({ status: choice });
     executorPending = false;
     await submitting;
+    if (before.state !== "PLANNED") return;
+    const after = current();
+    const items = kept.splice(0);
+    if (items.length === 0) return;
+    if (choice !== "SUBMITTED" || claimKind !== "SUBMITTED") {
+      // NOT_SENT, unrecognised or THROW with claims kept: back to UNKNOWN, every kept claim weighed.
+      if (!OUT_OF_FLIGHT_UNCONCLUDED.has(after.state)) fail(`R9: the executor's ${choice} with claims kept should send the operation back, it is ${after.state}`);
+      for (const item of items) reweigh(item);
+      if (contradictsKept) coverage.executorContradictionsOfBuffer += 1;
+      return;
+    }
+    const from = drainWeighedFrom(named, items, before, kind === "WRAP_COLLATERAL");
+    const back = from < items.length;
+    if (back !== OUT_OF_FLIGHT_UNCONCLUDED.has(after.state)) {
+      fail(`R9: the simulated drain says ${back ? `back to UNKNOWN from claim ${String(from)}` : "applied"}, the manager is ${after.state}`);
+    }
+    if (from === 0) coverage.drainConflicts += 1;
+    else if (back) coverage.drainPartlyApplied += 1;
+    for (const item of items.slice(from)) reweigh(item);
   }
 
   /** P1-P3 and the identity-set invariants after a step. */
   function check(before: WalletOperationView, releasedBefore: boolean, viaAnswer: boolean): void {
     const after = current();
+    // WP300-R9-01: no route returns an operation to flight while the executor call is pending.
+    if (after.submitting !== executorPending) fail(`the view says submitting=${String(after.submitting)}`);
+    if (executorPending && (after.state === "SUBMITTED" || after.state === "MINED")) fail("in flight while the executor call is pending");
+    if (executorPending && after.bufferedObservations !== kept.length) fail(`R9: ${String(after.bufferedObservations)} kept, the oracle predicts ${String(kept.length)}`);
     if (!viaAnswer && IN_FLIGHT.has(before.state) && after.state === "CONFIRMED") oracle.validations.push(t);
     // The identity set only grows.
     if (before.transactionHashes.some((h, i) => after.transactionHashes[i] !== h)) fail("the hash set shrank or reordered");
@@ -648,8 +816,44 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   // Seeded warm-ups (then random noise): reach the situations the findings were about.
   const otherHash = HASHES.find((hash) => hash !== firstHash) ?? firstHash;
   const otherId = pick(random, IDS.filter((id) => id !== firstId));
-  const warmUp = pick(random, ["none", "confirmed", "per-key", "per-key", "re-entry", "empty-weighing", "late-contradiction"] as const);
-  if (warmUp === "empty-weighing" || warmUp === "late-contradiction") {
+  const warmUp = pick(random, [
+    "none",
+    "confirmed",
+    "per-key",
+    "per-key",
+    "re-entry",
+    "empty-weighing",
+    "late-contradiction",
+    "buffered",
+    "buffered",
+  ] as const);
+  if (warmUp === "buffered") {
+    // WP300-R9-01: a terminal claim kept while the executor is pending, a trigger sending the operation
+    // back, then one identifier answered (for the latest request).
+    if (executorPending) {
+      const id = firstId ?? otherId;
+      const trigger = pick(random, ["NOT_SENT", "???", "THROW", "DROPPED", "conflict", "regression"] as const);
+      await step(() => observe("MINED", firstHash, id, null));
+      if (trigger === "regression") await step(() => observe("SUBMITTED", firstHash, id, null));
+      if (isApproval) await step(() => observe("FAILED", null, id, null));
+      else await step(() => observe("CONFIRMED", firstHash, null, kind === "WRAP_COLLATERAL" ? "10" : null));
+      if (trigger === "DROPPED") {
+        await step(() => observe("DROPPED", null, null, null));
+        await step(async () => void (await executorAnswers("SUBMITTED", firstHash, id)));
+      } else if (trigger === "conflict" || trigger === "regression") {
+        if (trigger === "conflict") await step(() => observe("MINED", firstHash, id, null));
+        await step(async () => void (await executorAnswers("SUBMITTED", firstHash, id)));
+      } else {
+        await step(async () => void (await executorAnswers(trigger, null, null)));
+      }
+      if (isApproval) {
+        await step(() => answer("CONFIRMED", firstHash, null));
+        await step(sync);
+      } else {
+        await step(() => answer("FAILED", null, id));
+      }
+    }
+  } else if (warmUp === "empty-weighing" || warmUp === "late-contradiction") {
     // WP300-R8-02: evidence weighed under reconciliation ends simple mode, even while
     // nothing is named, and a late contradiction from the executor ends it too.
     if (executorPending) {
@@ -670,7 +874,10 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     if (current().state === "SUBMITTED" && warmUp === "re-entry") {
       // WP300-R8-01: a read made for the first request is still in transit when the
       // operation, back in flight after a re-entry, receives it (or the loop does later).
-      await step(() => observe("DROPPED", firstHash, null, null));
+      // Since WP300-R9-01 the requests are raised by a SUBMITTED after MINED — the one trigger that weighs
+      // nothing — or "still in flight" would be refused.
+      await step(() => observe("MINED", firstHash, firstId, null));
+      await step(() => observe("SUBMITTED", firstHash, firstId, null));
       const first = latestRequestId();
       if (current().state === "RECONCILING" && first !== null) {
         const outcome = random() < 0.5 ? "CONFIRMED" : "FAILED";
@@ -682,7 +889,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
           trace.push(`t${String(t)} reconciler reads ${outcome}(${String(hash)},${String(id)}) for the first request`);
         });
         await step(() => answer("MINED", firstHash, firstId));
-        await step(() => observe("UNKNOWN", null, null, null));
+        await step(() => observe("SUBMITTED", firstHash, firstId, null));
         await step(() => answer("MINED", firstHash, firstId));
         const view = current();
         const roll = random();

@@ -24,10 +24,13 @@
  *   naming ANY member concludes the operation for the whole set (so
  *   `FAILED(null, R)` concludes an operation submitted as `(A, R)`).
  * Once anything is weighed under reconciliation (anything but a stale
- * SUBMITTED/MINED report naming no new member), or the set is conflicted,
- * every member must be answered by name and no pairing is assumed — and that
- * holds even if the weighing happened while the set was still EMPTY
- * (WP300-R8-02): {@link OperationIdentity.requireEveryKey} is set regardless,
+ * SUBMITTED/MINED report naming no new member — since WP300-R9-01 including
+ * whatever accompanies or triggers a return to UNKNOWN: the claim that sent
+ * the operation back and every observation buffered meanwhile, with the
+ * members each first named counting as named by it), or the set is
+ * conflicted, every member must be answered by name and no pairing is
+ * assumed — and that holds even if the weighing happened while the set was
+ * still EMPTY (WP300-R8-02): {@link OperationIdentity.requireEveryKey} is set regardless,
  * so every member named afterwards (by the executor's late answer, an
  * observation or an answer) is answered by name too, and no answer that is
  * not terminal is accepted. With no member at all there is nothing to name:
@@ -72,9 +75,14 @@
  *   `operation` key, when it names none): a FAILED answer read for an earlier
  *   request is superseded;
  * - a key that is SET ASIDE or ADMITTED is marked outright: any answer naming
- *   it read for an earlier request is superseded;
+ *   it read for an earlier request is superseded (a key the evidence first
+ *   named on arrival, admitted then and weighed only now, counts as admitted
+ *   by it — WP300-R9-01);
  * - re-entering reconciliation (UNKNOWN after a request was issued) marks
- *   everything ({@link OperationIdentity.supersedeEverything}).
+ *   everything ({@link OperationIdentity.supersedeEverything}). The first
+ *   entry marks nothing by itself: what accompanies or triggers it is weighed
+ *   and marks what it concerns (the manager's header, "RECONCILIATION
+ *   ANSWERS").
  * An answer is SUPERSEDED when a mark that concerns it is newer than its
  * request ({@link OperationIdentity.supersededFor}); the `operation` key's
  * marks concern every answer (evidence naming no transaction concerns every
@@ -95,10 +103,10 @@
  * UNRESOLVED. After a terminal state, every member without standing evidence
  * (the operation is quarantined while any remain). Before it, the same once
  * the whole set must be answered by name — the operation named more than one
- * hash or relayer id, or evidence arrived while it was under reconciliation
- * (see the manager's header; members named after that evidence included,
- * WP300-R8-02); otherwise one answer naming the operation's transaction
- * concludes it.
+ * hash or relayer id, or evidence was weighed under reconciliation (it arrived
+ * there, or it accompanied or triggered the return to UNKNOWN — see the
+ * manager's header; members named after that evidence included, WP300-R8-02);
+ * otherwise one answer naming the operation's transaction concludes it.
  */
 
 import { compareDecimal, type DecimalString } from "@polymarket-bot/decimal";
@@ -282,10 +290,18 @@ export class OperationIdentity {
   /**
    * Weigh a non-authoritative piece of evidence against the WHOLE set:
    * contradictions first, then admission, then the marks (see the header).
+   *
+   * `firstNamed` lists the keys this same evidence was the first to name when
+   * it ARRIVED, if it was admitted then and is weighed only now (WP300-R9-01:
+   * an observation buffered while the executor call was pending, or a claim
+   * that sent the operation back to reconciliation). They count as admitted BY
+   * this evidence — marked outright, and never a stale report — exactly as if
+   * the evidence were delivered only now.
    */
-  weigh(evidence: WeighedEvidence, appliedCredit: DecimalString | null): Weighing {
+  weigh(evidence: WeighedEvidence, appliedCredit: DecimalString | null, firstNamed: readonly string[] = []): Weighing {
     const members = this.keys();
     const named = identityKeys(evidence);
+    const earlier = firstNamed.filter((key) => named.includes(key) && members.includes(key));
     const targets = named.length > 0 ? named.filter((key) => members.includes(key)) : members;
     const contested = new Set<string>();
     for (const key of targets) {
@@ -302,7 +318,7 @@ export class OperationIdentity {
       this.#standing.delete(key);
       this.#reopened.push(key);
     }
-    const admitted = this.admit(evidence);
+    const admitted = [...earlier, ...this.admit(evidence)];
     const successClaim = evidence.kind === "CONFIRMED" || evidence.kind === "UNRECOGNISED";
     const success = successClaim
       ? [

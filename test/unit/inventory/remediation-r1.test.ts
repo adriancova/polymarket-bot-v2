@@ -270,8 +270,12 @@ describe("WP300-R1-03: evidence naming a different transaction is conflicting, n
     manager.plan(split("s", "10"));
     await manager.submit("s");
     manager.observe("s", { status: "DROPPED" });
+    // Amended in r9: the first answer echoes request 1. Since WP300-R9-01 the DROPPED that sent the
+    // operation back is weighed, so an answer echoing no request is taken as read before it (superseded);
+    // the identity conflict is checked with a current answer.
+    const first = reconciler.requests.at(-1)?.requestId;
     for (const [evidence, code] of [
-      [{ source: "AUTHORITATIVE_READ", state: "CONFIRMED", transactionHash: TX_B, transactionId: null }, "WALLET_OP_EVIDENCE_CONFLICT"],
+      [{ source: "AUTHORITATIVE_READ", state: "CONFIRMED", transactionHash: TX_B, transactionId: null, requestId: first }, "WALLET_OP_EVIDENCE_CONFLICT"],
       // TX_B is now a member (the refusal above was weighed), named after the
       // only request this unbound answer could have been read for: superseded.
       [{ source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash: TX_B }, "WALLET_OP_EVIDENCE_SUPERSEDED"],
@@ -289,11 +293,13 @@ describe("WP300-R1-03: evidence naming a different transaction is conflicting, n
       transactionIds: [ID_A, ID_B],
       unresolvedTransactions: [`hash:${TX_A}`, `hash:${TX_B}`, `id:${ID_A}`, `id:${ID_B}`],
     });
-    // The matching FAILED(TX_A) is accepted, but no longer releases anything.
+    // The matching FAILED(TX_A) is accepted, but no longer releases anything. (Amended in r9: it echoes
+    // the latest request — the weighed DROPPED supersedes an answer echoing none.)
     const matching = manager.resolveByReconciliation("s", {
       source: "AUTHORITATIVE_READ",
       state: "FAILED",
       transactionHash: TX_A,
+      requestId: reconciler.requests.at(-1)?.requestId,
     });
     expect(matching.ok && matching.value.state).toBe("RECONCILING");
     expect(book.line(ACCOUNT, PUSD)?.reserved).toBe("10");
@@ -452,7 +458,13 @@ describe("WP300-R1-05: observations that arrive during submission are kept and a
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     await submitting;
     expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", bufferedObservations: 0, transactionHash: TX_A });
-    expect(reconciler.requests).toEqual([expect.objectContaining({ trigger: "WALLET_OPERATION_UNKNOWN", walletOperationId: "s" })]);
+    // Amended in r9: since WP300-R9-01 the UNKNOWN that sent the operation back is weighed under
+    // reconciliation, so the transaction the executor names afterwards must be answered by name, and a
+    // second request names it (there was one request before r9).
+    expect(reconciler.requests).toEqual([
+      expect.objectContaining({ trigger: "WALLET_OPERATION_UNKNOWN", walletOperationId: "s" }),
+      expect.objectContaining({ trigger: "WALLET_OPERATION_UNKNOWN", walletOperationId: "s", unresolvedTransactions: [`hash:${TX_A}`] }),
+    ]);
     expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "10" });
   });
 
@@ -479,7 +491,10 @@ describe("WP300-R1-05: observations that arrive during submission are kept and a
     h.manager.plan(split("s", "10"));
     await h.manager.submit("s");
     expect(h.manager.operation("s")?.state).toBe("RECONCILING");
-    expect(h.reconciler.requests).toHaveLength(1);
+    // Amended in r9: since WP300-R9-01 the DROPPED is weighed when it sends the operation back, so the
+    // executor's SUBMITTED(A) names a member that must be answered by name: a second request (one before r9).
+    expect(h.reconciler.requests).toHaveLength(2);
+    expect(h.reconciler.requests[1]?.unresolvedTransactions).toEqual([`hash:${TX_A}`]);
   });
 
   it("NOT_SENT contradicted by an observation made meanwhile is UNKNOWN, not FAILED; the reservation stays", async () => {

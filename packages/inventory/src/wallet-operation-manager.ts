@@ -53,35 +53,69 @@
  * unbounded recursion; retry never delivers a queued request that a newer
  * request for the same operation supersedes (WP300-R7-X3). If the operation
  * was answered during the delivery and sent back to UNKNOWN inside it, it
- * stays UNKNOWN: the newer, queued request moves it to RECONCILING when retry
- * delivers it (WP300-R8-X1; the older request never stands in for it).
+ * stays UNKNOWN: retry moves it to RECONCILING by delivering the request
+ * raised when it was sent back — or, if evidence weighed inside the same call
+ * raised an even newer request, a fresh one carrying everything (WP300-R8-X1,
+ * WP300-R9-04; the older request never stands in for either).
+ *
+ * WHAT IS WEIGHED WHEN AN OPERATION GOES BACK TO UNKNOWN (WP300-R8-01,
+ * WP300-R9-01). Nothing that accompanies or triggers a return to UNKNOWN is
+ * thrown away. Before the reconciliation request is built, the evidence is
+ * weighed against the whole identity set (see EVIDENCE OUTSIDE FLIGHT)
+ * exactly as the same fact observed one step later, under reconciliation,
+ * would be — with the identifiers it was the first to name counting as named
+ * by it:
+ * - the claim that sent the operation back: an unrecognised or under-evidenced
+ *   observation (or refused reconciliation evidence applied like one), one
+ *   naming another transaction, a SUBMITTED after MINED (a stale report, which
+ *   changes nothing), a superseded terminal answer, the executor's late
+ *   contradiction, the executor's NOT_SENT / unrecognised answer contradicting
+ *   what was buffered, or its SUBMITTED when the buffer conflicts with it;
+ * - every observation still buffered (received while the executor call was
+ *   pending): none is applied, every one is weighed.
+ * What is NOT weighed is the executor's own answer when nothing else was
+ * received (a THROW, an unrecognised answer, a NOT_SENT naming a transaction):
+ * it is the operation's own uncertainty, the reason reconciliation is asked
+ * for, and contradicts nothing; it names at most the operation's own
+ * transaction, which it admits. Nor is a SUBMITTED the operation goes into
+ * flight under (its identity in flight — the in-flight trust boundary), nor a
+ * THROW (no fact), early or late.
  *
  * OBSERVATIONS DURING SUBMISSION (WP300-R1-05, WP300-R2-02). While the
  * executor call is still pending:
  * - an UNRECOGNISED observation (UNKNOWN, DROPPED, malformed …) moves the
  *   operation to UNKNOWN at once and requests reconciliation — it never waits
- *   for the executor to answer;
- * - any other observation is buffered (classified on arrival). When the
- *   executor answers SUBMITTED the WHOLE buffer is checked before anything is
- *   applied: an identity conflict, or anything after a terminal observation
- *   other than an exact repeat of it, is conflicting evidence and the
- *   operation goes UNKNOWN with nothing applied. Otherwise the buffer is
- *   applied in arrival order. If the executor answers NOT_SENT, throws, or
- *   answers something unrecognised while observations are buffered, the
- *   operation goes UNKNOWN (never FAILED);
+ *   for the executor to answer; it is weighed there, with whatever was
+ *   buffered (above);
+ * - any other observation is buffered (classified on arrival; its identity
+ *   admitted). When the executor answers SUBMITTED the WHOLE buffer is checked
+ *   before anything is applied: an identity conflict, or anything after a
+ *   terminal observation other than an exact repeat of it, is conflicting
+ *   evidence and the operation goes UNKNOWN with nothing applied. Otherwise
+ *   the buffer is applied in arrival order, and if one of them sends the
+ *   operation back to UNKNOWN, it and the rest are weighed there. If the
+ *   executor answers NOT_SENT, throws, or answers something unrecognised
+ *   while observations are buffered, the operation goes UNKNOWN (never
+ *   FAILED), and the buffer is weighed (above);
  * - NOTHING CONCLUDES (CONFIRMED or FAILED, which release reservations and end
  *   the in-flight hold) while the executor call is pending (WP300-R3-02): its
  *   answer may still name another transaction. A terminal reconciliation
  *   answer is refused (`WALLET_OP_EVIDENCE_REQUIRED`) and the reconciler is
- *   asked again once the executor answers; a terminal observation on an
- *   operation reconciliation moved to SUBMITTED/MINED is kept (buffered) and
- *   weighed with the executor's answer, exactly like the PLANNED buffer.
+ *   asked again once the executor answers.
+ * Since WP300-R9-01 an operation that left PLANNED while the executor call was
+ * pending never returns to flight before the executor answers: what moved it
+ * was weighed under reconciliation, so a "still in flight" answer is refused
+ * (see below). The handling of a terminal observation in flight while the
+ * executor is pending (kept, weighed with its answer) is defence in depth.
  * An executor answer that arrives after the operation already left PLANNED
- * is evidence too: consistent → its identity is learned and any kept
- * observations are applied; contradictory (NOT_SENT, unrecognised, another
- * transaction) → UNKNOWN if the operation is SUBMITTED/MINED, otherwise a
- * fresh reconciliation request carries it. Because nothing concluded while it
- * was pending, that request is always answerable.
+ * is evidence too, weighed like the same fact from any other source:
+ * consistent → weighed as the SUBMITTED report it is (a transaction it names
+ * first is admitted, marked, and must be answered by name); contradictory
+ * (NOT_SENT, unrecognised, another transaction) → weighed like an
+ * unrecognised fact; a fresh reconciliation request carries what it opens or
+ * contradicts.
+ * Because nothing concluded while it was pending, that request is always
+ * answerable.
  *
  * ONE IDENTITY SET (WP300-R1-03, WP300-R3-01, WP300-R4-01, WP300-R5-01/02,
  * WP300-R6-01/02). Every transaction hash and relayer id named by any evidence
@@ -110,16 +144,20 @@
  *   operation submitted as `(A, R)`, with A never answered by name.
  * Once anything is weighed under reconciliation (an observation, refused
  * reconciliation evidence — including a superseded answer that arrived in
- * flight — or a late contradiction from the executor; anything but a stale
- * SUBMITTED/MINED report naming no new member, which changes nothing), or the
- * set holds two hashes or two relayer ids, no pairing is assumed: every member
- * is answered by name, terminally (an answer saying "still in flight" is
- * refused and weighed). That holds even when the weighing happened while no transaction
- * had been named yet (WP300-R8-02): every member named AFTER it — by the
- * executor's late answer, an observation or an answer — is answered by name
- * too. With no member at all there is nothing to name, so a terminal answer
- * naming no transaction concludes (a CONFIRMED always names its hash, so such
- * an answer is a FAILED).
+ * flight —, a late contradiction from the executor, and, since WP300-R9-01,
+ * everything that accompanies or triggers a return to UNKNOWN: the claim that
+ * sent the operation back and every observation buffered meanwhile; anything
+ * but a stale SUBMITTED/MINED report naming no new member, which changes
+ * nothing), or the set holds two hashes or two relayer ids, no pairing is
+ * assumed: every member is answered by name, terminally (an answer saying
+ * "still in flight" is refused and weighed). That holds even when the
+ * weighing happened while no transaction had been named yet (WP300-R8-02):
+ * every member named AFTER it — by the executor's late answer, an observation
+ * or an answer — is answered by name too. With no member at all there is
+ * nothing to name, so a terminal answer naming no transaction concludes (a
+ * CONFIRMED always names its hash, so such an answer is a FAILED). So simple
+ * mode survives a return to UNKNOWN only when what sent the operation back is
+ * the executor's own answer with nothing buffered, or a stale report.
  *
  * Per member there is ONE standing outcome (CONFIRMED or FAILED), written by
  * an authoritative answer — for EVERY member the answer names — or by the
@@ -186,6 +224,20 @@
  * reconciliation (`WALLET_OP_EVIDENCE_SUPERSEDED`, as does a terminal answer
  * naming a request not issued for the operation), and is then weighed there.
  *
+ * The FIRST entry into reconciliation marks nothing by itself (WP300-R9-01
+ * asked whether it should; it does not): there is no earlier request whose
+ * reads it could supersede, and every claim that accompanies or triggers it
+ * is weighed (see WHAT IS WEIGHED …), so each marks what it concerns and an
+ * answer that echoes no request is superseded for all of it. What stays
+ * current for such an answer is only what no weighed evidence concerns — all
+ * of it after the executor's own uncertainty with nothing buffered (a THROW,
+ * an unrecognised answer), where nothing was weighed. Marking everything
+ * on the first entry would make an answer that echoes no request useless
+ * before any conclusion (every RECONCILING operation passed through UNKNOWN),
+ * which the request contract allows; known risk: a reconciler that answers
+ * without echoing the request it read for, from a read made before it was
+ * asked, is trusted for what nothing contradicts.
+ *
  * Reconciliation evidence that is not RECORDED as a resolution — whatever the
  * reason: not authoritative, inconclusive, superseded, unwitnessed, refused
  * while the executor is pending, contradicting standing evidence, or arriving
@@ -195,13 +247,19 @@
  *   name; quarantining after a terminal state and suspending an approval);
  * - in flight, a CURRENT answer is applied exactly as the same observation
  *   would be (the in-flight trust boundary), while a SUPERSEDED terminal
- *   answer, or one naming a request not issued for the operation, is never
- *   applied: it sends the operation back to reconciliation and is then
- *   weighed there like the same observation outside flight — admitting what
- *   it names, contesting what it contradicts, requiring every member by name
- *   (WP300-R8-01). That weighing happens BEFORE the reconciliation request is
- *   delivered, so the request carries the new members and a requester that
- *   answers synchronously, inside the call, already has to answer them.
+ *   answer, or one naming a request not issued for the operation —
+ *   authoritative or not (WP300-R9-03) — is never applied: it sends the
+ *   operation back to reconciliation and is then weighed there like the same
+ *   observation outside flight — admitting what it names, contesting what it
+ *   contradicts, requiring every member by name (WP300-R8-01). That weighing
+ *   happens BEFORE the reconciliation request is delivered, so the request
+ *   carries the new members and a requester that answers synchronously,
+ *   inside the call, already has to answer them. An answer that is not
+ *   terminal (SUBMITTED/MINED) is applied in flight like the same observation
+ *   whether or not it is superseded: it cannot conclude, but it can teach the
+ *   operation a first hash or a first relayer id (the in-flight trust
+ *   boundary), and one naming another transaction sends it back to UNKNOWN,
+ *   where it is weighed.
  * The one exception is an authoritative answer that repeats, for every member
  * it names, an outcome the authority already gave and that still stands: it
  * carries no new fact (directive 3 would otherwise let a reconciler that
@@ -319,9 +377,10 @@ export type WalletOperationSubmission = WalletOperationPlan;
  * refuses PAPER); in this repository only test mocks implement it.
  *
  * Recognised results: `{ status: "NOT_SENT" }` (definitively nothing left the
- * process) and `{ status: "SUBMITTED", transactionHash: string | null,
- * transactionId: string | null }` with at least one non-null. Anything else,
- * or a rejection, is UNKNOWN.
+ * process; it names no transaction — a NOT_SENT naming one, or carrying a
+ * malformed identity field, is unrecognised: WP300-R9-02) and `{ status:
+ * "SUBMITTED", transactionHash: string | null, transactionId: string | null }`
+ * with at least one non-null. Anything else, or a rejection, is UNKNOWN.
  */
 export interface WalletOperationExecutor {
   submit(submission: WalletOperationSubmission): Promise<unknown>;
@@ -434,8 +493,39 @@ interface Operation {
   latestRequestId: string | null;
   /** The credited amount of the CONFIRMED observation whose deltas were applied. */
   confirmedCredited: DecimalString | null;
-  readonly buffered: Classified[];
+  /** Observations kept while the executor call is pending, in arrival order. */
+  readonly buffered: Buffered[];
   ordinal: number;
+}
+
+/** An observation kept while the executor call is pending (see the header, "OBSERVATIONS DURING SUBMISSION"). */
+interface Buffered {
+  readonly outcome: Classified;
+  /** The keys it was the first to name (admitted on arrival — WP300-R3-01). */
+  readonly firstNamed: readonly string[];
+}
+
+/**
+ * The evidence that sends an operation back to UNKNOWN, weighed there
+ * (WP300-R8-01, WP300-R9-01). `firstNamed`: the keys it was the first to name
+ * if it was admitted before the weighing. `afterBuffer: false` when it arrived
+ * BEFORE the observations still buffered (a buffered observation being
+ * applied when it sent the operation back), so the weighing keeps arrival order.
+ */
+interface Trigger {
+  readonly evidence: WeighedEvidence;
+  readonly firstNamed: readonly string[];
+  readonly afterBuffer: boolean;
+}
+
+/** Where an outcome being applied in flight came from (see {@link WalletOperationManager.#applyOutcome}). */
+interface Origin {
+  /** Whatever identity the raw evidence named (an unrecognised outcome carries none of its own). */
+  readonly hints: Identity;
+  /** The keys it was the first to name, if they were admitted before it is applied. */
+  readonly firstNamed: readonly string[];
+  /** It was buffered: what is still buffered arrived after it. */
+  readonly fromBuffer: boolean;
 }
 
 type Classified =
@@ -586,14 +676,24 @@ export class WalletOperationManager {
       return ok(view(operation));
     }
     // Any identity the answer names is witnessed, whatever else it says (WP300-R3-01).
-    operation.identity.admit(hints);
+    const executorNamed = operation.identity.admit(hints);
+    // WP300-R9-01: when observations were buffered meanwhile, an executor answer
+    // that is NOT_SENT or unrecognised contradicts them, exactly like a late
+    // contradiction: it is weighed with them (as an unrecognised fact). A THROW
+    // carries no fact. With nothing buffered there is nothing to contradict:
+    // the executor's own uncertainty is the reason for reconciliation, and
+    // simple mode stays.
+    const contradiction = (): Trigger | null =>
+      operation.buffered.length === 0
+        ? null
+        : { evidence: { kind: "UNRECOGNISED", ...hints, credited: null }, firstNamed: executorNamed, afterBuffer: true };
     if (result === "THREW") {
       this.#toUnknown(operation, `the executor threw; the submission's fate is unknown${this.#bufferedNote(operation)}`);
     } else if (result.kind === "NOT_SENT") {
       if (operation.buffered.length > 0) {
         // Something was observed about this operation while the executor said
         // nothing left the process: conflicting evidence, never assumed.
-        this.#toUnknown(operation, `executor: NOT_SENT contradicted${this.#bufferedNote(operation)}`);
+        this.#toUnknown(operation, `executor: NOT_SENT contradicted${this.#bufferedNote(operation)}`, contradiction());
       } else {
         this.#transition(operation, "FAILED", "executor: NOT_SENT (nothing left the process)");
         this.#releaseAll(operation);
@@ -601,11 +701,16 @@ export class WalletOperationManager {
       }
     } else if (result.kind === "SUBMITTED") {
       this.#transition(operation, "SUBMITTED", "executor: SUBMITTED");
-      this.#drainBuffer(operation, result);
+      this.#drainBuffer(operation, result, {
+        evidence: { kind: "SUBMITTED", transactionHash: result.transactionHash, transactionId: result.transactionId, credited: null },
+        firstNamed: executorNamed,
+        afterBuffer: true,
+      });
     } else {
       this.#toUnknown(
         operation,
         `unrecognised executor result: ${result.kind === "UNRECOGNISED" ? result.why : result.kind}${this.#bufferedNote(operation)}`,
+        contradiction(),
       );
     }
     return ok(view(operation));
@@ -639,10 +744,12 @@ export class WalletOperationManager {
    * be: weighed against the whole identity set (contesting what it
    * contradicts, admitting what it names, requiring every member by name,
    * quarantining after a terminal state). In flight, a current answer is
-   * applied as the same observation would be; a superseded terminal answer, or
-   * one naming a request not issued for the operation, is not applied — it
-   * sends the operation back to reconciliation and is weighed there like the
-   * same observation outside flight, before the request is delivered
+   * applied as the same observation would be (and if that sends the operation
+   * back to UNKNOWN, it is weighed there — WP300-R9-01); a superseded terminal
+   * answer, or one naming a request not issued for the operation,
+   * authoritative or not (WP300-R9-03), is not applied — it sends the
+   * operation back to reconciliation and is weighed there like the same
+   * observation outside flight, before the request is delivered
    * (WP300-R8-01). The one exception is an authoritative answer that repeats,
    * for every member it names, what the authority already said and still
    * stands: it carries no new fact.
@@ -670,19 +777,22 @@ export class WalletOperationManager {
     if (operation.state === "PLANNED" && operation.submitting) {
       // Witnessed on arrival: the identity survives whatever happens to the
       // buffer (WP300-R3-01).
-      operation.identity.admit(hints);
+      const firstNamed = operation.identity.admit(hints);
       const classified = classifyObservation(observation);
       if (classified.kind === "UNRECOGNISED") {
-        // Uncertainty is acted on now, not when (or if) the executor answers.
+        // Uncertainty is acted on now, not when (or if) the executor answers;
+        // it is weighed there, with whatever was buffered (WP300-R9-01).
         this.#toUnknown(
           operation,
           `unrecognised observation during submission: ${classified.why}${this.#bufferedNote(operation)}`,
+          { evidence: { kind: "UNRECOGNISED", ...hints, credited: null }, firstNamed, afterBuffer: true },
         );
         return ok(view(operation));
       }
       // The executor has not answered yet; the observation is kept, classified
-      // now, and applied once it does (see the header).
-      operation.buffered.push(classified);
+      // now, and applied once it does — or weighed, if the operation goes back
+      // to reconciliation first (see the header).
+      operation.buffered.push({ outcome: classified, firstNamed });
       return ok(view(operation));
     }
     if (operation.state !== "SUBMITTED" && operation.state !== "MINED") {
@@ -710,16 +820,24 @@ export class WalletOperationManager {
       // kept and weighed with the executor's answer; a conflicting one is
       // conflicting evidence now.
       const conflict = operation.identity.fieldConflict(classified);
-      operation.identity.admit(classified);
+      const firstNamed = operation.identity.admit(classified);
       if (conflict !== null) {
-        this.#toUnknown(operation, `observation: ${classified.kind} under a different ${conflict}; conflicting evidence is never assumed`);
+        this.#toUnknown(operation, `observation: ${classified.kind} under a different ${conflict}; conflicting evidence is never assumed`, {
+          evidence: weighedOf(classified, hints),
+          firstNamed,
+          afterBuffer: true,
+        });
         return ok(view(operation));
       }
-      operation.buffered.push(classified);
+      operation.buffered.push({ outcome: classified, firstNamed });
       return ok(view(operation));
     }
-    if (classified.kind === "UNRECOGNISED") operation.identity.admit(hints);
-    this.#applyOutcome(operation, classified, from === "observation" ? "observation" : "reconciliation evidence (handled as an observation)");
+    const firstNamed = classified.kind === "UNRECOGNISED" ? operation.identity.admit(hints) : [];
+    this.#applyOutcome(operation, classified, from === "observation" ? "observation" : "reconciliation evidence (handled as an observation)", {
+      hints,
+      firstNamed,
+      fromBuffer: false,
+    });
     return ok(view(operation));
   }
 
@@ -773,10 +891,11 @@ export class WalletOperationManager {
     const issuedAt =
       binding === undefined || binding === null ? 0 : typeof binding === "string" ? operation.requests.get(binding) : undefined;
     if (!terminalState && operation.state !== "RECONCILING" && !answeringRequest) {
-      if (authoritative && outcome !== null && (operation.state === "SUBMITTED" || operation.state === "MINED")) {
+      if (outcome !== null && (operation.state === "SUBMITTED" || operation.state === "MINED")) {
         // In flight a refused answer is applied like an observation — unless it
-        // is superseded (or names a request not issued for this operation): an
-        // old read never concludes anything. It sends the operation back to
+        // is a TERMINAL answer that is superseded (or names a request not issued
+        // for this operation), authoritative or not (WP300-R9-03): an old read
+        // never concludes anything. It sends the operation back to
         // reconciliation instead (nothing applied or released) and, once the
         // operation is out of flight, it is WEIGHED like the same observation
         // would be there (WP300-R8-01): it admits what it names, contests what it
@@ -789,7 +908,7 @@ export class WalletOperationManager {
           this.#toUnknown(
             operation,
             `a superseded ${outcome} reconciliation answer arrived in flight (${superseded}); it is weighed against the whole identity set, nothing is assumed${this.#bufferedNote(operation)}`,
-            weighedEvidence(observation, identityHints(observation)),
+            { evidence: weighedEvidence(observation, identityHints(observation)), firstNamed: [], afterBuffer: true },
           );
           return {
             result: refuse("WALLET_OP_EVIDENCE_SUPERSEDED", "a superseded answer arrived in flight; the operation is under reconciliation again and the answer is weighed", {
@@ -945,13 +1064,25 @@ export class WalletOperationManager {
 
   // -------------------------------------------------------------- internal --
 
-  #applyOutcome(operation: Operation, outcome: Classified, via: string): void {
+  /**
+   * Apply an outcome to an operation in flight. Whatever sends the operation
+   * back to UNKNOWN here is weighed there, exactly as the same fact observed
+   * one step later would be (WP300-R9-01).
+   */
+  #applyOutcome(operation: Operation, outcome: Classified, via: string, origin: Origin): void {
+    let firstNamed = origin.firstNamed;
+    const back = (reason: string): void =>
+      this.#toUnknown(operation, reason, {
+        evidence: weighedOf(outcome, origin.hints),
+        firstNamed,
+        afterBuffer: !origin.fromBuffer,
+      });
     if (outcome.kind === "SUBMITTED" || outcome.kind === "MINED" || outcome.kind === "CONFIRMED" || outcome.kind === "FAILED") {
       const conflict = operation.identity.fieldConflict(outcome);
       // Witnessed even when it conflicts: the conflict stays explicit (WP300-R3-01).
-      operation.identity.admit(outcome);
+      firstNamed = [...firstNamed, ...operation.identity.admit(outcome)];
       if (conflict !== null) {
-        this.#toUnknown(operation, `${via}: ${outcome.kind} under a different ${conflict}; conflicting evidence is never assumed`);
+        back(`${via}: ${outcome.kind} under a different ${conflict}; conflicting evidence is never assumed`);
         return;
       }
     }
@@ -963,7 +1094,7 @@ export class WalletOperationManager {
       case "SUBMITTED":
         // A repeated SUBMITTED report changes nothing; after MINED it is a regression.
         if (operation.state !== "SUBMITTED") {
-          this.#toUnknown(operation, `${via}: SUBMITTED after MINED`);
+          back(`${via}: SUBMITTED after MINED`);
           return;
         }
         return;
@@ -975,7 +1106,7 @@ export class WalletOperationManager {
       case "CONFIRMED": {
         const needsCredit = CREDIT_EVIDENCE_TYPES.includes(operation.plan.type);
         if (needsCredit && outcome.credited === null) {
-          this.#toUnknown(operation, `${via}: CONFIRMED without the observed credited amount; not assumed`);
+          back(`${via}: CONFIRMED without the observed credited amount; not assumed`);
           return;
         }
         this.#transition(operation, "CONFIRMED", `${via}: CONFIRMED`);
@@ -1000,10 +1131,7 @@ export class WalletOperationManager {
         return;
       }
       default:
-        this.#toUnknown(
-          operation,
-          `unrecognised ${via}: ${outcome.kind === "UNRECOGNISED" ? outcome.why : outcome.kind}`,
-        );
+        back(`unrecognised ${via}: ${outcome.kind === "UNRECOGNISED" ? outcome.why : outcome.kind}`);
     }
   }
 
@@ -1143,19 +1271,31 @@ export class WalletOperationManager {
   }
 
   /**
-   * Move the operation to UNKNOWN and request reconciliation. `evidence`, if
-   * given, is the evidence that sent it back, to be weighed against the whole
-   * identity set once it is out of flight (WP300-R8-01): it is weighed HERE,
-   * after the transition and BEFORE the request is built and delivered, so
-   * the request carries every obligation it creates and a requester that
-   * answers synchronously, inside the call, already meets them.
+   * Move the operation to UNKNOWN and request reconciliation. Every piece of
+   * evidence that goes with it is weighed against the whole identity set HERE,
+   * after the transition and BEFORE the request is built and delivered, so the
+   * request carries every obligation it creates and a requester that answers
+   * synchronously, inside the call, already meets them (WP300-R8-01):
+   * - `trigger`, the evidence that sent the operation back, if it is a claim
+   *   (an observation or answer, or the executor contradicting what was
+   *   buffered); it is weighed exactly as the same fact observed one step
+   *   later would be (WP300-R9-01);
+   * - every observation still buffered (received while the executor call was
+   *   pending): none is applied, and none is thrown away (WP300-R9-01).
+   * They are weighed in arrival order. What none of them concerns is not
+   * marked: an answer that echoes no request stays current for it (see the
+   * header, "RECONCILIATION ANSWERS").
    */
-  #toUnknown(operation: Operation, reason: string, evidence: WeighedEvidence | null = null): void {
+  #toUnknown(operation: Operation, reason: string, trigger: Trigger | null = null): void {
     // WP300-R7-X3: re-entering reconciliation after a request was issued — the
     // evidence that sent the operation back is newer than any earlier read.
     if (operation.requestCount > 0) operation.identity.supersedeEverything();
     this.#transition(operation, "UNKNOWN", reason);
-    if (evidence !== null) this.#weighUnderReconciliation(operation, evidence);
+    const discarded = operation.buffered.splice(0).map(
+      (kept): Trigger => ({ evidence: weighedOf(kept.outcome, identityOf(kept.outcome)), firstNamed: kept.firstNamed, afterBuffer: true }),
+    );
+    const weighed = trigger === null ? discarded : trigger.afterBuffer ? [...discarded, trigger] : [trigger, ...discarded];
+    for (const item of weighed) this.#weighUnderReconciliation(operation, item.evidence, item.firstNamed);
     this.#requestReconciliation(
       operation,
       requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, reason),
@@ -1182,26 +1322,44 @@ export class WalletOperationManager {
    * Apply the observations buffered while the executor call was pending, now
    * that it has answered consistently. The whole buffer is checked first:
    * conflicting identities, or anything after a terminal observation other
-   * than an exact repeat, send the operation to UNKNOWN with nothing applied.
+   * than an exact repeat, send the operation to UNKNOWN with nothing applied
+   * (every buffered observation, and `executorAnswer`, weighed there).
    */
-  #drainBuffer(operation: Operation, seed: Identity): void {
+  #drainBuffer(operation: Operation, seed: Identity, executorAnswer: Trigger): void {
     const conflict = operation.identity.isConflicted()
       ? "more than one transaction has been named"
-      : bufferConflict(seed, operation.buffered);
+      : bufferConflict(
+          seed,
+          operation.buffered.map((kept) => kept.outcome),
+        );
     if (conflict !== null) {
-      // Nothing buffered is applied: conflicting evidence goes to reconciliation whole.
-      this.#toUnknown(operation, `observations received during submission conflict (${conflict})${this.#bufferedNote(operation)}`);
+      // Nothing buffered is applied: conflicting evidence goes to reconciliation
+      // whole, where every buffered observation is weighed — and so is the
+      // executor's answer, which arrived after them and is one side of the
+      // conflict (WP300-R9-01).
+      this.#toUnknown(
+        operation,
+        `observations received during submission conflict (${conflict})${this.#bufferedNote(operation)}`,
+        executorAnswer,
+      );
       return;
     }
-    const buffered = operation.buffered.splice(0);
-    for (const outcome of buffered) {
-      // Re-read the state: each applied outcome may have moved it. After a
-      // terminal outcome the rest are exact repeats (checked above); after
-      // UNKNOWN they are reconciliation's to weigh.
+    // Applied one at a time, in arrival order. Re-read the state: each applied
+    // outcome may have moved it. If one sends the operation back to UNKNOWN, it
+    // and every observation still buffered are weighed there (#toUnknown).
+    while (operation.buffered.length > 0) {
       const current: WalletOperationState = stateOf(operation);
       if (current !== "SUBMITTED" && current !== "MINED") break;
-      this.#applyOutcome(operation, outcome, "observation (received during submission)");
+      const kept = operation.buffered.shift();
+      if (kept === undefined) break;
+      this.#applyOutcome(operation, kept.outcome, "observation (received during submission)", {
+        hints: identityOf(kept.outcome),
+        firstNamed: kept.firstNamed,
+        fromBuffer: true,
+      });
     }
+    // After a conclusion, whatever is left repeats it exactly (checked above).
+    operation.buffered.length = 0;
   }
 
   /**
@@ -1248,8 +1406,8 @@ export class WalletOperationManager {
    * while the set is still empty (WP300-R8-02: the flag binds what is named
    * afterwards). Raises no request and quarantines nothing: the caller does.
    */
-  #weighUnderReconciliation(operation: Operation, evidence: WeighedEvidence): Weighing {
-    const weighed = operation.identity.weigh(evidence, operation.confirmedCredited);
+  #weighUnderReconciliation(operation: Operation, evidence: WeighedEvidence, firstNamed: readonly string[] = []): Weighing {
+    const weighed = operation.identity.weigh(evidence, operation.confirmedCredited, firstNamed);
     const staleReport = (evidence.kind === "SUBMITTED" || evidence.kind === "MINED") && weighed.admitted.length === 0;
     if (!isTerminalState(operation.state) && !staleReport) operation.identity.requireEveryKey();
     return weighed;
@@ -1325,12 +1483,15 @@ export class WalletOperationManager {
       operation.requesting = false;
     }
     if (operation.state !== "UNKNOWN") return delivered; // answered during the call
-    if (operation.latestRequestId !== request.requestId && this.#queuedAdvancing(operation.latestRequestId)) {
+    if (operation.latestRequestId !== request.requestId && this.#queuedAdvancing(operation, request.requestId)) {
       // Answered during the call, moved, and sent back to UNKNOWN inside it: the
-      // newer request raised then (queued, never re-entrant) carries the
-      // operation now and moves it to RECONCILING when retry delivers it. This
-      // one must not stand in for it, or retry would find the operation out of
-      // UNKNOWN and never deliver the newer request.
+      // request raised then (queued, never re-entrant) carries the operation
+      // now, and retry moves it to RECONCILING — delivering that request if it
+      // is still the newest, or a fresh one if an even newer request (one that
+      // does not advance, raised by evidence weighed inside the same call)
+      // superseded it (WP300-R9-04). This one must not stand in for it, or
+      // retry would find the operation out of UNKNOWN and never deliver the
+      // request that names the new evidence.
       return delivered;
     }
     if (delivered) this.#transition(operation, "RECONCILING", reason);
@@ -1338,9 +1499,16 @@ export class WalletOperationManager {
     return delivered;
   }
 
-  /** Whether the request with this id is queued and moves its operation to RECONCILING once delivered. */
-  #queuedAdvancing(requestId: string | null): boolean {
-    return this.#outstandingRequests.some((entry) => entry.advances && entry.request.requestId === requestId);
+  /**
+   * Whether a request other than `except` is queued for this operation that
+   * moves it to RECONCILING once delivered (one raised when it was sent back
+   * to UNKNOWN during a delivery).
+   */
+  #queuedAdvancing(operation: Operation, except: string): boolean {
+    return this.#outstandingRequests.some(
+      (entry) =>
+        entry.advances && entry.request.walletOperationId === operation.plan.operationId && entry.request.requestId !== except,
+    );
   }
 
   #deliver(request: ReconciliationRequest): boolean {
@@ -1417,27 +1585,41 @@ export class WalletOperationManager {
     }
     // Witnessed whatever it says: a second transaction stays explicit (WP300-R3-01).
     const unresolvedBefore = new Set(unresolvedKeys(operation));
-    if (state !== "SUBMITTED" && state !== "MINED" && contradiction !== null) {
-      // WP300-R7-X3: outside flight a contradiction is a doubt, weighed (and
-      // marked) like an unrecognised observation: reads made before it are
-      // superseded. Nothing stands while the executor was pending, so it
-      // contests nothing. Like any evidence weighed under reconciliation, it
-      // ends simple mode: every member is answered by name (WP300-R8-02).
-      this.#weighUnderReconciliation(operation, { kind: "UNRECOGNISED", ...hints, credited: null });
+    let firstNamed: readonly string[] = [];
+    if (state !== "SUBMITTED" && state !== "MINED") {
+      // Outside flight the late answer is weighed like the same fact arriving
+      // there from any other source. WP300-R7-X3: a contradiction is a doubt,
+      // weighed (and marked) like an unrecognised observation: reads made
+      // before it are superseded; like any evidence weighed under
+      // reconciliation, it ends simple mode (WP300-R8-02). WP300-R9-01: a
+      // consistent answer is the lifecycle report it is — stale (no change) if
+      // it names nothing new, otherwise it admits and marks what it names
+      // first, so a read made before that transaction was named is superseded.
+      // Nothing stands while the executor was pending, so it contests nothing.
+      const late: WeighedEvidence = { kind: contradiction === null ? "SUBMITTED" : "UNRECOGNISED", ...hints, credited: null };
+      this.#weighUnderReconciliation(operation, late);
     } else {
-      operation.identity.admit(hints);
+      firstNamed = operation.identity.admit(hints);
     }
     if (state === "SUBMITTED" || state === "MINED") {
       // Reconciliation said "still in flight" while the executor was pending.
       if (contradiction !== null) {
-        this.#toUnknown(operation, `${contradiction}${this.#bufferedNote(operation)}`);
+        // WP300-R9-01: the contradiction is weighed once the operation is out
+        // of flight, like the same contradiction arriving there, and so is
+        // everything kept meanwhile (#toUnknown).
+        this.#toUnknown(operation, `${contradiction}${this.#bufferedNote(operation)}`, {
+          evidence: { kind: "UNRECOGNISED", ...hints, credited: null },
+          firstNamed,
+          afterBuffer: true,
+        });
         return;
       }
       // Terminal observations kept while the executor was pending are weighed now.
-      this.#drainBuffer(operation, {
-        transactionHash: operation.identity.hashes[0] ?? null,
-        transactionId: operation.identity.ids[0] ?? null,
-      });
+      this.#drainBuffer(
+        operation,
+        { transactionHash: operation.identity.hashes[0] ?? null, transactionId: operation.identity.ids[0] ?? null },
+        { evidence: { kind: "SUBMITTED", ...hints, credited: null }, firstNamed, afterBuffer: true },
+      );
       return;
     }
     // A member the whole set must now answer for is news to the reconciler too.
@@ -1462,11 +1644,11 @@ export class WalletOperationManager {
     operation.holdId = null;
   }
 
+  /** A note for the reason of a return to UNKNOWN; the buffered observations themselves are weighed by {@link #toUnknown}. */
   #bufferedNote(operation: Operation): string {
     const count = operation.buffered.length;
     if (count === 0) return "";
-    operation.buffered.length = 0;
-    return ` (${String(count)} observation(s) received during submission; not applied)`;
+    return ` (${String(count)} observation(s) received during submission; not applied, weighed under reconciliation)`;
   }
 
   #transition(operation: Operation, to: WalletOperationState, reason: string): void {
@@ -1808,6 +1990,31 @@ function weighedEvidence(raw: unknown, hints: Identity): WeighedEvidence {
 }
 
 /**
+ * A classified outcome as evidence to weigh: a recognised one with its own
+ * identity (and credited amount), anything else as an unrecognised fact
+ * naming whatever the raw evidence named (`hints`).
+ */
+function weighedOf(outcome: Classified, hints: Identity): WeighedEvidence {
+  switch (outcome.kind) {
+    case "SUBMITTED":
+    case "MINED":
+    case "FAILED":
+      return { kind: outcome.kind, transactionHash: outcome.transactionHash, transactionId: outcome.transactionId, credited: null };
+    case "CONFIRMED":
+      return { kind: "CONFIRMED", transactionHash: outcome.transactionHash, transactionId: outcome.transactionId, credited: outcome.credited };
+    default:
+      return { kind: "UNRECOGNISED", ...hints, credited: null };
+  }
+}
+
+/** The identity a classified outcome names (none for NOT_SENT or an unrecognised one). */
+function identityOf(outcome: Classified): Identity {
+  return outcome.kind === "NOT_SENT" || outcome.kind === "UNRECOGNISED"
+    ? { transactionHash: null, transactionId: null }
+    : { transactionHash: outcome.transactionHash, transactionId: outcome.transactionId };
+}
+
+/**
  * Identity fields an arbitrary input names (own data, non-empty strings),
  * whether or not the rest of it is recognised: a transaction named by
  * unrecognised evidence is still a transaction to account for.
@@ -1839,7 +2046,15 @@ function requestFor(operation: Operation, trigger: ReconciliationTrigger, reason
 /** Classify an executor `submit` result. Only two shapes are recognised. */
 export function classifySubmit(raw: unknown): Classified {
   const status = ownData(raw, "status");
-  if (status === "NOT_SENT") return { kind: "NOT_SENT" };
+  if (status === "NOT_SENT") {
+    // WP300-R9-02: "nothing left the process" names no transaction. A NOT_SENT
+    // that names one (or carries a malformed identity field) contradicts
+    // itself: unrecognised, never a release.
+    if (optionalIdentity(raw, "transactionHash") !== null || optionalIdentity(raw, "transactionId") !== null) {
+      return { kind: "UNRECOGNISED", why: "NOT_SENT naming a transaction (or with a malformed identity field)" };
+    }
+    return { kind: "NOT_SENT" };
+  }
   if (status === "SUBMITTED") {
     const transactionHash = nullableString(raw, "transactionHash");
     const transactionId = nullableString(raw, "transactionId");

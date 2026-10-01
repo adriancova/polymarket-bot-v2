@@ -261,8 +261,11 @@ describe("WP300-R7-X3: an answer is bound to the request it answers; a supersede
   it("an answer naming no request is current only while nothing has been weighed; one naming an unknown request is refused", async () => {
     const h = await submitted(SPLIT);
     h.manager.observe("op", { status: "MINED", transactionHash: TX_B });
-    // Nothing weighed yet: an unbound answer is accepted.
-    expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_B)))).toBe("ok");
+    // Amended in r9: since WP300-R9-01 the conflicting MINED(B) that sent the operation back is weighed,
+    // and it first named B, so an unbound answer naming B is taken as read before it...
+    expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_B)))).toBe("WALLET_OP_EVIDENCE_SUPERSEDED");
+    // ...while nothing weighed concerns A yet: an unbound answer naming A is accepted.
+    expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_A)))).toBe("ok");
     h.manager.observe("op", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
     // After contrary evidence, an unbound FAILED(A) is taken as read before it.
     expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_A)))).toBe("WALLET_OP_EVIDENCE_SUPERSEDED");
@@ -274,12 +277,16 @@ describe("WP300-R7-X3: an answer is bound to the request it answers; a supersede
     );
     expectHeld(h, SPLIT);
     expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_A, null, h.reconciler.latest())))).toBe("ok");
+    expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_B, null, h.reconciler.latest())))).toBe("ok");
     expect(h.manager.operation("op")?.state).toBe("FAILED");
   });
 
   it("an answer read for a request issued before the operation re-entered reconciliation is superseded", async () => {
     const h = await submitted(SPLIT);
-    h.manager.observe("op", { status: "DROPPED" });
+    // Amended in r9 (setup only): request 1 is raised by a stale SUBMITTED after MINED, which weighs
+    // nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode.
+    h.manager.observe("op", { status: "MINED", transactionHash: TX_A });
+    h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     // Reconciliation says "still in flight": the operation returns to MINED.
     expect(code(h.manager.resolveByReconciliation("op", auth("MINED", TX_A, null, h.reconciler.id(1))))).toBe("ok");
     expect(h.manager.operation("op")?.state).toBe("MINED");
@@ -371,7 +378,10 @@ describe("WP300-R7-X1: refused reconciliation evidence is weighed like an observ
 
         it(`(a) a new hash under the member relayer id, via the ${route}: the next answer releases nothing`, async () => {
           const h = await submitted(op, () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: ID_R }));
-          h.manager.observe("op", { status: "DROPPED", transactionHash: TX_A, transactionId: ID_R });
+          // Amended in r9 (setup only): reconciliation is entered by a stale SUBMITTED after MINED, which
+          // weighs nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode.
+          h.manager.observe("op", { status: "MINED", transactionHash: TX_A, transactionId: ID_R });
+          h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: ID_R });
           expect(h.manager.operation("op")?.unresolvedTransactions).toEqual([]);
           const result = deliver(h, { state: "CONFIRMED", hash: TX_C, id: ID_R });
           if (route === "authoritative") expect(code(result)).toBe("WALLET_OP_EVIDENCE_CONFLICT");
@@ -436,7 +446,10 @@ describe("WP300-R7-X1: refused reconciliation evidence is weighed like an observ
 
   it("(d) after the simple-mode conclusion, the authority's CONFIRMED(C, R) naming a new hash is weighed: quarantined", async () => {
     const h = await submitted(SPLIT, () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: ID_R }));
-    h.manager.observe("op", { status: "DROPPED", transactionHash: TX_A, transactionId: ID_R });
+    // Amended in r9 (setup only): reconciliation is entered by a stale SUBMITTED after MINED, which weighs
+    // nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode.
+    h.manager.observe("op", { status: "MINED", transactionHash: TX_A, transactionId: ID_R });
+    h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: ID_R });
     expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_A, null, h.reconciler.latest())))).toBe("ok");
     expect(h.manager.operation("op")?.state).toBe("FAILED");
     expect(code(h.manager.resolveByReconciliation("op", auth("CONFIRMED", TX_C, ID_R)))).toBe("WALLET_OP_ILLEGAL_TRANSITION");
@@ -538,12 +551,16 @@ describe("WP300-R7-X1: refused reconciliation evidence is weighed like an observ
     // reconciliation while the set was empty, which WP300-R8-02 closes.
     const h = await submitted(SPLIT);
     expect(h.manager.operation("op")?.state).toBe("SUBMITTED");
+    // Amended in r9 (setup only): reconciliation is entered by a stale SUBMITTED after MINED, which weighs
+    // nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode, so the
+    // synchronous "still in flight" below would be refused.
+    h.manager.observe("op", { status: "MINED", transactionHash: TX_A });
     // A synchronous reconciler: on each request it says "still in flight" under A, then reports B.
     h.reconciler.onRequest = (request) => {
       h.manager.resolveByReconciliation("op", auth("MINED", TX_A, null, request.requestId));
       h.manager.resolveByReconciliation("op", auth("MINED", TX_B, null, request.requestId));
     };
-    h.manager.observe("op", { status: "DROPPED" });
+    h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     // MINED(B) in flight conflicts: back to UNKNOWN, and that request is queued, not delivered inside the call.
     expect(h.manager.operation("op")?.state).toBe("UNKNOWN");
     expect(h.manager.outstandingReconciliationRequests()).toHaveLength(1);
@@ -622,7 +639,10 @@ describe("WP300-R7-X2: an authoritative FAILED for a CONFIRMED approval that is 
 describe("WP300-R7-X4: the pairing still assumed is the one the headers state", () => {
   it("simple mode (one hash, one relayer id, nothing weighed under reconciliation): one answer naming any member concludes", async () => {
     const h = await submitted(SPLIT, () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: ID_R }));
-    h.manager.observe("op", { status: "DROPPED", transactionHash: TX_A, transactionId: ID_R });
+    // Amended in r9 (setup only): reconciliation is entered by a stale SUBMITTED after MINED, which weighs
+    // nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode.
+    h.manager.observe("op", { status: "MINED", transactionHash: TX_A, transactionId: ID_R });
+    h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: ID_R });
     expect(h.manager.operation("op")?.unresolvedTransactions).toEqual([]);
     expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", null, ID_R)))).toBe("ok");
     expect(h.manager.operation("op")?.state).toBe("FAILED");
@@ -649,14 +669,18 @@ describe("WP300-R7-X3 in flight: a superseded answer never concludes; it sends t
       // which WP300-R8-02 closes. Here nothing is weighed before the return to
       // flight; the read is superseded by the operation re-entering reconciliation.
       const h = await submitted(SPLIT);
-      // In flight, DROPPED: UNKNOWN, then RECONCILING with request 1.
-      h.manager.observe("op", { status: "DROPPED" });
+      // Amended in r9 (setup only): both requests are raised by a stale SUBMITTED after MINED, which
+      // weighs nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode
+      // (the r8 setup used DROPPED and UNKNOWN), so "still in flight" would be refused after it.
+      // In flight, a regression: UNKNOWN, then RECONCILING with request 1.
+      h.manager.observe("op", { status: "MINED", transactionHash: TX_A });
+      h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
       expect(h.manager.operation("op")?.state).toBe("RECONCILING");
       // A job reads FAILED for request 1 (delivered later).
       const stale = auth("FAILED", named ? TX_A : null, null, h.reconciler.id(1));
       // Another job says "still in flight" for request 1, then the operation re-enters reconciliation: request 2.
       expect(code(h.manager.resolveByReconciliation("op", auth("MINED", TX_A, null, h.reconciler.id(1))))).toBe("ok");
-      h.manager.observe("op", { status: "UNKNOWN" });
+      h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
       expect(h.reconciler.requests).toHaveLength(2);
       // Reconciliation says "still in flight" for request 2: the operation returns to SUBMITTED.
       expect(code(h.manager.resolveByReconciliation("op", auth("SUBMITTED", TX_A, null, h.reconciler.id(2))))).toBe("ok");
@@ -696,8 +720,11 @@ describe("WP300-R7-X3 in flight: a superseded answer never concludes; it sends t
 
   it("a current refused answer in flight is applied like the same observation (WP300-R7-X1 parity; the contrast to the superseded case)", async () => {
     // Amended in r8 (setup only; see above): in flight under A, DROPPED raises request 1.
+    // Amended in r9 (setup only): a stale SUBMITTED after MINED raises it instead, which weighs
+    // nothing — since WP300-R9-01 a DROPPED that sends the operation back is weighed and ends simple mode.
     const h = await submitted(SPLIT);
-    h.manager.observe("op", { status: "DROPPED" });
+    h.manager.observe("op", { status: "MINED", transactionHash: TX_A });
+    h.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     expect(code(h.manager.resolveByReconciliation("op", auth("SUBMITTED", TX_A, null, h.reconciler.latest())))).toBe("ok");
     expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_A, null, h.reconciler.latest())))).toBe(
       "WALLET_OP_ILLEGAL_TRANSITION",

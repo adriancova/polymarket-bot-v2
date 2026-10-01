@@ -278,7 +278,11 @@ describe("WP300-R6 class guards: every identifier of the set is answered for", (
     const h = harness({ transactionHash: TX_A, transactionId: null });
     h.manager.plan({ type: "SPLIT", operationId: "s", accountRef: ACCOUNT, conditionId: CONDITION, amount: "10" });
     await h.manager.submit("s");
-    h.manager.observe("s", { status: "DROPPED" });
+    // Amended in r9 (setup only): reconciliation is entered by a stale SUBMITTED after MINED, which weighs
+    // nothing, so the operation is in simple mode as this guard needs — since WP300-R9-01 a DROPPED that
+    // sends the operation back is weighed and ends simple mode.
+    h.manager.observe("s", { status: "MINED", transactionHash: TX_A });
+    h.manager.observe("s", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     expect(h.manager.operation("s")?.state).toBe("RECONCILING");
     expect(code(h.manager.resolveByReconciliation("s", authoritative("FAILED", null, ID_R)))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expectHeld(h.book);
