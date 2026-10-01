@@ -6,7 +6,10 @@
  *
  * - **3a, the append bound.** A sink that stalls is answered `503
  *   CONTROL_NOT_AUDITABLE` within the bound, the switch is not engaged, and an
- *   APPLIED record that lands afterwards is VOIDED — never applied.
+ *   APPLIED record that lands afterwards is VOIDED — never applied. Since
+ *   `CONTROL-1b` r1 (`CONTROL1B-R1-J-M1`), retrying that halt while its append
+ *   is unsettled is refused WITHOUT an append, so the retries cannot spend the
+ *   kill-switch reserve, and once the sink answers the halt engages.
  * - **3b, bounded mode-raise records.** An 8 KiB path and fifty key spellings
  *   write a record of the same size as any other refusal's.
  * - **3c, refusal bytes.** The joint INFO `CONTROL1-R2-J-I2` reproduced: an
@@ -166,6 +169,55 @@ describe("CONTROL-1b 3a over HTTP: an audit append is bounded", () => {
     expect((engaged.json() as { killSwitches: { action: string }[] }).killSwitches.map((entry) => entry.action)).toEqual([
       "FULL_HALT",
     ]);
+  });
+});
+
+describe("CONTROL-1b r1 (CONTROL1B-R1-J-M1) over HTTP: retrying a stalled halt cannot spend the reserve", () => {
+  it("the verifiers' reproduction: five GLOBAL FULL_HALTs through a stall offer ONE append; once the sink answers, the halt is 200 and in force", async () => {
+    // C = 10, R = 2, six ordinary records first — the joint report's setup.
+    const inner = stallingInner();
+    inner.stalling = false;
+    const api = await start({ auditInner: inner.wrap, auditAppendTimeoutMs: 100, auditCapacity: 10, auditSafetyReserve: 2 });
+    for (let index = 0; index < 6; index += 1) {
+      const refused = await api.call("POST", `/v1/strategies/ghost-${String(index)}/pause`, {
+        token: FAKE_OPERATOR_TOKEN,
+        body: { reason: "fill the ordinary tier" },
+      });
+      expect((refused.json() as Record<string, unknown>)["code"]).toBe("CONTROL_UNKNOWN_INSTANCE");
+    }
+    expect(api.auditBudget.admitted).toBe(6);
+
+    inner.stalling = true;
+    const halt = { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", reason: "halt now" };
+    const details: string[] = [];
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const refused = await api.call("POST", "/v1/kill-switch", { token: FAKE_OPERATOR_TOKEN, body: halt });
+      expect(refused.status, `attempt ${String(attempt)}`).toBe(503);
+      details.push(String((refused.json() as Record<string, unknown>)["detail"]));
+    }
+    expect(details[0]).toContain("100 ms append bound");
+    for (const detail of details.slice(1)) expect(detail).toContain("is UNSETTLED");
+
+    inner.stalling = false;
+    inner.land();
+    await vi.waitFor(() => {
+      expect(api.controlPlane.unsettledAuditAppends).toBe(0);
+    });
+    // One late APPLIED record landed (and its void, ordinary, was refused: the tier is full).
+    expect(api.audit.records().filter((record) => record.outcome === "APPLIED")).toHaveLength(1);
+    expect(api.auditBudget.admitted).toBe(7);
+
+    // At round 0 four late records filled the reserve and this was 503.
+    const applied = await api.call("POST", "/v1/kill-switch", { token: FAKE_OPERATOR_TOKEN, body: halt });
+    expect(applied.status).toBe(200);
+    const engaged = await api.call("GET", "/v1/kill-switch", { token: FAKE_OPERATOR_TOKEN });
+    expect((engaged.json() as { killSwitches: { action: string }[] }).killSwitches.map((entry) => entry.action)).toEqual([
+      "FULL_HALT",
+    ]);
+    const metrics = await api.call("GET", "/v1/metrics", { token: FAKE_OPERATOR_TOKEN });
+    expect(metrics.text).toContain('control_mutations_total{action="KILL_SWITCH_ENGAGE",outcome="NOT_AUDITED"} 5');
+    expect(metrics.text).toContain('control_mutations_total{action="KILL_SWITCH_ENGAGE",outcome="LANDED_LATE"} 1');
+    expect(metrics.text).toContain("control_audit_append_failures_total 1");
   });
 });
 

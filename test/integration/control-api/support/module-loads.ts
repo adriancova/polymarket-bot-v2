@@ -1,6 +1,7 @@
 /**
  * Every module a source file could LOAD, read from its SYNTAX TREE
- * (`CONTROL-1b`, closing `CONTROL1-R2-J-L1`).
+ * (`CONTROL-1b`, closing `CONTROL1-R2-J-L1`; widened at `CONTROL-1b` r1,
+ * closing `CONTROL1B-R1-J-H2` and `CONTROL1B-R1-J-H3`).
  *
  * ## Why a parse, again
  *
@@ -29,9 +30,17 @@
  * | `typeof import("m")`, `import("m").T` in a type | `import-type` |
  * | `import("m")`, with or without options | `dynamic-import` |
  * | `require("m")` — also `require?.(…)`, `(require)(…)`, `x.require(…)` | `require` |
+ * | `process.getBuiltinModule("m")` — read off any object | `builtin` |
+ * | vitest's `vi.importActual("m")`, `importMock`, `mock`, `doMock`, `unmock`, `doUnmock` | `vi-load` |
  * | `/// <reference types/path/lib="m" />`, `/// <amd-dependency path="m" />` | `reference` |
  * | JSDoc `@import … from "m"` | `jsdoc-import` |
  * | `declare module "m" { … }` | `declare-module` |
+ *
+ * Every executable extension is read with its own grammar (`CONTROL-1b` r1,
+ * closing `CONTROL1B-R1-J-H2`: `.tsx` and `.jsx` were not read at all, and a
+ * computed import in a `.tsx` helper loaded the secure adapter): TypeScript for
+ * `.ts`/`.mts`/`.cts`, TSX for `.tsx`, JavaScript for `.js`/`.mjs`/`.cjs`, JSX
+ * for `.jsx`, and JSON for `.json`.
  *
  * ## What cannot be read FAILS
  *
@@ -39,31 +48,45 @@
  *
  * - a specifier that is not a string literal — a variable, a concatenation, an
  *   interpolated template — is {@link COMPUTED};
- * - a reference to a NAMED LOADER outside a literal call — `require` aliased,
- *   passed or read as a property (`const r = require`, `module["require"]`),
- *   and every `createRequire`, `eval`, `_load` (`Module._load`) and
- *   `Function` called or constructed — is `<loader:NAME>`: each exists to load
- *   or evaluate code the parser cannot see;
- * - a file that does not parse under its own extension's grammar (TypeScript
- *   for `.ts`/`.mts`/`.cts`, JavaScript for `.js`/`.mjs`/`.cjs`, JSON for
- *   `.json`) is {@link UNPARSEABLE}: an escaped keyword (`\u0069mport`) is a
- *   syntax error, and a tree with an error in it is a tree this scan did not
- *   fully read. A `.json` file that parses holds no import at all — JSON has
- *   no syntax for one.
+ * - a NAMED LOADER or EVALUATOR, wherever the code can reach it, is
+ *   `<loader:NAME>` (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H3`: round 0
+ *   flagged `Function` only as a callee, so `const F = Function`,
+ *   `(() => {}).constructor` and `process.getBuiltinModule("node:vm")` each
+ *   reached an evaluator and loaded the venue SDK past it):
+ *   - every `createRequire`, `eval`, `_load`, `_compile`, `dlopen`, `binding`,
+ *     `_linkedBinding`, `ShadowRealm` and `constructor` — as an identifier or
+ *     a property name in ANY position;
+ *   - every name beginning `__vite` — vite-node runs each module inside a
+ *     wrapper whose parameters `__vite_ssr_import__` and
+ *     `__vite_ssr_dynamic_import__` are loaders in scope, and vitest keeps its
+ *     runtime on `globalThis.__vitest_*__` (`CONTROL-1b` r1: the implementer's
+ *     own plant loaded the secure adapter through the first);
+ *   - `Function` in any VALUE position — called, constructed, aliased, passed,
+ *     extended or read as a property — while `f: Function`, `typeof Function`
+ *     in a type and `implements Function` stay legal: types load nothing;
+ *   - `require`, `getBuiltinModule` and vitest's module loaders outside a
+ *     literal call (`vi.mock` and `vi.unmock` only when read off `vi` or
+ *     `vitest`, since `fn.mock.calls` is a spy's record, not a loader);
+ *   - any of those names as a STRING in a value position: `x["eval"]`,
+ *     `Reflect.get(globalThis, "eval")`;
+ *   - `import.meta.glob` and `import.meta.globEager`, which load every module
+ *     a pattern matches;
+ * - a file that does not parse under its own extension's grammar is
+ *   {@link UNPARSEABLE}: an escaped keyword (`import`) is a syntax error,
+ *   and a tree with an error in it is a tree this scan did not fully read. A
+ *   `.json` file that parses holds no import at all — JSON has no syntax for
+ *   one.
  *
- * The scan's caller decides what is FORBIDDEN (`acceptance-3-no-signer.test.ts`):
- * a signing library or the secure adapter, by literal, is never excusable;
- * a computed specifier, a named loader, a loader MODULE (`node:module`,
- * `node:vm`) or an unparseable file is a violation unless an explicit,
- * justified allowlist entry covers it.
+ * The scan's caller decides where each literal LANDS and whether that is
+ * forbidden (`support/load-judge.ts`): a path is judged by the file it
+ * reaches, a bare name by its package, and a builtin by an allowlist.
  *
- * ## What a static scan cannot see, and the layer behind it
+ * ## What a static scan cannot see
  *
- * Code that reaches a loader through a COMPUTED name it never spells
- * (`globalThis[atob("…")]`) is beyond any static scan. The acceptance test's
- * other layer covers that case independently of syntax: none of the forbidden
- * packages is declared in the manifest or even RESOLVABLE from the scanned
- * trees, so such a load would fail at run time.
+ * Code that reaches a loader through a COMPUTED property name it never spells
+ * — `globalThis[atob("…")]`, or `Reflect.get(Object.getPrototypeOf(f), k)`
+ * with a computed `k` — is beyond any static scan, and this one does not claim
+ * it (`acceptance-3-no-signer.test.ts`, "What this does not prove").
  */
 
 import ts from "typescript";
@@ -74,19 +97,36 @@ export const COMPUTED = "<computed>";
 /** A file that does not parse under its extension's grammar. */
 export const UNPARSEABLE = "<unparseable>";
 
-/** The finding a named loader reference produces: `<loader:require>` etc. */
+/** The finding a named loader reference produces: `<loader:eval>` etc. */
 export function loaderFinding(name: string): string {
   return `<loader:${name}>`;
 }
 
-/** Names whose only purpose is to load or evaluate code (module header). */
-export const LOADER_NAMES: readonly string[] = Object.freeze(["require", "createRequire", "eval", "_load"]);
+/**
+ * Names whose purpose is to load or evaluate code, flagged WHEREVER they
+ * appear as an identifier or a property name (module header). `constructor`
+ * is here because every function's `constructor` is an evaluator.
+ */
+export const LOADER_NAMES: readonly string[] = Object.freeze([
+  "createRequire",
+  "eval",
+  "_load",
+  "_compile",
+  "dlopen",
+  "binding",
+  "_linkedBinding",
+  "ShadowRealm",
+  "constructor",
+]);
 
-/** Flagged only when CALLED or CONSTRUCTED; `: Function` as a type is not a load. */
-export const LOADER_CONSTRUCTORS: readonly string[] = Object.freeze(["Function"]);
+/**
+ * Every name beginning with this is the test runner's own machinery
+ * (module header): flagged wherever it appears, like {@link LOADER_NAMES}.
+ */
+export const RUNTIME_LOADER_PREFIX = "__vite";
 
-/** Modules that exist to build a loader or to evaluate code. */
-export const LOADER_MODULES: readonly string[] = Object.freeze(["module", "node:module", "vm", "node:vm"]);
+/** Flagged in a VALUE position only; `: Function` as a type loads nothing. */
+export const EVALUATOR_CONSTRUCTORS: readonly string[] = Object.freeze(["Function"]);
 
 export type ModuleLoadKind =
   | "import"
@@ -95,11 +135,38 @@ export type ModuleLoadKind =
   | "import-type"
   | "dynamic-import"
   | "require"
+  | "builtin"
+  | "vi-load"
   | "reference"
   | "jsdoc-import"
   | "declare-module"
   | "loader"
   | "unparseable";
+
+/**
+ * Loaders whose first argument is a module specifier: a call is read as a load
+ * of that literal, and any other reference to the name is a named loader.
+ */
+export const SPECIFIER_LOADERS: ReadonlyMap<string, ModuleLoadKind> = new Map<string, ModuleLoadKind>([
+  ["require", "require"],
+  ["getBuiltinModule", "builtin"],
+  ["importActual", "vi-load"],
+  ["importMock", "vi-load"],
+  ["doMock", "vi-load"],
+  ["doUnmock", "vi-load"],
+  ["mock", "vi-load"],
+  ["unmock", "vi-load"],
+]);
+
+/**
+ * Of {@link SPECIFIER_LOADERS}, the names a NON-call reference flags only when
+ * read off `vi` or `vitest`: `fn.mock.calls` is a spy's record.
+ */
+export const VITEST_ONLY_WHEN_ON_VI: readonly string[] = Object.freeze(["mock", "unmock"]);
+const VITEST_OBJECTS: readonly string[] = Object.freeze(["vi", "vitest"]);
+
+/** `import.meta.<NAME>` properties that load modules (vite). */
+export const IMPORT_META_LOADERS: readonly string[] = Object.freeze(["glob", "globEager"]);
 
 export interface ModuleLoad {
   readonly kind: ModuleLoadKind;
@@ -109,11 +176,17 @@ export interface ModuleLoad {
   readonly line: number;
 }
 
-/** The extensions this scan reads, and the grammar each is read with. */
-export const SCANNED_EXTENSIONS = [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"] as const;
+/** The executable extensions this scan reads, each with its own grammar. */
+export const CODE_EXTENSIONS = [".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"] as const;
 
-function scriptKindFor(fileName: string): ts.ScriptKind | "JSON" {
+/** Every extension this scan reads: code, and JSON. */
+export const SCANNED_EXTENSIONS = [...CODE_EXTENSIONS, ".json"] as const;
+
+/** The grammar each scanned extension is read with. */
+export function scriptKindFor(fileName: string): ts.ScriptKind | "JSON" {
   if (fileName.endsWith(".json")) return "JSON";
+  if (fileName.endsWith(".tsx")) return ts.ScriptKind.TSX;
+  if (fileName.endsWith(".jsx")) return ts.ScriptKind.JSX;
   if (fileName.endsWith(".js") || fileName.endsWith(".mjs") || fileName.endsWith(".cjs")) return ts.ScriptKind.JS;
   return ts.ScriptKind.TS;
 }
@@ -156,6 +229,42 @@ function calleeOf(name: ts.Identifier): ts.CallExpression | ts.NewExpression | u
 }
 
 /**
+ * Whether `node` sits where only a TYPE can be: inside a type node, an
+ * interface or a type alias, or an `implements` clause. A class's `extends`
+ * clause and an instantiation expression (`f<T>`) are VALUES, although
+ * TypeScript files their node under the type kinds.
+ */
+function inTypePosition(node: ts.Node): boolean {
+  for (let current: ts.Node = node; current.parent !== undefined; current = current.parent) {
+    const parent = current.parent;
+    if (ts.isExpressionWithTypeArguments(parent)) {
+      const clause = parent.parent as ts.Node | undefined;
+      if (clause === undefined || !ts.isHeritageClause(clause)) return false;
+      return clause.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(clause.parent);
+    }
+    if (ts.isTypeNode(parent) || ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent)) return true;
+  }
+  return false;
+}
+
+/** The identifier a property-name identifier is read off (`vi` in `vi.mock`), or `undefined`. */
+function objectNameOf(name: ts.Identifier): string | undefined {
+  const parent = name.parent as ts.Node | undefined;
+  if (parent === undefined || !ts.isPropertyAccessExpression(parent) || parent.name !== name) return undefined;
+  return ts.isIdentifier(parent.expression) ? parent.expression.text : undefined;
+}
+
+/** Whether `name` loads or evaluates code when spelled as a string key. */
+function namesLoader(name: string): boolean {
+  return (
+    LOADER_NAMES.includes(name) ||
+    EVALUATOR_CONSTRUCTORS.includes(name) ||
+    SPECIFIER_LOADERS.has(name) ||
+    name.startsWith(RUNTIME_LOADER_PREFIX)
+  );
+}
+
+/**
  * Every module `text` could load, in source order, duplicates included.
  * `fileName` selects the grammar by extension and labels the parse; it is
  * never read.
@@ -190,7 +299,7 @@ export function moduleLoadsIn(text: string, fileName: string): readonly ModuleLo
     ts.transpileModule(text, {
       fileName,
       reportDiagnostics: true,
-      compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext },
+      compilerOptions: { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.Preserve },
     }).diagnostics ?? [];
   if (diagnostics.some((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)) {
     loads.push({ kind: "unparseable", specifier: UNPARSEABLE, line: 1 });
@@ -210,6 +319,26 @@ export function moduleLoadsIn(text: string, fileName: string): readonly ModuleLo
   for (const dependency of source.amdDependencies) {
     loads.push({ kind: "reference", specifier: dependency.path, line: 1 });
   }
+
+  /** A name that loads or evaluates code, met as an identifier or a property name. */
+  const identifier = (node: ts.Identifier): void => {
+    // `Identifier.text` is the name with its escapes resolved, so
+    // `require` is `require` here, as it is to the runtime.
+    const name = node.text;
+    const specifierKind = SPECIFIER_LOADERS.get(name);
+    if (specifierKind !== undefined) {
+      const call = calleeOf(node);
+      if (call !== undefined && ts.isCallExpression(call)) {
+        add(specifierKind, literal(call.arguments[0]), node);
+      } else if (!VITEST_ONLY_WHEN_ON_VI.includes(name) || VITEST_OBJECTS.includes(objectNameOf(node) ?? "")) {
+        add("loader", loaderFinding(name), node);
+      }
+    } else if (LOADER_NAMES.includes(name) || name.startsWith(RUNTIME_LOADER_PREFIX)) {
+      add("loader", loaderFinding(name), node);
+    } else if (EVALUATOR_CONSTRUCTORS.includes(name) && !inTypePosition(node)) {
+      add("loader", loaderFinding(name), node);
+    }
+  };
 
   const seenTags = new Set<ts.Node>();
   const visit = (node: ts.Node): void => {
@@ -233,26 +362,19 @@ export function moduleLoadsIn(text: string, fileName: string): readonly ModuleLo
       add("declare-module", node.name.text, node);
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
       add("dynamic-import", literal(node.arguments[0]), node);
-    } else if (ts.isIdentifier(node)) {
-      // `Identifier.text` is the name with its escapes resolved, so
-      // `\u0072equire` is `require` here, as it is to the runtime.
-      const name = node.text;
-      if (name === "require") {
-        const call = calleeOf(node);
-        if (call !== undefined && ts.isCallExpression(call)) add("require", literal(call.arguments[0]), node);
-        else add("loader", loaderFinding(name), node);
-      } else if (LOADER_NAMES.includes(name)) {
-        add("loader", loaderFinding(name), node);
-      } else if (LOADER_CONSTRUCTORS.includes(name) && calleeOf(node) !== undefined) {
-        add("loader", loaderFinding(name), node);
-      }
     } else if (
-      ts.isElementAccessExpression(node) &&
-      ts.isStringLiteralLike(node.argumentExpression) &&
-      [...LOADER_NAMES, ...LOADER_CONSTRUCTORS].includes(node.argumentExpression.text)
+      ts.isPropertyAccessExpression(node) &&
+      ts.isMetaProperty(node.expression) &&
+      node.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+      IMPORT_META_LOADERS.includes(node.name.text)
     ) {
-      // `module["require"]`, `globalThis["eval"]`: a loader named by a string.
-      add("loader", loaderFinding(node.argumentExpression.text), node);
+      add("loader", loaderFinding(`import.meta.${node.name.text}`), node);
+    } else if (ts.isIdentifier(node)) {
+      identifier(node);
+    } else if (ts.isStringLiteralLike(node) && namesLoader(node.text) && !inTypePosition(node)) {
+      // A loader named by a STRING in a value position: `module["require"]`,
+      // `Reflect.get(globalThis, "eval")`, `{ "constructor": … }`.
+      add("loader", loaderFinding(node.text), node);
     }
     ts.forEachChild(node, visit);
   };

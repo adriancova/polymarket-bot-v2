@@ -242,6 +242,15 @@ export async function startup(
       "no strategy instance is registered (no seam reaches a running trader's strategies), so a " +
       "pause or resume is refused CONTROL_UNKNOWN_INSTANCE",
   );
+  // `CONTROL-1b` r1 (closing `CONTROL1B-R1-J-L1`): read from the control plane
+  // this process composed, so a composition that drops the void-record source
+  // says so here — and `shipped-root-control-1.test.ts` pins this line.
+  ports.log(
+    `audit append bound ${String(controlPlane.auditAppendTimeoutMs)}ms; an APPLIED record that lands after it gets ` +
+      (controlPlane.voidsLateAppliedRecords
+        ? "a VOID record from this process's clock and id source, when the sink and the audit budget admit one"
+        : "NO void record: no audit record source was composed"),
+  );
   ports.log(
     config.traderHealth.kind === "http"
       ? `trader health: ${config.traderHealth.url} is read on every authorized /v1/health and ` +

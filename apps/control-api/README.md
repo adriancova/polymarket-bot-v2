@@ -174,27 +174,62 @@ switch included. Each append is now raced against a bound,
   record of a refusal. A late APPLIED record would say a change happened that
   did not, so the control plane appends a **void record** beside it:
   `REFUSED`, the same action and target, actor `control-api` (`AUTOMATED`), the
-  voided record's prior state unchanged, and `voidsRecordId` naming it. Both are
-  counted — `control_mutations_total{outcome="LANDED_LATE"}` and
-  `{outcome="VOIDED"}` — so an APPLIED record with no void beside it (the void
-  could not be written, or the composition supplied no record source) is
+  voided record's prior state unchanged, and `voidsRecordId` naming it — when
+  the sink and the audit budget admit it. **A void is not guaranteed:** it is
+  an ORDINARY record, so a full ordinary tier refuses it, as does a sink that
+  is still failing, and a composition with no record source writes none. Both
+  are counted — `control_mutations_total{outcome="LANDED_LATE"}` and
+  `{outcome="VOIDED"}` — so an APPLIED record with no void beside it is
   visible as their difference. A durable reader joins on `voidsRecordId`: the
   late row is in `ops.kill_switch_events` (or `ops.config_change_audit`), its
-  void in `ops.config_change_audit`.
+  void in `ops.config_change_audit`. A late record can also land AFTER a later
+  record of the same switch, so log order is not apply order; the void
+  resolves which records took effect.
 - **The budget sits behind the race.** A timed-out append keeps its budget slot
   until the sink settles it, so the budget never admits more than its capacity.
-  A timed-out ordinary or safety-direction append occupies only its own tier
-  and cannot reach the kill-switch reserve. A timed-out STRENGTHENING engage
-  holds a reserved slot while in flight and, if it lands late, spends that
-  reserved record for good (its void is ordinary) — one reserved record per
-  engage that times out and lands, as a real halt would cost. An append whose
-  sink never answers keeps its slot for the life of the process
-  (`ControlPlane.unsettledAuditAppends` counts them).
+  A timed-out ORDINARY append occupies only the ordinary tier and cannot reach
+  the reserve. A timed-out PROTECTED append — a strengthening engage (the
+  kill-switch reserve) or a halting pause (the safety-direction tier) — holds a
+  protected slot while in flight and, if it lands, spends that record for good
+  although nothing was applied. That is NOT what a real halt costs: a real halt
+  engages the switch, so its retry is an ordinary `409 CONTROL_ALREADY_IN_STATE`;
+  a halt that timed out leaves the switch as it was, so its retry is again a
+  strengthening engage. An append whose sink never answers keeps its slot for
+  the life of the process (`ControlPlane.unsettledAuditAppends` counts them).
+- **One unsettled protected append per switch or instance** (`CONTROL-1b` r1,
+  closing `CONTROL1B-R1-J-M1`). At round 0 every retry of a timed-out halt took
+  another protected slot: retrying one GLOBAL `FULL_HALT` through a stall
+  (capacity 10, reserve 2, six ordinary records) left four late APPLIED
+  records and no void, no switch engaged, and every further halt `503`. Now,
+  while a protected append of a switch or instance is unsettled, a new
+  protected mutation of the SAME switch or instance is refused
+  `503 CONTROL_NOT_AUDITABLE` **without an append** — it takes no budget slot,
+  is counted `NOT_AUDITED`, and is not an audit-append failure, since none was
+  attempted. The gate lifts as soon as the sink answers the earlier append,
+  whatever it answers. Exactly:
+  - per switch or instance, at most ONE timed-out protected append is in
+    flight. Retries sent while it is unsettled cost nothing; each timed-out
+    protected append that later LANDS costs one protected record. So a stall
+    the sink answers late costs one record per switch (or instance) whose
+    append timed out, however often it was retried — on top of the record the
+    real engage or pause spends once the sink answers in time. A sink that
+    answers late EVERY time costs one record per late answer, one at a time;
+  - a mutation that writes an ORDINARY record — a release, a resume, a
+    refusal, a change between two unordered actions — is never gated, and
+    other switches and instances are not affected;
+  - **the price:** an append the sink NEVER answers keeps that one switch's
+    strengthening engages (or that instance's pauses) refused for the life of
+    the process, as it keeps that append's slot. A durable sink must therefore
+    settle every append — for PostgreSQL, a client-side statement or query
+    timeout — before it is composed (`CONTROL-1b` handoff, follow-up).
 
 `main.ts`, the test harness and the integration client pass the API's clock and
-id source as the void records' `auditRecordSource`. The shipped in-memory log
-answers at once, so neither path is reachable in the shipped process today; a
-durable sink bound later inherits both.
+id source as the void records' `auditRecordSource`, and `main.ts` says so at
+startup ("audit append bound 5000ms; an APPLIED record that lands after it gets
+a VOID record … when the sink and the audit budget admit one", pinned by
+`shipped-root-control-1.test.ts`). The shipped in-memory
+log answers at once, so neither path is reachable in the shipped process today;
+a durable sink bound later inherits both.
 
 ### What an audit record's text can hold (`CONTROL-1b`)
 
@@ -267,9 +302,13 @@ refused. The design has two layers.
      four is applied as it was at `WP-240`, but in the ordinary tier. Once the
      ordinary tier is full, one scope can therefore take at most TWO reserved
      records — an engage and an escalation — until a release, and a release is
-     ordinary.
+     ordinary; plus, with a sink that can outlive the append bound, at most ONE
+     more per engage that timed out and then landed (`CONTROL-1b` r1, "One
+     unsettled protected append per switch or instance" above).
    - Once the ordinary tier is full, a pause can take at most one reserved
-     record per registered instance, and each one is a real halt. That holds
+     record per registered instance that is a real halt — plus at most one per
+     instance for each pause that timed out and then landed, which halted
+     nothing (the same gate). That holds
      under concurrency: the control plane SERIALIZES the mutations of each
      instance and each switch (`CONTROL-1` r1, closing `CONTROL1-J-L2`), so two
      pauses sent at once are one `APPLIED` pause and one
@@ -326,7 +365,7 @@ references or configures a signer, a wallet, a private key or the secure venue
 adapter. `test/integration/control-api/acceptance-3-no-signer.test.ts` asserts
 that by scanning the shipped source of both trees, and additionally asserts that
 `packages/polymarket-secure` is absent from this package's dependency manifest.
-Its import scan also covers this package's test suites and `infra/grafana/**`
+Its load scan also covers this package's test suites and `infra/grafana/**`
 (`CONTROL-1`, N-4). Since `CONTROL-1b` it reads each file's SYNTAX TREE with
 TypeScript's own parser (`test/integration/control-api/support/module-loads.ts`)
 instead of a regular expression — which a line comment or an escaped specifier
@@ -334,19 +373,64 @@ had walked past (`CONTROL1-R2-J-L1`):
 
 - every load form — static and type-only imports, re-exports, `import x =
   require()`, `import()` types, dynamic `import()`, `require()` in any calling
-  spelling, triple-slash and AMD references, JSDoc `@import`, and `declare
-  module` — is read as the EVALUATED string literal, so comments are inert and
-  escapes resolve as the runtime resolves them;
-- whatever it cannot read FAILS: a computed specifier, a named loader
-  (`require` aliased, `createRequire`, `eval`, `Function`, `Module._load`), a
-  loader module (`node:module`, `node:vm`) or a file that does not parse under
-  its extension's grammar — unless an explicit, justified allowlist entry
-  covers it exactly (the allowlist is empty);
-- planted controls cover every spelling the verifiers used, each escape and
-  comment form, each scanned tree and each file extension;
-- behind the scan, none of the forbidden packages even RESOLVES from a scanned
-  tree, so a load spelled in a way no static scan can read would still find
-  nothing to load.
+  spelling, `process.getBuiltinModule()`, vitest's `vi.importActual()` /
+  `importMock()` / `mock()` / `doMock()`, triple-slash and AMD references,
+  JSDoc `@import`, and `declare module` — is read as the EVALUATED string
+  literal, so comments are inert and escapes resolve as the runtime resolves
+  them;
+- every executable extension is read with its own grammar — `.ts`, `.mts`,
+  `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` — and JSON with JSON's, and
+  EVERY entry of a scanned tree is classified: a file that is not code, JSON
+  or an inert kind (`.md`, `.gitkeep`), a symbolic link, or a `node_modules`
+  directory fails (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H2`: `.tsx` and
+  `.jsx` files were never opened, and a computed import in a `.tsx` helper
+  loaded the secure adapter);
+- each literal is judged by WHERE IT LANDS (`support/load-judge.ts`;
+  `CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`): a relative, absolute or
+  `file:` path by the file it reaches — read both as the CommonJS loader reads
+  it and, percent-decoded, as the ES loader does, through every symbolic link —
+  which may not be inside `packages/polymarket-secure`, pass through
+  `node_modules`, name a signing package, or be anything but code or JSON; a
+  bare name by the package each vitest alias and `node_modules` resolution
+  makes of it; a builtin by an allowlist of modules that cannot load or run
+  code (`node:vm`, `node:module`, `node:child_process`, `node:worker_threads`
+  and the rest fail — `CONTROL1B-R1-J-L2`); and `data:`, other URL schemes and
+  `#imports` fail as unplaceable;
+- whatever it cannot read FAILS: a computed specifier, a named loader or
+  evaluator — `require` aliased, `createRequire`, `eval`, `Module._load`,
+  `_compile`, `dlopen`, `process.binding`, `ShadowRealm`, any `.constructor`,
+  `Function` in any VALUE position, and any name beginning `__vite` (vite-node's
+  in-scope `__vite_ssr_dynamic_import__`, vitest's `globalThis.__vitest_*__`)
+  (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H3`: an aliased `Function`,
+  `(() => {}).constructor` and `getBuiltinModule("node:vm")` each loaded the
+  venue SDK past round 0), including any of those names as a string key —
+  `import.meta.glob`, a file that does not parse under its extension's
+  grammar, or a load that lands on no file when the scan runs (a test that
+  WRITES a module and then loads it) — unless an explicit, justified allowlist
+  entry covers it exactly (the allowlist holds only the scan's own
+  vocabulary);
+- the RUNNERS load nothing their imports do not name: the three vitest configs
+  that run these trees are a closed world (no setup file, plugin or custom
+  environment) whose aliases are judged like any path, this package's scripts
+  are pinned exactly, and the bundle's tsconfig maps no name; a load that lands
+  on a file outside every scanned tree and every workspace package (a fixture
+  under `test/`, the repository's unit runner config) is scanned in turn; and
+  no workspace package a load lands in declares a forbidden dependency, at any
+  depth — its own source is `check:deps`'s (F6, F16);
+- planted controls cover every spelling and path form the verifiers used, each
+  escape and comment form, each scanned tree and each code extension.
+
+**Dated correction (`CONTROL-1b` r1, 2026-10-01).** Round 0 said that "behind
+the scan, none of the forbidden packages even RESOLVES from a scanned tree, so
+a load spelled in a way no static scan can read would still find nothing to
+load". That held for bare NAMES only: a PATH into `packages/polymarket-secure`
+or its `node_modules` really loads, which is how the round-1 verifiers loaded
+the secure adapter and the venue SDK with this acceptance green. What remains
+beyond the scan, stated rather than claimed away: a loader reached through a
+COMPUTED property name (`globalThis[atob(…)]`) with a computed path; a test
+that OVERWRITES an existing file at run time and then loads it (the scan read
+the file's earlier text); the deeper dependencies of third-party packages; and
+runner flags outside this package (CI's environment, `NODE_OPTIONS`).
 
 ## Authentication (§15) — the INTERPRETATION
 

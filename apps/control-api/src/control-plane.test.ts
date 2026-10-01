@@ -841,6 +841,9 @@ describe("CONTROL-1b (follow-up 3a): an audit append is BOUNDED", () => {
     for (const bad of [0, -1, 1.5, AUDIT_APPEND_TIMEOUT_MAX_MS + 1, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => plane(new InMemoryControlAuditLog(8), { auditAppendTimeoutMs: bad }), String(bad)).toThrow(RangeError);
     }
+    // `CONTROL-1b` r1 (J-L1): whether a late APPLIED record is voided is visible on the plane.
+    expect(plane(new InMemoryControlAuditLog(8)).voidsLateAppliedRecords).toBe(false);
+    expect(plane(new InMemoryControlAuditLog(8), { auditRecordSource: recordSource() }).voidsLateAppliedRecords).toBe(true);
   });
 
   it("a sink that never answers: refused CONTROL_NOT_AUDITABLE once the bound expires, state unmoved, lock released, counted NOT_AUDITED", async () => {
@@ -861,18 +864,39 @@ describe("CONTROL-1b (follow-up 3a): an audit append is BOUNDED", () => {
   });
 
   it("the mutation queued behind a stalled one runs when the bound expires — the lock is released, not held for the sink", async () => {
+    // `CONTROL-1b` r1: the queued mutations write ORDINARY records. A queued
+    // second PAUSE of the stalled instance is refused by the J-M1 gate instead
+    // (the block below); at round 0 this test queued one and saw it applied.
     const firstId = "01930000-0000-7000-8000-00000000f001";
     const sink = new GatedSink((record) => record.recordId === firstId);
     const control = plane(sink, { auditAppendTimeoutMs: 25 });
     control.register("sb-1", "2026-09-05T00:00:00.000Z");
     const [first, second] = await Promise.all([
       control.pauseStrategy("sb-1", context({ auditRecordId: firstId })),
-      control.pauseStrategy("sb-1", context()),
+      control.resumeStrategy("sb-1", context()),
     ]);
     expect(first).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
-    expect(second.ok).toBe(true);
-    expect(control.strategies()[0]?.state).toBe("PAUSED");
-    expect(sink.log.records().map((record) => record.outcome)).toEqual(["APPLIED"]);
+    // The resume RAN while the pause's append was still unsettled, and its record landed.
+    expect(second).toMatchObject({ ok: false, code: "CONTROL_ALREADY_IN_STATE" });
+    expect(control.unsettledAuditAppends).toBe(1);
+    expect(sink.log.records().map((record) => `${record.action}/${record.outcome}`)).toEqual(["STRATEGY_RESUME/REFUSED"]);
+
+    // …and a queued mutation that APPLIES: a release stalls, the escalation behind it is applied.
+    const releaseId = "01930000-0000-7000-8000-00000000f002";
+    const switchSink = new GatedSink((record) => record.recordId === releaseId);
+    const switches = plane(switchSink, { auditAppendTimeoutMs: 25 });
+    const target = { scope: "MARKET", scopeRef: "q-1" } as const;
+    expect((await switches.engageKillSwitch({ ...target, action: "HALT_NEW_ENTRIES" }, context())).ok).toBe(true);
+    const [released, escalated] = await Promise.all([
+      switches.releaseKillSwitch(
+        { ...target, release: { authoritativeSnapshotApplied: true, reason: "reconciled" } },
+        context({ auditRecordId: releaseId }),
+      ),
+      switches.engageKillSwitch({ ...target, action: "FULL_HALT" }, context()),
+    ]);
+    expect(released).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+    expect(escalated.ok).toBe(true);
+    expect(switches.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
   });
 
   it("a LATE SUCCESS never applies: the APPLIED record that landed is VOIDED by a REFUSED record naming it", async () => {
@@ -1086,6 +1110,160 @@ describe("CONTROL-1b (follow-up 3a): an audit append is BOUNDED", () => {
     expect(control.killSwitches().map((entry) => entry.scopeRef)).toEqual(["m-1"]);
     expect(control.mutationCounts()).toContainEqual({ action: "KILL_SWITCH_ENGAGE", outcome: "LANDED_LATE", count: 1 });
     expect(control.mutationCounts().some((entry) => entry.outcome === "VOIDED")).toBe(false);
+  });
+});
+
+describe("CONTROL-1b r1 (CONTROL1B-R1-J-M1): at most ONE unsettled protected append per switch or instance", () => {
+  const GLOBAL_HALT = { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" } as const;
+  const refuseOrdinary = (control: ControlPlane): Promise<unknown> =>
+    control.refuseRequest(
+      "STRATEGY_PAUSE",
+      { scope: "STRATEGY_INSTANCE", scopeRef: "sb-x" },
+      "REQUEST_BODY",
+      { code: "CONTROL_REQUEST_INVALID", detail: "d", issues: [] },
+      context(),
+    );
+
+  it("the verifiers' reproduction: retrying ONE timed-out GLOBAL FULL_HALT through a stall spends ONE reserved record, and once the sink answers the halt ENGAGES", async () => {
+    // C = 10, R = 2: ordinary to 6, safety-direction to 8, a strengthening
+    // engage to 10. Six ordinary records landed first, as in the reproduction.
+    let stalling = false;
+    const inner = new GatedSink((record) => stalling && record.outcome === "APPLIED");
+    const budget = new SafetyReservedAuditSink(inner, { capacity: 10, safetyReserve: 2 });
+    const control = plane(budget, { auditAppendTimeoutMs: 25, auditRecordSource: recordSource() });
+    for (let index = 0; index < 6; index += 1) expect(await refuseOrdinary(control)).toEqual({ audited: true });
+    expect(budget.admitted).toBe(6);
+
+    stalling = true;
+    const first = await control.engageKillSwitch(GLOBAL_HALT, context());
+    expect(first).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+    expect(!first.ok && first.detail).toContain("25 ms append bound");
+    // The 503 promises a void only conditionally: a void is ordinary (J-M1).
+    expect(!first.ok && first.detail).toContain("when the sink and the audit budget admit one");
+    // Four retries during the stall: each refused WITHOUT an append.
+    for (let retry = 0; retry < 4; retry += 1) {
+      const again = await control.engageKillSwitch(GLOBAL_HALT, context());
+      expect(again, `retry ${String(retry)}`).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+      expect(!again.ok && again.detail, `retry ${String(retry)}`).toContain("is UNSETTLED");
+    }
+    expect(inner.offered.filter((record) => record.outcome === "APPLIED")).toHaveLength(1);
+    expect(control.unsettledAuditAppends).toBe(1);
+    // A gated refusal attempted no append, so it is counted NOT_AUDITED but is
+    // not an audit-append FAILURE: only the timed-out one is.
+    expect(control.auditAppendFailures).toBe(1);
+
+    // The sink recovers: the one held engage lands, and its void is refused
+    // (a void is ordinary, and the ordinary tier is full) — visible as
+    // LANDED_LATE without VOIDED.
+    stalling = false;
+    inner.held[0]?.land();
+    await vi.waitFor(() => {
+      expect(control.unsettledAuditAppends).toBe(0);
+    });
+    await sleep(10);
+    expect(budget.admitted).toBe(7);
+    expect(control.killSwitches()).toEqual([]);
+
+    // At round 0 four late APPLIED records filled the reserve and this was 503.
+    const engaged = await control.engageKillSwitch(GLOBAL_HALT, context());
+    expect(engaged.ok).toBe(true);
+    expect(control.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
+    expect(budget.admitted).toBe(8);
+    // …and a repeat is the ordinary refusal a real halt's repeat is.
+    expect(await control.engageKillSwitch(GLOBAL_HALT, context())).toMatchObject({ code: "CONTROL_ALREADY_IN_STATE" });
+    // NOT_AUDITED: the timed-out engage, the four gated retries, and the
+    // repeat's refusal record (refused by the full ordinary tier).
+    const counts = control.mutationCounts().filter((entry) => entry.action === "KILL_SWITCH_ENGAGE");
+    expect(counts).toEqual([
+      { action: "KILL_SWITCH_ENGAGE", outcome: "APPLIED", count: 1 },
+      { action: "KILL_SWITCH_ENGAGE", outcome: "LANDED_LATE", count: 1 },
+      { action: "KILL_SWITCH_ENGAGE", outcome: "NOT_AUDITED", count: 6 },
+    ]);
+  });
+
+  it("the gate is per SWITCH and per PROTECTED record: another switch engages, an ordinary refusal of the same switch is written, and a late FAILURE lifts it", async () => {
+    let stalling = true;
+    const sink = new GatedSink((record) => stalling && record.scope === "GLOBAL" && record.outcome === "APPLIED");
+    const control = plane(sink, { auditAppendTimeoutMs: 25, auditRecordSource: recordSource() });
+    expect(await control.engageKillSwitch(GLOBAL_HALT, context())).toMatchObject({ code: "CONTROL_NOT_AUDITABLE" });
+
+    // Another action at the SAME switch is a strengthening engage too: gated, nothing offered.
+    const offeredBefore = sink.offered.length;
+    const other = await control.engageKillSwitch({ ...GLOBAL_HALT, action: "HALT_NEW_ENTRIES" }, context());
+    expect(!other.ok && other.detail).toContain("is UNSETTLED");
+    expect(sink.offered).toHaveLength(offeredBefore);
+    // A DIFFERENT switch is not gated.
+    expect((await control.engageKillSwitch({ scope: "MARKET", scopeRef: "m-1", action: "FULL_HALT" }, context())).ok).toBe(true);
+    // An ORDINARY record of the same switch is written: a release of a switch nobody engaged.
+    expect(
+      await control.releaseKillSwitch(
+        { scope: "GLOBAL", scopeRef: null, release: { authoritativeSnapshotApplied: true, reason: "r" } },
+        context(),
+      ),
+    ).toMatchObject({ code: "CONTROL_NOT_ENGAGED" });
+    expect(sink.log.records().at(-1)).toMatchObject({ action: "KILL_SWITCH_RELEASE", outcome: "REFUSED", scope: "GLOBAL" });
+
+    // The sink answers the held engage with a FAILURE: nothing landed, and the gate lifts.
+    stalling = false;
+    sink.held[0]?.fail();
+    await vi.waitFor(() => {
+      expect(control.unsettledAuditAppends).toBe(0);
+    });
+    expect((await control.engageKillSwitch(GLOBAL_HALT, context())).ok).toBe(true);
+    expect(control.killSwitches().map((entry) => `${entry.scope}:${entry.action}`)).toEqual([
+      "GLOBAL:FULL_HALT",
+      "MARKET:FULL_HALT",
+    ]);
+  });
+
+  it("an ESCALATION that timed out gates the next escalation of that switch; an unordered change of it is ordinary and applies", async () => {
+    let stalling = false;
+    const target = { scope: "MARKET", scopeRef: "e-1" } as const;
+    const sink = new GatedSink((record) => stalling && record.outcome === "APPLIED");
+    const control = plane(sink, { auditAppendTimeoutMs: 25, auditRecordSource: recordSource() });
+    expect((await control.engageKillSwitch({ ...target, action: "HALT_NEW_ENTRIES" }, context())).ok).toBe(true);
+    stalling = true;
+    expect(await control.engageKillSwitch({ ...target, action: "FULL_HALT" }, context())).toMatchObject({
+      code: "CONTROL_NOT_AUDITABLE",
+    });
+    const retried = await control.engageKillSwitch({ ...target, action: "FULL_HALT" }, context());
+    expect(!retried.ok && retried.detail).toContain("is UNSETTLED");
+    expect(sink.held).toHaveLength(1);
+    // HALT_NEW_ENTRIES -> CANCEL_ALL is a change between two unordered actions:
+    // an ORDINARY record, so the gate does not apply (it is offered, and held).
+    expect(await control.engageKillSwitch({ ...target, action: "CANCEL_ALL" }, context())).toMatchObject({
+      code: "CONTROL_NOT_AUDITABLE",
+    });
+    expect(sink.held).toHaveLength(2);
+    stalling = false;
+    for (const held of sink.held) held.refuse();
+    await vi.waitFor(() => {
+      expect(control.unsettledAuditAppends).toBe(0);
+    });
+    expect((await control.engageKillSwitch({ ...target, action: "FULL_HALT" }, context())).ok).toBe(true);
+    expect(control.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
+  });
+
+  it("a halting PAUSE that timed out gates the next pause of that instance — not a resume, not another instance — until the sink answers", async () => {
+    let stalling = true;
+    const sink = new GatedSink((record) => stalling && record.scopeRef === "sb-1" && record.outcome === "APPLIED");
+    const control = plane(sink, { auditAppendTimeoutMs: 25, auditRecordSource: recordSource() });
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    control.register("sb-2", "2026-09-05T00:00:00.000Z");
+    expect(await control.pauseStrategy("sb-1", context())).toMatchObject({ code: "CONTROL_NOT_AUDITABLE" });
+    const retried = await control.pauseStrategy("sb-1", context());
+    expect(!retried.ok && retried.detail).toContain("strategy instance is UNSETTLED");
+    expect(sink.held).toHaveLength(1);
+    expect(await control.resumeStrategy("sb-1", context())).toMatchObject({ code: "CONTROL_ALREADY_IN_STATE" });
+    expect((await control.pauseStrategy("sb-2", context())).ok).toBe(true);
+
+    stalling = false;
+    sink.held[0]?.land();
+    await vi.waitFor(() => {
+      expect(control.mutationCounts()).toContainEqual({ action: "STRATEGY_PAUSE", outcome: "VOIDED", count: 1 });
+    });
+    expect((await control.pauseStrategy("sb-1", context())).ok).toBe(true);
+    expect(control.strategies().map((entry) => entry.state)).toEqual(["PAUSED", "PAUSED"]);
   });
 });
 

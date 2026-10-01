@@ -37,13 +37,24 @@
  *   `CONTROL_ENGAGE_WOULD_WEAKEN`), and their records are ordinary
  *   (`CONTROL-1` r1, closing `CONTROL1-J-M1`). At one scope that bounds the
  *   reserved records to two — an engage and an escalation — until a release,
- *   and a release is ordinary.
- * - **Nothing but a halt that took effect can use the `R` before those.** A
- *   pause applies only to a registered `RUNNING` instance, pausing it again is
- *   a refusal (ordinary), and mutations of one instance are SERIALIZED by the
- *   control plane (`CONTROL1-J-L2`) — so once the ordinary tier is full a
- *   `STRATEGY_CONTROL` holder can consume at most one reserved record per
- *   registered instance, however many requests it sends at once.
+ *   and a release is ordinary. **Qualified (`CONTROL-1b` r1, closing
+ *   `CONTROL1B-R1-J-M1`):** with a sink that can outlive the control plane's
+ *   append bound, a strengthening engage whose append TIMED OUT and then
+ *   LANDED also spent a reserved record, although its switch did not engage.
+ *   The control plane refuses a further strengthening engage of that switch,
+ *   without an append, while such an append is unsettled — so at one scope a
+ *   stall adds at most ONE such record per timed-out engage that later lands,
+ *   however often it is retried (`control-plane.ts`, "One unsettled protected
+ *   append per state key").
+ * - **Nothing but a halt can use the `R` before those** — one that took
+ *   effect, or (`CONTROL-1b` r1) one whose append timed out and then landed,
+ *   which took no effect. A pause applies only to a registered `RUNNING`
+ *   instance, pausing it again is a refusal (ordinary), and mutations of one
+ *   instance are SERIALIZED by the control plane (`CONTROL1-J-L2`) — so once
+ *   the ordinary tier is full a `STRATEGY_CONTROL` holder can consume at most
+ *   one reserved record per registered instance by pauses that take effect,
+ *   however many requests it sends at once, plus at most one per instance
+ *   for each pause whose append timed out and later landed (the same gate).
  * - **The direction a full ordinary tier fails in is SAFE.** Resumes,
  *   releases and unordered action changes are ordinary: once the tier is full
  *   they are refused `503`, and an engage that would relax a `FULL_HALT` is
@@ -61,7 +72,9 @@
  *   still in flight here until the inner sink settles it, and is counted
  *   against its tier until then — the budget never admits more than its
  *   capacity, and a timed-out ordinary append cannot reach the reserve
- *   (`control-plane.ts`, "An append is bounded").
+ *   (`control-plane.ts`, "An append is bounded"). A timed-out PROTECTED append
+ *   that lands spends its protected record for good, and the void the control
+ *   plane writes beside it is ORDINARY, so a full ordinary tier refuses it.
  * - **Nothing here weakens "audit first, then apply".** A record the budget
  *   refuses is a refusal of the APPEND (`AUDIT_CAPACITY_EXHAUSTED`), and the
  *   control plane turns it into `503 CONTROL_NOT_AUDITABLE` with the state

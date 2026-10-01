@@ -183,6 +183,7 @@ describe("CONTROL-1b: the control plane the shipped process composes", () => {
       const environment = new ScriptedEnvironment();
       const plane = composeControlPlane(sink, environment);
       expect(plane.auditAppendTimeoutMs).toBe(AUDIT_APPEND_TIMEOUT_MS);
+      expect(plane.voidsLateAppliedRecords).toBe(true);
 
       const engaged = plane.engageKillSwitch(
         { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" },
