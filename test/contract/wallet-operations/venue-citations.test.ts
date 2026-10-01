@@ -3,13 +3,18 @@
  * is present, verbatim, in the dated verification reports it cites. If a later
  * report changes an address or a fact, this suite is where the drift shows.
  * Offline: reads repository files only.
+ *
+ * OFFLINE, enforced: a tripwire replaces `fetch` for every test, throws if it
+ * is called, and each test fails unless it was called 0 times (the same
+ * tripwire as `split-merge-redeem-fixtures.test.ts`; CI-4's "no network" step
+ * name rests on both files — WP-300b).
  */
 
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   APPROVAL_SPENDER_ROLES,
@@ -25,6 +30,21 @@ const baseline = readFileSync(resolve(repo, VENUE_FACTS_SOURCE.baseline), "utf8"
 /** The report with line wrapping collapsed, for quoted-sentence checks. */
 const reportText = report.replace(/\s+/g, " ");
 const baselineText = baseline.replace(/\s+/g, " ");
+
+let originalFetch: typeof globalThis.fetch;
+let fetchCalls = 0;
+beforeEach(() => {
+  originalFetch = globalThis.fetch;
+  fetchCalls = 0;
+  globalThis.fetch = (() => {
+    fetchCalls += 1;
+    throw new Error("network tripwire: the wallet-operations contract suite is offline");
+  }) as typeof globalThis.fetch;
+});
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  expect(fetchCalls).toBe(0);
+});
 
 describe("documented venue contracts", () => {
   it("each address appears verbatim in the 2026-09-30 report or its 2026-09-16 baseline", () => {
