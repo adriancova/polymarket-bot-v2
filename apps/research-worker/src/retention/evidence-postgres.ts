@@ -14,8 +14,8 @@
  *
  * | Evidence | Rows | State today |
  * | --- | --- | --- |
- * | durable frontier | `strategy.decisions.evaluated_at`, newest per instance; the minimum over instances | written by the trader for every evaluation |
- * | intent | `strategy.decisions` with `intent_count > 0` for the market | written; `gateway_epoch` / `ingest_seq` are NULL today (`H1R1-PROVENANCE`), so a source event is located by its instant |
+ * | durable dispatch frontier | `strategy.decisions` `(gateway_epoch, ingest_seq)`: per instance, run and epoch, the largest `ingest_seq` (compared as an integer) and the latest `evaluation_seq` | **NULL today** (`H1R1-PROVENANCE`): no instance has a frontier, so no trader-responsible window is classified until the trader persists them |
+ * | intent | `strategy.decisions` with `intent_count > 0` for the market | written; a source event with no `(gateway_epoch, ingest_seq)` is located by its instant |
  * | fill | `execution.fills` for the market; `accounting.ledger_transactions` `TRADE_PRINCIPAL` for the market | only the ledger rows are written today (`BOOT1 fill-link severing`) |
  * | refusal | `ops.risk_events` VETOED or BREAKER for the market | not written today |
  * | halt | `ops.incidents` for the market, or market-less for the instance, inside the window's responsible span | not written today (`OUT1-R1-HALT-NOT-DURABLE`) |
@@ -25,16 +25,71 @@
  * already names; this adapter reads the halt and refusal tables so the
  * classification is right the day they are written, without a change here.
  *
- * The durable frontier relies on the trader committing its rows in
- * processing order (the `THROUGHPUT-1a` commit chain); the grace margin in
- * `classify.ts` is applied on top.
+ * ## The durable dispatch frontier
+ *
+ * The frontier is read in DISPATCH order, never from `evaluated_at`: a receipt
+ * instant can step backwards (ADR-026 Context 5), so the newest `evaluated_at`
+ * does not show that every earlier-dispatched frame was processed. It relies
+ * on two facts, stated rather than assumed silently:
+ *
+ * 1. the trader consumes the gateway's one ordered stream in `ingestSeq`
+ *    order, and commits its rows in processing order (the `THROUGHPUT-1a`
+ *    commit chain), so a durable decision at `(epoch, n)` means every row from
+ *    events dispatched before it in that epoch is durable;
+ * 2. within one run, `evaluation_seq` is the processing order, so a decision in
+ *    another epoch with a larger `evaluation_seq` than every decision of epoch
+ *    `E` means the run had moved past `E` (`completedEpochs`).
+ *
+ * `ingest_seq` is a canonical unsigned-integer string (`internal.uint_string`,
+ * at most 40 digits), so its integer maximum is the maximum of its
+ * zero-padded form.
  */
 
 import type { PolymarketBotDatabase, RunModeValue } from "@polymarket-bot/storage-postgres";
 
+import { compareUnsignedIntegerStrings } from "@polymarket-bot/storage-parquet";
+
 import { epochMsOf } from "../research-tier/sampler.js";
 import type { IntentEvidence, MarketEvidence, TraderEvidenceSource } from "./classify.js";
+import type { DispatchFrontier } from "./wal-index.js";
 import type { MarketWindow } from "./windows.js";
+
+/** The width `internal.uint_string` is bounded to (`db/migrations/0001_foundation.up.sql`). */
+const UINT_STRING_MAX_DIGITS = 40;
+
+/** One instance's (run, epoch) aggregate. */
+export type FrontierRow = {
+  readonly runId: string;
+  readonly gatewayEpoch: string;
+  /** The largest `evaluation_seq` of the run's decisions in the epoch. */
+  readonly maxEvaluationSeq: bigint;
+  /** The largest `ingest_seq`, as a canonical unsigned-integer string. */
+  readonly maxIngestSeq: string;
+};
+
+/**
+ * Fold one instance's (run, epoch) aggregates into its frontier: the largest
+ * `ingest_seq` per epoch over every run, and the epochs some run moved past.
+ */
+export function frontierFromRows(rows: readonly FrontierRow[]): DispatchFrontier | null {
+  if (rows.length === 0) return null;
+  const byEpoch = new Map<string, string>();
+  for (const row of rows) {
+    const known = byEpoch.get(row.gatewayEpoch);
+    if (known === undefined || compareUnsignedIntegerStrings(row.maxIngestSeq, known) > 0) {
+      byEpoch.set(row.gatewayEpoch, row.maxIngestSeq);
+    }
+  }
+  const completedEpochs = new Set<string>();
+  for (const row of rows) {
+    const movedOn = rows.some(
+      (other) =>
+        other.runId === row.runId && other.gatewayEpoch !== row.gatewayEpoch && other.maxEvaluationSeq > row.maxEvaluationSeq,
+    );
+    if (movedOn) completedEpochs.add(row.gatewayEpoch);
+  }
+  return { byEpoch, completedEpochs };
+}
 
 function instantMs(value: string): number {
   return epochMsOf(value);
@@ -52,22 +107,39 @@ export function postgresTraderEvidence(
       .execute((trx) => work(trx as unknown as PolymarketBotDatabase));
 
   return {
-    async durableThroughMs(instanceIds: readonly string[]): Promise<number | null> {
-      if (instanceIds.length === 0) return null;
+    async dispatchFrontiers(instanceIds: readonly string[]): Promise<ReadonlyMap<string, DispatchFrontier>> {
+      const out = new Map<string, DispatchFrontier>();
+      if (instanceIds.length === 0) return out;
       return await readOnly(async (trx) => {
-        let minimum: number | null = null;
         for (const instanceId of instanceIds) {
-          const row = await trx
+          const rows = await trx
             .selectFrom("strategy.decisions")
-            .select((eb) => eb.fn.max("evaluated_at").as("frontier"))
+            .select((eb) => [
+              "run_id",
+              "gateway_epoch",
+              eb.fn.max("evaluation_seq").as("max_evaluation_seq"),
+              eb.fn
+                .max(eb.fn<string>("lpad", ["ingest_seq", eb.val(UINT_STRING_MAX_DIGITS), eb.val("0")]))
+                .as("max_ingest_seq_padded"),
+            ])
             .where("instance_id", "=", instanceId)
-            .executeTakeFirst();
-          const frontier = row?.frontier;
-          if (frontier === null || frontier === undefined) return null; // an instance with nothing durable
-          const ms = instantMs(String(frontier));
-          minimum = minimum === null ? ms : Math.min(minimum, ms);
+            .where("gateway_epoch", "is not", null)
+            .where("ingest_seq", "is not", null)
+            .groupBy(["run_id", "gateway_epoch"])
+            .execute();
+          const frontier = frontierFromRows(
+            rows.map((row) => ({
+              runId: String(row.run_id),
+              gatewayEpoch: String(row.gateway_epoch),
+              maxEvaluationSeq: BigInt(String(row.max_evaluation_seq)),
+              maxIngestSeq: String(row.max_ingest_seq_padded).replace(/^0+(?=[0-9])/u, ""),
+            })),
+          );
+          // An instance with no decision carrying a dispatch position has no
+          // frontier, and is left out: its windows stay unclassified.
+          if (frontier !== null) out.set(instanceId, frontier);
         }
-        return minimum;
+        return out;
       });
     },
 

@@ -64,6 +64,7 @@ async function context(inventory: WalInventory) {
     segments: [...inventory.byEpoch.values()].flat(),
     pointers,
     refusedSegmentIds: new Set<string>(),
+    wal: await fixture.walIndex(inventory),
   };
 }
 
@@ -86,6 +87,18 @@ describe("a pin waits for a complete range", () => {
     expect(extracted.record.datasets.flatMap((dataset) => dataset.segmentIds)).toStrictEqual([fixture.segments[0]?.segmentId]);
     const again = await extractPin(spec(T + 30_000, T + 90_000), await context(inventory));
     expect(again.status).toBe("already-extracted");
+  });
+
+  it("waits while the range ends exactly at the newest frame: only a frame AFTER the range closes it (J16, M5)", async () => {
+    fixture = await storageFixture({
+      nowMs: NOW,
+      segments: [[tradeFrame({ ingestSeq: "1", atMs: T })], [tradeFrame({ ingestSeq: "2", atMs: T + 120_000 })]],
+    });
+    const inventory = await fixture.extract();
+    // A frame stamped T + 120 s exists, but none after it.
+    const atEdge = await extractPin(spec(T, T + 120_000), await context(inventory));
+    expect(atEdge).toMatchObject({ status: "waiting", reason: expect.stringMatching(/not yet moved past/u) });
+    expect(await readPinRecord(fixture.objectStore, "operator-test")).toBeNull();
   });
 
   it("waits while a sealed segment is not yet extracted", async () => {
@@ -148,6 +161,7 @@ describe("a pin holds the bytes the research tier verified (ADR-028 Decision 2.6
       nowMs: NOW,
       retentionMs: RAW_RETENTION_MS,
       leadInMs: 0,
+      durabilityGraceMs: 0,
       inventory: all,
       objectStore: fixture.objectStore,
       windows: [],

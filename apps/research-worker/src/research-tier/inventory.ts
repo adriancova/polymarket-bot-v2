@@ -10,7 +10,15 @@
  *
  * Everything here only reads. The inventory is a listing, not a verification:
  * a segment's bytes are verified by `segment-verify.ts` before anything reads
- * them, and its sidecar is only parsed here to learn its epoch and ordinal.
+ * them, and its sidecar is only parsed here (strict JSON, ADR-017 §3) to learn
+ * its epoch, ordinal, ingest range and close reason. Those sidecar facts are
+ * used only where they can HOLD a segment or a window (`wal-index.ts`), never
+ * to let one expire: an expiry decision reads the verified research manifest.
+ *
+ * A sidecar whose segment file is gone is an **orphan**: an expired-after-
+ * extract deletion removes the segment, then its sidecar, so a crash between
+ * the two leaves one. It is reported, and never planned again (nothing is
+ * left to delete, and planning it would fail every later cycle).
  */
 
 import { readdir } from "node:fs/promises";
@@ -19,8 +27,10 @@ import { join } from "node:path";
 import type { CompactionFileSystem } from "@polymarket-bot/storage-parquet";
 import {
   listManifestedSegmentIds,
+  parseStrictJsonBytes,
   parseWalSegmentManifest,
   walManifestFileName,
+  walSegmentFileName,
 } from "@polymarket-bot/storage-parquet";
 
 /** One sealed segment, as its sidecar manifest describes it. */
@@ -30,7 +40,16 @@ export type InventoriedSegment = {
   readonly gatewayEpoch: string;
   readonly segmentIndex: number;
   readonly byteSize: number;
+  readonly createdAt: string;
   readonly closedAt: string;
+  /** Why the writer sealed it (`shutdown` and `recovery` end an epoch). */
+  readonly closeReason: string;
+  /** First and last `ingestSeq` in dispatch order, as the sidecar states them (unverified). */
+  readonly firstIngestSeq: string | null;
+  readonly lastIngestSeq: string | null;
+  /** First and last frame's receipt instant, as the sidecar states them (unverified). */
+  readonly firstReceivedAt: string | null;
+  readonly lastReceivedAt: string | null;
 };
 
 /** A sealed segment whose sidecar could not even be parsed. It never expires. */
@@ -40,10 +59,18 @@ export type UnreadableSegment = {
   readonly reason: string;
 };
 
+/** A sidecar whose segment file is gone: a deletion interrupted between its two unlinks. */
+export type OrphanSidecar = {
+  readonly walDirectoryPath: string;
+  readonly segmentId: string;
+};
+
 export type WalInventory = {
   /** Every readable sealed segment, grouped by epoch, each epoch in segment order. */
   readonly byEpoch: ReadonlyMap<string, readonly InventoriedSegment[]>;
   readonly unreadable: readonly UnreadableSegment[];
+  /** Sidecars with no segment file. Never planned; reported. */
+  readonly orphans?: readonly OrphanSidecar[];
 };
 
 /** The identifier grammar an id must meet to name an object key. */
@@ -67,11 +94,16 @@ export async function inventoryWalRoot(
   const directories = [walRootPath, ...(await subdirectories(walRootPath))];
   const segments: InventoriedSegment[] = [];
   const unreadable: UnreadableSegment[] = [];
+  const orphans: OrphanSidecar[] = [];
   for (const directory of directories) {
     for (const segmentId of await listManifestedSegmentIds(fileSystem, directory)) {
+      if ((await fileSystem.fileByteLength(fileSystem.joinPath(directory, walSegmentFileName(segmentId)))) === null) {
+        orphans.push({ walDirectoryPath: directory, segmentId });
+        continue;
+      }
       try {
         const bytes = await fileSystem.readWholeFile(fileSystem.joinPath(directory, walManifestFileName(segmentId)));
-        const manifest = parseWalSegmentManifest(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown);
+        const manifest = parseWalSegmentManifest(parseStrictJsonBytes(bytes));
         if (manifest.segmentId !== segmentId) throw new Error("the manifest names a different segment");
         // Both name object keys (`research/<epoch>/segments/<segmentId>.json`).
         if (!SAFE_IDENTIFIER.test(manifest.gatewayEpoch) || !SAFE_IDENTIFIER.test(segmentId)) {
@@ -83,7 +115,13 @@ export async function inventoryWalRoot(
           gatewayEpoch: manifest.gatewayEpoch,
           segmentIndex: manifest.segmentIndex,
           byteSize: manifest.byteSize,
+          createdAt: manifest.createdAt,
           closedAt: manifest.closedAt,
+          closeReason: manifest.closeReason,
+          firstIngestSeq: manifest.firstIngestSeq,
+          lastIngestSeq: manifest.lastIngestSeq,
+          firstReceivedAt: manifest.firstReceivedAt,
+          lastReceivedAt: manifest.lastReceivedAt,
         });
       } catch (error) {
         unreadable.push({
@@ -111,5 +149,5 @@ export async function inventoryWalRoot(
             : 0,
     );
   }
-  return { byEpoch, unreadable };
+  return { byEpoch, unreadable, orphans };
 }

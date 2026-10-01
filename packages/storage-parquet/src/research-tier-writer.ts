@@ -40,6 +40,7 @@ import type {
   ResearchTierManifest,
 } from "./research-tier-manifest.js";
 import { readResearchTableObject, writeResearchTableObject } from "./research-tier-object.js";
+import { parseStrictJsonBytes } from "./strict-json.js";
 import { compareUnsignedIntegerStrings, sha256Hex } from "./wal-format.js";
 
 /** Object name of the downsampler's end state, next to the manifest. */
@@ -273,7 +274,7 @@ export async function writeResearchTierDataset(options: ResearchTierWriteOptions
 
   // The written document must read back through the reader every consumer
   // uses, or the dataset is not one this build can prove anything with.
-  parseResearchTierManifest(JSON.parse(Buffer.from(manifestBytes).toString("utf8")) as unknown);
+  parseResearchTierManifest(parseStrictJsonBytes(manifestBytes));
 
   return { manifest, manifestObjectKey, manifestSha256, objectBytesWritten };
 }
@@ -317,11 +318,13 @@ export async function verifyResearchTierDataset(
   }
   let manifest: ResearchTierManifest;
   try {
-    manifest = parseResearchTierManifest(JSON.parse(Buffer.from(manifestBytes).toString("utf8")) as unknown);
+    // ADR-017 §3: the strict-JSON profile, never `JSON.parse`'s last-wins.
+    manifest = parseResearchTierManifest(parseStrictJsonBytes(manifestBytes));
   } catch (error) {
-    throw new DatasetManifestError("the research-tier manifest could not be read", {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new DatasetManifestError(`the research-tier manifest could not be read: ${detail}`, {
       manifestObjectKey,
-      detail: error instanceof Error ? error.message : String(error),
+      detail,
     });
   }
   const pinned: { objectKey: string; byteLength: number; sha256: string }[] = [

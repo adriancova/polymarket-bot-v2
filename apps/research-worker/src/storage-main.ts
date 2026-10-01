@@ -33,9 +33,16 @@ import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-post
 
 import type { TraderEvidenceSource } from "./retention/classify.js";
 import { staticEvidenceSource } from "./retention/classify.js";
+import { systemBootClock } from "./retention/clock-guard.js";
 import { runStorageCycle } from "./retention/cycle.js";
 import type { StorageCycleReport } from "./retention/cycle.js";
 import { postgresTraderEvidence } from "./retention/evidence-postgres.js";
+import {
+  fileOperatorPinLock,
+  noOperatorPinLock,
+  operatorPinLockPath,
+  publishOperatorPin,
+} from "./retention/operator-pin-lock.js";
 import { loadOperatorPins, loadWindowRegistry } from "./retention/windows.js";
 import { loadStorageConfig } from "./storage-config.js";
 
@@ -110,7 +117,7 @@ export async function storageMain(): Promise<number> {
   if (config.traderDatabaseUrl === null) {
     // No trader database: no trader-responsible window can be classified, so
     // none of the segments it overlaps can expire. Fail closed.
-    evidence = staticEvidenceSource({ durableThroughMs: new Map(), evidence: new Map() });
+    evidence = staticEvidenceSource({ frontiers: new Map(), evidence: new Map() });
   } else {
     const pool = createPostgresPool({
       connectionString: config.traderDatabaseUrl,
@@ -147,14 +154,43 @@ export async function storageMain(): Promise<number> {
         walMaxTotalBytes: config.walMaxTotalBytes,
         maxSegmentsPerDataset: config.maxSegmentsPerDataset,
         extractionBatchDelayMs: config.extractionBatchDelayMs,
+        clockStepToleranceMs: config.clockStepToleranceMs,
       },
       mode: config.mode,
       deletion,
       stateDirectory: config.stateDirectory,
+      bootClock: systemBootClock(),
+      operatorPinLock:
+        config.operatorPinsPath === null ? noOperatorPinLock() : fileOperatorPinLock(operatorPinLockPath(config.operatorPinsPath)),
     });
     console.log(JSON.stringify(summarizeStorageReport(report)));
     return report.expiry !== null && report.expiry.failures.length > 0 ? 1 : 0;
   } finally {
     await close();
   }
+}
+
+/**
+ * `storage pin <pinId> <from> <to> <reason>`: publish one operator pin under
+ * the operator-pin lock (`operator-pin-lock.ts`), so it is serialized with
+ * every expiry's final check and unlink. Reads `RESEARCH_WORKER_OPERATOR_PINS`.
+ * A pin added by editing the file by hand is re-read before each unlink, but
+ * only this command is serialized with the unlink itself.
+ */
+export async function storagePinMain(argv: readonly string[]): Promise<number> {
+  const [pinId, from, to, ...reasonWords] = argv;
+  const path = process.env["RESEARCH_WORKER_OPERATOR_PINS"]?.trim() ?? "";
+  if (pinId === undefined || from === undefined || to === undefined || reasonWords.length === 0 || path.length === 0) {
+    console.error(
+      "usage: RESEARCH_WORKER_OPERATOR_PINS=<file> main.mjs storage pin <pinId> <from ISO-8601> <to ISO-8601> <reason>",
+    );
+    return 2;
+  }
+  const pins = await publishOperatorPin({
+    operatorPinsPath: path,
+    lock: fileOperatorPinLock(operatorPinLockPath(path)),
+    pin: { pinId, from, to, reason: reasonWords.join(" ") },
+  });
+  console.log(JSON.stringify({ event: "operator-pin-published", pinId, pins: pins.length }));
+  return 0;
 }

@@ -15,7 +15,11 @@
  *   is provenance, and it is the deletion-time identity ADR-028 Decision 2.6
  *   needs: the expiry guard requires the file it is about to delete to hash to
  *   these two pins (`expiry-proof.ts`). Both digests were computed by the
- *   extractor from the bytes `validateSegment` verified;
+ *   extractor from the bytes `validateSegment` verified. Each entry also
+ *   inventories the Polymarket markets the segment names
+ *   (`marketIdentities`), which the expiry decision checks against the
+ *   window registry: an identity the decision relies on is checksummed here,
+ *   never read from an unverified index;
  * - it states its admissibility in the document itself (ADR-029 Decision 4.2:
  *   "The label is carried in the run's manifest, not inferred from a file
  *   name").
@@ -86,6 +90,33 @@ export type ResearchSourceSegment = {
    */
   readonly maxReceivedAt: string | null;
   readonly verification: string;
+  /**
+   * Every Polymarket market the segment's frames name, inventoried from the
+   * verified frames independently of what the downsampler keeps (ADR-028
+   * Decision 2.3: a window is classified only if it is known). Bound here, in
+   * the checksummed manifest, because the expiry decision relies on it.
+   */
+  readonly marketIdentities: ResearchMarketIdentities;
+};
+
+/**
+ * The market identities one source segment names (`STORAGE-1`).
+ *
+ * `unidentifiedFrames` counts frames that could carry Polymarket market
+ * content but name no market the inventory can read: a market-channel frame
+ * that does not parse or has an entry naming nothing, a Polymarket endpoint
+ * the inventory does not know with no identity in its query or body, a frame
+ * from an unknown source. A segment with any is never expired: its windows
+ * cannot be classified.
+ */
+export type ResearchMarketIdentities = {
+  /** Outcome token ids, sorted, unique. */
+  readonly polymarketTokenIds: readonly string[];
+  /** Condition ids, sorted, unique. */
+  readonly conditionIds: readonly string[];
+  /** Gamma market ids the lifecycle polls name by endpoint, sorted, unique. */
+  readonly gammaMarketIds: readonly string[];
+  readonly unidentifiedFrames: number;
 };
 
 /** One research-tier object. */
@@ -291,6 +322,12 @@ export function encodeResearchTierManifest(manifest: ResearchTierManifest): Uint
       minReceivedAt: segment.minReceivedAt,
       maxReceivedAt: segment.maxReceivedAt,
       verification: segment.verification,
+      marketIdentities: {
+        polymarketTokenIds: [...segment.marketIdentities.polymarketTokenIds],
+        conditionIds: [...segment.marketIdentities.conditionIds],
+        gammaMarketIds: [...segment.marketIdentities.gammaMarketIds],
+        unidentifiedFrames: segment.marketIdentities.unidentifiedFrames,
+      },
     })),
     objects: manifest.objects.map((object) => ({
       objectKey: object.objectKey,
@@ -359,6 +396,24 @@ function digest(value: unknown, what: string): string {
   const text = str(value, what);
   if (!SHA256.test(text)) bad(`${what} must be 64 lowercase hex`, { value: text });
   return text;
+}
+
+function identityList(value: unknown, what: string): readonly string[] {
+  const list = arr(value, what).map((entry, index) => str(entry, `${what}[${String(index)}]`));
+  for (let index = 1; index < list.length; index += 1) {
+    if ((list[index - 1] as string) >= (list[index] as string)) bad(`${what} must be sorted and unique`);
+  }
+  return list;
+}
+
+function marketIdentities(value: unknown, what: string): ResearchMarketIdentities {
+  const source = obj(value, what);
+  return {
+    polymarketTokenIds: identityList(source["polymarketTokenIds"], `${what}.polymarketTokenIds`),
+    conditionIds: identityList(source["conditionIds"], `${what}.conditionIds`),
+    gammaMarketIds: identityList(source["gammaMarketIds"], `${what}.gammaMarketIds`),
+    unidentifiedFrames: count(source["unidentifiedFrames"], `${what}.unidentifiedFrames`),
+  };
 }
 
 function stateObject(value: unknown, what: string): ResearchStateObject {
@@ -464,6 +519,9 @@ export function parseResearchTierManifest(value: unknown): ResearchTierManifest 
       minReceivedAt: nullableStr(entry["minReceivedAt"], `${at}.minReceivedAt`, ISO),
       maxReceivedAt: nullableStr(entry["maxReceivedAt"], `${at}.maxReceivedAt`, ISO),
       verification: str(entry["verification"], `${at}.verification`),
+      // Required: a manifest that does not inventory its markets cannot be
+      // the basis of an expiry (it would read as "names no market").
+      marketIdentities: marketIdentities(entry["marketIdentities"], `${at}.marketIdentities`),
     } satisfies ResearchSourceSegment;
   });
 

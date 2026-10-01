@@ -10,20 +10,34 @@
  *   retention age (its newest frame is older than 72 h), how long ago it
  *   reached it; the metric is the largest. `null` when no such segment is
  *   left. A segment kept for a reason (a pin not extracted, a window not
- *   classified, a stopped trader) shows here: that is what "stuck" means.
+ *   classified, a stopped trader) shows here: that is what "stuck" means. A
+ *   segment whose research tier is missing or does not verify has no verified
+ *   age, so its sidecar's `closedAt` stands in: a broken extract path is
+ *   stuck too (`SegmentDecision.retentionDueAtMs`).
  * - **expiry stuck** — the lag exceeds a threshold. It deletes nothing.
  * - **pin budget** — bytes of pins **recorded** on the current UTC day,
  *   against a daily budget (3 GB at 1-2 markets, 6 GB at 8; ADR-028 Decision
  *   3.6). Exceeding it **only alarms**: no pin is evicted, shrunk or skipped
  *   for it (Decision 3.7, "evidence is never deleted to meet a budget").
  * - **disk** — the WAL filesystem's free and total bytes (`statfs`), with the
- *   85% alarm; and the WAL's own bytes against the gateway's `maxTotalBytes`,
- *   when the operator states it, with a 90% "near" alarm. Neither triggers
- *   deletion: expiry never runs early to make room (Decision 5.4).
+ *   85% alarm.
+ * - **WAL capacity** — when the operator states the gateway's `maxTotalBytes`,
+ *   what the WAL WRITER counts against it, with a 90% "near" alarm. The
+ *   writer (`packages/storage-wal`, `#totalSegmentBytes`) counts every byte it
+ *   wrote in its epoch and never subtracts a deleted segment, so expiry does
+ *   not give it room back: the metric is, per epoch, the bytes of its sealed
+ *   segments on disk plus those of its segments this worker expired (from the
+ *   durable plans), and the largest epoch is compared with `maxTotalBytes`.
+ *   The open segment (at most `maxSegmentBytes`) is not counted. The bytes on
+ *   disk are reported beside it.
+ *
+ * None of these triggers deletion: expiry never runs early to make room
+ * (Decision 5.4).
  */
 
 import { statfs } from "node:fs/promises";
 
+import type { ClockAssessment } from "./clock-guard.js";
 import type { SegmentDecision } from "./plan.js";
 import { reasonClass } from "./plan.js";
 import type { PinRecord } from "./pins.js";
@@ -47,6 +61,8 @@ export type StorageMetrics = {
   readonly walSegmentsSealed: number;
   readonly walBytesSealed: number;
   readonly walSegmentsUnreadable: number;
+  /** Sidecars whose segment is gone (a deletion interrupted between its two unlinks). */
+  readonly walOrphanSidecars: number;
   readonly segmentsEligible: number;
   readonly segmentsKeptByReason: Readonly<Record<string, number>>;
   /** The largest time, in ms, a segment has been past retention age and still on disk. */
@@ -55,10 +71,17 @@ export type StorageMetrics = {
   readonly disk: DiskMetrics | null;
   readonly walCapacity: {
     readonly maxTotalBytes: number;
-    readonly usedBytes: number;
+    /** Sealed WAL bytes on disk, every epoch. */
+    readonly sealedBytesOnDisk: number;
+    /** The epoch whose writer has counted the most bytes, and that count (on disk plus expired). */
+    readonly largestEpoch: string | null;
+    readonly largestEpochWrittenBytes: number;
+    /** `maxTotalBytes` less that count: the room the writer still sees. */
     readonly headroomBytes: number;
     readonly alarm: boolean;
   } | null;
+  /** The clock guard's reading (`clock-guard.ts`); `skewMs` is subtracted from the wall clock. */
+  readonly clock: ClockAssessment;
   readonly pinBudget: {
     readonly day: string;
     readonly bytesPinnedToday: number;
@@ -69,14 +92,17 @@ export type StorageMetrics = {
   readonly pinsTotal: number;
   readonly pinBytesTotal: number;
   readonly expiryPlansWithoutReceipt: number;
+  /** Durable plans that do not read: the capacity figure may be low while any exist. */
+  readonly expiryPlansUnreadable: number;
 };
 
 /** The largest lag past retention age among segments still on disk. */
 export function expiryLagMs(decisions: readonly SegmentDecision[], nowMs: number): number | null {
   let lag: number | null = null;
   for (const decision of decisions) {
-    if (decision.ageEligibleAtMs === null || decision.ageEligibleAtMs > nowMs) continue;
-    const past = nowMs - decision.ageEligibleAtMs;
+    const dueAtMs = decision.retentionDueAtMs;
+    if (dueAtMs === null || dueAtMs > nowMs) continue;
+    const past = nowMs - dueAtMs;
     lag = lag === null ? past : Math.max(lag, past);
   }
   return lag;
@@ -113,13 +139,18 @@ export function storageMetrics(input: {
   readonly nowMs: number;
   readonly decisions: readonly SegmentDecision[];
   readonly walSegmentsUnreadable: number;
+  readonly walOrphanSidecars: number;
   readonly walBytesSealed: number;
+  /** Per epoch, the bytes its writer has counted: sealed on disk plus expired by this worker. */
+  readonly walEpochWrittenBytes: ReadonlyMap<string, number>;
   readonly disk: DiskMetrics | null;
   readonly walMaxTotalBytes: number | null;
+  readonly clock: ClockAssessment;
   readonly pinRecords: readonly PinRecord[];
   readonly pinBudgetBytesPerDay: number;
   readonly expiryStuckAfterMs: number;
   readonly expiryPlansWithoutReceipt: number;
+  readonly expiryPlansUnreadable?: number;
 }): StorageMetrics {
   const keptByReason: Record<string, number> = {};
   for (const decision of input.decisions) {
@@ -128,10 +159,19 @@ export function storageMetrics(input: {
     }
   }
   const lag = expiryLagMs(input.decisions, input.nowMs);
+  let largestEpoch: string | null = null;
+  let largestEpochWrittenBytes = 0;
+  for (const [epoch, bytes] of input.walEpochWrittenBytes) {
+    if (bytes > largestEpochWrittenBytes) {
+      largestEpoch = epoch;
+      largestEpochWrittenBytes = bytes;
+    }
+  }
   return {
     walSegmentsSealed: input.decisions.length,
     walBytesSealed: input.walBytesSealed,
     walSegmentsUnreadable: input.walSegmentsUnreadable,
+    walOrphanSidecars: input.walOrphanSidecars,
     segmentsEligible: input.decisions.filter((decision) => decision.eligible).length,
     segmentsKeptByReason: keptByReason,
     expiryLagMs: lag,
@@ -142,10 +182,13 @@ export function storageMetrics(input: {
         ? null
         : {
             maxTotalBytes: input.walMaxTotalBytes,
-            usedBytes: input.walBytesSealed,
-            headroomBytes: input.walMaxTotalBytes - input.walBytesSealed,
-            alarm: input.walBytesSealed >= input.walMaxTotalBytes * WAL_CAPACITY_ALARM_FRACTION,
+            sealedBytesOnDisk: input.walBytesSealed,
+            largestEpoch,
+            largestEpochWrittenBytes,
+            headroomBytes: input.walMaxTotalBytes - largestEpochWrittenBytes,
+            alarm: largestEpochWrittenBytes >= input.walMaxTotalBytes * WAL_CAPACITY_ALARM_FRACTION,
           },
+    clock: input.clock,
     pinBudget: pinBudget(input.pinRecords, input.nowMs, input.pinBudgetBytesPerDay),
     pinsTotal: input.pinRecords.length,
     pinBytesTotal: input.pinRecords.reduce(
@@ -153,5 +196,6 @@ export function storageMetrics(input: {
       0,
     ),
     expiryPlansWithoutReceipt: input.expiryPlansWithoutReceipt,
+    expiryPlansUnreadable: input.expiryPlansUnreadable ?? 0,
   };
 }

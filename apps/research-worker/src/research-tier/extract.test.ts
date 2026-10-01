@@ -98,6 +98,22 @@ describe("verifySegmentForExtraction", () => {
     expect(result.status).toBe("refused");
   });
 
+  it("refuses a segment the two readers disagree about (J16, M9)", async () => {
+    const fixture = segment(0, [{ ingestSeq: "1", payloadUtf8: binanceTrade(1, "1"), ...binance }]);
+    await place(fixture);
+    // The WAL's validator accepts, but counts one record more than the compactor's reader sees.
+    const result = await verifySegmentForExtraction({
+      fileSystem: nodeCompactionFileSystem(),
+      walDirectoryPath: walDir,
+      segmentId: fixture.segmentId,
+      validate: async (...args) => {
+        const report = await validateSegment(...args);
+        return { ...report, scan: { ...report.scan, recordCount: report.scan.recordCount + 1 } };
+      },
+    });
+    expect(result).toMatchObject({ status: "refused", reasons: [expect.stringMatching(/^READERS_DISAGREE/u)] });
+  });
+
   it("computes both digests from ONE read: a file that changes between reads cannot reach the tier", async () => {
     const fixture = segment(0, [{ ingestSeq: "1", payloadUtf8: binanceTrade(1, "1"), ...binance }]);
     await place(fixture);
@@ -216,6 +232,60 @@ describe("extractResearchTier", () => {
     expect(verified.manifest.samplerState.stateIn?.datasetId).toMatch(/000000-000000$/u);
     // Segment 0's open bar was released by segment 1's first frame.
     expect(second.datasets[0]?.samples).toBe(1);
+  });
+
+  it("adopts an existing dataset only when it describes exactly these segments (J16, M12)", async () => {
+    const zero = segment(0, [{ ingestSeq: "1", payloadUtf8: binanceTrade(1, "100"), ...binance }]);
+    await place(zero);
+    const objectStore = memoryObjectStore();
+    const fileSystem = nodeCompactionFileSystem();
+    const first = await extractResearchTier({ fileSystem, objectStore, clock: manualClock(), byEpoch: (await inventoryWalRoot(fileSystem, join(root, "wal"))).byEpoch });
+    expect(first.datasets).toHaveLength(1);
+    // A run that stopped before its pointers, then a different segment 0 under the same id.
+    objectStore.forget(`research/${EPOCH}/segments/${zero.segmentId}.json`);
+    const other = segment(0, [{ ingestSeq: "1", payloadUtf8: binanceTrade(1, "999"), ...binance }]);
+    await place(other);
+    await expect(
+      extractResearchTier({ fileSystem, objectStore, clock: manualClock(), byEpoch: (await inventoryWalRoot(fileSystem, join(root, "wal"))).byEpoch }),
+    ).rejects.toThrow(/already exists under this key with other sources/u);
+    expect(await readResearchPointer(objectStore, EPOCH, zero.segmentId)).toBeNull();
+  });
+
+  it("refuses a segment whose research pointer does not read, and goes on with the others", async () => {
+    const zero = segment(0, [{ ingestSeq: "1", payloadUtf8: binanceTrade(1, "100"), ...binance }]);
+    const one = segment(1, [{ ingestSeq: "2", payloadUtf8: binanceTrade(2, "100"), ...binance }]);
+    await place(zero);
+    const objectStore = memoryObjectStore();
+    const fileSystem = nodeCompactionFileSystem();
+    await extractResearchTier({ fileSystem, objectStore, clock: manualClock(), byEpoch: (await inventoryWalRoot(fileSystem, join(root, "wal"))).byEpoch });
+    objectStore.corrupt(`research/${EPOCH}/segments/${zero.segmentId}.json`, Buffer.from('{"pointerVersion":1,"pointerVersion":1}'));
+    await place(one);
+    const again = await extractResearchTier({ fileSystem, objectStore, clock: manualClock(), byEpoch: (await inventoryWalRoot(fileSystem, join(root, "wal"))).byEpoch });
+    expect(again.refused).toMatchObject([{ segmentId: zero.segmentId, reasons: [expect.stringMatching(/^RESEARCH_POINTER_UNREADABLE/u)] }]);
+    expect(again.datasets.map((dataset) => [dataset.segmentIds, dataset.freshStart])).toStrictEqual([[[one.segmentId], true]]);
+  });
+
+  it("binds every source segment's market inventory into the verified manifest", async () => {
+    const book = JSON.stringify([{ event_type: "best_bid_ask", market: "0xc1", asset_id: "tokA", best_bid: "0.4", best_ask: "0.6", spread: "0.2" }]);
+    const zero = segment(0, [
+      { ingestSeq: "1", payloadUtf8: book, source: "polymarket", endpoint: "wss://ws-subscriptions-clob.polymarket.com/ws/market" },
+      { ingestSeq: "2", payloadUtf8: "{}", source: "polymarket", endpoint: "https://gamma-api.polymarket.com/markets/5121169" },
+      { ingestSeq: "3", payloadUtf8: "not json", source: "polymarket", endpoint: "wss://ws-subscriptions-clob.polymarket.com/ws/market" },
+      { ingestSeq: "4", payloadUtf8: binanceTrade(4, "1"), ...binance },
+    ]);
+    await place(zero);
+    const objectStore = memoryObjectStore();
+    const fileSystem = nodeCompactionFileSystem();
+    const result = await extractResearchTier({ fileSystem, objectStore, clock: manualClock(), byEpoch: (await inventoryWalRoot(fileSystem, join(root, "wal"))).byEpoch });
+    const verified = await verifyResearchTierDataset(objectStore, result.datasets[0]?.manifestObjectKey ?? "");
+    expect(verified.manifest.sourceSegments[0]?.marketIdentities).toStrictEqual({
+      polymarketTokenIds: ["tokA"],
+      conditionIds: ["0xc1"],
+      gammaMarketIds: ["5121169"],
+      unidentifiedFrames: 1,
+    });
+    // The pointer carries no market names: it is an index, never proof.
+    expect(Object.keys((await readResearchPointer(objectStore, EPOCH, zero.segmentId)) ?? {})).not.toContain("polymarketTokenIds");
   });
 
   it("waits to batch until the oldest pending segment is old enough", async () => {

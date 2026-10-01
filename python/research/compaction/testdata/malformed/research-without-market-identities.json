@@ -747,13 +747,7 @@
       "lastIngestSeq": "4",
       "minReceivedAt": "2026-01-01T00:00:00.000Z",
       "maxReceivedAt": "2026-01-01T00:00:03.000Z",
-      "verification": "storage-wal.validateSegment+storage-parquet.readWalSegment over one in-memory read",
-      "marketIdentities": {
-        "polymarketTokenIds": [],
-        "conditionIds": [],
-        "gammaMarketIds": [],
-        "unidentifiedFrames": 4
-      }
+      "verification": "storage-wal.validateSegment+storage-parquet.readWalSegment over one in-memory read"
     },
     {
       "segmentId": "0190a3e0-0000-7000-8000-000000000001-000001",
@@ -768,13 +762,7 @@
       "lastIngestSeq": "18446744073709551617",
       "minReceivedAt": "2026-01-01T00:00:04.000Z",
       "maxReceivedAt": "2026-01-01T00:00:06.000Z",
-      "verification": "storage-wal.validateSegment+storage-parquet.readWalSegment over one in-memory read",
-      "marketIdentities": {
-        "polymarketTokenIds": [],
-        "conditionIds": [],
-        "gammaMarketIds": [],
-        "unidentifiedFrames": 3
-      }
+      "verification": "storage-wal.validateSegment+storage-parquet.readWalSegment over one in-memory read"
     }
   ],
   "objects": [

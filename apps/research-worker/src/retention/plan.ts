@@ -15,9 +15,12 @@
  *    pointer names re-verifies from the store and lists the segment with the
  *    pointer's two digests.
  * 3. **Every market window that overlaps it is classified** (2.3): every
- *    Polymarket token and condition its frames name belongs to a registered
- *    window (an unknown market is unclassified by definition), and no
- *    registered, unclassified window could still pin a range overlapping it.
+ *    Polymarket token, condition and Gamma market its frames name belongs to a
+ *    registered window (an unknown market is unclassified by definition), no
+ *    frame could name a market the inventory cannot read, and no registered,
+ *    unclassified window could still pin a range overlapping it. The names are
+ *    read from the VERIFIED research-tier manifest (`marketIdentities`, taken
+ *    from every frame), never from the unverified pointer.
  * 4. **Every pin whose range overlaps it is extracted and verified** (2.4):
  *    its record exists, its manifests verify, every source event it had to
  *    hold lies inside it, and it holds this segment with the same two digests.
@@ -48,6 +51,7 @@ import { potentialRange } from "./classify.js";
 import type { PinRecord } from "./pins.js";
 import { overlaps, verifyPinManifests } from "./pins.js";
 import type { PinSpec } from "./pins.js";
+import { cachedResearchVerifier } from "./wal-index.js";
 import type { MarketWindow, OperatorPin } from "./windows.js";
 
 /** ADR-028 Decision 2.1: 72 hours. */
@@ -59,10 +63,17 @@ export type SegmentDecision = {
   readonly eligible: boolean;
   /** Every reason the segment is kept; empty exactly when it is eligible. */
   readonly reasons: readonly string[];
-  /** The newest receipt instant over its verified frames, when known. */
+  /** The oldest and newest receipt instants over its verified frames, when known. */
+  readonly minReceivedAt: string | null;
   readonly maxReceivedAt: string | null;
   /** When it reaches the retention age, in epoch ms, when known. */
   readonly ageEligibleAtMs: number | null;
+  /**
+   * When it is due for expiry, for the lag metric: `ageEligibleAtMs` when
+   * known, otherwise its sidecar's `closedAt` plus the retention — so a
+   * segment the extract path cannot verify still shows as stuck.
+   */
+  readonly retentionDueAtMs: number | null;
   /** The deletion request, only when eligible. */
   readonly request: ExpiryDeletionRequest | null;
 };
@@ -71,6 +82,8 @@ export type ExpiryPlanningInput = {
   readonly nowMs: number;
   readonly retentionMs: number;
   readonly leadInMs: number;
+  /** The window range's tail after its end (`classify.ts`, `potentialRange`). */
+  readonly durabilityGraceMs: number;
   readonly inventory: WalInventory;
   readonly objectStore: ObjectStore;
   readonly windows: readonly MarketWindow[];
@@ -80,6 +93,8 @@ export type ExpiryPlanningInput = {
   readonly pinSpecs: readonly PinSpec[];
   /** Pin records by pin id; absent or `null` means not extracted. */
   readonly pinRecords: ReadonlyMap<string, PinRecord | null>;
+  /** A shared cache of verified research-tier datasets; one is made when absent. */
+  readonly verifiedResearch?: (manifestObjectKey: string) => Promise<VerifiedResearchTierDataset | Error>;
 };
 
 type VerifiedPin = { readonly record: PinRecord; readonly segmentDigests: ReadonlyMap<string, { sha: string; file: string }> };
@@ -102,19 +117,9 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
   const knownGammaMarkets = new Set(
     input.windows.map((window) => window.gammaMarketId).filter((id): id is string => id !== null),
   );
-  const researchCache = new Map<string, Promise<VerifiedResearchTierDataset | Error>>();
   const pinCache = new Map<string, Promise<VerifiedPin | Error>>();
-
-  const verifiedResearch = (key: string): Promise<VerifiedResearchTierDataset | Error> => {
-    let cached = researchCache.get(key);
-    if (cached === undefined) {
-      cached = verifyResearchTierDataset(input.objectStore, key).catch((error: unknown) =>
-        error instanceof Error ? error : new Error(String(error)),
-      );
-      researchCache.set(key, cached);
-    }
-    return cached;
-  };
+  const verifiedResearch =
+    input.verifiedResearch ?? cachedResearchVerifier((key) => verifyResearchTierDataset(input.objectStore, key));
   const verifiedPin = (record: PinRecord): Promise<VerifiedPin | Error> => {
     let cached = pinCache.get(record.pinId);
     if (cached === undefined) {
@@ -136,12 +141,20 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
 
   async function decide(segment: InventoriedSegment): Promise<SegmentDecision> {
     const reasons: string[] = [];
-    const keep = (maxReceivedAt: string | null, ageEligibleAtMs: number | null): SegmentDecision => ({
+    const closedAtMs = Date.parse(segment.closedAt);
+    const keep = (
+      minReceivedAt: string | null,
+      maxReceivedAt: string | null,
+      ageEligibleAtMs: number | null,
+    ): SegmentDecision => ({
       segment,
       eligible: false,
       reasons,
+      minReceivedAt,
       maxReceivedAt,
       ageEligibleAtMs,
+      retentionDueAtMs:
+        ageEligibleAtMs ?? (Number.isFinite(closedAtMs) ? closedAtMs + input.retentionMs : null),
       request: null,
     });
 
@@ -151,16 +164,16 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
       pointer = await readResearchPointer(input.objectStore, segment.gatewayEpoch, segment.segmentId);
     } catch (error) {
       reasons.push(`research-pointer-unreadable: ${error instanceof Error ? error.message : String(error)}`);
-      return keep(null, null);
+      return keep(null, null, null);
     }
     if (pointer === null) {
       reasons.push("not-extracted: no verified research tier names this segment");
-      return keep(null, null);
+      return keep(null, null, null);
     }
     const research = await verifiedResearch(pointer.manifestObjectKey);
     if (research instanceof Error) {
       reasons.push(`research-tier-not-verified: ${research.message}`);
-      return keep(null, null);
+      return keep(null, null, null);
     }
     const entry: ResearchSourceSegment | undefined = research.manifest.sourceSegments.find(
       (source) => source.segmentId === segment.segmentId,
@@ -173,7 +186,7 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
       entry.gatewayEpoch !== segment.gatewayEpoch
     ) {
       reasons.push("research-tier-mismatch: the verified research tier does not list this segment as its pointer says");
-      return keep(null, null);
+      return keep(null, null, null);
     }
 
     // -- 1. Age, from the maximum receipt instant over every frame. ---------
@@ -181,7 +194,7 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     const minReceivedAt = entry.minReceivedAt;
     if (maxReceivedAt === null || minReceivedAt === null) {
       reasons.push("no-frames: the segment holds no frame, so it has no age");
-      return keep(null, null);
+      return keep(null, null, null);
     }
     const maxMs = epochMsOf(maxReceivedAt);
     const span = { fromMs: epochMsOf(minReceivedAt), toMs: maxMs };
@@ -191,15 +204,22 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     }
 
     // -- 3. Every market it names is registered; every window classified. ---
-    for (const token of pointer.polymarketTokenIds) {
+    // From the VERIFIED manifest entry: the pointer is an index, never proof.
+    const named = entry.marketIdentities;
+    if (named.unidentifiedFrames > 0) {
+      reasons.push(
+        `unidentified-market-content: ${String(named.unidentifiedFrames)} frame(s) could carry market content but name no market the inventory can read`,
+      );
+    }
+    for (const token of named.polymarketTokenIds) {
       if (!knownTokens.has(token)) reasons.push(`unknown-market: token ${token} belongs to no registered window`);
     }
-    for (const condition of pointer.conditionIds) {
+    for (const condition of named.conditionIds) {
       if (!knownConditions.has(condition)) {
         reasons.push(`unknown-market: condition ${condition} belongs to no registered window`);
       }
     }
-    for (const gammaMarketId of pointer.gammaMarketIds) {
+    for (const gammaMarketId of named.gammaMarketIds) {
       if (!knownGammaMarkets.has(gammaMarketId)) {
         reasons.push(`unknown-market: Gamma market ${gammaMarketId} belongs to no registered window`);
       }
@@ -207,7 +227,7 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     for (const window of input.windows) {
       const classification = input.classifications.get(window.windowId);
       if (classification === undefined || classification.state === "unclassified") {
-        if (overlaps(span, potentialRange(window, input.leadInMs))) {
+        if (overlaps(span, potentialRange(window, input.leadInMs, input.durabilityGraceMs))) {
           reasons.push(
             `unclassified-window: ${window.windowId}${classification === undefined ? "" : ` (${classification.reason})`}`,
           );
@@ -264,13 +284,15 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
       }
     }
 
-    if (reasons.length > 0) return keep(maxReceivedAt, ageEligibleAtMs);
+    if (reasons.length > 0) return keep(minReceivedAt, maxReceivedAt, ageEligibleAtMs);
     return {
       segment,
       eligible: true,
       reasons: [],
+      minReceivedAt,
       maxReceivedAt,
       ageEligibleAtMs,
+      retentionDueAtMs: ageEligibleAtMs,
       request: {
         segmentId: segment.segmentId,
         gatewayEpoch: segment.gatewayEpoch,

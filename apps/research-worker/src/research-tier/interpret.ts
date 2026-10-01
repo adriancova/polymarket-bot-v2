@@ -36,6 +36,8 @@ import {
 } from "@polymarket-bot/polymarket-public/rtds";
 import type { RawFrameRecord } from "@polymarket-bot/storage-parquet";
 
+import { GAMMA_MARKET_ENDPOINT_PREFIX, POLYMARKET_MARKET_ENDPOINT_PREFIX } from "./identity.js";
+
 /** A book level as canonical decimal strings. */
 export type Level = readonly [price: string, size: string];
 
@@ -123,10 +125,6 @@ export type Interpretation = {
 const MAX_PROBLEMS = 8;
 const MAX_PROBLEM_LENGTH = 200;
 
-/** The Polymarket market-channel endpoint the gateway records (`docs/venue`). */
-const POLYMARKET_MARKET_ENDPOINT_PREFIX = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-/** The Gamma market-detail endpoint the lifecycle feed polls. */
-const GAMMA_MARKET_ENDPOINT_PREFIX = "https://gamma-api.polymarket.com/markets/";
 
 /** Whether a raw record is the Polymarket market channel. */
 export function isPolymarketMarketChannel(record: RawFrameRecord): boolean {
@@ -314,18 +312,6 @@ function interpretPolymarketMarket(payload: string): Interpretation {
     }
   });
   return result("polymarket-market", observations, problems);
-}
-
-/**
- * The Gamma market id a lifecycle poll names, from the request URL the
- * gateway recorded as the frame's endpoint — never from the body: the door's
- * `recorded` scalars are "NOT an authority: nothing in this repository may
- * derive behaviour from a key it holds" (`market-state/door.ts`).
- */
-export function gammaMarketIdOf(record: RawFrameRecord): string | null {
-  if (record.source !== "polymarket" || !record.endpoint.startsWith(GAMMA_MARKET_ENDPOINT_PREFIX)) return null;
-  const id = record.endpoint.slice(GAMMA_MARKET_ENDPOINT_PREFIX.length);
-  return /^[0-9A-Za-z_-]{1,64}$/u.test(id) ? id : null;
 }
 
 function interpretGamma(payload: string): Interpretation {

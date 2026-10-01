@@ -160,6 +160,22 @@ class ResearchSourceSegment:
     record_count: int
     min_received_at: str | None
     max_received_at: str | None
+    market_identities: "ResearchMarketIdentities"
+
+
+@dataclass(frozen=True)
+class ResearchMarketIdentities:
+    """The Polymarket markets one source segment names (``STORAGE-1``).
+
+    The expiry decision reads these from the checksummed manifest; a
+    manifest without them is refused here exactly as the TypeScript reader
+    refuses it (``parseResearchTierManifest``).
+    """
+
+    polymarket_token_ids: tuple[str, ...]
+    condition_ids: tuple[str, ...]
+    gamma_market_ids: tuple[str, ...]
+    unidentified_frames: int
 
 
 @dataclass(frozen=True)
@@ -333,6 +349,36 @@ def parse_any_manifest(document: Any) -> DatasetManifest | ResearchTierManifest:
     return parse_manifest(document)
 
 
+def _identity_list(value: Any, where: str) -> tuple[str, ...]:
+    items = tuple(_require_str(item, where) for item in _require_list(value, where))
+    for item in items:
+        if not item:
+            raise ManifestError(f"{where}: expected non-empty strings")
+    # Sorted and unique by UTF-16 code unit, as the TypeScript writer emits
+    # them (JavaScript's default string order).
+    keys = [item.encode("utf-16-be") for item in items]
+    if any(left >= right for left, right in zip(keys, keys[1:])):
+        raise ManifestError(f"{where}: must be sorted and unique")
+    return items
+
+
+def _market_identities(value: Any, where: str) -> ResearchMarketIdentities:
+    source = _require_dict(value, where)
+    unidentified = _require_int(_require(source, "unidentifiedFrames", where), f"{where}.unidentifiedFrames")
+    if unidentified < 0:
+        raise ManifestError(f"{where}.unidentifiedFrames: expected a non-negative integer")
+    return ResearchMarketIdentities(
+        polymarket_token_ids=_identity_list(
+            _require(source, "polymarketTokenIds", where), f"{where}.polymarketTokenIds"
+        ),
+        condition_ids=_identity_list(_require(source, "conditionIds", where), f"{where}.conditionIds"),
+        gamma_market_ids=_identity_list(
+            _require(source, "gammaMarketIds", where), f"{where}.gammaMarketIds"
+        ),
+        unidentified_frames=unidentified,
+    )
+
+
 def parse_research_tier_manifest(document: Any) -> ResearchTierManifest:
     """Parse a version 2 approximate (research-tier) manifest."""
     version, fidelity = read_fidelity(document)
@@ -392,6 +438,9 @@ def parse_research_tier_manifest(document: Any) -> ResearchTierManifest:
             record_count=_require_int(_require(e, "recordCount", "sourceSegment"), "recordCount"),
             min_received_at=_optional_str(e.get("minReceivedAt"), "minReceivedAt"),
             max_received_at=_optional_str(e.get("maxReceivedAt"), "maxReceivedAt"),
+            market_identities=_market_identities(
+                _require(e, "marketIdentities", "sourceSegment"), "sourceSegment.marketIdentities"
+            ),
         )
         for e in _require_list(_require(root, "sourceSegments", "manifest"), "sourceSegments")
     )

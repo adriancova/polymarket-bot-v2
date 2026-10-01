@@ -174,6 +174,55 @@ class TestVersionTwoApproximate:
         assert "fidelity-label" in {finding.check for finding in report.findings}
 
 
+MALFORMED = FIXTURE_ROOT / "malformed"
+
+
+class TestSharedMalformedFixtures:
+    """ADR-017 §3, on the same bytes the TypeScript reader refuses
+    (``test/integration/parquet/python-fixture.test.ts``; ``STORAGE-1``
+    round 1, J3). Each file is the committed research-tier manifest with one
+    change: a duplicate ``fidelity`` key ahead of the real one, an invalid
+    UTF-8 sequence, a ``NaN`` literal, an unpaired-surrogate escape, and no
+    ``marketIdentities`` on the source segments."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "research-duplicate-fidelity.json",
+            "research-invalid-utf8.json",
+            "research-nan-literal.json",
+            "research-lone-surrogate.json",
+            "research-without-market-identities.json",
+        ],
+    )
+    def test_each_is_refused(self, name: str) -> None:
+        with pytest.raises(ManifestError):
+            load_any_manifest(MALFORMED / name)
+
+    @pytest.mark.skipif(RESEARCH is None, reason="the research-tier fixture is absent")
+    def test_the_unchanged_manifest_reads_with_its_market_inventory(self) -> None:
+        assert RESEARCH is not None
+        manifest = load_any_manifest(RESEARCH)
+        assert isinstance(manifest, ResearchTierManifest)
+        for segment in manifest.source_segments:
+            assert segment.market_identities.unidentified_frames >= 0
+            assert list(segment.market_identities.polymarket_token_ids) == sorted(
+                segment.market_identities.polymarket_token_ids
+            )
+
+    @pytest.mark.skipif(RESEARCH is None, reason="the research-tier fixture is absent")
+    def test_an_unsorted_or_negative_inventory_is_refused(self) -> None:
+        assert RESEARCH is not None
+        document = _document(RESEARCH)
+        document["sourceSegments"][0]["marketIdentities"]["conditionIds"] = ["b", "a"]
+        with pytest.raises(ManifestError, match="sorted and unique"):
+            parse_any_manifest(document)
+        document = _document(RESEARCH)
+        document["sourceSegments"][0]["marketIdentities"]["unidentifiedFrames"] = -1
+        with pytest.raises(ManifestError, match="non-negative"):
+            parse_any_manifest(document)
+
+
 class TestRetentionReceiptVersions:
     def _receipt(self, version: int, deleted: list) -> dict:
         manifest_bytes = V2.read_bytes()

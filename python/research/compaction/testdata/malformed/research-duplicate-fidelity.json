@@ -1,4 +1,4 @@
-{
+{"fidelity": "exact",
   "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
   "datasetManifestVersion": 2,
   "fidelity": "approximate",

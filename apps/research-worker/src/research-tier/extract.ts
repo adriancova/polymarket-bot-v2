@@ -16,7 +16,14 @@
  *    verified bytes;
  * 4. only then writes one small **pointer** per segment, naming the verified
  *    dataset. The pointer is an index for the planner, never proof: the
- *    planner and the deletion guard re-verify the dataset itself.
+ *    planner and the deletion guard re-verify the dataset itself, and every
+ *    fact the expiry decision relies on — the digests, the receipt span and
+ *    the markets the segment names — is read from the verified manifest, not
+ *    from the pointer.
+ *
+ * Each segment's market inventory (`identity.ts`) is taken from every frame,
+ * independently of what the downsampler keeps, and bound into the manifest's
+ * source-segment entry (`marketIdentities`).
  *
  * A span still open at the end of a dataset travels in its sampler end state
  * to the next dataset of the epoch. A refused segment, or a gap in segment
@@ -31,6 +38,7 @@ import type {
   CompactionClock,
   CompactionFileSystem,
   ObjectStore,
+  ResearchMarketIdentities,
   ResearchSourceSegment,
   ResearchStateObject,
 } from "@polymarket-bot/storage-parquet";
@@ -38,12 +46,14 @@ import {
   DATASET_MANIFEST_OBJECT_NAME,
   ObjectVerificationError,
   RESEARCH_SOURCE_VERIFICATION,
+  parseStrictJsonBytes,
   sha256Hex,
   verifyResearchTierDataset,
   writeResearchTierDataset,
 } from "@polymarket-bot/storage-parquet";
 
-import { FrameInterpreter, gammaMarketIdOf } from "./interpret.js";
+import { MarketIdentityInventory } from "./identity.js";
+import { FrameInterpreter } from "./interpret.js";
 import type { InventoriedSegment } from "./inventory.js";
 import {
   RESEARCH_DOWNSAMPLING,
@@ -61,7 +71,13 @@ export const RESEARCH_KEY_PREFIX = "research";
 /** The version of {@link ResearchPointer}. */
 export const RESEARCH_POINTER_VERSION = 1;
 
-/** One segment's index entry: which verified research-tier dataset holds it. */
+/**
+ * One segment's index entry: which verified research-tier dataset holds it.
+ *
+ * An INDEX, never proof. It carries no market names: the expiry decision reads
+ * those from the verified manifest's `marketIdentities`, so rewriting a
+ * pointer cannot remove a market from the decision.
+ */
 export type ResearchPointer = {
   readonly pointerVersion: number;
   readonly segmentId: string;
@@ -76,16 +92,80 @@ export type ResearchPointer = {
   /** Smallest and largest `ingestSeq` over the segment's frames. */
   readonly minIngestSeq: string | null;
   readonly maxIngestSeq: string | null;
-  /** Polymarket outcome tokens the segment's frames name. */
-  readonly polymarketTokenIds: readonly string[];
-  /** Polymarket condition ids the segment's frames name. */
-  readonly conditionIds: readonly string[];
-  /** Gamma market ids the segment's lifecycle polls name (from their endpoints). */
-  readonly gammaMarketIds: readonly string[];
   readonly datasetId: string;
   readonly manifestObjectKey: string;
   readonly manifestSha256: string;
 };
+
+const POINTER_KEYS: readonly (keyof ResearchPointer)[] = [
+  "pointerVersion",
+  "segmentId",
+  "gatewayEpoch",
+  "segmentIndex",
+  "segmentSha256",
+  "segmentFileSha256",
+  "byteSize",
+  "recordCount",
+  "minReceivedAt",
+  "maxReceivedAt",
+  "minIngestSeq",
+  "maxIngestSeq",
+  "datasetId",
+  "manifestObjectKey",
+  "manifestSha256",
+];
+
+const POINTER_SHA256 = /^[0-9a-f]{64}$/u;
+const POINTER_UINT = /^(0|[1-9][0-9]*)$/u;
+const POINTER_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/u;
+
+/** Parse a pointer document field by field (strict JSON; every field typed; no other key). */
+export function parseResearchPointer(bytes: Uint8Array, key: string): ResearchPointer {
+  const fail = (what: string): never => {
+    throw new Error(`research pointer ${key} is not one this build reads: ${what}`);
+  };
+  let value: unknown;
+  try {
+    value = parseStrictJsonBytes(bytes);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return fail("not a JSON object");
+  const source = value as Record<string, unknown>;
+  for (const name of Object.keys(source)) {
+    if (!(POINTER_KEYS as readonly string[]).includes(name)) fail(`an unknown field ${name}`);
+  }
+  const text = (name: string, pattern?: RegExp): string => {
+    const field = source[name];
+    if (typeof field !== "string" || field.length === 0 || (pattern !== undefined && !pattern.test(field))) {
+      return fail(`${name} is malformed`);
+    }
+    return field;
+  };
+  const nullableText = (name: string, pattern: RegExp): string | null => (source[name] === null ? null : text(name, pattern));
+  const count = (name: string): number => {
+    const field = source[name];
+    if (typeof field !== "number" || !Number.isSafeInteger(field) || field < 0) return fail(`${name} is malformed`);
+    return field;
+  };
+  return {
+    pointerVersion: count("pointerVersion"),
+    segmentId: text("segmentId"),
+    gatewayEpoch: text("gatewayEpoch"),
+    segmentIndex: count("segmentIndex"),
+    segmentSha256: text("segmentSha256", POINTER_SHA256),
+    segmentFileSha256: text("segmentFileSha256", POINTER_SHA256),
+    byteSize: count("byteSize"),
+    recordCount: count("recordCount"),
+    minReceivedAt: nullableText("minReceivedAt", POINTER_ISO),
+    maxReceivedAt: nullableText("maxReceivedAt", POINTER_ISO),
+    minIngestSeq: nullableText("minIngestSeq", POINTER_UINT),
+    maxIngestSeq: nullableText("maxIngestSeq", POINTER_UINT),
+    datasetId: text("datasetId"),
+    manifestObjectKey: text("manifestObjectKey"),
+    manifestSha256: text("manifestSha256", POINTER_SHA256),
+  };
+}
 
 /** The key of a segment's research pointer. */
 export function researchPointerKey(gatewayEpoch: string, segmentId: string): string {
@@ -104,11 +184,25 @@ export async function readResearchPointer(
 ): Promise<ResearchPointer | null> {
   const key = researchPointerKey(gatewayEpoch, segmentId);
   if ((await objectStore.head(key)) === null) return null;
-  const value = JSON.parse(Buffer.from(await objectStore.get(key)).toString("utf8")) as ResearchPointer;
+  const value = parseResearchPointer(await objectStore.get(key), key);
   if (value.pointerVersion !== RESEARCH_POINTER_VERSION || value.segmentId !== segmentId || value.gatewayEpoch !== gatewayEpoch) {
     throw new Error(`research pointer ${key} is not one this build reads`);
   }
   return value;
+}
+
+const UNREADABLE = Symbol("unreadable research pointer");
+
+async function pointerOrUnreadable(
+  objectStore: ObjectStore,
+  gatewayEpoch: string,
+  segmentId: string,
+): Promise<ResearchPointer | null | typeof UNREADABLE> {
+  try {
+    return await readResearchPointer(objectStore, gatewayEpoch, segmentId);
+  } catch {
+    return UNREADABLE;
+  }
 }
 
 /** What one extraction run did. */
@@ -154,7 +248,8 @@ type Batch = {
   readonly interpreter: FrameInterpreter;
   readonly stateIn: (ResearchStateObject & { readonly datasetId: string }) | null;
   readonly segments: VerifiedSegment[];
-  readonly tokens: Map<string, { tokens: Set<string>; conditions: Set<string>; gammaMarkets: Set<string> }>;
+  /** Each segment's market inventory, taken from every frame (`identity.ts`). */
+  readonly identities: Map<string, ResearchMarketIdentities>;
   framesRead: number;
   segmentDeclared: number;
 };
@@ -204,7 +299,7 @@ export async function extractResearchTier(options: ExtractionOptions): Promise<E
     if (batchDelayMs > 0) {
       const pendingClosedAt: number[] = [];
       for (const segment of segments) {
-        if ((await readResearchPointer(options.objectStore, gatewayEpoch, segment.segmentId)) === null) {
+        if ((await pointerOrUnreadable(options.objectStore, gatewayEpoch, segment.segmentId)) === null) {
           pendingClosedAt.push(Date.parse(segment.closedAt));
         }
       }
@@ -247,7 +342,21 @@ export async function extractResearchTier(options: ExtractionOptions): Promise<E
     };
 
     for (const segment of segments) {
-      const existing = await readResearchPointer(options.objectStore, gatewayEpoch, segment.segmentId);
+      const existing = await pointerOrUnreadable(options.objectStore, gatewayEpoch, segment.segmentId);
+      if (existing === UNREADABLE) {
+        // A pointer that does not read is never written over (objects are
+        // immutable) and never trusted: the segment is refused, so it never
+        // expires, and the chain restarts after it. The other segments go on.
+        await closeBatch();
+        refused.push({
+          status: "refused",
+          segmentId: segment.segmentId,
+          walDirectoryPath: segment.walDirectoryPath,
+          reasons: ["RESEARCH_POINTER_UNREADABLE: its research pointer exists and does not read"],
+        });
+        previous = { segmentIndex: segment.segmentIndex, pointer: null, chainable: false };
+        continue;
+      }
       if (existing !== null) {
         await closeBatch();
         previous = { segmentIndex: segment.segmentIndex, pointer: existing, chainable: true };
@@ -286,27 +395,23 @@ export async function extractResearchTier(options: ExtractionOptions): Promise<E
           interpreter: new FrameInterpreter(),
           stateIn,
           segments: [],
-          tokens: new Map(),
+          identities: new Map(),
           framesRead: 0,
           segmentDeclared: 0,
         };
       }
       const active = batch as Batch | null;
       if (active === null) throw new Error("unreachable: no extraction batch is open");
-      const names = { tokens: new Set<string>(), conditions: new Set<string>(), gammaMarkets: new Set<string>() };
+      // The market inventory is taken from EVERY frame, whatever the sampler
+      // keeps: an event it discards (best_bid_ask), one the door does not
+      // know, or one it finds invalid still names its market.
+      const inventory = new MarketIdentityInventory();
       for (const entry of verified.records) {
+        inventory.add(entry.record);
         const interpretation = active.interpreter.interpret(entry.record);
-        const gammaMarketId = gammaMarketIdOf(entry.record);
-        if (gammaMarketId !== null) names.gammaMarkets.add(gammaMarketId);
-        for (const observation of interpretation.observations) {
-          if ("tokenId" in observation && observation.tokenId !== null) names.tokens.add(observation.tokenId);
-          if ("conditionId" in observation && observation.conditionId !== null) {
-            names.conditions.add(observation.conditionId);
-          }
-        }
         active.sampler.consume({ record: entry.record, segmentId: verified.segmentId, interpretation });
       }
-      active.tokens.set(verified.segmentId, names);
+      active.identities.set(verified.segmentId, inventory.result());
       active.framesRead += verified.records.length;
       active.segmentDeclared += verified.manifest.recordCount;
       // Keep the digests and ranges; drop the records.
@@ -320,7 +425,7 @@ export async function extractResearchTier(options: ExtractionOptions): Promise<E
   return { datasets, refused, segmentsExtracted, framesRead, uninterpretedByCategory: uninterpreted };
 }
 
-function sourceSegmentOf(segment: VerifiedSegment): ResearchSourceSegment {
+function sourceSegmentOf(segment: VerifiedSegment, marketIdentities: ResearchMarketIdentities): ResearchSourceSegment {
   return {
     segmentId: segment.segmentId,
     gatewayEpoch: segment.manifest.gatewayEpoch,
@@ -335,6 +440,7 @@ function sourceSegmentOf(segment: VerifiedSegment): ResearchSourceSegment {
     minReceivedAt: segment.minReceivedAt,
     maxReceivedAt: segment.maxReceivedAt,
     verification: RESEARCH_SOURCE_VERIFICATION,
+    marketIdentities,
   };
 }
 
@@ -342,7 +448,11 @@ async function writeBatch(options: ExtractionOptions, batch: Batch): Promise<Ext
   const datasetId = datasetIdFor(batch.gatewayEpoch, batch.segments);
   const prefix = `${RESEARCH_KEY_PREFIX}/${batch.gatewayEpoch}/${datasetId}`;
   const manifestObjectKey = `${prefix}/${DATASET_MANIFEST_OBJECT_NAME}`;
-  const sourceSegments = batch.segments.map(sourceSegmentOf);
+  const sourceSegments = batch.segments.map((segment) => {
+    const identities = batch.identities.get(segment.segmentId);
+    if (identities === undefined) throw new Error(`unreachable: segment ${segment.segmentId} has no market inventory`);
+    return sourceSegmentOf(segment, identities);
+  });
 
   let manifestSha256: string;
   let samples: number;
@@ -357,7 +467,8 @@ async function writeBatch(options: ExtractionOptions, batch: Batch): Promise<Ext
         (entry, index) =>
           entry.segmentId === sourceSegments[index]?.segmentId &&
           entry.segmentSha256 === sourceSegments[index]?.segmentSha256 &&
-          entry.segmentFileSha256 === sourceSegments[index]?.segmentFileSha256,
+          entry.segmentFileSha256 === sourceSegments[index]?.segmentFileSha256 &&
+          JSON.stringify(entry.marketIdentities) === JSON.stringify(sourceSegments[index]?.marketIdentities),
       );
     if (!same) {
       throw new ObjectVerificationError("a research-tier dataset already exists under this key with other sources", {
@@ -398,11 +509,6 @@ async function writeBatch(options: ExtractionOptions, batch: Batch): Promise<Ext
   }
 
   for (const segment of batch.segments) {
-    const names = batch.tokens.get(segment.segmentId) ?? {
-      tokens: new Set<string>(),
-      conditions: new Set<string>(),
-      gammaMarkets: new Set<string>(),
-    };
     const pointer: ResearchPointer = {
       pointerVersion: RESEARCH_POINTER_VERSION,
       segmentId: segment.segmentId,
@@ -416,9 +522,6 @@ async function writeBatch(options: ExtractionOptions, batch: Batch): Promise<Ext
       maxReceivedAt: segment.maxReceivedAt,
       minIngestSeq: segment.minIngestSeq,
       maxIngestSeq: segment.maxIngestSeq,
-      polymarketTokenIds: [...names.tokens].sort(),
-      conditionIds: [...names.conditions].sort(),
-      gammaMarketIds: [...names.gammaMarkets].sort(),
       datasetId,
       manifestObjectKey,
       manifestSha256,

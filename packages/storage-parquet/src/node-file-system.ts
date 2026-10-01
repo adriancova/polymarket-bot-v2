@@ -29,6 +29,7 @@ import type {
   CompactionClock,
   CompactionFileSystem,
   ExpiredSegmentDeletion,
+  ExpiredSegmentDeletionOptions,
   ObjectHead,
   ObjectStore,
   SegmentDeletionRequest,
@@ -286,9 +287,14 @@ export async function hasExpiryOptInMarker(walRootPath: string): Promise<boolean
  * 3. **The proof holds for the bytes about to go** ({@link verifyExpiryProof}):
  *    the research tier and every named pin verified from the store, and the
  *    file hashing to both digests they pin.
+ * 4. **The caller's final check** (`options.beforeUnlink`) runs after the
+ *    proof and immediately before the unlink, so a condition that can change
+ *    while the proof reads the store (an operator pin) is re-read last.
  *
  * Then it removes the segment and its sidecar manifest, in that order (the
- * reasoning on {@link deleteAfterVerifiedUploadRetention}).
+ * reasoning on {@link deleteAfterVerifiedUploadRetention}). A crash between
+ * the two leaves a sidecar with no segment, which the research worker's
+ * inventory reports as an orphan and never plans again.
  */
 export function expireAfterExtractDeletion(options: {
   readonly walRootPath: string;
@@ -301,6 +307,7 @@ export function expireAfterExtractDeletion(options: {
     async deleteExpiredSegment(
       walDirectoryPath: string,
       request: ExpiryDeletionRequest,
+      deletionOptions?: ExpiredSegmentDeletionOptions,
     ): Promise<ExpiryProofOutcome> {
       // Real paths, so a symbolic link cannot carry a deletion out of the root.
       const root = await realpath(options.walRootPath).catch(() => resolve(options.walRootPath));
@@ -323,6 +330,16 @@ export function expireAfterExtractDeletion(options: {
         { objectStore: options.objectStore, readSegmentFile: () => fileSystem.readWholeFile(segmentPath) },
         request,
       );
+      if (deletionOptions?.beforeUnlink !== undefined) {
+        try {
+          await deletionOptions.beforeUnlink();
+        } catch (error) {
+          throw new RetentionGuardError(
+            `refusing to expire a WAL segment: the final check before the unlink failed: ${error instanceof Error ? error.message : String(error)}`,
+            { segmentId: request.segmentId },
+          );
+        }
+      }
       await rm(segmentPath, { force: true });
       await rm(manifestPath, { force: true });
       return outcome;

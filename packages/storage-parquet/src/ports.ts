@@ -187,8 +187,21 @@ export interface ExpiredSegmentDeletion {
   deleteExpiredSegment(
     walDirectoryPath: string,
     request: ExpiryDeletionRequest,
+    options?: ExpiredSegmentDeletionOptions,
   ): Promise<ExpiryProofOutcome>;
 }
+
+/** What a caller may add to one expired-after-extract deletion. */
+export type ExpiredSegmentDeletionOptions = {
+  /**
+   * The caller's last word, run AFTER the proof has verified and
+   * IMMEDIATELY before the unlink, with nothing awaited in between: it throws
+   * (and nothing is deleted) when the segment must now be kept. The research
+   * worker re-reads the operator's pins here (ADR-028 Decision 2.5 must hold
+   * at the unlink, not only when the plan was made).
+   */
+  readonly beforeUnlink?: () => Promise<void>;
+};
 
 /** A segment was read and fully verified. */
 export type SegmentVerifiedEvent = {

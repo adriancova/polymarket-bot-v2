@@ -4,7 +4,7 @@
   "fidelity": "approximate",
   "datasetId": "research-0190a3e0-0000-7000-8000-000000000001-000000-000001",
   "createdAt": "2026-01-01T12:00:00.000Z",
-  "admissibility": "approximate: a research-tier dataset, downsampled from raw WAL. It cannot show queue position or moves inside one second (ADR-028 Decision 7). It is never admissible as determinism, calibration, promotion or soak evidence, and any result computed from it ranks below every ADR-012 tier (ADR-029 Decisions 2 and 3).",
+  "admissibility": "\ud800approximate: a research-tier dataset, downsampled from raw WAL. It cannot show queue position or moves inside one second (ADR-028 Decision 7). It is never admissible as determinism, calibration, promotion or soak evidence, and any result computed from it ranks below every ADR-012 tier (ADR-029 Decisions 2 and 3).",
   "schemaVersions": {
     "walFormatId": "polymarket-bot/wal/v1",
     "walSchemaVersion": 1,

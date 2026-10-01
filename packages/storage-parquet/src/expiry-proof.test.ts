@@ -37,6 +37,7 @@ import type { ResearchRow } from "./research-tier-layout.js";
 import { RESEARCH_SOURCE_VERIFICATION } from "./research-tier-manifest.js";
 import type { ResearchSourceSegment } from "./research-tier-manifest.js";
 import { verifyResearchTierDataset, writeResearchTierDataset } from "./research-tier-writer.js";
+import { verifyRetentionProof } from "./retention-proof.js";
 import type { ResearchTierWriteResult } from "./research-tier-writer.js";
 import { buildSegmentFixture, manualClock, memoryObjectStore } from "./testing/index.js";
 import type { SegmentFixture } from "./testing/wal-fixture.js";
@@ -70,6 +71,7 @@ function sourceOf(segment: SegmentFixture): ResearchSourceSegment {
     minReceivedAt: "2026-01-01T00:00:00.000Z",
     maxReceivedAt: "2026-01-01T00:00:05.000Z",
     verification: RESEARCH_SOURCE_VERIFICATION,
+    marketIdentities: { polymarketTokenIds: [], conditionIds: [], gammaMarketIds: [], unidentifiedFrames: 1 },
   };
 }
 
@@ -160,6 +162,63 @@ describe("writeResearchTierDataset", () => {
     objectStore.corrupt(objectKey, original);
     objectStore.corrupt("research/e/research-1/manifest.sha256", Buffer.from(`${"0".repeat(64)}\n`));
     await expect(verifyResearchTierDataset(objectStore, written.manifestObjectKey)).rejects.toThrow(/sidecar/u);
+  });
+
+  it("binds each source segment's market inventory into the checksummed manifest, and requires it", async () => {
+    const objectStore = memoryObjectStore();
+    const segment = fixture();
+    const identities = { polymarketTokenIds: ["tokA", "tokB"], conditionIds: ["0xc1"], gammaMarketIds: ["5121169"], unidentifiedFrames: 2 };
+    const written = await writeResearch(objectStore, segment, [{ ...sourceOf(segment), marketIdentities: identities }]);
+    const verified = await verifyResearchTierDataset(objectStore, written.manifestObjectKey);
+    expect(verified.manifest.sourceSegments[0]?.marketIdentities).toStrictEqual(identities);
+    // A manifest without the inventory (or with an unsorted one) is not one the expiry decision can rely on.
+    const text = Buffer.from(await objectStore.get(written.manifestObjectKey)).toString("utf8");
+    for (const altered of [
+      text.replace(/"marketIdentities": \{[^}]*\},?/su, "").replace(/,(\s*)\}/su, "$1}"),
+      text.replace('"tokA",', '"tokZ",'),
+    ]) {
+      expect(altered).not.toBe(text);
+      const bytes = Buffer.from(altered, "utf8");
+      objectStore.corrupt(written.manifestObjectKey, bytes);
+      objectStore.corrupt("research/e/research-1/manifest.sha256", Buffer.from(`${sha256Hex(bytes)}\n`));
+      await expect(verifyResearchTierDataset(objectStore, written.manifestObjectKey)).rejects.toThrow(/could not be read/u);
+    }
+  });
+});
+
+describe("ADR-017 §3: manifests on the deletion path are read under the strict-JSON profile", () => {
+  /** Replace a manifest's bytes, and its sidecar to match, so only the JSON profile can refuse it. */
+  function forge(store: ReturnType<typeof memoryObjectStore>, key: string, sidecarKey: string, bytes: Uint8Array): void {
+    store.corrupt(key, bytes);
+    store.corrupt(sidecarKey, Buffer.from(`${sha256Hex(bytes)}\n`));
+  }
+
+  it("refuses a research-tier manifest with a duplicate key, even with a matching sidecar", async () => {
+    const store = memoryObjectStore();
+    const written = await writeResearch(store, fixture());
+    const text = Buffer.from(await store.get(written.manifestObjectKey)).toString("utf8");
+    // A second spelling of a pinned field, BEFORE the real one: last-wins would read "approximate".
+    const duplicated = Buffer.from(text.replace("{", '{"fidelity":"exact",'), "utf8");
+    forge(store, written.manifestObjectKey, "research/e/research-1/manifest.sha256", duplicated);
+    await expect(verifyResearchTierDataset(store, written.manifestObjectKey)).rejects.toThrow(/duplicate key "fidelity"/u);
+  });
+
+  it("refuses invalid UTF-8 and non-RFC-8259 literals", async () => {
+    const store = memoryObjectStore();
+    const written = await writeResearch(store, fixture());
+    const text = Buffer.from(await store.get(written.manifestObjectKey)).toString("utf8");
+    const original = Buffer.from(text, "utf8");
+    const at = original.indexOf(Buffer.from('"admissibility": "', "utf8")) + '"admissibility": "'.length;
+    // 0xC3 0x28: a two-byte lead followed by a non-continuation byte.
+    const withBadByte = Buffer.concat([original.subarray(0, at), Buffer.from([0xc3, 0x28]), original.subarray(at)]);
+    forge(store, written.manifestObjectKey, "research/e/research-1/manifest.sha256", withBadByte);
+    await expect(verifyResearchTierDataset(store, written.manifestObjectKey)).rejects.toThrow(/not valid UTF-8/u);
+    const nan = Buffer.from(text.replace(/"rowGroupSize": [0-9]+/u, '"rowGroupSize": NaN'), "utf8");
+    forge(store, written.manifestObjectKey, "research/e/research-1/manifest.sha256", nan);
+    await expect(verifyResearchTierDataset(store, written.manifestObjectKey)).rejects.toThrow(/not strict JSON/u);
+    const surrogate = Buffer.from(text.replace('"admissibility": "', '"admissibility": "\\ud800'), "utf8");
+    forge(store, written.manifestObjectKey, "research/e/research-1/manifest.sha256", surrogate);
+    await expect(verifyResearchTierDataset(store, written.manifestObjectKey)).rejects.toThrow(/unpaired surrogate/u);
   });
 });
 
@@ -326,6 +385,70 @@ describe("verifyExpiryProof: the bytes are the ones extracted, checked at deleti
   });
 });
 
+describe("verifyExpiryProof: every claim in the request is re-checked", () => {
+  it("refuses a request whose research-tier dataset id differs from the verified manifest's", async () => {
+    const { segment, request } = await setUp();
+    await expect(
+      verifyExpiryProof(readerOf(segment.segmentBytes), { ...request, researchTier: { ...request.researchTier, datasetId: "research-other" } }),
+    ).rejects.toThrow(/names a different dataset/u);
+  });
+
+  it("refuses a request whose pin dataset id differs from the verified pin manifest's", async () => {
+    const { segment, request } = await setUp();
+    const firstPin = request.pins[0];
+    if (firstPin === undefined) throw new Error("no pin");
+    await expect(
+      verifyExpiryProof(readerOf(segment.segmentBytes), { ...request, pins: [{ ...firstPin, datasetId: "pin-other" }] }),
+    ).rejects.toThrow(/an overlapping pin's manifest names a different dataset/u);
+  });
+
+  it("refuses a request that names the same pin twice", async () => {
+    const { segment, request } = await setUp();
+    const firstPin = request.pins[0];
+    if (firstPin === undefined) throw new Error("no pin");
+    await expect(
+      verifyExpiryProof(readerOf(segment.segmentBytes), { ...request, pins: [firstPin, firstPin] }),
+    ).rejects.toThrow(/a pin is named twice/u);
+  });
+
+  it("refuses a pin manifest with a duplicate key, even with a matching sidecar and request digest", async () => {
+    const { segment, pin, request } = await setUp();
+    const text = Buffer.from(await objectStore.get(pin.manifestObjectKey)).toString("utf8");
+    const duplicated = Buffer.from(text.replace("{", '{"datasetId":"pin-1",'), "utf8");
+    await writeFile(join(root, "objects", pin.manifestObjectKey), duplicated);
+    await writeFile(join(root, "objects", pin.manifestObjectKey.replace(/manifest\.json$/u, "manifest.sha256")), `${sha256Hex(duplicated)}\n`);
+    const firstPin = request.pins[0];
+    if (firstPin === undefined) throw new Error("no pin");
+    await expect(
+      verifyExpiryProof(readerOf(segment.segmentBytes), { ...request, pins: [{ ...firstPin, manifestSha256: sha256Hex(duplicated) }] }),
+    ).rejects.toThrow(/not an exact dataset manifest this build reads/u);
+  });
+});
+
+describe("verifyRetentionProof (WP-130's guard, re-run on every pin) reads the manifest strictly", () => {
+  it("refuses a dataset manifest with a duplicate key, even with a matching sidecar", async () => {
+    const { segment, pin } = await setUp();
+    const text = Buffer.from(await objectStore.get(pin.manifestObjectKey)).toString("utf8");
+    const duplicated = Buffer.from(text.replace("{", '{"datasetId":"pin-1",'), "utf8");
+    await writeFile(join(root, "objects", pin.manifestObjectKey), duplicated);
+    await writeFile(join(root, "objects", pin.manifestObjectKey.replace(/manifest\.json$/u, "manifest.sha256")), `${sha256Hex(duplicated)}\n`);
+    const entry = pin.manifest.segments[0];
+    const object = pin.manifest.objects.find((candidate) => candidate.objectKey === entry?.objectKey);
+    if (entry === undefined || object === undefined) throw new Error("no pinned segment");
+    await expect(
+      verifyRetentionProof(readerOf(segment.segmentBytes), {
+        segmentId: segment.segmentId,
+        gatewayEpoch: EPOCH,
+        recordCount: entry.recordCount,
+        segmentSha256: segment.manifest.segmentSha256,
+        verifiedObjectKey: entry.objectKey,
+        verifiedObjectSha256: object.sha256,
+        datasetManifestKey: pin.manifestObjectKey,
+      }),
+    ).rejects.toThrow(/could not be parsed/u);
+  });
+});
+
 describe("expireAfterExtractDeletion: impossible to point at a directory by default", () => {
   it("refuses without the opt-in marker, and deletes nothing", async () => {
     const { request } = await setUp();
@@ -371,6 +494,31 @@ describe("expireAfterExtractDeletion: impossible to point at a directory by defa
     const deletion = expireAfterExtractDeletion({ walRootPath: walRoot, objectStore });
     const outcome = await deletion.deleteExpiredSegment(walDir, request);
     expect(outcome.pinsVerified).toBe(1);
+    expect(await readdir(walDir)).toStrictEqual([]);
+  });
+
+  it("runs the caller's final check after the proof and immediately before the unlink; a refusal keeps the file", async () => {
+    const { request } = await setUp();
+    await writeFile(join(walRoot, EXPIRY_OPT_IN_MARKER_FILE_NAME), EXPIRY_OPT_IN_MARKER_CONTENT);
+    const real = nodeCompactionFileSystem();
+    const events: string[] = [];
+    const observed = { ...real, async readWholeFile(path: string): Promise<Uint8Array> {
+      events.push("proof-read");
+      return await real.readWholeFile(path);
+    } };
+    const deletion = expireAfterExtractDeletion({ walRootPath: walRoot, objectStore, fileSystem: observed });
+    await expect(
+      deletion.deleteExpiredSegment(walDir, request, {
+        beforeUnlink: async () => {
+          events.push(`final-check:${String((await readdir(walDir)).length)}`);
+          throw new Error("an operator pin now covers it");
+        },
+      }),
+    ).rejects.toThrow(/final check before the unlink failed: an operator pin now covers it/u);
+    expect(events).toStrictEqual(["proof-read", "final-check:2"]);
+    expect(await readdir(walDir)).toHaveLength(2);
+    await deletion.deleteExpiredSegment(walDir, request, { beforeUnlink: async () => { events.push("final-check-ok"); } });
+    expect(events.at(-1)).toBe("final-check-ok");
     expect(await readdir(walDir)).toStrictEqual([]);
   });
 

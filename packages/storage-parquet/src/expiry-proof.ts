@@ -47,6 +47,7 @@ import type { ResearchSourceSegment } from "./research-tier-manifest.js";
 import { verifyResearchTierDataset } from "./research-tier-writer.js";
 import { verifyRetentionProof } from "./retention-proof.js";
 import type { ReliedOnDataset } from "./retention-receipt.js";
+import { parseStrictJsonBytes } from "./strict-json.js";
 import { sha256Hex } from "./wal-format.js";
 
 /** One deletion an expiry plan orders. Every field is a claim. */
@@ -113,7 +114,8 @@ async function fetchPinManifest(
   }
   let manifest: DatasetManifest;
   try {
-    manifest = parseDatasetManifest(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown);
+    // ADR-017 §3: the strict-JSON profile (a duplicate key is refused).
+    manifest = parseDatasetManifest(parseStrictJsonBytes(bytes));
   } catch (error) {
     return refuse("an overlapping pin's manifest is not an exact dataset manifest this build reads", {
       segmentId,

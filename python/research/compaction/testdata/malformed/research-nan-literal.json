@@ -29,7 +29,7 @@
     "library": "hyparquet-writer",
     "libraryVersion": "0.16.6",
     "codec": "SNAPPY",
-    "rowGroupSize": 10000
+    "rowGroupSize": NaN, "x": 10000
   },
   "tables": [
     {

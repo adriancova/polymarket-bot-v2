@@ -37,9 +37,9 @@ import type {
 import {
   DATASET_MANIFEST_OBJECT_NAME,
   compactWalDirectory,
-  compareUnsignedIntegerStrings,
   manifestDigestSidecarKey,
   parseDatasetManifest,
+  parseStrictJsonBytes,
   retainAllWalSegments,
   sha256Hex,
 } from "@polymarket-bot/storage-parquet";
@@ -48,6 +48,8 @@ import type { ResearchPointer } from "../research-tier/extract.js";
 import type { InventoriedSegment } from "../research-tier/inventory.js";
 import { epochMsOf } from "../research-tier/sampler.js";
 import type { IntentEvidence, PinClass, WindowClassification } from "./classify.js";
+import type { WalIndex } from "./wal-index.js";
+import { locateSourceEvent } from "./wal-index.js";
 import type { OperatorPin } from "./windows.js";
 
 /** The object-key root of pins. */
@@ -153,14 +155,69 @@ export function pinRecordKey(pinId: string): string {
   return `${PIN_KEY_PREFIX}/${pinId}/pin.json`;
 }
 
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/u;
+
+/** Parse a pin record's bytes (strict JSON, ADR-017 §3), checking every field the planner relies on. */
+export function parsePinRecord(bytes: Uint8Array, key: string): PinRecord {
+  const fail = (what: string): never => {
+    throw new Error(`pin record ${key} is not one this build reads: ${what}`);
+  };
+  let value: unknown;
+  try {
+    value = parseStrictJsonBytes(bytes);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+  const object = (raw: unknown, what: string): Record<string, unknown> =>
+    typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : fail(`${what} is not an object`);
+  const text = (raw: unknown, what: string, pattern?: RegExp): string =>
+    typeof raw === "string" && raw.length > 0 && (pattern === undefined || pattern.test(raw)) ? raw : fail(`${what} is malformed`);
+  const count = (raw: unknown, what: string): number =>
+    typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0 ? raw : fail(`${what} is malformed`);
+  const root = object(value, "the record");
+  if (root["pinRecordVersion"] !== PIN_RECORD_VERSION) fail("an unknown pinRecordVersion");
+  const origin = root["origin"];
+  if (origin !== "window" && origin !== "operator") fail("origin is malformed");
+  const pinClass = root["pinClass"];
+  if (!["fill", "halt", "refusal", "intent", "operator"].includes(String(pinClass))) fail("pinClass is malformed");
+  const datasets = Array.isArray(root["datasets"]) ? (root["datasets"] as unknown[]) : fail("datasets is not an array");
+  const outside = Array.isArray(root["sourceEventsOutside"]) ? (root["sourceEventsOutside"] as unknown[]) : fail("sourceEventsOutside is not an array");
+  if (typeof root["sourceEventsInside"] !== "boolean") fail("sourceEventsInside is not a boolean");
+  return {
+    pinRecordVersion: PIN_RECORD_VERSION,
+    pinId: text(root["pinId"], "pinId"),
+    origin: origin as PinRecord["origin"],
+    pinClass: pinClass as PinRecord["pinClass"],
+    windowId: root["windowId"] === null ? null : text(root["windowId"], "windowId"),
+    from: text(root["from"], "from", ISO_INSTANT),
+    to: text(root["to"], "to", ISO_INSTANT),
+    keepUntil: root["keepUntil"] === null ? null : text(root["keepUntil"], "keepUntil", ISO_INSTANT),
+    reason: text(root["reason"], "reason"),
+    datasets: datasets.map((raw, index) => {
+      const dataset = object(raw, `datasets[${String(index)}]`);
+      const segmentIds = Array.isArray(dataset["segmentIds"]) ? (dataset["segmentIds"] as unknown[]) : fail("segmentIds is not an array");
+      return {
+        gatewayEpoch: text(dataset["gatewayEpoch"], "gatewayEpoch"),
+        datasetId: text(dataset["datasetId"], "datasetId"),
+        manifestObjectKey: text(dataset["manifestObjectKey"], "manifestObjectKey"),
+        manifestSha256: text(dataset["manifestSha256"], "manifestSha256", SHA256_HEX),
+        segmentIds: segmentIds.map((id, idIndex) => text(id, `segmentIds[${String(idIndex)}]`)),
+        objectBytes: count(dataset["objectBytes"], "objectBytes"),
+      };
+    }),
+    sourceEventsInside: root["sourceEventsInside"] as boolean,
+    sourceEventsOutside: outside as IntentEvidence[],
+    createdAt: text(root["createdAt"], "createdAt", ISO_INSTANT),
+  };
+}
+
 /** Read a pin record, or `null` when the pin was never extracted. */
 export async function readPinRecord(objectStore: ObjectStore, pinId: string): Promise<PinRecord | null> {
   const key = pinRecordKey(pinId);
   if ((await objectStore.head(key)) === null) return null;
-  const record = JSON.parse(Buffer.from(await objectStore.get(key)).toString("utf8")) as PinRecord;
-  if (record.pinRecordVersion !== PIN_RECORD_VERSION || record.pinId !== pinId) {
-    throw new Error(`pin record ${key} is not one this build reads`);
-  }
+  const record = parsePinRecord(await objectStore.get(key), key);
+  if (record.pinId !== pinId) throw new Error(`pin record ${key} names another pin`);
   return record;
 }
 
@@ -202,7 +259,12 @@ export async function verifyPinManifests(
       .toString("utf8")
       .trim();
     if (sidecar !== digest) throw new Error(`pin ${record.pinId}: manifest does not match its digest sidecar`);
-    manifests.set(dataset.manifestObjectKey, parseDatasetManifest(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown));
+    // ADR-017 §3: the strict-JSON profile (a duplicate key is refused).
+    const manifest = parseDatasetManifest(parseStrictJsonBytes(bytes));
+    if (manifest.datasetId !== dataset.datasetId) {
+      throw new Error(`pin ${record.pinId}: manifest ${dataset.manifestObjectKey} names another dataset`);
+    }
+    manifests.set(dataset.manifestObjectKey, manifest);
   }
   return manifests;
 }
@@ -217,6 +279,8 @@ export type PinExtractionContext = {
   readonly pointers: ReadonlyMap<string, ResearchPointer>;
   /** Segments the research-tier extractor refused. They can never be pinned (or expire). */
   readonly refusedSegmentIds: ReadonlySet<string>;
+  /** The sealed WAL in dispatch order: where a source event named by identity lies (`wal-index.ts`). */
+  readonly wal: WalIndex;
 };
 
 /** What happened to one pin spec in a cycle. */
@@ -228,26 +292,27 @@ export type PinOutcome =
 /** The source events that do NOT lie inside the pinned segments (Decision 3.4). */
 function sourceEventsOutside(
   spec: PinSpec,
-  pinned: readonly { readonly pointer: ResearchPointer }[],
+  pinned: readonly { readonly segment: InventoriedSegment; readonly pointer: ResearchPointer }[],
+  wal: WalIndex,
 ): readonly IntentEvidence[] {
+  const pinnedIds = new Set(pinned.map(({ segment }) => segment.segmentId));
   const outside: IntentEvidence[] = [];
   for (const event of spec.sourceEvents) {
-    const inside = pinned.some(({ pointer }) => {
-      if (event.gatewayEpoch !== null && event.ingestSeq !== null) {
-        // The source frame's own identity: it must be in a pinned segment.
-        return (
-          pointer.gatewayEpoch === event.gatewayEpoch &&
-          pointer.minIngestSeq !== null &&
-          pointer.maxIngestSeq !== null &&
-          compareUnsignedIntegerStrings(pointer.minIngestSeq, event.ingestSeq) <= 0 &&
-          compareUnsignedIntegerStrings(event.ingestSeq, pointer.maxIngestSeq) <= 0
-        );
-      }
+    let inside: boolean;
+    if (event.gatewayEpoch !== null && event.ingestSeq !== null) {
+      // The source event's own dispatch identity: the segment holding it
+      // (`locateSourceEvent`, the same rule the classifier widened by) must
+      // be one the pin holds.
+      const location = locateSourceEvent(wal, event.gatewayEpoch, event.ingestSeq);
+      inside = location.status === "located" && pinnedIds.has(location.segmentId);
+    } else {
       // Only the event's instant is durable (`H1R1-PROVENANCE`): a pinned
       // segment must have received frames around it.
-      const span = pointerSpan(pointer);
-      return span !== null && span.fromMs <= event.evaluatedAtMs && event.evaluatedAtMs <= span.toMs;
-    });
+      inside = pinned.some(({ pointer }) => {
+        const span = pointerSpan(pointer);
+        return span !== null && span.fromMs <= event.evaluatedAtMs && event.evaluatedAtMs <= span.toMs;
+      });
+    }
     if (!inside) outside.push(event);
   }
   return outside;
@@ -340,7 +405,7 @@ export async function extractPin(spec: PinSpec, context: PinExtractionContext): 
     } else {
       const bytes = await context.objectStore.get(manifestObjectKey);
       manifestSha256 = sha256Hex(bytes);
-      manifest = parseDatasetManifest(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown);
+      manifest = parseDatasetManifest(parseStrictJsonBytes(bytes));
     }
     // ADR-028 Decision 2.6: every overlapping pin manifest lists the same two
     // digests for a segment as the research tier does.
@@ -370,7 +435,7 @@ export async function extractPin(spec: PinSpec, context: PinExtractionContext): 
     });
   }
 
-  const outside = sourceEventsOutside(spec, members);
+  const outside = sourceEventsOutside(spec, members, context.wal);
   const record: PinRecord = {
     pinRecordVersion: PIN_RECORD_VERSION,
     pinId: spec.pinId,

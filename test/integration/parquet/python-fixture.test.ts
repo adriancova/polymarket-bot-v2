@@ -32,7 +32,12 @@ import { dirname, join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { compactWalDirectory, nodeCompactionFileSystem } from "@polymarket-bot/storage-parquet";
+import {
+  compactWalDirectory,
+  nodeCompactionFileSystem,
+  parseAnyDatasetManifest,
+  parseStrictJsonBytes,
+} from "@polymarket-bot/storage-parquet";
 import { memoryObjectStore } from "@polymarket-bot/storage-parquet/testing";
 import type { MemoryObjectStore } from "@polymarket-bot/storage-parquet/testing";
 import type { CompactionClock, IncidentWindow } from "@polymarket-bot/storage-parquet";
@@ -206,5 +211,28 @@ describe("the Python validator's committed fixture", () => {
     expect(manifest.recordCounts["replayEligible"]).toBe(FIXTURE_FRAMES.length - 2);
     expect(manifest.excludedIncidentWindows).toHaveLength(1);
     expect(manifest.segments.length).toBeGreaterThan(1);
+  });
+});
+
+describe("the shared malformed manifests (ADR-017 §3; STORAGE-1 round 1, J3)", () => {
+  // The same files `python/research/compaction/tests/test_storage1_versions.py`
+  // refuses: the TypeScript and Python readers must agree on malformed bytes.
+  it.each([
+    "research-duplicate-fidelity.json",
+    "research-invalid-utf8.json",
+    "research-nan-literal.json",
+    "research-lone-surrogate.json",
+    "research-without-market-identities.json",
+  ])("refuses %s", async (name) => {
+    const bytes = await readFile(join(FIXTURE_ROOT, "malformed", name));
+    expect(() => parseAnyDatasetManifest(parseStrictJsonBytes(bytes))).toThrow();
+  });
+
+  it("reads the unchanged research-tier manifest, as the Python reader does", async () => {
+    const objectStore = await buildFixture("research");
+    const key = objectStore.keys().find((candidate) => candidate.endsWith("/manifest.json"));
+    if (key === undefined) throw new Error("no research manifest");
+    const committed = await readFile(join(FIXTURE_ROOT, key));
+    expect(parseAnyDatasetManifest(parseStrictJsonBytes(committed)).fidelity).toBe("approximate");
   });
 });

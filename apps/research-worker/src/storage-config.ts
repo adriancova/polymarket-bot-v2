@@ -18,6 +18,7 @@
  */
 
 import { ResearchWorkerConfigurationError } from "./config.js";
+import { DEFAULT_CLOCK_STEP_TOLERANCE_MS } from "./retention/clock-guard.js";
 import { DEFAULT_PIN_BUDGET_BYTES_PER_DAY } from "./retention/metrics.js";
 import { RAW_RETENTION_MS } from "./retention/plan.js";
 import type { ExpiryMode } from "./retention/cycle.js";
@@ -39,6 +40,8 @@ export type StorageConfig = {
   readonly walMaxTotalBytes: number | null;
   readonly maxSegmentsPerDataset: number;
   readonly extractionBatchDelayMs: number;
+  /** Clock movement between cycles below which nothing is a step (`clock-guard.ts`). */
+  readonly clockStepToleranceMs: number;
 };
 
 function value(env: NodeJS.ProcessEnv, key: string): string | null {
@@ -102,6 +105,11 @@ export function loadStorageConfig(env: NodeJS.ProcessEnv = process.env): Storage
       integer(env, "RESEARCH_WORKER_EXTRACTION_BATCH_DELAY_MS", 60 * 60 * 1000, 0),
       // Far below the 72 h retention: extraction must never be what holds expiry back.
       12 * 60 * 60 * 1000,
+    ),
+    // At most 10 minutes: a wider tolerance would let a real step through.
+    clockStepToleranceMs: Math.min(
+      integer(env, "RESEARCH_WORKER_CLOCK_STEP_TOLERANCE_MS", DEFAULT_CLOCK_STEP_TOLERANCE_MS, 1_000),
+      10 * 60 * 1000,
     ),
   };
 }

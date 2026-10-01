@@ -2,20 +2,25 @@
  * One storage cycle: extract, classify, pin, plan, and — only when asked —
  * expire (`STORAGE-1`; ADR-028, ADR-029).
  *
+ * 0. **Clock**: the wall clock is checked against the time since boot, and
+ *    any unexplained forward step is subtracted (`clock-guard.ts`), so a
+ *    clock that jumps ahead cannot shorten the retention.
  * 1. **Inventory** the sealed segments under the WAL root.
  * 2. **Extract** every unextracted sealed segment into the verified research
  *    tier (`extract.ts`).
  * 3. **Classify** every registered window (`classify.ts`), reading the
- *    trader's durable rows read-only.
+ *    trader's durable rows read-only, against the sealed WAL in dispatch
+ *    order (`wal-index.ts`).
  * 4. **Pin** every classified window with evidence, and every operator pin
  *    (`pins.ts`), once the WAL has moved past its range.
  * 5. **Plan**: decide every sealed segment, with every reason it is kept
  *    (`plan.ts`).
- * 6. **Expire**, only in `execute` mode: make the plan durable, then re-decide,
- *    prove and delete one segment at a time, then write the receipt
- *    (`execute.ts`). The default mode is `dry-run`, which deletes nothing and
- *    writes no plan.
- * 7. **Measure**: disk, pin budget and expiry lag (`metrics.ts`).
+ * 6. **Expire**, only in `execute` mode: make the plan durable, then — under
+ *    the operator-pin lock — re-decide, prove, re-read the operator's pins and
+ *    delete one segment at a time, then write the receipt (`execute.ts`). The
+ *    default mode is `dry-run`, which deletes nothing and writes no plan.
+ * 7. **Measure**: disk, WAL capacity, pin budget, expiry lag and the clock
+ *    (`metrics.ts`).
  */
 
 import type {
@@ -24,21 +29,36 @@ import type {
   ExpiredSegmentDeletion,
   ObjectStore,
 } from "@polymarket-bot/storage-parquet";
+import { RetentionGuardError, verifyResearchTierDataset } from "@polymarket-bot/storage-parquet";
 
 import type { ExtractionResult, ResearchPointer } from "../research-tier/extract.js";
 import { extractResearchTier, readResearchPointer } from "../research-tier/extract.js";
 import { inventoryWalRoot } from "../research-tier/inventory.js";
 import type { WalInventory } from "../research-tier/inventory.js";
+import { epochMsOf } from "../research-tier/sampler.js";
 import type { TraderEvidenceSource, WindowClassification } from "./classify.js";
 import { classifyWindow } from "./classify.js";
-import type { ExpiryRunResult } from "./execute.js";
-import { buildExpiryPlan, executeExpiryPlan, expiryReceiptKey, listExpiryPlanIds } from "./execute.js";
+import type { BootClock, ClockAssessment } from "./clock-guard.js";
+import { DEFAULT_CLOCK_STEP_TOLERANCE_MS, assessClock, guardedClock } from "./clock-guard.js";
+import type { ExpiryPlanEntry, ExpiryRunResult } from "./execute.js";
+import {
+  buildExpiryPlan,
+  executeExpiryPlan,
+  expiryReceiptKey,
+  listExpiryPlanIds,
+  newExpiryPlanId,
+  readExpiryPlanEntries,
+} from "./execute.js";
 import type { StorageMetrics } from "./metrics.js";
 import { diskMetrics, storageMetrics } from "./metrics.js";
+import type { OperatorPinLock } from "./operator-pin-lock.js";
+import { noOperatorPinLock } from "./operator-pin-lock.js";
 import type { PinOutcome, PinRecord, PinSpec } from "./pins.js";
-import { extractPin, pinSpecs, readPinRecord } from "./pins.js";
+import { extractPin, overlaps, pinSpecs, readPinRecord } from "./pins.js";
 import type { SegmentDecision } from "./plan.js";
 import { planExpiry } from "./plan.js";
+import type { WalIndex } from "./wal-index.js";
+import { buildWalIndex, cachedResearchVerifier } from "./wal-index.js";
 import type { MarketWindow, OperatorPin } from "./windows.js";
 
 /** `dry-run` deletes nothing and writes no plan. It is the default everywhere. */
@@ -49,7 +69,7 @@ export type StorageSettings = {
   readonly retentionMs: number;
   /** The reference lead-in before a pinned range (about 15 min; LEAN-1 §4). */
   readonly leadInMs: number;
-  /** Margin a trader's durable frontier must pass a window's end by. */
+  /** How long after its end a window's market can still produce evidence (`classify.ts`). */
   readonly durabilityGraceMs: number;
   readonly pinBudgetBytesPerDay: number;
   readonly expiryStuckAfterMs: number;
@@ -58,6 +78,8 @@ export type StorageSettings = {
   readonly maxSegmentsPerDataset: number;
   /** How long sealed segments may wait to be extracted together (`extract.ts`). */
   readonly extractionBatchDelayMs: number;
+  /** Clock movement between cycles below which nothing is a step (`clock-guard.ts`). */
+  readonly clockStepToleranceMs?: number;
 };
 
 export type StorageCycleDependencies = {
@@ -66,15 +88,19 @@ export type StorageCycleDependencies = {
   readonly fileSystem: CompactionFileSystem;
   readonly clock: CompactionClock;
   readonly evidence: TraderEvidenceSource;
-  /** Read fresh at the start of the cycle, and again right before each deletion. */
+  /** Read fresh at the start of the cycle, again right before each deletion, and once more right before each unlink. */
   readonly loadWindows: () => Promise<readonly MarketWindow[]>;
   readonly loadOperatorPins: () => Promise<readonly OperatorPin[]>;
   readonly settings: StorageSettings;
   readonly mode: ExpiryMode;
   /** Required in `execute` mode; never consulted in `dry-run`. */
   readonly deletion: ExpiredSegmentDeletion | null;
-  /** Where durable expiry plans live. Required in `execute` mode. */
+  /** Where durable expiry plans and the clock guard's state live. Required in `execute` mode. */
   readonly stateDirectory: string | null;
+  /** The time since boot, for the clock guard. Required in `execute` mode. */
+  readonly bootClock?: BootClock | null;
+  /** Serializes operator-pin publication with each deletion (`operator-pin-lock.ts`). */
+  readonly operatorPinLock?: OperatorPinLock;
 };
 
 export type StorageCycleReport = {
@@ -91,6 +117,8 @@ export type StorageCycleReport = {
 async function classifyAll(
   windows: readonly MarketWindow[],
   dependencies: StorageCycleDependencies,
+  clock: CompactionClock,
+  wal: WalIndex,
 ): Promise<ReadonlyMap<string, WindowClassification>> {
   const classifications = new Map<string, WindowClassification>();
   for (const window of windows) {
@@ -98,10 +126,11 @@ async function classifyAll(
       classifications.set(
         window.windowId,
         await classifyWindow(window, {
-          nowMs: dependencies.clock.nowMs(),
+          nowMs: clock.nowMs(),
           leadInMs: dependencies.settings.leadInMs,
           durabilityGraceMs: dependencies.settings.durabilityGraceMs,
           evidence: dependencies.evidence,
+          wal,
         }),
       );
     } catch (error) {
@@ -135,19 +164,75 @@ async function pointersOf(objectStore: ObjectStore, inventory: WalInventory): Pr
   const pointers = new Map<string, ResearchPointer>();
   for (const segments of inventory.byEpoch.values()) {
     for (const segment of segments) {
-      const pointer = await readResearchPointer(objectStore, segment.gatewayEpoch, segment.segmentId);
+      // An unreadable pointer is no pointer: that segment is refused, never pinned or expired.
+      const pointer = await readResearchPointer(objectStore, segment.gatewayEpoch, segment.segmentId).catch(() => null);
       if (pointer !== null) pointers.set(segment.segmentId, pointer);
     }
   }
   return pointers;
 }
 
+/**
+ * Per epoch, the bytes the WAL writer has counted: sealed on disk plus those
+ * this worker expired. A durable plan that does not read is counted in
+ * `unreadablePlans` (the capacity figure may then be low), never ignored.
+ */
+async function epochWrittenBytes(
+  inventory: WalInventory,
+  stateDirectory: string | null,
+): Promise<{ counted: Map<string, number>; unreadablePlans: number }> {
+  const counted = new Map<string, number>();
+  let unreadablePlans = 0;
+  const onDisk = new Set<string>();
+  for (const [epoch, segments] of inventory.byEpoch) {
+    counted.set(epoch, segments.reduce((sum, segment) => sum + segment.byteSize, 0));
+    for (const segment of segments) onDisk.add(segment.segmentId);
+  }
+  if (stateDirectory === null) return { counted, unreadablePlans };
+  const expired = new Map<string, { gatewayEpoch: string; byteSize: number }>();
+  for (const planId of await listExpiryPlanIds(stateDirectory)) {
+    let entries;
+    try {
+      entries = await readExpiryPlanEntries(stateDirectory, planId);
+    } catch {
+      unreadablePlans += 1;
+      continue;
+    }
+    // Every planned entry no longer on disk: an over-count at worst (a planned
+    // segment that was kept is still on disk, and so is not counted twice).
+    for (const entry of entries) {
+      if (!onDisk.has(entry.segmentId)) expired.set(entry.segmentId, entry);
+    }
+  }
+  for (const entry of expired.values()) {
+    if (!counted.has(entry.gatewayEpoch)) continue; // an epoch gone from disk is not the writer's
+    counted.set(entry.gatewayEpoch, (counted.get(entry.gatewayEpoch) ?? 0) + entry.byteSize);
+  }
+  return { counted, unreadablePlans };
+}
+
 /** Run one storage cycle. In `dry-run` (the default), nothing is deleted. */
 export async function runStorageCycle(dependencies: StorageCycleDependencies): Promise<StorageCycleReport> {
-  const { objectStore, fileSystem, clock, settings } = dependencies;
-  if (dependencies.mode === "execute" && (dependencies.deletion === null || dependencies.stateDirectory === null)) {
-    throw new Error("execute mode needs a deletion capability and a state directory; nothing was done");
+  const { objectStore, fileSystem, settings } = dependencies;
+  if (
+    dependencies.mode === "execute" &&
+    (dependencies.deletion === null ||
+      dependencies.stateDirectory === null ||
+      dependencies.bootClock === undefined ||
+      dependencies.bootClock === null)
+  ) {
+    throw new Error("execute mode needs a deletion capability, a state directory and a boot clock; nothing was done");
   }
+
+  // -- 0. The clock: a forward step is subtracted, never trusted. -----------
+  const toleranceMs = settings.clockStepToleranceMs ?? DEFAULT_CLOCK_STEP_TOLERANCE_MS;
+  const clockAssessment: ClockAssessment = await assessClock({
+    stateDirectory: dependencies.stateDirectory,
+    wallMs: dependencies.clock.nowMs(),
+    bootClock: dependencies.bootClock ?? null,
+    toleranceMs,
+  });
+  const clock = guardedClock(dependencies.clock, clockAssessment.skewMs, toleranceMs);
 
   // -- 1./2. Inventory and extract. ----------------------------------------
   let inventory = await inventoryWalRoot(fileSystem, dependencies.walRootPath);
@@ -161,19 +246,21 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
   });
   inventory = await inventoryWalRoot(fileSystem, dependencies.walRootPath);
   const pointers = await pointersOf(objectStore, inventory);
-
-  // -- 3. Classify. ---------------------------------------------------------
-  const windows = await dependencies.loadWindows();
-  const operatorPins = await dependencies.loadOperatorPins();
-  const classifications = await classifyAll(windows, dependencies);
-
-  // -- 4. Pin. ----------------------------------------------------------------
-  const specs = pinSpecs([...classifications.values()], operatorPins);
-  const allSegments = [...inventory.byEpoch.values()].flat();
   const refusedSegmentIds = new Set([
     ...extraction.refused.map((entry) => entry.segmentId),
     ...inventory.unreadable.map((entry) => entry.segmentId),
   ]);
+  const verifiedResearch = cachedResearchVerifier((key) => verifyResearchTierDataset(objectStore, key));
+  const wal = await buildWalIndex({ objectStore, inventory, refusedSegmentIds, verifiedResearch });
+
+  // -- 3. Classify. ---------------------------------------------------------
+  const windows = await dependencies.loadWindows();
+  const operatorPins = await dependencies.loadOperatorPins();
+  const classifications = await classifyAll(windows, dependencies, clock, wal);
+
+  // -- 4. Pin. ----------------------------------------------------------------
+  const specs = pinSpecs([...classifications.values()], operatorPins);
+  const allSegments = [...inventory.byEpoch.values()].flat();
   const pins: PinOutcome[] = [];
   const pinFailures: { pinId: string; detail: string }[] = [];
   for (const spec of specs) {
@@ -186,6 +273,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
           segments: allSegments,
           pointers,
           refusedSegmentIds,
+          wal,
         }),
       );
     } catch (error) {
@@ -199,6 +287,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     nowMs: clock.nowMs(),
     retentionMs: settings.retentionMs,
     leadInMs: settings.leadInMs,
+    durabilityGraceMs: settings.durabilityGraceMs,
     inventory,
     objectStore,
     windows,
@@ -206,12 +295,13 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     operatorPins,
     pinSpecs: specs,
     pinRecords,
+    verifiedResearch,
   });
 
   // -- 6. Expire, only when asked. -------------------------------------------
   let expiry: ExpiryRunResult | null = null;
   const plan = buildExpiryPlan({
-    planId: `expiry-${new Date(clock.nowMs()).toISOString().replace(/[:.]/gu, "-")}`,
+    planId: newExpiryPlanId(clock.nowMs()),
     nowMs: clock.nowMs(),
     retentionMs: settings.retentionMs,
     walRootPath: dependencies.walRootPath,
@@ -225,12 +315,13 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
       objectStore,
       deletion,
       clock,
+      lock: dependencies.operatorPinLock ?? noOperatorPinLock(),
       // Re-decide the one segment from fresh windows, operator pins and
       // classifications, right before its deletion.
       recheck: async (entry) => {
         const freshWindows = await dependencies.loadWindows();
         const freshOperatorPins = await dependencies.loadOperatorPins();
-        const freshClassifications = await classifyAll(freshWindows, dependencies);
+        const freshClassifications = await classifyAll(freshWindows, dependencies, clock, wal);
         const freshSpecs = pinSpecs([...freshClassifications.values()], freshOperatorPins);
         const segment = allSegments.find((candidate) => candidate.segmentId === entry.request.segmentId);
         if (segment === undefined) return ["the segment is no longer in the inventory"];
@@ -238,6 +329,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
           nowMs: clock.nowMs(),
           retentionMs: settings.retentionMs,
           leadInMs: settings.leadInMs,
+          durabilityGraceMs: settings.durabilityGraceMs,
           inventory: { byEpoch: new Map([[segment.gatewayEpoch, [segment]]]), unreadable: [] },
           objectStore,
           windows: freshWindows,
@@ -256,6 +348,18 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
         }
         return [];
       },
+      // The last word, after the proof and immediately before the unlink:
+      // the operator's pins, read once more (ADR-028 Decision 2.5).
+      finalCheck: async (entry: ExpiryPlanEntry) => {
+        const span = { fromMs: epochMsOf(entry.minReceivedAt), toMs: epochMsOf(entry.maxReceivedAt) };
+        for (const pin of await dependencies.loadOperatorPins()) {
+          if (overlaps(span, { fromMs: pin.fromMs, toMs: pin.toMs })) {
+            throw new RetentionGuardError(`operator pin ${pin.pinId} now covers the segment`, {
+              segmentId: entry.request.segmentId,
+            });
+          }
+        }
+      },
     });
   }
 
@@ -266,18 +370,24 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
       if ((await objectStore.head(expiryReceiptKey(planId))) === null) plansWithoutReceipt += 1;
     }
   }
+  const afterInventory = await inventoryWalRoot(fileSystem, dependencies.walRootPath);
+  const written = await epochWrittenBytes(afterInventory, dependencies.stateDirectory);
   const allPinRecords = [...pinRecords.values()].filter((record): record is PinRecord => record !== null);
   const metrics = storageMetrics({
     nowMs: clock.nowMs(),
     decisions,
     walSegmentsUnreadable: inventory.unreadable.length,
-    walBytesSealed: allSegments.reduce((sum, segment) => sum + segment.byteSize, 0),
+    walOrphanSidecars: afterInventory.orphans?.length ?? 0,
+    walBytesSealed: [...afterInventory.byEpoch.values()].flat().reduce((sum, segment) => sum + segment.byteSize, 0),
+    walEpochWrittenBytes: written.counted,
+    expiryPlansUnreadable: written.unreadablePlans,
     disk: await diskMetrics(dependencies.walRootPath),
     walMaxTotalBytes: settings.walMaxTotalBytes,
     pinRecords: allPinRecords,
     pinBudgetBytesPerDay: settings.pinBudgetBytesPerDay,
     expiryStuckAfterMs: settings.expiryStuckAfterMs,
     expiryPlansWithoutReceipt: plansWithoutReceipt,
+    clock: clockAssessment,
   });
 
   return {

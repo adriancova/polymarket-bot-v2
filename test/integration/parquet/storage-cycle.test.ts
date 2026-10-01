@@ -31,12 +31,13 @@ import type { ObjectStore, RawFrameRecord } from "@polymarket-bot/storage-parque
 import { buildRawFrameRecord } from "@polymarket-bot/storage-wal";
 import { manualClock } from "@polymarket-bot/storage-parquet/testing";
 import {
+  dispatchFrontier,
   listExpiryPlanIds,
   readPinRecord,
   runStorageCycle,
   staticEvidenceSource,
 } from "@polymarket-bot/research-worker";
-import type { MarketWindow, OperatorPin, StorageCycleReport } from "@polymarket-bot/research-worker";
+import type { BootClock, MarketWindow, OperatorPin, StorageCycleReport } from "@polymarket-bot/research-worker";
 
 import { createWorkspace, GATEWAY_EPOCH, recordFrames } from "./context.js";
 import type { TemporaryWorkspace } from "./context.js";
@@ -124,9 +125,18 @@ async function record(): Promise<void> {
   await recordFrames(workspace.walDirectoryPath, frames, { maxSegmentBytes: 3000 });
 }
 
+/** A boot clock that never moves: the wall clock is steady between these cycles. */
+const STEADY_BOOT: BootClock = { bootId: async () => "boot", sinceBootMs: async () => 1_000 };
+
+/** Every frame recorded: the trader has processed the whole WAL, in dispatch order. */
+const PROCESSED_ALL = "43";
+/** Through a frame inside the window only: the rest is not processed. */
+const PROCESSED_TO_WINDOW = "20";
+
 async function cycle(input: {
   readonly mode: "dry-run" | "execute";
-  readonly durableThroughMs: number;
+  /** The responsible trader's durable dispatch frontier (largest ingestSeq). */
+  readonly processedThrough: string;
   readonly pinBudgetBytesPerDay?: number;
   readonly loadOperatorPins?: () => Promise<readonly OperatorPin[]>;
 }): Promise<StorageCycleReport> {
@@ -135,8 +145,9 @@ async function cycle(input: {
     objectStore,
     fileSystem: nodeCompactionFileSystem(),
     clock: manualClock(NOW),
+    bootClock: STEADY_BOOT,
     evidence: staticEvidenceSource({
-      durableThroughMs: new Map([["inst-1", input.durableThroughMs]]),
+      frontiers: new Map([["inst-1", dispatchFrontier({ [GATEWAY_EPOCH]: input.processedThrough })]]),
       evidence: new Map([
         [
           "m1",
@@ -175,7 +186,7 @@ describe("a storage cycle, end to end", () => {
   it("dry-run (the default) extracts, classifies and pins, and deletes nothing", async () => {
     await record();
     const before = await segmentFiles();
-    const report = await cycle({ mode: "dry-run", durableThroughMs: NOW });
+    const report = await cycle({ mode: "dry-run", processedThrough: PROCESSED_ALL });
     expect(report.extraction.refused).toStrictEqual([]);
     expect(report.classifications).toMatchObject([{ state: "classified", pinClass: "fill" }]);
     expect(report.pins).toMatchObject([{ pinId: expect.stringMatching(/^window-btc-updown-15m-test-[0-9a-f]{12}$/u), status: "extracted" }]);
@@ -188,9 +199,9 @@ describe("a storage cycle, end to end", () => {
     expect(report.decisions.some((decision) => decision.reasons.some((reason) => reason.startsWith("younger-than-retention")))).toBe(true);
   });
 
-  it("keeps every old segment the window could pin while its trader's rows are not durable", async () => {
+  it("keeps every old segment the window could pin while its trader has not processed past it, in dispatch order", async () => {
     await record();
-    const report = await cycle({ mode: "dry-run", durableThroughMs: WINDOW.windowEndMs });
+    const report = await cycle({ mode: "dry-run", processedThrough: PROCESSED_TO_WINDOW });
     expect(report.classifications).toMatchObject([{ state: "unclassified" }]);
     expect(report.pins).toStrictEqual([]);
     const overlapping = report.decisions.filter((decision) =>
@@ -203,7 +214,7 @@ describe("a storage cycle, end to end", () => {
   it("execute without the opt-in marker makes the plan durable and deletes nothing", async () => {
     await record();
     const before = await segmentFiles();
-    const report = await cycle({ mode: "execute", durableThroughMs: NOW });
+    const report = await cycle({ mode: "execute", processedThrough: PROCESSED_ALL });
     expect(report.expiry?.deleted).toStrictEqual([]);
     expect(report.expiry?.failures.every((failure) => /has not opted in/u.test(failure.detail))).toBe(true);
     expect(await segmentFiles()).toStrictEqual(before);
@@ -215,7 +226,7 @@ describe("a storage cycle, end to end", () => {
     await writeFile(join(workspace.walDirectoryPath, EXPIRY_OPT_IN_MARKER_FILE_NAME), EXPIRY_OPT_IN_MARKER_CONTENT);
     const before = await segmentFiles();
     // A budget of one byte: the pin is over budget. It only alarms.
-    const report = await cycle({ mode: "execute", durableThroughMs: NOW, pinBudgetBytesPerDay: 1 });
+    const report = await cycle({ mode: "execute", processedThrough: PROCESSED_ALL, pinBudgetBytesPerDay: 1 });
     const expiry = report.expiry;
     if (expiry === null) throw new Error("expected an expiry run");
     expect(expiry.failures).toStrictEqual([]);
@@ -256,7 +267,7 @@ describe("a storage cycle, end to end", () => {
     }
 
     // A second cycle finds nothing more to delete and changes no pin.
-    const again = await cycle({ mode: "execute", durableThroughMs: NOW });
+    const again = await cycle({ mode: "execute", processedThrough: PROCESSED_ALL });
     expect(again.expiry).toBeNull();
     expect(again.pins).toMatchObject([{ pinId, status: "already-extracted" }]);
     expect(await readPinRecord(objectStore, pinId)).toStrictEqual(pin);
@@ -269,7 +280,7 @@ describe("a storage cycle, end to end", () => {
     let calls = 0;
     const report = await cycle({
       mode: "execute",
-      durableThroughMs: NOW,
+      processedThrough: PROCESSED_ALL,
       // Planning reads no operator pin; every read after it (the per-segment
       // recheck) finds one covering everything old.
       loadOperatorPins: async () => {

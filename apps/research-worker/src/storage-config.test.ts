@@ -43,6 +43,12 @@ describe("loadStorageConfig", () => {
     expect(() => loadStorageConfig({ RESEARCH_WORKER_WAL_ROOT: "/wal" })).toThrow(/RESEARCH_WORKER_OBJECT_STORE_ROOT/u);
   });
 
+  it("bounds the clock guard's tolerance, so a real step is never absorbed as drift", () => {
+    expect(loadStorageConfig(BASE).clockStepToleranceMs).toBe(60_000);
+    expect(loadStorageConfig({ ...BASE, RESEARCH_WORKER_CLOCK_STEP_TOLERANCE_MS: String(60 * 60 * 1000) }).clockStepToleranceMs).toBe(10 * 60 * 1000);
+    expect(() => loadStorageConfig({ ...BASE, RESEARCH_WORKER_CLOCK_STEP_TOLERANCE_MS: "10" })).toThrow(/at least 1000/u);
+  });
+
   it("bounds the extraction batching far below the retention", () => {
     expect(loadStorageConfig({ ...BASE, RESEARCH_WORKER_EXTRACTION_BATCH_DELAY_MS: String(100 * 60 * 60 * 1000) }).extractionBatchDelayMs).toBe(
       12 * 60 * 60 * 1000,

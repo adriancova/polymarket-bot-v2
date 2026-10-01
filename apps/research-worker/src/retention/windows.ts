@@ -27,6 +27,8 @@
 
 import { readFile } from "node:fs/promises";
 
+import { parseStrictJsonBytes } from "@polymarket-bot/storage-parquet";
+
 import { epochMsOf } from "../research-tier/sampler.js";
 
 /** Who is responsible for a window (ADR-028 Decision 2.3). */
@@ -199,14 +201,15 @@ export function parseOperatorPins(value: unknown): readonly OperatorPin[] {
 }
 
 async function readJson(path: string, what: string): Promise<unknown> {
-  let raw: string;
+  let raw: Uint8Array;
   try {
-    raw = await readFile(path, "utf8");
+    raw = await readFile(path);
   } catch (error) {
     throw new WindowRegistryError(`${what} ${path} could not be read: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
-    return JSON.parse(raw) as unknown;
+    // ADR-017 §3's strict profile: a duplicate key (two `pins`, say) is refused.
+    return parseStrictJsonBytes(raw);
   } catch (error) {
     throw new WindowRegistryError(`${what} ${path} is not JSON: ${error instanceof Error ? error.message : String(error)}`);
   }

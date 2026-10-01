@@ -136,6 +136,7 @@ export {
   researchTierSchemaVersions,
   type AnyDatasetManifest,
   type ResearchDownsampling,
+  type ResearchMarketIdentities,
   type ResearchObjectEntry,
   type ResearchRecordCounts,
   type ResearchReleaseIdentity,
@@ -160,6 +161,8 @@ export {
   verifyRetentionProof,
   type RetentionProofContext,
 } from "./retention-proof.js";
+
+export { StrictJsonError, parseStrictJsonBytes, parseStrictJsonText } from "./strict-json.js";
 
 export {
   compareUnsignedIntegerStrings,
@@ -277,6 +280,7 @@ export type {
   CompactionObserver,
   DatasetManifestWrittenEvent,
   ExpiredSegmentDeletion,
+  ExpiredSegmentDeletionOptions,
   ObjectHead,
   ObjectStore,
   ObjectUploadedEvent,

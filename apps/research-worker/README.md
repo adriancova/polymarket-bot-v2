@@ -8,6 +8,7 @@ connection or places an order; neither reads or relaxes `MAX_RUN_MODE`,
 | --- | --- | --- |
 | `node dist/main.mjs` | `WP-130` compaction loop: verified WAL segments to exact Parquet datasets | Only with `RESEARCH_WORKER_RETENTION=delete-after-verified-upload` (default `retain`) |
 | `node dist/main.mjs storage` | `STORAGE-1` storage cycle: research tier, window classification, pins, raw-WAL expiry plan, metrics (ADR-028, ADR-029) | Only in `execute` mode **and** with the opt-in marker in the WAL root (default `dry-run`) |
+| `node dist/main.mjs storage pin <pinId> <from> <to> <reason>` | Publish one operator pin under the expiry's lock | Never |
 
 Build and run with `pnpm --filter @polymarket-bot/research-worker start` (compaction) or
 `pnpm --filter @polymarket-bot/research-worker start storage`.
@@ -16,26 +17,43 @@ Build and run with `pnpm --filter @polymarket-bot/research-worker start` (compac
 
 One run does, in order:
 
+0. **Clock.** The wall clock is compared with the time since boot (`/proc/uptime`) since
+   the last cycle; an unexplained forward step is subtracted from "now", so a clock that
+   jumps ahead cannot shorten the 72 hours (`metrics.clock`). Removing
+   `<state dir>/clock-state.json` resets it; do that only after checking the host clock.
 1. **Research tier.** Every sealed WAL segment with no research tier yet is verified
    (`validateSegment` and the compactor's reader, over one in-memory read) and downsampled
    into a version 2 `approximate` dataset under `research/<gatewayEpoch>/` in the object
-   store. A segment that fails verification is never extracted, so it never expires.
+   store. A segment that fails verification is never extracted, so it never expires. Each
+   source segment's entry in the checksummed manifest also lists every Polymarket market its
+   frames name, read from every frame whatever the sampler keeps (`marketIdentities`).
 2. **Classification.** Every registered market window is classified: a trader-responsible
-   window once the trader's durable rows (read **read-only** from PostgreSQL) have passed
-   its end; a gateway-only window at its close.
+   window once the trader has durably processed, **in dispatch order**, every sealed frame
+   that could be stamped inside the window (its decisions' `gateway_epoch` / `ingest_seq`,
+   read **read-only** from PostgreSQL); a gateway-only window at its close. Receipt
+   instants are not used for this: they can step backwards. **Until the trader persists
+   its decisions' dispatch position (`H1R1-PROVENANCE`), no trader-responsible window
+   classifies, so nothing it overlaps expires.**
 3. **Pins.** A window with a fill (kept forever), an intent, a refusal or a halt (30 days),
    and every operator pin, is copied exactly — whole WAL segments, through the `WP-130`
    compactor — under `pins/<pinId>/`.
 4. **Plan.** Every sealed segment is decided, with every reason it is kept. A segment may
    expire only when its newest frame is at least 72 h old, its research tier verifies,
-   every window it could overlap is classified, every overlapping pin is extracted and
-   verified, and no operator pin covers it.
+   every market it names is registered and every frame could be identified, every window it
+   could overlap is classified, every overlapping pin is extracted and verified, and no
+   operator pin covers it.
 5. **Expiry**, only in `execute` mode: the plan is written durably to the state directory
-   first, each segment is re-decided and its bytes proved against the research tier and
-   the pins immediately before the unlink, and a version 2 retention receipt is written to
+   first (never replacing an existing plan), then, under the operator-pin lock, each segment
+   is re-decided, its bytes proved against the research tier and the pins, the operator pins
+   read once more, and only then unlinked; a version 2 retention receipt is written to
    `expiry/<planId>/retention-receipt.json`.
-6. **Metrics**: disk use, `maxTotalBytes` headroom, pin budget (an alarm only; no pin is
-   ever evicted or reduced), expiry lag, and plans with no receipt.
+6. **Metrics**: disk use, WAL capacity as the gateway's writer counts it, pin budget (an
+   alarm only; no pin is ever evicted or reduced), expiry lag (a segment the extract path
+   cannot verify counts from its sidecar's `closedAt`), orphan sidecars, the clock guard,
+   plans with no receipt, and plans that do not read.
+
+A sidecar whose segment is gone (a deletion interrupted between its two unlinks) is
+reported as `walOrphanSidecars` and never planned; it may be removed by hand.
 
 It prints one JSON report and exits. Run it on a timer.
 
@@ -53,10 +71,11 @@ It prints one JSON report and exits. Run it on a timer.
 | `RESEARCH_WORKER_TRADER_ENVIRONMENT` | `PAPER` | The run mode whose rows are read |
 | `RESEARCH_WORKER_RAW_RETENTION_MS` | 72 h | At least 72 h; shorter is refused |
 | `RESEARCH_WORKER_PIN_LEAD_IN_MS` | 15 min | The reference lead-in before a pinned window |
-| `RESEARCH_WORKER_DURABILITY_GRACE_MS` | 60 s | Margin the trader's frontier must pass a window's end by |
+| `RESEARCH_WORKER_DURABILITY_GRACE_MS` | 60 s | How long after its end a window's market can still produce evidence: the trader must have processed every frame stamped up to the end plus this |
 | `RESEARCH_WORKER_PIN_BUDGET_BYTES_PER_DAY` | 3 GB | The pin-budget alarm (6 GB at 8 markets) |
 | `RESEARCH_WORKER_EXPIRY_STUCK_AFTER_MS` | 6 h | Expiry lag that raises the stuck alarm |
-| `RESEARCH_WORKER_WAL_MAX_TOTAL_BYTES` | none | The gateway's `maxTotalBytes`, for the headroom metric |
+| `RESEARCH_WORKER_WAL_MAX_TOTAL_BYTES` | none | The gateway's `maxTotalBytes`, for the capacity metric. The writer counts every byte written in its epoch and never subtracts an expired segment, so expiry does not give it room back |
+| `RESEARCH_WORKER_CLOCK_STEP_TOLERANCE_MS` | 60 s | Clock movement between cycles below which nothing is a step (capped at 10 min) |
 | `RESEARCH_WORKER_EXTRACTION_BATCH_DELAY_MS` | 1 h | How long sealed segments wait to be extracted together (capped at 12 h) |
 | `RESEARCH_WORKER_MAX_SEGMENTS_PER_RESEARCH_DATASET` | 64 | Segments per research-tier dataset |
 
@@ -116,6 +135,19 @@ names a pruned window's market is then unclassified and kept, never deleted.
 
 An operator pin keeps the raw WAL it covers, and an exact copy is extracted too. It lasts
 until the operator removes it from the file.
+
+Publish a pin with the command, not by editing the file:
+
+```text
+RESEARCH_WORKER_OPERATOR_PINS=/var/lib/polymarket-bot/operator-pins.json \
+  node dist/main.mjs storage pin incident-42 2026-09-30T10:00:00Z 2026-09-30T11:00:00Z "review"
+```
+
+It takes the lock `<pins file>.lock`, which expiry also holds from each segment's final
+decision through its unlink, so a published pin holds every segment that has not already
+been deleted. A pin added by hand is re-read just before each unlink, but only the command
+is serialized with the unlink itself. A lock left by a crashed process is never broken
+automatically: expiry refuses to delete while it is held, and the error names the holder.
 
 ### What it does not do yet
 

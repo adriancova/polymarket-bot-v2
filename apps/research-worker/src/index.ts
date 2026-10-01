@@ -82,13 +82,23 @@ export {
   SAFE_IDENTIFIER,
   inventoryWalRoot,
   type InventoriedSegment,
+  type OrphanSidecar,
   type UnreadableSegment,
   type WalInventory,
 } from "./research-tier/inventory.js";
 export {
+  GAMMA_MARKET_ENDPOINT_PREFIX,
+  MarketIdentityInventory,
+  POLYMARKET_MARKET_ENDPOINT_PREFIX,
+  frameMarketIdentity,
+  gammaMarketIdOf,
+  type FrameMarketIdentity,
+} from "./research-tier/identity.js";
+export {
   RESEARCH_KEY_PREFIX,
   RESEARCH_POINTER_VERSION,
   extractResearchTier,
+  parseResearchPointer,
   readResearchPointer,
   researchPointerKey,
   type ExtractionOptions,
@@ -110,22 +120,57 @@ export {
 export {
   NON_FILL_PIN_RETENTION_MS,
   classifyWindow,
+  dispatchFrontier,
   pinRetentionMs,
   potentialRange,
   staticEvidenceSource,
   type ClassifyOptions,
+  type DispatchFrontier,
   type IntentEvidence,
   type MarketEvidence,
   type PinClass,
   type TraderEvidenceSource,
   type WindowClassification,
 } from "./retention/classify.js";
-export { postgresTraderEvidence } from "./retention/evidence-postgres.js";
+export { frontierFromRows, postgresTraderEvidence, type FrontierRow } from "./retention/evidence-postgres.js";
+export {
+  UNVERIFIED_ENVELOPE_MARGIN_MS,
+  buildWalIndex,
+  cachedResearchVerifier,
+  dispatchRequirements,
+  locateSourceEvent,
+  meetsRequirement,
+  verifiedEntryOf,
+  type DispatchRequirement,
+  type IndexedSegment,
+  type SourceLocation,
+  type Span,
+  type WalIndex,
+} from "./retention/wal-index.js";
+export {
+  CLOCK_STATE_FILE_NAME,
+  CLOCK_STATE_VERSION,
+  DEFAULT_CLOCK_STEP_TOLERANCE_MS,
+  assessClock,
+  guardedClock,
+  systemBootClock,
+  type BootClock,
+  type ClockAssessment,
+} from "./retention/clock-guard.js";
+export {
+  OperatorPinLockError,
+  fileOperatorPinLock,
+  noOperatorPinLock,
+  operatorPinLockPath,
+  publishOperatorPin,
+  type OperatorPinLock,
+} from "./retention/operator-pin-lock.js";
 export {
   PIN_KEY_PREFIX,
   PIN_RECORD_VERSION,
   extractPin,
   overlaps,
+  parsePinRecord,
   pinRecordKey,
   pinSpecs,
   pointerSpan,
@@ -153,9 +198,14 @@ export {
   executeExpiryPlan,
   expiryReceiptKey,
   listExpiryPlanIds,
+  newExpiryPlanId,
+  nodePlanFileSystem,
   persistExpiryPlan,
+  readExpiryPlanEntries,
   type ExpiryPlan,
+  type ExpiryPlanEntry,
   type ExpiryRunResult,
+  type PlanFileSystem,
 } from "./retention/execute.js";
 export {
   DEFAULT_PIN_BUDGET_BYTES_PER_DAY,
@@ -176,4 +226,4 @@ export {
   type StorageSettings,
 } from "./retention/cycle.js";
 export { loadStorageConfig, type StorageConfig } from "./storage-config.js";
-export { storageMain, summarizeStorageReport } from "./storage-main.js";
+export { storageMain, storagePinMain, summarizeStorageReport } from "./storage-main.js";

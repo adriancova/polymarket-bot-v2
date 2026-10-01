@@ -102,8 +102,13 @@ if (isEntryPoint) {
   // `storage` (STORAGE-1): one storage cycle — research tier, pins, and the
   // raw-WAL expiry plan, dry-run unless explicitly executed. Loaded only when
   // asked for; with no command, the worker is the WP-130 compaction loop.
+  // `storage pin …` publishes an operator pin under the expiry's lock.
   const storage = process.argv[2] === "storage";
-  const run = storage ? import("./storage-main.js").then(async (module) => await module.storageMain()) : main();
+  const run = storage
+    ? import("./storage-main.js").then(async (module) =>
+        process.argv[3] === "pin" ? await module.storagePinMain(process.argv.slice(4)) : await module.storageMain(),
+      )
+    : main();
   run
     .then((code) => {
       process.exitCode = code;
