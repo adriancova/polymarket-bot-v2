@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import type { EventEnvelope } from "@polymarket-bot/domain";
+import type { MarketEventTransport } from "@polymarket-bot/event-bus";
+
 import { GatewayDispatcher } from "./dispatcher.js";
 import type { EnvelopeDraft } from "./envelope.js";
 import { IncidentRegistry } from "./incidents.js";
@@ -290,5 +293,170 @@ describe("GatewayDispatcher.dispatchFrame", () => {
     expect(dispatcher.dispatchFrame([])).toEqual([]);
     await publisher.settle();
     expect(transport.published("market")).toHaveLength(0);
+  });
+});
+
+// `THROUGHPUT-1c` r7 (R7-H1): a frame the publisher cannot submit in ONE
+// transport call is preceded by a `GATEWAY_FRAME_SPLIT` incident naming no
+// market, so an outage between its calls cannot leave a prefix vouching for
+// a stale book (ADR-023 D2.4).
+describe("GatewayDispatcher.dispatchFrame — a frame too large for one transport call", () => {
+  const draftNumbered = (stalenessMs: number): EnvelopeDraft => ({
+    ...validDraft,
+    payload: { ...(validDraft.payload as Record<string, unknown>), stalenessMs },
+  });
+  const receiptAt = (offsetMs: number) => {
+    const nowMs = Date.parse("2026-08-30T12:00:00.000Z") + offsetMs;
+    return {
+      receivedAt: new Date(nowMs).toISOString(),
+      receivedMonotonicNs: String(BigInt(nowMs) * 1_000_000n),
+      nowMs,
+    };
+  };
+  const frameOf = (count: number, rawFrameIngestSeq: string) =>
+    Array.from({ length: count }, (_, index) => ({
+      draft: draftNumbered(index + 1),
+      context: { receipt: receiptAt(index), rawFrameIngestSeq },
+    }));
+
+  function buildWith(
+    transport: MarketEventTransport,
+    observer: ConstructorParameters<typeof GatewayDispatcher>[0]["observer"] = {},
+  ) {
+    const clock = new ManualGatewayClock();
+    const publisher = new GatewayPublisher({
+      transport,
+      stream: "market",
+      clock,
+      maxQueueDepth: 8_192,
+      maxQueueBytes: 64 * 1024 * 1024,
+    });
+    const dispatcher = new GatewayDispatcher({
+      clock,
+      ids: deterministicIdSource(),
+      sequencer: new IngestSequencer(EPOCH),
+      publisher,
+      incidents: new IncidentRegistry(),
+      observer,
+    });
+    return { publisher, dispatcher };
+  }
+
+  const reasonOf = (envelope: EventEnvelope<unknown> | undefined): unknown =>
+    (envelope?.payload as { reasonCode?: unknown } | undefined)?.reasonCode;
+
+  it("a frame of one more than the publisher's limit: GATEWAY_FRAME_SPLIT is published FIRST, at the frame's first receipt", async () => {
+    const transport = new MemoryEventTransport();
+    const incidents: string[] = [];
+    const { publisher, dispatcher } = buildWith(transport, {
+      onIncident: (incident) => incidents.push(`${incident.severity} ${incident.reasonCode}`),
+    });
+    const limit = publisher.atomicFrameEnvelopes;
+    const entries = frameOf(limit + 1, "7");
+    const outcomes = await Promise.all(dispatcher.dispatchFrame(entries));
+    await publisher.settle();
+    expect(outcomes.every((outcome) => outcome.published)).toBe(true);
+
+    const published = transport.published("market");
+    expect(published).toHaveLength(limit + 2);
+    const [incident, ...frame] = published as [EventEnvelope<unknown>, ...EventEnvelope<unknown>[]];
+    expect(incident.eventType).toBe("DataQualityIncidentOpened");
+    expect(reasonOf(incident)).toBe("GATEWAY_FRAME_SPLIT");
+    const payload = incident.payload as { severity?: unknown; affectedMarketIds?: unknown; detail?: unknown };
+    expect(payload.severity).toBe("LOG");
+    expect(payload.affectedMarketIds).toBeUndefined();
+    expect(String(payload.detail)).toContain(`a frame of ${String(limit + 1)} events`);
+    expect(incident.causationId).toBeUndefined();
+    // Sequenced ahead of every event of the frame, receipt instants never backwards.
+    expect(incident.ingestSeq).toBe("1");
+    expect(frame.map((envelope) => envelope.ingestSeq)).toEqual(
+      Array.from({ length: limit + 1 }, (_, index) => String(index + 2)),
+    );
+    expect(incident.receivedAt).toBe(entries[0]?.context.receipt.receivedAt);
+    expect(frame.every((envelope) => envelope.causationId === `raw:${EPOCH}:7`)).toBe(true);
+    expect(incidents).toEqual(["LOG GATEWAY_FRAME_SPLIT"]);
+  });
+
+  it("a frame of exactly the limit opens nothing and publishes exactly what one dispatch per event publishes", async () => {
+    const wholeTransport = new MemoryEventTransport();
+    const perEventTransport = new MemoryEventTransport();
+    const a = buildWith(wholeTransport);
+    const b = buildWith(perEventTransport);
+    const entries = frameOf(a.publisher.atomicFrameEnvelopes, "7");
+    await Promise.all(a.dispatcher.dispatchFrame(entries));
+    await Promise.all(entries.map((entry) => b.dispatcher.dispatch(entry.draft, entry.context)));
+    await a.publisher.settle();
+    await b.publisher.settle();
+    expect(wholeTransport.published("market").some((envelope) => envelope.eventType === "DataQualityIncidentOpened")).toBe(false);
+    expect(wholeTransport.published("market")).toEqual(perEventTransport.published("market"));
+  });
+
+  it("EVERY frame over the limit gets its own incident, so a consumer that joined late still meets one ahead of the frame", async () => {
+    const transport = new MemoryEventTransport();
+    const { publisher, dispatcher } = buildWith(transport);
+    const limit = publisher.atomicFrameEnvelopes;
+    void dispatcher.dispatchFrame(frameOf(limit + 1, "7"));
+    void dispatcher.dispatchFrame(frameOf(limit + 1, "9000"));
+    await publisher.settle();
+    const published = transport.published("market");
+    const incidentAt = published
+      .map((envelope, index) => (reasonOf(envelope) === "GATEWAY_FRAME_SPLIT" ? index : -1))
+      .filter((index) => index >= 0);
+    expect(incidentAt).toEqual([0, limit + 2]);
+    const ids = incidentAt.map((index) => (published[index]?.payload as { incidentId?: unknown }).incidentId);
+    expect(new Set(ids).size).toBe(2);
+    expect(published[limit + 3]?.causationId).toBe(`raw:${EPOCH}:9000`);
+  });
+
+  it("publication already halted: nothing of the frame can be published, so no incident is opened", async () => {
+    const transport = new MemoryEventTransport();
+    const incidents: string[] = [];
+    const { publisher, dispatcher } = buildWith(transport, {
+      onIncident: (incident) => incidents.push(incident.reasonCode),
+    });
+    publisher.haltPublication("EVENT_BUS_UNAVAILABLE", "test outage");
+    const outcomes = await Promise.all(dispatcher.dispatchFrame(frameOf(publisher.atomicFrameEnvelopes + 1, "7")));
+    expect(outcomes.some((outcome) => outcome.published)).toBe(false);
+    expect(incidents).toEqual([]);
+    expect(transport.published("market")).toHaveLength(0);
+  });
+
+  it("without the batch capability the limit is 1: a frame of two is preceded by the incident, a frame of one is not", async () => {
+    const memory = new MemoryEventTransport();
+    const perEnvelope: MarketEventTransport = {
+      transportId: memory.transportId,
+      retention: memory.retention,
+      publish: (stream, envelope) => memory.publish(stream, envelope),
+      subscribe: (options) => memory.subscribe(options),
+      streamMetrics: (stream) => memory.streamMetrics(stream),
+      close: () => memory.close(),
+    };
+    const { publisher, dispatcher } = buildWith(perEnvelope);
+    expect(publisher.atomicFrameEnvelopes).toBe(1);
+    void dispatcher.dispatchFrame(frameOf(1, "7"));
+    void dispatcher.dispatchFrame(frameOf(2, "8"));
+    await publisher.settle();
+    expect(memory.published("market").map((envelope) => reasonOf(envelope) ?? envelope.causationId)).toEqual([
+      `raw:${EPOCH}:7`,
+      "GATEWAY_FRAME_SPLIT",
+      `raw:${EPOCH}:8`,
+      `raw:${EPOCH}:8`,
+    ]);
+  });
+
+  it("a frame over the limit that also loses an event: both incidents precede its accepted events", async () => {
+    const transport = new MemoryEventTransport();
+    const { publisher, dispatcher } = buildWith(transport);
+    const limit = publisher.atomicFrameEnvelopes;
+    const entries = [
+      ...frameOf(limit + 1, "7"),
+      { draft: { ...validDraft, payload: { nonsense: true } }, context: { receipt: receiptAt(5_000), rawFrameIngestSeq: "7" } },
+    ];
+    void dispatcher.dispatchFrame(entries);
+    await publisher.settle();
+    const published = transport.published("market");
+    expect(published.slice(0, 2).map(reasonOf)).toEqual(["GATEWAY_FRAME_SPLIT", "GATEWAY_ENVELOPE_REJECTED"]);
+    expect(published.slice(2)).toHaveLength(limit + 1);
+    expect(published.slice(2).every((envelope) => envelope.causationId === `raw:${EPOCH}:7`)).toBe(true);
   });
 });

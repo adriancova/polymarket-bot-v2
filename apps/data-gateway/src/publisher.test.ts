@@ -677,3 +677,114 @@ describe("GatewayPublisher — frame-atomic runs (THROUGHPUT-2)", () => {
     expect(memory.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3"]);
   });
 });
+
+// `THROUGHPUT-1c` r7 (R7-H1): a frame of up to FRAME_RUN_MAX_ENVELOPES is
+// one transport call even behind a backlog, so an outage cannot publish a
+// prefix of it (ADR-023 D2.4). At `2d29b2d` a run that already held up to
+// 255 envelopes could start a frame and stop at the limit.
+describe("GatewayPublisher — a run never starts a frame it cannot hold whole (THROUGHPUT-1c r7)", () => {
+  const frameOf = (causation: string, count: number, firstSeq: number): EventEnvelope<unknown>[] =>
+    Array.from({ length: count }, (_, index) => ({
+      ...envelopeAt(String(firstSeq + index)),
+      causationId: `raw:${EPOCH}:${causation}`,
+    }));
+
+  /** Per transport call: how many envelopes of each frame it carried (`-` for none). */
+  function recordCalls(transport: MemoryEventTransport): Record<string, number>[] {
+    const calls: Record<string, number>[] = [];
+    transport.setPublishObserver((envelope) => {
+      const call = (calls[transport.batchCalls - 1] ??= {});
+      const frame = typeof envelope.causationId === "string" ? (envelope.causationId.split(":").at(-1) ?? "?") : "-";
+      call[frame] = (call[frame] ?? 0) + 1;
+    });
+    return calls;
+  }
+
+  /** One held envelope in flight, then `frames` queued behind it, then released. */
+  async function behindABacklog(frames: readonly (readonly [string, number])[]) {
+    const { transport, publisher } = build({ maxQueueDepth: 4_096, maxQueueBytes: 64 * 1024 * 1024 });
+    const calls = recordCalls(transport);
+    transport.stallPublishes();
+    const held = publisher.enqueue(envelopeAt("1"));
+    let next = 2;
+    const queued: Promise<PublishOutcome>[] = [];
+    for (const [causation, count] of frames) {
+      for (const envelope of frameOf(causation, count, next)) queued.push(publisher.enqueue(envelope));
+      next += count;
+    }
+    transport.resumePublishes();
+    const outcomes = await Promise.all([held, ...queued]);
+    expect(outcomes.every((outcome) => outcome.published)).toBe(true);
+    return { calls, publisher, transport };
+  }
+
+  it("review's case: frame B (900) behind frame A (200) is ONE call, not [A200+B824], [B76]", async () => {
+    const { calls } = await behindABacklog([["A", 200], ["B", 900]]);
+    expect(calls).toEqual([{ "-": 1 }, { A: 200 }, { B: 900 }]);
+  });
+
+  it("the boundary: A255+B769 fill one call exactly; with B770 the frame starts the next call whole", async () => {
+    const fits = await behindABacklog([["A", 255], ["B", 769]]);
+    expect(fits.calls).toEqual([{ "-": 1 }, { A: 255, B: 769 }]);
+    const over = await behindABacklog([["A", 255], ["B", 770]]);
+    expect(over.calls).toEqual([{ "-": 1 }, { A: 255 }, { B: 770 }]);
+  });
+
+  it("small frames still share a call: the look-ahead ends a run only for a frame that would not fit", async () => {
+    const { calls } = await behindABacklog([["A", 3], ["B", 4], ["C", 5]]);
+    expect(calls).toEqual([{ "-": 1 }, { A: 3, B: 4, C: 5 }]);
+  });
+
+  it("a frame of exactly the limit behind a backlog starts its own call and is one call", async () => {
+    const { FRAME_RUN_MAX_ENVELOPES } = await import("./publisher.js");
+    const { calls } = await behindABacklog([["A", 10], ["B", FRAME_RUN_MAX_ENVELOPES]]);
+    expect(calls).toEqual([{ "-": 1 }, { A: 10 }, { B: FRAME_RUN_MAX_ENVELOPES }]);
+  });
+
+  it("a frame over the limit behind a backlog starts its own call; only it is split, at the limit", async () => {
+    const { FRAME_RUN_MAX_ENVELOPES } = await import("./publisher.js");
+    const { calls } = await behindABacklog([["A", 10], ["B", FRAME_RUN_MAX_ENVELOPES + 6], ["C", 2]]);
+    expect(calls).toEqual([{ "-": 1 }, { A: 10 }, { B: FRAME_RUN_MAX_ENVELOPES }, { B: 6, C: 2 }]);
+  });
+
+  it("an outage striking the call that carries a sub-limit frame's LAST envelope publishes none of that frame", async () => {
+    const { transport, publisher } = build({ maxQueueDepth: 4_096, maxQueueBytes: 64 * 1024 * 1024 });
+    const b = frameOf("B", 900, 202);
+    const lastOfB = (b.at(-1) as EventEnvelope<unknown>).ingestSeq;
+    transport.setPublishObserver((envelope) => {
+      // The outage begins as the call carrying frame B's last envelope starts,
+      // so that call fails whole, like the Redis transport's all-or-nothing
+      // script. At `2d29b2d` that call was [B76], after [A200+B824] had published.
+      if (envelope.ingestSeq === lastOfB) transport.setUnavailable(true);
+    });
+    transport.stallPublishes();
+    const held = publisher.enqueue(envelopeAt("1"));
+    const queuedA = frameOf("A", 200, 2).map((envelope) => publisher.enqueue(envelope));
+    const queuedB = b.map((envelope) => publisher.enqueue(envelope));
+    transport.resumePublishes();
+    await Promise.all([held, ...queuedA, ...queuedB]);
+    const published = transport.published("market").map((envelope) => envelope.causationId?.split(":").at(-1) ?? "-");
+    expect(published.filter((frame) => frame === "B"), "no prefix of frame B").toHaveLength(0);
+    expect(published.filter((frame) => frame === "A")).toHaveLength(200);
+    expect(publisher.metrics().halt?.cause).toBe("EVENT_BUS_UNAVAILABLE");
+  });
+
+  it("atomicFrameEnvelopes: the transport limit with the batch capability, 1 without it", async () => {
+    const { FRAME_RUN_MAX_ENVELOPES } = await import("./publisher.js");
+    expect(build().publisher.atomicFrameEnvelopes).toBe(FRAME_RUN_MAX_ENVELOPES);
+    const memory = new MemoryEventTransport();
+    const perEnvelope = new GatewayPublisher({
+      transport: {
+        transportId: memory.transportId,
+        retention: memory.retention,
+        publish: (stream, envelope) => memory.publish(stream, envelope),
+        subscribe: (options) => memory.subscribe(options),
+        streamMetrics: (stream) => memory.streamMetrics(stream),
+        close: () => memory.close(),
+      },
+      stream: "market",
+      clock: new ManualGatewayClock(),
+    });
+    expect(perEnvelope.atomicFrameEnvelopes).toBe(1);
+  });
+});

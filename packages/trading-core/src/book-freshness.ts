@@ -41,7 +41,9 @@
  *    names no market arrived from that epoch. The gateway opens exactly such
  *    incidents when it suppresses a frame's events (a WAL refusal), cannot
  *    normalize a frame, refuses one of a frame's envelopes (review round 6,
- *    R6-H1: reported ahead of the frame's accepted events), or sees a
+ *    R6-H1: reported ahead of the frame's accepted events), is about to
+ *    publish a frame too large for one transport call (review round 7,
+ *    R7-H1: `GATEWAY_FRAME_SPLIT`, ahead of the frame), or sees a
  *    heartbeat stall, so from then on "another token's frame arrived" no
  *    longer implies "this token's frames are being delivered". The taint covers every session of the epoch, LATER ONES
  *    INCLUDED, and is never lifted: the gateway deduplicates an open incident

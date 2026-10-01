@@ -71,6 +71,35 @@
  * incident; the consumer's taint from the first one is for the whole epoch
  * (ADR-023 D2 rule 4). A consumer that did not see the first one is ADR-023's
  * accepted X2 gap, bounded by its ceiling.
+ *
+ * ## A frame too large for one transport call (`THROUGHPUT-1c` r7, R7-H1)
+ *
+ * The publisher submits a frame of up to
+ * {@link GatewayPublisher.atomicFrameEnvelopes} envelopes in ONE transport
+ * call (`publisher.ts`, "Frame-atomic runs"), so such a frame is published
+ * whole or not at all. A LARGER frame is published across several calls. If
+ * publication halts between two of them (an outage), the stream ends with a
+ * PREFIX of the frame, and the trader closes that prefix as a whole frame:
+ * its events would vouch for every book on their session, including a book
+ * whose change was in the lost tail. The gateway cannot report that loss
+ * after the fact, because publication has halted.
+ *
+ * So {@link GatewayDispatcher.dispatchFrame} reports the RISK ahead of the
+ * frame. When a frame has more entries than the publisher submits in one
+ * call, and publication has not halted, a `GATEWAY_FRAME_SPLIT` incident
+ * naming no market is opened BEFORE any of the frame's events is assigned a
+ * sequence, stamped with the frame's first receipt. A consumer that reads it
+ * taints the gateway epoch (ADR-023 D2 rule 4) before any of the frame's
+ * events can close an evaluation, whether or not the tail is later lost.
+ * The incident's registry key is closed again at once, so EVERY such frame
+ * is preceded by its own incident: a consumer that joined the epoch late
+ * still meets one ahead of the frame, so this route is not left to the X2
+ * bound. Its severity is `LOG`: nothing was lost, and the incident exists to
+ * taint. With the Redis transport the threshold is 1 024 envelopes, i.e. one
+ * venue message of more than a thousand normalized events (in the H1 burst
+ * the largest Polymarket frame has 2 events, and the largest frame of any
+ * source has 65). When publication has already halted, nothing of the frame
+ * can be published, so no incident is opened.
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
@@ -177,8 +206,16 @@ export class GatewayDispatcher {
    * re-assigned (fresh sequences, the same ids and receipts), re-validated
    * and submitted in their order. Synchronous up to the last submission, like
    * {@link dispatch}; one outcome per entry, in entry order, never rejecting.
+   *
+   * A frame with more entries than the publisher submits in one transport
+   * call is preceded by a `GATEWAY_FRAME_SPLIT` incident, opened before
+   * anything else of the frame (module header, "A frame too large for one
+   * transport call").
    */
   dispatchFrame(entries: readonly FrameDispatchEntry[]): readonly Promise<PublishOutcome>[] {
+    if (entries.length > this.#publisher.atomicFrameEnvelopes && !this.#publisher.halted) {
+      this.#reportSplitFrame(entries);
+    }
     const assigned = entries.map((entry) => this.#assign(entry.draft, entry.context ?? {}));
     const details: string[] = [];
     for (const entry of assigned) {
@@ -257,6 +294,31 @@ export class GatewayDispatcher {
           }),
     });
     return { draft, context: { ...context, receipt }, receipt, eventId: id, completed };
+  }
+
+  /**
+   * Opens the `GATEWAY_FRAME_SPLIT` incident ahead of a frame the publisher
+   * cannot submit in one call (r7, R7-H1), then closes its registry key so
+   * the next such frame opens its own. It is stamped with the frame's first
+   * receipt, so receipt instants never run backwards in the stream.
+   */
+  #reportSplitFrame(entries: readonly FrameDispatchEntry[]): void {
+    const firstReceipt = entries[0]?.context?.receipt;
+    this.openIncident(
+      {
+        scope: "frame",
+        reasonCode: "GATEWAY_FRAME_SPLIT",
+        severity: "LOG",
+        detail:
+          `a frame of ${String(entries.length)} events is more than the ` +
+          `${String(this.#publisher.atomicFrameEnvelopes)} the publisher submits in one transport call, ` +
+          "so it is published across several calls, and a publication halt between two of them " +
+          "would publish only a prefix; this incident precedes the frame",
+      },
+      undefined,
+      firstReceipt === undefined ? {} : { receipt: firstReceipt },
+    );
+    this.#incidents.markClosed("frame", "GATEWAY_FRAME_SPLIT");
   }
 
   /** Counts, observes and routes one refused draft (the single-event path). */

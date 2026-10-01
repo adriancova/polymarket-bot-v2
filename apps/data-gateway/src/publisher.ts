@@ -113,10 +113,11 @@
  * (`dispatcher.ts`, `rawFrameCausationId`). Its feed can tell a frame is
  * complete without waiting on the next event only because a frame is never
  * split across two transport calls, and one batched call is one atomic
- * script call at the Redis transport. Two rules make that so:
+ * script call at the Redis transport. Three rules make that so:
  *
  * - a feed driver dispatches all of one raw frame's events in ONE synchronous
- *   turn (`feeds/polymarket.ts` `onEvent`, called in a loop by the adapter), so
+ *   turn (`feeds/polymarket.ts`: since `THROUGHPUT-1c` r6, one
+ *   `dispatchFrame` call per socket message), so
  *   when the pump STARTS on an envelope that names a raw frame, it first yields
  *   one microtask, letting the rest of that frame be admitted before the run is
  *   cut. (A pump that is already running dequeues only in a later turn, when
@@ -126,14 +127,44 @@
  *   `causationId`: the envelope and byte bounds end a run only at a frame
  *   boundary, and a frame longer than the bounds is taken whole up to
  *   {@link FRAME_RUN_MAX_ENVELOPES}, the Redis transport's own limit for one
- *   script call. Only a frame beyond that limit is split (it would be a
- *   single venue message of over a thousand normalized events).
+ *   script call;
+ * - a run never STARTS a frame it cannot hold whole (`THROUGHPUT-1c` r7,
+ *   R7-H1). Before a run that already holds envelopes takes the first
+ *   envelope of a frame, it counts that frame's envelopes in the queue. If
+ *   the run plus the whole frame would pass {@link FRAME_RUN_MAX_ENVELOPES},
+ *   the run ends there and the frame starts the next run. Until r7 a run
+ *   holding up to 255 envelopes of earlier frames could start a frame and
+ *   then stop at the limit, so a frame of about 770 events or more queued
+ *   behind a backlog was split across two calls (review reproduced
+ *   `[A200+B824], [B76]` for a 900-event frame B). The count is exact,
+ *   because every queued frame is complete when a run is cut (the first
+ *   rule; since `THROUGHPUT-1c` r6 the Polymarket driver admits a socket
+ *   message's events in ONE `dispatchFrame` call).
  *
- * Neither rule changes what is published or in what order — only how the
- * queued envelopes are grouped into transport calls. A halt still suppresses
- * everything queued, so a frame is either published whole or, from the halt
- * on, not at all; the one exception, stated rather than hidden, is an
- * envelope REFUSED inside a run, which publishes the run's prefix and halts.
+ * So a frame of up to {@link FRAME_RUN_MAX_ENVELOPES} envelopes is published
+ * in ONE transport call. Two cases remain, and neither is hidden:
+ *
+ * - a frame LARGER than that limit (a single venue message of over a
+ *   thousand normalized events) cannot be one call, and is split at the
+ *   limit. An outage between its calls would publish a prefix of it. So the
+ *   dispatcher publishes a `GATEWAY_FRAME_SPLIT` incident naming no market
+ *   AHEAD of every such frame (`dispatcher.ts`, "A frame too large for one
+ *   transport call"), sized by {@link GatewayPublisher.atomicFrameEnvelopes};
+ * - without the batch capability every envelope is its own call, so
+ *   {@link GatewayPublisher.atomicFrameEnvelopes} is 1, and the dispatcher marks
+ *   every frame of more than one event the same way. Production wires the
+ *   Redis transport, which has the capability (`main.ts` checks it at
+ *   compile time). The per-envelope path belongs to the test doubles and to
+ *   the startup-outage transport, which publishes nothing.
+ *
+ * None of these rules changes what is published or in what order, only how
+ * the queued envelopes are grouped into transport calls. A halt still
+ * suppresses everything queued, so a frame of up to the limit is either
+ * published whole or, from the halt on, not at all. The one exception,
+ * stated rather than hidden, is an envelope REFUSED inside a run, which
+ * publishes the run's prefix and halts. The transport's door is derived from
+ * the same domain envelope schema the dispatcher has already validated
+ * against, so it does not refuse the gateway's own envelopes (ADR-023 D2.4).
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
@@ -475,6 +506,18 @@ export class GatewayPublisher {
   }
 
   /**
+   * The most envelopes of ONE frame this publisher submits in a single
+   * transport call (`THROUGHPUT-1c` r7, R7-H1; "Frame-atomic runs"): the
+   * Redis script limit {@link FRAME_RUN_MAX_ENVELOPES} with the batch
+   * capability, 1 without it. A frame with more envelopes than this is
+   * published across several calls, so an outage between them could publish
+   * a prefix; the dispatcher reports such a frame ahead of it.
+   */
+  get atomicFrameEnvelopes(): number {
+    return this.#batch === undefined ? 1 : FRAME_RUN_MAX_ENVELOPES;
+  }
+
+  /**
    * Admits one envelope for publication.
    *
    * MUST be called synchronously, in assignment order, by the dispatcher.
@@ -688,6 +731,10 @@ export class GatewayPublisher {
       if (!continuesFrame) {
         if (run.length >= this.#maxBatchEnvelopes) break;
         if (run.length > 0 && bytes + entry.bytes > this.#maxBatchBytes) break;
+        // `THROUGHPUT-1c` r7 (R7-H1): a run that already holds envelopes
+        // never STARTS a frame it cannot hold whole. That frame starts the
+        // next run instead, where it is taken whole up to the limit.
+        if (this.#batch !== undefined && run.length > 0 && !this.#frameFits(entry, run.length)) break;
       }
       this.#head += 1;
       this.#queueBytes -= entry.bytes;
@@ -700,6 +747,26 @@ export class GatewayPublisher {
       this.#queueBytes = 0;
     }
     return run;
+  }
+
+  /**
+   * Whether the frame whose first envelope is at the queue's head (`first`)
+   * fits whole in a run that already holds `held` envelopes (r7, R7-H1). An
+   * envelope that names no frame always fits. The count stops one envelope
+   * past the room left, so the look-ahead reads at most one run's worth.
+   */
+  #frameFits(first: QueuedPublication, held: number): boolean {
+    const frame = frameOf(first.envelope);
+    if (frame === undefined) return true;
+    const room = FRAME_RUN_MAX_ENVELOPES - held;
+    let length = 0;
+    for (let index = this.#head; index < this.#queue.length; index += 1) {
+      const entry = this.#queue[index] as QueuedPublication;
+      if (frameOf(entry.envelope) !== frame) break;
+      length += 1;
+      if (length > room) return false;
+    }
+    return true;
   }
 
   async #drainQueue(): Promise<void> {

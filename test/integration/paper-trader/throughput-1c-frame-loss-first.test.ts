@@ -23,7 +23,7 @@
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import { describe, expect, it } from "vitest";
 
-import { buildHarness, MARKET, type Harness } from "./support/harness.js";
+import { buildHarness, MARKET, type Harness } from "../data-gateway/support/harness.js";
 
 /** Inside the adapter's epoch range; its ISO form has a five-digit year. */
 const REFUSED_TIMESTAMP = "253402300800000";

@@ -35,6 +35,11 @@
   event its envelope contract refuses is reported ahead of the frame (D2.4,
   D3, D5); `LAST_CHANGE` records no delivery session (D4, O-R6-I1); a
   backward step of the gateway's wall clock is disclosed (D7, D8, O-R6-I2).
+  r7 (2026-10-01), after review round 7 (R7-H1): r6's claim that a frame of
+  up to 1 024 events is never split across two transport calls was false.
+  The publisher now never starts a frame in a run that cannot hold it
+  whole, and the gateway publishes a `GATEWAY_FRAME_SPLIT` taint ahead of
+  every frame too large for one call (D2.4, D3, D5, D8, §4, §5, §6).
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
@@ -230,8 +235,9 @@ more permissive than it — whenever any of rules 1–6 applies:
    that epoch. The gateway opens exactly such incidents when it suppresses a
    frame's events after a WAL refusal (`GATEWAY_WAL_FRAME_REFUSED`), cannot
    normalize a frame, refuses one of a frame's envelopes
-   (`GATEWAY_ENVELOPE_REJECTED`, r6), or sees a heartbeat stall
-   (`GATEWAY_FEED_STALL`) (`feeds/polymarket.ts`, `dispatcher.ts`). From
+   (`GATEWAY_ENVELOPE_REJECTED`, r6), is about to publish a frame too large
+   for one transport call (`GATEWAY_FRAME_SPLIT`, r7), or sees a heartbeat
+   stall (`GATEWAY_FEED_STALL`) (`feeds/polymarket.ts`, `dispatcher.ts`). From
    then on "another asset's frame arrived" no longer implies "this asset's
    frames are being delivered". The taint covers
    EVERY session of the epoch, later ones included, and is never lifted,
@@ -272,21 +278,72 @@ more permissive than it — whenever any of rules 1–6 applies:
    frame's first receipt, and the accepted events follow it under fresh
    sequences; when none is refused, the stream is byte-identical to one
    dispatch per event. The other ways a frame can lose events between the
-   socket and the stream were checked and lose no event after a sibling was
-   published: a WAL refusal opens its incident before the frame is parsed
-   and suppresses every derived event; a publication halt (an outage, a
-   full queue, a refused admission) suppresses everything queued, and a
-   frame of up to 1 024 events is never split across two transport calls
-   (`publisher.ts`, frame-atomic runs; one atomic script call; only a single
-   venue message of more than 1 024 events is split, and only an outage
-   between its two calls would publish a prefix, after which the stream
-   ends); the
+   socket and the stream were checked. A WAL refusal opens its incident
+   before the frame is parsed and suppresses every derived event. The
    transport's door (`packages/event-bus` `encodeEnvelope`) is derived from
    the same domain envelope schema, so it accepts every envelope
    `completeEnvelope` accepted (its one tightening, a top-level `__proto__`
    member, is never written by the gateway). REST recovery snapshots are
    dispatched one by one, as before: they carry no session (rule 2), so
    their order vouches for nothing.
+   **A frame published across two transport calls (r7, R7-H1).** A
+   publication halt (an outage, a full queue, a refused admission)
+   suppresses everything still queued, so it cannot cut a frame that one
+   transport call carries. The r6 text said a frame of up to 1 024 events
+   is never split across two calls. That was FALSE. The publisher
+   (`apps/data-gateway/src/publisher.ts`, "Frame-atomic runs") never cut a
+   run inside a frame, but a run that already held up to 255 envelopes of
+   earlier frames could START a frame and then stop at the Redis
+   transport's limit of 1 024 envelopes per call. Behind a backlog, a frame
+   of about 770 events or more was split (review reproduced `[A200+B824],
+   [B76]` for a 900-event frame B), and a frame of more than 1 024 events
+   was always split. An outage between the two calls published a PREFIX.
+   The trader closes a frame when the stream moves on or runs dry
+   (`apps/trader/src/adapters/redis-feed.ts`: a short read is handed out
+   whole; `loop.ts` closes the frame when the queue ends), so it evaluated
+   the prefix as a whole frame, and the prefix vouched for a book whose
+   change was in the lost tail. Review reproduced 2 approved orders under
+   `CONNECTION_CONFIRMED` (0 under `LAST_CHANGE`) with a 4 096-deep
+   admission queue; the H1 operator ran 16 384. "After which the stream
+   ends" is therefore not a safety argument. r7 closes both routes:
+   - **Backlog splits.** A run never starts a frame it cannot hold whole.
+     Before a run that already holds envelopes takes a frame's first
+     envelope, the publisher counts the frame's envelopes in the queue,
+     and if the run plus the whole frame would pass 1 024, the frame starts
+     the next run. The count is exact, because every queued frame is
+     complete when a run is cut (one `dispatchFrame` call per socket
+     message). So a frame of up to 1 024 events is now ONE transport call,
+     published whole or not at all.
+   - **Frames too large for one call.** A frame of more envelopes than the
+     publisher submits in one call (`GatewayPublisher.atomicFrameEnvelopes`:
+     1 024 with the Redis transport's batch capability, and 1 without it;
+     only test doubles and the startup-outage transport lack it, and that
+     transport publishes nothing) cannot be one call. So
+     `GatewayDispatcher.dispatchFrame` opens a `GATEWAY_FRAME_SPLIT` incident
+     naming no market BEFORE the frame's events are assigned sequences,
+     stamped with the frame's first receipt. Whatever later happens to the
+     tail, the epoch is tainted before any of the frame's events can close
+     an evaluation. The registry key is closed again at once, so EVERY
+     oversized frame is preceded by its own incident. A trader that joined
+     the epoch late therefore still meets one ahead of the frame, and this
+     route is not left to the X2 bound. Its severity is `LOG`: nothing was
+     lost, and the incident exists to taint. When publication has already
+     halted, no incident is opened, because nothing of the frame can be
+     published.
+   The cost is stated, not hidden: an oversized frame turns the extension
+   off for the rest of the epoch even when it is delivered whole
+   (fail-closed; §5). In the H1 burst fixture (99 668 events) the largest
+   Polymarket frame has 2 events, and the largest frame of any source has 65
+   (a Coinbase frame, which never confirms). One case remains, and it is
+   unchanged: an envelope
+   the transport REFUSES inside a run publishes the run's prefix and halts
+   (`packages/event-bus/src/redis/transport.ts` `publishBatch`: a door,
+   epoch or ordering refusal at index `k` publishes `0..k-1`; a script,
+   server or queue failure publishes nothing). The gateway's own envelopes
+   pass the door (above). One gateway process publishes one epoch. The
+   publisher admits only sequences above its high-water mark, in assignment
+   order. So none of these refusals is expected, and each one would halt
+   publication loudly.
    **What "never lifted" covers, and what it does not (r1, X2).** The taint
    is state of THIS PROCESS, fed by the incidents it consumed. A trader that
    starts, restarts or resumes from its checkpoint inside an epoch whose
@@ -324,13 +381,14 @@ more permissive than it — whenever any of rules 1–6 applies:
 | One asset's delivery stalls while the session stays busy (N-B) | FRESH until the ceiling, then aged by its own last change: STALE at `lastChange + max(ceiling, bound)` at the latest | D2 rule 6 |
 | A frame the gateway could only partly normalize | the frame's incident is sequenced before its accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r1, X8) |
 | A frame one of whose events the gateway's envelope contract refuses (an adapter-accepted `timestamp` whose ISO year has five digits, e.g. one sent in microseconds) | every envelope of the frame is validated before any is published; `GATEWAY_ENVELOPE_REJECTED` (no market) is published ahead of the frame's accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r6, R6-H1) |
+| A frame published across two transport calls, with an outage between them (a frame queued behind a backlog, or one larger than the transport's 1 024-envelope call) | a frame of up to 1 024 events is now one call, so an outage publishes all of it or none; a larger frame is preceded by `GATEWAY_FRAME_SPLIT` (no market), so the epoch is tainted before any of its events evaluates, whether or not its tail is lost | D2.4 (r7, R7-H1) |
 | A trader that starts or restarts inside an epoch whose incident it did not consume | the taint is unknown to it (an accepted gap): bounded by the ceiling | D2.4, rule 6 (r1, X2) |
 | Silent session, socket still open | no confirmations: STALE at `lastConfirmation + bound` | D2 (no rule needed) |
 | Disconnection (`FeedDisconnected`), reconnect | the old session gets no more frames; the new session's frames do not confirm a book delivered on the old one: STALE within the bound. A book re-delivered on the new session is confirmed by it | D1 key |
 | Missed `PONG` (`FeedStale`), heartbeat loss | the gateway reconnects (`reconnectWhenStale`), so as above; and its `GATEWAY_FEED_STALL` incident taints the gateway epoch | D2.4 |
 | Subscription change (new generation) | a new session; books of the old generation are not confirmed by it | D1 key |
 | Gateway restart | new `gatewayEpoch`: a new session even though `connectionId` repeats | D1 key |
-| Gateway publication halt / overflow (`CO2-N6`) | nothing is published, so no confirmations: STALE within the bound — IF any other event still advances the trader's event time; if nothing arrives at all, nothing is evaluated | D2 (and N1, D7) |
+| Gateway publication halt / overflow (`CO2-N6`) | nothing more is published, so no confirmations: STALE within the bound — IF any other event still advances the trader's event time; if nothing arrives at all, nothing is evaluated. A halt cannot leave part of a frame of up to 1 024 events in the stream, and a larger frame is preceded by its taint (r7) | D2 (and N1, D7); D2.4 |
 | Gateway WAL refusal, unparsable frame | the gateway's incident names no market: the epoch is tainted, fallback to the last change for the rest of the gateway's life (repeats are deduplicated, D2.4) | D2.4 |
 | Market data-quality incident | fallback to the last change | D2.5 |
 | REST recovery snapshot | no session: last change only, until a socket frame for that asset lands on a session | D2.2 |
@@ -362,19 +420,24 @@ under an absent block or `LAST_CHANGE` (review round 6, O-R6-I1).)
 
 ### D5. How the signal flows
 
-- **Gateway: no new event type; two ordering changes (r1, X8; r6, R6-H1).**
-  The session fields every market-data envelope already carries are the
-  signal. The market-channel adapter now reports a frame's normalization
-  problems BEFORE its accepted events
+- **Gateway: no new event type; three ordering changes (r1, X8; r6, R6-H1;
+  r7, R7-H1).** The session fields every market-data envelope already
+  carries are the signal. The market-channel adapter now reports a frame's
+  normalization problems BEFORE its accepted events
   (`packages/polymarket-public/src/feed/connection.ts`), so the gateway's
   incident for a partly malformed frame precedes the frame's siblings in the
-  stream (D2.4). And the gateway validates every envelope of a socket
+  stream (D2.4). The gateway validates every envelope of a socket
   message's frame before it publishes any (`apps/data-gateway/src/dispatcher.ts`
   `dispatchFrame`, `feeds/polymarket.ts`), so an envelope it refuses is
-  reported ahead of the frame as well (D2.4, r6). Nothing is dropped that was
+  reported ahead of the frame as well (D2.4, r6). And the publisher never
+  starts a frame in a run that cannot hold it whole, while the dispatcher
+  publishes a `GATEWAY_FRAME_SPLIT` incident (a new reason code, not a new
+  event type) ahead of a frame too large for one transport call
+  (`publisher.ts`, `dispatcher.ts`; D2.4, r7). Nothing is dropped that was
   not dropped before, and the accepted events keep their order; a refusal
   leaves the first pass's sequences as holes, which the stream already
-  allows (`dispatcher.ts` header). A `PONG`-derived
+  allows (`dispatcher.ts` header). Grouping envelopes into transport calls
+  changes no stream entry. A `PONG`-derived
   liveness event was considered and not built (Option B): a `PONG` confirmation
   has age 0 when it arrives, so it would satisfy a 2 000 ms bound briefly,
   but a 10 s heartbeat (V5) cannot maintain continuous freshness under a
@@ -582,6 +645,16 @@ gateway's wall clock (D7, O-R6-I2) is in the recorded `receivedAt` values, so
 a replay (lag 0) reproduces the extension it caused as a process on the
 gateway's host would have read it, never the guard's correction a trader on
 another, unstepped host applied.
+The `GATEWAY_FRAME_SPLIT` incident (D2.4, r7) is part of the published
+stream, so a replay of a normalized-stream recording reproduces it and its
+taint exactly. A raw-frame replay through the verification-only
+`polymarketMarketNormalizer` (`apps/backtest-cli/src/normalizer.ts`; not
+selectable from the CLI) runs no gateway. It therefore never splits a frame
+and never publishes the incident, so under an opted-in
+`CONNECTION_CONFIRMED` it can vouch through an oversized frame where the
+live trader was tainted. That replay is more permissive than live, in a
+backtest only. As with r6's refused-envelope case, a raw-frame replay is not
+a reproduction of the gateway.
 
 ## 4. Options considered
 
@@ -609,7 +682,8 @@ another, unstepped host applied.
 - **D. Session confirmations by consumed data frames, with a per-book
   ceiling (chosen).** It uses only fields every envelope already carries. It
   needs no new event type or contract change, only the losses-first order
-  of D5 (the adapter's problems, r1; the gateway's envelope refusals, r6).
+  of D5 (the adapter's problems, r1; the gateway's envelope refusals, r6;
+  whole-frame transport calls and the split-frame taint, r7).
   It fails closed on every missing piece. It is WEAKER per book than the last-change rule's proof, because a sibling's
   frame says nothing about this asset's delivery (§2, "Therefore"). The
   ceiling (D2 rule 6) bounds that weakness.
@@ -689,6 +763,17 @@ another, unstepped host applied.
   incident, so the fixture does not measure it). A narrower taint needs the
   gateway to attribute its incidents to a session or a market and to publish
   `DataQualityIncidentClosed` — a gateway change, not this round's.
+- **An oversized frame turns the extension off (r7, R7-H1).** A venue
+  message of more than 1 024 normalized events (for example a subscription
+  answered with more than 1 024 books in one message) is preceded by
+  `GATEWAY_FRAME_SPLIT`, which taints the epoch even when the whole frame is
+  delivered. That is the coarse taint above applied to a new trigger:
+  fail-closed, and visible as stale pauses and as one `LOG` incident per
+  such frame. Not observed in H1 (the burst's largest Polymarket frame has 2
+  events).
+  A narrower answer, such as a per-frame completeness marker the trader
+  could check, needs a stream or contract change, which is not this
+  round's.
 
 ## 6. Verification
 
@@ -753,11 +838,12 @@ r6 adds these pins (review round 6):
   orders, `GATEWAY_ENVELOPE_REJECTED` is published before the frame's
   accepted NO snapshot, and 0 orders are admitted under both bases (the NO-first
   order admitted 2 under `CONNECTION_CONFIRMED` at `74e17ca`);
-- `test/integration/data-gateway/throughput-1c-frame-loss-first.test.ts`: the
-  gateway alone. A well-formed frame is published whole, in order, right
-  behind its raw frame, inside the socket callback; the incident precedes
-  every accepted event of a frame that lost one; a socket close keeps its
-  place;
+- `test/integration/paper-trader/throughput-1c-frame-loss-first.test.ts`
+  (moved there from `test/integration/data-gateway/` in r7, unchanged except
+  its import path, to stay inside this package's test grant): the gateway
+  alone. A well-formed frame is published whole, in order, right behind its
+  raw frame, inside the socket callback; the incident precedes every
+  accepted event of a frame that lost one; a socket close keeps its place;
 - `apps/data-gateway/src/dispatcher.test.ts` › `dispatchFrame`: an all-valid
   frame publishes exactly what one dispatch per event publishes; a refusal
   is published first, at the frame's first receipt, with the first pass's
@@ -767,3 +853,30 @@ r6 adds these pins (review round 6):
   socket, no bracket);
 - `book-freshness.test.ts` › "r6 O-R6-I1": no delivery session is recorded
   under an absent block or `LAST_CHANGE`.
+
+r7 adds these pins (review round 7, R7-H1):
+- `test/integration/paper-trader/throughput-1c-frame-split.test.ts`: the
+  REAL gateway to the REAL trader, with a 4 096-deep admission queue. A
+  frame of 1 024 NO snapshots and a YES change, whose second call is lost
+  to an outage, admits 0 orders under both bases (`[2, 0]` at `2d29b2d`),
+  and `GATEWAY_FRAME_SPLIT` is published first. A 900-event frame queued
+  behind a held call and a 200-event frame is one call; with that call
+  lost, none of it is published and 0 orders are admitted (`[2, 0]` at
+  `2d29b2d`). Controls: a frame of exactly 1 024 is one call, carries no
+  incident and still vouches under `CONNECTION_CONFIRMED` only; at the
+  default depth the oversized frame halts on admission; and the cost: an
+  oversized frame delivered whole still taints the epoch;
+- `apps/data-gateway/src/publisher.test.ts`, "a run never starts a frame it
+  cannot hold whole": review's `[A200+B824], [B76]` is now `[A200], [B900]`;
+  the boundary `A255+B769` (one call) against `A255+B770` (two); small
+  frames still share a call; a frame of exactly the limit and one over it
+  each start their own call; an outage on the call carrying a sub-limit
+  frame's last envelope publishes none of the frame (824 at `2d29b2d`);
+  `atomicFrameEnvelopes` is 1 024 with the batch capability and 1 without;
+- `apps/data-gateway/src/dispatcher.test.ts`, "a frame too large for one
+  transport call": the incident is published first at the frame's first
+  receipt, names no market and is `LOG`; a frame of exactly the limit is
+  byte-identical to one dispatch per event; every oversized frame gets its
+  own incident; none is opened once publication has halted; without the
+  batch capability a frame of two is marked; an oversized frame that also
+  loses an event has both incidents ahead of its accepted events.
