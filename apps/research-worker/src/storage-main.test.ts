@@ -27,6 +27,7 @@ import {
 import type { MarketEvidence, TraderEvidenceSource } from "./retention/classify.js";
 import { dispatchFrontier, staticEvidenceSource } from "./retention/classify.js";
 import { runStorageCycle } from "./retention/cycle.js";
+import { StorageCycleLockError } from "./retention/cycle-lock.js";
 import type { StorageCycleDependencies } from "./retention/cycle.js";
 import { EVIDENCE_HOLDS_FILE_NAME, readEvidenceHolds } from "./retention/evidence-holds.js";
 import { loadOperatorPins } from "./retention/windows.js";
@@ -87,6 +88,52 @@ describe("storageMain: the timer holds the lock beside the pin file's canonical 
     // Control: once it is released, the old segment expires.
     await rm(lockPath);
     expect(await storageMain({ operatorPinLockTimeoutMs: 50 })).toBe(0);
+    expect(await walFiles()).not.toContain(fixture.segments[0]?.segmentFileName);
+  });
+});
+
+describe("STORAGE-1b: where this host's boot id cannot be read, the storage command refuses, having done nothing", () => {
+  it("rejects with the cause (so `main.mjs storage` exits 1), creates no state, deletes nothing; the control expires", async () => {
+    const now = Date.now();
+    fixture = await storageFixture({
+      nowMs: now,
+      segments: [[tradeFrame({ ingestSeq: "1", atMs: now - 80 * HOUR })], [tradeFrame({ ingestSeq: "2", atMs: now - HOUR })]],
+    });
+    await writeFile(join(fixture.walRoot, EXPIRY_OPT_IN_MARKER_FILE_NAME), EXPIRY_OPT_IN_MARKER_CONTENT);
+    const env: Record<string, string> = {
+      RESEARCH_WORKER_WAL_ROOT: fixture.walRoot,
+      RESEARCH_WORKER_OBJECT_STORE_ROOT: join(fixture.root, "objects"),
+      RESEARCH_WORKER_STATE_DIR: fixture.stateDir,
+      RESEARCH_WORKER_EXPIRY_MODE: "execute",
+      RESEARCH_WORKER_EXTRACTION_BATCH_DELAY_MS: "0",
+    };
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+    const printed: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      printed.push(String(line));
+    });
+    const walFiles = async () => (await readdir(fixture?.walDir ?? "")).filter((name) => name.endsWith(".wal.jsonl")).sort();
+    const walBefore = await walFiles();
+    // As under systemd ProcSubset=pid: /proc/sys is not there.
+    const subsetPid = async (): Promise<string> => {
+      const error = new Error("ENOENT: no such file or directory, open '/proc/sys/kernel/random/boot_id'") as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    };
+    for (const mode of ["dry-run", "execute"]) {
+      vi.stubEnv("RESEARCH_WORKER_EXPIRY_MODE", mode);
+      const refused = storageMain({ cycleLockBootId: subsetPid, cycleLockTimeoutMs: 50 });
+      await expect(refused).rejects.toBeInstanceOf(StorageCycleLockError);
+      await expect(refused).rejects.toThrow(
+        "this host's boot id cannot be read (ENOENT: no such file or directory, open '/proc/sys/kernel/random/boot_id'); nothing was done",
+      );
+      await expect(refused).rejects.toThrow("ProcSubset=pid");
+    }
+    expect(printed).toStrictEqual([]);
+    await expect(lstat(fixture.stateDir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await walFiles()).toStrictEqual(walBefore);
+    // Control: the kernel's boot id, read; the old segment expires.
+    expect(await storageMain({ cycleLockTimeoutMs: 50 })).toBe(0);
     expect(await walFiles()).not.toContain(fixture.segments[0]?.segmentFileName);
   });
 });
