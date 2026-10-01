@@ -49,6 +49,7 @@ export {
   CONTROL_KILL_SWITCH_ACTIONS,
   CONTROL_KILL_SWITCH_SCOPES,
   FORBIDDEN_CONTROL_KEYS,
+  STRONGEST_KILL_SWITCH_ACTION,
   forbiddenControlKeysIn,
 } from "./vocabulary.js";
 export type { ControlKillSwitchAction, ControlKillSwitchScope } from "./vocabulary.js";
@@ -56,14 +57,19 @@ export type { ControlKillSwitchAction, ControlKillSwitchScope } from "./vocabula
 export { buildDoor, deepFreeze, ownBoolean, ownNumber, ownRecord, ownString } from "./doors.js";
 export type { DoorRefusal, DoorRefusalCode, DoorResult } from "./doors.js";
 
-export { ControlPlane } from "./control-plane.js";
+export { ControlPlane, REFUSAL_AUDIT_MAX_ISSUES, REFUSAL_AUDIT_MAX_TEXT } from "./control-plane.js";
 export type {
   ControlPlaneOptions,
   KillSwitchRelease,
   KillSwitchState,
+  ModeRaiseAuditOutcome,
+  MutatingAuditAction,
   MutationContext,
   MutationRefusalCode,
   MutationResult,
+  RefusalAuditOutcome,
+  RequestRefusal,
+  RequestRefusalStage,
   RunStateView,
   StrategyInstanceState,
   StrategyRunState,
@@ -84,8 +90,38 @@ export type {
   TraderHealthSource,
 } from "./health-source.js";
 
-export { CONTROL_API_ROUTES, ControlApi } from "./api.js";
-export type { ApiEnvironment, ApiRequest, ApiResponse, ControlApiOptions } from "./api.js";
+export {
+  CONTROL_API_ROUTE_TABLE,
+  CONTROL_API_ROUTES,
+  ControlApi,
+  MUTATION_GRANTS,
+  holdsMutationAuthority,
+} from "./api.js";
+export type {
+  ApiEnvironment,
+  ApiRequest,
+  ApiResponse,
+  ControlApiOptions,
+  ControlApiRoute,
+  TransportRefusal,
+  TransportRefusalCode,
+} from "./api.js";
 
-export { startControlHttpServer } from "./http.js";
-export type { ControlHttpServerOptions, RunningControlHttpServer } from "./http.js";
+export {
+  AUDIT_BUDGET_TIERS,
+  SafetyReservedAuditSink,
+  auditBudgetProblem,
+  auditBudgetTier,
+  createBudgetedAuditLog,
+} from "./audit-budget.js";
+export type { AuditBudgetOptions, AuditBudgetTier, AuditBudgetTierInput } from "./audit-budget.js";
+
+export { MAX_INSTANCE_ID_LENGTH, instanceIdProblem, readInstanceIdParameter } from "./instance-id.js";
+export type { InstanceIdParameter } from "./instance-id.js";
+
+export { CONTROL_HTTP_TIMEOUTS, isJsonContentType, startControlHttpServer } from "./http.js";
+export type {
+  ControlHttpServerOptions,
+  ControlHttpTimeouts,
+  RunningControlHttpServer,
+} from "./http.js";

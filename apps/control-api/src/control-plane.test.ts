@@ -195,6 +195,81 @@ describe("ACCEPTANCE 2: audit first, then apply", () => {
   });
 });
 
+describe("CONTROL-1 (M-1): an instance the control plane never knew is REFUSED, not fabricated", () => {
+  it.each([
+    ["pause", "STRATEGY_PAUSE"],
+    ["resume", "STRATEGY_RESUME"],
+  ] as const)("refuses a %s of an unregistered instance, audits the refusal, and inserts nothing", async (verb, action) => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    const result =
+      verb === "pause"
+        ? await control.pauseStrategy("never-registered", context())
+        : await control.resumeStrategy("never-registered", context());
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_UNKNOWN_INSTANCE" });
+    expect(control.strategies()).toEqual([]);
+    expect(audit.records()).toHaveLength(1);
+    expect(audit.records()[0]).toMatchObject({
+      action,
+      outcome: "REFUSED",
+      scope: "STRATEGY_INSTANCE",
+      scopeRef: "never-registered",
+    });
+    expect(audit.records()[0]?.priorState).toEqual({ known: "false", instanceId: "never-registered" });
+    expect(audit.records()[0]?.resultingState).toMatchObject({
+      known: "false",
+      refusalCode: "CONTROL_UNKNOWN_INSTANCE",
+    });
+  });
+
+  it("an unknown id never grows the instance map, however many are tried (L-8)", async () => {
+    const control = plane(new InMemoryControlAuditLog(1_000));
+    for (let index = 0; index < 200; index += 1) {
+      await control.pauseStrategy(`unknown-${String(index)}`, context());
+    }
+    expect(control.strategies()).toEqual([]);
+  });
+});
+
+describe("CONTROL-1 (L-6): an unauditable mutation is counted NOT_AUDITED, never APPLIED", () => {
+  it("counts the refused append under its own outcome", async () => {
+    const control = plane(new RefusingSink());
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    await control.pauseStrategy("sb-1", context());
+    await control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, context());
+    expect(control.mutationCounts()).toEqual([
+      { action: "KILL_SWITCH_ENGAGE", outcome: "NOT_AUDITED", count: 1 },
+      { action: "STRATEGY_PAUSE", outcome: "NOT_AUDITED", count: 1 },
+    ]);
+    expect(control.auditAppendFailures).toBe(2);
+    expect(control.killSwitches()).toEqual([]);
+  });
+});
+
+describe("CONTROL-1 (M-3): the mode-raise record says whether it was written", () => {
+  it("returns audited: true when the sink accepted the record", async () => {
+    const control = plane(new InMemoryControlAuditLog(8));
+    expect(await control.refuseModeRaise(["runMode"], context())).toEqual({ audited: true });
+  });
+
+  it("returns audited: false, with the refusal, when the sink refused it — and still counts the attempt", async () => {
+    const control = plane(new RefusingSink());
+    const outcome = await control.refuseModeRaise(["runMode"], context());
+    expect(outcome).toMatchObject({ audited: false, code: "CONTROL_NOT_AUDITABLE" });
+    expect(control.modeRaiseAttemptsRefused).toBe(1);
+  });
+
+  it("countModeRaiseWithoutAudit counts and writes NOTHING", () => {
+    const sink = new RefusingSink();
+    const control = plane(sink);
+    control.countModeRaiseWithoutAudit();
+    control.countModeRaiseWithoutAudit();
+    expect(control.modeRaiseAttemptsRefused).toBe(2);
+    expect(sink.seen).toEqual([]);
+    expect(control.mutationCounts()).toEqual([]);
+  });
+});
+
 describe("ACCEPTANCE 1: a mode-raise attempt is recorded and changes nothing", () => {
   it("records the attempt, names the keys, and leaves the ceiling alone", async () => {
     const audit = new InMemoryControlAuditLog(8);
@@ -369,5 +444,229 @@ describe("determinism", () => {
       context(),
     );
     expect(control.killSwitches().map((entry) => entry.scope)).toEqual(["ACCOUNT", "MARKET"]);
+  });
+});
+
+describe("CONTROL-1 r1 (CONTROL1-J-M1): an engage never repeats and never weakens", () => {
+  const GLOBAL = { scope: "GLOBAL", scopeRef: null } as const;
+
+  it("REFUSES an identical re-engage CONTROL_ALREADY_IN_STATE, audited as a refusal, the switch untouched", async () => {
+    const audit = new InMemoryControlAuditLog(16);
+    const control = plane(audit);
+    expect((await control.engageKillSwitch({ ...GLOBAL, action: "HALT_NEW_ENTRIES" }, context({ reason: "first" }))).ok).toBe(true);
+    const again = await control.engageKillSwitch({ ...GLOBAL, action: "HALT_NEW_ENTRIES" }, context({ reason: "again" }));
+    expect(again).toMatchObject({ ok: false, code: "CONTROL_ALREADY_IN_STATE" });
+    expect(control.killSwitches()).toEqual([expect.objectContaining({ action: "HALT_NEW_ENTRIES", reason: "first" })]);
+    expect(audit.records().map((record) => `${record.action}|${record.outcome}`)).toEqual([
+      "KILL_SWITCH_ENGAGE|APPLIED",
+      "KILL_SWITCH_ENGAGE|REFUSED",
+    ]);
+  });
+
+  it.each(["HALT_NEW_ENTRIES", "CANCEL_ALL", "CANCEL_MARKET", "MANAGE_POSITIONS_ONLY"] as const)(
+    "REFUSES moving a FULL_HALT to %s: CONTROL_ENGAGE_WOULD_WEAKEN, pointing at the release",
+    async (weaker) => {
+      const audit = new InMemoryControlAuditLog(16);
+      const control = plane(audit);
+      await control.engageKillSwitch({ ...GLOBAL, action: "FULL_HALT" }, context());
+      const result = await control.engageKillSwitch({ ...GLOBAL, action: weaker }, context());
+      expect(result).toMatchObject({ ok: false, code: "CONTROL_ENGAGE_WOULD_WEAKEN" });
+      if (!result.ok) expect(result.detail).toContain("/v1/kill-switch/release");
+      expect(control.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
+      expect(audit.records().at(-1)).toMatchObject({ action: "KILL_SWITCH_ENGAGE", outcome: "REFUSED" });
+    },
+  );
+
+  it("APPLIES an escalation to FULL_HALT, and a change between two unordered actions", async () => {
+    const control = plane(new InMemoryControlAuditLog(16));
+    await control.engageKillSwitch({ ...GLOBAL, action: "HALT_NEW_ENTRIES" }, context());
+    expect((await control.engageKillSwitch({ ...GLOBAL, action: "CANCEL_ALL" }, context())).ok).toBe(true);
+    expect((await control.engageKillSwitch({ ...GLOBAL, action: "FULL_HALT" }, context())).ok).toBe(true);
+    expect(control.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
+  });
+
+  it("a weaker action after a RELEASE is a new switch, applied", async () => {
+    const control = plane(new InMemoryControlAuditLog(16));
+    await control.engageKillSwitch({ ...GLOBAL, action: "FULL_HALT" }, context());
+    await control.releaseKillSwitch(
+      { ...GLOBAL, release: { authoritativeSnapshotApplied: true, reason: "reconciled" } },
+      context(),
+    );
+    expect((await control.engageKillSwitch({ ...GLOBAL, action: "HALT_NEW_ENTRIES" }, context())).ok).toBe(true);
+    expect(control.killSwitches().map((entry) => entry.action)).toEqual(["HALT_NEW_ENTRIES"]);
+  });
+
+  it("the same action at ANOTHER scope is a new switch, not a repeat", async () => {
+    const control = plane(new InMemoryControlAuditLog(16));
+    await control.engageKillSwitch({ scope: "MARKET", scopeRef: "m-1", action: "FULL_HALT" }, context());
+    expect((await control.engageKillSwitch({ scope: "MARKET", scopeRef: "m-2", action: "FULL_HALT" }, context())).ok).toBe(true);
+    expect(control.killSwitches()).toHaveLength(2);
+  });
+});
+
+/** A sink whose appends settle only after a macrotask — the shape a durable sink has. */
+class SlowSink implements ControlAuditSink {
+  readonly records: ControlAuditRecord[] = [];
+  append(record: ControlAuditRecord): Promise<AuditAppendResult> {
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        this.records.push(record);
+        resolve({ ok: true });
+      }, 1);
+    });
+  }
+}
+
+describe("CONTROL-1 r1 (CONTROL1-J-L2): mutations of one state key are serialized", () => {
+  it("ten CONCURRENT pauses of one instance: exactly ONE is applied, nine are CONTROL_ALREADY_IN_STATE", async () => {
+    const sink = new SlowSink();
+    const control = plane(sink);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    const results = await Promise.all(Array.from({ length: 10 }, () => control.pauseStrategy("sb-1", context())));
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => !result.ok && result.code === "CONTROL_ALREADY_IN_STATE")).toHaveLength(9);
+    const applied = sink.records.filter((record) => record.outcome === "APPLIED");
+    expect(applied).toHaveLength(1);
+    expect(applied[0]?.priorState).toMatchObject({ state: "RUNNING" });
+    expect(control.mutationsInFlight).toBe(0);
+  });
+
+  it("ten CONCURRENT identical engages: exactly ONE is applied", async () => {
+    const sink = new SlowSink();
+    const control = plane(sink);
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, context()),
+      ),
+    );
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(sink.records.filter((record) => record.outcome === "APPLIED")).toHaveLength(1);
+    expect(control.mutationsInFlight).toBe(0);
+  });
+
+  it("a pause and a resume sent together apply IN ARRIVAL ORDER, each against the state the other left", async () => {
+    const sink = new SlowSink();
+    const control = plane(sink);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    const [paused, resumed] = await Promise.all([
+      control.pauseStrategy("sb-1", context()),
+      control.resumeStrategy("sb-1", context()),
+    ]);
+    expect(paused.ok && resumed.ok).toBe(true);
+    expect(sink.records.map((record) => `${String((record.priorState as Record<string, unknown>)["state"])}→${String((record.resultingState as Record<string, unknown>)["state"])}`)).toEqual([
+      "RUNNING→PAUSED",
+      "PAUSED→RUNNING",
+    ]);
+  });
+
+  it("a slow append for one instance does NOT queue a kill-switch engage behind it (keys are independent)", async () => {
+    const releases: (() => void)[] = [];
+    const sink: ControlAuditSink = {
+      append: (record) =>
+        record.scopeRef === "sb-slow"
+          ? new Promise<AuditAppendResult>((resolve) => {
+              releases.push(() => resolve({ ok: true }));
+            })
+          : Promise.resolve({ ok: true }),
+    };
+    const control = plane(sink);
+    control.register("sb-slow", "2026-09-05T00:00:00.000Z");
+    const pending = control.pauseStrategy("sb-slow", context());
+    const engaged = await control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, context());
+    expect(engaged.ok).toBe(true);
+    expect(control.killSwitches()).toHaveLength(1);
+    expect(control.mutationsInFlight).toBe(1);
+    for (const release of releases) release();
+    expect((await pending).ok).toBe(true);
+    expect(control.mutationsInFlight).toBe(0);
+  });
+
+  it("an unknown id leaves no lock behind, however many are tried", async () => {
+    const control = plane(new InMemoryControlAuditLog(1_000));
+    await Promise.all(Array.from({ length: 50 }, (_, index) => control.pauseStrategy(`ghost-${String(index)}`, context())));
+    expect(control.mutationsInFlight).toBe(0);
+  });
+
+  it("a sink that THROWS does not wedge its key", async () => {
+    let throwing = true;
+    const sink: ControlAuditSink = {
+      append: () => {
+        if (throwing) return Promise.reject(new Error("sink exploded"));
+        return Promise.resolve({ ok: true });
+      },
+    };
+    const control = plane(sink);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    await expect(control.pauseStrategy("sb-1", context())).rejects.toThrow("sink exploded");
+    throwing = false;
+    expect((await control.pauseStrategy("sb-1", context())).ok).toBe(true);
+    expect(control.mutationsInFlight).toBe(0);
+  });
+});
+
+describe("CONTROL-1 r1 (CONTROL1-J-M2): refuseRequest records a refusal before the plane, bounded", () => {
+  it("writes one REFUSED record that reads no state and changes nothing", async () => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    const outcome = await control.refuseRequest(
+      "STRATEGY_PAUSE",
+      { scope: "STRATEGY_INSTANCE", scopeRef: "sb-1" },
+      "REQUEST_BODY",
+      { code: "CONTROL_REQUEST_INVALID", detail: "the strategy control request failed its schema", issues: ["reason: required"] },
+      context(),
+    );
+    expect(outcome).toEqual({ audited: true });
+    expect(control.strategies()[0]?.state).toBe("RUNNING");
+    expect(audit.records()[0]).toMatchObject({
+      action: "STRATEGY_PAUSE",
+      outcome: "REFUSED",
+      scope: "STRATEGY_INSTANCE",
+      scopeRef: "sb-1",
+      priorState: { refusedAt: "REQUEST_BODY", stateRead: "false" },
+      resultingState: {
+        refusedAt: "REQUEST_BODY",
+        stateRead: "false",
+        refusalCode: "CONTROL_REQUEST_INVALID",
+        refusalIssues: ["reason: required"],
+        refusalIssueCount: "1",
+      },
+    });
+    expect(control.mutationCounts()).toEqual([{ action: "STRATEGY_PAUSE", outcome: "REFUSED", count: 1 }]);
+  });
+
+  it("keeps at most 8 issues of at most 256 characters, as an ORDINARY array whatever species it was handed", async () => {
+    class Issues extends Array<string> {}
+    const many = new Issues();
+    for (let index = 0; index < 40; index += 1) many.push(`k${String(index)}: ${"x".repeat(1_000)}`);
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    await control.refuseRequest(
+      "KILL_SWITCH_ENGAGE",
+      { scope: "CONTROL_PLANE", scopeRef: null },
+      "REQUEST_BODY",
+      { code: "CONTROL_REQUEST_INVALID", detail: "d".repeat(5_000), issues: many },
+      context(),
+    );
+    const document = audit.records()[0]?.resultingState as Record<string, unknown>;
+    const issues = document["refusalIssues"] as readonly string[];
+    expect(issues).toHaveLength(8);
+    expect(Object.getPrototypeOf(issues)).toBe(Array.prototype);
+    for (const issue of issues) expect(issue.length).toBeLessThanOrEqual(256);
+    expect((document["refusalDetail"] as string).length).toBeLessThanOrEqual(256);
+    expect(document["refusalIssueCount"]).toBe("40");
+  });
+
+  it("a refused append is counted NOT_AUDITED and reported, and nothing changes", async () => {
+    const control = plane(new RefusingSink());
+    const outcome = await control.refuseRequest(
+      "KILL_SWITCH_RELEASE",
+      { scope: "CONTROL_PLANE", scopeRef: null },
+      "TRANSPORT",
+      { code: "CONTROL_BODY_NOT_JSON", detail: "the request body is not JSON", issues: [] },
+      context(),
+    );
+    expect(outcome).toMatchObject({ audited: false, code: "CONTROL_NOT_AUDITABLE" });
+    expect(control.mutationCounts()).toEqual([{ action: "KILL_SWITCH_RELEASE", outcome: "NOT_AUDITED", count: 1 }]);
   });
 });
