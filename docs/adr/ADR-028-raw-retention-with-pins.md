@@ -349,9 +349,9 @@ an execute cycle that settles a window releases them.
 
 ### Rule 3. One storage cycle at a time per state directory
 
-**Refines:** Decision 2. The lock protects the durable state its conditions
-rely on: rule 2's holds, and the clock guard's state behind Decision 2.1's
-age check.
+**Refines:** Decision 2. The lock protects the durable state that Decision
+2's conditions rely on: rule 2's holds, and the clock guard's state behind
+Decision 2.1's age check.
 
 1. A cycle with a state directory runs whole under that directory's cycle
    lock (`withStorageCycleLock`, called by `runStorageCycle`). It takes the
@@ -381,6 +381,8 @@ age check.
      breaks it automatically.
    - A process that cannot read the boot id and one that can use different
      names, so neither excludes the other (`R6-LOCK-NAME-FALLBACK`).
+   - Owner of both lock residuals (items 5 and 8): a research-worker round,
+     before `HOST-1` (`STORAGE1-LOCK-LOWS`).
 9. The lock serializes cycles on one host. A state directory shared between
    hosts is not supported.
 
@@ -403,7 +405,8 @@ and, through rule 2, Decisions 2.3 and 3.4.
    state directory. It still accepts a dry run without one. That run makes
    no hold durable and takes no lock. The command never runs one.
 5. `STORAGE-1` assumes one state directory for each WAL root. A dry run
-   given another directory protects nothing for the timer's cycles.
+   given another directory protects nothing for the scheduled execute
+   cycles.
 
 **Why it fails closed:** a dry run reads the trader's rows like any cycle.
 Without a state directory, what it read would be lost when it exits. The
@@ -421,10 +424,11 @@ overlaps it is classified.
    registry only after an execute cycle has settled it (rule 2).
 3. This is an operator rule. The code cannot enforce it, because it never
    sees a window that is not registered.
-4. If a window leaves earlier, what any cycle already read stays durable:
-   its holds and its failed-read mark (rules 1 and 2). They keep their
-   segments until the window is registered again and an execute cycle
-   settles it.
+4. If a window leaves earlier, its recorded holds and any unsettled
+   failed-read mark stay durable (rules 1 and 2). Re-registering it lets an
+   execute cycle read its evidence again. Holds remain until an execute
+   cycle settles the window. A successful execute-mode read clears the
+   failed-read mark even if the window remains unclassified.
 5. What no cycle has read is not held:
    - rows the trader writes after the last read;
    - the potential range of a window that was unclassified with no evidence
@@ -495,11 +499,11 @@ Two limits come from the trader, not from this worker.
     no frontier. So no trader-responsible window classifies today, and no
     segment it could overlap expires. This keeps more, never less.
 - **Nothing writes refusal or halt rows yet (`OUT1-R1-HALT-NOT-DURABLE`).**
-  - `postgresTraderEvidence` reads both tables, so it finds none.
+  - `postgresTraderEvidence` reads both tables, but they are empty.
   - Today every trader-responsible window stays unclassified anyway (the
     item above), so every segment it could overlap is kept.
   - Once those windows can classify, the missing rows can leave an
     otherwise evidence-free window unpinned. Decision 3.1 would pin a
     window with a refusal or a halt for 30 days.
-- Owner of both: `H1R1-PROVENANCE` and trader persistence (`STORAGE-1`
-  follow_up 3), including `OUT1-R1-HALT-NOT-DURABLE`.
+- Owner of both: a trader/storage round that persists decision provenance,
+  halts and refusals (`STORAGE-1` follow_up 3).
