@@ -40,9 +40,10 @@
  * 4. the session's GATEWAY EPOCH is TAINTED: a data-quality incident that
  *    names no market arrived from that epoch. The gateway opens exactly such
  *    incidents when it suppresses a frame's events (a WAL refusal), cannot
- *    normalize a frame, or sees a heartbeat stall, so from then on "another
- *    token's frame arrived" no longer implies "this token's frames are being
- *    delivered". The taint covers every session of the epoch, LATER ONES
+ *    normalize a frame, refuses one of a frame's envelopes (review round 6,
+ *    R6-H1: reported ahead of the frame's accepted events), or sees a
+ *    heartbeat stall, so from then on "another token's frame arrived" no
+ *    longer implies "this token's frames are being delivered". The taint covers every session of the epoch, LATER ONES
  *    INCLUDED, and is never lifted: the gateway deduplicates an open incident
  *    per `(scope, reasonCode)` and closes almost none, so a repeat after a
  *    reconnect publishes nothing and a per-session taint would leave the new

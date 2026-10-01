@@ -38,12 +38,45 @@
  * — and is counted. The recursion terminates because an incident draft that
  * itself fails contract validation is counted and reported through the
  * observer only.
+ *
+ * ## A frame's loss is published BEFORE the frame (`THROUGHPUT-1c` r6, R6-H1)
+ *
+ * One venue frame becomes several events, and the trader may read a frame's
+ * accepted events as evidence that the delivery path is whole (ADR-023: a
+ * market-channel frame on a delivery session vouches for every book on that
+ * session). If the gateway refuses ONE of a frame's events here, the frame
+ * lost part of what the venue sent, and the consumer must learn of that loss
+ * before any of the frame's siblings can close an evaluation. `dispatch`
+ * cannot promise that: it sees one event at a time, so a refused LATER event
+ * opens its incident after the earlier siblings were already submitted (an
+ * adapter-accepted venue `timestamp` whose ISO form has a five-digit year —
+ * a timestamp sent in microseconds — did exactly that, and an opted-in
+ * trader approved two orders on the book whose change was lost).
+ *
+ * {@link GatewayDispatcher.dispatchFrame} takes the whole frame. It assigns
+ * and validates EVERY event, exactly as `dispatch` would, before it submits
+ * any. When all pass, it submits them in that order: the same sequences, ids
+ * and documents as one `dispatch` per event, nothing else changes. When any
+ * is refused, nothing assigned in that pass is submitted: the
+ * `GATEWAY_ENVELOPE_REJECTED` incident is opened FIRST (at the frame's first
+ * receipt, so receipt instants never run backwards in the stream), and only
+ * then are the accepted events assigned fresh sequences, re-validated with
+ * those sequences, and submitted. The first pass's sequences become holes,
+ * which the module header above already allows. What is validated is still
+ * exactly what is published: every submitted envelope passed
+ * `completeEnvelope` with its own final identity.
+ *
+ * The registry deduplicates an open incident per `(scope, reasonCode)`, so a
+ * later frame's loss inside the same gateway epoch publishes no second
+ * incident; the consumer's taint from the first one is for the whole epoch
+ * (ADR-023 D2 rule 4). A consumer that did not see the first one is ADR-023's
+ * accepted X2 gap, bounded by its ceiling.
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import type { IncidentSeverity } from "@polymarket-bot/domain";
 
-import type { EnvelopeDraft } from "./envelope.js";
+import type { CompletedEnvelope, EnvelopeDraft } from "./envelope.js";
 import { completeEnvelope, rawFrameCausationId } from "./envelope.js";
 import type { IncidentRegistry } from "./incidents.js";
 import type { GatewayClock, GatewayIdSource, GatewayReceipt } from "./ports.js";
@@ -69,6 +102,21 @@ export interface DispatcherObserver {
     readonly detail: string;
     readonly feedId?: string | undefined;
   }): void;
+}
+
+/** One event of a frame handed to {@link GatewayDispatcher.dispatchFrame}. */
+export interface FrameDispatchEntry {
+  readonly draft: EnvelopeDraft;
+  readonly context?: DispatchContext;
+}
+
+/** One draft after its identity was assigned and its envelope completed. */
+interface AssignedDraft {
+  readonly draft: EnvelopeDraft;
+  readonly context: DispatchContext;
+  readonly receipt: GatewayReceipt;
+  readonly eventId: string;
+  readonly completed: CompletedEnvelope;
 }
 
 export interface DispatcherMetrics {
@@ -111,9 +159,91 @@ export class GatewayDispatcher {
    * module header for exactly what that does and does not break.
    */
   dispatch(draft: EnvelopeDraft, context: DispatchContext = {}): Promise<PublishOutcome> {
+    const assigned = this.#assign(draft, context);
+    if (!assigned.completed.ok) {
+      return this.#reject(assigned.draft, assigned.completed.detail);
+    }
+    return this.#submit(assigned.completed.envelope);
+  }
+
+  /**
+   * Dispatches the events of ONE venue frame, reporting a loss BEFORE the
+   * frame (module header, "A frame's loss is published BEFORE the frame").
+   *
+   * Every entry is assigned and validated before any is submitted. All valid:
+   * submitted in order, exactly as one {@link dispatch} per entry would have
+   * submitted them. Any refused: the `GATEWAY_ENVELOPE_REJECTED` incident is
+   * opened first, at the first entry's receipt; the accepted entries are then
+   * re-assigned (fresh sequences, the same ids and receipts), re-validated
+   * and submitted in their order. Synchronous up to the last submission, like
+   * {@link dispatch}; one outcome per entry, in entry order, never rejecting.
+   */
+  dispatchFrame(entries: readonly FrameDispatchEntry[]): readonly Promise<PublishOutcome>[] {
+    const assigned = entries.map((entry) => this.#assign(entry.draft, entry.context ?? {}));
+    const details: string[] = [];
+    for (const entry of assigned) {
+      if (!entry.completed.ok) details.push(entry.completed.detail);
+    }
+    if (details.length === 0) {
+      const outcomes: Promise<PublishOutcome>[] = [];
+      for (const entry of assigned) {
+        if (entry.completed.ok) outcomes.push(this.#submit(entry.completed.envelope));
+      }
+      return outcomes;
+    }
+
+    // The frame lost events. Each refusal is counted and observed, as in
+    // `dispatch`; the ONE incident naming the loss goes ahead of the frame.
+    for (const entry of assigned) {
+      if (entry.completed.ok) continue;
+      this.#envelopeRejections += 1;
+      this.#observer.onEnvelopeRejected?.({ detail: entry.completed.detail, draft: entry.draft });
+    }
+    const first = assigned[0];
+    this.openIncident(
+      {
+        scope: "envelope",
+        reasonCode: "GATEWAY_ENVELOPE_REJECTED",
+        severity: "NOTIFY",
+        detail:
+          `${String(details.length)} of a frame's ${String(entries.length)} events failed their ` +
+          "frozen contract and were not published; this incident precedes the frame's " +
+          `accepted events: ${details.join("; ")}`,
+      },
+      undefined,
+      first === undefined ? {} : { receipt: first.receipt },
+    );
+
+    return assigned.map((entry): Promise<PublishOutcome> => {
+      if (!entry.completed.ok) {
+        return Promise.resolve({
+          published: false,
+          reason: "transport-rejected",
+          detail: entry.completed.detail,
+        });
+      }
+      // Re-assigned AFTER the incident, so the stream's order is the
+      // incident first. Same id and receipt; a fresh sequence, validated.
+      const reassigned = this.#assign(entry.draft, entry.context, entry.eventId);
+      if (!reassigned.completed.ok) {
+        return this.#reject(entry.draft, reassigned.completed.detail);
+      }
+      return this.#submit(reassigned.completed.envelope);
+    });
+  }
+
+  /**
+   * Assigns one draft its identity and completes (validates) its envelope.
+   * The id is minted BEFORE the sequence is drawn, as it always was, so the
+   * ids and sequences of a frame dispatched whole equal those of one
+   * `dispatch` per event. `eventId` is passed only by a re-assignment, which
+   * keeps the id of a document that was never submitted.
+   */
+  #assign(draft: EnvelopeDraft, context: DispatchContext, eventId?: string): AssignedDraft {
     const receipt = context.receipt ?? takeReceipt(this.#clock);
+    const id = eventId ?? this.#ids.newEventId(receipt.nowMs);
     const completed = completeEnvelope(draft, {
-      eventId: this.#ids.newEventId(receipt.nowMs),
+      eventId: id,
       gatewayEpoch: this.#sequencer.gatewayEpoch,
       ingestSeq: this.#sequencer.next(),
       receipt,
@@ -126,23 +256,29 @@ export class GatewayDispatcher {
             ),
           }),
     });
-    if (!completed.ok) {
-      this.#envelopeRejections += 1;
-      this.#observer.onEnvelopeRejected?.({ detail: completed.detail, draft });
-      this.openIncident({
-        scope: "envelope",
-        reasonCode: "GATEWAY_ENVELOPE_REJECTED",
-        severity: "NOTIFY",
-        detail: completed.detail,
-      });
-      return Promise.resolve({
-        published: false,
-        reason: "transport-rejected",
-        detail: completed.detail,
-      });
-    }
+    return { draft, context: { ...context, receipt }, receipt, eventId: id, completed };
+  }
+
+  /** Counts, observes and routes one refused draft (the single-event path). */
+  #reject(draft: EnvelopeDraft, detail: string): Promise<PublishOutcome> {
+    this.#envelopeRejections += 1;
+    this.#observer.onEnvelopeRejected?.({ detail, draft });
+    this.openIncident({
+      scope: "envelope",
+      reasonCode: "GATEWAY_ENVELOPE_REJECTED",
+      severity: "NOTIFY",
+      detail,
+    });
+    return Promise.resolve({
+      published: false,
+      reason: "transport-rejected",
+      detail,
+    });
+  }
+
+  #submit(envelope: EventEnvelope<unknown>): Promise<PublishOutcome> {
     this.#dispatched += 1;
-    return this.#publisher.enqueue(completed.envelope);
+    return this.#publisher.enqueue(envelope);
   }
 
   /**
@@ -157,6 +293,9 @@ export class GatewayDispatcher {
    * (so the published event carries the adapter's provenance and reason
    * vocabulary) without bypassing the registry's dedup or the observer. It is
    * the single funnel: there is no other way to open an incident.
+   *
+   * `context` is the incident envelope's own dispatch context; only
+   * {@link dispatchFrame} passes one (the frame's first receipt).
    */
   openIncident(
     input: {
@@ -167,6 +306,7 @@ export class GatewayDispatcher {
       readonly feedId?: string | undefined;
     },
     buildDraft?: (incidentId: string) => EnvelopeDraft,
+    context: DispatchContext = {},
   ): void {
     const outcome = this.#incidents.open({
       scope: input.scope,
@@ -192,6 +332,7 @@ export class GatewayDispatcher {
     // open — the registry's dedup is what terminates the recursion.
     void this.dispatch(
       buildDraft === undefined ? outcome.draft : buildDraft(outcome.incidentId),
+      context,
     );
   }
 

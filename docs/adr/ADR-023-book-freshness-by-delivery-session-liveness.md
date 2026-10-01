@@ -30,7 +30,11 @@
   only (review round 5, X9-GOV): the sentences that said a ruling was still
   owed (D7, §5) now point to the interim rulings recorded in
   `IMPLEMENTATION_STATUS.md`; the user's ratification is still the merge
-  gate.
+  gate. r6 (2026-10-01), after review round 6 (R6-H1): the gateway validates
+  every envelope of a market-channel frame before it publishes any, so an
+  event its envelope contract refuses is reported ahead of the frame (D2.4,
+  D3, D5); `LAST_CHANGE` records no delivery session (D4, O-R6-I1); a
+  backward step of the gateway's wall clock is disclosed (D7, D8, O-R6-I2).
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
@@ -225,9 +229,11 @@ more permissive than it — whenever any of rules 1–6 applies:
    that names no market (`affectedMarketIds` absent or empty) has arrived from
    that epoch. The gateway opens exactly such incidents when it suppresses a
    frame's events after a WAL refusal (`GATEWAY_WAL_FRAME_REFUSED`), cannot
-   normalize a frame, or sees a heartbeat stall (`GATEWAY_FEED_STALL`)
-   (`feeds/polymarket.ts`). From then on "another asset's frame arrived" no
-   longer implies "this asset's frames are being delivered". The taint covers
+   normalize a frame, refuses one of a frame's envelopes
+   (`GATEWAY_ENVELOPE_REJECTED`, r6), or sees a heartbeat stall
+   (`GATEWAY_FEED_STALL`) (`feeds/polymarket.ts`, `dispatcher.ts`). From
+   then on "another asset's frame arrived" no longer implies "this asset's
+   frames are being delivered". The taint covers
    EVERY session of the epoch, later ones included, and is never lifted,
    because the gateway's incident registry deduplicates an open incident per
    `(scope, reasonCode)` and closes only the stall and snapshot-fetch
@@ -243,6 +249,44 @@ more permissive than it — whenever any of rules 1–6 applies:
    gateway opens the incident synchronously, so the incident is sequenced
    ahead of every sibling event of that frame, and the epoch is tainted
    before any sibling can close an evaluation (r1, X8).
+   **A frame the gateway itself could only partly publish (r6, R6-H1)** is
+   reported the same way. An event the adapter accepts can still be refused
+   by the frozen envelope contract when the gateway completes it: a venue
+   `timestamp` inside the adapter's epoch range
+   (`packages/polymarket-public/src/normalize/values.ts`, |ms| ≤ 8.64e15)
+   whose ISO form has a five-digit year (`253402300800000` gives
+   `+010000-…`; the frame's own instant sent in MICROSECONDS gives
+   `+058142-…`) is refused by `IsoTimestampSchema`. Before r6 the dispatcher
+   refused such an event only when it reached it, AFTER the frame's earlier
+   siblings were submitted. Its `GATEWAY_ENVELOPE_REJECTED` incident carries
+   no raw-frame causation, so the trader read it as a frame of its own
+   (ADR-024's frame key) and evaluated the sibling's frame before the taint
+   landed: review reproduced 2 approved orders under `CONNECTION_CONFIRMED`
+   (0 under `LAST_CHANGE`). Now the driver hands the dispatcher each socket
+   message's market-data events as ONE frame
+   (`feeds/polymarket.ts` `frameBoundedSocketFactory`: the adapter handles a
+   message synchronously inside the socket's `onMessage`, so that callback
+   bounds the frame), and `GatewayDispatcher.dispatchFrame` assigns and
+   validates every envelope of the frame before it submits any. If one is
+   refused, the incident (no market) is opened FIRST, stamped with the
+   frame's first receipt, and the accepted events follow it under fresh
+   sequences; when none is refused, the stream is byte-identical to one
+   dispatch per event. The other ways a frame can lose events between the
+   socket and the stream were checked and lose no event after a sibling was
+   published: a WAL refusal opens its incident before the frame is parsed
+   and suppresses every derived event; a publication halt (an outage, a
+   full queue, a refused admission) suppresses everything queued, and a
+   frame of up to 1 024 events is never split across two transport calls
+   (`publisher.ts`, frame-atomic runs; one atomic script call; only a single
+   venue message of more than 1 024 events is split, and only an outage
+   between its two calls would publish a prefix, after which the stream
+   ends); the
+   transport's door (`packages/event-bus` `encodeEnvelope`) is derived from
+   the same domain envelope schema, so it accepts every envelope
+   `completeEnvelope` accepted (its one tightening, a top-level `__proto__`
+   member, is never written by the gateway). REST recovery snapshots are
+   dispatched one by one, as before: they carry no session (rule 2), so
+   their order vouches for nothing.
    **What "never lifted" covers, and what it does not (r1, X2).** The taint
    is state of THIS PROCESS, fed by the incidents it consumed. A trader that
    starts, restarts or resumes from its checkpoint inside an epoch whose
@@ -279,6 +323,7 @@ more permissive than it — whenever any of rules 1–6 applies:
 | Quiet book, live session (the H1 case) | other assets' frames keep confirming the session: FRESH, until the book's own last change is older than the ceiling | D2, rule 6 |
 | One asset's delivery stalls while the session stays busy (N-B) | FRESH until the ceiling, then aged by its own last change: STALE at `lastChange + max(ceiling, bound)` at the latest | D2 rule 6 |
 | A frame the gateway could only partly normalize | the frame's incident is sequenced before its accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r1, X8) |
+| A frame one of whose events the gateway's envelope contract refuses (an adapter-accepted `timestamp` whose ISO year has five digits, e.g. one sent in microseconds) | every envelope of the frame is validated before any is published; `GATEWAY_ENVELOPE_REJECTED` (no market) is published ahead of the frame's accepted events, so the epoch is tainted before any sibling evaluates | D2.4 (r6, R6-H1) |
 | A trader that starts or restarts inside an epoch whose incident it did not consume | the taint is unknown to it (an accepted gap): bounded by the ceiling | D2.4, rule 6 (r1, X2) |
 | Silent session, socket still open | no confirmations: STALE at `lastConfirmation + bound` | D2 (no rule needed) |
 | Disconnection (`FeedDisconnected`), reconnect | the old session gets no more frames; the new session's frames do not confirm a book delivered on the old one: STALE within the bound. A book re-delivered on the new session is confirmed by it | D1 key |
@@ -310,17 +355,26 @@ configuration written before this ADR — registered runs `BOOT-1` compares,
 golden configurations, operators' templates — must keep loading with its
 original meaning. Under `LAST_CHANGE` the loop records nothing new and computes
 exactly the pre-ADR-023 values; a test pins byte-identical decisions for an
-absent block and an explicit `LAST_CHANGE`.
+absent block and an explicit `LAST_CHANGE`. (Until r6 the loop did record each
+applied book update's session under `LAST_CHANGE` too, without ever reading
+it; r6 returns before recording, and a test pins that no session is recorded
+under an absent block or `LAST_CHANGE` (review round 6, O-R6-I1).)
 
 ### D5. How the signal flows
 
-- **Gateway: no new event type; one ordering change (r1, X8).** The session
-  fields every market-data envelope already carries are the signal. The
-  market-channel adapter now reports a frame's normalization problems BEFORE
-  its accepted events (`packages/polymarket-public/src/feed/connection.ts`),
-  so the gateway's incident for a partly malformed frame precedes the
-  frame's siblings in the stream (D2.4). Nothing is dropped, and neither list
-  is reordered internally. A `PONG`-derived
+- **Gateway: no new event type; two ordering changes (r1, X8; r6, R6-H1).**
+  The session fields every market-data envelope already carries are the
+  signal. The market-channel adapter now reports a frame's normalization
+  problems BEFORE its accepted events
+  (`packages/polymarket-public/src/feed/connection.ts`), so the gateway's
+  incident for a partly malformed frame precedes the frame's siblings in the
+  stream (D2.4). And the gateway validates every envelope of a socket
+  message's frame before it publishes any (`apps/data-gateway/src/dispatcher.ts`
+  `dispatchFrame`, `feeds/polymarket.ts`), so an envelope it refuses is
+  reported ahead of the frame as well (D2.4, r6). Nothing is dropped that was
+  not dropped before, and the accepted events keep their order; a refusal
+  leaves the first pass's sequences as holes, which the stream already
+  allows (`dispatcher.ts` header). A `PONG`-derived
   liveness event was considered and not built (Option B): a `PONG` confirmation
   has age 0 when it arrives, so it would satisfy a 2 000 ms bound briefly,
   but a 10 s heartbeat (V5) cannot maintain continuous freshness under a
@@ -433,6 +487,25 @@ confirmation) applies. A process clock that runs BEHIND event
 time (skew between the gateway host and the trader host) reads as lag 0, the
 pre-guard answer.
 
+**A backward step of the gateway's wall clock (review round 6, O-R6-I2).**
+Every `receivedAt` is the gateway's wall clock (`apps/data-gateway/src/system.ts`
+`nowMs`, stamped by `ports.ts` `takeReceipt`). If that clock steps BACK by
+`S` just after a session's last confirmation and the session then falls
+silent, later events carry instants up to `S` before that confirmation, so
+in event time the confirmation stays young: the session's books can read
+fresh for up to `S + bound` of real time, and rule 6's ceiling, judged in the
+same stepped event time, does not cut it short. This is a pre-existing
+event-time property, not a new one: under `LAST_CHANGE` a book's own last
+change ages the same way after such a step. What `CONNECTION_CONFIRMED`
+widens is its reach, from the one book that changed to every book on the
+session. The process-lag guard removes it when only the gateway's clock
+stepped: the trader's process clock is then ahead of event time by about
+`S`, the confirmation is moved back by that lag, and it ages in real time.
+It remains when both clocks step together (one host, the H1 deployment's
+shape) or when the trader's clock carries the same skew. Not closed here:
+it needs a monotonic receipt basis, which is the clock-semantics question
+`CO2-N1` owns.
+
 What it does not do: it does not make `LAST_CHANGE` lag-aware (that is N1),
 and a trader behind by less than the bound is still judged in event time for
 the part of the age that is its own last change. Pinned by
@@ -504,7 +577,11 @@ which every gate reads as fresh — exactly as a book update stamped after the
 evaluating event always was (`features-v1.md` §2: feed stamps "may sit after
 `asOf`"; the order-book never-clamp rule).
 Recorded data without session fields replays under the last-change rule, so an
-old recording can never read fresher than it did.
+old recording can never read fresher than it did. A backward step of the
+gateway's wall clock (D7, O-R6-I2) is in the recorded `receivedAt` values, so
+a replay (lag 0) reproduces the extension it caused as a process on the
+gateway's host would have read it, never the guard's correction a trader on
+another, unstepped host applied.
 
 ## 4. Options considered
 
@@ -531,9 +608,9 @@ old recording can never read fresher than it did.
   feed-health events.
 - **D. Session confirmations by consumed data frames, with a per-book
   ceiling (chosen).** It uses only fields every envelope already carries. It
-  needs no new event type or contract change, only the adapter's
-  problems-first order (D5). It fails closed on every missing piece. It is
-  WEAKER per book than the last-change rule's proof, because a sibling's
+  needs no new event type or contract change, only the losses-first order
+  of D5 (the adapter's problems, r1; the gateway's envelope refusals, r6).
+  It fails closed on every missing piece. It is WEAKER per book than the last-change rule's proof, because a sibling's
   frame says nothing about this asset's delivery (§2, "Therefore"). The
   ceiling (D2 rule 6) bounds that weakness.
 - **E. Raise `maximum_book_age_ms`.** Rejected: it loosens the bound for books
@@ -668,3 +745,25 @@ rulings (D7, §5, header), and the `book-freshness.ts` header's replay
 sentence, which now carries D8's qualification (review round 5, R5-L1). The
 corrected replay statement is already pinned as behaviour by r3's 3 ms
 composition pin above.
+
+r6 adds these pins (review round 6):
+- `test/integration/paper-trader/throughput-1c-partial-frame-taint.test.ts`,
+  "r6 (R6-H1)": the REAL gateway to the REAL trader. For both triggers (year
+  10000 in milliseconds; the frame's instant in microseconds) and both frame
+  orders, `GATEWAY_ENVELOPE_REJECTED` is published before the frame's
+  accepted NO snapshot, and 0 orders are admitted under both bases (the NO-first
+  order admitted 2 under `CONNECTION_CONFIRMED` at `74e17ca`);
+- `test/integration/data-gateway/throughput-1c-frame-loss-first.test.ts`: the
+  gateway alone. A well-formed frame is published whole, in order, right
+  behind its raw frame, inside the socket callback; the incident precedes
+  every accepted event of a frame that lost one; a socket close keeps its
+  place;
+- `apps/data-gateway/src/dispatcher.test.ts` › `dispatchFrame`: an all-valid
+  frame publishes exactly what one dispatch per event publishes; a refusal
+  is published first, at the frame's first receipt, with the first pass's
+  sequences left as holes; a later loss in the epoch opens no second
+  incident; `apps/data-gateway/src/feeds/polymarket.test.ts`: the bracket's
+  edges (a throw, a non-frame event, a second raw frame, a re-entrant
+  socket, no bracket);
+- `book-freshness.test.ts` › "r6 O-R6-I1": no delivery session is recorded
+  under an absent block or `LAST_CHANGE`.

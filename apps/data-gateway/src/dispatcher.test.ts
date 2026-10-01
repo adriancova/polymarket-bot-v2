@@ -184,3 +184,111 @@ describe("GatewayDispatcher", () => {
     expect(payload.severity).toBe("PAGE");
   });
 });
+
+// `THROUGHPUT-1c` r6 (R6-H1): a frame's loss is published BEFORE the frame.
+describe("GatewayDispatcher.dispatchFrame", () => {
+  const badDraft: EnvelopeDraft = { ...validDraft, payload: { nonsense: true } };
+  const draftNumbered = (stalenessMs: number): EnvelopeDraft => ({
+    ...validDraft,
+    payload: { ...(validDraft.payload as Record<string, unknown>), stalenessMs },
+  });
+  const receiptAt = (offsetMs: number) => {
+    const nowMs = Date.parse("2026-08-30T12:00:00.000Z") + offsetMs;
+    return {
+      receivedAt: new Date(nowMs).toISOString(),
+      receivedMonotonicNs: String(BigInt(nowMs) * 1_000_000n),
+      nowMs,
+    };
+  };
+
+  it("an all-valid frame publishes exactly what one dispatch per event publishes", async () => {
+    const entries = [1, 2, 3].map((index) => ({
+      draft: draftNumbered(index),
+      context: { receipt: receiptAt(index), rawFrameIngestSeq: "7" },
+    }));
+    const perEvent = build();
+    for (const entry of entries) void perEvent.dispatcher.dispatch(entry.draft, entry.context);
+    const whole = build();
+    const outcomes = await Promise.all(whole.dispatcher.dispatchFrame(entries));
+    await perEvent.publisher.settle();
+    await whole.publisher.settle();
+    expect(outcomes.map((outcome) => outcome.published)).toEqual([true, true, true]);
+    expect(whole.transport.published("market")).toEqual(perEvent.transport.published("market"));
+    expect(whole.transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3"]);
+    expect(whole.dispatcher.metrics()).toEqual(perEvent.dispatcher.metrics());
+  });
+
+  it("a refused event is reported BEFORE every accepted event of its frame, at the frame's first receipt", async () => {
+    const rejections: string[] = [];
+    const incidents: string[] = [];
+    const { transport, publisher, dispatcher } = build({
+      onEnvelopeRejected: (rejection) => rejections.push(rejection.detail),
+      onIncident: (incident) => incidents.push(incident.reasonCode),
+    });
+    const first = receiptAt(0);
+    const third = receiptAt(2);
+    const outcomes = await Promise.all(
+      dispatcher.dispatchFrame([
+        { draft: draftNumbered(1), context: { receipt: first, rawFrameIngestSeq: "7" } },
+        { draft: badDraft, context: { receipt: receiptAt(1), rawFrameIngestSeq: "7" } },
+        { draft: draftNumbered(3), context: { receipt: third, rawFrameIngestSeq: "7" } },
+      ]),
+    );
+    await publisher.settle();
+    expect(outcomes.map((outcome) => outcome.published)).toEqual([true, false, true]);
+
+    const published = transport.published("market");
+    expect(published.map((envelope) => envelope.eventType)).toEqual([
+      "DataQualityIncidentOpened",
+      "FeedStale",
+      "FeedStale",
+    ]);
+    // The first pass's sequences 1-3 are holes; the incident takes 4, the
+    // accepted events 5 and 6: strictly increasing, the incident first.
+    expect(published.map((envelope) => envelope.ingestSeq)).toEqual(["4", "5", "6"]);
+    // The incident is stamped with the frame's first receipt, so receipt
+    // instants never run backwards; each accepted event keeps its own.
+    expect(published[0]?.receivedAt).toBe(first.receivedAt);
+    expect(published[0]?.receivedMonotonicNs).toBe(first.receivedMonotonicNs);
+    expect(published.slice(1).map((envelope) => envelope.receivedAt)).toEqual([
+      first.receivedAt,
+      third.receivedAt,
+    ]);
+    // The accepted events keep their raw-frame causation; the incident has none.
+    expect(published[0]?.causationId).toBeUndefined();
+    expect(published[1]?.causationId).toBe(`raw:${EPOCH}:7`);
+    expect(published[2]?.causationId).toBe(`raw:${EPOCH}:7`);
+    expect(new Set(published.map((envelope) => envelope.eventId)).size).toBe(3);
+    const payload = published[0]?.payload as { reasonCode: string; detail: string; affectedMarketIds?: unknown };
+    expect(payload.reasonCode).toBe("GATEWAY_ENVELOPE_REJECTED");
+    expect(payload.affectedMarketIds).toBeUndefined();
+    expect(payload.detail).toContain("1 of a frame's 3 events");
+    expect(rejections).toHaveLength(1);
+    expect(incidents).toEqual(["GATEWAY_ENVELOPE_REJECTED"]);
+    expect(dispatcher.metrics()).toEqual({ dispatched: 3, envelopeRejections: 1 });
+  });
+
+  it("a later frame's loss inside the same epoch opens no second incident; its accepted events still publish", async () => {
+    const incidents: string[] = [];
+    const { transport, publisher, dispatcher } = build({
+      onIncident: (incident) => incidents.push(incident.reasonCode),
+    });
+    void dispatcher.dispatchFrame([{ draft: draftNumbered(1) }, { draft: badDraft }]);
+    void dispatcher.dispatchFrame([{ draft: draftNumbered(2) }, { draft: badDraft }]);
+    await publisher.settle();
+    expect(incidents).toEqual(["GATEWAY_ENVELOPE_REJECTED"]);
+    expect(transport.published("market").map((envelope) => envelope.eventType)).toEqual([
+      "DataQualityIncidentOpened",
+      "FeedStale",
+      "FeedStale",
+    ]);
+    expect(dispatcher.metrics().envelopeRejections).toBe(2);
+  });
+
+  it("an empty frame publishes nothing", async () => {
+    const { transport, publisher, dispatcher } = build();
+    expect(dispatcher.dispatchFrame([])).toEqual([]);
+    await publisher.settle();
+    expect(transport.published("market")).toHaveLength(0);
+  });
+});

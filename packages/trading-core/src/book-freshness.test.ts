@@ -1016,6 +1016,26 @@ describe("backward compatibility: a document with no bookFreshness block", () =>
     expect(evaluations(absent).some((evaluation) => evaluation.stale)).toBe(true);
   });
 
+  it("r6 O-R6-I1: under LAST_CHANGE the loop records no delivery session for a book; under CONNECTION_CONFIRMED it does", async () => {
+    const sessionsOf = (parts: Run) => {
+      const market = parts.trader.markets.get(MARKET_ID);
+      return [market?.bookSession("YES"), market?.bookSession("NO")];
+    };
+    const absent = await run({ paramsVersion: 1 }, quietYesTimeline());
+    const lastChange = await run({ basis: "LAST_CHANGE", paramsVersion: 1 }, quietYesTimeline());
+    const confirmed = await run({ basis: "CONNECTION_CONFIRMED" }, quietYesTimeline());
+    expect(sessionsOf(absent)).toEqual([undefined, undefined]);
+    expect(sessionsOf(lastChange)).toEqual([undefined, undefined]);
+    const session = sessionKeyOf({
+      eventType: "BookSnapshot",
+      gatewayEpoch: A1.epoch,
+      connectionId: A1.connectionId,
+      subscriptionGeneration: A1.generation,
+    });
+    expect(session).toBeDefined();
+    expect(sessionsOf(confirmed)).toEqual([session, session]);
+  });
+
   it("refuses an unknown basis and an unknown key in the block", () => {
     const withBlock = (block: unknown) => ({ ...traderConfig({ paramsVersion: 1 }), bookFreshness: block });
     expect(parseTraderConfig(withBlock({ basis: "HEARTBEAT" })).ok).toBe(false);

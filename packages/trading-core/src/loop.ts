@@ -4059,7 +4059,9 @@ export class CoreLoop {
 
   /**
    * `THROUGHPUT-1c` (ADR-023): records the delivery session of an update the
-   * book just ACCEPTED, against the outcome its token names.
+   * book just ACCEPTED, against the outcome its token names. Nothing is
+   * recorded under `LAST_CHANGE`, which never reads it (ADR-023 D4; review
+   * round 6, O-R6-I1).
    */
   #noteBookSession(
     market: MarketState,
@@ -4071,6 +4073,7 @@ export class CoreLoop {
       readonly subscriptionGeneration?: number;
     },
   ): void {
+    if (this.#freshnessBasis !== "CONNECTION_CONFIRMED") return;
     const outcome = market.outcomeOfToken(readString(envelope.payload, "tokenId"));
     if (outcome === undefined) return;
     market.noteBookSession(outcome, sessionKeyOf(envelope));

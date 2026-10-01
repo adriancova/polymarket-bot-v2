@@ -37,10 +37,23 @@
  *   evaluation, and the YES book is judged by its own last change (3.1 s):
  *   nothing is admitted, under either basis.
  *
+ * Review round 6, finding R6-H1, is the same loss through the GATEWAY'S OWN
+ * door: a YES `price_change` the adapter accepts (its `timestamp` lies inside
+ * the adapter's epoch range) but whose completed envelope the gateway's
+ * frozen contract refuses, because the ISO form of that instant has a
+ * five-digit year. `253402300800000` (year 10000 in milliseconds) and the
+ * frame's own instant sent in MICROSECONDS both do it. At `74e17ca` the
+ * dispatcher refused the event after the frame's NO snapshot was already
+ * submitted, so `[NO book, odd YES change]` approved two orders under
+ * `CONNECTION_CONFIRMED`. The gateway now validates every event of a frame
+ * before it publishes any, and opens `GATEWAY_ENVELOPE_REJECTED` ahead of
+ * the frame (`dispatcher.ts` `dispatchFrame`, `feeds/polymarket.ts`): nothing
+ * is admitted, under either basis, in either order.
+ *
  * PAPER only. No network, no credential, no signer, no real order.
  */
 
-import type { EventEnvelope } from "@polymarket-bot/domain";
+import { IsoTimestampSchema, type EventEnvelope } from "@polymarket-bot/domain";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { describe, expect, it } from "vitest";
 
@@ -262,4 +275,81 @@ describe("THROUGHPUT-1c r1 (X8) — a partly malformed frame cannot vouch for a 
     // Refused for the right reason: the YES book is judged by its own 3.1 s.
     expect(confirmed.staleBookPauses).toBeGreaterThan(0);
   });
+});
+
+/**
+ * A well-formed YES `price_change` (SELL 0.34 to size 0: it removes the very
+ * ask the entry would trade against) whose only oddity is its `timestamp`.
+ */
+function oddTimestampYesChange(timestamp: string): unknown {
+  return {
+    event_type: "price_change",
+    market: CONDITION_ID,
+    timestamp,
+    price_changes: [{ asset_id: YES_TOKEN, price: "0.34", size: "0", side: "SELL", hash: "h-odd" }],
+  };
+}
+
+/** Venue timestamps the adapter accepts and the gateway's envelope contract refuses (R6-H1). */
+const ENVELOPE_REFUSED_TIMESTAMPS: readonly (readonly [string, string])[] = [
+  ["year 10000 in milliseconds", "253402300800000"],
+  ["the frame's instant in microseconds", String((Date.parse(T_OPEN) + 4_100) * 1_000)],
+];
+
+const FRAME_ORDERS: readonly (readonly [string, (change: unknown) => readonly unknown[]])[] = [
+  ["NO book first", (change) => [noBook(), change]],
+  ["YES change first", (change) => [change, noBook()]],
+];
+
+function envelopeRejection(published: readonly EventEnvelope<unknown>[]): number {
+  return published.findIndex(
+    (envelope) =>
+      envelope.eventType === "DataQualityIncidentOpened" &&
+      (envelope.payload as { reasonCode?: unknown }).reasonCode === "GATEWAY_ENVELOPE_REJECTED",
+  );
+}
+
+describe("THROUGHPUT-1c r6 (R6-H1) — an event the gateway's envelope contract refuses cannot leave its frame vouching for a stale book", () => {
+  it("the trigger: each timestamp's ISO form has a five-digit year, which the frozen contract refuses", () => {
+    for (const [, timestamp] of ENVELOPE_REFUSED_TIMESTAMPS) {
+      const iso = new Date(Number(timestamp)).toISOString();
+      expect(iso.startsWith("+0"), iso).toBe(true);
+      expect(IsoTimestampSchema.safeParse(iso).success, iso).toBe(false);
+    }
+  });
+
+  for (const [label, timestamp] of ENVELOPE_REFUSED_TIMESTAMPS) {
+    for (const [order, frame] of FRAME_ORDERS) {
+      it(`${label}, ${order}: GATEWAY_ENVELOPE_REJECTED is published BEFORE the frame's accepted NO snapshot`, async () => {
+        const published = await gatewayStream(frame(oddTimestampYesChange(timestamp)));
+        const incident = envelopeRejection(published);
+        const noSnapshot = published.findIndex(
+          (envelope) =>
+            envelope.eventType === "BookSnapshot" && (envelope.payload as { tokenId?: unknown }).tokenId === NO_TOKEN,
+        );
+        expect(incident, "the envelope rejection is published").toBeGreaterThan(-1);
+        expect(noSnapshot, "the frame's accepted NO snapshot is published").toBeGreaterThan(-1);
+        expect(incident, "the loss precedes the frame's accepted event").toBeLessThan(noSnapshot);
+        const incidentEnvelope = published[incident] as EventEnvelope<unknown>;
+        const snapshotEnvelope = published[noSnapshot] as EventEnvelope<unknown>;
+        expect((incidentEnvelope.payload as { affectedMarketIds?: unknown }).affectedMarketIds).toBeUndefined();
+        // Stream order: strictly increasing sequence, receipt instants never backwards.
+        expect(BigInt(incidentEnvelope.ingestSeq) < BigInt(snapshotEnvelope.ingestSeq)).toBe(true);
+        expect(Date.parse(incidentEnvelope.receivedAt) <= Date.parse(snapshotEnvelope.receivedAt)).toBe(true);
+        // The refused change itself is not published.
+        expect(published.filter((envelope) => envelope.eventType === "BookLevelChanged")).toHaveLength(0);
+      });
+
+      it(`${label}, ${order}: no order is admitted under either basis`, async () => {
+        const published = await gatewayStream(frame(oddTimestampYesChange(timestamp)));
+        const confirmed = await trade(published, "CONNECTION_CONFIRMED");
+        const lastChange = await trade(published, "LAST_CHANGE");
+        expect([confirmed.orders, lastChange.orders], "orders after the gateway refused a YES update").toEqual([0, 0]);
+        expect([confirmed.approvals, lastChange.approvals]).toEqual([0, 0]);
+        // Refused for the right reason: the YES book is judged by its own 3.1 s.
+        expect(confirmed.staleBookPauses).toBeGreaterThan(0);
+        expect(lastChange.staleBookPauses).toBeGreaterThan(0);
+      });
+    }
+  }
 });

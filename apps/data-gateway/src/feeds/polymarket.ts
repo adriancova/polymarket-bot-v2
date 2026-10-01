@@ -29,6 +29,29 @@
  * snapshot having been fetched and applied, because only this driver calls
  * `markResynchronized` and it does so only after `fetchSnapshots` resolved.
  *
+ * ## One socket message is dispatched as one frame (`THROUGHPUT-1c` r6, R6-H1)
+ *
+ * The trader may read a market-channel frame's events as evidence that the
+ * delivery path is whole (ADR-023). So a frame that loses an event in the
+ * gateway must say so BEFORE any of its events: the adapter already reports
+ * its own normalization problems first (`connection.ts` `#onMessage`, r1
+ * X8), and this driver hands the dispatcher each inbound message's
+ * market-data events as ONE frame ({@link GatewayDispatcher.dispatchFrame}),
+ * which validates every envelope before it submits any and opens
+ * `GATEWAY_ENVELOPE_REJECTED` ahead of the frame when one is refused. The
+ * frame's bounds come from the socket itself: the adapter handles one
+ * message synchronously inside the socket's `onMessage` (raw frame, problems,
+ * events, all in that call; the publisher's frame-atomic runs rely on the
+ * same fact), so {@link PolymarketFeedDriver.frameBoundedSocketFactory} wraps
+ * that callback in a begin/end pair and the events emitted between them are
+ * buffered and dispatched together when it returns, or when anything that is
+ * not one of the frame's events (a feed-health event, the next raw frame)
+ * arrives first, so the stream's order is unchanged. Nothing waits on a
+ * timer or a later message. When every envelope is valid, the published
+ * stream is byte-identical to dispatching each event as it arrived. REST
+ * recovery snapshots carry no session (ADR-023 D2 rule 2), are fetched
+ * outside any socket message, and are dispatched one by one, as before.
+ *
  * ## Transport observations are not market-data incidents
  *
  * `PRE_SUBSCRIPTION_FRAME` and `STALE_CONNECTION_FRAME` are statements about
@@ -45,12 +68,14 @@ import type {
   PublicBookSnapshotFetcher,
   PublicMarketFeed,
   PublicMarketProblem,
+  PublicWebSocketFactory,
   RawMarketFrame,
 } from "@polymarket-bot/polymarket-public";
 import { dataQualityIncidentFromProblem } from "@polymarket-bot/polymarket-public";
 import type { IncidentSeverity } from "@polymarket-bot/domain";
 
-import type { GatewayDispatcher } from "../dispatcher.js";
+import type { DispatchContext, FrameDispatchEntry, GatewayDispatcher } from "../dispatcher.js";
+import type { EnvelopeDraft } from "../envelope.js";
 import type { GatewayJournal } from "../journal.js";
 import type { CancelScheduled, GatewayClock, GatewayTimers } from "../ports.js";
 import { isoFromMs, takeReceipt } from "../ports.js";
@@ -116,6 +141,13 @@ export class PolymarketFeedDriver {
   #recovering = false;
   #retryTimer: CancelScheduled | undefined;
   #stopped = false;
+  /**
+   * The market-data events of the socket message being handled, not yet
+   * dispatched; `undefined` outside a message (r6, R6-H1; module header).
+   */
+  #frame: FrameDispatchEntry[] | undefined;
+  /** How many socket callbacks are open (more than one only if a socket re-enters). */
+  #frameDepth = 0;
 
   #framesRecorded = 0;
   #framesRefusedByWal = 0;
@@ -141,8 +173,65 @@ export class PolymarketFeedDriver {
     this.#feed = feed;
   }
 
+  /**
+   * The socket factory to hand the adapter: `inner`, with every inbound
+   * message's handling bracketed as one frame (module header, "One socket
+   * message is dispatched as one frame"). Every other callback passes
+   * through untouched. The bracket closes in a `finally`, so a throw from the
+   * adapter still dispatches what the frame had emitted, as it always was.
+   */
+  frameBoundedSocketFactory(inner: PublicWebSocketFactory): PublicWebSocketFactory {
+    return (url, handlers) =>
+      inner(url, {
+        onOpen: () => {
+          handlers.onOpen();
+        },
+        onMessage: (data) => {
+          this.#beginFrame();
+          try {
+            handlers.onMessage(data);
+          } finally {
+            this.#endFrame();
+          }
+        },
+        onClose: (info) => {
+          handlers.onClose(info);
+        },
+        onError: (error) => {
+          handlers.onError(error);
+        },
+      });
+  }
+
+  #beginFrame(): void {
+    // A message handled inside another (never seen; a re-entrant socket)
+    // first releases the outer one's events, so order is kept.
+    this.#flushFrame();
+    this.#frameDepth += 1;
+    this.#frame = [];
+  }
+
+  #endFrame(): void {
+    this.#flushFrame();
+    this.#frameDepth -= 1;
+    // Back inside an outer callback, its later events are still buffered.
+    this.#frame = this.#frameDepth > 0 ? [] : undefined;
+  }
+
+  /** Dispatches the buffered frame, if any, as ONE frame. */
+  #flushFrame(): void {
+    const frame = this.#frame;
+    if (frame === undefined || frame.length === 0) return;
+    this.#frame = [];
+    this.#eventsDispatched += frame.length;
+    void this.#options.dispatcher.dispatchFrame(frame);
+  }
+
   /** The feed's `onRawFrame` handler: WAL first, always. */
   onRawFrame(frame: RawMarketFrame): void {
+    // A new raw frame's WAL record draws a sequence, so any earlier frame's
+    // buffered events go first, exactly as they did when dispatched at once.
+    this.#flushFrame();
     const receipt = takeReceipt(this.#options.clock);
     const outcome = this.#options.journal.record({
       source: "polymarket",
@@ -179,22 +268,28 @@ export class PolymarketFeedDriver {
       this.#suppressedUnrecorded += 1;
       return;
     }
-    void this.#options.dispatcher.dispatch(
-      {
-        eventType: event.eventType,
-        schemaVersion: event.schemaVersion,
-        source: event.provenance.source,
-        sourceChannel: event.provenance.sourceChannel,
-        venueTimestamp: event.provenance.venueTimestamp,
-        connectionId: event.provenance.connectionId,
-        subscriptionGeneration: event.provenance.subscriptionGeneration,
-        payload: event.payload,
-      },
-      {
-        receipt,
-        ...(raw !== undefined && raw.recorded ? { rawFrameIngestSeq: raw.ingestSeq } : {}),
-      },
-    );
+    const draft: EnvelopeDraft = {
+      eventType: event.eventType,
+      schemaVersion: event.schemaVersion,
+      source: event.provenance.source,
+      sourceChannel: event.provenance.sourceChannel,
+      venueTimestamp: event.provenance.venueTimestamp,
+      connectionId: event.provenance.connectionId,
+      subscriptionGeneration: event.provenance.subscriptionGeneration,
+      payload: event.payload,
+    };
+    const context: DispatchContext = {
+      receipt,
+      ...(raw !== undefined && raw.recorded ? { rawFrameIngestSeq: raw.ingestSeq } : {}),
+    };
+    if (isMarketData && this.#frame !== undefined) {
+      // One of the socket message's own events: dispatched with its frame.
+      this.#frame.push({ draft, context });
+      return;
+    }
+    // Anything else keeps its place in the stream behind what was buffered.
+    this.#flushFrame();
+    void this.#options.dispatcher.dispatch(draft, context);
     this.#eventsDispatched += 1;
 
     if (event.eventType === "FeedStale") {
@@ -349,6 +444,7 @@ export class PolymarketFeedDriver {
   }
 
   stop(): void {
+    this.#flushFrame();
     this.#stopped = true;
     this.#retryTimer?.();
     this.#retryTimer = undefined;
