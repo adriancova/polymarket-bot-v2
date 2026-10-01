@@ -45,6 +45,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `STORAGE-1` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`STORAGE-GOV`**: Ready (authorized) 2026-10-01 by the orchestrator. Docs only: an ADR-028 amendment that records the retention-safety rules `STORAGE-1` implemented and its reviewers accepted, and where it stops short of the ADR (`STORAGE-1` follow_up 1). It may edit only `docs/adr/ADR-028-*.md` and, if needed, the ADR-028 row of `docs/adr/README.md`. It decides nothing new. Verifiers: Opus and gpt-6-astra, reconciled.
 - **`STORAGE-1b`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `STORAGE1-LOCK-LOWS`: pin the cycle lock's refusal on other open errors, and make the lock exclude every participant on a host whatever it can read of the boot id. Paths: `apps/research-worker/**` only. Verifiers: Opus and gpt-6-astra, reconciled (the lock guards evidence deletion).
+- **`WP-300b`**: Ready (authorized) 2026-10-01 by the orchestrator. It closes `WP300-R10-01` and adds the fetch tripwire to `venue-citations.test.ts` (`CI-4` follow-up). Paths: `packages/inventory/**` (not its `package.json`), `test/unit/inventory/**`, `test/contract/wallet-operations/**`. Verifiers: Opus and gpt-6-astra, reconciled (collateral reservations).
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`. It merges only after the user ratifies ADR-023. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
   - **Interim rulings (orchestrator, 2026-10-01), each the most conservative option, pending the user's ADR-023 ratification:**
@@ -170,7 +171,8 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
 | `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | Complete (2026-10-01) | `a22502b` | [STORAGE-1](docs/handoffs/STORAGE-1.md) |
 | `STORAGE-GOV` | ADR-028 amendment: the retention-safety rules as implemented | **Ready (authorized)** 2026-10-01 | — | — |
-| `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | **Ready (authorized)** 2026-10-01 | — | — |
+| `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | **Accepted** (joint ACCEPT r1, `c8b6f6d`); PR pending | — | — |
+| `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | **Ready (authorized)** 2026-10-01 | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
