@@ -375,19 +375,80 @@ describe("an unclassified trader window holds the evidence its durable rows alre
     expect(reads).toBe(0);
   });
 
-  it("stays unclassified, holding nothing more, when the rows cannot be read while it is blocked; a read failure of a classifiable window propagates", async () => {
-    const failing = {
-      ...staticEvidenceSource({ frontiers: new Map([["a", frontier], ["b", dispatchFrontier({ [E]: "5" })]]), evidence: new Map() }),
+  // Round 3, L1 (flipped): a read failure is never "nothing more to hold".
+  // Blocked or classifiable, a window whose frontier or evidence cannot be read
+  // is marked evidence-unreadable, and the planner keeps every segment until
+  // its evidence is settled (`evidence-holds.ts`).
+  it("marks a window whose rows cannot be read evidence-unreadable, blocked or classifiable, frontier or evidence (round 3, L1)", async () => {
+    const failingEvidence = (frontiers: Record<string, ReturnType<typeof dispatchFrontier>>) => ({
+      ...staticEvidenceSource({ frontiers: new Map(Object.entries(frontiers)), evidence: new Map() }),
       async marketEvidence(): Promise<MarketEvidence> {
         throw new Error("connect ECONNREFUSED");
       },
+    });
+    const options = { nowMs: END + 10 * MIN, leadInMs: LEAD_IN, durabilityGraceMs: GRACE, wal: withEarlySource };
+    const unreadable = { state: "unclassified", holdRanges: [], evidenceUnreadable: expect.stringMatching(/ECONNREFUSED/u) };
+    // Blocked: instance b has not passed the window.
+    const blocked = await classifyWindow(WINDOW, { ...options, evidence: failingEvidence({ a: frontier, b: dispatchFrontier({ [E]: "5" }) }) });
+    expect(blocked).toMatchObject(unreadable);
+    // Otherwise classifiable: it no longer throws, it is marked.
+    const classifiable = await classifyWindow(WINDOW, { ...options, evidence: failingEvidence({ a: frontier, b: frontier }) });
+    expect(classifiable).toMatchObject(unreadable);
+    // The frontier itself cannot be read.
+    const frontierDown = {
+      async dispatchFrontiers(): Promise<never> {
+        throw new Error("connect ECONNREFUSED (frontier)");
+      },
+      async marketEvidence(): Promise<MarketEvidence> {
+        return { ...NONE, fillsAtMs: [START + MIN], intents: [located] };
+      },
     };
-    const blocked = await classifyWindow(WINDOW, { nowMs: END + 10 * MIN, leadInMs: LEAD_IN, durabilityGraceMs: GRACE, evidence: failing, wal: withEarlySource });
-    expect(blocked).toMatchObject({ state: "unclassified", reason: expect.stringMatching(/instance b/u), holdRanges: [] });
-    const passed = { ...failing, dispatchFrontiers: staticEvidenceSource({ frontiers: new Map([["a", frontier], ["b", frontier]]), evidence: new Map() }).dispatchFrontiers };
-    await expect(
-      classifyWindow(WINDOW, { nowMs: END + 10 * MIN, leadInMs: LEAD_IN, durabilityGraceMs: GRACE, evidence: passed, wal: withEarlySource }),
-    ).rejects.toThrow(/ECONNREFUSED/u);
+    expect(await classifyWindow(WINDOW, { ...options, evidence: frontierDown })).toMatchObject(unreadable);
+    // A window whose rows read is never marked.
+    const readable = await classify({ wal: withEarlySource, frontiers: { a: frontier, b: dispatchFrontier({ [E]: "5" }) } });
+    expect(readable).not.toHaveProperty("evidenceUnreadable");
+  });
+});
+
+describe("a source event whose segment is gone is resolved through the window's own pin (round 3, L3)", () => {
+  // The source's whole epoch is gone from disk: the WAL alone reads it as pending.
+  const sourceInGoneEpoch = { evaluatedAtMs: START + 3 * MIN, sourceEventId: "gone", gatewayEpoch: "epoch-gone", ingestSeq: "2" };
+  const walWithoutSourceEpoch = wal([
+    seg({ index: 0, first: "1", last: "13", fromMs: START - 20 * MIN, toMs: START + 5 * MIN }),
+    seg({ index: 1, first: "14", last: "23", fromMs: START + 5 * MIN, toMs: END + 30_000 }),
+    seg({ index: 2, first: "24", last: "33", fromMs: END + 2 * MIN, toMs: END + 10 * MIN }),
+  ]);
+  const frontiers = { a: dispatchFrontier({ [E]: "33" }), b: dispatchFrontier({ [E]: "33" }) };
+  const evidence: MarketEvidence = { ...NONE, fillsAtMs: [START + MIN], intents: [sourceInGoneEpoch] };
+
+  it("classifies the window when its own pin holds the source, and waits when nothing does", async () => {
+    expect(locateSourceEvent(walWithoutSourceEpoch, "epoch-gone", "2")).toMatchObject({ status: "pending" });
+    const waiting = await classify({ wal: walWithoutSourceEpoch, frontiers, evidence });
+    expect(waiting).toMatchObject({ state: "unclassified", reason: expect.stringMatching(/no sealed segment of epoch epoch-gone/u) });
+    const asked: string[] = [];
+    const resolved = await classifyWindow(WINDOW, {
+      nowMs: END + 10 * MIN,
+      leadInMs: LEAD_IN,
+      durabilityGraceMs: GRACE,
+      evidence: staticEvidenceSource({ frontiers: new Map(Object.entries(frontiers)), evidence: new Map([["m", evidence]]) }),
+      wal: walWithoutSourceEpoch,
+      pinnedSource: (window, event) => {
+        asked.push(`${window.windowId}:${String(event.sourceEventId)}`);
+        return event.sourceEventId === "gone";
+      },
+    });
+    expect(resolved).toMatchObject({ state: "classified", pinClass: "fill", pinFromMs: START - LEAD_IN, pinToMs: END, sourceEvents: [sourceInGoneEpoch] });
+    expect(asked).toStrictEqual(["w:gone"]);
+    // A resolver that holds nothing changes nothing.
+    const unresolved = await classifyWindow(WINDOW, {
+      nowMs: END + 10 * MIN,
+      leadInMs: LEAD_IN,
+      durabilityGraceMs: GRACE,
+      evidence: staticEvidenceSource({ frontiers: new Map(Object.entries(frontiers)), evidence: new Map([["m", evidence]]) }),
+      wal: walWithoutSourceEpoch,
+      pinnedSource: () => false,
+    });
+    expect(unresolved).toMatchObject({ state: "unclassified" });
   });
 });
 

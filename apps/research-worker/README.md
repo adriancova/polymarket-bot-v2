@@ -39,12 +39,20 @@ One run does, in order:
    its decisions' dispatch position (`H1R1-PROVENANCE`), no trader-responsible window
    classifies, so nothing it overlaps expires.** While a window is unclassified, whatever its
    durable rows already show is held as well: the range its pin would hold now, the whole
-   segment of every source event already located included.
+   segment of every source event already located included. Those holds are **durable**
+   (`<state dir>/evidence-holds.json`): a later cycle keeps them whether or not it can read
+   the trader's rows, and whether or not the window is still registered, until the window
+   is classified and its pin — verified, with its whole chain inside — covers them. A window
+   whose rows cannot be read (the database down, a timeout) and whose evidence is not yet
+   settled that way keeps **every** segment: what it holds is unknown. A source event whose
+   segment, or whole gateway epoch, has expired under the window's own pin is found through
+   that pin's verified manifests.
 3. **Pins.** A window with a fill (kept forever), an intent, a refusal or a halt (30 days),
    and every operator pin, is copied exactly — whole WAL segments, through the `WP-130`
    compactor — under `pins/<pinId>/`. A pin, once extracted, is a durable fact: a window
    whose existing pin already holds everything it requires stays bound to that pin, even
-   after the segment holding its chain's source event has expired under it.
+   after the segment holding its chain's source event has expired under it. No window pin
+   is extracted in a cycle whose pin catalog does not read in full.
 4. **Plan.** Every sealed segment is decided, with every reason it is kept. A segment may
    expire only when its newest frame is at least 72 h old, its research tier verifies,
    every market it names is registered and every frame could be identified, every window it
@@ -52,7 +60,11 @@ One run does, in order:
    operator pin covers it. "Every overlapping pin" is every pin in the store, not only the
    ones this cycle derives: a window that is unclassified this cycle (the trader database
    unreachable, say), re-derived or re-registered still has its pin verified and named in
-   the receipt. A pin record that does not read keeps every segment.
+   the receipt. A pin record that does not read keeps every segment; so does a window pin
+   record whose id no longer digests its own window, class, range and source events. A
+   segment a pin record lists is verified against that pin whatever the record's range
+   says, and kept when that range does not cover it. Holds that do not read, or cannot be
+   written, keep every segment; the file is then never overwritten.
 5. **Expiry**, only in `execute` mode: the plan is written durably to the state directory
    first (never replacing an existing plan), then, under the operator-pin lock, each segment
    is re-decided, its bytes proved against the research tier and the pins, the operator pins
@@ -68,6 +80,10 @@ reported as `walOrphanSidecars` and never planned; it may be removed by hand.
 
 It prints one JSON report and exits. Run it on a timer.
 
+`<state dir>/evidence-holds.json` is never edited by hand in normal operation. Removing it
+releases every hold without verifying anything, so do that only as a deliberate decision,
+after checking that every window it names is pinned or has no evidence.
+
 ### Configuration
 
 | Variable | Default | Meaning |
@@ -75,7 +91,7 @@ It prints one JSON report and exits. Run it on a timer.
 | `RESEARCH_WORKER_WAL_ROOT` | required | The gateway's WAL root (`<root>/<gatewayEpoch>/…`) |
 | `RESEARCH_WORKER_OBJECT_STORE_ROOT` | required | The filesystem object store |
 | `RESEARCH_WORKER_EXPIRY_MODE` | `dry-run` | `execute` deletes, subject to the marker |
-| `RESEARCH_WORKER_STATE_DIR` | none | Where durable expiry plans live; required for `execute` |
+| `RESEARCH_WORKER_STATE_DIR` | none | Where durable expiry plans, the clock guard's state and the evidence holds live; required for `execute` |
 | `RESEARCH_WORKER_WINDOW_REGISTRY` | none | The market windows (below). With none, every segment that names a Polymarket market is kept |
 | `RESEARCH_WORKER_OPERATOR_PINS` | none | Operator pins (below) |
 | `RESEARCH_WORKER_TRADER_DATABASE_URL` | none | The trader's PostgreSQL, read-only. With none, no trader window classifies |

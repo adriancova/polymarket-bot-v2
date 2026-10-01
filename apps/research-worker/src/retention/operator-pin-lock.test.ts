@@ -165,3 +165,36 @@ describe("one file, one lock, however it is spelled (round 2, K6)", () => {
     expect(await operatorPinLockPath(join(root, "new.json"))).toBe(join(await realpath(root), "new.json.lock"));
   });
 });
+
+describe("a pin file that does not exist yet is named through its directory's canonical path (round 3, L5)", () => {
+  it("gives a symbolically linked directory and its target the same lock while the file is absent, and serializes holders through both", async () => {
+    await mkdir(join(root, "real"));
+    await symlink(join(root, "real"), join(root, "alias-dir"));
+    const throughTarget = join(root, "real", "pins.json");
+    const throughAlias = join(root, "alias-dir", "pins.json");
+    const canonical = join(await realpath(join(root, "real")), "pins.json");
+    // The file is absent: only its directory can be resolved.
+    expect(await canonicalOperatorPinsPath(throughAlias)).toBe(canonical);
+    expect(await operatorPinLockPath(throughAlias)).toBe(`${canonical}.lock`);
+    expect(await operatorPinLockPath(throughAlias)).toBe(await operatorPinLockPath(throughTarget));
+    expect((await operatorPinFile(throughAlias)).path).toBe(canonical);
+    // The first `storage pin`, given the alias, and an expiry given the target share one lock.
+    const events: string[] = [];
+    const viaTarget = (await operatorPinFile(throughTarget, { pollMs: 5 })).lock;
+    const viaAlias = await operatorPinFile(throughAlias, { pollMs: 5 });
+    const expiry = viaTarget.withLock(async () => {
+      events.push("expiry-start");
+      await sleep(60);
+      events.push("expiry-end");
+    });
+    await sleep(10);
+    const publication = publishOperatorPin({
+      operatorPinsPath: viaAlias.path,
+      lock: viaAlias.lock,
+      pin: { pinId: "first", from: "2026-01-01T00:00:00Z", to: "2026-01-01T01:00:00Z", reason: "review" },
+    }).then(() => events.push("published"));
+    await Promise.all([expiry, publication]);
+    expect(events).toStrictEqual(["expiry-start", "expiry-end", "published"]);
+    expect((await loadOperatorPins(throughTarget)).map((pin) => pin.pinId)).toStrictEqual(["first"]);
+  });
+});

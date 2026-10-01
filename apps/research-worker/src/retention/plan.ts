@@ -22,7 +22,12 @@
  *    potential range, or a range its durable rows already show holds chain
  *    evidence (`holdRanges`). The names are read from the VERIFIED
  *    research-tier manifest (`marketIdentities`, taken from every frame),
- *    never from the unverified pointer.
+ *    never from the unverified pointer. The holds are durable
+ *    (`evidence-holds.ts`): a hold recorded in any earlier cycle keeps the
+ *    segment until its window is settled, whether or not the window can be
+ *    read, or is registered, now; a window whose rows cannot be read and that
+ *    is not settled keeps EVERY segment, since what it holds is unknown; and
+ *    holds that are not durably known keep every segment.
  * 4. **Every pin whose range overlaps it is extracted and verified** (2.4):
  *    every pin this cycle derives AND every pin already extracted into the
  *    store (`readExtractedPins`) — a pin is a durable fact, so a window that
@@ -31,7 +36,9 @@
  *    record exists, its manifests verify, every source event it had to hold
  *    lies inside it, and it holds this segment with the same two digests. A
  *    pin record that exists but does not read keeps every segment: its range
- *    is unknown.
+ *    is unknown. A record's range is not trusted alone: a segment its datasets
+ *    list is obliged to it whatever its range says, and kept when that range
+ *    does not cover it (round 3, L2).
  * 5. **No operator pin covers it** (2.5).
  *
  * Decisions 2.6 and 2.7 — the bytes are the ones extracted, and the file is
@@ -56,6 +63,7 @@ import type { InventoriedSegment, WalInventory } from "../research-tier/inventor
 import { epochMsOf } from "../research-tier/sampler.js";
 import type { WindowClassification } from "./classify.js";
 import { potentialRange } from "./classify.js";
+import type { EvidenceHoldState } from "./evidence-holds.js";
 import type { ExtractedPins, PinRecord } from "./pins.js";
 import { overlaps, recordHoldsSourceEvents, verifyPinManifests } from "./pins.js";
 import type { PinSpec } from "./pins.js";
@@ -103,6 +111,8 @@ export type ExpiryPlanningInput = {
   readonly pinRecords: ReadonlyMap<string, PinRecord | null>;
   /** Every pin already extracted into the store, whatever this cycle derives (`readExtractedPins`). */
   readonly extractedPins: ExtractedPins;
+  /** The durable evidence holds, with this cycle's classifications remembered (`evidence-holds.ts`). */
+  readonly evidenceHolds: EvidenceHoldState;
   /** A shared cache of verified research-tier datasets; one is made when absent. */
   readonly verifiedResearch?: (manifestObjectKey: string) => Promise<VerifiedResearchTierDataset | Error>;
 };
@@ -151,24 +161,37 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     readonly record: PinRecord | null;
     /** A derived spec's source events, which its record must have been extracted to hold. */
     readonly sourceEvents: PinSpec["sourceEvents"];
+    /** Every segment its record's datasets list: each is obliged to it, whatever its range says. */
+    readonly listed: ReadonlySet<string>;
   };
+  const listedBy = (record: PinRecord | null): ReadonlySet<string> =>
+    new Set(record === null ? [] : record.datasets.flatMap((dataset) => dataset.segmentIds));
   const obligations: PinObligation[] = [];
   const obliged = new Set<string>();
   for (const spec of input.pinSpecs) {
     if (spec.origin === "operator" || obliged.has(spec.pinId)) continue;
     obliged.add(spec.pinId);
+    const record = input.pinRecords.get(spec.pinId) ?? null;
     obligations.push({
       pinId: spec.pinId,
       fromMs: spec.fromMs,
       toMs: spec.toMs,
-      record: input.pinRecords.get(spec.pinId) ?? null,
+      record,
       sourceEvents: spec.sourceEvents,
+      listed: listedBy(record),
     });
   }
   for (const record of input.extractedPins.records) {
     if (obliged.has(record.pinId)) continue;
     obliged.add(record.pinId);
-    obligations.push({ pinId: record.pinId, fromMs: Date.parse(record.from), toMs: Date.parse(record.to), record, sourceEvents: [] });
+    obligations.push({
+      pinId: record.pinId,
+      fromMs: Date.parse(record.from),
+      toMs: Date.parse(record.to),
+      record,
+      sourceEvents: [],
+      listed: listedBy(record),
+    });
   }
 
   const decisions: SegmentDecision[] = [];
@@ -264,17 +287,41 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
         reasons.push(`unknown-market: Gamma market ${gammaMarketId} belongs to no registered window`);
       }
     }
+    const heldThisCycle = new Set<string>();
     for (const window of input.windows) {
       const classification = input.classifications.get(window.windowId);
       if (classification === undefined || classification.state === "unclassified") {
         const why = classification === undefined ? "" : ` (${classification.reason})`;
         if (overlaps(span, potentialRange(window, input.leadInMs, input.durabilityGraceMs))) {
           reasons.push(`unclassified-window: ${window.windowId}${why}`);
+          heldThisCycle.add(window.windowId);
         } else if (classification !== undefined && classification.holdRanges.some((range) => overlaps(span, range))) {
           // Its durable rows already show chain evidence here (a located source
           // event's segment, say): held whatever else is still unknown.
           reasons.push(`unclassified-window: ${window.windowId} holds chain evidence in this segment${why}`);
+          heldThisCycle.add(window.windowId);
         }
+        // Its rows could not be read and its evidence is not settled: what it
+        // holds is unknown, and a chain source can lie in any earlier segment.
+        if (classification?.state === "unclassified" && classification.evidenceUnreadable !== undefined) {
+          if (input.evidenceHolds.windows.get(window.windowId)?.settled !== true) {
+            reasons.push(`evidence-unreadable: ${window.windowId}'s rows could not be read and its evidence is not settled (${classification.evidenceUnreadable})`);
+          }
+        }
+      }
+    }
+    // -- The durable holds: whatever this cycle reads, or registers. ---------
+    if (input.evidenceHolds.failure !== null) {
+      reasons.push(`evidence-holds-unknown: ${input.evidenceHolds.failure}`);
+    }
+    for (const [windowId, held] of input.evidenceHolds.windows) {
+      if (!heldThisCycle.has(windowId) && held.holds.some((range) => overlaps(span, range))) {
+        reasons.push(`evidence-hold: ${windowId} holds chain evidence in this segment until its pin holds it`);
+      }
+      // It left the registry while its rows could not be read: nothing will
+      // read them again, so what it holds stays unknown.
+      if (held.unreadable && !held.settled && !input.classifications.has(windowId)) {
+        reasons.push(`evidence-unreadable: ${windowId} left the registry while its rows could not be read and its evidence is not settled`);
       }
     }
 
@@ -285,14 +332,25 @@ export async function planExpiry(input: ExpiryPlanningInput): Promise<readonly S
     }
     const pins: ExpiryDeletionRequest["pins"][number][] = [];
     for (const obligation of obligations) {
-      if (!overlaps(span, { fromMs: obligation.fromMs, toMs: obligation.toMs })) continue;
+      const inRange = overlaps(span, { fromMs: obligation.fromMs, toMs: obligation.toMs });
+      // A segment the record lists is obliged to it whatever its range says
+      // (round 3, L2): a range is never trusted to skip a pin's verification.
+      if (!inRange && !obligation.listed.has(segment.segmentId)) continue;
       const record = obligation.record;
       if (record === null) {
         reasons.push(`pin-not-extracted: ${obligation.pinId}`);
         continue;
       }
+      if (!inRange) {
+        // The record lists this segment, but its range does not cover it: its
+        // range no longer agrees with its datasets. Kept fail-closed.
+        reasons.push(`pin-range-mismatch: ${obligation.pinId} lists this segment in its datasets, but its range does not cover it`);
+        continue;
+      }
       if (record.from !== new Date(obligation.fromMs).toISOString() || record.to !== new Date(obligation.toMs).toISOString()) {
-        // Unreachable while pin ids carry their range's digest; kept fail-closed.
+        // A derived spec against its record: unreachable while window pin ids
+        // carry their range's digest (`checkPinRecordIdentity`); kept
+        // fail-closed. (A catalog obligation's range is its record's.)
         reasons.push(`pin-range-mismatch: ${obligation.pinId}'s record holds a different range than its spec`);
         continue;
       }

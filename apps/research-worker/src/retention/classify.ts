@@ -30,7 +30,20 @@
  * While a trader window is unclassified, whatever its durable rows already
  * show is held (`holdRanges`): a source event that is pending never releases
  * the segment of one that is located, and neither does a frontier that has not
- * passed the window yet.
+ * passed the window yet. The cycle makes those holds durable
+ * (`evidence-holds.ts`), so a later cycle that cannot read the rows, or no
+ * longer has the window, still keeps them.
+ *
+ * A window whose rows cannot be read — the frontier or the market's evidence
+ * — is unclassified with `evidenceUnreadable` set, whether or not it was
+ * otherwise classifiable: what it holds is then unknown, and the planner keeps
+ * every segment until its evidence is settled (round 3, L1).
+ *
+ * A source event that is no longer in the sealed WAL can still be resolved
+ * through the window's OWN verified pin, when that pin's manifests hold the
+ * segment it lay in (`pinnedSource`; round 3, L3): once a whole source epoch
+ * has expired under the window's pin, "no sealed segment of the epoch is on
+ * disk" no longer means "not sealed yet".
  */
 
 import type { DispatchFrontier, Span, WalIndex } from "./wal-index.js";
@@ -99,6 +112,13 @@ export type WindowClassification =
        * already known to hold its evidence. Empty when no row could be read.
        */
       readonly holdRanges: readonly Span[];
+      /**
+       * Set — to what failed — when the trader's rows could not be read this
+       * cycle (the frontier or the market's evidence). What the window holds
+       * is then unknown: until its evidence is settled (`evidence-holds.ts`),
+       * the planner keeps every segment.
+       */
+      readonly evidenceUnreadable?: string;
     }
   | {
       readonly windowId: string;
@@ -131,6 +151,13 @@ export type ClassifyOptions = {
   readonly evidence: TraderEvidenceSource;
   /** The sealed WAL in dispatch order (`wal-index.ts`). */
   readonly wal: WalIndex;
+  /**
+   * Whether the window's OWN existing pin — verified, with a complete trace,
+   * extracted to hold this event — holds the segment a source event lay in
+   * (`pins.ts`, `ownPinSources`). Consulted only for an event the sealed WAL
+   * no longer locates. Absent: nothing is resolved that way.
+   */
+  readonly pinnedSource?: (window: MarketWindow, event: IntentEvidence) => boolean;
 };
 
 /** The strongest evidence class of a market's rows, or `null` when it has none. */
@@ -158,6 +185,7 @@ function chainExtent(
   window: MarketWindow,
   evidence: MarketEvidence,
   wal: WalIndex,
+  pinnedSource: ((window: MarketWindow, event: IntentEvidence) => boolean) | undefined,
 ): { readonly fromMs: number; readonly toMs: number; readonly pending: string | null } {
   let fromMs = window.windowStartMs;
   let toMs = window.windowEndMs;
@@ -173,6 +201,13 @@ function chainExtent(
     widen(intent.evaluatedAtMs);
     if (intent.gatewayEpoch === null || intent.ingestSeq === null) continue;
     const location = locateSourceEvent(wal, intent.gatewayEpoch, intent.ingestSeq);
+    if (location.status !== "located" && pinnedSource !== undefined && pinnedSource(window, intent)) {
+      // The window's own verified pin holds the segment it lay in: it was
+      // sealed, and it is inside that pin, whether or not its segment (or its
+      // whole epoch) is still on disk. Nothing more to widen by: the pin the
+      // window is bound to already holds it.
+      continue;
+    }
     if (location.status === "pending") {
       pending ??= `the source event (${intent.gatewayEpoch}, ${intent.ingestSeq}) of a decision in its chain is not sealed and verified yet: ${location.reason}`;
       continue;
@@ -226,6 +261,17 @@ export async function classifyWindow(window: MarketWindow, options: ClassifyOpti
     reason,
     holdRanges,
   });
+  // The rows could not be read: what the window holds is unknown (fail closed).
+  const unreadable = (error: unknown): WindowClassification => {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      windowId: window.windowId,
+      state: "unclassified",
+      reason: `the trader's rows could not be read: ${detail}`,
+      holdRanges: [],
+      evidenceUnreadable: detail,
+    };
+  };
   if (window.responsibility.kind === "gateway-only") {
     if (options.nowMs < window.windowEndMs) return unclassified("the window has not closed");
     return {
@@ -244,19 +290,24 @@ export async function classifyWindow(window: MarketWindow, options: ClassifyOpti
   const instanceIds = window.responsibility.instanceIds;
 
   // -- The trader's rows are durable: established in dispatch order. --------
-  const blocker = await classificationBlocker(window, instanceIds, options);
+  let blocker: string | null;
+  try {
+    blocker = await classificationBlocker(window, instanceIds, options);
+  } catch (error) {
+    return unreadable(error);
+  }
 
   // -- The durable rows: they classify the window or, while it cannot be
-  // classified yet, name the evidence already known, which is HELD. ---------
+  // classified yet, name the evidence already known, which is HELD. A read
+  // failure is never "nothing to hold", blocked or not. ---------------------
   let evidence: MarketEvidence;
   try {
     evidence = await options.evidence.marketEvidence(window, instanceIds);
   } catch (error) {
-    if (blocker !== null) return unclassified(blocker);
-    throw error;
+    return unreadable(error);
   }
   const pinClass = pinClassOf(evidence);
-  const extent = chainExtent(window, evidence, options.wal);
+  const extent = chainExtent(window, evidence, options.wal, options.pinnedSource);
   const pinRange: Span = { fromMs: extent.fromMs - options.leadInMs, toMs: extent.toMs };
   if (blocker !== null) return unclassified(blocker, pinClass === null ? [] : [pinRange]);
   if (extent.pending !== null) return unclassified(extent.pending, [pinRange]);

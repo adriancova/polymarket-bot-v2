@@ -34,7 +34,20 @@
  * **bound** to it (`bindWindowPins`) rather than re-pinned. That is what keeps
  * a window's pin stable after its chain-source segment expires under it: the
  * source event can no longer be located in the WAL, but the record names it
- * among the events it holds, so it is still inside the pin.
+ * among the events it holds, so it is still inside the pin. When the source
+ * event's whole gateway epoch has expired, the classifier resolves it through
+ * the same pin (`ownPinSources`): its verified manifests still list the
+ * segment the event lay in.
+ *
+ * ## A record is checked against what it claims (round 3, L2)
+ *
+ * A record's range decides which segments it obliges, so it is never trusted
+ * alone. A window pin's id digests its class, range and source events
+ * (`windowPinId`): a window record whose id does not recompute from its own
+ * fields does not read (`pin-record-unreadable` keeps every segment). Every
+ * segment a record's datasets list is obliged to it whatever its range says,
+ * and a record whose range does not cover a segment it lists keeps that
+ * segment (`plan.ts`).
  *
  * ## What a pin never does
  *
@@ -52,6 +65,7 @@ import type {
 } from "@polymarket-bot/storage-parquet";
 import {
   DATASET_MANIFEST_OBJECT_NAME,
+  compareUnsignedIntegerStrings,
   compactWalDirectory,
   manifestDigestSidecarKey,
   parseDatasetManifest,
@@ -65,7 +79,7 @@ import type { InventoriedSegment } from "../research-tier/inventory.js";
 import { epochMsOf } from "../research-tier/sampler.js";
 import type { IntentEvidence, PinClass, WindowClassification } from "./classify.js";
 import type { WalIndex } from "./wal-index.js";
-import { locateSourceEvent } from "./wal-index.js";
+import { EPOCH_ENDING_CLOSE_REASONS, locateSourceEvent } from "./wal-index.js";
 import type { OperatorPin } from "./windows.js";
 
 /** The object-key root of pins. */
@@ -276,12 +290,38 @@ export function parsePinRecord(bytes: Uint8Array, key: string): PinRecord {
   };
 }
 
+/**
+ * Check that a record is the pin its id names (round 3, L2): a window pin's id
+ * recomputes from the record's own window, class, range and source events
+ * (`windowPinId`), so a record whose range or events were changed after it was
+ * written no longer reads; an operator pin's record is an operator's.
+ */
+export function checkPinRecordIdentity(record: PinRecord, key: string): void {
+  const fail = (what: string): never => {
+    throw new Error(`pin record ${key} is not the pin its id names: ${what}`);
+  };
+  if (record.origin === "window") {
+    if (record.windowId === null || record.pinClass === "operator") fail("a window pin without a window or a window class");
+    const expected = windowPinId(
+      record.windowId as string,
+      record.pinClass as PinClass,
+      Date.parse(record.from),
+      Date.parse(record.to),
+      record.sourceEvents,
+    );
+    if (expected !== record.pinId) fail(`its window, class, range and source events digest to ${expected}`);
+  } else if (record.windowId !== null || record.pinClass !== "operator" || !record.pinId.startsWith("operator-")) {
+    fail("an operator pin with a window, a window class or a window id");
+  }
+}
+
 /** Read a pin record, or `null` when the pin was never extracted. */
 export async function readPinRecord(objectStore: ObjectStore, pinId: string): Promise<PinRecord | null> {
   const key = pinRecordKey(pinId);
   if ((await objectStore.head(key)) === null) return null;
   const record = parsePinRecord(await objectStore.get(key), key);
   if (record.pinId !== pinId) throw new Error(`pin record ${key} names another pin`);
+  checkPinRecordIdentity(record, key);
   return record;
 }
 
@@ -393,6 +433,77 @@ export function bindWindowPins(specs: readonly PinSpec[], records: readonly PinR
   });
 }
 
+/**
+ * Whether a pin's verified manifests hold the segment a source event
+ * `(gatewayEpoch, ingestSeq)` lay in, by the rule `locateSourceEvent` applies
+ * to the sealed WAL (`wal-index.ts`): the last pinned segment of the epoch
+ * whose first `ingestSeq` is at or before the event holds it when the event is
+ * not after its last frame, or when it is but the pin also holds the very next
+ * segment of the epoch, or that segment ended its epoch. The pinned segments of
+ * an epoch are a subset of the epoch's, so a segment found this way is the one
+ * the event lay in.
+ */
+export function pinnedSegmentsHoldEvent(
+  manifests: Iterable<DatasetManifest>,
+  gatewayEpoch: string,
+  ingestSeq: string,
+): boolean {
+  const segments = [...manifests]
+    .flatMap((manifest) => manifest.segments)
+    .filter((entry) => entry.gatewayEpoch === gatewayEpoch)
+    .sort((left, right) => left.segmentIndex - right.segmentIndex);
+  let holderPosition = -1;
+  segments.forEach((entry, position) => {
+    if (entry.firstIngestSeq !== null && compareUnsignedIntegerStrings(entry.firstIngestSeq, ingestSeq) <= 0) {
+      holderPosition = position;
+    }
+  });
+  const holder = segments[holderPosition];
+  if (holder === undefined || holder.lastIngestSeq === null) return false;
+  if (compareUnsignedIntegerStrings(ingestSeq, holder.lastIngestSeq) <= 0) return true;
+  const next = segments[holderPosition + 1];
+  if (next !== undefined) return next.segmentIndex === holder.segmentIndex + 1;
+  return EPOCH_ENDING_CLOSE_REASONS.has(holder.closeReason);
+}
+
+/**
+ * The classifier's resolver for a source event the sealed WAL no longer
+ * locates (`classify.ts`, `pinnedSource`; round 3, L3): it lies inside the
+ * window's OWN existing pin when a record of that window — complete trace,
+ * extracted to hold exactly this event, its manifests verified now — holds the
+ * segment it lay in (`pinnedSegmentsHoldEvent`). Only the window's own pins
+ * count: Decision 3.4 requires the event inside the window's pin, not merely
+ * inside some pin.
+ *
+ * A record whose manifests do not verify resolves nothing (the window then
+ * waits, holding its range).
+ */
+export async function ownPinSources(
+  objectStore: ObjectStore,
+  records: readonly PinRecord[],
+  windowIds: ReadonlySet<string>,
+  verify: (record: PinRecord) => Promise<ReadonlyMap<string, DatasetManifest> | Error> = async (record) =>
+    await verifyPinManifests(objectStore, record).catch((error: unknown) => (error instanceof Error ? error : new Error(String(error)))),
+): Promise<(window: { readonly windowId: string }, event: IntentEvidence) => boolean> {
+  const verified: { readonly record: PinRecord; readonly manifests: readonly DatasetManifest[] }[] = [];
+  for (const record of records) {
+    if (record.origin !== "window" || record.windowId === null || !windowIds.has(record.windowId) || !record.sourceEventsInside) continue;
+    const manifests = await verify(record);
+    if (manifests instanceof Error) continue;
+    verified.push({ record, manifests: [...manifests.values()] });
+  }
+  return (window, event) => {
+    if (event.gatewayEpoch === null || event.ingestSeq === null) return false;
+    const { gatewayEpoch, ingestSeq } = event;
+    return verified.some(
+      ({ record, manifests }) =>
+        record.windowId === window.windowId &&
+        recordHoldsSourceEvents(record, [event]) &&
+        pinnedSegmentsHoldEvent(manifests, gatewayEpoch, ingestSeq),
+    );
+  };
+}
+
 /** Whether a segment's receipt span overlaps a range. */
 export function overlaps(
   span: { readonly fromMs: number; readonly toMs: number },
@@ -501,6 +612,16 @@ export async function extractPin(spec: PinSpec, context: PinExtractionContext): 
   if (existing !== null) {
     await verifyPinManifests(context.objectStore, existing);
     return { pinId: spec.pinId, status: "already-extracted", record: existing };
+  }
+  // A new window pin's id is the digest of what it holds, or its record would
+  // never read back (`checkPinRecordIdentity`).
+  if (
+    spec.origin === "window" &&
+    (spec.windowId === null ||
+      spec.pinClass === "operator" ||
+      spec.pinId !== windowPinId(spec.windowId, spec.pinClass, spec.fromMs, spec.toMs, spec.sourceEvents))
+  ) {
+    throw new Error(`pin ${spec.pinId}: a window pin's id must be the digest of its window, class, range and source events`);
   }
 
   // Every sealed segment must be extracted (so its receipt span is known) or

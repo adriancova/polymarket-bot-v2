@@ -42,7 +42,7 @@ import { epochMsOf } from "../research-tier/sampler.js";
 export const UNVERIFIED_ENVELOPE_MARGIN_MS = 60 * 60 * 1000;
 
 /** Close reasons after which the writer writes nothing more in the epoch. */
-const EPOCH_ENDING_CLOSE_REASONS: ReadonlySet<string> = new Set(["shutdown", "recovery", "write-fault"]);
+export const EPOCH_ENDING_CLOSE_REASONS: ReadonlySet<string> = new Set(["shutdown", "recovery", "write-fault"]);
 
 export type Span = { readonly fromMs: number; readonly toMs: number };
 

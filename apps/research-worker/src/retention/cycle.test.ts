@@ -19,14 +19,17 @@
  * | dry-run handed a deletion capability | J12 |
  * | a sidecar left without its segment | J13 |
  * | a segment the extract path refuses | J14 |
+ *
+ * Rounds 2 and 3 add their own sections below (K1-K6, L1-L4), each case a
+ * real deletion the review showed, or a liveness failure it showed.
  */
 
-import { readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { ExpiredSegmentDeletion } from "@polymarket-bot/storage-parquet";
+import type { ExpiredSegmentDeletion, ObjectStore } from "@polymarket-bot/storage-parquet";
 import {
   EXPIRY_OPT_IN_MARKER_CONTENT,
   EXPIRY_OPT_IN_MARKER_FILE_NAME,
@@ -35,6 +38,7 @@ import {
   readParquetObject,
 } from "@polymarket-bot/storage-parquet";
 import { buildSegmentFixture } from "@polymarket-bot/storage-parquet/testing";
+import type { SegmentFixture } from "@polymarket-bot/storage-parquet/testing";
 
 import { researchPointerKey } from "../research-tier/extract.js";
 import {
@@ -50,6 +54,7 @@ import type { ManualBootClock, StorageFixture } from "../testing/storage-fixture
 import type { MarketEvidence, TraderEvidenceSource } from "./classify.js";
 import { dispatchFrontier, staticEvidenceSource } from "./classify.js";
 import { runStorageCycle } from "./cycle.js";
+import { EVIDENCE_HOLDS_FILE_NAME, readEvidenceHolds } from "./evidence-holds.js";
 import { listExpiryPlanIds } from "./execute.js";
 import type { StorageCycleDependencies, StorageCycleReport } from "./cycle.js";
 import { fileOperatorPinLock, operatorPinLockPath, publishOperatorPin } from "./operator-pin-lock.js";
@@ -848,5 +853,384 @@ describe("K5: the final operator-pin check covers the segment's whole receipt sp
     expect(report.expiry?.deleted).toStrictEqual([]);
     expect(report.expiry?.failures[0]?.detail).toMatch(/operator pin late-frame now covers the segment/u);
     expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+  });
+});
+
+// -- Round 3 ------------------------------------------------------------------
+
+const E2 = "0190a3e0-0000-7000-8000-000000000002";
+const databaseDown: TraderEvidenceSource = {
+  async dispatchFrontiers() {
+    throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" });
+  },
+  async marketEvidence() {
+    throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" });
+  },
+};
+const evidenceTimesOut = (base: TraderEvidenceSource): TraderEvidenceSource => ({
+  dispatchFrontiers: (instanceIds) => base.dispatchFrontiers(instanceIds),
+  async marketEvidence() {
+    throw new Error("canceling statement due to statement timeout");
+  },
+});
+const frontiersAt = (byEpoch: Record<string, string>, evidence: MarketEvidence): TraderEvidenceSource =>
+  staticEvidenceSource({ frontiers: new Map([["i", dispatchFrontier(byEpoch)]]), evidence: new Map([["m", evidence]]) });
+/** A later, gateway-only window of the same market: it keeps the market registered once w1 is gone. */
+const LATER_SAME_MARKET: MarketWindow = { ...MARKET_WINDOW(NOW + HOUR, NOW + 2 * HOUR), windowId: "w2", responsibility: { kind: "gateway-only" } };
+
+/** Write a sealed segment of another gateway epoch into the WAL root. */
+async function writeEpochSegment(
+  f: StorageFixture,
+  gatewayEpoch: string,
+  segmentIndex: number,
+  frames: Parameters<typeof buildSegmentFixture>[0]["frames"],
+): Promise<SegmentFixture> {
+  const directory = join(f.walRoot, gatewayEpoch);
+  await mkdir(directory, { recursive: true });
+  const segment = buildSegmentFixture({ gatewayEpoch, segmentIndex, frames });
+  await writeFile(join(directory, segment.segmentFileName), segment.segmentBytes);
+  await writeFile(join(directory, segment.manifestFileName), segment.manifestBytes);
+  return segment;
+}
+
+async function onDisk(f: StorageFixture, gatewayEpoch: string, segment: SegmentFixture): Promise<boolean> {
+  return (await readdir(join(f.walRoot, gatewayEpoch))).includes(segment.segmentFileName);
+}
+
+function deletionPins(report: StorageCycleReport, segmentId: string | undefined): readonly string[] | null {
+  const deletion = report.expiry?.deleted.find((entry) => entry.segmentId === segmentId);
+  return deletion === undefined || deletion.basis !== "expired-after-extract" ? null : deletion.pins.map((pin) => pin.pinId);
+}
+
+describe("L1: a hold on a located chain source survives every later cycle until the window's pin holds it", () => {
+  // As K1: segment 0 holds the located source (EPOCH, "2"), two hours before
+  // the window; the other source's epoch has sealed nothing yet.
+  const located = { evaluatedAtMs: OLD, sourceEventId: "located", gatewayEpoch: EPOCH, ingestSeq: "2" };
+  const pending = { evaluatedAtMs: OLD + MIN, sourceEventId: "pending", gatewayEpoch: E2, ingestSeq: "2" };
+  const evidence: MarketEvidence = { ...NONE, fillsAtMs: [OLD + MIN], intents: [located, pending] };
+  const window = MARKET_WINDOW(OLD, OLD + 15 * MIN);
+  const segments = (sourceFrame = tokBook("1", OLD - 2 * HOUR)) => [
+    [sourceFrame],
+    [tokBook("3", OLD)],
+    [tradeFrame({ ingestSeq: "5", atMs: OLD + 20 * MIN })],
+    [tradeFrame({ ingestSeq: "7", atMs: NOW - HOUR })],
+  ];
+
+  async function heldInCycleOne(
+    sourceFrame?: ReturnType<typeof tokBook>,
+  ): Promise<{ f: StorageFixture; bootClock: ManualBootClock; filesAfter: string[] }> {
+    const f = await fixture(segments(sourceFrame));
+    const bootClock = manualBootClock();
+    const first = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: frontierAt("100", evidence) }));
+    expect(first.classifications[0]).toMatchObject({ state: "unclassified", holdRanges: [{ fromMs: OLD - 2 * HOUR - 15 * MIN, toMs: OLD + 15 * MIN }] });
+    // Only the reference-feed segment after the window, outside every range w1 could hold, went.
+    expect(first.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[2]?.segmentId]);
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + 30 * MIN);
+    return { f, bootClock, filesAfter: await walFiles(f) };
+  }
+
+  it.each<[string, () => TraderEvidenceSource]>([
+    ["the trader's database is unreachable", () => databaseDown],
+    ["the evidence read times out while the frontier reads", () => evidenceTimesOut(frontierAt("100", evidence))],
+    ["the evidence read times out while the trader lags", () => evidenceTimesOut(frontierAt("1", evidence))],
+  ])("keeps the source segment, and every other, in a later cycle where %s", async (_trigger, failing) => {
+    const { f, bootClock, filesAfter } = await heldInCycleOne();
+    const second = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: failing() }));
+    expect(await walFiles(f)).toStrictEqual(filesAfter);
+    expect(filesAfter).toContain(f.segments[0]?.segmentFileName);
+    expect(second.expiry).toBeNull();
+    const reasons = reasonsOf(second, f.segments[0]?.segmentId ?? "");
+    expect(reasons).toContainEqual(expect.stringMatching(/^evidence-unreadable: w1's rows could not be read/u));
+    expect(reasons).toContainEqual(expect.stringMatching(/^evidence-hold: w1 holds chain evidence in this segment/u));
+    for (const decision of second.decisions) expect(decision.eligible).toBe(false);
+  });
+
+  it("keeps every segment when the very first read of the window's rows fails, before any hold was recorded", async () => {
+    const f = await fixture(segments());
+    const report = await runStorageCycle(dependencies(f, { loadWindows: async () => [window], evidence: databaseDown }));
+    expect(await walFiles(f)).toHaveLength(4);
+    expect(report.expiry).toBeNull();
+    for (const decision of report.decisions) {
+      expect(decision.reasons).toContainEqual(expect.stringMatching(/^evidence-unreadable: w1's rows could not be read .*ECONNREFUSED/u));
+    }
+  });
+
+  it("keeps every segment when the rows read but cannot be interpreted", async () => {
+    const f = await fixture(segments());
+    const malformed: TraderEvidenceSource = {
+      dispatchFrontiers: (instanceIds) => frontierAt("100", NONE).dispatchFrontiers(instanceIds),
+      async marketEvidence() {
+        return { ...NONE, intents: null } as unknown as MarketEvidence;
+      },
+    };
+    const report = await runStorageCycle(dependencies(f, { loadWindows: async () => [window], evidence: malformed }));
+    expect(await walFiles(f)).toHaveLength(4);
+    for (const decision of report.decisions) {
+      expect(decision.reasons).toContainEqual(expect.stringMatching(/^evidence-unreadable: w1's rows could not be read/u));
+    }
+  });
+
+  it("keeps every segment when the window leaves the registry while its rows could not be read", async () => {
+    // Never read: the database was down from the window's first cycle.
+    const f = await fixture(segments(tradeFrame({ ingestSeq: "1", atMs: OLD - 2 * HOUR })));
+    const bootClock = manualBootClock();
+    await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: databaseDown }));
+    expect(await walFiles(f)).toHaveLength(4);
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + 30 * MIN);
+    const second = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [LATER_SAME_MARKET], evidence: databaseDown }));
+    expect(await walFiles(f)).toHaveLength(4);
+    for (const decision of second.decisions) {
+      expect(decision.reasons).toContainEqual(expect.stringMatching(/^evidence-unreadable: w1 left the registry while its rows could not be read/u));
+    }
+  });
+
+  it("a dry run reads the durable holds and never writes them", async () => {
+    const f = await fixture(segments(tradeFrame({ ingestSeq: "1", atMs: OLD - 2 * HOUR })));
+    const dryRun = (loadWindows: () => Promise<readonly MarketWindow[]>) =>
+      runStorageCycle(dependencies(f, { mode: "dry-run", deletion: null, loadWindows, evidence: frontierAt("100", evidence) }));
+    await dryRun(async () => [window]);
+    await expect(readFile(join(f.stateDir, EVIDENCE_HOLDS_FILE_NAME))).rejects.toMatchObject({ code: "ENOENT" });
+    // Held by an execute cycle, then read by a dry run without the window.
+    await runStorageCycle(dependencies(f, { loadWindows: async () => [window], evidence: frontierAt("100", evidence) }));
+    const before = await readFile(join(f.stateDir, EVIDENCE_HOLDS_FILE_NAME));
+    const report = await dryRun(async () => [LATER_SAME_MARKET]);
+    expect(reasonsOf(report, f.segments[0]?.segmentId ?? "")).toStrictEqual([expect.stringMatching(/^evidence-hold: w1 /u)]);
+    expect(await readFile(join(f.stateDir, EVIDENCE_HOLDS_FILE_NAME))).toStrictEqual(before);
+  });
+
+  it("keeps the source segment when the window leaves the registry", async () => {
+    // The located source is a reference-feed frame: once w1 is gone, no market keeps its segment.
+    const { f, bootClock } = await heldInCycleOne(tradeFrame({ ingestSeq: "1", atMs: OLD - 2 * HOUR }));
+    const second = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [LATER_SAME_MARKET], evidence: frontierAt("100", evidence) }));
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    expect(reasonsOf(second, f.segments[0]?.segmentId ?? "")).toStrictEqual([
+      expect.stringMatching(/^evidence-hold: w1 holds chain evidence in this segment/u),
+    ]);
+    expect((await readEvidenceHolds(f.stateDir)).windows.get("w1")?.holds).toStrictEqual([
+      { fromMs: OLD - 2 * HOUR - 15 * MIN, toMs: OLD + 15 * MIN },
+    ]);
+  });
+
+  it("releases the hold once the window's pin holds its evidence: the source segment then expires under that pin", async () => {
+    const { f, bootClock } = await heldInCycleOne();
+    // The pending source's epoch seals a segment holding it.
+    await writeEpochSegment(f, E2, 0, [tokBook("1", OLD + 2 * MIN), tokBook("3", OLD + 3 * MIN)]);
+    const second = await runStorageCycle(
+      dependencies(f, { bootClock, loadWindows: async () => [window], evidence: frontiersAt({ [EPOCH]: "100", [E2]: "100" }, evidence) }),
+    );
+    expect(second.classifications[0]).toMatchObject({ state: "classified", pinClass: "fill" });
+    const outcome = second.pins[0];
+    if (outcome === undefined || outcome.status !== "extracted") throw new Error("expected an extracted pin");
+    expect(outcome.record.sourceEventsInside).toBe(true);
+    expect(deletionPins(second, f.segments[0]?.segmentId)).toStrictEqual([outcome.pinId]);
+    expect((await readEvidenceHolds(f.stateDir)).windows.get("w1")).toStrictEqual({ holds: [], settled: true, unreadable: false });
+  });
+
+  it("makes a hold the recheck reads durable before its deletion: a later cycle without the window still keeps the segment", async () => {
+    const f = await fixture(segments(tradeFrame({ ingestSeq: "1", atMs: OLD - 2 * HOUR })));
+    const bootClock = manualBootClock();
+    // The plan reads no evidence yet; every recheck reads the located source and a pending one.
+    let reads = 0;
+    const growing: TraderEvidenceSource = {
+      dispatchFrontiers: (instanceIds) => frontierAt("100", NONE).dispatchFrontiers(instanceIds),
+      async marketEvidence() {
+        reads += 1;
+        return reads === 1 ? NONE : evidence;
+      },
+    };
+    const first = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: growing }));
+    expect(first.decisions[0]?.eligible).toBe(true);
+    expect(first.expiry?.failures).toContainEqual({
+      segmentId: f.segments[0]?.segmentId,
+      detail: expect.stringMatching(/^kept on recheck: unclassified-window: w1 holds chain evidence in this segment/u),
+    });
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + 30 * MIN);
+    const second = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [LATER_SAME_MARKET], evidence: growing }));
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    expect(reasonsOf(second, f.segments[0]?.segmentId ?? "")).toStrictEqual([
+      expect.stringMatching(/^evidence-hold: w1 holds chain evidence in this segment/u),
+    ]);
+  });
+});
+
+describe("L1: holds that are not durably known keep every segment", () => {
+  const segments = () => [[tradeFrame({ ingestSeq: "1", atMs: OLD })], [tradeFrame({ ingestSeq: "2", atMs: NOW - HOUR })]];
+
+  it("keeps every segment, and never overwrites the file, while the holds do not read; the control expires", async () => {
+    const f = await fixture(segments());
+    await mkdir(f.stateDir, { recursive: true });
+    await writeFile(join(f.stateDir, EVIDENCE_HOLDS_FILE_NAME), "{");
+    const report = await runStorageCycle(dependencies(f));
+    expect(await walFiles(f)).toHaveLength(2);
+    expect(reasonsOf(report, f.segments[0]?.segmentId ?? "")).toStrictEqual([expect.stringMatching(/^evidence-holds-unknown: /u)]);
+    expect(await readFile(join(f.stateDir, EVIDENCE_HOLDS_FILE_NAME), "utf8")).toBe("{");
+    // Control: the same WAL with no holds file.
+    await rm(join(f.stateDir, EVIDENCE_HOLDS_FILE_NAME));
+    const control = await runStorageCycle(dependencies(f));
+    expect(control.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[0]?.segmentId]);
+  });
+
+  it("keeps every segment when the holds cannot be made durable", async () => {
+    const f = await fixture(segments());
+    // The temporary file the durable write needs cannot be created.
+    await mkdir(join(f.stateDir, `${EVIDENCE_HOLDS_FILE_NAME}.${process.pid.toString(36)}.tmp`), { recursive: true });
+    const report = await runStorageCycle(dependencies(f));
+    expect(await walFiles(f)).toHaveLength(2);
+    expect(report.expiry).toBeNull();
+    expect(reasonsOf(report, f.segments[0]?.segmentId ?? "")).toStrictEqual([
+      expect.stringMatching(/^evidence-holds-unknown: .*could not be made durable/u),
+    ]);
+  });
+});
+
+describe("L2: a pin record's range is checked against its id and its datasets before it can skip a segment", () => {
+  // As K3: cycle 1 pins the window while every segment is younger than 72 h.
+  const START = NOW - 72 * HOUR + 60 * MIN;
+  const segments = () => [
+    [tokBook("1", START - 24 * MIN), tokBook("2", START - 22 * MIN)], // S0: only the widened pin's lead-in covers it
+    [tokBook("3", START - 10 * MIN), tokBook("4", START + 3 * MIN)], // S1: holds the source event (EPOCH, "4")
+    [tokBook("5", START + 6 * MIN), tokBook("6", START + 9 * MIN)], // S2: the window
+    [tradeFrame({ ingestSeq: "7", atMs: START + 20 * MIN })],
+    [tradeFrame({ ingestSeq: "8", atMs: NOW + 3 * HOUR })],
+  ];
+  const window = MARKET_WINDOW(START, START + 10 * MIN);
+  const evidence: MarketEvidence = {
+    ...NONE,
+    fillsAtMs: [START + 6 * MIN],
+    intents: [{ evaluatedAtMs: START + 3 * MIN, sourceEventId: "src-4", gatewayEpoch: EPOCH, ingestSeq: "4" }],
+  };
+
+  async function rewriteRecordRange(f: StorageFixture, pinId: string): Promise<void> {
+    const path = join(f.root, "objects", "pins", pinId, "pin.json");
+    const record = JSON.parse(await readFile(path, "utf8")) as { from: string; to: string };
+    record.from = record.from.replace(/^2026-/u, "2027-");
+    record.to = record.to.replace(/^2026-/u, "2027-");
+    await writeFile(path, `${JSON.stringify(record, null, 2)}\n`);
+  }
+
+  const cases: [string, boolean, Partial<Pick<StorageCycleDependencies, "evidence" | "loadWindows">>][] = [];
+  for (const damaged of [true, false]) {
+    cases.push(["the trader's database is unreachable", damaged, { evidence: databaseDown }]);
+    cases.push(["the window has left the registry", damaged, { loadWindows: async () => [LATER_SAME_MARKET] }]);
+  }
+
+  it.each(cases)("keeps the segment when %s and its record's range was rewritten (its copy damaged: %s)", async (_trigger, damaged, change) => {
+    const f = await fixture(segments());
+    const bootClock = manualBootClock();
+    const first = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: frontierAt("8", evidence) }));
+    const outcome = first.pins[0];
+    if (outcome === undefined || outcome.status !== "extracted") throw new Error("expected an extracted pin");
+    expect(outcome.record.datasets.flatMap((dataset) => dataset.segmentIds)).toContain(f.segments[0]?.segmentId);
+    if (damaged) await damagePinObject(f, outcome.pinId, f.segments[0]?.segmentId ?? "");
+    await rewriteRecordRange(f, outcome.pinId);
+    bootClock.advance(2 * HOUR);
+    f.clock.setNowMs(NOW + 2 * HOUR);
+    const second = await runStorageCycle(dependencies(f, { bootClock, loadWindows: async () => [window], evidence: frontierAt("8", evidence), ...change }));
+    expect(deletionPins(second, f.segments[0]?.segmentId)).toBeNull();
+    expect(await walFiles(f)).toContain(f.segments[0]?.segmentFileName);
+    expect(reasonsOf(second, f.segments[0]?.segmentId ?? "")).toContainEqual(
+      expect.stringMatching(new RegExp(`^pin-record-unreadable: ${outcome.pinId}: .*not the pin its id names`, "u")),
+    );
+  });
+});
+
+describe("L3: a window's own pin resolves a source whose whole gateway epoch expired under it", () => {
+  it("binds the window to that pin and expires its later segments under it, cycle after cycle", async () => {
+    const START = NOW - 71 * HOUR;
+    // EPOCH ended with one segment: the source (EPOCH, "2"), two hours before the window.
+    const f = await fixture([[tokBook("1", START - 2 * HOUR)]]);
+    const windowSegment = await writeEpochSegment(f, E2, 0, [tokBook("3", START)]);
+    await writeEpochSegment(f, E2, 1, [tradeFrame({ ingestSeq: "5", atMs: NOW - HOUR })]);
+    const evidence: MarketEvidence = {
+      ...NONE,
+      fillsAtMs: [START + MIN],
+      intents: [{ evaluatedAtMs: START, sourceEventId: "src-E1", gatewayEpoch: EPOCH, ingestSeq: "2" }],
+    };
+    const bootClock = manualBootClock();
+    const deps = () =>
+      dependencies(f, {
+        bootClock,
+        loadWindows: async () => [MARKET_WINDOW(START, START + 15 * MIN)],
+        evidence: frontiersAt({ [EPOCH]: "100", [E2]: "100" }, evidence),
+      });
+    const first = await runStorageCycle(deps());
+    const pin = first.pins[0];
+    if (pin === undefined || pin.status !== "extracted") throw new Error("expected an extracted pin");
+    expect(pin.record.sourceEventsInside).toBe(true);
+    expect(pin.record.datasets.map((dataset) => dataset.gatewayEpoch)).toStrictEqual([EPOCH, E2]);
+    // The source's whole epoch expires under the pin.
+    expect(first.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[0]?.segmentId]);
+    expect(await walFiles(f)).toStrictEqual([]);
+    for (const step of [1, 2]) {
+      bootClock.advance(2 * HOUR);
+      f.clock.setNowMs(NOW + 2 * HOUR * step);
+      const report = await runStorageCycle(deps());
+      expect(report.classifications[0]).toMatchObject({ state: "classified", pinClass: "fill" });
+      expect(report.pins.map((outcome) => [outcome.pinId, outcome.status])).toStrictEqual([[pin.pinId, "already-extracted"]]);
+      if (step === 1) expect(deletionPins(report, windowSegment.segmentId)).toStrictEqual([pin.pinId]);
+    }
+    expect(await onDisk(f, E2, windowSegment)).toBe(false);
+    expect(await windowPinDirectories(f)).toStrictEqual([pin.pinId]);
+  });
+});
+
+describe("L4: no window pin is extracted while the pin catalog does not read in full", () => {
+  it("binds the window to its first pin after a failed listing, with no second pin and nothing held forever", async () => {
+    // As K4.
+    const START = NOW - 72 * HOUR + 10 * MIN;
+    const f = await fixture([
+      [tokBook("1", START - 61 * MIN), tokBook("2", START - 60 * MIN)], // S0: the source (EPOCH, "2")
+      [tokBook("3", START - 30 * MIN)], // S1
+      [tokBook("4", START + MIN), tokBook("5", START + 4 * MIN)], // S2: the window
+      [tradeFrame({ ingestSeq: "6", atMs: START + 20 * MIN })],
+      [tradeFrame({ ingestSeq: "7", atMs: NOW })],
+    ]);
+    const evidence: MarketEvidence = {
+      ...NONE,
+      fillsAtMs: [START + 4 * MIN],
+      intents: [{ evaluatedAtMs: START + 3 * MIN, sourceEventId: "src-2", gatewayEpoch: EPOCH, ingestSeq: "2" }],
+    };
+    const store = f.objectStore;
+    let failNextListing = false;
+    const flaky: ObjectStore = {
+      put: (key, bytes) => store.put(key, bytes),
+      head: (key) => store.head(key),
+      get: (key) => store.get(key),
+      async list(prefix) {
+        if (failNextListing) {
+          failNextListing = false;
+          throw Object.assign(new Error("EIO: i/o error, scandir"), { code: "EIO" });
+        }
+        if (store.list === undefined) throw new Error("the fixture store lists");
+        return await store.list(prefix);
+      },
+    };
+    const bootClock = manualBootClock();
+    const deps = () =>
+      dependencies(f, { objectStore: flaky, bootClock, loadWindows: async () => [MARKET_WINDOW(START, START + 10 * MIN)], evidence: frontierAt("7", evidence) });
+    const first = await runStorageCycle(deps());
+    const pinId = first.pins[0]?.pinId;
+    expect(first.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[0]?.segmentId, f.segments[1]?.segmentId]);
+    // Cycle 2: the catalog's listing fails once.
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + 30 * MIN);
+    failNextListing = true;
+    const second = await runStorageCycle(deps());
+    expect(second.pins).toStrictEqual([
+      { pinId: expect.stringMatching(/^window-w1-/u), status: "waiting", reason: expect.stringMatching(/the pin catalog did not read in full/u) },
+    ]);
+    expect(await walFiles(f)).toContain(f.segments[2]?.segmentFileName);
+    // Cycle 3: it reads, and the window is bound to its first pin.
+    bootClock.advance(30 * MIN);
+    f.clock.setNowMs(NOW + 60 * MIN);
+    const third = await runStorageCycle(deps());
+    expect(third.pins.map((outcome) => [outcome.pinId, outcome.status])).toStrictEqual([[pinId, "already-extracted"]]);
+    expect(deletionPins(third, f.segments[2]?.segmentId)).toStrictEqual([pinId]);
+    expect(await walFiles(f)).not.toContain(f.segments[2]?.segmentFileName);
+    expect(await windowPinDirectories(f)).toStrictEqual([pinId]);
   });
 });

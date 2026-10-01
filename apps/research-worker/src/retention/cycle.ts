@@ -10,13 +10,18 @@
  *    tier (`extract.ts`).
  * 3. **Classify** every registered window (`classify.ts`), reading the
  *    trader's durable rows read-only, against the sealed WAL in dispatch
- *    order (`wal-index.ts`).
+ *    order (`wal-index.ts`); a source event whose segment is gone is
+ *    resolved through the window's own verified pin (`ownPinSources`).
  * 4. **Pin** every classified window with evidence, and every operator pin
  *    (`pins.ts`), once the WAL has moved past its range. A window whose
- *    existing pin already fulfils it is bound to that pin, not re-pinned.
+ *    existing pin already fulfils it is bound to that pin, not re-pinned. No
+ *    window pin is extracted while the pin catalog does not read in full: the
+ *    binding could not see the pin it should bind to.
+ * 4b. **Hold**: make every hold the classifications show durable, and release
+ *    the holds of every window this cycle settles (`evidence-holds.ts`).
  * 5. **Plan**: decide every sealed segment, with every reason it is kept
  *    (`plan.ts`), against the pins this cycle derives AND every pin already
- *    extracted into the store.
+ *    extracted into the store, and against the durable holds.
  * 6. **Expire**, only in `execute` mode: make the plan durable, then — under
  *    the operator-pin lock — re-decide, prove, re-read the operator's pins and
  *    delete one segment at a time, then write the receipt (`execute.ts`). The
@@ -38,7 +43,7 @@ import { extractResearchTier, readResearchPointer } from "../research-tier/extra
 import { inventoryWalRoot } from "../research-tier/inventory.js";
 import type { WalInventory } from "../research-tier/inventory.js";
 import { epochMsOf } from "../research-tier/sampler.js";
-import type { TraderEvidenceSource, WindowClassification } from "./classify.js";
+import type { IntentEvidence, TraderEvidenceSource, WindowClassification } from "./classify.js";
 import { classifyWindow } from "./classify.js";
 import type { BootClock, ClockAssessment } from "./clock-guard.js";
 import { DEFAULT_CLOCK_STEP_TOLERANCE_MS, assessClock, guardedClock } from "./clock-guard.js";
@@ -55,8 +60,10 @@ import type { StorageMetrics } from "./metrics.js";
 import { diskMetrics, storageMetrics } from "./metrics.js";
 import type { OperatorPinLock } from "./operator-pin-lock.js";
 import { noOperatorPinLock } from "./operator-pin-lock.js";
+import type { EvidenceHoldState } from "./evidence-holds.js";
+import { persistEvidenceHolds, readEvidenceHolds, rememberEvidence, sameEvidenceHolds, settledWindowIds } from "./evidence-holds.js";
 import type { ExtractedPins, PinOutcome, PinRecord, PinSpec } from "./pins.js";
-import { bindWindowPins, extractPin, overlaps, pinSpecs, readExtractedPins, readPinRecord } from "./pins.js";
+import { bindWindowPins, extractPin, overlaps, ownPinSources, pinSpecs, readExtractedPins, readPinRecord } from "./pins.js";
 import type { SegmentDecision } from "./plan.js";
 import { planExpiry } from "./plan.js";
 import type { WalIndex } from "./wal-index.js";
@@ -121,6 +128,7 @@ async function classifyAll(
   dependencies: StorageCycleDependencies,
   clock: CompactionClock,
   wal: WalIndex,
+  pinnedSource: (window: MarketWindow, event: IntentEvidence) => boolean,
 ): Promise<ReadonlyMap<string, WindowClassification>> {
   const classifications = new Map<string, WindowClassification>();
   for (const window of windows) {
@@ -133,21 +141,28 @@ async function classifyAll(
           durabilityGraceMs: dependencies.settings.durabilityGraceMs,
           evidence: dependencies.evidence,
           wal,
+          pinnedSource,
         }),
       );
     } catch (error) {
-      // An unreachable evidence source leaves the window unclassified: fail closed.
+      // Anything else that fails leaves the window unclassified, and what it
+      // holds unknown: fail closed, as for a read failure (`evidence-holds.ts`).
+      const detail = error instanceof Error ? error.message : String(error);
       classifications.set(window.windowId, {
         windowId: window.windowId,
         state: "unclassified",
-        reason: `the trader's rows could not be read: ${error instanceof Error ? error.message : String(error)}`,
-        // Nothing is known of its evidence this cycle; its extracted pins are
-        // still honoured from the store (`readExtractedPins`).
+        reason: `the trader's rows could not be read: ${detail}`,
         holdRanges: [],
+        evidenceUnreadable: detail,
       });
     }
   }
   return classifications;
+}
+
+/** Registered trader windows' ids: the windows whose own pins can resolve a source event. */
+function traderWindowIds(windows: readonly MarketWindow[]): ReadonlySet<string> {
+  return new Set(windows.filter((window) => window.responsibility.kind === "trader").map((window) => window.windowId));
 }
 
 async function readPinRecords(
@@ -261,15 +276,35 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
   // -- 3. Classify. ---------------------------------------------------------
   const windows = await dependencies.loadWindows();
   const operatorPins = await dependencies.loadOperatorPins();
-  const classifications = await classifyAll(windows, dependencies, clock, wal);
+  // Every pin already in the store: to resolve a source event through the
+  // window's own pin, and to bind a window to the pin that fulfils it.
+  const catalog = await readExtractedPins(objectStore);
+  const classifications = await classifyAll(
+    windows,
+    dependencies,
+    clock,
+    wal,
+    await ownPinSources(objectStore, catalog.records, traderWindowIds(windows)),
+  );
 
   // -- 4. Pin. ----------------------------------------------------------------
   // A window whose existing pin fulfils it is bound to that pin.
-  const specs = bindWindowPins(pinSpecs([...classifications.values()], operatorPins), (await readExtractedPins(objectStore)).records);
+  const specs = bindWindowPins(pinSpecs([...classifications.values()], operatorPins), catalog.records);
   const allSegments = [...inventory.byEpoch.values()].flat();
   const pins: PinOutcome[] = [];
   const pinFailures: { pinId: string; detail: string }[] = [];
   for (const spec of specs) {
+    if (spec.origin === "window" && catalog.unreadable.length > 0) {
+      // The binding could not see every pin: a window pin extracted now could
+      // be a narrower, permanent duplicate of one it should be bound to. The
+      // plan keeps every segment meanwhile (`pin-record-unreadable`).
+      pins.push({
+        pinId: spec.pinId,
+        status: "waiting",
+        reason: `the pin catalog did not read in full (${catalog.unreadable.map((entry) => entry.pinId).join(", ")}); no window pin is extracted until it does`,
+      });
+      continue;
+    }
     try {
       pins.push(
         await extractPin(spec, {
@@ -286,6 +321,20 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
       pinFailures.push({ pinId: spec.pinId, detail: error instanceof Error ? error.message : String(error) });
     }
   }
+
+  // -- 4b. Hold: what the classifications show is durable before any plan, and
+  // a window this cycle settles releases its holds. A dry run reads the holds
+  // but never writes them: it deletes nothing, and must not race the timer's
+  // read-modify-write of the file. ---------------------------------------------
+  const previousHolds = await readEvidenceHolds(dependencies.stateDirectory);
+  const rememberedHolds = rememberEvidence({
+    state: previousHolds,
+    classifications: classifications.values(),
+    settled: settledWindowIds({ classifications: classifications.values(), specs, outcomes: pins, state: previousHolds }),
+    registeredWindowIds: new Set(windows.map((window) => window.windowId)),
+  });
+  let holds: EvidenceHoldState =
+    dependencies.mode === "execute" ? await persistEvidenceHolds(dependencies.stateDirectory, rememberedHolds) : rememberedHolds;
 
   // -- 5. Plan. ---------------------------------------------------------------
   const pinRecords = await readPinRecords(objectStore, specs);
@@ -304,6 +353,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
     pinSpecs: specs,
     pinRecords,
     extractedPins,
+    evidenceHolds: holds,
     verifiedResearch,
   });
 
@@ -330,8 +380,23 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
       recheck: async (entry) => {
         const freshWindows = await dependencies.loadWindows();
         const freshOperatorPins = await dependencies.loadOperatorPins();
-        const freshClassifications = await classifyAll(freshWindows, dependencies, clock, wal);
         const freshPins = await readExtractedPins(objectStore);
+        const freshClassifications = await classifyAll(
+          freshWindows,
+          dependencies,
+          clock,
+          wal,
+          await ownPinSources(objectStore, freshPins.records, traderWindowIds(freshWindows)),
+        );
+        // What the fresh rows show is durable before this deletion (a recheck
+        // settles nothing: it extracts no pin).
+        const freshHolds = rememberEvidence({
+          state: holds,
+          classifications: freshClassifications.values(),
+          settled: null,
+          registeredWindowIds: new Set(freshWindows.map((window) => window.windowId)),
+        });
+        if (!sameEvidenceHolds(freshHolds, holds)) holds = await persistEvidenceHolds(dependencies.stateDirectory, freshHolds);
         const freshSpecs = bindWindowPins(pinSpecs([...freshClassifications.values()], freshOperatorPins), freshPins.records);
         const segment = allSegments.find((candidate) => candidate.segmentId === entry.request.segmentId);
         if (segment === undefined) return ["the segment is no longer in the inventory"];
@@ -348,6 +413,7 @@ export async function runStorageCycle(dependencies: StorageCycleDependencies): P
           pinSpecs: freshSpecs,
           pinRecords: await readPinRecords(objectStore, freshSpecs),
           extractedPins: freshPins,
+          evidenceHolds: holds,
         });
         if (fresh === undefined) return ["the segment could not be re-decided"];
         if (!fresh.eligible) return fresh.reasons;

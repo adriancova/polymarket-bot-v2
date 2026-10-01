@@ -59,7 +59,12 @@ export function summarizeStorageReport(report: StorageCycleReport): Record<strin
     },
     classifications: report.classifications.map((classification) =>
       classification.state === "unclassified"
-        ? { windowId: classification.windowId, state: classification.state, reason: classification.reason }
+        ? {
+            windowId: classification.windowId,
+            state: classification.state,
+            reason: classification.reason,
+            ...(classification.evidenceUnreadable === undefined ? {} : { evidenceUnreadable: true }),
+          }
         : {
             windowId: classification.windowId,
             state: classification.state,
