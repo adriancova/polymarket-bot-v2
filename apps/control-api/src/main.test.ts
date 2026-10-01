@@ -18,6 +18,7 @@ function validConfig(): string {
     bindPort: 0,
     maxRequestBodyBytes: 65_536,
     auditCapacity: 4096,
+    auditSafetyReserve: 64,
     traderHealth: { kind: "none" },
     operators: [{ operatorId: "operator-a", token: FAKE_OPERATOR_TOKEN, grants: ["READ"] }],
   });

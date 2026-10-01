@@ -16,6 +16,7 @@ function document(overrides: Record<string, unknown> = {}): Record<string, unkno
     bindPort: 0,
     maxRequestBodyBytes: 65_536,
     auditCapacity: 4096,
+    auditSafetyReserve: 64,
     traderHealth: { kind: "none" },
     operators: [{ operatorId: "operator-a", token: TOKEN, grants: ["READ", "KILL_SWITCH"] }],
     ...overrides,
@@ -34,6 +35,7 @@ describe("a valid configuration", () => {
     if (!result.ok) return;
     expect(result.config.bindHost).toBe("127.0.0.1");
     expect(result.config.auditCapacity).toBe(4096);
+    expect(result.config.auditSafetyReserve).toBe(64);
     expect(result.config.traderHealth).toEqual({ kind: "none" });
     expect(result.config.operators[0]?.grants).toEqual(["READ", "KILL_SWITCH"]);
   });
@@ -135,6 +137,7 @@ describe("no bare defaults on anything safety-relevant", () => {
     "bindPort",
     "maxRequestBodyBytes",
     "auditCapacity",
+    "auditSafetyReserve",
     "traderHealth",
     "operators",
   ])("REFUSES a document missing %s rather than defaulting it", (field) => {
@@ -150,6 +153,50 @@ describe("no bare defaults on anything safety-relevant", () => {
 
   it("REFUSES an audit capacity of zero — an unauditable control plane does nothing", () => {
     expect(codes(document({ auditCapacity: 0 }))).toEqual(["CONTROL_CONFIG_INVALID"]);
+  });
+});
+
+describe("CONTROL-1: the audit budget's safety reserve is required, and usable", () => {
+  it.each([0, -1, 1.5, "64", null])(
+    "REFUSES auditSafetyReserve=%s at the schema: a deployment cannot run without a reserve",
+    (reserve) => {
+      expect(codes(document({ auditSafetyReserve: reserve }))).toEqual(["CONTROL_CONFIG_INVALID"]);
+    },
+  );
+
+  it.each([
+    [4096, 2048],
+    [4096, 4096],
+    [3, 2],
+    [2, 1],
+  ])("REFUSES capacity %s with reserve %s: twice the reserve must leave an ordinary tier", (capacity, reserve) => {
+    const result = parseControlApiConfig(document({ auditCapacity: capacity, auditSafetyReserve: reserve }));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.refusals.map((refusal) => refusal.code)).toEqual(["CONTROL_CONFIG_AUDIT_BUDGET"]);
+    expect(result.refusals[0]?.detail).toContain("twice the reserve must be below the capacity");
+  });
+
+  it.each([
+    [4096, 2047],
+    [3, 1],
+  ])("ACCEPTS capacity %s with reserve %s, the smallest ordinary tier being one record", (capacity, reserve) => {
+    expect(codes(document({ auditCapacity: capacity, auditSafetyReserve: reserve }))).toEqual([]);
+  });
+
+  it("does not adopt an INHERITED reserve (ADR-020: a required field is own data)", () => {
+    const incomplete = document();
+    Reflect.deleteProperty(incomplete, "auditSafetyReserve");
+    Object.defineProperty(Object.prototype, "auditSafetyReserve", {
+      value: 64,
+      enumerable: false,
+      configurable: true,
+    });
+    try {
+      expect(codes(incomplete)).toEqual(["CONTROL_CONFIG_INVALID"]);
+    } finally {
+      Reflect.deleteProperty(Object.prototype, "auditSafetyReserve");
+    }
   });
 });
 

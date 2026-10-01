@@ -29,9 +29,11 @@
  *    raise a run mode; the ceiling is not writable" are different messages to
  *    an operator, and the second is the one the packet requires ("refused by
  *    name");
- * 2. it produces an audit record and a counter
- *    (`control_mode_raise_attempts_refused_total`), so a client repeatedly
- *    trying is visible rather than merely unsuccessful;
+ * 2. it produces a counter (`control_mode_raise_attempts_refused_total`) for
+ *    every authenticated caller, and an audit record for a caller holding a
+ *    mutation grant, so a client repeatedly trying is visible rather than
+ *    merely unsuccessful (a READ-only caller is counted, not audited:
+ *    `CONTROL-1`, closing `WP-240` r1 M-3 — `api.ts`, step 3);
  * 3. it runs BEFORE the schema, so it also covers a body shape no schema
  *    matched — a request to an unknown route, or a body that failed for some
  *    other reason, still gets classified as an attempt if it named one of
@@ -86,6 +88,22 @@ export const CONTROL_KILL_SWITCH_ACTIONS = [
 ] as const satisfies readonly KillSwitchActionValue[];
 
 export type ControlKillSwitchAction = (typeof CONTROL_KILL_SWITCH_ACTIONS)[number];
+
+/**
+ * The one §14.1 action this package ORDERS above the others (`CONTROL-1` r1,
+ * closing `CONTROL1-J-M1`).
+ *
+ * §14.1 lists five actions and orders none of them. `FULL_HALT` is the only
+ * one whose name claims to subsume the rest, so it is the only strengthening
+ * this package recognizes: an engage over an engaged switch STRENGTHENS it
+ * exactly when it changes the action to `FULL_HALT`. Every other pair of
+ * distinct actions is treated as UNORDERED — neither provably stronger nor
+ * provably weaker. `control-plane.ts` refuses an engage that would move a
+ * switch away from `FULL_HALT` (that is a release, and a release needs
+ * evidence); `audit-budget.ts` lets only a new switch or an escalation to
+ * `FULL_HALT` use the kill-switch reserve.
+ */
+export const STRONGEST_KILL_SWITCH_ACTION = "FULL_HALT" as const satisfies ControlKillSwitchAction;
 
 /**
  * A control-API caller is a human operator.

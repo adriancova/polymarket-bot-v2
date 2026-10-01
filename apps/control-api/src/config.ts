@@ -33,6 +33,7 @@
 
 import { z } from "zod";
 
+import { auditBudgetProblem } from "./audit-budget.js";
 import { buildDoor, ownNumber, ownString, type DoorResult } from "./doors.js";
 import { OPERATOR_GRANTS, type OperatorGrant } from "./auth.js";
 
@@ -64,6 +65,15 @@ const ControlApiConfigSchema = z.strictObject({
   maxRequestBodyBytes: z.number().int().positive().max(1_048_576),
   /** Audit log capacity. Reaching it stops the control plane from mutating. */
   auditCapacity: z.number().int().positive().max(10_000_000),
+  /**
+   * `CONTROL-1` (closing `WP-240` r1 M-3): the audit budget's safety reserve
+   * `R`. The last `R` records of `auditCapacity` are admitted only for an
+   * applied kill-switch engage, and the `R` before them only for an applied
+   * safety-direction action (`audit-budget.ts`). REQUIRED and at least 1, so a
+   * deployment cannot run without it; `2R < auditCapacity` is checked after
+   * the parse.
+   */
+  auditSafetyReserve: z.number().int().positive().max(5_000_000),
   /**
    * Where the trader health report comes from.
    *
@@ -104,6 +114,7 @@ const ControlApiConfigDoor = buildDoor(
       bindPort: ownNumber(materialized, "bindPort") ?? -1,
       maxRequestBodyBytes: ownNumber(materialized, "maxRequestBodyBytes") ?? -1,
       auditCapacity: ownNumber(materialized, "auditCapacity") ?? -1,
+      auditSafetyReserve: ownNumber(materialized, "auditSafetyReserve") ?? -1,
       traderHealth,
       operators: operatorsNode.operators.map((entry) =>
         Object.assign(Object.create(null) as object, {
@@ -136,6 +147,8 @@ export interface ControlApiConfig {
   readonly bindPort: number;
   readonly maxRequestBodyBytes: number;
   readonly auditCapacity: number;
+  /** The audit budget's safety reserve `R` (`audit-budget.ts`). */
+  readonly auditSafetyReserve: number;
   readonly traderHealth:
     | { readonly kind: "none" }
     | { readonly kind: "http"; readonly url: string; readonly timeoutMs: number };
@@ -152,7 +165,9 @@ export type ConfigRefusalCode =
   /** An operator credential is weak, duplicated, or unusable. */
   | "CONTROL_CONFIG_WEAK_OPERATOR"
   /** The trader health URL is not a loopback HTTP URL. */
-  | "CONTROL_CONFIG_HEALTH_SOURCE_NOT_LOOPBACK";
+  | "CONTROL_CONFIG_HEALTH_SOURCE_NOT_LOOPBACK"
+  /** The audit safety reserve leaves no ordinary tier (`2R ≥ auditCapacity`). */
+  | "CONTROL_CONFIG_AUDIT_BUDGET";
 
 export interface ConfigRefusal {
   readonly code: ConfigRefusalCode;
@@ -202,6 +217,22 @@ export function parseControlApiConfig(document: unknown): ParseConfigResult {
         "public network exposure for an internal control or metrics endpoint, and a deployment " +
         "that needs off-host access owes it a terminator in front rather than a different string " +
         "in this field",
+      issues: [],
+    });
+  }
+
+  const budgetProblem = auditBudgetProblem({
+    capacity: config.auditCapacity,
+    safetyReserve: config.auditSafetyReserve,
+  });
+  if (budgetProblem !== undefined) {
+    refusals.push({
+      code: "CONTROL_CONFIG_AUDIT_BUDGET",
+      detail:
+        `${budgetProblem}. The audit budget reserves auditSafetyReserve records for kill-switch ` +
+        "engages and as many again for safety-direction actions, and every other record shares " +
+        "what is left; a budget with nothing left for refusals, resumes and releases is not a " +
+        "budget this process will run with (README, 'The audit budget')",
       issues: [],
     });
   }
