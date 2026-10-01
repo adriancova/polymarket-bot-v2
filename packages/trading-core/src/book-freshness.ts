@@ -85,11 +85,30 @@
  * the last change (it never moves before it) or another fallback applies (rule
  * 6, a tainted epoch, no confirmation), and an unreadable process clock turns
  * the extension off. Under a replay clock positioned at each recorded
- * event (the backtest), `lag` is 0 and the answer is the recorded one.
+ * event (the backtest), `lag` is 0 and the answer is the unlagged one: what a
+ * live process that kept up with the stream would have computed, not
+ * necessarily what a lagging live process did.
  *
  * PURE STATE, NO CLOCK READ HERE. Every instant arrives from an event's own
  * `receivedAt`, already normalised to strict UTC by `time.ts`, or from the
- * caller's reading of its `Clock` port; replay reproduces both exactly.
+ * caller's reading of its `Clock` port. The answer is a pure function of
+ * those inputs, but replay reproduces only the event instants exactly, not a
+ * live process's clock readings: a replay clock sits at each event (lag 0).
+ * So under an opted-in `CONNECTION_CONFIRMED` basis (ADR-023 D8; review
+ * round 5, R5-L1):
+ *
+ * - a live process that ran behind may have read a book staler than replay
+ *   reads it, never fresher (the guard only removes extension);
+ * - its feed ages and `featureSnapshotRef` hashes carry its process lag, so
+ *   byte parity of its decision records with a replay is NOT guaranteed,
+ *   even where every stale/fresh outcome matches (a 3 ms lag changed 12 of 13
+ *   records in review). Evaluations that fall back (`LAST_CHANGE`, rule 6, a
+ *   tainted epoch, no confirmation) can still match byte for byte;
+ * - the epoch taint is state of the process (rule 4), so parity also needs
+ *   the same start and restart boundaries.
+ *
+ * Under the default `LAST_CHANGE` basis no clock is read and nothing is
+ * tracked here, so replay parity is as it was before ADR-023.
  */
 
 import { formatStrictUtc } from "./time.js";

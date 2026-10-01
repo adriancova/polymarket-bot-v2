@@ -1,6 +1,11 @@
 # ADR-023: Book freshness by delivery-session liveness, not by the last change
 
 - **Status:** Proposed, 2026-09-30. The user ratifies it before `THROUGHPUT-1c` merges.
+  The three rulings its review asked for (the D7 option, the `Clock`-port
+  reading of D7, and the epoch taint of §5) are recorded as the
+  orchestrator's INTERIM rulings in `IMPLEMENTATION_STATUS.md` (Authorized
+  now, `THROUGHPUT-1c`, 2026-10-01). At ratification the user confirms or
+  replaces them; the ratification is still the merge gate.
 - **Date:** 2026-09-30
 - **Recorded by:** `THROUGHPUT-1c`, which also implements it.
 - **Supersedes / Superseded by:** none. It changes how a venue book's AGE is
@@ -16,12 +21,16 @@
   accepted events (X8), and corrected statements on the taint's lifetime
   (X2), the H1 evidence (X3), the configuration identity (X6), the venue
   documentation (X7) and `CO2-N1` (X9). r2 (2026-09-30), after review
-  round 2: the process-lag guard (D7, X9 option (a), pending its ruling),
-  the heartbeat wording (D5, Option B) and the replay-parity qualification
-  (D8). r3 (2026-09-30), wording only: the guard's bound is unguarded
-  `CONNECTION_CONFIRMED`, not `LAST_CHANGE` (D7), and the process lag
-  reaches feature snapshot refs, so opted-in live records have no guaranteed
-  byte parity with replay (D8).
+  round 2: the process-lag guard (D7, X9 option (a), the option the interim
+  ruling later chose), the heartbeat wording (D5, Option B) and the
+  replay-parity qualification (D8). r3 (2026-09-30), wording only: the
+  guard's bound is unguarded `CONNECTION_CONFIRMED`, not `LAST_CHANGE` (D7),
+  and the process lag reaches feature snapshot refs, so opted-in live records
+  have no guaranteed byte parity with replay (D8). r5 (2026-10-01), wording
+  only (review round 5, X9-GOV): the sentences that said a ruling was still
+  owed (D7, §5) now point to the interim rulings recorded in
+  `IMPLEMENTATION_STATUS.md`; the user's ratification is still the merge
+  gate.
 - **Handoff sections:** §6 (invariants 9, 12 and 15), §7.1, §8.1, §9.5, §9.8
   (check 7), §9.9, §12.4, §13.3. **ADRs:** ADR-002 (envelope and ordering),
   ADR-013 (`price_change` semantics), ADR-020 (parse boundaries), ADR-022 (one
@@ -432,12 +441,19 @@ under both bases), a 30-minute replay equal to `LAST_CHANGE` evaluation by
 evaluation, a live process 1 700 ms behind fresh and 1 900 ms behind stale
 at the same event, and a per-event replay clock equal to the unlagged run.
 
-**A ruling is still owed before ratification**, because round 1 asked the
-orchestrator or the user to choose, and the choice is recorded in
-`IMPLEMENTATION_STATUS.md`, not here:
+**The ruling: option (a), interim.** Round 1 asked the orchestrator or the
+user to choose among the three options below. The choice is recorded in
+`IMPLEMENTATION_STATUS.md` (Authorized now, `THROUGHPUT-1c`, "Interim
+rulings", orchestrator, 2026-10-01), not here, as two interim rulings, each
+the most conservative option: option (a), the process-lag guard as
+implemented; and the reading above, that the guard's use of the `Clock` port
+is NOT a clock-semantics change (`CO2-N1` unchanged). Both await the user's
+ratification of this ADR, which is still the merge gate for `THROUGHPUT-1c`;
+at ratification the user confirms or replaces them. The options:
 
-- (a) **the live-admission guard:** implemented in r2 as above. Accepting
-  it closes the conflict with criterion B for this rule;
+- (a) **the live-admission guard:** implemented in r2 as above, and the
+  option the interim ruling chose. Accepting it closes the conflict with
+  criterion B for this rule;
 - (b) **narrowing criterion B** for this rule: accept that event-time
   freshness is judged in event time under both bases until N1 lands. The
   guard would then be stricter than required, never looser, and can stay;
@@ -542,12 +558,16 @@ old recording can never read fresher than it did.
   means this rule changes nothing in an H1-like deployment until the taint is
   narrowed. Narrowing it, for example by not tainting on incidents whose
   envelope `source` is a reference venue, would loosen a fail-closed rule, so
-  it is left to the user's ruling rather than made here. **A ruling is owed
-  before ratification** (review round 2, O-I1(ii)): today the taint applies
-  no source filter (`loop.ts` `#observeDeliverySession`), so the rule's
-  intended effect is unproven in any H1-like deployment until either the
-  narrowing is ruled in or a live run without reference-venue incidents
-  measures it.
+  it is not made here. **The interim ruling (review round 2, O-I1(ii)) keeps
+  the taint coarse and fail-closed:** any incident that names no market
+  taints the gateway epoch, with no source filter (`loop.ts`
+  `#observeDeliverySession`). It is recorded in `IMPLEMENTATION_STATUS.md`
+  (Authorized now, `THROUGHPUT-1c`, "Interim rulings", orchestrator,
+  2026-10-01), and awaits the user's ratification of this ADR, which is still
+  the merge gate. Whether to narrow the taint is the user's open choice at
+  ratification. Until it is narrowed, or a live run without reference-venue
+  incidents measures it, the rule's intended effect is unproven in any
+  H1-like deployment.
 - A book on a session whose only traffic is its own changes behaves exactly as
   before. A whole quiet subscription (no asset changing) goes stale after the
   bound, as before (Option B would be needed to change that).
@@ -565,7 +585,7 @@ old recording can never read fresher than it did.
   assumption (N-A, N-B), and the ceiling is what bounds it. The same bound
   covers the accepted gap of a taint this process never consumed (D2.4, X2).
   The widened `CO2-N1` backlog (D7, X9) is removed by the process-lag guard
-  (r2), subject to its ruling.
+  (r2; option (a), the interim ruling D7 points to, pending ratification).
 - **For the venue register (not this round's paths):** N-B deserves an
   unknown row of its own (no documented cross-asset ordering on the market
   channel), next to U-2 and U-3.
@@ -642,3 +662,9 @@ changed in r3):
 - the composition: a 3 ms lag leaves every stale/fresh verdict unchanged but
   changes the decision records, while under `LAST_CHANGE` the lag changes
   nothing.
+
+r5 adds no pins. It changes wording only: the pointers to the interim
+rulings (D7, §5, header), and the `book-freshness.ts` header's replay
+sentence, which now carries D8's qualification (review round 5, R5-L1). The
+corrected replay statement is already pinned as behaviour by r3's 3 ms
+composition pin above.
