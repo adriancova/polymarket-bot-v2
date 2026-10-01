@@ -51,7 +51,10 @@
  * WHILE another is being delivered (a synchronous requester's answer raising
  * one) is queued too, never delivered re-entrantly, so no requester can drive
  * unbounded recursion; retry never delivers a queued request that a newer
- * request for the same operation supersedes (WP300-R7-X3).
+ * request for the same operation supersedes (WP300-R7-X3). If the operation
+ * was answered during the delivery and sent back to UNKNOWN inside it, it
+ * stays UNKNOWN: the newer, queued request moves it to RECONCILING when retry
+ * delivers it (WP300-R8-X1; the older request never stands in for it).
  *
  * OBSERVATIONS DURING SUBMISSION (WP300-R1-05, WP300-R2-02). While the
  * executor call is still pending:
@@ -106,8 +109,17 @@
  *   member concludes for the whole set: `FAILED(null, R)` concludes an
  *   operation submitted as `(A, R)`, with A never answered by name.
  * Once anything is weighed under reconciliation (an observation, refused
- * reconciliation evidence, a late contradiction), or the set holds two hashes
- * or two relayer ids, no pairing is assumed: every member is answered by name.
+ * reconciliation evidence — including a superseded answer that arrived in
+ * flight — or a late contradiction from the executor; anything but a stale
+ * SUBMITTED/MINED report naming no new member, which changes nothing), or the
+ * set holds two hashes or two relayer ids, no pairing is assumed: every member
+ * is answered by name, terminally (an answer saying "still in flight" is
+ * refused and weighed). That holds even when the weighing happened while no transaction
+ * had been named yet (WP300-R8-02): every member named AFTER it — by the
+ * executor's late answer, an observation or an answer — is answered by name
+ * too. With no member at all there is nothing to name, so a terminal answer
+ * naming no transaction concludes (a CONFIRMED always names its hash, so such
+ * an answer is a FAILED).
  *
  * Per member there is ONE standing outcome (CONFIRMED or FAILED), written by
  * an authoritative answer — for EVERY member the answer names — or by the
@@ -130,7 +142,8 @@
  * - a stale SUBMITTED/MINED report of members, or a repeat of a standing
  *   outcome that is neither FAILED nor unrecognised, changes nothing.
  * Before the conclusion, any such evidence (anything but a stale report)
- * means the WHOLE set must be answered by name, as it must once more than one
+ * means the WHOLE set — members named later included, even if none was named
+ * yet (WP300-R8-02) — must be answered by name, as it must once more than one
  * hash or relayer id was named: the operation stays RECONCILING (reservations
  * and the in-flight hold kept) until every member stands; it then concludes
  * CONFIRMED if any stands CONFIRMED (the lines await a read), else FAILED. A
@@ -170,18 +183,29 @@
  * evidence does not supersede. An answer naming a request not issued for the
  * operation is refused (`WALLET_OP_EVIDENCE_REQUIRED`). A superseded answer
  * never concludes anything: delivered in flight it sends the operation back to
- * reconciliation.
+ * reconciliation (`WALLET_OP_EVIDENCE_SUPERSEDED`, as does a terminal answer
+ * naming a request not issued for the operation), and is then weighed there.
  *
  * Reconciliation evidence that is not RECORDED as a resolution — whatever the
  * reason: not authoritative, inconclusive, superseded, unwitnessed, refused
  * while the executor is pending, contradicting standing evidence, or arriving
- * after a terminal state — is never thrown away: it is handled exactly as the
- * same observation would be (weighed against the whole set outside flight,
- * quarantining after a terminal state and suspending an approval; applied in
- * flight). The one exception is an authoritative answer that repeats, for
- * every member it names, an outcome the authority already gave and that still
- * stands: it carries no new fact (directive 3 would otherwise let a reconciler
- * that answers every member on every request reopen its own answers forever).
+ * after a terminal state — is never thrown away:
+ * - outside flight it is weighed against the whole set exactly as the same
+ *   observation would be (contesting, admitting, requiring every member by
+ *   name; quarantining after a terminal state and suspending an approval);
+ * - in flight, a CURRENT answer is applied exactly as the same observation
+ *   would be (the in-flight trust boundary), while a SUPERSEDED terminal
+ *   answer, or one naming a request not issued for the operation, is never
+ *   applied: it sends the operation back to reconciliation and is then
+ *   weighed there like the same observation outside flight — admitting what
+ *   it names, contesting what it contradicts, requiring every member by name
+ *   (WP300-R8-01). That weighing happens BEFORE the reconciliation request is
+ *   delivered, so the request carries the new members and a requester that
+ *   answers synchronously, inside the call, already has to answer them.
+ * The one exception is an authoritative answer that repeats, for every member
+ * it names, an outcome the authority already gave and that still stands: it
+ * carries no new fact (directive 3 would otherwise let a reconciler that
+ * answers every member on every request reopen its own answers forever).
  * While the executor call is pending, weighed reconciliation evidence raises
  * no request; the executor's answer sends the one owed.
  *
@@ -216,6 +240,7 @@ import {
   type IdentityValues,
   type TerminalOutcome,
   type WeighedEvidence,
+  type Weighing,
 } from "./operation-identity.js";
 import { ok, refuse, type EvidenceValue, type InventoryRefusalCode, type InventoryResult } from "./refusals.js";
 import { isDocumentedApprovalSpender } from "./venue-facts.js";
@@ -609,13 +634,18 @@ export class WalletOperationManager {
    * re-applied).
    *
    * WP300-R7-X1: evidence this method does not RECORD as a resolution is never
-   * thrown away. It is handled exactly as the same fact delivered through
-   * {@link observe} would be — weighed against the whole identity set outside
-   * flight (contesting what it contradicts, admitting what it names, requiring
-   * every member by name, quarantining after a terminal state), applied in
-   * flight — and the call still returns the refusal. The one exception is an
-   * authoritative answer that repeats, for every member it names, what the
-   * authority already said and still stands: it carries no new fact.
+   * thrown away, and the call still returns the refusal. Outside flight it is
+   * handled exactly as the same fact delivered through {@link observe} would
+   * be: weighed against the whole identity set (contesting what it
+   * contradicts, admitting what it names, requiring every member by name,
+   * quarantining after a terminal state). In flight, a current answer is
+   * applied as the same observation would be; a superseded terminal answer, or
+   * one naming a request not issued for the operation, is not applied — it
+   * sends the operation back to reconciliation and is weighed there like the
+   * same observation outside flight, before the request is delivered
+   * (WP300-R8-01). The one exception is an authoritative answer that repeats,
+   * for every member it names, what the authority already said and still
+   * stands: it carries no new fact.
    */
   resolveByReconciliation(operationId: string, evidence: unknown): InventoryResult<WalletOperationView> {
     const operation = this.#operations.get(operationId);
@@ -745,20 +775,28 @@ export class WalletOperationManager {
     if (!terminalState && operation.state !== "RECONCILING" && !answeringRequest) {
       if (authoritative && outcome !== null && (operation.state === "SUBMITTED" || operation.state === "MINED")) {
         // In flight a refused answer is applied like an observation — unless it
-        // is superseded: an old read never concludes anything. It sends the
-        // operation back to reconciliation instead (nothing applied or released).
+        // is superseded (or names a request not issued for this operation): an
+        // old read never concludes anything. It sends the operation back to
+        // reconciliation instead (nothing applied or released) and, once the
+        // operation is out of flight, it is WEIGHED like the same observation
+        // would be there (WP300-R8-01): it admits what it names, contests what it
+        // contradicts, and requires every member by name — all before the
+        // reconciliation request is delivered (see #toUnknown).
         const superseded =
           issuedAt === undefined ? "a reconciliation request not issued for this operation" : operation.identity.supersededFor(outcome, identity, issuedAt);
         if (superseded !== null) {
+          const observation = answerAsObservation(evidence);
           this.#toUnknown(
             operation,
-            `a superseded ${outcome} reconciliation answer arrived in flight (${superseded}); nothing is assumed${this.#bufferedNote(operation)}`,
+            `a superseded ${outcome} reconciliation answer arrived in flight (${superseded}); it is weighed against the whole identity set, nothing is assumed${this.#bufferedNote(operation)}`,
+            weighedEvidence(observation, identityHints(observation)),
           );
           return {
-            result: refuse("WALLET_OP_EVIDENCE_SUPERSEDED", "a superseded answer arrived in flight; the operation is under reconciliation again", {
+            result: refuse("WALLET_OP_EVIDENCE_SUPERSEDED", "a superseded answer arrived in flight; the operation is under reconciliation again and the answer is weighed", {
               operationId,
               supersededBy: superseded,
             }),
+            // Already weighed (above), before the request was delivered.
             weigh: false,
           };
         }
@@ -1104,11 +1142,20 @@ export class WalletOperationManager {
     }
   }
 
-  #toUnknown(operation: Operation, reason: string): void {
+  /**
+   * Move the operation to UNKNOWN and request reconciliation. `evidence`, if
+   * given, is the evidence that sent it back, to be weighed against the whole
+   * identity set once it is out of flight (WP300-R8-01): it is weighed HERE,
+   * after the transition and BEFORE the request is built and delivered, so
+   * the request carries every obligation it creates and a requester that
+   * answers synchronously, inside the call, already meets them.
+   */
+  #toUnknown(operation: Operation, reason: string, evidence: WeighedEvidence | null = null): void {
     // WP300-R7-X3: re-entering reconciliation after a request was issued — the
     // evidence that sent the operation back is newer than any earlier read.
     if (operation.requestCount > 0) operation.identity.supersedeEverything();
     this.#transition(operation, "UNKNOWN", reason);
+    if (evidence !== null) this.#weighUnderReconciliation(operation, evidence);
     this.#requestReconciliation(
       operation,
       requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, reason),
@@ -1168,13 +1215,7 @@ export class WalletOperationManager {
   #weighOutsideFlight(operation: Operation, evidence: WeighedEvidence, what: string, deferRequest = false): void {
     const terminal = isTerminalState(operation.state);
     const before = new Set(unresolvedKeys(operation));
-    const weighed = operation.identity.weigh(evidence, operation.confirmedCredited);
-    const staleReport = (evidence.kind === "SUBMITTED" || evidence.kind === "MINED") && weighed.admitted.length === 0;
-    if (!terminal && !staleReport && operation.identity.keys().length > 0) {
-      // Evidence other than a stale lifecycle report arrived under
-      // reconciliation: the whole set is answered by name from now on.
-      operation.identity.requireEveryKey();
-    }
+    const weighed = this.#weighUnderReconciliation(operation, evidence);
     const unresolved = unresolvedKeys(operation);
     const opened = unresolved.filter((key) => !before.has(key));
     // WP300-R7-X3: evidence that supersedes reads made for earlier requests
@@ -1196,6 +1237,22 @@ export class WalletOperationManager {
       return;
     }
     this.#deliverOrQueue(requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, reason));
+  }
+
+  /**
+   * Weigh evidence about an operation outside flight against the whole
+   * identity set (contradictions, admission, marks) and set the obligation it
+   * creates: evidence other than a stale lifecycle report, arriving before the
+   * conclusion, means the whole set — every member named so far AND every
+   * member named later — is answered by name from now on. That holds even
+   * while the set is still empty (WP300-R8-02: the flag binds what is named
+   * afterwards). Raises no request and quarantines nothing: the caller does.
+   */
+  #weighUnderReconciliation(operation: Operation, evidence: WeighedEvidence): Weighing {
+    const weighed = operation.identity.weigh(evidence, operation.confirmedCredited);
+    const staleReport = (evidence.kind === "SUBMITTED" || evidence.kind === "MINED") && weighed.admitted.length === 0;
+    if (!isTerminalState(operation.state) && !staleReport) operation.identity.requireEveryKey();
+    return weighed;
   }
 
   /**
@@ -1268,9 +1325,22 @@ export class WalletOperationManager {
       operation.requesting = false;
     }
     if (operation.state !== "UNKNOWN") return delivered; // answered during the call
+    if (operation.latestRequestId !== request.requestId && this.#queuedAdvancing(operation.latestRequestId)) {
+      // Answered during the call, moved, and sent back to UNKNOWN inside it: the
+      // newer request raised then (queued, never re-entrant) carries the
+      // operation now and moves it to RECONCILING when retry delivers it. This
+      // one must not stand in for it, or retry would find the operation out of
+      // UNKNOWN and never deliver the newer request.
+      return delivered;
+    }
     if (delivered) this.#transition(operation, "RECONCILING", reason);
     else this.#outstandingRequests.push({ request, advances: true });
     return delivered;
+  }
+
+  /** Whether the request with this id is queued and moves its operation to RECONCILING once delivered. */
+  #queuedAdvancing(requestId: string | null): boolean {
+    return this.#outstandingRequests.some((entry) => entry.advances && entry.request.requestId === requestId);
   }
 
   #deliver(request: ReconciliationRequest): boolean {
@@ -1351,8 +1421,9 @@ export class WalletOperationManager {
       // WP300-R7-X3: outside flight a contradiction is a doubt, weighed (and
       // marked) like an unrecognised observation: reads made before it are
       // superseded. Nothing stands while the executor was pending, so it
-      // contests nothing.
-      operation.identity.weigh({ kind: "UNRECOGNISED", ...hints, credited: null }, operation.confirmedCredited);
+      // contests nothing. Like any evidence weighed under reconciliation, it
+      // ends simple mode: every member is answered by name (WP300-R8-02).
+      this.#weighUnderReconciliation(operation, { kind: "UNRECOGNISED", ...hints, credited: null });
     } else {
       operation.identity.admit(hints);
     }

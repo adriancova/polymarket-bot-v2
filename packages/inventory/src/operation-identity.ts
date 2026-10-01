@@ -23,8 +23,16 @@
  *   id and nothing has been weighed under reconciliation, one terminal answer
  *   naming ANY member concludes the operation for the whole set (so
  *   `FAILED(null, R)` concludes an operation submitted as `(A, R)`).
- * Once anything is weighed under reconciliation, or the set is conflicted,
- * every member must be answered by name and no pairing is assumed.
+ * Once anything is weighed under reconciliation (anything but a stale
+ * SUBMITTED/MINED report naming no new member), or the set is conflicted,
+ * every member must be answered by name and no pairing is assumed — and that
+ * holds even if the weighing happened while the set was still EMPTY
+ * (WP300-R8-02): {@link OperationIdentity.requireEveryKey} is set regardless,
+ * so every member named afterwards (by the executor's late answer, an
+ * observation or an answer) is answered by name too, and no answer that is
+ * not terminal is accepted. With no member at all there is nothing to name:
+ * {@link OperationIdentity.checkAnswer} accepts a terminal answer naming no
+ * transaction then (it is the whole of what can be answered).
  *
  * KEYS. `hash:<h>` and `id:<i>` per member, in order of arrival; `operation`
  * for an operation that concluded before any transaction was named.
@@ -88,8 +96,9 @@
  * (the operation is quarantined while any remain). Before it, the same once
  * the whole set must be answered by name — the operation named more than one
  * hash or relayer id, or evidence arrived while it was under reconciliation
- * (see the manager's header); otherwise one answer naming the operation's
- * transaction concludes it.
+ * (see the manager's header; members named after that evidence included,
+ * WP300-R8-02); otherwise one answer naming the operation's transaction
+ * concludes it.
  */
 
 import { compareDecimal, type DecimalString } from "@polymarket-bot/decimal";
@@ -209,7 +218,11 @@ export class OperationIdentity {
     return this.#everyKey || this.isConflicted();
   }
 
-  /** From now on, every member must be answered by name. Irreversible. */
+  /**
+   * From now on, every member — including members named later — must be
+   * answered by name, terminally. Irreversible. It may be set while the set is
+   * still empty (WP300-R8-02): it then binds whatever is named afterwards.
+   */
   requireEveryKey(): void {
     this.#everyKey = true;
   }
@@ -379,6 +392,10 @@ export class OperationIdentity {
     const named = identityKeys(identity);
     if (this.#anonymous && !this.#standing.has(OPERATION_KEY)) named.unshift(OPERATION_KEY);
     if (named.length === 0) {
+      // WP300-R8-02: every member must be answered by name, but none has been
+      // named yet: there is nothing to name, and the answer concerns the whole
+      // operation (only before the conclusion — a concluded set is never empty).
+      if (this.keys().length === 0) return { ok: true, keys: Object.freeze([]) };
       return refusal("WALLET_OP_EVIDENCE_REQUIRED", "the evidence must name which transaction it resolves; each is resolved by name");
     }
     for (const key of named) {

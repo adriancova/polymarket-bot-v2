@@ -61,6 +61,28 @@
  *   (it carries no new fact);
  * - every identifier a refused answer names must be in the identity set.
  *
+ * WP-300 remediation round 8 (WP300-R8-01, WP300-R8-02) extends both again:
+ * - the generator reaches a superseded answer delivered IN FLIGHT (a seeded
+ *   warm-up returns the operation to flight after a re-entry while a read made
+ *   for the first request is still in transit) and answers naming a request
+ *   not issued for the operation (a foreign request id);
+ * - the oracle records a refused answer that was SUPERSEDED in flight as a
+ *   claim made out of flight (the manager sends the operation back to
+ *   reconciliation and weighs it there), so its new identifiers and its
+ *   success claim create the same obligations as an observation out of flight;
+ * - once a claim was WEIGHED under reconciliation (UNKNOWN or RECONCILING) —
+ *   an observation-source claim other than a stale lifecycle report
+ *   (SUBMITTED/MINED naming nothing new), or a late contradiction from the
+ *   executor (NOT_SENT, an unrecognised answer, another transaction) — every
+ *   identifier first named LATER, by anything, must be answered by name too,
+ *   even if nothing had been named when that claim was made; and a release
+ *   requires every identifier named up to that claim to have been named by
+ *   an accepted answer (WP300-R8-02: no pairing is assumed after it);
+ * - two seeded warm-ups reach those situations directly: a claim weighed while
+ *   nothing is named followed by the executor's late answer naming two
+ *   identifiers, and a late executor contradiction in simple mode, each then
+ *   answered for one identifier only.
+ *
  * fast-check is not a dependency (no new dependency may be added); the
  * generator is the suite's seeded PRNG, so every failure reproduces from its
  * seed, printed with the trace. Executors and reconcilers are in-memory mocks.
@@ -148,6 +170,8 @@ class ClaimsOracle {
   readonly doubts: number[] = [];
   readonly validations: number[] = [];
   readonly syncs: number[] = [];
+  /** The step of the first claim weighed under reconciliation (WP300-R8-02): later new identifiers are due by name. */
+  everyKeyFrom: number | null = null;
 
   answeredAfter(t: number, key?: string): boolean {
     return this.answers.some((answer) => answer.t > t && (key === undefined || answer.named.includes(key)));
@@ -158,10 +182,21 @@ class ClaimsOracle {
     const unmet: string[] = [];
     for (const claim of this.claims) {
       const outOfFlight = !IN_FLIGHT.has(claim.stateBefore);
-      const freshDue = claim.fresh.length > 0 && (claim.conflicting || (claim.source === "observation" && outOfFlight));
+      const afterWeighing = this.everyKeyFrom !== null && claim.t > this.everyKeyFrom;
+      const freshDue =
+        claim.fresh.length > 0 && (claim.conflicting || (claim.source === "observation" && outOfFlight) || afterWeighing);
       if (which.fresh && freshDue) {
         for (const key of claim.fresh) {
           if (!this.answeredAfter(claim.t, key)) unmet.push(`t${String(claim.t)} new ${key} never answered`);
+        }
+      }
+      // WP300-R8-02: after the first claim weighed under reconciliation, no pairing is
+      // assumed — every identifier named up to it must have been named by an accepted answer.
+      if (which.fresh && this.everyKeyFrom !== null && claim.t <= this.everyKeyFrom) {
+        for (const key of claim.named) {
+          if (!this.answers.some((answer) => answer.named.includes(key)) && !unmet.includes(`${key} never named by an answer`)) {
+            unmet.push(`${key} never named by an answer`);
+          }
         }
       }
       if (claim.source !== "observation") continue;
@@ -216,6 +251,12 @@ interface Coverage {
   acceptedForOlderRequest: number;
   unboundAccepted: number;
   unboundRefused: number;
+  supersededInFlight: number;
+  supersededInFlightNamingNew: number;
+  unknownRequestAnswers: number;
+  unknownRequestInFlight: number;
+  namedAfterEmptyWeighing: number;
+  lateContradictionsWeighed: number;
 }
 
 function newCoverage(): Coverage {
@@ -241,8 +282,17 @@ function newCoverage(): Coverage {
     acceptedForOlderRequest: 0,
     unboundAccepted: 0,
     unboundRefused: 0,
+    supersededInFlight: 0,
+    supersededInFlightNamingNew: 0,
+    unknownRequestAnswers: 0,
+    unknownRequestInFlight: 0,
+    namedAfterEmptyWeighing: 0,
+    lateContradictionsWeighed: 0,
   };
 }
+
+/** A request id never issued for the operation (WP300-R8-01: a foreign or pre-restart id). */
+const FOREIGN_REQUEST = "wallet-op:foreign:reconciliation:1";
 
 /** A member (70%), a value never named (when one is left), or nothing. */
 function chooseValue(random: () => number, members: readonly string[], pool: readonly string[]): string | null {
@@ -343,7 +393,18 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   let executorPending = mode === "pending";
   if (!executorPending) await submitting;
 
-  function recordClaim(source: Claim["source"], claimKind: ClaimKind, hash: string | null, id: string | null, before: WalletOperationView): void {
+  /** The set was empty when the first claim was weighed under reconciliation (WP300-R8-02 coverage). */
+  let everyKeyFromEmpty = false;
+
+  function recordClaim(
+    source: Claim["source"],
+    claimKind: ClaimKind,
+    hash: string | null,
+    id: string | null,
+    before: WalletOperationView,
+    stateBefore: string = before.state,
+    executorChoice: string | null = null,
+  ): void {
     const fresh = [
       ...(hash !== null && !before.transactionHashes.includes(hash) ? [`hash:${hash}`] : []),
       ...(id !== null && !before.transactionIds.includes(id) ? [`id:${id}`] : []),
@@ -351,7 +412,24 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     const conflicting =
       (hash !== null && before.transactionHashes.length > 0 && !before.transactionHashes.includes(hash)) ||
       (id !== null && before.transactionIds.length > 0 && !before.transactionIds.includes(id));
-    oracle.claims.push({ t, source, kind: claimKind, named: keysOf(hash, id), fresh, conflicting, stateBefore: before.state });
+    if (fresh.length > 0 && oracle.everyKeyFrom !== null && t > oracle.everyKeyFrom && everyKeyFromEmpty) {
+      coverage.namedAfterEmptyWeighing += 1;
+    }
+    oracle.claims.push({ t, source, kind: claimKind, named: keysOf(hash, id), fresh, conflicting, stateBefore });
+    // WP300-R8-02: the first claim weighed under reconciliation (anything but a stale lifecycle
+    // report; from the executor, a late contradiction — a THROW carries no new fact).
+    const staleReport = (claimKind === "SUBMITTED" || claimKind === "MINED") && fresh.length === 0;
+    const weighed =
+      source === "observation"
+        ? !staleReport
+        : executorChoice === "NOT_SENT" || executorChoice === "???" || (executorChoice === "SUBMITTED" && conflicting);
+    if (source === "executor" && (stateBefore === "UNKNOWN" || stateBefore === "RECONCILING") && weighed) {
+      coverage.lateContradictionsWeighed += 1;
+    }
+    if ((stateBefore === "UNKNOWN" || stateBefore === "RECONCILING") && weighed && oracle.everyKeyFrom === null) {
+      oracle.everyKeyFrom = t;
+      everyKeyFromEmpty = before.transactionHashes.length === 0 && before.transactionIds.length === 0;
+    }
     if (claimKind === "FAILED" || claimKind === "UNRECOGNISED" || (source === "executor" && claimKind === "NOT_SENT")) {
       oracle.doubts.push(t);
     }
@@ -397,9 +475,14 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     if (requestId !== null) evidence["requestId"] = requestId;
     const result = manager.resolveByReconciliation("op", evidence);
     const olderRequest = requestId !== null && requestId !== latestRequestId();
+    const foreign = requestId === FOREIGN_REQUEST;
     trace.push(
-      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) read t${String(readAt)} for ${requestId === null ? "no request" : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
+      `t${String(t)} [${before.state}${before.quarantined ? ",Q" : ""} U=${before.unresolvedTransactions.join("|")}] answer ${source === "AUTHORITATIVE_READ" ? "" : `${source} `}${state}(${String(hash)},${String(id)}) read t${String(readAt)} for ${requestId === null ? "no request" : foreign ? "a foreign request" : `${olderRequest ? "an older " : "the latest "}request`} → ${result.ok ? "ok" : result.refusal.code}`,
     );
+    if (foreign) {
+      coverage.unknownRequestAnswers += 1;
+      if (before.state === "SUBMITTED" || before.state === "MINED") coverage.unknownRequestInFlight += 1;
+    }
     if (readAt < t) coverage.delayedDeliveries += 1;
     const named = keysOf(hash, id);
     if (result.ok) {
@@ -443,7 +526,22 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     }
     coverage.refusedAnswersAsClaims += 1;
     if (IN_FLIGHT.has(before.state)) coverage.refusedAnswersInFlight += 1;
-    recordClaim("observation", classify({ status: state, transactionHash: hash, transactionId: id }), hash, id, before);
+    // WP300-R8-01: a superseded answer delivered in flight sends the operation back to
+    // reconciliation and is weighed there — a claim made out of flight.
+    const supersededInFlight = code === "WALLET_OP_EVIDENCE_SUPERSEDED" && (before.state === "SUBMITTED" || before.state === "MINED");
+    if (supersededInFlight) {
+      coverage.supersededInFlight += 1;
+      const known = [...before.transactionHashes.map((h) => `hash:${h}`), ...before.transactionIds.map((i) => `id:${i}`)];
+      if (named.some((key) => !known.includes(key))) coverage.supersededInFlightNamingNew += 1;
+    }
+    recordClaim(
+      "observation",
+      classify({ status: state, transactionHash: hash, transactionId: id }),
+      hash,
+      id,
+      before,
+      supersededInFlight ? "UNKNOWN" : before.state,
+    );
     const after = current();
     for (const value of [hash, id]) {
       if (value !== null && !after.transactionHashes.includes(value) && !after.transactionIds.includes(value)) {
@@ -462,7 +560,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
     const before = current();
     const claimKind: ClaimKind =
       choice === "SUBMITTED" ? (hash !== null || id !== null ? "SUBMITTED" : "UNRECOGNISED") : choice === "NOT_SENT" ? "NOT_SENT" : "UNRECOGNISED";
-    recordClaim("executor", claimKind, choice === "SUBMITTED" ? hash : null, choice === "SUBMITTED" ? id : null, before);
+    recordClaim("executor", claimKind, choice === "SUBMITTED" ? hash : null, choice === "SUBMITTED" ? id : null, before, before.state, choice);
     trace.push(`t${String(t)} [${before.state}] executor ${choice}(${String(hash)},${String(id)})`);
     if (before.state !== "PLANNED") coverage.lateExecutorAnswers += 1;
     if (choice === "THROW") rejectExecutor(new Error("socket closed"));
@@ -550,10 +648,58 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   // Seeded warm-ups (then random noise): reach the situations the findings were about.
   const otherHash = HASHES.find((hash) => hash !== firstHash) ?? firstHash;
   const otherId = pick(random, IDS.filter((id) => id !== firstId));
-  const warmUp = pick(random, ["none", "confirmed", "per-key", "per-key"] as const);
-  if (warmUp !== "none") {
+  const warmUp = pick(random, ["none", "confirmed", "per-key", "per-key", "re-entry", "empty-weighing", "late-contradiction"] as const);
+  if (warmUp === "empty-weighing" || warmUp === "late-contradiction") {
+    // WP300-R8-02: evidence weighed under reconciliation ends simple mode, even while
+    // nothing is named, and a late contradiction from the executor ends it too.
+    if (executorPending) {
+      const id = firstId ?? otherId;
+      if (warmUp === "empty-weighing") {
+        await step(() => observe("DROPPED", null, null, null));
+        await step(() => observe(pick(random, ["FAILED", "UNKNOWN", "DROPPED"]), null, null, null));
+        await step(async () => void (await executorAnswers("SUBMITTED", firstHash, id)));
+      } else {
+        await step(() => observe("DROPPED", firstHash, id, null));
+        await step(async () => void (await executorAnswers(pick(random, ["NOT_SENT", "???"] as const), null, null)));
+      }
+      // One identifier answered by name, for the latest request.
+      await step(() => (random() < 0.5 ? answer("FAILED", null, id) : answer("FAILED", firstHash, null)));
+    }
+  } else if (warmUp !== "none") {
     if (executorPending) await step(async () => void (await executorAnswers("SUBMITTED", firstHash, firstId)));
-    if (current().state === "SUBMITTED" && warmUp === "confirmed") {
+    if (current().state === "SUBMITTED" && warmUp === "re-entry") {
+      // WP300-R8-01: a read made for the first request is still in transit when the
+      // operation, back in flight after a re-entry, receives it (or the loop does later).
+      await step(() => observe("DROPPED", firstHash, null, null));
+      const first = latestRequestId();
+      if (current().state === "RECONCILING" && first !== null) {
+        const outcome = random() < 0.5 ? "CONFIRMED" : "FAILED";
+        const hash = outcome === "CONFIRMED" ? pick(random, [firstHash, otherHash]) : pick(random, [firstHash, otherHash, null]);
+        // Biased toward a relayer id the set has not seen (with no relayer id yet, it is not a conflict).
+        const id = pick(random, [otherId, otherId, firstId, null]);
+        await step(() => {
+          pendingAnswers.push(read(outcome, hash, id, "AUTHORITATIVE_READ", first));
+          trace.push(`t${String(t)} reconciler reads ${outcome}(${String(hash)},${String(id)}) for the first request`);
+        });
+        await step(() => answer("MINED", firstHash, firstId));
+        await step(() => observe("UNKNOWN", null, null, null));
+        await step(() => answer("MINED", firstHash, firstId));
+        const view = current();
+        const roll = random();
+        if ((view.state === "SUBMITTED" || view.state === "MINED") && roll < 0.5) {
+          const stale = pendingAnswers.pop() as PendingAnswer;
+          await step(() => deliver(stale));
+          // Then, usually, a current answer for the first identifier only.
+          if (current().state === "RECONCILING" && random() < 0.7) await step(() => answer("FAILED", firstHash, null));
+        } else if (view.state === "SUBMITTED" || view.state === "MINED") {
+          // Or an answer naming a request never issued for this operation arrives in flight.
+          const foreignOutcome = roll < 0.75 ? "CONFIRMED" : "FAILED";
+          const foreignHash = foreignOutcome === "CONFIRMED" ? pick(random, [firstHash, otherHash]) : pick(random, [firstHash, otherHash, null]);
+          const foreignId = pick(random, [firstId, otherId, null]);
+          await step(() => deliver(read(foreignOutcome, foreignHash, foreignId, "AUTHORITATIVE_READ", FOREIGN_REQUEST)));
+        }
+      }
+    } else if (current().state === "SUBMITTED" && warmUp === "confirmed") {
       await step(() => observe("CONFIRMED", firstHash, firstId, kind === "WRAP_COLLATERAL" ? "10" : null));
     } else if (current().state === "SUBMITTED") {
       // The verifier's setup: another transaction is named, so every identifier is resolved by name.
@@ -587,6 +733,7 @@ async function run(seed: number, kind: OpKind, coverage: Coverage): Promise<void
   /** The request a read is made for: usually the latest delivered one, sometimes an older one, sometimes none named. */
   function requestFor(): string | null {
     const roll = random();
+    if (roll < 0.035) return FOREIGN_REQUEST; // WP300-R8-01: a request not issued for this operation
     if (roll < 0.1 || reconciler.requests.length === 0) return null;
     if (roll < 0.25) return pick(random, reconciler.requests).requestId;
     return latestRequestId();

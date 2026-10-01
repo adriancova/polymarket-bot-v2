@@ -533,8 +533,11 @@ describe("WP300-R7-X1: refused reconciliation evidence is weighed like an observ
   });
 
   it("a request raised while another is being delivered is queued, not delivered re-entrantly: the operation stays UNKNOWN until retry", async () => {
-    const h = await submitted(SPLIT, () => Promise.resolve({ status: "???" }));
-    expect(h.manager.operation("op")?.state).toBe("RECONCILING");
+    // Amended in r8 (setup only): the operation starts in flight under A. The r7
+    // setup returned to flight after an observation was weighed under
+    // reconciliation while the set was empty, which WP300-R8-02 closes.
+    const h = await submitted(SPLIT);
+    expect(h.manager.operation("op")?.state).toBe("SUBMITTED");
     // A synchronous reconciler: on each request it says "still in flight" under A, then reports B.
     h.reconciler.onRequest = (request) => {
       h.manager.resolveByReconciliation("op", auth("MINED", TX_A, null, request.requestId));
@@ -544,9 +547,12 @@ describe("WP300-R7-X1: refused reconciliation evidence is weighed like an observ
     // MINED(B) in flight conflicts: back to UNKNOWN, and that request is queued, not delivered inside the call.
     expect(h.manager.operation("op")?.state).toBe("UNKNOWN");
     expect(h.manager.outstandingReconciliationRequests()).toHaveLength(1);
+    expect(h.reconciler.requests).toHaveLength(1);
     h.reconciler.onRequest = undefined;
     expect(h.manager.retryReconciliationRequests()).toBe(1);
     expect(h.manager.operation("op")?.state).toBe("RECONCILING");
+    // The request retry delivered is the one that names B (WP300-R8: it is not dropped).
+    expect(h.reconciler.requests.at(-1)?.transactionHashes).toEqual([TX_A, TX_B]);
     expectHeld(h, SPLIT);
   });
 });
@@ -638,13 +644,19 @@ describe("WP300-R7-X4: the pairing still assumed is the one the headers state", 
 describe("WP300-R7-X3 in flight: a superseded answer never concludes; it sends the operation back to reconciliation", () => {
   for (const named of [false, true]) {
     it(`a superseded FAILED${named ? "(A)" : ""} delivered after reconciliation returned the operation to flight releases nothing`, async () => {
-      // The executor answers something unrecognised: UNKNOWN with no identity, request 1.
-      const h = await submitted(SPLIT, () => Promise.resolve({ status: "???" }));
+      // Amended in r8 (setup only): the r7 setup returned to flight after an
+      // observation was weighed under reconciliation while the set was empty,
+      // which WP300-R8-02 closes. Here nothing is weighed before the return to
+      // flight; the read is superseded by the operation re-entering reconciliation.
+      const h = await submitted(SPLIT);
+      // In flight, DROPPED: UNKNOWN, then RECONCILING with request 1.
+      h.manager.observe("op", { status: "DROPPED" });
       expect(h.manager.operation("op")?.state).toBe("RECONCILING");
       // A job reads FAILED for request 1 (delivered later).
       const stale = auth("FAILED", named ? TX_A : null, null, h.reconciler.id(1));
-      // An unrecognised observation naming nothing (a success claim about the whole operation): request 2.
-      h.manager.observe("op", { status: "DROPPED" });
+      // Another job says "still in flight" for request 1, then the operation re-enters reconciliation: request 2.
+      expect(code(h.manager.resolveByReconciliation("op", auth("MINED", TX_A, null, h.reconciler.id(1))))).toBe("ok");
+      h.manager.observe("op", { status: "UNKNOWN" });
       expect(h.reconciler.requests).toHaveLength(2);
       // Reconciliation says "still in flight" for request 2: the operation returns to SUBMITTED.
       expect(code(h.manager.resolveByReconciliation("op", auth("SUBMITTED", TX_A, null, h.reconciler.id(2))))).toBe("ok");
@@ -659,8 +671,32 @@ describe("WP300-R7-X3 in flight: a superseded answer never concludes; it sends t
     });
   }
 
+  it("added in r8 (restores the R7-X3-o coverage the amended setup above no longer gives): an unnamed claim concerns a transaction named later without a mark", async () => {
+    // The executor's late answer admits its identity without a mark, so only the
+    // unnamed claim's mark on the operation as a whole can supersede the read.
+    let answer: (value: unknown) => void = () => undefined;
+    const pending = new Promise<unknown>((resolve) => {
+      answer = resolve;
+    });
+    const h = harness(() => pending);
+    expect(h.manager.plan({ ...SPLIT.plan, operationId: "op", accountRef: ACCOUNT }).ok).toBe(true);
+    const submitting = h.manager.submit("op");
+    h.manager.observe("op", { status: "DROPPED" });
+    expect(h.manager.operation("op")?.state).toBe("RECONCILING");
+    // A job reads FAILED(A) for request 1 (delivered later).
+    const stale = auth("FAILED", TX_A, null, h.reconciler.id(1));
+    // An unrecognised observation naming nothing: a claim about the whole operation.
+    h.manager.observe("op", { status: "UNKNOWN" });
+    answer({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
+    await submitting;
+    expect(h.manager.operation("op")?.transactionHashes).toEqual([TX_A]);
+    expect(code(h.manager.resolveByReconciliation("op", stale))).toBe("WALLET_OP_EVIDENCE_SUPERSEDED");
+    expectHeld(h, SPLIT);
+  });
+
   it("a current refused answer in flight is applied like the same observation (WP300-R7-X1 parity; the contrast to the superseded case)", async () => {
-    const h = await submitted(SPLIT, () => Promise.resolve({ status: "???" }));
+    // Amended in r8 (setup only; see above): in flight under A, DROPPED raises request 1.
+    const h = await submitted(SPLIT);
     h.manager.observe("op", { status: "DROPPED" });
     expect(code(h.manager.resolveByReconciliation("op", auth("SUBMITTED", TX_A, null, h.reconciler.latest())))).toBe("ok");
     expect(code(h.manager.resolveByReconciliation("op", auth("FAILED", TX_A, null, h.reconciler.latest())))).toBe(
