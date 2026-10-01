@@ -90,13 +90,39 @@ It prints one JSON report and exits. Run it on a timer.
 **One cycle at a time.** Every cycle holds the lock
 `<state dir>/storage-cycle.<boot id>.lock` from its start to its end, in either mode, so an
 operator's dry run and the timer's cycle never interleave their reads and writes of the
-holds or the clock state. A cycle that finds the lock held waits up to 5 minutes, then exits
-non-zero having done nothing; the error names the holder. A lock left by a process that a
-reboot ended carries the old boot's id and holds nothing after the reboot; it may be
-removed. A lock left in the same boot by a killed process (`kill -9`, or a service stopped
-mid-cycle) is never broken automatically: every later cycle refuses, deleting nothing, until
-it is removed after checking that no storage cycle runs. The lock serializes cycles on one
-host; a state directory shared between hosts is not supported.
+holds or the clock state. Two cycles exclude each other only when they read the same boot
+id. The lock behaves as follows:
+
+- **A held lock.** A cycle that finds the lock held waits up to 5 minutes, then exits
+  non-zero having done nothing; the error names the holder.
+- **A reboot.** A lock left by a process that a reboot ended carries the old boot's id and
+  holds nothing after the reboot; it may be removed.
+- **A killed process.** A lock left in the same boot by a killed process (`kill -9`, or a
+  service stopped mid-cycle) is never broken automatically: every later cycle refuses,
+  deleting nothing, until it is removed after checking that no storage cycle runs.
+- **A lock that cannot be created.** If the lock cannot be created for any reason other than
+  being held (permission denied, a read-only or full filesystem, too many open files), the
+  cycle exits non-zero at once having done nothing. The error names the cause. It removes
+  nothing, not even a file at the lock's path.
+- **No boot id, no cycle (`STORAGE-1b`).** The boot id is read from
+  `/proc/sys/kernel/random/boot_id`. A cycle that cannot read it, or reads anything but a
+  lowercase UUID, exits non-zero having done nothing, not even creating the state directory.
+  The error (`StorageCycleLockError`, printed as `storage-cycle-fatal`) names the cause.
+  There is no fallback lock name: a cycle on another name would not exclude the others.
+  - The command therefore runs only on Linux, where every process reads the kernel's boot
+    id, containers included.
+  - **systemd's `ProcSubset=pid` is not supported.** It mounts `/proc` with `subset=pid`,
+    which hides `/proc/sys`, so a timer unit hardened that way refuses every cycle. Leave
+    `ProcSubset` unset in the storage unit. `ProtectProc=` does not hide the boot id.
+  - A sandbox that presents a boot id of its own, such as gVisor or a virtual machine,
+    counts as another host. Do not share a state directory with one.
+- **`<state dir>/storage-cycle.lock` must be removed by hand.** Versions before
+  `STORAGE-1b` took this lock where they could not read the boot id. A cycle now treats
+  that file as held: it waits, then refuses, naming it. Nothing removes it automatically.
+  Remove it once no storage cycle of an earlier version runs.
+
+The lock serializes cycles on one host; a state directory shared between hosts is not
+supported.
 
 `<state dir>/evidence-holds.json` is never edited by hand in normal operation. Removing it,
 or a window's entry in it, releases those holds without verifying anything, so do that only

@@ -34,7 +34,8 @@
  *
  * A cycle with a state directory runs whole under that directory's cycle lock
  * (`cycle-lock.ts`): the timer and a dry run never interleave their reads and
- * writes of the holds or the clock state.
+ * writes of the holds or the clock state. A cycle that cannot read this
+ * host's boot id, the lock's name, refuses before it reads or writes anything.
  */
 
 import type {
@@ -136,7 +137,7 @@ export type StorageCycleDependencies = {
   readonly operatorPinLock?: OperatorPinLock;
   /** The evidence holds file's operations; the real filesystem when absent. A test substitutes them to fail each step. */
   readonly evidenceHoldsFileSystem?: EvidenceHoldsFileSystem;
-  /** The state directory's cycle lock: how long to wait for a running cycle (`cycle-lock.ts`). */
+  /** The state directory's cycle lock: how long to wait for a running cycle; a test substitutes its boot id or file operations (`cycle-lock.ts`). */
   readonly cycleLock?: StorageCycleLockOptions;
 };
 
@@ -262,7 +263,8 @@ async function epochWrittenBytes(
 /**
  * Run one storage cycle. In `dry-run` (the default), nothing is deleted. With
  * a state directory, the whole cycle holds that directory's cycle lock; a
- * cycle that cannot take it in time refuses, having done nothing.
+ * cycle that cannot take it in time, cannot create it, or cannot read this
+ * host's boot id refuses (`StorageCycleLockError`), having done nothing.
  */
 export async function runStorageCycle(dependencies: StorageCycleDependencies): Promise<StorageCycleReport> {
   if (
