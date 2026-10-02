@@ -448,10 +448,16 @@
  *   bound to it afterwards: a later answer naming it — a verbatim replay of
  *   the same values included — is refused like the first (WP300C-R2-X1). If
  *   it is the operation's latest request once that answer has been handled,
- *   and the operation still awaits an answer, a fresh request replaces it at
- *   once (while the executor call is pending, the fresh request is owed, and
- *   sent when the executor answers), so the reconciler always holds a request
- *   it can answer;
+ *   and the operation still awaits an answer (only RECONCILING, or terminal
+ *   and quarantined: not in flight, and not terminal without a quarantine —
+ *   WP300C-R3-02), a fresh request replaces it. It is sent then, or queued
+ *   if it cannot be delivered then (the reconciler refused it, its token draw
+ *   failed, or this runs inside another request's delivery, which is never
+ *   re-entered), and retry delivers it — after a failed draw, a fresh request
+ *   in its place (WP300C-R3-01). While the executor call is pending, the
+ *   fresh request is owed instead, and sent when the executor answers. So the
+ *   reconciler always holds a request it can answer, or is handed one by
+ *   retry;
  * - every request id carries a TOKEN that no reconciler can know before it
  *   receives the request (WP300C-J1): `compositeKey("wallet-op", operationId,
  *   "reconciliation", n, token)`, the token drawn once per id from the
@@ -1130,11 +1136,16 @@ export class WalletOperationManager {
    * WP300C-R2-X1: an answer named the operation's LATEST request although the
    * reconciler received it only during that answer's own read, so no answer is
    * ever bound to it. While the operation still awaits an answer — under
-   * reconciliation, or terminal and quarantined — a fresh request replaces it
-   * now; while the executor call is pending, the request is owed and sent when
-   * the executor answers (WP300-R7-X1). So the reconciler always holds a
-   * request it can answer. (If the answer's own weighing already raised a
-   * newer request, there is nothing to replace.)
+   * reconciliation, or terminal and quarantined; never in flight, nor terminal
+   * without a quarantine (WP300C-R3-02) — a fresh request replaces it: sent
+   * now, or queued if it cannot be delivered now (the reconciler refused it,
+   * its token draw failed, or this runs inside another request's delivery,
+   * never re-entered), and delivered by retry (after a failed draw, retry
+   * sends a fresh request in its place; WP300C-R3-01). While the executor
+   * call is pending, the request is owed instead, and sent when the executor
+   * answers (WP300-R7-X1). So the reconciler always holds a request it can
+   * answer, or is handed one by retry. (If the answer's own weighing already
+   * raised a newer request, there is nothing to replace.)
    */
   #replaceNamedBeforeReceipt(operation: Operation): void {
     const latest = operation.latestRequestId;

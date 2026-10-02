@@ -49,6 +49,22 @@
  * WP300C-R2-X2 (LOW, round 2): that first refusal said the reconciler "never
  * received" the request, although it was received during the answer's read.
  *
+ * WP300C-R3-01 (LOW, round 3): no pin covered the replacement request when it
+ * cannot be delivered at once. The code queues it (`#deliverOrQueue`), but a
+ * mutant that only tried to deliver it (O-2) survived the whole suite: with
+ * the reconciler down it stranded the operation in RECONCILING (nothing
+ * queued, retry delivering nothing, an honest answer refused); raised inside
+ * another operation's delivery, it delivered re-entrantly. Pinned: the
+ * replacement is queued when the reconciler is down, when its token draw
+ * fails, and when it is raised inside another operation's delivery; it is
+ * never delivered re-entrantly, and retry delivers it (after a failed draw, a
+ * fresh request in its place).
+ * WP300C-R3-02 (INFO, round 3): no negative pin covered where the replacement
+ * fires (mutants O-7 and O-8 survived). Pinned: none fires when the recorded
+ * id is the latest of an operation that is terminal and not quarantined, or
+ * back in flight. These are test-only pins: they pass on `168760f` (the code
+ * was right) and fail on O-2, O-7 and O-8.
+ *
  * Pins marked "(control)" pass on the base (`28d542a`) too. The WP300C-J2 and
  * WP300C-J7 pins (except the controls) fail on the round-0 candidate
  * (`dcad467`) as well.
@@ -75,10 +91,19 @@ class Reconciler {
   readonly received: ReconciliationRequest[] = [];
   failing = false;
   onRequest: ((request: ReconciliationRequest) => void) | undefined;
+  /** How many `request` calls are in progress now, and the most ever at once (WP300C-R3-01: never above 1). */
+  depth = 0;
+  maxDepth = 0;
   request(request: ReconciliationRequest): void {
     if (this.failing) throw new Error("reconciler unavailable");
     this.received.push(request);
-    this.onRequest?.(request);
+    this.depth += 1;
+    this.maxDepth = Math.max(this.maxDepth, this.depth);
+    try {
+      this.onRequest?.(request);
+    } finally {
+      this.depth -= 1;
+    }
   }
   ids(operationId = "op"): string[] {
     return this.received.filter((request) => request.walletOperationId === operationId).map((request) => request.requestId);
@@ -498,9 +523,10 @@ type Kind = "SPLIT" | "APPROVE_ERC20" | "APPROVE_ERC1155";
 /**
  * WP300C-R2-X1: a SPLIT or an approval in flight (SUBMITTED(A)), plus what
  * shows whether its reservation was released (SPLIT) or the approval is ready
- * after a CLOB allowance sync.
+ * after a CLOB allowance sync. `requestToken` replaces the default counter
+ * source (WP300C-R3-01: one whose draws can be made to fail).
  */
-async function inFlight(kind: Kind) {
+async function inFlight(kind: Kind, requestToken?: () => string) {
   const book = seededBook({ [PUSD]: "100", [YES]: "20", [NO]: "20", [USDC_E]: "50" });
   const approvals = new ApprovalTracker();
   const reconciler = new Reconciler();
@@ -508,7 +534,7 @@ async function inFlight(kind: Kind) {
   const executor: WalletOperationExecutor = {
     submit: () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null }),
   };
-  const manager = new WalletOperationManager({ requestToken: tokens.next, book, approvals, executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestToken ?? tokens.next, book, approvals, executor, reconciler });
   const plan =
     kind === "SPLIT"
       ? { type: kind, operationId: "op", accountRef: ACCOUNT, conditionId: CONDITION, amount: "10" }
@@ -543,9 +569,18 @@ async function inFlight(kind: Kind) {
  * The answer `values` as a Proxy: the FIRST read of `field` calls `act` (back
  * into the manager) before the descriptor is reported, and `requestId` names
  * the request the reconciler received last, as it is when that field is read.
+ * `later`, if given, is a second trap of the same kind on a field the door
+ * reads after `requestId` (the binding is settled by then; WP300C-R3-01).
  */
-function namingTheLatest(values: Readonly<Record<string, unknown>>, field: string, act: () => void, reconciler: Reconciler) {
+function namingTheLatest(
+  values: Readonly<Record<string, unknown>>,
+  field: string,
+  act: () => void,
+  reconciler: Reconciler,
+  later?: { readonly field: string; readonly act: () => void },
+) {
   let fired = false;
+  let laterFired = false;
   let named: string | undefined;
   const proxy = new Proxy(
     {},
@@ -554,6 +589,10 @@ function namingTheLatest(values: Readonly<Record<string, unknown>>, field: strin
         if (key === field && !fired) {
           fired = true;
           act();
+        }
+        if (later !== undefined && key === later.field && !laterFired) {
+          laterFired = true;
+          later.act();
         }
         if (key === "requestId") {
           named ??= reconciler.latest();
@@ -705,6 +744,229 @@ describe("WP300C-R2-X1: an id received only during an answer's own read is never
     expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     expect(x.reconciler.ids()).toHaveLength(3);
     expect(x.reconciler.received.at(-1)?.reason).not.toContain("this request replaces it");
+  });
+});
+
+// ---------------------------------------------------------- WP300C-R3-01 --
+
+/** A MINED(A) report: weighed under reconciliation it raises no request, so a replacement is the only one raised. */
+const MINED_A_ANSWER = Object.freeze({ source: "AUTHORITATIVE_READ", state: "MINED", transactionHash: TX_A, transactionId: null });
+
+describe("WP300C-R3-01: a replacement request that cannot be delivered at once is queued — never lost, never delivered re-entrantly — and retry delivers it", () => {
+  for (const where of ["RECONCILING", "FAILED and quarantined"] as const) {
+    it(`${where}: the reconciler is down when the replacement is raised — it is queued, not lost; retry delivers it, and FAILED(A) for it ${where === "RECONCILING" ? "concludes" : "lifts the quarantine"} (liveness)`, async () => {
+      const x = await inFlight("SPLIT");
+      x.manager.observe("op", DROPPED_A);
+      if (where === "FAILED and quarantined") {
+        expect(code(x.manager.resolveByReconciliation("op", failed(x.reconciler.latest())))).toBe("ok");
+        // A contradicting observation after the conclusion: quarantined.
+        x.manager.observe("op", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
+        expect(x.manager.operation("op")).toMatchObject({ state: "FAILED", quarantined: true });
+      }
+      const before = x.reconciler.ids().length;
+      // The state trap delivers a request (the answer names it: recorded), then the reconciler goes down.
+      const answer = namingTheLatest(
+        MINED_A_ANSWER,
+        "state",
+        () => {
+          x.manager.observe("op", DROPPED_A);
+          x.reconciler.failing = true;
+        },
+        x.reconciler,
+      );
+      expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+      expect(x.reconciler.ids()).toHaveLength(before + 1);
+      expect(x.reconciler.latest()).toBe(answer.named());
+      // The replacement could not be delivered: it is queued, not lost.
+      const queued = x.manager.outstandingReconciliationRequests();
+      expect(queued).toHaveLength(1);
+      const replacement = queued[0];
+      if (replacement === undefined) throw new Error("no replacement queued");
+      expect(replacement).toMatchObject({
+        walletOperationId: "op",
+        trigger: where === "RECONCILING" ? WALLET_OPERATION_UNKNOWN_TRIGGER : "POSITION_BALANCE_DISCREPANCY",
+      });
+      expect(replacement.reason).toContain("this request replaces it");
+      expect(replacement.requestId).not.toBe(answer.named());
+      expect(x.state()).toBe(where === "RECONCILING" ? "RECONCILING" : "FAILED");
+      if (where === "RECONCILING") expect(x.releasedOrReady()).toBe(false);
+      else expect(x.manager.operation("op")?.quarantined).toBe(true);
+      // The reconciler is back: retry delivers the replacement, under its own id.
+      x.reconciler.failing = false;
+      expect(x.manager.retryReconciliationRequests()).toBe(1);
+      expect(x.manager.outstandingReconciliationRequests()).toEqual([]);
+      expect(x.reconciler.ids()).toHaveLength(before + 2);
+      expect(x.reconciler.latest()).toBe(replacement.requestId);
+      // The recorded id is never bound; FAILED(A) for the replacement is.
+      expect(code(x.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+      expect(code(x.manager.resolveByReconciliation("op", failed(x.reconciler.latest())))).toBe("ok");
+      expect(x.state()).toBe("FAILED");
+      if (where === "RECONCILING") expect(x.releasedOrReady()).toBe(true);
+      else expect(x.manager.operation("op")?.quarantined).toBe(false);
+    });
+  }
+
+  it("RECONCILING: the replacement's token draw fails — it is queued, never delivered under its untokened id; retry sends a fresh request in its place, and FAILED(A) for that one concludes (liveness)", async () => {
+    const tokens = new RequestTokens();
+    let failDraws = false;
+    const x = await inFlight("SPLIT", () => {
+      if (failDraws) throw new Error("token source unavailable");
+      return tokens.next();
+    });
+    x.manager.observe("op", DROPPED_A);
+    // The state trap delivers request 2 (the answer names it: recorded), then the token source fails.
+    const answer = namingTheLatest(
+      MINED_A_ANSWER,
+      "state",
+      () => {
+        x.manager.observe("op", DROPPED_A);
+        failDraws = true;
+      },
+      x.reconciler,
+    );
+    expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(x.reconciler.ids()).toHaveLength(2);
+    expect(x.reconciler.latest()).toBe(answer.named());
+    // The replacement (request 3) has no token: it is queued, not lost, and never handed over under that id.
+    const queued = x.manager.outstandingReconciliationRequests();
+    expect(queued).toHaveLength(1);
+    const untokened = queued[0];
+    if (untokened === undefined) throw new Error("no replacement queued");
+    expect(untokened.requestId).toBe(requestIdOf("op", 3, ""));
+    expect(untokened.reason).toContain("this request replaces it");
+    expect(x.state()).toBe("RECONCILING");
+    expect(x.releasedOrReady()).toBe(false);
+    // The source is back: retry sends a fresh request (a fresh draw) in its place.
+    failDraws = false;
+    expect(x.manager.retryReconciliationRequests()).toBe(1);
+    expect(x.manager.outstandingReconciliationRequests()).toEqual([]);
+    expect(x.reconciler.ids()).toHaveLength(3);
+    expect(x.reconciler.ids()).not.toContain(untokened.requestId);
+    expect(x.reconciler.received.at(-1)?.reason).toContain("this request replaces it");
+    expect(code(x.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(code(x.manager.resolveByReconciliation("op", failed(untokened.requestId)))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(x.releasedOrReady()).toBe(false);
+    expect(code(x.manager.resolveByReconciliation("op", failed(x.reconciler.latest())))).toBe("ok");
+    expect(x.state()).toBe("FAILED");
+    expect(x.releasedOrReady()).toBe(true);
+  });
+
+  it("raised inside another operation's delivery: the replacement is queued, never delivered re-entrantly (one delivery at a time); retry delivers it, and FAILED(A) for it concludes", async () => {
+    const h = harness("in-flight");
+    h.plan();
+    h.plan("op2");
+    await h.manager.submit("op");
+    // The executor throws for op2: it is under reconciliation too.
+    await h.manager.submit("op2");
+    h.manager.observe("op", DROPPED_A);
+    expect(h.state()).toBe("RECONCILING");
+    expect(h.state("op2")).toBe("RECONCILING");
+    const op2Before = h.reconciler.ids("op2").length;
+    let inner: string | undefined;
+    const answer = namingTheLatest(MINED_A_ANSWER, "state", () => void h.manager.observe("op", DROPPED_A), h.reconciler, {
+      // Read after requestId: the request the answer named is recorded by now.
+      field: "transactionHash",
+      act: () => {
+        // op2's next request is delivered, and inside that delivery the reconciler answers "op" (a MINED(A) report
+        // naming the recorded request): the replacement for "op" is raised inside another request's delivery.
+        h.reconciler.onRequest = (request) => {
+          if (request.walletOperationId !== "op2") return;
+          h.reconciler.onRequest = undefined;
+          inner = code(h.manager.resolveByReconciliation("op", Object.freeze({ ...MINED_A_ANSWER, requestId: answer.named() })));
+        };
+        h.manager.observe("op2", DROPPED_A);
+      },
+    });
+    expect(code(h.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(inner).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(h.reconciler.ids("op2")).toHaveLength(op2Before + 1);
+    // Never re-entrant: one delivery at a time.
+    expect(h.reconciler.maxDepth).toBe(1);
+    expect(h.reconciler.ids()).toHaveLength(2);
+    expect(h.reconciler.latest()).toBe(answer.named());
+    // Queued once, not raised again by the outer answer (its latest request is the replacement by then).
+    expect(h.queued()).toHaveLength(1);
+    const [replacement] = h.manager.outstandingReconciliationRequests();
+    if (replacement === undefined) throw new Error("no replacement queued");
+    expect(replacement).toMatchObject({ walletOperationId: "op", trigger: WALLET_OPERATION_UNKNOWN_TRIGGER });
+    expect(replacement.reason).toContain("this request replaces it");
+    expect(h.manager.outstandingReconciliationRequests()).toHaveLength(1);
+    expect(h.manager.retryReconciliationRequests()).toBe(1);
+    expect(h.reconciler.maxDepth).toBe(1);
+    expect(h.reconciler.latest()).toBe(replacement.requestId);
+    expect(code(h.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(code(h.manager.resolveByReconciliation("op", failed(h.reconciler.latest())))).toBe("ok");
+    expect(h.state()).toBe("FAILED");
+  });
+});
+
+// ---------------------------------------------------------- WP300C-R3-02 --
+
+describe("WP300C-R3-02: no replacement where nothing awaits an answer — the recorded id is the latest request of an operation that is terminal and not quarantined, or back in flight", () => {
+  it("terminal, not quarantined: inside the delivery the answer's state trap causes, a synchronous requester concludes the operation (FAILED(A) for request 1); the answer names request 1, which is recorded — and no request replaces it", async () => {
+    const x = await inFlight("SPLIT");
+    let inner: string | undefined;
+    const answer = namingTheLatest(
+      { source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash: TX_A, transactionId: null },
+      "state",
+      () => {
+        x.reconciler.onRequest = (request) => {
+          x.reconciler.onRequest = undefined;
+          // Read after receiving request 1: bound to it.
+          inner = code(x.manager.resolveByReconciliation("op", failed(request.requestId)));
+        };
+        x.manager.observe("op", DROPPED_A);
+      },
+      x.reconciler,
+    );
+    expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_ILLEGAL_TRANSITION");
+    expect(inner).toBe("ok");
+    expect(x.manager.operation("op")).toMatchObject({ state: "FAILED", quarantined: false });
+    expect(x.releasedOrReady()).toBe(true);
+    // Request 1 is the latest and recorded, and nothing awaits an answer: nothing was raised.
+    expect(x.reconciler.ids()).toEqual([answer.named()]);
+    expect(x.manager.outstandingReconciliationRequests()).toEqual([]);
+    // A replay naming it raises nothing either.
+    expect(code(x.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_ILLEGAL_TRANSITION");
+    expect(x.reconciler.ids()).toHaveLength(1);
+    expect(x.manager.outstandingReconciliationRequests()).toEqual([]);
+  });
+
+  it("back in flight: the executor threw while the reconciler was down (UNKNOWN, request 1 queued); the answer's state trap retries, and inside that delivery a synchronous requester answers 'still in flight' (MINED(A)) for request 1; the answer names request 1, which is recorded, while the operation is MINED — and no request replaces it", async () => {
+    const h = harness("threw");
+    h.plan();
+    h.reconciler.failing = true;
+    await h.manager.submit("op");
+    expect(h.state()).toBe("UNKNOWN");
+    expect(h.queued()).toHaveLength(1);
+    h.reconciler.failing = false;
+    let retried: number | undefined;
+    let inner: string | undefined;
+    const answer = namingTheLatest(
+      MINED_A_ANSWER,
+      "state",
+      () => {
+        h.reconciler.onRequest = (request) => {
+          h.reconciler.onRequest = undefined;
+          // Read after receiving request 1: bound to it, and the operation is back in flight.
+          inner = code(h.manager.resolveByReconciliation("op", Object.freeze({ ...MINED_A_ANSWER, requestId: request.requestId })));
+        };
+        retried = h.manager.retryReconciliationRequests();
+      },
+      h.reconciler,
+    );
+    expect(code(h.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_ILLEGAL_TRANSITION");
+    expect(retried).toBe(1);
+    expect(inner).toBe("ok");
+    expect(h.state()).toBe("MINED");
+    // Request 1 is the latest and recorded, and the operation is in flight: nothing was raised.
+    expect(h.reconciler.ids()).toEqual([answer.named()]);
+    expect(h.queued()).toEqual([]);
+    // The operation goes on in flight: FAILED(A) observed concludes it, and nothing more was asked.
+    expect(code(h.manager.observe("op", { status: "FAILED", transactionHash: TX_A, transactionId: null }))).toBe("ok");
+    expect(h.state()).toBe("FAILED");
+    expect(h.wholeReservable()).toBe(true);
+    expect(h.reconciler.ids()).toHaveLength(1);
   });
 });
 
