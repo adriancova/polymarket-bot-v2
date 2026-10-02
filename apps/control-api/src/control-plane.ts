@@ -29,7 +29,12 @@
  * refused BEFORE it reached a mutation method — at the transport, the route
  * parameter or the body door — which `api.ts` records through
  * {@link ControlPlane.refuseRequest} once authentication and the route's
- * authorization have passed (`CONTROL-1` r1, closing `CONTROL1-J-M2`). A caller
+ * authorization have passed (`CONTROL-1` r1, closing `CONTROL1-J-M2`). ONE
+ * refusal of such a caller writes nothing: the GATED refusal ("One unsettled
+ * protected append per state key", below), which offers no record because an
+ * earlier record of the same switch or instance is still in flight
+ * (`README.md`, "What writes NOTHING", item 7; `CONTROL-1b` r2, closing
+ * `CONTROL1B-R2-J-L1`). A caller
  * with NO mutation authority writes nothing here at all (`CONTROL-1`, closing
  * `WP-240` r1 M-3): an unauthenticated request never reaches this class, an
  * unauthorized one is refused before it, and a READ-only operator's mode-raise
@@ -68,6 +73,86 @@
  * engage behind it. A lock entry exists only while a mutation of its key is in
  * flight, so the map cannot grow with the ids callers try.
  *
+ * The KEY is the state a mutation reads, and nothing narrower or wider
+ * (`CONTROL-1b`, closing `CONTROL1-R2-J-L2`): an engage and a release of one
+ * switch take the SAME lock, whatever action the engage names, because each
+ * reads that switch's prior — so an escalation and a release sent together
+ * apply one after the other, and the release's record shows the switch it
+ * really released. Two different switches (a `MARKET` scope at two refs, or
+ * `GLOBAL` and a scoped one) take different locks and do not wait on each
+ * other. `control-plane.test.ts` pins both directions with a slow sink.
+ *
+ * ## An append is bounded (`CONTROL-1b`, closing `CONTROL-1` follow-up 3a)
+ *
+ * With a durable sink, an append that never settles used to hold its state
+ * key's lock for ever, queueing every later mutation of that instance or
+ * switch behind it — the kill switch included. Each append is now raced
+ * against a bound, {@link ControlPlaneOptions.auditAppendTimeoutMs} (default
+ * {@link AUDIT_APPEND_TIMEOUT_MS}):
+ *
+ * - **The bound expires first.** The append is treated as UNWRITTEN: the
+ *   mutation is refused `503 CONTROL_NOT_AUDITABLE`, its state is unmoved, it
+ *   is counted `NOT_AUDITED`, and its lock is released, so the next mutation
+ *   of the key proceeds. Audit first, then apply, fail closed — unchanged.
+ * - **The sink answers later.** Nothing is applied, ever: the mutation's
+ *   continuation returned its refusal when the bound expired. If the answer is
+ *   a failure, the audit already tells the truth. If a REFUSED record landed,
+ *   it is a true record of a refusal. If an APPLIED record landed, the audit
+ *   now says a change happened that did not — so this class appends a VOID
+ *   record beside it: `REFUSED`, the same action and target, actor
+ *   {@link CONTROL_PLANE_VOID_ACTOR} (`AUTOMATED`), the voided record's prior
+ *   state unchanged, and `voidsRecordId` naming it. The two are counted
+ *   `LANDED_LATE` and `VOIDED` on `control_mutations_total`
+ *   ({@link LATE_APPEND_OUTCOMES}), so an APPLIED record with no void beside
+ *   it — no record source, or a void the sink refused — is VISIBLE as their
+ *   difference rather than silent.
+ * - **The audit budget** (`audit-budget.ts`) sits BEHIND this race, so a
+ *   timed-out append keeps its budget slot until the sink settles it: the
+ *   budget counts a record that may still land, and can never admit more than
+ *   the capacity. A timed-out ORDINARY append therefore occupies only the
+ *   ordinary tier and cannot reach the reserve. A timed-out PROTECTED append —
+ *   a STRENGTHENING engage (the kill-switch reserve) or a halting pause (the
+ *   safety-direction tier) — holds a protected slot while in flight and, if it
+ *   LANDS, spends that record for good although its mutation did not happen;
+ *   its void is an ordinary record, refused when the ordinary tier is full.
+ *   Unlike a real halt, it leaves the switch or instance as it was, so the
+ *   operator's natural retry is again a strengthening engage or a halting
+ *   pause. An append whose sink NEVER answers keeps its slot for the life of
+ *   the process; {@link ControlPlane.unsettledAuditAppends} counts them.
+ * - **One unsettled protected append per state key** (`CONTROL-1b` r1, closing
+ *   `CONTROL1B-R1-J-M1`). At round 0 every retry of a timed-out halt took
+ *   another protected slot, so retrying ONE GLOBAL `FULL_HALT` through a stall
+ *   spent the whole reserve, and after the sink recovered no switch was
+ *   engaged and a fresh halt was refused `503`. Now, while a protected append
+ *   of a switch or instance is unsettled, a new protected mutation of that same
+ *   switch or instance is refused `503 CONTROL_NOT_AUDITABLE` WITHOUT an
+ *   append, so it takes no budget slot; it is counted `NOT_AUDITED`. The gate
+ *   lifts when the sink answers the earlier append, whatever it answers.
+ *   Exactly: per switch or instance, at most ONE timed-out protected append is
+ *   ever in flight. Retries sent while it is unsettled cost nothing; each
+ *   timed-out protected append that later LANDS costs one protected record. So
+ *   a stall the sink answers late costs one record per switch (or instance)
+ *   whose append timed out, however often it was retried — on top of the
+ *   record the real engage or pause spends once the sink answers in time; a
+ *   sink that answers late EVERY time costs one per late answer. A
+ *   mutation that would write an ORDINARY record (a release, a resume, a
+ *   refusal, an unordered action change) is never gated, and other switches
+ *   and instances are not affected. The price: an append the sink NEVER
+ *   answers keeps that one switch's strengthening engages (or that instance's
+ *   pauses) refused for the life of the process, as it keeps its slot — a
+ *   durable sink must therefore settle every append (README, "An append is
+ *   bounded").
+ *
+ * ## Every record's text is escaped once (`CONTROL-1b`, follow-up 3c)
+ *
+ * Every record — mutation, refusal, mode-raise attempt or void — is built from
+ * the raw values and then passed through `audit-text.ts`'s `auditSafeRecord`
+ * before any sink sees it: NUL, lone surrogates and every control, format or
+ * separator code point become a visible `\u{HEX}` escape, injectively. So a
+ * caller's bytes can never make a `jsonb` append fail, and the in-memory log
+ * and the PostgreSQL tables hold the same text. The state this class holds is
+ * not rewritten; only what the audit shows is.
+ *
  * ## Unknown instances are refused, not fabricated (`CONTROL-1`, M-1)
  *
  * A pause or resume of an instance this control plane has never registered is
@@ -96,6 +181,7 @@
  */
 
 import {
+  type AuditAppendResult,
   type AuditStateDocument,
   type ControlAuditAction,
   type ControlAuditOutcome,
@@ -103,6 +189,8 @@ import {
   type ControlAuditSink,
 } from "@polymarket-bot/observability";
 
+import { auditBudgetTier } from "./audit-budget.js";
+import { auditSafeRecord, boundAuditText } from "./audit-text.js";
 import { instanceIdProblem } from "./instance-id.js";
 import {
   CONTROL_ACTOR_KIND,
@@ -180,7 +268,18 @@ export type MutationRefusalCode =
  */
 export type ModeRaiseAuditOutcome =
   | { readonly audited: true }
-  | { readonly audited: false; readonly code: string; readonly detail: string };
+  | {
+      readonly audited: false;
+      readonly code: string;
+      readonly detail: string;
+      /**
+       * `true` when the sink did not ANSWER within the append bound
+       * (`CONTROL-1b`): the record was not confirmed, and may still land — a
+       * refusal's record landing late is still a true record of a refusal.
+       * `false` when the sink or the budget refused it outright.
+       */
+      readonly unconfirmed: boolean;
+    };
 
 /** The same answer, for {@link ControlPlane.refuseRequest}. */
 export type RefusalAuditOutcome = ModeRaiseAuditOutcome;
@@ -207,9 +306,62 @@ export interface RequestRefusal {
 /** The mutating audit actions — every action except `MODE_RAISE_ATTEMPT`. */
 export type MutatingAuditAction = Exclude<ControlAuditAction, "MODE_RAISE_ATTEMPT">;
 
-/** How many of a refusal's issues its audit record keeps, and how long each may be. */
+/**
+ * How many of a refusal's issues (or a mode-raise attempt's keys) its audit
+ * record keeps, and how long each may be — in UTF-16 code units of the
+ * STORED, escaped text, `…` included, cut only between code points
+ * (`audit-text.ts`, `boundAuditText`).
+ */
 export const REFUSAL_AUDIT_MAX_ISSUES = 8;
 export const REFUSAL_AUDIT_MAX_TEXT = 256;
+
+/**
+ * The default bound on one audit append, in milliseconds (`CONTROL-1b`; module
+ * header, "An append is bounded"). Generous for an in-process log or a
+ * loopback PostgreSQL insert, and short enough that a stalled sink answers an
+ * operator `503` in seconds rather than holding the request — and the state
+ * key's lock — for as long as the sink hangs.
+ */
+export const AUDIT_APPEND_TIMEOUT_MS = 5_000;
+
+/** The largest bound {@link ControlPlaneOptions.auditAppendTimeoutMs} accepts. */
+export const AUDIT_APPEND_TIMEOUT_MAX_MS = 60_000;
+
+/** Why `timeoutMs` is not a usable append bound, or `undefined`. */
+export function auditAppendTimeoutProblem(timeoutMs: number): string | undefined {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > AUDIT_APPEND_TIMEOUT_MAX_MS) {
+    return (
+      `the audit append bound must be an integer from 1 to ${String(AUDIT_APPEND_TIMEOUT_MAX_MS)} ms; ` +
+      `received ${String(timeoutMs)}`
+    );
+  }
+  return undefined;
+}
+
+/**
+ * The actor a VOID record names (module header, "An append is bounded"): the
+ * record is written by this process about its own refusal, not by the
+ * operator whose request it was, so it is `AUTOMATED`, the other §10.6
+ * `actor_kind`.
+ */
+export const CONTROL_PLANE_VOID_ACTOR = "control-api";
+
+/**
+ * The `control_mutations_total` outcomes an append that outlived its bound adds
+ * (module header). `LANDED_LATE` counts APPLIED records that landed after their
+ * mutation was refused; `VOIDED` counts the void records written for them. Their
+ * difference is the number of such records the audit holds with no void beside
+ * them.
+ */
+export const LATE_APPEND_OUTCOMES = ["LANDED_LATE", "VOIDED"] as const;
+
+/** The clock and id source a VOID record needs (module header). */
+export interface AuditRecordSource {
+  /** Strict-UTC instant. */
+  now(): string;
+  /** A fresh, sortable, unique audit record id. */
+  nextAuditRecordId(): string;
+}
 
 export type MutationResult<T> =
   | { readonly ok: true; readonly value: T }
@@ -251,6 +403,27 @@ export interface ControlPlaneOptions {
   readonly runMode: string;
   readonly maximumRunMode: string;
   readonly repositoryMaximumRunMode: string;
+  /**
+   * The bound on one audit append (`CONTROL-1b`). Absent:
+   * {@link AUDIT_APPEND_TIMEOUT_MS}. A value outside 1 to
+   * {@link AUDIT_APPEND_TIMEOUT_MAX_MS} is a composition defect and THROWS.
+   */
+  readonly auditAppendTimeoutMs?: number;
+  /**
+   * Where a VOID record's instant and id come from (module header, "An append
+   * is bounded"). `main.ts` and the test harnesses pass the API's environment.
+   * Absent, an APPLIED record that lands after its bound is COUNTED
+   * (`LANDED_LATE`) and not voided — so a composition that binds a sink which
+   * can be slow must supply it.
+   */
+  readonly auditRecordSource?: AuditRecordSource;
+}
+
+/** What one bounded append answered (`ControlPlane.#write`). */
+interface WriteOutcome {
+  readonly result: AuditAppendResult;
+  /** True when the bound expired first; `result` is then this class's own refusal. */
+  readonly timedOut: boolean;
 }
 
 function scopeKey(scope: ControlKillSwitchScope, scopeRef: string | null): string {
@@ -277,11 +450,53 @@ export class ControlPlane {
    */
   readonly #locks = new Map<string, Promise<void>>();
 
+  /** The bound on one audit append (module header, "An append is bounded"). */
+  readonly #appendTimeoutMs: number;
+  readonly #recordSource: AuditRecordSource | undefined;
+  /** Appends that outlived their bound and have not settled yet. */
+  #unsettledAppends = 0;
+  /**
+   * PROTECTED appends (a strengthening engage, a halting pause) that outlived
+   * their bound and have not settled, by state key (module header, "One
+   * unsettled protected append per state key"). An entry exists only while
+   * such an append is in flight.
+   */
+  readonly #unsettledProtected = new Map<string, number>();
+
   constructor(options: ControlPlaneOptions) {
+    const timeoutMs = options.auditAppendTimeoutMs ?? AUDIT_APPEND_TIMEOUT_MS;
+    const problem = auditAppendTimeoutProblem(timeoutMs);
+    if (problem !== undefined) throw new RangeError(problem);
     this.#audit = options.audit;
     this.#runMode = options.runMode;
     this.#maximumRunMode = options.maximumRunMode;
     this.#repositoryMaximumRunMode = options.repositoryMaximumRunMode;
+    this.#appendTimeoutMs = timeoutMs;
+    this.#recordSource = options.auditRecordSource;
+  }
+
+  /** The bound on one audit append, in milliseconds. */
+  get auditAppendTimeoutMs(): number {
+    return this.#appendTimeoutMs;
+  }
+
+  /**
+   * Appends that outlived their bound and whose sink has not answered yet
+   * (module header). Each is a record that may still land.
+   */
+  get unsettledAuditAppends(): number {
+    return this.#unsettledAppends;
+  }
+
+  /**
+   * Whether an APPLIED record that lands after its bound is VOIDED — that is,
+   * whether this control plane was composed with an
+   * {@link ControlPlaneOptions.auditRecordSource}. `main.ts` reports it at
+   * startup, so the shipped composition's wiring is visible and pinned
+   * (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-L1`).
+   */
+  get voidsLateAppliedRecords(): boolean {
+    return this.#recordSource !== undefined;
   }
 
   /**
@@ -467,6 +682,8 @@ export class ControlPlane {
       instanceId,
       strategyDocument(prior),
       strategyDocument(resulting),
+      undefined,
+      strategyLockKey(instanceId),
     );
     if (!appended.ok) return appended.refusal;
 
@@ -562,6 +779,8 @@ export class ControlPlane {
       request.scopeRef,
       priorDocument,
       killSwitchDocument(resulting),
+      undefined,
+      killSwitchLockKey(key),
     );
     if (!appended.ok) return appended.refusal;
 
@@ -623,6 +842,8 @@ export class ControlPlane {
       request.scopeRef,
       priorDocument,
       killSwitchAbsent(request.scope, request.scopeRef),
+      undefined,
+      killSwitchLockKey(key),
     );
     if (!appended.ok) return appended.refusal;
 
@@ -652,41 +873,51 @@ export class ControlPlane {
   ): Promise<ModeRaiseAuditOutcome> {
     this.#modeRaiseAttemptsRefused += 1;
     const ceiling = runStateDocument(this.runState());
+    // BOUNDED (`CONTROL-1b`, closing `CONTROL-1` follow-up 3b). At `CONTROL-1`
+    // this record carried every forbidden key a body named and a reason
+    // holding the request's whole path — bounded only by the transport, so a
+    // mutation-authorized caller chose how large a record it wrote. It now
+    // keeps what the other refusal records keep:
+    //
+    // - `attemptedKeys`: at most `REFUSAL_AUDIT_MAX_ISSUES` keys of at most
+    //   `REFUSAL_AUDIT_MAX_TEXT` code units each, built by an INDEX WALK into
+    //   an array literal (`boundedList`). That container is ORDINARY whatever
+    //   species the caller passed — `Array.prototype.map` would have PRESERVED
+    //   it (ECMA-262 `ArraySpeciesCreate`), and `adapters/postgres-audit-sink.ts`'s
+    //   own-data encoder refuses a container whose prototype is neither
+    //   `Array.prototype` nor `null`, which would refuse a record `pg` wrote
+    //   (`SER-3` review round 2, N1; pinned by
+    //   `test/unit/control-api/outbound-container-species.test.ts`). The index
+    //   walk also reads INDICES, as base's `.map()` did, rather than a
+    //   caller-overridable iterator — so the `SER-3` residual 6 / N4 trade-off
+    //   the earlier `[...keys]` spread made (`GOV-2C`, 2026-09-15) is gone: the
+    //   recorded values are the array's own elements.
+    // - `attemptedKeyCount`: the number of keys named, present EXACTLY when the
+    //   list was cut — so a record naming eight or fewer keys is byte-identical
+    //   to the one `CONTROL-1` wrote (the byte pin above);
+    // - the reason, cut to `REFUSAL_AUDIT_MAX_TEXT` (`api.ts` builds it from a
+    //   bounded path and a bounded key list, so the cut is a second fence).
+    const attemptedKeys = boundedList(keys);
     const appended = await this.#append(
       "MODE_RAISE_ATTEMPT",
       "REFUSED",
-      context,
+      { ...context, reason: bounded(context.reason) },
       "CONTROL_PLANE",
       null,
       ceiling,
       ceiling,
-      // `[...keys]`, NOT `keys.map(...)`: an array-literal spread is an
-      // ORDINARY array whatever species the caller passed, where
-      // `Array.prototype.map` PRESERVES it (ECMA-262 `ArraySpeciesCreate`) —
-      // and `readonly string[]` is satisfied by an `Array` SUBCLASS with no
-      // cast. This container goes into the §14.1 audit record, which
-      // `adapters/postgres-audit-sink.ts` serializes with the own-data
-      // encoder; that encoder refuses a container whose prototype is neither
-      // `Array.prototype` nor `null`, and this control plane AUDITS BEFORE IT
-      // APPLIES — so a foreign species here would refuse a record `pg` wrote.
-      // (`SER-3` review round 2, N1: the same spelling and the same reason as
-      // `packages/polymarket-public/src/venue/frames.ts`'s `assets_ids`.)
-      // `test/unit/control-api/outbound-container-species.test.ts` pins it.
-      // The trade-off (`SER-3` residual 6 / N4, recorded 2026-09-15 by
-      // `GOV-2C`): the spread reads the caller's ITERATOR where base's
-      // `.map()` read INDICES, so an `Array` subclass overriding
-      // `Symbol.iterator` changes the recorded VALUES — never the species, so
-      // the encoder is satisfied and nothing refuses — accepted because this
-      // list is §14.1 audit DIAGNOSTICS rather than a decision (the 403 is
-      // decided by `forbiddenControlKeysIn` walking the body), whereas
-      // `packages/polymarket-public/src/rtds/frames.ts` went the other way
-      // with an index walk because its values are load-bearing for an
-      // outbound protocol frame.
-      { attemptedKeys: [...keys] },
+      keys.length > REFUSAL_AUDIT_MAX_ISSUES
+        ? { attemptedKeys, attemptedKeyCount: String(keys.length) }
+        : { attemptedKeys },
     );
     return appended.ok
       ? { audited: true }
-      : { audited: false, code: appended.refusal.code, detail: appended.refusal.detail };
+      : {
+          audited: false,
+          code: appended.refusal.code,
+          detail: appended.refusal.detail,
+          unconfirmed: appended.timedOut,
+        };
   }
 
   /**
@@ -738,12 +969,17 @@ export class ControlPlane {
     const appended = await this.#append(action, "REFUSED", context, target.scope, target.scopeRef, state, state, {
       refusalCode: bounded(refusal.code),
       refusalDetail: bounded(refusal.detail),
-      refusalIssues: boundedIssues(refusal.issues),
+      refusalIssues: boundedList(refusal.issues),
       refusalIssueCount: String(refusal.issues.length),
     });
     return appended.ok
       ? { audited: true }
-      : { audited: false, code: appended.refusal.code, detail: appended.refusal.detail };
+      : {
+          audited: false,
+          code: appended.refusal.code,
+          detail: appended.refusal.detail,
+          unconfirmed: appended.timedOut,
+        };
   }
 
   // --- the audit path -------------------------------------------------------
@@ -772,10 +1008,18 @@ export class ControlPlane {
     priorState: AuditStateDocument,
     resultingState: AuditStateDocument,
     extra?: Readonly<Record<string, AuditStateDocument>>,
+    /**
+     * The state key whose lock the caller holds — passed by the three methods
+     * that write an APPLIED record (module header, "One unsettled protected
+     * append per state key"). Absent for a refusal, which is always ordinary.
+     */
+    stateKey?: string,
   ): Promise<
     | { readonly ok: true }
     | {
         readonly ok: false;
+        /** True when the append outlived its bound (module header). */
+        readonly timedOut: boolean;
         readonly refusal: {
           readonly ok: false;
           readonly code: MutationRefusalCode;
@@ -799,24 +1043,48 @@ export class ControlPlane {
           : mergeDocuments(resultingState, extra),
       at: context.at,
     };
-    const appended = await this.#audit.append(record);
+    // `CONTROL-1b` r1 (closing `CONTROL1B-R1-J-M1`; module header, "One
+    // unsettled protected append per state key"). The tier is the audit
+    // budget's own reading of THIS record, so "protected" here means exactly
+    // what would take a protected slot there. Checked under the key's lock, and
+    // registered by `#write` before that lock is released, so the next
+    // mutation of the key always sees it.
+    const protectedKey = stateKey !== undefined && auditBudgetTier(record) !== "ORDINARY" ? stateKey : undefined;
+    if (protectedKey !== undefined && this.#unsettledProtected.has(protectedKey)) {
+      this.#count(action, "NOT_AUDITED");
+      return {
+        ok: false,
+        timedOut: false,
+        refusal: {
+          ok: false,
+          code: "CONTROL_NOT_AUDITABLE",
+          detail:
+            `an earlier ${action} of this ${scope === "STRATEGY_INSTANCE" ? "strategy instance" : "kill switch"} ` +
+            `is UNSETTLED: its audit append outlived the ${String(this.#appendTimeoutMs)} ms bound and the sink ` +
+            "has not answered it yet. Until it does, this one is refused WITHOUT an audit append: each " +
+            "attempt that timed out and then landed would spend another record of the audit reserve a halt " +
+            "needs, although nothing was applied. The mutation did NOT happen; retry once the sink answers " +
+            "(README, 'An append is bounded')",
+        },
+      };
+    }
+    const { result: appended, timedOut } = await this.#write(record, protectedKey);
     // The COUNTER records what happened, which is not always what was asked
     // for. An append that failed means the mutation did NOT happen, so it is
     // counted under its own outcome rather than under `APPLIED` — the metric
     // an operator reads must not say a change was applied when the control
     // plane refused to apply it. `NOT_AUDITED` is a metric label only; the
     // AUDIT vocabulary stays the two outcomes §14.1's record can carry, since
-    // by definition no record was written for this one.
-    const measured = appended.ok ? outcome : "NOT_AUDITED";
-    this.#mutations.set(
-      `${action}|${measured}`,
-      (this.#mutations.get(`${action}|${measured}`) ?? 0) + 1,
-    );
+    // by definition no record was written for this one. An append that
+    // outlived its bound is `NOT_AUDITED` too: this control plane treated it as
+    // unwritten and refused (module header, "An append is bounded").
+    this.#count(action, appended.ok ? outcome : "NOT_AUDITED");
     if (appended.ok) return { ok: true };
 
     this.#auditAppendFailures += 1;
     return {
       ok: false,
+      timedOut,
       refusal: {
         ok: false,
         code: "CONTROL_NOT_AUDITABLE",
@@ -827,6 +1095,177 @@ export class ControlPlane {
       },
     };
   }
+
+  #count(action: ControlAuditAction, outcome: string): void {
+    this.#mutations.set(`${action}|${outcome}`, (this.#mutations.get(`${action}|${outcome}`) ?? 0) + 1);
+  }
+
+  /**
+   * Hands `raw` to the sink ESCAPED, exactly once (`audit-text.ts`, the
+   * chokepoint), and waits at most the append bound for the answer (module
+   * header, "An append is bounded").
+   *
+   * - The sink answers in time: its answer, as at `CONTROL-1`. A sink that
+   *   throws or rejects in time still rejects here — the port is total by
+   *   contract, and a broken sink stays visible as `CONTROL_INTERNAL_ERROR`
+   *   rather than being re-labelled.
+   * - The bound expires first: this class's own refusal,
+   *   `AUDIT_SINK_UNAVAILABLE`, and the caller refuses the mutation. The sink's
+   *   eventual answer is handed to {@link ControlPlane.#settledLate}, which can
+   *   only ever WRITE (a void record) — never apply.
+   *
+   * `protectedKey` names the state key of a PROTECTED record (module header,
+   * "One unsettled protected append per state key"): when the bound expires it
+   * is registered as unsettled — synchronously, before the caller's lock is
+   * released — and it is cleared when the sink answers, whatever it answers.
+   */
+  #write(raw: ControlAuditRecord, protectedKey?: string): Promise<WriteOutcome> {
+    // A synchronous throw from the sink propagates from here, as it did when
+    // the append was awaited directly.
+    const pending = this.#audit.append(auditSafeRecord(raw));
+    return new Promise<WriteOutcome>((resolve, reject) => {
+      let answered = false;
+      const timer = setTimeout(() => {
+        answered = true;
+        this.#unsettledAppends += 1;
+        if (protectedKey !== undefined) {
+          this.#unsettledProtected.set(protectedKey, (this.#unsettledProtected.get(protectedKey) ?? 0) + 1);
+        }
+        resolve({
+          timedOut: true,
+          result: {
+            ok: false,
+            code: "AUDIT_SINK_UNAVAILABLE",
+            detail:
+              `the audit sink did not answer within the ${String(this.#appendTimeoutMs)} ms append bound, ` +
+              "so the record is UNCONFIRMED and is treated as unwritten. If an APPLIED record lands " +
+              "later, this process appends a REFUSED record voiding it when the sink and the audit budget " +
+              "admit one — a void is an ordinary record, so a full ordinary tier refuses it, and " +
+              "control_mutations_total LANDED_LATE minus VOIDED counts the APPLIED records left unvoided " +
+              "(README, 'An append is bounded')",
+          },
+        });
+      }, this.#appendTimeoutMs);
+      Promise.resolve(pending).then(
+        (result) => {
+          if (!answered) {
+            answered = true;
+            clearTimeout(timer);
+            resolve({ result, timedOut: false });
+            return;
+          }
+          this.#unsettledAppends -= 1;
+          this.#settleProtected(protectedKey);
+          this.#settledLate(raw, result);
+        },
+        (cause: unknown) => {
+          if (!answered) {
+            answered = true;
+            clearTimeout(timer);
+            reject(cause);
+            return;
+          }
+          // A late throw: the sink says nothing landed. `NOT_AUDITED` stands.
+          this.#unsettledAppends -= 1;
+          this.#settleProtected(protectedKey);
+        },
+      );
+    });
+  }
+
+  /** The sink answered a timed-out protected append: its key's gate lifts. */
+  #settleProtected(protectedKey: string | undefined): void {
+    if (protectedKey === undefined) return;
+    const remaining = (this.#unsettledProtected.get(protectedKey) ?? 0) - 1;
+    if (remaining > 0) this.#unsettledProtected.set(protectedKey, remaining);
+    else this.#unsettledProtected.delete(protectedKey);
+  }
+
+  /**
+   * The sink answered an append AFTER its bound expired and its mutation was
+   * refused (module header). Nothing here applies anything: the mutation's
+   * continuation has already returned its refusal and released its lock.
+   *
+   * - A late REFUSAL of the append, or a late REFUSED record landing: the audit
+   *   already tells the truth (nothing landed, or a refusal that happened).
+   * - A late APPLIED record landing: the audit now holds `APPLIED` for a
+   *   mutation that did not happen. It is counted `LANDED_LATE`, and a VOID
+   *   record is appended: `REFUSED`, same action and target, naming the
+   *   voided record's id, its prior state unchanged. The void is counted
+   *   `VOIDED` once its own append lands. Without a record source, or when the
+   *   void cannot be written, the late record stays counted and unvoided.
+   *
+   * TOTAL: it never throws and leaves no rejection unhandled.
+   */
+  #settledLate(raw: ControlAuditRecord, result: AuditAppendResult): void {
+    // `accepted`, not `result.ok`: a sink that breaks the port's type and
+    // resolves something else LATE must not throw here, where nothing would
+    // catch it (an unhandled rejection can stop the process).
+    if (!accepted(result) || raw.outcome !== "APPLIED") return;
+    this.#count(raw.action, "LANDED_LATE");
+    const source = this.#recordSource;
+    if (source === undefined) return;
+    let pending: Promise<AuditAppendResult>;
+    try {
+      const voidRecord = voidRecordFor(raw, source.now(), source.nextAuditRecordId(), this.#appendTimeoutMs);
+      pending = Promise.resolve(this.#audit.append(auditSafeRecord(voidRecord)));
+    } catch {
+      return;
+    }
+    pending.then(
+      (voided) => {
+        if (accepted(voided)) this.#count(raw.action, "VOIDED");
+      },
+      () => undefined,
+    );
+  }
+}
+
+/**
+ * Whether a sink's answer is an acceptance — read defensively, because on the
+ * LATE path (`ControlPlane.#settledLate`) nothing above it would catch a throw.
+ */
+function accepted(result: unknown): boolean {
+  return typeof result === "object" && result !== null && (result as { readonly ok?: unknown }).ok === true;
+}
+
+/**
+ * The record that VOIDS an APPLIED record which landed after its bound (module
+ * header, "An append is bounded"). Built from the voided record's RAW fields,
+ * so the one escape the chokepoint applies makes its `voidsRecordId`, target
+ * and prior state equal, byte for byte, to what the sink holds for the record
+ * it voids.
+ */
+function voidRecordFor(
+  voided: ControlAuditRecord,
+  at: string,
+  recordId: string,
+  timeoutMs: number,
+): ControlAuditRecord {
+  return {
+    recordId,
+    action: voided.action,
+    outcome: "REFUSED",
+    actor: CONTROL_PLANE_VOID_ACTOR,
+    actorKind: "AUTOMATED",
+    scope: voided.scope,
+    scopeRef: voided.scopeRef,
+    reason:
+      `VOID of audit record ${voided.recordId}: its append outlived the ${String(timeoutMs)} ms bound, so ` +
+      `its ${voided.action} was refused and NOT applied; the record landed afterwards`,
+    priorState: voided.priorState,
+    resultingState: mergeDocuments(voided.priorState, {
+      voidsRecordId: voided.recordId,
+      voidsOutcome: voided.outcome,
+      voidsActor: voided.actor,
+      refusalCode: "CONTROL_NOT_AUDITABLE",
+      refusalDetail:
+        `the append of audit record ${voided.recordId} did not settle within the ${String(timeoutMs)} ms ` +
+        `bound, so the ${voided.action} it records was refused 503 CONTROL_NOT_AUDITABLE and NOT applied; ` +
+        "the record landed afterwards, and this record VOIDS its APPLIED outcome",
+    }),
+    at,
+  };
 }
 
 function strategyLockKey(instanceId: string): string {
@@ -837,22 +1276,28 @@ function killSwitchLockKey(key: string): string {
   return `kill-switch:${key}`;
 }
 
-/** At most {@link REFUSAL_AUDIT_MAX_TEXT} characters of `text`, marked when cut. */
+/**
+ * `text`, cut so that the STORED (escaped) form is at most
+ * {@link REFUSAL_AUDIT_MAX_TEXT} UTF-16 code units, `…` included, and only
+ * between code points (`audit-text.ts`, `boundAuditText`; `CONTROL-1b`). At
+ * `CONTROL-1` it cut by `String.prototype.slice`, which can split a surrogate
+ * pair and so MAKE a lone surrogate — a record `jsonb` refuses.
+ */
 function bounded(text: string): string {
-  return text.length <= REFUSAL_AUDIT_MAX_TEXT ? text : `${text.slice(0, REFUSAL_AUDIT_MAX_TEXT - 1)}…`;
+  return boundAuditText(text, REFUSAL_AUDIT_MAX_TEXT);
 }
 
 /**
- * A bounded prefix of `issues`, as an ORDINARY array of strings whatever
- * species the caller passed — an index walk into a literal, for the reason
- * {@link ControlPlane.refuseModeRaise}'s `[...keys]` comment gives (a foreign
- * container species in a §14.1 document would make the Postgres sink refuse
- * the record).
+ * A bounded prefix of `items` — a refusal's issues, a mode-raise attempt's
+ * keys — as an ORDINARY array of strings whatever species the caller passed:
+ * an index walk into a literal, for the reason
+ * {@link ControlPlane.refuseModeRaise}'s comment gives (a foreign container
+ * species in a §14.1 document would make the Postgres sink refuse the record).
  */
-function boundedIssues(issues: readonly string[]): readonly string[] {
+function boundedList(items: readonly string[]): readonly string[] {
   const out: string[] = [];
-  const count = Math.min(issues.length, REFUSAL_AUDIT_MAX_ISSUES);
-  for (let index = 0; index < count; index += 1) out.push(bounded(String(issues[index])));
+  const count = Math.min(items.length, REFUSAL_AUDIT_MAX_ISSUES);
+  for (let index = 0; index < count; index += 1) out.push(bounded(String(items[index])));
   return out;
 }
 

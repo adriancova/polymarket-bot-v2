@@ -64,7 +64,9 @@ describe("§15: no public network exposure", () => {
     "http://10.0.0.5:9464/health",
     "https://example.test/health",
     "http://evil.test/health",
-    "file:///etc/passwd",
+    // A file: URL naming no real file (`CONTROL-1b` r3: acceptance 3 fails a
+    // literal path that reaches an existing file it does not read as code).
+    "file:///nonexistent/trader-health",
   ])("REFUSES a trader-health URL that is not loopback http (%s)", (url) => {
     expect(codes(document({ traderHealth: { kind: "http", url, timeoutMs: 1000 } }))).toEqual([
       "CONTROL_CONFIG_HEALTH_SOURCE_NOT_LOOPBACK",

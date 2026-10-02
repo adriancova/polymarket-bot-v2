@@ -39,10 +39,12 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
+import type { ControlAuditSink } from "@polymarket-bot/observability";
+
 import { ControlApi, type ApiEnvironment } from "./api.js";
 import { createBudgetedAuditLog } from "./audit-budget.js";
 import { OperatorRegistry } from "./auth.js";
-import { ControlPlane } from "./control-plane.js";
+import { ControlPlane, type AuditRecordSource } from "./control-plane.js";
 import { parseControlApiConfig, type ControlApiConfig } from "./config.js";
 import {
   AbsentTraderHealthSource,
@@ -88,6 +90,27 @@ function processEnvironment(): ApiEnvironment {
     now: () => new Date().toISOString(),
     nextAuditRecordId: () => randomUUID(),
   };
+}
+
+/**
+ * The control plane the shipped process composes (`CONTROL-1b`): writing
+ * through `sink`, at PAPER, with the default append bound
+ * (`AUDIT_APPEND_TIMEOUT_MS`), and with every VOID record's instant and id
+ * drawn from `environment` (`control-plane.ts`, "An append is bounded").
+ *
+ * Exported so `main.test.ts` can prove that wiring with a sink that answers
+ * LATE: the shipped in-memory log answers at once, so the late path cannot be
+ * reached through `startup` itself, and a durable sink bound here later
+ * inherits exactly what that test pins.
+ */
+export function composeControlPlane(sink: ControlAuditSink, environment: AuditRecordSource): ControlPlane {
+  return new ControlPlane({
+    audit: sink,
+    runMode: CONTROL_API_RUN_MODE,
+    maximumRunMode: CONTROL_API_RUN_MODE,
+    repositoryMaximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
+    auditRecordSource: environment,
+  });
 }
 
 function healthSourceFor(config: ControlApiConfig): TraderHealthSource {
@@ -174,12 +197,13 @@ export async function startup(
     capacity: config.auditCapacity,
     safetyReserve: config.auditSafetyReserve,
   });
-  const controlPlane = new ControlPlane({
-    audit: sink,
-    runMode: CONTROL_API_RUN_MODE,
-    maximumRunMode: CONTROL_API_RUN_MODE,
-    repositoryMaximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
-  });
+  // `CONTROL-1b`: every append is bounded (`AUDIT_APPEND_TIMEOUT_MS`, the
+  // default), and an APPLIED record that lands after its bound is VOIDED by a
+  // record whose instant and id come from this process's environment
+  // (`composeControlPlane`). The in-memory log answers at once, so neither
+  // path is reachable in this composition today; `main.test.ts` pins the
+  // wiring with a sink that answers late.
+  const controlPlane = composeControlPlane(sink, environment);
   const health = new TraderHealthCache(healthSourceFor(config));
 
   const api = new ControlApi({
@@ -217,6 +241,15 @@ export async function startup(
       `${String(server.timeouts.requestTimeoutMs)}ms, keep-alive ${String(server.timeouts.keepAliveTimeoutMs)}ms; ` +
       "no strategy instance is registered (no seam reaches a running trader's strategies), so a " +
       "pause or resume is refused CONTROL_UNKNOWN_INSTANCE",
+  );
+  // `CONTROL-1b` r1 (closing `CONTROL1B-R1-J-L1`): read from the control plane
+  // this process composed, so a composition that drops the void-record source
+  // says so here — and `shipped-root-control-1.test.ts` pins this line.
+  ports.log(
+    `audit append bound ${String(controlPlane.auditAppendTimeoutMs)}ms; an APPLIED record that lands after it gets ` +
+      (controlPlane.voidsLateAppliedRecords
+        ? "a VOID record from this process's clock and id source, when the sink and the audit budget admit one"
+        : "NO void record: no audit record source was composed"),
   );
   ports.log(
     config.traderHealth.kind === "http"

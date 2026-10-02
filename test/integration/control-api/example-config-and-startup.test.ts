@@ -62,9 +62,14 @@ describe("the README does not overstate what ships", () => {
     expect(readme).toContain("No claim is made that a trader is on the other end");
   });
 
-  it("discloses that the PostgreSQL sink was never executed", () => {
-    expect(readme).toContain("No database was reached");
-    expect(readme).toContain("typecheck-pinned only");
+  it("discloses where the PostgreSQL sink has been executed, and that no composition binds it", () => {
+    // `CONTROL-1b`: the sink is now driven against a real PostgreSQL by an
+    // OPT-IN suite. The disclosure must say so — and must still say that the
+    // shipped process binds no durable sink and that CI does not run it.
+    expect(readme).toContain("reached by an opt-in suite, bound by no composition");
+    expect(readme).toContain("test:integration:postgres");
+    expect(readme).toContain("No composition binds the");
+    expect(readme).toContain("CI does not run it yet");
   });
 
   it("states all four safety defaults verbatim", () => {
