@@ -1,10 +1,12 @@
 /**
- * Where a module load LANDS, and which files a scan must read
- * (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`, `CONTROL1B-R1-J-H2` and
- * `CONTROL1B-R1-J-L2`) — and, since `CONTROL-1b` r2, what every OTHER literal
- * a scanned file holds names ({@link judgeLiteral}, closing
- * `CONTROL1B-R2-J-H1`), and which bare packages a scanned file may load at all
- * ({@link PERMITTED_BARE_SPECIFIERS}, closing `CONTROL1B-R2-J-H2`).
+ * Where a module load LANDS, and which files a scan must read — the judge of
+ * acceptance 3's test-tree scan, which is best-effort LINT (`CONTROL-1b` r4;
+ * "Its limits, stated plainly", below). Introduced at `CONTROL-1b` r1
+ * (`CONTROL1B-R1-J-H1`, `-J-H2`, `-J-L2`); since r2 it also judges what every
+ * OTHER literal a scanned file holds names ({@link judgeLiteral};
+ * `CONTROL1B-R2-J-H1`) and which bare packages a scanned file may load at all
+ * ({@link PERMITTED_BARE_SPECIFIERS}; `CONTROL1B-R2-J-H2`), and since r3 where
+ * a literal PATH lands (`CONTROL1B-R3-J-H1`).
  *
  * `support/module-loads.ts` reads every load a file spells as its evaluated
  * literal. Round 0 then judged that literal by NAME — a prefix match against
@@ -44,7 +46,7 @@
  * reads may not sit beside the code that could load it, whether the path to it
  * is a literal or is computed.
  *
- * ## Every other literal (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1`)
+ * ## Every other literal (`CONTROL-1b` r2, for `CONTROL1B-R2-J-H1`)
  *
  * A loader the scan does not name can still be handed a LITERAL target — the
  * round-2 verifiers' plants built `createRequire` from parts and gave it
@@ -55,7 +57,7 @@
  * `\`, as written and percent-decoded — name the secure adapter's directory or
  * a forbidden package. An identifier fails only when it IS a forbidden name.
  *
- * ## A literal PATH is judged where it lands (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`)
+ * ## A literal PATH is judged where it lands (`CONTROL-1b` r3, `CONTROL1B-R3-J-H1`)
  *
  * Round 2 asked of a literal only whether it was FORBIDDEN. The round-3
  * verifiers reached `createRequire` without spelling it and handed it a
@@ -65,28 +67,30 @@
  * loaded in the repository's unit runner with acceptance 3 green. So every
  * literal with a PATH form (`./`, `../`, `.`, `..`, `/`, `file:`), and every
  * quoted string inside a literal that has one (code text an evaluator could
- * run, its escapes decoded), is resolved the way a loader handed it resolves
- * it ({@link pathReadings}): a relative path against the literal's own file's
- * directory — where `createRequire(import.meta.url)`, `import()` and vitest's
- * loaders resolve it — as written and percent-decoded, its query dropped; an
- * absolute path as itself and under the repository root, which is vite's root
- * in every runner of these trees (vite reads `/x` against its root first, and
- * `/@fs/x` as `/x`); a `file:` URL as its path. A path through `/proc` or
+ * run, its common escapes decoded — {@link decodeEscapes} — to four layers of
+ * quoting — {@link quotedStrings}), is resolved the way a loader handed it
+ * resolves it ({@link pathReadings}): a relative path against the literal's
+ * own file's directory — where `createRequire(import.meta.url)`, `import()`
+ * and vitest's loaders resolve it — as written and percent-decoded, its query
+ * dropped; an absolute path as itself and under the repository root, which is
+ * vite's root in every runner of these trees (vite reads `/x` against its
+ * root first, and `/@fs/x` as `/x`); a `file:` URL as its path. A path through `/proc` or
  * `/dev` — itself or by a symbolic link — is `<lands:…>` outright: it names a
  * different file in each process (`/proc/self/cwd` is the reader's working
  * directory), so where the runner would land is not where the scan looks.
  * Every EXISTING file a resolver can take there ({@link filesAt}: the path,
  * the path with ANY extension added — CommonJS also tries one a program
  * registers at run time — TypeScript's source for a `.js` name, a directory's
- * manifest entries and its `index`) is then judged like a load's landing:
+ * `index` and its manifest's entries, ONE level deep) is then judged like a
+ * load's landing:
  * FORBIDDEN as above (on its real path too); `<lands:…>` when it is not a file
  * this scan reads as code or JSON (inert files included: the CommonJS loader
  * runs any file as JavaScript); otherwise a landing — which
  * `acceptance-3-no-signer.test.ts` scans in turn when it lies outside every
  * scanned tree and every workspace package, as it does for a load's.
  * A path that reaches no existing file reaches nothing a loader could take
- * when the scan runs. What remains is in `module-loads.ts`, "What a static
- * scan cannot see".
+ * when the scan runs. A LOAD's own specifier is judged as a load
+ * ({@link judgePaths}), by its extension, and not again as a literal path.
  *
  * ## What else decides what a worker loads
  *
@@ -101,6 +105,28 @@
  *   package runs that package's own imports, which no scan of these trees
  *   reads. {@link forbiddenDependencyClosure} reads their manifests instead,
  *   following workspace dependencies to any depth.
+ *
+ * ## Its limits, stated plainly (`CONTROL-1b` r4)
+ *
+ * This scan is best-effort lint: no static analysis of JavaScript is sound
+ * against deliberate obfuscation, and it does not claim to be. It does not
+ * see a loader reached by a computed key, by enumeration or found by value as
+ * an evaluator, handed a target computed or joined to a base at run time;
+ * escapes inside evaluated code text beyond the common ones (legacy octal
+ * escapes, braced escapes longer than six digits) or code text quoted more
+ * than four layers deep; crafted directories and manifests (a load or literal
+ * path that lands on a directory, a manifest whose entry is itself a package
+ * directory); a relative path resolved against the working directory or any
+ * base but its own file's directory (and, when absolute, the repository
+ * root); a value another module exports, or a file written at run time;
+ * copies or hard links of a forbidden file; child processes and worker
+ * threads; and Node's loader internals. The AUTHORITATIVE checks are the
+ * shipped bundle's metafile and the production-source rule
+ * (`acceptance-3-shipped-artifact.test.ts`), and the run-time guard
+ * (`no-signer-guard.ts`), installed in every runner that executes control-api
+ * code, which refuses each of these that lands on a forbidden file — copies
+ * and hard links, other threads and processes, and loader internals that run
+ * no hook stay outside it too.
  */
 
 import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
@@ -109,6 +135,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   FORBIDDEN_PACKAGES,
+  SDK_DEPENDENCY_PACKAGES,
   SECURE_DIRECTORY,
   isForbiddenName,
   namesForbiddenSegments,
@@ -119,7 +146,7 @@ import { NO_SIGNER_PLUGIN_NAME, NO_SIGNER_SETUP_FILE, noSignerLoad } from "./no-
 
 // The vocabulary lives in `forbidden-targets.ts` (`CONTROL-1b` r2), which the
 // run-time guard shares; it is re-exported here for the scan's callers.
-export { FORBIDDEN_PACKAGES, SECURE_DIRECTORY, isForbiddenName };
+export { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY, isForbiddenName };
 
 /**
  * The Node builtins a scanned file may load — each one that cannot load or
@@ -151,7 +178,7 @@ export const PERMITTED_BUILTINS = [
 
 /**
  * A bare specifier — package AND subpath, exactly — a scanned file may load
- * (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H2`). `files`, when present, are
+ * (`CONTROL-1b` r2, for `CONTROL1B-R2-J-H2`). `files`, when present, are
  * the repository-relative files that may; absent, any scanned file may.
  */
 export interface PermittedBare {
@@ -192,10 +219,10 @@ export const PERMITTED_BARE_SPECIFIERS: readonly PermittedBare[] = Object.freeze
   { specifier: "zod", justification: "a schema library: it parses and validates data, and loads no module" },
   {
     specifier: "typescript",
-    files: ["test/integration/control-api/support/module-loads.ts"],
+    files: ["test/integration/control-api/support/module-loads.ts", "test/integration/control-api/support/production-source-rule.ts"],
     justification:
-      "the scan's own parser, used to parse text only; its one module loader, sys.require, is a <loader:require> " +
-      "finding wherever it is named",
+      "the scan's own parser, and the production-source rule's (CONTROL-1b r4), used to parse text only; its one " +
+      "module loader, sys.require, is a <loader:require> finding wherever it is named",
   },
   ...[
     "@polymarket-bot/control-api",
@@ -419,7 +446,7 @@ function judgeBare(specifier: string, importer: string, context: LandingContext)
     }
     reached.push(real);
   }
-  // `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H2`): nothing forbidden, and
+  // `CONTROL-1b` r2 (for `CONTROL1B-R2-J-H2`): nothing forbidden, and
   // still only a package and subpath the list names for this file.
   const file = relative(context.repoRoot, importer);
   const permitted = (context.permittedBare ?? PERMITTED_BARE_SPECIFIERS).find((entry) => entry.specifier === specifier);
@@ -574,8 +601,10 @@ function filesNamed(stem: string): readonly string[] {
  * extension added (CommonJS tries `.js`, `.json`, `.node` and any extension a
  * program registers at run time; vite its own list); TypeScript's source for a
  * compiled name; and, when the path is a directory, its `index` with any
- * extension and each entry its manifest names (read the same way, one level
- * deep). A directory itself is not a file: what loads from it is.
+ * extension and each entry its manifest names (read the same way, ONE level
+ * deep: a manifest entry that is itself a package directory is not followed —
+ * a limit of this lint, module header). A directory itself is not a file: what
+ * loads from it is.
  */
 export function filesAt(path: string, depth = 0): readonly string[] {
   const out: string[] = [...filesNamed(path)];
@@ -603,7 +632,13 @@ export function hasPathForm(text: string): boolean {
   );
 }
 
-/** One JavaScript string's escapes, resolved: `\x2e`, `\u002e`, `\u{2e}`, the single-character escapes, line continuations. */
+/**
+ * One JavaScript string's COMMON escapes, resolved: `\x2e`, `\u002e`, `\u{2e}`
+ * (up to six hex digits), the single-character escapes, line continuations.
+ * Not every escape JavaScript reads: a legacy octal escape (`\56`) and a
+ * braced escape longer than six digits are left as written — a limit of this
+ * lint (module header), which the run-time guard does not share.
+ */
 export function decodeEscapes(text: string): string {
   const single: Readonly<Record<string, string>> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "0": "\0" };
   return text.replace(
@@ -623,8 +658,9 @@ export function decodeEscapes(text: string): string {
 /**
  * Every string QUOTED inside `text` — from each `'`, `"` or backtick to the next
  * unescaped one of the same kind, so a stray apostrophe cannot hide one — with
- * its escapes decoded, and those quoted inside it in turn (module header: code
- * text an evaluator could run names its loads this way).
+ * its escapes decoded, and those quoted inside it in turn, to FOUR layers of
+ * quoting (module header: code text an evaluator could run names its loads
+ * this way; deeper nesting is a limit of this lint).
  */
 export function quotedStrings(text: string, depth = 0): readonly string[] {
   if (depth > 4) return [];
@@ -721,7 +757,7 @@ function judgePathLiteral(text: string, importer: string, context: LandingContex
 
 /**
  * The verdict on `literal` — one a scanned file holds OUTSIDE a load
- * (`module-loads.ts`, "Every literal is read too"). `CONTROL-1b` r2, closing
+ * (`module-loads.ts`, "Every literal is read too"). `CONTROL-1b` r2, for
  * `CONTROL1B-R2-J-H1` (module header, "Every other literal"):
  *
  * - an IDENTIFIER is FORBIDDEN when it IS a forbidden package's name (`viem`),
@@ -733,7 +769,7 @@ function judgePathLiteral(text: string, importer: string, context: LandingContex
  *   (through a symbolic link too) or passes through `node_modules`, a bare
  *   name installed as a signing package.
  *
- * `CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1` (module header, "A literal PATH
+ * `CONTROL-1b` r3, for `CONTROL1B-R3-J-H1` (module header, "A literal PATH
  * is judged where it lands"): the literal, and each string quoted inside it,
  * that has a path form is then judged where it LANDS — FORBIDDEN, or
  * UNREADABLE as `<lands:…>` when an existing file a resolver can take there is
@@ -851,7 +887,21 @@ export function discover(tree: string, admitsInert = true): Discovery {
 export const VITEST_CONFIG_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   "": ["resolve", "test", "plugins"],
   resolve: ["alias"],
-  test: ["root", "setupFiles", "include", "exclude", "testTimeout", "hookTimeout", "passWithNoTests"],
+  test: ["root", "setupFiles", "include", "exclude", "testTimeout", "hookTimeout", "passWithNoTests", "projects"],
+});
+
+/**
+ * The keys an INLINE project of `test.projects` may set (`CONTROL-1b` r4: the
+ * repository's unit runner runs the control API's tests in a project of their
+ * own, under the run-time guard): its name, its files, and the guard's
+ * `plugins` and `test.setupFiles`, EXACTLY. No `extends` (a project that
+ * extends a config inherits keys no one judged here), no `root`, no
+ * `resolve`; a project given as a string names a config file this judge does
+ * not read, and fails.
+ */
+export const VITEST_PROJECT_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  "": ["test", "plugins"],
+  test: ["name", "include", "exclude", "setupFiles"],
 });
 
 function recordOf(value: unknown): Record<string, unknown> {
@@ -887,22 +937,47 @@ function isGuardSetup(setupFiles: unknown): boolean {
   return Array.isArray(setupFiles) && setupFiles.length === 1 && setupFiles[0] === NO_SIGNER_SETUP_FILE;
 }
 
-/** Every key path of `config` outside {@link VITEST_CONFIG_KEYS}, or holding a value it does not admit. */
-export function unjudgedConfigKeys(config: unknown): readonly string[] {
+/** Every key path of `config` outside `keys`, or holding a value it does not admit, each prefixed with `prefix`. */
+function unjudgedKeys(config: unknown, keys: Readonly<Record<string, readonly string[]>>, prefix: string): readonly string[] {
   const out: string[] = [];
   const top = recordOf(config);
   for (const key of ownKeysOf(config)) {
-    if (!(VITEST_CONFIG_KEYS[""] ?? []).includes(key)) out.push(key);
+    if (!(keys[""] ?? []).includes(key)) out.push(`${prefix}${key}`);
   }
-  if ("plugins" in top && !isGuardPlugins(top["plugins"])) out.push("plugins");
+  if ("plugins" in top && !isGuardPlugins(top["plugins"])) out.push(`${prefix}plugins`);
   for (const section of ["resolve", "test"]) {
     for (const key of ownKeysOf(top[section])) {
-      if (!(VITEST_CONFIG_KEYS[section] ?? []).includes(key)) out.push(`${section}.${key}`);
+      if (!(keys[section] ?? []).includes(key)) out.push(`${prefix}${section}.${key}`);
     }
   }
   const test = recordOf(top["test"]);
-  if ("setupFiles" in test && !isGuardSetup(test["setupFiles"])) out.push("test.setupFiles");
+  if ("setupFiles" in test && !isGuardSetup(test["setupFiles"])) out.push(`${prefix}test.setupFiles`);
   return out;
+}
+
+/**
+ * Every key path of `config` outside {@link VITEST_CONFIG_KEYS}, or holding a
+ * value it does not admit — and, since `CONTROL-1b` r4, of each inline project
+ * of its `test.projects` outside {@link VITEST_PROJECT_KEYS}.
+ */
+export function unjudgedConfigKeys(config: unknown): readonly string[] {
+  const out = [...unjudgedKeys(config, VITEST_CONFIG_KEYS, "")];
+  const test = recordOf(recordOf(config)["test"]);
+  if (!("projects" in test)) return out;
+  const projects = test["projects"];
+  if (!Array.isArray(projects)) return [...out, "test.projects"];
+  projects.forEach((project: unknown, index) => {
+    const prefix = `test.projects[${String(index)}].`;
+    if (typeof project !== "object" || project === null) out.push(`${prefix}<not an inline project>`);
+    else out.push(...unjudgedKeys(project, VITEST_PROJECT_KEYS, prefix));
+  });
+  return out;
+}
+
+/** The inline projects of a config's `test.projects` (`CONTROL-1b` r4), or none. */
+export function projectsOf(config: unknown): readonly unknown[] {
+  const projects = recordOf(recordOf(config)["test"])["projects"];
+  return Array.isArray(projects) ? projects : [];
 }
 
 /** Whether `config` installs BOTH halves of the run-time no-signer guard, exactly (`no-signer-guard.ts`). */

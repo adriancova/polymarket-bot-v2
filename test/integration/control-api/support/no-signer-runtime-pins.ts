@@ -1,11 +1,13 @@
 /**
- * The run-time no-signer guard's pins (`CONTROL-1b` r2, closing
- * `CONTROL1B-R2-J-H1` and `CONTROL1B-R2-J-H2` behind the static scan; r3 adds
- * the round-3 routes, an inert file and code outside every tree, written to
- * paths computed at run time), declared once and run by EACH runner that
- * installs the guard:
- * `no-signer-runtime-guard.test.ts` (the integration runner) and
- * `postgres/no-signer-runtime-guard.test.ts` (the PostgreSQL runner).
+ * The run-time no-signer guard's pins (`CONTROL-1b` r2; r3 adds the round-3
+ * routes, an inert file and code outside every tree; r4 the round-4 routes —
+ * a directory landing, nested manifests, exotic escapes in evaluated code
+ * text, a working-directory load), declared once and run by EACH runner that
+ * executes control-api code, all of which install the guard:
+ * `no-signer-runtime-guard.test.ts` (the integration runner),
+ * `postgres/no-signer-runtime-guard.test.ts` (the PostgreSQL runner) and,
+ * since `CONTROL-1b` r4, `test/unit/control-api/no-signer-runtime-guard.test.ts`
+ * (the repository's unit runner, its `control-api` project).
  *
  * Every attempt below is written the way the static scan CANNOT read — the
  * residual `module-loads.ts` states: each loader is reached without spelling
@@ -21,14 +23,14 @@
  * the secure adapter into this worker — and fail.
  */
 
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { FORBIDDEN_PACKAGES, SECURE_DIRECTORY } from "./forbidden-targets.js";
+import { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY } from "./forbidden-targets.js";
 import { NO_SIGNER_GUARD_TAG, noSignerLoad, refusedLanding } from "./no-signer-guard.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
@@ -76,8 +78,24 @@ function viteLoader(): (path: string) => Promise<unknown> {
   return loader.bind(vi);
 }
 
-function refusedBy(half: "node" | "vite"): RegExp {
-  return new RegExp(`${NO_SIGNER_GUARD_TAG} \\(${half}\\): refused`, "u");
+function refusedBy(half: "node" | "vite" | "either"): RegExp {
+  return new RegExp(`${NO_SIGNER_GUARD_TAG} \\(${half === "either" ? "(?:node|vite)" : half}\\): refused`, "u");
+}
+
+/** One `require` of `path`, as a CommonJS module's whole text. */
+const requireOf = (path: string): string => `module.exports = require(${JSON.stringify(path)});\n`;
+
+/** Each character of `text` as a three-digit LEGACY OCTAL escape (`\057`), which sloppy-mode code decodes. */
+const octalEscaped = (text: string): string => [...text].map((c) => `\\${c.charCodeAt(0).toString(8).padStart(3, "0")}`).join("");
+
+/** Each character of `text` as an eight-digit braced unicode escape (`\u{0000002f}`), which strict code decodes too. */
+const bracedEscaped = (text: string): string => [...text].map((c) => `\\u{${c.charCodeAt(0).toString(16).padStart(8, "0")}}`).join("");
+
+/** `body` wrapped `layers` times in an evaluator call: code text quoted inside code text. */
+function nested(body: string, layers: number): string {
+  let code = body;
+  for (let layer = 0; layer < layers; layer += 1) code = `return ${word("Func", "tion")}(${JSON.stringify(code)})()`;
+  return code;
 }
 
 /** Declares the guard's pins in the calling test file. */
@@ -123,7 +141,6 @@ export function pinNoSignerGuard(runner: string): void {
       try {
         // Written at run time, their paths and contents computed: the static
         // scan's residual (`module-loads.ts`), which only this guard sees.
-        const requireOf = (path: string): string => `module.exports = require(${JSON.stringify(path)});\n`;
         const notes = join(directory, word("notes", ".md"));
         const outside = join(directory, word("outside", ".cjs"));
         writeFileSync(notes, requireOf(VENUE_SDK_ENTRY), "utf8");
@@ -137,6 +154,105 @@ export function pinNoSignerGuard(runner: string): void {
         writeFileSync(innocuousOutside, "module.exports = { innocuous: 2 };\n", "utf8");
         expect(factoryAt(import.meta.url)(innocuousNotes)).toEqual({ innocuous: 1 });
         expect(factoryAt(import.meta.url)(innocuousOutside)).toEqual({ innocuous: 2 });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("CONTROL-1b r4 (R4-J-H1): a DIRECTORY named like code, whose manifest names its entry, is refused at the venue SDK that entry loads — and the same shape holding innocuous code loads", () => {
+      const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-guard-dir-"));
+      try {
+        // astra's round-4 plant, its paths computed: `zz.cjs/` is a directory, `{"main":"entry.cjs"}`.
+        const plant = (name: string, entry: string): string => {
+          const path = join(directory, name);
+          mkdirSync(path);
+          writeFileSync(join(path, "package.json"), JSON.stringify({ main: "entry.cjs" }), "utf8");
+          writeFileSync(join(path, "entry.cjs"), entry, "utf8");
+          return path;
+        };
+        expect(() => factoryAt(import.meta.url)(plant(word("zz", ".cjs"), requireOf(VENUE_SDK_ENTRY)))).toThrow(refusedBy("node"));
+        // A manifest whose entry lies IN the secure adapter: refused at the entry itself.
+        const into = join(directory, "into");
+        mkdirSync(into);
+        writeFileSync(join(into, "package.json"), JSON.stringify({ main: relative(into, SECURE_LEAF) }), "utf8");
+        expect(() => factoryAt(import.meta.url)(into)).toThrow(refusedBy("node"));
+        // Positive control: the same shape, innocuous code.
+        expect(factoryAt(import.meta.url)(plant(word("ok", ".cjs"), "module.exports = { innocuous: 1 };\n"))).toEqual({ innocuous: 1 });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("CONTROL-1b r4 (R4-J-H3): a directory whose manifest names a NESTED package directory — which vite follows, and Node's CommonJS loader does not — is refused at the venue SDK its entry loads, and the same shape holding innocuous code loads", async () => {
+      const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-guard-nest-"));
+      try {
+        // Opus's round-4 plant, its paths computed: `ndir/` → `{"main":"inner"}`, `inner/` → `{"main":"entry.mjs"}`.
+        const plant = (name: string, entry: string): string => {
+          const path = join(directory, name);
+          mkdirSync(join(path, "inner"), { recursive: true });
+          writeFileSync(join(path, "package.json"), JSON.stringify({ main: "inner" }), "utf8");
+          writeFileSync(join(path, "inner", "package.json"), JSON.stringify({ main: "entry.mjs" }), "utf8");
+          writeFileSync(join(path, "inner", "entry.mjs"), entry, "utf8");
+          return path;
+        };
+        const sdk = plant("ndir", `export * from ${JSON.stringify(pathToFileURL(VENUE_SDK_ENTRY).href)};\n`);
+        await expect(viteLoader()(sdk)).rejects.toThrow(refusedBy("either"));
+        // Three levels: each manifest is followed by the resolver, and the guard judges only where the load LANDS.
+        const deeper = join(directory, "deeper");
+        mkdirSync(deeper);
+        writeFileSync(join(deeper, "package.json"), JSON.stringify({ main: "../ndir" }), "utf8");
+        await expect(viteLoader()(deeper)).rejects.toThrow(refusedBy("either"));
+        // Positive control: the same shape, innocuous code.
+        const innocuous = plant("okdir", "export const innocuous = 2;\n");
+        await expect(viteLoader()(innocuous)).resolves.toMatchObject({ innocuous: 2 });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("CONTROL-1b r4 (R4-J-H2): code TEXT an evaluator found by ENUMERATION runs, its path spelled in legacy octal escapes, in long braced escapes, or quoted five layers deep, is refused at the venue SDK it reaches — and the same text aimed at innocuous code loads", () => {
+      const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-guard-text-"));
+      try {
+        const target = join(directory, word("zz", ".cjs"));
+        const innocuous = join(directory, word("ok", ".cjs"));
+        writeFileSync(target, requireOf(VENUE_SDK_ENTRY), "utf8");
+        writeFileSync(innocuous, "module.exports = { innocuous: 3 };\n", "utf8");
+        // The factory, built inside the evaluated text by computed names (Opus's round-4 plants).
+        const factory = "process.getBuiltinModule('node:mod' + 'ule')['create' + 'Require'](u)";
+        const routes = [
+          { label: "legacy octal", body: (path: string): string => `return ${factory}('${octalEscaped(path)}')` },
+          { label: "long braced, strict", body: (path: string): string => `'use strict'; return ${factory}('${bracedEscaped(path)}')` },
+        ];
+        for (const { label, body } of routes) {
+          expect(() => evaluator()("u", body(target))(import.meta.url), label).toThrow(refusedBy("node"));
+          expect(evaluator()("u", body(innocuous))(import.meta.url), label).toEqual({ innocuous: 3 });
+        }
+        const deep = (path: string): unknown =>
+          ((evaluator()(nested(`return (u) => ${factory}(${JSON.stringify(path)})`, 5)) as unknown as () => (u: string) => unknown)())(
+            import.meta.url,
+          );
+        expect(() => deep(target)).toThrow(refusedBy("node"));
+        expect(deep(innocuous)).toEqual({ innocuous: 3 });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("CONTROL-1b r4 (R4-J-I1): Node's loader internals, reached by COMPUTED names with no parent, resolve a relative path against the WORKING directory — and are refused at the venue SDK it reaches; the same route to innocuous code loads", () => {
+      const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-guard-cwd-"));
+      try {
+        const load = moduleApi()[word("_", "lo", "ad")] as ((request: string, parent: null) => unknown) | undefined;
+        if (load === undefined) throw new Error("the loader internals are not reachable — the pin is vacuous");
+        const fromWorkingDirectory = (path: string): string => {
+          const path2 = relative(process.cwd(), path);
+          return path2.startsWith(".") ? path2 : `./${path2}`;
+        };
+        const target = join(directory, word("zz", ".cjs"));
+        const innocuous = join(directory, word("ok", ".cjs"));
+        writeFileSync(target, requireOf(VENUE_SDK_ENTRY), "utf8");
+        writeFileSync(innocuous, "module.exports = { innocuous: 4 };\n", "utf8");
+        expect(() => load(fromWorkingDirectory(target), null)).toThrow(refusedBy("node"));
+        expect(load(fromWorkingDirectory(innocuous), null)).toEqual({ innocuous: 4 });
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
@@ -178,13 +294,21 @@ export function pinNoSignerGuard(runner: string): void {
     it("the landing rule: the secure adapter, every forbidden package's store path, and a symbolic link into either — and nothing else", () => {
       expect(refusedLanding(SECURE_LEAF)).toBeDefined();
       expect(refusedLanding(VENUE_SDK_ENTRY)).toBeDefined();
-      for (const name of FORBIDDEN_PACKAGES) {
+      for (const name of [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES]) {
         // As pnpm stores it: `node_modules/.pnpm/<name>@<version>/node_modules/<name>/…`.
         const stored = join(REPO_ROOT, "node_modules", ".pnpm", `${name.replace("/", "+")}@1.0.0`, "node_modules", ...name.split("/"), "index.js");
         expect(refusedLanding(stored), stored).toBeDefined();
       }
       expect(refusedLanding(join(REPO_ROOT, "apps", "control-api", "src", "index.ts"))).toBeUndefined();
       expect(refusedLanding(join(REPO_ROOT, "node_modules", "zod", "index.js"))).toBeUndefined();
+      // `CONTROL-1b` r4: the venue SDK's own packages, spelled from parts so this pin does not lean on the list…
+      for (const name of [word("o", "x"), word("@polymarket/", "bind", "ings"), word("@polymarket/", "ty", "pes")]) {
+        const stored = join(REPO_ROOT, "node_modules", ".pnpm", `${name.replace("/", "+")}@1.0.0`, "node_modules", ...name.split("/"), "index.js");
+        expect(refusedLanding(stored), stored).toBeDefined();
+      }
+      // …matched EXACTLY: a package whose name only begins like one loads.
+      expect(refusedLanding(join(REPO_ROOT, "node_modules", word("o", "xford"), "index.js"))).toBeUndefined();
+      expect(refusedLanding(join(REPO_ROOT, "node_modules", "@polymarket", word("types", "cript"), "index.js"))).toBeUndefined();
       const directory = mkdtempSync(join(tmpdir(), "control-1b-r2-guard-link-"));
       try {
         symlinkSync(SECURE, join(directory, "innocuous"));

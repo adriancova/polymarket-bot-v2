@@ -1,10 +1,11 @@
 /**
- * Every module a source file could LOAD, read from its SYNTAX TREE
- * (`CONTROL-1b`, closing `CONTROL1-R2-J-L1`; widened at `CONTROL-1b` r1,
- * closing `CONTROL1B-R1-J-H2` and `CONTROL1B-R1-J-H3`) — and, since
- * `CONTROL-1b` r2, every LITERAL it holds outside a load (closing
- * `CONTROL1B-R2-J-H1`), and only the REAL calling forms of each loader as
- * loads (closing `CONTROL1B-R2-J-H2`).
+ * Every module a source file could LOAD, read from its SYNTAX TREE — the
+ * reader of acceptance 3's test-tree scan, which is best-effort LINT
+ * (`CONTROL-1b` r4; "Its limits, stated plainly", below). Introduced at
+ * `CONTROL-1b` (`CONTROL1-R2-J-L1`), widened at r1 (`CONTROL1B-R1-J-H2`,
+ * `-J-H3`), r2 (every LITERAL a file holds outside a load, and only the REAL
+ * calling forms of each loader as loads: `CONTROL1B-R2-J-H1`, `-J-H2`) and r3
+ * (a literal PATH judged where it lands: `CONTROL1B-R3-J-H1`).
  *
  * ## Why a parse, again
  *
@@ -40,7 +41,7 @@
  * | `declare module "m" { … }` | `declare-module` |
  *
  * Every executable extension is read with its own grammar (`CONTROL-1b` r1,
- * closing `CONTROL1B-R1-J-H2`: `.tsx` and `.jsx` were not read at all, and a
+ * for `CONTROL1B-R1-J-H2`: `.tsx` and `.jsx` were not read at all, and a
  * computed import in a `.tsx` helper loaded the secure adapter): TypeScript for
  * `.ts`/`.mts`/`.cts`, TSX for `.tsx`, JavaScript for `.js`/`.mjs`/`.cjs`, JSX
  * for `.jsx`, and JSON for `.json`.
@@ -52,7 +53,7 @@
  * - a specifier that is not a string literal — a variable, a concatenation, an
  *   interpolated template — is {@link COMPUTED};
  * - a NAMED LOADER or EVALUATOR, wherever the code can reach it, is
- *   `<loader:NAME>` (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H3`: round 0
+ *   `<loader:NAME>` (`CONTROL-1b` r1, for `CONTROL1B-R1-J-H3`: round 0
  *   flagged `Function` only as a callee, so `const F = Function`,
  *   `(() => {}).constructor` and `process.getBuiltinModule("node:vm")` each
  *   reached an evaluator and loaded the venue SDK past it):
@@ -70,7 +71,7 @@
  *   - `require`, `getBuiltinModule` and vitest's module loaders outside a
  *     REAL call of the form in the table above (`vi.mock` and `vi.unmock`
  *     only when read off `vi` or `vitest`, since `fn.mock.calls` is a spy's
- *     record, not a loader). `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H2`):
+ *     record, not a loader). `CONTROL-1b` r2 (for `CONTROL1B-R2-J-H2`):
  *     round 1 read EVERY `x.require(…)` as a load of its first argument, but
  *     `ts.sys.require(baseDir, moduleName)` takes the module SECOND — the
  *     verifiers loaded the venue SDK through it while the scan judged the
@@ -93,7 +94,7 @@
  * reaches, a bare name by its package (from an explicit list), and a builtin
  * by an allowlist.
  *
- * ## Every literal is read too (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1`)
+ * ## Every literal is read too (`CONTROL-1b` r2, for `CONTROL1B-R2-J-H1`)
  *
  * Round 1 judged a literal only in a LOAD position. The round-2 verifiers
  * reached a loader without spelling its name — `getBuiltinModule` and
@@ -109,29 +110,33 @@
  * Comments are not read: code reaching one goes through `toString` and a
  * slice, which is a computed value.
  *
- * Since `CONTROL-1b` r3 (closing `CONTROL1B-R3-J-H1`) a literal with a PATH
+ * Since `CONTROL-1b` r3 (for `CONTROL1B-R3-J-H1`) a literal with a PATH
  * form — and a path quoted inside one — is also judged where a loader handed it
  * would LAND (`load-judge.ts`, "A literal PATH is judged where it lands"): the
  * round-3 verifiers handed a computed `createRequire` a literal path to an
  * inert `.md` and to a `.cjs` outside every tree, and each loaded the venue SDK.
  *
- * ## What a static scan cannot see
+ * ## Its limits, stated plainly (`CONTROL-1b` r4)
  *
- * A load whose loader the scan does not name — reached by a COMPUTED key
- * (`globalThis[atob("…")]`), by enumeration, by spreading an object that holds
- * one, or through an API of a permitted package other than those named above
- * — AND whose target the scan does not reach from a literal: a path or name
- * computed at run time (from parts, by slicing, from encoded data or from the
- * program's own text); a literal joined at run time to a base the program
- * supplies (`join(root, "x")`, a `createRequire` anchor other than the file's
- * own, a URL base), since the scan resolves a literal path only against its
- * own file's directory and, when absolute, the repository root; a value
- * another module exports; or a file that does not exist when the scan runs
- * (one a test writes, and then loads). That is beyond any static scan, and
- * this one does not claim it. The control API's integration runners close it
- * at RUN time (`no-signer-guard.ts`), and `acceptance-3-no-signer.test.ts`
- * ("What this does not prove") states where they do not — the repository's
- * unit runner among them.
+ * This scan is best-effort lint: no static analysis of JavaScript is sound
+ * against deliberate obfuscation, and it does not claim to be. It does not
+ * see a loader reached by a computed key, by enumeration or found by value as
+ * an evaluator, handed a target computed or joined to a base at run time;
+ * escapes inside evaluated code text beyond the common ones (legacy octal
+ * escapes, braced escapes longer than six digits) or code text quoted more
+ * than four layers deep; crafted directories and manifests (a load or literal
+ * path that lands on a directory, a manifest whose entry is itself a package
+ * directory); a relative path resolved against the working directory or any
+ * base but its own file's directory (and, when absolute, the repository
+ * root); a value another module exports, or a file written at run time;
+ * copies or hard links of a forbidden file; child processes and worker
+ * threads; and Node's loader internals. The AUTHORITATIVE checks are the
+ * shipped bundle's metafile and the production-source rule
+ * (`acceptance-3-shipped-artifact.test.ts`), and the run-time guard
+ * (`no-signer-guard.ts`), installed in every runner that executes control-api
+ * code, which refuses each of these that lands on a forbidden file — copies
+ * and hard links, other threads and processes, and loader internals that run
+ * no hook stay outside it too.
  */
 
 import ts from "typescript";

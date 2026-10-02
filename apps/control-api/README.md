@@ -385,233 +385,149 @@ bound by no composition — see "The PostgreSQL sink" below.
 
 Nothing in this package or in `packages/observability/src/control` imports,
 references or configures a signer, a wallet, a private key or the secure venue
-adapter. `test/integration/control-api/acceptance-3-no-signer.test.ts` asserts
-that by scanning the shipped source of both trees, and additionally asserts that
-`packages/polymarket-secure` is absent from this package's dependency manifest.
-Its load scan also covers this package's test suites and `infra/grafana/**`
-(`CONTROL-1`, N-4). Since `CONTROL-1b` it reads each file's SYNTAX TREE with
-TypeScript's own parser (`test/integration/control-api/support/module-loads.ts`)
-instead of a regular expression — which a line comment or an escaped specifier
-had walked past (`CONTROL1-R2-J-L1`):
+adapter, and the package's manifest declares no dependency on
+`packages/polymarket-secure`. Since `CONTROL-1b` r4 that property rests on two
+AUTHORITATIVE checks, with a test-tree scan beside them as best-effort lint.
+"Forbidden" means one place throughout
+(`test/integration/control-api/support/forbidden-targets.ts`): the secure
+adapter (`packages/polymarket-secure`), the venue SDKs and signing libraries
+(`FORBIDDEN_PACKAGES`), and the venue SDK's own `ox`, `@polymarket/bindings` and
+`@polymarket/types` (`SDK_DEPENDENCY_PACKAGES`, matched exactly).
+
+**1. The shipped artifact (authoritative;
+`test/integration/control-api/acceptance-3-shipped-artifact.test.ts`).**
+
+- **The bundle.** This package ships as ONE esbuild bundle, `dist/main.mjs`,
+  which `build` makes. The test runs that script's own esbuild invocation — the
+  package's `esbuild`, the script's arguments, read in full (another command,
+  shell syntax or a metafile of the script's own fails) — adding only
+  `--metafile` and writing to a scratch directory, and reads the metafile,
+  where every module the bundle holds is an input. No input may lie in the
+  secure adapter or under a forbidden package's directory, judged on its path
+  and its real path exactly as the run-time guard judges a landing. Every
+  input must be this package's `src`, a workspace package it depends on, or a
+  third-party package on an exact, justified list (today `zod` and
+  `decimal.js`; a new one fails until it is judged there). Every import the
+  bundle leaves external must be a builtin that cannot load or run code.
+  Positive controls build the same invocation with an entry that imports the
+  secure adapter, directly and through a symbolic link, and each forbidden
+  input is named.
+- **The production source.** `apps/control-api/src/**`, its tests excluded,
+  holds no dynamic-loading primitive at all
+  (`test/integration/control-api/support/production-source-rule.ts`, read from
+  TypeScript's syntax tree): no `import()` or `require()` but of a string
+  literal; no specifier but a relative path that stays in `src`, a permitted
+  builtin (`node:vm`, `node:module`, `node:child_process`,
+  `node:worker_threads` and the rest are not) or a declared dependency; no
+  `createRequire`, `eval`, `Function` in a value position, `getBuiltinModule`,
+  `constructor`, `getPrototypeOf` or `__proto__`, or Node's loader internals by
+  name; `globalThis`, `global`, `process` and `module` only as the object of a
+  non-computed property access, and no computed member of them but a read of
+  `process.env[…]` or `process.argv[…]`. Each primitive is pinned by a plant
+  that fails, in every code extension.
+- **What this does not prove.** A deployment that runs anything but
+  `dist/main.mjs` is not the shipped artifact. Third-party code in the bundle
+  is judged by its package, not read: `zod` v4 compiles object-schema checks
+  with `new Function` from the schemas' own shapes, never from a request.
+  Workspace packages' source is `check:deps`'s (F6, F14, F16). And the
+  production-source rule is a rule over source text: a computed key on an
+  ordinary value can still reach a function's constructor. Production source
+  is reviewed code; the rule refuses every primitive it can name.
+
+**2. The run-time guard (authoritative in every runner that executes
+control-api code; `test/integration/control-api/support/no-signer-guard.ts`).**
+It is installed in the repository's unit runner — `test/vitest.config.ts` runs
+`apps/control-api/src/**/*.test.ts` and `test/unit/control-api/**/*.test.ts` in
+a `control-api` project of their own, and every other test in a project
+without it, so `packages/polymarket-secure`'s own tests still load the venue
+SDK — and in both control-api integration runners (`test:integration` and
+`test:integration:postgres`). Acceptance 3 holds each config to exactly the
+guard's one plugin and one setup file, and the unit runner to exactly those two
+projects. It refuses the LANDING: a file that lies in the secure adapter or
+under a forbidden package's directory, on its path and its real path.
+
+- a `module.registerHooks` `load` hook (the setup file) runs for every module
+  loaded in the test worker's thread — through `require`, `createRequire`,
+  `Module._load`, ESM `import` and `import()`, and code an evaluator built —
+  after resolution, so a directory resolves to its entry and every manifest is
+  followed before it judges; being a LOAD hook, it also refuses what a test's
+  OWN resolution hook answered;
+- a vite `load` hook (the plugin) refuses the same files when vitest's own
+  module graph — `vi.importActual`, `__vite_ssr_dynamic_import__`, a test's
+  imports — would load them.
+
+`no-signer-runtime-guard.test.ts` pins both halves in each runner (in the unit
+runner from `test/unit/control-api/`, and `src/no-signer-guard.test.ts` from
+inside `src`), with loads written as the test-tree scan cannot read them: the
+round-2 and round-3 routes, and the round-4 ones — a directory named like code,
+nested manifests, a path in evaluated code text spelled in legacy octal or long
+braced escapes or quoted five layers deep, and a load resolved against the
+working directory. **What it does not see:** a copy or hard link of a forbidden
+file at a path that names nothing forbidden (it judges where a file lies, not
+what it holds); code read as text and evaluated, or handed to a load hook a
+test registers itself; a module graph a test builds itself (its Node-loaded
+dependencies are guarded); another thread or process (the hook is
+thread-local); Node's loader internals that run no hook
+(`Module._extensions[…]`); and a builtin reached through
+`process.getBuiltinModule`, which resolves nothing.
+
+**3. The test-tree scan (best-effort lint;
+`test/integration/control-api/acceptance-3-no-signer.test.ts`,
+`support/module-loads.ts`, `support/load-judge.ts`).** It reads every file of
+this package's `src`, `packages/observability/src/control`, the control API's
+test trees and `infra/grafana` from TypeScript's syntax tree, and fails on what
+it can see:
 
 - every load form — static and type-only imports, re-exports, `import x =
-  require()`, `import()` types, dynamic `import()`, `require()` in any calling
-  spelling, `process.getBuiltinModule()`, vitest's `vi.importActual()` /
+  require()`, `import()` types, dynamic `import()`, `require()` in its calling
+  spellings, `process.getBuiltinModule()`, vitest's `vi.importActual()` /
   `importMock()` / `mock()` / `doMock()`, triple-slash and AMD references,
-  JSDoc `@import`, and `declare module` — is read as the EVALUATED string
-  literal, so comments are inert and escapes resolve as the runtime resolves
-  them. Since `CONTROL-1b` r2 only the REAL calling forms are loads — `require`
-  as itself or as `module.require`, with one argument; `getBuiltinModule` off
-  `process`; vitest's loaders off `vi` or `vitest` — and any other `.require`
-  is a named loader: round 1 read `ts.sys.require(baseDir, moduleName)` as a
-  load of the BASE, and the venue SDK loaded through it (`CONTROL1B-R2-J-H2`);
-- every executable extension is read with its own grammar — `.ts`, `.mts`,
-  `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` — and JSON with JSON's, and
-  EVERY entry of a scanned tree is classified: a file that is not code, JSON
-  or an inert kind (`.md`, `.gitkeep`), a symbolic link, or a `node_modules`
-  directory fails (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H2`: `.tsx` and
-  `.jsx` files were never opened, and a computed import in a `.tsx` helper
-  loaded the secure adapter) — and since `CONTROL-1b` r3 an inert kind is
-  admitted only in `infra/grafana`, the one scanned tree that holds no code:
-  the CommonJS loader runs a `.md` file as JavaScript;
-- each literal is judged by WHERE IT LANDS (`support/load-judge.ts`;
-  `CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`): a relative, absolute or
-  `file:` path by the file it reaches — read both as the CommonJS loader reads
-  it and, percent-decoded, as the ES loader does, through every symbolic link —
-  which may not be inside `packages/polymarket-secure`, pass through
-  `node_modules`, name a signing package, or be anything but code or JSON; a
-  bare name by the package each vitest alias and `node_modules` resolution
-  makes of it; a builtin by an allowlist of modules that cannot load or run
-  code (`node:vm`, `node:module`, `node:child_process`, `node:worker_threads`
-  and the rest fail — `CONTROL1B-R1-J-L2`); and `data:`, other URL schemes and
-  `#imports` fail as unplaceable. A bare name must also be on an explicit
-  package-AND-subpath list (`PERMITTED_BARE_SPECIFIERS`: `vitest`, `zod`, the
-  workspace packages these trees use; `vitest/config` in the three runner
-  configs only; `typescript` in the scanner only) — `vitest/node`'s
-  `createViteServer().ssrLoadModule` and ESLint's `overrideConfigFile` load any
-  path they are handed, and the round-2 verifiers loaded the secure adapter and
-  the venue SDK through each (`CONTROL1B-R2-J-H2`);
-- every OTHER literal is judged by what it NAMES (`CONTROL-1b` r2, closing
-  `CONTROL1B-R2-J-H1`): each string, each template's text (evaluated and raw),
-  each regular expression's body, JSX text, each identifier and, in JSON, each
-  key and string value fails when, read as a load from the same file, it would
-  be forbidden, or when its path segments — split on `/` and `\`, as written and
-  percent-decoded — name `polymarket-secure` or a forbidden package. The
-  round-2 verifiers reached `createRequire` without spelling it (built with
-  `.join("")`, or `Function` found by enumerating the function prototype) and
-  handed it a LITERAL path or package name, which round 1 never judged because
-  it was not in a load position;
-- every literal PATH — a literal with a path form (`./`, `../`, `.`, `..`,
-  `/`, `file:`), and every path quoted inside a literal (code text an
-  evaluator could run, its escapes decoded) — is judged where a loader handed
-  it would LAND (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`): resolved
-  against its own file's directory, as `createRequire(import.meta.url)`,
-  `import()` and vitest's loaders resolve it — and, when absolute, as itself
-  and under the repository root, as vite reads `/x` (and `/@fs/x`) — as
-  written and percent-decoded; a path through `/proc` or `/dev` fails outright
-  (as a load, `<target:…>`, too: `/proc/self/cwd` is a different directory in
-  each runner); then every EXISTING file a resolver can take there (the path,
-  the path with ANY extension added — CommonJS tries one a program registers
-  at run time — TypeScript's source for a `.js` name, a directory's manifest
-  entries and `index`) must be code or JSON, or the literal fails as
-  `<lands:…>`, and the code it reaches outside every scanned tree is scanned
-  in turn, exactly as a load's is. Round 2 asked of such a literal only
-  whether it NAMED a forbidden target: the round-3 verifiers handed a
-  computed `createRequire` the literal paths `./zz-r3-notes.md` (an inert
-  file beside the test) and `../../zz-r3-outside.cjs` (code outside every
-  tree), each holding one `require` of the venue SDK, which loaded in the
-  repository's unit runner with this acceptance green;
-- whatever it cannot read FAILS: a computed specifier, a named loader or
-  evaluator — `require` aliased, `createRequire`, `eval`, `Module._load`,
-  `_compile`, `_extensions` (since r2), `dlopen`, `process.binding`,
-  `ShadowRealm`, any `.constructor`,
-  `Function` in any VALUE position, and any name beginning `__vite` (vite-node's
-  in-scope `__vite_ssr_dynamic_import__`, vitest's `globalThis.__vitest_*__`)
-  (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H3`: an aliased `Function`,
-  `(() => {}).constructor` and `getBuiltinModule("node:vm")` each loaded the
-  venue SDK past round 0), including any of those names as a string key —
-  `import.meta.glob`, a file that does not parse under its extension's
-  grammar, or a load that lands on no file when the scan runs (a test that
-  WRITES a module and then loads it) — unless an explicit, justified allowlist
-  entry covers it exactly (the allowlist holds only the scan's own
-  vocabulary — the loader names it detects and, since r2, the forbidden
-  targets it judges — and the run-time guard's one `node:module` import);
-- the RUNNERS load nothing their imports do not name: the three vitest configs
-  that run these trees are a closed world (no setup file, plugin or custom
-  environment but the run-time guard's, exactly) whose aliases are judged like
-  any path, this package's scripts
-  are pinned exactly, and the bundle's tsconfig maps no name; a load or a
-  literal path that lands on a file outside every scanned tree and every
-  workspace package (a fixture under `test/`, the repository's unit runner
-  config) is scanned in turn — and, since `CONTROL-1b` r3, so is one that lands
-  in a workspace package where `check:deps` reads nothing (a dot-directory,
-  `dist/` and the rest of its skipped directories); and no workspace package a
-  load or a literal path lands in declares a forbidden dependency, at any
-  depth — its own source is `check:deps`'s (F6, F16);
-- planted controls cover every spelling and path form the verifiers used, each
-  escape and comment form, each literal form, the round-2 verifiers' five plants
-  verbatim, each scanned tree and each code extension — and the round-3
-  verifiers' two plants verbatim, ON DISK in a mirror of each scanned tree, in
-  each code extension, beside the same plant aimed at an innocuous file.
+  JSDoc `@import`, `declare module` — read as the EVALUATED literal, so
+  comments, whitespace and escapes in the literal resolve as the runtime
+  resolves them; each file with its own extension's grammar;
+- each specifier judged by where it lands: a path by the file it reaches
+  (never the secure adapter, `node_modules` or a forbidden package; code or
+  JSON only); a bare name by the package aliases and `node_modules` make of it,
+  from an exact package-and-subpath list; a builtin from an allowlist of
+  modules that cannot load or run code;
+- every other literal judged by what it names, and a literal path by where a
+  loader handed it would land;
+- a computed specifier, a named loader or evaluator, a file that does not
+  parse, a load of a file that does not exist when the scan runs — each fails
+  unless an exact, justified allowlist entry covers it;
+- the runners' configs held to a closed world of keys, this package's scripts
+  pinned exactly, and every file a load or literal path lands on outside every
+  scanned tree and workspace package scanned in turn.
 
-**The run-time guard (`CONTROL-1b` r2).** A static scan cannot rule out a load
-whose loader it does not name AND whose target it does not reach from a
-literal (the residual below). So the control API's two integration runners
-(`test:integration` and `test:integration:postgres`) install
-`test/integration/control-api/support/no-signer-guard.ts`, which refuses the
-LANDING itself — a file that lies in the secure adapter or under a forbidden
-package's directory — whatever loader reached it:
+**Its limits, stated plainly.** It is best-effort lint: no static analysis of
+JavaScript is sound against deliberate obfuscation, and it does not claim to be.
+It does not see a loader reached by a computed key, by enumeration or found by
+value as an evaluator, handed a target computed or joined to a base at run
+time; escapes inside evaluated code text beyond the common ones (legacy octal
+escapes, braced escapes longer than six digits) or code text quoted more than
+four layers deep; crafted directories and manifests (a load or literal path
+that lands on a directory, a manifest whose entry is itself a package
+directory); a relative path resolved against the working directory or any base
+but its own file's directory (and, when absolute, the repository root); a value
+another module exports, or a file written at run time; copies or hard links of
+a forbidden file; child processes and worker threads; and Node's loader
+internals. The run-time guard refuses, in every runner that executes
+control-api code, each of these that lands on a forbidden file; copies and hard
+links, other threads and processes, and loader internals that run no hook stay
+outside it too.
 
-- a `module.registerHooks` `load` hook (the runner's one setup file) runs for
-  every module loaded in the test worker's thread — through `require`,
-  `createRequire`, `Module._load`, ESM `import` and `import()` — and throws
-  when it is inside `packages/polymarket-secure` or on a path naming a
-  forbidden package (which is where pnpm keeps every one of them); being a
-  LOAD hook, it also refuses what a test's OWN resolution hook answered;
-- a vite `load` hook (the runner's one plugin) refuses the same files when
-  vitest's own module graph — `vi.importActual`, `__vite_ssr_dynamic_import__`,
-  a test's imports — would load them.
-
-`no-signer-runtime-guard.test.ts` pins both halves in each runner, with loads
-written exactly as the static scan cannot read them; each of the five round-2
-plants, and the round-3 routes, are refused by it too. It judges where a file
-LIES, not what it holds.
-
-**Dated correction (`CONTROL-1b` r3, 2026-10-01).** Round 2 below stated the
-static residual as a load whose loader the scan does not name AND "whose
-target no literal in the file names", and the guard as refusing a forbidden
-file "however it was spelled". Both were wrong. The round-3 verifiers reached
-`createRequire` by computed names and handed it a LITERAL path to an inert
-`.md` beside the test and to a `.cjs` outside every scanned tree, each holding
-a `require` of the venue SDK: the SDK loaded in the repository's unit runner
-with this acceptance green (`CONTROL1B-R3-J-H1`). And a COPY of the SDK's files
-at a path naming nothing forbidden loaded with the guard installed
-(`CONTROL1B-R3-J-L1`). The literal-path form now fails, above. What remains,
-stated rather than claimed away:
-
-- **statically:** a load whose loader the scan does not NAME — reached by a
-  computed key, by enumeration, by spreading an object that holds one, or
-  through a method of a permitted package other than those named above — AND
-  whose target the scan does not reach from a literal: a path or name computed
-  at run time (from parts, by slicing, from encoded data or from the
-  program's own text); a literal joined at run time to a base the program
-  supplies (`join(root, "x")`, a `createRequire` anchor other than the file's
-  own, a URL base) — the scan resolves a literal path only against its own
-  file's directory and, when absolute, the repository root; a value another
-  module exports; or a file that does not exist when the scan runs (one a
-  test writes, and then loads);
-- **at run time, in the two integration runners:** a COPY or hard link of a
-  forbidden file at a path that names nothing forbidden (the guard judges
-  where a file lies, not what it holds); code read as TEXT and handed to an
-  evaluator (or to a load hook a test registers); a module graph a test
-  builds itself (its Node-loaded dependencies ARE guarded); another THREAD or
-  process (the hook is thread-local, so a `worker_threads` Worker loads
-  without it); Node's loader internals called directly
-  (`Module._extensions[…]`, which runs no hook; the scan refuses the name);
-  and a builtin reached through `process.getBuiltinModule`, which resolves
-  nothing;
-- **the repository unit runner** (`test/vitest.config.ts`, `WP-010`-owned and
-  outside `CONTROL-1b`'s grant) runs `src/**/*.test.ts` and
-  `test/unit/control-api/**` WITHOUT the guard: there the static residual
-  above stands alone, and a load in it — an unnamed loader handed a path
-  computed at run time or joined to a base, a value another module exports, a
-  file written at run time — really loads what it reaches;
-- as before: a test that OVERWRITES an existing file at run time and then
-  loads it (the scan read the earlier text; the guard still refuses what it
-  would load, in the integration runners), the deeper dependencies of
-  third-party packages, and runner flags outside this package (CI's
-  environment, `NODE_OPTIONS`).
-
-**Dated correction (`CONTROL-1b` r2, 2026-10-01).** Round 1 below said what
-remained beyond the scan was "a loader reached through a COMPUTED property name
-… with a computed path", which implied a LITERAL path was ruled out. It was
-not: the round-2 verifiers loaded the venue SDK through a computed loader name
-with a literal path, and through `ts.sys.require`, `vitest/node` and ESLint
-with every loader name spelled, all with this acceptance green. What remains
-now, stated rather than claimed away:
-
-- **statically:** a load whose loader the scan does not NAME — reached by a
-  computed key, by enumeration, by spreading an object that holds one, or
-  through a method of a permitted package other than those named above — AND
-  whose target no literal in the file names (a path or name computed at run
-  time, from parts, by slicing, from encoded data or from the program's own
-  text, or a value another module exports);
-- **at run time, in the two integration runners:** code read as TEXT and
-  handed to an evaluator (or to a load hook a test registers), a module graph
-  a test builds itself (its Node-loaded dependencies ARE guarded), another
-  THREAD or process (the hook is thread-local, so a `worker_threads` Worker
-  loads without it), Node's loader internals called directly
-  (`Module._extensions[…]`, which runs no hook; the scan refuses the name),
-  and a builtin reached through `process.getBuiltinModule`, which resolves
-  nothing;
-- **the repository unit runner** (`test/vitest.config.ts`, `WP-010`-owned and
-  outside `CONTROL-1b`'s grant) runs `src/**/*.test.ts` and
-  `test/unit/control-api/**` WITHOUT the guard: there the static residual
-  above stands alone;
-- as before: a test that OVERWRITES an existing file at run time and then
-  loads it (the scan read the earlier text; the guard still refuses what it
-  would load, in the integration runners), the deeper dependencies of
-  third-party packages, and runner flags outside this package (CI's
-  environment, `NODE_OPTIONS`).
-
-(Superseded by the `CONTROL-1b` r3 correction above: the static residual's
-second half was stated too narrowly — a computed loader with a LITERAL path to
-a file the scan did not read loaded the venue SDK — and the run-time list
-omitted a copy or hard link.)
-
-**Dated correction (`CONTROL-1b` r1, 2026-10-01).** Round 0 said that "behind
-the scan, none of the forbidden packages even RESOLVES from a scanned tree, so
-a load spelled in a way no static scan can read would still find nothing to
-load". That held for bare NAMES only: a PATH into `packages/polymarket-secure`
-or its `node_modules` really loads, which is how the round-1 verifiers loaded
-the secure adapter and the venue SDK with this acceptance green. What remains
-beyond the scan, stated rather than claimed away: a loader reached through a
-COMPUTED property name (`globalThis[atob(…)]`) with a computed path; a test
-that OVERWRITES an existing file at run time and then loads it (the scan read
-the file's earlier text); the deeper dependencies of third-party packages; and
-runner flags outside this package (CI's environment, `NODE_OPTIONS`).
-(Superseded by the `CONTROL-1b` r2 correction above: that residual was stated
-too narrowly — a computed loader with a LITERAL path loaded the venue SDK.)
+**History.** Round 0 replaced a regular-expression scan, which a line comment
+or an escaped specifier walked past (`CONTROL1-R2-J-L1`), with the syntax-tree
+scan. Rounds 1 to 4 of `CONTROL-1b` each found a new route past it that loaded
+the venue SDK in a test worker — a path load, an unread extension, an
+evaluator reached without the watched spelling (r1); a computed loader handed a
+literal, and a permitted package's own loader (r2); a literal path to an inert
+file and to code outside every tree (r3); a directory landing, exotic escapes
+in evaluated text, nested manifests (r4) — and the run-time guard refused every
+one where it was installed. Each round's wording of what remained was too
+narrow, so on 2026-10-01 the orchestrator withdrew the requirement that the
+scan resist every spelling: the bundle, the production-source rule and the
+guard are authoritative, and the scan is lint with the limits above.
 
 ## Authentication (§15) — the INTERPRETATION
 

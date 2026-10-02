@@ -4,16 +4,19 @@
  * secure adapter's DIRECTORY, and as the path SEGMENTS either leaves in a file
  * path.
  *
- * Three readers share it, and none of them may disagree:
+ * Four readers share it, and none of them may disagree:
  *
- * - `load-judge.ts`, which judges every load a scanned file spells by where it
- *   lands, and every literal it holds by what it names;
- * - `no-signer-guard.ts`, the RUN-TIME guard, which refuses the load, in a
- *   test worker, of a file that LIES in the secure adapter or under one of
- *   these packages' directories, whatever loader reached it (`CONTROL-1b` r3:
- *   it judges where a file lies, not what it holds — a copy elsewhere is not
- *   refused);
- * - `acceptance-3-no-signer.test.ts`, which pins both.
+ * - `acceptance-3-shipped-artifact.test.ts` (`CONTROL-1b` r4, authoritative),
+ *   which refuses any of them among the inputs of the shipped bundle's
+ *   esbuild metafile;
+ * - `no-signer-guard.ts`, the RUN-TIME guard (authoritative in every runner
+ *   that executes control-api code), which refuses the load, in a test
+ *   worker, of a file that LIES in the secure adapter or under one of these
+ *   packages' directories, through every loader it hooks — by where a file
+ *   lies, not what it holds, so a copy elsewhere is not refused;
+ * - `load-judge.ts`, the test-tree scan (best-effort lint), which judges the
+ *   loads and literals a scanned file spells;
+ * - `acceptance-3-no-signer.test.ts`, which pins the lint and the guard.
  *
  * It imports nothing, so the run-time guard can install it in every test file
  * of a runner without loading the scanner's parser.
@@ -37,13 +40,28 @@ export const FORBIDDEN_PACKAGES = [
   "@ethersproject",
 ] as const;
 
+/**
+ * `CONTROL-1b` r4 (`CONTROL1B-R3-J-I1`): the venue SDK's own packages — its
+ * bindings, its types, and the Ethereum library it signs with. Matched
+ * EXACTLY — the name, or the name and a subpath — and never as a prefix, as
+ * {@link FORBIDDEN_PACKAGES} are: `ox` begins ordinary words.
+ */
+export const SDK_DEPENDENCY_PACKAGES = ["ox", "@polymarket/bindings", "@polymarket/types"] as const;
+
 /** The secure adapter's directory name, a forbidden PATH segment too. */
 export const SECURE_DIRECTORY = "polymarket-secure";
 
-/** A forbidden package NAME — a prefix match, so `viem/accounts` counts. */
+/**
+ * A forbidden package NAME: one of {@link FORBIDDEN_PACKAGES} by prefix, so
+ * `viem/accounts` counts; one of {@link SDK_DEPENDENCY_PACKAGES} exactly, or
+ * with a subpath.
+ */
 export function isForbiddenName(specifier: string): boolean {
   const lower = specifier.toLowerCase();
-  return FORBIDDEN_PACKAGES.some((name) => lower.startsWith(name));
+  return (
+    FORBIDDEN_PACKAGES.some((name) => lower.startsWith(name)) ||
+    SDK_DEPENDENCY_PACKAGES.some((name) => lower === name || lower.startsWith(`${name}/`))
+  );
 }
 
 /**
@@ -56,7 +74,7 @@ export function namesForbiddenSegments(path: readonly string[]): boolean {
   return segments.some((segment, index) => {
     if (segment === SECURE_DIRECTORY) return true;
     const pair = `${segment}/${segments[index + 1] ?? ""}`;
-    return FORBIDDEN_PACKAGES.some((name) => name === segment || name === pair);
+    return [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES].some((name) => name === segment || name === pair);
   });
 }
 

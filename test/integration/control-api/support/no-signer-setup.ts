@@ -1,8 +1,10 @@
 /**
  * The Node half of the run-time no-signer guard (`CONTROL-1b` r2;
- * `no-signer-guard.ts` states the whole design): each control-api integration
- * runner names this file as its only setup file, so vitest runs it in the test
- * worker before it imports any test file.
+ * `no-signer-guard.ts` states the whole design): each runner that executes
+ * control-api code — both control-api integration runners and, since
+ * `CONTROL-1b` r4, the repository unit runner's `control-api` project — names
+ * this file as its only setup file, so vitest runs it in the test worker
+ * before it imports any test file.
  *
  * It registers ONE synchronous `load` hook with `module.registerHooks`
  * (Node 22.15+/23.5+; this repository runs Node 24). Node runs it for every
@@ -12,7 +14,7 @@
  * on the URL actually loaded. A load where `refusedLanding` refuses throws
  * instead: a file that LIES in the secure adapter or under a forbidden
  * package's directory — where pnpm keeps the venue SDK and every signing
- * library — cannot be loaded into this thread, whatever loader reached it.
+ * library — cannot be loaded into this thread through any of those loaders.
  * It judges where a file lies, not what it holds: a COPY or hard link of one at
  * a path that names nothing forbidden loads (`CONTROL-1b` r3,
  * `CONTROL1B-R3-J-L1`; `no-signer-guard.ts`, "What it does not see"). It is a

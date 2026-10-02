@@ -1,87 +1,80 @@
 /**
- * WP-240 ACCEPTANCE 3 — "No signer is loaded."
+ * WP-240 ACCEPTANCE 3 — "No signer is loaded." — the TEST-TREE SCAN, which is
+ * best-effort LINT, and the pins that hold the run-time guard's installation
+ * (`CONTROL-1b` r4).
  *
- * Asserted by ABSENCE, over the shipped source of both trees `WP-240` owns,
- * plus the manifests — and, for loads, over the control API's own test
- * suites and `infra/grafana/**` too (`CONTROL-1`, closing `WP-240` r1 N-4).
- * Loads are read from each file's SYNTAX TREE, as the evaluated literal, and
- * whatever the scan cannot read fails it (`CONTROL-1b`, closing
- * `CONTROL1-R2-J-L1`; `support/module-loads.ts`). Each literal is judged by
- * WHERE IT LANDS — the file a path reaches, the package a bare name resolves
- * to, the builtin a `node:` id names — and every file of every scanned tree is
- * classified, none skipped (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`,
- * `-J-H2`, `-J-H3` and `-J-L2`; `support/load-judge.ts`). Every OTHER literal
- * a file holds is judged by what it names, only real loader calls count as
- * loads, and only listed bare packages may be loaded at all; and the two
- * control-api integration runners refuse a forbidden landing at RUN time
- * (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1` and `-J-H2`;
- * `support/no-signer-guard.ts`). A literal PATH is judged where a loader
- * handed it would land, and the code it lands on outside every tree is
- * scanned in turn; and a tree that holds code may hold no file the scan does
- * not read (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`). This is the
- * `apps/trader` precedent
+ * The property rests on two AUTHORITATIVE checks:
+ * `acceptance-3-shipped-artifact.test.ts` — the shipped bundle's esbuild
+ * metafile holds no forbidden module, and the production source holds no
+ * dynamic-loading primitive — and the run-time guard
+ * (`support/no-signer-guard.ts`), installed in every runner that executes
+ * control-api code (the repository unit runner's `control-api` project and
+ * both control-api integration runners; "the runners" below hold each config
+ * to it) and pinned in each by `no-signer-runtime-guard.test.ts`.
+ *
+ * Beside them, this file scans the shipped source of both trees `WP-240` owns,
+ * the control API's own test suites and `infra/grafana/**`
+ * (`CONTROL-1`, closing `WP-240` r1 N-4). Loads are read from each file's
+ * SYNTAX TREE, as the evaluated literal, and what the scan cannot read fails
+ * it (`CONTROL-1b`, for `CONTROL1-R2-J-L1`; `support/module-loads.ts`). Each
+ * literal is judged by where it lands — the file a path reaches, the package a
+ * bare name resolves to, the builtin a `node:` id names — every file of every
+ * scanned tree is classified (r1), every other literal is judged by what it
+ * names, only listed bare packages may load (r2), and a literal path is judged
+ * where a loader handed it would land (r3; `support/load-judge.ts`). This is
+ * the `apps/trader` precedent
  * (`test/integration/paper-trader/compose-and-example-config.test.ts`'s scans),
  * applied to a package whose §4.1 description is literally "never has the
  * signing key".
  *
- * Three independent claims:
+ * Three claims, as far as the scan sees:
  *
  * 1. **No load** of the secure adapter, a venue client, or a signing library:
  *    no literal lands in `packages/polymarket-secure`, in `node_modules` by
- *    path, or in a package named like one; no literal ANYWHERE in a scanned
- *    file names one; no bare package outside an explicit list is loaded; no
- *    builtin that can load or run code is loaded; nothing the scan cannot place
- *    is excused without an exact allowlist entry; the runners that execute
- *    these trees load nothing their imports do not name but the run-time
- *    guard; and no workspace package a load lands in declares a forbidden
- *    dependency, at any depth.
+ *    path, or in a package named like one; no literal in a scanned file names
+ *    one; no bare package outside an explicit list is loaded; no builtin that
+ *    can load or run code is loaded; nothing the scan cannot place is excused
+ *    without an exact allowlist entry; the runners that execute these trees
+ *    load nothing their imports do not name but the run-time guard; and no
+ *    workspace package a load lands in declares a forbidden dependency, at any
+ *    depth.
  * 2. **No identifier** naming a signer, a wallet key or a credential in
  *    production source — and the exceptions are enumerated, not waived: the
  *    words appear only where the code REFUSES them.
  * 3. **No manifest dependency** on `packages/polymarket-secure`, and no
  *    credential-shaped value in the shipped example configuration.
  *
- * ## What this does not prove (`CONTROL-1b` r3)
+ * ## Its limits, stated plainly (`CONTROL-1b` r4)
  *
- * - **Statically:** a load whose loader the scan does not NAME — reached by a
- *   computed key, by enumeration, by spreading an object that holds one, or
- *   through a method of a permitted package other than those
- *   `support/module-loads.ts` names — AND whose target the scan does not reach
- *   from a literal: a path or package computed at run time (from parts, by
- *   slicing, from encoded data or from the program's own text); a literal
- *   joined at run time to a base the program supplies (`join(root, "x")`, a
- *   `createRequire` anchor other than the file's own, a URL base) — a literal
- *   path is resolved only against its own file's directory and, when
- *   absolute, the repository root; a value another module exports; or a file
- *   that does not exist when the scan runs (one a test writes, then loads).
- *   Round 2 stated the second half as a target "no literal in the file
- *   names", and it was wrong: the round-3 verifiers handed a computed loader a
- *   LITERAL path to an inert `.md` and to a `.cjs` outside every tree, each of
- *   which required the venue SDK, and round 2 asked of such a literal only
- *   whether it named a forbidden target (`CONTROL1B-R3-J-H1`). Round 1's "a
- *   computed name with a computed path" was narrower still (`CONTROL1B-R2-J-H1`
- *   and `-J-H2`). Each of those plants fails below.
- * - **At run time** the guard (`support/no-signer-guard.ts`) refuses, in the
- *   two control-api integration runners, every module Node loads in the test
- *   worker's thread and every module vitest loads for it that LIES in the
- *   secure adapter or under a forbidden package's directory, whatever loader
- *   reached it (`no-signer-runtime-guard.test.ts` in each runner). It judges
- *   where a file lies, not what it holds, so it does NOT see a copy or hard
- *   link of a forbidden file at a path that names nothing forbidden; nor code
- *   read as text and evaluated; a module graph a test builds itself (whose
- *   Node-loaded dependencies it does see); another thread or process (its hook
- *   is thread-local, so a `worker_threads` Worker loads without it); Node's
- *   loader internals called directly (`Module._extensions[…]`, which runs no
- *   hook); or a builtin reached through `process.getBuiltinModule`, which
- *   resolves nothing. And it does not run under the repository's unit runner,
- *   `test/vitest.config.ts` (`WP-010`-owned, outside `CONTROL-1b`'s grant),
- *   which runs `apps/control-api/src/**` and `test/unit/control-api/**`: there
- *   the static scan stands alone, and a load in its residual above really
- *   loads what it reaches.
+ * This scan is best-effort lint: no static analysis of JavaScript is sound
+ * against deliberate obfuscation, and it does not claim to be. It does not
+ * see a loader reached by a computed key, by enumeration or found by value as
+ * an evaluator, handed a target computed or joined to a base at run time;
+ * escapes inside evaluated code text beyond the common ones (legacy octal
+ * escapes, braced escapes longer than six digits) or code text quoted more
+ * than four layers deep; crafted directories and manifests (a load or literal
+ * path that lands on a directory, a manifest whose entry is itself a package
+ * directory); a relative path resolved against the working directory or any
+ * base but its own file's directory (and, when absolute, the repository
+ * root); a value another module exports, or a file written at run time;
+ * copies or hard links of a forbidden file; child processes and worker
+ * threads; and Node's loader internals. The run-time guard refuses, in every
+ * runner that executes control-api code, each of these that lands on a
+ * forbidden file. It does NOT see a copy or hard link of a forbidden file at a
+ * path that names nothing forbidden (it judges where a file lies, not what it
+ * holds); code read as text and evaluated, or handed to a load hook a test
+ * registers; a module graph a test builds itself (whose Node-loaded
+ * dependencies it does see); another thread or process (its hook is
+ * thread-local); Node's loader internals that run no hook
+ * (`Module._extensions[…]`); or a builtin reached through
+ * `process.getBuiltinModule`, which resolves nothing.
+ *
+ * ## What else this does not prove
+ *
  * - Code a test WRITES at run time over a file that already exists, and then
  *   loads, is not read: the scan read the file's earlier text. (A load of a
- *   file that does not exist when the scan runs fails, and in the integration
- *   runners the guard refuses whatever forbidden module such code loads.)
+ *   file that does not exist when the scan runs fails, and the guard refuses
+ *   whatever forbidden file such code loads.)
  * - Third-party packages are judged by name, by the bare-package list and by
  *   their own `package.json` dependencies; their deeper transitive
  *   dependencies are not read.
@@ -117,6 +110,7 @@ import {
   PERMITTED_BARE_SPECIFIERS,
   PERMITTED_BUILTINS,
   PROCESS_DEPENDENT_ROOTS,
+  SDK_DEPENDENCY_PACKAGES,
   SECURE_DIRECTORY,
   aliasesOf,
   discover,
@@ -128,6 +122,7 @@ import {
   judgePaths,
   landsFinding,
   literalFinding,
+  projectsOf,
   unjudgedConfigKeys,
   workspacePackageOf,
   type LandingContext,
@@ -189,7 +184,7 @@ const IMPORT_SCAN_TREES = [
 
 /**
  * The one scanned tree that holds no code, and so the only one that may hold an
- * inert file (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`: the CommonJS loader
+ * inert file (`CONTROL-1b` r3, for `CONTROL1B-R3-J-H1`: the CommonJS loader
  * runs a `.md` file as JavaScript, and the round-3 verifiers loaded the venue
  * SDK through one beside a test).
  */
@@ -223,10 +218,64 @@ const CONFIGS = [
     config: postgresConfig as unknown,
     runs: "test/integration/control-api/postgres/",
   },
-  // The repository's unit runner: it runs `apps/control-api/src/**` and
-  // `test/unit/control-api/**`. Read only — it is outside this grant.
+  // The repository's unit runner. Since `CONTROL-1b` r4 it runs
+  // `apps/control-api/src/**` and `test/unit/control-api/**` in a `control-api`
+  // project of their own, under the guard ({@link CONTROL_API_UNIT_TESTS}).
   { file: "test/vitest.config.ts", config: rootConfig as unknown, runs: undefined },
 ] as const;
+
+/**
+ * The ONE file outside the guarded trees that loads control-api code
+ * (`CONTROL-1b` r4), exactly. It runs in the unit runner's other project,
+ * without the guard: it is not a control-api test, and the guard's scope is
+ * the control API's own tests (`test/vitest.config.ts`). What it loads is
+ * production source, which the authoritative checks hold
+ * (`acceptance-3-shipped-artifact.test.ts`).
+ */
+const OUTSIDE_LOADS_OF_CONTROL_API: readonly { readonly load: string; readonly justification: string }[] = Object.freeze([
+  {
+    load: "test/unit/tooling/app-bundles-load.test.ts:106 ../../../apps/control-api/src/main.js",
+    justification:
+      "BUNDLE-1's check that every app's shipped bundle starts (WP-010-owned): it imports control-api's production " +
+      "main.ts for its exit codes and runs the built bundle in a child process; production source, held by the " +
+      "production-source rule and the bundle metafile",
+  },
+]);
+
+/** The trees whose files run only under the guard, or are the control API itself. */
+const GUARDED_TREES = ["apps/control-api", "test/integration/control-api", "test/unit/control-api"].map((tree) => resolve(repoRoot, tree));
+
+/** A file name a test runner reads as its configuration. */
+const isRunnerConfig = (name: string): boolean => /^(vite|vitest)\.(config|workspace)\.|\.config\.[cm]?[jt]s$/u.test(name);
+
+/** Of `configs`, every one that names the control API and is not one of {@link CONFIGS}: a runner without the guard. */
+function foreignRunnersOf(configs: readonly string[]): readonly string[] {
+  const runners = CONFIGS.map((entry) => resolve(repoRoot, entry.file));
+  return configs.filter((config) => !runners.includes(config) && read(config).includes("control-api"));
+}
+
+/** Every load in `files` of the control API — by its package name, or by a path into `apps/control-api` — as `file:line specifier`. */
+function loadsOfControlApi(files: readonly string[]): readonly string[] {
+  const controlApi = resolve(repoRoot, "apps/control-api");
+  const found: string[] = [];
+  for (const path of files) {
+    const text = read(path);
+    if (!text.includes("control-api")) continue;
+    for (const load of moduleLoadsIn(text, path)) {
+      const specifier = load.specifier;
+      const landsIn = specifier.startsWith(".") && resolve(dirname(path), specifier).startsWith(`${controlApi}/`);
+      if (landsIn || specifier.startsWith("@polymarket-bot/control-api")) found.push(`${relative(repoRoot, path)}:${String(load.line)} ${specifier}`);
+    }
+  }
+  return found;
+}
+
+/**
+ * The control API's test files the repository's unit runner runs — in its
+ * `control-api` project, which installs the run-time guard, and in no other
+ * (`CONTROL-1b` r4).
+ */
+const CONTROL_API_UNIT_TESTS = ["apps/control-api/src/**/*.test.ts", "test/unit/control-api/**/*.test.ts"] as const;
 
 const LANDING: LandingContext = { repoRoot, aliases: CONFIGS.flatMap((entry) => aliasesOf(entry.config)) };
 
@@ -308,8 +357,9 @@ const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([
     count: 1 + (VITEST_ONLY_WHEN_ON_VI.includes(name) ? 1 : 0) + (SPECIFIER_LOADERS.get(name) === name ? 1 : 0),
     justification: VOCABULARY,
   })),
-  // `CONTROL-1b` r2: the forbidden targets, each written once in their list.
-  ...[...FORBIDDEN_PACKAGES, SECURE_DIRECTORY].map((name) => ({
+  // `CONTROL-1b` r2: the forbidden targets, each written once in their list
+  // (since r4 the venue SDK's own packages too).
+  ...[...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY].map((name) => ({
     file: "test/integration/control-api/support/forbidden-targets.ts",
     finding: literalFinding(name),
     count: 1,
@@ -332,6 +382,17 @@ const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([
     justification:
       "the run-time guard's Node half reads registerHooks, and nothing else, from node:module: a load hook that " +
       "only REFUSES, registered before any test file is imported",
+  },
+  // `CONTROL-1b` r4: the shipped-artifact check runs the package's own esbuild,
+  // as its build script does, in a child process.
+  {
+    file: "test/integration/control-api/acceptance-3-shipped-artifact.test.ts",
+    finding: named("<builtin:node:", "child_", "process>"),
+    count: 1,
+    justification:
+      "the authoritative bundle check runs this package's own esbuild binary with its build script's arguments " +
+      "(asynchronously, execFile) to read the shipped bundle's metafile; the child bundles, and nothing it builds " +
+      "is loaded into this worker",
   },
 ]);
 
@@ -379,9 +440,9 @@ function violationsIn(
       count(`<absent:${load.specifier}>`);
     }
   }
-  // `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H1`): every OTHER literal, by
+  // `CONTROL-1b` r2 (for `CONTROL1B-R2-J-H1`): every OTHER literal, by
   // what it names — a loader the scan cannot see could be handed it; and
-  // since r3 (closing `CONTROL1B-R3-J-H1`), a literal PATH by where it lands.
+  // since r3 (for `CONTROL1B-R3-J-H1`), a literal PATH by where it lands.
   for (const literal of scanned.literals) {
     const verdict = judgeLiteral(literal, path, context);
     if (verdict.kind === "forbidden") count(literalFinding(literal.text));
@@ -434,7 +495,7 @@ function readByDependencyCheck(file: string, workspace: string): boolean {
  * which scans every workspace package's source (F6: the venue SDK only in
  * `packages/polymarket-secure`; F16: no relative import leaving a package).
  *
- * `CONTROL-1b` r3 (closing `CONTROL1B-R3-J-H1`): the same holds for every file
+ * `CONTROL-1b` r3 (for `CONTROL1B-R3-J-H1`): the same holds for every file
  * a LITERAL path lands on (`load-judge.ts`, `judgeLiteral`) — a loader the
  * scan does not name can be handed it, and the round-3 verifiers' `.cjs`
  * outside every tree held a `require` of the venue SDK; and a landing inside a
@@ -695,7 +756,7 @@ function unreadableSpellings(specifier: string): readonly string[] {
 }
 
 /**
- * `CONTROL-1b` r1 (closing `CONTROL1B-R1-J-H3`): an evaluator or loader
+ * `CONTROL-1b` r1 (for `CONTROL1B-R1-J-H3`): an evaluator or loader
  * reached WITHOUT the spelling round 0 watched. Each loaded the venue SDK, or
  * would, in the round-1 exchange; each must fail.
  */
@@ -907,7 +968,7 @@ export const linter = new ESLint({ overrideConfigFile: ${parts(SDK_ENTRY)} });
 }
 
 /**
- * `CONTROL-1b` r3 (closing `CONTROL1B-R3-J-H1`): the round-3 verifiers' two
+ * `CONTROL-1b` r3 (for `CONTROL1B-R3-J-H1`): the round-3 verifiers' two
  * plants (`reconcile-r3`; `fable-r3-evidence/plants-r3/`). Each reached
  * `createRequire` without spelling it — `getBuiltinModule` and `createRequire`
  * built with `.join("")`, as astra's round-2 plant did — and handed it a
@@ -1016,7 +1077,7 @@ async function withMirror(body: (mirror: Mirror) => Promise<void> | void): Promi
 }
 
 /**
- * `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H1`): a literal OUTSIDE a load, in
+ * `CONTROL-1b` r2 (for `CONTROL1B-R2-J-H1`): a literal OUTSIDE a load, in
  * each form `module-loads.ts` reads, naming a forbidden target. Built from the
  * vocabulary, so this file spells none. `jsx`: only the JSX grammars have it.
  */
@@ -1631,75 +1692,120 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     expect(findingOf("typescript", resolve(repoRoot, "test/integration/control-api/support/module-loads.ts"))).toBe("ok");
     expect(findingOf("vitest/config")).toBe("<unpermitted:vitest/config>");
     expect(findingOf("vitest/config", resolve(repoRoot, "test/integration/control-api/vitest.config.ts"))).toBe("ok");
+    // `CONTROL-1b` r4: the venue SDK's own packages are names matched EXACTLY —
+    // alone or with a subpath, never as a prefix of another name.
+    expect(SDK_DEPENDENCY_PACKAGES.length).toBe(3);
+    for (const name of SDK_DEPENDENCY_PACKAGES) {
+      expect(isForbiddenName(name), name).toBe(true);
+      expect(isForbiddenName(`${name}/sub`), name).toBe(true);
+      expect(isForbiddenName(`${name}ford`), name).toBe(false);
+    }
   });
 
-  it("CONTROL-1b r3 (J-H1, J-L1): the residual reads the same wherever it is stated — the README, this header, the scanner — names the unit runner's exposure and the guard's copy blind spot, and the earlier wordings are superseded", () => {
+  it("CONTROL-1b r4: the scan's limits read the same wherever they are stated — best-effort lint, each limit named — the guard's are named where it is described, and no text claims more", () => {
     const normalized = (text: string): string =>
       text
         .replace(/^\s*\*\s?/gmu, "")
         .replace(/\s+/gu, " ")
         .toLowerCase();
     const readme = read(resolve(repoRoot, "apps/control-api/README.md"));
+    const section = readme.slice(readme.indexOf('### 3. "No signer is loaded."'), readme.indexOf("## Authentication (§15)"));
     const self = read(resolve(here, "acceptance-3-no-signer.test.ts"));
     const header = self.slice(0, self.indexOf("\nimport {"));
     const scanner = read(resolve(here, "support/module-loads.ts"));
+    const judge = read(resolve(here, "support/load-judge.ts"));
     const guard = read(resolve(here, "support/no-signer-guard.ts"));
     const setup = read(resolve(here, "support/no-signer-setup.ts"));
     const vocabulary = read(resolve(here, "support/forbidden-targets.ts"));
+    const pins = read(resolve(here, "support/no-signer-runtime-pins.ts"));
+    const shipped = read(resolve(here, "acceptance-3-shipped-artifact.test.ts"));
+    expect(section.length).toBeGreaterThan(2000);
+    // The scan's limits: the same statement, each limit named, in the README,
+    // this header, the scanner and the judge.
     for (const [name, text] of [
-      ["README", readme],
+      ["README", section],
       ["acceptance-3's header", header],
       ["module-loads.ts", scanner],
+      ["load-judge.ts", judge],
     ] as const) {
       const said = normalized(text);
-      expect(said, name).toContain("whose loader the scan does not name");
-      // `CONTROL-1b` r3: the second half is what a literal cannot REACH, not what none names.
-      expect(said, name).toContain("whose target the scan does not reach from a literal");
-      expect(said, name).toContain("a literal joined at run time to a base the program supplies");
-      expect(said, name).toContain("against its own file's directory");
-      expect(said, name).toContain("another module exports");
-      expect(said, name).toContain("does not exist when the scan runs");
+      for (const phrase of [
+        "best-effort lint",
+        "deliberate obfuscation",
+        "a loader reached by a computed key, by enumeration or found by value as an evaluator",
+        "legacy octal escapes, braced escapes longer than six digits",
+        "quoted more than four layers deep",
+        "crafted directories and manifests",
+        "a manifest whose entry is itself a package directory",
+        "resolved against the working directory",
+        "a value another module exports, or a file written at run time",
+        "copies or hard links of a forbidden file",
+        "child processes and worker threads",
+        "loader internals",
+        "every runner that executes control-api code",
+      ]) {
+        expect(said, `${name}: ${phrase}`).toContain(phrase);
+      }
     }
-    // Round 2's wording is gone where the residual is stated now, and marked
-    // superseded in the README's dated corrections; so is round 1's.
+    // The guard's own limits, where the guard is described; and the unit
+    // runner no longer stands outside it.
     for (const [name, text] of [
-      ["acceptance-3's header", header],
-      ["module-loads.ts", scanner],
-    ] as const) {
-      expect(normalized(text), name).not.toContain("whose target no literal in the file names");
-    }
-    expect(normalized(readme)).toContain(normalized("Superseded by the `CONTROL-1b` r3 correction above"));
-    expect(normalized(header)).not.toContain(normalized(named("A computed name that reaches a loader ", "with a computed path")));
-    expect(normalized(readme)).toContain(normalized("Superseded by the `CONTROL-1b` r2 correction above"));
-    // Where the guard does NOT run, and what it does not see, is said in the
-    // header, the README and the guard itself — a copy or hard link included
-    // (`CONTROL1B-R3-J-L1`).
-    for (const [name, text] of [
-      ["README", readme],
+      ["README", section],
       ["acceptance-3's header", header],
       ["no-signer-guard.ts", guard],
     ] as const) {
       const said = normalized(text);
-      expect(said, name).toContain("test/vitest.config.ts");
-      expect(said, name).toContain("stands alone");
-      expect(said, name).toContain("code read as text");
-      expect(said, name).toContain("thread or process");
-      expect(said, name).toContain("copy or hard link of a forbidden file at a path that names nothing forbidden");
+      for (const phrase of [
+        "every runner that executes control-api code",
+        "copy or hard link of a forbidden file at a path that names nothing forbidden",
+        "code read as text",
+        "thread or process",
+        "module._extensions[",
+        "process.getbuiltinmodule",
+      ]) {
+        expect(said, `${name}: ${phrase}`).toContain(phrase);
+      }
+      expect(said, name).not.toContain("stands alone");
+      expect(said, name).not.toContain("outside `control-1b`'s grant");
     }
-    // …and no text claims the guard refuses a forbidden module however it was
-    // spelled: it judges where a file lies (the README quotes the old claim
-    // only in its dated correction).
+    // The authoritative checks are named as such where the property is stated.
     for (const [name, text] of [
+      ["README", section],
       ["acceptance-3's header", header],
+      ["acceptance-3-shipped-artifact.test.ts", shipped],
+    ] as const) {
+      const said = normalized(text);
+      expect(said, name).toContain("authoritative");
+      expect(said, name).toContain("metafile");
+    }
+    // No text claims more than the scan or the guard does.
+    for (const [name, text] of [
+      ["README", section],
+      ["acceptance-3's header", header],
+      ["module-loads.ts", scanner],
+      ["load-judge.ts", judge],
       ["no-signer-guard.ts", guard],
       ["no-signer-setup.ts", setup],
       ["forbidden-targets.ts", vocabulary],
+      ["no-signer-runtime-pins.ts", pins],
+      ["acceptance-3-shipped-artifact.test.ts", shipped],
     ] as const) {
-      expect(normalized(text), name).not.toContain("however it was spelled");
-      expect(normalized(text), name).not.toContain("however the loader or the path was spelled");
+      const said = normalized(text);
+      for (const claim of [
+        "however it was spelled",
+        "however the loader or the path was spelled",
+        "however spelled",
+        "regardless of spelling",
+        "whatever spelled it",
+        "unevadable",
+        "closes the literal-path class",
+        "the class is closed",
+        "class closed",
+        "what a static scan cannot see",
+      ]) {
+        expect(said, `${name}: ${claim}`).not.toContain(claim);
+      }
     }
-    expect(normalized(readme)).not.toContain(normalized("refuses the LANDING itself, however it was spelled"));
-    expect(normalized(setup)).toContain("copy or hard link");
   });
 
   it("CONTROL-1b r1 (J-H2): each extension is read with ITS grammar — JSX is code in .tsx and .jsx, and a syntax error in .ts", () => {
@@ -1870,11 +1976,10 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
   it("CONTROL-1b r1: the runners — every vitest config that runs these trees is a CLOSED world, and every alias lands where a load may", () => {
     for (const { file, config, runs } of CONFIGS) {
       expect(unjudgedConfigKeys(config), file).toEqual([]);
-      // `CONTROL-1b` r2: the two control-api runners install the run-time
-      // guard, both halves, exactly; the repository's unit runner — outside
-      // this grant — does not (the header's "What this does not prove").
-      expect(installsNoSignerGuard(config), file).toBe(runs !== undefined);
+      // `CONTROL-1b` r2: the two control-api integration runners install the
+      // run-time guard, both halves, exactly.
       if (runs !== undefined) {
+        expect(installsNoSignerGuard(config), file).toBe(true);
         const include = ((config as { test?: { include?: unknown } }).test?.include ?? []) as readonly string[];
         expect(include.length, file).toBeGreaterThan(0);
         for (const pattern of include) expect(pattern.startsWith(runs), `${file}: ${pattern}`).toBe(true);
@@ -1913,6 +2018,32 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     expect(unjudgedConfigKeys({ test: sneaky })).toEqual(["test.<prototype>", "test.setupFiles"]);
     expect(installsNoSignerGuard({ plugins: [guard] })).toBe(false);
     expect(installsNoSignerGuard({ test: { setupFiles: [NO_SIGNER_SETUP_FILE] } })).toBe(false);
+    // `CONTROL-1b` r4: an inline project is a closed world too — no extends, no
+    // root, no resolve, nothing but the guard's plugin and setup file — and a
+    // project named by a config file's path is one this judge does not read.
+    expect(unjudgedConfigKeys({ test: { projects: [{ test: { name: "x", include: ["x"], exclude: [] } }] } })).toEqual([]);
+    expect(unjudgedConfigKeys({ test: { projects: [{ plugins: [guard], test: { setupFiles: [NO_SIGNER_SETUP_FILE] } }] } })).toEqual([]);
+    expect(unjudgedConfigKeys({ test: { projects: ["packages/x/vitest.config.ts"] } })).toEqual(["test.projects[0].<not an inline project>"]);
+    expect(unjudgedConfigKeys({ test: { projects: {} } })).toEqual(["test.projects"]);
+    expect(
+      unjudgedConfigKeys({
+        test: {
+          projects: [
+            { test: { name: "a" } },
+            { extends: true, root: "x", resolve: { alias: [] }, plugins: [{ name: "other" }], test: { setupFiles: ["x"], environment: "x", pool: "threads" } },
+          ],
+        },
+      }),
+    ).toEqual([
+      "test.projects[1].extends",
+      "test.projects[1].root",
+      "test.projects[1].resolve",
+      "test.projects[1].plugins",
+      "test.projects[1].resolve.alias",
+      "test.projects[1].test.environment",
+      "test.projects[1].test.pool",
+      "test.projects[1].test.setupFiles",
+    ]);
     // …and an alias that maps an innocuous name onto the secure adapter is FORBIDDEN.
     const planted: LandingContext = {
       repoRoot,
@@ -1923,6 +2054,75 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     expect(violationsIn(importer, 'import "innocuous";\n', LOAD_ALLOWLIST, planted)).toEqual([
       "test/integration/control-api/planted.ts:1 import innocuous",
     ]);
+  });
+
+  it("CONTROL-1b r4: the repository's unit runner runs every control-api test under the guard, in a project of its own — and every other test without it", () => {
+    const unit = rootConfig as unknown;
+    // The guard is installed per project, never for the whole runner: the
+    // secure adapter's own tests load the venue SDK.
+    expect(installsNoSignerGuard(unit)).toBe(false);
+    const projects = projectsOf(unit);
+    expect(projects).toHaveLength(2);
+    const testOf = (project: unknown): { name?: unknown; include?: unknown; exclude?: unknown; setupFiles?: unknown } =>
+      (project as { test?: { name?: unknown; include?: unknown; exclude?: unknown; setupFiles?: unknown } }).test ?? {};
+    const guarded = projects.filter((project) => installsNoSignerGuard(project));
+    expect(guarded).toHaveLength(1);
+    expect(testOf(guarded[0]).name).toBe("control-api");
+    expect(testOf(guarded[0]).include).toEqual([...CONTROL_API_UNIT_TESTS]);
+    const others = projects.filter((project) => !installsNoSignerGuard(project));
+    expect(others).toHaveLength(1);
+    const other = others[0];
+    expect((other as { plugins?: unknown }).plugins).toBeUndefined();
+    expect(testOf(other).setupFiles).toBeUndefined();
+    // The other project runs the repository's unit tests, and none of the control API's.
+    expect(testOf(other).include).toEqual(["test/unit/**/*.test.ts", "packages/**/src/**/*.test.ts", "apps/**/src/**/*.test.ts"]);
+    for (const glob of CONTROL_API_UNIT_TESTS) expect(testOf(other).exclude as readonly string[], glob).toContain(glob);
+    // Non-vacuity: the guarded project's trees hold tests, and its pins are among them.
+    for (const pin of ["test/unit/control-api/no-signer-runtime-guard.test.ts", "apps/control-api/src/no-signer-guard.test.ts"]) {
+      expect(existsSync(resolve(repoRoot, pin)), pin).toBe(true);
+    }
+  });
+
+  it("CONTROL-1b r4: no other runner executes control-api code — no other vitest config names it, and no test file outside the guarded trees loads it but one exact, justified entry", () => {
+    const configs: string[] = [];
+    const files: string[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory)) {
+        if (entry === NODE_MODULES || entry.startsWith(".") || entry === "dist") continue;
+        const path = join(directory, entry);
+        if (statSync(path).isDirectory()) walk(path);
+        else if (isRunnerConfig(entry)) configs.push(path);
+        else if ((CODE_EXTENSIONS as readonly string[]).includes(extname(entry))) files.push(path);
+      }
+    };
+    for (const top of ["test", "apps", "packages", "tools"]) walk(resolve(repoRoot, top));
+    for (const top of readdirSync(repoRoot)) if (isRunnerConfig(top)) configs.push(resolve(repoRoot, top));
+    expect(configs.length).toBeGreaterThan(10);
+    expect(foreignRunnersOf(configs)).toEqual([]);
+    // EXACT, like the scan's allowlist: an entry that no longer matches fails too.
+    const outside = files.filter((path) => !GUARDED_TREES.some((tree) => path.startsWith(`${tree}/`)));
+    expect(loadsOfControlApi(outside)).toEqual(OUTSIDE_LOADS_OF_CONTROL_API.map((entry) => entry.load));
+    for (const entry of OUTSIDE_LOADS_OF_CONTROL_API) expect(entry.justification.length, entry.load).toBeGreaterThanOrEqual(40);
+    // Non-vacuity: files outside the trees do mention the control API (in prose).
+    expect(outside.filter((path) => read(path).includes("control-api")).length).toBeGreaterThan(OUTSIDE_LOADS_OF_CONTROL_API.length);
+    // Positive controls, on disk outside the repository: a runner config that
+    // names the control API, and a test that loads it by name or by path.
+    const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-runners-"));
+    try {
+      const config = join(directory, "vitest.config.ts");
+      writeFileSync(config, 'export default { test: { include: ["apps/control-api/src/**/*.test.ts"] } };\n', "utf8");
+      expect(foreignRunnersOf([config])).toEqual([config]);
+      const byName = join(directory, "by-name.test.ts");
+      writeFileSync(byName, 'import { EXIT_CODES } from "@polymarket-bot/control-api";\nexport const e = EXIT_CODES;\n', "utf8");
+      const byPath = join(directory, "by-path.test.ts");
+      const main = relative(directory, resolve(repoRoot, "apps/control-api/src/main.js"));
+      writeFileSync(byPath, `export { EXIT_CODES } from ${JSON.stringify(main)};\n`, "utf8");
+      const prose = join(directory, "prose.test.ts");
+      writeFileSync(prose, "// the control-api README says so\nexport const n = 1;\n", "utf8");
+      expect(loadsOfControlApi([byName, byPath, prose]).map((load) => load.split(" ")[1])).toEqual(["@polymarket-bot/control-api", main]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("CONTROL-1b r1: the runners — this package's scripts and its bundle's tsconfig load nothing the scan does not see", () => {
@@ -1979,7 +2179,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     };
     const scopeOnly = (specifier: string): boolean => specifier.startsWith("@") && !specifier.includes("/");
     for (const tree of IMPORT_SCAN_TREES) {
-      for (const specifier of FORBIDDEN_PACKAGES) {
+      for (const specifier of [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES]) {
         if (scopeOnly(specifier)) {
           // `@ethersproject` is a SCOPE: no package of it may be reachable.
           for (let directory = tree; ; directory = dirname(directory)) {
