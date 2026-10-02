@@ -27,6 +27,11 @@
  * contract)" pin shows what the guarantee rests on: with a source the
  * reconciler can read ahead, the held answer IS bound again.
  *
+ * WP300C-R2-X5 (INFO, round 2): the constructor read `deps.requestToken`
+ * twice — once for its check, once to keep it. It is now read once; the
+ * WP300C-R2-X5 pins fail on the round-1 candidate (`2b59821`), except the
+ * control.
+ *
  * All executors and reconcilers are in-memory mocks. Nothing is signed or sent.
  */
 
@@ -319,5 +324,62 @@ describe("WP300C-J1: the request-token source", () => {
     expect(keyParts(h.reconciler.latest())?.[4]).toBe("fresh-1");
     expect(code(h.manager.resolveByReconciliation("op", authoritative("FAILED", h.reconciler.latest())))).toBe("ok");
     expect(h.state()).toBe("FAILED");
+  });
+});
+
+describe("WP300C-R2-X5: the manager reads deps.requestToken exactly once, and checks and keeps that one value", () => {
+  const base = () => ({
+    book: seededBook({ [PUSD]: "100", [YES]: "20", [NO]: "20", [USDC_E]: "50" }),
+    approvals: new ApprovalTracker(),
+    executor: { submit: () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null }) },
+    reconciler: new Reconciler(),
+  });
+  type Deps = ConstructorParameters<typeof WalletOperationManager>[0];
+
+  it("building a manager reads the requestToken property once", () => {
+    const tokens = new RequestTokens();
+    let reads = 0;
+    const deps = {
+      ...base(),
+      get requestToken(): () => string {
+        reads += 1;
+        return tokens.next;
+      },
+    };
+    void new WalletOperationManager(deps as Deps);
+    expect(reads).toBe(1);
+  });
+
+  it("a requestToken that is a function when read, and would not be on a second read, is the source the manager keeps: its requests carry tokens and are delivered", async () => {
+    const tokens = new RequestTokens("once-");
+    let reads = 0;
+    const deps = {
+      ...base(),
+      get requestToken(): unknown {
+        reads += 1;
+        return reads === 1 ? tokens.next : 7;
+      },
+    };
+    const manager = new WalletOperationManager(deps as unknown as Deps);
+    expect(manager.plan(PLANS.SPLIT as WalletOperationPlan).ok).toBe(true);
+    await manager.submit("op");
+    manager.observe("op", { status: "UNKNOWN", transactionHash: TX_A, transactionId: null });
+    expect(manager.operation("op")?.state).toBe("RECONCILING");
+    expect(deps.reconciler.ids()).toHaveLength(1);
+    expect(keyParts(deps.reconciler.latest())?.[4]).toBe("once-1");
+    expect(manager.outstandingReconciliationRequests()).toEqual([]);
+  });
+
+  it("(control) a requestToken that is not a function when read is refused at construction, whatever a second read would say", () => {
+    const tokens = new RequestTokens();
+    let reads = 0;
+    const deps = {
+      ...base(),
+      get requestToken(): unknown {
+        reads += 1;
+        return reads === 1 ? "not a function" : tokens.next;
+      },
+    };
+    expect(() => new WalletOperationManager(deps as unknown as Deps)).toThrow(TypeError);
   });
 });

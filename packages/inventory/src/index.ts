@@ -8,7 +8,8 @@
  * the package only through the injected `WalletOperationExecutor` port. The
  * unpredictable token in each reconciliation request id comes from the
  * injected `requestToken` source (WP-300c round 1), which the composition root
- * binds to a CSPRNG.
+ * binds to a CSPRNG; request ids are therefore not reproducible across runs,
+ * and a journal or replay must record the drawn tokens (WP300C-R2-X3).
  *
  * There is no bridge, deposit, withdrawal or transfer path (§9.14 "No
  * autonomous deposit, withdrawal, or bridge behavior in v1");

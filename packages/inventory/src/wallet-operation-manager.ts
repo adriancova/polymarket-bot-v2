@@ -355,10 +355,11 @@
  * - `N.c`, `N.s`, `N.x`: SUBMITTED or MINED, recognised and authoritative —
  *   current; superseded (naming no request counts as naming one issued before
  *   any evidence was weighed); or naming a request the reconciler had not
- *   received for the operation before the answer's read began (another
- *   operation's, an unknown, pre-named or queued id, one whose token was
- *   guessed, one received only during the answer's own read, `""`, a number,
- *   an object; see REQUEST IDS);
+ *   received for the operation before the read of an answer naming it began
+ *   (another operation's, an unknown, pre-named or queued id, one whose token
+ *   was guessed, one received only during the answer's own read or during the
+ *   read of an earlier answer that named it, `""`, a number, an object; see
+ *   REQUEST IDS);
  * - `T.c`, `T.s`, `T.x`: CONFIRMED or FAILED, recognised and authoritative,
  *   likewise;
  * - `H`: recognised but not authoritative (`source` is not
@@ -407,7 +408,8 @@
  * request its `requestId` names had been received before the read began is
  * decided, and an id named before receipt is recorded, the moment that field
  * is read (see REQUEST IDS), so no trap — on a field read before it or after
- * it — can bind the answer to a request issued during its read (WP300C-J2). A field that is present but not the caller's own data —
+ * it — can bind the answer, or any later answer, to a request issued during
+ * its read (WP300C-J2, WP300C-R2-X1). A field that is present but not the caller's own data —
  * an accessor (whose getter is never run), an inherited property, or a
  * property whose read throws — is OPAQUE,
  * and the evidence carrying it is UNRECOGNISED: it moves the operation to
@@ -419,18 +421,19 @@
  * observation) `credited`; for an answer, `source`, `state`, `requestId`,
  * `transactionHash`, `transactionId` and `credited`.
  *
- * REQUEST IDS (WP-300c; WP-300b known risk 1; WP300C-J1, WP300C-J2). An
- * answer must never be bound to a request it was not read for. Three rules
- * make that hold:
+ * REQUEST IDS (WP-300c; WP-300b known risk 1; WP300C-J1, WP300C-J2,
+ * WP300C-R2-X1, WP300C-R2-X3). An answer must never be bound to a request it
+ * was not read for. Three rules make that hold:
  * - an answer is bound only to a request the reconciler had RECEIVED for the
  *   operation it is addressed to BEFORE the answer's door read began: its
  *   `request` call had returned, or was still in progress (a synchronous
  *   requester answers inside it). A request that is only queued (the
  *   reconciler was down, or it was raised during another delivery) has not
  *   been received, and nor has one whose `request` call threw. One received
- *   DURING the answer's own read — a trap on a field read before `requestId`
- *   called back into the manager, which issued and delivered it — is not
- *   bound either: the fields read before it predate it (WP300C-J2);
+ *   DURING the answer's own read — a trap on a field read before `requestId`,
+ *   or on `requestId` itself, called back into the manager, which issued and
+ *   delivered it — is not bound either: the fields read before it predate it
+ *   (WP300C-J2);
  * - every string an answer names as its `requestId` that is not, at that
  *   moment, a request received for the operation it is addressed to — or that
  *   is addressed to an operation that does not exist — is recorded manager
@@ -440,7 +443,15 @@
  *   (which may issue requests) can never issue the id just named (WP300C-J2).
  *   A queued request whose id is named before its delivery is never
  *   delivered: retry replaces it with a fresh request under a new id, as it
- *   replaces one that a newer request supersedes;
+ *   replaces one that a newer request supersedes. An id received only DURING
+ *   the read of the answer naming it is recorded too, and no answer is ever
+ *   bound to it afterwards: a later answer naming it — a verbatim replay of
+ *   the same values included — is refused like the first (WP300C-R2-X1). If
+ *   it is the operation's latest request once that answer has been handled,
+ *   and the operation still awaits an answer, a fresh request replaces it at
+ *   once (while the executor call is pending, the fresh request is owed, and
+ *   sent when the executor answers), so the reconciler always holds a request
+ *   it can answer;
  * - every request id carries a TOKEN that no reconciler can know before it
  *   receives the request (WP300C-J1): `compositeKey("wallet-op", operationId,
  *   "reconciliation", n, token)`, the token drawn once per id from the
@@ -456,15 +467,23 @@
  *   before) leaves the request without a token: it is never delivered, so no
  *   answer can be bound to it; it is queued, and retry replaces it with a
  *   fresh request under a fresh draw.
- * So an answer that names an id before the reconciler received it stays bound
- * to a request never issued for the operation, however often it is delivered
- * again. The record only grows; it lives as long as the manager, like the rest
- * of its state. What remains is what no id can show, because an answer carries
- * no time: a reconciler that receives a request and then answers it with a
- * read it made BEFORE receiving it, relabelled with the new id. The request
- * contract forbids that — never answer a request with a read made before
- * receiving it (WP-290) — and an id the reconciler could know in advance
- * (a token source that is not a CSPRNG) re-opens the held-back case above.
+ * So an answer that names an id before the reconciler received it (judged
+ * from the moment that answer's read began) is never bound to it, however
+ * often it is delivered again. The records only grow; they live as long as
+ * the manager, like the rest of its state. What remains is what no id can
+ * show, because an answer carries no time: a reconciler that receives a
+ * request and then answers it with a read it made BEFORE receiving it,
+ * relabelled with the new id (a stale read relabelled with the fresh request
+ * that replaced a recorded one included). The request contract forbids that —
+ * never answer a request with a read made before receiving it (WP-290) — and
+ * an id the reconciler could know in advance (a token source that is not a
+ * CSPRNG) re-opens the held-back case above.
+ * Because the token comes from the source, request ids are NOT reproducible
+ * from one run to the next: under a CSPRNG the same events give different
+ * ids. Anything that journals or replays requests, or answers echoing their
+ * ids, must record the tokens drawn (or inject a replay source that returns
+ * the recorded tokens in order), and a predictable replay source must never
+ * be the production source: that re-opens the held-back case (WP300C-R2-X3).
  *
  * RECOGNITION BOUNDARY. From submission until the operation resolves
  * (CONFIRMED or FAILED), every line it touches is under an in-flight hold in
@@ -657,6 +676,11 @@ export interface WalletOperationManagerDependencies {
    * else fails closed: the request is never delivered, and retry draws again.
    * A predictable source (a counter, a clock) re-opens the held-back
    * pre-named read the token closes; tests use one only to show that.
+   * Read once, when the manager is built (WP300C-R2-X5). Request ids are not
+   * reproducible across runs: a journal or replay of requests (or of answers
+   * echoing their ids) must record the drawn tokens or inject a source that
+   * returns them, and such a replay source must never be the production
+   * source (WP300C-R2-X3; see the header, "REQUEST IDS").
    */
   readonly requestToken: () => string;
 }
@@ -720,8 +744,9 @@ interface Operation {
   holdId: string | null;
   /**
    * A reconciliation request is owed once the executor answers: a terminal
-   * answer was refused, or refused evidence was weighed without a request,
-   * while the executor call was pending.
+   * answer was refused, or refused evidence was weighed without a request, or
+   * the latest request was named before its receipt (WP300C-R2-X1), while the
+   * executor call was pending.
    */
   requestOwed: boolean;
   /** Every request issued for this operation: request id → the evidence generation it was issued at. */
@@ -730,8 +755,9 @@ interface Operation {
    * The requests the reconciler has received (its `request` call returned, or
    * is in progress — a synchronous answer): request id → the manager-wide
    * receipt number it was received at. An answer is bound only to one of
-   * these, received before the answer's door read began (see the header,
-   * "REQUEST IDS").
+   * these, received before the answer's door read began, and never named by
+   * an answer whose read began before its receipt (see the header, "REQUEST
+   * IDS").
    */
   readonly delivered: Map<string, number>;
   /** The ordinal of the newest request id issued (ids an answer named first are skipped). */
@@ -822,6 +848,13 @@ export class WalletOperationManager {
    * before its delivery is never delivered: it is replaced by a fresh one.
    */
   readonly #namedUnissued = new Set<string>();
+  /**
+   * Every request id an answer has named that the reconciler had received for
+   * the operation only DURING that answer's own read (WP300C-R2-X1, "REQUEST
+   * IDS" in the header). No answer is ever bound to one of these ids; one
+   * that is an operation's latest request is replaced by a fresh one.
+   */
+  readonly #namedBeforeReceipt = new Set<string>();
   /** The request-token source (WP300C-J1, "REQUEST IDS" in the header). */
   readonly #requestToken: () => string;
   /** Every token drawn so far: a token drawn twice is a failed draw (it was predictable). */
@@ -834,8 +867,10 @@ export class WalletOperationManager {
   readonly #untokened = new Set<string>();
 
   constructor(deps: WalletOperationManagerDependencies) {
+    // WP300C-R2-X5: the source is read once; the check and every draw use that one value.
+    const requestToken = deps.requestToken;
     // WP300C-J1: without a token source every request id would be predictable; refused before anything is built.
-    if (typeof deps.requestToken !== "function") {
+    if (typeof requestToken !== "function") {
       throw new TypeError("WalletOperationManager needs a requestToken source (a CSPRNG; see the header, REQUEST IDS)");
     }
     this.#book = deps.book;
@@ -843,7 +878,7 @@ export class WalletOperationManager {
     this.#approvals = deps.approvals;
     this.#executor = deps.executor;
     this.#reconciler = deps.reconciler;
-    this.#requestToken = deps.requestToken;
+    this.#requestToken = requestToken;
   }
 
   /**
@@ -1007,10 +1042,11 @@ export class WalletOperationManager {
    * "AUTHORITATIVE_READ"`, a recognised state, and (optionally) the
    * `requestId` of the request it answers, each as an own data property; it
    * is refused if that request was issued before evidence that supersedes it
-   * (see the header, "RECONCILIATION ANSWERS"), or if the reconciler never
-   * received it ("REQUEST IDS"). The evidence is read once, here, and decided
-   * on that snapshot ("EVIDENCE AT THE DOOR"): a field that is present but not
-   * own data makes it unrecognised. The code returned for every state and
+   * (see the header, "RECONCILIATION ANSWERS"), or if the reconciler had not
+   * received it before the read of an answer naming it began ("REQUEST IDS").
+   * The evidence is read once, here, and decided on that snapshot ("EVIDENCE
+   * AT THE DOOR"): a field that is present but not own data makes it
+   * unrecognised. The code returned for every state and
    * shape is the header's REFUSAL CODES table. A CONFIRMED resolution
    * releases the reservations and blocks the affected lines until an
    * authoritative balance observation (the reconciler's read already reflects
@@ -1025,10 +1061,10 @@ export class WalletOperationManager {
    * state). In flight, a current answer is applied as the same observation
    * would be (and if that sends the operation back to UNKNOWN, it is weighed
    * there — WP300-R9-01); a superseded terminal answer, or one naming a
-   * request not issued for the operation, authoritative or not (WP300-R9-03),
-   * is not applied — it sends the operation back to reconciliation and is
-   * weighed there like the same observation outside flight, before the
-   * request is delivered (WP300-R8-01). The same holds while the executor call
+   * request it cannot be bound to (see REQUEST IDS), authoritative or not
+   * (WP300-R9-03), is not applied — it sends the operation back to
+   * reconciliation and is weighed there like the same observation outside
+   * flight, before the request is delivered (WP300-R8-01). The same holds while the executor call
    * is pending and the operation is still PLANNED (WP300-R10-01): a current
    * answer (one naming no request) is kept like the same observation, and a
    * terminal answer (CONFIRMED or FAILED as the observation classifier reads
@@ -1058,6 +1094,8 @@ export class WalletOperationManager {
     if (operation === undefined) return refuse("WALLET_OP_NOT_FOUND", "no such wallet operation", { operationId });
     const answered = this.#answer(operation, answer);
     if (answered.weigh) this.#observeEvidence(operation, answer.observation, "answer");
+    // WP300C-R2-X1: never leave the reconciler holding only a request no answer can be bound to.
+    this.#replaceNamedBeforeReceipt(operation);
     return answered.result;
   }
 
@@ -1066,8 +1104,11 @@ export class WalletOperationManager {
    * at the door, before any later field is read (WP300C-J2; see the header,
    * "REQUEST IDS"). True only if the reconciler had received a request under
    * that id, for the operation the answer is addressed to, before the door
-   * read began (`readFrom`: the receipt count then). An id no request
-   * received carries is recorded, and no request is ever issued under it.
+   * read began (`readFrom`: the receipt count then), and no earlier answer
+   * named it before ITS read had seen it received. An id no request received
+   * carries is recorded, and no request is ever issued under it; an id
+   * received only during this answer's read is recorded, and no answer is
+   * ever bound to it (WP300C-R2-X1).
    */
   #bindNamedRequest(operationId: string, named: string, readFrom: number): boolean {
     const receivedAt = this.#operations.get(operationId)?.delivered.get(named);
@@ -1075,9 +1116,42 @@ export class WalletOperationManager {
       this.#namedUnissued.add(named);
       return false;
     }
-    // Received DURING this answer's own read (a trap called back into the manager, which delivered it): the
-    // fields read before it predate the request, so the answer is not a read made after receiving it.
-    return receivedAt <= readFrom;
+    if (receivedAt > readFrom) {
+      // Received DURING this answer's own read (a trap called back into the manager, which delivered it): the
+      // fields read before it predate the request, so the answer is not a read made after receiving it. Recorded:
+      // a later answer naming it (a verbatim replay included) is refused too (WP300C-R2-X1).
+      this.#namedBeforeReceipt.add(named);
+      return false;
+    }
+    return !this.#namedBeforeReceipt.has(named);
+  }
+
+  /**
+   * WP300C-R2-X1: an answer named the operation's LATEST request although the
+   * reconciler received it only during that answer's own read, so no answer is
+   * ever bound to it. While the operation still awaits an answer — under
+   * reconciliation, or terminal and quarantined — a fresh request replaces it
+   * now; while the executor call is pending, the request is owed and sent when
+   * the executor answers (WP300-R7-X1). So the reconciler always holds a
+   * request it can answer. (If the answer's own weighing already raised a
+   * newer request, there is nothing to replace.)
+   */
+  #replaceNamedBeforeReceipt(operation: Operation): void {
+    const latest = operation.latestRequestId;
+    if (latest === null || !this.#namedBeforeReceipt.has(latest)) return;
+    const terminal = isTerminalState(operation.state);
+    if (terminal ? unresolvedKeys(operation).length === 0 : operation.state !== "RECONCILING") return;
+    if (!terminal && operation.submitting) {
+      operation.requestOwed = true;
+      return;
+    }
+    const reason =
+      "the latest reconciliation request was named by an answer before that answer's read had seen it received (it was delivered during the read); no answer is bound to it, and this request replaces it";
+    this.#deliverOrQueue(
+      terminal
+        ? this.#requestFor(operation, "POSITION_BALANCE_DISCREPANCY", `${reason}; the lines stay quarantined`)
+        : this.#requestFor(operation, WALLET_OPERATION_UNKNOWN_TRIGGER, reason),
+    );
   }
 
   /**
@@ -1215,7 +1289,8 @@ export class WalletOperationManager {
     // right now is ready for the answer (a synchronous requester).
     const answeringRequest = operation.state === "UNKNOWN" && operation.requesting;
     // WP300-R7-X3: the request the answer reports a read for (none named: before any evidence was weighed).
-    // WP-300c: bound only to a request the reconciler had received before the door read began (WP300C-J2);
+    // WP-300c: bound only to a request the reconciler had received before the door read began (WP300C-J2), and
+    // that no answer named before its read had seen it received (WP300C-R2-X1);
     // a `requestId` that is present but not own data is never "none named" (WP300B-R1-02: such an answer is
     // unrecognised above, and never current).
     const binding = answer.binding.kind === "NAMED" ? answer.binding.value : undefined;
@@ -1246,7 +1321,7 @@ export class WalletOperationManager {
         // with every observation still buffered.
         const superseded =
           issuedAt === undefined
-            ? "a reconciliation request the reconciler never received for this operation"
+            ? "a reconciliation request the reconciler had not received for this operation when the read of an answer naming it began"
             : operation.identity.supersededFor(outcome, identity, issuedAt);
         if (superseded !== null) {
           const where = inFlight ? "in flight" : "while the executor call was pending";
@@ -1301,7 +1376,7 @@ export class WalletOperationManager {
     if (issuedAt === undefined) {
       return refused(
         "WALLET_OP_EVIDENCE_REQUIRED",
-        "the evidence names a reconciliation request the reconciler never received for this operation (never issued for it, or issued but never delivered)",
+        "the evidence names a reconciliation request the reconciler had not received for this operation when the read of an answer naming it began (never issued for it, issued but not delivered by then, or delivered only during that answer's own read); no answer is bound to it",
         { requestId: typeof binding === "string" ? binding : null },
       );
     }
@@ -2487,9 +2562,10 @@ interface Answer {
   /**
    * The request it names: none (`requestId` absent, `undefined` or `null`), a
    * value (own data; bound only if it is a string id the reconciler had
-   * received before the door read began — `received`, settled the moment the
-   * field is read: WP300C-J2), or `OPAQUE` — present but not own data, never
-   * "none" (WP300B-R1-02).
+   * received before the door read began, and that no answer named before its
+   * read had seen it received — `received`, settled the moment the field is
+   * read: WP300C-J2, WP300C-R2-X1), or `OPAQUE` — present but not own data,
+   * never "none" (WP300B-R1-02).
    */
   readonly binding:
     | { readonly kind: "NONE" }

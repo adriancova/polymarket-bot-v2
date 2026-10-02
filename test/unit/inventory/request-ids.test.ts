@@ -35,6 +35,20 @@
  * WP300C-J7 (LOW, round 1): the refusal reasons said "not issued" for ids
  * that were issued but never received.
  *
+ * WP300C-R2-X1 (LOW, round 2): the refusal of an answer naming a request
+ * received only DURING its own read did not persist. A Proxy whose trap on
+ * `source`, `state` or `requestId` observed DROPPED(A) (which issued and
+ * delivered request 2) and then named request 2 was refused, but a frozen
+ * plain replay of the same values naming request 2 then concluded the
+ * operation: the SPLIT released, both approvals ready after a sync. Such an
+ * id is now recorded and never bound; if it is the operation's latest
+ * request, a fresh request replaces it (owed while the executor call is
+ * pending), so the reconciler always holds a request it can answer. The same
+ * stale values relabelled with that fresh request still bind: that is the
+ * relabelled stale read no id can show (WP-290), pinned as a control.
+ * WP300C-R2-X2 (LOW, round 2): that first refusal said the reconciler "never
+ * received" the request, although it was received during the answer's read.
+ *
  * Pins marked "(control)" pass on the base (`28d542a`) too. The WP300C-J2 and
  * WP300C-J7 pins (except the controls) fail on the round-0 candidate
  * (`dcad467`) as well.
@@ -46,11 +60,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   ApprovalTracker,
+  WALLET_OPERATION_UNKNOWN_TRIGGER,
   WalletOperationManager,
   type ReconciliationRequest,
   type WalletOperationExecutor,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, NO, PUSD, RequestTokens, USDC_E, YES, requestIdOf, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, RequestTokens, USDC_E, YES, requestIdOf, seededBook } from "./helpers.js";
 
 const TX_A = "0x" + "a".repeat(64);
 
@@ -476,10 +491,247 @@ describe("WP300C-J2: an answer is never bound to a request issued during its own
   });
 });
 
+// ---------------------------------------------------------- WP300C-R2-X1 --
+
+type Kind = "SPLIT" | "APPROVE_ERC20" | "APPROVE_ERC1155";
+
+/**
+ * WP300C-R2-X1: a SPLIT or an approval in flight (SUBMITTED(A)), plus what
+ * shows whether its reservation was released (SPLIT) or the approval is ready
+ * after a CLOB allowance sync.
+ */
+async function inFlight(kind: Kind) {
+  const book = seededBook({ [PUSD]: "100", [YES]: "20", [NO]: "20", [USDC_E]: "50" });
+  const approvals = new ApprovalTracker();
+  const reconciler = new Reconciler();
+  const tokens = new RequestTokens();
+  const executor: WalletOperationExecutor = {
+    submit: () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null }),
+  };
+  const manager = new WalletOperationManager({ requestToken: tokens.next, book, approvals, executor, reconciler });
+  const plan =
+    kind === "SPLIT"
+      ? { type: kind, operationId: "op", accountRef: ACCOUNT, conditionId: CONDITION, amount: "10" }
+      : kind === "APPROVE_ERC20"
+        ? { type: kind, operationId: "op", accountRef: ACCOUNT, assetId: PUSD, spender: CTF_EXCHANGE, allowance: "100" }
+        : { type: kind, operationId: "op", accountRef: ACCOUNT, spender: CTF_EXCHANGE };
+  expect(manager.plan(plan).ok).toBe(true);
+  await manager.submit("op");
+  expect(manager.operation("op")?.state).toBe("SUBMITTED");
+  return {
+    manager,
+    reconciler,
+    state: (): string | undefined => manager.operation("op")?.state,
+    /** SPLIT: whether all 100 pUSD can be reserved (the 10 released). Approvals: ready after an allowance sync. */
+    releasedOrReady: (): boolean => {
+      if (kind === "SPLIT") {
+        const result = book.reserve({ reservationId: "probe-all", holderRef: "probe-holder", accountRef: ACCOUNT, assetId: PUSD, amount: "100" });
+        if (result.ok) book.release({ reservationId: "probe-all" });
+        return result.ok;
+      }
+      if (kind === "APPROVE_ERC20") {
+        approvals.recordClobAllowanceSync({ accountRef: ACCOUNT, assetType: "COLLATERAL" });
+        return approvals.collateralReadiness(ACCOUNT, PUSD, [CTF_EXCHANGE]).ready;
+      }
+      approvals.recordClobAllowanceSync({ accountRef: ACCOUNT, assetType: "CONDITIONAL", tokenAssetId: YES });
+      return approvals.conditionalSellReadiness(ACCOUNT, YES, [CTF_EXCHANGE]).ready;
+    },
+  };
+}
+
+/**
+ * The answer `values` as a Proxy: the FIRST read of `field` calls `act` (back
+ * into the manager) before the descriptor is reported, and `requestId` names
+ * the request the reconciler received last, as it is when that field is read.
+ */
+function namingTheLatest(values: Readonly<Record<string, unknown>>, field: string, act: () => void, reconciler: Reconciler) {
+  let fired = false;
+  let named: string | undefined;
+  const proxy = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor(_target, key) {
+        if (key === field && !fired) {
+          fired = true;
+          act();
+        }
+        if (key === "requestId") {
+          named ??= reconciler.latest();
+          return { value: named, writable: true, enumerable: true, configurable: true };
+        }
+        if (typeof key !== "string" || !Object.prototype.hasOwnProperty.call(values, key)) return undefined;
+        return { value: values[key], writable: true, enumerable: true, configurable: true };
+      },
+      has: () => false,
+    },
+  );
+  return {
+    proxy,
+    named: (): string => {
+      if (named === undefined) throw new Error("requestId was never read");
+      return named;
+    },
+  };
+}
+
+const DROPPED_A = { status: "DROPPED", transactionHash: TX_A };
+
+describe("WP300C-R2-X1: an id received only during an answer's own read is never bound afterwards — a verbatim replay is refused too; a fresh request replaces it when it was the latest", () => {
+  for (const kind of ["SPLIT", "APPROVE_ERC20", "APPROVE_ERC1155"] as const) {
+    const values = { source: "AUTHORITATIVE_READ", state: kind === "SPLIT" ? "FAILED" : "CONFIRMED", transactionHash: TX_A, transactionId: null };
+    for (const field of ["source", "state", "requestId"] as const) {
+      it(`${kind}: a ${field} trap observes DROPPED(A), which issues and delivers request 2; the answer names request 2 and is refused — and a frozen plain replay naming request 2 is refused too; held`, async () => {
+        const x = await inFlight(kind);
+        x.manager.observe("op", DROPPED_A);
+        expect(x.state()).toBe("RECONCILING");
+        expect(x.reconciler.ids()).toHaveLength(1);
+        const answer = namingTheLatest(values, field, () => void x.manager.observe("op", DROPPED_A), x.reconciler);
+        const first = x.manager.resolveByReconciliation("op", answer.proxy);
+        // Request 2 was received during the read, and named.
+        expect(x.reconciler.ids()[1]).toBe(answer.named());
+        expect(code(first)).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+        const replay = x.manager.resolveByReconciliation("op", Object.freeze({ ...values, requestId: answer.named() }));
+        expect(code(replay)).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+        if (replay.ok) throw new Error("accepted");
+        expect(replay.refusal.details["requestId"]).toBe(answer.named());
+        expect(x.state()).toBe("RECONCILING");
+        expect(x.releasedOrReady()).toBe(false);
+        // Delivered again, any number of times: still refused.
+        expect(code(x.manager.resolveByReconciliation("op", Object.freeze({ ...values, requestId: answer.named() })))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+        expect(x.releasedOrReady()).toBe(false);
+      });
+    }
+
+    it(`(control: relabelled stale read, WP-290) ${kind}: the same values labelled with the latest request — one received before the read — bind, as on the base; no id can tell a read made before receipt`, async () => {
+      const x = await inFlight(kind);
+      x.manager.observe("op", DROPPED_A);
+      const answer = namingTheLatest(values, "state", () => void x.manager.observe("op", DROPPED_A), x.reconciler);
+      expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+      const latest = x.reconciler.latest();
+      expect(latest).not.toBe(answer.named());
+      expect(code(x.manager.resolveByReconciliation("op", Object.freeze({ ...values, requestId: latest })))).toBe("ok");
+      expect(x.state()).toBe(kind === "SPLIT" ? "FAILED" : "CONFIRMED");
+      expect(x.releasedOrReady()).toBe(true);
+    });
+  }
+
+  it("RECONCILING: when the refused answer's weighing raises no request (a MINED(A) report), the request it named was the latest — a fresh request replaces it at once, and FAILED(A) for the fresh one concludes (liveness)", async () => {
+    const x = await inFlight("SPLIT");
+    x.manager.observe("op", DROPPED_A);
+    const answer = namingTheLatest(
+      { source: "AUTHORITATIVE_READ", state: "MINED", transactionHash: TX_A, transactionId: null },
+      "state",
+      () => void x.manager.observe("op", DROPPED_A),
+      x.reconciler,
+    );
+    expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    // Request 2 (named during the read) and its replacement, request 3.
+    expect(x.reconciler.ids()).toHaveLength(3);
+    expect(x.reconciler.ids()[1]).toBe(answer.named());
+    const fresh = x.reconciler.received.at(-1);
+    expect(fresh?.trigger).toBe(WALLET_OPERATION_UNKNOWN_TRIGGER);
+    expect(fresh?.reason).toContain("this request replaces it");
+    expect(x.manager.outstandingReconciliationRequests()).toEqual([]);
+    // An answer naming request 2 is never bound; one naming request 3 is.
+    expect(code(x.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(x.releasedOrReady()).toBe(false);
+    expect(code(x.manager.resolveByReconciliation("op", failed(x.reconciler.latest())))).toBe("ok");
+    expect(x.state()).toBe("FAILED");
+    expect(x.releasedOrReady()).toBe(true);
+  });
+
+  it("RECONCILING while the executor call is pending: the replacement is owed, not sent (WP300-R7-X1) — it is sent when the executor answers, and FAILED(A) for it concludes", async () => {
+    const h = harness("pending");
+    h.plan();
+    const submitted = h.manager.submit("op");
+    h.manager.observe("op", DROPPED_A);
+    expect(h.state()).toBe("RECONCILING");
+    expect(h.reconciler.ids()).toHaveLength(1);
+    const answer = namingTheLatest(
+      { source: "AUTHORITATIVE_READ", state: "MINED", transactionHash: TX_A, transactionId: null },
+      "state",
+      () => void h.manager.observe("op", DROPPED_A),
+      h.reconciler,
+    );
+    expect(code(h.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(h.reconciler.ids()[1]).toBe(answer.named());
+    // Nothing more is sent while the executor call is pending.
+    expect(h.reconciler.ids()).toHaveLength(2);
+    expect(h.queued()).toEqual([]);
+    h.release();
+    await submitted;
+    expect(h.reconciler.ids()).toHaveLength(3);
+    expect(code(h.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(h.wholeReservable()).toBe(false);
+    expect(code(h.manager.resolveByReconciliation("op", failed(h.reconciler.latest())))).toBe("ok");
+    expect(h.state()).toBe("FAILED");
+    expect(h.wholeReservable()).toBe(true);
+  });
+
+  it("FAILED and quarantined: the replacement is a fresh POSITION_BALANCE_DISCREPANCY request, and FAILED(A) for it lifts the quarantine", async () => {
+    const x = await inFlight("SPLIT");
+    x.manager.observe("op", DROPPED_A);
+    expect(code(x.manager.resolveByReconciliation("op", failed(x.reconciler.latest())))).toBe("ok");
+    expect(x.state()).toBe("FAILED");
+    // A contradicting observation after the conclusion: quarantined, request 2.
+    x.manager.observe("op", { status: "CONFIRMED", transactionHash: TX_A, transactionId: null });
+    expect(x.manager.operation("op")).toMatchObject({ quarantined: true, unresolvedTransactions: [`hash:${TX_A}`] });
+    expect(x.reconciler.ids()).toHaveLength(2);
+    const answer = namingTheLatest(
+      { source: "AUTHORITATIVE_READ", state: "MINED", transactionHash: TX_A, transactionId: null },
+      "state",
+      () => void x.manager.observe("op", DROPPED_A),
+      x.reconciler,
+    );
+    expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(x.reconciler.ids()[2]).toBe(answer.named());
+    expect(x.reconciler.ids()).toHaveLength(4);
+    expect(x.reconciler.received.at(-1)?.trigger).toBe("POSITION_BALANCE_DISCREPANCY");
+    expect(code(x.manager.resolveByReconciliation("op", failed(answer.named())))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(x.manager.operation("op")?.quarantined).toBe(true);
+    expect(code(x.manager.resolveByReconciliation("op", failed(x.reconciler.latest())))).toBe("ok");
+    expect(x.manager.operation("op")?.quarantined).toBe(false);
+  });
+
+  it("(control) when the refused answer's weighing raises a newer request itself, nothing more is sent: FAILED(A) is weighed, and request 3 is the only one after request 2", async () => {
+    const x = await inFlight("SPLIT");
+    x.manager.observe("op", DROPPED_A);
+    const answer = namingTheLatest(
+      { source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash: TX_A, transactionId: null },
+      "state",
+      () => void x.manager.observe("op", DROPPED_A),
+      x.reconciler,
+    );
+    expect(code(x.manager.resolveByReconciliation("op", answer.proxy))).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    expect(x.reconciler.ids()).toHaveLength(3);
+    expect(x.reconciler.received.at(-1)?.reason).not.toContain("this request replaces it");
+  });
+});
+
+describe("WP300C-R2-X2: the refusal of an answer naming a request received during its own read says so — not 'never received'", () => {
+  it("a state trap delivers request 2, which the answer names: refused, and the reason says the request was not received when the read began (delivered only during it)", async () => {
+    const x = await inFlight("SPLIT");
+    x.manager.observe("op", DROPPED_A);
+    const answer = namingTheLatest(
+      { source: "AUTHORITATIVE_READ", state: "FAILED", transactionHash: TX_A, transactionId: null },
+      "state",
+      () => void x.manager.observe("op", DROPPED_A),
+      x.reconciler,
+    );
+    const result = x.manager.resolveByReconciliation("op", answer.proxy);
+    expect(code(result)).toBe("WALLET_OP_EVIDENCE_REQUIRED");
+    if (result.ok) throw new Error("accepted");
+    expect(result.refusal.details["requestId"]).toBe(answer.named());
+    expect(result.refusal.message).not.toContain("never received");
+    expect(result.refusal.message).toContain("had not received for this operation when the read of an answer naming it began");
+    expect(result.refusal.message).toContain("delivered only during that answer's own read");
+  });
+});
+
 // ------------------------------------------------------------- WP300C-J7 --
 
-describe("WP300C-J7: a request issued but never received is refused as 'never received', not 'not issued'", () => {
-  it("under reconciliation: a FAILED(A) naming the operation's queued request is refused, and the reason says the reconciler never received it", async () => {
+describe("WP300C-J7, WP300C-R2-X2: a request issued but not received is refused as 'not received' (when an answer naming it was read), not 'not issued'", () => {
+  it("under reconciliation: a FAILED(A) naming the operation's queued request is refused, and the reason says the reconciler had not received it", async () => {
     const h = harness("in-flight");
     h.plan();
     await h.manager.submit("op");
@@ -491,19 +743,19 @@ describe("WP300C-J7: a request issued but never received is refused as 'never re
     const result = h.manager.resolveByReconciliation("op", failed(queued));
     expect(code(result)).toBe("WALLET_OP_EVIDENCE_REQUIRED");
     if (result.ok) throw new Error("accepted");
-    expect(result.refusal.message).toContain("never received");
+    expect(result.refusal.message).toContain("had not received");
     expect(result.refusal.message).not.toContain("not issued");
     expect(result.refusal.details["requestId"]).toBe(queued);
   });
 
-  it("in flight: a FAILED(A) naming an id never received is refused SUPERSEDED, and what supersedes it says the reconciler never received it", async () => {
+  it("in flight: a FAILED(A) naming an id never received is refused SUPERSEDED, and what supersedes it says the reconciler had not received it", async () => {
     const h = harness("in-flight");
     h.plan();
     await h.manager.submit("op");
     const result = h.manager.resolveByReconciliation("op", failed(requestIdOf("op", 1, h.tokens.peek())));
     expect(code(result)).toBe("WALLET_OP_EVIDENCE_SUPERSEDED");
     if (result.ok) throw new Error("accepted");
-    expect(String(result.refusal.details["supersededBy"])).toContain("never received");
+    expect(String(result.refusal.details["supersededBy"])).toContain("had not received");
     expect(String(result.refusal.details["supersededBy"])).not.toContain("not issued");
   });
 });

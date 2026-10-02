@@ -21,6 +21,15 @@
  * request being delivered). A row or column the suite does not know, or one
  * it knows that the table lacks, fails.
  *
+ * WP300C-R2-X4 (INFO, round 2): the `x` bindings now include the two members
+ * a re-entrant answer produces, wherever a trap can deliver a request without
+ * moving the operation to another row (the three RECONCILING rows, answered
+ * afterwards, and the quarantined row): a request received DURING the
+ * answer's own read (a trap on `state` delivers it, and `requestId` names
+ * it), and a plain answer naming a request that an EARLIER answer named
+ * while it was being delivered during that answer's read (WP300C-R2-X1, the
+ * verbatim replay). Each row asserts that both members were delivered.
+ *
  * All executors and reconcilers are in-memory mocks. Nothing is signed or sent.
  */
 
@@ -141,6 +150,15 @@ type Binding = Readonly<Record<string, unknown>>;
 const NONE: Binding = {};
 const named = (requestId: unknown): Binding => ({ requestId });
 
+/**
+ * WP300C-R2-X4: two `x` members that need a re-entrant answer, marked in a
+ * binding's `requestId` and built by {@link deliverReentrant}: the request the
+ * answer names was received DURING its own read; or the answer is a plain
+ * replay naming a request an earlier answer named that way (WP300C-R2-X1).
+ */
+const DURING_READ = Symbol("received during the answer's own read");
+const REPLAYED = Symbol("received during an earlier answer's read, then replayed");
+
 interface Context {
   readonly manager: WalletOperationManager;
   readonly reconciler: Reconciler;
@@ -148,8 +166,10 @@ interface Context {
   current: () => Binding | undefined;
   /** Bindings the answer is superseded under (none while PLANNED). */
   superseded: () => readonly Binding[];
-  /** Bindings naming a request the reconciler never received for "op". */
+  /** Bindings naming a request the reconciler had not received for "op" (see {@link DURING_READ}, {@link REPLAYED}). */
   unissued: () => readonly Binding[];
+  /** WP300C-R2-X4: delivers a request for "op" without moving it to another row (a trap calls it during a read). */
+  duringRead?: () => void;
   /** For a synchronous form: the step whose request delivery the answer arrives inside. */
   trigger?: () => Promise<void> | void;
 }
@@ -191,7 +211,7 @@ async function world(executor: Executor) {
     if (found === undefined) throw new Error(`"op" has no request ${String(n)}`);
     return found;
   };
-  const unissued = (extra: readonly string[] = []): (() => readonly Binding[]) => () => [
+  const unissued = (extra: readonly string[] = [], reentrant = false): (() => readonly Binding[]) => () => [
     named(r2),
     named("wallet-op:foreign:reconciliation:1"),
     named("a-request-of-another-operation"),
@@ -202,6 +222,7 @@ async function world(executor: Executor) {
     // "op"'s own next id, named before it exists: the exact id, token included (a reconciler that knows the source).
     named(requestIdOf("op", Math.max(0, ...issued().map((requestId) => requestOrdinalOf(requestId) ?? 0)) + 1, tokens.peek())),
     ...extra.map(named),
+    ...(reentrant ? [named(DURING_READ), named(REPLAYED)] : []),
   ];
   return { manager, reconciler, release: (value: unknown) => release(value), unissued, id };
 }
@@ -229,6 +250,10 @@ async function backInFlight() {
   expect(w.manager.operation("op")?.state).toBe("MINED");
   return w;
 }
+
+/** WP300C-R2-X4: an unrecognised report about A, observed from inside a trap: it delivers a request for "op". */
+const dropped = (w: { readonly manager: WalletOperationManager }) => (): void =>
+  void w.manager.observe("op", { status: "DROPPED", transactionHash: TX_A });
 
 /** Build the state of `row` for `column`; `sync`: the answer will arrive inside the request call of the returned trigger. */
 async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> {
@@ -272,14 +297,28 @@ async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> 
       const w = await backInFlight();
       const trigger = (): void => void w.manager.observe("op", { status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
       if (!sync) trigger();
-      return { ...w, current: () => named(w.id(2)), superseded: () => [named(w.id(1)), NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
+      // WP300C-R2-X4: answered afterwards, a trap's DROPPED(A) delivers a request (and ends simple mode: the `x`
+      // codes are the same in the next row). Inside a request call nothing is delivered re-entrantly.
+      return {
+        ...w,
+        current: () => named(w.id(2)),
+        superseded: () => [named(w.id(1)), NONE],
+        unissued: w.unissued([], !sync),
+        ...(sync ? { trigger } : { duringRead: dropped(w) }),
+      };
     }
     case "RECONCILING, every member by name": {
       // A re-entry that weighs an unrecognised observation: every member by name, request 2 current.
       const w = await backInFlight();
       const trigger = (): void => void w.manager.observe("op", { status: "DROPPED", transactionHash: TX_A });
       if (!sync) trigger();
-      return { ...w, current: () => named(w.id(2)), superseded: () => [named(w.id(1)), NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
+      return {
+        ...w,
+        current: () => named(w.id(2)),
+        superseded: () => [named(w.id(1)), NONE],
+        unissued: w.unissued([], !sync),
+        ...(sync ? { trigger } : { duringRead: dropped(w) }),
+      };
     }
     case "RECONCILING, executor pending": {
       // Out of PLANNED while the executor call is pending: the observation that moved it was weighed.
@@ -287,7 +326,13 @@ async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> 
       void w.manager.submit("op");
       const trigger = (): void => void w.manager.observe("op", { status: "DROPPED", transactionHash: TX_A });
       if (!sync) trigger();
-      return { ...w, current: () => named(w.id(1)), superseded: () => [NONE], unissued: w.unissued(), ...(sync ? { trigger } : {}) };
+      return {
+        ...w,
+        current: () => named(w.id(1)),
+        superseded: () => [NONE],
+        unissued: w.unissued([], !sync),
+        ...(sync ? { trigger } : { duringRead: dropped(w) }),
+      };
     }
     case "CONFIRMED or FAILED, not quarantined":
     case "CONFIRMED or FAILED, quarantined": {
@@ -305,7 +350,9 @@ async function setUp(row: Row, column: Column, sync: boolean): Promise<Context> 
         ...w,
         current: () => named(w.id(3)),
         superseded: () => [named(w.id(2)), named(w.id(1)), NONE],
-        unissued: w.unissued(),
+        // WP300C-R2-X4: a trap's DROPPED(A) delivers a fresh quarantine request; the operation stays quarantined.
+        unissued: w.unissued([], true),
+        duringRead: dropped(w),
       };
     }
   }
@@ -413,12 +460,66 @@ const VARIANTS: Readonly<Record<Column, readonly Variant[]>> = {
   ],
 };
 
+/** WP300C-R2-X4: how many re-entrant `x` members each row delivered, by member. */
+const reentrantDelivered = new Map<string, number>();
+
+/**
+ * WP300C-R2-X4: deliver a re-entrant `x` member. A Proxy reporting an
+ * answer's values calls `duringRead` on the first read of `state` (a request
+ * is delivered), and its `requestId` names the request received last, as it
+ * is when that field is read: the request delivered during the read. For
+ * {@link DURING_READ} that Proxy is the variant's own answer; for
+ * {@link REPLAYED} it is a carrier (an authoritative MINED(A), refused), and
+ * the variant's answer then names the same id as plain data.
+ */
+function deliverReentrant(row: Row, context: Context, variant: Variant, which: typeof DURING_READ | typeof REPLAYED): string {
+  const act = context.duringRead;
+  if (act === undefined) throw new Error(`${row}: the state can deliver no request during a read`);
+  const before = context.reconciler.ids();
+  const values = (which === DURING_READ ? variant.make(named("placeholder")) : ANSWER("AUTHORITATIVE_READ", "MINED", TX_A, null)) as Readonly<
+    Record<string, unknown>
+  >;
+  let fired = false;
+  let namedId: string | undefined;
+  const proxy = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor(_target, key) {
+        if (key === "state" && !fired) {
+          fired = true;
+          act();
+        }
+        if (key === "requestId") {
+          namedId ??= context.reconciler.ids().at(-1);
+          return { value: namedId, writable: true, enumerable: true, configurable: true };
+        }
+        if (typeof key !== "string" || !Object.prototype.hasOwnProperty.call(values, key)) return undefined;
+        return { value: values[key], writable: true, enumerable: true, configurable: true };
+      },
+      has: () => false,
+    },
+  );
+  const first = code(context.manager.resolveByReconciliation("op", proxy));
+  // The id it named was delivered during its read: not received before, received by the time it was named.
+  expect(fired, `${row}: the trap fired`).toBe(true);
+  if (namedId === undefined) throw new Error(`${row}: requestId was never read`);
+  expect(before, `${row}: the named request was received before the read`).not.toContain(namedId);
+  expect(context.reconciler.ids(), `${row}: the named request was delivered during the read`).toContain(namedId);
+  const key = `${row}|${String(which.description)}`;
+  reentrantDelivered.set(key, (reentrantDelivered.get(key) ?? 0) + 1);
+  if (which === DURING_READ) return first;
+  expect(first, `${row}: the carrier is refused`).toBe(CODES["RQ"]);
+  return code(context.manager.resolveByReconciliation("op", variant.make(named(namedId))));
+}
+
 /** Deliver one answer in a freshly built state; returns its code. */
 async function deliver(row: Row, column: Column, variant: Variant, index: number, sync: boolean): Promise<string | null> {
   const context = await setUp(row, column, sync);
   if (!sync) {
     const binding = variant.binding(context)[index];
     if (binding === undefined) return null;
+    const which = binding["requestId"];
+    if (which === DURING_READ || which === REPLAYED) return deliverReentrant(row, context, variant, which);
     return code(context.manager.resolveByReconciliation("op", variant.make(binding)));
   }
   let result: string | null | undefined;
@@ -453,12 +554,21 @@ describe("WP300B-R1-03: the REFUSAL CODES table in the manager's header matches 
     for (const row of ROWS) expect([...(table.get(row)?.keys() ?? [])]).toEqual([...COLUMNS]);
   });
 
+  /** WP300C-R2-X4: the rows whose `x` bindings include the re-entrant members (answered afterwards). */
+  const REENTRANT_ROWS: readonly Row[] = [
+    "RECONCILING, simple mode",
+    "RECONCILING, every member by name",
+    "RECONCILING, executor pending",
+    "CONFIRMED or FAILED, quarantined",
+  ];
+
   for (const row of ROWS) {
     const forms = row.startsWith("RECONCILING") ? ([false, true] as const) : ([false] as const);
     for (const sync of forms) {
       it(`${row}${sync ? " (answered inside the request call)" : ""}: every column`, async () => {
         const cells = table.get(row);
         if (cells === undefined) throw new Error(`row "${row}" missing`);
+        for (const which of [DURING_READ, REPLAYED]) reentrantDelivered.delete(`${row}|${String(which.description)}`);
         for (const column of COLUMNS) {
           const cell = cells.get(column);
           if (cell === undefined) throw new Error(`cell ${row} / ${column} missing`);
@@ -486,6 +596,12 @@ describe("WP300B-R1-03: the REFUSAL CODES table in the manager's header matches 
             // Every documented code is reached (for "shape", checked in the shape columns themselves).
             if (cell.kind === "codes") expect([...seen].sort(), `${row} / ${column}: codes reached`).toEqual([...cell.codes].sort());
           }
+        }
+        // WP300C-R2-X4: both re-entrant members were delivered where a read can receive a request (never otherwise).
+        for (const which of [DURING_READ, REPLAYED]) {
+          const delivered = reentrantDelivered.get(`${row}|${String(which.description)}`) ?? 0;
+          if (!sync && REENTRANT_ROWS.includes(row)) expect(delivered, `${row}: ${String(which.description)}`).toBeGreaterThan(0);
+          else expect(delivered, `${row}: ${String(which.description)}`).toBe(0);
         }
       });
     }
