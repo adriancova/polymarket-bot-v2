@@ -24,6 +24,8 @@ import { fileURLToPath } from "node:url";
 
 import { defineConfig } from "vitest/config";
 
+import { NO_SIGNER_SETUP_FILE, noSignerVitePlugin } from "../support/no-signer-guard.js";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../../..");
 
@@ -35,6 +37,9 @@ function pkg(name: string, subpath: string): { find: RegExp; replacement: string
 }
 
 export default defineConfig({
+  // `CONTROL-1b` r2: the run-time no-signer guard, both halves
+  // (`../support/no-signer-guard.ts`), as in `../vitest.config.ts`.
+  plugins: [noSignerVitePlugin()],
   resolve: {
     alias: [
       pkg("control-api/testing", "apps/control-api/src/testing/index.ts"),
@@ -51,6 +56,7 @@ export default defineConfig({
   },
   test: {
     root: repoRoot,
+    setupFiles: [NO_SIGNER_SETUP_FILE],
     include: ["test/integration/control-api/postgres/**/*.test.ts"],
     testTimeout: 120_000,
     hookTimeout: 180_000,

@@ -111,7 +111,9 @@ would lose are the ones from the incident that filled it.
 REFUSALS are audited too, for a caller with mutation authority: a refused
 mutation is an operator fact. **Every refusal of a request an authenticated
 operator was authorized to send to a mutating route is audited**, wherever it
-happens (`CONTROL-1` r1, closing `CONTROL1-J-M2`):
+happens (`CONTROL-1` r1, closing `CONTROL1-J-M2`) — **save ONE, the gated
+refusal, item 7 of the list below** (`CONTROL-1b` r2, closing
+`CONTROL1B-R2-J-L1`):
 
 - at the transport: `413` too large, `415` undeclared, `400` not JSON;
 - at the route parameter: `400 CONTROL_INVALID_ROUTE_PARAMETER`, recorded with
@@ -119,7 +121,9 @@ happens (`CONTROL-1` r1, closing `CONTROL1-J-M2`):
 - at the body door: `400 CONTROL_REQUEST_INVALID` / `CONTROL_REQUEST_NOT_DATA`
   — including a release with `authoritativeSnapshotApplied: false` or without
   it, whose record's `refusalIssues` name the field;
-- at the control plane: `409` and `503`.
+- at the control plane: `409`, and a `503 CONTROL_NOT_AUDITABLE` whose
+  record the sink or the audit budget refused or did not confirm in time — the
+  record offered IS the audit, and nothing lands (below).
 
 Each is one `REFUSED` record for the route's action, in the audit budget's
 ORDINARY tier, carrying the refusal code, its detail and at most eight issues
@@ -142,11 +146,23 @@ What writes NOTHING, exhaustively:
    audited, accepted or refused;
 6. a request the HTTP server refuses before any handler runs: Node's own `408`
    (the timeouts above) or `400` for a malformed HTTP message, and a client
-   that disconnects before its body arrives.
+   that disconnects before its body arrives;
+7. **the GATED refusal** (`CONTROL-1b` r1; named here at r2, closing
+   `CONTROL1B-R2-J-L1`): a strengthening engage of a kill switch, or a halting
+   pause of an instance, while an earlier such append of the SAME switch or
+   instance is still unsettled ("An append is bounded", below). It is refused
+   `503 CONTROL_NOT_AUDITABLE` WITHOUT offering any record to the sink: a
+   record per retry would queue behind the append the sink has not answered and
+   take a budget slot each, which is the reserve exhaustion this gate exists to
+   prevent. It is counted `control_mutations_total{outcome="NOT_AUDITED"}` and
+   is NOT an audit-append failure (none was attempted); its `503` detail says
+   it was refused without an append.
 
 A mutation-grant holder's mode-raise attempt is the one thing audited before
 routing: it is recorded whatever route it named, so items 2 and 5 never apply
-to it. None of the six attempted a mutation an authorized operator could make. A caller
+to it. None of items 1–6 attempted a mutation an authorized operator could
+make. Item 7 did, and is refused because an earlier attempt's record may still
+land; the operator retries once the sink answers. A caller
 who could append the audit log's records without mutation authority could fill
 it, and a full log refuses every mutation, the kill switch included (`WP-240`
 r1 M-3).
@@ -219,9 +235,14 @@ switch included. Each append is now raced against a bound,
     other switches and instances are not affected;
   - **the price:** an append the sink NEVER answers keeps that one switch's
     strengthening engages (or that instance's pauses) refused for the life of
-    the process, as it keeps that append's slot. A durable sink must therefore
-    settle every append — for PostgreSQL, a client-side statement or query
-    timeout — before it is composed (`CONTROL-1b` handoff, follow-up).
+    the process, as it keeps that append's slot — including an ESCALATION: a
+    never-settling GLOBAL `HALT_NEW_ENTRIES` append keeps GLOBAL `FULL_HALT`
+    refused (`CONTROL1B-R2-J-I1`), while other switches still apply. A durable
+    sink must therefore settle every append — for PostgreSQL, a client-side
+    statement or query timeout — before it is composed (`CONTROL-1b` handoff,
+    follow-up);
+  - a gated refusal writes NO record: it is write-nothing item 7 in "2. Every
+    mutation is audited", above.
 
 `main.ts`, the test harness and the integration client pass the API's clock and
 id source as the void records' `auditRecordSource`, and `main.ts` says so at
@@ -339,7 +360,9 @@ The pins:
   verifiers' three `CONTROL1-J-M1` sequences, over HTTP and through the shipped
   `main.ts`; each fails at the round-0 commit.
 - `authorized-refusals-audited.test.ts` is `CONTROL1-J-M2`: every refusal of
-  an authorized request is audited, and nothing else is.
+  an authorized request is audited, and nothing else is — save the gated
+  refusal, write-nothing item 7, which it pins as writing nothing
+  (`CONTROL1B-R2-J-L1`).
 - `shipped-root-control-1.test.ts` drives the shipped `main.ts`.
 - `src/audit-budget.test.ts` pins the tiers; `src/control-plane.test.ts` pins
   the engage rules and the per-key serialization.
@@ -377,7 +400,11 @@ had walked past (`CONTROL1-R2-J-L1`):
   `importMock()` / `mock()` / `doMock()`, triple-slash and AMD references,
   JSDoc `@import`, and `declare module` — is read as the EVALUATED string
   literal, so comments are inert and escapes resolve as the runtime resolves
-  them;
+  them. Since `CONTROL-1b` r2 only the REAL calling forms are loads — `require`
+  as itself or as `module.require`, with one argument; `getBuiltinModule` off
+  `process`; vitest's loaders off `vi` or `vitest` — and any other `.require`
+  is a named loader: round 1 read `ts.sys.require(baseDir, moduleName)` as a
+  load of the BASE, and the venue SDK loaded through it (`CONTROL1B-R2-J-H2`);
 - every executable extension is read with its own grammar — `.ts`, `.mts`,
   `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` — and JSON with JSON's, and
   EVERY entry of a scanned tree is classified: a file that is not code, JSON
@@ -395,10 +422,27 @@ had walked past (`CONTROL1-R2-J-L1`):
   makes of it; a builtin by an allowlist of modules that cannot load or run
   code (`node:vm`, `node:module`, `node:child_process`, `node:worker_threads`
   and the rest fail — `CONTROL1B-R1-J-L2`); and `data:`, other URL schemes and
-  `#imports` fail as unplaceable;
+  `#imports` fail as unplaceable. A bare name must also be on an explicit
+  package-AND-subpath list (`PERMITTED_BARE_SPECIFIERS`: `vitest`, `zod`, the
+  workspace packages these trees use; `vitest/config` in the three runner
+  configs only; `typescript` in the scanner only) — `vitest/node`'s
+  `createViteServer().ssrLoadModule` and ESLint's `overrideConfigFile` load any
+  path they are handed, and the round-2 verifiers loaded the secure adapter and
+  the venue SDK through each (`CONTROL1B-R2-J-H2`);
+- every OTHER literal is judged by what it NAMES (`CONTROL-1b` r2, closing
+  `CONTROL1B-R2-J-H1`): each string, each template's text (evaluated and raw),
+  each regular expression's body, JSX text, each identifier and, in JSON, each
+  key and string value fails when, read as a load from the same file, it would
+  be forbidden, or when its path segments — split on `/` and `\`, as written and
+  percent-decoded — name `polymarket-secure` or a forbidden package. The
+  round-2 verifiers reached `createRequire` without spelling it (built with
+  `.join("")`, or `Function` found by enumerating the function prototype) and
+  handed it a LITERAL path or package name, which round 1 never judged because
+  it was not in a load position;
 - whatever it cannot read FAILS: a computed specifier, a named loader or
   evaluator — `require` aliased, `createRequire`, `eval`, `Module._load`,
-  `_compile`, `dlopen`, `process.binding`, `ShadowRealm`, any `.constructor`,
+  `_compile`, `_extensions` (since r2), `dlopen`, `process.binding`,
+  `ShadowRealm`, any `.constructor`,
   `Function` in any VALUE position, and any name beginning `__vite` (vite-node's
   in-scope `__vite_ssr_dynamic_import__`, vitest's `globalThis.__vitest_*__`)
   (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H3`: an aliased `Function`,
@@ -408,17 +452,72 @@ had walked past (`CONTROL1-R2-J-L1`):
   grammar, or a load that lands on no file when the scan runs (a test that
   WRITES a module and then loads it) — unless an explicit, justified allowlist
   entry covers it exactly (the allowlist holds only the scan's own
-  vocabulary);
+  vocabulary — the loader names it detects and, since r2, the forbidden
+  targets it judges — and the run-time guard's one `node:module` import);
 - the RUNNERS load nothing their imports do not name: the three vitest configs
   that run these trees are a closed world (no setup file, plugin or custom
-  environment) whose aliases are judged like any path, this package's scripts
+  environment but the run-time guard's, exactly) whose aliases are judged like
+  any path, this package's scripts
   are pinned exactly, and the bundle's tsconfig maps no name; a load that lands
   on a file outside every scanned tree and every workspace package (a fixture
   under `test/`, the repository's unit runner config) is scanned in turn; and
   no workspace package a load lands in declares a forbidden dependency, at any
   depth — its own source is `check:deps`'s (F6, F16);
 - planted controls cover every spelling and path form the verifiers used, each
-  escape and comment form, each scanned tree and each code extension.
+  escape and comment form, each literal form, the round-2 verifiers' five plants
+  verbatim, each scanned tree and each code extension.
+
+**The run-time guard (`CONTROL-1b` r2).** A static scan cannot rule out a load
+whose loader it does not name AND whose target is computed at run time. So the
+control API's two integration runners (`test:integration` and
+`test:integration:postgres`) install `test/integration/control-api/support/no-signer-guard.ts`,
+which refuses the LANDING itself, however it was spelled:
+
+- a `module.registerHooks` `load` hook (the runner's one setup file) runs for
+  every module loaded in the test worker's thread — through `require`,
+  `createRequire`, `Module._load`, ESM `import` and `import()` — and throws
+  when it is inside `packages/polymarket-secure` or on a path naming a
+  forbidden package (which is where pnpm keeps every one of them); being a
+  LOAD hook, it also refuses what a test's OWN resolution hook answered;
+- a vite `load` hook (the runner's one plugin) refuses the same files when
+  vitest's own module graph — `vi.importActual`, `__vite_ssr_dynamic_import__`,
+  a test's imports — would load them.
+
+`no-signer-runtime-guard.test.ts` pins both halves in each runner, with loads
+written exactly as the static scan cannot read them; each of the five round-2
+plants is refused by it too.
+
+**Dated correction (`CONTROL-1b` r2, 2026-10-01).** Round 1 below said what
+remained beyond the scan was "a loader reached through a COMPUTED property name
+… with a computed path", which implied a LITERAL path was ruled out. It was
+not: the round-2 verifiers loaded the venue SDK through a computed loader name
+with a literal path, and through `ts.sys.require`, `vitest/node` and ESLint
+with every loader name spelled, all with this acceptance green. What remains
+now, stated rather than claimed away:
+
+- **statically:** a load whose loader the scan does not NAME — reached by a
+  computed key, by enumeration, by spreading an object that holds one, or
+  through a method of a permitted package other than those named above — AND
+  whose target no literal in the file names (a path or name computed at run
+  time, from parts, by slicing, from encoded data or from the program's own
+  text, or a value another module exports);
+- **at run time, in the two integration runners:** code read as TEXT and
+  handed to an evaluator (or to a load hook a test registers), a module graph
+  a test builds itself (its Node-loaded dependencies ARE guarded), another
+  THREAD or process (the hook is thread-local, so a `worker_threads` Worker
+  loads without it), Node's loader internals called directly
+  (`Module._extensions[…]`, which runs no hook; the scan refuses the name),
+  and a builtin reached through `process.getBuiltinModule`, which resolves
+  nothing;
+- **the repository unit runner** (`test/vitest.config.ts`, `WP-010`-owned and
+  outside `CONTROL-1b`'s grant) runs `src/**/*.test.ts` and
+  `test/unit/control-api/**` WITHOUT the guard: there the static residual
+  above stands alone;
+- as before: a test that OVERWRITES an existing file at run time and then
+  loads it (the scan read the earlier text; the guard still refuses what it
+  would load, in the integration runners), the deeper dependencies of
+  third-party packages, and runner flags outside this package (CI's
+  environment, `NODE_OPTIONS`).
 
 **Dated correction (`CONTROL-1b` r1, 2026-10-01).** Round 0 said that "behind
 the scan, none of the forbidden packages even RESOLVES from a scanned tree, so
@@ -431,6 +530,8 @@ COMPUTED property name (`globalThis[atob(…)]`) with a computed path; a test
 that OVERWRITES an existing file at run time and then loads it (the scan read
 the file's earlier text); the deeper dependencies of third-party packages; and
 runner flags outside this package (CI's environment, `NODE_OPTIONS`).
+(Superseded by the `CONTROL-1b` r2 correction above: that residual was stated
+too narrowly — a computed loader with a LITERAL path loaded the venue SDK.)
 
 ## Authentication (§15) — the INTERPRETATION
 

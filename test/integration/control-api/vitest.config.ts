@@ -36,6 +36,8 @@ import { fileURLToPath } from "node:url";
 
 import { configDefaults, defineConfig } from "vitest/config";
 
+import { NO_SIGNER_SETUP_FILE, noSignerVitePlugin } from "./support/no-signer-guard.js";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
 
@@ -47,6 +49,10 @@ function pkg(name: string, subpath: string): { find: RegExp; replacement: string
 }
 
 export default defineConfig({
+  // `CONTROL-1b` r2: the run-time no-signer guard, both halves
+  // (`support/no-signer-guard.ts`). Acceptance 3 holds this config to exactly
+  // these, and to nothing else that could load a module no import names.
+  plugins: [noSignerVitePlugin()],
   resolve: {
     alias: [
       pkg("control-api/testing", "apps/control-api/src/testing/index.ts"),
@@ -63,6 +69,7 @@ export default defineConfig({
   },
   test: {
     root: repoRoot,
+    setupFiles: [NO_SIGNER_SETUP_FILE],
     include: ["test/integration/control-api/**/*.test.ts"],
     // `CONTROL-1b`: the real-PostgreSQL files start a container, and this suite
     // starts none (CI's "control-api (no container)" step). They run through

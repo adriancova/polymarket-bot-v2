@@ -1,7 +1,10 @@
 /**
  * Where a module load LANDS, and which files a scan must read
  * (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`, `CONTROL1B-R1-J-H2` and
- * `CONTROL1B-R1-J-L2`).
+ * `CONTROL1B-R1-J-L2`) — and, since `CONTROL-1b` r2, what every OTHER literal
+ * a scanned file holds names ({@link judgeLiteral}, closing
+ * `CONTROL1B-R2-J-H1`), and which bare packages a scanned file may load at all
+ * ({@link PERMITTED_BARE_SPECIFIERS}, closing `CONTROL1B-R2-J-H2`).
  *
  * `support/module-loads.ts` reads every load a file spells as its evaluated
  * literal. Round 0 then judged that literal by NAME — a prefix match against
@@ -18,7 +21,7 @@
  * | `./…`, `../…`, `/…` | the path it reaches, read BOTH as the CommonJS loader reads it (a literal path) and as the ES loader reads it (a URL: `%2e`, `%70` decoded), each through every symbolic link (`realpath`) |
  * | `file:…` | the path the URL names, the same way |
  * | `data:`, `http:`, any other scheme, `#imports`, a backslash | UNREADABLE |
- * | a bare package name | the name itself; then EVERY place it can land — each alias of a vitest config that runs a scanned tree, and the package `node_modules` resolution reaches from the importing file, through its symbolic link to its real directory and its `package.json` name. A name neither places is UNREADABLE |
+ * | a bare package name | the name itself; then EVERY place it can land — each alias of a vitest config that runs a scanned tree, and the package `node_modules` resolution reaches from the importing file, through its symbolic link to its real directory and its `package.json` name. A name neither places is UNREADABLE, and so is a name — package AND subpath — that {@link PERMITTED_BARE_SPECIFIERS} does not list for the importing file (`CONTROL-1b` r2: `vitest/node` and `eslint` are innocuous names whose APIs load any file they are given, and the round-2 verifiers loaded the secure adapter and the venue SDK through each) |
  *
  * A path is FORBIDDEN when it reaches into `packages/polymarket-secure`,
  * passes through a `node_modules` directory (a path import into installed
@@ -36,13 +39,28 @@
  * directory inside a scanned tree. Round 0 filtered by extension, so a `.tsx`
  * file was never opened.
  *
+ * ## Every other literal (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1`)
+ *
+ * A loader the scan does not name can still be handed a LITERAL target — the
+ * round-2 verifiers' plants built `createRequire` from parts and gave it
+ * `"…/packages/polymarket-secure/package.json"` and `"@polymarket/client"`.
+ * {@link judgeLiteral} judges every literal `module-loads.ts` collects outside
+ * a load: it FAILS when the literal, read as a load from the same file, would
+ * be FORBIDDEN by the rules above, or when its segments — split on `/` and
+ * `\`, as written and percent-decoded — name the secure adapter's directory or
+ * a forbidden package. An identifier fails only when it IS a forbidden name.
+ * What remains is a target computed at run time — `module-loads.ts`, "What a
+ * static scan cannot see".
+ *
  * ## What else decides what a worker loads
  *
  * - **The runners.** A vitest config can load a module no import names — a
  *   setup file, a plugin, a custom environment or runner, pool `execArgv`.
  *   {@link unjudgedConfigKeys} holds each config that runs a scanned tree to a
  *   CLOSED world of keys, and {@link aliasesOf} hands its aliases to the bare
- *   name judge above.
+ *   name judge above. Since `CONTROL-1b` r2 the one plugin and the one setup
+ *   file a config may name are the run-time no-signer guard's
+ *   (`no-signer-guard.ts`), EXACTLY.
  * - **The packages a load lands in.** A load that lands in another workspace
  *   package runs that package's own imports, which no scan of these trees
  *   reads. {@link forbiddenDependencyClosure} reads their manifests instead,
@@ -53,23 +71,19 @@ import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { CODE_EXTENSIONS, COMPUTED, UNPARSEABLE, type ModuleLoad } from "./module-loads.js";
+import {
+  FORBIDDEN_PACKAGES,
+  SECURE_DIRECTORY,
+  isForbiddenName,
+  namesForbiddenSegments,
+  segmentsOfText,
+} from "./forbidden-targets.js";
+import { CODE_EXTENSIONS, COMPUTED, UNPARSEABLE, type ModuleLoad, type SourceLiteral } from "./module-loads.js";
+import { NO_SIGNER_PLUGIN_NAME, NO_SIGNER_SETUP_FILE, noSignerLoad } from "./no-signer-guard.js";
 
-/** The secure adapter and the signing libraries: never loadable, never excusable. */
-export const FORBIDDEN_PACKAGES = [
-  "@polymarket-bot/polymarket-secure",
-  "@polymarket/client",
-  "@polymarket/clob-client",
-  "@polymarket/builder-signing-sdk",
-  "@polymarket/builder-relayer-client",
-  "ethers",
-  "viem",
-  "web3",
-  "@ethersproject",
-] as const;
-
-/** The secure adapter's directory name, a forbidden PATH segment too. */
-const SECURE_DIRECTORY = "polymarket-secure";
+// The vocabulary lives in `forbidden-targets.ts` (`CONTROL-1b` r2), which the
+// run-time guard shares; it is re-exported here for the scan's callers.
+export { FORBIDDEN_PACKAGES, SECURE_DIRECTORY, isForbiddenName };
 
 /**
  * The Node builtins a scanned file may load — each one that cannot load or
@@ -99,6 +113,68 @@ export const PERMITTED_BUILTINS = [
   "zlib",
 ] as const;
 
+/**
+ * A bare specifier — package AND subpath, exactly — a scanned file may load
+ * (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H2`). `files`, when present, are
+ * the repository-relative files that may; absent, any scanned file may.
+ */
+export interface PermittedBare {
+  readonly specifier: string;
+  readonly files?: readonly string[];
+  readonly justification: string;
+}
+
+const WORKSPACE_JUSTIFICATION =
+  "a workspace package: its manifest is held to no forbidden dependency at any depth (the dependency " +
+  "closure), and its source to check:deps (F6: the venue SDK only in the secure adapter; F16)";
+
+/**
+ * The bare specifiers the scanned trees load, and nothing else — an
+ * ALLOWLIST, like {@link PERMITTED_BUILTINS}: a package whose API takes a path
+ * and loads it (`vitest/node`'s `createViteServer().ssrLoadModule`, `eslint`'s
+ * `overrideConfigFile`, `vite`, `esbuild`) reaches the secure adapter by an
+ * ordinary string argument, so a package or subpath this list does not name
+ * fails until someone judges it here. `acceptance-3-no-signer.test.ts` holds
+ * the list to EXACTLY the specifiers the trees use.
+ */
+export const PERMITTED_BARE_SPECIFIERS: readonly PermittedBare[] = Object.freeze([
+  {
+    specifier: "vitest",
+    justification:
+      "the test runner's API: its module loaders (vi.importActual, importMock, mock, doMock, unmock, doUnmock) are read " +
+      "as loads when called off vi or vitest, and any other reference to one is a named loader",
+  },
+  {
+    specifier: "vitest/config",
+    files: [
+      "test/integration/control-api/vitest.config.ts",
+      "test/integration/control-api/postgres/vitest.config.ts",
+      "test/vitest.config.ts",
+    ],
+    justification: "defineConfig and configDefaults, in the three runner configs, each held to a closed world of keys",
+  },
+  { specifier: "zod", justification: "a schema library: it parses and validates data, and loads no module" },
+  {
+    specifier: "typescript",
+    files: ["test/integration/control-api/support/module-loads.ts"],
+    justification:
+      "the scan's own parser, used to parse text only; its one module loader, sys.require, is a <loader:require> " +
+      "finding wherever it is named",
+  },
+  ...[
+    "@polymarket-bot/control-api",
+    "@polymarket-bot/control-api/testing",
+    "@polymarket-bot/domain",
+    "@polymarket-bot/observability",
+    "@polymarket-bot/risk/plain-data",
+    "@polymarket-bot/risk/plain-json",
+    "@polymarket-bot/risk/schema-arena",
+    "@polymarket-bot/storage-postgres",
+    "@polymarket-bot/storage-postgres/testing",
+    "@polymarket-bot/trader",
+  ].map((specifier) => ({ specifier, justification: WORKSPACE_JUSTIFICATION })),
+]);
+
 /** Files a scanned tree may hold that no loader runs unless a load names them — and a load naming one fails. */
 export const INERT_EXTENSIONS = [".md"] as const;
 export const INERT_BASENAMES = [".gitkeep"] as const;
@@ -119,6 +195,8 @@ export interface LandingContext {
   readonly repoRoot: string;
   /** Every alias of every vitest config that runs a scanned tree. */
   readonly aliases: readonly Alias[];
+  /** The bare specifiers a scanned file may load. Absent: {@link PERMITTED_BARE_SPECIFIERS}. */
+  readonly permittedBare?: readonly PermittedBare[];
 }
 
 function ok(landings: readonly string[]): Verdict {
@@ -131,22 +209,6 @@ function forbidden(why: string): Verdict {
 
 function unreadable(finding: string, why: string): Verdict {
   return { kind: "unreadable", finding, why };
-}
-
-/** A forbidden package NAME — a prefix match, so `viem/accounts` counts. */
-export function isForbiddenName(specifier: string): boolean {
-  const lower = specifier.toLowerCase();
-  return FORBIDDEN_PACKAGES.some((name) => lower.startsWith(name));
-}
-
-/** Whether `segments` name a forbidden package or the secure adapter's directory. */
-function namesForbiddenSegments(path: readonly string[]): boolean {
-  const segments = path.map((segment) => segment.toLowerCase());
-  return segments.some((segment, index) => {
-    if (segment === SECURE_DIRECTORY) return true;
-    const pair = `${segment}/${segments[index + 1] ?? ""}`;
-    return FORBIDDEN_PACKAGES.some((name) => name === segment || name === pair);
-  });
 }
 
 /** `path` with its longest EXISTING prefix replaced by that prefix's real path. */
@@ -244,12 +306,6 @@ function judgeBare(specifier: string, importer: string, context: LandingContext)
     landings.push(landing);
   }
   const installed = packageDirectory(dirname(importer), packageNameOf(specifier));
-  if (landings.length === 0 && installed === undefined) {
-    return unreadable(
-      `<unresolved:${specifier}>`,
-      `${specifier} resolves through no alias and no node_modules from ${importer}, so the scan cannot say where it lands`,
-    );
-  }
   const reached: string[] = [];
   for (const landing of landings) {
     const verdict = judgePaths([landing], specifier, context);
@@ -270,6 +326,22 @@ function judgeBare(specifier: string, importer: string, context: LandingContext)
       return forbidden(`${specifier} is installed from the secure adapter or a signing package (${real})`);
     }
     reached.push(real);
+  }
+  // `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H2`): nothing forbidden, and
+  // still only a package and subpath the list names for this file.
+  const file = relative(context.repoRoot, importer);
+  const permitted = (context.permittedBare ?? PERMITTED_BARE_SPECIFIERS).find((entry) => entry.specifier === specifier);
+  if (permitted === undefined || (permitted.files !== undefined && !permitted.files.includes(file))) {
+    return unreadable(
+      `<unpermitted:${specifier}>`,
+      `${specifier} is not a bare specifier ${file} may load (PERMITTED_BARE_SPECIFIERS): a package's API can load any path it is handed`,
+    );
+  }
+  if (landings.length === 0 && installed === undefined) {
+    return unreadable(
+      `<unresolved:${specifier}>`,
+      `${specifier} resolves through no alias and no node_modules from ${importer}, so the scan cannot say where it lands`,
+    );
   }
   return ok(reached);
 }
@@ -321,6 +393,63 @@ export function judgeLoad(load: ModuleLoad, importer: string, context: LandingCo
   return judgeBare(specifier, importer, context);
 }
 
+/** Verdicts by literal, per context and importing directory: one file's literals are judged many times. */
+const LITERAL_VERDICTS = new WeakMap<LandingContext, Map<string, Verdict>>();
+
+/**
+ * Why `literal` — one a scanned file holds OUTSIDE a load (`module-loads.ts`,
+ * "Every literal is read too") — names a forbidden target, or `undefined`
+ * (module header, "Every other literal"). `CONTROL-1b` r2, closing
+ * `CONTROL1B-R2-J-H1`:
+ *
+ * - an IDENTIFIER fails when it IS a forbidden package's name (`viem`), since
+ *   `Function.prototype.name` and `Object.keys` make it a string;
+ * - any other literal fails when its segments — split on `/` and `\`, as
+ *   written and percent-decoded — name the secure adapter's directory or a
+ *   forbidden package, or when it would be FORBIDDEN as a load from the same
+ *   file: a forbidden name or subpath, a path that reaches the secure adapter
+ *   (through a symbolic link too) or passes through `node_modules`, a bare
+ *   name installed as a signing package.
+ *
+ * Whether it would be UNREADABLE as a load is not asked: a literal outside a
+ * load loads nothing by itself, and most literals are no specifier at all.
+ */
+export function judgeLiteral(literal: SourceLiteral, importer: string, context: LandingContext): string | undefined {
+  const text = literal.text;
+  if (literal.kind === "identifier") {
+    return namesForbiddenSegments([text]) ? `the name ${text} is a forbidden package's` : undefined;
+  }
+  const readings = [text];
+  try {
+    const decoded = decodeURIComponent(text);
+    if (decoded !== text) readings.push(decoded);
+  } catch {
+    // Not percent-encoded text: read as written only.
+  }
+  for (const reading of readings) {
+    if (namesForbiddenSegments(segmentsOfText(reading))) {
+      return `its segments name the secure adapter or a signing package (${reading.slice(0, 120)})`;
+    }
+  }
+  let verdicts = LITERAL_VERDICTS.get(context);
+  if (verdicts === undefined) {
+    verdicts = new Map();
+    LITERAL_VERDICTS.set(context, verdicts);
+  }
+  const key = `${dirname(importer)}\0${text}`;
+  let verdict = verdicts.get(key);
+  if (verdict === undefined) {
+    verdict = judgeLoad({ kind: "import", specifier: text, line: literal.line }, importer, context);
+    verdicts.set(key, verdict);
+  }
+  return verdict.kind === "forbidden" ? verdict.why : undefined;
+}
+
+/** The finding a literal naming a forbidden target produces: `<names:"viem">`. */
+export function literalFinding(text: string): string {
+  return `<names:${JSON.stringify(text)}>`;
+}
+
 export interface Discovery {
   /** Files read with a code grammar. */
   readonly code: readonly string[];
@@ -368,29 +497,72 @@ export function discover(tree: string): Discovery {
  * The keys a vitest config that runs a scanned tree may set — a CLOSED world:
  * `setupFiles`, `globalSetup`, `plugins`, `environment`, a custom `runner`,
  * pool `execArgv` and the rest can each load a module no import names, so a
- * key outside this list fails until someone judges it here.
+ * key outside this list fails until someone judges it here. `plugins` and
+ * `test.setupFiles` are in it only with the run-time no-signer guard's values,
+ * EXACTLY ({@link installsNoSignerGuard}; `CONTROL-1b` r2): any other value of
+ * either is an unjudged key.
  */
 export const VITEST_CONFIG_KEYS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  "": ["resolve", "test"],
+  "": ["resolve", "test", "plugins"],
   resolve: ["alias"],
-  test: ["root", "include", "exclude", "testTimeout", "hookTimeout", "passWithNoTests"],
+  test: ["root", "setupFiles", "include", "exclude", "testTimeout", "hookTimeout", "passWithNoTests"],
 });
 
-/** Every key path of `config` outside {@link VITEST_CONFIG_KEYS}. */
+function recordOf(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+/**
+ * EVERY own key of `value` — non-enumerable and symbol keys included, since
+ * vite reads a hook by property access — and `<prototype>` when `value`
+ * inherits from anything but a plain object, whose keys vite would read too.
+ */
+function ownKeysOf(value: unknown): readonly string[] {
+  if (typeof value !== "object" || value === null) return [];
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  const keys = Reflect.ownKeys(value).map((key) => String(key));
+  return prototype === Object.prototype || prototype === null ? keys : [...keys, "<prototype>"];
+}
+
+/** Whether `plugins` is exactly `[noSignerVitePlugin()]`: one plain plugin, its three keys, the guard's own `load`. */
+function isGuardPlugins(plugins: unknown): boolean {
+  if (!Array.isArray(plugins) || plugins.length !== 1) return false;
+  const plugin = recordOf(plugins[0]);
+  return (
+    [...ownKeysOf(plugins[0])].sort().join(",") === "enforce,load,name" &&
+    plugin["name"] === NO_SIGNER_PLUGIN_NAME &&
+    plugin["enforce"] === "pre" &&
+    plugin["load"] === noSignerLoad
+  );
+}
+
+/** Whether `setupFiles` is exactly `[NO_SIGNER_SETUP_FILE]`. */
+function isGuardSetup(setupFiles: unknown): boolean {
+  return Array.isArray(setupFiles) && setupFiles.length === 1 && setupFiles[0] === NO_SIGNER_SETUP_FILE;
+}
+
+/** Every key path of `config` outside {@link VITEST_CONFIG_KEYS}, or holding a value it does not admit. */
 export function unjudgedConfigKeys(config: unknown): readonly string[] {
   const out: string[] = [];
-  const record = (value: unknown): Record<string, unknown> =>
-    typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-  const top = record(config);
-  for (const key of Object.keys(top)) {
+  const top = recordOf(config);
+  for (const key of ownKeysOf(config)) {
     if (!(VITEST_CONFIG_KEYS[""] ?? []).includes(key)) out.push(key);
   }
+  if ("plugins" in top && !isGuardPlugins(top["plugins"])) out.push("plugins");
   for (const section of ["resolve", "test"]) {
-    for (const key of Object.keys(record(top[section]))) {
+    for (const key of ownKeysOf(top[section])) {
       if (!(VITEST_CONFIG_KEYS[section] ?? []).includes(key)) out.push(`${section}.${key}`);
     }
   }
+  const test = recordOf(top["test"]);
+  if ("setupFiles" in test && !isGuardSetup(test["setupFiles"])) out.push("test.setupFiles");
   return out;
+}
+
+/** Whether `config` installs BOTH halves of the run-time no-signer guard, exactly (`no-signer-guard.ts`). */
+export function installsNoSignerGuard(config: unknown): boolean {
+  const top = recordOf(config);
+  return isGuardPlugins(top["plugins"]) && isGuardSetup(recordOf(top["test"])["setupFiles"]);
 }
 
 /** The aliases a vitest config applies, as {@link Alias} entries (vite accepts an array or an object). */

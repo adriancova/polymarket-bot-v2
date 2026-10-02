@@ -25,13 +25,26 @@
  * 3. A full ordinary tier leaves each refusal standing, counted `NOT_AUDITED`.
  * 4. An undeclared body naming a forbidden key is refused BY NAME again
  *    (`403`), audited for a mutation-grant holder and counted for a reader.
+ * 5. `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-L1`): the ONE authorized
+ *    refusal that writes nothing — the control plane's GATED refusal, a
+ *    protected mutation of a switch whose earlier protected append is still
+ *    unsettled — offers no record, is counted `NOT_AUDITED`, and the README
+ *    names it as write-nothing item 7 where it says every authorized refusal
+ *    is audited.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FAKE_OPERATOR_TOKEN, FAKE_READER_TOKEN } from "@polymarket-bot/control-api/testing";
+import type { AuditAppendResult, ControlAuditRecord, InMemoryControlAuditLog } from "@polymarket-bot/observability";
 
 import { serveControlApi, type CallOptions, type ServedApi } from "./support/client.js";
+
+const README = resolve(dirname(fileURLToPath(import.meta.url)), "../../../apps/control-api/README.md");
 
 const STRATEGIST_TOKEN = "fake-paper-strategist-token-not-a-credential-r1-0003";
 
@@ -212,7 +225,7 @@ function stateOf(api: ServedApi): string {
   return JSON.stringify({ strategies: api.controlPlane.strategies(), killSwitches: api.controlPlane.killSwitches() });
 }
 
-describe("CONTROL1-J-M2: every refusal of an AUTHORIZED request to a mutating route is audited", () => {
+describe("CONTROL1-J-M2: every refusal of an AUTHORIZED request to a mutating route is audited — save write-nothing item 7, the GATED refusal (below)", () => {
   it.each(CASES)("$name → $status $code, ONE REFUSED $action record, nothing changed", async (testCase) => {
     const api = await start();
     const before = stateOf(api);
@@ -374,5 +387,82 @@ describe("an undeclared body naming a forbidden key is refused BY NAME again (th
     });
     expect(response.status).toBe(415);
     expect(api.controlPlane.killSwitches().map((entry) => entry.scope)).toEqual(["GLOBAL"]);
+  });
+});
+
+describe("CONTROL1B-R2-J-L1: write-nothing item 7 — the GATED refusal offers no record, and the README says so", () => {
+  /** An inner sink that holds every APPLIED record unanswered until released, and counts every record it is OFFERED. */
+  function stalledInner(): {
+    readonly wrap: (log: InMemoryControlAuditLog) => { append(record: ControlAuditRecord): Promise<AuditAppendResult> };
+    offered: number;
+    stalling: boolean;
+    release(): void;
+  } {
+    const held: (() => void)[] = [];
+    const control = {
+      offered: 0,
+      stalling: true,
+      wrap: (log: InMemoryControlAuditLog) => ({
+        append: (record: ControlAuditRecord): Promise<AuditAppendResult> => {
+          control.offered += 1;
+          return control.stalling && record.outcome === "APPLIED"
+            ? new Promise<AuditAppendResult>((resolveAppend) => {
+                held.push(() => {
+                  void log.append(record).then(resolveAppend);
+                });
+              })
+            : log.append(record);
+        },
+      }),
+      release: () => {
+        control.stalling = false;
+        for (const settle of held.splice(0)) settle();
+      },
+    };
+    return control;
+  }
+
+  it("an authorized operator's retried halt, while its first append is unsettled: 503, NOTHING offered, counted NOT_AUDITED and not as an append failure", async () => {
+    const inner = stalledInner();
+    served = await serveControlApi({ operators: OPERATORS, auditInner: inner.wrap, auditAppendTimeoutMs: 50, auditCapacity: 16, auditSafetyReserve: 2 });
+    const halt = { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", reason: "halt now" };
+    const first = await served.call("POST", "/v1/kill-switch", { token: FAKE_OPERATOR_TOKEN, body: halt });
+    expect(first.status).toBe(503);
+    expect(inner.offered).toBe(1);
+    const recordsBefore = served.audit.records().length;
+
+    const gated = await served.call("POST", "/v1/kill-switch", { token: FAKE_OPERATOR_TOKEN, body: halt });
+    expect(gated.status).toBe(503);
+    const body = gated.json() as Record<string, unknown>;
+    expect(body["code"]).toBe("CONTROL_NOT_AUDITABLE");
+    expect(String(body["detail"])).toContain("WITHOUT an audit append");
+    // Write-nothing item 7: no record OFFERED, none written, nothing engaged.
+    expect(inner.offered).toBe(1);
+    expect(served.audit.records()).toHaveLength(recordsBefore);
+    expect(served.controlPlane.killSwitches()).toEqual([]);
+    const metrics = await served.call("GET", "/v1/metrics", { token: FAKE_OPERATOR_TOKEN });
+    expect(metrics.text).toContain('control_mutations_total{action="KILL_SWITCH_ENGAGE",outcome="NOT_AUDITED"} 2');
+    // Only the FIRST attempt's append failed (by its bound); the gated one attempted none.
+    expect(metrics.text).toContain("control_audit_append_failures_total 1");
+
+    // Once the sink answers, the gate lifts and a halt is audited and applied.
+    inner.release();
+    await vi.waitFor(() => {
+      expect(served?.controlPlane.unsettledAuditAppends).toBe(0);
+    });
+    const applied = await served.call("POST", "/v1/kill-switch", { token: FAKE_OPERATOR_TOKEN, body: halt });
+    expect(applied.status).toBe(200);
+  });
+
+  it("the README names the gated refusal as write-nothing item 7, where it says every authorized refusal is audited", () => {
+    const readme = readFileSync(README, "utf8");
+    const passage = readme.slice(readme.indexOf("REFUSALS are audited too"), readme.indexOf("What writes NOTHING, exhaustively"));
+    expect(passage).toContain("save ONE, the gated");
+    expect(passage).toContain("item 7 of the list below");
+    const list = readme.slice(readme.indexOf("What writes NOTHING, exhaustively"), readme.indexOf("A mutation-grant holder's mode-raise attempt is the one thing"));
+    expect(list).toContain("7. **the GATED refusal**");
+    expect(list).toContain("WITHOUT offering any record to the sink");
+    expect(readme).toContain("None of items 1–6 attempted a mutation");
+    expect(readme).not.toContain("None of the six attempted");
   });
 });

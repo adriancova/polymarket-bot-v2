@@ -10,7 +10,12 @@
  * WHERE IT LANDS — the file a path reaches, the package a bare name resolves
  * to, the builtin a `node:` id names — and every file of every scanned tree is
  * classified, none skipped (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`,
- * `-J-H2`, `-J-H3` and `-J-L2`; `support/load-judge.ts`). This is the
+ * `-J-H2`, `-J-H3` and `-J-L2`; `support/load-judge.ts`). Every OTHER literal
+ * a file holds is judged by what it names, only real loader calls count as
+ * loads, and only listed bare packages may be loaded at all; and the two
+ * control-api integration runners refuse a forbidden landing at RUN time
+ * (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1` and `-J-H2`;
+ * `support/no-signer-guard.ts`). This is the
  * `apps/trader` precedent
  * (`test/integration/paper-trader/compose-and-example-config.test.ts`'s scans),
  * applied to a package whose §4.1 description is literally "never has the
@@ -20,30 +25,54 @@
  *
  * 1. **No load** of the secure adapter, a venue client, or a signing library:
  *    no literal lands in `packages/polymarket-secure`, in `node_modules` by
- *    path, or in a package named like one; no builtin that can load or run
- *    code is loaded; nothing the scan cannot place is excused without an exact
- *    allowlist entry; the runners that execute these trees load nothing their
- *    imports do not name; and no workspace package a load lands in declares a
- *    forbidden dependency, at any depth.
+ *    path, or in a package named like one; no literal ANYWHERE in a scanned
+ *    file names one; no bare package outside an explicit list is loaded; no
+ *    builtin that can load or run code is loaded; nothing the scan cannot place
+ *    is excused without an exact allowlist entry; the runners that execute
+ *    these trees load nothing their imports do not name but the run-time
+ *    guard; and no workspace package a load lands in declares a forbidden
+ *    dependency, at any depth.
  * 2. **No identifier** naming a signer, a wallet key or a credential in
  *    production source — and the exceptions are enumerated, not waived: the
  *    words appear only where the code REFUSES them.
  * 3. **No manifest dependency** on `packages/polymarket-secure`, and no
  *    credential-shaped value in the shipped example configuration.
  *
- * ## What this does not prove (`CONTROL-1b` r1)
+ * ## What this does not prove (`CONTROL-1b` r2)
  *
- * - A loader reached through a COMPUTED property name — `globalThis[atob(…)]`,
- *   or `Reflect.get(Object.getPrototypeOf(f), k)` with a computed `k` — is
- *   beyond any static scan. Round 0 said a resolution backstop made such a
- *   load find "nothing to load"; that was true only of BARE names, and the
- *   round-1 verifiers loaded the secure adapter by PATH. A computed name that
- *   reaches a loader with a computed path is therefore NOT ruled out here.
+ * - **Statically:** a load whose loader the scan does not NAME — reached by a
+ *   computed key, by enumeration, by spreading an object that holds one, or
+ *   through a method of a permitted package other than those
+ *   `support/module-loads.ts` names — AND whose target no literal in the file
+ *   names: a path or package computed at run time (from parts, by slicing,
+ *   from encoded data or from the program's own text) or a value another
+ *   module exports. Round 1 said only "a computed name with a computed path"
+ *   remained, which implied a LITERAL path was ruled out; it was not — the
+ *   round-2 verifiers loaded the venue SDK through a computed loader and a
+ *   literal path that the scan never judged (`CONTROL1B-R2-J-H1`), and
+ *   through `ts.sys.require`, `vitest/node` and ESLint (`CONTROL1B-R2-J-H2`).
+ *   Each of those plants fails below.
+ * - **At run time** the guard (`support/no-signer-guard.ts`) refuses, in the
+ *   two control-api integration runners, every module Node loads in the test
+ *   worker's thread and every module vitest loads for it that lands in the
+ *   secure adapter or a forbidden package, however it was spelled
+ *   (`no-signer-runtime-guard.test.ts` in each runner). It does NOT see code
+ *   read as text and evaluated; a module graph a test builds itself (whose
+ *   Node-loaded dependencies it does see); another thread or process (its hook
+ *   is thread-local, so a `worker_threads` Worker loads without it); Node's
+ *   loader internals called directly (`Module._extensions[…]`, which runs no
+ *   hook); or a builtin reached through `process.getBuiltinModule`, which
+ *   resolves nothing. And it does not run under the repository's unit runner,
+ *   `test/vitest.config.ts` (`WP-010`-owned, outside `CONTROL-1b`'s grant),
+ *   which runs `apps/control-api/src/**` and `test/unit/control-api/**`: there
+ *   the static scan stands alone, with the residual above.
  * - Code a test WRITES at run time over a file that already exists, and then
  *   loads, is not read: the scan read the file's earlier text. (A load of a
- *   file that does not exist when the scan runs fails.)
- * - Third-party packages are judged by name and by their own `package.json`
- *   dependencies; their deeper transitive dependencies are not read.
+ *   file that does not exist when the scan runs fails, and in the integration
+ *   runners the guard refuses whatever forbidden module such code loads.)
+ * - Third-party packages are judged by name, by the bare-package list and by
+ *   their own `package.json` dependencies; their deeper transitive
+ *   dependencies are not read.
  * - Runner flags outside this package — CI's environment, `NODE_OPTIONS` —
  *   are not read; this package's own scripts and the three vitest configs
  *   that run these trees are.
@@ -72,12 +101,18 @@ import rootConfig from "../../vitest.config.js";
 import postgresConfig from "./postgres/vitest.config.js";
 import {
   FORBIDDEN_PACKAGES,
+  PERMITTED_BARE_SPECIFIERS,
+  PERMITTED_BUILTINS,
+  SECURE_DIRECTORY,
   aliasesOf,
   discover,
   forbiddenDependencyClosure,
+  installsNoSignerGuard,
   isForbiddenName,
+  judgeLiteral,
   judgeLoad,
   judgePaths,
+  literalFinding,
   unjudgedConfigKeys,
   workspacePackageOf,
   type LandingContext,
@@ -94,7 +129,9 @@ import {
   VITEST_ONLY_WHEN_ON_VI,
   loaderFinding,
   moduleLoadsIn,
+  scanSource,
 } from "./support/module-loads.js";
+import { NO_SIGNER_PLUGIN_NAME, NO_SIGNER_SETUP_FILE, noSignerLoad, noSignerVitePlugin } from "./support/no-signer-guard.js";
 import integrationConfig from "./vitest.config.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -102,6 +139,11 @@ const repoRoot = resolve(here, "../../..");
 
 /** A name built from parts, so this file spells no loader name as a literal (the scan reads it too). */
 const named = (...parts: readonly string[]): string => parts.join("");
+
+// `CONTROL-1b` r2: every literal is judged by what it names, so this file
+// spells no forbidden target either — each is read from the vocabulary.
+const [SECURE_PACKAGE, VENUE_SDK, , , , ETHERS_NAME, VIEM_NAME, WEB3_NAME] = FORBIDDEN_PACKAGES;
+const NODE_MODULES = named("node_", "modules");
 
 /** Yields to the event loop between heavy synchronous blocks, so the worker's RPC is answered. */
 const yieldToLoop = (): Promise<void> =>
@@ -164,7 +206,9 @@ function read(path: string): string {
   return readFileSync(path, "utf8");
 }
 
-const SECURE = resolve(repoRoot, "packages/polymarket-secure");
+const SECURE = resolve(repoRoot, "packages", SECURE_DIRECTORY);
+/** The venue SDK's entry, by PATH, through the secure adapter's own `node_modules`. */
+const SDK_ENTRY = join(SECURE, NODE_MODULES, ...VENUE_SDK.split("/"), "dist", "index.js");
 
 /** The workspace packages (`pnpm-workspace.yaml`: `apps/*`, `packages/*`, `packages/strategies/*`), by name. */
 const WORKSPACES: ReadonlyMap<string, string> = (() => {
@@ -203,7 +247,13 @@ function fileOnDisk(landing: string): string | undefined {
  * `CONTROL-1b` r1: the scan's own vocabulary. `support/module-loads.ts` must
  * NAME every loader it looks for, and since r1 a loader named by a string in
  * a value position is itself a finding — so each name in its lists is one.
- * None is used as a key or called; every other scanned file needs no entry.
+ * None is used as a key or called.
+ *
+ * `CONTROL-1b` r2: likewise `support/forbidden-targets.ts` must NAME every
+ * forbidden target, and every literal naming one is now a finding — so each
+ * entry of its list is one, once; and the run-time guard's Node half reads
+ * `registerHooks` from `node:module`, a builtin the scan otherwise refuses.
+ * Every other scanned file needs no entry.
  */
 interface LoadAllowlistEntry {
   readonly file: string;
@@ -214,22 +264,54 @@ interface LoadAllowlistEntry {
 const VOCABULARY =
   "support/module-loads.ts lists the loader names it detects as string literals in its own vocabulary " +
   "arrays and map; none is read as a key or called";
-const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze(
+const TARGET_VOCABULARY =
+  "support/forbidden-targets.ts IS the list of forbidden targets every judge and the run-time guard read: each " +
+  "literal names one, once, and nothing loads it";
+const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([
   // Read from the vocabulary itself, so this file spells none of the names.
   // A name is written once in its list — and once more where it is also the
   // load KIND it produces (`require`), or also in the list of names flagged
   // only when read off `vi` (`mock`, `unmock`).
-  [...LOADER_NAMES, ...EVALUATOR_CONSTRUCTORS, ...SPECIFIER_LOADERS.keys(), RUNTIME_LOADER_PREFIX].map((name) => ({
+  ...[...LOADER_NAMES, ...EVALUATOR_CONSTRUCTORS, ...SPECIFIER_LOADERS.keys(), RUNTIME_LOADER_PREFIX].map((name) => ({
     file: "test/integration/control-api/support/module-loads.ts",
     finding: loaderFinding(name),
     count: 1 + (VITEST_ONLY_WHEN_ON_VI.includes(name) ? 1 : 0) + (SPECIFIER_LOADERS.get(name) === name ? 1 : 0),
     justification: VOCABULARY,
   })),
-);
+  // `CONTROL-1b` r2: the forbidden targets, each written once in their list.
+  ...[...FORBIDDEN_PACKAGES, SECURE_DIRECTORY].map((name) => ({
+    file: "test/integration/control-api/support/forbidden-targets.ts",
+    finding: literalFinding(name),
+    count: 1,
+    justification: TARGET_VOCABULARY,
+  })),
+  {
+    file: "test/integration/control-api/support/no-signer-setup.ts",
+    finding: named("<builtin:node:", "module>"),
+    count: 1,
+    justification:
+      "the run-time guard's Node half reads registerHooks, and nothing else, from node:module: a load hook that " +
+      "only REFUSES, registered before any test file is imported",
+  },
+]);
+
+/** A file on disk, read every time and parsed once per path and CONTENT (a test rewrites its own fixtures). */
+const SCANNED_ON_DISK = new Map<string, ReturnType<typeof scanSource>>();
+function scanFile(path: string): { readonly text: string; readonly scanned: ReturnType<typeof scanSource> } {
+  const text = read(path);
+  const key = `${path}\0${text}`;
+  let scanned = SCANNED_ON_DISK.get(key);
+  if (scanned === undefined) {
+    scanned = scanSource(text, path);
+    SCANNED_ON_DISK.set(key, scanned);
+  }
+  return { text, scanned };
+}
 
 /**
- * Every violation in one file: each FORBIDDEN landing, and each unreadable
- * finding the allowlist does not cover EXACTLY.
+ * Every violation in one file: each FORBIDDEN landing, each unreadable
+ * finding, and (`CONTROL-1b` r2) each literal naming a forbidden target, that
+ * the allowlist does not cover EXACTLY.
  */
 function violationsIn(
   path: string,
@@ -237,6 +319,7 @@ function violationsIn(
   allowlist: readonly LoadAllowlistEntry[] = LOAD_ALLOWLIST,
   context: LandingContext = LANDING,
   onDisk = false,
+  scanned: ReturnType<typeof scanSource> = scanSource(text, path),
 ): readonly string[] {
   const file = relative(repoRoot, path);
   const violations: string[] = [];
@@ -244,7 +327,7 @@ function violationsIn(
   const count = (finding: string): void => {
     unreadable.set(finding, (unreadable.get(finding) ?? 0) + 1);
   };
-  for (const load of moduleLoadsIn(text, path)) {
+  for (const load of scanned.loads) {
     const verdict = judgeLoad(load, path, context);
     if (verdict.kind === "forbidden") {
       violations.push(`${file}:${String(load.line)} ${load.kind} ${load.specifier}`);
@@ -255,6 +338,11 @@ function violationsIn(
       // written at run time and then loaded holds code no scan has read.
       count(`<absent:${load.specifier}>`);
     }
+  }
+  // `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H1`): every OTHER literal, by
+  // what it names — a loader the scan cannot see could be handed it.
+  for (const literal of scanned.literals) {
+    if (judgeLiteral(literal, path, context) !== undefined) count(literalFinding(literal.text));
   }
   const entries = allowlist.filter((entry) => entry.file === file);
   for (const [finding, count] of unreadable) {
@@ -291,9 +379,9 @@ function scanClosure(
   let loads = 0;
   for (let path = queue.shift(); path !== undefined; path = queue.shift()) {
     files.push(path);
-    const text = read(path);
-    violations.push(...violationsIn(path, text, LOAD_ALLOWLIST, context, true));
-    for (const load of moduleLoadsIn(text, path)) {
+    const { text, scanned } = scanFile(path);
+    violations.push(...violationsIn(path, text, LOAD_ALLOWLIST, context, true, scanned));
+    for (const load of scanned.loads) {
       loads += 1;
       const verdict = judgeLoad(load, path, context);
       if (verdict.kind !== "ok") continue;
@@ -411,7 +499,7 @@ function landingSpellings(importer: string): readonly { readonly label: string; 
     return path.startsWith(".") ? path : `./${path}`;
   };
   const secureSource = join(SECURE, "src", "index.js");
-  const sdk = join(SECURE, "node_modules", "@polymarket", "client", "dist", "index.js");
+  const sdk = SDK_ENTRY;
   const relSecure = rel(secureSource);
   const v = named("vi", "em");
   return [
@@ -419,13 +507,13 @@ function landingSpellings(importer: string): readonly { readonly label: string; 
     { label: "relative into the venue SDK (Opus's plant)", specifier: rel(sdk), expect: "forbidden" },
     { label: "absolute into the secure adapter", specifier: join(SECURE, "src", "index.ts"), expect: "forbidden" },
     { label: "file: URL into the secure adapter", specifier: pathToFileURL(join(SECURE, "src", "index.ts")).href, expect: "forbidden" },
-    { label: "a local node_modules path", specifier: `./node_modules/${v}/index.js`, expect: "forbidden" },
+    { label: "a local node_modules path", specifier: `./${NODE_MODULES}/${v}/index.js`, expect: "forbidden" },
     // Forbidden by the node_modules rule ALONE: the package it names is innocuous.
-    { label: "a node_modules path to any package", specifier: "./node_modules/innocuous/index.js", expect: "forbidden" },
+    { label: "a node_modules path to any package", specifier: `./${NODE_MODULES}/innocuous/index.js`, expect: "forbidden" },
     // Forbidden by the segment rule ALONE: a directory named like the secure adapter, elsewhere.
     { label: "a directory named like the secure adapter", specifier: rel(join(repoRoot, "vendor", named("polymarket-", "secure"), "index.js")), expect: "forbidden" },
-    { label: "a node_modules path from the root", specifier: rel(join(repoRoot, "node_modules", ".pnpm", `${v}@2.0.0`, "node_modules", v, "index.js")), expect: "forbidden" },
-    { label: "a file: URL into node_modules", specifier: pathToFileURL(join(repoRoot, "node_modules", v, "index.js")).href, expect: "forbidden" },
+    { label: "a node_modules path from the root", specifier: rel(join(repoRoot, NODE_MODULES, ".pnpm", `${v}@2.0.0`, NODE_MODULES, v, "index.js")), expect: "forbidden" },
+    { label: "a file: URL into node_modules", specifier: pathToFileURL(join(repoRoot, NODE_MODULES, v, "index.js")).href, expect: "forbidden" },
     { label: "a path naming a signing package", specifier: rel(join(repoRoot, "vendor", v, "index.js")), expect: "forbidden" },
     // Percent-encoded so that ONLY the ES loader's reading (a URL, decoded)
     // reaches the secure adapter: the literal path names neither directory.
@@ -540,6 +628,213 @@ function evaluatorSpellings(sdkPath: string): readonly string[] {
     `const worker = globalThis.__vitest_worker__;`,
     `const worker = Reflect.get(globalThis, "__vitest_worker__");`,
     `const realm = new ShadowRealm();`,
+    // `CONTROL-1b` r2: Node's loader internals compile a file without running
+    // any loader hook — the run-time guard cannot see this one, so the scan must.
+    `export const compileWith = (M, m) => M._extensions[".js"](m, ${JSON.stringify(sdkPath)});`,
+  ];
+}
+
+/** Where a round-2 plant names its targets: the checkout's own paths, from the vocabulary. */
+const R2 = {
+  anchor: join(SECURE, "package.json"),
+  secureIndex: join(SECURE, "src", "index.ts"),
+  q1Base: join(repoRoot, "test", "integration", "control-api", "zz-rc-q1.test.ts"),
+  // Q1's module, as the plant spelled it: relative to its base path read as a directory.
+  q1Module: ["..", "..", "..", "..", "packages", SECURE_DIRECTORY, NODE_MODULES, ...VENUE_SDK.split("/"), "dist", "index.js"].join("/"),
+} as const;
+
+/**
+ * `CONTROL-1b` r2: the round-2 verifiers' five plants (`reconcile-r2/plants/`).
+ * Each LOADED the venue SDK or the secure adapter into a test worker with
+ * acceptance 3 green at round 1. `ts` is the plant VERBATIM but for its
+ * checkout path (this one's), its targets interpolated from the vocabulary so
+ * this file spells none; `js` is the same plant with its types stripped, for
+ * the JavaScript grammars. `findings` must each be among the violations.
+ * `computed` is the plant with every target computed from parts — the
+ * mechanism alone — and `computedFindings` what must still catch it: for
+ * astra's plant and Q3 nothing static can (the residual), which is what the
+ * run-time guard's pins load instead (`support/no-signer-runtime-pins.ts`).
+ */
+function roundTwoPlants(): readonly {
+  readonly label: string;
+  readonly ts: string;
+  readonly js: string;
+  readonly findings: readonly string[];
+  readonly computed?: string;
+  readonly computedFindings?: readonly string[];
+}[] {
+  const s = (value: string): string => JSON.stringify(value);
+  // Every segment split in two as well, so no literal of the computed form is a segment that names a target.
+  const parts = (value: string): string =>
+    `[${value
+      .split("/")
+      .map((part) => (part.length > 1 ? `${s(part.slice(0, 1))} + ${s(part.slice(1))}` : s(part)))
+      .join(", ")}].join("/")`;
+  return [
+    {
+      label: "astra's plant: getBuiltinModule and createRequire built with .join, a LITERAL anchor and package (J-H1)",
+      ts: `import { expect, it } from "vitest";
+
+const word = (...parts: readonly string[]): string => parts.join("");
+
+it("loads the venue SDK through computed builtin and factory names", () => {
+  const builtinName = word("get", "Builtin", "Module");
+  const factoryName = word("create", "Require");
+  const getBuiltin = (process as unknown as Record<string, (name: string) => unknown>)[builtinName];
+  const moduleApi = getBuiltin?.("node:module") as Record<string, unknown>;
+  const makeRequire = moduleApi[factoryName] as (anchor: string) => (specifier: string) => unknown;
+  const load = makeRequire(
+    ${s(R2.anchor)},
+  );
+  const sdk = load(${s(VENUE_SDK)}) as Record<string, unknown>;
+  console.log("PLANT ASTRA LOADED", Object.keys(sdk).length, "SigningError", "SigningError" in sdk);
+  expect(Object.keys(sdk).length).toBeGreaterThan(0);
+  expect("SigningError" in sdk).toBe(true);
+});
+`,
+      js: `import { expect, it } from "vitest";
+const word = (...parts) => parts.join("");
+it("loads the venue SDK through computed builtin and factory names", () => {
+  const getBuiltin = process[word("get", "Builtin", "Module")];
+  const makeRequire = getBuiltin?.("node:module")[word("create", "Require")];
+  const sdk = makeRequire(${s(R2.anchor)})(${s(VENUE_SDK)});
+  expect("SigningError" in sdk).toBe(true);
+});
+`,
+      findings: [literalFinding(R2.anchor), literalFinding(VENUE_SDK)],
+    },
+    {
+      label: "Opus's Q3: Function found by enumerating the prototype, a LITERAL SDK path (J-H1)",
+      ts: `import { it } from "vitest";
+it("Q3 evaluator found by value, no name spelled", () => {
+  const proto = Object.getPrototypeOf(() => 0) as object;
+  const found = Object.values(Object.getOwnPropertyDescriptors(proto)).map((d) => d.value as unknown).find((v) => typeof v === "function" && (v as { prototype?: unknown }).prototype === proto) as (...a: string[]) => (p: string) => object;
+  const m = found("p", "return process.getBuiltinModule('node:mod' + 'ule')['create' + 'Require'](p)(p)")(${s(SDK_ENTRY)});
+  console.log("PLANT Q3 LOADED", Object.keys(m).length);
+});
+`,
+      js: `import { it } from "vitest";
+it("Q3 evaluator found by value, no name spelled", () => {
+  const proto = Object.getPrototypeOf(() => 0);
+  const found = Object.values(Object.getOwnPropertyDescriptors(proto)).map((d) => d.value).find((v) => typeof v === "function" && v.prototype === proto);
+  const m = found("p", "return process.getBuiltinModule('node:mod' + 'ule')['create' + 'Require'](p)(p)")(${s(SDK_ENTRY)});
+  console.log("PLANT Q3 LOADED", Object.keys(m).length);
+});
+`,
+      findings: [literalFinding(SDK_ENTRY)],
+    },
+    {
+      label: "Opus's Q1: ts.sys.require(baseDir, moduleName) — the module SECOND (J-H2)",
+      ts: `import { it } from "vitest";
+import ts from "typescript";
+it("Q1 typescript sys loader", () => {
+  const got = ts.sys.require?.(${s(R2.q1Base)}, ${s(R2.q1Module)});
+  console.log("PLANT Q1", got?.error === undefined ? "LOADED " + String(Object.keys((got?.module ?? {}) as object).length) + " SigningError " + String("SigningError" in ((got?.module ?? {}) as object)) : "ERROR " + String(got.error));
+});
+`,
+      js: `import { it } from "vitest";
+import ts from "typescript";
+it("Q1 typescript sys loader", () => {
+  const got = ts.sys.require?.(${s(R2.q1Base)}, ${s(R2.q1Module)});
+  console.log("PLANT Q1", got?.error === undefined ? "LOADED" : "ERROR " + String(got.error));
+});
+`,
+      findings: [named("<loader:re", "quire>"), "<unpermitted:typescript>", literalFinding(R2.q1Module)],
+      computed: `import ts from "typescript";
+export const got = ts.sys.require?.(${s(R2.q1Base)}, ${parts(R2.q1Module)});
+`,
+      computedFindings: [named("<loader:re", "quire>"), "<unpermitted:typescript>"],
+    },
+    {
+      label: "Opus's Q2: vitest/node's createViteServer().ssrLoadModule (J-H2)",
+      ts: `import { it } from "vitest";
+import { createViteServer } from "vitest/node";
+it("Q2 vite server ssrLoadModule", async () => {
+  const server = await createViteServer({ configFile: false, logLevel: "silent", appType: "custom", server: { middlewareMode: true, hmr: false, ws: false, watch: null }, optimizeDeps: { noDiscovery: true, include: [] } });
+  try {
+    const m = await server.ssrLoadModule(${s(R2.secureIndex)});
+    console.log("PLANT Q2 LOADED", Object.keys(m).length, Object.keys(m).slice(0, 4).join(","));
+  } finally {
+    await server.close();
+  }
+}, 60000);
+`,
+      js: `import { it } from "vitest";
+import { createViteServer } from "vitest/node";
+it("Q2 vite server ssrLoadModule", async () => {
+  const server = await createViteServer({ configFile: false });
+  const m = await server.ssrLoadModule(${s(R2.secureIndex)});
+  console.log("PLANT Q2 LOADED", Object.keys(m).length);
+}, 60000);
+`,
+      findings: ["<unpermitted:vitest/node>", literalFinding(R2.secureIndex)],
+      computed: `import { createViteServer } from "vitest/node";
+export const load = async () => (await createViteServer({ configFile: false })).ssrLoadModule(${parts(R2.secureIndex)});
+`,
+      computedFindings: ["<unpermitted:vitest/node>"],
+    },
+    {
+      label: "Opus's Q4: ESLint's overrideConfigFile (J-H2)",
+      ts: `import { it } from "vitest";
+import { ESLint } from "eslint";
+it("Q4 eslint config loader", async () => {
+  const before = Object.keys(globalThis).length;
+  const linter = new ESLint({ cwd: ${s(repoRoot)}, overrideConfigFile: ${s(SDK_ENTRY)} });
+  try { await linter.lintText("export {};\\n"); console.log("PLANT Q4 linted"); } catch (error) { console.log("PLANT Q4 threw", String(error).slice(0, 300).replace(/\\n/g, " ")); }
+  console.log("PLANT Q4 globals", before, Object.keys(globalThis).slice(before).join(","));
+}, 60000);
+`,
+      js: `import { it } from "vitest";
+import { ESLint } from "eslint";
+it("Q4 eslint config loader", async () => {
+  const linter = new ESLint({ cwd: ${s(repoRoot)}, overrideConfigFile: ${s(SDK_ENTRY)} });
+  await linter.lintText("export {};\\n");
+}, 60000);
+`,
+      findings: ["<unpermitted:eslint>", literalFinding(SDK_ENTRY)],
+      computed: `import { ESLint } from "eslint";
+export const linter = new ESLint({ overrideConfigFile: ${parts(SDK_ENTRY)} });
+`,
+      computedFindings: ["<unpermitted:eslint>"],
+    },
+  ];
+}
+
+/**
+ * `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H1`): a literal OUTSIDE a load, in
+ * each form `module-loads.ts` reads, naming a forbidden target. Built from the
+ * vocabulary, so this file spells none. `jsx`: only the JSX grammars have it.
+ */
+function literalForms(): readonly { readonly label: string; readonly text: string; readonly finding: string; readonly jsx?: true }[] {
+  const s = (value: string): string => JSON.stringify(value);
+  const rest = ["packages", SECURE_DIRECTORY, "package.json"].join("/");
+  const hexViem = [...VIEM_NAME].map((c) => `\\x${c.charCodeAt(0).toString(16)}`).join("");
+  const percent = R2.anchor.replace(SECURE_DIRECTORY, named("polymarket-%73", "ecure"));
+  const backslashed = ["packages", SECURE_DIRECTORY, "package.json"].join("\\");
+  const bareEncoded = rest.replace(SECURE_DIRECTORY, named("polymarket-%73", "ecure"));
+  const scoped = VENUE_SDK.replace("/", "\\/");
+  return [
+    { label: "a string: the secure adapter's manifest, by absolute path", text: `export const anchor = ${s(R2.anchor)};\n`, finding: literalFinding(R2.anchor) },
+    { label: "a string: the venue SDK, by package name", text: `export const name = ${s(VENUE_SDK)};\n`, finding: literalFinding(VENUE_SDK) },
+    { label: "a string: a signing library's subpath", text: `export const name = ${s(`${VIEM_NAME}/accounts`)};\n`, finding: literalFinding(`${VIEM_NAME}/accounts`) },
+    { label: "a string: a path into node_modules", text: `export const p = ${s(`./${NODE_MODULES}/innocuous/index.js`)};\n`, finding: literalFinding(`./${NODE_MODULES}/innocuous/index.js`) },
+    { label: "a string, percent-encoded", text: `export const anchor = ${s(percent)};\n`, finding: literalFinding(percent) },
+    { label: "a string with backslash separators", text: `export const anchor = ${s(backslashed)};\n`, finding: literalFinding(backslashed) },
+    // Bare-form paths, read by no loader rule as a path: only the segments name the target.
+    { label: "a relative path without ./", text: `export const anchor = ${s(rest)};\n`, finding: literalFinding(rest) },
+    { label: "a relative path without ./, percent-encoded", text: `export const anchor = ${s(bareEncoded)};\n`, finding: literalFinding(bareEncoded) },
+    { label: "a template's text after a substitution", text: `export const anchor = (base) => \`\${base}/${rest}\`;\n`, finding: literalFinding(`/${rest}`) },
+    { label: "a template with no substitution", text: `export const name = \`${VENUE_SDK}\`;\n`, finding: literalFinding(VENUE_SDK) },
+    { label: "a template whose escapes evaluate to a name", text: `export const name = \`${hexViem}\`;\n`, finding: literalFinding(VIEM_NAME) },
+    // A Windows-style path: the evaluated text drops each backslash (`\p` is `p`), the RAW text keeps them.
+    { label: "String.raw: only the RAW text names it", text: `export const anchor = String.raw\`${backslashed}\`;\n`, finding: literalFinding(backslashed) },
+    { label: "a regular expression's body", text: `export const source = /${scoped}/.source;\n`, finding: literalFinding(scoped) },
+    { label: "a function's name", text: `export function ${VIEM_NAME}() { return 1; }\n`, finding: literalFinding(VIEM_NAME) },
+    { label: "an object key", text: `export const o = { ${ETHERS_NAME}: 1 };\n`, finding: literalFinding(ETHERS_NAME) },
+    { label: "a string key", text: `export const o = { ${s(VENUE_SDK)}: 1 };\n`, finding: literalFinding(VENUE_SDK) },
+    { label: "a private name", text: `export class C { #${WEB3_NAME} = 1; }\n`, finding: literalFinding(WEB3_NAME) },
+    { label: "JSX text", text: `export const e = <b>${VIEM_NAME}</b>;\n`, finding: literalFinding(VIEM_NAME), jsx: true },
+    { label: "a JSX attribute", text: `export const e = <b title=${s(VENUE_SDK)} />;\n`, finding: literalFinding(VENUE_SDK), jsx: true },
   ];
 }
 
@@ -647,8 +942,13 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       }
     }
     // A subpath is a load of the package.
-    const subpath = plantedSpellings("viem/accounts")[0]?.text ?? "";
-    expect(violationsIn(resolve(repoRoot, "planted.ts"), subpath)).toEqual(["planted.ts:1 import viem/accounts"]);
+    const subpath = plantedSpellings(`${VIEM_NAME}/accounts`)[0]?.text ?? "";
+    expect(violationsIn(resolve(repoRoot, "planted.ts"), subpath)).toEqual([`planted.ts:1 import ${VIEM_NAME}/accounts`]);
+    // `CONTROL-1b` r2: a load's specifier is judged ONCE, as a load — not again
+    // as a literal (`module-loads.ts`, "Every literal is read too").
+    expect(violationsIn(resolve(repoRoot, "planted.ts"), `declare module ${JSON.stringify(VIEM_NAME)} { export const z: number; }\n`)).toEqual([
+      `planted.ts:1 declare-module ${VIEM_NAME}`,
+    ]);
     // The verifiers' three round-2 plants, exactly as reported.
     const reported = [
       ["export * from // c\n", "'viem';"].join(""),
@@ -662,7 +962,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
 
   it("CONTROL-1b (R2-J-L1): a specifier the scan cannot read, a named loader or a parse error FAILS it", () => {
     const path = resolve(repoRoot, "test/integration/control-api/planted.ts");
-    for (const specifier of ["viem", "ethers", "@polymarket-bot/polymarket-secure"]) {
+    for (const specifier of [VIEM_NAME, ETHERS_NAME, SECURE_PACKAGE]) {
       for (const spelling of unreadableSpellings(specifier)) {
         const violations = violationsIn(path, spelling);
         expect(violations.length, spelling).toBeGreaterThan(0);
@@ -703,7 +1003,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     const plantFile = resolve(repoRoot, "test/integration/control-api/zz-review-plant.test.ts");
     const plants = [
       named('import * as secure from "../../../packages/polymarket-', 'secure/src/index.js";'),
-      named('import * as sdk from "../../../packages/polymarket-', 'secure/node_modules/@polymarket/client/dist/index.js";'),
+      named('import * as sdk from "../../../packages/polymarket-', "secure/node_", "modules/@polymarket", '/client/dist/index.js";'),
     ];
     for (const plant of plants) {
       expect(violationsIn(plantFile, plant), plant).toEqual([`test/integration/control-api/zz-review-plant.test.ts:1 import ${specifiersIn(plant, plantFile)[0] ?? ""}`]);
@@ -739,10 +1039,24 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       writeFileSync(join(directory, "store", named("eth", "ers"), "package.json"), JSON.stringify({ name: "plain" }), "utf8");
       symlinkSync(join(directory, "store", named("eth", "ers")), join(directory, "node_modules", "plain"));
       expect(judge("plain")).toBe("forbidden");
-      // Positive control: an innocuous package, installed as itself, is not.
+      // Positive control: an innocuous package, installed as itself, is not
+      // forbidden — and loads only where the bare-package list names it
+      // (`CONTROL-1b` r2, `CONTROL1B-R2-J-H2`).
       mkdirSync(join(directory, "node_modules", "harmless"), { recursive: true });
       writeFileSync(join(directory, "node_modules", "harmless", "package.json"), JSON.stringify({ name: "harmless" }), "utf8");
-      expect(judge("harmless")).toBe("ok");
+      const unlisted = judgeLoad({ kind: "import", specifier: "harmless", line: 1 }, importer, LANDING);
+      expect(unlisted.kind === "unreadable" ? unlisted.finding : unlisted.kind).toBe("<unpermitted:harmless>");
+      const listed: LandingContext = {
+        ...LANDING,
+        permittedBare: [{ specifier: "harmless", justification: "a synthetic entry exercising the bare-name judge itself" }],
+      };
+      expect(judgeLoad({ kind: "import", specifier: "harmless", line: 1 }, importer, listed).kind).toBe("ok");
+      // …and the list never excuses a forbidden landing.
+      const excused: LandingContext = {
+        ...LANDING,
+        permittedBare: [{ specifier: "innocuous", justification: "a synthetic entry that must not excuse a signer" }],
+      };
+      expect(judgeLoad({ kind: "import", specifier: "innocuous", line: 1 }, importer, excused).kind).toBe("forbidden");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -773,7 +1087,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
   });
 
   it("CONTROL-1b r1 (J-H3): an evaluator or loader reached WITHOUT the spelling round 0 watched fails, in every tree and every code extension", async () => {
-    const sdk = join(SECURE, "node_modules", "@polymarket", "client", "dist", "index.js");
+    const sdk = SDK_ENTRY;
     for (const tree of IMPORT_SCAN_TREES) {
       for (const extension of CODE_EXTENSIONS) {
         const importer = join(tree, `planted${extension}`);
@@ -788,6 +1102,176 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       }
       await yieldToLoop();
     }
+  });
+
+  it("CONTROL-1b r2 (J-H1): a literal OUTSIDE a load is judged by what it NAMES — every form, in every scanned tree and every code extension", async () => {
+    for (const tree of IMPORT_SCAN_TREES) {
+      for (const extension of CODE_EXTENSIONS) {
+        const importer = join(tree, `planted${extension}`);
+        const jsx = extension === ".tsx" || extension === ".jsx";
+        for (const form of literalForms()) {
+          if (form.jsx === true && !jsx) continue;
+          const violations = violationsIn(importer, form.text);
+          expect(violations, `${importer}: ${form.label}`).toEqual([`${relative(repoRoot, importer)} ${form.finding} x1 (not allowlisted)`]);
+        }
+      }
+      await yieldToLoop();
+    }
+    // A symbolic link: the literal names nothing forbidden, the place it reaches does.
+    const directory = mkdtempSync(join(tmpdir(), "control-1b-r2-literal-link-"));
+    try {
+      symlinkSync(SECURE, join(directory, "innocuous"));
+      const importer = join(directory, "planted.ts");
+      expect(violationsIn(importer, 'export const anchor = "./innocuous/package.json";\n')).toEqual([
+        `${relative(repoRoot, importer)} ${literalFinding("./innocuous/package.json")} x1 (not allowlisted)`,
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+    // JSON: a key and a value.
+    const json = resolve(repoRoot, "test/integration/control-api/planted.json");
+    expect(violationsIn(json, JSON.stringify({ anchor: R2.anchor, [VENUE_SDK]: 1 }))).toEqual([
+      `test/integration/control-api/planted.json ${literalFinding(R2.anchor)} x1 (not allowlisted)`,
+      `test/integration/control-api/planted.json ${literalFinding(VENUE_SDK)} x1 (not allowlisted)`,
+    ]);
+  });
+
+  it("CONTROL-1b r2 (J-H1, J-H2): the round-2 verifiers' five plants FAIL — verbatim, in every scanned tree and every code extension", async () => {
+    for (const tree of IMPORT_SCAN_TREES) {
+      for (const extension of CODE_EXTENSIONS) {
+        const importer = join(tree, `zz-rc-plant${extension}`);
+        const typed = [".ts", ".mts", ".cts", ".tsx"].includes(extension);
+        for (const plant of roundTwoPlants()) {
+          const text = typed ? plant.ts : plant.js;
+          const violations = violationsIn(importer, text);
+          // Read, not refused as unparseable: each finding is the plant's own.
+          expect(violations.some((violation) => violation.includes(UNPARSEABLE)), `${importer}: ${plant.label}`).toBe(false);
+          for (const finding of plant.findings) {
+            expect(
+              violations.some((violation) => violation.includes(` ${finding} `)),
+              `${importer}: ${plant.label}: ${finding} in ${JSON.stringify(violations)}`,
+            ).toBe(true);
+          }
+        }
+      }
+      await yieldToLoop();
+    }
+  });
+
+  it("CONTROL-1b r2 (J-H2): each mechanism ALONE — with every target computed, only real loader calls are loads and only listed bare packages load", () => {
+    const path = resolve(repoRoot, "test/integration/control-api/zz-rc-plant.ts");
+    for (const plant of roundTwoPlants()) {
+      if (plant.computed === undefined) continue;
+      const violations = violationsIn(path, plant.computed);
+      expect(violations.map((violation) => violation.split(" ")[1]).sort(), plant.label).toEqual(
+        [...(plant.computedFindings ?? [])].sort(),
+      );
+    }
+    // `.require` read off anything but `module`, or with other than one
+    // argument, is a NAMED loader — whoever permits the package it is on.
+    const typescriptAnywhere: LandingContext = {
+      ...LANDING,
+      permittedBare: [
+        ...PERMITTED_BARE_SPECIFIERS.filter((entry) => entry.specifier !== "typescript"),
+        { specifier: "typescript", justification: "a synthetic entry isolating the require rule" },
+      ],
+    };
+    const q1 = roundTwoPlants().find((plant) => plant.label.includes("Q1"))?.computed ?? "";
+    expect(violationsIn(path, q1, [], typescriptAnywhere)).toEqual([
+      `test/integration/control-api/zz-rc-plant.ts ${named("<loader:re", "quire>")} x1 (not allowlisted)`,
+    ]);
+    const req = named("re", "quire");
+    const kinds = (text: string): readonly string[] => moduleLoadsIn(text, path).map((load) => `${load.kind}|${load.specifier}`);
+    const loader = (name: string): string => `loader|${loaderFinding(name)}`;
+    expect(kinds(`${req}("zod");`)).toEqual([`${req}|zod`]);
+    expect(kinds(`module.${req}("zod");`)).toEqual([`${req}|zod`]);
+    expect(kinds(`module?.${req}?.("zod");`)).toEqual([`${req}|zod`]);
+    expect(kinds(`(module.${req})("zod");`)).toEqual([`${req}|zod`]);
+    expect(kinds(`${req}("zod", "extra");`)).toEqual([loader(req)]);
+    expect(kinds(`${req}();`)).toEqual([loader(req)]);
+    expect(kinds(`ts.sys.${req}("/base", "zod");`)).toEqual([loader(req)]);
+    expect(kinds(`registry.${req}("event", 1);`)).toEqual([loader(req)]);
+    expect(kinds(`globalThis.${req}("zod");`)).toEqual([loader(req)]);
+    const builtin = named("getBuiltin", "Module");
+    expect(kinds(`process.${builtin}("node:fs");`)).toEqual(["builtin|node:fs"]);
+    expect(kinds(`globalThis.process.${builtin}("node:fs");`)).toEqual([loader(builtin)]);
+    expect(kinds(`other.${builtin}("node:fs");`)).toEqual([loader(builtin)]);
+    expect(kinds(`process.${builtin}("node:fs", 1);`)).toEqual([loader(builtin)]);
+    const actual = named("import", "Actual");
+    expect(kinds(`await vi.${actual}("zod");`)).toEqual(["vi-load|zod"]);
+    expect(kinds(`await vitest.${actual}("zod");`)).toEqual(["vi-load|zod"]);
+    expect(kinds(`await other.${actual}("zod");`)).toEqual([loader(actual)]);
+    // A spy's own `mock` is not vitest's loader, called or read.
+    expect(kinds("spy.mock(1); export const n = spy.mock.calls.length;")).toEqual([]);
+  });
+
+  it("CONTROL-1b r2 (J-H2): the bare-package list is EXACT — every package and subpath the trees load, per file where narrow, and nothing else", () => {
+    const used = new Map<string, Set<string>>();
+    for (const path of scanClosure(IMPORT_SCAN_FILES).files) {
+      for (const load of scanFile(path).scanned.loads) {
+        const specifier = load.specifier;
+        const builtin = specifier.startsWith("node:") || (PERMITTED_BUILTINS as readonly string[]).includes(specifier);
+        if (builtin || specifier.startsWith("<") || specifier.startsWith(".") || specifier.startsWith("/")) continue;
+        const users = used.get(specifier) ?? new Set<string>();
+        users.add(relative(repoRoot, path));
+        used.set(specifier, users);
+      }
+    }
+    expect([...used.keys()].sort()).toEqual(PERMITTED_BARE_SPECIFIERS.map((entry) => entry.specifier).sort());
+    for (const entry of PERMITTED_BARE_SPECIFIERS) {
+      expect(entry.justification.length, entry.specifier).toBeGreaterThanOrEqual(40);
+      expect(isForbiddenName(entry.specifier), entry.specifier).toBe(false);
+      if (entry.files !== undefined) expect([...(used.get(entry.specifier) ?? [])].sort(), entry.specifier).toEqual([...entry.files].sort());
+    }
+    // A package — or a subpath — the list does not name fails, wherever it is installed.
+    const importer = resolve(repoRoot, "test/integration/control-api/planted.ts");
+    const findingOf = (specifier: string, from = importer): string => {
+      const verdict = judgeLoad({ kind: "import", specifier, line: 1 }, from, LANDING);
+      return verdict.kind === "unreadable" ? verdict.finding : verdict.kind;
+    };
+    for (const specifier of ["vitest/node", "vitest/execute", "eslint", "esbuild", "vite", "vite-node/client", "zod/v4", "typescript/lib/tsserverlibrary"]) {
+      expect(findingOf(specifier), specifier).toBe(`<unpermitted:${specifier}>`);
+    }
+    // …and a narrow entry holds outside its files.
+    expect(findingOf("typescript")).toBe("<unpermitted:typescript>");
+    expect(findingOf("typescript", resolve(repoRoot, "test/integration/control-api/support/module-loads.ts"))).toBe("ok");
+    expect(findingOf("vitest/config")).toBe("<unpermitted:vitest/config>");
+    expect(findingOf("vitest/config", resolve(repoRoot, "test/integration/control-api/vitest.config.ts"))).toBe("ok");
+  });
+
+  it("CONTROL-1b r2 (J-H1): the residual reads the same wherever it is stated — the README, this header, the scanner — and round 1's narrower wording is superseded", () => {
+    const normalized = (text: string): string =>
+      text
+        .replace(/^\s*\*\s?/gmu, "")
+        .replace(/\s+/gu, " ")
+        .toLowerCase();
+    const readme = read(resolve(repoRoot, "apps/control-api/README.md"));
+    const self = read(resolve(here, "acceptance-3-no-signer.test.ts"));
+    const header = self.slice(0, self.indexOf("\nimport {"));
+    const scanner = read(resolve(here, "support/module-loads.ts"));
+    for (const [name, text] of [
+      ["README", readme],
+      ["acceptance-3's header", header],
+      ["module-loads.ts", scanner],
+    ] as const) {
+      const said = normalized(text);
+      expect(said, name).toContain("whose loader the scan does not name");
+      expect(said, name).toContain("whose target no literal in the file names");
+      expect(said, name).toContain("another module exports");
+    }
+    // Where the guard does NOT run is said in the header and the README.
+    for (const [name, text] of [
+      ["README", readme],
+      ["acceptance-3's header", header],
+    ] as const) {
+      expect(normalized(text), name).toContain("test/vitest.config.ts");
+      expect(normalized(text), name).toContain("code read as text");
+      expect(normalized(text), name).toContain("thread or process");
+    }
+    // Round 1's sentence implied a literal path was ruled out: gone from the
+    // header, and marked superseded in the README's dated corrections.
+    expect(normalized(header)).not.toContain(normalized(named("A computed name that reaches a loader ", "with a computed path")));
+    expect(normalized(readme)).toContain(normalized("Superseded by the `CONTROL-1b` r2 correction above"));
   });
 
   it("CONTROL-1b r1 (J-H2): each extension is read with ITS grammar — JSX is code in .tsx and .jsx, and a syntax error in .ts", () => {
@@ -823,19 +1307,26 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     }
   });
 
-  it("CONTROL-1b: negative controls — permitted loads, and the words as data, comments or types, are not reported", () => {
+  it("CONTROL-1b: negative controls — permitted loads, and the words in comments, types or prose, are not reported", () => {
     const path = resolve(repoRoot, "test/integration/control-api/planted.ts");
     for (const spelling of plantedSpellings("@polymarket-bot/observability")) {
       expect(violationsIn(path, spelling.text), spelling.text).toEqual([]);
     }
+    // `CONTROL-1b` r2: a literal that IS a forbidden name, or names one as a
+    // path segment, is now a finding wherever it sits (the J-H1 literal pins
+    // below) — what stays clean is a comment, a type, a name inside prose, and
+    // an identifier that merely starts like one.
     for (const clean of [
-      'const words = ["viem", "ethers"]; // import "viem" in a comment\n',
+      'const words = ["the viem library", "ethereal", "@polymarket", "client"]; // import "viem" in a comment\n',
       '/* const m = require("viem"); */ export const required = true;\n',
       'const label = `import("viem")`;\nexport const t = label;\n',
+      'type Lib = "web3" | "@polymarket/client";\nexport type L = Lib;\n',
+      "export const viemClient = 1;\nexport const ethersLike = 2;\n",
+      'export const doc = "packages/observability/src/control";\n',
       "export function call(f: Function): unknown { return f; }\n",
       "type Ctor = typeof Function;\nexport type F = Ctor;\n",
       "interface Callable extends Function { readonly tag: string }\nexport type C = Callable;\n",
-      'export const options = { required: ["web3"] };\n',
+      'export const options = { required: ["observability"] };\n',
       'import { readFileSync } from "node:fs";\nimport { join } from "path";\nexport const r = [readFileSync, join];\n',
       'import { describe } from "vitest";\nimport { tmpdir } from "node:os";\nexport const d = [describe, tmpdir];\n',
       'import { serveControlApi } from "./support/client.js";\nexport const s = serveControlApi;\n',
@@ -844,11 +1335,11 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     ]) {
       expect(violationsIn(path, clean), clean).toEqual([]);
     }
-    expect(violationsIn(resolve(repoRoot, "planted.json"), '{ "import": "viem", "from": "ethers" }')).toEqual([]);
+    expect(violationsIn(resolve(repoRoot, "planted.json"), '{ "import": "the viem docs", "from": "ethereal" }')).toEqual([]);
   });
 
   it("CONTROL-1b: a planted load is caught in EVERY scanned tree, in a real file the walk reaches and in every extension", async () => {
-    const spellings = plantedSpellings("viem");
+    const spellings = plantedSpellings(VIEM_NAME);
     for (const tree of IMPORT_SCAN_TREES) {
       // The tree's own first file, as the walk found it, with a load appended
       // in memory — the trees are only READ (infra/** is outside the grant).
@@ -876,7 +1367,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
           expect(violationsIn(virtual, spelling.text).length, `${virtual}: ${spelling.text}`).toBeGreaterThan(0);
           if (extension === ".json") expect(loads).toEqual([UNPARSEABLE]);
           else if (!spelling.ts || [".ts", ".mts", ".cts", ".tsx"].includes(extension)) {
-            expect(loads, spelling.text).toContain("viem");
+            expect(loads, spelling.text).toContain(VIEM_NAME);
           }
         }
       }
@@ -925,11 +1416,16 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       expect(found.problems.filter((problem) => problem.includes("a symbolic link"))).toHaveLength(2);
       for (const path of [...found.code, ...found.json]) {
         if (path.endsWith("zz-recon-helper.tsx")) {
-          expect(violationsIn(path, read(path)), path).toEqual([`${relative(repoRoot, path)} <computed> x1 (not allowlisted)`]);
+          // Two reasons since `CONTROL-1b` r2: the computed import, and the
+          // literal naming the secure adapter's directory.
+          expect(violationsIn(path, read(path)), path).toEqual([
+            `${relative(repoRoot, path)} <computed> x1 (not allowlisted)`,
+            `${relative(repoRoot, path)} ${literalFinding(SECURE_DIRECTORY)} x1 (not allowlisted)`,
+          ]);
           continue;
         }
         expect(violationsIn(path, read(path)).length, path).toBe(1);
-        expect(specifiersIn(read(path), path), path).toEqual(path.endsWith(".json") ? [UNPARSEABLE] : ["ethers"]);
+        expect(specifiersIn(read(path), path), path).toEqual(path.endsWith(".json") ? [UNPARSEABLE] : [ETHERS_NAME]);
       }
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -939,6 +1435,10 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
   it("CONTROL-1b r1: the runners — every vitest config that runs these trees is a CLOSED world, and every alias lands where a load may", () => {
     for (const { file, config, runs } of CONFIGS) {
       expect(unjudgedConfigKeys(config), file).toEqual([]);
+      // `CONTROL-1b` r2: the two control-api runners install the run-time
+      // guard, both halves, exactly; the repository's unit runner — outside
+      // this grant — does not (the header's "What this does not prove").
+      expect(installsNoSignerGuard(config), file).toBe(runs !== undefined);
       if (runs !== undefined) {
         const include = ((config as { test?: { include?: unknown } }).test?.include ?? []) as readonly string[];
         expect(include.length, file).toBeGreaterThan(0);
@@ -953,9 +1453,31 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     // Positive controls: a setup file, a plugin, a custom environment — each named.
     expect(unjudgedConfigKeys({ plugins: [], test: { setupFiles: ["x"], environment: "x", include: [] } })).toEqual([
       "plugins",
-      "test.setupFiles",
       "test.environment",
+      "test.setupFiles",
     ]);
+    // `CONTROL-1b` r2: the guard's two values are admitted EXACTLY — not a
+    // second plugin or setup file beside them, nor a look-alike plugin.
+    const guard = noSignerVitePlugin();
+    expect(unjudgedConfigKeys({ plugins: [guard], test: { setupFiles: [NO_SIGNER_SETUP_FILE] } })).toEqual([]);
+    expect(installsNoSignerGuard({ plugins: [guard], test: { setupFiles: [NO_SIGNER_SETUP_FILE] } })).toBe(true);
+    for (const plugins of [[guard, { name: "other" }], [{ ...guard, load: (): undefined => undefined }], [{ ...guard, transform: noSignerLoad }], [{ name: NO_SIGNER_PLUGIN_NAME }]]) {
+      expect(unjudgedConfigKeys({ plugins }), JSON.stringify(plugins)).toEqual(["plugins"]);
+    }
+    for (const setupFiles of [[NO_SIGNER_SETUP_FILE, "x"], ["x"], [`${NO_SIGNER_SETUP_FILE}?x`]]) {
+      expect(unjudgedConfigKeys({ test: { setupFiles } }), setupFiles.join()).toEqual(["test.setupFiles"]);
+    }
+    // A hook vite would read but `Object.keys` would not: non-enumerable, or inherited.
+    const hidden = noSignerVitePlugin();
+    Object.defineProperty(hidden, "transform", { value: noSignerLoad, enumerable: false });
+    const inherited = Object.assign(Object.create({ transform: noSignerLoad }) as object, noSignerVitePlugin());
+    for (const plugins of [[hidden], [inherited]]) {
+      expect(unjudgedConfigKeys({ plugins })).toEqual(["plugins"]);
+    }
+    const sneaky = Object.create({ setupFiles: ["x"] }) as object;
+    expect(unjudgedConfigKeys({ test: sneaky })).toEqual(["test.<prototype>", "test.setupFiles"]);
+    expect(installsNoSignerGuard({ plugins: [guard] })).toBe(false);
+    expect(installsNoSignerGuard({ test: { setupFiles: [NO_SIGNER_SETUP_FILE] } })).toBe(false);
     // …and an alias that maps an innocuous name onto the secure adapter is FORBIDDEN.
     const planted: LandingContext = {
       repoRoot,
@@ -996,10 +1518,10 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
 
   it("CONTROL-1b r1: no workspace package a load LANDS in declares a forbidden dependency, at any depth", () => {
     const workspaces = WORKSPACES;
-    expect(workspaces.get("@polymarket-bot/polymarket-secure")).toBe(SECURE);
+    expect(workspaces.get(SECURE_PACKAGE)).toBe(SECURE);
     const reached = new Set<string>();
     for (const path of IMPORT_SCAN_FILES) {
-      for (const load of moduleLoadsIn(read(path), path)) {
+      for (const load of scanFile(path).scanned.loads) {
         const verdict = judgeLoad(load, path, LANDING);
         if (verdict.kind !== "ok") continue;
         for (const landing of verdict.landings) {
@@ -1054,10 +1576,10 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       devDependencies?: Record<string, string>;
     };
     const declared = Object.keys({ ...manifest.dependencies, ...manifest.devDependencies });
-    expect(declared).not.toContain("@polymarket-bot/polymarket-secure");
+    expect(declared).not.toContain(SECURE_PACKAGE);
     for (const name of declared) {
       expect(name.toLowerCase(), `${name} looks like a signing dependency`).not.toMatch(
-        /ethers|viem|web3|signer|wallet/u,
+        new RegExp([ETHERS_NAME, VIEM_NAME, WEB3_NAME, "signer", "wallet"].join("|"), "u"),
       );
     }
     // The observability package declares no runtime dependency at all.

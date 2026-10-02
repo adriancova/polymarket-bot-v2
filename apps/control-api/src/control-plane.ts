@@ -29,7 +29,12 @@
  * refused BEFORE it reached a mutation method — at the transport, the route
  * parameter or the body door — which `api.ts` records through
  * {@link ControlPlane.refuseRequest} once authentication and the route's
- * authorization have passed (`CONTROL-1` r1, closing `CONTROL1-J-M2`). A caller
+ * authorization have passed (`CONTROL-1` r1, closing `CONTROL1-J-M2`). ONE
+ * refusal of such a caller writes nothing: the GATED refusal ("One unsettled
+ * protected append per state key", below), which offers no record because an
+ * earlier record of the same switch or instance is still in flight
+ * (`README.md`, "What writes NOTHING", item 7; `CONTROL-1b` r2, closing
+ * `CONTROL1B-R2-J-L1`). A caller
  * with NO mutation authority writes nothing here at all (`CONTROL-1`, closing
  * `WP-240` r1 M-3): an unauthenticated request never reaches this class, an
  * unauthorized one is refused before it, and a READ-only operator's mode-raise
