@@ -18,7 +18,7 @@
  * | The literal | Judged by |
  * | --- | --- |
  * | `node:x`, or a bare `x` that names a builtin | {@link PERMITTED_BUILTINS} — any other builtin (`node:vm`, `node:module`, `node:child_process`, `node:worker_threads`, …) is UNREADABLE: it exists to load or run code the scan cannot see |
- * | `./…`, `../…`, `/…` | the path it reaches, read BOTH as the CommonJS loader reads it (a literal path) and as the ES loader reads it (a URL: `%2e`, `%70` decoded), each through every symbolic link (`realpath`) |
+ * | `./…`, `../…`, `/…` | the path it reaches, read BOTH as the CommonJS loader reads it (a literal path) and as the ES loader reads it (a URL: `%2e`, `%70` decoded), each through every symbolic link (`realpath`); one through `/proc` or `/dev` is UNREADABLE (`CONTROL-1b` r3: it lands in a different file for each process) |
  * | `file:…` | the path the URL names, the same way |
  * | `data:`, `http:`, any other scheme, `#imports`, a backslash | UNREADABLE |
  * | a bare package name | the name itself; then EVERY place it can land — each alias of a vitest config that runs a scanned tree, and the package `node_modules` resolution reaches from the importing file, through its symbolic link to its real directory and its `package.json` name. A name neither places is UNREADABLE, and so is a name — package AND subpath — that {@link PERMITTED_BARE_SPECIFIERS} does not list for the importing file (`CONTROL-1b` r2: `vitest/node` and `eslint` are innocuous names whose APIs load any file they are given, and the round-2 verifiers loaded the secure adapter and the venue SDK through each) |
@@ -37,7 +37,12 @@
  * the grammars `module-loads.ts` has), JSON, or one of the INERT kinds below —
  * and anything else FAILS, as does a symbolic link or a `node_modules`
  * directory inside a scanned tree. Round 0 filtered by extension, so a `.tsx`
- * file was never opened.
+ * file was never opened. Since `CONTROL-1b` r3 (`CONTROL1B-R3-J-H1`) an inert
+ * kind is admitted only in a tree that holds no code — `infra/grafana` — and
+ * FAILS in any other: the CommonJS loader runs a `.md` file as JavaScript, and
+ * the round-3 verifiers loaded the venue SDK through one, so a file no scan
+ * reads may not sit beside the code that could load it, whether the path to it
+ * is a literal or is computed.
  *
  * ## Every other literal (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1`)
  *
@@ -49,8 +54,39 @@
  * be FORBIDDEN by the rules above, or when its segments — split on `/` and
  * `\`, as written and percent-decoded — name the secure adapter's directory or
  * a forbidden package. An identifier fails only when it IS a forbidden name.
- * What remains is a target computed at run time — `module-loads.ts`, "What a
- * static scan cannot see".
+ *
+ * ## A literal PATH is judged where it lands (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`)
+ *
+ * Round 2 asked of a literal only whether it was FORBIDDEN. The round-3
+ * verifiers reached `createRequire` without spelling it and handed it a
+ * literal path to a file the scan never reads — an inert `.md` in a scanned
+ * tree, which the CommonJS loader runs as JavaScript, and a `.cjs` outside
+ * every scanned tree — each of which held a `require` of the venue SDK; it
+ * loaded in the repository's unit runner with acceptance 3 green. So every
+ * literal with a PATH form (`./`, `../`, `.`, `..`, `/`, `file:`), and every
+ * quoted string inside a literal that has one (code text an evaluator could
+ * run, its escapes decoded), is resolved the way a loader handed it resolves
+ * it ({@link pathReadings}): a relative path against the literal's own file's
+ * directory — where `createRequire(import.meta.url)`, `import()` and vitest's
+ * loaders resolve it — as written and percent-decoded, its query dropped; an
+ * absolute path as itself and under the repository root, which is vite's root
+ * in every runner of these trees (vite reads `/x` against its root first, and
+ * `/@fs/x` as `/x`); a `file:` URL as its path. A path through `/proc` or
+ * `/dev` — itself or by a symbolic link — is `<lands:…>` outright: it names a
+ * different file in each process (`/proc/self/cwd` is the reader's working
+ * directory), so where the runner would land is not where the scan looks.
+ * Every EXISTING file a resolver can take there ({@link filesAt}: the path,
+ * the path with ANY extension added — CommonJS also tries one a program
+ * registers at run time — TypeScript's source for a `.js` name, a directory's
+ * manifest entries and its `index`) is then judged like a load's landing:
+ * FORBIDDEN as above (on its real path too); `<lands:…>` when it is not a file
+ * this scan reads as code or JSON (inert files included: the CommonJS loader
+ * runs any file as JavaScript); otherwise a landing — which
+ * `acceptance-3-no-signer.test.ts` scans in turn when it lies outside every
+ * scanned tree and every workspace package, as it does for a load's.
+ * A path that reaches no existing file reaches nothing a loader could take
+ * when the scan runs. What remains is in `module-loads.ts`, "What a static
+ * scan cannot see".
  *
  * ## What else decides what a worker loads
  *
@@ -67,8 +103,8 @@
  *   following workspace dependencies to any depth.
  */
 
-import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -175,7 +211,12 @@ export const PERMITTED_BARE_SPECIFIERS: readonly PermittedBare[] = Object.freeze
   ].map((specifier) => ({ specifier, justification: WORKSPACE_JUSTIFICATION })),
 ]);
 
-/** Files a scanned tree may hold that no loader runs unless a load names them — and a load naming one fails. */
+/**
+ * Files a scanned tree that holds no code (`infra/grafana`) may hold: no loader
+ * runs one unless a load or a literal path names it — and either fails
+ * (`<target:…>`, `<lands:…>`). Since `CONTROL-1b` r3 a tree that holds code may
+ * hold none ({@link discover}).
+ */
 export const INERT_EXTENSIONS = [".md"] as const;
 export const INERT_BASENAMES = [".gitkeep"] as const;
 
@@ -238,11 +279,54 @@ function segmentsOf(path: string, repoRoot: string): readonly string[] {
 }
 
 /**
+ * The trees whose paths name a different file in each process that reads them
+ * (`/proc/self/cwd` is that process's working directory; `/dev/fd/3` its open
+ * file): where a path through one lands, the scan cannot say (`CONTROL-1b` r3).
+ */
+export const PROCESS_DEPENDENT_ROOTS: readonly string[] = Object.freeze(["/proc", "/dev"]);
+
+function underProcessDependentRoot(path: string): boolean {
+  return PROCESS_DEPENDENT_ROOTS.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+/**
+ * Whether the absolute `path` — or a symbolic link on the way to it, followed
+ * one component at a time — passes through {@link PROCESS_DEPENDENT_ROOTS}. A
+ * real path cannot show it: `realpath` of `/proc/self/cwd` is the CALLER's
+ * working directory, which is not the runner's that would load it.
+ */
+export function reachesProcessDependent(path: string): boolean {
+  let pending = path.split("/").filter((segment) => segment !== "");
+  let current = "/";
+  for (let links = 0; pending.length > 0; ) {
+    const segment = pending.shift() ?? "";
+    const next = segment === ".." ? dirname(current) : segment === "." ? current : join(current, segment);
+    if (underProcessDependentRoot(next)) return true;
+    let target: string | undefined;
+    try {
+      if (lstatSync(next).isSymbolicLink()) target = resolve(current, readlinkSync(next));
+    } catch {
+      // Absent from here on: the rest of the path is read as written.
+    }
+    if (target === undefined) {
+      current = next;
+      continue;
+    }
+    links += 1;
+    if (links > 40 || underProcessDependentRoot(target)) return true;
+    pending = [...target.split("/").filter((part) => part !== ""), ...pending];
+    current = "/";
+  }
+  return false;
+}
+
+/**
  * Judges the files a path-form load can reach: FORBIDDEN through
  * `node_modules`, or through a path naming a signing package or the secure
  * adapter's directory (`packages/polymarket-secure` itself is one) — on the
- * path as spelled and on its real path; then UNREADABLE when the file is not
- * one the scan reads.
+ * path as spelled and on its real path; then UNREADABLE when it passes through
+ * a process-dependent tree (`CONTROL-1b` r3), or when the file is not one the
+ * scan reads.
  */
 export function judgePaths(candidates: readonly string[], specifier: string, context: LandingContext): Verdict {
   for (const candidate of candidates) {
@@ -254,6 +338,14 @@ export function judgePaths(candidates: readonly string[], specifier: string, con
       if (namesForbiddenSegments(segments)) {
         return forbidden(`${specifier} reaches the secure adapter or a signing package (${path})`);
       }
+    }
+  }
+  for (const candidate of candidates) {
+    if (reachesProcessDependent(candidate)) {
+      return unreadable(
+        `<target:${specifier}>`,
+        `${specifier} passes through ${PROCESS_DEPENDENT_ROOTS.join(" or ")}: where it lands depends on the process that loads it`,
+      );
     }
   }
   for (const candidate of candidates) {
@@ -396,28 +488,264 @@ export function judgeLoad(load: ModuleLoad, importer: string, context: LandingCo
 /** Verdicts by literal, per context and importing directory: one file's literals are judged many times. */
 const LITERAL_VERDICTS = new WeakMap<LandingContext, Map<string, Verdict>>();
 
+function verdictCache(context: LandingContext): Map<string, Verdict> {
+  let verdicts = LITERAL_VERDICTS.get(context);
+  if (verdicts === undefined) {
+    verdicts = new Map();
+    LITERAL_VERDICTS.set(context, verdicts);
+  }
+  return verdicts;
+}
+
 /**
- * Why `literal` — one a scanned file holds OUTSIDE a load (`module-loads.ts`,
- * "Every literal is read too") — names a forbidden target, or `undefined`
- * (module header, "Every other literal"). `CONTROL-1b` r2, closing
- * `CONTROL1B-R2-J-H1`:
+ * TypeScript's source for a compiled name, which vite resolves too: `./x.js`
+ * is `./x.ts`. (The extensions a resolver ADDS to a path that names no file —
+ * CommonJS `.js`, `.json`, `.node`; vite `.mjs`, `.js`, `.mts`, `.ts`, `.jsx`,
+ * `.tsx`, `.json` — need no list: {@link filesAt} takes every extension, since
+ * CommonJS also tries one a program registers at run time.)
+ */
+const SOURCE_SWAPS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  ".js": [".ts", ".tsx"],
+  ".mjs": [".mts"],
+  ".cjs": [".cts"],
+  ".jsx": [".tsx"],
+});
+
+/** The `package.json` fields a resolver takes a directory's entry from: CommonJS `main`; vite `exports`, `module`, `browser`. */
+export const MANIFEST_ENTRY_FIELDS: readonly string[] = Object.freeze(["main", "module", "browser", "exports"]);
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Every string a directory's manifest names as an entry, at any depth of the fields a resolver reads. */
+function manifestEntries(directory: string): readonly string[] {
+  const manifest = join(directory, "package.json");
+  if (!isFile(manifest)) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(manifest, "utf8"));
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  const leaves = (value: unknown): void => {
+    if (typeof value === "string") out.push(value);
+    else if (typeof value === "object" && value !== null) for (const entry of Object.values(value)) leaves(entry);
+  };
+  for (const field of MANIFEST_ENTRY_FIELDS) leaves((parsed as Record<string, unknown> | null)?.[field]);
+  return out;
+}
+
+/** `stem` itself when it is a file, and every file beside it named `<stem>.<any extension>`. */
+function filesNamed(stem: string): readonly string[] {
+  const out: string[] = [];
+  if (isFile(stem)) out.push(stem);
+  const directory = dirname(stem);
+  const name = basename(stem);
+  if (name === "" || directory === stem) return out;
+  let entries: readonly string[];
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.startsWith(`${name}.`) && isFile(join(directory, entry))) out.push(join(directory, entry));
+  }
+  return out;
+}
+
+/**
+ * Every EXISTING file a resolver handed `path` can load (module header, "A
+ * literal PATH is judged where it lands"): the path itself; the path with ANY
+ * extension added (CommonJS tries `.js`, `.json`, `.node` and any extension a
+ * program registers at run time; vite its own list); TypeScript's source for a
+ * compiled name; and, when the path is a directory, its `index` with any
+ * extension and each entry its manifest names (read the same way, one level
+ * deep). A directory itself is not a file: what loads from it is.
+ */
+export function filesAt(path: string, depth = 0): readonly string[] {
+  const out: string[] = [...filesNamed(path)];
+  const extension = extname(path);
+  for (const swap of SOURCE_SWAPS[extension] ?? []) {
+    const source = `${path.slice(0, -extension.length)}${swap}`;
+    if (isFile(source)) out.push(source);
+  }
+  if (isDirectory(path)) {
+    out.push(...filesNamed(join(path, "index")));
+    if (depth === 0) for (const entry of manifestEntries(path)) out.push(...filesAt(resolve(path, entry), depth + 1));
+  }
+  return [...new Set(out)];
+}
+
+/** Whether `text` has a PATH form a loader reads as a path, not as a package name. */
+export function hasPathForm(text: string): boolean {
+  return (
+    text === "." ||
+    text === ".." ||
+    text.startsWith("./") ||
+    text.startsWith("../") ||
+    text.startsWith("/") ||
+    /^file:/iu.test(text)
+  );
+}
+
+/** One JavaScript string's escapes, resolved: `\x2e`, `\u002e`, `\u{2e}`, the single-character escapes, line continuations. */
+export function decodeEscapes(text: string): string {
+  const single: Readonly<Record<string, string>> = { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "0": "\0" };
+  return text.replace(
+    /\\(?:x([0-9A-Fa-f]{2})|u\{([0-9A-Fa-f]{1,6})\}|u([0-9A-Fa-f]{4})|(\r\n|[\s\S]))/gu,
+    (_match, hex?: string, braced?: string, unicode?: string, other?: string): string => {
+      const code = hex ?? braced ?? unicode;
+      if (code !== undefined) {
+        const point = Number.parseInt(code, 16);
+        return point <= 0x10ffff ? String.fromCodePoint(point) : "";
+      }
+      if (other === "\n" || other === "\r" || other === "\r\n" || other === "\u2028" || other === "\u2029") return "";
+      return single[other ?? ""] ?? other ?? "";
+    },
+  );
+}
+
+/**
+ * Every string QUOTED inside `text` — from each `'`, `"` or backtick to the next
+ * unescaped one of the same kind, so a stray apostrophe cannot hide one — with
+ * its escapes decoded, and those quoted inside it in turn (module header: code
+ * text an evaluator could run names its loads this way).
+ */
+export function quotedStrings(text: string, depth = 0): readonly string[] {
+  if (depth > 4) return [];
+  const out = new Set<string>();
+  for (let open = 0; open < text.length; open += 1) {
+    const quote = text[open];
+    if (quote !== "'" && quote !== '"' && quote !== "`") continue;
+    let close = open + 1;
+    while (close < text.length && text[close] !== quote) close += text[close] === "\\" ? 2 : 1;
+    if (close >= text.length) continue;
+    const inner = decodeEscapes(text.slice(open + 1, close));
+    if (inner === "") continue;
+    out.add(inner);
+    for (const nested of quotedStrings(inner, depth + 1)) out.add(nested);
+  }
+  return [...out];
+}
+
+/**
+ * Where a loader handed the path-form `text` from `importer` looks (module
+ * header): relative to `importer`'s directory, or — absolute — as itself and
+ * under the repository root (vite's root), with vite's `/@fs/` prefix dropped
+ * too; each as written, with its query or hash dropped, and percent-decoded; a
+ * `file:` URL as the path it names.
+ */
+export function pathReadings(text: string, importer: string, context: LandingContext): readonly string[] {
+  if (/^file:/iu.test(text)) {
+    try {
+      return [fileURLToPath(new URL(text))];
+    } catch {
+      return [];
+    }
+  }
+  const forms = new Set<string>([text, text.replace(/[?#].*$/su, "")]);
+  for (const form of [...forms]) {
+    try {
+      forms.add(decodeURIComponent(form));
+    } catch {
+      // Not percent-encoded: read as written only.
+    }
+  }
+  for (const form of [...forms]) if (form.startsWith("/@fs/")) forms.add(form.slice("/@fs".length));
+  const out = new Set<string>();
+  for (const form of forms) {
+    if (form === "" || form.includes("\0")) continue;
+    if (isAbsolute(form)) {
+      out.add(resolve(form));
+      out.add(join(context.repoRoot, form));
+    } else {
+      out.add(resolve(dirname(importer), form));
+    }
+  }
+  return [...out];
+}
+
+/** The finding a literal path that lands on a file this scan does not read produces: `<lands:"./notes.md">`. */
+export function landsFinding(text: string): string {
+  return `<lands:${JSON.stringify(text.slice(0, 160))}>`;
+}
+
+/** The verdict on one path-form string `importer` holds (module header, "A literal PATH is judged where it lands"). */
+function judgePathLiteral(text: string, importer: string, context: LandingContext): Verdict {
+  const verdicts = verdictCache(context);
+  const key = `path\0${dirname(importer)}\0${text}`;
+  const cached = verdicts.get(key);
+  if (cached !== undefined) return cached;
+  const verdict = ((): Verdict => {
+    const readings = pathReadings(text, importer, context);
+    const files = readings.flatMap((reading) => filesAt(reading));
+    for (const path of [...readings, ...files]) {
+      for (const candidate of [path, realpathThrough(path)]) {
+        const segments = segmentsOf(candidate, context.repoRoot);
+        if (segments.includes("node_modules") || namesForbiddenSegments(segments)) {
+          return forbidden(`${text} reaches the secure adapter, a signing package or node_modules (${candidate})`);
+        }
+      }
+    }
+    for (const reading of readings) {
+      if (reachesProcessDependent(reading)) {
+        return unreadable(landsFinding(text), `${text} passes through ${PROCESS_DEPENDENT_ROOTS.join(" or ")}: where it lands depends on the process`);
+      }
+    }
+    for (const file of files) {
+      const extension = extname(file);
+      if (!(CODE_EXTENSIONS as readonly string[]).includes(extension) && extension !== ".json") {
+        return unreadable(landsFinding(text), `${text} reaches ${file}, which is not a file this scan reads as code or JSON`);
+      }
+    }
+    return ok(files.map(realpathThrough));
+  })();
+  verdicts.set(key, verdict);
+  return verdict;
+}
+
+/**
+ * The verdict on `literal` — one a scanned file holds OUTSIDE a load
+ * (`module-loads.ts`, "Every literal is read too"). `CONTROL-1b` r2, closing
+ * `CONTROL1B-R2-J-H1` (module header, "Every other literal"):
  *
- * - an IDENTIFIER fails when it IS a forbidden package's name (`viem`), since
- *   `Function.prototype.name` and `Object.keys` make it a string;
- * - any other literal fails when its segments — split on `/` and `\`, as
- *   written and percent-decoded — name the secure adapter's directory or a
+ * - an IDENTIFIER is FORBIDDEN when it IS a forbidden package's name (`viem`),
+ *   since `Function.prototype.name` and `Object.keys` make it a string;
+ * - any other literal is FORBIDDEN when its segments — split on `/` and `\`,
+ *   as written and percent-decoded — name the secure adapter's directory or a
  *   forbidden package, or when it would be FORBIDDEN as a load from the same
  *   file: a forbidden name or subpath, a path that reaches the secure adapter
  *   (through a symbolic link too) or passes through `node_modules`, a bare
  *   name installed as a signing package.
  *
- * Whether it would be UNREADABLE as a load is not asked: a literal outside a
- * load loads nothing by itself, and most literals are no specifier at all.
+ * `CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1` (module header, "A literal PATH
+ * is judged where it lands"): the literal, and each string quoted inside it,
+ * that has a path form is then judged where it LANDS — FORBIDDEN, or
+ * UNREADABLE as `<lands:…>` when an existing file a resolver can take there is
+ * not code or JSON; otherwise its `landings` are the code and JSON files it
+ * reaches, for the caller to scan in turn. Whether the literal as a whole would
+ * be UNREADABLE as a load is still not asked: most literals are no specifier at
+ * all, and a path that reaches no file loads nothing.
  */
-export function judgeLiteral(literal: SourceLiteral, importer: string, context: LandingContext): string | undefined {
+export function judgeLiteral(literal: SourceLiteral, importer: string, context: LandingContext): Verdict {
   const text = literal.text;
   if (literal.kind === "identifier") {
-    return namesForbiddenSegments([text]) ? `the name ${text} is a forbidden package's` : undefined;
+    return namesForbiddenSegments([text]) ? forbidden(`the name ${text} is a forbidden package's`) : ok([]);
   }
   const readings = [text];
   try {
@@ -428,21 +756,29 @@ export function judgeLiteral(literal: SourceLiteral, importer: string, context: 
   }
   for (const reading of readings) {
     if (namesForbiddenSegments(segmentsOfText(reading))) {
-      return `its segments name the secure adapter or a signing package (${reading.slice(0, 120)})`;
+      return forbidden(`its segments name the secure adapter or a signing package (${reading.slice(0, 120)})`);
     }
   }
-  let verdicts = LITERAL_VERDICTS.get(context);
-  if (verdicts === undefined) {
-    verdicts = new Map();
-    LITERAL_VERDICTS.set(context, verdicts);
-  }
+  const verdicts = verdictCache(context);
   const key = `${dirname(importer)}\0${text}`;
-  let verdict = verdicts.get(key);
-  if (verdict === undefined) {
-    verdict = judgeLoad({ kind: "import", specifier: text, line: literal.line }, importer, context);
-    verdicts.set(key, verdict);
+  let asLoad = verdicts.get(key);
+  if (asLoad === undefined) {
+    asLoad = judgeLoad({ kind: "import", specifier: text, line: literal.line }, importer, context);
+    verdicts.set(key, asLoad);
   }
-  return verdict.kind === "forbidden" ? verdict.why : undefined;
+  if (asLoad.kind === "forbidden") return asLoad;
+  const landings: string[] = [];
+  let lands: Verdict | undefined;
+  // Each string quoted inside the literal — and inside its percent-decoded
+  // reading, as a `data:` URL holds code — is code text an evaluator could run.
+  const quoted = new Set([text, ...readings.flatMap((reading) => quotedStrings(reading))]);
+  for (const path of [...quoted].filter(hasPathForm)) {
+    const verdict = judgePathLiteral(path, importer, context);
+    if (verdict.kind === "forbidden") return verdict;
+    if (verdict.kind === "unreadable") lands ??= verdict;
+    else landings.push(...verdict.landings);
+  }
+  return lands ?? ok(landings);
 }
 
 /** The finding a literal naming a forbidden target produces: `<names:"viem">`. */
@@ -460,8 +796,13 @@ export interface Discovery {
   readonly problems: readonly string[];
 }
 
-/** Every entry of `tree`, classified (module header, "Discovery is total"). */
-export function discover(tree: string): Discovery {
+/**
+ * Every entry of `tree`, classified (module header, "Discovery is total").
+ * `admitsInert`: whether the tree may hold the inert kinds at all — only a
+ * tree that holds no code may (`CONTROL-1b` r3); in any other an inert file
+ * is a problem.
+ */
+export function discover(tree: string, admitsInert = true): Discovery {
   const code: string[] = [];
   const json: string[] = [];
   const inert: string[] = [];
@@ -483,7 +824,12 @@ export function discover(tree: string): Discovery {
         (INERT_EXTENSIONS as readonly string[]).includes(extname(entry)) ||
         (INERT_BASENAMES as readonly string[]).includes(basename(entry))
       ) {
-        inert.push(path);
+        if (admitsInert) inert.push(path);
+        else {
+          problems.push(
+            `${path}: an inert kind in a tree that holds code (the CommonJS loader runs any file as JavaScript, and no scan reads this one)`,
+          );
+        }
       } else {
         problems.push(`${path}: a file the scan cannot classify (not code, JSON, or an inert kind)`);
       }

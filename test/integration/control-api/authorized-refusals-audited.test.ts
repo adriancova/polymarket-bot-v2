@@ -44,7 +44,9 @@ import type { AuditAppendResult, ControlAuditRecord, InMemoryControlAuditLog } f
 
 import { serveControlApi, type CallOptions, type ServedApi } from "./support/client.js";
 
-const README = resolve(dirname(fileURLToPath(import.meta.url)), "../../../apps/control-api/README.md");
+// Read as TEXT, and spelled as `example-config-and-startup.test.ts` spells it
+// (`CONTROL-1b` r3: a literal PATH to a file acceptance 3 does not read as code fails it).
+const README = resolve(dirname(fileURLToPath(import.meta.url)), "../../..", "apps/control-api/README.md");
 
 const STRATEGIST_TOKEN = "fake-paper-strategist-token-not-a-credential-r1-0003";
 

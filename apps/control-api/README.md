@@ -411,7 +411,9 @@ had walked past (`CONTROL1-R2-J-L1`):
   or an inert kind (`.md`, `.gitkeep`), a symbolic link, or a `node_modules`
   directory fails (`CONTROL-1b` r1, closing `CONTROL1B-R1-J-H2`: `.tsx` and
   `.jsx` files were never opened, and a computed import in a `.tsx` helper
-  loaded the secure adapter);
+  loaded the secure adapter) — and since `CONTROL-1b` r3 an inert kind is
+  admitted only in `infra/grafana`, the one scanned tree that holds no code:
+  the CommonJS loader runs a `.md` file as JavaScript;
 - each literal is judged by WHERE IT LANDS (`support/load-judge.ts`;
   `CONTROL-1b` r1, closing `CONTROL1B-R1-J-H1`): a relative, absolute or
   `file:` path by the file it reaches — read both as the CommonJS loader reads
@@ -439,6 +441,26 @@ had walked past (`CONTROL1-R2-J-L1`):
   `.join("")`, or `Function` found by enumerating the function prototype) and
   handed it a LITERAL path or package name, which round 1 never judged because
   it was not in a load position;
+- every literal PATH — a literal with a path form (`./`, `../`, `.`, `..`,
+  `/`, `file:`), and every path quoted inside a literal (code text an
+  evaluator could run, its escapes decoded) — is judged where a loader handed
+  it would LAND (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`): resolved
+  against its own file's directory, as `createRequire(import.meta.url)`,
+  `import()` and vitest's loaders resolve it — and, when absolute, as itself
+  and under the repository root, as vite reads `/x` (and `/@fs/x`) — as
+  written and percent-decoded; a path through `/proc` or `/dev` fails outright
+  (as a load, `<target:…>`, too: `/proc/self/cwd` is a different directory in
+  each runner); then every EXISTING file a resolver can take there (the path,
+  the path with ANY extension added — CommonJS tries one a program registers
+  at run time — TypeScript's source for a `.js` name, a directory's manifest
+  entries and `index`) must be code or JSON, or the literal fails as
+  `<lands:…>`, and the code it reaches outside every scanned tree is scanned
+  in turn, exactly as a load's is. Round 2 asked of such a literal only
+  whether it NAMED a forbidden target: the round-3 verifiers handed a
+  computed `createRequire` the literal paths `./zz-r3-notes.md` (an inert
+  file beside the test) and `../../zz-r3-outside.cjs` (code outside every
+  tree), each holding one `require` of the venue SDK, which loaded in the
+  repository's unit runner with this acceptance green;
 - whatever it cannot read FAILS: a computed specifier, a named loader or
   evaluator — `require` aliased, `createRequire`, `eval`, `Module._load`,
   `_compile`, `_extensions` (since r2), `dlopen`, `process.binding`,
@@ -458,20 +480,27 @@ had walked past (`CONTROL1-R2-J-L1`):
   that run these trees are a closed world (no setup file, plugin or custom
   environment but the run-time guard's, exactly) whose aliases are judged like
   any path, this package's scripts
-  are pinned exactly, and the bundle's tsconfig maps no name; a load that lands
-  on a file outside every scanned tree and every workspace package (a fixture
-  under `test/`, the repository's unit runner config) is scanned in turn; and
-  no workspace package a load lands in declares a forbidden dependency, at any
+  are pinned exactly, and the bundle's tsconfig maps no name; a load or a
+  literal path that lands on a file outside every scanned tree and every
+  workspace package (a fixture under `test/`, the repository's unit runner
+  config) is scanned in turn — and, since `CONTROL-1b` r3, so is one that lands
+  in a workspace package where `check:deps` reads nothing (a dot-directory,
+  `dist/` and the rest of its skipped directories); and no workspace package a
+  load or a literal path lands in declares a forbidden dependency, at any
   depth — its own source is `check:deps`'s (F6, F16);
 - planted controls cover every spelling and path form the verifiers used, each
   escape and comment form, each literal form, the round-2 verifiers' five plants
-  verbatim, each scanned tree and each code extension.
+  verbatim, each scanned tree and each code extension — and the round-3
+  verifiers' two plants verbatim, ON DISK in a mirror of each scanned tree, in
+  each code extension, beside the same plant aimed at an innocuous file.
 
 **The run-time guard (`CONTROL-1b` r2).** A static scan cannot rule out a load
-whose loader it does not name AND whose target is computed at run time. So the
-control API's two integration runners (`test:integration` and
-`test:integration:postgres`) install `test/integration/control-api/support/no-signer-guard.ts`,
-which refuses the LANDING itself, however it was spelled:
+whose loader it does not name AND whose target it does not reach from a
+literal (the residual below). So the control API's two integration runners
+(`test:integration` and `test:integration:postgres`) install
+`test/integration/control-api/support/no-signer-guard.ts`, which refuses the
+LANDING itself — a file that lies in the secure adapter or under a forbidden
+package's directory — whatever loader reached it:
 
 - a `module.registerHooks` `load` hook (the runner's one setup file) runs for
   every module loaded in the test worker's thread — through `require`,
@@ -485,7 +514,53 @@ which refuses the LANDING itself, however it was spelled:
 
 `no-signer-runtime-guard.test.ts` pins both halves in each runner, with loads
 written exactly as the static scan cannot read them; each of the five round-2
-plants is refused by it too.
+plants, and the round-3 routes, are refused by it too. It judges where a file
+LIES, not what it holds.
+
+**Dated correction (`CONTROL-1b` r3, 2026-10-01).** Round 2 below stated the
+static residual as a load whose loader the scan does not name AND "whose
+target no literal in the file names", and the guard as refusing a forbidden
+file "however it was spelled". Both were wrong. The round-3 verifiers reached
+`createRequire` by computed names and handed it a LITERAL path to an inert
+`.md` beside the test and to a `.cjs` outside every scanned tree, each holding
+a `require` of the venue SDK: the SDK loaded in the repository's unit runner
+with this acceptance green (`CONTROL1B-R3-J-H1`). And a COPY of the SDK's files
+at a path naming nothing forbidden loaded with the guard installed
+(`CONTROL1B-R3-J-L1`). The literal-path form now fails, above. What remains,
+stated rather than claimed away:
+
+- **statically:** a load whose loader the scan does not NAME — reached by a
+  computed key, by enumeration, by spreading an object that holds one, or
+  through a method of a permitted package other than those named above — AND
+  whose target the scan does not reach from a literal: a path or name computed
+  at run time (from parts, by slicing, from encoded data or from the
+  program's own text); a literal joined at run time to a base the program
+  supplies (`join(root, "x")`, a `createRequire` anchor other than the file's
+  own, a URL base) — the scan resolves a literal path only against its own
+  file's directory and, when absolute, the repository root; a value another
+  module exports; or a file that does not exist when the scan runs (one a
+  test writes, and then loads);
+- **at run time, in the two integration runners:** a COPY or hard link of a
+  forbidden file at a path that names nothing forbidden (the guard judges
+  where a file lies, not what it holds); code read as TEXT and handed to an
+  evaluator (or to a load hook a test registers); a module graph a test
+  builds itself (its Node-loaded dependencies ARE guarded); another THREAD or
+  process (the hook is thread-local, so a `worker_threads` Worker loads
+  without it); Node's loader internals called directly
+  (`Module._extensions[…]`, which runs no hook; the scan refuses the name);
+  and a builtin reached through `process.getBuiltinModule`, which resolves
+  nothing;
+- **the repository unit runner** (`test/vitest.config.ts`, `WP-010`-owned and
+  outside `CONTROL-1b`'s grant) runs `src/**/*.test.ts` and
+  `test/unit/control-api/**` WITHOUT the guard: there the static residual
+  above stands alone, and a load in it — an unnamed loader handed a path
+  computed at run time or joined to a base, a value another module exports, a
+  file written at run time — really loads what it reaches;
+- as before: a test that OVERWRITES an existing file at run time and then
+  loads it (the scan read the earlier text; the guard still refuses what it
+  would load, in the integration runners), the deeper dependencies of
+  third-party packages, and runner flags outside this package (CI's
+  environment, `NODE_OPTIONS`).
 
 **Dated correction (`CONTROL-1b` r2, 2026-10-01).** Round 1 below said what
 remained beyond the scan was "a loader reached through a COMPUTED property name
@@ -518,6 +593,11 @@ now, stated rather than claimed away:
   would load, in the integration runners), the deeper dependencies of
   third-party packages, and runner flags outside this package (CI's
   environment, `NODE_OPTIONS`).
+
+(Superseded by the `CONTROL-1b` r3 correction above: the static residual's
+second half was stated too narrowly — a computed loader with a LITERAL path to
+a file the scan did not read loaded the venue SDK — and the run-time list
+omitted a copy or hard link.)
 
 **Dated correction (`CONTROL-1b` r1, 2026-10-01).** Round 0 said that "behind
 the scan, none of the forbidden packages even RESOLVES from a scanned tree, so

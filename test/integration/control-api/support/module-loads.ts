@@ -109,18 +109,29 @@
  * Comments are not read: code reaching one goes through `toString` and a
  * slice, which is a computed value.
  *
+ * Since `CONTROL-1b` r3 (closing `CONTROL1B-R3-J-H1`) a literal with a PATH
+ * form — and a path quoted inside one — is also judged where a loader handed it
+ * would LAND (`load-judge.ts`, "A literal PATH is judged where it lands"): the
+ * round-3 verifiers handed a computed `createRequire` a literal path to an
+ * inert `.md` and to a `.cjs` outside every tree, and each loaded the venue SDK.
+ *
  * ## What a static scan cannot see
  *
  * A load whose loader the scan does not name — reached by a COMPUTED key
  * (`globalThis[atob("…")]`), by enumeration, by spreading an object that holds
  * one, or through an API of a permitted package other than those named above
- * — AND whose target no literal in the file names: a path or name computed at
- * run time (from parts, by slicing, from encoded data or from the program's
- * own text), or a value another module exports. That is beyond any static
- * scan, and this one does not claim it. The control API's integration
- * runners close it at RUN time (`no-signer-guard.ts`), and
- * `acceptance-3-no-signer.test.ts` ("What this does not prove") states where
- * they do not.
+ * — AND whose target the scan does not reach from a literal: a path or name
+ * computed at run time (from parts, by slicing, from encoded data or from the
+ * program's own text); a literal joined at run time to a base the program
+ * supplies (`join(root, "x")`, a `createRequire` anchor other than the file's
+ * own, a URL base), since the scan resolves a literal path only against its
+ * own file's directory and, when absolute, the repository root; a value
+ * another module exports; or a file that does not exist when the scan runs
+ * (one a test writes, and then loads). That is beyond any static scan, and
+ * this one does not claim it. The control API's integration runners close it
+ * at RUN time (`no-signer-guard.ts`), and `acceptance-3-no-signer.test.ts`
+ * ("What this does not prove") states where they do not — the repository's
+ * unit runner among them.
  */
 
 import ts from "typescript";

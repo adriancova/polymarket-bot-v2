@@ -15,7 +15,10 @@
  * loads, and only listed bare packages may be loaded at all; and the two
  * control-api integration runners refuse a forbidden landing at RUN time
  * (`CONTROL-1b` r2, closing `CONTROL1B-R2-J-H1` and `-J-H2`;
- * `support/no-signer-guard.ts`). This is the
+ * `support/no-signer-guard.ts`). A literal PATH is judged where a loader
+ * handed it would land, and the code it lands on outside every tree is
+ * scanned in turn; and a tree that holds code may hold no file the scan does
+ * not read (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`). This is the
  * `apps/trader` precedent
  * (`test/integration/paper-trader/compose-and-example-config.test.ts`'s scans),
  * applied to a package whose §4.1 description is literally "never has the
@@ -38,25 +41,33 @@
  * 3. **No manifest dependency** on `packages/polymarket-secure`, and no
  *    credential-shaped value in the shipped example configuration.
  *
- * ## What this does not prove (`CONTROL-1b` r2)
+ * ## What this does not prove (`CONTROL-1b` r3)
  *
  * - **Statically:** a load whose loader the scan does not NAME — reached by a
  *   computed key, by enumeration, by spreading an object that holds one, or
  *   through a method of a permitted package other than those
- *   `support/module-loads.ts` names — AND whose target no literal in the file
- *   names: a path or package computed at run time (from parts, by slicing,
- *   from encoded data or from the program's own text) or a value another
- *   module exports. Round 1 said only "a computed name with a computed path"
- *   remained, which implied a LITERAL path was ruled out; it was not — the
- *   round-2 verifiers loaded the venue SDK through a computed loader and a
- *   literal path that the scan never judged (`CONTROL1B-R2-J-H1`), and
- *   through `ts.sys.require`, `vitest/node` and ESLint (`CONTROL1B-R2-J-H2`).
- *   Each of those plants fails below.
+ *   `support/module-loads.ts` names — AND whose target the scan does not reach
+ *   from a literal: a path or package computed at run time (from parts, by
+ *   slicing, from encoded data or from the program's own text); a literal
+ *   joined at run time to a base the program supplies (`join(root, "x")`, a
+ *   `createRequire` anchor other than the file's own, a URL base) — a literal
+ *   path is resolved only against its own file's directory and, when
+ *   absolute, the repository root; a value another module exports; or a file
+ *   that does not exist when the scan runs (one a test writes, then loads).
+ *   Round 2 stated the second half as a target "no literal in the file
+ *   names", and it was wrong: the round-3 verifiers handed a computed loader a
+ *   LITERAL path to an inert `.md` and to a `.cjs` outside every tree, each of
+ *   which required the venue SDK, and round 2 asked of such a literal only
+ *   whether it named a forbidden target (`CONTROL1B-R3-J-H1`). Round 1's "a
+ *   computed name with a computed path" was narrower still (`CONTROL1B-R2-J-H1`
+ *   and `-J-H2`). Each of those plants fails below.
  * - **At run time** the guard (`support/no-signer-guard.ts`) refuses, in the
  *   two control-api integration runners, every module Node loads in the test
- *   worker's thread and every module vitest loads for it that lands in the
- *   secure adapter or a forbidden package, however it was spelled
- *   (`no-signer-runtime-guard.test.ts` in each runner). It does NOT see code
+ *   worker's thread and every module vitest loads for it that LIES in the
+ *   secure adapter or under a forbidden package's directory, whatever loader
+ *   reached it (`no-signer-runtime-guard.test.ts` in each runner). It judges
+ *   where a file lies, not what it holds, so it does NOT see a copy or hard
+ *   link of a forbidden file at a path that names nothing forbidden; nor code
  *   read as text and evaluated; a module graph a test builds itself (whose
  *   Node-loaded dependencies it does see); another thread or process (its hook
  *   is thread-local, so a `worker_threads` Worker loads without it); Node's
@@ -65,7 +76,8 @@
  *   resolves nothing. And it does not run under the repository's unit runner,
  *   `test/vitest.config.ts` (`WP-010`-owned, outside `CONTROL-1b`'s grant),
  *   which runs `apps/control-api/src/**` and `test/unit/control-api/**`: there
- *   the static scan stands alone, with the residual above.
+ *   the static scan stands alone, and a load in its residual above really
+ *   loads what it reaches.
  * - Code a test WRITES at run time over a file that already exists, and then
  *   loads, is not read: the scan read the file's earlier text. (A load of a
  *   file that does not exist when the scan runs fails, and in the integration
@@ -84,6 +96,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -103,6 +116,7 @@ import {
   FORBIDDEN_PACKAGES,
   PERMITTED_BARE_SPECIFIERS,
   PERMITTED_BUILTINS,
+  PROCESS_DEPENDENT_ROOTS,
   SECURE_DIRECTORY,
   aliasesOf,
   discover,
@@ -112,10 +126,12 @@ import {
   judgeLiteral,
   judgeLoad,
   judgePaths,
+  landsFinding,
   literalFinding,
   unjudgedConfigKeys,
   workspacePackageOf,
   type LandingContext,
+  type Verdict,
 } from "./support/load-judge.js";
 import {
   CODE_EXTENSIONS,
@@ -171,8 +187,20 @@ const IMPORT_SCAN_TREES = [
   resolve(repoRoot, "infra/grafana"),
 ];
 
+/**
+ * The one scanned tree that holds no code, and so the only one that may hold an
+ * inert file (`CONTROL-1b` r3, closing `CONTROL1B-R3-J-H1`: the CommonJS loader
+ * runs a `.md` file as JavaScript, and the round-3 verifiers loaded the venue
+ * SDK through one beside a test).
+ */
+const INERT_TREES = [resolve(repoRoot, "infra/grafana")];
+
+/** `directory` — the tree itself, or a mirror of it — classified under `tree`'s policy for inert files. */
+const discoverTree = (tree: string, directory = tree): ReturnType<typeof discover> =>
+  discover(directory, INERT_TREES.includes(tree));
+
 /** Every entry of every scanned tree, classified (`support/load-judge.ts`, "Discovery is total"). */
-const DISCOVERED = new Map(IMPORT_SCAN_TREES.map((tree) => [tree, discover(tree)] as const));
+const DISCOVERED = new Map(IMPORT_SCAN_TREES.map((tree) => [tree, discoverTree(tree)] as const));
 const scannedIn = (tree: string): readonly string[] => {
   const found = DISCOVERED.get(tree);
   return found === undefined ? [] : [...found.code, ...found.json];
@@ -253,6 +281,8 @@ function fileOnDisk(landing: string): string | undefined {
  * forbidden target, and every literal naming one is now a finding — so each
  * entry of its list is one, once; and the run-time guard's Node half reads
  * `registerHooks` from `node:module`, a builtin the scan otherwise refuses.
+ * `CONTROL-1b` r3: `support/load-judge.ts` names the process-dependent trees
+ * (`/proc`, `/dev`) a literal path through which fails, each once.
  * Every other scanned file needs no entry.
  */
 interface LoadAllowlistEntry {
@@ -284,6 +314,16 @@ const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([
     finding: literalFinding(name),
     count: 1,
     justification: TARGET_VOCABULARY,
+  })),
+  // `CONTROL-1b` r3: the judge names the process-dependent trees it refuses a
+  // path through, each once.
+  ...PROCESS_DEPENDENT_ROOTS.map((root) => ({
+    file: "test/integration/control-api/support/load-judge.ts",
+    finding: landsFinding(root),
+    count: 1,
+    justification:
+      "support/load-judge.ts lists the process-dependent trees (/proc, /dev) it REFUSES a path through; the list " +
+      "is read by the judge only, and nothing loads it",
   })),
   {
     file: "test/integration/control-api/support/no-signer-setup.ts",
@@ -340,9 +380,12 @@ function violationsIn(
     }
   }
   // `CONTROL-1b` r2 (closing `CONTROL1B-R2-J-H1`): every OTHER literal, by
-  // what it names — a loader the scan cannot see could be handed it.
+  // what it names — a loader the scan cannot see could be handed it; and
+  // since r3 (closing `CONTROL1B-R3-J-H1`), a literal PATH by where it lands.
   for (const literal of scanned.literals) {
-    if (judgeLiteral(literal, path, context) !== undefined) count(literalFinding(literal.text));
+    const verdict = judgeLiteral(literal, path, context);
+    if (verdict.kind === "forbidden") count(literalFinding(literal.text));
+    else if (verdict.kind === "unreadable") count(verdict.finding);
   }
   const entries = allowlist.filter((entry) => entry.file === file);
   for (const [finding, count] of unreadable) {
@@ -359,6 +402,29 @@ function violationsIn(
 }
 
 /**
+ * The directories `check:deps` never reads inside a workspace package
+ * (`tools/check-dependency-direction.mjs`, `SKIPPED_DIRS` — and, there too,
+ * every directory whose name begins with a dot). Pinned against the tool's own
+ * text below.
+ */
+const DEPENDENCY_CHECK_SKIPS = ["node_modules", "dist", "build", "coverage", "python", "target", "out"] as const;
+
+/**
+ * Whether `file`, inside the workspace package `workspace`, is one `check:deps`
+ * reads — source of an extension it parses, under no directory it skips — or
+ * JSON, which loads nothing (`CONTROL-1b` r3).
+ */
+function readByDependencyCheck(file: string, workspace: string): boolean {
+  const extension = extname(file);
+  if (extension === ".json") return true;
+  if (!(CODE_EXTENSIONS as readonly string[]).includes(extension)) return false;
+  const directories = relative(workspace, file).split("/").slice(0, -1);
+  return directories.every(
+    (directory) => !directory.startsWith(".") && !(DEPENDENCY_CHECK_SKIPS as readonly string[]).includes(directory),
+  );
+}
+
+/**
  * Scans `entries` and, in turn, every file a load of theirs LANDS on outside
  * every scanned tree and every workspace package (`CONTROL-1b` r1): such a
  * file — `test/vitest.config.ts`, or a fixture under `test/` — runs its own
@@ -367,16 +433,36 @@ function violationsIn(
  * package's manifest (the dependency-closure test below) and by `check:deps`,
  * which scans every workspace package's source (F6: the venue SDK only in
  * `packages/polymarket-secure`; F16: no relative import leaving a package).
+ *
+ * `CONTROL-1b` r3 (closing `CONTROL1B-R3-J-H1`): the same holds for every file
+ * a LITERAL path lands on (`load-judge.ts`, `judgeLiteral`) — a loader the
+ * scan does not name can be handed it, and the round-3 verifiers' `.cjs`
+ * outside every tree held a `require` of the venue SDK; and a landing inside a
+ * workspace package that `check:deps` does NOT read (under `dist/`, a
+ * dot-directory and the rest of {@link DEPENDENCY_CHECK_SKIPS}) is scanned in
+ * turn too.
  */
 function scanClosure(
   entries: readonly string[],
   context: LandingContext = LANDING,
+  workspaces: ReadonlyMap<string, string> = WORKSPACES,
 ): { readonly files: readonly string[]; readonly violations: readonly string[]; readonly loads: number } {
   const files: string[] = [];
   const violations: string[] = [];
   const seen = new Set(entries);
   const queue = [...entries];
   let loads = 0;
+  const follow = (landings: readonly string[]): void => {
+    for (const landing of landings) {
+      const file = fileOnDisk(landing);
+      if (file === undefined || seen.has(file)) continue;
+      if (IMPORT_SCAN_TREES.some((tree) => file.startsWith(`${tree}/`))) continue;
+      const workspace = [...workspaces.values()].find((directory) => file.startsWith(`${directory}/`));
+      if (workspace !== undefined && readByDependencyCheck(file, workspace)) continue;
+      seen.add(file);
+      queue.push(file);
+    }
+  };
   for (let path = queue.shift(); path !== undefined; path = queue.shift()) {
     files.push(path);
     const { text, scanned } = scanFile(path);
@@ -384,18 +470,36 @@ function scanClosure(
     for (const load of scanned.loads) {
       loads += 1;
       const verdict = judgeLoad(load, path, context);
-      if (verdict.kind !== "ok") continue;
-      for (const landing of verdict.landings) {
-        const file = fileOnDisk(landing);
-        if (file === undefined || seen.has(file)) continue;
-        if (IMPORT_SCAN_TREES.some((tree) => file.startsWith(`${tree}/`))) continue;
-        if ([...WORKSPACES.values()].some((directory) => file.startsWith(`${directory}/`))) continue;
-        seen.add(file);
-        queue.push(file);
-      }
+      if (verdict.kind === "ok") follow(verdict.landings);
+    }
+    for (const literal of scanned.literals) {
+      const verdict = judgeLiteral(literal, path, context);
+      if (verdict.kind === "ok") follow(verdict.landings);
     }
   }
   return { files, violations, loads };
+}
+
+/**
+ * The workspace packages a load — or, since `CONTROL-1b` r3, a literal path —
+ * of `files` lands in: each runs its own imports, which its manifest's
+ * dependency closure must keep clear of every forbidden package.
+ */
+function reachedWorkspaces(files: readonly string[], context: LandingContext = LANDING): ReadonlySet<string> {
+  const reached = new Set<string>();
+  const reach = (verdict: Verdict): void => {
+    if (verdict.kind !== "ok") return;
+    for (const landing of verdict.landings) {
+      const owner = workspacePackageOf(landing, context.repoRoot);
+      if (owner !== undefined) reached.add(owner);
+    }
+  };
+  for (const path of files) {
+    const { scanned } = scanFile(path);
+    for (const load of scanned.loads) reach(judgeLoad(load, path, context));
+    for (const literal of scanned.literals) reach(judgeLiteral(literal, path, context));
+  }
+  return reached;
 }
 
 /** The specifiers `text` loads, as `path`'s grammar reads them. */
@@ -536,6 +640,8 @@ function landingSpellings(importer: string): readonly { readonly label: string; 
     { label: "a native addon", specifier: "./addon.node", expect: "unreadable" },
     { label: "an extensionless target", specifier: "./helper", expect: "unreadable" },
     { label: "a bare name nothing resolves", specifier: "not-an-installed-package", expect: "unreadable" },
+    // `CONTROL-1b` r3: /proc/self/cwd is the LOADER's working directory — another file in each runner.
+    { label: "a process-dependent path", specifier: ["", "pr" + "oc", "self", "cwd", "test", "zz.cjs"].join("/"), expect: "unreadable" },
     ...[
       "node:child_process",
       "child_process",
@@ -798,6 +904,115 @@ export const linter = new ESLint({ overrideConfigFile: ${parts(SDK_ENTRY)} });
       computedFindings: ["<unpermitted:eslint>"],
     },
   ];
+}
+
+/**
+ * `CONTROL-1b` r3 (closing `CONTROL1B-R3-J-H1`): the round-3 verifiers' two
+ * plants (`reconcile-r3`; `fable-r3-evidence/plants-r3/`). Each reached
+ * `createRequire` without spelling it — `getBuiltinModule` and `createRequire`
+ * built with `.join("")`, as astra's round-2 plant did — and handed it a
+ * LITERAL path to a file no scan read, which held one `require` of the venue
+ * SDK: an inert `.md` beside the test, and a `.cjs` outside every scanned tree.
+ * Both LOADED the SDK in the repository's unit runner with acceptance 3 green.
+ * `ts` is each test file verbatim but for the target it is aimed at (so the
+ * same plant can be aimed at an innocuous file); `js` the same, types
+ * stripped. Their targets are written at run time ({@link withMirror}).
+ */
+function roundThreePlant(title: string, tag: string, target: string): { readonly ts: string; readonly js: string } {
+  return {
+    ts: `import { it } from "vitest";
+
+const word = (...parts: readonly string[]): string => parts.join("");
+
+it(${JSON.stringify(title)}, () => {
+  const getBuiltin = (process as unknown as Record<string, (name: string) => unknown>)[word("get", "Builtin", "Module")];
+  const api = getBuiltin?.(word("node:", "mod", "ule")) as Record<string, unknown>;
+  const make = api[word("create", "Require")] as (anchor: string) => (specifier: string) => unknown;
+  const m = make(import.meta.url)(${JSON.stringify(target)}) as Record<string, unknown>;
+  console.log("PLANT ${tag} LOADED", Object.keys(m).length, "SigningError", "SigningError" in m);
+});
+`,
+    js: `import { it } from "vitest";
+
+const word = (...parts) => parts.join("");
+
+it(${JSON.stringify(title)}, () => {
+  const getBuiltin = process[word("get", "Builtin", "Module")];
+  const api = getBuiltin?.(word("node:", "mod", "ule"));
+  const make = api[word("create", "Require")];
+  const m = make(import.meta.url)(${JSON.stringify(target)});
+  console.log("PLANT ${tag} LOADED", Object.keys(m).length, "SigningError", "SigningError" in m);
+});
+`,
+  };
+}
+
+const ROUND_THREE_PLANTS = [
+  {
+    label: "R3 md: an inert .md beside the test",
+    stem: "zz-r3-md",
+    title: "R3 md: an unnamed loader handed a LITERAL path to an inert file",
+    tag: "R3MD",
+    target: "./zz-r3-notes.md",
+    innocuous: "./zz-r3-innocuous.cjs",
+  },
+  {
+    label: "R3 outside: a .cjs outside every scanned tree",
+    stem: "zz-r3-out",
+    title: "R3 outside: an unnamed loader handed a LITERAL path to code outside every scanned tree",
+    tag: "R3OUT",
+    target: "../../zz-r3-outside.cjs",
+    innocuous: "../../zz-r3-innocuous-outside.cjs",
+  },
+] as const;
+
+interface Mirror {
+  /** The mirror's root: a scratch directory laid out like the repository, holding none of its files. */
+  readonly root: string;
+  /** The landing context with the mirror as the repository root (vite's root). */
+  readonly context: LandingContext;
+  /** `tree`'s place in the mirror. */
+  readonly at: (tree: string) => string;
+  /** Writes `text` to `file`, creating its directories; returns `file`. */
+  readonly write: (file: string, text: string) => string;
+  /** One `require` of the venue SDK's entry, by the PATH the plants used, relative to `file`'s directory. */
+  readonly requireSdk: (file: string) => string;
+  /** That path. */
+  readonly sdkFrom: (file: string) => string;
+}
+
+/**
+ * Runs `body` in a scratch MIRROR of the repository's layout (`CONTROL-1b`
+ * r3), so a plant's targets can exist on disk — the judge asks what a loader
+ * would find there — without writing into a scanned tree (`infra/**` is
+ * outside this grant, and the trees are only ever READ here). Bare packages
+ * resolve from it as from the checkout.
+ */
+async function withMirror(body: (mirror: Mirror) => Promise<void> | void): Promise<void> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "control-1b-r3-mirror-")));
+  try {
+    symlinkSync(join(repoRoot, NODE_MODULES), join(root, NODE_MODULES));
+    const sdk = join(root, "packages", SECURE_DIRECTORY, NODE_MODULES, ...VENUE_SDK.split("/"), "dist", "index.js");
+    const pathTo = (from: string): string => {
+      const path = relative(from, sdk);
+      return path.startsWith(".") ? path : `./${path}`;
+    };
+    const write = (file: string, text: string): string => {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, text, "utf8");
+      return file;
+    };
+    await body({
+      root,
+      context: { ...LANDING, repoRoot: root },
+      at: (tree) => join(root, relative(repoRoot, tree)),
+      write,
+      requireSdk: (file) => `module.exports = require(${JSON.stringify(pathTo(dirname(file)))});\n`,
+      sdkFrom: (file) => pathTo(dirname(file)),
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -1158,6 +1373,185 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     }
   });
 
+  it("CONTROL-1b r3 (J-H1): the round-3 verifiers' two plants FAIL — on disk in a mirror of every scanned tree, in every code extension — and the same plant aimed at an innocuous file passes", async () => {
+    await withMirror(async ({ context, at, write, requireSdk, sdkFrom }) => {
+      for (const tree of IMPORT_SCAN_TREES) {
+        const directory = at(tree);
+        for (const plant of ROUND_THREE_PLANTS) {
+          const target = write(resolve(directory, plant.target), requireSdk(resolve(directory, plant.target)));
+          const innocuous = write(resolve(directory, plant.innocuous), "module.exports = { innocuous: 1 };\n");
+          for (const extension of CODE_EXTENSIONS) {
+            const typed = [".ts", ".mts", ".cts", ".tsx"].includes(extension);
+            const aimed = roundThreePlant(plant.title, plant.tag, plant.target);
+            const file = write(join(directory, `${plant.stem}${extension}`), typed ? aimed.ts : aimed.js);
+            const closure = scanClosure([file], context);
+            const label = `${relative(context.repoRoot, file)}: ${plant.label}`;
+            expect(closure.violations.some((violation) => violation.includes(UNPARSEABLE)), label).toBe(false);
+            if (plant.target.endsWith(".md")) {
+              // (a) A literal path that lands on a file no scan reads as code fails.
+              expect(closure.violations, label).toEqual([`${relative(repoRoot, file)} ${landsFinding(plant.target)} x1 (not allowlisted)`]);
+            } else {
+              // (b) A literal path that lands on code outside every tree is scanned in turn.
+              expect(closure.files, label).toContain(target);
+              expect(closure.violations, label).toEqual([
+                `${relative(repoRoot, target)}:1 ${named("re", "quire")} ${sdkFrom(target)}`,
+              ]);
+            }
+            // The same plant aimed at an innocuous file: the route alone is not what fails.
+            const control = roundThreePlant(plant.title, plant.tag, plant.innocuous);
+            const controlFile = write(join(directory, `${plant.stem}-control${extension}`), typed ? control.ts : control.js);
+            const controlClosure = scanClosure([controlFile], context);
+            expect(controlClosure.violations, `${label} (aimed at ${plant.innocuous})`).toEqual([]);
+            if (!plant.target.endsWith(".md")) expect(controlClosure.files, label).toContain(innocuous);
+          }
+        }
+        // The .md itself fails discovery wherever code is: a tree that holds
+        // code may hold no file the scan does not read (the inert kinds stay
+        // only in infra/grafana, which holds none).
+        const notes = resolve(directory, ROUND_THREE_PLANTS[0].target);
+        const admits = relative(repoRoot, tree) === "infra/grafana";
+        expect(discoverTree(tree, directory).problems.some((problem) => problem.startsWith(`${notes}:`)), tree).toBe(!admits);
+        expect(discover(directory, true).inert, tree).toContain(notes);
+        await yieldToLoop();
+      }
+    });
+  });
+
+  it("CONTROL-1b r3 (J-H1): a literal PATH is judged where a loader handed it would LAND — every route a resolver takes, on disk in a mirror", async () => {
+    await withMirror(({ root, context, at, write, requireSdk }) => {
+      const here = at(resolve(repoRoot, "test/unit/control-api"));
+      const outside = join(root, "test");
+      const sdkTarget = (file: string): string => write(file, requireSdk(file));
+      // Targets that are not code — the CommonJS loader runs each as JavaScript.
+      sdkTarget(join(here, "notes.md"));
+      sdkTarget(join(here, "blob"));
+      write(join(here, "addon.node"), "");
+      sdkTarget(join(outside, "registered.zz"));
+      // A link to the READER's working directory: where it lands differs per process.
+      const procSelf = ["", "pr" + "oc", "self", "cwd"].join("/");
+      symlinkSync(procSelf, join(outside, "cwdlink"));
+      // Code outside every tree, each holding a require of the venue SDK.
+      const cjs = sdkTarget(join(outside, "outside.cjs"));
+      const probed = sdkTarget(join(outside, "probed.js"));
+      const main = sdkTarget(join(outside, "pkgdir", "lib", "entry.js"));
+      write(join(outside, "pkgdir", "package.json"), JSON.stringify({ main: "lib/entry" }));
+      const index = sdkTarget(join(outside, "idxdir", "index.js"));
+      const exported = sdkTarget(join(outside, "expdir", "entry.cjs"));
+      write(join(outside, "expdir", "package.json"), JSON.stringify({ exports: { ".": { default: "./entry.cjs" } } }));
+      const source = sdkTarget(join(outside, "tsdir", "source.ts"));
+      // A directory whose manifest entry is a LINK into the secure adapter: the path names nothing, the file it takes does.
+      const secureLeaf = write(join(root, "packages", SECURE_DIRECTORY, "src", "leaf.js"), "module.exports = { leaf: 1 };\n");
+      mkdirSync(join(outside, "fwd"), { recursive: true });
+      symlinkSync(secureLeaf, join(outside, "fwd", "entry.js"));
+      write(join(outside, "fwd", "package.json"), JSON.stringify({ main: "entry.js" }));
+      // Clean code, inside the tree and outside it.
+      write(join(here, "clean.ts"), "export const innocuous = 1;\n");
+      const clean = write(join(outside, "clean.cjs"), "module.exports = { innocuous: 1 };\n");
+
+      const backslash = "\\";
+      let n = 0;
+      const plant = (literal: string, extension = ".ts"): string => {
+        n += 1;
+        return write(join(here, `planted-${String(n)}${extension}`), extension === ".json" ? `{ "entry": ${literal} }\n` : `export const p = ${literal};\n`);
+      };
+      const s = JSON.stringify;
+      // (a) a literal path that lands on a file no scan reads as code or JSON.
+      for (const text of [
+        "./notes.md",
+        "./notes.md?raw",
+        "./blob",
+        "./addon.node",
+        "./addon",
+        // Any extension: CommonJS tries one a program registers at run time.
+        "./notes",
+        "../../registered",
+        // Through /proc, directly or by a link: each runner reads its own working directory there.
+        `${procSelf}/test/outside.cjs`,
+        "../../cwdlink/test/outside.cjs",
+      ]) {
+        const file = plant(s(text));
+        expect(scanClosure([file], context).violations, text).toEqual([`${relative(repoRoot, file)} ${landsFinding(text)} x1 (not allowlisted)`]);
+      }
+      // (b) a literal path that lands on code outside every tree — by any
+      // route a resolver takes — is scanned in turn, and its require fails.
+      const routes: readonly (readonly [string, string, string?])[] = [
+        ["code outside every tree", s("../../outside.cjs")],
+        ["an extension CommonJS and vite try", s("../../probed"), probed],
+        ["a directory's manifest main", s("../../pkgdir"), main],
+        ["a directory's index", s("../../idxdir"), index],
+        ["a directory's manifest exports", s("../../expdir"), exported],
+        ["TypeScript's source for a .js name", s("../../tsdir/source.js"), source],
+        ["an absolute path", s(cjs)],
+        ["root-relative, as vite reads /x", s("/test/outside.cjs")],
+        ["vite's /@fs/ prefix", s(`/@fs${cjs}`)],
+        ["a file: URL", s(pathToFileURL(cjs).href)],
+        ["percent-encoded", s("../../%6Futside.cjs")],
+        ["a template", "`../../outside.cjs`"],
+        // Code TEXT an evaluator could run: each string quoted inside a literal, its escapes decoded.
+        ["quoted inside code text", s("return import('../../outside.cjs')")],
+        ["quoted and escaped inside code text", s(`return import('${backslash}x2e./../outside.cjs')`)],
+        ["quoted after a stray apostrophe", s("don't: return import('../../outside.cjs')")],
+        ["quoted twice over", s(`return F("return import('../../outside.cjs')")`)],
+        ["quoted inside a percent-encoded data: URL", s(`data:text/javascript,export%20*%20from%20%27${pathToFileURL(cjs).href}%27`)],
+      ];
+      for (const [label, literal, landing = cjs] of routes) {
+        const file = plant(literal);
+        const closure = scanClosure([file], context);
+        expect(closure.files, label).toContain(landing);
+        expect(closure.violations.length, `${label}: ${s(closure.violations)}`).toBe(1);
+        expect(closure.violations[0]?.startsWith(`${relative(repoRoot, landing)}:1 `), `${label}: ${s(closure.violations)}`).toBe(true);
+      }
+      // A file a resolver takes from a directory is judged on its REAL path: forbidden.
+      const linked = plant(s("../../fwd"));
+      expect(scanClosure([linked], context).violations).toEqual([`${relative(repoRoot, linked)} ${literalFinding("../../fwd")} x1 (not allowlisted)`]);
+      // …and in JSON.
+      const json = plant(s("../../outside.cjs"), ".json");
+      expect(scanClosure([json], context).violations).toHaveLength(1);
+      // Negative controls: what reaches nothing a resolver takes, code in the
+      // tree, and clean code outside it (scanned, and clean) — no finding.
+      for (const text of ["/v1/kill-switch", "./nothing-here", "./clean.ts", ".", "..", "../../..", "/", "file:///nonexistent/x.cjs", "the ./notes.md prose"]) {
+        expect(scanClosure([plant(s(text))], context).violations, text).toEqual([]);
+      }
+      const cleanClosure = scanClosure([plant(s("../../clean.cjs"))], context);
+      expect(cleanClosure.violations).toEqual([]);
+      expect(cleanClosure.files).toContain(clean);
+    });
+  });
+
+  it("CONTROL-1b r3: a landing inside a workspace package is left to check:deps only where check:deps READS it — and the directories it skips are the tool's own", async () => {
+    const tool = read(resolve(repoRoot, "tools/check-dependency-direction.mjs"));
+    const skipped = /const SKIPPED_DIRS = new Set\(\[([^\]]*)\]\)/u.exec(tool)?.[1] ?? "";
+    expect([...skipped.matchAll(/"([^"]+)"/gu)].map((match) => match[1]).sort()).toEqual([...DEPENDENCY_CHECK_SKIPS].sort());
+    expect(tool).toContain("entry.name.startsWith(\".\") || SKIPPED_DIRS.has(entry.name)");
+    await withMirror(({ root, context, at, write, requireSdk }) => {
+      const workspace = join(root, "packages", "innocuous");
+      write(join(workspace, "package.json"), JSON.stringify({ name: "innocuous" }));
+      const sdkTarget = (file: string): string => write(file, requireSdk(file));
+      const hidden = sdkTarget(join(workspace, ".zz", "evil.cjs"));
+      const built = sdkTarget(join(workspace, "dist", "evil.js"));
+      const sourced = sdkTarget(join(workspace, "src", "sourced.ts"));
+      const importer = write(
+        join(at(resolve(repoRoot, "test/unit/control-api")), "planted.ts"),
+        [hidden, built, sourced].map((target, index) => `export const p${String(index)} = ${JSON.stringify(target)};\n`).join(""),
+      );
+      const closure = scanClosure([importer], context, new Map([["innocuous", workspace]]));
+      // Under a dot-directory and dist/, check:deps reads nothing: scanned in turn, and each require fails.
+      expect(closure.files).toContain(hidden);
+      expect(closure.files).toContain(built);
+      expect(closure.violations.filter((violation) => violation.includes(`:1 ${named("re", "quire")} `))).toHaveLength(2);
+      // Under src/, check:deps reads it (F6, F16): left to it.
+      expect(closure.files).not.toContain(sourced);
+      // …and the package a LITERAL path lands in is held to its dependency
+      // closure, as one a load lands in is: here it declares a signing library.
+      write(join(workspace, "package.json"), JSON.stringify({ name: "innocuous", dependencies: { [VIEM_NAME]: "2.0.0" } }));
+      const reached = reachedWorkspaces([importer], context);
+      expect([...reached]).toEqual([workspace]);
+      expect(forbiddenDependencyClosure([...reached], new Map([["innocuous", workspace]]))).toEqual([
+        `${workspace}: dependencies ${VIEM_NAME}`,
+      ]);
+    });
+  });
+
   it("CONTROL-1b r2 (J-H2): each mechanism ALONE — with every target computed, only real loader calls are loads and only listed bare packages load", () => {
     const path = resolve(repoRoot, "test/integration/control-api/zz-rc-plant.ts");
     for (const plant of roundTwoPlants()) {
@@ -1239,7 +1633,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     expect(findingOf("vitest/config", resolve(repoRoot, "test/integration/control-api/vitest.config.ts"))).toBe("ok");
   });
 
-  it("CONTROL-1b r2 (J-H1): the residual reads the same wherever it is stated — the README, this header, the scanner — and round 1's narrower wording is superseded", () => {
+  it("CONTROL-1b r3 (J-H1, J-L1): the residual reads the same wherever it is stated — the README, this header, the scanner — names the unit runner's exposure and the guard's copy blind spot, and the earlier wordings are superseded", () => {
     const normalized = (text: string): string =>
       text
         .replace(/^\s*\*\s?/gmu, "")
@@ -1249,6 +1643,9 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     const self = read(resolve(here, "acceptance-3-no-signer.test.ts"));
     const header = self.slice(0, self.indexOf("\nimport {"));
     const scanner = read(resolve(here, "support/module-loads.ts"));
+    const guard = read(resolve(here, "support/no-signer-guard.ts"));
+    const setup = read(resolve(here, "support/no-signer-setup.ts"));
+    const vocabulary = read(resolve(here, "support/forbidden-targets.ts"));
     for (const [name, text] of [
       ["README", readme],
       ["acceptance-3's header", header],
@@ -1256,22 +1653,53 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     ] as const) {
       const said = normalized(text);
       expect(said, name).toContain("whose loader the scan does not name");
-      expect(said, name).toContain("whose target no literal in the file names");
+      // `CONTROL-1b` r3: the second half is what a literal cannot REACH, not what none names.
+      expect(said, name).toContain("whose target the scan does not reach from a literal");
+      expect(said, name).toContain("a literal joined at run time to a base the program supplies");
+      expect(said, name).toContain("against its own file's directory");
       expect(said, name).toContain("another module exports");
+      expect(said, name).toContain("does not exist when the scan runs");
     }
-    // Where the guard does NOT run is said in the header and the README.
+    // Round 2's wording is gone where the residual is stated now, and marked
+    // superseded in the README's dated corrections; so is round 1's.
+    for (const [name, text] of [
+      ["acceptance-3's header", header],
+      ["module-loads.ts", scanner],
+    ] as const) {
+      expect(normalized(text), name).not.toContain("whose target no literal in the file names");
+    }
+    expect(normalized(readme)).toContain(normalized("Superseded by the `CONTROL-1b` r3 correction above"));
+    expect(normalized(header)).not.toContain(normalized(named("A computed name that reaches a loader ", "with a computed path")));
+    expect(normalized(readme)).toContain(normalized("Superseded by the `CONTROL-1b` r2 correction above"));
+    // Where the guard does NOT run, and what it does not see, is said in the
+    // header, the README and the guard itself — a copy or hard link included
+    // (`CONTROL1B-R3-J-L1`).
     for (const [name, text] of [
       ["README", readme],
       ["acceptance-3's header", header],
+      ["no-signer-guard.ts", guard],
     ] as const) {
-      expect(normalized(text), name).toContain("test/vitest.config.ts");
-      expect(normalized(text), name).toContain("code read as text");
-      expect(normalized(text), name).toContain("thread or process");
+      const said = normalized(text);
+      expect(said, name).toContain("test/vitest.config.ts");
+      expect(said, name).toContain("stands alone");
+      expect(said, name).toContain("code read as text");
+      expect(said, name).toContain("thread or process");
+      expect(said, name).toContain("copy or hard link of a forbidden file at a path that names nothing forbidden");
     }
-    // Round 1's sentence implied a literal path was ruled out: gone from the
-    // header, and marked superseded in the README's dated corrections.
-    expect(normalized(header)).not.toContain(normalized(named("A computed name that reaches a loader ", "with a computed path")));
-    expect(normalized(readme)).toContain(normalized("Superseded by the `CONTROL-1b` r2 correction above"));
+    // …and no text claims the guard refuses a forbidden module however it was
+    // spelled: it judges where a file lies (the README quotes the old claim
+    // only in its dated correction).
+    for (const [name, text] of [
+      ["acceptance-3's header", header],
+      ["no-signer-guard.ts", guard],
+      ["no-signer-setup.ts", setup],
+      ["forbidden-targets.ts", vocabulary],
+    ] as const) {
+      expect(normalized(text), name).not.toContain("however it was spelled");
+      expect(normalized(text), name).not.toContain("however the loader or the path was spelled");
+    }
+    expect(normalized(readme)).not.toContain(normalized("refuses the LANDING itself, however it was spelled"));
+    expect(normalized(setup)).toContain("copy or hard link");
   });
 
   it("CONTROL-1b r1 (J-H2): each extension is read with ITS grammar — JSX is code in .tsx and .jsx, and a syntax error in .ts", () => {
@@ -1410,6 +1838,13 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       );
       expect(found.json.map((path) => relative(directory, path))).toEqual(["planted.json"]);
       expect(found.inert.map((path) => relative(directory, path)).sort()).toEqual([".gitkeep", "README.md"]);
+      // `CONTROL-1b` r3: a tree that holds code admits no inert kind at all.
+      const strict = discover(directory, false);
+      expect(strict.inert).toEqual([]);
+      expect(strict.problems.filter((problem) => problem.includes("an inert kind in a tree that holds code")).map((problem) => relative(directory, problem.split(":")[0] ?? "")).sort()).toEqual([
+        ".gitkeep",
+        "README.md",
+      ]);
       expect(found.problems.map((problem) => relative(directory, problem.split(":")[0] ?? "")).sort()).toEqual(
         ["addon.node", "alias.ts", "helper", "link", "node_modules", "notes.txt"],
       );
@@ -1516,20 +1951,10 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     );
   });
 
-  it("CONTROL-1b r1: no workspace package a load LANDS in declares a forbidden dependency, at any depth", () => {
+  it("CONTROL-1b r1: no workspace package a load — or, since r3, a literal path — LANDS in declares a forbidden dependency, at any depth", () => {
     const workspaces = WORKSPACES;
     expect(workspaces.get(SECURE_PACKAGE)).toBe(SECURE);
-    const reached = new Set<string>();
-    for (const path of IMPORT_SCAN_FILES) {
-      for (const load of scanFile(path).scanned.loads) {
-        const verdict = judgeLoad(load, path, LANDING);
-        if (verdict.kind !== "ok") continue;
-        for (const landing of verdict.landings) {
-          const owner = workspacePackageOf(landing, repoRoot);
-          if (owner !== undefined) reached.add(owner);
-        }
-      }
-    }
+    const reached = reachedWorkspaces(IMPORT_SCAN_FILES);
     // Non-vacuity: the aliased trader, the observability package and this one are reached.
     for (const expected of ["apps/trader", "apps/control-api", "packages/observability", "packages/storage-postgres"]) {
       expect([...reached].map((path) => relative(repoRoot, path)), expected).toContain(expected);

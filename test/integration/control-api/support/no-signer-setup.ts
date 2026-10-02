@@ -10,8 +10,12 @@
  * `Module._load` and `Module.prototype.load`, ESM `import` and `import()`,
  * `require` of an ES module, and code an evaluator built — after resolution,
  * on the URL actually loaded. A load where `refusedLanding` refuses throws
- * instead: the venue SDK, a signing library and the secure adapter cannot be
- * loaded into this thread however the loader or the path was spelled. It is a
+ * instead: a file that LIES in the secure adapter or under a forbidden
+ * package's directory — where pnpm keeps the venue SDK and every signing
+ * library — cannot be loaded into this thread, whatever loader reached it.
+ * It judges where a file lies, not what it holds: a COPY or hard link of one at
+ * a path that names nothing forbidden loads (`CONTROL-1b` r3,
+ * `CONTROL1B-R3-J-L1`; `no-signer-guard.ts`, "What it does not see"). It is a
  * LOAD hook, not a resolution hook, because hooks registered later run first:
  * a resolution hook a test registered itself could answer without asking
  * this one, but the load of whatever it named still passes through here

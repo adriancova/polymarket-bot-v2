@@ -5,9 +5,11 @@
  * ## Why a run-time guard
  *
  * The static scan (`module-loads.ts`, `load-judge.ts`) judges every load a
- * file SPELLS and every literal it holds. It cannot judge a load whose loader
- * is reached without spelling its name AND whose target is computed at run
- * time. The round-2 verifiers loaded the venue SDK into a test worker through
+ * file SPELLS, every literal it holds, and where every literal PATH lands. It
+ * cannot judge a load whose loader is reached without spelling its name AND
+ * whose target it does not reach from a literal — computed or joined to a base
+ * at run time (`module-loads.ts`, "What a static scan cannot see"). The
+ * round-2 verifiers loaded the venue SDK into a test worker through
  * a computed `getBuiltinModule`/`createRequire` pair, through `Function` found
  * by enumeration, through `ts.sys.require`, through a private vite server and
  * through ESLint's config loader. The scan now catches each of those plants —
@@ -28,10 +30,17 @@
  * segments name a forbidden package (`forbidden-targets.ts`) — which is where
  * pnpm keeps every venue SDK and signing library, under its own name. Both
  * control-api integration runners install both halves; acceptance 3 holds
- * each runner's config to exactly them.
+ * each runner's config to exactly them. It judges where a file LIES, by its
+ * path, and never what the file holds.
  *
  * ## What it does not see
  *
+ * - a COPY or hard link of a forbidden file at a path that names nothing
+ *   forbidden (`CONTROL-1b` r3, `CONTROL1B-R3-J-L1`: the round-3 verifiers
+ *   copied the venue SDK's `dist/` to a scratch `node_modules/zzsdk`, linked
+ *   its dependencies beside it, and loaded it with this guard installed) — the
+ *   static scan still fails any literal that names the source, and only a
+ *   path computed at run time reaches it;
  * - code READ AS TEXT and handed to an evaluator, or to a load hook a test
  *   registers itself — nothing is resolved or loaded from disk;
  * - a module graph the test builds itself (its own vite server's file reads;
@@ -45,7 +54,8 @@
  * - builtins reached by `process.getBuiltinModule`, which resolves nothing;
  * - the repository's unit runner, `test/vitest.config.ts` (`WP-010`-owned,
  *   outside `CONTROL-1b`'s grant), which runs `apps/control-api/src/**` and
- *   `test/unit/control-api/**` without it: there the static scan stands alone.
+ *   `test/unit/control-api/**` without it: there the static scan stands alone,
+ *   and a load in its residual really loads what it reaches.
  */
 
 import { existsSync, realpathSync } from "node:fs";

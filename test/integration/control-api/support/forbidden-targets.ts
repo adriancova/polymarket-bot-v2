@@ -8,8 +8,11 @@
  *
  * - `load-judge.ts`, which judges every load a scanned file spells by where it
  *   lands, and every literal it holds by what it names;
- * - `no-signer-guard.ts`, the RUN-TIME guard, which refuses a resolution or a
- *   load that lands on one of these in a test worker, however it was spelled;
+ * - `no-signer-guard.ts`, the RUN-TIME guard, which refuses the load, in a
+ *   test worker, of a file that LIES in the secure adapter or under one of
+ *   these packages' directories, whatever loader reached it (`CONTROL-1b` r3:
+ *   it judges where a file lies, not what it holds — a copy elsewhere is not
+ *   refused);
  * - `acceptance-3-no-signer.test.ts`, which pins both.
  *
  * It imports nothing, so the run-time guard can install it in every test file

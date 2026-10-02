@@ -1,7 +1,9 @@
 /**
  * The run-time no-signer guard's pins (`CONTROL-1b` r2, closing
- * `CONTROL1B-R2-J-H1` and `CONTROL1B-R2-J-H2` behind the static scan),
- * declared once and run by EACH runner that installs the guard:
+ * `CONTROL1B-R2-J-H1` and `CONTROL1B-R2-J-H2` behind the static scan; r3 adds
+ * the round-3 routes, an inert file and code outside every tree, written to
+ * paths computed at run time), declared once and run by EACH runner that
+ * installs the guard:
  * `no-signer-runtime-guard.test.ts` (the integration runner) and
  * `postgres/no-signer-runtime-guard.test.ts` (the PostgreSQL runner).
  *
@@ -111,6 +113,30 @@ export function pinNoSignerGuard(runner: string): void {
         await expect(load(pathToFileURL(SECURE_LEAF).href)).rejects.toThrow(refusedBy("node"));
         // Positive control: the same native import of an innocuous module.
         await expect(load(pathToFileURL(helper).href)).resolves.toMatchObject({ innocuous: 1 });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("CONTROL-1b r3: the round-3 routes — a factory reached by COMPUTED names, handed an INERT file or code OUTSIDE every tree whose own require lands on the venue SDK — are refused; the same files holding innocuous code load", () => {
+      const directory = mkdtempSync(join(tmpdir(), "control-1b-r3-guard-"));
+      try {
+        // Written at run time, their paths and contents computed: the static
+        // scan's residual (`module-loads.ts`), which only this guard sees.
+        const requireOf = (path: string): string => `module.exports = require(${JSON.stringify(path)});\n`;
+        const notes = join(directory, word("notes", ".md"));
+        const outside = join(directory, word("outside", ".cjs"));
+        writeFileSync(notes, requireOf(VENUE_SDK_ENTRY), "utf8");
+        writeFileSync(outside, requireOf(VENUE_SDK_ENTRY), "utf8");
+        expect(() => factoryAt(import.meta.url)(notes)).toThrow(refusedBy("node"));
+        expect(() => factoryAt(import.meta.url)(outside)).toThrow(refusedBy("node"));
+        // Positive control: the same route and the same kinds of file, innocuous code.
+        const innocuousNotes = join(directory, word("innocuous", ".md"));
+        const innocuousOutside = join(directory, word("innocuous", ".cjs"));
+        writeFileSync(innocuousNotes, "module.exports = { innocuous: 1 };\n", "utf8");
+        writeFileSync(innocuousOutside, "module.exports = { innocuous: 2 };\n", "utf8");
+        expect(factoryAt(import.meta.url)(innocuousNotes)).toEqual({ innocuous: 1 });
+        expect(factoryAt(import.meta.url)(innocuousOutside)).toEqual({ innocuous: 2 });
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
