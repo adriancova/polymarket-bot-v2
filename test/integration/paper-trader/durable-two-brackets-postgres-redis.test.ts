@@ -42,12 +42,24 @@
  *   trade's stamp is not EARLIER than its rest start (`packages/simulation`
  *   `venue.ts`, `monotonicNs < record.restingFromNs`).
  *
+ * **Dated correction (`CO2-N1`, ADR-031, 2026-10-03).** The clock now also
+ * supplies ADMISSION's process instant: once per routed placement the loop
+ * reads `clock.now()`, and an entry whose event is older than the risk
+ * policy's `featuresMaxAgeMs` at that reading, or whose reading is inside the
+ * entry cutoff before the close, is refused. Strategy time is still the
+ * envelope's `receivedAt`; the pins below are unchanged. But the contrast
+ * test's `SystemPaperClock`, as-is, reads 2026-10 against these 2026-03-04
+ * events, and every entry was refused. It now runs the same host clock
+ * RE-BASED to the scenario's first event (`support/host-clock.ts`): read
+ * live, advancing in real time from that instant, so the guard measures the
+ * real processing delay of the one pump — milliseconds — and admits.
+ *
  * So the main test positions a `ManualClock` at each delivered event's
  * `receivedAt` (monotonic = its epoch milliseconds × 10^6) inside a feed
  * wrapper, as `pump` receives the event and BEFORE `drain` processes it — the
  * events are published one at a time and pumped until idle, and the wrapper
  * REFUSES a batch of more than one, so "before the loop reads it" holds per
- * event. The contrast test runs the process's own `SystemPaperClock`, publishes
+ * event. The contrast test runs the process's own `SystemPaperClock` (re-based, above), publishes
  * all eleven events first and pumps ONCE over the whole batch, as `startup()`
  * would: the durable run is identical. The pins that the reduce is caused by
  * `SB.HOLDING_TIMEOUT` at `12:03:06`, the cancel at `12:03:05` and
@@ -199,9 +211,10 @@ import { ManualClock } from "@polymarket-bot/trader/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RedisMarketEventFeed } from "../../../apps/trader/src/adapters/redis-feed.js";
-import { assembleDurableTrader, SystemPaperClock } from "../../../apps/trader/src/main.js";
+import { assembleDurableTrader } from "../../../apps/trader/src/main.js";
 import { pump } from "../../../apps/trader/src/pump.js";
 import { T_OPEN, safeEnvironment } from "./support/fixture.js";
+import { RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
   ACCOUNT,
   CONDITION_ID,
@@ -450,7 +463,8 @@ async function runDurableTwoBrackets(options: RunOptions): Promise<DurableRun> {
     const manual =
       options.clock === "event-time" ? new ManualClock(recordedInstant(first.envelope.receivedAt).instant) : undefined;
     if (manual !== undefined) positionAt(manual, first.envelope.receivedAt);
-    const clock: Clock = manual ?? new SystemPaperClock();
+    // `CO2-N1` (ADR-031): the host's clock, re-based to the first event.
+    const clock: Clock = manual ?? new RebasedSystemPaperClock(first.envelope.receivedAt);
 
     // --- the process's steps 3b + 4 against the registered database ---------
     const lines: string[] = [];
@@ -913,7 +927,7 @@ describe("BRACKET-1c: a durable two-bracket round trip through PostgreSQL, Redis
     expect(run.db.snapshots[3]?.["realized_pnl"]).toBe(run.memory.realizedAfterBracket2);
   }, 180_000);
 
-  it("the process's own SystemPaperClock and ONE pump over the whole stream give the same durable run — strategy time is the envelope's receivedAt", async () => {
+  it("the process's own SystemPaperClock (re-based to the first event, ADR-031) and ONE pump over the whole stream give the same durable run — strategy time is the envelope's receivedAt", async () => {
     const run = await runDurableTwoBrackets({
       label: "b1c-system-clock",
       clock: "system",

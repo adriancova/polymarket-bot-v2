@@ -38,12 +38,23 @@
  *    startup was factored into {@link assembleDurableTrader} — the durable
  *    store, the registration check, the simulated venue and the composition
  *    root — which `startup` calls and this file calls, with the process's own
- *    `SystemPaperClock`. What this file does NOT run of `startup()`: the
+ *    `SystemPaperClock` (since `CO2-N1`, re-based: see below). What this file
+ *    does NOT run of `startup()`: the
  *    `checkPaperTraderSafety` call on the environment (run again on the same
  *    environment by `createPaperTrader`), the configuration FILE read (the same
  *    `parseTraderConfig` door is run here), the Redis connect / subscribe /
  *    `RedisMarketEventFeed`, and `pump` — whose per-batch `ingest` + `drain` the
  *    test performs directly on the loop.
+ *
+ * ## The clock (`CO2-N1`, ADR-031)
+ *
+ * ADR-031's entry guard reads the trader's clock at admission. Against the
+ * fixture's `2026-03-04` events the host's clock as-is is months late, and
+ * the first-fill entry was refused (`RISK_FEATURES_STALE`,
+ * `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED`). Every assembly here now gets the same
+ * host clock re-based to the fixture's first event
+ * (`support/host-clock.ts`, {@link RebasedSystemPaperClock}): read live,
+ * advancing in real time, so the lag is the real processing delay.
  *
  * ## What lands, and what is asserted to be ABSENT (disclosed)
  *
@@ -92,12 +103,9 @@ import { hashOf, startPostgresContainer, fixtureTimestamp } from "@polymarket-bo
 import { parseTraderConfig } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import {
-  assembleDurableTrader,
-  EXIT_CODES,
-  SystemPaperClock,
-} from "../../../apps/trader/src/main.js";
+import { assembleDurableTrader, EXIT_CODES } from "../../../apps/trader/src/main.js";
 import { recordedEvents, safeEnvironment, traderConfig } from "./support/fixture.js";
+import { FIXTURE_FIRST_EVENT_AT, RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
   ACCOUNT,
   CONDITION_ID,
@@ -147,7 +155,7 @@ async function assemble(
     config: parsed.config,
     document,
     postgresUrl,
-    clock: new SystemPaperClock(),
+    clock: new RebasedSystemPaperClock(FIXTURE_FIRST_EVENT_AT),
     log: (line) => {
       lines.push(line);
     },

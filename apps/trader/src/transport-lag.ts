@@ -42,8 +42,11 @@
  *
  * The event-time lag is computed when the section is READ: the wall clock now
  * minus the `receivedAt` of the last event the loop processed (the loop's own
- * fact, handed in by `HealthState`). The core has no wall clock; this module is
- * where the process's wall clock enters the health surface, and only here.
+ * fact, handed in by `HealthState`). The core reads its `Clock` port at
+ * admission (ADR-031: an entry is refused once the trader lags its stream past
+ * the features bound, or reaches the entry cutoff), and under ADR-023's
+ * `CONNECTION_CONFIRMED` for book freshness (D7). This module is still the
+ * only place the process's wall clock enters the health surface.
  */
 
 import type { ConsumerMetrics } from "@polymarket-bot/event-bus";

@@ -158,7 +158,14 @@ import {
   OrderTimeInForceBook,
 } from "./pipeline.js";
 import { pnlSnapshotKey } from "./pnl-snapshot-key.js";
-import type { Clock, GroupCommit, IngestedEvent, TraderStore } from "./ports.js";
+import type {
+  Clock,
+  DispatchPosition,
+  GroupCommit,
+  IngestedEvent,
+  RiskRefusalRecord,
+  TraderStore,
+} from "./ports.js";
 import type { DecisionRecord, DecisionTelemetry } from "@polymarket-bot/strategy-runtime";
 import type { StrategyStateCheckpoint } from "@polymarket-bot/strategy-runtime";
 import { buildStrategyFeatureView, projectFeatureValues } from "./projection.js";
@@ -770,6 +777,16 @@ export class CoreLoop {
    */
   #durabilityLost = false;
   /**
+   * `PROVENANCE-1`: refused intents not yet handed to the store — appended at
+   * the risk seam's refusal (`#routeIntent`) and taken by the flush that ends
+   * the event (`#flushOutbox`: staged with the event's rows, or written after
+   * them) through `#takeRiskRefusals`, which hands over nothing once
+   * durability is lost. Emptied by every flush; bounded by the event's own
+   * evaluations (one record per refused intent of a decision), which the
+   * bounded outbox already bounds.
+   */
+  #pendingRiskRefusals: RiskRefusalRecord[] = [];
+  /**
    * `DURABLE-1`: the decision whose intents are being routed could not be
    * made durable at the boundary before its first placement. Every LATER
    * placement of the SAME decision is then refused at the boundary as well
@@ -1196,7 +1213,7 @@ export class CoreLoop {
         market.observeInstant(instant.instant, instant.epochMs);
         await this.#evaluateMarket(
           market,
-          envelope,
+          dispatchPositionOf(envelope),
           { kind: "onFeatures" },
           instant.instant,
           instant.epochMs,
@@ -1222,7 +1239,7 @@ export class CoreLoop {
       if (callback === undefined) continue;
       if (this.#options.halts.isMarketHalted(marketId)) continue;
       // --- steps 3-9 -------------------------------------------------------
-      await this.#evaluateMarket(market, envelope, callback, instant.instant, instant.epochMs);
+      await this.#evaluateMarket(market, dispatchPositionOf(envelope), callback, instant.instant, instant.epochMs);
     }
 
     // --- fills the venue produced, plus their accounting -------------------
@@ -1251,7 +1268,7 @@ export class CoreLoop {
     // would have acted alone — an owed evaluation names THIS event, and the
     // harvest instant moves only for an event that reaches the harvest point.
     // An event for a market this trader does not run changes neither.
-    const at: OwedEvaluation["at"] = { eventId: envelope.eventId, instant, epochMs };
+    const at: OwedEvaluation["at"] = { source: dispatchPositionOf(envelope), instant, epochMs };
 
     if (envelope.eventType === "ReferenceTradeObserved") {
       const venue = readString(envelope.payload, "venue");
@@ -1296,7 +1313,7 @@ export class CoreLoop {
         oweEvaluation(frame, marketId, market, at);
         continue;
       }
-      await this.#evaluateMarket(market, envelope, callback, instant, epochMs);
+      await this.#evaluateMarket(market, dispatchPositionOf(envelope), callback, instant, epochMs);
     }
     frame.harvestAt = instant;
   }
@@ -1324,7 +1341,7 @@ export class CoreLoop {
       if (this.#options.halts.isMarketHalted(marketId)) continue;
       await this.#evaluateMarket(
         owed.market,
-        { eventId: owed.at.eventId },
+        owed.at.source,
         { kind: "onFeatures" },
         owed.at.instant,
         owed.at.epochMs,
@@ -1565,10 +1582,18 @@ export class CoreLoop {
     }
   }
 
-  /** §8.1 steps 3-9 for one market's instances, in §8.2 order. */
+  /**
+   * §8.1 steps 3-9 for one market's instances, in §8.2 order.
+   *
+   * `PROVENANCE-1`: `source` is the triggering event's dispatch position —
+   * its own §7.1 `eventId`, `gatewayEpoch` and `ingestSeq` — and every
+   * decision this evaluates carries all three (`#buildEvaluationInput`). It
+   * used to be the `eventId` alone, so every persisted decision's
+   * `gateway_epoch` and `ingest_seq` were NULL (`H1R1-PROVENANCE`).
+   */
   async #evaluateMarket(
     market: MarketState,
-    envelope: { readonly eventId: string },
+    source: DispatchPosition,
     callback: TriggeredCallback,
     instant: string,
     epochMs: number,
@@ -1589,10 +1614,10 @@ export class CoreLoop {
         instant,
         snapshotRef: snapshot.snapshotRef,
         values: snapshot.values,
-        eventId: envelope.eventId,
+        source,
       });
       const outcome = instance.runtime.evaluate(input);
-      await this.#consumeOutcome(instance, market, outcome, envelope.eventId, instant, epochMs);
+      await this.#consumeOutcome(instance, market, outcome, source, instant, epochMs);
     }
   }
 
@@ -1686,15 +1711,21 @@ export class CoreLoop {
     readonly values: Readonly<Record<string, string | boolean | null>>;
     /**
      * The §7.1 identity of the event that triggered this evaluation, when one
-     * did.
+     * did: its `eventId`, `gatewayEpoch` and `ingestSeq` (`PROVENANCE-1`; it
+     * was the `eventId` alone).
      *
      * `undefined` for a delivery the loop originates rather than an event —
      * an `onFill` or an `onOrderUpdate` — and the field is then OMITTED, not
      * blanked. `SourceEventRef` is "optional as a GROUP", and an empty string
      * is not a UUID: supplying one made the runtime refuse the evaluation with
      * `INPUT_INVALID`, so a fill was never delivered to the strategy at all.
+     * The three values are the envelope's own, which the event door already
+     * held to the frozen §7.1 contract (`UuidSchema`,
+     * `UnsignedBigIntStringSchema`) — the same schemas the runtime's input
+     * door applies to `sourceEvent`, so a position the door admitted is one
+     * the runtime admits.
      */
-    readonly eventId: string | undefined;
+    readonly source: DispatchPosition | undefined;
   }): EvaluationInput {
     const base = {
       evaluatedAt: input.instant,
@@ -1714,7 +1745,15 @@ export class CoreLoop {
       position: this.#positionView(input.instance, input.instant),
       orders: this.#orderViews_(input.instance, input.instant),
       riskBudget: this.#riskBudgetView(input.instant),
-      ...(input.eventId === undefined ? {} : { sourceEvent: { eventId: input.eventId } }),
+      ...(input.source === undefined
+        ? {}
+        : {
+            sourceEvent: {
+              eventId: input.source.eventId,
+              gatewayEpoch: input.source.gatewayEpoch,
+              ingestSeq: input.source.ingestSeq,
+            },
+          }),
     } as const;
     switch (input.callback.kind) {
       case "onMarketOpen":
@@ -1808,15 +1847,22 @@ export class CoreLoop {
     });
   }
 
-  /** Handles one `EvaluationOutcome` and walks its intents through the pipeline. */
+  /**
+   * Handles one `EvaluationOutcome` and walks its intents through the pipeline.
+   *
+   * `source` is the triggering event's dispatch position, or `null` for an
+   * evaluation the loop originates (`onFill`, `onOrderUpdate`), whose trace
+   * and provenance records carry `""` as their source event id, as before.
+   */
   async #consumeOutcome(
     instance: RegisteredInstance,
     market: MarketState,
     outcome: EvaluationOutcome,
-    eventId: string,
+    source: DispatchPosition | null,
     instant: string,
     epochMs: number,
   ): Promise<void> {
+    const eventId = source?.eventId ?? "";
     this.#options.health.countLoop("evaluations");
     switch (outcome.kind) {
       case "REFUSED":
@@ -1849,6 +1895,7 @@ export class CoreLoop {
             market,
             intent,
             eventId,
+            source,
             featureSnapshotRef: outcome.record.decision.featureSnapshotRef,
             evaluationSeq: outcome.record.evaluationSeq,
             instant,
@@ -1924,6 +1971,8 @@ export class CoreLoop {
     readonly market: MarketState;
     readonly intent: Intent;
     readonly eventId: string;
+    /** `PROVENANCE-1`: the decision's triggering event, for a refusal's record. */
+    readonly source: DispatchPosition | null;
     readonly featureSnapshotRef: string;
     readonly evaluationSeq: number;
     readonly instant: string;
@@ -1966,6 +2015,12 @@ export class CoreLoop {
       // seam does not depend on its verdict.
       undurable = true;
     }
+    // `CO2-N1` (ADR-031 R1): a PLACEMENT reads the process clock once, HERE —
+    // after its decision is durable (so a slow commit counts as lag) and
+    // before its risk input is built. A CANCEL reads nothing; its path is
+    // unchanged (§6 invariant 13).
+    const admission =
+      input.intent.type === "CANCEL" ? undefined : this.#admissionMeasurements(input.epochMs);
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
     const projection = this.#held.view;
@@ -2005,10 +2060,15 @@ export class CoreLoop {
       strategyStatePermitsIntent: input.instance.runtime.instanceStatus() === "ACTIVE",
       market: input.market,
       marketConfig,
-      secondsToClose: this.#secondsToClose(marketConfig, input.epochMs),
+      // ADR-031 R4: from the later of the event instant and the process
+      // instant (the event instant for a CANCEL, or an unreadable reading).
+      secondsToClose: this.#secondsToClose(marketConfig, admission?.closeFromEpochMs ?? input.epochMs),
       bookSynchronized: input.market.bookFor(input.instance.direction).baseline() !== undefined,
       venueBookAgeMs: bookAgeMs,
-      featuresAgeMs: 0,
+      // ADR-031 R3/R5: the feature snapshot's age at admission is the lag;
+      // `undefined` (an unreadable reading) is OMITTED, so check 7 refuses an
+      // entry `RISK_FRESHNESS_UNKNOWN`. A CANCEL keeps the constant 0.
+      featuresAgeMs: admission === undefined ? 0 : admission.featuresAgeMs,
       positions,
       openOrders: this.#openOrdersFor(input.instance, marketConfig),
       exposures: allocation.exposures,
@@ -2036,6 +2096,29 @@ export class CoreLoop {
       this.#options.health.countRiskRefusal(
         evaluation.refusals.map((refusal) => refusal.code),
         isProtectiveExitIntent(input.intent),
+      );
+      // `PROVENANCE-1`: the refusal is made durable with the event's other
+      // rows (`#flushOutbox`), as `ops.risk_events` evidence (ADR-028
+      // Decision 3.1) — unless durability is lost by then: a refusal under a
+      // `STORE_UNAVAILABLE` halt (`DURABLE-1`'s undurable decision among
+      // them) is the halt's own consequence, and nothing is written after the
+      // failure the halt reports (`#takeRiskRefusals`).
+      this.#pendingRiskRefusals.push(
+        Object.freeze({
+          runId: input.instance.runId,
+          instanceId: input.instance.instanceId,
+          marketId: input.instance.marketId,
+          evaluationSeq: input.evaluationSeq,
+          intentId: intentIdOf(input.intent),
+          protectiveExit: isProtectiveExitIntent(input.intent),
+          occurredAt: input.instant,
+          refusals: Object.freeze(
+            evaluation.refusals.map((refusal) =>
+              Object.freeze({ code: refusal.code, message: refusal.message }),
+            ),
+          ),
+          sourceEvent: input.source,
+        }),
       );
       return;
     }
@@ -3352,10 +3435,10 @@ export class CoreLoop {
         instant,
         snapshotRef: snapshot.snapshotRef,
         values: snapshot.values,
-        eventId: undefined,
+        source: undefined,
       }),
     );
-    await this.#consumeOutcome(instance, market, outcome, "", instant, this.#lastEpochMs);
+    await this.#consumeOutcome(instance, market, outcome, null, instant, this.#lastEpochMs);
   }
 
   /**
@@ -3439,14 +3522,14 @@ export class CoreLoop {
           instant,
           snapshotRef: snapshot.snapshotRef,
           values: snapshot.values,
-          eventId: undefined,
+          source: undefined,
         }),
       );
       // R1: only a DECIDED outcome is an evaluation of the view. REFUSED (a
       // PAUSED runtime), CONTAINED (the callback failed; its state did not
       // move) and HALTED (persistence failed) all leave the order deliverable.
       if (terminal && outcome.kind === "DECIDED") this.#retired.add(order.simulatedOrderId);
-      await this.#consumeOutcome(instance, market, outcome, "", instant, this.#lastEpochMs);
+      await this.#consumeOutcome(instance, market, outcome, null, instant, this.#lastEpochMs);
     }
 
     for (const order of boundary) {
@@ -3592,6 +3675,42 @@ export class CoreLoop {
         return;
       }
     }
+    // `PROVENANCE-1`: the event's refused intents, after its decisions and
+    // checkpoints. Never after a store failure this process has halted on.
+    for (const refusal of this.#takeRiskRefusals()) {
+      const written = await this.#options.store.persistRiskRefusal(refusal);
+      if (!written.ok) {
+        this.#durabilityLost = true;
+        this.#options.halts.halt(
+          { kind: "GLOBAL" },
+          "STORE_UNAVAILABLE",
+          `a risk refusal could not be persisted (${written.failure.kind}): ` +
+            `${written.failure.detail}; ADR-028 Decision 3.1 pins a window by its refusals, so a ` +
+            "refusal the store did not record is evidence lost, and the process makes no further " +
+            "trading decision",
+          this.#lastInstant,
+        );
+        return;
+      }
+    }
+  }
+
+  /**
+   * `PROVENANCE-1` — the pending refused intents, handed over ONCE (the list
+   * is emptied), or NONE once a decision or checkpoint could not be made
+   * durable (`#durabilityLost`: a refused per-row write, or a refused
+   * staging): a refusal made under that `STORE_UNAVAILABLE` halt —
+   * `DURABLE-1`'s undurable decision's, refused at the risk seam under the
+   * halt — is dropped, never written after the failure the halt reports. The
+   * ONE gate both write paths take: the per-row flush (`#flushOutbox`) and
+   * the group staging (`#stageOutbox`). After a failed group COMMIT
+   * (`#groupCommitFailed`) a staging is never committed (`#requestCommit`),
+   * so it needs no gate here.
+   */
+  #takeRiskRefusals(): readonly RiskRefusalRecord[] {
+    const refusals = this.#pendingRiskRefusals;
+    this.#pendingRiskRefusals = [];
+    return this.#durabilityLost ? [] : refusals;
   }
 
   /**
@@ -3654,7 +3773,7 @@ export class CoreLoop {
     const decisions = this.#options.outbox.drainDecisions();
     if (group !== undefined) {
       if (decisions.length > 0) {
-        const staged = group.stage({ decisions, checkpoints: [] });
+        const staged = group.stage({ decisions, checkpoints: [], riskRefusals: [] });
         if (!staged.ok) {
           this.#durabilityLost = true;
           this.#options.outbox.drain();
@@ -3701,10 +3820,15 @@ export class CoreLoop {
    */
   #stageOutbox(group: GroupCommit): void {
     const drained = this.#options.outbox.drain();
-    if (drained.decisions.length === 0 && drained.checkpoints.length === 0) return;
+    // `PROVENANCE-1`: the event's refused intents go in the SAME staging as
+    // its remaining rows, so they commit in that batch's transaction, before
+    // any later event's decision (the commit chain is in stage order).
+    const riskRefusals = this.#takeRiskRefusals();
+    if (drained.decisions.length === 0 && drained.checkpoints.length === 0 && riskRefusals.length === 0) return;
     const staged = group.stage({
       decisions: drained.decisions,
       checkpoints: drained.checkpoints.map((checkpoint) => ({ checkpoint, capturedAt: this.#lastInstant })),
+      riskRefusals,
     });
     if (!staged.ok) {
       this.#durabilityLost = true;
@@ -4099,6 +4223,49 @@ export class CoreLoop {
     market.noteBookSession(outcome, sessionKeyOf(envelope));
   }
 
+  /**
+   * `CO2-N1` (ADR-031, option (a), through existing inputs): one PLACEMENT's
+   * admission measurements, from ONE reading of the process clock.
+   *
+   * WHY. Every other admission input is measured at the evaluation's EVENT
+   * instant (`receivedAt`). A trader N seconds behind the stream would judge
+   * an entry as of N seconds ago, and would admit one after the close (the
+   * `CO2-N1` residual; `CLOSEOUT-2` N1). Option (a) supplies two existing §9.8
+   * inputs from the process clock, and nothing else:
+   *
+   * - R2/R3: `featuresAgeMs` is the lag, `max(0, processNow − eventNow)` in
+   *   whole milliseconds: the feature snapshot's age at admission. Check 7's
+   *   features row judges ENTRIES only, so an `EXIT`'s verdict is unchanged
+   *   (ADR-031 Q2, as ruled).
+   * - R4: `secondsToClose` is measured from `max(eventNow, processNow)`.
+   *   Check 20 judges ENTRIES only.
+   * - R5: a reading that does not normalise to strict UTC is no measurement.
+   *   The features age is `undefined` (OMITTED, so check 7 refuses an entry
+   *   `RISK_FRESHNESS_UNKNOWN`), and seconds-to-close keeps the event instant.
+   *
+   * Both inputs can only ADD refusals: the lag is never negative, and the
+   * close instant is never earlier than the event instant. So a process clock
+   * BEHIND the event instant (lag 0) changes nothing, and in a replay that
+   * positions its clock at each event (the backtest's `ReplayClock`) nothing
+   * changes at all (R6). No configuration turns this off (R7).
+   *
+   * Book and reference ages, `evaluatedAt`, the request budget and every
+   * strategy input stay on event time (R6). Under ADR-023's
+   * `CONNECTION_CONFIRMED`, D7's own reading (`#processNowEpochMs`) is
+   * separate and unchanged: this one never touches a book age.
+   */
+  #admissionMeasurements(eventEpochMs: number): {
+    readonly featuresAgeMs: number | undefined;
+    readonly closeFromEpochMs: number;
+  } {
+    const reading = normalizeToStrictUtc(this.#options.clock.now());
+    if (!reading.ok) return { featuresAgeMs: undefined, closeFromEpochMs: eventEpochMs };
+    return {
+      featuresAgeMs: Math.max(0, reading.epochMs - eventEpochMs),
+      closeFromEpochMs: Math.max(eventEpochMs, reading.epochMs),
+    };
+  }
+
   #secondsToClose(marketConfig: MarketConfig, epochMs: number): number | undefined {
     const close = normalizeToStrictUtc(marketConfig.closeTime);
     if (!close.ok) return undefined;
@@ -4143,7 +4310,12 @@ interface OpenFrame {
 /** One market's owed evaluation: the market, and the last frame event that owed it. */
 interface OwedEvaluation {
   readonly market: MarketState;
-  readonly at: { readonly eventId: string; readonly instant: string; readonly epochMs: number };
+  /**
+   * `PROVENANCE-1`: `source` is that event's dispatch position (it was its
+   * `eventId` alone), so the frame-close evaluation's decision carries the
+   * same `(gatewayEpoch, ingestSeq)` the per-event cadence's would have.
+   */
+  readonly at: { readonly source: DispatchPosition; readonly instant: string; readonly epochMs: number };
 }
 
 /**
@@ -4164,6 +4336,25 @@ function oweEvaluation(
 }
 
 const ZERO_UUID = "00000000-0000-7000-8000-000000000000";
+
+/**
+ * `PROVENANCE-1`: an envelope's dispatch position — a fresh frozen record of
+ * its own §7.1 `eventId`, `gatewayEpoch` and `ingestSeq`, which the event
+ * door has already held to the frozen contract. Copied, never derived, and
+ * never the envelope itself (a decision or refusal record must not carry the
+ * payload).
+ */
+function dispatchPositionOf(envelope: {
+  readonly eventId: string;
+  readonly gatewayEpoch: string;
+  readonly ingestSeq: string;
+}): DispatchPosition {
+  return Object.freeze({
+    eventId: envelope.eventId,
+    gatewayEpoch: envelope.gatewayEpoch,
+    ingestSeq: envelope.ingestSeq,
+  });
+}
 
 function readString(payload: unknown, key: string): string | undefined {
   if (typeof payload !== "object" || payload === null) return undefined;

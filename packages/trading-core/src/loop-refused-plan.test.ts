@@ -1779,6 +1779,7 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+      persistRiskRefusal: (refusal) => inner.persistRiskRefusal(refusal),
       close: () => inner.close(),
     };
     return { store, inner, refused };
@@ -1875,6 +1876,7 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
             await inner.saveCheckpoint(entry.checkpoint, entry.capturedAt);
             checkpoints += 1;
           }
+          for (const refusal of evaluation.riskRefusals) await inner.persistRiskRefusal(refusal);
         }
         return portOk({ decisions, checkpoints });
       },
@@ -1885,6 +1887,7 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+      persistRiskRefusal: (refusal) => inner.persistRiskRefusal(refusal),
       close: () => inner.close(),
       groupCommit: group,
     };
@@ -1972,6 +1975,7 @@ describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durabili
             await inner.saveCheckpoint(entry.checkpoint, entry.capturedAt);
             checkpoints += 1;
           }
+          for (const refusal of evaluation.riskRefusals) await inner.persistRiskRefusal(refusal);
         }
         return portOk({ decisions, checkpoints });
       },
@@ -1988,6 +1992,7 @@ describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durabili
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+      persistRiskRefusal: (refusal) => inner.persistRiskRefusal(refusal),
       close: () => inner.close(),
       ...(grouped ? { groupCommit: group } : {}),
     };

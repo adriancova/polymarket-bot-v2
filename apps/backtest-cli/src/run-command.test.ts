@@ -249,7 +249,7 @@ describe("backtest-cli run — argv in, artifact out (the operator path)", () =>
     expect(readFileSync(artifact, "utf8")).toBe("an earlier run's evidence\n");
   });
 
-  it("usage: a missing option, or one run does not take, is a usage error; the usage names both commands", async () => {
+  it("usage: a missing option, or one run does not take, is a usage error; the usage names every command", async () => {
     const missing = await cli(["run", "--dataset", FIXTURE, "--pins", PINS]);
     expect(missing.code).toBe(EXIT_USAGE);
     expect(missing.err).toContain("run needs --dataset, --pins, --config and --artifact");
@@ -258,8 +258,10 @@ describe("backtest-cli run — argv in, artifact out (the operator path)", () =>
     expect(unknown.err).toContain("run does not take --core");
     const none = await cli([]);
     expect(none.code).toBe(EXIT_USAGE);
-    expect(none.err).toContain("backtest-cli: a command is required: verify or run");
+    // APPROX-REPLAY-1 added a third command, `approx-run`; the usage names all three.
+    expect(none.err).toContain("backtest-cli: a command is required: verify, run or approx-run");
     expect(none.err).toContain("usage: backtest-cli verify --dataset <dir> --pins <run-pins.json>");
     expect(none.err).toContain("backtest-cli run --dataset <dir>");
+    expect(none.err).toContain("backtest-cli approx-run --store <dir>");
   });
 });

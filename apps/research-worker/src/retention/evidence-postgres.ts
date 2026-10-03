@@ -10,20 +10,15 @@
  * `@polymarket-bot/storage-postgres` so a wrong column name fails the
  * compiler (the `GOV-2B` B1 lesson).
  *
- * ## What it reads, and what is not there yet (disclosed)
+ * ## What it reads, and what the trader writes (`PROVENANCE-1`)
  *
- * | Evidence | Rows | State today |
+ * | Evidence | Rows | What the trader writes |
  * | --- | --- | --- |
- * | durable dispatch frontier | `strategy.decisions` `(gateway_epoch, ingest_seq)`: per instance, run and epoch, the largest `ingest_seq` (compared as an integer) and the latest `evaluation_seq` | **NULL today** (`H1R1-PROVENANCE`): no instance has a frontier, so no trader-responsible window is classified until the trader persists them |
+ * | durable dispatch frontier | `strategy.decisions` `(gateway_epoch, ingest_seq)`: per instance, run and epoch, the largest `ingest_seq` (compared as an integer) and the latest `evaluation_seq` | every event-triggered decision carries its triggering envelope's position; a decision the trader originates (`onFill`, `onOrderUpdate`) carries NULL and is skipped here |
  * | intent | `strategy.decisions` with `intent_count > 0` for the market | written; a source event with no `(gateway_epoch, ingest_seq)` is located by its instant |
  * | fill | `execution.fills` for the market; `accounting.ledger_transactions` `TRADE_PRINCIPAL` for the market | only the ledger rows are written today (`BOOT1 fill-link severing`) |
- * | refusal | `ops.risk_events` VETOED or BREAKER for the market | not written today |
- * | halt | `ops.incidents` for the market, or market-less for the instance, inside the window's responsible span | not written today (`OUT1-R1-HALT-NOT-DURABLE`) |
- *
- * So today a window with a refusal or a halt but no intent and no fill is
- * classified unpinned. That is the residual `OUT1-R1-HALT-NOT-DURABLE`
- * already names; this adapter reads the halt and refusal tables so the
- * classification is right the day they are written, without a change here.
+ * | refusal | `ops.risk_events` VETOED or BREAKER for the market | one VETOED row per refusal code, with its event's other rows |
+ * | halt | `ops.incidents` for the market, or market-less for the instance, inside the window's responsible span | written when the halted process exits, within a bound; a halt whose record could not land (PostgreSQL itself was the failed dependency) is not here |
  *
  * ## The durable dispatch frontier
  *
@@ -33,12 +28,19 @@
  * on two facts, stated rather than assumed silently:
  *
  * 1. the trader consumes the gateway's one ordered stream in `ingestSeq`
- *    order, and commits its rows in processing order (the `THROUGHPUT-1a`
- *    commit chain), so a durable decision at `(epoch, n)` means every row from
- *    events dispatched before it in that epoch is durable;
+ *    order, and makes each event's rows durable before any decision of a later
+ *    event (it awaits a fill's ledger rows before it processes the next event;
+ *    an event's refusals are staged with its rows, and the `THROUGHPUT-1a`
+ *    commit chain commits in stage order). So a durable decision at
+ *    `(epoch, n)` means every row from events dispatched BEFORE `n` in that
+ *    epoch is durable. It does NOT mean event `n`'s own rows are: a decision
+ *    is made durable before its placement (`DURABLE-1`), so its fill follows
+ *    it (`PROVENANCE-1` r1, `PROV1-R1-01`). What a frontier can therefore
+ *    meet is `wal-index.ts`'s `meetsRequirement`;
  * 2. within one run, `evaluation_seq` is the processing order, so a decision in
  *    another epoch with a larger `evaluation_seq` than every decision of epoch
- *    `E` means the run had moved past `E` (`completedEpochs`).
+ *    `E` means the run had moved past `E` (`completedEpochs`): every event of
+ *    `E` it consumed was completed, and it had not halted (a halt stops it).
  *
  * `ingest_seq` is a canonical unsigned-integer string (`internal.uint_string`,
  * at most 40 digits), so its integer maximum is the maximum of its

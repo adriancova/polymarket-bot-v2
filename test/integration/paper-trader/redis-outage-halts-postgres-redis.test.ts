@@ -97,16 +97,37 @@
  *   least as strict as "after the halt". The quiescent snapshot must still
  *   equal the rows after exit, compared whole.
  *
+ * ## Dated addition (`PROVENANCE-1`, 2026-10-02): the halt IS read back, and it is the ONLY write after the fault
+ *
+ * `OUT1-R1-HALT-NOT-DURABLE` is closed: `startup()` writes every latched halt
+ * to `ops.incidents` after the pump stops and before it closes anything
+ * (`apps/trader/src/halt-record.ts`). This file used to say "The halt is not
+ * read back from PostgreSQL, because the trader writes no halt row anywhere".
+ * `OUT2-R1-HALT-RECORD-INTERACTION` named the consequence for the check
+ * above: the halt row is committed after the fault boundary BY DESIGN. So each
+ * of the three outage scenarios now expects EXACTLY ONE row version committed
+ * after the boundary — the halt's `ops.incidents` row — and nothing else, in
+ * any table (`expectOnlyTheHaltRecordAfter`). It reads that row back whole:
+ * GLOBAL scope, `TRANSPORT_UNAVAILABLE`, `FULL_HALT`, the registered instance,
+ * the detail and instant the exit snapshot reports. The settle also asserts
+ * that every event-triggered decision row carries its event's dispatch
+ * position (`gateway_epoch`, `ingest_seq`; `H1R1-PROVENANCE`).
+ *
+ * ## The process clock (`CO2-N1`, ADR-031, 2026-10-03)
+ *
+ * `startup()` builds its own `SystemPaperClock`, and ADR-031's entry guard
+ * reads it at admission. Against the fixture's `2026-03-04` events the host
+ * clock as-is is months late, so the settle's entry was refused and nothing
+ * filled. While the six events are published and settled
+ * ({@link publishSixAndSettle}), every `SystemPaperClock` now reads the host
+ * clock RE-BASED to the fixture's first event (`support/host-clock.ts`,
+ * `rebaseSystemPaperClock`: the prototype's `now()` only — not the global
+ * `Date`, so the database, the transport and the bounds measured here keep
+ * real time). The lag the guard sees is the real processing delay. The
+ * re-basing is restored once the process is quiescent, before any fault.
+ *
  * ## What it does NOT prove (disclosed)
  *
- * - **The halt is not read back from PostgreSQL**, because the trader writes
- *   no halt row anywhere. The `TraderStore` port has no halt write
- *   (`packages/trading-core/src/ports.ts`), and `ops.risk_events` /
- *   `ops.incidents` have no writer in `apps/trader`. The halt is read from the
- *   process's own exit snapshot and its HALT line. Its durable consequence —
- *   no row written after it — is read from PostgreSQL. A durable halt record
- *   is a store-port change outside `OUTAGE-1`'s grant; it is reported, not
- *   invented here.
  * - "No order after the outage" is shown on the process's own counters and
  *   the durable rows. The paper process persists no `execution.orders` row at
  *   all (`RECON2-DURABLE`), so there is no order table to read.
@@ -146,7 +167,8 @@ import type { LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { EXIT_CODES, REDIS_RESPONSE_TIMEOUT_ENV, startup } from "../../../apps/trader/src/main.js";
-import { recordedEvents, safeEnvironment } from "./support/fixture.js";
+import { GATEWAY_EPOCH, recordedEvents, safeEnvironment } from "./support/fixture.js";
+import { FIXTURE_FIRST_EVENT_AT, rebaseSystemPaperClock } from "./support/host-clock.js";
 import {
   CONDITION_ID,
   documentFor,
@@ -398,19 +420,25 @@ async function publishSixAndSettle(options: {
 }): Promise<Settled> {
   const { publisher, stream, consumerId, label, healthUrl, context, registered } = options;
   const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
-  for (const event of events) {
-    await publisher.publish(stream, event.envelope);
+  // `CO2-N1` (ADR-031): the process's clock, re-based to the first event while the six are admitted.
+  const rebased = rebaseSystemPaperClock(FIXTURE_FIRST_EVENT_AT);
+  try {
+    for (const event of events) {
+      await publisher.publish(stream, event.envelope);
+    }
+    await waitFor(
+      `the process's pump to commit its position past all ${String(events.length)} events ` +
+        `(consumer "${consumerId}" at lag 0), which it does only after drain() — every durable write — returned`,
+      60_000,
+      async () => {
+        const metrics = await publisher.streamMetrics(stream);
+        const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
+        return metrics.publishedTotal === events.length && lag === 0 ? metrics : undefined;
+      },
+    );
+  } finally {
+    rebased.restore();
   }
-  await waitFor(
-    `the process's pump to commit its position past all ${String(events.length)} events ` +
-      `(consumer "${consumerId}" at lag 0), which it does only after drain() — every durable write — returned`,
-    60_000,
-    async () => {
-      const metrics = await publisher.streamMetrics(stream);
-      const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
-      return metrics.publishedTotal === events.length && lag === 0 ? metrics : undefined;
-    },
-  );
   const health = await readHealth(healthUrl);
   const rows = await durableRows(context, registered);
   const settled = { health, rows };
@@ -427,6 +455,19 @@ async function publishSixAndSettle(options: {
 
   expect(settled.health.halts).toEqual([]);
   expect(settled.health.healthy).toBe(true);
+  // `PROVENANCE-1`: every decision a published event triggered carries that
+  // envelope's own dispatch position; a loop-originated one carries none.
+  const published = new Map(events.map((event) => [event.envelope.eventId, event.envelope]));
+  for (const row of settled.rows.decisions) {
+    if (row.source_event_id === null) {
+      expect([row.gateway_epoch, row.ingest_seq]).toEqual([null, null]);
+      continue;
+    }
+    const envelope = published.get(row.source_event_id);
+    expect(envelope, `decision ${String(row.evaluation_seq)} names an unpublished event`).toBeDefined();
+    expect([row.gateway_epoch, row.ingest_seq]).toEqual([GATEWAY_EPOCH, envelope?.ingestSeq]);
+  }
+  expect(settled.rows.decisions.filter((row) => row.ingest_seq !== null).length).toBeGreaterThanOrEqual(3);
   expect(settled.health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
   expect(settled.rows.decisions.some((row) => row.decision_type === "enter")).toBe(true);
   expect(settled.rows.transactions.length).toBeGreaterThanOrEqual(2);
@@ -518,10 +559,7 @@ async function expectNothingTradedOrWrittenAfter(
 ): Promise<void> {
   expect(tradingCounters(exitHealth(run))).toEqual(tradingCounters(before.health));
 
-  expect(
-    await writesCommittedAfter(context, boundary),
-    `a row was committed after the fault boundary (PostgreSQL clock ${boundary.at}), which the halt follows`,
-  ).toEqual([]);
+  await expectOnlyTheHaltRecordAfter(run, context, registered, boundary);
 
   const rows = await durableRows(context, registered);
   expect(rows.decisions).toEqual(before.rows.decisions);
@@ -531,6 +569,59 @@ async function expectNothingTradedOrWrittenAfter(
   // The one table the store may UPDATE (`replacePnlSnapshot`): compared whole.
   expect(rows.snapshots).toEqual(before.rows.snapshots);
   for (const row of rows.entries) expect(typeof row.amount).toBe("string");
+}
+
+/**
+ * `PROVENANCE-1` (`OUT2-R1-HALT-RECORD-INTERACTION`): the ONE write after the
+ * fault boundary is the halt's own durable record — exactly one row version,
+ * in `ops.incidents`, and nothing in any other table. That row is read back
+ * whole: the GLOBAL `TRANSPORT_UNAVAILABLE` (`FULL_HALT`) the exit snapshot
+ * reports, for the one registered instance, at the halt's own instant.
+ */
+async function expectOnlyTheHaltRecordAfter(
+  run: ProcessRun,
+  context: TestContext,
+  registered: Registered,
+  boundary: FaultBoundary,
+): Promise<void> {
+  expect(
+    await writesCommittedAfter(context, boundary),
+    `after the fault boundary (PostgreSQL clock ${boundary.at}), which the halt follows, the ONLY write may be ` +
+      "the halt's own ops.incidents row",
+  ).toEqual(["ops.incidents: 1 row version(s)"]);
+  const halts = exitHealth(run).halts;
+  expect(halts).toHaveLength(1);
+  const halt = halts[0];
+  if (halt === undefined) throw new Error("unreachable");
+  const incidents = await context.db.selectFrom("ops.incidents").selectAll().execute();
+  expect(incidents).toHaveLength(1);
+  expect(incidents[0]).toMatchObject({
+    incident_key: "TRADER_HALT:GLOBAL",
+    environment: "PAPER",
+    account_ref: "paper-account",
+    severity: "PAGE",
+    status: "OPEN",
+    failure_class: "TRANSPORT_UNAVAILABLE",
+    action: "FULL_HALT",
+    market_id: null,
+    instance_id: registered.instanceId,
+    data_quality_incident_id: null,
+    detail: halt.detail.length <= 2000 ? halt.detail : expect.stringContaining("truncated to fit internal.detail"),
+    resolution: null,
+    acknowledged_at: null,
+    resolved_at: null,
+  });
+  expect(Date.parse(String(incidents[0]?.opened_at))).toBe(Date.parse(halt.at));
+  expect(run.text()).toContain(
+    "halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL TRANSPORT_UNAVAILABLE)",
+  );
+  // The halt record follows the HALT line and the exit snapshot, and precedes the closes.
+  const order = run.lines.map(({ line }) => line);
+  expect(order.findIndex((line) => line.startsWith("halt record: "))).toBeGreaterThan(
+    order.findIndex((line) => line.startsWith("health: {")),
+  );
+  // This run's entry was approved: no refusal row.
+  expect(await context.db.selectFrom("ops.risk_events").selectAll().execute()).toEqual([]);
 }
 
 /**
@@ -733,11 +824,9 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
         expect(exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
           ["GLOBAL", "TRANSPORT_UNAVAILABLE", "FULL_HALT"],
         ]);
-        // Nothing was written after the halt, nor at any point: the stream never carried an event.
-        expect(
-          await writesCommittedAfter(context, boundary),
-          `a row was committed after the fault boundary (PostgreSQL clock ${boundary.at}), which the halt follows`,
-        ).toEqual([]);
+        // Nothing was written after the halt but its own record, nor at any
+        // point before it: the stream never carried an event.
+        await expectOnlyTheHaltRecordAfter(run, context, registered, boundary);
         const rows = await durableRows(context, registered);
         expect(rows.decisions).toHaveLength(0);
         expect(rows.checkpoints).toHaveLength(0);

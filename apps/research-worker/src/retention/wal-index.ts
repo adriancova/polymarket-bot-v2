@@ -170,11 +170,13 @@ function overlapsSpan(left: Span, right: Span): boolean {
  *   reach `ingestSeq` (that segment's last). Every frame dispatched before it
  *   is then processed, whatever it is stamped.
  * - `past-epoch-end`: the epoch ended (its newest segment was sealed by a
- *   shutdown, a recovery or a write fault) inside the window's range; the
- *   frontier must pass `ingestSeq` (the epoch's last frame).
+ *   shutdown, a recovery or a write fault) inside the window's range, after
+ *   `ingestSeq` (the epoch's last frame). Only a trader that MOVED ON to a
+ *   later epoch in the same run meets it (`DispatchFrontier.completedEpochs`;
+ *   {@link meetsRequirement} says why a frontier inside the epoch cannot).
  *
- * Either is also met when the trader moved on to a later epoch in the same
- * run (`DispatchFrontier.completedEpochs`).
+ * `past-segment` is also met when the trader moved on to a later epoch in the
+ * same run.
  */
 export type DispatchRequirement = {
   readonly gatewayEpoch: string;
@@ -225,7 +227,17 @@ export function dispatchRequirements(
   return { ok: true, requirements };
 }
 
-/** One responsible instance's durable dispatch-order progress. */
+/**
+ * One responsible instance's durable dispatch-order progress.
+ *
+ * What it shows, and what it does not (`PROVENANCE-1` r1, `PROV1-R1-01`): a
+ * durable decision at `(epoch, n)` shows that every event dispatched BEFORE
+ * `n` in the epoch was processed with its rows durable
+ * (`evidence-postgres.ts`, the frontier's contract). It does NOT show that
+ * event `n`'s own rows are: the trading core makes a decision durable BEFORE
+ * its placement (`DURABLE-1`), so the fill that placement produces is
+ * written after the decision that carries `n`.
+ */
 export type DispatchFrontier = {
   /** Per gateway epoch, the largest `ingestSeq` of the instance's durable decisions. */
   readonly byEpoch: ReadonlyMap<string, string>;
@@ -233,13 +245,32 @@ export type DispatchFrontier = {
   readonly completedEpochs: ReadonlySet<string>;
 };
 
-/** Whether one frontier meets one requirement. */
+/**
+ * Whether one frontier meets one requirement.
+ *
+ * - `past-segment`: the frontier reaches the last frame of a segment that does
+ *   not overlap the range. Every event dispatched before the frontier's own
+ *   is complete, and the frontier's own event, whose rows may still be
+ *   pending, lies at or after that frame: outside the range. So does every
+ *   halt the process can still latch, which is stamped at the instant of the
+ *   last event it processed (at or after the frontier's).
+ * - `past-epoch-end`: met ONLY when the run moved on to a later epoch
+ *   (`completedEpochs`). A frontier inside the ended epoch, even past its last
+ *   frame, cannot meet it: its own event is one of the epoch's last, stamped
+ *   inside the range, and no later event of the epoch exists to show that
+ *   event's rows were completed. Its fill may still be pending (`PROV1-R1-01`:
+ *   reproduced, a window classified `intent` and its raw expired while its
+ *   fill's insert waited on a lock), and a halt latched later is stamped at
+ *   that same instant. A later epoch's decision of the same run is made only
+ *   after every event before it was completed, and only by a run that did not
+ *   halt (a halt stops it).
+ */
 export function meetsRequirement(frontier: DispatchFrontier, requirement: DispatchRequirement): boolean {
   if (frontier.completedEpochs.has(requirement.gatewayEpoch)) return true;
+  if (requirement.kind === "past-epoch-end") return false;
   const reached = frontier.byEpoch.get(requirement.gatewayEpoch);
   if (reached === undefined) return false;
-  const order = compareUnsignedIntegerStrings(reached, requirement.ingestSeq);
-  return requirement.kind === "past-segment" ? order >= 0 : order > 0;
+  return compareUnsignedIntegerStrings(reached, requirement.ingestSeq) >= 0;
 }
 
 /** Where a source event `(gatewayEpoch, ingestSeq)` lies in the sealed WAL. */

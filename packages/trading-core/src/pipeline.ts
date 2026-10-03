@@ -205,14 +205,26 @@ export interface RiskInputContext {
   readonly strategyStatePermitsIntent: boolean;
   readonly market: MarketState;
   readonly marketConfig: MarketConfig;
-  /** Whole seconds to close, from the loop's instant. Absent = unknown. */
+  /**
+   * Whole seconds to close, from the later of the event instant and the
+   * process instant (`CO2-N1`, ADR-031 R4). Absent = unknown.
+   */
   readonly secondsToClose: number | undefined;
   /** §9.8 check 8: the book applied its last update without refusing. */
   readonly bookSynchronized: boolean;
   /** Measured book age in milliseconds at the loop's instant. */
   readonly venueBookAgeMs: number;
-  /** Measured feature-snapshot age in milliseconds. */
-  readonly featuresAgeMs: number;
+  /**
+   * Measured feature-snapshot age in milliseconds: for a placement, the
+   * trader's lag behind the event it evaluated, `max(0, processNow −
+   * eventNow)` (`CO2-N1`, ADR-031 R3).
+   *
+   * `undefined` when the process clock's reading could not be read (R5). It
+   * is propagated as an OMITTED observation, exactly as
+   * {@link referenceFeedAgeMs} is, so §9.8 check 7 reads the features feed as
+   * `UNKNOWN` and refuses an entry — never a zero nobody measured.
+   */
+  readonly featuresAgeMs: number | undefined;
   /**
    * Measured reference-feed age in milliseconds, or `undefined` when this
    * process has seen no reference event at all.
@@ -265,7 +277,9 @@ export interface RiskInputContext {
  * closed on an unknown, and manufacturing a value here would convert a
  * fail-closed check into a fail-open one. `secondsToClose`, `availableRequests`,
  * `exposures` and `allocation` are therefore omitted when the loop does not
- * know them, rather than defaulted.
+ * know them, rather than defaulted — and so are the `FEATURES` and
+ * `REFERENCE_FEED` freshness measurements (`CO2-N1`: an unreadable process
+ * clock leaves the features age unmeasured).
  *
  * For `exposures` and `allocation` the loop DOES know them: `allocation.ts`
  * asks `packages/capital-allocator` before every risk check, and this function
@@ -304,7 +318,7 @@ export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
     markets: [market],
     freshness: [
       { feed: "VENUE_BOOK", marketId: context.marketConfig.marketId, ageMs: context.venueBookAgeMs },
-      { feed: "FEATURES", ageMs: context.featuresAgeMs },
+      ...(context.featuresAgeMs === undefined ? [] : [{ feed: "FEATURES", ageMs: context.featuresAgeMs }]),
       ...(context.referenceFeedAgeMs === undefined
         ? []
         : [{ feed: "REFERENCE_FEED", ageMs: context.referenceFeedAgeMs }]),

@@ -197,15 +197,42 @@ describe("a trader-responsible window is classified only once the trader's rows 
       state: "unclassified",
       reason: expect.stringMatching(/epoch epoch-1 has not sealed a segment after the window's range/u),
     });
-    // An epoch that ENDED there needs the trader past its last frame.
+    // An epoch that ENDED there needs the trader to have MOVED ON from it.
     const ended = wal([
       seg({ index: 0, first: "1", last: "10", fromMs: START - 20 * MIN, toMs: END + 30 * MIN, closeReason: "shutdown" }),
       seg({ index: 0, first: "1", last: "3", fromMs: END + 40 * MIN, toMs: END + 50 * MIN, epoch: "epoch-2" }),
     ]);
+    expect(dispatchRequirements(ended, potentialRange(WINDOW, LEAD_IN, GRACE))).toStrictEqual({
+      ok: true,
+      requirements: [{ gatewayEpoch: E, kind: "past-epoch-end", ingestSeq: "10" }],
+    });
     const atLast = dispatchFrontier({ [E]: "10" });
     expect(await classify({ wal: ended, frontiers: { a: atLast, b: atLast } })).toMatchObject({ state: "unclassified" });
-    const pastLast = dispatchFrontier({ [E]: "11" });
-    expect(await classify({ wal: ended, frontiers: { a: pastLast, b: pastLast } })).toMatchObject({ state: "classified" });
+    // `PROVENANCE-1` r1 (`PROV1-R1-01`): a frontier PAST the epoch's last
+    // frame, inside the epoch, is NOT enough. It is the decision of one of the
+    // epoch's last events — stamped inside the range — and that event's own
+    // rows (the fill its placement produces, after the decision is durable)
+    // may still be pending; no later event of the epoch can show otherwise.
+    for (const insideTheEpoch of ["11", "12", "1000"]) {
+      const frontier = dispatchFrontier({ [E]: insideTheEpoch });
+      expect(await classify({ wal: ended, frontiers: { a: frontier, b: frontier } })).toMatchObject({
+        state: "unclassified",
+        reason: expect.stringMatching(
+          /instance a has not moved past epoch epoch-1, which ended inside the window's range after ingestSeq 10: only a later epoch's decision of the same run/u,
+        ),
+      });
+    }
+    // A run that moved on to a later epoch completed every event of this one
+    // (and did not halt in it: a halt stops the run) — EVERY responsible instance.
+    const movedOn = dispatchFrontier({ [E]: "11", "epoch-2": "2" }, [E]);
+    expect(await classify({ wal: ended, frontiers: { a: movedOn, b: movedOn } })).toMatchObject({ state: "classified" });
+    expect(await classify({ wal: ended, frontiers: { a: movedOn, b: dispatchFrontier({ [E]: "11" }) } })).toMatchObject({
+      state: "unclassified",
+      reason: expect.stringMatching(/instance b has not moved past epoch epoch-1/u),
+    });
+    // Even a run that moved on WITHOUT a decision in the ended epoch's tail.
+    const movedOnEarly = dispatchFrontier({ [E]: "4", "epoch-2": "1" }, [E]);
+    expect(await classify({ wal: ended, frontiers: { a: movedOnEarly, b: movedOnEarly } })).toMatchObject({ state: "classified" });
   });
 
   it("is held by an unreadable sealed segment, and by an unverified one it could overlap", async () => {

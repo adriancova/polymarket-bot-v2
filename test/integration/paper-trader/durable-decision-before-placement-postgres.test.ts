@@ -30,6 +30,14 @@
  * And a control, without the trigger: the same run books its fill, so the
  * zero rows below are the refusal's doing, not an empty fixture.
  *
+ * The clock (`CO2-N1`, ADR-031): the group-commit arm used to hand the trader
+ * the host's `SystemPaperClock` as-is. ADR-031's entry guard reads that clock
+ * at admission, and against the fixture's `2026-03-04` events it refused the
+ * control's entry (lag of months, market closed). The arm now hands it the
+ * same host clock re-based to the fixture's first event
+ * (`support/host-clock.ts`), so the lag is the real processing delay; the
+ * per-row arm keeps the fixture's own clock, as before.
+ *
  * Docker: Testcontainers, its own `beforeAll`, as the other container files
  * of this suite. Throwaway credentials; PAPER only; no venue, no signer.
  */
@@ -40,8 +48,9 @@ import { parseTraderConfig, type TraderStore } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { PostgresTraderStore } from "../../../apps/trader/src/adapters/postgres-store.js";
-import { assembleDurableTrader, SystemPaperClock } from "../../../apps/trader/src/main.js";
+import { assembleDurableTrader } from "../../../apps/trader/src/main.js";
 import { assemble, recordedEvents, safeEnvironment } from "./support/fixture.js";
+import { RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
   CONDITION_ID,
   documentFor,
@@ -126,19 +135,21 @@ async function runGroupCommitting(label: string, connectionString: string, conte
   const parsed = parseTraderConfig(document);
   if (!parsed.ok) throw new Error(`${parsed.refusal.code}: ${parsed.refusal.issues.join("; ")}`);
   const lines: string[] = [];
+  const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
   const assembled = await assembleDurableTrader({
     env: safeEnvironment(),
     config: parsed.config,
     document,
     postgresUrl: connectionString,
-    clock: new SystemPaperClock(),
+    // `CO2-N1` (ADR-031): the host's clock, re-based to the fixture's first event.
+    clock: new RebasedSystemPaperClock(events[0]?.envelope.receivedAt ?? ""),
     log: (line) => {
       lines.push(line);
     },
   });
   if (!assembled.ok) throw new Error(`the durable trader did not assemble:\n${lines.join("\n")}`);
   expect(assembled.trader.loop.groupCommits).toBe(true);
-  for (const event of recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`)) {
+  for (const event of events) {
     expect(assembled.trader.loop.ingest(event)).toBe(true);
   }
   await assembled.trader.loop.drain();
@@ -159,6 +170,7 @@ async function runPerRow(label: string, connectionString: string, context: TestC
     appendLedgerTransaction: (transaction) => store.appendLedgerTransaction(transaction),
     writePnlSnapshot: (snapshot) => store.writePnlSnapshot(snapshot),
     replacePnlSnapshot: (snapshot) => store.replacePnlSnapshot(snapshot),
+    persistRiskRefusal: (refusal) => store.persistRiskRefusal(refusal),
     close: () => store.close(),
   };
   const { result, parts } = assemble({ config: documentFor(registered, label), wrapStore: () => perRow });

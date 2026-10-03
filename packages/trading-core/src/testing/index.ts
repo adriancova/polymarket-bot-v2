@@ -44,6 +44,7 @@ import {
   type IngestedEvent,
   type MarketEventFeed,
   type PortResult,
+  type RiskRefusalRecord,
   type TraderStore,
 } from "../ports.js";
 
@@ -180,11 +181,13 @@ export const MISSING_PNL_SNAPSHOT_DETAIL =
   `the durable store could not replace a PnL snapshot: Error: ${unreplacedPnlSnapshotProblem(0n)}`;
 
 /**
- * The five writes {@link MemoryTraderStore} can be made to fail, by name
- * (`replacePnlSnapshot` since `SNAP-1` r1).
+ * The six writes {@link MemoryTraderStore} can be made to fail, by name
+ * (`replacePnlSnapshot` since `SNAP-1` r1; `persistRiskRefusal` since
+ * `PROVENANCE-1`).
  */
 export type TraderStoreWrite =
   | "persistDecision"
+  | "persistRiskRefusal"
   | "saveCheckpoint"
   | "appendLedgerTransaction"
   | "writePnlSnapshot"
@@ -221,6 +224,8 @@ export class MemoryTraderStore implements TraderStore {
   readonly checkpointInstants: string[] = [];
   readonly transactions: AppendedLedgerTransaction[] = [];
   readonly pnlSnapshots: PnlSnapshot[] = [];
+  /** `PROVENANCE-1`: every recorded risk refusal, in write order. */
+  readonly riskRefusals: RiskRefusalRecord[] = [];
   /**
    * `SNAP-1`: the identity of every snapshot recorded — `pnl_snapshots_scope_unique`
    * — and its position in {@link pnlSnapshots} (r1: where a replacement writes).
@@ -288,6 +293,14 @@ export class MemoryTraderStore implements TraderStore {
     const refused = this.#refusalFor("persistDecision");
     if (refused !== undefined) return await Promise.resolve(refused);
     this.decisions.push({ record, telemetry });
+    return await Promise.resolve(portOk(null));
+  }
+
+  /** `PROVENANCE-1`: records one refused intent, unless an injected failure refuses it. */
+  async persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>> {
+    const refused = this.#refusalFor("persistRiskRefusal");
+    if (refused !== undefined) return await Promise.resolve(refused);
+    this.riskRefusals.push(refusal);
     return await Promise.resolve(portOk(null));
   }
 

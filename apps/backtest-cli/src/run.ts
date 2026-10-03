@@ -121,12 +121,30 @@ export async function runBacktest(options: BacktestRunOptions): Promise<Backtest
   const pins = readRunPins(options.runPins);
   if (!pins.ok) return { ok: false, refusal: pins.refusal };
 
-  const dataset: SimulationResult<ReplayDataset> =
-    options.dataset === undefined
-      ? readDatasetManifestBytes(
-          await readManifestBytes(options.datasetDirectory, options.manifestFileName ?? DATASET_MANIFEST_OBJECT_NAME),
-        )
-      : { ok: true, value: options.dataset };
+  let dataset: SimulationResult<ReplayDataset>;
+  if (options.dataset === undefined) {
+    // `APPROX-REPLAY-1`: a manifest that cannot be read is a REFUSAL, not an
+    // exception out of `verify` (a research-tier directory, say, whose
+    // manifest has another name). Whatever is read goes through the exact
+    // door, which refuses an approximate manifest by its own `fidelity`
+    // (`REPLAY_MANIFEST_APPROXIMATE`), never by a file name.
+    let bytes: Uint8Array;
+    try {
+      bytes = await readManifestBytes(options.datasetDirectory, options.manifestFileName ?? DATASET_MANIFEST_OBJECT_NAME);
+    } catch (error) {
+      return {
+        ok: false,
+        refusal: simulationRefusal(
+          "REPLAY_ARCHIVE_UNREADABLE",
+          `the dataset manifest could not be read (${error instanceof Error ? error.message : String(error)}); ` +
+            "nothing was replayed",
+        ),
+      };
+    }
+    dataset = readDatasetManifestBytes(bytes);
+  } else {
+    dataset = { ok: true, value: options.dataset };
+  }
   if (!dataset.ok) return { ok: false, refusal: dataset.refusal };
 
   const result = await runReplay({

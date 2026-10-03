@@ -17,9 +17,10 @@ import path from "node:path";
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
 import { parseTraderConfig } from "@polymarket-bot/trader";
 
-import { assembleDurableTrader, SystemPaperClock } from "../../../../apps/trader/src/main.js";
+import { assembleDurableTrader } from "../../../../apps/trader/src/main.js";
 import { runRegisterCommand } from "../../../../apps/trader/src/register/main.js";
 import { NO_TOKEN, YES_TOKEN, safeEnvironment, traderConfig } from "./fixture.js";
+import { FIXTURE_FIRST_EVENT_AT, RebasedSystemPaperClock } from "./host-clock.js";
 
 /** The condition id a scenario's template states. */
 export function conditionFor(label: string): string {
@@ -245,7 +246,15 @@ export const ZERO_ROWS: Record<(typeof REGISTRATION_TABLES)[number], number> = {
   "strategy.runs": 0,
 };
 
-/** Runs the durable trader's own assembly on a document, capturing what it logged. */
+/**
+ * Runs the durable trader's own assembly on a document, capturing what it logged.
+ *
+ * `CO2-N1` (ADR-031): the clock is the host's, re-based to the fixture's first
+ * recorded event (`host-clock.ts`). The round trip feeds the fixture's
+ * `2026-03-04` events, and the host clock as-is would have the entry guard
+ * refuse their entry; re-based, the lag is the real processing delay, and the
+ * run decides and fills as it did before ADR-031.
+ */
 export async function assemble(document: unknown, postgresUrl: string) {
   const parsed = parseTraderConfig(document);
   if (!parsed.ok) {
@@ -257,7 +266,7 @@ export async function assemble(document: unknown, postgresUrl: string) {
     config: parsed.config,
     document,
     postgresUrl,
-    clock: new SystemPaperClock(),
+    clock: new RebasedSystemPaperClock(FIXTURE_FIRST_EVENT_AT),
     log: (line) => {
       lines.push(line);
     },

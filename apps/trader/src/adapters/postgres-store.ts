@@ -83,18 +83,22 @@ import {
   RUN_MODES,
   type LedgerScopeValue,
   type PolymarketBotDatabase,
+  type PostgresPool,
   type RunModeValue,
 } from "@polymarket-bot/storage-postgres";
 
-import { unreplacedPnlSnapshotProblem } from "@polymarket-bot/trading-core";
+import { TRADER_RUN_MODE, unreplacedPnlSnapshotProblem } from "@polymarket-bot/trading-core";
 import {
   portFailed,
   portOk,
   type GroupCommit,
   type PortResult,
+  type RiskRefusalRecord,
   type StagedEvaluations,
   type TraderStore,
 } from "@polymarket-bot/trading-core";
+
+import type { HaltIncidentRow, HaltRecordOutcome } from "../halt-record.js";
 
 /**
  * Narrows `scope` from the row's `string` to the column's enumeration.
@@ -138,6 +142,115 @@ export interface PostgresTraderStoreOptions {
   readonly db: PolymarketBotDatabase;
   /** The §10.3 `definitions.decision_contract_version` this run pins. */
   readonly decisionContractVersion: number;
+  /**
+   * `PROVENANCE-1`: the account the run books against, written as
+   * `ops.risk_events.account_ref` (the configuration's
+   * `accounting.accountRef`). Absent: `NULL`.
+   */
+  readonly accountRef?: string;
+  /**
+   * `PROVENANCE-1` r1 (`PROV1-R1-02`): the pool `db` was built over. The
+   * durable halt record ({@link PostgresTraderStore.recordHalts}) checks ONE
+   * connection out of it directly, so that at its deadline that connection
+   * is DESTROYED rather than left checked out: `pool.end()`, which
+   * {@link PostgresTraderStore.close} awaits, waits for every checked-out
+   * connection, so an abandoned one held the process's exit until
+   * PostgreSQL answered. Absent: `recordHalts` writes nothing and answers
+   * `failed` (no bounded connection can be had).
+   */
+  readonly pool?: PostgresPool;
+}
+
+/**
+ * `PROVENANCE-1`: `ops.risk_events.check_code` of a §9.8 pre-trade refusal.
+ * The risk engine evaluates its twenty checks as ONE gate and answers each
+ * failing one by a reason code from its own vocabulary
+ * (`@polymarket-bot/risk` `RISK_REASON_CODES`, grouped there by check). So the
+ * gate is the check, and the row's `reason_code` names which of the twenty
+ * refused — no check-number mapping is invented here.
+ */
+export const PRE_TRADE_RISK_CHECK_CODE = "PRE_TRADE_RISK";
+
+/** `internal.detail` is bounded at 2000 characters (`db/migrations/0001_foundation.up.sql`). */
+export const DETAIL_MAX_CHARACTERS = 2000;
+
+/**
+ * A text bounded to {@link DETAIL_MAX_CHARACTERS} characters (code points, as
+ * PostgreSQL counts them), with a marker saying how much was cut, so a long
+ * cause chain is shortened, never refused by the column's CHECK. The full
+ * text is in the process's own log line.
+ */
+export function boundedDetail(text: string): string {
+  const characters = Array.from(text);
+  if (characters.length <= DETAIL_MAX_CHARACTERS) return text;
+  const marker = ` … [${String(characters.length)} characters; truncated to fit internal.detail]`;
+  return characters.slice(0, DETAIL_MAX_CHARACTERS - Array.from(marker).length).join("") + marker;
+}
+
+/**
+ * `PROVENANCE-1` — the `ops.risk_events` rows of one refused intent: ONE ROW
+ * PER REFUSAL the check answered, in its order, each a `VETOED` §9.8 event.
+ * The ONE binding both {@link PostgresTraderStore.persistRiskRefusal} and the
+ * group commit insert.
+ *
+ * - `run_id`, `instance_id`, `market_id` are the decision's (the startup
+ *   registration check verified all three rows exist, `BOOT-1`);
+ * - `intent_id` is `NULL`: it is a foreign key into `strategy.intents`, which
+ *   this process does not write (the same reason the ledger header's fill link
+ *   is `NULL`; see {@link PostgresTraderStore.appendLedgerTransaction}). The
+ *   strategy's own intent id is in `measures`;
+ * - `measures` carries the decision's `evaluationSeq`, the intent id, the
+ *   protective-exit flag, every reason code of the evaluation and the
+ *   decision's dispatch position — strings and booleans only, bound as TEXT
+ *   (`encodeJsonbText`, the `SER-2` rule);
+ * - `occurred_at` is the evaluation's instant, the decision's `evaluated_at`.
+ *
+ * `ops.risk_events` is append-only (`internal.enforce_append_only`): the rows
+ * are only ever inserted.
+ */
+/** One `ops.risk_events` row as this adapter binds it (`db/migrations/0007_ops.up.sql`). */
+export interface RiskEventRow {
+  readonly environment: typeof TRADER_RUN_MODE;
+  readonly account_ref: string | null;
+  readonly run_id: string;
+  readonly instance_id: string;
+  readonly market_id: string;
+  readonly intent_id: null;
+  readonly check_code: typeof PRE_TRADE_RISK_CHECK_CODE;
+  readonly outcome: "VETOED";
+  readonly reason_code: string;
+  readonly measures: string;
+  readonly detail: string;
+  readonly occurred_at: string;
+}
+
+export function riskEventRows(refusal: RiskRefusalRecord, accountRef: string | null): RiskEventRow[] {
+  const measures = encodeJsonbText(
+    {
+      evaluationSeq: String(refusal.evaluationSeq),
+      intentId: refusal.intentId,
+      protectiveExit: refusal.protectiveExit,
+      reasonCodes: refusal.refusals.map((entry) => entry.code),
+      sourceEventId: refusal.sourceEvent?.eventId ?? null,
+      gatewayEpoch: refusal.sourceEvent?.gatewayEpoch ?? null,
+      ingestSeq: refusal.sourceEvent?.ingestSeq ?? null,
+    },
+    "risk_events.measures",
+  );
+  return refusal.refusals.map((entry): RiskEventRow => ({
+    environment: TRADER_RUN_MODE,
+    account_ref: accountRef,
+    run_id: refusal.runId,
+    instance_id: refusal.instanceId,
+    market_id: refusal.marketId,
+    intent_id: null,
+    check_code: PRE_TRADE_RISK_CHECK_CODE,
+    outcome: "VETOED",
+    reason_code: entry.code,
+    measures,
+    detail: boundedDetail(entry.message),
+    occurred_at: refusal.occurredAt,
+  }));
 }
 
 /**
@@ -159,11 +272,21 @@ function decisionRow(record: DecisionRecord, telemetry: DecisionTelemetry, decis
     decision_contract_version: decisionContractVersion,
     reason_codes: [...record.decision.reasonCodes],
     feature_snapshot_ref: record.decision.featureSnapshotRef,
+    // `PROVENANCE-1`: NULL on purpose. The column is a foreign key into
+    // `data.feature_snapshot_index`, which nothing in this repository writes
+    // (its `feature_set_id` needs a `data.feature_sets` row, its
+    // `content_hash` the archived snapshot bytes, and neither is produced).
+    // The decision's feature snapshot is named by `feature_snapshot_ref`, the
+    // engine's own content address, which a replay of the same events
+    // re-derives (§12.4). An id here would point at no row.
     feature_snapshot_id: null,
     model_outputs: modelOutputs,
     state_patch: statePatch,
     next_wakeup_at: record.decision.nextWakeupAt ?? null,
     source_event_id: record.sourceEvent?.eventId ?? null,
+    // `PROVENANCE-1`: the loop now supplies both (`#buildEvaluationInput`),
+    // from the triggering envelope's own §7.1 fields; NULL only for an
+    // evaluation the loop originates (`onFill`, `onOrderUpdate`).
     gateway_epoch: record.sourceEvent?.gatewayEpoch ?? null,
     ingest_seq: record.sourceEvent?.ingestSeq ?? null,
     intent_count: record.decision.intents.length,
@@ -231,13 +354,17 @@ const GROUP_COMMIT_ROWS_PER_STATEMENT = 1_000;
 export class PostgresGroupCommit implements GroupCommit {
   readonly #db: PolymarketBotDatabase;
   readonly #decisionContractVersion: number;
+  readonly #accountRef: string | null;
   #decisions: ReturnType<typeof decisionRow>[] = [];
   #checkpoints: ReturnType<typeof checkpointRow>[] = [];
+  /** `PROVENANCE-1`: the staged `ops.risk_events` rows ({@link riskEventRows}). */
+  #riskEvents: ReturnType<typeof riskEventRows> = [];
   #events = 0;
 
-  constructor(db: PolymarketBotDatabase, decisionContractVersion: number) {
+  constructor(db: PolymarketBotDatabase, decisionContractVersion: number, accountRef: string | null = null) {
     this.#db = db;
     this.#decisionContractVersion = decisionContractVersion;
+    this.#accountRef = accountRef;
   }
 
   get stagedEvents(): number {
@@ -247,16 +374,22 @@ export class PostgresGroupCommit implements GroupCommit {
   stage(evaluations: StagedEvaluations): PortResult<null> {
     let decisions: ReturnType<typeof decisionRow>[];
     let checkpoints: ReturnType<typeof checkpointRow>[];
+    let riskEvents: ReturnType<typeof riskEventRows>;
     try {
       decisions = evaluations.decisions.map((entry) =>
         decisionRow(entry.record, entry.telemetry, this.#decisionContractVersion),
       );
       checkpoints = evaluations.checkpoints.map((entry) => checkpointRow(entry.checkpoint, entry.capturedAt));
+      riskEvents = evaluations.riskRefusals.flatMap((refusal) => riskEventRows(refusal, this.#accountRef));
     } catch (cause) {
-      return portFailed("UNAVAILABLE", `the durable store could not stage a decision or checkpoint: ${describeCause(cause)}`);
+      return portFailed(
+        "UNAVAILABLE",
+        `the durable store could not stage a decision, checkpoint or risk refusal: ${describeCause(cause)}`,
+      );
     }
     this.#decisions.push(...decisions);
     this.#checkpoints.push(...checkpoints);
+    this.#riskEvents.push(...riskEvents);
     // One per `stage` call — one per frame the loop flushes (`TP2-R1-M2`).
     this.#events += 1;
     return portOk(null);
@@ -265,15 +398,21 @@ export class PostgresGroupCommit implements GroupCommit {
   async commit(): Promise<PortResult<{ readonly decisions: number; readonly checkpoints: number }>> {
     const decisions = this.#decisions;
     const checkpoints = this.#checkpoints;
+    const riskEvents = this.#riskEvents;
     const events = this.#events;
     this.#decisions = [];
     this.#checkpoints = [];
+    this.#riskEvents = [];
     this.#events = 0;
-    if (decisions.length === 0 && checkpoints.length === 0) {
+    if (decisions.length === 0 && checkpoints.length === 0 && riskEvents.length === 0) {
       return portOk({ decisions: 0, checkpoints: 0 });
     }
     try {
-      if (
+      if (riskEvents.length > 0) {
+        // `PROVENANCE-1`: a batch that carries refusals. A batch WITHOUT them
+        // takes exactly the statements below, unchanged.
+        await this.#commitWithRiskEvents(decisions, checkpoints, riskEvents);
+      } else if (
         decisions.length > 0 &&
         checkpoints.length > 0 &&
         decisions.length + checkpoints.length <= GROUP_COMMIT_ROWS_PER_STATEMENT
@@ -314,12 +453,75 @@ export class PostgresGroupCommit implements GroupCommit {
     } catch (cause) {
       return portFailed(
         "UNAVAILABLE",
-        `the durable store could not commit a batch of ${String(decisions.length)} decision(s) and ` +
-          `${String(checkpoints.length)} checkpoint(s) from ${String(events)} event(s); nothing of it ` +
-          `was committed: ${describeCause(cause)}`,
+        `the durable store could not commit a batch of ${String(decisions.length)} decision(s), ` +
+          `${String(checkpoints.length)} checkpoint(s) and ${String(riskEvents.length)} risk event(s) ` +
+          `from ${String(events)} event(s); nothing of it was committed: ${describeCause(cause)}`,
       );
     }
     return portOk({ decisions: decisions.length, checkpoints: checkpoints.length });
+  }
+
+  /**
+   * `PROVENANCE-1` — a batch with `ops.risk_events` rows, still ATOMIC: within
+   * {@link GROUP_COMMIT_ROWS_PER_STATEMENT} rows, ONE statement (the other
+   * tables' inserts as data-modifying `WITH` members, which PostgreSQL runs to
+   * completion), otherwise chunked inserts inside one explicit transaction.
+   * Either way every row of the batch commits together or not at all.
+   */
+  async #commitWithRiskEvents(
+    decisions: ReturnType<typeof decisionRow>[],
+    checkpoints: ReturnType<typeof checkpointRow>[],
+    riskEvents: ReturnType<typeof riskEventRows>,
+  ): Promise<void> {
+    if (decisions.length + checkpoints.length + riskEvents.length <= GROUP_COMMIT_ROWS_PER_STATEMENT) {
+      if (decisions.length > 0 && checkpoints.length > 0) {
+        await this.#db
+          .with("staged_decisions", (db) => db.insertInto("strategy.decisions").values(decisions).returning("decision_id"))
+          .with("staged_risk_events", (db) =>
+            db.insertInto("ops.risk_events").values(riskEvents).returning("risk_event_id"),
+          )
+          .insertInto("strategy.state_checkpoints")
+          .values(checkpoints)
+          .execute();
+      } else if (decisions.length > 0) {
+        await this.#db
+          .with("staged_decisions", (db) => db.insertInto("strategy.decisions").values(decisions).returning("decision_id"))
+          .insertInto("ops.risk_events")
+          .values(riskEvents)
+          .execute();
+      } else if (checkpoints.length > 0) {
+        await this.#db
+          .with("staged_risk_events", (db) =>
+            db.insertInto("ops.risk_events").values(riskEvents).returning("risk_event_id"),
+          )
+          .insertInto("strategy.state_checkpoints")
+          .values(checkpoints)
+          .execute();
+      } else {
+        await this.#db.insertInto("ops.risk_events").values(riskEvents).execute();
+      }
+      return;
+    }
+    await this.#db.transaction().execute(async (trx) => {
+      for (let start = 0; start < decisions.length; start += GROUP_COMMIT_ROWS_PER_STATEMENT) {
+        await trx
+          .insertInto("strategy.decisions")
+          .values(decisions.slice(start, start + GROUP_COMMIT_ROWS_PER_STATEMENT))
+          .execute();
+      }
+      for (let start = 0; start < checkpoints.length; start += GROUP_COMMIT_ROWS_PER_STATEMENT) {
+        await trx
+          .insertInto("strategy.state_checkpoints")
+          .values(checkpoints.slice(start, start + GROUP_COMMIT_ROWS_PER_STATEMENT))
+          .execute();
+      }
+      for (let start = 0; start < riskEvents.length; start += GROUP_COMMIT_ROWS_PER_STATEMENT) {
+        await trx
+          .insertInto("ops.risk_events")
+          .values(riskEvents.slice(start, start + GROUP_COMMIT_ROWS_PER_STATEMENT))
+          .execute();
+      }
+    });
   }
 }
 
@@ -327,10 +529,39 @@ function describeCause(cause: unknown): string {
   return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
 }
 
+/**
+ * `PROVENANCE-1` r1 — what the halt record uses of a pooled `pg` connection.
+ * `release(error)` is `pg-pool`'s: an error makes the pool DROP the
+ * connection, and `pg` then destroys its socket when a query is in flight.
+ */
+interface HaltRecordConnection {
+  query(text: string, values?: unknown[]): Promise<unknown>;
+  release(destroy?: Error): void;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  removeListener(event: "error", listener: (error: Error) => void): unknown;
+}
+
+/**
+ * `PROVENANCE-1` r1 — the halt record's listener for its connection's
+ * `error` event while it holds the connection. `pg-pool` removes its own
+ * listener from a connection it hands out, and a `pg` client whose socket
+ * dies (the server killed, the link reset) emits `error` after failing the
+ * query in flight; with no listener that is an uncaught exception, and the
+ * process would crash (exit 1) instead of exiting `halted` (75). The query's
+ * own failure already reaches `recordHalts`, which destroys the connection;
+ * this only keeps the event from escaping.
+ */
+function ignoreConnectionError(): void {
+  // Deliberately empty: see above.
+}
+
 export class PostgresTraderStore implements TraderStore {
   readonly #db: PolymarketBotDatabase;
   readonly #ledger: ReturnType<typeof createLedgerRepository>;
   readonly #decisionContractVersion: number;
+  readonly #accountRef: string | null;
+  /** `PROVENANCE-1` r1: where the halt record checks its one connection out ({@link PostgresTraderStoreOptions.pool}). */
+  readonly #pool: PostgresPool | undefined;
   /** `THROUGHPUT-1a`: the store's group commit (see {@link PostgresGroupCommit}). */
   readonly groupCommit: PostgresGroupCommit;
 
@@ -338,7 +569,135 @@ export class PostgresTraderStore implements TraderStore {
     this.#db = options.db;
     this.#ledger = createLedgerRepository(options.db);
     this.#decisionContractVersion = options.decisionContractVersion;
-    this.groupCommit = new PostgresGroupCommit(options.db, options.decisionContractVersion);
+    this.#accountRef = options.accountRef ?? null;
+    this.#pool = options.pool;
+    this.groupCommit = new PostgresGroupCommit(options.db, options.decisionContractVersion, this.#accountRef);
+  }
+
+  /**
+   * `PROVENANCE-1`: one refused intent's `ops.risk_events` rows
+   * ({@link riskEventRows}), in ONE multi-row insert. The per-row path; the
+   * group commit stages the same rows with the event's others.
+   */
+  async persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>> {
+    return await this.#contained("persist a risk refusal", async () => {
+      await this.#db.insertInto("ops.risk_events").values(riskEventRows(refusal, this.#accountRef)).execute();
+    });
+  }
+
+  /**
+   * `PROVENANCE-1` — writes a halt's `ops.incidents` rows
+   * (`halt-record.ts`, `haltIncidentRows`) in one transaction, and answers
+   * within `deadlineMs` whatever the database does. NEVER throws, and never
+   * holds the caller past the bound: the process exits after this whether or
+   * not the rows were written (fail closed — the halt is already latched and
+   * nothing trades; the record is what an operator and the research worker
+   * read afterwards).
+   *
+   * The transaction runs on ONE connection this method checks out of the
+   * pool itself ({@link PostgresTraderStoreOptions.pool}), and owns until it
+   * gives it back. Two bounds, because a database can fail two ways:
+   *
+   * - one that ANSWERS slowly (a lock, an overloaded server): the transaction
+   *   first sets its own `statement_timeout` to `deadlineMs`
+   *   (`set_config(..., true)`, local to this transaction), so the SERVER
+   *   cancels the insert at the bound — the backend does not outlive it;
+   * - one that does NOT ANSWER (frozen, partitioned): a timer of `deadlineMs`
+   *   (unreferenced, so it never keeps the process alive) answers
+   *   `unconfirmed` AND DESTROYS the connection — it is released WITH AN
+   *   ERROR, so the pool drops it and `pg` closes its socket at once (a query
+   *   is in flight). `PROVENANCE-1` r1 (`PROV1-R1-02`): the first round only
+   *   raced the timer, which left the connection checked out; the store's
+   *   close (`pool.end()`) then waited for it, and the process did not exit
+   *   until PostgreSQL answered (reproduced by both reviewers, a frozen server
+   *   behind a proxy and `docker pause`). A connection the pool hands over
+   *   only after the bound is destroyed the moment it arrives. One the pool
+   *   is still OPENING at the bound is the pool's: its own connection
+   *   timeout (`createPostgresPool`, 10 s by default) ends it, and the
+   *   store's close waits at most that long for it.
+   *
+   * A refused or reset connection fails at once, and a socket that dies
+   * while the record holds it is the record's failure, never an uncaught
+   * `error` event ({@link ignoreConnectionError}). A statement that fails also
+   * destroys the connection: it is never handed back to the pool inside an
+   * aborted transaction. An answer after the bound is not reported as
+   * written: the outcome is `unconfirmed`, and says the rows may or may not
+   * exist (a `COMMIT` already sent can still land).
+   */
+  async recordHalts(rows: readonly HaltIncidentRow[], deadlineMs: number): Promise<HaltRecordOutcome> {
+    if (rows.length === 0) return { status: "written", rows: 0 };
+    const pool = this.#pool;
+    if (pool === undefined) {
+      return {
+        status: "failed",
+        detail:
+          "this store was built without its connection pool, so the halt record has no connection it can " +
+          "bound and destroy; nothing was written",
+      };
+    }
+    let connection: HaltRecordConnection | undefined;
+    let returned = false;
+    let abandoned = false;
+    // Gives the connection back ONCE: plainly after a commit, or WITH AN
+    // ERROR — which makes the pool drop it and `pg` destroy its socket.
+    const giveBack = (destroy: Error | undefined): void => {
+      if (connection === undefined || returned) return;
+      returned = true;
+      try {
+        connection.release(destroy);
+      } catch {
+        // `pg-pool` throws only on a second release, which `returned` rules out.
+      }
+      // Released first: the pool has attached its own listener again.
+      connection.removeListener("error", ignoreConnectionError);
+    };
+    const write = (async (): Promise<HaltRecordOutcome> => {
+      try {
+        // The statements, compiled by the typed builder (a wrong column name
+        // fails the compiler), run on the one connection this method owns.
+        const bound = this.#db
+          .selectNoFrom((eb) =>
+            eb.fn<string>("set_config", [eb.val("statement_timeout"), eb.val(String(deadlineMs)), eb.val(true)]).as("bound"),
+          )
+          .compile();
+        const insert = this.#db.insertInto("ops.incidents").values([...rows]).compile();
+        const acquired: HaltRecordConnection = await pool.connect();
+        acquired.on("error", ignoreConnectionError);
+        connection = acquired;
+        if (abandoned) {
+          giveBack(new Error(`the halt record's connection arrived after its ${String(deadlineMs)} ms bound`));
+          return { status: "failed", detail: "the connection arrived after the bound" };
+        }
+        await acquired.query("begin");
+        await acquired.query(bound.sql, [...bound.parameters]);
+        await acquired.query(insert.sql, [...insert.parameters]);
+        await acquired.query("commit");
+        giveBack(undefined);
+        return { status: "written", rows: rows.length };
+      } catch (cause) {
+        giveBack(cause instanceof Error ? cause : new Error(String(cause)));
+        return { status: "failed", detail: describeCause(cause) };
+      }
+    })();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<HaltRecordOutcome>((resolve) => {
+      timer = setTimeout(() => {
+        abandoned = true;
+        giveBack(new Error(`the halt record did not answer within ${String(deadlineMs)} ms`));
+        resolve({
+          status: "unconfirmed",
+          detail:
+            `the database did not answer within ${String(deadlineMs)} ms; the halt's rows may or may ` +
+            "not have been written",
+        });
+      }, deadlineMs);
+      timer.unref();
+    });
+    try {
+      return await Promise.race([write, expired]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
