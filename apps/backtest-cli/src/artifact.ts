@@ -29,6 +29,7 @@
  * the rule `runReplay` applies to the venue's evicted history.
  */
 
+import { SIMULATION_RUN_SERIALIZATION_VERSION } from "@polymarket-bot/simulation";
 import {
   projectionOf,
   type DecisionTrace,
@@ -89,8 +90,60 @@ function traceLine(trace: TraceLink): string {
   ].join(" ");
 }
 
-/** Renders the artifact. Pure: the same inputs give the same bytes. */
+/** What the core sections are rendered from: the core that ran and the driver that drove it. */
+export interface CoreSectionsInput {
+  readonly trader: PaperTrader;
+  readonly store: Pick<InMemoryTraderStore, "decisions" | "checkpoints" | "transactions" | "pnlSnapshots">;
+  readonly driver: ReplayDriverObservations;
+}
+
+/**
+ * Renders the artifact. Pure: the same inputs give the same bytes.
+ *
+ * `APPROX-REPLAY-1` (ADR-029 Decision 4.3): this is an EVIDENCE artifact — its
+ * golden is a determinism gate — so it refuses an approximate result. Only an
+ * exact replay's `ReplayRunResult` renders: a result that states any
+ * `fidelity`, or whose serialization is not the exact run's
+ * (`polymarket-bot/simulation-run/v3`), is refused by name. An approximate
+ * run writes its own artifact (`approximate/serialize.ts`), labelled as such.
+ */
 export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestArtifact {
+  const result: unknown = input.outcome.result;
+  const fidelity =
+    typeof result === "object" && result !== null && Object.hasOwn(result, "fidelity")
+      ? (result as { readonly fidelity: unknown }).fidelity
+      : undefined;
+  const serialization =
+    typeof result === "object" && result !== null ? (result as { readonly serialization?: unknown }).serialization : undefined;
+  if (
+    fidelity !== undefined ||
+    typeof serialization !== "string" ||
+    !serialization.startsWith(`${SIMULATION_RUN_SERIALIZATION_VERSION}\n`)
+  ) {
+    return {
+      ok: false,
+      problem:
+        `REPLAY_MANIFEST_APPROXIMATE: this artifact is evidence of an exact replay, and the result offered is not one ` +
+        `(fidelity ${JSON.stringify(fidelity ?? "unstated")}); an approximate result is never determinism, calibration, ` +
+        "promotion or soak evidence (ADR-029 Decisions 2 and 4.3)",
+    };
+  }
+  const sections = renderCoreSections(input);
+  if (!sections.ok) return sections;
+  const lines: string[] = [BACKTEST_ARTIFACT_FORMAT_ID, "--- simulation-run ---", serialization, ...sections.lines];
+  return { ok: true, text: `${lines.join("\n")}\n` };
+}
+
+/**
+ * The sections the shared core produced — every persisted decision, every §6
+ * invariant 4 chain, the ledger projection, the §9.16 snapshots, the health
+ * counters, the store's write counts and the driver's counters — ending in
+ * `end`. Shared by the exact artifact above and the approximate one, so the
+ * two can never describe the core differently.
+ */
+export function renderCoreSections(
+  input: CoreSectionsInput,
+): { readonly ok: true; readonly lines: readonly string[] } | { readonly ok: false; readonly problem: string } {
   const loop = input.trader.loop;
   const health = loop.health();
   const retention = health.seams.retention;
@@ -105,7 +158,7 @@ export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestAr
     };
   }
 
-  const lines: string[] = [BACKTEST_ARTIFACT_FORMAT_ID, "--- simulation-run ---", input.outcome.result.serialization];
+  const lines: string[] = [];
   lines.push("--- decisions ---");
   for (const decision of loop.decisions()) lines.push(decisionLine(decision));
   lines.push("--- traces ---");
@@ -179,5 +232,5 @@ export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestAr
     `driver eventsIngested=${String(input.driver.eventsIngested)} drains=${String(input.driver.drains)}`,
   );
   lines.push("end");
-  return { ok: true, text: `${lines.join("\n")}\n` };
+  return { ok: true, lines };
 }

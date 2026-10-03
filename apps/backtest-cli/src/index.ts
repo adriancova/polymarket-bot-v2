@@ -78,5 +78,65 @@ export type {
   BacktestRefusal,
 } from "./assembly.js";
 
-export { BACKTEST_ARTIFACT_FORMAT_ID, renderBacktestArtifact } from "./artifact.js";
-export type { BacktestArtifact, BacktestArtifactInput } from "./artifact.js";
+export { BACKTEST_ARTIFACT_FORMAT_ID, renderBacktestArtifact, renderCoreSections } from "./artifact.js";
+export type { BacktestArtifact, BacktestArtifactInput, CoreSectionsInput } from "./artifact.js";
+
+// --- APPROX-REPLAY-1: approximate replay over the research tier (ADR-029) ---
+export {
+  SUPPORTED_DOWNSAMPLING_ID,
+  SUPPORTED_DOWNSAMPLING_VERSION,
+  isSpanTable,
+  readResearchTierReplaySource,
+  v1TieKey,
+} from "./approximate/research-source.js";
+export type {
+  ReleaseFrame,
+  ResearchSample,
+  ResearchSourceOptions,
+  ResearchSourceRefusal,
+  ResearchSourceRefusalCode,
+  ResearchSourceResult,
+  ResearchTierReplaySource,
+  VerifiedResearchDataset,
+} from "./approximate/research-source.js";
+export {
+  APPROXIMATE_BOOK_SUBSCRIPTION_GENERATION,
+  APPROXIMATE_TRANSLATION_VERSION,
+  ResearchSampleTranslator,
+  approximateMarketsOf,
+  deriveApproximateEventId,
+} from "./approximate/translate.js";
+export type {
+  ApproximateMarket,
+  FrameTranslation,
+  LifecycleOutcome,
+  TranslationCounts,
+  TranslationRefusal,
+} from "./approximate/translate.js";
+export {
+  deliverReleaseFrames,
+  derivedMonotonicNs,
+  releaseRecord,
+  runApproximateBacktest,
+} from "./approximate/run.js";
+export type {
+  ApproximateReplayResult,
+  ApproximateRun,
+  ApproximateRunOptions,
+  ApproximateRunRefusal,
+  ApproximateRunResult,
+  ApproximateStop,
+  DeliveryOptions,
+  DeliveryOutcome,
+} from "./approximate/run.js";
+export {
+  APPROXIMATE_ARTIFACT_FORMAT_ID,
+  APPROXIMATE_EVIDENCE_CLASS,
+  APPROXIMATE_MONOTONIC_BASIS,
+  APPROXIMATE_RANK,
+  APPROXIMATE_RUN_SERIALIZATION_VERSION,
+  fidelityLine,
+  renderApproximateArtifact,
+  serializeApproximateRun,
+} from "./approximate/serialize.js";
+export type { ApproximateArtifactInput } from "./approximate/serialize.js";
