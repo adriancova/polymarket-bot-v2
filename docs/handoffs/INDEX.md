@@ -124,3 +124,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-02 | [ADR031-ACCEPT.md](ADR031-ACCEPT.md) | `ADR031-ACCEPT`: ADR-031 Accepted; ADR-032 | Governance | Complete (2026-10-02) | `a60ee27` | 3 KB |
 | 2026-10-03 | [APPROX-REPLAY-1.md](APPROX-REPLAY-1.md) | `APPROX-REPLAY-1`: approximate replay over the research tier | WP | Complete (2026-10-03) | `86830d9` | 3 KB |
 | 2026-10-03 | [PROVENANCE-1.md](PROVENANCE-1.md) | `PROVENANCE-1`: decision provenance, durable halts and refusals | Round | Complete (2026-10-03) | `71d8b80` | 5 KB |
+| 2026-10-03 | [CO2-N1.md](CO2-N1.md) | `CO2-N1`: ADR-031's entry guard on the process clock | Round | Complete (2026-10-03) | `9869e53` | 4 KB |
