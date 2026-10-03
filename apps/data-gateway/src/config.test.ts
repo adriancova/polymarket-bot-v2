@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   GAMMA_MARKETS_RATE_LIMIT_PER_10S,
+  LAPTOP_PAPER_HOST_PROFILE,
   LIFECYCLE_MAX_BUDGET_SHARE_PERCENT,
   lifecycleRequestBudgetPer10s,
   lifecycleRequestsPer10s,
@@ -210,6 +211,53 @@ function lifecycleMarkets(count: number): (typeof LIFECYCLE_MARKET)[] {
   }));
 }
 
+/**
+ * `WALCAP-1`, ADR-028 Decision 5.1: "On this profile `maxTotalBytes` must be
+ * set. `null` is refused." The profile is the ADR-025 laptop, which a
+ * configuration declares with `hostProfile`. A configuration that does not
+ * declare it is judged exactly as before.
+ */
+describe("parseGatewayConfig — the laptop host profile requires maxTotalBytes (ADR-028 D5.1)", () => {
+  const LAPTOP = { ...BASE, hostProfile: "laptop-paper" };
+
+  it("refuses the laptop profile with maxTotalBytes absent", () => {
+    expect(LAPTOP_PAPER_HOST_PROFILE).toBe("laptop-paper");
+    expect(() => parseGatewayConfig(LAPTOP)).toThrow(GatewayConfigurationError);
+    expect(() => parseGatewayConfig(LAPTOP)).toThrow(/requires wal\.maxTotalBytes/u);
+  });
+
+  it("refuses the laptop profile with maxTotalBytes null", () => {
+    expect(() =>
+      parseGatewayConfig({ ...LAPTOP, wal: { rootPath: "/wal", maxTotalBytes: null } }),
+    ).toThrow(/ADR-028 Decision 5\.1/u);
+  });
+
+  it("accepts the laptop profile with a positive maxTotalBytes, and refuses zero or a fraction as before", () => {
+    const config = parseGatewayConfig({ ...LAPTOP, wal: { rootPath: "/wal", maxTotalBytes: 100_000_000_000 } });
+    expect(config.hostProfile).toBe("laptop-paper");
+    expect(config.wal.maxTotalBytes).toBe(100_000_000_000);
+    for (const bad of [0, -1, 1.5]) {
+      expect(() => parseGatewayConfig({ ...LAPTOP, wal: { rootPath: "/wal", maxTotalBytes: bad } })).toThrow(
+        GatewayConfigurationError,
+      );
+    }
+  });
+
+  it("changes nothing for a configuration that declares no profile: maxTotalBytes may be absent or null", () => {
+    expect(parseGatewayConfig(BASE).wal.maxTotalBytes).toBeUndefined();
+    expect(parseGatewayConfig(BASE).hostProfile).toBeUndefined();
+    expect(parseGatewayConfig({ ...BASE, wal: { rootPath: "/wal", maxTotalBytes: null } }).wal.maxTotalBytes).toBeNull();
+  });
+
+  it("refuses a profile it does not know rather than guessing what it requires", () => {
+    for (const unknown of ["laptop", "LAPTOP-PAPER", "cloud", ""]) {
+      expect(() =>
+        parseGatewayConfig({ ...BASE, hostProfile: unknown, wal: { rootPath: "/wal", maxTotalBytes: 1 } }),
+      ).toThrow(GatewayConfigurationError);
+    }
+  });
+});
+
 describe("parseGatewayConfig — the lifecycle feed (UNIV-4)", () => {
   it("applies the documented defaults: feed id, 10 s cadence, three-failure stall threshold", () => {
     const config = parseGatewayConfig({
@@ -399,5 +447,14 @@ describe("the shipped example configuration (infra/compose/data-gateway)", () =>
     expect(config.lifecycle?.feedId).toBe("polymarket-lifecycle");
     expect(config.binance?.feedId).toBe("binance-reference");
     expect(config.coinbase?.feedId).toBe("coinbase-reference");
+  });
+
+  it("sets the WAL's hard stop, so a copy of it never fills the disk (WALCAP-1, ADR-028 D5)", async () => {
+    const path = new URL(
+      "../../../infra/compose/data-gateway/gateway.config.example.json",
+      import.meta.url,
+    );
+    const config = parseGatewayConfig(JSON.parse(await readFile(path, "utf8")) as unknown);
+    expect(config.wal.maxTotalBytes).toBe(100_000_000_000);
   });
 });

@@ -87,6 +87,21 @@ export function nodeWalFileSystem(): WalFileSystem {
       }
     },
 
+    async listDirectoryNames(directoryPath: string): Promise<readonly string[]> {
+      // A symbolic link is not followed: the WAL root's epoch directories are
+      // real directories, exactly as the research worker's inventory reads them
+      // (`apps/research-worker/src/research-tier/inventory.ts`).
+      try {
+        const entries = await readdir(directoryPath, { withFileTypes: true });
+        return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+      } catch (error) {
+        if (isErrnoException(error) && error.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+    },
+
     async fileByteLength(path: string): Promise<number | null> {
       try {
         const stats = await stat(path);
