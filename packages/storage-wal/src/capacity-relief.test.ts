@@ -17,7 +17,9 @@
  *
  * Every test checks the two invariants that matter after each step: the
  * segment bytes on disk under the root never exceed `maxTotalBytes`, and the
- * writer's count is never below them.
+ * writer's count is never below them. "After each step" means with no write
+ * of the writer in flight; `capacity-in-flight.test.ts` (round 1) covers
+ * drains suspended mid-write, failed writes, and the count at open.
  */
 
 import { describe, expect, it } from "vitest";

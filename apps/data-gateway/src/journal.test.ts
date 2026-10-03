@@ -502,3 +502,129 @@ describe("GatewayJournal — maxTotalBytes over the WAL root (WALCAP-1)", () => 
     await journal.close();
   });
 });
+
+/**
+ * `WALCAP-1` round 1, finding A-01: the journal enqueues from socket
+ * callbacks, synchronously, while a drain on its chain is suspended in the
+ * filesystem. The frames that drain took are neither queued nor counted yet,
+ * and admission must still charge them, or the disk goes past `maxTotalBytes`
+ * (a 6,000-byte cap ended at 8,010 before the fix). Each case holds a REAL
+ * fsync of the drain — a new segment's header, then an fsync after an append
+ * — and keeps recording until the cap refuses.
+ */
+describe("GatewayJournal — frames in flight count against maxTotalBytes (WALCAP-1 r1, A-01)", () => {
+  const CAP = 12_000;
+
+  function segmentBytesUnder(fileSystem: ObservingWalFileSystem): number {
+    let total = 0;
+    for (const [path, bytes] of fileSystem.files) {
+      if (path.startsWith("/wal/") && path.endsWith(".wal.jsonl")) total += bytes.length;
+    }
+    return total;
+  }
+
+  const cases = [
+    { name: "a new segment's header fsync", fsyncByteThreshold: undefined, primed: false },
+    { name: "an fsync after an append, mid-drain", fsyncByteThreshold: 1, primed: true },
+  ] as const;
+
+  for (const testCase of cases) {
+    it(`a drain held in ${testCase.name}: recording continues, and stops at the cap, never past it`, async () => {
+      const clock = new ManualGatewayClock();
+      const fileSystem = createObservingWalFileSystem();
+      const failures: { reason: string }[] = [];
+      const journal = await GatewayJournal.open({
+        walRootPath: "/wal",
+        fileSystem,
+        clock,
+        sequencer: new IngestSequencer(EPOCH),
+        maxTotalBytes: CAP,
+        maxSegmentBytes: 2_000,
+        ...(testCase.fsyncByteThreshold === undefined ? {} : { fsyncByteThreshold: testCase.fsyncByteThreshold }),
+        onRecordingFailure: (failure) => failures.push(failure),
+      });
+      if (testCase.primed) {
+        expect(journal.record(frameInput(clock, "{\"primed\":1}")).recorded).toBe(true);
+        await journal.settle();
+      }
+
+      fileSystem.holdSyncs();
+      // A burst in one turn: the first scheduled drain takes all of it.
+      for (let index = 0; index < 10; index += 1) {
+        expect(journal.record(frameInput(clock, `{"burst":${String(index)}}`)).recorded).toBe(true);
+      }
+      await microturns(30);
+      expect(fileSystem.observations.concurrentOperations, "the drain is held in an fsync").toBe(1);
+      expect(journal.metrics().queue.currentDepth, "the drain took the burst").toBe(0);
+
+      // Frames keep arriving while the drain waits.
+      let admitted = 0;
+      for (let index = 0; index < 100; index += 1) {
+        const outcome = journal.record(frameInput(clock, `{"during":${String(index)}}`));
+        await microturns(2);
+        if (!outcome.recorded) {
+          expect(outcome.reason).toBe("capacity-exceeded");
+          break;
+        }
+        admitted += 1;
+      }
+      expect(admitted, "the cap still had room while the drain was held").toBeGreaterThan(0);
+      expect(failures.at(-1)?.reason).toBe("capacity-exceeded");
+
+      fileSystem.releaseSyncs();
+      await journal.settle();
+      expect(journal.faulted).toBe(false);
+      expect(segmentBytesUnder(fileSystem)).toBeLessThanOrEqual(CAP);
+      expect(journal.metrics().framesWritten).toBe(journal.metrics().framesAccepted);
+      expect(journal.metrics().totalSegmentBytes).toBe(segmentBytesUnder(fileSystem));
+      expect(fileSystem.observations.maxConcurrentOperations).toBe(1);
+      await journal.close();
+      expect(segmentBytesUnder(fileSystem)).toBeLessThanOrEqual(CAP);
+    });
+  }
+});
+
+/** `WALCAP-1` round 1, finding O-M1: a count it could not read bounds nothing. */
+describe("GatewayJournal — the capacity count at open fails closed (WALCAP-1 r1, O-M1)", () => {
+  it("does not open when the WAL root cannot be listed, and opens once it can", async () => {
+    const base = createMemoryFileSystem();
+    const first = await GatewayJournal.open({
+      walRootPath: "/wal",
+      fileSystem: base,
+      clock: new ManualGatewayClock(),
+      sequencer: new IngestSequencer(EPOCH),
+      maxTotalBytes: 6_000,
+    });
+    first.record(frameInput(new ManualGatewayClock(), "{\"earlier\":1}"));
+    await first.close();
+    const before = base.snapshot();
+
+    let failNext = true;
+    const fileSystem: typeof base = {
+      ...base,
+      listDirectoryNames: async (directory) => {
+        if (failNext && directory === "/wal") {
+          failNext = false;
+          throw new Error("EIO (injected root listing)");
+        }
+        return (await base.listDirectoryNames?.(directory)) ?? [];
+      },
+    };
+    const open = async () =>
+      GatewayJournal.open({
+        walRootPath: "/wal",
+        fileSystem,
+        clock: new ManualGatewayClock(),
+        sequencer: new IngestSequencer(OTHER_EPOCH),
+        maxTotalBytes: 6_000,
+      });
+    await expect(open()).rejects.toThrow("EIO (injected root listing)");
+    expect(base.snapshot()).toStrictEqual(before);
+    const journal = await open();
+    let earlier = 0;
+    for (const [path, bytes] of base.files) if (path.endsWith(".wal.jsonl")) earlier += bytes.length;
+    expect(earlier).toBeGreaterThan(0);
+    expect(journal.metrics().totalSegmentBytes).toBe(earlier);
+    await journal.close();
+  });
+});

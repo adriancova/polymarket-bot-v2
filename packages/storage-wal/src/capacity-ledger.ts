@@ -32,15 +32,30 @@
  * - **The open segment is never forgotten.** Its descriptor is held, so its
  *   bytes stay on disk until it is closed even if its name is removed.
  *
- * ## Never undercount
+ * ## Never undercount, and what that means exactly
  *
  * Every entry is at least the size of its file: a sealed one equals it, an
  * unsealed one is the largest size anyone has seen or written. An entry leaves
- * only when its file is gone. The writer records a segment it creates in the
- * ledger before it appends a frame to it. What the ledger cannot see is a
- * segment file another process creates under the root after a re-derivation;
- * one writer per WAL root is a premise (ADR-025 Decision 10, `wal-format.md`
- * §2), and the next re-derivation counts it anyway.
+ * only when its file is gone. What the ledger cannot see is a segment file
+ * another process creates under the root after a re-derivation; one writer per
+ * WAL root is a premise (ADR-025 Decision 10, `wal-format.md` §2), and the
+ * next re-derivation counts it anyway.
+ *
+ * The writer's own writes reach the ledger when they return, so the precise
+ * statement has two halves (`WALCAP-1` r1, findings A-01 and O-L1):
+ *
+ * - **The ledger alone is never below the disk while none of the writer's
+ *   writes is in flight.** During one — a header, an append, a footer — its
+ *   bytes can be on disk a moment before the ledger counts them. A write that
+ *   fails is counted before the writer faults: the writer reads the file's
+ *   length, or counts the most the write can have left when that read fails
+ *   too (`writer.ts`, `#countAfterFailedWrite`).
+ * - **What admission compares with `maxTotalBytes` is never below the disk,
+ *   at any instant.** It is the ledger, plus every accepted frame not yet in
+ *   the ledger — the ones a drain took and is writing, and the queued ones —
+ *   plus the framing reserved for them and for the open segment's footer. A
+ *   write in flight is always one of those, so its bytes are charged before
+ *   they land and released only when the ledger holds them.
  *
  * ## What it never does
  *

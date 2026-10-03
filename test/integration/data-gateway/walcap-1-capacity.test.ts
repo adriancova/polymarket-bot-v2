@@ -161,6 +161,39 @@ describe("maxTotalBytes on a running gateway (WALCAP-1)", () => {
     await second.gateway.stop();
   });
 
+  it("does not start when its first read of the WAL root fails: a count it could not read bounds nothing (round 1, O-M1)", async () => {
+    const first = await buildHarness({ config: CONFIG, idSeed: 1 });
+    first.gateway.start();
+    first.binanceSockets.current.open();
+    await tradeUntilRefused(first, 1);
+    await first.gateway.stop();
+    const disk = first.walFileSystem;
+    const before = disk.snapshot();
+
+    let failNext = true;
+    const failing: MemoryFileSystem = {
+      ...disk,
+      listDirectoryNames: async (directory) => {
+        if (failNext && directory === "/wal") {
+          failNext = false;
+          throw new Error("EIO (injected root listing)");
+        }
+        return (await disk.listDirectoryNames?.(directory)) ?? [];
+      },
+    };
+    await expect(buildHarness({ config: CONFIG, idSeed: 2, walFileSystem: failing })).rejects.toThrow(
+      "EIO (injected root listing)",
+    );
+    expect(failNext).toBe(false);
+    expect(disk.snapshot()).toStrictEqual(before);
+
+    // Once the root answers, the restart counts the earlier epoch and stays at the cap.
+    const second = await buildHarness({ config: CONFIG, idSeed: 3, walFileSystem: failing });
+    expect(second.gateway.metrics().wal.totalSegmentBytes).toBe(segmentBytesUnderRoot(disk));
+    expectBounded(second);
+    await second.gateway.stop();
+  });
+
   it("does not start a laptop-profile gateway whose configuration leaves maxTotalBytes unset (ADR-028 D5.1)", async () => {
     await expect(
       buildHarness({ config: { hostProfile: "laptop-paper", wal: { rootPath: "/wal" }, binance: BINANCE } }),
