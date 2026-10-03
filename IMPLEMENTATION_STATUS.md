@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `THROUGHPUT-1c` is Complete (ADR-023 ratified). The trading-core rounds now run one at a time: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (ADR-031 option (a), before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` and `ADR031-ACCEPT` (with ADR-032) run beside them. `WP-300c` is Complete. `HOST-BENCH` waits on the laptop agent.
+- **Next:** `THROUGHPUT-1c` is Complete (ADR-023 ratified). The trading-core rounds now run one at a time: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (ADR-031 option (a), before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` runs beside them. ADR-031 and ADR-032 are Accepted. `WP-300c` is Complete. `HOST-BENCH` waits on the laptop agent.
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -55,12 +55,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
   - `test/integration/paper-trader/**`, `test/integration/postgres/**`, `test/unit/trader/**`, `test/e2e/**`, `test/replay-golden/**`.
   Forbidden: `db/migrations/**`. Verifiers: Opus and gpt-6-astra, reconciled.
 - **`APPROX-REPLAY-1`**: Ready (authorized) 2026-10-02, per the work plan (its dependencies `STORAGE-1` and `THROUGHPUT-1c` are met). Paths: `apps/backtest-cli/**`. Verifier: astra.
-- **`ADR031-ACCEPT`**: Ready (authorized) 2026-10-02 by the orchestrator. Docs only:
-  - set ADR-031's status to Accepted, and record the user's ruling (option (a), Q1, Q2 and Q3) in it;
-  - fix the reviewers' round-2 LOWs (`CO2N1-R2-L1`, `F2-L1`..`F2-L5`);
-  - correct the stale statements that hold the ADR-023 dependency open.
-  - write ADR-032, Accepted, recording the user's request-token ruling for `WP-300c`.
-  Paths: `docs/adr/ADR-031-*.md`, `docs/adr/ADR-032-*.md` (new), and their `docs/adr/README.md` rows. Verifiers: Opus and gpt-6-astra, reconciled.
+- `ADR031-ACCEPT` is Complete (2026-10-02, `a60ee27`): ADR-031 is Accepted (option (a)), and ADR-032 records the request-token design. See [Work packages](#work-packages).
 - `CONTROL-1b` is Complete (2026-10-01); see [Work packages](#work-packages). Its no-signer requirement was revised after round 4 (brief `8579244`).
 - `WP-300c` is Complete (2026-10-02, `7e05702`), on the user's request-token ruling; see [Work packages](#work-packages). ADR-032 records the design (`ADR031-ACCEPT`).
 - `STORAGE-GOV2` is Complete (2026-10-01); see [Work packages](#work-packages).
@@ -192,10 +187,10 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Complete (2026-10-01) | `7b6499e` | [STORAGE-1b](docs/handoffs/STORAGE-1b.md) |
 | `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
-| `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | Complete (2026-10-01): ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
+| `CO2-N1-ADR` | ADR-031: the design decision `CO2-N1` needs (now Accepted) | Complete (2026-10-01): ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
 | `PROVENANCE-1` | decision provenance, durable halts and refusals; raw WAL expiry where a trader runs | **Ready (authorized)** 2026-10-02 | — | — |
 | `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | **Ready (authorized)** 2026-10-02 | — | — |
-| `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | **Ready (authorized)** 2026-10-02 | — | — |
+| `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | Complete (2026-10-02) | `a60ee27` | [ADR031-ACCEPT](docs/handoffs/ADR031-ACCEPT.md) |
 | `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | Complete (2026-10-01) | `80a06e2` | [CONTROL-1b](docs/handoffs/CONTROL-1b.md) |
 | `WP-300c` | `WP300B-LOWS`: hostile evidence, refusal-code docs, module-load tripwires, predictable ids | Complete (2026-10-02) | `7e05702` | [WP-300c](docs/handoffs/WP-300c.md) |
 | `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | Complete (2026-10-01) | `a428ba3` | [STORAGE-GOV2](docs/handoffs/STORAGE-GOV2.md) |
