@@ -7,7 +7,9 @@
  * (The fixture-driven contract test is `test/contract/user-stream/`.)
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { installNetworkTripwire, type NetworkTripwire } from "../testing/network-tripwire.js";
 
 import { normalizeUserChannelFrame, normalizeUserChannelMessage, type NormalizedTradeEvent, type UserChannelMessage } from "./normalize.js";
 import { FIXTURE_MARKET, FIXTURE_OWNER } from "./testing/harness.js";
@@ -70,6 +72,15 @@ function tradeEvent(message: UserChannelMessage): NormalizedTradeEvent {
   if (message.kind !== "TRADE") throw new Error(`expected TRADE, got ${message.kind}`);
   return message.event;
 }
+
+let tripwire: NetworkTripwire;
+beforeEach(() => {
+  tripwire = installNetworkTripwire();
+});
+afterEach(() => {
+  tripwire.uninstall();
+  expect(tripwire.refused()).toEqual([]);
+});
 
 describe("order events", () => {
   it("carries every identifier exactly and every amount as an exact canonical decimal", () => {

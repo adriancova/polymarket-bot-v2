@@ -322,6 +322,37 @@ describe("messages", () => {
     });
   });
 
+  it("a trade event the OMS projection cannot fully apply requests reconciliation naming the trade and its order ids (C-3)", () => {
+    const h = openUserStream();
+    h.subscribe();
+    h.port.latest.deliver(
+      JSON.stringify({
+        event_type: "trade",
+        type: "TRADE",
+        id: "trade-c3",
+        taker_order_id: "0xfeed0004",
+        market: FIXTURE_MARKET,
+        asset_id: "1075058827",
+        side: "BUY",
+        size: "40",
+        price: "0.08",
+        status: "MATCHED_NOT_BROADCASTED",
+        owner: FIXTURE_OWNER,
+        maker_orders: [{ order_id: "0xfeed0005", owner: "other", matched_amount: "40", price: "0.08", asset_id: "1075058827", side: "SELL" }],
+        trader_side: "TAKER",
+        timestamp: "1782753360000",
+      }),
+    );
+    expect(h.outputs.map((output) => output.kind)).toEqual(["TRADE", "RECONCILIATION_REQUESTED"]);
+    expect(h.requests()[0]).toMatchObject({
+      cause: "EVENT_NOT_FULLY_APPLICABLE",
+      shortfalls: ["TRADE_STATUS_C3"],
+      venueTradeId: "trade-c3",
+      venueOrderIds: ["0xfeed0004", "0xfeed0005"],
+      markets: [FIXTURE_MARKET],
+    });
+  });
+
   it("frames from a retired connection are ignored, not delivered late (their gap was already reported)", () => {
     const h = openUserStream();
     h.subscribe();

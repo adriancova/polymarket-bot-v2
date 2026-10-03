@@ -17,7 +17,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { installNetworkTripwire, type NetworkTripwire } from "../testing/network-tripwire.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.resolve(HERE, "..");
@@ -54,6 +56,15 @@ async function sources(dir: string, out: string[] = []): Promise<string[]> {
   }
   return out;
 }
+
+let tripwire: NetworkTripwire;
+beforeEach(() => {
+  tripwire = installNetworkTripwire();
+});
+afterEach(() => {
+  tripwire.uninstall();
+  expect(tripwire.refused()).toEqual([]);
+});
 
 describe("the user-stream test doubles are test-only", () => {
   it("no non-test source file of the package imports user-stream/testing", async () => {

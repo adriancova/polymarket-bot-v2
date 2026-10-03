@@ -5,7 +5,9 @@
  * requests reconciliation, `manager.test.ts`).
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { installNetworkTripwire, type NetworkTripwire } from "../testing/network-tripwire.js";
 
 import { normalizeUserChannelMessage, type NormalizedOrderEvent, type NormalizedTradeEvent } from "./normalize.js";
 import { projectOrderEventForOms, projectTradeEventForOms, UNRECOGNIZED_ORDER_STATUS } from "./oms-projection.js";
@@ -67,6 +69,15 @@ function tradeEvent(overrides: Record<string, unknown> = {}): NormalizedTradeEve
   if (message.kind !== "TRADE") throw new Error(message.kind);
   return message.event;
 }
+
+let tripwire: NetworkTripwire;
+beforeEach(() => {
+  tripwire = installNetworkTripwire();
+});
+afterEach(() => {
+  tripwire.uninstall();
+  expect(tripwire.refused()).toEqual([]);
+});
 
 describe("order events → OrderObservation", () => {
   it.each(["LIVE", "MATCHED", "DELAYED", "UNMATCHED", "CANCELED"])("%s is observed as itself", (status) => {
