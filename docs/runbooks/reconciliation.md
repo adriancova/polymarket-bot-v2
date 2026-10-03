@@ -87,7 +87,10 @@ consistent run no longer finds it.
   (`HOLDING_DELTA_UNCONFIRMED`). If a read at least `holdingConfirmationMs`
   later shows the same delta, it is booked to the ledger's `UNATTRIBUTED`
   scope (a `RECONCILIATION_CORRECTION` carrying the run's id), giving
-  `POSITION_UNATTRIBUTED` or `BALANCE_UNATTRIBUTED`.
+  `POSITION_UNATTRIBUTED` or `BALANCE_UNATTRIBUTED`. It is never booked
+  while an unresolved attempt could explain it (that attempt's fill may not
+  be visible yet). Such a delta stays held instead. Any unresolved attempt
+  could explain a collateral delta.
 
 Each UNATTRIBUTED break halts its market through the halt port. Collateral,
 or a token whose market is unknown, halts the account. The halt is delivered
@@ -118,10 +121,18 @@ unclaimed orders.
 | exactly one matching order, which no other unresolved attempt could own | `PRESENT` |
 | two or more matching orders, or one that another attempt could own | none: `SIGNED_IDENTITY_AMBIGUOUS` |
 | an unclaimed order on the same token and side that does not match exactly | none: `SIGNED_IDENTITY_AMBIGUOUS` |
-| nothing on the same token and side | `ABSENT`, once the reads begin at least `quiescenceHorizonMs` after the coordinator received the request |
+| nothing on the same token and side | `ABSENT`, once the reads begin at least `quiescenceHorizonMs` after the coordinator received the request, and the run judged the holdings with no break in the attempt's token or the collateral |
 
 Every `ABSENT` carries `transmissionQuiescent: true`, from the coordinator's
-own clock. After a clock fault the window starts again.
+own clock. After a clock fault the window starts again; a reading that went
+backwards is never used.
+
+Why ABSENT also needs clean holdings: a marketable order that matched at once
+is gone from the open-orders list, and its trade may not be visible yet. Its
+fill still moves the holdings once settled, so an unexplained delta in the
+token or the collateral withholds ABSENT. So does any unresolved break that
+names them. A venue order id the user stream named, which the OMS holds as
+retained evidence, is read by id and is a candidate too.
 
 ## 6. Resume
 

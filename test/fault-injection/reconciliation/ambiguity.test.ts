@@ -152,6 +152,29 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
     await expectPaused(r, report.resumed, "READ_STALE");
   });
 
+  it("a stale read (the clock steps back during the reads as a request arrives; the end reading is sound again): paused", async () => {
+    const r = await ready();
+    const pending: { requestId: string; cause: string; markets: string[] }[] = [];
+    r.p.coordinator.bindUserStream({
+      pendingReconciliationRequests: () => [...pending],
+      acknowledgeReconciliationRequest: (requestId: string) => pending.splice(pending.findIndex((entry) => entry.requestId === requestId), 1).length === 1,
+    });
+    let stepped = false;
+    r.u.world.faults.onRead = (name) => {
+      if (name === "listTrades" && !stepped) {
+        stepped = true;
+        r.u.clock.t -= 10;
+        const request = { requestId: "stream-mid-read", cause: "SOCKET_CLOSED", markets: [] };
+        pending.push(request);
+        r.p.coordinator.onUserStreamOutput({ kind: "RECONCILIATION_REQUESTED", request });
+      }
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    expect(report.runs[0]?.detections.map((detection) => detection.breakClass)).toContain("READ_STALE");
+    expect(report.runs[0]?.status).not.toBe("PASSED");
+  });
+
   it("an out-of-order read (an order's matched size goes down): paused until a read catches up", async () => {
     const r = await ready();
     await submitOne(r.oms);
@@ -242,7 +265,7 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
     expect(r.u.ledger.transactions().filter((appended) => appended.transaction.eventType === "RECONCILIATION_CORRECTION")).toEqual([]);
   });
 
-  it("a tracked order whose venue facts differ from the order's is quarantined, never answered", async () => {
+  it("a tracked order whose venue facts differ from the order's is quarantined (found by the periodic comparison)", async () => {
     const r = await ready();
     await submitOne(r.oms);
     r.u.world.faults.listOpenOrders = (answer) => {
@@ -253,6 +276,25 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
     const report = await r.p.coordinator.reconcile();
     await expectPaused(r, report.resumed, "ORDER_FACTS_MISMATCH");
     expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_FACTS_MISMATCH")?.status).toBe("QUARANTINED");
+  });
+
+  it("a tracked order whose venue facts differ from the order's is quarantined, and a request about it is not answered", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    // The venue shows another price, consistently in both reads (the OMS itself checks only the size).
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, price: "0.51" })) };
+    };
+    r.u.world.faults.readOrder = (_id, answer) => {
+      const read = answer() as { order?: Record<string, unknown> };
+      return { ...read, order: { ...(read.order ?? {}), price: "0.51" } };
+    };
+    expect((await r.oms.requestOrderReconciliation(r.oms.orders()[0]?.orderId as string)).ok).toBe(true);
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "ORDER_FACTS_MISMATCH");
+    expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_FACTS_MISMATCH")?.status).toBe("QUARANTINED");
+    expect(r.u.accepted).toEqual([]);
   });
 
   it("a read behind the OMS (it recorded more fill than the venue shows) is held, never answered into a conflict", async () => {
@@ -280,6 +322,18 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
     expect(r.oms.alerts().filter((alert) => alert.haltMarket)).toEqual([]);
     r.u.world.faults = {};
     expect(await reconcileRounds(r, 3)).toBe(true);
+  });
+
+  it("an unrecognised order status (not in the documented vocabulary) holds: paused", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, status: "ORDER_STATUS_LIVE" })) };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "STATUS_UNRECOGNISED");
   });
 
   it("a malformed read (an inexact decimal) is discarded whole, never read as empty: paused", async () => {

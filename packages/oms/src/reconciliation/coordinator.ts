@@ -48,7 +48,16 @@
  *   request, by its own clock, with no clock fault since. Every transmission
  *   of the attempt began before the OMS issued the request (a retransmission
  *   consumes the request first), so the horizon bounds how long one may
- *   still travel. Before that, the attempt simply stays unresolved.
+ *   still travel. Before that, the attempt simply stays unresolved. ABSENT
+ *   also needs this run to have judged the holdings with no break in the
+ *   attempt's token or the collateral, and no unresolved break naming them:
+ *   a marketable order matched at once leaves the open-orders list, and a
+ *   lagging trades read would hide it, but its fill still moves the
+ *   holdings. A clock reading that went backwards is never used, and every
+ *   pending request's window restarts after a clock fault.
+ * - **Holdings an attempt could explain.** A delta that an unresolved attempt
+ *   could explain is held, never booked to UNATTRIBUTED, while that attempt
+ *   is unresolved.
  * - **requestId (WP-270, WP-300c, ADR-032 D4).** Every answer echoes the
  *   request's id verbatim; ids are opaque and never derived.
  * - **By signed identity (WP-270 follow_up 3).** An attempt without a venue
@@ -229,6 +238,10 @@ class RunState {
   stale = false;
   /** Holdings were not judged in this run (the OMS and the venue still disagreed about fills or state). */
   holdingsDeferred = false;
+  /** Holdings were compared in this run (all reads sound, nothing deferred, no wallet operation in flight). */
+  holdingsJudged = false;
+  /** Submission-unknown requests with no candidate and a quiet horizon: ABSENT once holdings are judged clean. */
+  readonly absentCandidates: Received<OmsReconciliationRequest>[] = [];
   /** Requests received after this were not answerable by the run's reads. */
   readsStartSeq: number | null = null;
   constructor(
@@ -238,7 +251,9 @@ class RunState {
 }
 
 function freezeDetail(text: string): string {
-  const trimmed = text.length === 0 ? "(no detail)" : text;
+  // eslint-disable-next-line no-control-regex
+  const clean = text.replace(/[\u0000-\u001f\u007f]/gu, " ");
+  const trimmed = clean.length === 0 ? "(no detail)" : clean;
   return trimmed.length > MAX_DETAIL ? trimmed.slice(0, MAX_DETAIL) : trimmed;
 }
 
@@ -571,6 +586,7 @@ export class ReconciliationCoordinator {
       } else {
         await this.#compareHoldings(run, oms, view, reads, readsStartedAt);
       }
+      await this.#answerAbsent(run, oms);
       this.#acknowledgeStreamRequests(run, answerableStream);
     }
     this.#inspectOms(run, oms);
@@ -625,6 +641,8 @@ export class ReconciliationCoordinator {
       if (order.venueOrderId !== null && !TERMINAL_ORDER_STATES.has(order.state) && !listed.has(order.venueOrderId)) ids.add(order.venueOrderId);
     }
     for (const entry of answerableOms) if (entry.request.venueOrderId !== null) ids.add(entry.request.venueOrderId);
+    // A venue order id the stream named and the OMS retains (it could not attribute it yet) is a candidate too.
+    for (const item of oms.retainedEvidence()) if (isVenueId(item.venueOrderId)) ids.add(item.venueOrderId);
     const byId = new Map<string, ReadOutcome<VenueOrderView | null>>();
     for (const id of [...ids].sort()) {
       const call = await callRead(() => ports.readOrder(id));
@@ -883,10 +901,35 @@ export class ReconciliationCoordinator {
         });
         continue;
       }
-      // NO_CANDIDATE: ABSENT only once quiescent, by this coordinator's own clock (WP-270's QUIESCENCE RULE).
+      // NO_CANDIDATE: ABSENT only once quiescent, by this coordinator's own clock (WP-270's QUIESCENCE RULE), and only
+      // after this run's holdings are judged clean for the attempt's token and the collateral (`#answerAbsent`).
       if (received.atMs === null || this.#clockFaultSeq >= received.seq || readsStartedAt - received.atMs < this.#deps.policy.quiescenceHorizonMs) {
         continue;
       }
+      run.absentCandidates.push(received);
+    }
+  }
+
+  /**
+   * The ABSENT answers this run may give. "No live order and no trade" is what the order and trade reads show;
+   * a fill they do not show yet (a marketable order matched at once, whose trade the read lags) would still move
+   * the holdings once settled. So ABSENT also needs this run to have judged the holdings, with no holding break
+   * in the attempt's token or in the collateral. Anything else waits for a later run (fail closed: the attempt
+   * stays unresolved and submissions stay paused).
+   */
+  async #answerAbsent(run: RunState, oms: ReconciledOms): Promise<void> {
+    if (run.absentCandidates.length === 0) return;
+    const collateral = this.#deps.policy.collateralAssetId;
+    for (const received of run.absentCandidates) {
+      const request = received.request;
+      // Any break this run found in the token or the collateral (an unexplained or unconfirmed delta, one in transit,
+      // a booking, an unattributed order or trade) withholds ABSENT.
+      const touched = run.detections.some((detection) => detection.assetId === request.tokenId || detection.assetId === collateral);
+      // So does any unresolved break from an earlier run that names them (a quarantined booking, say).
+      const open = this.#unresolvedBreaksWithAssets().some((assetId) => assetId === request.tokenId || assetId === collateral);
+      if (!run.holdingsJudged || touched || open) continue;
+      const attempt = oms.attempts().find((candidate) => candidate.submissionAttemptId === request.submissionAttemptId);
+      if (attempt === undefined || attempt.currentRequestId !== request.requestId || attempt.inFlight) continue;
       await this.#answerOms(run, oms, received, {
         requestId: request.requestId,
         submissionAttemptId: request.submissionAttemptId,
@@ -1227,6 +1270,7 @@ export class ReconciliationCoordinator {
       }
     }
     const pending = pendingDeltas(inTransit, policy.collateralAssetId);
+    run.holdingsJudged = true;
     // Compared: every outcome token (positions) and the policy's collateral. Another collateral-kind asset (e.g. USDC.e
     // after an unwrap) has no read here, so it is not judged (a known limit, in the handoff).
     const tokens = [...projected.lines].filter(([, line]) => line.assetKind === "OUTCOME_TOKEN").map(([assetId]) => assetId);
@@ -1265,6 +1309,21 @@ export class ReconciliationCoordinator {
           expectedValue: line?.balance ?? "0",
           observedValue: authoritative,
           detail: `${assetId}: an unexplained delta of ${verdict.delta}, seen once; booked only if a later read confirms it`,
+        });
+        continue;
+      }
+      // A delta an unresolved attempt could explain (its fill, not yet visible) does not lack attribution: it is not
+      // yet known. It is held, never booked, while such an attempt exists (any attempt moves the collateral).
+      const explainers = this.#potentialOwners(oms).filter((owner) => isCollateral || owner.facts === null || owner.facts.tokenId === assetId);
+      if (explainers.length > 0) {
+        this.#detect(run, {
+          breakClass: "HOLDING_DELTA_UNCONFIRMED",
+          subjectKey: compositeKey("HOLDING_DELTA_UNCONFIRMED", assetId),
+          ...market,
+          assetId,
+          expectedValue: line?.balance ?? "0",
+          observedValue: authoritative,
+          detail: `${assetId}: an unexplained delta of ${verdict.delta} that unresolved attempt ${explainers[0]?.attemptId ?? "?"} could explain; not booked while it is unresolved`,
         });
         continue;
       }
@@ -1900,7 +1959,11 @@ export class ReconciliationCoordinator {
     if (current !== undefined && current.request.requestId === request.requestId) this.#omsRequests.delete(request.submissionAttemptId);
   }
 
-  /** A request received while the clock was unreadable is stamped now: its quiescence counts from here (later: conservative). */
+  /**
+   * A request received while the clock was unreadable, or whose window a clock fault restarted, is stamped with
+   * this sound reading: its quiescence counts from here (later than its receipt: conservative), and its sequence
+   * number is just below the reads', so this run may answer it but no fault before now taints it.
+   */
   #stampUnclockedRequests(seq: number, atMs: number | null): void {
     if (atMs === null) return;
     for (const [key, entry] of this.#omsRequests) if (entry.atMs === null) this.#omsRequests.set(key, Object.freeze({ ...entry, seq: seq - 0.5, atMs }));
@@ -1963,6 +2026,15 @@ export class ReconciliationCoordinator {
     }
   }
 
+  /** The assets named by unresolved breaks. Unreadable: a sentinel that matches every asset check (fail closed). */
+  #unresolvedBreaksWithAssets(): string[] {
+    try {
+      return this.#deps.journal.unresolvedBreaks().flatMap((view) => (view.assetId === null ? [] : [view.assetId]));
+    } catch {
+      return [this.#deps.policy.collateralAssetId];
+    }
+  }
+
   /** Subjects an operator released (acknowledged quarantines). Unreadable: none (fail closed: they re-open). */
   #releasedSubjects(): Set<string> {
     try {
@@ -2001,8 +2073,8 @@ export class ReconciliationCoordinator {
     refusalCode: string | null,
   ): Promise<void> {
     run.answers.push(Object.freeze({ channel, requestId, subjectId, verdict, accepted, refusalCode }));
-    const atMs = this.#now();
-    if (atMs === null) return;
+    // Recorded even when the clock cannot be read now: the latest sound reading stands in for the time.
+    const atMs = this.#now() ?? Math.max(this.#lastClock, 0);
     const result = await this.#append({ kind: "ANSWER_RECORDED", runId: run.runId, channel, requestId, subjectId, verdict, accepted, refusalCode, atMs });
     if (!result.ok) {
       this.#detect(run, {
@@ -2024,8 +2096,14 @@ export class ReconciliationCoordinator {
       this.#clockFault();
       return null;
     }
-    if (value < this.#lastClock) this.#clockFault();
-    this.#lastClock = Math.max(this.#lastClock, value);
+    if (value < this.#lastClock) {
+      // A backwards step: this reading is never used (not as a receipt time, not as a read time), and later readings
+      // are judged from it, so one step back faults once rather than until the clock catches up.
+      this.#clockFault();
+      this.#lastClock = value;
+      return null;
+    }
+    this.#lastClock = value;
     return value;
   }
 

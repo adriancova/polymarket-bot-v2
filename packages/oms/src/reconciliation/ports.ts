@@ -361,6 +361,7 @@ export interface JournalBreakView {
   readonly scope: BreakScope;
   readonly status: "OPEN" | "RESOLVED" | "QUARANTINED";
   readonly marketId: string | null;
+  readonly assetId: string | null;
   readonly resolutionLedgerTransactionId: string | null;
   readonly resolution: "RESOLVED_IN_RUN" | "NOT_REPRODUCED" | "OPERATOR_RELEASED" | null;
   readonly detail: string;

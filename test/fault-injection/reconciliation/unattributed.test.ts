@@ -128,6 +128,38 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     expect(projectLedger(r.u.ledger).unattributedActivity).toEqual([expect.objectContaining({ assetId: PUSD, amount: "25", haltRequired: true })]);
   });
 
+  it("a delta seen again before the confirmation time has passed is not booked yet", async () => {
+    const r = await ready();
+    r.u.world.adjustPosition(YES, "3");
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    r.u.clock.t += r.u.policy.holdingConfirmationMs - 1;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const early = await r.p.coordinator.reconcile();
+    await expectPaused(r, early.resumed, "HOLDING_DELTA_UNCONFIRMED");
+    expect(corrections(r.u.ledger)).toEqual([]);
+    r.u.clock.t += 1;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const confirmed = await r.p.coordinator.reconcile();
+    await expectPaused(r, confirmed.resumed, "POSITION_UNATTRIBUTED");
+    expect(corrections(r.u.ledger)).toHaveLength(1);
+  });
+
+  it("a fill of a TRACKED order the OMS cannot record yet (its fee is not fixed) is never booked as UNATTRIBUTED", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4", { feeAmount: null });
+    for (let round = 0; round < 3; round += 1) {
+      r.p.coordinator.trigger("PERIODIC_TIMER");
+      await r.p.coordinator.reconcile();
+      r.u.clock.t += r.u.policy.holdingConfirmationMs + 1;
+    }
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "FILL_ECONOMICS_UNFIXED");
+    expect(corrections(r.u.ledger)).toEqual([]);
+    expect(r.u.halts).toEqual([]);
+  });
+
   it("a delta that changes before it is confirmed is not booked; one that disappears clears", async () => {
     const r = await ready();
     r.u.world.adjustPosition(YES, "3");

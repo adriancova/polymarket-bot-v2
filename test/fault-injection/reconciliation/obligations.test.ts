@@ -65,6 +65,41 @@ describe("WP-270: quiescence, requestId, signed identity", () => {
     expect(r.u.violations).toEqual([]);
   });
 
+  it("a marketable order matched at once, whose trade the read lags: never ABSENT while the holdings show the fill", async () => {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
+    const attempt = await submitOne(r.oms);
+    r.u.world.match(r.u.world.receipts.at(-1) as string, "1"); // fully matched: gone from the open-orders list
+    r.u.world.faults.listTrades = (answer) => ({ ...(answer() as object), trades: [] }); // the trade is not visible yet
+    expect(await reconcileRounds(r, 4)).toBe(false);
+    expect(r.u.accepted).toEqual([]);
+    expect(r.p.journal.unresolvedBreaks().map((view) => view.breakClass)).toContain("HOLDING_DELTA_UNCONFIRMED");
+    r.u.world.faults = {};
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(r.u.accepted.map((answer) => answer.verdict)).toEqual(["PRESENT"]);
+    expect(r.oms.attempt(attempt as string)?.venueOrderId).not.toBeNull();
+    expect([...r.u.violations, ...r.u.world.violations]).toEqual([]);
+  });
+
+  it("a venue order id the stream named and the OMS retains is a candidate: found PRESENT, not ABSENT", async () => {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    const trade = r.u.world.match(salt, "1", { status: "TRADE_STATUS_MATCHED" });
+    // Matched, not on chain yet (the holdings do not show it), and the trades read lags; only the stream saw it.
+    r.u.world.adjustPosition(YES, "-1");
+    r.u.world.adjustCollateral("0.5");
+    r.u.world.faults.listTrades = (answer) => ({ ...(answer() as object), trades: [] });
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? ""));
+    await r.p.coordinator.settled();
+    expect(r.oms.retainedEvidence().map((item) => item.kind)).toEqual(["FILL"]);
+    await reconcileRounds(r, 3);
+    expect(r.u.accepted.map((answer) => answer.verdict)).toEqual(["PRESENT"]);
+    expect(r.oms.alerts().filter((alert) => alert.haltMarket)).toEqual([]);
+    expect([...r.u.violations, ...r.u.world.violations]).toEqual([]);
+  });
+
   it("a transmission still travelling inside the horizon is found PRESENT once it arrives, never answered ABSENT", async () => {
     const r = await ready();
     r.u.world.lateMs = r.u.policy.quiescenceHorizonMs - 1;
@@ -91,6 +126,20 @@ describe("WP-270: quiescence, requestId, signed identity", () => {
     expect(r.u.accepted.map((answer) => [answer.verdict, answer.quiescent])).toEqual([["ABSENT", true]]);
   });
 
+  it("a backwards reading at the very moment of receipt is never used, and does not withhold ABSENT for good", async () => {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_ABSENT"]);
+    r.u.clock.t -= 60_000; // the step happens before the request arrives: its receipt reading is the faulty one
+    await submitOne(r.oms);
+    const stamped = r.u.clock.t;
+    await r.p.coordinator.reconcile(); // the first sound reading after the fault starts the window
+    r.u.clock.t = stamped + r.u.policy.quiescenceHorizonMs - 1;
+    expect((await r.p.coordinator.reconcile()).resumed).toBe(false);
+    r.u.clock.t = stamped + r.u.policy.quiescenceHorizonMs;
+    expect((await r.p.coordinator.reconcile()).resumed).toBe(true);
+    expect(r.u.accepted.map((answer) => [answer.verdict, answer.quiescent])).toEqual([["ABSENT", true]]);
+  });
+
   it("every answer echoes its request's id verbatim, however opaque (a 64-character token with separators)", async () => {
     // 64, not 128: the OMS refuses an answer whose id exceeds 200 characters, which its own ids do once the token
     // exceeds 118 (WP290-F1, a WP-270 finding reported in the handoff).
@@ -112,6 +161,26 @@ describe("WP-270: quiescence, requestId, signed identity", () => {
       expect(issued.get(event.requestId), event.requestId).toBe(event.subjectId);
     }
     expect(answersFollowReceipts(r.u.log, "oms")).toEqual([]);
+  });
+
+  it("an OMS request raised DURING the reads is never answered with them; the next run answers it (ADR-032 D4)", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const orderId = r.oms.orders()[0]?.orderId as string;
+    let raised = false;
+    r.u.world.faults.onRead = (name) => {
+      if (name === "listTrades" && !raised) {
+        raised = true;
+        void r.oms.requestOrderReconciliation(orderId);
+      }
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    expect(raised).toBe(true);
+    expect(r.u.accepted.map((answer) => answer.verdict)).toEqual(["PRESENT"]);
+    expect(answersFollowReceipts(r.u.log, "oms")).toEqual([]);
+    expect(report.resumed).toBe(true);
+    expect(report.runs.length).toBeGreaterThan(1);
   });
 
   it("by signed identity: an unknown attempt is matched only among UNCLAIMED orders (a tracked twin is not a candidate)", async () => {
