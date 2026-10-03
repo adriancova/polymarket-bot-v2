@@ -4,6 +4,10 @@
  * (`packages/inventory`, layer-1 logic, in memory). Also: many-to-many
  * attribution (fill allocations sum to the fill, §10.7), fill validation, and
  * the trade-settlement state machine (§9.11; §6 invariant 5).
+ *
+ * r2: a redelivered fill must agree on its liquidity role and its match time
+ * as an instant (WP270-R2-02); a repeated settlement state carrying a new
+ * transaction hash is kept in the log (WP270-R2-03).
  */
 
 import { addDecimal, mulDecimal, subDecimal } from "../../../packages/decimal/src/index.js";
@@ -11,7 +15,9 @@ import { describe, expect, it } from "vitest";
 
 import { accepted, venueIdFor } from "./support/fake-venue.js";
 import { uuid7 } from "./support/ids.js";
-import { ACCOUNT, INSTANCE_A, INSTANCE_B, PUSD, YES, group, openHarness, ticket, type Harness } from "./support/harness.js";
+import { OrderManager } from "../../../packages/oms/src/index.js";
+
+import { ACCOUNT, INSTANCE_A, INSTANCE_B, PUSD, YES, group, openHarness, reopen, ticket, type Harness } from "./support/harness.js";
 
 async function live(h: Harness, n: number, opts: { side?: "BUY" | "SELL"; shares?: string; price?: string; amount?: string } = {}) {
   h.venue.placement = (handle) => accepted(venueIdFor(handle.identity.salt));
@@ -124,6 +130,85 @@ describe("acceptance 3: partial fills release only the unused reservation, exact
     const conflict = await h.manager.recordFill(fill(venueOrderId, "d1", "3", "0.5"));
     expect(!conflict.ok && conflict.refusal.code).toBe("OMS_FILL_CONFLICT");
     expect(h.inventory?.book.line(ACCOUNT, PUSD)?.pendingOut).toBe("1");
+  });
+
+  it("a redelivered fill must agree on its liquidity role and its match time as an instant; same instant at another offset or precision is the same fill (r2, WP270-R2-02)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const { t, venueOrderId } = await live(h, 7);
+    const at = (matchedAt: string, extra: Record<string, unknown> = {}) => fill(venueOrderId, "d2", "2", "0.5", { matchedAt, ...extra });
+    expect((await h.manager.recordFill(at("2026-10-03T00:00:00.123456789Z"))).ok).toBe(true);
+    const pending = h.inventory?.book.line(ACCOUNT, PUSD)?.pendingOut;
+    const writes = h.store.calls;
+    const conflicts = () => h.manager.alerts().filter((alert) => alert.kind === "EVIDENCE_CONFLICT" && alert.haltMarket && alert.orderId === t.orderId).length;
+    // The same instant: another UTC offset; truncated or rounded to a coarser precision (a store keeping microseconds; a
+    // report in seconds).
+    for (const same of [
+      "2026-10-03T00:00:00.123456789Z",
+      "2026-10-03T02:00:00.123456789+02:00",
+      "2026-10-02T19:30:00.123456789-04:30",
+      "2026-10-03T00:00:00.123456Z",
+      "2026-10-03T00:00:00.123457Z",
+      "2026-10-03T00:00:00.12Z",
+      "2026-10-03T00:00:00Z",
+      "2026-10-03T00:00:00.1Z",
+    ]) {
+      const result = await h.manager.recordFill(at(same));
+      expect(result.ok, same).toBe(true);
+    }
+    expect(h.store.calls).toBe(writes);
+    expect(conflicts()).toBe(0);
+    // Not the same fill: another liquidity role, or a time the texts disagree on at a precision both carry.
+    for (const [label, other] of [
+      ["MAKER, not TAKER", at("2026-10-03T00:00:00.123456789Z", { liquidityRole: "MAKER" })],
+      ["one second later", at("2026-10-03T00:00:01Z")],
+      ["0.124 (neither truncation nor rounding of .123456789)", at("2026-10-03T00:00:00.124Z")],
+      ["one nanosecond later", at("2026-10-03T00:00:00.123456790Z")],
+      ["the same wall time in another offset", at("2026-10-03T00:00:00.123456789+01:00")],
+      ["another day", at("2026-10-04T00:00:00.123456789Z")],
+    ] as const) {
+      const result = await h.manager.recordFill(other);
+      expect(!result.ok && result.refusal.code, label).toBe("OMS_FILL_CONFLICT");
+    }
+    expect(conflicts()).toBe(6);
+    expect(h.manager.order(t.orderId)?.filledShares).toBe("2");
+    expect(h.inventory?.book.line(ACCOUNT, PUSD)?.pendingOut).toBe(pending);
+    expect(h.store.snapshotSync().fills.map((f) => [f.liquidityRole, f.matchedAt])).toEqual([["TAKER", "2026-10-03T00:00:00.123456789Z"]]);
+    // After a restart the recovered record is compared the same way.
+    const r = await reopen(h);
+    expect((await r.manager.recordFill(at("2026-10-03T01:00:00.123+01:00"))).ok).toBe(true);
+    const role = await r.manager.recordFill(at("2026-10-03T00:00:00.123456789Z", { liquidityRole: "MAKER" }));
+    expect(!role.ok && role.refusal.code).toBe("OMS_FILL_CONFLICT");
+  });
+
+  it("refuses a timestamp naming no instant (month 13, February 30 outside a leap year, hour 24, second 60) on a fill and on a settlement (r2)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const { venueOrderId } = await live(h, 8);
+    for (const bad of ["2026-13-03T00:00:00Z", "2026-02-29T00:00:00Z", "2026-02-30T00:00:00Z", "2026-04-31T00:00:00Z", "2026-10-03T24:00:00Z", "2026-10-03T00:60:00Z", "2026-10-03T00:00:60Z", "2026-10-03T00:00:00+24:00", "2026-10-00T00:00:00Z"]) {
+      const result = await h.manager.recordFill(fill(venueOrderId, "ts", "1", "0.5", { matchedAt: bad }));
+      expect(!result.ok && result.refusal.code, bad).toBe("OMS_INVALID_INPUT");
+    }
+    expect((await h.manager.recordFill(fill(venueOrderId, "ts", "1", "0.5", { matchedAt: "2024-02-29T23:59:59.999+14:00" }))).ok).toBe(true);
+    const settlement = await h.manager.applySettlement({ venueTradeId: "ts", venueOrderId, status: "MATCHED", observedAt: "2026-02-29T00:00:00Z" });
+    expect(!settlement.ok && settlement.refusal.code).toBe("OMS_INVALID_INPUT");
+  });
+
+  it("refuses to open over a stored fill without a readable liquidity role or match time (r2: a redelivery is compared with them)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const { venueOrderId } = await live(h, 9);
+    expect((await h.manager.recordFill(fill(venueOrderId, "s1", "1", "0.5"))).ok).toBe(true);
+    const snapshot = await h.store.load();
+    expect((await OrderManager.open({ ...h.deps, store: { apply: async () => undefined, load: async () => snapshot } })).ok).toBe(true);
+    for (const [label, edit] of [
+      ["no matchedAt", (f: Record<string, unknown>) => delete f["matchedAt"]],
+      ["matchedAt not a timestamp", (f: Record<string, unknown>) => (f["matchedAt"] = "2026-10-03 00:00:00+00")],
+      ["no liquidityRole", (f: Record<string, unknown>) => delete f["liquidityRole"]],
+      ["liquidityRole unknown", (f: Record<string, unknown>) => (f["liquidityRole"] = "BOTH")],
+    ] as const) {
+      const tampered = structuredClone(snapshot);
+      edit(tampered.fills[0] as unknown as Record<string, unknown>);
+      const opened = await OrderManager.open({ ...h.deps, store: { apply: async () => undefined, load: async () => tampered } });
+      expect(!opened.ok && opened.refusal.code, label).toBe("OMS_INVALID_INPUT");
+    }
   });
 
   it("refuses a fill for a venue order the manager does not hold (unattributed activity: a halt alert, WP-290 attributes it)", async () => {
@@ -250,6 +335,57 @@ describe("the trade settlement state machine (separate from order state)", () =>
     const h = await openHarness({ balances: { pusd: "100" } });
     const id = await filled(h);
     for (const status of ["MINED", "RETRYING", "CONFIRMED"]) expect((await h.manager.applySettlement(at(status, id))).ok).toBe(true);
+  });
+
+  it("a repeated state carrying a new transaction hash is kept as a same-state row: the enrichment quietly, a different hash with a non-halting alert; the hash survives a restart (r2, WP270-R2-03)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const id = await filled(h);
+    const hashed = (status: string, transactionHash: string | null) => ({ ...at(status, id), transactionHash });
+    for (const [status, hash] of [
+      ["MINED", null],
+      ["MINED", null],
+      ["MINED", "0xabc"],
+      ["MINED", "0xabc"],
+      ["MINED", null],
+      ["MINED", "0xdef"],
+      ["CONFIRMED", "0xdef"],
+      ["CONFIRMED", null],
+    ] as const) {
+      const result = await h.manager.applySettlement(hashed(status, hash));
+      expect(result.ok && result.value, `${status} ${String(hash)}`).toBe(status);
+    }
+    const history = () => h.store.snapshotSync().settlements.map((s) => [s.stateOrdinal, s.previousState, s.state, s.transactionHash]);
+    expect(history()).toEqual([
+      [0, null, "MINED", null],
+      [1, "MINED", "MINED", "0xabc"],
+      [2, "MINED", "MINED", "0xdef"],
+      [3, "MINED", "CONFIRMED", "0xdef"],
+    ]);
+    expect(h.manager.alerts().map((alert) => [alert.kind, alert.haltMarket])).toEqual([["SETTLEMENT_CONFLICT", false]]);
+    const r = await reopen(h);
+    expect((await r.manager.applySettlement(hashed("CONFIRMED", "0xdef"))).ok).toBe(true);
+    expect(history()).toHaveLength(4);
+    expect((await r.manager.applySettlement(hashed("CONFIRMED", "0x123"))).ok).toBe(true);
+    expect(history().at(-1)).toEqual([4, "CONFIRMED", "CONFIRMED", "0x123"]);
+    expect(r.manager.alerts().map((alert) => [alert.kind, alert.haltMarket])).toEqual([["SETTLEMENT_CONFLICT", false]]);
+    const stale = await r.manager.applySettlement(hashed("MINED", "0x999"));
+    expect(!stale.ok && stale.refusal.code).toBe("OMS_SETTLEMENT_REGRESSION");
+    // The recorded hash is read back on recovery, so a stored row must carry a readable one (or null).
+    const snapshot = await h.store.load();
+    const tampered = structuredClone(snapshot);
+    (tampered.settlements[0] as unknown as Record<string, unknown>)["transactionHash"] = 42;
+    expect((await OrderManager.open({ ...h.deps, store: { apply: async () => undefined, load: async () => snapshot } })).ok).toBe(true);
+    const refused = await OrderManager.open({ ...h.deps, store: { apply: async () => undefined, load: async () => tampered } });
+    expect(!refused.ok && refused.refusal.code).toBe("OMS_INVALID_INPUT");
+  });
+
+  it("a FAILED settlement re-reported with a hash is recorded once more, without a second SETTLEMENT_FAILED alert (r2)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const id = await filled(h);
+    expect((await h.manager.applySettlement(at("FAILED", id))).ok).toBe(true);
+    expect((await h.manager.applySettlement({ ...at("FAILED", id), transactionHash: "0xabc" })).ok).toBe(true);
+    expect(h.store.snapshotSync().settlements.map((s) => [s.state, s.transactionHash])).toEqual([["FAILED", null], ["FAILED", "0xabc"]]);
+    expect(h.manager.alerts().filter((alert) => alert.kind === "SETTLEMENT_FAILED")).toHaveLength(1);
   });
 
   it("FAILED raises a halt alert; CONFIRMED against FAILED is a conflict; an unknown status is refused", async () => {

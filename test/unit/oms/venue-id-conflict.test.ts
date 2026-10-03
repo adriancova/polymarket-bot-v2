@@ -11,6 +11,10 @@
  *   the order's reservation stays held;
  * - a late answer that does not resolve the attempt still supersedes the read
  *   that was outstanding when the port settled.
+ *
+ * r2 (OP-R2-01): while one is open, the signed order is never retransmitted
+ * (§9.11 step 9): a quiescent ABSENT abandons a conflicted 425 attempt rather
+ * than holding it, and `retransmitSameSignedOrder` refuses.
  */
 
 import { describe, expect, it } from "vitest";
@@ -21,6 +25,7 @@ import { accepted, venueError, venueIdFor } from "./support/fake-venue.js";
 import { flush, group, openHarness, reopen, ticket, type Harness } from "./support/harness.js";
 
 const UNKNOWN_TIMEOUT: PlacementOutcome = { kind: "UNKNOWN", reason: "ERROR", error: venueError("TIMEOUT", "UNKNOWN") };
+const UNKNOWN_425: PlacementOutcome = { kind: "UNKNOWN", reason: "ERROR", error: venueError("ENGINE_RESTARTING", "UNKNOWN", 1) };
 
 /** A placement whose answer is held back: the watchdog declares it lost; returns the attempt and the late answer's trigger. */
 async function lostInFlight(h: Harness, n: number): Promise<{ attemptId: string; orderId: string; answer: (outcome: PlacementOutcome) => Promise<void> }> {
@@ -224,4 +229,54 @@ describe("the other places a venue order id can conflict are sticky too", () => 
     expect(h.manager.order(t.orderId)).toMatchObject({ state: "CANCELED", finalSize: "0", venueIdConflict: true });
     expect(h.manager.saltGate(g.executionGroupId)?.blockers).toEqual([{ id: attemptId, reason: "EVIDENCE_CONFLICT" }]);
   });
+});
+
+describe("an open venue-id conflict forbids the step-9 retransmission (r2, OP-R2-01; probe N1)", () => {
+  for (const restart of [false, true]) {
+    it(`a 425 attempt whose read named another order's venue id: a quiescent ABSENT abandons it (never held), and the same signed order is never resent${restart ? " (a restart between the PRESENT and the ABSENT)" : ""}`, async () => {
+      const h = await openHarness();
+      const gx = group(restart ? 51 : 50);
+      await h.manager.registerGroup(gx);
+      await h.manager.submit(ticket(gx, { n: restart ? 51 : 50 }));
+      const heldId = venueIdFor(h.venue.signed[0] as string);
+      h.venue.placement = () => UNKNOWN_425;
+      const gy = group(restart ? 53 : 52);
+      await h.manager.registerGroup(gy);
+      const y = await h.manager.submit(ticket(gy, { n: restart ? 53 : 52 }));
+      if (!y.ok) throw new Error("submit failed");
+      const attemptId = y.value.submissionAttemptId;
+      expect(h.manager.attempt(attemptId)).toMatchObject({ state: "RECONCILING", errorCode: "ENGINE_RESTARTING" });
+      const request = h.reconciler.latestFor(attemptId);
+      const taken = await h.manager.applyReconciliation({
+        requestId: request?.requestId,
+        submissionAttemptId: attemptId,
+        verdict: "PRESENT",
+        order: { venueOrderId: heldId, status: "LIVE", sizeMatched: "0", originalSize: "10" },
+      });
+      expect(!taken.ok && taken.refusal.code).toBe("OMS_EVIDENCE_CONFLICT");
+      expect(h.manager.order(y.value.orderId)).toMatchObject({ venueIdConflict: true });
+      let m: Harness = h;
+      if (restart) {
+        m = await reopen(h);
+        expect(m.manager.order(y.value.orderId)).toMatchObject({ venueIdConflict: true });
+      }
+      const read = m.reconciler.latestFor(attemptId);
+      const absent = await m.manager.applyReconciliation({ requestId: read?.requestId, submissionAttemptId: attemptId, verdict: "ABSENT", transmissionQuiescent: true });
+      // Never held for the retransmission decision: abandoned at once, the conflict kept.
+      expect(absent.ok && absent.value).toMatchObject({ state: "ABANDONED", absentConfirmed: false });
+      expect(m.manager.resume().ok).toBe(true);
+      m.venue.placement = (handle) => accepted(venueIdFor(handle.identity.salt));
+      const resent = await m.manager.retransmitSameSignedOrder(attemptId);
+      expect(!resent.ok && resent.refusal.code).toBe("OMS_RETRANSMIT_NOT_SUPPORTED");
+      // The venue received salt 1002 exactly once; nothing was re-signed.
+      expect(m.venue.received).toEqual(["1001", "1002"]);
+      expect(m.venue.signed).toEqual(["1001", "1002"]);
+      expect(m.manager.order(y.value.orderId)).toMatchObject({ state: "REJECTED", venueIdConflict: true, conflict: true });
+      expect(m.manager.order(y.value.orderId)?.reservation.released).toBe(false);
+      expect(m.manager.saltGate(gy.executionGroupId)?.blockers).toEqual([{ id: attemptId, reason: "EVIDENCE_CONFLICT" }]);
+      const again = await m.manager.submit(ticket(gy, { n: restart ? 953 : 952 }));
+      expect(!again.ok && again.refusal.code).toBe("OMS_SALT_GATE_CLOSED");
+      expect(m.venue.signed).toHaveLength(2);
+    });
+  }
 });

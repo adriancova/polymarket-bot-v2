@@ -9,6 +9,10 @@
  * package manifest carries exactly its two scripts and one dependency (r1,
  * SCOPE-1). Planted lines in this file are assembled at run time, so the
  * suite scan covers this file too.
+ *
+ * r2 (WP270-R2-04): the package's sources and the OMS suites pass what
+ * `git diff --check` checks: no trailing whitespace, and no blank line at the
+ * end of a file.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -116,6 +120,33 @@ describe("packages/oms source hygiene", () => {
       typecheck: "tsc --noEmit",
       "test:fault": "tsc --noEmit -p ../../test/fault-injection/oms/tsconfig.json && vitest run --config ../../test/fault-injection/oms/vitest.config.ts",
     });
+  });
+});
+
+/** What `git diff --check` reports for a new file: trailing whitespace on a line, or a blank line at its end. */
+function whitespaceProblems(files: readonly { readonly file: string; readonly text: string }[]): string[] {
+  const out: string[] = [];
+  for (const { file, text } of files) {
+    text.split("\n").forEach((line, index) => {
+      if (/[ \t]+\r?$/u.test(line)) out.push(`${file}:${String(index + 1)}: trailing whitespace`);
+    });
+    if (!text.endsWith("\n") || /\n[ \t]*\n$/u.test(text)) out.push(`${file}: no single newline at the end (a blank line at EOF, or none)`);
+  }
+  return out;
+}
+
+describe("whitespace hygiene (r2, WP270-R2-04)", () => {
+  it("no OMS source or suite file has trailing whitespace or a blank line at its end", () => {
+    const files = [...sources().map((entry) => ({ ...entry, file: `packages/oms/src/${entry.file}` })), ...suiteFiles()];
+    expect(files.map((entry) => entry.file)).toContain("packages/oms/src/order-manager.ts");
+    expect(whitespaceProblems(files)).toEqual([]);
+  });
+
+  it("fires on planted text (the check is not vacuous)", () => {
+    for (const text of ["const a = 1;\n\n", "const a = 1; \n", "const a = 1;\t\nconst b = 2;\n", "const a = 1;"]) {
+      expect(whitespaceProblems([{ file: "planted.ts", text }]), JSON.stringify(text)).toHaveLength(1);
+    }
+    expect(whitespaceProblems([{ file: "clean.ts", text: "const a = 1;\n\nconst b = 2;\n" }])).toEqual([]);
   });
 });
 

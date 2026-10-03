@@ -43,8 +43,9 @@
  * (same salt; no re-signing) only when the attempt's last transmission ended
  * with the restart kind, an authoritative read made after that transmission
  * found it absent, no post-only refusal was seen (`POST_ONLY_NO_UNCHANGED_
- * RETRY`), and nothing is in flight. Every other case is refused. The handoff
- * flags this reading for a ruling.
+ * RETRY`), no VENUE-ID CONFLICT is open on its order, and nothing is in
+ * flight. Every other case is refused. The handoff flags this reading for a
+ * ruling.
  *
  * ## THE EXPECTED ORDER HASH: STOPPED
  *
@@ -81,8 +82,26 @@
  * recorded in the order's event log (`conflictingVenueOrderId`), so it
  * survives a restart (recovery re-raises the alert). It is never cleared by
  * the OMS: not by a read of the tracked id, not by a cancel, not by
- * abandonment. While it is open, the group's salt gate stays closed and the
- * order's reservation stays held. Resolving it is an operator's act.
+ * abandonment. While it is open, the group's salt gate stays closed, the
+ * order's reservation stays held, and its signed order is never retransmitted
+ * (an ABSENT answer abandons the attempt instead of holding it for step 9).
+ * Resolving it is an operator's act.
+ *
+ * ## STATE CONFLICTS (cleared only by an authoritative read)
+ *
+ * Evidence about a TERMINAL order that the OMS cannot reconcile with
+ * "terminal" reopens it to RECONCILING with a market-halt alert and its final
+ * size unknown again (`finalSize: null`). A stream status saying the venue may
+ * still hold it (LIVE, DELAYED, UNMATCHED) and an UNRECOGNISED stream status
+ * alike (never an assumption that an unknown status is harmless) ask for a
+ * fresh authoritative read; an authoritative read finding it open moves it on
+ * to that open state. The order then carries a STATE conflict (`conflict`,
+ * durable in the event payload). Only an authoritative read of the tracked
+ * venue order that finds it terminal clears it, fixing the final matched size
+ * at the same time; until then the group's salt gate stays closed and the
+ * remainder stays reserved. A terminal order with an open state conflict
+ * always needs that read (`#needs`), so the conflict can never be stranded:
+ * not after a restart, and not when fills complete a reopened order.
  *
  * ## PAUSE AND RESUME (§9.17 step 1)
  *
@@ -426,7 +445,7 @@ interface OrderModel {
   consumeFailed: boolean;
   venueSizeMatched: DecimalString | null;
   finalSize: DecimalString | null;
-  /** A state conflict (a terminal order contradicted); a by-id read showing it terminal again clears it. */
+  /** A STATE conflict (a terminal order contradicted, or observed with an unrecognised status); see STATE CONFLICTS. */
   conflict: boolean;
   /** A VENUE-ID CONFLICT: sticky and durable (the `conflictingVenueOrderId` event payload); never cleared here. */
   venueIdConflict: boolean;
@@ -483,6 +502,8 @@ interface FillModel {
   readonly debit: DecimalString;
   settlement: SettlementState | null;
   settlementOrdinal: number;
+  /** The transaction hash the latest settlement row recorded (for the current state), or `null`. */
+  transactionHash: string | null;
 }
 
 interface ValidatedTicket {
@@ -741,9 +762,9 @@ export class OrderManager {
       if (this.#paused) return refuse("OMS_PAUSED", "new submissions are paused until every recovered attempt is resolved");
       const attempt = this.#attempts.get(attemptId);
       if (attempt === undefined) return refuse("OMS_UNKNOWN_ATTEMPT", "no such attempt", { attemptId });
-      const refusal = retransmissionRefusal(attempt);
-      if (refusal !== undefined) return refuse("OMS_RETRANSMIT_NOT_SUPPORTED", refusal, { attemptId });
       const order = this.#mustOrder(attempt.orderId);
+      const refusal = retransmissionRefusal(attempt, order);
+      if (refusal !== undefined) return refuse("OMS_RETRANSMIT_NOT_SUPPORTED", refusal, { attemptId });
       const mode = this.#mode();
       if (mode === "TRADING_UNAVAILABLE") return refuse("OMS_TRADING_UNAVAILABLE", "the venue mode admits no placement");
       if (mode === "POST_ONLY" && !order.postOnly) {
@@ -1025,8 +1046,9 @@ export class OrderManager {
    * order along; it never resolves RECONCILING (only an authoritative answer
    * does) and never creates a rejection or a cancel from `unmatched`
    * (`VENUE_FACTS.UNMATCHED_ACCEPTED_NOT_FILLED`). An unrecognised status
-   * sends a non-terminal order to RECONCILING; contradicting a terminal order
-   * reopens it to RECONCILING and raises an evidence conflict.
+   * sends a non-terminal order to RECONCILING. On a terminal order, a status
+   * that contradicts it and an unrecognised status alike reopen it to
+   * RECONCILING with a state conflict (STATE CONFLICTS in the header).
    */
   async applyOrderObservation(raw: unknown): Promise<OmsResult<OrderView>> {
     return this.#guarded(async () => {
@@ -1045,7 +1067,10 @@ export class OrderManager {
       const status = fields.status;
       if (!isObservedStatus(status)) {
         if (TERMINAL_ORDER_STATES.has(order.state)) {
-          this.#record(order, "OBSERVATION_UNRECOGNISED", fx, { reasonCode: "UNRECOGNISED_STATUS", source: "polymarket" });
+          // Never an assumption that an unknown status is harmless: reopen and read (STATE CONFLICTS).
+          this.#reopenTerminal(order, attempt, "OBSERVATION_UNRECOGNISED", "a terminal order was observed with an unrecognised status", fx, {
+            reasonCode: "UNRECOGNISED_STATUS",
+          });
         } else if (order.state !== "RECONCILING") {
           this.#transition(order, "RECONCILING", "OBSERVATION_UNRECOGNISED", fx, { reasonCode: "UNRECOGNISED_STATUS", source: "polymarket" });
           fx.requests.add(attempt);
@@ -1080,11 +1105,15 @@ export class OrderManager {
       const key = fillKey(fill.venueTradeId, fill.venueOrderId, fill.allocationDiscriminator);
       const existing = this.#fills.get(key);
       if (existing !== undefined) {
+        // Every fact of the fill must agree: the money (shares, price, fee), the liquidity role, and the match
+        // time as an instant (offsets applied; the coarser text the finer one truncated or rounded: `sameInstant`).
         const same =
           existing.record.shares === fill.shares &&
           existing.record.price === fill.price &&
           existing.record.feeAmount === fill.feeAmount &&
-          existing.record.feeAssetId === fill.feeAssetId;
+          existing.record.feeAssetId === fill.feeAssetId &&
+          existing.record.liquidityRole === fill.liquidityRole &&
+          sameInstant(existing.record.matchedAt, fill.matchedAt);
         if (same) return ok(this.#orderView(order));
         this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, order.attemptId, "a fill was reported twice with different facts");
         return refuse("OMS_FILL_CONFLICT", "this fill is already recorded with different facts");
@@ -1119,7 +1148,7 @@ export class OrderManager {
         matchedAt: fill.matchedAt,
       });
       const allocations = allocationsFor(order, fillId, before, after);
-      this.#fills.set(key, { record, debit, settlement: null, settlementOrdinal: 0 });
+      this.#fills.set(key, { record, debit, settlement: null, settlementOrdinal: 0, transactionHash: null });
       order.filledShares = after;
       order.debited = addDecimal(order.debited, debit);
       fx.writes.push({ kind: "INSERT_FILL", fill: record, allocations });
@@ -1139,6 +1168,9 @@ export class OrderManager {
       // supersede it, so only a read requested after this fill can describe the order (WP-300 R7-X3's rule).
       const owner = this.#mustAttempt(order.attemptId);
       if (owner.currentRequestId !== null && order.state !== "FILLED") fx.requests.add(owner);
+      // A filled order needs no read, unless it carries an open state conflict (STATE CONFLICTS): then it needs
+      // the read that can clear it, made after this fill.
+      if (order.state === "FILLED" && order.conflict) fx.requests.add(owner);
       if (!(await this.#commit(fx))) return storeFailed();
       // Durable first, then consume (a replayed consume is a duplicate pending id: done).
       await this.#consume(order, record, debit);
@@ -1152,7 +1184,9 @@ export class OrderManager {
    * One trade-settlement observation (§9.11 trade settlement machine; §6
    * invariant 5). Stale deliveries are refused; CONFIRMED against FAILED is a
    * conflict; FAILED raises a halt alert (ADR-006 §5: a compensating reversal
-   * is the ledger's).
+   * is the ledger's). A repeated state is idempotent unless it carries a new
+   * transaction hash, which is appended as a same-state row (the log keeps the
+   * enrichment, or the contradiction with a non-halting alert).
    */
   async applySettlement(raw: unknown): Promise<OmsResult<SettlementState>> {
     return this.#guarded(async () => {
@@ -1176,8 +1210,24 @@ export class OrderManager {
         return refuse("OMS_SETTLEMENT_UNRECOGNISED", "the settlement status is not one of MATCHED, MINED, CONFIRMED, RETRYING, FAILED");
       }
       const current = fill.settlement;
-      if (current === status) return ok(status);
-      if (current !== null && !isLegalSettlementTransition(current, status)) {
+      const transactionHash = (fields.transactionHash as string | null | undefined) ?? null;
+      if (current === status) {
+        // The same state again. Without a new transaction hash it is a duplicate (idempotent). With one, it is
+        // evidence the append-only log keeps, as a same-state row: a hash the earlier report lacked, or one that
+        // differs from the hash recorded, which also raises a non-halting alert (no venue fact says whether a
+        // state can be re-reported in another transaction, so it is recorded, not judged).
+        if (transactionHash === null || transactionHash === fill.transactionHash) return ok(status);
+        if (fill.transactionHash !== null) {
+          this.#alert(
+            "SETTLEMENT_CONFLICT",
+            false,
+            order.marketId,
+            order.orderId,
+            order.attemptId,
+            `settlement ${status} re-reported with a different transaction hash`,
+          );
+        }
+      } else if (current !== null && !isLegalSettlementTransition(current, status)) {
         // FAILED is terminal: anything after it contradicts it. CONFIRMED then FAILED contradicts too.
         // Anything else is an earlier state delivered late (a regression).
         const conflict = current === "FAILED" || (current === "CONFIRMED" && status === "FAILED");
@@ -1193,12 +1243,13 @@ export class OrderManager {
         previousState: current,
         state: status,
         venueTradeId: fill.record.venueTradeId,
-        transactionHash: (fields.transactionHash as string | null | undefined) ?? null,
+        transactionHash,
         observedAt: fields.observedAt,
       });
       fill.settlement = status;
       fill.settlementOrdinal += 1;
-      if (status === "FAILED") {
+      fill.transactionHash = transactionHash;
+      if (status === "FAILED" && current !== "FAILED") {
         this.#alert("SETTLEMENT_FAILED", true, order.marketId, order.orderId, order.attemptId, "a trade settlement FAILED; the ledger owes a compensating reversal");
       }
       if (!(await this.#persist([{ kind: "APPEND_SETTLEMENT", settlement: record }]))) return storeFailed();
@@ -1720,6 +1771,8 @@ export class OrderManager {
     if (order === undefined || order.venueOrderId === null) return null;
     if (order.state === "RECONCILING") return "ORDER_STATE";
     if ((order.state === "CANCELED" || order.state === "EXPIRED") && order.finalSize === null) return "FINAL_SIZE";
+    // STATE CONFLICTS: a terminal order with an open state conflict always needs the read that can clear it.
+    if (order.conflict && TERMINAL_ORDER_STATES.has(order.state)) return "ORDER_STATE";
     return null;
   }
 
@@ -1800,7 +1853,7 @@ export class OrderManager {
     }
     this.#consumeCurrentRequest(attempt);
     const fx = effects();
-    if (retransmissionEligible(attempt)) {
+    if (retransmissionEligible(attempt, order)) {
       // Held for the caller's decision: retransmit the same signed order, or abandon (§9.11 step 9).
       attempt.absentConfirmed = true;
       this.#setAttempt(attempt, "RECONCILING", "RECONCILED_ABSENT", attempt.errorCode, fx);
@@ -1873,7 +1926,15 @@ export class OrderManager {
       }
     } else {
       if (order.state !== "RECONCILING") this.#transition(order, "RECONCILING", "RECONCILIATION_REQUESTED", fx, {});
-      if (terminalTarget) order.finalSize = venue.sizeMatched;
+      if (terminalTarget) {
+        order.finalSize = venue.sizeMatched;
+        // The read finds the tracked venue order terminal: it resolves a STATE conflict (STATE CONFLICTS), as in
+        // the both-terminal branch above, e.g. for an order a stale or unrecognised observation reopened.
+        if (order.conflict) {
+          order.conflict = false;
+          payload["conflict"] = false;
+        }
+      }
       this.#transition(order, target, "RECONCILED_PRESENT", fx, { source: "polymarket", payload });
     }
     if (order.finalSize !== null) fx.releases.add(order);
@@ -1925,11 +1986,7 @@ export class OrderManager {
         this.#record(order, "OBSERVATION", fx, opts);
         return;
       }
-      this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, `a terminal order was observed ${status}`);
-      order.conflict = true;
-      order.finalSize = null;
-      this.#transition(order, "RECONCILING", "EVIDENCE_CONFLICT", fx, { ...opts, payload: { status, conflict: true, finalSize: null } });
-      fx.requests.add(attempt);
+      this.#reopenTerminal(order, attempt, "EVIDENCE_CONFLICT", `a terminal order was observed ${status}`, fx, { status });
       return;
     }
     if (state === "RECONCILING") {
@@ -1961,6 +2018,35 @@ export class OrderManager {
         return;
       }
     }
+  }
+
+  /**
+   * Reopen a terminal order on stream evidence it cannot reconcile with
+   * "terminal" (STATE CONFLICTS in the header): a market-halt alert, a durable
+   * state conflict, the final size unknown again, and a fresh authoritative read.
+   */
+  #reopenTerminal(
+    order: OrderModel,
+    attempt: AttemptModel,
+    eventType: string,
+    detail: string,
+    fx: Effects,
+    evidence: { readonly status?: ObservedStatus; readonly reasonCode?: string },
+  ): void {
+    this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, detail);
+    order.conflict = true;
+    order.finalSize = null;
+    const payload: Record<string, JsonValue> = {
+      ...(evidence.status === undefined ? {} : { status: evidence.status }),
+      conflict: true,
+      finalSize: null,
+    };
+    this.#transition(order, "RECONCILING", eventType, fx, {
+      source: "polymarket",
+      payload,
+      ...(evidence.reasonCode === undefined ? {} : { reasonCode: evidence.reasonCode }),
+    });
+    fx.requests.add(attempt);
   }
 
   // ----- fills and reservations ---------------------------------------------
@@ -2521,6 +2607,7 @@ export class OrderManager {
         debit,
         settlement: null,
         settlementOrdinal: 0,
+        transactionHash: null,
       });
       this.#usedIds.add(record.fillId);
     }
@@ -2531,6 +2618,7 @@ export class OrderManager {
       if (fill === undefined) return refuse("OMS_INVALID_INPUT", "a settlement names an unknown fill");
       fill.settlement = settlement.state;
       fill.settlementOrdinal = settlement.stateOrdinal + 1;
+      fill.transactionHash = settlement.transactionHash;
     }
     // Normalize what a crash can leave behind, then reconcile.
     let unresolved = false;
@@ -2620,21 +2708,25 @@ function checkDependencies(deps: unknown): string | undefined {
   return undefined;
 }
 
-function retransmissionRefusal(attempt: AttemptModel): string | undefined {
+function retransmissionRefusal(attempt: AttemptModel, order: OrderModel): string | undefined {
   if (attempt.state !== "RECONCILING" || !attempt.absentConfirmed) {
     return "the same signed order is resent only after an authoritative read found it absent (ADR-007 §3)";
   }
-  if (!retransmissionEligible(attempt)) {
-    return "only the documented restart path (HTTP 425) supports resubmitting the signed request (VENUE_FACTS.RESTART_RESUBMIT, RETRY_ONLY_RESTART)";
+  if (!retransmissionEligible(attempt, order)) {
+    return "only the documented restart path (HTTP 425), with no post-only refusal and no open venue-id conflict, supports resubmitting the signed request (VENUE_FACTS.RESTART_RESUBMIT, RETRY_ONLY_RESTART)";
   }
   if (attempt.inFlight) return "a transmission of this attempt is in flight";
   if (attempt.handle === null) return "the signed payload could not be restored";
   return undefined;
 }
 
-/** VENUE_FACTS.RESTART_RESUBMIT and RETRY_ONLY_RESTART; POST_ONLY_NO_UNCHANGED_RETRY. */
-function retransmissionEligible(attempt: AttemptModel): boolean {
-  return attempt.errorCode === "ENGINE_RESTARTING" && !attempt.postOnlyRefused && attempt.handle !== null;
+/**
+ * VENUE_FACTS.RESTART_RESUBMIT and RETRY_ONLY_RESTART; POST_ONLY_NO_UNCHANGED_RETRY. Never while a VENUE-ID
+ * CONFLICT is open on the order: resolving one is an operator's act, so an ABSENT answer then abandons the
+ * attempt rather than holding it for step 9.
+ */
+function retransmissionEligible(attempt: AttemptModel, order: OrderModel): boolean {
+  return attempt.errorCode === "ENGINE_RESTARTING" && !attempt.postOnlyRefused && attempt.handle !== null && !order.venueIdConflict;
 }
 
 function acceptedState(status: AcceptedStatus): OrderState {
@@ -2738,10 +2830,72 @@ function allocationsFor(order: OrderModel, fillId: string, before: DecimalString
   );
 }
 
-const TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/u;
+const TIMESTAMP = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?(?:Z|([+-])([0-9]{2}):([0-9]{2}))$/u;
+
+/** An instant, exactly: nanoseconds since 1970-01-01T00:00:00Z, and the precision its text carried. */
+interface Instant {
+  readonly nanos: bigint;
+  /** Fraction digits in the text (0-9). */
+  readonly digits: number;
+}
+
+/** Days from 1970-01-01 to a proleptic Gregorian date (H. Hinnant's `days_from_civil`; exact integer arithmetic). */
+function daysFromCivil(year: number, month: number, day: number): number {
+  const y = month <= 2 ? year - 1 : year;
+  const era = Math.floor(y / 400);
+  const yearOfEra = y - era * 400;
+  const dayOfYear = Math.floor((153 * (month > 2 ? month - 3 : month + 9) + 2) / 5) + day - 1;
+  const dayOfEra = yearOfEra * 365 + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear;
+  return era * 146097 + dayOfEra - 719468;
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+/**
+ * The instant an ISO-8601 timestamp names, its UTC offset applied; `undefined` when the text is not one or a
+ * field is out of range (month 13, February 30, hour 24, second 60, ...). Pure: no clock is read.
+ */
+function instantOf(text: string): Instant | undefined {
+  const match = TIMESTAMP.exec(text);
+  if (match === null) return undefined;
+  // The first six groups always participate in a match; the defaults only satisfy the type checker.
+  const [, year = "", month = "", day = "", hour = "", minute = "", second = "", fraction = "", sign = "+", offsetHours = "00", offsetMinutes = "00"] = match;
+  const y = Number(year);
+  const mo = Number(month);
+  const d = Number(day);
+  const h = Number(hour);
+  const mi = Number(minute);
+  const s = Number(second);
+  const oh = Number(offsetHours);
+  const om = Number(offsetMinutes);
+  if (mo < 1 || mo > 12 || d < 1 || d > daysInMonth(y, mo) || h > 23 || mi > 59 || s > 59 || oh > 23 || om > 59) return undefined;
+  const offset = (sign === "-" ? -1 : 1) * (oh * 3600 + om * 60);
+  const seconds = daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s - offset;
+  return { nanos: BigInt(seconds) * 1_000_000_000n + BigInt(fraction.padEnd(9, "0")), digits: fraction.length };
+}
 
 function isTimestampText(value: unknown): value is string {
-  return typeof value === "string" && TIMESTAMP.test(value);
+  return typeof value === "string" && instantOf(value) !== undefined;
+}
+
+/**
+ * Whether two timestamps name the same instant as far as both texts can tell: offsets are applied, and the
+ * coarser text must be the finer instant truncated or rounded to the coarser precision. So a report in
+ * whole seconds, or a store that keeps microseconds, still agrees with a nanosecond text of the same
+ * instant, while two texts that differ at a precision both carry never do.
+ */
+function sameInstant(a: string, b: string): boolean {
+  const x = instantOf(a);
+  const y = instantOf(b);
+  if (x === undefined || y === undefined) return false;
+  const [coarse, fine] = x.digits <= y.digits ? [x, y] : [y, x];
+  const unit = 10n ** BigInt(9 - coarse.digits);
+  const excess = fine.nanos - coarse.nanos;
+  // Truncation leaves 0 <= excess < unit; rounding leaves -unit/2 <= excess <= unit/2. Equal precisions: excess 0.
+  return 2n * excess >= -unit && excess < unit;
 }
 
 interface ValidatedFill {
@@ -2955,7 +3109,8 @@ function readSnapshot(raw: unknown): StoreSnapshot | undefined {
       !isUuidV7(settlement.fillId) ||
       typeof settlement.stateOrdinal !== "number" ||
       !Number.isSafeInteger(settlement.stateOrdinal) ||
-      !isSettlementState(settlement.state)
+      !isSettlementState(settlement.state) ||
+      !(settlement.transactionHash === null || isIdentifier(settlement.transactionHash))
     ) {
       return undefined;
     }
@@ -3111,7 +3266,20 @@ function readEventRecord(raw: unknown): OrderEventRecord | undefined {
 }
 
 function readFillRecord(raw: unknown): FillRecord | undefined {
-  const f = readFields(raw, ["fillId", "orderId", "venueTradeId", "venueOrderId", "allocationDiscriminator", "shares", "price", "notional", "feeAmount", "feeAssetId"]);
+  const f = readFields(raw, [
+    "fillId",
+    "orderId",
+    "venueTradeId",
+    "venueOrderId",
+    "allocationDiscriminator",
+    "shares",
+    "price",
+    "notional",
+    "feeAmount",
+    "feeAssetId",
+    "liquidityRole",
+    "matchedAt",
+  ]);
   if (f === undefined) return undefined;
   if (
     !isUuidV7(f.fillId) ||
@@ -3123,7 +3291,10 @@ function readFillRecord(raw: unknown): FillRecord | undefined {
     !isUnitPrice(f.price) ||
     !isNonNegativeAmount(f.notional) ||
     !isNonNegativeAmount(f.feeAmount) ||
-    !(f.feeAssetId === null || isIdentifier(f.feeAssetId))
+    !(f.feeAssetId === null || isIdentifier(f.feeAssetId)) ||
+    // A redelivered fill is compared with these (`recordFill`), so a recovered record must carry them readably.
+    (f.liquidityRole !== "MAKER" && f.liquidityRole !== "TAKER") ||
+    !isTimestampText(f.matchedAt)
   ) {
     return undefined;
   }
@@ -3223,4 +3394,3 @@ function foldOrder(record: OrderRecord, events: readonly OrderEventRecord[]): Or
   if (last === undefined || last.newState !== record.state) return undefined;
   return order;
 }
-
