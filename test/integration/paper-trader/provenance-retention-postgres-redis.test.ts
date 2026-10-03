@@ -102,12 +102,16 @@ const RESPONSIBLE_FROM_MS = OPEN_MS - 15 * MINUTE;
 const STRETCH_A_END_MS = Date.parse("2026-03-04T10:10:00.000Z");
 
 let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+/** ONE Redis for the file (each scenario has its own stream; an outage is a partition, never a stop). */
+let redis: Awaited<ReturnType<typeof startRedisContainer>>;
 
 beforeAll(async () => {
   postgres = await startPostgresContainer();
+  redis = await startRedisContainer();
 }, 300_000);
 
 afterAll(async () => {
+  await redis?.stop();
   await postgres?.stop();
 });
 
@@ -378,7 +382,6 @@ async function retentionScenario(scenario: Scenario): Promise<void> {
   const label = `prov-retention-${scenario}`;
   const root = await mkdtemp(join(tmpdir(), "pmb-provenance-1-"));
   const walRoot = join(root, "wal");
-  const redis = await startRedisContainer();
   try {
     await withFreshDatabase(postgres.getConnectionUri(), label, async ({ connectionString, context }) => {
       const registered = await registerThroughTheRepositories(context, label);
@@ -650,7 +653,6 @@ async function retentionScenario(scenario: Scenario): Promise<void> {
       );
     });
   } finally {
-    await redis.stop();
     await rm(root, { recursive: true, force: true });
   }
 }

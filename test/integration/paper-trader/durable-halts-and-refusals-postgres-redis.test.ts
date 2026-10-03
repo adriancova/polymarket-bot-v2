@@ -18,7 +18,7 @@
  *    says so (`HALT RECORD NOT DURABLE`) and exits 75 regardless, within the
  *    stated bound: fail-closed exit is not weakened to get a row written.
  * 4. **Refusals and a halt, read as a window's evidence** — a risk policy
- *    that refuses the entry, then a Redis outage inside the window: the
+ *    that refuses the entry, then a Redis partition inside the window: the
  *    research worker's `postgresTraderEvidence` reads the refusal rows, the
  *    halt row and the instance's dispatch frontier back from what the real
  *    trader wrote.
@@ -54,12 +54,21 @@ import {
 } from "./support/registration.js";
 
 let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+/**
+ * ONE Redis for the file: no scenario stops it (an outage is a partition, the
+ * freezable hop), and each has its own stream — so the suite starts as few
+ * containers as it can (`TC-LOCAL-FLAKE`: Docker Desktop's port forwarding has
+ * refused connections when many start at once).
+ */
+let redis: Awaited<ReturnType<typeof startRedisContainer>>;
 
 beforeAll(async () => {
   postgres = await startPostgresContainer();
+  redis = await startRedisContainer();
 }, 300_000);
 
 afterAll(async () => {
+  await redis?.stop();
   await postgres?.stop();
 });
 
@@ -183,166 +192,150 @@ async function incidents(context: TestContext) {
 
 describe("every halt is written to ops.incidents before the process exits (PROVENANCE-1, OUT1-R1-HALT-NOT-DURABLE)", () => {
   it("TRANSPORT_RESYNC_REQUIRED: a restart finds that retention removed events it never read — the halt is an ops.incidents row, and the process exits 75", async () => {
-    const redis = await startRedisContainer();
-    try {
-      await withFreshDatabase(postgres.getConnectionUri(), "prov-resync", async ({ connectionString, context }) => {
-        const label = "prov-resync";
-        const registered = await registerThroughTheRepositories(context, label);
-        const stream = uniqueStreamName(label);
-        const document = documentOn(registered, label, stream);
-        // A retention bound of 50 on the publisher.
-        const publisher = await connectPublisher(redis.getConnectionUrl(), 50);
-        const reference = (seq: number): IngestedEvent =>
-          ingested(
-            "ReferenceTradeObserved",
-            { venue: "binance", symbol: "BTCUSDT", price: "100000", size: "0.5" },
-            { receivedAt: "2026-03-04T11:59:00.000Z", ingestSeq: seq, source: "binance" },
-          );
-        try {
-          // --- run 1: reads 20 events and records its position, then a partition halts it
-          const hop = await startFreezableRedisProxy(redis.getConnectionUrl());
-          try {
-            const first = runProcess(environment(hop.url, connectionString, `${label}-1`), document);
-            await publishAndSettle(publisher, stream, "trader-1", Array.from({ length: 20 }, (_, index) => reference(index + 1)), 20);
-            hop.freeze();
-            const exited = await settleWithin(first.exit, 60_000);
-            expect(exited?.value, first.text()).toBe(EXIT_CODES.halted);
-            expect(exitHealth(first).halts.map((halt) => halt.code)).toEqual(["TRANSPORT_UNAVAILABLE"]);
-          } finally {
-            await hop.close();
-          }
-          // --- while it is down: 100 more events, so retention removes 50 it never read
-          for (let seq = 21; seq <= 120; seq += 1) await publisher.publish(stream, reference(seq).envelope);
-        } finally {
-          await publisher.close();
-        }
-
-        // --- run 2, the restart: it resumes at its recorded position and finds the gap
-        const run = runProcess(environment(redis.getConnectionUrl(), connectionString, `${label}-2`), document);
-        const exited = await settleWithin(run.exit, 60_000);
-        expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
-        const halts = exitHealth(run).halts;
-        expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-          ["GLOBAL", "TRANSPORT_RESYNC_REQUIRED", "FULL_HALT"],
-        ]);
-        expect(halts[0]?.detail).toContain("retention removed 50 event(s)");
-        // One row per run's halt: run 1's outage, then run 2's resync.
-        const rows = await incidents(context);
-        expect(rows.map((row) => row.failure_class)).toEqual(["TRANSPORT_UNAVAILABLE", "TRANSPORT_RESYNC_REQUIRED"]);
-        expect(rows[1]).toMatchObject({
-          incident_key: "TRADER_HALT:GLOBAL",
-          environment: "PAPER",
-          account_ref: "paper-account",
-          severity: "PAGE",
-          status: "OPEN",
-          failure_class: "TRANSPORT_RESYNC_REQUIRED",
-          action: "FULL_HALT",
-          market_id: null,
-          instance_id: registered.instanceId,
-          detail: halts[0]?.detail,
-        });
-        expect(Date.parse(String(rows[1]?.opened_at))).toBe(Date.parse(halts[0]?.at ?? ""));
-        expect(run.text()).toContain(
-          "halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL TRANSPORT_RESYNC_REQUIRED)",
+    await withFreshDatabase(postgres.getConnectionUri(), "prov-resync", async ({ connectionString, context }) => {
+      const label = "prov-resync";
+      const registered = await registerThroughTheRepositories(context, label);
+      const stream = uniqueStreamName(label);
+      const document = documentOn(registered, label, stream);
+      // A retention bound of 50 on the publisher.
+      const publisher = await connectPublisher(redis.getConnectionUrl(), 50);
+      const reference = (seq: number): IngestedEvent =>
+        ingested(
+          "ReferenceTradeObserved",
+          { venue: "binance", symbol: "BTCUSDT", price: "100000", size: "0.5" },
+          { receivedAt: "2026-03-04T11:59:00.000Z", ingestSeq: seq, source: "binance" },
         );
-        // Nothing was decided: reference prints before any book or open evaluate nothing.
-        expect(await context.db.selectFrom("strategy.decisions").selectAll().execute()).toEqual([]);
+      try {
+        // --- run 1: reads 20 events and records its position, then a partition halts it
+        const hop = await startFreezableRedisProxy(redis.getConnectionUrl());
+        try {
+          const first = runProcess(environment(hop.url, connectionString, `${label}-1`), document);
+          await publishAndSettle(publisher, stream, "trader-1", Array.from({ length: 20 }, (_, index) => reference(index + 1)), 20);
+          hop.freeze();
+          const exited = await settleWithin(first.exit, 60_000);
+          expect(exited?.value, first.text()).toBe(EXIT_CODES.halted);
+          expect(exitHealth(first).halts.map((halt) => halt.code)).toEqual(["TRANSPORT_UNAVAILABLE"]);
+        } finally {
+          await hop.close();
+        }
+        // --- while it is down: 100 more events, so retention removes 50 it never read
+        for (let seq = 21; seq <= 120; seq += 1) await publisher.publish(stream, reference(seq).envelope);
+      } finally {
+        await publisher.close();
+      }
+
+      // --- run 2, the restart: it resumes at its recorded position and finds the gap
+      const run = runProcess(environment(redis.getConnectionUrl(), connectionString, `${label}-2`), document);
+      const exited = await settleWithin(run.exit, 60_000);
+      expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
+      const halts = exitHealth(run).halts;
+      expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
+        ["GLOBAL", "TRANSPORT_RESYNC_REQUIRED", "FULL_HALT"],
+      ]);
+      expect(halts[0]?.detail).toContain("retention removed 50 event(s)");
+      // One row per run's halt: run 1's outage, then run 2's resync.
+      const rows = await incidents(context);
+      expect(rows.map((row) => row.failure_class)).toEqual(["TRANSPORT_UNAVAILABLE", "TRANSPORT_RESYNC_REQUIRED"]);
+      expect(rows[1]).toMatchObject({
+        incident_key: "TRADER_HALT:GLOBAL",
+        environment: "PAPER",
+        account_ref: "paper-account",
+        severity: "PAGE",
+        status: "OPEN",
+        failure_class: "TRANSPORT_RESYNC_REQUIRED",
+        action: "FULL_HALT",
+        market_id: null,
+        instance_id: registered.instanceId,
+        detail: halts[0]?.detail,
       });
-    } finally {
-      await redis.stop();
-    }
+      expect(Date.parse(String(rows[1]?.opened_at))).toBe(Date.parse(halts[0]?.at ?? ""));
+      expect(run.text()).toContain(
+        "halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL TRANSPORT_RESYNC_REQUIRED)",
+      );
+      // Nothing was decided: reference prints before any book or open evaluate nothing.
+      expect(await context.db.selectFrom("strategy.decisions").selectAll().execute()).toEqual([]);
+    });
   }, 240_000);
 
   it("STORE_UNAVAILABLE with the database ALIVE (a write it refuses): the halt record still lands, naming the refusal, and the process exits 75", async () => {
-    const redis = await startRedisContainer();
-    try {
-      await withFreshDatabase(postgres.getConnectionUri(), "prov-store-refused", async ({ connectionString, context }) => {
-        const label = "prov-store-refused";
-        const registered = await registerThroughTheRepositories(context, label);
-        const stream = uniqueStreamName(label);
-        const publisher = await connectPublisher(redis.getConnectionUrl());
-        const document = documentOn(registered, label, stream);
-        const run = runProcess(environment(redis.getConnectionUrl(), connectionString, label), document);
-        try {
-          const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
-          await publishAndSettle(publisher, stream, "trader-1", events, events.length);
-          // The database is up, and from now on refuses every new decision row.
-          await context.pool.query(
-            "alter table strategy.decisions add constraint provenance_probe_refuses check (false) not valid",
-          );
-          await publisher.publish(
-            stream,
-            ingested(
-              "ReferenceTradeObserved",
-              { venue: "binance", symbol: "BTCUSDT", price: "100200", size: "0.1" },
-              { receivedAt: "2026-03-04T12:00:04.000Z", ingestSeq: 7, source: "binance" },
-            ).envelope,
-          );
-          const exited = await settleWithin(run.exit, 60_000);
-          expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
-          const halts = exitHealth(run).halts;
-          expect(halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
-          const rows = await incidents(context);
-          expect(rows).toHaveLength(1);
-          expect(rows[0]).toMatchObject({
-            incident_key: "TRADER_HALT:GLOBAL",
-            failure_class: "STORE_UNAVAILABLE",
-            action: "FULL_HALT",
-            instance_id: registered.instanceId,
-            market_id: null,
-          });
-          expect(rows[0]?.detail).toContain("provenance_probe_refuses");
-        } finally {
-          await publisher.close();
-        }
-      });
-    } finally {
-      await redis.stop();
-    }
+    await withFreshDatabase(postgres.getConnectionUri(), "prov-store-refused", async ({ connectionString, context }) => {
+      const label = "prov-store-refused";
+      const registered = await registerThroughTheRepositories(context, label);
+      const stream = uniqueStreamName(label);
+      const publisher = await connectPublisher(redis.getConnectionUrl());
+      const document = documentOn(registered, label, stream);
+      const run = runProcess(environment(redis.getConnectionUrl(), connectionString, label), document);
+      try {
+        const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
+        await publishAndSettle(publisher, stream, "trader-1", events, events.length);
+        // The database is up, and from now on refuses every new decision row.
+        await context.pool.query(
+          "alter table strategy.decisions add constraint provenance_probe_refuses check (false) not valid",
+        );
+        await publisher.publish(
+          stream,
+          ingested(
+            "ReferenceTradeObserved",
+            { venue: "binance", symbol: "BTCUSDT", price: "100200", size: "0.1" },
+            { receivedAt: "2026-03-04T12:00:04.000Z", ingestSeq: 7, source: "binance" },
+          ).envelope,
+        );
+        const exited = await settleWithin(run.exit, 60_000);
+        expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
+        const halts = exitHealth(run).halts;
+        expect(halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
+        const rows = await incidents(context);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          incident_key: "TRADER_HALT:GLOBAL",
+          failure_class: "STORE_UNAVAILABLE",
+          action: "FULL_HALT",
+          instance_id: registered.instanceId,
+          market_id: null,
+        });
+        expect(rows[0]?.detail).toContain("provenance_probe_refuses");
+      } finally {
+        await publisher.close();
+      }
+    });
   }, 240_000);
 
   it("a PostgreSQL connection the server TERMINATES while the trader idles: GLOBAL STORE_UNAVAILABLE, the record lands, exit 75 (it was an uncaught 'error' event: exit 1, no halt)", async () => {
-    const redis = await startRedisContainer();
-    try {
-      await withFreshDatabase(postgres.getConnectionUri(), "prov-terminated", async ({ connectionString, context }) => {
-        const label = "prov-terminated";
-        const registered = await registerThroughTheRepositories(context, label);
-        const stream = uniqueStreamName(label);
-        const publisher = await connectPublisher(redis.getConnectionUrl());
-        const run = runProcess(environment(redis.getConnectionUrl(), connectionString, label), documentOn(registered, label, stream));
-        try {
-          const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
-          await publishAndSettle(publisher, stream, "trader-1", events, events.length);
-          // The server ends the trader's pooled connections (a restart, an
-          // operator's pg_terminate_backend, a dropped link look the same).
-          const terminated = await context.pool.query<{ readonly n: number }>(
-            "select count(pg_terminate_backend(pid))::int as n from pg_stat_activity " +
-              "where datname = current_database() and application_name = 'polymarket-bot'",
-          );
-          expect(terminated.rows[0]?.n).toBeGreaterThanOrEqual(1);
-          const exited = await settleWithin(run.exit, 60_000);
-          expect(exited === undefined ? "STILL RUNNING" : "returned", run.text()).toBe("returned");
-          expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
-          const halts = exitHealth(run).halts;
-          expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT"]]);
-          expect(halts[0]?.detail).toContain("the PostgreSQL connection pool lost an idle connection");
-          expect(halts[0]?.detail).toContain("terminating connection due to administrator command");
-          expect(run.text()).toContain("STORE CONNECTION LOST: ");
-          // The server is up, so the halt record lands (on a new connection).
-          const rows = await incidents(context);
-          expect(rows.map((row) => [row.failure_class, row.instance_id])).toEqual([["STORE_UNAVAILABLE", registered.instanceId]]);
-          expect(run.text()).toContain("halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL STORE_UNAVAILABLE)");
-        } finally {
-          await publisher.close();
-        }
-      });
-    } finally {
-      await redis.stop();
-    }
+    await withFreshDatabase(postgres.getConnectionUri(), "prov-terminated", async ({ connectionString, context }) => {
+      const label = "prov-terminated";
+      const registered = await registerThroughTheRepositories(context, label);
+      const stream = uniqueStreamName(label);
+      const publisher = await connectPublisher(redis.getConnectionUrl());
+      const run = runProcess(environment(redis.getConnectionUrl(), connectionString, label), documentOn(registered, label, stream));
+      try {
+        const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
+        await publishAndSettle(publisher, stream, "trader-1", events, events.length);
+        // The server ends the trader's pooled connections (a restart, an
+        // operator's pg_terminate_backend, a dropped link look the same).
+        const terminated = await context.pool.query<{ readonly n: number }>(
+          "select count(pg_terminate_backend(pid))::int as n from pg_stat_activity " +
+            "where datname = current_database() and application_name = 'polymarket-bot'",
+        );
+        expect(terminated.rows[0]?.n).toBeGreaterThanOrEqual(1);
+        const exited = await settleWithin(run.exit, 60_000);
+        expect(exited === undefined ? "STILL RUNNING" : "returned", run.text()).toBe("returned");
+        expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
+        const halts = exitHealth(run).halts;
+        expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT"]]);
+        expect(halts[0]?.detail).toContain("the PostgreSQL connection pool lost an idle connection");
+        expect(halts[0]?.detail).toContain("terminating connection due to administrator command");
+        expect(run.text()).toContain("STORE CONNECTION LOST: ");
+        // The server is up, so the halt record lands (on a new connection).
+        const rows = await incidents(context);
+        expect(rows.map((row) => [row.failure_class, row.instance_id])).toEqual([["STORE_UNAVAILABLE", registered.instanceId]]);
+        expect(run.text()).toContain("halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL STORE_UNAVAILABLE)");
+      } finally {
+        await publisher.close();
+      }
+    });
   }, 240_000);
 
   it("STORE_UNAVAILABLE with the database DOWN: the record cannot land; the process says so and exits 75 within the stated bound — fail closed, not weakened", async () => {
-    const redis = await startRedisContainer();
     const own = await startPostgresContainer();
     let ownStopped = false;
     try {
@@ -390,15 +383,13 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
       });
     } finally {
       if (!ownStopped) await own.stop();
-      await redis.stop();
     }
   }, 300_000);
 });
 
 describe("refusals and halts, read back as a window's evidence by the research worker's own adapter (PROVENANCE-1)", () => {
   it("a refused entry is ops.risk_events rows; a halt inside the window is an ops.incidents row; the instance has a dispatch frontier", async () => {
-    const redis = await startRedisContainer();
-    let stopped = false;
+    const hop = await startFreezableRedisProxy(redis.getConnectionUrl());
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "prov-evidence", async ({ connectionString, context }) => {
         const label = "prov-evidence";
@@ -410,14 +401,13 @@ describe("refusals and halts, read back as a window's evidence by the research w
         const document = documentOn(registered, label, stream, {
           riskPolicy: { ...policy, limits: { ...(policy["limits"] as Record<string, unknown>), maxWorstCaseContractualLoss: "1" } },
         });
-        const run = runProcess(environment(redis.getConnectionUrl(), connectionString, label), document);
+        const run = runProcess(environment(hop.url, connectionString, label), document);
         try {
           const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
           await publishAndSettle(publisher, stream, "trader-1", events, events.length);
           await publisher.close();
-          // The outage: the halt latches at the last event's instant, inside the window.
-          await redis.stop();
-          stopped = true;
+          // The outage (a partition): the halt latches at the last event's instant, inside the window.
+          hop.freeze();
           const exited = await settleWithin(run.exit, 60_000);
           expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
           const health = exitHealth(run);
@@ -482,7 +472,7 @@ describe("refusals and halts, read back as a window's evidence by the research w
         }
       });
     } finally {
-      if (!stopped) await redis.stop();
+      await hop.close();
     }
   }, 240_000);
 });
