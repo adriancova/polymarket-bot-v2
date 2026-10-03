@@ -33,6 +33,14 @@
  *   `t − last ≥ heartbeatMs` (D2.4). Its `last` then becomes `t` (D2.5).
  *   Otherwise a market that is owed stays owed — CARRIED — until a later close
  *   allows it (D2.6, D2.7).
+ * - `last` is the instant of the market's last `onFeatures` EVALUATION
+ *   (D2.3): {@link EvaluationCadenceClock.due} only says the cadence allows
+ *   one, and the loop calls {@link EvaluationCadenceClock.markEvaluated} only
+ *   once a runtime was actually asked. An attempt the snapshot gate stopped
+ *   leaves `last` where it was and keeps the market owed
+ *   ({@link EvaluationCadenceClock.carry}); one the halt gates stopped leaves
+ *   `last` too, and drops the owed evaluation
+ *   ({@link EvaluationCadenceClock.dropOwed}).
  * - A market that has never been evaluated has no `last`, so it gets no
  *   heartbeat until it is first owed.
  *
@@ -237,14 +245,21 @@ export class EvaluationCadenceClock {
     return (owed && since >= this.settings.intervalMs) || since >= this.settings.heartbeatMs;
   }
 
-  /** ADR-026 D2.5: `marketId` is evaluated at this close; `last` becomes `t`, and it is owed nothing. */
+  /**
+   * ADR-026 D2.3, D2.5: `marketId` WAS evaluated at this close — a runtime was
+   * asked for its `onFeatures` — so `last` becomes `t`, and it is owed nothing.
+   * Never called for an attempt that asked no runtime.
+   */
   markEvaluated(marketId: string): void {
     this.#carried.delete(marketId);
     if (this.perFrame || this.#now === undefined) return;
     this.#last.set(marketId, this.#now);
   }
 
-  /** ADR-026 D2.6: `marketId` was owed and not evaluated at this close; it stays owed. */
+  /**
+   * ADR-026 D2.6: `marketId` was owed and not evaluated at this close —
+   * coalesced, or stopped by the snapshot gate — so it stays owed.
+   */
   carry(marketId: string): void {
     if (this.perFrame) return;
     this.#carried.add(marketId);
@@ -256,9 +271,9 @@ export class EvaluationCadenceClock {
   }
 
   /**
-   * ADR-026 D2.11: a halted market is not evaluated, and its owed evaluation
-   * is DROPPED, as a halted market's per-frame evaluation always was. Its
-   * `last` is kept.
+   * ADR-026 D2.11: a halted market — or one whose every instance is halted —
+   * is not evaluated, and its owed evaluation is DROPPED, as a halted market's
+   * per-frame evaluation always was. Its `last` is kept.
    */
   dropOwed(marketId: string): void {
     this.#carried.delete(marketId);

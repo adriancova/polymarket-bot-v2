@@ -201,7 +201,12 @@ driver line did:
 The run pins gained the two cadence pins (`0`, `0`). The same fixture
 replayed as a NEW run — the PAPER cadence, 1,000 ms and 5,000 ms, nothing
 declared — is pinned beside it in
-`test/unit/simulation/backtest-static-bracket-replay.test.ts` (`CADENCE-1`).
+`test/unit/simulation/backtest-static-bracket-replay.test.ts` (`CADENCE-1`):
+it decides exactly what this golden holds, and differs from it in the cadence
+line and in one health counter only — `snapshotsUnavailable=4`, not `3`
+(`CADENCE-1` r1): the two reference trades owe the market an evaluation
+before its first book, which is no evaluation (ADR-026 D2.3), so the market
+stays owed and the `MarketOpened` close tries it once more.
 
 ## Relationship to the other goldens
 

@@ -250,8 +250,8 @@ describe("CADENCE-1 (ADR-026): the evaluation cadence the replay runs is recorde
 
   it("the same data replayed as a NEW run — the PAPER cadence, nothing declared — decides exactly what the golden holds", async () => {
     // The fixture's eight recorded frames are each at least a second apart for
-    // the one market, so the cadence coalesces nothing: only the cadence line
-    // differs from the golden's.
+    // the one market, so the cadence coalesces nothing: the decisions, orders,
+    // fills, ledger and PnL are the golden's.
     const run = await replayThroughShippedRoot({ withCore: true, paperCadence: true });
     const health = run.core?.trader.loop.health();
     expect(health?.loop.evaluationsCoalesced).toBe(0);
@@ -260,10 +260,18 @@ describe("CADENCE-1 (ADR-026): the evaluation cadence the replay runs is recorde
     const golden = expectedArtifact().split("\n");
     const cadenceAt = golden.indexOf("--- cadence ---") + 1;
     expect(paper[cadenceAt]).toBe("cadence evaluationIntervalMs=1000 evaluationHeartbeatMs=5000 reproduction=false");
-    expect([...paper.slice(0, cadenceAt), ...paper.slice(cadenceAt + 1)]).toEqual([
-      ...golden.slice(0, cadenceAt),
-      ...golden.slice(cadenceAt + 1),
-    ]);
+    // `CADENCE-1` r1 (J2): one more snapshot ATTEMPT, and nothing else. The two
+    // reference trades (frames 1-2) owe the market an evaluation before any
+    // book has arrived, so no runtime is asked: that is no evaluation, and the
+    // market stays owed (ADR-026 D2.3, D2.6). The `MarketOpened` close (frame
+    // 3) owes it no `onFeatures`, so its carried pass tries it again — still no
+    // book: `snapshotsUnavailable` 4, where the per-frame cadence, which
+    // carries nothing, counts 3. No decision moves.
+    const healthAt = golden.indexOf("--- health ---") + 1;
+    expect(golden[healthAt]).toContain(" snapshotsUnavailable=3 ");
+    expect(paper[healthAt]).toBe(golden[healthAt]?.replace(" snapshotsUnavailable=3 ", " snapshotsUnavailable=4 "));
+    const rest = (lines: readonly string[]) => lines.filter((_, index) => index !== cadenceAt && index !== healthAt);
+    expect(rest(paper)).toEqual(rest(golden));
   });
 });
 

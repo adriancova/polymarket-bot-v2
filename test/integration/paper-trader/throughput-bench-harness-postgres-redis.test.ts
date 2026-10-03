@@ -43,9 +43,12 @@
  * per market per 1 s of EVENT time, plus a 5 s heartbeat). The trader here is
  * the live composition, so it runs the PAPER cadence — there is no switch.
  * The pins are now {@link CADENCE_NORMALIZED_DECISIONS} /
- * {@link CADENCE_DECISIONS}: the sample's 2,001 envelopes span about 2.3 s of
- * recorded time, so the trader makes 4 decisions where the per-frame cadence
- * made 928. Catch-up and paced give the SAME content: the cadence reads event
+ * {@link CADENCE_DECISIONS}: the sample's 2,000 burst envelopes span 3,345 ms
+ * of recorded time (`receivedAt` 21:02:07.095Z to 21:02:10.440Z; the 2,001st,
+ * the prepended `MarketOpened`, is stamped 39 minutes earlier), and at most one
+ * evaluation per 1,000 ms of event time gives the trader 4 decisions where the
+ * per-frame cadence made 928 (`CADENCE-1` r1, O09: this said "about 2.3 s",
+ * which was wrong). Catch-up and paced give the SAME content: the cadence reads event
  * time only, never the processing time (ADR-026 D6-D7). The per-frame pins
  * are kept below as the record of what ADR-024's cadence decided; the
  * decision-by-decision relation to them, on the full burst, is the bench's
@@ -212,8 +215,10 @@ describe("the throughput harness on the committed 2,000-event sample", () => {
     expect(report.durable.normalizedDecisionContentSha256).toBe(CADENCE_NORMALIZED_DECISIONS);
     expect(report.durable.normalizedCheckpointContentSha256).toBe(CADENCE_NORMALIZED_CHECKPOINTS);
     expect(report.framesSplit).toBe(0);
-    // The recorded spacing of the sample's 2,000 envelopes is ~2.3 s; the
-    // publication took at least that, and every event's lag was measured.
+    // The sample's 2,000 burst envelopes span 3,345 ms of recorded time (it
+    // said ~2.3 s until `CADENCE-1` r1, O09); a paced publication takes about
+    // that long, so it took more than this 2,000 ms floor, and every event's
+    // lag was measured.
     expect(report.publish.wallMs).toBeGreaterThan(2_000);
     expect(report.lag.count).toBe(2_001);
   }, 180_000);

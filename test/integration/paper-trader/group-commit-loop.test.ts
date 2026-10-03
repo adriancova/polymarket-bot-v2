@@ -45,7 +45,8 @@ import {
  * `CADENCE-1` (ADR-026 D1.6): these tests count group-commit STAGINGS, one per
  * frame that decides, so their timelines (events 100 ms apart, each deciding)
  * pin ADR-024's per-frame cadence. They REPRODUCE it (the value 0, declared);
- * the cadence itself is pinned by `evaluation-cadence.test.ts`.
+ * the cadence itself is pinned by `packages/trading-core/src/cadence.test.ts`
+ * and `packages/trading-core/src/loop-cadence.test.ts`.
  */
 const PER_FRAME = adr024Reproduction("test/integration/paper-trader/group-commit-loop.test.ts");
 

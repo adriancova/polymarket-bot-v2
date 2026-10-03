@@ -30,7 +30,7 @@ import { describe, expect, it } from "vitest";
 
 import { captureArtifact, serializeArtifact } from "./support/artifact.js";
 import { goldenBytes } from "./support/golden.js";
-import { assembleOrThrow, type Run } from "./support/harness.js";
+import { assembleOrThrow, goldenReproduction, type Run } from "./support/harness.js";
 import { PAPER_E2E_SCENARIO } from "./support/scenario.js";
 
 /** The golden's decisions (`test/replay-golden/paper-e2e/paper-e2e-run.json`). */
@@ -63,6 +63,11 @@ async function observe(grouped: boolean, refuseSeq: number | undefined): Promise
   let emitted = (): readonly { readonly evaluationSeq: number; readonly intentIds: readonly string[] }[] => [];
 
   const parts = assembleOrThrow({
+    // `CADENCE-1` (ADR-026 D1.6): this run is compared byte for byte with the
+    // committed golden, so it REPRODUCES it — the per-frame cadence that
+    // golden was recorded under, declared (the harness's default is the
+    // production cadence).
+    evaluationCadence: goldenReproduction(PAPER_E2E_SCENARIO),
     wrapStore(inner: MemoryTraderStore): TraderStore {
       durableSeqs = () => new Set(inner.decisions.map((entry) => entry.record.evaluationSeq));
       const staged: StagedEvaluations[] = [];

@@ -449,12 +449,15 @@ function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Har
     // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams
     // are checked against their rebuilds from zero after EVERY fill.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
-    // `CADENCE-1` (ADR-026 D1.6): this harness's timelines were written for,
-    // and pin, ADR-024's per-frame cadence — a strategy evaluated at every event, events
-    // often under a second apart. They are not about
-    // the cadence, so they REPRODUCE that cadence (the value 0, declared);
-    // the cadence itself is pinned by `cadence.test.ts` and
-    // `loop-cadence.test.ts`.
+    // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is TRDR-4 long-run
+    // retention and order settlement, not the cadence — but its timelines were written
+    // for ADR-024's per-frame cadence: a scripted strategy that acts at events often
+    // under a second apart. Under the production cadence (1,000 ms / 5,000 ms) those
+    // evaluations are coalesced, and 4 of this file's 7 tests fail under it (measured
+    // in r1; the failures were not analysed one by one). So it REPRODUCES the ADR-024
+    // behaviour its timelines pin (the value 0, declared); this subject is NOT
+    // exercised here under the production cadence. The cadence is pinned by
+    // `cadence.test.ts` and `loop-cadence.test.ts`.
     evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-long-run.test.ts" },
   });
   wiring.loop = loop;

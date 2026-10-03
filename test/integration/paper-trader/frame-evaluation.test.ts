@@ -42,7 +42,9 @@ const CONDITION = "0xcondition";
  * `CADENCE-1` (ADR-026 D1.6): this file pins ADR-024's per-frame cadence — one
  * evaluation per frame, never on a half-applied one — so it REPRODUCES that
  * cadence (the value 0, declared). Under the PAPER cadence a frame is still
- * evaluated whole or not at all; `evaluation-cadence.test.ts` pins that.
+ * evaluated whole or not at all;
+ * `packages/trading-core/src/loop-cadence.test.ts` pins that (acceptance 7,
+ * the longer frame).
  */
 const PER_FRAME = adr024Reproduction("test/integration/paper-trader/frame-evaluation.test.ts");
 

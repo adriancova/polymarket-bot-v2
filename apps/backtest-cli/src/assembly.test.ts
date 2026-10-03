@@ -29,7 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { ReplayRunPins } from "@polymarket-bot/simulation";
-import { PAPER_ACCOUNTING_CHECKS, parseTraderConfig } from "@polymarket-bot/trading-core";
+import { PAPER_ACCOUNTING_CHECKS, parseTraderConfig, type IngestedEvent } from "@polymarket-bot/trading-core";
 import { describe, expect, it } from "vitest";
 
 import { sha256Hex } from "./archive.js";
@@ -375,5 +375,59 @@ describe("CADENCE-1 — the evaluation cadence a replay runs is its run pins' (A
       if (assembled.ok) continue;
       expect(assembled.refusal.code).toBe("BACKTEST_CADENCE_REFUSED");
     }
+  });
+});
+
+describe("CADENCE-1 r1 (O03) — the backtest core logs the forward-jump alarm to its log sink (ADR-026 D2.10)", () => {
+  /** One applied event for a market the fixture does not run, at `receivedAt`. */
+  function unknownBook(receivedAt: string, ordinal: number): IngestedEvent {
+    const gatewayEpoch = "019b1e00-0000-7000-8000-0000000000e5";
+    const ingestSeq = String(ordinal);
+    return {
+      envelope: {
+        eventId: `019b1e00-0000-7000-8000-${String(ordinal).padStart(12, "0")}`,
+        eventType: "BookSnapshot",
+        schemaVersion: 1,
+        source: "polymarket" as const,
+        sourceChannel: "market",
+        receivedAt,
+        receivedMonotonicNs: String(ordinal * 1_000_000),
+        gatewayEpoch,
+        ingestSeq,
+        subscriptionGeneration: 1,
+        payload: {
+          internalMarketId: "019b1e00-0000-7000-8000-0000000000e1",
+          tokenId: "999",
+          bids: [{ price: "0.4", size: "10" }],
+          asks: [],
+        },
+      },
+      identity: { gatewayEpoch, ingestSeq, receivedAt, datasetRowOrdinal: ordinal },
+    };
+  }
+
+  it("an episode's start and its end each give ONE line, naming the event and the clock", async () => {
+    const lines: string[] = [];
+    const assembled = assembleBacktestCore({
+      environment: safeEnvironment(),
+      traderConfig: traderConfig(),
+      runPins: { ...pins(), evaluationIntervalMs: 1000, evaluationHeartbeatMs: 5000 },
+      clockStart: FIRST_INSTANT,
+      log: (line) => {
+        lines.push(line);
+      },
+    });
+    if (!assembled.ok) throw new Error(assembled.refusal.detail);
+    const loop = assembled.core.trader.loop;
+    // An hour ahead, then an hour behind it (beyond the 5,000 ms bound), then within it.
+    for (const [index, receivedAt] of ["2026-05-01T10:00:00.000Z", "2026-05-01T09:00:01.000Z", "2026-05-01T09:59:58.000Z"].entries()) {
+      expect(loop.ingest(unknownBook(receivedAt, index + 1))).toBe(true);
+    }
+    await loop.drain();
+    expect(lines.filter((line) => line.startsWith("CADENCE CLOCK "))).toEqual([
+      "CADENCE CLOCK FORWARD JUMP: event 2026-05-01T09:00:01Z lies 3599000 ms behind the event clock 2026-05-01T10:00:00Z (bound 5000 ms; ADR-026 D2.10)",
+      "CADENCE CLOCK CAUGHT UP: event 2026-05-01T09:59:58Z lies 2000 ms behind the event clock 2026-05-01T10:00:00Z (bound 5000 ms; ADR-026 D2.10)",
+    ]);
+    expect(loop.health().loop.cadenceForwardJumpAlarms).toBe(1);
   });
 });

@@ -31,6 +31,19 @@
  * (5, the policy, is `cadence.test.ts` and the composition roots' tests; 10
  * and 11 are the control API's and the run record's; 12 is
  * `apps/backtest-cli/src/cadence-one-code-path.test.ts`.)
+ *
+ * `CADENCE-1` r1 adds, each against a finding of the round-1 review:
+ *
+ * - J2 — a market's `last` moves only when a runtime was asked: an attempt
+ *   with no snapshot is no evaluation (the market stays owed), and a market
+ *   whose every instance is halted is not evaluated (its owed evaluation is
+ *   dropped);
+ * - J1 — the harvest points are ADR-024's: the cadence adds none, moves none
+ *   and re-stamps none; a carried-over or heartbeat evaluation whose source is
+ *   not at its close's harvest instant has its own effects delivered at the
+ *   next harvest point;
+ * - O02, O04, O05 — the coalescence count over a longer frame, a lifecycle
+ *   event at a carried market, and `[A, A]` under the per-frame value 0.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -81,8 +94,11 @@ const TOKENS = {
 } as const;
 const INSTANCE_A = "e18f5c20-2000-7a20-8b00-0000000000c1";
 const INSTANCE_B = "e18f5c20-2000-7a20-8b00-0000000000c2";
+/** `CADENCE-1` r1: a SHADOW instance on market A, registered only with `shadowOnA`. */
+const INSTANCE_A2 = "e18f5c20-2000-7a20-8b00-0000000000c3";
 const RUN_A = "018f5c20-3000-7a30-8b00-0000000000c1";
 const RUN_B = "018f5c20-3000-7a30-8b00-0000000000c2";
+const RUN_A2 = "018f5c20-3000-7a30-8b00-0000000000c3";
 const CONFIG_ID = "018f5c20-4000-7a40-8b00-0000000000c0";
 const GATEWAY_EPOCH = "018f5c20-5000-7a50-8b00-0000000000c5";
 const T0_MS = Date.parse("2026-05-01T09:00:00.000Z");
@@ -196,13 +212,46 @@ function hold(ctx: StrategyContext): DecisionResult {
 }
 
 /**
+ * `CADENCE-1` r1: an `onFeatures` evaluation at instant `at` places one order
+ * — a resting maker BUY (10 YES at 0.30), or with `immediate` a taker BUY that
+ * fills at once against the 0.34 ask — so a carried-over or heartbeat
+ * evaluation's OWN effects can be followed to the harvest that delivers them.
+ */
+interface PlaceOnFeatures {
+  readonly market: string;
+  readonly at: string;
+  readonly immediate: boolean;
+}
+
+/**
  * The recording double: holds everywhere, except that — when `placeOnOpen` —
  * `onMarketOpen` places ONE resting maker BUY (10 YES at 0.30). Placing from a
  * LIFECYCLE callback, which fires in place under every cadence, gives both
  * cadences the same order at the same event, so what follows from it (order
- * views, the fill) can be compared one to one.
+ * views, the fill) can be compared one to one. With `onFeaturesAt`, its
+ * `onFeatures` places one order at that instant ({@link PlaceOnFeatures}).
  */
-function recordingStrategy(placeOnOpen: boolean): Strategy<unknown, Record<string, never>> {
+function recordingStrategy(
+  marketId: string,
+  placeOnOpen: boolean,
+  onFeaturesAt?: PlaceOnFeatures,
+): Strategy<unknown, Record<string, never>> {
+  const buy = (ctx: StrategyContext, intentId: string, immediate: boolean): Intent => ({
+    type: "POSITION",
+    intentId,
+    marketId,
+    direction: "YES",
+    targetMode: "DELTA",
+    targetShares: "10",
+    maximumBuyPrice: immediate ? "0.35" : "0.3",
+    maximumTotalCost: immediate ? "4" : "3",
+    urgency: immediate ? "IMMEDIATE" : "PASSIVE",
+    liquidityPreference: immediate ? "TAKER_OK" : "MAKER_ONLY",
+    partialFillPolicy: "ACCEPT_ANY",
+    validUntil: new Date(Date.parse(ctx.now()) + 600_000).toISOString(),
+    expectedNetEdge: "5",
+    tags: ["cadence1.entry", immediate ? "sb.order-type:FAK" : "sb.order-type:GTC"],
+  });
   return {
     name: "cadence1-recording-double",
     version: "1.0.0",
@@ -211,30 +260,27 @@ function recordingStrategy(placeOnOpen: boolean): Strategy<unknown, Record<strin
     onStart: hold,
     onTimer: hold,
     onStop: hold,
-    onFeatures: hold,
+    onFeatures(ctx: StrategyContext): DecisionResult {
+      if (onFeaturesAt === undefined || ctx.now() !== onFeaturesAt.at) return hold(ctx);
+      return {
+        decisionType: "enter",
+        reasonCodes: ["CADENCE1.PLACE"],
+        featureSnapshotRef: ctx.features().snapshotRef,
+        intents: [buy(ctx, "cadence1-features-buy", onFeaturesAt.immediate)],
+      };
+    },
     onFill: (ctx: StrategyContext) => hold(ctx),
     onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
     onMarketClosing: (ctx: StrategyContext) => hold(ctx),
     onMarketResolved: (ctx: StrategyContext) => hold(ctx),
     onMarketOpen(ctx: StrategyContext): DecisionResult {
       if (!placeOnOpen) return hold(ctx);
-      const buy: Intent = {
-        type: "POSITION",
-        intentId: "cadence1-resting-buy",
-        marketId: MARKET_A,
-        direction: "YES",
-        targetMode: "DELTA",
-        targetShares: "10",
-        maximumBuyPrice: "0.3",
-        maximumTotalCost: "3",
-        urgency: "PASSIVE",
-        liquidityPreference: "MAKER_ONLY",
-        partialFillPolicy: "ACCEPT_ANY",
-        validUntil: new Date(Date.parse(ctx.now()) + 600_000).toISOString(),
-        expectedNetEdge: "5",
-        tags: ["cadence1.entry", "sb.order-type:GTC"],
+      return {
+        decisionType: "enter",
+        reasonCodes: ["CADENCE1.PLACE"],
+        featureSnapshotRef: ctx.features().snapshotRef,
+        intents: [buy(ctx, "cadence1-resting-buy", false)],
       };
-      return { decisionType: "enter", reasonCodes: ["CADENCE1.PLACE"], featureSnapshotRef: ctx.features().snapshotRef, intents: [buy] };
     },
   };
 }
@@ -260,6 +306,10 @@ interface HarnessOptions {
   readonly cadence: EvaluationCadenceOption;
   readonly placeOnOpen?: boolean;
   readonly clock?: Clock;
+  /** `CADENCE-1` r1: one market's `onFeatures` places an order at one instant. */
+  readonly placeOnFeatures?: PlaceOnFeatures;
+  /** `CADENCE-1` r1 (J2): a second, SHADOW, instance on market A ("A2"), after A's own in §8.2 order. */
+  readonly shadowOnA?: boolean;
 }
 
 /** `createPaperTrader`'s assembly, with the recording double's runtimes registered. */
@@ -284,12 +334,18 @@ function assemble(options: HarnessOptions): Harness {
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const registry = new InstanceRegistry();
   const seen: Seen[] = [];
-  for (const [instanceId, runId, marketId] of [
-    [INSTANCE_A, RUN_A, MARKET_A],
-    [INSTANCE_B, RUN_B, MARKET_B],
-  ] as const) {
+  const instances: (readonly [string, string, string, "OWNER" | "SHADOW", number])[] = [
+    [INSTANCE_A, RUN_A, MARKET_A, "OWNER", 0],
+    [INSTANCE_B, RUN_B, MARKET_B, "OWNER", 0],
+  ];
+  if (options.shadowOnA === true) instances.push([INSTANCE_A2, RUN_A2, MARKET_A, "SHADOW", 1]);
+  for (const [instanceId, runId, marketId, ownership, evaluationPriority] of instances) {
     const created = createStrategyInstanceRuntime({
-      strategy: recordingStrategy(options.placeOnOpen === true && marketId === MARKET_A),
+      strategy: recordingStrategy(
+        marketId,
+        options.placeOnOpen === true && instanceId === INSTANCE_A,
+        options.placeOnFeatures?.market === marketId && ownership === "OWNER" ? options.placeOnFeatures : undefined,
+      ),
       params: {},
       run: { runId, instanceId, configId: CONFIG_ID, runSeed: "7" },
       watchdog: { evaluationBudgetUs: 5_000_000 },
@@ -313,8 +369,8 @@ function assemble(options: HarnessOptions): Harness {
       runId,
       configId: CONFIG_ID,
       marketId,
-      ownership: "OWNER",
-      evaluationPriority: 0,
+      ownership,
+      evaluationPriority,
       runtime: created.runtime,
       direction: "YES",
       params: {},
@@ -485,14 +541,19 @@ const resolved = (offsetMs: number, marketId: string): IngestedEvent =>
     resolvedAt: new Date(T0_MS + offsetMs).toISOString(),
   });
 
-const trade = (offsetMs: number, marketId: string, price: string): IngestedEvent =>
-  event(offsetMs, "PublicTradeObserved", {
-    internalMarketId: marketId,
-    tokenId: TOKENS[marketId as keyof typeof TOKENS].yes,
-    price,
-    size: "50",
-    takerSide: "ASK",
-  });
+const trade = (offsetMs: number, marketId: string, price: string, frame?: string): IngestedEvent =>
+  event(
+    offsetMs,
+    "PublicTradeObserved",
+    {
+      internalMarketId: marketId,
+      tokenId: TOKENS[marketId as keyof typeof TOKENS].yes,
+      price,
+      size: "50",
+      takerSide: "ASK",
+    },
+    frame === undefined ? {} : { frame },
+  );
 
 /** An event type the loop does not consume: REFUSED (counted, no halt), never applied. */
 const refused = (offsetMs: number, frame?: string): IngestedEvent =>
@@ -513,28 +574,41 @@ async function feed(harness: Harness, ...batches: readonly (IngestedEvent | read
   }
 }
 
+/** An instance's short name in these tests: "A", "B", or "A2" (A's SHADOW instance). */
+function label(instanceId: string): string {
+  return instanceId === INSTANCE_A ? "A" : instanceId === INSTANCE_B ? "B" : "A2";
+}
+
 /** The `onFeatures` invocations since `from`, as `[instance, source event, evaluatedAt]`. */
 function featureCalls(harness: Harness, from = 0): [string, string | undefined, string][] {
   return harness.seen
     .slice(from)
     .filter((entry) => entry.callback === "onFeatures")
-    .map((entry) => [entry.instanceId === INSTANCE_A ? "A" : "B", entry.source, entry.evaluatedAt]);
+    .map((entry) => [label(entry.instanceId), entry.source, entry.evaluatedAt]);
 }
 
 /**
- * Both markets' books at 10-40 ms, then a reference trade at {@link S}: the
- * trade at 0 evaluated both markets (no book yet: no snapshot), the four
- * snapshots each owed one market inside the interval (4 coalescences, both
- * markets carried), and the trade at 1,000 ms evaluates both. After this,
- * `last` is 1,000 ms for both markets and nothing is owed.
+ * A reference trade, then both markets' books, all at 0 ms, then a reference
+ * trade at {@link S}.
+ *
+ * - The trade at 0 owes both markets an evaluation, but neither has a book, so
+ *   no snapshot can be computed and no runtime is asked: NOT an evaluation
+ *   (r1, J2). Both stay owed, with no `last`.
+ * - A's YES book evaluates A at 0 ms; B, still owed, is tried again by the
+ *   carried pass and still has no book. A's NO book is coalesced (+1).
+ * - B's YES book evaluates B at 0 ms; A, carried, is coalesced (+1). B's NO
+ *   book is coalesced (+1), and A again (+1): 4 coalescences.
+ * - The trade at {@link S} evaluates both.
+ *
+ * After this, `last` is {@link S} for both markets and nothing is owed.
  */
 function opening(): IngestedEvent[] {
   return [
     reference(0),
-    snapshot(10, MARKET_A, "yes"),
-    snapshot(20, MARKET_A, "no"),
-    snapshot(30, MARKET_B, "yes"),
-    snapshot(40, MARKET_B, "no"),
+    snapshot(0, MARKET_A, "yes"),
+    snapshot(0, MARKET_A, "no"),
+    snapshot(0, MARKET_B, "yes"),
+    snapshot(0, MARKET_B, "no"),
     reference(S),
   ];
 }
@@ -605,10 +679,17 @@ describe("acceptance 2, ADR-026 D5: a coalesced market is not evaluated; every i
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
     await feed(harness, ...opening());
-    expect(featureCalls(harness).map(([market]) => market)).toEqual(["A", "B"]);
-    // The opening's four snapshots: A owed at 10 and 20 ms, B at 30 and 40 ms, and
-    // A — still owed — at the 30 and 40 ms closes too: one per owed market per close.
-    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(6);
+    // Each market's first book evaluates it at 0 ms (the trade at 0 asked no
+    // runtime: no book yet), and the trade at S evaluates both.
+    expect(featureCalls(harness).map(([market, , at]) => `${market}@${at}`)).toEqual([
+      `A@${iso(0)}`,
+      `B@${iso(0)}`,
+      `A@${iso(S)}`,
+      `B@${iso(S)}`,
+    ]);
+    // The opening's other closes: A's NO book (A +1), B's YES book (A, carried, +1),
+    // B's NO book (B +1, A +1): one per owed market per close.
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(4);
     const before = harness.seen.length;
     // Four closes inside the interval: A owed at all four (+4), B owed from the
     // second on (+3, ADR-026 D5.6: "a market that stays owed over three closes
@@ -616,7 +697,7 @@ describe("acceptance 2, ADR-026 D5: a coalesced market is not evaluated; every i
     await feed(harness, level(S + 300, MARKET_A, "0.31"), level(S + 500, MARKET_B, "0.31"));
     await feed(harness, level(S + 600, MARKET_A, "0.3"), level(S + 999, MARKET_A, "0.31"));
     expect(harness.seen.length).toBe(before);
-    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(6 + 7);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(4 + 7);
     // At S + 1,000 A is owed and due, and B, still owed, is carried and due: both evaluated, nothing coalesced.
     const due = level(S + 1_000, MARKET_A, "0.3");
     await feed(harness, due);
@@ -624,7 +705,7 @@ describe("acceptance 2, ADR-026 D5: a coalesced market is not evaluated; every i
       ["A", idOf(due), iso(S + 1_000)],
       ["B", idOf(due), iso(S + 1_000)],
     ]);
-    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(6 + 7);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(4 + 7);
 
     const health = harness.loop.health();
     expect(health.loop.evaluations).toBe(harness.seen.length);
@@ -729,7 +810,8 @@ describe("acceptance 4, ADR-026 D2.1 and D2.8: the high-water mark; a backward s
     };
     const withBack = await run(true);
     expect(withBack).toEqual(await run(false));
-    expect(withBack.slice(2)).toEqual([`A@${iso(S + 1_200)}`, `A@${iso(S + 2_200)}`, `A@${iso(S + 3_200)}`]);
+    // After the opening's four evaluations (A and B at 0 ms and at S).
+    expect(withBack.slice(4)).toEqual([`A@${iso(S + 1_200)}`, `A@${iso(S + 2_200)}`, `A@${iso(S + 3_200)}`]);
   });
 });
 
@@ -1018,7 +1100,196 @@ describe("edges of one close", () => {
     expect(featureCalls(harness, start)).toHaveLength(1);
   });
 
-  it("a longer frame of events for no configured market, at which heartbeats run, reaches the harvest point: harvested and flushed at its close", async () => {
+
+  it("under the per-frame value 0 a market named twice by ONE event is evaluated twice, as ADR-024 did (r1, O05)", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PER_FRAME });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    const incident = event(S + 1_000, "DataQualityIncidentOpened", {
+      incidentId: "cadence1-incident-per-frame",
+      openedAt: iso(S + 1_000),
+      reasonCode: "FEED_STALE",
+      severity: "NOTIFY",
+      affectedMarketIds: [MARKET_A, MARKET_A],
+    });
+    await feed(harness, incident);
+    expect(featureCalls(harness, start)).toEqual([
+      ["A", idOf(incident), iso(S + 1_000)],
+      ["A", idOf(incident), iso(S + 1_000)],
+    ]);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(0);
+  });
+
+  it("a LONGER frame's close counts an owed market it coalesces ONCE, though the carried pass walks every market after it (r1, O02; D5.6)", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    const before = harness.loop.health().loop.evaluationsCoalesced;
+    // A owed twice in one frame inside the interval, and the frame ends with an
+    // event for a market this trader does not run: one owed market, one close, +1.
+    await feed(harness, [
+      level(S + 300, MARKET_A, "0.31", "c1"),
+      level(S + 301, MARKET_A, "0.3", "c1"),
+      snapshot(S + 302, MARKET_X, "yes", "c1"),
+    ]);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(before + 1);
+    // The next frame owes B (coalesced, +1) and closes with A carried and not due (+1).
+    await feed(harness, [level(S + 400, MARKET_B, "0.31", "c2"), snapshot(S + 401, MARKET_X, "no", "c2")]);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(before + 3);
+    expect(harness.seen.length).toBe(start);
+  });
+
+  it("a lone lifecycle event for a market that is carried and due fires its callback in place, then the carried onFeatures at the same close (r1, O04)", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening(), level(S + 300, MARKET_A, "0.31"));
+    const start = harness.seen.length;
+    const close = closing(S + 1_000, MARKET_A);
+    await feed(harness, close);
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.source, entry.evaluatedAt])).toEqual([
+      ["A", "onMarketClosing", idOf(close), iso(S + 1_000)],
+      ["A", "onFeatures", idOf(close), iso(S + 1_000)],
+    ]);
+  });
+});
+
+describe("r1 (J2), ADR-026 D2.3-D2.6: a market's `last` moves only when the loop asked a runtime for its onFeatures", () => {
+  it("an owed evaluation with no computable snapshot is no evaluation: the market stays owed, is tried at each later close, and its first usable book evaluates it at once", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    // The trade owes both markets an evaluation; neither has a book: no runtime is asked.
+    await feed(harness, reference(0));
+    expect(featureCalls(harness)).toEqual([]);
+    expect(harness.loop.health().loop.snapshotsUnavailable).toBe(2);
+    // Still owed, so a close that owes neither tries both again (the carried pass).
+    await feed(harness, snapshot(5, MARKET_X, "yes"));
+    expect(featureCalls(harness)).toEqual([]);
+    expect(harness.loop.health().loop.snapshotsUnavailable).toBe(4);
+    // A's first usable book, 10 ms after the trade: A is evaluated there, not coalesced.
+    const bookA = snapshot(10, MARKET_A, "yes");
+    await feed(harness, bookA);
+    expect(featureCalls(harness)).toEqual([["A", idOf(bookA), iso(10)]]);
+    // B, still owed, was tried by that close's carried pass and still had no book.
+    expect(harness.loop.health().loop.snapshotsUnavailable).toBe(5);
+    const bookB = snapshot(20, MARKET_B, "yes");
+    await feed(harness, bookB);
+    expect(featureCalls(harness)).toEqual([
+      ["A", idOf(bookA), iso(10)],
+      ["B", idOf(bookB), iso(20)],
+    ]);
+    const loop = harness.loop.health().loop;
+    expect(loop.evaluations).toBe(2);
+    expect(loop.evaluationsCoalesced).toBe(0);
+    expect(loop.snapshotsUnavailable).toBe(5);
+  });
+
+  it("the same first book under the per-frame value 0 evaluates the market at the same event", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PER_FRAME });
+    await feed(harness, reference(0));
+    const bookA = snapshot(10, MARKET_A, "yes");
+    await feed(harness, bookA);
+    expect(featureCalls(harness)).toEqual([["A", idOf(bookA), iso(10)]]);
+  });
+
+  it("a market whose ONLY instance is halted is not evaluated: `last` stays, the owed evaluation is dropped, and after the release its next owed close evaluates it", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    const coalesced = harness.loop.health().loop.evaluationsCoalesced;
+    const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
+    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 400));
+    // A owed and due by the cadence, but its one instance is halted: no runtime is asked.
+    await feed(harness, level(S + 1_000, MARKET_A, "0.31"));
+    expect(featureCalls(harness, start)).toEqual([]);
+    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
+    // Dropped, not carried: an event for no configured market evaluates nothing.
+    await feed(harness, snapshot(S + 1_100, MARKET_X, "yes"));
+    expect(featureCalls(harness, start)).toEqual([]);
+    // `last` is still S, so A's next owed close — 200 ms after the halted one — evaluates it.
+    const next = level(S + 1_200, MARKET_A, "0.3");
+    await feed(harness, next);
+    expect(featureCalls(harness, start)).toEqual([["A", idOf(next), iso(S + 1_200)]]);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
+  });
+
+  it("with A's OWNER instance halted and its SHADOW instance evaluated, the market WAS evaluated: `last` moves", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, shadowOnA: true });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    harness.halts.halt({ kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A }, "OPERATOR_HALT", "test", iso(S + 400));
+    const owed = level(S + 1_000, MARKET_A, "0.31");
+    await feed(harness, owed);
+    expect(featureCalls(harness, start)).toEqual([["A2", idOf(owed), iso(S + 1_000)]]);
+    // `last` moved to S + 1,000: A's next owed event, inside the interval, is coalesced.
+    const coalesced = harness.loop.health().loop.evaluationsCoalesced;
+    await feed(harness, level(S + 1_200, MARKET_A, "0.3"));
+    expect(featureCalls(harness, start)).toHaveLength(1);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced + 1);
+  });
+});
+
+describe("r1 (J1), ADR-026 D4.2: the harvest points are ADR-024's — the cadence adds none, moves none and re-stamps none", () => {
+  /** Every invocation but `onFeatures` since `from`: what D4.2 says fires exactly as before. */
+  const others = (harness: Harness, from: number): Seen[] =>
+    harness.seen.slice(from).filter((entry) => entry.callback !== "onFeatures");
+
+  it("a mixed frame — A's fill, then an applied event for a market this trader does not run, B heartbeat-due — fires A's fill and order update at the fill's instant, as per-frame does", async () => {
+    const run = async (cadence: EvaluationCadenceOption) => {
+      ordinal = 0;
+      const harness = assemble({ cadence, placeOnOpen: true });
+      await feed(harness, ...opening(), opened(S + 100, MARKET_A), level(S + 4_800, MARKET_A, "0.31"));
+      const start = harness.seen.length;
+      const unknown = snapshot(S + 5_500, MARKET_X, "yes", "mixed");
+      await feed(harness, [trade(S + 5_000, MARKET_A, "0.29", "mixed"), unknown]);
+      return { harness, start, unknown };
+    };
+    const perFrame = await run(PER_FRAME);
+    const paper = await run(PAPER_EVALUATION_CADENCE);
+    expect(others(paper.harness, paper.start)).toEqual(others(perFrame.harness, perFrame.start));
+    // Non-vacuous: the order filled, both callbacks came at the fill's instant,
+    // A was coalesced there, and B's heartbeat ran at the unknown event.
+    expect(others(paper.harness, paper.start).map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["A", "onFill", iso(S + 5_000)],
+      ["A", "onOrderUpdate", iso(S + 5_000)],
+    ]);
+    expect(featureCalls(paper.harness, paper.start)).toEqual([["B", idOf(paper.unknown), iso(S + 5_500)]]);
+    expect(paper.harness.venue.fills).toHaveLength(1);
+  });
+
+  it("heartbeats at lone events for no configured market add no harvest: no fill or order view is delivered there, as per-frame", async () => {
+    const run = async (cadence: EvaluationCadenceOption) => {
+      ordinal = 0;
+      const harness = assemble({ cadence, placeOnOpen: true });
+      await feed(harness, ...opening(), opened(S + 100, MARKET_A));
+      const start = harness.seen.length;
+      for (const offset of [5_100, 10_200, 15_300]) await feed(harness, snapshot(S + offset, MARKET_X, "yes"));
+      await feed(harness, level(S + 15_400, MARKET_A, "0.31"));
+      return { harness, start };
+    };
+    const perFrame = await run(PER_FRAME);
+    const paper = await run(PAPER_EVALUATION_CADENCE);
+    expect(others(paper.harness, paper.start)).toEqual(others(perFrame.harness, perFrame.start));
+    // Non-vacuous: three rounds of heartbeats ran, and the old order's WORKING
+    // view came only at A's own event, the one harvest point.
+    expect(featureCalls(paper.harness, paper.start).map(([market, , at]) => `${market}@${at}`)).toEqual([
+      `A@${iso(S + 5_100)}`,
+      `B@${iso(S + 5_100)}`,
+      `A@${iso(S + 10_200)}`,
+      `B@${iso(S + 10_200)}`,
+      `A@${iso(S + 15_300)}`,
+      `B@${iso(S + 15_300)}`,
+    ]);
+    expect(others(paper.harness, paper.start).map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["A", "onOrderUpdate", iso(S + 15_400)],
+    ]);
+  });
+
+  it("a longer frame of events for no configured market, at which heartbeats run, harvests nothing; its decisions are flushed at its close", async () => {
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnOpen: true });
     await feed(harness, ...opening(), opened(S + 100, MARKET_A));
@@ -1028,36 +1299,96 @@ describe("edges of one close", () => {
     const x1 = snapshot(S + 5_000, MARKET_X, "yes", "u1");
     const x2 = snapshot(S + 5_001, MARKET_X, "no", "u1");
     await feed(harness, [x1, x2]);
-    expect(harness.seen.slice(start).map((entry) => [entry.instanceId === INSTANCE_A ? "A" : "B", entry.callback, entry.source])).toEqual([
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.source])).toEqual([
       ["A", "onFeatures", idOf(x2)],
       ["B", "onFeatures", idOf(x2)],
-      ["A", "onOrderUpdate", undefined],
     ]);
     // Flushed at this close, not left in the outbox for a later one.
-    expect(harness.store.decisions.length).toBe(decided + 3);
+    expect(harness.store.decisions.length).toBe(decided + 2);
   });
-});
 
-describe("the one place harvest points differ: an event at which the cadence evaluates, and which ADR-024 left unharvested", () => {
-  it("a heartbeat at a lone event for a market this trader does not run is followed by that event's harvest (its fills booked before the next evaluation reads the position)", async () => {
-    const run = async (cadence: EvaluationCadenceOption): Promise<Seen[]> => {
-      ordinal = 0;
-      const harness = assemble({ cadence, placeOnOpen: true });
-      await feed(harness, ...opening(), opened(S + 100, MARKET_A));
-      expect(harness.venue.ordersSnapshot()).toHaveLength(1);
-      const start = harness.seen.length;
-      await feed(harness, snapshot(S + 5_100, MARKET_X, "yes"));
-      return harness.seen.slice(start);
-    };
-    // Per frame: an event for no configured market evaluates nothing and harvests nothing.
-    expect(await run(PER_FRAME)).toEqual([]);
-    // PAPER: both markets' heartbeats run there, and the harvest that follows every
-    // evaluation delivers the resting order's WORKING view, as at every harvest.
-    const paper = await run(PAPER_EVALUATION_CADENCE);
-    expect(paper.map((entry) => `${entry.instanceId === INSTANCE_A ? "A" : "B"}:${entry.callback}`)).toEqual([
-      "A:onFeatures",
-      "B:onFeatures",
-      "A:onOrderUpdate",
+  it("a heartbeat at an event that IS its close's harvest point: its own new order is delivered by that harvest, at that instant", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: false } });
+    // B's market is opened, so the risk engine admits B's entry (§9.8 market status).
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    const owesA = level(S + 5_000, MARKET_A, "0.31");
+    await feed(harness, owesA);
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.source, entry.evaluatedAt])).toEqual([
+      ["A", "onFeatures", idOf(owesA), at],
+      ["B", "onFeatures", idOf(owesA), at],
+      ["B", "onOrderUpdate", undefined, at],
     ]);
+  });
+
+  it("in a LONGER frame whose last applied event reached the harvest point, a heartbeat's own new order is delivered by that frame's harvest, at its instant", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_001);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: false } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    const a1 = level(S + 5_000, MARKET_A, "0.31", "s");
+    const a2 = level(S + 5_001, MARKET_A, "0.3", "s");
+    await feed(harness, [a1, a2]);
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.source, entry.evaluatedAt])).toEqual([
+      ["A", "onFeatures", idOf(a2), at],
+      ["B", "onFeatures", idOf(a2), at],
+      ["B", "onOrderUpdate", undefined, at],
+    ]);
+  });
+
+  it("a heartbeat at an event for no configured market: no harvest there; its own fill and order view come at the next harvest point, stamped there — never before their source", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    // B's heartbeat placed a taker order, which the venue filled at once. The
+    // order went out at once; nothing is delivered at this event.
+    expect(harness.venue.fills).toHaveLength(1);
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback])).toEqual([
+      ["A", "onFeatures"],
+      ["B", "onFeatures"],
+    ]);
+    // The next harvest point: A's event (A coalesced). B's fill and its order's view, stamped there.
+    await feed(harness, level(S + 5_200, MARKET_A, "0.31"));
+    expect(harness.seen.slice(start + 2).map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["B", "onFill", iso(S + 5_200)],
+      ["B", "onOrderUpdate", iso(S + 5_200)],
+    ]);
+  });
+
+  it("a mixed frame whose tail is for no configured market: the frame's harvest runs at its own instant, first; the heartbeat's own new order is delivered at the next harvest point", async () => {
+    const run = async (cadence: EvaluationCadenceOption) => {
+      ordinal = 0;
+      const harness = assemble({
+        cadence,
+        placeOnOpen: true,
+        placeOnFeatures: { market: MARKET_B, at: iso(S + 5_100), immediate: false },
+      });
+      await feed(harness, ...opening(), opened(S + 100, MARKET_A), opened(S + 150, MARKET_B));
+      const start = harness.seen.length;
+      await feed(harness, [level(S + 5_000, MARKET_A, "0.31", "m"), snapshot(S + 5_100, MARKET_X, "yes", "m")]);
+      await feed(harness, reference(S + 5_300));
+      return { harness, start };
+    };
+    const paper = await run(PAPER_EVALUATION_CADENCE);
+    expect(paper.harness.seen.slice(paper.start).map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["A", "onFeatures", iso(S + 5_000)],
+      // The frame's harvest: A's resting order, at A's event, exactly where ADR-024 ran it.
+      ["A", "onOrderUpdate", iso(S + 5_000)],
+      // Then B's heartbeat, at the frame's last applied event; it places a resting order.
+      ["B", "onFeatures", iso(S + 5_100)],
+      // The next harvest point (the reference trade; A and B coalesced there): both orders' views.
+      ["A", "onOrderUpdate", iso(S + 5_300)],
+      ["B", "onOrderUpdate", iso(S + 5_300)],
+    ]);
+    // A's own callbacks are exactly per-frame's.
+    const perFrame = await run(PER_FRAME);
+    const ofA = (harness: Harness, from: number) => others(harness, from).filter((entry) => entry.instanceId === INSTANCE_A);
+    expect(ofA(paper.harness, paper.start)).toEqual(ofA(perFrame.harness, perFrame.start));
   });
 });

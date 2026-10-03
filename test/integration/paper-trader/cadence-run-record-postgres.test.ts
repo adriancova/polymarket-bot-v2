@@ -22,7 +22,7 @@ import { parseTraderConfig } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { assembleDurableTrader, EXIT_CODES } from "../../../apps/trader/src/main.js";
-import { safeEnvironment } from "./support/fixture.js";
+import { ingested, safeEnvironment } from "./support/fixture.js";
 import { FIXTURE_FIRST_EVENT_AT, RebasedSystemPaperClock } from "./support/host-clock.js";
 import { RUN_SEED, documentFor, registerThroughTheRepositories, withFreshDatabase } from "./support/registration.js";
 
@@ -67,6 +67,54 @@ describe("CADENCE-1: the run row pins the evaluation cadence, and a PAPER trader
       expect(result.ok ? "ok" : log).toBe("ok");
       if (!result.ok) return;
       expect(result.trader.loop.evaluationCadence()).toEqual({ intervalMs: 1000, heartbeatMs: 5000 });
+      await result.store.close();
+    });
+  }, 120_000);
+
+  // `CADENCE-1` r1 (O03): the process's own assembly wires the forward-jump
+  // alarm to the log line HOST-1 pages on (`main.ts` `onCadenceAlarm`). Three
+  // applied events for a market this trader does not run: one stamped an hour
+  // ahead, one an hour behind it (beyond the 5,000 ms bound: RAISED), and one
+  // within the bound (CLEARED).
+  it("a forward jump in event time logs the PAGE line once, and the end of the episode once", async () => {
+    await withFreshDatabase(container.getConnectionUri(), "cadence-page", async ({ connectionString, context }) => {
+      const registered = await registerThroughTheRepositories(context, "cadence-page");
+      const lines: string[] = [];
+      const parsed = parseTraderConfig(documentFor(registered, "cadence-page"));
+      if (!parsed.ok) throw new Error(parsed.refusal.code);
+      const result = await assembleDurableTrader({
+        env: safeEnvironment(),
+        config: parsed.config,
+        document: documentFor(registered, "cadence-page"),
+        postgresUrl: connectionString,
+        clock: new RebasedSystemPaperClock(FIXTURE_FIRST_EVENT_AT),
+        log: (line) => {
+          lines.push(line);
+        },
+      });
+      expect(result.ok ? "ok" : lines.join("\n")).toBe("ok");
+      if (!result.ok) return;
+      const unknownMarket = "018f4a7e-dddd-7abc-8def-0123456789ab";
+      const book = (receivedAt: string, ingestSeq: number) =>
+        ingested(
+          "BookSnapshot",
+          { internalMarketId: unknownMarket, tokenId: "999", bids: [{ price: "0.4", size: "10" }], asks: [] },
+          { receivedAt, ingestSeq },
+        );
+      for (const event of [
+        book("2026-03-04T13:00:00.000Z", 1),
+        book("2026-03-04T12:00:01.000Z", 2),
+        book("2026-03-04T12:59:58.000Z", 3),
+      ]) {
+        expect(result.trader.loop.ingest(event)).toBe(true);
+      }
+      await result.trader.loop.drain();
+      const paged = lines.filter((line) => line.startsWith("CADENCE CLOCK FORWARD JUMP: "));
+      expect(paged).toHaveLength(1);
+      expect(paged[0]).toContain("2026-03-04T12:00:01Z");
+      expect(paged[0]).toContain("2026-03-04T13:00:00Z");
+      expect(lines.filter((line) => line.startsWith("CADENCE CLOCK CAUGHT UP: "))).toHaveLength(1);
+      expect(result.trader.loop.health().loop.cadenceForwardJumpAlarms).toBe(1);
       await result.store.close();
     });
   }, 120_000);
