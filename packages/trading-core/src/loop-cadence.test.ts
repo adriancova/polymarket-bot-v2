@@ -996,6 +996,48 @@ describe("ADR-026 D2.11 (corrected 2026-10-03): a halted market is not evaluated
   });
 });
 
+describe("edges of one close", () => {
+  it("a market named twice by ONE event is decided once at its close: evaluated once, never also coalesced and carried", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening());
+    const coalesced = harness.loop.health().loop.evaluationsCoalesced;
+    const start = harness.seen.length;
+    const incident = event(S + 1_000, "DataQualityIncidentOpened", {
+      incidentId: "cadence1-incident",
+      openedAt: iso(S + 1_000),
+      reasonCode: "FEED_STALE",
+      severity: "NOTIFY",
+      affectedMarketIds: [MARKET_A, MARKET_A],
+    });
+    await feed(harness, incident);
+    expect(featureCalls(harness, start)).toEqual([["A", idOf(incident), iso(S + 1_000)]]);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
+    // Nothing was left owed: a later close that allows a carried evaluation evaluates nothing.
+    await feed(harness, snapshot(S + 2_000, MARKET_X, "yes"));
+    expect(featureCalls(harness, start)).toHaveLength(1);
+  });
+
+  it("a longer frame of events for no configured market, at which heartbeats run, reaches the harvest point: harvested and flushed at its close", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnOpen: true });
+    await feed(harness, ...opening(), opened(S + 100, MARKET_A));
+    expect(harness.venue.ordersSnapshot()).toHaveLength(1);
+    const start = harness.seen.length;
+    const decided = harness.store.decisions.length;
+    const x1 = snapshot(S + 5_000, MARKET_X, "yes", "u1");
+    const x2 = snapshot(S + 5_001, MARKET_X, "no", "u1");
+    await feed(harness, [x1, x2]);
+    expect(harness.seen.slice(start).map((entry) => [entry.instanceId === INSTANCE_A ? "A" : "B", entry.callback, entry.source])).toEqual([
+      ["A", "onFeatures", idOf(x2)],
+      ["B", "onFeatures", idOf(x2)],
+      ["A", "onOrderUpdate", undefined],
+    ]);
+    // Flushed at this close, not left in the outbox for a later one.
+    expect(harness.store.decisions.length).toBe(decided + 3);
+  });
+});
+
 describe("the one place harvest points differ: an event at which the cadence evaluates, and which ADR-024 left unharvested", () => {
   it("a heartbeat at a lone event for a market this trader does not run is followed by that event's harvest (its fills booked before the next evaluation reads the position)", async () => {
     const run = async (cadence: EvaluationCadenceOption): Promise<Seen[]> => {

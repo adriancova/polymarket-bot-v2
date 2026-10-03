@@ -1667,6 +1667,45 @@ describe("retention bounds reach the loop through createPaperTrader, and evict o
   });
 });
 
+describe("CADENCE-1 (ADR-026): a heartbeat sweeps the cancels before it evaluates, as every evaluation an event triggers does", () => {
+  it("at an event for no configured market, past a lost cancel's silence bound, the market halts CANCEL_UNRESOLVED and is NOT evaluated", async () => {
+    const parts = assemble();
+    await drive(parts, 1, 5);
+    // As in (d): event 6 (09:00:03) withdraws the take-profit and the cancel's answer is lost.
+    parts.venue.afterSubmit = (plan) => {
+      if ((plan as { planKind?: string }).planKind !== "CANCEL") return undefined;
+      parts.venue.afterSubmit = undefined;
+      return "LOSE_ANSWER";
+    };
+    parts.event = 6;
+    const recorded = RECORDED[5];
+    if (recorded === undefined) throw new Error("no event 6");
+    expect(parts.trader.loop.ingest(ingested(recorded, 6))).toBe(true);
+    await expect(parts.trader.loop.drain()).rejects.toThrow(/answer was lost/u);
+    expect(parts.trader.loop.health().seams.cancels.pending).toBe(1);
+    const before = parts.evaluations.length;
+    // 09:00:10: past the 5 s silence bound, and 7 s after the market's last
+    // evaluation, so its heartbeat is due — at an event for a market this
+    // trader does not run, which ADR-024 would not even have swept at.
+    await driveOne(
+      parts,
+      ingested(
+        {
+          eventType: "BookLevelChanged",
+          payload: { internalMarketId: "018f5c20-1000-7a10-8b00-0000000000ff", tokenId: "999", side: "BID", price: "0.31", size: "1" },
+          receivedAt: "2026-05-01T09:00:10.000Z",
+        },
+        9,
+      ),
+      9,
+    );
+    const health = parts.trader.loop.health();
+    expect(health.seams.cancels).toMatchObject({ pending: 0, silenceExceeded: 1 });
+    expect(health.halts.map((halt) => halt.code)).toContain("CANCEL_UNRESOLVED");
+    expect(parts.evaluations.slice(before).filter((evaluation) => evaluation.callback === "onFeatures")).toEqual([]);
+  });
+});
+
 describe("CADENCE-1 (ADR-026 D1.5-D1.6): createPaperTrader runs the PAPER cadence, and refuses anything else by name", () => {
   it("omitted, the cadence is 1,000 ms and 5,000 ms — what every live run uses", () => {
     expect(assemble().trader.loop.evaluationCadence()).toEqual({ intervalMs: 1_000, heartbeatMs: 5_000 });
