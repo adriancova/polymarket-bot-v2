@@ -1,11 +1,15 @@
 # ADR-023: Book freshness by delivery-session liveness, not by the last change
 
-- **Status:** Proposed, 2026-09-30. The user ratifies it before `THROUGHPUT-1c` merges.
-  The three rulings its review asked for (the D7 option, the `Clock`-port
-  reading of D7, and the epoch taint of §5) are recorded as the
-  orchestrator's INTERIM rulings in `IMPLEMENTATION_STATUS.md` (Authorized
-  now, `THROUGHPUT-1c`, 2026-10-01). At ratification the user confirms or
-  replaces them; the ratification is still the merge gate.
+- **Status:** **Accepted, 2026-10-02: ratified by the user as is.** Proposed
+  2026-09-30. The user's ratification confirms the three rulings its review
+  asked for, which the orchestrator recorded on 2026-10-01 as interim rulings
+  in `IMPLEMENTATION_STATUS.md`:
+  - the D7 option: (a), the process-lag guard;
+  - the `Clock`-port reading of D7;
+  - the epoch taint of §5, which stays coarse and fail-closed.
+
+  Wherever the text below says a ruling is interim or awaits ratification,
+  read it as confirmed on 2026-10-02.
 - **Date:** 2026-09-30
 - **Recorded by:** `THROUGHPUT-1c`, which also implements it.
 - **Supersedes / Superseded by:** none. It changes how a venue book's AGE is
@@ -679,7 +683,7 @@ under both bases), a 30-minute replay equal to `LAST_CHANGE` evaluation by
 evaluation, a live process 1 700 ms behind fresh and 1 900 ms behind stale
 at the same event, and a per-event replay clock equal to the unlagged run.
 
-**The ruling: option (a), interim.** Round 1 asked the orchestrator or the
+**The ruling: option (a), interim; confirmed by the user's ratification on 2026-10-02.** Round 1 asked the orchestrator or the
 user to choose among the three options below. The choice is recorded in
 `IMPLEMENTATION_STATUS.md` (Authorized now, `THROUGHPUT-1c`, "Interim
 rulings", orchestrator, 2026-10-01), not here, as two interim rulings, each
@@ -832,9 +836,8 @@ a reproduction of the gateway.
   taints the gateway epoch, with no source filter (`loop.ts`
   `#observeDeliverySession`). It is recorded in `IMPLEMENTATION_STATUS.md`
   (Authorized now, `THROUGHPUT-1c`, "Interim rulings", orchestrator,
-  2026-10-01), and awaits the user's ratification of this ADR, which is still
-  the merge gate. Whether to narrow the taint is the user's open choice at
-  ratification. Until it is narrowed, or a live run without reference-venue
+  2026-10-01). The user's ratification of this ADR on 2026-10-02 confirmed
+  it, and kept the taint coarse. Until it is narrowed, or a live run without reference-venue
   incidents measures it, the rule's intended effect is unproven in any
   H1-like deployment.
 - A book on a session whose only traffic is its own changes behaves exactly as
@@ -854,7 +857,7 @@ a reproduction of the gateway.
   assumption (N-A, N-B), and the ceiling is what bounds it. The same bound
   covers the accepted gap of a taint this process never consumed (D2.4, X2).
   The widened `CO2-N1` backlog (D7, X9) is removed by the process-lag guard
-  (r2; option (a), the interim ruling D7 points to, pending ratification).
+  (r2; option (a), the ruling D7 points to, confirmed on 2026-10-02).
 - **For the venue register (not this round's paths):** N-B deserves an
   unknown row of its own (no documented cross-asset ordering on the market
   channel), next to U-2 and U-3.
@@ -893,8 +896,8 @@ a reproduction of the gateway.
   could check, needs a stream or contract change, which is not this
   round's. (Since r8 the trader no longer needs the taint to stay safe
   through a cut frame: D2.4's consumer rule covers it. Removing or
-  narrowing the taint would loosen a fail-closed rule, so it is kept, and
-  the choice is left to ratification.)
+  narrowing the taint would loosen a fail-closed rule, so it is kept. The
+  user's ratification on 2026-10-02 kept it.)
 - **The frame proof costs one frame (r8, R8-H1).** A frame vouches only from
   the next event of its gateway epoch on. On a busy session the delay is the
   gap between two frames (milliseconds in H1's burst). A quiet session's
