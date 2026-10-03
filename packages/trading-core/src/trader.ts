@@ -52,6 +52,7 @@ import {
 
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
+import { evaluationCadenceProblem, type CadenceAlarm, type EvaluationCadenceOption } from "./cadence.js";
 import { configuredFeatureKeys, parseTraderConfig, type TraderConfig } from "./config.js";
 import { accountingChecksProblem, type AccountingChecks } from "./folds.js";
 import { HaltController } from "./halt.js";
@@ -101,12 +102,30 @@ export interface CreateTraderOptions {
    * O1); it is not part of the configuration document.
    */
   readonly accountingChecks?: AccountingChecks;
+  /**
+   * `CADENCE-1` — the ADR-026 evaluation cadence (`cadence.ts`). Omitted: the
+   * PAPER cadence, 1,000 ms and 5,000 ms — what every live-data run and every
+   * replay that is not a reproduction uses (D1.5). The live composition root
+   * (`apps/trader` `main.ts`) passes it explicitly, after its registration
+   * check has read the same two values from the run's `strategy.runs` row. The
+   * per-frame value 0 is accepted only with `reproduces` (D1.6), which only a
+   * golden harness or `backtest-cli run --reproduces` sets. Anything else is
+   * refused, `TRADER_CADENCE_REFUSED`. Not part of the configuration document.
+   */
+  readonly evaluationCadence?: EvaluationCadenceOption;
+  /**
+   * `CADENCE-1` (ADR-026 D2.10) — told when a forward-jump alarm episode starts
+   * or ends; the live root logs the line an operator's pager watches. Output
+   * only.
+   */
+  readonly onCadenceAlarm?: (alarm: CadenceAlarm) => void;
 }
 
 export interface TraderRefusal {
   readonly code:
     | "TRADER_UNSAFE_ENVIRONMENT"
     | "TRADER_CONFIG_REFUSED"
+    | "TRADER_CADENCE_REFUSED"
     | "TRADER_RISK_POLICY_REFUSED"
     | "TRADER_ALLOCATOR_CAPS_REFUSED"
     | "TRADER_MARKET_INVALID"
@@ -284,6 +303,19 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     );
   }
 
+  // `CADENCE-1`: the evaluation cadence — the same rule, refused here by name.
+  // ADR-026 D1.5-D1.6: 1,000 / 5,000, or 0 / 0 for a declared reproduction.
+  const cadenceProblem =
+    options.evaluationCadence === undefined ? undefined : evaluationCadenceProblem(options.evaluationCadence);
+  if (cadenceProblem !== undefined) {
+    return refuse(
+      "TRADER_CADENCE_REFUSED",
+      "the evaluation cadence was refused; a live-data run, and every replay that is not a reproduction, " +
+        "uses exactly 1000 ms and 5000 ms (ADR-026 D1.5)",
+      [cadenceProblem],
+    );
+  }
+
   // --- 5. the outbox, the ledger, and the counters -------------------------
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const ledger = Ledger.empty(config.environment);
@@ -409,6 +441,8 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     ...(options.accountingChecks === undefined
       ? {}
       : { accountingChecks: options.accountingChecks }),
+    ...(options.evaluationCadence === undefined ? {} : { evaluationCadence: options.evaluationCadence }),
+    ...(options.onCadenceAlarm === undefined ? {} : { onCadenceAlarm: options.onCadenceAlarm }),
   });
 
   void staticBracketParamsSchema;

@@ -123,6 +123,26 @@ as the loop already uses it.
       step add evaluations, which rule 8 forbids.
 11. The usual gates still apply. A halted or closed market is not evaluated, as
     today.
+
+    > **Corrected 2026-10-03 (`CADENCE-1`, under the orchestrator's grant Q4).**
+    > What the code does today. A HALTED market — a market-scoped halt, or any
+    > GLOBAL halt — is not evaluated: at each close the loop's market-halt gate
+    > skips it, and an evaluation it was owed is dropped, not carried, as the
+    > per-frame cadence dropped it. A halted strategy INSTANCE is skipped
+    > inside the market's evaluation, which still runs for the market's other
+    > instances; the market's `last` moves only if at least one instance's
+    > runtime was asked (rule 3: `last` is the last `onFeatures` evaluation).
+    > A market whose EVERY instance is halted is not evaluated: its `last`
+    > does not move, and an evaluation it was owed is dropped, as for a
+    > halted market. A CLOSED market has no
+    > gate: nothing in the loop or the strategy runtime gates evaluation on a
+    > market's lifecycle. A market whose `MarketClosing` or `MarketResolved`
+    > event has arrived is still evaluated under rule 4, like any other. Its
+    > lifecycle callbacks fire in place (D4); the strategy learns of the close
+    > from them, and the risk engine reads the lifecycle as the §9.8 market
+    > status at admission. "A closed market is not evaluated" therefore
+    > describes no gate the code has. This correction adds none; a lifecycle
+    > gate would need its own ruling.
 12. **The order at one close.** First come the markets this frame owed an
     evaluation (D3.1), in the order ADR-024 D3 gives. Then come all the
     others, carried-over and heartbeat evaluations alike (D3.2), in the stable

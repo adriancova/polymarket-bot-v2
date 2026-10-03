@@ -228,6 +228,18 @@ async function runGateway(options: {
   );
   socket.message(bookFrame(options.conditionId, NO_TOKEN, [["0.65", "200"]], [["0.66", "200"]]));
   await gateway.settle();
+  // `CADENCE-1` (ADR-026): every envelope above carries ONE instant (the
+  // gateway's manual clock has not moved), and the trader evaluates a market
+  // at most once per 1 s of event time. The first reference trade evaluates
+  // it (no book yet); the books, at that same instant, are owed and carried.
+  // Two later reference trades, 1 s and 2 s on, close the frames at which the
+  // carried evaluation runs: Static Bracket arms on the first and enters on
+  // the second, as it did on the books themselves under the per-frame cadence.
+  for (const tradeId of [3, 4]) {
+    timers.advance(1_000);
+    binance.message(binanceTradeFrame(tradeId, clock.nowMs(), "100200"));
+  }
+  await gateway.settle();
   return { gateway, gammaRequests };
 }
 

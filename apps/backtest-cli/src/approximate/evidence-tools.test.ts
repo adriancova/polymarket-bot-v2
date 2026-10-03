@@ -48,7 +48,14 @@ import { bar, depth, gammaPoll, writeResearchDataset, type WrittenDataset } from
 const FIXTURE = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "test", "replay-golden", "backtest", "static-bracket");
 const CONFIG = JSON.parse(readFileSync(join(FIXTURE, "trader-config.json"), "utf8")) as Record<string, unknown>;
 const EXACT_PINS_PATH = join(FIXTURE, "run-pins.json");
-const EXACT_PINS_DOCUMENT = JSON.parse(readFileSync(EXACT_PINS_PATH, "utf8")) as Record<string, unknown>;
+// `CADENCE-1` (ADR-026 D1.5-D1.6): the golden's own pins declare the per-frame
+// cadence 0 for its REPRODUCTION. These runs reproduce nothing — they exercise
+// the evidence doors over the fixture — so they run the PAPER cadence.
+const EXACT_PINS_DOCUMENT: Record<string, unknown> = {
+  ...(JSON.parse(readFileSync(EXACT_PINS_PATH, "utf8")) as Record<string, unknown>),
+  evaluationIntervalMs: 1000,
+  evaluationHeartbeatMs: 5000,
+};
 const C = "0xbacktest1condition";
 const T0 = Date.UTC(2026, 4, 1, 9, 0, 0);
 

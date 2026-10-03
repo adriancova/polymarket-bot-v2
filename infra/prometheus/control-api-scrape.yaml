@@ -35,6 +35,11 @@
 # untouched by observability, and no route the scrape reaches can change
 # them.
 
+# CADENCE-1: the trader's alert rules (`trader-alerts.yaml`) read series this
+# job produces; add that file to the deployment's `rule_files`.
+rule_files:
+  - "trader-alerts.yaml"
+
 scrape_configs:
   # The control API (WP-240) — the producer of every trader_* / control_* series.
   - job_name: "control-api"

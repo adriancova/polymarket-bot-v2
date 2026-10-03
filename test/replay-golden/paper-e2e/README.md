@@ -45,8 +45,35 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `ledgerTransactions` | the append-only postings, entry by entry |
 | `pnlRecords` / `pnlSnapshots` | the §9.16 stream and the rows written to the store |
 | `ledgerProjection` | the §6 invariant 8 fold: balances, virtual positions, and the two "nothing unexplained" counts |
+| `evaluationCadence` | since golden format 5 (`CADENCE-1`): the ADR-026 evaluation cadence the core RAN with — `intervalMs` and `heartbeatMs` `0`, the per-frame cadence (ADR-024) this golden was recorded under, and `reproduces`, the golden's own repository path: the harness DECLARES the run a reproduction of this file, the only kind of run that may use the value 0 (ADR-026 D1.6) |
 | `health` | every §14.3-shaped counter the run moved, plus `accounting.realizedPnl` (below), and — golden format 3 (`TRDR-4`) — `seams.orders` (the loop's per-order state: `tracked`, `settled`, the settled-order tombstones, `unownedFills`, `lateFillsAfterSettlement`, `settleMismatches`) and `seams.retention` (`retained / maximumRetained / evicted` for the decision, trace and provenance logs — all `evicted: 0` here, which PINS that this fixture evicts nothing) |
 | `reconciliation` | the projected-vs-realized table, with each difference's named mechanism |
+
+### The `CADENCE-1` regeneration (golden format 5): the evaluation cadence, recorded
+
+ADR-026 makes the trader evaluate each market's `onFeatures` at most once per
+1,000 ms of event time, plus a 5,000 ms heartbeat, with both settings pinned in
+every run's record; a golden recorded under ADR-024's per-frame cadence keeps
+the value 0, through a DECLARED reproduction (D1.6). The harness now passes
+`evaluationCadence` `{ intervalMs: 0, heartbeatMs: 0, reproduces:
+"test/replay-golden/paper-e2e/<this file>" }` (`test/e2e/support/harness.ts`,
+`goldenReproduction`), and the artefact records what the core ran with.
+
+The regeneration — ONCE per file, with `WP250_WRITE_GOLDEN`, from the committed
+base bytes — moved exactly this and nothing else, checked mechanically against
+the base files:
+
+- `goldenFormatVersion` `4 → 5`;
+- a new top-level `evaluationCadence` section, as above;
+- `health.loop` gains `evaluationsCoalesced` and `cadenceForwardJumpAlarms`,
+  both `0` — the per-frame cadence coalesces nothing, and no event here lies
+  5 s behind an earlier one;
+- every other top-level section, and every other `health` key, is equal to
+  base's (12 decisions in `paper-e2e-run.json`, 19 in `two-brackets-run.json`).
+
+The same scenarios driven at the PAPER cadence (a NEW run, nothing declared)
+are pinned beside the goldens in `test/e2e/determinism-golden.test.ts`
+(`CADENCE-1`), with what the cadence changes there.
 
 ### The `PROVENANCE-1` regeneration (golden format 4): each decision carries its dispatch position
 

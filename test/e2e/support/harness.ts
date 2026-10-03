@@ -50,9 +50,12 @@ import {
 } from "@polymarket-bot/simulation";
 import {
   EVERY_FILL_ACCOUNTING_CHECKS,
+  PAPER_EVALUATION_CADENCE,
+  PER_FRAME_EVALUATION_CADENCE,
   buildSimulatedVenue,
   createPaperTrader,
   type CreateTraderResult,
+  type EvaluationCadenceOption,
   type PaperTrader,
   type TraderStore,
 } from "@polymarket-bot/trader";
@@ -90,6 +93,25 @@ export interface AssembleOptions {
    * directly. `parts.store` is always the in-memory store itself.
    */
   readonly wrapStore?: (store: MemoryTraderStore) => TraderStore;
+  /**
+   * `CADENCE-1` (ADR-026 D1.5-D1.6): the evaluation cadence. Absent, the
+   * PAPER cadence (1,000 ms / 5,000 ms) — what every live-data run uses — so
+   * every e2e suite runs the production cadence unless it says otherwise
+   * (r1, O06). A test that compares a run with a committed golden REPRODUCES
+   * that golden instead, and says so: it passes {@link goldenReproduction},
+   * the per-frame cadence the golden was recorded under (ADR-024), declared
+   * with the golden's path.
+   */
+  readonly evaluationCadence?: EvaluationCadenceOption;
+}
+
+/**
+ * `CADENCE-1` (ADR-026 D1.6): the cadence a scenario's golden was recorded
+ * under — ADR-024's per-frame cadence, the value 0 — declared as a
+ * reproduction of that golden, named by its repository path.
+ */
+export function goldenReproduction(scenario: Scenario): EvaluationCadenceOption {
+  return { ...PER_FRAME_EVALUATION_CADENCE, reproduces: `test/replay-golden/paper-e2e/${scenario.goldenFile}` };
 }
 
 /** A string field of an unparsed document, or a stated fallback. */
@@ -172,6 +194,9 @@ export function assemble(options: AssembleOptions = {}): {
     // after EVERY fill. A mismatch latches a GLOBAL halt, which the golden's
     // `health.halts` would show.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    // `CADENCE-1` r1 (O06): the production cadence unless the caller declares
+    // a reproduction of a golden.
+    evaluationCadence: options.evaluationCadence ?? PAPER_EVALUATION_CADENCE,
   });
   if (!result.ok) return { result, parts: undefined };
   built.wiring.trader = result.trader;

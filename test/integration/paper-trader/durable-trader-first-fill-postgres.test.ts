@@ -258,6 +258,9 @@ describe("the startup registration check refuses what the database does not hold
         codeCommit: "boot-1-acceptance-test",
         stateSchemaVersion: 1,
         runSeed: RUN_SEED,
+        // `CADENCE-1` (ADR-026 D1.4-D1.5): the cadence every live run records.
+        evaluationIntervalMs: 1000,
+        evaluationHeartbeatMs: 5000,
       });
 
       // (1) instances.environment: the PAPER trader names the SHADOW instance.
@@ -382,6 +385,9 @@ describe("the startup registration check refuses what the database does not hold
         codeCommit: "boot-1-acceptance-test",
         stateSchemaVersion: 1,
         runSeed: RUN_SEED,
+        // `CADENCE-1` (ADR-026 D1.4-D1.5): the cadence every live run records.
+        evaluationIntervalMs: 1000,
+        evaluationHeartbeatMs: 5000,
       });
       const third = await assemble(documentFor(registered, "restart", { runId: newRunId }), connectionString);
       expect(third.result.ok ? "ok" : third.log).toBe("ok");

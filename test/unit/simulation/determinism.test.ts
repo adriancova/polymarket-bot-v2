@@ -202,6 +202,8 @@ describe("acceptance 2 — the same manifest/config/seed is byte-identical", () 
     // The same run pins, built with their keys in a different order and with the
     // settlement-spec list reversed. Nothing about the RUN changed.
     const shuffledPins = {
+      evaluationHeartbeatMs: 5000,
+      evaluationIntervalMs: 1000,
       simulatorVersion: "wp-210/v2",
       settlementSpecVersions: ["b", "a"],
       rewardSnapshotVersion: "rewards/2026-08-24",

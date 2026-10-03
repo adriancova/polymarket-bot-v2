@@ -84,6 +84,7 @@
  * | | `environment` | `environment` |
  * | | `instances[].configId` | `config_id` — §9.6's pin: the run executes the config it was started with |
  * | | `instances[].runSeed` | `run_seed` — §12.4's pin: the seed the runtime is handed is the one the run row records |
+ * | | (implicit: the PAPER cadence) | `evaluation_interval_ms` = 1000 and `evaluation_heartbeat_ms` = 5000 — `CADENCE-1`, ADR-026 D1.4-D1.5: the run record pins the evaluation cadence, and a PAPER run on live data uses exactly these values. A row recording anything else — 0 (a reproduction's per-frame cadence), another number, or NULL (a run recorded under ADR-024, before migration 0010) — is refused; the trader then runs with exactly the values it verified here (`main.ts`) |
  * | | (implicit) | `status = 'RUNNING'` — `runs_end_consistent` makes a stopped run a closed record; no decision may be appended to it |
  * | `strategy.configs` by `config_id` (`OUTAGE-1`) | `instances[].params` | `parameters`, compared CANONICALLY — see "The registered parameters" below |
  * | `strategy.decisions` by `run_id` | (implicit) | NO ROW — see "A run that already has decisions" below |
@@ -176,7 +177,7 @@
 
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
 
-import type { TraderConfig } from "@polymarket-bot/trading-core";
+import { PAPER_EVALUATION_CADENCE, type TraderConfig } from "@polymarket-bot/trading-core";
 
 export interface RegistrationRefusal {
   readonly code:
@@ -292,7 +293,16 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
   const runIds = config.instances.map((instance) => instance.runId);
   const runRows = await db
     .selectFrom("strategy.runs")
-    .select(["run_id", "instance_id", "environment", "config_id", "run_seed", "status"])
+    .select([
+      "run_id",
+      "instance_id",
+      "environment",
+      "config_id",
+      "run_seed",
+      "status",
+      "evaluation_interval_ms",
+      "evaluation_heartbeat_ms",
+    ])
     .where("run_id", "in", runIds)
     .execute();
   const runsById = new Map(runRows.map((row) => [row.run_id, row]));
@@ -324,6 +334,20 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
       mismatched.push(
         `${at}: the row records run_seed ${row.run_seed} but the configuration states runSeed ` +
           `${instance.runSeed} (§12.4: the seed the runtime is handed must be the one the run pins)`,
+      );
+    }
+    // `CADENCE-1` (ADR-026 D1.4-D1.5): the run record pins the evaluation
+    // cadence, and a PAPER run on live data uses exactly 1000 ms and 5000 ms.
+    if (
+      row.evaluation_interval_ms !== PAPER_EVALUATION_CADENCE.intervalMs ||
+      row.evaluation_heartbeat_ms !== PAPER_EVALUATION_CADENCE.heartbeatMs
+    ) {
+      mismatched.push(
+        `${at}: the row pins evaluation_interval_ms ${pinnedCadence(row.evaluation_interval_ms)} and ` +
+          `evaluation_heartbeat_ms ${pinnedCadence(row.evaluation_heartbeat_ms)}, but a ` +
+          `${config.environment} run on live data uses exactly ` +
+          `${String(PAPER_EVALUATION_CADENCE.intervalMs)} and ${String(PAPER_EVALUATION_CADENCE.heartbeatMs)} ` +
+          "(ADR-026 D1.5); start a new run that records them (§9.6, ADR-026 D1.3)",
       );
     }
     if (row.status !== "RUNNING") {
@@ -430,6 +454,11 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
     };
   }
   return { ok: true };
+}
+
+/** A run row's pinned cadence value, for a refusal line: NULL says what it means. */
+function pinnedCadence(value: number | null): string {
+  return value === null ? "NULL (a run recorded under ADR-024, before migration 0010)" : String(value);
 }
 
 /** How many differing fields one refusal line names before it summarises the rest. */

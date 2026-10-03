@@ -44,6 +44,7 @@ import { describe, expect, it } from "vitest";
 
 import { buildHarness } from "../data-gateway/support/harness.js";
 import {
+  adr024Reproduction,
   CONDITION_ID,
   MARKET_ID,
   NO_TOKEN,
@@ -259,7 +260,13 @@ interface Outcome {
 }
 
 async function trade(published: readonly EventEnvelope<unknown>[], basis: Basis): Promise<Outcome> {
-  const run = assembleOrThrow({ config: config(basis) });
+  // `CADENCE-1` (ADR-026 D1.6): this file pins book freshness at EACH
+  // evaluation of a timeline written for ADR-024's per-frame cadence (an entry
+  // needs the book evaluations 100 ms apart), so it REPRODUCES that cadence.
+  const run = assembleOrThrow({
+    config: config(basis),
+    evaluationCadence: adr024Reproduction("test/integration/paper-trader/throughput-1c-frame-split.test.ts"),
+  });
   resetEventIds();
   // The reference feed (hand-written, see the header), just before the open.
   run.trader.loop.ingest(

@@ -38,9 +38,11 @@ import type {
 } from "@polymarket-bot/simulation";
 import {
   EVERY_FILL_ACCOUNTING_CHECKS,
+  PER_FRAME_EVALUATION_CADENCE,
   buildSimulatedVenue,
   createPaperTrader,
   type CreateTraderResult,
+  type EvaluationCadenceOption,
   type IngestedEvent,
   type PaperTrader,
   type TraderStore,
@@ -604,6 +606,16 @@ export function feeSnapshot(): FeeScheduleSnapshot {
   };
 }
 
+/**
+ * `CADENCE-1` (ADR-026 D1.6): ADR-024's per-frame evaluation cadence, declared
+ * as a reproduction of what `test` pinned under ADR-024 — for a test whose
+ * subject is per-frame behaviour (frames, group-commit stagings, freshness at
+ * each event), not the cadence.
+ */
+export function adr024Reproduction(test: string): EvaluationCadenceOption {
+  return { ...PER_FRAME_EVALUATION_CADENCE, reproduces: `adr-024:${test}` };
+}
+
 export interface Assembled {
   readonly trader: PaperTrader;
   readonly venue: SimulatedVenue;
@@ -645,6 +657,12 @@ export function assemble(
      * the in-memory store itself, as before.
      */
     readonly wrapStore?: (store: MemoryTraderStore) => TraderStore;
+    /**
+     * `CADENCE-1` (ADR-026): the evaluation cadence. Absent: the PAPER
+     * cadence, 1,000 ms and 5,000 ms, as the shipped process runs. A test that
+     * pins ADR-024's per-frame behaviour passes {@link adr024Reproduction}.
+     */
+    readonly evaluationCadence?: EvaluationCadenceOption;
   } = {},
 ): { readonly result: CreateTraderResult; readonly parts: Assembled | undefined } {
   const clock = new ManualClock("2026-03-04T12:00:00.000Z");
@@ -684,6 +702,7 @@ export function assemble(
     // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams
     // are checked against their rebuilds from zero after EVERY fill.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    ...(options.evaluationCadence === undefined ? {} : { evaluationCadence: options.evaluationCadence }),
   });
   if (!result.ok) return { result, parts: undefined };
   built.wiring.trader = result.trader;

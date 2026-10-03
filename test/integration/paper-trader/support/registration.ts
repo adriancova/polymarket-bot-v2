@@ -115,6 +115,11 @@ export async function registerThroughTheRepositories(
     readonly accountRef?: string;
     /** The §13.2 document the config row records; the fixture's own when absent. */
     readonly params?: Record<string, unknown>;
+    /**
+     * `CADENCE-1` (ADR-026 D1.4): the evaluation cadence the run row pins;
+     * the PAPER cadence, 1000 / 5000, when absent — what every live run records.
+     */
+    readonly evaluationCadence?: { readonly intervalMs: number; readonly heartbeatMs: number };
   } = {},
 ): Promise<Registered> {
   const { catalog, strategy } = context.repositories;
@@ -180,6 +185,8 @@ export async function registerThroughTheRepositories(
     codeCommit: "boot-1-acceptance-test",
     stateSchemaVersion: 1,
     runSeed: RUN_SEED,
+    evaluationIntervalMs: options.evaluationCadence?.intervalMs ?? 1000,
+    evaluationHeartbeatMs: options.evaluationCadence?.heartbeatMs ?? 5000,
   });
 
   return { marketId, definitionId, configId, instanceId, runId };

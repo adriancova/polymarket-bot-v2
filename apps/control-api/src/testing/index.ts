@@ -176,6 +176,8 @@ export function healthDocument(
       containedEvaluations: 0,
       refusedEvaluations: 0,
       deliveriesSuppressedByHalt: 0,
+      evaluationsCoalesced: 27,
+      cadenceForwardJumpAlarms: 0,
     },
     risk: {
       evaluations: 6,
