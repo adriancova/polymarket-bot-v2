@@ -1851,6 +1851,7 @@ export class ReconciliationCoordinator {
     if (run.stale) return "the run's reads were stale";
     if (!complete) return "the run did not read everything completely and consistently";
     if (run.holdingsDeferred) return "holdings were not judged: the OMS and the venue disagreed about an order this run";
+    if (!run.holdingsJudged) return "holdings were not judged in this run";
     const unresolved = this.#unresolvedBreaks();
     if (unresolved.length > 0) return `${String(unresolved.length)} break(s) unresolved, first ${unresolved[0]?.breakClass ?? "?"}`;
     if (rerun) return "work arrived during the run";
