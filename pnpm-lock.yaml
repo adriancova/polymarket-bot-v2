@@ -466,6 +466,10 @@ importers:
         version: 5.9.3
 
   packages/oms:
+    dependencies:
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../decimal
     devDependencies:
       typescript:
         specifier: ^5.9.2
