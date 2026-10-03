@@ -91,6 +91,33 @@ export {
 export { MAX_ORDERS_PER_BATCH, VENUE_FACTS, type VenueFact } from "./venue-facts.js";
 
 export {
+  conditionOfCancelOutcome,
+  conditionOfPlacement,
+  conditionOfPlacementOutcome,
+  conditionsOfBatchOutcome,
+  parseRestrictedModeConfiguration,
+  RESTRICTED_MODE_CONFIGURATION_SCHEMA,
+  RESTRICTED_MODE_FACTS,
+  RestrictedModeTimeline,
+  toOmsMode,
+  VenueModeDetector,
+  venueModeSource,
+  withModeDetection,
+  type CancelsEvidence,
+  type Gate,
+  type GateRefusalReason,
+  type ModeBackoffPolicy,
+  type ObservationFlag,
+  type ObservationResult,
+  type RestrictedModeConfiguration,
+  type RestrictedVenueMode,
+  type VenueCondition,
+  type VenueModeSnapshot,
+  type VenueOperation,
+  type VenueSignal,
+} from "./restricted-mode/index.js";
+
+export {
   MAX_ATTRIBUTIONS_PER_ORDER,
   MAX_REQUEST_TOKEN_LENGTH,
   MAX_RETAINED_EVIDENCE,
