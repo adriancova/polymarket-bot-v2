@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `CADENCE-1` is Complete (ADR-026; the lag that made ADR-031 refuse entries is now below 0.1 s on the H1 burst). `WP-280` and `WP-310` run now. `WP-290` follows (it needs `WP-280`), then `WP-320`. On `packages/trading-core`, one at a time: `ROLLOVER-1`, then `CKPT-1`. `HOST-BENCH` waits on the laptop agent.
+- **Next:** `WP-280`, `WP-310` and `CKPT-1` are Complete. `WP-290` (reconciliation) runs now, and the dual review of ADR-033 (the order heartbeat, C-12) runs beside it. `WP-320` follows both. `CI-5` wires the OMS and reconciliation fault suites into CI after `WP-290`. `ROLLOVER-1` is stopped on the user's rulings Q1–Q4. `HOST-BENCH` waits on the laptop agent.
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
