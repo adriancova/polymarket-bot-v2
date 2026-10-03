@@ -9,7 +9,11 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/fault-injection/oms/tsconfig.json",
+    "test:fault": "vitest run --config ../../test/fault-injection/oms/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
