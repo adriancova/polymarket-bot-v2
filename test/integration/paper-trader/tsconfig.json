@@ -38,7 +38,10 @@
       "@polymarket-bot/binance-adapter": ["packages/binance-adapter/src/index.ts"],
       "@polymarket-bot/coinbase-adapter/testing": [
         "packages/coinbase-adapter/src/testing/index.ts"
-      ]
+      ],
+      "@polymarket-bot/research-worker": ["apps/research-worker/src/index.ts"],
+      "@polymarket-bot/storage-parquet": ["packages/storage-parquet/src/index.ts"],
+      "@polymarket-bot/storage-parquet/testing": ["packages/storage-parquet/src/testing/index.ts"]
     }
   },
   "include": ["."]

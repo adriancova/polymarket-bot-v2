@@ -36,7 +36,9 @@
         "SB.ARMED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000004"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000004",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "4"
     },
     {
       "attribution": "STRATEGY",
@@ -79,7 +81,9 @@
         "SB.ENTRY_INTENT_EMITTED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000005"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000005",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "5"
     },
     {
       "attribution": "STRATEGY",
@@ -120,7 +124,9 @@
         "SB.EXIT_SIZED_TO_ALLOCATION"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -139,7 +145,9 @@
         "SB.ENTRY_ORDER_TERMINAL"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -156,7 +164,9 @@
         "SB.EXIT_ORDER_WORKING"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -179,7 +189,9 @@
         "SB.SAFETY_CANCEL"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000006"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000006",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "6"
     },
     {
       "attribution": "STRATEGY",
@@ -197,7 +209,9 @@
         "SB.EXIT_ORDER_TERMINAL"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -238,7 +252,9 @@
         "SB.PROTECTED_REDUCE"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000007"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000007",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "7"
     },
     {
       "attribution": "STRATEGY",
@@ -256,7 +272,9 @@
         "SB.CLOSED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -273,7 +291,9 @@
         "SB.IDLE"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -290,7 +310,9 @@
         "SB.REARMED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000008"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000008",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "8"
     },
     {
       "attribution": "STRATEGY",
@@ -333,7 +355,9 @@
         "SB.ENTRY_INTENT_EMITTED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000009"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000009",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "9"
     },
     {
       "attribution": "STRATEGY",
@@ -374,7 +398,9 @@
         "SB.EXIT_SIZED_TO_ALLOCATION"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -393,7 +419,9 @@
         "SB.ENTRY_ORDER_TERMINAL"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -410,7 +438,9 @@
         "SB.EXIT_ORDER_WORKING"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -427,7 +457,9 @@
         "SB.EXIT_ORDER_WORKING"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000010"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000010",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "10"
     },
     {
       "attribution": "STRATEGY",
@@ -445,7 +477,9 @@
         "SB.CLOSED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -462,7 +496,9 @@
         "SB.IDLE"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
+      "sourceEventId": null,
+      "sourceGatewayEpoch": null,
+      "sourceIngestSeq": null
     },
     {
       "attribution": "STRATEGY",
@@ -479,7 +515,9 @@
         "SB.REFUSED_MAXIMUM_ENTRIES"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000011"
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000011",
+      "sourceGatewayEpoch": "018f5c20-5000-7a50-8b00-000000000005",
+      "sourceIngestSeq": "11"
     }
   ],
   "events": [
@@ -646,7 +684,7 @@
       "tokenId": "9001"
     }
   ],
-  "goldenFormatVersion": 3,
+  "goldenFormatVersion": 4,
   "health": {
     "accounting": {
       "ledgerRefusals": 0,

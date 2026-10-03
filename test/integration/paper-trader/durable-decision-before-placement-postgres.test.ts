@@ -159,6 +159,7 @@ async function runPerRow(label: string, connectionString: string, context: TestC
     appendLedgerTransaction: (transaction) => store.appendLedgerTransaction(transaction),
     writePnlSnapshot: (snapshot) => store.writePnlSnapshot(snapshot),
     replacePnlSnapshot: (snapshot) => store.replacePnlSnapshot(snapshot),
+    persistRiskRefusal: (refusal) => store.persistRiskRefusal(refusal),
     close: () => store.close(),
   };
   const { result, parts } = assemble({ config: documentFor(registered, label), wrapStore: () => perRow });

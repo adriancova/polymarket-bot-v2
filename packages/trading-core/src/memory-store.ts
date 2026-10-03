@@ -56,7 +56,13 @@ import {
   pnlSnapshotKey,
   unreplacedPnlSnapshotProblem,
 } from "./pnl-snapshot-key.js";
-import { portFailed, portOk, type PortResult, type TraderStore } from "./ports.js";
+import {
+  portFailed,
+  portOk,
+  type PortResult,
+  type RiskRefusalRecord,
+  type TraderStore,
+} from "./ports.js";
 
 /** The refusal for a second row of one `pnl_snapshots_scope_unique` identity. */
 export const IN_MEMORY_DUPLICATE_PNL_SNAPSHOT_DETAIL =
@@ -84,6 +90,7 @@ export class InMemoryTraderStore implements TraderStore {
   readonly #checkpointInstants: string[] = [];
   readonly #transactions: AppendedLedgerTransaction[] = [];
   readonly #pnlSnapshots: PnlSnapshot[] = [];
+  readonly #riskRefusals: RiskRefusalRecord[] = [];
   /** `pnl_snapshots_scope_unique` identity → position in {@link #pnlSnapshots}. */
   readonly #pnlSnapshotPositions = new Map<string, number>();
   #pnlSnapshotReplacements = 0;
@@ -118,6 +125,11 @@ export class InMemoryTraderStore implements TraderStore {
     return this.#pnlSnapshots;
   }
 
+  /** `PROVENANCE-1`: every recorded risk refusal, in write order. */
+  get riskRefusals(): readonly RiskRefusalRecord[] {
+    return this.#riskRefusals;
+  }
+
   /** How many replacements rewrote a row. */
   get pnlSnapshotReplacements(): number {
     return this.#pnlSnapshotReplacements;
@@ -133,6 +145,13 @@ export class InMemoryTraderStore implements TraderStore {
   ): Promise<PortResult<null>> {
     if (this.#closed) return await Promise.resolve(closedRefusal());
     this.#decisions.push({ record, telemetry });
+    return await Promise.resolve(portOk(null));
+  }
+
+  /** `PROVENANCE-1`: records one refused intent. */
+  async persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>> {
+    if (this.#closed) return await Promise.resolve(closedRefusal());
+    this.#riskRefusals.push(refusal);
     return await Promise.resolve(portOk(null));
   }
 

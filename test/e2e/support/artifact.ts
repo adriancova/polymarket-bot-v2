@@ -63,8 +63,15 @@ import type { Run } from "./harness.js";
  * settlement mismatches) and `health.seams.retention` (the three audit logs'
  * `retained / maximumRetained / evicted`). The golden therefore also PINS that
  * this fixture evicts nothing from any audit log.
+ *
+ * `4` (`PROVENANCE-1`): each decision's `sourceGatewayEpoch` and
+ * `sourceIngestSeq` — its triggering event's own §7.1 dispatch position, as
+ * the persisted `DecisionRecord.sourceEvent` carries it (`null` for an
+ * evaluation the loop originates). The golden therefore PINS that the
+ * position is deterministic under replay and is the position of the event
+ * `sourceEventId` names.
  */
-export const GOLDEN_FORMAT_VERSION = 3;
+export const GOLDEN_FORMAT_VERSION = 4;
 
 export interface ArtifactEvent {
   readonly eventId: string;
@@ -101,6 +108,13 @@ export interface ArtifactDecision {
   readonly evaluatedAt: string;
   /** `null` when the evaluation had no triggering event (§7.1 timer path). */
   readonly sourceEventId: string | null;
+  /**
+   * `PROVENANCE-1` (format 4): the triggering event's `gatewayEpoch` and
+   * `ingestSeq`, as the persisted record carries them; `null` exactly when
+   * `sourceEventId` is.
+   */
+  readonly sourceGatewayEpoch: string | null;
+  readonly sourceIngestSeq: string | null;
   readonly decisionType: string;
   readonly reasonCodes: readonly string[];
   readonly featureSnapshotRef: string;
@@ -424,7 +438,9 @@ export function captureArtifact(run: Run): PaperRunArtifact {
   const decisions: ArtifactDecision[] = run.parts.store.decisions.map((written) => {
     const record = written.record;
     const decision = record.decision as unknown as Record<string, unknown>;
-    const source = record.sourceEvent as { eventId?: string } | undefined;
+    const source = record.sourceEvent as
+      | { eventId?: string; gatewayEpoch?: string; ingestSeq?: string }
+      | undefined;
     return {
       runId: record.runId,
       instanceId: record.instanceId,
@@ -434,6 +450,8 @@ export function captureArtifact(run: Run): PaperRunArtifact {
       attribution: record.attribution,
       evaluatedAt: record.evaluatedAt,
       sourceEventId: source?.eventId ?? null,
+      sourceGatewayEpoch: source?.gatewayEpoch ?? null,
+      sourceIngestSeq: source?.ingestSeq ?? null,
       decisionType: String(decision["decisionType"]),
       reasonCodes: (decision["reasonCodes"] as readonly string[]).map((code) => code),
       featureSnapshotRef: String(decision["featureSnapshotRef"]),

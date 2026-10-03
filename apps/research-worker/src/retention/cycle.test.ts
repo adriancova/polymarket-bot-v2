@@ -884,8 +884,12 @@ const evidenceTimesOut = (base: TraderEvidenceSource): TraderEvidenceSource => (
     throw new Error("canceling statement due to statement timeout");
   },
 });
-const frontiersAt = (byEpoch: Record<string, string>, evidence: MarketEvidence): TraderEvidenceSource =>
-  staticEvidenceSource({ frontiers: new Map([["i", dispatchFrontier(byEpoch)]]), evidence: new Map([["m", evidence]]) });
+const frontiersAt = (
+  byEpoch: Record<string, string>,
+  evidence: MarketEvidence,
+  completedEpochs: readonly string[] = [],
+): TraderEvidenceSource =>
+  staticEvidenceSource({ frontiers: new Map([["i", dispatchFrontier(byEpoch, completedEpochs)]]), evidence: new Map([["m", evidence]]) });
 /** A later, gateway-only window of the same market: it keeps the market registered once w1 is gone. */
 const LATER_SAME_MARKET: MarketWindow = { ...MARKET_WINDOW(NOW + HOUR, NOW + 2 * HOUR), windowId: "w2", responsibility: { kind: "gateway-only" } };
 
@@ -1034,10 +1038,17 @@ describe("L1: a hold on a located chain source survives every later cycle until 
 
   it("releases the hold once the window's pin holds its evidence: the source segment then expires under that pin", async () => {
     const { f, bootClock } = await heldInCycleOne();
-    // The pending source's epoch seals a segment holding it.
+    // The pending source's epoch seals a segment holding it. That epoch ENDS
+    // inside the window's range, so the trader must have MOVED ON from it
+    // (`PROVENANCE-1` r1, `PROV1-R1-01`: a frontier inside an ended epoch does
+    // not show its last events' rows are durable).
     await writeEpochSegment(f, E2, 0, [tokBook("1", OLD + 2 * MIN), tokBook("3", OLD + 3 * MIN)]);
     const second = await runStorageCycle(
-      dependencies(f, { bootClock, loadWindows: async () => [window], evidence: frontiersAt({ [EPOCH]: "100", [E2]: "100" }, evidence) }),
+      dependencies(f, {
+        bootClock,
+        loadWindows: async () => [window],
+        evidence: frontiersAt({ [EPOCH]: "100", [E2]: "100" }, evidence, [E2]),
+      }),
     );
     expect(second.classifications[0]).toMatchObject({ state: "classified", pinClass: "fill" });
     const outcome = second.pins[0];

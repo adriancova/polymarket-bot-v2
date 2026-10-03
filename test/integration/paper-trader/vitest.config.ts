@@ -75,6 +75,13 @@
  * `RedisStreamsEventTransport`, to the process's own `RedisMarketEventFeed`
  * and `pump`. The rule is unchanged.
  *
+ * **Dated note (`PROVENANCE-1`, 2026-10-02): two more container files.**
+ * `durable-halts-and-refusals-postgres-redis.test.ts` (PostgreSQL and Redis;
+ * one scenario starts a SECOND PostgreSQL of its own, which it stops) and
+ * `provenance-retention-postgres-redis.test.ts` (PostgreSQL and Redis, plus a
+ * throwaway WAL root, object store and state directory under the OS temporary
+ * directory, removed afterwards). The rule is unchanged.
+ *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each
  * package this suite uses to its source.
@@ -143,6 +150,14 @@ export default defineConfig({
       pkg("polymarket-public", "packages/polymarket-public/src/index.ts"),
       pkg("binance-adapter", "packages/binance-adapter/src/index.ts"),
       pkg("coinbase-adapter/testing", "packages/coinbase-adapter/src/testing/index.ts"),
+      // `PROVENANCE-1`: `provenance-retention-postgres-redis.test.ts` runs the
+      // REAL research-worker storage cycle (`storageMain`) over the rows the
+      // real trader wrote, and the halt/refusal file reads them through the
+      // worker's own read-only evidence adapter. The same rows are carried in
+      // `tsconfig.json`.
+      pkg("research-worker", "apps/research-worker/src/index.ts"),
+      pkg("storage-parquet/testing", "packages/storage-parquet/src/testing/index.ts"),
+      pkg("storage-parquet", "packages/storage-parquet/src/index.ts"),
     ],
   },
   test: {

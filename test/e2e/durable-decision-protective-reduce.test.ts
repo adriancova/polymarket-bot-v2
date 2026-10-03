@@ -89,6 +89,7 @@ async function observe(grouped: boolean, refuseSeq: number | undefined): Promise
               await inner.saveCheckpoint(entry.checkpoint, entry.capturedAt);
               checkpoints += 1;
             }
+            for (const refusal of evaluation.riskRefusals) await inner.persistRiskRefusal(refusal);
           }
           return portOk({ decisions: decisions.length, checkpoints });
         },
@@ -114,6 +115,7 @@ async function observe(grouped: boolean, refuseSeq: number | undefined): Promise
         },
         writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
         replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+        persistRiskRefusal: (refusal) => inner.persistRiskRefusal(refusal),
         close: () => inner.close(),
         ...(grouped ? { groupCommit: group } : {}),
       };

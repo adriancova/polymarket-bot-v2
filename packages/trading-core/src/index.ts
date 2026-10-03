@@ -147,6 +147,8 @@ export {
   type GroupCommit,
   type StagedEvaluations,
   type FeedMark,
+  type DispatchPosition,
+  type RiskRefusalRecord,
 } from "./ports.js";
 
 export {
