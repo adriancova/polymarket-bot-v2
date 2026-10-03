@@ -41,6 +41,16 @@
  * - stretch C, 12:15-12:40: reference prints only — the trader keeps deciding
  *   on them, which carries its frontier past the window and its grace.
  *
+ * The trader's clock (`CO2-N1`, ADR-031, 2026-10-03): `startup()` builds its
+ * own `SystemPaperClock`, and ADR-031's entry guard reads it at admission.
+ * The timeline is months old, so the host clock as-is refused the FILL
+ * scenario's entry (`RISK_FEATURES_STALE`, `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED`)
+ * and nothing filled. While a trader runs here, every `SystemPaperClock`
+ * reads the host clock RE-BASED to the first event that trader is fed
+ * (`support/host-clock.ts`, `rebaseSystemPaperClock`). Only the trader's
+ * clock is re-based — not the global `Date` — so the research worker's
+ * "today", its 72 h expiry and its grace keep the real time.
+ *
  * Docker: Testcontainers (PostgreSQL, Redis), no skip. PAPER only; no venue,
  * no signer, no real order. The WAL root, object store and state directory
  * are throwaway temporary directories; nothing outside them is touched.
@@ -74,7 +84,7 @@ import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing
 import type { IngestedEvent } from "@polymarket-bot/trader";
 import { buildRawFrameRecord, nodeWalFileSystem, openWalWriter, type RawFrameRecord } from "@polymarket-bot/storage-wal";
 import { createManualClock } from "@polymarket-bot/storage-wal/testing";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { EXIT_CODES, REDIS_RESPONSE_TIMEOUT_ENV, startup } from "../../../apps/trader/src/main.js";
 import {
@@ -88,6 +98,7 @@ import {
   riskPolicy,
   safeEnvironment,
 } from "./support/fixture.js";
+import { rebaseSystemPaperClock } from "./support/host-clock.js";
 import { CONDITION_ID, documentFor, registerThroughTheRepositories, withFreshDatabase } from "./support/registration.js";
 
 const HOUR = 60 * 60 * 1000;
@@ -113,6 +124,11 @@ beforeAll(async () => {
 afterAll(async () => {
   await redis?.stop();
   await postgres?.stop();
+});
+
+// `CO2-N1`: a scenario that fails before it restores the trader's re-based clock leaves no spy behind.
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 async function sleep(ms: number): Promise<void> {
@@ -385,6 +401,8 @@ async function runTraderThrough(input: {
 }): Promise<readonly string[]> {
   const hop = await startFreezableRedisProxy(input.redisUrl);
   const lines: string[] = [];
+  // `CO2-N1` (ADR-031): the trader's clock, re-based to the first event it is fed.
+  const rebased = rebaseSystemPaperClock(input.events[0]?.envelope.receivedAt ?? "");
   try {
     const exit = startup({
       env: {
@@ -412,6 +430,7 @@ async function runTraderThrough(input: {
     expect(lines.join("\n")).toContain("halt record: 1 row(s) written to ops.incidents");
     return lines;
   } finally {
+    rebased.restore();
     await hop.close();
   }
 }
@@ -820,6 +839,8 @@ describe("a window whose gateway epoch ENDS inside it classifies only once the r
         await lock.query("begin");
         await lock.query("lock table accounting.ledger_transactions in share mode");
         const lines: string[] = [];
+        // `CO2-N1` (ADR-031): the trader's clock, re-based to its first event until it is partitioned.
+        const rebased = rebaseSystemPaperClock(events[0]?.envelope.receivedAt ?? "");
         const exit = startup({
           env: {
             ...safeEnvironment(),
@@ -926,6 +947,7 @@ describe("a window whose gateway epoch ENDS inside it classifies only once the r
               `${String(pinned.length)} segment(s) in the pin`,
           );
         } finally {
+          rebased.restore();
           hop.freeze();
           expect(await exit, lines.join("\n")).toBe(EXIT_CODES.halted);
           stopped = true;

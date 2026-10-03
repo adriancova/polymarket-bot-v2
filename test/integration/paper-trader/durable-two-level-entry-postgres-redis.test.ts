@@ -38,6 +38,15 @@
  * with ONE pump over the whole stream; and (`SNAP-1` r1) the SHARED-INSTANT
  * shape — see below.
  *
+ * **Dated correction (`CO2-N1`, ADR-031, 2026-10-03).** The trader's clock
+ * now gates admission: an entry whose event is older than the features bound
+ * at the clock's reading, or whose reading is inside the entry cutoff, is
+ * refused. The one-pump test's `SystemPaperClock`, as-is, reads 2026-10
+ * against these 2026-03-04 events and refused every entry; it now runs the
+ * same host clock RE-BASED to the scenario's first event
+ * (`support/host-clock.ts`): read live, advancing in real time, so the guard
+ * measures the one pump's real processing delay and admits.
+ *
  * ## Hand derivation (written before the first run)
  *
  * Fixture fee schedule: zero (taker and maker). Sizes 50 shares.
@@ -159,9 +168,10 @@ import { MISSING_PNL_SNAPSHOT_DETAIL, ManualClock, MemoryTraderStore } from "@po
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RedisMarketEventFeed } from "../../../apps/trader/src/adapters/redis-feed.js";
-import { assembleDurableTrader, SystemPaperClock } from "../../../apps/trader/src/main.js";
+import { assembleDurableTrader } from "../../../apps/trader/src/main.js";
 import { pump } from "../../../apps/trader/src/pump.js";
 import { safeEnvironment } from "./support/fixture.js";
+import { RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
   ACCOUNT,
   CONDITION_ID,
@@ -359,7 +369,8 @@ async function runTwoLevelEntry(options: {
 
     const manual =
       options.delivery === "per-event" ? new ManualClock(recordedInstant(first.envelope.receivedAt).instant) : undefined;
-    const clock: Clock = manual ?? new SystemPaperClock();
+    // `CO2-N1` (ADR-031): the host's clock, re-based to the first event.
+    const clock: Clock = manual ?? new RebasedSystemPaperClock(first.envelope.receivedAt);
 
     const lines: string[] = [];
     const assembled = await assembleDurableTrader({
@@ -755,7 +766,7 @@ describe("SNAP-1: an entry that walks two ask levels in one instant, durably, th
     expect(missing?.double).toEqual(missing?.database);
   }, 180_000);
 
-  it("the process's own SystemPaperClock and ONE pump over the whole stream give the same durable run", async () => {
+  it("the process's own SystemPaperClock (re-based to the first event, ADR-031) and ONE pump over the whole stream give the same durable run", async () => {
     const run = await runTwoLevelEntry({ label: "snap1-two-level-one-pump", delivery: "one-pump" });
     expect(run.health.halts).toEqual([]);
     expect(run.pumps).toEqual([{ polls: 2, ingested: run.events.length, stopped: "IDLE" }]);
