@@ -142,7 +142,27 @@ export interface PayloadCipher {
 /** A JSON value for `order_events.payload` (jsonb). Exact decimals stay strings. */
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-/** The OMS's view of an execution group (`execution.groups`, with the plan's post-only preference). */
+/**
+ * An execution group: every column of its `execution.groups` row (migration 0005), plus three facts of its
+ * plan (`execution.plans`): the market, the account and the post-only preference (the plan's liquidity
+ * preference, as the composition maps it).
+ *
+ * | Field | `execution.groups` column |
+ * | --- | --- |
+ * | `executionGroupId` | `execution_group_id` |
+ * | `planId` | `plan_id` (references `execution.plans`) |
+ * | `groupOrdinal` | `group_ordinal` (NOT NULL, >= 0, unique per plan) |
+ * | `groupKind` | `group_kind` (NOT NULL; SLICE or LEG) |
+ * | `tokenId` | `token_id` |
+ * | `side` | `side` |
+ * | `limitPrice` | `limit_price` (NOT NULL; [0, 1]) |
+ * | `plannedShares` | `shares` |
+ * | `releaseAfterGroupId` | `release_after_group_id` (nullable) |
+ * | `legRiskLimit` | `leg_risk_limit` (nullable) |
+ * | `marketId`, `accountRef`, `postOnly` | none: `execution.plans`' `market_id`, `account_ref`, `liquidity_preference` |
+ *
+ * `recorded_at` is the database's default.
+ */
 export interface GroupRecord {
   readonly executionGroupId: string;
   readonly planId: string;
@@ -152,6 +172,11 @@ export interface GroupRecord {
   readonly side: "BUY" | "SELL";
   readonly plannedShares: DecimalString;
   readonly postOnly: boolean;
+  readonly groupOrdinal: number;
+  readonly groupKind: "SLICE" | "LEG";
+  readonly limitPrice: DecimalString;
+  readonly releaseAfterGroupId: string | null;
+  readonly legRiskLimit: DecimalString | null;
 }
 
 /** `execution.orders` (the current projection). */
@@ -253,6 +278,13 @@ export interface TradeSettlementRecord {
   readonly observedAt: string;
 }
 
+/**
+ * One write. `INSERT_GROUP` is self-sufficient for `execution.groups`: it carries every column the table
+ * requires. Groups are part of the immutable plan (append-only), so plan persistence may already have written
+ * the row with its plan; the adapter then verifies that the existing row is identical instead of inserting.
+ * In both cases it verifies `marketId`, `accountRef` and `postOnly` against the plan's row (which must exist:
+ * `plan_id` references it). Any difference rejects the transaction, and the OMS faults (fail closed).
+ */
 export type StoreWrite =
   | { readonly kind: "INSERT_GROUP"; readonly group: GroupRecord }
   | { readonly kind: "INSERT_ORDER"; readonly order: OrderRecord }

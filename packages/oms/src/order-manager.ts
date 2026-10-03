@@ -28,7 +28,9 @@
  *   absent; or
  * - `RESPONDED` and its order is terminal with an authoritatively known final
  *   matched size and no open evidence conflict (a definitive rejection is
- *   terminal with final size 0).
+ *   terminal with final size 0), and no transmission of it is still in flight
+ *   in this process (r3: its answer could yet name another venue order, a
+ *   VENUE-ID CONFLICT, which must be seen before a new salt, not after).
  * The check and the claim of the group happen in one synchronous step, so two
  * concurrent submissions cannot both pass. The new order's size is capped by
  * the group's remaining quantity, computed exactly from the final sizes.
@@ -102,6 +104,30 @@
  * remainder stays reserved. A terminal order with an open state conflict
  * always needs that read (`#needs`), so the conflict can never be stranded:
  * not after a restart, and not when fills complete a reopened order.
+ *
+ * ## UNATTRIBUTED EVIDENCE (a fill or an observation racing its placement answer)
+ *
+ * No venue fact orders the user stream against the placement response, so a
+ * fill or an observation for our own order can arrive while its placement is
+ * still in flight (a marketable order matches at once), or while a lost
+ * response is being reconciled: before the OMS knows the order's venue id.
+ * Such evidence is never dropped while an attempt that could own it is
+ * unresolved (no venue order id yet; SENDING, SUBMISSION_UNKNOWN or
+ * RECONCILING; not held absent). It is RETAINED, in memory, with the set of
+ * those candidate attempts (the caller gets `OMS_EVIDENCE_RETAINED`; at most
+ * `MAX_RETAINED_EVIDENCE` items). When a placement answer or an authoritative
+ * read adopts that venue order id, the evidence is applied to the order
+ * through the ordinary fill and observation paths, in arrival order, and an
+ * order still open afterwards goes to RECONCILING with a fresh authoritative
+ * read (durable: a restart re-requests it). Once none of its candidates can
+ * own it any more, the evidence is released with a market-halt
+ * `UNKNOWN_VENUE_ORDER` alert naming the venue order id; with no candidate at
+ * all it is refused at once, with the same alert. Evidence beyond the bound is
+ * refused with that alert too, and every attempt that could have owned it gets
+ * the forced read once it is identified. Retained evidence dies with the
+ * process: after a restart the attempt is reconciled by its signed identity
+ * (the read carries the venue's matched size, which fixes the group's
+ * remainder; the reservation stays held until the fills are delivered again).
  *
  * ## PAUSE AND RESUME (§9.17 step 1)
  *
@@ -216,7 +242,11 @@ import { MAX_ORDERS_PER_BATCH } from "./venue-facts.js";
 
 export type Side = "BUY" | "SELL";
 
-/** An execution group (a slice or leg): every attempt of the group shares the salt gate. */
+/**
+ * An execution group (a slice or leg): every attempt of the group shares the salt gate. It carries every
+ * column of its `execution.groups` row (migration 0005; `GroupRecord`), plus the plan's market, account and
+ * post-only preference.
+ */
 export interface GroupSpec {
   readonly executionGroupId: string;
   readonly planId: string;
@@ -224,11 +254,24 @@ export interface GroupSpec {
   readonly tokenId: string;
   readonly accountRef: string;
   readonly side: Side;
-  /** The group's total planned shares; every attempt is capped by what remains of it. */
+  /** The group's total planned shares (`groups.shares`); every attempt is capped by what remains of it. */
   readonly plannedShares: DecimalString;
   /** Fixed for the group: changing an order to post-only is a new plan (ADR-007 §7). */
   readonly postOnly: boolean;
+  /** `groups.group_ordinal`: unique within the plan, at least 0. */
+  readonly groupOrdinal: number;
+  /** `groups.group_kind`. */
+  readonly groupKind: GroupKind;
+  /** `groups.limit_price`: a canonical decimal in [0, 1] (`internal.price_string`). */
+  readonly limitPrice: DecimalString;
+  /** `groups.release_after_group_id` (nullable); omitted: `null`. */
+  readonly releaseAfterGroupId?: string | null;
+  /** `groups.leg_risk_limit` (nullable); omitted: `null`. */
+  readonly legRiskLimit?: DecimalString | null;
 }
+
+/** `internal.execution_group_kind` (migration 0001). */
+export type GroupKind = "SLICE" | "LEG";
 
 /** One intent's share of an order (`execution.intent_order_links`; ADR-006 §4). */
 export interface AttributionSpec {
@@ -312,13 +355,30 @@ export interface OmsAlert {
     | "SETTLEMENT_FAILED"
     | "SETTLEMENT_CONFLICT"
     | "PAYLOAD_UNREADABLE"
-    | "RECONCILIATION_UNDELIVERED";
+    | "RECONCILIATION_UNDELIVERED"
+    | "EVIDENCE_UNAPPLIED";
   /** True when the affected market should stop taking new entries (§6 invariant 7, §9.9). */
   readonly haltMarket: boolean;
   readonly marketId: string | null;
   readonly orderId: string | null;
   readonly submissionAttemptId: string | null;
+  /**
+   * The venue order id the evidence named: the unknown id of an `UNKNOWN_VENUE_ORDER` alert, the conflicting
+   * id of a venue-id conflict; otherwise the order's own venue order id, when known.
+   */
+  readonly venueOrderId: string | null;
   readonly detail: string;
+}
+
+/** One item of UNATTRIBUTED EVIDENCE (see the header) the manager holds while an attempt that could own it is unresolved. */
+export interface RetainedEvidenceView {
+  readonly kind: "FILL" | "OBSERVATION";
+  readonly venueOrderId: string;
+  /** A fill's trade id and discriminator; `null` for an observation. */
+  readonly venueTradeId: string | null;
+  readonly allocationDiscriminator: string | null;
+  /** The attempts that could own it when it arrived (unresolved, without a venue order id). */
+  readonly candidateAttemptIds: readonly string[];
 }
 
 export interface SubmissionReport {
@@ -402,6 +462,8 @@ export interface OrderManagerDependencies {
 export const MAX_REQUEST_TOKEN_LENGTH = 128;
 /** At most this many intents may share one order. */
 export const MAX_ATTRIBUTIONS_PER_ORDER = 64;
+/** At most this many items of UNATTRIBUTED EVIDENCE (see the header) are retained at once. */
+export const MAX_RETAINED_EVIDENCE = 1024;
 
 // ---------------------------------------------------------------------------
 // Internal models.
@@ -502,8 +564,17 @@ interface FillModel {
   readonly debit: DecimalString;
   settlement: SettlementState | null;
   settlementOrdinal: number;
-  /** The transaction hash the latest settlement row recorded (for the current state), or `null`. */
-  transactionHash: string | null;
+  /** Every transaction hash recorded for the CURRENT settlement state (a repeat of any of them is a duplicate). */
+  stateHashes: Set<string>;
+}
+
+/** One item of UNATTRIBUTED EVIDENCE (see the header). Exactly one of `fill` and `observation` is set. */
+interface RetainedEvidence {
+  readonly venueOrderId: string;
+  readonly fill: ValidatedFill | null;
+  /** An observation: its status, or `null` for an unrecognised one. */
+  readonly observation: { readonly status: ObservedStatus | null } | null;
+  readonly candidates: ReadonlySet<string>;
 }
 
 interface ValidatedTicket {
@@ -589,6 +660,10 @@ export class OrderManager {
   readonly #usedIds = new Set<string>();
   readonly #usedTokens = new Set<string>();
   readonly #namedUnissued = new Set<string>();
+  /** UNATTRIBUTED EVIDENCE, in arrival order (memory only). */
+  readonly #retained: RetainedEvidence[] = [];
+  /** Attempts that could have owned evidence refused at the bound: each gets a forced read once identified. */
+  readonly #evidenceLost = new Set<string>();
   readonly #alerts: OmsAlert[] = [];
   #faulted = false;
   #paused = false;
@@ -674,6 +749,21 @@ export class OrderManager {
     return count;
   }
 
+  /** UNATTRIBUTED EVIDENCE still held, in arrival order (see the header). */
+  retainedEvidence(): readonly RetainedEvidenceView[] {
+    return Object.freeze(
+      this.#retained.map((item) =>
+        Object.freeze({
+          kind: item.fill === null ? ("OBSERVATION" as const) : ("FILL" as const),
+          venueOrderId: item.venueOrderId,
+          venueTradeId: item.fill?.venueTradeId ?? null,
+          allocationDiscriminator: item.fill?.allocationDiscriminator ?? null,
+          candidateAttemptIds: Object.freeze([...item.candidates]),
+        }),
+      ),
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Groups.
 
@@ -681,13 +771,27 @@ export class OrderManager {
     return this.#guarded(async () => {
       const group = readGroup(raw);
       if (group === undefined) {
-        return refuse("OMS_INVALID_INPUT", "a group needs UUIDv7 executionGroupId, planId and marketId, a token id, an account, a side, positive plannedShares and a boolean postOnly");
+        return refuse(
+          "OMS_INVALID_INPUT",
+          "a group needs UUIDv7 executionGroupId, planId and marketId, a token id, an account, a side, positive plannedShares, a boolean postOnly, " +
+            "and its execution.groups columns: a groupOrdinal >= 0, a groupKind (SLICE or LEG), a limitPrice in [0, 1], " +
+            "and optionally a UUIDv7 releaseAfterGroupId and a non-negative legRiskLimit",
+        );
       }
       const existing = this.#groups.get(group.executionGroupId);
       if (existing !== undefined) {
         return sameGroup(existing.record, group)
           ? ok(existing.record)
           : refuse("OMS_DUPLICATE_GROUP", "this group id is registered with different facts", { executionGroupId: group.executionGroupId });
+      }
+      // `groups_ordinal_unique (plan_id, group_ordinal)`: one ordinal names one group of a plan.
+      for (const other of this.#groups.values()) {
+        if (other.record.planId === group.planId && other.record.groupOrdinal === group.groupOrdinal) {
+          return refuse("OMS_DUPLICATE_GROUP", "another group of this plan holds this group ordinal", {
+            executionGroupId: group.executionGroupId,
+            groupOrdinal: group.groupOrdinal,
+          });
+        }
       }
       this.#groups.set(group.executionGroupId, { record: group, attemptIds: [], orderIds: [], claim: null, staged: null, nextOrdinal: 1 });
       const persisted = await this.#persist([{ kind: "INSERT_GROUP", group }]);
@@ -1048,7 +1152,9 @@ export class OrderManager {
    * (`VENUE_FACTS.UNMATCHED_ACCEPTED_NOT_FILLED`). An unrecognised status
    * sends a non-terminal order to RECONCILING. On a terminal order, a status
    * that contradicts it and an unrecognised status alike reopen it to
-   * RECONCILING with a state conflict (STATE CONFLICTS in the header).
+   * RECONCILING with a state conflict (STATE CONFLICTS in the header). An
+   * observation naming a venue order id no order holds yet is retained while
+   * an unresolved attempt could own it (UNATTRIBUTED EVIDENCE).
    */
   async applyOrderObservation(raw: unknown): Promise<OmsResult<OrderView>> {
     return this.#guarded(async () => {
@@ -1056,39 +1162,41 @@ export class OrderManager {
       if (fields === undefined || !isVenueId(fields.venueOrderId)) {
         return refuse("OMS_OBSERVATION_UNRECOGNISED", "an observation needs a venue order id, as own data");
       }
+      const status = isObservedStatus(fields.status) ? fields.status : null;
       const orderId = this.#ordersByVenueId.get(fields.venueOrderId);
-      if (orderId === undefined) {
-        this.#alert("UNKNOWN_VENUE_ORDER", true, null, null, null, "an observation names a venue order this manager does not hold");
-        return refuse("OMS_UNKNOWN_VENUE_ORDER", "no order holds this venue order id");
-      }
-      const order = this.#mustOrder(orderId);
-      const attempt = this.#mustAttempt(order.attemptId);
-      const fx = effects();
-      const status = fields.status;
-      if (!isObservedStatus(status)) {
-        if (TERMINAL_ORDER_STATES.has(order.state)) {
-          // Never an assumption that an unknown status is harmless: reopen and read (STATE CONFLICTS).
-          this.#reopenTerminal(order, attempt, "OBSERVATION_UNRECOGNISED", "a terminal order was observed with an unrecognised status", fx, {
-            reasonCode: "UNRECOGNISED_STATUS",
-          });
-        } else if (order.state !== "RECONCILING") {
-          this.#transition(order, "RECONCILING", "OBSERVATION_UNRECOGNISED", fx, { reasonCode: "UNRECOGNISED_STATUS", source: "polymarket" });
-          fx.requests.add(attempt);
-        }
-        if (!(await this.#commit(fx))) return storeFailed();
-        return ok(this.#orderView(order));
-      }
-      this.#applyObservation(order, attempt, status, fx);
-      if (!(await this.#commit(fx))) return storeFailed();
-      return ok(this.#orderView(order));
+      if (orderId === undefined) return this.#unattributed({ venueOrderId: fields.venueOrderId, fill: null, observation: { status } });
+      return this.#observe(this.#mustOrder(orderId), status);
     });
+  }
+
+  /** An observation of an order this manager holds; `status` is `null` when unrecognised. */
+  async #observe(order: OrderModel, status: ObservedStatus | null): Promise<OmsResult<OrderView>> {
+    const attempt = this.#mustAttempt(order.attemptId);
+    const fx = effects();
+    if (status === null) {
+      if (TERMINAL_ORDER_STATES.has(order.state)) {
+        // Never an assumption that an unknown status is harmless: reopen and read (STATE CONFLICTS).
+        this.#reopenTerminal(order, attempt, "OBSERVATION_UNRECOGNISED", "a terminal order was observed with an unrecognised status", fx, {
+          reasonCode: "UNRECOGNISED_STATUS",
+        });
+      } else if (order.state !== "RECONCILING") {
+        this.#transition(order, "RECONCILING", "OBSERVATION_UNRECOGNISED", fx, { reasonCode: "UNRECOGNISED_STATUS", source: "polymarket" });
+        fx.requests.add(attempt);
+      }
+    } else {
+      this.#applyObservation(order, attempt, status, fx);
+    }
+    if (!(await this.#commit(fx))) return storeFailed();
+    return ok(this.#orderView(order));
   }
 
   /**
    * One fill (a venue trade against our order). Deduplicated on (trade id,
    * order id, discriminator) (§10.7). A fill that contradicts its order (wrong
    * side of the limit, more than the order, more than a confirmed final size)
-   * is refused with a market-halt alert: reconciliation owns it (WP-290).
+   * is refused with a market-halt alert: reconciliation owns it (WP-290). A
+   * fill naming a venue order id no order holds yet is retained while an
+   * unresolved attempt could own it (UNATTRIBUTED EVIDENCE).
    */
   async recordFill(raw: unknown): Promise<OmsResult<OrderView>> {
     return this.#guarded(async () => {
@@ -1097,96 +1205,103 @@ export class OrderManager {
         return refuse("OMS_INVALID_INPUT", "a fill needs trade and order ids, positive shares, a unit price, a liquidity role and matchedAt");
       }
       const orderId = this.#ordersByVenueId.get(fill.venueOrderId);
-      if (orderId === undefined) {
-        this.#alert("UNKNOWN_VENUE_ORDER", true, null, null, null, "a fill names a venue order this manager does not hold");
-        return refuse("OMS_UNKNOWN_VENUE_ORDER", "no order holds this venue order id");
-      }
-      const order = this.#mustOrder(orderId);
-      const key = fillKey(fill.venueTradeId, fill.venueOrderId, fill.allocationDiscriminator);
-      const existing = this.#fills.get(key);
-      if (existing !== undefined) {
-        // Every fact of the fill must agree: the money (shares, price, fee), the liquidity role, and the match
-        // time as an instant (offsets applied; the coarser text the finer one truncated or rounded: `sameInstant`).
-        const same =
-          existing.record.shares === fill.shares &&
-          existing.record.price === fill.price &&
-          existing.record.feeAmount === fill.feeAmount &&
-          existing.record.feeAssetId === fill.feeAssetId &&
-          existing.record.liquidityRole === fill.liquidityRole &&
-          sameInstant(existing.record.matchedAt, fill.matchedAt);
-        if (same) return ok(this.#orderView(order));
-        this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, order.attemptId, "a fill was reported twice with different facts");
-        return refuse("OMS_FILL_CONFLICT", "this fill is already recorded with different facts");
-      }
-      const inconsistent = this.#fillInconsistency(order, fill);
-      if (inconsistent !== undefined) {
-        this.#alert("FILL_INCONSISTENT", true, order.marketId, order.orderId, order.attemptId, inconsistent);
-        return refuse("OMS_FILL_INCONSISTENT", inconsistent, { orderId: order.orderId });
-      }
-      const fillId = this.#drawId();
-      if (fillId === undefined) return refuse("OMS_ID_SOURCE_FAILED", "the id source gave no fresh UUIDv7");
-      const fx = effects();
-      const debit = this.#debitOf(order, fill);
-      const before = order.filledShares;
-      const after = addDecimal(before, fill.shares);
-      const record: FillRecord = Object.freeze({
-        fillId,
-        orderId: order.orderId,
-        marketId: order.marketId,
-        tokenId: order.tokenId,
-        accountRef: order.accountRef,
-        venueTradeId: fill.venueTradeId,
-        venueOrderId: fill.venueOrderId,
-        allocationDiscriminator: fill.allocationDiscriminator,
-        side: order.side,
-        shares: fill.shares,
-        price: fill.price,
-        notional: mulDecimal(fill.shares, fill.price),
-        feeAmount: fill.feeAmount,
-        feeAssetId: fill.feeAssetId,
-        liquidityRole: fill.liquidityRole,
-        matchedAt: fill.matchedAt,
-      });
-      const allocations = allocationsFor(order, fillId, before, after);
-      this.#fills.set(key, { record, debit, settlement: null, settlementOrdinal: 0, transactionHash: null });
-      order.filledShares = after;
-      order.debited = addDecimal(order.debited, debit);
-      fx.writes.push({ kind: "INSERT_FILL", fill: record, allocations });
-      const complete = compareDecimal(after, order.originalShares) === 0;
-      const payload = { debit, fillId };
-      if (complete && !TERMINAL_ORDER_STATES.has(order.state)) {
-        this.#transition(order, "FILLED", "FILL", fx, { sharesDelta: fill.shares, source: "polymarket", payload: { ...payload, finalSize: order.originalShares } });
-        order.finalSize = order.originalShares;
-        const attempt = this.#mustAttempt(order.attemptId);
-        this.#consumeCurrentRequest(attempt);
-      } else if (order.state === "ACKNOWLEDGED" || order.state === "LIVE" || order.state === "DELAYED") {
-        this.#transition(order, "PARTIALLY_FILLED", "FILL", fx, { sharesDelta: fill.shares, source: "polymarket", payload });
-      } else {
-        this.#record(order, "FILL", fx, { sharesDelta: fill.shares, source: "polymarket", payload });
-      }
-      // A read outstanding for this order may predate the fill (and so under-report the matched size):
-      // supersede it, so only a read requested after this fill can describe the order (WP-300 R7-X3's rule).
-      const owner = this.#mustAttempt(order.attemptId);
-      if (owner.currentRequestId !== null && order.state !== "FILLED") fx.requests.add(owner);
-      // A filled order needs no read, unless it carries an open state conflict (STATE CONFLICTS): then it needs
-      // the read that can clear it, made after this fill.
-      if (order.state === "FILLED" && order.conflict) fx.requests.add(owner);
-      if (!(await this.#commit(fx))) return storeFailed();
-      // Durable first, then consume (a replayed consume is a duplicate pending id: done).
-      await this.#consume(order, record, debit);
-      await this.#maybeRelease(order);
-      if (!(await this.#settled())) return storeFailed();
-      return ok(this.#orderView(order));
+      if (orderId === undefined) return this.#unattributed({ venueOrderId: fill.venueOrderId, fill, observation: null });
+      return this.#applyFill(this.#mustOrder(orderId), fill);
     });
+  }
+
+  /**
+   * A fill of an order this manager holds. Every decision is taken synchronously, before the first await, so
+   * that taking a retained fill and deciding on it happen in one step (`#drainRetained`).
+   */
+  async #applyFill(order: OrderModel, fill: ValidatedFill): Promise<OmsResult<OrderView>> {
+    const key = fillKey(fill.venueTradeId, fill.venueOrderId, fill.allocationDiscriminator);
+    const existing = this.#fills.get(key);
+    if (existing !== undefined) {
+      // Every fact of the fill must agree: the money (shares, price, fee), the liquidity role, and the match
+      // time as an instant (offsets applied; the coarser text the finer one truncated or rounded: `sameInstant`).
+      const same =
+        existing.record.shares === fill.shares &&
+        existing.record.price === fill.price &&
+        existing.record.feeAmount === fill.feeAmount &&
+        existing.record.feeAssetId === fill.feeAssetId &&
+        existing.record.liquidityRole === fill.liquidityRole &&
+        sameInstant(existing.record.matchedAt, fill.matchedAt);
+      if (same) return ok(this.#orderView(order));
+      this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, order.attemptId, "a fill was reported twice with different facts");
+      return refuse("OMS_FILL_CONFLICT", "this fill is already recorded with different facts");
+    }
+    const inconsistent = this.#fillInconsistency(order, fill);
+    if (inconsistent !== undefined) {
+      this.#alert("FILL_INCONSISTENT", true, order.marketId, order.orderId, order.attemptId, inconsistent);
+      return refuse("OMS_FILL_INCONSISTENT", inconsistent, { orderId: order.orderId });
+    }
+    const fillId = this.#drawId();
+    if (fillId === undefined) return refuse("OMS_ID_SOURCE_FAILED", "the id source gave no fresh UUIDv7");
+    const fx = effects();
+    const debit = this.#debitOf(order, fill);
+    const before = order.filledShares;
+    const after = addDecimal(before, fill.shares);
+    const record: FillRecord = Object.freeze({
+      fillId,
+      orderId: order.orderId,
+      marketId: order.marketId,
+      tokenId: order.tokenId,
+      accountRef: order.accountRef,
+      venueTradeId: fill.venueTradeId,
+      venueOrderId: fill.venueOrderId,
+      allocationDiscriminator: fill.allocationDiscriminator,
+      side: order.side,
+      shares: fill.shares,
+      price: fill.price,
+      notional: mulDecimal(fill.shares, fill.price),
+      feeAmount: fill.feeAmount,
+      feeAssetId: fill.feeAssetId,
+      liquidityRole: fill.liquidityRole,
+      matchedAt: fill.matchedAt,
+    });
+    const allocations = allocationsFor(order, fillId, before, after);
+    this.#fills.set(key, { record, debit, settlement: null, settlementOrdinal: 0, stateHashes: new Set() });
+    order.filledShares = after;
+    order.debited = addDecimal(order.debited, debit);
+    fx.writes.push({ kind: "INSERT_FILL", fill: record, allocations });
+    const complete = compareDecimal(after, order.originalShares) === 0;
+    const payload = { debit, fillId };
+    if (complete && !TERMINAL_ORDER_STATES.has(order.state)) {
+      this.#transition(order, "FILLED", "FILL", fx, { sharesDelta: fill.shares, source: "polymarket", payload: { ...payload, finalSize: order.originalShares } });
+      order.finalSize = order.originalShares;
+      const attempt = this.#mustAttempt(order.attemptId);
+      this.#consumeCurrentRequest(attempt);
+    } else if (order.state === "ACKNOWLEDGED" || order.state === "LIVE" || order.state === "DELAYED") {
+      this.#transition(order, "PARTIALLY_FILLED", "FILL", fx, { sharesDelta: fill.shares, source: "polymarket", payload });
+    } else {
+      this.#record(order, "FILL", fx, { sharesDelta: fill.shares, source: "polymarket", payload });
+    }
+    // A read outstanding for this order may predate the fill (and so under-report the matched size):
+    // supersede it, so only a read requested after this fill can describe the order (WP-300 R7-X3's rule).
+    const owner = this.#mustAttempt(order.attemptId);
+    if (owner.currentRequestId !== null && order.state !== "FILLED") fx.requests.add(owner);
+    // A filled order needs no read, unless it carries an open state conflict (STATE CONFLICTS): then it needs
+    // the read that can clear it, made after this fill.
+    if (order.state === "FILLED" && order.conflict) fx.requests.add(owner);
+    if (!(await this.#commit(fx))) return storeFailed();
+    // Durable first, then consume (a replayed consume is a duplicate pending id: done).
+    await this.#consume(order, record, debit);
+    await this.#maybeRelease(order);
+    if (!(await this.#settled())) return storeFailed();
+    return ok(this.#orderView(order));
   }
 
   /**
    * One trade-settlement observation (§9.11 trade settlement machine; §6
    * invariant 5). Stale deliveries are refused; CONFIRMED against FAILED is a
    * conflict; FAILED raises a halt alert (ADR-006 §5: a compensating reversal
-   * is the ledger's). A repeated state is idempotent unless it carries a new
-   * transaction hash, which is appended as a same-state row (the log keeps the
-   * enrichment, or the contradiction with a non-halting alert).
+   * is the ledger's). A repeated state is idempotent unless it carries a
+   * transaction hash not yet recorded for that state, which is appended as a
+   * same-state row (the log keeps the enrichment, or the contradiction with a
+   * non-halting alert). A hash already recorded for the state is a duplicate,
+   * whichever row recorded it (r3, OP-R3-01: two sources alternating between
+   * two hashes add one row and one alert, not one per report).
    */
   async applySettlement(raw: unknown): Promise<OmsResult<SettlementState>> {
     return this.#guarded(async () => {
@@ -1212,12 +1327,13 @@ export class OrderManager {
       const current = fill.settlement;
       const transactionHash = (fields.transactionHash as string | null | undefined) ?? null;
       if (current === status) {
-        // The same state again. Without a new transaction hash it is a duplicate (idempotent). With one, it is
-        // evidence the append-only log keeps, as a same-state row: a hash the earlier report lacked, or one that
-        // differs from the hash recorded, which also raises a non-halting alert (no venue fact says whether a
-        // state can be re-reported in another transaction, so it is recorded, not judged).
-        if (transactionHash === null || transactionHash === fill.transactionHash) return ok(status);
-        if (fill.transactionHash !== null) {
+        // The same state again. Without a transaction hash, or with one already recorded for this state, it is
+        // a duplicate (idempotent). With a new one, it is evidence the append-only log keeps, as a same-state
+        // row: a hash the earlier reports lacked, or one that differs from every hash recorded, which also
+        // raises a non-halting alert (no venue fact says whether a state can be re-reported in another
+        // transaction, so it is recorded, not judged).
+        if (transactionHash === null || fill.stateHashes.has(transactionHash)) return ok(status);
+        if (fill.stateHashes.size > 0) {
           this.#alert(
             "SETTLEMENT_CONFLICT",
             false,
@@ -1246,9 +1362,11 @@ export class OrderManager {
         transactionHash,
         observedAt: fields.observedAt,
       });
+      // A new state starts its own set of recorded hashes.
+      if (current !== status) fill.stateHashes = new Set();
+      if (transactionHash !== null) fill.stateHashes.add(transactionHash);
       fill.settlement = status;
       fill.settlementOrdinal += 1;
-      fill.transactionHash = transactionHash;
       if (status === "FAILED" && current !== "FAILED") {
         this.#alert("SETTLEMENT_FAILED", true, order.marketId, order.orderId, order.attemptId, "a trade settlement FAILED; the ledger owes a compensating reversal");
       }
@@ -1644,6 +1762,8 @@ export class OrderManager {
       else this.#applyPlacement(attempt, order, cls, outcome);
     }
     if (!(await this.#commit(outcome))) return storeFailed();
+    // UNATTRIBUTED EVIDENCE: a fill or an observation that raced this answer is applied now (or released).
+    if (!(await this.#drainRetained())) return storeFailed();
     return ok(
       Object.freeze(
         items.map(({ attempt, order }, index) => this.#report(attempt, order, classes[index] ?? null)),
@@ -1751,12 +1871,126 @@ export class OrderManager {
   /** Record a sticky, durable VENUE-ID CONFLICT (see the header), with a market-halt alert. */
   #markVenueIdConflict(order: OrderModel, attempt: AttemptModel, conflictingVenueOrderId: string, eventType: string, detail: string, fx: Effects): void {
     order.venueIdConflict = true;
-    this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, detail);
+    this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, detail, conflictingVenueOrderId);
     this.#record(order, eventType, fx, { reasonCode: "VENUE_ID_CONFLICT", source: "polymarket", payload: { conflictingVenueOrderId } });
   }
 
   #conflicted(order: OrderModel): boolean {
     return order.conflict || order.venueIdConflict;
+  }
+
+  // ----- unattributed evidence (see UNATTRIBUTED EVIDENCE in the header) ------
+
+  /**
+   * Whether an attempt could own a venue order id the OMS does not yet know: it has none yet and may have
+   * reached the venue (SENDING, SUBMISSION_UNKNOWN, or RECONCILING without a quiescent ABSENT holding it).
+   */
+  #couldOwn(attempt: AttemptModel | undefined): boolean {
+    if (attempt === undefined || attempt.venueOrderId !== null) return false;
+    if (attempt.state === "SENDING" || attempt.state === "SUBMISSION_UNKNOWN") return true;
+    return attempt.state === "RECONCILING" && !(attempt.absentConfirmed && !attempt.inFlight);
+  }
+
+  /** Evidence naming a venue order id no order holds: retained while an unresolved attempt could own it. */
+  #unattributed(item: Omit<RetainedEvidence, "candidates">): OmsResult<never> {
+    const what = item.fill === null ? "an observation" : "a fill";
+    const candidates = new Set<string>();
+    for (const attempt of this.#attempts.values()) if (this.#couldOwn(attempt)) candidates.add(attempt.attemptId);
+    if (candidates.size === 0) {
+      this.#alert("UNKNOWN_VENUE_ORDER", true, null, null, null, `${what} names a venue order this manager does not hold`, item.venueOrderId);
+      return refuse("OMS_UNKNOWN_VENUE_ORDER", "no order holds this venue order id, and no unresolved attempt could", { venueOrderId: item.venueOrderId });
+    }
+    // The same evidence again (a redelivery) is held once.
+    const duplicate = this.#retained.some(
+      (held) =>
+        held.venueOrderId === item.venueOrderId &&
+        (item.fill === null
+          ? held.observation !== null && held.observation.status === item.observation?.status
+          : held.fill !== null && sameReportedFill(held.fill, item.fill)),
+    );
+    if (!duplicate) {
+      if (this.#retained.length >= MAX_RETAINED_EVIDENCE) {
+        for (const attemptId of candidates) this.#evidenceLost.add(attemptId);
+        this.#alert(
+          "UNKNOWN_VENUE_ORDER",
+          true,
+          null,
+          null,
+          null,
+          `${what} names a venue order no order holds yet, and no more evidence can be retained; the attempts that could own it get a fresh read once identified`,
+          item.venueOrderId,
+        );
+        return refuse("OMS_UNKNOWN_VENUE_ORDER", "no order holds this venue order id yet, and the retained-evidence bound is reached", {
+          venueOrderId: item.venueOrderId,
+          bound: MAX_RETAINED_EVIDENCE,
+        });
+      }
+      this.#retained.push(Object.freeze({ ...item, candidates }));
+    }
+    return refuse(
+      "OMS_EVIDENCE_RETAINED",
+      "no order holds this venue order id yet; an unresolved attempt may own it, so the evidence is kept and applied when that attempt's venue order id is known",
+      { venueOrderId: item.venueOrderId, candidateAttempts: candidates.size },
+    );
+  }
+
+  /**
+   * Run after anything that can adopt a venue order id or resolve an attempt (a placement answer, an
+   * authoritative read): apply the retained evidence an order now holds, in arrival order; release, with a
+   * market-halt alert naming its venue order id, the evidence no candidate can own any more; then give every
+   * order that evidence touched, if still open, a fresh authoritative read (RECONCILING, durable).
+   * Returns whether everything it wrote is durable.
+   */
+  async #drainRetained(): Promise<boolean> {
+    if (this.#faulted) return false;
+    if (this.#retained.length === 0 && this.#evidenceLost.size === 0) return this.#settled();
+    const touched = new Set<OrderModel>();
+    for (const item of [...this.#retained]) {
+      const index = this.#retained.indexOf(item);
+      if (index < 0) continue; // a concurrent drain has taken it
+      const orderId = this.#ordersByVenueId.get(item.venueOrderId);
+      if (orderId === undefined) {
+        if ([...item.candidates].some((attemptId) => this.#couldOwn(this.#attempts.get(attemptId)))) continue;
+        this.#retained.splice(index, 1);
+        this.#alert(
+          "UNKNOWN_VENUE_ORDER",
+          true,
+          null,
+          null,
+          null,
+          `${item.fill === null ? "an observation" : "a fill"} named a venue order that no unresolved attempt turned out to own`,
+          item.venueOrderId,
+        );
+        continue;
+      }
+      const order = this.#mustOrder(orderId);
+      touched.add(order);
+      // Taken and decided in one synchronous step: both appliers decide before their first await.
+      this.#retained.splice(index, 1);
+      const result = item.fill !== null ? await this.#applyFill(order, item.fill) : await this.#observe(order, item.observation?.status ?? null);
+      if (this.#faulted) return false;
+      if (!result.ok && result.refusal.code === "OMS_ID_SOURCE_FAILED") {
+        this.#alert("EVIDENCE_UNAPPLIED", true, order.marketId, order.orderId, order.attemptId, "a retained fill could not be recorded (the id source failed); deliver it again");
+      }
+    }
+    for (const attemptId of [...this.#evidenceLost]) {
+      const attempt = this.#attempts.get(attemptId);
+      if (attempt !== undefined && attempt.venueOrderId !== null) {
+        this.#evidenceLost.delete(attemptId);
+        touched.add(this.#mustOrder(attempt.orderId));
+      } else if (!this.#couldOwn(attempt)) {
+        this.#evidenceLost.delete(attemptId);
+      }
+    }
+    const fx = effects();
+    for (const order of touched) {
+      // The placement answer and the stream raced: an authoritative read settles what the order is now.
+      if (order.state === "ACKNOWLEDGED" || order.state === "LIVE" || order.state === "DELAYED" || order.state === "PARTIALLY_FILLED") {
+        this.#transition(order, "RECONCILING", "RECONCILIATION_REQUESTED", fx, { reasonCode: "UNATTRIBUTED_EVIDENCE" });
+        fx.requests.add(this.#mustAttempt(order.attemptId));
+      }
+    }
+    return this.#commit(fx);
   }
 
   // ----- reconciliation -----------------------------------------------------
@@ -1864,6 +2098,8 @@ export class OrderManager {
       fx.releases.add(order);
     }
     if (!(await this.#commit(fx))) return storeFailed();
+    // The attempt can no longer own unattributed evidence: release what none of its candidates can own.
+    if (!(await this.#drainRetained())) return storeFailed();
     return ok(this.#attemptView(attempt));
   }
 
@@ -1939,6 +2175,8 @@ export class OrderManager {
     }
     if (order.finalSize !== null) fx.releases.add(order);
     if (!(await this.#commit(fx))) return storeFailed();
+    // UNATTRIBUTED EVIDENCE: evidence retained for the venue order id this read may have adopted is applied now.
+    if (!(await this.#drainRetained())) return storeFailed();
     return ok(this.#attemptView(attempt));
   }
 
@@ -2162,6 +2400,9 @@ export class OrderManager {
       if (!TERMINAL_ORDER_STATES.has(order.state)) blockers.push({ id: attemptId, reason: `ORDER_${order.state}` });
       else if (order.finalSize === null) blockers.push({ id: attemptId, reason: "FINAL_SIZE_UNCONFIRMED" });
       else if (this.#conflicted(order)) blockers.push({ id: attemptId, reason: "EVIDENCE_CONFLICT" });
+      // An authoritative read may close the order while its own placement call is still pending (after a watchdog
+      // timeout). That call's answer can still name another venue order (a VENUE-ID CONFLICT): wait for it.
+      else if (attempt.inFlight) blockers.push({ id: attemptId, reason: "TRANSMISSION_IN_FLIGHT" });
     }
     let remaining: DecimalString | null = group.record.plannedShares;
     for (const orderId of group.orderIds) {
@@ -2433,8 +2674,11 @@ export class OrderManager {
     orderId: string | null,
     submissionAttemptId: string | null,
     detail: string,
+    /** The venue order id the evidence named; omitted: the order's own venue order id, when known. */
+    venueOrderId?: string,
   ): void {
-    this.#alerts.push(Object.freeze({ kind, haltMarket, marketId, orderId, submissionAttemptId, detail }));
+    const named = venueOrderId ?? (orderId === null ? null : (this.#orders.get(orderId)?.venueOrderId ?? null));
+    this.#alerts.push(Object.freeze({ kind, haltMarket, marketId, orderId, submissionAttemptId, venueOrderId: named, detail }));
   }
 
   #mustOrder(orderId: string): OrderModel {
@@ -2607,7 +2851,7 @@ export class OrderManager {
         debit,
         settlement: null,
         settlementOrdinal: 0,
-        transactionHash: null,
+        stateHashes: new Set(),
       });
       this.#usedIds.add(record.fillId);
     }
@@ -2616,9 +2860,11 @@ export class OrderManager {
     for (const settlement of [...snapshot.settlements].sort((a, b) => a.stateOrdinal - b.stateOrdinal)) {
       const fill = fillById.get(settlement.fillId);
       if (fill === undefined) return refuse("OMS_INVALID_INPUT", "a settlement names an unknown fill");
+      // The hashes recorded for the current state (OP-R3-01): a state change starts a new set.
+      if (fill.settlement !== settlement.state) fill.stateHashes = new Set();
+      if (settlement.transactionHash !== null) fill.stateHashes.add(settlement.transactionHash);
       fill.settlement = settlement.state;
       fill.settlementOrdinal = settlement.stateOrdinal + 1;
-      fill.transactionHash = settlement.transactionHash;
     }
     // Normalize what a crash can leave behind, then reconcile.
     let unresolved = false;
@@ -2898,6 +3144,21 @@ function sameInstant(a: string, b: string): boolean {
   return 2n * excess >= -unit && excess < unit;
 }
 
+/** Whether two reports describe the same fill: the same key and every fact of it (as `#applyFill`'s deduplication). */
+function sameReportedFill(a: ValidatedFill, b: ValidatedFill): boolean {
+  return (
+    a.venueTradeId === b.venueTradeId &&
+    a.venueOrderId === b.venueOrderId &&
+    a.allocationDiscriminator === b.allocationDiscriminator &&
+    a.shares === b.shares &&
+    a.price === b.price &&
+    a.feeAmount === b.feeAmount &&
+    a.feeAssetId === b.feeAssetId &&
+    a.liquidityRole === b.liquidityRole &&
+    sameInstant(a.matchedAt, b.matchedAt)
+  );
+}
+
 interface ValidatedFill {
   readonly venueTradeId: string;
   readonly venueOrderId: string;
@@ -2954,8 +3215,24 @@ function readFill(raw: unknown): ValidatedFill | undefined {
 }
 
 function readGroup(raw: unknown): GroupRecord | undefined {
-  const fields = readFields(raw, ["executionGroupId", "planId", "marketId", "tokenId", "accountRef", "side", "plannedShares", "postOnly"]);
+  const fields = readFields(raw, [
+    "executionGroupId",
+    "planId",
+    "marketId",
+    "tokenId",
+    "accountRef",
+    "side",
+    "plannedShares",
+    "postOnly",
+    "groupOrdinal",
+    "groupKind",
+    "limitPrice",
+    "releaseAfterGroupId",
+    "legRiskLimit",
+  ]);
   if (fields === undefined) return undefined;
+  const releaseAfter = fields.releaseAfterGroupId ?? null;
+  const legRiskLimit = fields.legRiskLimit ?? null;
   if (
     !isUuidV7(fields.executionGroupId) ||
     !isUuidV7(fields.planId) ||
@@ -2964,7 +3241,17 @@ function readGroup(raw: unknown): GroupRecord | undefined {
     !isIdentifier(fields.accountRef) ||
     (fields.side !== "BUY" && fields.side !== "SELL") ||
     !isPositiveAmount(fields.plannedShares) ||
-    typeof fields.postOnly !== "boolean"
+    typeof fields.postOnly !== "boolean" ||
+    // The `execution.groups` columns (migration 0005): `groups_ordinal_non_negative`, the
+    // `execution_group_kind` enum, `internal.price_string`, a self-reference, a non-negative limit.
+    typeof fields.groupOrdinal !== "number" ||
+    !Number.isSafeInteger(fields.groupOrdinal) ||
+    fields.groupOrdinal < 0 ||
+    fields.groupOrdinal > 2_147_483_647 ||
+    (fields.groupKind !== "SLICE" && fields.groupKind !== "LEG") ||
+    !isUnitPrice(fields.limitPrice) ||
+    !(releaseAfter === null || (isUuidV7(releaseAfter) && releaseAfter !== fields.executionGroupId)) ||
+    !(legRiskLimit === null || isNonNegativeAmount(legRiskLimit))
   ) {
     return undefined;
   }
@@ -2977,6 +3264,11 @@ function readGroup(raw: unknown): GroupRecord | undefined {
     side: fields.side,
     plannedShares: fields.plannedShares,
     postOnly: fields.postOnly,
+    groupOrdinal: fields.groupOrdinal,
+    groupKind: fields.groupKind,
+    limitPrice: fields.limitPrice,
+    releaseAfterGroupId: releaseAfter,
+    legRiskLimit,
   });
 }
 
@@ -2989,7 +3281,12 @@ function sameGroup(a: GroupRecord, b: GroupRecord): boolean {
     a.accountRef === b.accountRef &&
     a.side === b.side &&
     a.plannedShares === b.plannedShares &&
-    a.postOnly === b.postOnly
+    a.postOnly === b.postOnly &&
+    a.groupOrdinal === b.groupOrdinal &&
+    a.groupKind === b.groupKind &&
+    a.limitPrice === b.limitPrice &&
+    a.releaseAfterGroupId === b.releaseAfterGroupId &&
+    a.legRiskLimit === b.legRiskLimit
   );
 }
 

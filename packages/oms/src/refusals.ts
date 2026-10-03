@@ -59,6 +59,9 @@ export const OMS_REFUSAL_CODES = [
   "OMS_REPLACEMENT_NOT_READY",
   // Venue-side evidence.
   "OMS_UNKNOWN_VENUE_ORDER",
+  // Not an error: the evidence names a venue order id no order holds YET, and is kept while an unresolved
+  // attempt could own it (UNATTRIBUTED EVIDENCE in `order-manager.ts`). Delivering it again is harmless.
+  "OMS_EVIDENCE_RETAINED",
   "OMS_OBSERVATION_UNRECOGNISED",
   "OMS_FILL_INCONSISTENT",
   "OMS_FILL_CONFLICT",

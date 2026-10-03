@@ -169,6 +169,10 @@ export function group(n: number, overrides: Partial<GroupSpec> = {}): GroupSpec 
     side: "BUY",
     plannedShares: "10",
     postOnly: false,
+    // The `execution.groups` columns (r3, WP270-R3-02); `n` doubles as the group's ordinal in PLAN.
+    groupOrdinal: n,
+    groupKind: "SLICE",
+    limitPrice: "0.5",
     ...overrides,
   };
 }

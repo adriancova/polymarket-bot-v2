@@ -6,14 +6,18 @@
  * THE WORLD holds the ground truth the OMS can never see directly: which
  * signed orders (by salt) the venue holds, their status and matched size, and
  * which transmissions are still travelling (a "hang", or a transmission whose
- * sender crashed). Each OMS incarnation gets its own port wrappers; a crash
+ * sender crashed). A hang may already have ARRIVED (`HANG_ARRIVED`, r3): the
+ * venue holds and can match the order while its answer still travels, so a
+ * fill or an observation can reach the OMS before the placement answer
+ * (WP270-R3-01). Each OMS incarnation gets its own port wrappers; a crash
  * kills the wrappers (every later call throws), so a dead process can neither
  * write nor send, while the world carries on.
  *
  * THE ORACLE knows nothing of the OMS's state machine or gate. It records
  * only what the harness itself caused or delivered, and decides from that:
  *
- *   closed(A) holds for an earlier attempt A (by salt) of a group when
+ *   closed(A) holds for an earlier attempt A (by salt) of a group when no
+ *   transmission of A can still ARRIVE (create the order) and
  *   - E1: the venue never received A and no transmission of A is travelling;
  *   - E2: every transmission of A came back to the OMS as a definitive
  *         non-placement (REJECTED, a documented REFUSED, NOT_SENT) and none
@@ -39,7 +43,18 @@
  *   S6  when the OMS ABANDONS an attempt (closes it without a placement, which
  *       opens its group's gate), the attempt is closed(A) at that moment: the
  *       harness reports every abandonment the OMS accepted, whatever it asked
- *       for (r1: the generator also asks to abandon ineligible attempts).
+ *       for (r1: the generator also asks to abandon ineligible attempts);
+ *   S7  venue evidence for our own orders is never lost (r3, WP270-R3-01): a
+ *       fill or an observation for an order the venue holds for one of our
+ *       salts is never refused as an unknown venue order (the harness reports
+ *       every such refusal, and does NOT deliver a retained fill again within
+ *       the incarnation that retained it), and at the end every such order's
+ *       recorded fills sum exactly to what the venue matched.
+ * A travelling transmission that has already ARRIVED (`HANG_ARRIVED`: the
+ * venue holds its order; only the answer is in transit) can create nothing
+ * more, since one salt is one venue order: it does not hold an attempt open,
+ * and its answer settling resets nothing (r3). For every other behaviour,
+ * "can still arrive" and "travelling" are the same, as before.
  * Answers the OMS REFUSED never count as evidence; answers it accepted count
  * only if fresh, so a stale answer the OMS wrongly accepts is caught by S1.
  * An answer delivered into a call that died inside a store transaction may
@@ -72,7 +87,8 @@ export type Behavior =
   | "UNKNOWN_429"
   | "UNKNOWN_UNMATCHED"
   | "THROW"
-  | "HANG";
+  | "HANG"
+  | "HANG_ARRIVED";
 
 export const BEHAVIORS: readonly Behavior[] = [
   "ACCEPT_LIVE",
@@ -88,6 +104,7 @@ export const BEHAVIORS: readonly Behavior[] = [
   "UNKNOWN_UNMATCHED",
   "THROW",
   "HANG",
+  "HANG_ARRIVED",
 ];
 
 interface VenueOrder {
@@ -105,6 +122,8 @@ interface SaltLedger {
   readonly signTick: number;
   received: number;
   travelling: number;
+  /** Travelling transmissions that have not arrived yet: each may still create the order. */
+  pending: number;
   lastSendTick: number;
   definitiveOnly: boolean;
   closedBy: string | null;
@@ -129,6 +148,8 @@ export interface Hang {
   readonly resolve: (outcomes: readonly PlacementOutcome[]) => void;
   /** False once its incarnation died: the answer then reaches no one, but the world still decides arrival. */
   live: boolean;
+  /** `HANG_ARRIVED`: the orders reached the venue when sent; only the answers travel. */
+  readonly arrivedAtSend: boolean;
 }
 
 export class OracleViolation extends Error {}
@@ -195,13 +216,13 @@ export class SimWorld {
       if (entry.group !== group) continue;
       if (!this.#closed(entry)) this.fail(`S1: a new salt for group ${group} while salt ${entry.salt} is not authoritatively closed`);
       const order = this.orders.get(entry.salt);
-      if ((order !== undefined && order.status === "LIVE" && order.matched < order.original) || entry.travelling > 0) {
-        this.fail(`S2: a new salt for group ${group} while salt ${entry.salt} is live or travelling at the venue`);
+      if ((order !== undefined && order.status === "LIVE" && order.matched < order.original) || entry.pending > 0) {
+        this.fail(`S2: a new salt for group ${group} while salt ${entry.salt} is live at the venue or may still arrive there`);
       }
     }
     this.#salt += 1;
     const salt = String(this.#salt);
-    this.ledger.set(salt, { salt, group, signTick: this.tick, received: 0, travelling: 0, lastSendTick: -1, definitiveOnly: true, closedBy: null });
+    this.ledger.set(salt, { salt, group, signTick: this.tick, received: 0, travelling: 0, pending: 0, lastSendTick: -1, definitiveOnly: true, closedBy: null });
     const payload = {
       builder: `0x${"0".repeat(64)}`,
       expiration: request.expirationUnixSeconds ?? 0,
@@ -223,8 +244,8 @@ export class SimWorld {
   }
 
   #closed(entry: SaltLedger): boolean {
-    // A transmission still travelling may yet create the order: nothing closes the attempt meanwhile.
-    if (entry.travelling > 0) return false;
+    // A transmission that may still arrive may yet create the order: nothing closes the attempt meanwhile.
+    if (entry.pending > 0) return false;
     if (entry.received === 0) return true;
     if (entry.definitiveOnly) return true;
     return entry.closedBy !== null;
@@ -270,13 +291,16 @@ export class SimWorld {
       entry.closedBy = null;
       this.receipts.push(entry.salt);
     }
-    if (unit === "HANG") {
+    if (unit === "HANG" || unit === "HANG_ARRIVED") {
       for (const entry of entries) {
         entry.definitiveOnly = false;
         entry.travelling += 1;
+        // The venue already holds the order (it can be matched and observed); only the answer still travels.
+        if (unit === "HANG_ARRIVED") this.#create(entry.salt);
+        else entry.pending += 1;
       }
       return new Promise<readonly PlacementOutcome[]>((resolve) => {
-        this.hangs.push({ salts: entries.map((entry) => entry.salt), resolve, live: alive() });
+        this.hangs.push({ salts: entries.map((entry) => entry.salt), resolve, live: alive(), arrivedAtSend: unit === "HANG_ARRIVED" });
       });
     }
     if (unit === "THROW") {
@@ -288,7 +312,7 @@ export class SimWorld {
     }
     return entries.map((entry, index) => {
       const behavior = index === 0 ? unit : this.nextBehavior();
-      return this.#answer(entry, behavior === "HANG" || behavior === "THROW" || behavior === "NOT_SENT" ? "UNKNOWN_SOCKET" : behavior);
+      return this.#answer(entry, behavior === "HANG" || behavior === "HANG_ARRIVED" || behavior === "THROW" || behavior === "NOT_SENT" ? "UNKNOWN_SOCKET" : behavior);
     });
   }
 
@@ -345,10 +369,17 @@ export class SimWorld {
     const outcomes: PlacementOutcome[] = [];
     for (const salt of hang.salts) {
       const entry = this.ledger.get(salt);
+      if (hang.arrivedAtSend) {
+        // Arrived when sent: the order is there, and only its answer comes back now; nothing new can happen.
+        if (entry !== undefined) entry.travelling -= 1;
+        outcomes.push(acceptIfArrived ? accepted(venueIdFor(salt)) : { kind: "UNKNOWN", reason: "ERROR", error: venueError("TIMEOUT", "UNKNOWN") });
+        continue;
+      }
       const arrived = this.existsOnUnknown();
       if (arrived) this.#create(salt);
       if (entry !== undefined) {
         entry.travelling -= 1;
+        entry.pending -= 1;
         entry.lastSendTick = this.tick;
         entry.closedBy = null;
       }
@@ -382,7 +413,8 @@ export class SimWorld {
   read(request: ReconciliationRequest): ReadAnswer {
     this.tick += 1;
     const entry = this.ledger.get(request.salt);
-    const fresh = entry !== undefined && entry.travelling === 0 && this.tick > entry.lastSendTick;
+    // Fresh: made after the last send, while no transmission may still arrive (an arrived one cannot change it).
+    const fresh = entry !== undefined && entry.pending === 0 && this.tick > entry.lastSendTick;
     const order = this.orders.get(request.salt);
     if (order === undefined) {
       // The truthful reconciler attests quiescence exactly when nothing of this attempt is travelling and the read follows its last send.
@@ -433,6 +465,28 @@ export class SimWorld {
   abandonAccepted(salt: string): void {
     const entry = this.ledger.get(salt);
     if (entry !== undefined && !this.#closed(entry)) this.fail(`S6: salt ${salt} abandoned while not authoritatively closed`);
+  }
+
+  /** The venue's order with this venue order id, if the venue holds one (for S7). */
+  orderByVenueId(venueOrderId: string): VenueOrder | undefined {
+    return [...this.orders.values()].find((order) => order.venueOrderId === venueOrderId);
+  }
+
+  /** S7: the OMS refused evidence (a fill or an observation) for this venue order id as an unknown venue order. */
+  evidenceRefusedAsUnknown(venueOrderId: string, what: string): void {
+    const order = this.orderByVenueId(venueOrderId);
+    if (order !== undefined) this.fail(`S7: ${what} for salt ${order.salt}'s order (which the venue holds) was refused as an unknown venue order`);
+  }
+
+  /** S7, at the end: every order the venue holds for our salts has recorded fills summing exactly to what the venue matched. */
+  checkFillsKept(omsOrders: readonly { readonly venueOrderId: string | null; readonly filledShares: string }[]): void {
+    for (const order of this.orders.values()) {
+      const oms = omsOrders.find((candidate) => candidate.venueOrderId === order.venueOrderId);
+      if (oms === undefined) this.fail(`S7: the venue holds salt ${order.salt}'s order, but no OMS order holds its venue order id`);
+      else if (oms.filledShares !== centi(order.matched)) {
+        this.fail(`S7: salt ${order.salt}: the OMS recorded ${oms.filledShares} filled; the venue matched ${centi(order.matched)}`);
+      }
+    }
   }
 
   /** S4: every received salt is known to the current OMS. */

@@ -13,6 +13,8 @@
  *   `submission_attempts_expected_order_hash_unique` (where known);
  *   `submission_attempts_immutable_signature`;
  * - `order_events_ordinal_unique` (here stricter: a gapless sequence from 0);
+ * - `groups`: the NOT NULL columns, `groups_ordinal_non_negative`,
+ *   `groups_ordinal_unique` (r3, WP270-R3-02);
  * - `intent_order_links_unique`; `fills_venue_identity_unique`;
  *   `fills_order_has_submission_attempt` (PMB11); the fill-allocation sum
  *   (PMB03/PMB04); `trade_settlements_ordinal_unique`.
@@ -185,10 +187,22 @@ function checkOrder(state: State, order: OrderRecord): void {
 
 function applyWrite(state: State, write: StoreWrite): void {
   switch (write.kind) {
-    case "INSERT_GROUP":
-      if (state.groups.has(write.group.executionGroupId)) throw new ConstraintViolation("groups primary key");
-      state.groups.set(write.group.executionGroupId, write.group);
+    case "INSERT_GROUP": {
+      const g = write.group;
+      if (state.groups.has(g.executionGroupId)) throw new ConstraintViolation("groups primary key");
+      // The NOT NULL columns of `execution.groups` (r3, WP270-R3-02): the write must be a self-sufficient row.
+      const row = g as unknown as Record<string, unknown>;
+      for (const column of ["groupOrdinal", "groupKind", "limitPrice", "tokenId", "side", "plannedShares", "planId"]) {
+        if (row[column] === undefined || row[column] === null) throw new ConstraintViolation(`groups not null: ${column}`);
+      }
+      if (!Number.isSafeInteger(g.groupOrdinal) || g.groupOrdinal < 0) throw new ConstraintViolation("groups_ordinal_non_negative");
+      if (g.groupKind !== "SLICE" && g.groupKind !== "LEG") throw new ConstraintViolation("groups group_kind enum");
+      for (const other of state.groups.values()) {
+        if (other.planId === g.planId && other.groupOrdinal === g.groupOrdinal) throw new ConstraintViolation("groups_ordinal_unique");
+      }
+      state.groups.set(g.executionGroupId, g);
       return;
+    }
     case "INSERT_ORDER":
       if (state.orders.has(write.order.orderId)) throw new ConstraintViolation("orders primary key");
       checkOrder(state, write.order);

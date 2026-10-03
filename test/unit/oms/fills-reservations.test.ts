@@ -8,6 +8,11 @@
  * r2: a redelivered fill must agree on its liquidity role and its match time
  * as an instant (WP270-R2-02); a repeated settlement state carrying a new
  * transaction hash is kept in the log (WP270-R2-03).
+ *
+ * r3: a hash already recorded for the current settlement state is a duplicate
+ * whichever row recorded it (OP-R3-01); the half-unit rounding boundary and the
+ * whole-unit truncation boundary of the match-time comparison are pinned
+ * (OP-R3-02).
  */
 
 import { addDecimal, mulDecimal, subDecimal } from "../../../packages/decimal/src/index.js";
@@ -178,6 +183,29 @@ describe("acceptance 3: partial fills release only the unused reservation, exact
     expect((await r.manager.recordFill(at("2026-10-03T01:00:00.123+01:00"))).ok).toBe(true);
     const role = await r.manager.recordFill(at("2026-10-03T00:00:00.123456789Z", { liquidityRole: "MAKER" }));
     expect(!role.ok && role.refusal.code).toBe("OMS_FILL_CONFLICT");
+  });
+
+  it("the half-unit rounding boundary: a coarser text is the finer instant rounded half up, never a half unit beyond (r3, OP-R3-02)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const { venueOrderId } = await live(h, 10);
+    const at = (id: string, matchedAt: string) => fill(venueOrderId, id, "1", "0.5", { matchedAt });
+    // 00.5 rounded half up to whole seconds is 01: the same instant (the excess is exactly minus half a unit).
+    expect((await h.manager.recordFill(at("h1", "2026-10-03T00:00:00.5Z"))).ok).toBe(true);
+    expect((await h.manager.recordFill(at("h1", "2026-10-03T00:00:01Z"))).ok).toBe(true);
+    // The same boundary at a finer precision: 00.15 rounded half up to tenths is 00.2.
+    expect((await h.manager.recordFill(at("h2", "2026-10-03T00:00:00.15Z"))).ok).toBe(true);
+    expect((await h.manager.recordFill(at("h2", "2026-10-03T00:00:00.2Z"))).ok).toBe(true);
+    // Just below the half unit, the coarser text is neither the truncation nor the rounding: another instant.
+    expect((await h.manager.recordFill(at("h3", "2026-10-03T00:00:00.499999999Z"))).ok).toBe(true);
+    const below = await h.manager.recordFill(at("h3", "2026-10-03T00:00:01Z"));
+    expect(!below.ok && below.refusal.code).toBe("OMS_FILL_CONFLICT");
+    // Truncation stays accepted right up to a whole unit, and not at it.
+    expect((await h.manager.recordFill(at("h4", "2026-10-03T00:00:01.999999999Z"))).ok).toBe(true);
+    expect((await h.manager.recordFill(at("h4", "2026-10-03T00:00:01Z"))).ok).toBe(true);
+    expect((await h.manager.recordFill(at("h5", "2026-10-03T00:00:01.0Z"))).ok).toBe(true);
+    const whole = await h.manager.recordFill(at("h5", "2026-10-03T00:00:00Z"));
+    expect(!whole.ok && whole.refusal.code).toBe("OMS_FILL_CONFLICT");
+    expect(h.manager.alerts().filter((alert) => alert.kind === "EVIDENCE_CONFLICT")).toHaveLength(2);
   });
 
   it("refuses a timestamp naming no instant (month 13, February 30 outside a leap year, hour 24, second 60) on a fill and on a settlement (r2)", async () => {
@@ -377,6 +405,43 @@ describe("the trade settlement state machine (separate from order state)", () =>
     expect((await OrderManager.open({ ...h.deps, store: { apply: async () => undefined, load: async () => snapshot } })).ok).toBe(true);
     const refused = await OrderManager.open({ ...h.deps, store: { apply: async () => undefined, load: async () => tampered } });
     expect(!refused.ok && refused.refusal.code).toBe("OMS_INVALID_INPUT");
+  });
+
+  it("a hash already recorded for the current state is a duplicate, whichever row recorded it: alternating reports add one row and one alert, also after a restart (r3, OP-R3-01)", async () => {
+    const h = await openHarness({ balances: { pusd: "100" } });
+    const id = await filled(h);
+    const hashed = (status: string, transactionHash: string) => ({ ...at(status, id), transactionHash });
+    for (const hash of ["0xabc", "0xdef", "0xabc", "0xdef", "0xabc"]) {
+      const result = await h.manager.applySettlement(hashed("MINED", hash));
+      expect(result.ok && result.value, hash).toBe("MINED");
+    }
+    const history = () => h.store.snapshotSync().settlements.map((s) => [s.stateOrdinal, s.previousState, s.state, s.transactionHash]);
+    expect(history()).toEqual([
+      [0, null, "MINED", "0xabc"],
+      [1, "MINED", "MINED", "0xdef"],
+    ]);
+    expect(h.manager.alerts().map((alert) => [alert.kind, alert.haltMarket])).toEqual([["SETTLEMENT_CONFLICT", false]]);
+    // The set of hashes recorded for the state is rebuilt on recovery from every row of that state.
+    const r = await reopen(h);
+    for (const hash of ["0xabc", "0xdef"]) expect((await r.manager.applySettlement(hashed("MINED", hash))).ok).toBe(true);
+    expect(history()).toHaveLength(2);
+    expect(r.manager.alerts()).toEqual([]);
+    // A state change starts a new set: CONFIRMED in 0x123, then 0xabc (recorded for MINED, not for CONFIRMED) is new
+    // evidence for CONFIRMED: a row and an alert.
+    expect((await r.manager.applySettlement(hashed("CONFIRMED", "0x123"))).ok).toBe(true);
+    expect((await r.manager.applySettlement(hashed("CONFIRMED", "0xabc"))).ok).toBe(true);
+    expect(r.manager.alerts().map((alert) => [alert.kind, alert.haltMarket])).toEqual([["SETTLEMENT_CONFLICT", false]]);
+    // Recovery rebuilds the set from the current state's rows only: 0xdef (a MINED row) is new for CONFIRMED.
+    const again = await reopen(r);
+    expect((await again.manager.applySettlement(hashed("CONFIRMED", "0xdef"))).ok).toBe(true);
+    expect((await again.manager.applySettlement(hashed("CONFIRMED", "0xabc"))).ok).toBe(true);
+    expect((await again.manager.applySettlement(hashed("CONFIRMED", "0x123"))).ok).toBe(true);
+    expect(history().slice(2)).toEqual([
+      [2, "MINED", "CONFIRMED", "0x123"],
+      [3, "CONFIRMED", "CONFIRMED", "0xabc"],
+      [4, "CONFIRMED", "CONFIRMED", "0xdef"],
+    ]);
+    expect(again.manager.alerts().map((alert) => [alert.kind, alert.haltMarket])).toEqual([["SETTLEMENT_CONFLICT", false]]);
   });
 
   it("a FAILED settlement re-reported with a hash is recorded once more, without a second SETTLEMENT_FAILED alert (r2)", async () => {

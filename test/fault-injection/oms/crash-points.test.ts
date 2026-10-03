@@ -18,7 +18,16 @@
  *   remaining = reserved), consumption equal to the recorded fills' debits,
  *   every closed order's remainder released, and the inventory's own
  *   invariants intact;
- * - encryption at rest: no signature ever written in clear.
+ * - encryption at rest: no signature ever written in clear;
+ * - evidence kept (r3, S7): every order the venue holds for our salts ends with
+ *   recorded fills summing exactly to what the venue matched.
+ *
+ * r3 (WP270-R3-01, R3-EVIDENCE): one scenario delivers a fill and an
+ * observation while the placement call is still in flight (the venue already
+ * holds the order), and asserts in the uncrashed run that the OMS applies the
+ * retained fill itself when the acceptance arrives, without redelivery. Its
+ * crash runs kill the process at every port call around that race; the
+ * restarted process reconciles the attempt and records the fill exactly once.
  */
 
 import { describe, expect, it } from "vitest";
@@ -46,6 +55,10 @@ interface Run {
 }
 
 type Scenario = (inc: Incarnation, run: Run) => Promise<void>;
+
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !condition(); i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 function behaviors(list: readonly Behavior[], then: Behavior = "ACCEPT_LIVE"): () => Behavior {
   let index = 0;
@@ -121,6 +134,28 @@ const SCENARIOS: Readonly<Record<string, Scenario>> = {
     venueMatch(run, run.u.world.receipts[0], 100);
     await deliver(m, run);
   },
+  "a fill and an observation while the placement is in flight (the venue already holds the order), then the acceptance": async (inc, run) => {
+    const m = inc.manager as OrderManager;
+    run.u.world.nextBehavior = behaviors(["HANG_ARRIVED"]);
+    await m.registerGroup(G1);
+    const t = ticket(G1, { n: 10, shares: "1" });
+    const pending = m.submit(t);
+    await until(() => run.u.world.hangs.length > 0 || !inc.alive);
+    const salt = run.u.world.receipts[0];
+    if (run.u.world.hangs.length > 0 && salt !== undefined) {
+      venueMatch(run, salt, 40);
+      await deliver(m, run);
+      await m.applyOrderObservation({ venueOrderId: venueIdFor(salt), status: "LIVE" });
+      if (inc.alive) expect(m.retainedEvidence().map((item) => item.kind), "retained while in flight").toEqual(["FILL", "OBSERVATION"]);
+      run.u.world.settleHang(0, true);
+    }
+    await pending;
+    // The OMS applied the retained fill itself when the acceptance named the order (no redelivery in between).
+    if (inc.alive) expect(m.order(t.orderId)?.filledShares, "applied without redelivery").toBe("0.4");
+    await answerCurrent(m, run);
+    await m.requestCancel(t.orderId);
+    await answerCurrent(m, run);
+  },
   "`unmatched` turned UNKNOWN, found absent, then a new salt for the slot": async (inc, run) => {
     const m = inc.manager as OrderManager;
     run.u.world.nextBehavior = behaviors(["UNKNOWN_UNMATCHED", "ACCEPT_LIVE"]);
@@ -179,6 +214,10 @@ function check(label: string, run: Run, last: Incarnation): void {
   }
   const written = u.store.serialized();
   for (const salt of u.world.ledger.keys()) expect(written.includes(signatureFor(salt)), `${label}: a signature in clear`).toBe(false);
+  // S7 (r3): nothing the venue matched for our orders is lost on the way.
+  u.world.checkFillsKept(manager.orders());
+  expect(u.world.violations, `${label}: evidence kept`).toEqual([]);
+  expect(run.fills, `${label}: fills never recorded`).toEqual([]);
 }
 
 describe("crash before and after every port call, then restart through the store", () => {

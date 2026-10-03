@@ -7,14 +7,18 @@
  * - submissions (single and batched) whose transmissions end in any of the
  *   port's outcomes: accepted live or delayed, rejected, a post-only refusal,
  *   not sent, every unknown kind (timeout, socket, 401, 425, 429, `unmatched`,
- *   a throw), or a HANG that stays travelling until the world settles it;
+ *   a throw), or a HANG that stays travelling until the world settles it
+ *   (sometimes one that has already ARRIVED: the venue holds the order and
+ *   can match it while its answer still travels; r3, WP270-R3-01);
  * - watchdog timeouts on hung transmissions, and their late answers;
  * - reconciliation reads made at one moment and delivered later, out of
  *   order, for current, superseded or dead incarnations' requests; and
  *   UNRESOLVED answers;
  * - retransmissions of the same signed order, abandonments, transmissions of
- *   recovered SIGNED attempts, cancels, venue-side matches and late fill
- *   deliveries, venue-mode changes, resumes;
+ *   recovered SIGNED attempts, cancels, venue-side matches and fill
+ *   deliveries (also while the placement is in flight or the attempt is
+ *   unresolved), stream observations (truthful, stale or unrecognised; r3,
+ *   OP-R3-03), venue-mode changes, resumes;
  * - the same calls (abandon, retransmit, transmit a SIGNED attempt, declare a
  *   transmission lost) aimed at ANY attempt, eligible or not, so that the
  *   oracle, not the OMS's own view, judges every one the OMS accepts (r1,
@@ -22,10 +26,19 @@
  * - process crashes between operations AND inside a store transaction, each
  *   followed by a restart through the store port.
  *
- * After every step the oracle's S1-S3, S5 and S6 must hold; at the end S4 (never
- * forgotten), and a truthful drain resolves every attempt (liveness). Each
+ * After every step the oracle's S1-S3, S5, S6 and S7 must hold; at the end S4
+ * (never forgotten), S7 (every fill the venue made for our orders recorded,
+ * exactly), and a truthful drain resolves every attempt (liveness). Each
  * failure reproduces from its seed, and a failing seed prints its step trace
  * and final state.
+ *
+ * r3 (WP270-R3-01, R3-EVIDENCE): a fill is delivered ONCE per incarnation. A
+ * fill the OMS retains (`OMS_EVIDENCE_RETAINED`) is not delivered again by
+ * this harness; it counts as delivered (for the oracle's E4) only once the
+ * OMS no longer retains it and an order holds its venue order id. A refusal as
+ * an unknown venue order is an S7 violation, not a reason to try again.
+ * Retained evidence lives in the process's memory, so a restart hands the
+ * retained fills back for delivery to the new incarnation (as WP-290 would).
  */
 
 import { describe, expect, it } from "vitest";
@@ -83,7 +96,8 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
   world.nextBehavior = () => {
     const roll = random();
     // Weighted toward the restart path (425: the only one with a retransmission) and toward hangs.
-    const behavior: Behavior = roll < 0.25 ? "ACCEPT_LIVE" : roll < 0.4 ? "UNKNOWN_425" : roll < 0.47 ? "HANG" : (pick(BEHAVIORS) as Behavior);
+    const behavior: Behavior =
+      roll < 0.25 ? "ACCEPT_LIVE" : roll < 0.4 ? "UNKNOWN_425" : roll < 0.47 ? "HANG" : roll < 0.53 ? "HANG_ARRIVED" : (pick(BEHAVIORS) as Behavior);
     count(`behavior:${behavior}`);
     return behavior;
   };
@@ -100,6 +114,8 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
   const mode: { value: VenueMode } = { value: "NORMAL" };
   const deliveredFills = new Set<string>();
   const deliveredCenti = new Map<string, number>();
+  /** Fills the current incarnation retained (r3): never delivered again to it. */
+  const retainedFills: { salt: string; shares: string; venueOrderId: string; id: string }[] = [];
   let killAtNextWrite = false;
   let fillCounter = 0;
   let ticketCounter = 0;
@@ -197,8 +213,66 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
   const restart = async (): Promise<void> => {
     inc.alive = false;
     for (const hang of world.hangs) hang.live = false;
+    // Retained evidence died with the process: hand it back for delivery to the next one.
+    fills.push(...retainedFills.splice(0));
     inc = await incarnate();
     count("restart");
+  };
+
+  // The oracle's E4 for a fill: counted once, when the OMS accepted it (or may have, in a call that died).
+  const credit = (fill: { salt: string; shares: string; id: string }): void => {
+    if (!deliveredFills.has(fill.id)) {
+      deliveredFills.add(fill.id);
+      deliveredCenti.set(fill.salt, (deliveredCenti.get(fill.salt) ?? 0) + Math.round(Number(fill.shares) * 100));
+    }
+    if ((deliveredCenti.get(fill.salt) ?? 0) >= 100) world.filledAccepted(fill.salt);
+  };
+
+  // A retained fill counts as delivered once the OMS has taken it: no longer retained, and an order holds its
+  // venue order id (the OMS takes and decides on a retained fill in one synchronous step).
+  const creditRetained = (m: OrderManager): void => {
+    const held = new Set(m.retainedEvidence().map((item) => `${item.venueOrderId}|${String(item.venueTradeId)}`));
+    const owned = new Set(m.orders().map((order) => order.venueOrderId));
+    for (const fill of [...retainedFills]) {
+      if (held.has(`${fill.venueOrderId}|${fill.id}`)) continue;
+      if (owned.has(fill.venueOrderId)) {
+        credit(fill);
+        count("retainedFill:applied");
+      } else {
+        world.evidenceRefusedAsUnknown(fill.venueOrderId, "a retained fill");
+      }
+      retainedFills.splice(retainedFills.indexOf(fill), 1);
+    }
+  };
+
+  /** Deliver one queued fill, once: S7 judges every refusal. */
+  const deliverFill = async (m: OrderManager, index: number): Promise<void> => {
+    const fill = fills[index];
+    if (fill === undefined) return;
+    const result = await m.recordFill({
+      venueTradeId: fill.id,
+      venueOrderId: fill.venueOrderId,
+      shares: fill.shares,
+      price: "0.5",
+      liquidityRole: "MAKER",
+      matchedAt: "2026-10-03T00:00:00Z",
+    });
+    count(result.ok ? "fill:accepted" : `fill:${result.refusal.code}`);
+    if (result.ok) {
+      fills.splice(fills.indexOf(fill), 1);
+      credit(fill);
+    } else if (!inc.alive || result.refusal.code === "OMS_STORE_WRITE_FAILED" || result.refusal.code === "OMS_FAULTED") {
+      // A fill delivered into a call that died inside a store transaction may have been applied (an ambiguous
+      // commit): it counts once, and stays queued so its redelivery to the next incarnation is deduplicated.
+      if (!inc.alive) credit(fill);
+    } else if (result.refusal.code === "OMS_EVIDENCE_RETAINED") {
+      fills.splice(fills.indexOf(fill), 1);
+      retainedFills.push(fill);
+    } else {
+      fills.splice(fills.indexOf(fill), 1);
+      if (result.refusal.code === "OMS_UNKNOWN_VENUE_ORDER") world.evidenceRefusedAsUnknown(fill.venueOrderId, "a fill");
+      else world.fail(`S7: a fill for salt ${fill.salt}'s order was refused: ${result.refusal.code}`);
+    }
   };
 
   // S6: every abandonment the OMS accepts is reported to the oracle (also one inside a killed transaction,
@@ -217,6 +291,8 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
   for (let step = 0; step < steps; step += 1) {
     if (!inc.alive || inc.manager.faulted) await restart();
     const m = inc.manager;
+    // Synchronously before the step's operation, so a submission's gate check and the oracle's view agree.
+    creditRetained(m);
     const roll = random();
     if (roll < 0.2) {
       count("submit");
@@ -317,30 +393,24 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
           fills.push({ salt: target.salt, shares: matched.shares, venueOrderId: matched.venueOrderId, id: `f${String(seed)}-${String(fillCounter)}` });
         }
       }
-    } else if (roll < 0.9) {
+    } else if (roll < 0.89) {
       const index = Math.floor(random() * fills.length);
       const fill = fills[index];
       if (fill !== undefined) {
-        const result = await m.recordFill({
-          venueTradeId: fill.id,
-          venueOrderId: fill.venueOrderId,
-          shares: fill.shares,
-          price: "0.5",
-          liquidityRole: "MAKER",
-          matchedAt: "2026-10-03T00:00:00Z",
-        });
-        // An undeliverable fill (its order not yet identified) stays queued for later. A fill delivered into a
-        // call that died inside a store transaction may have been applied (an ambiguous commit): it counts once,
-        // and stays queued so its redelivery is deduplicated.
-        if (result.ok || !inc.alive) {
-          if (result.ok) fills.splice(index, 1);
-          if (!deliveredFills.has(fill.id)) {
-            deliveredFills.add(fill.id);
-            deliveredCenti.set(fill.salt, (deliveredCenti.get(fill.salt) ?? 0) + Math.round(Number(fill.shares) * 100));
-          }
-          if ((deliveredCenti.get(fill.salt) ?? 0) >= 100) world.filledAccepted(fill.salt);
-        }
-        count(result.ok ? "fill:accepted" : `fill:${result.refusal.code}`);
+        if ((world.ledger.get(fill.salt)?.travelling ?? 0) > 0) count("fillWhilePlacementInFlight");
+        await deliverFill(m, index);
+      }
+    } else if (roll < 0.92) {
+      // A stream observation of an order the venue holds: its truth now, a stale LIVE, or an unrecognised status.
+      const target = pick([...world.orders.values()]);
+      if (target !== undefined) {
+        const r = random();
+        const truth = target.status === "CANCELED" ? "CANCELED" : target.matched >= target.original ? "MATCHED" : "LIVE";
+        const status = r < 0.6 ? truth : r < 0.9 ? "LIVE" : "SOMETHING_NEW";
+        if ((world.ledger.get(target.salt)?.travelling ?? 0) > 0) count("observeWhilePlacementInFlight");
+        const result = await m.applyOrderObservation({ venueOrderId: target.venueOrderId, status });
+        count(result.ok ? "observe:ok" : `observe:${result.refusal.code}`);
+        if (!result.ok && result.refusal.code === "OMS_UNKNOWN_VENUE_ORDER" && inc.alive) world.evidenceRefusedAsUnknown(target.venueOrderId, "an observation");
       }
     } else if (roll < 0.93) {
       mode.value = random() < 0.8 ? "NORMAL" : random() < 0.5 ? "POST_ONLY" : "TRADING_UNAVAILABLE";
@@ -355,6 +425,7 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
       if (random() < 0.4) await restart();
     }
     await flush();
+    creditRetained(inc.manager);
     if (world.violations.length > 0) {
       // A failing seed prints its own step trace and final state (no switch: it fails the test anyway).
       console.log(`seed ${String(seed)} trace:\n${trace.join("\n")}`);
@@ -383,13 +454,15 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
         if (result.ok) world.answerAccepted(read);
       }
     }
-    for (const fill of [...fills]) {
-      const result = await m.recordFill({ venueTradeId: fill.id, venueOrderId: fill.venueOrderId, shares: fill.shares, price: "0.5", liquidityRole: "MAKER", matchedAt: "2026-10-03T00:00:00Z" });
-      if (result.ok) fills.splice(fills.indexOf(fill), 1);
-    }
+    creditRetained(m);
+    for (const fill of [...fills]) await deliverFill(m, fills.indexOf(fill));
     await flush();
+    creditRetained(m);
   }
   world.checkNeverForgotten(new Set(inc.manager.attempts().map((attempt) => attempt.salt)));
+  // S7: nothing the venue matched for our orders was lost on the way.
+  if (fills.length > 0 || retainedFills.length > 0) world.fail(`S7: ${String(fills.length + retainedFills.length)} fills never recorded after a truthful drain`);
+  world.checkFillsKept(inc.manager.orders());
   const unresolved = inc.manager.attempts().filter((attempt) => ["SENDING", "SUBMISSION_UNKNOWN", "RECONCILING"].includes(attempt.state));
   if (unresolved.length > 0) world.fail(`liveness: ${String(unresolved.length)} attempts still unresolved after a truthful drain`);
   const transient = inc.manager.orders().filter((order) => ["PLANNED", "SIGNED", "SENDING", "SUBMISSION_UNKNOWN", "RECONCILING", "CANCEL_PENDING"].includes(order.state));
@@ -431,6 +504,14 @@ describe("acceptance 2: no new salt before authoritative reconciliation (seeded 
       "fill:OMS_STORE_WRITE_FAILED",
       "cancel",
       "fill:accepted",
+      // r3 (WP270-R3-01, R3-EVIDENCE, OP-R3-03): evidence racing its placement answer, retained and applied by the
+      // OMS itself (never delivered again within the incarnation), and stream observations.
+      "fillWhilePlacementInFlight",
+      "fill:OMS_EVIDENCE_RETAINED",
+      "retainedFill:applied",
+      "observeWhilePlacementInFlight",
+      "observe:ok",
+      "observe:OMS_EVIDENCE_RETAINED",
       "answer:accepted",
       "queued:accepted",
       "queued:OMS_RECONCILIATION_SUPERSEDED",
