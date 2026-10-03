@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `THROUGHPUT-1c` is Complete (ADR-023 ratified). The trading-core rounds now run one at a time: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (ADR-031 option (a), before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` runs beside them. ADR-031 and ADR-032 are Accepted. `WP-300c` is Complete. `HOST-BENCH` waits on the laptop agent.
+- **Next:** `THROUGHPUT-1c` is Complete (ADR-023 ratified). The trading-core rounds now run one at a time: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (ADR-031 option (a), before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` is Complete, and `WALCAP-1` (the WAL cap and the stall flake) runs beside them. ADR-031 and ADR-032 are Accepted. `WP-300c` is Complete. `HOST-BENCH` waits on the laptop agent.
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -54,7 +54,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
   - `apps/research-worker/src/**`, only if the evidence reader needs it;
   - `test/integration/paper-trader/**`, `test/integration/postgres/**`, `test/unit/trader/**`, `test/e2e/**`, `test/replay-golden/**`.
   Forbidden: `db/migrations/**`. Verifiers: Opus and gpt-6-astra, reconciled.
-- **`APPROX-REPLAY-1`**: Ready (authorized) 2026-10-02, per the work plan (its dependencies `STORAGE-1` and `THROUGHPUT-1c` are met). Paths: `apps/backtest-cli/**`. Verifier: astra.
+- `APPROX-REPLAY-1` is Complete (2026-10-03, `86830d9`); see [Work packages](#work-packages).
 - **`WALCAP-1`**: Ready (authorized) 2026-10-03 by the orchestrator. It closes `STORAGE1-MAXBYTES` and `CI-FLAKE-STALL-BOUND`:
   - the WAL writer's capacity count is relieved by expiry and never undercounts (J10);
   - `maxTotalBytes` is required on the laptop profile (ADR-028 D5.1);
@@ -195,7 +195,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
 | `CO2-N1-ADR` | ADR-031: the design decision `CO2-N1` needs (now Accepted) | Complete (2026-10-01): ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
 | `PROVENANCE-1` | decision provenance, durable halts and refusals; raw WAL expiry where a trader runs | **Ready (authorized)** 2026-10-02 | — | — |
-| `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | **Ready (authorized)** 2026-10-02 | — | — |
+| `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | Complete (2026-10-03) | `86830d9` | [APPROX-REPLAY-1](docs/handoffs/APPROX-REPLAY-1.md) |
 | `WALCAP-1` | the WAL cap after expiry, required on the laptop profile, visible; the stall-bound flake | **Ready (authorized)** 2026-10-03 | — | — |
 | `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | Complete (2026-10-02) | `a60ee27` | [ADR031-ACCEPT](docs/handoffs/ADR031-ACCEPT.md) |
 | `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | Complete (2026-10-01) | `80a06e2` | [CONTROL-1b](docs/handoffs/CONTROL-1b.md) |
