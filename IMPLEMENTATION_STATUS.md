@@ -51,6 +51,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `PROVENANCE-1` is Complete (2026-10-03, `71d8b80`); see [Work packages](#work-packages). It closed `H1R1-PROVENANCE`, `OUT1-R1-HALT-NOT-DURABLE` and `OUT2-R1-HALT-RECORD-INTERACTION`.
 - `CO2-N1` is Complete (2026-10-03, `9869e53`): ADR-031's entry guard. See [Work packages](#work-packages).
 - **`WP-270`**: Ready (authorized) 2026-10-03 under the Wave 3 authorization. Its dependencies (`WP-190`, `WP-200`, `WP-260`) and the closeout preconditions (`CO2-N1` and `CO2-N8` fixed) are met. It is the OMS and signed-order persistence, PAPER only: the venue only through an injected, mocked port, with no key and no network. Paths: `packages/oms/**`, `test/unit/oms/**`, `test/fault-injection/oms/**`, and the lockfile for a workspace-internal dependency only. Verifiers: Opus and gpt-6-astra, reconciled (ruled safety-critical).
+- **`CADENCE-1`**: Ready (authorized) 2026-10-03, per the work plan; its dependencies `LEAN-GOV` and `THROUGHPUT-1c` are met. It implements ADR-026: at most one `onFeatures` evaluation per market per 1 s of event time, plus a 5 s heartbeat, with the settings pinned in the run record. The paths are the work plan's. Verifiers: Opus and gpt-6-astra, reconciled (decision-changing).
 - `APPROX-REPLAY-1` is Complete (2026-10-03, `86830d9`); see [Work packages](#work-packages).
 - **`WALCAP-1`**: Ready (authorized) 2026-10-03 by the orchestrator. It closes `STORAGE1-MAXBYTES` and `CI-FLAKE-STALL-BOUND`:
   - the WAL writer's capacity count is relieved by expiry and never undercounts (J10);
@@ -194,6 +195,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `PROVENANCE-1` | decision provenance, durable halts and refusals; raw WAL expiry where a trader runs | Complete (2026-10-03) | `71d8b80` | [PROVENANCE-1](docs/handoffs/PROVENANCE-1.md) |
 | `CO2-N1` | ADR-031 option (a): the entry guard on the process clock | Complete (2026-10-03) | `9869e53` | [CO2-N1](docs/handoffs/CO2-N1.md) |
 | `WP-270` | OMS and signed-order persistence (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-03 | — | — |
+| `CADENCE-1` | ADR-026: evaluation cadence, once per market per second of event time | **Ready (authorized)** 2026-10-03 | — | — |
 | `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | Complete (2026-10-03) | `86830d9` | [APPROX-REPLAY-1](docs/handoffs/APPROX-REPLAY-1.md) |
 | `WALCAP-1` | the WAL cap after expiry, required on the laptop profile, visible; the stall-bound flake | **Ready (authorized)** 2026-10-03 | — | — |
 | `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | Complete (2026-10-02) | `a60ee27` | [ADR031-ACCEPT](docs/handoffs/ADR031-ACCEPT.md) |
