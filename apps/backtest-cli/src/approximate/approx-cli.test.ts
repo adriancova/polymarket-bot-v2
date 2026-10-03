@@ -18,6 +18,13 @@
  * The label is the manifest's own: a manifest re-sealed with another
  * admissibility statement prints that statement, verbatim.
  *
+ * r1 (APPROX-R1-H1): "every line" means every PHYSICAL line. Every check below
+ * splits on every character a common reader ends a line at (LF, CR, CRLF,
+ * VT, FF, FS, GS, RS, NEL, LS, PS), and the r1 block drives text holding each
+ * of them through every sink — a manifest's admissibility and dataset id, a
+ * refusal's detail, a translation stop's detail — and requires every one to
+ * come out as one escaped, labelled line, never a line of its own.
+ *
  * NO DOCKER. NO NETWORK. NO CREDENTIAL. NO SIGNER. Every file written is
  * under a fresh temporary directory.
  */
@@ -108,13 +115,45 @@ function approxArgv(store: string, manifests: string, artifact: string, override
   ];
 }
 
-/** Every non-empty line carries the label, except the named format-id lines. */
+/** Every character a common reader ends a line at: LF, CR (and CRLF), VT, FF, FS, GS, RS, NEL, LS, PS. */
+const LINE_BREAKS: ReadonlySet<number> = new Set([0x0a, 0x0d, 0x0b, 0x0c, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029]);
+
+/** The physical lines of what a sink received (a sink call may carry several: the run serialization is one call). */
+function physicalLines(lines: readonly string[]): string[] {
+  const physical: string[] = [];
+  for (const text of lines) {
+    let current = "";
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      if (LINE_BREAKS.has(code)) {
+        physical.push(current);
+        current = "";
+        if (code === 0x0d && text.charCodeAt(index + 1) === 0x0a) index += 1;
+      } else {
+        current += text.charAt(index);
+      }
+    }
+    physical.push(current);
+  }
+  return physical;
+}
+
+/** A C0 or C1 control, DEL, LS or PS: none may survive into an approximate output line. */
+function holdsControl(line: string): boolean {
+  for (let index = 0; index < line.length; index += 1) {
+    const code = line.charCodeAt(index);
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029) return true;
+  }
+  return false;
+}
+
+/** Every non-empty PHYSICAL line carries the label, except the named format-id lines; none holds a control. */
 function everyLineLabelled(lines: readonly string[], exempt: readonly string[] = []): void {
-  // A sink call may carry several lines (the run serialization is one call).
-  const physical = lines.flatMap((line) => line.split("\n"));
+  const physical = physicalLines(lines);
   expect(physical.length).toBeGreaterThan(0);
   const unlabelled = physical.filter((line) => line !== "" && !exempt.includes(line) && !line.startsWith("approximate "));
   expect(unlabelled).toEqual([]);
+  expect(physical.filter(holdsControl)).toEqual([]);
 }
 
 describe("acceptance 4: every output is labelled approximate, from the manifest", () => {
@@ -267,5 +306,157 @@ describe("approx-run: the command's own boundaries", () => {
     expect(result.code).toBe(EXIT_REFUSED);
     expect(readFileSync(artifact, "utf8")).toBe("keep me\n");
     everyLineLabelled(result.err);
+  });
+});
+
+/**
+ * r1 (APPROX-R1-H1): text a manifest, a row or an argument carries can hold a
+ * line break, and the published parser admits it (`admissibility` and
+ * `datasetId` are any non-empty string). Each sink must print it as ONE
+ * escaped, labelled line: never a physical line the label does not cover, and
+ * never a line of its own that reads like one of the run's counters.
+ *
+ * Every line separator a common reader honours, in one statement.
+ */
+const FORGED = [
+  "approximate: research only",
+  "decisions_persisted=987654321\rrisk_refusals=0\r\nfills=5",
+  "VT\u000bFF\u000cFS\u001cGS\u001dRS\u001eNEL\u0085LS PS ESC\u001b[2KTAB\tDEL\u007f\\n-is-literal",
+].join("\n");
+/** The same statement escaped by hand (backslash doubled; LF, CR, TAB by name; every other control as \uXXXX). */
+const FORGED_ESCAPED =
+  "approximate: research only\\ndecisions_persisted=987654321\\rrisk_refusals=0\\r\\nfills=5\\n" +
+  "VT\\u000bFF\\u000cFS\\u001cGS\\u001dRS\\u001eNEL\\u0085LS\\u2028PS\\u2029ESC\\u001b[2KTAB\\tDEL\\u007f\\\\n-is-literal";
+
+/** No physical line that starts as a counter, other than the one real counter line of each name. */
+function noForgedCounter(physical: readonly string[]): void {
+  for (const name of ["decisions_persisted", "risk_refusals", "fills"]) {
+    const counters = physical.filter((line) => line.startsWith(`${name}=`) || line.startsWith(`approximate ${name}=`));
+    expect(counters.length, name).toBeLessThanOrEqual(1);
+  }
+}
+
+describe("r1, APPROX-R1-H1: text holding a line break never prints an unlabelled or forged line", () => {
+  it("a re-sealed multiline admissibility statement: report, run serialization and artifact each print it as one escaped, labelled line", async () => {
+    const store = fresh("store");
+    const written = await writeResearchDataset({ root: store, datasetId: "multiline", samples: opening() });
+    resealManifest(store, written.manifestObjectKey, (manifest) => {
+      manifest["admissibility"] = FORGED;
+    });
+    const artifact = join(scratch, `multiline-${String(counter)}.txt`);
+    const result = await cli(approxArgv(store, written.manifestObjectKey, artifact));
+    expect(result.code).toBe(EXIT_OK);
+
+    everyLineLabelled(result.out, [APPROXIMATE_RUN_SERIALIZATION_VERSION]);
+    expect(result.err.filter((line) => !line.startsWith("approximate "))).toEqual([]);
+    const out = physicalLines(result.out);
+    noForgedCounter(out);
+    // The forged value appears only inside the escaped admissibility lines.
+    expect(out.filter((line) => line.includes("987654321") && !line.includes("admissibility"))).toEqual([]);
+    expect(out).toContain(`approximate admissibility=${FORGED_ESCAPED}`);
+    // The run serialization (one sink call) carries it once, escaped too.
+    expect(out).toContain(`approximate admissibility ${FORGED_ESCAPED}`);
+    expect(out.filter((line) => line.startsWith("approximate decisions_persisted="))).toHaveLength(1);
+    expect(out).not.toContain("approximate decisions_persisted=987654321");
+
+    const lines = physicalLines([readFileSync(artifact, "utf8")]);
+    expect(lines[0]).toBe(APPROXIMATE_ARTIFACT_FORMAT_ID);
+    everyLineLabelled(lines.slice(1));
+    noForgedCounter(lines);
+    expect(lines.filter((line) => line.includes("987654321") && !line.includes("admissibility"))).toEqual([]);
+    expect(lines).toContain(`approximate admissibility ${FORGED_ESCAPED}`);
+  });
+
+  it("a re-sealed multiline dataset id: the run serialization's and the artifact's dataset line stay one labelled line", async () => {
+    const store = fresh("store");
+    const written = await writeResearchDataset({ root: store, datasetId: "dataset-id", samples: opening() });
+    resealManifest(store, written.manifestObjectKey, (manifest) => {
+      manifest["datasetId"] = "dataset-id\nrisk_refusals=0";
+    });
+    const artifact = join(scratch, `dataset-id-${String(counter)}.txt`);
+    const result = await cli(approxArgv(store, written.manifestObjectKey, artifact));
+    expect(result.code).toBe(EXIT_OK);
+    everyLineLabelled(result.out, [APPROXIMATE_RUN_SERIALIZATION_VERSION]);
+    noForgedCounter(physicalLines(result.out));
+    expect(physicalLines(result.out).some((line) => line.startsWith("approximate dataset id=dataset-id\\nrisk_refusals=0 fidelity=approximate "))).toBe(true);
+    const lines = physicalLines([readFileSync(artifact, "utf8")]);
+    everyLineLabelled(lines.slice(1));
+    noForgedCounter(lines);
+    expect(lines.some((line) => line.startsWith("approximate dataset id=dataset-id\\nrisk_refusals=0 fidelity=approximate "))).toBe(true);
+  });
+
+  it("a refusal after a manifest verified, whose detail carries a manifest's line break, prints one labelled line per issue", async () => {
+    const store = fresh("store");
+    const one = await writeResearchDataset({ root: store, datasetId: "chain-a", samples: opening() });
+    const two = await writeResearchDataset({
+      root: store,
+      datasetId: "chain-b",
+      segmentIndex: 1,
+      samples: [bar({ ...r(0, "9", T0 + 9_000), segment: `${EPOCH}-000001` }, { spanStartMs: T0 + 8_000, close: "1" })],
+    });
+    resealManifest(store, two.manifestObjectKey, (manifest) => {
+      manifest["datasetId"] = "chain-b\nrisk_refusals=0";
+    });
+    const result = await cli(approxArgv(store, `${one.manifestObjectKey},${two.manifestObjectKey}`, join(scratch, "never-r1.txt")));
+    expect(result.code).toBe(EXIT_REFUSED);
+    everyLineLabelled(result.err);
+    expect(physicalLines(result.err)).toHaveLength(result.err.length);
+    noForgedCounter(physicalLines(result.err));
+    expect(result.err).toContain("approximate   datasetId=chain-b\\nrisk_refusals=0");
+  });
+
+  it("a translation stop whose detail carries a row's line break prints one labelled line per detail", async () => {
+    const store = fresh("store");
+    const samples: FixtureSample[] = [
+      ...opening(),
+      depth(r(5, "3", T0 + 2_000), {
+        spanStartMs: T0 + 1_000,
+        conditionId: "0xother\nrisk_refusals=0",
+        tokenId: "9101",
+        bids: [["0.32", "200"]],
+        asks: [["0.34", "30"]],
+      }),
+    ];
+    const written = await writeResearchDataset({ root: store, datasetId: "row-detail", samples });
+    const artifact = join(scratch, `row-detail-${String(counter)}.txt`);
+    const result = await cli(approxArgv(store, written.manifestObjectKey, artifact));
+    expect(result.code).toBe(EXIT_REFUSED);
+    everyLineLabelled(result.err);
+    expect(physicalLines(result.err)).toHaveLength(result.err.length);
+    noForgedCounter(physicalLines(result.err));
+    expect(result.err).toContain("approximate   sampleConditionId=0xother\\nrisk_refusals=0");
+    expect(existsSync(artifact)).toBe(false);
+  });
+
+  it("a refusal before any manifest verified carries no label, and still prints one physical line per line", async () => {
+    const store = fresh("store");
+    const result = await cli(approxArgv(store, "missing\nrisk_refusals=0/manifest.json", join(scratch, "never-r1-2.txt")));
+    expect(result.code).toBe(EXIT_REFUSED);
+    expect(result.err[0]).toMatch(/^REFUSED: APPROX_REPLAY_DATASET_UNVERIFIED: .*carries no fidelity label\)$/u);
+    expect(physicalLines(result.err)).toHaveLength(result.err.length);
+    expect(physicalLines(result.err).filter(holdsControl)).toEqual([]);
+    noForgedCounter(physicalLines(result.err));
+    expect(result.err.some((line) => line.includes("missing\\nrisk_refusals=0/manifest.json"))).toBe(true);
+  });
+
+  it("the command's own refusals before anything is read (an argument, a file error) are one physical line each", async () => {
+    const store = fresh("store");
+    const written = await writeResearchDataset({ root: store, datasetId: "pre-read", samples: opening() });
+    const pins = join(scratch, "missing\ndecisions_persisted=987654321\npins.json");
+    const missingPins = await cli(approxArgv(store, written.manifestObjectKey, join(scratch, "never-r1-3.txt"), { pins }));
+    expect(missingPins.code).toBe(EXIT_REFUSED);
+    const config = join(scratch, "missing\rrisk_refusals=0\u2028config.json");
+    const missingConfig = await cli(approxArgv(store, written.manifestObjectKey, join(scratch, "never-r1-4.txt"), { config }));
+    expect(missingConfig.code).toBe(EXIT_REFUSED);
+    const badOption = await cli([...approxArgv(store, written.manifestObjectKey, join(scratch, "never-r1-5.txt")), "--x\nfills=5", "y"]);
+    expect(badOption.code).toBe(EXIT_USAGE);
+    for (const result of [missingPins, missingConfig, badOption]) {
+      expect(result.err.length).toBeGreaterThan(0);
+      expect(physicalLines(result.err)).toHaveLength(result.err.length);
+      expect(physicalLines(result.err).filter(holdsControl)).toEqual([]);
+      noForgedCounter(physicalLines(result.err));
+      expect(result.out).toEqual([]);
+    }
+    expect(missingPins.err[0]).toContain("missing\\ndecisions_persisted=987654321\\npins.json");
   });
 });

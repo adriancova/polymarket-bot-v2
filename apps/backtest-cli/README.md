@@ -166,12 +166,21 @@ promotion or soak evidence, and ranks below every ADR-012 tier. So:
 - every line it prints, and every line of the artifact it writes after the
   format id, starts with the manifests' own `fidelity` (`approximate`), read
   through the verifier — never inferred from a file name;
+- every such line is ONE physical line (`approximate/label.ts`): a line break,
+  any other control character or a backslash inside a manifest's text, a
+  row's value, a refusal's detail or an argument is escaped (`\n`, `\r`,
+  `\t`, `\\`, `\uXXXX`), so no text can print a line the label does not
+  cover. The same holds for its refusals and for anything the core's venue
+  logs during the run;
 - its formats are its own: `polymarket-bot/approximate-run/v1` and
   `polymarket-bot/approximate-backtest-replay/v1`;
 - the exact tools refuse it: `verify`, `run`, `runBacktest`,
   `runBacktestCore` (`REPLAY_MANIFEST_APPROXIMATE`) and the exact artifact
   renderer, which refuses any result that states a fidelity or is not an exact
-  run's serialization.
+  run's serialization, and any core an approximate run built;
+- the package's public surface has no unlabelled renderer: the core-section
+  builder is private to `artifact.ts`, and the approximate artifact's core
+  sections come labelled from `renderApproximateCoreSections`.
 
 **The source** (`approximate/research-source.ts`):
 

@@ -83,8 +83,13 @@ export type {
   BacktestRefusal,
 } from "./assembly.js";
 
-export { BACKTEST_ARTIFACT_FORMAT_ID, renderBacktestArtifact, renderCoreSections } from "./artifact.js";
-export type { BacktestArtifact, BacktestArtifactInput, CoreSectionsInput } from "./artifact.js";
+// APPROX-REPLAY-1 r1 (APPROX-R1-H2): the core-section builder is NOT public.
+// It renders a core's decisions with no fidelity, so an approximate core
+// handed to it would print unlabelled; the two public renderers either refuse
+// an approximate core (`renderBacktestArtifact`) or label every line
+// (`renderApproximateArtifact`).
+export { BACKTEST_ARTIFACT_FORMAT_ID, renderBacktestArtifact } from "./artifact.js";
+export type { BacktestArtifact, BacktestArtifactInput } from "./artifact.js";
 
 // --- APPROX-REPLAY-1: approximate replay over the research tier (ADR-029) ---
 export {

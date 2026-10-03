@@ -18,6 +18,11 @@
  * Each input below is a REAL research-tier manifest, written by the
  * published writer: the refusal is by the manifest's own `fidelity`, never by
  * a file name (ADR-029 Decision 4.2).
+ *
+ * r1 (APPROX-R1-H2): the package's PUBLIC surface (`index.ts`) has no renderer
+ * that prints an approximate core unlabelled. Its renderers are pinned by
+ * name; the exact one refuses an approximate core even beside a real exact
+ * result, and the approximate one labels every line.
  */
 
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -29,6 +34,7 @@ import { readDatasetManifestBytes, readRunPins, type ReplayRunPins } from "@poly
 import { fileSystemObjectStore } from "@polymarket-bot/storage-parquet";
 import { afterAll, describe, expect, it } from "vitest";
 
+import * as publicSurface from "../index.js";
 import { sha256Hex } from "../archive.js";
 import { renderBacktestArtifact } from "../artifact.js";
 import { runBacktestCore } from "../assembly.js";
@@ -187,5 +193,102 @@ describe("acceptance 5: every evidence tool refuses an approximate input", () =>
     });
     expect(started.ok).toBe(false);
     if (!started.ok) expect(started.refusal.code).toBe("BACKTEST_NORMALIZER_NOT_SUPPORTED");
+  });
+});
+
+/** A completed approximate run over a real research-tier dataset (the caller closes its store). */
+async function completedApproximateRun() {
+  const { root, written } = await researchDataset();
+  const started = await runApproximateBacktest({
+    environment: {},
+    traderConfig: CONFIG,
+    runPins: { ...EXACT_PINS_DOCUMENT, normalizerVersion: APPROXIMATE_TRANSLATION_VERSION },
+    objectStore: fileSystemObjectStore(root),
+    manifestObjectKeys: [written.manifestObjectKey],
+    gammaMarketIds: new Map([["019b1e00-0000-7000-8000-000000000001", "777"]]),
+  });
+  if (!started.ok || !started.run.outcome.ok) throw new Error("the approximate run did not complete");
+  return { run: started.run, result: started.run.outcome.result };
+}
+
+/** A completed EXACT run over the committed static-bracket fixture (the caller closes its store). */
+async function completedExactRun() {
+  const started = await runBacktestCore({ environment: {}, traderConfig: CONFIG, runPins: exactPins(), datasetDirectory: FIXTURE });
+  if (!started.ok || !started.run.outcome.ok) throw new Error("the exact run did not complete");
+  return { run: started.run, outcome: started.run.outcome };
+}
+
+describe("r1, APPROX-R1-H2: no public renderer prints an approximate core without its label", () => {
+  it("the public surface exports no core-section renderer; its renderers are exactly these four", () => {
+    const exported = publicSurface as Readonly<Record<string, unknown>>;
+    expect(exported["renderCoreSections"]).toBeUndefined();
+    expect(Object.keys(exported).filter((name) => /core.?sections/iu.test(name))).toEqual([]);
+    expect(Object.keys(exported).filter((name) => /^(render|serialize)/u.test(name)).sort()).toEqual([
+      "renderApproximateArtifact",
+      "renderBacktestArtifact",
+      "renderBacktestOutcome",
+      "serializeApproximateRun",
+    ]);
+  });
+
+  it("the public exact renderer refuses an approximate run's core even beside a REAL exact result", async () => {
+    const approximate = await completedApproximateRun();
+    const exact = await completedExactRun();
+    try {
+      // The control: the exact run's own core renders.
+      expect(publicSurface.renderBacktestArtifact({ outcome: exact.outcome, trader: exact.run.core.trader, store: exact.run.core.store, driver: exact.run.driver }).ok).toBe(true);
+      // The approximate core, the approximate store, either alone, or a shallow copy of the approximate
+      // trader (no cast: its loop is the approximate run's): refused, nothing rendered.
+      for (const input of [
+        { outcome: exact.outcome, trader: approximate.run.core.trader, store: approximate.run.core.store, driver: approximate.run.driver },
+        { outcome: exact.outcome, trader: approximate.run.core.trader, store: exact.run.core.store, driver: exact.run.driver },
+        { outcome: exact.outcome, trader: exact.run.core.trader, store: approximate.run.core.store, driver: exact.run.driver },
+        { outcome: exact.outcome, trader: { ...approximate.run.core.trader }, store: exact.run.core.store, driver: exact.run.driver },
+      ]) {
+        const artifact = publicSurface.renderBacktestArtifact(input);
+        expect(artifact.ok).toBe(false);
+        if (!artifact.ok) expect(artifact.problem).toContain("REPLAY_MANIFEST_APPROXIMATE");
+        if (!artifact.ok) expect(artifact.problem).toContain("built and driven by an approximate replay");
+      }
+    } finally {
+      await approximate.run.core.store.close();
+      await exact.run.core.store.close();
+    }
+  });
+
+  it("the public approximate renderer labels every line of what the approximate core produced", async () => {
+    const approximate = await completedApproximateRun();
+    try {
+      const artifact = publicSurface.renderApproximateArtifact({
+        result: approximate.result,
+        trader: approximate.run.core.trader,
+        store: approximate.run.core.store,
+        driver: approximate.run.driver,
+      });
+      expect(artifact.ok).toBe(true);
+      if (!artifact.ok) return;
+      const lines = artifact.text.split("\n").filter((line) => line !== "");
+      expect(lines[0]).toBe(publicSurface.APPROXIMATE_ARTIFACT_FORMAT_ID);
+      expect(lines.slice(1).filter((line) => !line.startsWith("approximate "))).toEqual([]);
+      expect(lines.some((line) => line.startsWith("approximate decision seq=0 "))).toBe(true);
+      expect(lines.some((line) => line.startsWith("approximate ledger transactions="))).toBe(true);
+      expect(lines.some((line) => line.startsWith("approximate health "))).toBe(true);
+    } finally {
+      await approximate.run.core.store.close();
+    }
+  });
+
+  it("the exact renderer still refuses an approximate RESULT beside an exact run's core (the fidelity guard, alone)", async () => {
+    const approximate = await completedApproximateRun();
+    const exact = await completedExactRun();
+    try {
+      const forged = { ok: true, runMode: "BACKTEST", result: approximate.result } as unknown as Extract<BacktestOutcome, { readonly ok: true }>;
+      const artifact = renderBacktestArtifact({ outcome: forged, trader: exact.run.core.trader, store: exact.run.core.store, driver: exact.run.driver });
+      expect(artifact.ok).toBe(false);
+      if (!artifact.ok) expect(artifact.problem).toContain('REPLAY_MANIFEST_APPROXIMATE: this artifact is evidence of an exact replay, and the result offered is not one (fidelity "approximate")');
+    } finally {
+      await approximate.run.core.store.close();
+      await exact.run.core.store.close();
+    }
   });
 });

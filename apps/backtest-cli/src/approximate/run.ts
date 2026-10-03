@@ -24,7 +24,11 @@
  * - the samples become envelopes through {@link ResearchSampleTranslator},
  *   whose version the run pins pin as their `normalizerVersion`;
  * - the result is labelled `approximate` from the manifests, everywhere it is
- *   printed or written ({@link ./serialize.js}).
+ *   printed or written ({@link ./serialize.js}); so is every line the core's
+ *   venue logs through {@link ApproximateRunOptions.log} (r1, APPROX-R1-H1);
+ * - the core is marked as an approximate run's (`markApproximateCore`) right
+ *   after its assembly, so the exact artifact renderer refuses whatever it
+ *   produced, whatever result it is handed with (r1, APPROX-R1-H2).
  *
  * ## The clock is positioned at every sample (ADR-031 R7)
  *
@@ -62,6 +66,7 @@ import { parseTraderConfig, type AccountingChecks } from "@polymarket-bot/tradin
 import type { ObjectStore } from "@polymarket-bot/storage-parquet";
 
 import { sha256Hex } from "../archive.js";
+import { markApproximateCore } from "../artifact.js";
 import {
   assembleBacktestCore,
   checkBacktestCoreSafety,
@@ -70,6 +75,7 @@ import {
 } from "../assembly.js";
 import type { ReplayDriverObservations, ReplayFraming } from "../core-loop.js";
 import { BACKTEST_RUN_MODE } from "../safety.js";
+import { labelledLog } from "./label.js";
 import {
   readResearchTierReplaySource,
   type ReleaseFrame,
@@ -154,6 +160,11 @@ export interface ApproximateRunOptions {
   readonly gammaMarketIds: ReadonlyMap<string, string>;
   readonly idNamespace?: string;
   readonly accountingChecks?: AccountingChecks;
+  /**
+   * Where the core's venue logs (an unresolvable time-in-force). Every line
+   * it receives is labelled with the manifests' fidelity and is one physical
+   * line (`./label.ts`): the venue only logs once a manifest has verified.
+   */
   readonly log?: (line: string) => void;
 }
 
@@ -376,12 +387,14 @@ export async function runApproximateBacktest(options: ApproximateRunOptions): Pr
     clockStart: { receivedAt: first.availableAt, receivedMonotonicNs: monotonic[0] ?? "0" },
     ...(options.idNamespace === undefined ? {} : { idNamespace: options.idNamespace }),
     ...(options.accountingChecks === undefined ? {} : { accountingChecks: options.accountingChecks }),
-    ...(options.log === undefined ? {} : { log: options.log }),
+    ...(options.log === undefined ? {} : { log: labelledLog(source.fidelity, options.log) }),
   });
   if (!assembled.ok) {
     return refuse(assembled.refusal.code, assembled.refusal.detail, assembled.refusal.issues, source.fidelity);
   }
   const core = assembled.core;
+  // Before the core is driven: nothing it produces renders as an exact artifact.
+  markApproximateCore(core);
 
   // --- 6. drive it, one release frame at a time -----------------------------
   const translator = new ResearchSampleTranslator({ markets: markets.markets, digestSha256: sha256Hex });

@@ -7,23 +7,29 @@
  * manifest, not inferred from a file name." So the label printed here is the
  * manifests' own `fidelity` value, read through the verifier
  * (`ApproximateReplayResult.fidelity`, set from `ResearchTierManifest.fidelity`),
- * and the admissibility statement is the manifests' own text, verbatim.
+ * and the admissibility statement is the manifests' own text, verbatim but
+ * for one rule: every line break, other control character and backslash in it
+ * is escaped (`./label.ts`).
  *
- * The label is on EVERY LINE, not only in a header: each line of the run
- * serialization after its format id, and each line of the artifact after its
- * format id, begins with the fidelity token. A line copied out of an
- * approximate result still says what it is, and no line of it is a line an
- * exact artifact could contain (an exact artifact's lines never begin with
- * `approximate `). The format ids are their own:
+ * The label is on EVERY PHYSICAL LINE, not only in a header: each line of the
+ * run serialization after its format id, and each line of the artifact after
+ * its format id, begins with the fidelity token, and every line passes
+ * through `labelLine`, which escapes the text so it stays one physical line
+ * (r1, APPROX-R1-H1: a manifest's text, a row's value or a refusal detail
+ * holding a line break can never print a line the label does not cover). A
+ * line copied out of an approximate result still says what it is, and no line
+ * of it is a line an exact artifact could contain (an exact artifact's lines
+ * never begin with `approximate `). The format ids are their own:
  *
  * - {@link APPROXIMATE_RUN_SERIALIZATION_VERSION}, never the exact
  *   `polymarket-bot/simulation-run/v3`;
  * - {@link APPROXIMATE_ARTIFACT_FORMAT_ID}, never the exact
  *   `polymarket-bot/backtest-static-bracket-replay/v1`.
  *
- * What the core produced is rendered by the exact artifact's own
- * `renderCoreSections`, so the two artifacts can never describe the core
- * differently; only the label and the run section differ.
+ * What the core produced is rendered by the exact artifact's own section
+ * builder, through `renderApproximateCoreSections` (`../artifact.ts`), which
+ * labels every line it returns; so the two artifacts can never describe the
+ * core differently, and only the label and the run section differ.
  *
  * Determinism inside the class (ADR-029 Decision 6): the same research tier,
  * code, configuration, pins and seed give the same bytes. That shows the
@@ -32,7 +38,8 @@
 
 import { serializeBand } from "@polymarket-bot/simulation";
 
-import { renderCoreSections, type BacktestArtifact, type CoreSectionsInput } from "../artifact.js";
+import { renderApproximateCoreSections, type BacktestArtifact, type CoreSectionsInput } from "../artifact.js";
+import { labelLine } from "./label.js";
 import type { ApproximateReplayResult } from "./run.js";
 
 /** The approximate run serialization's format id. A grammar change changes it. */
@@ -260,9 +267,9 @@ function runBody(result: ApproximateReplayResult): string[] {
   return lines;
 }
 
-/** Prefixes every line with the manifests' fidelity token. */
-function labelled(fidelity: string, lines: readonly string[]): string[] {
-  return lines.map((line) => `${fidelity} ${line}`);
+/** Each line labelled with the manifests' fidelity, as one physical line ({@link labelLine}). */
+function labelled(fidelity: "approximate", lines: readonly string[]): string[] {
+  return lines.map((line) => labelLine(fidelity, line));
 }
 
 /**
@@ -283,21 +290,18 @@ export interface ApproximateArtifactInput extends CoreSectionsInput {
 /**
  * The approximate artifact: its format id, then every line labelled — the
  * label line, the run section, and what the core produced (the exact
- * artifact's own sections). A truncated core log is refused, as the exact
- * artifact refuses it.
+ * artifact's own sections, labelled by `renderApproximateCoreSections`). A
+ * truncated core log is refused, as the exact artifact refuses it; so is a
+ * result whose fidelity is not `approximate`.
  */
 export function renderApproximateArtifact(input: ApproximateArtifactInput): BacktestArtifact {
-  const sections = renderCoreSections(input);
-  if (!sections.ok) return sections;
   const fidelity = input.result.fidelity;
+  const sections = renderApproximateCoreSections(input, fidelity);
+  if (!sections.ok) return sections;
   const lines = [
     APPROXIMATE_ARTIFACT_FORMAT_ID,
-    ...labelled(fidelity, [
-      `label ${fidelityLine(fidelity)}`,
-      "--- approximate-run ---",
-      ...runBody(input.result),
-      ...sections.lines,
-    ]),
+    ...labelled(fidelity, [`label ${fidelityLine(fidelity)}`, "--- approximate-run ---", ...runBody(input.result)]),
+    ...sections.lines,
   ];
   return { ok: true, text: `${lines.join("\n")}\n` };
 }

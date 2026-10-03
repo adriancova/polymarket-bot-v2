@@ -16,7 +16,9 @@
  * - the Static Bracket scenario of `test/replay-golden/backtest/static-bracket/`,
  *   restated as research-tier samples, drives the real core to an entry and a
  *   fill, byte-identically across two runs (ADR-029 Decision 6: repeatable,
- *   not evidence).
+ *   not evidence);
+ * - r1 (APPROX-R1-H1): a line the core's venue logs during an approximate run
+ *   reaches the caller's log labelled, as one physical line.
  *
  * NO DOCKER. NO NETWORK. NO CREDENTIAL. NO SIGNER. Every file written is
  * under a fresh temporary directory; the committed fixture is read only.
@@ -285,5 +287,60 @@ describe("the Static Bracket scenario as research-tier samples, through the real
     expect(render(one)).toEqual(render(two));
     await one.core.store.close();
     await two.core.store.close();
+  });
+});
+
+describe("r1, APPROX-R1-H1: the core's venue log is an approximate output too", () => {
+  it("a line the venue's policy logs reaches the run's log labelled with the manifest's fidelity, as one physical line", async () => {
+    const root = freshRoot();
+    const written = await writeResearchDataset({ root, datasetId: "venue-log", samples: scenario() });
+    const logged: string[] = [];
+    const started = await runApproximateBacktest({
+      environment: {},
+      traderConfig: CONFIG,
+      runPins: PINS,
+      objectStore: fileSystemObjectStore(root),
+      manifestObjectKeys: [written.manifestObjectKey],
+      gammaMarketIds: GAMMA,
+      idNamespace: "approx-replay-1-test",
+      log: (line) => logged.push(line),
+    });
+    if (!started.ok) throw new Error(started.refusal.detail);
+    const run = started.run;
+    try {
+      // The policy's one logged case: a planned order the core never recorded a
+      // time-in-force for. Its id carries a line break and a counter-like tail.
+      const submitted = await run.core.venue.submit({
+        executionPlanId: "019b1e00-0000-7000-8000-00000000f00d",
+        planKind: "PLACE",
+        runMode: "PAPER",
+        accountingMode: "LIVE",
+        groups: [
+          {
+            marketId: MARKET_ID,
+            orders: [
+              {
+                plannedOrderId: "planned-unknown\nrisk_refusals=0",
+                tokenId: "9101",
+                side: "YES",
+                action: "BUY",
+                limitPrice: "0.34",
+                shares: "1",
+                executionStyle: "MARKETABLE_LIMIT",
+                postOnly: false,
+              },
+            ],
+          },
+        ],
+        reservations: [],
+      } as unknown as Parameters<typeof run.core.venue.submit>[0]);
+      expect(submitted.accepted).toBe(false);
+      expect(logged.length).toBeGreaterThan(0);
+      expect(logged.filter((line) => !line.startsWith("approximate "))).toEqual([]);
+      expect(logged.filter((line) => line.includes("\n") || line.includes("\r"))).toEqual([]);
+      expect(logged.some((line) => line.startsWith("approximate SUBMISSION REFUSED") && line.includes("planned-unknown\\nrisk_refusals=0"))).toBe(true);
+    } finally {
+      await run.core.store.close();
+    }
   });
 });
