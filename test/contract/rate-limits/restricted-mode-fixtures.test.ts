@@ -74,9 +74,10 @@ async function outcomeFor(fixture: HttpFixture): Promise<PlacementOutcome> {
   return client.postOrder(signed.order);
 }
 
-async function observe(detector: VenueModeDetector, fixture: HttpFixture, atMs: number): Promise<void> {
+/** Show the detector the secure client's answer to `fixture`, for a request sent at `sentAtMs` (default: `atMs`). */
+async function observe(detector: VenueModeDetector, fixture: HttpFixture, atMs: number, sentAtMs: number = atMs): Promise<void> {
   const outcome = await outcomeFor(fixture);
-  const result = detector.observe({ operation: "PLACEMENT", condition: conditionOfPlacementOutcome(outcome) }, atMs);
+  const result = detector.observe({ operation: "PLACEMENT", condition: conditionOfPlacementOutcome(outcome), sentAtMs }, atMs);
   expect(result.ok).toBe(true);
 }
 
@@ -91,10 +92,10 @@ const C9_STRINGS: readonly [string, HttpFixture][] = [
 ];
 
 describe("restricted-mode fixtures → pinned SDK → WP-260 → the OMS's reading → the detector", () => {
-  it("425 without a body or Retry-After (U-9) → RESTARTING for the documented 1 s fallback, then post-only for two minutes", async () => {
+  it("425 without a body or Retry-After (U-9) → RESTARTING for the documented 1 s fallback, then post-only until the engine is seen back", async () => {
     const detector = documentedDetector();
     await observe(detector, example("http-425-engine-restarting-body-undocumented"), T0);
-    expect(detector.snapshot(T0)).toMatchObject({ mode: "RESTARTING", omsMode: "TRADING_UNAVAILABLE", restartingUntilMs: T0 + 1000, postOnlyUntilMs: T0 + 1000 + 120_000 });
+    expect(detector.snapshot(T0)).toMatchObject({ mode: "RESTARTING", omsMode: "TRADING_UNAVAILABLE", restartingUntilMs: T0 + 1000, postOnlyUntilMs: null, engineReturnPending: true });
     // The next failed attempt after the wait doubles it.
     await observe(detector, example("http-425-engine-restarting-body-undocumented"), T0 + 1000);
     expect(detector.snapshot(T0 + 1000).restartingUntilMs).toBe(T0 + 3000);
@@ -106,9 +107,29 @@ describe("restricted-mode fixtures → pinned SDK → WP-260 → the OMS's readi
     const detector = documentedDetector();
     await observe(detector, { http_status: 425, headers: { "Retry-After": "1" } }, T0);
     const at = (ms: number): VenueModeSnapshot["mode"] => detector.snapshot(ms).mode;
-    expect([at(T0 + 999), at(T0 + 1000), at(T0 + 120_999), at(T0 + 121_000)]).toEqual(["RESTARTING", "POST_ONLY", "POST_ONLY", "NORMAL"]);
-    expect(detector.placementGate({ postOnly: false }, T0 + 1000)).toMatchObject({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY" });
+    // The backoff's end is not the engine's return: POST_ONLY, with no end, until an answer shows it back.
+    expect([at(T0 + 999), at(T0 + 1000), at(T0 + 121_000), at(T0 + 600_000)]).toEqual(["RESTARTING", "POST_ONLY", "POST_ONLY", "POST_ONLY"]);
+    expect(detector.placementGate({ postOnly: false }, T0 + 1000)).toMatchObject({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY", retryAtMs: null });
     expect(detector.placementGate({ postOnly: true }, T0 + 1000)).toEqual({ allowed: true });
+    // The documented post-only refusal (503 post_only_mode, retry 79 s) of an order sent after the 425 is the running
+    // engine's own answer: POST_ONLY for exactly those 79 s, then NORMAL.
+    await observe(detector, example("http-503-post-only"), T0 + 5000);
+    expect(detector.snapshot(T0 + 5000)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: false, postOnlyUntilMs: T0 + 84_000 });
+    expect([at(T0 + 83_999), at(T0 + 84_000)]).toEqual(["POST_ONLY", "NORMAL"]);
+  });
+
+  it("D-24: the 400 closed-only rejection → WP-260's REQUEST_REJECTED → no mode, and no resend is ever cleared for it (OP-R1-10)", async () => {
+    const report = normalized(readRepoText("docs/venue/verified-2026-09-30.md"));
+    expect(report).toContain("\"'0x1234...' address in closed only mode\"");
+    const outcome = await outcomeFor({ http_status: 400, body: { error: "'0x1234...' address in closed only mode" } });
+    expect(outcome).toMatchObject({ kind: "UNKNOWN", error: { kind: "REQUEST_REJECTED", effect: "UNKNOWN" } });
+    expect(conditionOfPlacementOutcome(outcome)).toEqual({ kind: "NONE" });
+    const detector = documentedDetector();
+    await observe(detector, { http_status: 400, body: { error: "'0x1234...' address in closed only mode" } }, T0);
+    expect(detector.snapshot(T0).mode).toBe("NORMAL");
+    for (const postOnly of [false, true]) {
+      expect(detector.retransmissionGate({ errorKind: "REQUEST_REJECTED", postOnly }, T0 + 60_000)).toEqual({ allowed: false, reason: "RETRY_ONLY_RESTART", retryAtMs: null });
+    }
   });
 
   it("503 post_only_mode with Retry-After 79 → POST_ONLY exactly 79 s; cancels stay allowed", async () => {

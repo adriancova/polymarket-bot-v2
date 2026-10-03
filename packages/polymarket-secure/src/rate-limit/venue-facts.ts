@@ -64,7 +64,7 @@ export const RATE_LIMIT_VENUE_FACTS = Object.freeze({
   IP_THROTTLED: {
     id: "IP_THROTTLED",
     consequence:
-      "IP endpoint classes are budgeted locally as sliding windows: an excess request is queued by Cloudflare, not refused, so a lower class could otherwise delay a heartbeat or a safety cancel without any error to react to.",
+      "IP endpoint classes are budgeted locally as sliding windows: an excess request is queued by Cloudflare, not refused, so a lower class could otherwise delay a heartbeat or a safety cancel without any error to react to. For the same reason a 429 is never read as an IP class's limit: on a request with no signer bucket it holds back only that operation, for its class and below.",
     sourceKind: "REPORT",
     source: REPORT_0916,
     section: "§8",
@@ -166,7 +166,8 @@ export const RATE_LIMIT_VENUE_FACTS = Object.freeze({
   },
   RETRY_AFTER_SECONDS: {
     id: "RETRY_AFTER_SECONDS",
-    consequence: "A 429's `Retry-After` is a whole number of seconds; the charged bucket waits exactly that long.",
+    consequence:
+      "A 429's `Retry-After` is a whole number of seconds; the charged signer bucket (or, with none, the operation for the request's class and below) waits exactly that long, and no other header of the same response lengthens it.",
     sourceKind: "PINNED_SDK",
     source: PINNED_SDK,
     section: "RateLimitError.retryAfter",

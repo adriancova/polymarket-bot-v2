@@ -11,14 +11,26 @@
  *   ("`rate-limits.json` matches value-for-value", 2026-09-16 §8).
  * - The restricted-mode snapshot's venue durations are tied to their quotes.
  * - Both snapshots carry a source and an effective time, and both parse.
+ *
+ * OFFLINE: every test installs WP-260's network tripwire; none may be refused.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { parseRestrictedModeConfiguration, type RestrictedModeConfiguration } from "../../../packages/oms/src/index.js";
 import { parseRateLimitConfiguration, type RateLimitConfiguration } from "../../../packages/polymarket-secure/src/index.js";
+import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/index.js";
 
 import { RATE_LIMIT_SNAPSHOT_PATH, RESTRICTED_MODE_SNAPSHOT_PATH, normalized, readJson, readRepoText, venueExample } from "./support.js";
+
+let tripwire: NetworkTripwire;
+beforeEach(() => {
+  tripwire = installNetworkTripwire();
+});
+afterEach(() => {
+  tripwire.uninstall();
+  expect(tripwire.refused()).toEqual([]);
+});
 
 const REPORT_0916 = normalized(readRepoText("docs/venue/verified-2026-09-16.md"));
 const REPORT_0930 = normalized(readRepoText("docs/venue/verified-2026-09-30.md"));

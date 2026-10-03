@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Grant, PollEvent, RateLimitBudget, RequestDecision } from "./budget.js";
 import { SIGNER_A, SIGNER_B, T0, ZERO_HEADROOM, budgetOf, iso, snapshot, warm } from "./fixtures.test-support.js";
+import { parseRateLimitHeaders } from "./headers.js";
 import { PRIORITY_LADDER, type PriorityClass } from "./priority.js";
 
 /** The operation each ladder class is filed with in these tests. */
@@ -350,5 +351,131 @@ describe("snapshots take effect at their effective time (acceptance 3)", () => {
     expect(budget.poll(T1)).toEqual([
       { kind: "REFUSED", ticketId: queued.kind === "QUEUED" ? queued.ticketId : "", refusal: { code: "UNKNOWN_OPERATION", message: expect.any(String) as string } },
     ]);
+  });
+});
+
+describe("a snapshot binds at its effective instant, and only with complete history (r1: CX310-R1-01, CX310-R1-03, N01)", () => {
+  const T1 = T0 + 30_000;
+  /** The synthetic snapshot with the Base tier's order burst (and rate) replaced, effective at `atMs`. */
+  const withOrderBucket = (snapshotId: string, atMs: number, orderBurst: number, orderTokensPerSecond = 1): ReturnType<typeof snapshot> => {
+    const document = snapshot({ snapshotId, effectiveFrom: iso(atMs) });
+    const tiers = document["signerTiers"] as { [key: string]: unknown }[];
+    document["signerTiers"] = tiers.map((tier) => (tier["tier"] === "Base" ? { ...tier, orderBurst, orderTokensPerSecond } : tier)) as never;
+    return document;
+  };
+  const place = (budget: RateLimitBudget, atMs: number): RequestDecision => budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, atMs);
+
+  it("requests AT the instant a lowered burst takes effect see the new burst (CX310-R1-01)", () => {
+    const budget = budgetOf(snapshot(), withOrderBucket("lowered", T1, 1));
+    warm(budget, SIGNER_A, T1 - 10_000);
+    expect([0, 1, 2, 3].map(() => place(budget, T1).kind)).toEqual(["GRANTED", "QUEUED", "QUEUED", "QUEUED"]);
+    expect(budget.view(T1).signers[0]?.order).toMatchObject({ tokens: "0", capacity: 1 });
+  });
+
+  it("a poll at exactly that instant (the one nextWakeAtMs names) grants only what the new burst holds (CX310-R1-01)", () => {
+    const budget = budgetOf(snapshot(), withOrderBucket("lowered", T1, 1));
+    warm(budget, SIGNER_A, T1 - 10_000);
+    const grant = grantOf(place(budget, T1 - 2000));
+    budget.complete(grant, { atMs: T1 - 2000, error: { kind: "RATE_LIMITED", retryAfterSeconds: 2 } });
+    const queued = [0, 1, 2, 3].map(() => place(budget, T1 - 2000));
+    expect(queued.every((decision) => decision.kind === "QUEUED")).toBe(true);
+    expect(budget.nextWakeAtMs(T1 - 2000)).toBe(T1);
+    expect(granted(budget.poll(T1))).toHaveLength(1);
+    expect(budget.view(T1).signers[0]?.order).toMatchObject({ tokens: "0", capacity: 1 });
+  });
+
+  it("a lowered burst caps the level for the whole segment it governs, before a later raise refills from there (N01)", () => {
+    const budget = budgetOf(snapshot(), withOrderBucket("lowered", T1, 1), withOrderBucket("raised", T1 + 10_000, 4));
+    warm(budget, SIGNER_A, T1 - 10_000);
+    // Read only at the end: 4 under A, capped at 1 from T1, 1 + 1 token/s for 1 s under the raised burst.
+    expect(budget.view(T1 + 11_000).signers[0]?.order.tokens).toBe("2");
+  });
+
+  it("a snapshot whose longer window would count dropped history is refused; one late enough is accepted and counts exactly (CX310-R1-03)", () => {
+    const short = snapshot();
+    short["ipEndpointClasses"] = (short["ipEndpointClasses"] as { readonly classId: string }[]).map((entry) => ({ classId: entry.classId, windows: [{ limit: 2, windowMs: 1000 }] })) as never;
+    short["relayer"] = { windows: [{ limit: 2, windowMs: 1000 }] };
+    const budget = budgetOf(short);
+    const read = (atMs: number): string => budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, atMs).kind;
+    // The third request drops the first two from history (no window on the timeline can count them any more).
+    expect([read(T0), read(T0), read(T0 + 1001)]).toEqual(["GRANTED", "GRANTED", "GRANTED"]);
+    const longer = (atMs: number): ReturnType<typeof snapshot> => {
+      const document = structuredClone(short) as ReturnType<typeof snapshot>;
+      document["snapshotId"] = `longer-${String(atMs - T0)}`;
+      document["effectiveFrom"] = iso(atMs);
+      document["ipEndpointClasses"] = (short["ipEndpointClasses"] as { readonly classId: string }[]).map((entry) => ({ classId: entry.classId, windows: [{ limit: 2, windowMs: 10_000 }] })) as never;
+      return document;
+    };
+    // At T0 + 2000 a 10 s window would count the two dropped requests at T0.
+    expect(budget.addConfiguration(longer(T0 + 2000))).toMatchObject({ ok: false, refusal: { code: "HISTORY_NOT_RETAINED" } });
+    expect(budget.configurationAt(T0 + 2000)?.snapshotId).toBe("synthetic-a");
+    expect(budget.addConfiguration(longer(T0 + 9999))).toMatchObject({ ok: false, refusal: { code: "HISTORY_NOT_RETAINED" } });
+    // From T0 + 10,000 the window counts only requests after T0, all of them still held.
+    expect(budget.addConfiguration(longer(T0 + 10_000)).ok).toBe(true);
+    expect(read(T0 + 5000)).toBe("GRANTED");
+    // The new window at T0 + 10,000 counts T0 + 1001 and T0 + 5000: full.
+    expect(read(T0 + 10_000)).toBe("QUEUED");
+    expect(budget.view(T0 + 10_000).ipEndpointClasses.find((entry) => entry.budget.dimension === "IP_ENDPOINT_CLASS" && entry.budget.classId === "shared")?.windows).toEqual([
+      { limit: 2, windowMs: 10_000, used: 2 },
+    ]);
+  });
+});
+
+describe("budget mechanics pinned in r1 (OP-R1-04: N02, N05, N06, N07, N08)", () => {
+  /** The synthetic snapshot with the Base tier's order refill at 3 tokens/s: refills of a token are not whole milliseconds. */
+  const thirds = (): ReturnType<typeof snapshot> => {
+    const document = snapshot();
+    const tiers = document["signerTiers"] as { [key: string]: unknown }[];
+    document["signerTiers"] = tiers.map((tier) => (tier["tier"] === "Base" ? { ...tier, orderTokensPerSecond: 3 } : tier)) as never;
+    return document;
+  };
+
+  it("time never runs backwards: a completion reported with an earlier instant waits from the latest instant seen (N02)", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0));
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 100).kind).toBe("GRANTED");
+    budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 1 } });
+    expect(budget.view(T0 + 100).signers[0]?.order.blockedUntilMs).toBe(T0 + 1100);
+  });
+
+  it("refill is exact to the thousandth of a token, never rounded up to the burst early (N06)", () => {
+    const budget = budgetOf(thirds());
+    warm(budget, SIGNER_A, T0);
+    expect(budget.view(T0 + 333).signers[0]?.order.tokens).toBe("0.999");
+    expect(budget.view(T0 + 1333).signers[0]?.order.tokens).toBe("3.999");
+    expect(budget.view(T0 + 1334).signers[0]?.order.tokens).toBe("4");
+  });
+
+  it("nextWakeAtMs rounds a refill wait UP: polling then grants (N05)", () => {
+    const budget = budgetOf(thirds());
+    warm(budget, SIGNER_A, T0);
+    const queued = budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0);
+    expect(queued.kind).toBe("QUEUED");
+    // One token at 3 per second: 333.3 ms, so 334.
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 334);
+    expect(granted(budget.poll(T0 + 333))).toEqual([]);
+    expect(granted(budget.poll(T0 + 334))).toEqual([queued.kind === "QUEUED" ? queued.ticketId : ""]);
+  });
+
+  it("request() never jumps an earlier waiter of the SAME class: first come, first served (N07)", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0);
+    const first = budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0);
+    expect(first.kind).toBe("QUEUED");
+    // At T0 + 1000 one token has refilled; a later new order asks before any poll: the earlier one holds it.
+    expect(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0 + 1000).kind).toBe("QUEUED");
+    expect(granted(budget.poll(T0 + 1000))).toEqual([first.kind === "QUEUED" ? first.ticketId : ""]);
+  });
+
+  it("on a tier without a negative cancel balance, the post-cancel floor never raises a debt the venue reported (N08)", () => {
+    const budget = budgetOf(snapshot({}, { assumedSignerTier: "Floor" }));
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const sweep = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    const single = grantOf(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_A }, T0));
+    budget.complete(single, { atMs: T0, feedback: parseRateLimitHeaders({ httpStatus: 200, headers: { "Poly-RateLimit-Remaining": "-3" } }) });
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-3");
+    expect(budget.complete(sweep, { atMs: T0, canceledCount: 8 }).ok).toBe(true);
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-3");
   });
 });

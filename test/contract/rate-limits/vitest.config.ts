@@ -7,9 +7,10 @@
  *
  * Self-contained, like the `polymarket-secure` suite: NO ALIASES. Sources are
  * imported through RELATIVE paths; the pinned SDK is reached only through
- * `packages/polymarket-secure/src/testing` (F6). OFFLINE: every test installs
- * the package's network tripwire; the only HTTP "responses" are in-memory
- * fixtures.
+ * `packages/polymarket-secure/src/testing` (F6). OFFLINE: every test FILE of
+ * the suite installs the package's network tripwire before each test and
+ * fails any test during which a request was refused (there is no shared
+ * setup file); the only HTTP "responses" are in-memory fixtures.
  *
  * Run it with (it is chained into the package's `test:contract`, after the
  * WP-260 suite, and typechecked first):

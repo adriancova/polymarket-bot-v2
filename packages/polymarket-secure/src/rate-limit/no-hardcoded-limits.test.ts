@@ -73,7 +73,7 @@ function productionSources(): string[] {
 describe("no limit value is hardcoded in packages/polymarket-secure/src/rate-limit", () => {
   it("scans every production source and finds no number but 0, 1 and the named units", () => {
     const files = productionSources();
-    expect(files).toEqual(["budget.ts", "configuration.ts", "headers.ts", "index.ts", "plain-data.ts", "priority.ts", "venue-facts.ts"]);
+    expect(files).toEqual(["budget.ts", "configuration.ts", "headers.ts", "index.ts", "plain-data.ts", "priority.ts", "units.ts", "venue-facts.ts"]);
     const found = files.flatMap((name) => hardcodedNumbers(readFileSync(path.join(DIR, name), "utf8"), name));
     expect(found).toEqual([]);
   });

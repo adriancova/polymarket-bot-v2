@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { Grant, RateLimitBudget, RequestDecision } from "./budget.js";
 import { SIGNER_A, T0, budgetOf, snapshot, warm } from "./fixtures.test-support.js";
 import { feedbackFromObservation, parseRateLimitHeaders, signerBucketOfObservation, type RateLimitFeedback } from "./headers.js";
+import { MAX_TOKEN_MAGNITUDE } from "./units.js";
 
 function grantOf(decision: RequestDecision): Grant {
   if (decision.kind !== "GRANTED") throw new Error(`expected GRANTED, got ${decision.kind}`);
@@ -204,7 +205,7 @@ describe("the budget applies each documented header as documented", () => {
     // (checked inside the wait: the budget's time never runs backwards).
     expect(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0 + 6).kind).toBe("GRANTED");
     expect(budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0 + 6).kind).toBe("GRANTED");
-    expect(budget.view(T0 + 6).ipEndpointClasses.every((entry) => entry.blockedUntilMs === null)).toBe(true);
+    expect(budget.view(T0 + 6).operationWaits).toEqual([]);
     expect(place(budget, T0 + 2004).kind).toBe("QUEUED");
     expect(budget.poll(T0 + 2004)).toEqual([]);
     expect(budget.poll(T0 + 2005).map((event) => event.kind)).toEqual(["GRANTED"]);
@@ -246,16 +247,56 @@ describe("the budget applies each documented header as documented", () => {
     expect(waits).toEqual([1000, 990, 2000, 4000]);
   });
 
-  it("a request with no signer bucket: a 429 waits on its IP classes; header fields are flagged, not applied", () => {
+  it("a request with no signer bucket: a 429 holds back only that operation, for its class and below; header fields are flagged, not applied (OP-R1-01)", () => {
     const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
     const grant = grantOf(budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0));
     const result = budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 1 }, feedback: headers(429, { "Poly-RateLimit-Remaining": "0" }) });
-    expect(result.ok && result.value.filter((effect) => effect.kind === "WAIT_APPLIED").map((effect) => (effect.kind === "WAIT_APPLIED" ? effect.budget : null))).toEqual([
-      { dimension: "IP_ENDPOINT_CLASS", classId: "shared" },
-      { dimension: "IP_ENDPOINT_CLASS", classId: "reads" },
+    expect(result.ok && result.value.filter((effect) => effect.kind === "WAIT_APPLIED" || effect.kind === "OPERATION_WAIT_APPLIED")).toEqual([
+      {
+        kind: "OPERATION_WAIT_APPLIED",
+        operationId: "read",
+        priorities: ["RECONCILIATION_READ", "RISK_REDUCING_ORDER", "STALE_QUOTE_CANCEL", "NEW_ORDER", "METADATA_ANALYTICS"],
+        untilMs: T0 + 1000,
+        basis: "RETRY_AFTER",
+      },
     ]);
     expect(result.ok && result.value).toContainEqual({ kind: "FEEDBACK_WITHOUT_SIGNER_BUCKET" });
-    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0 + 999).kind).toBe("QUEUED");
+    // Every other operation, the classes above it and every IP class it drew on are untouched, inside the wait.
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0 + 1).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0 + 1).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "read_dual", priority: "RECONCILIATION_READ" }, T0 + 1).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0 + 1).kind).toBe("GRANTED");
+    // The operation itself waits exactly Retry-After, for its own class and the classes below it.
+    const same = budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0 + 1);
+    const lower = budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 1);
+    expect([same.kind, lower.kind]).toEqual(["QUEUED", "QUEUED"]);
+    expect(budget.view(T0 + 1).operationWaits.map((entry) => [entry.priority, entry.untilMs - T0])).toEqual([
+      ["RECONCILIATION_READ", 1000],
+      ["RISK_REDUCING_ORDER", 1000],
+      ["STALE_QUOTE_CANCEL", 1000],
+      ["NEW_ORDER", 1000],
+      ["METADATA_ANALYTICS", 1000],
+    ]);
+    expect(budget.nextWakeAtMs(T0 + 1)).toBe(T0 + 1000);
+    expect(budget.poll(T0 + 999)).toEqual([]);
+    expect(budget.poll(T0 + 1000).map((event) => event.kind)).toEqual(["GRANTED", "GRANTED"]);
+  });
+
+  it("a lower class's 429 on an operation never holds back a higher class of the same operation (OP-R1-01)", () => {
+    const budget = budgetOf();
+    const grant = grantOf(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0));
+    const result = budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+    expect(result.ok && result.value).toEqual([{ kind: "OPERATION_WAIT_APPLIED", operationId: "read", priorities: ["METADATA_ANALYTICS"], untilMs: T0 + 3_600_000, basis: "RETRY_AFTER" }]);
+    expect(budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0 + 1).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0 + 1).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 1).kind).toBe("QUEUED");
+    // Without Retry-After or Reset: the fallback, on the operation only.
+    const other = budgetOf();
+    const read = grantOf(other.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0));
+    other.complete(read, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: null } });
+    expect(other.view(T0).operationWaits).toEqual([{ operationId: "read", priority: "METADATA_ANALYTICS", untilMs: T0 + 1000 }]);
+    expect(other.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0 + 500).kind).toBe("GRANTED");
   });
 
   it("an undocumented header changes nothing in the budget", () => {
@@ -290,5 +331,144 @@ describe("the budget applies each documented header as documented", () => {
     budget.complete(grantOf(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0 + 1000)), { atMs: T0 + 1000, error: null });
     const result = budget.complete(grantOf(place(budget, T0 + 2000)), { atMs: T0 + 2000, error: { kind: "RATE_LIMITED", retryAfterSeconds: null } });
     expect(result.ok && result.value).toContainEqual(expect.objectContaining({ kind: "WAIT_APPLIED", untilMs: T0 + 3000, basis: "FALLBACK" }));
+  });
+});
+
+describe("one wait per response: a 429's Retry-After is never lengthened by the same response's Reset (CX310-R1-02)", () => {
+  const cancel = (budget: RateLimitBudget, atMs: number): RequestDecision =>
+    budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, atMs);
+  const resetAt = (ms: number): string => String(ms / 1000);
+
+  it("the completion path: Retry-After 2 with Remaining -1 and Reset +10 s waits exactly 2 s; the bucket's own refill then admits the cancel", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(cancel(budget, T0));
+    const feedback = headers(429, { "Retry-After": "2", "Poly-RateLimit-Remaining": "-1", "Poly-RateLimit-Reset": resetAt(T0 + 10_000) });
+    const result = budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 2 }, feedback });
+    expect(result.ok && result.value.filter((effect) => effect.kind === "WAIT_APPLIED")).toEqual([
+      { kind: "WAIT_APPLIED", budget: { dimension: "SIGNER_CANCEL_BUCKET", signer: SIGNER_A }, untilMs: T0 + 2000, basis: "RETRY_AFTER" },
+    ]);
+    const next = cancel(budget, T0);
+    expect(next.kind).toBe("QUEUED");
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 2000);
+    expect(budget.poll(T0 + 1999)).toEqual([]);
+    expect(budget.view(T0 + 2000).signers[0]?.cancel).toMatchObject({ tokens: "3", blockedUntilMs: null });
+    expect(budget.poll(T0 + 2000).map((event) => event.kind)).toEqual(["GRANTED"]);
+  });
+
+  it("the observation path: the SDK reports the 429's headers before the call returns; the completion still waits exactly Retry-After", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(cancel(budget, T0));
+    const observation = { bucket: "cancel", remaining: -1, resetUnixSeconds: (T0 + 10_000) / 1000, tier: null, warning: false };
+    const observed = budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "CANCEL" }, feedbackFromObservation(observation), T0);
+    expect(observed.ok && observed.value).toEqual([{ kind: "FEEDBACK_ATTACHED", grantId: grant.grantId }]);
+    const result = budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 2 } });
+    expect(result.ok && result.value).toContainEqual({ kind: "ATTACHED_FEEDBACK_APPLIED" });
+    expect(budget.view(T0).signers[0]?.cancel).toMatchObject({ tokens: "-1", blockedUntilMs: T0 + 2000 });
+    expect(cancel(budget, T0).kind).toBe("QUEUED");
+    expect(budget.poll(T0 + 2000).map((event) => event.kind)).toEqual(["GRANTED"]);
+  });
+
+  it("an observation applied on its own with the documented 429 status: Retry-After exactly, its Reset ignored", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const observation = { bucket: "cancel", remaining: -1, resetUnixSeconds: (T0 + 10_000) / 1000, tier: null, warning: false };
+    const result = budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "CANCEL" }, feedbackFromObservation(observation, { httpStatus: 429, retryAfterSeconds: 2 }), T0);
+    expect(result.ok && result.value.filter((effect) => effect.kind === "WAIT_APPLIED")).toEqual([
+      { kind: "WAIT_APPLIED", budget: { dimension: "SIGNER_CANCEL_BUCKET", signer: SIGNER_A }, untilMs: T0 + 2000, basis: "RETRY_AFTER" },
+    ]);
+    // Without Retry-After, the 429's later Reset is the wait (bounded), even with a balance of zero.
+    const other = budgetOf();
+    warm(other, SIGNER_A, T0 - 10_000);
+    const zero = { bucket: "order", remaining: 0, resetUnixSeconds: (T0 + 5000) / 1000, tier: null, warning: false };
+    other.observeSignerFeedback({ signer: SIGNER_A, bucket: "ORDER" }, feedbackFromObservation(zero, { httpStatus: 429, retryAfterSeconds: null }), T0);
+    expect(other.view(T0).signers[0]?.order.blockedUntilMs).toBe(T0 + 5000);
+  });
+});
+
+describe("one response is counted once: an SDK observation and its grant's completion (OP-R1-03)", () => {
+  const cancelAll = (budget: RateLimitBudget, atMs: number): RequestDecision =>
+    budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, atMs);
+  const observe = (budget: RateLimitBudget, remaining: number) =>
+    budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "CANCEL" }, feedbackFromObservation({ bucket: "cancel", remaining, resetUnixSeconds: null, tier: null, warning: false }), T0);
+
+  it("the cancel-all's own observation (its Remaining already includes the per-canceled debit) is not debited twice", () => {
+    const control = budgetOf();
+    warm(control, SIGNER_A, T0 - 10_000);
+    control.complete(grantOf(cancelAll(control, T0)), { atMs: T0, canceledCount: 8, feedback: headers(200, { "Poly-RateLimit-Remaining": "-3" }) });
+    expect(control.view(T0).signers[0]?.cancel.tokens).toBe("-3");
+
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(cancelAll(budget, T0));
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("5");
+    expect(observe(budget, -3)).toEqual({ ok: true, value: [{ kind: "FEEDBACK_ATTACHED", grantId: grant.grantId }] });
+    const result = budget.complete(grant, { atMs: T0, canceledCount: 8 });
+    expect(result.ok && result.value).toContainEqual({ kind: "ATTACHED_FEEDBACK_APPLIED" });
+    expect(result.ok && result.value).toContainEqual(expect.objectContaining({ kind: "CANCELED_DEBITED", tokens: 8 }));
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-3");
+    expect(budget.view(T0)).toEqual(control.view(T0));
+  });
+
+  it("a completion that carries the response's own headers supersedes the attached observation (no double count either way)", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(cancelAll(budget, T0));
+    observe(budget, -3);
+    const result = budget.complete(grant, { atMs: T0, canceledCount: 8, feedback: headers(200, { "Poly-RateLimit-Remaining": "-3", "Poly-RateLimit-Warning": "true" }) });
+    expect(result.ok && result.value).toContainEqual({ kind: "ATTACHED_FEEDBACK_SUPERSEDED" });
+    expect(budget.view(T0).signers[0]?.cancel).toMatchObject({ tokens: "-3", warnings: 1 });
+  });
+
+  it("an observation is attributed only when exactly one grant is outstanding on its bucket; otherwise it applies at once", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    // No grant outstanding: applied at once.
+    expect(observe(budget, 4)).toMatchObject({ ok: true, value: [{ kind: "REMAINING_APPLIED", tokens: "4" }] });
+    const first = grantOf(cancelAll(budget, T0));
+    const second = grantOf(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_A }, T0));
+    // Two outstanding: ambiguous, applied at once (conservative).
+    expect(observe(budget, 1)).toMatchObject({ ok: true, value: [{ kind: "REMAINING_APPLIED", tokens: "1" }] });
+    budget.complete(second, { atMs: T0 });
+    // One outstanding: attached; a second observation before its completion is not its response: applied at once.
+    expect(observe(budget, 0)).toEqual({ ok: true, value: [{ kind: "FEEDBACK_ATTACHED", grantId: first.grantId }] });
+    expect(observe(budget, -2)).toMatchObject({ ok: true, value: [{ kind: "REMAINING_APPLIED", tokens: "-2" }] });
+    // An order-bucket observation is not attributed to a cancel-bucket grant.
+    expect(budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "ORDER" }, feedbackFromObservation({ bucket: "order", remaining: 2, resetUnixSeconds: null, tier: null, warning: false }), T0)).toMatchObject({
+      ok: true,
+      value: [{ kind: "REMAINING_APPLIED" }],
+    });
+  });
+});
+
+describe("Poly-RateLimit-Remaining is bounded so token levels stay exact (OP-R1-05)", () => {
+  it("a magnitude above MAX_TOKEN_MAGNITUDE is MALFORMED and never interpreted, from headers or from the SDK observation", () => {
+    expect(MAX_TOKEN_MAGNITUDE).toBe(9_007_199_254);
+    expect(headers(200, { "Poly-RateLimit-Remaining": "-9007199254" }).remaining).toBe(-9_007_199_254);
+    for (const value of ["-9007199255", "-123456789012345", "9007199254740991"]) {
+      expect(headers(200, { "Poly-RateLimit-Remaining": value }), value).toMatchObject({ remaining: null, flags: [{ kind: "MALFORMED_HEADER", header: "Poly-RateLimit-Remaining" }] });
+    }
+    expect(feedbackFromObservation({ bucket: "cancel", remaining: -123_456_789_012_345, resetUnixSeconds: null, tier: null, warning: false })).toMatchObject({
+      remaining: null,
+      flags: [{ kind: "MALFORMED_HEADER", header: "Poly-RateLimit-Remaining" }],
+    });
+  });
+
+  it("the budget's level stays an exact integer of thousandths, and a hand-built feedback outside the bound is refused", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    const absurd = headers(200, { "Poly-RateLimit-Remaining": "-123456789012345" });
+    const result = budget.complete(grant, { atMs: T0, feedback: absurd });
+    expect(result.ok && result.value).toEqual([{ kind: "FEEDBACK_FLAG", flag: { kind: "MALFORMED_HEADER", header: "Poly-RateLimit-Remaining" } }]);
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("5");
+    const forged: RateLimitFeedback = { httpStatus: 200, remaining: -123_456_789_012_345, resetUnixSeconds: null, tier: null, warning: false, retryAfterSeconds: null, flags: [] };
+    expect(budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "CANCEL" }, forged, T0)).toMatchObject({ ok: false, refusal: { code: "INVALID_REQUEST" } });
+    const sweep = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.complete(sweep, { atMs: T0, canceledCount: 123_456_789_012_345 })).toMatchObject({ ok: false, refusal: { code: "INVALID_COMPLETION" } });
+    expect(budget.complete(sweep, { atMs: T0, canceledCount: 2 }).ok).toBe(true);
+    // 6 (full) - 1 (the cancel) - 1 (the cancel-all) - 2 (canceled): exact.
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("2");
   });
 });

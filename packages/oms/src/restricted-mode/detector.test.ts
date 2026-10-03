@@ -31,14 +31,46 @@ function modes(detector: VenueModeDetector, instants: readonly number[]): string
   return instants.map((atMs) => detector.snapshot(atMs).mode);
 }
 
+/** An answer (a completed cancel, or a placement the engine answered) to a request sent at `sentAtMs`, observed at `atMs`. */
+function answered(detector: VenueModeDetector, operation: "PLACEMENT" | "CANCEL", sentAtMs: number | undefined, atMs: number): void {
+  const signal = sentAtMs === undefined ? { operation, condition: { kind: "ANSWERED" as const } } : { operation, condition: { kind: "ANSWERED" as const }, sentAtMs };
+  expect(detector.observe(signal, atMs).ok).toBe(true);
+}
+
 describe("RESTARTING (HTTP 425)", () => {
-  it("honours Retry-After EXACTLY, then post-only for the window, then normal", () => {
+  it("honours Retry-After EXACTLY, then POST_ONLY with no end until the engine is seen back, then the window from that answer, then normal (OP-R1-02)", () => {
     const detector = detectorOf();
     place(detector, RESTART(2), T0);
-    expect(modes(detector, [T0, T0 + 1999, T0 + 2000, T0 + 6999, T0 + 7000])).toEqual(["RESTARTING", "RESTARTING", "POST_ONLY", "POST_ONLY", "NORMAL"]);
+    // However long it takes: the backoff's end is not the engine's return.
+    expect(modes(detector, [T0, T0 + 1999, T0 + 2000, T0 + 7000, T0 + 86_400_000])).toEqual(["RESTARTING", "RESTARTING", "POST_ONLY", "POST_ONLY", "POST_ONLY"]);
+    expect(detector.snapshot(T0 + 2000)).toMatchObject({ engineReturnPending: true, lastRestartObservedMs: T0, postOnlyUntilMs: null });
     expect(detector.omsVenueMode(T0 + 1999)).toBe("TRADING_UNAVAILABLE");
     expect(detector.omsVenueMode(T0 + 2000)).toBe("POST_ONLY");
-    expect(detector.omsVenueMode(T0 + 7000)).toBe("NORMAL");
+    // A cancel sent at T0 + 3000 is answered at T0 + 3010: the engine is back, and its window ends at most 5 s later.
+    answered(detector, "CANCEL", T0 + 3000, T0 + 3010);
+    expect(detector.snapshot(T0 + 3010)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: false, postOnlyUntilMs: T0 + 8010 });
+    expect(modes(detector, [T0 + 8009, T0 + 8010])).toEqual(["POST_ONLY", "NORMAL"]);
+    expect(detector.omsVenueMode(T0 + 8010)).toBe("NORMAL");
+  });
+
+  it("only an answer to a request SENT after the last 425 shows the engine back (OP-R1-02)", () => {
+    const detector = detectorOf();
+    place(detector, RESTART(1), T0);
+    // Sent before the 425 (a request in flight when the engine went down), at the same instant, or with no send instant: no evidence.
+    answered(detector, "CANCEL", T0 - 50, T0 + 2000);
+    answered(detector, "PLACEMENT", T0, T0 + 2000);
+    answered(detector, "PLACEMENT", undefined, T0 + 2000);
+    expect(detector.snapshot(T0 + 2000)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: true });
+    // A post-only refusal of a request sent after the 425 is the running engine's own answer: its Retry-After ends the window.
+    const refusal = conditionOfPlacement(POST_ONLY_REFUSED(30));
+    expect(detector.observe({ operation: "PLACEMENT", condition: refusal, sentAtMs: T0 + 2000 }, T0 + 2001).ok).toBe(true);
+    expect(detector.snapshot(T0 + 2001)).toMatchObject({ engineReturnPending: false, postOnlyUntilMs: T0 + 32_001 });
+    expect(modes(detector, [T0 + 32_000, T0 + 32_001])).toEqual(["POST_ONLY", "NORMAL"]);
+    // A later 425 starts a new episode: the earlier evidence no longer counts.
+    place(detector, RESTART(1), T0 + 40_000);
+    answered(detector, "CANCEL", T0 + 39_999, T0 + 41_000);
+    expect(detector.snapshot(T0 + 41_000)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: true });
+    expect(detector.observe({ operation: "CANCEL", condition: { kind: "ANSWERED" }, sentAtMs: T0 + 41_001 }, T0 + 41_000)).toMatchObject({ ok: false, reason: "INVALID_INPUT" });
   });
 
   it("without Retry-After, a bounded exponential backoff that escalates only per failed attempt, and resets on an answer", () => {
@@ -56,7 +88,10 @@ describe("RESTARTING (HTTP 425)", () => {
     }
     expect(waits).toEqual([100, 300, 900, 1000, 1000]);
     expect(detector.snapshot(at).consecutiveRestartFallbacks).toBe(5);
-    place(detector, ACCEPTED, at + 10);
+    // An answer to a request sent before the last 425 is not the engine's return: the run goes on.
+    place(detector, ACCEPTED, at + 5);
+    expect(detector.snapshot(at + 5).consecutiveRestartFallbacks).toBe(5);
+    answered(detector, "PLACEMENT", at + 5, at + 10);
     expect(detector.snapshot(at + 10).consecutiveRestartFallbacks).toBe(0);
     place(detector, RESTART(null), at + 20);
     expect((detector.snapshot(at + 20).restartingUntilMs ?? 0) - (at + 20)).toBe(100);
@@ -149,8 +184,12 @@ describe("the gates: no blind retry in post-only mode (acceptance 2)", () => {
     const detector = detectorOf();
     place(detector, RESTART(1), T0);
     expect(detector.placementGate({ postOnly: true }, T0)).toEqual({ allowed: false, reason: "RESTARTING", retryAtMs: T0 + 1000 });
-    expect(detector.placementGate({ postOnly: false }, T0 + 1000)).toEqual({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY", retryAtMs: T0 + 6000 });
+    // The engine's return is unseen: no instant is known at which a non-post-only order may go.
+    expect(detector.placementGate({ postOnly: false }, T0 + 1000)).toEqual({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY", retryAtMs: null });
     expect(detector.placementGate({ postOnly: true }, T0 + 1000)).toEqual({ allowed: true });
+    expect(detector.placementGate({ postOnly: false }, T0 + 6000)).toMatchObject({ allowed: false, retryAtMs: null });
+    answered(detector, "PLACEMENT", T0 + 1000, T0 + 1000);
+    expect(detector.placementGate({ postOnly: false }, T0 + 1000)).toEqual({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY", retryAtMs: T0 + 6000 });
     expect(detector.placementGate({ postOnly: false }, T0 + 6000)).toEqual({ allowed: true });
     place(detector, UNAVAILABLE(), T0 + 7000);
     expect(detector.placementGate({ postOnly: true }, T0 + 7000)).toEqual({ allowed: false, reason: "TRADING_UNAVAILABLE", retryAtMs: T0 + 9000 });
@@ -164,7 +203,19 @@ describe("the gates: no blind retry in post-only mode (acceptance 2)", () => {
     }
     expect(detector.retransmissionGate({ errorKind: "ENGINE_RESTARTING", postOnly: true }, T0 + 999)).toMatchObject({ allowed: false, reason: "RESTARTING" });
     expect(detector.retransmissionGate({ errorKind: "ENGINE_RESTARTING", postOnly: false }, T0 + 1000)).toMatchObject({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY" });
+    expect(detector.retransmissionGate({ errorKind: "ENGINE_RESTARTING", postOnly: false }, T0 + 86_400_000)).toMatchObject({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY", retryAtMs: null });
     expect(detector.retransmissionGate({ errorKind: "ENGINE_RESTARTING", postOnly: true }, T0 + 1000)).toEqual({ allowed: true });
+  });
+
+  it("a closed-only rejection (a 400 without a documented code, D-24) moves no mode and never clears a resend (OP-R1-10)", () => {
+    const detector = detectorOf();
+    const closedOnly: PlacementClass = { kind: "UNKNOWN", reason: "ERROR", errorKind: "REQUEST_REJECTED", retryAfterSeconds: null };
+    expect(conditionOfPlacement(closedOnly)).toEqual({ kind: "NONE" });
+    place(detector, closedOnly, T0);
+    expect(detector.snapshot(T0).mode).toBe("NORMAL");
+    for (const postOnly of [false, true]) {
+      expect(detector.retransmissionGate({ errorKind: "REQUEST_REJECTED", postOnly }, T0 + 1000)).toEqual({ allowed: false, reason: "RETRY_ONLY_RESTART", retryAtMs: null });
+    }
   });
 
   it("malformed gate input is refused, never thrown", () => {
@@ -233,6 +284,42 @@ describe("signals and the OMS wiring", () => {
       throw new Error("clock");
     });
     expect(await broken.postOrder({} as never)).toBe(restartAnswer);
+  });
+
+  it("withModeDetection gives the detector each request's SEND instant, read before the call: a cancel in flight across a 425 is no evidence (OP-R1-02)", async () => {
+    const detector = detectorOf();
+    let now = T0;
+    const restart: PlacementOutcome = { kind: "UNKNOWN", reason: "ERROR", error: { kind: "ENGINE_RESTARTING", effect: "UNKNOWN", retryAfterSeconds: null } };
+    const completed: CancelOutcome = { kind: "COMPLETED", canceled: ["v"], notCanceled: [] };
+    let release: ((outcome: CancelOutcome) => void) | undefined;
+    let holdCancels = true;
+    const port: OmsVenuePort = {
+      createLimitOrder: () => Promise.reject(new Error("unused")),
+      postOrder: () => {
+        now += 50;
+        return Promise.resolve(restart);
+      },
+      postOrders: () => Promise.reject(new Error("unused")),
+      cancelOrder: () =>
+        holdCancels
+          ? new Promise<CancelOutcome>((resolve) => {
+              release = resolve;
+            })
+          : Promise.resolve(completed),
+    };
+    const wrapped = withModeDetection(port, detector, () => now);
+    // A cancel sent at T0 is still in flight when a placement sent at T0 meets a 425 (observed at T0 + 50).
+    const inFlight = wrapped.cancelOrder("v-1");
+    await wrapped.postOrder({} as never);
+    expect(detector.snapshot(now)).toMatchObject({ mode: "RESTARTING", lastRestartObservedMs: T0 + 50 });
+    now = T0 + 5000;
+    release?.(completed);
+    await inFlight;
+    expect(detector.snapshot(now)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: true });
+    // A cancel SENT now, after the 425, completes: the engine is back.
+    holdCancels = false;
+    await wrapped.cancelOrder("v-2");
+    expect(detector.snapshot(now)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: false, postOnlyUntilMs: T0 + 10_000 });
   });
 
   it("venueModeSource reads the detector at the clock's instant and fails closed on a bad clock", () => {

@@ -2,15 +2,29 @@
  * Contract: the §9.13 ladder over the DOCUMENTED snapshot (WP-310 acceptance
  * 1, "Safety cancels outrank new orders"). The CLOB general IP class (9,000
  * requests / 10 s) is exhausted; every ladder class is filed on an operation
- * that draws on it.
+ * that draws on it. Also on the documented snapshot: a lower class's 429
+ * never holds back the safety classes (r1, OP-R1-01), and a cancel-all's
+ * response is counted once (OP-R1-03).
+ *
+ * OFFLINE: every test installs WP-260's network tripwire; none may be refused.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { RateLimitBudget, type PollEvent, type PriorityClass, type RequestDecision } from "../../../packages/polymarket-secure/src/index.js";
+import { feedbackFromObservation, parseRateLimitHeaders, RateLimitBudget, type Grant, type PollEvent, type PriorityClass, type RequestDecision } from "../../../packages/polymarket-secure/src/index.js";
 import { PRIORITY_LADDER } from "../../../packages/polymarket-secure/src/rate-limit/index.js";
+import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/index.js";
 
 import { SIGNER, T0, documentedBudget, rateLimitSnapshot } from "./support.js";
+
+let tripwire: NetworkTripwire;
+beforeEach(() => {
+  tripwire = installNetworkTripwire();
+});
+afterEach(() => {
+  tripwire.uninstall();
+  expect(tripwire.refused()).toEqual([]);
+});
 
 const OPERATION_FOR: Readonly<Record<PriorityClass, { readonly operationId: string; readonly signer?: string }>> = {
   ORDER_HEARTBEAT: { operationId: "clob.heartbeat" },
@@ -117,5 +131,68 @@ describe("the documented snapshot under exhaustion", () => {
     expect(budget.nextWakeAtMs(T0 + 1)).toBe(T0 + 4775);
     expect(granted(budget.poll(T0 + 4774))).toEqual([]);
     expect(granted(budget.poll(T0 + 4775))).toEqual([next.kind === "QUEUED" ? next.ticketId : ""]);
+  });
+});
+
+function grantOf(decision: RequestDecision): Grant {
+  if (decision.kind !== "GRANTED") throw new Error(`expected GRANTED, got ${decision.kind}`);
+  return decision.grant;
+}
+
+describe("a 429 on a request with no signer bucket never holds back the safety classes (OP-R1-01)", () => {
+  it.each([
+    ["gamma.markets", "METADATA_ANALYTICS"],
+    ["clob.book", "METADATA_ANALYTICS"],
+    ["clob.get_order", "RECONCILIATION_READ"],
+  ] as const)("after a 429 (Retry-After one hour) on %s filed as %s, a heartbeat and an emergency cancel-all are granted at once", (operationId, priority) => {
+    const budget = documentedBudget();
+    warm(budget, T0 - 60_000);
+    const grant = grantOf(budget.request({ operationId, priority }, T0));
+    const effects = budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+    expect(effects.ok && effects.value).toEqual([
+      { kind: "OPERATION_WAIT_APPLIED", operationId, priorities: PRIORITY_LADDER.slice(PRIORITY_LADDER.indexOf(priority)), untilMs: T0 + 3_600_000, basis: "RETRY_AFTER" },
+    ]);
+    expect(ask(budget, "ORDER_HEARTBEAT", T0 + 1000).kind).toBe("GRANTED");
+    expect(ask(budget, "EMERGENCY_CANCEL", T0 + 1000).kind).toBe("GRANTED");
+    expect(ask(budget, "NEW_ORDER", T0 + 1000).kind).toBe("GRANTED");
+    // The operation itself waits exactly the hour, for its class.
+    const again = budget.request({ operationId, priority }, T0 + 1000);
+    expect(again.kind).toBe("QUEUED");
+    expect(budget.nextWakeAtMs(T0 + 1000)).toBe(T0 + 3_600_000);
+    expect(granted(budget.poll(T0 + 3_600_000))).toEqual([again.kind === "QUEUED" ? again.ticketId : ""]);
+  });
+
+  it("without Retry-After (the fallback), the heartbeat is still granted at once", () => {
+    const budget = documentedBudget();
+    const grant = grantOf(budget.request({ operationId: "gamma.markets", priority: "METADATA_ANALYTICS" }, T0));
+    budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: null } });
+    expect(budget.view(T0).operationWaits).toEqual([{ operationId: "gamma.markets", priority: "METADATA_ANALYTICS", untilMs: T0 + 1000 }]);
+    expect(ask(budget, "ORDER_HEARTBEAT", T0 + 500).kind).toBe("GRANTED");
+  });
+});
+
+describe("a cancel-all's response is counted once under the prescribed wiring (OP-R1-03)", () => {
+  it("the SDK observation (fired before the call returns) and complete({ canceledCount }) leave -381, and the next emergency cancel waits 4,775 ms", () => {
+    for (const viaObservation of [false, true]) {
+      const budget = documentedBudget();
+      warm(budget, T0 - 60_000);
+      const sweep = grantOf(ask(budget, "EMERGENCY_CANCEL", T0));
+      expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("119");
+      if (viaObservation) {
+        const observed = budget.observeSignerFeedback(
+          { signer: SIGNER, bucket: "CANCEL" },
+          feedbackFromObservation({ bucket: "cancel", remaining: -381, resetUnixSeconds: null, tier: "standard", warning: false }),
+          T0,
+        );
+        expect(observed.ok && observed.value).toEqual([{ kind: "FEEDBACK_ATTACHED", grantId: sweep.grantId }]);
+        expect(budget.complete(sweep, { atMs: T0, canceledCount: 500 }).ok).toBe(true);
+      } else {
+        const feedback = parseRateLimitHeaders({ httpStatus: 200, headers: { "Poly-RateLimit-Remaining": "-381", "Poly-RateLimit-Tier": "standard" } });
+        expect(budget.complete(sweep, { atMs: T0, canceledCount: 500, feedback }).ok).toBe(true);
+      }
+      expect(budget.view(T0).signers[0]?.cancel.tokens, String(viaObservation)).toBe("-381");
+      expect(ask(budget, "EMERGENCY_CANCEL", T0 + 1).kind).toBe("QUEUED");
+      expect(budget.nextWakeAtMs(T0 + 1), String(viaObservation)).toBe(T0 + 4775);
+    }
   });
 });

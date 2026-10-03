@@ -94,9 +94,9 @@ describe("rate-limits header fixtures → the documented budget", () => {
     expect(feedback).toMatchObject({ remaining: 0, retryAfterSeconds: 2 });
     budget.complete(grant, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 2 }, feedback });
     expect(budget.view(T0).signers[0]?.order).toMatchObject({ tokens: "0", blockedUntilMs: T0 + 2000 });
-    // Inside the wait (the budget's time never runs backwards): the cancel bucket and the IP classes are free.
+    // Inside the wait (the budget's time never runs backwards): the cancel bucket and every operation are free.
     expect(budget.request({ operationId: "clob.cancel_order", priority: "EMERGENCY_CANCEL", signer: SIGNER }, T0 + 1).kind).toBe("GRANTED");
-    expect(budget.view(T0 + 1).ipEndpointClasses.every((entry) => entry.blockedUntilMs === null)).toBe(true);
+    expect(budget.view(T0 + 1).operationWaits).toEqual([]);
     expect(placeOrder(budget, T0 + 1999).kind).toBe("QUEUED");
     expect(budget.poll(T0 + 1999)).toEqual([]);
     expect(budget.poll(T0 + 2000).map((event) => event.kind)).toEqual(["GRANTED"]);

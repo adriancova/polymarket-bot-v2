@@ -4,7 +4,7 @@
  * WP-270 `VENUE_FACTS` convention, whose rows this module also relies on:
  * `RESTART_RESUBMIT`, `RETRY_ONLY_RESTART`, `POST_ONLY_NO_UNCHANGED_RETRY`,
  * `POST_ONLY_AFTER_RESTART`, `TRADING_UNAVAILABLE_CANCELS_UNKNOWN`,
- * `CANCELS_IN_CANCEL_ONLY`). `facts.test.ts` checks every quote.
+ * `CANCELS_IN_CANCEL_ONLY`). `hygiene.test.ts` checks every quote.
  */
 
 import type { VenueFact } from "../venue-facts.js";
@@ -57,7 +57,8 @@ export const RESTRICTED_MODE_FACTS = Object.freeze({
   },
   POST_ONLY_WINDOW: {
     id: "POST_ONLY_WINDOW",
-    consequence: "After a restart the detector reports POST_ONLY for the snapshot's `postOnlyWindowMs` (two minutes in the fixture).",
+    consequence:
+      "After a restart the detector reports POST_ONLY until the engine is seen back (an answer to a request sent after the last 425), then for the snapshot's `postOnlyWindowMs` (two minutes in the fixture) from that answer.",
     source: REPORT_0930,
     section: "§9",
     quote: "enters post-only mode for two minutes: cancels remain available, but new orders must be eligible maker orders submitted as post-only",
@@ -103,6 +104,14 @@ export const RESTRICTED_MODE_FACTS = Object.freeze({
     source: REPORT_0930,
     section: "§9, E-05",
     quote: "mode detection must key on status + absence of `code`, never on the `error` text",
+  },
+  CLOSED_ONLY_NO_RESUBMIT: {
+    id: "CLOSED_ONLY_NO_RESUBMIT",
+    consequence:
+      "A closed-only rejection (a 400 without a documented code: WP-260's `REQUEST_REJECTED`) moves no mode and never clears a resend: only `ENGINE_RESTARTING` does.",
+    source: REPORT_0916,
+    section: "§9, D-24",
+    quote: "mode-aware retry must not resubmit an opening order after this rejection",
   },
   CANCELS_WORK_IN_CANCEL_ONLY: {
     id: "CANCELS_WORK_IN_CANCEL_ONLY",

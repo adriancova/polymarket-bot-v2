@@ -22,7 +22,13 @@
  * bounds) comes from the configuration snapshot in effect at the instant in
  * question (`configuration.ts`). A snapshot takes effect at exactly its
  * `effectiveFrom`: token refill is computed segment by segment, each segment
- * under the snapshot in effect during it.
+ * under the snapshot in effect during it, and a bucket is capped at the burst
+ * in effect at every instant it is read (a lowered burst binds from its
+ * effective millisecond, not from the next refill). A window counts the
+ * requests granted within it; the budget keeps every grant instant the
+ * longest window on its timeline can still count, and refuses a snapshot
+ * whose windows would reach back past history it has already dropped
+ * (`HISTORY_NOT_RETAINED`): missing history is never read as free capacity.
  *
  * ## The grant order (§9.13 "Priority order")
  *
@@ -52,15 +58,38 @@
  * (WP-260's `SecureVenueError` fields), the parsed headers (`headers.ts`) and,
  * for cancel-all / cancel-market-orders, the number of orders canceled.
  * `observeSignerFeedback()` takes WP-260's `onRateLimitUpdate` observations.
- * What each documented header does is in `#applyFeedback`; a 429's
- * `Retry-After` blocks exactly the budget the venue's limiter charged, for
- * exactly that many seconds.
+ * What each documented header does is in `#applyFeedback`.
+ *
+ * - **One wait per response.** A 429's wait is resolved once: its
+ *   `Retry-After` exactly; else a later `Poly-RateLimit-Reset` (bounded);
+ *   else the snapshot's fallback backoff. No other header of the same
+ *   response lengthens it.
+ * - **Whose wait.** A 429 on a request that drew on a signer bucket is the
+ *   per-signer limiter's ("`Retry-After` on 429", §8): that bucket waits. A
+ *   429 on a request that drew on no signer bucket is documented nowhere
+ *   (IP limits throttle rather than reject, `IP_THROTTLED`): it holds back
+ *   only that OPERATION, for the request's own class and the classes ranked
+ *   below it. It never blocks an IP class, so it can never hold back a
+ *   heartbeat, an emergency cancel or any other operation (a lower class
+ *   never starves a higher one, §9.13).
+ * - **One response, counted once.** The pinned SDK reports a response's
+ *   headers to `onRateLimitUpdate` BEFORE the call returns, so the SDK
+ *   observation of a response arrives before its grant's completion. An
+ *   observation for a signer bucket on which exactly one grant is
+ *   outstanding is that grant's response: it is attached to the grant and
+ *   applied by its completion, as that response's feedback (after a
+ *   cancel-all's per-canceled debit, which its `Remaining` already
+ *   reflects; and under the one-wait rule). Any other observation is
+ *   applied at once.
  *
  * ## Time
  *
  * No clock is read: every call takes `atMs`, Unix epoch milliseconds, from the
  * caller. A time earlier than one already seen is read as the latest seen
  * (no refill is invented, no block is shortened).
+ *
+ * Exactness: token levels are integers of thousandths of a token
+ * (`units.ts`); a figure too large to keep exact is refused, never rounded.
  *
  * Nothing here performs I/O, holds a credential, or retries anything: it
  * only says when a request may be sent. PAPER only.
@@ -77,15 +106,8 @@ import {
 } from "./configuration.js";
 import { HTTP_TOO_MANY_REQUESTS, type FeedbackFlag, type RateLimitFeedback } from "./headers.js";
 import { isEpochMs, isIntegerAtLeast, readList, readOwn } from "./plain-data.js";
-import { isPermittedPriority, isPriorityClass, priorityRank, type PriorityClass } from "./priority.js";
-
-/** Unit: milliseconds per second. */
-export const MS_PER_SECOND = 1000;
-/**
- * Token levels are kept in thousandths of a token, so a rate in tokens per
- * second times a span in milliseconds is an exact integer number of them.
- */
-const MILLI_PER_TOKEN = MS_PER_SECOND;
+import { isPermittedPriority, isPriorityClass, PRIORITY_LADDER, priorityRank, type PriorityClass } from "./priority.js";
+import { isExactTokenCount, MILLI_PER_TOKEN, MS_PER_SECOND } from "./units.js";
 
 const SIGNER = /^0x[0-9a-fA-F]{40}$/u;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/u;
@@ -146,7 +168,9 @@ export type BudgetRefusalCode =
   | "GRANT_ALREADY_COMPLETED"
   | "INVALID_COMPLETION"
   | "INVALID_CONFIGURATION"
-  | "EFFECTIVE_TIME_NOT_IN_FUTURE";
+  | "EFFECTIVE_TIME_NOT_IN_FUTURE"
+  /** The snapshot's windows would count requests older than the history this budget has kept. */
+  | "HISTORY_NOT_RETAINED";
 
 export interface BudgetRefusal {
   readonly code: BudgetRefusalCode;
@@ -174,13 +198,30 @@ export interface GrantCompletion {
   readonly canceledCount?: number | null;
 }
 
+export type WaitBasis = "RETRY_AFTER" | "RESET" | "FALLBACK";
+
 export type BudgetEffect =
   | { readonly kind: "REMAINING_APPLIED"; readonly budget: BudgetKeyView; readonly tokens: string }
   | { readonly kind: "TIER_APPLIED"; readonly signer: string; readonly tier: string }
   | { readonly kind: "TIER_UNRECOGNISED"; readonly signer: string; readonly fallbackTier: string }
   | { readonly kind: "WARNING_MODE"; readonly budget: BudgetKeyView }
-  | { readonly kind: "WAIT_APPLIED"; readonly budget: BudgetKeyView; readonly untilMs: number; readonly basis: "RETRY_AFTER" | "RESET" | "FALLBACK" }
-  | { readonly kind: "RESET_WAIT_CAPPED"; readonly budget: BudgetKeyView }
+  /** A signer bucket waits until `untilMs`. */
+  | { readonly kind: "WAIT_APPLIED"; readonly budget: BudgetKeyView; readonly untilMs: number; readonly basis: WaitBasis }
+  /** A 429 on a request with no signer bucket: that operation waits, for `priorities` only (the request's class and those below it). */
+  | {
+      readonly kind: "OPERATION_WAIT_APPLIED";
+      readonly operationId: string;
+      readonly priorities: readonly PriorityClass[];
+      readonly untilMs: number;
+      readonly basis: WaitBasis;
+    }
+  | { readonly kind: "RESET_WAIT_CAPPED"; readonly budget: BudgetKeyView | null }
+  /** An SDK observation held for the one grant outstanding on its bucket; its completion applies it. */
+  | { readonly kind: "FEEDBACK_ATTACHED"; readonly grantId: string }
+  /** The completion applied the SDK observation attached to its grant, as the response's feedback. */
+  | { readonly kind: "ATTACHED_FEEDBACK_APPLIED" }
+  /** The completion carried its own feedback for the response; the attached SDK observation was not applied again. */
+  | { readonly kind: "ATTACHED_FEEDBACK_SUPERSEDED" }
   | { readonly kind: "CANCELED_DEBITED"; readonly budget: BudgetKeyView; readonly tokens: number }
   | { readonly kind: "CANCELED_COUNT_UNKNOWN"; readonly budget: BudgetKeyView }
   | { readonly kind: "CANCELED_COUNT_NOT_APPLICABLE" }
@@ -198,7 +239,13 @@ export interface WindowView {
 export interface WindowBudgetView {
   readonly budget: BudgetKeyView;
   readonly windows: readonly WindowView[];
-  readonly blockedUntilMs: number | null;
+}
+
+/** An operation held back by a 429 on a request with no signer bucket, for one class. */
+export interface OperationWaitView {
+  readonly operationId: string;
+  readonly priority: PriorityClass;
+  readonly untilMs: number;
 }
 
 export interface BucketView {
@@ -218,6 +265,7 @@ export interface BudgetView {
   readonly relayer: WindowBudgetView | null;
   readonly signers: readonly { readonly signer: string; readonly tier: string; readonly order: BucketView; readonly cancel: BucketView }[];
   readonly queue: readonly { readonly ticketId: string; readonly operationId: string; readonly priority: PriorityClass; readonly signer: string | null }[];
+  readonly operationWaits: readonly OperationWaitView[];
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +289,11 @@ interface SignerState {
 interface WindowState {
   /** Grant instants, ascending (one entry per request). */
   readonly times: number[];
-  blockedUntilMs: number;
+}
+
+interface OperationWaitState {
+  /** By §9.13 rank: until when requests of that class for this operation wait (a 429 with no signer bucket). */
+  readonly untilByRank: number[];
   fallbackCount: number;
 }
 
@@ -271,13 +323,27 @@ type InternalCharge =
     };
 
 interface GrantRecord {
+  readonly grant: Grant;
   readonly operation: OperationConfig;
   readonly charges: readonly InternalCharge[];
+  /** The signer-bucket charge, if the request drew on one. */
+  readonly bucket: Extract<InternalCharge, { type: "BUCKET" }> | null;
+  /** An SDK observation attributed to this grant's response, applied by its completion. */
+  attached: RateLimitFeedback | null;
 }
+
+/** How a response's headers may set a wait (`#applyFeedback`). */
+type WaitContext =
+  /** A completion whose 429 wait is already resolved: no header of the response sets another. */
+  | "RESOLVED"
+  /** A completion that was not a 429: a later Reset is a wait only in a wait period (a balance below zero). */
+  | "ANSWER"
+  /** An SDK observation applied on its own: as ANSWER, but with the documented 429 status its Retry-After, else its later Reset, is the wait. */
+  | "OBSERVATION";
 
 /** Scratch availability during one planning pass. */
 type Availability =
-  | { readonly type: "WINDOW"; readonly blocked: boolean; readonly free: number[]; readonly limits: readonly number[] }
+  | { readonly type: "WINDOW"; readonly free: number[]; readonly limits: readonly number[] }
   | { readonly type: "BUCKET"; readonly blocked: boolean; free: number; readonly capacityMilli: number };
 
 function freezeRefusal(code: BudgetRefusalCode, message: string): BudgetRefusal {
@@ -359,6 +425,11 @@ export class RateLimitBudget {
   #grantCounter = 0;
   readonly #signers = new Map<string, SignerState>();
   readonly #windows = new Map<string, WindowState>();
+  readonly #operationWaits = new Map<string, OperationWaitState>();
+  /** Per signer bucket: the grants issued and not yet completed, in grant order. */
+  readonly #outstanding = new Map<string, GrantRecord[]>();
+  /** The latest grant instant dropped from any window's history (`null`: none dropped yet). */
+  #droppedThroughMs: number | null = null;
   #queue: Waiter[] = [];
   #pending: PollEvent[] = [];
   readonly #issued = new WeakMap<Grant, GrantRecord>();
@@ -390,13 +461,24 @@ export class RateLimitBudget {
   /**
    * Add a snapshot that takes effect LATER than every instant this budget has
    * already processed (a retroactive change would rewrite history it has
-   * already acted on).
+   * already acted on), and late enough that every window it declares counts
+   * only requests whose history is still kept: a window longer than any on
+   * the timeline so far could otherwise reach back past dropped history and
+   * read it as unused capacity.
    */
   addConfiguration(raw: unknown): BudgetResult<{ readonly snapshotId: string; readonly effectiveFromMs: number }> {
     const parsed = parseRateLimitConfiguration(raw);
     if (!parsed.ok) return failure("INVALID_CONFIGURATION", parsed.problems.join("; "));
     if (parsed.value.effectiveFromMs <= this.#lastMs) {
       return failure("EFFECTIVE_TIME_NOT_IN_FUTURE", "a new snapshot must take effect after every instant already processed");
+    }
+    // A window counts the grants strictly after `effectiveFrom - windowMs`; none of those may have been dropped.
+    const reach = longestWindowMs(parsed.value);
+    if (this.#droppedThroughMs !== null && parsed.value.effectiveFromMs - reach < this.#droppedThroughMs) {
+      return failure(
+        "HISTORY_NOT_RETAINED",
+        `its longest window would count requests this budget no longer holds: take effect at ${String(this.#droppedThroughMs + reach)} or later`,
+      );
     }
     const next = this.#timeline.with(parsed.value);
     if (!next.ok) return failure("INVALID_CONFIGURATION", next.problem);
@@ -438,7 +520,7 @@ export class RateLimitBudget {
       const charges = this.#resolve(above.request, config);
       if (charges.ok) for (const charge of charges.value) reserved.set(charge.key, (reserved.get(charge.key) ?? 0) + reservationOf(charge));
     }
-    if (this.#affordable(resolved.value, request.priority, config, t, availability, reserved)) {
+    if (this.#operationWaitUntil(request) <= t && this.#affordable(resolved.value, request.priority, config, t, availability, reserved)) {
       const grant = this.#commit(waiter, resolved.value, config, t);
       return Object.freeze({ kind: "GRANTED" as const, ticketId: waiter.ticketId, grant });
     }
@@ -512,7 +594,7 @@ export class RateLimitBudget {
     for (const waiter of this.#queue) {
       const charges = this.#resolve(waiter.request, config);
       if (!charges.ok) continue;
-      let eta = t;
+      let eta = Math.max(t, this.#operationWaitUntil(waiter.request));
       for (const charge of charges.value) eta = Math.max(eta, this.#etaOf(charge, waiter.request.priority, config, t));
       if (eta > t) wake = Math.min(wake, eta);
     }
@@ -524,8 +606,10 @@ export class RateLimitBudget {
 
   /**
    * Close a grant with the venue's answer. Applies, in order: the post-hoc
-   * cancel debit (cancel-all / cancel-market-orders, D-21), a 429's wait,
-   * and the documented headers. Each grant completes once.
+   * cancel debit (cancel-all / cancel-market-orders, D-21), a 429's wait
+   * (resolved once for the response), and the response's documented headers:
+   * the completion's own `feedback`, or else the SDK observation attached to
+   * this grant (see "Feedback" above). Each grant completes once.
    */
   complete(grant: Grant, completion: GrantCompletion): BudgetResult<readonly BudgetEffect[]> {
     const record = this.#issued.get(grant);
@@ -537,49 +621,79 @@ export class RateLimitBudget {
     if (t === undefined) return failure("INVALID_TIME", "atMs must be a non-negative safe integer of epoch milliseconds");
     const config = this.#timeline.activeAt(t);
     if (config === undefined) return failure("NO_ACTIVE_CONFIGURATION", "no rate-limit snapshot is in effect at this instant");
+
+    const bucketCharge = record.bucket;
+    const signerState = bucketCharge === null ? undefined : this.#signer(bucketCharge.signer, t);
+
+    // 1. The post-hoc cancel debit: "the bucket is debited one additional token for every order successfully
+    // canceled". Computed before anything changes, so a count too large to account exactly refuses the completion.
+    const perCanceled = record.operation.tokenCost?.perCanceled ?? 0;
+    let debited: { readonly state: BucketState; readonly level: number; readonly tokens: number } | null = null;
+    if (perCanceled > 0 && bucketCharge !== null && signerState !== undefined && read.canceledCount !== null) {
+      const state = this.#bucketState(signerState, bucketCharge.bucket);
+      this.#advance(signerState, bucketCharge.bucket, t);
+      const params = bucketParams(config, signerState.tier, bucketCharge.bucket);
+      const tokens = perCanceled * read.canceledCount;
+      const debit = tokens * MILLI_PER_TOKEN;
+      // Tiers without a negative cancel balance "floor the post-cancel balance at zero regardless of debit size";
+      // a balance already below zero (a venue Remaining) is left as it is.
+      const level = params.negativeAllowed ? state.levelMilli - debit : state.levelMilli >= 0 ? Math.max(state.levelMilli - debit, 0) : state.levelMilli;
+      if (!isExactTokenCount(tokens) || !Number.isSafeInteger(level)) {
+        return failure("INVALID_COMPLETION", "the canceled count is too large to account exactly");
+      }
+      debited = { state, level, tokens };
+    }
     this.#completed.add(grant);
+    this.#release(record);
 
     const effects: BudgetEffect[] = [];
-    const bucketCharge = record.charges.find((charge): charge is Extract<InternalCharge, { type: "BUCKET" }> => charge.type === "BUCKET");
-    const signerState = bucketCharge === undefined ? undefined : this.#signer(bucketCharge.signer, t);
+    // The response's feedback: the completion's own, else the SDK observation attributed to this grant.
+    let feedback = read.feedback;
+    const attached = record.attached;
+    record.attached = null;
+    if (attached !== null) {
+      if (feedback === null) {
+        feedback = attached;
+        effects.push(Object.freeze({ kind: "ATTACHED_FEEDBACK_APPLIED" as const }));
+      } else {
+        effects.push(Object.freeze({ kind: "ATTACHED_FEEDBACK_SUPERSEDED" as const }));
+      }
+    }
 
-    // 1. The post-hoc cancel debit: "the bucket is debited one additional token for every order successfully canceled".
-    const perCanceled = record.operation.tokenCost?.perCanceled ?? 0;
     if (read.canceledCount !== null && perCanceled === 0) effects.push(Object.freeze({ kind: "CANCELED_COUNT_NOT_APPLICABLE" as const }));
-    if (perCanceled > 0 && bucketCharge !== undefined && signerState !== undefined) {
-      if (read.canceledCount === null) {
+    if (perCanceled > 0 && bucketCharge !== null) {
+      if (debited === null) {
         effects.push(Object.freeze({ kind: "CANCELED_COUNT_UNKNOWN" as const, budget: bucketCharge.view }));
       } else {
-        const state = this.#bucketState(signerState, bucketCharge.bucket);
-        this.#advance(signerState, bucketCharge.bucket, t);
-        const params = bucketParams(config, signerState.tier, bucketCharge.bucket);
-        const debit = perCanceled * read.canceledCount * MILLI_PER_TOKEN;
-        // Tiers without a negative cancel balance "floor the post-cancel balance at zero regardless of debit size".
-        state.levelMilli = params.negativeAllowed ? state.levelMilli - debit : state.levelMilli >= 0 ? Math.max(state.levelMilli - debit, 0) : state.levelMilli;
-        effects.push(Object.freeze({ kind: "CANCELED_DEBITED" as const, budget: bucketCharge.view, tokens: perCanceled * read.canceledCount }));
+        debited.state.levelMilli = debited.level;
+        effects.push(Object.freeze({ kind: "CANCELED_DEBITED" as const, budget: bucketCharge.view, tokens: debited.tokens }));
       }
     }
 
-    // 2. A 429: wait on exactly the budget the per-signer limiter charged (the signer bucket), or, for a
-    // request with no signer bucket, on every budget it drew on.
-    const feedback = read.feedback;
-    if (read.error !== null && read.error.kind === "RATE_LIMITED") {
-      const targets = bucketCharge !== undefined ? [bucketCharge] : record.charges;
+    // 2. A 429: ONE wait for the response. With a signer bucket, that bucket waits (the per-signer limiter's
+    // 429). Without one, only this operation waits, for this class and the classes below it.
+    const rateLimited = read.error !== null && read.error.kind === "RATE_LIMITED" ? read.error : null;
+    if (rateLimited !== null) {
       const headerRetry = feedback !== null && feedback.httpStatus === HTTP_TOO_MANY_REQUESTS ? feedback.retryAfterSeconds : null;
-      const retryAfterSeconds = read.error.retryAfterSeconds ?? headerRetry;
-      for (const target of targets) effects.push(this.#rateLimitedWait(target, retryAfterSeconds, feedback, config, t));
+      const retryAfterSeconds = rateLimited.retryAfterSeconds ?? headerRetry;
+      if (bucketCharge !== null && signerState !== undefined) {
+        effects.push(...this.#bucketRateLimited(signerState, bucketCharge, retryAfterSeconds, feedback, config, t));
+      } else {
+        effects.push(...this.#operationRateLimited(grant.operationId, grant.priority, retryAfterSeconds, feedback, config, t));
+      }
     } else if (read.error === null) {
-      // A request the venue answered without a 429 ends the consecutive-fallback run on its budgets.
-      for (const charge of record.charges) {
-        if (charge.type === "WINDOW") this.#window(charge.key).fallbackCount = 0;
-        else if (signerState !== undefined) this.#bucketState(signerState, charge.bucket).fallbackCount = 0;
+      // A request the venue answered without a 429 ends the consecutive-fallback run on what it drew on.
+      if (bucketCharge !== null && signerState !== undefined) this.#bucketState(signerState, bucketCharge.bucket).fallbackCount = 0;
+      else {
+        const waits = this.#operationWaits.get(grant.operationId);
+        if (waits !== undefined) waits.fallbackCount = 0;
       }
     }
 
-    // 3. The documented headers (a 429's Retry-After is already applied above).
+    // 3. The documented headers. A 429's wait is already resolved: no header of the response sets another.
     if (feedback !== null) {
-      if (bucketCharge !== undefined && signerState !== undefined) {
-        effects.push(...this.#applyFeedback(signerState, bucketCharge.bucket, feedback, config, t, false));
+      if (bucketCharge !== null && signerState !== undefined) {
+        effects.push(...this.#applyFeedback(signerState, bucketCharge.bucket, feedback, config, t, rateLimited !== null ? "RESOLVED" : "ANSWER"));
       } else {
         for (const flag of feedback.flags) effects.push(Object.freeze({ kind: "FEEDBACK_FLAG" as const, flag }));
         if (feedback.remaining !== null || feedback.resetUnixSeconds !== null || feedback.tier !== null || feedback.warning) {
@@ -592,10 +706,16 @@ export class RateLimitBudget {
   }
 
   /**
-   * Apply one rate-limit observation that is not tied to a grant (WP-260's
-   * `onRateLimitUpdate`, whose `bucket` names the signer bucket). A
-   * `Retry-After` is applied only when the feedback carries the documented
-   * 429 status.
+   * Take one rate-limit observation not tied to a grant by the caller
+   * (WP-260's `onRateLimitUpdate`, whose `bucket` names the signer bucket).
+   *
+   * When exactly one grant is outstanding on that bucket and nothing is
+   * attached to it yet, the observation is that grant's response (the pinned
+   * SDK reports a response's headers before the call returns): it is
+   * ATTACHED, and the grant's completion applies it as the response's
+   * feedback. Otherwise it is applied at once; a `Retry-After` then counts
+   * only when the feedback carries the documented 429 status, and takes
+   * precedence over that response's `Poly-RateLimit-Reset`.
    */
   observeSignerFeedback(
     target: { readonly signer: string; readonly bucket: SignerBucket },
@@ -614,8 +734,14 @@ export class RateLimitBudget {
     if (signer === undefined || bucket === undefined || read === undefined || read === null) {
       return failure("INVALID_REQUEST", "the target must be { signer, bucket: ORDER | CANCEL } and the feedback a RateLimitFeedback");
     }
+    const outstanding = this.#outstanding.get(bucketKey(signer, bucket));
+    const only = outstanding !== undefined && outstanding.length === 1 ? outstanding[0] : undefined;
+    if (only !== undefined && only.attached === null) {
+      only.attached = read;
+      return Object.freeze({ ok: true as const, value: Object.freeze([Object.freeze({ kind: "FEEDBACK_ATTACHED" as const, grantId: only.grant.grantId })]) });
+    }
     const state = this.#signer(signer, t);
-    const effects = this.#applyFeedback(state, bucket, read, config, t, true);
+    const effects = this.#applyFeedback(state, bucket, read, config, t, "OBSERVATION");
     return Object.freeze({ ok: true as const, value: Object.freeze(effects) });
   }
 
@@ -632,7 +758,6 @@ export class RateLimitBudget {
         windows: Object.freeze(
           windows.map((window) => Object.freeze({ limit: window.limit, windowMs: window.windowMs, used: state.times.length - firstAfter(state.times, t - window.windowMs) })),
         ),
-        blockedUntilMs: state.blockedUntilMs > t ? state.blockedUntilMs : null,
       });
     };
     const bucketView = (signer: SignerState, bucket: SignerBucket): BucketView => {
@@ -663,6 +788,14 @@ export class RateLimitBudget {
       queue: Object.freeze(
         this.#ranked().map((waiter) =>
           Object.freeze({ ticketId: waiter.ticketId, operationId: waiter.request.operationId, priority: waiter.request.priority, signer: waiter.request.signer }),
+        ),
+      ),
+      operationWaits: Object.freeze(
+        [...this.#operationWaits.entries()].flatMap(([operationId, state]) =>
+          PRIORITY_LADDER.flatMap((priority, rank) => {
+            const until = state.untilByRank[rank] ?? 0;
+            return until > t ? [Object.freeze({ operationId, priority, untilMs: until })] : [];
+          }),
         ),
       ),
     });
@@ -701,17 +834,35 @@ export class RateLimitBudget {
   #window(key: string): WindowState {
     let state = this.#windows.get(key);
     if (state === undefined) {
-      state = { times: [], blockedUntilMs: 0, fallbackCount: 0 };
+      state = { times: [] };
       this.#windows.set(key, state);
     }
     return state;
   }
 
-  /** Refill a bucket up to `toMs`, segment by segment, each under the snapshot in effect during it. */
+  /** The instant until which `request`'s operation waits for its class (a 429 with no signer bucket); 0 if none. */
+  #operationWaitUntil(request: NormalizedRequest): number {
+    return this.#operationWaits.get(request.operationId)?.untilByRank[priorityRank(request.priority)] ?? 0;
+  }
+
+  /** A grant no longer outstanding on its signer bucket. */
+  #release(record: GrantRecord): void {
+    if (record.bucket === null) return;
+    const list = this.#outstanding.get(record.bucket.key);
+    if (list === undefined) return;
+    const rest = list.filter((entry) => entry !== record);
+    if (rest.length === 0) this.#outstanding.delete(record.bucket.key);
+    else this.#outstanding.set(record.bucket.key, rest);
+  }
+
+  /**
+   * Refill a bucket up to `toMs`, segment by segment, each under the snapshot in effect during it, and cap it
+   * at the burst in effect at `toMs`: a snapshot that lowers the burst binds from its effective instant, even
+   * when that instant is exactly `toMs` or no time has passed since the last read.
+   */
   #advance(signer: SignerState, bucket: SignerBucket, toMs: number): void {
     const state = this.#bucketState(signer, bucket);
     let from = state.lastMs;
-    if (toMs <= from) return;
     let level = state.levelMilli;
     while (from < toMs) {
       const config = this.#timeline.activeAt(from);
@@ -723,20 +874,24 @@ export class RateLimitBudget {
       }
       from = end;
     }
+    const now = Math.max(state.lastMs, toMs);
+    const active = this.#timeline.activeAt(now);
+    if (active !== undefined) level = Math.min(level, bucketParams(active, signer.tier, bucket).capacityMilli);
     state.levelMilli = level;
-    state.lastMs = toMs;
+    state.lastMs = now;
   }
 
-  /** Drop window entries no snapshot on the timeline can still count. */
+  /** Drop window entries no snapshot on the timeline can still count, and remember the latest one dropped. */
   #prune(key: string, t: number): WindowState {
     const state = this.#window(key);
     let longest = 0;
-    for (const snapshot of this.#timeline.snapshots) {
-      for (const entry of snapshot.ipEndpointClasses) for (const window of entry.windows) longest = Math.max(longest, window.windowMs);
-      for (const window of snapshot.relayer.windows) longest = Math.max(longest, window.windowMs);
-    }
+    for (const snapshot of this.#timeline.snapshots) longest = Math.max(longest, longestWindowMs(snapshot));
     const keep = firstAfter(state.times, t - longest);
-    if (keep > 0) state.times.splice(0, keep);
+    if (keep > 0) {
+      const last = state.times[keep - 1] ?? t;
+      this.#droppedThroughMs = this.#droppedThroughMs === null ? last : Math.max(this.#droppedThroughMs, last);
+      state.times.splice(0, keep);
+    }
     return state;
   }
 
@@ -802,7 +957,6 @@ export class RateLimitBudget {
       const state = this.#prune(charge.key, t);
       found = {
         type: "WINDOW",
-        blocked: state.blockedUntilMs > t,
         free: charge.windows.map((window) => window.limit - (state.times.length - firstAfter(state.times, t - window.windowMs))),
         limits: charge.windows.map((window) => window.limit),
       };
@@ -829,7 +983,7 @@ export class RateLimitBudget {
     const permille = config.policy.headroomPermille[priority];
     for (const charge of charges) {
       const available = this.#availability(charge, config, t, scratch);
-      if (available.blocked) return false;
+      if (available.type === "BUCKET" && available.blocked) return false;
       const held = reserved.get(charge.key) ?? 0;
       if (available.type === "WINDOW") {
         for (let index = 0; index < available.free.length; index += 1) {
@@ -862,7 +1016,7 @@ export class RateLimitBudget {
         refusals.push({ waiter, refusal: resolved.refusal });
         continue;
       }
-      if (this.#affordable(resolved.value, waiter.request.priority, config, t, scratch, reserved)) {
+      if (this.#operationWaitUntil(waiter.request) <= t && this.#affordable(resolved.value, waiter.request.priority, config, t, scratch, reserved)) {
         grants.push({ waiter, charges: resolved.value });
         for (const charge of resolved.value) {
           const available = scratch.get(charge.key);
@@ -891,6 +1045,7 @@ export class RateLimitBudget {
     }
     const operation = config.operations.find((entry) => entry.operationId === waiter.request.operationId);
     if (operation === undefined) throw new TypeError("a resolved request names a configured operation");
+    const bucket = charges.find((charge): charge is Extract<InternalCharge, { type: "BUCKET" }> => charge.type === "BUCKET") ?? null;
     this.#grantCounter += 1;
     const grant: Grant = Object.freeze({
       grantId: `grant-${String(this.#grantCounter)}`,
@@ -903,7 +1058,9 @@ export class RateLimitBudget {
       grantedAtMs: t,
       snapshotId: config.snapshotId,
     });
-    this.#issued.set(grant, Object.freeze({ operation, charges }));
+    const record: GrantRecord = { grant, operation, charges, bucket, attached: null };
+    this.#issued.set(grant, record);
+    if (bucket !== null) this.#outstanding.set(bucket.key, [...(this.#outstanding.get(bucket.key) ?? []), record]);
     return grant;
   }
 
@@ -912,7 +1069,7 @@ export class RateLimitBudget {
     const permille = config.policy.headroomPermille[priority];
     if (charge.type === "WINDOW") {
       const state = this.#prune(charge.key, t);
-      let eta = Math.max(t, state.blockedUntilMs);
+      let eta = t;
       for (const window of charge.windows) {
         const start = firstAfter(state.times, t - window.windowMs);
         const used = state.times.length - start;
@@ -930,37 +1087,100 @@ export class RateLimitBudget {
     return Math.max(refillAt, state.blockedUntilMs);
   }
 
-  /** A 429: wait `Retry-After` exactly; else until `Poly-RateLimit-Reset`; else the policy's fallback backoff. */
-  #rateLimitedWait(
-    charge: InternalCharge,
+  /**
+   * A later `Poly-RateLimit-Reset` as a wait deadline, bounded by the snapshot's `maxHeaderWaitMs`; `null` when
+   * the response carries none, or one not after `t`.
+   */
+  #resetDeadline(feedback: RateLimitFeedback | null, config: RateLimitConfiguration, t: number): { readonly untilMs: number; readonly capped: boolean } | null {
+    if (feedback === null || feedback.resetUnixSeconds === null) return null;
+    const resetMs = feedback.resetUnixSeconds * MS_PER_SECOND;
+    if (resetMs <= t) return null;
+    const bound = t + config.policy.maxHeaderWaitMs;
+    return { untilMs: Math.min(resetMs, bound), capped: resetMs > bound };
+  }
+
+  /**
+   * ONE response's 429 wait: `Retry-After` exactly; else a later `Poly-RateLimit-Reset` (bounded); else the
+   * snapshot's fallback backoff, which escalates only on a 429 seen after the previous wait ran out (a 429 for
+   * a request sent before the running wait began is not a new failed attempt).
+   */
+  #resolveWait(
+    retryAfterSeconds: number | null,
+    feedback: RateLimitFeedback | null,
+    running: { readonly untilMs: number; readonly fallbackCount: number },
+    config: RateLimitConfiguration,
+    t: number,
+  ): { readonly untilMs: number; readonly basis: WaitBasis; readonly capped: boolean; readonly fallbackCount: number } {
+    if (retryAfterSeconds !== null) {
+      return { untilMs: t + retryAfterSeconds * MS_PER_SECOND, basis: "RETRY_AFTER", capped: false, fallbackCount: running.fallbackCount };
+    }
+    const reset = this.#resetDeadline(feedback, config, t);
+    if (reset !== null) return { untilMs: reset.untilMs, basis: "RESET", capped: reset.capped, fallbackCount: running.fallbackCount };
+    if (running.untilMs > t) return { untilMs: running.untilMs, basis: "FALLBACK", capped: false, fallbackCount: running.fallbackCount };
+    return {
+      untilMs: t + backoffDelay(config.policy.rateLimitedFallback, running.fallbackCount),
+      basis: "FALLBACK",
+      capped: false,
+      fallbackCount: running.fallbackCount + 1,
+    };
+  }
+
+  /** A 429 on a request that drew on a signer bucket: that bucket waits (the per-signer limiter's 429). */
+  #bucketRateLimited(
+    signer: SignerState,
+    charge: Extract<InternalCharge, { type: "BUCKET" }>,
     retryAfterSeconds: number | null,
     feedback: RateLimitFeedback | null,
     config: RateLimitConfiguration,
     t: number,
-  ): BudgetEffect {
-    let until: number;
-    let basis: "RETRY_AFTER" | "RESET" | "FALLBACK";
-    const resetMs = feedback?.resetUnixSeconds === null || feedback === null ? null : feedback.resetUnixSeconds * MS_PER_SECOND;
-    let fallbackCount: number;
-    const state = charge.type === "WINDOW" ? this.#window(charge.key) : this.#bucketState(this.#signer(charge.signer, t), charge.bucket);
-    if (retryAfterSeconds !== null) {
-      until = t + retryAfterSeconds * MS_PER_SECOND;
-      basis = "RETRY_AFTER";
-    } else if (resetMs !== null && resetMs > t) {
-      until = Math.min(resetMs, t + config.policy.maxHeaderWaitMs);
-      basis = "RESET";
-    } else if (state.blockedUntilMs > t) {
-      // A 429 for a request sent before the running wait began is not a new failed attempt: no escalation.
-      until = state.blockedUntilMs;
-      basis = "FALLBACK";
-    } else {
-      fallbackCount = state.fallbackCount;
-      until = t + backoffDelay(config.policy.rateLimitedFallback, fallbackCount);
-      state.fallbackCount = fallbackCount + 1;
-      basis = "FALLBACK";
+  ): BudgetEffect[] {
+    const state = this.#bucketState(signer, charge.bucket);
+    const wait = this.#resolveWait(retryAfterSeconds, feedback, { untilMs: state.blockedUntilMs, fallbackCount: state.fallbackCount }, config, t);
+    state.fallbackCount = wait.fallbackCount;
+    state.blockedUntilMs = Math.max(state.blockedUntilMs, wait.untilMs);
+    const effects: BudgetEffect[] = [];
+    if (wait.capped) effects.push(Object.freeze({ kind: "RESET_WAIT_CAPPED" as const, budget: charge.view }));
+    effects.push(Object.freeze({ kind: "WAIT_APPLIED" as const, budget: charge.view, untilMs: state.blockedUntilMs, basis: wait.basis }));
+    return effects;
+  }
+
+  /**
+   * A 429 on a request that drew on no signer bucket. No venue fact says what it limits (IP limits throttle
+   * rather than reject), so it is applied as narrowly as it can be honoured: THIS operation waits, for the
+   * request's class and every class ranked below it. No IP class is blocked, so no other operation, and no
+   * higher class of this one, is held back by it.
+   */
+  #operationRateLimited(
+    operationId: string,
+    priority: PriorityClass,
+    retryAfterSeconds: number | null,
+    feedback: RateLimitFeedback | null,
+    config: RateLimitConfiguration,
+    t: number,
+  ): BudgetEffect[] {
+    let state = this.#operationWaits.get(operationId);
+    if (state === undefined) {
+      state = { untilByRank: PRIORITY_LADDER.map(() => 0), fallbackCount: 0 };
+      this.#operationWaits.set(operationId, state);
     }
-    state.blockedUntilMs = Math.max(state.blockedUntilMs, until);
-    return Object.freeze({ kind: "WAIT_APPLIED" as const, budget: charge.view, untilMs: state.blockedUntilMs, basis });
+    const rank = priorityRank(priority);
+    const wait = this.#resolveWait(retryAfterSeconds, feedback, { untilMs: state.untilByRank[rank] ?? 0, fallbackCount: state.fallbackCount }, config, t);
+    state.fallbackCount = wait.fallbackCount;
+    for (let below = rank; below < state.untilByRank.length; below += 1) {
+      state.untilByRank[below] = Math.max(state.untilByRank[below] ?? 0, wait.untilMs);
+    }
+    const effects: BudgetEffect[] = [];
+    if (wait.capped) effects.push(Object.freeze({ kind: "RESET_WAIT_CAPPED" as const, budget: null }));
+    effects.push(
+      Object.freeze({
+        kind: "OPERATION_WAIT_APPLIED" as const,
+        operationId,
+        priorities: Object.freeze(PRIORITY_LADDER.slice(rank)),
+        untilMs: state.untilByRank[rank] ?? wait.untilMs,
+        basis: wait.basis,
+      }),
+    );
+    return effects;
   }
 
   /**
@@ -977,13 +1197,16 @@ export class RateLimitBudget {
    * - `Poly-RateLimit-Warning: true`: enforcement would have rejected the
    *   request, so the bucket had less than its cost: the estimate drops to
    *   at most zero, and the warning is counted for alerting.
-   * - `Poly-RateLimit-Reset`: when the bucket is in a wait period (a
-   *   balance below zero, D-21: "remain blocked"), the bucket waits until
-   *   then (capped by `maxHeaderWaitMs`, and flagged when capped). A balance
-   *   of zero alone is not a wait (the pinned SDK: "do not back off solely
-   *   because this value is zero").
-   * - `Retry-After`: only with the documented 429 status, and only when
-   *   `applyRetryAfter` (a grant's completion applies it with the error).
+   * - Waits, ONE per response (`context`):
+   *   - a completion whose 429 wait is already resolved (`RESOLVED`): none;
+   *   - otherwise `Poly-RateLimit-Reset` is a wait only while the bucket is
+   *     in a wait period (a balance below zero, D-21: "remain blocked"),
+   *     capped by `maxHeaderWaitMs` and flagged when capped; a balance of
+   *     zero alone is not a wait (the pinned SDK: "do not back off solely
+   *     because this value is zero");
+   *   - an SDK observation applied on its own (`OBSERVATION`) that carries
+   *     the documented 429 status: its `Retry-After` exactly, else its later
+   *     `Reset`; never both.
    */
   #applyFeedback(
     signer: SignerState,
@@ -991,7 +1214,7 @@ export class RateLimitBudget {
     feedback: RateLimitFeedback,
     config: RateLimitConfiguration,
     t: number,
-    applyRetryAfter: boolean,
+    context: WaitContext,
   ): BudgetEffect[] {
     const effects: BudgetEffect[] = feedback.flags.map((flag) => Object.freeze({ kind: "FEEDBACK_FLAG" as const, flag }));
     this.#advance(signer, "ORDER", t);
@@ -1020,18 +1243,22 @@ export class RateLimitBudget {
       state.warnings += 1;
       effects.push(Object.freeze({ kind: "WARNING_MODE" as const, budget: view }));
     }
-    if (feedback.resetUnixSeconds !== null && feedback.remaining !== null && feedback.remaining < 0) {
-      const resetMs = feedback.resetUnixSeconds * MS_PER_SECOND;
-      if (resetMs > t) {
-        const bound = t + config.policy.maxHeaderWaitMs;
-        if (resetMs > bound) effects.push(Object.freeze({ kind: "RESET_WAIT_CAPPED" as const, budget: view }));
-        state.blockedUntilMs = Math.max(state.blockedUntilMs, Math.min(resetMs, bound));
-        effects.push(Object.freeze({ kind: "WAIT_APPLIED" as const, budget: view, untilMs: state.blockedUntilMs, basis: "RESET" as const }));
+    let wait: { readonly untilMs: number; readonly basis: WaitBasis; readonly capped: boolean } | null = null;
+    if (context === "OBSERVATION" && feedback.httpStatus === HTTP_TOO_MANY_REQUESTS) {
+      if (feedback.retryAfterSeconds !== null) {
+        wait = { untilMs: t + feedback.retryAfterSeconds * MS_PER_SECOND, basis: "RETRY_AFTER", capped: false };
+      } else {
+        const reset = this.#resetDeadline(feedback, config, t);
+        if (reset !== null) wait = { untilMs: reset.untilMs, basis: "RESET", capped: reset.capped };
       }
+    } else if (context !== "RESOLVED" && feedback.remaining !== null && feedback.remaining < 0) {
+      const reset = this.#resetDeadline(feedback, config, t);
+      if (reset !== null) wait = { untilMs: reset.untilMs, basis: "RESET", capped: reset.capped };
     }
-    if (applyRetryAfter && feedback.httpStatus === HTTP_TOO_MANY_REQUESTS && feedback.retryAfterSeconds !== null) {
-      state.blockedUntilMs = Math.max(state.blockedUntilMs, t + feedback.retryAfterSeconds * MS_PER_SECOND);
-      effects.push(Object.freeze({ kind: "WAIT_APPLIED" as const, budget: view, untilMs: state.blockedUntilMs, basis: "RETRY_AFTER" as const }));
+    if (wait !== null) {
+      if (wait.capped) effects.push(Object.freeze({ kind: "RESET_WAIT_CAPPED" as const, budget: view }));
+      state.blockedUntilMs = Math.max(state.blockedUntilMs, wait.untilMs);
+      effects.push(Object.freeze({ kind: "WAIT_APPLIED" as const, budget: view, untilMs: state.blockedUntilMs, basis: wait.basis }));
     }
     return effects;
   }
@@ -1042,6 +1269,14 @@ export class RateLimitBudget {
 
 const RELAYER_KEY = "relayer";
 const RELAYER_VIEW: BudgetKeyView = Object.freeze({ dimension: "RELAYER" as const });
+
+/** The longest window a snapshot declares (IP classes and the relayer): how far back its counts reach. */
+function longestWindowMs(config: RateLimitConfiguration): number {
+  let longest = 0;
+  for (const entry of config.ipEndpointClasses) for (const window of entry.windows) longest = Math.max(longest, window.windowMs);
+  for (const window of config.relayer.windows) longest = Math.max(longest, window.windowMs);
+  return longest;
+}
 
 function ipKey(classId: string): string {
   return `ip|${classId}`;
@@ -1099,7 +1334,7 @@ function readFeedback(value: unknown): RateLimitFeedback | null | undefined {
     candidate === null || (typeof candidate === "number" && Number.isSafeInteger(candidate) && (minimum === null || candidate >= minimum));
   if (
     !intOrNull(status, null) ||
-    !intOrNull(remaining, null) ||
+    !(remaining === null || isExactTokenCount(remaining)) ||
     !intOrNull(reset, 0) ||
     !(tier === null || (typeof tier === "string" && /^[A-Za-z0-9_-]{1,32}$/u.test(tier))) ||
     typeof warning !== "boolean" ||

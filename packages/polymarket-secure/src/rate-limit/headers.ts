@@ -8,7 +8,7 @@
  *
  * | Header | Documented as | Read as |
  * | --- | --- | --- |
- * | `Poly-RateLimit-Remaining` | the applicable bucket's token balance after accounting; can be negative after cancel-all / cancel-market-orders on tiers with a negative cancel balance (D-21) | a signed safe integer |
+ * | `Poly-RateLimit-Remaining` | the applicable bucket's token balance after accounting; can be negative after cancel-all / cancel-market-orders on tiers with a negative cancel balance (D-21) | a signed integer of magnitude at most `MAX_TOKEN_MAGNITUDE` (`units.ts`: the budget then holds it exactly in thousandths of a token) |
  * | `Poly-RateLimit-Reset` | the Unix timestamp, in seconds, when the current wait period ends (pinned SDK `RateLimitUpdate.reset`) | an unsigned safe integer |
  * | `Poly-RateLimit-Tier` | the tier applied to the request; read it, never assume it (D-22) | a short token |
  * | `Poly-RateLimit-Warning` | `true` in warning mode, when enforcement would have rejected the request | exactly `true` or `false` |
@@ -31,6 +31,7 @@
 import { MAX_RETRY_AFTER_SECONDS } from "../errors.js";
 
 import { ownKeys, readOwn } from "./plain-data.js";
+import { isExactTokenCount } from "./units.js";
 
 export const DOCUMENTED_RATE_LIMIT_HEADERS = Object.freeze({
   REMAINING: "Poly-RateLimit-Remaining",
@@ -90,11 +91,12 @@ function statusOf(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 }
 
-function signedInteger(text: string): number | null {
+/** A `Poly-RateLimit-Remaining` value: a signed integer the budget can hold exactly (`units.ts`), or `null`. */
+function remainingValue(text: string): number | null {
   if (!REMAINING.test(text)) return null;
   const value = Number(text);
-  // `-0` is zero.
-  return Number.isSafeInteger(value) ? value + 0 : null;
+  // `-0` is zero. A grammatical but absurd magnitude is malformed, never interpreted.
+  return isExactTokenCount(value) ? value + 0 : null;
 }
 
 function unsignedInteger(text: string): number | null {
@@ -153,7 +155,7 @@ export function parseRateLimitHeaders(input: { readonly httpStatus: number | nul
     return parsed;
   };
 
-  const remaining = take(DOCUMENTED_RATE_LIMIT_HEADERS.REMAINING, signedInteger);
+  const remaining = take(DOCUMENTED_RATE_LIMIT_HEADERS.REMAINING, remainingValue);
   const resetUnixSeconds = take(DOCUMENTED_RATE_LIMIT_HEADERS.RESET, unsignedInteger);
   const tier = take(DOCUMENTED_RATE_LIMIT_HEADERS.TIER, (text) => (TIER.test(text) ? text : null));
   const warning = take(DOCUMENTED_RATE_LIMIT_HEADERS.WARNING, (text) => (text === "true" ? true : text === "false" ? false : null)) === true;
@@ -203,16 +205,19 @@ export function feedbackFromObservation(
   const remainingRaw = value(remainingRead);
   const resetRaw = value(resetRead);
   const tierRaw = value(tierRead);
-  const remaining = typeof remainingRaw === "number" && Number.isSafeInteger(remainingRaw) ? remainingRaw + 0 : null;
+  const remainingNumber = typeof remainingRaw === "number" && Number.isSafeInteger(remainingRaw);
+  const remaining = remainingNumber && isExactTokenCount(remainingRaw) ? remainingRaw + 0 : null;
   const resetUnixSeconds = typeof resetRaw === "number" && Number.isSafeInteger(resetRaw) && resetRaw >= 0 ? resetRaw : null;
   const tier = typeof tierRaw === "string" && TIER.test(tierRaw) ? tierRaw : null;
   if (
-    (remainingRaw !== null && remaining === null) ||
+    (remainingRaw !== null && !remainingNumber) ||
     (resetRaw !== null && resetUnixSeconds === null) ||
     (tierRaw !== null && tier === null)
   ) {
     flags.push(Object.freeze({ kind: "OBSERVATION_UNREADABLE" }));
   }
+  // A readable but absurd Remaining is malformed, as in the headers: never interpreted.
+  if (remainingNumber && remaining === null) flags.push(Object.freeze({ kind: "MALFORMED_HEADER", header: DOCUMENTED_RATE_LIMIT_HEADERS.REMAINING }));
   return Object.freeze({
     httpStatus,
     remaining,

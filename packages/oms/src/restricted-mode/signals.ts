@@ -33,6 +33,13 @@ export type VenueCondition =
 export interface VenueSignal {
   readonly operation: VenueOperation;
   readonly condition: VenueCondition;
+  /**
+   * When the request this answer is for was SENT (Unix epoch ms), if known.
+   * Only an answer to a request sent after the last restart rejection can
+   * show that the engine is back (`detector.ts`). `withModeDetection`
+   * supplies it from the injected clock.
+   */
+  readonly sentAtMs?: number;
 }
 
 const NONE: VenueCondition = Object.freeze({ kind: "NONE" as const });
@@ -102,13 +109,23 @@ export function conditionOfCancelOutcome(raw: unknown): VenueCondition {
   }
 }
 
-/** Read a `{ operation, condition }` signal from own data fields, or `undefined`. */
-export function readCondition(signal: unknown): VenueSignal | undefined {
+/** A signal as read: `sentAtMs` is `null` when the caller did not supply it. */
+export interface ReadSignal {
+  readonly operation: VenueOperation;
+  readonly condition: VenueCondition;
+  readonly sentAtMs: number | null;
+}
+
+/** Read a `{ operation, condition, sentAtMs? }` signal from own data fields, or `undefined`. */
+export function readCondition(signal: unknown): ReadSignal | undefined {
   try {
-    const fields = readFields(signal, ["operation", "condition"]);
+    const fields = readFields(signal, ["operation", "condition", "sentAtMs"]);
     if (fields === undefined) return undefined;
     const operation = fields.operation;
     if (operation !== "PLACEMENT" && operation !== "CANCEL") return undefined;
+    const sentRaw = fields.sentAtMs;
+    if (sentRaw !== undefined && !(typeof sentRaw === "number" && Number.isSafeInteger(sentRaw) && sentRaw >= 0)) return undefined;
+    const sentAtMs = sentRaw === undefined ? null : sentRaw;
     const conditionFields = readFields(fields.condition, ["kind", "retryAfterSeconds"]);
     if (conditionFields === undefined) return undefined;
     const kind = conditionFields.kind;
@@ -120,7 +137,7 @@ export function readCondition(signal: unknown): VenueSignal | undefined {
       if (!(retry === null || retryOf(retry) !== null)) return undefined;
       condition = Object.freeze({ kind, retryAfterSeconds: retry === null ? null : retryOf(retry) });
     } else return undefined;
-    return Object.freeze({ operation, condition });
+    return Object.freeze({ operation, condition, sentAtMs });
   } catch {
     return undefined;
   }

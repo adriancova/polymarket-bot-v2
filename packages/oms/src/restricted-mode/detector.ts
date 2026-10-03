@@ -14,18 +14,36 @@
  *
  * | Answer | Condition | Effect here |
  * | --- | --- | --- |
- * | 425 (`ENGINE_RESTARTING`) on a placement or a cancel | RESTARTING | no placement until `Retry-After` has passed EXACTLY, or, without one, the snapshot's bounded exponential backoff; then POST_ONLY for `postOnlyWindowMs` |
+ * | 425 (`ENGINE_RESTARTING`) on a placement or a cancel | RESTARTING | no placement until `Retry-After` has passed EXACTLY, or, without one, the snapshot's bounded exponential backoff; then POST_ONLY, with no end, until the engine is seen back (below) |
  * | 503 `post_only_mode` (`POST_ONLY_MODE`), or a batch entry rejected with it | POST_ONLY | only post-only orders until `Retry-After` / `retry_after_seconds`, or, without one, `postOnlyWindowMs` |
  * | 503 without a documented code (`TRADING_UNAVAILABLE`) | TRADING_UNAVAILABLE | no placement for the snapshot's pause (bounded exponential over consecutive pauses); a `Retry-After` is not documented for it and is not interpreted |
+ * | a placement the venue answered (accepted, or rejected for another reason) | — | ends the consecutive pause run; see "The engine's return" for the restart |
+ * | a cancel the venue answered | — | records that cancels worked; see "The engine's return" |
+ * | anything else (nothing sent, a 429, a timeout, a transport failure, …) | — | nothing: "Retry only restart rejections" (E-07). A 429 is the rate-limit budget's (`polymarket-secure/src/rate-limit`) |
  *
  * A fallback backoff (one the venue gave no delay for) escalates only on a
  * rejection observed after the previous one has run out: an answer to a
  * request sent earlier (or another entry of the same batch) that arrives
  * while it runs neither extends nor escalates it. A delay the venue does
  * give is always honoured as given (and never shortens a running wait).
- * | a placement the venue answered (accepted, or rejected for another reason) | — | ends the consecutive restart and pause runs |
- * | a cancel the venue answered | — | ends the consecutive restart run; records that cancels worked |
- * | anything else (nothing sent, a 429, a timeout, a transport failure, …) | — | nothing: "Retry only restart rejections" (E-07). A 429 is the rate-limit budget's (`polymarket-secure/src/rate-limit`) |
+ *
+ * ## The engine's return, and the post-only window after it
+ *
+ * After a restart the engine "enters post-only mode for two minutes"
+ * (`POST_ONLY_WINDOW`), but no answer says WHEN it returned: the end of the
+ * local backoff is only when a resend may be TRIED. So after a 425, once
+ * the backoff has passed, the mode is POST_ONLY with no end (the engine may
+ * still be restarting, or in its post-only window) until the engine is seen
+ * back: an answer (a placement the venue answered, a post-only refusal, a
+ * completed cancel) to a request SENT after the last 425 was observed. That
+ * request was processed after the restart rejection, by a running engine, so
+ * the engine returned before the answer arrived, and its two-minute window
+ * ends at most `postOnlyWindowMs` after it: POST_ONLY holds until then (a
+ * post-only refusal's own `Retry-After`, when it gives one). An answer to a
+ * request sent before the last 425 proves nothing about the engine now and
+ * is not counted, nor is an answer without a known send instant. Until the
+ * engine is seen back a non-post-only order is never cleared, however long
+ * that takes; a post-only order, and any cancel, may probe it.
  *
  * ## The OMS's mode
  *
@@ -43,8 +61,11 @@
  * while POST_ONLY holds, and a retransmission of the same signed order is
  * cleared only for the restart path (`ENGINE_RESTARTING`) and only after the
  * backoff (WP-270 decision 2 adds the authoritative, quiescent ABSENT that
- * the OMS itself requires). After a restart the venue is post-only for two
- * minutes, so a restart always ends in POST_ONLY before NORMAL.
+ * the OMS itself requires). A restart always ends in POST_ONLY, held until
+ * the engine is seen back and its window has passed, before NORMAL: the
+ * same non-post-only order is never resent into the venue's post-only
+ * window. Any other rejection (a closed-only 400, D-24; a 429; a 503) never
+ * clears a resend (`RESTRICTED_MODE_FACTS.CLOSED_ONLY_NO_RESUBMIT`).
  *
  * Layer 1: no clock. Every method takes `atMs` (Unix epoch milliseconds)
  * from the caller; `venueModeSource` binds an injected clock for the OMS.
@@ -76,6 +97,10 @@ export interface VenueModeSnapshot {
   readonly restartingUntilMs: number | null;
   readonly tradingUnavailableUntilMs: number | null;
   readonly postOnlyUntilMs: number | null;
+  /** A 425 was seen and no answer to a request sent after it has shown the engine back: POST_ONLY, with no end, once the restart wait has passed. */
+  readonly engineReturnPending: boolean;
+  /** The latest instant a 425 was observed, or `null`. */
+  readonly lastRestartObservedMs: number | null;
   readonly consecutiveRestartFallbacks: number;
   readonly consecutiveUnavailablePauses: number;
   readonly cancelsEvidence: CancelsEvidence;
@@ -135,6 +160,8 @@ export class VenueModeDetector {
   #restartUntilMs = 0;
   #unavailableUntilMs = 0;
   #postOnlyUntilMs = 0;
+  #lastRestartObservedMs: number | null = null;
+  #engineReturnPending = false;
   #restartFallbacks = 0;
   #unavailablePauses = 0;
   #latestObservationMs = 0;
@@ -182,7 +209,7 @@ export class VenueModeDetector {
    * Record one classified venue answer (see `signals.ts` for the adapters
    * from the OMS's placement classes and the venue port's cancel outcomes).
    */
-  observe(signal: { readonly operation: VenueOperation; readonly condition: VenueCondition }, atMs: number): ObservationResult {
+  observe(signal: { readonly operation: VenueOperation; readonly condition: VenueCondition; readonly sentAtMs?: number }, atMs: number): ObservationResult {
     if (!isEpochMs(atMs)) return Object.freeze({ ok: false as const, reason: "INVALID_INPUT" as const, message: "atMs must be a non-negative safe integer" });
     const read = readCondition(signal);
     if (read === undefined) return Object.freeze({ ok: false as const, reason: "INVALID_INPUT" as const, message: "not a { operation, condition } signal" });
@@ -190,10 +217,15 @@ export class VenueModeDetector {
     if (config === undefined) {
       return Object.freeze({ ok: false as const, reason: "NO_ACTIVE_CONFIGURATION" as const, message: "no restricted-mode snapshot is in effect at this instant" });
     }
+    if (read.sentAtMs !== null && read.sentAtMs > atMs) {
+      return Object.freeze({ ok: false as const, reason: "INVALID_INPUT" as const, message: "a request cannot be sent after its answer was observed" });
+    }
     const before = this.#modeAt(atMs);
     if (atMs > this.#latestObservationMs) this.#latestObservationMs = atMs;
     const flags: ObservationFlag[] = [];
     const { operation, condition } = read;
+    // Was this request sent after the last restart rejection was observed? Only then can its answer show the engine back.
+    const sentAfterRestart = read.sentAtMs !== null && this.#lastRestartObservedMs !== null && read.sentAtMs > this.#lastRestartObservedMs;
     switch (condition.kind) {
       case "RESTARTING": {
         // E-06: "Honor `Retry-After` when the response includes it; otherwise, apply bounded exponential backoff".
@@ -209,8 +241,10 @@ export class VenueModeDetector {
           this.#restartFallbacks += 1;
         }
         this.#restartUntilMs = Math.max(this.#restartUntilMs, until);
-        // "After the engine returns, it enters post-only mode for two minutes."
-        this.#postOnlyUntilMs = Math.max(this.#postOnlyUntilMs, this.#restartUntilMs + config.postOnlyWindowMs);
+        // The engine is down now; when it returns, it "enters post-only mode for two minutes". That instant is
+        // unknown until an answer shows it back, so POST_ONLY has no end until then.
+        this.#lastRestartObservedMs = this.#lastRestartObservedMs === null ? atMs : Math.max(this.#lastRestartObservedMs, atMs);
+        this.#engineReturnPending = true;
         break;
       }
       case "POST_ONLY": {
@@ -220,6 +254,8 @@ export class VenueModeDetector {
         }
         const until = condition.retryAfterSeconds === null ? atMs + config.postOnlyWindowMs : atMs + condition.retryAfterSeconds * MS_PER_SECOND;
         this.#postOnlyUntilMs = Math.max(this.#postOnlyUntilMs, until);
+        // A post-only refusal of a request sent after the last 425 is the running engine's own answer.
+        if (this.#engineReturnPending && sentAfterRestart) this.#engineSeenBack();
         break;
       }
       case "TRADING_UNAVAILABLE": {
@@ -233,8 +269,16 @@ export class VenueModeDetector {
         break;
       }
       case "ANSWERED": {
-        // An answer that is not a restart rejection ends the run of consecutive restart rejections.
-        this.#restartFallbacks = 0;
+        if (this.#engineReturnPending) {
+          // Only an answer to a request sent after the last 425 shows the engine back; its post-only window
+          // began before this answer arrived, so it ends at most `postOnlyWindowMs` from now.
+          if (sentAfterRestart) {
+            this.#engineSeenBack();
+            this.#postOnlyUntilMs = Math.max(this.#postOnlyUntilMs, atMs + config.postOnlyWindowMs);
+          }
+        } else {
+          this.#restartFallbacks = 0;
+        }
         if (operation === "PLACEMENT") this.#unavailablePauses = 0;
         else this.#cancels = Object.freeze({ observation: "WORKED" as const, atMs });
         break;
@@ -257,6 +301,8 @@ export class VenueModeDetector {
       restartingUntilMs: pending(this.#restartUntilMs),
       tradingUnavailableUntilMs: pending(this.#unavailableUntilMs),
       postOnlyUntilMs: pending(this.#postOnlyUntilMs),
+      engineReturnPending: this.#engineReturnPending,
+      lastRestartObservedMs: this.#lastRestartObservedMs,
       consecutiveRestartFallbacks: this.#restartFallbacks,
       consecutiveUnavailablePauses: this.#unavailablePauses,
       cancelsEvidence: this.#cancels,
@@ -278,7 +324,10 @@ export class VenueModeDetector {
     const mode = this.#modeAt(atMs);
     if (mode === "RESTARTING") return blocked("RESTARTING", this.#restartUntilMs);
     if (mode === "TRADING_UNAVAILABLE") return blocked("TRADING_UNAVAILABLE", this.#unavailableUntilMs);
-    if (mode === "POST_ONLY" && !postOnly.value) return blocked("POST_ONLY_MODE_REQUIRES_POST_ONLY", this.#postOnlyUntilMs);
+    if (mode === "POST_ONLY" && !postOnly.value) {
+      // While the engine's return is unseen, no instant is known at which a non-post-only order may go.
+      return blocked("POST_ONLY_MODE_REQUIRES_POST_ONLY", this.#engineReturnPending ? null : this.#postOnlyUntilMs);
+    }
     return ALLOWED;
   }
 
@@ -302,10 +351,17 @@ export class VenueModeDetector {
     return Object.freeze({ allowed: true as const, cancelsEvidence: this.#cancels });
   }
 
+  /** An answer to a request sent after the last 425 showed the engine running: the restart episode is over. */
+  #engineSeenBack(): void {
+    this.#engineReturnPending = false;
+    this.#restartFallbacks = 0;
+  }
+
   #modeAt(atMs: number): RestrictedVenueMode {
     if (this.#timeline.activeAt(atMs) === undefined) return "TRADING_UNAVAILABLE";
     if (atMs < this.#restartUntilMs) return "RESTARTING";
     if (atMs < this.#unavailableUntilMs) return "TRADING_UNAVAILABLE";
+    if (this.#engineReturnPending) return "POST_ONLY";
     if (atMs < this.#postOnlyUntilMs) return "POST_ONLY";
     return "NORMAL";
   }
