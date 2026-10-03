@@ -27,12 +27,21 @@
  * 2–4. Read, in this order and all AFTER every request the run will answer
  *    was received (`readsStartSeq`): open orders, trades, each order that
  *    must be read by id (E-14: an order absent from the open list is not
- *    proof of cancellation), positions (`/v2`), the collateral balance,
+ *    proof of cancellation; every tracked order still open, and every one
+ *    with fills, terminal or not), positions (`/v2`), the collateral balance,
  *    approvals, the ledger projection, and each wallet-operation member a
  *    request names. A read made before a request was received NEVER answers
  *    it (ADR-032 D4; `WP300C-OBLIGATIONS`): a request that arrives during the
  *    reads waits for the next run, which starts at once.
  * 5. Compare (`door.ts`, `identity.ts`, `holdings.ts`); answer the requests.
+ *    Fills are compared BY IDENTITY and with exact economics, both ways
+ *    (`#probeFills`, `#compareFills`): a trade the OMS holds under the same
+ *    (trade, order) identity must carry the same facts; the OMS's recorded
+ *    fill must be exactly what it holds under the venue's identities; only
+ *    then is a trade it does not hold a missed fill, delivered. A read behind
+ *    the OMS's durable settlement is a READ_REGRESSION (no restart forgets
+ *    it). A tracked order's token (its group's, `tokenOfGroup`), side, price
+ *    and size are its fixed facts.
  * 6. Record every discrepancy as an append-only break (`BREAK_OPENED`), and
  *    every answer (`ANSWER_RECORDED`).
  * 7. Resolve or quarantine, by the break's rule (the ledger's taxonomy):
@@ -72,8 +81,13 @@
  *   answered.
  * - **The user stream (WP-280).** Its reconciliation requests trigger runs and
  *   are acknowledged, by id, only after a run whose order and trade reads
- *   began after their receipt and were complete. Its normalized events are
- *   routed to the OMS (outside runs; buffered during one).
+ *   began after their receipt and were complete; each acknowledgement is
+ *   journaled. Its normalized events are routed to the OMS (outside runs;
+ *   buffered during one).
+ * - **Malformed requests.** A request that cannot be read, on any channel, is
+ *   refused to its requester (the OMS and the inventory keep it as owed) and
+ *   recorded as a REQUEST_MALFORMED break by the next run: a hold, which a
+ *   later complete run that no longer receives it clears.
  * - **Data API v2 only (V3-E15).** A positions or approvals read from any
  *   other route is refused (`READ_WRONG_ROUTE`).
  *
@@ -90,10 +104,19 @@
  *   no evidence is retained;
  * - no OMS, wallet or stream request is unanswered, and none arrived during
  *   the run; the inventory holds no undelivered request;
- * - `RUN_COMPLETED` with `PASSED` is durable.
+ * - `RUN_COMPLETED` with `PASSED` is durable, AND nothing held the account
+ *   while it was being written (a trigger, any request receipt, a pause: the
+ *   hold epoch). The decision is taken, the record awaited, and the epoch
+ *   compared again just before `resume()`, synchronously. If it moved, the
+ *   run records `RESUME_REFUSED` and the next run, at once, answers the work.
  * Anything else leaves submissions paused. Ambiguity breaks are
  * `HOLD_UNTIL_CONSISTENT`: no operator can release them; only a later
- * complete run that no longer finds them clears them.
+ * complete run that no longer finds them, having judged them again, clears
+ * them. A release acknowledges immutable history only; a live contradiction
+ * (a tracked order's facts) opens again while it is found.
+ *
+ * One run at a time: `reconcile()` claims the run synchronously, before its
+ * first await.
  *
  * Layer 1: no I/O, no global clock, no randomness, no timer. Every effect
  * leaves through a port in `ports.ts`; the clock is one of them.
@@ -158,8 +181,22 @@ const MAX_REQUEST_ID = 2000;
 const STREAM_DISCREPANCY_CAUSES: readonly string[] = ["UNRECOGNIZED_MESSAGE", "EVENT_NOT_FULLY_APPLICABLE", "EVENT_NOT_DELIVERED"];
 /** OMS refusals of routed stream evidence that mean the account's activity did not match what the OMS tracks. */
 const DISCREPANCY_REFUSALS: readonly string[] = ["OMS_UNKNOWN_VENUE_ORDER", "OMS_FILL_INCONSISTENT", "OMS_FILL_CONFLICT", "OMS_SETTLEMENT_CONFLICT"];
-/** Order-level disagreements after which the run's ledger projection is known to be behind (see `#runOnce`). */
-const DEFERS_HOLDINGS: readonly BreakClass[] = ["TRADE_MISSING_IN_OMS", "FILL_ECONOMICS_UNFIXED", "ORDER_STATE_MISMATCH", "ORDER_FILLS_AHEAD_OF_VENUE", "ORDER_TRADES_INCOMPLETE"];
+/** Order-level disagreements after which the run's ledger projection is known to be behind, or wrong (see `#runOnce`). */
+const DEFERS_HOLDINGS: readonly BreakClass[] = [
+  "TRADE_MISSING_IN_OMS",
+  "FILL_ECONOMICS_UNFIXED",
+  "FILL_MISMATCH",
+  "FILL_REFUSED",
+  "ORDER_STATE_MISMATCH",
+  "ORDER_FILLS_AHEAD_OF_VENUE",
+  "ORDER_TRADES_INCOMPLETE",
+];
+/** Classes only the holding comparison finds: a run that did not judge the holdings never clears them (it did not look). */
+const JUDGED_WITH_HOLDINGS: readonly BreakClass[] = ["HOLDING_IN_TRANSIT_AMBIGUOUS", "HOLDING_DELTA_UNCONFIRMED", "CORRECTION_FAILED", "APPROVAL_MISSING", "WALLET_OPERATION_IN_FLIGHT"];
+/** Malformed request receipts itemised between runs; more are counted, and recorded as one break. */
+const MAX_MALFORMED_PENDING = 256;
+/** Contradictions already shown by the OMS (each probe of one raises an OMS alert); beyond this, they are probed again. */
+const MAX_KNOWN_CONFLICTS = 10_000;
 const OPEN_FOR_STATE_CHECK: ReadonlySet<OrderState> = new Set<OrderState>(["ACKNOWLEDGED", "LIVE", "DELAYED", "PARTIALLY_FILLED"]);
 
 interface Received<T> {
@@ -168,6 +205,13 @@ interface Received<T> {
   readonly seq: number;
   /** The clock at receipt; `null` until a sound reading was taken (it is then stamped, conservatively, later). */
   readonly atMs: number | null;
+}
+
+/** A reconciliation request that could not be read, awaiting the run that records it. */
+interface MalformedReceipt {
+  readonly channel: "oms" | "inventory" | "user-stream";
+  readonly seq: number;
+  readonly why: string;
 }
 
 interface Detection {
@@ -244,6 +288,17 @@ class RunState {
   readonly absentCandidates: Received<OmsReconciliationRequest>[] = [];
   /** Requests received after this were not answerable by the run's reads. */
   readsStartSeq: number | null = null;
+  /** Per leg of a tracked order (`compositeKey(trade, order)`): whether the OMS holds a fill under that identity (`#probeFills`). */
+  readonly fillProbe = new Map<string, "KNOWN" | "UNKNOWN">();
+  /** Tracked orders (order id) whose fills this run could not verify: nothing is delivered for them. */
+  readonly unverifiedOrders = new Set<string>();
+  /** A tracked order's fills were not compared at all (its token is unknown, or its fixed facts differ). */
+  fillsUncompared = false;
+  /** Attempts whose signed identity this run judged, and attempts this run gave an answer (accepted or refused). */
+  readonly identityJudged = new Set<string>();
+  readonly answered = new Set<string>();
+  /** Subjects this run did not judge again: it never clears them as NOT_REPRODUCED (see `#judged`). */
+  readonly unjudged = new Set<string>();
   constructor(
     readonly runId: string,
     public runStartSeq: number,
@@ -321,12 +376,19 @@ export class ReconciliationCoordinator {
   readonly #walletRequests = new Map<string, Received<WalletReconciliationRequest>>();
   /** stream request id → the request. */
   readonly #streamRequests = new Map<string, Received<StreamReconciliationRequest>>();
-  #malformedRequests = 0;
+  /** Malformed request receipts, each recorded as a REQUEST_MALFORMED break by the next run (`#takeMalformed`). */
+  readonly #malformed: MalformedReceipt[] = [];
+  #malformedUnitemised = 0;
 
   readonly #streamBuffer: unknown[] = [];
   #streamChain: Promise<void> = Promise.resolve();
   #running = false;
   #holding = true;
+  /**
+   * Advanced by every hold (every trigger, so every request receipt, and every pause). A run decides to resume,
+   * then awaits its durable PASSED record; it resumes only if the epoch has not moved meanwhile (`#finish`).
+   */
+  #holdEpoch = 0;
 
   /** Venue order id → the highest matched size and whether a sound read showed it terminal (out-of-order reads). */
   readonly #orderHighWater = new Map<string, { readonly sizeMatched: DecimalString; readonly terminal: boolean }>();
@@ -334,6 +396,8 @@ export class ReconciliationCoordinator {
   readonly #tradeHighWater = new Map<string, VenueTradeStatus>();
   /** Asset id → an unexplained delta awaiting confirmation. */
   readonly #unexplained = new Map<string, { readonly delta: DecimalString; readonly firstSeenAtMs: number }>();
+  /** Fill and settlement facts the OMS already refused as contradictions: not offered again (each offer raises an OMS alert). */
+  readonly #knownConflicts = new Set<string>();
 
   /** Hand this to `OrderManager.open` as its `reconciler`. */
   readonly omsRequester: ReconciliationRequester;
@@ -411,10 +475,11 @@ export class ReconciliationCoordinator {
    */
   async reconcile(): Promise<ReconcileReport> {
     if (this.#running) return Object.freeze({ runs: Object.freeze([notRun([], "a run is already in progress")]), resumed: false });
-    await this.#streamChain;
+    // Claimed before the first await: a second call in the same tick, or during this run, finds it taken.
     this.#running = true;
     const runs: RunReport[] = [];
     try {
+      await this.#streamChain;
       for (let index = 0; index < MAX_RUNS_PER_RECONCILE; index += 1) {
         let report: RunReport;
         try {
@@ -468,7 +533,7 @@ export class ReconciliationCoordinator {
       pendingOmsRequests: this.#omsRequests.size,
       pendingWalletRequests: this.#walletRequests.size,
       pendingStreamRequests: this.#streamRequests.size,
-      unresolvedBreaks: this.#unresolvedBreaks(),
+      unresolvedBreaks: this.#unresolvedBreaks() ?? [],
     });
   }
 
@@ -531,6 +596,8 @@ export class ReconciliationCoordinator {
       this.#hold();
       return notRun(triggers, `the run could not be recorded: ${started.code}`);
     }
+    // Every malformed request received before this run is recorded by it, as a break of its own.
+    this.#takeMalformed(run, runStartSeq);
     if (oms === null || oms.faulted) {
       run.readsComplete = false;
       this.#detect(run, {
@@ -572,6 +639,9 @@ export class ReconciliationCoordinator {
 
     // ---- §9.17 step 5: compare, and answer ------------------------------------------------------
     const view = this.#assembleOrderView(run, reads);
+    // The trades read against the OMS's durable fills, by identity: a read behind the OMS is not one view of the
+    // account, and nothing is answered or compared from it.
+    if (run.orderReadsSound) await this.#probeFills(run, oms, view, readsStartedAt);
     if (run.orderReadsSound) {
       await this.#answerOmsRequests(run, oms, answerableOms, view, readsStartedAt);
       await this.#compareOrdersAndTrades(run, oms, view, readsStartedAt);
@@ -579,16 +649,18 @@ export class ReconciliationCoordinator {
     await this.#answerWalletRequests(run, answerableWallet, reads.walletMembers);
     if (run.orderReadsSound && run.readsComplete) {
       // The ledger projection was read before this run's fill deliveries and routings: while the OMS and the venue
-      // disagree about an order's fills or state, holdings are not judged (the projection is known to be behind),
-      // and the run cannot pass; the next run, at once, judges them.
-      if (run.detections.some((detection) => DEFERS_HOLDINGS.includes(detection.breakClass))) {
+      // disagree about an order's fills or state, or an order's fills were not compared at all, holdings are not
+      // judged (the projection may be behind: a delta such an order explains is never booked UNATTRIBUTED), and the
+      // run cannot pass; the next run, at once, judges them.
+      if (run.fillsUncompared || run.detections.some((detection) => DEFERS_HOLDINGS.includes(detection.breakClass))) {
         run.holdingsDeferred = true;
       } else {
         await this.#compareHoldings(run, oms, view, reads, readsStartedAt);
       }
       await this.#answerAbsent(run, oms);
-      this.#acknowledgeStreamRequests(run, answerableStream);
+      await this.#acknowledgeStreamRequests(run, answerableStream);
     }
+    this.#markUnjudgedAttempts(run, oms);
     this.#inspectOms(run, oms);
     this.#inspectWallet(run);
     return this.#finish(run, triggers, this.#now() ?? readsEndedAt);
@@ -637,8 +709,10 @@ export class ReconciliationCoordinator {
     const ids = new Set<string>();
     if (open.kind === "OK") for (const order of open.value) if (!claimed.has(order.venueOrderId)) ids.add(order.venueOrderId);
     if (trades.kind === "OK") for (const trade of trades.value) for (const leg of trade.ownLegs) if (!listed.has(leg.venueOrderId)) ids.add(leg.venueOrderId);
+    // A terminal order with fills stays in the comparison: its fills must still be the venue's.
     for (const order of oms.orders()) {
-      if (order.venueOrderId !== null && !TERMINAL_ORDER_STATES.has(order.state) && !listed.has(order.venueOrderId)) ids.add(order.venueOrderId);
+      if (order.venueOrderId === null || listed.has(order.venueOrderId)) continue;
+      if (!TERMINAL_ORDER_STATES.has(order.state) || compareDecimal(order.filledShares, "0") > 0) ids.add(order.venueOrderId);
     }
     for (const entry of answerableOms) if (entry.request.venueOrderId !== null) ids.add(entry.request.venueOrderId);
     // A venue order id the stream named and the OMS retains (it could not attribute it yet) is a candidate too.
@@ -877,6 +951,7 @@ export class ReconciliationCoordinator {
       if (attempt.inFlight) continue; // the OMS refuses ABSENT while its own transmission is pending
       const facts = this.#attemptFacts.get(request.submissionAttemptId) ?? factsOf(request);
       const verdict = resolveBySignedIdentity(facts, this.#unclaimed(oms, view), this.#potentialOwners(oms));
+      run.identityJudged.add(request.submissionAttemptId);
       if (verdict.kind === "AMBIGUOUS") {
         this.#detect(run, {
           breakClass: "SIGNED_IDENTITY_AMBIGUOUS",
@@ -955,13 +1030,14 @@ export class ReconciliationCoordinator {
       });
       return;
     }
-    if (!sameOrderFacts(order, venue)) {
+    // The request names the order's token (its group's): the venue's token is a fixed fact like the others.
+    if (!sameOrderFacts(order, venue, request.tokenId)) {
       this.#detect(run, {
         breakClass: "ORDER_FACTS_MISMATCH",
         subjectKey: compositeKey("ORDER_FACTS_MISMATCH", order.orderId),
         marketId: order.marketId,
         orderId: order.orderId,
-        detail: `tracked order ${order.orderId}: the venue's side, price or size differs from the order's`,
+        detail: `tracked order ${order.orderId}: the venue's token, side, price or size differs from the order's`,
       });
       return;
     }
@@ -987,6 +1063,7 @@ export class ReconciliationCoordinator {
 
   async #answerOms(run: RunState, oms: ReconciledOms, received: Received<OmsReconciliationRequest>, answer: Readonly<Record<string, unknown>>): Promise<void> {
     const request = received.request;
+    run.answered.add(request.submissionAttemptId);
     let accepted = false;
     let code: string | null = null;
     try {
@@ -1018,30 +1095,136 @@ export class ReconciliationCoordinator {
 
   // ---- orders and trades against the OMS ------------------------------------------------------
 
+  /**
+   * The IDENTITY PROBE (§6 invariant 5): every leg of a tracked order is offered to the OMS as a settlement
+   * observation. The OMS keys a fill on (trade, order, discriminator `"0"`, WP-280's convention), so
+   * `OMS_UNKNOWN_FILL` says it holds no fill under the leg's identity, and any other answer says it does. A
+   * refusal as stale (a settlement earlier than the one the OMS recorded durably) means the read is behind the
+   * OMS: a READ_REGRESSION, which no restart forgets, and nothing is answered or compared from the read. A
+   * contradicted terminal settlement is a FILL_MISMATCH. Any other refusal leaves the order unverified.
+   */
+  async #probeFills(run: RunState, oms: ReconciledOms, view: OrderTradeView, readsStartedAt: number): Promise<void> {
+    for (const order of oms.orders()) {
+      if (order.venueOrderId === null) continue;
+      for (const entry of view.legsByOrder.get(order.venueOrderId) ?? []) await this.#probeLeg(run, oms, order, entry, readsStartedAt);
+    }
+  }
+
+  /** Probe one leg of a tracked order (see `#probeFills`). Every outcome is recorded: a KNOWN or UNKNOWN identity, or a break. */
+  async #probeLeg(
+    run: RunState,
+    oms: ReconciledOms,
+    order: OrderView,
+    entry: { readonly leg: VenueTradeLeg; readonly trade: VenueTradeView; readonly status: VenueTradeStatus | null },
+    readsStartedAt: number,
+  ): Promise<void> {
+    const venueOrderId = entry.leg.venueOrderId;
+    const tradeId = entry.trade.venueTradeId;
+    const key = compositeKey(tradeId, venueOrderId);
+    if (run.fillProbe.has(key)) return;
+    if (entry.status === null) {
+      // Unreachable on a sound view (an unrecognised status makes it unsound); fail closed regardless.
+      run.unverifiedOrders.add(order.orderId);
+      this.#detect(run, {
+        breakClass: "STATUS_UNRECOGNISED",
+        subjectKey: compositeKey("STATUS_UNRECOGNISED", "trade", tradeId),
+        detail: `trade ${tradeId} has a status outside the documented vocabulary`,
+      });
+      return;
+    }
+    const conflict = compositeKey("settlement", tradeId, venueOrderId, entry.status);
+    let code: string | null = "OMS_SETTLEMENT_CONFLICT";
+    if (!this.#knownConflicts.has(conflict)) {
+      let result: unknown;
+      try {
+        result = await oms.applySettlement({
+          venueTradeId: tradeId,
+          venueOrderId,
+          status: entry.status,
+          transactionHash: entry.trade.transactionHash,
+          observedAt: isoFromEpochMs(readsStartedAt) as string,
+        });
+      } catch {
+        result = undefined;
+      }
+      code = readOkFlag(result) ? null : readRefusalCode(result);
+    }
+    if (code === "OMS_UNKNOWN_FILL") {
+      run.fillProbe.set(key, "UNKNOWN");
+      return;
+    }
+    if (code === null || code === "OMS_SETTLEMENT_REGRESSION" || code === "OMS_SETTLEMENT_CONFLICT") run.fillProbe.set(key, "KNOWN");
+    if (code === "OMS_SETTLEMENT_REGRESSION") {
+      run.orderReadsSound = false;
+      this.#detect(run, {
+        breakClass: "READ_REGRESSION",
+        subjectKey: compositeKey("READ_REGRESSION", "trade", tradeId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        detail: `trade ${tradeId}: the read shows settlement ${entry.status}, earlier than the OMS recorded durably (a read behind the OMS)`,
+      });
+    } else if (code === "OMS_SETTLEMENT_CONFLICT") {
+      this.#rememberConflict(conflict);
+      run.unverifiedOrders.add(order.orderId);
+      this.#detect(run, {
+        breakClass: "FILL_MISMATCH",
+        subjectKey: compositeKey("FILL_MISMATCH", order.orderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        detail: `tracked order ${order.orderId}: trade ${tradeId}'s settlement ${entry.status} contradicts the terminal settlement the OMS recorded`,
+      });
+    } else if (code !== null) {
+      run.unverifiedOrders.add(order.orderId);
+      this.#detect(run, {
+        breakClass: "FILL_REFUSED",
+        subjectKey: compositeKey("FILL_REFUSED", "settlement", tradeId, venueOrderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        detail: `the OMS refused trade ${tradeId}'s settlement status: ${code}`,
+      });
+    }
+  }
+
   async #compareOrdersAndTrades(run: RunState, oms: ReconciledOms, view: OrderTradeView, readsStartedAt: number): Promise<void> {
-    const observedAt = isoFromEpochMs(readsStartedAt) as string;
     for (const order of oms.orders()) {
       if (order.venueOrderId === null) continue;
       const venue = view.venueOrders.get(order.venueOrderId);
       if (venue === undefined) {
-        if (!TERMINAL_ORDER_STATES.has(order.state) && view.notFound.has(order.venueOrderId)) {
+        // Read by id when open, or when it has fills (a terminal execution stays in the comparison; E-14: the by-id
+        // read finds canceled and fully matched orders): not found is a contradiction.
+        const filled = compareDecimal(order.filledShares, "0") > 0;
+        if ((!TERMINAL_ORDER_STATES.has(order.state) || filled) && view.notFound.has(order.venueOrderId)) {
           this.#detect(run, {
             breakClass: "ORDER_STATE_MISMATCH",
             subjectKey: compositeKey("ORDER_STATE_MISMATCH", order.orderId),
             marketId: order.marketId,
             orderId: order.orderId,
-            detail: `tracked open order ${order.orderId}: the venue does not find its venue order ${order.venueOrderId}`,
+            detail: `tracked ${order.state} order ${order.orderId} (${order.filledShares} filled): the venue does not find its venue order ${order.venueOrderId}`,
           });
         }
         continue;
       }
-      if (!sameOrderFacts(order, venue)) {
+      // WP-270's OrderView carries no token: the order's group names it (`tokenOfGroup`). Unknown: not compared.
+      const tokenId = this.#groupToken(order.executionGroupId);
+      if (tokenId === null) {
+        run.fillsUncompared = true;
+        this.#detect(run, {
+          breakClass: "COMPONENT_UNAVAILABLE",
+          subjectKey: compositeKey("COMPONENT_UNAVAILABLE", "group-token", order.executionGroupId),
+          marketId: order.marketId,
+          orderId: order.orderId,
+          detail: `the token of execution group ${order.executionGroupId} is unknown: tracked order ${order.orderId} cannot be compared with the venue's`,
+        });
+        continue;
+      }
+      if (!sameOrderFacts(order, venue, tokenId)) {
+        run.fillsUncompared = true;
         this.#detect(run, {
           breakClass: "ORDER_FACTS_MISMATCH",
           subjectKey: compositeKey("ORDER_FACTS_MISMATCH", order.orderId),
           marketId: order.marketId,
           orderId: order.orderId,
-          detail: `tracked order ${order.orderId}: the venue's side, price or size differs from the order's`,
+          detail: `tracked order ${order.orderId}: the venue's token, side, price or size differs from the order's`,
         });
         continue;
       }
@@ -1065,81 +1248,7 @@ export class ReconciliationCoordinator {
           act: async () => readOkFlag(await oms.applyOrderObservation({ venueOrderId, status: venue.status })),
         });
       }
-      const legs = view.legsByOrder.get(venueOrderId) ?? [];
-      const traded = sumShares(legs.map((entry) => entry.leg));
-      if (compareDecimal(traded, venue.sizeMatched) < 0) {
-        this.#detect(run, {
-          breakClass: "ORDER_TRADES_INCOMPLETE",
-          subjectKey: compositeKey("ORDER_TRADES_INCOMPLETE", order.orderId),
-          marketId: order.marketId,
-          orderId: order.orderId,
-          expectedValue: venue.sizeMatched,
-          observedValue: traded,
-          detail: `tracked order ${order.orderId}: the venue matched more than its trades show`,
-        });
-      }
-      if (compareDecimal(order.filledShares, traded) > 0) {
-        this.#detect(run, {
-          breakClass: "ORDER_FILLS_AHEAD_OF_VENUE",
-          subjectKey: compositeKey("ORDER_FILLS_AHEAD_OF_VENUE", order.orderId),
-          marketId: order.marketId,
-          orderId: order.orderId,
-          expectedValue: order.filledShares,
-          observedValue: traded,
-          detail: `tracked order ${order.orderId}: the OMS recorded more fill than the venue's trades show`,
-        });
-      } else if (compareDecimal(order.filledShares, traded) < 0) {
-        const unfixed = legs.filter((entry) => entry.leg.feeAmount === null);
-        if (unfixed.length > 0) {
-          this.#detect(run, {
-            breakClass: "FILL_ECONOMICS_UNFIXED",
-            subjectKey: compositeKey("FILL_ECONOMICS_UNFIXED", order.orderId),
-            marketId: order.marketId,
-            orderId: order.orderId,
-            expectedValue: traded,
-            observedValue: order.filledShares,
-            detail: `tracked order ${order.orderId}: a missing fill's exact fee is not known; it is not booked with a guess`,
-          });
-        } else {
-          this.#detect(run, {
-            breakClass: "TRADE_MISSING_IN_OMS",
-            subjectKey: compositeKey("TRADE_MISSING_IN_OMS", order.orderId),
-            marketId: order.marketId,
-            orderId: order.orderId,
-            expectedValue: traded,
-            observedValue: order.filledShares,
-            detail: `tracked order ${order.orderId}: the venue's trades show fills the OMS had not recorded; delivered`,
-            act: async () => this.#deliverFills(run, oms, order, legs),
-          });
-        }
-      }
-      // Settlement statuses (§6 invariant 5): the OMS keeps the latest and refuses stale ones itself.
-      for (const entry of legs) {
-        if (entry.status === null) continue;
-        let result: unknown;
-        try {
-          result = await oms.applySettlement({
-            venueTradeId: entry.trade.venueTradeId,
-            venueOrderId,
-            status: entry.status,
-            transactionHash: entry.trade.transactionHash,
-            observedAt,
-          });
-        } catch {
-          result = undefined;
-        }
-        const code = readOkFlag(result) ? null : readRefusalCode(result);
-        // UNKNOWN_FILL: the fill is not recorded (yet); REGRESSION: this read is behind the OMS. Neither is a break here.
-        if (code !== null && code !== "OMS_UNKNOWN_FILL" && code !== "OMS_SETTLEMENT_REGRESSION" && code !== "OMS_SETTLEMENT_CONFLICT") {
-          this.#detect(run, {
-            breakClass: "FILL_REFUSED",
-            subjectKey: compositeKey("FILL_REFUSED", "settlement", entry.trade.venueTradeId, venueOrderId),
-            marketId: order.marketId,
-            orderId: order.orderId,
-            detail: `the OMS refused trade ${entry.trade.venueTradeId}'s settlement status: ${code}`,
-          });
-        }
-      }
+      await this.#compareFills(run, oms, order, venue, view.legsByOrder.get(venueOrderId) ?? [], readsStartedAt);
     }
     // Venue orders and trades no tracked order owns: UNATTRIBUTED, unless an unresolved attempt could own them.
     const claimed = claimedVenueIds(oms.orders(), oms.attempts());
@@ -1177,6 +1286,151 @@ export class ReconciliationCoordinator {
     }
   }
 
+  /**
+   * One tracked order's fills against the venue's trades, BY IDENTITY and with exact economics, both ways:
+   * - every leg the OMS holds under its identity (`#probeFills`) must carry the OMS's exact economics;
+   * - the OMS's recorded fill must equal the shares it holds under the venue's identities: more means it
+   *   recorded fills the venue does not show under their ids (ORDER_FILLS_AHEAD_OF_VENUE, or FILL_MISMATCH
+   *   when the venue shows trade ids the OMS did not record instead);
+   * - only then are the legs it does not hold missing fills, and delivered (TRADE_MISSING_IN_OMS).
+   * An order with any mismatch, unverifiable fee or refused probe gets no delivery, and holds.
+   */
+  async #compareFills(
+    run: RunState,
+    oms: ReconciledOms,
+    order: OrderView,
+    venue: VenueOrderView,
+    legs: readonly { readonly leg: VenueTradeLeg; readonly trade: VenueTradeView; readonly status: VenueTradeStatus | null }[],
+    readsStartedAt: number,
+  ): Promise<void> {
+    const venueOrderId = venue.venueOrderId;
+    // A leg of an order that became tracked during this run (an answer named its venue order) is probed now.
+    for (const entry of legs) await this.#probeLeg(run, oms, order, entry, readsStartedAt);
+    const traded = sumShares(legs.map((entry) => entry.leg));
+    if (compareDecimal(traded, venue.sizeMatched) < 0) {
+      this.#detect(run, {
+        breakClass: "ORDER_TRADES_INCOMPLETE",
+        subjectKey: compositeKey("ORDER_TRADES_INCOMPLETE", order.orderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        expectedValue: venue.sizeMatched,
+        observedValue: traded,
+        detail: `tracked order ${order.orderId}: the venue matched more than its trades show`,
+      });
+    }
+    const probed = (entry: (typeof legs)[number]): "KNOWN" | "UNKNOWN" | undefined => run.fillProbe.get(compositeKey(entry.trade.venueTradeId, venueOrderId));
+    const known = legs.filter((entry) => probed(entry) === "KNOWN");
+    const unknown = legs.filter((entry) => probed(entry) === "UNKNOWN");
+    // Every leg was probed above: each is KNOWN or UNKNOWN, or its order is unverified with a break recorded.
+    let verified = !run.unverifiedOrders.has(order.orderId) && known.length + unknown.length === legs.length;
+    for (const entry of known) if (!(await this.#verifyEconomics(run, oms, order, entry))) verified = false;
+    if (!verified) return;
+    const held = sumShares(known.map((entry) => entry.leg));
+    const comparison = compareDecimal(order.filledShares, held);
+    if (comparison !== 0) {
+      // More: the OMS recorded fills the venue does not show under their ids; the read lags (ORDER_FILLS_AHEAD_OF_
+      // VENUE), unless the venue shows trade ids the OMS did not record instead (FILL_MISMATCH). Less cannot happen
+      // (each fill held was verified equal to a leg); it would be a mismatch too.
+      const lagging = comparison > 0 && unknown.length === 0;
+      this.#detect(run, {
+        breakClass: lagging ? "ORDER_FILLS_AHEAD_OF_VENUE" : "FILL_MISMATCH",
+        subjectKey: compositeKey(lagging ? "ORDER_FILLS_AHEAD_OF_VENUE" : "FILL_MISMATCH", order.orderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        expectedValue: order.filledShares,
+        observedValue: held,
+        detail: lagging
+          ? `tracked order ${order.orderId}: the OMS recorded more fill than the venue's trades show under the OMS's trade ids`
+          : `tracked order ${order.orderId}: the OMS's fills and the venue's trades differ by trade id (it recorded ${order.filledShares}; the venue shows ${held} of it under the same ids, and trades it did not record); nothing is delivered`,
+      });
+      return;
+    }
+    // The OMS's fills are exactly the legs it holds: the others are fills it missed.
+    if (unknown.length === 0) return;
+    if (unknown.some((entry) => entry.leg.feeAmount === null)) {
+      this.#detect(run, {
+        breakClass: "FILL_ECONOMICS_UNFIXED",
+        subjectKey: compositeKey("FILL_ECONOMICS_UNFIXED", order.orderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        expectedValue: traded,
+        observedValue: order.filledShares,
+        detail: `tracked order ${order.orderId}: a missing fill's exact fee is not known; it is not booked with a guess`,
+      });
+      return;
+    }
+    this.#detect(run, {
+      breakClass: "TRADE_MISSING_IN_OMS",
+      subjectKey: compositeKey("TRADE_MISSING_IN_OMS", order.orderId),
+      marketId: order.marketId,
+      orderId: order.orderId,
+      expectedValue: traded,
+      observedValue: order.filledShares,
+      detail: `tracked order ${order.orderId}: the venue's trades show fills the OMS had not recorded; delivered`,
+      act: async () => this.#deliverFills(run, oms, order, unknown),
+    });
+  }
+
+  /**
+   * A leg the OMS holds a fill for, offered with the leg's exact facts: the OMS answers OK only when every fact
+   * of its record is the same (`recordFill`'s de-duplication), and refuses a difference (`OMS_FILL_CONFLICT`,
+   * with its own halting alert). `true` when verified equal.
+   */
+  async #verifyEconomics(
+    run: RunState,
+    oms: ReconciledOms,
+    order: OrderView,
+    entry: { readonly leg: VenueTradeLeg; readonly trade: VenueTradeView },
+  ): Promise<boolean> {
+    const { leg, trade } = entry;
+    if (leg.feeAmount === null) {
+      this.#detect(run, {
+        breakClass: "FILL_ECONOMICS_UNFIXED",
+        subjectKey: compositeKey("FILL_ECONOMICS_UNFIXED", order.orderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        detail: `tracked order ${order.orderId}: the read does not fix trade ${trade.venueTradeId}'s fee, so the fill the OMS recorded cannot be verified`,
+      });
+      return false;
+    }
+    const facts = [trade.venueTradeId, leg.venueOrderId, leg.shares, leg.price, leg.feeAmount, leg.feeAssetId ?? "", leg.role, leg.matchedAt];
+    const conflict = compositeKey("fill", ...facts);
+    let code: string | null = "OMS_FILL_CONFLICT";
+    if (!this.#knownConflicts.has(conflict)) {
+      let result: unknown;
+      try {
+        result = await oms.recordFill(fillReportOf(leg, trade));
+      } catch {
+        result = undefined;
+      }
+      code = readOkFlag(result) ? null : readRefusalCode(result);
+    }
+    if (code === null) return true;
+    if (code === "OMS_FILL_CONFLICT") {
+      this.#rememberConflict(conflict);
+      this.#detect(run, {
+        breakClass: "FILL_MISMATCH",
+        subjectKey: compositeKey("FILL_MISMATCH", order.orderId),
+        marketId: order.marketId,
+        orderId: order.orderId,
+        detail: `tracked order ${order.orderId}: trade ${trade.venueTradeId} is recorded in the OMS with other economics (shares, price, fee, role or match time) than the venue's`,
+      });
+      return false;
+    }
+    this.#detect(run, {
+      breakClass: "FILL_REFUSED",
+      subjectKey: compositeKey("FILL_REFUSED", "fill", trade.venueTradeId, leg.venueOrderId),
+      marketId: order.marketId,
+      orderId: order.orderId,
+      detail: `the OMS refused to compare trade ${trade.venueTradeId}'s fill of order ${order.orderId}: ${code}`,
+    });
+    return false;
+  }
+
+  #rememberConflict(key: string): void {
+    if (this.#knownConflicts.size < MAX_KNOWN_CONFLICTS) this.#knownConflicts.add(key);
+  }
+
   /** Deliver an order's legs as fills (the OMS de-duplicates identical facts). `true` when every one was accepted. */
   async #deliverFills(
     run: RunState,
@@ -1188,16 +1442,7 @@ export class ReconciliationCoordinator {
     for (const { leg, trade } of legs) {
       let result: unknown;
       try {
-        result = await oms.recordFill({
-          venueTradeId: trade.venueTradeId,
-          venueOrderId: leg.venueOrderId,
-          shares: leg.shares,
-          price: leg.price,
-          liquidityRole: leg.role,
-          feeAmount: leg.feeAmount,
-          feeAssetId: leg.feeAssetId,
-          matchedAt: leg.matchedAt,
-        });
+        result = await oms.recordFill(fillReportOf(leg, trade));
       } catch {
         result = undefined;
       }
@@ -1562,7 +1807,12 @@ export class ReconciliationCoordinator {
 
   // ---- the user stream ------------------------------------------------------------------------
 
-  #acknowledgeStreamRequests(run: RunState, answerable: readonly Received<StreamReconciliationRequest>[]): void {
+  /**
+   * Acknowledge, by id, every stream request this run's complete reads answer, and record each acknowledgement
+   * in the journal like every other answer (WP-280's manager keeps its backlog in memory only: the journal is
+   * the durable record that a request was answered, and by which run).
+   */
+  async #acknowledgeStreamRequests(run: RunState, answerable: readonly Received<StreamReconciliationRequest>[]): Promise<void> {
     const stream = this.#stream;
     for (const received of answerable) {
       const requestId = received.request.requestId;
@@ -1573,7 +1823,9 @@ export class ReconciliationCoordinator {
         accepted = false;
       }
       this.#streamRequests.delete(requestId);
-      run.answers.push(Object.freeze({ channel: "USER_STREAM", requestId, subjectId: requestId, verdict: "ACKNOWLEDGED", accepted, refusalCode: accepted ? null : "STREAM_UNKNOWN_REQUEST" }));
+      // The journal's subject is an identifier (at most 200 characters); a longer request id stands in the request id only.
+      const subjectId = isIdentifier(requestId) ? requestId : "user-stream";
+      await this.#recordAnswer(run, "USER_STREAM", requestId, subjectId, "ACKNOWLEDGED", accepted, accepted ? null : "STREAM_UNKNOWN_REQUEST");
     }
   }
 
@@ -1587,8 +1839,7 @@ export class ReconciliationCoordinator {
       pending = undefined;
     }
     if (pending === undefined) {
-      this.#malformedRequests += 1;
-      this.trigger("USER_STREAM_RECONNECT");
+      this.#receiveMalformed("user-stream", "the stream's request backlog could not be read", "USER_STREAM_RECONNECT");
       return;
     }
     for (const request of pending) {
@@ -1707,10 +1958,13 @@ export class ReconciliationCoordinator {
         if (detection.act !== null) await this.#safeAct(detection);
         return;
       }
-      // An operator released this very subject (an UNATTRIBUTED trade stays in the account's history for good): it
-      // is acknowledged, and not opened again. New activity has new subjects (a new trade, a new booking).
+      // An operator released this very subject. Immutable history (an UNATTRIBUTED trade stays in the account's
+      // history for good; an alert the OMS raised) is acknowledged, and not opened again: new activity has new
+      // subjects. A LIVE contradiction (a tracked order whose venue facts differ) is not: still found, it opens
+      // again, and holds until a fresh comparison shows the subject consistent (the taxonomy decides which).
       const rule = this.#ruleOf(detection.breakClass);
-      if ((rule === "QUARANTINE_UNTIL_RELEASED" || rule === "UNATTRIBUTED_HALT") && acknowledged.has(detection.subjectKey)) return;
+      const releasable = rule === "QUARANTINE_UNTIL_RELEASED" || rule === "UNATTRIBUTED_HALT";
+      if (releasable && acknowledged.has(detection.subjectKey) && this.#releaseAcknowledges(detection.breakClass)) return;
       const breakId = this.#drawId();
       if (breakId === undefined) {
         journalOk = false;
@@ -1738,7 +1992,7 @@ export class ReconciliationCoordinator {
         return;
       }
       reproduced.add(breakId);
-      if (rule === "QUARANTINE_UNTIL_RELEASED" || rule === "UNATTRIBUTED_HALT") {
+      if (releasable) {
         const quarantined = await this.#append({
           kind: "BREAK_QUARANTINED",
           breakId,
@@ -1763,7 +2017,10 @@ export class ReconciliationCoordinator {
         if (!resolved.ok) journalOk = false;
       }
     };
-    const unresolvedBefore = this.#unresolvedBreaks();
+    const readable = this.#unresolvedBreaks();
+    // The journal's breaks unreadable: nothing is cleared, and the run cannot pass (fail closed).
+    if (readable === undefined) journalOk = false;
+    const unresolvedBefore = readable ?? [];
     const bySubject = new Map(unresolvedBefore.map((view) => [view.subjectKey, view]));
     const reproduced = new Set<string>();
     // Detections can raise detections (a refused delivery): record until none is new.
@@ -1771,7 +2028,7 @@ export class ReconciliationCoordinator {
     // Halts for every quarantine (idempotent; re-delivered every run).
     const haltDetections = this.#deliverHalts(run);
     for (const detection of haltDetections) await record(detection, bySubject, reproduced);
-    // Clear what a complete run no longer finds; repair a quarantine a crash left OPEN.
+    // Clear what a complete run no longer finds, and judged again; repair a quarantine a crash left OPEN.
     const complete = !run.stale && run.readsComplete && run.orderReadsSound;
     for (const view of unresolvedBefore) {
       if (reproduced.has(view.breakId)) continue;
@@ -1780,7 +2037,7 @@ export class ReconciliationCoordinator {
         if (!repaired.ok) journalOk = false;
         continue;
       }
-      if (!complete || view.status !== "OPEN" || (view.rule !== "HOLD_UNTIL_CONSISTENT" && view.rule !== "RESOLVE_IN_RUN")) continue;
+      if (!complete || !this.#judged(run, view) || view.status !== "OPEN" || (view.rule !== "HOLD_UNTIL_CONSISTENT" && view.rule !== "RESOLVE_IN_RUN")) continue;
       const cleared = await this.#append({
         kind: "BREAK_RESOLVED",
         breakId: view.breakId,
@@ -1792,10 +2049,11 @@ export class ReconciliationCoordinator {
       });
       if (!cleared.ok) journalOk = false;
     }
-    // §9.17 step 8.
+    // §9.17 step 8. The decision and the epoch it was taken at are read in one synchronous step.
+    const epoch = this.#holdEpoch;
     const rerun = this.#workArrivedDuring(run.readsStartSeq ?? run.runStartSeq) || run.holdingsDeferred;
     const invariant = this.#resumeBlocker(run, complete, journalOk, rerun);
-    const unresolvedNow = this.#unresolvedBreaks();
+    const unresolvedNow = this.#unresolvedBreaks() ?? [];
     const status: "PASSED" | "FAILED" | "QUARANTINED" =
       invariant === undefined ? "PASSED" : unresolvedNow.some((view) => view.status === "QUARANTINED") ? "QUARANTINED" : "FAILED";
     const completed = await this.#append({
@@ -1810,25 +2068,34 @@ export class ReconciliationCoordinator {
       atMs,
     });
     let resumed = false;
+    let rerunNext = rerun;
     let reason = invariant ?? "every required invariant passed";
     if (status === "PASSED" && completed.ok) {
-      // Resume only after the PASSED record is durable.
-      const oms = this.#oms as ReconciledOms;
-      let result: unknown;
-      try {
-        result = oms.resume();
-      } catch {
-        result = undefined;
-      }
-      if (readOkFlag(result)) {
-        this.#holding = false;
-        resumed = true;
+      if (this.#holdEpoch !== epoch) {
+        // Work arrived (a trigger, a request, a pause) while the PASSED record was being written: the decision
+        // predates it, so it does not resume; the next run, at once, answers the new work.
+        rerunNext = true;
+        reason = "work arrived while the run's completion was being recorded; it does not resume, and another run follows";
+        await this.#append({ kind: "RESUME_REFUSED", runId, refusalCode: "RECON_WORK_ARRIVED", atMs });
       } else {
-        // The OMS's own rule refused (a race with its state): it stays paused, and the refusal is recorded.
-        this.#hold();
-        const code = readRefusalCode(result);
-        reason = `the OMS refused to resume: ${code}`;
-        await this.#append({ kind: "RESUME_REFUSED", runId, refusalCode: code, atMs });
+        // Resume only after the PASSED record is durable, with nothing new since the decision (synchronous from here).
+        const oms = this.#oms as ReconciledOms;
+        let result: unknown;
+        try {
+          result = oms.resume();
+        } catch {
+          result = undefined;
+        }
+        if (readOkFlag(result)) {
+          this.#holding = false;
+          resumed = true;
+        } else {
+          // The OMS's own rule refused (a race with its state): it stays paused, and the refusal is recorded.
+          this.#hold();
+          const code = readRefusalCode(result);
+          reason = `the OMS refused to resume: ${code}`;
+          await this.#append({ kind: "RESUME_REFUSED", runId, refusalCode: code, atMs });
+        }
       }
     } else if (!completed.ok) {
       reason = `the run's completion could not be recorded: ${completed.code}`;
@@ -1840,9 +2107,28 @@ export class ReconciliationCoordinator {
       triggers,
       detections: Object.freeze(run.detections.map((detection) => Object.freeze({ breakClass: detection.breakClass, subjectKey: detection.subjectKey, detail: detection.detail }))),
       answers: Object.freeze([...run.answers]),
-      rerun: !resumed && rerun,
+      rerun: !resumed && rerunNext,
       reason,
     });
+  }
+
+  /**
+   * Whether this run judged a break's subject again, so that not finding it means it is gone. A holding break
+   * needs a run that judged the holdings; an attempt's identity ambiguity, a run that judged its identity; a
+   * refused answer, a run that answered again. Anything else is judged by every complete run.
+   */
+  #judged(run: RunState, view: JournalBreakView): boolean {
+    if (JUDGED_WITH_HOLDINGS.includes(view.breakClass)) return run.holdingsJudged;
+    return !run.unjudged.has(view.subjectKey);
+  }
+
+  /** The attempt-scoped subjects this run did not judge again (see `#judged`). */
+  #markUnjudgedAttempts(run: RunState, oms: ReconciledOms): void {
+    for (const attempt of oms.attempts()) {
+      const id = attempt.submissionAttemptId;
+      if (couldHavePlaced(attempt) && !run.identityJudged.has(id)) run.unjudged.add(compositeKey("SIGNED_IDENTITY_AMBIGUOUS", id));
+      if ((couldHavePlaced(attempt) || this.#omsRequests.has(id)) && !run.answered.has(id)) run.unjudged.add(compositeKey("ANSWER_REFUSED", id));
+    }
   }
 
   /** The first required invariant that fails, or `undefined` (see RESUME in the header). */
@@ -1851,8 +2137,10 @@ export class ReconciliationCoordinator {
     if (run.stale) return "the run's reads were stale";
     if (!complete) return "the run did not read everything completely and consistently";
     if (run.holdingsDeferred) return "holdings were not judged: the OMS and the venue disagreed about an order this run";
+    // Defence in depth: every path that leaves the holdings unjudged also records a break or an incomplete read.
     if (!run.holdingsJudged) return "holdings were not judged in this run";
     const unresolved = this.#unresolvedBreaks();
+    if (unresolved === undefined) return "the journal's breaks could not be read";
     if (unresolved.length > 0) return `${String(unresolved.length)} break(s) unresolved, first ${unresolved[0]?.breakClass ?? "?"}`;
     if (rerun) return "work arrived during the run";
     const oms = this.#oms;
@@ -1867,7 +2155,6 @@ export class ReconciliationCoordinator {
     if (this.#omsRequests.size > 0) return "an OMS request is unanswered";
     if (this.#walletRequests.size > 0) return "a wallet-operation request is unanswered";
     if (this.#streamRequests.size > 0) return "a user-stream request is unacknowledged";
-    if (this.#malformedRequests > 0) return "a malformed request was received";
     const wallet = this.#wallet;
     if (wallet !== null) {
       try {
@@ -1882,7 +2169,17 @@ export class ReconciliationCoordinator {
   /** Deliver the halt of every quarantined break; a failure is itself a break. */
   #deliverHalts(run: RunState): Detection[] {
     const out: Detection[] = [];
-    for (const view of this.#unresolvedBreaks()) {
+    const unresolved = this.#unresolvedBreaks();
+    if (unresolved === undefined) {
+      out.push(
+        detection({
+          breakClass: "COMPONENT_UNAVAILABLE",
+          subjectKey: compositeKey("COMPONENT_UNAVAILABLE", "journal"),
+          detail: "the journal's unresolved breaks could not be read: no halt could be delivered",
+        }),
+      );
+    }
+    for (const view of unresolved ?? []) {
       if (view.status !== "QUARANTINED") continue;
       try {
         if (view.scope === "MARKET" && view.marketId !== null) {
@@ -1900,8 +2197,12 @@ export class ReconciliationCoordinator {
         );
       }
     }
-    for (const entry of out) run.detections.push(entry);
-    return out;
+    const fresh = out.filter((entry) => !run.subjects.has(entry.subjectKey));
+    for (const entry of fresh) {
+      run.subjects.add(entry.subjectKey);
+      run.detections.push(entry);
+    }
+    return fresh;
   }
 
   async #safeAct(detection: Detection): Promise<boolean> {
@@ -1917,8 +2218,7 @@ export class ReconciliationCoordinator {
   #receiveOmsRequest(raw: unknown): void {
     const request = readOmsRequest(raw);
     if (request === undefined) {
-      this.#malformedRequests += 1;
-      this.trigger("POSITION_BALANCE_DISCREPANCY");
+      this.#receiveMalformed("oms", "outside the OMS's request shape", "POSITION_BALANCE_DISCREPANCY");
       // Thrown, so the OMS records it as undelivered and alerts (it never waits on an answer that cannot come).
       throw new TypeError("a reconciliation request outside the OMS's request shape");
     }
@@ -1931,8 +2231,7 @@ export class ReconciliationCoordinator {
   #receiveWalletRequest(raw: unknown): void {
     const request = readWalletRequest(raw);
     if (request === undefined) {
-      this.#malformedRequests += 1;
-      this.trigger("WALLET_OPERATION_UNKNOWN");
+      this.#receiveMalformed("inventory", "outside the inventory's request shape", "WALLET_OPERATION_UNKNOWN");
       // Thrown: the inventory then holds it as undelivered and retries (ADR-032 D5).
       throw new TypeError("a reconciliation request outside the inventory's request shape");
     }
@@ -1944,8 +2243,7 @@ export class ReconciliationCoordinator {
   #receiveStreamRequest(raw: unknown): void {
     const fields = readFields(raw, ["requestId", "cause", "markets"]);
     if (fields === undefined || !isText(fields.requestId, MAX_REQUEST_ID) || typeof fields.cause !== "string") {
-      this.#malformedRequests += 1;
-      this.trigger("USER_STREAM_RECONNECT");
+      this.#receiveMalformed("user-stream", "outside WP-280's request shape", "USER_STREAM_RECONNECT");
       return;
     }
     const markets = (readArray(fields.markets, 100_000) ?? []).filter((market): market is string => typeof market === "string");
@@ -1953,6 +2251,44 @@ export class ReconciliationCoordinator {
     const seq = ++this.#seq;
     this.#streamRequests.set(request.requestId, Object.freeze({ request, seq, atMs: this.#now() }));
     this.trigger(STREAM_DISCREPANCY_CAUSES.includes(request.cause) ? "POSITION_BALANCE_DISCREPANCY" : "USER_STREAM_RECONNECT");
+  }
+
+  /** A request that could not be read: recorded (a REQUEST_MALFORMED break, by the next run), and a run is triggered. */
+  #receiveMalformed(channel: MalformedReceipt["channel"], why: string, trigger: ReconciliationTrigger): void {
+    const seq = ++this.#seq;
+    if (this.#malformed.length < MAX_MALFORMED_PENDING) this.#malformed.push(Object.freeze({ channel, seq, why }));
+    else this.#malformedUnitemised += 1;
+    this.trigger(trigger);
+  }
+
+  /**
+   * Record every malformed receipt from before `beforeSeq` as its own REQUEST_MALFORMED break (a hold). The run
+   * that records one reads everything after the receipt, but cannot pass with the break open; a later complete
+   * run, which no longer receives it, clears it. A requester that keeps presenting an unreadable request (the
+   * OMS's and the inventory's retries, WP-280's backlog) is received again by every run, and keeps it held.
+   */
+  #takeMalformed(run: RunState, beforeSeq: number): void {
+    for (let index = 0; index < this.#malformed.length; ) {
+      const entry = this.#malformed[index] as MalformedReceipt;
+      if (entry.seq >= beforeSeq) {
+        index += 1;
+        continue;
+      }
+      this.#malformed.splice(index, 1);
+      this.#detect(run, {
+        breakClass: "REQUEST_MALFORMED",
+        subjectKey: compositeKey("REQUEST_MALFORMED", entry.channel, String(entry.seq)),
+        detail: `a reconciliation request from the ${entry.channel} channel could not be read (${entry.why}); it was not answered`,
+      });
+    }
+    if (this.#malformedUnitemised > 0) {
+      this.#detect(run, {
+        breakClass: "REQUEST_MALFORMED",
+        subjectKey: compositeKey("REQUEST_MALFORMED", "unitemised", String(beforeSeq)),
+        detail: `${String(this.#malformedUnitemised)} further malformed reconciliation requests arrived beyond the ${String(MAX_MALFORMED_PENDING)} itemised`,
+      });
+      this.#malformedUnitemised = 0;
+    }
   }
 
   #dropOmsRequest(request: OmsReconciliationRequest): void {
@@ -1997,6 +2333,7 @@ export class ReconciliationCoordinator {
   // ---- helpers --------------------------------------------------------------------------------
 
   #hold(): void {
+    this.#holdEpoch += 1;
     this.#holding = true;
     try {
       this.#oms?.pause();
@@ -2019,11 +2356,13 @@ export class ReconciliationCoordinator {
     }
   }
 
-  #unresolvedBreaks(): JournalBreakView[] {
+  /** The journal's unresolved breaks. Unreadable: `undefined`, which every caller treats as blocking (fail closed). */
+  #unresolvedBreaks(): JournalBreakView[] | undefined {
     try {
-      return [...(this.#deps.journal.unresolvedBreaks() ?? [])];
+      const list = readArray(this.#deps.journal.unresolvedBreaks(), 10_000_000);
+      return list === undefined ? undefined : [...(list as readonly JournalBreakView[])];
     } catch {
-      return [];
+      return undefined;
     }
   }
 
@@ -2033,6 +2372,15 @@ export class ReconciliationCoordinator {
       return this.#deps.journal.unresolvedBreaks().flatMap((view) => (view.assetId === null ? [] : [view.assetId]));
     } catch {
       return [this.#deps.policy.collateralAssetId];
+    }
+  }
+
+  /** Whether a release of this class acknowledges its subject (the ledger's taxonomy). Unreadable: no (fail closed: it re-opens). */
+  #releaseAcknowledges(breakClass: BreakClass): boolean {
+    try {
+      return this.#deps.journal.releaseAcknowledgesSubject(breakClass) === true;
+    } catch {
+      return false;
     }
   }
 
@@ -2131,6 +2479,17 @@ export class ReconciliationCoordinator {
     return id;
   }
 
+  /** The token an execution group trades (`tokenOfGroup`); `null` when unknown, unreadable or not a token id. */
+  #groupToken(executionGroupId: string): string | null {
+    let token: unknown;
+    try {
+      token = this.#deps.tokenOfGroup(executionGroupId);
+    } catch {
+      token = null;
+    }
+    return isTokenId(token) ? token : null;
+  }
+
   #marketOf(tokenId: string): { readonly scope: BreakScope; readonly marketId: string | null } {
     let market: unknown;
     try {
@@ -2222,8 +2581,28 @@ function claimedVenueIds(orders: readonly OrderView[], attempts: readonly Attemp
   return out;
 }
 
-function sameOrderFacts(order: OrderView, venue: VenueOrderView): boolean {
-  return order.side === venue.side && compareDecimal(order.limitPrice, venue.price) === 0 && compareDecimal(order.originalShares, venue.originalSize) === 0;
+/** A tracked order's fixed facts equal the venue's: its token (its group's), side, limit price and original size. */
+function sameOrderFacts(order: OrderView, venue: VenueOrderView, tokenId: string): boolean {
+  return (
+    venue.tokenId === tokenId &&
+    order.side === venue.side &&
+    compareDecimal(order.limitPrice, venue.price) === 0 &&
+    compareDecimal(order.originalShares, venue.originalSize) === 0
+  );
+}
+
+/** A leg as the OMS's `FillReport` (discriminator omitted: the OMS's `"0"`, one fill per trade and order). */
+function fillReportOf(leg: VenueTradeLeg, trade: VenueTradeView): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    venueTradeId: trade.venueTradeId,
+    venueOrderId: leg.venueOrderId,
+    shares: leg.shares,
+    price: leg.price,
+    liquidityRole: leg.role,
+    feeAmount: leg.feeAmount,
+    feeAssetId: leg.feeAssetId,
+    matchedAt: leg.matchedAt,
+  });
 }
 
 function factsOf(request: OmsReconciliationRequest): AttemptFacts {
@@ -2319,12 +2698,12 @@ function readWalletRequest(raw: unknown): WalletReconciliationRequest | undefine
 }
 
 function checkDependencies(deps: unknown): string | undefined {
-  const fields = readFields(deps, ["reads", "journal", "holdings", "halts", "clock", "newId", "marketOfToken", "policy"]);
+  const fields = readFields(deps, ["reads", "journal", "holdings", "halts", "clock", "newId", "marketOfToken", "tokenOfGroup", "policy"]);
   if (fields === undefined) return "the dependencies must be own data";
   for (const key of ["reads", "journal", "holdings", "halts", "clock"] as const) {
     if (fields[key] === null || typeof fields[key] !== "object") return `${key} is required`;
   }
-  for (const key of ["newId", "marketOfToken"] as const) if (typeof fields[key] !== "function") return `${key} must be a function`;
+  for (const key of ["newId", "marketOfToken", "tokenOfGroup"] as const) if (typeof fields[key] !== "function") return `${key} must be a function`;
   const policy = readFields(fields.policy, [
     "accountRef",
     "collateralAssetId",

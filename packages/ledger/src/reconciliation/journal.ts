@@ -39,7 +39,8 @@
  *   unresolved; with `QUARANTINED` only when some break is QUARANTINED;
  * - `RESUME_REFUSED` only right after the latest run completed `PASSED`
  *   (resume happens only once that record is durable; the OMS may still
- *   refuse it).
+ *   refuse it, and so may the coordinator itself, when work arrived while
+ *   the record was being written).
  *
  * Times are epoch milliseconds from the coordinator's injected clock (safe
  * non-negative integers). Identifiers are caller-minted (this package draws
@@ -64,6 +65,7 @@ import {
   isBreakClass,
   isOperatorReleasable,
   quarantinesOnOpen,
+  releaseAcknowledgesSubject,
   type BreakClass,
   type BreakResolution,
   type BreakRule,
@@ -553,6 +555,11 @@ export class ReconciliationJournal {
   /** The rule of a break class (the taxonomy is the journal's). */
   ruleOf(breakClass: BreakClass): BreakRule {
     return breakRule(breakClass);
+  }
+
+  /** Whether an operator's release of this class acknowledges its subject for good (the taxonomy's `RELEASE_ACKNOWLEDGES_SUBJECT`). */
+  releaseAcknowledgesSubject(breakClass: BreakClass): boolean {
+    return releaseAcknowledgesSubject(breakClass);
   }
 
   events(): readonly ReconciliationJournalEvent[] {

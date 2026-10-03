@@ -27,12 +27,14 @@ import { Ledger, buildUnattributedCorrection, projectLedger, projectedHoldings, 
 import {
   OrderManager,
   ReconciliationCoordinator,
+  type AttemptView,
   type HaltRequest,
   type OmsReservationPort,
   type OmsStore,
   type OrderManagerDependencies,
   type PayloadCipher,
   type ReconciledOms,
+  type ReconciliationJournalPort,
   type ReconciliationPolicy,
   type ReconciliationRequest,
   type VenueMode,
@@ -94,10 +96,31 @@ export interface Universe {
   /** One ordered log of request receipts, reads and answers: `recv:oms:<id>`, `read:<name>`, `answer:oms:<id>`. */
   readonly log: string[];
   policy: ReconciliationPolicy;
+  /**
+   * Test seams over the ports a process binds (all default to the real objects): the journal port the
+   * coordinator sees (read at boot); the OMS's attempt list (e.g. an attempt reported in flight) and its answer
+   * to a reconciliation; the group-token binding; a ledger that refuses bookings; a halt port that throws.
+   * Each is a structural answer a real port could give; none reaches a network or a key.
+   */
+  readonly seams: {
+    journal?: (real: ReconciliationJournal) => ReconciliationJournalPort;
+    attempts?: (real: readonly AttemptView[]) => readonly AttemptView[];
+    applyReconciliation?: (raw: unknown, real: (raw: unknown) => Promise<unknown>) => Promise<unknown>;
+    tokenOfGroup?: (executionGroupId: string, real: (executionGroupId: string) => string | null) => string | null;
+    /** The ledger refuses every UNATTRIBUTED booking. */
+    refuseBooking?: boolean;
+    /** The halt port throws. */
+    haltsFail?: boolean;
+  };
 }
 
 export function universe(
-  options: { readonly pusd?: string; readonly policy?: Partial<ReconciliationPolicy>; readonly requestToken?: () => string } = {},
+  options: {
+    readonly pusd?: string;
+    readonly policy?: Partial<ReconciliationPolicy>;
+    readonly requestToken?: () => string;
+    readonly seams?: Universe["seams"];
+  } = {},
 ): Universe {
   const clock = { t: START_MS };
   const pusd = options.pusd ?? "1000";
@@ -142,6 +165,7 @@ export function universe(
     omsRetries: 0,
     log: [],
     policy: Object.freeze({ ...POLICY, ...options.policy }),
+    seams: { ...options.seams },
   };
 }
 
@@ -305,7 +329,7 @@ function oracleOms(u: Universe, oms: OrderManager): ReconciledOms {
       }
       return result;
     },
-    attempts: () => oms.attempts(),
+    attempts: () => (u.seams.attempts === undefined ? oms.attempts() : u.seams.attempts(oms.attempts())),
     orders: () => oms.orders(),
     alerts: () => oms.alerts(),
     retainedEvidence: () => oms.retainedEvidence(),
@@ -326,7 +350,10 @@ function oracleOms(u: Universe, oms: OrderManager): ReconciledOms {
       const attempt = oms.attempt(answer.submissionAttemptId);
       const salt = attempt?.salt;
       u.world.settleArrivals();
-      const result = await oms.applyReconciliation(raw);
+      const seam = u.seams.applyReconciliation;
+      const result = (seam === undefined ? await oms.applyReconciliation(raw) : await seam(raw, (inner) => oms.applyReconciliation(inner))) as Awaited<
+        ReturnType<OrderManager["applyReconciliation"]>
+      >;
       if (result.ok && salt !== undefined) {
         if (answer.verdict === "ABSENT" && (u.world.orders.has(salt) || u.world.isPending(salt))) {
           u.violations.push(`R2: ABSENT accepted for salt ${salt}, which the venue holds or which may still arrive`);
@@ -380,11 +407,12 @@ export async function boot(u: Universe, plan: KillPlan | null = null): Promise<P
       readApprovals: () => inc.call("read.approvals", () => logged(u, "readApprovals", () => reads.readApprovals())),
       readWalletMember: (member) => inc.call("read.walletMember", () => logged(u, "readWalletMember", () => reads.readWalletMember(member))),
     },
-    journal,
+    journal: u.seams.journal === undefined ? journal : u.seams.journal(journal),
     holdings: {
       projected: () => inc.call("ledger.projected", async () => projectedHoldings(projectLedgerSynced(u), ACCOUNT)),
       bookUnattributed: (booking) =>
         inc.call("ledger.book", async () => {
+          if (u.seams.refuseBooking === true) return { ok: false };
           const built = buildUnattributedCorrection({
             ledgerTransactionId: booking.ledgerTransactionId,
             reconciliationRunId: booking.reconciliationRunId,
@@ -406,12 +434,25 @@ export async function boot(u: Universe, plan: KillPlan | null = null): Promise<P
         }),
     },
     halts: {
-      haltMarket: (request) => inc.callSync("halt.market", () => void u.halts.push(request)),
-      haltAccount: (request) => inc.callSync("halt.account", () => void u.halts.push({ ...request, marketId: null })),
+      haltMarket: (request) =>
+        inc.callSync("halt.market", () => {
+          if (u.seams.haltsFail === true) throw new Error("the incident controller is unreachable");
+          u.halts.push(request);
+        }),
+      haltAccount: (request) =>
+        inc.callSync("halt.account", () => {
+          if (u.seams.haltsFail === true) throw new Error("the incident controller is unreachable");
+          u.halts.push({ ...request, marketId: null });
+        }),
     },
     clock: { now: () => u.clock.t },
     newId: u.coordinatorIds,
     marketOfToken: (tokenId) => (tokenId === YES ? MARKET : tokenId === NO ? MARKET_NO : null),
+    // The groups the OMS registered, as the composition would bind them (`execution.groups.token_id`).
+    tokenOfGroup: (executionGroupId) => {
+      const real = (id: string): string | null => u.store.snapshotSync().groups.get(id)?.tokenId ?? null;
+      return u.seams.tokenOfGroup === undefined ? real(executionGroupId) : u.seams.tokenOfGroup(executionGroupId, real);
+    },
     policy: u.policy,
   });
   const venue = u.world.venuePort(() => inc.alive);

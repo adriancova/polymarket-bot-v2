@@ -17,8 +17,10 @@ import {
   BREAK_CLASSES,
   BREAK_TAXONOMY,
   RECONCILIATION_TRIGGERS,
+  RELEASE_ACKNOWLEDGES_SUBJECT,
   ReconciliationJournal,
   isOperatorReleasable,
+  releaseAcknowledgesSubject,
   type ReconciliationJournalEvent,
 } from "../../../packages/ledger/src/index.js";
 import { uuid7 } from "../../unit/oms/support/ids.js";
@@ -92,7 +94,7 @@ async function expectRefused(j: ReconciliationJournal, event: unknown, code: str
 
 describe("the break taxonomy", () => {
   it("every class is a valid internal.code and has a rule, a meaning and a handling", () => {
-    expect(BREAK_CLASSES.length).toBe(39);
+    expect(BREAK_CLASSES.length).toBe(40);
     for (const breakClass of BREAK_CLASSES) {
       expect(breakClass).toMatch(/^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u);
       const spec = BREAK_TAXONOMY[breakClass];
@@ -115,6 +117,18 @@ describe("the break taxonomy", () => {
       expect(BREAK_TAXONOMY[breakClass].rule, breakClass).toBe("UNATTRIBUTED_HALT");
     }
     expect(BREAK_CLASSES.filter((breakClass) => BREAK_TAXONOMY[breakClass].rule === "UNATTRIBUTED_HALT")).toHaveLength(5);
+  });
+
+  it("a release acknowledges immutable history for good, never a live contradiction (I-06); fill contradictions hold (I-02)", () => {
+    const releasable = BREAK_CLASSES.filter((breakClass) => isOperatorReleasable(BREAK_TAXONOMY[breakClass].rule));
+    expect(releasable.filter((breakClass) => !releaseAcknowledgesSubject(breakClass))).toEqual(["ORDER_FACTS_MISMATCH"]);
+    expect([...RELEASE_ACKNOWLEDGES_SUBJECT].every((breakClass) => isOperatorReleasable(BREAK_TAXONOMY[breakClass].rule))).toBe(true);
+    // No HOLD class is ever acknowledged by a release (none can be released).
+    expect(BREAK_CLASSES.filter((breakClass) => releaseAcknowledgesSubject(breakClass) && !releasable.includes(breakClass))).toEqual([]);
+    const { j } = journal();
+    expect(j.releaseAcknowledgesSubject("ORDER_FACTS_MISMATCH")).toBe(false);
+    expect(j.releaseAcknowledgesSubject("TRADE_UNATTRIBUTED")).toBe(true);
+    expect(BREAK_TAXONOMY.FILL_MISMATCH.rule).toBe("HOLD_UNTIL_CONSISTENT");
   });
 
   it("the triggers are §9.17's eight, token-identical to internal.reconciliation_trigger", () => {

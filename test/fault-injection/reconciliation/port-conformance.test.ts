@@ -95,6 +95,7 @@ describe("the coordinator's ports and mirrors", () => {
       clock: { now: () => 0 },
       newId: () => "",
       marketOfToken: () => null,
+      tokenOfGroup: () => null,
     };
     for (const policy of [
       { ...u.policy, quiescenceHorizonMs: 0 },

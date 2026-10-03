@@ -246,8 +246,11 @@ describe("WP-280: its reconciliation requests and normalized events", () => {
     r.u.world.faults = {};
     expect((await r.p.coordinator.reconcile()).resumed).toBe(true);
     expect(stream.acknowledged).toEqual(["stream-req-1"]);
+    // The acknowledgement is journaled like every answer (I-13): WP-280's manager keeps its backlog in memory only.
     const recorded = r.p.journal.events().filter((event) => event.kind === "ANSWER_RECORDED" && event.channel === "USER_STREAM");
-    expect(recorded).toEqual([]); // acknowledgements are reported per run, and the stream holds the durable backlog
+    expect(recorded.map((event) => (event.kind === "ANSWER_RECORDED" ? [event.requestId, event.subjectId, event.verdict, event.accepted] : null))).toEqual([
+      ["stream-req-1", "stream-req-1", "ACKNOWLEDGED", true],
+    ]);
   });
 
   it("a request raised DURING the reads is not acknowledged by that run; the next run, at once, acknowledges it", async () => {
@@ -300,6 +303,17 @@ describe("WP-280: its reconciliation requests and normalized events", () => {
     await expectPaused(r, report.resumed, "OMS_HALTING_ALERT");
   });
 
+  it("(I-10) evidence the OMS retains for a venue order an unresolved attempt could own holds (OMS_EVIDENCE_RETAINED)", async () => {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_ABSENT"]);
+    await submitOne(r.oms);
+    r.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: { venueOrderId: "venue-unclaimed-1", status: "LIVE" }, shortfalls: [] } });
+    await r.p.coordinator.settled();
+    expect(r.oms.retainedEvidence().map((item) => item.venueOrderId)).toEqual(["venue-unclaimed-1"]);
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "OMS_EVIDENCE_RETAINED");
+  });
+
   it("events that arrive during a run are applied after it, in order", async () => {
     const r = await ready();
     await submitOne(r.oms);
@@ -326,16 +340,30 @@ interface WalletRig {
   readonly requests: InventoryRequest[];
   retries: number;
   respond: () => unknown;
+  /** The inventory's requests do not reach the coordinator (a delivery failure). */
+  undeliverable: boolean;
+  /** The inventory's answer port refuses every answer. */
+  refuseAnswers: boolean;
 }
 
 /** A real WP-300 manager bound to the coordinator, its executor a mock (nothing is signed or sent). */
 function walletRig(r: Ready): WalletRig {
-  const rig: { wallet: WalletOperationManager | null; answers: Record<string, unknown>[]; requests: InventoryRequest[]; retries: number; respond: () => unknown } = {
+  const rig: {
+    wallet: WalletOperationManager | null;
+    answers: Record<string, unknown>[];
+    requests: InventoryRequest[];
+    retries: number;
+    respond: () => unknown;
+    undeliverable: boolean;
+    refuseAnswers: boolean;
+  } = {
     wallet: null,
     answers: [],
     requests: [],
     retries: 0,
     respond: () => ({ status: "SUBMITTED", transactionHash: HASH_A, transactionId: null }),
+    undeliverable: false,
+    refuseAnswers: false,
   };
   const wallet = new WalletOperationManager({
     requestToken: requestTokens("w"),
@@ -344,6 +372,7 @@ function walletRig(r: Ready): WalletRig {
     executor: { submit: async () => rig.respond() },
     reconciler: {
       request: (request) => {
+        if (rig.undeliverable) throw new Error("the coordinator is unreachable");
         rig.requests.push(request);
         r.u.log.push(`recv:wallet:${request.requestId}`);
         r.p.coordinator.walletRequester.request(request);
@@ -356,6 +385,7 @@ function walletRig(r: Ready): WalletRig {
       const answer = evidence as Record<string, unknown>;
       rig.answers.push(answer);
       r.u.log.push(`answer:wallet:${String(answer["requestId"])}`);
+      if (rig.refuseAnswers) return { ok: false, refusal: { code: "TEST_REFUSED", message: "refused by the test" } };
       return wallet.resolveByReconciliation(operationId, evidence);
     },
     retryReconciliationRequests: () => {
@@ -375,24 +405,103 @@ const HASH_B = "0x00000000000000000000000000000000000000000000000000000000000000
 const split = { type: "SPLIT", operationId: "op-split-290", accountRef: INVENTORY_ACCOUNT, conditionId: CONDITION, amount: "10" };
 
 describe("WP-300 / WP-300c: wallet operations answered by name, after receipt, with the request's id", () => {
-  it("after an UNKNOWN report the member is waited out while PENDING, then answered by name once terminal, echoing requestId", async () => {
+  // DROPPED, UNKNOWN, and a malformed report (a status that is not text): each is unrecognised evidence that still names its
+  // transaction (WP300C-OBLIGATIONS), and each member is answered by name once terminal.
+  for (const [label, report] of [
+    ["a DROPPED", { status: "DROPPED", transactionHash: HASH_A }],
+    ["an UNKNOWN", { status: "UNKNOWN", transactionHash: HASH_A }],
+    ["a malformed", { status: 42, transactionHash: HASH_A }],
+  ] as const) {
+    it(`after ${label} report the member is waited out while PENDING, then answered by name once terminal, echoing requestId`, async () => {
+      const r = await ready();
+      const rig = walletRig(r);
+      expect(rig.wallet.plan(split).ok).toBe(true);
+      expect((await rig.wallet.submit(split.operationId)).ok).toBe(true);
+      rig.wallet.observe(split.operationId, report);
+      expect(rig.wallet.operation(split.operationId)?.state).toBe("RECONCILING");
+      expect(r.oms.paused).toBe(true);
+      r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "PENDING", transactionHash: HASH_A, credited: null });
+      const pending = await r.p.coordinator.reconcile();
+      await expectPaused(r, pending.resumed, "WALLET_MEMBER_PENDING");
+      expect(r.p.journal.unresolvedBreaks().map((view) => view.breakClass)).toContain("WALLET_OPERATION_UNSETTLED");
+      expect(rig.answers).toEqual([]);
+      r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "CONFIRMED", transactionHash: HASH_A, credited: null });
+      expect(await reconcileRounds(r, 3)).toBe(true);
+      const latest = rig.requests.at(-1);
+      expect(rig.answers).toEqual([{ source: "AUTHORITATIVE_READ", requestId: latest?.requestId, state: "CONFIRMED", transactionHash: HASH_A, transactionId: null }]);
+      expect(rig.wallet.operation(split.operationId)?.state).toBe("CONFIRMED");
+      expect(answersFollowReceipts(r.u.log, "wallet")).toEqual([]);
+    });
+  }
+
+  it("(I-10, X2) a wallet operation in flight: holdings are not judged, and the change it makes is never booked UNATTRIBUTED", async () => {
     const r = await ready();
     const rig = walletRig(r);
     expect(rig.wallet.plan(split).ok).toBe(true);
     expect((await rig.wallet.submit(split.operationId)).ok).toBe(true);
+    expect(rig.wallet.operation(split.operationId)?.state).toBe("SUBMITTED");
+    // The operation reached the chain; nothing has booked its effect yet.
+    r.u.world.adjustCollateral("-10");
+    for (let round = 0; round < 3; round += 1) {
+      r.p.coordinator.trigger("PERIODIC_TIMER");
+      const report = await r.p.coordinator.reconcile();
+      await expectPaused(r, report.resumed, "WALLET_OPERATION_IN_FLIGHT");
+      r.u.clock.t += r.u.policy.holdingConfirmationMs + 1;
+    }
+    expect(r.u.ledger.transactions().filter((appended) => appended.transaction.eventType === "RECONCILIATION_CORRECTION")).toEqual([]);
+    // Terminal, and its effect accounted for: the holdings are judged again, and trading resumes.
+    rig.wallet.observe(split.operationId, { status: "CONFIRMED", transactionHash: HASH_A, transactionId: null });
+    expect(rig.wallet.operation(split.operationId)?.state).toBe("CONFIRMED");
+    r.u.world.adjustCollateral("10");
+    expect(await reconcileRounds(r, 3)).toBe(true);
+  });
+
+  it("(I-10) a member that cannot be read holds (WALLET_MEMBER_UNREADABLE); once read terminal, it is answered", async () => {
+    const r = await ready();
+    const rig = walletRig(r);
+    rig.wallet.plan(split);
+    await rig.wallet.submit(split.operationId);
     rig.wallet.observe(split.operationId, { status: "DROPPED", transactionHash: HASH_A });
-    expect(rig.wallet.operation(split.operationId)?.state).toBe("RECONCILING");
-    expect(r.oms.paused).toBe(true);
-    r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "PENDING", transactionHash: HASH_A, credited: null });
-    const pending = await r.p.coordinator.reconcile();
-    await expectPaused(r, pending.resumed, "WALLET_MEMBER_PENDING");
+    r.u.world.faults.readWalletMember = () => {
+      throw new Error("the chain read failed");
+    };
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "WALLET_MEMBER_UNREADABLE");
     expect(rig.answers).toEqual([]);
+    r.u.world.faults = {};
     r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "CONFIRMED", transactionHash: HASH_A, credited: null });
     expect(await reconcileRounds(r, 3)).toBe(true);
-    const latest = rig.requests.at(-1);
-    expect(rig.answers).toEqual([{ source: "AUTHORITATIVE_READ", requestId: latest?.requestId, state: "CONFIRMED", transactionHash: HASH_A, transactionId: null }]);
+  });
+
+  it("(I-10) an answer the inventory refuses holds (WALLET_ANSWER_REFUSED)", async () => {
+    const r = await ready();
+    const rig = walletRig(r);
+    rig.wallet.plan(split);
+    await rig.wallet.submit(split.operationId);
+    rig.wallet.observe(split.operationId, { status: "DROPPED", transactionHash: HASH_A });
+    r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "CONFIRMED", transactionHash: HASH_A, credited: null });
+    rig.refuseAnswers = true;
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "WALLET_ANSWER_REFUSED");
+    rig.refuseAnswers = false;
+    expect(await reconcileRounds(r, 3)).toBe(true);
+  });
+
+  it("(I-10) requests the inventory could not deliver hold (WALLET_REQUESTS_OUTSTANDING); delivered by the retry, answered", async () => {
+    const r = await ready();
+    const rig = walletRig(r);
+    rig.wallet.plan(split);
+    await rig.wallet.submit(split.operationId);
+    rig.undeliverable = true;
+    rig.wallet.observe(split.operationId, { status: "DROPPED", transactionHash: HASH_A });
+    expect(rig.wallet.outstandingReconciliationRequests().length).toBeGreaterThan(0);
+    r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "CONFIRMED", transactionHash: HASH_A, credited: null });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "WALLET_REQUESTS_OUTSTANDING");
+    rig.undeliverable = false;
+    expect(await reconcileRounds(r, 3)).toBe(true);
     expect(rig.wallet.operation(split.operationId)?.state).toBe("CONFIRMED");
-    expect(answersFollowReceipts(r.u.log, "wallet")).toEqual([]);
   });
 
   it("two members (a contradiction in flight): each is answered BY NAME, with its own terminal state", async () => {
@@ -461,6 +570,51 @@ describe("WP-300 / WP-300c: wallet operations answered by name, after receipt, w
     }
     expect(r.u.omsRetries - before).toBe(3);
     expect(rig.retries).toBe(3);
+  });
+});
+
+describe("(I-08) a malformed request, on any channel, is recorded as a break and holds", () => {
+  const malformedBreaks = (r: Ready): string[] =>
+    r.p.journal
+      .breaks()
+      .filter((view) => view.breakClass === "REQUEST_MALFORMED")
+      .map((view) => `${view.status}:${view.resolution ?? "-"}`);
+
+  it("(I-08) the OMS channel: refused to the OMS (it keeps it as owed), recorded, held; a later complete run clears it", async () => {
+    const r = await ready();
+    expect(() => r.p.coordinator.omsRequester.request({ requestId: "x" } as never)).toThrow(TypeError);
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "REQUEST_MALFORMED");
+    expect(report.runs[0]?.detections.find((detection) => detection.breakClass === "REQUEST_MALFORMED")?.detail).toContain("the oms channel");
+    expect(await reconcileRounds(r, 2)).toBe(true);
+    expect(malformedBreaks(r)).toEqual(["RESOLVED:NOT_REPRODUCED"]);
+  });
+
+  it("(I-08) the inventory channel: refused to the inventory (it retries it), recorded, held; a later complete run clears it", async () => {
+    const r = await ready();
+    expect(() => r.p.coordinator.walletRequester.request({ requestId: "w-1", trigger: "NOT_A_TRIGGER" } as never)).toThrow(TypeError);
+    const report = await r.p.coordinator.reconcile();
+    expect(report.runs[0]?.triggers).toEqual(["WALLET_OPERATION_UNKNOWN"]);
+    await expectPaused(r, report.resumed, "REQUEST_MALFORMED");
+    expect(await reconcileRounds(r, 2)).toBe(true);
+    expect(malformedBreaks(r)).toEqual(["RESOLVED:NOT_REPRODUCED"]);
+  });
+
+  it("(I-08) the user-stream channel: held for as long as WP-280 keeps presenting it, one break per receipt; cleared once it stops", async () => {
+    const r = await ready();
+    const stream = new FakeStream();
+    r.p.coordinator.bindUserStream(stream);
+    const bad = { requestId: "", cause: "SOCKET_CLOSED", markets: [] };
+    stream.pending.push(bad);
+    r.p.coordinator.onUserStreamOutput({ kind: "RECONCILIATION_REQUESTED", request: bad });
+    for (let round = 0; round < 3; round += 1) {
+      const report = await r.p.coordinator.reconcile();
+      await expectPaused(r, report.resumed, "REQUEST_MALFORMED");
+    }
+    expect(malformedBreaks(r).length).toBeGreaterThan(2);
+    stream.pending.splice(0);
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(malformedBreaks(r).every((entry) => entry === "RESOLVED:NOT_REPRODUCED")).toBe(true);
   });
 });
 

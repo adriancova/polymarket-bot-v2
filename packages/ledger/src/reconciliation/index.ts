@@ -20,6 +20,8 @@ export {
   isBreakClass,
   isOperatorReleasable,
   quarantinesOnOpen,
+  RELEASE_ACKNOWLEDGES_SUBJECT,
+  releaseAcknowledgesSubject,
   type BreakClass,
   type BreakClassSpec,
   type BreakFamily,

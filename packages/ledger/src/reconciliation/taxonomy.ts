@@ -20,7 +20,15 @@
  * identity) is always `HOLD_UNTIL_CONSISTENT`: it can never be released by an
  * operator, only out-read by a later complete run. That is how "ambiguous
  * state never resumes trading" (work-plan acceptance 1) is a property of the
- * table rather than of a caller's diligence.
+ * table rather than of a caller's diligence. "No longer reproduces it" means
+ * the later run performed the check that found it: a run that did not judge
+ * the holdings, for one, does not clear a holding break.
+ *
+ * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
+ * immutable history (an UNATTRIBUTED order or trade, a booking, an OMS alert)
+ * acknowledges its subject for good. Releasing a LIVE contradiction (a tracked
+ * order whose venue facts differ) does not: every run that still finds it
+ * opens it again.
  *
  * UNMATCHED ACTUAL ACTIVITY becomes UNATTRIBUTED (work-plan acceptance 2;
  * §6 invariant 7; §9.15): an order or a trade of the account that no tracked
@@ -157,8 +165,8 @@ export const BREAK_TAXONOMY = Object.freeze({
   ORDER_FACTS_MISMATCH: {
     family: "ORDER",
     rule: QUARANTINE,
-    meaning: "a tracked order's fixed facts (side, price, original size) differ at the venue",
-    handling: "no answer is given; quarantined until released",
+    meaning: "a tracked order's fixed facts (token, side, price, original size) differ at the venue",
+    handling: "no answer is given; quarantined until released, and opened again by every run that still finds it (a release does not acknowledge a live contradiction)",
   },
   ORDER_STATE_MISMATCH: {
     family: "ORDER",
@@ -208,6 +216,13 @@ export const BREAK_TAXONOMY = Object.freeze({
     rule: HOLD,
     meaning: "the OMS refused a fill or settlement the coordinator delivered",
     handling: "held; a conflicting fill also raises the OMS's own halting alert",
+  },
+  FILL_MISMATCH: {
+    family: "TRADE",
+    rule: HOLD,
+    meaning:
+      "a tracked order's fills in the OMS and its trades at the venue differ: the same trade with other economics (shares, price, fee, role, match time) or a contradicting settlement, or trade ids the OMS did not record while fills it recorded are missing",
+    handling: "nothing is delivered or booked for the order, and holdings are not judged; held until a fresh comparison finds the two equal",
   },
   // --- holdings (positions and balances against the ledger projection) -------------------
   HOLDING_IN_TRANSIT_AMBIGUOUS: {
@@ -356,4 +371,32 @@ export function isOperatorReleasable(rule: BreakRule): boolean {
 /** Whether a break of this rule is QUARANTINED as soon as it is opened. */
 export function quarantinesOnOpen(rule: BreakRule): boolean {
   return rule === "QUARANTINE_UNTIL_RELEASED" || rule === "UNATTRIBUTED_HALT";
+}
+
+/**
+ * The releasable classes whose subject is IMMUTABLE HISTORY: an order or a
+ * trade the account's history keeps for good, a booking, an alert the OMS
+ * raised, an operation that never named a transaction. An operator's release
+ * ACKNOWLEDGES such a subject: the same subject is not opened again (new
+ * activity has new subjects, and opens new breaks).
+ *
+ * Every other releasable class is a LIVE CONTRADICTION (today:
+ * `ORDER_FACTS_MISMATCH`, a comparison of current state). A release records
+ * the operator's decision, but does not acknowledge the subject: every run
+ * that still finds the contradiction opens it again, so it holds until a
+ * fresh comparison shows the subject consistent.
+ */
+export const RELEASE_ACKNOWLEDGES_SUBJECT: ReadonlySet<BreakClass> = new Set<BreakClass>([
+  "ORDER_UNATTRIBUTED",
+  "TRADE_UNATTRIBUTED",
+  "POSITION_UNATTRIBUTED",
+  "BALANCE_UNATTRIBUTED",
+  "LEDGER_UNATTRIBUTED_ARRIVAL",
+  "OMS_HALTING_ALERT",
+  "WALLET_OPERATION_UNIDENTIFIABLE",
+]);
+
+/** Whether an operator's release of this class acknowledges its subject for good (see {@link RELEASE_ACKNOWLEDGES_SUBJECT}). */
+export function releaseAcknowledgesSubject(breakClass: BreakClass): boolean {
+  return RELEASE_ACKNOWLEDGES_SUBJECT.has(breakClass) && isOperatorReleasable(breakRule(breakClass));
 }

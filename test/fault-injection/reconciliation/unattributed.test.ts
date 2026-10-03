@@ -160,6 +160,40 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     expect(r.u.halts).toEqual([]);
   });
 
+  it("(I-10) a confirmed delta the ledger refuses to book: CORRECTION_FAILED, held; booked by a later run once the ledger takes it", async () => {
+    const r = await ready();
+    r.u.seams.refuseBooking = true;
+    r.u.world.adjustPosition(YES, "3");
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    r.u.clock.t += r.u.policy.holdingConfirmationMs;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const refused = await r.p.coordinator.reconcile();
+    await expectPaused(r, refused.resumed, "CORRECTION_FAILED");
+    expect(corrections(r.u.ledger)).toEqual([]);
+    delete r.u.seams.refuseBooking;
+    r.u.clock.t += r.u.policy.holdingConfirmationMs;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const booked = await r.p.coordinator.reconcile();
+    await expectPaused(r, booked.resumed, "POSITION_UNATTRIBUTED");
+    expect(corrections(r.u.ledger)).toHaveLength(1);
+  });
+
+  it("(I-10) a halt the halt port cannot take: HALT_DELIVERY_FAILED, held; delivered again by every run", async () => {
+    const r = await ready();
+    r.u.seams.haltsFail = true;
+    r.u.world.placeForeign({ tokenId: YES, side: "BUY", price: "0.3", size: "2" });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "HALT_DELIVERY_FAILED");
+    expect(r.u.halts).toEqual([]);
+    delete r.u.seams.haltsFail;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    const quarantined = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_UNATTRIBUTED");
+    expect(r.u.halts.some((halt) => halt.breakId === quarantined?.breakId)).toBe(true);
+  });
+
   it("a delta that changes before it is confirmed is not booked; one that disappears clears", async () => {
     const r = await ready();
     r.u.world.adjustPosition(YES, "3");

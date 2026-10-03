@@ -15,6 +15,7 @@
  * | {@link ReconciliationJournalPort} | `ReconciliationJournal` (`packages/ledger`, this package's other half) | the journal |
  * | {@link HoldingsPort} | the ledger projection and `buildUnattributedCorrection` (`packages/ledger`) | — |
  * | {@link HaltPort} | the incident controller (§9.9) | — |
+ * | `tokenOfGroup` | the execution groups the composition registered with the OMS (`execution.groups`) | — |
  * | {@link ReconciliationClock} | a MONOTONIC epoch-millisecond clock | — |
  *
  * `packages/oms` may not import `packages/polymarket-secure` (layer 2, F12),
@@ -252,6 +253,7 @@ export type BreakClass =
   | "TRADE_MISSING_IN_OMS"
   | "FILL_ECONOMICS_UNFIXED"
   | "FILL_REFUSED"
+  | "FILL_MISMATCH"
   | "HOLDING_IN_TRANSIT_AMBIGUOUS"
   | "HOLDING_DELTA_UNCONFIRMED"
   | "POSITION_UNATTRIBUTED"
@@ -375,6 +377,8 @@ export interface ReconciliationJournalPort {
   readonly faulted: boolean;
   readonly runningRunId: string | null;
   ruleOf(breakClass: BreakClass): BreakRule;
+  /** Whether an operator's release of this class acknowledges its subject for good (immutable history), or a run that still finds it opens it again (a live contradiction). */
+  releaseAcknowledgesSubject(breakClass: BreakClass): boolean;
   /** Every break, resolved or not. */
   breaks(): readonly JournalBreakView[];
   /** Breaks still OPEN or QUARANTINED. */
@@ -464,5 +468,12 @@ export interface ReconciliationCoordinatorDependencies {
   readonly newId: () => string;
   /** The internal market (UUIDv7) of an outcome token, or `null` when unknown (the account is then halted). */
   readonly marketOfToken: (tokenId: string) => string | null;
+  /**
+   * The outcome token an execution group trades (`execution.groups.token_id`: the `GroupSpec` the composition
+   * registered with the OMS), or `null` when unknown. WP-270's `OrderView` carries no token, and a tracked
+   * order's token is one of the fixed facts compared against the venue's; an order whose token is unknown
+   * is not compared, and holds (`COMPONENT_UNAVAILABLE`).
+   */
+  readonly tokenOfGroup: (executionGroupId: string) => string | null;
   readonly policy: ReconciliationPolicy;
 }

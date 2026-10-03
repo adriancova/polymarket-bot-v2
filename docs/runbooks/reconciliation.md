@@ -46,14 +46,32 @@ not a fault.
 
 1. Pause. Close any run a crash left `RUNNING` (recorded `FAILED`). Record
    `RUN_STARTED`. Ask the OMS and the inventory to re-deliver any request they
-   still owe (`retryReconciliationRequests`, ADR-032 D5).
+   still owe (`retryReconciliationRequests`, ADR-032 D5). Record every request
+   received since the last run that could not be read (`REQUEST_MALFORMED`).
 2. Read, in this order: open orders, trades, each order that must be read by
-   id, positions (`/v2` only), the collateral balance (on chain), approvals,
+   id (every tracked order still open, and every one with fills, terminal or
+   not), positions (`/v2` only), the collateral balance (on chain), approvals,
    the ledger projection, and each wallet-operation member a request names.
    Every read starts after every request the run will answer was received.
    A request that arrives during the reads waits for the next run, which
    starts at once.
-3. Compare, and answer the requests (section 5).
+3. Compare, and answer the requests (section 5). Fills are compared with what
+   the OMS recorded durably, by identity (one fill per trade and order) and
+   with exact economics, both ways:
+   - a trade the OMS holds must carry the same shares, price, fee, role and
+     match time; otherwise `FILL_MISMATCH`;
+   - the OMS's recorded fill must be exactly what it holds under the venue's
+     trade ids. More, with no other trade ids, means the read lags
+     (`ORDER_FILLS_AHEAD_OF_VENUE`); more, with trade ids the OMS did not
+     record, is `FILL_MISMATCH`;
+   - only then is a trade the OMS does not hold a missed fill, delivered
+     (`TRADE_MISSING_IN_OMS`);
+   - a settlement read earlier than the one the OMS recorded is a
+     `READ_REGRESSION`, after a restart too; one that contradicts its terminal
+     settlement is a `FILL_MISMATCH`.
+
+   A tracked order's token (its execution group's), side, price and size are
+   its fixed facts; any difference is `ORDER_FACTS_MISMATCH`.
 4. Record each discrepancy as a break, and each answer.
 5. Act on each break by its rule (section 4).
 6. Resume if, and only if, everything in section 6 holds.
@@ -69,14 +87,24 @@ Its class decides its rule. The full table, with every class's meaning, is
 
 | Rule | Who clears it | Classes |
 | --- | --- | --- |
-| `HOLD_UNTIL_CONSISTENT` | a later complete run that no longer finds it; **never an operator** | every `READ_*` class, `STATUS_UNRECOGNISED`, `SIGNED_IDENTITY_AMBIGUOUS`, `ORDER_STATE_MISMATCH`, `ORDER_UNRESOLVED`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `FILL_ECONOMICS_UNFIXED`, `FILL_REFUSED`, `HOLDING_IN_TRANSIT_AMBIGUOUS`, `HOLDING_DELTA_UNCONFIRMED`, `WALLET_OPERATION_IN_FLIGHT`, `APPROVAL_MISSING`, `CORRECTION_FAILED`, `WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`, `WALLET_REQUESTS_OUTSTANDING`, `WALLET_OPERATION_UNSETTLED`, `OMS_EVIDENCE_RETAINED`, `COMPONENT_UNAVAILABLE`, `ANSWER_REFUSED`, `HALT_DELIVERY_FAILED`, `REQUEST_MALFORMED` |
+| `HOLD_UNTIL_CONSISTENT` | a later complete run that judged it again and no longer finds it; **never an operator** | every `READ_*` class, `STATUS_UNRECOGNISED`, `SIGNED_IDENTITY_AMBIGUOUS`, `ORDER_STATE_MISMATCH`, `ORDER_UNRESOLVED`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `FILL_MISMATCH`, `FILL_ECONOMICS_UNFIXED`, `FILL_REFUSED`, `HOLDING_IN_TRANSIT_AMBIGUOUS`, `HOLDING_DELTA_UNCONFIRMED`, `WALLET_OPERATION_IN_FLIGHT`, `APPROVAL_MISSING`, `CORRECTION_FAILED`, `WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`, `WALLET_REQUESTS_OUTSTANDING`, `WALLET_OPERATION_UNSETTLED`, `OMS_EVIDENCE_RETAINED`, `COMPONENT_UNAVAILABLE`, `ANSWER_REFUSED`, `HALT_DELIVERY_FAILED`, `REQUEST_MALFORMED` |
 | `RESOLVE_IN_RUN` | the run that found it, once its fix is accepted | `TRADE_MISSING_IN_OMS` (a missed fill, delivered with its exact economics) |
 | `QUARANTINE_UNTIL_RELEASED` | an operator's release | `ORDER_FACTS_MISMATCH`, `OMS_HALTING_ALERT`, `WALLET_OPERATION_UNIDENTIFIABLE` |
 | `UNATTRIBUTED_HALT` | an operator's release, after the market (or account) was halted | `ORDER_UNATTRIBUTED`, `TRADE_UNATTRIBUTED`, `POSITION_UNATTRIBUTED`, `BALANCE_UNATTRIBUTED`, `LEDGER_UNATTRIBUTED_ARRIVAL` |
 
 **Ambiguity never resumes trading.** Every class that means "we cannot tell"
 is a hold. No release exists for it. It clears only when a complete,
-consistent run no longer finds it.
+consistent run no longer finds it, having performed the check that found it:
+a run that did not judge the holdings does not clear a holding break, and a
+run that did not judge an attempt's identity (or give it an answer) does not
+clear that attempt's ambiguity (or refused answer).
+
+**A malformed request** (from the OMS, the inventory or the user stream) is
+refused to its requester and recorded as `REQUEST_MALFORMED`, one break per
+receipt. The run that records it cannot pass. A later complete run that no
+longer receives it clears it. A requester that keeps presenting it (the OMS's
+and the inventory's retries, the user stream's backlog) keeps the account
+held: that component needs attention.
 
 **Unmatched activity becomes UNATTRIBUTED** (§6 invariant 7, §9.15):
 
@@ -96,6 +124,14 @@ Each UNATTRIBUTED break halts its market through the halt port. Collateral,
 or a token whose market is unknown, halts the account. The halt is delivered
 again by every run while the break is open: the halt port must be idempotent.
 
+**What a release means.** Releasing immutable history (an UNATTRIBUTED order,
+trade or booking; an OMS alert; an operation that never named a transaction)
+acknowledges that subject for good: the same subject does not open again, and
+new activity opens new breaks. Releasing a live contradiction
+(`ORDER_FACTS_MISMATCH`) does not acknowledge it: every run that still finds
+it opens it again, quarantined, with its market halted. The table is
+`RELEASE_ACKNOWLEDGES_SUBJECT` in the taxonomy.
+
 **The journal is append-only.** Runs, breaks, quarantines, resolutions and
 answers are events. The `ops.reconciliation_runs` and
 `ops.reconciliation_breaks` rows are projections of them.
@@ -104,10 +140,10 @@ answers are events. The `ops.reconciliation_runs` and
 
 | Request | Answer |
 | --- | --- |
-| OMS, a known venue order (`ORDER_STATE`, `FINAL_SIZE`) | `PRESENT`, from a by-id read made after the request was received. Not given if the venue shows less matched than the OMS recorded (`ORDER_FILLS_AHEAD_OF_VENUE`) or other fixed facts (`ORDER_FACTS_MISMATCH`). |
+| OMS, a known venue order (`ORDER_STATE`, `FINAL_SIZE`) | `PRESENT`, from a by-id read made after the request was received. Not given if the venue shows less matched than the OMS recorded (`ORDER_FILLS_AHEAD_OF_VENUE`) or other fixed facts: token, side, price or size (`ORDER_FACTS_MISMATCH`). |
 | OMS, a lost placement (`SUBMISSION_UNKNOWN`) | By signed identity, strictly (next table). |
 | Inventory, a wallet operation | Each unresolved member read by name. Only CONFIRMED or FAILED is answered, one answer per member. A pending, dropped, not-found or unrecognised report is waited out. |
-| User stream (`WP-280`) | Acknowledged by id after a complete run whose order and trade reads began after the request arrived. |
+| User stream (`WP-280`) | Acknowledged by id after a complete run whose order and trade reads began after the request arrived. Each acknowledgement is journaled (`ANSWER_RECORDED`, channel `USER_STREAM`): WP-280 keeps its backlog in memory only. |
 
 Every answer echoes the request's id verbatim.
 
@@ -148,10 +184,17 @@ Trading resumes only when ALL of these hold at the end of a run:
   attempt held for the retransmission decision is the OMS's own exception.
   No evidence is retained;
 - no request is unanswered, and none arrived during the run;
-- `RUN_COMPLETED` with `PASSED` is durable.
+- the journal's breaks can be read;
+- `RUN_COMPLETED` with `PASSED` is durable, and nothing held the account
+  while it was being written (a trigger, a request, a pause).
 
-If the OMS's own `resume()` then refuses, it stays paused, and the journal
-records `RESUME_REFUSED`.
+If work arrived while the `PASSED` record was being written, the run does not
+resume: the journal records `RESUME_REFUSED` (`RECON_WORK_ARRIVED`), and the
+next run starts at once. If the OMS's own `resume()` refuses, it stays
+paused, and the journal records `RESUME_REFUSED` with the OMS's code.
+
+One run at a time: a `reconcile()` call made while a run is in progress
+returns at once, with no run.
 
 ## 7. Operator actions
 
@@ -161,9 +204,18 @@ records `RESUME_REFUSED`.
 - **Release a quarantine** with `releaseQuarantine({ breakId, operatorRef,
   reason })`. It works only on a QUARANTINED break, and records who released
   it and why. It does not resume trading: it queues a `MANUAL_REQUEST` run,
-  which must pass on its own. A released subject is acknowledged: the same
+  which must pass on its own. Released history is acknowledged: the same
   order, trade or booking does not reopen it, but new activity opens a new
-  break.
+  break. A released `ORDER_FACTS_MISMATCH` reopens while the venue still
+  shows other facts: correct the cause first.
+- **A `FILL_MISMATCH` that does not clear** means the OMS's durable fills and
+  the venue's trades disagree about a trade, or a settlement contradicts a
+  terminal one. The coordinator never rewrites a recorded fill. Establish
+  which side is wrong. A wrong read clears on its own once the read is right.
+  A wrong OMS record needs a correction outside this package, after which a
+  run must find the two equal. Each contradiction is offered to the OMS once
+  per process, so its own halting alert (an `OMS_HALTING_ALERT` quarantine)
+  is raised once.
 - **Before releasing an UNATTRIBUTED break,** make sure the incident
   controller holds the market halt. Then decide what the activity was. A live
   unattributed order is cancelled with the emergency CLI (`WP-330`), not here.
@@ -205,6 +257,17 @@ early.
 Reads are per credential (E-16). Read with the credential that placed the
 orders. A second credential's orders are invisible.
 
+The trades adapter must report each own leg as the user stream's projection
+reports a fill (WP-280): the same shares, price and match instant, and the
+fee as an exact amount only when it is fixed (a zero-rate taker fee is `0`
+with no fee asset; anything not fixed is `null`). The OMS compares a recorded
+fill's facts exactly, so a different spelling of the same fill holds as a
+`FILL_MISMATCH`.
+
+The composition also binds `tokenOfGroup` to the execution groups it
+registered with the OMS (`execution.groups.token_id`). An order whose group's
+token is unknown is not compared, and holds (`COMPONENT_UNAVAILABLE`).
+
 ## 10. Known limits
 
 - An order placed and then cancelled with nothing matched is invisible to
@@ -216,6 +279,22 @@ orders. A second credential's orders are invisible.
   read here, so they are not judged.
 - A wallet operation in flight holds the account paused until it is terminal.
 - The coordinator's in-memory marks are lost on a restart: the out-of-order
-  marks, the unconfirmed deltas, and the attempt facts learned from requests.
-  The startup run rebuilds what it needs, conservatively. Quarantines are in
-  the journal and survive.
+  marks, the unconfirmed deltas, the attempt facts learned from requests, and
+  the contradictions already offered to the OMS. The startup run rebuilds
+  what it needs, conservatively: a settlement read behind the OMS's durable
+  one is a `READ_REGRESSION` whatever the in-memory marks say. Quarantines
+  are in the journal and survive.
+- The out-of-order marks keep the latest status a sound read showed, even one
+  that contradicted the OMS. If a contradicting read later corrects itself,
+  the earlier mark reads the correction as a regression, and holds until a
+  restart. Fail closed: it never resumes early.
+- **A foreign twin.** No order hash exists, so an unknown attempt is matched on
+  its economics. Suppose one order placed outside the OMS has exactly the
+  attempt's token, side, price and size, and the attempt's own order is not
+  visible (it never arrived, or was cancelled with nothing matched). That
+  order is answered `PRESENT` for the attempt, and the OMS then tracks it as
+  the attempt's. If the attempt's own order is later seen, it is an unclaimed
+  order: `ORDER_UNATTRIBUTED`, or a hold while another attempt could own it.
+  This is detection after the fact, not prevention.
+- Every tracked order with fills is read by id every run, as is every order
+  the trades read names. Both grow with history.
