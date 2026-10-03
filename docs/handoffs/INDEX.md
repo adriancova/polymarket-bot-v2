@@ -112,3 +112,10 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-01 | [WP-300.md](WP-300.md) | `WP-300`: collateral inventory and wallet operations | WP | Complete (2026-10-01) | `9cdbf32` | 9 KB |
 | 2026-10-01 | [STORAGE-1.md](STORAGE-1.md) | `STORAGE-1`: research tier, pinned windows, verified raw expiry, disk metrics | WP | Complete (2026-10-01) | `a22502b` | 10 KB |
 | 2026-10-01 | [CI-4.md](CI-4.md) | `CI-4`: run the wallet-operations contract suite in CI | Round | Complete (2026-10-01) | `4628541` | 2 KB |
+| 2026-10-01 | [STORAGE-GOV.md](STORAGE-GOV.md) | `STORAGE-GOV`: ADR-028 Amendment 1 | Governance | Complete (2026-10-01) | `1f75ac0` | 3 KB |
+| 2026-10-01 | [STORAGE-1b.md](STORAGE-1b.md) | `STORAGE-1b`: the storage cycle lock's round-6 LOWs | Round | Complete (2026-10-01) | `7b6499e` | 4 KB |
+| 2026-10-01 | [WP-300b.md](WP-300b.md) | `WP-300b`: WP300-R10-01 and the contract suite fetch tripwire | Round | Complete (2026-10-01) | `05535ae` | 4 KB |
+| 2026-10-01 | [STORAGE-GOV2.md](STORAGE-GOV2.md) | `STORAGE-GOV2`: ADR-028 Amendment 1 corrections; ADR-029 header | Governance | Complete (2026-10-01) | `a428ba3` | 2 KB |
+| 2026-10-01 | [CONTROL-1.md](CONTROL-1.md) | `CONTROL-1`: CO2-N8, the kill switch cannot be starved via the audit log | Round | Complete (2026-10-01) | `b9d9818` | 6 KB |
+| 2026-10-01 | [CO2-N1-ADR.md](CO2-N1-ADR.md) | `CO2-N1-ADR`: ADR-031 (Proposed), admitting entries when the trader lags | Governance | Complete (2026-10-01): Proposed | `1770be3` | 5 KB |
+| 2026-10-01 | [CONTROL-1b.md](CONTROL-1b.md) | `CONTROL-1b`: authoritative no-signer checks; lock key; durable-sink prerequisites | Round | Complete (2026-10-01) | `80a06e2` | 7 KB |

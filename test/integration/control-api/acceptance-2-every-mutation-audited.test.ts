@@ -9,10 +9,14 @@
  * what the middle group of tests measures: with the log at its bound, and with
  * a record id reused, the state does not move.
  *
- * The ONE documented exception is asserted rather than glossed: an
+ * The documented exceptions are asserted rather than glossed: an
  * unauthenticated request writes no audit record, because it never reaches the
- * control plane. An audit log an anonymous caller can fill is an audit log an
+ * control plane. (An AUTHORIZED operator's malformed request IS audited since
+ * `CONTROL-1` r1 — `authorized-refusals-audited.test.ts`.) An audit log an anonymous caller can fill is an audit log an
  * anonymous caller can exhaust — and this one refuses mutations when full.
+ * (`CONTROL-1` extended the same reasoning to every caller WITHOUT mutation
+ * authority — `README.md`, "The audit budget"; pinned in
+ * `m3-audit-exhaustion.test.ts` and `audit-budget-adversarial.test.ts`.)
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -243,17 +247,23 @@ describe("ACCEPTANCE 2: every mutation writes an audit record", () => {
     );
   });
 
-  it("a refused REQUEST (bad body) reaches no control plane and writes nothing", async () => {
+  it("an AUTHORIZED operator's refused REQUEST (bad body) changes nothing — and IS audited (CONTROL-1 r1)", async () => {
     const api = await start();
-    // Missing reason: the door refuses before the control plane is called.
+    // Missing reason: the door refuses before any mutation method is called.
     const response = await api.call("POST", "/v1/strategies/sb-1/pause", {
       token: FAKE_OPERATOR_TOKEN,
       body: {},
     });
     expect(response.status).toBe(400);
-    expect(api.audit.records()).toEqual([]);
-    // The distinction is deliberate: a malformed request is not a mutation
-    // ATTEMPT on any state, it is a request that never named one.
+    expect(api.controlPlane.strategies().map((entry) => entry.state)).toEqual(["RUNNING", "RUNNING"]);
+    // `WP-240` wrote nothing here, reasoning that a malformed request "never
+    // named" a mutation. `CONTROL-1` r1 (CONTROL1-J-M2) reversed that: the
+    // caller authenticated and holds the route's mutation grant, so its
+    // refusal is an operator fact, and "refusals are audited for authorized
+    // actors" must hold for it. It is ONE ordinary-tier REFUSED record.
+    expect(api.audit.records().map((record) => `${record.actor}|${record.action}|${record.outcome}|${String(record.scopeRef)}`)).toEqual([
+      "operator-a|STRATEGY_PAUSE|REFUSED|sb-1",
+    ]);
   });
 
   it("the audit log is append-only to every reader: a caller cannot rewrite it", async () => {

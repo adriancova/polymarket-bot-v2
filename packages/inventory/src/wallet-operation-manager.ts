@@ -68,9 +68,11 @@
  * - the claim that sent the operation back: an unrecognised or under-evidenced
  *   observation (or refused reconciliation evidence applied like one), one
  *   naming another transaction, a SUBMITTED after MINED (a stale report, which
- *   changes nothing), a superseded terminal answer, the executor's late
- *   contradiction, the executor's NOT_SENT / unrecognised answer contradicting
- *   what was buffered, or its SUBMITTED when the buffer conflicts with it;
+ *   changes nothing), a superseded terminal answer (or one naming a request
+ *   not issued for the operation) delivered in flight or while the executor
+ *   call is pending (WP300-R10-01), the executor's late contradiction, the
+ *   executor's NOT_SENT / unrecognised answer contradicting what was
+ *   buffered, or its SUBMITTED when the buffer conflicts with it;
  * - every observation still buffered (received while the executor call was
  *   pending): none is applied, every one is weighed.
  * What is NOT weighed is the executor's own answer when nothing else was
@@ -100,8 +102,26 @@
  * - NOTHING CONCLUDES (CONFIRMED or FAILED, which release reservations and end
  *   the in-flight hold) while the executor call is pending (WP300-R3-02): its
  *   answer may still name another transaction. A terminal reconciliation
- *   answer is refused (`WALLET_OP_EVIDENCE_REQUIRED`) and the reconciler is
- *   asked again once the executor answers.
+ *   answer is never recorded then; what happens to it depends on where the
+ *   operation is (WP300-R10-01):
+ *   - still PLANNED (no reconciliation request has been issued for it yet): a
+ *     terminal answer that names a request — necessarily one not issued for
+ *     this operation — or is superseded, authoritative or not, is refused
+ *     (`WALLET_OP_EVIDENCE_SUPERSEDED`) and never kept: it sends the operation
+ *     to UNKNOWN and is weighed there with whatever was buffered, exactly as
+ *     the same answer delivered in flight is (see RECONCILIATION ANSWERS). A
+ *     terminal answer that names no request is current (nothing has been
+ *     weighed yet): it is refused (`WALLET_OP_ILLEGAL_TRANSITION`) and kept
+ *     like the same observation — applied once the executor answers
+ *     SUBMITTED, when it can conclude, or weighed if the operation goes back
+ *     first. So is a terminal fact delivered through {@link observe} (the
+ *     in-flight trust boundary for observations);
+ *   - already under reconciliation (it left PLANNED while the executor call
+ *     was pending): a terminal answer that every other check accepts is
+ *     refused (`WALLET_OP_EVIDENCE_REQUIRED`) and weighed, and the reconciler
+ *     is asked again once the executor answers; any other is refused as it
+ *     would be with no call pending, and weighed (raising no request until
+ *     the executor answers).
  * Since WP300-R9-01 an operation that left PLANNED while the executor call was
  * pending never returns to flight before the executor answers: what moved it
  * was weighed under reconciliation, so a "still in flight" answer is refused
@@ -144,7 +164,8 @@
  *   operation submitted as `(A, R)`, with A never answered by name.
  * Once anything is weighed under reconciliation (an observation, refused
  * reconciliation evidence — including a superseded answer that arrived in
- * flight —, a late contradiction from the executor, and, since WP300-R9-01,
+ * flight or, since WP300-R10-01, while the executor call was pending —, a late
+ * contradiction from the executor, and, since WP300-R9-01,
  * everything that accompanies or triggers a return to UNKNOWN: the claim that
  * sent the operation back and every observation buffered meanwhile; anything
  * but a stale SUBMITTED/MINED report naming no new member, which changes
@@ -218,11 +239,28 @@
  * wrong: a doubt for a CONFIRMED answer, a success claim about a member it
  * names for a FAILED answer, a set-aside or first naming of a member it names
  * for any answer, or the operation re-entering reconciliation. Agreeing
- * evidence does not supersede. An answer naming a request not issued for the
- * operation is refused (`WALLET_OP_EVIDENCE_REQUIRED`). A superseded answer
- * never concludes anything: delivered in flight it sends the operation back to
- * reconciliation (`WALLET_OP_EVIDENCE_SUPERSEDED`, as does a terminal answer
- * naming a request not issued for the operation), and is then weighed there.
+ * evidence does not supersede. A superseded answer, or one naming a request
+ * not issued for the operation, never concludes anything, so it never
+ * releases a reservation or makes an approval ready (WP300-R10-01 closed the
+ * last route by which one could, through the buffer):
+ * - under reconciliation (RECONCILING, an UNKNOWN operation answering the
+ *   request being delivered, or a quarantined terminal one) it is refused —
+ *   `WALLET_OP_EVIDENCE_REQUIRED` for a request not issued for the operation,
+ *   `WALLET_OP_EVIDENCE_SUPERSEDED` for a superseded read — and weighed;
+ * - a TERMINAL one delivered in flight, or while the executor call is
+ *   pending before the operation left PLANNED (no request has been issued for
+ *   it then, so any request it names is not one of its own), is refused
+ *   (`WALLET_OP_EVIDENCE_SUPERSEDED`), never applied or kept: it sends the
+ *   operation to reconciliation and is weighed there;
+ * - one that is not terminal (SUBMITTED/MINED), in flight or while the
+ *   executor call is pending, is handled like the same observation (see
+ *   below): it cannot conclude;
+ * - anywhere else (UNKNOWN with no request being delivered, a terminal
+ *   operation that is not quarantined) it is refused
+ *   (`WALLET_OP_ILLEGAL_TRANSITION`) and weighed.
+ * Before submission (PLANNED, the executor not called) nothing has left the
+ * process: any answer or observation is refused
+ * (`WALLET_OP_ILLEGAL_TRANSITION`) and changes nothing.
  *
  * The FIRST entry into reconciliation marks nothing by itself (WP300-R9-01
  * asked whether it should; it does not): there is no earlier request whose
@@ -241,7 +279,17 @@
  * Reconciliation evidence that is not RECORDED as a resolution — whatever the
  * reason: not authoritative, inconclusive, superseded, unwitnessed, refused
  * while the executor is pending, contradicting standing evidence, or arriving
- * after a terminal state — is never thrown away:
+ * after a terminal state — is never thrown away once the operation has been
+ * handed to the executor (before that, nothing has left the process and it
+ * changes nothing; see above):
+ * - while the executor call is pending and the operation is still PLANNED,
+ *   it is handled like the same observation there (kept, or, if
+ *   unrecognised, sending the operation to UNKNOWN — see OBSERVATIONS DURING
+ *   SUBMISSION), except a TERMINAL answer that names a request (none has been
+ *   issued for the operation yet) or is superseded, authoritative or not:
+ *   that one is never kept, and is handled exactly as in flight (next item) —
+ *   it sends the operation to reconciliation and is weighed there, after
+ *   whatever was buffered and before the request is delivered (WP300-R10-01);
  * - outside flight it is weighed against the whole set exactly as the same
  *   observation would be (contesting, admitting, requiring every member by
  *   name; quarantining after a terminal state and suspending an approval);
@@ -264,8 +312,11 @@
  * it names, an outcome the authority already gave and that still stands: it
  * carries no new fact (directive 3 would otherwise let a reconciler that
  * answers every member on every request reopen its own answers forever).
- * While the executor call is pending, weighed reconciliation evidence raises
- * no request; the executor's answer sends the one owed.
+ * While the executor call is pending, reconciliation evidence weighed under
+ * reconciliation raises no request of its own; the executor's answer sends
+ * the one owed. (Evidence that moves the operation to UNKNOWN — out of
+ * PLANNED, as above — requests reconciliation at once, like every move to
+ * UNKNOWN.)
  *
  * RECOGNITION BOUNDARY. From submission until the operation resolves
  * (CONFIRMED or FAILED), every line it touches is under an in-flight hold in
@@ -739,20 +790,27 @@ export class WalletOperationManager {
    * re-applied).
    *
    * WP300-R7-X1: evidence this method does not RECORD as a resolution is never
-   * thrown away, and the call still returns the refusal. Outside flight it is
-   * handled exactly as the same fact delivered through {@link observe} would
-   * be: weighed against the whole identity set (contesting what it
-   * contradicts, admitting what it names, requiring every member by name,
-   * quarantining after a terminal state). In flight, a current answer is
-   * applied as the same observation would be (and if that sends the operation
-   * back to UNKNOWN, it is weighed there — WP300-R9-01); a superseded terminal
-   * answer, or one naming a request not issued for the operation,
-   * authoritative or not (WP300-R9-03), is not applied — it sends the
-   * operation back to reconciliation and is weighed there like the same
-   * observation outside flight, before the request is delivered
-   * (WP300-R8-01). The one exception is an authoritative answer that repeats,
-   * for every member it names, what the authority already said and still
-   * stands: it carries no new fact.
+   * thrown away once the operation has been handed to the executor, and the
+   * call still returns the refusal. Outside flight it is handled exactly as the
+   * same fact delivered through {@link observe} would be: weighed against the
+   * whole identity set (contesting what it contradicts, admitting what it
+   * names, requiring every member by name, quarantining after a terminal
+   * state). In flight, a current answer is applied as the same observation
+   * would be (and if that sends the operation back to UNKNOWN, it is weighed
+   * there — WP300-R9-01); a superseded terminal answer, or one naming a
+   * request not issued for the operation, authoritative or not (WP300-R9-03),
+   * is not applied — it sends the operation back to reconciliation and is
+   * weighed there like the same observation outside flight, before the
+   * request is delivered (WP300-R8-01). The same holds while the executor call
+   * is pending and the operation is still PLANNED (WP300-R10-01): a current
+   * answer (one naming no request) is kept like the same observation, and a
+   * terminal answer naming any request (none has been issued for the
+   * operation yet) or superseded is refused (`WALLET_OP_EVIDENCE_SUPERSEDED`)
+   * and never kept — it sends the operation to reconciliation and is weighed
+   * there, with whatever was buffered. Before submission an answer is refused
+   * (`WALLET_OP_ILLEGAL_TRANSITION`) and changes nothing. The one exception is
+   * an authoritative answer that repeats, for every member it names, what the
+   * authority already said and still stands: it carries no new fact.
    */
   resolveByReconciliation(operationId: string, evidence: unknown): InventoryResult<WalletOperationView> {
     const operation = this.#operations.get(operationId);
@@ -791,12 +849,18 @@ export class WalletOperationManager {
       }
       // The executor has not answered yet; the observation is kept, classified
       // now, and applied once it does — or weighed, if the operation goes back
-      // to reconciliation first (see the header).
+      // to reconciliation first (see the header). Reconciliation evidence
+      // reaches this point only when it is current (it names no request) or not
+      // terminal: #answer has already sent a terminal answer naming a request,
+      // or a superseded one, to reconciliation (WP300-R10-01).
       operation.buffered.push({ outcome: classified, firstNamed });
       return ok(view(operation));
     }
     if (operation.state !== "SUBMITTED" && operation.state !== "MINED") {
       // Refused as a transition, never dropped: weighed against the whole identity set (WP300-R6).
+      // The exception is a PLANNED operation not yet handed to the executor (the
+      // pending case is handled above): nothing has left the process, and the
+      // evidence changes nothing.
       if (operation.state !== "PLANNED") {
         this.#weighOutsideFlight(
           operation,
@@ -891,30 +955,42 @@ export class WalletOperationManager {
     const issuedAt =
       binding === undefined || binding === null ? 0 : typeof binding === "string" ? operation.requests.get(binding) : undefined;
     if (!terminalState && operation.state !== "RECONCILING" && !answeringRequest) {
-      if (outcome !== null && (operation.state === "SUBMITTED" || operation.state === "MINED")) {
-        // In flight a refused answer is applied like an observation — unless it
-        // is a TERMINAL answer that is superseded (or names a request not issued
-        // for this operation), authoritative or not (WP300-R9-03): an old read
-        // never concludes anything. It sends the operation back to
-        // reconciliation instead (nothing applied or released) and, once the
-        // operation is out of flight, it is WEIGHED like the same observation
-        // would be there (WP300-R8-01): it admits what it names, contests what it
+      const inFlight = operation.state === "SUBMITTED" || operation.state === "MINED";
+      // WP300-R10-01: the executor call is pending and the operation has not left
+      // PLANNED. No reconciliation request has been issued for it yet, so an
+      // answer naming any request names one not issued for this operation.
+      const pendingPlanned = operation.state === "PLANNED" && operation.submitting;
+      if (outcome !== null && (inFlight || pendingPlanned)) {
+        // In flight a refused answer is applied like an observation, and while
+        // the executor call is pending (still PLANNED) it is kept like one —
+        // unless it is a TERMINAL answer that is superseded (or names a request
+        // not issued for this operation), authoritative or not (WP300-R9-03,
+        // WP300-R10-01): such a read never concludes anything, and is never kept
+        // to be applied later. It sends the operation to reconciliation instead
+        // (nothing applied or released) and, once the operation is out of
+        // flight / out of PLANNED, it is WEIGHED like the same observation would
+        // be there (WP300-R8-01): it admits what it names, contests what it
         // contradicts, and requires every member by name — all before the
-        // reconciliation request is delivered (see #toUnknown).
+        // reconciliation request is delivered (see #toUnknown), and together
+        // with every observation still buffered.
         const superseded =
           issuedAt === undefined ? "a reconciliation request not issued for this operation" : operation.identity.supersededFor(outcome, identity, issuedAt);
         if (superseded !== null) {
           const observation = answerAsObservation(evidence);
+          const where = inFlight ? "in flight" : "while the executor call was pending";
           this.#toUnknown(
             operation,
-            `a superseded ${outcome} reconciliation answer arrived in flight (${superseded}); it is weighed against the whole identity set, nothing is assumed${this.#bufferedNote(operation)}`,
+            `a superseded ${outcome} reconciliation answer arrived ${where} (${superseded}); it is weighed against the whole identity set, nothing is assumed${this.#bufferedNote(operation)}`,
             { evidence: weighedEvidence(observation, identityHints(observation)), firstNamed: [], afterBuffer: true },
           );
           return {
-            result: refuse("WALLET_OP_EVIDENCE_SUPERSEDED", "a superseded answer arrived in flight; the operation is under reconciliation again and the answer is weighed", {
-              operationId,
-              supersededBy: superseded,
-            }),
+            result: refuse(
+              "WALLET_OP_EVIDENCE_SUPERSEDED",
+              inFlight
+                ? "a superseded answer arrived in flight; the operation is under reconciliation again and the answer is weighed"
+                : "a superseded answer arrived while the executor call was pending; the operation is under reconciliation and the answer is weighed",
+              { operationId, supersededBy: superseded },
+            ),
             // Already weighed (above), before the request was delivered.
             weigh: false,
           };

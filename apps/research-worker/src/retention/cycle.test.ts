@@ -1770,6 +1770,58 @@ describe("N2: one storage cycle at a time per state directory: a dry run cannot 
     expect((await readdir(f.stateDir)).sort()).toStrictEqual([CLOCK_STATE_FILE_NAME, EVIDENCE_HOLDS_FILE_NAME, "expiry-plans"].sort());
   });
 
+  // "Cannot read the boot id", both ways a reader can say it: the round-6
+  // reader's `null` (the lock then fell back to `storage-cycle.lock`), and the
+  // read's own rejection, as under a /proc mounted subset=pid.
+  const subsetPid = async (): Promise<string> => {
+    const error = new Error("ENOENT: no such file or directory, open '/proc/sys/kernel/random/boot_id'") as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    throw error;
+  };
+  it.each([
+    ["no boot id (null, as the round-6 reader gave)", async (): Promise<string> => null as unknown as string, "this host's boot id reads as null"],
+    ["a read rejected with ENOENT (ProcSubset=pid)", subsetPid, "this host's boot id cannot be read (ENOENT: no such file or directory"],
+  ] as const)("STORAGE-1b: a cycle that gets %s refuses in either mode, reading and writing nothing; the control runs", async (_name, cannot, message) => {
+    const f = await fixture(segments());
+    const waiting = { timeoutMs: 100, pollMs: 10 };
+    let reads = 0;
+    const counted: TraderEvidenceSource = {
+      dispatchFrontiers: (instanceIds) => {
+        reads += 1;
+        return frontierAt("1", evidence).dispatchFrontiers(instanceIds);
+      },
+      marketEvidence: (marketWindow, instanceIds) => frontierAt("1", evidence).marketEvidence(marketWindow, instanceIds),
+    };
+    let windowReads = 0;
+    const loadWindows = async (): Promise<readonly MarketWindow[]> => {
+      windowReads += 1;
+      return [window];
+    };
+    const before = (await readdir(f.root)).sort();
+    for (const mode of ["dry-run", "execute"] as const) {
+      const attempt = runStorageCycle(
+        dependencies(f, {
+          mode,
+          ...(mode === "dry-run" ? { deletion: null } : {}),
+          cycleLock: { ...waiting, bootId: cannot },
+          loadWindows,
+          evidence: counted,
+        }),
+      );
+      await expect(attempt).rejects.toBeInstanceOf(StorageCycleLockError);
+      await expect(attempt).rejects.toThrow(message);
+      await expect(attempt).rejects.toThrow("ProcSubset=pid");
+    }
+    expect(reads).toBe(0);
+    expect(windowReads).toBe(0);
+    // Nothing was created: no state directory, no research tier, no plan.
+    expect((await readdir(f.root)).sort()).toStrictEqual(before);
+    expect(await walFiles(f)).toHaveLength(4);
+    // Control: the same cycle, reading the kernel's boot id, runs.
+    const run = await runStorageCycle(dependencies(f, { cycleLock: waiting, loadWindows, evidence: counted }));
+    expect(run.expiry?.deleted.map((entry) => entry.segmentId)).toStrictEqual([f.segments[2]?.segmentId]);
+  });
+
   it("a dry run started while an execute cycle re-decides waits for it: the holds each makes durable both survive", async () => {
     const f = await fixture(segments());
     const bootClock = manualBootClock();

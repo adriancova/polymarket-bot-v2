@@ -18,6 +18,33 @@
  * (`test/integration/control-api/acceptance-2-every-mutation-audited.test.ts`),
  * which is the `WP-120`/`WP-230` precedent for this class of claim.
  *
+ * **Dated correction (`CONTROL-1b`, 2026-10-01): PostgreSQL HAS now been
+ * reached.** `test/integration/control-api/postgres/audit-sink-postgres.test.ts`
+ * drives this sink against a Testcontainers PostgreSQL with every migration
+ * applied (`pnpm --filter @polymarket-bot/control-api test:integration:postgres`;
+ * opt-in, because the control API's main integration suite starts no
+ * container). It measured that the `ops` tables REFUSE a raw record carrying
+ * NUL (in `text` or `jsonb`), a lone surrogate (in `jsonb`), a `reason` over
+ * `internal.detail`'s 2000 characters or a `scope_ref` over
+ * `internal.identifier`'s 200 — and silently REPLACE a lone surrogate in a
+ * `text` column with U+FFFD — and that every record the control plane writes,
+ * whatever bytes its caller sent, lands, equal field for field to the record
+ * the in-memory log holds. The paragraph above stays as the record of what was
+ * true when this binding was written; no composition binds this sink yet.
+ *
+ * ## The records this sink receives are already safe (`CONTROL-1b`)
+ *
+ * `ControlPlane` passes every record through `audit-text.ts`'s
+ * `auditSafeRecord` before any sink sees it: NUL, lone surrogates and every
+ * control, format or separator code point are escaped as `\u{HEX}`, and
+ * `actor`, `scopeRef` and `reason` are cut to the column domains above. This
+ * sink therefore does NOT escape again — the escape is injective, not
+ * idempotent, so a second pass would rewrite the first one's backslashes — and
+ * writes what it is handed, so the database and the in-memory log hold the same
+ * text. A caller that drives this sink DIRECTLY with a hand-built raw record
+ * gets PostgreSQL's refusal for such bytes, reported as `AUDIT_SINK_UNAVAILABLE`
+ * (fail closed); nothing in this repository does.
+ *
  * ## Why the two tables, and which record goes where
  *
  * §10.6 gives the `ops` schema two audit tables and they mean different things:
@@ -93,8 +120,8 @@ export interface PostgresAuditSinkOptions {
  * before the wire). A string primitive never reaches `prepareObject`, which
  * closes both lookups; the parameter's type is inferred from the column, so
  * PostgreSQL parses the text as `jsonb` on insert (the `SER-2` TEXT rule the
- * `storage-postgres` repositories follow; like the rest of this file, not
- * executed against a live database here).
+ * `storage-postgres` repositories follow; executed against a live database
+ * since `CONTROL-1b`, header).
  * `encodePlainJson` (`@polymarket-bot/risk/plain-json`) is byte-identical to a
  * clean `JSON.stringify` for plain data — the same document the driver would
  * have produced in a clean process — and never consults `toJSON`.

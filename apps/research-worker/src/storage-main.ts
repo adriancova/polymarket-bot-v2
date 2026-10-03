@@ -17,7 +17,10 @@
  * `RESEARCH_WORKER_EXPIRY_MODE=execute` and the WAL root holds the expiry
  * opt-in marker (`storage-config.ts`). A state directory is required in either
  * mode: a dry run makes the evidence holds it learned durable there, releasing
- * nothing (`evidence-holds.ts`), under the directory's cycle lock.
+ * nothing (`evidence-holds.ts`), under the directory's cycle lock. That lock is
+ * named by this host's kernel boot id: where it cannot be read (not Linux, or a
+ * `/proc` mounted `subset=pid`, as under systemd's `ProcSubset=pid`), the
+ * command refuses, exiting non-zero having done nothing (`cycle-lock.ts`).
  *
  * The composition root: the only place that reads the environment, opens the
  * filesystem and the trader database (read-only), and chooses the deletion
@@ -119,6 +122,8 @@ export type StorageMainOptions = {
   readonly operatorPinLockTimeoutMs?: number;
   /** How long to wait for another storage cycle's lock on the state directory (default 5 min). */
   readonly cycleLockTimeoutMs?: number;
+  /** Reads this host's boot id, which names that lock; the kernel's when absent (`cycle-lock.ts`). */
+  readonly cycleLockBootId?: () => Promise<string>;
 };
 
 /** Run one storage cycle and print its report. */
@@ -189,7 +194,10 @@ export async function storageMain(options: StorageMainOptions = {}): Promise<num
       stateDirectory: config.stateDirectory,
       bootClock: systemBootClock(),
       operatorPinLock: pinFile === null ? noOperatorPinLock() : pinFile.lock,
-      cycleLock: options.cycleLockTimeoutMs === undefined ? {} : { timeoutMs: options.cycleLockTimeoutMs },
+      cycleLock: {
+        ...(options.cycleLockTimeoutMs === undefined ? {} : { timeoutMs: options.cycleLockTimeoutMs }),
+        ...(options.cycleLockBootId === undefined ? {} : { bootId: options.cycleLockBootId }),
+      },
     });
     console.log(JSON.stringify(summarizeStorageReport(report)));
     return report.expiry !== null && report.expiry.failures.length > 0 ? 1 : 0;

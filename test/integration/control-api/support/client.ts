@@ -16,16 +16,21 @@ import {
   ControlPlane,
   InMemoryTraderHealthSource,
   OperatorRegistry,
+  SafetyReservedAuditSink,
   TraderHealthCache,
+  createBudgetedAuditLog,
   startControlHttpServer,
+  type ControlHttpTimeouts,
   type RunningControlHttpServer,
 } from "@polymarket-bot/control-api";
 import { ScriptedEnvironment } from "@polymarket-bot/control-api/testing";
-import { InMemoryControlAuditLog } from "@polymarket-bot/observability";
+import { InMemoryControlAuditLog, type ControlAuditSink } from "@polymarket-bot/observability";
 
 export interface HttpResponse {
   readonly status: number;
   readonly contentType: string;
+  /** Every response header, lower-cased names (`node:http`'s own record). */
+  readonly headers: Readonly<Record<string, string | readonly string[] | undefined>>;
   readonly text: string;
   json(): unknown;
 }
@@ -33,6 +38,8 @@ export interface HttpResponse {
 export interface ServedApi {
   readonly url: string;
   readonly audit: InMemoryControlAuditLog;
+  /** The audit budget the control plane writes through (`audit-budget.ts`). */
+  readonly auditBudget: SafetyReservedAuditSink;
   readonly controlPlane: ControlPlane;
   readonly healthSource: InMemoryTraderHealthSource;
   readonly health: TraderHealthCache;
@@ -40,28 +47,66 @@ export interface ServedApi {
   call(
     method: string,
     path: string,
-    options?: { readonly token?: string; readonly body?: unknown; readonly rawBody?: string },
+    options?: CallOptions,
   ): Promise<HttpResponse>;
+}
+
+export interface CallOptions {
+  readonly token?: string;
+  readonly body?: unknown;
+  readonly rawBody?: string;
+  /**
+   * The `Content-Type` sent with a body. Absent: `application/json`. `null`:
+   * none at all (`CONTROL-1`, L-3's probes).
+   */
+  readonly contentType?: string | null;
 }
 
 export interface ServeOptions {
   readonly auditCapacity?: number;
+  /** The audit budget's safety reserve. Defaults to `0` (see the harness's note). */
+  readonly auditSafetyReserve?: number;
   readonly maxRequestBodyBytes?: number;
+  readonly timeouts?: ControlHttpTimeouts;
   readonly operators?: readonly {
     readonly operatorId: string;
     readonly token: string;
     readonly grants: readonly ("READ" | "STRATEGY_CONTROL" | "KILL_SWITCH")[];
   }[];
+  /**
+   * `CONTROL-1b`: a sink placed BETWEEN the audit budget and the log — a slow,
+   * stalling or late-answering durable sink, as a test needs one. Absent: the
+   * shipped composition exactly (`createBudgetedAuditLog`).
+   */
+  readonly auditInner?: (log: InMemoryControlAuditLog) => ControlAuditSink;
+  /** `CONTROL-1b`: the control plane's append bound. Absent: its default. */
+  readonly auditAppendTimeoutMs?: number;
 }
 
-/** Starts the REAL server over the REAL API, control plane and audit log. */
+/**
+ * Starts the REAL server over the REAL API, control plane and audit log, behind
+ * the REAL audit budget (`createBudgetedAuditLog`, the composition `main.ts`
+ * builds).
+ */
 export async function serveControlApi(options: ServeOptions = {}): Promise<ServedApi> {
-  const audit = new InMemoryControlAuditLog(options.auditCapacity ?? 64);
+  const budget = { capacity: options.auditCapacity ?? 64, safetyReserve: options.auditSafetyReserve ?? 0 };
+  let audit: InMemoryControlAuditLog;
+  let auditBudget: SafetyReservedAuditSink;
+  if (options.auditInner === undefined) {
+    ({ log: audit, sink: auditBudget } = createBudgetedAuditLog(budget));
+  } else {
+    audit = new InMemoryControlAuditLog(budget.capacity);
+    auditBudget = new SafetyReservedAuditSink(options.auditInner(audit), budget);
+  }
+  const environment = new ScriptedEnvironment();
   const controlPlane = new ControlPlane({
-    audit,
+    audit: auditBudget,
     runMode: "PAPER",
     maximumRunMode: "PAPER",
     repositoryMaximumRunMode: "PAPER",
+    // As `main.ts` (`CONTROL-1b`): a void record's instant and id.
+    auditRecordSource: environment,
+    ...(options.auditAppendTimeoutMs === undefined ? {} : { auditAppendTimeoutMs: options.auditAppendTimeoutMs }),
   });
   const healthSource = new InMemoryTraderHealthSource();
   const health = new TraderHealthCache(healthSource);
@@ -69,7 +114,7 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
     operators: new OperatorRegistry([...(options.operators ?? [])]),
     controlPlane,
     health,
-    environment: new ScriptedEnvironment(),
+    environment,
     auditCapacity: options.auditCapacity ?? 64,
     auditSize: () => audit.size,
   });
@@ -79,12 +124,14 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
     host: "127.0.0.1",
     port: 0,
     maxRequestBodyBytes: options.maxRequestBodyBytes ?? 65_536,
+    ...(options.timeouts === undefined ? {} : { timeouts: options.timeouts }),
   });
   const url = `http://127.0.0.1:${String(server.port)}`;
 
   return {
     url,
     audit,
+    auditBudget,
     controlPlane,
     healthSource,
     health,
@@ -98,14 +145,15 @@ function call(
   base: string,
   method: string,
   path: string,
-  options: { readonly token?: string; readonly body?: unknown; readonly rawBody?: string },
+  options: CallOptions,
 ): Promise<HttpResponse> {
   const payload =
     options.rawBody ?? (options.body === undefined ? undefined : JSON.stringify(options.body));
   const headers: Record<string, string> = {};
   if (options.token !== undefined) headers["authorization"] = `Bearer ${options.token}`;
   if (payload !== undefined) {
-    headers["content-type"] = "application/json";
+    const contentType = options.contentType === undefined ? "application/json" : options.contentType;
+    if (contentType !== null) headers["content-type"] = contentType;
     headers["content-length"] = String(Buffer.byteLength(payload));
   }
 
@@ -118,6 +166,7 @@ function call(
         resolve({
           status: response.statusCode ?? 0,
           contentType: String(response.headers["content-type"] ?? ""),
+          headers: response.headers,
           text,
           json: () => JSON.parse(text) as unknown,
         });

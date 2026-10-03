@@ -181,6 +181,7 @@ async function startShipped(
       bindPort: 0,
       maxRequestBodyBytes: 65_536,
       auditCapacity: 64,
+      auditSafetyReserve: 4,
       traderHealth: { kind: "http", url: `http://127.0.0.1:${String(stubPort)}/health`, timeoutMs: 2000 },
       operators: [{ operatorId: "trdr3-operator", token: TOKEN, grants: ["READ"] }],
     }),

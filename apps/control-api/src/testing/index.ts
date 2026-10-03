@@ -9,9 +9,10 @@
  * real one.** Every token is obviously fake and says so in its own text.
  */
 
-import { InMemoryControlAuditLog, type TraderHealthReportInput } from "@polymarket-bot/observability";
+import type { InMemoryControlAuditLog, TraderHealthReportInput } from "@polymarket-bot/observability";
 
 import { ControlApi, type ApiEnvironment } from "../api.js";
+import { createBudgetedAuditLog, type SafetyReservedAuditSink } from "../audit-budget.js";
 import { OperatorRegistry, type OperatorGrant } from "../auth.js";
 import { ControlPlane } from "../control-plane.js";
 import type { TraderHealthDocument } from "../health-door.js";
@@ -36,7 +37,11 @@ export class ScriptedEnvironment implements ApiEnvironment {
 
   now(): string {
     this.#instant += 1;
-    return `2026-09-05T00:00:${String(this.#instant).padStart(2, "0")}.000Z`;
+    // One second per call from 2026-09-05T00:00:00Z. Byte-identical to the
+    // earlier `00:00:${n}` spelling for the first 59 calls, and still a valid
+    // strict-UTC instant after them (`CONTROL-1`'s adversarial suite makes
+    // hundreds of calls; the old spelling produced `00:00:350.000Z`).
+    return new Date(Date.UTC(2026, 8, 5, 0, 0, this.#instant)).toISOString();
   }
 
   nextAuditRecordId(): string {
@@ -50,6 +55,13 @@ export class ScriptedEnvironment implements ApiEnvironment {
 
 export interface HarnessOptions {
   readonly auditCapacity?: number;
+  /**
+   * The audit budget's safety reserve (`audit-budget.ts`). Defaults to `0` —
+   * `WP-240`'s single bound, which the pre-`CONTROL-1` suites measure. The
+   * configuration door refuses `0`, so the SHIPPED composition always has a
+   * reserve; a suite measuring the budget passes one explicitly.
+   */
+  readonly auditSafetyReserve?: number;
   readonly operators?: readonly {
     readonly operatorId: string;
     readonly token: string;
@@ -62,29 +74,40 @@ export interface Harness {
   readonly api: ControlApi;
   readonly controlPlane: ControlPlane;
   readonly audit: InMemoryControlAuditLog;
+  /** The budget the control plane writes through, in front of {@link Harness.audit}. */
+  readonly auditBudget: SafetyReservedAuditSink;
   readonly health: TraderHealthCache;
   readonly healthSource: InMemoryTraderHealthSource;
   readonly environment: ScriptedEnvironment;
 }
 
 /**
- * Builds the REAL API over the REAL control plane and the REAL append-only log.
+ * Builds the REAL API over the REAL control plane and the REAL append-only log,
+ * behind the REAL audit budget — the composition `main.ts` builds, through the
+ * same `createBudgetedAuditLog`.
  *
  * The only doubled thing is the trader health SOURCE, which stands in for a
  * process this repository cannot start from here (see `health-source.ts`).
  * Nothing else is a stub.
  */
 export function createHarness(options: HarnessOptions = {}): Harness {
-  const audit = new InMemoryControlAuditLog(options.auditCapacity ?? 64);
+  const { log: audit, sink: auditBudget } = createBudgetedAuditLog({
+    capacity: options.auditCapacity ?? 64,
+    safetyReserve: options.auditSafetyReserve ?? 0,
+  });
+  const environment = new ScriptedEnvironment();
   const controlPlane = new ControlPlane({
-    audit,
+    audit: auditBudget,
     runMode: CONTROL_API_RUN_MODE,
     maximumRunMode: CONTROL_API_RUN_MODE,
     repositoryMaximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
+    // As `main.ts`: a void record's instant and id come from the API's
+    // environment. The in-memory log answers at once, so this draws nothing
+    // from the scripted sequence unless an append outlives its bound.
+    auditRecordSource: environment,
   });
   const healthSource = new InMemoryTraderHealthSource(options.healthDocument);
   const health = new TraderHealthCache(healthSource);
-  const environment = new ScriptedEnvironment();
 
   const api = new ControlApi({
     operators: new OperatorRegistry([
@@ -104,7 +127,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     auditSize: () => audit.size,
   });
 
-  return { api, controlPlane, audit, health, healthSource, environment };
+  return { api, controlPlane, audit, auditBudget, health, healthSource, environment };
 }
 
 /** `Authorization` header value for a token. */

@@ -133,16 +133,18 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
 
 ## known_risks
 
-- **Classification and chain containment are supersets until `H1R1-PROVENANCE`.**
-  - The trader's `gateway_epoch` and `ingest_seq` columns are NULL, so a source event is located by its instant, `evaluated_at`.
-  - This keeps more raw data, never less.
+- **No trader-responsible window classifies until `H1R1-PROVENANCE`, so raw WAL that such a window could overlap never expires.**
+  - `CoreLoop` gives a decision only its `eventId`, so the trader writes `gateway_epoch` and `ingest_seq` as NULL.
+  - `dispatchFrontiers` skips those rows, and `classificationBlocker` refuses a window with no dispatch frontier.
+  - This keeps more, never less. But wherever a trader runs, the 72 h expiry does not run, so `BURN-IN`'s criterion "Raw expiry, pins and backups ran and were verified" cannot be met until it is fixed (`PROVENANCE-1`).
+  - Corrected 2026-10-01 (STORAGE-GOV review): was 'Classification and chain containment are supersets until `H1R1-PROVENANCE`… This keeps more raw data, never less.'
 - **A stale cycle lock blocks expiry.** A cycle killed mid-run leaves its lock, and every later cycle refuses and deletes nothing until the operator removes it. A reboot clears it.
 - **No trader database while an unsettled trader window is registered: nothing expires.**
 - **A window settled only by dry runs, then pruned from the registry, keeps its holds.** They stay until it is re-registered and settled by `execute`.
 - **Pin volume.** About 3.4 GB/day at H1's intent rate, above the 3 GB/day alarm. Segments shared between overlapping pins are stored twice, and SNAPPY is about 3× larger than ZSTD.
 - **One unreadable pin record, or an unreadable `evidence-holds.json`, stalls every expiry.** It fails closed.
-- **R6-LOCK-OPEN-ERROR-UNTESTED (LOW).** The refusal on an `open()` error other than EEXIST is correct but unpinned.
-- **R6-LOCK-NAME-FALLBACK (LOW).** If the boot id cannot be read, the lock name falls back to `storage-cycle.lock`. Two participants that derive different names do not exclude each other. One trigger: `/proc` mounted with `subset=pid`, as under systemd `ProcSubset=pid`.
+- **R6-LOCK-OPEN-ERROR-UNTESTED (LOW): closed by `STORAGE-1b` (`7b6499e`).** The refusal on an `open()` error other than EEXIST is correct but unpinned.
+- **R6-LOCK-NAME-FALLBACK (LOW): closed by `STORAGE-1b` (`7b6499e`); an unreadable boot id now refuses, and `ProcSubset=pid` is unsupported.** If the boot id cannot be read, the lock name falls back to `storage-cycle.lock`. Two participants that derive different names do not exclude each other. One trigger: `/proc` mounted with `subset=pid`, as under systemd `ProcSubset=pid`.
 
 ## follow_up
 
@@ -155,7 +157,7 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
 2. **A data-gateway round:**
    - enforce `maxTotalBytes`;
    - make the WAL writer's capacity counter account for expired segments (J10).
-3. **`H1R1-PROVENANCE` and trader persistence:** persist decision provenance, halts, refusals and the execution chain. Classification and chain containment then become exact rather than supersets.
+3. **`PROVENANCE-1` (`H1R1-PROVENANCE`, `OUT1-R1-HALT-NOT-DURABLE`):** persist decision provenance (`gateway_epoch`, `ingest_seq`, `feature_snapshot_id`), halts and refusals. Until then no trader-responsible window classifies, and raw WAL under it never expires. It blocks `BURN-IN`.
 4. **`HOST-1`:**
    - run the storage timer in `execute` mode, with `RESEARCH_WORKER_STATE_DIR` set and the opt-in marker on the live WAL root only;
    - produce the window registry;
@@ -163,12 +165,12 @@ Both round-6 verifiers ran the gates on `162fcfe`, with identical counts:
    - add alerts for a non-zero storage exit, long-lived holds or unreadable marks, and clock skew;
    - back up `evidence-holds.json`;
    - export the storage metrics to Prometheus.
-   - Avoid `ProcSubset=pid`, or close R6-LOCK-NAME-FALLBACK first.
+   - Leave `ProcSubset` unset: the cycle refuses under `ProcSubset=pid` (`STORAGE-1b`).
 5. **A pin-storage ruling or round:** share segments between overlapping pins, and/or add a ZSTD codec.
 6. **Deleting lapsed non-fill pins** deletes evidence, so it needs its own dual-verified round.
 7. **`APPROX-REPLAY-1`** can now consume the research tier.
 8. **Before `SCALE-8`:** add a durable classification cache, or prune the registry.
-9. **Close the two round-6 LOWs** in a research-worker round.
+9. The two round-6 LOWs: closed by `STORAGE-1b` (`7b6499e`).
 
 ## commit_sha
 

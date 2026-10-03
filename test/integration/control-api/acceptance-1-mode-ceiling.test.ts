@@ -9,7 +9,11 @@
  *    mode-raising key is refused before it reaches a handler.
  * 2. **Refused by name**, with a message that says what was refused and why.
  * 3. **Audited**, as a `MODE_RAISE_ATTEMPT` record whose prior and resulting
- *    ceilings are identical — the record of an attempt that changed nothing.
+ *    ceilings are identical — the record of an attempt that changed nothing —
+ *    when the caller holds a mutation grant. A READ-only caller's attempt is
+ *    refused identically and COUNTED, and writes no record (`CONTROL-1`,
+ *    closing `WP-240` r1 M-3: a reader that could append could fill the log
+ *    and so refuse every mutation, the kill switch included).
  *
  * The startup half (a deployment trying to raise `MAX_RUN_MODE`) is
  * `apps/control-api/src/safety.test.ts`; it is a pure function of an
@@ -21,6 +25,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { FAKE_OPERATOR_TOKEN, FAKE_READER_TOKEN } from "@polymarket-bot/control-api/testing";
 
 import { serveControlApi, type ServedApi } from "./support/client.js";
+
+/** A third obviously-fake token, for an operator holding STRATEGY_CONTROL only. */
+const STRATEGIST_TOKEN = "fake-paper-strategist-token-not-a-credential-0003";
 
 const OPERATORS = [
   {
@@ -129,10 +136,19 @@ describe("ACCEPTANCE 1: the run-mode ceiling is not writable through this API", 
     expect(metrics.text).toContain("control_allow_real_orders 0");
   });
 
-  it("records an unauthorized operator's attempt too — the attempt is the fact", async () => {
-    const api = await start();
+  it("records the attempt of an operator UNAUTHORIZED for the route but holding a mutation grant — the attempt is the fact", async () => {
+    // `strategist-c` holds STRATEGY_CONTROL, not KILL_SWITCH, and names a run
+    // mode on the kill-switch route: the answer is the mode-raise refusal, not
+    // the missing grant, and the attempt is audited under its own actor.
+    served = await serveControlApi({
+      operators: [
+        ...OPERATORS,
+        { operatorId: "strategist-c", token: STRATEGIST_TOKEN, grants: ["READ", "STRATEGY_CONTROL"] },
+      ],
+    });
+    const api = served;
     const response = await api.call("POST", "/v1/kill-switch", {
-      token: FAKE_READER_TOKEN,
+      token: STRATEGIST_TOKEN,
       body: { runMode: "LIVE", scope: "GLOBAL", action: "FULL_HALT", reason: "please" },
     });
     expect(response.status).toBe(403);
@@ -141,8 +157,24 @@ describe("ACCEPTANCE 1: the run-mode ceiling is not writable through this API", 
     );
     expect(api.audit.records().at(-1)).toMatchObject({
       action: "MODE_RAISE_ATTEMPT",
-      actor: "reader-b",
+      actor: "strategist-c",
     });
+  });
+
+  it("CONTROL-1 (M-3): a READ-only operator's attempt is refused by name and counted, and writes NO record", async () => {
+    const api = await start();
+    const response = await api.call("POST", "/v1/kill-switch", {
+      token: FAKE_READER_TOKEN,
+      body: { runMode: "LIVE", scope: "GLOBAL", action: "FULL_HALT", reason: "please" },
+    });
+    expect(response.status).toBe(403);
+    const problem = response.json() as Record<string, unknown>;
+    expect(problem["code"]).toBe("CONTROL_MODE_RAISE_REFUSED");
+    expect(String(problem["detail"])).toContain("is refused by name");
+    expect(String(problem["detail"])).toContain("NOT audited");
+    expect(api.audit.records()).toEqual([]);
+    const metrics = await api.call("GET", "/v1/metrics", { token: FAKE_READER_TOKEN });
+    expect(metrics.text).toContain("control_mode_raise_attempts_refused_total 1");
   });
 
   it("does NOT refuse an ordinary request whose REASON mentions live or a signer", async () => {

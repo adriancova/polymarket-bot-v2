@@ -14,7 +14,8 @@
       "@polymarket-bot/risk": ["packages/risk/src/index.ts"],
       "@polymarket-bot/risk/plain-data": ["packages/risk/src/plain-data.ts"],
       "@polymarket-bot/risk/schema-arena": ["packages/risk/src/schema-arena.ts"],
-      "@polymarket-bot/storage-postgres": ["packages/storage-postgres/src/index.ts"]
+      "@polymarket-bot/storage-postgres": ["packages/storage-postgres/src/index.ts"],
+      "@polymarket-bot/storage-postgres/testing": ["packages/storage-postgres/src/testing/index.ts"]
     }
   },
   "include": ["."]

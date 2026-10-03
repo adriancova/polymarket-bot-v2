@@ -11,7 +11,7 @@
  * ```text
  * 1. checkControlApiSafety(env)      ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration ← ADR-020 D1-D4, §15 loopback
- * 3. construct the audit sink         ← in-memory, or the WP-040 ops tables
+ * 3. construct the audit sink         ← in-memory, behind the audit budget
  * 4. construct the control plane      ← audits before it applies
  * 5. bind loopback and serve
  * ```
@@ -39,11 +39,12 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
-import { InMemoryControlAuditLog, type ControlAuditSink } from "@polymarket-bot/observability";
+import type { ControlAuditSink } from "@polymarket-bot/observability";
 
 import { ControlApi, type ApiEnvironment } from "./api.js";
+import { createBudgetedAuditLog } from "./audit-budget.js";
 import { OperatorRegistry } from "./auth.js";
-import { ControlPlane } from "./control-plane.js";
+import { ControlPlane, type AuditRecordSource } from "./control-plane.js";
 import { parseControlApiConfig, type ControlApiConfig } from "./config.js";
 import {
   AbsentTraderHealthSource,
@@ -89,6 +90,27 @@ function processEnvironment(): ApiEnvironment {
     now: () => new Date().toISOString(),
     nextAuditRecordId: () => randomUUID(),
   };
+}
+
+/**
+ * The control plane the shipped process composes (`CONTROL-1b`): writing
+ * through `sink`, at PAPER, with the default append bound
+ * (`AUDIT_APPEND_TIMEOUT_MS`), and with every VOID record's instant and id
+ * drawn from `environment` (`control-plane.ts`, "An append is bounded").
+ *
+ * Exported so `main.test.ts` can prove that wiring with a sink that answers
+ * LATE: the shipped in-memory log answers at once, so the late path cannot be
+ * reached through `startup` itself, and a durable sink bound here later
+ * inherits exactly what that test pins.
+ */
+export function composeControlPlane(sink: ControlAuditSink, environment: AuditRecordSource): ControlPlane {
+  return new ControlPlane({
+    audit: sink,
+    runMode: CONTROL_API_RUN_MODE,
+    maximumRunMode: CONTROL_API_RUN_MODE,
+    repositoryMaximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
+    auditRecordSource: environment,
+  });
 }
 
 function healthSourceFor(config: ControlApiConfig): TraderHealthSource {
@@ -154,7 +176,9 @@ export async function startup(
 
   ports.log(
     `control API configuration accepted: ${String(config.operators.length)} operator(s), ` +
-      `audit bound ${String(config.auditCapacity)}, trader health source ${config.traderHealth.kind}`,
+      `audit bound ${String(config.auditCapacity)} (the last ${String(config.auditSafetyReserve)} ` +
+      `for kill-switch engages, the ${String(config.auditSafetyReserve)} before them for ` +
+      `safety-direction actions), trader health source ${config.traderHealth.kind}`,
   );
 
   if (!options.serve) {
@@ -163,14 +187,23 @@ export async function startup(
   }
 
   const environment = processEnvironment();
-  const audit = new InMemoryControlAuditLog(config.auditCapacity);
-  const sink: ControlAuditSink = audit;
-  const controlPlane = new ControlPlane({
-    audit: sink,
-    runMode: CONTROL_API_RUN_MODE,
-    maximumRunMode: CONTROL_API_RUN_MODE,
-    repositoryMaximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
+  // `CONTROL-1` (closing `WP-240` r1 M-3): the log sits behind the audit budget,
+  // so only a halt can use the capacity a halt needs (`audit-budget.ts`). No
+  // strategy instance is REGISTERED: no seam reaches a running trader's
+  // strategies yet, so the control plane knows none and refuses a pause or
+  // resume of any id `CONTROL_UNKNOWN_INSTANCE` rather than answering for an
+  // instance it cannot control (M-1; README, "the composition obligation").
+  const { log: audit, sink } = createBudgetedAuditLog({
+    capacity: config.auditCapacity,
+    safetyReserve: config.auditSafetyReserve,
   });
+  // `CONTROL-1b`: every append is bounded (`AUDIT_APPEND_TIMEOUT_MS`, the
+  // default), and an APPLIED record that lands after its bound is VOIDED by a
+  // record whose instant and id come from this process's environment
+  // (`composeControlPlane`). The in-memory log answers at once, so neither
+  // path is reachable in this composition today; `main.test.ts` pins the
+  // wiring with a sink that answers late.
+  const controlPlane = composeControlPlane(sink, environment);
   const health = new TraderHealthCache(healthSourceFor(config));
 
   const api = new ControlApi({
@@ -202,6 +235,21 @@ export async function startup(
   ports.log(
     `control API listening on ${config.bindHost}:${String(server.port)} — PAPER, no signer, ` +
       "no venue connection, no route that raises a run mode",
+  );
+  ports.log(
+    `server timeouts: headers ${String(server.timeouts.headersTimeoutMs)}ms, request ` +
+      `${String(server.timeouts.requestTimeoutMs)}ms, keep-alive ${String(server.timeouts.keepAliveTimeoutMs)}ms; ` +
+      "no strategy instance is registered (no seam reaches a running trader's strategies), so a " +
+      "pause or resume is refused CONTROL_UNKNOWN_INSTANCE",
+  );
+  // `CONTROL-1b` r1 (closing `CONTROL1B-R1-J-L1`): read from the control plane
+  // this process composed, so a composition that drops the void-record source
+  // says so here — and `shipped-root-control-1.test.ts` pins this line.
+  ports.log(
+    `audit append bound ${String(controlPlane.auditAppendTimeoutMs)}ms; an APPLIED record that lands after it gets ` +
+      (controlPlane.voidsLateAppliedRecords
+        ? "a VOID record from this process's clock and id source, when the sink and the audit budget admit one"
+        : "NO void record: no audit record source was composed"),
   );
   ports.log(
     config.traderHealth.kind === "http"

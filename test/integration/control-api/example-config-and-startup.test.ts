@@ -62,9 +62,14 @@ describe("the README does not overstate what ships", () => {
     expect(readme).toContain("No claim is made that a trader is on the other end");
   });
 
-  it("discloses that the PostgreSQL sink was never executed", () => {
-    expect(readme).toContain("No database was reached");
-    expect(readme).toContain("typecheck-pinned only");
+  it("discloses where the PostgreSQL sink has been executed, and that no composition binds it", () => {
+    // `CONTROL-1b`: the sink is now driven against a real PostgreSQL by an
+    // OPT-IN suite. The disclosure must say so — and must still say that the
+    // shipped process binds no durable sink and that CI does not run it.
+    expect(readme).toContain("reached by an opt-in suite, bound by no composition");
+    expect(readme).toContain("test:integration:postgres");
+    expect(readme).toContain("No composition binds the");
+    expect(readme).toContain("CI does not run it yet");
   });
 
   it("states all four safety defaults verbatim", () => {
@@ -91,6 +96,24 @@ describe("the README does not overstate what ships", () => {
       const [, path = ""] = route.split(" ");
       expect(readme, `the README omits ${route}`).toContain(path);
     }
+  });
+
+  it("CONTROL-1 (L-5): the README's route table is the ROUTER's table, row for row, grant for grant", async () => {
+    const { CONTROL_API_ROUTE_TABLE } = await import("@polymarket-bot/control-api");
+    const rows = readme
+      .split("\n")
+      .map((line) => /^\| `(GET|POST|PUT|PATCH|DELETE) (\/[^`]*)` \| `([A-Z_]+)` \|/u.exec(line))
+      .filter((match): match is RegExpExecArray => match !== null)
+      .map((match) => `${match[1] ?? ""} ${match[2] ?? ""} ${match[3] ?? ""}`);
+    expect(rows).toEqual(
+      CONTROL_API_ROUTE_TABLE.map((route) => `${route.method} ${route.path} ${route.grant}`),
+    );
+  });
+
+  it("CONTROL-1 (M-3): the README states the audit budget and the mutation-authority gate", () => {
+    expect(readme).toContain("## The audit budget");
+    expect(readme).toContain("auditSafetyReserve");
+    expect(readme).toContain("holds no mutation grant");
   });
 });
 
