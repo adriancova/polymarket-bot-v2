@@ -149,7 +149,7 @@ describe("trade events → FillReport and SettlementObservation", () => {
     expect(projection.shortfalls).toEqual(["TAKER_FEE_NOT_ON_STREAM"]);
   });
 
-  it("a MAKER trade: only the maker legs the transport affirmed are fills, at their own amount and price, with no fee", () => {
+  it("a MAKER trade: only the maker legs the transport affirmed are the account's; their settlement projects, their fill does not (D-13: the maker fee is per market)", () => {
     const projection = projectTradeEventForOms(
       tradeEvent({
         trader_side: "MAKER",
@@ -158,20 +158,12 @@ describe("trade events → FillReport and SettlementObservation", () => {
         maker_orders: [maker({ order_id: "mine", owner: FIXTURE_OWNER, side: "BUY", matched_amount: "10", price: "0.09" }), maker({ order_id: "theirs", side: "BUY" })],
       }),
     );
-    expect(projection.fills).toEqual([
-      {
-        venueTradeId: "trade-1",
-        venueOrderId: "mine",
-        shares: "10",
-        price: "0.09",
-        liquidityRole: "MAKER",
-        feeAmount: "0",
-        feeAssetId: null,
-        matchedAt: "2026-06-29T17:16:00.000Z",
-      },
+    // r1 (F-01): no exact maker fee is on the stream, so no fill, never a zero-fee one.
+    expect(projection.fills).toEqual([]);
+    expect(projection.settlements).toEqual([
+      { venueTradeId: "trade-1", venueOrderId: "mine", status: "MATCHED", transactionHash: null, observedAt: "2026-06-29T17:16:01.000Z" },
     ]);
-    expect(projection.settlements.map((settlement) => settlement.venueOrderId)).toEqual(["mine"]);
-    expect(projection.shortfalls).toEqual([]);
+    expect(projection.shortfalls).toEqual(["MAKER_FEE_NOT_ON_STREAM"]);
   });
 
   it("a MAKER trade whose ownership cannot be decided projects nothing for the undecided legs", () => {

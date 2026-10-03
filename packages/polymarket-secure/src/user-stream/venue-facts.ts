@@ -133,11 +133,24 @@ export const RECONNECT_GUIDANCE =
   "After reconnecting, fetch the account's open orders and recent trades from [Manage Orders], then resume applying new stream events from that refreshed state.";
 
 /**
- * Fees: "Makers are never charged fees. Only takers pay fees." (S-D19 line 27,
- * `verified-2026-09-16.md` §6, unchanged `verified-2026-09-30.md` §6). The
- * stream carries a fee RATE (`fee_rate_bps`), never a fee AMOUNT, and the fee
- * rounding direction is undocumented (U-16), so this adapter derives a fee
- * amount only where no arithmetic is needed: zero for a maker leg (this fact),
- * and zero for a taker leg whose rate is exactly zero.
+ * Fees. The fees page says "Makers are never charged fees. Only takers pay
+ * fees." (S-D19 line 27, `verified-2026-09-16.md` §6). The same section
+ * records drift D-13 (`verified-2026-09-16.md` §6, carried unchanged in
+ * `verified-2026-09-30.md` §6, S-D23): the market object publishes a
+ * per-market `feeSchedule { rate, exponent, takerOnly, rebateRate }`, where
+ * `takerOnly` is documented as "When `true`, fees are charged to the taker side
+ * only, and makers pay no fee." The blanket statement is therefore QUALIFIED
+ * by a per-market flag. The reports do not show that a `takerOnly: false`
+ * market exists; they do not rule one out either.
+ *
+ * THIS ADAPTER'S HANDLING. The user stream does not carry `takerOnly`, and it
+ * carries a fee RATE (`fee_rate_bps`), never a fee AMOUNT; the fee rounding
+ * direction is undocumented (U-16). So the adapter states a fee amount only
+ * where no reading is needed: zero for a taker leg whose rate is exactly
+ * zero. An own maker leg is never projected as a fill from the stream (the
+ * shortfall `MAKER_FEE_NOT_ON_STREAM`, which requests reconciliation): a zero
+ * maker fee is not established by the event. Projecting maker fills again
+ * needs either the market's `feeSchedule` beside the event or an orchestrator
+ * ruling that S-D19 controls.
  */
-export const MAKERS_ARE_NEVER_CHARGED_FEES = true as const;
+export const MAKER_FEE_IS_PER_MARKET = true as const;

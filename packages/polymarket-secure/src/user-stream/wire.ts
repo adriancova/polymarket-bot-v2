@@ -20,7 +20,9 @@
  * - TIMESTAMPS. `timestamp` is epoch milliseconds and `match_time`,
  *   `matchtime`, `last_update`, `created_at`, `expiration` are epoch seconds,
  *   all as digit strings (`/^\d+$/`, `verified-2026-08-24.md` §4). The exact
- *   wire text is kept beside the derived ISO-8601 instant.
+ *   wire text is kept beside the derived ISO-8601 instant. An instant outside
+ *   a plausible window (a client choice, {@link MIN_PLAUSIBLE_EPOCH_MS}) is
+ *   refused.
  * - IDENTIFIERS are carried exactly as received when they are safe tokens
  *   (`[A-Za-z0-9_\-:.]`, at most 200 characters: the OMS's venue-id grammar);
  *   anything else is refused, never altered.
@@ -44,8 +46,16 @@ const CONDITION_ID = /^0x(?:[0-9a-fA-F]{62}|[0-9a-fA-F]{64})$/u;
 /** A CTF token id (decimal) or a Polymarket V2 position id (hex); the same grammar as `venue-client.ts`. */
 const ASSET_ID = /^(?:[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
 const DIGITS = /^[0-9]{1,16}$/u;
-/** The largest epoch-millisecond value `Date` represents (ECMAScript §21.4.1.1). */
-const MAX_EPOCH_MS = 8_640_000_000_000_000;
+/**
+ * CLIENT CHOICE, not a venue fact: the plausible window for a venue instant,
+ * 2020-01-01T00:00:00Z (inclusive) to 2100-01-01T00:00:00Z (exclusive). The
+ * units follow the verified report (milliseconds for `timestamp`, seconds for
+ * the rest), so an instant outside the window is a unit slip (seconds read as
+ * milliseconds land in January 1970; milliseconds read as seconds land tens
+ * of thousands of years ahead) or garbage, and it is refused, never carried.
+ */
+export const MIN_PLAUSIBLE_EPOCH_MS = 1_577_836_800_000;
+export const MAX_PLAUSIBLE_EPOCH_MS = 4_102_444_800_000;
 
 export type DecimalRange = "NON_NEGATIVE" | "POSITIVE" | "UNIT_INTERVAL";
 
@@ -93,7 +103,7 @@ export interface VenueInstant {
 function instant(value: unknown, unitMs: number): VenueInstant | undefined {
   if (typeof value !== "string" || !DIGITS.test(value)) return undefined;
   const ms = Number(value) * unitMs;
-  if (!Number.isSafeInteger(ms) || ms > MAX_EPOCH_MS) return undefined;
+  if (!Number.isSafeInteger(ms) || ms < MIN_PLAUSIBLE_EPOCH_MS || ms >= MAX_PLAUSIBLE_EPOCH_MS) return undefined;
   return Object.freeze({ wire: value, iso: new Date(ms).toISOString() });
 }
 

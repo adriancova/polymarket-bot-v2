@@ -21,12 +21,21 @@
  *                     │ closed / connect timeout / send failed       │ no PONG within staleAfterMs
  *                     ▼                                              ▼
  *                DISCONNECTED ◀──────── closed / send failed ─────  STALE
- *                     │
+ *                     │                 │
+ *                     │                 └─ the credentials refused {@link MAX_CONSECUTIVE_AUTH_REJECTIONS}
+ *                     │                    times in a row ──▶ CLOSED
  *                     ▼ backoff scheduled
  *                RECONNECTING ──backoff elapsed──▶ CONNECTING
  *
  * any state ──stop or fault──▶ CLOSED (terminal)
  * ```
+ *
+ * AUTHENTICATION FAILURES. An `AUTH_REJECTED` loss requests reconciliation
+ * and reconnects like any other loss, but the manager stops re-sending the
+ * credentialed subscription once the credentials have been refused
+ * {@link MAX_CONSECUTIVE_AUTH_REJECTIONS} times in a row with no recognized
+ * message (a `PONG`, an order or a trade event) in between: it then closes
+ * (a client choice; the venue documents no policy).
  *
  * RECONCILIATION, AND WHAT THIS ADAPTER DOES NOT DO. The venue states that
  * real-time updates do not replace authoritative account reads and do not
@@ -46,12 +55,22 @@
  * - for markets added to a live subscription (`MARKETS_ADDED`);
  * - for every gap in what it could apply: an unrecognized message, and an
  *   event the OMS projection could not fully apply (`oms-projection.ts`);
+ * - for every order or trade event the listener failed to take (it threw):
+ *   `EVENT_NOT_DELIVERED`, naming the event's market and identifiers;
  * - when the owner stops a live stream, and when the manager faults.
  *
  * Every request is emitted to the listener AND kept in a backlog until the
- * consumer acknowledges it, so a listener failure cannot lose one. The backlog
- * is bounded: when it is full, one `BACKLOG_OVERFLOW` request (covering every
- * subscribed market) stands for everything after it.
+ * consumer acknowledges it, so a listener failure cannot lose one, and an
+ * event the listener failed to take becomes a request of its own. The backlog
+ * is bounded: when it is full, ONE `BACKLOG_OVERFLOW` request stands for
+ * everything that did not fit. Each request that does not fit REPLACES it
+ * with a new one (a new id) that covers the union of the markets the previous
+ * one covered, the markets of the request that did not fit and every
+ * subscribed market, at the newest subscription generation and after the
+ * newest loss. Acknowledging a replaced overflow request clears nothing (its
+ * id is unknown by then). If that union outgrows
+ * {@link MAX_OVERFLOW_MARKETS}, the manager faults closed rather than grow
+ * without bound.
  *
  * NOTHING THROWS after construction: every port call, timer call, clock read
  * and listener call is contained, and what they throw is dropped unread.
@@ -121,6 +140,7 @@ export const RECONCILIATION_CAUSES = [
   "MARKETS_ADDED",
   "UNRECOGNIZED_MESSAGE",
   "EVENT_NOT_FULLY_APPLICABLE",
+  "EVENT_NOT_DELIVERED",
   "STREAM_STOPPED",
   "MANAGER_FAULT",
   "BACKLOG_OVERFLOW",
@@ -131,7 +151,10 @@ export type ReconciliationCause = (typeof RECONCILIATION_CAUSES)[number];
 export interface UserStreamReconciliationRequest {
   readonly requestId: string;
   readonly cause: ReconciliationCause;
-  /** For `RESUBSCRIBED`: the loss that preceded this subscription. */
+  /**
+   * For `RESUBSCRIBED`: the loss that preceded this subscription. For
+   * `BACKLOG_OVERFLOW`: the newest loss when it was (re)built, if any.
+   */
   readonly afterLoss: StreamLossCause | null;
   /** The condition ids the read must cover. */
   readonly markets: readonly string[];
@@ -140,7 +163,7 @@ export interface UserStreamReconciliationRequest {
   readonly shortfalls: readonly ProjectionShortfall[];
   /** For `UNRECOGNIZED_MESSAGE`: the reason code. */
   readonly unrecognized: UnrecognizedMessageReason | null;
-  /** For an event-level request: the identifiers the event named, exactly. */
+  /** For an event-level request (`EVENT_NOT_FULLY_APPLICABLE`, `EVENT_NOT_DELIVERED`): the identifiers the event named, exactly. */
   readonly venueOrderIds: readonly string[];
   readonly venueTradeId: string | null;
   /** From the injected clock; `null` when the clock could not be read. */
@@ -223,6 +246,10 @@ export interface UserStreamManager {
 /** Client guards (no venue fact bounds these). */
 export const MAX_SUBSCRIBED_MARKETS = 1_000;
 export const MAX_PENDING_RECONCILIATION_REQUESTS = 1_024;
+/** The most markets the one `BACKLOG_OVERFLOW` request may cover before the manager faults closed. */
+export const MAX_OVERFLOW_MARKETS = 10 * MAX_SUBSCRIBED_MARKETS;
+/** CLIENT CHOICE: refused credentials, in a row with no recognized message between, before the manager closes. */
+export const MAX_CONSECUTIVE_AUTH_REJECTIONS = 3;
 const MAX_TIMING_MS = 3_600_000;
 
 // ---------------------------------------------------------------------------
@@ -305,7 +332,9 @@ function timing(value: unknown, fallback: number, min: number): number {
 
 /**
  * The ONLY way to build a user-stream manager. Runs WP-260's run-mode gate
- * first; nothing is read from `transport` unless the gate permits.
+ * first; nothing is read from `transport` unless the gate permits. The gate
+ * guards this manager's use of the port, not the port's own construction
+ * (`socket-port.ts`).
  *
  * @throws {SignerBoundaryRefusal} when the gate refuses (every PAPER process).
  * @throws {UserStreamConfigurationError} for an invalid option.
@@ -384,9 +413,35 @@ interface Connection {
   handle: unknown;
   retired: boolean;
   frameSequence: number;
+  /** The markets this connection's frames have subscribed it to; `null` until its subscription frame is sent. */
+  subscribed: Set<string> | null;
 }
 
 type TimerSlot = "connect" | "ping" | "stale" | "backoff";
+
+interface TimerEntry {
+  handle: unknown;
+  /** True while `setTimeout` is running for this entry. */
+  scheduling: boolean;
+  firedWhileScheduling: boolean;
+}
+
+type EventOutput = Extract<UserStreamOutput, { readonly kind: "ORDER" | "TRADE" }>;
+
+/** The scope of an event-level request: the event's market and the identifiers it named, exactly. */
+function eventScope(output: EventOutput): {
+  readonly markets: readonly string[];
+  readonly venueOrderIds: readonly string[];
+  readonly venueTradeId?: string;
+} {
+  if (output.kind === "ORDER") return { markets: [output.event.market], venueOrderIds: [output.event.venueOrderId] };
+  const event = output.event;
+  return {
+    markets: [event.market],
+    venueOrderIds: [event.takerOrderId, ...(event.makerOrders ?? []).map((maker) => maker.venueOrderId)],
+    venueTradeId: event.venueTradeId,
+  };
+}
 
 /** An internal invariant failure: the manager faults (fail closed). */
 class ManagerFault extends Error {}
@@ -410,10 +465,14 @@ class SubscriptionManager implements UserStreamManager {
   #generation = 0;
   #current: Connection | null = null;
   #markets: string[];
-  readonly #timers = new Map<TimerSlot, { readonly token: object; readonly handle: unknown }>();
+  readonly #timers = new Map<TimerSlot, TimerEntry>();
   #backoffMs: number;
   #lastLoss: StreamLossCause | null = null;
+  #consecutiveAuthRejections = 0;
   readonly #pending = new Map<string, UserStreamReconciliationRequest>();
+  /** The id of the one `BACKLOG_OVERFLOW` request in `#pending`, if any. */
+  #overflowId: string | null = null;
+  #overflowFaultQueued = false;
   #requestCounter = 0;
   readonly #outbox: UserStreamOutput[] = [];
   readonly #deferred: (() => void)[] = [];
@@ -466,21 +525,23 @@ class SubscriptionManager implements UserStreamManager {
     });
   }
 
+  /*
+   * Market changes are validated AND applied to the market list at once, at the call, so a later call
+   * (one made from inside a port call or a listener included) always sees every earlier one. Only the
+   * frames wait for a step: `#syncSubscription` sends the live connection the difference between what
+   * it is subscribed to and the market list, so queued changes can neither be lost nor sent twice.
+   */
+
   addMarkets(markets: readonly string[]): MarketChange {
     if (this.#state === "CLOSED") return Object.freeze({ ok: false, reason: "CLOSED" });
     const requested = readMarkets(markets, false);
     if (requested === undefined) return Object.freeze({ ok: false, reason: "INVALID_MARKETS" });
     const added = requested.filter((market) => !this.#markets.includes(market));
     if (this.#markets.length + added.length > MAX_SUBSCRIBED_MARKETS) return Object.freeze({ ok: false, reason: "INVALID_MARKETS" });
-    this.#run(() => {
+    if (added.length > 0) {
       this.#markets.push(...added);
-      const connection = this.#current;
-      // Not subscribed: the next subscription frame carries them, and its own request covers them.
-      if (added.length === 0 || this.#state !== "SUBSCRIBED" || connection === null) return;
-      const copy = Object.freeze([...added]);
-      if (!this.#send(connection, (handle) => (handle as UserSocketConnection).updateSubscription("subscribe", copy))) return;
-      this.#request("MARKETS_ADDED", { markets: copy });
-    });
+      this.#run(() => this.#syncSubscription());
+    }
     return Object.freeze({ ok: true, changed: Object.freeze([...added]) });
   }
 
@@ -492,13 +553,10 @@ class SubscriptionManager implements UserStreamManager {
     // An empty `markets` list is not "no markets": the venue makes the list optional, and an
     // undocumented reading of an empty one is not something to rely on.
     if (removed.length === this.#markets.length) return Object.freeze({ ok: false, reason: "WOULD_EMPTY_SUBSCRIPTION" });
-    this.#run(() => {
+    if (removed.length > 0) {
       this.#markets = this.#markets.filter((market) => !removed.includes(market));
-      const connection = this.#current;
-      if (removed.length === 0 || this.#state !== "SUBSCRIBED" || connection === null) return;
-      const copy = Object.freeze([...removed]);
-      this.#send(connection, (handle) => (handle as UserSocketConnection).updateSubscription("unsubscribe", copy));
-    });
+      this.#run(() => this.#syncSubscription());
+    }
     return Object.freeze({ ok: true, changed: Object.freeze([...removed]) });
   }
 
@@ -507,7 +565,9 @@ class SubscriptionManager implements UserStreamManager {
   }
 
   acknowledgeReconciliationRequest(requestId: string): boolean {
-    return this.#pending.delete(requestId);
+    const known = this.#pending.delete(requestId);
+    if (known && requestId === this.#overflowId) this.#overflowId = null;
+    return known;
   }
 
   diagnostics(): UserStreamDiagnostics {
@@ -518,10 +578,12 @@ class SubscriptionManager implements UserStreamManager {
 
   /**
    * Run one step. Steps never interleave: a step requested while another runs
-   * (a port handler or a timer firing synchronously inside a port or timer
-   * call, or a public method called from inside one) is queued and runs after
-   * it. An internal fault closes the manager. When no step is running, every
-   * queued output is delivered, in order.
+   * (a port handler called synchronously inside a port call, an earlier timer
+   * firing inside one, or a public method called from inside one) is queued
+   * and runs after it. A timer that fires inside its OWN `setTimeout` call is
+   * not queued: it breaks the timers contract, and the manager faults
+   * (`#schedule`). An internal fault closes the manager. When no step is
+   * running, every queued output is delivered, in order.
    */
   #run(step: () => void): void {
     if (this.#depth > 0) {
@@ -548,11 +610,17 @@ class SubscriptionManager implements UserStreamManager {
     this.#flushing = true;
     try {
       for (let output = this.#outbox.shift(); output !== undefined; output = this.#outbox.shift()) {
+        const delivered = output;
         try {
-          this.#settings.listener(output);
+          this.#settings.listener(delivered);
         } catch {
-          // Dropped unread. A reconciliation request stays in the backlog until acknowledged.
+          // Dropped unread. A reconciliation request stays in the backlog until acknowledged; an order or
+          // trade event the listener did not take becomes a request of its own (delivered next, in this
+          // loop). A failure on that request, or on any other output, makes no further request.
           this.#counts.listenerFailures += 1;
+          if (delivered.kind === "ORDER" || delivered.kind === "TRADE") {
+            this.#run(() => this.#request("EVENT_NOT_DELIVERED", eventScope(delivered)));
+          }
         }
       }
     } finally {
@@ -596,21 +664,30 @@ class SubscriptionManager implements UserStreamManager {
 
   #schedule(slot: TimerSlot, delayMs: number, fire: () => void): void {
     this.#cancel(slot);
-    const token = {};
+    const entry: TimerEntry = { handle: undefined, scheduling: true, firedWhileScheduling: false };
     const callback = (): void => {
-      const entry = this.#timers.get(slot);
-      if (entry === undefined || entry.token !== token) return;
+      if (this.#timers.get(slot) !== entry) return; // cancelled or replaced: a no-op
+      if (entry.scheduling) {
+        entry.firedWhileScheduling = true;
+        return;
+      }
       this.#timers.delete(slot);
       this.#run(fire);
     };
-    let handle: unknown;
+    // Registered BEFORE `setTimeout` runs, so a fire inside it is seen rather than dropped.
+    this.#timers.set(slot, entry);
     try {
-      handle = this.#settings.setTimer(callback, delayMs);
+      entry.handle = this.#settings.setTimer(callback, delayMs);
     } catch {
+      if (this.#timers.get(slot) === entry) this.#timers.delete(slot);
       // Without its timers the manager cannot keep its guarantees: fault (fail closed).
       throw new ManagerFault();
+    } finally {
+      entry.scheduling = false;
     }
-    this.#timers.set(slot, { token, handle });
+    // A timer that fires inside its own `setTimeout` makes every delay zero; honouring it could spin the
+    // reconnect loop without end. The timers port is broken: fault (fail closed).
+    if (entry.firedWhileScheduling) throw new ManagerFault();
   }
 
   #cancel(slot: TimerSlot): void {
@@ -620,7 +697,7 @@ class SubscriptionManager implements UserStreamManager {
     try {
       this.#settings.clearTimer(entry.handle);
     } catch {
-      // The token check makes a timer that still fires a no-op.
+      // The entry check in the callback makes a timer that still fires a no-op.
     }
   }
 
@@ -628,7 +705,7 @@ class SubscriptionManager implements UserStreamManager {
 
   #connect(): void {
     this.#generation += 1;
-    const connection: Connection = { generation: this.#generation, handle: undefined, retired: false, frameSequence: 0 };
+    const connection: Connection = { generation: this.#generation, handle: undefined, retired: false, frameSequence: 0, subscribed: null };
     this.#current = connection;
     this.#transition("CONNECTING", null);
     this.#schedule("connect", this.#settings.connectTimeoutMs, () => this.#lose(connection, "CONNECT_TIMEOUT"));
@@ -700,6 +777,7 @@ class SubscriptionManager implements UserStreamManager {
     const markets = Object.freeze([...this.#markets]);
     // "Send the subscription frame immediately after connecting" (S-D16). The port adds the credentials.
     if (!this.#send(connection, (handle) => (handle as UserSocketConnection).subscribe(markets))) return;
+    connection.subscribed = new Set(markets);
     this.#transition("SUBSCRIBED", null);
     this.#backoffMs = this.#settings.initialBackoffMs;
     this.#schedule("stale", this.#settings.staleAfterMs, () => this.#onStale(connection));
@@ -707,6 +785,29 @@ class SubscriptionManager implements UserStreamManager {
     // The stream never holds what happened before this subscription: the read must follow it.
     if (this.#lastLoss === null) this.#request("SUBSCRIPTION_STARTED", { markets });
     else this.#request("RESUBSCRIBED", { markets, afterLoss: this.#lastLoss });
+  }
+
+  /**
+   * Bring the live connection's subscription to the market list: only the
+   * difference is sent, additions first (so the connection is never left
+   * subscribed to nothing), and the added markets request reconciliation.
+   */
+  #syncSubscription(): void {
+    const connection = this.#current;
+    // Not subscribed: the next subscription frame carries the market list, and its own request covers it.
+    if (this.#state !== "SUBSCRIBED" || connection === null || connection.subscribed === null) return;
+    const subscribed = connection.subscribed;
+    const added = Object.freeze(this.#markets.filter((market) => !subscribed.has(market)));
+    const removed = Object.freeze([...subscribed].filter((market) => !this.#markets.includes(market)));
+    if (added.length > 0) {
+      if (!this.#send(connection, (handle) => (handle as UserSocketConnection).updateSubscription("subscribe", added))) return;
+      for (const market of added) subscribed.add(market);
+      this.#request("MARKETS_ADDED", { markets: added });
+    }
+    if (removed.length > 0) {
+      if (!this.#send(connection, (handle) => (handle as UserSocketConnection).updateSubscription("unsubscribe", removed))) return;
+      for (const market of removed) subscribed.delete(market);
+    }
   }
 
   #schedulePing(connection: Connection): void {
@@ -722,7 +823,10 @@ class SubscriptionManager implements UserStreamManager {
     this.#lose(connection, "HEARTBEAT_STALE");
   }
 
-  /** The stream is lost: retire the connection, request reconciliation, schedule the reconnect. */
+  /**
+   * The stream is lost: retire the connection, request reconciliation, and schedule the reconnect, or,
+   * once the credentials have been refused too often in a row, close.
+   */
   #lose(connection: Connection, cause: StreamLossCause): void {
     if (connection.retired || connection !== this.#current) return;
     connection.retired = true;
@@ -734,6 +838,15 @@ class SubscriptionManager implements UserStreamManager {
     this.#transition("DISCONNECTED", cause);
     this.#lastLoss = cause;
     this.#request(cause, {});
+    if (cause === "AUTH_REJECTED") {
+      this.#consecutiveAuthRejections += 1;
+      if (this.#consecutiveAuthRejections >= MAX_CONSECUTIVE_AUTH_REJECTIONS) {
+        // The credentials keep being refused: stop re-sending them (fail closed). The request above stands.
+        for (const slot of [...this.#timers.keys()]) this.#cancel(slot);
+        this.#transition("CLOSED", cause);
+        return;
+      }
+    }
     this.#transition("RECONNECTING", null);
     const delay = this.#backoffMs;
     this.#backoffMs = Math.min(this.#backoffMs * 2, this.#settings.maxBackoffMs);
@@ -771,6 +884,8 @@ class SubscriptionManager implements UserStreamManager {
         indexInFrame,
         receivedAt,
       });
+      // A recognized message is evidence that the server took the subscription and its credentials.
+      if (message.kind !== "UNRECOGNIZED") this.#consecutiveAuthRejections = 0;
       switch (message.kind) {
         case "PONG":
           this.#counts.pongsReceived += 1;
@@ -794,13 +909,7 @@ class SubscriptionManager implements UserStreamManager {
           this.#counts.tradesEmitted += 1;
           this.#emit({ kind: "TRADE", event: message.event, oms, receipt });
           if (oms.shortfalls.length > 0) {
-            const event = message.event;
-            this.#request("EVENT_NOT_FULLY_APPLICABLE", {
-              markets: [event.market],
-              shortfalls: oms.shortfalls,
-              venueOrderIds: [event.takerOrderId, ...(event.makerOrders ?? []).map((maker) => maker.venueOrderId)],
-              venueTradeId: event.venueTradeId,
-            });
+            this.#request("EVENT_NOT_FULLY_APPLICABLE", { ...eventScope({ kind: "TRADE", event: message.event, oms, receipt }), shortfalls: oms.shortfalls });
           }
           break;
         }
@@ -828,14 +937,37 @@ class SubscriptionManager implements UserStreamManager {
   ): void {
     const request = this.#makeRequest(cause, detail);
     this.#counts.reconciliationRequests += 1;
-    if (this.#pending.size < MAX_PENDING_RECONCILIATION_REQUESTS - 1) {
-      this.#pending.set(request.requestId, request);
-    } else if (![...this.#pending.values()].some((held) => held.cause === "BACKLOG_OVERFLOW")) {
-      // The backlog is full: one request covering every subscribed market stands for everything after it.
-      const overflow = this.#makeRequest("BACKLOG_OVERFLOW", {});
-      this.#pending.set(overflow.requestId, overflow);
-    }
+    // One slot is kept for the overflow request.
+    const held = this.#pending.size - (this.#overflowId === null ? 0 : 1);
+    if (held < MAX_PENDING_RECONCILIATION_REQUESTS - 1) this.#pending.set(request.requestId, request);
+    else this.#mergeIntoOverflow(request);
     this.#emit({ kind: "RECONCILIATION_REQUESTED", request });
+  }
+
+  /**
+   * The backlog is full. The one `BACKLOG_OVERFLOW` request is REPLACED, under
+   * a new id, by one that covers the markets the previous one covered, the
+   * markets of `request`, and every subscribed market, at the current
+   * subscription generation and after the newest loss. The replaced id is
+   * unknown from then on, so acknowledging it clears nothing newer.
+   */
+  #mergeIntoOverflow(request: UserStreamReconciliationRequest): void {
+    const previous = this.#overflowId === null ? undefined : this.#pending.get(this.#overflowId);
+    const markets = new Set<string>(previous?.markets ?? []);
+    for (const market of request.markets) markets.add(market);
+    for (const market of this.#markets) markets.add(market);
+    if (previous !== undefined) this.#pending.delete(previous.requestId);
+    const overflow = this.#makeRequest("BACKLOG_OVERFLOW", { markets: [...markets], ...(this.#lastLoss === null ? {} : { afterLoss: this.#lastLoss }) });
+    this.#pending.set(overflow.requestId, overflow);
+    this.#overflowId = overflow.requestId;
+    if (markets.size > MAX_OVERFLOW_MARKETS && this.#state !== "CLOSED" && !this.#overflowFaultQueued) {
+      // The union would grow without bound: fail closed. A closed manager adds little after that: its own
+      // markets, and those of events still being handed to the listener.
+      this.#overflowFaultQueued = true;
+      this.#run(() => {
+        this.#fault();
+      });
+    }
   }
 
   #makeRequest(

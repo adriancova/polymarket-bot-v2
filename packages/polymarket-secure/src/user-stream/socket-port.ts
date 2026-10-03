@@ -19,6 +19,12 @@
  * gate before it reads the port (`manager.ts`), so in PAPER no port method is
  * ever called.
  *
+ * WHAT THE GATE DOES NOT COVER. The manager's gate guards the manager's USE of
+ * a port. It cannot guard the CONSTRUCTION of a port: a binding that holds
+ * credentials exists before the manager sees it. A live binding must
+ * therefore run its own gate check before it reads any credential (inside
+ * this package, behind WP-260's signer gate); no such binding exists today.
+ *
  * Contract for an implementation:
  *
  * - `connect` starts ONE connection attempt and returns its handle at once;
@@ -82,7 +88,9 @@ export interface AuthenticatedUserSocketPort {
    * Optional: `true` only when `owner` (a maker order's `owner` field) is the
    * API-key identity this transport authenticates as. Only the port, which
    * holds the credential, can answer; the manager keeps only the verdict.
-   * Without it, maker legs are `UNDETERMINED` and never projected as fills.
+   * Without it, maker legs are `UNDETERMINED`: never projected as fills, and
+   * every trade event that names one requests reconciliation
+   * (`MAKER_LEG_OWNERSHIP_UNDETERMINED`), on either side of the trade.
    */
   isAccountOwner?(owner: string): boolean;
 }

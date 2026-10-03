@@ -29,6 +29,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { REDACTED, redactForLog } from "../redaction.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../testing/network-tripwire.js";
 
+import { MAX_FRAME_CHARACTERS } from "./normalize.js";
 import { isUserStreamSensitiveKey, redactUserStreamPayload } from "./redaction.js";
 import { FIXTURE_MARKET, openUserStream } from "./testing/harness.js";
 
@@ -242,6 +243,48 @@ describe("every user-stream payload is redacted", () => {
     },
     60_000,
   );
+
+  it(
+    "r1 F-02: a RAW TEXT frame is never returned as given: JSON text comes back as redacted JSON text, free text as the placeholder",
+    () => {
+      const random = mulberry32(SEED);
+      let textFrames = 0;
+      let jsonFrames = 0;
+      for (let index = 0; index < CASES; index += 1) {
+        const generated = generate(random, index);
+        const redacted = redactUserStreamPayload(generated.frame);
+        expect(typeof redacted).toBe("string");
+        expect(leaks(redacted, generated.credentials)).toEqual([]);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(generated.frame);
+        } catch {
+          textFrames += 1;
+          // Free text cannot be vetted: nothing of it survives, not even the secrets in value positions.
+          expect(redacted).toBe(REDACTED);
+          expect(leaks(redacted, generated.secrets)).toEqual([]);
+          continue;
+        }
+        jsonFrames += 1;
+        expect(JSON.parse(String(redacted))).toEqual(redactUserStreamPayload(parsed));
+      }
+      expect(textFrames).toBeGreaterThan(0);
+      expect(jsonFrames).toBeGreaterThan(CASES / 2);
+    },
+    60_000,
+  );
+
+  it("r1 F-02: the heartbeat frames are kept; a JSON scalar or an over-long frame becomes the placeholder; an owner in JSON text is redacted", () => {
+    expect(redactUserStreamPayload("PONG")).toBe("PONG");
+    expect(redactUserStreamPayload("PING")).toBe("PING");
+    expect(redactUserStreamPayload('"fake-owner-s"')).toBe(REDACTED);
+    expect(redactUserStreamPayload("12345")).toBe(REDACTED);
+    expect(redactUserStreamPayload(JSON.stringify({ owner: "fake-owner-long", pad: "y".repeat(MAX_FRAME_CHARACTERS) }))).toBe(REDACTED);
+    const owner = "11111111-2222-3333-4444-555555555555";
+    const redacted = redactUserStreamPayload(JSON.stringify({ event_type: "order", owner, market: FIXTURE_MARKET }));
+    expect(String(redacted)).not.toContain(owner);
+    expect(JSON.parse(String(redacted))).toEqual({ event_type: "order", owner: REDACTED, market: FIXTURE_MARKET });
+  });
 
   it("the subscription frame's credentials are redacted; its markets are kept", () => {
     const frame = { auth: { apiKey: "fake-api-key-1", secret: "fake-secret-1", passphrase: "fake-passphrase-1" }, type: "user", markets: [FIXTURE_MARKET] };

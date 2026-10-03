@@ -11,8 +11,9 @@
  * 2. delivered as a frame through the subscription manager over a fake
  *    socket port, which must emit the normalized event, its OMS projection,
  *    and no reconciliation request for a fully applicable event;
- * 3. redacted: no output, and no `redactUserStreamPayload` copy, carries the
- *    fixtures' API-key owner placeholder.
+ * 3. redacted: no output, and no `redactUserStreamPayload` copy (of the parsed
+ *    payload or of its text frame), carries the fixtures' API-key owner
+ *    placeholder.
  *
  * C-3: each trade-status lexeme of the REST fixture `orders/rest-trades.json`
  * is grafted onto a user-channel trade: the prefixed spellings of verified
@@ -235,6 +236,8 @@ describe("every user-ws fixture example parses into a normalized event (acceptan
         expect(JSON.stringify(example.payload)).toContain(FIXTURE_OWNER); // the detector can see it
         h.port.latest.deliver(JSON.stringify(example.payload));
         expect(JSON.stringify(redactUserStreamPayload(example.payload))).not.toContain(FIXTURE_OWNER);
+        // r1 F-02: the raw TEXT frame too (a WebSocket payload is text).
+        expect(String(redactUserStreamPayload(JSON.stringify(example.payload)))).not.toContain(FIXTURE_OWNER);
       }
     }
     expect(JSON.stringify(h.outputs)).not.toContain(FIXTURE_OWNER);

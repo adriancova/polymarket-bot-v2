@@ -12,8 +12,11 @@
  * key) holding orders whose venue ids are the fixtures' ids, and the OMS
  * accepts every one: the order lifecycle moves LIVE → (MATCHED observed) →
  * CANCELED; the taker trade records its fill and settles MATCHED → MINED →
- * CONFIRMED; a maker trade records its fill and settles RETRYING → FAILED,
- * which the OMS raises as its halting SETTLEMENT_FAILED alert. A settlement
+ * CONFIRMED; a maker trade's MATCHED event projects its settlement and a
+ * shortfall rather than a fill (the maker fee is per market, D-13), and once
+ * the fill is known (a stand-in for the reconciler's read) the stream's
+ * settlements apply, RETRYING → FAILED, which the OMS raises as its halting
+ * SETTLEMENT_FAILED alert. A settlement
  * event that carries no fill facts is refused by the OMS until the fill is
  * known (`OMS_UNKNOWN_FILL`), which is why every stream gap requests
  * reconciliation.
@@ -135,7 +138,7 @@ describe("the projections are inputs the real OMS takes", () => {
     expect(h.manager.order(orderId)).toMatchObject({ state: "FILLED", filledShares: "40" });
   });
 
-  it("maker side: a MATCHED maker leg records its fill; the RETRYING and FAILED fixtures then settle it, and FAILED halts", async () => {
+  it("maker side: the MATCHED maker leg is a shortfall (no exact maker fee on the stream, D-13); once the fill is known, the RETRYING and FAILED fixtures settle it, and FAILED halts", async () => {
     const h = await openHarness();
     await place(h, 3, id("feed0007"), "BUY", "10", "0.09");
     const trades = await examples("trade-settlement.json");
@@ -149,12 +152,25 @@ describe("the projections are inputs the real OMS takes", () => {
     const refused = await h.manager.applySettlement(asSettlement(early.settlements[0] as OmsSettlementObservation));
     expect(refused.ok === false && refused.refusal.code).toBe("OMS_UNKNOWN_FILL");
 
-    // A MATCHED event for the same trade (built from the RETRYING fixture, with the match time a MATCHED event carries).
+    // A MATCHED event for the same trade (built from the RETRYING fixture, with the match time a MATCHED event carries):
+    // the maker fee depends on the market's `feeSchedule.takerOnly`, which the stream does not carry, so the stream
+    // projects the settlement and a shortfall (a reconciliation request), never a fill with a guessed fee.
     const matched = tradeProjection({ ...retrying, status: "MATCHED", match_time: "1782753379" });
-    expect(matched.fills).toEqual([
-      expect.objectContaining({ venueOrderId: id("feed0007"), shares: "10", price: "0.09", liquidityRole: "MAKER", feeAmount: "0" }),
-    ]);
-    for (const fill of matched.fills) expect((await h.manager.recordFill(asFill(fill))).ok).toBe(true);
+    expect(matched.fills).toEqual([]);
+    expect(matched.shortfalls).toEqual(["MAKER_FEE_NOT_ON_STREAM"]);
+    expect(matched.settlements).toEqual([expect.objectContaining({ venueOrderId: id("feed0007"), status: "MATCHED" })]);
+
+    // The reconciler (WP-290) records the fill from its authoritative read. This stand-in carries only the facts
+    // the event fixed (the fee is whatever that read establishes, so none is stated here).
+    const fromAuthoritativeRead: FillReport = {
+      venueTradeId: "00000000-0000-0000-0000-00000000t002",
+      venueOrderId: id("feed0007"),
+      shares: "10",
+      price: "0.09",
+      liquidityRole: "MAKER",
+      matchedAt: "2026-06-29T17:16:19.000Z",
+    };
+    expect((await h.manager.recordFill(fromAuthoritativeRead)).ok).toBe(true);
     const states: string[] = [];
     for (const projection of [matched, early, tradeProjection(failed)]) {
       for (const settlement of projection.settlements) {

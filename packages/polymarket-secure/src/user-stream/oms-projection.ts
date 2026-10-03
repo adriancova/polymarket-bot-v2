@@ -22,13 +22,24 @@
  * - Which side of a trade is the account's comes from `trader_side`. A TAKER
  *   trade's own leg is the taker order. A MAKER trade's own legs are the maker
  *   orders the transport's `isAccountOwner` affirmed; an undetermined leg is
- *   never projected.
+ *   never projected. On EITHER side, a maker leg whose ownership is
+ *   undetermined (no predicate, a throw, a non-boolean verdict) is a
+ *   shortfall: on a TAKER trade it could be a same-account match, or a sign
+ *   that `trader_side` was misread, and neither can be ruled out here. The
+ *   taker fill of a TAKER trade is still projected beside that shortfall. The
+ *   backstop for the `trader_side` reading is the OMS: it keys every fill by
+ *   venue order id and refuses, with a halting alert, a fill on an id it did
+ *   not place, so a misread side cannot credit another account's order to
+ *   ours (WP-270 `recordFill`).
  * - A fill is projected only with its match time (`match_time`/`matchtime`)
  *   and with an exact fee AMOUNT. The stream carries only a fee RATE, and the
  *   fee rounding direction is undocumented (U-16), so the amount is known
- *   exactly in two cases only: a maker leg (makers are never charged fees,
- *   `venue-facts.ts`) and a taker leg whose rate is exactly zero. A taker fill
- *   with a non-zero or absent rate is a shortfall, never a zero-fee fill.
+ *   exactly in one case only: a taker leg whose rate is exactly zero. A taker
+ *   fill with a non-zero or absent rate is a shortfall, never a zero-fee fill.
+ *   An own MAKER leg is a shortfall too (`MAKER_FEE_NOT_ON_STREAM`): makers
+ *   pay no fee on a market whose `feeSchedule.takerOnly` is true (D-13), the
+ *   stream does not carry that flag, and so a maker fee of zero is not a fact
+ *   this event establishes (`venue-facts.ts`, `MAKER_FEE_IS_PER_MARKET`).
  * - A taker fill is projected only when the maker legs fix its economics
  *   without any reading of trade-level semantics: every maker leg is on the
  *   same asset, on the opposite side and at the trade price, and the matched
@@ -95,6 +106,7 @@ export const PROJECTION_SHORTFALLS = [
   "MATCH_TIME_ABSENT",
   "TAKER_ECONOMICS_UNVERIFIABLE",
   "TAKER_FEE_NOT_ON_STREAM",
+  "MAKER_FEE_NOT_ON_STREAM",
   "FILL_SIZE_NOT_POSITIVE",
 ] as const;
 export type ProjectionShortfall = (typeof PROJECTION_SHORTFALLS)[number];
@@ -145,6 +157,8 @@ function ownLegs(event: NormalizedTradeEvent, shortfalls: ProjectionShortfall[])
   if (event.traderSide.value === "TAKER") {
     // Same-account matching is a registered venue-fact gap; an own maker leg on our own taker trade is not judged here.
     if (makers.some((maker) => maker.account === "OWN")) shortfalls.push("OWN_MAKER_LEG_ON_TAKER_TRADE");
+    // An undetermined leg could be the same case, or a misread `trader_side`: it cannot pass unremarked.
+    if (makers.some((maker) => maker.account === "UNDETERMINED")) shortfalls.push("MAKER_LEG_OWNERSHIP_UNDETERMINED");
     return [{ role: "TAKER", venueOrderId: event.takerOrderId, maker: null }];
   }
   const own = makers.filter((maker) => maker.account === "OWN");
@@ -203,30 +217,29 @@ export function projectTradeEventForOms(event: NormalizedTradeEvent): TradeProje
       fillShortfall("MATCH_TIME_ABSENT");
       continue;
     }
-    let facts: { readonly shares: DecimalString; readonly price: DecimalString; readonly feeAmount: DecimalString };
-    if (leg.maker === null) {
-      const taker = takerFill(event);
-      if (typeof taker === "string") {
-        fillShortfall(taker);
-        continue;
-      }
-      facts = { shares: taker.shares, price: event.price, feeAmount: taker.feeAmount };
-    } else {
+    if (leg.maker !== null) {
       if (compareDecimals(leg.maker.matchedAmount, "0") <= 0) {
         fillShortfall("FILL_SIZE_NOT_POSITIVE");
         continue;
       }
-      // Makers are never charged fees (venue-facts.ts, MAKERS_ARE_NEVER_CHARGED_FEES).
-      facts = { shares: leg.maker.matchedAmount, price: leg.maker.price, feeAmount: "0" };
+      // The maker fee depends on the market's `feeSchedule.takerOnly`, which the stream does not carry
+      // (venue-facts.ts, MAKER_FEE_IS_PER_MARKET): no exact fee amount, so no fill. Fail closed.
+      fillShortfall("MAKER_FEE_NOT_ON_STREAM");
+      continue;
+    }
+    const taker = takerFill(event);
+    if (typeof taker === "string") {
+      fillShortfall(taker);
+      continue;
     }
     fills.push(
       Object.freeze({
         venueTradeId: event.venueTradeId,
         venueOrderId: leg.venueOrderId,
-        shares: facts.shares,
-        price: facts.price,
+        shares: taker.shares,
+        price: event.price,
         liquidityRole: leg.role,
-        feeAmount: facts.feeAmount,
+        feeAmount: taker.feeAmount,
         feeAssetId: null,
         matchedAt: event.matchedAt.iso,
       }),

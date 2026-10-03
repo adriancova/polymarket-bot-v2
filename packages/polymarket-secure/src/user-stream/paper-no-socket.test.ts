@@ -8,12 +8,16 @@
  *
  * - the transport is never touched: it is a Proxy that records every trap,
  *   and records none;
- * - a transport that WOULD dial the real user channel (`new WebSocket(...)`)
- *   never does, and WP-260's network tripwire records no attempt.
+ * - a transport that WOULD dial (`new WebSocket(...)`) never does, and
+ *   WP-260's network tripwire records no attempt.
  *
  * NON-VACUOUS: with a live-SHAPED context the same dialling transport IS
  * reached on `start()`, and the tripwire DOES record (and refuse) the dial;
  * and the recording Proxy does record accesses when the gate permits.
+ *
+ * The dial target is the loopback address and a closed port (as in WP-260's
+ * own tripwire self-test), never the venue: even with a tripwire leg missing,
+ * nothing would leave this machine. A test pins that the target is loopback.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -28,6 +32,9 @@ import { ManualTimers } from "./testing/fake-socket-port.js";
 import { FIXTURE_MARKET, LIVE_SHAPED_CONTEXT } from "./testing/harness.js";
 import { USER_CHANNEL_URL } from "./venue-facts.js";
 
+/** Loopback and a closed port (WP-260's `network-tripwire.test.ts` uses the same). */
+const LOOPBACK_DIAL_TARGET = "ws://127.0.0.1:9/";
+
 let tripwire: NetworkTripwire;
 beforeEach(() => {
   tripwire = installNetworkTripwire();
@@ -36,13 +43,13 @@ afterEach(() => {
   tripwire.uninstall();
 });
 
-/** A transport that would open the real user channel if it were ever asked to. */
+/** A transport that would open a socket (to a loopback closed port) if it were ever asked to. */
 class DiallingTransport implements AuthenticatedUserSocketPort {
   dials = 0;
 
   connect(handlers: UserSocketHandlers): UserSocketConnection {
     this.dials += 1;
-    const socket = new (globalThis as unknown as { WebSocket: new (url: string) => unknown }).WebSocket(USER_CHANNEL_URL);
+    const socket = new (globalThis as unknown as { WebSocket: new (url: string) => unknown }).WebSocket(LOOPBACK_DIAL_TARGET);
     void socket;
     void handlers;
     throw new Error("unreachable: the tripwire refuses the dial");
@@ -77,6 +84,13 @@ const REFUSED_CONTEXTS: readonly [string, unknown][] = [
 ];
 
 describe("no socket opens in PAPER (or any non-live mode)", () => {
+  it("r1 F-04: the dialling transport targets loopback and a closed port, never the venue's user channel", () => {
+    const target = new URL(LOOPBACK_DIAL_TARGET);
+    expect([target.hostname, target.port]).toEqual(["127.0.0.1", "9"]);
+    expect(LOOPBACK_DIAL_TARGET).not.toBe(USER_CHANNEL_URL);
+    expect(DiallingTransport.toString()).not.toContain("USER_CHANNEL_URL");
+  });
+
   for (const [label, runModeContext] of REFUSED_CONTEXTS) {
     it(`${label}: construction is refused before the transport is read`, () => {
       const dialling = new DiallingTransport();
@@ -151,7 +165,7 @@ describe("no socket opens in PAPER (or any non-live mode)", () => {
     expect(dialling.dials).toBe(0);
     manager.start();
     expect(dialling.dials).toBe(1);
-    expect(tripwire.refused()).toEqual([{ via: "WebSocket", target: USER_CHANNEL_URL }]);
+    expect(tripwire.refused()).toEqual([{ via: "WebSocket", target: LOOPBACK_DIAL_TARGET }]);
     // The refused dial is a lost connection, and requests reconciliation like any other.
     expect(outputs.flatMap((output) => (output.kind === "RECONCILIATION_REQUESTED" ? [output.request.cause] : []))).toEqual(["CONNECT_FAILED"]);
     manager.stop();
