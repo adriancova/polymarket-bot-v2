@@ -42,6 +42,32 @@ export {
   type QueryOutcome,
   type VenueOrderSnapshot,
 } from "./outcomes.js";
+export {
+  createRateLimitBudget,
+  DOCUMENTED_RATE_LIMIT_HEADERS,
+  feedbackFromObservation,
+  parseRateLimitConfiguration,
+  parseRateLimitHeaders,
+  PRIORITY_LADDER,
+  RATE_LIMIT_CONFIGURATION_SCHEMA,
+  RATE_LIMIT_VENUE_FACTS,
+  RateLimitBudget,
+  RateLimitConfigurationTimeline,
+  signerBucketOfObservation,
+  type BudgetEffect,
+  type BudgetRefusal,
+  type BudgetRequest,
+  type BudgetResult,
+  type BudgetView,
+  type FeedbackFlag,
+  type Grant,
+  type GrantCompletion,
+  type PollEvent,
+  type PriorityClass,
+  type RateLimitConfiguration,
+  type RateLimitFeedback,
+  type RequestDecision,
+} from "./rate-limit/index.js";
 export { SignedOrderEnvelope, type SignedOrderIdentity } from "./signed-order.js";
 export { isSealedSignerHandle, SignerHandle, type SignerProvenance } from "./signer.js";
 export {

@@ -1,0 +1,82 @@
+{
+  "schema": "polymarket-bot/rate-limit-configuration@1",
+  "snapshotId": "venue-2026-09-30",
+  "effectiveFrom": "2026-09-30T05:12:03Z",
+  "source": {
+    "documents": [
+      { "url": "https://docs.polymarket.com/api-reference/rate-limits.md", "retrievedAt": "2026-09-30T05:12:02Z" },
+      { "url": "https://docs.polymarket.com/api-reference/trading-rate-limits.md", "retrievedAt": "2026-09-30T05:12:03Z" }
+    ],
+    "report": "docs/venue/verified-2026-09-30.md §8 and §W.7 (values unchanged; recorded in docs/venue/verified-2026-09-16.md §8, D-21, D-22)",
+    "policyAuthority": "WP-310 contract fixture: the policy block (headroom, fallback backoff, header-wait bound, queue bound) is an example for tests, not an operator ruling"
+  },
+  "ipEndpointClasses": [
+    { "classId": "general", "windows": [{ "limit": 15000, "windowMs": 10000 }] },
+    { "classId": "clob.general", "windows": [{ "limit": 9000, "windowMs": 10000 }] },
+    { "classId": "clob.balance_allowance_get", "windows": [{ "limit": 200, "windowMs": 10000 }] },
+    { "classId": "clob.balance_allowance_update", "windows": [{ "limit": 50, "windowMs": 10000 }] },
+    { "classId": "clob.book", "windows": [{ "limit": 1500, "windowMs": 10000 }] },
+    { "classId": "clob.books", "windows": [{ "limit": 500, "windowMs": 10000 }] },
+    { "classId": "clob.ledger", "windows": [{ "limit": 900, "windowMs": 10000 }] },
+    { "classId": "clob.data_orders", "windows": [{ "limit": 500, "windowMs": 10000 }] },
+    { "classId": "clob.data_trades", "windows": [{ "limit": 500, "windowMs": 10000 }] },
+    { "classId": "clob.auth", "windows": [{ "limit": 100, "windowMs": 10000 }] },
+    { "classId": "clob.post_order", "windows": [{ "limit": 5000, "windowMs": 10000 }, { "limit": 120000, "windowMs": 600000 }] },
+    { "classId": "clob.delete_order", "windows": [{ "limit": 5000, "windowMs": 10000 }, { "limit": 120000, "windowMs": 600000 }] },
+    { "classId": "clob.post_orders", "windows": [{ "limit": 2000, "windowMs": 10000 }, { "limit": 21000, "windowMs": 600000 }] },
+    { "classId": "clob.delete_orders", "windows": [{ "limit": 2000, "windowMs": 10000 }, { "limit": 15000, "windowMs": 600000 }] },
+    { "classId": "clob.cancel_all", "windows": [{ "limit": 250, "windowMs": 10000 }, { "limit": 6000, "windowMs": 600000 }] },
+    { "classId": "clob.cancel_market_orders", "windows": [{ "limit": 1500, "windowMs": 10000 }, { "limit": 21000, "windowMs": 600000 }] },
+    { "classId": "gamma.general", "windows": [{ "limit": 4000, "windowMs": 10000 }] },
+    { "classId": "gamma.events", "windows": [{ "limit": 500, "windowMs": 10000 }] },
+    { "classId": "gamma.markets", "windows": [{ "limit": 300, "windowMs": 10000 }] },
+    { "classId": "gamma.listing", "windows": [{ "limit": 900, "windowMs": 10000 }] },
+    { "classId": "gamma.public_search", "windows": [{ "limit": 350, "windowMs": 10000 }] },
+    { "classId": "data.v2.general", "windows": [{ "limit": 800, "windowMs": 10000 }] },
+    { "classId": "data.v2.trades", "windows": [{ "limit": 300, "windowMs": 10000 }] },
+    { "classId": "data.v2.positions", "windows": [{ "limit": 200, "windowMs": 10000 }] }
+  ],
+  "relayer": { "windows": [{ "limit": 25, "windowMs": 60000 }] },
+  "signerTiers": [
+    { "tier": "Standard", "orderTokensPerSecond": 40, "orderBurst": 60, "cancelTokensPerSecond": 80, "cancelBurst": 120, "negativeCancelBalance": true },
+    { "tier": "Copper", "orderTokensPerSecond": 60, "orderBurst": 90, "cancelTokensPerSecond": 120, "cancelBurst": 180, "negativeCancelBalance": true },
+    { "tier": "Bronze", "orderTokensPerSecond": 80, "orderBurst": 120, "cancelTokensPerSecond": 160, "cancelBurst": 240, "negativeCancelBalance": true },
+    { "tier": "Silver", "orderTokensPerSecond": 200, "orderBurst": 300, "cancelTokensPerSecond": 400, "cancelBurst": 600, "negativeCancelBalance": true },
+    { "tier": "Gold", "orderTokensPerSecond": 400, "orderBurst": 600, "cancelTokensPerSecond": 800, "cancelBurst": 1200, "negativeCancelBalance": true },
+    { "tier": "Platinum", "orderTokensPerSecond": 450, "orderBurst": 675, "cancelTokensPerSecond": 900, "cancelBurst": 1350, "negativeCancelBalance": false },
+    { "tier": "Diamond", "orderTokensPerSecond": 525, "orderBurst": 787, "cancelTokensPerSecond": 1050, "cancelBurst": 1575, "negativeCancelBalance": false },
+    { "tier": "Elite", "orderTokensPerSecond": 600, "orderBurst": 900, "cancelTokensPerSecond": 1200, "cancelBurst": 1800, "negativeCancelBalance": false }
+  ],
+  "operations": [
+    { "operationId": "clob.heartbeat", "kind": "HEARTBEAT", "ipEndpointClasses": ["general", "clob.general"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "clob.post_order", "kind": "PLACEMENT", "ipEndpointClasses": ["general", "clob.general", "clob.post_order"], "signerBucket": "ORDER", "relayer": false, "tokenCost": { "base": 1, "perEntry": 0, "perCanceled": 0 } },
+    { "operationId": "clob.post_orders", "kind": "PLACEMENT", "ipEndpointClasses": ["general", "clob.general", "clob.post_orders"], "signerBucket": "ORDER", "relayer": false, "tokenCost": { "base": 0, "perEntry": 1, "perCanceled": 0 } },
+    { "operationId": "clob.cancel_order", "kind": "CANCEL", "ipEndpointClasses": ["general", "clob.general", "clob.delete_order"], "signerBucket": "CANCEL", "relayer": false, "tokenCost": { "base": 1, "perEntry": 0, "perCanceled": 0 } },
+    { "operationId": "clob.cancel_orders", "kind": "CANCEL", "ipEndpointClasses": ["general", "clob.general", "clob.delete_orders"], "signerBucket": "CANCEL", "relayer": false, "tokenCost": { "base": 0, "perEntry": 1, "perCanceled": 0 } },
+    { "operationId": "clob.cancel_all", "kind": "CANCEL", "ipEndpointClasses": ["general", "clob.general", "clob.cancel_all"], "signerBucket": "CANCEL", "relayer": false, "tokenCost": { "base": 1, "perEntry": 0, "perCanceled": 1 } },
+    { "operationId": "clob.cancel_market_orders", "kind": "CANCEL", "ipEndpointClasses": ["general", "clob.general", "clob.cancel_market_orders"], "signerBucket": "CANCEL", "relayer": false, "tokenCost": { "base": 1, "perEntry": 0, "perCanceled": 1 } },
+    { "operationId": "clob.get_order", "kind": "READ", "ipEndpointClasses": ["general", "clob.general", "clob.ledger"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "clob.get_trades", "kind": "READ", "ipEndpointClasses": ["general", "clob.general", "clob.ledger"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "clob.data_orders", "kind": "READ", "ipEndpointClasses": ["general", "clob.general", "clob.data_orders"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "clob.balance_allowance", "kind": "READ", "ipEndpointClasses": ["general", "clob.general", "clob.balance_allowance_get"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "clob.book", "kind": "READ", "ipEndpointClasses": ["general", "clob.general", "clob.book"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "data.v2.positions", "kind": "READ", "ipEndpointClasses": ["general", "data.v2.general", "data.v2.positions"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "gamma.markets", "kind": "READ", "ipEndpointClasses": ["general", "gamma.general", "gamma.markets"], "signerBucket": null, "relayer": false, "tokenCost": null },
+    { "operationId": "relayer.submit", "kind": "RELAYER", "ipEndpointClasses": ["general"], "signerBucket": null, "relayer": true, "tokenCost": null }
+  ],
+  "policy": {
+    "assumedSignerTier": "Standard",
+    "headroomPermille": {
+      "ORDER_HEARTBEAT": 0,
+      "EMERGENCY_CANCEL": 0,
+      "RECONCILIATION_READ": 50,
+      "RISK_REDUCING_ORDER": 100,
+      "STALE_QUOTE_CANCEL": 150,
+      "NEW_ORDER": 200,
+      "METADATA_ANALYTICS": 300
+    },
+    "rateLimitedFallback": { "initialMs": 1000, "multiplier": 2, "capMs": 30000 },
+    "maxHeaderWaitMs": 600000,
+    "maxQueuedRequests": 10000
+  }
+}

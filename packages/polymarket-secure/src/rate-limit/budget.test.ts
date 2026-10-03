@@ -1,0 +1,354 @@
+/**
+ * WP-310 deliverable 1 and acceptance 1 and 3: the local budgets, the §9.13
+ * grant order, and snapshots taking effect at their effective time. Every
+ * number here is the SYNTHETIC snapshot's (`fixtures.test-support.ts`).
+ */
+
+import { describe, expect, it } from "vitest";
+
+import type { Grant, PollEvent, RateLimitBudget, RequestDecision } from "./budget.js";
+import { SIGNER_A, SIGNER_B, T0, ZERO_HEADROOM, budgetOf, iso, snapshot, warm } from "./fixtures.test-support.js";
+import { PRIORITY_LADDER, type PriorityClass } from "./priority.js";
+
+/** The operation each ladder class is filed with in these tests. */
+const OPERATION_FOR: Readonly<Record<PriorityClass, { operationId: string; signer?: string }>> = {
+  ORDER_HEARTBEAT: { operationId: "heartbeat" },
+  EMERGENCY_CANCEL: { operationId: "cancel_all", signer: SIGNER_A },
+  RECONCILIATION_READ: { operationId: "read" },
+  RISK_REDUCING_ORDER: { operationId: "place", signer: SIGNER_A },
+  STALE_QUOTE_CANCEL: { operationId: "cancel", signer: SIGNER_A },
+  NEW_ORDER: { operationId: "place", signer: SIGNER_A },
+  METADATA_ANALYTICS: { operationId: "read" },
+};
+
+function ask(budget: RateLimitBudget, priority: PriorityClass, atMs: number): RequestDecision {
+  return budget.request({ ...OPERATION_FOR[priority], priority }, atMs);
+}
+
+function granted(events: readonly PollEvent[]): string[] {
+  return events.filter((event) => event.kind === "GRANTED").map((event) => event.ticketId);
+}
+
+function grantOf(decision: RequestDecision): Grant {
+  if (decision.kind !== "GRANTED") throw new Error(`expected GRANTED, got ${decision.kind}`);
+  return decision.grant;
+}
+
+/** Fill the 10-per-second `shared` window with heartbeats sent 1 ms apart from `from`. */
+function exhaustShared(budget: RateLimitBudget, from: number): void {
+  for (let index = 0; index < 10; index += 1) {
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, from + index).kind).toBe("GRANTED");
+  }
+}
+
+describe("the §9.13 ladder under exhaustion (acceptance 1)", () => {
+  it("grants one freed slot at a time in exactly the ladder order, whatever the arrival order", () => {
+    const budget = budgetOf(snapshot({}, { assumedSignerTier: "Big" }));
+    warm(budget, SIGNER_A, T0 - 10_000);
+    exhaustShared(budget, T0);
+    // Arrivals in REVERSE ladder order: metadata first, heartbeat last.
+    const tickets = new Map<string, PriorityClass>();
+    for (const priority of [...PRIORITY_LADDER].reverse()) {
+      const decision = ask(budget, priority, T0 + 10);
+      expect(decision.kind, priority).toBe("QUEUED");
+      if (decision.kind === "QUEUED") tickets.set(decision.ticketId, priority);
+    }
+    // The heartbeat sent at T0 + i leaves the 1000 ms window at T0 + 1000 + i: one slot per millisecond.
+    const order: PriorityClass[] = [];
+    for (let index = 0; index < PRIORITY_LADDER.length; index += 1) {
+      const ids = granted(budget.poll(T0 + 1000 + index));
+      expect(ids, `slot ${String(index)}`).toHaveLength(1);
+      order.push(tickets.get(ids[0] ?? "") as PriorityClass);
+    }
+    expect(order).toEqual([...PRIORITY_LADDER]);
+  });
+
+  it("grants everything affordable at once, still in ladder order", () => {
+    const budget = budgetOf(snapshot({}, { assumedSignerTier: "Big" }));
+    warm(budget, SIGNER_A, T0 - 10_000);
+    exhaustShared(budget, T0);
+    const tickets = new Map<string, PriorityClass>();
+    for (const priority of [...PRIORITY_LADDER].reverse()) {
+      const decision = ask(budget, priority, T0 + 10);
+      if (decision.kind === "QUEUED") tickets.set(decision.ticketId, priority);
+    }
+    const order = granted(budget.poll(T0 + 2000)).map((id) => tickets.get(id));
+    expect(order).toEqual([...PRIORITY_LADDER]);
+  });
+
+  it("an emergency cancel-all queued AFTER five new orders is granted before any of them", () => {
+    const budget = budgetOf(snapshot({}, { assumedSignerTier: "Big" }));
+    warm(budget, SIGNER_A, T0 - 10_000);
+    exhaustShared(budget, T0);
+    const newOrders = [1, 2, 3, 4, 5].map(() => ask(budget, "NEW_ORDER", T0 + 10));
+    const cancelAll = ask(budget, "EMERGENCY_CANCEL", T0 + 11);
+    expect(newOrders.every((decision) => decision.kind === "QUEUED")).toBe(true);
+    expect(cancelAll.kind).toBe("QUEUED");
+    const first = budget.poll(T0 + 1000);
+    expect(granted(first)).toEqual([cancelAll.kind === "QUEUED" ? cancelAll.ticketId : ""]);
+    // Then the new orders, first come first served.
+    const rest = granted(budget.poll(T0 + 1004));
+    expect(rest).toEqual(newOrders.slice(0, 4).map((decision) => (decision.kind === "QUEUED" ? decision.ticketId : "")));
+  });
+
+  it("a request never jumps a higher-ranked waiter: a new order arriving while an emergency cancel waits is queued behind it", () => {
+    const budget = budgetOf(snapshot({}, { assumedSignerTier: "Big" }));
+    warm(budget, SIGNER_A, T0 - 10_000);
+    exhaustShared(budget, T0);
+    const cancel = ask(budget, "EMERGENCY_CANCEL", T0 + 10);
+    expect(cancel.kind).toBe("QUEUED");
+    // At T0 + 1000 one shared slot frees. The new order asks first, but the cancel holds that slot.
+    expect(ask(budget, "NEW_ORDER", T0 + 1000).kind).toBe("QUEUED");
+    const events = budget.poll(T0 + 1000);
+    expect(granted(events)).toEqual([cancel.kind === "QUEUED" ? cancel.ticketId : ""]);
+  });
+
+  it("a waiting emergency cancel blocked on its own cancel bucket still holds the shared IP capacity it needs; a request sharing nothing with it proceeds", () => {
+    const budget = budgetOf(snapshot());
+    warm(budget, SIGNER_A, T0 - 10_000);
+    // Drive the cancel bucket into debt: a cancel-all that canceled 30 orders on a negative-balance tier.
+    const sweep = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.complete(sweep, { atMs: T0, canceledCount: 30 }).ok).toBe(true);
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-25");
+    // 1 (the sweep) + 7 heartbeats: 8 of the 10 shared slots are used, 2 are free.
+    for (let index = 0; index < 7; index += 1) budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0 + 1);
+    const emergency = ask(budget, "EMERGENCY_CANCEL", T0 + 2);
+    expect(emergency.kind).toBe("QUEUED");
+    // One free slot is held for the emergency cancel: one new order gets the other, the next one waits.
+    expect(ask(budget, "NEW_ORDER", T0 + 3).kind).toBe("GRANTED");
+    expect(ask(budget, "NEW_ORDER", T0 + 3).kind).toBe("QUEUED");
+    expect(granted(budget.poll(T0 + 3))).toEqual([]);
+    expect(budget.view(T0 + 3).ipEndpointClasses.find((entry) => entry.budget.dimension === "IP_ENDPOINT_CLASS" && entry.budget.classId === "shared")?.windows[0]?.used).toBe(9);
+    // A read that shares no budget with the waiting cancel is not held back.
+    expect(budget.request({ operationId: "read_dual", priority: "METADATA_ANALYTICS" }, T0 + 4).kind).toBe("GRANTED");
+    // The cancel bucket climbs out of debt at 2 tokens/s: from -25 it holds 1 token after exactly 13 s.
+    expect(granted(budget.poll(T0 + 12_999))).not.toContain(emergency.kind === "QUEUED" ? emergency.ticketId : "");
+    expect(granted(budget.poll(T0 + 13_000))[0]).toBe(emergency.kind === "QUEUED" ? emergency.ticketId : "");
+  });
+
+  it("headroom: a new order cannot take the last part of a shared budget a higher class may need", () => {
+    const budget = budgetOf(snapshot({}, { assumedSignerTier: "Big", headroomPermille: { ...ZERO_HEADROOM, NEW_ORDER: 500, METADATA_ANALYTICS: 500 } }));
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const decisions = [1, 2, 3, 4, 5, 6].map(() => ask(budget, "NEW_ORDER", T0).kind);
+    // shared: limit 10, NEW_ORDER must leave 500‰ = 5 slots: only 5 new orders go.
+    expect(decisions).toEqual(["GRANTED", "GRANTED", "GRANTED", "GRANTED", "GRANTED", "QUEUED"]);
+    // An emergency cancel still finds room at once.
+    expect(ask(budget, "EMERGENCY_CANCEL", T0).kind).toBe("GRANTED");
+  });
+
+  it("refuses a class the operation's kind does not permit (a new order cannot borrow a safety rank)", () => {
+    const budget = budgetOf();
+    const misfiled = [
+      budget.request({ operationId: "place", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0),
+      budget.request({ operationId: "place", priority: "ORDER_HEARTBEAT", signer: SIGNER_A }, T0),
+      budget.request({ operationId: "cancel", priority: "NEW_ORDER", signer: SIGNER_A }, T0),
+      budget.request({ operationId: "read", priority: "EMERGENCY_CANCEL" }, T0),
+      budget.request({ operationId: "heartbeat", priority: "EMERGENCY_CANCEL" }, T0),
+    ];
+    for (const decision of misfiled) expect(decision).toMatchObject({ kind: "REFUSED", refusal: { code: "PRIORITY_NOT_PERMITTED" } });
+  });
+});
+
+describe("token buckets per signer (§8: separate order and cancel buckets)", () => {
+  it("a signer first seen starts empty and refills at its tier's rate, exactly", () => {
+    const budget = budgetOf();
+    expect(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0).kind).toBe("QUEUED");
+    expect(budget.view(T0 + 999).signers[0]?.order.tokens).toBe("0.999");
+    expect(granted(budget.poll(T0 + 999))).toEqual([]);
+    expect(granted(budget.poll(T0 + 1000))).toHaveLength(1);
+    expect(budget.view(T0 + 1000).signers[0]?.order.tokens).toBe("0");
+  });
+
+  it("order and cancel buckets are independent, and so are two signers", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    for (let index = 0; index < 4; index += 1) expect(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0).kind).toBe("QUEUED");
+    expect(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_A }, T0).kind).toBe("GRANTED");
+    // SIGNER_B has its own (empty) buckets.
+    expect(budget.request({ operationId: "place", priority: "RISK_REDUCING_ORDER", signer: SIGNER_B }, T0).kind).toBe("QUEUED");
+  });
+
+  it("a batch is all or nothing, and a batch above the burst is refused (split it)", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 2000);
+    expect(budget.view(T0).signers[0]?.order.tokens).toBe("2");
+    const batch = budget.request({ operationId: "place_batch", priority: "NEW_ORDER", signer: SIGNER_A, entries: 3 }, T0);
+    expect(batch.kind).toBe("QUEUED");
+    expect(budget.view(T0).signers[0]?.order.tokens).toBe("2");
+    expect(granted(budget.poll(T0 + 1000))).toHaveLength(1);
+    expect(budget.request({ operationId: "place_batch", priority: "NEW_ORDER", signer: SIGNER_A, entries: 5 }, T0 + 1000)).toMatchObject({
+      kind: "REFUSED",
+      refusal: { code: "COST_EXCEEDS_CAPACITY" },
+    });
+  });
+
+  it("cancel-all: one token when granted, one per canceled order on completion; debt on a negative-balance tier, a floor at zero otherwise", () => {
+    for (const [tier, expected] of [
+      ["Base", "-3"],
+      ["Floor", "0"],
+    ] as const) {
+      const budget = budgetOf(snapshot({}, { assumedSignerTier: tier }));
+      warm(budget, SIGNER_A, T0 - 10_000);
+      const grant = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+      expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("5");
+      const result = budget.complete(grant, { atMs: T0, canceledCount: 8 });
+      expect(result.ok && result.value).toContainEqual(expect.objectContaining({ kind: "CANCELED_DEBITED", tokens: 8 }));
+      expect(budget.view(T0).signers[0]?.cancel.tokens, tier).toBe(expected);
+    }
+  });
+
+  it("a cancel-all completed without its canceled count is flagged, not guessed", () => {
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const grant = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    const result = budget.complete(grant, { atMs: T0 });
+    expect(result.ok && result.value).toContainEqual(expect.objectContaining({ kind: "CANCELED_COUNT_UNKNOWN" }));
+    expect(budget.complete(grant, { atMs: T0 })).toMatchObject({ ok: false, refusal: { code: "GRANT_ALREADY_COMPLETED" } });
+  });
+
+  it("refuses a forged grant", () => {
+    const budget = budgetOf();
+    const forged = { grantId: "grant-1", ticketId: "ticket-1", operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A, entries: null, charges: [], grantedAtMs: T0, snapshotId: "synthetic-a" } as const;
+    expect(budget.complete(forged as unknown as Grant, { atMs: T0, canceledCount: 1 })).toMatchObject({ ok: false, refusal: { code: "UNKNOWN_GRANT" } });
+  });
+});
+
+describe("IP endpoint classes and the relayer (sliding windows)", () => {
+  it("a class with a burst and a sustained window is limited by both", () => {
+    const budget = budgetOf();
+    const at = (ms: number): string => budget.request({ operationId: "read_dual", priority: "METADATA_ANALYTICS" }, ms).kind;
+    expect([at(T0), at(T0), at(T0), at(T0)]).toEqual(["GRANTED", "GRANTED", "GRANTED", "QUEUED"]);
+    // At T0 + 1000 the burst window is free again, but the 4-per-10-s window allows only one more.
+    expect(granted(budget.poll(T0 + 1000))).toHaveLength(1);
+    expect(at(T0 + 1000)).toBe("QUEUED");
+    expect(granted(budget.poll(T0 + 9999))).toEqual([]);
+    expect(granted(budget.poll(T0 + 10_000))).toHaveLength(1);
+  });
+
+  it("the relayer budget is separate", () => {
+    const budget = budgetOf();
+    const submit = (ms: number): string => budget.request({ operationId: "relayer_submit", priority: "NEW_ORDER" }, ms).kind;
+    expect([submit(T0), submit(T0), submit(T0)]).toEqual(["GRANTED", "GRANTED", "QUEUED"]);
+    expect(budget.view(T0).relayer?.windows[0]).toMatchObject({ limit: 2, used: 2 });
+    expect(granted(budget.poll(T0 + 60_000))).toHaveLength(1);
+  });
+});
+
+describe("the queue", () => {
+  it("is bounded: when full, a higher class evicts the lowest-ranked waiter; an equal or lower class is refused", () => {
+    const budget = budgetOf(snapshot({}, { maxQueuedRequests: 2 }));
+    exhaustShared(budget, T0);
+    const meta1 = budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 10);
+    const meta2 = budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 10);
+    expect([meta1.kind, meta2.kind]).toEqual(["QUEUED", "QUEUED"]);
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 10)).toMatchObject({ kind: "REFUSED", refusal: { code: "QUEUE_FULL" } });
+    expect(budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0 + 10).kind).toBe("QUEUED");
+    const events = budget.poll(T0 + 10);
+    expect(events).toEqual([
+      { kind: "REFUSED", ticketId: meta2.kind === "QUEUED" ? meta2.ticketId : "", refusal: { code: "EVICTED_BY_HIGHER_PRIORITY", message: expect.any(String) as string } },
+    ]);
+  });
+
+  it("withdraw removes a queued request", () => {
+    const budget = budgetOf();
+    exhaustShared(budget, T0);
+    const decision = budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 10);
+    expect(decision.kind === "QUEUED" && budget.withdraw(decision.ticketId)).toBe(true);
+    expect(granted(budget.poll(T0 + 5000))).toEqual([]);
+  });
+
+  it("nextWakeAtMs names the instant a poll can next grant", () => {
+    const budget = budgetOf();
+    expect(budget.nextWakeAtMs(T0)).toBeNull();
+    exhaustShared(budget, T0);
+    budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0 + 10);
+    expect(budget.nextWakeAtMs(T0 + 10)).toBe(T0 + 1000);
+    expect(budget.nextWakeAtMs(T0 + 1000)).toBe(T0 + 1000);
+  });
+
+  it("refuses malformed input without throwing", () => {
+    const budget = budgetOf();
+    expect(budget.request({ operationId: "place", priority: "NEW_ORDER" }, T0)).toMatchObject({ refusal: { code: "SIGNER_REQUIRED" } });
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS", signer: SIGNER_A }, T0)).toMatchObject({ refusal: { code: "SIGNER_NOT_EXPECTED" } });
+    expect(budget.request({ operationId: "place_batch", priority: "NEW_ORDER", signer: SIGNER_A }, T0)).toMatchObject({ refusal: { code: "ENTRIES_REQUIRED" } });
+    expect(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A, entries: 2 }, T0)).toMatchObject({ refusal: { code: "ENTRIES_NOT_EXPECTED" } });
+    expect(budget.request({ operationId: "nope", priority: "NEW_ORDER" }, T0)).toMatchObject({ refusal: { code: "UNKNOWN_OPERATION" } });
+    expect(budget.request({ operationId: "read", priority: "URGENT" as PriorityClass }, T0)).toMatchObject({ refusal: { code: "INVALID_REQUEST" } });
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, -1)).toMatchObject({ refusal: { code: "INVALID_TIME" } });
+    const getter = Object.defineProperty({ priority: "NEW_ORDER" }, "operationId", { get: () => "read", enumerable: true });
+    expect(budget.request(getter as never, T0)).toMatchObject({ refusal: { code: "INVALID_REQUEST" } });
+  });
+});
+
+describe("snapshots take effect at their effective time (acceptance 3)", () => {
+  const T1 = T0 + 30_000;
+  const later = (): ReturnType<typeof snapshot> =>
+    snapshot({
+      snapshotId: "synthetic-b",
+      effectiveFrom: iso(T1),
+      ipEndpointClasses: [
+        { classId: "shared", windows: [{ limit: 1, windowMs: 1000 }] },
+        { classId: "orders", windows: [{ limit: 100, windowMs: 1000 }] },
+        { classId: "cancels", windows: [{ limit: 100, windowMs: 1000 }] },
+        { classId: "reads", windows: [{ limit: 100, windowMs: 1000 }] },
+        { classId: "dual", windows: [{ limit: 3, windowMs: 1000 }] },
+      ],
+      signerTiers: [
+        { tier: "Base", orderTokensPerSecond: 3, orderBurst: 30, cancelTokensPerSecond: 2, cancelBurst: 6, negativeCancelBalance: true },
+        { tier: "Floor", orderTokensPerSecond: 1, orderBurst: 4, cancelTokensPerSecond: 2, cancelBurst: 6, negativeCancelBalance: false },
+        { tier: "Big", orderTokensPerSecond: 10, orderBurst: 40, cancelTokensPerSecond: 20, cancelBurst: 60, negativeCancelBalance: true },
+      ],
+    });
+
+  it("the old limits apply until one millisecond before, the new ones from the effective instant", () => {
+    const budget = budgetOf(snapshot(), later());
+    expect(budget.configurationAt(T1 - 1)?.snapshotId).toBe("synthetic-a");
+    expect(budget.configurationAt(T1)?.snapshotId).toBe("synthetic-b");
+    // shared: 10 per second under A, 1 under B.
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T1 - 2).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T1 - 1).kind).toBe("GRANTED");
+    expect(budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T1).kind).toBe("QUEUED");
+  });
+
+  it("token refill is computed segment by segment: the old rate before, the new rate after", () => {
+    const budget = budgetOf(snapshot(), later());
+    warm(budget, SIGNER_A, T1 - 2000);
+    // Read ONLY after the boundary: 2 s at 1 token/s under A, then 2 s at 3 tokens/s under B. (One rate for
+    // the whole span would give 4 under A, capped at A's burst of 4, or 12 under B.)
+    expect(budget.view(T1 + 2000).signers[0]?.order.tokens).toBe("8");
+  });
+
+  it("the same refill read at the boundary agrees", () => {
+    const budget = budgetOf(snapshot(), later());
+    warm(budget, SIGNER_A, T1 - 2000);
+    expect(budget.view(T1).signers[0]?.order.tokens).toBe("2");
+    expect(budget.view(T1 + 2000).signers[0]?.order.tokens).toBe("8");
+  });
+
+  it("a snapshot added later must take effect after every instant already processed", () => {
+    const budget = budgetOf();
+    budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T0);
+    expect(budget.addConfiguration({ ...later(), effectiveFrom: iso(T0) })).toMatchObject({ ok: false, refusal: { code: "EFFECTIVE_TIME_NOT_IN_FUTURE" } });
+    expect(budget.addConfiguration(later())).toMatchObject({ ok: true, value: { snapshotId: "synthetic-b", effectiveFromMs: T1 } });
+    expect(budget.configurationAt(T1)?.snapshotId).toBe("synthetic-b");
+  });
+
+  it("before the first snapshot nothing is in effect, and every request is refused", () => {
+    const budget = budgetOf(snapshot({ effectiveFrom: iso(T0) }));
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0 - 1)).toMatchObject({ kind: "REFUSED", refusal: { code: "NO_ACTIVE_CONFIGURATION" } });
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0).kind).toBe("GRANTED");
+  });
+
+  it("a queued request the new snapshot no longer admits is refused at the next poll, not left to block others", () => {
+    const withoutRead = later();
+    withoutRead["operations"] = (withoutRead["operations"] as readonly { readonly operationId: string }[]).filter((op) => op.operationId !== "read") as never;
+    const budget = budgetOf(snapshot(), withoutRead);
+    exhaustShared(budget, T1 - 100);
+    const queued = budget.request({ operationId: "read", priority: "METADATA_ANALYTICS" }, T1 - 50);
+    expect(queued.kind).toBe("QUEUED");
+    expect(budget.poll(T1)).toEqual([
+      { kind: "REFUSED", ticketId: queued.kind === "QUEUED" ? queued.ticketId : "", refusal: { code: "UNKNOWN_OPERATION", message: expect.any(String) as string } },
+    ]);
+  });
+});
