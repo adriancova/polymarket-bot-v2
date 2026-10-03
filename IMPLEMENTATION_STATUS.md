@@ -53,7 +53,8 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-270` is Complete (2026-10-03, `259c964`); see [Work packages](#work-packages). Its 18 design decisions are fail-closed interim rulings (`WP270-DECISIONS`).
 - `WP-280` is Complete (2026-10-03, `065716f`); see [Work packages](#work-packages). `WP-290`'s dependencies (`WP-200`, `WP-270`, `WP-280`) are now met; it starts when a slot frees.
 - **`WP-310`**: Ready (authorized) 2026-10-03 under the Wave 3 authorization; its dependencies `WP-000`, `WP-260` and `WP-270` are met. It covers rate-limit budgets and matching-engine modes, PAPER only. Paths: `packages/polymarket-secure/src/rate-limit/**`, `packages/oms/src/restricted-mode/**`, `test/contract/rate-limits/**`, plus export lines and a `test:contract` script line. Verifiers: Opus and gpt-6-astra, reconciled.
-- **`ROLLOVER-1`**: Ready (authorized) 2026-10-03, per the work plan; its dependencies `LEAN-GOV` and `THROUGHPUT-1c` are met. It implements ADR-030: series auto-admission and multi-window runs, PAPER only. A 72 h burn-in spans about 288 windows. The paths are the work plan's. Verifiers: Opus and gpt-6-astra, reconciled (the work plan requires an independent adversarial review).
+- **`ROLLOVER-1`**: **STOPPED, as its packet required, before any change** (2026-10-03). Three blockers each need a ruling; they are in Human items, and the implementer's evidence and plan are in `~/pmb-rounds/rollover-1/handoff-r0-stop.md`. Until they are ruled, only the restart-per-window driver can run more than one window.
+- **`WP-290`**: Ready (authorized) 2026-10-03 under the Wave 3 authorization; its dependencies `WP-200`, `WP-270` and `WP-280` are met. It is account reconciliation, PAPER only. Paths: the work plan's (`packages/oms/src/reconciliation/**`, `packages/ledger/src/reconciliation/**`, `test/fault-injection/reconciliation/**`, `docs/runbooks/reconciliation.md`), plus export lines and a fault-script line. Verifiers: Opus and gpt-6-astra, reconciled (ruled safety-critical).
 - `CADENCE-1` is Complete (2026-10-03, `8d7086a`): ADR-026. On the H1 burst, catch-up throughput rose from 874 to 8,440 events/s, and paced max lag fell from 8.56 s to 0.07 s. See [Work packages](#work-packages); its grants are recorded in `docs/handoffs/CADENCE-1.md`.
 - `APPROX-REPLAY-1` is Complete (2026-10-03, `86830d9`); see [Work packages](#work-packages).
 - `WALCAP-1` is Complete (2026-10-03, `da559ca`); see [Work packages](#work-packages).
@@ -195,7 +196,8 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-270` | OMS and signed-order persistence (Wave 3, PAPER only) | Complete (2026-10-03) | `259c964` | [WP-270](docs/handoffs/WP-270.md) |
 | `WP-280` | Authenticated user-stream adapter (Wave 3, PAPER only) | Complete (2026-10-03) | `065716f` | [WP-280](docs/handoffs/WP-280.md) |
 | `WP-310` | Rate-limit budgets and matching-engine modes (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-03 | — | — |
-| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Ready (authorized)** 2026-10-03 | — | — |
+| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Stopped: awaiting rulings Q1–Q4** (Human items) | — | — |
+| `WP-290` | Account reconciliation (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-03 | — | — |
 | `CADENCE-1` | ADR-026: evaluation cadence, once per market per second of event time | Complete (2026-10-03) | `8d7086a` | [CADENCE-1](docs/handoffs/CADENCE-1.md) |
 | `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | Complete (2026-10-03) | `86830d9` | [APPROX-REPLAY-1](docs/handoffs/APPROX-REPLAY-1.md) |
 | `WALCAP-1` | the WAL cap after expiry, required on the laptop profile, visible; the stall-bound flake | Complete (2026-10-03) | `da559ca` | [WALCAP-1](docs/handoffs/WALCAP-1.md) |
@@ -400,6 +402,11 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
+- **`ROLLOVER-1` rulings** (its implementer stopped on 2026-10-03; the evidence is in `~/pmb-rounds/rollover-1/handoff-r0-stop.md`).
+  - **Q1, a `packages/domain` grant.** No existing contract can carry an admitted window's scheduled open and close. The candidates are `TradingParametersChanged@2`, optional `openTime`/`closeTime` fields, or a new `SeriesWindowAdmitted@1`. ADR-030 D3.3 says to stop and ask.
+  - **Q2, a `packages/strategy-runtime` grant.** It would add a run-scoped sequence source, so the per-window runtimes of one run never share a decision or checkpoint sequence. The alternative is to amend ADR-030 D4.2 so that a run is one window.
+  - **Q3, the venue facts.** A venue round must record the outcome-to-token pairing, the discovery surface, the window-schedule fields and the trading-delay field. A user ruling is the other way.
+  - **Q4, confirm the series pin.** The reviewed series would be pinned through `config_id`, by registering `{strategy, series}` in `strategy.configs.parameters`. That needs no migration, but it changes what those rows mean.
 - **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
 
 ### Wave 3 authorization (conditional)
