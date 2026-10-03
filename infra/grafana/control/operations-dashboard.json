@@ -300,6 +300,29 @@
         { "refId": "A", "expr": "trader_event_time_lag_seconds", "legendFormat": "event-time lag (s)" },
         { "refId": "B", "expr": "trader_transport_sample_age_seconds", "legendFormat": "transport sample age (s)" }
       ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Evaluation cadence: coalesced evaluations",
+      "description": "CADENCE-1 (ADR-026). The trader evaluates each market's onFeatures at most once per 1 s of EVENT time, plus a 5 s heartbeat. 'Coalesced' counts, at each frame close, every market an event touched that the cadence did not evaluate there: it is not evaluated, so no decision is owed, and it stays owed to a later close. Every event is still applied to the books; fills, order updates and lifecycle callbacks are never delayed.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_evaluations_coalesced_total[5m])", "legendFormat": "coalesced/s" },
+        { "refId": "B", "expr": "rate(trader_evaluations_total[5m])", "legendFormat": "evaluations/s" }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Evaluation cadence: forward-jump alarm",
+      "description": "CADENCE-1 (ADR-026 D2.10). Applied events whose receipt instant lies more than 5 s behind the cadence's event clock: one far-future stamp moved that clock, and no market's onFeatures is evaluated — a stop decided there included — until event time has moved past it by the interval. Any rise pages (TraderCadenceForwardJump, infra/prometheus/trader-alerts.yaml); the trader also logs 'CADENCE CLOCK FORWARD JUMP:'. Check the gateway's receipt clock.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_cadence_forward_jump_alarms_total[5m])", "legendFormat": "events behind the cadence clock" }
+      ]
     }
   ]
 }

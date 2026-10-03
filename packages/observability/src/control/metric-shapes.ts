@@ -69,6 +69,10 @@ export interface TraderLoopHealthInput {
   readonly containedEvaluations: number;
   readonly refusedEvaluations: number;
   readonly deliveriesSuppressedByHalt: number;
+  /** `CADENCE-1` (ADR-026 D5.6): owed markets the evaluation cadence did not evaluate, one per close. */
+  readonly evaluationsCoalesced: number;
+  /** `CADENCE-1` (ADR-026 D2.10): applied events lying beyond the alarm bound behind the cadence clock. */
+  readonly cadenceForwardJumpAlarms: number;
 }
 
 /** Mirrors `apps/trader/src/health.ts` `RiskHealth`. */

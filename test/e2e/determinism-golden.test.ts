@@ -43,7 +43,9 @@ import {
   writeGoldenBytes,
   WRITE_GOLDEN_ENV,
 } from "./support/golden.js";
-import { driveScenario } from "./support/harness.js";
+import { PAPER_EVALUATION_CADENCE } from "@polymarket-bot/trader";
+
+import { driveScenario, goldenReproduction } from "./support/harness.js";
 import { PAPER_E2E_SCENARIO } from "./support/scenario.js";
 import type { Scenario } from "./support/scenario-contract.js";
 import { TWO_BRACKETS_SCENARIO } from "./support/scenarios/two-brackets.js";
@@ -53,8 +55,15 @@ const SCENARIOS: readonly Scenario[] = [PAPER_E2E_SCENARIO, TWO_BRACKETS_SCENARI
 
 for (const scenario of SCENARIOS) {
   describe(`deterministic golden output — ${scenario.name}`, () => {
+    /**
+     * `CADENCE-1` (ADR-026 D1.6): every comparison with the committed golden
+     * REPRODUCES it — the per-frame cadence it was recorded under, declared
+     * with its path. The harness's default is the production cadence (r1, O06).
+     */
+    const reproduction = { scenario, evaluationCadence: goldenReproduction(scenario) };
+
     async function runBytes(): Promise<string> {
-      return serializeArtifact(captureArtifact(await driveScenario({ scenario })));
+      return serializeArtifact(captureArtifact(await driveScenario(reproduction)));
     }
 
     it("two fresh in-suite runs produce byte-identical artefacts", async () => {
@@ -90,7 +99,7 @@ for (const scenario of SCENARIOS) {
     });
 
     it("the comparison is falsifiable: one changed character changes the bytes", async () => {
-      const run = await driveScenario({ scenario });
+      const run = await driveScenario(reproduction);
       const artifact = captureArtifact(run);
       const honest = serializeArtifact(artifact);
       const tampered = serializeArtifact({
@@ -104,10 +113,46 @@ for (const scenario of SCENARIOS) {
       expect(tampered).not.toBe(goldenBytes(scenario));
     });
 
+    it("CADENCE-1 (ADR-026 D1.6): the golden is a DECLARED reproduction of the per-frame cadence it was recorded under", async () => {
+      const golden = JSON.parse(goldenBytes(scenario)) as Record<string, unknown>;
+      expect(golden["evaluationCadence"]).toEqual({ ...goldenReproduction(scenario) });
+      expect(golden["evaluationCadence"]).toEqual({
+        intervalMs: 0,
+        heartbeatMs: 0,
+        reproduces: `test/replay-golden/paper-e2e/${scenario.goldenFile}`,
+      });
+    });
+
+    it("CADENCE-1 (ADR-026): at the PAPER cadence the scenario decides EXACTLY what the golden holds — its events are never under a second apart for one market", async () => {
+      // The harness's default: the production cadence, nothing declared.
+      const paper = captureArtifact(await driveScenario({ scenario }));
+      expect(PAPER_EVALUATION_CADENCE).toEqual({ intervalMs: 1_000, heartbeatMs: 5_000 });
+      expect(paper.evaluationCadence).toEqual({ intervalMs: 1_000, heartbeatMs: 5_000, reproduces: null });
+      expect(paper.health.loop["evaluationsCoalesced"]).toBe(0);
+      expect(paper.health.loop["cadenceForwardJumpAlarms"]).toBe(0);
+      // `CADENCE-1` r1 (J2): one more snapshot ATTEMPT. The two reference trades
+      // owe the market an evaluation before its first book, which is no
+      // evaluation (ADR-026 D2.3), so it stays owed and the `MarketOpened`
+      // close tries it again: `snapshotsUnavailable` is the golden's + 1.
+      const golden = JSON.parse(goldenBytes(scenario)) as typeof paper;
+      expect(paper.health.loop["snapshotsUnavailable"]).toBe(Number(golden.health.loop["snapshotsUnavailable"]) + 1);
+      // Every other byte is the golden's: the same decisions, orders, fills,
+      // ledger, PnL and health.
+      const aligned = {
+        ...paper,
+        evaluationCadence: golden.evaluationCadence,
+        health: {
+          ...paper.health,
+          loop: { ...paper.health.loop, snapshotsUnavailable: golden.health.loop["snapshotsUnavailable"] },
+        },
+      } as typeof paper;
+      expect(serializeArtifact(aligned)).toBe(goldenBytes(scenario));
+    });
+
     it("the golden parses back into the document the chain walk reads", async () => {
       const golden = goldenBytes(scenario);
       const parsed = JSON.parse(golden) as Record<string, unknown>;
-      const produced = captureArtifact(await driveScenario({ scenario }));
+      const produced = captureArtifact(await driveScenario(reproduction));
       expect(parsed["goldenFormatVersion"]).toBe(produced.goldenFormatVersion);
       // A round trip through the committed BYTES, not through the live objects:
       // whatever the walk asserts, it asserts about what is on disk.

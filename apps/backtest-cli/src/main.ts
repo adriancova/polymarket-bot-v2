@@ -13,7 +13,7 @@
  * ```text
  * backtest-cli verify --dataset <dir> --pins <run-pins.json>
  * backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json>
- *                  --artifact <file> [--id-namespace <namespace>]
+ *                  --artifact <file> [--id-namespace <namespace>] [--reproduces <what>]
  * backtest-cli approx-run --store <dir> --manifests <key>[,<key>...]
  *                  --gamma-markets <marketId>=<gammaMarketId>[,...] --pins <run-pins.json>
  *                  --config <trader-config.json> --artifact <file> [--id-namespace <namespace>]
@@ -38,8 +38,17 @@
  * is minted from; absent, it is the instances' run ids joined, as the paper
  * trader derives it. Over the committed fixture
  * `test/replay-golden/backtest/static-bracket/` with
- * `--id-namespace backtest-1-static-bracket-replay`, the artifact is
- * byte-identical to that directory's `expected-artifact.txt`.
+ * `--id-namespace backtest-1-static-bracket-replay` and
+ * `--reproduces test/replay-golden/backtest/static-bracket/expected-artifact.txt`,
+ * the artifact is byte-identical to that directory's `expected-artifact.txt`.
+ *
+ * `--reproduces <what>` (`CADENCE-1`, ADR-026 D1.6) DECLARES that the run
+ * reproduces a golden or a run recorded under ADR-024, and names it (1-256
+ * printable ASCII characters, no space). Only a declared reproduction may run
+ * the per-frame evaluation cadence (pins `evaluationIntervalMs` and
+ * `evaluationHeartbeatMs` 0); every other run uses exactly 1,000 ms and
+ * 5,000 ms and refuses anything else. The artifact records the cadence and
+ * the declaration.
  *
  * The artifact and the report are SIMULATED: every fill is
  * `SIMULATED_NOT_REAL_EVIDENCE`, and the report says `core_run_mode=PAPER`
@@ -124,7 +133,7 @@ export const EXIT_ASK = 4;
 export const USAGE_LINES: readonly string[] = Object.freeze([
   "usage: backtest-cli verify --dataset <dir> --pins <run-pins.json>",
   "       backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json> " +
-    "--artifact <file> [--id-namespace <namespace>]",
+    "--artifact <file> [--id-namespace <namespace>] [--reproduces <what>]",
   "       backtest-cli approx-run --store <dir> --manifests <key>[,<key>...] " +
     "--gamma-markets <marketId>=<gammaMarketId>[,...] --pins <run-pins.json> --config <trader-config.json> " +
     "--artifact <file> [--id-namespace <namespace>]",
@@ -215,7 +224,7 @@ async function runCommand(options: Readonly<Record<string, string>>, io: CliIo):
     for (const line of USAGE_LINES) io.err(line);
     return EXIT_USAGE;
   }
-  const known = new Set(["dataset", "pins", "config", "artifact", "id-namespace"]);
+  const known = new Set(["dataset", "pins", "config", "artifact", "id-namespace", "reproduces"]);
   const unknown = Object.keys(options).filter((key) => !known.has(key));
   if (unknown.length > 0) {
     io.err(`backtest-cli: run does not take ${unknown.map((key) => `--${key}`).join(", ")}`);
@@ -250,12 +259,15 @@ async function runCommand(options: Readonly<Record<string, string>>, io: CliIo):
 
   // --- 3. the core, built HERE, and the run ---------------------------------
   const idNamespace = options["id-namespace"];
+  // `CADENCE-1` (ADR-026 D1.6): a reproduction is DECLARED, never inferred.
+  const reproduces = options["reproduces"];
   const started = await runBacktestCore({
     environment: io.environment,
     traderConfig: config.value,
     runPins: pins,
     datasetDirectory,
     ...(idNamespace === undefined ? {} : { idNamespace }),
+    ...(reproduces === undefined ? {} : { reproduces }),
     log: io.err,
   });
   if (!started.ok) {
@@ -299,6 +311,11 @@ async function runCommand(options: Readonly<Record<string, string>>, io: CliIo):
     io.out(`core_run_mode=${BACKTEST_CORE_RUN_MODE}`);
     io.out("evidence=SIMULATED_NOT_REAL_EVIDENCE");
     io.out(`id_namespace=${core.idNamespace}`);
+    const cadence = core.trader.loop.evaluationCadence();
+    io.out(
+      `evaluation_cadence=${String(cadence.intervalMs)}/${String(cadence.heartbeatMs)}` +
+        (cadence.reproduces === undefined ? "" : ` reproduces=${cadence.reproduces}`),
+    );
     io.out(`halts=${halts}`);
     io.out(`artifact=${artifactPath}`);
     io.out(`artifact_bytes=${String(bytes.byteLength)}`);

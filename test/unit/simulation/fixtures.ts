@@ -322,6 +322,9 @@ export function runPins(overrides: Partial<ReplayRunPins> = {}): ReplayRunPins {
     rewardSnapshotVersion: "rewards/2026-08-24",
     settlementSpecVersions: [],
     simulatorVersion: "wp-210/v2",
+    // `CADENCE-1` (ADR-026 D1.3): the evaluation cadence every run pins.
+    evaluationIntervalMs: 1000,
+    evaluationHeartbeatMs: 5000,
     ...overrides,
   };
 }

@@ -2560,6 +2560,44 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     expect(Object.keys(baseline.value).sort()).toEqual(Object.keys(runPins()).sort());
   });
 
+  it("CADENCE-1 (ADR-026 D1.3): readRunPins REQUIRES the evaluation cadence, as non-negative integers, 0 together or not at all", () => {
+    for (const [pins, accepted] of [
+      [{ evaluationIntervalMs: 1000, evaluationHeartbeatMs: 5000 }, true],
+      [{ evaluationIntervalMs: 0, evaluationHeartbeatMs: 0 }, true],
+      // The door holds the run record's SHAPE (migration 0010's checks); which
+      // values a run may USE is the core's policy, applied by the assembly.
+      [{ evaluationIntervalMs: 2000, evaluationHeartbeatMs: 10000 }, true],
+    ] as const) {
+      const outcome = readRunPins({ ...runPins(), ...pins });
+      expect(outcome.ok, JSON.stringify(pins)).toBe(accepted);
+      if (outcome.ok) {
+        expect([outcome.value.evaluationIntervalMs, outcome.value.evaluationHeartbeatMs]).toEqual([
+          pins.evaluationIntervalMs,
+          pins.evaluationHeartbeatMs,
+        ]);
+      }
+    }
+    const missing = (field: "evaluationIntervalMs" | "evaluationHeartbeatMs"): Record<string, unknown> => {
+      const pins = { ...runPins() } as Record<string, unknown>;
+      delete pins[field];
+      return pins;
+    };
+    for (const [label, offered, code] of [
+      ["no interval", missing("evaluationIntervalMs"), "REPLAY_MANIFEST_PIN_MISSING"],
+      ["no heartbeat", missing("evaluationHeartbeatMs"), "REPLAY_MANIFEST_PIN_MISSING"],
+      ["a string", { ...runPins(), evaluationIntervalMs: "1000" }, "REPLAY_MANIFEST_PIN_MISSING"],
+      ["a fraction", { ...runPins(), evaluationHeartbeatMs: 5000.5 }, "REPLAY_MANIFEST_PIN_MISSING"],
+      ["a negative", { ...runPins(), evaluationIntervalMs: -1 }, "REPLAY_MANIFEST_PIN_MISSING"],
+      ["an unsafe integer", { ...runPins(), evaluationIntervalMs: 2 ** 53 }, "REPLAY_MANIFEST_PIN_MISSING"],
+      ["interval 0 with a heartbeat", { ...runPins(), evaluationIntervalMs: 0 }, "REPLAY_MANIFEST_INVALID"],
+      ["a heartbeat 0 with an interval", { ...runPins(), evaluationHeartbeatMs: 0 }, "REPLAY_MANIFEST_INVALID"],
+    ] as const) {
+      const outcome = readRunPins(offered as unknown as ReplayRunPins);
+      expect(outcome.ok, label).toBe(false);
+      if (!outcome.ok) expect(outcome.refusal.code, label).toBe(code);
+    }
+  });
+
   it("the shared battery really drove the getter-bearing argument", () => {
     // `gettersInvoked` is incremented by the battery's own getter-bearing
     // record. It is NOT asserted to be zero: a door that reads a field by name

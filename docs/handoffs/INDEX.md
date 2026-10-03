@@ -127,3 +127,5 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-03 | [CO2-N1.md](CO2-N1.md) | `CO2-N1`: ADR-031's entry guard on the process clock | Round | Complete (2026-10-03) | `9869e53` | 4 KB |
 | 2026-10-03 | [WALCAP-1.md](WALCAP-1.md) | `WALCAP-1`: the WAL cap after expiry; the stall-bound flake | Round | Complete (2026-10-03) | `da559ca` | 5 KB |
 | 2026-10-03 | [WP-270.md](WP-270.md) | `WP-270`: the OMS and signed-order persistence | WP | Complete (2026-10-03) | `259c964` | 7 KB |
+| 2026-10-03 | [CADENCE-1.md](CADENCE-1.md) | `CADENCE-1`: ADR-026 evaluation cadence | WP | Complete (2026-10-03) | `8d7086a` | 6 KB |
+| 2026-10-03 | [WP-280.md](WP-280.md) | `WP-280`: the authenticated user-stream adapter | WP | Complete (2026-10-03) | `065716f` | 4 KB |

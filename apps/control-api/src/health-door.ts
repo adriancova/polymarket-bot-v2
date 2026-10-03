@@ -199,6 +199,9 @@ const TraderHealthSchema = z.strictObject({
     containedEvaluations: Counter,
     refusedEvaluations: Counter,
     deliveriesSuppressedByHalt: Counter,
+    // `CADENCE-1` (ADR-026 D5.6, D2.10): required like every other counter.
+    evaluationsCoalesced: Counter,
+    cadenceForwardJumpAlarms: Counter,
   }),
   risk: z.strictObject({
     evaluations: Counter,

@@ -268,6 +268,18 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     "loop",
     "Fill and order-view deliveries the §4.2 halt gate withheld from a strategy. The accounting still happened; the halted scope was not allowed to decide on it.",
   ),
+  family(
+    "trader_evaluations_coalesced_total",
+    "counter",
+    "loop",
+    "ADR-026 D5.6: one per owed market at each frame close where the evaluation cadence (at most one onFeatures evaluation per market per 1 s of event time) did not evaluate it. A coalesced market is not evaluated, so no decision is owed; it stays owed to a later close.",
+  ),
+  family(
+    "trader_cadence_forward_jump_alarms_total",
+    "counter",
+    "loop",
+    "ADR-026 D2.10: applied events whose instant lay more than the alarm bound (5 s) behind the evaluation cadence's event clock. While it rises a far-future stamp is holding every onFeatures evaluation, a stop decided there included; it pages.",
+  ),
 
   // --- §9.8 risk ------------------------------------------------------------
   family("trader_risk_evaluations_total", "counter", "risk", "Risk-engine evaluations."),

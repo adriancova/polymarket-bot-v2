@@ -222,6 +222,23 @@ export interface LoopHealth {
    * halted scope was not allowed to decide on what it had booked.
    */
   readonly deliveriesSuppressedByHalt: number;
+  /**
+   * `CADENCE-1` (ADR-026 D5.6): one for each OWED market at each frame close
+   * where the evaluation cadence did not evaluate it. A market that stays owed
+   * over three closes adds three. A coalesced market is not evaluated — the
+   * runtime is never asked — so no decision is owed for it; `evaluations` and
+   * `decisionsPersisted` keep their meaning.
+   */
+  readonly evaluationsCoalesced: number;
+  /**
+   * `CADENCE-1` (ADR-026 D2.10): the forward-jump alarm. One for each APPLIED
+   * event whose instant lay more than the alarm bound (`evaluationHeartbeatMs`,
+   * or 5,000 ms when the heartbeat is off) behind the cadence clock — the
+   * event-time high-water mark a far-future stamp moved. While it rises, no
+   * `onFeatures` evaluation runs until the clock has moved on by the interval,
+   * so a stop decided in `onFeatures` waits: it pages.
+   */
+  readonly cadenceForwardJumpAlarms: number;
 }
 
 /** The integer counters of the §14.3 `accounting` family — what {@link HealthState.countAccounting} moves. */
@@ -503,6 +520,8 @@ export class HealthState {
     containedEvaluations: 0,
     refusedEvaluations: 0,
     deliveriesSuppressedByHalt: 0,
+    evaluationsCoalesced: 0,
+    cadenceForwardJumpAlarms: 0,
   };
 
   #risk = { evaluations: 0, approvals: 0, refusals: 0, refusedExits: 0 };

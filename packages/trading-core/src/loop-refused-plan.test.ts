@@ -114,6 +114,7 @@ import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { PER_FRAME_EVALUATION_CADENCE } from "./cadence.js";
 import type * as Pipeline from "./pipeline.js";
 import { z } from "zod";
 
@@ -727,6 +728,16 @@ function assemble(
     outbox,
     // `FOLD-1` (orchestrator call O1): checked against the rebuilds after EVERY fill.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is the refused-plan
+    // and capital paths, not the cadence — but its timelines were written for
+    // ADR-024's per-frame cadence: a scripted strategy that acts at named events,
+    // often at one instant. Under the production cadence (1,000 ms / 5,000 ms) those
+    // evaluations are coalesced, and 2 of this file's 26 tests fail under it (measured
+    // in r1; the failures were not analysed one by one). So it REPRODUCES the ADR-024
+    // behaviour its timelines pin (the value 0, declared); this subject is NOT
+    // exercised here under the production cadence. The cadence is pinned by
+    // `cadence.test.ts` and `loop-cadence.test.ts`.
+    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-refused-plan.test.ts" },
   });
   wiring.loop = loop;
 

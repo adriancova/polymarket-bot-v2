@@ -42,8 +42,15 @@ import { labelLine } from "./approximate/label.js";
 import type { ReplayDriverObservations } from "./core-loop.js";
 import type { BacktestOutcome } from "./run.js";
 
-/** The format id of the artifact. Frozen by the committed golden; bump = re-derive it. */
-export const BACKTEST_ARTIFACT_FORMAT_ID = "polymarket-bot/backtest-static-bracket-replay/v1";
+/**
+ * The format id of the artifact. Frozen by the committed golden; bump = re-derive it.
+ *
+ * `v2` (`CADENCE-1`): a `--- cadence ---` section after the serialization
+ * records the evaluation cadence the core ran with and, for a declared
+ * reproduction, what it reproduces (ADR-026 D1.3, D1.6). A grammar change, so
+ * a new id; every other line is `v1`'s.
+ */
+export const BACKTEST_ARTIFACT_FORMAT_ID = "polymarket-bot/backtest-static-bracket-replay/v2";
 
 /** What an artifact is rendered from: a completed run and the core that ran. */
 export interface BacktestArtifactInput {
@@ -163,8 +170,33 @@ export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestAr
   }
   const sections = coreSectionLines(input);
   if (!sections.ok) return sections;
-  const lines: string[] = [BACKTEST_ARTIFACT_FORMAT_ID, "--- simulation-run ---", serialization, ...sections.lines];
+  const lines: string[] = [
+    BACKTEST_ARTIFACT_FORMAT_ID,
+    "--- simulation-run ---",
+    serialization,
+    "--- cadence ---",
+    cadenceLine(input.trader),
+    ...sections.lines,
+  ];
   return { ok: true, text: `${lines.join("\n")}\n` };
+}
+
+/**
+ * `CADENCE-1` (ADR-026 D1.3, D1.6): the evaluation cadence the core RAN with —
+ * read from the core, not from the pins it was handed — and, for a declared
+ * reproduction, what it reproduces. `reproduces` is 1-256 printable ASCII
+ * characters without a space (`evaluationCadenceProblem`), so the line stays
+ * one line of `key=value` fields.
+ */
+function cadenceLine(trader: PaperTrader): string {
+  const cadence = trader.loop.evaluationCadence();
+  return [
+    "cadence",
+    `evaluationIntervalMs=${String(cadence.intervalMs)}`,
+    `evaluationHeartbeatMs=${String(cadence.heartbeatMs)}`,
+    `reproduction=${String(cadence.reproduces !== undefined)}`,
+    ...(cadence.reproduces === undefined ? [] : [`reproduces=${cadence.reproduces}`]),
+  ].join(" ");
 }
 
 /** Core section lines, or why they cannot be rendered. */

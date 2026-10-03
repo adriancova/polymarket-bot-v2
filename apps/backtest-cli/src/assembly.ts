@@ -35,6 +35,13 @@
  *    seed come from the configuration; the §12.4 serialization prints the
  *    run pins. A disagreement would make the artifact's `pins` line a claim
  *    about a run that did not happen, so it is REFUSED, naming every field.
+ * 3b. **The evaluation cadence (`CADENCE-1`, ADR-026 D1.3-D1.6).** The run
+ *    pins carry `evaluationIntervalMs` and `evaluationHeartbeatMs`, and the
+ *    core runs with exactly those. A replay that is not a reproduction uses
+ *    exactly 1,000 ms and 5,000 ms; the per-frame value 0 is accepted only
+ *    when the caller DECLARES what the replay reproduces (`reproduces`: a
+ *    golden or an ADR-024 run; the `run` command's `--reproduces`). Anything
+ *    else is REFUSED here, before a core is built.
  * 4. **The replay clock**, at the dataset's first recorded instant, so the
  *    core's constructor reads a recorded value.
  * 5. **The venue, the store, the core, the driver** — in that order, the
@@ -69,7 +76,9 @@ import {
   buildSimulatedVenue,
   checkPaperTraderSafety,
   createPaperTrader,
+  evaluationCadenceProblem,
   parseTraderConfig,
+  type EvaluationCadenceOption,
   type AccountingChecks,
   type PaperTrader,
   type TraderConfig,
@@ -98,6 +107,7 @@ export interface BacktestRefusal {
     | "BACKTEST_DATASET_REFUSED"
     | "BACKTEST_CONFIG_REFUSED"
     | "BACKTEST_PINS_DISAGREE_WITH_CONFIG"
+    | "BACKTEST_CADENCE_REFUSED"
     | "BACKTEST_VENUE_REFUSED"
     | "BACKTEST_CORE_REFUSED";
   readonly detail: string;
@@ -205,8 +215,27 @@ export interface BacktestCoreOptions {
    * every-fill cadence in code (orchestrator call O1).
    */
   readonly accountingChecks?: AccountingChecks;
+  /**
+   * `CADENCE-1` (ADR-026 D1.6): what this replay REPRODUCES — a golden or a run
+   * recorded under ADR-024 — or absent for a replay that reproduces nothing.
+   * Only a declared reproduction may run the per-frame value 0 its pins state.
+   * 1-256 printable ASCII characters without a space; the artifact prints it.
+   */
+  readonly reproduces?: string;
   /** Where the venue's policy logs an unresolvable time-in-force. */
   readonly log?: (line: string) => void;
+}
+
+/**
+ * `CADENCE-1` (ADR-026 D1.3-D1.6): the evaluation cadence a replay runs with —
+ * its run pins' two values, and what it reproduces when it declares that. Pure.
+ */
+export function replayEvaluationCadence(pins: ReplayRunPins, reproduces: string | undefined): EvaluationCadenceOption {
+  return {
+    intervalMs: pins.evaluationIntervalMs,
+    heartbeatMs: pins.evaluationHeartbeatMs,
+    ...(reproduces === undefined ? {} : { reproduces }),
+  };
 }
 
 /** What the assembly built. */
@@ -254,6 +283,19 @@ export function assembleBacktestCore(options: BacktestCoreOptions): BacktestCore
     );
   }
 
+  // --- 3b. CADENCE-1: the evaluation cadence the pins state (ADR-026 D1) ----
+  const cadence = replayEvaluationCadence(options.runPins, options.reproduces);
+  const cadenceProblem = evaluationCadenceProblem(cadence);
+  if (cadenceProblem !== undefined) {
+    return refuse(
+      "BACKTEST_CADENCE_REFUSED",
+      "the evaluation cadence the run pins state is refused: a replay that is not a reproduction uses exactly " +
+        "1000 ms and 5000 ms, and the per-frame value 0 needs a declared reproduction (ADR-026 D1.5-D1.6; the " +
+        "run command's --reproduces); no core was built",
+      [cadenceProblem],
+    );
+  }
+
   // --- 4. the replay clock --------------------------------------------------
   const clock = createReplayClock(options.clockStart);
   if (!clock.ok) {
@@ -287,6 +329,19 @@ export function assembleBacktestCore(options: BacktestCoreOptions): BacktestCore
     store,
     idNamespace,
     ...(options.accountingChecks === undefined ? {} : { accountingChecks: options.accountingChecks }),
+    // `CADENCE-1`: the pinned cadence, checked above; the core checks it again.
+    evaluationCadence: cadence,
+    ...(options.log === undefined
+      ? {}
+      : {
+          onCadenceAlarm: (alarm) => {
+            options.log?.(
+              `CADENCE CLOCK ${alarm.kind === "RAISED" ? "FORWARD JUMP" : "CAUGHT UP"}: event ${alarm.eventAt} lies ` +
+                `${String(alarm.behindMs)} ms behind the event clock ${alarm.clockAt} (bound ${String(alarm.boundMs)} ms; ` +
+                "ADR-026 D2.10)",
+            );
+          },
+        }),
   });
   if (!created.ok) {
     return refuse(
@@ -395,6 +450,7 @@ export async function runBacktestCore(options: BacktestCoreRunOptions): Promise<
     clockStart: { receivedAt: first.receivedAt, receivedMonotonicNs: "0" },
     ...(options.idNamespace === undefined ? {} : { idNamespace: options.idNamespace }),
     ...(options.accountingChecks === undefined ? {} : { accountingChecks: options.accountingChecks }),
+    ...(options.reproduces === undefined ? {} : { reproduces: options.reproduces }),
     ...(options.log === undefined ? {} : { log: options.log }),
   });
   if (!assembled.ok) return assembled;

@@ -9,5 +9,7 @@
   "feeSnapshotVersion": "backtest1.sim.2026-05-01",
   "rewardSnapshotVersion": "rewards/none",
   "settlementSpecVersions": [],
-  "simulatorVersion": "wp-210/v2"
+  "simulatorVersion": "wp-210/v2",
+  "evaluationIntervalMs": 0,
+  "evaluationHeartbeatMs": 0
 }
