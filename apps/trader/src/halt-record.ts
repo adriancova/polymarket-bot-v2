@@ -57,12 +57,19 @@
  *   the process exits 75 as before;
  * - PostgreSQL answers slowly: the transaction's own `statement_timeout` is
  *   the bound, so the server cancels the insert;
- * - PostgreSQL does not answer at all: the call returns at the bound,
- *   `HALT RECORD UNCONFIRMED` is logged (the rows may or may not exist), and
- *   the process goes on to close and exit 75.
+ * - PostgreSQL does not answer at all (frozen, partitioned): the call returns
+ *   at the bound, `HALT RECORD UNCONFIRMED` is logged (the rows may or may
+ *   not exist), the write's connection is DESTROYED (`PROVENANCE-1` r1,
+ *   `PROV1-R1-02`: left checked out, it held the PostgreSQL close, and so the
+ *   process's exit, until the server answered), and the process goes on to
+ *   close and exit 75.
  *
  * Fail-closed behaviour is not weakened to get the row written: no retry, no
- * wait past the bound, no change to the exit code.
+ * wait past the bound, no change to the exit code. What the close can still
+ * wait on is what it waited on before this round: a trading commit already
+ * in flight on a silent server (`pg` sets no client-side query timeout), and
+ * — new here, and bounded — a connection the pool was still opening for the
+ * record at the bound, which the pool's own connection timeout ends.
  */
 
 import type { HaltRecord, TraderConfig } from "@polymarket-bot/trading-core";

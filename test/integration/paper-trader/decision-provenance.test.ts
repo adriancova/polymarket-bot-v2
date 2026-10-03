@@ -26,7 +26,7 @@ import type { EventEnvelope } from "@polymarket-bot/domain";
 import type { IngestedEvent } from "@polymarket-bot/trader";
 import { describe, expect, it } from "vitest";
 
-import { GATEWAY_EPOCH, MARKET_ID, YES_TOKEN, ingested, recordedEvents } from "./support/fixture.js";
+import { CONDITION_ID, GATEWAY_EPOCH, MARKET_ID, T_CLOSE, YES_TOKEN, ingested, recordedEvents } from "./support/fixture.js";
 import { assembleOrThrow, driveRecordedRun } from "./support/run.js";
 
 /** The envelope fields a decision's `sourceEvent` must equal. */
@@ -140,5 +140,63 @@ describe("every persisted decision carries its triggering envelope's dispatch po
       .filter((record) => record.sourceEvent?.eventId === first.envelope.eventId || record.sourceEvent?.eventId === second.envelope.eventId);
     // Exactly the one frame-close evaluation, keyed to the frame's last event.
     expect(fromFrame.map((record) => ({ ...record.sourceEvent }))).toStrictEqual([positionOf(second)]);
+  });
+
+  it("a LIFECYCLE callback inside a multi-event frame carries ITS OWN event's position, not the frame's last (r1, F2)", async () => {
+    // Review r1 (`F2-INFRAME-LIFECYCLE-POSITION-UNTESTED`): a callback that is
+    // not `onFeatures` fires in place inside a frame (`#applyWithinFrame`),
+    // and no test pinned its position — a mutant that shifted it survived.
+    // One venue frame (one causationId): a level change, the market's
+    // `MarketClosing`, another level change. The closing is evaluated where
+    // it stands, as the frame's MIDDLE event; the frame's owed `onFeatures`
+    // evaluation runs at its close, as its last event.
+    const opening = recordedEvents().slice(0, 5);
+    // Right after the opening's books, so they are fresh (as in the frame test above).
+    const at = "2026-03-04T12:00:03.000Z";
+    const causation = `raw:${GATEWAY_EPOCH}:29`;
+    const before = restamped(
+      ingested(
+        "BookLevelChanged",
+        { internalMarketId: MARKET_ID, tokenId: YES_TOKEN, side: "BID", price: "0.32", size: "180" },
+        { receivedAt: at, ingestSeq: 30 },
+      ),
+      GATEWAY_EPOCH,
+      "30",
+      causation,
+    );
+    const closing = restamped(
+      ingested(
+        "MarketClosing",
+        { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, closesAt: T_CLOSE },
+        { receivedAt: at, ingestSeq: 31 },
+      ),
+      GATEWAY_EPOCH,
+      "31",
+      causation,
+    );
+    const after = restamped(
+      ingested(
+        "BookLevelChanged",
+        { internalMarketId: MARKET_ID, tokenId: YES_TOKEN, side: "BID", price: "0.31", size: "250" },
+        { receivedAt: at, ingestSeq: 32 },
+      ),
+      GATEWAY_EPOCH,
+      "32",
+      causation,
+    );
+    const run = assembleOrThrow();
+    for (const event of [...opening, before, closing, after]) expect(run.trader.loop.ingest(event)).toBe(true);
+    await run.trader.loop.drain();
+    const fromFrame = run.parts.store.decisions
+      .map((entry) => entry.record)
+      .filter((record) =>
+        [before, closing, after].some((event) => record.sourceEvent?.eventId === event.envelope.eventId),
+      );
+    // The closing callback first, in place, at ITS position; then the frame's
+    // one owed evaluation, at the frame's last event.
+    expect(fromFrame.map((record) => [record.callback, { ...record.sourceEvent }])).toStrictEqual([
+      ["onMarketClosing", positionOf(closing)],
+      ["onFeatures", positionOf(after)],
+    ]);
   });
 });

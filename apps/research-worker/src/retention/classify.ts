@@ -11,8 +11,10 @@
  *   instance's durable frontier — the largest `(gatewayEpoch, ingestSeq)` its
  *   persisted decisions carry — must have passed every sealed frame that could
  *   be stamped inside the window's range (`wal-index.ts`,
- *   `dispatchRequirements`). A trader that lags or is stopped has not passed
- *   it, and a trader whose decisions carry no dispatch position
+ *   `dispatchRequirements`); where the epoch ENDED inside that range, the
+ *   instance must have moved on to a later epoch in the same run
+ *   (`meetsRequirement`; `PROVENANCE-1` r1). A trader that lags or is stopped
+ *   has not passed it, and a trader whose decisions carry no dispatch position
  *   (`H1R1-PROVENANCE`) cannot show that it has, so the window stays
  *   unclassified; whether the process is running does not matter.
  * - A window **only the gateway records** is classified when it has closed.
@@ -246,7 +248,11 @@ async function classificationBlocker(
     }
     for (const requirement of required.requirements) {
       if (!meetsRequirement(frontier, requirement)) {
-        return `instance ${instanceId} has not durably processed epoch ${requirement.gatewayEpoch} past ingestSeq ${requirement.ingestSeq}`;
+        return requirement.kind === "past-epoch-end"
+          ? `instance ${instanceId} has not moved past epoch ${requirement.gatewayEpoch}, which ended inside the window's ` +
+              `range after ingestSeq ${requirement.ingestSeq}: only a later epoch's decision of the same run shows ` +
+              "that the epoch's last events, and their rows, were completed"
+          : `instance ${instanceId} has not durably processed epoch ${requirement.gatewayEpoch} past ingestSeq ${requirement.ingestSeq}`;
       }
     }
   }

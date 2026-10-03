@@ -46,7 +46,7 @@
  * are throwaway temporary directories; nothing outside them is touched.
  */
 
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -148,72 +148,118 @@ interface Timeline {
   readonly events: readonly IngestedEvent[];
 }
 
-/** The gateway's two outputs for one timeline: the raw frames it records and the events it dispatches. */
-function timeline(marketId: string, conditionId: string): Timeline {
-  resetEventIds();
-  const raws: RawFrameRecord[] = [];
-  const events: IngestedEvent[] = [];
-  let seq = 0;
-  const iso = (atMs: number): string => new Date(atMs).toISOString();
-  const binance = (atMs: number, price: string): void => {
-    seq += 1;
-    raws.push(
-      buildRawFrameRecord({
-        gatewayEpoch: GATEWAY_EPOCH,
-        ingestSeq: String(seq),
-        source: "binance",
-        endpoint: "wss://data-stream.binance.vision/stream",
-        connectionId: "bn-1",
-        subscriptionGeneration: 0,
-        receivedAt: iso(atMs),
-        receivedMonotonicNs: String(seq * 1_000_000),
-        payloadUtf8: JSON.stringify({
-          stream: "btcusdt@trade",
-          data: { e: "trade", E: atMs, s: "BTCUSDT", t: seq, p: price, q: "0.25", T: atMs, m: false, M: true },
-        }),
-      }),
-    );
-    seq += 1;
-    events.push(
-      ingested(
-        "ReferenceTradeObserved",
-        { venue: "binance", symbol: "BTCUSDT", price, size: "0.25" },
-        { receivedAt: iso(atMs), ingestSeq: seq, source: "binance" },
-      ),
-    );
-  };
-  const book = (
+/** The gateway's two outputs, as one gateway epoch records and dispatches them. */
+interface GatewayRecorder extends Timeline {
+  /** A reference print: one raw frame, then its event. */
+  readonly binance: (atMs: number, price: string) => void;
+  /** A book snapshot: one raw frame, then its event. */
+  readonly book: (
     atMs: number,
     tokenId: string,
     bids: readonly { price: string; size: string }[],
     asks: readonly { price: string; size: string }[],
-  ): void => {
-    seq += 1;
-    raws.push(
-      buildRawFrameRecord({
-        gatewayEpoch: GATEWAY_EPOCH,
-        ingestSeq: String(seq),
-        source: "polymarket",
-        endpoint: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-        connectionId: "pm-1",
-        subscriptionGeneration: 0,
-        receivedAt: iso(atMs),
-        receivedMonotonicNs: String(seq * 1_000_000),
-        payloadUtf8: JSON.stringify([
-          { event_type: "book", market: conditionId, asset_id: tokenId, bids, asks, timestamp: String(atMs) },
-        ]),
-      }),
-    );
-    seq += 1;
-    events.push(
-      ingested("BookSnapshot", { internalMarketId: marketId, tokenId, bids, asks }, { receivedAt: iso(atMs), ingestSeq: seq }),
-    );
+  ) => void;
+  /** The market's opening: an event with its own `ingestSeq`, from no market-data frame. */
+  readonly opened: (atMs: number) => void;
+}
+
+/**
+ * One gateway epoch's recorder: each raw frame takes one `ingestSeq` and its
+ * event the next, from 1 (a live gateway assigns every envelope its own
+ * `ingestSeq` after the frame's, `frames.ts`).
+ */
+function gatewayRecorder(gatewayEpoch: string, marketId: string, conditionId: string): GatewayRecorder {
+  const raws: RawFrameRecord[] = [];
+  const events: IngestedEvent[] = [];
+  let seq = 0;
+  const iso = (atMs: number): string => new Date(atMs).toISOString();
+  // The fixture stamps its own epoch; another epoch's events carry theirs.
+  const dispatched = (event: IngestedEvent): IngestedEvent =>
+    gatewayEpoch === GATEWAY_EPOCH
+      ? event
+      : { envelope: { ...event.envelope, gatewayEpoch }, identity: { ...event.identity, gatewayEpoch } };
+  return {
+    raws,
+    events,
+    binance: (atMs, price) => {
+      seq += 1;
+      raws.push(
+        buildRawFrameRecord({
+          gatewayEpoch,
+          ingestSeq: String(seq),
+          source: "binance",
+          endpoint: "wss://data-stream.binance.vision/stream",
+          connectionId: "bn-1",
+          subscriptionGeneration: 0,
+          receivedAt: iso(atMs),
+          receivedMonotonicNs: String(seq * 1_000_000),
+          payloadUtf8: JSON.stringify({
+            stream: "btcusdt@trade",
+            data: { e: "trade", E: atMs, s: "BTCUSDT", t: seq, p: price, q: "0.25", T: atMs, m: false, M: true },
+          }),
+        }),
+      );
+      seq += 1;
+      events.push(
+        dispatched(
+          ingested(
+            "ReferenceTradeObserved",
+            { venue: "binance", symbol: "BTCUSDT", price, size: "0.25" },
+            { receivedAt: iso(atMs), ingestSeq: seq, source: "binance" },
+          ),
+        ),
+      );
+    },
+    book: (atMs, tokenId, bids, asks) => {
+      seq += 1;
+      raws.push(
+        buildRawFrameRecord({
+          gatewayEpoch,
+          ingestSeq: String(seq),
+          source: "polymarket",
+          endpoint: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+          connectionId: "pm-1",
+          subscriptionGeneration: 0,
+          receivedAt: iso(atMs),
+          receivedMonotonicNs: String(seq * 1_000_000),
+          payloadUtf8: JSON.stringify([
+            { event_type: "book", market: conditionId, asset_id: tokenId, bids, asks, timestamp: String(atMs) },
+          ]),
+        }),
+      );
+      seq += 1;
+      events.push(
+        dispatched(
+          ingested("BookSnapshot", { internalMarketId: marketId, tokenId, bids, asks }, { receivedAt: iso(atMs), ingestSeq: seq }),
+        ),
+      );
+    },
+    opened: (atMs) => {
+      seq += 1;
+      events.push(
+        dispatched(
+          ingested("MarketOpened", { internalMarketId: marketId, conditionId, openedAt: T_OPEN }, { receivedAt: iso(atMs), ingestSeq: seq }),
+        ),
+      );
+    },
   };
-  const opened = (atMs: number): void => {
-    // The lifecycle event: dispatched with its own ingestSeq, from no market-data frame.
-    seq += 1;
-    events.push(ingested("MarketOpened", { internalMarketId: marketId, conditionId, openedAt: T_OPEN }, { receivedAt: iso(atMs), ingestSeq: seq }));
-  };
+}
+
+const YES_BIDS = [
+  { price: "0.32", size: "200" },
+  { price: "0.31", size: "300" },
+];
+const YES_ASKS = [
+  { price: "0.34", size: "200" },
+  { price: "0.35", size: "300" },
+];
+const NO_BIDS = [{ price: "0.65", size: "200" }];
+const NO_ASKS = [{ price: "0.66", size: "200" }];
+
+/** The gateway's two outputs for one timeline: the raw frames it records and the events it dispatches. */
+function timeline(marketId: string, conditionId: string): Timeline {
+  resetEventIds();
+  const { raws, events, binance, book, opened } = gatewayRecorder(GATEWAY_EPOCH, marketId, conditionId);
 
   // Stretch A: reference prints only, 10:00-10:10.
   for (let atMs = Date.parse("2026-03-04T10:00:00.000Z"); atMs <= STRETCH_A_END_MS; atMs += 20_000) binance(atMs, "99000");
@@ -221,23 +267,15 @@ function timeline(marketId: string, conditionId: string): Timeline {
   binance(OPEN_MS - 2_000, "100000");
   binance(OPEN_MS - 1_000, "100100");
   opened(OPEN_MS);
-  const yesBids = [
-    { price: "0.32", size: "200" },
-    { price: "0.31", size: "300" },
-  ];
-  const yesAsks = [
-    { price: "0.34", size: "200" },
-    { price: "0.35", size: "300" },
-  ];
-  book(OPEN_MS + 1_000, YES_TOKEN, yesBids, yesAsks);
-  book(OPEN_MS + 2_000, NO_TOKEN, [{ price: "0.65", size: "200" }], [{ price: "0.66", size: "200" }]);
-  book(OPEN_MS + 3_000, YES_TOKEN, yesBids, yesAsks);
+  book(OPEN_MS + 1_000, YES_TOKEN, YES_BIDS, YES_ASKS);
+  book(OPEN_MS + 2_000, NO_TOKEN, NO_BIDS, NO_ASKS);
+  book(OPEN_MS + 3_000, YES_TOKEN, YES_BIDS, YES_ASKS);
   // The venue re-sends each book periodically (a snapshot a minute here), so a
   // trader restarted mid-window has an authoritative book again (§7.1).
   const resend = (atMs: number): void => {
     if ((atMs - OPEN_MS) % MINUTE !== 0) return;
-    book(atMs + 1, YES_TOKEN, yesBids, yesAsks);
-    book(atMs + 2, NO_TOKEN, [{ price: "0.65", size: "200" }], [{ price: "0.66", size: "200" }]);
+    book(atMs + 1, YES_TOKEN, YES_BIDS, YES_ASKS);
+    book(atMs + 2, NO_TOKEN, NO_BIDS, NO_ASKS);
   };
   for (let atMs = OPEN_MS + 10_000; atMs < CLOSE_MS; atMs += 10_000) {
     binance(atMs, "100050");
@@ -264,7 +302,7 @@ async function recordWal(directoryPath: string, raws: readonly RawFrameRecord[])
   const clock = createManualClock({ startEpochMs: previousMs });
   const writer = await openWalWriter({
     directoryPath,
-    gatewayEpoch: GATEWAY_EPOCH,
+    gatewayEpoch: first.gatewayEpoch,
     fileSystem: nodeWalFileSystem(),
     clock,
     maxSegmentBytes: 6_000,
@@ -668,5 +706,236 @@ describe("raw WAL expires where a trader runs, through the real composition root
 
   it("HALT: a partition halts the trader inside the window and a new run of the instance carries on; the halt pins the window (30 days)", async () => {
     await retentionScenario("halt-and-restart");
+  }, 300_000);
+});
+
+/** The gateway epoch that follows the fixture's when the first gateway stops (`PROV1-R1-01`). */
+const LATER_EPOCH = "018f4a7e-5555-7abc-8def-00000000beef";
+/** A recording an hour old: it keeps the sealed WAL past the window's range without ever expiring. */
+const ANCHOR_EPOCH = "018f4a7e-5555-7abc-8def-00000000cafe";
+
+describe("a window whose gateway epoch ENDS inside it classifies only once the run moved past the epoch (PROVENANCE-1 r1, PROV1-R1-01)", () => {
+  it("EPOCH END: the entry's event is the epoch's last; while its fill's insert waits on a lock the window is NOT classified and its raw is kept; still not once the fill lands; it classifies as FILL (kept forever) once the run decides in the next epoch", async () => {
+    // Review r1 (`PROV1-R1-01`, reproduced by both reviewers through these
+    // same composition roots): the decision on the epoch's last event is made
+    // durable BEFORE its placement (`DURABLE-1`), so it carried the frontier
+    // past the epoch's last frame while that event's own fill was still being
+    // written. The worker classified the window `intent` with no fill, pinned
+    // it for 30 days and deleted its raw, and a fill pin could never be made
+    // afterwards (its frames were gone).
+    const label = "prov-retention-epoch-end";
+    const root = await mkdtemp(join(tmpdir(), "pmb-provenance-1-r1-"));
+    const walRoot = join(root, "wal");
+    try {
+      await withFreshDatabase(postgres.getConnectionUri(), label, async ({ connectionString, context }) => {
+        const registered = await registerThroughTheRepositories(context, label);
+        const conditionId = `${CONDITION_ID}-${label}`;
+        // The first gateway stops right after the NO book, 12:00:02: the
+        // event that arms the entry is its epoch's LAST, and the epoch ends
+        // (its newest segment sealed by the shutdown) inside the window's range.
+        const full = timeline(registered.marketId, conditionId);
+        const cutoffMs = OPEN_MS + 2_000;
+        const raws = full.raws.filter((raw) => Date.parse(raw.receivedAt) <= cutoffMs);
+        const events = full.events.filter((event) => Date.parse(event.envelope.receivedAt) <= cutoffMs);
+        const lastRaw = raws.at(-1)?.ingestSeq ?? "";
+        const lastEvent = events.at(-1)?.envelope.ingestSeq ?? "";
+        expect(Number(lastEvent)).toBe(Number(lastRaw) + 1);
+        await recordWal(walRoot, raws);
+        // A later recording, an hour old (younger than 72 h, so it never
+        // expires here): the sealed, verified WAL is past the window's range
+        // in every cycle below, so what holds the window back is the rule
+        // under test, not a WAL that has not moved on.
+        const anchor = gatewayRecorder(ANCHOR_EPOCH, registered.marketId, conditionId);
+        anchor.binance(Date.now() - HOUR, "100040");
+        await recordWal(join(walRoot, ANCHOR_EPOCH), anchor.raws);
+        // The next gateway epoch, after the window's range: both books again,
+        // then reference prints — what the trader consumes once it moves on.
+        // Its frames reach the WAL when that gateway runs (below).
+        const later = gatewayRecorder(LATER_EPOCH, registered.marketId, conditionId);
+        later.book(CLOSE_MS + 2 * MINUTE, YES_TOKEN, YES_BIDS, YES_ASKS);
+        later.book(CLOSE_MS + 2 * MINUTE + 1_000, NO_TOKEN, NO_BIDS, NO_ASKS);
+        for (let step = 1; step <= 4; step += 1) later.binance(CLOSE_MS + 2 * MINUTE + step * 10_000, "100030");
+        const recorded = await segmentFiles(walRoot);
+        // The window's segments: every segment of the first epoch stamped inside the window's range.
+        const windowSegments: string[] = [];
+        for (const name of recorded) {
+          const segmentRaws = await readFile(join(walRoot, name), "utf8");
+          if (segmentRaws.includes(`"ingestSeq":"${lastRaw}"`)) windowSegments.push(name);
+        }
+        expect(windowSegments).toHaveLength(1);
+
+        const registry = join(root, "windows.json");
+        const windowId = "btc-updown-15m-epoch-end";
+        await writeFile(
+          registry,
+          JSON.stringify({
+            windowRegistryVersion: 1,
+            windows: [
+              {
+                windowId,
+                marketId: registered.marketId,
+                conditionId,
+                tokenIds: [YES_TOKEN, NO_TOKEN],
+                windowStart: T_OPEN,
+                windowEnd: T_CLOSE,
+                responsibleFrom: new Date(RESPONSIBLE_FROM_MS).toISOString(),
+                responsibility: { kind: "trader", instanceIds: [registered.instanceId] },
+              },
+            ],
+          }),
+        );
+        await writeFile(join(walRoot, EXPIRY_OPT_IN_MARKER_FILE_NAME), EXPIRY_OPT_IN_MARKER_CONTENT);
+        const objectStoreRoot = join(root, "objects");
+        const cycle = async (): Promise<{ readonly report: Record<string, unknown>; readonly classification: Record<string, unknown> }> => {
+          const { code, report } = await storageCommand({
+            RESEARCH_WORKER_WAL_ROOT: walRoot,
+            RESEARCH_WORKER_OBJECT_STORE_ROOT: objectStoreRoot,
+            RESEARCH_WORKER_STATE_DIR: join(root, "state"),
+            RESEARCH_WORKER_WINDOW_REGISTRY: registry,
+            RESEARCH_WORKER_TRADER_DATABASE_URL: connectionString,
+            RESEARCH_WORKER_TRADER_ENVIRONMENT: "PAPER",
+            RESEARCH_WORKER_EXPIRY_MODE: "execute",
+            RESEARCH_WORKER_EXTRACTION_BATCH_DELAY_MS: "0",
+          });
+          expect(code, JSON.stringify(report, null, 2)).toBe(0);
+          const classifications = report["classifications"] as readonly Record<string, unknown>[];
+          expect(classifications).toHaveLength(1);
+          return { report, classification: classifications[0] ?? {} };
+        };
+        const evidence = postgresTraderEvidence(context.db, { environment: "PAPER" });
+        const notMovedOn = new RegExp(
+          `has not moved past epoch ${GATEWAY_EPOCH}, which ended inside the window's range after ingestSeq ${lastRaw}`,
+          "u",
+        );
+
+        const stream = uniqueStreamName(label);
+        const base = documentFor(registered, label);
+        const document = { ...base, infrastructure: { ...(base["infrastructure"] as Record<string, unknown>), eventStream: stream } };
+        const hop = await startFreezableRedisProxy(redis.getConnectionUrl());
+        const publisher = await connectPublisher(redis.getConnectionUrl());
+        // The entry's fill is written to `accounting.ledger_transactions`: its
+        // insert waits on this lock for as long as the test holds it.
+        const lock = await context.pool.connect();
+        let locked = true;
+        await lock.query("begin");
+        await lock.query("lock table accounting.ledger_transactions in share mode");
+        const lines: string[] = [];
+        const exit = startup({
+          env: {
+            ...safeEnvironment(),
+            TRADER_CONFIG_PATH: `/${label}.json`,
+            REDIS_URL: hop.url,
+            DATABASE_URL: connectionString,
+            [REDIS_RESPONSE_TIMEOUT_ENV]: "1000",
+          },
+          readConfig: () => Promise.resolve(JSON.stringify(document)),
+          log: (line) => {
+            lines.push(line);
+          },
+        });
+        let stopped = false;
+        let whilePending = "";
+        try {
+          for (const event of events) await publisher.publish(stream, event.envelope);
+          await waitFor("the entry's fill insert to wait on the lock", 60_000, async () => {
+            const waiting = await context.pool.query(
+              "select pid from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' " +
+                "and query like '%ledger_transactions%'",
+            );
+            return waiting.rows.length > 0 ? true : undefined;
+          });
+          // The entry's decision IS durable, on the epoch's last event — past
+          // its last frame; its fill is NOT.
+          const entry = await context.db
+            .selectFrom("strategy.decisions")
+            .select(["gateway_epoch", "ingest_seq", "intent_count"])
+            .where("instance_id", "=", registered.instanceId)
+            .where("intent_count", ">", 0)
+            .execute();
+          expect(entry).toEqual([{ gateway_epoch: GATEWAY_EPOCH, ingest_seq: lastEvent, intent_count: expect.any(Number) }]);
+          expect(await evidence.dispatchFrontiers([registered.instanceId])).toEqual(
+            new Map([[registered.instanceId, { byEpoch: new Map([[GATEWAY_EPOCH, lastEvent]]), completedEpochs: new Set() }]]),
+          );
+          expect(await context.db.selectFrom("accounting.ledger_transactions").select("event_type").execute()).toEqual([]);
+
+          // --- cycle 1, execute, while the fill is pending: NOT classified, the window's raw kept.
+          const first = await cycle();
+          expect(first.classification, JSON.stringify(first.report, null, 2)).toMatchObject({
+            windowId,
+            state: "unclassified",
+            reason: expect.stringMatching(notMovedOn),
+          });
+          expect(first.report["pins"]).toEqual([]);
+          for (const name of windowSegments) expect(await segmentFiles(walRoot)).toContain(name);
+          whilePending = String(first.classification["state"]);
+        } finally {
+          if (locked) {
+            locked = false;
+            await lock.query("rollback");
+            lock.release();
+          }
+        }
+        try {
+          await waitFor("the entry's fill to be durable", 60_000, async () => {
+            const rows = await context.db
+              .selectFrom("accounting.ledger_transactions")
+              .select("event_type")
+              .where("event_type", "=", "TRADE_PRINCIPAL")
+              .execute();
+            return rows.length > 0 ? rows : undefined;
+          });
+          // --- cycle 2: the fill is durable, but nothing shows the epoch's
+          // last events were COMPLETED (a halt latched now would be stamped
+          // at their instant): still not classified, the raw still kept.
+          const second = await cycle();
+          expect(second.classification).toMatchObject({ windowId, state: "unclassified", reason: expect.stringMatching(notMovedOn) });
+          for (const name of windowSegments) expect(await segmentFiles(walRoot)).toContain(name);
+
+          // --- the next gateway runs, and the trader moves on: it decides in the next epoch.
+          await recordWal(join(walRoot, LATER_EPOCH), later.raws);
+          for (const event of later.events) await publisher.publish(stream, event.envelope);
+          await waitFor("a decision of the run in the next epoch", 60_000, async () => {
+            const rows = await context.db
+              .selectFrom("strategy.decisions")
+              .select("ingest_seq")
+              .where("instance_id", "=", registered.instanceId)
+              .where("gateway_epoch", "=", LATER_EPOCH)
+              .execute();
+            return rows.length > 0 ? rows : undefined;
+          });
+          const frontier = (await evidence.dispatchFrontiers([registered.instanceId])).get(registered.instanceId);
+          expect(frontier?.completedEpochs).toEqual(new Set([GATEWAY_EPOCH]));
+
+          // --- cycle 3: classified FILL, kept forever; the window's frames are in the verified pin.
+          const third = await cycle();
+          const shown = JSON.stringify(third.report, null, 2);
+          expect(third.classification, shown).toMatchObject({ windowId, state: "classified", pinClass: "fill" });
+          const counts = third.classification["evidenceCounts"] as Record<string, number>;
+          expect(counts["fills"]).toBeGreaterThanOrEqual(1);
+          const pins = third.report["pins"] as readonly Record<string, unknown>[];
+          expect(pins).toHaveLength(1);
+          expect(pins[0], shown).toMatchObject({ status: "extracted", pinClass: "fill", keepUntil: null, sourceEventsInside: true });
+          const pin = await readPinRecord(fileSystemObjectStore(objectStoreRoot), String(pins[0]?.["pinId"]));
+          const pinned = pin?.datasets.flatMap((dataset) => dataset.segmentIds) ?? [];
+          for (const name of windowSegments) expect(pinned).toContain(name.replace(/\.wal\.jsonl$/u, ""));
+          console.log(
+            `[PROVENANCE-1 r1 measured, epoch end] last raw ${lastRaw}, entry event ${lastEvent}; cycle 1 (fill pending): ` +
+              `${whilePending}; cycle 2 (fill durable, run not moved on): ` +
+              `${String(second.classification["state"])}; cycle 3 (run decided in ${LATER_EPOCH}): ` +
+              `${String(third.classification["state"])} ${String(third.classification["pinClass"])}, ` +
+              `${String(pinned.length)} segment(s) in the pin`,
+          );
+        } finally {
+          hop.freeze();
+          expect(await exit, lines.join("\n")).toBe(EXIT_CODES.halted);
+          stopped = true;
+          await hop.close();
+          await publisher.close();
+        }
+        expect(stopped).toBe(true);
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }, 300_000);
 });

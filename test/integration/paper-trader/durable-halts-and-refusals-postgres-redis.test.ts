@@ -17,6 +17,11 @@
  *    the one the record is written to. The record cannot land; the process
  *    says so (`HALT RECORD NOT DURABLE`) and exits 75 regardless, within the
  *    stated bound: fail-closed exit is not weakened to get a row written.
+ * 3b. **PostgreSQL SILENT** (frozen behind a proxy, sockets open) with Redis
+ *    — `PROVENANCE-1` r1, `PROV1-R1-02`: the record answers `UNCONFIRMED` at
+ *    its bound and its connection is destroyed, so `startup()` returns 75
+ *    while PostgreSQL is still frozen (it used to wait for PostgreSQL to
+ *    answer again).
  * 4. **Refusals and a halt, read as a window's evidence** — a risk policy
  *    that refuses the entry, then a Redis partition inside the window: the
  *    research worker's `postgresTraderEvidence` reads the refusal rows, the
@@ -385,6 +390,70 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
       if (!ownStopped) await own.stop();
     }
   }, 300_000);
+
+  it("PostgreSQL goes SILENT (frozen, sockets open) with Redis: the record answers UNCONFIRMED at its bound, its connection is destroyed, and startup() returns 75 while PostgreSQL is STILL frozen (PROV1-R1-02)", async () => {
+    // Review r1 (`PROV1-R1-02`, reproduced by both reviewers): the record's
+    // timer answered at the bound, but its connection stayed checked out, so
+    // the store's close (`pool.end()`) waited for it and `startup()` returned
+    // only once PostgreSQL answered again. Nothing was in flight here: the
+    // trader is quiescent when both links go silent.
+    await withFreshDatabase(postgres.getConnectionUri(), "prov-silent-db", async ({ connectionString, context }) => {
+      const label = "prov-silent-db";
+      const registered = await registerThroughTheRepositories(context, label);
+      const stream = uniqueStreamName(label);
+      const postgresHop = await startFreezableRedisProxy(connectionString);
+      const redisHop = await startFreezableRedisProxy(redis.getConnectionUrl());
+      const throughHop = new URL(connectionString);
+      throughHop.hostname = "127.0.0.1";
+      throughHop.port = new URL(postgresHop.url).port;
+      const publisher = await connectPublisher(redis.getConnectionUrl());
+      const run = runProcess(environment(redisHop.url, throughHop.toString(), label), documentOn(registered, label, stream));
+      let thawed = false;
+      try {
+        const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
+        await publishAndSettle(publisher, stream, "trader-1", events, events.length);
+        postgresHop.freeze();
+        redisHop.freeze();
+        const silentAt = Date.now();
+        // One Redis bound to the halt, the record's bound, two QUIT bounds, a margin.
+        const bound = 1_000 + HALT_RECORD_DEADLINE_MS + 2 * 1_000 + 3_000;
+        const exited = await settleWithin(run.exit, bound);
+        console.log(
+          `[PROVENANCE-1 r1 measured, PostgreSQL silent] startup() ` +
+            (exited === undefined ? `still pending after ${String(bound)} ms` : `returned +${String(exited.at - silentAt)} ms after the silence`),
+        );
+        expect(exited === undefined ? "STILL PENDING while PostgreSQL is frozen" : "returned", run.text()).toBe("returned");
+        if (exited === undefined) throw new Error("unreachable");
+        expect(exited.value, run.text()).toBe(EXIT_CODES.halted);
+        expect(exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "TRANSPORT_UNAVAILABLE"]]);
+        expect(run.text()).toContain(
+          `HALT RECORD UNCONFIRMED: the database did not answer within ${String(HALT_RECORD_DEADLINE_MS)} ms; the halt's rows may or may not have been written`,
+        );
+        const halted = lineAt(run, "pump stopped: ").at;
+        const recordLine = lineAt(run, "HALT RECORD UNCONFIRMED").at;
+        expect(recordLine - halted).toBeLessThanOrEqual(HALT_RECORD_DEADLINE_MS + MARGIN_MS);
+        // The record's connection is gone: the close waited on nothing of it.
+        expect(exited.at - recordLine).toBeLessThanOrEqual(2 * 1_000 + MARGIN_MS);
+        // Thawed only now. The destroyed connection never sent its COMMIT, so
+        // nothing of the record lands afterwards: UNCONFIRMED meant "may or may
+        // not", and here it is "not".
+        postgresHop.thaw();
+        redisHop.thaw();
+        thawed = true;
+        await sleep(1_000);
+        expect(await incidents(context)).toEqual([]);
+      } finally {
+        if (!thawed) {
+          postgresHop.thaw();
+          redisHop.thaw();
+        }
+        await settleWithin(run.exit, 30_000);
+        await postgresHop.close();
+        await redisHop.close();
+        await publisher.close();
+      }
+    });
+  }, 240_000);
 });
 
 describe("refusals and halts, read back as a window's evidence by the research worker's own adapter (PROVENANCE-1)", () => {

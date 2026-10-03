@@ -83,6 +83,7 @@ import {
   RUN_MODES,
   type LedgerScopeValue,
   type PolymarketBotDatabase,
+  type PostgresPool,
   type RunModeValue,
 } from "@polymarket-bot/storage-postgres";
 
@@ -147,6 +148,17 @@ export interface PostgresTraderStoreOptions {
    * `accounting.accountRef`). Absent: `NULL`.
    */
   readonly accountRef?: string;
+  /**
+   * `PROVENANCE-1` r1 (`PROV1-R1-02`): the pool `db` was built over. The
+   * durable halt record ({@link PostgresTraderStore.recordHalts}) checks ONE
+   * connection out of it directly, so that at its deadline that connection
+   * is DESTROYED rather than left checked out: `pool.end()`, which
+   * {@link PostgresTraderStore.close} awaits, waits for every checked-out
+   * connection, so an abandoned one held the process's exit until
+   * PostgreSQL answered. Absent: `recordHalts` writes nothing and answers
+   * `failed` (no bounded connection can be had).
+   */
+  readonly pool?: PostgresPool;
 }
 
 /**
@@ -517,11 +529,39 @@ function describeCause(cause: unknown): string {
   return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
 }
 
+/**
+ * `PROVENANCE-1` r1 — what the halt record uses of a pooled `pg` connection.
+ * `release(error)` is `pg-pool`'s: an error makes the pool DROP the
+ * connection, and `pg` then destroys its socket when a query is in flight.
+ */
+interface HaltRecordConnection {
+  query(text: string, values?: unknown[]): Promise<unknown>;
+  release(destroy?: Error): void;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  removeListener(event: "error", listener: (error: Error) => void): unknown;
+}
+
+/**
+ * `PROVENANCE-1` r1 — the halt record's listener for its connection's
+ * `error` event while it holds the connection. `pg-pool` removes its own
+ * listener from a connection it hands out, and a `pg` client whose socket
+ * dies (the server killed, the link reset) emits `error` after failing the
+ * query in flight; with no listener that is an uncaught exception, and the
+ * process would crash (exit 1) instead of exiting `halted` (75). The query's
+ * own failure already reaches `recordHalts`, which destroys the connection;
+ * this only keeps the event from escaping.
+ */
+function ignoreConnectionError(): void {
+  // Deliberately empty: see above.
+}
+
 export class PostgresTraderStore implements TraderStore {
   readonly #db: PolymarketBotDatabase;
   readonly #ledger: ReturnType<typeof createLedgerRepository>;
   readonly #decisionContractVersion: number;
   readonly #accountRef: string | null;
+  /** `PROVENANCE-1` r1: where the halt record checks its one connection out ({@link PostgresTraderStoreOptions.pool}). */
+  readonly #pool: PostgresPool | undefined;
   /** `THROUGHPUT-1a`: the store's group commit (see {@link PostgresGroupCommit}). */
   readonly groupCommit: PostgresGroupCommit;
 
@@ -530,6 +570,7 @@ export class PostgresTraderStore implements TraderStore {
     this.#ledger = createLedgerRepository(options.db);
     this.#decisionContractVersion = options.decisionContractVersion;
     this.#accountRef = options.accountRef ?? null;
+    this.#pool = options.pool;
     this.groupCommit = new PostgresGroupCommit(options.db, options.decisionContractVersion, this.#accountRef);
   }
 
@@ -553,40 +594,96 @@ export class PostgresTraderStore implements TraderStore {
    * nothing trades; the record is what an operator and the research worker
    * read afterwards).
    *
-   * Two bounds, because a database can fail two ways:
+   * The transaction runs on ONE connection this method checks out of the
+   * pool itself ({@link PostgresTraderStoreOptions.pool}), and owns until it
+   * gives it back. Two bounds, because a database can fail two ways:
    *
    * - one that ANSWERS slowly (a lock, an overloaded server): the transaction
    *   first sets its own `statement_timeout` to `deadlineMs`
    *   (`set_config(..., true)`, local to this transaction), so the SERVER
-   *   cancels the insert at the bound and releases the connection — the
-   *   store's close then does not wait on it;
-   * - one that does NOT ANSWER (down, refused, partitioned): the call is raced
-   *   against a timer of `deadlineMs` (unreferenced, so it never keeps the
-   *   process alive). A refused or reset connection fails at once.
+   *   cancels the insert at the bound — the backend does not outlive it;
+   * - one that does NOT ANSWER (frozen, partitioned): a timer of `deadlineMs`
+   *   (unreferenced, so it never keeps the process alive) answers
+   *   `unconfirmed` AND DESTROYS the connection — it is released WITH AN
+   *   ERROR, so the pool drops it and `pg` closes its socket at once (a query
+   *   is in flight). `PROVENANCE-1` r1 (`PROV1-R1-02`): the first round only
+   *   raced the timer, which left the connection checked out; the store's
+   *   close (`pool.end()`) then waited for it, and the process did not exit
+   *   until PostgreSQL answered (reproduced by both reviewers, a frozen server
+   *   behind a proxy and `docker pause`). A connection the pool hands over
+   *   only after the bound is destroyed the moment it arrives. One the pool
+   *   is still OPENING at the bound is the pool's: its own connection
+   *   timeout (`createPostgresPool`, 10 s by default) ends it, and the
+   *   store's close waits at most that long for it.
    *
-   * An answer after the bound is not reported as written: the outcome is
-   * `unconfirmed`, and says the rows may or may not exist.
+   * A refused or reset connection fails at once, and a socket that dies
+   * while the record holds it is the record's failure, never an uncaught
+   * `error` event ({@link ignoreConnectionError}). A statement that fails also
+   * destroys the connection: it is never handed back to the pool inside an
+   * aborted transaction. An answer after the bound is not reported as
+   * written: the outcome is `unconfirmed`, and says the rows may or may not
+   * exist (a `COMMIT` already sent can still land).
    */
   async recordHalts(rows: readonly HaltIncidentRow[], deadlineMs: number): Promise<HaltRecordOutcome> {
     if (rows.length === 0) return { status: "written", rows: 0 };
+    const pool = this.#pool;
+    if (pool === undefined) {
+      return {
+        status: "failed",
+        detail:
+          "this store was built without its connection pool, so the halt record has no connection it can " +
+          "bound and destroy; nothing was written",
+      };
+    }
+    let connection: HaltRecordConnection | undefined;
+    let returned = false;
+    let abandoned = false;
+    // Gives the connection back ONCE: plainly after a commit, or WITH AN
+    // ERROR — which makes the pool drop it and `pg` destroy its socket.
+    const giveBack = (destroy: Error | undefined): void => {
+      if (connection === undefined || returned) return;
+      returned = true;
+      try {
+        connection.release(destroy);
+      } catch {
+        // `pg-pool` throws only on a second release, which `returned` rules out.
+      }
+      // Released first: the pool has attached its own listener again.
+      connection.removeListener("error", ignoreConnectionError);
+    };
     const write = (async (): Promise<HaltRecordOutcome> => {
       try {
-        await this.#db.transaction().execute(async (trx) => {
-          await trx
-            .selectNoFrom((eb) =>
-              eb.fn<string>("set_config", [eb.val("statement_timeout"), eb.val(String(deadlineMs)), eb.val(true)]).as("bound"),
-            )
-            .execute();
-          await trx.insertInto("ops.incidents").values([...rows]).execute();
-        });
+        // The statements, compiled by the typed builder (a wrong column name
+        // fails the compiler), run on the one connection this method owns.
+        const bound = this.#db
+          .selectNoFrom((eb) =>
+            eb.fn<string>("set_config", [eb.val("statement_timeout"), eb.val(String(deadlineMs)), eb.val(true)]).as("bound"),
+          )
+          .compile();
+        const insert = this.#db.insertInto("ops.incidents").values([...rows]).compile();
+        const acquired: HaltRecordConnection = await pool.connect();
+        acquired.on("error", ignoreConnectionError);
+        connection = acquired;
+        if (abandoned) {
+          giveBack(new Error(`the halt record's connection arrived after its ${String(deadlineMs)} ms bound`));
+          return { status: "failed", detail: "the connection arrived after the bound" };
+        }
+        await acquired.query("begin");
+        await acquired.query(bound.sql, [...bound.parameters]);
+        await acquired.query(insert.sql, [...insert.parameters]);
+        await acquired.query("commit");
+        giveBack(undefined);
         return { status: "written", rows: rows.length };
       } catch (cause) {
+        giveBack(cause instanceof Error ? cause : new Error(String(cause)));
         return { status: "failed", detail: describeCause(cause) };
       }
     })();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<HaltRecordOutcome>((resolve) => {
       timer = setTimeout(() => {
+        abandoned = true;
+        giveBack(new Error(`the halt record did not answer within ${String(deadlineMs)} ms`));
         resolve({
           status: "unconfirmed",
           detail:

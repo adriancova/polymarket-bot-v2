@@ -113,8 +113,11 @@
  * bounded by `HALT_RECORD_DEADLINE_MS` and never changes the exit code: a
  * database that refuses it, or does not answer within the bound, is logged
  * (`HALT RECORD NOT DURABLE` / `UNCONFIRMED`) and the process still exits
- * {@link EXIT_CODES.halted}. Nothing trades after the halt either way; the
- * record is for the operator and the research worker afterwards.
+ * {@link EXIT_CODES.halted}. The write's own connection is destroyed at the
+ * bound (`PostgresTraderStore.recordHalts`; `PROVENANCE-1` r1), so the
+ * PostgreSQL close that follows does not wait on it. Nothing trades after the
+ * halt either way; the record is for the operator and the research worker
+ * afterwards.
  *
  * ## The two-phase venue wiring, and why it is not a smell
  *
@@ -277,8 +280,8 @@ export async function startup(ports: StartupPorts): Promise<number> {
       "outage latches a GLOBAL TRANSPORT_UNAVAILABLE halt within that bound of the first command it " +
       `leaves unanswered, and the process exits ${String(EXIT_CODES.halted)} at most ` +
       `${String(2 * responseTimeoutMs)} ms after the halt (one bound for each connection's courtesy ` +
-      `QUIT) plus the durable halt record (at most ${String(HALT_RECORD_DEADLINE_MS)} ms) and the ` +
-      "PostgreSQL close (§4.2)",
+      `QUIT) plus the durable halt record (at most ${String(HALT_RECORD_DEADLINE_MS)} ms; a connection ` +
+      "that has not answered by then is destroyed) and the PostgreSQL close (§4.2)",
   );
 
   // --- 3. infrastructure ----------------------------------------------------
@@ -529,6 +532,9 @@ export async function assembleDurableTrader(
     decisionContractVersion: 1,
     // `PROVENANCE-1`: the account its `ops.risk_events` rows name.
     accountRef: config.accounting.accountRef,
+    // `PROVENANCE-1` r1 (`PROV1-R1-02`): the halt record checks its one
+    // connection out of the pool itself, so it can destroy it at its bound.
+    pool,
   });
   // The realized-PnL book the health surface reads (`TRDR-3`): every PnL
   // snapshot the store ACCEPTS is recorded here by the decorator the trader is
