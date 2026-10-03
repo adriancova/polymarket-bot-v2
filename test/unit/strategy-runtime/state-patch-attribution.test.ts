@@ -299,7 +299,8 @@ describe("MEDIUM 2: a statePatch failure is attributed to the statePatch, wherev
     expect(outcome.record.decision.nextWakeupAt).toBe("2026-01-02T03:04:06.000Z");
     expect(outcome.record.decision.statePatch).toEqual({ count: 1, nested: { list: [1, 2] } });
     expect(Object.isFrozen(outcome.record.decision.statePatch)).toBe(true);
-    expect(outcome.checkpoint.stateJson).toBe('{"count":1,"nested":{"list":[1,2]}}');
+    // `CKPT-1`: a first decision (START) that changed the state has its checkpoint.
+    expect(outcome.checkpoint?.stateJson).toBe('{"count":1,"nested":{"list":[1,2]}}');
   });
 
   it("an own __proto__ on the returned decision is copied as DATA, never re-parented", () => {
@@ -333,7 +334,7 @@ describe("MEDIUM 2: a statePatch failure is attributed to the statePatch, wherev
     expect(Object.getPrototypeOf(outcome.record.decision)).toBeNull();
     // The patch keeps its own `__proto__` as an ordinary data property, and the
     // canonical bytes say so.
-    expect(outcome.checkpoint.stateJson).toBe('{"nested":{"__proto__":{"alsoPolluted":true}}}');
+    expect(outcome.checkpoint?.stateJson).toBe('{"nested":{"__proto__":{"alsoPolluted":true}}}');
     const patched = outcome.record.decision.statePatch?.["nested"];
     // STRENGTHENED, `WP-170-FU1`: was `toBe(Object.prototype)`. The claim under
     // test — `__proto__` is held as DATA and never re-parents the copy — is

@@ -124,7 +124,8 @@ function assembleGroupCommitting(): GroupCommitRun {
       };
       return {
         persistDecision: (record, telemetry) => inner.persistDecision(record, telemetry),
-        saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+        persistDecisionWithCheckpoint: (record, telemetry, checkpoint, capturedAt) =>
+          inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
         appendLedgerTransaction: (transaction) => {
           guard("ledger");
           return inner.appendLedgerTransaction(transaction);

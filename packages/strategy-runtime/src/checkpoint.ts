@@ -2,12 +2,20 @@
  * Versioned strategy-state checkpoints (§9.6 "Checkpoint strategy state after
  * defined transitions" / "Restore compatible state on restart").
  *
- * The defined transitions: the runtime checkpoints after EVERY persisted
- * decision record (strategy-attributed or runtime-attributed). That is a
- * superset of any narrower "state actually changed" rule and it is what keeps
- * `checkpointSeq` aligned with the decisions table's unique
- * `(run_id, evaluation_seq)` key — a restore never re-uses an evaluation
- * sequence number that already has a persisted decision.
+ * The defined transitions (`CKPT-1`, ADR-027 Decision 1; `transitions.ts`):
+ * after a persisted decision the runtime checkpoints only on a state, status
+ * or RNG change, at the start, at the stop, or on a 60 s event-time
+ * heartbeat. Until `CKPT-1` it checkpointed after EVERY persisted decision,
+ * and a restore resumed at `checkpointSeq + 1`; that held only because the
+ * two sequences were equal. They are no longer: a checkpoint keeps the
+ * `evaluationSeq` of the decision it follows, so checkpoint sequences have
+ * gaps, and later decisions that owed no checkpoint may be durable after it.
+ * So a restore takes a RESTORE POINT ({@link StrategyRestorePoint}): the last
+ * checkpoint, plus the highest durable `evaluationSeq`, plus the instant of
+ * the checkpointed decision. The next sequence is the highest durable one plus
+ * one (ADR-027 D2.2) — never the checkpoint's — so a restore never re-uses an
+ * evaluation sequence number that already has a persisted decision
+ * (`decisions_evaluation_unique`).
  *
  * A checkpoint pins the full run identity (§9.6 "Start a new run for every
  * code, config, model, feature, or state-schema change"): strategy name and
@@ -56,8 +64,10 @@ import {
   deepFreeze,
   materializeCheckpointableJsonAt,
 } from "./json.js";
+import { DoorIsoTimestampSchema } from "./parse-door.js";
 import { readOwnFieldsOnce } from "./read-once.js";
 import { isRngState, type RngState } from "./rng.js";
+import { parseExactInstant, type CheckpointMark } from "./transitions.js";
 
 export const STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION = 1;
 
@@ -145,23 +155,184 @@ export type CheckpointRefusalCode =
   | "CHECKPOINT_SEQ_INVALID"
   | "CHECKPOINT_STATUS_INVALID"
   | "CHECKPOINT_RNG_STATE_INVALID"
-  | "CHECKPOINT_STATE_INVALID";
+  | "CHECKPOINT_STATE_INVALID"
+  /**
+   * `CKPT-1`: the restore point is not an object whose three fields can be
+   * read once ({@link StrategyRestorePoint}).
+   */
+  | "RESTORE_POINT_INVALID"
+  /**
+   * `CKPT-1` (ADR-027 D2.2): `highestEvaluationSeq` is not a non-negative safe
+   * integer, lies BELOW the checkpoint's sequence (a checkpoint is durable only
+   * with or after its own decision, so a store that answers this is
+   * inconsistent), or lies past {@link MAX_EVALUATION_SEQ} (its successor, the
+   * next sequence, would not be exactly representable).
+   */
+  | "RESTORE_SEQ_INVALID"
+  /**
+   * `CKPT-1` (ADR-027 D1.6): `checkpointEvaluatedAt` is not an ISO-8601 instant
+   * the runtime can read — the heartbeat would have no anchor.
+   */
+  | "RESTORE_INSTANT_INVALID";
 
 export interface CheckpointRefusal {
   readonly code: CheckpointRefusalCode;
   readonly detail: string;
 }
 
+/**
+ * One checkpoint DOCUMENT, validated against the run identity.
+ *
+ * `CKPT-1`: it no longer answers a `nextEvaluationSeq`. Until ADR-027 the next
+ * sequence was `checkpointSeq + 1`, because a checkpoint followed every
+ * decision; now a durable decision may follow the last checkpoint, and the next
+ * sequence is the highest DURABLE one plus one (D2.2). A checkpoint alone
+ * cannot know that, so it does not say it: {@link restoreFromPoint} does.
+ */
 export interface RestoredCheckpoint {
   readonly state: Readonly<Record<string, unknown>>;
+  /** The canonical bytes `state` was read from (equal to the document's). */
+  readonly stateJson: string;
   readonly rngState: RngState;
-  readonly nextEvaluationSeq: number;
+  /** The `evaluationSeq` of the decision the checkpoint follows. */
+  readonly checkpointSeq: number;
   readonly status: InstanceStatus;
 }
 
 export type RestoreCheckpointResult =
   | { readonly ok: true; readonly restored: RestoredCheckpoint }
   | { readonly ok: false; readonly refusal: CheckpointRefusal };
+
+/**
+ * `CKPT-1` — what a restart restores from (ADR-027 D2: "It needs the last
+ * checkpoint and the highest `evaluationSeq`").
+ *
+ * The caller reads all three from the durable store:
+ *
+ * - `checkpoint`: the instance's LAST durable checkpoint — the one with the
+ *   highest `checkpointSeq`;
+ * - `highestEvaluationSeq`: the highest durable `evaluationSeq` over the scope
+ *   of the store's uniqueness key for decisions. Today that key is
+ *   `decisions_evaluation_unique (run_id, evaluation_seq)` and a run holds ONE
+ *   runtime instance, so this is the run's highest and the instance's alike.
+ *   It is never lower than `checkpoint.checkpointSeq`;
+ * - `checkpointEvaluatedAt`: the `evaluatedAt` of the decision at
+ *   `checkpoint.checkpointSeq` — the instant the heartbeat counts from (D1.6).
+ *   A checkpoint document carries no instant (the runtime reads no clock), and
+ *   adding one would change every checkpoint's bytes; the decision row that the
+ *   checkpoint follows has it, and is durable with it (D3).
+ *
+ * Why the decisions after the checkpoint need no inspection: a decision that
+ * changed the state, the status or the RNG owed a checkpoint, and it is
+ * durable only together with that checkpoint (ADR-027 D3, `CKPT-1`'s choice —
+ * see `packages/trading-core/src/loop.ts`). So every durable decision after the
+ * last checkpoint changed none of the three, and the checkpoint is the current
+ * state, status and RNG cursor.
+ */
+export interface StrategyRestorePoint {
+  readonly checkpoint: StrategyStateCheckpoint;
+  readonly highestEvaluationSeq: number;
+  readonly checkpointEvaluatedAt: string;
+}
+
+/** A validated restore point: the restored instance, and the mark its transition rule resumes from. */
+export interface RestoredInstance {
+  readonly state: Readonly<Record<string, unknown>>;
+  readonly rngState: RngState;
+  readonly status: InstanceStatus;
+  /** `highestEvaluationSeq + 1` (ADR-027 D2.2). */
+  readonly nextEvaluationSeq: number;
+  /** The restored checkpoint as the transition rule compares against it. */
+  readonly mark: CheckpointMark;
+}
+
+export type RestoreFromPointResult =
+  | { readonly ok: true; readonly restored: RestoredInstance }
+  | { readonly ok: false; readonly refusal: CheckpointRefusal };
+
+const RESTORE_POINT_FIELDS = ["checkpoint", "highestEvaluationSeq", "checkpointEvaluatedAt"] as const;
+
+/**
+ * `CKPT-1` — validates a {@link StrategyRestorePoint} against the run identity
+ * and answers the restored instance, or a typed refusal. Never throws.
+ *
+ * The checkpoint document is validated exactly as before
+ * ({@link restoreCheckpoint}); then the two new fields:
+ *
+ * - the next sequence is `highestEvaluationSeq + 1`, refused when that number
+ *   is not a safe integer at least `checkpointSeq` and at most
+ *   {@link MAX_EVALUATION_SEQ};
+ * - the heartbeat's anchor is `checkpointEvaluatedAt`, refused unless it is an
+ *   instant the input door would accept.
+ */
+export function restoreFromPoint(
+  point: StrategyRestorePoint,
+  identity: CheckpointIdentity,
+): RestoreFromPointResult {
+  const fields = readOwnFieldsOnce(point, "restoreFrom", RESTORE_POINT_FIELDS);
+  if (!fields.ok) {
+    return refusePoint("RESTORE_POINT_INVALID", fields.problem);
+  }
+  const checkpoint = fields.fields.checkpoint;
+  if (checkpoint === null || typeof checkpoint !== "object") {
+    return refusePoint(
+      "RESTORE_POINT_INVALID",
+      "restoreFrom.checkpoint must be a checkpoint document (ADR-027 D2: a restore needs the " +
+        "last checkpoint and the highest evaluationSeq)",
+    );
+  }
+  const restored = restoreCheckpoint(checkpoint as StrategyStateCheckpoint, identity);
+  if (!restored.ok) {
+    return { ok: false, refusal: restored.refusal };
+  }
+  const highest = fields.fields.highestEvaluationSeq;
+  if (typeof highest !== "number" || !Number.isSafeInteger(highest) || highest < 0) {
+    return refusePoint(
+      "RESTORE_SEQ_INVALID",
+      `restoreFrom.highestEvaluationSeq must be a non-negative safe integer; received ` +
+        `${describeCause(highest)}`,
+    );
+  }
+  if (highest < restored.restored.checkpointSeq) {
+    return refusePoint(
+      "RESTORE_SEQ_INVALID",
+      `restoreFrom.highestEvaluationSeq ${String(highest)} is below the checkpoint's sequence ` +
+        `${String(restored.restored.checkpointSeq)}: a checkpoint is durable only with or after the ` +
+        "decision it follows, so a store that answers this is inconsistent and is not resumed from",
+    );
+  }
+  if (highest > MAX_EVALUATION_SEQ) {
+    return refusePoint(
+      "RESTORE_SEQ_INVALID",
+      `restoreFrom.highestEvaluationSeq ${String(highest)} is past the last sequence a run can ` +
+        `consume (${String(MAX_EVALUATION_SEQ)}): the next evaluation sequence would not be ` +
+        "exactly representable — a run that reaches this bound is finished (§9.6)",
+    );
+  }
+  const anchor = fields.fields.checkpointEvaluatedAt;
+  if (
+    typeof anchor !== "string" ||
+    !DoorIsoTimestampSchema.safeParse(anchor).success ||
+    parseExactInstant(anchor) === undefined
+  ) {
+    return refusePoint(
+      "RESTORE_INSTANT_INVALID",
+      `restoreFrom.checkpointEvaluatedAt must be the ISO-8601 evaluatedAt of the checkpointed ` +
+        `decision; received ${describeCause(anchor)}`,
+    );
+  }
+  const { state, stateJson, rngState, status } = restored.restored;
+  return {
+    ok: true,
+    restored: {
+      state,
+      rngState,
+      status,
+      nextEvaluationSeq: highest + 1,
+      mark: { stateJson, status, rngState, evaluatedAt: anchor },
+    },
+  };
+}
 
 /** Every field of one caller-supplied document, read exactly once. */
 interface CheckpointSnapshot {
@@ -299,11 +470,12 @@ export function restoreCheckpoint(
     );
   }
   if (found.checkpointSeq > MAX_EVALUATION_SEQ) {
-    // The SUCCESSOR is what this document is restored as (`checkpointSeq + 1`),
-    // so a `checkpointSeq` of `Number.MAX_SAFE_INTEGER` is refused even though
-    // it is itself a safe integer: its successor is not exactly representable,
+    // A `checkpointSeq` of `Number.MAX_SAFE_INTEGER` is refused even though it
+    // is itself a safe integer: its successor is not exactly representable,
     // and an instance whose counter cannot advance persists two decisions under
-    // one sequence (round 4, HIGH 1).
+    // one sequence (round 4, HIGH 1). `CKPT-1`: the next sequence now comes
+    // from the restore point's `highestEvaluationSeq` (bounded the same way in
+    // `restoreFromPoint`), which is never below this one, so this bound stays.
     return refuse(
       "CHECKPOINT_SEQ_INVALID",
       `checkpointSeq ${String(found.checkpointSeq)} is past the last sequence a run can ` +
@@ -376,8 +548,9 @@ export function restoreCheckpoint(
     ok: true,
     restored: {
       state: deepFreeze(materialized) as Readonly<Record<string, unknown>>,
+      stateJson,
       rngState: [laneA, laneB, laneC, laneD],
-      nextEvaluationSeq: checkpointSeq + 1,
+      checkpointSeq,
       status,
     },
   };
@@ -390,6 +563,10 @@ function isInstanceStatus(value: unknown): value is InstanceStatus {
 }
 
 function refuse(code: CheckpointRefusalCode, detail: string): RestoreCheckpointResult {
+  return { ok: false, refusal: { code, detail } };
+}
+
+function refusePoint(code: CheckpointRefusalCode, detail: string): RestoreFromPointResult {
   return { ok: false, refusal: { code, detail } };
 }
 

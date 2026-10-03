@@ -51,6 +51,7 @@ import {
   makeHarness,
   makeInput,
   makeStrategy,
+  restorePoint,
   RUN_ID,
   RUN_SEED,
 } from "./helpers.js";
@@ -353,7 +354,9 @@ describe("MEDIUM 2: the checkpoint document is snapshotted, and both public entr
     expect(() => {
       created = createStrategyInstanceRuntime({
         ...definition,
-        restoreFrom: hostile as unknown as StrategyStateCheckpoint,
+        // `CKPT-1`: a restore takes a restore POINT (ADR-027 D2); the hostile
+        // document is its checkpoint, and is still what refuses.
+        restoreFrom: restorePoint(hostile as unknown as StrategyStateCheckpoint),
       });
     }).not.toThrow();
     expect(created?.ok).toBe(false);
@@ -642,7 +645,10 @@ describe("the P1/P2 sweep: definition, ports and callbacks are captured once and
 
     const harness = makeHarness({ strategy });
     expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
-    expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
+    // `CKPT-1` (ADR-027 D1): a second no-change hold writes NO checkpoint, so
+    // the second evaluation is `onStop` — the STOP transition writes one — to
+    // keep a LATER checkpoint in the probe.
+    expect(harness.runtime.evaluate(makeInput("onStop")).kind).toBe("DECIDED");
     expect(harness.store.checkpoints.map((checkpoint) => checkpoint.strategyName)).toEqual([
       "test-strategy",
       "test-strategy",
@@ -709,8 +715,43 @@ describe("the P1/P2 sweep: definition, ports and callbacks are captured once and
     expect(outcome.failure.reasonCode).toBe("RUNTIME.CLOCK_INVALID");
     expect(outcome.telemetry.evaluationDurationUs).toBeNull();
     expect(harness.sink.calls).toHaveLength(1);
+    // `CKPT-1` (ADR-027 §5 re-pin): still exactly one checkpoint, now for a
+    // stated reason — this is the instance's first decision, the START
+    // transition (with no earlier checkpoint there is no status to differ
+    // from); the case below covers a LATER containment, where the pause alone
+    // (STATUS) writes it.
     expect(harness.store.checkpoints).toHaveLength(1);
+    expect(outcome.checkpointTransitions).toEqual(["START"]);
+    expect(harness.store.checkpoints[0]?.status).toBe("PAUSED");
     expect(harness.runtime.instanceStatus()).toBe("PAUSED");
+  });
+
+  it("CKPT-1: a clock that fails AFTER a LATER callback is contained with its checkpoint too (STATUS alone)", () => {
+    // The re-pin's second half: not the first decision, so START cannot be
+    // what writes the checkpoint — the pause must.
+    let calls = 0;
+    const clock: MonotonicClock = {
+      nowNs: (): bigint => {
+        calls += 1;
+        if (calls >= 4) {
+          throw new Error("CLOCK_THREW_LATE");
+        }
+        return 1_000_000n;
+      },
+    };
+    const harness = makeHarness({ clock });
+    expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
+    const outcome = harness.runtime.evaluate(makeInput("onFeatures"));
+    expect(outcome.kind).toBe("CONTAINED");
+    if (outcome.kind !== "CONTAINED") {
+      return;
+    }
+    expect(outcome.checkpointTransitions).toEqual(["STATUS"]);
+    expect(harness.sink.calls).toHaveLength(2);
+    expect(harness.store.checkpoints.map((checkpoint) => [checkpoint.checkpointSeq, checkpoint.status])).toEqual([
+      [0, "ACTIVE"],
+      [1, "PAUSED"],
+    ]);
   });
 
   it("a clock that returns a non-bigint is refused rather than mixed into arithmetic", () => {

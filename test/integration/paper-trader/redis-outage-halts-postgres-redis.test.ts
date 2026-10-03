@@ -163,10 +163,12 @@ import {
   writeStoredCheckpoint,
 } from "@polymarket-bot/event-bus/testing";
 import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import { canonicalJsonStringify } from "@polymarket-bot/strategy-runtime";
 import type { LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { EXIT_CODES, REDIS_RESPONSE_TIMEOUT_ENV, startup } from "../../../apps/trader/src/main.js";
+import { owedCheckpoints } from "./support/checkpoints.js";
 import { GATEWAY_EPOCH, recordedEvents, safeEnvironment } from "./support/fixture.js";
 import { FIXTURE_FIRST_EVENT_AT, rebaseSystemPaperClock } from "./support/host-clock.js";
 import {
@@ -446,9 +448,29 @@ async function publishSixAndSettle(options: {
   // Quiescent: every write the counters promise has landed, and nothing is left in flight.
   expect(settled.health.loop.eventsProcessed).toBe(events.length);
   expect(settled.rows.decisions).toHaveLength(settled.health.loop.decisionsPersisted);
-  // §9.6: one checkpoint per persisted decision, carrying the decision's sequence.
-  expect(settled.rows.checkpoints.map((row) => row.checkpoint_seq)).toEqual(
-    settled.rows.decisions.map((row) => row.evaluation_seq),
+  // `CKPT-1` re-pin (ADR-027 §5 names this settle): this was "§9.6: one
+  // checkpoint per persisted decision, carrying the decision's sequence". A
+  // checkpoint now follows only a decision that meets ADR-027 Decision 1, so
+  // the settle compares the durable checkpoints with the ones the oracle
+  // derives from the durable decision rows — the same sequences and the same
+  // folded state bytes. The quiescence argument is unchanged: a decision and
+  // its checkpoint are now ONE write (ADR-027 D3), so the race the dated note
+  // above describes cannot recur as a checkpoint landing after its decision.
+  const owed = owedCheckpoints(
+    settled.rows.decisions.map((row) => ({
+      instanceId: row.instance_id,
+      evaluationSeq: Number(row.evaluation_seq),
+      callback: row.callback,
+      attribution: row.reason_codes.some((code) => code.startsWith("RUNTIME.")) ? "RUNTIME" : "STRATEGY",
+      evaluatedAt: String(row.evaluated_at),
+      statePatch: row.state_patch as Readonly<Record<string, unknown>> | null,
+    })),
+  );
+  expect(settled.rows.checkpoints.map((row) => Number(row.checkpoint_seq))).toEqual(
+    owed.map((entry) => entry.checkpointSeq),
+  );
+  expect(settled.rows.checkpoints.map((row) => canonicalJsonStringify(row.state))).toEqual(
+    owed.map((entry) => entry.stateJson),
   );
   expect(settled.rows.transactions).toHaveLength(settled.health.accounting.ledgerTransactions);
   expect(settled.rows.snapshots.length).toBe(settled.health.execution.fillsObserved);

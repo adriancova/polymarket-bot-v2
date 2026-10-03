@@ -33,6 +33,14 @@
  * The oracles below do not ask the runtime what its counter is: they read the
  * sequences off the persisted records and check distinctness and exact
  * representability directly.
+ *
+ * `CKPT-1` (ADR-027 D2): a restore now takes a restore POINT, and the next
+ * sequence is its `highestEvaluationSeq + 1`, not `checkpointSeq + 1`. The
+ * restores here say "the checkpoint is the last durable decision", which keeps
+ * every bound where it was; the new bound on `highestEvaluationSeq` is pinned
+ * beside the old one. A restored runtime is not at START (D1.4), so the
+ * evaluations that must still write a checkpoint are placed 60 s apart in
+ * event time — the HEARTBEAT (D1.6) — and each re-pin says so.
  */
 
 import { describe, expect, it } from "vitest";
@@ -41,6 +49,7 @@ import {
   createStrategyInstanceRuntime,
   MAX_EVALUATION_SEQ,
   restoreCheckpoint,
+  restoreFromPoint,
   type CheckpointIdentity,
   type CreateRuntimeResult,
   type StrategyStateCheckpoint,
@@ -50,10 +59,16 @@ import {
   INSTANCE_ID,
   makeDefinition,
   makeInput,
+  restorePoint,
   RUN_ID,
   RUN_SEED,
   type Harness,
 } from "./helpers.js";
+
+/** `CKPT-1`: the k-th minute after the helpers' `T0` (2026-01-02T03:04:05.000Z). */
+function minutesAfterT0(minutes: number): string {
+  return new Date(Date.parse("2026-01-02T03:04:05.000Z") + minutes * 60_000).toISOString();
+}
 
 const IDENTITY: CheckpointIdentity = {
   runId: RUN_ID,
@@ -88,7 +103,7 @@ type RestoreAttempt =
 
 function restoredHarness(checkpointSeq: number): RestoreAttempt {
   const { definition, sink, store, clock } = makeDefinition({
-    restoreFrom: checkpointAt(checkpointSeq),
+    restoreFrom: restorePoint(checkpointAt(checkpointSeq)),
   });
   const created = createStrategyInstanceRuntime(definition);
   if (!created.ok) {
@@ -125,12 +140,29 @@ describe("HIGH 1: the evaluation sequence cannot silently stop advancing", () =>
   });
 
   it("the boundary pair, at restore: MAX_EVALUATION_SEQ is accepted and MAX_SAFE_INTEGER is refused", () => {
-    const accepted = restoreCheckpoint(checkpointAt(MAX_EVALUATION_SEQ), IDENTITY);
+    // `CKPT-1` re-pin: the next sequence is the restore POINT's answer now.
+    const accepted = restoreFromPoint(restorePoint(checkpointAt(MAX_EVALUATION_SEQ)), IDENTITY);
     expect(accepted.ok).toBe(true);
     if (accepted.ok) {
       expect(accepted.restored.nextEvaluationSeq).toBe(Number.MAX_SAFE_INTEGER);
       expect(Number.isSafeInteger(accepted.restored.nextEvaluationSeq)).toBe(true);
     }
+    // …and the same pair on the restore point's own bound: a highest durable
+    // sequence of MAX_SAFE_INTEGER is refused, whatever the checkpoint says.
+    const pointPastBound = restoreFromPoint(
+      restorePoint(checkpointAt(MAX_EVALUATION_SEQ - 5), MAX_EVALUATION_SEQ + 1),
+      IDENTITY,
+    );
+    expect(pointPastBound.ok).toBe(false);
+    if (!pointPastBound.ok) {
+      expect(pointPastBound.refusal.code).toBe("RESTORE_SEQ_INVALID");
+      expect(pointPastBound.refusal.detail).toContain("exactly representable");
+    }
+    const pointAtBound = restoreFromPoint(
+      restorePoint(checkpointAt(MAX_EVALUATION_SEQ - 5), MAX_EVALUATION_SEQ),
+      IDENTITY,
+    );
+    expect(pointAtBound.ok && pointAtBound.restored.nextEvaluationSeq).toBe(Number.MAX_SAFE_INTEGER);
 
     const refused = restoreCheckpoint(checkpointAt(MAX_EVALUATION_SEQ + 1), IDENTITY);
     expect(refused.ok).toBe(false);
@@ -183,9 +215,13 @@ describe("HIGH 1: the evaluation sequence cannot silently stop advancing", () =>
     const harness = attempt.harness;
     expect(harness.runtime.nextEvaluationSeq()).toBe(MAX_EVALUATION_SEQ);
 
-    const first = harness.runtime.evaluate(makeInput());
+    // `CKPT-1`: 60 s after the restored checkpoint's instant (T0), so the
+    // HEARTBEAT writes this decision's checkpoint (a restored runtime has no
+    // START, and this hold changes nothing else).
+    const first = harness.runtime.evaluate(makeInput("onFeatures", { evaluatedAt: minutesAfterT0(1) }));
     expect(first.kind).toBe("DECIDED");
-    const second = harness.runtime.evaluate(makeInput());
+    expect(first.kind === "DECIDED" && first.checkpointTransitions).toEqual(["HEARTBEAT"]);
+    const second = harness.runtime.evaluate(makeInput("onFeatures", { evaluatedAt: minutesAfterT0(2) }));
     expect(second.kind).toBe("REFUSED");
     if (second.kind === "REFUSED") {
       expect(second.refusal.code).toBe("EVALUATION_SEQ_EXHAUSTED");
@@ -208,8 +244,12 @@ describe("HIGH 1: the evaluation sequence cannot silently stop advancing", () =>
     }
     const harness = attempt.harness;
     const kinds: string[] = [];
+    // `CKPT-1`: one minute apart, so every decided evaluation is a HEARTBEAT
+    // and the checkpoint sequences can still be compared with the records'.
     for (let attempt = 0; attempt < 6; attempt += 1) {
-      kinds.push(harness.runtime.evaluate(makeInput()).kind);
+      kinds.push(
+        harness.runtime.evaluate(makeInput("onFeatures", { evaluatedAt: minutesAfterT0(attempt + 1) })).kind,
+      );
     }
     expect(kinds).toEqual([
       "DECIDED",

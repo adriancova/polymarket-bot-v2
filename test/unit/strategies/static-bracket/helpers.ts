@@ -26,12 +26,14 @@ import type {
   VirtualPositionView,
 } from "../../../../packages/strategy-sdk/src/index.js";
 import type { Intent } from "../../../../packages/domain/src/index.js";
-import type {
-  DecisionRecord,
-  DecisionTelemetry,
-  EvaluationInput,
-  MonotonicClock,
-  StrategyStateCheckpoint,
+import {
+  canonicalJsonStringify,
+  rebuildStateFromPatches,
+  type DecisionRecord,
+  type DecisionTelemetry,
+  type EvaluationInput,
+  type MonotonicClock,
+  type StrategyStateCheckpoint,
 } from "../../../../packages/strategy-runtime/src/index.js";
 import {
   INITIAL_STATE,
@@ -463,6 +465,41 @@ export class RecordingStore {
   save(checkpoint: StrategyStateCheckpoint): void {
     this.checkpoints.push(checkpoint);
   }
+}
+
+/**
+ * `CKPT-1` (ADR-027 D2.1): the canonical bytes of the fold of every persisted
+ * `statePatch` — the state the records alone rebuild (`WP-170` decision 8).
+ * Since ADR-027 a checkpoint is written only when the state (or status, or
+ * RNG) changed, so the LAST checkpoint must equal this; a test that reads the
+ * current state off the last checkpoint checks that it does.
+ */
+export function foldedStateBytes(sink: RecordingSink): string {
+  const folded = rebuildStateFromPatches(sink.calls.map((call) => call.record.decision.statePatch));
+  if (!folded.ok) throw new Error(`the persisted patches do not fold: ${folded.problem}`);
+  return canonicalJsonStringify(folded.state);
+}
+
+/**
+ * `CKPT-1` — the sequences of the records after which the folded state bytes
+ * changed, plus the first record (START): what ADR-027 Decision 1 owes a
+ * checkpoint for, for this strategy. Static Bracket draws no randomness, and
+ * these runs neither stop nor contain nor span 60 s, so STATE and START are
+ * the only transitions that can apply.
+ */
+export function stateChangingSeqs(sink: RecordingSink): number[] {
+  const owed: number[] = [];
+  let last = "";
+  for (const [index, call] of sink.calls.entries()) {
+    const folded = rebuildStateFromPatches(
+      sink.calls.slice(0, index + 1).map((entry) => entry.record.decision.statePatch),
+    );
+    if (!folded.ok) throw new Error(`the persisted patches do not fold: ${folded.problem}`);
+    const bytes = canonicalJsonStringify(folded.state);
+    if (index === 0 || bytes !== last) owed.push(call.record.evaluationSeq);
+    last = bytes;
+  }
+  return owed;
 }
 
 /** One evaluation input for the real runtime. */

@@ -74,6 +74,7 @@ import {
   context,
   evaluationInput,
   fillPayload,
+  foldedStateBytes,
   order,
   parsedParams,
   stateWith,
@@ -1093,6 +1094,7 @@ describe("repeated brackets — a reduction-closed bracket re-arms and enters ag
       checkpointStore: store,
     });
     if (!created.ok) throw new Error(`the runtime refused the strategy: ${created.refusal.code}`);
+    sinkOf.set(store, sink);
     return { runtime: created.runtime, store, sink };
   }
 
@@ -1107,9 +1109,22 @@ describe("repeated brackets — a reduction-closed bracket re-arms and enters ag
     return outcome.record.decision;
   }
 
+  /** `CKPT-1`: each harness's sink, by its store, for {@link stateOf}'s check. */
+  const sinkOf = new WeakMap<RecordingStore, RecordingSink>();
+
+  /**
+   * The state the runtime holds, read off its last checkpoint. `CKPT-1`
+   * (ADR-027 §5 asks this be checked): a checkpoint now follows only a
+   * decision that changed the state, so the last one must still BE the current
+   * state (D2.1) — asserted against the fold of every persisted patch.
+   */
   function stateOf(store: RecordingStore): StaticBracketState {
     const last = store.checkpoints[store.checkpoints.length - 1];
-    return JSON.parse((last as { stateJson: string }).stateJson) as StaticBracketState;
+    const bytes = (last as { stateJson: string }).stateJson;
+    const sink = sinkOf.get(store);
+    expect(sink, "stateOf reads a store that harness() built").toBeDefined();
+    if (sink !== undefined) expect(bytes).toBe(foldedStateBytes(sink));
+    return JSON.parse(bytes) as StaticBracketState;
   }
 
   const cases = [

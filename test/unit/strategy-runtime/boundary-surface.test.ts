@@ -76,8 +76,10 @@ import {
   isRngState,
   materializeCheckpointableJson,
   prepareEvaluationView,
+  checkpointTransitions,
   rebuildStateFromPatches,
   restoreCheckpoint,
+  restoreFromPoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   StrategyContextRevokedError,
   validateEvaluationInput,
@@ -158,6 +160,15 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     shape: "function",
     totality: "TOTAL",
     note: "both arguments snapshotted; every failure is a typed CheckpointRefusal",
+  },
+  restoreFromPoint: {
+    params: ["point", "identity"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "TOTAL",
+    note:
+      "CKPT-1 (ADR-027 D2): the restore point's three fields read once; the checkpoint through " +
+      "restoreCheckpoint; every failure is a typed CheckpointRefusal",
   },
   validateEvaluationInput: {
     params: ["input"],
@@ -374,6 +385,15 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
       "round 5: the facade a strategy actually calls. Same deliberate RangeError as the " +
       "generator beneath it, contained by the runtime as one CALLBACK_THREW record",
   },
+  checkpointTransitions: {
+    params: ["last", "next"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "PARTIAL",
+    note:
+      "CKPT-1 (ADR-027 D1): a pure rule over the runtime's OWN mark and candidate values; the " +
+      "runtime computes both itself, so no caller data reaches it on any runtime path",
+  },
 
   // --- package-internal: reachable only through the entry points above -----
   buildStrategyContext: {
@@ -445,6 +465,20 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     totality: "TOTAL",
     note: "round 4, HIGH 2: the params grammar; same path normalization",
   },
+  elapsedAtLeast: {
+    params: ["earlier", "later"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "TOTAL",
+    note: "CKPT-1: exact heartbeat arithmetic; an unreadable instant answers undefined, never a throw",
+  },
+  parseExactInstant: {
+    params: ["value"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "TOTAL",
+    note: "CKPT-1: a typeof guard, then one regex and integer arithmetic; never a Date, never a throw",
+  },
   readOwnFieldsOnce: {
     params: ["owner", "label", "fields"],
     visibility: "PACKAGE",
@@ -474,6 +508,7 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
       "rng",
       "initialEvaluationSeq",
       "initialStatus",
+      "initialMark",
     ],
     visibility: "PACKAGE",
     shape: "constructor",
@@ -626,6 +661,11 @@ const PUBLIC_TOTAL_CALLS: Readonly<Record<string, (args: readonly unknown[]) => 
       args[0] as Parameters<typeof restoreCheckpoint>[0],
       args[1] as Parameters<typeof restoreCheckpoint>[1],
     ),
+  restoreFromPoint: (args) =>
+    restoreFromPoint(
+      args[0] as Parameters<typeof restoreFromPoint>[0],
+      args[1] as Parameters<typeof restoreFromPoint>[1],
+    ),
   validateEvaluationInput: (args) => validateEvaluationInput(args[0]),
   "StrategyContextRevokedError.constructor": (args) =>
     new StrategyContextRevokedError(args[0] as never),
@@ -702,6 +742,13 @@ const MULTI_PARAMETER_BASELINES: Readonly<Record<string, () => readonly unknown[
   // checkpoint in position 0 is what makes a hostile `identity` in position 1
   // reachable at all.
   restoreCheckpoint: () => [validCheckpoint(), validIdentity()],
+  // `CKPT-1`: a VALID restore point in position 0 is what makes a hostile
+  // `identity` reachable (the identity is read only once the point's
+  // checkpoint is being validated).
+  restoreFromPoint: () => [
+    { checkpoint: validCheckpoint(), highestEvaluationSeq: 6, checkpointEvaluatedAt: "2026-01-02T03:04:05.000Z" },
+    validIdentity(),
+  ],
 };
 
 /**
@@ -871,6 +918,11 @@ const PUBLIC_PARTIAL_WITNESSES: Readonly<Record<string, PartialWitness>> = {
     precondition: "an integer bound in [1, 2^32], inside a live invocation",
     breaks: () => withLiveContext((ctx) => ctx.rng().nextIntBelow(0)),
     throws: RangeError,
+  },
+  checkpointTransitions: {
+    precondition: "the runtime's own inert mark and candidate values",
+    breaks: () => checkpointTransitions(undefined, undefined as never),
+    throws: TypeError,
   },
 };
 

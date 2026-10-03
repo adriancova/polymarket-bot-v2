@@ -43,7 +43,9 @@
  * decision and one fill, and every row read back. The sentence this header
  * used to carry — "**The other three methods still have no such evidence**:
  * `persistDecision`, `saveCheckpoint` and `appendLedgerTransaction` remain
- * typecheck-pinned" — is superseded by that file. What it found on the way is
+ * typecheck-pinned" — is superseded by that file. (`CKPT-1` replaced
+ * `saveCheckpoint` with `persistDecisionWithCheckpoint`; its round trip is
+ * `test/integration/paper-trader/checkpoint-durable-together-postgres.test.ts`.) What it found on the way is
  * recorded on {@link PostgresTraderStore.appendLedgerTransaction}: the durable
  * ledger header cannot yet carry its fill link. `apps/trader`'s acceptance
  * evidence for §4.2's halt BEHAVIOUR remains at the PORT, with failure
@@ -314,8 +316,9 @@ function checkpointRow(checkpoint: StrategyStateCheckpoint, capturedAt: string) 
  * Rows per statement: 1,000 rows of at most 19 bind parameters each is far
  * below PostgreSQL's 65,535. A batch is at most 128 stagings (the loop's hard
  * bound, `GROUP_COMMIT_MAX_EVENTS`; one staging per venue frame since ADR-024,
- * `TP2-R1-M2`), and a staging's evaluations write one decision and one
- * checkpoint each, so a batch fits one statement unless a frame evaluates
+ * `TP2-R1-M2`), and a staging's evaluations write one decision each and at
+ * most one checkpoint each (`CKPT-1`: only the decisions ADR-027 Decision 1
+ * says owe one), so a batch fits one statement unless a frame evaluates
  * unusually many callbacks — which the transaction path below still handles.
  */
 const GROUP_COMMIT_ROWS_PER_STATEMENT = 1_000;
@@ -344,7 +347,9 @@ const GROUP_COMMIT_ROWS_PER_STATEMENT = 1_000;
  *
  * WHAT THIS CHANGES AND WHAT IT DOES NOT. Every row, every column value and
  * the `(run_id, evaluation_seq)` / `(run_id, checkpoint_seq)` uniqueness are
- * exactly the per-row path's. What changes is WHEN they become durable: at the
+ * exactly the per-row path's. `CKPT-1` (ADR-027 D3): the loop stages every
+ * checkpoint in the staging of the decision it follows, so a batch's one
+ * transaction holds each decision and its owed checkpoint together. What changes is WHEN they become durable: at the
  * batch's commit (`loop.ts` states the bounds) instead of at each insert, in
  * one commit per batch instead of two per decision — which H1 run 1 measured
  * as the store's whole cost (~1.2 ms per autocommit on its host). The
@@ -733,7 +738,13 @@ export class PostgresTraderStore implements TraderStore {
   }
 
   /**
-   * §9.6's checkpoint after every persisted decision.
+   * `CKPT-1` (ADR-027 D3) — one decision AND the checkpoint it owes, in ONE
+   * statement: a data-modifying CTE inserts the decision and the outer insert
+   * the checkpoint, which PostgreSQL runs as one implicit transaction — both
+   * rows commit or neither does (the same form the group commit uses for a
+   * batch). It replaces `saveCheckpoint`, which inserted the checkpoint in its
+   * own autocommit after the decision's, so a failure or a crash between the
+   * two left a durable decision without its checkpoint (`DURABLE-1` LOW-3).
    *
    * `state` is stored as the runtime's OWN CANONICAL BYTES rather than as a
    * re-serialized object: `stateJson` is what the runtime hashed, checkpointed
@@ -746,14 +757,19 @@ export class PostgresTraderStore implements TraderStore {
    * `docs/contracts/dependency-direction.md` §2.2 leaves outside F17's
    * enumerated built-in allowlist.
    */
-  async saveCheckpoint(
+  async persistDecisionWithCheckpoint(
+    record: DecisionRecord,
+    telemetry: DecisionTelemetry,
     checkpoint: StrategyStateCheckpoint,
     capturedAt: string,
   ): Promise<PortResult<null>> {
-    return await this.#contained("save a strategy checkpoint", async () => {
+    return await this.#contained("persist a decision with its strategy checkpoint", async () => {
+      const decision = decisionRow(record, telemetry, this.#decisionContractVersion);
+      const stored = checkpointRow(checkpoint, capturedAt);
       await this.#db
+        .with("persisted_decision", (db) => db.insertInto("strategy.decisions").values(decision).returning("decision_id"))
         .insertInto("strategy.state_checkpoints")
-        .values(checkpointRow(checkpoint, capturedAt))
+        .values(stored)
         .execute();
     });
   }

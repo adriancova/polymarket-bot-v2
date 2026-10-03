@@ -18,13 +18,16 @@ import type {
   StrategyContext,
 } from "../../../packages/strategy-sdk/src/index.js";
 import {
+  canonicalJsonStringify,
   createStrategyInstanceRuntime,
+  rebuildStateFromPatches,
   type CreateRuntimeResult,
   type DecisionRecord,
   type DecisionTelemetry,
   type EvaluationInput,
   type MonotonicClock,
   type StrategyInstanceRuntime,
+  type StrategyRestorePoint,
   type StrategyRuntimeDefinition,
   type StrategyStateCheckpoint,
 } from "../../../packages/strategy-runtime/src/index.js";
@@ -238,4 +241,58 @@ export function makeHarness(overrides: Partial<StrategyRuntimeDefinition> = {}):
     throw new Error(`runtime creation refused: ${created.refusal.code}: ${created.refusal.detail}`);
   }
   return { runtime: created.runtime, sink, store, clock };
+}
+
+/**
+ * `CKPT-1` (ADR-027 D2): a restore point for `checkpoint`. The defaults say
+ * "this checkpoint follows the LAST durable decision, evaluated at {@link T0}"
+ * — which is what every pre-`CKPT-1` restore in this tree assumed, since a
+ * checkpoint then followed every decision. A test that restores with later
+ * decisions durable passes `highestEvaluationSeq` explicitly.
+ */
+export function restorePoint(
+  checkpoint: StrategyStateCheckpoint,
+  highestEvaluationSeq: number = checkpoint.checkpointSeq,
+  checkpointEvaluatedAt: string = T0,
+): StrategyRestorePoint {
+  return { checkpoint, highestEvaluationSeq, checkpointEvaluatedAt };
+}
+
+/**
+ * `CKPT-1` — an INDEPENDENT oracle for ADR-027 Decision 1, written from the
+ * persisted records alone: the `evaluationSeq` of every record that owes a
+ * checkpoint. START is the first record; STATE is a record after which the
+ * fold of every persisted `statePatch` (`rebuildStateFromPatches`) has bytes
+ * other than at the last owed checkpoint; STATUS is a RUNTIME-attributed record
+ * (containment pauses) or `onStop` (stops); STOP is `onStop`; HEARTBEAT is
+ * 60 s of `evaluatedAt` since the last owed checkpoint's record.
+ *
+ * PRECONDITION: the strategy draws NO randomness — an RNG draw leaves no trace
+ * in a record, which is exactly why ADR-027 D3 makes the decision and its
+ * checkpoint durable together rather than relying on a restore to find it.
+ */
+export function owedCheckpointSeqs(
+  calls: ReadonlyArray<{ readonly record: DecisionRecord }>,
+): number[] {
+  const owed: number[] = [];
+  let lastBytes = "";
+  let lastAtMs = Number.NaN;
+  for (const [index, call] of calls.entries()) {
+    const folded = rebuildStateFromPatches(calls.slice(0, index + 1).map((entry) => entry.record.decision.statePatch));
+    if (!folded.ok) throw new Error(`the oracle cannot fold the records: ${folded.problem}`);
+    const bytes = canonicalJsonStringify(folded.state);
+    const atMs = Date.parse(call.record.evaluatedAt);
+    const owes =
+      index === 0 ||
+      bytes !== lastBytes ||
+      call.record.attribution === "RUNTIME" ||
+      call.record.callback === "onStop" ||
+      atMs - lastAtMs >= 60_000;
+    if (owes) {
+      owed.push(call.record.evaluationSeq);
+      lastBytes = bytes;
+      lastAtMs = atMs;
+    }
+  }
+  return owed;
 }

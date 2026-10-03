@@ -166,7 +166,8 @@ async function runPerRow(label: string, connectionString: string, context: TestC
   });
   const perRow: TraderStore = {
     persistDecision: (record, telemetry) => store.persistDecision(record, telemetry),
-    saveCheckpoint: (checkpoint, capturedAt) => store.saveCheckpoint(checkpoint, capturedAt),
+    persistDecisionWithCheckpoint: (record, telemetry, checkpoint, capturedAt) =>
+      store.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
     appendLedgerTransaction: (transaction) => store.appendLedgerTransaction(transaction),
     writePnlSnapshot: (snapshot) => store.writePnlSnapshot(snapshot),
     replacePnlSnapshot: (snapshot) => store.replacePnlSnapshot(snapshot),

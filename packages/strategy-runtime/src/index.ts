@@ -53,6 +53,7 @@ export {
   MAX_EVALUATION_SEQ,
   rebuildStateFromPatches,
   restoreCheckpoint,
+  restoreFromPoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   type CheckpointIdentity,
   type CheckpointRefusal,
@@ -61,8 +62,23 @@ export {
   type RebuildStateResult,
   type RestoreCheckpointResult,
   type RestoredCheckpoint,
+  type RestoredInstance,
+  type RestoreFromPointResult,
+  type StrategyRestorePoint,
   type StrategyStateCheckpoint,
 } from "./checkpoint.js";
+
+/**
+ * `CKPT-1` — ADR-027 Decision 1, the checkpoint transition rule (pure). The
+ * exact instant arithmetic behind its heartbeat stays package-internal.
+ */
+export {
+  CHECKPOINT_HEARTBEAT_MS,
+  checkpointTransitions,
+  type CheckpointCandidate,
+  type CheckpointMark,
+  type CheckpointTransition,
+} from "./transitions.js";
 
 export {
   isReservedRuntimeReasonCode,

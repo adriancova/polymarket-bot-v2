@@ -202,7 +202,9 @@ import type {
   DispatchPosition,
   GroupCommit,
   IngestedEvent,
+  PortResult,
   RiskRefusalRecord,
+  StagedEvaluations,
   TraderStore,
 } from "./ports.js";
 import type { DecisionRecord, DecisionTelemetry } from "@polymarket-bot/strategy-runtime";
@@ -499,6 +501,19 @@ export interface RetainedOrderState {
 }
 
 /**
+ * `CKPT-1` — one persisted decision as the outbox holds it: the record, its
+ * telemetry, and the checkpoint it owes, if ADR-027 Decision 1 says it owes
+ * one. The checkpoint is ATTACHED to its decision, never queued apart from it,
+ * so every write path — the flush, the group staging and `DURABLE-1`'s
+ * boundary before a placement — takes the two together (ADR-027 D3).
+ */
+export interface OutboxEntry {
+  readonly record: DecisionRecord;
+  readonly telemetry: DecisionTelemetry;
+  readonly checkpoint: StrategyStateCheckpoint | undefined;
+}
+
+/**
  * The bounded, synchronous journal between the runtime and the store.
  *
  * BOUNDED for §8.3's reason: an unbounded outbox is an unbounded memory
@@ -507,65 +522,89 @@ export interface RetainedOrderState {
  * into its own `HALTED` outcome, which this loop turns into a latched halt —
  * so the back pressure reaches the halt controller through the runtime's own
  * contract rather than around it, and nothing is dropped on any path.
+ *
+ * `CKPT-1` (ADR-027 D3): a checkpoint is held ON the decision it follows
+ * ({@link OutboxEntry}). The runtime saves a checkpoint synchronously, inside
+ * the same `evaluate()` call that persisted its decision and with that
+ * decision's `evaluationSeq`, so {@link appendCheckpoint} attaches it to the
+ * entry just appended — and refuses (throws, which the runtime turns into a
+ * `SAVE_CHECKPOINT` halt) a checkpoint that does not follow that entry. Until
+ * `CKPT-1` checkpoints were a second list, drained apart from the decisions by
+ * `DURABLE-1`'s boundary (`DURABLE-1` LOW-3). The bound counts entries; a
+ * checkpoint adds no entry, so attaching one never fails for capacity.
  */
 export class DecisionOutboxBuffer {
   readonly maximumDepth: number;
-  #decisions: { record: DecisionRecord; telemetry: DecisionTelemetry }[] = [];
-  #checkpoints: StrategyStateCheckpoint[] = [];
+  #entries: { record: DecisionRecord; telemetry: DecisionTelemetry; checkpoint: StrategyStateCheckpoint | undefined }[] = [];
 
   constructor(maximumDepth: number) {
     this.maximumDepth = maximumDepth;
   }
 
   appendDecision(record: DecisionRecord, telemetry: DecisionTelemetry): void {
-    if (this.#decisions.length >= this.maximumDepth) {
+    if (this.#entries.length >= this.maximumDepth) {
       throw new Error(
         `the decision outbox is at its maximum depth of ${String(this.maximumDepth)}; §8.3 ` +
           "forbids dropping the record, so the append REFUSES and the runtime halts the instance",
       );
     }
-    this.#decisions.push({ record, telemetry });
-  }
-
-  appendCheckpoint(checkpoint: StrategyStateCheckpoint): void {
-    if (this.#checkpoints.length >= this.maximumDepth) {
-      throw new Error(
-        `the checkpoint outbox is at its maximum depth of ${String(this.maximumDepth)}; the ` +
-          "append REFUSES rather than dropping a checkpoint a persisted decision depends on",
-      );
-    }
-    this.#checkpoints.push(checkpoint);
-  }
-
-  drain(): {
-    readonly decisions: readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[];
-    readonly checkpoints: readonly StrategyStateCheckpoint[];
-  } {
-    const decisions = this.#decisions;
-    const checkpoints = this.#checkpoints;
-    this.#decisions = [];
-    this.#checkpoints = [];
-    return { decisions, checkpoints };
+    this.#entries.push({ record, telemetry, checkpoint: undefined });
   }
 
   /**
-   * `DURABLE-1`: drains the DECISIONS only, leaving every checkpoint where it
-   * is. The loop's durability boundary before a placement
-   * ({@link CoreLoop}'s `#persistDecisionsBeforePlacement`) makes the pending
-   * decisions durable there and then; the checkpoints stay for the flush that
-   * always wrote them, so each is written with exactly the `capturedAt` it
-   * always had (the flush's instant, which inside a venue frame is the
-   * frame's last event, not the event a mid-frame callback fired at).
+   * Attaches a checkpoint to the decision it follows: the entry appended LAST,
+   * which must carry the checkpoint's run, instance and sequence and no
+   * checkpoint yet. Anything else is refused, never queued on its own.
    */
-  drainDecisions(): readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[] {
-    const decisions = this.#decisions;
-    this.#decisions = [];
-    return decisions;
+  appendCheckpoint(checkpoint: StrategyStateCheckpoint): void {
+    const last = this.#entries.at(-1);
+    if (
+      last === undefined ||
+      last.checkpoint !== undefined ||
+      last.record.runId !== checkpoint.runId ||
+      last.record.instanceId !== checkpoint.instanceId ||
+      last.record.evaluationSeq !== checkpoint.checkpointSeq
+    ) {
+      throw new Error(
+        `the checkpoint of run ${checkpoint.runId} / instance ${checkpoint.instanceId} at sequence ` +
+          `${String(checkpoint.checkpointSeq)} does not follow the decision the outbox holds last; ` +
+          "ADR-027 D3 makes a checkpoint durable only together with its decision, so the append " +
+          "REFUSES rather than queue it alone",
+      );
+    }
+    last.checkpoint = checkpoint;
   }
 
-  get depth(): number {
-    return this.#decisions.length + this.#checkpoints.length;
+  /** Every pending entry, in evaluation order, each decision with the checkpoint it owes. */
+  drain(): readonly OutboxEntry[] {
+    const entries = this.#entries;
+    this.#entries = [];
+    return entries;
   }
+
+  /** Pending decisions plus the checkpoints attached to them. */
+  get depth(): number {
+    let depth = this.#entries.length;
+    for (const entry of this.#entries) if (entry.checkpoint !== undefined) depth += 1;
+    return depth;
+  }
+}
+
+/** `CKPT-1`: an outbox drain as one {@link StagedEvaluations} — every checkpoint with its decision. */
+function stagedFrom(
+  entries: readonly OutboxEntry[],
+  capturedAt: string,
+  riskRefusals: readonly RiskRefusalRecord[],
+): StagedEvaluations {
+  const checkpoints: { checkpoint: StrategyStateCheckpoint; capturedAt: string }[] = [];
+  for (const entry of entries) {
+    if (entry.checkpoint !== undefined) checkpoints.push({ checkpoint: entry.checkpoint, capturedAt });
+  }
+  return {
+    decisions: entries.map((entry) => ({ record: entry.record, telemetry: entry.telemetry })),
+    checkpoints,
+    riskRefusals,
+  };
 }
 
 /**
@@ -2305,6 +2344,25 @@ export class CoreLoop {
           outcome.incident.detail,
           instant,
         );
+        if (outcome.stage === "SAVE_CHECKPOINT") {
+          // `CKPT-1` (ADR-027 D3): the decision is in the outbox and the
+          // checkpoint it owes is not, so writing the outbox would make the
+          // decision durable alone. The outbox refuses only a checkpoint that
+          // does not follow the decision appended last (`appendCheckpoint`) —
+          // a broken pairing, not a store outage — and the process answers it
+          // as it answers a staging failure: nothing pending is written, and a
+          // GLOBAL halt stops every further decision.
+          this.#durabilityLost = true;
+          this.#options.outbox.drain();
+          this.#options.halts.halt(
+            { kind: "GLOBAL" },
+            "STORE_UNAVAILABLE",
+            `a decision's owed strategy checkpoint could not be queued with it (${outcome.incident.detail}); ` +
+              "ADR-027 D3 makes a decision and its checkpoint durable together, so neither is written " +
+              "and the process makes no further trading decision",
+            instant,
+          );
+        }
         return;
       case "CONTAINED":
         this.#options.health.countLoop("containedEvaluations");
@@ -4305,35 +4363,13 @@ export class CoreLoop {
       if (group.stagedEvents >= GROUP_COMMIT_MAX_EVENTS) await this.#commitStaged();
       return;
     }
-    const drained = this.#options.outbox.drain();
-    for (const entry of drained.decisions) {
-      const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
-      if (!written.ok) {
-        this.#durabilityLost = true;
-        this.#options.halts.halt(
-          { kind: "GLOBAL" },
-          "STORE_UNAVAILABLE",
-          `a decision record could not be persisted (${written.failure.kind}): ` +
-            `${written.failure.detail}; §6 invariant 3 requires exactly one PERSISTED decision ` +
-            "per callback, so the process makes no further trading decision",
-          this.#lastInstant,
-        );
-        return;
-      }
-    }
-    for (const checkpoint of drained.checkpoints) {
-      const written = await this.#options.store.saveCheckpoint(checkpoint, this.#lastInstant);
-      if (!written.ok) {
-        this.#durabilityLost = true;
-        this.#options.halts.halt(
-          { kind: "GLOBAL" },
-          "STORE_UNAVAILABLE",
-          `a strategy checkpoint could not be persisted (${written.failure.kind}): ` +
-            `${written.failure.detail}`,
-          this.#lastInstant,
-        );
-        return;
-      }
+    // `CKPT-1` (ADR-027 D3): each decision is written WITH the checkpoint it
+    // owes, in one store transaction (`persistDecisionWithCheckpoint`), and a
+    // decision that owes none alone. Base wrote every decision of the event
+    // and THEN every checkpoint, so a failure (or a crash) between the two
+    // left decisions durable without their checkpoints.
+    for (const entry of this.#options.outbox.drain()) {
+      if (!(await this.#writeEntry(entry, false))) return;
     }
     // `PROVENANCE-1`: the event's refused intents, after its decisions and
     // checkpoints. Never after a store failure this process has halted on.
@@ -4353,6 +4389,38 @@ export class CoreLoop {
         return;
       }
     }
+  }
+
+  /**
+   * `CKPT-1` — one outbox entry through the per-row store: the decision with
+   * the checkpoint it owes in ONE transaction, or the decision alone when it
+   * owes none (ADR-027 D3). On a refusal: `#durabilityLost`, a GLOBAL
+   * `STORE_UNAVAILABLE` halt, and `false` — neither row of a refused pair is
+   * durable, so the store never holds a decision whose owed checkpoint is
+   * missing.
+   */
+  async #writeEntry(entry: OutboxEntry, beforePlacement: boolean): Promise<boolean> {
+    const store = this.#options.store;
+    const written: PortResult<null> =
+      entry.checkpoint === undefined
+        ? await store.persistDecision(entry.record, entry.telemetry)
+        : await store.persistDecisionWithCheckpoint(entry.record, entry.telemetry, entry.checkpoint, this.#lastInstant);
+    if (written.ok) return true;
+    this.#durabilityLost = true;
+    this.#options.halts.halt(
+      { kind: "GLOBAL" },
+      "STORE_UNAVAILABLE",
+      `a decision record could not be persisted (${written.failure.kind})` +
+        (entry.checkpoint === undefined ? "" : ", nor the strategy checkpoint it owes (ADR-027 D3: one transaction)") +
+        `: ${written.failure.detail}; ` +
+        (beforePlacement
+          ? "§6 invariant 3 requires the decision to be PERSISTED before its placement, so nothing is placed " +
+            "and the process makes no further trading decision"
+          : "§6 invariant 3 requires exactly one PERSISTED decision per callback, so the process makes no " +
+            "further trading decision"),
+      this.#lastInstant,
+    );
+    return false;
   }
 
   /**
@@ -4386,13 +4454,24 @@ export class CoreLoop {
    *   exactly the rows `#stageOutbox` would have staged for them) and the
    *   loop waits until EVERYTHING staged is committed (`#commitStaged`), so
    *   the durable rows stay a prefix of the run's;
-   * - without it, each pending decision is written by `persistDecision`, in
-   *   evaluation order, exactly as `#flushOutbox` would have written it.
+   * - without it, each pending decision is written in evaluation order,
+   *   exactly as `#flushOutbox` would have written it (`#writeEntry`:
+   *   `persistDecision`, or `persistDecisionWithCheckpoint` for one that owes
+   *   a checkpoint).
    *
-   * Checkpoints are NOT drained here ({@link DecisionOutboxBuffer.drainDecisions}):
-   * the flush that follows the callback writes them, with the instant it
-   * always gave them. So the fix changes WHEN a decision row is written, never
-   * WHAT is written.
+   * `CKPT-1` (ADR-027 D3; `DURABLE-1` LOW-3): every pending decision is made
+   * durable WITH the checkpoint it owes — in the same staging (so the same
+   * commit), or by one `persistDecisionWithCheckpoint` per pair. Until
+   * `CKPT-1` this boundary drained the decisions only and left their
+   * checkpoints for the flush after the callback, so in group mode the
+   * decision committed in the transaction this boundary awaits and its
+   * checkpoint in a LATER one — a crash between them left a durable decision
+   * whose checkpoint was not (LOW-3), and per-row did the same with two
+   * autocommits. The checkpoints are now written here, with the instant the
+   * loop holds HERE: for a decision taken at a frame's close or at a
+   * single-event frame that is the instant the flush gives (the frame's last
+   * event); for a lifecycle callback fired inside a longer frame it is that
+   * event's own instant, where the flush used the frame's last.
    *
    * Answers `false` — with a GLOBAL `STORE_UNAVAILABLE` halt latched, the same
    * halt a failed flush latches — when the decisions are not durable. The
@@ -4410,16 +4489,8 @@ export class CoreLoop {
    * placement without asking the store again (`#routingUndurableDecision`),
    * so the refusal never depends on the risk seam reading the halt.
    *
-   * GROUP COMMIT SPLITS A DECISION FROM ITS EVENT'S CHECKPOINT (r1, LOW-3).
-   * The decisions are staged here WITHOUT the checkpoints the outbox still
-   * holds, so the decision rows commit in the transaction this boundary
-   * awaits and the event's checkpoints in a LATER one (the flush stages them;
-   * a crash between the two leaves a durable decision whose checkpoint is not).
-   * Base staged an event's decisions and checkpoints as one staging. Keeping
-   * them together would mean draining the checkpoints here, with an instant
-   * that inside a venue frame is not the one they always had. Per-row stores
-   * never wrote the two atomically. No production path restores from a
-   * checkpoint (`restoreFrom` has no caller outside tests).
+   * GROUP COMMIT USED TO SPLIT A DECISION FROM ITS CHECKPOINT (`DURABLE-1`
+   * r1, LOW-3); `CKPT-1` closes it as stated above.
    */
   async #persistDecisionsBeforePlacement(): Promise<boolean> {
     if (this.#routingUndurableDecision) return false;
@@ -4430,10 +4501,11 @@ export class CoreLoop {
 
   async #persistPendingDecisions(): Promise<boolean> {
     const group = this.#options.store.groupCommit;
-    const decisions = this.#options.outbox.drainDecisions();
+    // `CKPT-1`: the decisions WITH their checkpoints (see above).
+    const entries = this.#options.outbox.drain();
     if (group !== undefined) {
-      if (decisions.length > 0) {
-        const staged = group.stage({ decisions, checkpoints: [], riskRefusals: [] });
+      if (entries.length > 0) {
+        const staged = group.stage(stagedFrom(entries, this.#lastInstant, []));
         if (!staged.ok) {
           this.#durabilityLost = true;
           this.#options.outbox.drain();
@@ -4452,19 +4524,11 @@ export class CoreLoop {
       await this.#commitStaged();
       return !this.#groupCommitFailed;
     }
-    for (const entry of decisions) {
-      const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
-      if (!written.ok) {
-        this.#durabilityLost = true;
+    for (const entry of entries) {
+      if (!(await this.#writeEntry(entry, true))) {
+        // As a failed flush drops what it drained: nothing is written after
+        // the failure the halt reports.
         this.#options.outbox.drain();
-        this.#options.halts.halt(
-          { kind: "GLOBAL" },
-          "STORE_UNAVAILABLE",
-          `a decision record could not be persisted (${written.failure.kind}): ` +
-            `${written.failure.detail}; §6 invariant 3 requires the decision to be PERSISTED before ` +
-            "its placement, so nothing is placed and the process makes no further trading decision",
-          this.#lastInstant,
-        );
         return false;
       }
     }
@@ -4484,12 +4548,9 @@ export class CoreLoop {
     // its remaining rows, so they commit in that batch's transaction, before
     // any later event's decision (the commit chain is in stage order).
     const riskRefusals = this.#takeRiskRefusals();
-    if (drained.decisions.length === 0 && drained.checkpoints.length === 0 && riskRefusals.length === 0) return;
-    const staged = group.stage({
-      decisions: drained.decisions,
-      checkpoints: drained.checkpoints.map((checkpoint) => ({ checkpoint, capturedAt: this.#lastInstant })),
-      riskRefusals,
-    });
+    if (drained.length === 0 && riskRefusals.length === 0) return;
+    // `CKPT-1`: each checkpoint in the staging of its own decision.
+    const staged = group.stage(stagedFrom(drained, this.#lastInstant, riskRefusals));
     if (!staged.ok) {
       this.#durabilityLost = true;
       this.#options.halts.halt(

@@ -110,7 +110,15 @@ import {
   type SimulatedOrder,
   type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
-import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
+import {
+  canonicalJsonStringify,
+  createStrategyInstanceRuntime,
+  rebuildStateFromPatches,
+  type DecisionRecord,
+  type DecisionTelemetry,
+  type EvaluationInput,
+  type StrategyStateCheckpoint,
+} from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -149,7 +157,16 @@ import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
-import { portFailed, portOk, type GroupCommit, type IngestedEvent, type StagedEvaluations, type TraderStore } from "./ports.js";
+import {
+  portFailed,
+  portOk,
+  type GroupCommit,
+  type IngestedEvent,
+  type PortResult,
+  type RiskRefusalRecord,
+  type StagedEvaluations,
+  type TraderStore,
+} from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
 
@@ -566,6 +583,11 @@ function assemble(
     readonly tier1?: { readonly secondsDelay: number; readonly venueClock?: ManualClock };
     /** SIM-2 r1: the venue's history bounds (its defaults when absent). */
     readonly venueRetention?: VenueRetentionBounds;
+    /**
+     * `CKPT-1`: replaces the runtime's checkpoint port (the outbox's
+     * `appendCheckpoint`) — the `SAVE_CHECKPOINT` halt case.
+     */
+    readonly checkpointSave?: (checkpoint: StrategyStateCheckpoint, append: (checkpoint: StrategyStateCheckpoint) => void) => void;
   } = {},
 ): Harness {
   const parsed = parseTraderConfig(traderConfig());
@@ -600,7 +622,15 @@ function assemble(
     watchdog: { evaluationBudgetUs: 5_000_000 },
     clock: { nowNs: () => clock.monotonicNs() },
     decisionSink: { persist: (record, telemetry) => outbox.appendDecision(record, telemetry) },
-    checkpointStore: { save: (checkpoint) => outbox.appendCheckpoint(checkpoint) },
+    checkpointStore: {
+      save: (checkpoint) => {
+        const append = (owed: StrategyStateCheckpoint): void => {
+          outbox.appendCheckpoint(owed);
+        };
+        if (input.checkpointSave === undefined) append(checkpoint);
+        else input.checkpointSave(checkpoint, append);
+      },
+    },
   });
   if (!created.ok) throw new Error(`runtime refused: ${created.refusal.detail}`);
   const registry = new InstanceRegistry();
@@ -1786,7 +1816,15 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
         }
         return await inner.persistDecision(record, telemetry);
       },
-      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      // `CKPT-1`: a decision that owes a checkpoint is written WITH it, in one
+      // write; the store refuses that write the same way (neither row lands).
+      persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) => {
+        if (record.decision.intents.length > 0) {
+          refused.push(record.evaluationSeq);
+          return portFailed<null>("UNAVAILABLE", "durable-1: the store refuses this decision");
+        }
+        return await inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt);
+      },
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
@@ -1894,7 +1932,8 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
     };
     const store: TraderStore = {
       persistDecision: (record, telemetry) => inner.persistDecision(record, telemetry),
-      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      persistDecisionWithCheckpoint: (record, telemetry, checkpoint, capturedAt) =>
+        inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
@@ -1999,7 +2038,15 @@ describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durabili
         }
         return await inner.persistDecision(record, telemetry);
       },
-      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      // `CKPT-1`: the paired write (a decision with the checkpoint it owes) is
+      // held the same way.
+      persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) => {
+        if (carriesIntent(record)) {
+          reached();
+          await gate;
+        }
+        return await inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt);
+      },
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
@@ -2052,4 +2099,299 @@ describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durabili
       });
     }
   }
+});
+
+/**
+ * `CKPT-1` — ADR-027 Decision 3, `CKPT-1`'s choice: a decision that owes a
+ * checkpoint and that checkpoint are durable TOGETHER, in one store transaction
+ * (the other option, a restore that detects the missing checkpoint and refuses,
+ * cannot see an RNG change in a decision row). This closes `DURABLE-1` LOW-3:
+ * the durability boundary before a placement used to make the decision durable
+ * ALONE — in group mode its own commit, per-row its own autocommit — and leave
+ * its checkpoint to the flush after the callback, so a crash between the two
+ * left a durable decision whose checkpoint was not.
+ *
+ * "Crash" here is a store that stops answering — every write after the named
+ * one never resolves — which is what a dead process looks like from the
+ * database: what was committed stays, nothing after it lands. The real-
+ * PostgreSQL version is `test/integration/paper-trader/checkpoint-durable-together-postgres.test.ts`.
+ */
+describe("CKPT-1 (ADR-027 D3, DURABLE-1 LOW-3): a decision and the checkpoint it owes are durable together", () => {
+  async function openUntilEntry(harness: Harness): Promise<void> {
+    await feed(harness, envelope(1, "ReferenceTradeObserved", { venue: "binance", symbol: "BTCUSDT", price: "64000", size: "0.5" }, "binance"));
+    await feed(harness, envelope(2, "MarketOpened", { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, openedAt: T_OPEN }));
+    await feed(harness, envelope(3, "BookSnapshot", {
+      internalMarketId: MARKET_ID,
+      tokenId: NO_TOKEN,
+      bids: [{ price: "0.65", size: "5000" }],
+      asks: [{ price: "0.66", size: "5000" }],
+    }));
+  }
+
+  /** Lets every turn that does not wait on a dead store run. */
+  async function settle(): Promise<void> {
+    for (let turn = 0; turn < 40; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const carriesIntent = (record: DecisionRecord): boolean => record.decision.intents.length > 0;
+  const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
+
+  /**
+   * The store a dead process leaves behind: per-row writes go to `inner` until
+   * the first write that carries an intent-bearing decision has landed; every
+   * write after it never resolves. It also offers the lone `saveCheckpoint`
+   * write the trader used before `CKPT-1`, so this file can be replayed against
+   * that loop, where these tests must fail.
+   */
+  class CrashAfterIntentDecision implements TraderStore {
+    readonly inner = new MemoryTraderStore();
+    crashed = false;
+
+    async #write<T>(write: () => Promise<PortResult<T>>, landsIntentDecision: boolean): Promise<PortResult<T>> {
+      if (this.crashed) return await never<PortResult<T>>();
+      const written = await write();
+      if (landsIntentDecision) this.crashed = true;
+      return written;
+    }
+
+    async persistDecision(record: DecisionRecord, telemetry: DecisionTelemetry): Promise<PortResult<null>> {
+      return await this.#write(() => this.inner.persistDecision(record, telemetry), carriesIntent(record));
+    }
+
+    async persistDecisionWithCheckpoint(
+      record: DecisionRecord,
+      telemetry: DecisionTelemetry,
+      checkpoint: StrategyStateCheckpoint,
+      capturedAt: string,
+    ): Promise<PortResult<null>> {
+      return await this.#write(
+        () => this.inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
+        carriesIntent(record),
+      );
+    }
+
+    async saveCheckpoint(checkpoint: StrategyStateCheckpoint, capturedAt: string): Promise<PortResult<null>> {
+      return await this.#write(() => this.inner.saveCheckpoint(checkpoint, capturedAt), false);
+    }
+
+    async persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>> {
+      return await this.#write(() => this.inner.persistRiskRefusal(refusal), false);
+    }
+
+    async appendLedgerTransaction(transaction: Parameters<TraderStore["appendLedgerTransaction"]>[0]): Promise<PortResult<null>> {
+      return await this.#write(() => this.inner.appendLedgerTransaction(transaction), false);
+    }
+
+    async writePnlSnapshot(snapshot: Parameters<TraderStore["writePnlSnapshot"]>[0]): Promise<PortResult<null>> {
+      return await this.#write(() => this.inner.writePnlSnapshot(snapshot), false);
+    }
+
+    async replacePnlSnapshot(snapshot: Parameters<TraderStore["replacePnlSnapshot"]>[0]): Promise<PortResult<null>> {
+      return await this.#write(() => this.inner.replacePnlSnapshot(snapshot), false);
+    }
+
+    async close(): Promise<void> {
+      await this.inner.close();
+    }
+  }
+
+  /**
+   * The group-commit form: with `crash`, the first COMMIT that lands an
+   * intent-bearing decision is the last one that lands.
+   */
+  function crashingGroupCommit(
+    store: CrashAfterIntentDecision,
+    crash: boolean,
+  ): { readonly group: GroupCommit; readonly stagings: StagedEvaluations[] } {
+    const stagings: StagedEvaluations[] = [];
+    let pending: StagedEvaluations[] = [];
+    const group: GroupCommit = {
+      stage(evaluations) {
+        stagings.push(evaluations);
+        pending.push(evaluations);
+        return portOk(null);
+      },
+      get stagedEvents() {
+        return pending.length;
+      },
+      async commit() {
+        const batch = pending;
+        pending = [];
+        if (store.crashed) return await never<PortResult<{ decisions: number; checkpoints: number }>>();
+        let decisions = 0;
+        let checkpoints = 0;
+        for (const evaluation of batch) {
+          for (const entry of evaluation.decisions) {
+            await store.inner.persistDecision(entry.record, entry.telemetry);
+            decisions += 1;
+          }
+          for (const entry of evaluation.checkpoints) {
+            await store.inner.saveCheckpoint(entry.checkpoint, entry.capturedAt);
+            checkpoints += 1;
+          }
+          for (const refusal of evaluation.riskRefusals) await store.inner.persistRiskRefusal(refusal);
+        }
+        if (crash && batch.some((evaluation) => evaluation.decisions.some((entry) => carriesIntent(entry.record)))) {
+          store.crashed = true;
+        }
+        return portOk({ decisions, checkpoints });
+      },
+    };
+    return { group, stagings };
+  }
+
+  /** `store`'s writes, with `group` as its group commit. */
+  function groupedStore(store: CrashAfterIntentDecision, group: GroupCommit): TraderStore {
+    return {
+      persistDecision: (record, telemetry) => store.persistDecision(record, telemetry),
+      persistDecisionWithCheckpoint: (record, telemetry, checkpoint, capturedAt) =>
+        store.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
+      appendLedgerTransaction: (transaction) => store.appendLedgerTransaction(transaction),
+      writePnlSnapshot: (snapshot) => store.writePnlSnapshot(snapshot),
+      replacePnlSnapshot: (snapshot) => store.replacePnlSnapshot(snapshot),
+      persistRiskRefusal: (refusal) => store.persistRiskRefusal(refusal),
+      close: () => store.close(),
+      groupCommit: group,
+    };
+  }
+
+  /** What a restore would read: every durable decision that changed the state has its checkpoint. */
+  function expectDurableTogether(inner: MemoryTraderStore): void {
+    const entry = inner.decisions.find((written) => carriesIntent(written.record));
+    expect(entry, "the intent-bearing decision is durable (the crash came after it)").toBeDefined();
+    const seq = entry?.record.evaluationSeq ?? -1;
+    // The checkpoint the entry owed (its patch moved the state) is durable with it…
+    expect(inner.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toContain(seq);
+    // …so the LAST durable checkpoint is the fold of every durable decision's
+    // patch: a restore from it does not resume older than a durable change.
+    const folded = rebuildStateFromPatches(inner.decisions.map((written) => written.record.decision.statePatch));
+    expect(folded.ok && canonicalJsonStringify(folded.state)).toBe(inner.checkpoints.at(-1)?.stateJson);
+  }
+
+  it("group commit: the boundary before a placement stages the decision WITH its checkpoint — one staging, one commit (fails at base: checkpoints [])", async () => {
+    const store = new CrashAfterIntentDecision();
+    // No crash in this case: it reads what the boundary STAGED.
+    const { group, stagings } = crashingGroupCommit(store, false);
+    const harness = assemble({ store: groupedStore(store, group), intents: (ctx) => [followOnBuy(ctx)] });
+    await openUntilEntry(harness);
+    await feed(harness, yesBook(4));
+    const carrying = stagings.filter((staging) => staging.decisions.some((entry) => carriesIntent(entry.record)));
+    expect(carrying).toHaveLength(1);
+    const seq = carrying[0]?.decisions.find((entry) => carriesIntent(entry.record))?.record.evaluationSeq;
+    expect(carrying[0]?.checkpoints.map((entry) => entry.checkpoint.checkpointSeq)).toContain(seq);
+  });
+
+  it("group commit, a CRASH right after the commit that made the entry decision durable: its checkpoint is durable too (fails at base)", async () => {
+    const store = new CrashAfterIntentDecision();
+    const { group } = crashingGroupCommit(store, true);
+    const harness = assemble({ store: groupedStore(store, group), intents: (ctx) => [followOnBuy(ctx)] });
+    await openUntilEntry(harness);
+    expect(harness.loop.ingest(yesBook(4))).toBe(true);
+    void harness.loop.drain();
+    await settle();
+    expect(store.crashed).toBe(true);
+    expectDurableTogether(store.inner);
+  });
+
+  it("per-row, a CRASH right after the write that made the entry decision durable: its checkpoint is durable too (fails at base)", async () => {
+    const store = new CrashAfterIntentDecision();
+    const harness = assemble({ store, intents: (ctx) => [followOnBuy(ctx)] });
+    await openUntilEntry(harness);
+    expect(harness.loop.ingest(yesBook(4))).toBe(true);
+    void harness.loop.drain();
+    await settle();
+    expect(store.crashed).toBe(true);
+    expectDurableTogether(store.inner);
+    // Per-row, the pair is ONE write: the store was asked for it, not for a
+    // lone checkpoint.
+    expect(store.inner.checkpoints.length).toBeGreaterThan(0);
+  });
+
+  it("a checkpoint the outbox cannot queue WITH its decision (the runtime's SAVE_CHECKPOINT halt): neither is written, and a GLOBAL halt stops the process", async () => {
+    const inner = new MemoryTraderStore();
+    let armed = false;
+    let refusedSeq = -1;
+    const harness = assemble({
+      store: inner,
+      intents: (ctx) => [followOnBuy(ctx)],
+      checkpointSave: (checkpoint, append) => {
+        // Once armed, the next checkpoint — the entry's: its decision moved the
+        // state — cannot be queued: the port throws, as the outbox does on a
+        // broken pairing.
+        if (armed) {
+          refusedSeq = checkpoint.checkpointSeq;
+          throw new Error("ckpt-1: this checkpoint cannot be queued with its decision");
+        }
+        append(checkpoint);
+      },
+    });
+    await openUntilEntry(harness);
+    armed = true;
+    const before = { decisions: inner.decisions.length, checkpoints: inner.checkpoints.length };
+    await feed(harness, yesBook(4));
+    expect(refusedSeq).toBeGreaterThanOrEqual(0);
+    // The runtime HALTED that evaluation (its record was handed to the outbox,
+    // its checkpoint was not), so it is not in the loop's decision log either.
+    expect(harness.loop.decisions().map((decision) => decision.evaluationSeq)).not.toContain(refusedSeq);
+    expect(inner.decisions.some((written) => carriesIntent(written.record))).toBe(false);
+    const halts = harness.loop.health().halts.map((halt) => [halt.scope.kind, halt.code]);
+    expect(halts).toContainEqual(["STRATEGY_INSTANCE", "RUNTIME_PERSISTENCE_FAILED"]);
+    expect(halts).toContainEqual(["GLOBAL", "STORE_UNAVAILABLE"]);
+    // The decision whose checkpoint could not be queued never became durable,
+    // and nothing of that event was written after it.
+    expect(inner.decisions.map((written) => written.record.evaluationSeq)).not.toContain(refusedSeq);
+    expect({ decisions: inner.decisions.length, checkpoints: inner.checkpoints.length }).toEqual(before);
+    expect(harness.submitted).toEqual([]);
+    expect(await harness.loop.durabilityMark()).toBe(false);
+  });
+});
+
+describe("CKPT-1: the outbox holds a checkpoint ON the decision it follows", () => {
+  function record(seq: number, intents = 0): DecisionRecord {
+    return {
+      runId: RUN_ID,
+      instanceId: INSTANCE_ID,
+      evaluationSeq: seq,
+      decision: { intents: Array.from({ length: intents }, () => ({})) },
+    } as unknown as DecisionRecord;
+  }
+  function checkpoint(seq: number, runId: string = RUN_ID): StrategyStateCheckpoint {
+    return { runId, instanceId: INSTANCE_ID, checkpointSeq: seq } as unknown as StrategyStateCheckpoint;
+  }
+  const telemetry = { evaluationDurationUs: 0 };
+
+  it("attaches a checkpoint to the decision appended last, and drains them as pairs", () => {
+    const outbox = new DecisionOutboxBuffer(8);
+    outbox.appendDecision(record(0), telemetry);
+    outbox.appendCheckpoint(checkpoint(0));
+    outbox.appendDecision(record(1), telemetry);
+    outbox.appendDecision(record(2), telemetry);
+    outbox.appendCheckpoint(checkpoint(2));
+    expect(outbox.depth).toBe(5);
+    const drained = outbox.drain();
+    expect(drained.map((entry) => [entry.record.evaluationSeq, entry.checkpoint?.checkpointSeq])).toEqual([
+      [0, 0],
+      [1, undefined],
+      [2, 2],
+    ]);
+    expect(outbox.drain()).toEqual([]);
+  });
+
+  it("refuses — never queues alone — a checkpoint that does not follow the decision appended last", () => {
+    const outbox = new DecisionOutboxBuffer(8);
+    expect(() => outbox.appendCheckpoint(checkpoint(0))).toThrow(/does not follow/u);
+    outbox.appendDecision(record(0), telemetry);
+    expect(() => outbox.appendCheckpoint(checkpoint(1))).toThrow(/does not follow/u);
+    expect(() => outbox.appendCheckpoint(checkpoint(0, "another-run"))).toThrow(/does not follow/u);
+    outbox.appendCheckpoint(checkpoint(0));
+    expect(() => outbox.appendCheckpoint(checkpoint(0))).toThrow(/does not follow/u);
+    expect(outbox.drain().map((entry) => entry.checkpoint?.checkpointSeq)).toEqual([0]);
+  });
+
+  it("the bound counts decisions; a checkpoint never fails for capacity", () => {
+    const outbox = new DecisionOutboxBuffer(1);
+    outbox.appendDecision(record(0), telemetry);
+    expect(() => outbox.appendDecision(record(1), telemetry)).toThrow(/maximum depth/u);
+    expect(() => outbox.appendCheckpoint(checkpoint(0))).not.toThrow();
+  });
 });
