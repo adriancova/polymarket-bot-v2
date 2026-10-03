@@ -75,6 +75,13 @@
  * `RedisStreamsEventTransport`, to the process's own `RedisMarketEventFeed`
  * and `pump`. The rule is unchanged.
  *
+ * **Dated note (`PROVENANCE-1`, 2026-10-02): two more container files.**
+ * `durable-halts-and-refusals-postgres-redis.test.ts` (PostgreSQL and Redis;
+ * one scenario starts a SECOND PostgreSQL of its own, which it stops) and
+ * `provenance-retention-postgres-redis.test.ts` (PostgreSQL and Redis, plus a
+ * throwaway WAL root, object store and state directory under the OS temporary
+ * directory, removed afterwards). The rule is unchanged.
+ *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each
  * package this suite uses to its source.
