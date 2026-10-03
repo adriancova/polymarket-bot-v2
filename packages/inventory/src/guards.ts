@@ -9,6 +9,16 @@
  *
  * Amounts are canonical decimal strings (§6 invariant 1; ADR-001). A `number`
  * is never an amount.
+ *
+ * EVIDENCE IS READ ONCE (WP300B-R1-01, WP300B-R1-02; WP-300c). Evidence about a
+ * wallet operation (an observation, a reconciliation answer, the executor's
+ * answer) is read field by field with {@link readField}, ONCE, at the door,
+ * and every decision is taken on that snapshot: a Proxy whose traps answer
+ * differently on a second read never gets one. A field that is present but is
+ * not the caller's own data (an accessor, an inherited property, or one whose
+ * read throws) is not "absent" there: it is OPAQUE, and the manager reads the
+ * evidence carrying it as unrecognised (fail closed), never as evidence that
+ * names nothing. (Plans and other inputs keep the "absent" reading above.)
  */
 
 import { compareDecimal, isCanonicalDecimalString, type DecimalString } from "@polymarket-bot/decimal";
@@ -21,6 +31,53 @@ export function ownData(source: unknown, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(source, key);
   if (descriptor === undefined || !("value" in descriptor)) return undefined;
   return descriptor.value;
+}
+
+/**
+ * One field of caller evidence, as it read at the door:
+ * - `ABSENT`: no own property, and none inherited (or the source is not an
+ *   object);
+ * - `DATA`: an own data property, enumerable or not; its value, copied out;
+ * - `OPAQUE`: present, but not the caller's own data — an accessor (its getter
+ *   is never run), an inherited property, or a property whose read threw (a
+ *   hostile Proxy trap, a revoked Proxy). It has no value.
+ */
+export type FieldRead =
+  | { readonly kind: "ABSENT" }
+  | { readonly kind: "DATA"; readonly value: unknown }
+  | { readonly kind: "OPAQUE"; readonly why: "accessor" | "inherited" | "unreadable" };
+
+const ABSENT: FieldRead = Object.freeze({ kind: "ABSENT" });
+
+/**
+ * Read one field of caller evidence, exactly once (see the header, "EVIDENCE
+ * IS READ ONCE"): one `[[GetOwnProperty]]` (a Proxy's `getOwnPropertyDescriptor`
+ * trap) and, only when there is no own property, one `[[HasProperty]]` (its
+ * `has` trap) to tell an inherited property from an absent one. It never runs
+ * a getter and never throws: a read that throws is OPAQUE. Callers read each
+ * field once and decide on the result, never on the source again.
+ */
+export function readField(source: unknown, key: string): FieldRead {
+  if (source === null || (typeof source !== "object" && typeof source !== "function")) return ABSENT;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(source, key);
+  } catch {
+    return Object.freeze({ kind: "OPAQUE", why: "unreadable" });
+  }
+  if (descriptor !== undefined) {
+    // A descriptor returned by Object.getOwnPropertyDescriptor is a fresh ordinary object: reading it is stable.
+    return "value" in descriptor
+      ? Object.freeze({ kind: "DATA", value: descriptor.value })
+      : Object.freeze({ kind: "OPAQUE", why: "accessor" });
+  }
+  let inherited: boolean;
+  try {
+    inherited = key in source;
+  } catch {
+    return Object.freeze({ kind: "OPAQUE", why: "unreadable" });
+  }
+  return inherited ? Object.freeze({ kind: "OPAQUE", why: "inherited" }) : ABSENT;
 }
 
 /**

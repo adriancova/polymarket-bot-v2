@@ -120,3 +120,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-01 | [CO2-N1-ADR.md](CO2-N1-ADR.md) | `CO2-N1-ADR`: ADR-031 (Proposed), admitting entries when the trader lags | Governance | Complete (2026-10-01): Proposed | `1770be3` | 5 KB |
 | 2026-10-01 | [CONTROL-1b.md](CONTROL-1b.md) | `CONTROL-1b`: authoritative no-signer checks; lock key; durable-sink prerequisites | Round | Complete (2026-10-01) | `80a06e2` | 7 KB |
 | 2026-10-02 | [THROUGHPUT-1c.md](THROUGHPUT-1c.md) | `THROUGHPUT-1c`: book freshness by feed liveness (ADR-023) | Round | Complete (2026-10-02) | `0c270df` | 6 KB |
+| 2026-10-02 | [WP-300c.md](WP-300c.md) | `WP-300c`: hostile evidence, refusal codes, module-load tripwires, unguessable request ids | Round | Complete (2026-10-02) | `7e05702` | 5 KB |

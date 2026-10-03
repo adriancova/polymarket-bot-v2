@@ -36,7 +36,7 @@ import {
   tx,
   unattributedDeposit,
 } from "../../../packages/ledger/src/testing/scenarios.js";
-import { ACCOUNT, CONDITION, NO, PUSD, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, NO, PUSD, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
@@ -80,7 +80,7 @@ function harness(
   const book = seededBook(balances);
   const executor = new ScriptedExecutor(respond);
   const reconciler = new Reconciler();
-  const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals: new ApprovalTracker(), executor, reconciler });
   return { book, executor, reconciler, manager };
 }
 
@@ -403,7 +403,7 @@ describe("WP300-R2-03: every identifier an operation depends on is valid before 
     book.observeActual({ accountRef: ACCOUNT, assetId: "p", balance: "100" });
     const executor = new ScriptedExecutor(() => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null }));
     const reconciler = new Reconciler();
-    const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor, reconciler });
+    const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals: new ApprovalTracker(), executor, reconciler });
     const id = "x".repeat(485);
     expect(key("wallet-op", id, "p")).toHaveLength(506);
     expect(key(key("wallet-op", id, "p"), "out")).toHaveLength(517);
