@@ -18,7 +18,10 @@
  * a fractional or non-positive limit, a duplicate id, an operation that names
  * an undeclared class, or an operation whose kind and bucket disagree refuses
  * the whole document with the paths at fault. A refused snapshot never takes
- * effect.
+ * effect. So does a figure too large for the budget to keep exact
+ * (`units.ts`): a token figure (a window's limit, a rate, a burst, a cost)
+ * above `MAX_TOKEN_MAGNITUDE`, or a duration (a window, a backoff, the
+ * header-wait bound) above `MAX_DURATION_MS`.
  *
  * A {@link RateLimitConfigurationTimeline} holds several snapshots and
  * answers which one is in effect at an instant: the one with the latest
@@ -27,8 +30,9 @@
  * (the budget then refuses every request: fail closed).
  */
 
-import { isIntegerAtLeast, ownKeys, parseIsoInstant, readList, readOwn } from "./plain-data.js";
+import { isIntegerWithin, ownKeys, parseIsoInstant, readList, readOwn } from "./plain-data.js";
 import { isOperationKind, PRIORITY_LADDER, type OperationKind, type PriorityClass } from "./priority.js";
+import { MAX_DURATION_MS, MAX_TOKEN_MAGNITUDE } from "./units.js";
 
 /** The one schema this module reads. */
 export const RATE_LIMIT_CONFIGURATION_SCHEMA = "polymarket-bot/rate-limit-configuration@1" as const;
@@ -193,8 +197,19 @@ class Reader {
     return typeof value === "string" && TEXT.test(value) ? value : this.fail(path, "must be non-empty text without control characters");
   }
 
-  integer(value: unknown, path: string, minimum: number): number | undefined {
-    return isIntegerAtLeast(value, minimum) ? value : this.fail(path, `must be a safe integer >= ${String(minimum)}`);
+  /** An integer in `[minimum, maximum]`; `maximum` defaults to `Number.MAX_SAFE_INTEGER` (no bound but safety). */
+  integer(value: unknown, path: string, minimum: number, maximum: number = Number.MAX_SAFE_INTEGER): number | undefined {
+    return isIntegerWithin(value, minimum, maximum) ? value : this.fail(path, `must be an integer from ${String(minimum)} to ${String(maximum)}`);
+  }
+
+  /** A token figure: kept exactly in thousandths of a token by the budget. */
+  tokens(value: unknown, path: string, minimum: number): number | undefined {
+    return this.integer(value, path, minimum, MAX_TOKEN_MAGNITUDE);
+  }
+
+  /** A duration in milliseconds: added to instants by the budget. */
+  duration(value: unknown, path: string): number | undefined {
+    return this.integer(value, path, 1, MAX_DURATION_MS);
   }
 
   boolean(value: unknown, path: string): boolean | undefined {
@@ -215,8 +230,8 @@ function readWindows(r: Reader, value: unknown, path: string): SlidingWindowLimi
     const at = `${path}[${String(index)}]`;
     const get = r.object(entry, at, ["limit", "windowMs"]);
     if (get === undefined) return;
-    const limit = r.integer(get("limit"), `${at}.limit`, 1);
-    const windowMs = r.integer(get("windowMs"), `${at}.windowMs`, 1);
+    const limit = r.tokens(get("limit"), `${at}.limit`, 1);
+    const windowMs = r.duration(get("windowMs"), `${at}.windowMs`);
     if (limit !== undefined && windowMs !== undefined) out.push(Object.freeze({ limit, windowMs }));
   });
   return out;
@@ -225,9 +240,9 @@ function readWindows(r: Reader, value: unknown, path: string): SlidingWindowLimi
 function readBackoff(r: Reader, value: unknown, path: string): BackoffPolicy | undefined {
   const get = r.object(value, path, ["initialMs", "multiplier", "capMs"]);
   if (get === undefined) return undefined;
-  const initialMs = r.integer(get("initialMs"), `${path}.initialMs`, 1);
+  const initialMs = r.duration(get("initialMs"), `${path}.initialMs`);
   const multiplier = r.integer(get("multiplier"), `${path}.multiplier`, 1);
-  const capMs = r.integer(get("capMs"), `${path}.capMs`, 1);
+  const capMs = r.duration(get("capMs"), `${path}.capMs`);
   if (initialMs === undefined || multiplier === undefined || capMs === undefined) return undefined;
   // "increase it after each failed attempt" (verified-2026-09-16.md §9): a backoff that grows.
   if (multiplier === 1) return r.fail(`${path}.multiplier`, "must exceed 1");
@@ -335,10 +350,10 @@ function parseUncontained(raw: unknown): ConfigurationResult {
     ]);
     if (getTier === undefined) return;
     const tier = r.identifier(getTier("tier"), `${at}.tier`);
-    const orderTokensPerSecond = r.integer(getTier("orderTokensPerSecond"), `${at}.orderTokensPerSecond`, 1);
-    const orderBurst = r.integer(getTier("orderBurst"), `${at}.orderBurst`, 1);
-    const cancelTokensPerSecond = r.integer(getTier("cancelTokensPerSecond"), `${at}.cancelTokensPerSecond`, 1);
-    const cancelBurst = r.integer(getTier("cancelBurst"), `${at}.cancelBurst`, 1);
+    const orderTokensPerSecond = r.tokens(getTier("orderTokensPerSecond"), `${at}.orderTokensPerSecond`, 1);
+    const orderBurst = r.tokens(getTier("orderBurst"), `${at}.orderBurst`, 1);
+    const cancelTokensPerSecond = r.tokens(getTier("cancelTokensPerSecond"), `${at}.cancelTokensPerSecond`, 1);
+    const cancelBurst = r.tokens(getTier("cancelBurst"), `${at}.cancelBurst`, 1);
     const negativeCancelBalance = r.boolean(getTier("negativeCancelBalance"), `${at}.negativeCancelBalance`);
     if (
       tier !== undefined &&
@@ -391,9 +406,9 @@ function parseUncontained(raw: unknown): ConfigurationResult {
     } else if (signerBucket !== undefined) {
       const getCost = r.object(costRaw, `${at}.tokenCost`, ["base", "perEntry", "perCanceled"]);
       if (getCost !== undefined) {
-        const base = r.integer(getCost("base"), `${at}.tokenCost.base`, 0);
-        const perEntry = r.integer(getCost("perEntry"), `${at}.tokenCost.perEntry`, 0);
-        const perCanceled = r.integer(getCost("perCanceled"), `${at}.tokenCost.perCanceled`, 0);
+        const base = r.tokens(getCost("base"), `${at}.tokenCost.base`, 0);
+        const perEntry = r.tokens(getCost("perEntry"), `${at}.tokenCost.perEntry`, 0);
+        const perCanceled = r.tokens(getCost("perCanceled"), `${at}.tokenCost.perCanceled`, 0);
         if (base !== undefined && perEntry !== undefined && perCanceled !== undefined) {
           // Every request costs at least one token before any post-hoc debit.
           if (base + perEntry < 1) r.fail(`${at}.tokenCost`, "base + perEntry must be at least 1");
@@ -445,7 +460,7 @@ function parseUncontained(raw: unknown): ConfigurationResult {
       }
     }
     const rateLimitedFallback = readBackoff(r, getPolicy("rateLimitedFallback"), "$.policy.rateLimitedFallback");
-    const maxHeaderWaitMs = r.integer(getPolicy("maxHeaderWaitMs"), "$.policy.maxHeaderWaitMs", 1);
+    const maxHeaderWaitMs = r.duration(getPolicy("maxHeaderWaitMs"), "$.policy.maxHeaderWaitMs");
     const maxQueuedRequests = r.integer(getPolicy("maxQueuedRequests"), "$.policy.maxQueuedRequests", 1);
     if (
       assumedSignerTier !== undefined &&

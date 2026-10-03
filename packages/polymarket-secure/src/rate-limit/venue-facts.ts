@@ -167,7 +167,7 @@ export const RATE_LIMIT_VENUE_FACTS = Object.freeze({
   RETRY_AFTER_SECONDS: {
     id: "RETRY_AFTER_SECONDS",
     consequence:
-      "A 429's `Retry-After` is a whole number of seconds; the charged signer bucket (or, with none, the operation for the request's class and below) waits exactly that long, and no other header of the same response lengthens it.",
+      "A 429's `Retry-After` is a whole number of seconds (at most WP-260's bound); the charged signer bucket (or, with none, the operation for the request's class and below) waits exactly that long from the completion. No other header of the same response lengthens it: every wait an SDK observation set while the grant was in flight (it may be this response's `Reset`) is withdrawn by the 429. A wait of another response (another completion's, or an observation's that arrived while the grant was not in flight) still holds the bucket.",
     sourceKind: "PINNED_SDK",
     source: PINNED_SDK,
     section: "RateLimitError.retryAfter",

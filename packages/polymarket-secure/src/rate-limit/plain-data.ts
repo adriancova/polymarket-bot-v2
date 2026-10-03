@@ -6,6 +6,8 @@
  * dropped unread. Package-internal.
  */
 
+import { MAX_EPOCH_MS } from "./units.js";
+
 export type OwnRead =
   | { readonly kind: "ABSENT" }
   | { readonly kind: "DATA"; readonly value: unknown }
@@ -66,9 +68,17 @@ export function isIntegerAtLeast(value: unknown, minimum: number): value is numb
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
 }
 
-/** An instant on the budget's time base: a safe, non-negative integer of Unix epoch milliseconds. */
+/**
+ * An instant on the budget's time base: a non-negative integer of Unix epoch milliseconds, at most
+ * `MAX_EPOCH_MS` (so every deadline derived from it stays exact; `units.ts`).
+ */
 export function isEpochMs(value: unknown): value is number {
-  return isIntegerAtLeast(value, 0);
+  return isIntegerAtLeast(value, 0) && value <= MAX_EPOCH_MS;
+}
+
+/** An integer in `[minimum, maximum]`. */
+export function isIntegerWithin(value: unknown, minimum: number, maximum: number): value is number {
+  return isIntegerAtLeast(value, minimum) && value <= maximum;
 }
 
 const ISO_INSTANT = /^([1-9]\d{3})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{3}))?Z$/u;

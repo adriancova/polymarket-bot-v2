@@ -207,6 +207,24 @@ describe("the gates: no blind retry in post-only mode (acceptance 2)", () => {
     expect(detector.retransmissionGate({ errorKind: "ENGINE_RESTARTING", postOnly: true }, T0 + 1000)).toEqual({ allowed: true });
   });
 
+  it("a post-only refusal is evidence of the engine's return only for a request SENT after the last 425 (OP-R2-01)", () => {
+    const detector = detectorOf();
+    place(detector, RESTART(1), T0);
+    const refusal = conditionOfPlacement(POST_ONLY_REFUSED(null));
+    // In flight across the 425 (sent before it), sent at its very instant, or with no send instant: the refusal may
+    // be the pre-restart engine's (or say nothing of when it was processed), so the return stays unseen.
+    for (const sentAtMs of [T0 - 10, T0, undefined]) {
+      const signal = sentAtMs === undefined ? { operation: "PLACEMENT" as const, condition: refusal } : { operation: "PLACEMENT" as const, condition: refusal, sentAtMs };
+      expect(detector.observe(signal, T0 + 2000).ok).toBe(true);
+      expect(detector.snapshot(T0 + 2000), String(sentAtMs)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: true });
+    }
+    expect(detector.placementGate({ postOnly: false }, T0 + 86_400_000)).toEqual({ allowed: false, reason: "POST_ONLY_MODE_REQUIRES_POST_ONLY", retryAtMs: null });
+    // Sent after the 425: the running engine's own refusal. The return is seen; the window it names then runs out.
+    expect(detector.observe({ operation: "PLACEMENT", condition: refusal, sentAtMs: T0 + 1 }, T0 + 2001).ok).toBe(true);
+    expect(detector.snapshot(T0 + 2001)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: false, postOnlyUntilMs: T0 + 7001 });
+    expect(detector.snapshot(T0 + 7001).mode).toBe("NORMAL");
+  });
+
   it("a closed-only rejection (a 400 without a documented code, D-24) moves no mode and never clears a resend (OP-R1-10)", () => {
     const detector = detectorOf();
     const closedOnly: PlacementClass = { kind: "UNKNOWN", reason: "ERROR", errorKind: "REQUEST_REJECTED", retryAfterSeconds: null };
@@ -320,6 +338,47 @@ describe("signals and the OMS wiring", () => {
     holdCancels = false;
     await wrapped.cancelOrder("v-2");
     expect(detector.snapshot(now)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: false, postOnlyUntilMs: T0 + 10_000 });
+  });
+
+  it.each([
+    ["postOrder", false],
+    ["postOrders", true],
+  ] as const)("withModeDetection reads %s's SEND instant before the call: a placement in flight across a 425 is no evidence (OP-R2-01)", async (_label, batch) => {
+    const detector = detectorOf();
+    let now = T0;
+    const restart: PlacementOutcome = { kind: "UNKNOWN", reason: "ERROR", error: { kind: "ENGINE_RESTARTING", effect: "UNKNOWN", retryAfterSeconds: null } };
+    const accepted: PlacementOutcome = { kind: "ACCEPTED", orderId: "v-1", status: "LIVE", makingAmount: "1", takingAmount: "2", tradeIds: [], transactionHashes: [] };
+    let release: (() => void) | undefined;
+    let postOrderCalls = 0;
+    const port: OmsVenuePort = {
+      createLimitOrder: () => Promise.reject(new Error("unused")),
+      postOrder: () => {
+        postOrderCalls += 1;
+        if (!batch && postOrderCalls === 1) {
+          return new Promise<PlacementOutcome>((resolve) => {
+            release = () => resolve(accepted);
+          });
+        }
+        // The 425, answered 50 ms after it was sent.
+        now += 50;
+        return Promise.resolve(restart);
+      },
+      postOrders: () =>
+        new Promise<readonly PlacementOutcome[]>((resolve) => {
+          release = () => resolve([accepted]);
+        }),
+      cancelOrder: () => Promise.reject(new Error("unused")),
+    };
+    const wrapped = withModeDetection(port, detector, () => now);
+    // Sent at T0 and still in flight when another placement, sent at T0, meets a 425 observed at T0 + 50.
+    const inFlight = batch ? wrapped.postOrders([{} as never]) : wrapped.postOrder({} as never);
+    await wrapped.postOrder({} as never);
+    expect(detector.snapshot(now)).toMatchObject({ mode: "RESTARTING", lastRestartObservedMs: T0 + 50 });
+    now = T0 + 5000;
+    release?.();
+    await inFlight;
+    // The engine accepted it, but before the restart: its answer says nothing of the engine's return.
+    expect(detector.snapshot(now)).toMatchObject({ mode: "POST_ONLY", engineReturnPending: true });
   });
 
   it("venueModeSource reads the detector at the clock's instant and fails closed on a bad clock", () => {

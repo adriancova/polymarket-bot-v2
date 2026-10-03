@@ -7,9 +7,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { Grant, PollEvent, RateLimitBudget, RequestDecision } from "./budget.js";
-import { SIGNER_A, SIGNER_B, T0, ZERO_HEADROOM, budgetOf, iso, snapshot, warm } from "./fixtures.test-support.js";
-import { parseRateLimitHeaders } from "./headers.js";
+import { SIGNER_A, SIGNER_B, T0, ZERO_HEADROOM, budgetOf, iso, snapshot, warm, type Json } from "./fixtures.test-support.js";
+import { feedbackFromObservation, parseRateLimitHeaders } from "./headers.js";
 import { PRIORITY_LADDER, type PriorityClass } from "./priority.js";
+import { MAX_EPOCH_MS, MAX_TOKEN_MAGNITUDE, MILLI_PER_TOKEN } from "./units.js";
 
 /** The operation each ladder class is filed with in these tests. */
 const OPERATION_FOR: Readonly<Record<PriorityClass, { operationId: string; signer?: string }>> = {
@@ -477,5 +478,258 @@ describe("budget mechanics pinned in r1 (OP-R1-04: N02, N05, N06, N07, N08)", ()
     expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-3");
     expect(budget.complete(sweep, { atMs: T0, canceledCount: 8 }).ok).toBe(true);
     expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-3");
+  });
+
+  it("a debt already in the estimate stays when the venue then names a tier that floors at zero (N08, r2)", () => {
+    // On the Base tier (negative balance allowed) a cancel-all leaves a debt in the estimate itself.
+    const budget = budgetOf();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const first = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    const second = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    budget.complete(first, { atMs: T0, canceledCount: 10 });
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-6");
+    // The venue names the signer's tier: Floor, which floors the post-cancel balance at zero.
+    budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "CANCEL" }, feedbackFromObservation({ bucket: "cancel", remaining: null, resetUnixSeconds: null, tier: "Floor", warning: false }), T0);
+    expect(budget.view(T0).signers[0]?.tier).toBe("Floor");
+    expect(budget.complete(second, { atMs: T0, canceledCount: 2 }).ok).toBe(true);
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("-6");
+  });
+});
+
+describe("nextWakeAtMs never sleeps through a grant: each waiter's earliest grant is net of the reservations above it (CX310-R2-03)", () => {
+  /** The synthetic snapshot with `shared` at 2 requests per second (every other class as before). */
+  const tight = (): RateLimitBudget =>
+    budgetOf(
+      snapshot({
+        ipEndpointClasses: [
+          { classId: "shared", windows: [{ limit: 2, windowMs: 1000 }] },
+          { classId: "orders", windows: [{ limit: 100, windowMs: 1000 }] },
+          { classId: "cancels", windows: [{ limit: 100, windowMs: 1000 }] },
+          { classId: "reads", windows: [{ limit: 100, windowMs: 1000 }] },
+          { classId: "dual", windows: [{ limit: 3, windowMs: 1000 }, { limit: 4, windowMs: 10_000 }] },
+        ],
+      }),
+    );
+
+  /** A composition that sleeps until nextWakeAtMs, polls, and re-arms: the instant each ticket is granted (within the horizon). */
+  function driveByTimer(budget: RateLimitBudget, from: number, until: number): Map<string, number> {
+    const grantedAt = new Map<string, number>();
+    let now = from;
+    for (let wakes = 0; wakes < 1000; wakes += 1) {
+      const next = budget.nextWakeAtMs(now);
+      if (next === null || next > until) break;
+      now = next;
+      for (const event of budget.poll(now)) if (event.kind === "GRANTED") grantedAt.set(event.ticketId, now);
+    }
+    return grantedAt;
+  }
+
+  /** The same budget polled every millisecond. */
+  function driveByPolling(budget: RateLimitBudget, from: number, until: number): Map<string, number> {
+    const grantedAt = new Map<string, number>();
+    for (let now = from; now <= until; now += 1) for (const event of budget.poll(now)) if (event.kind === "GRANTED") grantedAt.set(event.ticketId, now);
+    return grantedAt;
+  }
+
+  const ticket = (decision: RequestDecision): string => {
+    if (decision.kind !== "QUEUED") throw new Error(`expected QUEUED, got ${decision.kind}`);
+    return decision.ticketId;
+  };
+
+  /** Each scenario queues work at T0 and returns the ticket of the request that must not be slept through. */
+  const SCENARIOS: readonly (readonly [string, (budget: RateLimitBudget) => string])[] = [
+    [
+      "a heartbeat held back an hour by its operation's 429 reserves `shared`; an emergency cancel is grantable once a slot leaves the window",
+      (budget) => {
+        const heartbeat = grantOf(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0));
+        budget.complete(heartbeat, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+        ticket(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0));
+        return ticket(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+      },
+    ],
+    [
+      "a signer's emergency cancel held back an hour by its bucket's 429 (no operation wait); another signer's emergency cancel",
+      (budget) => {
+        const first = grantOf(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+        budget.complete(first, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+        ticket(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+        return ticket(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_B }, T0));
+      },
+    ],
+    [
+      "a 30-second bucket wait above a stale-quote cancel of another signer",
+      (budget) => {
+        const first = grantOf(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+        budget.complete(first, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 30 } });
+        ticket(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+        return ticket(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_B }, T0));
+      },
+    ],
+    [
+      "reconciliation reads held back an hour reserve `shared` ahead of a stale-quote cancel (OP-R2-04's shape)",
+      (budget) => {
+        const read = grantOf(budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0));
+        budget.complete(read, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+        ticket(budget.request({ operationId: "read", priority: "RECONCILIATION_READ" }, T0));
+        return ticket(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_B }, T0));
+      },
+    ],
+  ];
+
+  it.each(SCENARIOS)("%s: the timer wakes at +1,000 ms and grants it then", (_label, script) => {
+    const budget = tight();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    warm(budget, SIGNER_B, T0 - 10_000);
+    const target = script(budget);
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 1000);
+    expect(budget.poll(T0 + 999)).toEqual([]);
+    expect(driveByTimer(budget, T0, T0 + 3_600_000).get(target)).toBe(T0 + 1000);
+  });
+
+  it.each(SCENARIOS)("%s: a timer-driven loop grants every request at exactly the instant a 1 ms poller does", (_label, script) => {
+    const twins = [tight(), tight()] as const;
+    const targets = twins.map((budget) => {
+      warm(budget, SIGNER_A, T0 - 10_000);
+      warm(budget, SIGNER_B, T0 - 10_000);
+      return script(budget);
+    });
+    expect(targets[0]).toBe(targets[1]);
+    const byTimer = driveByTimer(twins[0], T0, T0 + 3000);
+    const byPolling = driveByPolling(twins[1], T0, T0 + 3000);
+    expect(byPolling.get(targets[1] ?? "")).toBe(T0 + 1000);
+    expect([...byTimer.entries()]).toEqual([...byPolling.entries()]);
+  });
+
+  /** The synthetic snapshot plus a `slow` class (one request per 10 s) that two cancel operations also draw on. */
+  const withSlowCancels = (): RateLimitBudget => {
+    const document = snapshot();
+    const classes = document["ipEndpointClasses"] as Json[];
+    const operations = document["operations"] as Json[];
+    return budgetOf({
+      ...document,
+      ipEndpointClasses: [...classes, { classId: "slow", windows: [{ limit: 1, windowMs: 10_000 }] }],
+      operations: [
+        ...operations,
+        { operationId: "cancel_slow", kind: "CANCEL", ipEndpointClasses: ["slow"], signerBucket: "CANCEL", relayer: false, tokenCost: { base: 1, perEntry: 0, perCanceled: 0 } },
+        { operationId: "cancel_slow_batch", kind: "CANCEL", ipEndpointClasses: ["slow"], signerBucket: "CANCEL", relayer: false, tokenCost: { base: 0, perEntry: 1, perCanceled: 0 } },
+      ],
+    });
+  };
+
+  it("on a signer bucket, a lower waiter's wake is when the bucket holds its cost AND the reservation above it", () => {
+    const budget = withSlowCancels();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    // The slow class is used until T0 + 10,000; the cancel bucket (2 per second) is drained.
+    grantOf(budget.request({ operationId: "cancel_slow", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    for (let index = 0; index < 5; index += 1) grantOf(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe("0");
+    // The emergency cancel waits for the slow window and reserves one token; the stale-quote cancel needs a second.
+    ticket(budget.request({ operationId: "cancel_slow", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    const stale = ticket(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 1000);
+    expect(budget.poll(T0 + 999)).toEqual([]);
+    expect(granted(budget.poll(T0 + 1000))).toEqual([stale]);
+  });
+
+  it("on a signer bucket, a reservation that leaves no room for a lower waiter's cost: the wake is the higher waiter's", () => {
+    const budget = withSlowCancels();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    grantOf(budget.request({ operationId: "cancel_slow", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    for (let index = 0; index < 5; index += 1) grantOf(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    // A six-id emergency batch cancel reserves the whole burst (6) until the slow window frees at T0 + 10,000.
+    const batch = ticket(budget.request({ operationId: "cancel_slow_batch", priority: "EMERGENCY_CANCEL", signer: SIGNER_A, entries: 6 }, T0));
+    ticket(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 10_000);
+    expect(granted(budget.poll(T0 + 10_000))).toEqual([batch]);
+  });
+
+  it("the queue is walked in RANK order: a lower class that arrived first never reserves ahead of an emergency cancel", () => {
+    const budget = tight();
+    // SIGNER_B stays cold: its buckets start empty when first touched (2 cancel tokens per second).
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const first = grantOf(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    budget.complete(first, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+    // SIGNER_A's stale-quote cancel arrives first and waits an hour on its bucket.
+    ticket(budget.request({ operationId: "cancel", priority: "STALE_QUOTE_CANCEL", signer: SIGNER_A }, T0));
+    // SIGNER_B's emergency cancel arrives second and waits only for one token (500 ms); `shared` has room for it.
+    const emergency = ticket(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_B }, T0));
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 500);
+    expect(driveByTimer(budget, T0, T0 + 3000).get(emergency)).toBe(T0 + 500);
+  });
+
+  it("the reservations of the requests ranked above it can leave no room at all: the wake is then the instant one of THEM can go", () => {
+    const budget = tight();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    // Two heartbeats held back an hour reserve the whole of `shared` (2 per second).
+    const heartbeat = grantOf(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0));
+    budget.complete(heartbeat, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 3600 } });
+    ticket(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0));
+    ticket(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, T0));
+    const cancel = ticket(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.nextWakeAtMs(T0)).toBe(T0 + 3_600_000);
+    expect(driveByPolling(budget, T0, T0 + 3000).size).toBe(0);
+    const granted = budget.poll(T0 + 3_600_000).filter((event) => event.kind === "GRANTED").map((event) => event.ticketId);
+    // Both heartbeats take the window; the cancel follows when they leave it.
+    expect(granted).not.toContain(cancel);
+    expect(budget.nextWakeAtMs(T0 + 3_600_000)).toBe(T0 + 3_601_000);
+  });
+});
+
+describe("every derived figure stays exact (OP-R2-02)", () => {
+  /** A tier at the bound: rate and burst MAX_TOKEN_MAGNITUDE, and the slowest cancel refill (one token per second). */
+  const extreme = (): RateLimitBudget =>
+    budgetOf(
+      snapshot({
+        signerTiers: [
+          { tier: "Base", orderTokensPerSecond: MAX_TOKEN_MAGNITUDE, orderBurst: MAX_TOKEN_MAGNITUDE, cancelTokensPerSecond: 1, cancelBurst: MAX_TOKEN_MAGNITUDE, negativeCancelBalance: true },
+        ],
+      }),
+    );
+
+  it("an instant after MAX_EPOCH_MS is refused; MAX_EPOCH_MS itself is accepted", () => {
+    const budget = budgetOf();
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, MAX_EPOCH_MS + 1)).toMatchObject({ kind: "REFUSED", refusal: { code: "INVALID_TIME" } });
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, Number.MAX_SAFE_INTEGER)).toMatchObject({ kind: "REFUSED", refusal: { code: "INVALID_TIME" } });
+    expect(budget.request({ operationId: "heartbeat", priority: "ORDER_HEARTBEAT" }, MAX_EPOCH_MS).kind).toBe("GRANTED");
+    expect(budget.configurationAt(MAX_EPOCH_MS + 1)).toBeUndefined();
+  });
+
+  it("at MAX_EPOCH_MS, the deepest debt's refill deadline and the longest Retry-After are exact", () => {
+    const budget = extreme();
+    warm(budget, SIGNER_A, MAX_EPOCH_MS - 1);
+    // The deepest debt the budget holds: MAX_TOKEN_MAGNITUDE tokens below zero.
+    budget.observeSignerFeedback(
+      { signer: SIGNER_A, bucket: "CANCEL" },
+      feedbackFromObservation({ bucket: "cancel", remaining: -MAX_TOKEN_MAGNITUDE, resetUnixSeconds: null, tier: null, warning: false }),
+      MAX_EPOCH_MS,
+    );
+    expect(budget.view(MAX_EPOCH_MS).signers[0]?.cancel.tokens).toBe(`-${String(MAX_TOKEN_MAGNITUDE)}`);
+    expect(budget.request({ operationId: "cancel", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, MAX_EPOCH_MS).kind).toBe("QUEUED");
+    const wake = budget.nextWakeAtMs(MAX_EPOCH_MS);
+    expect(Number.isSafeInteger(wake)).toBe(true);
+    // From MAX_TOKEN_MAGNITUDE tokens below zero to one token, at one token per second.
+    expect(wake).toBe(MAX_EPOCH_MS + (MAX_TOKEN_MAGNITUDE + 1) * MILLI_PER_TOKEN);
+    const order = grantOf(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, MAX_EPOCH_MS));
+    const result = budget.complete(order, { atMs: MAX_EPOCH_MS, error: { kind: "RATE_LIMITED", retryAfterSeconds: 86_400 } });
+    expect(result.ok && result.value).toContainEqual(expect.objectContaining({ kind: "WAIT_APPLIED", untilMs: MAX_EPOCH_MS + 86_400_000 }));
+  });
+
+  it("a Retry-After beyond WP-260's bound, or a canceled count that would push a level past the bound, is refused before anything changes", () => {
+    const budget = extreme();
+    warm(budget, SIGNER_A, T0 - 10_000);
+    const order = grantOf(budget.request({ operationId: "place", priority: "NEW_ORDER", signer: SIGNER_A }, T0));
+    expect(budget.complete(order, { atMs: T0, error: { kind: "RATE_LIMITED", retryAfterSeconds: 86_401 } })).toMatchObject({ ok: false, refusal: { code: "INVALID_COMPLETION" } });
+    const forged = { httpStatus: 429, remaining: null, resetUnixSeconds: null, tier: null, warning: false, retryAfterSeconds: 86_401, flags: [] };
+    expect(budget.observeSignerFeedback({ signer: SIGNER_A, bucket: "ORDER" }, forged, T0)).toMatchObject({ ok: false, refusal: { code: "INVALID_REQUEST" } });
+    // Ten seconds at one token per second: 10; two cancel-alls leave 8.
+    const first = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    const second = grantOf(budget.request({ operationId: "cancel_all", priority: "EMERGENCY_CANCEL", signer: SIGNER_A }, T0));
+    expect(budget.complete(first, { atMs: T0, canceledCount: MAX_TOKEN_MAGNITUDE }).ok).toBe(true);
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe(`-${String(MAX_TOKEN_MAGNITUDE - 8)}`);
+    // Nine more would take the level one token past the deepest debt it may hold: refused, nothing changed.
+    expect(budget.complete(second, { atMs: T0, canceledCount: 9 })).toMatchObject({ ok: false, refusal: { code: "INVALID_COMPLETION" } });
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe(`-${String(MAX_TOKEN_MAGNITUDE - 8)}`);
+    expect(budget.complete(second, { atMs: T0, canceledCount: 8 }).ok).toBe(true);
+    expect(budget.view(T0).signers[0]?.cancel.tokens).toBe(`-${String(MAX_TOKEN_MAGNITUDE)}`);
   });
 });
