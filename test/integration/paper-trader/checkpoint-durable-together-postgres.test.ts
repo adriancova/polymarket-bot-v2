@@ -325,7 +325,10 @@ async function durableRows(context: TestContext, registered: Registered): Promis
  * resumes at the highest sequence plus one, from the fold of EVERY durable
  * patch.
  */
-function expectDurableTogether(rows: DurableRows, registered: Registered): void {
+function expectDurableTogether(
+  rows: DurableRows,
+  registered: Registered,
+): { readonly next: number; readonly lastCheckpointSeq: number; readonly highest: number } | undefined {
   const owed = owedCheckpoints(
     rows.decisions.map((row) => ({
       instanceId: row.instanceId,
@@ -346,7 +349,7 @@ function expectDurableTogether(rows: DurableRows, registered: Registered): void 
   // commit whose first batch was refused whole) is a fresh run, not a restore.
   if (rows.decisions.length === 0) {
     expect(rows.checkpoints).toEqual([]);
-    return;
+    return undefined;
   }
   const last = rows.checkpoints.at(-1);
   const highest = rows.decisions.at(-1)?.evaluationSeq;
@@ -381,10 +384,35 @@ function expectDurableTogether(rows: DurableRows, registered: Registered): void 
     },
   );
   expect(restored.ok, restored.ok ? "" : `${restored.refusal.code}: ${restored.refusal.detail}`).toBe(true);
-  if (!restored.ok) return;
+  if (!restored.ok) return undefined;
   expect(restored.restored.nextEvaluationSeq).toBe(highest + 1);
   // It does not resume older than a durable decision that changed the state.
   expect(canonicalJsonStringify(restored.restored.state)).toBe(owed.at(-1)?.stateJson);
+  return { next: restored.restored.nextEvaluationSeq, lastCheckpointSeq: last.checkpointSeq, highest };
+}
+
+/**
+ * ADR-027 D2 on the database's own keys: the restored next sequence is held by
+ * NEITHER `decisions_evaluation_unique` nor `state_checkpoints_seq_unique`, so
+ * the restored runtime's first decision and checkpoint cannot collide.
+ * Answers how many durable decisions hold the pre-`CKPT-1` rule's sequence,
+ * `checkpointSeq + 1`.
+ */
+async function expectNextSequenceFree(
+  context: TestContext,
+  registered: Registered,
+  restore: { readonly next: number; readonly lastCheckpointSeq: number },
+): Promise<number> {
+  const held = async (seq: number): Promise<{ decisions: number; checkpoints: number }> => {
+    const { rows } = await context.pool.query<{ decisions: string; checkpoints: string }>(
+      `select (select count(*) from strategy.decisions where run_id = $1 and evaluation_seq = $2)::text as decisions,
+              (select count(*) from strategy.state_checkpoints where run_id = $1 and checkpoint_seq = $2)::text as checkpoints`,
+      [registered.runId, seq],
+    );
+    return { decisions: Number(rows[0]?.decisions ?? "-1"), checkpoints: Number(rows[0]?.checkpoints ?? "-1") };
+  };
+  expect(await held(restore.next)).toEqual({ decisions: 0, checkpoints: 0 });
+  return (await held(restore.lastCheckpointSeq + 1)).decisions;
 }
 
 /**
@@ -470,7 +498,9 @@ describe.each([
       // THE LOW-3 CASE: the entry moved the state, so it owed a checkpoint —
       // and the checkpoint is durable with it.
       expect(rows.checkpoints.map((row) => row.checkpointSeq)).toContain(entry?.evaluationSeq);
-      expectDurableTogether(rows, registered);
+      const restore = expectDurableTogether(rows, registered);
+      expect(restore).toBeDefined();
+      if (restore !== undefined) await expectNextSequenceFree(context, registered, restore);
     });
   }, 180_000);
 
@@ -488,7 +518,16 @@ describe.each([
       const rows = await durableRows(context, registered);
       expect(rows.decisions.filter((row) => row.intentCount > 0).length).toBe(2);
       expect(rows.checkpoints.length).toBeLessThan(rows.decisions.length);
-      expectDurableTogether(rows, registered);
+      const restore = expectDurableTogether(rows, registered);
+      expect(restore).toBeDefined();
+      if (restore === undefined) return;
+      // Decisions that owed no checkpoint are durable AFTER the last one…
+      expect(restore.highest).toBeGreaterThan(restore.lastCheckpointSeq);
+      // …so the restored next sequence is free in both keys, while the
+      // pre-`CKPT-1` rule (`checkpointSeq + 1`) would re-use a durable
+      // decision's sequence: `decisions_evaluation_unique` would refuse the
+      // restored runtime's first decision.
+      expect(await expectNextSequenceFree(context, registered, restore)).toBe(1);
     });
   }, 180_000);
 });
