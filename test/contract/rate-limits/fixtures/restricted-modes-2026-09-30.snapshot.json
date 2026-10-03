@@ -1,0 +1,13 @@
+{
+  "schema": "polymarket-bot/restricted-mode-configuration@1",
+  "snapshotId": "venue-modes-2026-09-30",
+  "effectiveFrom": "2026-09-30T05:12:03Z",
+  "source": {
+    "documents": [{ "url": "https://docs.polymarket.com/trading/matching-engine.md", "retrievedAt": "2026-09-30T05:12:03Z" }],
+    "report": "docs/venue/verified-2026-09-30.md §9 (E-05, E-06, E-07) and §W.7; docs/venue/verified-2026-09-16.md §9",
+    "policyAuthority": "WP-310 contract fixture: tradingUnavailableBackoff is an example for tests (the venue documents no pause duration), not an operator ruling"
+  },
+  "postOnlyWindowMs": 120000,
+  "restartBackoff": { "initialMs": 1000, "multiplier": 2, "capMs": 30000 },
+  "tradingUnavailableBackoff": { "initialMs": 5000, "multiplier": 2, "capMs": 60000 }
+}
