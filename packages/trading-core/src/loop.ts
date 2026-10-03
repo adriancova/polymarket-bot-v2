@@ -26,6 +26,19 @@
  * sorts events. It processes them in the order the feed delivered them, and the
  * only ordering decision it makes at all is §8.2's, over strategy instances.
  *
+ * ## The evaluation cadence (ADR-026, `CADENCE-1`)
+ *
+ * "Invoke subscribed strategies" is, for `onFeatures`, at most once per market
+ * per `evaluationIntervalMs` (1,000 ms) of EVENT time, plus a heartbeat after
+ * `evaluationHeartbeatMs` (5,000 ms) — `cadence.ts`, driven at each venue
+ * frame's close by `#processEvent` and `#closeFrame`. Every event is still
+ * applied; every other callback fires in place; a market the cadence does not
+ * evaluate is COALESCED (`evaluationsCoalesced`), stays owed, and persists no
+ * decision because no callback ran. The cadence clock is the high-water mark
+ * of applied instants, so it reads no clock of its own. A run that DECLARES a
+ * reproduction may run the per-frame value 0, which is ADR-024's cadence
+ * exactly.
+ *
  * ## Determinism (§12.4)
  *
  * Every source of non-determinism is either injected or absent:
@@ -1160,6 +1173,11 @@ export class CoreLoop {
    * each market the frame touched ONCE, on the fully applied frame
    * ({@link CoreLoop.#closeFrame}). No event is skipped; only WHEN the
    * callback fires changes.
+   *
+   * `CADENCE-1` (ADR-026): in both paths an `onFeatures` evaluation runs only
+   * when the evaluation cadence allows it at the close (`#admitOwed`), and the
+   * close then runs the carried-over and heartbeat evaluations
+   * (`#runCarriedPass`). Every other callback still fires exactly where it did.
    */
   async #processEvent(event: IngestedEvent, closesFrame: boolean): Promise<void> {
     // --- step 1: validate schema ------------------------------------------
