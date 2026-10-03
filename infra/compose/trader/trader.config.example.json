@@ -71,6 +71,7 @@
     { "scenarioId": "time.decay", "kind": "TIME", "yesPriceShock": "-0.02" },
     { "scenarioId": "liq.thin", "kind": "LIQUIDITY", "yesPriceShock": "-0.03" }
   ],
+  "bookFreshness": { "basis": "CONNECTION_CONFIRMED", "maximumLastChangeAgeMs": 30000 },
   "infrastructure": {
     "eventStream": "polymarket.normalized",
     "consumerId": "trader-local-1",
@@ -108,7 +109,7 @@
       "evaluationBudgetUs": 5000000,
       "params": {
         "strategy": "static-bracket",
-        "version": 1,
+        "version": 2,
         "market_selector": { "series_id": "btc-15m-updown", "direction": "YES" },
         "entry": {
           "trigger_basis": "executable_ask",
@@ -163,6 +164,7 @@
         },
         "data_quality": {
           "maximum_book_age_ms": 2000,
+          "book_age_feature_key": "quality.input_feed_ages@polymarket.book",
           "incident_feature_key": "quality.active_incidents@any",
           "on_stale_book": "PAUSE_AND_CANCEL",
           "on_incident": "PAUSE_AND_CANCEL"

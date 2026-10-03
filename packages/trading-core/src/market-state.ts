@@ -144,6 +144,11 @@ export class MarketState {
     );
   }
 
+  /** Whether any data-quality incident is active for this market (ADR-023 rule 5). */
+  hasActiveIncident(): boolean {
+    return this.#incidents.size > 0;
+  }
+
   openIncident(incident: ActiveIncident): void {
     this.#incidents.set(incident.incidentId, incident);
   }
@@ -192,6 +197,34 @@ export class MarketState {
 
   bookFor(outcome: "YES" | "NO"): OutcomeTokenBook {
     return outcome === "YES" ? this.books.yesBook : this.books.noBook;
+  }
+
+  /**
+   * `THROUGHPUT-1c` (ADR-023): records the delivery session — the
+   * `book-freshness.ts` session key — of the update just APPLIED to one
+   * outcome's book, or `undefined` when that update carried none (a REST
+   * snapshot). Called only after the book accepted the update, so the key
+   * always describes the book's current last update.
+   */
+  noteBookSession(outcome: "YES" | "NO", sessionKey: string | undefined): void {
+    this.#bookSessions[outcome] = sessionKey;
+  }
+
+  /** The delivery session of one outcome's last applied update (ADR-023). */
+  bookSession(outcome: "YES" | "NO"): string | undefined {
+    return this.#bookSessions[outcome];
+  }
+
+  readonly #bookSessions: { YES: string | undefined; NO: string | undefined } = {
+    YES: undefined,
+    NO: undefined,
+  };
+
+  /** The outcome a token id names in this market, if either. */
+  outcomeOfToken(tokenId: string | undefined): "YES" | "NO" | undefined {
+    if (tokenId === this.config.yesTokenId) return "YES";
+    if (tokenId === this.config.noTokenId) return "NO";
+    return undefined;
   }
 
   /**

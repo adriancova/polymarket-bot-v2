@@ -22,6 +22,9 @@ export {
   staticBracketParamsSchema,
   validateStaticBracketParams,
   STATIC_BRACKET_CONFIG_VERSION,
+  STATIC_BRACKET_CONFIG_VERSION_2,
+  STATIC_BRACKET_CONFIG_VERSIONS,
+  BOOK_AGE_FEATURE_KEY,
   STATIC_BRACKET_STRATEGY_NAME,
   DATA_QUALITY_RESPONSES,
   ECONOMIC_LEG_POLICIES,
@@ -108,6 +111,7 @@ export { REASONS, TAGS, legTag, orderTypeTag, type Reason } from "./reasons.js";
 export {
   EXIT_ROLE_PREFIXES,
   assessDataQuality,
+  measureBookAge,
   chooseLeg,
   currentLeg,
   exitRole,

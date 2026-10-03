@@ -115,4 +115,19 @@ tools/bench/trader-throughput/run.sh --mode catch-up --registered /tmp/reg \
 Each run then clones the registered database (`create database … template …`),
 so both runs share every minted id; compare their `decisions.jsonl`.
 
+With `--registered`, the run uses the registered directory's `document.json`
+and ignores `--template`: the configuration, a `bookFreshness` block
+included, is the one given to `register`. Register once per configuration.
+
+### Recorded timestamps and `CONNECTION_CONFIRMED` (ADR-023 D7)
+
+The harness runs the trader with `SystemPaperClock` and publishes the
+fixture's recorded `receivedAt` values unchanged, so every event is hours or
+days older than the process clock. Under `bookFreshness.basis:
+"CONNECTION_CONFIRMED"` the process-lag guard therefore gives every book its
+`LAST_CHANGE` answer: a bench run over recorded data does not exercise the
+extension: its book ages are the `LAST_CHANGE` ones. The mechanism is
+exercised by the backtest's replay clock and by
+`packages/trading-core/src/book-freshness.test.ts`.
+
 `BENCH_BUILD_DIR` keeps the bundles in a directory of your choosing.

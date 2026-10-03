@@ -46,7 +46,12 @@
  *
  * 1. the gateway writes every envelope of one raw frame in ONE atomic script
  *    call (`apps/data-gateway/src/publisher.ts`, frame-atomic runs), so a
- *    reader sees all of a frame's entries or none of them;
+ *    reader sees all of a frame's entries or none of them. (Dated correction,
+ *    `THROUGHPUT-1c` r8: that holds for a frame of up to 1 024 envelopes,
+ *    the transport's limit for one call. A larger frame is split across
+ *    calls, preceded by a `GATEWAY_FRAME_SPLIT` incident; and a transport
+ *    refusal inside a call publishes the call's prefix. Neither matters for
+ *    book freshness any more: see the next section);
  * 2. a read that returned FEWER entries than its `COUNT` reached the end of
  *    the stream at that instant.
  *
@@ -59,6 +64,23 @@
  * short. A batch never exceeds `maxEvents` (the read asks for what the carry
  * leaves room for); a single frame of `maxEvents` or more cannot be aligned
  * and is handed out as it stands (counted in {@link RedisMarketEventFeed.framesSplit}).
+ *
+ * ## A frame handed out in parts never vouches for a book (`THROUGHPUT-1c` r8)
+ *
+ * Review round 8 (R8-H1) found that the split above reached book freshness:
+ * the loop closes a frame at the end of a batch, so the first part of a frame
+ * longer than `maxEvents` (`receiveBatchSize`, 1 to 10 000; the example ships
+ * 128) closed as if it were the whole frame, and under ADR-023's
+ * `CONNECTION_CONFIRMED` its events confirmed the delivery session while the
+ * change in the unread part was not yet applied. This feed is NOT what closes
+ * that: it still hands such a frame out in parts, with buffering bounded by
+ * `maxEvents`. The loop does. It takes a frame's session confirmations only
+ * once it has processed a LATER event of the same gateway epoch from another
+ * frame (`packages/trading-core/src/book-freshness.ts`,
+ * `FrameCompletionGate`; ADR-023 D2.4, "A frame the trader has not proven
+ * whole"). So neither a part handed out here, nor a short read that ends on a
+ * prefix the gateway published, nor a carried frame can vouch for a book
+ * before all of it is applied, at any `maxEvents`.
  *
  * Positions follow DELIVERY: `mark`/`commit` name the last event handed OUT,
  * never a carried one, so a crash re-reads a carried partial frame whole.
@@ -140,7 +162,12 @@ export class RedisMarketEventFeed implements MarketEventFeed {
    * `THROUGHPUT-2`: how many times a single frame of `maxEvents` or more
    * events had to be handed out across two batches (see the module header).
    * `0` in every run measured; a non-zero value means some evaluation saw a
-   * partially applied frame.
+   * partially applied frame. Such an evaluation is never vouched for by that
+   * frame's own session confirmations (`THROUGHPUT-1c` r8, R8-H1: ADR-023
+   * D2.4; module header, "A frame handed out in parts never vouches"). The
+   * count is conservative: a read that returns exactly `maxEvents` events of
+   * one frame is counted even when that frame happens to end there (at
+   * `maxEvents` 1, every full read).
    */
   get framesSplit(): number {
     return this.#framesSplit;

@@ -441,7 +441,8 @@ export class DataGateway {
             monotonicMs: () => Number(ports.clock.monotonicNs() / 1_000_000n),
           },
           timers: ports.timers,
-          webSocketFactory: ports.polymarketSocketFactory,
+          // `THROUGHPUT-1c` r6 (R6-H1): one socket message, one frame.
+          webSocketFactory: driver.frameBoundedSocketFactory(ports.polymarketSocketFactory),
           directory: this.#directory,
           connectionId: () => connectionIds.next(),
         },

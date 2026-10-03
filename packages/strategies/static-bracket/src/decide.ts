@@ -458,21 +458,31 @@ export interface DataQuality {
  *
  * Two independent conditions, both configured:
  *
- * - the traded book's age (`now - book.asOf`) against `maximum_book_age_ms`;
+ * - the traded book's age against `maximum_book_age_ms` ({@link measureBookAge});
  * - the configured data-quality incident flag, which is the strategy's view of
  *   §9.5's "active data-quality incident flags".
  *
  * An UNUSABLE incident flag (absent key, wrong type) counts as an incident. The
  * fail-safe direction is deliberate: the cost of a false incident is a missed
  * trade; the cost of a false all-clear is an aggressive order against a book
- * nobody can vouch for.
+ * nobody can vouch for. A book age that cannot be measured is a stale book, for
+ * the same reason.
  */
 export function assessDataQuality(
   params: StaticBracketParams,
   observation: Observation,
   leg: Outcome2,
 ): DataQuality {
-  const bookAgeMs = observation.nowMs - observation.books[leg].asOfMs;
+  const measured = measureBookAge(params, observation, leg);
+  if (!measured.ok) {
+    return {
+      healthy: false,
+      reason: REASONS.staleBook,
+      detail: measured.problem,
+      bookAgeMs: measured.viewAgeMs,
+    };
+  }
+  const bookAgeMs = measured.value;
   if (bookAgeMs > params.data_quality.maximum_book_age_ms) {
     return {
       healthy: false,
@@ -507,6 +517,66 @@ export function assessDataQuality(
     };
   }
   return { healthy: true, reason: null, detail: null, bookAgeMs };
+}
+
+/** A canonical base-10 integer string: what projection rule R6 emits (ADR-023 D5). */
+const INTEGER_STRING = /^-?(?:0|[1-9][0-9]*)$/u;
+
+type BookAgeMeasurement =
+  | { readonly ok: true; readonly value: number }
+  | { readonly ok: false; readonly problem: string; readonly viewAgeMs: number };
+
+/**
+ * The traded book's age, in milliseconds — `THROUGHPUT-1c`, ADR-023 D6.
+ *
+ * - Grammar version 1 (no `book_age_feature_key`): `now - book.asOf`, the
+ *   instant of the book's last applied change. Unchanged since `1.0.0`.
+ * - Grammar version 2, for the configured `market_selector.direction` book —
+ *   the feature snapshot's subject: the composition root's own measurement,
+ *   read from `book_age_feature_key` (`quality.input_feed_ages@polymarket.book`,
+ *   an integer string). Under the root's `CONNECTION_CONFIRMED` basis it may
+ *   vouch for a quiet book on a live delivery session; under `LAST_CHANGE` it
+ *   equals the version-1 age. ABSENT, UNUSABLE or malformed is refused as a
+ *   stale book (fail closed), never replaced by the view's age.
+ * - Grammar version 2, for the OTHER outcome's book (a complement-leg
+ *   bracket): the feature snapshot says nothing about that book, so the
+ *   version-1 age applies — the stricter answer, never an invented one.
+ */
+export function measureBookAge(
+  params: StaticBracketParams,
+  observation: Observation,
+  leg: Outcome2,
+): BookAgeMeasurement {
+  const viewAgeMs = observation.nowMs - observation.books[leg].asOfMs;
+  const dataQuality = params.data_quality;
+  if (!Object.hasOwn(dataQuality, "book_age_feature_key")) return { ok: true, value: viewAgeMs };
+  const key = dataQuality.book_age_feature_key;
+  if (key === undefined || leg !== params.market_selector.direction) {
+    return { ok: true, value: viewAgeMs };
+  }
+  const read = readFeatureScalar(observation.features, key);
+  if (read.kind === "UNUSABLE") {
+    return { ok: false, problem: `the book age cannot be read: ${read.problem}`, viewAgeMs };
+  }
+  if (read.kind === "ABSENT") {
+    return {
+      ok: false,
+      problem: `feature "${key}" is absent, so the book's age is unknown; unknown is stale`,
+      viewAgeMs,
+    };
+  }
+  if (!INTEGER_STRING.test(read.value)) {
+    return {
+      ok: false,
+      problem: `feature "${key}" is not an integer number of milliseconds`,
+      viewAgeMs,
+    };
+  }
+  const ageMs = Number(read.value);
+  if (!Number.isSafeInteger(ageMs)) {
+    return { ok: false, problem: `feature "${key}" is out of the safe integer range`, viewAgeMs };
+  }
+  return { ok: true, value: ageMs };
 }
 
 /**

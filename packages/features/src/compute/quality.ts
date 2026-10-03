@@ -9,6 +9,14 @@
  * negative age (the feed's stamp is ahead of the evaluated event's time) is
  * reported as-is, mirroring the order-book package's never-clamped staleness
  * rule.
+ *
+ * `lastEventAt` is the CALLER's statement of when each feed last vouched for
+ * its section; this module computes the same `asOf - lastEventAt` whatever the
+ * caller meant. The trader's composition root supplies, for the book, the
+ * instant its configured book-freshness basis vouches for (ADR-023: the last
+ * change under `LAST_CHANGE`, the delivery-session confirmation under
+ * `CONNECTION_CONFIRMED`), and its strategy gate reads the resulting
+ * `polymarket.book` age. No definition here changed for that.
  */
 
 import type { ValidatedFeatureInput } from "../inputs.js";

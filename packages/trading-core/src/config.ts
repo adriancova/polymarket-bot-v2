@@ -71,6 +71,12 @@ import { Uuidv7Schema } from "@polymarket-bot/domain";
 import { readPlainData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
+import {
+  BOOK_FRESHNESS_BASES,
+  DEFAULT_BOOK_FRESHNESS_BASIS,
+  type BookFreshnessBasis,
+} from "./book-freshness.js";
+
 /** A positive integer bound in milliseconds, small enough to be a real bound. */
 const BoundedMs = z.number().int().positive().max(86_400_000);
 const BoundedDepth = z.number().int().positive().max(1_000_000);
@@ -201,6 +207,57 @@ const FeatureConfigSchema = z.strictObject({
   ewmaLambda: NonNegativeDecimal,
   primaryReferenceVenue: z.enum(["binance", "coinbase"]),
 });
+
+/**
+ * `THROUGHPUT-1c` (ADR-023 D4) — how a venue book's age is measured, for the
+ * feature engine's `polymarket.book` input, the strategy's data-quality gate
+ * (through the projected `quality.input_feed_ages@polymarket.book`) and §9.8
+ * check 7's `VENUE_BOOK` measurement.
+ *
+ * - `LAST_CHANGE`: the instant of the book's last applied update — the rule
+ *   every run before ADR-023 used.
+ * - `CONNECTION_CONFIRMED`: the later of that and the latest market-channel
+ *   event consumed on the SAME delivery session (`book-freshness.ts`), with
+ *   every fallback to `LAST_CHANGE` that module lists — including the
+ *   REQUIRED per-book ceiling `maximumLastChangeAgeMs` (rule 6).
+ *
+ * ## Why this block may be ABSENT (the one optional key of this document)
+ *
+ * The header's rule is that no safety-relevant field is defaulted, because "a
+ * defaulted safety bound is a bound nobody chose" and a defeated `.default()`
+ * silently skips a check. Neither reason reaches this block:
+ *
+ * - absence selects `LAST_CHANGE`, and `CONNECTION_CONFIRMED` is never stricter
+ *   than it (the confirmed instant is never before the last change), so an
+ *   absent block is the STRICTEST choice, not someone else's looser one;
+ * - there is no `.default()`: absence is read as an own-property absence on the
+ *   D1-materialized, prototype-free tree ({@link bookFreshnessBasisOf}), so an
+ *   inherited `bookFreshness` cannot be adopted.
+ *
+ * And it must be absent-tolerant: every configuration written before ADR-023 —
+ * the registered runs `BOOT-1` compares, the recorded golden configurations,
+ * an operator's H1 template — has no such block and must still load with its
+ * original meaning.
+ */
+/**
+ * The per-book ceiling on the book's OWN last-change age under
+ * `CONNECTION_CONFIRMED` (ADR-023 D2 rule 6; review round 1, finding X1).
+ * Session traffic proves the session delivers, never that THIS asset's changes
+ * are delivered, so the extension stops vouching for a book once its own last
+ * change is older than this. REQUIRED with that basis (no default: a safety
+ * bound nobody chose is not a bound), and capped at ten minutes so the
+ * extension cannot be configured into a disguised "freshness off".
+ */
+export const MAXIMUM_LAST_CHANGE_AGE_CAP_MS = 600_000;
+const LastChangeCeilingMs = z.number().int().positive().max(MAXIMUM_LAST_CHANGE_AGE_CAP_MS);
+
+const BookFreshnessConfigSchema = z.discriminatedUnion("basis", [
+  z.strictObject({ basis: z.literal(BOOK_FRESHNESS_BASES[0]) }),
+  z.strictObject({
+    basis: z.literal(BOOK_FRESHNESS_BASES[1]),
+    maximumLastChangeAgeMs: LastChangeCeilingMs,
+  }),
+]);
 
 /** One market this process trades, with the versioned parameters §6 invariant 9 pins. */
 const MarketConfigSchema = z.strictObject({
@@ -456,6 +513,8 @@ export const TraderConfigSchema = z.strictObject({
    * omits a kind the policy requires therefore refuses every entry, loudly.
    */
   scenarios: z.array(ScenarioConfigSchema).min(1).max(64).readonly(),
+  /** ADR-023: optional; absent means `LAST_CHANGE` (see the schema's comment). */
+  bookFreshness: BookFreshnessConfigSchema.optional(),
   infrastructure: InfrastructureConfigSchema,
   markets: z.array(MarketConfigSchema).min(1).max(1000).readonly(),
   instances: z.array(InstanceConfigSchema).min(1).max(1000).readonly(),
@@ -625,6 +684,31 @@ function crossFieldRefusal(config: TraderConfig): ConfigRefusal | undefined {
       `simulation.startingCash: ${config.simulation.startingCash}`,
     ],
   };
+}
+
+/**
+ * `THROUGHPUT-1c` (ADR-023): the configured book-freshness basis, read as an
+ * OWN property of the parsed (prototype-free, frozen) configuration. Absent
+ * means {@link DEFAULT_BOOK_FRESHNESS_BASIS}, the pre-ADR-023 rule.
+ */
+export function bookFreshnessBasisOf(config: TraderConfig): BookFreshnessBasis {
+  if (!Object.hasOwn(config, "bookFreshness")) return DEFAULT_BOOK_FRESHNESS_BASIS;
+  const block = config.bookFreshness;
+  if (block === undefined || !Object.hasOwn(block, "basis")) return DEFAULT_BOOK_FRESHNESS_BASIS;
+  return block.basis;
+}
+
+/**
+ * `THROUGHPUT-1c` r1 (ADR-023 D2 rule 6): the configured per-book ceiling on
+ * the last-change age, read as an OWN property; `undefined` unless the basis
+ * is `CONNECTION_CONFIRMED` (whose schema requires it).
+ */
+export function bookFreshnessCeilingMsOf(config: TraderConfig): number | undefined {
+  if (!Object.hasOwn(config, "bookFreshness")) return undefined;
+  const block = config.bookFreshness;
+  if (block === undefined || block.basis !== "CONNECTION_CONFIRMED") return undefined;
+  if (!Object.hasOwn(block, "maximumLastChangeAgeMs")) return undefined;
+  return block.maximumLastChangeAgeMs;
 }
 
 /**
