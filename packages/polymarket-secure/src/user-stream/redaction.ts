@@ -83,9 +83,16 @@ function redactText(text: string): string {
 }
 
 /**
- * A copy of a user-channel payload that is safe to log: a deep copy of an
- * object, or the redacted form of a text frame (see the module comment).
- * Never throws.
+ * A redacted copy of a user-channel payload: a deep copy of an object, or the
+ * redacted form of a text frame (see the module comment). Never throws.
+ *
+ * WHAT IT REMOVES IS DECIDED BY KEY NAME ONLY: the value under every key
+ * WP-260's rule names sensitive, and under every key whose normalised name
+ * contains `owner` or equals `auth`. Free text under any other key (an
+ * `error` or `message` string, say) is kept exactly as given and is NOT
+ * vetted, so a credential echoed into such a field survives. Only text that is
+ * not a JSON object or array as a whole is replaced. Treat the result as
+ * key-name-redacted, not as cleared for logging.
  */
 export function redactUserStreamPayload(value: unknown): unknown {
   try {

@@ -8,7 +8,8 @@
  *   lifecycle events; unrecognized input is surfaced as unrecognized.
  * - {@link projectOrderEventForOms} / {@link projectTradeEventForOms}: the
  *   inputs of the OMS's observation, fill and settlement ports, fail-closed.
- * - {@link redactUserStreamPayload}: log-safe copies of raw user-channel payloads.
+ * - {@link redactUserStreamPayload}: key-name-redacted copies of raw
+ *   user-channel payloads (free text under a public key is not vetted).
  *
  * Every reconnect, and every detected gap, requests reconciliation. The
  * adapter offers no way to obtain events missed while disconnected, because

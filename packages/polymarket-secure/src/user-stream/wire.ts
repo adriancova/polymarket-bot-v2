@@ -53,6 +53,17 @@ const DIGITS = /^[0-9]{1,16}$/u;
  * the rest), so an instant outside the window is a unit slip (seconds read as
  * milliseconds land in January 1970; milliseconds read as seconds land tens
  * of thousands of years ahead) or garbage, and it is refused, never carried.
+ *
+ * THE WIRE VALUE "0" IS REFUSED TOO. The pinned SDK accepts `"0"` in every
+ * instant field (`/^\d+$/`: `EpochMillisecondsStringSchema`,
+ * `EpochSecondsStringToIsoDateTimeStringSchema`), and only `expiration` gives
+ * it a meaning (`ExpirationToIsoDateTimeStringSchema` maps it to undefined;
+ * `normalize.ts` likewise reads an `expiration` of `"0"` as "no
+ * expiration"). No venue fact says what
+ * `"0"` means in `timestamp`, `created_at`, `last_update`, `match_time` or
+ * `matchtime`, so it is not read as "absent" either: such an event is
+ * malformed as a whole, surfaces as an UNRECOGNIZED message and requests
+ * reconciliation (fail closed).
  */
 export const MIN_PLAUSIBLE_EPOCH_MS = 1_577_836_800_000;
 export const MAX_PLAUSIBLE_EPOCH_MS = 4_102_444_800_000;

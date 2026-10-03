@@ -59,14 +59,22 @@
  *   `EVENT_NOT_DELIVERED`, naming the event's market and identifiers;
  * - when the owner stops a live stream, and when the manager faults.
  *
+ * A request about the stream as a whole (a loss, a stop, a fault, an
+ * unrecognized message, the overflow) covers EVERYTHING THE STREAM COVERS:
+ * every market in the list, and every market the connection's own frames had
+ * subscribed it to. A market removed from the list stays in scope until its
+ * unsubscribe frame has been sent, so a loss whose unsubscribe never went out
+ * (or failed) still covers it. The scope of a loss is read before the lost
+ * connection is retired.
+ *
  * Every request is emitted to the listener AND kept in a backlog until the
  * consumer acknowledges it, so a listener failure cannot lose one, and an
  * event the listener failed to take becomes a request of its own. The backlog
  * is bounded: when it is full, ONE `BACKLOG_OVERFLOW` request stands for
  * everything that did not fit. Each request that does not fit REPLACES it
  * with a new one (a new id) that covers the union of the markets the previous
- * one covered, the markets of the request that did not fit and every
- * subscribed market, at the newest subscription generation and after the
+ * one covered, the markets of the request that did not fit and everything the
+ * stream covers, at the newest subscription generation and after the
  * newest loss. Acknowledging a replaced overflow request clears nothing (its
  * id is unknown by then). If that union outgrows
  * {@link MAX_OVERFLOW_MARKETS}, the manager faults closed rather than grow
@@ -156,7 +164,13 @@ export interface UserStreamReconciliationRequest {
    * `BACKLOG_OVERFLOW`: the newest loss when it was (re)built, if any.
    */
   readonly afterLoss: StreamLossCause | null;
-  /** The condition ids the read must cover. */
+  /**
+   * The condition ids the read must cover. For a request about the stream as
+   * a whole (a loss, `STREAM_STOPPED`, `MANAGER_FAULT`,
+   * `UNRECOGNIZED_MESSAGE`, `BACKLOG_OVERFLOW`): every market in the list and
+   * every market the connection's frames had subscribed it to, a removal not
+   * yet unsubscribed on the wire included.
+   */
   readonly markets: readonly string[];
   readonly subscriptionGeneration: number;
   /** For `EVENT_NOT_FULLY_APPLICABLE`: why the event could not be applied in full. */
@@ -520,8 +534,10 @@ class SubscriptionManager implements UserStreamManager {
     if (this.#state === "CLOSED") return;
     this.#run(() => {
       const wasSubscribed = this.#state === "SUBSCRIBED" || this.#state === "STALE";
+      // Read before `#shutDown` retires the connection.
+      const scope = this.#streamScope(this.#current);
       this.#shutDown(null);
-      if (wasSubscribed) this.#request("STREAM_STOPPED", {});
+      if (wasSubscribed) this.#request("STREAM_STOPPED", { markets: scope });
     });
   }
 
@@ -642,12 +658,27 @@ class SubscriptionManager implements UserStreamManager {
   #fault(): void {
     this.#counts.faults += 1;
     if (this.#state === "CLOSED") return;
+    // Read before `#shutDown` retires the connection.
+    const scope = this.#streamScope(this.#current);
     try {
       this.#shutDown(null);
     } catch {
       this.#state = "CLOSED";
     }
-    this.#request("MANAGER_FAULT", {});
+    this.#request("MANAGER_FAULT", { markets: scope });
+  }
+
+  /**
+   * Everything the stream covers: every market in the list (an addition not
+   * yet sent, or whose send failed, included), then every market the frames of
+   * `connection` subscribed it to that the list no longer holds (a removal
+   * whose unsubscribe was not yet sent, or failed). The list's order comes
+   * first, so with nothing pending this is exactly the list.
+   */
+  #streamScope(connection: Connection | null): readonly string[] {
+    const scope = new Set<string>(this.#markets);
+    if (connection !== null && connection.subscribed !== null) for (const market of connection.subscribed) scope.add(market);
+    return [...scope];
   }
 
   #nowIso(): string | null {
@@ -829,6 +860,8 @@ class SubscriptionManager implements UserStreamManager {
    */
   #lose(connection: Connection, cause: StreamLossCause): void {
     if (connection.retired || connection !== this.#current) return;
+    // Read BEFORE the connection is retired: what its frames subscribed it to is lost with it.
+    const scope = this.#streamScope(connection);
     connection.retired = true;
     this.#current = null;
     this.#cancel("connect");
@@ -837,7 +870,7 @@ class SubscriptionManager implements UserStreamManager {
     if (connection.handle !== undefined) this.#closeHandle(connection.handle);
     this.#transition("DISCONNECTED", cause);
     this.#lastLoss = cause;
-    this.#request(cause, {});
+    this.#request(cause, { markets: scope });
     if (cause === "AUTH_REJECTED") {
       this.#consecutiveAuthRejections += 1;
       if (this.#consecutiveAuthRejections >= MAX_CONSECUTIVE_AUTH_REJECTIONS) {
@@ -947,15 +980,16 @@ class SubscriptionManager implements UserStreamManager {
   /**
    * The backlog is full. The one `BACKLOG_OVERFLOW` request is REPLACED, under
    * a new id, by one that covers the markets the previous one covered, the
-   * markets of `request`, and every subscribed market, at the current
-   * subscription generation and after the newest loss. The replaced id is
-   * unknown from then on, so acknowledging it clears nothing newer.
+   * markets of `request`, and everything the stream covers (`#streamScope`),
+   * at the current subscription generation and after the newest loss. The
+   * replaced id is unknown from then on, so acknowledging it clears nothing
+   * newer.
    */
   #mergeIntoOverflow(request: UserStreamReconciliationRequest): void {
     const previous = this.#overflowId === null ? undefined : this.#pending.get(this.#overflowId);
     const markets = new Set<string>(previous?.markets ?? []);
     for (const market of request.markets) markets.add(market);
-    for (const market of this.#markets) markets.add(market);
+    for (const market of this.#streamScope(this.#current)) markets.add(market);
     if (previous !== undefined) this.#pending.delete(previous.requestId);
     const overflow = this.#makeRequest("BACKLOG_OVERFLOW", { markets: [...markets], ...(this.#lastLoss === null ? {} : { afterLoss: this.#lastLoss }) });
     this.#pending.set(overflow.requestId, overflow);
@@ -986,7 +1020,8 @@ class SubscriptionManager implements UserStreamManager {
       requestId: `user-stream-reconcile-${String(this.#requestCounter)}`,
       cause,
       afterLoss: detail.afterLoss ?? null,
-      markets: Object.freeze([...(detail.markets ?? this.#markets)]),
+      // No explicit scope: the request is about the stream as a whole.
+      markets: Object.freeze([...(detail.markets ?? this.#streamScope(this.#current))]),
       subscriptionGeneration: this.#generation,
       shortfalls: Object.freeze([...(detail.shortfalls ?? [])]),
       unrecognized: detail.unrecognized ?? null,
