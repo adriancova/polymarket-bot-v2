@@ -114,6 +114,9 @@ export function createObservingWalFileSystem(): ObservingWalFileSystem {
     joinPath: (...segments) => inner.joinPath(...segments),
     ensureDirectory: async (path) => observe(async () => inner.ensureDirectory(path)),
     listFileNames: async (path) => observe(async () => inner.listFileNames(path)),
+    // `WALCAP-1`: a capped writer re-derives its count on every tick, on the
+    // same operation chain; observed like every other call.
+    listDirectoryNames: async (path) => observe(async () => (await inner.listDirectoryNames?.(path)) ?? []),
     fileByteLength: async (path) => observe(async () => inner.fileByteLength(path)),
     readWholeFile: async (path) => observe(async () => inner.readWholeFile(path)),
     openRead: async (path) => observe(async () => inner.openRead(path)),

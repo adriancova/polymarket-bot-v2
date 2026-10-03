@@ -172,9 +172,34 @@ export const WalConfigSchema = z.strictObject({
   maxSegmentAgeMs: z.number().int().positive().optional(),
   fsyncIntervalMs: z.number().int().positive().optional(),
   fsyncByteThreshold: z.number().int().positive().optional(),
-  /** §4.2 hard capacity threshold. `null` disables it. */
+  /**
+   * §4.2 hard capacity threshold over the whole WAL root, every epoch in it
+   * (ADR-028 D5, `WALCAP-1`). `null` disables it; on the laptop host profile
+   * it is required ({@link LAPTOP_PAPER_HOST_PROFILE}).
+   */
   maxTotalBytes: z.number().int().positive().nullable().optional(),
 });
+
+/**
+ * The ADR-025 laptop PAPER host profile, as a gateway configuration declares
+ * it (`WALCAP-1`, ADR-028 Decision 5.1: "On this profile `maxTotalBytes` must
+ * be set. `null` is refused.").
+ *
+ * Nothing in the repository identified the profile before this marker: the
+ * host configuration is `HOST-1`'s, and no field, path or environment value
+ * said "laptop". The marker is therefore OPT-IN and narrow on purpose. A
+ * configuration that declares it is refused at startup unless
+ * `wal.maxTotalBytes` is a positive number; a configuration that does not
+ * declare it is judged exactly as before, so CI, test and compose
+ * configurations are unchanged. It does not detect the host and does not
+ * change any other value. `HOST-1`'s host configuration declares it, and its
+ * start script refuses a missing `maxTotalBytes` too (work plan, `HOST-1`
+ * acceptance), so the two checks are independent.
+ */
+export const LAPTOP_PAPER_HOST_PROFILE = "laptop-paper";
+
+/** The host profiles a configuration may declare. Anything else is refused by the strict schema. */
+export const HostProfileSchema = z.enum([LAPTOP_PAPER_HOST_PROFILE]);
 
 export const PolymarketFeedConfigSchema = z.strictObject({
   feedId: FeedIdSchema.default(DEFAULT_POLYMARKET_FEED_ID),
@@ -297,6 +322,11 @@ export const GatewayConfigSchema = z.strictObject({
     .refine((name) => !UUID_PATTERN.test(name.toLowerCase()), {
       message: "streamName must not be a UUID: it must be stable across restarts",
     }),
+  /**
+   * The host profile this configuration is for, when it is one with rules of
+   * its own ({@link LAPTOP_PAPER_HOST_PROFILE}). Optional; see there.
+   */
+  hostProfile: HostProfileSchema.optional(),
   wal: WalConfigSchema,
   publisher: PublisherConfigSchema.default({
     maxQueueDepth: DEFAULT_PUBLISH_QUEUE_MAX_DEPTH,
@@ -428,6 +458,20 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
   ) {
     throw new GatewayConfigurationError(
       "at least one feed must be configured; a gateway recording nothing is a deployment error",
+    );
+  }
+  // ADR-028 D5.1 on the ADR-025 laptop profile: a hard stop that is not set
+  // is no stop at all, and the disk fills instead (`WALCAP-1`).
+  if (
+    config.hostProfile === LAPTOP_PAPER_HOST_PROFILE &&
+    (config.wal.maxTotalBytes === undefined || config.wal.maxTotalBytes === null)
+  ) {
+    throw new GatewayConfigurationError(
+      `the ${LAPTOP_PAPER_HOST_PROFILE} host profile requires wal.maxTotalBytes: ADR-028 Decision 5.1 refuses a null or missing cap on this profile; set it below the free disk, with room for pins, the research tier, PostgreSQL and backups (Decision 5.2)`,
+      {
+        hostProfile: config.hostProfile,
+        maxTotalBytes: config.wal.maxTotalBytes === undefined ? "absent" : null,
+      },
     );
   }
   if (config.polymarket !== undefined && config.markets.length === 0) {

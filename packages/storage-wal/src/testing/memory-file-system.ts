@@ -107,6 +107,34 @@ export function createMemoryFileSystem(): MemoryFileSystem {
       return names.sort();
     },
 
+    async listDirectoryNames(directoryPath: string): Promise<readonly string[]> {
+      const target = normalize(directoryPath);
+      const names = new Set<string>();
+      // A directory exists here when it was ensured or when a file lives at or
+      // below it, so every ancestor of every file is considered.
+      const consider = (directory: string): void => {
+        let current = directory;
+        while (current !== "/" && current !== "") {
+          const parent = directoryOf(current);
+          if (parent === target) {
+            names.add(baseNameOf(current));
+            return;
+          }
+          if (parent === current) {
+            return;
+          }
+          current = parent;
+        }
+      };
+      for (const directory of directories) {
+        consider(directory);
+      }
+      for (const path of files.keys()) {
+        consider(directoryOf(path));
+      }
+      return [...names].sort();
+    },
+
     async fileByteLength(path: string): Promise<number | null> {
       const bytes = files.get(normalize(path));
       return bytes === undefined ? null : bytes.length;

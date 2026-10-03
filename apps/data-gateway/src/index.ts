@@ -14,7 +14,7 @@
  * everything else is driven through injected ports (§12.4).
  */
 
-export { DataGateway } from "./gateway.js";
+export { DataGateway, WAL_CAPACITY_REACHED_REASON_CODE } from "./gateway.js";
 export type {
   GatewayCreateOptions,
   GatewayMetrics,
@@ -25,6 +25,8 @@ export type {
 export {
   GAMMA_MARKETS_RATE_LIMIT_PER_10S,
   GatewayConfigSchema,
+  HostProfileSchema,
+  LAPTOP_PAPER_HOST_PROFILE,
   LIFECYCLE_MAX_BUDGET_SHARE_PERCENT,
   LifecycleFeedConfigSchema,
   lifecycleRequestBudgetPer10s,

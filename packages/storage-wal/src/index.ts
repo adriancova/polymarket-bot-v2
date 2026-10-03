@@ -142,6 +142,13 @@ export {
 export { ActiveSegment } from "./segment-writer.js";
 
 export {
+  rescanSegmentBytes,
+  SegmentByteLedger,
+  type CapacityRescanOutcome,
+  type CapacityScope,
+} from "./capacity-ledger.js";
+
+export {
   openWalWriter,
   WalWriter,
   type WalDrainResult,
@@ -157,6 +164,7 @@ export type {
   SegmentIdContext,
   SegmentIdFactory,
   WalAppendHandle,
+  WalCapacityRescanEvent,
   WalClock,
   WalCloseReason,
   WalEnqueueResult,

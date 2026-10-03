@@ -15,6 +15,10 @@
  *   CONTINUES: every feed driver's WAL path is independent of the publisher.
  * - WAL refusal/fault → PAGE incident, affected derived data unpublished; the
  *   feed-health stream keeps flowing so the outage is visible.
+ * - WAL capacity (`maxTotalBytes`, ADR-028 D5) reached → recording stops and
+ *   `GATEWAY_WAL_CAPACITY_REACHED` pages, once per episode: nothing is deleted
+ *   or overwritten, and recording resumes when raw-WAL expiry frees room. A
+ *   relief re-arms the page for the next episode (`WALCAP-1`).
  * - a trader deploy touches nothing here: this process owns no trader state.
  *
  * Everything impure is injected (`GatewayPorts`), so the whole gateway runs
@@ -100,6 +104,13 @@ export interface GatewayObserver extends DispatcherObserver {
    */
   onDisposalFailure?(failure: DisposalFailure): void;
 }
+
+/**
+ * The page for reaching the WAL's `maxTotalBytes` (ADR-028 D5.3: "Recording
+ * stops and a page fires"). Market-less, so a consumer taints the epoch
+ * (ADR-023 D2 rule 4), which is right: the gateway is not recording.
+ */
+export const WAL_CAPACITY_REACHED_REASON_CODE = "GATEWAY_WAL_CAPACITY_REACHED";
 
 /**
  * One PAGE incident reason code per halt cause.
@@ -281,6 +292,25 @@ export class DataGateway {
             detail: failure.detail,
           });
         }
+        // `WALCAP-1`: the cap gets its own page, beside the per-feed
+        // `GATEWAY_WAL_FRAME_REFUSED`, because it stops every feed at once and
+        // only expiry ends it. One incident per episode: the registry counts
+        // the repeats while it is open.
+        if (failure.reason === "capacity-exceeded") {
+          late.dispatcher?.openIncident({
+            scope: "wal",
+            reasonCode: WAL_CAPACITY_REACHED_REASON_CODE,
+            severity: "PAGE",
+            detail:
+              `${failure.detail}: new raw frames are refused and their market data is not published; ` +
+              "nothing is deleted or overwritten, and recording resumes only when raw-WAL expiry frees room (ADR-028 D5)",
+          });
+        }
+      },
+      onCapacityRelieved: () => {
+        // Expiry gave room back after the cap refused: the next time the cap
+        // is reached is a new episode, and it pages again.
+        late.dispatcher?.markIncidentClosed("wal", WAL_CAPACITY_REACHED_REASON_CODE);
       },
     });
 

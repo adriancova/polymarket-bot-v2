@@ -347,3 +347,158 @@ describe("GatewayJournal — one operation chain (round-1 review H1)", () => {
     expect(manifestedIngestSeqs(fileSystem)).toEqual(["1"]);
   });
 });
+
+/**
+ * `WALCAP-1` (ADR-028 D5, `STORAGE1-MAXBYTES`): the journal opens its writer
+ * with the WAL ROOT as the capacity root, so `maxTotalBytes` bounds every
+ * epoch under it, and expiry's deletions give room back on the next tick.
+ */
+describe("GatewayJournal — maxTotalBytes over the WAL root (WALCAP-1)", () => {
+  function segmentBytesUnder(fileSystem: ReturnType<typeof createMemoryFileSystem>, root: string): number {
+    let total = 0;
+    for (const [path, bytes] of fileSystem.files) {
+      if (path.startsWith(`${root}/`) && path.endsWith(".wal.jsonl")) total += bytes.length;
+    }
+    return total;
+  }
+
+  async function capped(
+    fileSystem: ReturnType<typeof createMemoryFileSystem>,
+    epoch: string,
+    reliefs: { relievedBytes: number }[],
+    failures: { reason: string }[],
+  ) {
+    const clock = new ManualGatewayClock();
+    const journal = await GatewayJournal.open({
+      walRootPath: "/wal",
+      fileSystem,
+      clock,
+      sequencer: new IngestSequencer(epoch),
+      maxTotalBytes: 6_000,
+      maxSegmentBytes: 1_500,
+      onRecordingFailure: (failure) => failures.push(failure),
+      onCapacityRelieved: (relief) => reliefs.push(relief),
+    });
+    return { clock, journal };
+  }
+
+  async function recordUntilRefused(
+    journal: GatewayJournal,
+    clock: ManualGatewayClock,
+  ): Promise<number> {
+    for (let index = 0; index < 100; index += 1) {
+      const outcome = journal.record(frameInput(clock, `{"n":${String(index)}}`));
+      await journal.settle();
+      if (!outcome.recorded) {
+        expect(outcome.reason).toBe("capacity-exceeded");
+        return index;
+      }
+    }
+    throw new Error("the cap never refused");
+  }
+
+  it("a new epoch counts the earlier epoch's segments: one cap for the whole root", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const reliefs: { relievedBytes: number }[] = [];
+    const failures: { reason: string }[] = [];
+    const first = await capped(fileSystem, EPOCH, reliefs, failures);
+    expect(await recordUntilRefused(first.journal, first.clock)).toBeGreaterThan(3);
+    await first.journal.close();
+
+    const second = await capped(fileSystem, OTHER_EPOCH, reliefs, failures);
+    const outcome = second.journal.record(frameInput(second.clock, "{}"));
+    expect(outcome.recorded).toBe(false);
+    expect(segmentBytesUnder(fileSystem, "/wal")).toBeLessThanOrEqual(6_000);
+    expect(second.journal.metrics().totalSegmentBytes).toBe(segmentBytesUnder(fileSystem, "/wal"));
+    await second.journal.close();
+  });
+
+  it("reports relief once per capacity refusal, after expiry deletes a sealed segment and a tick re-derives", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const reliefs: { relievedBytes: number }[] = [];
+    const failures: { reason: string }[] = [];
+    const { clock, journal } = await capped(fileSystem, EPOCH, reliefs, failures);
+    await recordUntilRefused(journal, clock);
+    expect(failures.at(-1)?.reason).toBe("capacity-exceeded");
+
+    // A tick with nothing deleted gives nothing back and reports nothing.
+    await journal.tick();
+    expect(reliefs).toHaveLength(0);
+
+    const sealed = [...fileSystem.files.keys()]
+      .filter((path) => path.endsWith(".wal.manifest.json"))
+      .sort()[0];
+    if (sealed === undefined) throw new Error("no sealed segment");
+    const segment = sealed.replace(/\.wal\.manifest\.json$/u, ".wal.jsonl");
+    const freed = fileSystem.peek(segment)?.length ?? 0;
+    fileSystem.files.delete(segment);
+    fileSystem.files.delete(sealed);
+
+    await journal.tick();
+    expect(reliefs).toStrictEqual([{ relievedBytes: freed, countedBytes: segmentBytesUnder(fileSystem, "/wal") }]);
+    expect(journal.record(frameInput(clock, "{}")).recorded).toBe(true);
+    await journal.settle();
+    // A second tick, with nothing more freed, reports nothing more; nor does
+    // a second deletion with no refusal in between: one report per refusal.
+    await journal.tick();
+    expect(reliefs).toHaveLength(1);
+    const another = [...fileSystem.files.keys()].filter((path) => path.endsWith(".wal.manifest.json")).sort()[0];
+    if (another === undefined) throw new Error("no second sealed segment");
+    fileSystem.files.delete(another.replace(/\.wal\.manifest\.json$/u, ".wal.jsonl"));
+    await journal.tick();
+    expect(journal.metrics().capacityRelievedBytes).toBeGreaterThan(freed);
+    expect(reliefs).toHaveLength(1);
+    expect(journal.faulted).toBe(false);
+    expect(segmentBytesUnder(fileSystem, "/wal")).toBeLessThanOrEqual(6_000);
+    await journal.close();
+  });
+
+  it("re-derives on the one operation chain: never alongside a drain, even with the tick's fsync held", async () => {
+    const clock = new ManualGatewayClock();
+    const fileSystem = createObservingWalFileSystem();
+    const journal = await GatewayJournal.open({
+      walRootPath: "/wal",
+      fileSystem,
+      clock,
+      sequencer: new IngestSequencer(EPOCH),
+      maxTotalBytes: 1_000_000,
+      fsyncByteThreshold: 1_000_000,
+    });
+    journal.record(frameInput(clock, "{\"first\":1}"));
+    await journal.settle();
+    clock.advance(2_000);
+    fileSystem.holdSyncs();
+    const tick = journal.tick();
+    await microturns(20);
+    for (let index = 0; index < 5; index += 1) {
+      journal.record(frameInput(clock, `{"during":${String(index)}}`));
+      await microturns(5);
+    }
+    fileSystem.releaseSyncs();
+    await tick;
+    await journal.settle();
+    await journal.tick();
+    expect(journal.metrics().capacityRescans).toBeGreaterThanOrEqual(2);
+    expect(fileSystem.observations.maxConcurrentOperations).toBe(1);
+    expect(journal.faulted).toBe(false);
+    await journal.close();
+  });
+
+  it("a relief with no capacity refusal before it reports nothing", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const reliefs: { relievedBytes: number }[] = [];
+    const failures: { reason: string }[] = [];
+    const { clock, journal } = await capped(fileSystem, EPOCH, reliefs, failures);
+    for (let index = 0; index < 4; index += 1) {
+      journal.record(frameInput(clock, `{"n":${String(index)}}`));
+      await journal.settle();
+    }
+    const sealed = [...fileSystem.files.keys()].find((path) => path.endsWith(".wal.manifest.json"));
+    if (sealed === undefined) throw new Error("no sealed segment");
+    fileSystem.files.delete(sealed.replace(/\.wal\.manifest\.json$/u, ".wal.jsonl"));
+    await journal.tick();
+    expect(journal.metrics().capacityRelievedBytes).toBeGreaterThan(0);
+    expect(reliefs).toHaveLength(0);
+    await journal.close();
+  });
+});
