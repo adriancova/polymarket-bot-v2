@@ -72,6 +72,30 @@
  * The seeded property (`salt-gate.property.test.ts`) found this: a read made
  * between a crash and the late arrival of the dead process's request.
  *
+ * ## VENUE-ID CONFLICTS (sticky and durable)
+ *
+ * When a placement answer (in time or late) or an authoritative read names,
+ * for one signed order, a venue order id other than the one the OMS tracks
+ * for it, or one another order holds, the OMS cannot rule out a venue order
+ * it does not track. Such a conflict raises a market-halt alert and is
+ * recorded in the order's event log (`conflictingVenueOrderId`), so it
+ * survives a restart (recovery re-raises the alert). It is never cleared by
+ * the OMS: not by a read of the tracked id, not by a cancel, not by
+ * abandonment. While it is open, the group's salt gate stays closed and the
+ * order's reservation stays held. Resolving it is an operator's act.
+ *
+ * ## PAUSE AND RESUME (§9.17 step 1)
+ *
+ * The manager starts PAUSED when recovery finds a never-transmitted SIGNED
+ * attempt or anything `resume()` would refuse (an attempt still unresolved,
+ * or an order still RECONCILING). `resume()` refuses while any attempt is
+ * SENDING, SUBMISSION_UNKNOWN or RECONCILING, or any order is RECONCILING,
+ * EXCEPT an attempt held for the retransmission decision: an authoritative,
+ * quiescent read found it absent and nothing of it is in flight. Nothing of
+ * that attempt can still arrive, and its group's gate stays closed until it
+ * is retransmitted or abandoned, so §9.11 step 9 stays reachable after a
+ * restart.
+ *
  * ## DURABILITY ORDER
  *
  * Decisions are taken synchronously on the in-memory model; their writes go
@@ -300,7 +324,10 @@ export interface OrderView {
   readonly filledShares: DecimalString;
   readonly venueSizeMatched: DecimalString | null;
   readonly finalSize: DecimalString | null;
+  /** An open evidence conflict of either kind (a state conflict, or a sticky venue-id conflict). */
   readonly conflict: boolean;
+  /** A VENUE-ID CONFLICT (see the header): sticky and durable; the OMS never clears it. */
+  readonly venueIdConflict: boolean;
   readonly reservation: {
     readonly reservationId: string;
     readonly assetId: string;
@@ -399,7 +426,12 @@ interface OrderModel {
   consumeFailed: boolean;
   venueSizeMatched: DecimalString | null;
   finalSize: DecimalString | null;
+  /** A state conflict (a terminal order contradicted); a by-id read showing it terminal again clears it. */
   conflict: boolean;
+  /** A VENUE-ID CONFLICT: sticky and durable (the `conflictingVenueOrderId` event payload); never cleared here. */
+  venueIdConflict: boolean;
+  /** A post-only-mode refusal arrived for this order's attempt after its watchdog (the `postOnlyRefused` event payload). */
+  latePostOnlyRefusal: boolean;
   cancelRevert: OrderState | null;
   nextOrdinal: number;
 }
@@ -857,18 +889,14 @@ export class OrderManager {
     this.#paused = true;
   }
 
-  /** Resume new submissions; refused while any attempt or order still awaits an authoritative read. */
+  /**
+   * Resume new submissions; refused while any attempt or order still awaits an
+   * authoritative read (PAUSE AND RESUME in the header).
+   */
   resume(): OmsResult<true> {
     if (this.#faulted) return refuse("OMS_FAULTED", "the manager is faulted; reopen it from the store");
-    for (const attempt of this.#attempts.values()) {
-      if (attempt.state === "SENDING" || attempt.state === "SUBMISSION_UNKNOWN" || attempt.state === "RECONCILING") {
-        return refuse("OMS_RESUME_BLOCKED", "an attempt is still unresolved", { attemptId: attempt.attemptId, state: attempt.state });
-      }
-      const order = this.#orders.get(attempt.orderId);
-      if (order !== undefined && order.state === "RECONCILING") {
-        return refuse("OMS_RESUME_BLOCKED", "an order is still reconciling", { orderId: order.orderId });
-      }
-    }
+    const blocker = this.#resumeBlocker();
+    if (blocker !== undefined) return blocker;
     this.#paused = false;
     return ok(true);
   }
@@ -1180,6 +1208,23 @@ export class OrderManager {
 
   // =========================================================================
   // Internals.
+
+  /** `resume()`'s rule: the first attempt or order still awaiting an authoritative read, as a refusal. */
+  #resumeBlocker(): OmsResult<never> | undefined {
+    for (const attempt of this.#attempts.values()) {
+      // Held for the retransmission decision: authoritatively and quiescently absent, nothing in flight.
+      const held = attempt.state === "RECONCILING" && attempt.absentConfirmed && !attempt.inFlight;
+      if (held) continue;
+      if (attempt.state === "SENDING" || attempt.state === "SUBMISSION_UNKNOWN" || attempt.state === "RECONCILING") {
+        return refuse("OMS_RESUME_BLOCKED", "an attempt is still unresolved", { attemptId: attempt.attemptId, state: attempt.state });
+      }
+      const order = this.#orders.get(attempt.orderId);
+      if (order !== undefined && order.state === "RECONCILING") {
+        return refuse("OMS_RESUME_BLOCKED", "an order is still reconciling", { orderId: order.orderId });
+      }
+    }
+    return undefined;
+  }
 
   async #guarded<T>(body: () => Promise<OmsResult<T>>): Promise<OmsResult<T>> {
     if (this.#faulted) return refuse("OMS_FAULTED", "the manager is faulted; reopen it from the store");
@@ -1560,8 +1605,8 @@ export class OrderManager {
     switch (cls.kind) {
       case "ACCEPTED": {
         if (!this.#venueIdFree(cls.venueOrderId, order.orderId)) {
-          this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, "an accepted placement named a venue order id another order holds");
           this.#toUnknown(attempt, order, "VENUE_ID_CONFLICT", null, fx);
+          this.#markVenueIdConflict(order, attempt, cls.venueOrderId, "PLACEMENT_VENUE_ID_CONFLICT", "an accepted placement named a venue order id another order holds", fx);
           return;
         }
         this.#adoptVenueId(attempt, order, cls.venueOrderId);
@@ -1604,41 +1649,63 @@ export class OrderManager {
 
   /**
    * A placement answer that arrives after the watchdog declared the
-   * transmission lost. Only an acceptance changes anything: it proves the
-   * order exists. Every other late answer is recorded and ignored (ADR-007 §3).
-   * Either way the port has now settled, so any outstanding read is replaced
-   * by one made after this point.
+   * transmission lost. Only an acceptance changes the attempt: it proves the
+   * order exists. An acceptance naming another venue order id is a sticky
+   * VENUE-ID CONFLICT (see the header). Every other late answer is recorded
+   * and ignored (ADR-007 §3), except that a post-only-mode refusal still
+   * forbids an unchanged non-post-only retry, durably
+   * (`VENUE_FACTS.POST_ONLY_NO_UNCHANGED_RETRY`). Unless the late answer
+   * resolved the attempt, the port has now settled, so any outstanding read
+   * is replaced by one made after this point.
    */
   #applyLateOutcome(attempt: AttemptModel, order: OrderModel, cls: PlacementClass, fx: Effects): void {
     attempt.lostDeclared = false;
     if (cls.kind === "ACCEPTED") {
       if (attempt.venueOrderId === cls.venueOrderId) return;
-      if (attempt.venueOrderId !== null || !this.#venueIdFree(cls.venueOrderId, order.orderId)) {
-        this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, "a late acceptance contradicts the venue order id already known");
-        this.#record(order, "LATE_OUTCOME_CONFLICT", fx, { reasonCode: "VENUE_ID_CONFLICT", source: "polymarket" });
-        order.conflict = true;
+      if (attempt.venueOrderId === null && this.#venueIdFree(cls.venueOrderId, order.orderId)) {
+        // ABSENT is refused while a transmission is in flight, so an attempt with a pending port call is never
+        // ABANDONED or RESPONDED-by-absence here. Anything else is an invariant failure: fault, never guess.
+        if (attempt.state !== "SUBMISSION_UNKNOWN" && attempt.state !== "RECONCILING") {
+          throw new OmsInvariantError("a late acceptance for an attempt that is no longer unresolved");
+        }
+        this.#adoptVenueId(attempt, order, cls.venueOrderId);
+        this.#setAttempt(attempt, "RESPONDED", "ACCEPTED_LATE", null, fx);
+        if (order.state === "SUBMISSION_UNKNOWN") {
+          this.#transition(order, "RECONCILING", "LATE_OUTCOME", fx, { reasonCode: "LATE_ACCEPTANCE", source: "polymarket" });
+        }
+        this.#transition(order, acceptedState(cls.status), "PLACEMENT_ACCEPTED", fx, { source: "polymarket", payload: { status: cls.status } });
+        this.#consumeCurrentRequest(attempt);
         return;
       }
-      // ABSENT is refused while a transmission is in flight, so an attempt with a pending port call is never
-      // ABANDONED or RESPONDED-by-absence here. Anything else is an invariant failure: fault, never guess.
-      if (attempt.state !== "SUBMISSION_UNKNOWN" && attempt.state !== "RECONCILING") {
-        throw new OmsInvariantError("a late acceptance for an attempt that is no longer unresolved");
+      this.#markVenueIdConflict(order, attempt, cls.venueOrderId, "LATE_OUTCOME_CONFLICT", "a late acceptance contradicts the venue order id already known, or names one another order holds", fx);
+    } else {
+      const code = cls.kind === "REJECTED" ? cls.reason : cls.kind === "REFUSED" ? cls.errorKind : null;
+      if (code === "POST_ONLY_MODE") {
+        attempt.postOnlyRefused = true;
+        order.latePostOnlyRefusal = true;
       }
-      this.#adoptVenueId(attempt, order, cls.venueOrderId);
-      this.#setAttempt(attempt, "RESPONDED", "ACCEPTED_LATE", null, fx);
-      if (order.state === "SUBMISSION_UNKNOWN") {
-        this.#transition(order, "RECONCILING", "LATE_OUTCOME", fx, { reasonCode: "LATE_ACCEPTANCE", source: "polymarket" });
-      }
-      this.#transition(order, acceptedState(cls.status), "PLACEMENT_ACCEPTED", fx, { source: "polymarket", payload: { status: cls.status } });
-      this.#consumeCurrentRequest(attempt);
-      return;
+      this.#record(order, "LATE_OUTCOME_IGNORED", fx, {
+        reasonCode: cls.kind,
+        source: "polymarket",
+        ...(code === "POST_ONLY_MODE" ? { payload: { postOnlyRefused: true } } : {}),
+      });
     }
-    this.#record(order, "LATE_OUTCOME_IGNORED", fx, { reasonCode: cls.kind, source: "polymarket" });
     if (attempt.state === "SUBMISSION_UNKNOWN" || attempt.state === "RECONCILING") {
       // Supersede: only a read requested after the port settled may conclude absence.
       this.#consumeCurrentRequest(attempt);
       fx.requests.add(attempt);
     }
+  }
+
+  /** Record a sticky, durable VENUE-ID CONFLICT (see the header), with a market-halt alert. */
+  #markVenueIdConflict(order: OrderModel, attempt: AttemptModel, conflictingVenueOrderId: string, eventType: string, detail: string, fx: Effects): void {
+    order.venueIdConflict = true;
+    this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, detail);
+    this.#record(order, eventType, fx, { reasonCode: "VENUE_ID_CONFLICT", source: "polymarket", payload: { conflictingVenueOrderId } });
+  }
+
+  #conflicted(order: OrderModel): boolean {
+    return order.conflict || order.venueIdConflict;
   }
 
   // ----- reconciliation -----------------------------------------------------
@@ -1771,7 +1838,8 @@ export class OrderManager {
     const unresolved = attempt.venueOrderId === null;
     if (unresolved) {
       if (!this.#venueIdFree(venue.venueOrderId, order.orderId)) {
-        this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, "a PRESENT answer named a venue order id another order holds");
+        this.#markVenueIdConflict(order, attempt, venue.venueOrderId, "RECONCILED_VENUE_ID_CONFLICT", "a PRESENT answer named a venue order id another order holds", fx);
+        if (!(await this.#commit(fx))) return storeFailed();
         return refuse("OMS_EVIDENCE_CONFLICT", "the PRESENT venue order id belongs to another order");
       }
       this.#adoptVenueId(attempt, order, venue.venueOrderId);
@@ -1779,7 +1847,8 @@ export class OrderManager {
       attempt.absentConfirmed = false;
       if (order.state === "SUBMISSION_UNKNOWN") this.#transition(order, "RECONCILING", "RECONCILIATION_REQUESTED", fx, {});
     } else if (venue.venueOrderId !== order.venueOrderId) {
-      this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, attempt.attemptId, "a PRESENT answer named a different venue order id");
+      this.#markVenueIdConflict(order, attempt, venue.venueOrderId, "RECONCILED_VENUE_ID_CONFLICT", "a PRESENT answer named a different venue order id", fx);
+      if (!(await this.#commit(fx))) return storeFailed();
       return refuse("OMS_EVIDENCE_CONFLICT", "the PRESENT venue order id differs from this order's");
     }
     this.#consumeCurrentRequest(attempt);
@@ -1789,7 +1858,8 @@ export class OrderManager {
     if (terminalTarget) payload["finalSize"] = venue.sizeMatched;
     if (TERMINAL_ORDER_STATES.has(order.state)) {
       if (terminalTarget) {
-        // Both terminal: the read fixes the final matched size.
+        // Both terminal: the read fixes the final matched size. It resolves a STATE conflict about this venue
+        // order; a VENUE-ID CONFLICT is about another venue order, which this read says nothing about.
         order.finalSize = venue.sizeMatched;
         order.conflict = false;
         this.#record(order, "RECONCILED_PRESENT", fx, { source: "polymarket", payload: { ...payload, conflict: false } });
@@ -1951,7 +2021,7 @@ export class OrderManager {
    * succeeded, and no evidence conflict is open.
    */
   async #maybeRelease(order: OrderModel): Promise<void> {
-    if (!order.reservationHeld || order.reservationReleased || order.consumeFailed || order.conflict) return;
+    if (!order.reservationHeld || order.reservationReleased || order.consumeFailed || this.#conflicted(order)) return;
     if (!TERMINAL_ORDER_STATES.has(order.state) || order.finalSize === null) return;
     if (compareDecimal(order.filledShares, order.finalSize) !== 0) return;
     const remainder = subDecimal(order.reservation.amount, order.debited);
@@ -1996,7 +2066,7 @@ export class OrderManager {
       const order = this.#orders.get(attempt.orderId);
       if (order === undefined) throw new OmsInvariantError("an attempt names a missing order");
       if (attempt.state === "ABANDONED") {
-        if (order.conflict) blockers.push({ id: attemptId, reason: "EVIDENCE_CONFLICT" });
+        if (this.#conflicted(order)) blockers.push({ id: attemptId, reason: "EVIDENCE_CONFLICT" });
         continue;
       }
       if (attempt.state !== "RESPONDED") {
@@ -2005,7 +2075,7 @@ export class OrderManager {
       }
       if (!TERMINAL_ORDER_STATES.has(order.state)) blockers.push({ id: attemptId, reason: `ORDER_${order.state}` });
       else if (order.finalSize === null) blockers.push({ id: attemptId, reason: "FINAL_SIZE_UNCONFIRMED" });
-      else if (order.conflict) blockers.push({ id: attemptId, reason: "EVIDENCE_CONFLICT" });
+      else if (this.#conflicted(order)) blockers.push({ id: attemptId, reason: "EVIDENCE_CONFLICT" });
     }
     let remaining: DecimalString | null = group.record.plannedShares;
     for (const orderId of group.orderIds) {
@@ -2051,6 +2121,8 @@ export class OrderManager {
       venueSizeMatched: null,
       finalSize: null,
       conflict: false,
+      venueIdConflict: false,
+      latePostOnlyRefusal: false,
       cancelRevert: null,
       nextOrdinal: 0,
     };
@@ -2321,7 +2393,8 @@ export class OrderManager {
       filledShares: order.filledShares,
       venueSizeMatched: order.venueSizeMatched,
       finalSize: order.finalSize,
-      conflict: order.conflict,
+      conflict: this.#conflicted(order),
+      venueIdConflict: order.venueIdConflict,
       reservation: Object.freeze({
         reservationId: order.reservation.reservationId,
         assetId: order.reservation.assetId,
@@ -2406,7 +2479,10 @@ export class OrderManager {
         inFlight: false,
         lostDeclared: false,
         absentConfirmed: false,
-        postOnlyRefused: record.errorCode === "POST_ONLY_MODE" && (record.responseStatus === "REFUSED" || record.responseStatus === "REJECTED"),
+        // In time: the attempt's own response; after the watchdog: the order's `postOnlyRefused` event.
+        postOnlyRefused:
+          (record.errorCode === "POST_ONLY_MODE" && (record.responseStatus === "REFUSED" || record.responseStatus === "REJECTED")) ||
+          order.latePostOnlyRefusal,
         requestCount: 0,
         currentRequestId: null,
         requestOwed: false,
@@ -2485,9 +2561,18 @@ export class OrderManager {
         // A cancel was requested and its answer died with the process: its effect is unknown. Reconcile.
         this.#transition(order, "RECONCILING", "RECOVERED_CANCEL_PENDING", fx, { reasonCode: "RECOVERED_CANCEL_PENDING" });
       }
-      if (attempt.state === "SIGNED" || attempt.state === "SUBMISSION_UNKNOWN" || attempt.state === "RECONCILING") unresolved = true;
+      if (attempt.state === "SIGNED") unresolved = true;
       if (this.#needs(attempt) !== null) fx.requests.add(attempt);
       if (TERMINAL_ORDER_STATES.has(order.state)) fx.releases.add(order);
+    }
+    // Start paused on anything `resume()` would refuse too (PAUSE AND RESUME in the header): an unresolved
+    // attempt, or an order still RECONCILING (a recovered cancel among them).
+    if (this.#resumeBlocker() !== undefined) unresolved = true;
+    // An open evidence conflict survives the restart; so does its market-halt alert.
+    for (const order of this.#orders.values()) {
+      if (this.#conflicted(order)) {
+        this.#alert("EVIDENCE_CONFLICT", true, order.marketId, order.orderId, order.attemptId, "recovered with an open evidence conflict");
+      }
     }
     // Replay consumption for every fill of an order whose reservation is not yet released (a duplicate reads as done).
     const persisted = await this.#persist(fx.writes);
@@ -3105,6 +3190,8 @@ function foldOrder(record: OrderRecord, events: readonly OrderEventRecord[]): Or
     venueSizeMatched: null,
     finalSize: null,
     conflict: false,
+    venueIdConflict: false,
+    latePostOnlyRefusal: false,
     cancelRevert: null,
     nextOrdinal: 0,
   };
@@ -3125,6 +3212,9 @@ function foldOrder(record: OrderRecord, events: readonly OrderEventRecord[]): Or
       order.finalSize = typeof finalSize === "string" && isNonNegativeAmount(finalSize) ? finalSize : null;
     }
     if ("conflict" in payload) order.conflict = payload["conflict"] === true;
+    // Sticky: no later event clears either fact.
+    if (isVenueId(payload["conflictingVenueOrderId"])) order.venueIdConflict = true;
+    if (payload["postOnlyRefused"] === true) order.latePostOnlyRefusal = true;
     const revert = payload["cancelRevert"];
     if (isOrderState(revert)) order.cancelRevert = revert;
   }

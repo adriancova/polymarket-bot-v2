@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { type PlacementOutcome, type StoreWrite } from "../../../packages/oms/src/index.js";
 
 import { accepted, signatureFor, venueError, venueIdFor } from "./support/fake-venue.js";
-import { PUSD, group, openHarness, ticket } from "./support/harness.js";
+import { PUSD, flush, group, openHarness, reopen, ticket } from "./support/harness.js";
 
 function kinds(transaction: readonly StoreWrite[]): string[] {
   return transaction.map((write) => write.kind);
@@ -301,5 +301,60 @@ describe("definitive placement answers", () => {
     const second = await h.manager.submit(ticket(g, { n: 305, shares: "10" }));
     expect(!second.ok && second.refusal.code).toBe("OMS_POST_ONLY_RETRY_FORBIDDEN");
     expect(h.venue.signed).toHaveLength(1);
+  });
+
+  it("a post-only-mode refusal that arrives AFTER the watchdog still forbids an unchanged non-post-only retry, durably (r1, OP-R1-04)", async () => {
+    const h = await openHarness();
+    let answer: (outcome: PlacementOutcome) => void = () => undefined;
+    h.venue.placement = () => new Promise<PlacementOutcome>((resolve) => (answer = resolve));
+    const g = group(306, { plannedShares: "20" });
+    await h.manager.registerGroup(g);
+    const t = ticket(g, { n: 306, shares: "10" });
+    const pending = h.manager.submit(t);
+    for (let i = 0; i < 50 && h.venue.received.length === 0; i += 1) await Promise.resolve();
+    const attemptId = h.manager.order(t.orderId)?.submissionAttemptId as string;
+    const lost = await h.manager.declareTransmissionLost(attemptId);
+    expect(lost.ok && lost.value.state).toBe("RECONCILING");
+    // The late answer: the venue refused it in post-only mode. Evidence only (ADR-007 §3): the attempt is still reconciled.
+    answer({ kind: "REFUSED", error: venueError("POST_ONLY_MODE", "NOT_APPLIED", 79) });
+    await pending;
+    await flush();
+    expect(h.manager.attempt(attemptId)?.state).toBe("RECONCILING");
+    const late = h.store.snapshotSync().events.filter((event) => event.orderId === t.orderId && event.eventType === "LATE_OUTCOME_IGNORED");
+    expect(late.map((event) => event.payload)).toEqual([{ postOnlyRefused: true }]);
+    const request = h.reconciler.latestFor(attemptId);
+    const absent = await h.manager.applyReconciliation({ requestId: request?.requestId, submissionAttemptId: attemptId, verdict: "ABSENT", transmissionQuiescent: true });
+    expect(absent.ok && absent.value.state).toBe("ABANDONED");
+    expect(h.manager.order(t.orderId)?.state).toBe("REJECTED");
+    h.venue.placement = (handle) => accepted(venueIdFor(handle.identity.salt));
+    const second = await h.manager.submit(ticket(g, { n: 307, shares: "10" }));
+    expect(!second.ok && second.refusal.code).toBe("OMS_POST_ONLY_RETRY_FORBIDDEN");
+    // Durable: a restart folds the refusal back from the order's event log.
+    const r = await reopen(h);
+    const third = await r.manager.submit(ticket(g, { n: 308, shares: "10" }));
+    expect(!third.ok && third.refusal.code).toBe("OMS_POST_ONLY_RETRY_FORBIDDEN");
+    expect(h.venue.signed).toHaveLength(1);
+    expect(h.venue.received).toHaveLength(1);
+  });
+
+  it("a late REJECTED with another reason forbids nothing more (the post-only rule is keyed on the post-only refusal only)", async () => {
+    const h = await openHarness();
+    let answer: (outcome: PlacementOutcome) => void = () => undefined;
+    h.venue.placement = () => new Promise<PlacementOutcome>((resolve) => (answer = resolve));
+    const g = group(309, { plannedShares: "20" });
+    await h.manager.registerGroup(g);
+    const t = ticket(g, { n: 309, shares: "10" });
+    const pending = h.manager.submit(t);
+    for (let i = 0; i < 50 && h.venue.received.length === 0; i += 1) await Promise.resolve();
+    const attemptId = h.manager.order(t.orderId)?.submissionAttemptId as string;
+    await h.manager.declareTransmissionLost(attemptId);
+    answer({ kind: "REJECTED", reason: "INSUFFICIENT_BALANCE_OR_ALLOWANCE" });
+    await pending;
+    await flush();
+    const request = h.reconciler.latestFor(attemptId);
+    await h.manager.applyReconciliation({ requestId: request?.requestId, submissionAttemptId: attemptId, verdict: "ABSENT", transmissionQuiescent: true });
+    h.venue.placement = (handle) => accepted(venueIdFor(handle.identity.salt));
+    const second = await h.manager.submit(ticket(g, { n: 310, shares: "10" }));
+    expect(second.ok && second.value.orderState).toBe("LIVE");
   });
 });

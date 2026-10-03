@@ -60,6 +60,7 @@ export class FakeSignedOrder implements SignedOrderHandle {
   }
 }
 
+/** The real envelope's shape (`packages/polymarket-secure/src/signed-order.ts`): 14 required keys, `postOnly` optional. */
 const PAYLOAD_KEYS = [
   "builder",
   "expiration",
@@ -67,7 +68,6 @@ const PAYLOAD_KEYS = [
   "makerAmount",
   "metadata",
   "orderType",
-  "postOnly",
   "salt",
   "side",
   "signature",
@@ -77,12 +77,16 @@ const PAYLOAD_KEYS = [
   "timestamp",
   "tokenId",
 ];
+const OPTIONAL_PAYLOAD_KEYS = ["postOnly"];
 
-/** `SignedOrderEnvelope.fromPersistedPayload`'s role: strict shape, else `undefined`. */
+/** `SignedOrderEnvelope.fromPersistedPayload`'s role: strict shape (as the real one: `postOnly` optional), else `undefined`. */
 export function restoreFakeSignedOrder(payload: unknown): SignedOrderHandle | undefined {
   if (payload === null || typeof payload !== "object") return undefined;
-  const keys = Object.keys(payload).sort();
-  if (keys.join(",") !== [...PAYLOAD_KEYS].sort().join(",")) return undefined;
+  const keys = Object.keys(payload);
+  if (keys.some((key) => !PAYLOAD_KEYS.includes(key) && !OPTIONAL_PAYLOAD_KEYS.includes(key))) return undefined;
+  if (PAYLOAD_KEYS.some((key) => !keys.includes(key))) return undefined;
+  const postOnly = (payload as Record<string, unknown>)["postOnly"];
+  if (postOnly !== undefined && typeof postOnly !== "boolean") return undefined;
   return new FakeSignedOrder(payload as Record<string, string | number | boolean>);
 }
 

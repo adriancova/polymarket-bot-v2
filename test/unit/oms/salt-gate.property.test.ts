@@ -15,13 +15,17 @@
  * - retransmissions of the same signed order, abandonments, transmissions of
  *   recovered SIGNED attempts, cancels, venue-side matches and late fill
  *   deliveries, venue-mode changes, resumes;
+ * - the same calls (abandon, retransmit, transmit a SIGNED attempt, declare a
+ *   transmission lost) aimed at ANY attempt, eligible or not, so that the
+ *   oracle, not the OMS's own view, judges every one the OMS accepts (r1,
+ *   OP-R1-01);
  * - process crashes between operations AND inside a store transaction, each
  *   followed by a restart through the store port.
  *
- * After every step the oracle's S1-S3 must hold; at the end S4 (never
+ * After every step the oracle's S1-S3, S5 and S6 must hold; at the end S4 (never
  * forgotten), and a truthful drain resolves every attempt (liveness). Each
- * failure reproduces from its seed (set OMS_PROPERTY_TRACE=<seed> to print
- * its step trace and final state).
+ * failure reproduces from its seed, and a failing seed prints its step trace
+ * and final state.
  */
 
 import { describe, expect, it } from "vitest";
@@ -197,6 +201,14 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
     count("restart");
   };
 
+  // S6: every abandonment the OMS accepts is reported to the oracle (also one inside a killed transaction,
+  // which may have committed). The oracle decides from what the harness caused, not from the OMS's view.
+  const abandon = async (m: OrderManager, attemptId: string, salt: string, label: string): Promise<void> => {
+    const result = await m.abandonAttempt(attemptId);
+    if (result.ok || !inc.alive) world.abandonAccepted(salt);
+    count(result.ok ? label : `${label}:${result.refusal.code}`);
+  };
+
   const newTicket = (index: number) => {
     ticketCounter += 1;
     return ticket(GROUPS[index] as (typeof GROUPS)[number], { n: 100_000 + seed * 1000 + ticketCounter, shares: "1" });
@@ -248,36 +260,44 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
         await flush();
       }
     } else if (roll < 0.64) {
-      const flying = m.attempts().filter((attempt) => attempt.inFlight && attempt.state === "SENDING");
+      // Usually a transmission in flight; sometimes ANY attempt (the OMS must refuse the others).
+      const any = random() < 0.3;
+      const flying = any ? m.attempts() : m.attempts().filter((attempt) => attempt.inFlight && attempt.state === "SENDING");
       const target = pick(flying);
       if (target !== undefined) {
-        count("declareLost");
-        await m.declareTransmissionLost(target.submissionAttemptId);
+        const result = await m.declareTransmissionLost(target.submissionAttemptId);
+        count(any ? `declareLostAny:${result.ok ? "ok" : result.refusal.code}` : "declareLost");
       }
     } else if (roll < 0.69) {
-      const held = m.attempts().filter((attempt) => attempt.absentConfirmed);
+      // Usually an attempt the OMS reports held absent; sometimes ANY attempt, eligible or not.
+      const any = random() < 0.35;
+      const held = any ? m.attempts() : m.attempts().filter((attempt) => attempt.absentConfirmed);
       const target = pick(held);
       if (target !== undefined) {
         if (random() < 0.6) {
-          count("retransmit");
-          pending.push(m.retransmitSameSignedOrder(target.submissionAttemptId));
+          count(any ? "retransmitAny" : "retransmit");
+          const op = m.retransmitSameSignedOrder(target.submissionAttemptId);
+          if (any) void op.then((result) => count(`retransmitAny:${result.ok ? "ok" : result.refusal.code}`));
+          pending.push(op);
           await flush();
         } else {
-          count("abandonAbsent");
-          await m.abandonAttempt(target.submissionAttemptId);
+          await abandon(m, target.submissionAttemptId, target.salt, any ? "abandonAny" : "abandonAbsent");
         }
       }
     } else if (roll < 0.72) {
-      const signed = m.attempts().filter((attempt) => attempt.state === "SIGNED");
+      // Usually a SIGNED attempt; sometimes ANY attempt, eligible or not.
+      const any = random() < 0.35;
+      const signed = any ? m.attempts() : m.attempts().filter((attempt) => attempt.state === "SIGNED");
       const target = pick(signed);
       if (target !== undefined) {
         if (random() < 0.5) {
-          count("transmitSigned");
-          pending.push(m.transmitSigned(target.submissionAttemptId));
+          count(any ? "transmitAny" : "transmitSigned");
+          const op = m.transmitSigned(target.submissionAttemptId);
+          if (any) void op.then((result) => count(`transmitAny:${result.ok ? "ok" : result.refusal.code}`));
+          pending.push(op);
           await flush();
         } else {
-          count("abandonSigned");
-          await m.abandonAttempt(target.submissionAttemptId);
+          await abandon(m, target.submissionAttemptId, target.salt, any ? "abandonAny" : "abandonSigned");
         }
       }
     } else if (roll < 0.78) {
@@ -336,11 +356,10 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
     }
     await flush();
     if (world.violations.length > 0) {
-      if (process.env["OMS_PROPERTY_TRACE"] === String(seed)) {
-        console.log(trace.join("\n"));
-        console.log(JSON.stringify([...world.ledger.values()], null, 1));
-        console.log(JSON.stringify(inc.manager.attempts(), null, 1));
-      }
+      // A failing seed prints its own step trace and final state (no switch: it fails the test anyway).
+      console.log(`seed ${String(seed)} trace:\n${trace.join("\n")}`);
+      console.log(JSON.stringify([...world.ledger.values()], null, 1));
+      console.log(JSON.stringify(inc.manager.attempts(), null, 1));
       return { violations: world.violations, stats };
     }
   }
@@ -355,8 +374,8 @@ async function runSeed(seed: number, steps: number): Promise<{ violations: reado
     const m = inc.manager;
     await m.retryReconciliationRequests();
     for (const attempt of m.attempts()) {
-      if (attempt.absentConfirmed) await m.abandonAttempt(attempt.submissionAttemptId);
-      if (attempt.state === "SIGNED") await m.abandonAttempt(attempt.submissionAttemptId);
+      if (attempt.absentConfirmed) await abandon(m, attempt.submissionAttemptId, attempt.salt, "drainAbandon");
+      if (attempt.state === "SIGNED") await abandon(m, attempt.submissionAttemptId, attempt.salt, "drainAbandon");
       const request = [...requests].reverse().find((candidate) => candidate.submissionAttemptId === attempt.submissionAttemptId);
       if (request !== undefined && attempt.currentRequestId === request.requestId) {
         const read = world.read(request);
@@ -400,6 +419,11 @@ describe("acceptance 2: no new salt before authoritative reconciliation (seeded 
       "abandonAbsent",
       "transmitSigned",
       "abandonSigned",
+      // r1 (OP-R1-01): calls aimed at ineligible attempts were made and refused, so the oracle judged the rest.
+      "abandonAny:OMS_ILLEGAL_TRANSITION",
+      "retransmitAny:OMS_RETRANSMIT_NOT_SUPPORTED",
+      "transmitAny:OMS_ILLEGAL_TRANSITION",
+      "declareLostAny:OMS_ILLEGAL_TRANSITION",
       "modeFlipDuringSigning",
       "killedDuringRecovery",
       "answer:OMS_RECONCILIATION_NOT_QUIESCENT",

@@ -8,6 +8,11 @@
  * follow-up (as `CI-4` was for the contract suites). The suite imports the
  * package and its shared test support by relative path, so it needs no alias
  * (and `tsconfig.lint.json` no new path).
+ *
+ * The script typechecks this tree first (`./tsconfig.json`): the root
+ * `typecheck`'s test program (`test/tsconfig.json`) includes only
+ * `test/unit`, and the package's own `typecheck` script stays `tsc --noEmit`
+ * (WP-270 r1, SCOPE-1).
  */
 
 import { dirname, resolve } from "node:path";

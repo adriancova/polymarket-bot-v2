@@ -8,9 +8,9 @@
 
 import { describe, expect, it } from "vitest";
 
-import { OrderManager } from "../../../packages/oms/src/index.js";
+import { OrderManager, type PlacementOutcome } from "../../../packages/oms/src/index.js";
 
-import { accepted, venueIdFor } from "./support/fake-venue.js";
+import { accepted, venueError, venueIdFor } from "./support/fake-venue.js";
 import { ACCOUNT, PUSD, group, openHarness, reopen, ticket } from "./support/harness.js";
 
 describe("restart through the store", () => {
@@ -185,6 +185,72 @@ describe("restart through the store", () => {
     const attemptId = r.manager.order(t.orderId)?.submissionAttemptId as string;
     expect(h.reconciler.latestFor(attemptId)?.purpose).toBe("ORDER_STATE");
     expect(r.manager.order(t.orderId)?.reservation.released).toBe(false);
+  });
+
+  it("a recovered cancel-pending order starts the manager PAUSED, as resume() would refuse it; it resumes once the read lands (r1, OP-R1-05)", async () => {
+    const h = await openHarness();
+    const g = group(10);
+    await h.manager.registerGroup(g);
+    const t = ticket(g, { n: 10 });
+    await h.manager.submit(t);
+    h.venue.cancel = () => {
+      h.store.frozen = true;
+      throw new Error("killed with the cancel in flight");
+    };
+    await h.manager.requestCancel(t.orderId);
+    h.store.frozen = false;
+    const r = await reopen(h);
+    const attemptId = r.manager.order(t.orderId)?.submissionAttemptId as string;
+    expect(r.manager.attempt(attemptId)?.state).toBe("RESPONDED");
+    expect(r.manager.order(t.orderId)?.state).toBe("RECONCILING");
+    expect(r.manager.paused).toBe(true);
+    const fresh = await r.manager.submit(ticket(group(11), { n: 11 }));
+    expect(!fresh.ok && fresh.refusal.code).toBe("OMS_PAUSED");
+    const blocked = r.manager.resume();
+    expect(!blocked.ok && blocked.refusal).toMatchObject({ code: "OMS_RESUME_BLOCKED", details: { orderId: t.orderId } });
+    const request = h.reconciler.latestFor(attemptId);
+    const answer = await r.manager.applyReconciliation({
+      requestId: request?.requestId,
+      submissionAttemptId: attemptId,
+      verdict: "PRESENT",
+      order: { venueOrderId: venueIdFor(h.venue.signed[0] as string), status: "CANCELED", sizeMatched: "0", originalSize: "10" },
+    });
+    expect(answer.ok).toBe(true);
+    expect(r.manager.resume().ok).toBe(true);
+  });
+
+  it("resume() refuses while an attempt is SENDING (in flight) or SUBMISSION_UNKNOWN (its request owed), whatever its order's state says (r1, OP-R1-05)", async () => {
+    // SENDING: the order is SENDING too, which the order-level rule alone does not catch.
+    const h = await openHarness();
+    let answer: (outcome: PlacementOutcome) => void = () => undefined;
+    h.venue.placement = () => new Promise<PlacementOutcome>((resolve) => (answer = resolve));
+    const g = group(12);
+    await h.manager.registerGroup(g);
+    const t = ticket(g, { n: 12 });
+    const pending = h.manager.submit(t);
+    for (let i = 0; i < 50 && h.venue.received.length === 0; i += 1) await Promise.resolve();
+    h.manager.pause();
+    const sending = h.manager.resume();
+    expect(!sending.ok && sending.refusal).toMatchObject({ code: "OMS_RESUME_BLOCKED", details: { state: "SENDING" } });
+    expect(h.manager.paused).toBe(true);
+    answer(accepted(venueIdFor(h.venue.signed[0] as string)));
+    await pending;
+    expect(h.manager.resume().ok).toBe(true);
+    // SUBMISSION_UNKNOWN: the token source fails, so the request is owed and both attempt and order stay SUBMISSION_UNKNOWN.
+    const u = await openHarness({
+      requestToken: () => {
+        throw new Error("no token");
+      },
+    });
+    u.venue.placement = () => ({ kind: "UNKNOWN", reason: "ERROR", error: venueError("TIMEOUT", "UNKNOWN") });
+    const gu = group(13);
+    await u.manager.registerGroup(gu);
+    const unknown = await u.manager.submit(ticket(gu, { n: 13 }));
+    expect(unknown.ok && unknown.value).toMatchObject({ orderState: "SUBMISSION_UNKNOWN", attemptState: "SUBMISSION_UNKNOWN" });
+    u.manager.pause();
+    const owed = u.manager.resume();
+    expect(!owed.ok && owed.refusal).toMatchObject({ code: "OMS_RESUME_BLOCKED", details: { state: "SUBMISSION_UNKNOWN" } });
+    expect(u.manager.paused).toBe(true);
   });
 
   it("a faulted manager refuses everything until reopened; opening refuses a malformed store", async () => {

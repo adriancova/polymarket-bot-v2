@@ -17,6 +17,7 @@ import {
   type PortResult,
   type ReconciliationRequest,
   type ReconciliationRequester,
+  type RestoreSignedOrder,
   type VenueMode,
 } from "../../../../packages/oms/src/index.js";
 
@@ -116,6 +117,8 @@ export interface HarnessOptions {
   readonly balances?: { readonly pusd?: string; readonly yes?: string };
   readonly newId?: () => string;
   readonly requestToken?: () => string;
+  /** Defaults to the fake restorer (which mirrors the real envelope's shape check). */
+  readonly restoreSignedOrder?: RestoreSignedOrder;
 }
 
 export async function openHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -128,7 +131,7 @@ export async function openHarness(options: HarnessOptions = {}): Promise<Harness
   const mode = { value: "NORMAL" as VenueMode };
   const deps: OrderManagerDependencies = {
     venue,
-    restoreSignedOrder: restoreFakeSignedOrder,
+    restoreSignedOrder: options.restoreSignedOrder ?? restoreFakeSignedOrder,
     store,
     cipher,
     reservations,

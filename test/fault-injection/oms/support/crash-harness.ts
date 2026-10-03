@@ -53,10 +53,13 @@ export interface Universe {
   readonly newId: () => string;
   readonly requestToken: () => string;
   readonly mode: { value: VenueMode };
+  /** How many held attempts the drain resent (the same signed order) after the restart. */
+  retransmittedAfterRestart: number;
 }
 
 export function universe(): Universe {
   return {
+    retransmittedAfterRestart: 0,
     world: new SimWorld(),
     store: new MemoryStore(),
     cipher: new MockCipher(),
@@ -172,15 +175,27 @@ export async function restartAndDrain(u: Universe, deliverFills: (manager: Order
   const manager = inc.manager;
   if (manager === null) throw new Error("a restart with no kill plan must open");
   u.world.nextBehavior = () => "ACCEPT_LIVE";
+  // S6: every abandonment the OMS accepts is checked by the oracle.
+  const abandon = async (attemptId: string, salt: string): Promise<void> => {
+    const result = await manager.abandonAttempt(attemptId);
+    if (result.ok) u.world.abandonAccepted(salt);
+  };
   for (let round = 0; round < 12; round += 1) {
     await manager.retryReconciliationRequests();
     for (const attempt of manager.attempts()) {
-      if (attempt.absentConfirmed) await manager.abandonAttempt(attempt.submissionAttemptId);
+      if (attempt.absentConfirmed) {
+        // §9.11 step 9 after a restart (r1, OP-R1-03): resume, then resend the SAME signed order on the
+        // documented restart path; abandon only if the OMS refuses that.
+        if (manager.paused) manager.resume();
+        const resent = await manager.retransmitSameSignedOrder(attempt.submissionAttemptId);
+        if (resent.ok) u.retransmittedAfterRestart += 1;
+        else await abandon(attempt.submissionAttemptId, attempt.salt);
+      }
       if (attempt.state === "SIGNED") {
         if (manager.paused) manager.resume();
         // A recovered, never-transmitted signed order is sent as it is (no re-signing), or abandoned.
         if (attempt.signedPayloadAvailable) await manager.transmitSigned(attempt.submissionAttemptId);
-        else await manager.abandonAttempt(attempt.submissionAttemptId);
+        else await abandon(attempt.submissionAttemptId, attempt.salt);
       }
       const request = [...u.requests].reverse().find((candidate) => candidate.submissionAttemptId === attempt.submissionAttemptId);
       if (request !== undefined && attempt.currentRequestId === request.requestId) {

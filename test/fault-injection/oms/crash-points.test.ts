@@ -11,6 +11,9 @@
  * - never forgotten (S4): every salt the venue received is known after the
  *   restart, and every attempt ends resolved (none SENDING,
  *   SUBMISSION_UNKNOWN or RECONCILING);
+ * - every abandonment the OMS accepts in the drain is of an attempt the oracle
+ *   holds closed (S6), and an attempt held absent after the restart is resent
+ *   on the 425 path rather than abandoned (r1, OP-R1-03);
  * - reservations: exact conservation for every order (consumed + released +
  *   remaining = reserved), consumption equal to the recorded fills' debits,
  *   every closed order's remainder released, and the inventory's own
@@ -187,14 +190,17 @@ describe("crash before and after every port call, then restart through the store
       const calls = baseline.first.calls;
       expect(calls).toBeGreaterThan(5);
       let killedRuns = 0;
+      let resentAfterRestart = 0;
       for (let at = 1; at <= calls; at += 1) {
         for (const phase of ["before", "after"] as const) {
           const { run, first, last, killed } = await execute(scenario, { at, phase });
           if (killed) killedRuns += 1;
+          resentAfterRestart += run.u.retransmittedAfterRestart;
           check(`${name}: killed ${phase} call ${String(at)} (${first.trace[at - 1] ?? "?"})`, run, last);
         }
       }
       expect(killedRuns).toBe(2 * calls);
+      if (name === "425 unknown, absent, the same signed order retransmitted") expect(resentAfterRestart, `${name}: step 9 after a restart`).toBeGreaterThan(0);
     }, 120_000);
   }
 

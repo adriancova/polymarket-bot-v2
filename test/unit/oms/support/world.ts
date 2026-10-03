@@ -17,7 +17,8 @@
  *   - E1: the venue never received A and no transmission of A is travelling;
  *   - E2: every transmission of A came back to the OMS as a definitive
  *         non-placement (REJECTED, a documented REFUSED, NOT_SENT) and none
- *         is travelling;
+ *         is travelling; transmissions an accepted, fresh ABSENT (E3) already
+ *         accounted for are not counted again;
  *   - E3: the OMS ACCEPTED an ABSENT answer for A whose read was FRESH: made
  *         after A's last transmission started, while none was travelling; or
  *   - E4: the OMS ACCEPTED a fresh PRESENT answer showing A's order terminal
@@ -34,7 +35,11 @@
  *       current OMS (never forgotten);
  *   S5  a salt reaches the venue a second time only after the OMS accepted a
  *       fresh ABSENT for it since its last transmission (the same signed order
- *       is resent only on the documented path, never blindly).
+ *       is resent only on the documented path, never blindly);
+ *   S6  when the OMS ABANDONS an attempt (closes it without a placement, which
+ *       opens its group's gate), the attempt is closed(A) at that moment: the
+ *       harness reports every abandonment the OMS accepted, whatever it asked
+ *       for (r1: the generator also asks to abandon ineligible attempts).
  * Answers the OMS REFUSED never count as evidence; answers it accepted count
  * only if fresh, so a stale answer the OMS wrongly accepts is caught by S1.
  * An answer delivered into a call that died inside a store transaction may
@@ -256,6 +261,10 @@ export class SimWorld {
       if (entry.received > 0 && (entry.closedBy === null || !entry.closedBy.startsWith("E3"))) {
         this.fail(`S5: salt ${entry.salt} resent without an authoritative ABSENT since its last transmission`);
       }
+      // That fresh ABSENT accounted for every earlier transmission (none travelling, read after the last one):
+      // E2 now concerns only this transmission and later ones. (r1: a definitive rejection of a retransmission
+      // after E3 closes the attempt; the oracle had kept the first, unknown, transmission against it.)
+      if (entry.closedBy !== null && entry.closedBy.startsWith("E3")) entry.definitiveOnly = true;
       entry.received += 1;
       entry.lastSendTick = this.tick;
       entry.closedBy = null;
@@ -418,6 +427,12 @@ export class SimWorld {
     const entry = this.ledger.get(salt);
     const order = this.orders.get(salt);
     if (entry !== undefined && order !== undefined && order.matched >= order.original) entry.closedBy = "E4:filled";
+  }
+
+  /** S6: the OMS accepted an abandonment of this salt's attempt (or may have, inside a killed transaction). */
+  abandonAccepted(salt: string): void {
+    const entry = this.ledger.get(salt);
+    if (entry !== undefined && !this.#closed(entry)) this.fail(`S6: salt ${salt} abandoned while not authoritatively closed`);
   }
 
   /** S4: every received salt is known to the current OMS. */
