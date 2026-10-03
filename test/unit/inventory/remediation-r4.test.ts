@@ -15,7 +15,7 @@ import {
   type ReconciliationRequest,
   type WalletOperationExecutor,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, NO, PUSD, USDC_E, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, NO, PUSD, USDC_E, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
@@ -45,7 +45,7 @@ function harness(answer: unknown, balances: Readonly<Record<string, string>> = {
   const book = seededBook(balances);
   const reconciler = new Reconciler();
   const executor: WalletOperationExecutor = { submit: () => Promise.resolve(answer) };
-  const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals: new ApprovalTracker(), executor, reconciler });
   return { book, reconciler, manager };
 }
 

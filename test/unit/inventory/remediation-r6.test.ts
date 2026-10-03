@@ -20,7 +20,7 @@ import {
   type ReconciliationRequest,
   type WalletOperationExecutor,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, CTF_EXCHANGE, PUSD, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, CTF_EXCHANGE, PUSD, YES, requestTokens, seededBook } from "./helpers.js";
 
 // Valid 32-byte transaction hashes (the verifier also reproduced R6-01 with these).
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
@@ -54,7 +54,7 @@ function harness(submitted: { readonly transactionHash: string; readonly transac
   const reconciler = new Reconciler();
   const approvals = new ApprovalTracker();
   const executor: WalletOperationExecutor = { submit: () => Promise.resolve({ status: "SUBMITTED", ...submitted }) };
-  const manager = new WalletOperationManager({ book, approvals, executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals, executor, reconciler });
   return { book, reconciler, approvals, manager };
 }
 
@@ -304,7 +304,7 @@ describe("WP300-R6 class guards: every identifier of the set is answered for", (
     const book = seededBook({ [PUSD]: "100" });
     const reconciler = new Reconciler();
     const executor: WalletOperationExecutor = { submit: () => new Promise((resolve) => (answer = resolve)) };
-    const manager = new WalletOperationManager({ book, approvals: new ApprovalTracker(), executor, reconciler });
+    const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals: new ApprovalTracker(), executor, reconciler });
     manager.plan({ type: "SPLIT", operationId: "s", accountRef: ACCOUNT, conditionId: CONDITION, amount: "10" });
     const submitting = manager.submit("s");
     manager.observe("s", { status: "DROPPED" });

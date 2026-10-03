@@ -30,7 +30,7 @@ import {
   WalletOperationManager,
   type WalletOperationSubmission,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, USDC_E, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, USDC_E, YES, requestTokens, seededBook } from "./helpers.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(here, "../../../packages/inventory/src");
@@ -106,6 +106,7 @@ describe("API surface: no bridge, deposit, withdrawal or transfer", () => {
 
   const manager = () =>
     new WalletOperationManager({
+      requestToken: requestTokens(),
       book: seededBook({ [PUSD]: "100", [YES]: "10", [NO]: "10", [USDC_E]: "10" }),
       approvals: new ApprovalTracker(),
       executor: { submit: () => Promise.resolve({ status: "NOT_SENT" }) },
@@ -148,6 +149,7 @@ describe("API surface: no bridge, deposit, withdrawal or transfer", () => {
     for (const type of WALLET_OPERATION_TYPES) {
       const received: WalletOperationSubmission[] = [];
       const m = new WalletOperationManager({
+        requestToken: requestTokens(),
         book: seededBook({ [PUSD]: "100", [YES]: "10", [NO]: "10", [USDC_E]: "10" }),
         approvals: new ApprovalTracker(),
         executor: {

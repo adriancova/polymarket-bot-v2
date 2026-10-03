@@ -10,6 +10,11 @@
  * and builds it itself (`assembly.ts`), so its `run` command backtests the
  * core the paper trader runs.
  *
+ * Since `APPROX-REPLAY-1` it also replays a research-tier (APPROXIMATE)
+ * dataset through the same core (`approximate/`, ADR-029): every output of
+ * that path is labelled `approximate` from its manifests and is never
+ * evidence; the exact paths keep refusing an approximate manifest.
+ *
  * SAFETY (§11, §6 invariant 17, ADR-010, `AGENTS.md`): `BACKTEST` mode,
  * simulated venue, no credentials, no venue connection, no signer, no order.
  * `MAX_RUN_MODE`, `ALLOW_REAL_ORDERS` and both live-micro caps are treated as a
@@ -78,5 +83,70 @@ export type {
   BacktestRefusal,
 } from "./assembly.js";
 
+// APPROX-REPLAY-1 r1 (APPROX-R1-H2): the core-section builder is NOT public.
+// It renders a core's decisions with no fidelity, so an approximate core
+// handed to it would print unlabelled; the two public renderers either refuse
+// an approximate core (`renderBacktestArtifact`) or label every line
+// (`renderApproximateArtifact`).
 export { BACKTEST_ARTIFACT_FORMAT_ID, renderBacktestArtifact } from "./artifact.js";
 export type { BacktestArtifact, BacktestArtifactInput } from "./artifact.js";
+
+// --- APPROX-REPLAY-1: approximate replay over the research tier (ADR-029) ---
+export {
+  SUPPORTED_DOWNSAMPLING_ID,
+  SUPPORTED_DOWNSAMPLING_VERSION,
+  isSpanTable,
+  readResearchTierReplaySource,
+  v1TieKey,
+} from "./approximate/research-source.js";
+export type {
+  ReleaseFrame,
+  ResearchSample,
+  ResearchSourceOptions,
+  ResearchSourceRefusal,
+  ResearchSourceRefusalCode,
+  ResearchSourceResult,
+  ResearchTierReplaySource,
+  VerifiedResearchDataset,
+} from "./approximate/research-source.js";
+export {
+  APPROXIMATE_BOOK_SUBSCRIPTION_GENERATION,
+  APPROXIMATE_TRANSLATION_VERSION,
+  ResearchSampleTranslator,
+  approximateMarketsOf,
+  deriveApproximateEventId,
+} from "./approximate/translate.js";
+export type {
+  ApproximateMarket,
+  FrameTranslation,
+  LifecycleOutcome,
+  TranslationCounts,
+  TranslationRefusal,
+} from "./approximate/translate.js";
+export {
+  deliverReleaseFrames,
+  derivedMonotonicNs,
+  releaseRecord,
+  runApproximateBacktest,
+} from "./approximate/run.js";
+export type {
+  ApproximateReplayResult,
+  ApproximateRun,
+  ApproximateRunOptions,
+  ApproximateRunRefusal,
+  ApproximateRunResult,
+  ApproximateStop,
+  DeliveryOptions,
+  DeliveryOutcome,
+} from "./approximate/run.js";
+export {
+  APPROXIMATE_ARTIFACT_FORMAT_ID,
+  APPROXIMATE_EVIDENCE_CLASS,
+  APPROXIMATE_MONOTONIC_BASIS,
+  APPROXIMATE_RANK,
+  APPROXIMATE_RUN_SERIALIZATION_VERSION,
+  fidelityLine,
+  renderApproximateArtifact,
+  serializeApproximateRun,
+} from "./approximate/serialize.js";
+export type { ApproximateArtifactInput } from "./approximate/serialize.js";

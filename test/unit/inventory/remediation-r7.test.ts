@@ -23,7 +23,7 @@ import {
   type ReconciliationRequest,
   type WalletOperationExecutor,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, USDC_E, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, CTF_EXCHANGE, NO, PUSD, USDC_E, YES, requestTokens, seededBook } from "./helpers.js";
 
 // Valid 32-byte transaction hashes (the verifiers' probes used these shapes).
 const TX_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -56,7 +56,7 @@ function harness(submit: () => Promise<unknown> = () => Promise.resolve({ status
   const reconciler = new Reconciler();
   const approvals = new ApprovalTracker();
   const executor: WalletOperationExecutor = { submit };
-  const manager = new WalletOperationManager({ book, approvals, executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals, executor, reconciler });
   return { book, reconciler, approvals, manager };
 }
 

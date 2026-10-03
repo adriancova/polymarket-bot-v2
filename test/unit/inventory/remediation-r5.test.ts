@@ -17,7 +17,7 @@ import {
   type ReconciliationRequest,
   type WalletOperationExecutor,
 } from "../../../packages/inventory/src/index.js";
-import { ACCOUNT, CONDITION, CTF_EXCHANGE, PUSD, YES, seededBook } from "./helpers.js";
+import { ACCOUNT, CONDITION, CTF_EXCHANGE, PUSD, YES, requestTokens, seededBook } from "./helpers.js";
 
 const TX_A = "0x00000000000000000000000000000000000000000000000000000000000000a1";
 const TX_B = "0x00000000000000000000000000000000000000000000000000000000000000b2";
@@ -49,7 +49,7 @@ function harness() {
   const executor: WalletOperationExecutor = {
     submit: () => Promise.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null }),
   };
-  const manager = new WalletOperationManager({ book, approvals, executor, reconciler });
+  const manager = new WalletOperationManager({ requestToken: requestTokens(), book, approvals, executor, reconciler });
   return { book, reconciler, approvals, manager };
 }
 

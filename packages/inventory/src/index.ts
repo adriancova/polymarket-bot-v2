@@ -5,7 +5,11 @@
  * Layer 1 (`docs/contracts/dependency-direction.md` §2): depends only on
  * `@polymarket-bot/decimal` and `@polymarket-bot/domain`. No I/O, no clock, no
  * randomness, no key, no RPC endpoint, no credential. Wallet operations leave
- * the package only through the injected `WalletOperationExecutor` port.
+ * the package only through the injected `WalletOperationExecutor` port. The
+ * unpredictable token in each reconciliation request id comes from the
+ * injected `requestToken` source (WP-300c round 1), which the composition root
+ * binds to a CSPRNG; request ids are therefore not reproducible across runs,
+ * and a journal or replay must record the drawn tokens (WP300C-R2-X3).
  *
  * There is no bridge, deposit, withdrawal or transfer path (§9.14 "No
  * autonomous deposit, withdrawal, or bridge behavior in v1");
@@ -81,6 +85,7 @@ export {
 export {
   classifyObservation,
   classifySubmit,
+  MAX_REQUEST_TOKEN_LENGTH,
   WALLET_PLAN_KEYS,
   WalletOperationManager,
   type ReconciliationRequest,
@@ -88,6 +93,7 @@ export {
   type ReconciliationTrigger,
   type WalletOperationEvent,
   type WalletOperationExecutor,
+  type WalletOperationManagerDependencies,
   type WalletOperationPlan,
   type WalletOperationSubmission,
   type WalletOperationView,
