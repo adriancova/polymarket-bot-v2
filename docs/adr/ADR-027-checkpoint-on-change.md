@@ -3,7 +3,7 @@
 - **Status:** Accepted. The user ruled on 2026-09-30 (`LEAN-1`, ruling A2).
 - **Date:** 2026-09-30
 - **Recorded by:** `LEAN-GOV`
-- **Implemented by:** `CKPT-1`, after `CADENCE-1`. Not yet implemented.
+- **Implemented by:** `CKPT-1`, merged as `891ccdd` (2026-10-03). D3 chose one transaction: see `docs/handoffs/CKPT-1.md`.
 - **Supersedes / Superseded by:** none. It defines the transitions that §9.6
   and ADR-005 §5 leave open. It refines `WP-170` decision 4.
 - **Handoff sections:** §6 (invariants 3 and 8), §9.6, §10.3, §12.4.
