@@ -242,6 +242,46 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
     expect(r.u.ledger.transactions().filter((appended) => appended.transaction.eventType === "RECONCILIATION_CORRECTION")).toEqual([]);
   });
 
+  it("a tracked order whose venue facts differ from the order's is quarantined, never answered", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, originalSize: "2" })) };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "ORDER_FACTS_MISMATCH");
+    expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_FACTS_MISMATCH")?.status).toBe("QUARANTINED");
+  });
+
+  it("a read behind the OMS (it recorded more fill than the venue shows) is held, never answered into a conflict", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    const trade = r.u.world.match(salt, "0.4");
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? ""));
+    await r.p.coordinator.settled();
+    // The REST reads lag: they show neither the match nor the trade yet.
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, sizeMatched: "0" })) };
+    };
+    r.u.world.faults.readOrder = (_id, answer) => {
+      const read = answer() as { order?: Record<string, unknown> };
+      return { ...read, order: { ...(read.order ?? {}), sizeMatched: "0", status: "LIVE" } };
+    };
+    r.u.world.faults.listTrades = (answer) => ({ ...(answer() as object), trades: [] });
+    const orderId = r.oms.orders()[0]?.orderId as string;
+    expect((await r.oms.requestOrderReconciliation(orderId)).ok).toBe(true);
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "ORDER_FILLS_AHEAD_OF_VENUE");
+    expect(r.u.accepted).toEqual([]);
+    expect(r.oms.alerts().filter((alert) => alert.haltMarket)).toEqual([]);
+    r.u.world.faults = {};
+    expect(await reconcileRounds(r, 3)).toBe(true);
+  });
+
   it("a malformed read (an inexact decimal) is discarded whole, never read as empty: paused", async () => {
     const r = await ready();
     r.u.world.faults.readPositions = () => ({ route: "/v2/positions", complete: true, positions: [{ tokenId: YES, size: "1.50" }] });

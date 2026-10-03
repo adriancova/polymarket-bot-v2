@@ -229,9 +229,11 @@ class RunState {
   stale = false;
   /** Holdings were not judged in this run (the OMS and the venue still disagreed about fills or state). */
   holdingsDeferred = false;
+  /** Requests received after this were not answerable by the run's reads. */
+  readsStartSeq: number | null = null;
   constructor(
     readonly runId: string,
-    readonly runStartSeq: number,
+    public runStartSeq: number,
   ) {}
 }
 
@@ -310,7 +312,6 @@ export class ReconciliationCoordinator {
   #streamChain: Promise<void> = Promise.resolve();
   #running = false;
   #holding = true;
-  #alertsSeen = 0;
 
   /** Venue order id → the highest matched size and whether a sound read showed it terminal (out-of-order reads). */
   readonly #orderHighWater = new Map<string, { readonly sizeMatched: DecimalString; readonly terminal: boolean }>();
@@ -338,7 +339,6 @@ export class ReconciliationCoordinator {
   /** Bind a freshly opened OMS: pause it at once and queue the STARTUP run. Bind before any submission. */
   bindOms(oms: ReconciledOms): void {
     this.#oms = oms;
-    this.#alertsSeen = 0;
     this.#hold();
     this.trigger("STARTUP");
   }
@@ -492,7 +492,17 @@ export class ReconciliationCoordinator {
       this.#hold();
       return notRun([], "the id source gave no fresh UUIDv7; a run is not started");
     }
+    // §9.17 step 1.
+    this.#hold();
+    const oms = this.#oms;
+    const run = new RunState(runId, this.#seq + 1);
+    if (oms !== null && !oms.faulted) {
+      // ADR-032 D5's cadence, before the run's triggers are taken: what it delivers is answered by this run.
+      await this.#retryCadence(run, oms);
+      this.#pullStreamRequests();
+    }
     const runStartSeq = ++this.#seq;
+    run.runStartSeq = runStartSeq;
     const triggers = this.#takeTriggers(runStartSeq);
     const started = await this.#append({
       kind: "RUN_STARTED",
@@ -506,10 +516,6 @@ export class ReconciliationCoordinator {
       this.#hold();
       return notRun(triggers, `the run could not be recorded: ${started.code}`);
     }
-    // §9.17 step 1.
-    this.#hold();
-    const run = new RunState(runId, runStartSeq);
-    const oms = this.#oms;
     if (oms === null || oms.faulted) {
       run.readsComplete = false;
       this.#detect(run, {
@@ -519,11 +525,10 @@ export class ReconciliationCoordinator {
       });
       return this.#finish(run, triggers, startMs);
     }
-    await this.#retryCadence(run, oms);
-    this.#pullStreamRequests();
 
     // ---- §9.17 steps 2-4: the reads, every one after every request it may answer --------------
     const readsStartSeq = ++this.#seq;
+    run.readsStartSeq = readsStartSeq;
     const readsStartedAt = this.#now();
     this.#stampUnclockedRequests(readsStartSeq, readsStartedAt);
     const answerableOms = [...this.#omsRequests.values()].filter((entry) => entry.seq < readsStartSeq);
@@ -1583,9 +1588,9 @@ export class ReconciliationCoordinator {
         detail: "the OMS is faulted; it must be reopened from its store and bound again",
       });
     }
-    const alerts = oms.alerts();
-    for (const alert of alerts.slice(this.#alertsSeen)) this.#alertBreak(run, alert);
-    this.#alertsSeen = alerts.length;
+    // Every halting alert, every run: subject keys de-duplicate them, and an alert is never lost to a failed journal
+    // write (an index of "alerts seen" would be).
+    for (const alert of oms.alerts()) this.#alertBreak(run, alert);
     for (const item of oms.retainedEvidence()) {
       this.#detect(run, {
         breakClass: "OMS_EVIDENCE_RETAINED",
@@ -1729,7 +1734,7 @@ export class ReconciliationCoordinator {
       if (!cleared.ok) journalOk = false;
     }
     // §9.17 step 8.
-    const rerun = this.#workArrivedDuring(run.runStartSeq) || run.holdingsDeferred;
+    const rerun = this.#workArrivedDuring(run.readsStartSeq ?? run.runStartSeq) || run.holdingsDeferred;
     const invariant = this.#resumeBlocker(run, complete, journalOk, rerun);
     const unresolvedNow = this.#unresolvedBreaks();
     const status: "PASSED" | "FAILED" | "QUARANTINED" =
@@ -1916,11 +1921,12 @@ export class ReconciliationCoordinator {
     return taken;
   }
 
-  #workArrivedDuring(runStartSeq: number): boolean {
+  /** A trigger is pending, or a request arrived after the run's reads began (its answer needs a fresh read). */
+  #workArrivedDuring(sinceSeq: number): boolean {
     if (this.#triggers.length > 0) return true;
-    for (const entry of this.#omsRequests.values()) if (entry.seq > runStartSeq) return true;
-    for (const entry of this.#walletRequests.values()) if (entry.seq > runStartSeq) return true;
-    for (const entry of this.#streamRequests.values()) if (entry.seq > runStartSeq) return true;
+    for (const entry of this.#omsRequests.values()) if (entry.seq > sinceSeq) return true;
+    for (const entry of this.#walletRequests.values()) if (entry.seq > sinceSeq) return true;
+    for (const entry of this.#streamRequests.values()) if (entry.seq > sinceSeq) return true;
     return false;
   }
 
