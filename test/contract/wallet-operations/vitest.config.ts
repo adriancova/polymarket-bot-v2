@@ -4,8 +4,12 @@
  * Self-contained, like the `polymarket-secure` suite: the root config's
  * `include` covers `test/unit/**` and colocated package tests only. Relative
  * imports, no aliases. OFFLINE: the suite reads sanitized fixtures from
- * `test/fixtures/venue/` and installs a network tripwire; nothing is signed or
- * sent.
+ * `test/fixtures/venue/`; nothing is signed or sent. The network tripwire is
+ * a setup file (WP300B-R1-04): it is installed before each test module loads,
+ * so module-level code is covered too (`network-tripwire.setup.ts`). Its
+ * self-test, `network-tripwire.test.ts`, runs this config with `include`
+ * narrowed to planted files (`network-tripwire.plants.config.ts`), so keep
+ * this config importable as it is.
  *
  * Run it with:
  *   pnpm --filter @polymarket-bot/inventory test:contract
@@ -23,6 +27,7 @@ export default defineConfig({
   test: {
     root: repoRoot,
     include: ["test/contract/wallet-operations/**/*.test.ts"],
+    setupFiles: ["test/contract/wallet-operations/network-tripwire.setup.ts"],
     passWithNoTests: false,
   },
 });
