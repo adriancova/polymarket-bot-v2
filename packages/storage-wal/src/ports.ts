@@ -61,8 +61,25 @@ export interface WalReadHandle {
 export interface WalFileSystem {
   /** Create the directory (and parents) if it does not exist. */
   ensureDirectory(directoryPath: string): Promise<void>;
-  /** File names (not paths) directly inside the directory. */
+  /**
+   * File names (not paths) directly inside the directory.
+   *
+   * The capacity count (`capacity-ledger.ts`) relies on one property of it,
+   * the one `readdir` gives: a file that exists for the whole call is listed.
+   * A file created or removed during the call may or may not be.
+   */
   listFileNames(directoryPath: string): Promise<readonly string[]>;
+  /**
+   * Directory names (not paths) directly inside the directory; empty when the
+   * directory does not exist.
+   *
+   * Optional, because only one caller needs it: a writer whose
+   * `maxTotalBytes` covers a whole WAL root (`capacityRootPath`) lists the
+   * root's per-epoch subdirectories with it (WALCAP-1). Opening such a writer
+   * on a filesystem without it is a configuration error, never a narrower
+   * count.
+   */
+  listDirectoryNames?(directoryPath: string): Promise<readonly string[]>;
   /** Byte length of a file, or `null` when it does not exist. */
   fileByteLength(path: string): Promise<number | null>;
   /** Open (creating if needed) a file for appending. */
@@ -182,6 +199,32 @@ export type WalIngestSeqAnomalyEvent = {
 };
 
 /**
+ * Emitted after every re-derivation of the capacity count (`tick()`, WALCAP-1).
+ *
+ * `relievedBytes` is what the count gave back: the counted bytes of segment
+ * files a direct `fileByteLength` found gone, which on a gateway host means
+ * raw-WAL expiry deleted them (ADR-028 Decision 2). A re-derivation that fails
+ * part-way keeps what it observed and leaves the rest of the count as it was;
+ * neither half can undercount, because a deletion only ever lowers what is on
+ * disk.
+ */
+export type WalCapacityRescanEvent =
+  | {
+      readonly outcome: "counted";
+      readonly previousBytes: number;
+      readonly countedBytes: number;
+      readonly relievedBytes: number;
+      readonly segmentsForgotten: number;
+      readonly atMs: number;
+    }
+  | {
+      readonly outcome: "failed";
+      readonly countedBytes: number;
+      readonly error: unknown;
+      readonly atMs: number;
+    };
+
+/**
  * Observation hooks.
  *
  * The writer never decides policy from these; it reports. The gateway
@@ -196,4 +239,5 @@ export interface WalWriterObserver {
   onRecovery?(report: WalRecoveryReport): void;
   onWriteFault?(event: WalWriteFaultEvent): void;
   onIngestSeqAnomaly?(event: WalIngestSeqAnomalyEvent): void;
+  onCapacityRescan?(event: WalCapacityRescanEvent): void;
 }

@@ -1,5 +1,11 @@
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
+import { listSegmentManifests, nodeWalFileSystem } from "@polymarket-bot/storage-wal";
+import type { WalFileSystem } from "@polymarket-bot/storage-wal";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 
 import { GatewayStateError } from "./errors.js";
@@ -345,5 +351,382 @@ describe("GatewayJournal — one operation chain (round-1 review H1)", () => {
     expect(fileSystem.observations.maxConcurrentOperations).toBe(1);
     expect(journal.pendingFrames()).toHaveLength(0);
     expect(manifestedIngestSeqs(fileSystem)).toEqual(["1"]);
+  });
+});
+
+/**
+ * `WALCAP-1` (ADR-028 D5, `STORAGE1-MAXBYTES`): the journal opens its writer
+ * with the WAL ROOT as the capacity root, so `maxTotalBytes` bounds every
+ * epoch under it, and expiry's deletions give room back on the next tick.
+ */
+describe("GatewayJournal — maxTotalBytes over the WAL root (WALCAP-1)", () => {
+  function segmentBytesUnder(fileSystem: ReturnType<typeof createMemoryFileSystem>, root: string): number {
+    let total = 0;
+    for (const [path, bytes] of fileSystem.files) {
+      if (path.startsWith(`${root}/`) && path.endsWith(".wal.jsonl")) total += bytes.length;
+    }
+    return total;
+  }
+
+  async function capped(
+    fileSystem: ReturnType<typeof createMemoryFileSystem>,
+    epoch: string,
+    reliefs: { relievedBytes: number }[],
+    failures: { reason: string }[],
+  ) {
+    const clock = new ManualGatewayClock();
+    const journal = await GatewayJournal.open({
+      walRootPath: "/wal",
+      fileSystem,
+      clock,
+      sequencer: new IngestSequencer(epoch),
+      maxTotalBytes: 6_000,
+      maxSegmentBytes: 1_500,
+      onRecordingFailure: (failure) => failures.push(failure),
+      onCapacityRelieved: (relief) => reliefs.push(relief),
+    });
+    return { clock, journal };
+  }
+
+  async function recordUntilRefused(
+    journal: GatewayJournal,
+    clock: ManualGatewayClock,
+  ): Promise<number> {
+    for (let index = 0; index < 100; index += 1) {
+      const outcome = journal.record(frameInput(clock, `{"n":${String(index)}}`));
+      await journal.settle();
+      if (!outcome.recorded) {
+        expect(outcome.reason).toBe("capacity-exceeded");
+        return index;
+      }
+    }
+    throw new Error("the cap never refused");
+  }
+
+  it("a new epoch counts the earlier epoch's segments: one cap for the whole root", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const reliefs: { relievedBytes: number }[] = [];
+    const failures: { reason: string }[] = [];
+    const first = await capped(fileSystem, EPOCH, reliefs, failures);
+    expect(await recordUntilRefused(first.journal, first.clock)).toBeGreaterThan(3);
+    await first.journal.close();
+
+    const second = await capped(fileSystem, OTHER_EPOCH, reliefs, failures);
+    const outcome = second.journal.record(frameInput(second.clock, "{}"));
+    expect(outcome.recorded).toBe(false);
+    expect(segmentBytesUnder(fileSystem, "/wal")).toBeLessThanOrEqual(6_000);
+    expect(second.journal.metrics().totalSegmentBytes).toBe(segmentBytesUnder(fileSystem, "/wal"));
+    await second.journal.close();
+  });
+
+  it("reports relief once per capacity refusal, after expiry deletes a sealed segment and a tick re-derives", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const reliefs: { relievedBytes: number }[] = [];
+    const failures: { reason: string }[] = [];
+    const { clock, journal } = await capped(fileSystem, EPOCH, reliefs, failures);
+    await recordUntilRefused(journal, clock);
+    expect(failures.at(-1)?.reason).toBe("capacity-exceeded");
+
+    // A tick with nothing deleted gives nothing back and reports nothing.
+    await journal.tick();
+    expect(reliefs).toHaveLength(0);
+
+    const sealed = [...fileSystem.files.keys()]
+      .filter((path) => path.endsWith(".wal.manifest.json"))
+      .sort()[0];
+    if (sealed === undefined) throw new Error("no sealed segment");
+    const segment = sealed.replace(/\.wal\.manifest\.json$/u, ".wal.jsonl");
+    const freed = fileSystem.peek(segment)?.length ?? 0;
+    fileSystem.files.delete(segment);
+    fileSystem.files.delete(sealed);
+
+    await journal.tick();
+    expect(reliefs).toStrictEqual([{ relievedBytes: freed, countedBytes: segmentBytesUnder(fileSystem, "/wal") }]);
+    expect(journal.record(frameInput(clock, "{}")).recorded).toBe(true);
+    await journal.settle();
+    // A second tick, with nothing more freed, reports nothing more; nor does
+    // a second deletion with no refusal in between: one report per refusal.
+    await journal.tick();
+    expect(reliefs).toHaveLength(1);
+    const another = [...fileSystem.files.keys()].filter((path) => path.endsWith(".wal.manifest.json")).sort()[0];
+    if (another === undefined) throw new Error("no second sealed segment");
+    fileSystem.files.delete(another.replace(/\.wal\.manifest\.json$/u, ".wal.jsonl"));
+    await journal.tick();
+    expect(journal.metrics().capacityRelievedBytes).toBeGreaterThan(freed);
+    expect(reliefs).toHaveLength(1);
+    expect(journal.faulted).toBe(false);
+    expect(segmentBytesUnder(fileSystem, "/wal")).toBeLessThanOrEqual(6_000);
+    await journal.close();
+  });
+
+  it("re-derives on the one operation chain: never alongside a drain, even with the tick's fsync held", async () => {
+    const clock = new ManualGatewayClock();
+    const fileSystem = createObservingWalFileSystem();
+    const journal = await GatewayJournal.open({
+      walRootPath: "/wal",
+      fileSystem,
+      clock,
+      sequencer: new IngestSequencer(EPOCH),
+      maxTotalBytes: 1_000_000,
+      fsyncByteThreshold: 1_000_000,
+    });
+    journal.record(frameInput(clock, "{\"first\":1}"));
+    await journal.settle();
+    clock.advance(2_000);
+    fileSystem.holdSyncs();
+    const tick = journal.tick();
+    await microturns(20);
+    for (let index = 0; index < 5; index += 1) {
+      journal.record(frameInput(clock, `{"during":${String(index)}}`));
+      await microturns(5);
+    }
+    fileSystem.releaseSyncs();
+    await tick;
+    await journal.settle();
+    await journal.tick();
+    expect(journal.metrics().capacityRescans).toBeGreaterThanOrEqual(2);
+    expect(fileSystem.observations.maxConcurrentOperations).toBe(1);
+    expect(journal.faulted).toBe(false);
+    await journal.close();
+  });
+
+  it("a relief with no capacity refusal before it reports nothing", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const reliefs: { relievedBytes: number }[] = [];
+    const failures: { reason: string }[] = [];
+    const { clock, journal } = await capped(fileSystem, EPOCH, reliefs, failures);
+    for (let index = 0; index < 4; index += 1) {
+      journal.record(frameInput(clock, `{"n":${String(index)}}`));
+      await journal.settle();
+    }
+    const sealed = [...fileSystem.files.keys()].find((path) => path.endsWith(".wal.manifest.json"));
+    if (sealed === undefined) throw new Error("no sealed segment");
+    fileSystem.files.delete(sealed.replace(/\.wal\.manifest\.json$/u, ".wal.jsonl"));
+    await journal.tick();
+    expect(journal.metrics().capacityRelievedBytes).toBeGreaterThan(0);
+    expect(reliefs).toHaveLength(0);
+    await journal.close();
+  });
+});
+
+/**
+ * `WALCAP-1` round 1, finding A-01: the journal enqueues from socket
+ * callbacks, synchronously, while a drain on its chain is suspended in the
+ * filesystem. The frames that drain took are neither queued nor counted yet,
+ * and admission must still charge them, or the disk goes past `maxTotalBytes`
+ * (a 6,000-byte cap ended at 8,010 before the fix). Each case holds a REAL
+ * fsync of the drain — a new segment's header, then an fsync after an append
+ * — and keeps recording until the cap refuses.
+ */
+describe("GatewayJournal — frames in flight count against maxTotalBytes (WALCAP-1 r1, A-01)", () => {
+  const CAP = 12_000;
+
+  function segmentBytesUnder(fileSystem: ObservingWalFileSystem): number {
+    let total = 0;
+    for (const [path, bytes] of fileSystem.files) {
+      if (path.startsWith("/wal/") && path.endsWith(".wal.jsonl")) total += bytes.length;
+    }
+    return total;
+  }
+
+  const cases = [
+    { name: "a new segment's header fsync", fsyncByteThreshold: undefined, primed: false },
+    { name: "an fsync after an append, mid-drain", fsyncByteThreshold: 1, primed: true },
+  ] as const;
+
+  for (const testCase of cases) {
+    it(`a drain held in ${testCase.name}: recording continues, and stops at the cap, never past it`, async () => {
+      const clock = new ManualGatewayClock();
+      const fileSystem = createObservingWalFileSystem();
+      const failures: { reason: string }[] = [];
+      const journal = await GatewayJournal.open({
+        walRootPath: "/wal",
+        fileSystem,
+        clock,
+        sequencer: new IngestSequencer(EPOCH),
+        maxTotalBytes: CAP,
+        maxSegmentBytes: 2_000,
+        ...(testCase.fsyncByteThreshold === undefined ? {} : { fsyncByteThreshold: testCase.fsyncByteThreshold }),
+        onRecordingFailure: (failure) => failures.push(failure),
+      });
+      if (testCase.primed) {
+        expect(journal.record(frameInput(clock, "{\"primed\":1}")).recorded).toBe(true);
+        await journal.settle();
+      }
+
+      fileSystem.holdSyncs();
+      // A burst in one turn: the first scheduled drain takes all of it.
+      for (let index = 0; index < 10; index += 1) {
+        expect(journal.record(frameInput(clock, `{"burst":${String(index)}}`)).recorded).toBe(true);
+      }
+      await microturns(30);
+      expect(fileSystem.observations.concurrentOperations, "the drain is held in an fsync").toBe(1);
+      expect(journal.metrics().queue.currentDepth, "the drain took the burst").toBe(0);
+
+      // Frames keep arriving while the drain waits.
+      let admitted = 0;
+      for (let index = 0; index < 100; index += 1) {
+        const outcome = journal.record(frameInput(clock, `{"during":${String(index)}}`));
+        await microturns(2);
+        if (!outcome.recorded) {
+          expect(outcome.reason).toBe("capacity-exceeded");
+          break;
+        }
+        admitted += 1;
+      }
+      expect(admitted, "the cap still had room while the drain was held").toBeGreaterThan(0);
+      expect(failures.at(-1)?.reason).toBe("capacity-exceeded");
+
+      fileSystem.releaseSyncs();
+      await journal.settle();
+      expect(journal.faulted).toBe(false);
+      expect(segmentBytesUnder(fileSystem)).toBeLessThanOrEqual(CAP);
+      expect(journal.metrics().framesWritten).toBe(journal.metrics().framesAccepted);
+      expect(journal.metrics().totalSegmentBytes).toBe(segmentBytesUnder(fileSystem));
+      expect(fileSystem.observations.maxConcurrentOperations).toBe(1);
+      await journal.close();
+      expect(segmentBytesUnder(fileSystem)).toBeLessThanOrEqual(CAP);
+    });
+  }
+});
+
+/** `WALCAP-1` round 1, finding O-M1: a count it could not read bounds nothing. */
+describe("GatewayJournal — the capacity count at open fails closed (WALCAP-1 r1, O-M1)", () => {
+  it("does not open when the WAL root cannot be listed, and opens once it can", async () => {
+    const base = createMemoryFileSystem();
+    const first = await GatewayJournal.open({
+      walRootPath: "/wal",
+      fileSystem: base,
+      clock: new ManualGatewayClock(),
+      sequencer: new IngestSequencer(EPOCH),
+      maxTotalBytes: 6_000,
+    });
+    first.record(frameInput(new ManualGatewayClock(), "{\"earlier\":1}"));
+    await first.close();
+    const before = base.snapshot();
+
+    let failNext = true;
+    const fileSystem: typeof base = {
+      ...base,
+      listDirectoryNames: async (directory) => {
+        if (failNext && directory === "/wal") {
+          failNext = false;
+          throw new Error("EIO (injected root listing)");
+        }
+        return (await base.listDirectoryNames?.(directory)) ?? [];
+      },
+    };
+    const open = async () =>
+      GatewayJournal.open({
+        walRootPath: "/wal",
+        fileSystem,
+        clock: new ManualGatewayClock(),
+        sequencer: new IngestSequencer(OTHER_EPOCH),
+        maxTotalBytes: 6_000,
+      });
+    await expect(open()).rejects.toThrow("EIO (injected root listing)");
+    expect(base.snapshot()).toStrictEqual(before);
+    const journal = await open();
+    let earlier = 0;
+    for (const [path, bytes] of base.files) if (path.endsWith(".wal.jsonl")) earlier += bytes.length;
+    expect(earlier).toBeGreaterThan(0);
+    expect(journal.metrics().totalSegmentBytes).toBe(earlier);
+    await journal.close();
+  });
+});
+
+/**
+ * `WALCAP-1` round 2, finding TR: a time rotation that fired with frames
+ * still unwritten opened a segment whose framing nobody had reserved. Through
+ * the journal, the review's probe ended a 6,000-byte cap at 6,028 bytes before
+ * `close()` and 6,408 after, on the memory and the real Node filesystem alike;
+ * these tests read 6,173 before `close()` on the round-1 writer. Admission now
+ * reserves that segment whenever the open one holds a record, so the rotation
+ * happens on time and the cap holds.
+ */
+describe("GatewayJournal — a time rotation never takes the disk past maxTotalBytes (WALCAP-1 r2, TR)", () => {
+  const CAP = 6_000;
+  const AGE_MS = 1_000;
+
+  async function burstAtTheBoundary(
+    fileSystem: WalFileSystem,
+    walRootPath: string,
+    aged: "before the burst" | "between the burst and its drain",
+    segmentBytes: () => Promise<number>,
+  ) {
+    const clock = new ManualGatewayClock();
+    const failures: { reason: string }[] = [];
+    const journal = await GatewayJournal.open({
+      walRootPath,
+      fileSystem,
+      clock,
+      sequencer: new IngestSequencer(EPOCH),
+      maxTotalBytes: CAP,
+      // Segments only time closes.
+      maxSegmentBytes: 64_000_000,
+      maxSegmentAgeMs: AGE_MS,
+      onRecordingFailure: (failure) => failures.push(failure),
+    });
+    expect(journal.record(frameInput(clock, "{}")).recorded).toBe(true);
+    await journal.settle();
+
+    if (aged === "before the burst") clock.advance(AGE_MS);
+    // One turn, as a socket delivers a burst: the drain runs after all of it.
+    let burst = 0;
+    for (let index = 0; index < 100; index += 1) {
+      const outcome = journal.record(frameInput(clock, `{"burst":${String(index)}}`));
+      if (!outcome.recorded) {
+        expect(outcome.reason).toBe("capacity-exceeded");
+        break;
+      }
+      burst += 1;
+    }
+    expect(burst, "the cap had room for a burst").toBeGreaterThan(0);
+    if (aged === "between the burst and its drain") clock.advance(AGE_MS);
+    await journal.settle();
+    expect(journal.faulted).toBe(false);
+    expect(await segmentBytes()).toBeLessThanOrEqual(CAP);
+    expect(journal.metrics().framesWritten).toBe(journal.metrics().framesAccepted);
+    await journal.close();
+    expect(await segmentBytes()).toBeLessThanOrEqual(CAP);
+    expect(failures.at(-1)?.reason).toBe("capacity-exceeded");
+
+    // On time: the aged segment closed by age, the burst in the next one.
+    const manifests = await listSegmentManifests(fileSystem, fileSystem.joinPath(walRootPath, EPOCH));
+    expect(manifests.map((manifest) => [manifest.closeReason, manifest.recordCount])).toEqual([
+      ["time-rotation", 1],
+      ["shutdown", burst],
+    ]);
+    expect(journal.metrics().timeRotationsDeferred).toBe(0);
+  }
+
+  for (const aged of ["before the burst", "between the burst and its drain"] as const) {
+    it(`a segment aged ${aged}: a burst to refusal stays under the cap, before and after close`, async () => {
+      const fileSystem = createMemoryFileSystem();
+      await burstAtTheBoundary(fileSystem, "/wal", aged, async () => {
+        let total = 0;
+        for (const [path, bytes] of fileSystem.files) {
+          if (path.startsWith("/wal/") && path.endsWith(".wal.jsonl")) total += bytes.length;
+        }
+        return total;
+      });
+    });
+  }
+
+  it("the same on the real Node filesystem, the segment aged before the burst", async () => {
+    const root = await mkdtemp(join(tmpdir(), "walcap-r2-journal-"));
+    try {
+      await burstAtTheBoundary(nodeWalFileSystem(), root, "before the burst", async () => {
+        let total = 0;
+        for (const epoch of await readdir(root)) {
+          for (const name of await readdir(join(root, epoch))) {
+            if (name.endsWith(".wal.jsonl")) total += (await stat(join(root, epoch, name))).size;
+          }
+        }
+        return total;
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

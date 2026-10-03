@@ -32,6 +32,22 @@
  * DETECTABLE by that key, never two facts with two identities. The journal
  * never re-stamps a frame.
  *
+ * ## The capacity threshold covers the WAL root (`WALCAP-1`, ADR-028 D5)
+ *
+ * `maxTotalBytes` is a hard stop for the disk the raw WAL lives on, so the
+ * writer is opened with the WAL ROOT as its capacity root: every epoch's
+ * segments count, not only this epoch's (a restart mints a new directory, and
+ * used to start the count again from zero). The count is re-derived from the
+ * disk on every `tick()`, so a segment that raw-WAL expiry deleted gives its
+ * bytes back, and a gateway refused at its cap records again. Reaching the cap
+ * still refuses frames and deletes nothing (D5.3); nothing here triggers
+ * expiry (D5.4).
+ *
+ * The refusal reaches the gateway through `onRecordingFailure` as
+ * `capacity-exceeded`, and the gateway pages. When a re-derivation gives bytes
+ * back after a capacity refusal, `onCapacityRelieved` fires once, so the
+ * gateway can re-arm its page for the next time the cap is reached.
+ *
  * ## Cadence (WP-050 assumption 7 / `known_risks` 7)
  *
  * The writer schedules nothing; the gateway drives `drain()` after every
@@ -70,6 +86,7 @@
 
 import type {
   RawFrameRecord,
+  WalCapacityRescanEvent,
   WalClock,
   WalEnqueueResult,
   WalFileSystem,
@@ -127,20 +144,33 @@ export interface GatewayJournalOptions {
     readonly reason: string;
     readonly detail: string;
   }) => void;
+  /**
+   * Called once when a re-derivation of the capacity count gives bytes back
+   * after a `capacity-exceeded` refusal: expiry freed room. Not called again
+   * until the cap refuses another frame.
+   */
+  readonly onCapacityRelieved?: (relief: {
+    readonly relievedBytes: number;
+    readonly countedBytes: number;
+  }) => void;
 }
 
 export class GatewayJournal {
   readonly #writer: WalWriter;
   readonly #sequencer: IngestSequencer;
   readonly #onFailure: GatewayJournalOptions["onRecordingFailure"];
+  readonly #onCapacityRelieved: GatewayJournalOptions["onCapacityRelieved"];
   /** The one chain every asynchronous writer operation runs on. */
   #operations: Promise<void> = Promise.resolve();
   #faulted = false;
+  /** The cap refused a frame and no re-derivation has given bytes back since. */
+  #refusedAtCapacity = false;
 
   private constructor(writer: WalWriter, options: GatewayJournalOptions) {
     this.#writer = writer;
     this.#sequencer = options.sequencer;
     this.#onFailure = options.onRecordingFailure;
+    this.#onCapacityRelieved = options.onCapacityRelieved;
   }
 
   /** Opens (and recovers) the per-epoch WAL directory. */
@@ -153,11 +183,22 @@ export class GatewayJournal {
       // nanoseconds. Integer division loses sub-millisecond precision only.
       monotonicMs: () => Number(options.clock.monotonicNs() / 1_000_000n),
     };
+    // Late-bound: the writer reports re-derivations from its first `tick()`,
+    // which only the journal constructed below can issue.
+    const late: { journal?: GatewayJournal } = {};
     const writer = await openWalWriter({
       directoryPath,
       gatewayEpoch,
       fileSystem: options.fileSystem,
       clock: walClock,
+      // ADR-028 D5: the threshold bounds the WAL root, every epoch in it.
+      capacityRootPath: options.walRootPath,
+      observer: {
+        onCapacityRescan: (event) => {
+          const journal = late.journal;
+          if (journal !== undefined) journal.#noteCapacityRescan(event);
+        },
+      },
       ...(options.queueCapacity === undefined ? {} : { queueCapacity: options.queueCapacity }),
       ...(options.queueMaxBytes === undefined ? {} : { queueMaxBytes: options.queueMaxBytes }),
       ...(options.maxSegmentBytes === undefined
@@ -174,7 +215,9 @@ export class GatewayJournal {
         : { fsyncByteThreshold: options.fsyncByteThreshold }),
       ...(options.maxTotalBytes === undefined ? {} : { maxTotalBytes: options.maxTotalBytes }),
     });
-    return new GatewayJournal(writer, options);
+    const journal = new GatewayJournal(writer, options);
+    late.journal = journal;
+    return journal;
   }
 
   /** True once a write fault has been observed; recording is no longer trusted. */
@@ -241,6 +284,9 @@ export class GatewayJournal {
       return { recorded: false, reason: "validation-rejected", detail, ingestSeq };
     }
     if (!result.accepted) {
+      if (result.reason === "capacity-exceeded") {
+        this.#refusedAtCapacity = true;
+      }
       this.#onFailure?.({ reason: result.reason, detail: result.detail });
       return { recorded: false, reason: result.reason, detail: result.detail, ingestSeq };
     }
@@ -333,6 +379,18 @@ export class GatewayJournal {
       },
       { evenWhenFaulted: true },
     );
+  }
+
+  /** A re-derivation that gave bytes back ends a capacity refusal, once. */
+  #noteCapacityRescan(event: WalCapacityRescanEvent): void {
+    if (event.outcome !== "counted" || event.relievedBytes <= 0 || !this.#refusedAtCapacity) {
+      return;
+    }
+    this.#refusedAtCapacity = false;
+    this.#onCapacityRelieved?.({
+      relievedBytes: event.relievedBytes,
+      countedBytes: event.countedBytes,
+    });
   }
 
   #noteFault(error: unknown): void {

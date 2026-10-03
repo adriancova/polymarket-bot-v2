@@ -76,6 +76,12 @@ export interface PublishBenchOptions {
    * The stall tests use it to take the transport away at a known point.
    */
   readonly afterAdmit?: (index: number) => void;
+  /**
+   * Called once, synchronously, when publication halts: the publisher's own
+   * `onPublicationHalted`. The stall test brings its frozen hop back here, so
+   * the run the hop holds cannot complete before the halt (`WALCAP-1`).
+   */
+  readonly onPublicationHalted?: (halt: PublicationHalt) => void;
 }
 
 export interface PublishBenchResult {
@@ -206,6 +212,7 @@ export async function runPublishBench(options: PublishBenchOptions): Promise<Pub
     clock: benchClock(),
     ...(options.maxQueueDepth === undefined ? {} : { maxQueueDepth: options.maxQueueDepth }),
     ...(options.maxQueueBytes === undefined ? {} : { maxQueueBytes: options.maxQueueBytes }),
+    ...(options.onPublicationHalted === undefined ? {} : { onPublicationHalted: options.onPublicationHalted }),
   });
   const envelopes = options.envelopes;
   const total = envelopes.length;

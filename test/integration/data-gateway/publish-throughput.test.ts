@@ -22,6 +22,8 @@
  *    hop — the `docker pause` shape, see `startFreezableRedisProxy`) still
  *    fills the admission queue and halts `GATEWAY_PUBLISH_ADMISSION_OVERFLOW`
  *    at 1024/1024, and the stream holds a prefix that ends before the halt.
+ *    `WALCAP-1` made its bound exact: the hop freezes at the moment a run is
+ *    handed to the transport, not at an admission (see the test).
  * 5. An envelope refused INSIDE a batch halts `GATEWAY_PUBLISH_REJECTED`, the
  *    envelopes before it are in the stream, and nothing after it is.
  */
@@ -94,6 +96,80 @@ async function frozenHop(): Promise<FreezableRedisProxy> {
   const proxy = await startFreezableRedisProxy(redisUrl);
   proxies.push(proxy);
   return proxy;
+}
+
+/** One run the publisher handed to the transport, by envelope index (`ingestSeq` − 1). */
+interface Submission {
+  readonly firstIndex: number;
+  readonly lastIndex: number;
+  /** Handed over while the hop was already frozen. */
+  readonly afterFreeze: boolean;
+  /** Its result came back after publication had halted. */
+  settledAfterHalt?: boolean;
+}
+
+/**
+ * The real transport, with its hop frozen AT A SUBMISSION (`WALCAP-1`).
+ *
+ * Every call is the real `RedisStreamsEventTransport`'s, over the real frozen
+ * hop; the wrapper only records each run the publisher hands over and, when
+ * the run carrying envelope `freezeAtIndex` is handed over, freezes the hop
+ * synchronously before the transport writes a byte of it.
+ *
+ * That is the one instant at which nothing else is in flight on the hop. The
+ * publisher keeps one run in flight and hands over the next only after the
+ * previous one's reply was read, so no reply can be on its way through the hop
+ * when it freezes, and no further run can be cut until the frozen one
+ * completes. The thaw comes from the halt (`onPublicationHalted`), so the
+ * frozen run completes only after publication has halted.
+ */
+function freezeAtSubmission(
+  real: RedisStreamsEventTransport,
+  hop: FreezableRedisProxy,
+  freezeAtIndex: number,
+): {
+  readonly transport: RedisStreamsEventTransport;
+  readonly submissions: Submission[];
+  readonly frozen: () => Submission | undefined;
+  readonly noteHalt: () => void;
+} {
+  const submissions: Submission[] = [];
+  let frozenAt: Submission | undefined;
+  let halted = false;
+  const transport = new Proxy(real, {
+    get(target, property) {
+      if (property === "publishBatch") {
+        return async (...args: Parameters<RedisStreamsEventTransport["publishBatch"]>) => {
+          const [, batch] = args;
+          const submission: Submission = {
+            firstIndex: Number(batch[0]?.ingestSeq) - 1,
+            lastIndex: Number(batch[batch.length - 1]?.ingestSeq) - 1,
+            afterFreeze: frozenAt !== undefined,
+          };
+          submissions.push(submission);
+          if (frozenAt === undefined && submission.lastIndex >= freezeAtIndex) {
+            frozenAt = submission;
+            hop.freeze();
+          }
+          const result = await target.publishBatch(...args);
+          submission.settledAfterHalt = halted;
+          return result;
+        };
+      }
+      // Everything else is the real transport's own, bound to it (its
+      // private state is not reachable through the proxy).
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+  return {
+    transport,
+    submissions,
+    frozen: () => frozenAt,
+    noteHalt: () => {
+      halted = true;
+    },
+  };
 }
 
 function ingestSeqsOf(entries: readonly RawStreamEntry[]): readonly string[] {
@@ -192,40 +268,90 @@ describe("the gateway publish path on a real Redis (THROUGHPUT-1b)", () => {
 });
 
 describe("fail-closed on the real transport is intact (THROUGHPUT-1b)", () => {
+  /**
+   * Why this used to read 303 or 304 against `≤ 302` (`CI-FLAKE-STALL-BOUND`).
+   *
+   * It froze the hop from `afterAdmit(300)`, which runs at an ADMISSION, at an
+   * arbitrary point in the publisher's cycle, and bounded the published prefix
+   * by the end of index 300's frame (302 envelopes). Two things the freeze did
+   * not stop could each publish envelopes admitted after it:
+   *
+   * - The bench admits every envelope that is due in one synchronous turn.
+   *   On a loaded runner a late timer makes that a burst, so 301, 302 and 303
+   *   are admitted in the same turn as 300, before the pump (which waits one
+   *   microtask for a frame) cuts its next run. That run holds all of them.
+   * - `freeze()` stops the hop reading; it cannot recall a reply already past
+   *   it. If the reply to the run in flight was already on its way, the
+   *   publisher reads it after the freeze and cuts one more run from whatever
+   *   was admitted by then.
+   *
+   * Either way the run is written into the frozen hop, which holds the bytes
+   * (nothing is lost) and forwards them at the thaw, inside the 5 s reply
+   * deadline, so it is published. The prefix then ends wherever that run
+   * ended: 303 and 304 in CI, 310 in a local run under load at `8e68fcc`. The
+   * gateway did nothing wrong; the bound described the test's timing, not the
+   * publisher.
+   *
+   * Now the hop freezes at the hand-over of the run carrying index 300
+   * ({@link freezeAtSubmission}) and thaws at the halt, so every bound below
+   * is exact rather than timed: the frozen run is the last one handed over,
+   * it completes after the halt, and the stream is exactly the runs handed
+   * over before and including it.
+   */
   it("a transport that stops answering (the docker-pause shape) still overflows the admission bound and halts; the stream ends before the halt", async () => {
     const hop = await frozenHop();
-    const transport = await connect(hop.url);
+    const real = await connect(hop.url);
     const stream = uniqueStreamName("tp1b-stall");
     const envelopes = restampEnvelopes(recorded, EPOCH);
-    let thawTimer: ReturnType<typeof setTimeout> | undefined;
+    const FREEZE_AT = 300;
+    const stall = freezeAtSubmission(real, hop, FREEZE_AT);
+    let thaws = 0;
 
     const result = await runPublishBench({
-      transport,
+      transport: stall.transport,
       stream,
       envelopes,
       offeredRate: 1_500,
-      afterAdmit: (index) => {
-        if (index !== 300) return;
-        hop.freeze();
-        // Released well after the queue has filled (1,024 at 1,500/s is about
-        // 0.7 s) and well inside the 5 s response deadline, so what was in
-        // flight lands and the halt boundary is observable in the stream.
-        thawTimer = setTimeout(() => {
-          hop.thaw();
-        }, 2_000);
+      onPublicationHalted: () => {
+        stall.noteHalt();
+        thaws += 1;
+        hop.thaw();
       },
     });
-    if (thawTimer !== undefined) clearTimeout(thawTimer);
 
+    // Fail-closed admission overflow, and a halt.
     const halt = result.halt as PublicationHalt;
     expect(halt.cause).toBe("GATEWAY_PUBLISH_ADMISSION_OVERFLOW");
     expect(halt.detail).toContain("depth 1024/1024");
     expect(result.overflowed).toBe(true);
     expect(result.queueMaxDepthObserved).toBe(1_024);
+    expect(thaws).toBe(1);
     // The refused envelope is the last one offered: offering stops at the halt.
     expect(halt.haltedAtIngestSeq).toBe(String(result.offered));
     expect(result.offered).toBeLessThan(2_800);
     expect(result.published + result.notPublished).toBe(result.offered);
+
+    // The hop froze when the run carrying index 300 was handed over, and that
+    // run was the last one: nothing admitted after the freeze was submitted.
+    const frozen = stall.frozen();
+    if (frozen === undefined) throw new Error("the run carrying index 300 was never handed over");
+    expect(frozen.firstIndex).toBeLessThanOrEqual(FREEZE_AT);
+    expect(frozen.lastIndex).toBeGreaterThanOrEqual(FREEZE_AT);
+    expect(stall.submissions.at(-1)).toBe(frozen);
+    expect(stall.submissions.filter((submission) => submission.afterFreeze)).toHaveLength(0);
+    expect(result.submissions).toBe(stall.submissions.length);
+    // It completed only after the halt: publication was flowing until the
+    // freeze and stuck from then until the halt.
+    expect(frozen.settledAfterHalt).toBe(true);
+    expect(stall.submissions.slice(0, -1).every((submission) => submission.settledAfterHalt === false)).toBe(true);
+    // The runs are consecutive from the first envelope: every envelope up to
+    // the end of the frozen run was handed over exactly once.
+    stall.submissions.forEach((submission, position) => {
+      expect(submission.firstIndex).toBe(position === 0 ? 0 : (stall.submissions[position - 1]?.lastIndex ?? -2) + 1);
+      expect(submission.lastIndex).toBeGreaterThanOrEqual(submission.firstIndex);
+    });
+    // Exactly what was handed over was published, the frozen run included.
+    expect(result.published).toBe(frozen.lastIndex + 1);
 
     // The stream holds exactly what the publisher counted as published: a
     // prefix of the input, in order, ending before the halt.
@@ -234,25 +360,6 @@ describe("fail-closed on the real transport is intact (THROUGHPUT-1b)", () => {
     expect(ingestSeqsOf(entries)).toStrictEqual(
       envelopes.slice(0, result.published).map((envelope) => envelope.ingestSeq),
     );
-    // Publication was really flowing until the hop froze, and nothing
-    // admitted AFTER the freeze was published: once frozen, the one run in
-    // flight cannot complete until the thaw, and by then publication has
-    // halted, so the published prefix is at most envelopes 0..300 (index 300
-    // is the admission that froze the hop, which may itself have been the
-    // run in flight). Exactly where in that range it ends is timing.
-    //
-    // `THROUGHPUT-2` (ADR-024, frame-atomic runs): a run is never cut inside a
-    // raw frame, so the run in flight may carry index 300's WHOLE frame —
-    // here indices 300 and 301 share one `causationId` (the recorded
-    // two-token `price_change`). The bound is therefore the end of that frame
-    // (302 envelopes, 0..301), still before anything admitted after it.
-    let frameEnd = 301;
-    while (envelopes[frameEnd]?.causationId !== undefined && envelopes[frameEnd]?.causationId === envelopes[300]?.causationId) {
-      frameEnd += 1;
-    }
-    expect(frameEnd).toBe(302);
-    expect(result.published).toBeGreaterThan(200);
-    expect(result.published).toBeLessThanOrEqual(frameEnd);
     expect(BigInt(ingestSeqsOf(entries).at(-1) ?? "0") < BigInt(halt.haltedAtIngestSeq)).toBe(true);
   }, 60_000);
 
