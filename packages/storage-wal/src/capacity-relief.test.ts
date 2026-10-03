@@ -266,7 +266,13 @@ describe("the count covers the WAL root, so a restart starts from the disk", () 
   });
 
   it("an epoch directory removed whole stops counting; one still there keeps counting", async () => {
-    const fileSystem = createMemoryFileSystem();
+    const base = createMemoryFileSystem();
+    let removed = false;
+    // The memory filesystem keeps a directory it was asked to ensure; on a
+    // real disk `rm -r` removes it from the root's listing too.
+    const fileSystem = hookedFileSystem(base, {
+      directories: (_directory, names) => (removed ? names.filter((name) => name !== EPOCH_A) : names),
+    });
     const clock = createManualClock();
     const frames = feeder();
     const first = await openEpoch(fileSystem, clock, EPOCH_A);
@@ -277,13 +283,36 @@ describe("the count covers the WAL root, so a restart starts from the disk", () 
     await first.close();
     const second = await openEpoch(fileSystem, clock, EPOCH_B);
     const counted = second.metrics().totalSegmentBytes;
-    for (const path of [...fileSystem.files.keys()]) {
-      if (path.startsWith(`${directoryOf(EPOCH_A)}/`)) fileSystem.files.delete(path);
+    expect(counted).toBeGreaterThan(0);
+    for (const path of [...base.files.keys()]) {
+      if (path.startsWith(`${directoryOf(EPOCH_A)}/`)) base.files.delete(path);
     }
+    removed = true;
     await second.tick();
     expect(second.metrics().capacityRelievedBytes).toBe(counted);
     expect(second.metrics().totalSegmentBytes).toBe(0);
     await second.close();
+  });
+
+  it("a segment another process writes under the root after the open is counted by the next re-derivation", async () => {
+    // One writer per WAL root is a premise (ADR-025 D10); if it is broken, the
+    // count still catches up on the next tick rather than never.
+    const fileSystem = createMemoryFileSystem();
+    const clock = createManualClock();
+    const frames = feeder();
+    const writer = await openEpoch(fileSystem, clock, EPOCH_A);
+    const foreign = await openEpoch(fileSystem, clock, EPOCH_B, { maxTotalBytes: null });
+    for (let index = 0; index < 5; index += 1) {
+      foreign.enqueue(frames.next(EPOCH_B));
+      await foreign.drain();
+    }
+    await foreign.close();
+    // Segment files written straight into the root count as well.
+    fileSystem.poke(`${ROOT}/0190a3e0-0000-7000-8000-00000000000d-000000.wal.jsonl`, Buffer.from("x".repeat(100)));
+    expect(writer.metrics().totalSegmentBytes).toBe(0);
+    await writer.tick();
+    expect(writer.metrics().totalSegmentBytes).toBe(onDisk(fileSystem));
+    await writer.close();
   });
 
   it("without a capacity root, the threshold covers the writer's own directory, as before", async () => {
@@ -312,6 +341,8 @@ function hookedFileSystem(
   hooks: {
     beforeList?: (directory: string) => Promise<void> | void;
     list?: (directory: string, names: readonly string[]) => readonly string[];
+    /** Rewrites a directory listing (the in-memory filesystem keeps an ensured directory forever). */
+    directories?: (directory: string, names: readonly string[]) => readonly string[];
     beforeLength?: (path: string) => Promise<void> | void;
     /** Runs after the length was read and before it is returned: a late answer. */
     afterLength?: (path: string, length: number | null) => Promise<void> | void;
@@ -324,6 +355,10 @@ function hookedFileSystem(
       await hooks.beforeList?.(directory);
       const names = await base.listFileNames(directory);
       return hooks.list === undefined ? names : hooks.list(directory, names);
+    },
+    listDirectoryNames: async (directory) => {
+      const names = (await base.listDirectoryNames?.(directory)) ?? [];
+      return hooks.directories === undefined ? names : hooks.directories(directory, names);
     },
     fileByteLength: async (path) => {
       await hooks.beforeLength?.(path);

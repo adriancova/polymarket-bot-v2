@@ -213,6 +213,11 @@ describe("node filesystem port", () => {
     await second.tick();
     expect(second.metrics().capacityRelievedBytes).toBe(oldest.byteSize);
     expect(second.metrics().totalSegmentBytes).toBe(await onDisk());
+    // The whole earlier epoch removed, directory and all: every byte back.
+    await rm(join(root, epochA), { recursive: true, force: true });
+    await second.tick();
+    expect(second.metrics().totalSegmentBytes).toBe(await onDisk());
+    expect(second.metrics().totalSegmentBytes).toBe(0);
     await second.close();
   });
 });
