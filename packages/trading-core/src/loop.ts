@@ -40,15 +40,17 @@
  * exactly.
  *
  * A market's `last` moves only when the loop actually asked one of its
- * instances' runtimes for `onFeatures` (D2.3, D5.4): an evaluation the
- * snapshot gate or the halt gates stopped is no evaluation
- * (`#settleCadence`). The HARVEST POINTS are exactly ADR-024's — the cadence
- * adds none, moves none and re-stamps none — so every fill and order-update
- * callback fires where, and at the instant, it always did. A carried-over or
+ * instances' runtimes for `onFeatures` and the callback ran or was refused
+ * for good (D2.3, D5.4): an evaluation the snapshot gate, the halt gates or a
+ * passing runtime refusal stopped is no evaluation (`#settleCadence`). The
+ * HARVEST POINTS are exactly ADR-024's — the cadence adds none, moves none
+ * and re-stamps none — so every fill and order-update callback ADR-024
+ * delivered fires where, and at the instant, it always did. A carried-over or
  * heartbeat evaluation whose source is not at its close's harvest instant
- * runs after that harvest, and its own fills and order views are delivered at
- * the NEXT harvest point, as an `onFill` or `onOrderUpdate` decision's always
- * were (`#closeFrame`).
+ * runs after that harvest, and its OWN effects — the fills and views of the
+ * orders it placed or cancelled, and nothing else — are booked and delivered
+ * at once, at its source's instant (`#harvestCarriedEffects`): never delayed
+ * (D4, ruling A1).
  *
  * ## Determinism (§12.4)
  *
@@ -106,7 +108,11 @@ import {
 import { computeFeatureSnapshot } from "@polymarket-bot/features";
 import { executablePrice } from "@polymarket-bot/order-book";
 import type { Intent } from "@polymarket-bot/domain";
-import type { EvaluationInput, EvaluationOutcome } from "@polymarket-bot/strategy-runtime";
+import type {
+  EvaluationInput,
+  EvaluationOutcome,
+  EvaluationRefusalCode,
+} from "@polymarket-bot/strategy-runtime";
 import type { ExecutionPlan, PlacementPlan } from "@polymarket-bot/execution-planner";
 import type {
   ExecutionResult,
@@ -767,6 +773,25 @@ export class CoreLoop {
    * copy of it. Advanced only after a whole batch was booked.
    */
   #knownFills = 0;
+  /**
+   * `CADENCE-1` r2 (RA): the venue fill ids a carried harvest
+   * (`#harvestCarriedEffects`) booked AHEAD of `#knownFills` — the own fills of
+   * a carried-over or heartbeat evaluation, booked at its own close while an
+   * earlier fill, which keeps its ADR-024 harvest point, was still unread. The
+   * next ordinary harvest re-reads them from the cursor and skips them: they
+   * are not booked, counted or delivered twice. Every id is at or past the
+   * cursor, so the next ordinary harvest's page holds all of them, and it
+   * empties this set when it moves the cursor. Empty unless a carried harvest
+   * found such an earlier fill.
+   */
+  readonly #bookedAhead = new Set<string>();
+  /**
+   * `CADENCE-1` r2 (RA): while a carried pass runs (`#runCarriedPass`), the
+   * venue orders its evaluations' decisions touched — booked by a placement,
+   * or cancelled by a CANCEL — recorded at each venue answer
+   * (`#absorbVenueAnswer`). `undefined` outside a carried pass.
+   */
+  #carriedEffects: CarriedEffects | undefined;
   #seenArrivals = 0;
   #seenUnexplained = 0;
   /**
@@ -1190,8 +1215,10 @@ export class CoreLoop {
    * the close then runs the carried-over and heartbeat evaluations
    * (`#runCarriedPass`). Every other callback still fires exactly where it
    * did, and every harvest point is ADR-024's: an event for no configured
-   * market still harvests nothing, even when a carried-over or heartbeat
-   * evaluation runs at it.
+   * market still harvests nothing of what ADR-024 delivered, even when a
+   * carried-over or heartbeat evaluation runs at it. r2 (RA): that
+   * evaluation's OWN effects are delivered there, at once
+   * (`#harvestCarriedEffects`).
    */
   async #processEvent(event: IngestedEvent, closesFrame: boolean): Promise<void> {
     // --- step 1: validate schema ------------------------------------------
@@ -1326,11 +1353,15 @@ export class CoreLoop {
       // `CADENCE-1` r1 (J1): that holds under the cadence too — a carried-over
       // or heartbeat evaluation at it adds NO harvest point, so no fill or
       // order view is delivered here that ADR-024 did not deliver, and none
-      // is re-stamped. Its decisions are flushed; its own fills and order
-      // views are delivered at the next harvest point, as an `onFill` or
-      // `onOrderUpdate` decision's always were. At the per-frame value 0
-      // nothing is evaluated here, and nothing is flushed.
-      if (await this.#runCarriedPass(applied, new Set())) await this.#flushOutbox();
+      // is re-stamped. r2 (RA): its OWN effects — the fills and views of the
+      // orders it placed or cancelled — are booked and delivered here, at
+      // once, at this event's instant (`#harvestCarriedEffects`); then its
+      // decisions are flushed. At the per-frame value 0 nothing is evaluated
+      // here, and nothing is flushed.
+      const pass = await this.#runCarriedPass(applied, new Set());
+      if (pass?.asked !== true) return;
+      await this.#harvestCarriedEffects(pass, applied.instant);
+      await this.#flushOutbox();
       return;
     }
 
@@ -1369,7 +1400,8 @@ export class CoreLoop {
     // `CADENCE-1` (ADR-026 D2.12): then the carried-over and heartbeat
     // evaluations, in configured order, sourced at this event (D3.2). This
     // event IS the harvest point below, so their own fills and order views are
-    // harvested there, at this event's instant, with every other one.
+    // harvested there, at this event's instant, with every other one: no
+    // carried harvest is needed.
     await this.#runCarriedPass(applied, decided);
 
     // --- fills the venue produced, plus their accounting -------------------
@@ -1480,9 +1512,18 @@ export class CoreLoop {
    * - otherwise — the frame's tail after its last harvest-reaching event is
    *   events for markets this trader does not run, or the frame has no
    *   harvest point at all — the harvest runs first, exactly where ADR-024
-   *   ran it, and the carried evaluations after it. Their own fills and order
-   *   views are delivered at the NEXT harvest point, never stamped at an
-   *   instant before their source; their decisions are flushed here.
+   *   ran it, and the carried evaluations after it. r2 (RA): their OWN fills
+   *   and order views are then booked and delivered at once, at their
+   *   source's instant, by a carried harvest that reads nothing else
+   *   (`#harvestCarriedEffects`); their decisions are flushed here.
+   *
+   * Either way the own effects a carried evaluation has at its close — the
+   * fills the venue made for its orders at once, and its orders' views — are
+   * delivered at that close, stamped at its source's own instant: never at a
+   * later event, and never at another event's instant. (A fill the venue makes
+   * LATER — a resting order matched by a later trade, a DELAYED order's
+   * disposition — is delivered by the harvest that first reads it, as under
+   * ADR-024.)
    */
   async #closeFrame(): Promise<void> {
     const frame = this.#frame;
@@ -1514,7 +1555,15 @@ export class CoreLoop {
       return;
     }
     if (harvestAt !== undefined) await this.#harvestFills(harvestAt);
-    const evaluated = carriedSource !== undefined && (await this.#runCarriedPass(carriedSource, decided));
+    let evaluated = false;
+    if (carriedSource !== undefined) {
+      const pass = await this.#runCarriedPass(carriedSource, decided);
+      if (pass?.asked === true) {
+        evaluated = true;
+        // r2 (RA): the pass's own effects, at its source's instant, at once.
+        await this.#harvestCarriedEffects(pass, carriedSource.instant);
+      }
+    }
     if (harvestAt === undefined && !evaluated) return;
     await this.#flushOutbox();
   }
@@ -1542,6 +1591,10 @@ export class CoreLoop {
    * `CADENCE-1` (ADR-026 D2.4-D2.6, D5.6): one market OWED an `onFeatures`
    * evaluation at this close, at `source`.
    *
+   * - Every instance of the market is halted (or it has none): the owed
+   *   evaluation is DROPPED here, BEFORE the cadence is asked, exactly as the
+   *   market-halt gate drops a halted market's (r2, RC; D2.11 as corrected).
+   *   It is not coalesced: nothing is owed any more.
    * - The cadence does not allow it: it is COALESCED — counted once for this
    *   close, carried, still owed, to a later close — and the runtime is not
    *   asked (D5.4).
@@ -1549,7 +1602,8 @@ export class CoreLoop {
    *   records what actually happened (`#settleCadence`) — `last` moves only if
    *   a runtime was asked.
    *
-   * At the per-frame value 0 every owed market is evaluated, as ADR-024 did.
+   * At the per-frame value 0 every owed market is evaluated, as ADR-024 did
+   * (an all-halted market asked no runtime there either).
    */
   async #evaluateOwed(
     market: MarketState,
@@ -1558,6 +1612,10 @@ export class CoreLoop {
     epochMs: number,
   ): Promise<void> {
     const marketId = market.config.marketId;
+    if (!this.#hasEligibleInstance(marketId)) {
+      this.#cadence.dropOwed(marketId);
+      return;
+    }
     if (!this.#cadence.due(marketId, true)) {
       this.#cadence.carry(marketId);
       this.#options.health.countLoop("evaluationsCoalesced");
@@ -1578,6 +1636,9 @@ export class CoreLoop {
    *   feature snapshot, so no runtime was asked: this is NOT an evaluation.
    *   `last` does not move, and a market that was owed STAYS owed (D2.6), to be
    *   evaluated at the first later close that has the data (D2.4, D2.7).
+   * - `NOT_INVOKED` (r2, RB) — a runtime was asked, but refused for a cause
+   *   that can pass, before invoking the callback: settled exactly as
+   *   `NO_SNAPSHOT`. A PERMANENT refusal is `EVALUATED` (`REFUSAL_PERSISTENCE`).
    * - `NOT_ELIGIBLE` — every instance of the market is halted (or it has
    *   none): not an evaluation either, so `last` does not move, and an owed
    *   evaluation is DROPPED, as a halted market's is (D2.11, corrected).
@@ -1591,6 +1652,7 @@ export class CoreLoop {
         this.#cadence.markEvaluated(marketId);
         return;
       case "NO_SNAPSHOT":
+      case "NOT_INVOKED":
         if (owed) this.#cadence.carry(marketId);
         return;
       case "NOT_ELIGIBLE":
@@ -1609,17 +1671,27 @@ export class CoreLoop {
    * source and `evaluatedAt` are `applied`'s: the frame's last APPLIED event.
    * A market still owed and not allowed is coalesced again (counted for this
    * close). A halted market is not evaluated and its owed evaluation is
-   * dropped (D2.11); so is one whose every instance is halted, once its
-   * evaluation finds no instance to ask (`#settleCadence`, `NOT_ELIGIBLE`).
-   * Before the first evaluation, the cancels are swept at `applied`'s instant,
-   * as before any evaluation an event triggers. Each evaluation is recorded on
-   * the cadence clock by what it did (`#settleCadence`).
+   * dropped (D2.11); so is one whose every instance is halted — r2 (RC):
+   * BEFORE the cadence is asked, as in `#evaluateOwed`, so a debt not yet due
+   * does not outlive the halt either. Before the first evaluation, the
+   * cancels are swept at `applied`'s instant, as before any evaluation an
+   * event triggers. Each evaluation is recorded on the cadence clock by what it
+   * did (`#settleCadence`).
    *
-   * Answers whether a runtime was asked. At the per-frame value 0 nothing is
+   * r2 (RA): while it evaluates, every venue order its decisions place or
+   * cancel is recorded (`#carriedEffects`, filled by `#absorbVenueAnswer`), so
+   * a close that is not a harvest point at `applied`'s instant can deliver
+   * exactly those effects there (`#harvestCarriedEffects`).
+   *
+   * Answers what it did — whether a runtime was asked, and those orders — or
+   * `undefined` when no market was due. At the per-frame value 0 nothing is
    * carried and there is no heartbeat, so it evaluates nothing.
    */
-  async #runCarriedPass(applied: AppliedEventPosition, decided: ReadonlySet<string>): Promise<boolean> {
-    if (this.#cadence.perFrame) return false;
+  async #runCarriedPass(
+    applied: AppliedEventPosition,
+    decided: ReadonlySet<string>,
+  ): Promise<CarriedEffects | undefined> {
+    if (this.#cadence.perFrame) return undefined;
     const due: [string, MarketState, boolean][] = [];
     for (const [marketId, market] of this.#options.markets) {
       if (decided.has(marketId)) continue;
@@ -1628,33 +1700,54 @@ export class CoreLoop {
         continue;
       }
       const carried = this.#cadence.isCarried(marketId);
+      if (carried && !this.#hasEligibleInstance(marketId)) {
+        this.#cadence.dropOwed(marketId);
+        continue;
+      }
       if (this.#cadence.due(marketId, carried)) {
         due.push([marketId, market, carried]);
       } else if (carried) {
         this.#options.health.countLoop("evaluationsCoalesced");
       }
     }
-    if (due.length === 0) return false;
+    if (due.length === 0) return undefined;
     // --- every cancel reaches a terminal fact (WP-220 obligation 10) -------
     this.#sweepCancels(applied.instant, applied.epochMs);
-    let asked = false;
-    for (const [marketId, market, carried] of due) {
-      // An evaluation earlier in this pass, or the sweep, may have halted it.
-      if (this.#options.halts.isMarketHalted(marketId)) {
-        this.#cadence.dropOwed(marketId);
-        continue;
+    const effects: CarriedEffects = { asked: false, placed: new Set(), touched: new Set() };
+    this.#carriedEffects = effects;
+    try {
+      for (const [marketId, market, carried] of due) {
+        // An evaluation earlier in this pass, or the sweep, may have halted it.
+        if (this.#options.halts.isMarketHalted(marketId)) {
+          this.#cadence.dropOwed(marketId);
+          continue;
+        }
+        const evaluated = await this.#evaluateMarket(
+          market,
+          applied.source,
+          { kind: "onFeatures" },
+          applied.instant,
+          applied.epochMs,
+        );
+        this.#settleCadence(marketId, evaluated, carried);
+        if (evaluated === "EVALUATED") effects.asked = true;
       }
-      const evaluated = await this.#evaluateMarket(
-        market,
-        applied.source,
-        { kind: "onFeatures" },
-        applied.instant,
-        applied.epochMs,
-      );
-      this.#settleCadence(marketId, evaluated, carried);
-      if (evaluated === "EVALUATED") asked = true;
+    } finally {
+      this.#carriedEffects = undefined;
     }
-    return asked;
+    return effects;
+  }
+
+  /**
+   * `CADENCE-1` r2 (RC; ADR-026 D2.11 as corrected): can any instance of
+   * `marketId` be evaluated — is at least one not halted? A market with no
+   * instance has none.
+   */
+  #hasEligibleInstance(marketId: string): boolean {
+    for (const instance of this.#options.registry.forMarket(marketId)) {
+      if (!this.#options.halts.isInstanceHalted(instance.instanceId, marketId)) return true;
+    }
+    return false;
   }
 
   /**
@@ -1901,7 +1994,9 @@ export class CoreLoop {
    * been asked but none had a computable snapshot, `NOT_ELIGIBLE` when every
    * instance is halted (or there is none) — so the cadence moves a market's
    * `last` only on a real evaluation (`#settleCadence`). Only an `onFeatures`
-   * caller reads it.
+   * caller reads it. r2 (RB): a runtime that refused for a cause that can pass
+   * was asked but invoked nothing, so unless another instance was evaluated
+   * the answer is `NOT_INVOKED`, not `EVALUATED` (`REFUSAL_PERSISTENCE`).
    */
   async #evaluateMarket(
     market: MarketState,
@@ -1933,7 +2028,14 @@ export class CoreLoop {
         source,
       });
       const outcome = instance.runtime.evaluate(input);
-      evaluated = "EVALUATED";
+      // r2 (RB): a refusal for a cause that can pass invoked no callback, so
+      // it is no evaluation; a PERMANENT one counts as the market's evaluation
+      // (`REFUSAL_PERSISTENCE`). Either way it is counted and handled below.
+      if (outcome.kind !== "REFUSED" || REFUSAL_PERSISTENCE[outcome.refusal.code] === "PERMANENT") {
+        evaluated = "EVALUATED";
+      } else if (evaluated === "NOT_ELIGIBLE") {
+        evaluated = "NOT_INVOKED";
+      }
       await this.#consumeOutcome(instance, market, outcome, source, instant, epochMs);
     }
     return evaluated;
@@ -2661,6 +2763,16 @@ export class CoreLoop {
     result: ExecutionResult,
     submissionAttemptId: string,
   ): void {
+    // `CADENCE-1` r2 (RA): during a carried pass, the orders this answer
+    // booked (a placement, on any outcome) or cancelled (a CANCEL, on any
+    // outcome) are that pass's own effects (`#harvestCarriedEffects`).
+    const carried = this.#carriedEffects;
+    if (carried !== undefined) {
+      for (const order of result.orders) {
+        carried.touched.add(order.simulatedOrderId);
+        if (input.plan.planKind !== "CANCEL") carried.placed.add(order.simulatedOrderId);
+      }
+    }
     if (!result.accepted) {
       this.#options.health.countExecution("submissionsRefused");
       if (input.plan.planKind === "CANCEL") {
@@ -3074,8 +3186,153 @@ export class CoreLoop {
    * — a second event with the same `receivedAt` — REPLACES that row
    * (`SNAP-1` r1; `#flushPnlSnapshots`), so the instant's one row holds the
    * state after its last fill.
+   *
+   * `CADENCE-1` r2 (RA): the booking phase is `#bookFills`, which the CARRIED
+   * harvest (`#harvestCarriedEffects`) shares — the same staging, the same one
+   * write before any delivery. A carried harvest runs only where no ordinary
+   * harvest runs at its instant (an event for no configured market, or the
+   * close of a frame whose own harvest ran at a different instant), and a
+   * later write at an instant already written replaces the row as above, so
+   * "one row per instance per instant" holds.
    */
   async #harvestFills(instant: string): Promise<void> {
+    const page = this.#readFills(instant);
+    if (page === undefined) return;
+    // `CADENCE-1` r2 (RA): a fill a carried harvest already read
+    // (`#bookedAhead`) is skipped — not counted, booked or delivered again.
+    // Empty, so a no-op, unless a carried harvest booked ahead of the cursor.
+    const fills =
+      this.#bookedAhead.size === 0
+        ? page.fills
+        : page.fills.filter((fill) => !this.#bookedAhead.has(fill.simulatedFillId));
+    const booked = await this.#bookFills(fills, instant, undefined);
+    if (booked === undefined) return;
+    this.#knownFills = page.next;
+    // Every id booked ahead lay in this page, at or past the old cursor.
+    this.#bookedAhead.clear();
+
+    // --- every order this harvest SETTLED gives its capacity back -----------
+    // Between a fill's posting and its order's terminal release BOTH the new
+    // position and the still-held reservation describe the same capital, and
+    // §9.14 forbids double reservation. Running the release here — after every
+    // fill of this harvest is in the ledger, before any evaluation reads the
+    // account — closes the window in the fail-closed direction at both ends:
+    // nothing is released before the position that replaces it exists.
+    this.#releaseSettledReservations();
+    // SIM-1 r2 (`SIM1-R2-1`): a cancel or a fill of this iteration can leave a
+    // watched basket short; judged before anything below is delivered. Since
+    // r3 (`SIM1-R3-1`) every venue door is judged at its own answer, so this
+    // is the BACKSTOP: kept because the deliveries below evaluate strategies,
+    // and a venue whose state moved some other way must not reach them first.
+    this.#judgeBasketWatches(instant);
+
+    await this.#deliverBookedFills(booked, instant);
+    await this.#deliverOrderViews(instant);
+  }
+
+  /**
+   * `CADENCE-1` r2 (RA; ADR-026 D4, ruling A1 — "fills, order updates … are
+   * never delayed"): the CARRIED HARVEST. A carried pass whose close is not a
+   * harvest point at its source's instant — an event for no configured
+   * market, or a frame whose tail after its last harvest-reaching event is
+   * such events, or which has none — delivers its OWN effects here, at its
+   * source's instant, at once:
+   *
+   * - the fills of the orders its decisions placed (`placed`) are booked and
+   *   offered (`onFill`), exactly as an ordinary harvest books and offers
+   *   them, with the same §4.2 gate;
+   * - the views of the orders its decisions placed or cancelled (`touched`)
+   *   are delivered (`onOrderUpdate`), with the same R1 rules, the same
+   *   terminal release and the same §4.2 gate as `#deliverOrderViews`.
+   *
+   * Nothing else. The cadence still adds NO harvest point for anything that is
+   * not the pass's own: every other fill and every other view — an earlier
+   * decision's, a working order's repeat — waits for, and is delivered at,
+   * the harvest point ADR-024 gives it, at its instant (r1, J1). So no fill
+   * outside `placed` is booked here, no reservation outside `touched` is
+   * released (`#releaseSettledReservations` is the ordinary harvest's), and no
+   * order is SETTLED here: settlement stays with the ordinary harvest, which
+   * books every fill before it judges (b). Like the ordinary harvest, it
+   * judges the watched baskets before it delivers anything (the `SIM1-R3-1`
+   * backstop).
+   *
+   * The venue's fill cursor is one sequence. When nothing before the pass's
+   * own fills is unread, the cursor moves past them, as an ordinary harvest
+   * would. When an earlier fill — which keeps its ADR-024 harvest point — is
+   * still unread, the cursor stays, and the own fills are booked AHEAD of it
+   * (`#bookedAhead`): the next ordinary harvest books the earlier fill and
+   * skips these.
+   *
+   * A view is delivered here only when every fill it reports is booked
+   * (`#fullyBooked`): a touched order whose venue view reports a fill this
+   * process has not read yet — one that keeps its ADR-024 harvest point —
+   * waits, with its release, for the ordinary harvest that books the fill.
+   * Fail closed: nothing is released before the position that replaces it
+   * exists.
+   */
+  async #harvestCarriedEffects(effects: CarriedEffects, instant: string): Promise<void> {
+    if (effects.touched.size === 0) return;
+    const page = this.#readFills(instant);
+    if (page === undefined) return;
+    const own = page.fills.filter((fill) => effects.placed.has(fill.simulatedOrderId));
+    const booked = await this.#bookFills(own, instant, this.#bookedAhead);
+    if (booked === undefined) return;
+    if (page.fills.every((fill) => this.#bookedAhead.has(fill.simulatedFillId))) {
+      // Nothing before them is unread: the cursor moves past the page.
+      this.#knownFills = page.next;
+      this.#bookedAhead.clear();
+    }
+    // The ordinary harvest's BACKSTOP (`SIM1-R3-1`), for the same reason: this
+    // harvest read the venue, and the deliveries below evaluate strategies.
+    this.#judgeBasketWatches(instant);
+    await this.#deliverBookedFills(booked, instant);
+    await this.#deliverOrderViews(instant, effects.touched);
+  }
+
+  /**
+   * The fills a harvest booked, offered to their instances (`onFill`), in
+   * booking order — each stopped by the §4.2 halt gate. Shared by the ordinary
+   * harvest and the carried one (`CADENCE-1` r2, RA).
+   */
+  async #deliverBookedFills(booked: readonly BookedFill[], instant: string): Promise<void> {
+    for (const delivery of booked) {
+      // --- WP-220 obligation 8, and the §4.2 gate it stops at ---------------
+      //
+      // The fill is offered even while the instance is PAUSED: the runtime
+      // refuses a paused instance without invoking the callback, and that
+      // refusal is RECORDED rather than treated as an error — the accounting
+      // above already happened, which is the half a paused strategy would
+      // otherwise lose.
+      //
+      // A HALTED SCOPE IS A DIFFERENT FACT (review round 1, MEDIUM-1). The
+      // posting above is unconditional — the money moved, and §6 invariant 8
+      // makes the ledger the source of truth whatever this process's own state
+      // is — but §4.2's rule is that a process which can no longer know its
+      // state MAKES NO TRADING DECISION for the halted scope. At the reviewed
+      // tip a halt latched EARLIER IN THIS SAME ITERATION (a refused ledger
+      // projection, a failed PnL write) did not stop the delivery: the strategy
+      // was evaluated and an `exit` decision was persisted AFTER a
+      // GLOBAL/FULL_HALT. The books stay truthful; the strategy does not act.
+      if (
+        this.#options.halts.isInstanceHalted(
+          delivery.instance.instanceId,
+          delivery.instance.marketId,
+        )
+      ) {
+        this.#options.health.countLoop("deliveriesSuppressedByHalt");
+        continue;
+      }
+      await this.#deliverFill(delivery.instance, delivery.fill, instant);
+    }
+  }
+
+  /**
+   * The venue's fills since `#knownFills` (SIM-2's non-destructive cursor), or
+   * `undefined` after HALTING when the venue refuses the cursor — older than
+   * its retained window, so fills this process never read are gone. Nothing
+   * is booked or released then.
+   */
+  #readFills(instant: string): { readonly fills: readonly SimulatedFill[]; readonly next: number } | undefined {
     const page = this.#options.venue.fillsSince(this.#knownFills);
     if (!page.ok) {
       this.#options.halts.halt(
@@ -3088,14 +3345,29 @@ export class CoreLoop {
       );
       // `SNAP-1`: nothing is staged here — nothing was booked, and every
       // earlier harvest flushed before it returned.
-      return;
+      return undefined;
     }
-    const fills = page.value.fills;
+    return page.value;
+  }
+
+  /**
+   * Books `fills`, in order, then writes the staged §9.16 snapshots ONCE
+   * (`SNAP-1`) — exactly the booking phase of a harvest (see `#harvestFills`).
+   * Answers the fills booked to an instance, for delivery, or `undefined` after
+   * a store failure halted GLOBAL (the snapshots staged so far are written).
+   * `admitted`, when given, receives the id of every fill the deduplicator
+   * admitted (`CADENCE-1` r2, RA: a carried harvest's `#bookedAhead`).
+   */
+  async #bookFills(
+    fills: readonly SimulatedFill[],
+    instant: string,
+    admitted: Set<string> | undefined,
+  ): Promise<BookedFill[] | undefined> {
     // `THROUGHPUT-1a`: every earlier decision is durable before this harvest
     // writes a ledger posting or a PnL snapshot — the commit order the per-row
     // path always had.
     if (fills.length > 0 && this.#options.store.groupCommit !== undefined) await this.#commitStaged();
-    const booked: { instance: RegisteredInstance; fill: SimulatedFill }[] = [];
+    const booked: BookedFill[] = [];
     for (const fill of fills) {
       this.#options.health.countExecution("fillsObserved");
 
@@ -3105,6 +3377,10 @@ export class CoreLoop {
         this.#options.health.countExecution("duplicateFillsRefused");
         continue;
       }
+      // `CADENCE-1` r2 (RA): a carried harvest records each fill it has READ
+      // — admitted, whatever its booking then does — so the next ordinary
+      // harvest neither counts nor re-reads it (`#bookedAhead`).
+      admitted?.add(fill.simulatedFillId);
 
       const ownerId = this.#orderOwners.get(fill.simulatedOrderId);
       const instance = ownerId === undefined ? undefined : this.#options.registry.get(ownerId);
@@ -3114,7 +3390,7 @@ export class CoreLoop {
           // `SNAP-1`: the rows staged by the fills booked before this one are
           // written, as base had already written them.
           await this.#flushPnlSnapshots(instant);
-          return;
+          return undefined;
         }
         continue;
       }
@@ -3191,7 +3467,7 @@ export class CoreLoop {
           // postings, as in base); the rows staged by the fills booked before
           // it are written, as base had already written them.
           await this.#flushPnlSnapshots(instant);
-          return;
+          return undefined;
         }
       }
 
@@ -3214,54 +3490,7 @@ export class CoreLoop {
     // fill of the harvest is booked, before anything below releases, judges
     // or delivers (so a failed write halts before this harvest's `onFill`).
     await this.#flushPnlSnapshots(instant);
-    this.#knownFills = page.value.next;
-
-    // --- every order this harvest SETTLED gives its capacity back -----------
-    // Between a fill's posting and its order's terminal release BOTH the new
-    // position and the still-held reservation describe the same capital, and
-    // §9.14 forbids double reservation. Running the release here — after every
-    // fill of this harvest is in the ledger, before any evaluation reads the
-    // account — closes the window in the fail-closed direction at both ends:
-    // nothing is released before the position that replaces it exists.
-    this.#releaseSettledReservations();
-    // SIM-1 r2 (`SIM1-R2-1`): a cancel or a fill of this iteration can leave a
-    // watched basket short; judged before anything below is delivered. Since
-    // r3 (`SIM1-R3-1`) every venue door is judged at its own answer, so this
-    // is the BACKSTOP: kept because the deliveries below evaluate strategies,
-    // and a venue whose state moved some other way must not reach them first.
-    this.#judgeBasketWatches(instant);
-
-    for (const delivery of booked) {
-      // --- WP-220 obligation 8, and the §4.2 gate it stops at ---------------
-      //
-      // The fill is offered even while the instance is PAUSED: the runtime
-      // refuses a paused instance without invoking the callback, and that
-      // refusal is RECORDED rather than treated as an error — the accounting
-      // above already happened, which is the half a paused strategy would
-      // otherwise lose.
-      //
-      // A HALTED SCOPE IS A DIFFERENT FACT (review round 1, MEDIUM-1). The
-      // posting above is unconditional — the money moved, and §6 invariant 8
-      // makes the ledger the source of truth whatever this process's own state
-      // is — but §4.2's rule is that a process which can no longer know its
-      // state MAKES NO TRADING DECISION for the halted scope. At the reviewed
-      // tip a halt latched EARLIER IN THIS SAME ITERATION (a refused ledger
-      // projection, a failed PnL write) did not stop the delivery: the strategy
-      // was evaluated and an `exit` decision was persisted AFTER a
-      // GLOBAL/FULL_HALT. The books stay truthful; the strategy does not act.
-      if (
-        this.#options.halts.isInstanceHalted(
-          delivery.instance.instanceId,
-          delivery.instance.marketId,
-        )
-      ) {
-        this.#options.health.countLoop("deliveriesSuppressedByHalt");
-        continue;
-      }
-      await this.#deliverFill(delivery.instance, delivery.fill, instant);
-    }
-
-    await this.#deliverOrderViews(instant);
+    return booked;
   }
 
   /**
@@ -3653,8 +3882,9 @@ export class CoreLoop {
   /**
    * `SNAP-1`: the harvest's ONE PnL-snapshot write — each staged instance's
    * rows, in the order of each instance's last fill. Called exactly once per
-   * harvest, at the end of its booking phase (`#harvestFills`), so nothing is
-   * ever left staged when a harvest returns — at the end of a run included.
+   * harvest, at the end of its booking phase (`#bookFills`, for the ordinary
+   * harvest and, `CADENCE-1` r2, the carried one), so nothing is ever left
+   * staged when a harvest returns — at the end of a run included.
    *
    * THE KEY. `accounting.pnl_snapshots_scope_unique` is `unique nulls not
    * distinct (scope, environment, account_ref, instance_id, market_id,
@@ -3795,10 +4025,18 @@ export class CoreLoop {
    * order the snapshot scan visited them in, so the evaluation order, the
    * decision sequence and `ctx.orders()` are unchanged). An order submitted
    * by a delivery is not in it, exactly as it was not in the snapshot.
+   *
+   * `CADENCE-1` r2 (RA): `only`, from a carried harvest
+   * (`#harvestCarriedEffects`), narrows the boundary to the orders a carried
+   * pass placed or cancelled — each one the venue has just answered for, so
+   * it still holds it; one this process does not own is skipped below, as
+   * here always. A view among them is delivered only when every fill it
+   * reports is booked (`#fullyBooked`), and nothing is settled — the
+   * ordinary harvest settles.
    */
-  async #deliverOrderViews(instant: string): Promise<void> {
+  async #deliverOrderViews(instant: string, only?: ReadonlySet<string>): Promise<void> {
     const boundary: SimulatedOrder[] = [];
-    for (const venueOrderId of inVenueOrder(this.#orderOwners.keys())) {
+    for (const venueOrderId of inVenueOrder(only ?? this.#orderOwners.keys())) {
       const order = this.#ownedOrder(venueOrderId, instant);
       if (order !== undefined) boundary.push(order);
     }
@@ -3811,6 +4049,9 @@ export class CoreLoop {
       if (instance === undefined) continue;
       const market = this.#options.markets.get(instance.marketId);
       if (market === undefined) continue;
+      // r2 (RA): fail closed — a view reporting a fill not yet booked, and the
+      // release its terminal status brings, wait for the ordinary harvest.
+      if (only !== undefined && !this.#fullyBooked(order)) continue;
       const view = toStrategyOrderView(order, {
         marketId: instance.marketId,
         placedAt: instant,
@@ -3850,9 +4091,26 @@ export class CoreLoop {
       await this.#consumeOutcome(instance, market, outcome, null, instant, this.#lastEpochMs);
     }
 
+    if (only !== undefined) return;
     for (const order of boundary) {
       if (this.#retired.has(order.simulatedOrderId)) this.#settle(order);
     }
+  }
+
+  /**
+   * `CADENCE-1` r2 (RA): have the fill shares BOOKED for `order` reached the
+   * venue's `filledShares` — condition (b) of `settlementBlocker`, compared as
+   * exact decimals? A quantity that is not a canonical decimal cannot prove
+   * it, so it answers `false` (fail closed).
+   */
+  #fullyBooked(order: SimulatedOrder): boolean {
+    const booked = this.#bookedShares.get(order.simulatedOrderId);
+    return (
+      booked !== undefined &&
+      isCanonicalDecimalString(booked) &&
+      isCanonicalDecimalString(order.filledShares) &&
+      compareDecimal(booked, order.filledShares) === 0
+    );
   }
 
   /**
@@ -4639,8 +4897,60 @@ type AppliedEventPosition = OwedEvaluation["at"];
  * a runtime was asked, or none could be because no instance had a computable
  * snapshot, or because every instance is halted. Only the first is an
  * evaluation (ADR-026 D2.3, D5.4).
+ *
+ * r2 (RB): `NOT_INVOKED` — a runtime WAS asked, but it refused before invoking
+ * the callback, for a cause that can pass ({@link REFUSAL_PERSISTENCE}). No
+ * callback ran, so that is no evaluation either, and the cadence treats it as
+ * it treats `NO_SNAPSHOT`.
  */
-type MarketEvaluation = "EVALUATED" | "NO_SNAPSHOT" | "NOT_ELIGIBLE";
+type MarketEvaluation = "EVALUATED" | "NO_SNAPSHOT" | "NOT_INVOKED" | "NOT_ELIGIBLE";
+
+/**
+ * `CADENCE-1` r2 (RB; ADR-026 D2.3, D5.4-D5.5): whether a runtime's `REFUSED`
+ * answer — always given BEFORE the callback is invoked (`WP-170` decision 5) —
+ * can pass before the run ends.
+ *
+ * - `TRANSIENT`: a later evaluation may well run. The cadence does not move
+ *   the market's `last`, and an owed market stays owed (`#settleCadence`), as
+ *   for a missing snapshot. `CLOCK_INVALID` is a monotonic clock that threw or
+ *   answered a non-`bigint`; `INPUT_INVALID` is an input the runtime could not
+ *   acquire; `EVALUATION_REENTRANT` is a nested `evaluate()`.
+ * - `PERMANENT`: the runtime refuses every later evaluation of the run the
+ *   same way — a PAUSED or STOPPED instance (resumption is a new run), an
+ *   exhausted evaluation sequence. The cadence counts the refusal as the
+ *   market's evaluation and moves `last`: keeping it owed would ask a runtime
+ *   that can only refuse again at every close, which ADR-024 never did.
+ *
+ * A `Record` over the runtime's whole refusal vocabulary, so a code added
+ * there fails to compile here until it is classified.
+ */
+const REFUSAL_PERSISTENCE: Readonly<Record<EvaluationRefusalCode, "TRANSIENT" | "PERMANENT">> = Object.freeze({
+  CLOCK_INVALID: "TRANSIENT",
+  INPUT_INVALID: "TRANSIENT",
+  EVALUATION_REENTRANT: "TRANSIENT",
+  INSTANCE_PAUSED: "PERMANENT",
+  INSTANCE_STOPPED: "PERMANENT",
+  EVALUATION_SEQ_EXHAUSTED: "PERMANENT",
+});
+
+/** One fill a harvest booked to an instance, awaiting its `onFill` delivery. */
+interface BookedFill {
+  readonly instance: RegisteredInstance;
+  readonly fill: SimulatedFill;
+}
+
+/**
+ * `CADENCE-1` r2 (RA): what one carried pass did (`#runCarriedPass`) — whether
+ * it asked a runtime, and the venue orders its decisions touched: `placed`,
+ * the orders a placement booked (their fills are the pass's own), and
+ * `touched`, those plus the orders a CANCEL cancelled (their views are the
+ * pass's own).
+ */
+interface CarriedEffects {
+  asked: boolean;
+  readonly placed: Set<string>;
+  readonly touched: Set<string>;
+}
 
 /** One market's owed evaluation: the market, and the last frame event that owed it. */
 interface OwedEvaluation {

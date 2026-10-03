@@ -39,11 +39,22 @@
  *   whose every instance is halted is not evaluated (its owed evaluation is
  *   dropped);
  * - J1 — the harvest points are ADR-024's: the cadence adds none, moves none
- *   and re-stamps none; a carried-over or heartbeat evaluation whose source is
- *   not at its close's harvest instant has its own effects delivered at the
- *   next harvest point;
+ *   and re-stamps none (r1 delivered a carried-over or heartbeat evaluation's
+ *   own effects at the NEXT harvest point; r2 replaces that, below);
  * - O02, O04, O05 — the coalescence count over a longer frame, a lifecycle
  *   event at a carried market, and `[A, A]` under the per-frame value 0.
+ *
+ * `CADENCE-1` r2 adds, each against a finding of the round-2 review:
+ *
+ * - RA — a carried-over or heartbeat evaluation whose source is not at its
+ *   close's harvest instant has its OWN fills and order views (the orders it
+ *   placed or cancelled) booked and delivered at once, at its source's
+ *   instant: repeated heartbeats see the position, the end of input loses
+ *   nothing, and every other fill and view keeps its ADR-024 harvest point;
+ * - RB — a runtime refusal for a cause that can pass (`CLOCK_INVALID`) is no
+ *   evaluation; a refusal for good (`INSTANCE_PAUSED`) is;
+ * - RC — a market whose every instance is halted has its owed evaluation
+ *   dropped before the cadence is asked, also when it is not yet due.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -57,6 +68,7 @@ import {
   unmodeledRateLimits,
   type BookView,
   type FeeScheduleSnapshot,
+  type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
 import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
@@ -216,11 +228,24 @@ function hold(ctx: StrategyContext): DecisionResult {
  * — a resting maker BUY (10 YES at 0.30), or with `immediate` a taker BUY that
  * fills at once against the 0.34 ask — so a carried-over or heartbeat
  * evaluation's OWN effects can be followed to the harvest that delivers them.
+ * r2: `at` may list several instants; each places one order.
  */
 interface PlaceOnFeatures {
   readonly market: string;
-  readonly at: string;
+  readonly at: string | readonly string[];
   readonly immediate: boolean;
+}
+
+/**
+ * `CADENCE-1` r2 (RA): one market's callback acts at one instant —
+ * `cancelOnFeatures`: its `onFeatures` emits a market-scope CANCEL;
+ * `placeOnFill`: its `onFill` places a taker BUY that fills at once (with
+ * `restsRemainder`, a GTC one: what the book cannot fill RESTS).
+ */
+interface ActAt {
+  readonly market: string;
+  readonly at: string;
+  readonly restsRemainder?: boolean;
 }
 
 /**
@@ -235,8 +260,15 @@ function recordingStrategy(
   marketId: string,
   placeOnOpen: boolean,
   onFeaturesAt?: PlaceOnFeatures,
+  acts: {
+    readonly cancelAt?: string;
+    readonly placeOnFillAt?: string;
+    readonly placeOnFillResting?: boolean;
+    readonly throwAt?: string;
+  } = {},
 ): Strategy<unknown, Record<string, never>> {
-  const buy = (ctx: StrategyContext, intentId: string, immediate: boolean): Intent => ({
+  const placeAt = onFeaturesAt === undefined ? [] : typeof onFeaturesAt.at === "string" ? [onFeaturesAt.at] : onFeaturesAt.at;
+  const buy = (ctx: StrategyContext, intentId: string, immediate: boolean, restsRemainder = false): Intent => ({
     type: "POSITION",
     intentId,
     marketId,
@@ -250,7 +282,7 @@ function recordingStrategy(
     partialFillPolicy: "ACCEPT_ANY",
     validUntil: new Date(Date.parse(ctx.now()) + 600_000).toISOString(),
     expectedNetEdge: "5",
-    tags: ["cadence1.entry", immediate ? "sb.order-type:FAK" : "sb.order-type:GTC"],
+    tags: ["cadence1.entry", immediate && !restsRemainder ? "sb.order-type:FAK" : "sb.order-type:GTC"],
   });
   return {
     name: "cadence1-recording-double",
@@ -261,15 +293,35 @@ function recordingStrategy(
     onTimer: hold,
     onStop: hold,
     onFeatures(ctx: StrategyContext): DecisionResult {
-      if (onFeaturesAt === undefined || ctx.now() !== onFeaturesAt.at) return hold(ctx);
+      if (acts.throwAt !== undefined && ctx.now() === acts.throwAt) {
+        throw new Error("cadence1: this onFeatures fails, so the runtime contains it and PAUSES the instance");
+      }
+      if (acts.cancelAt !== undefined && ctx.now() === acts.cancelAt) {
+        return {
+          decisionType: "exit",
+          reasonCodes: ["CADENCE1.CANCEL"],
+          featureSnapshotRef: ctx.features().snapshotRef,
+          intents: [{ type: "CANCEL", marketId, reason: "cadence1: cancel this market's working orders" }],
+        };
+      }
+      const index = placeAt.indexOf(ctx.now());
+      if (onFeaturesAt === undefined || index < 0) return hold(ctx);
       return {
         decisionType: "enter",
         reasonCodes: ["CADENCE1.PLACE"],
         featureSnapshotRef: ctx.features().snapshotRef,
-        intents: [buy(ctx, "cadence1-features-buy", onFeaturesAt.immediate)],
+        intents: [buy(ctx, index === 0 ? "cadence1-features-buy" : `cadence1-features-buy-${String(index)}`, onFeaturesAt.immediate)],
       };
     },
-    onFill: (ctx: StrategyContext) => hold(ctx),
+    onFill(ctx: StrategyContext): DecisionResult {
+      if (acts.placeOnFillAt === undefined || ctx.now() !== acts.placeOnFillAt) return hold(ctx);
+      return {
+        decisionType: "enter",
+        reasonCodes: ["CADENCE1.PLACE"],
+        featureSnapshotRef: ctx.features().snapshotRef,
+        intents: [buy(ctx, "cadence1-fill-buy", true, acts.placeOnFillResting === true)],
+      };
+    },
     onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
     onMarketClosing: (ctx: StrategyContext) => hold(ctx),
     onMarketResolved: (ctx: StrategyContext) => hold(ctx),
@@ -293,12 +345,24 @@ interface Seen {
   readonly source: string | undefined;
 }
 
+/**
+ * `CADENCE-1` r2 (RA): what the same invocation was SHOWN — its position's
+ * YES shares and, for `onOrderUpdate`, the order's status — kept beside
+ * `seen` (the same index) so every existing comparison of `seen` is unchanged.
+ */
+interface Shown {
+  readonly yesShares: string;
+  readonly orderStatus: string | undefined;
+}
+
 interface Harness {
   readonly loop: CoreLoop;
   readonly venue: SimulatedVenue;
   readonly store: MemoryTraderStore;
   readonly halts: HaltController;
   readonly seen: Seen[];
+  /** `CADENCE-1` r2: what each invocation in `seen` was shown, at the same index. */
+  readonly shown: Shown[];
   readonly alarms: CadenceAlarm[];
 }
 
@@ -310,6 +374,14 @@ interface HarnessOptions {
   readonly placeOnFeatures?: PlaceOnFeatures;
   /** `CADENCE-1` r1 (J2): a second, SHADOW, instance on market A ("A2"), after A's own in §8.2 order. */
   readonly shadowOnA?: boolean;
+  /** `CADENCE-1` r2 (RA): one market's `onFeatures` cancels its working orders at one instant. */
+  readonly cancelOnFeatures?: ActAt;
+  /** `CADENCE-1` r2 (RA): one market's `onFill` places a taker BUY at one instant. */
+  readonly placeOnFill?: ActAt;
+  /** `CADENCE-1` r2 (RB): one market's `onFeatures` throws at one instant (contained; the instance PAUSES). */
+  readonly throwOnFeatures?: ActAt;
+  /** `CADENCE-1` r2 (RA): the venue's history bounds (SIM-2). */
+  readonly venueRetention?: VenueRetentionBounds;
 }
 
 /** `createPaperTrader`'s assembly, with the recording double's runtimes registered. */
@@ -334,6 +406,7 @@ function assemble(options: HarnessOptions): Harness {
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const registry = new InstanceRegistry();
   const seen: Seen[] = [];
+  const shown: Shown[] = [];
   const instances: (readonly [string, string, string, "OWNER" | "SHADOW", number])[] = [
     [INSTANCE_A, RUN_A, MARKET_A, "OWNER", 0],
     [INSTANCE_B, RUN_B, MARKET_B, "OWNER", 0],
@@ -345,6 +418,15 @@ function assemble(options: HarnessOptions): Harness {
         marketId,
         options.placeOnOpen === true && instanceId === INSTANCE_A,
         options.placeOnFeatures?.market === marketId && ownership === "OWNER" ? options.placeOnFeatures : undefined,
+        ownership !== "OWNER"
+          ? {}
+          : {
+              ...(options.cancelOnFeatures?.market === marketId ? { cancelAt: options.cancelOnFeatures.at } : {}),
+              ...(options.placeOnFill?.market === marketId
+                ? { placeOnFillAt: options.placeOnFill.at, placeOnFillResting: options.placeOnFill.restsRemainder === true }
+                : {}),
+              ...(options.throwOnFeatures?.market === marketId ? { throwAt: options.throwOnFeatures.at } : {}),
+            },
       ),
       params: {},
       run: { runId, instanceId, configId: CONFIG_ID, runSeed: "7" },
@@ -361,6 +443,10 @@ function assemble(options: HarnessOptions): Harness {
         callback: input.callback,
         evaluatedAt: input.evaluatedAt,
         source: input.sourceEvent?.eventId,
+      });
+      shown.push({
+        yesShares: input.position.yesShares,
+        orderStatus: input.callback === "onOrderUpdate" ? input.order.status : undefined,
       });
       return evaluate(input);
     });
@@ -398,6 +484,7 @@ function assemble(options: HarnessOptions): Harness {
       sameInstantAdditionsFor: () => "NOT_OBSERVED" as const,
     },
     startingCash: "1000",
+    ...(options.venueRetention === undefined ? {} : { retention: options.venueRetention }),
     books: {
       book(request): BookView | undefined {
         const market = markets.get(request.marketId);
@@ -456,7 +543,7 @@ function assemble(options: HarnessOptions): Harness {
     onCadenceAlarm: (alarm) => alarms.push(alarm),
   });
   wiring.loop = loop;
-  return { loop, venue, store, halts, seen, alarms };
+  return { loop, venue, store, halts, seen, shown, alarms };
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +613,16 @@ const level = (offsetMs: number, marketId: string, price: string, frame?: string
     { internalMarketId: marketId, tokenId: TOKENS[marketId as keyof typeof TOKENS].yes, side: "BID", price, size: "100" },
     frame === undefined ? {} : { frame },
   );
+
+/** `CADENCE-1` r2: one ASK level of the market's YES book (the venue fills a taker BUY against it). */
+const askLevel = (offsetMs: number, marketId: string, price: string, size: string): IngestedEvent =>
+  event(offsetMs, "BookLevelChanged", {
+    internalMarketId: marketId,
+    tokenId: TOKENS[marketId as keyof typeof TOKENS].yes,
+    side: "ASK",
+    price,
+    size,
+  });
 
 const opened = (offsetMs: number, marketId: string): IngestedEvent =>
   event(offsetMs, "MarketOpened", { internalMarketId: marketId, conditionId: `0xcadence1${marketId.slice(-2)}`, openedAt: T_OPEN });
@@ -1216,6 +1313,27 @@ describe("r1 (J2), ADR-026 D2.3-D2.6: a market's `last` moves only when the loop
     expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
   });
 
+  it("a HEARTBEAT that finds A's only instance halted is no evaluation either: `last` stays, so after the release A's heartbeat comes at the next close (r2)", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
+    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 4_000));
+    // Both heartbeats due; A's one instance is halted, so only B is evaluated.
+    const first = snapshot(S + 5_000, MARKET_X, "yes");
+    await feed(harness, first);
+    expect(featureCalls(harness, start)).toEqual([["B", idOf(first), iso(S + 5_000)]]);
+    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
+    // `last` is still S for A: its heartbeat is due at once.
+    const next = snapshot(S + 5_100, MARKET_X, "yes");
+    await feed(harness, next);
+    expect(featureCalls(harness, start)).toEqual([
+      ["B", idOf(first), iso(S + 5_000)],
+      ["A", idOf(next), iso(S + 5_100)],
+    ]);
+  });
+
   it("with A's OWNER instance halted and its SHADOW instance evaluated, the market WAS evaluated: `last` moves", async () => {
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, shadowOnA: true });
@@ -1339,29 +1457,60 @@ describe("r1 (J1), ADR-026 D4.2: the harvest points are ADR-024's — the cadenc
     ]);
   });
 
-  it("a heartbeat at an event for no configured market: no harvest there; its own fill and order view come at the next harvest point, stamped there — never before their source", async () => {
+  it("in a LONGER frame whose last applied event reached the harvest point, the heartbeat runs BEFORE that harvest, beside the owed evaluation: the harvest then delivers every view at once — an older working order's and the heartbeat's new one (r2)", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_001);
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      placeOnOpen: true,
+      placeOnFeatures: { market: MARKET_B, at, immediate: false },
+    });
+    await feed(harness, ...opening(), opened(S + 100, MARKET_A), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    await feed(harness, [level(S + 5_000, MARKET_A, "0.31", "s2"), level(S + 5_001, MARKET_A, "0.3", "s2")]);
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["A", "onFeatures", at],
+      ["B", "onFeatures", at],
+      // The frame's one harvest, after every evaluation of the close: A's
+      // older working order, then B's new one, in venue order.
+      ["A", "onOrderUpdate", at],
+      ["B", "onOrderUpdate", at],
+    ]);
+  });
+
+  it("a heartbeat at an event for no configured market: its OWN fill and order view are booked and delivered there, at once, stamped at its source's instant (r2, RA; r1's deferral to the next harvest point is gone)", async () => {
     ordinal = 0;
     const at = iso(S + 5_000);
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true } });
     await feed(harness, ...opening(), opened(S + 150, MARKET_B));
     const start = harness.seen.length;
-    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
-    // B's heartbeat placed a taker order, which the venue filled at once. The
-    // order went out at once; nothing is delivered at this event.
+    const unknown = snapshot(S + 5_000, MARKET_X, "yes");
+    await feed(harness, unknown);
+    // B's heartbeat placed a taker order, which the venue filled at once: the
+    // fill is booked, and B's onFill and onOrderUpdate come at this event, at
+    // its instant — the instant of the heartbeat's own source.
     expect(harness.venue.fills).toHaveLength(1);
-    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback])).toEqual([
-      ["A", "onFeatures"],
-      ["B", "onFeatures"],
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.source, entry.evaluatedAt])).toEqual([
+      ["A", "onFeatures", idOf(unknown), at],
+      ["B", "onFeatures", idOf(unknown), at],
+      ["B", "onFill", undefined, at],
+      ["B", "onOrderUpdate", undefined, at],
     ]);
-    // The next harvest point: A's event (A coalesced). B's fill and its order's view, stamped there.
+    expect(harness.shown.slice(start + 2).map((entry) => [entry.yesShares, entry.orderStatus])).toEqual([
+      ["10", undefined],
+      ["10", "FILLED"],
+    ]);
+    const execution = harness.loop.health().execution;
+    expect(execution.fillsObserved).toBe(1);
+    expect(harness.loop.health().accounting.ledgerTransactions).toBeGreaterThan(0);
+    // The next harvest point (A's event; A coalesced) delivers nothing of B's
+    // again, and reads the fill neither as new nor as a duplicate.
     await feed(harness, level(S + 5_200, MARKET_A, "0.31"));
-    expect(harness.seen.slice(start + 2).map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
-      ["B", "onFill", iso(S + 5_200)],
-      ["B", "onOrderUpdate", iso(S + 5_200)],
-    ]);
+    expect(harness.seen.slice(start + 4)).toEqual([]);
+    expect(harness.loop.health().execution).toMatchObject({ fillsObserved: 1, duplicateFillsRefused: 0 });
   });
 
-  it("a mixed frame whose tail is for no configured market: the frame's harvest runs at its own instant, first; the heartbeat's own new order is delivered at the next harvest point", async () => {
+  it("a mixed frame whose tail is for no configured market: the frame's harvest runs at its own instant, first; the heartbeat's own new order is delivered right after, at the heartbeat's source's instant (r2, RA)", async () => {
     const run = async (cadence: EvaluationCadenceOption) => {
       ordinal = 0;
       const harness = assemble({
@@ -1380,15 +1529,337 @@ describe("r1 (J1), ADR-026 D4.2: the harvest points are ADR-024's — the cadenc
       ["A", "onFeatures", iso(S + 5_000)],
       // The frame's harvest: A's resting order, at A's event, exactly where ADR-024 ran it.
       ["A", "onOrderUpdate", iso(S + 5_000)],
-      // Then B's heartbeat, at the frame's last applied event; it places a resting order.
+      // Then B's heartbeat, at the frame's last applied event; it places a resting order...
       ["B", "onFeatures", iso(S + 5_100)],
-      // The next harvest point (the reference trade; A and B coalesced there): both orders' views.
+      // ...whose view comes at once, at that event's instant: the carried harvest.
+      ["B", "onOrderUpdate", iso(S + 5_100)],
+      // The next harvest point (the reference trade; A and B coalesced there):
+      // both WORKING orders' views, as every harvest delivers them.
       ["A", "onOrderUpdate", iso(S + 5_300)],
       ["B", "onOrderUpdate", iso(S + 5_300)],
     ]);
-    // A's own callbacks are exactly per-frame's.
+    // A's own callbacks are exactly per-frame's: the carried harvest delivered
+    // no view of A's older order.
     const perFrame = await run(PER_FRAME);
     const ofA = (harness: Harness, from: number) => others(harness, from).filter((entry) => entry.instanceId === INSTANCE_A);
     expect(ofA(paper.harness, paper.start)).toEqual(ofA(perFrame.harness, perFrame.start));
+  });
+});
+
+describe("r2 (RA), ADR-026 D4 and ruling A1: a carried-over or heartbeat evaluation's own fills and order views are never delayed", () => {
+  it("repeated heartbeats at events for no configured market: the first one's own fill is booked and delivered at its close, and every later heartbeat sees the position", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    for (const offset of [5_000, 10_000, 15_000, 20_000]) await feed(harness, snapshot(S + offset, MARKET_X, "yes"));
+    const ofB = harness.seen
+      .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+      .slice(start)
+      .filter(({ entry }) => entry.instanceId === INSTANCE_B)
+      .map(({ entry, shown }) => [entry.callback, entry.evaluatedAt, shown?.yesShares]);
+    expect(ofB).toEqual([
+      ["onFeatures", at, "0"],
+      ["onFill", at, "10"],
+      ["onOrderUpdate", at, "10"],
+      ["onFeatures", iso(S + 10_000), "10"],
+      ["onFeatures", iso(S + 15_000), "10"],
+      ["onFeatures", iso(S + 20_000), "10"],
+    ]);
+    const health = harness.loop.health();
+    expect(health.execution).toMatchObject({ fillsObserved: 1, duplicateFillsRefused: 0 });
+    expect(health.accounting.ledgerTransactions).toBeGreaterThan(0);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 1, released: 1 });
+    // B's next own event: B is evaluated on the booked position, and nothing
+    // of the old order is delivered again.
+    const bookB = level(S + 26_000, MARKET_B, "0.31");
+    const before = harness.seen.length;
+    await feed(harness, bookB);
+    expect(harness.seen.slice(before).map((entry, index) => [label(entry.instanceId), entry.callback, harness.shown[before + index]?.yesShares])).toEqual([
+      ["B", "onFeatures", "10"],
+      ["A", "onFeatures", "0"],
+    ]);
+  });
+
+  it("under a BACKWARD step in event time, a heartbeat's own fill and view are still stamped at their source's instant — never at a later-arriving, earlier-stamped event's (r2, RD)", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    // The next event steps back 100 ms; it is a harvest point (A's book).
+    await feed(harness, level(S + 4_900, MARKET_A, "0.31"));
+    expect(harness.seen.slice(start).filter((entry) => entry.callback !== "onFeatures").map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["B", "onFill", at],
+      ["B", "onOrderUpdate", at],
+    ]);
+  });
+
+  it("at the END of input — the run's last event is for no configured market — the heartbeat's own fill is booked and delivered before the drain returns", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), snapshot(S + 5_000, MARKET_X, "yes"));
+    // No event follows.
+    expect(harness.seen.filter((entry) => entry.callback === "onFill" || entry.callback === "onOrderUpdate").map((entry) => [label(entry.instanceId), entry.callback, entry.evaluatedAt])).toEqual([
+      ["B", "onFill", at],
+      ["B", "onOrderUpdate", at],
+    ]);
+    const health = harness.loop.health();
+    expect(health.execution.fillsObserved).toBe(1);
+    expect(health.accounting.ledgerTransactions).toBeGreaterThan(0);
+    expect(health.seams.reservations).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+  });
+
+  it("a frame of events for no configured market (no harvest point at all): the heartbeat's own fill is delivered at the frame's close, at its last applied event's instant", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at: iso(S + 5_001), immediate: true } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    const x1 = snapshot(S + 5_000, MARKET_X, "yes", "u2");
+    const x2 = snapshot(S + 5_001, MARKET_X, "no", "u2");
+    await feed(harness, [x1, x2]);
+    expect(harness.seen.slice(start).map((entry) => [label(entry.instanceId), entry.callback, entry.source, entry.evaluatedAt])).toEqual([
+      ["A", "onFeatures", idOf(x2), iso(S + 5_001)],
+      ["B", "onFeatures", idOf(x2), iso(S + 5_001)],
+      ["B", "onFill", undefined, iso(S + 5_001)],
+      ["B", "onOrderUpdate", undefined, iso(S + 5_001)],
+    ]);
+    expect(harness.loop.health().execution.fillsObserved).toBe(1);
+  });
+
+  it("a heartbeat that CANCELS an older working order: the order's terminal view comes at once, at the heartbeat's instant, and its reservation is released there", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_100);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnOpen: true, cancelOnFeatures: { market: MARKET_A, at } });
+    await feed(harness, ...opening(), opened(S + 100, MARKET_A));
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 1, released: 0 });
+    const start = harness.seen.length;
+    await feed(harness, snapshot(S + 5_100, MARKET_X, "yes"));
+    expect(harness.seen.slice(start).map((entry, index) => [label(entry.instanceId), entry.callback, entry.evaluatedAt, harness.shown[start + index]?.orderStatus])).toEqual([
+      ["A", "onFeatures", at, undefined],
+      ["B", "onFeatures", at, undefined],
+      // After the pass, as after any close's evaluations: the carried harvest.
+      ["A", "onOrderUpdate", at, "CANCELED"],
+    ]);
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+    // Retired there, but SETTLED only by the ordinary harvest, which books every fill first.
+    expect(harness.loop.health().seams.orders).toMatchObject({ settled: 0, settleMismatches: 0 });
+    // Retired: the next harvest point does not deliver it again.
+    const before = harness.seen.length;
+    await feed(harness, reference(S + 5_200));
+    expect(harness.seen.slice(before).filter((entry) => entry.callback !== "onFeatures")).toEqual([]);
+    expect(harness.loop.health().seams.orders).toMatchObject({ settled: 1, settleMismatches: 0 });
+  });
+
+  it("an EARLIER decision's fill keeps its ADR-024 harvest point: an onFill decision's own fill, unread at a later heartbeat, is booked at the next harvest point, after the heartbeat's own fill was booked ahead of it — none twice", async () => {
+    ordinal = 0;
+    const first = iso(S + 5_000);
+    const second = iso(S + 10_000);
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      placeOnFeatures: { market: MARKET_B, at: [first, second], immediate: true },
+      // B's onFill at the first heartbeat's fill places another taker order:
+      // an onFill decision's effect, which ADR-024 delivers at the NEXT harvest point.
+      placeOnFill: { market: MARKET_B, at: first },
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    // Three fills at the venue: the first heartbeat's, the onFill decision's, the second heartbeat's.
+    expect(harness.venue.fills).toHaveLength(3);
+    const bookB = level(S + 10_100, MARKET_B, "0.31");
+    await feed(harness, bookB);
+    const fills = harness.seen
+      .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+      .slice(start)
+      .filter(({ entry }) => entry.callback === "onFill")
+      .map(({ entry, shown }) => [entry.evaluatedAt, shown?.yesShares]);
+    expect(fills).toEqual([
+      // The first heartbeat's own fill, at once.
+      [first, "10"],
+      // The second heartbeat's own fill, at once — booked AHEAD of the onFill
+      // decision's fill, which is still unread, so the position shows 20.
+      [second, "20"],
+      // The onFill decision's fill, at the next harvest point, as ADR-024 times it.
+      [iso(S + 10_100), "30"],
+    ]);
+    // Each fill read, booked and delivered once: no duplicate, no recount.
+    expect(harness.loop.health().execution).toMatchObject({ fillsObserved: 3, duplicateFillsRefused: 0 });
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, taken: 3, released: 3 });
+  });
+
+  it("a heartbeat CANCELS an order whose fill is still unread (an onFill decision's GTC order, partly filled at once): that fill keeps its ADR-024 harvest point, and the order's view — and its release — wait for it", async () => {
+    ordinal = 0;
+    const first = iso(S + 5_000);
+    const second = iso(S + 10_000);
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      placeOnFeatures: { market: MARKET_B, at: first, immediate: true },
+      placeOnFill: { market: MARKET_B, at: first, restsRemainder: true },
+      cancelOnFeatures: { market: MARKET_B, at: second },
+    });
+    // B's asks: 5 shares at 0.34, then 0.40 — so a 10-share BUY limited to 0.35 fills 5.
+    await feed(
+      harness,
+      ...opening(),
+      opened(S + 150, MARKET_B),
+      askLevel(S + 200, MARKET_B, "0.4", "500"),
+      askLevel(S + 210, MARKET_B, "0.34", "5"),
+    );
+    const start = harness.seen.length;
+    // The first heartbeat's FAK BUY fills 5 and is CANCELLED short; its own fill
+    // and view come at once. Its onFill places a GTC BUY: 5 filled at once (an
+    // onFill decision's fill, unread until the next harvest point), 5 resting.
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    expect(harness.venue.fills).toHaveLength(2);
+    // The second heartbeat cancels B's working order — the GTC one, whose fill is unread.
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    expect(harness.venue.ordersSnapshot().map((order) => `${order.state} ${order.filledShares}/${order.requestedShares}`)).toEqual([
+      "CANCELLED 5/10",
+      "CANCELLED 5/10",
+    ]);
+    // Neither that fill nor the cancelled order's view came at the cancel's close:
+    // the view reports a fill not yet booked, so its reservation is held too.
+    expect(harness.loop.health().execution.fillsObserved).toBe(1);
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 1 });
+    // B's own event: the ordinary harvest books the fill, then delivers the view.
+    await feed(harness, level(S + 10_100, MARKET_B, "0.31"));
+    const ofB = harness.seen
+      .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+      .slice(start)
+      .filter(({ entry }) => entry.instanceId === INSTANCE_B && entry.callback !== "onFeatures")
+      .map(({ entry, shown }) => [entry.callback, entry.evaluatedAt, shown?.yesShares, shown?.orderStatus]);
+    expect(ofB).toEqual([
+      ["onFill", first, "5", undefined],
+      ["onOrderUpdate", first, "5", "CANCELED"],
+      ["onFill", iso(S + 10_100), "10", undefined],
+      ["onOrderUpdate", iso(S + 10_100), "10", "CANCELED"],
+    ]);
+    expect(harness.loop.health().execution).toMatchObject({ fillsObserved: 2, duplicateFillsRefused: 0 });
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, reservedCollateral: "0" });
+    expect(harness.loop.health().seams.orders).toMatchObject({ settled: 2, settleMismatches: 0 });
+  });
+
+  it("with nothing earlier unread, a carried harvest moves the fill cursor past its own fills: a venue that retains ONE fill still answers the next one", async () => {
+    ordinal = 0;
+    const first = iso(S + 5_000);
+    const second = iso(S + 10_000);
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      placeOnFeatures: { market: MARKET_B, at: [first, second], immediate: true },
+      venueRetention: { fills: 1 },
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    expect(harness.halts.records()).toEqual([]);
+    expect(harness.seen.filter((entry) => entry.callback === "onFill").map((entry) => entry.evaluatedAt)).toEqual([first, second]);
+    expect(harness.loop.health().execution.fillsObserved).toBe(2);
+  });
+});
+
+describe("r2 (RB), ADR-026 D2.3 with D5.4-D5.5: a runtime refusal for a cause that can pass is no evaluation; a refusal for good is", () => {
+  /** A clock whose `n`-th read from now throws once (the runtime then refuses `CLOCK_INVALID`). */
+  class FailsOnceClock extends ManualClock {
+    failIn = 0;
+    override monotonicNs(): bigint {
+      if (this.failIn > 0) {
+        this.failIn -= 1;
+        if (this.failIn === 0) throw new Error("cadence1: one unreadable runtime start clock");
+      }
+      return super.monotonicNs();
+    }
+  }
+
+  it("CLOCK_INVALID before the callback: `last` does not move, so A's next change, 10 ms later, is evaluated — not coalesced", async () => {
+    ordinal = 0;
+    const clock = new FailsOnceClock(T_OPEN);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, clock });
+    await feed(harness, ...opening());
+    const count = harness.store.decisions.length;
+    clock.failIn = 2;
+    await feed(harness, level(S + 1_000, MARKET_A, "0.31"));
+    expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
+    expect(harness.store.decisions).toHaveLength(count);
+    const next = level(S + 1_010, MARKET_A, "0.3");
+    await feed(harness, next);
+    expect(harness.store.decisions).toHaveLength(count + 1);
+    expect(harness.store.decisions.at(-1)?.record.sourceEvent?.eventId).toBe(idOf(next));
+  });
+
+  it("CLOCK_INVALID before the callback: A STAYS OWED, so a later close that owes it nothing evaluates it once due", async () => {
+    ordinal = 0;
+    const clock = new FailsOnceClock(T_OPEN);
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, clock });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    clock.failIn = 2;
+    await feed(harness, level(S + 1_000, MARKET_A, "0.31"));
+    const unknown = snapshot(S + 1_500, MARKET_X, "yes");
+    await feed(harness, unknown);
+    // The refused call, then the carried one at the event for no configured market.
+    expect(featureCalls(harness, start).filter(([market]) => market === "A")).toEqual([
+      ["A", featureCalls(harness, start)[0]?.[1], iso(S + 1_000)],
+      ["A", idOf(unknown), iso(S + 1_500)],
+    ]);
+    expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
+  });
+
+  it("INSTANCE_PAUSED is a refusal for good: it counts as A's evaluation, so A is not asked again inside the interval", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, throwOnFeatures: { market: MARKET_A, at: iso(S + 1_000) } });
+    await feed(harness, ...opening());
+    // A's onFeatures throws: contained, and the runtime PAUSES the instance.
+    await feed(harness, level(S + 1_000, MARKET_A, "0.31"));
+    expect(harness.loop.health().loop.containedEvaluations).toBe(1);
+    // Due again: the paused runtime refuses, and that IS A's evaluation.
+    await feed(harness, level(S + 2_000, MARKET_A, "0.3"));
+    expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
+    // 100 ms later: coalesced, not asked again.
+    const coalesced = harness.loop.health().loop.evaluationsCoalesced;
+    await feed(harness, level(S + 2_100, MARKET_A, "0.31"));
+    expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced + 1);
+  });
+});
+
+describe("r2 (RC), ADR-026 D2.11 as corrected: a market whose every instance is halted has its owed evaluation dropped before the cadence is asked", () => {
+  it("an owed evaluation NOT YET DUE, while A's only instance is halted, is dropped: after the release, nothing is evaluated for it", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    const before = harness.loop.health().loop.evaluationsCoalesced;
+    const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
+    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 100));
+    await feed(harness, snapshot(S + 200, MARKET_A, "yes"));
+    expect(harness.seen.slice(start)).toEqual([]);
+    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
+    await feed(harness, snapshot(S + 1_000, MARKET_X, "yes"));
+    expect(featureCalls(harness, start)).toEqual([]);
+    // Dropped, not coalesced: nothing was owed any more.
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(before);
+  });
+
+  it("a CARRIED evaluation, not yet due, of a market whose only instance is then halted is dropped by the carried pass: after the release, nothing is evaluated for it", async () => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
+    await feed(harness, ...opening());
+    const start = harness.seen.length;
+    // A owed inside the interval: coalesced and carried.
+    await feed(harness, snapshot(S + 200, MARKET_A, "yes"));
+    const coalesced = harness.loop.health().loop.evaluationsCoalesced;
+    const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
+    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 250));
+    // A close that owes A nothing, still inside the interval: the carried pass drops A's debt.
+    await feed(harness, snapshot(S + 300, MARKET_X, "yes"));
+    expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
+    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
+    await feed(harness, snapshot(S + 1_000, MARKET_X, "yes"));
+    expect(featureCalls(harness, start)).toEqual([]);
   });
 });
