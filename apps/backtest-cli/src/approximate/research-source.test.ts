@@ -476,6 +476,25 @@ describe("several datasets of one epoch form one unbroken chain", () => {
     if (!result.ok) expect(result.refusal.code).toBe("APPROX_REPLAY_RELEASE_ORDER_VIOLATED");
   });
 
+  it("refuses a chain whose second dataset re-releases the first's last release frame", async () => {
+    const root = freshRoot();
+    const first = await writeResearchDataset({
+      root,
+      datasetId: "split-a",
+      samples: [trade({ ordinal: 0, seq: "5", atMs: 1_000 }, { conditionId: CONDITION, tokenId: YES, price: "0.5", size: "1" })],
+    });
+    const second = await writeResearchDataset({
+      root,
+      datasetId: "split-b",
+      segmentIndex: 1,
+      stateIn: first.stateOut,
+      samples: [trade({ ordinal: 0, seq: "5", atMs: 1_000, segment: `${EPOCH}-000001` }, { conditionId: CONDITION, tokenId: YES, price: "0.6", size: "1", entryIndex: 1 })],
+    });
+    const result = await sourceOf(root, [first.manifestObjectKey, second.manifestObjectKey]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.detail).toContain("split across two datasets");
+  });
+
   it("refuses no input and a key named twice", async () => {
     expect((await sourceOf(freshRoot(), [])).ok).toBe(false);
     const root = freshRoot();

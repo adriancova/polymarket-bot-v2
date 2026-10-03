@@ -425,6 +425,7 @@ async function readDatasetRows(
 
 /** A release frame being assembled from consecutive samples. */
 interface OpenFrame {
+  readonly datasetId: string;
   readonly seq: string;
   readonly at: string;
   readonly atMs: number;
@@ -485,6 +486,14 @@ function orderReleaseFrames(
       const atMs = isoToEpochMilliseconds(at);
       if (atMs === undefined) return violated("a sample's availableAt is not an ISO-8601 instant", sample);
 
+      if (open !== null && open.datasetId !== sample.datasetId && compareUnsignedIntegerStrings(seq, open.seq) === 0) {
+        return violated(
+          "one release frame is split across two datasets of the chain; a frame is consumed by exactly one " +
+            "dataset's sampler, so the chain does not describe one recording",
+          sample,
+          { previousDatasetId: open.datasetId },
+        );
+      }
       if (open === null || compareUnsignedIntegerStrings(seq, open.seq) !== 0) {
         if (open !== null && compareUnsignedIntegerStrings(seq, open.seq) < 0) {
           return violated(
@@ -495,7 +504,16 @@ function orderReleaseFrames(
           );
         }
         if (open !== null) close(open);
-        open = { seq, at, atMs, segment: text(row, "releaseSegmentId"), samples: [], previousKey: null, boundaries: new Map() };
+        open = {
+          datasetId: sample.datasetId,
+          seq,
+          at,
+          atMs,
+          segment: text(row, "releaseSegmentId"),
+          samples: [],
+          previousKey: null,
+          boundaries: new Map(),
+        };
       } else if (at !== open.at || text(row, "releaseSegmentId") !== open.segment) {
         return violated("samples released at one frame disagree on that frame's receipt instant or segment", sample, {
           availableAt: at,

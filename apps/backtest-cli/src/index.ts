@@ -10,6 +10,11 @@
  * and builds it itself (`assembly.ts`), so its `run` command backtests the
  * core the paper trader runs.
  *
+ * Since `APPROX-REPLAY-1` it also replays a research-tier (APPROXIMATE)
+ * dataset through the same core (`approximate/`, ADR-029): every output of
+ * that path is labelled `approximate` from its manifests and is never
+ * evidence; the exact paths keep refusing an approximate manifest.
+ *
  * SAFETY (§11, §6 invariant 17, ADR-010, `AGENTS.md`): `BACKTEST` mode,
  * simulated venue, no credentials, no venue connection, no signer, no order.
  * `MAX_RUN_MODE`, `ALLOW_REAL_ORDERS` and both live-micro caps are treated as a
