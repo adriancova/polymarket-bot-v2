@@ -216,6 +216,31 @@ describe("ADR-027 Decision 1: the six transitions, each one alone", () => {
     expect(candidate("2026-01-02T03:03:05.1234567Z")).toEqual([]);
   });
 
+  it("a checkpoint port that tampers with the checkpoint it was handed cannot move the next verdict, or make evaluate() throw", () => {
+    const saved: StrategyStateCheckpoint[] = [];
+    const tampering = {
+      save(checkpoint: StrategyStateCheckpoint): void {
+        saved.push(checkpoint);
+        // The object is the port's to hold, not to rewrite — but it is not frozen.
+        Object.defineProperty(checkpoint, "stateJson", { value: '{"tampered":true}' });
+        Object.defineProperty(checkpoint, "rngState", {
+          get(): never {
+            throw new Error("TAMPERED_RNG_STATE");
+          },
+        });
+      },
+    };
+    const { runtime } = makeHarness({ checkpointStore: tampering });
+    let outcomes: EvaluationOutcome[] = [];
+    expect(() => {
+      outcomes = [runtime.evaluate(makeInput("onFeatures")), runtime.evaluate(makeInput("onFeatures"))];
+    }).not.toThrow();
+    // The second, no-change hold is judged against what the runtime itself
+    // checkpointed — not against the bytes the port wrote back.
+    expect(outcomes.map(transitionsOf)).toEqual([["START"], []]);
+    expect(saved).toHaveLength(1);
+  });
+
   it("the pure rule: each transition is reported alone, and STOP is reported even when nothing else moved", () => {
     const mark: CheckpointMark = { stateJson: '{"a":1}', status: "ACTIVE", rngState: [1, 2, 3, 4], evaluatedAt: T0 };
     const same = { callback: "onFeatures" as const, evaluatedAt: T0, stateJson: '{"a":1}', status: "ACTIVE" as const, rngState: [1, 2, 3, 4] as const };

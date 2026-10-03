@@ -879,17 +879,22 @@ class StrategyInstanceRuntime {
       return { ok: true, checkpoint: null };
     }
     const checkpoint = this.buildCheckpoint(recordedSeq);
+    // The next comparison base, from the runtime's OWN values — taken before
+    // the checkpoint object is handed to a caller-supplied port, so nothing
+    // that port does to it (it is not frozen) can move what the next verdict
+    // compares against, or make a read here throw.
+    const mark: CheckpointMark = {
+      stateJson: this.stateJson,
+      status: this.status,
+      rngState: this.rng.snapshot(),
+      evaluatedAt,
+    };
     try {
       this.saveCheckpoint(checkpoint);
     } catch (cause) {
       return { ok: false, cause };
     }
-    this.lastCheckpoint = {
-      stateJson: checkpoint.stateJson,
-      status: checkpoint.status,
-      rngState: checkpoint.rngState,
-      evaluatedAt,
-    };
+    this.lastCheckpoint = mark;
     return { ok: true, checkpoint };
   }
 
