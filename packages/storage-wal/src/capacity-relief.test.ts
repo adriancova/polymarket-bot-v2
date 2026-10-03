@@ -12,8 +12,10 @@
  * - an earlier epoch's segments under the root count, so a restart cannot
  *   start the count from zero (each epoch writes its own directory);
  * - nothing ever lowers the count but a direct read that finds a file gone,
- *   so it never drops below the disk: not under concurrent appends, a deletion
- *   during a rotation, a stale or partial listing, or a failed read.
+ *   or the writer's own truncation of a torn tail on its fault path, recorded
+ *   at the truncated size (r2, N-4), so it never drops below the disk: not
+ *   under concurrent appends, a deletion during a rotation, a stale or partial
+ *   listing, or a failed read.
  *
  * Every test checks the two invariants that matter after each step: the
  * segment bytes on disk under the root never exceed `maxTotalBytes`, and the
@@ -78,8 +80,8 @@ async function openEpoch(
     maxTotalBytes: CAP,
     capacityRootPath: ROOT,
     maxSegmentBytes: SEGMENT_BYTES,
-    // No time rotation: its one bounded residual (`wal-format.md` §11.1) is
-    // not what these tests are about.
+    // No time rotation here: `capacity-in-flight.test.ts` holds the cap
+    // against it (r2, TR).
     maxSegmentAgeMs: 1_000_000_000,
     ...overrides,
   });

@@ -21,10 +21,14 @@
  * - **What raises an entry.** This writer's own writes (exact, because the
  *   writer is the only appender to its own segments), or a `fileByteLength`
  *   that reads more than the entry holds.
- * - **What lowers the count.** Only a direct `fileByteLength` of a path that
- *   answers "absent". A directory listing never removes anything: a path the
- *   ledger knows and a listing omits is read directly, and kept if it is still
- *   there. So a stale or partial listing can only keep bytes, never drop them.
+ * - **What lowers the count.** Two things, and nothing else. A direct
+ *   `fileByteLength` of a path that answers "absent" removes its entry; that
+ *   is raw-WAL expiry. And the writer's own truncation of a torn tail, on its
+ *   fault path, records the truncated file at its new, exact size
+ *   (`writer.ts`, `#finalizeFaultedSegment`; `WALCAP-1` r2, finding N-4). A
+ *   directory listing never removes anything: a path the ledger knows and a
+ *   listing omits is read directly, and kept if it is still there. So a stale
+ *   or partial listing can only keep bytes, never drop them.
  * - **Sealed files are exact.** A segment whose sidecar manifest exists can no
  *   longer grow (`wal-format.md` §6; the manifest is written last). Its size is
  *   read once with the manifest present and then trusted until the file is

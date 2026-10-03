@@ -100,7 +100,9 @@ export type WalWriterOptions = {
    * under {@link WalWriterOptions.capacityRootPath} counts (`WALCAP-1`).
    * Admission adds every accepted frame the ledger does not hold yet — queued,
    * or taken by a drain that is still writing it — and the framing they will
-   * cause.
+   * cause, including a new segment's when a time rotation closes the open one
+   * before they are written. A time rotation that would pass the threshold
+   * waits until it fits (`WALCAP-1` r2).
    */
   readonly maxTotalBytes?: number | null;
   /**
@@ -174,6 +176,13 @@ export type WalWriterMetrics = {
   readonly capacityRescanFailures: number;
   /** Bytes the count gave back because their segment files were found gone. */
   readonly capacityRelievedBytes: number;
+  /**
+   * Segments whose time rotation waited because opening the next segment for
+   * the frames still unwritten would have passed `maxTotalBytes` (`WALCAP-1`
+   * r2). Counted once per segment. Such a segment is closed by time once those
+   * frames are written. Always `0` with no threshold.
+   */
+  readonly timeRotationsDeferred: number;
   /**
    * Frame bytes that may still be admitted under `maxTotalBytes`, given what is
    * on disk, what a drain has taken and not yet recorded, what is queued, and
@@ -303,27 +312,62 @@ const WIDEST_TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const WIDEST_CLOSE_REASON: WalCloseReason = "manual-rotation";
 
 /**
- * How the frames that are accepted but not yet written will pack into segments.
+ * How the frames that are accepted but not yet written will pack into segments,
+ * from one starting point.
  *
  * `newSegments` is how many further segments they need beyond the open one, and
  * `roomLeft` is the frame bytes that still fit in the last of them. `overhead`
  * is the header-plus-footer reservation those new segments cost.
  *
- * The projection exists because segment count is a *packing* question, not a
+ * Packing exists because segment count is a *packing* question, not a
  * division: a segment holds whole records, so 10 records of 415 bytes need ten
  * 900-byte segments, not the `ceil(4150 / 900) = 5` a byte-count division
  * predicts. Getting that wrong is what let a queued burst overshoot
  * `maxTotalBytes` (`docs/contracts/wal-format.md` §11.1).
  */
-type CapacityProjection = {
-  readonly newSegments: number;
-  readonly roomLeft: number;
-  readonly overhead: number;
+type Packing = {
+  newSegments: number;
+  roomLeft: number;
+  overhead: number;
   /**
    * The next frame lands in a segment that holds no record yet, so it is
    * admitted however large it is — §8's "a record is never split" exception.
    */
-  readonly nextRecordAlwaysFits: boolean;
+  nextRecordAlwaysFits: boolean;
+};
+
+/** Frames packed with no segment open: the first of them starts a new one. */
+const PACKED_FROM_NO_SEGMENT: Readonly<Packing> = {
+  newSegments: 0,
+  roomLeft: 0,
+  overhead: 0,
+  nextRecordAlwaysFits: false,
+};
+
+/**
+ * The framing the unwritten frames will cause, under both things that can
+ * happen to the open segment before the first of them is written (`WALCAP-1`
+ * r2, finding TR).
+ *
+ * - `bySize`: the open segment takes them while they fit, by the size rule.
+ * - `closedFirst`: the open segment is closed before the first of them, by a
+ *   time rotation in `drain()` or `tick()`, so they start a new segment.
+ *   Admission cannot rule that out. A segment can age between a frame's
+ *   admission and its write, and it may be aged already. `null` when nothing
+ *   can close the open segment first: none is open, or the open one holds no
+ *   record yet, which no rotation closes.
+ *
+ * What is reserved is the larger of the two. Before `WALCAP-1` r2 it was
+ * `bySize` alone. A time rotation that fired with frames still unwritten then
+ * wrote a header and a footer nobody had reserved: 6,359 bytes on disk under
+ * a 6,000-byte cap, after `close()` as well as before it. The contract named
+ * this as §11.1's one exception.
+ */
+type CapacityProjection = {
+  readonly bySize: Readonly<Packing>;
+  readonly closedFirst: Readonly<Packing> | null;
+  /** `max(bySize.overhead, closedFirst.overhead)`. */
+  readonly overhead: number;
 };
 
 /** Bytes of the header line for a segment, at its widest. */
@@ -594,6 +638,9 @@ export class WalWriter {
   #inFlight: readonly QueuedFrame[] = [];
   #inFlightNext = 0;
   #inFlightBytes = 0;
+  /** Time rotations that waited for `maxTotalBytes`, counted once per segment (`#mayCloseByTime`). */
+  #timeRotationsDeferred = 0;
+  #activeTimeRotationDeferred = false;
   #overflowSignals = 0;
   #capacityRefusals = 0;
   #closedRefusals = 0;
@@ -884,7 +931,9 @@ export class WalWriter {
 
   /**
    * Advance time-driven policy without new frames: rotate an aged segment,
-   * fsync when the interval has elapsed.
+   * fsync when the interval has elapsed. A rotation that would take the
+   * frames still unwritten past `maxTotalBytes` waits (`#mayCloseByTime`), and
+   * the fsync then runs if it is due.
    *
    * The gateway calls this on its own cadence. Without it an idle recorder would
    * hold unsynced bytes past the published data-loss bound.
@@ -899,7 +948,10 @@ export class WalWriter {
       try {
         if (
           active.recordCount > 0 &&
-          monotonic - active.openedMonotonicMs >= this.#options.maxSegmentAgeMs
+          monotonic - active.openedMonotonicMs >= this.#options.maxSegmentAgeMs &&
+          // A rotation waiting for the cap (`#mayCloseByTime`) still lets the
+          // fsync below run: the data-loss bound does not wait for it.
+          this.#mayCloseByTime()
         ) {
           await this.#finalizeActive("time-rotation");
         } else if (
@@ -1117,6 +1169,7 @@ export class WalWriter {
       capacityRescans: this.#capacityRescans,
       capacityRescanFailures: this.#capacityRescanFailures,
       capacityRelievedBytes: this.#capacityRelievedBytes,
+      timeRotationsDeferred: this.#timeRotationsDeferred,
       // Headroom for *frame bytes*, under the §11.1 definition of the bound:
       // what is on disk, plus what a drain took and has not recorded yet, plus
       // what is queued, plus the framing overhead those bytes will cause.
@@ -1255,8 +1308,11 @@ export class WalWriter {
    * widest (`Number.MAX_SAFE_INTEGER`) and a small fixed slack, so the
    * reservation is an over-estimate and never an under-estimate.
    *
-   * `docs/contracts/wal-format.md` §11.1 states the bound this enforces and the
-   * one case it does not cover.
+   * `docs/contracts/wal-format.md` §11.1 states the bound this enforces. The
+   * case it named as not covered, a time rotation with frames still unwritten,
+   * is covered since `WALCAP-1` r2: the packing also assumes the open segment
+   * is closed first (`CapacityProjection.closedFirst`), and a time rotation
+   * that admission could not foresee waits until it fits (`#mayCloseByTime`).
    */
   #reservedOverheadBytes(): number {
     const active = this.#active;
@@ -1273,8 +1329,7 @@ export class WalWriter {
    */
   #currentProjection(): CapacityProjection {
     if (this.#projection === null) {
-      const inFlight = this.#inFlight.slice(this.#inFlightNext).map((frame) => frame.bytes.length);
-      this.#projection = this.#packFrames([...inFlight, ...this.#queue.queuedByteLengths()]);
+      this.#projection = this.#packFrames(this.#unwrittenFrameLengths());
     }
     return this.#projection;
   }
@@ -1343,19 +1398,34 @@ export class WalWriter {
   }
 
   /**
-   * Pack `frameByteLengths` into segments the way `drain()` will, starting from
-   * the active segment's remaining room.
-   *
-   * Mirrors `#rotationReason`: a frame goes into the current segment when it
-   * still fits, otherwise it starts a new one — and a record larger than
-   * `maxSegmentBytes` is never split, so it occupies a segment of its own.
+   * Pack `frameByteLengths` into segments the way `drain()` will, under both
+   * starting points of {@link CapacityProjection}, continuing from `from`.
    */
   #packFrames(
     frameByteLengths: readonly number[],
     from: CapacityProjection = this.#emptyProjection(),
   ): CapacityProjection {
+    const bySize = this.#pack(frameByteLengths, from.bySize);
+    const closedFirst =
+      from.closedFirst === null ? null : this.#pack(frameByteLengths, from.closedFirst);
+    return {
+      bySize,
+      closedFirst,
+      overhead: Math.max(bySize.overhead, closedFirst?.overhead ?? 0),
+    };
+  }
+
+  /**
+   * Pack `frameByteLengths` into segments the way `drain()` will, from `start`.
+   *
+   * Mirrors the size rule of `#rotationReason`: a frame goes into the current
+   * segment when it still fits, otherwise it starts a new one — and a record
+   * larger than `maxSegmentBytes` is never split, so it occupies a segment of
+   * its own.
+   */
+  #pack(frameByteLengths: readonly number[], start: Readonly<Packing>): Packing {
     const maxSegmentBytes = this.#options.maxSegmentBytes;
-    let { newSegments, roomLeft, overhead, nextRecordAlwaysFits } = from;
+    let { newSegments, roomLeft, overhead, nextRecordAlwaysFits } = start;
     for (const length of frameByteLengths) {
       if (nextRecordAlwaysFits || length <= roomLeft) {
         roomLeft = Math.max(roomLeft - length, 0);
@@ -1373,16 +1443,88 @@ export class WalWriter {
     return { newSegments, roomLeft, overhead, nextRecordAlwaysFits };
   }
 
-  /** The projection for an empty backlog: whatever room the active segment has. */
+  /** The active segment's remaining room, as a starting point for packing. */
+  #packedFromActive(): Readonly<Packing> {
+    const active = this.#active;
+    if (active === null) {
+      return PACKED_FROM_NO_SEGMENT;
+    }
+    return {
+      newSegments: 0,
+      roomLeft: Math.max(this.#options.maxSegmentBytes - active.byteLength, 0),
+      overhead: 0,
+      nextRecordAlwaysFits: active.recordCount === 0,
+    };
+  }
+
+  /**
+   * The projection for an empty backlog. `closedFirst` exists exactly when a
+   * rotation can close the open segment before the backlog's first frame: it
+   * holds a record (`#rotationReason`, `tick()`).
+   */
   #emptyProjection(): CapacityProjection {
     const active = this.#active;
     return {
-      newSegments: 0,
-      roomLeft:
-        active === null ? 0 : Math.max(this.#options.maxSegmentBytes - active.byteLength, 0),
+      bySize: this.#packedFromActive(),
+      closedFirst: active !== null && active.recordCount > 0 ? PACKED_FROM_NO_SEGMENT : null,
       overhead: 0,
-      nextRecordAlwaysFits: active !== null && active.recordCount === 0,
     };
+  }
+
+  /** Byte lengths of every accepted frame not yet written, in the order `drain()` writes them. */
+  #unwrittenFrameLengths(): number[] {
+    return [
+      ...this.#inFlight.slice(this.#inFlightNext).map((frame) => frame.bytes.length),
+      ...this.#queue.queuedByteLengths(),
+    ];
+  }
+
+  /**
+   * May the open, aged segment be closed by time now, ahead of the frames
+   * still unwritten (`WALCAP-1` r2, finding TR)?
+   *
+   * Closing it sends those frames to a new segment, and that segment's header
+   * and footer cost bytes. Admission reserves them whenever the open segment
+   * held a record (`CapacityProjection.closedFirst`). It cannot when the
+   * segment got its first record after some of the frames were admitted: a
+   * segment this same backlog opened, which ages before the backlog is
+   * written. So the rotation checks again, against everything admitted. It
+   * goes ahead when it costs no more framing than keeping the segment, or when
+   * the total stays within `maxTotalBytes`.
+   *
+   * Otherwise the time rotation waits. The frames go where admission placed
+   * them, by the size rule, and the segment is closed by time at the first
+   * `drain()` or `tick()` that finds it aged and the rotation affordable. With
+   * nothing unwritten, closing costs only the footer already reserved, so a
+   * deferral ends once the backlog is written. The age bound (§9.1) yields to
+   * the hard stop only here: within one segment's framing of the cap, with
+   * frames still unwritten. Every deferral is counted, once per segment, in
+   * `timeRotationsDeferred`.
+   */
+  #mayCloseByTime(): boolean {
+    const capacity = this.#options.maxTotalBytes;
+    if (capacity === null) {
+      return true;
+    }
+    const unwritten = this.#unwrittenFrameLengths();
+    const closed = this.#pack(unwritten, PACKED_FROM_NO_SEGMENT);
+    if (closed.overhead <= this.#pack(unwritten, this.#packedFromActive()).overhead) {
+      return true;
+    }
+    const projected =
+      this.#countedSegmentBytes() +
+      this.#inFlightBytes +
+      this.#queue.byteDepth +
+      (this.#active === null ? 0 : this.#activeFooterReserveBytes) +
+      closed.overhead;
+    if (projected <= capacity) {
+      return true;
+    }
+    if (!this.#activeTimeRotationDeferred) {
+      this.#activeTimeRotationDeferred = true;
+      this.#timeRotationsDeferred += 1;
+    }
+    return false;
   }
 
   /** Worst-case header + footer bytes for the segment at `segmentIndex`. */
@@ -1458,7 +1600,10 @@ export class WalWriter {
       return null;
     }
     const monotonic = this.#options.clock.monotonicMs();
-    if (monotonic - active.openedMonotonicMs >= this.#options.maxSegmentAgeMs) {
+    if (
+      monotonic - active.openedMonotonicMs >= this.#options.maxSegmentAgeMs &&
+      this.#mayCloseByTime()
+    ) {
       return "time-rotation";
     }
     if (active.byteLength + nextRecordBytes > this.#options.maxSegmentBytes) {
@@ -1595,6 +1740,7 @@ export class WalWriter {
     }
     this.#active = active;
     this.#activeFooterReserveBytes = footerReserveBytes(segmentId, this.#options.gatewayEpoch);
+    this.#activeTimeRotationDeferred = false;
     this.#invalidateProjection();
     this.#nextSegmentIndex += 1;
     this.#segmentsOpened += 1;

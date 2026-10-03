@@ -13,7 +13,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { segmentFileName } from "./manifest.js";
+import { listSegmentManifests, segmentFileName } from "./manifest.js";
 import { nodeWalFileSystem } from "./node-file-system.js";
 import { readSegmentRecords, validateSegment, validateWalDirectory } from "./reader.js";
 import { createManualClock } from "./testing/manual-clock.js";
@@ -219,5 +219,48 @@ describe("node filesystem port", () => {
     expect(second.metrics().totalSegmentBytes).toBe(await onDisk());
     expect(second.metrics().totalSegmentBytes).toBe(0);
     await second.close();
+  });
+  it("an aged segment and a burst at the cap: the time rotation's framing was reserved, so the disk stays under it (WALCAP-1 r2, TR)", async () => {
+    const fileSystem = nodeWalFileSystem();
+    const root = join(directory, "wal-root");
+    const epoch = "0190a3e0-0000-7000-8000-00000000000a";
+    const clock = createManualClock();
+    const cap = 6_000;
+    const writer = await openWalWriter({
+      directoryPath: join(root, epoch),
+      gatewayEpoch: epoch,
+      fileSystem,
+      clock,
+      maxTotalBytes: cap,
+      capacityRootPath: root,
+      maxSegmentBytes: 64_000_000,
+      maxSegmentAgeMs: 1_000,
+    });
+    let seq = 0;
+    const next = () => {
+      seq += 1;
+      return createTestFrame({ gatewayEpoch: epoch, ingestSeq: seq, payloadUtf8: `{"n":${String(seq)}}` });
+    };
+    expect(writer.enqueue(next()).accepted).toBe(true);
+    await writer.drain();
+    clock.advance(1_000);
+    let burst = 0;
+    for (let index = 0; index < 200 && writer.enqueue(next()).accepted; index += 1) burst += 1;
+    expect(burst).toBeGreaterThan(0);
+    expect(burst, "the cap refused within the loop").toBeLessThan(200);
+    await writer.drain();
+    await writer.close();
+    let onDisk = 0;
+    for (const name of await fileSystem.listFileNames(join(root, epoch))) {
+      if (name.endsWith(".wal.jsonl")) onDisk += (await stat(join(root, epoch, name))).size;
+    }
+    // Before r2: 6,359 bytes.
+    expect(onDisk).toBeLessThanOrEqual(cap);
+    expect(writer.metrics().totalSegmentBytes).toBe(onDisk);
+    const manifests = await listSegmentManifests(fileSystem, join(root, epoch));
+    expect(manifests.map((manifest) => [manifest.closeReason, manifest.recordCount])).toEqual([
+      ["time-rotation", 1],
+      ["shutdown", burst],
+    ]);
   });
 });

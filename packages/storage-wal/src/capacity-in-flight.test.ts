@@ -1,5 +1,6 @@
 /**
- * `WALCAP-1` round 1: the gaps the joint review found in `maxTotalBytes`.
+ * `WALCAP-1` rounds 1 and 2: the gaps the joint reviews found in
+ * `maxTotalBytes`.
  *
  * - **A-01, frames in flight.** `drain()` takes the queue with `takeAll()` and
  *   then awaits the filesystem. The gateway keeps enqueueing while it waits,
@@ -15,6 +16,13 @@
  * - **O-M1, the count at open fails closed.** A restart that cannot read the
  *   WAL root does not open: a count it could not read bounds nothing.
  * - **O-I4.** Two ticks at once re-derive the count once.
+ * - **TR (round 2), a time rotation.** A segment closed by age with frames
+ *   still unwritten sent them to a new segment whose framing nobody had
+ *   reserved: a 6,000-byte cap ended at 6,359 bytes, after `close()` too.
+ * - **N-1 (round 2).** A failed write's fallback counts, and that the count is
+ *   taken before the fault is raised.
+ * - **N-2 (round 2).** The in-flight frames that landed are not reserved for
+ *   again.
  *
  * The invariants checked: the segment bytes on disk under the root never pass
  * `maxTotalBytes`, at any instant; once no write is in flight the writer's
@@ -77,8 +85,8 @@ async function openEpoch(
     maxTotalBytes: CAP,
     capacityRootPath: ROOT,
     maxSegmentBytes: SEGMENT_BYTES,
-    // No time rotation: its one bounded residual (`wal-format.md` §11.1) is
-    // not what these tests are about.
+    // No time rotation here: the r2 tests below hold the cap against it
+    // (TR).
     maxSegmentAgeMs: 1_000_000_000,
     ...overrides,
   });
@@ -700,5 +708,550 @@ describe("re-derivations never overlap (O-I4)", () => {
     await writer.tick();
     expect(writer.metrics().capacityRescans).toBe(2);
     await writer.close();
+  });
+});
+
+/**
+ * `WALCAP-1` round 2, finding TR: a time rotation added framing nobody had
+ * reserved. The packing reserved a backlog's framing by the size rule alone;
+ * a segment that was aged, or aged before the backlog was written, was then
+ * closed by time and the backlog started a new segment, so a 6,000-byte cap
+ * ended at 6,359 bytes and stayed there after `close()`. Two guards now hold
+ * the cap:
+ *
+ * - admission also packs the backlog as if the open segment were closed
+ *   first, whenever it holds a record, and reserves the larger framing. The
+ *   time rotation then happens on time;
+ * - a time rotation, in `drain()` or `tick()`, that admission could not
+ *   foresee (a segment this backlog opened, aged before the backlog is
+ *   written) waits until it fits. The frames go where admission put them.
+ */
+describe("a time rotation never takes the disk past the cap (r2, TR)", () => {
+  const AGE_MS = 1_000;
+
+  async function openTimed(
+    fileSystem: WalFileSystem,
+    clock: ManualClock,
+    cap: number,
+    options: { readonly root?: boolean; readonly overrides?: Partial<WalWriterOptions> } = {},
+  ): Promise<WalWriter> {
+    return openWalWriter({
+      directoryPath: directoryOf(EPOCH_A),
+      gatewayEpoch: EPOCH_A,
+      fileSystem,
+      clock,
+      maxTotalBytes: cap,
+      ...(options.root === false ? {} : { capacityRootPath: ROOT }),
+      // Segments only time closes: the case §11.1 used to except.
+      maxSegmentBytes: 64_000_000,
+      maxSegmentAgeMs: AGE_MS,
+      ...options.overrides,
+    });
+  }
+
+  /** `[closeReason, recordCount]` of every manifest of an epoch, in segment order. */
+  async function closes(fileSystem: MemoryFileSystem, epoch = EPOCH_A): Promise<[string, number][]> {
+    return (await listSegmentManifests(fileSystem, directoryOf(epoch))).map((manifest) => [
+      manifest.closeReason,
+      manifest.recordCount,
+    ]);
+  }
+
+  for (const cap of [3_000, 6_000, 20_000]) {
+    for (const root of [true, false]) {
+      for (const aged of ["before the burst", "between the burst and its drain"] as const) {
+        it(`a ${String(cap)}-byte cap${root ? " over the root" : ", own directory"}, the segment aged ${aged}: a burst to refusal stays under it, and the rotation is on time`, async () => {
+          const base = createMemoryFileSystem();
+          const clock = createManualClock();
+          const frames = new Frames();
+          const writer = await openTimed(base, clock, cap, { root });
+          expect(writer.enqueue(frames.next(EPOCH_A)).accepted).toBe(true);
+          await writer.drain();
+
+          if (aged === "before the burst") clock.advance(AGE_MS);
+          const burst = offerUntilRefused(writer, frames, EPOCH_A);
+          expect(burst.length, "the cap had room for a burst").toBeGreaterThan(0);
+          if (aged === "between the burst and its drain") clock.advance(AGE_MS);
+          await writer.drain();
+          expectInvariants(writer, base, cap);
+          await writer.close();
+          // Before r2: 3,210, 6,359 and 20,185 bytes, after close.
+          expectInvariants(writer, base, cap);
+
+          expect(framesOnDisk(base).size, "every admitted frame was written").toBe(1 + burst.length);
+          // On time: the aged segment was closed by age before the burst, whose
+          // new segment's framing admission had reserved.
+          expect(await closes(base)).toEqual([
+            ["time-rotation", 1],
+            ["shutdown", burst.length],
+          ]);
+          expect(writer.metrics().timeRotationsDeferred).toBe(0);
+        });
+      }
+    }
+  }
+
+  it("a segment the backlog opened, aged before the rest of it is written: the time rotation waits, and closes the segment once nothing is unwritten", async () => {
+    const base = createMemoryFileSystem();
+    const gated = gatedFileSystem(base);
+    const clock = createManualClock();
+    const frames = new Frames();
+    const cap = 6_000;
+    const writer = await openTimed(gated.fileSystem, clock, cap);
+    const accepted: string[] = [];
+    const first = frames.next(EPOCH_A);
+    expect(writer.enqueue(first).accepted).toBe(true);
+    accepted.push(first.ingestSeq);
+
+    // The drain opens a segment and is held before its first record lands:
+    // no rotation can close a segment that holds no record, so the frames
+    // admitted now reserve no new segment.
+    const gate = gated.hold((call) => call.op === "append" && call.line === "frames", "before");
+    const drain = writer.drain();
+    expect(await suspended(gate, drain), "the drain reached the held call").toBe(true);
+    expect(writer.metrics().activeSegmentRecordCount).toBe(0);
+    accepted.push(...offerUntilRefused(writer, frames, EPOCH_A));
+    expect(accepted.length).toBeGreaterThan(2);
+
+    // The segment ages before the rest is written.
+    clock.advance(AGE_MS);
+    gate.release();
+    await drain;
+    expectInvariants(writer, base, cap);
+    expect(framesOnDisk(base).size, "every admitted frame was written").toBe(accepted.length);
+    const afterDrain = { ...writer.metrics() };
+    // Nothing is unwritten now: closing costs only the reserved footer.
+    await writer.tick();
+    const afterTick = await closes(base);
+    await writer.close();
+    // Before r2 the drain closed the segment by time and opened another one
+    // for the rest: 6,359 bytes against 6,000 once that one closed.
+    expectInvariants(writer, base, cap);
+
+    expect(afterDrain.segmentsFinalized, "the rotation waited: still open, and aged").toBe(0);
+    expect(afterDrain.timeRotationsDeferred).toBe(1);
+    expect(afterTick, "closed by age once nothing was unwritten").toEqual([["time-rotation", accepted.length]]);
+    expect(writer.metrics().timeRotationsDeferred).toBe(1);
+  });
+
+  for (const fits of [false, true]) {
+    it(
+      fits
+        ? "a tick whose rotation lands exactly on the cap goes ahead"
+        : "a tick that finds the segment aged with frames queued waits too, once the count grew under them, and still fsyncs",
+      async () => {
+        const base = createMemoryFileSystem();
+        const clock = createManualClock();
+        const frames = new Frames();
+        const cap = 6_000;
+        const writer = await openTimed(base, clock, cap, { overrides: { fsyncIntervalMs: 100 } });
+        expect(writer.enqueue(frames.next(EPOCH_A)).accepted).toBe(true);
+        await writer.drain();
+        // Nothing unwritten: the reservation is the open segment's footer alone.
+        const footer = writer.metrics().capacityReservedBytes ?? Number.NaN;
+        for (let index = 0; index < 2; index += 1) expect(writer.enqueue(frames.next(EPOCH_A)).accepted).toBe(true);
+        // Admitted with the new segment a time rotation would open reserved.
+        const queued = writer.metrics();
+        const newSegment = (queued.capacityReservedBytes ?? Number.NaN) - footer;
+        expect(newSegment).toBeGreaterThan(0);
+        const remaining = queued.capacityRemainingBytes ?? Number.NaN;
+
+        // A segment file another writer put under the root (one writer per
+        // root is a premise; the count sees it anyway). Waiting: it takes
+        // more than the room left, though less than the reservation, so the
+        // queued frames still fit in the open segment and a new one for them
+        // would not. Exactly on the cap: it takes the room left, no more.
+        const foreign = fits ? remaining : remaining + Math.floor(newSegment / 2);
+        base.files.set(`${directoryOf(EPOCH_B)}/${EPOCH_B}-000000.wal.jsonl`, Buffer.alloc(foreign, 0x61));
+        await writer.tick();
+        expect(writer.metrics().totalSegmentBytes, "the re-derivation counts it").toBe(onDisk(base));
+
+        clock.advance(AGE_MS);
+        const fsyncs = writer.metrics().fsyncCount;
+        await writer.tick();
+        if (fits) {
+          expect(await closes(base)).toEqual([["time-rotation", 1]]);
+          await writer.close();
+          expect(await closes(base)).toEqual([
+            ["time-rotation", 1],
+            ["shutdown", 2],
+          ]);
+          expect(writer.metrics().timeRotationsDeferred).toBe(0);
+          expectInvariants(writer, base, cap);
+          return;
+        }
+        expect(writer.metrics().timeRotationsDeferred).toBe(1);
+        expect(writer.metrics().segmentsFinalized, "the rotation waited").toBe(0);
+        expect(writer.metrics().fsyncCount, "the data-loss bound did not wait for it").toBe(fsyncs + 1);
+
+        // The drain's own check waits as well: the frames go into the aged segment.
+        await writer.drain();
+        expect(writer.metrics().segmentsFinalized).toBe(0);
+        expectInvariants(writer, base, cap);
+        await writer.tick();
+        expect(await closes(base)).toEqual([["time-rotation", 3]]);
+        await writer.close();
+        expectInvariants(writer, base, cap);
+      },
+    );
+  }
+
+  it("a segment with nothing unwritten is closed by age even when foreign bytes put the count past the cap: closing adds only its reserved footer", async () => {
+    const base = createMemoryFileSystem();
+    const clock = createManualClock();
+    const frames = new Frames();
+    const cap = 6_000;
+    const writer = await openTimed(base, clock, cap);
+    expect(writer.enqueue(frames.next(EPOCH_A)).accepted).toBe(true);
+    await writer.drain();
+    base.files.set(`${directoryOf(EPOCH_B)}/${EPOCH_B}-000000.wal.jsonl`, Buffer.alloc(cap, 0x61));
+    await writer.tick();
+    expect(writer.metrics().totalSegmentBytes).toBeGreaterThan(cap);
+    clock.advance(AGE_MS);
+    await writer.tick();
+    // Sealed, so expiry can remove it once it is old enough; waiting would
+    // have saved nothing, since its footer is owed either way.
+    expect(await closes(base)).toEqual([["time-rotation", 1]]);
+    await writer.close();
+    expect(writer.metrics().totalSegmentBytes).toBe(onDisk(base));
+  });
+
+  it("counts a waiting rotation once per segment, however many batches it waits through", async () => {
+    const base = createMemoryFileSystem();
+    const gated = gatedFileSystem(base);
+    const clock = createManualClock();
+    const frames = new Frames();
+    const cap = 6_000;
+    // One frame per batch: the rotation is decided again before every one.
+    const writer = await openTimed(gated.fileSystem, clock, cap, { overrides: { fsyncByteThreshold: 1 } });
+    const episode = async (): Promise<number> => {
+      const first = frames.next(EPOCH_A);
+      expect(writer.enqueue(first).accepted).toBe(true);
+      const gate = gated.hold((call) => call.op === "append" && call.line === "frames", "before");
+      const drain = writer.drain();
+      expect(await suspended(gate, drain)).toBe(true);
+      const admitted = 1 + offerUntilRefused(writer, frames, EPOCH_A).length;
+      clock.advance(AGE_MS);
+      gate.release();
+      await drain;
+      expectInvariants(writer, base, cap);
+      await writer.tick();
+      return admitted;
+    };
+    const firstEpisode = await episode();
+    expect(firstEpisode).toBeGreaterThan(3);
+    expect(writer.metrics().timeRotationsDeferred).toBe(1);
+    // Expiry frees the first segment; the next one waits the same way.
+    const [sealed] = await listSegmentManifests(base, directoryOf(EPOCH_A));
+    if (sealed === undefined) throw new Error("no sealed segment");
+    expire(base, directoryOf(EPOCH_A), sealed);
+    await writer.tick();
+    const secondEpisode = await episode();
+    expect(secondEpisode).toBeGreaterThan(3);
+    expect(writer.metrics().timeRotationsDeferred).toBe(2);
+    expect((await closes(base)).map(([reason]) => reason)).toEqual(["time-rotation"]);
+    await writer.close();
+    expectInvariants(writer, base, cap);
+  });
+
+  it("holds the cap over random bursts, drains suspended anywhere, ticks and clock steps, with segments aging at any point", async () => {
+    let seed = 0x7e57_0a6e;
+    const random = (): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed / 2_147_483_648;
+    };
+    const pickOne = <T>(values: readonly T[]): T => {
+      const value = values[Math.floor(random() * values.length)];
+      if (value === undefined) throw new Error("nothing to pick from");
+      return value;
+    };
+    const epochs = [EPOCH_A, EPOCH_B, EPOCH_C];
+    const matchers: readonly ((call: GatedCall) => boolean)[] = [
+      (call) => call.op === "openAppend",
+      (call) => call.op === "append" && call.line === "header",
+      (call) => call.op === "append" && call.line === "frames",
+      (call) => call.op === "append" && call.line === "footer",
+      (call) => call.op === "sync",
+      (call) => call.op === "writeWholeFile",
+    ];
+    const seen = { suspensions: 0, agedWhileSuspended: 0, refusals: 0, timeRotations: 0, deferred: 0, expiries: 0, restarts: 0 };
+
+    for (let run = 0; run < 100; run += 1) {
+      const base = createMemoryFileSystem();
+      const gated = gatedFileSystem(base);
+      const clock = createManualClock();
+      const frames = new Frames();
+      const cap = pickOne([3_000, 6_000, 12_000, 20_000]);
+      const segmentBytes = pickOne([1_500, 3_000, 64_000_000, 64_000_000]);
+      const fsyncByteThreshold = pickOne([1, 1_000_000]);
+      const open = async (epoch: string): Promise<WalWriter> =>
+        openWalWriter({
+          directoryPath: directoryOf(epoch),
+          gatewayEpoch: epoch,
+          fileSystem: gated.fileSystem,
+          clock,
+          maxTotalBytes: cap,
+          capacityRootPath: ROOT,
+          maxSegmentBytes: segmentBytes,
+          maxSegmentAgeMs: AGE_MS,
+          fsyncByteThreshold,
+          observer: {
+            onSegmentFinalized: (manifest) => {
+              if (manifest.closeReason === "time-rotation") seen.timeRotations += 1;
+            },
+          },
+        });
+      const writers: WalWriter[] = [];
+      let epochIndex = 0;
+      let writer = await open(EPOCH_A);
+      writers.push(writer);
+      const offer = (epoch: string, count: number): void => {
+        for (let index = 0; index < count; index += 1) {
+          const result = writer.enqueue(frames.next(epoch, "x".repeat(Math.floor(random() * 300))));
+          if (!result.accepted && result.reason === "capacity-exceeded") seen.refusals += 1;
+        }
+      };
+      for (let step = 0; step < 50; step += 1) {
+        const roll = random();
+        const epoch = epochs[epochIndex] as string;
+        if (roll < 0.5) {
+          offer(epoch, 1 + Math.floor(random() * 6));
+          if (random() < 0.3) clock.advance(pickOne([AGE_MS / 2, AGE_MS]));
+          const gate = gated.hold(pickOne(matchers), random() < 0.5 ? "before" : "after");
+          const drain = writer.drain();
+          if (await suspended(gate, drain)) {
+            seen.suspensions += 1;
+            offer(epoch, Math.floor(random() * 8));
+            if (random() < 0.5) {
+              clock.advance(AGE_MS);
+              seen.agedWhileSuspended += 1;
+            }
+            expect(onDisk(base), "mid-drain").toBeLessThanOrEqual(cap);
+            gate.release();
+          } else {
+            gated.disarm();
+          }
+          await drain;
+          await writer.drain();
+        } else if (roll < 0.62) {
+          clock.advance(pickOne([AGE_MS / 2, AGE_MS]));
+        } else if (roll < 0.75) {
+          await writer.tick();
+        } else if (roll < 0.95) {
+          const sealed: { directory: string; manifest: WalSegmentManifest }[] = [];
+          for (const candidate of epochs) {
+            for (const manifest of await listSegmentManifests(base, directoryOf(candidate))) {
+              if (base.peek(`${directoryOf(candidate)}/${manifest.segmentFileName}`) !== undefined) {
+                sealed.push({ directory: directoryOf(candidate), manifest });
+              }
+            }
+          }
+          const victim = sealed[Math.floor(random() * sealed.length)];
+          if (victim !== undefined) {
+            expire(base, victim.directory, victim.manifest);
+            seen.expiries += 1;
+          }
+        } else if (epochIndex < epochs.length - 1) {
+          if (random() < 0.7) await writer.close();
+          seen.restarts += 1;
+          epochIndex += 1;
+          writer = await open(epochs[epochIndex] as string);
+          writers.push(writer);
+        }
+        expectInvariants(writer, base, cap);
+      }
+      if (writer.state === "open") await writer.close();
+      expectInvariants(writer, base, cap);
+      for (const each of writers) {
+        seen.deferred += each.metrics().timeRotationsDeferred;
+      }
+    }
+    // Not vacuous: segments aged mid-drain and were closed by time, rotations
+    // had to wait, expiry gave room back, and the cap refused frames
+    // throughout (seeded: 474, 252, 368, 37, 509 and 7,512 when written).
+    expect(seen.suspensions).toBeGreaterThan(350);
+    expect(seen.agedWhileSuspended).toBeGreaterThan(180);
+    expect(seen.timeRotations).toBeGreaterThan(250);
+    expect(seen.deferred).toBeGreaterThan(20);
+    expect(seen.expiries).toBeGreaterThan(300);
+    expect(seen.refusals).toBeGreaterThan(5_000);
+    expect(seen.restarts).toBeGreaterThan(100);
+  });
+});
+
+/**
+ * `WALCAP-1` round 2, finding N-1: the values a failed write's count falls
+ * back to, and that the count is taken before the fault is raised, not after.
+ */
+describe("a failed write's count: its fallback values, and taken before the fault (r2, N-1)", () => {
+  /** A memory filesystem whose next planned write fails, and whose next planned length read fails. */
+  function failingWrites(base: MemoryFileSystem) {
+    const plan: {
+      append?: (bytes: Uint8Array) => Uint8Array;
+      manifest?: true;
+      headerSync?: true;
+      failNextLengthRead?: true;
+      /** Length reads answer only after a timer: a count not awaited lands after the fault. */
+      slowLengthReads?: true;
+    } = {};
+    const synced = new Set<string>();
+    const fileSystem: MemoryFileSystem = {
+      ...base,
+      openAppend: async (path) => {
+        const handle = await base.openAppend(path);
+        return {
+          append: async (bytes) => {
+            const tear = plan.append;
+            if (tear !== undefined && lineOf(bytes) === "frames") {
+              delete plan.append;
+              await handle.append(tear(bytes));
+              throw new Error("EIO (injected append)");
+            }
+            await handle.append(bytes);
+          },
+          sync: async () => {
+            if (plan.headerSync === true && !synced.has(path)) {
+              delete plan.headerSync;
+              throw new Error("ENOSPC (injected fsync)");
+            }
+            synced.add(path);
+            await handle.sync();
+          },
+          close: async () => handle.close(),
+        };
+      },
+      writeWholeFile: async (path, bytes) => {
+        if (plan.manifest === true && path.endsWith(".wal.manifest.json")) {
+          delete plan.manifest;
+          throw new Error("ENOSPC (injected sidecar)");
+        }
+        await base.writeWholeFile(path, bytes);
+      },
+      fileByteLength: async (path) => {
+        if (plan.slowLengthReads === true) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        if (plan.failNextLengthRead === true) {
+          delete plan.failNextLengthRead;
+          throw new Error("EIO (injected length read)");
+        }
+        return base.fileByteLength(path);
+      },
+    };
+    return { fileSystem, plan };
+  }
+
+  it("a torn append whose length read fails too counts the segment as it was plus the whole batch", async () => {
+    const base = createMemoryFileSystem();
+    const { fileSystem, plan } = failingWrites(base);
+    const frames = new Frames();
+    const writer = await openEpoch(fileSystem, createManualClock(), EPOCH_A, { maxSegmentBytes: 100_000 });
+    writer.enqueue(frames.next(EPOCH_A));
+    await writer.drain();
+    const before = writer.metrics().activeSegmentByteLength;
+    let batch = 0;
+    for (let index = 0; index < 3; index += 1) {
+      const frame = frames.next(EPOCH_A);
+      batch += frames.lineBytes.get(frame.ingestSeq) ?? Number.NaN;
+      writer.enqueue(frame);
+    }
+    plan.append = (bytes) => bytes.subarray(0, Math.floor((bytes.length * 5) / 6));
+    plan.failNextLengthRead = true;
+    await expect(writer.drain()).rejects.toThrow();
+    expect(plan.failNextLengthRead, "the fault path's length read was the one that failed").toBeUndefined();
+    expect(writer.metrics().totalSegmentBytes).toBe(before + batch);
+    expect(writer.metrics().totalSegmentBytes).toBeGreaterThanOrEqual(onDisk(base));
+  });
+
+  it("a failed finalize whose length read fails too counts the segment as it was plus the footer's reserve", async () => {
+    const base = createMemoryFileSystem();
+    const { fileSystem, plan } = failingWrites(base);
+    const frames = new Frames();
+    const writer = await openEpoch(fileSystem, createManualClock(), EPOCH_A);
+    writer.enqueue(frames.next(EPOCH_A));
+    await writer.drain();
+    const before = writer.metrics().activeSegmentByteLength;
+    // Nothing unwritten: the reservation is the open segment's footer alone.
+    const footerReserve = writer.metrics().capacityReservedBytes ?? Number.NaN;
+    plan.manifest = true;
+    plan.failNextLengthRead = true;
+    await expect(writer.rotate()).rejects.toThrow();
+    expect(plan.failNextLengthRead, "the fault path's length read was the one that failed").toBeUndefined();
+    expect(base.peek([...base.files.keys()].find((path) => path.endsWith(".wal.jsonl")) ?? "")?.toString("utf8")).toContain(
+      '{"record":"footer"',
+    );
+    expect(writer.metrics().totalSegmentBytes).toBe(before + footerReserve);
+    expect(writer.metrics().totalSegmentBytes).toBeGreaterThanOrEqual(onDisk(base));
+  });
+
+  for (const site of ["a torn append", "a segment whose header landed and whose creation failed"] as const) {
+    it(`the count already holds what ${site} left when the fault is raised`, async () => {
+      const base = createMemoryFileSystem();
+      const { fileSystem, plan } = failingWrites(base);
+      const frames = new Frames();
+      const atFault: { counted: number; disk: number }[] = [];
+      const late: { writer?: WalWriter } = {};
+      const writer = await openEpoch(fileSystem, createManualClock(), EPOCH_A, {
+        maxSegmentBytes: 100_000,
+        observer: {
+          onWriteFault: () => {
+            atFault.push({ counted: late.writer?.metrics().totalSegmentBytes ?? Number.NaN, disk: onDisk(base) });
+          },
+        },
+      });
+      late.writer = writer;
+      if (site === "a torn append") {
+        writer.enqueue(frames.next(EPOCH_A));
+        await writer.drain();
+        plan.append = (bytes) => bytes.subarray(0, Math.floor(bytes.length / 2));
+      } else {
+        plan.headerSync = true;
+      }
+      writer.enqueue(frames.next(EPOCH_A));
+      plan.slowLengthReads = true;
+      await expect(writer.drain()).rejects.toThrow();
+      expect(atFault).toHaveLength(1);
+      const [fault] = atFault;
+      expect(fault?.disk).toBeGreaterThan(0);
+      expect(fault?.counted, "counted when the fault was raised").toBe(fault?.disk);
+    });
+  }
+});
+
+/** `WALCAP-1` round 2, finding N-2: in-flight frames that landed are not packed again. */
+describe("the in-flight framing reserved is exactly what is still unwritten (r2, N-2)", () => {
+  it("a drain held after its first batch landed reserves what a writer with the rest queued reserves", async () => {
+    const options = { maxSegmentBytes: SEGMENT_BYTES, fsyncByteThreshold: 1 } as const;
+    const big = "x".repeat(900);
+
+    // Held: the big frame landed, two small ones still in flight.
+    const heldBase = createMemoryFileSystem();
+    const gated = gatedFileSystem(heldBase);
+    const heldFrames = new Frames();
+    const held = await openEpoch(gated.fileSystem, createManualClock(), EPOCH_A, options);
+    held.enqueue(heldFrames.next(EPOCH_A));
+    await held.drain();
+    for (const payload of [big, undefined, undefined]) held.enqueue(heldFrames.next(EPOCH_A, payload));
+    const gate = gated.hold((call) => call.op === "sync", "before");
+    const drain = held.drain();
+    expect(await suspended(gate, drain)).toBe(true);
+    expect(framesOnDisk(heldBase).size, "the big frame landed").toBe(2);
+
+    // At rest: the same frames on disk, the two small ones queued.
+    const restBase = createMemoryFileSystem();
+    const restFrames = new Frames();
+    const rest = await openEpoch(restBase, createManualClock(), EPOCH_A, options);
+    rest.enqueue(restFrames.next(EPOCH_A));
+    await rest.drain();
+    rest.enqueue(restFrames.next(EPOCH_A, big));
+    await rest.drain();
+    for (let index = 0; index < 2; index += 1) rest.enqueue(restFrames.next(EPOCH_A));
+    expect(restBase.snapshot()).toStrictEqual(heldBase.snapshot());
+
+    expect(held.metrics().capacityReservedBytes).toBe(rest.metrics().capacityReservedBytes);
+    expect(held.metrics().capacityRemainingBytes).toBe(rest.metrics().capacityRemainingBytes);
+    gate.release();
+    await drain;
+    await held.close();
+    await rest.close();
+    expect(restBase.snapshot()).toStrictEqual(heldBase.snapshot());
   });
 });

@@ -1,5 +1,11 @@
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
+import { listSegmentManifests, nodeWalFileSystem } from "@polymarket-bot/storage-wal";
+import type { WalFileSystem } from "@polymarket-bot/storage-wal";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 
 import { GatewayStateError } from "./errors.js";
@@ -626,5 +632,101 @@ describe("GatewayJournal — the capacity count at open fails closed (WALCAP-1 r
     expect(earlier).toBeGreaterThan(0);
     expect(journal.metrics().totalSegmentBytes).toBe(earlier);
     await journal.close();
+  });
+});
+
+/**
+ * `WALCAP-1` round 2, finding TR: a time rotation that fired with frames
+ * still unwritten opened a segment whose framing nobody had reserved. Through
+ * the journal, the review's probe ended a 6,000-byte cap at 6,028 bytes before
+ * `close()` and 6,408 after, on the memory and the real Node filesystem alike;
+ * these tests read 6,173 before `close()` on the round-1 writer. Admission now
+ * reserves that segment whenever the open one holds a record, so the rotation
+ * happens on time and the cap holds.
+ */
+describe("GatewayJournal — a time rotation never takes the disk past maxTotalBytes (WALCAP-1 r2, TR)", () => {
+  const CAP = 6_000;
+  const AGE_MS = 1_000;
+
+  async function burstAtTheBoundary(
+    fileSystem: WalFileSystem,
+    walRootPath: string,
+    aged: "before the burst" | "between the burst and its drain",
+    segmentBytes: () => Promise<number>,
+  ) {
+    const clock = new ManualGatewayClock();
+    const failures: { reason: string }[] = [];
+    const journal = await GatewayJournal.open({
+      walRootPath,
+      fileSystem,
+      clock,
+      sequencer: new IngestSequencer(EPOCH),
+      maxTotalBytes: CAP,
+      // Segments only time closes.
+      maxSegmentBytes: 64_000_000,
+      maxSegmentAgeMs: AGE_MS,
+      onRecordingFailure: (failure) => failures.push(failure),
+    });
+    expect(journal.record(frameInput(clock, "{}")).recorded).toBe(true);
+    await journal.settle();
+
+    if (aged === "before the burst") clock.advance(AGE_MS);
+    // One turn, as a socket delivers a burst: the drain runs after all of it.
+    let burst = 0;
+    for (let index = 0; index < 100; index += 1) {
+      const outcome = journal.record(frameInput(clock, `{"burst":${String(index)}}`));
+      if (!outcome.recorded) {
+        expect(outcome.reason).toBe("capacity-exceeded");
+        break;
+      }
+      burst += 1;
+    }
+    expect(burst, "the cap had room for a burst").toBeGreaterThan(0);
+    if (aged === "between the burst and its drain") clock.advance(AGE_MS);
+    await journal.settle();
+    expect(journal.faulted).toBe(false);
+    expect(await segmentBytes()).toBeLessThanOrEqual(CAP);
+    expect(journal.metrics().framesWritten).toBe(journal.metrics().framesAccepted);
+    await journal.close();
+    expect(await segmentBytes()).toBeLessThanOrEqual(CAP);
+    expect(failures.at(-1)?.reason).toBe("capacity-exceeded");
+
+    // On time: the aged segment closed by age, the burst in the next one.
+    const manifests = await listSegmentManifests(fileSystem, fileSystem.joinPath(walRootPath, EPOCH));
+    expect(manifests.map((manifest) => [manifest.closeReason, manifest.recordCount])).toEqual([
+      ["time-rotation", 1],
+      ["shutdown", burst],
+    ]);
+    expect(journal.metrics().timeRotationsDeferred).toBe(0);
+  }
+
+  for (const aged of ["before the burst", "between the burst and its drain"] as const) {
+    it(`a segment aged ${aged}: a burst to refusal stays under the cap, before and after close`, async () => {
+      const fileSystem = createMemoryFileSystem();
+      await burstAtTheBoundary(fileSystem, "/wal", aged, async () => {
+        let total = 0;
+        for (const [path, bytes] of fileSystem.files) {
+          if (path.startsWith("/wal/") && path.endsWith(".wal.jsonl")) total += bytes.length;
+        }
+        return total;
+      });
+    });
+  }
+
+  it("the same on the real Node filesystem, the segment aged before the burst", async () => {
+    const root = await mkdtemp(join(tmpdir(), "walcap-r2-journal-"));
+    try {
+      await burstAtTheBoundary(nodeWalFileSystem(), root, "before the burst", async () => {
+        let total = 0;
+        for (const epoch of await readdir(root)) {
+          for (const name of await readdir(join(root, epoch))) {
+            if (name.endsWith(".wal.jsonl")) total += (await stat(join(root, epoch, name))).size;
+          }
+        }
+        return total;
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
