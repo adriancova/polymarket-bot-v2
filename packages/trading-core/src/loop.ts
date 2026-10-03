@@ -2015,6 +2015,12 @@ export class CoreLoop {
       // seam does not depend on its verdict.
       undurable = true;
     }
+    // `CO2-N1` (ADR-031 R1): a PLACEMENT reads the process clock once, HERE —
+    // after its decision is durable (so a slow commit counts as lag) and
+    // before its risk input is built. A CANCEL reads nothing; its path is
+    // unchanged (§6 invariant 13).
+    const admission =
+      input.intent.type === "CANCEL" ? undefined : this.#admissionMeasurements(input.epochMs);
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
     const projection = this.#held.view;
@@ -2054,10 +2060,15 @@ export class CoreLoop {
       strategyStatePermitsIntent: input.instance.runtime.instanceStatus() === "ACTIVE",
       market: input.market,
       marketConfig,
-      secondsToClose: this.#secondsToClose(marketConfig, input.epochMs),
+      // ADR-031 R4: from the later of the event instant and the process
+      // instant (the event instant for a CANCEL, or an unreadable reading).
+      secondsToClose: this.#secondsToClose(marketConfig, admission?.closeFromEpochMs ?? input.epochMs),
       bookSynchronized: input.market.bookFor(input.instance.direction).baseline() !== undefined,
       venueBookAgeMs: bookAgeMs,
-      featuresAgeMs: 0,
+      // ADR-031 R3/R5: the feature snapshot's age at admission is the lag;
+      // `undefined` (an unreadable reading) is OMITTED, so check 7 refuses an
+      // entry `RISK_FRESHNESS_UNKNOWN`. A CANCEL keeps the constant 0.
+      featuresAgeMs: admission === undefined ? 0 : admission.featuresAgeMs,
       positions,
       openOrders: this.#openOrdersFor(input.instance, marketConfig),
       exposures: allocation.exposures,
@@ -4210,6 +4221,49 @@ export class CoreLoop {
     const outcome = market.outcomeOfToken(readString(envelope.payload, "tokenId"));
     if (outcome === undefined) return;
     market.noteBookSession(outcome, sessionKeyOf(envelope));
+  }
+
+  /**
+   * `CO2-N1` (ADR-031, option (a), through existing inputs): one PLACEMENT's
+   * admission measurements, from ONE reading of the process clock.
+   *
+   * WHY. Every other admission input is measured at the evaluation's EVENT
+   * instant (`receivedAt`). A trader N seconds behind the stream would judge
+   * an entry as of N seconds ago, and would admit one after the close (the
+   * `CO2-N1` residual; `CLOSEOUT-2` N1). Option (a) supplies two existing §9.8
+   * inputs from the process clock, and nothing else:
+   *
+   * - R2/R3: `featuresAgeMs` is the lag, `max(0, processNow − eventNow)` in
+   *   whole milliseconds: the feature snapshot's age at admission. Check 7's
+   *   features row judges ENTRIES only, so an `EXIT`'s verdict is unchanged
+   *   (ADR-031 Q2, as ruled).
+   * - R4: `secondsToClose` is measured from `max(eventNow, processNow)`.
+   *   Check 20 judges ENTRIES only.
+   * - R5: a reading that does not normalise to strict UTC is no measurement.
+   *   The features age is `undefined` (OMITTED, so check 7 refuses an entry
+   *   `RISK_FRESHNESS_UNKNOWN`), and seconds-to-close keeps the event instant.
+   *
+   * Both inputs can only ADD refusals: the lag is never negative, and the
+   * close instant is never earlier than the event instant. So a process clock
+   * BEHIND the event instant (lag 0) changes nothing, and in a replay that
+   * positions its clock at each event (the backtest's `ReplayClock`) nothing
+   * changes at all (R6). No configuration turns this off (R7).
+   *
+   * Book and reference ages, `evaluatedAt`, the request budget and every
+   * strategy input stay on event time (R6). Under ADR-023's
+   * `CONNECTION_CONFIRMED`, D7's own reading (`#processNowEpochMs`) is
+   * separate and unchanged: this one never touches a book age.
+   */
+  #admissionMeasurements(eventEpochMs: number): {
+    readonly featuresAgeMs: number | undefined;
+    readonly closeFromEpochMs: number;
+  } {
+    const reading = normalizeToStrictUtc(this.#options.clock.now());
+    if (!reading.ok) return { featuresAgeMs: undefined, closeFromEpochMs: eventEpochMs };
+    return {
+      featuresAgeMs: Math.max(0, reading.epochMs - eventEpochMs),
+      closeFromEpochMs: Math.max(eventEpochMs, reading.epochMs),
+    };
   }
 
   #secondsToClose(marketConfig: MarketConfig, epochMs: number): number | undefined {

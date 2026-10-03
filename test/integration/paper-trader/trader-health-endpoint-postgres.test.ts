@@ -27,6 +27,16 @@
  * LAST `accounting.pnl_snapshots` row the store persisted. `Number(...)`
  * appears nowhere on the path or in the assertion.
  *
+ * ## The clock (`CO2-N1`, ADR-031)
+ *
+ * The round trip's assembly used to take the host's `SystemPaperClock` as-is.
+ * ADR-031's entry guard reads the trader's clock at admission, and against
+ * the fixture's `2026-03-04` events that clock is months late: the entry was
+ * refused and nothing round-tripped. The round trip now takes the same host
+ * clock re-based to the fixture's first event (`support/host-clock.ts`): read
+ * live, advancing in real time, so the lag is the real processing delay. The
+ * two bind-refusal cases route no event and keep the clock as-is.
+ *
  * ## Why the read is `node:http` here
  *
  * `test/integration/paper-trader/**` aliases no `apps/control-api` module, and
@@ -72,6 +82,7 @@ import {
   recordedEvents,
   safeEnvironment,
 } from "./support/fixture.js";
+import { FIXTURE_FIRST_EVENT_AT, RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
   CONDITION_ID,
   documentFor,
@@ -161,7 +172,8 @@ describe("the REAL composition root serves its health endpoint, and realized PnL
         config: parsed.config,
         document,
         postgresUrl: connectionString,
-        clock: new SystemPaperClock(),
+        // `CO2-N1` (ADR-031): the host's clock, re-based to the fixture's first event.
+        clock: new RebasedSystemPaperClock(FIXTURE_FIRST_EVENT_AT),
         log: (line) => {
           lines.push(line);
         },

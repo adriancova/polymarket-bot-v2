@@ -31,6 +31,18 @@
  * contrast scenario runs the same gateway WITHOUT the lifecycle feed: the
  * trader stays `PENDING` (§9.8 `UNKNOWN`, fail closed) and admits nothing.
  *
+ * ## The trader's clock (`CO2-N1`, ADR-031)
+ *
+ * The gateway runs on its manual clock at the fixture's open (`T_OPEN`,
+ * 2026-03-04), so every envelope it publishes is stamped then. ADR-031's entry
+ * guard reads the TRADER's clock at admission; the host's `SystemPaperClock`
+ * as-is is months later, and the entry was refused. Both scenarios now give
+ * the trader the same host clock re-based to `T_OPEN`, the gateway's instant
+ * (`support/host-clock.ts`): read live, advancing in real time, so the lag is
+ * the real delay between the gateway's publication and the trader's
+ * admission. The contrast keeps ONE difference from the main scenario — the
+ * lifecycle feed — and nothing else.
+ *
  * ## Docker
  *
  * Testcontainers, as `durable-trader-first-fill-postgres.test.ts` and the
@@ -56,13 +68,14 @@ import { parseTraderConfig, type IngestedEvent, type MarketEventFeed } from "@po
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RedisMarketEventFeed } from "../../../apps/trader/src/adapters/redis-feed.js";
-import { assembleDurableTrader, SystemPaperClock } from "../../../apps/trader/src/main.js";
+import { assembleDurableTrader } from "../../../apps/trader/src/main.js";
 import { pump } from "../../../apps/trader/src/pump.js";
 import {
   ScriptedBinanceSocketFactory,
   ScriptedPublicSocketFactory,
 } from "../data-gateway/support/scripted-sockets.js";
 import { NO_TOKEN, T_CLOSE, T_OPEN, YES_TOKEN, safeEnvironment } from "./support/fixture.js";
+import { RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
   CONDITION_ID,
   documentFor,
@@ -269,7 +282,8 @@ describe("UNIV-4 acceptance (c) — the trader opens a market from the gateway's
         config: parsed.config,
         document,
         postgresUrl: connectionString,
-        clock: new SystemPaperClock(),
+        // `CO2-N1` (ADR-031): the host's clock, re-based to the gateway's instant.
+        clock: new RebasedSystemPaperClock(T_OPEN),
         log: (line) => {
           lines.push(line);
         },
@@ -365,7 +379,8 @@ describe("UNIV-4 acceptance (c) — the trader opens a market from the gateway's
         config: parsed.config,
         document,
         postgresUrl: connectionString,
-        clock: new SystemPaperClock(),
+        // `CO2-N1` (ADR-031): the host's clock, re-based to the gateway's instant.
+        clock: new RebasedSystemPaperClock(T_OPEN),
         log: () => undefined,
       });
       if (!assembled.ok) throw new Error("the trader did not assemble");

@@ -113,6 +113,19 @@
  * that every event-triggered decision row carries its event's dispatch
  * position (`gateway_epoch`, `ingest_seq`; `H1R1-PROVENANCE`).
  *
+ * ## The process clock (`CO2-N1`, ADR-031, 2026-10-03)
+ *
+ * `startup()` builds its own `SystemPaperClock`, and ADR-031's entry guard
+ * reads it at admission. Against the fixture's `2026-03-04` events the host
+ * clock as-is is months late, so the settle's entry was refused and nothing
+ * filled. While the six events are published and settled
+ * ({@link publishSixAndSettle}), every `SystemPaperClock` now reads the host
+ * clock RE-BASED to the fixture's first event (`support/host-clock.ts`,
+ * `rebaseSystemPaperClock`: the prototype's `now()` only — not the global
+ * `Date`, so the database, the transport and the bounds measured here keep
+ * real time). The lag the guard sees is the real processing delay. The
+ * re-basing is restored once the process is quiescent, before any fault.
+ *
  * ## What it does NOT prove (disclosed)
  *
  * - "No order after the outage" is shown on the process's own counters and
@@ -155,6 +168,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { EXIT_CODES, REDIS_RESPONSE_TIMEOUT_ENV, startup } from "../../../apps/trader/src/main.js";
 import { GATEWAY_EPOCH, recordedEvents, safeEnvironment } from "./support/fixture.js";
+import { FIXTURE_FIRST_EVENT_AT, rebaseSystemPaperClock } from "./support/host-clock.js";
 import {
   CONDITION_ID,
   documentFor,
@@ -406,19 +420,25 @@ async function publishSixAndSettle(options: {
 }): Promise<Settled> {
   const { publisher, stream, consumerId, label, healthUrl, context, registered } = options;
   const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
-  for (const event of events) {
-    await publisher.publish(stream, event.envelope);
+  // `CO2-N1` (ADR-031): the process's clock, re-based to the first event while the six are admitted.
+  const rebased = rebaseSystemPaperClock(FIXTURE_FIRST_EVENT_AT);
+  try {
+    for (const event of events) {
+      await publisher.publish(stream, event.envelope);
+    }
+    await waitFor(
+      `the process's pump to commit its position past all ${String(events.length)} events ` +
+        `(consumer "${consumerId}" at lag 0), which it does only after drain() — every durable write — returned`,
+      60_000,
+      async () => {
+        const metrics = await publisher.streamMetrics(stream);
+        const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
+        return metrics.publishedTotal === events.length && lag === 0 ? metrics : undefined;
+      },
+    );
+  } finally {
+    rebased.restore();
   }
-  await waitFor(
-    `the process's pump to commit its position past all ${String(events.length)} events ` +
-      `(consumer "${consumerId}" at lag 0), which it does only after drain() — every durable write — returned`,
-    60_000,
-    async () => {
-      const metrics = await publisher.streamMetrics(stream);
-      const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
-      return metrics.publishedTotal === events.length && lag === 0 ? metrics : undefined;
-    },
-  );
   const health = await readHealth(healthUrl);
   const rows = await durableRows(context, registered);
   const settled = { health, rows };
