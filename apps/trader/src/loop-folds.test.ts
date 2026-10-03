@@ -89,6 +89,7 @@ import {
   type AccountingChecks,
 } from "@polymarket-bot/trading-core";
 import { HaltController } from "@polymarket-bot/trading-core";
+import { PER_FRAME_EVALUATION_CADENCE } from "@polymarket-bot/trading-core";
 import { HealthState, RealizedPnlBook } from "@polymarket-bot/trading-core";
 import { healthResponseBody } from "./health-server.js";
 import { InstanceRegistry } from "@polymarket-bot/trading-core";
@@ -488,6 +489,13 @@ function assemble(
     tokenAssetIds,
     outbox,
     ...(accountingChecks === undefined ? {} : { accountingChecks }),
+    // `CADENCE-1` (ADR-026 D1.6): this harness's timelines were written for,
+    // and pin, ADR-024's per-frame cadence — fills booked at named events, several at one
+    // instant. They are not about
+    // the cadence, so they REPRODUCE that cadence (the value 0, declared);
+    // the cadence itself is pinned by `cadence.test.ts` and
+    // `loop-cadence.test.ts`.
+    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:apps/trader/src/loop-folds.test.ts" },
   });
   wiring.loop = loop;
   return { loop, store, book, ordinal: 0 };

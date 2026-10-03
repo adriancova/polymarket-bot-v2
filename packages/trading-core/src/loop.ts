@@ -121,6 +121,13 @@ import {
   type BookFreshnessBasis,
   type ConfirmedInstant,
 } from "./book-freshness.js";
+import {
+  EvaluationCadenceClock,
+  PAPER_EVALUATION_CADENCE,
+  evaluationCadenceProblem,
+  type CadenceAlarm,
+  type EvaluationCadenceOption,
+} from "./cadence.js";
 import { CancelLedger } from "./cancels.js";
 import {
   bookFreshnessBasisOf,
@@ -371,6 +378,24 @@ export interface CoreLoopOptions {
    * safe integer.
    */
   readonly accountingChecks?: AccountingChecks;
+  /**
+   * `CADENCE-1` — the ADR-026 evaluation cadence (`cadence.ts`). Omitted: the
+   * PAPER cadence, `PAPER_EVALUATION_CADENCE` (1,000 ms and 5,000 ms), which
+   * every live-data run and every replay that is not a reproduction uses
+   * (D1.5). The per-frame value 0 is accepted only with `reproduces` (D1.6):
+   * the golden harnesses and a `backtest-cli run --reproduces` pass it IN
+   * CODE. A programmatic option, never operator configuration; the
+   * constructor refuses anything `evaluationCadenceProblem` refuses
+   * (`createPaperTrader` refuses it by name first).
+   */
+  readonly evaluationCadence?: EvaluationCadenceOption;
+  /**
+   * `CADENCE-1` (ADR-026 D2.10) — told when a forward-jump alarm episode
+   * starts or ends, so the composition root can log the line an operator's
+   * pager watches (`main.ts`). Output only: nothing it does reaches a
+   * decision, and a hook that throws is contained.
+   */
+  readonly onCadenceAlarm?: (alarm: CadenceAlarm) => void;
 }
 
 /**
@@ -800,9 +825,28 @@ export class CoreLoop {
    * never outlives a drain (see `drain`).
    */
   #frame: OpenFrame | undefined;
+  /**
+   * `CADENCE-1` (ADR-026): the evaluation cadence's clock — `now`, each
+   * market's `last`, the markets still owed, the alarm episode. Moved only by
+   * APPLIED events (`#processEvent`), and read only at a frame close.
+   */
+  readonly #cadence: EvaluationCadenceClock;
+  /** `CADENCE-1`: the cadence this loop runs with, as it was handed in (for the run's artifact). */
+  readonly #cadenceOption: EvaluationCadenceOption;
 
   constructor(options: CoreLoopOptions) {
     this.#options = options;
+    const cadence: EvaluationCadenceOption = options.evaluationCadence ?? PAPER_EVALUATION_CADENCE;
+    const cadenceProblem = evaluationCadenceProblem(cadence);
+    if (cadenceProblem !== undefined) {
+      throw new Error(`the core loop refuses its evaluation cadence: ${cadenceProblem}`);
+    }
+    this.#cadenceOption = Object.freeze({
+      intervalMs: cadence.intervalMs,
+      heartbeatMs: cadence.heartbeatMs,
+      ...(cadence.reproduces === undefined ? {} : { reproduces: cadence.reproduces }),
+    });
+    this.#cadence = new EvaluationCadenceClock(this.#cadenceOption);
     this.#queue = new BoundedQueue<IngestedEvent>({
       name: "ingest",
       maximumDepth: options.config.queues.ingestMaximumDepth,
@@ -981,6 +1025,15 @@ export class CoreLoop {
     return Object.freeze({ matched: ledgerMatched && pnl.matched, pnlStreamsChecked: pnl.checked });
   }
 
+  /**
+   * `CADENCE-1`: the evaluation cadence this loop runs with (ADR-026 D1) — the
+   * two settings and, for a declared reproduction, what it reproduces. A
+   * fresh frozen record; a run's artifact prints it.
+   */
+  evaluationCadence(): EvaluationCadenceOption {
+    return this.#cadenceOption;
+  }
+
   queueMetrics(): readonly QueueMetrics[] {
     return Object.freeze([this.#queue.metrics(this.#lastEpochMs)]);
   }
@@ -1150,6 +1203,9 @@ export class CoreLoop {
     this.#lastInstant = instant.instant;
     this.#lastEpochMs = instant.epochMs;
     this.#options.health.countLoop("eventsProcessed");
+    // `CADENCE-1` (ADR-026 D2.1): the event is APPLIED — it passed the door and
+    // its instant normalised — so it, and only it, moves the cadence clock.
+    this.#observeCadence(instant.epochMs, instant.instant);
     // `THROUGHPUT-1c` (ADR-023 D5): every consumed event is offered to the
     // delivery-session table before anything else reads it, so a book
     // evaluated at this event's instant is vouched for by at most this event.
@@ -1209,8 +1265,14 @@ export class CoreLoop {
       }
       this.#sweepCancels(instant.instant, instant.epochMs);
       for (const [marketId, market] of this.#options.markets) {
-        if (this.#options.halts.isMarketHalted(marketId)) continue;
+        if (this.#options.halts.isMarketHalted(marketId)) {
+          this.#cadence.dropOwed(marketId);
+          continue;
+        }
         market.observeInstant(instant.instant, instant.epochMs);
+        // `CADENCE-1` (ADR-026 D2): every market is owed; each is evaluated
+        // only if the cadence allows it at this close, and stays owed if not.
+        if (!this.#admitOwed(marketId)) continue;
         await this.#evaluateMarket(
           market,
           dispatchPositionOf(envelope),
@@ -1226,21 +1288,58 @@ export class CoreLoop {
 
     const affected = affectedMarketIds(envelope.payload);
     const known = affected.filter((marketId) => this.#options.markets.has(marketId));
-    if (known.length === 0) return;
+    // `CADENCE-1` (ADR-026 D3.2): this event is the frame's last APPLIED event,
+    // so it is the source of every carried-over or heartbeat evaluation its
+    // close runs — even though it owes no configured market one.
+    const applied: AppliedEventPosition = {
+      source: dispatchPositionOf(envelope),
+      instant: instant.instant,
+      epochMs: instant.epochMs,
+    };
+    if (known.length === 0) {
+      // ADR-024: an event that names no configured market harvests nothing
+      // and flushes nothing — unless the cadence evaluated something at its
+      // close, whose decisions and fills must be harvested and flushed as any
+      // evaluation's are. At the per-frame value 0 that never happens.
+      if (!(await this.#runCarriedPass(applied, new Set()))) return;
+      await this.#harvestFills(instant.instant);
+      await this.#flushOutbox();
+      return;
+    }
 
     // --- every cancel reaches a terminal fact (WP-220 obligation 10) -------
     this.#sweepCancels(instant.instant, instant.epochMs);
 
+    // `CADENCE-1`: the markets this close has decided (evaluated or coalesced),
+    // so each is decided at most once per close (ADR-026 D2.12).
+    const decided = new Set<string>();
     for (const marketId of known) {
       const market = this.#options.markets.get(marketId);
       if (market === undefined) continue;
       market.observeInstant(instant.instant, instant.epochMs);
       const callback = this.#applyEvent(market, envelope, event, instant.instant, instant.epochMs);
       if (callback === undefined) continue;
-      if (this.#options.halts.isMarketHalted(marketId)) continue;
+      if (this.#options.halts.isMarketHalted(marketId)) {
+        this.#cadence.dropOwed(marketId);
+        continue;
+      }
+      // `CADENCE-1` (ADR-026, the ADR-024 D3 one-event row): every callback
+      // other than `onFeatures` fires in place, as before (D4). The
+      // `onFeatures` evaluation follows the cadence like any other frame's:
+      // it runs here, in place, only if the cadence allows it at this close.
+      if (callback.kind === "onFeatures") {
+        if (!this.#cadence.perFrame) {
+          if (decided.has(marketId)) continue;
+          decided.add(marketId);
+        }
+        if (!this.#admitOwed(marketId)) continue;
+      }
       // --- steps 3-9 -------------------------------------------------------
       await this.#evaluateMarket(market, dispatchPositionOf(envelope), callback, instant.instant, instant.epochMs);
     }
+    // `CADENCE-1` (ADR-026 D2.12): then the carried-over and heartbeat
+    // evaluations, in configured order, sourced at this event (D3.2).
+    await this.#runCarriedPass(applied, decided);
 
     // --- fills the venue produced, plus their accounting -------------------
     await this.#harvestFills(instant.instant);
@@ -1263,12 +1362,16 @@ export class CoreLoop {
     instant: string,
     epochMs: number,
   ): Promise<void> {
-    const frame = (this.#frame ??= { owed: new Map(), harvestAt: undefined });
+    const frame = (this.#frame ??= { owed: new Map(), harvestAt: undefined, lastApplied: undefined });
     // r1 (`TP2-R1-M1`): what an event contributes is recorded only where it
     // would have acted alone — an owed evaluation names THIS event, and the
     // harvest instant moves only for an event that reaches the harvest point.
     // An event for a market this trader does not run changes neither.
     const at: OwedEvaluation["at"] = { source: dispatchPositionOf(envelope), instant, epochMs };
+    // `CADENCE-1` (ADR-026 D3.2): EVERY applied event of the frame — one for a
+    // market this trader does not run included — is, while it is the latest,
+    // the source of the close's carried-over and heartbeat evaluations.
+    frame.lastApplied = at;
 
     if (envelope.eventType === "ReferenceTradeObserved") {
       const venue = readString(envelope.payload, "venue");
@@ -1337,8 +1440,16 @@ export class CoreLoop {
     const frame = this.#frame;
     if (frame === undefined) return;
     this.#frame = undefined;
+    // `CADENCE-1` (ADR-026 D2.12): first the markets this frame owed, in the
+    // order above, each only if the cadence allows it at this close...
+    const decided = new Set<string>();
     for (const [marketId, owed] of frame.owed) {
-      if (this.#options.halts.isMarketHalted(marketId)) continue;
+      if (this.#options.halts.isMarketHalted(marketId)) {
+        this.#cadence.dropOwed(marketId);
+        continue;
+      }
+      decided.add(marketId);
+      if (!this.#admitOwed(marketId)) continue;
       await this.#evaluateMarket(
         owed.market,
         owed.at.source,
@@ -1347,9 +1458,101 @@ export class CoreLoop {
         owed.at.epochMs,
       );
     }
-    if (frame.harvestAt === undefined) return;
-    await this.#harvestFills(frame.harvestAt);
+    // ...then the carried-over and heartbeat evaluations, in configured order,
+    // each sourced at the frame's last APPLIED event (D3.2). A frame with no
+    // applied event has no `lastApplied` and evaluates nothing (D3.3) — and
+    // such a frame is never opened: only an applied event opens one.
+    let harvestAt = frame.harvestAt;
+    if (frame.lastApplied !== undefined && (await this.#runCarriedPass(frame.lastApplied, decided))) {
+      // The carried pass evaluated at the frame's last applied event, so that
+      // event reached the harvest point: the harvest runs at its instant.
+      harvestAt = frame.lastApplied.instant;
+    }
+    if (harvestAt === undefined) return;
+    await this.#harvestFills(harvestAt);
     await this.#flushOutbox();
+  }
+
+  /**
+   * `CADENCE-1` (ADR-026 D2.1, D2.10): one APPLIED event moves the cadence
+   * clock; an event lying more than the alarm bound behind it is a
+   * forward-jump alarm, counted, and an episode's start and end are told to
+   * the composition root's hook. Never called for a refused event.
+   */
+  #observeCadence(epochMs: number, instant: string): void {
+    const seen = this.#cadence.observeApplied(epochMs, instant);
+    if (seen.alarmed) this.#options.health.countLoop("cadenceForwardJumpAlarms");
+    const hook = this.#options.onCadenceAlarm;
+    if (seen.transition === undefined || hook === undefined) return;
+    try {
+      hook(seen.transition);
+    } catch {
+      // Output only (see `CoreLoopOptions.onCadenceAlarm`): a log hook that
+      // throws must not change what the loop does. The counter above moved.
+    }
+  }
+
+  /**
+   * `CADENCE-1` (ADR-026 D2.4-D2.6, D5.6): a market OWED at this close is
+   * evaluated if the cadence allows it — its `last` becomes `t` — or else it
+   * is COALESCED: counted once for this close, and carried, still owed, to a
+   * later close. At the per-frame value 0 every owed market is evaluated.
+   */
+  #admitOwed(marketId: string): boolean {
+    if (this.#cadence.due(marketId, true)) {
+      this.#cadence.markEvaluated(marketId);
+      return true;
+    }
+    this.#cadence.carry(marketId);
+    this.#options.health.countLoop("evaluationsCoalesced");
+    return false;
+  }
+
+  /**
+   * `CADENCE-1` (ADR-026 D2.4, D2.7, D2.12, D3.2): after the markets the
+   * closing frame owed, every OTHER configured market, in configured order —
+   * the order a reference trade evaluates them in, each market's instances in
+   * §8.2 order — is evaluated if the cadence allows it: a market still owed
+   * from an earlier close once `t − last ≥ evaluationIntervalMs`, and any
+   * market once `t − last ≥ evaluationHeartbeatMs`. Each such evaluation's
+   * source and `evaluatedAt` are `applied`'s: the frame's last APPLIED event.
+   * A market still owed and not allowed is coalesced again (counted for this
+   * close). A halted market is not evaluated and its owed evaluation is
+   * dropped (D2.11). Before the first evaluation, the cancels are swept at
+   * `applied`'s instant, as before any evaluation an event triggers.
+   *
+   * Answers whether anything was evaluated. At the per-frame value 0 nothing
+   * is carried and there is no heartbeat, so it evaluates nothing.
+   */
+  async #runCarriedPass(applied: AppliedEventPosition, decided: ReadonlySet<string>): Promise<boolean> {
+    if (this.#cadence.perFrame) return false;
+    const due: [string, MarketState][] = [];
+    for (const [marketId, market] of this.#options.markets) {
+      if (decided.has(marketId)) continue;
+      if (this.#options.halts.isMarketHalted(marketId)) {
+        this.#cadence.dropOwed(marketId);
+        continue;
+      }
+      const carried = this.#cadence.isCarried(marketId);
+      if (this.#cadence.due(marketId, carried)) {
+        due.push([marketId, market]);
+      } else if (carried) {
+        this.#options.health.countLoop("evaluationsCoalesced");
+      }
+    }
+    if (due.length === 0) return false;
+    // --- every cancel reaches a terminal fact (WP-220 obligation 10) -------
+    this.#sweepCancels(applied.instant, applied.epochMs);
+    for (const [marketId, market] of due) {
+      // An evaluation earlier in this pass, or the sweep, may have halted it.
+      if (this.#options.halts.isMarketHalted(marketId)) {
+        this.#cadence.dropOwed(marketId);
+        continue;
+      }
+      this.#cadence.markEvaluated(marketId);
+      await this.#evaluateMarket(market, applied.source, { kind: "onFeatures" }, applied.instant, applied.epochMs);
+    }
+    return true;
   }
 
   /**
@@ -4305,7 +4508,16 @@ interface OpenFrame {
    * event harvests fills and flushes; `undefined` when none did.
    */
   harvestAt: string | undefined;
+  /**
+   * `CADENCE-1` (ADR-026 D3.2): the frame's last APPLIED event — the source of
+   * the close's carried-over and heartbeat evaluations. Set by every applied
+   * event, so defined from the frame's first.
+   */
+  lastApplied: AppliedEventPosition | undefined;
 }
+
+/** `CADENCE-1`: an applied event's dispatch position and instant (ADR-026 D3.2). */
+type AppliedEventPosition = OwedEvaluation["at"];
 
 /** One market's owed evaluation: the market, and the last frame event that owed it. */
 interface OwedEvaluation {

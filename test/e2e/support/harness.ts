@@ -50,9 +50,11 @@ import {
 } from "@polymarket-bot/simulation";
 import {
   EVERY_FILL_ACCOUNTING_CHECKS,
+  PER_FRAME_EVALUATION_CADENCE,
   buildSimulatedVenue,
   createPaperTrader,
   type CreateTraderResult,
+  type EvaluationCadenceOption,
   type PaperTrader,
   type TraderStore,
 } from "@polymarket-bot/trader";
@@ -90,6 +92,23 @@ export interface AssembleOptions {
    * directly. `parts.store` is always the in-memory store itself.
    */
   readonly wrapStore?: (store: MemoryTraderStore) => TraderStore;
+  /**
+   * `CADENCE-1` (ADR-026 D1.6): the evaluation cadence. Absent — as in every
+   * golden run — the scenario's golden is REPRODUCED: the per-frame cadence it
+   * was recorded under (ADR-024), declared with the golden's path
+   * ({@link goldenReproduction}). A test of the cadence itself passes the
+   * PAPER cadence (`PAPER_EVALUATION_CADENCE`).
+   */
+  readonly evaluationCadence?: EvaluationCadenceOption;
+}
+
+/**
+ * `CADENCE-1` (ADR-026 D1.6): the cadence a scenario's golden was recorded
+ * under — ADR-024's per-frame cadence, the value 0 — declared as a
+ * reproduction of that golden, named by its repository path.
+ */
+export function goldenReproduction(scenario: Scenario): EvaluationCadenceOption {
+  return { ...PER_FRAME_EVALUATION_CADENCE, reproduces: `test/replay-golden/paper-e2e/${scenario.goldenFile}` };
 }
 
 /** A string field of an unparsed document, or a stated fallback. */
@@ -172,6 +191,8 @@ export function assemble(options: AssembleOptions = {}): {
     // after EVERY fill. A mismatch latches a GLOBAL halt, which the golden's
     // `health.halts` would show.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    // `CADENCE-1`: the golden's reproduction unless the caller says otherwise.
+    evaluationCadence: options.evaluationCadence ?? goldenReproduction(scenario),
   });
   if (!result.ok) return { result, parts: undefined };
   built.wiring.trader = result.trader;

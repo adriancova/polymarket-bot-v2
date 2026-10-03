@@ -46,6 +46,11 @@ const CONFIG: Record<string, unknown> = JSON.parse(readFileSync(join(FIXTURE, "t
 const PINS: Record<string, unknown> = {
   ...(JSON.parse(readFileSync(join(FIXTURE, "run-pins.json"), "utf8")) as Record<string, unknown>),
   normalizerVersion: APPROXIMATE_TRANSLATION_VERSION,
+  // `CADENCE-1` (ADR-026 D1.5): an approximate replay is never a reproduction,
+  // so it runs the PAPER cadence (the exact golden's pins declare 0, for its
+  // reproduction).
+  evaluationIntervalMs: 1000,
+  evaluationHeartbeatMs: 5000,
 };
 const MARKET_ID = "019b1e00-0000-7000-8000-000000000001";
 const C = "0xbacktest1condition";
@@ -210,9 +215,16 @@ describe("acceptance 1 through the real core: release order, not instant order",
     expect(run.outcome.result.clock.wallClockRegressions).toBe(1);
     expect(run.outcome.result.clock.currentAt).toBe(new Date(at2).toISOString());
     expect(run.outcome.result.clock.startedAt).toBe(new Date(at1).toISOString());
-    // F2's trade reached the core after F1 and, its instant being earlier than the core's last
-    // snapshot, produced no feature snapshot (the core's own rule, live and replay alike).
-    expect(run.core.trader.loop.health().loop.snapshotsUnavailable).toBe(1);
+    // F2's trade reached the core after F1 and was APPLIED (both frames' five events were
+    // processed). `CADENCE-1` (ADR-026 D2.8): an approximate replay runs the PAPER evaluation
+    // cadence, and F2's instant (9,999 ms) lies behind the cadence clock F1 set (10,000 ms), at
+    // which the market was just evaluated; a backward step adds no evaluation, so the market F2
+    // owed is COALESCED — not evaluated, no decision owed — rather than evaluated at an instant
+    // earlier than its snapshot (which per-frame, before ADR-026, produced no feature snapshot).
+    const loopHealth = run.core.trader.loop.health().loop;
+    expect(loopHealth.eventsProcessed).toBe(5);
+    expect(loopHealth.evaluationsCoalesced).toBe(1);
+    expect(loopHealth.snapshotsUnavailable).toBe(0);
     expect(decisions.some((decision) => decision.sourceEventId === id("2", at2, 0))).toBe(false);
     await run.core.store.close();
   });

@@ -760,6 +760,20 @@ export interface ReplayRunPins {
   readonly settlementSpecVersions: readonly string[];
   /** Identity of the code that produced the run (§12.4 "code commit"). */
   readonly simulatorVersion: string;
+  /**
+   * `CADENCE-1` (ADR-026 D1.1, D1.3): the run's `evaluationIntervalMs` — the
+   * shortest event-time gap, in ms, between two `onFeatures` evaluations of one
+   * market. A JSON integer, 0 or more. Which values a run may USE is the core's
+   * policy (1000, or 0 for a declared reproduction); this door holds only the
+   * shape every run record holds (migration 0010's checks).
+   */
+  readonly evaluationIntervalMs: number;
+  /**
+   * `CADENCE-1` (ADR-026 D1.2-D1.3): the run's `evaluationHeartbeatMs`. A JSON
+   * integer, 0 or more; 0 exactly when `evaluationIntervalMs` is 0 (the
+   * per-frame cadence has no heartbeat).
+   */
+  readonly evaluationHeartbeatMs: number;
 }
 
 const RUN_PIN_STRING_FIELDS: readonly (keyof ReplayRunPins)[] = [
@@ -775,7 +789,16 @@ const RUN_PIN_STRING_FIELDS: readonly (keyof ReplayRunPins)[] = [
 ];
 
 /** Every key a §12.5 run pin set may carry. Nothing else crosses this door. */
-const RUN_PIN_KEYS: readonly string[] = [...RUN_PIN_STRING_FIELDS, "runSeed", "settlementSpecVersions"];
+const RUN_PIN_KEYS: readonly string[] = [
+  ...RUN_PIN_STRING_FIELDS,
+  "runSeed",
+  "settlementSpecVersions",
+  "evaluationIntervalMs",
+  "evaluationHeartbeatMs",
+];
+
+/** `CADENCE-1`: the two evaluation-cadence pins (ADR-026 D1), each a non-negative safe integer. */
+const RUN_PIN_CADENCE_FIELDS = ["evaluationIntervalMs", "evaluationHeartbeatMs"] as const;
 
 /**
  * Validates a run pin set, prototype-free in and out.
@@ -837,6 +860,27 @@ export function readRunPins(offered: unknown): SimulationResult<ReplayRunPins> {
           "settlementSpecVersions[] must be bounded non-empty strings",
         );
       }
+    }
+    // `CADENCE-1` (ADR-026 D1.3): the evaluation cadence is pinned in the run
+    // record of every replay. Required, each a non-negative safe integer, and
+    // 0 together or not at all — the shape migration 0010 gives a run row.
+    for (const field of RUN_PIN_CADENCE_FIELDS) {
+      const member = readField(value, field);
+      if (typeof member !== "number" || !Number.isSafeInteger(member) || member < 0) {
+        return simulationFailure(
+          "REPLAY_MANIFEST_PIN_MISSING",
+          `the §12.5 run pin ${field} must be a non-negative integer number of milliseconds; ADR-026 D1.3 pins ` +
+            "the evaluation cadence in the run record of every replay",
+          { pin: field },
+        );
+      }
+    }
+    if ((readField(value, "evaluationIntervalMs") === 0) !== (readField(value, "evaluationHeartbeatMs") === 0)) {
+      return simulationFailure(
+        "REPLAY_MANIFEST_INVALID",
+        "the run pins evaluationIntervalMs and evaluationHeartbeatMs must be 0 together or not at all: 0 is " +
+          "ADR-024's per-frame cadence, which has no heartbeat (ADR-026 D1.6)",
+      );
     }
     return simulationOk(ownFrozenTree<ReplayRunPins>(value as unknown as ReplayRunPins));
   });

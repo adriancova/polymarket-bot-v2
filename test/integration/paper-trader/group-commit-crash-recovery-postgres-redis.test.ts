@@ -26,9 +26,12 @@
  * - EQUAL TO THE UNINTERRUPTED RUN: those k decisions and k checkpoints are,
  *   column for column (ids and wall timestamps aside), the reference run's
  *   first k;
- * - THE POSITION AGREES: the consumer position stored in Redis is exactly the
- *   end of A — never past a decision that is not durable. Every event before
- *   it has its decision durable.
+ * - THE POSITION AGREES: the consumer position stored in Redis is never
+ *   before the end of A and never past a decision that is not durable. Every
+ *   event before it has its decision durable. (`CADENCE-1`: it was exactly
+ *   the end of A while every frame decided; under ADR-026 B's first frames
+ *   are coalesced and decide nothing, so the position may be recorded inside
+ *   B, up to the first batch that holds a decision.)
  *
  * ## The restart
  *
@@ -37,6 +40,15 @@
  * the same instance (`startRun`, as that refusal instructs) resumes from the
  * stored position: it decides exactly the events after it — every one of
  * them, and none before it.
+ *
+ * `CADENCE-1` (ADR-026 D2.3): "every one of them" now means what a NEW run
+ * decides there. The evaluation cadence is a run's own — `last` is "the value
+ * of `now` at the market's last `onFeatures` evaluation in this run" — so the
+ * new run starts with no `last`, and over the events after the position it
+ * decides exactly what a FRESH run fed only those events decides (computed
+ * in-process below, through the same core), not what the uninterrupted run
+ * decided there with A's cadence state behind it. Everything before the
+ * restart — the prefix, the position, the frame boundary — is unchanged.
  *
  * `THROUGHPUT-2` (ADR-024): every publication here is frame-atomic, as the
  * gateway's is, and the file pins that the stored position is a frame
@@ -67,7 +79,14 @@ import { createDatabase, createPostgresPool, createRepositories, migrateUp } fro
 import { createIsolatedDatabase, startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { sameFrame } from "@polymarket-bot/trader";
+import {
+  PAPER_EVALUATION_CADENCE,
+  buildSimulatedVenue,
+  createPaperTrader,
+  parseTraderConfig,
+  sameFrame,
+} from "@polymarket-bot/trader";
+import { ManualClock, MemoryTraderStore } from "@polymarket-bot/trader/testing";
 
 import { H1_MARKET_ID, readEnvelope, readEnvelopes, remapMarketId, withMarketOpened } from "./support/throughput/fixture.js";
 import { benchEnvironment, registerForBench } from "./support/throughput/harness.js";
@@ -76,6 +95,13 @@ const execFileAsync = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../../..");
 const fixtures = path.resolve(here, "../../fixtures/trader-throughput");
+
+/**
+ * `CADENCE-1` (ADR-026): the durable decisions an uninterrupted run makes on
+ * the sample at the PAPER cadence — see
+ * `throughput-bench-harness-postgres-redis.test.ts`, which pins the same.
+ */
+const CADENCE_DECISIONS = 4;
 
 /** Batch A: `MarketOpened` + the sample's first 460 envelopes (B opens on a book snapshot pair). */
 const BATCH_A = 461;
@@ -241,6 +267,24 @@ async function publish(run: Scenario, from: number, to: number): Promise<void> {
   }
 }
 
+/**
+ * `CADENCE-1`: `publish`, but in as FEW transport calls as possible — runs of
+ * whole frames of at most 1,024 envelopes (the transport's one-call limit) —
+ * so a reader sees B's first 128 entries at once. Still frame-atomic: no
+ * frame is ever split across two calls (ADR-024 D2.1).
+ */
+async function publishInWholeFrameRuns(run: Scenario, from: number, to: number): Promise<void> {
+  expect(onFrameBoundary(run.envelopes, from) && onFrameBoundary(run.envelopes, to)).toBe(true);
+  for (let start = from; start < to; ) {
+    let end = Math.min(start + 1_024, to);
+    while (end > start + 1 && !onFrameBoundary(run.envelopes, end)) end -= 1;
+    const result = await run.publisher.publishBatch(run.stream, run.envelopes.slice(start, end));
+    expect(result.failure).toBeUndefined();
+    expect(result.receipts).toHaveLength(end - start);
+    start = end;
+  }
+}
+
 /** Is `index` a frame boundary: no frame has events on both sides of it? */
 function onFrameBoundary(envelopes: readonly EventEnvelope<unknown>[], index: number): boolean {
   return index <= 0 || index >= envelopes.length || !sameFrame(envelopes[index - 1], envelopes[index]);
@@ -294,6 +338,55 @@ async function durableRows(databaseUrl: string, runId: string, ids: readonly str
   }
 }
 
+/**
+ * `CADENCE-1` (ADR-026 D2.3): the source events a FRESH run of `document` —
+ * the same core, the PAPER cadence, no history — decides at over `envelopes`,
+ * fed frame by frame as the trader's feed hands frames out (never split). In
+ * process, over the in-memory store: only the cadence decides WHICH events
+ * are evaluated, and it reads event time only (D6).
+ */
+async function freshRunSources(
+  document: Record<string, unknown>,
+  envelopes: readonly EventEnvelope<unknown>[],
+): Promise<string[]> {
+  const parsed = parseTraderConfig(document);
+  if (!parsed.ok) throw new Error(`${parsed.refusal.code}: ${parsed.refusal.issues.join("; ")}`);
+  const clock = new ManualClock(envelopes[0]?.receivedAt ?? "2026-09-29T21:00:00Z");
+  const built = buildSimulatedVenue({ clock, settings: parsed.config.simulation });
+  if (!built.ok) throw new Error(built.refusal.message);
+  const created = createPaperTrader({
+    env: benchEnvironment("postgres://unused"),
+    config: document,
+    clock,
+    venue: built.venue,
+    store: new MemoryTraderStore(),
+    idNamespace: "cadence-1-fresh-run",
+    evaluationCadence: PAPER_EVALUATION_CADENCE,
+  });
+  if (!created.ok) throw new Error(`${created.refusal.code}: ${created.refusal.issues.join("; ")}`);
+  built.wiring.trader = created.trader;
+  const loop = created.trader.loop;
+  for (let start = 0; start < envelopes.length; ) {
+    let end = start + 1;
+    while (end < envelopes.length && sameFrame(envelopes[start], envelopes[end])) end += 1;
+    for (const [offset, envelope] of envelopes.slice(start, end).entries()) {
+      loop.ingest({
+        envelope,
+        identity: {
+          gatewayEpoch: envelope.gatewayEpoch,
+          ingestSeq: envelope.ingestSeq,
+          receivedAt: envelope.receivedAt,
+          datasetRowOrdinal: start + offset,
+        },
+      });
+    }
+    await loop.drain();
+    start = end;
+  }
+  expect(created.trader.halts.anyHalt).toBe(false);
+  return loop.decisions().map((decision) => decision.sourceEventId);
+}
+
 function mintedIds(document: Record<string, unknown>): string[] {
   const market = (document["markets"] as Record<string, unknown>[])[0] ?? {};
   const instance = (document["instances"] as Record<string, unknown>[])[0] ?? {};
@@ -312,10 +405,12 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
     referenceProcess.child.kill("SIGKILL");
     await referenceProcess.exit;
     const referenceRows = await durableRows(reference.databaseUrl, reference.runId, mintedIds(reference.document));
-    // `THROUGHPUT-2` (ADR-024): one decision per venue frame — the sample's 928
+    // `CADENCE-1` (ADR-026): at most one evaluation per market per 1 s of event
+    // time — the sample's CADENCE_DECISIONS
     // (`throughput-bench-harness-postgres-redis.test.ts` pins the same count;
-    // before frames it was one per event, 1,837, and this line read "> 1,000").
-    expect(referenceRows.decisions.length).toBe(928);
+    // per frame (ADR-024) it was 928, per event 1,837, and this line read
+    // "> 1,000").
+    expect(referenceRows.decisions.length).toBe(CADENCE_DECISIONS);
     await reference.publisher.close();
 
     // --- 2. the crash run: A consumed and recorded, B in flight -----------------
@@ -329,7 +424,13 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
     try {
       await lock.query("begin");
       await lock.query("lock table strategy.decisions in exclusive mode");
-      await publish(crash, BATCH_A, crash.envelopes.length);
+      // `CADENCE-1` (ADR-026): B in whole-frame RUNS, so the trader's first
+      // read of B is a full 128-entry batch, and it holds B's first decision
+      // (the cadence evaluates at most once per 1 s of event time, so B's
+      // first ~60 envelopes are coalesced and decide nothing — read alone,
+      // their batch would be durable at once and its position recorded past
+      // the end of A, mid-book, where no new run could resume).
+      await publishInWholeFrameRuns(crash, BATCH_A, crash.envelopes.length);
       // The trader's group commit, blocked on the lock: mid-batch.
       const blocked = await waitFor("the trader's commit to block on the lock", 60_000, async () => {
         const rows = await lockPool.query<{ pid: number }>(
@@ -359,18 +460,31 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
     // Equal to the uninterrupted run, column for column.
     expect(crashed.decisions).toEqual(referenceRows.decisions.slice(0, k));
     expect(crashed.checkpoints).toEqual(referenceRows.checkpoints.slice(0, k));
-    // Nothing of the in-flight batch B is durable, and every event of A is.
-    const aEvents = new Set(crash.envelopes.slice(0, BATCH_A).map((envelope) => envelope.eventId));
-    const referenceA = referenceRows.decisions.filter((row) => aEvents.has(String(row["source_event_id"])));
-    expect(k).toBe(referenceA.length);
-    // The stored position agrees: exactly the end of A, never past a decision that is not durable.
-    expect(await recordedPosition(crash)).toBe(BATCH_A);
+    // The stored position agrees: never before the end of A, and never past a
+    // decision that is not durable. `CADENCE-1` (ADR-026): it may now lie
+    // INSIDE B — B's first frames, within 1 s of event time of A's last
+    // evaluation, are coalesced and decide nothing, so their batches are
+    // durable at once and their position is recorded; the first batch with a
+    // decision is the one whose commit the lock holds. (Per frame, every
+    // frame decided, and the position stopped exactly at the end of A.)
+    const position = (await recordedPosition(crash)) ?? -1;
+    expect(position).toBeGreaterThanOrEqual(BATCH_A);
+    expect(position).toBeLessThan(crash.envelopes.length);
+    // With B published in whole-frame runs, the first batch of B holds its
+    // first decision, so the position is exactly the end of A.
+    expect(position).toBe(BATCH_A);
+    // Every decision of an event before the position is durable, and nothing
+    // of the in-flight rest is.
+    const beforePosition = new Set(crash.envelopes.slice(0, position).map((envelope) => envelope.eventId));
+    const referenceBefore = referenceRows.decisions.filter((row) => beforePosition.has(String(row["source_event_id"])));
+    expect(k).toBe(referenceBefore.length);
+    expect(k).toBeLessThan(referenceRows.decisions.length);
     // `THROUGHPUT-2` (ADR-024 D5): and never inside a venue frame. The trader
     // was killed mid-B with B's frames read in 128-entry batches — whose
     // boundaries cut two-token frames (checked below), so the feed was
     // carrying partial frames — and the position it had recorded is still a
     // frame boundary: a restart re-reads every frame whole.
-    expect(onFrameBoundary(crash.envelopes, BATCH_A)).toBe(true);
+    expect(onFrameBoundary(crash.envelopes, position)).toBe(true);
     const receiveBatch = Number(
       (crash.document["infrastructure"] as Record<string, unknown>)["receiveBatchSize"],
     );
@@ -401,6 +515,9 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
         codeCommit: "throughput-1a-test-restart",
         stateSchemaVersion: 1,
         runSeed: String(instance["runSeed"]),
+        // `CADENCE-1` (ADR-026 D1.4-D1.5): the cadence every live run records.
+        evaluationIntervalMs: 1000,
+        evaluationHeartbeatMs: 5000,
       });
     } finally {
       await database.destroy();
@@ -415,14 +532,14 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
     await resumed.exit;
 
     const resumedRows = await durableRows(crash.databaseUrl, newRunId, mintedIds(resumedDocument));
-    const bEvents = new Set(crash.envelopes.slice(BATCH_A).map((envelope) => envelope.eventId));
+    const afterPosition = new Set(crash.envelopes.slice(position).map((envelope) => envelope.eventId));
     const resumedSources = resumedRows.decisions.map((row) => String(row["source_event_id"]));
-    // It decides after the stored position only — and every event there the reference decided.
-    expect(resumedSources.every((id) => bEvents.has(id))).toBe(true);
-    const referenceB = referenceRows.decisions
-      .filter((row) => bEvents.has(String(row["source_event_id"])))
-      .map((row) => String(row["source_event_id"]));
-    expect(resumedSources).toEqual(referenceB);
+    // It decides after the stored position only — and, `CADENCE-1` (ADR-026
+    // D2.3), at exactly the events a FRESH run fed only those events decides
+    // at: a new run's cadence has no `last` (see the module header).
+    expect(resumedSources.length).toBeGreaterThan(0);
+    expect(resumedSources.every((id) => afterPosition.has(id))).toBe(true);
+    expect(resumedSources).toEqual(await freshRunSources(resumedDocument, crash.envelopes.slice(position)));
     await crash.publisher.close();
   }, 300_000);
 });

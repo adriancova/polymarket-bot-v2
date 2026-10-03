@@ -20,6 +20,7 @@ import type { IngestedEvent, PaperTrader } from "@polymarket-bot/trader";
 import { describe, expect, it } from "vitest";
 
 import {
+  adr024Reproduction,
   GATEWAY_EPOCH,
   INSTANCE_ID,
   INSTANCE_ID_2,
@@ -36,6 +37,14 @@ import {
 import { assembleOrThrow } from "./support/run.js";
 
 const CONDITION = "0xcondition";
+
+/**
+ * `CADENCE-1` (ADR-026 D1.6): this file pins ADR-024's per-frame cadence — one
+ * evaluation per frame, never on a half-applied one — so it REPRODUCES that
+ * cadence (the value 0, declared). Under the PAPER cadence a frame is still
+ * evaluated whole or not at all; `evaluation-cadence.test.ts` pins that.
+ */
+const PER_FRAME = adr024Reproduction("test/integration/paper-trader/frame-evaluation.test.ts");
 
 /** The same event as `ingested` builds, stamped as one gateway raw frame's event. */
 function inFrame(frame: string, event: IngestedEvent): IngestedEvent {
@@ -172,7 +181,7 @@ async function drive(trader: PaperTrader, events: readonly IngestedEvent[]): Pro
 
 describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied frame", () => {
   it("a two-token price_change frame is evaluated ONCE, after both tokens applied — never half-applied", async () => {
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     const seen = spyOnBooks(trader);
     const frame = [
       // One venue frame: the YES ask and the NO bid move together.
@@ -205,7 +214,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
   });
 
   it("the frame's evaluation sees BOTH tokens' new best prices; base's per-event evaluation saw YES alone first", async () => {
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     const seen = spyOnBooks(trader);
     const frame = [
       // New BEST prices on both books, in one frame.
@@ -223,7 +232,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
   });
 
   it("a single-event frame (no shared causationId) is evaluated after its own event, exactly as before", async () => {
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     const seen = spyOnBooks(trader);
     const lone = [
       level(YES_TOKEN, "ASK", "0.39", "150", 5, "2026-03-04T12:00:01.000Z"),
@@ -241,7 +250,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
   });
 
   it("a multi-trade reference frame applies every trade and evaluates the market once", async () => {
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     const trades = [0, 1, 2].map((index) =>
       inFrame(
         "300",
@@ -265,7 +274,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
   });
 
   it("a frame whose first event halts its market (desynchronized book) is not evaluated at its close", async () => {
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     const frame = [
       // A level change for a token with no baseline in this run: BOOK_DESYNCHRONIZED.
       inFrame("400", level(YES_TOKEN, "ASK", "0.39", "150", 1, "2026-03-04T12:00:01.000Z")),
@@ -280,7 +289,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
     // `apps/backtest-cli`'s raw-frame normalizers stamp every envelope derived
     // from one recorded frame with that record's (gatewayEpoch, ingestSeq);
     // the core groups them exactly as it groups the gateway's causationId.
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     const seen = spyOnBooks(trader);
     await drive(trader, opening());
     const opened = trader.loop.decisions().length;
@@ -298,7 +307,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
     // The producers' obligation (ADR-024 §2) is to hand whole frames to a
     // drain; this pins what the loop does if one does not — it never holds a
     // frame open across drains (so a recorded position is never mid-frame).
-    const { trader } = assembleOrThrow();
+    const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     await drive(trader, opening());
     const opened = trader.loop.decisions().length;
     const first = inFrame("500", level(YES_TOKEN, "ASK", "0.39", "150", 5, "2026-03-04T12:00:01.000Z"));
@@ -314,7 +323,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
   // it. On `6be3eae` both tests fail: the frame's decisions named the frame's
   // last door-passing event, whichever market it was for.
   it("r1: a frame whose last event is for a market this trader does not run is attributed to the last event that touched its market", async () => {
-    const { trader, parts } = assembleOrThrow();
+    const { trader, parts } = assembleOrThrow({ evaluationCadence: PER_FRAME });
     await drive(trader, opening());
     const opened = trader.loop.decisions().length;
     const frame = [
@@ -341,7 +350,7 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
     // The same three events, as one frame (`framed`) or as three frames of one
     // (the per-event cadence): event ids are minted identically in both.
     const run = async (framed: boolean) => {
-      const assembled = assembleOrThrow({ config: twoMarketConfig("1000") });
+      const assembled = assembleOrThrow({ config: twoMarketConfig("1000"), evaluationCadence: PER_FRAME });
       await drive(assembled.trader, twoMarketOpening());
       const opened = assembled.trader.loop.decisions().length;
       const stamp = (event: IngestedEvent): IngestedEvent => (framed ? inFrame("700", event) : event);

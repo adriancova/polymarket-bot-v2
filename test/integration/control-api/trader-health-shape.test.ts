@@ -149,6 +149,9 @@ function realSnapshot(): HealthSnapshot {
   state.countLoop("containedEvaluations");
   state.countLoop("refusedEvaluations");
   state.countLoop("deliveriesSuppressedByHalt", 2);
+  // `CADENCE-1` (ADR-026 D5.6, D2.10).
+  state.countLoop("evaluationsCoalesced", 27);
+  state.countLoop("cadenceForwardJumpAlarms", 4);
 
   state.countRiskApproval();
   state.countRiskApproval();
@@ -251,6 +254,10 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     expect(report.queues).toHaveLength(2);
     expect(report.execution.observeOnlyIntents).toBe(2);
     expect(report.loop.deliveriesSuppressedByHalt).toBe(2);
+    // `CADENCE-1`: the health door admits a trader health report carrying the
+    // evaluation cadence's two counters, exactly (work-plan acceptance 10).
+    expect(report.loop.evaluationsCoalesced).toBe(27);
+    expect(report.loop.cadenceForwardJumpAlarms).toBe(4);
     expect(report.risk.refusedExits).toBe(1);
     expect(report.risk.refusedExitsByCode).toEqual({ RISK_NO_NET_EDGE: 1 });
     expect(report.seams.allocator.refusalsByCode).toEqual({ CAPITAL_CAP_EXCEEDED: 1 });

@@ -1,0 +1,41 @@
+# Trader alert rules (CADENCE-1).
+#
+# Severities follow handoff §14.4: `page` and `notify`. Add this file to the
+# deployment's prometheus.yml `rule_files`, beside `control-api-scrape.yaml`'s
+# job: every series here is a `trader_*` family the control API renders on
+# `GET /v1/metrics` from the trader's health report.
+#
+# Machine-checked: packages/observability/src/control/trader-alerts.test.ts
+# asserts every series referenced here is a declared PLATFORM metric family,
+# and that the declared alert-name set matches EXACTLY in both directions.
+#
+# WIRING STATUS, disclosed: as for `control-api-scrape.yaml`, no real
+# Prometheus has loaded this file (GOV-2B round R5 / human item H3); the
+# host's alert routing is `HOST-1`'s.
+#
+# THE ALARM IS ALSO A LOG LINE. The trader logs one stderr line when an
+# episode starts, `CADENCE CLOCK FORWARD JUMP: …`, and one when it ends,
+# `CADENCE CLOCK CAUGHT UP: …` (`apps/trader/src/main.ts`). A trader that exits
+# before a scrape still leaves the line; page on it in the log pipeline too.
+#
+# Safety: alerting is read-only. MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false,
+# LIVE_MICRO_MAX_ORDER_NOTIONAL=0 and LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 are
+# untouched by it.
+
+groups:
+  - name: trader-evaluation-cadence
+    rules:
+      # ADR-026 D2.10: one applied event stamped far ahead moves the evaluation
+      # cadence's event clock, and every later event lies behind it: no
+      # market's onFeatures is evaluated — a stop decided in onFeatures
+      # included — until event time has moved past that clock by the interval.
+      # The rule does not recover early, so the alarm pages; it does not
+      # shorten the hold.
+      - alert: TraderCadenceForwardJump
+        expr: increase(trader_cadence_forward_jump_alarms_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "A far-future event stamp is holding every onFeatures evaluation (ADR-026 D2.10)"
+          description: "Applied events lie more than 5 s behind the trader's evaluation-cadence clock, which one event stamped far ahead moved. Until event time catches up, no market is evaluated, so no stop decided in onFeatures runs; fills, order updates and lifecycle callbacks still fire. Check the gateway's receipt clock; the trader's log carries the CADENCE CLOCK FORWARD JUMP line with both instants."

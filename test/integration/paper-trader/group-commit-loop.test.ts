@@ -31,7 +31,23 @@ import { describe, expect, it } from "vitest";
 
 import { pump } from "../../../apps/trader/src/pump.js";
 import { GROUP_COMMIT_EARLY_START_EVENTS, GROUP_COMMIT_MAX_EVENTS } from "../../../packages/trading-core/src/loop.js";
-import { assemble, GATEWAY_EPOCH, ingested, MARKET_ID, recordedEvents, YES_TOKEN } from "./support/fixture.js";
+import {
+  adr024Reproduction,
+  assemble,
+  GATEWAY_EPOCH,
+  ingested,
+  MARKET_ID,
+  recordedEvents,
+  YES_TOKEN,
+} from "./support/fixture.js";
+
+/**
+ * `CADENCE-1` (ADR-026 D1.6): these tests count group-commit STAGINGS, one per
+ * frame that decides, so their timelines (events 100 ms apart, each deciding)
+ * pin ADR-024's per-frame cadence. They REPRODUCE it (the value 0, declared);
+ * the cadence itself is pinned by `evaluation-cadence.test.ts`.
+ */
+const PER_FRAME = adr024Reproduction("test/integration/paper-trader/group-commit-loop.test.ts");
 
 /** A group commit over the fixture's in-memory store: a commit writes its batch through the per-row methods. */
 class MemoryGroupCommit implements GroupCommit {
@@ -97,6 +113,7 @@ function assembleGroupCommitting(): GroupCommitRun {
   const violations: string[] = [];
   let group: MemoryGroupCommit | undefined;
   const { result, parts } = assemble({
+    evaluationCadence: PER_FRAME,
     wrapStore: (inner): TraderStore => {
       const created = new MemoryGroupCommit(inner, log);
       group = created;
@@ -144,7 +161,7 @@ function durableContent(store: MemoryTraderStore): string {
 
 describe("group commit in the core loop (THROUGHPUT-1a)", () => {
   it("makes durable exactly what the per-row path writes, and writes no ledger row while anything is staged", async () => {
-    const plain = assemble();
+    const plain = assemble({ evaluationCadence: PER_FRAME });
     if (!plain.result.ok || plain.parts === undefined) throw new Error("unassembled");
     for (const event of recordedEvents()) plain.result.trader.loop.ingest(event);
     await plain.result.trader.loop.drain();
@@ -247,7 +264,7 @@ describe("group commit in the core loop (THROUGHPUT-1a)", () => {
         ),
       ),
     ];
-    const plain = assemble();
+    const plain = assemble({ evaluationCadence: PER_FRAME });
     if (!plain.result.ok || plain.parts === undefined) throw new Error("unassembled");
     for (const event of events()) plain.result.trader.loop.ingest(event);
     await plain.result.trader.loop.drain();

@@ -101,8 +101,9 @@ vi.mock("./pipeline.js", async (importOriginal) => {
 
 import { projectionOf } from "./accounting.js";
 import { AllocatorGate } from "./allocation.js";
+import type { EvaluationCadenceOption } from "./cadence.js";
 import { EVERY_FILL_ACCOUNTING_CHECKS, type AccountingChecks } from "./folds.js";
-import type { TraderVenue } from "./loop.js";
+import { CoreLoop, type TraderVenue } from "./loop.js";
 import { createExecutionPolicy, type VenueWiring } from "./venue-policy.js";
 import type { RetentionBounds } from "./order-lifecycle.js";
 import type { IngestedEvent } from "./ports.js";
@@ -564,6 +565,8 @@ function assemble(
     readonly retention?: RetentionBounds;
     /** `FOLD-1`: the rebuild-check cadence; the test cadence when absent (O1). */
     readonly accountingChecks?: AccountingChecks;
+    /** `CADENCE-1`: the evaluation cadence; the PAPER cadence when absent. */
+    readonly evaluationCadence?: unknown;
     readonly rateLimits?: RateLimitBudget;
     readonly maxSliceShares?: string;
     /** Wraps the venue's book provider (a book that vanishes mid-plan). */
@@ -681,9 +684,12 @@ function assemble(
     ...(input.retention === undefined ? {} : { retention: input.retention }),
     // `FOLD-1` (orchestrator call O1): checked against the rebuilds after EVERY fill.
     accountingChecks: input.accountingChecks ?? EVERY_FILL_ACCOUNTING_CHECKS,
+    ...(input.evaluationCadence === undefined
+      ? {}
+      : { evaluationCadence: input.evaluationCadence as EvaluationCadenceOption }),
   });
   if (!result.ok) {
-    throw new Error(`${result.refusal.code}: ${result.refusal.detail}`);
+    throw new Error(`${result.refusal.code}: ${result.refusal.detail} ${result.refusal.issues.join("; ")}`);
   }
   wiring.trader = result.trader;
 
@@ -1658,6 +1664,40 @@ describe("retention bounds reach the loop through createPaperTrader, and evict o
       checkEveryFills: 50,
       pnlCheck: false,
     });
+  });
+});
+
+describe("CADENCE-1 (ADR-026 D1.5-D1.6): createPaperTrader runs the PAPER cadence, and refuses anything else by name", () => {
+  it("omitted, the cadence is 1,000 ms and 5,000 ms — what every live run uses", () => {
+    expect(assemble().trader.loop.evaluationCadence()).toEqual({ intervalMs: 1_000, heartbeatMs: 5_000 });
+  });
+
+  it("the per-frame value 0 only with a declared reproduction; every other value refused — the function stays total", () => {
+    expect(assemble({ evaluationCadence: { intervalMs: 0, heartbeatMs: 0, reproduces: "a-golden.json" } }).trader.loop.evaluationCadence()).toEqual({
+      intervalMs: 0,
+      heartbeatMs: 0,
+      reproduces: "a-golden.json",
+    });
+    for (const cadence of [
+      { intervalMs: 0, heartbeatMs: 0 },
+      { intervalMs: 500, heartbeatMs: 5_000 },
+      { intervalMs: 1_000, heartbeatMs: 10_000 },
+      { intervalMs: 2_000, heartbeatMs: 10_000, reproduces: "a-golden.json" },
+      { intervalMs: "1000", heartbeatMs: "5000" },
+      { intervalMs: 0, heartbeatMs: 0, reproduces: "two words" },
+      null,
+    ]) {
+      expect(() => assemble({ evaluationCadence: cadence }), JSON.stringify(cadence)).toThrow(
+        /^TRADER_CADENCE_REFUSED: the evaluation cadence was refused/u,
+      );
+    }
+  });
+
+  it("the core loop's own constructor refuses the same (a second layer)", () => {
+    const trader = assemble().trader;
+    expect(() =>
+      Reflect.construct(CoreLoop, [{ config: trader.config, evaluationCadence: { intervalMs: 0, heartbeatMs: 0 } }]),
+    ).toThrow(/the core loop refuses its evaluation cadence/u);
   });
 });
 

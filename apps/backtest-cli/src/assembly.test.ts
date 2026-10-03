@@ -16,7 +16,10 @@
  *   drain, as the live pump returns `HALTED`, and no later recorded event
  *   reaches the core; the same core driven WITHOUT the latch keeps delivering;
  * - `run` refuses a dataset pinned to a normalizer whose stream the core
- *   does not consume.
+ *   does not consume;
+ * - `CADENCE-1` (ADR-026 D1.3-D1.6): the core runs the evaluation cadence its
+ *   run pins state; the per-frame value 0 only for a DECLARED reproduction,
+ *   1000/5000 otherwise, anything else refused before a core is built.
  *
  * NO DOCKER. NO NETWORK. NO CREDENTIAL. NO SIGNER.
  */
@@ -52,6 +55,8 @@ const FIXTURE = resolve(
 );
 const FIRST_INSTANT = { receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" };
 const ID_NAMESPACE = "backtest-1-static-bracket-replay";
+/** `CADENCE-1` (ADR-026 D1.6): the fixture's pins state 0; its golden is what a run of them reproduces. */
+const REPRODUCES = "test/replay-golden/backtest/static-bracket/expected-artifact.txt";
 
 function readJson<T>(file: string): T {
   return JSON.parse(readFileSync(join(FIXTURE, file), "utf8")) as T;
@@ -78,6 +83,7 @@ function assemble(overrides: { readonly runPins?: ReplayRunPins; readonly trader
     clockStart: FIRST_INSTANT,
     idNamespace: ID_NAMESPACE,
     accountingChecks: PAPER_ACCOUNTING_CHECKS,
+    reproduces: REPRODUCES,
   });
 }
 
@@ -286,6 +292,7 @@ describe("runBacktestCore — what the run command runs", () => {
       runPins: pins(),
       datasetDirectory: FIXTURE,
       idNamespace: ID_NAMESPACE,
+      reproduces: REPRODUCES,
     });
     expect(started.ok).toBe(true);
     if (!started.ok) return;
@@ -294,5 +301,79 @@ describe("runBacktestCore — what the run command runs", () => {
     expect(started.run.core.trader.halts.anyHalt).toBe(false);
     expect(started.run.core.store.decisions.length).toBe(12);
     expect(started.run.core.trader.loop.health().seams.folds.checkEveryFills).toBe(PAPER_ACCOUNTING_CHECKS.everyFills);
+  });
+});
+
+describe("CADENCE-1 — the evaluation cadence a replay runs is its run pins' (ADR-026 D1.3-D1.6)", () => {
+  it("the golden's pins state 0/0, and its declared reproduction runs exactly that, recorded on the core", () => {
+    expect([pins().evaluationIntervalMs, pins().evaluationHeartbeatMs]).toEqual([0, 0]);
+    const assembled = assemble();
+    if (!assembled.ok) throw new Error(assembled.refusal.detail);
+    expect(assembled.core.trader.loop.evaluationCadence()).toEqual({
+      intervalMs: 0,
+      heartbeatMs: 0,
+      reproduces: REPRODUCES,
+    });
+  });
+
+  it("the same pins WITHOUT a declared reproduction are refused before a core is built (D1.6)", () => {
+    const assembled = assembleBacktestCore({
+      environment: safeEnvironment(),
+      traderConfig: traderConfig(),
+      runPins: pins(),
+      clockStart: FIRST_INSTANT,
+    });
+    expect(assembled.ok).toBe(false);
+    if (assembled.ok) return;
+    expect(assembled.refusal.code).toBe("BACKTEST_CADENCE_REFUSED");
+    expect(assembled.refusal.issues.join("\n")).toContain("evaluationIntervalMs 0");
+  });
+
+  it("a replay that reproduces nothing runs exactly 1000/5000 from its pins", () => {
+    const assembled = assembleBacktestCore({
+      environment: safeEnvironment(),
+      traderConfig: traderConfig(),
+      runPins: { ...pins(), evaluationIntervalMs: 1000, evaluationHeartbeatMs: 5000 },
+      clockStart: FIRST_INSTANT,
+    });
+    if (!assembled.ok) throw new Error(assembled.refusal.detail);
+    expect(assembled.core.trader.loop.evaluationCadence()).toEqual({ intervalMs: 1000, heartbeatMs: 5000 });
+  });
+
+  for (const [interval, heartbeat] of [
+    [1, 5000],
+    [1000, 5001],
+    [0, 5000],
+    [2000, 10000],
+  ] as const) {
+    it(`pins of ${String(interval)}/${String(heartbeat)} are refused, declared reproduction or not (D1.5)`, () => {
+      for (const reproduces of [REPRODUCES, undefined]) {
+        const assembled = assembleBacktestCore({
+          environment: safeEnvironment(),
+          traderConfig: traderConfig(),
+          runPins: { ...pins(), evaluationIntervalMs: interval, evaluationHeartbeatMs: heartbeat },
+          clockStart: FIRST_INSTANT,
+          ...(reproduces === undefined ? {} : { reproduces }),
+        });
+        expect(assembled.ok).toBe(false);
+        if (assembled.ok) continue;
+        expect(assembled.refusal.code).toBe("BACKTEST_CADENCE_REFUSED");
+      }
+    });
+  }
+
+  it("a reproduction label that would break the artifact's line grammar is refused", () => {
+    for (const reproduces of ["", "two words", "line\nbreak", "x".repeat(257)]) {
+      const assembled = assembleBacktestCore({
+        environment: safeEnvironment(),
+        traderConfig: traderConfig(),
+        runPins: pins(),
+        clockStart: FIRST_INSTANT,
+        reproduces,
+      });
+      expect(assembled.ok, JSON.stringify(reproduces)).toBe(false);
+      if (assembled.ok) continue;
+      expect(assembled.refusal.code).toBe("BACKTEST_CADENCE_REFUSED");
+    }
   });
 });

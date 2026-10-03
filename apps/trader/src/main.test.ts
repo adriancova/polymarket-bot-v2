@@ -21,7 +21,7 @@ import {
 } from "@polymarket-bot/simulation";
 import { describe, expect, it } from "vitest";
 
-import { EXIT_CODES, createExecutionPolicy, type VenueWiring } from "./main.js";
+import { EXIT_CODES, cadenceAlarmLine, createExecutionPolicy, type VenueWiring } from "./main.js";
 
 const MARKET = "018f4a7e-1111-7abc-8def-0123456789ab";
 const EPOCH = "018f4a7e-5555-7abc-8def-0123456789ab";
@@ -147,5 +147,34 @@ describe("the process entry point's execution policy", () => {
     expect(EXIT_CODES.halted).toBe(75);
     // `BOOT-1`: the database could not answer the registration check.
     expect(EXIT_CODES.infrastructureUnavailable).toBe(69);
+  });
+});
+
+describe("CADENCE-1 (ADR-026 D2.10): the forward-jump alarm's log lines", () => {
+  it("an episode's start is the PAGE line, naming both instants, the lag and the bound", () => {
+    const line = cadenceAlarmLine({
+      kind: "RAISED",
+      eventAt: "2026-03-04T12:00:01Z",
+      clockAt: "2026-03-04T13:00:00Z",
+      behindMs: 3_599_000,
+      boundMs: 5_000,
+    });
+    expect(line.startsWith("CADENCE CLOCK FORWARD JUMP: ")).toBe(true);
+    for (const part of ["2026-03-04T12:00:01Z", "2026-03-04T13:00:00Z", "3599000 ms", "5000 ms", "ADR-026 D2.10"]) {
+      expect(line).toContain(part);
+    }
+    expect(line).not.toContain("\n");
+  });
+
+  it("an episode's end is its own line, not the page line", () => {
+    const line = cadenceAlarmLine({
+      kind: "CLEARED",
+      eventAt: "2026-03-04T12:59:55Z",
+      clockAt: "2026-03-04T13:00:00Z",
+      behindMs: 5_000,
+      boundMs: 5_000,
+    });
+    expect(line.startsWith("CADENCE CLOCK CAUGHT UP: ")).toBe(true);
+    expect(line).not.toContain("FORWARD JUMP");
   });
 });

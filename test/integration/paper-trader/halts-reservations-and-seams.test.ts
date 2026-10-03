@@ -16,6 +16,7 @@ import { parseTraderConfig } from "@polymarket-bot/trader";
 import { describe, expect, it } from "vitest";
 
 import {
+  adr024Reproduction,
   INSTANCE_ID,
   MARKET_ID,
   recordedEvents,
@@ -94,7 +95,15 @@ describe("M10 — `runStatePermitsIntent` is the run's REAL state", () => {
     // is untouched, so its instance still evaluates and still emits an entry —
     // and §9.8 check 1 must refuse it, because the RUN is no longer in a state
     // that permits new orders.
-    const run = assembleOrThrow({ config: twoMarketConfig("1000") });
+    // `CADENCE-1` (ADR-026 D1.6): the desync below is injected FIRST with the
+    // instant of a LATER event (:03 before :01), which under the PAPER cadence
+    // moves the event clock ahead and coalesces market 1's second book
+    // evaluation — the one that enters. This test's subject is check 1, not
+    // the cadence, so it REPRODUCES the per-frame cadence it was written for.
+    const run = assembleOrThrow({
+      config: twoMarketConfig("1000"),
+      evaluationCadence: adr024Reproduction("test/integration/paper-trader/halts-reservations-and-seams.test.ts#M10"),
+    });
     const events = twoMarketEvents();
     const desync = events.find((event) => event.envelope.eventType === "BookSnapshot");
     expect(desync).toBeDefined();

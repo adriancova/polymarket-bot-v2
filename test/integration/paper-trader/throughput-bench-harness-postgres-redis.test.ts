@@ -23,7 +23,7 @@
  * decides on this sample fails here.
  *
  * RE-BASELINED BY `THROUGHPUT-2` (ADR-024: one evaluation per venue frame). The
- * pins are now {@link FRAME_NORMALIZED_DECISIONS} / {@link FRAME_DECISIONS}.
+ * pins became the per-frame digests and {@link FRAME_DECISIONS}.
  * How they relate to base, measured on one registered clone (`bf1ee89` against
  * the THROUGHPUT-2 candidate, `tools/bench/trader-throughput --limit 2000`): the
  * sample's 2,001 envelopes form 1,092 frames, 908 of them multi-event (905
@@ -38,6 +38,18 @@
  * construction (`harness.ts` `durableContent`); the full-fixture comparison
  * with every column, feature snapshot addresses included, is the benchmark's
  * (`--registered`, see the handoff).
+ *
+ * RE-BASELINED BY `CADENCE-1` (ADR-026: at most one `onFeatures` evaluation
+ * per market per 1 s of EVENT time, plus a 5 s heartbeat). The trader here is
+ * the live composition, so it runs the PAPER cadence — there is no switch.
+ * The pins are now {@link CADENCE_NORMALIZED_DECISIONS} /
+ * {@link CADENCE_DECISIONS}: the sample's 2,001 envelopes span about 2.3 s of
+ * recorded time, so the trader makes 4 decisions where the per-frame cadence
+ * made 928. Catch-up and paced give the SAME content: the cadence reads event
+ * time only, never the processing time (ADR-026 D6-D7). The per-frame pins
+ * are kept below as the record of what ADR-024's cadence decided; the
+ * decision-by-decision relation to them, on the full burst, is the bench's
+ * (`CADENCE-1` handoff).
  *
  * Docker: Testcontainers, its own containers, no skip. PAPER only.
  */
@@ -78,12 +90,22 @@ const BASE_DECISIONS = 1_837;
 /**
  * `THROUGHPUT-2` (ADR-024): measured on the candidate with this harness and this
  * sample (catch-up mode). See the module header for how they derive from base.
+ * `CADENCE-1` retired its two digest pins — normalized decision digest
+ * `1abc8596890c2d38b7aef25ca2b9ec9d36b8b19d5110f72029be509ce68634d4`, normalized
+ * checkpoint digest `ef35b67257e603a2082c33f175619d91c054d9f16d77eb73056bcca15366cd83`
+ * — as THROUGHPUT-2 retired base's; the count stays.
  */
-const FRAME_NORMALIZED_DECISIONS = "1abc8596890c2d38b7aef25ca2b9ec9d36b8b19d5110f72029be509ce68634d4";
-const FRAME_NORMALIZED_CHECKPOINTS = "ef35b67257e603a2082c33f175619d91c054d9f16d77eb73056bcca15366cd83";
 const FRAME_DECISIONS = 928;
 /** Base's decisions on the first event of a multi-event frame: the ones that are gone. */
 const HALF_APPLIED_BASE_DECISIONS = 909;
+
+/**
+ * `CADENCE-1` (ADR-026): measured on the candidate with this harness and this
+ * sample, in BOTH modes (the same bytes). See the module header.
+ */
+const CADENCE_DECISIONS = 4;
+const CADENCE_NORMALIZED_DECISIONS = "5662980df21598ab1d9124ca676ad9c9fa48213c405196289c7c9b54db3ae820";
+const CADENCE_NORMALIZED_CHECKPOINTS = "f2692145057e79755fc42dfeec031f7c0139c5c107292e68af2e419a7dc51925";
 
 let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
 let redis: Awaited<ReturnType<typeof startRedisContainer>>;
@@ -161,13 +183,18 @@ function assertCompleteAndOnePerEvaluation(report: ThroughputReport): void {
 }
 
 describe("the throughput harness on the committed 2,000-event sample", () => {
-  it("catch-up: consumes everything, one durable decision per evaluation, and decides once per venue frame", async () => {
+  it("catch-up: consumes everything, one durable decision per evaluation, and decides at the ADR-026 cadence", async () => {
     const report = await run("catch-up", "catch-up");
     assertCompleteAndOnePerEvaluation(report);
-    expect(report.durable.decisions).toBe(FRAME_DECISIONS);
+    expect(report.durable.decisions).toBe(CADENCE_DECISIONS);
+    // The per-frame record (ADR-024), kept: what this sample decided before ADR-026.
     expect(FRAME_DECISIONS + HALF_APPLIED_BASE_DECISIONS).toBe(BASE_DECISIONS);
-    expect(report.durable.normalizedDecisionContentSha256).toBe(FRAME_NORMALIZED_DECISIONS);
-    expect(report.durable.normalizedCheckpointContentSha256).toBe(FRAME_NORMALIZED_CHECKPOINTS);
+    expect(report.durable.normalizedDecisionContentSha256).toBe(CADENCE_NORMALIZED_DECISIONS);
+    expect(report.durable.normalizedCheckpointContentSha256).toBe(CADENCE_NORMALIZED_CHECKPOINTS);
+    // `CADENCE-1`: every owed market not evaluated at a close is counted, and
+    // no event lay 5 s behind the cadence clock.
+    expect(report.health.loop["evaluationsCoalesced"]).toBeGreaterThan(0);
+    expect(report.health.loop["cadenceForwardJumpAlarms"]).toBe(0);
     // Every event was still processed; the frames split across a batch: none.
     expect((report.health.loop["eventsProcessed"] ?? 0) + (report.health.loop["eventsRefused"] ?? 0)).toBe(2_001);
     expect(report.framesSplit).toBe(0);
@@ -179,9 +206,11 @@ describe("the throughput harness on the committed 2,000-event sample", () => {
     const report = await run("paced", "paced");
     assertCompleteAndOnePerEvaluation(report);
     // The same decisions as catch-up: the frames are the same however the
-    // publication was spread in time (frame-atomic publication, ADR-024).
-    expect(report.durable.normalizedDecisionContentSha256).toBe(FRAME_NORMALIZED_DECISIONS);
-    expect(report.durable.normalizedCheckpointContentSha256).toBe(FRAME_NORMALIZED_CHECKPOINTS);
+    // publication was spread in time (frame-atomic publication, ADR-024), and
+    // the cadence reads event time only (ADR-026 D6-D7).
+    expect(report.durable.decisions).toBe(CADENCE_DECISIONS);
+    expect(report.durable.normalizedDecisionContentSha256).toBe(CADENCE_NORMALIZED_DECISIONS);
+    expect(report.durable.normalizedCheckpointContentSha256).toBe(CADENCE_NORMALIZED_CHECKPOINTS);
     expect(report.framesSplit).toBe(0);
     // The recorded spacing of the sample's 2,000 envelopes is ~2.3 s; the
     // publication took at least that, and every event's lag was measured.

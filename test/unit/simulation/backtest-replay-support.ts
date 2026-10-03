@@ -81,6 +81,24 @@ export const ARTIFACT_FORMAT_ID = BACKTEST_ARTIFACT_FORMAT_ID;
  */
 export const ID_NAMESPACE = "backtest-1-static-bracket-replay";
 
+/**
+ * `CADENCE-1` (ADR-026 D1.6): what a replay of this fixture REPRODUCES — the
+ * golden artefact. The fixture's run pins state the per-frame evaluation
+ * cadence (`evaluationIntervalMs` 0) the golden was recorded under (ADR-024),
+ * and only a declared reproduction may run it. The `run` command takes the
+ * same value as `--reproduces`; the artefact prints it.
+ */
+export const REPRODUCES = "test/replay-golden/backtest/static-bracket/expected-artifact.txt";
+
+/**
+ * `CADENCE-1`: the fixture's run pins with the PAPER evaluation cadence
+ * (1,000 ms and 5,000 ms) — a replay of the same data that reproduces
+ * nothing, as every new replay is (ADR-026 D1.5).
+ */
+export function paperCadencePins(pins: ReplayRunPins): ReplayRunPins {
+  return { ...pins, evaluationIntervalMs: 1000, evaluationHeartbeatMs: 5000 };
+}
+
 /** One recorded frame of the normalized-stream recording, as `frames.json` states it. */
 export interface FixtureFrame {
   readonly ingestSeq: string;
@@ -216,6 +234,7 @@ export function assembleSharedCore(
     clockStart: { receivedAt: fixture.manifest.eventRange.first.receivedAt, receivedMonotonicNs: "0" },
     idNamespace: ID_NAMESPACE,
     accountingChecks,
+    reproduces: REPRODUCES,
   });
   if (!assembled.ok) {
     throw new Error(
@@ -246,6 +265,12 @@ export async function replayThroughShippedRoot(options: {
   readonly datasetDirectory?: string;
   /** `FOLD-1`: the core's check cadence; the every-fill test cadence when omitted. */
   readonly accountingChecks?: AccountingChecks;
+  /**
+   * `CADENCE-1`: `true` replays the fixture as a NEW replay — the PAPER
+   * evaluation cadence, no reproduction declared. Omitted: the golden's
+   * reproduction ({@link REPRODUCES}, the pins' per-frame cadence).
+   */
+  readonly paperCadence?: boolean;
 }): Promise<ReplayRun> {
   const fixture = loadFixture();
   const datasetDirectory = options.datasetDirectory ?? FIXTURE_DIRECTORY;
@@ -264,10 +289,11 @@ export async function replayThroughShippedRoot(options: {
   const started = await runBacktestCore({
     environment: paperEnvironment(),
     traderConfig: fixture.traderConfig,
-    runPins: fixture.runPins,
+    runPins: options.paperCadence === true ? paperCadencePins(fixture.runPins) : fixture.runPins,
     datasetDirectory,
     idNamespace: ID_NAMESPACE,
     accountingChecks: options.accountingChecks ?? EVERY_FILL_ACCOUNTING_CHECKS,
+    ...(options.paperCadence === true ? {} : { reproduces: REPRODUCES }),
   });
   if (!started.ok) {
     throw new Error(

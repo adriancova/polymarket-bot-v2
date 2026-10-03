@@ -20,9 +20,9 @@ it needs:
 | `frames.json` | the eight recorded frames, readable: provenance per frame, and the `{eventType, schemaVersion, sourceChannel, payload}` the gateway added to each raw frame. **The source of truth**; the test re-derives the Parquet object from it and pins the committed bytes. |
 | `part-00000.parquet` | the archived object, `hyparquet-writer` `UNCOMPRESSED`, deterministic (written twice at generation, byte-equal) |
 | `dataset-manifest.json` | `polymarket-bot/dataset-manifest/v1`, `WP-130`'s shape; `objects[0].sha256` / `byteLength` are the real digests of the committed object, so the loader re-derives and refuses a mismatch; `replayPins.normalizerVersion` is pinned to `backtest-cli/normalized-envelope/v1` because the dataset knows what it recorded |
-| `run-pins.json` | the complete §12.5 run-scoped pin set the shipped CLI's `--pins` reads |
+| `run-pins.json` | the complete §12.5 run-scoped pin set the shipped CLI's `--pins` reads — since `CADENCE-1` with `evaluationIntervalMs` and `evaluationHeartbeatMs` (ADR-026 D1.3), both `0`: the per-frame cadence this golden was recorded under (ADR-024), which a run may use only as a DECLARED reproduction (`--reproduces test/replay-golden/backtest/static-bracket/expected-artifact.txt`; D1.6) |
 | `trader-config.json` | the operator document `apps/trader`'s `createPaperTrader` parses — the shared core's configuration |
-| `expected-artifact.txt` | the `polymarket-bot/backtest-static-bracket-replay/v1` artefact, compared **byte for byte** |
+| `expected-artifact.txt` | the `polymarket-bot/backtest-static-bracket-replay/v2` artefact (`v1` until `CADENCE-1`), compared **byte for byte** |
 
 ## Provenance
 
@@ -181,6 +181,27 @@ entry's `30 @ 0.34` fill, one of TWO rows at that instant) is gone, and the
 byte-identical to base's — the LAST row base wrote at each instant. Every
 order, fill, trace, ledger, health and driver line is byte-identical (no health
 counter counts snapshots).
+
+**Re-captured by `CADENCE-1` (2026-10-03)** (a scratch probe calling the CLI's
+`main` with `run … --id-namespace backtest-1-static-bracket-replay
+--reproduces test/replay-golden/backtest/static-bracket/expected-artifact.txt`,
+written ONCE and diffed against the base bytes), because ADR-026 pins the
+evaluation cadence in every run record and only a declared reproduction may
+run the per-frame value 0 this golden was recorded under. Exactly three lines
+moved, and no decision, order, fill, trace, ledger, PnL, health, store or
+driver line did:
+
+- line 1, the format id: `…/v1` → `…/v2` (the artefact grammar gained a
+  section);
+- two new lines after the serialization: `--- cadence ---` and
+  `cadence evaluationIntervalMs=0 evaluationHeartbeatMs=0 reproduction=true
+  reproduces=test/replay-golden/backtest/static-bracket/expected-artifact.txt`
+  — the cadence the core ran with, read from the core.
+
+The run pins gained the two cadence pins (`0`, `0`). The same fixture
+replayed as a NEW run — the PAPER cadence, 1,000 ms and 5,000 ms, nothing
+declared — is pinned beside it in
+`test/unit/simulation/backtest-static-bracket-replay.test.ts` (`CADENCE-1`).
 
 ## Relationship to the other goldens
 

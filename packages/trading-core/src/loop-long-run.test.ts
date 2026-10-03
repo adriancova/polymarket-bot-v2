@@ -65,6 +65,7 @@ import type { Strategy, StrategyContext, StrategyOrderView } from "@polymarket-b
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
+import { PER_FRAME_EVALUATION_CADENCE } from "./cadence.js";
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
@@ -448,6 +449,13 @@ function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Har
     // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams
     // are checked against their rebuilds from zero after EVERY fill.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    // `CADENCE-1` (ADR-026 D1.6): this harness's timelines were written for,
+    // and pin, ADR-024's per-frame cadence — a strategy evaluated at every event, events
+    // often under a second apart. They are not about
+    // the cadence, so they REPRODUCE that cadence (the value 0, declared);
+    // the cadence itself is pinned by `cadence.test.ts` and
+    // `loop-cadence.test.ts`.
+    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-long-run.test.ts" },
   });
   wiring.loop = loop;
 

@@ -330,6 +330,11 @@
       "sourceIngestSeq": "8"
     }
   ],
+  "evaluationCadence": {
+    "heartbeatMs": 0,
+    "intervalMs": 0,
+    "reproduces": "test/replay-golden/paper-e2e/paper-e2e-run.json"
+  },
   "events": [
     {
       "datasetRowOrdinal": 1,
@@ -452,7 +457,7 @@
       "tokenId": "9001"
     }
   ],
-  "goldenFormatVersion": 4,
+  "goldenFormatVersion": 5,
   "health": {
     "accounting": {
       "ledgerRefusals": 0,
@@ -484,10 +489,12 @@
     "halts": [],
     "healthy": true,
     "loop": {
+      "cadenceForwardJumpAlarms": 0,
       "containedEvaluations": 0,
       "decisionsPersisted": 12,
       "deliveriesSuppressedByHalt": 0,
       "evaluations": 12,
+      "evaluationsCoalesced": 0,
       "eventsAccepted": 8,
       "eventsProcessed": 8,
       "eventsRefused": 0,

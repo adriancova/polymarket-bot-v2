@@ -73,6 +73,9 @@ writeFileSync(
   JSON.stringify({
     ...(JSON.parse(readFileSync(join(FIXTURE, "run-pins.json"), "utf8")) as Record<string, unknown>),
     normalizerVersion: APPROXIMATE_TRANSLATION_VERSION,
+    // `CADENCE-1` (ADR-026 D1.5): an approximate replay is never a reproduction.
+    evaluationIntervalMs: 1000,
+    evaluationHeartbeatMs: 5000,
   }),
 );
 const EXACT_PINS_PATH = join(FIXTURE, "run-pins.json");

@@ -191,7 +191,9 @@
     "feeSnapshotVersion": "fees/2026-08-24",
     "rewardSnapshotVersion": "rewards/2026-08-24",
     "settlementSpecVersions": [],
-    "simulatorVersion": "wp-210/v2"
+    "simulatorVersion": "wp-210/v2",
+    "evaluationIntervalMs": 1000,
+    "evaluationHeartbeatMs": 5000
   },
   "expected": {
     "serialization": [

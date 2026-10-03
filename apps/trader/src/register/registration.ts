@@ -11,7 +11,7 @@
  * | `strategy.definitions` | `createDefinition` | {@link STATIC_BRACKET_DEFINITION} — the one strategy `createPaperTrader` runs |
  * | `strategy.configs` | `createConfig` | the instance's `params`, canonically (`template.ts`), its sha256, the operator's `--created-by` |
  * | `strategy.instances` | `createInstance` | `PAPER`, `accounting.accountRef`, `ownership` (`OWNER` → `LIVE_OWNER`, `SHADOW` → `SHADOW`), `evaluationPriority` |
- * | `strategy.runs` | `startRun` | `PAPER`, `runSeed`, the operator's `--code-commit`, `RUNNING` |
+ * | `strategy.runs` | `startRun` | `PAPER`, `runSeed`, the operator's `--code-commit`, `RUNNING`, and (`CADENCE-1`, ADR-026 D1.5) the evaluation cadence every live PAPER run uses: `evaluation_interval_ms` 1000, `evaluation_heartbeat_ms` 5000 |
  *
  * Every write goes through a repository; this module writes no SQL of its own.
  * Its reads — the duplicate check and the two content-addressed lookups — go
@@ -57,6 +57,7 @@ import {
   type OwnershipModeValue,
   type PolymarketBotDatabase,
 } from "@polymarket-bot/storage-postgres";
+import { PAPER_EVALUATION_CADENCE } from "@polymarket-bot/trading-core";
 
 /**
  * The `strategy.definitions` row of the ONE strategy the trader runs.
@@ -386,10 +387,17 @@ export async function registerRows(
     codeCommit: plan.run.codeCommit,
     stateSchemaVersion: STATIC_BRACKET_DEFINITION.stateSchemaVersion,
     runSeed: plan.run.runSeed,
+    // `CADENCE-1` (ADR-026 D1.3-D1.5): the run's evaluation cadence, pinned in
+    // its row; a live PAPER run uses exactly these, and the trader's
+    // registration check refuses a run row that records anything else.
+    evaluationIntervalMs: PAPER_EVALUATION_CADENCE.intervalMs,
+    evaluationHeartbeatMs: PAPER_EVALUATION_CADENCE.heartbeatMs,
   });
   log(
     `strategy.runs: started run_id ${runId} (PAPER, RUNNING, run_seed ${plan.run.runSeed}, ` +
-      `code_commit ${JSON.stringify(plan.run.codeCommit)}) — not yet committed`,
+      `code_commit ${JSON.stringify(plan.run.codeCommit)}, evaluation cadence ` +
+      `${String(PAPER_EVALUATION_CADENCE.intervalMs)} ms / ${String(PAPER_EVALUATION_CADENCE.heartbeatMs)} ms) ` +
+      "— not yet committed",
   );
 
   return {

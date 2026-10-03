@@ -196,6 +196,20 @@ export {
 } from "./folds.js";
 
 export {
+  EVALUATION_HEARTBEAT_MS,
+  EVALUATION_INTERVAL_MS,
+  EvaluationCadenceClock,
+  FORWARD_JUMP_ALARM_FALLBACK_MS,
+  PAPER_EVALUATION_CADENCE,
+  PER_FRAME_EVALUATION_CADENCE,
+  evaluationCadenceProblem,
+  type CadenceAlarm,
+  type CadenceObservation,
+  type EvaluationCadenceOption,
+  type EvaluationCadenceSettings,
+} from "./cadence.js";
+
+export {
   CancelLedger,
   type CancelLedgerMetrics,
   type CancelResolution,

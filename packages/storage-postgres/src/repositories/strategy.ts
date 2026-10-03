@@ -67,6 +67,16 @@ export type StartRunInput = {
   readonly codeCommit: Identifier;
   readonly stateSchemaVersion: number;
   readonly runSeed: UnsignedBigIntString;
+  /**
+   * `CADENCE-1` (ADR-026 D1.3-D1.4): the run's evaluation cadence, pinned in
+   * its row and never changed (`runs_immutable_pinning`). REQUIRED: every run
+   * started from migration 0010 on records both; NULL is only ever a run
+   * recorded before it, under ADR-024. The database holds both >= 0 and
+   * (interval = 0) = (heartbeat = 0); which values a run may USE is the
+   * application's policy (a live PAPER run: exactly 1000 and 5000).
+   */
+  readonly evaluationIntervalMs: number;
+  readonly evaluationHeartbeatMs: number;
   readonly featureSetId?: UuidV7Column | null;
   readonly datasetManifestId?: UuidV7Column | null;
   readonly modelVersion?: Identifier | null;
@@ -185,6 +195,8 @@ export function createStrategyRepository(db: PolymarketBotDatabase) {
             state_schema_version: input.stateSchemaVersion,
             simulator_version: input.simulatorVersion ?? null,
             run_seed: input.runSeed,
+            evaluation_interval_ms: input.evaluationIntervalMs,
+            evaluation_heartbeat_ms: input.evaluationHeartbeatMs,
             status: "RUNNING",
           })
           .execute(),

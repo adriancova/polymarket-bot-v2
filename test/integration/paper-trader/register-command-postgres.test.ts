@@ -315,6 +315,9 @@ describe("the registration command composes with the durable trader (REGISTER-1)
       expect(runRow.config_id).toBe(ids.configId);
       expect(runRow.definition_id).toBe(ids.definitionId);
       expect(runRow.state_schema_version).toBe(STATIC_BRACKET_STATE_SCHEMA_VERSION);
+      // `CADENCE-1` (ADR-026 D1.4-D1.5): the run record pins the evaluation
+      // cadence every live PAPER run uses.
+      expect([runRow.evaluation_interval_ms, runRow.evaluation_heartbeat_ms]).toEqual([1000, 5000]);
 
       const config = await context.db
         .selectFrom("strategy.configs")

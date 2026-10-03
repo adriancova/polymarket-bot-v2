@@ -91,6 +91,9 @@ export const CONTROL_DASHBOARDS: readonly ControlDashboardSpec[] = Object.freeze
       // THROUGHPUT-1a: the input stream's lag, which the ingest-queue panels cannot show.
       "Input stream lag (entries behind head)",
       "Event-time lag",
+      // CADENCE-1 (ADR-026 D5.6, D2.10): the evaluation cadence's two counters.
+      "Evaluation cadence: coalesced evaluations",
+      "Evaluation cadence: forward-jump alarm",
     ]),
   }),
   Object.freeze({

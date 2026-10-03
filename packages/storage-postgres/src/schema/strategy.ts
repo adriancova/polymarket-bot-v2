@@ -108,6 +108,18 @@ export type StrategyRunsTable = {
   state_schema_version: number;
   simulator_version: Identifier | null;
   run_seed: UnsignedIntegerString;
+  /**
+   * `CADENCE-1` (migration 0010; ADR-026 D1.1): the run's
+   * `evaluationIntervalMs`. NULL only for a run recorded before migration
+   * 0010, under ADR-024's per-frame cadence. Immutable (`runs_immutable_pinning`).
+   */
+  evaluation_interval_ms: number | null;
+  /**
+   * `CADENCE-1` (migration 0010; ADR-026 D1.2): the run's
+   * `evaluationHeartbeatMs`. NULL exactly when `evaluation_interval_ms` is;
+   * 0 exactly when it is 0. Immutable (`runs_immutable_pinning`).
+   */
+  evaluation_heartbeat_ms: number | null;
   status: WithDefault<RunStatusValue>;
   started_at: TimestampColumnWithDefault;
   ended_at: TimestampColumn | null;

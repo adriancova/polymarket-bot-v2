@@ -17,6 +17,12 @@
  * names the core's PAPER run mode beside the root's BACKTEST (BT1-R5); usage
  * errors are usage.
  *
+ * `CADENCE-1` (ADR-026 D1.5-D1.6): the fixture's pins state the per-frame
+ * evaluation cadence 0 the golden was recorded under, so the golden's run
+ * DECLARES its reproduction (`--reproduces`); without it the same pins are
+ * refused, and a replay of the same data that reproduces nothing runs the
+ * PAPER cadence and says so in its artifact.
+ *
  * NO DOCKER. NO NETWORK. NO CREDENTIAL. NO SIGNER. The only files written are
  * under a fresh temporary directory.
  */
@@ -46,6 +52,8 @@ const GOLDEN = join(FIXTURE, "expected-artifact.txt");
 const PINS = join(FIXTURE, "run-pins.json");
 const CONFIG = join(FIXTURE, "trader-config.json");
 const ID_NAMESPACE = "backtest-1-static-bracket-replay";
+/** `CADENCE-1` (ADR-026 D1.6): what the golden's run reproduces. */
+const REPRODUCES = "test/replay-golden/backtest/static-bracket/expected-artifact.txt";
 
 const scratch = mkdtempSync(join(tmpdir(), "backtest-2-run-"));
 afterAll(() => {
@@ -71,7 +79,11 @@ async function cli(
   return { code, out: out.join("\n"), err: err.join("\n") };
 }
 
-function runArgv(artifact: string, overrides: { readonly pins?: string } = {}): string[] {
+function runArgv(
+  artifact: string,
+  overrides: { readonly pins?: string; readonly reproduces?: string | null } = {},
+): string[] {
+  const reproduces = overrides.reproduces === undefined ? REPRODUCES : overrides.reproduces;
   return [
     "run",
     "--dataset",
@@ -84,6 +96,7 @@ function runArgv(artifact: string, overrides: { readonly pins?: string } = {}): 
     artifact,
     "--id-namespace",
     ID_NAMESPACE,
+    ...(reproduces === null ? [] : ["--reproduces", reproduces]),
   ];
 }
 
@@ -229,7 +242,7 @@ describe("backtest-cli run — argv in, artifact out (the operator path)", () =>
     });
     const artifact = join(scratch, "halted.txt");
     const result = await cli(["run", "--dataset", dataset, "--pins", PINS, "--config", CONFIG, "--artifact", artifact,
-      "--id-namespace", ID_NAMESPACE]);
+      "--id-namespace", ID_NAMESPACE, "--reproduces", REPRODUCES]);
     expect(result.code, result.err).toBe(EXIT_HALTED);
     expect(EXIT_HALTED).toBe(75);
     expect(result.err).toContain("REFUSED: SIMULATION_INTERNAL");
@@ -238,6 +251,54 @@ describe("backtest-cli run — argv in, artifact out (the operator path)", () =>
     expect(result.err).toContain("ingestSeq=4");
     expect(result.err).toContain("HALTED: the core latched BOOK_DESYNCHRONIZED@MARKET");
     expect(existsSync(artifact)).toBe(false);
+  });
+
+  it("CADENCE-1 (ADR-026 D1.6): the golden's per-frame pins WITHOUT --reproduces are refused, and nothing is written", async () => {
+    const artifact = join(scratch, "undeclared.txt");
+    const result = await cli(runArgv(artifact, { reproduces: null }));
+    expect(result.code).toBe(EXIT_REFUSED);
+    expect(result.err).toContain("REFUSED: BACKTEST_CADENCE_REFUSED");
+    expect(result.err).toContain("evaluationIntervalMs 0");
+    expect(existsSync(artifact)).toBe(false);
+  });
+
+  it("CADENCE-1 (ADR-026 D1.5): pins naming any cadence but 1000/5000 or a declared 0/0 are refused, declared or not", async () => {
+    const pins = JSON.parse(readFileSync(PINS, "utf8")) as Record<string, unknown>;
+    for (const [interval, heartbeat] of [
+      [500, 5000],
+      [1000, 4000],
+      [2000, 10000],
+    ] as const) {
+      const other = join(scratch, `cadence-${String(interval)}-${String(heartbeat)}.json`);
+      writeFileSync(other, JSON.stringify({ ...pins, evaluationIntervalMs: interval, evaluationHeartbeatMs: heartbeat }));
+      for (const reproduces of [REPRODUCES, null]) {
+        const artifact = join(scratch, `cadence-${String(interval)}-${String(reproduces !== null)}.txt`);
+        const result = await cli(runArgv(artifact, { pins: other, reproduces }));
+        expect(result.code).toBe(EXIT_REFUSED);
+        expect(result.err).toContain("BACKTEST_CADENCE_REFUSED");
+        expect(existsSync(artifact)).toBe(false);
+      }
+    }
+  });
+
+  it("CADENCE-1: the same data replayed as a NEW run (PAPER cadence, nothing declared) records that in its artifact", async () => {
+    const pins = JSON.parse(readFileSync(PINS, "utf8")) as Record<string, unknown>;
+    const paper = join(scratch, "paper-cadence-pins.json");
+    writeFileSync(paper, JSON.stringify({ ...pins, evaluationIntervalMs: 1000, evaluationHeartbeatMs: 5000 }));
+    const artifact = join(scratch, "paper-cadence.txt");
+    const result = await cli(runArgv(artifact, { pins: paper, reproduces: null }));
+    expect(result.code, result.err).toBe(EXIT_OK);
+    expect(result.out).toContain("evaluation_cadence=1000/5000\n");
+    const lines = readFileSync(artifact, "utf8").split("\n");
+    expect(lines[0]).toBe("polymarket-bot/backtest-static-bracket-replay/v2");
+    expect(lines[lines.indexOf("--- cadence ---") + 1]).toBe(
+      "cadence evaluationIntervalMs=1000 evaluationHeartbeatMs=5000 reproduction=false",
+    );
+    // The declared reproduction prints what it reproduces.
+    const golden = readFileSync(GOLDEN, "utf8").split("\n");
+    expect(golden[golden.indexOf("--- cadence ---") + 1]).toBe(
+      `cadence evaluationIntervalMs=0 evaluationHeartbeatMs=0 reproduction=true reproduces=${REPRODUCES}`,
+    );
   });
 
   it("never overwrites an existing artifact", async () => {

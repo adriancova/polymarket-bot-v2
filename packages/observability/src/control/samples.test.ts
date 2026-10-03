@@ -25,6 +25,9 @@ describe("traderHealthSamples", () => {
     expect(sample("trader_events_processed_total")?.value).toBe(102);
     expect(sample("trader_decisions_persisted_total")?.value).toBe(108);
     expect(sample("trader_deliveries_suppressed_by_halt_total")?.value).toBe(111);
+    // `CADENCE-1` (ADR-026 D5.6, D2.10).
+    expect(sample("trader_evaluations_coalesced_total")?.value).toBe(112);
+    expect(sample("trader_cadence_forward_jump_alarms_total")?.value).toBe(113);
     expect(sample("trader_risk_refused_exits_total")?.value).toBe(204);
     expect(sample("trader_observe_only_intents_total")?.value).toBe(313);
     expect(sample("trader_unexplained_movements_total")?.value).toBe(404);

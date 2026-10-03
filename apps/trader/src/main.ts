@@ -119,6 +119,24 @@
  * halt either way; the record is for the operator and the research worker
  * afterwards.
  *
+ * ## The evaluation cadence (`CADENCE-1`, ADR-026)
+ *
+ * The trader evaluates each market's `onFeatures` at most once per 1,000 ms of
+ * EVENT time, plus a 5,000 ms heartbeat (`packages/trading-core` `cadence.ts`).
+ * Both settings are pinned in each run's `strategy.runs` row (migration 0010):
+ * step 3b refuses a run row that records anything but 1,000 / 5,000 — 0, NULL
+ * or another value — and step 4 then runs the core with exactly those values.
+ * No environment variable or configuration field can change them (ADR-026
+ * D1.5: other values need a new ruling).
+ *
+ * A far-future event stamp holds every `onFeatures` evaluation until the event
+ * clock has moved on (ADR-026 D2.10). The core counts each event that lies
+ * more than 5,000 ms behind its event clock (`cadenceForwardJumpAlarms`), and
+ * this file logs ONE line when such an episode starts —
+ * `CADENCE CLOCK FORWARD JUMP: …`, the line an operator's pager watches, as it
+ * watches `HALT RECORD NOT DURABLE` — and one when it ends,
+ * `CADENCE CLOCK CAUGHT UP: …`.
+ *
  * ## The two-phase venue wiring, and why it is not a smell
  *
  * The simulated venue asks the composition root two questions it cannot answer
@@ -173,6 +191,7 @@ import { TransportLagSampler } from "./transport-lag.js";
 import { checkPaperTraderSafety } from "@polymarket-bot/trading-core";
 import { createPaperTrader, type PaperTrader } from "@polymarket-bot/trading-core";
 import { createExecutionPolicy, type VenueWiring } from "@polymarket-bot/trading-core";
+import { PAPER_EVALUATION_CADENCE, type CadenceAlarm } from "@polymarket-bot/trading-core";
 import { buildSimulatedVenue } from "@polymarket-bot/trading-core";
 
 export { createExecutionPolicy, type VenueWiring };
@@ -598,6 +617,12 @@ export async function assembleDurableTrader(
     venue,
     store: observedStore,
     idNamespace: config.instances.map((instance) => instance.runId).join("|"),
+    // `CADENCE-1` (ADR-026 D1.4-D1.5): exactly the cadence step 3b verified
+    // every configured run's `strategy.runs` row pins. Never a reproduction.
+    evaluationCadence: PAPER_EVALUATION_CADENCE,
+    onCadenceAlarm: (alarm) => {
+      log(cadenceAlarmLine(alarm));
+    },
   });
   if (!created.ok) {
     log(`REFUSING TO START: ${created.refusal.code}: ${created.refusal.detail}`);
@@ -647,6 +672,28 @@ export async function assembleDurableTrader(
     );
   }
   return { ok: true, trader: created.trader, store, healthServer };
+}
+
+/**
+ * `CADENCE-1` (ADR-026 D2.10): the log line for a forward-jump alarm episode.
+ * A `RAISED` line is the PAGE line (`CADENCE CLOCK FORWARD JUMP:`); the
+ * `CLEARED` line says the episode ended. Exported for its test.
+ */
+export function cadenceAlarmLine(alarm: CadenceAlarm): string {
+  if (alarm.kind === "RAISED") {
+    return (
+      `CADENCE CLOCK FORWARD JUMP: an applied event stamped ${alarm.eventAt} lies ${String(alarm.behindMs)} ms ` +
+      `behind the evaluation cadence's event clock (${alarm.clockAt}), beyond the ${String(alarm.boundMs)} ms ` +
+      "alarm bound. No market's onFeatures is evaluated — so no stop decided in onFeatures runs — until event " +
+      "time has moved past that clock by the interval; fills, order updates and lifecycle callbacks still " +
+      "fire (ADR-026 D2.10). Page: check the gateway's receipt clock"
+    );
+  }
+  return (
+    `CADENCE CLOCK CAUGHT UP: an applied event stamped ${alarm.eventAt} lies ${String(alarm.behindMs)} ms ` +
+    `behind the evaluation cadence's event clock (${alarm.clockAt}), within the ${String(alarm.boundMs)} ms ` +
+    "alarm bound; the forward-jump alarm episode has ended (ADR-026 D2.10)"
+  );
 }
 
 /** The environment variable that states the Redis outage bound (`OUTAGE-1`). */

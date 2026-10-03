@@ -43,7 +43,9 @@ import {
   writeGoldenBytes,
   WRITE_GOLDEN_ENV,
 } from "./support/golden.js";
-import { driveScenario } from "./support/harness.js";
+import { PAPER_EVALUATION_CADENCE } from "@polymarket-bot/trader";
+
+import { driveScenario, goldenReproduction } from "./support/harness.js";
 import { PAPER_E2E_SCENARIO } from "./support/scenario.js";
 import type { Scenario } from "./support/scenario-contract.js";
 import { TWO_BRACKETS_SCENARIO } from "./support/scenarios/two-brackets.js";
@@ -102,6 +104,27 @@ for (const scenario of SCENARIOS) {
       // …and the tampered bytes do not match the committed golden either, which
       // is the property the golden comparison actually rests on.
       expect(tampered).not.toBe(goldenBytes(scenario));
+    });
+
+    it("CADENCE-1 (ADR-026 D1.6): the golden is a DECLARED reproduction of the per-frame cadence it was recorded under", async () => {
+      const golden = JSON.parse(goldenBytes(scenario)) as Record<string, unknown>;
+      expect(golden["evaluationCadence"]).toEqual({ ...goldenReproduction(scenario) });
+      expect(golden["evaluationCadence"]).toEqual({
+        intervalMs: 0,
+        heartbeatMs: 0,
+        reproduces: `test/replay-golden/paper-e2e/${scenario.goldenFile}`,
+      });
+    });
+
+    it("CADENCE-1 (ADR-026): at the PAPER cadence the scenario decides EXACTLY what the golden holds — its events are never under a second apart for one market", async () => {
+      const paper = captureArtifact(await driveScenario({ scenario, evaluationCadence: PAPER_EVALUATION_CADENCE }));
+      expect(paper.evaluationCadence).toEqual({ intervalMs: 1_000, heartbeatMs: 5_000, reproduces: null });
+      expect(paper.health.loop["evaluationsCoalesced"]).toBe(0);
+      expect(paper.health.loop["cadenceForwardJumpAlarms"]).toBe(0);
+      // Every other byte is the golden's: the same decisions, orders, fills,
+      // ledger, PnL and health.
+      const golden = JSON.parse(goldenBytes(scenario)) as typeof paper;
+      expect(serializeArtifact({ ...paper, evaluationCadence: golden.evaluationCadence })).toBe(goldenBytes(scenario));
     });
 
     it("the golden parses back into the document the chain walk reads", async () => {
