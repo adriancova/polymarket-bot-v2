@@ -111,6 +111,19 @@ describe("§9.11 steps 1-5: the order of persistence and transmission", () => {
     expect(order?.reservation.released).toBe(true);
   });
 
+  it("refuses a no-op cipher that round-trips (the payload in clear, or merely wrapped)", async () => {
+    for (const [index, mode] of (["PASSTHROUGH", "WRAP"] as const).entries()) {
+      const h = await openHarness();
+      h.cipher.mode = mode;
+      const g = group(10 + index);
+      await h.manager.registerGroup(g);
+      const result = await h.manager.submit(ticket(g, { n: 10 + index }));
+      expect(!result.ok && result.refusal.code).toBe("OMS_CIPHER_FAILED");
+      expect(h.venue.received).toEqual([]);
+      expect(h.store.serialized()).not.toContain(signatureFor(h.venue.signed[0] as string));
+    }
+  });
+
   it("refuses a cipher whose decryption does not round-trip", async () => {
     const h = await openHarness();
     h.cipher.mode = "CORRUPT_DECRYPT";
