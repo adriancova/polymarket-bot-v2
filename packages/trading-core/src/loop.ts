@@ -50,7 +50,9 @@
  * runs after that harvest, and its OWN effects — the fills and views of the
  * orders it placed or cancelled, and nothing else — are booked and delivered
  * at once, at its source's instant (`#harvestCarriedEffects`): never delayed
- * (D4, ruling A1).
+ * (D4, ruling A1). That carried harvest takes the ordinary harvest's steps in
+ * its order (r3): the settled orders' release before any `onFill`, and the
+ * views of the orders those `onFill` decisions place at the same close.
  *
  * ## Determinism (§12.4)
  *
@@ -789,7 +791,9 @@ export class CoreLoop {
    * `CADENCE-1` r2 (RA): while a carried pass runs (`#runCarriedPass`), the
    * venue orders its evaluations' decisions touched — booked by a placement,
    * or cancelled by a CANCEL — recorded at each venue answer
-   * (`#absorbVenueAnswer`). `undefined` outside a carried pass.
+   * (`#absorbVenueAnswer`). r3 (A-R3-02): also while a carried harvest
+   * delivers its fills (`#harvestCarriedEffects`), the orders those `onFill`
+   * decisions touch. `undefined` at every other time.
    */
   #carriedEffects: CarriedEffects | undefined;
   #seenArrivals = 0;
@@ -1523,7 +1527,10 @@ export class CoreLoop {
    * later event, and never at another event's instant. (A fill the venue makes
    * LATER — a resting order matched by a later trade, a DELAYED order's
    * disposition — is delivered by the harvest that first reads it, as under
-   * ADR-024.)
+   * ADR-024.) r3: the `onFill` decisions that delivery makes get what an
+   * ordinary harvest gives them — the settled orders' capacity back before
+   * they run (A-R3-01), and the views of the orders they place at the same
+   * close (A-R3-02).
    */
   async #closeFrame(): Promise<void> {
     const frame = this.#frame;
@@ -2765,7 +2772,10 @@ export class CoreLoop {
   ): void {
     // `CADENCE-1` r2 (RA): during a carried pass, the orders this answer
     // booked (a placement, on any outcome) or cancelled (a CANCEL, on any
-    // outcome) are that pass's own effects (`#harvestCarriedEffects`).
+    // outcome) are that pass's own effects (`#harvestCarriedEffects`); r3
+    // (A-R3-02): during a carried harvest's fill deliveries, they are those
+    // onFill decisions' (their views come at that close). Recorded BEFORE the
+    // outcome is read: a refused plan's booked orders are owned below too.
     const carried = this.#carriedEffects;
     if (carried !== undefined) {
       for (const order of result.orders) {
@@ -3243,13 +3253,15 @@ export class CoreLoop {
    *   them, with the same §4.2 gate;
    * - the views of the orders its decisions placed or cancelled (`touched`)
    *   are delivered (`onOrderUpdate`), with the same R1 rules, the same
-   *   terminal release and the same §4.2 gate as `#deliverOrderViews`.
+   *   terminal release and the same §4.2 gate as `#deliverOrderViews`;
+   * - r3 (A-R3-02): and the views of the orders the `onFill` decisions made
+   *   here placed or cancelled, as the ordinary harvest delivers those.
    *
    * Nothing else. The cadence still adds NO harvest point for anything that is
    * not the pass's own: every other fill and every other view — an earlier
    * decision's, a working order's repeat — waits for, and is delivered at,
    * the harvest point ADR-024 gives it, at its instant (r1, J1). So no fill
-   * outside `placed` is booked here, no reservation outside `touched` is
+   * outside `placed` is booked here, no reservation outside those orders is
    * released (`#releaseSettledReservations` is the ordinary harvest's), and no
    * order is SETTLED here: settlement stays with the ordinary harvest, which
    * books every fill before it judges (b). Like the ordinary harvest, it
@@ -3263,12 +3275,40 @@ export class CoreLoop {
    * (`#bookedAhead`): the next ordinary harvest books the earlier fill and
    * skips these.
    *
-   * A view is delivered here only when every fill it reports is booked
-   * (`#fullyBooked`): a touched order whose venue view reports a fill this
-   * process has not read yet — one that keeps its ADR-024 harvest point —
-   * waits, with its release, for the ordinary harvest that books the fill.
-   * Fail closed: nothing is released before the position that replaces it
-   * exists.
+   * A view of the pass's own orders is delivered here only when every fill
+   * it reports is booked (`#fullyBooked`): a touched order whose venue view
+   * reports a fill this process has not read yet — one that keeps its ADR-024
+   * harvest point — waits, with its release, for the ordinary harvest that
+   * books the fill. Fail closed: nothing is released before the position that
+   * replaces it exists.
+   *
+   * r3 — the steps are the ordinary harvest's, in its order, so an `onFill`
+   * decision made here gets exactly what it would get there:
+   *
+   * 1. book the own fills (above);
+   * 2. (A-R3-01) every own order those fills SETTLED gives its capacity back
+   *    BEFORE any `onFill` runs (`#releaseSettledOwn`) — the ordinary
+   *    harvest's `#releaseSettledReservations` step, scoped to the pass's own
+   *    orders: §9.14 forbids counting the reservation beside the position that
+   *    replaced it, and an `onFill` decision is admitted against that account;
+   * 3. judge the watched baskets (the backstop);
+   * 4. (A-R3-02) deliver the fills, RECORDING every order those `onFill`
+   *    decisions place or cancel, as the pass's own were recorded: the
+   *    ordinary harvest reads its view boundary AFTER its fill deliveries, so
+   *    such an order's view comes at the same close there, and so it does
+   *    here;
+   * 5. deliver the views of the pass's own orders and of those. An order an
+   *    `onFill` decision PLACED here is delivered exactly as the ordinary
+   *    harvest delivers it — with no booking gate: a fill it made at once was
+   *    made after this harvest read the venue, exactly as it would have been
+   *    after the ordinary harvest's read, so that fill keeps its ADR-024
+   *    harvest point (the next one) on both paths, while the view, and the
+   *    release its terminal status brings, come now on both. An order such a
+   *    decision CANCELLED is gated like the pass's own cancels.
+   *
+   * An order an `onOrderUpdate` decision places here is not in the boundary,
+   * exactly as it is not in the ordinary harvest's: its view comes at the
+   * next harvest point on both paths.
    */
   async #harvestCarriedEffects(effects: CarriedEffects, instant: string): Promise<void> {
     if (effects.touched.size === 0) return;
@@ -3282,11 +3322,44 @@ export class CoreLoop {
       this.#knownFills = page.next;
       this.#bookedAhead.clear();
     }
+    // r3 (A-R3-01): the ordinary harvest's release step, before any onFill.
+    this.#releaseSettledOwn(effects.touched, instant);
     // The ordinary harvest's BACKSTOP (`SIM1-R3-1`), for the same reason: this
     // harvest read the venue, and the deliveries below evaluate strategies.
     this.#judgeBasketWatches(instant);
-    await this.#deliverBookedFills(booked, instant);
-    await this.#deliverOrderViews(instant, effects.touched);
+    // r3 (A-R3-02): what the onFill decisions below place or cancel.
+    const delivered: CarriedEffects = { asked: false, placed: new Set(), touched: new Set() };
+    this.#carriedEffects = delivered;
+    try {
+      await this.#deliverBookedFills(booked, instant);
+    } finally {
+      this.#carriedEffects = undefined;
+    }
+    await this.#deliverOrderViews(instant, {
+      orders: new Set([...effects.touched, ...delivered.touched]),
+      placedByDeliveries: delivered.placed,
+    });
+  }
+
+  /**
+   * `CADENCE-1` r3 (A-R3-01): the carried harvest's RELEASE step — the
+   * ordinary harvest's `#releaseSettledReservations`, run at the same point
+   * (after the booking, before any `onFill`), over the carried pass's own
+   * orders only. An owned order that is terminal, with every fill its venue
+   * view reports booked (`#fullyBooked`), releases both reservation books and
+   * its time-in-force. One with a fill still unread keeps all three until the
+   * ordinary harvest books that fill (fail closed). Idempotent, like every
+   * release: the terminal arm of `#deliverOrderViews` releases nothing twice.
+   */
+  #releaseSettledOwn(venueOrderIds: ReadonlySet<string>, instant: string): void {
+    for (const venueOrderId of inVenueOrder(venueOrderIds)) {
+      if (!this.#orderOwners.has(venueOrderId)) continue;
+      const order = this.#ownedOrder(venueOrderId, instant);
+      if (order === undefined || !this.#isTerminalOrder(order) || !this.#fullyBooked(order)) continue;
+      this.#reservations.releaseForOrder(order.plannedOrderId);
+      this.#options.allocator.release(order.plannedOrderId);
+      this.#timeInForce.release(order.plannedOrderId);
+    }
   }
 
   /**
@@ -4026,17 +4099,20 @@ export class CoreLoop {
    * decision sequence and `ctx.orders()` are unchanged). An order submitted
    * by a delivery is not in it, exactly as it was not in the snapshot.
    *
-   * `CADENCE-1` r2 (RA): `only`, from a carried harvest
+   * `CADENCE-1` r2 (RA): `carried`, from a carried harvest
    * (`#harvestCarriedEffects`), narrows the boundary to the orders a carried
-   * pass placed or cancelled — each one the venue has just answered for, so
-   * it still holds it; one this process does not own is skipped below, as
-   * here always. A view among them is delivered only when every fill it
-   * reports is booked (`#fullyBooked`), and nothing is settled — the
-   * ordinary harvest settles.
+   * pass placed or cancelled — r3 (A-R3-02): and those its own `onFill`
+   * deliveries then placed or cancelled — each one the venue has just
+   * answered for, so it still holds it; one this process does not own is
+   * skipped below, as here always. A view among them is delivered only when
+   * every fill it reports is booked (`#fullyBooked`) — except, r3, an order
+   * those `onFill` deliveries PLACED, which is delivered as here always (its
+   * fills were made after the harvest read the venue, as they would have been
+   * here) — and nothing is settled: the ordinary harvest settles.
    */
-  async #deliverOrderViews(instant: string, only?: ReadonlySet<string>): Promise<void> {
+  async #deliverOrderViews(instant: string, carried?: CarriedViewBoundary): Promise<void> {
     const boundary: SimulatedOrder[] = [];
-    for (const venueOrderId of inVenueOrder(only ?? this.#orderOwners.keys())) {
+    for (const venueOrderId of inVenueOrder(carried?.orders ?? this.#orderOwners.keys())) {
       const order = this.#ownedOrder(venueOrderId, instant);
       if (order !== undefined) boundary.push(order);
     }
@@ -4051,7 +4127,15 @@ export class CoreLoop {
       if (market === undefined) continue;
       // r2 (RA): fail closed — a view reporting a fill not yet booked, and the
       // release its terminal status brings, wait for the ordinary harvest.
-      if (only !== undefined && !this.#fullyBooked(order)) continue;
+      // r3 (A-R3-02): not an order this carried harvest's own onFill
+      // deliveries placed — delivered as the ordinary harvest delivers it.
+      if (
+        carried !== undefined &&
+        !carried.placedByDeliveries.has(order.simulatedOrderId) &&
+        !this.#fullyBooked(order)
+      ) {
+        continue;
+      }
       const view = toStrategyOrderView(order, {
         marketId: instance.marketId,
         placedAt: instant,
@@ -4091,7 +4175,7 @@ export class CoreLoop {
       await this.#consumeOutcome(instance, market, outcome, null, instant, this.#lastEpochMs);
     }
 
-    if (only !== undefined) return;
+    if (carried !== undefined) return;
     for (const order of boundary) {
       if (this.#retired.has(order.simulatedOrderId)) this.#settle(order);
     }
@@ -4944,12 +5028,25 @@ interface BookedFill {
  * it asked a runtime, and the venue orders its decisions touched: `placed`,
  * the orders a placement booked (their fills are the pass's own), and
  * `touched`, those plus the orders a CANCEL cancelled (their views are the
- * pass's own).
+ * pass's own). r3 (A-R3-02): the same record, filled while a carried harvest
+ * delivers its fills, says what those `onFill` decisions touched.
  */
 interface CarriedEffects {
   asked: boolean;
   readonly placed: Set<string>;
   readonly touched: Set<string>;
+}
+
+/**
+ * `CADENCE-1` r3 (A-R3-02): a carried harvest's view boundary
+ * (`#deliverOrderViews`) — the orders whose views it delivers (the carried
+ * pass's own, and those its `onFill` deliveries placed or cancelled), and,
+ * among them, the ones those deliveries PLACED, which are delivered as the
+ * ordinary harvest delivers them: with no booking gate.
+ */
+interface CarriedViewBoundary {
+  readonly orders: ReadonlySet<string>;
+  readonly placedByDeliveries: ReadonlySet<string>;
 }
 
 /** One market's owed evaluation: the market, and the last frame event that owed it. */

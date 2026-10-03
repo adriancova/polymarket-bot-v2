@@ -55,6 +55,22 @@
  *   evaluation; a refusal for good (`INSTANCE_PAUSED`) is;
  * - RC — a market whose every instance is halted has its owed evaluation
  *   dropped before the cadence is asked, also when it is not yet due.
+ *
+ * `CADENCE-1` r3 adds, each against a finding of the round-3 review — the
+ * carried harvest (`#harvestCarriedEffects`) gives its `onFill` decisions what
+ * the ORDINARY harvest gives them, compared run against run (the same
+ * heartbeat, its close's source an event of A or of X):
+ *
+ * - A-R3-01 — its settled order's reservation is released BEFORE `onFill`, so
+ *   a covered take-profit SELL is admitted under a tight cap on both paths;
+ * - A-R3-02 — an order an `onFill` decision places has its view at the same
+ *   close (resting, filled at once, or partly filled at once), with the same
+ *   release; its immediate fill keeps its ADR-024 harvest point on both paths;
+ * - O-R3-02 — the end-of-input closes flush AFTER the carried harvest (every
+ *   invocation's decision is in the store), and a placement the venue booked
+ *   only IN PART is still the pass's own;
+ * - O-R3-03 — each of the runtime's six refusal codes, scripted at the spy,
+ *   is classified as the loop's `REFUSAL_PERSISTENCE` table says.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -65,12 +81,19 @@ import {
   SimulatedVenue,
   readFeeScheduleSnapshot,
   tier0Model,
+  tokenBucketRateLimits,
   unmodeledRateLimits,
   type BookView,
   type FeeScheduleSnapshot,
+  type RateLimitBudget,
   type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
-import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
+import {
+  createStrategyInstanceRuntime,
+  type EvaluationInput,
+  type EvaluationOutcome,
+  type EvaluationRefusalCode,
+} from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -150,7 +173,7 @@ function marketDocument(marketId: string, tokens: { readonly yes: string; readon
   };
 }
 
-function traderConfig(): Record<string, unknown> {
+function traderConfig(perStrategyCap = "1000"): Record<string, unknown> {
   return {
     environment: "PAPER",
     riskPolicy: {
@@ -164,7 +187,7 @@ function traderConfig(): Record<string, unknown> {
     },
     allocatorCaps: {
       globalAccountCap: "10000",
-      perStrategyCap: "1000",
+      perStrategyCap,
       liveMicroMaxOrderNotional: "0",
       liveMicroMaxAccountExposure: "0",
     },
@@ -229,11 +252,14 @@ function hold(ctx: StrategyContext): DecisionResult {
  * fills at once against the 0.34 ask — so a carried-over or heartbeat
  * evaluation's OWN effects can be followed to the harvest that delivers them.
  * r2: `at` may list several instants; each places one order.
+ * r3: `slices` places `slices` × 10 shares instead — one plan of that many
+ * 10-share orders (`planning.maxSliceShares`), at the same limit price.
  */
 interface PlaceOnFeatures {
   readonly market: string;
   readonly at: string | readonly string[];
   readonly immediate: boolean;
+  readonly slices?: number;
 }
 
 /**
@@ -241,11 +267,15 @@ interface PlaceOnFeatures {
  * `cancelOnFeatures`: its `onFeatures` emits a market-scope CANCEL;
  * `placeOnFill`: its `onFill` places a taker BUY that fills at once (with
  * `restsRemainder`, a GTC one: what the book cannot fill RESTS).
+ * r3 (A-R3-01, A-R3-02): with `sells`, `onFill` instead places a COVERED
+ * resting SELL of the whole position (GTC, maker only, at 0.36) — Static
+ * Bracket's take-profit shape (`planTakeProfit`).
  */
 interface ActAt {
   readonly market: string;
   readonly at: string;
   readonly restsRemainder?: boolean;
+  readonly sells?: boolean;
 }
 
 /**
@@ -264,19 +294,21 @@ function recordingStrategy(
     readonly cancelAt?: string;
     readonly placeOnFillAt?: string;
     readonly placeOnFillResting?: boolean;
+    readonly placeOnFillSells?: boolean;
+    readonly cancelOnFillAt?: string;
     readonly throwAt?: string;
   } = {},
 ): Strategy<unknown, Record<string, never>> {
   const placeAt = onFeaturesAt === undefined ? [] : typeof onFeaturesAt.at === "string" ? [onFeaturesAt.at] : onFeaturesAt.at;
-  const buy = (ctx: StrategyContext, intentId: string, immediate: boolean, restsRemainder = false): Intent => ({
+  const buy = (ctx: StrategyContext, intentId: string, immediate: boolean, restsRemainder = false, slices = 1): Intent => ({
     type: "POSITION",
     intentId,
     marketId,
     direction: "YES",
     targetMode: "DELTA",
-    targetShares: "10",
+    targetShares: String(10 * slices),
     maximumBuyPrice: immediate ? "0.35" : "0.3",
-    maximumTotalCost: immediate ? "4" : "3",
+    maximumTotalCost: String((immediate ? 4 : 3) * slices),
     urgency: immediate ? "IMMEDIATE" : "PASSIVE",
     liquidityPreference: immediate ? "TAKER_OK" : "MAKER_ONLY",
     partialFillPolicy: "ACCEPT_ANY",
@@ -310,11 +342,51 @@ function recordingStrategy(
         decisionType: "enter",
         reasonCodes: ["CADENCE1.PLACE"],
         featureSnapshotRef: ctx.features().snapshotRef,
-        intents: [buy(ctx, index === 0 ? "cadence1-features-buy" : `cadence1-features-buy-${String(index)}`, onFeaturesAt.immediate)],
+        intents: [
+          buy(
+            ctx,
+            index === 0 ? "cadence1-features-buy" : `cadence1-features-buy-${String(index)}`,
+            onFeaturesAt.immediate,
+            false,
+            onFeaturesAt.slices,
+          ),
+        ],
       };
     },
     onFill(ctx: StrategyContext): DecisionResult {
+      if (acts.cancelOnFillAt !== undefined && ctx.now() === acts.cancelOnFillAt) {
+        return {
+          decisionType: "exit",
+          reasonCodes: ["CADENCE1.CANCEL"],
+          featureSnapshotRef: ctx.features().snapshotRef,
+          intents: [{ type: "CANCEL", marketId, reason: "cadence1: an onFill decision cancels this market's working orders" }],
+        };
+      }
       if (acts.placeOnFillAt === undefined || ctx.now() !== acts.placeOnFillAt) return hold(ctx);
+      if (acts.placeOnFillSells === true) {
+        // r3: a covered take-profit — sell the whole position, resting.
+        return {
+          decisionType: "enter",
+          reasonCodes: ["CADENCE1.TAKE_PROFIT"],
+          featureSnapshotRef: ctx.features().snapshotRef,
+          intents: [
+            {
+              type: "POSITION",
+              intentId: "cadence1-fill-sell",
+              marketId,
+              direction: "YES",
+              targetMode: "ABSOLUTE",
+              targetShares: "0",
+              minimumSellPrice: "0.36",
+              urgency: "PASSIVE",
+              liquidityPreference: "MAKER_ONLY",
+              partialFillPolicy: "ACCEPT_ANY",
+              validUntil: new Date(Date.parse(ctx.now()) + 600_000).toISOString(),
+              tags: ["cadence1.take-profit", "sb.order-type:GTC"],
+            },
+          ],
+        };
+      }
       return {
         decisionType: "enter",
         reasonCodes: ["CADENCE1.PLACE"],
@@ -378,15 +450,27 @@ interface HarnessOptions {
   readonly cancelOnFeatures?: ActAt;
   /** `CADENCE-1` r2 (RA): one market's `onFill` places a taker BUY at one instant. */
   readonly placeOnFill?: ActAt;
+  /** `CADENCE-1` r3 (A-R3-02): one market's `onFill` cancels its working orders at one instant. */
+  readonly cancelOnFill?: ActAt;
   /** `CADENCE-1` r2 (RB): one market's `onFeatures` throws at one instant (contained; the instance PAUSES). */
   readonly throwOnFeatures?: ActAt;
   /** `CADENCE-1` r2 (RA): the venue's history bounds (SIM-2). */
   readonly venueRetention?: VenueRetentionBounds;
+  /** `CADENCE-1` r3 (A-R3-01): the allocator's per-strategy cap, in pUSD (default 1,000). */
+  readonly perStrategyCap?: string;
+  /** `CADENCE-1` r3 (O-R3-02): the venue's order budget (default: none modelled). */
+  readonly rateLimits?: RateLimitBudget;
+  /**
+   * `CADENCE-1` r3 (O-R3-03): one market's OWNER runtime answers its
+   * `onFeatures` at one instant `REFUSED` with this code, without invoking the
+   * callback — the runtime's refusal vocabulary, each code as it would come.
+   */
+  readonly refuseOnFeatures?: { readonly market: string; readonly at: string; readonly code: EvaluationRefusalCode };
 }
 
 /** `createPaperTrader`'s assembly, with the recording double's runtimes registered. */
 function assemble(options: HarnessOptions): Harness {
-  const parsed = parseTraderConfig(traderConfig());
+  const parsed = parseTraderConfig(traderConfig(options.perStrategyCap));
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
   const policy = parseRiskPolicy(config.riskPolicy);
@@ -423,8 +507,13 @@ function assemble(options: HarnessOptions): Harness {
           : {
               ...(options.cancelOnFeatures?.market === marketId ? { cancelAt: options.cancelOnFeatures.at } : {}),
               ...(options.placeOnFill?.market === marketId
-                ? { placeOnFillAt: options.placeOnFill.at, placeOnFillResting: options.placeOnFill.restsRemainder === true }
+                ? {
+                    placeOnFillAt: options.placeOnFill.at,
+                    placeOnFillResting: options.placeOnFill.restsRemainder === true,
+                    placeOnFillSells: options.placeOnFill.sells === true,
+                  }
                 : {}),
+              ...(options.cancelOnFill?.market === marketId ? { cancelOnFillAt: options.cancelOnFill.at } : {}),
               ...(options.throwOnFeatures?.market === marketId ? { throwAt: options.throwOnFeatures.at } : {}),
             },
       ),
@@ -437,7 +526,8 @@ function assemble(options: HarnessOptions): Harness {
     });
     if (!created.ok) throw new Error(`runtime refused: ${created.refusal.detail}`);
     const evaluate = created.runtime.evaluate.bind(created.runtime);
-    vi.spyOn(created.runtime, "evaluate").mockImplementation((input: EvaluationInput) => {
+    const refusal = options.refuseOnFeatures;
+    vi.spyOn(created.runtime, "evaluate").mockImplementation((input: EvaluationInput): EvaluationOutcome => {
       seen.push({
         instanceId,
         callback: input.callback,
@@ -448,6 +538,15 @@ function assemble(options: HarnessOptions): Harness {
         yesShares: input.position.yesShares,
         orderStatus: input.callback === "onOrderUpdate" ? input.order.status : undefined,
       });
+      if (
+        refusal !== undefined &&
+        refusal.market === marketId &&
+        ownership === "OWNER" &&
+        input.callback === "onFeatures" &&
+        input.evaluatedAt === refusal.at
+      ) {
+        return { kind: "REFUSED", refusal: { code: refusal.code, detail: "cadence1: a scripted runtime refusal" } };
+      }
       return evaluate(input);
     });
     const registered = registry.register({
@@ -473,7 +572,7 @@ function assemble(options: HarnessOptions): Harness {
     runMode: "PAPER",
     model: tier0Model({ fillModelVersion: "tier0.cadence1", fillModelParametersHash: "c".repeat(64) }),
     feeSnapshot: fees.value,
-    rateLimits: unmodeledRateLimits("no venue rate-limit budget is modelled in this test"),
+    rateLimits: options.rateLimits ?? unmodeledRateLimits("no venue rate-limit budget is modelled in this test"),
     policy: {
       timeInForceFor(order) {
         const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
@@ -1611,6 +1710,12 @@ describe("r2 (RA), ADR-026 D4 and ruling A1: a carried-over or heartbeat evaluat
     expect(health.execution.fillsObserved).toBe(1);
     expect(health.accounting.ledgerTransactions).toBeGreaterThan(0);
     expect(health.seams.reservations).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+    // r3 (O-R3-02, MY8): the outbox is flushed AFTER the carried harvest, so the
+    // decisions of its onFill and onOrderUpdate are in the store too — every
+    // invoked callback's, with no later event to flush them.
+    expect(health.loop.decisionsPersisted).toBe(harness.seen.length);
+    expect(harness.store.decisions).toHaveLength(harness.seen.length);
+    expect(harness.store.decisions.slice(-2).map((entry) => entry.record.callback)).toEqual(["onFill", "onOrderUpdate"]);
   });
 
   it("a frame of events for no configured market (no harvest point at all): the heartbeat's own fill is delivered at the frame's close, at its last applied event's instant", async () => {
@@ -1628,6 +1733,10 @@ describe("r2 (RA), ADR-026 D4 and ruling A1: a carried-over or heartbeat evaluat
       ["B", "onOrderUpdate", undefined, iso(S + 5_001)],
     ]);
     expect(harness.loop.health().execution.fillsObserved).toBe(1);
+    // r3 (O-R3-02): the frame's close flushes after its carried harvest — the
+    // input ends here, and every invoked callback's decision is in the store.
+    expect(harness.store.decisions).toHaveLength(harness.seen.length);
+    expect(harness.store.decisions.slice(-2).map((entry) => entry.record.callback)).toEqual(["onFill", "onOrderUpdate"]);
   });
 
   it("a heartbeat that CANCELS an older working order: the order's terminal view comes at once, at the heartbeat's instant, and its reservation is released there", async () => {
@@ -1736,6 +1845,10 @@ describe("r2 (RA), ADR-026 D4 and ruling A1: a carried-over or heartbeat evaluat
     expect(ofB).toEqual([
       ["onFill", first, "5", undefined],
       ["onOrderUpdate", first, "5", "CANCELED"],
+      // r3 (A-R3-02): the GTC order its onFill placed has its view at the same
+      // close, as an ordinary harvest delivers it — reporting the 5 shares
+      // filled at once, whose fill keeps its ADR-024 harvest point on both paths.
+      ["onOrderUpdate", first, "5", "PARTIALLY_FILLED"],
       ["onFill", iso(S + 10_100), "10", undefined],
       ["onOrderUpdate", iso(S + 10_100), "10", "CANCELED"],
     ]);
@@ -1861,5 +1974,300 @@ describe("r2 (RC), ADR-026 D2.11 as corrected: a market whose every instance is 
     expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
     await feed(harness, snapshot(S + 1_000, MARKET_X, "yes"));
     expect(featureCalls(harness, start)).toEqual([]);
+  });
+});
+
+describe("r3 (A-R3-01, A-R3-02), ADR-026 D4 and §9.14: a carried harvest gives its onFill decisions exactly what an ordinary harvest gives them", () => {
+  /** What one run did at, and after, the close of interest. */
+  interface CloseOutcome {
+    /** Every non-`onFeatures` callback at the close, as `[instance, callback, evaluatedAt, order status]`. */
+    readonly calls: readonly (readonly [string, string, string, string | undefined])[];
+    readonly execution: ReturnType<CoreLoop["health"]>["execution"];
+    readonly reservations: ReturnType<CoreLoop["health"]>["seams"]["reservations"];
+    readonly allocator: ReturnType<CoreLoop["health"]>["seams"]["allocator"];
+    readonly harness: Harness;
+  }
+
+  /**
+   * B's HEARTBEAT at S + 5,000 places a taker BUY that fills 10 at 0.34 at once.
+   * Its close's source is an event of A — a harvest point, so the ORDINARY
+   * harvest delivers it (the comparator) — or of X, a market this trader does
+   * not run: the CARRIED harvest (`#harvestCarriedEffects`). Everything else is
+   * the same, so the two must agree.
+   */
+  async function heartbeatClose(
+    carried: boolean,
+    options: Omit<HarnessOptions, "cadence" | "placeOnFeatures">,
+    setup: () => readonly IngestedEvent[] = () => [],
+  ): Promise<CloseOutcome> {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    const harness = assemble({ ...options, cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true } });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), ...setup());
+    const start = harness.seen.length;
+    await feed(harness, snapshot(S + 5_000, carried ? MARKET_X : MARKET_A, "yes"));
+    const health = harness.loop.health();
+    return {
+      calls: harness.seen
+        .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+        .slice(start)
+        .filter(({ entry }) => entry.callback !== "onFeatures")
+        .map(({ entry, shown }) => [label(entry.instanceId), entry.callback, entry.evaluatedAt, shown?.orderStatus] as const),
+      execution: health.execution,
+      reservations: health.seams.reservations,
+      allocator: health.seams.allocator,
+      harness,
+    };
+  }
+
+  it("A-R3-01: the heartbeat's FILLED order releases its reservation BEFORE onFill, so under a 4 pUSD cap onFill's covered SELL is admitted, as at an ordinary harvest", async () => {
+    const options = { perStrategyCap: "4", placeOnFill: { market: MARKET_B, at: iso(S + 5_000), sells: true } };
+    const ordinary = await heartbeatClose(false, options);
+    const carried = await heartbeatClose(true, options);
+    // The comparator: 3.40 pUSD is in the position, the BUY's 3.40 reservation
+    // is released before onFill, and the covered SELL fits the 4 pUSD cap.
+    expect(ordinary.execution).toMatchObject({ submissionsAccepted: 2, submissionsRefused: 0 });
+    // The carried harvest: the same, at the same instant — the reservation is
+    // not counted beside the position that replaced it (§9.14).
+    expect(carried.execution).toEqual(ordinary.execution);
+    expect(carried.allocator).toEqual(ordinary.allocator);
+    expect(carried.reservations).toEqual(ordinary.reservations);
+    expect(carried.calls).toEqual(ordinary.calls);
+    expect(carried.harness.halts.records()).toEqual([]);
+    // Non-vacuous: the SELL rests at the venue on both paths.
+    for (const run of [ordinary, carried]) {
+      expect(run.harness.venue.ordersSnapshot().map((order) => `${order.action} ${order.state}`)).toEqual([
+        "BUY FILLED",
+        "SELL RESTING",
+      ]);
+    }
+  });
+
+  it("A-R3-02: an order an onFill delivery places at a carried harvest has its view delivered at that same close, as at an ordinary harvest — not at the next harvest point", async () => {
+    const options = { placeOnFill: { market: MARKET_B, at: iso(S + 5_000), sells: true } };
+    const ordinary = await heartbeatClose(false, options);
+    const carried = await heartbeatClose(true, options);
+    const at = iso(S + 5_000);
+    expect(ordinary.calls).toEqual([
+      ["B", "onFill", at, undefined],
+      ["B", "onOrderUpdate", at, "FILLED"],
+      // The take-profit SELL onFill placed: its view at the same close.
+      ["B", "onOrderUpdate", at, "OPEN"],
+    ]);
+    expect(carried.calls).toEqual(ordinary.calls);
+    expect(carried.reservations).toEqual(ordinary.reservations);
+    // Later heartbeats at events for no configured market deliver nothing more:
+    // the SELL's view was delivered, and nothing else is the carried passes' own.
+    const before = carried.harness.seen.length;
+    for (const offset of [10_000, 15_000, 20_000]) await feed(carried.harness, snapshot(S + offset, MARKET_X, "yes"));
+    expect(carried.harness.seen.slice(before).filter((entry) => entry.callback !== "onFeatures")).toEqual([]);
+  });
+
+  it("A-R3-02, exact parity: an onFill decision's order that FILLS AT ONCE has its FILLED view, and its release, at the same close, as at an ordinary harvest; its fill keeps its ADR-024 harvest point", async () => {
+    const options = { placeOnFill: { market: MARKET_B, at: iso(S + 5_000) } };
+    const ordinary = await heartbeatClose(false, options);
+    const carried = await heartbeatClose(true, options);
+    const at = iso(S + 5_000);
+    expect(ordinary.calls).toEqual([
+      ["B", "onFill", at, undefined],
+      ["B", "onOrderUpdate", at, "FILLED"],
+      ["B", "onOrderUpdate", at, "FILLED"],
+    ]);
+    expect(carried.calls).toEqual(ordinary.calls);
+    expect(carried.reservations).toEqual(ordinary.reservations);
+    expect(carried.reservations).toMatchObject({ open: 0, taken: 2, released: 2, reservedCollateral: "0" });
+    expect(carried.allocator).toEqual(ordinary.allocator);
+    // The onFill decision's own fill is NOT read at this close on either path:
+    // it keeps its ADR-024 harvest point (the next one).
+    expect(carried.execution.fillsObserved).toBe(1);
+    expect(ordinary.execution.fillsObserved).toBe(1);
+    expect(carried.harness.venue.fills).toHaveLength(2);
+
+    // Until that harvest point, heartbeats at events for no configured market
+    // see the same position and the same account on BOTH paths: the window
+    // before that fill is booked is the cadence's (O-R3-01), not the carried
+    // harvest's.
+    const later = async (run: CloseOutcome) => {
+      const from = run.harness.seen.length;
+      for (const offset of [10_000, 15_000]) await feed(run.harness, snapshot(S + offset, MARKET_X, "yes"));
+      const health = run.harness.loop.health();
+      return {
+        calls: run.harness.seen
+          .map((entry, index) => ({ entry, shown: run.harness.shown[index] }))
+          .slice(from)
+          .map(({ entry, shown }) => [label(entry.instanceId), entry.callback, entry.evaluatedAt, shown?.yesShares]),
+        reservations: health.seams.reservations,
+        allocator: health.seams.allocator,
+        fillsObserved: health.execution.fillsObserved,
+      };
+    };
+    const ordinaryLater = await later(ordinary);
+    expect(await later(carried)).toEqual(ordinaryLater);
+    expect(ordinaryLater.calls).toEqual([
+      ["A", "onFeatures", iso(S + 10_000), "0"],
+      ["B", "onFeatures", iso(S + 10_000), "10"],
+      ["A", "onFeatures", iso(S + 15_000), "0"],
+      ["B", "onFeatures", iso(S + 15_000), "10"],
+    ]);
+    expect(ordinaryLater.fillsObserved).toBe(1);
+
+    // B's own event: the next harvest point books that fill and delivers it
+    // once; the order, retired at its FILLED view, is not delivered again, and
+    // both orders settle with every share booked.
+    const bookB = level(S + 15_100, MARKET_B, "0.31");
+    const before = carried.harness.seen.length;
+    await feed(carried.harness, bookB);
+    expect(
+      carried.harness.seen
+        .map((entry, index) => ({ entry, shown: carried.harness.shown[index] }))
+        .slice(before)
+        .filter(({ entry }) => entry.callback !== "onFeatures")
+        .map(({ entry, shown }) => [label(entry.instanceId), entry.callback, entry.evaluatedAt, shown?.yesShares]),
+    ).toEqual([["B", "onFill", iso(S + 15_100), "20"]]);
+    const health = carried.harness.loop.health();
+    expect(health.execution).toMatchObject({ fillsObserved: 2, duplicateFillsRefused: 0 });
+    expect(health.seams.orders).toMatchObject({ settled: 2, settleMismatches: 0 });
+  });
+
+  it("A-R3-02, exact parity: an onFill decision's GTC order PARTLY filled at once has its working view at the same close on both paths, and keeps its reservation", async () => {
+    // B's asks: 5 shares at 0.34, then 0.40 — the heartbeat's FAK BUY fills 5
+    // and is cancelled short; its onFill's GTC BUY fills 5 at once and rests 5.
+    const setup = () => [askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5")];
+    const options = { placeOnFill: { market: MARKET_B, at: iso(S + 5_000), restsRemainder: true } };
+    const ordinary = await heartbeatClose(false, options, setup);
+    const carried = await heartbeatClose(true, options, setup);
+    const at = iso(S + 5_000);
+    expect(ordinary.calls).toEqual([
+      ["B", "onFill", at, undefined],
+      ["B", "onOrderUpdate", at, "CANCELED"],
+      ["B", "onOrderUpdate", at, "PARTIALLY_FILLED"],
+    ]);
+    expect(carried.calls).toEqual(ordinary.calls);
+    expect(carried.reservations).toEqual(ordinary.reservations);
+    expect(carried.reservations).toMatchObject({ open: 1, taken: 2, released: 1 });
+    expect(carried.allocator).toEqual(ordinary.allocator);
+  });
+
+  it("A-R3-02: an order an onFill decision CANCELS at a carried harvest is gated like the pass's own cancels — with a fill still unread, its view and its release wait for the harvest that books that fill", async () => {
+    ordinal = 0;
+    const first = iso(S + 5_000);
+    const second = iso(S + 10_000);
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      placeOnFeatures: { market: MARKET_B, at: [first, second], immediate: true },
+      placeOnFill: { market: MARKET_B, at: first, restsRemainder: true },
+      cancelOnFill: { market: MARKET_B, at: second },
+    });
+    // B's asks: 5 shares at 0.34, then 0.40.
+    await feed(
+      harness,
+      ...opening(),
+      opened(S + 150, MARKET_B),
+      askLevel(S + 200, MARKET_B, "0.4", "500"),
+      askLevel(S + 210, MARKET_B, "0.34", "5"),
+    );
+    const start = harness.seen.length;
+    // The first heartbeat: its FAK BUY fills 5; onFill places a GTC BUY that
+    // fills 5 at once (that fill unread until the next harvest point) and rests 5.
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    // The second heartbeat: its FAK BUY fills 5; ITS onFill cancels B's working
+    // orders — the GTC one, whose fill is still unread.
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    expect(harness.venue.ordersSnapshot().map((order) => `${order.state} ${order.filledShares}/${order.requestedShares}`)).toEqual([
+      "CANCELLED 5/10",
+      "CANCELLED 5/10",
+      "CANCELLED 5/10",
+    ]);
+    // The GTC order's view and its reservation wait: the view reports a fill not yet booked.
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 1 });
+    await feed(harness, level(S + 10_100, MARKET_B, "0.31"));
+    const ofB = harness.seen
+      .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+      .slice(start)
+      .filter(({ entry }) => entry.instanceId === INSTANCE_B && entry.callback !== "onFeatures")
+      .map(({ entry, shown }) => [entry.callback, entry.evaluatedAt, shown?.yesShares, shown?.orderStatus]);
+    expect(ofB).toEqual([
+      ["onFill", first, "5", undefined],
+      ["onOrderUpdate", first, "5", "CANCELED"],
+      ["onOrderUpdate", first, "5", "PARTIALLY_FILLED"],
+      ["onFill", second, "10", undefined],
+      // The second heartbeat's own FAK order; NOT the GTC order its onFill cancelled.
+      ["onOrderUpdate", second, "10", "CANCELED"],
+      // B's own event: the ordinary harvest books the GTC order's fill, then delivers its view.
+      ["onFill", iso(S + 10_100), "15", undefined],
+      ["onOrderUpdate", iso(S + 10_100), "15", "CANCELED"],
+    ]);
+    expect(harness.loop.health().execution).toMatchObject({ fillsObserved: 3, duplicateFillsRefused: 0 });
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, reservedCollateral: "0" });
+    expect(harness.loop.health().seams.orders).toMatchObject({ settled: 3, settleMismatches: 0 });
+  });
+});
+
+describe("r3 (O-R3-02): the carried harvest's flush order, and a placement the venue booked only in part", () => {
+  it("MY10: a heartbeat's plan the venue books only IN PART (refused, PARTIAL) — the booked orders are still its own: their views come at its close", async () => {
+    ordinal = 0;
+    const at = iso(S + 5_000);
+    // 16 resting slices; a 15-token order budget books the first batch of 15
+    // and refuses the second (all-or-nothing per batch, D-05).
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      placeOnFeatures: { market: MARKET_B, at, immediate: false, slices: 16 },
+      rateLimits: tokenBucketRateLimits({
+        orderTokensPerWindow: 15,
+        cancelTokensPerWindow: 10,
+        windowMs: 3_600_000,
+        snapshotVersion: "cadence1-r3-partial",
+      }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    const start = harness.seen.length;
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    const health = harness.loop.health();
+    expect(health.execution).toMatchObject({ submissionsRefused: 1, submissionsAccepted: 0, reservationsReleasedOnRefusal: 1 });
+    expect(harness.venue.ordersSnapshot()).toHaveLength(15);
+    expect(harness.halts.records()).toEqual([]);
+    const views = harness.seen
+      .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+      .slice(start)
+      .filter(({ entry }) => entry.callback === "onOrderUpdate")
+      .map(({ entry, shown }) => [label(entry.instanceId), entry.evaluatedAt, shown?.orderStatus]);
+    expect(views).toEqual(Array.from({ length: 15 }, () => ["B", at, "OPEN"]));
+    // Every invocation's decision is in the store when the drain returns.
+    expect(harness.store.decisions).toHaveLength(harness.seen.length);
+  });
+});
+
+describe("r3 (O-R3-03): each runtime refusal code is classified — a refusal that can pass is no evaluation; a refusal for good is", () => {
+  const codes: readonly (readonly [EvaluationRefusalCode, "TRANSIENT" | "PERMANENT"])[] = [
+    ["CLOCK_INVALID", "TRANSIENT"],
+    ["INPUT_INVALID", "TRANSIENT"],
+    ["EVALUATION_REENTRANT", "TRANSIENT"],
+    ["INSTANCE_PAUSED", "PERMANENT"],
+    ["INSTANCE_STOPPED", "PERMANENT"],
+    ["EVALUATION_SEQ_EXHAUSTED", "PERMANENT"],
+  ];
+
+  it.each(codes)("%s is %s: A's next change, 10 ms later, is evaluated only if the refusal can pass", async (code, persistence) => {
+    ordinal = 0;
+    const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, refuseOnFeatures: { market: MARKET_A, at: iso(S + 1_000), code } });
+    await feed(harness, ...opening());
+    const count = harness.store.decisions.length;
+    await feed(harness, level(S + 1_000, MARKET_A, "0.31"));
+    expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
+    expect(harness.store.decisions).toHaveLength(count);
+    const coalesced = harness.loop.health().loop.evaluationsCoalesced;
+    const next = level(S + 1_010, MARKET_A, "0.3");
+    await feed(harness, next);
+    if (persistence === "TRANSIENT") {
+      // `last` did not move: A is asked again, and decides.
+      expect(harness.store.decisions).toHaveLength(count + 1);
+      expect(harness.store.decisions.at(-1)?.record.sourceEvent?.eventId).toBe(idOf(next));
+      expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
+    } else {
+      // The refusal was A's evaluation: inside the interval A is coalesced, not asked.
+      expect(harness.store.decisions).toHaveLength(count);
+      expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced + 1);
+    }
+    expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
   });
 });
