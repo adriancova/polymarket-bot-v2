@@ -45,7 +45,16 @@ normalizer.
 backtest-cli verify --dataset <dir> --pins <run-pins.json>
 backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json> \
                  --artifact <file> [--id-namespace <namespace>]
+backtest-cli approx-run --store <dir> --manifests <key>[,<key>...] \
+                 --gamma-markets <marketId>=<gammaMarketId>[,...] --pins <run-pins.json> \
+                 --config <trader-config.json> --artifact <file> [--id-namespace <namespace>]
 ```
+
+`verify` and `run` are EXACT: both read the dataset manifest through
+`packages/simulation`'s exact door, which refuses a research-tier
+(`approximate`) manifest with `REPLAY_MANIFEST_APPROXIMATE`. `approx-run` is
+the approximate backtest over the research tier (below); nothing it produces
+is evidence.
 
 `verify` reads `<dir>/dataset-manifest.json` under the ADR-017 §3 strict-JSON
 profile, digests every object the manifest pins and compares it with the pin,
@@ -142,6 +151,78 @@ node apps/backtest-cli/dist/main.mjs run --dataset test/replay-golden/backtest/s
 `BACKTEST` mode; the core it builds is the PAPER core, whose run-mode
 constants are the paper trader's, unchanged. A backtest is "the PAPER core
 driven by recorded events under the BACKTEST root".
+
+## `approx-run` — approximate replay over the research tier (APPROX-REPLAY-1, ADR-029)
+
+`approx-run` replays a research-tier dataset — the downsampled record
+`STORAGE-1`'s extractor keeps under `research/<gatewayEpoch>/<datasetId>/` —
+through the SAME core `run` builds (`assembleBacktestCore`) and the SAME
+driver (`replayDrivenCoreLoop`). Its code is `src/approximate/`.
+
+**Nothing it produces is evidence.** ADR-029 Decision 2: an approximate
+dataset, and any result computed from it, is never determinism, calibration,
+promotion or soak evidence, and ranks below every ADR-012 tier. So:
+
+- every line it prints, and every line of the artifact it writes after the
+  format id, starts with the manifests' own `fidelity` (`approximate`), read
+  through the verifier — never inferred from a file name;
+- every such line is ONE physical line (`approximate/label.ts`): a line break,
+  any other control character or a backslash inside a manifest's text, a
+  row's value, a refusal's detail or an argument is escaped (`\n`, `\r`,
+  `\t`, `\\`, `\uXXXX`), so no text can print a line the label does not
+  cover. The same holds for its refusals and for anything the core's venue
+  logs during the run;
+- its formats are its own: `polymarket-bot/approximate-run/v1` and
+  `polymarket-bot/approximate-backtest-replay/v1`;
+- the exact tools refuse it: `verify`, `run`, `runBacktest`,
+  `runBacktestCore` (`REPLAY_MANIFEST_APPROXIMATE`) and the exact artifact
+  renderer, which refuses any result that states a fidelity or is not an exact
+  run's serialization, and any core an approximate run built;
+- the package's public surface has no unlabelled renderer: the core-section
+  builder is private to `artifact.ts`, and the approximate artifact's core
+  sections come labelled from `renderApproximateCoreSections`.
+
+**The source** (`approximate/research-source.ts`):
+
+1. every manifest is verified by `storage-parquet`'s `verifyResearchTierDataset`
+   first; an unverified dataset is refused and nothing of it is read. Each
+   table object is then read once more and digested against the verified pin
+   before it is decoded;
+2. datasets of more than one gateway epoch STOP AND ASK (exit 4): no recorded
+   evidence orders one epoch against another (`wal-format.md` §12.1; ADR-029
+   Decision 5.4). Several datasets of one epoch must form one unbroken
+   `stateIn` chain;
+3. samples are consumed in the dispatch order of their release frames
+   (`releaseIngestSeq`), with downsampling v1's fixed tie order — never by
+   instant. Both are checked, and so are the span release rules a reader can
+   see: a span sample is released at or after its boundary, one frame closes
+   at most one span of each length, and boundaries only increase. A dataset
+   of another downsampling version is refused: its tie order is unknown here.
+
+**The translation** (`approximate/translate.ts`,
+`backtest-cli/research-tier-samples/v1`, pinned by the run pins as their
+`normalizerVersion`) turns samples into the envelopes the core consumes, and
+states what each loses: a full book or a five-level depth becomes a
+`BookSnapshot` (one per token per release frame; no connection, so ADR-023's
+session liveness never extends it); a 1 s reference bar becomes one
+`ReferenceTradeObserved` at its close; a Polymarket trade a
+`PublicTradeObserved`; Gamma polls become `MarketOpened`/`MarketClosing` by
+`UNIV-4`'s rules at sample resolution, attributed to a configured market by
+the operator-stated `--gamma-markets` id; the configured `closeTime` gives the
+scheduled `MarketClosing`. `market_resolved` (no timestamp is kept),
+tick-size and new-market events, Chainlink ticks and feed events become
+nothing, and are counted in the run record.
+
+**The clock.** The driver advances the replay clock to each release frame's
+receipt instant before every envelope is ingested, and every envelope's
+`receivedAt` is that instant: the process-lag guard (ADR-023 D7, ADR-031)
+reads 0. The research tier records no monotonic reading; the run uses the
+receipt instant in milliseconds, never decreasing, and says so
+(`monotonicBasis=DERIVED_FROM_AVAILABLE_AT_MILLISECONDS_NON_DECREASING`).
+
+Exit codes: `0` completed; `2` usage; `3` refused or stopped part-way (the
+translation, a venue refusal); `4` stopped to ask (more than one gateway
+epoch); `75` the core latched a halt. A stopped run writes no artifact.
 
 ## The shared core in replay (BACKTEST-1, BACKTEST-2, GOV-2B B3)
 

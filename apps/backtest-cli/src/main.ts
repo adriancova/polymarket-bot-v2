@@ -14,6 +14,9 @@
  * backtest-cli verify --dataset <dir> --pins <run-pins.json>
  * backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json>
  *                  --artifact <file> [--id-namespace <namespace>]
+ * backtest-cli approx-run --store <dir> --manifests <key>[,<key>...]
+ *                  --gamma-markets <marketId>=<gammaMarketId>[,...] --pins <run-pins.json>
+ *                  --config <trader-config.json> --artifact <file> [--id-namespace <namespace>]
  * ```
  *
  * `verify` reads the dataset manifest, verifies every pinned object's checksum,
@@ -41,6 +44,17 @@
  * The artifact and the report are SIMULATED: every fill is
  * `SIMULATED_NOT_REAL_EVIDENCE`, and the report says `core_run_mode=PAPER`
  * beside the root's `run_mode=BACKTEST` (ADR-022 D6; BT1-R5).
+ *
+ * `approx-run` (`APPROX-REPLAY-1`, ADR-029) is the APPROXIMATE backtest: the
+ * same core, driven by a verified research-tier dataset of one gateway epoch
+ * (`approximate/`). Every line it prints and every line of the artifact it
+ * writes is labelled with the manifests' `fidelity` (`approximate`), and is
+ * one physical line: text inside it is escaped (`approximate/label.ts`), so
+ * no line break in a manifest, a row or an argument prints an unlabelled
+ * line. It is never determinism, calibration, promotion or soak evidence. `verify` and
+ * `run` stay exact: both refuse an approximate manifest
+ * (`REPLAY_MANIFEST_APPROXIMATE`). A replay across gateway epochs stops and
+ * asks (exit {@link EXIT_ASK}).
  */
 
 import { readFile, writeFile } from "node:fs/promises";
@@ -52,6 +66,7 @@ import {
   type ReplayNormalizer,
   type ReplayRunPins,
 } from "@polymarket-bot/simulation";
+import { fileSystemObjectStore } from "@polymarket-bot/storage-parquet";
 
 import { sha256Hex } from "./archive.js";
 import { renderBacktestArtifact } from "./artifact.js";
@@ -62,6 +77,13 @@ import {
   recordedFrameNormalizer,
 } from "./normalizer.js";
 import { renderBacktestOutcome, runBacktest } from "./run.js";
+import { escapeLineText, labelLine } from "./approximate/label.js";
+import { runApproximateBacktest, type ApproximateRunRefusal } from "./approximate/run.js";
+import {
+  fidelityLine,
+  renderApproximateArtifact,
+  serializeApproximateRun,
+} from "./approximate/serialize.js";
 
 /**
  * The shipped normalizer the run pins name, or the verification-only one.
@@ -91,11 +113,20 @@ export const EXIT_REFUSED = 3;
  * over a completed run. The paper trader's `EXIT_CODES.halted` value.
  */
 export const EXIT_HALTED = 75;
+/**
+ * `approx-run` only: the replay STOPPED AND ASKS (ADR-029 Decision 5.4,
+ * wal-format.md §12.1). The datasets span more than one gateway epoch, and no
+ * recorded evidence orders one epoch against another; nothing was replayed.
+ */
+export const EXIT_ASK = 4;
 
 /** The usage lines, printed on any usage error. */
 export const USAGE_LINES: readonly string[] = Object.freeze([
   "usage: backtest-cli verify --dataset <dir> --pins <run-pins.json>",
   "       backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json> " +
+    "--artifact <file> [--id-namespace <namespace>]",
+  "       backtest-cli approx-run --store <dir> --manifests <key>[,<key>...] " +
+    "--gamma-markets <marketId>=<gammaMarketId>[,...] --pins <run-pins.json> --config <trader-config.json> " +
     "--artifact <file> [--id-namespace <namespace>]",
 ]);
 
@@ -108,7 +139,7 @@ interface ParsedArguments {
 export function parseArguments(argv: readonly string[]): ParsedArguments | { readonly usage: string } {
   const [command, ...rest] = argv;
   if (command === undefined || command.startsWith("--")) {
-    return { usage: "a command is required: verify or run" };
+    return { usage: "a command is required: verify, run or approx-run" };
   }
   const options: Record<string, string> = {};
   for (let index = 0; index < rest.length; index += 2) {
@@ -280,6 +311,196 @@ async function runCommand(options: Readonly<Record<string, string>>, io: CliIo):
   }
 }
 
+/** `--gamma-markets a=1,b=2` → the map, or why it is not one. */
+export function parseGammaMarkets(value: string): ReadonlyMap<string, string> | { readonly problem: string } {
+  const map = new Map<string, string>();
+  for (const entry of value.split(",")) {
+    const separator = entry.indexOf("=");
+    const marketId = separator < 0 ? "" : entry.slice(0, separator);
+    const gammaMarketId = separator < 0 ? "" : entry.slice(separator + 1);
+    if (marketId === "" || gammaMarketId === "" || map.has(marketId)) {
+      return { problem: `--gamma-markets takes <marketId>=<gammaMarketId>[,...] with each market once; got ${JSON.stringify(entry)}` };
+    }
+    map.set(marketId, gammaMarketId);
+  }
+  return map;
+}
+
+function approximateRefusalLines(refusal: ApproximateRunRefusal): { readonly lines: string[]; readonly code: number } {
+  // Labelled from the manifests once one verified; before that there is no
+  // approximate output to label, and the line says so. Either way each line
+  // is ONE physical line (r1, APPROX-R1-H1): a detail or an issue carrying a
+  // manifest's text, a row's value or an operator argument is escaped.
+  const fidelity = refusal.fidelity;
+  const line = (text: string): string => (fidelity === undefined ? escapeLineText(text) : labelLine(fidelity, text));
+  const unlabelled = fidelity === undefined ? " (no research-tier manifest verified, so this refusal carries no fidelity label)" : "";
+  if (refusal.code === "APPROX_REPLAY_CROSS_EPOCH") {
+    return {
+      code: EXIT_ASK,
+      lines: [
+        line(`ASK: ${refusal.code}: ${refusal.detail}`),
+        ...refusal.issues.map((issue) => line(`  ${issue}`)),
+        line(
+          "QUESTION: replay each gateway epoch separately (one --manifests list per epoch), or first record " +
+            "evidence that orders the epochs and amend ADR-004 (wal-format.md §12.1 rule 5)? Nothing was replayed.",
+        ),
+      ],
+    };
+  }
+  return {
+    code: EXIT_REFUSED,
+    lines: [line(`REFUSED: ${refusal.code}: ${refusal.detail}${unlabelled}`), ...refusal.issues.map((issue) => line(`  ${issue}`))],
+  };
+}
+
+/**
+ * The `approx-run` command (`APPROX-REPLAY-1`). Safety FIRST, then the pins
+ * and the configuration, then the research tier through its verifier, the
+ * core's own assembly, the run and the artifact. Every line printed after a
+ * manifest verified starts with the manifests' fidelity. Every line it prints
+ * at all is one physical line (r1, APPROX-R1-H1): before a manifest verified
+ * there is nothing to label, but an argument, an environment name or a file
+ * error carrying a line break is still escaped (`approximate/label.ts`).
+ */
+async function approximateRunCommand(options: Readonly<Record<string, string>>, io: CliIo): Promise<number> {
+  // Before any manifest verified: unlabelled, one physical line each.
+  const err = (line: string): void => {
+    io.err(escapeLineText(line));
+  };
+  const required = ["store", "manifests", "gamma-markets", "pins", "config", "artifact"];
+  const missing = required.filter((key) => options[key] === undefined);
+  if (missing.length > 0) {
+    err(`backtest-cli: approx-run needs ${missing.map((key) => `--${key}`).join(", ")}`);
+    for (const line of USAGE_LINES) err(line);
+    return EXIT_USAGE;
+  }
+  const known = new Set([...required, "id-namespace"]);
+  const unknown = Object.keys(options).filter((key) => !known.has(key));
+  if (unknown.length > 0) {
+    err(`backtest-cli: approx-run does not take ${unknown.map((key) => `--${key}`).join(", ")}`);
+    for (const line of USAGE_LINES) err(line);
+    return EXIT_USAGE;
+  }
+  const gammaMarkets = parseGammaMarkets(options["gamma-markets"] as string);
+  if ("problem" in gammaMarkets) {
+    err(`backtest-cli: ${gammaMarkets.problem}`);
+    return EXIT_USAGE;
+  }
+  const manifestObjectKeys = (options["manifests"] as string).split(",");
+
+  // --- 1. §6 invariant 17: nothing is opened before this --------------------
+  const safety = checkBacktestCoreSafety(io.environment);
+  if (!safety.ok) {
+    err("REFUSED: startup safety validation failed (§6 invariant 17, §11, §15, AGENTS.md); no file was read and no core was built");
+    for (const violation of safety.violations) err(`  ${violation}`);
+    return EXIT_REFUSED;
+  }
+
+  // --- 2. the run pins and the operator configuration ------------------------
+  const pins = await readStrictJsonFile(options["pins"] as string, "run-pins file");
+  if ("problem" in pins) {
+    err(`backtest-cli: ${pins.problem}`);
+    return EXIT_REFUSED;
+  }
+  const config = await readStrictJsonFile(options["config"] as string, "trader configuration");
+  if ("problem" in config) {
+    err(`backtest-cli: ${config.problem}`);
+    return EXIT_REFUSED;
+  }
+
+  // --- 3. the research tier, the core, the run --------------------------------
+  const idNamespace = options["id-namespace"];
+  const started = await runApproximateBacktest({
+    environment: io.environment,
+    traderConfig: config.value,
+    runPins: pins.value,
+    objectStore: fileSystemObjectStore(options["store"] as string),
+    manifestObjectKeys,
+    gammaMarketIds: gammaMarkets,
+    ...(idNamespace === undefined ? {} : { idNamespace }),
+    log: io.err,
+  });
+  if (!started.ok) {
+    const refused = approximateRefusalLines(started.refusal);
+    for (const line of refused.lines) io.err(line);
+    return refused.code;
+  }
+  const { outcome, core, driver, fidelity } = started.run;
+  // Every line from here on: the manifests' fidelity, then the text as ONE
+  // physical line (r1, APPROX-R1-H1; `approximate/label.ts`).
+  const label = (line: string): string => labelLine(fidelity, line);
+  const halts = core.trader.halts
+    .records()
+    .map((record) => `${record.code}@${record.scope.kind}`)
+    .join(",");
+  try {
+    if (!outcome.ok) {
+      io.err(label(fidelityLine(fidelity)));
+      io.err(label(`STOPPED: ${outcome.refusal.code}: ${outcome.refusal.message}`));
+      for (const key of Object.keys(outcome.refusal.details).sort()) {
+        io.err(label(`  ${key}=${String(outcome.refusal.details[key])}`));
+      }
+      io.err(label(`release_frames_read=${String(started.run.source.releaseFrames.length)}`));
+      if (core.trader.halts.anyHalt) {
+        io.err(label(`HALTED: the core latched ${halts}; the replay stopped where the live pump returns HALTED (BT1-R3)`));
+        return EXIT_HALTED;
+      }
+      return EXIT_REFUSED;
+    }
+
+    // --- 4. the artifact: approximate, labelled on every line -------------------
+    const artifact = renderApproximateArtifact({ result: outcome.result, trader: core.trader, store: core.store, driver });
+    if (!artifact.ok) {
+      io.err(label(`REFUSED: no artifact was written: ${artifact.problem}`));
+      return EXIT_REFUSED;
+    }
+    const bytes = new Uint8Array(Buffer.from(artifact.text, "utf8"));
+    try {
+      await writeFile(options["artifact"] as string, bytes, { flag: "wx" });
+    } catch (error) {
+      io.err(
+        label(
+          `REFUSED: the artifact could not be written to ${options["artifact"] as string} ` +
+            `(${error instanceof Error ? error.message : String(error)}); approx-run never overwrites an existing file`,
+        ),
+      );
+      return EXIT_REFUSED;
+    }
+    const health = core.trader.loop.health();
+    io.out(label(fidelityLine(fidelity)));
+    for (const statement of outcome.result.source.admissibility) io.out(label(`admissibility=${statement}`));
+    io.out(label(`run_mode=${outcome.result.runMode}`));
+    io.out(label(`core_run_mode=${BACKTEST_CORE_RUN_MODE}`));
+    io.out(label(`release_frames=${String(outcome.result.source.releaseFrames.length)}`));
+    io.out(label(`release_frames_delivered=${String(outcome.result.releaseFramesDelivered)}`));
+    io.out(label(`samples_read=${String(outcome.result.source.samplesRead)}`));
+    io.out(label(`envelopes_delivered=${String(outcome.result.envelopesDelivered)}`));
+    io.out(label(`decisions_persisted=${String(health.loop.decisionsPersisted)}`));
+    io.out(label(`risk_evaluations=${String(health.risk.evaluations)}`));
+    io.out(label(`risk_refusals=${String(health.risk.refusals)}`));
+    io.out(
+      label(
+        `risk_refusals_by_code=${Object.entries(health.risk.refusalsByCode)
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+          .map(([code, count]) => `${code}:${String(count)}`)
+          .join(",")}`,
+      ),
+    );
+    io.out(label(`fills=${String(health.execution.fillsObserved)}`));
+    io.out(label(`id_namespace=${core.idNamespace}`));
+    io.out(label(`halts=${halts}`));
+    io.out("");
+    io.out(serializeApproximateRun(outcome.result));
+    io.out("");
+    io.out(label(`artifact=${options["artifact"] as string}`));
+    io.out(label(`artifact_bytes=${String(bytes.byteLength)}`));
+    io.out(label(`artifact_sha256=${sha256Hex(bytes)}`));
+    return core.trader.halts.anyHalt ? EXIT_HALTED : EXIT_OK;
+  } finally {
+    await core.store.close();
+  }
+}
+
 /** Runs the CLI. Returns an exit code; writes through the injected sinks. */
 export async function main(input: {
   readonly argv: readonly string[];
@@ -294,6 +515,7 @@ export async function main(input: {
     return EXIT_USAGE;
   }
   if (parsed.command === "run") return await runCommand(parsed.options, input);
+  if (parsed.command === "approx-run") return await approximateRunCommand(parsed.options, input);
   if (parsed.command !== "verify") {
     input.err(`backtest-cli: unknown command ${JSON.stringify(parsed.command)}`);
     return EXIT_USAGE;

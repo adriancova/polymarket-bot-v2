@@ -29,6 +29,7 @@
  * the rule `runReplay` applies to the venue's evicted history.
  */
 
+import { SIMULATION_RUN_SERIALIZATION_VERSION } from "@polymarket-bot/simulation";
 import {
   projectionOf,
   type DecisionTrace,
@@ -37,6 +38,7 @@ import {
   type TraceLink,
 } from "@polymarket-bot/trading-core";
 
+import { labelLine } from "./approximate/label.js";
 import type { ReplayDriverObservations } from "./core-loop.js";
 import type { BacktestOutcome } from "./run.js";
 
@@ -89,8 +91,123 @@ function traceLine(trace: TraceLink): string {
   ].join(" ");
 }
 
-/** Renders the artifact. Pure: the same inputs give the same bytes. */
+/** What the core sections are rendered from: the core that ran and the driver that drove it. */
+export interface CoreSectionsInput {
+  readonly trader: PaperTrader;
+  readonly store: Pick<InMemoryTraderStore, "decisions" | "checkpoints" | "transactions" | "pnlSnapshots">;
+  readonly driver: ReplayDriverObservations;
+}
+
+/**
+ * `APPROX-REPLAY-1` r1 (APPROX-R1-H2): the cores an approximate run built.
+ * `approximate/run.ts` marks each core right after its assembly, before it
+ * is driven, so whatever that core produced is never rendered as an exact
+ * artifact, whichever outcome it is handed with. The trader, its loop (where
+ * the decisions, chains and health are read) and the store are each marked.
+ * Marking only ever adds a refusal.
+ */
+const approximateCores = new WeakSet<object>();
+
+/** Marks a core as one an approximate run built (see {@link approximateCores}). */
+export function markApproximateCore(core: Pick<CoreSectionsInput, "trader" | "store">): void {
+  approximateCores.add(core.trader);
+  approximateCores.add(core.trader.loop);
+  approximateCores.add(core.store);
+}
+
+function isApproximateCore(input: Pick<CoreSectionsInput, "trader" | "store">): boolean {
+  return approximateCores.has(input.trader) || approximateCores.has(input.trader.loop) || approximateCores.has(input.store);
+}
+
+/**
+ * Renders the artifact. Pure: the same inputs give the same bytes.
+ *
+ * `APPROX-REPLAY-1` (ADR-029 Decision 4.3): this is an EVIDENCE artifact — its
+ * golden is a determinism gate — so it refuses an approximate result. Only an
+ * exact replay's `ReplayRunResult` renders: a result that states any
+ * `fidelity`, or whose serialization is not the exact run's
+ * (`polymarket-bot/simulation-run/v3`), is refused by name; so is a core an
+ * approximate run built, even beside an exact result (r1, APPROX-R1-H2). An
+ * approximate run writes its own artifact (`approximate/serialize.ts`),
+ * labelled as such.
+ */
 export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestArtifact {
+  if (isApproximateCore(input)) {
+    return {
+      ok: false,
+      problem:
+        "REPLAY_MANIFEST_APPROXIMATE: this artifact is evidence of an exact replay, and the core offered was built " +
+        "and driven by an approximate replay (a research-tier dataset); what it produced is never determinism, " +
+        "calibration, promotion or soak evidence (ADR-029 Decisions 2 and 4.3)",
+    };
+  }
+  const result: unknown = input.outcome.result;
+  const fidelity =
+    typeof result === "object" && result !== null && Object.hasOwn(result, "fidelity")
+      ? (result as { readonly fidelity: unknown }).fidelity
+      : undefined;
+  const serialization =
+    typeof result === "object" && result !== null ? (result as { readonly serialization?: unknown }).serialization : undefined;
+  if (
+    fidelity !== undefined ||
+    typeof serialization !== "string" ||
+    !serialization.startsWith(`${SIMULATION_RUN_SERIALIZATION_VERSION}\n`)
+  ) {
+    return {
+      ok: false,
+      problem:
+        `REPLAY_MANIFEST_APPROXIMATE: this artifact is evidence of an exact replay, and the result offered is not one ` +
+        `(fidelity ${JSON.stringify(fidelity ?? "unstated")}); an approximate result is never determinism, calibration, ` +
+        "promotion or soak evidence (ADR-029 Decisions 2 and 4.3)",
+    };
+  }
+  const sections = coreSectionLines(input);
+  if (!sections.ok) return sections;
+  const lines: string[] = [BACKTEST_ARTIFACT_FORMAT_ID, "--- simulation-run ---", serialization, ...sections.lines];
+  return { ok: true, text: `${lines.join("\n")}\n` };
+}
+
+/** Core section lines, or why they cannot be rendered. */
+export type CoreSections =
+  | { readonly ok: true; readonly lines: readonly string[] }
+  | { readonly ok: false; readonly problem: string };
+
+/**
+ * The core sections of an APPROXIMATE artifact (`approximate/serialize.ts`):
+ * the same sections the exact artifact renders, every line labelled with the
+ * manifests' fidelity and escaped to one physical line
+ * (`approximate/label.ts`). It never returns an unlabelled line: a fidelity
+ * other than `approximate` (the only one the research-tier verifier admits)
+ * is refused rather than printed as a label.
+ *
+ * `APPROX-REPLAY-1` r1 (APPROX-R1-H2): the unlabelled builder below is this
+ * module's own; the package's public surface (`index.ts`) exports neither.
+ */
+export function renderApproximateCoreSections(input: CoreSectionsInput, fidelity: "approximate"): CoreSections {
+  const stated: unknown = fidelity;
+  if (stated !== "approximate") {
+    return {
+      ok: false,
+      problem:
+        `an approximate artifact's core sections are labelled with the manifests' fidelity, which is "approximate"; ` +
+        `the fidelity offered was ${JSON.stringify(typeof stated === "string" ? stated : String(stated))}, so nothing is rendered`,
+    };
+  }
+  const sections = coreSectionLines(input);
+  if (!sections.ok) return sections;
+  return { ok: true, lines: sections.lines.map((line) => labelLine(fidelity, line)) };
+}
+
+/**
+ * The sections the shared core produced — every persisted decision, every §6
+ * invariant 4 chain, the ledger projection, the §9.16 snapshots, the health
+ * counters, the store's write counts and the driver's counters — ending in
+ * `end`. UNLABELLED, so private to this module: the exact artifact above and
+ * {@link renderApproximateCoreSections} are its only callers, so the two
+ * artifacts can never describe the core differently, and no caller can render
+ * an approximate core without its label.
+ */
+function coreSectionLines(input: CoreSectionsInput): CoreSections {
   const loop = input.trader.loop;
   const health = loop.health();
   const retention = health.seams.retention;
@@ -105,7 +222,7 @@ export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestAr
     };
   }
 
-  const lines: string[] = [BACKTEST_ARTIFACT_FORMAT_ID, "--- simulation-run ---", input.outcome.result.serialization];
+  const lines: string[] = [];
   lines.push("--- decisions ---");
   for (const decision of loop.decisions()) lines.push(decisionLine(decision));
   lines.push("--- traces ---");
@@ -179,5 +296,5 @@ export function renderBacktestArtifact(input: BacktestArtifactInput): BacktestAr
     `driver eventsIngested=${String(input.driver.eventsIngested)} drains=${String(input.driver.drains)}`,
   );
   lines.push("end");
-  return { ok: true, text: `${lines.join("\n")}\n` };
+  return { ok: true, lines };
 }
