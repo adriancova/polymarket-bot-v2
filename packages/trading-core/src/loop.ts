@@ -778,12 +778,11 @@ export class CoreLoop {
   #durabilityLost = false;
   /**
    * `PROVENANCE-1`: refused intents not yet handed to the store — appended at
-   * the risk seam's refusal (`#routeIntent`) and written by the flush that
-   * ends the event (`#flushOutbox`: staged with the event's rows, or written
-   * after them). Emptied by every flush, and DROPPED with the outbox wherever
-   * a store failure drops it: nothing is written after the failure a
-   * `STORE_UNAVAILABLE` halt reports. Bounded by the event's own evaluations
-   * (one record per refused intent of a persisted decision), which the
+   * the risk seam's refusal (`#routeIntent`) and taken by the flush that ends
+   * the event (`#flushOutbox`: staged with the event's rows, or written after
+   * them) through `#takeRiskRefusals`, which hands over nothing once
+   * durability is lost. Emptied by every flush; bounded by the event's own
+   * evaluations (one record per refused intent of a decision), which the
    * bounded outbox already bounds.
    */
   #pendingRiskRefusals: RiskRefusalRecord[] = [];
@@ -2089,28 +2088,27 @@ export class CoreLoop {
       );
       // `PROVENANCE-1`: the refusal is made durable with the event's other
       // rows (`#flushOutbox`), as `ops.risk_events` evidence (ADR-028
-      // Decision 3.1). NOT when the decision itself could not be made durable
-      // (`DURABLE-1`): that refusal is the STORE_UNAVAILABLE halt's own
-      // consequence, and nothing is written after the failure the halt reports.
-      if (!undurable) {
-        this.#pendingRiskRefusals.push(
-          Object.freeze({
-            runId: input.instance.runId,
-            instanceId: input.instance.instanceId,
-            marketId: input.instance.marketId,
-            evaluationSeq: input.evaluationSeq,
-            intentId: intentIdOf(input.intent),
-            protectiveExit: isProtectiveExitIntent(input.intent),
-            occurredAt: input.instant,
-            refusals: Object.freeze(
-              evaluation.refusals.map((refusal) =>
-                Object.freeze({ code: refusal.code, message: refusal.message }),
-              ),
+      // Decision 3.1) — unless durability is lost by then: a refusal under a
+      // `STORE_UNAVAILABLE` halt (`DURABLE-1`'s undurable decision among
+      // them) is the halt's own consequence, and nothing is written after the
+      // failure the halt reports (`#takeRiskRefusals`).
+      this.#pendingRiskRefusals.push(
+        Object.freeze({
+          runId: input.instance.runId,
+          instanceId: input.instance.instanceId,
+          marketId: input.instance.marketId,
+          evaluationSeq: input.evaluationSeq,
+          intentId: intentIdOf(input.intent),
+          protectiveExit: isProtectiveExitIntent(input.intent),
+          occurredAt: input.instant,
+          refusals: Object.freeze(
+            evaluation.refusals.map((refusal) =>
+              Object.freeze({ code: refusal.code, message: refusal.message }),
             ),
-            sourceEvent: input.source,
-          }),
-        );
-      }
+          ),
+          sourceEvent: input.source,
+        }),
+      );
       return;
     }
     // `DURABLE-1`: the belt. The halt the boundary latched makes the seam
@@ -3641,7 +3639,6 @@ export class CoreLoop {
       const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
       if (!written.ok) {
         this.#durabilityLost = true;
-        this.#pendingRiskRefusals = [];
         this.#options.halts.halt(
           { kind: "GLOBAL" },
           "STORE_UNAVAILABLE",
@@ -3657,7 +3654,6 @@ export class CoreLoop {
       const written = await this.#options.store.saveCheckpoint(checkpoint, this.#lastInstant);
       if (!written.ok) {
         this.#durabilityLost = true;
-        this.#pendingRiskRefusals = [];
         this.#options.halts.halt(
           { kind: "GLOBAL" },
           "STORE_UNAVAILABLE",
@@ -3670,10 +3666,7 @@ export class CoreLoop {
     }
     // `PROVENANCE-1`: the event's refused intents, after its decisions and
     // checkpoints. Never after a store failure this process has halted on.
-    const refusals = this.#pendingRiskRefusals;
-    this.#pendingRiskRefusals = [];
-    if (this.#durabilityLost || this.#groupCommitFailed) return;
-    for (const refusal of refusals) {
+    for (const refusal of this.#takeRiskRefusals()) {
       const written = await this.#options.store.persistRiskRefusal(refusal);
       if (!written.ok) {
         this.#durabilityLost = true;
@@ -3689,6 +3682,24 @@ export class CoreLoop {
         return;
       }
     }
+  }
+
+  /**
+   * `PROVENANCE-1` — the pending refused intents, handed over ONCE (the list
+   * is emptied), or NONE once a decision or checkpoint could not be made
+   * durable (`#durabilityLost`: a refused per-row write, or a refused
+   * staging): a refusal made under that `STORE_UNAVAILABLE` halt —
+   * `DURABLE-1`'s undurable decision's, refused at the risk seam under the
+   * halt — is dropped, never written after the failure the halt reports. The
+   * ONE gate both write paths take: the per-row flush (`#flushOutbox`) and
+   * the group staging (`#stageOutbox`). After a failed group COMMIT
+   * (`#groupCommitFailed`) a staging is never committed (`#requestCommit`),
+   * so it needs no gate here.
+   */
+  #takeRiskRefusals(): readonly RiskRefusalRecord[] {
+    const refusals = this.#pendingRiskRefusals;
+    this.#pendingRiskRefusals = [];
+    return this.#durabilityLost ? [] : refusals;
   }
 
   /**
@@ -3755,7 +3766,6 @@ export class CoreLoop {
         if (!staged.ok) {
           this.#durabilityLost = true;
           this.#options.outbox.drain();
-          this.#pendingRiskRefusals = [];
           this.#options.halts.halt(
             { kind: "GLOBAL" },
             "STORE_UNAVAILABLE",
@@ -3776,7 +3786,6 @@ export class CoreLoop {
       if (!written.ok) {
         this.#durabilityLost = true;
         this.#options.outbox.drain();
-        this.#pendingRiskRefusals = [];
         this.#options.halts.halt(
           { kind: "GLOBAL" },
           "STORE_UNAVAILABLE",
@@ -3803,8 +3812,7 @@ export class CoreLoop {
     // `PROVENANCE-1`: the event's refused intents go in the SAME staging as
     // its remaining rows, so they commit in that batch's transaction, before
     // any later event's decision (the commit chain is in stage order).
-    const riskRefusals = this.#pendingRiskRefusals;
-    this.#pendingRiskRefusals = [];
+    const riskRefusals = this.#takeRiskRefusals();
     if (drained.decisions.length === 0 && drained.checkpoints.length === 0 && riskRefusals.length === 0) return;
     const staged = group.stage({
       decisions: drained.decisions,

@@ -177,7 +177,7 @@ function checkpoint(seq: number) {
 }
 
 describe("the group commit carries refusals in its one atomic statement (PROVENANCE-1)", () => {
-  async function committed(input: { decisions: number[]; checkpoints: number[]; refusals: RiskRefusalRecord[] }) {
+  async function captured(input: { decisions: number[]; checkpoints: number[]; refusals: RiskRefusalRecord[] }) {
     const capture = capturingPool();
     const store = new PostgresTraderStore({ db: createDatabase(capture.pool), decisionContractVersion: 1 });
     const staged = store.groupCommit.stage({
@@ -188,7 +188,11 @@ describe("the group commit carries refusals in its one atomic statement (PROVENA
     expect(staged.ok).toBe(true);
     const outcome = await store.groupCommit.commit();
     expect(outcome.ok).toBe(true);
-    return capture.statements.map((statement) => statement.sql);
+    return capture.statements;
+  }
+
+  async function committed(input: { decisions: number[]; checkpoints: number[]; refusals: RiskRefusalRecord[] }) {
+    return (await captured(input)).map((statement) => statement.sql);
   }
 
   it("a batch WITHOUT refusals emits the THROUGHPUT-1a statement, unchanged: decisions in a CTE feeding the checkpoints", async () => {
@@ -196,6 +200,25 @@ describe("the group commit carries refusals in its one atomic statement (PROVENA
     expect(sql).toHaveLength(1);
     expect(sql[0]).toMatch(/^with "staged_decisions" as \(insert into "strategy"\."decisions" .* returning "decision_id"\) insert into "strategy"\."state_checkpoints" /u);
     expect(sql[0]).not.toContain("risk_events");
+  });
+
+  it("a decision row binds its dispatch position (gateway_epoch, ingest_seq) from sourceEvent, and feature_snapshot_id NULL (H1R1-PROVENANCE)", async () => {
+    const [statement] = await captured({ decisions: [1], checkpoints: [], refusals: [] });
+    const sql = statement?.sql ?? "";
+    const columns = /^insert into "strategy"\."decisions" \(([^)]*)\) values \(([^)]*)\)/u.exec(sql);
+    if (columns === null) throw new Error(`not a decision insert: ${sql}`);
+    const names = (columns[1] ?? "").split(", ").map((quoted) => quoted.replaceAll('"', ""));
+    const placeholders = (columns[2] ?? "").split(", ");
+    const bound = (column: string): unknown => {
+      const at = names.indexOf(column);
+      expect(at, `column ${column} is bound`).toBeGreaterThanOrEqual(0);
+      const placeholder = placeholders[at] ?? "";
+      return statement?.parameters[Number(placeholder.slice(1)) - 1];
+    };
+    expect(bound("gateway_epoch")).toBe(EPOCH);
+    expect(bound("ingest_seq")).toBe("4001");
+    expect(bound("source_event_id")).toBe("018f3a5c-0000-7000-8000-0000000000a5");
+    expect(bound("feature_snapshot_id")).toBeNull();
   });
 
   it("decisions, checkpoints and refusals: ONE statement, the refusals a data-modifying CTE member", async () => {
