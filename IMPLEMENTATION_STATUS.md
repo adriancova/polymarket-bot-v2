@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** the user ratified ADR-023 and ruled ADR-031 (option (a)) on 2026-10-02. `THROUGHPUT-1c` merges now. After it, the trading-core rounds go one at a time, because each edits `packages/trading-core` and `apps/trader`: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` (`apps/backtest-cli` only) and `ADR031-ACCEPT` (docs) run beside them. `WP-300c` waits on the user's request-token ruling, and `HOST-BENCH` on the laptop agent.
+- **Next:** the user ratified ADR-023 and ruled ADR-031 (option (a)) on 2026-10-02. `THROUGHPUT-1c` merges now. After it, the trading-core rounds go one at a time, because each edits `packages/trading-core` and `apps/trader`: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` (`apps/backtest-cli` only) and `ADR031-ACCEPT` (docs) run beside them. `WP-300c` merges now, on the user's request-token ruling of 2026-10-02. `HOST-BENCH` waits on the laptop agent.
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -52,9 +52,15 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
   - set ADR-031's status to Accepted, and record the user's ruling (option (a), Q1, Q2 and Q3) in it;
   - fix the reviewers' round-2 LOWs (`CO2N1-R2-L1`, `F2-L1`..`F2-L5`);
   - correct the stale statements that hold the ADR-023 dependency open.
-  Paths: `docs/adr/ADR-031-*.md`, and its `docs/adr/README.md` row. Verifiers: Opus and gpt-6-astra, reconciled.
+  - write ADR-032, Accepted, recording the user's request-token ruling for `WP-300c`.
+  Paths: `docs/adr/ADR-031-*.md`, `docs/adr/ADR-032-*.md` (new), and their `docs/adr/README.md` rows. Verifiers: Opus and gpt-6-astra, reconciled.
 - `CONTROL-1b` is Complete (2026-10-01); see [Work packages](#work-packages). Its no-signer requirement was revised after round 4 (brief `8579244`).
-- **`WP-300c`**: every code finding is fixed at `1322b89` (draft PR #45). Both verifiers would ACCEPT it unchanged, but it is blocked on governance item G1. Its fix for a held-back read of a predicted request id relies on an unguessable request token. That token is a required injected `requestToken` source bound to a CSPRNG, which is a design decision that needs the user's ruling (Human items).
+- **`WP-300c`**: every code finding is fixed at `1322b89` (PR #45). **The user ruled for the request-token design on 2026-10-02**, which discharges G1, the only blocker; both verifiers would ACCEPT `1322b89` unchanged. The design is the draft in `~/pmb-rounds/wp-300c/handoff-r3.md` follow_up 1:
+  - reconciliation request ids carry an unguessable token from a required injected `requestToken: () => string`, which the composition binds to a CSPRNG;
+  - ids are not reproducible across runs, so a journal or replay records the drawn tokens;
+  - WP-290 echoes `requestId` and never answers with a read made before receiving the request;
+  - a failed draw queues the request, and retry draws again.
+  ADR-032 records it (in `ADR031-ACCEPT`). Merging.
 - `STORAGE-GOV2` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`; its merge-ref CI is green (run `36874368278`). **The user ratified ADR-023 as-is on 2026-10-02**, confirming the three rulings below; the merge proceeds. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
@@ -185,9 +191,9 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
 | `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | Complete (2026-10-01): ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
-| `ADR031-ACCEPT` | ADR-031: Accepted status, the user's ruling, the round-2 LOWs | **Ready (authorized)** 2026-10-02 | — | — |
+| `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | **Ready (authorized)** 2026-10-02 | — | — |
 | `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | Complete (2026-10-01) | `80a06e2` | [CONTROL-1b](docs/handoffs/CONTROL-1b.md) |
-| `WP-300c` | `WP300B-LOWS`: hostile evidence, refusal-code docs, module-load tripwires, predictable ids | **Awaiting the user's request-token ruling** (code accepted by both verifiers at `1322b89`; draft PR #45) | — | — |
+| `WP-300c` | `WP300B-LOWS`: hostile evidence, refusal-code docs, module-load tripwires, predictable ids | **Merging**: the request-token design ruled by the user 2026-10-02 (code accepted at `1322b89`; PR #45) | — | — |
 | `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | Complete (2026-10-01) | `a428ba3` | [STORAGE-GOV2](docs/handoffs/STORAGE-GOV2.md) |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
@@ -218,7 +224,7 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | Id | Residual | Owner |
 | --- | --- | --- |
 | `DURABLE1-LOWS` | LOW-3: in group mode a decision and its checkpoint can commit in separate transactions (no production `restoreFrom` caller yet). LOW-6: the commit cost on placement-heavy bursts is unmeasured. R2-LOW-7: a CANCEL from a later decision can wait on an earlier decision's placement write. | the first production `restoreFrom` round; a throughput round |
-| `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 twice: PR #29 attempt 1 and PR #39 attempt 1 (run `36881820439`). TP1B-R1-L5 flagged it. | a data-gateway test round |
+| `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 twice and 304 once: PR #29 attempt 1, PR #39 attempt 1 (run `36881820439`), and PR #45 (run `36951828847`, 304). TP1B-R1-L5 flagged it. | a data-gateway test round after `THROUGHPUT-1c` merges; it is now frequent enough to fix |
 | `FLAKE-CANONICAL-ORDER` | `packages/features/src/canonical-order.test.ts`'s `compareCanonicalUnitInterval` sweep can exceed vitest's 5000 ms timeout under host load. Verifiers saw it 4 times on 2026-10-01 at load 11-24, and one saw `boundary-surface.test.ts` too. Every rerun passed; not seen in CI yet. | a features test round, after `THROUGHPUT-1c` (it owns `packages/features/**`) |
 | `WP300B-LOWS` | `WP-300b`'s four open LOWs (WP300B-R1-01..04: a double read of evidence `state` under a Proxy; a getter `requestId` read as none; refusal-code doc precision; tripwires do not cover module load) and predictable request ids. | an optional inventory round, or the first `WP-290` grant |
 | `WP300-PERSIST` | WP-300's identity sets, kept observations, quarantines and request map are in memory only; no journal rebuild exists. Needed before restart-safe composition. | `WP-290` or the composition round |
@@ -385,12 +391,6 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
-- **The `WP-300c` request-token ruling.** Should wallet-operation reconciliation request ids carry an unguessable token? The token would come from a required injected `requestToken: () => string`, which the composition binds to a CSPRNG such as `crypto.randomUUID`.
-  - **Yes:** it closes the held-back pre-named read (`WP300C-J1`). The costs:
-    - ids are not reproducible across runs, so a journal or replay must record the drawn tokens;
-    - a failing source stalls reconciliation, safely.
-  - **No:** that case rests on WP-290's contract alone, that it never answers with a read made before receiving the request.
-  - **The orchestrator recommends yes,** because it defends the release of collateral. On a yes, ADR-032 records it and `1322b89` merges. The draft is in `~/pmb-rounds/wp-300c/handoff-r3.md`, follow_up 1.
 - **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
 
 ### Wave 3 authorization (conditional)
