@@ -11,7 +11,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/contract/polymarket-secure/tsconfig.json",
-    "test:contract": "vitest run --config ../../test/contract/polymarket-secure/vitest.config.ts"
+    "test:contract": "vitest run --config ../../test/contract/polymarket-secure/vitest.config.ts && tsc --noEmit -p ../../test/contract/user-stream/tsconfig.json && vitest run --config ../../test/contract/user-stream/vitest.config.ts"
   },
   "dependencies": {
     "@polymarket-bot/domain": "workspace:*",

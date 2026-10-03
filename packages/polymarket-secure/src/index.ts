@@ -63,3 +63,4 @@ export {
   type SignerRefusalReason,
 } from "./errors.js";
 export { isSensitiveKey, REDACTED, redactForLog } from "./redaction.js";
+export * from "./user-stream/index.js";
