@@ -520,6 +520,11 @@
       "sourceIngestSeq": "11"
     }
   ],
+  "evaluationCadence": {
+    "heartbeatMs": 0,
+    "intervalMs": 0,
+    "reproduces": "test/replay-golden/paper-e2e/two-brackets-run.json"
+  },
   "events": [
     {
       "datasetRowOrdinal": 1,
@@ -684,7 +689,7 @@
       "tokenId": "9001"
     }
   ],
-  "goldenFormatVersion": 4,
+  "goldenFormatVersion": 5,
   "health": {
     "accounting": {
       "ledgerRefusals": 0,
@@ -716,10 +721,12 @@
     "halts": [],
     "healthy": true,
     "loop": {
+      "cadenceForwardJumpAlarms": 0,
       "containedEvaluations": 0,
       "decisionsPersisted": 19,
       "deliveriesSuppressedByHalt": 0,
       "evaluations": 19,
+      "evaluationsCoalesced": 0,
       "eventsAccepted": 11,
       "eventsProcessed": 11,
       "eventsRefused": 0,

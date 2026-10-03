@@ -89,6 +89,7 @@ import {
   type AccountingChecks,
 } from "@polymarket-bot/trading-core";
 import { HaltController } from "@polymarket-bot/trading-core";
+import { PER_FRAME_EVALUATION_CADENCE } from "@polymarket-bot/trading-core";
 import { HealthState, RealizedPnlBook } from "@polymarket-bot/trading-core";
 import { healthResponseBody } from "./health-server.js";
 import { InstanceRegistry } from "@polymarket-bot/trading-core";
@@ -488,6 +489,16 @@ function assemble(
     tokenAssetIds,
     outbox,
     ...(accountingChecks === undefined ? {} : { accountingChecks }),
+    // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is FOLD-1 held-
+    // ledger and PnL folds, not the cadence — but its timelines were written for
+    // ADR-024's per-frame cadence: fills booked at named events, several at one
+    // instant. Under the production cadence (1,000 ms / 5,000 ms) those evaluations
+    // are coalesced, and 15 of this file's 23 tests fail under it (measured in r1; the
+    // failures were not analysed one by one). So it REPRODUCES the ADR-024 behaviour
+    // its timelines pin (the value 0, declared); this subject is NOT exercised here
+    // under the production cadence. The cadence is pinned by `cadence.test.ts` and
+    // `loop-cadence.test.ts`.
+    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:apps/trader/src/loop-folds.test.ts" },
   });
   wiring.loop = loop;
   return { loop, store, book, ordinal: 0 };

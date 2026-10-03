@@ -133,6 +133,9 @@ export function traderHealthSamples(
   add("trader_contained_evaluations_total", loop.containedEvaluations);
   add("trader_refused_evaluations_total", loop.refusedEvaluations);
   add("trader_deliveries_suppressed_by_halt_total", loop.deliveriesSuppressedByHalt);
+  // `CADENCE-1` (ADR-026 D5.6, D2.10).
+  add("trader_evaluations_coalesced_total", loop.evaluationsCoalesced);
+  add("trader_cadence_forward_jump_alarms_total", loop.cadenceForwardJumpAlarms);
 
   const risk = report.risk;
   add("trader_risk_evaluations_total", risk.evaluations);

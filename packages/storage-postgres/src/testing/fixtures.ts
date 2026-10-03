@@ -200,6 +200,9 @@ export async function createTradingChain(
     codeCommit: "0000000000000000000000000000000000000000",
     stateSchemaVersion: 1,
     runSeed: "42",
+    // `CADENCE-1` (ADR-026 D1.5): the live-data cadence, the one every new run records.
+    evaluationIntervalMs: 1000,
+    evaluationHeartbeatMs: 5000,
   });
 
   const decisionId = uuidV7();

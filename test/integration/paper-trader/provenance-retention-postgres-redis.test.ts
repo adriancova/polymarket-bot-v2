@@ -484,6 +484,9 @@ async function retentionScenario(scenario: Scenario): Promise<void> {
             codeCommit: "provenance-1-restart",
             stateSchemaVersion: 1,
             runSeed: "424242",
+            // `CADENCE-1` (ADR-026 D1.4-D1.5): the cadence every live run records.
+            evaluationIntervalMs: 1000,
+            evaluationHeartbeatMs: 5000,
           });
           await runTraderThrough({
             redisUrl: redis.getConnectionUrl(),

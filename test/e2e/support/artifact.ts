@@ -70,8 +70,15 @@ import type { Run } from "./harness.js";
  * evaluation the loop originates). The golden therefore PINS that the
  * position is deterministic under replay and is the position of the event
  * `sourceEventId` names.
+ *
+ * `5` (`CADENCE-1`): the `evaluationCadence` section — the cadence the core
+ * RAN with (`CoreLoop.evaluationCadence()`), which for a golden is the
+ * per-frame value 0 declared as a reproduction of that golden (ADR-026
+ * D1.6) — and `health.loop`'s two new counters, `evaluationsCoalesced` and
+ * `cadenceForwardJumpAlarms` (both 0 under the per-frame cadence, which
+ * coalesces nothing and whose fixtures never step back by 5 s).
  */
-export const GOLDEN_FORMAT_VERSION = 4;
+export const GOLDEN_FORMAT_VERSION = 5;
 
 export interface ArtifactEvent {
   readonly eventId: string;
@@ -323,6 +330,13 @@ export type MetricGroup = Readonly<
 
 export interface PaperRunArtifact {
   readonly goldenFormatVersion: number;
+  /** `CADENCE-1` (format 5): the evaluation cadence the core ran with (ADR-026 D1). */
+  readonly evaluationCadence: {
+    readonly intervalMs: number;
+    readonly heartbeatMs: number;
+    /** What the run reproduces, or `null` for a run that reproduces nothing. */
+    readonly reproduces: string | null;
+  };
   readonly scenario: {
     readonly idNamespace: string;
     readonly marketId: string;
@@ -612,8 +626,14 @@ export function captureArtifact(run: Run): PaperRunArtifact {
     },
   };
 
+  const cadence = run.trader.loop.evaluationCadence();
   const partial: Omit<PaperRunArtifact, "reconciliation"> = {
     goldenFormatVersion: GOLDEN_FORMAT_VERSION,
+    evaluationCadence: {
+      intervalMs: cadence.intervalMs,
+      heartbeatMs: cadence.heartbeatMs,
+      reproduces: cadence.reproduces ?? null,
+    },
     scenario: {
       idNamespace: scenario.idNamespace,
       marketId: constants.marketId,

@@ -179,6 +179,19 @@ export {
   type RiskRefusalRecord,
 } from "@polymarket-bot/trading-core";
 
+// `CADENCE-1` (ADR-026): the evaluation cadence the core runs, for the
+// harnesses that import the core through this package.
+export {
+  EVALUATION_HEARTBEAT_MS,
+  EVALUATION_INTERVAL_MS,
+  PAPER_EVALUATION_CADENCE,
+  PER_FRAME_EVALUATION_CADENCE,
+  evaluationCadenceProblem,
+  type CadenceAlarm,
+  type EvaluationCadenceOption,
+  type EvaluationCadenceSettings,
+} from "@polymarket-bot/trading-core";
+
 export {
   FILLS_ARE_DELIVERED_WHILE_PAUSED,
   FillDeduplicator,

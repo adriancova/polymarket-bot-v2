@@ -71,6 +71,7 @@ import { RedisMarketEventFeed } from "../../../apps/trader/src/adapters/redis-fe
 import { pump } from "../../../apps/trader/src/pump.js";
 import { buildHarness } from "../data-gateway/support/harness.js";
 import {
+  adr024Reproduction,
   CONDITION_ID,
   MARKET_ID,
   NO_TOKEN,
@@ -440,7 +441,13 @@ async function startProcess(
   retention: number,
   restarted: boolean,
 ): Promise<TraderProcess> {
-  const run = assembleOrThrow({ config: config(consumer) });
+  // `CADENCE-1` (ADR-026 D1.6): this file pins book freshness at EACH
+  // evaluation of a timeline written for ADR-024's per-frame cadence (an entry
+  // needs the book evaluations 100 ms apart), so it REPRODUCES that cadence.
+  const run = assembleOrThrow({
+    config: config(consumer),
+    evaluationCadence: adr024Reproduction("test/integration/paper-trader/throughput-1c-consumer-frame-proof-redis.test.ts"),
+  });
   resetEventIds();
   // The reference feed (hand-written, see the header), just before the open.
   const preamble = [

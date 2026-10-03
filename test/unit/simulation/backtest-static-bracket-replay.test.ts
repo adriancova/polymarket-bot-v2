@@ -58,6 +58,7 @@ import { describe, expect, it } from "vitest";
 import { renderBacktestOutcome } from "../../../apps/backtest-cli/src/index.js";
 import { writeParquetObject } from "../../../packages/storage-parquet/src/index.js";
 import {
+  REPRODUCES,
   ARTIFACT_FORMAT_ID,
   EXPECTED_ARTIFACT_FILE,
   FIXTURE_DIRECTORY,
@@ -236,6 +237,44 @@ describe("through the shipped root, the shared core runs Static Bracket (checkli
  * cutoff reduction is always after the entry cutoff); that is not what this
  * fixture is for, and §7 checklist item 1 is not closed by it.
  */
+describe("CADENCE-1 (ADR-026): the evaluation cadence the replay runs is recorded, and pinned", () => {
+  it("the golden is a DECLARED reproduction of the per-frame cadence its pins state", () => {
+    const fixture = loadFixture();
+    expect([fixture.runPins.evaluationIntervalMs, fixture.runPins.evaluationHeartbeatMs]).toEqual([0, 0]);
+    const lines = expectedArtifact().split("\n");
+    expect(lines[0]).toBe("polymarket-bot/backtest-static-bracket-replay/v2");
+    expect(lines[lines.indexOf("--- cadence ---") + 1]).toBe(
+      `cadence evaluationIntervalMs=0 evaluationHeartbeatMs=0 reproduction=true reproduces=${REPRODUCES}`,
+    );
+  });
+
+  it("the same data replayed as a NEW run — the PAPER cadence, nothing declared — decides exactly what the golden holds", async () => {
+    // The fixture's eight recorded frames are each at least a second apart for
+    // the one market, so the cadence coalesces nothing: the decisions, orders,
+    // fills, ledger and PnL are the golden's.
+    const run = await replayThroughShippedRoot({ withCore: true, paperCadence: true });
+    const health = run.core?.trader.loop.health();
+    expect(health?.loop.evaluationsCoalesced).toBe(0);
+    expect(health?.loop.cadenceForwardJumpAlarms).toBe(0);
+    const paper = renderArtifact(run).split("\n");
+    const golden = expectedArtifact().split("\n");
+    const cadenceAt = golden.indexOf("--- cadence ---") + 1;
+    expect(paper[cadenceAt]).toBe("cadence evaluationIntervalMs=1000 evaluationHeartbeatMs=5000 reproduction=false");
+    // `CADENCE-1` r1 (J2): one more snapshot ATTEMPT, and nothing else. The two
+    // reference trades (frames 1-2) owe the market an evaluation before any
+    // book has arrived, so no runtime is asked: that is no evaluation, and the
+    // market stays owed (ADR-026 D2.3, D2.6). The `MarketOpened` close (frame
+    // 3) owes it no `onFeatures`, so its carried pass tries it again — still no
+    // book: `snapshotsUnavailable` 4, where the per-frame cadence, which
+    // carries nothing, counts 3. No decision moves.
+    const healthAt = golden.indexOf("--- health ---") + 1;
+    expect(golden[healthAt]).toContain(" snapshotsUnavailable=3 ");
+    expect(paper[healthAt]).toBe(golden[healthAt]?.replace(" snapshotsUnavailable=3 ", " snapshotsUnavailable=4 "));
+    const rest = (lines: readonly string[]) => lines.filter((_, index) => index !== cadenceAt && index !== healthAt);
+    expect(rest(paper)).toEqual(rest(golden));
+  });
+});
+
 describe("residual 5 — RESOLVED: the instance's own exit fill closes the bracket through the replay root", () => {
   it("the reduction fills, the strategy names the fill, and the bracket closes", async () => {
     const run = await replayThroughShippedRoot({ withCore: true });

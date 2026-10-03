@@ -88,6 +88,9 @@ describe("no counter is defaulted", () => {
   it.each([
     ["loop", "eventsAccepted"],
     ["loop", "deliveriesSuppressedByHalt"],
+    // `CADENCE-1` (ADR-026 D5.6, D2.10): required, never read as 0.
+    ["loop", "evaluationsCoalesced"],
+    ["loop", "cadenceForwardJumpAlarms"],
     ["risk", "refusedExits"],
     ["execution", "observeOnlyIntents"],
     ["accounting", "unexplainedMovements"],

@@ -91,6 +91,8 @@ export function fullTraderHealthReport(
       containedEvaluations: 109,
       refusedEvaluations: 110,
       deliveriesSuppressedByHalt: 111,
+      evaluationsCoalesced: 112,
+      cadenceForwardJumpAlarms: 113,
     },
     risk: {
       evaluations: 201,

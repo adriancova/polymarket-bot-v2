@@ -44,6 +44,7 @@ import {
   bookConfirmedAt,
   sessionKeyOf,
 } from "./book-freshness.js";
+import { PER_FRAME_EVALUATION_CADENCE } from "./cadence.js";
 import { bookFreshnessBasisOf, bookFreshnessCeilingMsOf, parseTraderConfig } from "./config.js";
 import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import type { IngestedEvent } from "./ports.js";
@@ -522,6 +523,16 @@ function assemble(options: ConfigOptions): Run {
     store,
     idNamespace: "throughput-1c-book-freshness",
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is book freshness —
+    // the ADR-023 D5 freshness verdict, not the cadence — but its timelines were
+    // written for ADR-024's per-frame cadence: the verdict at each evaluation of
+    // events 100-200 ms apart. Under the production cadence (1,000 ms / 5,000 ms)
+    // those evaluations are coalesced, and 25 of this file's 54 tests fail under it
+    // (measured in r1; the failures were not analysed one by one). So it REPRODUCES
+    // the ADR-024 behaviour its timelines pin (the value 0, declared); this subject is
+    // NOT exercised here under the production cadence. The cadence is pinned by
+    // `cadence.test.ts` and `loop-cadence.test.ts`.
+    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/book-freshness.test.ts" },
   });
   if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.detail} ${result.refusal.issues.join("; ")}`);
   wiring.trader = result.trader;
