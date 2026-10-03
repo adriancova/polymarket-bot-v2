@@ -39,6 +39,14 @@
  * - After `close()`, the port calls no handler of that connection again (the
  *   manager ignores any that arrive anyway).
  * - Any method may throw; the manager treats a throw as a lost connection.
+ * - A method that RETURNS is no evidence that its frame arrived, or that the
+ *   connection was still alive when it was sent. Node v24.13.0's global
+ *   `WebSocket.prototype.send` (undici) throws only while CONNECTING. It
+ *   returns without an error when the socket is not established or is
+ *   closing, and it only queues the data on an established one. So the
+ *   manager keeps every market a connection subscribed to, or attempted to,
+ *   in that connection's reconciliation scope for the rest of the
+ *   connection's life, even after its unsubscribe frame was sent.
  */
 
 /**

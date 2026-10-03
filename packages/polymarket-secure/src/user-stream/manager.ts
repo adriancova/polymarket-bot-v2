@@ -30,6 +30,9 @@
  * any state ──stop or fault──▶ CLOSED (terminal)
  * ```
  *
+ * SUBSCRIBED also goes straight to DISCONNECTED when the socket closes, when
+ * a send fails, or when the connection's scope is full (below).
+ *
  * AUTHENTICATION FAILURES. An `AUTH_REJECTED` loss requests reconciliation
  * and reconnects like any other loss, but the manager stops re-sending the
  * credentialed subscription once the credentials have been refused
@@ -47,7 +50,8 @@
  *
  * - on every loss of the stream (each {@link StreamLossCause}: the socket
  *   closed, a stale heartbeat, a server error, an authentication failure, a
- *   transport failure, a connect timeout, a failed send, an unclassified close);
+ *   transport failure, a connect timeout, a failed send, an unclassified close,
+ *   and the manager's own close of a connection whose scope is full, below);
  * - on every (re)subscription, after the subscription frame is sent:
  *   `SUBSCRIPTION_STARTED` for the first, `RESUBSCRIBED` (naming the loss
  *   before it) for every later one. Events from before a subscription are
@@ -61,11 +65,22 @@
  *
  * A request about the stream as a whole (a loss, a stop, a fault, an
  * unrecognized message, the overflow) covers EVERYTHING THE STREAM COVERS:
- * every market in the list, and every market the connection's own frames had
- * subscribed it to. A market removed from the list stays in scope until its
- * unsubscribe frame has been sent, so a loss whose unsubscribe never went out
- * (or failed) still covers it. The scope of a loss is read before the lost
- * connection is retired.
+ * every market in the list, and every market the live connection's frames
+ * subscribed it to OR ATTEMPTED to. An attempt is recorded before the port is
+ * called, so a send that throws, or one inside which the market is removed
+ * again, still leaves the market covered. A market stays in that connection's
+ * scope FOR THE REST OF THE CONNECTION'S LIFE, even after its unsubscribe
+ * frame has been sent. A send that returns is no evidence that the frame
+ * arrived, or that the connection was alive when it was sent. A loss is
+ * detected only after it began, and the market was subscribed, and relied on,
+ * until its removal. The scope of a loss is read before the lost connection
+ * is retired, and the next connection starts from the list alone.
+ *
+ * The scope of one connection is bounded. An addition that would take it past
+ * {@link MAX_OVERFLOW_MARKETS} markets is not sent. Instead, the manager
+ * closes that connection itself (`CONNECTION_SCOPE_FULL`, a loss like any
+ * other). Its request covers everything the connection covered, and the next
+ * subscription frame carries the list.
  *
  * Every request is emitted to the listener AND kept in a backlog until the
  * consumer acknowledges it, so a listener failure cannot lose one, and an
@@ -138,6 +153,8 @@ export const STREAM_LOSS_CAUSES = [
   "CONNECT_TIMEOUT",
   "CONNECT_FAILED",
   "SEND_FAILED",
+  /** The manager closed the connection itself: an addition would have taken its scope past {@link MAX_OVERFLOW_MARKETS}. */
+  "CONNECTION_SCOPE_FULL",
 ] as const;
 export type StreamLossCause = (typeof STREAM_LOSS_CAUSES)[number];
 
@@ -165,11 +182,12 @@ export interface UserStreamReconciliationRequest {
    */
   readonly afterLoss: StreamLossCause | null;
   /**
-   * The condition ids the read must cover. For a request about the stream as
-   * a whole (a loss, `STREAM_STOPPED`, `MANAGER_FAULT`,
-   * `UNRECOGNIZED_MESSAGE`, `BACKLOG_OVERFLOW`): every market in the list and
-   * every market the connection's frames had subscribed it to, a removal not
-   * yet unsubscribed on the wire included.
+   * The condition ids the read must cover. A request about the stream as a
+   * whole (a loss, `STREAM_STOPPED`, `MANAGER_FAULT`, `UNRECOGNIZED_MESSAGE`,
+   * `BACKLOG_OVERFLOW`) covers every market in the list, and every market the
+   * connection's frames subscribed it to or attempted to during its life. A
+   * market removed from the list is included, even after its unsubscribe
+   * frame was sent.
    */
   readonly markets: readonly string[];
   readonly subscriptionGeneration: number;
@@ -260,7 +278,12 @@ export interface UserStreamManager {
 /** Client guards (no venue fact bounds these). */
 export const MAX_SUBSCRIBED_MARKETS = 1_000;
 export const MAX_PENDING_RECONCILIATION_REQUESTS = 1_024;
-/** The most markets the one `BACKLOG_OVERFLOW` request may cover before the manager faults closed. */
+/**
+ * The most markets the one `BACKLOG_OVERFLOW` request may cover before the
+ * manager faults closed. It is also the most markets one connection's scope
+ * may hold: an addition that would take the scope past it closes the
+ * connection (`CONNECTION_SCOPE_FULL`), and the manager reconnects.
+ */
 export const MAX_OVERFLOW_MARKETS = 10 * MAX_SUBSCRIBED_MARKETS;
 /** CLIENT CHOICE: refused credentials, in a row with no recognized message between, before the manager closes. */
 export const MAX_CONSECUTIVE_AUTH_REJECTIONS = 3;
@@ -427,8 +450,17 @@ interface Connection {
   handle: unknown;
   retired: boolean;
   frameSequence: number;
-  /** The markets this connection's frames have subscribed it to; `null` until its subscription frame is sent. */
+  /**
+   * The markets this connection is subscribed to on the wire, as far as its sent frames say; `null` until its
+   * subscription frame is sent. It drives the wire difference (`#syncSubscription`), not the reconciliation scope.
+   */
   subscribed: Set<string> | null;
+  /**
+   * The connection's reconciliation scope: every market its frames subscribed it to or ATTEMPTED to, each
+   * recorded BEFORE the port is called. It never shrinks while the connection lives: an unsubscribe frame that
+   * was sent leaves the market here.
+   */
+  readonly covered: Set<string>;
 }
 
 type TimerSlot = "connect" | "ping" | "stale" | "backoff";
@@ -669,15 +701,17 @@ class SubscriptionManager implements UserStreamManager {
   }
 
   /**
-   * Everything the stream covers: every market in the list (an addition not
-   * yet sent, or whose send failed, included), then every market the frames of
-   * `connection` subscribed it to that the list no longer holds (a removal
-   * whose unsubscribe was not yet sent, or failed). The list's order comes
-   * first, so with nothing pending this is exactly the list.
+   * Everything the stream covers. First comes every market in the list,
+   * including an addition not yet sent or whose send failed. Then comes every
+   * market `connection` covered (`Connection.covered`: subscribed or
+   * attempted at any point in its life) that the list no longer holds. That
+   * includes a removal whose unsubscribe frame was already sent. The list's
+   * order comes first, so a connection that never lost a market gives exactly
+   * the list.
    */
   #streamScope(connection: Connection | null): readonly string[] {
     const scope = new Set<string>(this.#markets);
-    if (connection !== null && connection.subscribed !== null) for (const market of connection.subscribed) scope.add(market);
+    if (connection !== null) for (const market of connection.covered) scope.add(market);
     return [...scope];
   }
 
@@ -736,7 +770,7 @@ class SubscriptionManager implements UserStreamManager {
 
   #connect(): void {
     this.#generation += 1;
-    const connection: Connection = { generation: this.#generation, handle: undefined, retired: false, frameSequence: 0, subscribed: null };
+    const connection: Connection = { generation: this.#generation, handle: undefined, retired: false, frameSequence: 0, subscribed: null, covered: new Set() };
     this.#current = connection;
     this.#transition("CONNECTING", null);
     this.#schedule("connect", this.#settings.connectTimeoutMs, () => this.#lose(connection, "CONNECT_TIMEOUT"));
@@ -806,6 +840,9 @@ class SubscriptionManager implements UserStreamManager {
     if (this.#state !== "CONNECTING") return; // a repeated `opened` changes nothing
     this.#cancel("connect");
     const markets = Object.freeze([...this.#markets]);
+    // In scope BEFORE the port call: whatever the call does (throw, or remove one of them inside it), the
+    // connection's loss covers every market it attempted.
+    for (const market of markets) connection.covered.add(market);
     // "Send the subscription frame immediately after connecting" (S-D16). The port adds the credentials.
     if (!this.#send(connection, (handle) => (handle as UserSocketConnection).subscribe(markets))) return;
     connection.subscribed = new Set(markets);
@@ -819,9 +856,15 @@ class SubscriptionManager implements UserStreamManager {
   }
 
   /**
-   * Bring the live connection's subscription to the market list: only the
-   * difference is sent, additions first (so the connection is never left
-   * subscribed to nothing), and the added markets request reconciliation.
+   * Bring the live connection's subscription to the market list. Only the
+   * difference is sent, additions first, so the connection is never left
+   * subscribed to nothing. The added markets request reconciliation.
+   *
+   * An addition enters the connection's scope before the port call. A removal
+   * leaves the wire subscription only: it stays in the connection's scope
+   * (`Connection.covered`). An addition that would take that scope past
+   * {@link MAX_OVERFLOW_MARKETS} is not sent: the connection is closed
+   * (`CONNECTION_SCOPE_FULL`) and the next one subscribes to the list.
    */
   #syncSubscription(): void {
     const connection = this.#current;
@@ -831,12 +874,20 @@ class SubscriptionManager implements UserStreamManager {
     const added = Object.freeze(this.#markets.filter((market) => !subscribed.has(market)));
     const removed = Object.freeze([...subscribed].filter((market) => !this.#markets.includes(market)));
     if (added.length > 0) {
+      const growth = added.filter((market) => !connection.covered.has(market)).length;
+      if (connection.covered.size + growth > MAX_OVERFLOW_MARKETS) {
+        this.#lose(connection, "CONNECTION_SCOPE_FULL");
+        return;
+      }
+      for (const market of added) connection.covered.add(market);
       if (!this.#send(connection, (handle) => (handle as UserSocketConnection).updateSubscription("subscribe", added))) return;
       for (const market of added) subscribed.add(market);
       this.#request("MARKETS_ADDED", { markets: added });
     }
     if (removed.length > 0) {
       if (!this.#send(connection, (handle) => (handle as UserSocketConnection).updateSubscription("unsubscribe", removed))) return;
+      // Off the wire subscription only. A returned send is no evidence that the frame arrived, or that the
+      // connection still lived when it was sent, so the market stays in the connection's scope.
       for (const market of removed) subscribed.delete(market);
     }
   }
@@ -860,7 +911,7 @@ class SubscriptionManager implements UserStreamManager {
    */
   #lose(connection: Connection, cause: StreamLossCause): void {
     if (connection.retired || connection !== this.#current) return;
-    // Read BEFORE the connection is retired: what its frames subscribed it to is lost with it.
+    // Read BEFORE the connection is retired: what it covered (subscribed or attempted, in its life) is lost with it.
     const scope = this.#streamScope(connection);
     connection.retired = true;
     this.#current = null;
@@ -949,7 +1000,8 @@ class SubscriptionManager implements UserStreamManager {
         case "UNRECOGNIZED":
           this.#counts.unrecognizedMessages += 1;
           this.#emit({ kind: "UNRECOGNIZED_MESSAGE", reason: message.reason, field: message.field, receipt });
-          this.#request("UNRECOGNIZED_MESSAGE", { unrecognized: message.reason });
+          // The scope of the frame's own connection: the message may concern any market it covered.
+          this.#request("UNRECOGNIZED_MESSAGE", { markets: this.#streamScope(connection), unrecognized: message.reason });
           break;
       }
     }
@@ -960,7 +1012,8 @@ class SubscriptionManager implements UserStreamManager {
   #request(
     cause: ReconciliationCause,
     detail: {
-      readonly markets?: readonly string[];
+      /** Always explicit: there is no default scope, so every request states what it covers. */
+      readonly markets: readonly string[];
       readonly afterLoss?: StreamLossCause;
       readonly shortfalls?: readonly ProjectionShortfall[];
       readonly unrecognized?: UnrecognizedMessageReason;
@@ -1007,7 +1060,7 @@ class SubscriptionManager implements UserStreamManager {
   #makeRequest(
     cause: ReconciliationCause,
     detail: {
-      readonly markets?: readonly string[];
+      readonly markets: readonly string[];
       readonly afterLoss?: StreamLossCause;
       readonly shortfalls?: readonly ProjectionShortfall[];
       readonly unrecognized?: UnrecognizedMessageReason;
@@ -1020,8 +1073,7 @@ class SubscriptionManager implements UserStreamManager {
       requestId: `user-stream-reconcile-${String(this.#requestCounter)}`,
       cause,
       afterLoss: detail.afterLoss ?? null,
-      // No explicit scope: the request is about the stream as a whole.
-      markets: Object.freeze([...(detail.markets ?? this.#streamScope(this.#current))]),
+      markets: Object.freeze([...detail.markets]),
       subscriptionGeneration: this.#generation,
       shortfalls: Object.freeze([...(detail.shortfalls ?? [])]),
       unrecognized: detail.unrecognized ?? null,

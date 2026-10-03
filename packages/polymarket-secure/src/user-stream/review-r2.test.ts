@@ -186,9 +186,10 @@ describe("CX280-R2-01: a request about the whole stream covers every market the 
     h.timers.advance(PING_INTERVAL_MS);
     expect(connection.sent.slice(1)).toEqual([{ kind: "ping" }, { kind: "update", operation: "unsubscribe", markets: [A] }]);
     expect(scopes(h.requests())).toEqual([["UNRECOGNIZED_MESSAGE", [B, A]]]);
-    // Once the unsubscribe is out, A is no longer the stream's: a later frame covers the list only.
+    // r3 (OP-R3-01, flipped from r2's [B]): a sent unsubscribe does not take A out of the connection's scope.
+    // A later frame may still be an A event the venue sent before it processed the unsubscribe.
     connection.deliver("not json");
-    expect(scopes(h.requests()).at(-1)).toEqual(["UNRECOGNIZED_MESSAGE", [B]]);
+    expect(scopes(h.requests()).at(-1)).toEqual(["UNRECOGNIZED_MESSAGE", [B, A]]);
   });
 
   it("STREAM_STOPPED: a stop queued before a removal covers the removed market (its unsubscribe never goes out)", () => {
@@ -240,7 +241,7 @@ describe("CX280-R2-01: a request about the whole stream covers every market the 
     ]);
   });
 
-  it("controls: with nothing pending the scope is exactly the list, in order; after a successful unsubscribe a loss covers the list only", () => {
+  it("controls: with nothing pending the scope is exactly the list, in order; after a successful unsubscribe a loss still covers the removed market (r3, OP-R3-01)", () => {
     const h = openUserStream({ markets: [A, B] });
     h.subscribe();
     acknowledgeAll(h);
@@ -253,7 +254,8 @@ describe("CX280-R2-01: a request about the whole stream covers every market the 
     expect(g.manager.removeMarkets([A]).ok).toBe(true);
     expect(g.port.latest.sent.at(-1)).toEqual({ kind: "update", operation: "unsubscribe", markets: [A] });
     g.port.latest.drop("TRANSPORT_ERROR");
-    expect(scopes(g.requests())).toEqual([["TRANSPORT_ERROR", [B]]]);
+    // r3 (OP-R3-01, flipped from r2's [B]): the loss may have begun before the unsubscribe was sent.
+    expect(scopes(g.requests())).toEqual([["TRANSPORT_ERROR", [B, A]]]);
   });
 });
 
