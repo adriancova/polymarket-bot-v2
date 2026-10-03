@@ -14,14 +14,20 @@
  *   run, finds the run in progress, and never closes it as interrupted (I-07).
  * - A journal whose unresolved breaks cannot be read never lets a run resume
  *   (fail closed, I-14).
+ * - Every OMS halting alert is its own quarantine: a release acknowledges that
+ *   one alert, never a later one like it, in this process or after a restart
+ *   (R2-C).
+ * - What still holds the account at the end of a run is recorded: an attempt
+ *   awaiting its read, an order still reconciling (R2-E).
  */
 
 import { describe, expect, it } from "vitest";
 
 import type { ReconciliationJournal, ReconciliationJournalEvent } from "../../../packages/ledger/src/index.js";
-import type { ReconciliationJournalPort } from "../../../packages/oms/src/index.js";
+import type { OmsAlert, OrderManager, ReconciliationJournalPort } from "../../../packages/oms/src/index.js";
 
-import { ready, reconcileRounds, type Ready } from "./support/scenario.js";
+import { MARKET, boot } from "./support/harness.js";
+import { expectPaused, ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 
 /** Run `inject` once, while the coordinator's PASSED completion is being appended (before it is durable). */
 function duringPassedWrite(r: Ready, inject: () => void): { readonly fired: () => boolean; readonly pausedAtNextStart: () => boolean | null } {
@@ -172,5 +178,139 @@ describe("WP-290 deliverable 3: resume only when every invariant still holds at 
     expect(completions.every((event) => event.kind === "RUN_COMPLETED" && event.status !== "PASSED")).toBe(true);
     failing = false;
     expect(await reconcileRounds(r, 3)).toBe(true);
+  });
+});
+
+describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2, R2-C)", () => {
+  /** One BUY order matched by two trades, both MINED; reconciled and resumed. */
+  async function twoTrades(): Promise<{ r: Ready; first: { status: string }; second: { status: string } }> {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    const first = r.u.world.match(salt, "0.4", { status: "MINED" });
+    const second = r.u.world.match(salt, "0.3", { status: "MINED" });
+    expect(first !== undefined && second !== undefined).toBe(true);
+    expect(await reconcileRounds(r, 6)).toBe(true);
+    return { r, first: first as { status: string }, second: second as { status: string } };
+  }
+
+  function alertBreaks(r: Ready): ReturnType<Ready["p"]["journal"]["unresolvedBreaks"]> {
+    return r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "OMS_HALTING_ALERT");
+  }
+
+  async function release(r: Ready, breakId: string | undefined): Promise<void> {
+    expect((await r.p.coordinator.releaseQuarantine({ breakId: breakId ?? "", operatorRef: "operator-1", reason: "the reversal is booked" })).ok).toBe(true);
+  }
+
+  it("(R2-C) a second halting alert of one kind on one order, after the first was released: its own quarantine, its market halted, never resumed past", async () => {
+    const { r, first, second } = await twoTrades();
+    first.status = "FAILED"; // the OMS raises SETTLEMENT_FAILED (a compensating reversal is owed)
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
+    const firstAlert = alertBreaks(r);
+    expect(firstAlert).toHaveLength(1);
+    await release(r, firstAlert[0]?.breakId);
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    const haltsBefore = r.u.halts.length;
+    second.status = "FAILED"; // the same kind of alert, on the same order: another reversal is owed
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
+    expect(r.oms.alerts().filter((alert) => alert.kind === "SETTLEMENT_FAILED" && alert.haltMarket)).toHaveLength(2);
+    const secondAlert = alertBreaks(r);
+    expect(secondAlert).toHaveLength(1);
+    expect(secondAlert[0]?.breakId).not.toBe(firstAlert[0]?.breakId);
+    expect(secondAlert[0]?.status).toBe("QUARANTINED");
+    expect(r.u.halts.slice(haltsBefore).some((halt) => halt.breakId === secondAlert[0]?.breakId && halt.marketId === MARKET)).toBe(true);
+    // Released in turn, the account resumes.
+    await release(r, secondAlert[0]?.breakId);
+    expect(await reconcileRounds(r, 4)).toBe(true);
+  });
+
+  it("(R2-C) two halting alerts raised before one run: two quarantines; releasing one leaves the other holding", async () => {
+    const { r, first, second } = await twoTrades();
+    first.status = "FAILED";
+    second.status = "FAILED";
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
+    const both = alertBreaks(r);
+    expect(both).toHaveLength(2);
+    expect(new Set(both.map((view) => view.subjectKey)).size).toBe(2);
+    expect(both.every((view) => view.status === "QUARANTINED")).toBe(true);
+    await release(r, both[0]?.breakId);
+    expect(await reconcileRounds(r, 3)).toBe(false);
+    expect(alertBreaks(r).map((view) => view.breakId)).toEqual([both[1]?.breakId]);
+    await release(r, both[1]?.breakId);
+    expect(await reconcileRounds(r, 3)).toBe(true);
+  });
+
+  it("(R2-C) after a restart, a new halting alert is never taken for one released before the restart", async () => {
+    const { r, first, second } = await twoTrades();
+    first.status = "FAILED";
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    const before = alertBreaks(r);
+    expect(before).toHaveLength(1);
+    await release(r, before[0]?.breakId);
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    // A fresh process: its OMS's first alert stands where the released one stood before the restart.
+    const p = await boot(r.u);
+    const again: Ready = { u: r.u, p, oms: p.oms as OrderManager };
+    expect(await reconcileRounds(again, 4)).toBe(true);
+    second.status = "FAILED";
+    again.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(again, (await again.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
+    const after = alertBreaks(again);
+    expect(after).toHaveLength(1);
+    expect(after[0]?.subjectKey).not.toBe(before[0]?.subjectKey);
+  });
+
+  for (const [variant, rewrite] of [
+    ["an earlier alert disappeared", (): readonly OmsAlert[] => []],
+    ["an earlier alert changed", (real: readonly OmsAlert[]): readonly OmsAlert[] => real.map((alert, index) => (index === 0 ? { ...alert, detail: "rewritten" } : alert))],
+  ] as const) {
+    it(`(R2-C) an alert list that is not append-only (${variant}) holds the account: alerts can no longer be told apart`, async () => {
+      const { r, first } = await twoTrades();
+      first.status = "FAILED";
+      r.p.coordinator.trigger("PERIODIC_TIMER");
+      await r.p.coordinator.reconcile();
+      const alert = alertBreaks(r);
+      await release(r, alert[0]?.breakId);
+      expect(await reconcileRounds(r, 4)).toBe(true);
+      r.u.seams.alerts = rewrite; // the OMS port breaks its contract
+      r.p.coordinator.trigger("PERIODIC_TIMER");
+      await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "COMPONENT_UNAVAILABLE");
+      expect(r.p.journal.unresolvedBreaks().map((view) => view.detail)).toContainEqual(expect.stringContaining("not append-only"));
+    });
+  }
+});
+
+describe("WP-290 deliverable 3: what still awaits a read at the end of a run is recorded, and holds (r2, R2-E)", () => {
+  it("(R2-E) an attempt still awaiting its authoritative read (inside the quiescence horizon) is recorded as ORDER_UNRESOLVED by attempt", async () => {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_ABSENT"]);
+    const attempt = await submitOne(r.oms);
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "ORDER_UNRESOLVED");
+    const held = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "ORDER_UNRESOLVED");
+    expect(held.map((view) => view.detail)).toContainEqual(`attempt ${attempt ?? "?"} is RECONCILING and still awaits an authoritative read`);
+    // Answered ABSENT once quiescent: the attempt resolves, the break clears, trading resumes.
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    expect(r.p.journal.unresolvedBreaks()).toEqual([]);
+  });
+
+  it("(R2-E) an order the OMS is still reconciling (its answer refused) is recorded as ORDER_UNRESOLVED by order", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    expect(await reconcileRounds(r, 2)).toBe(true);
+    r.u.world.cancel(r.u.world.orders.get(salt)?.venueOrderId as string);
+    r.u.seams.applyReconciliation = async () => ({ ok: false, refusal: { code: "OMS_TEST_REFUSED", message: "refused by the test" } });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "ORDER_UNRESOLVED");
+    const orderId = r.oms.orders()[0]?.orderId as string;
+    expect(r.oms.orders()[0]?.state).toBe("RECONCILING");
+    expect(r.p.journal.unresolvedBreaks().map((view) => view.detail)).toContain(`order ${orderId} is RECONCILING`);
+    delete r.u.seams.applyReconciliation;
+    expect(await reconcileRounds(r, 4)).toBe(true);
   });
 });

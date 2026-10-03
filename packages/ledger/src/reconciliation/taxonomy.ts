@@ -21,14 +21,21 @@
  * operator, only out-read by a later complete run. That is how "ambiguous
  * state never resumes trading" (work-plan acceptance 1) is a property of the
  * table rather than of a caller's diligence. "No longer reproduces it" means
- * the later run performed the check that found it: a run that did not judge
- * the holdings, for one, does not clear a holding break.
+ * the later run performed the check that found it, and the check found the
+ * subject consistent: a run that did not judge the holdings does not clear a
+ * holding break; a run that skipped a tracked order (its token unknown, its
+ * venue facts different, its by-id read missing) or could not verify its
+ * fills does not clear any break about that order's state or fills (the
+ * coordinator's `#judged`); a run that did not judge an attempt's identity,
+ * or answer it, does not clear that attempt's ambiguity or refused answer.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
- * immutable history (an UNATTRIBUTED order or trade, a booking, an OMS alert)
+ * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert)
  * acknowledges its subject for good. Releasing a LIVE contradiction (a tracked
  * order whose venue facts differ) does not: every run that still finds it
- * opens it again.
+ * opens it again. A subject must therefore name ONE occurrence: each OMS
+ * halting alert is keyed by its OMS instance and its ordinal, so a release
+ * never acknowledges a later alert like it.
  *
  * UNMATCHED ACTUAL ACTIVITY becomes UNATTRIBUTED (work-plan acceptance 2;
  * §6 invariant 7; §9.15): an order or a trade of the account that no tracked
@@ -314,8 +321,8 @@ export const BREAK_TAXONOMY = Object.freeze({
   OMS_HALTING_ALERT: {
     family: "CONTROL",
     rule: QUARANTINE,
-    meaning: "the OMS raised an alert that halts a market (an evidence conflict, an unknown venue order, a failed settlement, ...)",
-    handling: "the market is halted; quarantined until released",
+    meaning: "the OMS raised an alert that halts a market (an evidence conflict, an unknown venue order, a failed settlement, ...); one break per alert raised",
+    handling: "the market is halted; quarantined until released; releasing it acknowledges that one alert, never a later one like it",
   },
   OMS_EVIDENCE_RETAINED: {
     family: "CONTROL",
@@ -375,10 +382,11 @@ export function quarantinesOnOpen(rule: BreakRule): boolean {
 
 /**
  * The releasable classes whose subject is IMMUTABLE HISTORY: an order or a
- * trade the account's history keeps for good, a booking, an alert the OMS
- * raised, an operation that never named a transaction. An operator's release
- * ACKNOWLEDGES such a subject: the same subject is not opened again (new
- * activity has new subjects, and opens new breaks).
+ * trade the account's history keeps for good, a booking, one alert the OMS
+ * raised (one occurrence: its OMS instance and ordinal, never its kind and
+ * order alone), an operation that never named a transaction. An operator's
+ * release ACKNOWLEDGES such a subject: the same subject is not opened again
+ * (new activity has new subjects, and opens new breaks).
  *
  * Every other releasable class is a LIVE CONTRADICTION (today:
  * `ORDER_FACTS_MISMATCH`, a comparison of current state). A release records

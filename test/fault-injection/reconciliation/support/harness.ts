@@ -29,6 +29,7 @@ import {
   ReconciliationCoordinator,
   type AttemptView,
   type HaltRequest,
+  type OmsAlert,
   type OmsReservationPort,
   type OmsStore,
   type OrderManagerDependencies,
@@ -98,13 +99,15 @@ export interface Universe {
   policy: ReconciliationPolicy;
   /**
    * Test seams over the ports a process binds (all default to the real objects): the journal port the
-   * coordinator sees (read at boot); the OMS's attempt list (e.g. an attempt reported in flight) and its answer
-   * to a reconciliation; the group-token binding; a ledger that refuses bookings; a halt port that throws.
+   * coordinator sees (read at boot); the OMS's attempt list (e.g. an attempt reported in flight), its alert list,
+   * and its answer to a reconciliation; the group-token binding; a ledger that refuses bookings; a halt port that throws.
    * Each is a structural answer a real port could give; none reaches a network or a key.
    */
   readonly seams: {
     journal?: (real: ReconciliationJournal) => ReconciliationJournalPort;
     attempts?: (real: readonly AttemptView[]) => readonly AttemptView[];
+    /** The OMS's alert list as the coordinator sees it (e.g. one that is not append-only, a contract break). */
+    alerts?: (real: readonly OmsAlert[]) => readonly OmsAlert[];
     applyReconciliation?: (raw: unknown, real: (raw: unknown) => Promise<unknown>) => Promise<unknown>;
     tokenOfGroup?: (executionGroupId: string, real: (executionGroupId: string) => string | null) => string | null;
     /** The ledger refuses every UNATTRIBUTED booking. */
@@ -331,7 +334,7 @@ function oracleOms(u: Universe, oms: OrderManager): ReconciledOms {
     },
     attempts: () => (u.seams.attempts === undefined ? oms.attempts() : u.seams.attempts(oms.attempts())),
     orders: () => oms.orders(),
-    alerts: () => oms.alerts(),
+    alerts: () => (u.seams.alerts === undefined ? oms.alerts() : u.seams.alerts(oms.alerts())),
     retainedEvidence: () => oms.retainedEvidence(),
     outstandingReconciliations: () => oms.outstandingReconciliations(),
     retryReconciliationRequests: () => {

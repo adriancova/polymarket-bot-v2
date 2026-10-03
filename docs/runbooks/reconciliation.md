@@ -49,15 +49,25 @@ not a fault.
    still owe (`retryReconciliationRequests`, ADR-032 D5). Record every request
    received since the last run that could not be read (`REQUEST_MALFORMED`).
 2. Read, in this order: open orders, trades, each order that must be read by
-   id (every tracked order still open, and every one with fills, terminal or
-   not), positions (`/v2` only), the collateral balance (on chain), approvals,
-   the ledger projection, and each wallet-operation member a request names.
+   id (every tracked order still open, every one with fills, terminal or not,
+   and every one an unresolved break names), positions (`/v2` only), the
+   collateral balance (on chain), approvals, the ledger projection, and each
+   wallet-operation member a request names.
    Every read starts after every request the run will answer was received.
    A request that arrives during the reads waits for the next run, which
    starts at once.
-3. Compare, and answer the requests (section 5). Fills are compared with what
-   the OMS recorded durably, by identity (one fill per trade and order) and
-   with exact economics, both ways:
+3. Compare, and answer the requests (section 5). Every order observation is
+   checked on its own before the open-orders list and a by-id read of the
+   same order are merged: a status outside the documented vocabulary in
+   either read is `STATUS_UNRECOGNISED`; a later read showing an older state
+   (less matched, or live after the list showed it terminal) is
+   `READ_REGRESSION`; another status at the same stage (`DELAYED`, then
+   `LIVE`) is `READ_CONFLICT`. Only "live, then terminal" is a step forward:
+   no order-status transition table is documented (C-6, C-14). Any of these
+   makes the run's order reads unsound: nothing is answered from them.
+
+   Fills are compared with what the OMS recorded durably, by identity (one
+   fill per trade and order) and with exact economics, both ways:
    - a trade the OMS holds must carry the same shares, price, fee, role and
      match time; otherwise `FILL_MISMATCH`;
    - the OMS's recorded fill must be exactly what it holds under the venue's
@@ -68,7 +78,14 @@ not a fault.
      (`TRADE_MISSING_IN_OMS`);
    - a settlement read earlier than the one the OMS recorded is a
      `READ_REGRESSION`, after a restart too; one that contradicts its terminal
-     settlement is a `FILL_MISMATCH`.
+     settlement is a `FILL_MISMATCH`. Once a read is found behind the OMS,
+     nothing more is written to the OMS from that run's reads. (Comparing a
+     settlement records it in the OMS when it is a legal step forward; a leg
+     compared before the regression was found may have been recorded. Each
+     such write is a forward fact the venue showed, which the OMS itself
+     checks, and the run does not resume.)
+   - a missed fill the OMS refuses as a contradiction (it raises its own
+     halting alert) is offered once per process, not once per run.
 
    A tracked order's token (its execution group's), side, price and size are
    its fixed facts; any difference is `ORDER_FACTS_MISMATCH`.
@@ -94,10 +111,21 @@ Its class decides its rule. The full table, with every class's meaning, is
 
 **Ambiguity never resumes trading.** Every class that means "we cannot tell"
 is a hold. No release exists for it. It clears only when a complete,
-consistent run no longer finds it, having performed the check that found it:
-a run that did not judge the holdings does not clear a holding break, and a
-run that did not judge an attempt's identity (or give it an answer) does not
-clear that attempt's ambiguity (or refused answer).
+consistent run no longer finds it, having performed the check that found it,
+and found the subject consistent:
+
+- a run that did not judge the holdings does not clear a holding break;
+- a break about one tracked order's state or fills (`ORDER_STATE_MISMATCH`,
+  `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`,
+  `TRADE_MISSING_IN_OMS`, `FILL_*`) is cleared only by a run that compared
+  that order in full and found nothing wrong with it. A run that skipped the
+  order (its group's token unknown, its venue facts different, its by-id
+  read missing), could not verify its fills, found anything else wrong with
+  it, or saw it mid-cancel or still reconciling in the OMS clears none of
+  them. Every tracked order such a break names is read by id each run, so
+  the comparison can be made again;
+- a run that did not judge an attempt's identity (or give it an answer) does
+  not clear that attempt's ambiguity (or refused answer).
 
 **A malformed request** (from the OMS, the inventory or the user stream) is
 refused to its requester and recorded as `REQUEST_MALFORMED`, one break per
@@ -125,12 +153,16 @@ or a token whose market is unknown, halts the account. The halt is delivered
 again by every run while the break is open: the halt port must be idempotent.
 
 **What a release means.** Releasing immutable history (an UNATTRIBUTED order,
-trade or booking; an OMS alert; an operation that never named a transaction)
+trade or booking; one OMS alert; an operation that never named a transaction)
 acknowledges that subject for good: the same subject does not open again, and
-new activity opens new breaks. Releasing a live contradiction
-(`ORDER_FACTS_MISMATCH`) does not acknowledge it: every run that still finds
-it opens it again, quarantined, with its market halted. The table is
-`RELEASE_ACKNOWLEDGES_SUBJECT` in the taxonomy.
+new activity opens new breaks. Each OMS halting alert is its own break, keyed
+by its OMS instance and its place in that instance's list: two alerts of one
+kind on one order (two trades of one order FAILED, each owing a reversal) are
+two breaks, and releasing the first never acknowledges the second. After a
+restart, every alert the new OMS raises is a new break. Releasing a live
+contradiction (`ORDER_FACTS_MISMATCH`) does not acknowledge it: every run that
+still finds it opens it again, quarantined, with its market halted. The table
+is `RELEASE_ACKNOWLEDGES_SUBJECT` in the taxonomy.
 
 **The journal is append-only.** Runs, breaks, quarantines, resolutions and
 answers are events. The `ops.reconciliation_runs` and
@@ -203,11 +235,14 @@ returns at once, with no run.
   report names its detections and answers.
 - **Release a quarantine** with `releaseQuarantine({ breakId, operatorRef,
   reason })`. It works only on a QUARANTINED break, and records who released
-  it and why. It does not resume trading: it queues a `MANUAL_REQUEST` run,
-  which must pass on its own. Released history is acknowledged: the same
-  order, trade or booking does not reopen it, but new activity opens a new
-  break. A released `ORDER_FACTS_MISMATCH` reopens while the venue still
-  shows other facts: correct the cause first.
+  it and why. An `OMS_HALTING_ALERT` break is one alert: its detail names the
+  alert's place in the OMS instance's list. Handle each one (a FAILED
+  settlement owes its own reversal) before releasing it. A release does not
+  resume trading: it queues a `MANUAL_REQUEST` run, which must pass on its
+  own. Released history is acknowledged: the same order, trade, booking or
+  alert does not reopen it, but new activity opens a new break. A released
+  `ORDER_FACTS_MISMATCH` reopens while the venue still shows other facts:
+  correct the cause first.
 - **A `FILL_MISMATCH` that does not clear** means the OMS's durable fills and
   the venue's trades disagree about a trade, or a settlement contradicts a
   terminal one. The coordinator never rewrites a recorded fill. Establish
@@ -297,4 +332,21 @@ token is unknown is not compared, and holds (`COMPONENT_UNAVAILABLE`).
   order: `ORDER_UNATTRIBUTED`, or a hold while another attempt could own it.
   This is detection after the fact, not prevention.
 - Every tracked order with fills is read by id every run, as is every order
-  the trades read names. Both grow with history.
+  the trades read names, and every tracked order an unresolved break names.
+  All grow with history.
+- A break about a tracked order holds while that order cannot be compared
+  again. That includes a terminal order the venue's by-id read no longer
+  finds: E-14 says the by-id read finds canceled and fully matched orders, so
+  that is a contradiction, and it holds (fail closed).
+- The two order reads of one run are compared strictly. A status change
+  between them other than "live, then terminal" (a delayed order going live,
+  say) holds for that run, and a list that still shows an order live after an
+  earlier sound read showed it terminal holds until the list catches up.
+  Fail closed: a liveness cost.
+- Every OMS halting alert is a quarantine of its own, and needs its own
+  release. An OMS that raises the same alert repeatedly (re-delivered
+  evidence) opens one quarantine per alert. The coordinator offers each
+  contradiction it finds (a fill's economics, a settlement, a refused
+  delivery) once per process, so it raises one alert per contradiction per
+  process. The OMS's alert list must be append-only: one that is not holds
+  the account (`COMPONENT_UNAVAILABLE`) until a freshly opened OMS is bound.

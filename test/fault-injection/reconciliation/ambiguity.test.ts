@@ -15,6 +15,11 @@
  * read (orders and trades); an incomplete read; an undetermined trade
  * ownership; an unrecognised status (C-3's MATCHED_NOT_BROADCASTED); a
  * malformed read.
+ *
+ * Round 2: the two reads of one order are each validated before they are
+ * merged (R2-A); a break about one tracked order is cleared only by a run that
+ * compared that order in full and found it consistent (R2-B); nothing more is
+ * written to the OMS from a read set found unsound (R2-D).
  */
 
 import { describe, expect, it } from "vitest";
@@ -724,5 +729,327 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     delete r.u.seams.attempts;
     expect(await reconcileRounds(r, 3)).toBe(true);
     expect(resolutions(r, refused?.breakId)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+  });
+});
+
+describe("WP-290 acceptance 1: every order observation is validated before two reads of one order are merged (r2, R2-A)", () => {
+  /** An attempt whose answer was lost, whose order is at the venue and unclaimed: read in the open-orders list AND by id. */
+  async function unclaimed(): Promise<{ r: Ready; salt: string }> {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
+    await submitOne(r.oms);
+    return { r, salt: r.u.world.receipts.at(-1) as string };
+  }
+
+  function listedAs(r: Ready, status: string): void {
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, status })) };
+    };
+  }
+
+  it("(R2-A) a status outside the vocabulary in the open-orders list is not erased by a recognised one in the by-id read: nothing answered, paused", async () => {
+    const { r } = await unclaimed();
+    listedAs(r, "MYSTERY"); // the by-id read, later, says LIVE
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "STATUS_UNRECOGNISED");
+    expect(report.runs.flatMap((run) => run.answers)).toEqual([]);
+    expect(r.u.accepted).toEqual([]);
+    // Both reads agree again: the attempt is found PRESENT, and trading resumes.
+    r.u.world.faults = {};
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(r.u.accepted.map((answer) => answer.verdict)).toEqual(["PRESENT"]);
+  });
+
+  it("(R2-A) a by-id read showing an order live after the list showed it terminal is an out-of-order read (READ_REGRESSION): nothing answered, paused", async () => {
+    const { r } = await unclaimed();
+    listedAs(r, "CANCELED"); // the by-id read, later, says LIVE
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "READ_REGRESSION");
+    expect(report.runs.flatMap((run) => run.answers)).toEqual([]);
+    expect(r.u.accepted).toEqual([]);
+  });
+
+  it("(R2-A) the two reads naming another status at the same stage (DELAYED, then LIVE) disagree (READ_CONFLICT): nothing answered, paused", async () => {
+    const { r } = await unclaimed();
+    listedAs(r, "DELAYED");
+    const report = await r.p.coordinator.reconcile();
+    await expectPaused(r, report.resumed, "READ_CONFLICT");
+    expect(report.runs.flatMap((run) => run.answers)).toEqual([]);
+  });
+
+  it("(R2-A) a status outside the vocabulary in the by-id read of an order the list does not show (a FILLED order): paused", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.match(r.u.world.receipts.at(-1) as string, "1");
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    expect(r.oms.orders()[0]?.state).toBe("FILLED");
+    r.u.world.faults.readOrder = (_id, answer) => {
+      const read = answer() as { order?: Record<string, unknown> };
+      return { ...read, order: { ...read.order, status: "MYSTERY" } };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "STATUS_UNRECOGNISED");
+  });
+
+  it("(R2-A, liveness) a by-id read showing the order further along (canceled after the list showed it live) is no disagreement", async () => {
+    const { r, salt } = await unclaimed();
+    const order = r.u.world.orders.get(salt);
+    expect(order).toBeDefined();
+    r.u.world.cancel(order?.venueOrderId as string); // canceled between the list read and the by-id read
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: [...read.orders, { ...r.u.world.orderView(order as NonNullable<typeof order>), status: "LIVE" }] };
+    };
+    const report = await r.p.coordinator.reconcile();
+    const classes = report.runs.flatMap((run) => run.detections.map((detection) => detection.breakClass));
+    for (const problem of ["READ_CONFLICT", "READ_REGRESSION", "STATUS_UNRECOGNISED"]) expect(classes).not.toContain(problem);
+    expect(r.u.accepted.map((answer) => [answer.verdict, answer.venueOrderId])).toEqual([["PRESENT", order?.venueOrderId]]);
+    expect([...r.u.violations, ...r.u.world.violations]).toEqual([]);
+  });
+});
+
+describe("WP-290 acceptance 1: a break about one tracked order is cleared only by a run that compared that order in full (r2, R2-B)", () => {
+  /** The breaks of these classes that a given run resolved. */
+  function resolvedBy(r: Ready, runIds: readonly (string | null)[], breakIds: readonly (string | undefined)[]): unknown[] {
+    return r.p.journal.events().filter((event) => event.kind === "BREAK_RESOLVED" && runIds.includes(event.runId) && breakIds.includes(event.breakId));
+  }
+
+  function unresolved(r: Ready, breakClass: string): string | undefined {
+    return r.p.journal.unresolvedBreaks().find((view) => view.breakClass === breakClass)?.breakId;
+  }
+
+  /** A FILL_MISMATCH that persists in the read: the trade the OMS recorded is shown under another id. */
+  async function fillMismatch(): Promise<{ r: Ready; mismatch: string | undefined }> {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    r.u.world.faults.listTrades = (answer) => {
+      const read = answer() as { trades: Record<string, unknown>[] };
+      return { ...read, trades: read.trades.map((trade) => ({ ...trade, venueTradeId: "replacement-trade" })) };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    const mismatch = unresolved(r, "FILL_MISMATCH");
+    expect(mismatch).toBeDefined();
+    return { r, mismatch };
+  }
+
+  it("(R2-B) a run that skipped the order (its group's token unknown) does not clear its FILL_MISMATCH; a run that compares it again does", async () => {
+    const { r, mismatch } = await fillMismatch();
+    r.u.seams.tokenOfGroup = () => null;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const skipped = await r.p.coordinator.reconcile();
+    expect(skipped.runs.flatMap((run) => run.detections.map((detection) => detection.breakClass))).not.toContain("FILL_MISMATCH");
+    expect(resolutions(r, mismatch)).toEqual([]);
+    expect(unresolved(r, "FILL_MISMATCH")).toBe(mismatch);
+    // Compared again, the mismatch is still there: the same break holds.
+    delete r.u.seams.tokenOfGroup;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "FILL_MISMATCH");
+    expect(unresolved(r, "FILL_MISMATCH")).toBe(mismatch);
+    // The read agrees again: compared in full and consistent, it clears.
+    r.u.world.faults = {};
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(resolutions(r, mismatch)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+  });
+
+  it("(R2-B) a run that skipped the order (its venue facts differ: ORDER_FACTS_MISMATCH) does not clear its FILL_MISMATCH", async () => {
+    const { r, mismatch } = await fillMismatch();
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, price: "0.51" })) };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const skipped = await r.p.coordinator.reconcile();
+    await expectPaused(r, skipped.resumed, "ORDER_FACTS_MISMATCH");
+    expect(resolutions(r, mismatch)).toEqual([]);
+    expect(unresolved(r, "FILL_MISMATCH")).toBe(mismatch);
+  });
+
+  it("(R2-B) ORDER_TRADES_INCOMPLETE and ORDER_FILLS_AHEAD_OF_VENUE are not cleared by a run that could not verify the order's fills", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.match(r.u.world.receipts.at(-1) as string, "1");
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    r.u.world.faults.listTrades = () => ({ route: "/data/trades", complete: true, trades: [] });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    const incomplete = unresolved(r, "ORDER_TRADES_INCOMPLETE");
+    const ahead = unresolved(r, "ORDER_FILLS_AHEAD_OF_VENUE");
+    expect([incomplete, ahead].every((id) => id !== undefined)).toBe(true);
+    // The trade is shown again, but its fee is not fixed: the fill the OMS recorded cannot be verified.
+    r.u.world.faults.listTrades = (answer) => {
+      const read = answer() as { trades: { ownLegs: Record<string, unknown>[] }[] };
+      return { ...read, trades: read.trades.map((trade) => ({ ...trade, ownLegs: trade.ownLegs.map((leg) => ({ ...leg, feeAmount: null })) })) };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const unverified = await r.p.coordinator.reconcile();
+    await expectPaused(r, unverified.resumed, "FILL_ECONOMICS_UNFIXED");
+    expect(resolutions(r, incomplete)).toEqual([]);
+    expect(resolutions(r, ahead)).toEqual([]);
+    // Verifiable and consistent again: both clear, and trading resumes.
+    r.u.world.faults = {};
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(resolutions(r, incomplete)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+    expect(resolutions(r, ahead)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+  });
+
+  it("(R2-B) a refused delivery (FILL_REFUSED, keyed by trade) and its TRADE_MISSING_IN_OMS are not cleared by a run that skipped the order", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4"); // the OMS has not seen it
+    r.u.world.faults.listTrades = (answer) => {
+      const read = answer() as { trades: { ownLegs: Record<string, unknown>[] }[] };
+      return { ...read, trades: read.trades.map((trade) => ({ ...trade, ownLegs: trade.ownLegs.map((leg) => ({ ...leg, price: "0.6" })) })) };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    const refused = unresolved(r, "FILL_REFUSED");
+    const missing = unresolved(r, "TRADE_MISSING_IN_OMS");
+    expect([refused, missing].every((id) => id !== undefined)).toBe(true);
+    r.u.seams.tokenOfGroup = () => null;
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "COMPONENT_UNAVAILABLE");
+    expect(resolutions(r, refused)).toEqual([]);
+    expect(resolutions(r, missing)).toEqual([]);
+    // The refused delivery was offered to the OMS once (one halting alert, one quarantine), not once per run.
+    expect(r.oms.alerts().filter((alert) => alert.kind === "FILL_INCONSISTENT")).toHaveLength(1);
+    const alert = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "OMS_HALTING_ALERT");
+    expect(alert).toHaveLength(1);
+    // Compared again with the venue's true price: delivered, then a run finds the order consistent and clears both.
+    delete r.u.seams.tokenOfGroup;
+    r.u.world.faults = {};
+    expect((await r.p.coordinator.releaseQuarantine({ breakId: alert[0]?.breakId ?? "", operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    expect(resolutions(r, refused)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+    expect(resolutions(r, missing)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+    expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
+  });
+
+  it("(R2-B) a run that finds the order's state wrong clears none of its other breaks, though its fills now compare equal", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    r.u.world.match(salt, "0.4");
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    r.u.world.faults.listTrades = () => ({ route: "/data/trades", complete: true, trades: [] });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await r.p.coordinator.reconcile();
+    const ahead = unresolved(r, "ORDER_FILLS_AHEAD_OF_VENUE");
+    expect(ahead).toBeDefined();
+    // The trades are shown again (the fills compare equal), but the venue canceled the order the OMS holds live.
+    r.u.world.faults = {};
+    r.u.world.cancel(r.u.world.orders.get(salt)?.venueOrderId as string);
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    const first = report.runs[0];
+    expect(first?.detections.map((detection) => detection.breakClass)).toContain("ORDER_STATE_MISMATCH");
+    expect(resolvedBy(r, [first?.runId ?? null], [ahead])).toEqual([]);
+    // Once the OMS agrees (it read the order by id and concluded it), a later run clears it and resumes.
+    expect(report.resumed || (await reconcileRounds(r, 3))).toBe(true);
+    expect(resolutions(r, ahead)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+  });
+
+  it("(R2-B) an order the OMS is still reconciling is not judged: its ORDER_STATE_MISMATCH holds until the OMS concludes it", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    expect(await reconcileRounds(r, 2)).toBe(true);
+    r.u.world.cancel(r.u.world.orders.get(salt)?.venueOrderId as string);
+    // The OMS will not take the answer yet: its order stays RECONCILING.
+    r.u.seams.applyReconciliation = async () => ({ ok: false, refusal: { code: "OMS_TEST_REFUSED", message: "refused by the test" } });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    expect(report.runs.length).toBeGreaterThan(1);
+    expect(r.oms.orders()[0]?.state).toBe("RECONCILING");
+    const mismatch = r.p.journal.breaks().find((view) => view.breakClass === "ORDER_STATE_MISMATCH");
+    expect(mismatch?.status).toBe("OPEN");
+    expect(resolutions(r, mismatch?.breakId)).toEqual([]);
+    // The OMS takes the answer: the order is CANCELED, compared in full, and the break clears.
+    delete r.u.seams.applyReconciliation;
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    expect(r.oms.orders()[0]?.state).toBe("CANCELED");
+    expect(resolutions(r, mismatch?.breakId)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+  });
+});
+
+describe("WP-290 acceptance 1: a break about one tracked order clears once that order is compared again and found consistent (r2, R2-B liveness)", () => {
+  it("(R2-B, liveness) after a restart, a break about a canceled order with nothing filled clears once its by-id read (made because the break names it) finds it consistent", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    expect(await reconcileRounds(r, 2)).toBe(true);
+    const venueOrderId = r.u.world.orders.get(salt)?.venueOrderId as string;
+    r.u.world.cancel(venueOrderId);
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    expect([r.oms.orders()[0]?.state, r.oms.orders()[0]?.filledShares]).toEqual(["CANCELED", "0"]);
+    // A trades read names the canceled order with a trade the venue later withdraws (the by-id read agrees on its size).
+    const phantom = {
+      venueTradeId: "phantom-1",
+      status: "CONFIRMED",
+      transactionHash: null,
+      ownershipUndetermined: false,
+      ownLegs: [{ venueOrderId, role: "MAKER", tokenId: YES, side: "BUY", shares: "0.4", price: "0.5", feeAmount: "0", feeAssetId: null, matchedAt: "2026-10-03T00:00:00Z" }],
+    };
+    r.u.world.faults.listTrades = (answer) => {
+      const read = answer() as { trades: unknown[] };
+      return { ...read, trades: [...read.trades, phantom] };
+    };
+    r.u.world.faults.readOrder = (id, answer) => {
+      const read = answer() as { order?: Record<string, unknown> };
+      return id === venueOrderId ? { ...read, order: { ...read.order, sizeMatched: "0.4" } } : read;
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "FILL_REFUSED");
+    const named = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "FILL_REFUSED" || view.breakClass === "TRADE_MISSING_IN_OMS");
+    expect(named).toHaveLength(2);
+    // The trade is withdrawn. After a restart (no in-memory marks), nothing lists the order and no trade names it: it is
+    // read by id only because the breaks name it, found canceled with nothing matched, compared, and the breaks clear.
+    r.u.world.faults = {};
+    const again = await restart(r);
+    for (const view of again.p.journal.unresolvedBreaks().filter((entry) => entry.breakClass === "OMS_HALTING_ALERT")) {
+      expect((await again.p.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "the phantom trade was withdrawn" })).ok).toBe(true);
+    }
+    expect(await reconcileRounds(again, 3)).toBe(true);
+    for (const view of named) expect(resolutions(again, view.breakId)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+  });
+});
+
+describe("WP-290 acceptance 1: nothing more is written to the OMS from a read set found unsound (r2, R2-D)", () => {
+  it("(R2-D) after a restart, a settlement read behind the OMS's durable one stops the probe: a later leg's settlement is not recorded from that read", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const first = r.u.world.receipts.at(-1) as string;
+    await submitOne(r.oms);
+    const second = r.u.world.receipts.at(-1) as string;
+    const behind = r.u.world.match(first, "0.4", { status: "CONFIRMED" });
+    const ahead = r.u.world.match(second, "0.4", { status: "MATCHED" });
+    expect(await reconcileRounds(r, 4)).toBe(true);
+    const states = (): string[][] => r.u.store.snapshotSync().settlements.map((settlement) => [settlement.venueTradeId, settlement.state]);
+    expect(states()).toEqual([
+      [behind?.venueTradeId, "CONFIRMED"],
+      [ahead?.venueTradeId, "MATCHED"],
+    ]);
+    // The first order's trade reads behind the OMS; the second's has moved on. The first order is probed first.
+    if (behind !== undefined) behind.status = "MATCHED";
+    if (ahead !== undefined) ahead.status = "CONFIRMED";
+    const again = await restart(r);
+    const report = await again.p.coordinator.reconcile();
+    await expectPaused(again, report.resumed, "READ_REGRESSION");
+    expect(states()).toEqual([
+      [behind?.venueTradeId, "CONFIRMED"],
+      [ahead?.venueTradeId, "MATCHED"],
+    ]);
+    // The read catches up: the second trade's settlement is recorded by a sound run, and trading resumes.
+    if (behind !== undefined) behind.status = "CONFIRMED";
+    expect(await reconcileRounds(again, 3)).toBe(true);
+    expect(states()).toEqual([
+      [behind?.venueTradeId, "CONFIRMED"],
+      [ahead?.venueTradeId, "MATCHED"],
+      [ahead?.venueTradeId, "CONFIRMED"],
+    ]);
   });
 });

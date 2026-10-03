@@ -156,6 +156,12 @@ export interface ReconciledOms {
   resume(): OmsResult<true>;
   attempts(): readonly AttemptView[];
   orders(): readonly OrderView[];
+  /**
+   * Every alert the instance raised, oldest first. APPEND-ONLY for the instance's life (`OrderManager` only
+   * appends): an alert's identity is its ordinal here, with the instance's incarnation id (the id of the first run
+   * that inspects the instance). A list that shrinks or changes an earlier entry holds the account
+   * (`COMPONENT_UNAVAILABLE`).
+   */
   alerts(): readonly OmsAlert[];
   retainedEvidence(): readonly RetainedEvidenceView[];
   outstandingReconciliations(): number;
@@ -363,6 +369,8 @@ export interface JournalBreakView {
   readonly scope: BreakScope;
   readonly status: "OPEN" | "RESOLVED" | "QUARANTINED";
   readonly marketId: string | null;
+  /** The tracked order the break is about: the coordinator clears an order's state and fill breaks only by comparing that order again. */
+  readonly orderId: string | null;
   readonly assetId: string | null;
   readonly resolutionLedgerTransactionId: string | null;
   readonly resolution: "RESOLVED_IN_RUN" | "NOT_REPRODUCED" | "OPERATOR_RELEASED" | null;
