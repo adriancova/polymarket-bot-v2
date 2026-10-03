@@ -269,13 +269,37 @@ describe("3. a reconnect asks for nothing and synthesises nothing", () => {
     expect(outputs.map((output) => output.kind)).toEqual(["STATE", "RECONCILIATION_REQUESTED"]);
   });
 
-  it("no ORDER or TRADE output appears between a loss and the first frame on the new connection", () => {
+  it("no ORDER or TRADE output appears between a loss and the first frame on the new connection: nothing is re-emitted", () => {
+    const frame = JSON.stringify({
+      event_type: "order",
+      type: "PLACEMENT",
+      id: "0xfeed0001",
+      owner: "00000000-0000-0000-0000-000000000000",
+      market: FIXTURE_MARKET,
+      asset_id: "1075058827",
+      side: "BUY",
+      original_size: "100",
+      size_matched: "0",
+      price: "0.08",
+      status: "LIVE",
+      timestamp: "1782753357257",
+    });
     const h = openUserStream();
     h.subscribe();
+    // Events seen BEFORE the loss: a re-emission of any of them after the reconnect would be a synthesized backfill.
+    h.port.latest.deliver(frame);
+    h.port.latest.deliver(frame);
+    expect(h.outputs.filter((output) => output.kind === "ORDER")).toHaveLength(2);
+    const lossAt = h.outputs.length;
     h.port.latest.drop("SERVER_ERROR");
     h.timers.advance(DEFAULT_INITIAL_BACKOFF_MS);
     h.port.latest.open();
-    h.timers.advance(5 * 60_000);
-    expect(h.outputs.some((output) => output.kind === "ORDER" || output.kind === "TRADE")).toBe(false);
+    h.timers.advance(5_000);
+    expect(h.outputs.slice(lossAt).some((output) => output.kind === "ORDER" || output.kind === "TRADE")).toBe(false);
+    // Only a frame on the new connection yields an event, and it carries the new generation.
+    h.port.latest.deliver(frame);
+    const after = h.outputs.slice(lossAt).filter((output) => output.kind === "ORDER");
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ receipt: { subscriptionGeneration: 2, frameSequence: 1 } });
   });
 });
