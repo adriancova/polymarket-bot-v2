@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** the user ratified ADR-023 and ruled ADR-031 (option (a)) on 2026-10-02. `THROUGHPUT-1c` merges now. After it, the trading-core rounds go one at a time, because each edits `packages/trading-core` and `apps/trader`: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` (`apps/backtest-cli` only) and `ADR031-ACCEPT` (docs) run beside them. `WP-300c` merges now, on the user's request-token ruling of 2026-10-02. `HOST-BENCH` waits on the laptop agent.
+- **Next:** `THROUGHPUT-1c` is Complete (ADR-023 ratified). The trading-core rounds now run one at a time: `PROVENANCE-1` (it blocks `BURN-IN`), then `CO2-N1` (ADR-031 option (a), before `WP-270`), then `CADENCE-1`, `ROLLOVER-1` and `CKPT-1`. `APPROX-REPLAY-1` and `ADR031-ACCEPT` (with ADR-032) run beside them. `WP-300c` is merging. `HOST-BENCH` waits on the laptop agent.
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -48,6 +48,13 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-300b` is Complete (2026-10-01); see [Work packages](#work-packages).
 - `CONTROL-1` is Complete (2026-10-01); see [Work packages](#work-packages). `CADENCE-1`, which also owns `apps/control-api/src/**`, starts from its merge.
 - `CO2-N1-ADR` is Complete (2026-10-01). The user ruled ADR-031 on 2026-10-02: option (a); see the `CO2-N1` residual row.
+- **`PROVENANCE-1`**: Ready (authorized) 2026-10-02 by the orchestrator. It persists decision provenance (`gateway_epoch`, `ingest_seq`, `feature_snapshot_id`), durable halts and refusals, so trader-responsible windows classify and raw WAL expires. It closes `H1R1-PROVENANCE`, `OUT1-R1-HALT-NOT-DURABLE` and `OUT2-R1-HALT-RECORD-INTERACTION`, and bears on `H1R1-HALT-INVISIBLE`; it blocks `BURN-IN`. Paths:
+  - `packages/trading-core/src/**`;
+  - `apps/trader/src/**`, not `src/register/**`;
+  - `apps/research-worker/src/**`, only if the evidence reader needs it;
+  - `test/integration/paper-trader/**`, `test/integration/postgres/**`, `test/unit/trader/**`, `test/e2e/**`, `test/replay-golden/**`.
+  Forbidden: `db/migrations/**`. Verifiers: Opus and gpt-6-astra, reconciled.
+- **`APPROX-REPLAY-1`**: Ready (authorized) 2026-10-02, per the work plan (its dependencies `STORAGE-1` and `THROUGHPUT-1c` are met). Paths: `apps/backtest-cli/**`. Verifier: astra.
 - **`ADR031-ACCEPT`**: Ready (authorized) 2026-10-02 by the orchestrator. Docs only:
   - set ADR-031's status to Accepted, and record the user's ruling (option (a), Q1, Q2 and Q3) in it;
   - fix the reviewers' round-2 LOWs (`CO2N1-R2-L1`, `F2-L1`..`F2-L5`);
@@ -63,7 +70,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
   ADR-032 records it (in `ADR031-ACCEPT`). Merging.
 - `STORAGE-GOV2` is Complete (2026-10-01); see [Work packages](#work-packages).
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
-- **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29. **Joint ACCEPT at round 9** (`d997d39`; Opus and gpt-6-astra, reconciled; INFO items only). Draft PR #38 carries it, merged with `main` at `dac9f77`; its merge-ref CI is green (run `36874368278`). **The user ratified ADR-023 as-is on 2026-10-02**, confirming the three rulings below; the merge proceeds. The orchestrator's bench re-measure (8 alternating runs, H1 burst) found +1.7% wall and +1.6% CPU by median, identical decisions and 0 stale pauses.
+- `THROUGHPUT-1c` is Complete (2026-10-02, `0c270df`); ADR-023 is Accepted, ratified by the user as is. See [Work packages](#work-packages). Its rulings and evidence are below, kept for reference.
   - **Rulings: made by the orchestrator on 2026-10-01, each the most conservative option, and confirmed by the user's ratification of ADR-023 on 2026-10-02:**
     - **ADR-023 D7: option (a)**, the process-lag guard, as implemented. Not (b), narrowing criterion B, and not (c), deferring the opt-in.
     - **The Clock-port reading:** the guard's use of the `Clock` port is NOT a clock-semantics change. Every age stays in event time; the process clock can only remove the extension ADR-023 adds, never make a book fresher (ADR-023 D7). `CO2-N1` is unchanged.
@@ -169,7 +176,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `OUTAGE-2` | make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt | Complete (2026-09-29) | `a618752` | [OUTAGE-2](docs/handoffs/OUTAGE-2.md) |
 | `THROUGHPUT-1a` | the trader keeps pace with a live 15-minute market; its stream lag is visible | Complete (2026-09-30) | `229d58a` | [THROUGHPUT-1a](docs/handoffs/THROUGHPUT-1a.md) |
 | `THROUGHPUT-1b` | the gateway publishes a window-open burst without overflowing; the example config subscribes to books | Complete (2026-09-30) | `c179095` | [THROUGHPUT-1b](docs/handoffs/THROUGHPUT-1b.md) |
-| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | **Merging**: ADR-023 ratified by the user 2026-10-02 (joint ACCEPT r9, `d997d39`; PR #38) | — | — |
+| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | Complete (2026-10-02): ADR-023 Accepted (ratified by the user) | `0c270df` | [THROUGHPUT-1c](docs/handoffs/THROUGHPUT-1c.md) |
 | `DEPS-1` | CI health: new high advisories in dev/test-only transitive dependencies | Complete (2026-09-30) | `f6a2714` | the archived row |
 | `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Complete (2026-09-30) | `7d59fd3` | [THROUGHPUT-2](docs/handoffs/THROUGHPUT-2.md) |
 | `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
@@ -191,6 +198,8 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
 | `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
 | `CO2-N1-ADR` | ADR-031 (Proposed): the design decision `CO2-N1` needs | Complete (2026-10-01): ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
+| `PROVENANCE-1` | decision provenance, durable halts and refusals; raw WAL expiry where a trader runs | **Ready (authorized)** 2026-10-02 | — | — |
+| `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | **Ready (authorized)** 2026-10-02 | — | — |
 | `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | **Ready (authorized)** 2026-10-02 | — | — |
 | `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | Complete (2026-10-01) | `80a06e2` | [CONTROL-1b](docs/handoffs/CONTROL-1b.md) |
 | `WP-300c` | `WP300B-LOWS`: hostile evidence, refusal-code docs, module-load tripwires, predictable ids | **Merging**: the request-token design ruled by the user 2026-10-02 (code accepted at `1322b89`; PR #45) | — | — |
