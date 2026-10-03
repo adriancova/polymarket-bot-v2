@@ -50,7 +50,8 @@
  * 6. **Answer the transport's refusal, read the route parameter and the body
  *    through their doors**, then **act**, through the control plane, which
  *    audits before it applies. On a MUTATING route every refusal from here on
- *    is AUDITED (`CONTROL-1` r1, closing `CONTROL1-J-M2`): the caller has
+ *    is AUDITED (`CONTROL-1` r1, closing `CONTROL1-J-M2`) — save the control
+ *    plane's GATED refusal, item 7 below: the caller has
  *    authenticated and holds the route's mutation grant, so its refusal is an
  *    operator fact, and it is recorded through `ControlPlane.refuseRequest` in
  *    the audit budget's ORDINARY tier — a full tier leaves the refusal standing
@@ -61,9 +62,14 @@
  * mode-raise attempt from a caller holding no mutation grant (3); a request the
  * router does not serve, `404`/`405` (4 — authorization is per route, and there
  * is no route); an authenticated caller lacking the route's grant (5); a read
- * route's transport refusal (6); and a request the HTTP server refuses before
+ * route's transport refusal (6); a request the HTTP server refuses before
  * any handler runs — Node's own `408`/`400`, or a client that disconnects
- * mid-body (`http.ts`). A mutation-grant holder's mode-raise attempt is audited
+ * mid-body (`http.ts`); and the control plane's GATED refusal (7): a
+ * strengthening engage or halting pause of a switch or instance whose earlier
+ * protected append is still unsettled, refused `503 CONTROL_NOT_AUDITABLE`
+ * without offering a record (`control-plane.ts`, "One unsettled protected
+ * append per state key"; `CONTROL-1b` r2, closing `CONTROL1B-R2-J-L1`). A
+ * mutation-grant holder's mode-raise attempt is audited
  * at step 3 whatever route it named, so none of 4-6 applies to it. `README.md`,
  * "2. Every mutation is audited", lists the same.
  *
@@ -124,13 +130,15 @@ import {
 } from "@polymarket-bot/observability";
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 
+import { boundAuditText } from "./audit-text.js";
 import { hasGrant, type OperatorCredential, type OperatorGrant, type OperatorRegistry } from "./auth.js";
-import type {
-  ControlPlane,
-  KillSwitchRelease,
-  MutatingAuditAction,
-  MutationContext,
-  RequestRefusalStage,
+import {
+  REFUSAL_AUDIT_MAX_ISSUES,
+  type ControlPlane,
+  type KillSwitchRelease,
+  type MutatingAuditAction,
+  type MutationContext,
+  type RequestRefusalStage,
 } from "./control-plane.js";
 import {
   buildDoor,
@@ -672,11 +680,14 @@ export class ControlApi {
         actor: operator.operatorId,
         at: this.#options.environment.now(),
         auditRecordId: this.#options.environment.nextAuditRecordId(),
-        reason: `request to ${request.method} ${request.path} named ${named}`,
+        reason: modeRaiseReason(request.method, request.path, forbidden),
       });
       recorded = outcome.audited
         ? "the attempt has been audited."
-        : `the attempt has been counted; it could NOT be audited (${outcome.code}), and nothing changed.`;
+        : outcome.unconfirmed
+          ? `the attempt has been counted; its audit record was NOT confirmed within the append bound ` +
+            `(${outcome.code}) and may still land, and nothing changed.`
+          : `the attempt has been counted; it could NOT be audited (${outcome.code}), and nothing changed.`;
     } else {
       this.#options.controlPlane.countModeRaiseWithoutAudit();
       recorded =
@@ -946,6 +957,29 @@ function sortedCounts(counts: ReadonlyMap<string, number>): Readonly<Record<stri
   const out: Record<string, number> = Object.create(null) as Record<string, number>;
   for (const key of [...counts.keys()].sort()) out[key] = counts.get(key) ?? 0;
   return Object.freeze(out);
+}
+
+/** How much of a request's method and path a mode-raise record's reason keeps. */
+export const MODE_RAISE_REASON_MAX_METHOD = 16;
+export const MODE_RAISE_REASON_MAX_PATH = 128;
+
+/**
+ * The reason a mode-raise attempt's audit record carries (`CONTROL-1b`,
+ * closing `CONTROL-1` follow-up 3b): the method and path, each BOUNDED, and the
+ * forbidden keys — at most `REFUSAL_AUDIT_MAX_ISSUES` of them, then how many
+ * more. At `CONTROL-1` it held the whole path and every key, so its size was
+ * the caller's choice up to the transport's limits. The control plane cuts the
+ * whole reason to `REFUSAL_AUDIT_MAX_TEXT` again, and escapes it, so this is
+ * the legible bound and that is the fence.
+ */
+function modeRaiseReason(method: string, path: string, forbidden: readonly string[]): string {
+  const shown = forbidden.slice(0, REFUSAL_AUDIT_MAX_ISSUES);
+  const more = forbidden.length - shown.length;
+  return (
+    `request to ${boundAuditText(method, MODE_RAISE_REASON_MAX_METHOD)} ` +
+    `${boundAuditText(path, MODE_RAISE_REASON_MAX_PATH)} named ${shown.join(", ")}` +
+    (more > 0 ? ` and ${String(more)} more` : "")
+  );
 }
 
 function doorProblem(refusal: {

@@ -129,6 +129,14 @@ describe("CONTROL-1 through the shipped composition root", () => {
       const log = lines.join("\n");
       expect(log).toContain("audit bound 7 (the last 2 for kill-switch engages, the 2 before them for safety-direction actions)");
       expect(log).toContain("server timeouts: headers 10000ms, request 30000ms, keep-alive 5000ms");
+      // `CONTROL-1b` r1 (`CONTROL1B-R1-J-L1`): the plane this process composed
+      // bounds every append at the default and writes a VOID beside a late
+      // APPLIED record — a composition without the record source would log
+      // "NO void record".
+      expect(log).toContain(
+        "audit append bound 5000ms; an APPLIED record that lands after it gets a VOID record from this " +
+          "process's clock and id source, when the sink and the audit budget admit one",
+      );
 
       // A READ-only operator tries the M-3 vector: refused by name, never audited.
       for (let index = 0; index < 5; index += 1) {

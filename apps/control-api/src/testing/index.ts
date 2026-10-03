@@ -95,15 +95,19 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     capacity: options.auditCapacity ?? 64,
     safetyReserve: options.auditSafetyReserve ?? 0,
   });
+  const environment = new ScriptedEnvironment();
   const controlPlane = new ControlPlane({
     audit: auditBudget,
     runMode: CONTROL_API_RUN_MODE,
     maximumRunMode: CONTROL_API_RUN_MODE,
     repositoryMaximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
+    // As `main.ts`: a void record's instant and id come from the API's
+    // environment. The in-memory log answers at once, so this draws nothing
+    // from the scripted sequence unless an append outlives its bound.
+    auditRecordSource: environment,
   });
   const healthSource = new InMemoryTraderHealthSource(options.healthDocument);
   const health = new TraderHealthCache(healthSource);
-  const environment = new ScriptedEnvironment();
 
   const api = new ControlApi({
     operators: new OperatorRegistry([

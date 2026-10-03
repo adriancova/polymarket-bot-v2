@@ -57,8 +57,18 @@ export type { ControlKillSwitchAction, ControlKillSwitchScope } from "./vocabula
 export { buildDoor, deepFreeze, ownBoolean, ownNumber, ownRecord, ownString } from "./doors.js";
 export type { DoorRefusal, DoorRefusalCode, DoorResult } from "./doors.js";
 
-export { ControlPlane, REFUSAL_AUDIT_MAX_ISSUES, REFUSAL_AUDIT_MAX_TEXT } from "./control-plane.js";
+export {
+  AUDIT_APPEND_TIMEOUT_MAX_MS,
+  AUDIT_APPEND_TIMEOUT_MS,
+  CONTROL_PLANE_VOID_ACTOR,
+  ControlPlane,
+  LATE_APPEND_OUTCOMES,
+  REFUSAL_AUDIT_MAX_ISSUES,
+  REFUSAL_AUDIT_MAX_TEXT,
+  auditAppendTimeoutProblem,
+} from "./control-plane.js";
 export type {
+  AuditRecordSource,
   ControlPlaneOptions,
   KillSwitchRelease,
   KillSwitchState,
@@ -94,9 +104,21 @@ export {
   CONTROL_API_ROUTE_TABLE,
   CONTROL_API_ROUTES,
   ControlApi,
+  MODE_RAISE_REASON_MAX_METHOD,
+  MODE_RAISE_REASON_MAX_PATH,
   MUTATION_GRANTS,
   holdsMutationAuthority,
 } from "./api.js";
+
+export {
+  AUDIT_IDENTIFIER_MAX_TEXT,
+  AUDIT_REASON_MAX_TEXT,
+  AUDIT_TEXT_ELLIPSIS,
+  auditSafeDocument,
+  auditSafeRecord,
+  boundAuditText,
+  escapeAuditText,
+} from "./audit-text.js";
 export type {
   ApiEnvironment,
   ApiRequest,
