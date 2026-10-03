@@ -14,6 +14,12 @@
  * 2. **Rebuildable.** Checkpoints are an optimization, not the source of truth
  *    (§6 invariant 8 applied to strategy state): the fold of the persisted
  *    `statePatch` values reproduces the checkpointed bytes.
+ *
+ * `CKPT-1` (ADR-027) re-pins two things here, each stated where it changes:
+ * a restore takes a RESTORE POINT (the last checkpoint plus the highest durable
+ * `evaluationSeq`, D2), so `restoreCheckpoint` validates the document but no
+ * longer answers a next sequence; and a checkpoint is written after a decision
+ * that meets Decision 1 — not after every one.
  */
 
 import { describe, expect, it } from "vitest";
@@ -23,6 +29,7 @@ import {
   createStrategyInstanceRuntime,
   rebuildStateFromPatches,
   restoreCheckpoint,
+  restoreFromPoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   type CheckpointIdentity,
   type StrategyStateCheckpoint,
@@ -33,6 +40,7 @@ import {
   makeDefinition,
   makeHarness,
   makeInput,
+  restorePoint,
   RUN_ID,
   RUN_SEED,
 } from "./helpers.js";
@@ -76,7 +84,7 @@ function refusalCode(overrides: Partial<StrategyStateCheckpoint>): string {
 }
 
 describe("state checkpointing: versioned, rebuildable, refusing on incompatibility", () => {
-  it("restores a compatible checkpoint into frozen state at the NEXT evaluation sequence", () => {
+  it("restores a compatible checkpoint into frozen state; the NEXT sequence is the highest durable one plus one (ADR-027 D2)", () => {
     const result = restoreCheckpoint(makeCheckpoint(), IDENTITY);
     expect(result.ok).toBe(true);
     if (!result.ok) {
@@ -84,9 +92,22 @@ describe("state checkpointing: versioned, rebuildable, refusing on incompatibili
     }
     expect(result.restored.state).toEqual({ count: 2 });
     expect(Object.isFrozen(result.restored.state)).toBe(true);
-    expect(result.restored.nextEvaluationSeq).toBe(5);
+    // `CKPT-1` re-pin: this was `nextEvaluationSeq` 5 (= checkpointSeq + 1).
+    // A checkpoint alone no longer knows the next sequence — decisions that
+    // owed no checkpoint may be durable after it — so it answers its OWN
+    // sequence, and the restore point answers the next one.
+    expect(result.restored.checkpointSeq).toBe(4);
+    expect(result.restored).not.toHaveProperty("nextEvaluationSeq");
     expect(result.restored.rngState).toEqual([1, 2, 3, 4]);
     expect(result.restored.status).toBe("ACTIVE");
+
+    const atCheckpoint = restoreFromPoint(restorePoint(makeCheckpoint()), IDENTITY);
+    expect(atCheckpoint.ok && atCheckpoint.restored.nextEvaluationSeq).toBe(5);
+    // Three decisions with no checkpoint are durable after it (5, 6, 7): the
+    // next sequence is 8, never the checkpoint's 5.
+    const afterLater = restoreFromPoint(restorePoint(makeCheckpoint(), 7), IDENTITY);
+    expect(afterLater.ok && afterLater.restored.nextEvaluationSeq).toBe(8);
+    expect(afterLater.ok && afterLater.restored.state).toEqual({ count: 2 });
   });
 
   it("REFUSES an unknown checkpoint schema version rather than best-effort loading it", () => {
@@ -169,7 +190,7 @@ describe("state checkpointing: versioned, rebuildable, refusing on incompatibili
     const { definition } = makeDefinition();
     const created = createStrategyInstanceRuntime({
       ...definition,
-      restoreFrom: makeCheckpoint({ checkpointSchemaVersion: 99 }),
+      restoreFrom: restorePoint(makeCheckpoint({ checkpointSchemaVersion: 99 })),
     });
     expect(created.ok).toBe(false);
     if (!created.ok) {
@@ -178,7 +199,7 @@ describe("state checkpointing: versioned, rebuildable, refusing on incompatibili
 
     const mismatched = createStrategyInstanceRuntime({
       ...definition,
-      restoreFrom: makeCheckpoint({ strategyVersion: "2.0.0" }),
+      restoreFrom: restorePoint(makeCheckpoint({ strategyVersion: "2.0.0" })),
     });
     expect(mismatched.ok).toBe(false);
     if (!mismatched.ok) {
@@ -190,7 +211,7 @@ describe("state checkpointing: versioned, rebuildable, refusing on incompatibili
     const { definition, sink } = makeDefinition();
     const created = createStrategyInstanceRuntime({
       ...definition,
-      restoreFrom: makeCheckpoint({ status: "PAUSED" }),
+      restoreFrom: restorePoint(makeCheckpoint({ status: "PAUSED" })),
     });
     expect(created.ok).toBe(true);
     if (!created.ok) {
@@ -205,9 +226,17 @@ describe("state checkpointing: versioned, rebuildable, refusing on incompatibili
     expect(sink.calls).toHaveLength(0);
   });
 
-  it("a checkpoint is written after EVERY persisted decision and pins the full run identity", () => {
-    const { runtime, store } = makeHarness();
+  it("the START decision writes a checkpoint, which pins the full run identity; a no-change decision writes none (ADR-027 D1)", () => {
+    // `CKPT-1` re-pin (ADR-027 §5): this was "a checkpoint is written after
+    // EVERY persisted decision". The first decision of the instance is the
+    // START transition and still writes one; a second hold that changes
+    // neither state, status nor RNG, at the same instant, writes none.
+    const { runtime, store, sink } = makeHarness();
     expect(runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
+    const second = runtime.evaluate(makeInput("onFeatures"));
+    expect(second.kind === "DECIDED" && second.checkpoint).toBeNull();
+    expect(sink.calls).toHaveLength(2);
+    expect(store.checkpoints).toHaveLength(1);
     const checkpoint = store.checkpoints[0];
     expect(checkpoint).toMatchObject({
       checkpointSchemaVersion: STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,

@@ -64,6 +64,7 @@ function snapshot(overrides: Partial<PnlSnapshot> = {}): PnlSnapshot {
 }
 
 const DECISION = { decisionId: "d-1" } as unknown as DecisionRecord;
+const DECISION_2 = { decisionId: "d-2" } as unknown as DecisionRecord;
 const TELEMETRY = { evaluationDurationUs: 1 } as unknown as DecisionTelemetry;
 const CHECKPOINT = { checkpointId: "c-1" } as unknown as StrategyStateCheckpoint;
 const TRANSACTION = { transactionId: "t-1" } as unknown as AppendedLedgerTransaction;
@@ -76,10 +77,17 @@ describe("InMemoryTraderStore — the production in-memory store", () => {
   it("records every write in order and publishes each list", async () => {
     const store = new InMemoryTraderStore();
     expect(verdict(await store.persistDecision(DECISION, TELEMETRY))).toBe("ok");
-    expect(verdict(await store.saveCheckpoint(CHECKPOINT, "2026-05-01T09:00:02Z"))).toBe("ok");
+    // `CKPT-1` (ADR-027 D3): a checkpoint is written only WITH its decision
+    // (the store has no lone `saveCheckpoint` any more); the pair records both.
+    expect(
+      verdict(await store.persistDecisionWithCheckpoint(DECISION_2, TELEMETRY, CHECKPOINT, "2026-05-01T09:00:02Z")),
+    ).toBe("ok");
     expect(verdict(await store.appendLedgerTransaction(TRANSACTION))).toBe("ok");
     expect(verdict(await store.writePnlSnapshot(snapshot()))).toBe("ok");
-    expect(store.decisions).toEqual([{ record: DECISION, telemetry: TELEMETRY }]);
+    expect(store.decisions).toEqual([
+      { record: DECISION, telemetry: TELEMETRY },
+      { record: DECISION_2, telemetry: TELEMETRY },
+    ]);
     expect(store.checkpoints).toEqual([CHECKPOINT]);
     expect(store.checkpointInstants).toEqual(["2026-05-01T09:00:02Z"]);
     expect(store.transactions).toEqual([TRANSACTION]);
@@ -118,7 +126,10 @@ describe("InMemoryTraderStore — the production in-memory store", () => {
     expect(store.closed).toBe(true);
     const refused = { ok: false, failure: { kind: "UNAVAILABLE", detail: IN_MEMORY_STORE_CLOSED_DETAIL } };
     expect(await store.persistDecision(DECISION, TELEMETRY)).toEqual(refused);
-    expect(await store.saveCheckpoint(CHECKPOINT, "2026-05-01T09:00:02Z")).toEqual(refused);
+    expect(await store.persistDecisionWithCheckpoint(DECISION, TELEMETRY, CHECKPOINT, "2026-05-01T09:00:02Z")).toEqual(
+      refused,
+    );
+    expect(store.checkpoints).toEqual([]);
     expect(await store.appendLedgerTransaction(TRANSACTION)).toEqual(refused);
     expect(await store.writePnlSnapshot(snapshot({ asOf: "2026-05-01T09:14:49Z" }))).toEqual(refused);
     expect(await store.replacePnlSnapshot(snapshot())).toEqual(refused);

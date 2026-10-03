@@ -47,9 +47,11 @@ function journaling(inner: MemoryTraderStore, journal: string[]): TraderStore {
       journal.push(`decision ${String(record.evaluationSeq)}`);
       return await inner.persistDecision(record, telemetry);
     },
-    saveCheckpoint: async (checkpoint, capturedAt) => {
-      journal.push(`checkpoint ${String(checkpoint.checkpointSeq)}`);
-      return await inner.saveCheckpoint(checkpoint, capturedAt);
+    // `CKPT-1` (ADR-027 D3): a decision and the checkpoint it owes are ONE
+    // write, journaled as the two rows it carries.
+    persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) => {
+      journal.push(`decision ${String(record.evaluationSeq)}`, `checkpoint ${String(checkpoint.checkpointSeq)}`);
+      return await inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt);
     },
     persistRiskRefusal: async (refusal) => {
       journal.push(`refusal ${String(refusal.evaluationSeq)}`);
@@ -168,16 +170,33 @@ describe("a risk refusal is recorded at the store port (PROVENANCE-1)", () => {
     expect(refusals.length).toBeGreaterThanOrEqual(1);
     const first = refusals[0];
     if (first === undefined) throw new Error("unreachable");
-    // The staging that carries the refusal also carries its decision's checkpoint.
+    // `CKPT-1` re-pin (ADR-027 D3; `DURABLE-1` LOW-3). This used to read: "the
+    // staging that carries the refusal also carries its decision's checkpoint"
+    // and "the DURABLE-1 boundary staged the decision ALONE, with no
+    // refusal" — that is, the boundary staged the decision WITHOUT its
+    // checkpoint, and the checkpoint followed in the event's later staging
+    // (LOW-3: two transactions). Now the boundary stages the decision WITH the
+    // checkpoint it owes, and the event's flush stages the refusal after it.
     const carrying = stagings.filter((staging) => staging.riskRefusals.length > 0);
     expect(carrying.length).toBeGreaterThanOrEqual(1);
     for (const staging of carrying) {
       for (const refusal of staging.riskRefusals) {
-        expect(staging.checkpoints.map((entry) => entry.checkpoint.checkpointSeq)).toContain(refusal.evaluationSeq);
+        const decisionStaging = stagings.findIndex((candidate) =>
+          candidate.decisions.some((entry) => entry.record.evaluationSeq === refusal.evaluationSeq),
+        );
+        expect(decisionStaging, "the refused intent's decision was staged").toBeGreaterThanOrEqual(0);
+        // …with its checkpoint, in the SAME staging (ADR-027 D3)…
+        expect(
+          stagings[decisionStaging]?.checkpoints.map((entry) => entry.checkpoint.checkpointSeq),
+        ).toContain(refusal.evaluationSeq);
+        // …and the refusal no EARLIER than that staging.
+        expect(stagings.indexOf(staging)).toBeGreaterThanOrEqual(decisionStaging);
       }
     }
-    // The DURABLE-1 boundary staged the decision ALONE, with no refusal.
-    for (const staging of stagings.filter((candidate) => candidate.checkpoints.length === 0)) {
+    // The DURABLE-1 boundary staged the decision with no refusal.
+    for (const staging of stagings.filter((candidate) =>
+      candidate.decisions.some((entry) => entry.record.decision.intents.length > 0),
+    )) {
       expect(staging.riskRefusals).toEqual([]);
     }
     const seq = String(first.evaluationSeq);
@@ -204,6 +223,11 @@ describe("a risk refusal is recorded at the store port (PROVENANCE-1)", () => {
             record.decision.intents.length > 0
               ? portFailed<null>("UNAVAILABLE", "provenance-1: the store refuses this decision")
               : await base.persistDecision(record, telemetry),
+          // `CKPT-1`: the same refusal for the paired write (decision + its owed checkpoint).
+          persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) =>
+            record.decision.intents.length > 0
+              ? portFailed<null>("UNAVAILABLE", "provenance-1: the store refuses this decision")
+              : await base.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
         };
       },
     });

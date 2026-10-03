@@ -54,6 +54,17 @@
  * decision-by-decision relation to them, on the full burst, is the bench's
  * (`CADENCE-1` handoff).
  *
+ * RE-PINNED BY `CKPT-1` (ADR-027: a checkpoint only after a decision that
+ * changes the state, the status or the RNG, at the start, at the stop, or on a
+ * 60 s event-time heartbeat). The DECISIONS are untouched — the same 4, the
+ * same {@link CADENCE_NORMALIZED_DECISIONS} digest. "One checkpoint per
+ * decision" no longer holds: the checkpoints are pinned by their own count,
+ * {@link CKPT1_CHECKPOINTS}, and digest, {@link CKPT1_NORMALIZED_CHECKPOINTS}.
+ * Measured on the candidate in both modes (the same bytes); that the remaining
+ * checkpoint rows are base's rows at the same sequences, byte for byte, was
+ * checked with the bench's `checkpoints.jsonl` (see the `CKPT-1` handoff). The
+ * `CADENCE-1` checkpoint digest is kept below as the record.
+ *
  * Docker: Testcontainers, its own containers, no skip. PAPER only.
  */
 
@@ -108,7 +119,18 @@ const HALF_APPLIED_BASE_DECISIONS = 909;
  */
 const CADENCE_DECISIONS = 4;
 const CADENCE_NORMALIZED_DECISIONS = "5662980df21598ab1d9124ca676ad9c9fa48213c405196289c7c9b54db3ae820";
+/**
+ * `CADENCE-1`'s checkpoint pin — one checkpoint per decision, 4 — retired by
+ * `CKPT-1` and kept as the record of what ADR-026 alone wrote.
+ */
 const CADENCE_NORMALIZED_CHECKPOINTS = "f2692145057e79755fc42dfeec031f7c0139c5c107292e68af2e419a7dc51925";
+
+/**
+ * `CKPT-1` (ADR-027): the checkpoints the same 4 decisions owe, and their
+ * normalized digest, measured on the candidate in both modes.
+ */
+const CKPT1_CHECKPOINTS = 2;
+const CKPT1_NORMALIZED_CHECKPOINTS = "f31a2a92d44ddffd87247f1c4fba9cbbb56a597f3aefe07f461d9b1c1d245fb3";
 
 let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
 let redis: Awaited<ReturnType<typeof startRedisContainer>>;
@@ -176,9 +198,13 @@ function assertCompleteAndOnePerEvaluation(report: ThroughputReport): void {
   expect(report.stopped).toBe("COMPLETE");
   expect(report.consumed).toBe(2_001);
   expect(report.events).toBe(2_001);
-  // One durable decision per evaluation, contiguous, one checkpoint each.
+  // One durable decision per evaluation, contiguous. `CKPT-1` re-pin: this
+  // read "one checkpoint each"; under ADR-027 the checkpoints are those the
+  // decisions owe — the first (START) at least, never more than one each.
   expect(report.durable.decisions).toBe(report.health.loop["decisionsPersisted"]);
-  expect(report.durable.checkpoints).toBe(report.durable.decisions);
+  expect(report.durable.checkpoints).toBeGreaterThanOrEqual(1);
+  expect(report.durable.checkpoints).toBeLessThanOrEqual(report.durable.decisions);
+  expect(report.durable.checkpoints).toBe(CKPT1_CHECKPOINTS);
   expect(report.durable.distinctEvaluationSeqs).toBe(report.durable.decisions);
   expect(report.durable.minEvaluationSeq).toBe(0);
   expect(report.durable.maxEvaluationSeq).toBe(report.durable.decisions - 1);
@@ -193,7 +219,8 @@ describe("the throughput harness on the committed 2,000-event sample", () => {
     // The per-frame record (ADR-024), kept: what this sample decided before ADR-026.
     expect(FRAME_DECISIONS + HALF_APPLIED_BASE_DECISIONS).toBe(BASE_DECISIONS);
     expect(report.durable.normalizedDecisionContentSha256).toBe(CADENCE_NORMALIZED_DECISIONS);
-    expect(report.durable.normalizedCheckpointContentSha256).toBe(CADENCE_NORMALIZED_CHECKPOINTS);
+    expect(report.durable.normalizedCheckpointContentSha256).toBe(CKPT1_NORMALIZED_CHECKPOINTS);
+    expect(CKPT1_NORMALIZED_CHECKPOINTS).not.toBe(CADENCE_NORMALIZED_CHECKPOINTS);
     // `CADENCE-1`: every owed market not evaluated at a close is counted, and
     // no event lay 5 s behind the cadence clock.
     expect(report.health.loop["evaluationsCoalesced"]).toBeGreaterThan(0);
@@ -213,7 +240,7 @@ describe("the throughput harness on the committed 2,000-event sample", () => {
     // the cadence reads event time only (ADR-026 D6-D7).
     expect(report.durable.decisions).toBe(CADENCE_DECISIONS);
     expect(report.durable.normalizedDecisionContentSha256).toBe(CADENCE_NORMALIZED_DECISIONS);
-    expect(report.durable.normalizedCheckpointContentSha256).toBe(CADENCE_NORMALIZED_CHECKPOINTS);
+    expect(report.durable.normalizedCheckpointContentSha256).toBe(CKPT1_NORMALIZED_CHECKPOINTS);
     expect(report.framesSplit).toBe(0);
     // The sample's 2,000 burst envelopes span 3,345 ms of recorded time (it
     // said ~2.3 s until `CADENCE-1` r1, O09); a paced publication takes about

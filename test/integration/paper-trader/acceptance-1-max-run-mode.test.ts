@@ -118,7 +118,7 @@ describe("acceptance 1 — MAX_RUN_MODE=PAPER is enforced", () => {
       },
       store: {
         persistDecision: async () => ({ ok: true, value: null }),
-        saveCheckpoint: async () => ({ ok: true, value: null }),
+        persistDecisionWithCheckpoint: async () => ({ ok: true, value: null }),
         appendLedgerTransaction: async () => ({ ok: true, value: null }),
         writePnlSnapshot: async () => ({ ok: true, value: null }),
         replacePnlSnapshot: async () => ({ ok: true, value: null }),

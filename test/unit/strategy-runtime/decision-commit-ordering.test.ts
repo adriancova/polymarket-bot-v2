@@ -43,6 +43,7 @@ import {
   makeHarness,
   makeInput,
   makeStrategy,
+  owedCheckpointSeqs,
   RecordingSink,
   RecordingStore,
   type Harness,
@@ -81,11 +82,19 @@ function patchingStrategy(patch: () => Record<string, unknown>) {
   });
 }
 
-/** Every persisted decision has a checkpoint carrying the same sequence. */
+/**
+ * Records and checkpoints agree. `CKPT-1` re-pin (ADR-027 D1): this was "every
+ * persisted decision has a checkpoint carrying the same sequence". Now every
+ * persisted decision that OWES one (`owedCheckpointSeqs`, an oracle over the
+ * records alone — these strategies draw no randomness) has one carrying its
+ * sequence, no other decision has one, and the last checkpoint holds the fold
+ * of every persisted patch, so the durable record and the recoverable state
+ * still agree. Sequences are still unique and contiguous.
+ */
 function assertRecordsAndCheckpointsAgree(harness: Harness): void {
   const sequences = harness.sink.calls.map((call) => call.record.evaluationSeq);
   const checkpointSeqs = harness.store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq);
-  expect(checkpointSeqs).toEqual(sequences);
+  expect(checkpointSeqs).toEqual(owedCheckpointSeqs(harness.sink.calls));
   expect(new Set(sequences).size).toBe(sequences.length);
   expect(sequences).toEqual(sequences.map((_, index) => index));
 }
@@ -215,7 +224,7 @@ describe("a decision is never persisted before the state it depends on is final"
     expect(harness.runtime.instanceStatus()).toBe("PAUSED");
   });
 
-  it("INVARIANT: no strategy value makes evaluate() throw, and every persisted decision is checkpointed", () => {
+  it("INVARIANT: no strategy value makes evaluate() throw, and every persisted decision that owes a checkpoint has it", () => {
     const hostilePatches: ReadonlyArray<{ name: string; patch: () => Record<string, unknown> }> = [
       { name: "post-freeze proxy", patch: () => ({ nested: postFreezeProxy().proxy }) },
       {
@@ -336,7 +345,17 @@ describe("a decision is never persisted before the state it depends on is final"
   });
 
   it("INVARIANT: an evaluation that fails at CHECKPOINT has already consumed its sequence", () => {
-    const harness = makeHarness({ strategy: patchingStrategy(() => ({ count: 1 })) });
+    // `CKPT-1` re-pin: the patch now CHANGES the state at every evaluation
+    // (a counter). With the constant `{ count: 1 }` it used to return, the
+    // second decision changes nothing, owes no checkpoint under ADR-027 D1,
+    // and never reaches the failing store at all.
+    let count = 0;
+    const harness = makeHarness({
+      strategy: patchingStrategy(() => {
+        count += 1;
+        return { count };
+      }),
+    });
     expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
 
     harness.store.failNext = true;

@@ -41,7 +41,10 @@ import {
   MODEL_OUTPUTS_KEY,
   RawModelOutputsSchema,
 } from "../../../packages/strategy-runtime/src/parse-door.js";
-import { createStrategyInstanceRuntime } from "../../../packages/strategy-runtime/src/index.js";
+import {
+  createStrategyInstanceRuntime,
+  type EvaluationOutcome,
+} from "../../../packages/strategy-runtime/src/index.js";
 import {
   makeDefinition,
   makeHarness,
@@ -1064,6 +1067,12 @@ describe("the `modelOutputs` split: equivalent on a clean process, and no format
 // G2 — the honest-path bound, pinned to the BASE bytes
 // ---------------------------------------------------------------------------
 
+/**
+ * `CKPT-1`: the 9-stage honest run's outcome bytes under ADR-027 (measured on
+ * the `CKPT-1` candidate); the base value is reconstructed in the test.
+ */
+const CKPT1_NINE_STAGE_SHA256 = "23da29d6600ecd131d284ac515140b52aae3715adfc79a0ac098553fc35cbe69";
+
 describe("the honest path is byte-identical to base `53e9f62`", () => {
   it("a 9-stage run hashes to the value measured at base, before the door existed", () => {
     // Measured base→tip in a `/dev/shm` scratch pair: sha256
@@ -1105,18 +1114,45 @@ describe("the honest path is byte-identical to base `53e9f62`", () => {
         }),
       }),
     });
-    const lines: string[] = [];
-    lines.push(JSON.stringify(harness.runtime.evaluate(makeInput("onStart"))));
+    const outcomes: EvaluationOutcome[] = [];
+    outcomes.push(harness.runtime.evaluate(makeInput("onStart")));
     for (let i = 0; i < 6; i += 1) {
-      lines.push(JSON.stringify(harness.runtime.evaluate(makeInput("onFeatures"))));
+      outcomes.push(harness.runtime.evaluate(makeInput("onFeatures")));
     }
-    lines.push(JSON.stringify(harness.runtime.evaluate(makeInput("onMarketResolved"))));
-    lines.push(JSON.stringify(harness.runtime.evaluate(makeInput("onStop"))));
-    const text = lines.join("\n");
+    outcomes.push(harness.runtime.evaluate(makeInput("onMarketResolved")));
+    outcomes.push(harness.runtime.evaluate(makeInput("onStop")));
+    const text = outcomes.map((outcome) => JSON.stringify(outcome)).join("\n");
     expect(harness.sink.calls).toHaveLength(9);
-    expect(harness.store.checkpoints).toHaveLength(9);
-    expect(new TextEncoder().encode(text).length).toBe(7805);
-    expect(createHash("sha256").update(text, "utf8").digest("hex")).toBe(
+    // `CKPT-1` re-pin (ADR-027 D1). Two things moved, and ONLY these two:
+    //
+    // 1. every DECIDED outcome carries `checkpointTransitions` after its
+    //    `checkpoint` (the transitions that decided it);
+    // 2. `onMarketResolved` (sequence 7) is a no-change hold — no patch, no
+    //    draw, same status, same instant — so it owes no checkpoint: its
+    //    `checkpoint` is `null` and the store holds 8 checkpoints, not 9.
+    //
+    // The base bytes are RECONSTRUCTED below by undoing exactly those two
+    // differences, and must still hash to the value measured at base: so the
+    // record, decision and checkpoint bytes of the honest path did not move.
+    expect(harness.store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toEqual([0, 1, 2, 3, 4, 5, 6, 8]);
+    expect(new TextEncoder().encode(text).length).toBe(7759);
+    expect(createHash("sha256").update(text, "utf8").digest("hex")).toBe(CKPT1_NINE_STAGE_SHA256);
+    let previous: Record<string, unknown> | undefined;
+    const reconstructed = outcomes.map((outcome) => {
+      expect(outcome.kind).toBe("DECIDED");
+      if (outcome.kind !== "DECIDED") return "";
+      const { checkpointTransitions, ...rest } = outcome;
+      expect(checkpointTransitions.length === 0).toBe(rest.checkpoint === null);
+      const checkpoint =
+        rest.checkpoint === null
+          ? { ...previous, checkpointSeq: rest.record.evaluationSeq }
+          : (rest.checkpoint as unknown as Record<string, unknown>);
+      previous = checkpoint;
+      return JSON.stringify({ ...rest, checkpoint });
+    });
+    const baseText = reconstructed.join("\n");
+    expect(new TextEncoder().encode(baseText).length).toBe(7805);
+    expect(createHash("sha256").update(baseText, "utf8").digest("hex")).toBe(
       "fa9f1b6345939072599dfeaf9ddbb447cff7e2bf85fe8d9ee4993cc56f6c89d9",
     );
   });
@@ -1366,7 +1402,8 @@ describe("the bounded pollution battery: permission never varies and no throw es
       // The door's emission, for the reason `evaluateOnce` records.
       return JSON.stringify({
         record: outcome.record,
-        stateJson: outcome.checkpoint.stateJson,
+        // `CKPT-1`: a first decision is the START transition, so it has one.
+        stateJson: outcome.checkpoint?.stateJson,
       });
     };
     const clean = honestBytes();

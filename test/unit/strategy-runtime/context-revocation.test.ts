@@ -39,7 +39,7 @@ import type {
   SeededRandom,
   StrategyContext,
 } from "../../../packages/strategy-sdk/src/index.js";
-import { holdDecision, makeDefinition, makeInput, makeStrategy } from "./helpers.js";
+import { holdDecision, makeDefinition, makeInput, makeStrategy, restorePoint } from "./helpers.js";
 
 /** The seed the reviewer's transcript used. */
 const SEED = "1";
@@ -76,8 +76,11 @@ function newRuntime(sink: Retained, restoreFrom?: StrategyStateCheckpoint) {
     strategy: retainingStrategy(sink),
     run: { runId: "run-1", instanceId: "instance-1", configId: "config-1", runSeed: SEED },
   });
+  // `CKPT-1` (ADR-027 D2): a restore takes a restore point. The checkpoint
+  // here is the one written after `onStart`, the last decision when it is
+  // taken, so the highest durable sequence is its own.
   const created = createStrategyInstanceRuntime(
-    restoreFrom === undefined ? definition : { ...definition, restoreFrom },
+    restoreFrom === undefined ? definition : { ...definition, restoreFrom: restorePoint(restoreFrom) },
   );
   if (!created.ok) {
     throw new Error(`runtime creation refused: ${created.refusal.code}`);

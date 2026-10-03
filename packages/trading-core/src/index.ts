@@ -272,6 +272,7 @@ export {
   type CoreLoopOptions,
   type DecisionTrace,
   type LoopHealthSnapshot,
+  type OutboxEntry,
   type RetainedOrderState,
   type TraderVenue,
 } from "./loop.js";

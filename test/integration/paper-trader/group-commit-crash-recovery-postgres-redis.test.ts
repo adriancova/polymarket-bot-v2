@@ -21,11 +21,17 @@
  * ## What must hold after the crash
  *
  * - NO GAP, NO DUPLICATE: the crashed run's decisions carry
- *   `evaluation_seq` 0…k−1 with nothing missing, one checkpoint for each,
- *   and nothing of the in-flight batch;
- * - EQUAL TO THE UNINTERRUPTED RUN: those k decisions and k checkpoints are,
- *   column for column (ids and wall timestamps aside), the reference run's
- *   first k;
+ *   `evaluation_seq` 0…k−1 with nothing missing, and nothing of the
+ *   in-flight batch;
+ * - EQUAL TO THE UNINTERRUPTED RUN: those k decisions are, column for column
+ *   (ids and wall timestamps aside), the reference run's first k, and the
+ *   crashed run's checkpoints are exactly the reference run's checkpoints of
+ *   those k decisions. (`CKPT-1`, ADR-027: this said "one checkpoint for
+ *   each" and "k checkpoints". A checkpoint now follows only a decision that
+ *   changes the state, the status or the RNG, or starts, stops or heartbeats
+ *   the instance — on this sample 2 of the reference run's 4 decisions — so
+ *   the crashed prefix holds the reference's checkpoints whose sequence is
+ *   below k, and a decision and its checkpoint commit in one transaction.)
  * - THE POSITION AGREES: the consumer position stored in Redis is never
  *   before the end of A and never past a decision that is not durable. Every
  *   event before it has its decision durable. (`CADENCE-1`: it was exactly
@@ -454,12 +460,16 @@ describe("group commit survives a SIGKILL mid-batch (THROUGHPUT-1a)", () => {
 
     const crashed = await durableRows(crash.databaseUrl, crash.runId, mintedIds(crash.document));
     const k = crashed.decisions.length;
-    // No gap, no duplicate: 0…k−1, one checkpoint per decision.
+    // No gap, no duplicate: 0…k−1.
     expect(crashed.decisions.map((row) => row["seq"])).toEqual(Array.from({ length: k }, (_, index) => String(index)));
-    expect(crashed.checkpoints.map((row) => row["seq"])).toEqual(Array.from({ length: k }, (_, index) => String(index)));
-    // Equal to the uninterrupted run, column for column.
+    // Equal to the uninterrupted run, column for column. `CKPT-1` re-pin
+    // (ADR-027): the checkpoints are the reference's checkpoints of the first
+    // k decisions — no longer one per decision (the reference holds fewer
+    // checkpoints than decisions; see the header).
     expect(crashed.decisions).toEqual(referenceRows.decisions.slice(0, k));
-    expect(crashed.checkpoints).toEqual(referenceRows.checkpoints.slice(0, k));
+    expect(referenceRows.checkpoints.length).toBeLessThan(referenceRows.decisions.length);
+    expect(crashed.checkpoints).toEqual(referenceRows.checkpoints.filter((row) => Number(row["seq"]) < k));
+    expect(crashed.checkpoints.length).toBeGreaterThan(0);
     // The stored position agrees: never before the end of A, and never past a
     // decision that is not durable. `CADENCE-1` (ADR-026): it may now lie
     // INSIDE B — B's first frames, within 1 s of event time of A's last

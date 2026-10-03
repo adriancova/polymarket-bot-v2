@@ -199,12 +199,25 @@ export interface TraderStore {
    */
   persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>>;
   /**
+   * `CKPT-1` (ADR-027 D3) — writes one decision AND the checkpoint it owes in
+   * ONE transaction: both rows are durable, or neither is. The per-row path
+   * calls it for every decision that owes a checkpoint (ADR-027 Decision 1);
+   * a decision that owes none goes through {@link TraderStore.persistDecision}.
+   * There is no lone-checkpoint write: until `CKPT-1` a `saveCheckpoint`
+   * method wrote a checkpoint in its own autocommit, after its decision's, so
+   * a failure or crash between the two left a decision durable without its
+   * checkpoint (`DURABLE-1` LOW-3). The group commit
+   * ({@link GroupCommit}) keeps the same rule by staging a checkpoint in its
+   * decision's staging.
+   *
    * @param capturedAt the strict-UTC instant of the evaluation this checkpoint
    *   belongs to. §10.3's `state_checkpoints.captured_at` is NOT NULL and the
    *   checkpoint value itself carries no instant — the runtime reads no clock —
    *   so the loop supplies the one the evaluation used, not a wall-clock read.
    */
-  saveCheckpoint(
+  persistDecisionWithCheckpoint(
+    record: DecisionRecord,
+    telemetry: DecisionTelemetry,
     checkpoint: StrategyStateCheckpoint,
     capturedAt: string,
   ): Promise<PortResult<null>>;
@@ -245,8 +258,13 @@ export interface TraderStore {
 /**
  * `THROUGHPUT-1a` — one event's decisions and checkpoints, as the loop's
  * outbox drained them (decisions in evaluation order, then checkpoints in the
- * same order), each checkpoint with the instant `saveCheckpoint` would have
- * been given.
+ * same order), each checkpoint with the instant its row's `captured_at` takes.
+ *
+ * `CKPT-1` (ADR-027 D3): every checkpoint here follows a decision of THIS
+ * staging — the loop never stages a checkpoint apart from its decision — so a
+ * store that commits a staging in one transaction (as {@link GroupCommit}
+ * requires) makes each decision and its checkpoint durable together. Since
+ * ADR-027 a staging holds a checkpoint only for the decisions that owe one.
  */
 export interface StagedEvaluations {
   readonly decisions: readonly { readonly record: DecisionRecord; readonly telemetry: DecisionTelemetry }[];
@@ -266,8 +284,8 @@ export interface StagedEvaluations {
  *
  * - {@link GroupCommit.stage} is synchronous and does no I/O. It turns one
  *   event's rows into the exact column values `persistDecision` /
- *   `saveCheckpoint` would bind, or answers the failure those would have
- *   answered (then nothing of that event is staged);
+ *   `persistDecisionWithCheckpoint` would bind, or answers the failure those
+ *   would have answered (then nothing of that event is staged);
  * - {@link GroupCommit.commit} writes EVERYTHING staged, in stage order, in
  *   ONE database transaction, and resolves only once that transaction
  *   committed — or answers the failure, having committed nothing. Either way
@@ -310,12 +328,17 @@ export interface GroupCommit {
  * outbox makes the synchronous port throw — which the runtime turns into its
  * own `HALTED` outcome, which the loop turns into a latched halt. Nothing is
  * dropped on any path.
+ *
+ * `CKPT-1` (ADR-027 D3): the shape is one entry per decision, carrying the
+ * checkpoint it owes (or `undefined`), so a drain can never hand a store a
+ * decision without its owed checkpoint or a checkpoint without its decision.
+ * It was two parallel lists (`decisions`, `checkpoints`); the loop's
+ * `DecisionOutboxBuffer` is the implementation.
  */
 export interface DecisionOutbox {
-  readonly decisions: readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[];
-  readonly checkpoints: readonly StrategyStateCheckpoint[];
-  drain(): {
-    readonly decisions: readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[];
-    readonly checkpoints: readonly StrategyStateCheckpoint[];
-  };
+  drain(): readonly {
+    readonly record: DecisionRecord;
+    readonly telemetry: DecisionTelemetry;
+    readonly checkpoint: StrategyStateCheckpoint | undefined;
+  }[];
 }
