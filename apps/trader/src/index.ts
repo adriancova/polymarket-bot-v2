@@ -175,6 +175,8 @@ export {
   type FeedMark,
   type GroupCommit,
   type StagedEvaluations,
+  type DispatchPosition,
+  type RiskRefusalRecord,
 } from "@polymarket-bot/trading-core";
 
 export {

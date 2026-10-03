@@ -43,7 +43,7 @@ import type {
 } from "@polymarket-bot/strategy-runtime";
 
 import type { RealizedPnlBook } from "@polymarket-bot/trading-core";
-import type { PortResult, TraderStore } from "@polymarket-bot/trading-core";
+import type { PortResult, RiskRefusalRecord, TraderStore } from "@polymarket-bot/trading-core";
 
 /** A `TraderStore` that records every ACCEPTED PnL snapshot's realized PnL in `book`. */
 export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): TraderStore {
@@ -53,6 +53,10 @@ export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): T
     },
     saveCheckpoint(checkpoint: StrategyStateCheckpoint, capturedAt: string): Promise<PortResult<null>> {
       return store.saveCheckpoint(checkpoint, capturedAt);
+    },
+    // `PROVENANCE-1`: refusals pass through untouched, like decisions.
+    persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>> {
+      return store.persistRiskRefusal(refusal);
     },
     appendLedgerTransaction(transaction: AppendedLedgerTransaction): Promise<PortResult<null>> {
       return store.appendLedgerTransaction(transaction);

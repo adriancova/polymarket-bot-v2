@@ -77,6 +77,7 @@ class MemoryGroupCommit implements GroupCommit {
         await this.#store.saveCheckpoint(entry.checkpoint, entry.capturedAt);
         checkpoints += 1;
       }
+      for (const refusal of event.riskRefusals) await this.#store.persistRiskRefusal(refusal);
     }
     this.batches.push(batch.length);
     return portOk({ decisions, checkpoints });
@@ -118,6 +119,7 @@ function assembleGroupCommitting(): GroupCommitRun {
           guard("pnl-replace");
           return inner.replacePnlSnapshot(snapshot);
         },
+        persistRiskRefusal: (refusal) => inner.persistRiskRefusal(refusal),
         close: () => inner.close(),
         groupCommit: created,
       };

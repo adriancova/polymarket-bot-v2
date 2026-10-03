@@ -37,7 +37,7 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | --- | --- |
 | `scenario` | the identities, sizes, prices and fee schedule `test/e2e/support/scenario.ts` states |
 | `events` | the eight recorded §7.1 events, by id and ingest sequence |
-| `decisions` | every PERSISTED `DecisionRecord`, as it reached the durable-store port |
+| `decisions` | every PERSISTED `DecisionRecord`, as it reached the durable-store port — since golden format 4 (`PROVENANCE-1`) with its triggering event's dispatch position, `sourceGatewayEpoch` and `sourceIngestSeq` |
 | `checkpointInstants` | one per persisted decision, at the evaluation's own instant |
 | `traces` | the §6 invariant 4 chains the run produced — one per FILL, so an order that never filled is on none |
 | `orderProvenance` | every order's §6 invariant 4 trace PREFIX as the loop recorded it at SUBMISSION (`CoreLoop.orderProvenance()`), filled or not, in submission order — golden format 2 (`RECON-2`) |
@@ -47,6 +47,36 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `ledgerProjection` | the §6 invariant 8 fold: balances, virtual positions, and the two "nothing unexplained" counts |
 | `health` | every §14.3-shaped counter the run moved, plus `accounting.realizedPnl` (below), and — golden format 3 (`TRDR-4`) — `seams.orders` (the loop's per-order state: `tracked`, `settled`, the settled-order tombstones, `unownedFills`, `lateFillsAfterSettlement`, `settleMismatches`) and `seams.retention` (`retained / maximumRetained / evicted` for the decision, trace and provenance logs — all `evicted: 0` here, which PINS that this fixture evicts nothing) |
 | `reconciliation` | the projected-vs-realized table, with each difference's named mechanism |
+
+### The `PROVENANCE-1` regeneration (golden format 4): each decision carries its dispatch position
+
+`H1R1-PROVENANCE`: the loop gave a decision's `sourceEvent` only the
+triggering event's `eventId`, so every persisted decision's `gateway_epoch`
+and `ingest_seq` were NULL, and the research worker's durable dispatch
+frontier (ADR-028 Decision 2.3) had nothing to read. The loop now copies the
+envelope's own §7.1 `gatewayEpoch` and `ingestSeq` beside the `eventId`
+(`packages/trading-core/src/loop.ts`, `dispatchPositionOf`), and the artefact
+records both on each decision as `sourceGatewayEpoch` / `sourceIngestSeq`
+(`test/e2e/support/artifact.ts`).
+
+The regeneration — ONCE per file, with `WP250_WRITE_GOLDEN`, from the
+committed base bytes — moved exactly this and nothing else, checked
+mechanically against the base files:
+
+- every top-level section except `decisions` and `goldenFormatVersion`
+  (`3 → 4`) is byte-identical — `health`, `traces`, `orderProvenance`,
+  `ledgerTransactions`, `pnlSnapshots` and `reconciliation` included;
+- every decision, with its two new keys removed, is identical to base's
+  decision at the same position (12 in `paper-e2e-run.json`, 19 in
+  `two-brackets-run.json`);
+- a decision with a `sourceEventId` has `sourceGatewayEpoch` equal to the
+  scenario's epoch (`018f5c20-5000-7a50-8b00-000000000005`) and
+  `sourceIngestSeq` equal to the `ingestSeq` the `events` section records for
+  that event (5 of 12 and 8 of 19); a decision without one (`onFill`,
+  `onOrderUpdate`, which the loop originates) has `null` for both.
+
+The two fresh in-suite runs of each scenario remain byte-identical, so the
+position is deterministic under replay.
 
 ### The `TRDR-4` regeneration (golden format 3): terminal order views are evaluated once
 

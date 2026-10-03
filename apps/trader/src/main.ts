@@ -21,6 +21,7 @@
  * 4b. startTraderHealthServer(...)       ← TRDR-3: GET /health over the loopback, if configured
  * 5. pump                                ← §8.1's outer loop
  * 5b. checkAccountingRebuild("SHUTDOWN") ← FOLD-1: §6 invariant 8's rebuild, run once the pump stops
+ * 5c. recordHaltsBeforeExit(...)         ← PROVENANCE-1: every latched halt to ops.incidents, bounded
  * ```
  *
  * Step 1 runs on the ENVIRONMENT RECORD before a configuration file is opened,
@@ -104,6 +105,17 @@
  *   of which waits on Redis. An idle stream never trips it: an idle poll is
  *   answered in milliseconds.
  *
+ * ## The durable halt record (`PROVENANCE-1`)
+ *
+ * Once the pump has stopped on a halt (and the shutdown rebuild check has
+ * run, which can latch one more), every latched halt is written to
+ * `ops.incidents` before anything is closed (`halt-record.ts`). The write is
+ * bounded by `HALT_RECORD_DEADLINE_MS` and never changes the exit code: a
+ * database that refuses it, or does not answer within the bound, is logged
+ * (`HALT RECORD NOT DURABLE` / `UNCONFIRMED`) and the process still exits
+ * {@link EXIT_CODES.halted}. Nothing trades after the halt either way; the
+ * record is for the operator and the research worker afterwards.
+ *
  * ## The two-phase venue wiring, and why it is not a smell
  *
  * The simulated venue asks the composition root two questions it cannot answer
@@ -150,6 +162,7 @@ import {
   type HealthListen,
   type RunningTraderHealthServer,
 } from "./health-server.js";
+import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
@@ -264,7 +277,8 @@ export async function startup(ports: StartupPorts): Promise<number> {
       "outage latches a GLOBAL TRANSPORT_UNAVAILABLE halt within that bound of the first command it " +
       `leaves unanswered, and the process exits ${String(EXIT_CODES.halted)} at most ` +
       `${String(2 * responseTimeoutMs)} ms after the halt (one bound for each connection's courtesy ` +
-      "QUIT) plus the PostgreSQL close (§4.2)",
+      `QUIT) plus the durable halt record (at most ${String(HALT_RECORD_DEADLINE_MS)} ms) and the ` +
+      "PostgreSQL close (§4.2)",
   );
 
   // --- 3. infrastructure ----------------------------------------------------
@@ -400,6 +414,16 @@ export async function startup(ports: StartupPorts): Promise<number> {
   }
   ports.log(`health: ${JSON.stringify(health)}`);
 
+  // `PROVENANCE-1` (`OUT1-R1-HALT-NOT-DURABLE`): every latched halt, written
+  // to `ops.incidents` BEFORE anything is closed, bounded, and never changing
+  // the exit code below (`halt-record.ts`).
+  await recordHaltsBeforeExit({
+    halts: health.halts,
+    config,
+    write: (rows, deadlineMs) => store.recordHalts(rows, deadlineMs),
+    log: ports.log,
+  });
+
   transportLag.stop();
   await healthServer?.close();
   await feed.close();
@@ -482,11 +506,29 @@ export async function assembleDurableTrader(
     return { ok: false, code: EXIT_CODES.unsafeEnvironment };
   }
 
-  const database = createDatabase(createPostgresPool({ connectionString: options.postgresUrl }));
+  const pool = createPostgresPool({ connectionString: options.postgresUrl });
+  // `PROVENANCE-1`: node-postgres re-emits an IDLE pooled connection's error
+  // (the server terminated it: a restart, `pg_terminate_backend`, a dropped
+  // link) on the pool, and an 'error' event nobody listens to is an uncaught
+  // exception — measured: the process died with exit 1, before any halt was
+  // latched or logged. It is a PostgreSQL outage (§4.2), so once the trader
+  // exists it latches GLOBAL `STORE_UNAVAILABLE` like any failed write, the
+  // pump stops, and the process exits `halted` (75) after trying to record
+  // the halt. Before the trader exists it is logged; the registration check's
+  // own query then meets the outage and refuses.
+  let onPoolError = (error: Error): void => {
+    log(`STORE CONNECTION LOST before the trader was assembled: ${describeError(error)}`);
+  };
+  pool.on("error", (error: Error) => {
+    onPoolError(error);
+  });
+  const database = createDatabase(pool);
   const store = new PostgresTraderStore({
     db: database,
     // §7.5's contract version, as `strategy.definitions` pins it.
     decisionContractVersion: 1,
+    // `PROVENANCE-1`: the account its `ops.risk_events` rows name.
+    accountRef: config.accounting.accountRef,
   });
   // The realized-PnL book the health surface reads (`TRDR-3`): every PnL
   // snapshot the store ACCEPTS is recorded here by the decorator the trader is
@@ -558,6 +600,13 @@ export async function assembleDurableTrader(
     return { ok: false, code: EXIT_CODES.configurationRefused };
   }
   wiring.trader = created.trader;
+  onPoolError = (error) => {
+    const detail =
+      `the PostgreSQL connection pool lost an idle connection (${describeError(error)}); §4.2 makes a ` +
+      "PostgreSQL outage a trading halt — no decision may be made while the durable store may be unreachable";
+    log(`STORE CONNECTION LOST: ${detail}`);
+    created.trader.halts.halt({ kind: "GLOBAL" }, "STORE_UNAVAILABLE", detail, created.trader.loop.health().asOf);
+  };
   created.trader.health.attachRealizedPnl(realizedPnl);
   for (const row of created.trader.manifest) {
     log(

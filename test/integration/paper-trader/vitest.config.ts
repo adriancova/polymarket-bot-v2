@@ -143,6 +143,14 @@ export default defineConfig({
       pkg("polymarket-public", "packages/polymarket-public/src/index.ts"),
       pkg("binance-adapter", "packages/binance-adapter/src/index.ts"),
       pkg("coinbase-adapter/testing", "packages/coinbase-adapter/src/testing/index.ts"),
+      // `PROVENANCE-1`: `provenance-retention-postgres-redis.test.ts` runs the
+      // REAL research-worker storage cycle (`storageMain`) over the rows the
+      // real trader wrote, and the halt/refusal file reads them through the
+      // worker's own read-only evidence adapter. The same rows are carried in
+      // `tsconfig.json`.
+      pkg("research-worker", "apps/research-worker/src/index.ts"),
+      pkg("storage-parquet/testing", "packages/storage-parquet/src/testing/index.ts"),
+      pkg("storage-parquet", "packages/storage-parquet/src/index.ts"),
     ],
   },
   test: {

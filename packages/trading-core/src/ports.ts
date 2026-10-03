@@ -132,6 +132,50 @@ export interface FeedMark {
 }
 
 /**
+ * `PROVENANCE-1` — where an evaluation's triggering event lies in the
+ * gateway's dispatch order: the §7.1 envelope's own `eventId`, `gatewayEpoch`
+ * and `ingestSeq`, copied from the envelope and never derived.
+ *
+ * §7.1: "`gatewayEpoch + ingestSeq` defines the exact order consumed during
+ * one gateway epoch." A decision that carries it can be placed in that order
+ * without a join through the event id, which is what the research worker's
+ * durable dispatch frontier reads (ADR-028 Decision 2.3; `H1R1-PROVENANCE`).
+ */
+export interface DispatchPosition {
+  readonly eventId: string;
+  readonly gatewayEpoch: string;
+  readonly ingestSeq: string;
+}
+
+/**
+ * `PROVENANCE-1` — one intent the §9.8 pre-trade risk check REFUSED, as the
+ * loop saw it: the persisted decision that emitted it, the refusals, and the
+ * evaluation's instant and dispatch position.
+ *
+ * Every field is the loop's own data at the refusal; nothing is read from a
+ * clock. `ops.risk_events` is its table (`apps/trader`'s adapter binds one row
+ * per refusal), and it is what the research worker reads as a window's refusal
+ * evidence (ADR-028 Decision 3.1).
+ */
+export interface RiskRefusalRecord {
+  readonly runId: string;
+  readonly instanceId: string;
+  readonly marketId: string;
+  /** The persisted decision that emitted the refused intent. */
+  readonly evaluationSeq: number;
+  /** The strategy's own `intentId` (§7.7); `""` for an id-less intent. */
+  readonly intentId: string;
+  /** The loop's protective-exit classification of the intent (`risk.refusedExits`). */
+  readonly protectiveExit: boolean;
+  /** The strict-UTC instant of the evaluation the decision was made at. */
+  readonly occurredAt: string;
+  /** Every refusal the check answered, in its order (never empty). */
+  readonly refusals: readonly { readonly code: string; readonly message: string }[];
+  /** The decision's triggering event, or `null` for a loop-originated evaluation. */
+  readonly sourceEvent: DispatchPosition | null;
+}
+
+/**
  * The durable store the process writes through (§10, PostgreSQL).
  *
  * §6 invariant 3 makes exactly one persisted `DecisionResult` per callback the
@@ -145,6 +189,15 @@ export interface TraderStore {
     record: DecisionRecord,
     telemetry: DecisionTelemetry,
   ): Promise<PortResult<null>>;
+  /**
+   * `PROVENANCE-1`: records one refused intent ({@link RiskRefusalRecord}).
+   * The loop writes it with the event's other rows — through the group commit
+   * when the store has one ({@link StagedEvaluations.riskRefusals}), otherwise
+   * here, after the event's decisions and checkpoints — and never after a
+   * store failure it has halted on. A failure is a store failure like any
+   * other: the loop halts `STORE_UNAVAILABLE`.
+   */
+  persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>>;
   /**
    * @param capturedAt the strict-UTC instant of the evaluation this checkpoint
    *   belongs to. §10.3's `state_checkpoints.captured_at` is NOT NULL and the
@@ -198,6 +251,12 @@ export interface TraderStore {
 export interface StagedEvaluations {
   readonly decisions: readonly { readonly record: DecisionRecord; readonly telemetry: DecisionTelemetry }[];
   readonly checkpoints: readonly { readonly checkpoint: StrategyStateCheckpoint; readonly capturedAt: string }[];
+  /**
+   * `PROVENANCE-1`: the event's refused intents, written in the same
+   * transaction as the rows staged with them — so no decision of a LATER
+   * event becomes durable before them (the commit chain is in stage order).
+   */
+  readonly riskRefusals: readonly RiskRefusalRecord[];
 }
 
 /**
