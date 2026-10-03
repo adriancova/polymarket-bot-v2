@@ -144,3 +144,7 @@ export type {
   PnlTradeRecord,
   PostingAccounts,
 } from "./fill-posting.js";
+
+// WP-290: account reconciliation's ledger half (break taxonomy, append-only
+// journal, holdings and UNATTRIBUTED corrections; handoff §9.17, §10.6).
+export * from "./reconciliation/index.js";

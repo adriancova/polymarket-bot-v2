@@ -112,3 +112,6 @@ export {
   type Side,
   type SubmissionReport,
 } from "./order-manager.js";
+
+// WP-290: the reconciliation coordinator (handoff §9.17).
+export * from "./reconciliation/index.js";
