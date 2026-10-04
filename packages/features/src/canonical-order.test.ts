@@ -12,8 +12,10 @@
  * - One `expect()` per value cost about 5.5 µs, against about 0.9 µs for the
  *   `compareDecimal` oracle itself: some 85% of the two single-value tests and
  *   of the 50,000 sampled pairs. Each loop now compares the same two answers
- *   with `!==`, collects every disagreement, and asserts once that there is
- *   none. Every value and every pair is still checked against the oracle.
+ *   with `toBe`'s own equality, `Object.is` ({@link sameAsToBe}), collects
+ *   every disagreement, and asserts once that there is none. Every value and
+ *   every pair is still checked against the oracle, as strictly as `toBe`
+ *   checked it: `-0` is not `+0` (`FLAKES1-R1-01`).
  * - The exhaustive pair sweep is about 1,000,000 oracle calls. That cost IS the
  *   check, so it keeps every call and gets an explicit, measured budget
  *   instead ({@link EXHAUSTIVE_PAIR_BUDGET_MS}).
@@ -109,6 +111,42 @@ function disagree(found: Disagreements, detail: string): void {
   if (found.first.length < 20) found.first.push(detail);
 }
 
+/**
+ * `toBe`'s own equality, `Object.is` (`FLAKES1-R1-01`). Unlike `!==`, it tells
+ * `-0` from `+0`: a comparator answering `-0` where `compareDecimal` answers
+ * `0` is a disagreement here, as it was under `toBe`.
+ */
+function sameAsToBe(answer: unknown, oracle: unknown): boolean {
+  return Object.is(answer, oracle);
+}
+
+/** `String(value)`, except that `-0` is spelled `-0` (`String(-0)` is `"0"`). */
+function spell(value: unknown): string {
+  return Object.is(value, -0) ? "-0" : String(value);
+}
+
+/**
+ * The 50,000 seeded pairs over `unit`, each answer checked against
+ * `compareDecimal` with `toBe`'s equality. `compare` is a parameter only so
+ * that the `FLAKES1-R1-01` pin can run this very loop against a comparator
+ * that answers `-0`.
+ */
+function sampledPairDisagreements(
+  compare: (left: string, right: string) => number,
+  unit: readonly string[],
+): Disagreements {
+  const random = prng(7);
+  const found = noDisagreements();
+  for (let index = 0; index < 50_000; index += 1) {
+    const left = unit[Math.floor(random() * unit.length)] ?? "0";
+    const right = unit[Math.floor(random() * unit.length)] ?? "0";
+    const answer = compare(left, right);
+    const oracle = compareDecimal(left, right);
+    if (!sameAsToBe(answer, oracle)) disagree(found, `${left} vs ${right}: ${spell(answer)}, oracle ${spell(oracle)}`);
+  }
+  return found;
+}
+
 describe("canonical-order: exact string answers to compareDecimal", () => {
   it("covers a non-trivial exhaustive space", () => {
     expect(SHORT.length).toBeGreaterThan(10_000);
@@ -122,7 +160,7 @@ describe("canonical-order: exact string answers to compareDecimal", () => {
     for (const value of ALL) {
       const oracle = compareDecimal(value, "0") > 0;
       const answer = isPositiveCanonical(value);
-      if (answer !== oracle) disagree(found, `${value}: ${String(answer)}, oracle ${String(oracle)}`);
+      if (!sameAsToBe(answer, oracle)) disagree(found, `${value}: ${spell(answer)}, oracle ${spell(oracle)}`);
     }
     expect(found).toStrictEqual(noDisagreements());
   });
@@ -132,7 +170,7 @@ describe("canonical-order: exact string answers to compareDecimal", () => {
     for (const value of ALL) {
       const oracle = compareDecimal(value, "1") <= 0;
       const answer = isAtMostOneCanonical(value);
-      if (answer !== oracle) disagree(found, `${value}: ${String(answer)}, oracle ${String(oracle)}`);
+      if (!sameAsToBe(answer, oracle)) disagree(found, `${value}: ${spell(answer)}, oracle ${spell(oracle)}`);
     }
     expect(found).toStrictEqual(noDisagreements());
   });
@@ -149,15 +187,27 @@ describe("canonical-order: exact string answers to compareDecimal", () => {
         }
       }
     }
-    const random = prng(7);
-    const found = noDisagreements();
-    for (let index = 0; index < 50_000; index += 1) {
-      const left = unit[Math.floor(random() * unit.length)] ?? "0";
-      const right = unit[Math.floor(random() * unit.length)] ?? "0";
-      const answer = compareCanonicalUnitInterval(left, right);
-      const oracle = compareDecimal(left, right);
-      if (answer !== oracle) disagree(found, `${left} vs ${right}: ${String(answer)}, oracle ${String(oracle)}`);
-    }
-    expect(found).toStrictEqual(noDisagreements());
+    expect(sampledPairDisagreements(compareCanonicalUnitInterval, unit)).toStrictEqual(noDisagreements());
   }, EXHAUSTIVE_PAIR_BUDGET_MS);
+
+  it("FLAKES1-R1-01 pin: the collected checks tell -0 from +0, as toBe does", () => {
+    expect(sameAsToBe(-0, 0)).toBe(false);
+    expect(sameAsToBe(0, -0)).toBe(false);
+    expect(sameAsToBe(0, 0)).toBe(true);
+    expect(sameAsToBe(-1, -1)).toBe(true);
+    expect(sameAsToBe(1, true)).toBe(false);
+    expect(spell(-0)).toBe("-0");
+    expect(spell(0)).toBe("0");
+    // The very loop the pair test runs, against the real comparator with its
+    // equal answer turned into -0: it reports disagreements, and each one it
+    // spells out is an answer of -0 against the oracle's 0.
+    const unit = ALL.filter((value) => compareDecimal(value, "1") <= 0);
+    const negativeZero = (left: string, right: string): number => {
+      const answer = compareCanonicalUnitInterval(left, right);
+      return answer === 0 ? -0 : answer;
+    };
+    const found = sampledPairDisagreements(negativeZero, unit);
+    expect(found.count).toBeGreaterThan(0);
+    for (const detail of found.first) expect(detail).toMatch(/: -0, oracle 0$/);
+  });
 });
