@@ -70,9 +70,13 @@ import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-post
 
 import { PostgresTraderHaltSource, TRADER_HALT_READ_TIMEOUT_MAX_MS } from "../../../apps/control-api/src/adapters/postgres-trader-halts.js";
 import {
+  EXIT_CODES,
+  TRADER_HALTS_APPLICATION_NAME,
   TRADER_HALTS_CLOSE_WAIT_MS,
   TRADER_HALTS_DATABASE_URL_ENV,
   TRADER_HALTS_TERMINATE_WAIT_MS,
+  planTraderHalts,
+  redactDatabaseUrl,
   startup,
 } from "../../../apps/control-api/src/main.js";
 import { HALT_INCIDENT_KEYS, haltIncidentRows } from "../../../apps/trader/src/halt-record.js";
@@ -82,6 +86,7 @@ import {
   SAFE_PAPER_ENVIRONMENT,
   buildShippedBundle,
   removeBundle,
+  runShippedBundle,
   startShippedBundle,
   type BuiltBundle,
 } from "./support/shipped-bundle.js";
@@ -310,12 +315,23 @@ async function closedPort(): Promise<number> {
 /**
  * A loopback "PostgreSQL" that asks for the password in clear and then
  * refuses the login with an error that ECHOES it — the worst a driver error
- * can do with a credential. The composition must redact it.
+ * can do with a credential. The composition must redact it. `received()` is
+ * every password the driver sent, in order (`CONTROL2-R2-C1`: what the driver
+ * ACTUALLY sends, not what a reading of the URL expects), and `connections()`
+ * how many connections it was opened.
  */
-async function echoingPostgres(): Promise<{ readonly port: number; readonly close: () => Promise<void> }> {
+async function echoingPostgres(): Promise<{
+  readonly port: number;
+  readonly received: () => readonly string[];
+  readonly connections: () => number;
+  readonly close: () => Promise<void>;
+}> {
   const field = (code: string, value: string): Buffer => Buffer.concat([Buffer.from(code, "latin1"), Buffer.from(`${value}\0`, "utf8")]);
   const sockets = new Set<Socket>();
+  const received: string[] = [];
+  let connections = 0;
   const server = createServer((socket) => {
+    connections += 1;
     sockets.add(socket);
     socket.on("error", () => undefined);
     let buffer = Buffer.alloc(0);
@@ -334,7 +350,9 @@ async function echoingPostgres(): Promise<{ readonly port: number; readonly clos
         socket.write(ask);
       }
       if (buffer.length < 5 || buffer[0] !== 0x70 || buffer.length < 1 + buffer.readInt32BE(1)) return;
+      // The PasswordMessage's body, without its terminating NUL: what the driver sent.
       const password = buffer.subarray(5, buffer.readInt32BE(1)).toString("utf8");
+      received.push(password);
       const fields = Buffer.concat([
         field("S", "FATAL"),
         field("V", "FATAL"),
@@ -352,6 +370,8 @@ async function echoingPostgres(): Promise<{ readonly port: number; readonly clos
   const address = server.address();
   return {
     port: typeof address === "object" && address !== null ? address.port : 0,
+    received: () => [...received],
+    connections: () => connections,
     close: async () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
@@ -417,15 +437,32 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
   });
 
   /**
-   * Runs `startup()` serving, with `traderHalts` and `env`; returns its log, its port, and a stop that
-   * waits up to `stopWaitMs` for "control API stopped.". `traderHealth` defaults to `none`; `exit` is the
-   * `CTL2-L2` port (absent: nothing is told to exit, as before).
+   * Runs `startup()` serving, with `traderHalts` and `env`, and asserts it started; returns its log, its
+   * port, and a stop that waits up to `stopWaitMs` for "control API stopped.". `traderHealth` defaults
+   * to `none`; `exit` is the `CTL2-L2` port (absent: nothing is told to exit, as before).
    */
   async function started(
     traderHalts: unknown,
     env: Record<string, string | undefined>,
     extra: { readonly traderHealth?: unknown; readonly exit?: (code: number) => void } = {},
   ): Promise<{ readonly lines: string[]; readonly port: number; readonly stop: (stopWaitMs?: number) => Promise<void> }> {
+    const run = await launched(traderHalts, env, extra);
+    expect(run.code, run.lines.join("\n")).toBe(0);
+    expect(run.port).toBeGreaterThan(0);
+    return run;
+  }
+
+  /** {@link started}, without asserting that it started: also its exit code (`CONTROL2-R2-C1`). */
+  async function launched(
+    traderHalts: unknown,
+    env: Record<string, string | undefined>,
+    extra: { readonly traderHealth?: unknown; readonly exit?: (code: number) => void } = {},
+  ): Promise<{
+    readonly code: number;
+    readonly lines: string[];
+    readonly port: number;
+    readonly stop: (stopWaitMs?: number) => Promise<void>;
+  }> {
     directory = await mkdtemp(join(tmpdir(), "ctl2-control-api-"));
     const configPath = join(directory, "control-api.json");
     await writeFile(
@@ -457,11 +494,10 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
       },
       { serve: true },
     );
-    expect(code, lines.join("\n")).toBe(0);
     const listening = lines.find((line) => line.startsWith("control API listening on 127.0.0.1:"));
     const port = Number(/127\.0\.0\.1:(\d+)/u.exec(listening ?? "")?.[1] ?? "0");
-    expect(port).toBeGreaterThan(0);
     return {
+      code,
       lines,
       port,
       stop: async (stopWaitMs = 2_000) => {
@@ -557,6 +593,37 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
     } finally {
       await run.stop();
       await echoing.close();
+    }
+  }, 30_000);
+
+  it("CONTROL2-R2-C1: through the shipped startup() and HTTP — a URL the driver would rewrite is REFUSED (78) before any connection, and what the driver would have sent is printed nowhere", async () => {
+    // Each fake password with the one the driver sends for it (measured below, `driverSends`): at
+    // 01f23a9 both URLs were admitted, and /v1/health carried the second column from the echoing server.
+    for (const [password, driverWouldSend] of [
+      ["Fake%2FSecret Word-ctl2-r2", "Fake%2FSecret Word-ctl2-r2"],
+      ["Ec%41%zz-nac-ctl2-r2", "EcA%zz-nac-ctl2-r2"],
+    ] as const) {
+      const echoing = await echoingPostgres();
+      const url = `postgres://halt_reader:${password}@127.0.0.1:${String(echoing.port)}/polymarket_bot`;
+      const run = await launched({ kind: "postgres", timeoutMs: 2_000 }, { [TRADER_HALTS_DATABASE_URL_ENV]: url });
+      const bodies: string[] = [];
+      try {
+        // Were it admitted, this is where the password would surface.
+        if (run.code === EXIT_CODES.ok) {
+          bodies.push((await get(run.port, "/v1/health")).body, (await get(run.port, "/v1/metrics")).body);
+        }
+      } finally {
+        if (run.code === EXIT_CODES.ok) await run.stop();
+        await echoing.close();
+      }
+      for (const text of [...bodies, run.lines.join("\n")]) {
+        for (const secret of [driverWouldSend, password, ...echoing.received()]) expect(text, password).not.toContain(secret);
+      }
+      expect(run.code, password).toBe(EXIT_CODES.configurationRefused);
+      expect(run.lines.join("\n")).toContain("[CONTROL_TRADER_HALTS_URL_ENCODING]");
+      expect(run.lines.join("\n")).not.toContain("control API listening");
+      // Refused before any pool: the database was never reached.
+      expect(echoing.connections(), password).toBe(0);
     }
   }, 30_000);
 
@@ -665,6 +732,86 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
   }, 30_000);
 });
 
+describe("CONTROL2-R2-C1: the password the REAL driver sends, for a URL planTraderHalts admits, is the one redacted", () => {
+  const POSTGRES = { kind: "postgres", timeoutMs: 2_000 } as const;
+
+  /** `text` percent-decoded, or as written when it does not decode. */
+  const decoded = (text: string): string => {
+    try {
+      return decodeURIComponent(text);
+    } catch {
+      return text;
+    }
+  };
+
+  it("each admitted URL: the driver sends the authority's password percent-decoded, and its echo is <redacted>; each refused rewrite form: the driver, handed it directly, sends a password that is neither the URL's as written nor its decoding", async () => {
+    const echoing = await echoingPostgres();
+    const at = (password: string): string => `postgres://halt_reader:${password}@127.0.0.1:${String(echoing.port)}/polymarket_bot`;
+    /** What the driver sends for `url`, and the error it reports, through a pool made as `main.ts` makes it. */
+    const driverSends = async (url: string): Promise<{ readonly sent: string | undefined; readonly error: string }> => {
+      const before = echoing.received().length;
+      const pool = createPostgresPool({
+        connectionString: url,
+        maxConnections: 1,
+        connectionTimeoutMs: 5_000,
+        applicationName: TRADER_HALTS_APPLICATION_NAME,
+      });
+      pool.on("error", () => undefined);
+      let error = "";
+      try {
+        const client = await pool.connect();
+        client.release();
+      } catch (cause) {
+        error = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+      }
+      await pool.end();
+      return { sent: echoing.received()[before], error };
+    };
+    try {
+      let admitted = 0;
+      for (const password of [
+        "Zq7-plain-ctl2-r2",
+        "p%40ss%2Fword-ctl2-r2",
+        "sp%20ace%41-ctl2-r2",
+        "%C3%A9t%C3%A9-ctl2-r2",
+        "100%25-ctl2-r2",
+        "semi;colon=eq-ctl2-r2",
+        "%2F%2f%3A%41%7E-ctl2-r2",
+      ]) {
+        const url = at(password);
+        expect(planTraderHalts(POSTGRES, url).ok, password).toBe(true);
+        const { sent, error } = await driverSends(url);
+        // The driver read the URL as written: what it sent is the authority's password, decoded.
+        expect(sent, password).toBe(decodeURIComponent(new URL(url).password));
+        expect(error, password).toContain(`this server echoes the password it was sent: ${sent ?? "(nothing)"}`);
+        const redacted = redactDatabaseUrl(error, url);
+        expect(redacted, password).toContain("this server echoes the password it was sent: <redacted>");
+        expect(redacted, password).not.toContain(sent ?? "(nothing)");
+        admitted += 1;
+      }
+      expect(admitted).toBe(7);
+
+      // The verifiers' two forms, and a third mixing both escapes: each REFUSED — and the positive
+      // control: the driver, handed it directly, sends what the URL holds neither as written nor decoded.
+      for (const [password, driverSent] of [
+        ["Fake%2FSecret Word-ctl2-r2", "Fake%2FSecret Word-ctl2-r2"],
+        ["Ec%41%zz-nac-ctl2-r2", "EcA%zz-nac-ctl2-r2"],
+        ["Ec%2F%41 x-ctl2-r2", "Ec%2FA x-ctl2-r2"],
+      ] as const) {
+        const url = at(password);
+        const plan = planTraderHalts(POSTGRES, url);
+        expect(plan.ok ? "ADMITTED" : plan.code, password).toBe("CONTROL_TRADER_HALTS_URL_ENCODING");
+        const { sent } = await driverSends(url);
+        expect(sent, password).toBe(driverSent);
+        const written = new URL(url).password;
+        expect([written, decoded(written)], password).not.toContain(sent);
+      }
+    } finally {
+      await echoing.close();
+    }
+  }, 60_000);
+});
+
 describe("CONTROL-2 r1 (S1): the PAGE rule and the operations panel read the platform's trader-halt families", () => {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
   const rules = readFileSync(resolve(repoRoot, "infra/prometheus/trader-alerts.yaml"), "utf8")
@@ -748,7 +895,7 @@ describe("CONTROL-2 r1 (S1): the PAGE rule and the operations panel read the pla
   });
 });
 
-describe("CTL2-L2: the SHIPPED bundle, run with node, exits on SIGTERM while a frozen database holds its connection", () => {
+describe("the SHIPPED bundle, run with node: CTL2-L2 (SIGTERM exits while a frozen database and a silent trader hold it) and CONTROL2-R2-C1 (a URL the driver would rewrite is refused)", () => {
   let bundle: BuiltBundle | undefined;
   let directory = "";
   beforeAll(async () => {
@@ -760,8 +907,8 @@ describe("CTL2-L2: the SHIPPED bundle, run with node, exits on SIGTERM while a f
     if (directory !== "") await rm(directory, { recursive: true, force: true });
   });
 
-  it("SIGTERM: the pool's connection is ended at the close bound, and the process exits 0 — it does not wait for the database", async () => {
-    const frozen = await frozenPostgres();
+  /** Writes the bundle's configuration: `traderHalts` postgres, and `traderHealth` as given. */
+  async function configWith(traderHealth: unknown): Promise<string> {
     const config = join(directory, "control-api.json");
     await writeFile(
       config,
@@ -771,21 +918,46 @@ describe("CTL2-L2: the SHIPPED bundle, run with node, exits on SIGTERM while a f
         maxRequestBodyBytes: 65_536,
         auditCapacity: 64,
         auditSafetyReserve: 4,
-        traderHealth: { kind: "none" },
+        traderHealth,
         traderHalts: { kind: "postgres", timeoutMs: 400 },
         operators: OPERATORS.map((operator) => ({ ...operator, grants: [...operator.grants] })),
       }),
       "utf8",
     );
+    return config;
+  }
+
+  it("SIGTERM: the pool's connection is ended at the close bound, and the process exits 0 — it waits neither for the database nor for a trader read still within its 60 s bound (CTL2-R2-L3: only the exit port ends it)", async () => {
+    const frozen = await frozenPostgres();
+    // CTL2-R2-L3: a trader that never answers, read with a 60 s bound. Its read is still outstanding at
+    // SIGTERM, and its socket keeps the event loop alive: only the shipped `exit` port can end the process
+    // within the stop's bounds — without it, the process lives until SIGKILL.
+    const openTraderSockets = new Set<Socket>();
+    const silentTrader = createHttpServer(() => undefined);
+    silentTrader.on("connection", (socket: Socket) => {
+      openTraderSockets.add(socket);
+      socket.on("close", () => openTraderSockets.delete(socket));
+    });
+    await new Promise<void>((resolveListen) => silentTrader.listen(0, "127.0.0.1", () => resolveListen()));
+    const traderAddress = silentTrader.address();
+    const traderPort = typeof traderAddress === "object" && traderAddress !== null ? traderAddress.port : 0;
+    const config = await configWith({ kind: "http", url: `http://127.0.0.1:${String(traderPort)}/health`, timeoutMs: 60_000 });
     const running = await startShippedBundle(bundle?.file ?? "", {
       ...SAFE_PAPER_ENVIRONMENT,
       CONTROL_API_CONFIG: config,
       [TRADER_HALTS_DATABASE_URL_ENV]: `postgres://halt_reader:not-a-credential@127.0.0.1:${String(frozen.port)}/x`,
     });
     try {
-      const health = JSON.parse((await get(running.port, "/v1/health")).body) as { traderHalts: Record<string, unknown> };
+      // Answered at the answer deadline: the halts UNKNOWN at their bound, the trader not current.
+      const health = JSON.parse((await get(running.port, "/v1/health")).body) as {
+        current: unknown;
+        traderHalts: Record<string, unknown>;
+      };
       expect(health.traderHalts["state"]).toBe("UNKNOWN");
+      expect(health.current).toBe(false);
       expect(frozen.open()).toBe(1);
+      // The trader read is outstanding: the process holds an open socket to the silent trader.
+      expect(openTraderSockets.size).toBe(1);
       const began = Date.now();
       // SIGTERM, and SIGKILL only if it is still alive well past both bounds.
       const exit = await running.stop(TRADER_HALTS_CLOSE_WAIT_MS + 5_000);
@@ -795,9 +967,41 @@ describe("CTL2-L2: the SHIPPED bundle, run with node, exits on SIGTERM while a f
       expect(exit.stdout).toContain("ending the 1 connection(s) it still holds");
       expect(exit.stdout).toContain("control API stopped.");
       expect(elapsed).toBeLessThan(TRADER_HALTS_CLOSE_WAIT_MS + TRADER_HALTS_TERMINATE_WAIT_MS + 2_000);
+      // The process is gone, and the trader read with it.
+      expect(await until(() => openTraderSockets.size === 0, 2_000)).toBe(true);
     } finally {
       if (running.alive()) await running.stop(0);
+      for (const socket of openTraderSockets) socket.destroy();
+      await new Promise<void>((resolveClose) => silentTrader.close(() => resolveClose()));
       await frozen.close();
+    }
+  }, 60_000);
+
+  it("CONTROL2-R2-C1: the bundle refuses both URL forms the driver would rewrite (78), serving or --check, before any connection and printing neither the password nor what the driver would send", async () => {
+    const config = await configWith({ kind: "none" });
+    for (const [password, driverWouldSend] of [
+      ["Fake%2FSecret Word-ctl2-r2", "Fake%2FSecret Word-ctl2-r2"],
+      ["Ec%41%zz-nac-ctl2-r2", "EcA%zz-nac-ctl2-r2"],
+    ] as const) {
+      const echoing = await echoingPostgres();
+      try {
+        // `--check` first: a bundle that admitted the URL would exit 0 at once there, where serving would not exit.
+        for (const args of [["--check"], []]) {
+          const exit = await runShippedBundle(bundle?.file ?? "", args, {
+            ...SAFE_PAPER_ENVIRONMENT,
+            CONTROL_API_CONFIG: config,
+            [TRADER_HALTS_DATABASE_URL_ENV]: `postgres://halt_reader:${password}@127.0.0.1:${String(echoing.port)}/polymarket_bot`,
+          });
+          const said = `${exit.stdout}${exit.stderr}`;
+          for (const secret of [password, driverWouldSend, "halt_reader"]) expect(said, `${password} ${args.join(" ")}`).not.toContain(secret);
+          expect(exit.code, said).toBe(EXIT_CODES.configurationRefused);
+          expect(exit.stdout).toContain("[CONTROL_TRADER_HALTS_URL_ENCODING]");
+          expect(exit.stdout).not.toContain("control API listening");
+        }
+        expect(echoing.connections(), password).toBe(0);
+      } finally {
+        await echoing.close();
+      }
     }
   }, 60_000);
 });

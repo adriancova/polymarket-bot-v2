@@ -97,8 +97,40 @@ import {
  * be the password the driver sends, while {@link redactDatabaseUrl} redacts
  * the authority's. So the only query parameter admitted is one `sslmode` with
  * a value from {@link TRADER_HALTS_URL_SSLMODES}; any other refuses the start.
+ *
+ * And the URL is one the driver reads AS WRITTEN (`CONTROL2-R2-C1`). The
+ * parser REWRITES a URL that holds a raw space or a malformed escape before it
+ * reads it ({@link TRADER_HALTS_URL_DRIVER_REWRITES}), and the password it then
+ * sends is neither the authority's as written nor as decoded — past the
+ * redaction. So such a URL, and one whose user, password, host or database
+ * does not decode, refuses the start; for every URL admitted, the password the
+ * driver sends is the authority's, percent-decoded, which
+ * {@link redactDatabaseUrl} redacts.
  */
 export const TRADER_HALTS_DATABASE_URL_ENV = "CONTROL_API_TRADER_HALTS_DATABASE_URL";
+
+/**
+ * `CONTROL2-R2-C1`: a URL the PostgreSQL driver's parser would REWRITE before
+ * it reads it — a raw space, or a `%` that does not begin a two-hex-digit
+ * escape, anywhere in the URL.
+ *
+ * `pg-connection-string@2.14.0` (`index.js`, `parse`) tests the WHOLE string
+ * against `/ |%[^a-f0-9]|%[a-f0-9][^a-f0-9]/i` and, on a match, reads
+ * `encodeURI(url).replace(/%25(\d\d)/g, '%$1')` instead: every escape is
+ * re-escaped, then the ones whose two characters are DIGITS are restored. So a
+ * password `Fake%2FSecret Word` is sent as `Fake%2FSecret Word` (the hex-letter
+ * escape kept as written, the space decoded), and `Ec%41%zz` as `EcA%zz` (the
+ * decimal escape decoded, the malformed one kept) — neither the password the
+ * URL holds as written nor its decoding, which are what
+ * {@link redactDatabaseUrl} redacts, so a driver error that echoed it would
+ * carry it to the log and to `/v1/health`.
+ *
+ * This is a SUPERSET of the driver's test, so it does not depend on which
+ * malformed escapes the driver's version happens to rewrite: every `%` the
+ * driver's test flags begins no two-hex-digit escape. Write a space as `%20`
+ * and a literal `%` as `%25`.
+ */
+export const TRADER_HALTS_URL_DRIVER_REWRITES = / |%(?![0-9A-Fa-f]{2})/u;
 
 /**
  * `CONTROL2-R1-C2`: the values the one admitted query parameter, `sslmode`, may
@@ -158,6 +190,12 @@ const REDACTED = "<redacted>";
  * as written and percent-decoded, replaced by `<redacted>` (longest first).
  * Applied to every driver text that can reach a log line or a health answer.
  * TOTAL.
+ *
+ * Complete for every URL {@link planTraderHalts} admits (`CONTROL2-R2-C1`): it
+ * admits only a URL the driver reads as written, whose password the driver
+ * therefore sends as `decodeURIComponent(new URL(url).password)` — the
+ * decoded form here. A URL the driver would rewrite first is refused before
+ * any pool exists ({@link TRADER_HALTS_URL_DRIVER_REWRITES}).
  */
 export function redactDatabaseUrl(text: string, url: string): string {
   const secrets = new Set<string>([url]);
@@ -183,6 +221,22 @@ export function redactDatabaseUrl(text: string, url: string): string {
 
 function describeCause(cause: unknown): string {
   return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+}
+
+/**
+ * `CONTROL2-R2-C1`: whether every component the driver decodes does decode —
+ * the user, the password and the host as URI components, the database as a
+ * URI (`pg-connection-string`'s `parse`). One that does not would fail every
+ * read with a bare "URI malformed"; it is refused at startup instead.
+ */
+function decodesForTheDriver(parsed: URL): boolean {
+  try {
+    for (const component of [parsed.username, parsed.password, parsed.hostname]) decodeURIComponent(component);
+    decodeURI(parsed.pathname);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -235,6 +289,19 @@ export function planTraderHalts(
       detail:
         `${TRADER_HALTS_DATABASE_URL_ENV} is not a postgres:// or postgresql:// URL (its value is not printed: it ` +
         "may carry a credential)",
+    };
+  }
+  // `CONTROL2-R2-C1`: a URL the driver reads as written, so the password it sends is the one redacted.
+  if (TRADER_HALTS_URL_DRIVER_REWRITES.test(url) || !decodesForTheDriver(parsed)) {
+    return {
+      ok: false,
+      code: "CONTROL_TRADER_HALTS_URL_ENCODING",
+      detail:
+        `${TRADER_HALTS_DATABASE_URL_ENV} holds a raw space, a % that begins no two-hex-digit escape, or a user, ` +
+        "password, host or database that does not percent-decode (its value is not printed): the PostgreSQL driver " +
+        "rewrites a URL with a raw space or a malformed escape before it reads it, so the password it would send is " +
+        "not the one this process redacts, and it cannot read a component that does not decode; write every space as " +
+        "%20 and every literal % as %25",
     };
   }
   // `CONTROL2-R1-C2`: the authority is the one source; the query may say one sslmode and nothing else.

@@ -704,11 +704,25 @@ and nothing else. The driver's other modes are refused: it treats `prefer`,
 major version weakens them), and `no-verify` would send the password to a
 server whose certificate nobody checked.
 
+The driver must read the URL AS WRITTEN (`CONTROL2-R2-C1`). Its parser
+(`pg-connection-string`) REWRITES a URL that holds a raw space or a malformed
+escape before reading it: it re-escapes every `%`, then restores the escapes
+whose two characters are digits. The password it then sends is neither the
+URL's as written nor its decoding (`Fake%2FSecret Word` is sent as written,
+`Ec%41%zz` as `EcA%zz`), so the redaction above would miss it. So the URL may
+hold no raw space and no `%` that does not begin a two-hex-digit escape
+(`TRADER_HALTS_URL_DRIVER_REWRITES`, a superset of the driver's own test), and
+its user, password, host and database must percent-decode. Write a space as
+`%20` and a literal `%` as `%25`. For every URL admitted, the password the
+driver sends is the authority's, percent-decoded, which the redaction covers;
+`trader-halt-shape.test.ts` proves it against the real driver.
+
 The process refuses to start (exit 78), naming the variable and never its
 value, when `postgres` has no URL, when the URL is not a PostgreSQL URL or
-omits one of those four, when its query holds anything but one `sslmode`, when
-a `PG*` variable is set, and when the URL variable is set while
-`traderHalts.kind` is `none`.
+omits one of those four, when the driver would rewrite it or one of its
+components does not decode (`CONTROL_TRADER_HALTS_URL_ENCODING`), when its
+query holds anything but one `sslmode`, when a `PG*` variable is set, and when
+the URL variable is set while `traderHalts.kind` is `none`.
 
 **The deployment's duty: a role that can read `ops.incidents` and nothing
 else.** Give the URL a role of its own, with `USAGE` on the schema `ops` and
@@ -754,7 +768,9 @@ Without a container, `test/integration/control-api/trader-halt-shape.test.ts`
 runs the shipped `startup()` and the SHIPPED bundle against loopback servers
 that stand in for a database that froze and a trader that never answers: the
 scrape is answered `UNKNOWN 1` inside the scrape timeout (`CTL2-F1`), and
-SIGTERM exits 0 within the stop's bounds (`CTL2-L2`).
+SIGTERM exits 0 within the stop's bounds (`CTL2-L2`), while a trader read with
+a 60 s bound is still outstanding, which only the shipped exit port can end
+(`CTL2-R2-L3`).
 
 ## The PostgreSQL sink: reached by an opt-in suite, bound by no composition (disclosed)
 

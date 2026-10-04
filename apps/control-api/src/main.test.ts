@@ -19,6 +19,7 @@ import { AUDIT_APPEND_TIMEOUT_MS, CONTROL_PLANE_VOID_ACTOR } from "./control-pla
 import {
   EXIT_CODES,
   TRADER_HALTS_DATABASE_URL_ENV,
+  TRADER_HALTS_URL_DRIVER_REWRITES,
   TRADER_HALTS_URL_SSLMODES,
   composeControlPlane,
   libpqVariablesIn,
@@ -348,6 +349,78 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
     expect(planTraderHalts(postgres, `${URL_VALUE}?`).ok).toBe(true);
   });
 
+  it("CONTROL2-R2-C1: a URL the driver would REWRITE before reading it — a raw space, or a % that begins no two-hex-digit escape, anywhere — is refused, and so is one whose user, password, host or database does not decode", () => {
+    const postgres = { kind: "postgres", timeoutMs: 750 } as const;
+    const at = (password: string): string => `postgres://halt_reader:${password}@127.0.0.1:5432/polymarket_bot`;
+    const refused: readonly (readonly [string, string])[] = [
+      // The verifiers' two forms: the driver sends `Fake%2FSecret Word-r2c1` and `EcA%zz-nac-r2c1`, which the redaction missed.
+      [at("Fake%2FSecret Word-r2c1"), "a raw space beside a hex-letter escape"],
+      [at("Ec%41%zz-nac-r2c1"), "a malformed escape beside a decimal escape"],
+      // Every branch of the driver's test, whether or not the rewrite would change the password.
+      [at("my pass-r2c1"), "a raw space alone"],
+      [at("Ec%2F%zz-nac-r2c1"), "a malformed escape beside a hex-letter escape"],
+      [at("pct%-r2c1"), "a % before a non-hex character"],
+      [at("pct%a-r2c1"), "a % and one hex digit before a non-hex character"],
+      [at("pct%"), "a % just before the @"],
+      ["postgres://halt reader:Zq7-r2c1@127.0.0.1:5432/polymarket_bot", "a raw space in the user"],
+      ["postgres://halt_reader:Zq7-r2c1@127.0.0.1:5432/polymarket bot", "a raw space in the database"],
+      ["postgres://halt_reader:Zq7-r2c1@127.0.0.1:5432/polymarket_bot?sslmode=disable%", "a bare % in the query"],
+      // The superset: a % the driver's own test misses, at the very end of the string.
+      ["postgres://halt_reader:Zq7-r2c1@127.0.0.1:5432/polymarket_bot#frag%", "a bare % at the very end"],
+      ["postgres://halt_reader:Zq7-r2c1@127.0.0.1:5432/polymarket_bot#frag%a", "a % and one hex digit at the very end"],
+      // Escapes that do not decode: the driver would fail every read with a bare "URI malformed".
+      [at("Zq7%FF-r2c1"), "a password that is not UTF-8"],
+      ["postgres://halt%C3%28reader:Zq7-r2c1@127.0.0.1:5432/polymarket_bot", "a user that is not UTF-8"],
+      ["postgres://halt_reader:Zq7-r2c1@db%FF.internal:5432/polymarket_bot", "a host that is not UTF-8"],
+      ["postgres://halt_reader:Zq7-r2c1@127.0.0.1:5432/polymarket%FFbot", "a database that is not UTF-8"],
+    ];
+    for (const [url, why] of refused) {
+      // Each is a URL WHATWG reads: only this rule refuses it.
+      expect(() => new URL(url), why).not.toThrow();
+      const plan = planTraderHalts(postgres, url);
+      expect(plan.ok, why).toBe(false);
+      if (plan.ok) continue;
+      expect(plan.code, why).toBe("CONTROL_TRADER_HALTS_URL_ENCODING");
+      expect(plan.detail).toContain(TRADER_HALTS_DATABASE_URL_ENV);
+      for (const part of ["Zq7", "r2c1", "Secret", "nac", "halt_reader", "halt reader", "127.0.0.1", "db%FF", "frag"]) {
+        expect(plan.detail, why).not.toContain(part);
+      }
+    }
+
+    // Admitted: the driver reads each as written, so the password it sends is the authority's,
+    // percent-decoded — and that is redacted (the real driver: `trader-halt-shape.test.ts`).
+    for (const url of [
+      at("Zq7-plain-r2c1"),
+      at("p%40ss%2Fword-r2c1"),
+      at("sp%20ace%41-r2c1"),
+      at("%C3%A9t%C3%A9-r2c1"),
+      at("100%25-r2c1"),
+      at("semi;colon=eq-r2c1"),
+    ]) {
+      expect(planTraderHalts(postgres, url), url).toEqual({ ok: true, kind: "postgres", url, timeoutMs: 750 });
+      const sent = decodeURIComponent(new URL(url).password);
+      expect(redactDatabaseUrl(`echo: ${sent}`, url), url).toBe("echo: <redacted>");
+    }
+
+    // A SUPERSET of the driver's own test (`pg-connection-string@2.14.0`, `parse`, copied here as
+    // written), over every two characters after a % and at the end of the string.
+    const driverRewrites = / |%[^a-f0-9]|%[a-f0-9][^a-f0-9]/iu;
+    const alphabet = [..."0123456789abcdefABCDEFgGzZ%@/:?#&= -_.~é"];
+    let flagged = 0;
+    for (const first of ["", ...alphabet]) {
+      for (const second of ["", ...alphabet]) {
+        const text = `pw%${first}${second}`;
+        if (!driverRewrites.test(`${text}x`)) continue;
+        flagged += 1;
+        expect(TRADER_HALTS_URL_DRIVER_REWRITES.test(text), text).toBe(true);
+        expect(TRADER_HALTS_URL_DRIVER_REWRITES.test(`${text}x`), `${text}x`).toBe(true);
+      }
+    }
+    expect(flagged).toBeGreaterThan(1_000);
+    expect(TRADER_HALTS_URL_DRIVER_REWRITES.test("pw%2Fq%41%c3%a9")).toBe(false);
+    expect(TRADER_HALTS_URL_DRIVER_REWRITES.test("a b")).toBe(true);
+  });
+
   it("startup REFUSES each mismatch (78), naming the variable and never printing its value", async () => {
     const cases = [
       { config: configWithHalts({ kind: "postgres", timeoutMs: 750 }), env: BASE, code: "CONTROL_TRADER_HALTS_URL_MISSING" },
@@ -372,6 +445,17 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
         config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
         env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: `${URL_VALUE}?password=${PASSWORD}-query` },
         code: "CONTROL_TRADER_HALTS_URL_PARAMETERS",
+      },
+      // `CONTROL2-R2-C1`: the driver would rewrite each before reading it, and send a password the redaction misses.
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE.replace(PASSWORD, `${PASSWORD}%2FSecret Word`) },
+        code: "CONTROL_TRADER_HALTS_URL_ENCODING",
+      },
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE.replace(PASSWORD, `${PASSWORD}%41%zz-nac`) },
+        code: "CONTROL_TRADER_HALTS_URL_ENCODING",
       },
     ];
     for (const entry of cases) {
