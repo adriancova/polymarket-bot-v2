@@ -70,6 +70,7 @@ import {
   type OrderTrack,
   type StaticBracketState,
 } from "../../../../packages/strategies/static-bracket/src/index.js";
+import { isImmutablePlainData } from "../../../../packages/strategies/static-bracket/src/params.js";
 import type { DecisionResult } from "../../../../packages/domain/src/index.js";
 import {
   STOP_KEY,
@@ -220,14 +221,38 @@ const PREFERRING = configWith({
   "entry.economic_leg_policy": "PREFER_CHEAPEST_WITH_INVENTORY",
 });
 
+/**
+ * The params every whole-space sweep evaluates under: `PREFERRING`, parsed
+ * ONCE per sweep (`FLAKES-1`).
+ *
+ * Each sweep used to parse `PREFERRING` again for every shape: a fresh params
+ * object per evaluation, which also missed the strategy's per-object parse
+ * cache (`params.ts`, `PARSED_BY_OBJECT`). That was about 68 µs of the 80 µs
+ * an evaluation took (measured), and under host load the sweeps exceeded
+ * vitest's 5,000 ms default. The shapes, the params' contents, the decisions and every
+ * assertion are unchanged. Only the params object is shared, which is what the
+ * WP-170 runtime does in production: ONE deep-frozen params object for a run's
+ * whole life. `params-cache.test.ts` pins that the cached parse answers
+ * exactly what a fresh one does.
+ *
+ * The object is checked to be deep-frozen plain data first, so no evaluation
+ * can change what the next one reads.
+ */
+function sweepParams(): ReturnType<typeof params> {
+  const parsed = params(PREFERRING);
+  expect(isImmutablePlainData(parsed), "the shared sweep params are deep-frozen plain data").toBe(true);
+  return parsed;
+}
+
 describe("the §13.3 machine is CLOSED over the shapes the code can reach", () => {
   it("never halts on any reachable (bracket, entry order, exit order, allocation, leg)", () => {
+    const preferring = sweepParams();
     const halted: string[] = [];
     let evaluated = 0;
     for (const shape of shapes()) {
       evaluated += 1;
       const decision = staticBracketStrategy.onFeatures(
-        context(params(PREFERRING), stateFor(shape), viewsFor(shape)),
+        context(preferring, stateFor(shape), viewsFor(shape)),
       );
       if (decision.reasonCodes.includes(REASONS.halted)) {
         halted.push(
@@ -247,11 +272,12 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
   it("never halts with the stop deep in the money either", () => {
     // The route that mattered most: a halt with an OPEN position and the stop
     // satisfied abandoned the position permanently.
+    const preferring = sweepParams();
     const halted: string[] = [];
     for (const shape of shapes()) {
       if (shape.allocated === "0") continue;
       const decision = staticBracketStrategy.onFeatures(
-        context(params(PREFERRING), stateFor(shape), {
+        context(preferring, stateFor(shape), {
           ...viewsFor(shape),
           features: { [STOP_KEY]: "0.1" },
         }),
@@ -269,13 +295,14 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
     // fresh document allocates nothing), and §13.3's own `DORMANT -> ARMED` is
     // right to fire regardless. The risk caps — not the machine — are what
     // answer those, which the next assertion pins.
+    const preferring = sweepParams();
     const leaked: string[] = [];
     for (const shape of shapes()) {
       if (shape.allocated === "0") continue;
       if (shape.instanceState === "ARMED" || shape.instanceState === "DORMANT") continue;
       const before = stateFor(shape);
       const decision = staticBracketStrategy.onFeatures(
-        context(params(PREFERRING), before, viewsFor(shape)),
+        context(preferring, before, viewsFor(shape)),
       );
       const after = nextState(before, decision);
       if (after.instanceState === "ARMED" && after.allocatedShares !== "0") {
@@ -292,11 +319,12 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
     // this sweeps the whole shape space with a book the strategy must refuse to
     // act on. Nothing position-changing may come out — not an entry, not a
     // take-profit, not a reduction — however deep the stop is in the money.
+    const preferring = sweepParams();
     const acted: string[] = [];
     const STALE = "2026-03-04T12:04:00.000Z"; // 60s old against a 2000ms bound.
     for (const shape of shapes()) {
       const decision = staticBracketStrategy.onFeatures(
-        context(params(PREFERRING), stateFor(shape), {
+        context(preferring, stateFor(shape), {
           ...viewsFor(shape),
           features: { [STOP_KEY]: "0.1" },
           yes: { bids: [["0.34", "2000"]], asks: [["0.35", "2000"]], asOf: STALE },
@@ -1038,11 +1066,12 @@ function places(decision: DecisionResult): number {
 
 describe("§6 invariant 13 — safety cancellation outranks new placement", () => {
   it("no decision in the whole sweep both cancels and places", () => {
+    const preferring = sweepParams();
     const offenders: string[] = [];
     for (const shape of shapes()) {
       for (const features of [undefined, { [STOP_KEY]: "0.1" }]) {
         const decision = staticBracketStrategy.onFeatures(
-          context(params(PREFERRING), stateFor(shape), {
+          context(preferring, stateFor(shape), {
             ...viewsFor(shape),
             ...(features === undefined ? {} : { features }),
           }),
