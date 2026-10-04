@@ -2,48 +2,65 @@
  * `TC-LOWS-1` (`PROV1-R2-L2`) — the SHIPPED process (its esbuild bundle,
  * built here with `apps/trader`'s own esbuild and flags) EXITS within a bound
  * after `startup()` returns, against a FROZEN PostgreSQL. Real PostgreSQL,
- * real Redis.
+ * real Redis, each behind a freezable hop (sockets open, no byte forwarded:
+ * what a paused server or a partition looks like from the client).
  *
  * ## Why a process, and not `startup()`
  *
  * `durable-halts-and-refusals-postgres-redis.test.ts` (3b, SILENT) proves that
  * `startup()` RETURNS 75 while PostgreSQL is frozen. A return is not an exit:
- * the pool's close ends its idle connections with a Terminate and a
+ * the pool's close ends each idle connection with a Terminate and a
  * half-close, and a socket whose peer never answers kept the process alive
  * (`PROVENANCE-1` r2, measured with `docker pause`). Only a process can show
  * that it exits, so this file runs the bundle the operator runs.
+ *
+ * ## Where the half-closed socket comes from (measured while writing this file)
+ *
+ * The trader's pool holds ONE connection in these runs (`pg_stat_activity`
+ * after the settle: one idle `polymarket-bot` session): its writes are
+ * sequential. When PostgreSQL freezes BEFORE the halt, the halt record checks
+ * that one connection out, and at its bound DESTROYS it (`PROVENANCE-1` r1),
+ * so the pool's close has nothing left to half-close. The L2 shape needs an
+ * idle connection the pool ENDS: PostgreSQL that freezes AFTER the record
+ * landed and before the store's close. That window is real: the close comes
+ * after `feed.close()`, which waits up to one Redis bound for its courtesy
+ * `QUIT` on the frozen Redis.
  *
  * ## The scenarios
  *
  * 0. **Nothing holds the process** (a startup refusal, 78): it exits at once,
  *    on its own, with no forced line — the shell's grace timer holds nothing.
- * 1. **PostgreSQL and Redis frozen** (two freezable hops: sockets open, no
- *    byte forwarded). The pump halts `TRANSPORT_UNAVAILABLE` within the Redis
- *    bound, the halt record answers `UNCONFIRMED` at its bound, `startup()`
- *    returns 75, and the process — still held by the pool's half-closed
- *    sockets — logs `PROCESS EXIT FORCED` and exits 75 within
- *    `PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS`, while PostgreSQL is
- *    STILL frozen. Thawed afterwards, nothing of the record lands, as before
- *    this round (its connection was destroyed at its bound).
- * 2. **Redis frozen, PostgreSQL alive** (the control). The halt record is
- *    WRITTEN and acknowledged, and the process exits 75 within the same
- *    bound. After the exit the row is there, and every decision the process
- *    counted as persisted is in `strategy.decisions`: an acknowledged write
- *    stays acknowledged.
+ * 1. **The L2 shape.** Redis freezes; the pump halts `TRANSPORT_UNAVAILABLE`;
+ *    the halt record is WRITTEN (PostgreSQL alive) and logged; PostgreSQL
+ *    freezes at that line; the store's close ends the record's idle
+ *    connection, half-closed, against the frozen server. `startup()` returns
+ *    75 and the process, held by that socket, logs `PROCESS EXIT FORCED` and
+ *    exits 75 within `PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS` (plus the
+ *    closes' Redis bounds) — PostgreSQL STILL frozen. Thawed afterwards, the
+ *    record the process saw acknowledged is in `ops.incidents`, and every
+ *    decision it counted as persisted is in `strategy.decisions`.
+ * 2. **PostgreSQL and Redis frozen together.** The halt record answers
+ *    `UNCONFIRMED` at its bound, `startup()` returns 75, and the process exits
+ *    75 within the same bound. What holds it after the return is the frozen
+ *    Redis hop's two half-closed sockets, which `ioredis` drops about two
+ *    seconds after the return (measured), so the exit is forced at the grace
+ *    — logged, not pinned, because it rests on that library's timing.
+ *    Thawed afterwards, nothing of the record lands, as before this round.
+ * 3. **Redis frozen, PostgreSQL alive** (the control). The record is written,
+ *    the process exits 75 within the bound, and the rows are there after the
+ *    exit. Measured: this process too is held by the frozen Redis hop's
+ *    sockets after `startup()` returns, and its exit is forced (logged).
  *
  * The scenario is the fixture's own, shifted so that its last event is one
  * minute before the host's now (`support/host-clock.ts`, `shiftScenario`,
  * ADR-031 T4's method): the bundle runs the unmodified `SystemPaperClock`,
  * and its entry is judged at a real lag inside the bound, so it fills.
  *
- * Measured while writing this file: scenario 2's process is ALSO held after
- * `startup()` returns — by the frozen Redis hop's sockets — and exits forced.
- * So the bound covers a Redis partition too, not only a frozen PostgreSQL.
- *
  * NON-VACUITY: with the shell's `exitAfterStartup` call removed (the shell
- * before this round), scenarios 1 and 2 fail: the process is still running at
- * the bound. With the shell's grace timer referenced (no `unref()`), scenario
- * 0 fails. Recorded in the `TC-LOWS-1` handoff.
+ * before this round), scenario 1 fails: the process is still running at the
+ * bound, held by the half-closed PostgreSQL socket. With the shell's grace
+ * timer referenced (no `unref()`), scenario 0 fails. Recorded in the
+ * `TC-LOWS-1` handoff.
  *
  * Docker: Testcontainers, its own containers, no skip. PAPER only; no venue,
  * no signer, no real order; throwaway credentials that live only for the run.
@@ -230,6 +247,14 @@ async function publishAndSettle(publisher: RedisStreamsEventTransport, stream: s
   });
 }
 
+/** `connectionString`, through the freezable hop at `hopUrl` (same credentials and database). */
+function throughHop(connectionString: string, hopUrl: string): string {
+  const through = new URL(connectionString);
+  through.hostname = "127.0.0.1";
+  through.port = new URL(hopUrl).port;
+  return through.toString();
+}
+
 async function incidents(context: TestContext) {
   return await context.db.selectFrom("ops.incidents").selectAll().orderBy("incident_id").execute();
 }
@@ -260,7 +285,76 @@ describe("the shipped process exits within a bound once startup() has returned (
     console.log(`[TC-LOWS-1 measured, nothing held] the refused process exited +${String(exited.at - startedAt)} ms after its spawn`);
   }, 60_000);
 
-  it("PostgreSQL and Redis FROZEN: startup() returns 75, and the process, held by the pool's half-closed sockets, says so and EXITS 75 within the bound — PostgreSQL still frozen", async () => {
+  it("the L2 shape — PostgreSQL freezes after the halt record LANDED, before the store's close: the pool's ended connection is half-closed against it, and the process says so and EXITS 75 within the bound; the acknowledged record is durable", async () => {
+    await withFreshDatabase(postgres.getConnectionUri(), "exit-l2", async ({ connectionString, context }) => {
+      const label = "exit-l2";
+      const registered = await registerThroughTheRepositories(context, label);
+      const stream = uniqueStreamName(label);
+      const { events, document } = shiftedScenario(registered, label, stream);
+      const postgresHop = await startFreezableRedisProxy(connectionString);
+      const redisHop = await startFreezableRedisProxy(redis.getConnectionUrl());
+      const publisher = await connectPublisher(redis.getConnectionUrl());
+      let thawed = false;
+      try {
+        const run = await startTrader(label, document, {
+          ...safeEnvironment(),
+          REDIS_URL: redisHop.url,
+          DATABASE_URL: throughHop(connectionString, postgresHop.url),
+        });
+        await publishAndSettle(publisher, stream, events);
+        redisHop.freeze();
+        // The record lands (PostgreSQL alive); PostgreSQL freezes at its line,
+        // while `feed.close()` waits on the frozen Redis — before the store's close.
+        const record = await waitFor("the halt record's line", 30_000, () =>
+          Promise.resolve(run.lines.find(({ line }) => line.startsWith("halt record: "))),
+        );
+        postgresHop.freeze();
+        const frozenAt = Date.now();
+        expect(record.line).toBe("halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL TRANSPORT_UNAVAILABLE)");
+        const bound = 2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS + MARGIN_MS;
+        const exited = await settleWithin(run.exit, bound);
+        console.log(
+          "[TC-LOWS-1 measured, PostgreSQL frozen after the record] the process " +
+            (exited === undefined
+              ? `was STILL RUNNING ${String(bound)} ms after PostgreSQL froze`
+              : `exited ${String(exited.code)} +${String(exited.at - frozenAt)} ms after PostgreSQL froze`),
+        );
+        expect(exited === undefined ? "STILL RUNNING while PostgreSQL is frozen" : "exited", run.text()).toBe("exited");
+        if (exited === undefined) throw new Error("unreachable");
+        expect(exited.code, run.text()).toBe(EXIT_CODES.halted);
+        const health = exitHealth(run);
+        expect(health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
+        expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "TRANSPORT_UNAVAILABLE"]]);
+        const forced = lineAt(run, "PROCESS EXIT FORCED: ");
+        expect(forced.line).toContain(`startup() returned ${String(EXIT_CODES.halted)} ${String(PROCESS_EXIT_GRACE_MS)} ms ago`);
+        expect(forced.line).toMatch(/still held open by [^:]*TCPSocketWrap/u);
+        console.log(`[TC-LOWS-1 measured] ${forced.line.slice(0, 170)}…`);
+        // Thawed only now. The record the process saw acknowledged is durable,
+        // and so is every decision it counted as persisted.
+        postgresHop.thaw();
+        redisHop.thaw();
+        thawed = true;
+        const rows = await incidents(context);
+        expect(rows.map((row) => [row.failure_class, row.instance_id])).toEqual([["TRANSPORT_UNAVAILABLE", registered.instanceId]]);
+        const decisions = await context.db
+          .selectFrom("strategy.decisions")
+          .select(["evaluation_seq"])
+          .where("run_id", "=", registered.runId)
+          .execute();
+        expect(decisions).toHaveLength(health.loop.decisionsPersisted);
+      } finally {
+        if (!thawed) {
+          postgresHop.thaw();
+          redisHop.thaw();
+        }
+        await postgresHop.close();
+        await redisHop.close();
+        await publisher.close();
+      }
+    });
+  }, 240_000);
+
+  it("PostgreSQL and Redis frozen TOGETHER: the record answers UNCONFIRMED, startup() returns 75, and the process exits 75 within the bound — PostgreSQL still frozen; nothing of the record lands afterwards", async () => {
     await withFreshDatabase(postgres.getConnectionUri(), "exit-frozen", async ({ connectionString, context }) => {
       const label = "exit-frozen";
       const registered = await registerThroughTheRepositories(context, label);
@@ -268,25 +362,21 @@ describe("the shipped process exits within a bound once startup() has returned (
       const { events, document } = shiftedScenario(registered, label, stream);
       const postgresHop = await startFreezableRedisProxy(connectionString);
       const redisHop = await startFreezableRedisProxy(redis.getConnectionUrl());
-      const throughHop = new URL(connectionString);
-      throughHop.hostname = "127.0.0.1";
-      throughHop.port = new URL(postgresHop.url).port;
       const publisher = await connectPublisher(redis.getConnectionUrl());
       let thawed = false;
       try {
         const run = await startTrader(label, document, {
           ...safeEnvironment(),
           REDIS_URL: redisHop.url,
-          DATABASE_URL: throughHop.toString(),
+          DATABASE_URL: throughHop(connectionString, postgresHop.url),
         });
         await publishAndSettle(publisher, stream, events);
-        // At once, while the pool still holds the idle connections the run used.
         postgresHop.freeze();
         redisHop.freeze();
         const silentAt = Date.now();
         const exited = await settleWithin(run.exit, SILENCE_TO_EXIT_MS);
         console.log(
-          "[TC-LOWS-1 measured, PostgreSQL and Redis frozen] the process " +
+          "[TC-LOWS-1 measured, PostgreSQL and Redis frozen together] the process " +
             (exited === undefined
               ? `was STILL RUNNING ${String(SILENCE_TO_EXIT_MS)} ms after the silence`
               : `exited ${String(exited.code)} +${String(exited.at - silentAt)} ms after the silence`),
@@ -294,17 +384,13 @@ describe("the shipped process exits within a bound once startup() has returned (
         expect(exited === undefined ? "STILL RUNNING while PostgreSQL is frozen" : "exited", run.text()).toBe("exited");
         if (exited === undefined) throw new Error("unreachable");
         expect(exited.code, run.text()).toBe(EXIT_CODES.halted);
-        // The run was a real one: its entry filled before the silence.
         const health = exitHealth(run);
         expect(health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
         expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "TRANSPORT_UNAVAILABLE"]]);
-        // startup() returned after the record's bound; the process was still
-        // held, and the exit says by what.
         const record = lineAt(run, "HALT RECORD UNCONFIRMED: ");
-        const forced = lineAt(run, "PROCESS EXIT FORCED: ");
-        expect(forced.line).toContain(`startup() returned ${String(EXIT_CODES.halted)} ${String(PROCESS_EXIT_GRACE_MS)} ms ago`);
-        expect(forced.line).toMatch(/still held open by [^:]*TCPSocketWrap/u);
-        console.log(`[TC-LOWS-1 measured] ${forced.line.slice(0, 160)}…`);
+        // Forced or not depends on when `ioredis` drops the frozen hop's
+        // sockets (measured: about a second after the grace): logged, not pinned.
+        console.log(`[TC-LOWS-1 measured] exit ${run.text().includes("PROCESS EXIT FORCED: ") ? "forced" : "on its own"}`);
         // Bounded from the record's answer: two QUIT bounds for the closes, then the exit's own bound.
         expect(exited.at - record.at).toBeLessThanOrEqual(2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS + MARGIN_MS);
         // Thawed only now: the record's connection was destroyed at its bound,
@@ -326,7 +412,7 @@ describe("the shipped process exits within a bound once startup() has returned (
     });
   }, 240_000);
 
-  it("the control — Redis frozen, PostgreSQL ALIVE: the halt record is written, the process exits 75 within the same bound, and every acknowledged write is still there after the exit", async () => {
+  it("the control — Redis frozen, PostgreSQL ALIVE throughout: the halt record is written, the process exits 75 within the bound, and every acknowledged write is still there after the exit", async () => {
     await withFreshDatabase(postgres.getConnectionUri(), "exit-control", async ({ connectionString, context }) => {
       const label = "exit-control";
       const registered = await registerThroughTheRepositories(context, label);
@@ -359,10 +445,8 @@ describe("the shipped process exits within a bound once startup() has returned (
         expect(run.text()).toContain(
           "halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL TRANSPORT_UNAVAILABLE)",
         );
-        // After the exit: the acknowledged halt record is durable...
         const rows = await incidents(context);
         expect(rows.map((row) => [row.failure_class, row.instance_id])).toEqual([["TRANSPORT_UNAVAILABLE", registered.instanceId]]);
-        // ...and so is every decision the process counted as persisted.
         const decisions = await context.db
           .selectFrom("strategy.decisions")
           .select(["evaluation_seq"])
