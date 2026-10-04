@@ -27,8 +27,9 @@
  * - if something still holds it when the timer fires, one line says so
  *   (`PROCESS EXIT FORCED: …`, naming what holds it, and explaining the hold
  *   from those names: a half-closed socket, or a log still behind —
- *   `TC-LOWS-1` r2, `TCL1-R2-01`), and the process exits with the SAME code
- *   from that line's own write callback — and from nowhere else.
+ *   `TC-LOWS-1` r2, `TCL1-R2-01` — and blaming neither when the names show
+ *   neither — r3, `NEW-1`), and the process exits with the SAME code from
+ *   that line's own write callback — and from nowhere else.
  *
  * ## The log is never cut short (`TC-LOWS-1` r1, `TCL1-R1-01`)
  *
@@ -195,7 +196,9 @@ export function exitAfterStartup(code: number, ports: ProcessExitPorts): void {
  * the line can reach the log later, behind lines a slow log has not yet
  * taken, so it neither dates itself ("ago") nor says "now". And it explains
  * the hold from the holders it names (`TC-LOWS-1` r2, `TCL1-R2-01`): a write
- * still pending — the log itself, behind — is not blamed on a socket.
+ * still pending — the log itself, behind — is not blamed on a socket; and a
+ * hold whose names show neither a TCP connection nor a pending write — a
+ * timer beside the stdio pipes, say — is blamed on neither (r3, `NEW-1`).
  */
 export function forcedExitLine(code: number, graceMs: number, holders: readonly string[]): string {
   return (
@@ -213,18 +216,39 @@ export function forcedExitLine(code: number, graceMs: number, holders: readonly 
  * piped process always lists, held or not).
  */
 const PENDING_WRITE_HOLDERS: ReadonlySet<string> = new Set(["SimpleWriteWrap", "WriteWrap"]);
-/** Node's name for a TCP connection's handle (a half-closed one included). */
+/**
+ * Node's name for a TCP connection's handle (a half-closed one included). The
+ * socket explanation is offered only when it is named (`TC-LOWS-1` r3,
+ * `NEW-1`): `PipeWrap`, which a piped process always lists for its stdio,
+ * proves nothing, and a `Timeout` is no socket at all.
+ */
 const TCP_SOCKET_HOLDER = "TCPSocketWrap";
 
-/** What most likely holds the process, judged from the holders' names. */
+/** The socket explanation: what a frozen PostgreSQL leaves behind (the module header). */
+const SOCKET_HOLD =
+  "typically a socket whose peer never answers its close (a frozen or partitioned PostgreSQL leaves the " +
+  "pool's ended idle connections half-closed)";
+
+/**
+ * What the line says when the names show neither a TCP connection nor a
+ * pending write (`NEW-1`): no cause is offered, so none is wrong. The names
+ * before it stay the diagnosis.
+ */
+const NO_NAMED_CAUSE = "nothing named is a TCP connection or a pending write, so the names suggest no likelier cause";
+
+/**
+ * What most likely holds the process, judged from the holders' names: the
+ * socket explanation when a TCP connection is named, the log's when a pending
+ * write is, both when both are — and no cause when neither is.
+ */
 function likelyHold(holders: readonly string[]): string {
-  const socket =
-    "typically a socket whose peer never answers its close (a frozen or partitioned PostgreSQL leaves the " +
-    "pool's ended idle connections half-closed)";
   const pending = [...new Set(holders.filter((holder) => PENDING_WRITE_HOLDERS.has(holder)))].sort();
-  if (pending.length === 0) return socket;
-  const write = `a write its reader had not yet taken (${pending.join(", ")}): typically this log, still behind on the lines above`;
-  return holders.includes(TCP_SOCKET_HOLDER) ? `${socket}; and ${write}` : write;
+  const causes: string[] = [];
+  if (holders.includes(TCP_SOCKET_HOLDER)) causes.push(SOCKET_HOLD);
+  if (pending.length > 0) {
+    causes.push(`a write its reader had not yet taken (${pending.join(", ")}): typically this log, still behind on the lines above`);
+  }
+  return causes.length === 0 ? NO_NAMED_CAUSE : causes.join("; and ");
 }
 
 /** `["TCPSocketWrap", "TCPSocketWrap", "Timeout"]` → `2 × TCPSocketWrap, 1 × Timeout`. */

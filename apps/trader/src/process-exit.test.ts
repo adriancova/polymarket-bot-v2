@@ -22,7 +22,9 @@
  *    worth of lines queued, delivers EVERY line — the halt lines included —
  *    before it exits. The forced line explains the hold from what Node names
  *    (`TC-LOWS-1` r2, `TCL1-R2-01`): the socket in the first case, the log
- *    still behind in the last — never a socket that is not there.
+ *    still behind in the last — never a socket that is not there; and a
+ *    process held by a timer alone is exited the same way, its line blaming
+ *    neither a socket nor the log (r3, `NEW-1`).
  *
  * The shipped bundle against a frozen PostgreSQL is
  * `test/integration/paper-trader/process-exit-frozen-postgres-redis.test.ts`.
@@ -164,12 +166,35 @@ describe("exitAfterStartup, through its ports", () => {
     );
   });
 
-  it("no pending write: the socket explanation stands, whatever else is named — the stdio pipes and a timer included (TCL1-R2-01)", () => {
-    for (const holders of [["PipeWrap", "PipeWrap", "TCPSocketWrap", "TCPSocketWrap", "Timeout"], ["PipeWrap", "Timeout"], []]) {
+  it("a TCP connection named and no pending write: the socket explanation stands, whatever else is named — the stdio pipes and a timer included (TCL1-R2-01)", () => {
+    for (const holders of [["PipeWrap", "PipeWrap", "TCPSocketWrap", "TCPSocketWrap", "Timeout"], ["TCPSocketWrap"]]) {
       const line = forcedExitLine(75, 1_000, holders);
       expect(line).toContain(": typically a socket whose peer never answers its close (");
       expect(line).not.toContain("a write its reader had not yet taken");
+      expect(line).not.toContain("suggest no likelier cause");
     }
+  });
+
+  it("neither a TCP connection nor a pending write named — a timer beside the stdio pipes, or nothing Node names: NO cause is blamed, a socket least of all (NEW-1)", () => {
+    // What Node 24 lists for a process a timer alone holds (measured by both
+    // verifiers, TC-LOWS-1 r3): one stdio pipe and the timer.
+    expect(forcedExitLine(75, 1_000, ["PipeWrap", "Timeout"])).toBe(
+      "PROCESS EXIT FORCED: startup() returned 75, and 1000 ms later the process was still held open by " +
+        "1 × PipeWrap, 1 × Timeout: nothing named is a TCP connection or a pending write, so the names suggest " +
+        "no likelier cause. Nothing is in flight: every durable write, and the halt record, was final — " +
+        "acknowledged, refused or reported UNCONFIRMED above — when startup() returned. The process exits 75 " +
+        "once this line has reached the log",
+    );
+    for (const holders of [["PipeWrap", "Timeout"], ["PipeWrap", "PipeWrap"], ["Timeout"], ["TCPServerWrap", "Immediate"], []]) {
+      const line = forcedExitLine(75, 1_000, holders);
+      expect(line).toContain(": nothing named is a TCP connection or a pending write, so the names suggest no likelier cause. ");
+      expect(line).not.toContain("socket");
+      expect(line).not.toContain("a write its reader had not yet taken");
+    }
+    // And with nothing named at all, the line still reads.
+    expect(forcedExitLine(75, 1_000, [])).toContain(
+      "still held open by a handle Node does not name: nothing named is a TCP connection or a pending write",
+    );
   });
 });
 
@@ -277,11 +302,15 @@ const MODULE_URL = new URL("./process-exit.ts", import.meta.url).href;
  * half-closed with NO write before `end()` did not hold the process; the
  * write-then-end shape does, as the frozen-PostgreSQL probe of
  * `PROVENANCE-1` r2 found.)
+ *
+ * With `timerHold`, a referenced interval holds it instead, and no socket is
+ * opened at all (`TC-LOWS-1` r3, `NEW-1`).
  */
-function childScript(options: { readonly bounded: boolean; readonly frozenPeerPort?: number }): string {
+function childScript(options: { readonly bounded: boolean; readonly frozenPeerPort?: number; readonly timerHold?: boolean }): string {
   return `
 import { createConnection } from "node:net";
 import { exitAfterStartup, processExitPorts } from ${JSON.stringify(MODULE_URL)};
+${options.timerHold === true ? "setInterval(() => {}, 1_000_000);" : ""}
 ${
   options.frozenPeerPort === undefined
     ? ""
@@ -392,6 +421,20 @@ describe("a real process: a half-closed socket whose peer never answers", () => 
     expect(run.outcome, run.stderr).toBe(75);
     expect(run.stderr).not.toContain("PROCESS EXIT FORCED");
     expect(run.afterStartupMs).toBeLessThan(PROCESS_EXIT_GRACE_MS);
+  }, 20_000);
+});
+
+describe("a real process a timer alone holds (TC-LOWS-1 r3, NEW-1)", () => {
+  it("no socket opened, a log that keeps up: it exits 75 within the bound, and its line names the timer and blames neither a socket nor the log", async () => {
+    const run = await runChild(childScript({ bounded: true, timerHold: true }), 10_000);
+    expect(run.outcome, run.stderr).toBe(75);
+    expect(run.stderr).toContain("PROCESS EXIT FORCED: startup() returned 75, and 1000 ms later the process was still held open by ");
+    expect(run.stderr).toMatch(/still held open by [^:]*Timeout[^:]*: nothing named is a TCP connection or a pending write, so the names suggest no likelier cause\. /u);
+    expect(run.stderr).not.toContain("TCPSocketWrap");
+    expect(run.stderr).not.toContain("socket");
+    expect(run.stderr).not.toContain("a write its reader had not yet taken");
+    expect(run.afterStartupMs).toBeGreaterThanOrEqual(PROCESS_EXIT_GRACE_MS - 50);
+    expect(run.afterStartupMs).toBeLessThanOrEqual(BOUND_MS + MARGIN_MS);
   }, 20_000);
 });
 
