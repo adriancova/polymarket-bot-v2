@@ -79,7 +79,10 @@ not a fault.
    fee asset, liquidity role, match time: r7), its furthest settlement, every
    terminal settlement any observation showed (r8), and (r9) whether an
    observation carried it without identifying all of its own legs, and
-   whether a valid row ever showed it with its ownership determined.
+   whether a valid row ever showed it with its ownership determined; and
+   (r10) every trade in the order it was learned, and per venue order every
+   own leg a trades read showed on it in full under an unreadable trade id,
+   with what it owes.
    These marks only ever go up. The sources:
 
    | Source | Provenance |
@@ -87,9 +90,13 @@ not a fault.
    | a row of a complete, valid open-orders list | shown |
    | a row that validated in full inside a partial, malformed or duplicated open-orders answer (the answer is discarded; what the row showed is not) | shown |
    | an own leg of a valid trades read, or one that validated in full inside an unusable trades answer | shown |
+   | (r10) an own leg that validated in full in a trade row whose trade id is unreadable (a number, an empty string, an accessor): its order matched at least its shares, and the leg is an obligation on its order (below), with every fill fact; never booked | shown |
    | (r9) a trade row of a valid trades read, or one that validated in full inside an unusable trades answer: the trade's identity and status, whatever its legs (a row with no own leg, its ownership undetermined, included), and whether its ownership is determined | shown |
    | (r9) the trade id of a trade row that did not validate in full (a leg's fee, time or id out of shape, say), with its status when that is text: nothing else of the row, and never its economics | named |
    | a by-id read that found the order | shown |
+   | (r10) the order row of a by-id answer that is unusable for the order asked about (a not-found answer carrying an order, an answer that does not say whether it found it, a row naming ANOTHER order), when the row validated in full: kept under the id the ROW carries, never the id asked about; the answer still answers nothing about the order asked about, and its read break stands until a usable answer | shown |
+   | (r10) the id alone of an invalid order row of such a by-id answer | named |
+   | (r10) the rows of an open-orders, trades or by-id answer one of whose top-level fields, or one of whose list entries, is not own data (an accessor, say), when its route is readable and the right one: kept like any unusable answer's (the answer is unusable) | as above |
    | the id alone of a malformed row or leg (nothing else of it validated) | named |
    | an id the OMS retains as user-stream evidence | named |
    | what the user stream reported that the OMS did not apply, whatever it answered (it retained it; it refused it as unknown, inconsistent or contradicting; its store failed and it faulted; it was already faulted; it refused the input; it holds no such fill; it threw), or that was routed while no OMS was bound, recorded the moment it is routed, with a run triggered (r7) | named |
@@ -136,9 +143,11 @@ not a fault.
      known, or the same value at another precision, is no contradiction); a
      trade a read SHOWED, or (r8) only the user stream NAMED, that a complete
      trades read omits while it is not accounted for under its own identity,
-     a leg the stream named that a read of its trade does not show, and (r9)
+     a leg the stream named that a read of its trade does not show, (r9)
      a trade whose own legs no read has identified that a complete trades
-     read omits (`READ_CONFLICT`: below);
+     read omits, and (r10) an order carrying an own leg a trades read showed
+     under an unreadable trade id, until the reads have shown by id the
+     new trades it owes (`READ_CONFLICT`: below);
    - **a ghost**: an unclaimed order only NAMED that the by-id read of a
      sound run does not find. No earlier read is contradicted, so it is an
      `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), read by id
@@ -249,6 +258,46 @@ not a fault.
    operator is not told separately that the history no longer shows it).
    An UNATTRIBUTED order's `TRADE_UNATTRIBUTED` breaks cover every trade the
    evidence holds on it, not only those the current read shows.
+   **(r10) An own leg shown under an unreadable trade id is owed.** A trades
+   row whose trade id cannot be read (a number, an empty string, an
+   accessor) can still carry an own leg that validated in full. That leg is
+   activity the venue showed, but it names no trade: it may be a trade the
+   evidence does not know, or a garbled copy of one it already holds (that
+   answer's other rows, or any trade a read or the user stream named
+   before). Fail closed, it is a new trade. Two holds follow, both after a
+   restart too:
+   - **the trades owed.** The leg is recorded with every fill fact (shares,
+     price, fee, fee asset, role, match time, token, side) and with how many
+     such legs its answer showed. Until the reads have SHOWN that many
+     trades, each under a readable trade id with a leg of exactly those facts
+     on the order, that the evidence did NOT hold when the leg was seen, the
+     order is a `READ_CONFLICT` in every run ("a trades read showed 1 own
+     leg(s) on it ... in a row whose trade id was unreadable"; its detail
+     names the trades already held on the order, which cannot answer it,
+     and those shown since). Each such trade is durable (its shares are in
+     the order's high-water mark, and it carries its own classification
+     obligation, above), so once they are shown the activity is accounted
+     for under trade identities: the tracked fill is delivered, or the
+     foreign trade is `TRADE_UNATTRIBUTED`. That is sound only when the
+     answer was WHOLE: it said it was complete, its list was readable, and
+     every row of it was identified (a readable trade id, or every own leg
+     valid with its ownership determined). Then every trade of that time is
+     in it, so a trade a lagging read shows later is the unkeyed one. An
+     answer that was NOT whole (a partial one, or one with a row nothing of
+     which could be identified) may have left out a trade of exactly the
+     same facts that no observation knew, which a lagging read could show in
+     the unkeyed one's place: its unkeyed leg is never answered, and the
+     order holds for good ("in an answer that did not show every trade of
+     the account"; fail closed);
+   - **the matched size.** The order matched at least the shares of every
+     trade known on it (the evidence's, and the OMS's fills of a tracked
+     order, which the evidence may not hold: a fill the user stream
+     delivered) PLUS the unkeyed legs'. A read showing less is a
+     `READ_REGRESSION`. The order's own matched size alone was not enough: a
+     leg no larger than what the order already showed added nothing to it.
+   A later read of the same garbled answer, with nothing learned since, owes
+   nothing new; one made after more trades were learned owes beyond them too
+   (section 10).
 4. Record each discrepancy as a break, and each answer.
 5. Act on each break by its rule (section 4).
 6. Resume if, and only if, everything in section 6 holds.
@@ -500,16 +549,20 @@ returns at once, with no run.
   attempt, say) needs a person, and today has no tool. Cancelling one of the
   orders does not remove it as a candidate: once observed, an order id is
   read by id in every run (whether a complete list, a partial or malformed
-  one, a trade, or a by-id read observed it), and a canceled order is still
+  one, a trade, or a by-id read observed it; r10: an unusable by-id answer
+  too, such as one that returned this order's row when another order was
+  asked about), and a canceled order is still
   found by id (E-14). It clears only if a candidate is claimed by its real
   owner (another attempt found `PRESENT` for it). There is no override
   (section 10).
 - **An `ORDER_NOT_FOUND_BY_ID` quarantine** names a venue order id that only
-  NAMED evidence knows (the id alone of a malformed row or leg, an id the OMS
-  retains as user-stream evidence, one the stream reported) and that the
-  venue's by-id read does not find. An order a source SHOWED (a valid row or
-  leg, even inside a partial or malformed answer; a by-id read that found
-  it) is never this quarantine: its not-found is a `READ_CONFLICT`. The
+  NAMED evidence knows (the id alone of a malformed row or leg, a by-id
+  answer's invalid row included, an id the OMS retains as user-stream
+  evidence, one the stream reported) and that the venue's by-id read does not
+  find. An order a source SHOWED (a valid row or leg, even inside a partial
+  or malformed answer; a by-id read that found it; r10: a valid row an
+  unusable by-id answer returned, under its own id) is never this
+  quarantine: its not-found is a `READ_CONFLICT`. The
   account is halted, and while it stands no attempt is answered by signed
   identity (the id could be any attempt's). Establish whether the id is the
   account's (the stream's evidence, the adapter's logs). If it may be, do not
@@ -583,6 +636,38 @@ returns at once, with no run.
   from before that trade looks exactly like that. If the venue never shows
   the trade again (it dropped it, or the row named a trade it does not
   have), the account stays held: no release exists (section 10).
+- **A `READ_CONFLICT` whose detail says "in an answer that did not show
+  every trade of the account"** (r10) is the same, from a partial answer (or
+  one with a row nothing of which could be identified). It never clears: a
+  trade that answer left out could stand in for the unkeyed one, so no read
+  can tell which trade it was. The account stays held until the retraction
+  ADR gives a path (section 10). Find which trade the row was from the
+  adapter's logs and escalate.
+- **A `READ_CONFLICT` whose detail says "in a row whose trade id was
+  unreadable"** (r10) names a venue order on which a trades read showed an
+  own leg in full, in a row whose trade id was a number, an empty string or
+  not readable at all. The detail gives the leg's facts, how many such legs
+  the answer showed, the trades the evidence already held on the order (they
+  cannot answer it), and the trades of exactly those facts the reads have
+  shown by id since. It is usually a faulty or lagging trades read, and
+  clears on its own when the reads show the owed trades with their ids (a
+  missed fill is then delivered, or a foreign trade classified
+  `TRADE_UNATTRIBUTED`). It holds even when every other read looks
+  consistent: a snapshot from before that trade looks exactly like that. A
+  `READ_REGRESSION` on the same order ("less than the ... an earlier
+  observation showed") often stands beside it: the order matched at least
+  every known trade plus the unkeyed leg. If the unkeyed row was a garbled
+  copy of a trade already known, it owes one trade more than the venue has,
+  and the account stays held: no release exists (section 10). Find which
+  trade the row was from the adapter's logs and escalate.
+- **A `READ_MALFORMED` on one order's by-id read that does not clear** (r10)
+  means the by-id answer for that order is unusable (it says not found but
+  carries an order, does not say whether it found it, or returns another
+  order's row). Whatever valid row it returned is kept under the row's own
+  id, so a `READ_CONFLICT` or `ORDER_UNRESOLVED` naming that other id may
+  appear beside it: the adapter is relabelling or mixing up rows. Fix the
+  adapter; the hold clears when the by-id read answers in its shape and the
+  other id's own by-id read agrees with what was shown.
 
 ## 8. Configuration
 
@@ -609,7 +694,7 @@ for the retransmission decision, or abandons it.
 | Read | Source | Note |
 | --- | --- | --- |
 | open orders | CLOB `GET /data/orders`, every page | E-14: absence from this list is not proof of cancellation |
-| one order | CLOB `GET /data/order/<id>` | any status |
+| one order | CLOB `GET /data/order/<id>` | any status; the answer must be the order asked about, with `found` stated (r10: any other shape holds that order's read, and a row it carries is kept under the row's own id) |
 | trades | CLOB `GET /data/trades`, every page | both status spellings (E-13, C-5); the adapter splits out the account's own legs and states when it cannot |
 | positions | Data API **`GET /v2/positions`**, every status | v1 is retired on 2026-10-24 (E-15) |
 | approvals | Data API `GET /v2/approvals` | |
@@ -624,7 +709,11 @@ reports a fill (WP-280): the same shares, price and match instant, and the
 fee as an exact amount only when it is fixed (a zero-rate taker fee is `0`
 with no fee asset; anything not fixed is `null`). The OMS compares a recorded
 fill's facts exactly, so a different spelling of the same fill holds as a
-`FILL_MISMATCH`.
+`FILL_MISMATCH`. (r10) Every trade row must carry its trade id as text: a row
+whose id cannot be read holds its order until the reads show, by id, every
+trade it may have been, and for good when its answer was not whole (a
+partial answer, or one with a row nothing of which could be identified;
+section 3).
 
 The composition also binds `tokenOfGroup` to the execution groups it
 registered with the OMS (`execution.groups.token_id`). An order whose group's
@@ -677,6 +766,21 @@ nothing is judged or booked from it.
   adapter that emits one malformed row naming a trade the venue does not
   have holds the account for good, and so does a trades history that drops
   such a trade first. Its status counts toward the terminal pair too.
+  Since r10, so do: a valid order row that an unusable by-id answer
+  returned under another id than the one asked about, if the venue's by-id
+  read of THAT id later does not find it (an adapter that relabels a row
+  holds the account for good this way); an own leg shown under an
+  unreadable trade id in an answer that was not whole (a partial answer, or
+  one with a row nothing of which could be identified), always; and one in a
+  whole answer, if the reads never show by id a trade of exactly its facts
+  on the order that the evidence did not already hold. That rule is
+  fail closed: an unkeyed row that was only a garbled copy of a trade the
+  evidence already held (its answer's own keyed row, a trade an earlier read
+  showed, one the stream named) owes one trade more than the venue has, and
+  its matched-size bound exceeds the venue's; and a garbled answer read again
+  AFTER more trades were learned owes beyond them too. So an adapter that
+  garbles the id of a trade the coordinator already knows, or garbles one
+  intermittently, holds the account for good.
 - **What "evidence never goes down" assumes (unverified venue assumptions,
   held as a conservative policy).** No venue document states any of these;
   the code treats a read that disagrees as wrong (it holds), never as a
@@ -688,6 +792,23 @@ nothing is judged or booked from it.
   - the user stream and the trades read name one trade by the same id, and
     the trades read shows every trade the stream reported on the account's
     own orders (the OMS de-duplicates fills across the two by that id too);
+  - (r10) two distinct trades on one order may share every fill fact (the
+    simulated venue's do; the venue's `match_time` is an epoch-SECOND digit
+    string, `docs/venue/verified-2026-08-24.md`, so two fills of one maker
+    order in the same second can be identical): an unkeyed leg is only ever
+    discharged by a trade with a readable id that the evidence did not hold
+    when the leg was seen, never by a count of shares. When a lagging read
+    shows such a trade of exactly the
+    same facts, the reads cannot tell it from the unkeyed one, and the
+    obligation is met by it (the activity the evidence showed is then
+    accounted for, by count, under trade identities). For an unkeyed leg
+    of a WHOLE answer that is safe: every trade of that time was in the
+    answer (keyed, so held, or unkeyed), given the assumption above that
+    the trades read keeps every trade not yet accounted for. For one of an
+    answer that was not whole it would not be: a trade of the same facts
+    that the answer left out, and no observation knew, could answer it
+    while the unkeyed one is still unshown. No read tells the two apart, so
+    such a leg is never answered (it holds for good);
   - (r9) a trade's own legs never change for one trade id: once a valid row
     showed the trade with its ownership determined, a later row that does
     not identify its legs (undetermined, or malformed) adds no leg the

@@ -18,6 +18,9 @@
  *   (CONFIRMED for FAILED, or the reverse);
  * - (r9) a trades answer in which one trade's leg is malformed (its fee), and a VALID trades read showing one trade
  *   with its ownership undetermined and no own leg, at its true status;
+ * - (r10) a by-id read answering with the order's TRUE row in an unusable envelope (`found: false`, or `found`
+ *   absent), and a trades answer in which a trade not yet shown carries an unreadable trade id (a number), its legs
+ *   valid;
  * - a ledger transaction with UNATTRIBUTED arrivals in two markets;
  * - every read source and answer shape: complete, partial, duplicated, sibling-malformed, by-id found, not found,
  *   thrown or regressing, trades complete, partial, malformed or lagging, positions and collateral failing;
@@ -464,7 +467,7 @@ class Sim {
     const chosen: string[] = [];
     const count = 1 + Math.floor(this.rand() * 2);
     for (let index = 0; index < count; index += 1) {
-      const roll = Math.floor(this.rand() * 19);
+      const roll = Math.floor(this.rand() * 21);
       const target = this.pick([...this.u.world.orders.values()]);
       const trade = this.pick(this.u.world.trades);
       switch (roll) {
@@ -668,6 +671,42 @@ class Sim {
             };
           };
           break;
+        case 18: {
+          // r10 (WP290-CX-R10-01): a by-id read answers with the order's TRUE row in an unusable envelope (`found: false`,
+          // or `found` absent): it answers nothing about the order (the run is inconclusive), and the row is kept as
+          // evidence under its own id.
+          if (target === undefined) break;
+          const absent = this.chance(0.5);
+          chosen.push(`BYID_UNUSABLE(${target.venueOrderId} ${absent ? "found absent" : "found false"})`);
+          faults.readOrder = (id, answer) => {
+            const read = answer() as Record<string, unknown>;
+            if (id !== target.venueOrderId || read["found"] !== true) return read;
+            this.fire("BYID_UNUSABLE", true, id);
+            const unusable: Record<string, unknown> = { ...read, found: false };
+            if (absent) delete unusable["found"];
+            return unusable;
+          };
+          break;
+        }
+        case 19:
+          // r10 (WP290-V10-UNKEYED-LEG-DISCHARGED): a trade no completed run has seen in full carries an unreadable trade id
+          // (a number), its legs valid: the answer is unusable, and each leg is an obligation on its order until the reads
+          // show the trade by its id. (A trade already shown by its id and re-shown garbled owes one trade more than the
+          // venue has, by the fail-closed count: a disclosed permanent hold, outside this fault model.)
+          if (trade === undefined || this.#factsSeen.has(`trade:${trade.venueTradeId}`)) break;
+          chosen.push(`TRADES_UNKEYED(${trade.venueTradeId})`);
+          faults.listTrades = (answer) => {
+            const read = answer() as { trades: { venueTradeId: string }[] };
+            return {
+              ...read,
+              trades: read.trades.map((entry) => {
+                if (entry.venueTradeId !== trade.venueTradeId) return entry;
+                this.fire("TRADES_UNKEYED", true);
+                return { ...entry, venueTradeId: 42 };
+              }),
+            };
+          };
+          break;
         default:
           // A clock fault at a random await of the run (a read or an OMS write).
           this.#clockArm = 1 + Math.floor(this.rand() * 12);
@@ -720,6 +759,10 @@ class Sim {
         if (read.found === true && read.order !== undefined) {
           this.saw(id, read.order["sizeMatched"]);
           this.sawFacts(`order:${id}`);
+        } else if (read.order !== undefined && read.order !== null && typeof read.order["venueOrderId"] === "string") {
+          // r10: the row of an unusable by-id answer (BYID_UNUSABLE: the order's true row) is kept, under its own id.
+          this.saw(read.order["venueOrderId"], read.order["sizeMatched"]);
+          this.sawFacts(`order:${read.order["venueOrderId"]}`);
         }
         return read;
       },

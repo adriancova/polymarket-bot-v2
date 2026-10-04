@@ -43,9 +43,11 @@
  * evidence store is rebuilt from it after a restart. Its PROVENANCE: SHOWN
  * when a source showed the order in full (a complete open-orders list, a
  * valid row or leg inside a partial, malformed or duplicated answer, a valid
- * trades read's leg, a by-id read that found it), NAMED otherwise (the id
- * alone of a malformed row or leg; an id the OMS retains as user-stream
- * evidence; one the stream reported). Its HIGH-WATER marks (the most matched
+ * trades read's leg, a by-id read that found it, and (r10) a valid order row
+ * of a by-id answer that is unusable for the order asked about, ALWAYS under
+ * the row's own id), NAMED otherwise (the id alone of a malformed row or leg,
+ * a by-id answer's included; an id the OMS retains as user-stream evidence;
+ * one the stream reported). Its HIGH-WATER marks (the most matched
  * any observation showed, at least the sum of the distinct trades' legs;
  * terminal once shown terminal; the furthest settlement) are monotonic. Every
  * venue order with evidence no sound run has settled is read by id in every
@@ -82,7 +84,19 @@
  * legs, that no valid row has shown with its ownership determined, is OPEN:
  * a complete trades read that omits it is a `READ_CONFLICT`, whatever the
  * accounting of its known legs, and its status counts toward the CONFIRMED
- * and FAILED pair. Nothing of a malformed row is ever booked.
+ * and FAILED pair. Nothing of a malformed row is ever booked. (r10) An own
+ * leg shown in full in a row whose TRADE ID was unreadable is an obligation
+ * on its order: it may be a trade the evidence does not know, or any trade
+ * it already held there (fail closed: a new one). So the order is a
+ * `READ_CONFLICT`, in every run, until the reads have shown, under readable
+ * trade ids and with a leg of exactly its fill facts on the order, as many
+ * trades the evidence did NOT hold when the leg was seen as its answer
+ * showed such unkeyed legs; and the order matched at least every trade known
+ * on it (the evidence's, and the OMS's fills of a tracked order) plus the
+ * unkeyed legs. Such a leg of an answer that was not WHOLE (partial, or a row
+ * of it not identified) is never answered: a trade that answer left out could
+ * stand in for it, so its order holds for good. No economics of an unkeyed
+ * leg is ever booked.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
  * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,
@@ -209,7 +223,7 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "READ",
     rule: HOLD,
     meaning:
-      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size (or a trade naming an order a read shows with nothing matched), a trade's leg missing or of other shares; (r7) an order's fixed fact or a fill's economics shown with two values by any observations, of any run or source (a durable contradiction); (r8) a trade any observations showed both CONFIRMED and FAILED (a durable contradiction; r9: a row that showed no own leg of it, or a malformed row, counts); a trade a read showed, or (r8) the user stream named, that a complete trades read omits while it is not accounted for under its own identity, a leg the stream named that a read of its trade does not show, and (r9) a trade a row carried without identifying its own legs (its ownership undetermined, or its row malformed), that no valid row has shown with them, which a complete trades read omits",
+      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size (or a trade naming an order a read shows with nothing matched), a trade's leg missing or of other shares; (r7) an order's fixed fact or a fill's economics shown with two values by any observations, of any run or source (a durable contradiction); (r8) a trade any observations showed both CONFIRMED and FAILED (a durable contradiction; r9: a row that showed no own leg of it, or a malformed row, counts); a trade a read showed, or (r8) the user stream named, that a complete trades read omits while it is not accounted for under its own identity, a leg the stream named that a read of its trade does not show, and (r9) a trade a row carried without identifying its own legs (its ownership undetermined, or its row malformed), that no valid row has shown with them, which a complete trades read omits; (r10) an order with an own leg a trades read showed in full under an unreadable trade id, until the reads have shown by readable id, with a leg of exactly its facts, as many trades the evidence did not hold when the leg was seen",
     handling:
       "nothing about the subject is concluded, the run is not one view of the account (no answer, no signed-identity resolution, no delivery, no classification, no clearing); submissions stay paused until a read agrees with all the evidence. A fact shown with two values, or a trade shown both CONFIRMED and FAILED, never agrees again: it holds for good, and no tool retracts evidence (an ADR is owed)",
   },

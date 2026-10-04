@@ -13,17 +13,26 @@
  * | `INCOMPLETE` | a paginated read did not reach its last page | `READ_INCOMPLETE` |
  * | `WRONG_ROUTE` | the answer names another route (Data API v1, E-15) | `READ_WRONG_ROUTE` |
  *
- * None of them is ever read as "empty". A partial or malformed open-orders or
- * trades answer is discarded whole, but what its rows SHOWED is NOT forgotten
- * (r4, WP290-CX-R4-01; r5, R5-NAMED; r6, WP290-CX-R6-01): the outcome keeps
- * `named` (each id a row or leg carries, with its token when the row
- * validated in full, `null` for the id alone of a malformed row) and
+ * None of them is ever read as "empty". A partial or malformed open-orders,
+ * trades or (r10) by-id answer is discarded whole, but what its rows SHOWED is
+ * NOT forgotten (r4, WP290-CX-R4-01; r5, R5-NAMED; r6, WP290-CX-R6-01): the
+ * outcome keeps `named` (each id a row or leg carries, with its token when the
+ * row validated in full, `null` for the id alone of a malformed row) and
  * `salvage` (every row and every leg that validated in full, with its matched
  * size or shares and its status as read, and, r9, every trade identity a
  * trade row carries: a valid row's, legless or not, and the readable trade id
- * and status of a malformed row). The coordinator records all of it
- * as evidence (`evidence.ts`) before anything is classified, so a later read
- * that shows less can never be taken for the truth. Statuses are kept as data: an order
+ * and status of a malformed row). (r10, WP290-CX-R10-01) A by-id answer that
+ * is unusable for the order asked about (a not-found answer carrying an order,
+ * an answer that does not say whether it found it, an order row naming ANOTHER
+ * order, an invalid row) keeps its order row the same way, ALWAYS under the id
+ * the row itself carries, never the one asked about; the answer still answers
+ * nothing about the order asked about. (r10, the door audit) An answer one of
+ * whose top-level fields is not own data, or one of whose list entries (a
+ * row, a leg) is not, is MALFORMED, but when its route is readable and the
+ * right one, its other rows are still read and kept. The coordinator
+ * records all of it as evidence (`evidence.ts`) before anything is
+ * classified, so a later read that shows less can never be taken for the
+ * truth. Statuses are kept as data: an order
  * or trade status outside the documented vocabulary is not malformed, it is
  * UNRECOGNISED, and the coordinator holds on it (`STATUS_UNRECOGNISED`).
  * Trade statuses are accepted in both documented spellings (E-13, C-5):
@@ -90,6 +99,13 @@ export interface Salvage {
   readonly rows: readonly VenueOrderView[];
   readonly legs: readonly SalvagedLeg[];
   readonly trades: readonly SalvagedTrade[];
+  /**
+   * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) Trades answers only: the answer said it was complete, its fields and its
+   * list were readable, and EVERY row of it was identified (a readable trade id, or every own leg validated in full
+   * with its ownership determined), so no trade of the account is missing from what was kept. An unkeyed leg of an
+   * answer that is not whole may be any trade the answer left out: no later read can answer it.
+   */
+  readonly whole?: boolean;
 }
 
 export type ReadOutcome<T> =
@@ -117,6 +133,7 @@ function frozenSalvage(salvage: Salvage | undefined): Salvage | undefined {
     rows: Object.freeze([...salvage.rows]),
     legs: Object.freeze(salvage.legs.map((entry) => Object.freeze({ ...entry }))),
     trades: Object.freeze(salvage.trades.map((entry) => Object.freeze({ ...entry }))),
+    whole: salvage.whole === true,
   });
 }
 
@@ -199,14 +216,47 @@ function readOrderView(raw: unknown): VenueOrderView | string {
 }
 
 /**
- * `/data/orders`: every live order of the account. Every row is read once, whatever the answer's outcome: an
- * INCOMPLETE or MALFORMED answer keeps the ids its rows carry (`named`).
+ * (r10, the door audit) The entries of a list that are own data, each read once, index by index, for SALVAGE only:
+ * an accessor or a hole at one index drops that entry, never the others (`readArray`, which decides whether the
+ * answer is usable, refuses the whole list). `undefined` for a non-array, a length outside `0..max`, or any
+ * reflection failure. Never throws.
  */
-export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderView[]> {
-  const fields = readFields(raw, ["route", "complete", "orders"]);
-  if (fields === undefined) return malformed("the open-orders answer carries a field that is not own data");
-  if (fields.route !== "/data/orders") return wrongRoute(fields.route);
-  const list = readArray(fields.orders, MAX_READ_ENTRIES);
+function ownEntries(value: unknown, max: number): readonly unknown[] | undefined {
+  const whole = readArray(value, max);
+  if (whole !== undefined) return whole;
+  try {
+    if (!Array.isArray(value)) return undefined;
+    const length = readField(value, "length");
+    if (length.kind !== "DATA" || typeof length.value !== "number" || !Number.isSafeInteger(length.value) || length.value < 0 || length.value > max) return undefined;
+    const out: unknown[] = [];
+    for (let index = 0; index < length.value; index += 1) {
+      const entry = readField(value, String(index));
+      if (entry.kind === "DATA") out.push(entry.value);
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * (r10, the door audit) One field of an answer some other top-level field of which is not own data, read only when
+ * the answer's route is readable and is `route`: an answer from an unknown route keeps nothing.
+ */
+function fieldOfRightRoute(raw: unknown, route: string, key: string): unknown {
+  const read = readField(raw, "route");
+  if (read.kind !== "DATA" || read.value !== route) return undefined;
+  const value = readField(raw, key);
+  return value.kind === "DATA" ? value.value : undefined;
+}
+
+/** The open-orders rows of one list, each read once: the valid ones, and the ids of the others (`named`). */
+function readOrderRows(list: readonly unknown[] | undefined): {
+  readonly out: VenueOrderView[];
+  readonly named: Map<string, string | null>;
+  readonly rows: VenueOrderView[];
+  readonly problem: string | undefined;
+} {
   const out: VenueOrderView[] = [];
   const named = new Map<string, string | null>();
   // Every row that validated in full, a repeated one included (r6): each SHOWED its order.
@@ -230,25 +280,70 @@ export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderVie
     seen.add(order.venueOrderId);
     out.push(order);
   }
+  return { out, named, rows, problem };
+}
+
+/**
+ * `/data/orders`: every live order of the account. Every row is read once, whatever the answer's outcome: an
+ * INCOMPLETE or MALFORMED answer keeps the ids its rows carry (`named`) and every row that validated in full.
+ */
+export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderView[]> {
+  const fields = readFields(raw, ["route", "complete", "orders"]);
+  if (fields === undefined) {
+    const kept = readOrderRows(ownEntries(fieldOfRightRoute(raw, "/data/orders", "orders"), MAX_READ_ENTRIES));
+    return malformed("the open-orders answer carries a field that is not own data", kept.named, { rows: kept.rows, legs: [], trades: [] });
+  }
+  if (fields.route !== "/data/orders") return wrongRoute(fields.route);
+  const list = readArray(fields.orders, MAX_READ_ENTRIES);
+  // (r10, the door audit) A list one entry of which is not own data is unusable, but its other rows are still read.
+  const { out, named, rows, problem } = readOrderRows(list ?? ownEntries(fields.orders, MAX_READ_ENTRIES));
   const salvage: Salvage = { rows, legs: [], trades: [] };
   if (fields.complete !== true) {
     return fields.complete === false ? incomplete(named, salvage) : malformed("the open-orders answer does not say whether it is complete", named, salvage);
   }
-  if (list === undefined) return malformed("the open orders are not a list");
+  if (list === undefined) return malformed("the open orders are not a list", named, salvage);
   if (problem !== undefined) return malformed(problem, named, salvage);
   return ok(Object.freeze(out));
 }
 
-/** `/data/order`: one order by id, any status (E-14). */
+/**
+ * (r10, WP290-CX-R10-01) What the `order` field of a by-id answer shows, read once, under the id the row ITSELF
+ * carries (never the id asked about): a row that validated in full SHOWED its order (`rows`, and its id with its
+ * token in `named`); the id alone of a row that did not only NAMED it. `order` is the row as read (or why it is not one).
+ */
+function keepOrderField(value: unknown): { readonly order: VenueOrderView | string; readonly named: Map<string, string | null>; readonly salvage: Salvage } {
+  const named = new Map<string, string | null>();
+  const order = readOrderView(value);
+  if (typeof order === "string") {
+    const id = rowVenueId(value);
+    if (id !== undefined) keepNamed(named, id, null);
+    return { order, named, salvage: { rows: [], legs: [], trades: [] } };
+  }
+  keepNamed(named, order.venueOrderId, order.tokenId);
+  return { order, named, salvage: { rows: [order], legs: [], trades: [] } };
+}
+
+/**
+ * `/data/order`: one order by id, any status (E-14). Only a found answer whose row validated in full and names the
+ * order asked about answers it (`OK`), and only `found: false` with no order says it is not found (`OK`, `null`).
+ * Every other answer of the right route is MALFORMED for the order asked about, and keeps what its row showed, under
+ * the row's own id (r10, WP290-CX-R10-01: a fully valid row, of the order asked about or of another, is SHOWN; the
+ * id alone of an invalid row is NAMED).
+ */
 export function readOrderById(raw: unknown, venueOrderId: string): ReadOutcome<VenueOrderView | null> {
   const fields = readFields(raw, ["route", "found", "order"]);
-  if (fields === undefined) return malformed("the order answer carries a field that is not own data");
+  if (fields === undefined) {
+    const row = fieldOfRightRoute(raw, "/data/order", "order");
+    const kept = row === undefined || row === null ? undefined : keepOrderField(row);
+    return malformed("the order answer carries a field that is not own data", kept?.named, kept?.salvage);
+  }
   if (fields.route !== "/data/order") return wrongRoute(fields.route);
-  if (fields.found === false) return fields.order === undefined || fields.order === null ? ok(null) : malformed("a not-found answer carries an order");
-  if (fields.found !== true) return malformed("the order answer does not say whether the order was found");
-  const order = readOrderView(fields.order);
-  if (typeof order === "string") return malformed(order);
-  if (order.venueOrderId !== venueOrderId) return malformed("the order answer names another order");
+  if (fields.found === false && (fields.order === undefined || fields.order === null)) return ok(null);
+  const { order, named, salvage } = keepOrderField(fields.order);
+  if (fields.found === false) return malformed("a not-found answer carries an order", named, salvage);
+  if (fields.found !== true) return malformed("the order answer does not say whether the order was found", named, salvage);
+  if (typeof order === "string") return malformed(order, named, salvage);
+  if (order.venueOrderId !== venueOrderId) return malformed("the order answer names another order", named, salvage);
   return ok(order);
 }
 
@@ -312,49 +407,84 @@ function readTradeView(raw: unknown): VenueTradeView | string {
  * whole (`salvage`), with the row's trade id and status when those are readable (r6). The row's trade id itself, when
  * readable, is kept as a trade identity (`trades`, shape `MALFORMED`, with its status when that is text), whatever
  * its legs (r9, WP290-CX-R9-01): a leg that fails validation, or a row with no readable leg at all, never drops the
- * identity of the trade the venue reported. Nothing of a malformed leg but its order id is kept.
+ * identity of the trade the venue reported. Nothing of a malformed leg but its order id is kept. (r10, the door audit)
+ * A leg list one entry of which is not own data still keeps its other legs.
  */
-function keepLegsOf(named: Map<string, string | null>, salvage: SalvagedLeg[], trades: SalvagedTrade[], row: unknown): void {
+function keepLegsOf(named: Map<string, string | null>, salvage: SalvagedLeg[], trades: SalvagedTrade[], row: unknown): boolean {
   const tradeId = readField(row, "venueTradeId");
   const status = readField(row, "status");
   const venueTradeId = tradeId.kind === "DATA" && isIdentifier(tradeId.value) ? tradeId.value : null;
   const statusText = status.kind === "DATA" && isIdentifier(status.value) ? status.value : null;
   if (venueTradeId !== null) trades.push({ venueTradeId, status: statusText, shape: "MALFORMED" });
   const legs = readField(row, "ownLegs");
-  for (const leg of (legs.kind === "DATA" ? readArray(legs.value, MAX_LEGS_PER_TRADE) : undefined) ?? []) {
+  // (r10) Whether the row is identified even without its trade id: its leg list readable in full, not empty, every
+  // leg valid (each kept, unkeyed), and its ownership determined (its own legs are exactly those).
+  const list = legs.kind === "DATA" ? readArray(legs.value, MAX_LEGS_PER_TRADE) : undefined;
+  const undetermined = readField(row, "ownershipUndetermined");
+  let everyLegKept = list !== undefined && list.length > 0 && undetermined.kind === "DATA" && undetermined.value === false;
+  for (const leg of (legs.kind === "DATA" ? ownEntries(legs.value, MAX_LEGS_PER_TRADE) : undefined) ?? []) {
     const valid = readLeg(leg);
     if (typeof valid !== "string") {
       keepNamed(named, valid.venueOrderId, valid.tokenId);
       salvage.push({ venueTradeId, status: statusText, leg: valid });
     } else {
+      everyLegKept = false;
       const id = rowVenueId(leg);
       if (id !== undefined) keepNamed(named, id, null);
     }
   }
+  return venueTradeId !== null || everyLegKept;
 }
 
 /**
  * `/data/trades`: every trade of the account, own legs only. Every row is read once, whatever the answer's
  * outcome: an INCOMPLETE or MALFORMED answer keeps the venue order ids its rows' legs carry (`named`), every leg that
  * validated in full, and (r9) every trade identity its rows carry (`salvage.trades`): a row that validated in full,
- * legless or not, and the readable trade id of a malformed row.
+ * legless or not, and the readable trade id of a malformed row. (r10, the door audit) So does an answer one of whose
+ * top-level fields, or one of whose list entries, is not own data (its route readable and the right one).
  */
 export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]> {
   const fields = readFields(raw, ["route", "complete", "trades"]);
-  if (fields === undefined) return malformed("the trades answer carries a field that is not own data");
+  if (fields === undefined) {
+    const kept = readTradeRows(ownEntries(fieldOfRightRoute(raw, "/data/trades", "trades"), MAX_READ_ENTRIES));
+    return malformed("the trades answer carries a field that is not own data", kept.named, kept.salvage);
+  }
   if (fields.route !== "/data/trades") return wrongRoute(fields.route);
   const list = readArray(fields.trades, MAX_READ_ENTRIES);
+  // (r10, the door audit) A list one entry of which is not own data is unusable, but its other rows are still read.
+  const rows = readTradeRows(list ?? ownEntries(fields.trades, MAX_READ_ENTRIES));
+  const { out, named, problem } = rows;
+  // (r10) WHOLE: complete, its list readable, and every row identified: nothing of the account was left out.
+  const salvage: Salvage = { ...rows.salvage, whole: fields.complete === true && list !== undefined && rows.identified };
+  if (fields.complete !== true) {
+    return fields.complete === false ? incomplete(named, salvage) : malformed("the trades answer does not say whether it is complete", named, salvage);
+  }
+  if (list === undefined) return malformed("the trades are not a list", named, salvage);
+  if (problem !== undefined) return malformed(problem, named, salvage);
+  return ok(Object.freeze(out));
+}
+
+/** The trade rows of one list, each read once: the valid ones, and what every row carries (`named`, `salvage`). */
+function readTradeRows(list: readonly unknown[] | undefined): {
+  readonly out: VenueTradeView[];
+  readonly named: Map<string, string | null>;
+  readonly salvage: Salvage;
+  readonly problem: string | undefined;
+  /** (r10) Every row was identified (`keepLegsOf`): a valid row, a readable trade id, or every own leg kept. */
+  readonly identified: boolean;
+} {
   const out: VenueTradeView[] = [];
   const named = new Map<string, string | null>();
   const legs: SalvagedLeg[] = [];
   const trades: SalvagedTrade[] = [];
   const seen = new Set<string>();
   let problem: string | undefined;
+  let identified = true;
   for (const entry of list ?? []) {
     const trade = readTradeView(entry);
     if (typeof trade === "string") {
       problem ??= trade;
-      keepLegsOf(named, legs, trades, entry);
+      if (!keepLegsOf(named, legs, trades, entry)) identified = false;
       continue;
     }
     // (r9, WP290-CX-R9-01) The trade's identity and status, whatever its legs: a valid row with no own leg (its
@@ -371,13 +501,7 @@ export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]>
     seen.add(trade.venueTradeId);
     out.push(trade);
   }
-  const salvage: Salvage = { rows: [], legs, trades };
-  if (fields.complete !== true) {
-    return fields.complete === false ? incomplete(named, salvage) : malformed("the trades answer does not say whether it is complete", named, salvage);
-  }
-  if (list === undefined) return malformed("the trades are not a list");
-  if (problem !== undefined) return malformed(problem, named, salvage);
-  return ok(Object.freeze(out));
+  return { out, named, salvage: { rows: [], legs, trades }, problem, identified };
 }
 
 /** `/v2/positions` (Data API v2 only; E-15): token id → size. */

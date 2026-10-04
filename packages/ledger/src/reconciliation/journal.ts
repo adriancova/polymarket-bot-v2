@@ -176,7 +176,7 @@ export interface ResumeRefusedEvent {
 }
 
 /** What one evidence record is about (see {@link EvidenceRecordedEvent}). */
-export const EVIDENCE_KINDS = ["ORDER", "LEG", "TRADE", "SETTLED"] as const;
+export const EVIDENCE_KINDS = ["ORDER", "LEG", "TRADE", "UNKEYED_LEG", "SETTLED"] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 
 /**
@@ -199,6 +199,12 @@ export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
  * - `TRADE` (WP-290 r9): one trade row's trade identity (`venueTradeId`), whatever its legs, and its settlement
  *   `status` as read: a row that validated in full (its ownership determined or not, legless or not), or the readable
  *   id of a row that did not. It names no order (`venueOrderId` is `null`) and carries nothing else: no economics.
+ * - `UNKEYED_LEG` (WP-290 r10): one of the account's own legs, SHOWN in full on its venue order in a trade row whose
+ *   trade id was unreadable (`venueTradeId` is `null`): `size` is its shares, with every fill fact, and `level` is how
+ *   many such legs of exactly those facts its answer showed on the order (at least one). The coordinator holds the
+ *   order until the reads have shown that many trades of exactly those facts on it, under readable trade ids, beyond
+ *   every trade the evidence held when this record was folded (journal order); for good when its answer was not whole
+ *   (its source `TRADES_LEG_UNKEYED_PARTIAL`). Never booked.
  * - `SETTLED`: a SOUND run classified the venue order consistently with all of its evidence, up to `level` (the
  *   number of informative records about it then), or an operator released its not-found quarantine. It stops the
  *   order being read by id until new evidence about it arrives.
@@ -221,12 +227,12 @@ export interface EvidenceRecordedEvent {
   readonly originalSize: string | null;
   readonly size: string | null;
   readonly status: string | null;
-  /** `SETTLED` only. */
+  /** `SETTLED`: the level it covers; `UNKEYED_LEG` (r10): how many such unkeyed legs its answer showed (at least one). `null` otherwise. */
   readonly level: number | null;
   /**
-   * `LEG` only (r7, WP-290 WP290-CX-R7-02): the leg's fill facts as the observation fixed them (`null` when it did
-   * not), so a restart compares every later read of the fill against them: its exact fee, the fee's asset, its
-   * liquidity role and its match time (ISO-8601). Every other record carries `null`.
+   * `LEG` and (r10) `UNKEYED_LEG` only (r7, WP-290 WP290-CX-R7-02): the leg's fill facts as the observation fixed them
+   * (`null` when it did not), so a restart compares every later read of the fill against them: its exact fee, the
+   * fee's asset, its liquidity role and its match time (ISO-8601). Every other record carries `null`.
    */
   readonly feeAmount: string | null;
   readonly feeAssetId: string | null;
@@ -455,15 +461,23 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
   if (typeof provenance !== "string" || !(EVIDENCE_PROVENANCES as readonly string[]).includes(provenance) || typeof source !== "string" || !CODE.test(source)) return undefined;
   if (!(tokenId === null || (typeof tokenId === "string" && TOKEN_ID.test(tokenId))) || !(side === null || side === "BUY" || side === "SELL")) return undefined;
   if (!nullable(price, isDecimal) || !nullable(originalSize, isDecimal) || !nullable(size, isDecimal) || !nullable(status, isIdentifier) || !nullable(level, isCount)) return undefined;
-  // A leg and a trade (r9) name their trade; nothing else does. Only a settlement carries a level, and it names no trade.
-  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  // A leg and a trade (r9) name their trade; nothing else does. Only a settlement and (r10) an unkeyed leg carry a level.
+  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED" || evidenceKind === "UNKEYED_LEG") !== (level !== null)) return undefined;
   // Only a trade (r9) names no order, and it carries its status alone: nothing of an order, and no economics.
   if ((evidenceKind === "TRADE") !== (venueOrderId === null)) return undefined;
   if (evidenceKind === "TRADE" && (tokenId !== null || side !== null || price !== null || originalSize !== null || size !== null)) return undefined;
   // A leg's fill facts (r7): an exact fee, an id for its asset, a role, an instant; only a leg carries them.
   if (!nullable(feeAmount, isDecimal) || !nullable(feeAssetId, isIdentifier) || !(role === null || role === "MAKER" || role === "TAKER")) return undefined;
   if (!(matchedAt === null || (typeof matchedAt === "string" && INSTANT.test(matchedAt)))) return undefined;
-  if (evidenceKind !== "LEG" && (feeAmount !== null || feeAssetId !== null || role !== null || matchedAt !== null)) return undefined;
+  if (evidenceKind !== "LEG" && evidenceKind !== "UNKEYED_LEG" && (feeAmount !== null || feeAssetId !== null || role !== null || matchedAt !== null)) return undefined;
+  // (r10) An unkeyed leg was SHOWN in full: its order's token and side, its price and shares, its role and match time
+  // (its fee may be unfixed), nothing of an order's size, and at least one trade owed.
+  if (
+    evidenceKind === "UNKEYED_LEG" &&
+    (provenance !== "SHOWN" || tokenId === null || side === null || price === null || size === null || originalSize !== null || role === null || matchedAt === null || level === null || level < 1)
+  ) {
+    return undefined;
+  }
   return {
     kind: "EVIDENCE_RECORDED",
     runId,

@@ -370,7 +370,7 @@ export type JournalInput =
 export interface JournalEvidenceInput {
   readonly kind: "EVIDENCE_RECORDED";
   readonly runId: string | null;
-  readonly evidenceKind: "ORDER" | "LEG" | "TRADE" | "SETTLED";
+  readonly evidenceKind: "ORDER" | "LEG" | "TRADE" | "UNKEYED_LEG" | "SETTLED";
   /** `null` only for a TRADE record (r9: a trade identity, whatever its legs). */
   readonly venueOrderId: string | null;
   /** LEG and TRADE: the venue trade. */
@@ -383,8 +383,9 @@ export interface JournalEvidenceInput {
   readonly originalSize: string | null;
   readonly size: string | null;
   readonly status: string | null;
+  /** SETTLED: the level it covers; (r10) UNKEYED_LEG: how many such unkeyed legs its answer showed. */
   readonly level: number | null;
-  /** LEG only (r7): the leg's fill facts as the observation fixed them; `null` on every other record. */
+  /** LEG and (r10) UNKEYED_LEG only (r7): the leg's fill facts as the observation fixed them; `null` on every other record. */
   readonly feeAmount: string | null;
   readonly feeAssetId: string | null;
   readonly role: "MAKER" | "TAKER" | null;

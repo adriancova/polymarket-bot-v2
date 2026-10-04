@@ -11,12 +11,15 @@
  * | `OPEN_ORDERS_ID` | NAMED | the id alone of a malformed row (nothing else of it validated) |
  * | `TRADES_LEG` | SHOWN | an own leg of a trade in a valid trades read: the trade, its shares, its status |
  * | `TRADES_LEG_SALVAGED` | SHOWN | an own leg that validated in full inside an unusable trades answer |
- * | `TRADES_LEG_UNKEYED` | SHOWN | the same, when its trade's own id did not validate: the order matched at least its shares |
+ * | `TRADES_LEG_UNKEYED` | SHOWN | the same, when its trade's own id did not validate: the order matched at least its shares (r10: at least the shares of every trade known on it, plus its answer's unkeyed legs'); and (r10) an UNKEYED_LEG record of a WHOLE answer: the leg's every fill fact, and how many such legs its answer showed |
+ * | `TRADES_LEG_UNKEYED_PARTIAL` | SHOWN | (r10) the same UNKEYED_LEG record, from an answer that was not whole (partial, or a row of it not identified): no read can ever answer it |
  * | `TRADES_LEG_ID` | NAMED | the id alone of a malformed leg |
  * | `TRADES_ROW` | SHOWN | (r9) a TRADE record: a trade row that validated in full, its ownership determined (its own legs exactly) |
  * | `TRADES_ROW_PARTIAL` | SHOWN | (r9) a TRADE record: a trade row that validated in full, its ownership undetermined (no own leg, possibly) |
  * | `TRADES_ROW_ID` | NAMED | (r9) a TRADE record: the trade id (and status, when text) of a row that did not validate in full |
  * | `BY_ID` | SHOWN | a by-id read that found the order |
+ * | `BY_ID_ROW` | SHOWN | (r10) an order row that validated in full inside an unusable by-id answer (not found, found unsaid, another order's): under the row's OWN id |
+ * | `BY_ID_ID` | NAMED | (r10) the id alone of an invalid order row of an unusable by-id answer |
  * | `OMS_RETAINED` | NAMED | a venue order id the OMS retains as user-stream evidence |
  * | `STREAM_ORDER`, `STREAM_FILL`, `STREAM_SETTLEMENT` | NAMED | what the user stream reported, as routed to the OMS |
  *
@@ -75,7 +78,24 @@
  *   accounting of the legs the evidence holds (its legs are unknown). Nothing of a malformed row but its trade id and
  *   status is kept, so no malformed economics is ever compared or booked;
  * - (r7) an order a trade names (any leg, its shares known or not) matched something: a read showing nothing
- *   matched is a CONFLICT.
+ *   matched is a CONFLICT;
+ * - (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) an own leg a trades read showed in full in a row whose TRADE ID was
+ *   unreadable is a leg of a trade the evidence may not know. Its record (UNKEYED_LEG) carries every fill fact and how
+ *   many such legs of exactly those facts its answer showed on the order. An unkeyed row may be any trade the
+ *   evidence already held (its answer's other rows, folded first, and every trade any source named before, a lagging
+ *   read's or the stream's included), or a new one: fail closed, it is a new one. So the order is a CONFLICT, in every
+ *   run, until the reads have SHOWN, each under a readable trade id with a leg of exactly those facts on the order,
+ *   that many distinct trades the evidence did NOT hold when the unkeyed leg was seen (the store's fold order, journal
+ *   order: replayed the same). Only then is the activity accounted for under trade identities, each one durable (its
+ *   shares in the order's high-water mark, its own classification obligation). That is sound only for a WHOLE answer
+ *   (complete, every row identified): every trade of that time is in it, keyed (so held) or unkeyed, so a trade first
+ *   shown later by a lagging read is the unkeyed one (the r7 assumption: the trades read keeps every trade not yet
+ *   accounted for). An answer that is NOT whole may have left out a trade of exactly the same facts that no observation
+ *   knew, which a lagging read could show in the unkeyed one's place: its unkeyed leg (`TRADES_LEG_UNKEYED_PARTIAL`)
+ *   is never answered, and its order holds for good (fail closed; an operator path needs the retraction ADR).
+ *   Keeping the order's matched lower bound is not enough (a leg no larger than what the order already showed adds
+ *   nothing to it: the coordinator now records the known trades' shares PLUS the unkeyed legs'), and no economics of
+ *   an unkeyed leg is ever booked;
  *
  * Pure: no I/O, no clock, no randomness. Exact decimal strings throughout.
  */
@@ -89,7 +109,7 @@ import { isIsoInstant, orderStatusOf, tradeStatusOf } from "./door.js";
 import type { VenueOrderView, VenueTradeLeg, VenueTradeStatus, VenueTradeView } from "./ports.js";
 import { sameInstantText } from "./time.js";
 
-export type EvidenceKind = "ORDER" | "LEG" | "TRADE" | "SETTLED";
+export type EvidenceKind = "ORDER" | "LEG" | "TRADE" | "UNKEYED_LEG" | "SETTLED";
 export type EvidenceProvenance = "SHOWN" | "NAMED";
 
 export const EVIDENCE_SOURCES = [
@@ -99,11 +119,14 @@ export const EVIDENCE_SOURCES = [
   "TRADES_LEG",
   "TRADES_LEG_SALVAGED",
   "TRADES_LEG_UNKEYED",
+  "TRADES_LEG_UNKEYED_PARTIAL",
   "TRADES_LEG_ID",
   "TRADES_ROW",
   "TRADES_ROW_PARTIAL",
   "TRADES_ROW_ID",
   "BY_ID",
+  "BY_ID_ROW",
+  "BY_ID_ID",
   "OMS_RETAINED",
   "STREAM_ORDER",
   "STREAM_FILL",
@@ -138,18 +161,21 @@ export interface EvidenceRecord {
   readonly side: "BUY" | "SELL" | null;
   readonly price: DecimalString | null;
   readonly originalSize: DecimalString | null;
-  /** ORDER: the matched size shown (`TRADES_LEG_UNKEYED`: a lower bound); LEG: the leg's shares. */
+  /** ORDER: the matched size shown (`TRADES_LEG_UNKEYED`: a lower bound); LEG and UNKEYED_LEG: the leg's shares. */
   readonly size: DecimalString | null;
   readonly status: string | null;
-  /** SETTLED only. */
+  /**
+   * SETTLED: the level it covers. (r10) UNKEYED_LEG: how many unkeyed legs of exactly its fill facts its answer showed
+   * on its order (at least one).
+   */
   readonly level: number | null;
-  /** LEG only (r7, WP290-CX-R7-02): the leg's exact fee, when the observation fixed it. */
+  /** LEG and (r10) UNKEYED_LEG only (r7, WP290-CX-R7-02): the leg's exact fee, when the observation fixed it. */
   readonly feeAmount: DecimalString | null;
-  /** LEG only: the asset the fee is charged in. */
+  /** LEG and UNKEYED_LEG only: the asset the fee is charged in. */
   readonly feeAssetId: string | null;
-  /** LEG only: the leg's liquidity role. */
+  /** LEG and UNKEYED_LEG only: the leg's liquidity role. */
   readonly role: "MAKER" | "TAKER" | null;
-  /** LEG only: the match time (ISO-8601). */
+  /** LEG and UNKEYED_LEG only: the match time (ISO-8601). */
   readonly matchedAt: string | null;
 }
 
@@ -168,7 +194,7 @@ const ORDER_FACTS = ["tokenId", "side", "price", "originalSize"] as const;
 type OrderFact = (typeof ORDER_FACTS)[number];
 /** A trade leg's fill facts (r7, WP290-CX-R7-02): never change for one (trade, order) fill. */
 const LEG_FACTS = ["shares", "price", "feeAmount", "feeAssetId", "role", "matchedAt", "tokenId", "side"] as const;
-type LegFact = (typeof LEG_FACTS)[number];
+export type LegFact = (typeof LEG_FACTS)[number];
 const DECIMAL_FACTS: readonly string[] = ["price", "originalSize", "shares", "feeAmount"];
 
 /** Whether two values of one fact are the same value: decimals by value, a match time as an instant, text exactly. */
@@ -183,6 +209,51 @@ function pushValue(fact: string, values: string[], value: string | null): boolea
   if (value === null || values.some((known) => sameValue(fact, known, value)) || values.length >= MAX_VALUES) return false;
   values.push(value);
   return true;
+}
+
+/** One fill's facts, each `null` when the observation did not fix it (an UNKEYED_LEG's are those of a valid leg). */
+export type FillFacts = Readonly<Record<LegFact, string | null>>;
+
+/** Two fills' facts are the same fill's facts: every fact the same value (decimals by value, a time as an instant), or unfixed in both. */
+function sameFill(a: FillFacts, b: FillFacts): boolean {
+  return LEG_FACTS.every((fact) => {
+    const x = a[fact];
+    const y = b[fact];
+    return x === null || y === null ? x === y : sameValue(fact, x, y);
+  });
+}
+
+/**
+ * (r10) Whether a leg the evidence holds SHOWS exactly these fill facts: shown in full by a read (with its trade's
+ * readable id), and every fact with exactly one value, the same (a fact the facts leave unfixed: none shown). A leg
+ * whose facts were shown two ways (a durable contradiction of its own) is never one.
+ */
+function showsFacts(leg: LegEntry, facts: FillFacts): boolean {
+  if (!leg.shown) return false;
+  return LEG_FACTS.every((fact) => {
+    const values = leg.facts[fact];
+    const value = facts[fact];
+    if (value === null) return values.length === 0;
+    const only = values[0];
+    return values.length === 1 && only !== undefined && sameValue(fact, only, value);
+  });
+}
+
+function factsOf(record: EvidenceRecord): FillFacts {
+  return {
+    shares: record.size,
+    price: record.price,
+    feeAmount: record.feeAmount,
+    feeAssetId: record.feeAssetId,
+    role: record.role,
+    matchedAt: record.matchedAt,
+    tokenId: record.tokenId,
+    side: record.side,
+  };
+}
+
+function describeFill(facts: FillFacts): string {
+  return `${facts.side ?? "?"} ${facts.shares ?? "?"} at ${facts.price ?? "?"}, fee ${facts.feeAmount ?? "unfixed"}${facts.feeAssetId === null ? "" : ` in ${facts.feeAssetId}`}, ${facts.role ?? "?"}, matched ${facts.matchedAt ?? "?"}`;
 }
 
 /** "price 0.5 / 0.6"-style texts for every fact shown with more than one value. */
@@ -204,6 +275,13 @@ interface OrderEntry {
   level: number;
   /** The level a SETTLED record covers (-1: never settled). */
   settledLevel: number;
+  /**
+   * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) Every UNKEYED_LEG observation on this order that owes something new: the
+   * fill's facts, how many such unkeyed legs its answer showed (`need`), and how many trades the evidence then held
+   * (`before`: the first `before` trades of the store's fold order, on any order or none, which can never answer it).
+   * Never bounded: each is decided on.
+   */
+  unkeyed: { readonly facts: FillFacts; readonly need: number; readonly before: number; readonly partial: boolean }[];
 }
 
 interface LegEntry {
@@ -374,7 +452,18 @@ function cloneFacts<K extends string>(facts: Readonly<Record<K, readonly string[
 }
 
 function cloneOrders(orders: ReadonlyMap<string, OrderEntry>): Map<string, OrderEntry> {
-  return new Map([...orders].map(([id, entry]) => [id, { ...entry, sources: [...entry.sources], statuses: [...entry.statuses], facts: cloneFacts(entry.facts) }]));
+  return new Map(
+    [...orders].map(([id, entry]) => [
+      id,
+      {
+        ...entry,
+        sources: [...entry.sources],
+        statuses: [...entry.statuses],
+        facts: cloneFacts(entry.facts),
+        unkeyed: entry.unkeyed.map((fill) => ({ ...fill })),
+      },
+    ]),
+  );
 }
 
 function cloneTrades(trades: ReadonlyMap<string, TradeEntry>): Map<string, TradeEntry> {
@@ -432,6 +521,11 @@ function orderView(orders: ReadonlyMap<string, OrderEntry>, trades: ReadonlyMap<
 export class EvidenceStore {
   readonly #orders = new Map<string, OrderEntry>();
   readonly #trades = new Map<string, TradeEntry>();
+  /**
+   * (r10) Every trade the evidence holds, in the order it was first folded (journal order, so a rebuild makes the same
+   * list): what the evidence held at any point of the fold, whatever the record (a leg, on any order; a trade identity).
+   */
+  readonly #tradeOrder: string[] = [];
   /** The evidence as it stood before this run's reads were folded in (`beginRun`): each observation is judged against it. */
   #baseline: { readonly orders: Map<string, OrderEntry>; readonly trades: Map<string, TradeEntry> } = { orders: new Map(), trades: new Map() };
 
@@ -497,11 +591,70 @@ export class EvidenceStore {
           informative = true;
         }
       }
+    } else if (record.evidenceKind === "UNKEYED_LEG") {
+      if (this.#addUnkeyed(order, record)) informative = true;
     } else if (record.venueTradeId !== null) {
       if (this.#addLeg(record, venueOrderId)) informative = true;
     }
     if (informative) order.level += 1;
     return informative;
+  }
+
+  /**
+   * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) Fold one UNKEYED_LEG record: the fill it showed, how many unkeyed legs of
+   * exactly those facts its answer showed (`level`), and how many trades the evidence holds NOW (they can never answer
+   * it: the unkeyed row may be any of them). `true` when it owes something no earlier observation of the same fill
+   * owes: a new fill, more legs, or a trade the evidence learned since. A repeated observation of the same answer, with
+   * nothing learned between, owes nothing new (and is not journaled).
+   */
+  #addUnkeyed(order: OrderEntry, record: EvidenceRecord): boolean {
+    const need = record.level;
+    // Unreachable through either door (an UNKEYED_LEG owes at least one trade); nothing is folded from it.
+    if (need === null || need < 1) return false;
+    const facts = factsOf(record);
+    const before = this.#tradeOrder.length;
+    // (r10) One from an answer that was not whole is never answered: nothing about the same fill owes more than it.
+    const partial = record.source === "TRADES_LEG_UNKEYED_PARTIAL";
+    if (order.unkeyed.some((fill) => sameFill(fill.facts, facts) && (fill.partial || (!partial && fill.before === before && fill.need >= need)))) return false;
+    order.unkeyed.push({ facts, need, before, partial });
+    return true;
+  }
+
+  /**
+   * (r10) The trades the evidence holds with a leg on `venueOrderId` that a read SHOWED in full, with a readable trade
+   * id, and with exactly these fill facts (sorted): the only trades that can answer an unkeyed leg of those facts.
+   */
+  keyedTradesShowing(venueOrderId: string, facts: FillFacts): string[] {
+    const out: string[] = [];
+    for (const [tradeId, trade] of this.#trades) {
+      const leg = trade.legs.get(venueOrderId);
+      if (leg !== undefined && showsFacts(leg, facts)) out.push(tradeId);
+    }
+    return out.sort();
+  }
+
+  /**
+   * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) Every unkeyed observation on one venue order whose obligation is not met:
+   * the reads have shown, with a readable id and a leg of exactly its facts on the order, fewer trades the evidence did
+   * not hold when it was made than it showed unkeyed legs. `known` lists, for the operator, the trades with a leg on the
+   * order the evidence held then (they cannot answer it; neither can any other trade it held). Each is a CONFLICT of
+   * the order in every run until it is met (`#judgeOrder`).
+   */
+  unaccountedUnkeyed(
+    venueOrderId: string,
+  ): { readonly facts: FillFacts; readonly need: number; readonly partial: boolean; readonly known: readonly string[]; readonly shown: readonly string[] }[] {
+    const order = this.#orders.get(venueOrderId);
+    if (order === undefined) return [];
+    const out: { readonly facts: FillFacts; readonly need: number; readonly partial: boolean; readonly known: readonly string[]; readonly shown: readonly string[] }[] = [];
+    for (const fill of order.unkeyed) {
+      const held = new Set(this.#tradeOrder.slice(0, fill.before));
+      const shown = this.keyedTradesShowing(venueOrderId, fill.facts).filter((tradeId) => !held.has(tradeId));
+      // (r10) One from an answer that was not whole is never met: a trade the answer left out could stand in for it.
+      if (!fill.partial && shown.length >= fill.need) continue;
+      const known = [...held].filter((tradeId) => this.#trades.get(tradeId)?.legs.has(venueOrderId) === true).sort();
+      out.push(Object.freeze({ facts: fill.facts, need: fill.need, partial: fill.partial, known: Object.freeze(known), shown: Object.freeze(shown) }));
+    }
+    return out;
   }
 
   /** The trade's entry, created when new (`created`: new information). */
@@ -510,6 +663,8 @@ export class EvidenceStore {
     if (existing !== undefined) return { trade: existing, created: false };
     const trade: TradeEntry = { shown: false, legs: new Map(), status: null, statuses: [], terminals: [], legsUnidentified: false, legsInFull: false, sources: [] };
     this.#trades.set(tradeId, trade);
+    // (r10) An unkeyed leg seen from now on may be this trade.
+    this.#tradeOrder.push(tradeId);
     return { trade, created: true };
   }
 
@@ -578,6 +733,7 @@ export class EvidenceStore {
       statuses: [],
       level: 0,
       settledLevel: -1,
+      unkeyed: [],
     };
     this.#orders.set(id, entry);
     return { entry, created: true };
@@ -703,6 +859,19 @@ export class EvidenceStore {
         problem(
           "READ_CONFLICT",
           `venue order ${id}: observations showed different fixed facts (${evidence.contradictions.join("; ")}; sources: ${evidence.sources.join(", ")}): which is the venue's is unknown, so nothing about it is concluded`,
+        ),
+      );
+    }
+    // (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) An own leg a trades read showed in full on this order in a row whose
+    // trade id was unreadable, that the reads have not yet shown under enough distinct readable trade ids: it may be a
+    // trade the evidence does not know, so nothing about the order is concluded, in any run, whatever this run read.
+    for (const fill of this.unaccountedUnkeyed(id)) {
+      problems.push(
+        problem(
+          "READ_CONFLICT",
+          fill.partial
+            ? `venue order ${id}: a trades read showed ${String(fill.need)} own leg(s) on it (${describeFill(fill.facts)}) in a row whose trade id was unreadable, in an answer that did not show every trade of the account (partial, or a row of it not identified): a trade of exactly those facts that the answer left out could be shown in its place, so no read can answer it (it holds until an operator path exists; trades already held there: ${fill.known.join(", ") || "none"})`
+            : `venue order ${id}: a trades read showed ${String(fill.need)} own leg(s) on it (${describeFill(fill.facts)}) in a row whose trade id was unreadable: each could be a trade the evidence does not know, so the reads owe ${String(fill.need)} distinct trade(s) with a leg of exactly those facts on it, shown by a readable id, beyond the ${String(fill.known.length)} it already held there (${fill.known.join(", ") || "none"}), and they have shown ${String(fill.shown.length)} (${fill.shown.join(", ") || "none"}): the activity is not accounted for under any trade's identity`,
         ),
       );
     }
@@ -908,15 +1077,16 @@ export function readEvidenceRecord(raw: unknown): EvidenceRecord | undefined {
   ]);
   if (fields === undefined) return undefined;
   const { evidenceKind, venueOrderId, venueTradeId, provenance, source, tokenId, side, price, originalSize, size, status, level, feeAmount, feeAssetId, role, matchedAt } = fields;
-  if (evidenceKind !== "ORDER" && evidenceKind !== "LEG" && evidenceKind !== "TRADE" && evidenceKind !== "SETTLED") return undefined;
+  if (evidenceKind !== "ORDER" && evidenceKind !== "LEG" && evidenceKind !== "TRADE" && evidenceKind !== "UNKEYED_LEG" && evidenceKind !== "SETTLED") return undefined;
   if (!(venueOrderId === null || isIdentifier(venueOrderId)) || !(venueTradeId === null || isIdentifier(venueTradeId))) return undefined;
   if ((provenance !== "SHOWN" && provenance !== "NAMED") || typeof source !== "string" || !(EVIDENCE_SOURCES as readonly string[]).includes(source)) return undefined;
   if (!(tokenId === null || isTokenId(tokenId)) || !(side === null || side === "BUY" || side === "SELL")) return undefined;
   const decimal = (value: unknown): value is DecimalString | null => value === null || isCanonicalDecimalString(value);
   if (!decimal(price) || !decimal(originalSize) || !decimal(size) || !(status === null || isIdentifier(status))) return undefined;
   if (!(level === null || (typeof level === "number" && Number.isSafeInteger(level) && level >= 0))) return undefined;
-  // A LEG and a TRADE name their trade, nothing else does; only a TRADE names no order (r9); only a SETTLED has a level.
-  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  // A LEG and a TRADE name their trade, nothing else does; only a TRADE names no order (r9); only a SETTLED and (r10) an
+  // UNKEYED_LEG have a level.
+  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED" || evidenceKind === "UNKEYED_LEG") !== (level !== null)) return undefined;
   if ((evidenceKind === "TRADE") !== (venueOrderId === null)) return undefined;
   // (r9) A TRADE comes from a trade row (and only a TRADE does), SHOWN when the row validated in full, and carries its
   // status alone: nothing of an order, and no economics.
@@ -927,8 +1097,29 @@ export function readEvidenceRecord(raw: unknown): EvidenceRecord | undefined {
   if (!decimal(feeAmount) || !(feeAssetId === null || isIdentifier(feeAssetId)) || !(role === null || role === "MAKER" || role === "TAKER") || !(matchedAt === null || isIsoInstant(matchedAt))) {
     return undefined;
   }
-  // Only a leg carries fill facts (r7).
-  if (evidenceKind !== "LEG" && (feeAmount !== null || feeAssetId !== null || role !== null || matchedAt !== null)) return undefined;
+  // (r10) Only an UNKEYED_LEG comes from an answer that was not whole.
+  if (source === "TRADES_LEG_UNKEYED_PARTIAL" && evidenceKind !== "UNKEYED_LEG") return undefined;
+  // Only a leg (r7) and an unkeyed leg (r10) carry fill facts.
+  if (evidenceKind !== "LEG" && evidenceKind !== "UNKEYED_LEG" && (feeAmount !== null || feeAssetId !== null || role !== null || matchedAt !== null)) return undefined;
+  // (r10) An UNKEYED_LEG is an own leg SHOWN in full under no readable trade id (`TRADES_LEG_UNKEYED`): every fill fact
+  // a valid leg fixes (its fee may be unfixed), nothing of an order, and at least one trade owed.
+  if (
+    evidenceKind === "UNKEYED_LEG" &&
+    (provenance !== "SHOWN" ||
+      (source !== "TRADES_LEG_UNKEYED" && source !== "TRADES_LEG_UNKEYED_PARTIAL") ||
+      tokenId === null ||
+      side === null ||
+      price === null ||
+      size === null ||
+      compareDecimal(size, "0") <= 0 ||
+      originalSize !== null ||
+      role === null ||
+      matchedAt === null ||
+      level === null ||
+      level < 1)
+  ) {
+    return undefined;
+  }
   return Object.freeze({
     evidenceKind,
     venueOrderId,
@@ -1039,6 +1230,52 @@ export function tradeRecord(venueTradeId: string, status: string | null, source:
     level: null,
     ...NO_FILL_FACTS,
   });
+}
+
+/**
+ * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) An UNKEYED_LEG record: an own leg a trades read showed in full in a row whose
+ * trade id was unreadable, with every fill fact, its row's status as read (detail only), `count`: how many such unkeyed
+ * legs of exactly these facts on its order the one answer showed, and whether that answer was WHOLE (`door.ts`): one
+ * that was not (`TRADES_LEG_UNKEYED_PARTIAL`) is never answered (see {@link EvidenceStore}).
+ */
+export function unkeyedLegRecord(leg: VenueTradeLeg, status: string | null, count: number, whole: boolean): EvidenceRecord {
+  return Object.freeze({
+    evidenceKind: "UNKEYED_LEG",
+    venueOrderId: leg.venueOrderId,
+    venueTradeId: null,
+    provenance: "SHOWN",
+    source: whole ? "TRADES_LEG_UNKEYED" : "TRADES_LEG_UNKEYED_PARTIAL",
+    tokenId: leg.tokenId,
+    side: leg.side,
+    price: leg.price,
+    originalSize: null,
+    size: leg.shares,
+    status,
+    level: count,
+    feeAmount: leg.feeAmount,
+    feeAssetId: leg.feeAssetId,
+    role: leg.role,
+    matchedAt: leg.matchedAt,
+  });
+}
+
+/** The fill facts of one valid leg (an UNKEYED_LEG's, before it is recorded). */
+export function fillFactsOfLeg(leg: VenueTradeLeg): FillFacts {
+  return {
+    shares: leg.shares,
+    price: leg.price,
+    feeAmount: leg.feeAmount,
+    feeAssetId: leg.feeAssetId,
+    role: leg.role,
+    matchedAt: leg.matchedAt,
+    tokenId: leg.tokenId,
+    side: leg.side,
+  };
+}
+
+/** Whether two valid legs show the same fill facts (decimals by value, a time as an instant). */
+export function sameFillOfLegs(a: VenueTradeLeg, b: VenueTradeLeg): boolean {
+  return sameFill(fillFactsOfLeg(a), fillFactsOfLeg(b));
 }
 
 /** An ORDER record of an id only named (and, for the stream, its status when it reported one). */
