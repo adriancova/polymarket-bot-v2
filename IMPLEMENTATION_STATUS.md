@@ -67,6 +67,14 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `CONTROL-2` is Complete (2026-10-04, `2f84ad7`); see [Work packages](#work-packages). It closes `H1R1-HALT-INVISIBLE` and `CONTROL1B-LOWS` R5-L1 to R5-L3, under grants S1 and S2 (the record has them).
 - `FLAKES-1` is Complete (2026-10-04, `e476a49`); see [Work packages](#work-packages). It closes `FLAKE-CANONICAL-ORDER` and the "TWICE pace" flake. `TC-LOCAL-FLAKE` is deferred, with its measured cause.
 - **`CAP-1`**: Ready (authorized) 2026-10-04, a residual round for `CAP-OVERSHOOT`. A filled order's capital must never vanish from the cap check: a reservation is converted to filled exposure, never released, until the exact remainder. It holds one invariant at one choke point, under a seeded property test, and stops if what a cap means would have to change (an ADR matter). Paths: `packages/capital-allocator/**`, `packages/risk/src/**`, `packages/trading-core/**`, `packages/inventory/src/**`, and the paper-trader, e2e and golden tests. Verifiers: Opus and gpt-6-astra, reconciled (risk and capital). **Ruling, 2026-10-04, on its implementer's one STOPPED item:** risk checks 16 and 17 (worst-case contractual loss and scenario loss) have the same unbooked-fill window. The orchestrator extends the same fail-closed invariant to them, through a new, separate risk input for filled-but-unbooked exposure. It counts in worst-case and scenario loss only. It never counts as a sellable position (§6 invariant 10) or as an open order (check 18). It may only make risk more conservative.
+- **`VENUE-SETL-1`**: Ready (authorized) 2026-10-04, commissioned by the user. A combined venue round and settlement-spec prep for `btc-15m-updown`:
+  - `ROLLOVER-1` Q3's four facts;
+  - the rules text pinned;
+  - the TWAP reading resolved from evidence;
+  - a corrected seed, still UNVERIFIED;
+  - the sign-off path, and a one-page checklist for the user.
+
+  Public unauthenticated reads only. Paths: `docs/venue/verified-2026-10-04.md`, `docs/settlement/**`, the two `btc-15m-updown` seed files (values only), and `test/fixtures/venue/gamma-series/**`. Verifiers: Opus and gpt-6-astra, reconciled.
 - `CADENCE-1` is Complete (2026-10-03, `8d7086a`): ADR-026. On the H1 burst, catch-up throughput rose from 874 to 8,440 events/s, and paced max lag fell from 8.56 s to 0.07 s. See [Work packages](#work-packages); its grants are recorded in `docs/handoffs/CADENCE-1.md`.
 - `APPROX-REPLAY-1` is Complete (2026-10-03, `86830d9`); see [Work packages](#work-packages).
 - `WALCAP-1` is Complete (2026-10-03, `da559ca`); see [Work packages](#work-packages).
