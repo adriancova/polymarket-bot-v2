@@ -35,8 +35,15 @@
  *
  * Offering stops at the first halt: every later envelope would be suppressed
  * anyway, and the halt is the result.
+ *
+ * WHICH CLOCK A SCHEDULE RUNS ON (`FLAKES-1`). By default a numeric rate is
+ * scheduled on the wall clock, as above. A caller may instead ask for the
+ * `runnable` clock ({@link ScheduleClock}): the wall clock minus the time the
+ * driving thread spent waiting for a CPU. The command-line benchmark never
+ * asks for it, so its reports are unchanged.
  */
 
+import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
@@ -59,6 +66,55 @@ export type OfferedRate = number | "saturate";
  */
 export type Pacing = "uniform" | "recorded";
 
+/**
+ * The clock a numeric offered rate's schedule runs on (`FLAKES-1`).
+ *
+ * - `wall` (the default): envelope `i` is offered once its due time has passed
+ *   on the wall clock, measured from the start.
+ * - `runnable`: the same, minus the time this thread spent RUNNABLE BUT NOT
+ *   RUNNING, waiting on the host's run queue for a CPU. Linux counts that per
+ *   thread as `run_delay`, the second field of `/proc/thread-self/schedstat`
+ *   ({@link threadRunQueueWaitMs}).
+ *
+ * Why `runnable` exists. The driver and the publisher share ONE thread. On a
+ * host saturated by other work, that thread can wait tens of milliseconds for
+ * a CPU. Neither can run in that gap, yet the wall-clock schedule keeps
+ * advancing. When the thread runs again, the driver admits the whole gap's
+ * envelopes in one synchronous turn: measured at 20 busy processes on a
+ * 24-thread host, single turns of 666 envelopes and a queue high-water of 969
+ * of 1,024. That burst measures the host, not the publish path.
+ *
+ * What `runnable` does not excuse. The run-queue wait is time the thread
+ * could not run at all, so nothing the publisher does can create it on a host
+ * with a free CPU. The thread's own work still counts in full: CPU time spent
+ * encoding or parsing, a garbage-collection pause, a synchronous call that
+ * blocks the thread. So does every wait for Redis or the network. On a host
+ * with headroom the wait stays near zero (0.2-1.7 ms over a 450 ms replay,
+ * measured) and the two clocks agree. Where the host does not report the wait,
+ * `runnable` falls back to `wall`, the stricter clock, and the result says so
+ * ({@link PublishBenchResult.scheduleClock}).
+ */
+export type ScheduleClock = "wall" | "runnable";
+
+/** Linux's per-thread scheduler statistics: on-CPU ns, run-queue wait ns, timeslices. */
+const THREAD_SCHEDSTAT = "/proc/thread-self/schedstat";
+
+/**
+ * This thread's cumulative run-queue wait in ms (`run_delay`, see
+ * {@link ScheduleClock}), or `undefined` where the host does not report it.
+ */
+export function threadRunQueueWaitMs(): number | undefined {
+  let text: string;
+  try {
+    text = readFileSync(THREAD_SCHEDSTAT, "utf8");
+  } catch {
+    return undefined;
+  }
+  const field = text.trim().split(/\s+/u)[1];
+  if (field === undefined || !/^[0-9]{1,18}$/u.test(field)) return undefined;
+  return Number(field) / 1e6;
+}
+
 export interface PublishBenchOptions {
   readonly transport: MarketEventTransport;
   readonly stream: string;
@@ -67,6 +123,8 @@ export interface PublishBenchOptions {
   readonly offeredRate: OfferedRate;
   /** Ignored for `"saturate"`. Defaults to `uniform`. */
   readonly pacing?: Pacing;
+  /** Ignored for `"saturate"`. Defaults to `wall` (see {@link ScheduleClock}). */
+  readonly scheduleClock?: ScheduleClock;
   /** Omitted: the publisher's default bound, which is what the benchmark is for. */
   readonly maxQueueDepth?: number;
   /** Omitted: the publisher's default bound. */
@@ -87,6 +145,18 @@ export interface PublishBenchOptions {
 export interface PublishBenchResult {
   readonly offeredRate: OfferedRate;
   readonly pacing: Pacing;
+  /**
+   * The clock the schedule really ran on: `wall` for `"saturate"`, for a
+   * caller that did not ask for `runnable`, and where the host does not
+   * report run-queue waits.
+   */
+  readonly scheduleClock: ScheduleClock;
+  /**
+   * How far the `runnable` schedule fell behind the wall clock: the driving
+   * thread's run-queue wait between the first and the last offer, in ms.
+   * Always 0 on the `wall` clock.
+   */
+  readonly runQueueWaitMs: number;
   readonly envelopes: number;
   /** `enqueue()` calls made; less than `envelopes` when publication halted. */
   readonly offered: number;
@@ -236,6 +306,8 @@ export async function runPublishBench(options: PublishBenchOptions): Promise<Pub
   };
 
   const startedAt = performance.now();
+  let scheduleClock: ScheduleClock = "wall";
+  let runQueueWaitMs = 0;
   if (options.offeredRate === "saturate") {
     const target = Math.max(1, Math.floor(publisher.metrics().queueMaxDepth / 2));
     while (next < total && !publisher.halted) {
@@ -248,8 +320,15 @@ export async function runPublishBench(options: PublishBenchOptions): Promise<Pub
       throw new Error(`offered rate must be a positive number of events per second, received ${String(rate)}`);
     }
     const due = dueTimesMs(envelopes, rate, options.pacing ?? "uniform");
+    const waitAtStart = options.scheduleClock === "runnable" ? threadRunQueueWaitMs() : undefined;
+    if (waitAtStart !== undefined) scheduleClock = "runnable";
     while (next < total && !publisher.halted) {
-      const elapsedMs = performance.now() - startedAt;
+      if (waitAtStart !== undefined) {
+        // Monotone: a reading that fails mid-run keeps the last good one.
+        const waitedNow = threadRunQueueWaitMs();
+        if (waitedNow !== undefined) runQueueWaitMs = Math.max(runQueueWaitMs, waitedNow - waitAtStart);
+      }
+      const elapsedMs = performance.now() - startedAt - runQueueWaitMs;
       while (next < total && !publisher.halted && (due[next] ?? Infinity) <= elapsedMs) admit();
       await yieldToTimers();
     }
@@ -266,6 +345,8 @@ export async function runPublishBench(options: PublishBenchOptions): Promise<Pub
   return {
     offeredRate: options.offeredRate,
     pacing: options.pacing ?? "uniform",
+    scheduleClock,
+    runQueueWaitMs,
     envelopes: total,
     offered: next,
     published,

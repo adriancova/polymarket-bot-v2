@@ -15,6 +15,14 @@
  *    with no overflow. Measured before this package (base `051d058`), the
  *    same replay overflowed the admission queue in every run; the candidate
  *    peaked at about 60 of 1,024 (`tools/bench/gateway/README.md`).
+ *    `FLAKES-1`: the schedule runs on the `runnable` clock (see
+ *    `ScheduleClock` in `./bench/publish-bench.ts`). Time the shared driver
+ *    and publisher thread spent waiting for a CPU no longer advances the
+ *    replay. On a loaded host that wait is what used to overflow it: the whole
+ *    gap was admitted in one turn. On a host with headroom the wait is near
+ *    zero, and the replay is the wall-clock replay it always was. Every
+ *    assertion is unchanged, and base `051d058` still overflows (the round's
+ *    handoff).
  * 2. Byte identity: the stream entries the batched path writes are, field for
  *    field, the ones per-envelope publication writes.
  * 3. The runner script (`tools/bench/gateway/run.sh`) runs end to end.
@@ -194,7 +202,22 @@ describe("the gateway publish path on a real Redis (THROUGHPUT-1b)", () => {
     const transport = await connect();
     const stream = uniqueStreamName("tp1b-sample");
 
-    const result = await runPublishBench({ transport, stream, envelopes, offeredRate: rate, pacing: "recorded" });
+    const result = await runPublishBench({
+      transport,
+      stream,
+      envelopes,
+      offeredRate: rate,
+      pacing: "recorded",
+      scheduleClock: "runnable",
+    });
+    console.log(
+      `[FLAKES-1 measured] 2x pace: queue high-water ${String(result.queueMaxDepthObserved)} of 1024; ` +
+        `the ${result.scheduleClock} schedule waited ${result.runQueueWaitMs.toFixed(1)} ms for a CPU ` +
+        `in ${result.elapsedMs.toFixed(0)} ms`,
+    );
+    // Linux reports the run-queue wait; elsewhere the replay falls back to the
+    // stricter wall clock, and says so.
+    expect(result.scheduleClock).toBe(process.platform === "linux" ? "runnable" : "wall");
 
     expect(result.halt).toBeUndefined();
     expect(result.overflowed).toBe(false);
