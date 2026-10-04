@@ -19,7 +19,9 @@
  * `named` (each id a row or leg carries, with its token when the row
  * validated in full, `null` for the id alone of a malformed row) and
  * `salvage` (every row and every leg that validated in full, with its matched
- * size or shares and its status as read). The coordinator records all of it
+ * size or shares and its status as read, and, r9, every trade identity a
+ * trade row carries: a valid row's, legless or not, and the readable trade id
+ * and status of a malformed row). The coordinator records all of it
  * as evidence (`evidence.ts`) before anything is classified, so a later read
  * that shows less can never be taken for the truth. Statuses are kept as data: an order
  * or trade status outside the documented vocabulary is not malformed, it is
@@ -62,12 +64,32 @@ export interface SalvagedLeg {
 }
 
 /**
+ * How one trade row of an unusable trades answer showed its trade (r9, WP290-CX-R9-01):
+ * - `IN_FULL`: the row validated in full and its ownership is determined: its own legs are exactly those it shows;
+ * - `OWNERSHIP_UNDETERMINED`: the row validated in full, but the read could not establish which legs are the
+ *   account's (it may show none);
+ * - `MALFORMED`: the row did not validate in full; only its trade id (and its status, when that is text) was readable.
+ */
+export type SalvagedTradeShape = "IN_FULL" | "OWNERSHIP_UNDETERMINED" | "MALFORMED";
+
+/** One trade IDENTITY a row of an unusable trades answer carries, whatever its legs (r9, WP290-CX-R9-01). */
+export interface SalvagedTrade {
+  readonly venueTradeId: string;
+  /** The row's status as read (text only, never interpreted here); `null` when it was not readable. */
+  readonly status: string | null;
+  readonly shape: SalvagedTradeShape;
+}
+
+/**
  * What the rows of an unusable open-orders or trades answer SHOWED in full (r6, WP290-CX-R6-01): every order row
- * and every own leg that validated in full. The answer is discarded; these facts are not (`evidence.ts`).
+ * and every own leg that validated in full, and (r9, WP290-CX-R9-01) every trade identity a trade row carries, a
+ * legless row and a malformed row whose trade id is readable included. The answer is discarded; these facts are not
+ * (`evidence.ts`). No economics of a malformed row or leg is ever kept.
  */
 export interface Salvage {
   readonly rows: readonly VenueOrderView[];
   readonly legs: readonly SalvagedLeg[];
+  readonly trades: readonly SalvagedTrade[];
 }
 
 export type ReadOutcome<T> =
@@ -90,8 +112,12 @@ function ok<T>(value: T): ReadOutcome<T> {
 }
 
 function frozenSalvage(salvage: Salvage | undefined): Salvage | undefined {
-  if (salvage === undefined || (salvage.rows.length === 0 && salvage.legs.length === 0)) return undefined;
-  return Object.freeze({ rows: Object.freeze([...salvage.rows]), legs: Object.freeze(salvage.legs.map((entry) => Object.freeze({ ...entry }))) });
+  if (salvage === undefined || (salvage.rows.length === 0 && salvage.legs.length === 0 && salvage.trades.length === 0)) return undefined;
+  return Object.freeze({
+    rows: Object.freeze([...salvage.rows]),
+    legs: Object.freeze(salvage.legs.map((entry) => Object.freeze({ ...entry }))),
+    trades: Object.freeze(salvage.trades.map((entry) => Object.freeze({ ...entry }))),
+  });
 }
 
 function malformed<T>(why: string, named?: NamedOrders, salvage?: Salvage): ReadOutcome<T> {
@@ -204,7 +230,7 @@ export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderVie
     seen.add(order.venueOrderId);
     out.push(order);
   }
-  const salvage: Salvage = { rows, legs: [] };
+  const salvage: Salvage = { rows, legs: [], trades: [] };
   if (fields.complete !== true) {
     return fields.complete === false ? incomplete(named, salvage) : malformed("the open-orders answer does not say whether it is complete", named, salvage);
   }
@@ -282,14 +308,18 @@ function readTradeView(raw: unknown): VenueTradeView | string {
 }
 
 /**
- * The ids an unusable trade row's legs carry, each leg read on its own; every leg that validated in full is kept
- * whole (`salvage`), with the row's trade id and status when those are readable (r6).
+ * The ids a malformed trade row's legs carry, each leg read on its own; every leg that validated in full is kept
+ * whole (`salvage`), with the row's trade id and status when those are readable (r6). The row's trade id itself, when
+ * readable, is kept as a trade identity (`trades`, shape `MALFORMED`, with its status when that is text), whatever
+ * its legs (r9, WP290-CX-R9-01): a leg that fails validation, or a row with no readable leg at all, never drops the
+ * identity of the trade the venue reported. Nothing of a malformed leg but its order id is kept.
  */
-function keepLegsOf(named: Map<string, string | null>, salvage: SalvagedLeg[], row: unknown): void {
+function keepLegsOf(named: Map<string, string | null>, salvage: SalvagedLeg[], trades: SalvagedTrade[], row: unknown): void {
   const tradeId = readField(row, "venueTradeId");
   const status = readField(row, "status");
   const venueTradeId = tradeId.kind === "DATA" && isIdentifier(tradeId.value) ? tradeId.value : null;
   const statusText = status.kind === "DATA" && isIdentifier(status.value) ? status.value : null;
+  if (venueTradeId !== null) trades.push({ venueTradeId, status: statusText, shape: "MALFORMED" });
   const legs = readField(row, "ownLegs");
   for (const leg of (legs.kind === "DATA" ? readArray(legs.value, MAX_LEGS_PER_TRADE) : undefined) ?? []) {
     const valid = readLeg(leg);
@@ -305,7 +335,9 @@ function keepLegsOf(named: Map<string, string | null>, salvage: SalvagedLeg[], r
 
 /**
  * `/data/trades`: every trade of the account, own legs only. Every row is read once, whatever the answer's
- * outcome: an INCOMPLETE or MALFORMED answer keeps the venue order ids its rows' legs carry (`named`).
+ * outcome: an INCOMPLETE or MALFORMED answer keeps the venue order ids its rows' legs carry (`named`), every leg that
+ * validated in full, and (r9) every trade identity its rows carry (`salvage.trades`): a row that validated in full,
+ * legless or not, and the readable trade id of a malformed row.
  */
 export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]> {
   const fields = readFields(raw, ["route", "complete", "trades"]);
@@ -315,15 +347,19 @@ export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]>
   const out: VenueTradeView[] = [];
   const named = new Map<string, string | null>();
   const legs: SalvagedLeg[] = [];
+  const trades: SalvagedTrade[] = [];
   const seen = new Set<string>();
   let problem: string | undefined;
   for (const entry of list ?? []) {
     const trade = readTradeView(entry);
     if (typeof trade === "string") {
       problem ??= trade;
-      keepLegsOf(named, legs, entry);
+      keepLegsOf(named, legs, trades, entry);
       continue;
     }
+    // (r9, WP290-CX-R9-01) The trade's identity and status, whatever its legs: a valid row with no own leg (its
+    // ownership undetermined) shows its trade too.
+    trades.push({ venueTradeId: trade.venueTradeId, status: trade.status, shape: trade.ownershipUndetermined ? "OWNERSHIP_UNDETERMINED" : "IN_FULL" });
     for (const leg of trade.ownLegs) {
       keepNamed(named, leg.venueOrderId, leg.tokenId);
       legs.push({ venueTradeId: trade.venueTradeId, status: trade.status, leg });
@@ -335,7 +371,7 @@ export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]>
     seen.add(trade.venueTradeId);
     out.push(trade);
   }
-  const salvage: Salvage = { rows: [], legs };
+  const salvage: Salvage = { rows: [], legs, trades };
   if (fields.complete !== true) {
     return fields.complete === false ? incomplete(named, salvage) : malformed("the trades answer does not say whether it is complete", named, salvage);
   }

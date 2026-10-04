@@ -76,7 +76,10 @@ not a fault.
    observation showed (and at least the sum of its distinct trades' legs),
    whether any showed it terminal, and every status seen; per venue trade, its
    legs, each with every value shown of each fill fact (shares, price, fee,
-   fee asset, liquidity role, match time: r7), and its furthest settlement.
+   fee asset, liquidity role, match time: r7), its furthest settlement, every
+   terminal settlement any observation showed (r8), and (r9) whether an
+   observation carried it without identifying all of its own legs, and
+   whether a valid row ever showed it with its ownership determined.
    These marks only ever go up. The sources:
 
    | Source | Provenance |
@@ -84,6 +87,8 @@ not a fault.
    | a row of a complete, valid open-orders list | shown |
    | a row that validated in full inside a partial, malformed or duplicated open-orders answer (the answer is discarded; what the row showed is not) | shown |
    | an own leg of a valid trades read, or one that validated in full inside an unusable trades answer | shown |
+   | (r9) a trade row of a valid trades read, or one that validated in full inside an unusable trades answer: the trade's identity and status, whatever its legs (a row with no own leg, its ownership undetermined, included), and whether its ownership is determined | shown |
+   | (r9) the trade id of a trade row that did not validate in full (a leg's fee, time or id out of shape, say), with its status when that is text: nothing else of the row, and never its economics | named |
    | a by-id read that found the order | shown |
    | the id alone of a malformed row or leg (nothing else of it validated) | named |
    | an id the OMS retains as user-stream evidence | named |
@@ -115,7 +120,9 @@ not a fault.
      answer and a stream item the OMS did not apply included), showed
      CONFIRMED and FAILED (`READ_CONFLICT`, DURABLE: both are terminal, so a
      later read repeating either one never ends it; MATCHED, MINED, RETRYING,
-     then ONE terminal status, is forward progress, never a contradiction);
+     then ONE terminal status, is forward progress, never a contradiction;
+     r9: a status a trade row showed with no own leg, its ownership
+     undetermined, or that a malformed row showed, counts the same);
      the list and the by-id read disagreeing about
      a fixed fact, or about the status at the same stage (`READ_CONFLICT`;
      only "live, then terminal" is a step forward, since no order-status
@@ -129,8 +136,9 @@ not a fault.
      known, or the same value at another precision, is no contradiction); a
      trade a read SHOWED, or (r8) only the user stream NAMED, that a complete
      trades read omits while it is not accounted for under its own identity,
-     and a leg the stream named that a read of its trade does not show
-     (`READ_CONFLICT`: below);
+     a leg the stream named that a read of its trade does not show, and (r9)
+     a trade whose own legs no read has identified that a complete trades
+     read omits (`READ_CONFLICT`: below);
    - **a ghost**: an unclaimed order only NAMED that the by-id read of a
      sound run does not find. No earlier read is contradicted, so it is an
      `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), read by id
@@ -165,7 +173,10 @@ not a fault.
    - a trade of a tracked order the venue shows FAILED is a
      `SETTLEMENT_FAILED` quarantine, keyed by the trade and the order, and
      its market is halted: the ledger booked the fill at its match and owes a
-     compensating reversal (ADR-006 §5). This is derived from the venue's
+     compensating reversal (ADR-006 §5). (r9) A settlement is the trade's:
+     a FAILED trade whose row does not show a leg the evidence holds of it on
+     a tracked order (its ownership undetermined, say, with no own leg) owes
+     the same quarantine for that leg. This is derived from the venue's
      trades read in every run that read it, whatever the run's soundness. The OMS's own `SETTLEMENT_FAILED` alert lives only in
      its memory and is raised once, so a crash after the OMS recorded the
      failure, before the alert was journaled, would otherwise lose the halt.
@@ -215,7 +226,18 @@ not a fault.
      attempt could own it is NOT: an answer in the same run could claim the
      order, with nothing left to stand for the trade.
    A leg the stream named that a read of its trade does not show is a
-   `READ_CONFLICT` too, while it is not accounted for. When no one can own a
+   `READ_CONFLICT` too, while it is not accounted for.
+   **(r9) A trade whose own legs are unknown is OPEN.** A trades row can carry
+   a trade without identifying the account's own legs of it: a valid row whose
+   ownership the read could not establish (it may show no own leg at all), or
+   a row that did not validate in full (a leg's fee, match time or id out of
+   shape), whose trade id is still readable. Its identity and its status are
+   evidence all the same, in any answer, a partial or malformed one included.
+   Until a valid row shows the trade with its ownership determined (its own
+   legs exactly), no per-leg rule can answer it, so a complete trades read
+   that omits it is a `READ_CONFLICT`: a later lagging read never discharges
+   it, and nothing of a malformed row is ever booked. Once such a row shows
+   the trade, its legs are judged as above. When no one can own a
    missing trade's order, the run records `TRADE_UNATTRIBUTED` for each of its
    shown legs from the evidence, whatever the run's soundness, so the operator
    sees the trade by its own id. The `READ_CONFLICT` itself clears only when a
@@ -498,7 +520,9 @@ returns at once, with no run.
   quarantine). If new evidence names the id again and the venue still does
   not show it, that is a new occurrence and a new quarantine. While it stands
   it is read by id in every run, and if the venue shows it later it is
-  classified like any order.
+  classified like any order. (r9) Its detail lists, by id, the trades the
+  user stream named on that order: the quarantine covers them too, so a
+  release acknowledges them with the order.
 - **A `READ_CONFLICT` or `READ_REGRESSION` that does not clear** means a read
   shows less than the evidence holds: an order a source showed is no longer
   found, a matched size went down, a terminal order reads live, trades sum to
@@ -544,7 +568,21 @@ returns at once, with no run.
   trade's real outcome from the chain (its transaction hash); the account
   stays held until the retraction ADR gives a path (section 10). A FAILED
   trade of a tracked order also has its `SETTLEMENT_FAILED` quarantine:
-  releasing it does not end this conflict.
+  releasing it does not end this conflict. (r9) The two statuses may come
+  from rows that showed no leg of the trade (its ownership undetermined) or
+  from a malformed row: each is an observation of the trade all the same.
+- **A `READ_CONFLICT` whose detail says "without identifying all of its own
+  legs"** (r9) names a trade that a trades read carried without the
+  account's own legs of it (the read could not establish its ownership, or
+  its row was malformed, its trade id readable), that no read has shown with
+  its own legs since, and that a complete trades read now omits. Its details
+  list the sources. It is usually a lagging or faulty trades read, and clears
+  on its own when a valid read shows the trade with its ownership
+  determined (a missed fill is then delivered, or the trade classified). It
+  holds until then, even when every other read looks consistent: a snapshot
+  from before that trade looks exactly like that. If the venue never shows
+  the trade again (it dropped it, or the row named a trade it does not
+  have), the account stays held: no release exists (section 10).
 
 ## 8. Configuration
 
@@ -632,7 +670,13 @@ nothing is judged or booked from it.
   on an order the OMS tracks or an unresolved attempt could own, if no read
   ever shows it (a stream that named a trade the venue does not have, or a
   trades history that drops it first), and any ONE observation of a trade's
-  settlement as CONFIRMED against another as FAILED.
+  settlement as CONFIRMED against another as FAILED. Since r9, so does a
+  trade that a trades row carried without identifying its own legs (its
+  ownership undetermined, or its row malformed with its trade id readable),
+  if no valid row ever shows it with its ownership determined: a faulty
+  adapter that emits one malformed row naming a trade the venue does not
+  have holds the account for good, and so does a trades history that drops
+  such a trade first. Its status counts toward the terminal pair too.
 - **What "evidence never goes down" assumes (unverified venue assumptions,
   held as a conservative policy).** No venue document states any of these;
   the code treats a read that disagrees as wrong (it holds), never as a
@@ -644,6 +688,11 @@ nothing is judged or booked from it.
   - the user stream and the trades read name one trade by the same id, and
     the trades read shows every trade the stream reported on the account's
     own orders (the OMS de-duplicates fills across the two by that id too);
+  - (r9) a trade's own legs never change for one trade id: once a valid row
+    showed the trade with its ownership determined, a later row that does
+    not identify its legs (undetermined, or malformed) adds no leg the
+    account must answer for. A malformed row's trade id and status are taken
+    as the venue's (they are held, never booked);
   - a trade's settlement reaches at most one terminal status: CONFIRMED and
     FAILED are both terminal (the OMS's own transition table, `states.ts`),
     so a trade shown both ways is a wrong observation;

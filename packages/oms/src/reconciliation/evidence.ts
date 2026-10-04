@@ -13,6 +13,9 @@
  * | `TRADES_LEG_SALVAGED` | SHOWN | an own leg that validated in full inside an unusable trades answer |
  * | `TRADES_LEG_UNKEYED` | SHOWN | the same, when its trade's own id did not validate: the order matched at least its shares |
  * | `TRADES_LEG_ID` | NAMED | the id alone of a malformed leg |
+ * | `TRADES_ROW` | SHOWN | (r9) a TRADE record: a trade row that validated in full, its ownership determined (its own legs exactly) |
+ * | `TRADES_ROW_PARTIAL` | SHOWN | (r9) a TRADE record: a trade row that validated in full, its ownership undetermined (no own leg, possibly) |
+ * | `TRADES_ROW_ID` | NAMED | (r9) a TRADE record: the trade id (and status, when text) of a row that did not validate in full |
  * | `BY_ID` | SHOWN | a by-id read that found the order |
  * | `OMS_RETAINED` | NAMED | a venue order id the OMS retains as user-stream evidence |
  * | `STREAM_ORDER`, `STREAM_FILL`, `STREAM_SETTLEMENT` | NAMED | what the user stream reported, as routed to the OMS |
@@ -21,8 +24,10 @@
  * (token, side, price, original size: r7), the HIGH-WATER matched size (the most any order observation showed, and
  * at least the sum of every distinct trade's leg on it), whether any observation showed it TERMINAL, every status
  * seen. Per venue trade: its legs, each with EVERY value any observation showed of each of its fill facts (shares,
- * price, fee, fee asset, liquidity role, match time, token, side: r7), the furthest settlement status seen, and EVERY
- * terminal settlement status any observation showed (CONFIRMED, FAILED: r8). The
+ * price, fee, fee asset, liquidity role, match time, token, side: r7), the furthest settlement status seen, EVERY
+ * terminal settlement status any observation showed (CONFIRMED, FAILED: r8), from a leg or (r9) from a TRADE record (a
+ * row with no own leg, or a malformed row, shows its trade's status all the same), and (r9) whether an observation
+ * carried the trade without identifying all of its own legs, and whether a valid row ever showed it with them. The
  * marks are MONOTONIC and move on validated evidence from ANY run: an unsound, stale or unusable run's observations
  * count as much as a sound run's (r6, WP290-CX-R6-01). What this rests on (a matched size never decreases, a terminal
  * order is never live again, a trade id is not replaced, an order's and a fill's facts never change for one id) is an
@@ -60,9 +65,15 @@
  *   size covered by other trades) answers it. A leg the stream named on a trade a read shows is a CONFLICT too
  *   while the read does not show that leg and it is not accounted for;
  * - (r8, WP290-CX-R8-02) a trade that observations showed both CONFIRMED and FAILED, from any source and any run
- *   (a valid row of an unusable answer and an unapplied stream item included), is a DURABLE CONTRADICTION: both are
- *   terminal (`states.ts`: either order is a conflict), so no later read ends it. Normal forward progress (MATCHED,
- *   MINED, RETRYING, then one terminal status) never is;
+ *   (a valid row of an unusable answer, an unapplied stream item and, r9, WP290-V9-UNFOLDED-TERMINAL, a row that
+ *   showed no own leg of it, or a malformed row, included), is a DURABLE CONTRADICTION: both are terminal
+ *   (`states.ts`: either order is a conflict), so no later read ends it. Normal forward progress (MATCHED, MINED,
+ *   RETRYING, then one terminal status) never is;
+ * - (r9, WP290-CX-R9-01) a trade an observation carried WITHOUT identifying all of its own legs (a valid row whose
+ *   ownership is undetermined, legless or not; a malformed row whose trade id is readable), that no valid row has
+ *   shown with its ownership determined, is OPEN: a complete trades read that omits it is a CONFLICT, whatever the
+ *   accounting of the legs the evidence holds (its legs are unknown). Nothing of a malformed row but its trade id and
+ *   status is kept, so no malformed economics is ever compared or booked;
  * - (r7) an order a trade names (any leg, its shares known or not) matched something: a read showing nothing
  *   matched is a CONFLICT.
  *
@@ -78,7 +89,7 @@ import { isIsoInstant, orderStatusOf, tradeStatusOf } from "./door.js";
 import type { VenueOrderView, VenueTradeLeg, VenueTradeStatus, VenueTradeView } from "./ports.js";
 import { sameInstantText } from "./time.js";
 
-export type EvidenceKind = "ORDER" | "LEG" | "SETTLED";
+export type EvidenceKind = "ORDER" | "LEG" | "TRADE" | "SETTLED";
 export type EvidenceProvenance = "SHOWN" | "NAMED";
 
 export const EVIDENCE_SOURCES = [
@@ -89,6 +100,9 @@ export const EVIDENCE_SOURCES = [
   "TRADES_LEG_SALVAGED",
   "TRADES_LEG_UNKEYED",
   "TRADES_LEG_ID",
+  "TRADES_ROW",
+  "TRADES_ROW_PARTIAL",
+  "TRADES_ROW_ID",
   "BY_ID",
   "OMS_RETAINED",
   "STREAM_ORDER",
@@ -99,10 +113,24 @@ export const EVIDENCE_SOURCES = [
 ] as const;
 export type EvidenceSource = (typeof EVIDENCE_SOURCES)[number];
 
+/**
+ * (r9, WP290-CX-R9-01 and WP290-V9-UNFOLDED-TERMINAL) The sources of a TRADE record, one per trade row a trades read
+ * carried, whatever its legs and whatever the answer's completeness:
+ * - `TRADES_ROW` (SHOWN): the row validated in full and its ownership is determined: its own legs are exactly those it
+ *   showed (each its own LEG record);
+ * - `TRADES_ROW_PARTIAL` (SHOWN): the row validated in full, but its ownership is undetermined: it may not show (or
+ *   show none of) the account's own legs;
+ * - `TRADES_ROW_ID` (NAMED): the trade id of a row that did not validate in full, with its status when that is text.
+ */
+export const TRADE_SOURCES = ["TRADES_ROW", "TRADES_ROW_PARTIAL", "TRADES_ROW_ID"] as const;
+export type TradeSource = (typeof TRADE_SOURCES)[number];
+
 /** One record (the journal's `EVIDENCE_RECORDED` without its run, time and position). */
 export interface EvidenceRecord {
   readonly evidenceKind: EvidenceKind;
-  readonly venueOrderId: string;
+  /** The venue order (`null` only for a TRADE record, r9: a trade identity, whatever its legs). */
+  readonly venueOrderId: string | null;
+  /** LEG and TRADE: the venue trade. */
   readonly venueTradeId: string | null;
   readonly provenance: EvidenceProvenance;
   readonly source: EvidenceSource;
@@ -197,6 +225,15 @@ interface TradeEntry {
    * apart from `statuses` (whose length is bounded) so a terminal status is never dropped. Both: a durable contradiction.
    */
   terminals: VenueTradeStatus[];
+  /**
+   * (r9, WP290-CX-R9-01) An observation carried the trade WITHOUT identifying all of its own legs: a valid row whose
+   * ownership is undetermined (`TRADES_ROW_PARTIAL`), or a row that did not validate in full (`TRADES_ROW_ID`).
+   */
+  legsUnidentified: boolean;
+  /** (r9) A valid row with its ownership determined showed the trade (`TRADES_ROW`): its own legs are known in full. */
+  legsInFull: boolean;
+  /** The sources that carried it (detail only; nothing is decided on the list, whose length is bounded). */
+  sources: string[];
 }
 
 /** What the store knows of one venue order (frozen). */
@@ -240,6 +277,13 @@ export interface TradeEvidence {
   readonly status: VenueTradeStatus | null;
   /** (r8) Every terminal settlement status any observation showed: both CONFIRMED and FAILED is a durable contradiction. */
   readonly terminals: readonly VenueTradeStatus[];
+  /**
+   * (r9, WP290-CX-R9-01) An observation carried the trade without identifying all of its own legs (its ownership
+   * undetermined, or its row malformed), and no valid row has shown it with its ownership determined: its identity is
+   * not answered, so no omission discharges it.
+   */
+  readonly identityOpen: boolean;
+  readonly sources: readonly string[];
   readonly legs: readonly LegEvidence[];
 }
 
@@ -335,7 +379,10 @@ function cloneOrders(orders: ReadonlyMap<string, OrderEntry>): Map<string, Order
 
 function cloneTrades(trades: ReadonlyMap<string, TradeEntry>): Map<string, TradeEntry> {
   return new Map(
-    [...trades].map(([id, trade]) => [id, { ...trade, statuses: [...trade.statuses], terminals: [...trade.terminals], legs: new Map([...trade.legs].map(([order, leg]) => [order, { ...leg, facts: cloneFacts(leg.facts) }])) }]),
+    [...trades].map(([id, trade]) => [
+      id,
+      { ...trade, statuses: [...trade.statuses], terminals: [...trade.terminals], sources: [...trade.sources], legs: new Map([...trade.legs].map(([order, leg]) => [order, { ...leg, facts: cloneFacts(leg.facts) }])) },
+    ]),
   );
 }
 
@@ -410,13 +457,18 @@ export class EvidenceStore {
    * contradicting record is always journaled, so a restart folds the same contradiction again.
    */
   add(record: EvidenceRecord): boolean {
+    // (r9) A trade identity, whatever its legs: it names no order.
+    if (record.evidenceKind === "TRADE") return this.#addTrade(record);
+    const venueOrderId = record.venueOrderId;
+    // Unreachable through either door (only a TRADE record names no order); nothing is folded from it.
+    if (venueOrderId === null) return false;
     if (record.evidenceKind === "SETTLED") {
-      const entry = this.#orders.get(record.venueOrderId);
+      const entry = this.#orders.get(venueOrderId);
       if (entry === undefined || record.level === null || record.level <= entry.settledLevel) return false;
       entry.settledLevel = Math.min(record.level, entry.level);
       return true;
     }
-    const entry = this.#orderEntry(record.venueOrderId);
+    const entry = this.#orderEntry(venueOrderId);
     let informative = entry.created;
     const order = entry.entry;
     if (record.provenance === "SHOWN" && !order.shown) {
@@ -446,9 +498,71 @@ export class EvidenceStore {
         }
       }
     } else if (record.venueTradeId !== null) {
-      if (this.#addLeg(record)) informative = true;
+      if (this.#addLeg(record, venueOrderId)) informative = true;
     }
     if (informative) order.level += 1;
+    return informative;
+  }
+
+  /** The trade's entry, created when new (`created`: new information). */
+  #tradeEntry(tradeId: string): { readonly trade: TradeEntry; readonly created: boolean } {
+    const existing = this.#trades.get(tradeId);
+    if (existing !== undefined) return { trade: existing, created: false };
+    const trade: TradeEntry = { shown: false, legs: new Map(), status: null, statuses: [], terminals: [], legsUnidentified: false, legsInFull: false, sources: [] };
+    this.#trades.set(tradeId, trade);
+    return { trade, created: true };
+  }
+
+  /**
+   * (r9, WP290-CX-R9-01 and WP290-V9-UNFOLDED-TERMINAL) Fold one TRADE record: the trade's identity and its status,
+   * whatever its legs. Its status is folded exactly as a leg's (every terminal status kept: a FAILED shown on a trade
+   * with no own leg is as durable as one shown on a leg). Whether it identified the trade's own legs is kept as two
+   * monotonic marks: `legsInFull` (a valid row with its ownership determined) and `legsUnidentified` (a row whose
+   * ownership is undetermined, or a malformed row): the identity is OPEN while the second holds without the first.
+   */
+  #addTrade(record: EvidenceRecord): boolean {
+    const tradeId = record.venueTradeId;
+    // Unreachable through either door (a TRADE record names its trade); nothing is folded from it.
+    if (tradeId === null) return false;
+    const { trade, created } = this.#tradeEntry(tradeId);
+    let informative = created;
+    pushText(trade.sources, record.source);
+    if (record.provenance === "SHOWN" && !trade.shown) {
+      trade.shown = true;
+      informative = true;
+    }
+    if (record.source === "TRADES_ROW") {
+      if (!trade.legsInFull) {
+        trade.legsInFull = true;
+        informative = true;
+      }
+    } else if (!trade.legsUnidentified) {
+      trade.legsUnidentified = true;
+      informative = true;
+    }
+    if (this.#foldStatus(trade, record.status)) informative = true;
+    return informative;
+  }
+
+  /**
+   * Fold one observation's settlement status into its trade (a LEG's or a TRADE's): a new status text, a new terminal
+   * status (r8: always information, so a restart folds the same contradiction), a legal forward step. `true` when it
+   * added information.
+   */
+  #foldStatus(trade: TradeEntry, text: string | null): boolean {
+    if (text === null) return false;
+    let informative = pushText(trade.statuses, text);
+    const status = tradeStatusOf(text);
+    // (r8, WP290-CX-R8-02) Every terminal status, whatever came before it: a second one is a durable contradiction,
+    // so it is information (journaled, and folded again after a restart).
+    if (status !== null && TERMINAL_SETTLEMENTS.includes(status) && !trade.terminals.includes(status)) {
+      trade.terminals.push(status);
+      informative = true;
+    }
+    if (status !== null && (trade.status === null || (status !== trade.status && isLegalSettlementTransition(trade.status, status)))) {
+      trade.status = status;
+      informative = true;
+    }
     return informative;
   }
 
@@ -469,23 +583,18 @@ export class EvidenceStore {
     return { entry, created: true };
   }
 
-  #addLeg(record: EvidenceRecord): boolean {
-    const tradeId = record.venueTradeId as string;
-    let informative = false;
-    let trade = this.#trades.get(tradeId);
-    if (trade === undefined) {
-      trade = { shown: false, legs: new Map(), status: null, statuses: [], terminals: [] };
-      this.#trades.set(tradeId, trade);
-      informative = true;
-    }
+  #addLeg(record: EvidenceRecord, venueOrderId: string): boolean {
+    const { trade, created } = this.#tradeEntry(record.venueTradeId as string);
+    let informative = created;
+    pushText(trade.sources, record.source);
     if (record.provenance === "SHOWN" && !trade.shown) {
       trade.shown = true;
       informative = true;
     }
-    let leg = trade.legs.get(record.venueOrderId);
+    let leg = trade.legs.get(venueOrderId);
     if (leg === undefined) {
       leg = { shares: null, facts: emptyFacts(LEG_FACTS), shown: false };
-      trade.legs.set(record.venueOrderId, leg);
+      trade.legs.set(venueOrderId, leg);
       informative = true;
     }
     if (record.provenance === "SHOWN" && !leg.shown) {
@@ -510,20 +619,7 @@ export class EvidenceStore {
       side: record.side,
     };
     for (const fact of LEG_FACTS) if (pushValue(fact, leg.facts[fact], values[fact])) informative = true;
-    if (record.status !== null) {
-      if (pushText(trade.statuses, record.status)) informative = true;
-      const status = tradeStatusOf(record.status);
-      // (r8, WP290-CX-R8-02) Every terminal status, whatever came before it: a second one is a durable contradiction,
-      // so it is information (journaled, and folded again after a restart).
-      if (status !== null && TERMINAL_SETTLEMENTS.includes(status) && !trade.terminals.includes(status)) {
-        trade.terminals.push(status);
-        informative = true;
-      }
-      if (status !== null && (trade.status === null || (status !== trade.status && isLegalSettlementTransition(trade.status, status)))) {
-        trade.status = status;
-        informative = true;
-      }
-    }
+    if (this.#foldStatus(trade, record.status)) informative = true;
     return informative;
   }
 
@@ -541,6 +637,8 @@ export class EvidenceStore {
       shown: trade.shown,
       status: trade.status,
       terminals: Object.freeze([...trade.terminals]),
+      identityOpen: trade.legsUnidentified && !trade.legsInFull,
+      sources: Object.freeze([...trade.sources]),
       legs: Object.freeze(
         [...trade.legs].map(([venueOrderId, leg]) =>
           Object.freeze({
@@ -739,13 +837,20 @@ export class EvidenceStore {
       // about the trade's orders or holdings is concluded. A trade only the stream NAMED is judged like one a read
       // SHOWED: no read has answered its identity yet. Once accounted for (each leg classified under the trade's id,
       // and no hold naming it), its absence is not judged: history may age a trade out.
-      if (evidence !== undefined && (reads.held || legs.some((leg) => !reads.accounted(leg)))) {
+      // (r9, WP290-CX-R9-01) A trade an observation carried WITHOUT identifying all of its own legs (a valid row whose
+      // ownership is undetermined, legless or not; a row that did not validate in full, its id readable), that no valid
+      // row has shown with its ownership determined, is OPEN: its legs are unknown, so no per-leg accounting can answer
+      // it, and no omission discharges it. Only a read showing the trade with its own legs in full does.
+      const open = evidence !== undefined && evidence.legsUnidentified && !evidence.legsInFull;
+      if (evidence !== undefined && (open || reads.held || legs.some((leg) => !reads.accounted(leg)))) {
         problems.push(
           problem(
             "READ_CONFLICT",
-            evidence.shown
-              ? `trade ${id}, which an earlier read showed, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`
-              : `trade ${id}, which the user stream named (a fill or settlement the OMS did not apply) and no read has shown, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`,
+            open
+              ? `trade ${id}, which a trades read carried without identifying all of its own legs (its ownership undetermined, or its row malformed; sources: ${evidence.sources.join(", ")}), is missing from a complete trades read, and no read has shown it with its own legs: its identity is not answered (every trade of the account is in that read)`
+              : evidence.shown
+                ? `trade ${id}, which an earlier read showed, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`
+                : `trade ${id}, which the user stream named (a fill or settlement the OMS did not apply) and no read has shown, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`,
           ),
         );
       }
@@ -803,14 +908,22 @@ export function readEvidenceRecord(raw: unknown): EvidenceRecord | undefined {
   ]);
   if (fields === undefined) return undefined;
   const { evidenceKind, venueOrderId, venueTradeId, provenance, source, tokenId, side, price, originalSize, size, status, level, feeAmount, feeAssetId, role, matchedAt } = fields;
-  if (evidenceKind !== "ORDER" && evidenceKind !== "LEG" && evidenceKind !== "SETTLED") return undefined;
-  if (!isIdentifier(venueOrderId) || !(venueTradeId === null || isIdentifier(venueTradeId))) return undefined;
+  if (evidenceKind !== "ORDER" && evidenceKind !== "LEG" && evidenceKind !== "TRADE" && evidenceKind !== "SETTLED") return undefined;
+  if (!(venueOrderId === null || isIdentifier(venueOrderId)) || !(venueTradeId === null || isIdentifier(venueTradeId))) return undefined;
   if ((provenance !== "SHOWN" && provenance !== "NAMED") || typeof source !== "string" || !(EVIDENCE_SOURCES as readonly string[]).includes(source)) return undefined;
   if (!(tokenId === null || isTokenId(tokenId)) || !(side === null || side === "BUY" || side === "SELL")) return undefined;
   const decimal = (value: unknown): value is DecimalString | null => value === null || isCanonicalDecimalString(value);
   if (!decimal(price) || !decimal(originalSize) || !decimal(size) || !(status === null || isIdentifier(status))) return undefined;
   if (!(level === null || (typeof level === "number" && Number.isSafeInteger(level) && level >= 0))) return undefined;
-  if ((evidenceKind === "LEG") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  // A LEG and a TRADE name their trade, nothing else does; only a TRADE names no order (r9); only a SETTLED has a level.
+  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  if ((evidenceKind === "TRADE") !== (venueOrderId === null)) return undefined;
+  // (r9) A TRADE comes from a trade row (and only a TRADE does), SHOWN when the row validated in full, and carries its
+  // status alone: nothing of an order, and no economics.
+  if ((evidenceKind === "TRADE") !== (TRADE_SOURCES as readonly string[]).includes(source)) return undefined;
+  if (evidenceKind === "TRADE" && (provenance !== (source === "TRADES_ROW_ID" ? "NAMED" : "SHOWN") || tokenId !== null || side !== null || price !== null || originalSize !== null || size !== null)) {
+    return undefined;
+  }
   if (!decimal(feeAmount) || !(feeAssetId === null || isIdentifier(feeAssetId)) || !(role === null || role === "MAKER" || role === "TAKER") || !(matchedAt === null || isIsoInstant(matchedAt))) {
     return undefined;
   }
@@ -902,6 +1015,29 @@ export function legRecord(venueTradeId: string, leg: LegFacts, status: string | 
     feeAssetId: leg.feeAssetId ?? null,
     role: leg.role ?? null,
     matchedAt: leg.matchedAt ?? null,
+  });
+}
+
+/**
+ * (r9, WP290-CX-R9-01 and WP290-V9-UNFOLDED-TERMINAL) A TRADE record: one trade row's trade identity and its status as
+ * read (text, or `null` when not readable), whatever its legs. SHOWN for a row that validated in full (`TRADES_ROW`,
+ * `TRADES_ROW_PARTIAL`), NAMED for the readable id of a malformed row (`TRADES_ROW_ID`). It carries no economics.
+ */
+export function tradeRecord(venueTradeId: string, status: string | null, source: TradeSource): EvidenceRecord {
+  return Object.freeze({
+    evidenceKind: "TRADE",
+    venueOrderId: null,
+    venueTradeId,
+    provenance: source === "TRADES_ROW_ID" ? "NAMED" : "SHOWN",
+    source,
+    tokenId: null,
+    side: null,
+    price: null,
+    originalSize: null,
+    size: null,
+    status,
+    level: null,
+    ...NO_FILL_FACTS,
   });
 }
 

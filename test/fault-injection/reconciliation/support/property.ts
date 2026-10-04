@@ -16,6 +16,8 @@
  *   observed fill with other economics (an offsetting price and fee);
  * - (r8) a trades read showing a trade with the OTHER terminal settlement than one a read already showed it with
  *   (CONFIRMED for FAILED, or the reverse);
+ * - (r9) a trades answer in which one trade's leg is malformed (its fee), and a VALID trades read showing one trade
+ *   with its ownership undetermined and no own leg, at its true status;
  * - a ledger transaction with UNATTRIBUTED arrivals in two markets;
  * - every read source and answer shape: complete, partial, duplicated, sibling-malformed, by-id found, not found,
  *   thrown or regressing, trades complete, partial, malformed or lagging, positions and collateral failing;
@@ -51,6 +53,9 @@ import { uuid7 } from "../../../unit/oms/support/ids.js";
 import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, bookReversal, boot, reopenOms, streamTrade, universe, type Process, type Universe } from "./harness.js";
 import { G_YES, sequence, submitOne } from "./scenario.js";
 import type { ReadFaults, Transmission, VenueOrder, VenueTrade } from "./world.js";
+
+/** (r9) The fee the TRADES_MALFORMED_LEG lie gives a leg: not an exact decimal, so the door refuses the leg. */
+const MALFORMED_FEE = "not-a-fee";
 
 /** A seeded generator (mulberry32): the same seed always draws the same scenario. */
 export function seeded(seed: number): () => number {
@@ -459,7 +464,7 @@ class Sim {
     const chosen: string[] = [];
     const count = 1 + Math.floor(this.rand() * 2);
     for (let index = 0; index < count; index += 1) {
-      const roll = Math.floor(this.rand() * 17);
+      const roll = Math.floor(this.rand() * 19);
       const target = this.pick([...this.u.world.orders.values()]);
       const trade = this.pick(this.u.world.trades);
       switch (roll) {
@@ -628,6 +633,41 @@ class Sim {
           };
           break;
         }
+        case 16:
+          // r9 (WP290-CX-R9-01): one trade's leg is malformed (its fee): the answer is unusable, and only the trade's
+          // id and status are kept (never its economics); a later read must answer that identity.
+          if (trade === undefined) break;
+          chosen.push(`TRADES_MALFORMED_LEG(${trade.venueTradeId})`);
+          faults.listTrades = (answer) => {
+            const read = answer() as { trades: { venueTradeId: string; ownLegs: Record<string, unknown>[] }[] };
+            return {
+              ...read,
+              trades: read.trades.map((entry) => {
+                if (entry.venueTradeId !== trade.venueTradeId) return entry;
+                this.fire("TRADES_MALFORMED_LEG", true);
+                return { ...entry, ownLegs: entry.ownLegs.map((leg) => ({ ...leg, feeAmount: MALFORMED_FEE })) };
+              }),
+            };
+          };
+          break;
+        case 17:
+          // r9 (WP290-CX-R9-01, WP290-V9-UNFOLDED-TERMINAL): a VALID trades read shows one trade with its ownership
+          // undetermined and no own leg, at its true status (FAILED included): its status is kept, its identity open.
+          if (trade === undefined) break;
+          chosen.push(`TRADES_LEGLESS(${trade.venueTradeId})`);
+          faults.listTrades = (answer) => {
+            const read = answer() as { trades: { venueTradeId: string }[] };
+            return {
+              ...read,
+              trades: read.trades.map((entry) => {
+                if (entry.venueTradeId !== trade.venueTradeId) return entry;
+                // The trade's own READ_INCOMPLETE leaves the run inconclusive: it must conclude nothing.
+                this.fire("TRADES_LEGLESS", true);
+                return { ...entry, ownershipUndetermined: true, ownLegs: [] };
+              }),
+            };
+          };
+          break;
         default:
           // A clock fault at a random await of the run (a read or an OMS write).
           this.#clockArm = 1 + Math.floor(this.rand() * 12);
@@ -662,8 +702,12 @@ class Sim {
         const read = trades(answer) as { trades?: unknown };
         if (Array.isArray(read.trades)) {
           for (const trade of read.trades as { venueTradeId?: unknown; ownLegs?: unknown }[]) {
-            if (Array.isArray(trade.ownLegs)) for (const leg of trade.ownLegs as Record<string, unknown>[]) this.saw(leg["venueOrderId"], leg["shares"]);
-            if (typeof trade.venueTradeId === "string") this.sawFacts(`trade:${trade.venueTradeId}`);
+            const legs = Array.isArray(trade.ownLegs) ? (trade.ownLegs as Record<string, unknown>[]) : [];
+            // r9: a leg the TRADES_MALFORMED_LEG lie broke only NAMES its order (the door keeps its id alone, never its
+            // shares); a row with no intact leg shows none of the trade's economics.
+            for (const leg of legs) this.saw(leg["venueOrderId"], leg["feeAmount"] === MALFORMED_FEE ? "0" : leg["shares"]);
+            const intact = legs.length > 0 && legs.every((leg) => leg["feeAmount"] !== MALFORMED_FEE);
+            if (typeof trade.venueTradeId === "string" && intact) this.sawFacts(`trade:${trade.venueTradeId}`);
             // r8: the terminal settlement a read showed (either spelling), so a TRADES_TERMINAL lie can contradict it.
             const status = (trade as { status?: unknown }).status;
             if (typeof trade.venueTradeId === "string" && typeof status === "string") this.sawFacts(`status:${trade.venueTradeId}:${status.replace(/^TRADE_STATUS_/u, "")}`);

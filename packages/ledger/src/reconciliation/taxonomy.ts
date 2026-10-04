@@ -75,7 +75,14 @@
  * showing it, or on an order no tracked order claims and that no read ever
  * showed (the order's not-found quarantine) or no unresolved attempt could
  * own (`TRADE_UNATTRIBUTED`); never by a tracked order, nor by an order's
- * matched size that other trades cover.
+ * matched size that other trades cover. (r9) Every trade ROW is evidence too,
+ * whatever its legs: its trade identity and status (a valid row with no own
+ * leg, its ownership undetermined, and the readable trade id of a malformed
+ * row included). A trade a row carried without identifying all of its own
+ * legs, that no valid row has shown with its ownership determined, is OPEN:
+ * a complete trades read that omits it is a `READ_CONFLICT`, whatever the
+ * accounting of its known legs, and its status counts toward the CONFIRMED
+ * and FAILED pair. Nothing of a malformed row is ever booked.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
  * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,
@@ -202,7 +209,7 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "READ",
     rule: HOLD,
     meaning:
-      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size (or a trade naming an order a read shows with nothing matched), a trade's leg missing or of other shares; (r7) an order's fixed fact or a fill's economics shown with two values by any observations, of any run or source (a durable contradiction); (r8) a trade any observations showed both CONFIRMED and FAILED (a durable contradiction); a trade a read showed, or (r8) the user stream named, that a complete trades read omits while it is not accounted for under its own identity, and a leg the stream named that a read of its trade does not show",
+      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size (or a trade naming an order a read shows with nothing matched), a trade's leg missing or of other shares; (r7) an order's fixed fact or a fill's economics shown with two values by any observations, of any run or source (a durable contradiction); (r8) a trade any observations showed both CONFIRMED and FAILED (a durable contradiction; r9: a row that showed no own leg of it, or a malformed row, counts); a trade a read showed, or (r8) the user stream named, that a complete trades read omits while it is not accounted for under its own identity, a leg the stream named that a read of its trade does not show, and (r9) a trade a row carried without identifying its own legs (its ownership undetermined, or its row malformed), that no valid row has shown with them, which a complete trades read omits",
     handling:
       "nothing about the subject is concluded, the run is not one view of the account (no answer, no signed-identity resolution, no delivery, no classification, no clearing); submissions stay paused until a read agrees with all the evidence. A fact shown with two values, or a trade shown both CONFIRMED and FAILED, never agrees again: it holds for good, and no tool retracts evidence (an ADR is owed)",
   },
@@ -316,7 +323,7 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "TRADE",
     rule: QUARANTINE,
     meaning:
-      "the venue's trades read shows a trade of a tracked order FAILED (ADR-006 §5: the ledger booked the fill at its match and owes a compensating reversal); one break per trade and order, keyed by the venue's own ids",
+      "the venue's trades read shows a trade of a tracked order FAILED (ADR-006 §5: the ledger booked the fill at its match and owes a compensating reversal); one break per trade and order, keyed by the venue's own ids; (r9) a leg the evidence holds of a FAILED trade on a tracked order counts when the row does not show it (its ownership undetermined, say)",
     handling:
       "the order's market is halted; quarantined until released. Derived from the venue's trades read in every run that read it (whatever the run's soundness), not from the OMS's in-memory alert, so a restart never loses it; releasing it acknowledges that one trade's failure",
   },

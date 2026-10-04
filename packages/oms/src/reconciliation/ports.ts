@@ -370,8 +370,10 @@ export type JournalInput =
 export interface JournalEvidenceInput {
   readonly kind: "EVIDENCE_RECORDED";
   readonly runId: string | null;
-  readonly evidenceKind: "ORDER" | "LEG" | "SETTLED";
-  readonly venueOrderId: string;
+  readonly evidenceKind: "ORDER" | "LEG" | "TRADE" | "SETTLED";
+  /** `null` only for a TRADE record (r9: a trade identity, whatever its legs). */
+  readonly venueOrderId: string | null;
+  /** LEG and TRADE: the venue trade. */
   readonly venueTradeId: string | null;
   readonly provenance: "SHOWN" | "NAMED";
   readonly source: string;

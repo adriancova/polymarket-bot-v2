@@ -176,10 +176,13 @@ export interface ResumeRefusedEvent {
 }
 
 /** What one evidence record is about (see {@link EvidenceRecordedEvent}). */
-export const EVIDENCE_KINDS = ["ORDER", "LEG", "SETTLED"] as const;
+export const EVIDENCE_KINDS = ["ORDER", "LEG", "TRADE", "SETTLED"] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 
-/** Whether a source SHOWED the venue order in full (a valid row, a valid leg, a by-id read that found it) or only NAMED its id. */
+/**
+ * Whether a source SHOWED the venue order (or, for a `TRADE`, the trade row) in full (a valid row, a valid leg, a by-id
+ * read that found it) or only NAMED its id.
+ */
 export const EVIDENCE_PROVENANCES = ["SHOWN", "NAMED"] as const;
 export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
 
@@ -193,6 +196,9 @@ export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
  *   its status as read, when the source showed them.
  * - `LEG`: one of the account's own legs of one venue trade (`venueTradeId`): `size` is the leg's shares, `status`
  *   the trade's settlement status as read.
+ * - `TRADE` (WP-290 r9): one trade row's trade identity (`venueTradeId`), whatever its legs, and its settlement
+ *   `status` as read: a row that validated in full (its ownership determined or not, legless or not), or the readable
+ *   id of a row that did not. It names no order (`venueOrderId` is `null`) and carries nothing else: no economics.
  * - `SETTLED`: a SOUND run classified the venue order consistently with all of its evidence, up to `level` (the
  *   number of informative records about it then), or an operator released its not-found quarantine. It stops the
  *   order being read by id until new evidence about it arrives.
@@ -202,8 +208,9 @@ export interface EvidenceRecordedEvent {
   /** The RUNNING run that observed it, or `null` for an observation recorded between runs (the user stream, a release). */
   readonly runId: string | null;
   readonly evidenceKind: EvidenceKind;
-  readonly venueOrderId: string;
-  /** `LEG` only: the venue trade. */
+  /** The venue order; `null` only for a `TRADE` (r9), which names no order. */
+  readonly venueOrderId: string | null;
+  /** `LEG` and `TRADE` only: the venue trade. */
   readonly venueTradeId: string | null;
   readonly provenance: EvidenceProvenance;
   /** Where it was observed (a code, e.g. `OPEN_ORDERS_LIST`, `BY_ID`, `STREAM_FILL`, `OMS_RETAINED`). */
@@ -444,12 +451,15 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
   const role = field(record, "role");
   const matchedAt = field(record, "matchedAt");
   if (!nullable(runId, isUuidV7) || typeof evidenceKind !== "string" || !(EVIDENCE_KINDS as readonly string[]).includes(evidenceKind)) return undefined;
-  if (!isIdentifier(venueOrderId) || !nullable(venueTradeId, isIdentifier)) return undefined;
+  if (!nullable(venueOrderId, isIdentifier) || !nullable(venueTradeId, isIdentifier)) return undefined;
   if (typeof provenance !== "string" || !(EVIDENCE_PROVENANCES as readonly string[]).includes(provenance) || typeof source !== "string" || !CODE.test(source)) return undefined;
   if (!(tokenId === null || (typeof tokenId === "string" && TOKEN_ID.test(tokenId))) || !(side === null || side === "BUY" || side === "SELL")) return undefined;
   if (!nullable(price, isDecimal) || !nullable(originalSize, isDecimal) || !nullable(size, isDecimal) || !nullable(status, isIdentifier) || !nullable(level, isCount)) return undefined;
-  // A leg names its trade; nothing else does. Only a settlement carries a level, and it names no trade.
-  if ((evidenceKind === "LEG") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  // A leg and a trade (r9) name their trade; nothing else does. Only a settlement carries a level, and it names no trade.
+  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  // Only a trade (r9) names no order, and it carries its status alone: nothing of an order, and no economics.
+  if ((evidenceKind === "TRADE") !== (venueOrderId === null)) return undefined;
+  if (evidenceKind === "TRADE" && (tokenId !== null || side !== null || price !== null || originalSize !== null || size !== null)) return undefined;
   // A leg's fill facts (r7): an exact fee, an id for its asset, a role, an instant; only a leg carries them.
   if (!nullable(feeAmount, isDecimal) || !nullable(feeAssetId, isIdentifier) || !(role === null || role === "MAKER" || role === "TAKER")) return undefined;
   if (!(matchedAt === null || (typeof matchedAt === "string" && INSTANT.test(matchedAt)))) return undefined;

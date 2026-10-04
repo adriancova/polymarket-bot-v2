@@ -40,6 +40,8 @@
  * 5. EVIDENCE FIRST (r6, class A; `evidence.ts`). Every validated
  *    observation of the reads, from every source (a complete list's row, a
  *    valid row or leg of an unusable answer, the id alone of a malformed one,
+ *    r9: every trade row's trade identity and status, whatever its legs, a
+ *    legless row and the readable trade id of a malformed row included,
  *    a by-id read that found the order, an id the OMS retains as stream
  *    evidence) and what the user stream reported that the OMS did not apply,
  *    is folded into the EVIDENCE STORE and journaled (`EVIDENCE_RECORDED`)
@@ -59,7 +61,9 @@
  *    accounted for under its own identity (`#accounting`: a leg only the
  *    stream named is never answered by a tracked order or by an order's
  *    matched size), and a leg the stream named that a read of its trade does
- *    not show: the run is unsound and holds),
+ *    not show; r9: a trade a row carried without identifying its own legs,
+ *    that no valid row has shown with them, which a complete trades read
+ *    omits: the run is unsound and holds),
  *    a GHOST (an unclaimed id only NAMED that its by-id
  *    read does not find: no signed-identity answer while it stands, and a
  *    releasable `ORDER_NOT_FOUND_BY_ID`), ACKNOWLEDGED (the same, released by
@@ -230,6 +234,7 @@ import {
   readEvidenceRecords,
   settledRecord,
   shownOrder,
+  tradeRecord,
   type EvidenceRecord,
   type LegEvidence,
   type LegFacts,
@@ -895,8 +900,17 @@ export class ReconciliationCoordinator {
     if (open.kind === "OK") for (const order of open.value) this.#observe(shownOrder(order, "OPEN_ORDERS_LIST"));
     for (const order of salvageOf(open).rows) this.#observe(shownOrder(order, "OPEN_ORDERS_ROW"));
     for (const [id, tokenId] of namedIn(open)) if (tokenId === null) this.#observe(namedOrder(id, "OPEN_ORDERS_ID"));
+    // (r9, WP290-CX-R9-01 and WP290-V9-UNFOLDED-TERMINAL) Every trade row's IDENTITY and status too, whatever its legs:
+    // a valid row with no own leg (its ownership undetermined) shows a status as durable as a leg's, and a row that
+    // did not validate in full still names its trade. Whether the row identified the trade's own legs is kept with it.
     if (trades.kind === "OK") {
-      for (const trade of trades.value) for (const leg of trade.ownLegs) this.#observe(legRecord(trade.venueTradeId, legFacts(leg), trade.status, "SHOWN", "TRADES_LEG"));
+      for (const trade of trades.value) {
+        this.#observe(tradeRecord(trade.venueTradeId, trade.status, trade.ownershipUndetermined ? "TRADES_ROW_PARTIAL" : "TRADES_ROW"));
+        for (const leg of trade.ownLegs) this.#observe(legRecord(trade.venueTradeId, legFacts(leg), trade.status, "SHOWN", "TRADES_LEG"));
+      }
+    }
+    for (const { venueTradeId, status, shape } of salvageOf(trades).trades) {
+      this.#observe(tradeRecord(venueTradeId, status, shape === "IN_FULL" ? "TRADES_ROW" : shape === "OWNERSHIP_UNDETERMINED" ? "TRADES_ROW_PARTIAL" : "TRADES_ROW_ID"));
     }
     for (const { venueTradeId, status, leg } of salvageOf(trades).legs) {
       this.#observe(
@@ -1197,11 +1211,13 @@ export class ReconciliationCoordinator {
     for (const id of view.ghosts) {
       if (claimed.has(id)) continue;
       const evidence = this.#evidence.order(id);
+      // (r9, the P9-C observation) The trades named on it, which this quarantine covers (`#accounting`), by their ids.
+      const trades = this.#evidence.legsOn(id).map((entry) => entry.venueTradeId);
       this.#detect(run, {
         breakClass: "ORDER_NOT_FOUND_BY_ID",
         subjectKey: this.#ghostSubject(id),
         ...(evidence?.tokenId === null || evidence?.tokenId === undefined ? {} : this.#marketOf(evidence.tokenId)),
-        detail: `venue order ${id} was only named (${evidence?.sources.join(", ") ?? "?"}), no read ever showed it in full, and the venue's by-id read does not find it (E-14: canceled and fully matched orders are found by id): quarantined until an operator releases it; while it stands no attempt is answered by signed identity`,
+        detail: `venue order ${id} was only named (${evidence?.sources.join(", ") ?? "?"}), no read ever showed it in full, and the venue's by-id read does not find it (E-14: canceled and fully matched orders are found by id): quarantined until an operator releases it; while it stands no attempt is answered by signed identity${trades.length === 0 ? "" : `; it covers the trade(s) named on it: ${trades.join(", ")}`}`,
       });
     }
   }
@@ -1676,7 +1692,9 @@ export class ReconciliationCoordinator {
    * - each halt obligation the LEDGER records (an UNATTRIBUTED arrival or an unexplained movement), keyed by its
    *   transaction, movement kind, asset, market and place among records equal in all four: one transaction touching
    *   N markets is N obligations, each halting its own market (a crash between a booking and its break included);
-   * - each FAILED settlement the venue's trades read shows on a tracked order (ADR-006 §5), keyed by trade and order;
+   * - each FAILED settlement the venue's trades read shows on a tracked order (ADR-006 §5), keyed by trade and order:
+   *   each leg the row shows, and (r9) each leg the evidence holds of the trade that the row does not show (its
+   *   ownership undetermined, legless or not: a settlement is the trade's);
    * - each OMS halting alert, keyed by the OMS instance's incarnation and the alert's ordinal (`#inspectAlerts`).
    *
    * The FAILED settlement: the OMS raises `SETTLEMENT_FAILED` only into its in-memory alert list, once, on the
@@ -1721,7 +1739,9 @@ export class ReconciliationCoordinator {
       const tracked = new Map(oms.orders().filter((order) => order.venueOrderId !== null).map((order) => [order.venueOrderId as string, order]));
       for (const trade of reads.trades.value) {
         if (tradeStatusOf(trade.status) !== "FAILED") continue;
+        const shownOn = new Set<string>();
         for (const leg of trade.ownLegs) {
+          shownOn.add(leg.venueOrderId);
           const order = tracked.get(leg.venueOrderId);
           if (order === undefined) continue;
           this.#detect(run, {
@@ -1732,6 +1752,23 @@ export class ReconciliationCoordinator {
             assetId: leg.tokenId,
             observedValue: leg.shares,
             detail: `trade ${trade.venueTradeId} of tracked order ${order.orderId} (venue order ${leg.venueOrderId}, ${leg.side} ${leg.shares} at ${leg.price}) FAILED at the venue: the ledger owes a compensating reversal (ADR-006 §5)`,
+          });
+        }
+        // (r9, WP290-V9-UNFOLDED-TERMINAL) A settlement is the TRADE's: every leg the evidence holds of it on a tracked
+        // order FAILED too, one this row does not show included (its ownership undetermined, legless or not). Each is
+        // the same gate, keyed by trade and order.
+        for (const leg of this.#evidence.trade(trade.venueTradeId)?.legs ?? []) {
+          if (shownOn.has(leg.venueOrderId)) continue;
+          const order = tracked.get(leg.venueOrderId);
+          if (order === undefined) continue;
+          this.#detect(run, {
+            breakClass: "SETTLEMENT_FAILED",
+            subjectKey: compositeKey("SETTLEMENT_FAILED", trade.venueTradeId, leg.venueOrderId),
+            ...this.#marketScope(order.marketId),
+            orderId: order.orderId,
+            assetId: leg.tokenId,
+            observedValue: leg.shares,
+            detail: `trade ${trade.venueTradeId} of tracked order ${order.orderId} FAILED at the venue; its leg on venue order ${leg.venueOrderId} (${leg.side ?? "?"} ${leg.shares ?? "?"} at ${leg.price ?? "?"}) is known from its evidence, and this read does not show it${trade.ownershipUndetermined ? " (the read could not establish which legs are the account's)" : ""}: the ledger owes a compensating reversal (ADR-006 §5)`,
           });
         }
       }
@@ -3418,7 +3455,7 @@ function namedIn(outcome: ReadOutcome<unknown>): NamedOrders {
 
 /** The rows and legs of an unusable answer that validated in full (`door.ts`); none for any other outcome. */
 function salvageOf(outcome: ReadOutcome<unknown>): Salvage {
-  return (outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED") && outcome.salvage !== undefined ? outcome.salvage : { rows: [], legs: [] };
+  return (outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED") && outcome.salvage !== undefined ? outcome.salvage : { rows: [], legs: [], trades: [] };
 }
 
 /** A leg's facts as the evidence store records them: every fill fact the read fixed (r7, WP290-CX-R7-02). */

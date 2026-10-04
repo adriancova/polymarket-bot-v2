@@ -517,7 +517,7 @@ describe("WP-290 r6 class D: the one run-validity latch is checked after every a
     const faulted = report.runs[0]?.runId;
     expect(fired).toBe(true);
     expect(report.runs[0]?.resumed).toBe(false);
-    const settledBy = (runId: string | null | undefined): string[] =>
+    const settledBy = (runId: string | null | undefined): (string | null)[] =>
       r.p.journal
         .evidence()
         .filter((record) => record.evidenceKind === "SETTLED" && record.runId === runId)
