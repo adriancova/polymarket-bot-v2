@@ -14,7 +14,9 @@
  * answer's usability, so no validated fact is lost between the wire and the store; and every unreadable fragment of
  * a row is recorded as an explicit UNREADABLE obligation (an unreadable identity: `UNKEYED_ORDER`, `UNKEYED_LEG`,
  * `ORPHAN_LEG`, `UNKEYED_TRADE`; an unreadable fact of a keyed object: the object's own obligation, read again until
- * a sound read shows it in full).
+ * a sound read shows it in full). (r12, WP290-CX-R12-01) The same holds for the user-stream door's own keys: a
+ * WP-280 projection whose `observation`, `fills` or `settlements` key is MISSING carries an unreadable entry (an
+ * obligation of the account, and a run), exactly as one whose key is not own data or not in its shape.
  *
  * A read has exactly one outcome:
  *
@@ -868,7 +870,13 @@ export function streamItemFragments(kind: StreamItemFragments["kind"], raw: Entr
 /** The most items one stream output may carry (a guard). */
 export const MAX_STREAM_ITEMS = 1000;
 
-/** Read one WP-280 `UserStreamOutput` (an ORDER or TRADE output) once, into its items and their fragments. */
+/**
+ * Read one WP-280 `UserStreamOutput` (an ORDER or TRADE output) once, into its items and their fragments. Every key
+ * of WP-280's projection this door reads (`oms`; an ORDER's `observation`; a TRADE's `fills` and `settlements`) is
+ * present in every output WP-280 emits (`oms-projection.ts`): one that is missing, not own data, or not in its shape is
+ * an UNREADABLE entry (r12: a missing key too, WP290-CX-R12-01), never "nothing". The projection's `shortfalls` is
+ * not read here: WP-280 raises its own `EVENT_NOT_FULLY_APPLICABLE` request for them, from its own projection.
+ */
 export function readStreamOutput(output: unknown): StreamOutput {
   const kind = readField(output, "kind");
   // An output whose kind cannot be read may have been any of WP-280's outputs, an ORDER or a TRADE among them: it is
@@ -886,8 +894,11 @@ export function readStreamOutput(output: unknown): StreamOutput {
       unreadable.push({ kind: "ORDER", field: "oms" });
     } else {
       const observation = readField(projection.value, "observation");
-      if (observation.kind === "OPAQUE") unreadable.push({ kind: "ORDER", field: "observation" });
-      else if (observation.kind === "DATA" && observation.value !== null) {
+      // (r12, WP290-CX-R12-01) WP-280's ORDER projection always carries `observation`: `null` when the event named no
+      // status (WP-280 then raises its own request), else the observation. A MISSING key (or one holding `undefined`)
+      // is unreadable, an obligation of the account, exactly as one that is not own data: never "no observation".
+      if (observation.kind !== "DATA" || observation.value === undefined) unreadable.push({ kind: "ORDER", field: "observation" });
+      else if (observation.value !== null) {
         items.push(Object.freeze({ raw: observation.value, fragments: streamItemFragments("ORDER", observation.value) }));
       }
     }
@@ -901,8 +912,9 @@ export function readStreamOutput(output: unknown): StreamOutput {
     ["fills", "FILL"],
     ["settlements", "SETTLEMENT"],
   ] as const) {
+    // (r12, WP290-CX-R12-01) WP-280's TRADE projection always carries both lists (empty when it projected nothing): a
+    // MISSING list is unreadable, an obligation of the account, exactly as one that is not a list: never "nothing".
     const listField = readField(projection.value, field);
-    if (listField.kind === "ABSENT") continue;
     const list = listField.kind === "DATA" ? listEntries(listField.value, MAX_STREAM_ITEMS) : undefined;
     if (list === undefined) {
       unreadable.push({ kind: itemKind, field });

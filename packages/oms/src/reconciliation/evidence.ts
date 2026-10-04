@@ -26,7 +26,7 @@
  * | `TRADES_LEG_FRAGMENTS` (r11) | NAMED | a LEG on a readable trade and order that did not validate in full: every fact it validated |
  * | `TRADES_LEG_ORPHAN`, `STREAM_*_ORPHAN` (r11) | NAMED | an ORPHAN_LEG: an own leg under a readable trade id whose order id was unreadable |
  * | `OPEN_ORDERS_UNKEYED`, `BY_ID_UNKEYED`, `STREAM_ORDER_UNKEYED` (r11) | NAMED | an UNKEYED_ORDER: an order row (or observation) whose id was unreadable |
- * | `TRADES_ROW_UNKEYED`, `STREAM_UNREADABLE` (r11) | NAMED | an UNKEYED_TRADE: a trade row whose id was unreadable with no own leg kept on a readable order; an unreadable stream entry |
+ * | `TRADES_ROW_UNKEYED`, `STREAM_UNREADABLE` (r11) | NAMED | an UNKEYED_TRADE: a trade row whose id was unreadable with no own leg kept on a readable order; an unreadable stream entry or list (r12: a missing one included) |
  * | `TRADES_LEG_UNKEYED_FRAGMENTS`, `STREAM_*_UNKEYED` (r11) | SHOWN / NAMED | an UNKEYED_LEG no read can answer (a fact or its order unreadable; the stream's) |
  * | `BY_ID_FOUND` (r11) | NAMED | a by-id answer's `found: true` in an unusable answer: the order asked about exists |
  * | `POSITIONS`, `COLLATERAL`, `APPROVALS` (r11) | SHOWN / NAMED | a HOLDING: detail only (not monotonic) |

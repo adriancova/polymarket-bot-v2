@@ -6,8 +6,9 @@
  * type (or an inexact decimal), a field that is an accessor, a row relabelled with another id, a by-id `found` flag
  * flipped or removed, a row listed twice, a malformed sibling row added, the list truncated (rows dropped from its
  * end, or a row cut short), a list entry that is not own data (an accessor or a hole), an envelope field (the route,
- * `complete`, the list itself) dropped or garbled. Every mutated answer is a fresh plain object; nothing of the input
- * is changed.
+ * `complete`, the list itself) dropped or garbled; for a user-stream output (r12, WP290-CX-R12-01), its own keys
+ * (`kind`, `oms`, an ORDER's `observation`, a TRADE's `fills` and `settlements`) DELETED, made an accessor, or given a
+ * value outside their shape. Every mutated answer is a fresh plain object; nothing of the input is changed.
  *
  * The ORACLE reads a delivered answer field by field, each on its own, with the field domains of `ports.ts` (the
  * guards are the domains' definitions; the oracle's walk over rows, legs and entries is its own): a field that is own
@@ -272,19 +273,50 @@ function mutateEnvelope(rand: Rand, door: Door, base: Row): Row {
   return { ...base, [key]: key === "complete" || key === "found" ? "yes" : key === list ? "not a list" : 7 };
 }
 
+/** A copy of `row` without `key` (r12: a MISSING key). */
+function without(row: Row, key: string): Row {
+  const copy = { ...row };
+  delete copy[key];
+  return copy;
+}
+
+/**
+ * One mutation of a user-stream output (WP-280's ORDER or TRADE output). ENVELOPE breaks the output's own keys: its
+ * `kind` or `oms` (one draw in four), else an ORDER's `observation` or one of a TRADE's lists. Each such key is made an
+ * accessor, given a value outside its shape, or (r12, WP290-CX-R12-01) DELETED. A second mutation may meet an output
+ * a first one broke (no `oms`, no list): it then mutates what is there.
+ */
 function mutateStream(rand: Rand, base: Row, mutation: Mutation): Row {
-  const oms = base["oms"] as Row;
-  // The output's own kind, unreadable (an accessor, or not text): one ENVELOPE draw in four.
-  if (mutation === "ENVELOPE" && rand() < 0.25) return rand() < 0.5 ? withAccessor(base, "kind") : { ...base, kind: 7 };
+  const projection = base["oms"];
+  const oms: Row = projection !== null && typeof projection === "object" && !Array.isArray(projection) ? (projection as Row) : {};
+  if (mutation === "ENVELOPE" && rand() < 0.25) {
+    const key = rand() < 0.5 ? "kind" : "oms";
+    const how = rand();
+    if (how < 1 / 3) return withAccessor(base, key);
+    if (how < 2 / 3) return without(base, key);
+    return { ...base, [key]: 7 };
+  }
   if (base["kind"] === "ORDER") {
-    const observation = oms["observation"] as Row;
-    if (mutation === "ENVELOPE" || mutation === "OPAQUE_ENTRY" || mutation === "HOLE_ENTRY") return { ...base, oms: withAccessor(oms, "observation") };
-    return { ...base, oms: { ...oms, observation: mutateRowFields(rand, observation, OBSERVATION_KEYS, ["DROP_FIELD", "WRONG_TYPE", "ACCESSOR", "TRUNCATE_ROW"].includes(mutation) ? mutation : "WRONG_TYPE") } };
+    const observation = oms["observation"];
+    if (mutation === "ENVELOPE") {
+      const how = rand();
+      if (how < 1 / 3) return { ...base, oms: withAccessor(oms, "observation") };
+      if (how < 2 / 3) return { ...base, oms: without(oms, "observation") };
+      return { ...base, oms: { ...oms, observation: pick(rand, [7, undefined, "not an observation"]) } };
+    }
+    if (mutation === "OPAQUE_ENTRY" || mutation === "HOLE_ENTRY") return { ...base, oms: withAccessor(oms, "observation") };
+    if (observation === null || typeof observation !== "object") return base;
+    return { ...base, oms: { ...oms, observation: mutateRowFields(rand, observation as Row, OBSERVATION_KEYS, ["DROP_FIELD", "WRONG_TYPE", "ACCESSOR", "TRUNCATE_ROW"].includes(mutation) ? mutation : "WRONG_TYPE") } };
   }
   const field = pick(rand, ["fills", "settlements"] as const);
   const items = Array.isArray(oms[field]) ? (oms[field] as Row[]) : [];
   const keys = field === "fills" ? FILL_KEYS : SETTLEMENT_KEYS;
-  if (mutation === "ENVELOPE") return { ...base, oms: pick(rand, [true, false]) ? withAccessor(oms, field) : { ...oms, [field]: "not a list" } };
+  if (mutation === "ENVELOPE") {
+    const how = rand();
+    if (how < 1 / 3) return { ...base, oms: withAccessor(oms, field) };
+    if (how < 2 / 3) return { ...base, oms: without(oms, field) };
+    return { ...base, oms: { ...oms, [field]: pick(rand, ["not a list", undefined, null]) } };
+  }
   if (items.length === 0) return base;
   const index = Math.floor(rand() * items.length);
   if (mutation === "OPAQUE_ENTRY") return { ...base, oms: { ...oms, [field]: opaqueEntry(items, index) } };
@@ -375,6 +407,53 @@ export function expectedRoute(answer: unknown, key: string, right: string): "RIG
   const read = own(answer, key);
   if (!read.data || typeof read.value !== "string") return "UNREADABLE";
   return read.value === right ? "RIGHT" : "OTHER";
+}
+
+/**
+ * (r12) What a delivered user-stream output carries, read by the oracle on its own: every item (a row of fragments) and
+ * every unreadable entry BY NAME (`<item kind>:<field>`, as the door names it: `FILL:kind`, `ORDER:oms`, `FILL:oms`,
+ * `ORDER:observation`, `FILL:fills`, `SETTLEMENT:settlements`, `<kind>:entry`). Every key of WP-280's projection the
+ * door reads is present in every output WP-280 emits: one that is MISSING is unreadable, never "nothing"
+ * (WP290-CX-R12-01).
+ */
+export function expectedStream(answer: unknown, maxItems: number): { readonly items: { kind: string; row: Expected }[]; readonly unreadable: string[] } {
+  const kind = own(answer, "kind");
+  const oms = own(answer, "oms");
+  const items: { kind: string; row: Expected }[] = [];
+  // Each unreadable entry by name (`<item kind>:<field>`): r12 states them by name, not by count.
+  const unreadable: string[] = [];
+  const projection = oms.data && oms.value !== null && typeof oms.value === "object" ? oms.value : undefined;
+  // An output whose own kind cannot be read: one unreadable entry (it may have been any output, a TRADE among them).
+  if (!kind.data || typeof kind.value !== "string") unreadable.push("FILL:kind");
+  else if (kind.value === "ORDER") {
+    // (r12, WP290-CX-R12-01) WP-280's ORDER projection always carries `observation` (null: no observation): a key
+    // that is MISSING, not own data, or `undefined` is unreadable, never "nothing".
+    const observation = projection === undefined ? undefined : Object.getOwnPropertyDescriptor(projection, "observation");
+    if (projection === undefined) unreadable.push("ORDER:oms");
+    else if (observation === undefined || !("value" in observation) || observation.value === undefined) unreadable.push("ORDER:observation");
+    else if (observation.value !== null) items.push({ kind: "ORDER", row: expectedRow(observation.value, OBSERVATION_KEYS) });
+  } else if (kind.value === "TRADE") {
+    if (projection === undefined) unreadable.push("FILL:oms");
+    else {
+      for (const [field, itemKind, keys, optional] of [
+        ["fills", "FILL", FILL_KEYS, ["feeAmount", "feeAssetId"]],
+        ["settlements", "SETTLEMENT", SETTLEMENT_KEYS, ["transactionHash"]],
+      ] as const) {
+        // (r12, WP290-CX-R12-01) WP-280's TRADE projection always carries both lists: a MISSING one is unreadable.
+        const descriptor = Object.getOwnPropertyDescriptor(projection, field);
+        const entries = descriptor !== undefined && "value" in descriptor ? expectedEntries(descriptor.value, maxItems) : undefined;
+        if (entries === undefined) {
+          unreadable.push(`${itemKind}:${field}`);
+          continue;
+        }
+        for (const entry of entries) {
+          if (entry === UNREADABLE) unreadable.push(`${itemKind}:entry`);
+          else items.push({ kind: itemKind, row: expectedRow(entry, keys, optional) });
+        }
+      }
+    }
+  }
+  return { items, unreadable };
 }
 
 export { APPROVAL_KEYS, COLLATERAL_KEYS, FILL_KEYS, LEG_KEYS, MEMBER_KEYS, OBSERVATION_KEYS, ORDER_KEYS, POSITION_KEYS, SETTLEMENT_KEYS, TRADE_KEYS, own };

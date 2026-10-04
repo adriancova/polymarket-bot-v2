@@ -65,6 +65,7 @@ import {
   expectedEntries,
   expectedRoute,
   expectedRow,
+  expectedStream,
   mutateAnswer,
   own,
   type Door,
@@ -246,41 +247,8 @@ function oracle(door: Door, answer: unknown): unknown {
       return expectedRoute(answer, "source", "ONCHAIN_ERC20_BALANCE") === "OTHER" ? [] : [expectedRow(answer !== null && typeof answer === "object" ? answer : UNREADABLE, COLLATERAL_KEYS)];
     case "wallet-member":
       return [expectedRow(answer !== null && typeof answer === "object" ? answer : UNREADABLE, MEMBER_KEYS)];
-    case "stream": {
-      const kind = own(answer, "kind");
-      const oms = own(answer, "oms");
-      const items: { kind: string; row: Expected }[] = [];
-      let unreadable = 0;
-      // An output whose own kind cannot be read: one unreadable entry (it may have been any output, a TRADE among them).
-      if (!kind.data || typeof kind.value !== "string") unreadable += 1;
-      else if (kind.value === "ORDER") {
-        const observation = oms.data && oms.value !== null && typeof oms.value === "object" ? Object.getOwnPropertyDescriptor(oms.value, "observation") : undefined;
-        if (!oms.data || oms.value === null || typeof oms.value !== "object") unreadable += 1;
-        else if (observation !== undefined && !("value" in observation)) unreadable += 1;
-        else if (observation !== undefined && observation.value !== null && observation.value !== undefined) items.push({ kind: "ORDER", row: expectedRow(observation.value, OBSERVATION_KEYS) });
-      } else if (kind.value === "TRADE") {
-        if (!oms.data || oms.value === null || typeof oms.value !== "object") unreadable += 1;
-        else {
-          for (const [field, itemKind, keys, optional] of [
-            ["fills", "FILL", FILL_KEYS, ["feeAmount", "feeAssetId"]],
-            ["settlements", "SETTLEMENT", SETTLEMENT_KEYS, ["transactionHash"]],
-          ] as const) {
-            const descriptor = Object.getOwnPropertyDescriptor(oms.value, field);
-            if (descriptor === undefined) continue;
-            const entries = "value" in descriptor ? expectedEntries(descriptor.value, MAX_STREAM_ITEMS) : undefined;
-            if (entries === undefined) {
-              unreadable += 1;
-              continue;
-            }
-            for (const entry of entries) {
-              if (entry === UNREADABLE) unreadable += 1;
-              else items.push({ kind: itemKind, row: expectedRow(entry, keys, optional) });
-            }
-          }
-        }
-      }
-      return { items, unreadable };
-    }
+    case "stream":
+      return expectedStream(answer, MAX_STREAM_ITEMS);
   }
 }
 
@@ -326,7 +294,7 @@ function stated(door: Door, output: ReturnType<typeof readDoor>): unknown {
         const keys = item.fragments.kind === "ORDER" ? OBSERVATION_KEYS : item.fragments.kind === "FILL" ? FILL_KEYS : SETTLEMENT_KEYS;
         return { kind: item.fragments.kind, row: asExpected(item.fragments as unknown as Readonly<Record<string, unknown>> & { unreadable: readonly string[] }, keys, { liquidityRole: "role" }) };
       }),
-      unreadable: stream.unreadable.length,
+      unreadable: stream.unreadable.map((entry) => `${entry.kind}:${entry.field}`),
     };
   }
   const { salvage } = output as ReadOutcome<unknown>;
@@ -358,12 +326,24 @@ function anyUnreadable(value: unknown): boolean {
 
 const SEEDS_PER_DOOR = 2500;
 
+/** (r12) Whether a delivered stream output lacks one of the keys the door reads (`kind`, `oms`, `observation`, `fills`, `settlements`). */
+function streamKeyMissing(answer: unknown): boolean {
+  const has = (value: unknown, key: string): boolean => value !== null && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, key);
+  if (!has(answer, "kind") || !has(answer, "oms")) return true;
+  const kind = own(answer, "kind");
+  const projection = own(answer, "oms");
+  if (!kind.data || !projection.data) return false;
+  if (kind.value === "ORDER") return !has(projection.value, "observation");
+  return kind.value === "TRADE" && (!has(projection.value, "fills") || !has(projection.value, "settlements"));
+}
+
 describe("WP-290 r11: the door property (the class fix at the door layer)", () => {
   it(`every door, ${String(SEEDS_PER_DOOR)} seeds each (1 to ${String(SEEDS_PER_DOOR)}): every fragment validated in isolation is in the door's output, every fragment present but unreadable is listed unreadable, every outcome carries its salvage`, () => {
     const counts = new Map<string, number>();
     let cases = 0;
     let unreadableCases = 0;
     let doubles = 0;
+    let streamKeysMissing = 0;
     for (const door of DOORS) {
       for (let seed = 1; seed <= SEEDS_PER_DOOR; seed += 1) {
         const rand = seeded(seed * 31 + DOORS.indexOf(door));
@@ -379,7 +359,9 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
         const expected = oracle(door, delivered);
         const actual = stated(door, output);
         expect(actual, `${door} seed ${String(seed)} ${mutation}`).toEqual(expected);
-        if (anyUnreadable(expected)) unreadableCases += 1;
+        if (anyUnreadable(expected) || (door === "stream" && (expected as ReturnType<typeof expectedStream>).unreadable.length > 0)) unreadableCases += 1;
+        // (r12) The stream outputs delivered with one of the door's own keys MISSING (WP290-CX-R12-01's shape).
+        if (door === "stream" && streamKeyMissing(delivered)) streamKeysMissing += 1;
         if (door !== "stream") {
           const outcome = output as ReadOutcome<unknown>;
           expect(outcome.salvage, `${door} seed ${String(seed)}: an outcome without its salvage`).toBeDefined();
@@ -392,8 +374,9 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
         }
       }
     }
-    console.log(`DOOR-PROPERTY doors=${String(DOORS.length)} seeds=1..${String(SEEDS_PER_DOOR)} cases=${String(cases)} doubleMutations=${String(doubles)} withUnreadable=${String(unreadableCases)} byMutation=${JSON.stringify(Object.fromEntries([...counts].sort()))}`);
+    console.log(`DOOR-PROPERTY doors=${String(DOORS.length)} seeds=1..${String(SEEDS_PER_DOOR)} cases=${String(cases)} doubleMutations=${String(doubles)} withUnreadable=${String(unreadableCases)} streamKeyMissing=${String(streamKeysMissing)} byMutation=${JSON.stringify(Object.fromEntries([...counts].sort()))}`);
     expect(cases).toBe(DOORS.length * SEEDS_PER_DOOR);
+    expect(streamKeysMissing, "the key-deletion mutation is drawn").toBeGreaterThan(0);
     // About 0.5 s alone; a generous bound, so a loaded host never times it out (vitest's default is 5 s).
   }, 120_000);
 
@@ -414,6 +397,40 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
     const v10 = readTrades({ route: "/data/trades", complete: true, trades: [{ ...trade, venueTradeId: 42, ownLegs: [leg] }] });
     expect(v10.salvage.trades[0]).toMatchObject({ venueTradeId: null, status: "FAILED", unreadable: ["venueTradeId"] });
     expect(v10.salvage.trades[0]?.legs[0]?.inFull).toEqual(leg);
+  });
+});
+
+describe("WP-290 r12 (WP290-CX-R12-01): the stream door's own keys", () => {
+  it("(named) a WP-280 output whose observation, fills or settlements key is MISSING: one unreadable entry each, named, as the oracle states; the same key null or an accessor alike; observation null and a missing shortfalls carry none", () => {
+    const fill = { venueTradeId: "t1", venueOrderId: "venue-1", shares: "0.4", price: "0.5", liquidityRole: "MAKER", feeAmount: "0", feeAssetId: null, matchedAt: "2026-10-03T00:00:00Z" };
+    const settlement = { venueTradeId: "t1", venueOrderId: "venue-1", status: "CONFIRMED", transactionHash: null };
+    const accessor = (key: string, value: unknown): Row => {
+      const projection: Row = { fills: [fill], settlements: [settlement], observation: { venueOrderId: "venue-1", status: "LIVE" }, shortfalls: [] };
+      delete projection[key];
+      Object.defineProperty(projection, key, { get: () => value, enumerable: true });
+      return projection;
+    };
+    const cases: [string, unknown, string[]][] = [
+      ["TRADE, fills missing", { kind: "TRADE", oms: { settlements: [settlement], shortfalls: [] } }, ["FILL:fills"]],
+      ["TRADE, settlements missing", { kind: "TRADE", oms: { fills: [fill], shortfalls: [] } }, ["SETTLEMENT:settlements"]],
+      ["TRADE, both missing", { kind: "TRADE", oms: { shortfalls: [] } }, ["FILL:fills", "SETTLEMENT:settlements"]],
+      ["TRADE, fills null", { kind: "TRADE", oms: { fills: null, settlements: [settlement], shortfalls: [] } }, ["FILL:fills"]],
+      ["TRADE, fills an accessor", { kind: "TRADE", oms: accessor("fills", [fill]) }, ["FILL:fills"]],
+      ["ORDER, observation missing", { kind: "ORDER", oms: { shortfalls: [] } }, ["ORDER:observation"]],
+      ["ORDER, observation undefined", { kind: "ORDER", oms: { observation: undefined, shortfalls: [] } }, ["ORDER:observation"]],
+      ["ORDER, observation an accessor", { kind: "ORDER", oms: accessor("observation", { venueOrderId: "venue-1", status: "LIVE" }) }, ["ORDER:observation"]],
+      ["ORDER, oms missing", { kind: "ORDER" }, ["ORDER:oms"]],
+      ["TRADE, oms missing", { kind: "TRADE" }, ["FILL:oms"]],
+      ["kind missing", { oms: { fills: [fill], settlements: [], shortfalls: [] } }, ["FILL:kind"]],
+      ["control: ORDER, observation null", { kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } }, []],
+      ["control: TRADE, shortfalls missing", { kind: "TRADE", oms: { fills: [fill], settlements: [settlement] } }, []],
+      ["control: TRADE, well formed", { kind: "TRADE", oms: { fills: [fill], settlements: [settlement], shortfalls: [] } }, []],
+    ];
+    for (const [name, answer, names] of cases) {
+      const output = readStreamOutput(answer);
+      expect(stated("stream", output), name).toEqual(oracle("stream", answer));
+      expect(output.unreadable.map((entry) => `${entry.kind}:${entry.field}`), name).toEqual(names);
+    }
   });
 });
 

@@ -106,7 +106,8 @@
  * fragment present but unreadable is an explicit obligation: of an object
  * whose id is readable, that object's (read again until a sound read shows it
  * in full); an UNREADABLE IDENTITY (an order row, a trade row or a leg whose
- * id could not be read, an unreadable user-stream entry) is a
+ * id could not be read, an unreadable user-stream entry or list, r12: a
+ * missing one included) is a
  * `READ_CONFLICT` of the account keyed `unreadable`, which no run resolves
  * (no read can say which object it was); a wallet member shown in two
  * terminal states is a `READ_CONFLICT` on that member, never answered.

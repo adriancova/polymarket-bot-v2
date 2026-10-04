@@ -218,7 +218,8 @@ export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
  *   ever answer those (`venueOrderId` is `null` when the order id was unreadable too);
  * - `ORPHAN_LEG`: an own leg shown under a readable trade id (`venueTradeId`) whose order id was unreadable;
  * - `UNKEYED_ORDER`: an order row whose order id was unreadable; `UNKEYED_TRADE`: a trade row whose trade id was
- *   unreadable and that carried no own leg the door could keep, or a user-stream entry that could not be read;
+ *   unreadable and that carried no own leg the door could keep, or a user-stream entry or list that could not be read
+ *   (r12: a missing list included; a missing ORDER observation is an `UNKEYED_ORDER`);
  * - `HOLDING`: a position, the collateral balance or an approval an answer showed (`subject`, `value`: detail only);
  * - `MEMBER`: what one read of a wallet member, by name (`subject`), showed (`status`: its state, `value`: the amount
  *   credited, `transactionHash`).

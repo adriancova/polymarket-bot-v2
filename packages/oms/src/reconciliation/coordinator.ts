@@ -2501,6 +2501,8 @@ export class ReconciliationCoordinator {
    * whatever its siblings (a list one entry of which is not own data no longer drops the others), and every item the
    * OMS did not apply keeps EVERY fragment it validated (`#streamRecords`): an item whose shares are inexact still
    * names its trade and order. Every entry or list present but unreadable is an UNREADABLE obligation of the account.
+   * (r12, WP290-CX-R12-01) So is a projection key that is MISSING (an ORDER's `observation`, a TRADE's `fills` or
+   * `settlements`): the door names it unreadable, so it is journaled here as an obligation and a run is triggered.
    */
   async #routeStream(output: unknown): Promise<void> {
     const read = readStreamOutput(output);

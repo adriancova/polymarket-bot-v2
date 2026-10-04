@@ -284,9 +284,10 @@ describe("WP-290 r11 units (the stream door): every item read on its own; an ent
       ["SETTLEMENT", "t3", ["status"]],
     ]);
     expect(read.unreadable).toEqual([{ kind: "FILL", field: "entry" }]);
-    const inexact = readStreamOutput({ kind: "TRADE", oms: { fills: [{ ...fill, shares: "0.40" }] } });
+    // (r12) Every input carries both lists, as WP-280 always does: a MISSING list is itself an unreadable entry.
+    const inexact = readStreamOutput({ kind: "TRADE", oms: { fills: [{ ...fill, shares: "0.40" }], settlements: [] } });
     expect(inexact.items.map((item) => [item.fragments.venueTradeId, item.fragments.venueOrderId, item.fragments.shares, item.fragments.feeAmount, item.fragments.unreadable])).toEqual([["t1", "venue-1", null, null, ["shares"]]]);
-    expect(readStreamOutput({ kind: "TRADE", oms: { fills: "not a list" } }).unreadable).toEqual([{ kind: "FILL", field: "fills" }]);
+    expect(readStreamOutput({ kind: "TRADE", oms: { fills: "not a list", settlements: [] } }).unreadable).toEqual([{ kind: "FILL", field: "fills" }]);
     expect(readStreamOutput({ kind: "TRADE" }).unreadable).toEqual([{ kind: "FILL", field: "oms" }]);
     expect(readStreamOutput({ kind: "STATE" })).toMatchObject({ kind: null, unreadable: [] });
     // An output whose kind cannot be read may have been a TRADE: it is one unreadable entry.

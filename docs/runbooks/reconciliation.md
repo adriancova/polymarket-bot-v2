@@ -105,7 +105,7 @@ not a fault.
    | (r11) a by-id answer's `found: true` when the answer is unusable (its row absent, its id unreadable, or the order asked about's): the order asked about exists (`BY_ID_FOUND`), so a later not-found is a contradiction (E-14), never a ghost | named |
    | (r11) every position, the collateral balance and every approval an answer showed, valid or not (`HOLDING`): kept as detail only (a holding goes down legitimately, so no later read is judged against it) | shown or named |
    | (r11) every wallet member read by name (`MEMBER`): its state, hash and amount credited, valid or not; a state that contradicts another terminal one holds the member (section 7) | shown or named |
-   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed | named |
+   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed. (r12) A projection key that is MISSING (a TRADE output with no `fills` or no `settlements` key, an ORDER output with no `observation` key) is unreadable too: the same obligation (`UNKEYED_TRADE`, or `UNKEYED_ORDER` for the observation), and a run at once. `observation: null` is WP-280's own shape for an event that named no status, not an obligation | named |
 
    **(r11) Salvage is the default path.** Every door reads EVERY field of
    EVERY row of every answer on its own first, whatever the answer's
@@ -719,7 +719,10 @@ returns at once, with no run.
 - **A `READ_CONFLICT` keyed `unreadable`** (r11) is an account-level
   UNREADABLE obligation: an order row, a trade row or a leg whose id could
   not be read (its detail says which, its source, and every fragment it
-  showed), or a user-stream entry that could not be read. No read can say
+  showed), or a user-stream entry, list or observation that could not be
+  read (r12: a missing one included; the detail names the source,
+  `STREAM_UNREADABLE` with the list, e.g. "unreadable: fills", or
+  `STREAM_ORDER_UNKEYED` for an order observation). No read can say
   which object it was, so it never clears and halts the account until the
   retraction ADR gives a path (section 10). Find what the row was from the
   adapter's logs; fix the adapter; escalate.
@@ -794,7 +797,12 @@ be read holds the account for good (it can never be matched to an object);
 a field out of its domain is kept as unreadable on its object, which is then
 read again until a sound read shows it in full. WP-280's user-stream outputs
 must carry their lists as plain lists of plain items: an entry that is not
-own data holds the account for good.
+own data holds the account for good. (r12) Every ORDER output must carry
+`oms.observation` (`null` when the event named no status) and every TRADE
+output `oms.fills` and `oms.settlements` (empty lists when nothing was
+projected): an output missing one of them holds the account for good, as
+one whose key is not a list. `oms.shortfalls` is not read here: WP-280
+raises its own `EVENT_NOT_FULLY_APPLICABLE` request for a shortfall.
 
 The composition also binds `tokenOfGroup` to the execution groups it
 registered with the OMS (`execution.groups.token_id`). An order whose group's
@@ -868,12 +876,17 @@ nothing is judged or booked from it.
   is unreadable and whose own legs could not be kept on a readable order; an
   own leg under an unreadable trade id with any fill fact unreadable (or its
   order id); a user-stream item whose trade id is unreadable, and a stream
-  entry or list that is not own data; a by-id answer's `found: true` for an
+  entry or list that is not own data (r12: or MISSING, as is an ORDER
+  output's observation); a by-id answer's `found: true` for an
   order the venue later does not find; an orphan leg of a trade that a valid
   row later shows without it; a wallet member shown both FAILED and
   CONFIRMED. Each is fail closed: an adapter that garbles one id, once,
   holds the account until the retraction ADR gives an operator path. The
-  measured cost on the property is in the WP-290 r11 handoff.
+  measured cost on the property is in the WP-290 r11 handoff. While such an
+  obligation stands, every run's order reads are unsound: no submission is
+  answered from them, and a fill the venue shows is not delivered to the
+  OMS, so it is not booked either, until that path exists (r12 pins this
+  for a missing stream list: `regressions-r12.test.ts`).
 - **(r11) What the doors keep, and what they do not.** Holdings (positions,
   the collateral balance, approvals) are kept as evidence, as detail only: a
   holding goes down legitimately (a sale, a FAILED settlement, a
