@@ -8,7 +8,7 @@
     "displayName": "BTC 15-minute up/down (example)",
     "underlyingSymbol": "btc.usd",
     "cadence": "PT15M",
-    "description": "Example rolling series used by the first strategy configuration in handoff section 13.2. Membership rules and settlement semantics are unreviewed.",
+    "description": "Example rolling series used by the first strategy configuration in handoff section 13.2. Membership rules and settlement semantics are unreviewed. Observed on 2026-10-04 (VENUE-SETL-1, docs/venue/verified-2026-10-04.md): its venue windows are the Gamma events of series id 10192, slug btc-up-or-down-15m, recurrence 15m, one market each with outcomes Up and Down and a 900-second window from eventStartTime to endDate. These are observed venue values, not documented constants.",
     "binding": {
       "approved": false
     },
