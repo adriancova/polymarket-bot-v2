@@ -116,7 +116,7 @@ describe("the reconciliation subtrees stay layer 1", () => {
   it("the coordinator (packages/oms/src/reconciliation) has no I/O, clock, randomness, timer, adapter or same-layer import", () => {
     const list = files(OMS_TREE);
     expect(list.map((entry) => entry.file).sort()).toEqual(
-      ["coordinator.ts", "door.ts", "holdings.ts", "identity.ts", "index.ts", "ports.ts", "time.ts"].map((name) => `packages/oms/src/reconciliation/${name}`),
+      ["coordinator.ts", "door.ts", "holdings.ts", "identity.ts", "index.ts", "ports.ts", "subjects.ts", "time.ts"].map((name) => `packages/oms/src/reconciliation/${name}`),
     );
     expect(violations(list, OMS_FORBIDDEN, true)).toEqual([]);
     // Its only package import is the decimal package (the OMS's one dependency).

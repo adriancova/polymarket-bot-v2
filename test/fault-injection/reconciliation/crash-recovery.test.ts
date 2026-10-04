@@ -44,6 +44,7 @@ import { group, ticket } from "../../unit/oms/support/harness.js";
 import {
   ACCOUNT,
   Killed,
+  MARKET,
   NO,
   YES,
   boot,
@@ -210,6 +211,124 @@ describe("WP-290 acceptance 3: crash before and after every port call, restart, 
         }
       }
       expect(killedRuns).toBe(2 * calls);
+    }, 300_000);
+  }
+});
+
+/**
+ * r3 (D-A1): A FAILED SETTLEMENT'S HALT SURVIVES A CRASH. The OMS raises `SETTLEMENT_FAILED` only into its in-memory
+ * alert list, once, on the transition into FAILED, and then persists the settlement; its restore replays the
+ * settlement without the alert, and a repeated FAILED is idempotent. So the coordinator derives the obligation
+ * from the venue's authoritative read in every run: one `SETTLEMENT_FAILED` quarantine per (trade, order).
+ *
+ * One order, matched once (MINED), reconciled and resumed; then the venue's trade FAILS, seen by the coordinator's
+ * own probe (the venue path) or first delivered by the user stream (the stream path). The process is killed before
+ * and after every port call from that moment on: both sides of the OMS's settlement write and of every journal
+ * write (the break, its quarantine). After the restart, the account NEVER resumes while the trade's quarantine is
+ * unreleased, its market is halted, and once an operator releases the quarantines, it resumes consistent.
+ */
+const G_FAIL = group(7103, { tokenId: YES, plannedShares: "5" });
+
+interface FailedRun {
+  readonly u: Universe;
+  readonly first: Process;
+  readonly trade: { readonly venueTradeId: string; status: string } | undefined;
+  /** The first incarnation's port calls before the trade FAILED. */
+  readonly before: number;
+}
+
+function failedSettlementOutput(trade: { readonly venueTradeId: string; readonly venueOrderId: string; readonly transactionHash: string }): unknown {
+  return {
+    kind: "TRADE",
+    oms: {
+      fills: [],
+      settlements: [{ venueTradeId: trade.venueTradeId, venueOrderId: trade.venueOrderId, status: "FAILED", transactionHash: trade.transactionHash, observedAt: "2026-10-03T00:00:01Z" }],
+      shortfalls: [],
+    },
+  };
+}
+
+async function failedSettlement(path: "venue" | "stream", plan: KillPlan | null): Promise<FailedRun> {
+  const u = universe();
+  const first = await boot(u, plan);
+  let trade: ReturnType<Universe["world"]["match"]>;
+  let before = -1;
+  try {
+    await reconcileUntilResumed(first, u, 2);
+    const oms = manager(first);
+    await oms.registerGroup(G_FAIL);
+    await oms.submit(ticket(G_FAIL, { n: 11, shares: "1" }));
+    const salt = u.world.receipts.at(-1);
+    trade = salt === undefined ? undefined : u.world.match(salt, "0.4", { status: "MINED" });
+    await reconcileUntilResumed(first, u, 4);
+    before = first.inc.calls;
+    if (trade !== undefined) trade.status = "FAILED";
+    if (path === "stream" && trade !== undefined) {
+      first.coordinator.onUserStreamOutput(failedSettlementOutput(trade));
+      await first.coordinator.settled();
+    }
+    first.coordinator.trigger("PERIODIC_TIMER");
+    await first.coordinator.reconcile();
+  } catch (error) {
+    if (!(error instanceof Killed) && first.inc.alive) throw error;
+  }
+  first.inc.alive = false;
+  return { u, first, trade, before };
+}
+
+async function checkFailed(label: string, run: FailedRun): Promise<void> {
+  const { u, trade } = run;
+  expect(trade?.status, `${label}: the venue's trade FAILED`).toBe("FAILED");
+  const last = await boot(u, null);
+  expect(await reconcileUntilResumed(last, u, 4), `${label}: never resumed while the reversal is owed`).toBe(false);
+  expect(last.oms?.paused, `${label}: paused`).toBe(true);
+  const failed = last.journal.unresolvedBreaks().filter((view) => view.breakClass === "SETTLEMENT_FAILED");
+  expect(failed, `${label}: one quarantine for the FAILED trade`).toHaveLength(1);
+  expect(failed[0], label).toMatchObject({ status: "QUARANTINED", scope: "MARKET", marketId: MARKET, assetId: YES });
+  expect(failed[0]?.subjectKey, label).toContain(trade?.venueTradeId ?? "?");
+  expect(
+    u.halts.some((halt) => halt.breakId === failed[0]?.breakId && halt.marketId === MARKET),
+    `${label}: the market is halted`,
+  ).toBe(true);
+  // The operator handles the reversal and releases every quarantine: the account resumes, consistent.
+  for (const view of last.journal.unresolvedBreaks()) {
+    if (view.status !== "QUARANTINED") continue;
+    expect((await last.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "the reversal is booked" })).ok, label).toBe(true);
+  }
+  expect(await reconcileUntilResumed(last, u, 4), `${label}: resumes once released`).toBe(true);
+  expect([...u.violations, ...u.world.violations], `${label}: oracle`).toEqual([]);
+}
+
+describe("WP-290 acceptance 3 (r3, D-A1): a FAILED settlement's halt survives a crash on either side of every write", () => {
+  it("(D-A1, R3-B) a crash right after the OMS durably recorded the FAILED settlement: after the restart, quarantined and halted, never resumed", async () => {
+    const r = await failedSettlement("venue", null);
+    // The same history, with the process killed right after the OMS's durable APPEND_SETTLEMENT(FAILED).
+    const at = r.first.inc.trace.findIndex((name, index) => index >= r.before && name.includes("APPEND_SETTLEMENT")) + 1;
+    expect(at).toBeGreaterThan(r.before);
+    const run = await failedSettlement("venue", { at, phase: "after" });
+    expect(run.u.store.snapshotSync().settlements.map((settlement) => settlement.state)).toEqual(["MINED", "FAILED"]);
+    // Nothing the coordinator journaled after the settlement write survives: the OMS's alert is gone with its process.
+    expect(run.u.journalEvents.some((event) => event.kind === "BREAK_OPENED" && (event.breakClass === "OMS_HALTING_ALERT" || event.breakClass === "SETTLEMENT_FAILED"))).toBe(false);
+    await checkFailed("R3-B", run);
+  });
+
+  for (const path of ["venue", "stream"] as const) {
+    it(`(D-A1) the ${path} path: killed before and after every port call once the trade FAILED; restart; quarantined until released`, async () => {
+      const baseline = await failedSettlement(path, null);
+      await checkFailed(`${path} (no crash)`, baseline);
+      const total = baseline.first.inc.calls;
+      expect(total - baseline.before).toBeGreaterThan(10);
+      // Both sides of the settlement write and of the break's journal writes are among the calls.
+      const phase = baseline.first.inc.trace.slice(baseline.before);
+      expect(phase.some((name) => name.includes("APPEND_SETTLEMENT"))).toBe(true);
+      expect(phase.filter((name) => name === "journal.append").length).toBeGreaterThan(2);
+      for (let at = baseline.before + 1; at <= total; at += 1) {
+        for (const phaseName of ["before", "after"] as const) {
+          const run = await failedSettlement(path, { at, phase: phaseName });
+          expect(run.first.inc.alive).toBe(false);
+          await checkFailed(`${path}: killed ${phaseName} call ${String(at)} (${baseline.first.inc.trace[at - 1] ?? "?"})`, run);
+        }
+      }
     }, 300_000);
   }
 });

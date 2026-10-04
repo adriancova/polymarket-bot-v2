@@ -202,6 +202,20 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     expect((await r.p.coordinator.releaseQuarantine({ breakId: breakId ?? "", operatorRef: "operator-1", reason: "the reversal is booked" })).ok).toBe(true);
   }
 
+  /**
+   * r3 (D-A1): a FAILED settlement is also its own trade-keyed quarantine, derived from the venue's read (not from
+   * the OMS's in-memory alert), so each FAILED trade here is two quarantines: the OMS's alert and the trade's.
+   */
+  function failedBreaks(r: Ready): ReturnType<Ready["p"]["journal"]["unresolvedBreaks"]> {
+    return r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "SETTLEMENT_FAILED");
+  }
+
+  async function releaseFailed(r: Ready, count: number): Promise<void> {
+    const failed = failedBreaks(r);
+    expect(failed).toHaveLength(count);
+    for (const view of failed) await release(r, view.breakId);
+  }
+
   it("(R2-C) a second halting alert of one kind on one order, after the first was released: its own quarantine, its market halted, never resumed past", async () => {
     const { r, first, second } = await twoTrades();
     first.status = "FAILED"; // the OMS raises SETTLEMENT_FAILED (a compensating reversal is owed)
@@ -210,6 +224,8 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     const firstAlert = alertBreaks(r);
     expect(firstAlert).toHaveLength(1);
     await release(r, firstAlert[0]?.breakId);
+    expect(await reconcileRounds(r, 2)).toBe(false); // the trade's own quarantine still holds
+    await releaseFailed(r, 1);
     expect(await reconcileRounds(r, 4)).toBe(true);
     const haltsBefore = r.u.halts.length;
     second.status = "FAILED"; // the same kind of alert, on the same order: another reversal is owed
@@ -221,8 +237,9 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     expect(secondAlert[0]?.breakId).not.toBe(firstAlert[0]?.breakId);
     expect(secondAlert[0]?.status).toBe("QUARANTINED");
     expect(r.u.halts.slice(haltsBefore).some((halt) => halt.breakId === secondAlert[0]?.breakId && halt.marketId === MARKET)).toBe(true);
-    // Released in turn, the account resumes.
+    // Released in turn (the alert, and the second trade's own quarantine), the account resumes.
     await release(r, secondAlert[0]?.breakId);
+    await releaseFailed(r, 1);
     expect(await reconcileRounds(r, 4)).toBe(true);
   });
 
@@ -240,6 +257,8 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     expect(await reconcileRounds(r, 3)).toBe(false);
     expect(alertBreaks(r).map((view) => view.breakId)).toEqual([both[1]?.breakId]);
     await release(r, both[1]?.breakId);
+    expect(await reconcileRounds(r, 2)).toBe(false); // each trade's own quarantine still holds
+    await releaseFailed(r, 2);
     expect(await reconcileRounds(r, 3)).toBe(true);
   });
 
@@ -251,6 +270,7 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     const before = alertBreaks(r);
     expect(before).toHaveLength(1);
     await release(r, before[0]?.breakId);
+    await releaseFailed(r, 1);
     expect(await reconcileRounds(r, 4)).toBe(true);
     // A fresh process: its OMS's first alert stands where the released one stood before the restart.
     const p = await boot(r.u);
@@ -275,6 +295,7 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
       await r.p.coordinator.reconcile();
       const alert = alertBreaks(r);
       await release(r, alert[0]?.breakId);
+      await releaseFailed(r, 1);
       expect(await reconcileRounds(r, 4)).toBe(true);
       r.u.seams.alerts = rewrite; // the OMS port breaks its contract
       r.p.coordinator.trigger("PERIODIC_TIMER");

@@ -21,21 +21,34 @@
  * operator, only out-read by a later complete run. That is how "ambiguous
  * state never resumes trading" (work-plan acceptance 1) is a property of the
  * table rather than of a caller's diligence. "No longer reproduces it" means
- * the later run performed the check that found it, and the check found the
- * subject consistent: a run that did not judge the holdings does not clear a
- * holding break; a run that skipped a tracked order (its token unknown, its
- * venue facts different, its by-id read missing) or could not verify its
- * fills does not clear any break about that order's state or fills (the
- * coordinator's `#judged`); a run that did not judge an attempt's identity,
- * or answer it, does not clear that attempt's ambiguity or refused answer.
+ * a later COMPLETE run (every read answered, in its shape, consistently) no
+ * longer finds it, and, for each kind of subject below, that run performed the
+ * check that would find it (the coordinator's `#judged`):
+ *
+ * | Subject | Judged again only by a run that |
+ * | --- | --- |
+ * | a holding (`HOLDING_*`, `CORRECTION_FAILED`, `APPROVAL_MISSING`, `WALLET_OPERATION_IN_FLIGHT`) | judged the holdings |
+ * | one tracked order's state or fills (`ORDER_STATE_MISMATCH`, `ORDER_FACTS_MISMATCH`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `TRADE_MISSING_IN_OMS`, `FILL_*`) | compared that order in full (not skipped for an unknown token, other venue facts or a missing read) and found nothing wrong with it |
+ * | one venue order (a read problem keyed by the order; `ORDER_UNRESOLVED` keyed by the venue order) | read that order: by id, or in the open-orders list |
+ * | one venue trade (a read problem keyed by the trade) | read that trade in its trades read |
+ * | an attempt's identity ambiguity, or a refused answer | judged that attempt's identity, or answered it |
+ *
+ * Anything else (a whole read, the run's clock, a component, a request) is
+ * judged by every complete run. Every venue order an unresolved hold names
+ * is read by id in every run, so a later run can always look again; and an
+ * order of the account that a run saw but could not classify (its reads were
+ * not one consistent view) is recorded as `ORDER_UNRESOLVED` keyed by that
+ * venue order, so it is never forgotten, after a restart too.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
- * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert)
- * acknowledges its subject for good. Releasing a LIVE contradiction (a tracked
- * order whose venue facts differ) does not: every run that still finds it
- * opens it again. A subject must therefore name ONE occurrence: each OMS
- * halting alert is keyed by its OMS instance and its ordinal, so a release
- * never acknowledges a later alert like it.
+ * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,
+ * one trade's FAILED settlement) acknowledges its subject for good. Releasing
+ * a LIVE contradiction (a tracked order whose venue facts differ) does not:
+ * every run that still finds it opens it again. A subject must therefore name
+ * ONE occurrence: each OMS halting alert is keyed by its OMS instance and its
+ * ordinal, each FAILED settlement by its trade and order, and each ledger halt
+ * obligation by its transaction, movement kind, asset, market and place, so a
+ * release never acknowledges another occurrence like it.
  *
  * UNMATCHED ACTUAL ACTIVITY becomes UNATTRIBUTED (work-plan acceptance 2;
  * §6 invariant 7; §9.15): an order or a trade of the account that no tracked
@@ -231,6 +244,14 @@ export const BREAK_TAXONOMY = Object.freeze({
       "a tracked order's fills in the OMS and its trades at the venue differ: the same trade with other economics (shares, price, fee, role, match time) or a contradicting settlement, or trade ids the OMS did not record while fills it recorded are missing",
     handling: "nothing is delivered or booked for the order, and holdings are not judged; held until a fresh comparison finds the two equal",
   },
+  SETTLEMENT_FAILED: {
+    family: "TRADE",
+    rule: QUARANTINE,
+    meaning:
+      "the venue's trades read shows a trade of a tracked order FAILED (ADR-006 §5: the ledger booked the fill at its match and owes a compensating reversal); one break per trade and order, keyed by the venue's own ids",
+    handling:
+      "the order's market is halted; quarantined until released. Derived from the venue's read in every run, not from the OMS's in-memory alert, so a restart never loses it; releasing it acknowledges that one trade's failure",
+  },
   // --- holdings (positions and balances against the ledger projection) -------------------
   HOLDING_IN_TRANSIT_AMBIGUOUS: {
     family: "HOLDING",
@@ -384,7 +405,8 @@ export function quarantinesOnOpen(rule: BreakRule): boolean {
  * The releasable classes whose subject is IMMUTABLE HISTORY: an order or a
  * trade the account's history keeps for good, a booking, one alert the OMS
  * raised (one occurrence: its OMS instance and ordinal, never its kind and
- * order alone), an operation that never named a transaction. An operator's
+ * order alone), one trade's FAILED settlement (FAILED is terminal), an
+ * operation that never named a transaction. An operator's
  * release ACKNOWLEDGES such a subject: the same subject is not opened again
  * (new activity has new subjects, and opens new breaks).
  *
@@ -400,6 +422,7 @@ export const RELEASE_ACKNOWLEDGES_SUBJECT: ReadonlySet<BreakClass> = new Set<Bre
   "POSITION_UNATTRIBUTED",
   "BALANCE_UNATTRIBUTED",
   "LEDGER_UNATTRIBUTED_ARRIVAL",
+  "SETTLEMENT_FAILED",
   "OMS_HALTING_ALERT",
   "WALLET_OPERATION_UNIDENTIFIABLE",
 ]);

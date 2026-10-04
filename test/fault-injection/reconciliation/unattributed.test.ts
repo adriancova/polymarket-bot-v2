@@ -24,8 +24,8 @@ import { describe, expect, it } from "vitest";
 
 import { projectLedger, projectedHoldings } from "../../../packages/ledger/src/index.js";
 
-import { ACCOUNT, Killed, MARKET, PUSD, YES, boot, ledgerHoldings, reconcileUntilResumed, universe, type KillPlan, type Process, type Universe } from "./support/harness.js";
-import { expectPaused, ready, reconcileRounds, submitOne } from "./support/scenario.js";
+import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, boot, ledgerHoldings, reconcileUntilResumed, universe, type KillPlan, type Process, type Universe } from "./support/harness.js";
+import { expectPaused, ready, reconcileRounds, submitOne, type Ready } from "./support/scenario.js";
 
 function corrections(ledger: Parameters<typeof projectLedger>[0]): { readonly id: string; readonly eventType: string; readonly entries: readonly { readonly scope: string; readonly assetId: string; readonly amount: string }[] }[] {
   return ledger
@@ -248,5 +248,140 @@ describe("WP-290 acceptance 2: unmatched actual activity becomes UNATTRIBUTED", 
     await second.coordinator.reconcile();
     expect(corrections(u.ledger)).toHaveLength(1);
     expect(projectedHoldings(projectLedger(u.ledger), ACCOUNT).unattributedArrivals).toHaveLength(1);
+  });
+});
+
+describe("WP-290 acceptance 2 (r3, D-A3): every halt obligation of one ledger transaction is its own break, and halts its own market", () => {
+  /** One transaction, appended through the real `Ledger.append`, with an UNATTRIBUTED arrival of 3 in each of two markets. */
+  function twoMarketArrival(r: Ready): string {
+    const id = r.u.ledgerIds();
+    const entries = [
+      { assetId: YES, marketId: MARKET },
+      { assetId: NO, marketId: MARKET_NO },
+    ].flatMap(({ assetId, marketId }) => [
+      { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId, assetKind: "OUTCOME_TOKEN", marketId, amount: "3" },
+      { scope: "EXTERNAL_CLEARING", accountRef: "clearing-venue", assetId, assetKind: "OUTCOME_TOKEN", marketId, amount: "-3" },
+      { scope: "UNATTRIBUTED", accountRef: ACCOUNT, assetId, assetKind: "OUTCOME_TOKEN", marketId, amount: "3" },
+      { scope: "EXTERNAL_CLEARING", accountRef: "clearing-attribution", assetId, assetKind: "OUTCOME_TOKEN", marketId, amount: "-3" },
+    ]);
+    const appended = r.u.ledger.append({ ledgerTransactionId: id, eventType: "RECONCILIATION_CORRECTION", environment: "PAPER", accountRef: ACCOUNT, source: "internal", occurredAt: "2026-10-03T00:00:00Z", entries });
+    expect(appended.ok, JSON.stringify(appended)).toBe(true);
+    if (appended.ok) r.u.ledger = appended.value.ledger;
+    r.u.world.adjustPosition(YES, "3");
+    r.u.world.adjustPosition(NO, "3");
+    expect(projectedHoldings(projectLedger(r.u.ledger), ACCOUNT).unattributedArrivals.map((arrival) => [arrival.ledgerTransactionId, arrival.marketId])).toEqual([
+      [id, MARKET],
+      [id, MARKET_NO],
+    ]);
+    return id;
+  }
+
+  async function release(r: Ready, breakId: string | undefined): Promise<void> {
+    expect((await r.p.coordinator.releaseQuarantine({ breakId: breakId ?? "", operatorRef: "operator-1", reason: "this arrival only" })).ok).toBe(true);
+  }
+
+  it("(D-A3, R3-C) two markets in one transaction: two breaks, both markets halted; released independently, across a restart", async () => {
+    const r = await ready();
+    const id = twoMarketArrival(r);
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "LEDGER_UNATTRIBUTED_ARRIVAL");
+    const breaks = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "LEDGER_UNATTRIBUTED_ARRIVAL");
+    expect(breaks.map((view) => [view.status, view.scope, view.marketId, view.assetId])).toEqual([
+      ["QUARANTINED", "MARKET", MARKET, YES],
+      ["QUARANTINED", "MARKET", MARKET_NO, NO],
+    ]);
+    expect(breaks.every((view) => view.detail.includes(id))).toBe(true);
+    expect(new Set(r.u.halts.map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
+    // The operator releases market A's arrival only: market B's still holds, and is still halted.
+    const [first, second] = breaks;
+    await release(r, first?.breakId);
+    expect(await reconcileRounds(r, 2)).toBe(false);
+    expect(r.p.journal.unresolvedBreaks().map((view) => view.breakId)).toEqual([second?.breakId]);
+    // A restart: the released arrival is acknowledged (not opened again); the other still holds, halted again.
+    const p = await boot(r.u);
+    const again: Ready = { u: r.u, p, oms: p.oms as Ready["oms"] };
+    const haltsBefore = r.u.halts.length;
+    expect(await reconcileRounds(again, 2)).toBe(false);
+    expect(again.p.journal.unresolvedBreaks().map((view) => view.breakId)).toEqual([second?.breakId]);
+    expect(r.u.halts.slice(haltsBefore).some((halt) => halt.breakId === second?.breakId && halt.marketId === MARKET_NO)).toBe(true);
+    await release(again, second?.breakId);
+    expect(await reconcileRounds(again, 2)).toBe(true);
+    // Nothing was booked: the obligations were the ledger's own.
+    expect(corrections(r.u.ledger)).toHaveLength(1);
+  });
+
+  it("(D-A3) one asset in two markets of one transaction (collateral entries naming two markets): two breaks, both markets halted", async () => {
+    const r = await ready();
+    const id = r.u.ledgerIds();
+    const entries = [MARKET, MARKET_NO].flatMap((marketId) => [
+      { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: PUSD, assetKind: "COLLATERAL", marketId, amount: "5" },
+      { scope: "EXTERNAL_CLEARING", accountRef: "clearing-venue", assetId: PUSD, assetKind: "COLLATERAL", amount: "-5" },
+      { scope: "UNATTRIBUTED", accountRef: ACCOUNT, assetId: PUSD, assetKind: "COLLATERAL", marketId, amount: "5" },
+      { scope: "EXTERNAL_CLEARING", accountRef: "clearing-attribution", assetId: PUSD, assetKind: "COLLATERAL", amount: "-5" },
+    ]);
+    const appended = r.u.ledger.append({ ledgerTransactionId: id, eventType: "RECONCILIATION_CORRECTION", environment: "PAPER", accountRef: ACCOUNT, source: "internal", occurredAt: "2026-10-03T00:00:00Z", entries });
+    expect(appended.ok, JSON.stringify(appended)).toBe(true);
+    if (appended.ok) r.u.ledger = appended.value.ledger;
+    r.u.world.adjustCollateral("10");
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "LEDGER_UNATTRIBUTED_ARRIVAL");
+    const breaks = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "LEDGER_UNATTRIBUTED_ARRIVAL");
+    expect(breaks.map((view) => [view.marketId, view.assetId])).toEqual([
+      [MARKET, PUSD],
+      [MARKET_NO, PUSD],
+    ]);
+    expect(new Set(r.u.halts.map((halt) => halt.marketId))).toEqual(new Set([MARKET, MARKET_NO]));
+  });
+
+  it("(D-A3) two obligations equal in transaction, kind, asset and market are two breaks (each its own place)", async () => {
+    const r = await ready();
+    const id = r.u.ledgerIds();
+    const entries = ["1", "2"].flatMap((amount) => [
+      { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: YES, assetKind: "OUTCOME_TOKEN", marketId: MARKET, amount },
+      { scope: "EXTERNAL_CLEARING", accountRef: "clearing-venue", assetId: YES, assetKind: "OUTCOME_TOKEN", marketId: MARKET, amount: `-${amount}` },
+      { scope: "UNATTRIBUTED", accountRef: ACCOUNT, assetId: YES, assetKind: "OUTCOME_TOKEN", marketId: MARKET, amount },
+      { scope: "EXTERNAL_CLEARING", accountRef: "clearing-attribution", assetId: YES, assetKind: "OUTCOME_TOKEN", marketId: MARKET, amount: `-${amount}` },
+    ]);
+    const appended = r.u.ledger.append({ ledgerTransactionId: id, eventType: "RECONCILIATION_CORRECTION", environment: "PAPER", accountRef: ACCOUNT, source: "internal", occurredAt: "2026-10-03T00:00:00Z", entries });
+    expect(appended.ok, JSON.stringify(appended)).toBe(true);
+    if (appended.ok) r.u.ledger = appended.value.ledger;
+    r.u.world.adjustPosition(YES, "3");
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "LEDGER_UNATTRIBUTED_ARRIVAL");
+    const breaks = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "LEDGER_UNATTRIBUTED_ARRIVAL");
+    expect(breaks.map((view) => view.observedValue)).toEqual(["1", "2"]);
+    expect(new Set(breaks.map((view) => view.subjectKey)).size).toBe(2);
+  });
+
+  it("(r3) a crash between a quarantine's BREAK_OPENED and its BREAK_QUARANTINED: the restarted run that finds it again quarantines it and halts its market", async () => {
+    const run = async (plan: KillPlan | null): Promise<{ readonly u: Universe; readonly first: Process }> => {
+      const u = universe();
+      const first = await boot(u, plan);
+      try {
+        await reconcileUntilResumed(first, u, 2);
+        u.world.placeForeign({ tokenId: YES, side: "BUY", price: "0.3", size: "2" });
+        first.coordinator.trigger("PERIODIC_TIMER");
+        await first.coordinator.reconcile();
+      } catch (error) {
+        if (!(error instanceof Killed)) throw error;
+      }
+      return { u, first };
+    };
+    const dry = await run(null);
+    const opened = dry.u.journalEvents.findIndex((event) => event.kind === "BREAK_OPENED" && event.breakClass === "ORDER_UNATTRIBUTED");
+    expect(opened).toBeGreaterThan(0);
+    // The k-th journal.append call is the k-th journal event (every append is one port call).
+    const appends = dry.first.inc.trace.map((name, index) => [name, index] as const).filter(([name]) => name === "journal.append");
+    const at = (appends[opened]?.[1] ?? -1) + 1;
+    const { u, first } = await run({ at, phase: "after" });
+    expect(first.inc.alive).toBe(false);
+    const second = await boot(u);
+    const view = (): ReturnType<Process["journal"]["unresolvedBreaks"]>[number] | undefined => second.journal.unresolvedBreaks().find((entry) => entry.breakClass === "ORDER_UNATTRIBUTED");
+    expect(view()?.status).toBe("OPEN");
+    expect(u.halts).toEqual([]);
+    const report = await second.coordinator.reconcile();
+    expect(report.resumed).toBe(false);
+    expect(view()?.status).toBe("QUARANTINED");
+    expect(u.halts.some((halt) => halt.breakId === view()?.breakId && halt.marketId === MARKET)).toBe(true);
   });
 });
