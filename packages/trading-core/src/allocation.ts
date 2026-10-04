@@ -37,30 +37,76 @@
  * is per-`(market, side)` inventory for a planner that plans one market, the
  * second is the account-wide commitment table every cap compares against. They
  * are TAKEN at the same moment (before submission — §9.10 "reserve
- * collateral/inventory before submission") and RELEASED at the same two moments
- * (a refused submission, for each planned order the venue does not hold, and an
- * order reaching a terminal state — `TRDR-4` round 1: an order a refused plan
- * nonetheless left at the venue is released only at the second), and both are
- * keyed on the PLANNED ORDER, so no state exists in which one holds a
- * commitment the other has forgotten.
+ * collateral/inventory before submission"), both keyed on the PLANNED ORDER,
+ * and both let go at a refused submission, for each planned order the venue
+ * does not hold. At an order's TERMINAL state they part (`CAP-1`, below): the
+ * planner's book releases there, as it always did; the allocator's book
+ * releases there only the exact unused remainder, and keeps the capital of a
+ * fill no position carries yet until that fill is booked. So the allocator
+ * never holds LESS than the planner's book, and no state exists in which the
+ * cap check has forgotten a commitment.
  *
  * ## Why the state carries NO open orders
  *
  * `AllocatorStateInput.openOrders` and an applied reservation would both
  * describe the SAME in-flight commitment, and §9.14 forbids double reservation.
- * This process holds an allocator reservation from before submission until the
- * order is terminal, so the reservation IS the in-flight commitment and
- * `openOrders` is deliberately empty.
+ * This process holds an allocator commitment from before submission until the
+ * order's capital is fully accounted for elsewhere, so the commitment IS the
+ * in-flight capital and `openOrders` is deliberately empty.
  *
- * The consequence is stated where it matters: between a partial fill's posting
- * and its order's terminal state the filled part is counted TWICE — once as a
- * position, once as the still-held reservation. That OVERSTATES committed
- * exposure, which is the fail-closed direction, and it is the same property
- * `reservations.ts` defends for the inventory book ("releasing on a fill would
- * free inventory a partially-filled resting order can still consume").
+ * ## `CAP-1`: a commitment is CONVERTED, never released, as its fills are seen
+ *
+ * THE INVARIANT, held at ONE choke point ({@link AllocatorGate}'s
+ * `#buildState`, which builds the account for every `evaluate` — the §9.8
+ * check-14 verdict AND the check-15 snapshot — and every `applyForPlan`): the
+ * capital the cap check counts for a strategy is at least the exact sum of its
+ * open reservations plus its booked and unbooked filled exposure.
+ *
+ * `CAP-OVERSHOOT` was the gap. An order's reservation was released at its
+ * FILLED view, and its fill became a position only at its harvest point
+ * (ADR-024; ADR-026 for the carried path). An order an `onFill` decision
+ * places and the venue fills at once is FILLED in the same close, but its fill
+ * is read only at the next harvest point — so every evaluation in between saw
+ * neither the reservation nor the position. A `CADENCE-1` review probe with a
+ * per-strategy cap of 8 pUSD admitted three 10 @ 0.34 BUYs (10.20 pUSD).
+ *
+ * So each planned order's commitment ({@link Commitment}) is a small state
+ * machine, and what it adds to the account is always derived from it
+ * (`commitmentRequests`):
+ *
+ * 1. **Reserved** (`applyForPlan`): `limit × shares` (BUY), or `shares` of
+ *    inventory (SELL) — exactly what the planner reserved.
+ * 2. **Converted, as each fill is booked** (`observeFill`): the fill's shares
+ *    leave the reserved part, and the fill's debit (`price × shares`, the
+ *    capital the position's FIFO cost basis now carries) is no longer counted
+ *    here — the position counts it. The part of the reservation the fill did
+ *    NOT consume (`(limit − price) × shares`, a better price) stays reserved:
+ *    before the final size is confirmed the order is counted at exactly its
+ *    reservation, never more (no double count with the position) and never
+ *    less. A partly sold SELL reserves only its unsold shares, so the account
+ *    no longer refuses to rebuild while it rests.
+ * 3. **Settled, once the final size is confirmed** (`settle`, at the order's
+ *    terminal view): exactly the unused remainder is released —
+ *    `reservation − Σ debits` (WP-270 decision 5's rule for the OMS). What
+ *    stays is the capital of each fill the position does not carry yet,
+ *    counted at that fill's own price when the loop has seen the fill, and at
+ *    the order's limit when it has not (never less than its debit).
+ * 4. **Closed** when every share of the final size is booked: the positions
+ *    now carry all of it.
+ *
+ * Nothing here changes what a cap means: every cap still compares positions
+ * plus in-flight commitments, at the same prices, against the same limits.
+ * The change is only that a commitment leaves the in-flight half when, and to
+ * the extent that, the position half has taken it over — not before.
  */
 
-import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
+import {
+  addDecimal,
+  compareDecimal,
+  isCanonicalDecimalString,
+  mulDecimal,
+  subDecimal,
+} from "@polymarket-bot/decimal";
 import {
   EXPOSURE_ZERO,
   applyReservation,
@@ -105,11 +151,20 @@ export interface AllocationOutcome {
 }
 
 export interface AllocatorMetrics {
-  /** Allocator reservations currently applied (§9.10, pre-submission). */
+  /**
+   * Allocator commitments currently held (§9.10, pre-submission): applied and
+   * not yet CLOSED — the order is working, or it is terminal with a fill no
+   * position carries yet (`CAP-1`).
+   */
   readonly open: number;
   readonly applied: number;
+  /** Commitments CLOSED: released whole (never placed), or settled and fully booked (`CAP-1`). */
   readonly released: number;
-  /** §9.7 "reserved pUSD" across the applied BUY reservations, exactly summed. */
+  /**
+   * §9.7 "reserved pUSD": the pUSD the held BUY commitments add to the account
+   * beyond its booked positions — the reserved remainder of each working
+   * order, and each terminal order's not-yet-booked fills — exactly summed.
+   */
   readonly reservedCollateral: string;
   /** Allocator refusals seen, by the allocator's OWN code. */
   readonly refusalsByCode: Readonly<Record<string, number>>;
@@ -119,6 +174,104 @@ export interface AllocatorMetrics {
 type BuiltState =
   | { readonly ok: true; readonly state: AllocatorState }
   | { readonly ok: false; readonly refusals: readonly CapitalRefusal[] };
+
+/** One fill a commitment knows of: its venue id, exact price and shares. */
+export type CommitmentFill = Pick<SimulatedFill, "simulatedFillId" | "price" | "shares">;
+
+/**
+ * `CAP-1`: one planned order's capital commitment — see the module header,
+ * "a commitment is CONVERTED, never released, as its fills are seen".
+ *
+ * Mutable, and private to {@link AllocatorGate}: nothing outside it can move a
+ * commitment, and what a commitment adds to the account is DERIVED from these
+ * fields at every question (`commitmentRequests`), never cached beside them.
+ */
+interface Commitment {
+  /** The request applied before submission: `limit × shares` (BUY), or `shares` of inventory (SELL). */
+  readonly request: ReservationRequest;
+  /** Shares of this order's fills BOOKED into the owning instance's position, exactly summed. */
+  bookedShares: string;
+  /** The venue ids of those booked fills: a fill is converted once, and never counted again as unbooked. */
+  readonly bookedFillIds: Set<string>;
+  /**
+   * BUY: the booked fills, as `fill price -> shares`, in booking order. Each
+   * leaves `(limit − price) × shares` of the reservation unconsumed, and that
+   * stays reserved until the final size is confirmed (WP-270 decision 5).
+   */
+  readonly bookedByPrice: Map<string, string>;
+  /**
+   * Fills of this order the loop booked UNATTRIBUTED (`TRDR-4`: an order no
+   * instance owns — a refused plan's held orphan, a lost answer's order), as
+   * `fill id -> fill`. No position will ever carry them, so their capital
+   * stays in this commitment, against the instance that reserved it.
+   */
+  readonly unattributed: Map<string, CommitmentFill>;
+  /**
+   * The final size, once the order is terminal (`settle`), with the fills the
+   * loop saw for it that no position carries yet — `fill id -> fill` — or
+   * `undefined` while the order may still fill.
+   */
+  final: { readonly filledShares: string; readonly unbooked: Map<string, CommitmentFill> } | undefined;
+}
+
+/** `value > 0`, exactly. */
+function positive(value: string): boolean {
+  return compareDecimal(value, "0") > 0;
+}
+
+/**
+ * `CAP-1`: what one commitment adds to the account NOW, as allocator requests
+ * — each a real `(price, shares)` commitment, re-applied by `#buildState`:
+ *
+ * - **SELL**: its shares not yet booked as sold — `shares − booked` while it can
+ *   still fill, `final size − booked` once settled (a sold share the position
+ *   still shows stays reserved until its sale is booked). Cost `"0"`, as ever.
+ * - **BUY, while it can still fill**: the unfilled-or-unbooked shares at its
+ *   limit, plus, per booked fill price below the limit, the unconsumed
+ *   `(limit − price) × shares`. Together: exactly `reservation − Σ booked
+ *   debits`; the position carries the debits.
+ * - **BUY, once settled**: only the fills no position carries yet — each seen
+ *   fill (unbooked, or booked unattributed) at its own price, and any share of
+ *   the final size the loop has not seen a fill for at the limit (never less
+ *   than its debit). The unused remainder is gone: that is the release.
+ *
+ * Every derived id extends the planned order's own reservation id, so it is
+ * unique in the state and names the order it belongs to.
+ */
+function commitmentRequests(commitment: Commitment): ReservationRequest[] {
+  const { request, bookedShares, final, unattributed } = commitment;
+  const out: ReservationRequest[] = [];
+  if (request.action === "SELL") {
+    const reserved = subDecimal(final?.filledShares ?? request.shares, bookedShares);
+    if (positive(reserved)) out.push({ ...request, shares: reserved });
+    return out;
+  }
+  if (final === undefined) {
+    const open = subDecimal(request.shares, bookedShares);
+    if (positive(open)) out.push({ ...request, shares: open });
+    for (const [price, shares] of commitment.bookedByPrice) {
+      const unused = subDecimal(request.price, price);
+      if (!positive(unused)) continue;
+      out.push({ ...request, reservationId: `${request.reservationId}/unused@${price}`, price: unused, shares });
+    }
+    return out;
+  }
+  const byPrice = new Map<string, string>();
+  let seen = "0";
+  for (const fill of [...final.unbooked.values(), ...unattributed.values()]) {
+    byPrice.set(fill.price, addDecimal(byPrice.get(fill.price) ?? "0", fill.shares));
+    seen = addDecimal(seen, fill.shares);
+  }
+  for (const [price, shares] of byPrice) {
+    if (!positive(price)) continue;
+    out.push({ ...request, reservationId: `${request.reservationId}/filled@${price}`, price, shares });
+  }
+  const unseen = subDecimal(subDecimal(final.filledShares, bookedShares), seen);
+  if (positive(unseen)) {
+    out.push({ ...request, reservationId: `${request.reservationId}/filled@limit`, shares: unseen });
+  }
+  return out;
+}
 
 interface Lot {
   readonly shares: string;
@@ -241,7 +394,8 @@ function scopeOf(market: AllocationMarket): {
  * The composition root's handle on `packages/capital-allocator`.
  *
  * It holds exactly two things of its own: the operator's parsed caps and the
- * reservations this process has APPLIED and not yet released. Everything else
+ * commitments this process has APPLIED and not yet closed (`CAP-1`: each one
+ * converted as its fills are booked — see the module header). Everything else
  * is rebuilt from the loop's own authoritative state on every question, so the
  * allocator can never answer from a stale copy of the account.
  */
@@ -251,8 +405,11 @@ export class AllocatorGate {
   /** `assetId -> (marketId, side)`, inverted from the loop's own token map. */
   readonly #assets: ReadonlyMap<string, { readonly marketId: string; readonly side: "YES" | "NO" }>;
   readonly #costBasis = new CostBasisBook();
-  /** `plannedOrderId -> the applied request`, keyed exactly as `ReservationBook` is. */
-  readonly #applied = new Map<string, ReservationRequest>();
+  /**
+   * `plannedOrderId -> its commitment`, keyed exactly as `ReservationBook` is.
+   * Insertion-ordered, so the account `#buildState` builds is deterministic.
+   */
+  readonly #commitments = new Map<string, Commitment>();
   readonly #refusalsByCode = new Map<string, number>();
   #appliedCount = 0;
   #releasedCount = 0;
@@ -277,12 +434,138 @@ export class AllocatorGate {
     this.#assets = assets;
   }
 
-  /** Folds one booked fill into the cost-basis book. */
+  /**
+   * Folds one fill BOOKED into `instanceId`'s position into the cost-basis
+   * book, and — `CAP-1` — CONVERTS the commitment of the planned order it
+   * filled: its shares leave the reserved part, and its debit is now the
+   * position's. Closes the commitment when its confirmed final size is fully
+   * booked.
+   *
+   * `plannedOrderId` is the order's, as the venue names it. Without one (the
+   * venue could not answer) nothing is converted: the commitment keeps its
+   * whole reservation, which only ever over-counts.
+   */
   observeFill(
     instanceId: string,
-    fill: Pick<SimulatedFill, "marketId" | "side" | "action" | "price" | "shares">,
+    fill: Pick<SimulatedFill, "simulatedFillId" | "marketId" | "side" | "action" | "price" | "shares">,
+    plannedOrderId?: string,
   ): void {
     this.#costBasis.observe(instanceId, fill);
+    if (plannedOrderId === undefined) return;
+    const commitment = this.#commitments.get(plannedOrderId);
+    if (commitment === undefined) return;
+    const { request } = commitment;
+    // A fill that is not this commitment's — another market, side, direction
+    // or owner — converts nothing: the commitment keeps its reservation.
+    if (
+      request.strategyInstanceId !== instanceId ||
+      request.marketId !== fill.marketId ||
+      request.side !== fill.side ||
+      request.action !== fill.action ||
+      !isCanonicalDecimalString(fill.shares) ||
+      !isCanonicalDecimalString(fill.price)
+    ) {
+      return;
+    }
+    // Once per fill: a fill already converted converts nothing more.
+    if (commitment.bookedFillIds.has(fill.simulatedFillId)) return;
+    commitment.bookedFillIds.add(fill.simulatedFillId);
+    commitment.bookedShares = addDecimal(commitment.bookedShares, fill.shares);
+    if (request.action === "BUY") {
+      commitment.bookedByPrice.set(
+        fill.price,
+        addDecimal(commitment.bookedByPrice.get(fill.price) ?? "0", fill.shares),
+      );
+    }
+    commitment.final?.unbooked.delete(fill.simulatedFillId);
+    this.#closeIfBooked(plannedOrderId, commitment);
+  }
+
+  /**
+   * `CAP-1`: one fill of `plannedOrderId` was booked UNATTRIBUTED (`TRDR-4`:
+   * no instance owns its order). No position will ever carry it, so its
+   * capital stays in the commitment — at the fill's own price once the final
+   * size is confirmed — against the instance that reserved it, and the
+   * commitment never closes. Fail closed: the capital the account spent
+   * cannot vanish from the cap check, and the market is halted
+   * `UNATTRIBUTED_ACTIVITY` for reconciliation meanwhile.
+   */
+  observeUnattributedFill(
+    fill: Pick<SimulatedFill, "simulatedFillId" | "marketId" | "side" | "action" | "price" | "shares">,
+    plannedOrderId: string | undefined,
+  ): void {
+    if (plannedOrderId === undefined) return;
+    const commitment = this.#commitments.get(plannedOrderId);
+    if (commitment === undefined) return;
+    const { request } = commitment;
+    if (
+      request.marketId !== fill.marketId ||
+      request.side !== fill.side ||
+      request.action !== fill.action ||
+      !isCanonicalDecimalString(fill.shares) ||
+      !isCanonicalDecimalString(fill.price)
+    ) {
+      return;
+    }
+    commitment.unattributed.set(fill.simulatedFillId, {
+      simulatedFillId: fill.simulatedFillId,
+      price: fill.price,
+      shares: fill.shares,
+    });
+    commitment.final?.unbooked.delete(fill.simulatedFillId);
+  }
+
+  /**
+   * `CAP-1`: one planned order's FINAL size is confirmed — the order is
+   * terminal and can fill no more. Releases EXACTLY the unused remainder,
+   * `reservation − Σ debits` (WP-270 decision 5), and keeps the capital of
+   * every fill no position carries yet: each of `unbookedFills` at its own
+   * price, and any share of `filledShares` the caller saw no fill for at the
+   * order's limit. Answers whether the commitment is now CLOSED (every share
+   * of the final size booked).
+   *
+   * Idempotent: a later call replaces the unbooked set (the fills booked since
+   * have left it). A fill in `unbookedFills` that this commitment has already
+   * converted is not counted again. `unbookedFills` `undefined` means the
+   * caller could not read the venue's fills: every unbooked share is then held
+   * at the limit.
+   */
+  settle(
+    plannedOrderId: string,
+    final: { readonly filledShares: string; readonly unbookedFills: readonly CommitmentFill[] | undefined },
+  ): boolean {
+    const commitment = this.#commitments.get(plannedOrderId);
+    if (commitment === undefined) return false;
+    // A final size that is not an exact decimal cannot be shown to be final:
+    // the commitment keeps its whole reservation (fail closed).
+    if (!isCanonicalDecimalString(final.filledShares)) return false;
+    const unbooked = new Map<string, CommitmentFill>();
+    for (const fill of final.unbookedFills ?? []) {
+      if (!isCanonicalDecimalString(fill.price) || !isCanonicalDecimalString(fill.shares)) continue;
+      // A fill a position already carries (booked) or none ever will
+      // (unattributed) is counted where it is — never again here.
+      if (commitment.bookedFillIds.has(fill.simulatedFillId)) continue;
+      if (commitment.unattributed.has(fill.simulatedFillId)) continue;
+      unbooked.set(fill.simulatedFillId, {
+        simulatedFillId: fill.simulatedFillId,
+        price: fill.price,
+        shares: fill.shares,
+      });
+    }
+    commitment.final = { filledShares: final.filledShares, unbooked };
+    return this.#closeIfBooked(plannedOrderId, commitment);
+  }
+
+  /**
+   * Closes a commitment whose final size is confirmed and fully booked: every
+   * share of it is in a position now, which counts it from here on.
+   */
+  #closeIfBooked(plannedOrderId: string, commitment: Commitment): boolean {
+    if (commitment.final === undefined) return false;
+    if (compareDecimal(commitment.bookedShares, commitment.final.filledShares) < 0) return false;
+    this.#commitments.delete(plannedOrderId);
+    this.#releasedCount += 1;
+    return true;
   }
 
   /** The exact remaining cost basis of one held position. */
@@ -393,39 +676,54 @@ export class AllocatorGate {
     // reserved: a partial application would leave capital committed against an
     // order this process then refuses to submit.
     for (const entry of input.entries) {
-      this.#applied.set(entry.plannedOrderId, entry.request);
+      this.#commitments.set(entry.plannedOrderId, {
+        request: entry.request,
+        bookedShares: "0",
+        bookedFillIds: new Set(),
+        bookedByPrice: new Map(),
+        unattributed: new Map(),
+        final: undefined,
+      });
       this.#appliedCount += 1;
     }
     return { ok: true };
   }
 
   /**
-   * Releases the allocator reservation one planned order holds.
+   * Releases the WHOLE commitment of a planned order the venue does NOT hold
+   * — a REFUSED submission's (review round 1, MEDIUM-4: such an order has no
+   * view, so nothing else would ever release it; `TRDR-4` round 1: one the
+   * venue DOES hold is kept until it is terminal). Nothing of it can fill, so
+   * its final size is what was booked — nothing — and it closes.
    *
-   * Called from exactly the two places `ReservationBook.releaseForOrder` is: a
-   * REFUSED submission, for each planned order the venue does NOT hold (review
-   * round 1, MEDIUM-4 — such an order has no view, so nothing else would ever
-   * release it; `TRDR-4` round 1 — one the venue DOES hold is kept until it is
-   * terminal) and an order reaching a TERMINAL state.
+   * `CAP-1`: an order that reaches a TERMINAL state is not released here; it
+   * is {@link settle}d, which releases only its exact unused remainder.
    */
   release(plannedOrderId: string): boolean {
-    if (!this.#applied.delete(plannedOrderId)) return false;
-    this.#releasedCount += 1;
-    return true;
+    const commitment = this.#commitments.get(plannedOrderId);
+    if (commitment === undefined) return false;
+    // What was booked, plus — defensively, for no reachable path — anything
+    // booked unattributed, which keeps its capital (and the commitment) open.
+    let filledShares = commitment.bookedShares;
+    for (const fill of commitment.unattributed.values()) filledShares = addDecimal(filledShares, fill.shares);
+    commitment.final = { filledShares, unbooked: new Map() };
+    return this.#closeIfBooked(plannedOrderId, commitment);
   }
 
   metrics(): AllocatorMetrics {
     let reserved = "0";
-    for (const request of this.#applied.values()) {
-      if (request.action !== "BUY") continue;
-      reserved = addDecimal(reserved, mulDecimal(request.price, request.shares));
+    for (const commitment of this.#commitments.values()) {
+      for (const request of commitmentRequests(commitment)) {
+        if (request.action !== "BUY") continue;
+        reserved = addDecimal(reserved, mulDecimal(request.price, request.shares));
+      }
     }
     const counts: Record<string, number> = Object.create(null) as Record<string, number>;
     for (const code of [...this.#refusalsByCode.keys()].sort()) {
       counts[code] = this.#refusalsByCode.get(code) ?? 0;
     }
     return Object.freeze({
-      open: this.#applied.size,
+      open: this.#commitments.size,
       applied: this.#appliedCount,
       released: this.#releasedCount,
       reservedCollateral: reserved,
@@ -452,7 +750,15 @@ export class AllocatorGate {
 
   /**
    * The account, rebuilt from the loop's own authoritative state and then
-   * carrying every reservation this process still holds.
+   * carrying every commitment this process still holds.
+   *
+   * THE CHOKE POINT (`CAP-1`). Every question the cap check is asked —
+   * `evaluate` (the §9.8 check-14 verdict and the check-15 snapshot) and
+   * `applyForPlan` — is answered from the account built HERE, and only here:
+   * the booked positions at their FIFO cost basis, plus what each commitment
+   * adds now (`commitmentRequests`). So at every evaluation the capital
+   * counted for a strategy is at least its open reservations plus its booked
+   * and unbooked filled exposure, and the converted shares are counted once.
    *
    * The re-application is not ceremony: capacity is re-checked against the
    * state as it is NOW, so a reservation that could no longer be made becomes a
@@ -477,10 +783,12 @@ export class AllocatorGate {
     });
     if (!created.ok) return { ok: false, refusals: created.refusals };
     let state = created.value;
-    for (const request of this.#applied.values()) {
-      const applied = applyReservation(state, this.#caps, request);
-      if (!applied.ok) return { ok: false, refusals: applied.refusals };
-      state = applied.value.state;
+    for (const commitment of this.#commitments.values()) {
+      for (const request of commitmentRequests(commitment)) {
+        const applied = applyReservation(state, this.#caps, request);
+        if (!applied.ok) return { ok: false, refusals: applied.refusals };
+        state = applied.value.state;
+      }
     }
     return { ok: true, state };
   }

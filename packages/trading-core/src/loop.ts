@@ -3286,6 +3286,9 @@ export class CoreLoop {
     // fill of this harvest is in the ledger, before any evaluation reads the
     // account — closes the window in the fail-closed direction at both ends:
     // nothing is released before the position that replaces it exists.
+    // (`CAP-1`: and the allocator's commitment was CONVERTED fill by fill as
+    // each was booked above, so the position and the commitment never count
+    // the same shares; here only the exact unused remainder goes.)
     this.#releaseSettledReservations();
     // SIM-1 r2 (`SIM1-R2-1`): a cancel or a fill of this iteration can leave a
     // watched basket short; judged before anything below is delivered. Since
@@ -3415,9 +3418,46 @@ export class CoreLoop {
       const order = this.#ownedOrder(venueOrderId, instant);
       if (order === undefined || !this.#isTerminalOrder(order) || !this.#fullyBooked(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
-      this.#options.allocator.release(order.plannedOrderId);
+      this.#settleCapital(order);
       this.#timeInForce.release(order.plannedOrderId);
     }
+  }
+
+  /**
+   * `CAP-1`: a TERMINAL order's final size is confirmed, so the allocator
+   * releases EXACTLY its unused remainder (WP-270 decision 5) and keeps the
+   * capital of every fill of it no position carries yet — at that fill's own
+   * price when the venue's unread fills show it, at the order's limit when they
+   * cannot be read — until the harvest that books it (`#bookFills`, which
+   * converts the commitment fill by fill). It used to release the whole
+   * commitment here, at the FILLED view, so an order an `onFill` decision
+   * placed and the venue filled at once vanished from every cap check until
+   * its fill's harvest point (`CAP-OVERSHOOT`). Called wherever an order's
+   * terminal state is acted on; idempotent.
+   */
+  #settleCapital(order: SimulatedOrder): void {
+    this.#options.allocator.settle(order.plannedOrderId, {
+      filledShares: order.filledShares,
+      unbookedFills: this.#unbookedFillsOf(order),
+    });
+  }
+
+  /**
+   * `CAP-1`: the fills of `order` the venue has made that this process may not
+   * have booked — none when every share it reports is booked (`#fullyBooked`);
+   * otherwise its fills past the fill cursor. One a carried harvest booked
+   * ahead of the cursor (`#bookedAhead`) may be among them: the allocator
+   * knows every fill it has converted and never counts one twice
+   * (`AllocatorGate.settle`). `undefined` when the venue refuses the cursor:
+   * the allocator then holds every unbooked share at the order's limit. Books
+   * nothing and moves nothing: `fillsSince` is the venue's NON-destructive
+   * cursor (SIM-2), and it is read only when a share is still unbooked.
+   */
+  #unbookedFillsOf(order: SimulatedOrder): readonly SimulatedFill[] | undefined {
+    if (this.#fullyBooked(order)) return [];
+    const page = this.#options.venue.fillsSince(this.#knownFills);
+    if (!page.ok) return undefined;
+    return page.value.fills.filter((fill) => fill.simulatedOrderId === order.simulatedOrderId);
   }
 
   /**
@@ -3563,7 +3603,13 @@ export class CoreLoop {
       // §9.7's position exposure is "capital already spent", and this is the
       // only place that number can be folded: the ledger projection carries
       // balances, not lots. FIFO, exact, no division (`allocation.ts`).
-      this.#options.allocator.observeFill(instance.instanceId, fill);
+      // `CAP-1`: the same call CONVERTS the order's commitment — the fill's
+      // shares leave its reservation as the position takes them over.
+      this.#options.allocator.observeFill(
+        instance.instanceId,
+        fill,
+        this.#options.venue.orderById(fill.simulatedOrderId)?.plannedOrderId,
+      );
       // `buildFillPosting` emits one stream per OWNER — the actual account's
       // and each claiming instance's — and `applyPnlRecord` refuses a record
       // whose owner is not the stream's. So the instance's stream keeps the
@@ -3699,6 +3745,13 @@ export class CoreLoop {
     this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
     this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
     this.#cash = cashAfter(this.#cash, fill);
+    // `CAP-1`: no position will ever carry this fill, so the commitment of
+    // the order it filled keeps its capital — at the fill's own price — in the
+    // cap check, against the instance that reserved it.
+    this.#options.allocator.observeUnattributedFill(
+      fill,
+      this.#options.venue.orderById(fill.simulatedOrderId)?.plannedOrderId,
+    );
 
     for (const appended of posted.appended) {
       const written = await this.#options.store.appendLedgerTransaction(appended);
@@ -3896,13 +3949,19 @@ export class CoreLoop {
    * Idempotent: a second call for the same order releases nothing and says so,
    * which is why `#deliverOrderViews` may keep its own call for orders that go
    * terminal without producing a fill (a cancel, an expiry, a rejection).
+   *
+   * `CAP-1`: the allocator commitment is SETTLED, not released
+   * (`#settleCapital`): its exact unused remainder goes, and the capital of a
+   * fill no position carries yet stays in the cap check until it is booked.
+   * Here, after this harvest booked every fill it read, that is normally
+   * nothing.
    */
   #releaseSettledReservations(): void {
     for (const venueOrderId of inVenueOrder(this.#orderOwners.keys())) {
       const order = this.#ownedOrder(venueOrderId, this.#lastInstant);
       if (order === undefined || !this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
-      this.#options.allocator.release(order.plannedOrderId);
+      this.#settleCapital(order);
       this.#timeInForce.release(order.plannedOrderId);
     }
     for (const plannedOrderId of inVenueOrder(this.#heldUnowned.keys())) {
@@ -3932,7 +3991,11 @@ export class CoreLoop {
       if (venueOrderId === undefined) this.#heldUnowned.set(plannedOrderId, order.simulatedOrderId);
       if (!this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
-      this.#options.allocator.release(order.plannedOrderId);
+      // `CAP-1`: its fills are booked UNATTRIBUTED (`#bookUnownedFill`), so
+      // no position will ever carry them: the allocator keeps their capital
+      // against the instance that reserved it (fail closed; the market is
+      // halted `UNATTRIBUTED_ACTIVITY` for reconciliation).
+      this.#settleCapital(order);
       this.#timeInForce.release(order.plannedOrderId);
       this.#heldUnowned.delete(plannedOrderId);
       this.#acknowledgeIfDone(order.simulatedOrderId);
@@ -4143,6 +4206,9 @@ export class CoreLoop {
    *   its time-in-force at the first harvest that sees it terminal
    *   (obligation 9: the reservation stands until the order can consume no
    *   more inventory) — unchanged, and never before terminal (ADR-006 §9).
+   *   `CAP-1`: the allocator commitment is SETTLED there (`#settleCapital`):
+   *   only its exact unused remainder goes, and a fill the view reports that
+   *   no position carries yet keeps its capital until it is booked.
    *
    * Every view is read from ONE boundary taken here, at the harvest boundary —
    * after every fill of this harvest was booked — and every retired order is
@@ -4204,8 +4270,12 @@ export class CoreLoop {
         // BOTH books, at the same moment and on the same key: the order can
         // consume no more inventory and commit no more capital (`allocation.ts`
         // §"The two reservation books"). Keyed by the PLANNED order id.
+        // `CAP-1`: the allocator releases only the exact unused remainder; a
+        // fill this view reports and no position carries yet — an `onFill`
+        // decision's order the venue filled at once — keeps its capital in
+        // the cap check until the harvest that books it.
         this.#reservations.releaseForOrder(order.plannedOrderId);
-        this.#options.allocator.release(order.plannedOrderId);
+        this.#settleCapital(order);
         this.#timeInForce.release(order.plannedOrderId);
       }
       if (this.#options.halts.isInstanceHalted(instance.instanceId, instance.marketId)) {

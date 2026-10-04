@@ -341,6 +341,154 @@ describe("the allocator gate", () => {
   });
 });
 
+/**
+ * `CAP-1` (`CAP-OVERSHOOT`): one planned order's commitment is CONVERTED as
+ * its fills are booked, SETTLED to exactly its unused remainder once its final
+ * size is confirmed, and CLOSED only when every share of that size is booked.
+ * `loop-capital.test.ts` drives the same through the real core loop; these
+ * pin each transition's exact numbers at the gate.
+ */
+describe("CAP-1: a commitment is converted, never released, as its fills are seen", () => {
+  const PLANNED = "planned-cap1";
+
+  /** A gate holding one applied BUY of 50 at a 0.35 limit: 17.5 pUSD. */
+  function holding(caps: Record<string, unknown> = {}): AllocatorGate {
+    const subject = gate(caps);
+    const request = requestFor({
+      reservationId: "018f4a7e-7000-7abc-8def-0000000000c1",
+      instanceId: INSTANCE,
+      accountingMode: "LIVE",
+      leg: { marketId: MARKET, side: "YES", action: "BUY", price: "0.35", shares: "50" },
+      market: SCOPE,
+    });
+    const applied = subject.applyForPlan({
+      entries: [{ plannedOrderId: PLANNED, request }],
+      liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+      projection: EMPTY_PROJECTION,
+      availableCollateral: "1000",
+    });
+    if (!applied.ok) throw new Error("the fixture reservation was refused");
+    return subject;
+  }
+
+  function fill(
+    id: string,
+    shares: string,
+    price: string,
+  ): { simulatedFillId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string } {
+    return { simulatedFillId: id, marketId: MARKET, side: "YES", action: "BUY", price, shares };
+  }
+
+  /** What the cap check counts for the instance — the commitment alone (the projection is empty). */
+  function countedFor(subject: AllocatorGate): string {
+    return (
+      evaluate(subject, { type: "CANCEL", marketId: MARKET, reason: "read" } as unknown as Intent).exposures
+        .byStrategyInstance[INSTANCE]?.combined ?? "missing"
+    );
+  }
+
+  it("a BOOKED fill converts its shares: the commitment holds the reservation less the fill's debit, its better price still reserved", () => {
+    const subject = holding();
+    expect(countedFor(subject)).toBe("17.5");
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    // 30 × 0.35 still reserved + 20 × (0.35 − 0.34) unused: 17.5 − 6.8.
+    expect(subject.metrics()).toMatchObject({ open: 1, released: 0, reservedCollateral: "10.7" });
+    expect(countedFor(subject)).toBe("10.7");
+    // The position carries the debit: the cost basis the cap check counts.
+    expect(subject.costBasisOf(INSTANCE, MARKET, "YES")).toBe("6.8");
+  });
+
+  it("SETTLE releases EXACTLY the unused remainder and keeps an unbooked fill at its own price until it is booked; then the commitment CLOSES", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    // Final size 30: 20 booked, 10 filled at 0.33 and not booked yet.
+    expect(subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-2", "10", "0.33")] })).toBe(false);
+    // Released: 17.5 − 6.8 − 3.3 = 7.4. Kept: the unbooked fill's 3.3.
+    expect(subject.metrics()).toMatchObject({ open: 1, released: 0, reservedCollateral: "3.3" });
+    expect(countedFor(subject)).toBe("3.3");
+    subject.observeFill(INSTANCE, fill("f-2", "10", "0.33"), PLANNED);
+    expect(subject.metrics()).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+    expect(subject.costBasisOf(INSTANCE, MARKET, "YES")).toBe("10.1");
+  });
+
+  it("a share of the final size whose fill was not seen is held at the order's LIMIT — never less than its debit", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: undefined });
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "3.5" });
+    // A later settle that SEES it replaces the limit with the fill's own price.
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-2", "10", "0.33")] });
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "3.3" });
+  });
+
+  it("a final size fully booked CLOSES at once; a second settle releases nothing more", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "50", "0.34"), PLANNED);
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "0.5" });
+    expect(subject.settle(PLANNED, { filledShares: "50", unbookedFills: [] })).toBe(true);
+    expect(subject.metrics()).toMatchObject({ open: 0, applied: 1, released: 1, reservedCollateral: "0" });
+    expect(subject.settle(PLANNED, { filledShares: "50", unbookedFills: [] })).toBe(false);
+    expect(subject.metrics().released).toBe(1);
+  });
+
+  it("a cancel with nothing filled closes the whole commitment (final size 0)", () => {
+    const subject = holding();
+    expect(subject.settle(PLANNED, { filledShares: "0", unbookedFills: [] })).toBe(true);
+    expect(subject.metrics()).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+  });
+
+  it("RELEASE (a planned order the venue never booked) closes it whole", () => {
+    const subject = holding();
+    expect(subject.release(PLANNED)).toBe(true);
+    expect(subject.release(PLANNED)).toBe(false);
+    expect(subject.metrics()).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+  });
+
+  it("a fill booked UNATTRIBUTED keeps its debit in the commitment for good: no position will carry it", () => {
+    const subject = holding();
+    subject.observeUnattributedFill(fill("f-u", "20", "0.34"), PLANNED);
+    // Before the final size: still the whole reservation.
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "17.5" });
+    expect(subject.settle(PLANNED, { filledShares: "20", unbookedFills: [fill("f-u", "20", "0.34")] })).toBe(false);
+    expect(subject.metrics()).toMatchObject({ open: 1, released: 0, reservedCollateral: "6.8" });
+    expect(subject.costBasisOf(INSTANCE, MARKET, "YES")).toBe("0");
+  });
+
+  it("a fill that is not this commitment's — another market, side, direction or instance — converts nothing", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, { ...fill("f-x", "20", "0.34"), side: "NO" }, PLANNED);
+    subject.observeFill(INSTANCE, { ...fill("f-y", "20", "0.34"), action: "SELL" }, PLANNED);
+    subject.observeFill(OTHER, fill("f-z", "20", "0.34"), PLANNED);
+    subject.observeFill(INSTANCE, fill("f-w", "20", "0.34"), "planned-unknown");
+    subject.observeFill(INSTANCE, fill("f-v", "20", "0.34"));
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "17.5" });
+  });
+
+  it("a fill is converted ONCE: observing it again converts nothing more", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "10.7" });
+  });
+
+  it("a fill the commitment already converted, offered again as UNBOOKED at settle (a carried harvest booked it ahead of the cursor), is not counted twice", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-ahead", "20", "0.34"), PLANNED);
+    // The venue's page past the cursor still lists the booked-ahead fill.
+    expect(
+      subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-ahead", "20", "0.34"), fill("f-2", "10", "0.33")] }),
+    ).toBe(false);
+    // Only the truly unbooked fill is kept: 3.3, not 3.3 + 6.8.
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "3.3" });
+  });
+
+  it("a final size that is not an exact decimal settles nothing: the whole reservation stays", () => {
+    const subject = holding();
+    expect(subject.settle(PLANNED, { filledShares: "1e1", unbookedFills: [] })).toBe(false);
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "17.5" });
+  });
+});
+
 describe("the intent leg derivation", () => {
   it("a TARGET-mode position resolves against the held shares", () => {
     const target = {
