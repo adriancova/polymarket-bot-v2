@@ -53,7 +53,13 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-270` is Complete (2026-10-03, `259c964`); see [Work packages](#work-packages). Its 18 design decisions are fail-closed interim rulings (`WP270-DECISIONS`).
 - `WP-280` is Complete (2026-10-03, `065716f`); see [Work packages](#work-packages). `WP-290`'s dependencies (`WP-200`, `WP-270`, `WP-280`) are now met; it starts when a slot frees.
 - `WP-310` is Complete (2026-10-03, `fdf27ff`); see [Work packages](#work-packages). `WP-320` still needs `WP-290` and the heartbeat ADR (`V3-C12-HEARTBEAT-ADR`).
-- **`ROLLOVER-1`**: **STOPPED, as its packet required, before any change** (2026-10-03). Three blockers each need a ruling; they are in Human items, and the implementer's evidence and plan are in `~/pmb-rounds/rollover-1/handoff-r0-stop.md`. Until they are ruled, only the restart-per-window driver can run more than one window.
+- **`ROLLOVER-1`**: stopped before any change (2026-10-03). **The user ruled Q1–Q4 on 2026-10-04**, each as recommended:
+  - Q1: a new `SeriesWindowAdmitted@1` event in `packages/domain` carries each admitted window's ids, series, config hash, token ids and scheduled open and close; existing events are unchanged.
+  - Q2: a run-scoped sequence in `packages/strategy-runtime`, so one run spans many windows; checkpoint rows name their window.
+  - Q3: a venue round records the outcome-token pairing, the discovery surface, the window-schedule fields and the trading-delay field. It is combined with the settlement-spec prep.
+  - Q4: the series is pinned by registering `{strategy, series}` in `strategy.configs.parameters`.
+
+  It relaunches after the venue round, from the plan in `~/pmb-rounds/rollover-1/handoff-r0-stop.md`.
 - **`WP-290`**: Ready (authorized) 2026-10-03 under the Wave 3 authorization; its dependencies `WP-200`, `WP-270` and `WP-280` are met. It is account reconciliation, PAPER only. Paths: the work plan's (`packages/oms/src/reconciliation/**`, `packages/ledger/src/reconciliation/**`, `test/fault-injection/reconciliation/**`, `docs/runbooks/reconciliation.md`), plus export lines and a fault-script line. Verifiers: Opus and gpt-6-astra, reconciled (ruled safety-critical).
 - `CKPT-1` is Complete (2026-10-03, `891ccdd`); see [Work packages](#work-packages). It closes `DURABLE-1` LOW-3; residual `CKPT1-PG-RNG-STATUS` is open.
 - `TC-LOWS-1` is Complete (2026-10-04, `9033743`); see [Work packages](#work-packages). It closes `CO2N1-LOWS`, and trims `CADENCE1-LOWS` and `PROV1-LOWS`.
@@ -202,7 +208,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-270` | OMS and signed-order persistence (Wave 3, PAPER only) | Complete (2026-10-03) | `259c964` | [WP-270](docs/handoffs/WP-270.md) |
 | `WP-280` | Authenticated user-stream adapter (Wave 3, PAPER only) | Complete (2026-10-03) | `065716f` | [WP-280](docs/handoffs/WP-280.md) |
 | `WP-310` | Rate-limit budgets and matching-engine modes (Wave 3, PAPER only) | Complete (2026-10-03) | `fdf27ff` | [WP-310](docs/handoffs/WP-310.md) |
-| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Stopped: awaiting rulings Q1–Q4** (Human items) | — | — |
+| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Ruled 2026-10-04; waits on the venue round** | — | — |
 | `WP-290` | Account reconciliation (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-03 | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
@@ -412,12 +418,7 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
-- **`ROLLOVER-1` rulings** (its implementer stopped on 2026-10-03; the evidence is in `~/pmb-rounds/rollover-1/handoff-r0-stop.md`).
-  - **Q1, a `packages/domain` grant.** No existing contract can carry an admitted window's scheduled open and close. The candidates are `TradingParametersChanged@2`, optional `openTime`/`closeTime` fields, or a new `SeriesWindowAdmitted@1`. ADR-030 D3.3 says to stop and ask.
-  - **Q2, a `packages/strategy-runtime` grant.** It would add a run-scoped sequence source, so the per-window runtimes of one run never share a decision or checkpoint sequence. The alternative is to amend ADR-030 D4.2 so that a run is one window.
-  - **Q3, the venue facts.** A venue round must record the outcome-to-token pairing, the discovery surface, the window-schedule fields and the trading-delay field. A user ruling is the other way.
-  - **Q4, confirm the series pin.** The reviewed series would be pinned through `config_id`, by registering `{strategy, series}` in `strategy.configs.parameters`. That needs no migration, but it changes what those rows mean.
-- **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
+- **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): **the user commissioned the prep round on 2026-10-04.** It pins the market rules text, settles the comparison and window ambiguity, drafts a corrected (still unverified) spec, confirms the sign-off path, and produces a one-page checklist for the user to sign. It is combined with `ROLLOVER-1`'s Q3 venue round. V3-C13 (the reference price now needs credentials) still bears on observing settlement in PAPER.
 
 ### Wave 3 authorization (conditional)
 
