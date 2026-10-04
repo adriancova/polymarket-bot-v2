@@ -33,7 +33,7 @@ import {
   type BookView,
   type FeeScheduleSnapshot,
 } from "@polymarket-bot/simulation";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   DeliverySessionLiveness,
@@ -44,7 +44,7 @@ import {
   bookConfirmedAt,
   sessionKeyOf,
 } from "./book-freshness.js";
-import { PER_FRAME_EVALUATION_CADENCE } from "./cadence.js";
+import { PAPER_EVALUATION_CADENCE, PER_FRAME_EVALUATION_CADENCE, type EvaluationCadenceOption } from "./cadence.js";
 import { bookFreshnessBasisOf, bookFreshnessCeilingMsOf, parseTraderConfig } from "./config.js";
 import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import type { IngestedEvent } from "./ports.js";
@@ -67,6 +67,49 @@ const T_OPEN = "2026-05-01T09:00:00.000Z";
 const T_CLOSE = "2026-05-01T10:00:00.000Z";
 const BOOK_AGE_KEY = "quality.input_feed_ages@polymarket.book";
 const STALE = "SB.STALE_BOOK";
+
+/**
+ * `TC-LOWS-1` (O07): every test of this file that runs the loop runs at BOTH
+ * evaluation cadences — ADR-024's per-frame value 0, as a declared
+ * reproduction (ADR-026 D1.6), under the test names it always had, and the
+ * production cadence every new run uses (ADR-026 D1.5: 1,000 ms / 5,000 ms),
+ * under the same names with {@link PRODUCTION_SUFFIX}.
+ *
+ * The subject is the freshness VERDICT at an evaluation, and the timelines
+ * read it at instants 100-500 ms apart. At the production cadence a market is
+ * evaluated at most once per 1,000 ms of event time (ADR-026 D2.4): an event
+ * sooner than that after its last evaluation is coalesced (D5), and an owed
+ * evaluation is carried to the first close the rule allows (D2.6-D2.7). So
+ * where a test reads a verdict at an instant the production cadence does not
+ * evaluate, its production branch says so, reads the verdict at the
+ * evaluations the cadence does run, and — where the subject needs the reading
+ * at a particular age — moves the probe to an instant the cadence evaluates,
+ * saying how. The verdict rule itself (ADR-023) is the same at both.
+ */
+interface CadenceCase {
+  readonly production: boolean;
+  readonly option: EvaluationCadenceOption;
+}
+const REPRODUCTION: CadenceCase = {
+  production: false,
+  option: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/book-freshness.test.ts" },
+};
+const PRODUCTION: CadenceCase = { production: true, option: PAPER_EVALUATION_CADENCE };
+const PRODUCTION_SUFFIX = " [at the production cadence, ADR-026 D1.5: 1,000 ms / 5,000 ms]";
+/** The cadence the tests now running use: set by {@link describeAtEachCadence}. */
+let cadence: CadenceCase = REPRODUCTION;
+
+/** `describe`, twice: at the reproduction cadence (the name as it was), then at the production one. */
+function describeAtEachCadence(name: string, body: () => void): void {
+  for (const each of [REPRODUCTION, PRODUCTION]) {
+    describe(each.production ? `${name}${PRODUCTION_SUFFIX}` : name, () => {
+      beforeAll(() => {
+        cadence = each;
+      });
+      body();
+    });
+  }
+}
 
 function paperEnvironment(): Record<string, string | undefined> {
   return {
@@ -526,13 +569,10 @@ function assemble(options: ConfigOptions): Run {
     // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is book freshness —
     // the ADR-023 D5 freshness verdict, not the cadence — but its timelines were
     // written for ADR-024's per-frame cadence: the verdict at each evaluation of
-    // events 100-200 ms apart. Under the production cadence (1,000 ms / 5,000 ms)
-    // those evaluations are coalesced, and 25 of this file's 54 tests fail under it
-    // (measured in r1; the failures were not analysed one by one). So it REPRODUCES
-    // the ADR-024 behaviour its timelines pin (the value 0, declared); this subject is
-    // NOT exercised here under the production cadence. The cadence is pinned by
-    // `cadence.test.ts` and `loop-cadence.test.ts`.
-    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/book-freshness.test.ts" },
+    // events 100-500 ms apart. `TC-LOWS-1` (O07): every loop test now runs at both
+    // cadences ({@link describeAtEachCadence}); where an assertion differs at the
+    // production cadence, the test says where and why.
+    evaluationCadence: cadence.option,
   });
   if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.detail} ${result.refusal.issues.join("; ")}`);
   wiring.trader = result.trader;
@@ -604,6 +644,23 @@ function evaluationAt(parts: Run, at: number): Evaluation {
 }
 
 /**
+ * `TC-LOWS-1` (O07): the instants, in seconds after the open, at which the
+ * run evaluated the market — the production cadence's evaluations.
+ */
+function evaluatedSeconds(parts: Run): readonly number[] {
+  return evaluations(parts).map((evaluation) => (Date.parse(evaluation.at) - Date.parse(T_OPEN)) / 1000);
+}
+
+/**
+ * `TC-LOWS-1` (O07): the quiet-YES timeline's evaluations at the production
+ * cadence. The NO changes every 500 ms owe the market an evaluation, and it
+ * is evaluated at most once per 1,000 ms (ADR-026 D2.4): at 1.000 s, then at
+ * the change at each whole second; the change between, and the tick at
+ * 6.200 s (200 ms after 6.000 s), are coalesced (D5).
+ */
+const QUIET_AT_PRODUCTION = [1, 2, 3, 4, 5, 6] as const;
+
+/**
  * The quiet-YES timeline: YES snapshot at 1.000 s; the NO book changes every
  * 500 ms from 1.500 s to 6.000 s on the SAME session, so the YES book is quiet
  * while the socket is busy. A reference tick evaluates at 6.200 s.
@@ -621,10 +678,18 @@ function quietYesTimeline(session: Session = A1): Recorded[] {
 // 1. A quiet but live book stays fresh
 // ---------------------------------------------------------------------------
 
-describe("1. a quiet book on a live delivery session stays fresh", () => {
+describeAtEachCadence("1. a quiet book on a live delivery session stays fresh", () => {
   it("CONNECTION_CONFIRMED: no evaluation of the quiet YES book is stale", async () => {
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, quietYesTimeline());
     const all = evaluations(parts);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): six evaluations, not more than ten, and none at the
+      // 6.200 s tick (coalesced; see QUIET_AT_PRODUCTION). Every one is fresh —
+      // the last 5 000 ms after the YES book's last change.
+      expect(evaluatedSeconds(parts)).toEqual(QUIET_AT_PRODUCTION);
+      expect(all.filter((evaluation) => evaluation.stale)).toEqual([]);
+      return;
+    }
     expect(all.length).toBeGreaterThan(10);
     expect(all.filter((evaluation) => evaluation.stale)).toEqual([]);
     expect(evaluationAt(parts, 6.2).stale).toBe(false);
@@ -632,6 +697,16 @@ describe("1. a quiet book on a live delivery session stays fresh", () => {
 
   it("LAST_CHANGE (the pre-ADR-023 rule): the same timeline pauses once the last change is 2 s old", async () => {
     const parts = await run({ basis: "LAST_CHANGE" }, quietYesTimeline());
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the same rule at the production cadence's
+      // evaluations (QUIET_AT_PRODUCTION): fresh at 3.000 s (2 000 ms, the
+      // bound itself), stale from the next one, 4.000 s (3 000 ms).
+      expect(evaluatedSeconds(parts)).toEqual(QUIET_AT_PRODUCTION);
+      expect(evaluationAt(parts, 3).stale).toBe(false);
+      expect(evaluationAt(parts, 4)).toMatchObject({ stale: true, bookAgeMs: "3000" });
+      expect(evaluationAt(parts, 6)).toMatchObject({ stale: true, bookAgeMs: "5000" });
+      return;
+    }
     expect(evaluationAt(parts, 3).stale).toBe(false);
     expect(evaluationAt(parts, 3.5).stale).toBe(true);
     const last = evaluationAt(parts, 6.2);
@@ -654,10 +729,22 @@ describe("1. a quiet book on a live delivery session stays fresh", () => {
 // 2. A silent feed goes stale within its bound
 // ---------------------------------------------------------------------------
 
-describe("2. a silent session goes stale within its bound", () => {
+describeAtEachCadence("2. a silent session goes stale within its bound", () => {
   it("after the last frame at 6.000 s: fresh at 7.900 s (1 900 ms), stale at 8.100 s (2 100 ms)", async () => {
     const events = [...quietYesTimeline(), tick(7.9, "64001"), tick(8.0, "64002"), tick(8.1, "64003")];
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the 7.900 s tick is evaluated (1 900 ms after the
+      // 6.000 s evaluation) and fresh; the ticks at 8.000 s and 8.100 s come
+      // 100 and 200 ms after it and are coalesced (ADR-026 D2.4). So the
+      // stale reading is taken in a run whose only later tick is 8.100 s,
+      // which the cadence evaluates (2 100 ms after 6.000 s).
+      expect(evaluatedSeconds(parts)).toEqual([...QUIET_AT_PRODUCTION, 7.9]);
+      expect(evaluationAt(parts, 7.9).stale).toBe(false);
+      const later = await run({ basis: "CONNECTION_CONFIRMED" }, [...quietYesTimeline(), tick(8.1, "64003")]);
+      expect(evaluationAt(later, 8.1)).toMatchObject({ stale: true, bookAgeMs: "2100" });
+      return;
+    }
     expect(evaluationAt(parts, 7.9).stale).toBe(false);
     expect(evaluationAt(parts, 8).stale).toBe(false);
     const stale = evaluationAt(parts, 8.1);
@@ -669,6 +756,16 @@ describe("2. a silent session goes stale within its bound", () => {
     const events = [...quietYesTimeline()];
     for (let step = 1; step <= 30; step += 1) events.push(tick(6.2 + step * 0.1, String(64000 + step)));
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): ticks every 100 ms evaluate the market once per
+      // second (ADR-026 D2.4): 7.000, 8.000 and 9.000 s. None of them is a
+      // confirmation: fresh at 8.000 s (2 000 ms after A1's last frame, the
+      // bound itself), stale at 9.000 s (3 000 ms).
+      expect(evaluatedSeconds(parts)).toEqual([...QUIET_AT_PRODUCTION, 7, 8, 9]);
+      expect(evaluationAt(parts, 8).stale).toBe(false);
+      expect(evaluationAt(parts, 9)).toMatchObject({ stale: true, bookAgeMs: "3000" });
+      return;
+    }
     expect(evaluationAt(parts, 8).stale).toBe(false);
     expect(evaluationAt(parts, 8.1).stale).toBe(true);
     expect(evaluationAt(parts, 9.2).stale).toBe(true);
@@ -679,7 +776,7 @@ describe("2. a silent session goes stale within its bound", () => {
 // 3. A disconnection mid-quiet is detected
 // ---------------------------------------------------------------------------
 
-describe("3. a disconnection mid-quiet is detected", () => {
+describeAtEachCadence("3. a disconnection mid-quiet is detected", () => {
   /**
    * The quiet timeline on A1, then the socket drops at 6.100 s and a NEW
    * session carries traffic from 6.300 s. The YES book was delivered on A1 and
@@ -700,6 +797,17 @@ describe("3. a disconnection mid-quiet is detected", () => {
   ] as const) {
     it(`${name}: stale 2 s after the old session's last frame, although the new one is busy`, async () => {
       const parts = await run({ basis: "CONNECTION_CONFIRMED" }, reconnected(next));
+      if (cadence.production) {
+        // `TC-LOWS-1` (O07): after 6.000 s the new session's changes evaluate
+        // the market at 7.100 s and 8.300 s (ADR-026 D2.4); the ticks at
+        // 7.950 and 8.050 s are coalesced. Fresh at 7.100 s (1 100 ms after the
+        // old session's last frame), stale at 8.300 s (2 300 ms), although the
+        // new session is busy.
+        expect(evaluatedSeconds(parts)).toEqual([...QUIET_AT_PRODUCTION, 7.1, 8.3]);
+        expect(evaluationAt(parts, 7.1).stale).toBe(false);
+        expect(evaluationAt(parts, 8.3)).toMatchObject({ stale: true, bookAgeMs: "2300" });
+        return;
+      }
       expect(evaluationAt(parts, 7.95).stale).toBe(false);
       const stale = evaluationAt(parts, 8.05);
       expect(stale.stale).toBe(true);
@@ -712,6 +820,14 @@ describe("3. a disconnection mid-quiet is detected", () => {
     for (let step = 1; step <= 10; step += 1) events.push(noChange(6.35 + step * 0.5, A2, String(400 + step)));
     events.push(tick(11.5, "64020"));
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the new session's changes evaluate the market once
+      // per second (ADR-026 D2.4), the last at 11.350 s; the 11.500 s tick is
+      // coalesced. Every evaluation is fresh, the last included.
+      expect(evaluatedSeconds(parts)).toEqual([...QUIET_AT_PRODUCTION, 7.35, 8.35, 9.35, 10.35, 11.35]);
+      expect(evaluations(parts).filter((evaluation) => evaluation.stale)).toEqual([]);
+      return;
+    }
     expect(evaluationAt(parts, 11.5).stale).toBe(false);
   });
 });
@@ -720,11 +836,21 @@ describe("3. a disconnection mid-quiet is detected", () => {
 // The fail-closed fallbacks
 // ---------------------------------------------------------------------------
 
-describe("the fallbacks to the last change (fail closed)", () => {
+describeAtEachCadence("the fallbacks to the last change (fail closed)", () => {
   it("a data-quality incident naming NO market taints the gateway epoch: the quiet book is stale at once", async () => {
     const events = [...quietYesTimeline()];
     // Before 6.200 s's tick: the incident arrives, then one more frame on A1.
     events.splice(events.length - 1, 0, incident(6.05, "gw-polymarket-market-1"), noChange(6.1, A1, "999"));
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the 6.200 s tick comes 200 ms after the 6.000 s
+      // evaluation and is coalesced (ADR-026 D2.4), so the reading after the
+      // incident is a tick the cadence evaluates: 7.000 s. Stale at once, its
+      // age the LAST CHANGE's (1.000 s): 6 000 ms.
+      const later = await run({ basis: "CONNECTION_CONFIRMED" }, [...events, tick(7, "64005")]);
+      expect(evaluationAt(later, 6).stale).toBe(false);
+      expect(evaluationAt(later, 7)).toMatchObject({ stale: true, bookAgeMs: "6000" });
+      return;
+    }
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
     expect(evaluationAt(parts, 6).stale).toBe(false);
     const after = evaluationAt(parts, 6.2);
@@ -743,6 +869,17 @@ describe("the fallbacks to the last change (fail closed)", () => {
     for (let step = 1; step <= 10; step += 1) events.push(noChange(6.35 + step * 0.5, A2, String(500 + step)));
     events.push(tick(11.5, "64030"));
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): A2's changes evaluate the market once per second
+      // (ADR-026 D2.4); the 11.500 s tick is coalesced. Every reading ages by
+      // the re-delivered YES book's own last change (6.300 s): fresh at
+      // 7.350 s (1 050 ms), stale from 8.350 s (2 050 ms) to 11.350 s (5 050 ms).
+      expect(evaluatedSeconds(parts)).toEqual([...QUIET_AT_PRODUCTION, 7.35, 8.35, 9.35, 10.35, 11.35]);
+      expect(evaluationAt(parts, 7.35).stale).toBe(false);
+      expect(evaluationAt(parts, 8.35)).toMatchObject({ stale: true, bookAgeMs: "2050" });
+      expect(evaluationAt(parts, 11.35)).toMatchObject({ stale: true, bookAgeMs: "5050" });
+      return;
+    }
     const after = evaluationAt(parts, 11.5);
     expect(after.stale).toBe(true);
     // The age is the re-delivered YES book's own last change (6.300 s).
@@ -754,12 +891,27 @@ describe("the fallbacks to the last change (fail closed)", () => {
     for (let step = 1; step <= 10; step += 1) events.push(noChange(6.35 + step * 0.5, B1, String(500 + step)));
     events.push(tick(11.5, "64030"));
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the same evaluations as the tainted epoch's above
+      // (ADR-026 D2.4), and every one of them fresh: epoch B is clean.
+      expect(evaluatedSeconds(parts)).toEqual([...QUIET_AT_PRODUCTION, 7.35, 8.35, 9.35, 10.35, 11.35]);
+      expect(evaluations(parts).filter((evaluation) => evaluation.stale)).toEqual([]);
+      return;
+    }
     expect(evaluationAt(parts, 11.5).stale).toBe(false);
   });
 
   it("an active incident on THIS market falls back to the last change", async () => {
     const events = [...quietYesTimeline()];
     events.splice(events.length - 1, 0, incident(6.05, "gw-lifecycle-1", [MARKET_ID]));
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the 6.200 s tick is coalesced (ADR-026 D2.4); the
+      // reading is taken at a tick the cadence evaluates, 7.000 s: stale, aged
+      // by the last change (1.000 s).
+      const later = await run({ basis: "CONNECTION_CONFIRMED" }, [...events, tick(7, "64005")]);
+      expect(evaluationAt(later, 7)).toMatchObject({ stale: true, bookAgeMs: "6000" });
+      return;
+    }
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
     const after = evaluationAt(parts, 6.2);
     expect(after.stale).toBe(true);
@@ -769,6 +921,13 @@ describe("the fallbacks to the last change (fail closed)", () => {
   it("an incident naming ANOTHER market neither taints the session nor touches this market", async () => {
     const events = [...quietYesTimeline()];
     events.splice(events.length - 1, 0, incident(6.05, "gw-lifecycle-9", [OTHER_MARKET_ID]));
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): read at a tick the cadence evaluates, 7.000 s
+      // (ADR-026 D2.4): fresh, 1 000 ms after A1's last frame.
+      const later = await run({ basis: "CONNECTION_CONFIRMED" }, [...events, tick(7, "64005")]);
+      expect(evaluationAt(later, 7).stale).toBe(false);
+      return;
+    }
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
     expect(evaluationAt(parts, 6.2).stale).toBe(false);
   });
@@ -782,13 +941,21 @@ describe("the fallbacks to the last change (fail closed)", () => {
       ...Array.from({ length: 10 }, (_, step) => noChange(1.5 + step * 0.5, A1, String(600 + step))),
       tick(6.2),
     ]);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): read at the production cadence's evaluations
+      // (QUIET_AT_PRODUCTION; the 6.200 s tick is coalesced): A1's traffic
+      // confirms nothing, so the book ages by itself — 5 000 ms at 6.000 s.
+      expect(evaluatedSeconds(parts)).toEqual(QUIET_AT_PRODUCTION);
+      expect(evaluationAt(parts, 6)).toMatchObject({ stale: true, bookAgeMs: "5000" });
+      return;
+    }
     const after = evaluationAt(parts, 6.2);
     expect(after.stale).toBe(true);
     expect(after.bookAgeMs).toBe("5200");
   });
 });
 
-describe("r1 X5: a REST snapshot replaces a socket-delivered book's session", () => {
+describeAtEachCadence("r1 X5: a REST snapshot replaces a socket-delivered book's session", () => {
   it("socket book on A1, then a REST snapshot, then A1 keeps flowing: the book ages from the REST snapshot", async () => {
     const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1), noSnapshot(1.1, A1)];
     // A1 is busy, and the YES book is re-fetched over REST at 2.000 s.
@@ -799,6 +966,15 @@ describe("r1 X5: a REST snapshot replaces a socket-delivered book's session", ()
     // A1's frames (the last at 6.000 s) confirm nothing about a book whose
     // last update came over REST: its age is its own, 4 200 ms. Mutant M6
     // (keep the previous session when an update carries none) reads fresh.
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): read at the production cadence's evaluations
+      // (QUIET_AT_PRODUCTION; the 6.200 s tick is coalesced): fresh while the
+      // REST snapshot is within 2 000 ms, then aged by it — 4 000 ms at 6.000 s.
+      expect(evaluatedSeconds(parts)).toEqual(QUIET_AT_PRODUCTION);
+      expect(evaluationAt(parts, 4).stale).toBe(false);
+      expect(evaluationAt(parts, 6)).toMatchObject({ stale: true, bookAgeMs: "4000" });
+      return;
+    }
     const after = evaluationAt(parts, 6.2);
     expect(after.stale).toBe(true);
     expect(after.bookAgeMs).toBe("4200");
@@ -810,6 +986,14 @@ describe("r1 X5: a REST snapshot replaces a socket-delivered book's session", ()
     for (let step = 0; step < 8; step += 1) events.push(noChange(2.5 + step * 0.5, A1, String(710 + step)));
     events.push(tick(6.2));
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): read at the production cadence's evaluations
+      // (QUIET_AT_PRODUCTION; the 6.200 s tick is coalesced): every one is
+      // fresh, A1 confirming the book again from 2.400 s.
+      expect(evaluatedSeconds(parts)).toEqual(QUIET_AT_PRODUCTION);
+      expect(evaluations(parts).filter((evaluation) => evaluation.stale)).toEqual([]);
+      return;
+    }
     expect(evaluationAt(parts, 6.2).stale).toBe(false);
   });
 });
@@ -818,7 +1002,7 @@ describe("r1 X5: a REST snapshot replaces a socket-delivered book's session", ()
 // r1 finding X1 — the per-book ceiling on the last-change age (D2 rule 6)
 // ---------------------------------------------------------------------------
 
-describe("r1 X1: a book whose OWN delivery stalls is bounded by the per-book ceiling", () => {
+describeAtEachCadence("r1 X1: a book whose OWN delivery stalls is bounded by the per-book ceiling", () => {
   /**
    * The YES snapshot at 1.000 s on A1, then ONLY another market's frames on
    * the same session, every 500 ms, until `until` s: a busy session whose YES
@@ -845,6 +1029,24 @@ describe("r1 X1: a book whose OWN delivery stalls is bounded by the per-book cei
 
   it("fresh while the last change is within the ceiling, stale 1 ms past it (ceiling 5 000 ms)", async () => {
     const parts = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 5_000 }, stalledYes(7, [5.9, 6, 6.001, 6.5]));
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the other market's frames owe this market nothing,
+      // so it is evaluated at 1.000 s, at 2.000 s (the NO snapshot's owed
+      // evaluation, carried), at the 5.900 s tick, and at 7.000 s (the ticks
+      // at 6.000, 6.001 and 6.500 s, carried, at the first close 1 000 ms
+      // after 5.900 s: ADR-026 D2.4, D2.6-D2.7). Fresh at 5.900 s (4 900 ms),
+      // stale at 7.000 s (6 000 ms, its own last change).
+      expect(evaluatedSeconds(parts)).toEqual([1, 2, 5.9, 7]);
+      expect(evaluationAt(parts, 5.9).stale).toBe(false);
+      expect(evaluationAt(parts, 7)).toMatchObject({ stale: true, bookAgeMs: "6000" });
+      // The edge itself, at the production cadence: a lone tick is evaluated
+      // (four seconds after 2.000 s), so each side of the ceiling gets a run.
+      const atCeiling = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 5_000 }, stalledYes(7, [6]));
+      expect(evaluationAt(atCeiling, 6).stale).toBe(false);
+      const pastCeiling = await run({ basis: "CONNECTION_CONFIRMED", ceilingMs: 5_000 }, stalledYes(7, [6.001]));
+      expect(evaluationAt(pastCeiling, 6.001)).toMatchObject({ stale: true, bookAgeMs: "5001" });
+      return;
+    }
     // 4 900 ms and exactly 5 000 ms since the YES book's own change: vouched for.
     expect(evaluationAt(parts, 5.9).stale).toBe(false);
     expect(evaluationAt(parts, 6).stale).toBe(false);
@@ -869,8 +1071,20 @@ describe("r1 X1: a book whose OWN delivery stalls is bounded by the per-book cei
       events,
     );
     expect(within.trader.loop.orderProvenance().length).toBeGreaterThan(0);
+    // `TC-LOWS-1` (O07): at the production cadence the quiet market is
+    // evaluated by its HEARTBEAT at 6.000 s, 5 000 ms after its 1.000 s
+    // evaluation (ADR-026 D2.4), and Static Bracket enters there — not at the
+    // NO snapshot (9.100 s). A 5 000 ms ceiling still vouches for a change
+    // exactly 5 000 ms old (measured: admitted), so the production run puts
+    // the ceiling below the heartbeat's age, 4 000 ms: past it, check 7 refuses.
     const past = await run(
-      { basis: "CONNECTION_CONFIRMED", ceilingMs: 5_000, paramsVersion: 1, strategyMaxAgeMs: 600_000, riskMaxAgeMs: 2_000 },
+      {
+        basis: "CONNECTION_CONFIRMED",
+        ceilingMs: cadence.production ? 4_000 : 5_000,
+        paramsVersion: 1,
+        strategyMaxAgeMs: 600_000,
+        riskMaxAgeMs: 2_000,
+      },
       events,
     );
     expect(past.trader.loop.orderProvenance()).toHaveLength(0);
@@ -905,7 +1119,7 @@ describe("r1 X1: a book whose OWN delivery stalls is bounded by the per-book cei
 // §9.8 check 7 — the risk engine's VENUE_BOOK measurement
 // ---------------------------------------------------------------------------
 
-describe("§9.8 check 7 measures the same confirmed age (risk freshness)", () => {
+describeAtEachCadence("§9.8 check 7 measures the same confirmed age (risk freshness)", () => {
   /**
    * The strategy's own bound is set out of the way (600 000 ms, version 1) so
    * the ONLY freshness gate is risk's `venueBookMaxAgeMs` (2 000 ms). The YES
@@ -954,7 +1168,7 @@ describe("§9.8 check 7 measures the same confirmed age (risk freshness)", () =>
 // the backlog (the process-lag guard, ADR-023 D7)
 // ---------------------------------------------------------------------------
 
-describe("r2 X9: a lagging trader or a live replay of old data gets no more than unguarded CONNECTION_CONFIRMED at its own instant", () => {
+describeAtEachCadence("r2 X9: a lagging trader or a live replay of old data gets no more than unguarded CONNECTION_CONFIRMED at its own instant", () => {
   /** The reviewers' check-7 timeline (YES 09:00:01, NO snapshot 09:00:04.100 on the same session). */
   function checkSevenTimeline(): Recorded[] {
     const cheapAsks = [
@@ -986,10 +1200,31 @@ describe("r2 X9: a lagging trader or a live replay of old data gets no more than
     const confirmed = await run({ basis: "CONNECTION_CONFIRMED", processClockAt: BACKLOG_CLOCK }, quietYesTimeline());
     const lastChange = await run({ basis: "LAST_CHANGE", processClockAt: BACKLOG_CLOCK }, quietYesTimeline());
     expect(evaluations(confirmed)).toEqual(evaluations(lastChange));
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the 6.200 s tick is coalesced (ADR-026 D2.4); the
+      // last evaluation is 6.000 s, aged by the last change: 5 000 ms.
+      expect(evaluatedSeconds(confirmed)).toEqual(QUIET_AT_PRODUCTION);
+      expect(evaluationAt(confirmed, 6)).toMatchObject({ stale: true, bookAgeMs: "5000" });
+      return;
+    }
     expect(evaluationAt(confirmed, 6.2)).toMatchObject({ stale: true, bookAgeMs: "5200" });
   });
 
   it("a live process 1 700 ms behind is still vouched for at 6.200 s (1 900 ms); 1 900 ms behind, it is stale (2 100 ms)", async () => {
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): the 6.200 s tick is coalesced (ADR-026 D2.4). The
+      // production cadence evaluates at the NO change at each whole second,
+      // and a frame never vouches at its own close (r8, R8-H1): the latest
+      // proven frame is 500 ms earlier, not 200 ms. So the same edge — the
+      // lag plus the confirmed age against the 2 000 ms bound — lies at a lag
+      // of 1 500 ms: vouched for at 6.000 s (2 000 ms); 1 600 ms behind, stale
+      // (2 100 ms).
+      const atBound = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 1_500 }, quietYesTimeline());
+      expect(evaluationAt(atBound, 6).stale).toBe(false);
+      const pastBound = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 1_600 }, quietYesTimeline());
+      expect(evaluationAt(pastBound, 6)).toMatchObject({ stale: true, bookAgeMs: "2100" });
+      return;
+    }
     const within = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 1_700 }, quietYesTimeline());
     expect(evaluationAt(within, 6.2).stale).toBe(false);
     const beyond = await run({ basis: "CONNECTION_CONFIRMED", processLagMs: 1_900 }, quietYesTimeline());
@@ -1023,7 +1258,7 @@ describe("r2 X9: a lagging trader or a live replay of old data gets no more than
 // 4. Replay determinism, and backward compatibility
 // ---------------------------------------------------------------------------
 
-describe("4. replay is deterministic", () => {
+describeAtEachCadence("4. replay is deterministic", () => {
   it("the same recorded events produce byte-identical decisions, twice", async () => {
     const events = [
       ...quietYesTimeline(),
@@ -1038,7 +1273,10 @@ describe("4. replay is deterministic", () => {
     const second = await run({ basis: "CONNECTION_CONFIRMED" }, events);
     const records = (parts: Run) => JSON.stringify(parts.store.decisions.map((recorded) => recorded.record));
     expect(records(first)).toBe(records(second));
-    expect(first.store.decisions.length).toBeGreaterThan(10);
+    // `TC-LOWS-1` (O07): at the production cadence the market is evaluated
+    // once per second (ADR-026 D2.4), so fewer decisions are made (8,
+    // measured); the same bytes twice either way (D6).
+    expect(first.store.decisions.length).toBeGreaterThan(cadence.production ? 5 : 10);
   });
 });
 
@@ -1047,13 +1285,25 @@ describe("4. replay is deterministic", () => {
 // a book only once this process has PROVEN it whole
 // ---------------------------------------------------------------------------
 
-describe("r8 R8-H1: no evaluation takes a confirmation from a frame this loop has not proven whole", () => {
+describeAtEachCadence("r8 R8-H1: no evaluation takes a confirmation from a frame this loop has not proven whole", () => {
   const CHEAP_ASKS = [
     { price: "0.34", size: "100" },
     { price: "0.35", size: "100" },
   ];
   /** Both freshness gates at 2 000 ms: the strategy's (version 2) and check 7's. */
   const BOTH_GATES = { basis: "CONNECTION_CONFIRMED" as const, riskMaxAgeMs: 2_000 };
+
+  /**
+   * `TC-LOWS-1` (O07): the instant of the frame that FOLLOWS the 4.100 s
+   * one. At the per-frame cadence, 4.200 s. At the production cadence an
+   * event 100 ms after the 4.100 s evaluation is coalesced (ADR-026 D2.4) and
+   * would evaluate nothing, so the following frame comes at 5.100 s, the
+   * first instant the cadence evaluates the market again: the frame it
+   * follows is the same one, and what it may vouch for is the same question.
+   */
+  function following(offsetMs = 0): number {
+    return (cadence.production ? 5.1 : 4.2) + offsetMs / 1000;
+  }
 
   /**
    * The R8-H1 shape at the loop. The YES book (asks under the 0.35 trigger)
@@ -1114,13 +1364,14 @@ describe("r8 R8-H1: no evaluation takes a confirmation from a frame this loop ha
       marketOpened(0),
       yesSnapshot(1, A1, CHEAP_ASKS),
       noSnapshot(4.1, A1),
-      noChange(4.2, A1, "250"),
+      noChange(following(), A1, "250"),
     ];
     const parts = await run(BOTH_GATES, events);
     expect(evaluationAt(parts, 4.1)).toMatchObject({ stale: true, bookAgeMs: "3100" });
     // At 4.200 s the entry is evaluated first (the fill's callbacks follow it
     // at the same instant), on a YES book vouched for by the 4.100 s frame.
-    const at42 = evaluations(parts).filter((evaluation) => Date.parse(evaluation.at) === Date.parse(iso(4.2)));
+    // (`TC-LOWS-1`: 5.100 s at the production cadence; see `following`.)
+    const at42 = evaluations(parts).filter((evaluation) => Date.parse(evaluation.at) === Date.parse(iso(following())));
     expect(at42[0]?.stale).toBe(false);
     const provenance = parts.trader.loop.orderProvenance();
     expect(provenance.length).toBeGreaterThan(0);
@@ -1134,10 +1385,10 @@ describe("r8 R8-H1: no evaluation takes a confirmation from a frame this loop ha
     expect(alone.trader.loop.orderProvenance()).toHaveLength(0);
     // A gateway restart: its first frame is epoch B's, so the epoch-A frame
     // at 4.100 s stays unproven (its tail may have been lost in the restart).
-    const restarted = await run(BOTH_GATES, [...lastFrame, noChange(4.2, B1, "250")]);
+    const restarted = await run(BOTH_GATES, [...lastFrame, noChange(following(), B1, "250")]);
     expect(restarted.trader.loop.orderProvenance()).toHaveLength(0);
     // A reference tick of epoch A, by contrast, follows it in the same stream.
-    const followed = await run(BOTH_GATES, [...lastFrame, tick(4.2, "64001")]);
+    const followed = await run(BOTH_GATES, [...lastFrame, tick(following(), "64001")]);
     expect(followed.trader.loop.orderProvenance().length).toBeGreaterThan(0);
   });
 
@@ -1148,7 +1399,8 @@ describe("r8 R8-H1: no evaluation takes a confirmation from a frame this loop ha
     // frame moved it earlier, onto the frame's own unproven head.
     const events: Recorded[] = [tick(-2), marketOpened(0), yesSnapshot(1, A1, CHEAP_ASKS)];
     for (let index = 0; index < 5; index += 1) events.push({ ...noSnapshot(4.1, A1), frame: "late" });
-    events.push(noChange(4.2, A1, "250"), noChange(4.3, A1, "251"));
+    // `TC-LOWS-1` (O07): 5.100 s and 5.200 s at the production cadence (`following`).
+    events.push(noChange(following(), A1, "250"), noChange(following(100), A1, "251"));
     const partitions: number[][] = [[events.length], Array.from({ length: events.length }, () => 1), [4, 6], [5, 2, 3], [7, 1, 2]];
     const sources: string[][] = [];
     for (const batches of partitions) {
@@ -1172,15 +1424,17 @@ describe("r8 R8-H1: no evaluation takes a confirmation from a frame this loop ha
       yesSnapshot(1, A1, CHEAP_ASKS),
       { ...noSnapshot(4.1, A1), frame: "late" },
       incident(4.1, "gw-polymarket-market-r6"),
-      noChange(4.2, A1, "250"),
+      noChange(following(), A1, "250"),
     ];
     const parts = await run(BOTH_GATES, events);
     expect(parts.trader.loop.orderProvenance()).toHaveLength(0);
-    expect(evaluationAt(parts, 4.2)).toMatchObject({ stale: true, bookAgeMs: "3200" });
+    // `TC-LOWS-1` (O07): aged by the last change (1.000 s) — 3 200 ms at
+    // 4.200 s, 4 100 ms at the production cadence's 5.100 s (`following`).
+    expect(evaluationAt(parts, following())).toMatchObject({ stale: true, bookAgeMs: cadence.production ? "4100" : "3200" });
   });
 });
 
-describe("backward compatibility: a document with no bookFreshness block", () => {
+describeAtEachCadence("backward compatibility: a document with no bookFreshness block", () => {
   it("parses, and selects LAST_CHANGE", () => {
     const parsed = parseTraderConfig(traderConfig({ paramsVersion: 1 }));
     expect(parsed.ok).toBe(true);

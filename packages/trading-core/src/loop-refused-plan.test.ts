@@ -120,9 +120,9 @@ import {
   type StrategyStateCheckpoint,
 } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { PER_FRAME_EVALUATION_CADENCE } from "./cadence.js";
+import { PAPER_EVALUATION_CADENCE, PER_FRAME_EVALUATION_CADENCE, type EvaluationCadenceOption } from "./cadence.js";
 import type * as Pipeline from "./pipeline.js";
 import { z } from "zod";
 
@@ -182,6 +182,46 @@ const T_START_MS = Date.parse("2026-05-01T09:00:00.000Z");
 const T_OPEN = "2026-05-01T09:00:00.000Z";
 const T_CLOSE = "2026-05-02T09:00:00.000Z";
 const STEP_MS = 100;
+
+/**
+ * `TC-LOWS-1` (O07): every test of this file that runs the loop runs at BOTH
+ * evaluation cadences — ADR-024's per-frame value 0, as a declared
+ * reproduction (ADR-026 D1.6), under the test names it always had, and the
+ * production cadence every new run uses (ADR-026 D1.5: 1,000 ms / 5,000 ms),
+ * under the same names with {@link PRODUCTION_SUFFIX}.
+ *
+ * The timelines are 100 ms apart ({@link STEP_MS}). A test that runs
+ * unchanged at both is cadence-agnostic. Where an assertion differs at the
+ * production cadence, the test says so at that assertion and why, from
+ * ADR-026: an event less than 1,000 ms of event time after the market's last
+ * evaluation does not evaluate it (D2.4), and is coalesced — no evaluation, no
+ * record (D5) — while every other callback and every harvest point is
+ * unchanged (D4).
+ */
+interface CadenceCase {
+  readonly production: boolean;
+  readonly option: EvaluationCadenceOption;
+}
+const REPRODUCTION: CadenceCase = {
+  production: false,
+  option: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-refused-plan.test.ts" },
+};
+const PRODUCTION: CadenceCase = { production: true, option: PAPER_EVALUATION_CADENCE };
+const PRODUCTION_SUFFIX = " [at the production cadence, ADR-026 D1.5: 1,000 ms / 5,000 ms]";
+/** The cadence the tests now running use: set by {@link describeAtEachCadence}. */
+let cadence: CadenceCase = REPRODUCTION;
+
+/** `describe`, twice: at the reproduction cadence (the name as it was), then at the production one. */
+function describeAtEachCadence(name: string, body: () => void): void {
+  for (const each of [REPRODUCTION, PRODUCTION]) {
+    describe(each.production ? `${name}${PRODUCTION_SUFFIX}` : name, () => {
+      beforeAll(() => {
+        cadence = each;
+      });
+      body();
+    });
+  }
+}
 
 type Level = { readonly price: string; readonly size: string };
 
@@ -761,13 +801,10 @@ function assemble(
     // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is the refused-plan
     // and capital paths, not the cadence — but its timelines were written for
     // ADR-024's per-frame cadence: a scripted strategy that acts at named events,
-    // often at one instant. Under the production cadence (1,000 ms / 5,000 ms) those
-    // evaluations are coalesced, and 2 of this file's 26 tests fail under it (measured
-    // in r1; the failures were not analysed one by one). So it REPRODUCES the ADR-024
-    // behaviour its timelines pin (the value 0, declared); this subject is NOT
-    // exercised here under the production cadence. The cadence is pinned by
-    // `cadence.test.ts` and `loop-cadence.test.ts`.
-    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-refused-plan.test.ts" },
+    // 100 ms apart. `TC-LOWS-1` (O07): every test now runs at both cadences
+    // ({@link describeAtEachCadence}); the two whose assertions differ at the
+    // production cadence say where and why.
+    evaluationCadence: cadence.option,
   });
   wiring.loop = loop;
 
@@ -863,7 +900,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("SIM-1 R3 — the REAL venue reports what it booked, and the loop OWNS it", () => {
+describeAtEachCadence("SIM-1 R3 — the REAL venue reports what it booked, and the loop OWNS it", () => {
   it("a 20-slice POSITION plan whose SECOND batch is refused: the 15 booked slices are owned, traced and delivered, the 5 refused are released, and nothing halts", async () => {
     // 100 shares at 0.2 in 5-share slices = 20 orders = two venue batches
     // (15 + 5). A 15-token budget admits the first batch and refuses the
@@ -996,7 +1033,7 @@ describe("SIM-1 R3 — the REAL venue reports what it booked, and the loop OWNS 
   });
 });
 
-describe("SIM-1 R3 — a BASKET the venue executed only IN PART halts its markets (nothing consumes failurePolicy yet)", () => {
+describeAtEachCadence("SIM-1 R3 — a BASKET the venue executed only IN PART halts its markets (nothing consumes failurePolicy yet)", () => {
   it("the booked YES leg is owned and attributed; the refused NO leg is released; the market halts BASKET_PARTIALLY_EXECUTED", async () => {
     // A two-leg basket in ONE market — BUY 10 YES (≤ 0.35) and BUY 10 NO
     // (≤ 0.67), planned as two groups of two 5-share slices — against a venue
@@ -1105,7 +1142,7 @@ function basketHalts(harness: Harness): ReturnType<CoreLoop["health"]>["halts"] 
 /** The basket's recorded 5 s delay window, from the submission at recorded monotonic 0. */
 const MATCHABLE_NS = 5_000_000_000n;
 
-describe("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcome, not from the venue's `accepted`", () => {
+describeAtEachCadence("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcome, not from the venue's `accepted`", () => {
   it("the verifier's reproduction: an ACCEPTED FOK basket — YES FILLED, NO REJECTED 0/5 — halts BASKET_PARTIALLY_EXECUTED at submission; its legs stay owned and are released at terminal", async () => {
     const harness = assemble({ immediateOrderType: "FOK", venueLadder: oneShareAsks(["NO"]), intent: twoLegBasket });
     await open(harness);
@@ -1307,9 +1344,27 @@ describe("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcome, not from t
     expect(loop.health().halts).toEqual([]);
     expect(loop.retainedOrderState().basketWatches).toBe(1);
 
-    // Event 5: the strategy cancels its market's working orders — the NO slices.
+    // `TC-LOWS-1` (O07): at the production cadence event 5 lies 100 ms after
+    // event 4's evaluation, so it does NOT evaluate the market (ADR-026 D2.4):
+    // its `onFeatures` is coalesced — no runtime asked, nothing persisted (D5)
+    // — and the strategy has not cancelled yet. Event 5's harvest delivers the
+    // two working NO legs' views, as every harvest point does under both
+    // cadences (D4); the legs still rest, watched. The market is evaluated, and
+    // cancels, at the first event 1,000 ms after event 4: event 14.
+    let cancelAt = 5;
+    if (cadence.production) {
+      const coalesced = harness.evaluations.length;
+      await feed(harness, yesBook(5));
+      expect(callbacks(harness, coalesced)).toEqual(["onOrderUpdate", "onOrderUpdate"]);
+      expect(legs(harness.venue.ordersSnapshot()).slice(2)).toEqual(["NO PARTIALLY_FILLED 1/5", "NO PARTIALLY_FILLED 1/5"]);
+      expect(loop.health().halts).toEqual([]);
+      expect(loop.health().loop.evaluationsCoalesced).toBe(1);
+      cancelAt = 14;
+    }
+    // Event 5 (14 at the production cadence): the strategy cancels its
+    // market's working orders — the NO slices.
     const before = harness.evaluations.length;
-    await feed(harness, yesBook(5));
+    await feed(harness, yesBook(cancelAt));
     expect(legs(harness.venue.ordersSnapshot())).toEqual([
       "YES FILLED 5/5",
       "YES FILLED 5/5",
@@ -1318,7 +1373,7 @@ describe("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcome, not from t
     ]);
     const halts = basketHalts(harness);
     expect(halts).toHaveLength(1);
-    expect(halts[0]?.at).toBe(new Date(T_START_MS + 5 * STEP_MS).toISOString());
+    expect(halts[0]?.at).toBe(new Date(T_START_MS + cancelAt * STEP_MS).toISOString());
     expect(halts[0]?.detail).toContain("2 booked order(s) ended short of their size");
     // Judged at the cancel's answer (r3, `SIM1-R3-1`; r2 judged it in the
     // harvest), so BEFORE the harvest's deliveries: the only evaluation of
@@ -1398,7 +1453,7 @@ function callbacks(harness: Harness, from = 0): readonly string[] {
 /** Event 4's instant: the basket is submitted, and its fills harvested and delivered, at it. */
 const T_EVENT_4 = new Date(T_START_MS + 4 * STEP_MS).toISOString();
 
-describe("SIM1-R3-1 — a basket a DELIVERY callback leaves short halts at the venue's answer, before any other intent or callback executes", () => {
+describeAtEachCadence("SIM1-R3-1 — a basket a DELIVERY callback leaves short halts at the venue's answer, before any other intent or callback executes", () => {
   it("onFill: the first fill delivery cancels the basket's working NO legs (CANCELLED 1/5 beside FILLED YES); the halt is raised at the cancel's answer, and the second onFill — which would BUY — is never delivered", async () => {
     const harness = assemble({
       immediateOrderType: "GTC",
@@ -1615,7 +1670,11 @@ describe("SIM1-R3-1 — a basket a DELIVERY callback leaves short halts at the v
     expect(halts[0]?.at).toBe(new Date(T_START_MS + 5 * STEP_MS).toISOString());
     // Event 5's own evaluation ran before the venue moved; the harvest then
     // judged the basket before delivering the CANCELLED views.
-    expect(callbacks(harness, before)).toEqual(["onFeatures"]);
+    // `TC-LOWS-1` (O07): at the production cadence event 5 lies 100 ms after
+    // event 4's evaluation, so its `onFeatures` is coalesced (ADR-026 D2.4,
+    // D5) and no callback runs at all; the harvest point is the same (D4), and
+    // the backstop still judges the basket before the deliveries it withholds.
+    expect(callbacks(harness, before)).toEqual(cadence.production ? [] : ["onFeatures"]);
     expect(planKinds(harness)).toEqual(["BASKET"]);
     expect(harness.loop.retainedOrderState().basketWatches).toBe(0);
     expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
@@ -1637,7 +1696,7 @@ describe("SIM1-R3-1 — a basket a DELIVERY callback leaves short halts at the v
   });
 });
 
-describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOLDING part of it (scripted double)", () => {
+describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOLDING part of it (scripted double)", () => {
   it("the RESTING first slice keeps its reservation, allocator commitment and time-in-force until it is terminal; the market halts for reconciliation", async () => {
     const harness = assemble({ venueDouble: (inner) => new RefusesWhileHoldingVenue(inner) });
     await open(harness);
@@ -1735,7 +1794,7 @@ describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOL
 
 });
 
-describe("SIM-2 r1 — a WATCHED basket's settled leg stays answerable until the watch concludes (the venue retains ONE acknowledged order)", () => {
+describeAtEachCadence("SIM-2 r1 — a WATCHED basket's settled leg stays answerable until the watch concludes (the venue retains ONE acknowledged order)", () => {
   it("a GTC basket: the YES legs FILL and SETTLE at once while the NO legs rest; a later trade fills the NO legs — the watch still finds every leg, concludes COMPLETE, and only then are the YES legs acknowledged", async () => {
     const harness = assemble({
       immediateOrderType: "GTC",
@@ -1803,7 +1862,7 @@ describe("SIM-2 r1 — a WATCHED basket's settled leg stays answerable until the
  * failure. The store refuses (as data) every decision that carries an intent;
  * everything else is the real loop, risk, allocator, planner and venue.
  */
-describe("DURABLE-1: a placement waits for its decision to be durable", () => {
+describeAtEachCadence("DURABLE-1: a placement waits for its decision to be durable", () => {
   /** A per-row store that refuses every intent-bearing decision, counting what it was asked. */
   function refusingStore(): { readonly store: TraderStore; readonly inner: MemoryTraderStore; readonly refused: number[] } {
     const inner = new MemoryTraderStore();
@@ -1981,7 +2040,7 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
  * carries it) until the test releases it; while it is held, the CANCEL must
  * already be out and the placement must not. Both orderings, both modes.
  */
-describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durability wait", () => {
+describeAtEachCadence("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durability wait", () => {
   function heldStore(grouped: boolean): {
     readonly store: TraderStore;
     readonly inner: MemoryTraderStore;
@@ -2116,7 +2175,7 @@ describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durabili
  * database: what was committed stays, nothing after it lands. The real-
  * PostgreSQL version is `test/integration/paper-trader/checkpoint-durable-together-postgres.test.ts`.
  */
-describe("CKPT-1 (ADR-027 D3, DURABLE-1 LOW-3): a decision and the checkpoint it owes are durable together", () => {
+describeAtEachCadence("CKPT-1 (ADR-027 D3, DURABLE-1 LOW-3): a decision and the checkpoint it owes are durable together", () => {
   async function openUntilEntry(harness: Harness): Promise<void> {
     await feed(harness, envelope(1, "ReferenceTradeObserved", { venue: "binance", symbol: "BTCUSDT", price: "64000", size: "0.5" }, "binance"));
     await feed(harness, envelope(2, "MarketOpened", { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, openedAt: T_OPEN }));
