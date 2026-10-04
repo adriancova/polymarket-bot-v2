@@ -140,8 +140,12 @@ describe(`${REDIS_RESPONSE_TIMEOUT_ENV}: the stated outage bound (OUTAGE-1, BOOT
       `event transport bound: every Redis command must answer within 250 ms (${REDIS_RESPONSE_TIMEOUT_ENV}); ` +
         "a Redis outage latches a GLOBAL TRANSPORT_UNAVAILABLE halt within that bound of the first command " +
         "it leaves unanswered, and the process exits 75 at most 500 ms after the halt (one bound for each " +
-        "connection's courtesy QUIT) plus the durable halt record (at most 5000 ms; a connection that has not " +
-        "answered by then is destroyed) and the PostgreSQL close (§4.2)",
+        "connection's courtesy QUIT) plus the durable halt record, the PostgreSQL close and 1000 ms for the " +
+        "process to exit. The record answers within 5000 ms: at that bound it reports UNCONFIRMED and destroys " +
+        "the connection it holds; a connection the pool is still opening then is ended only by the pool's " +
+        "10000 ms connection timeout, which the PostgreSQL close waits for. A process that a silent peer still " +
+        "holds open once that grace has passed is exited by force, as soon as every line it logged has reached " +
+        "the log (§4.2)",
     );
 
     const defaulted = await run(safeEnv());
