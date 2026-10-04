@@ -397,13 +397,25 @@ function randomState(random: () => number): {
   };
 }
 
+/**
+ * Yields to the macrotask queue so a long synchronous stretch never starves
+ * the worker's RPC with vitest (CI-2; `CAP1-R1-GATE-1`).
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 describe("CAP-1 r0 property — for the same state, the candidate's check-16 and check-17 losses are at least the booked-only ones, equal when nothing is unbooked, and no other check moves", () => {
-  it("holds over 3,000 seeded states", () => {
+  it("holds over 3,000 seeded states", async () => {
     let unbookedStates = 0;
     let strictlyRaised = 0;
     let guarded = 0;
     let refusedOnlyWithUnbooked = 0;
     for (let seed = 1; seed <= 3_000; seed += 1) {
+      // `CAP1-R1-GATE-1`: one macrotask turn every 100 states.
+      if (seed % 100 === 0) await yieldToEventLoop();
       const random = prng(seed);
       const state = randomState(random);
       const where = `seed ${String(seed)}`;

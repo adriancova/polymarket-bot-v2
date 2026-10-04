@@ -143,7 +143,7 @@ import {
   type PostingIdentity,
   type TraceLink,
 } from "./accounting.js";
-import { requestFor, type AllocatorGate, type UnbookedExposure } from "./allocation.js";
+import { requestFor, type AllocatorGate, type OrderView, type UnbookedExposure } from "./allocation.js";
 import { judgeBasketExecution } from "./basket-execution.js";
 import {
   bookConfirmedAt,
@@ -1995,6 +1995,9 @@ export class CoreLoop {
         if (!traded.ok && traded.refusal?.code === DISPOSITION_NOT_APPLIED) {
           this.#haltOnVenueObservation("observeTrade", traded.refusal, instant);
         }
+        // `CAP-1` r1: the trade's answer carries the fills it made, with their
+        // prices — recorded as SEEN, as a placement answer's are.
+        if (traded.ok && traded.value !== undefined) this.#noteSeenFills(traded.value.fills, undefined);
         // SIM-1 r2 (`SIM1-R2-1`): the trade's instant can resolve a DELAYED
         // order too (a venue clock that lags the loop's), so a watched basket
         // is judged before the caller evaluates this market.
@@ -2530,6 +2533,9 @@ export class CoreLoop {
         marketId === marketConfig.marketId
           ? (positions.find((position) => position.side === side)?.shares ?? "0")
           : "0",
+      // `CAP-1` r1: a commitment whose order the venue shows terminal is
+      // judged at its final size here, not at the next harvest's settlement.
+      viewOf: (plannedOrderId) => this.#orderViewOf(plannedOrderId),
     });
 
     const riskInput = buildRiskEvaluationInput({
@@ -2745,6 +2751,7 @@ export class CoreLoop {
         liveOwners: this.#liveOwners(),
         projection: this.#held.view,
         availableCollateral: this.#cash,
+        viewOf: (plannedOrderId) => this.#orderViewOf(plannedOrderId),
       });
       if (!reserved.ok) {
         // §9.10 is "reserve BEFORE submission", so a reservation the allocator
@@ -2849,6 +2856,13 @@ export class CoreLoop {
         if (input.plan.planKind !== "CANCEL") carried.placed.add(order.simulatedOrderId);
       }
     }
+    // `CAP-1` r1: the answer carries the fills its orders made at once, with
+    // their prices. The allocator records them as SEEN (evidence of price
+    // only; nothing is booked or released here), so an order the venue ended
+    // at once is judged at those prices, not at its limit, before the harvest
+    // that books them (`CAP1-ASTRA-R1-03`). On every outcome: a refused
+    // plan's booked orders may have filled too.
+    this.#noteSeenFills(result.fills, result.orders);
     if (!result.accepted) {
       this.#options.health.countExecution("submissionsRefused");
       if (input.plan.planKind === "CANCEL") {
@@ -3434,38 +3448,26 @@ export class CoreLoop {
   /**
    * `CAP-1`: a TERMINAL order's final size is confirmed, so the allocator
    * releases EXACTLY its unused remainder (WP-270 decision 5) and keeps the
-   * capital of every fill of it no position carries yet — at that fill's own
-   * price when the venue's unread fills show it, at the order's limit when they
-   * cannot be read — until the harvest that books it (`#bookFills`, which
-   * converts the commitment fill by fill). It used to release the whole
-   * commitment here, at the FILLED view, so an order an `onFill` decision
-   * placed and the venue filled at once vanished from every cap check until
-   * its fill's harvest point (`CAP-OVERSHOOT`). Called wherever an order's
-   * terminal state is acted on; idempotent.
+   * capital of every fill of it no position carries yet until the harvest
+   * that books it (`#bookFills`, which converts the commitment fill by fill).
+   * It used to release the whole commitment here, at the FILLED view, so an
+   * order an `onFill` decision placed and the venue filled at once vanished
+   * from every cap check until its fill's harvest point (`CAP-OVERSHOOT`).
+   * Called wherever an order's terminal state is acted on; idempotent.
+   *
+   * `CAP-1` r1: NO fill page is read here. Round 0 read the venue's fill
+   * cursor again for an order not fully booked, which was a second
+   * `fillsSince` in the event that delivers an `onFill` order filled at once,
+   * outside SIM-2's one read per harvest. Each fill a venue answer carried is
+   * already SEEN by the commitment (`#noteSeenFills`), at its own price. A
+   * share no answer carried is held at the order's limit, never below its
+   * debit, until it is booked.
    */
   #settleCapital(order: SimulatedOrder): void {
     this.#options.allocator.settle(order.plannedOrderId, {
       filledShares: order.filledShares,
-      unbookedFills: this.#unbookedFillsOf(order),
+      unbookedFills: undefined,
     });
-  }
-
-  /**
-   * `CAP-1`: the fills of `order` the venue has made that this process may not
-   * have booked — none when every share it reports is booked (`#fullyBooked`);
-   * otherwise its fills past the fill cursor. One a carried harvest booked
-   * ahead of the cursor (`#bookedAhead`) may be among them: the allocator
-   * knows every fill it has converted and never counts one twice
-   * (`AllocatorGate.settle`). `undefined` when the venue refuses the cursor:
-   * the allocator then holds every unbooked share at the order's limit. Books
-   * nothing and moves nothing: `fillsSince` is the venue's NON-destructive
-   * cursor (SIM-2), and it is read only when a share is still unbooked.
-   */
-  #unbookedFillsOf(order: SimulatedOrder): readonly SimulatedFill[] | undefined {
-    if (this.#fullyBooked(order)) return [];
-    const page = this.#options.venue.fillsSince(this.#knownFills);
-    if (!page.ok) return undefined;
-    return page.value.fills.filter((fill) => fill.simulatedOrderId === order.simulatedOrderId);
   }
 
   /**
@@ -4800,17 +4802,27 @@ export class CoreLoop {
 
   /**
    * The instance's OWN working orders, as §9.8 reads them (`openOrders`), and
-   * — `CAP-1` — the planned order ids of exactly those, so the allocator can
-   * state what the view does NOT present (`#unbookedFillsFor`).
+   * — `CAP-1` — the planned order ids of exactly those, each with the filled
+   * shares its presentation leaves out (`#unbookedFillsFor`).
+   *
+   * `CAP-1` r1 (`CAP1-ASTRA-R1-02`): a working order is presented at its
+   * UNFILLED remainder, `requested − filled`. Its BOOKED fills are already the
+   * position's, and presenting them again in the order counted them twice
+   * (risk's lot builder adds both). Its filled shares no position carries yet
+   * are stated through the separate `unbookedFills` input, at their own price
+   * when seen. Disjoint, so each share is counted once. A working order with
+   * no unfilled share presents nothing (risk's open order is never
+   * zero-sized); one whose sizes are not exact decimals is presented whole, as
+   * before (fail closed).
    */
   #openOrdersFor(
     instance: RegisteredInstance,
     marketConfig: MarketConfig,
   ): {
     readonly openOrders: readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[];
-    readonly presented: ReadonlySet<string>;
+    readonly presented: ReadonlyMap<string, string>;
   } {
-    const presented = new Set<string>();
+    const presented = new Map<string, string>();
     const owned = this.#instanceOrders.get(instance.instanceId);
     if (owned === undefined) return { openOrders: Object.freeze([]), presented };
     const orders: { orderId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }[] = [];
@@ -4822,15 +4834,19 @@ export class CoreLoop {
       if (order.state === "FILLED" || order.state === "CANCELLED" || order.state === "EXPIRED" || order.state === "REJECTED") {
         continue;
       }
+      const exact = isCanonicalDecimalString(order.requestedShares) && isCanonicalDecimalString(order.filledShares);
+      const filled = exact ? order.filledShares : "0";
+      const open = exact ? subDecimal(order.requestedShares, filled) : order.requestedShares;
+      if (exact && compareDecimal(open, "0") <= 0) continue;
       orders.push({
         orderId: order.simulatedOrderId,
         marketId: marketConfig.marketId,
         side: order.side,
         action: order.action,
         price: order.limitPrice,
-        shares: order.requestedShares,
+        shares: open,
       });
-      presented.add(order.plannedOrderId);
+      presented.set(order.plannedOrderId, filled);
     }
     return { openOrders: Object.freeze(orders), presented };
   }
@@ -4862,29 +4878,61 @@ export class CoreLoop {
    *
    * Derived by the allocator from the SAME commitments the cap check counts
    * (`AllocatorGate.unbookedExposure`), scoped like `#positionsFor` (this
-   * instance, this market), and minus what `presented` already counts. The
-   * venue is asked one thing only, for a commitment not yet settled: is its
-   * order terminal, and at what final size (`orderByPlannedId`, O(1)). Its
-   * fill page is NOT read on this path (SIM-2: one cursor read per harvest),
-   * so such an order's unbooked shares are stated at its LIMIT — never less
-   * than their debit — until `#settleCapital` reads their prices. Moves
+   * instance, this market). `presented` names the orders `openOrders` shows
+   * at their unfilled remainder, whose filled-but-unbooked shares belong
+   * here (`CAP-1` r1). For a commitment neither settled nor presented the
+   * venue is asked one thing only, O(1): its order's state and filled size
+   * (`#orderViewOf`). No fill page is read on this path (SIM-2: one cursor
+   * read per harvest); `CAP-1` r1: an unbooked fill is priced from the
+   * placement or trade answer that carried it (`#noteSeenFills`), and at its
+   * order's limit (never less than its debit) only when no answer did. Moves
    * nothing.
    */
   #unbookedFillsFor(
     instance: RegisteredInstance,
     marketConfig: MarketConfig,
-    presented: ReadonlySet<string>,
+    presented: ReadonlyMap<string, string>,
   ): readonly UnbookedExposure[] {
     return this.#options.allocator.unbookedExposure({
       instanceId: instance.instanceId,
       marketId: marketConfig.marketId,
       presentedOpen: presented,
-      terminalViewOf: (plannedOrderId) => {
-        const order = this.#options.venue.orderByPlannedId(plannedOrderId);
-        if (order === undefined || !this.#isTerminalOrder(order)) return undefined;
-        return { filledShares: order.filledShares, unbookedFills: undefined };
-      },
+      viewOf: (plannedOrderId) => this.#orderViewOf(plannedOrderId),
     });
+  }
+
+  /**
+   * `CAP-1` r1: what the venue shows of a planned order NOW, for the
+   * allocator's questions: whether it is terminal (the trader's one terminal
+   * predicate) and its filled size. One O(1) lookup by planned id; it moves
+   * nothing and HALTS on nothing. An order the venue cannot show is
+   * `undefined`, and the allocator then keeps its whole reservation (fail
+   * closed); the loop's own reads of the orders it owns stay where they were
+   * and are loud on a miss.
+   */
+  #orderViewOf(plannedOrderId: string): OrderView | undefined {
+    const order = this.#options.venue.orderByPlannedId(plannedOrderId);
+    if (order === undefined) return undefined;
+    return { terminal: this.#isTerminalOrder(order), filledShares: order.filledShares };
+  }
+
+  /**
+   * `CAP-1` r1: records each of `fills`, which a venue ANSWER carried (a
+   * placement's or a trade's), as SEEN by its planned order's allocator
+   * commitment: evidence of its price, nothing booked, released or moved.
+   * `orders`, when the answer lists them, names each fill's planned order;
+   * otherwise it is looked up by the fill's venue order id, O(1) per fill.
+   */
+  #noteSeenFills(
+    fills: readonly Pick<SimulatedFill, "simulatedFillId" | "simulatedOrderId" | "marketId" | "side" | "action" | "price" | "shares">[],
+    orders: readonly SimulatedOrder[] | undefined,
+  ): void {
+    for (const fill of fills) {
+      const plannedOrderId =
+        orders?.find((order) => order.simulatedOrderId === fill.simulatedOrderId)?.plannedOrderId ??
+        this.#options.venue.orderById(fill.simulatedOrderId)?.plannedOrderId;
+      this.#options.allocator.observeVenueFill(fill, plannedOrderId);
+    }
   }
 
   /**

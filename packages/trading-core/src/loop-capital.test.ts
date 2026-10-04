@@ -50,6 +50,27 @@
  * 6. the property, extended: at EVERY risk evaluation, the holdings checks 16
  *    and 17 count are at least the venue's floor, and no admitted entry takes
  *    the strategy's floor over its worst-case limit.
+ *
+ * `CAP-1` r1 — THE JOINT REVIEW OF `651d258`. Three over-counts a booked
+ * control did not make, each now pinned against its booked control:
+ *
+ * 7. an order the venue ENDED at once, not yet settled, kept its whole
+ *    reservation in the cap check (`CAP1-ASTRA-R1-01`), and its unbooked fills
+ *    were priced at its limit for check 16 (`CAP1-ASTRA-R1-03`);
+ * 8. a partly filled WORKING order was presented whole in risk's open orders
+ *    while its booked fills were also a position (`CAP1-ASTRA-R1-02`);
+ * 9. the property's oracles are now EXACT, keyed on the venue's own state:
+ *    the cap check counts a terminal order at exactly its fills' debits, and
+ *    checks 16 and 17 count exactly the venue's floor. Round 0 keyed `exact`
+ *    on the loop's own release marker and held risk only to a lower bound,
+ *    which hid all three;
+ * 10. a DELAYED disposition whose fill a trade's ANSWER carries is priced at
+ *     that fill. One that `observe()` applies is the single stated residual
+ *     (`observe()`'s answer carries no fills): it is held at the limit, never
+ *     below its debit.
+ *
+ * The property yields to the macrotask queue after every seed
+ * (`CAP1-R1-GATE-1`).
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -115,7 +136,7 @@ import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
-import { CoreLoop, DecisionOutboxBuffer } from "./loop.js";
+import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
 import type { RiskInputContext } from "./pipeline.js";
 import type { IngestedEvent } from "./ports.js";
@@ -418,6 +439,8 @@ interface HarnessOptions {
   readonly risk?: RiskLimits;
   /** `CAP-1` r0: runs at EVERY risk evaluation, after the engine answered — the property's check-16/17 floor. */
   readonly onRisk?: (harness: Harness, risk: Harness["risks"][number]) => void;
+  /** `CAP-1` r1: the venue port the LOOP is handed, wrapping the simulated venue (the harness's own reads stay on it). */
+  readonly wrapVenue?: (venue: SimulatedVenue, clock: ManualClock) => TraderVenue;
 }
 
 const ZERO_LATENCY: LatencyModel = {
@@ -582,7 +605,7 @@ function assemble(options: HarnessOptions): Harness {
     riskPolicy: policy.value,
     allocator: gate,
     clock,
-    venue,
+    venue: options.wrapVenue?.(venue, clock) ?? venue,
     store: new MemoryTraderStore(),
     registry,
     markets,
@@ -757,10 +780,15 @@ const S = 1_000;
  *   its limit, plus every fill's debit (`price × shares`), booked or not. The
  *   invariant is `counted ≥ floor`.
  * - `exact`: what the cap check counts with no double count and the exact
- *   remainder released — each order the loop still holds (its time-in-force is
- *   recorded: working, or terminal and not yet acted on) at its whole
- *   reservation `limit × shares`; each order the loop has settled at exactly
- *   its fills' debits.
+ *   remainder released — each WORKING order at its whole reservation `limit ×
+ *   shares` (WP-270 decision 5: the unused part goes only once the final size
+ *   is confirmed); each order the venue shows TERMINAL at exactly its fills'
+ *   debits, booked or not.
+ *
+ * `CAP-1` r1 (`CAP1-ASTRA-R1-01`): `exact` is keyed on the VENUE's state
+ * alone. Round 0 keyed it on the loop's own time-in-force marker, so an order
+ * the venue had ended but the loop had not yet settled was "exactly" its
+ * whole reservation, and the delayed release passed the oracle.
  *
  * BUY-only by construction (the property's double sells nothing), so a
  * position's FIFO cost basis is exactly the sum of its booked BUY debits.
@@ -783,7 +811,7 @@ function committed(harness: Harness): Readonly<Record<Label, { readonly floor: s
     }
     const exact = addDecimal(
       out[label].exact,
-      harness.loop.timeInForceFor(order.plannedOrderId) === undefined ? debit : mulDecimal(order.limitPrice, order.requestedShares),
+      TERMINAL.has(order.state) ? debit : mulDecimal(order.limitPrice, order.requestedShares),
     );
     out[label] = { floor, exact };
   }
@@ -818,6 +846,8 @@ function counted(harness: Harness): { readonly A: string; readonly B: string; re
     availableCollateral: "1000000",
     approvedIntentId: "cap1-read",
     heldShares: () => "0",
+    // `CAP-1` r1: the venue's own view of each order, as the loop's questions read it.
+    viewOf: (plannedOrderId) => venueViewOf(harness, plannedOrderId),
   });
   return {
     A: combinedOf(outcome.exposures.byStrategyInstance, INSTANCE_A),
@@ -826,18 +856,36 @@ function counted(harness: Harness): { readonly A: string; readonly B: string; re
   };
 }
 
-/** Asserts the invariant for both strategies and the account: `floor ≤ counted = exact`. */
-function expectInvariant(harness: Harness, where: string): void {
+/** `CAP-1` r1: one planned order as the VENUE shows it now (its state and filled size), read without the loop. */
+function venueViewOf(harness: Harness, plannedOrderId: string): { readonly terminal: boolean; readonly filledShares: string } | undefined {
+  const order = harness.venue.orderByPlannedId(plannedOrderId);
+  return order === undefined ? undefined : { terminal: TERMINAL.has(order.state), filledShares: order.filledShares };
+}
+
+/**
+ * Asserts the invariant for both strategies and the account: `floor ≤ counted
+ * = exact`.
+ *
+ * `unseen` (`CAP-1` r1) names, per strategy, the ONE stated residual: a fill
+ * no venue answer the loop received has carried yet. That is a Tier-1
+ * DELAYED order's disposition applied inside `observe()`, whose answer
+ * carries no fills, until a fill page is read. Such a share is held at its
+ * order's limit, so the cap check counts `exact + (limit − price) × shares`,
+ * never less. A test that expects it states that excess exactly; every other
+ * caller states none.
+ */
+function expectInvariant(harness: Harness, where: string, unseen: Partial<Record<Label, string>> = {}): void {
   const now = counted(harness);
   const venue = committed(harness);
   let exactGlobal = "0";
   for (const label of ["A", "B"] as const) {
     const truth = venue[label];
+    const expected = addDecimal(truth.exact, unseen[label] ?? "0");
     expect(now[label], `${where}: ${label} counted ≥ its floor ${truth.floor}`).toSatisfy(
       (value: string) => compareDecimal(value, truth.floor) >= 0,
     );
-    expect(now[label], `${where}: ${label} counted exactly (no double count, the exact remainder released)`).toBe(truth.exact);
-    exactGlobal = addDecimal(exactGlobal, truth.exact);
+    expect(now[label], `${where}: ${label} counted exactly (no double count, the exact remainder released)`).toBe(expected);
+    exactGlobal = addDecimal(exactGlobal, expected);
   }
   expect(now.global, `${where}: the account`).toBe(exactGlobal);
 }
@@ -931,6 +979,34 @@ describe("CAP-1 regression — the CADENCE-1 R4-CAP probe (O-R3-01's capital sid
       expect(harness.halts.records()).toEqual([]);
     });
   }
+
+  it("r1 — SIM-2's cursor budget on the same paths: at most ONE fillsSince read per event (651d258 read the venue's fill page a SECOND time to settle the onFill order filled at once)", async () => {
+    for (const variant of ["carried", "ordinary"] as const) {
+      ordinal = 0;
+      const harness = assemble({
+        cadence: PAPER_EVALUATION_CADENCE,
+        perStrategyCap: CAP,
+        script: scheduled({ B: { onFeatures: [[FIRST, BUY10], [iso(S + 10_000), BUY10]], onFill: [[FIRST, BUY10]] } }),
+      });
+      const cursor = vi.spyOn(harness.venue, "fillsSince");
+      const reads: number[] = [];
+      for (const ingested of [
+        ...opening(),
+        opened(S + 150, MARKET_B),
+        snapshot(S + 5_000, variant === "ordinary" ? MARKET_A : MARKET_X, "yes"),
+        snapshot(S + 10_000, MARKET_X, "yes"),
+      ]) {
+        const before = cursor.mock.calls.length;
+        await feed(harness, ingested);
+        reads.push(cursor.mock.calls.length - before);
+      }
+      // The onFill order filled at once was SETTLED at its view (its fill seen
+      // in the placement answer) without reading the page again.
+      expect(Math.max(...reads), `${variant}: fillsSince reads per event ${JSON.stringify(reads)}`).toBeLessThanOrEqual(1);
+      expect(outcomeOf(harness)).toMatchObject({ accepted: 2, allocator: { CAPITAL_STRATEGY_CAP_EXCEEDED: 1 } });
+      expect(harness.halts.records()).toEqual([]);
+    }
+  });
 
   it("per-frame cadence (B's own events at S + 5 000 and S + 10 000): the same refusal", async () => {
     ordinal = 0;
@@ -1114,7 +1190,7 @@ describe("CAP-1 r0 — what the separate input is NOT: never a sellable position
 });
 
 describe("CAP-1 r0 — exactly what the separate input states, through the real loop", () => {
-  it("an UNSETTLED terminal order (an onOrderUpdate FAK, partly filled and cancelled at once, outside its harvest's view boundary): checks 16 and 17 count exactly its FILLED unbooked shares — at its limit, its fill page unread on this path — and a RESTING order only through openOrders", async () => {
+  it("an UNSETTLED terminal order (an onOrderUpdate FAK, partly filled and cancelled at once, outside its harvest's view boundary): checks 16 and 17 count exactly its FILLED unbooked shares — r1: at the 0.34 its placement answer carried, no longer at its 0.35 limit (CAP1-ASTRA-R1-03) — and a RESTING order only through openOrders", async () => {
     ordinal = 0;
     const harness = assemble({
       cadence: PAPER_EVALUATION_CADENCE,
@@ -1140,14 +1216,185 @@ describe("CAP-1 r0 — exactly what the separate input states, through the real 
     // judged while the FAK is terminal, unbooked and not yet settled.
     await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
     const third = harness.risks.filter((risk) => risk.label === "B").at(-1);
-    // Exactly the 5 FILLED shares, at the 0.35 limit (never below their
-    // 0.34 debit) — not the 5 cancelled ones, and not the resting order,
-    // which openOrders presents whole.
-    expect(third?.document.unbookedFills).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.75" }]);
+    // Exactly the 5 FILLED shares, at their own 0.34 (the placement answer
+    // carried it; round 0 stated the 0.35 limit, 1.75) — not the 5 cancelled
+    // ones, and not the resting order, which openOrders presents whole.
+    expect(third?.document.unbookedFills).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.7" }]);
     expect(third?.document.portfolio.openOrders.map((open) => open.orderId)).toHaveLength(1);
-    // Check 16: 3.00 resting + 1.75 unbooked + 3.50 this BUY.
-    expect(third?.evaluation.worstCase?.maximumContractualLoss).toBe("8.25");
+    // Check 16: 3.00 resting + 1.70 unbooked + 3.50 this BUY (round 0: 8.25).
+    expect(third?.evaluation.worstCase?.maximumContractualLoss).toBe("8.2");
     expect(harness.halts.records()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1c. Round 1's named regressions (the joint review of 651d258)
+// ---------------------------------------------------------------------------
+
+describe("CAP-1 r1 regression (CAP1-ASTRA-R1-01, -03) — an order the venue ENDED at once (an onOrderUpdate FAK: 5 filled at 0.34, 5 cancelled), not yet booked or settled: the cap check and check 16 judge it at its final size and its fills' own prices, exactly as the booked control does", () => {
+  /**
+   * B rests a maker BUY of 10 at 0.30 (3.00). Its RESTING view places a FAK of
+   * 10 at ≤ 0.35 against 5 shares at 0.34: 5 fill (1.70) and 5 are cancelled
+   * at once — CANCELLED 5/10, outside its harvest's view boundary, so no loop
+   * site settles it before the next harvest. A heartbeat at an event for no
+   * configured market then asks for another FAK BUY of 10 at ≤ 0.35 (3.50).
+   *
+   * The booked control books the fill first (B's own event at S + 9 500).
+   *
+   * At `651d258` the PENDING run counted the FAK's whole 3.50 reservation
+   * (6.50 + 3.50 = 10 > 8.30: refused CAPITAL_STRATEGY_CAP_EXCEEDED) and
+   * priced its 5 filled shares at the 0.35 limit for check 16 (3.00 + 1.75 +
+   * 3.50 = 8.25 > 8.22: refused RISK_WORST_CASE_LOSS_EXCEEDED). The booked
+   * control admitted both: 4.70 and 8.20.
+   */
+  async function run(booked: boolean, limits: "allocator" | "risk"): Promise<{ readonly harness: Harness; readonly judged: string[] }> {
+    ordinal = 0;
+    const judged: string[] = [];
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: limits === "allocator" ? "8.3" : "1000",
+      risk: { maxWorstCaseContractualLoss: limits === "risk" ? "8.22" : "1000" },
+      script: scheduled({
+        B: {
+          onFeatures: [
+            [iso(S + 5_000), { kind: "BUY", shares: "10", style: "MAKER" }],
+            [iso(S + 15_000), { kind: "BUY", shares: "10", style: "FAK" }],
+          ],
+          onOrderUpdate: [[iso(S + 5_000), { kind: "BUY", shares: "10", style: "FAK" }]],
+        },
+      }),
+    });
+    const original = harness.gate.evaluate.bind(harness.gate);
+    vi.spyOn(harness.gate, "evaluate").mockImplementation((input) => {
+      const outcome = original(input);
+      if (input.instanceId === INSTANCE_B) judged.push(combinedOf(outcome.exposures.byStrategyInstance, INSTANCE_B));
+      return outcome;
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5"));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY RESTING 0/10", "BUY CANCELLED 5/10"]);
+    expect(harness.loop.health().execution.fillsObserved).toBe(0);
+    if (booked) {
+      await feed(harness, level(S + 9_500, MARKET_B, "0.31"));
+      expect(harness.loop.health().execution.fillsObserved).toBe(1);
+    }
+    // At the heartbeat, before the third BUY is judged: 3.00 + 1.70, and the
+    // FAK's 1.80 unused remainder released, on BOTH runs.
+    expect(counted(harness).B).toBe("4.7");
+    expectInvariant(harness, `${booked ? "booked" : "pending"} run, before the heartbeat`);
+    await feed(harness, snapshot(S + 15_000, MARKET_X, "yes"));
+    expect(harness.halts.records()).toEqual([]);
+    return { harness, judged };
+  }
+
+  it("the allocator (per-strategy cap 8.30): the third BUY is ADMITTED at 4.70 + 3.50 = 8.20, exactly as the booked control admits it (651d258: 6.50 counted, refused)", async () => {
+    const pending = await run(false, "allocator");
+    const control = await run(true, "allocator");
+    expect(outcomeOf(pending.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+    expect(outcomeOf(control.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+    // B's cap checks: nothing; the resting 3.00; then the third BUY's.
+    expect(pending.judged).toEqual(["0", "3", "4.7"]);
+    expect(control.judged.at(-1)).toBe("4.7");
+  });
+
+  it("check 16 (maxWorstCaseContractualLoss 8.22): the third BUY is ADMITTED at 3.00 + 1.70 + 3.50 = 8.20, exactly as the booked control admits it (651d258: 1.75 stated at the limit, 8.25, refused)", async () => {
+    const pending = await run(false, "risk");
+    const control = await run(true, "risk");
+    expect(outcomeOf(pending.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+    expect(outcomeOf(control.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+    expect(checkSixteen(pending.harness, "B").at(-1)).toBe("8.2");
+    expect(checkSixteen(control.harness, "B").at(-1)).toBe("8.2");
+    // The pending run states the unbooked fill at its own 0.34; the control's is a position.
+    expect(unbookedInputs(pending.harness, "B").at(-1)).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.7" }]);
+    expect(unbookedInputs(control.harness, "B").at(-1)).toEqual([]);
+  });
+});
+
+describe("CAP-1 r1 regression (CAP1-ASTRA-R1-02) — a PARTLY FILLED working order: risk's open orders present only its UNFILLED remainder, so no share is counted in the position (or the unbooked input) AND in the order", () => {
+  it("BOOKED partial fill: a GTC BUY of 10 at ≤ 0.35 fills 5 at 0.34 and rests 5; at check 16's limit of 5, a maker BUY of 5 at 0.30 is ADMITTED at 1.70 + 1.75 + 1.50 = 4.95 (651d258: 1.70 + 3.50 + 1.50 = 6.70, refused)", async () => {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      risk: { maxWorstCaseContractualLoss: "5" },
+      script: scheduled({
+        B: {
+          onFeatures: [
+            [iso(S + 5_000), { kind: "BUY", shares: "10", style: "GTC" }],
+            [iso(S + 6_100), { kind: "BUY", shares: "5", style: "MAKER" }],
+          ],
+        },
+      }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5"));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY PARTIALLY_FILLED 5/10"]);
+    expect(harness.loop.health().execution.fillsObserved).toBe(1);
+    await feed(harness, level(S + 6_100, MARKET_B, "0.31"));
+    expect(outcomeOf(harness)).toMatchObject({ accepted: 2, risk: {}, allocator: {} });
+    const second = harness.risks.filter((risk) => risk.label === "B").at(-1);
+    expect(second?.document.portfolio.positions.map((position) => position.shares)).toEqual(["5"]);
+    // The working order at its 5 UNFILLED shares; nothing unbooked.
+    expect(second?.context.openOrders.map((open) => open.shares)).toEqual(["5"]);
+    expect(second?.document.unbookedFills).toEqual([]);
+    expect(second?.evaluation.worstCase?.maximumContractualLoss).toBe("4.95");
+    expect(harness.halts.records()).toEqual([]);
+  });
+
+  /**
+   * B rests a maker BUY of 10 at 0.30 (3.00). Its RESTING view places a GTC
+   * BUY of 10 at ≤ 0.35 against 5 shares at 0.34: PARTIALLY FILLED 5/10 at
+   * once, 5 resting at 0.35, its fill unread until the next harvest. A
+   * heartbeat then asks for a maker BUY of 5 at 0.30 (1.50). Check 16's limit
+   * is 7.97. The booked control books the fill first.
+   *
+   * Pending and control both measure 3.00 + 1.70 (the 5 filled shares: unbooked
+   * at their own price, or booked) + 1.75 (the 5 unfilled) + 1.50 = 7.95.
+   * At `651d258` the pending run measured 3.00 + 3.50 (the order presented
+   * whole) + 1.50 = 8.00, refused; its control 9.70 (position AND whole order).
+   */
+  async function workingPartial(booked: boolean): Promise<Harness> {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      risk: { maxWorstCaseContractualLoss: "7.97" },
+      script: scheduled({
+        B: {
+          onFeatures: [
+            [iso(S + 5_000), { kind: "BUY", shares: "10", style: "MAKER" }],
+            [iso(S + 15_000), { kind: "BUY", shares: "5", style: "MAKER" }],
+          ],
+          onOrderUpdate: [[iso(S + 5_000), { kind: "BUY", shares: "10", style: "GTC" }]],
+        },
+      }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5"));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY RESTING 0/10", "BUY PARTIALLY_FILLED 5/10"]);
+    expect(harness.loop.health().execution.fillsObserved).toBe(0);
+    if (booked) {
+      await feed(harness, level(S + 9_500, MARKET_B, "0.31"));
+      expect(harness.loop.health().execution.fillsObserved).toBe(1);
+    }
+    expectInvariant(harness, `${booked ? "booked" : "pending"} working partial, before the heartbeat`);
+    await feed(harness, snapshot(S + 15_000, MARKET_X, "yes"));
+    expect(harness.halts.records()).toEqual([]);
+    return harness;
+  }
+
+  it("UNBOOKED partial fill of a working order (an onOrderUpdate GTC): its 5 filled shares are stated at their own 0.34 and its 5 unfilled ones presented as the open order — 7.95, ADMITTED at 7.97, exactly as the booked control (651d258: 8.00, refused)", async () => {
+    const pending = await workingPartial(false);
+    const control = await workingPartial(true);
+    for (const harness of [pending, control]) {
+      expect(outcomeOf(harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+      expect(checkSixteen(harness, "B").at(-1)).toBe("7.95");
+      const last = harness.risks.filter((risk) => risk.label === "B").at(-1);
+      // The resting maker whole (10 unfilled) and the GTC at its 5 unfilled.
+      expect(last?.context.openOrders.map((open) => open.shares)).toEqual(["10", "5"]);
+    }
+    expect(unbookedInputs(pending, "B").at(-1)).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.7" }]);
+    expect(unbookedInputs(control, "B").at(-1)).toEqual([]);
   });
 });
 
@@ -1159,13 +1406,23 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
   it("THE RELEASE AT FILLED (ordinary harvest): the onFill order's FILLED view releases only its unused remainder; its fill's exact debit is counted until the next harvest point books it, and then the commitment closes", async () => {
     ordinal = 0;
     const first = iso(S + 5_000);
+    const atOnFill: ReturnType<AllocatorGate["metrics"]>[] = [];
     const harness = assemble({
       cadence: PAPER_EVALUATION_CADENCE,
       perStrategyCap: "1000",
       script: scheduled({ B: { onFeatures: [[first, { kind: "BUY", shares: "10", style: "FAK" }]], onFill: [[first, { kind: "BUY", shares: "10", style: "FAK" }]] } }),
+      beforeEvaluation: (current, input, label) => {
+        if (label === "B" && input.callback === "onFill") atOnFill.push(current.gate.metrics());
+      },
     });
     await feed(harness, ...opening(), opened(S + 150, MARKET_B));
     await feed(harness, snapshot(S + 5_000, MARKET_A, "yes"));
+    // r1: the harvest's release step SETTLED (and, every share booked, CLOSED)
+    // the first order BEFORE its onFill ran — the allocator's half of
+    // CADENCE-1's A-R3-01 ordering. Since the cap check judges a terminal
+    // order at its view anyway, only the gate's own book shows the order.
+    expect(atOnFill).toHaveLength(1);
+    expect(atOnFill[0]).toMatchObject({ open: 0, applied: 1, released: 1, reservedCollateral: "0" });
     // Both FILLED; the second's fill unread (it keeps its ADR-024 harvest point).
     expect(outcomeOf(harness).orders).toEqual(["BUY FILLED 10/10", "BUY FILLED 10/10"]);
     expect(harness.loop.health().execution.fillsObserved).toBe(1);
@@ -1216,9 +1473,12 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
     await feed(harness, level(S + 6_100, MARKET_B, "0.31"));
     // Admitted: 3.50 + 1.50 = 5 ≤ 5 (base counted 5.20 and refused it).
     expect(outcomeOf(harness)).toMatchObject({ accepted: 2, allocator: {} });
-    // `CAP-1` r0: the partly filled order RESTS, so risk's open orders present
-    // it whole and the separate unbooked input states nothing for it.
+    // `CAP-1` r0: the partly filled order RESTS, and its fill is booked, so the
+    // separate unbooked input states nothing for it. r1 (`CAP1-ASTRA-R1-02`):
+    // risk's open orders present it at its 5 UNFILLED shares — its 5 booked
+    // ones are the position's (651d258 presented all 10 again).
     expect(harness.risks.at(-1)?.document.portfolio.openOrders).toHaveLength(1);
+    expect(harness.risks.at(-1)?.context.openOrders.map((open) => open.shares)).toEqual(["5"]);
     expect(harness.risks.at(-1)?.document.unbookedFills).toEqual([]);
     expect(counted(harness).B).toBe("5");
     expectInvariant(harness, "with the maker BUY resting");
@@ -1260,7 +1520,7 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
     expect(harness.halts.records()).toEqual([]);
   });
 
-  it("AN onOrderUpdate PLACEMENT that fills at once: not in its harvest's view boundary, so its whole reservation stays counted until the next harvest books it", async () => {
+  it("AN onOrderUpdate PLACEMENT that fills at once: not in its harvest's view boundary, so it is not settled until the next harvest — r1: the cap check judges it at its final size at once (its exact 3.40 debit counted, its 0.10 unused remainder released), and its capital still never leaves the check", async () => {
     ordinal = 0;
     const harness = assemble({
       cadence: PAPER_EVALUATION_CADENCE,
@@ -1278,10 +1538,12 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
     await feed(harness, ...opening(), opened(S + 150, MARKET_B));
     await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
     expect(outcomeOf(harness).orders).toEqual(["BUY RESTING 0/10", "BUY FILLED 10/10"]);
-    // 3 (resting maker) + 3.50 (the FAK order, filled, nothing of it read yet).
-    expect(counted(harness).B).toBe("6.5");
+    // 3 (resting maker) + 3.40 (the FAK order: FILLED at the venue, not yet
+    // booked or settled — judged at its final size; round 0 counted 3.50).
+    expect(counted(harness).B).toBe("6.4");
+    expect(harness.loop.health().execution.fillsObserved).toBe(0);
     expectInvariant(harness, "after the onOrderUpdate placement");
-    // A heartbeat at an event for no configured market: 6.50 + 3.50 > 8.
+    // A heartbeat at an event for no configured market: 6.40 + 3.50 > 8.
     await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
     expect(outcomeOf(harness)).toMatchObject({ accepted: 2, allocator: { CAPITAL_STRATEGY_CAP_EXCEEDED: 1 } });
     await feed(harness, level(S + 10_100, MARKET_B, "0.31"));
@@ -1289,7 +1551,7 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
     expectInvariant(harness, "after the booking");
   });
 
-  it("A FILL APPLIED AT AN UNCONFIGURED MARKET'S observe() (Tier 1, a 5 s delayed market): the DELAYED order's reservation stays counted through the heartbeats at that event until the next ordinary harvest books its fill", async () => {
+  it("A FILL APPLIED AT AN UNCONFIGURED MARKET'S observe() (Tier 1, a 5 s delayed market): the DELAYED order's capital stays counted through the heartbeats at that event until the next ordinary harvest books its fill — r1: at its final size, its unseen fill at the limit (the stated residual: observe()'s answer carries no fills)", async () => {
     ordinal = 0;
     const harness = assemble({
       cadence: PAPER_EVALUATION_CADENCE,
@@ -1314,22 +1576,121 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
     harness.clock.positionAt(iso(S + 11_000), 6_000_000_000n);
     await feed(harness, snapshot(S + 11_000, MARKET_X, "yes"));
     expect(outcomeOf(harness).orders).toEqual(["BUY FILLED 10/10"]);
-    // The fill is unread (no harvest point at X), and the reservation stays:
+    // The fill is unread (no harvest point at X), and its capital stays:
     // 3.50 + 3.50 > 6, so the heartbeat's BUY is refused.
     expect(harness.loop.health().execution.fillsObserved).toBe(0);
     expect(outcomeOf(harness)).toMatchObject({ accepted: 1, allocator: { CAPITAL_STRATEGY_CAP_EXCEEDED: 1 } });
+    // r1: the order is FILLED 10/10 at the venue, so it is judged at that
+    // final size. No answer the loop received carried the fill (`observe()`
+    // answers no fills, and no page is read here: SIM-2), so its 10 shares
+    // are held at the 0.35 limit: 3.50, which is 10 × (0.35 − 0.34) = 0.10
+    // over the 3.40 debit, never under it. The STATED residual.
+    expect(harness.venue.fills.map((fill) => `${fill.shares}@${fill.price}`)).toEqual(["10@0.34"]);
     expect(counted(harness).B).toBe("3.5");
-    expectInvariant(harness, "at the heartbeat after observe()'s fill");
+    expectInvariant(harness, "at the heartbeat after observe()'s fill", { B: "0.1" });
     await feed(harness, level(S + 11_100, MARKET_B, "0.31"));
     expect(harness.loop.health().execution.fillsObserved).toBe(1);
     expect(counted(harness).B).toBe(harness.venue.fills.reduce((total, fill) => addDecimal(total, mulDecimal(fill.price, fill.shares)), "0"));
     expectInvariant(harness, "after the booking");
+  });
+  it("r1: a WORKING order whose filled shares no answer carried (Tier 1: a DELAYED GTC partly filled inside observe(), its remainder resting): risk's open orders present its 5 unfilled shares and the separate input its 5 filled ones — at the limit, the stated residual, never below their debit, and never dropped", async () => {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      tier1DelaySeconds: 5,
+      script: scheduled({
+        B: {
+          onFeatures: [
+            [iso(S + 5_000), { kind: "BUY", shares: "10", style: "GTC" }],
+            [iso(S + 11_000), { kind: "BUY", shares: "5", style: "MAKER" }],
+          ],
+        },
+      }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5"));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY DELAYED 0/10"]);
+    harness.clock.positionAt(iso(S + 11_000), 6_000_000_000n);
+    await feed(harness, snapshot(S + 11_000, MARKET_X, "yes"));
+    const gtc = outcomeOf(harness).orders[0];
+    expect(gtc).toBe("BUY PARTIALLY_FILLED 5/10");
+    expect(harness.loop.health().execution.fillsObserved).toBe(0);
+    const heartbeat = harness.risks.filter((risk) => risk.label === "B").at(-1);
+    expect(heartbeat?.context.evaluatedAt).toBe(iso(S + 11_000));
+    // Disjoint: 5 unfilled in the open order, 5 filled-but-unbooked here.
+    expect(heartbeat?.context.openOrders.map((open) => open.shares)).toEqual(["5"]);
+    expect(heartbeat?.document.unbookedFills).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.75" }]);
+    // Check 16: 1.75 unfilled + 1.75 filled (at the limit: 0.05 over their
+    // 1.70 debit, never under it) + 1.50 this BUY = 5. The venue's floor, now
+    // that BUY rests too: 1.70 + 1.75 + 1.50 = 4.95.
+    expect(heartbeat?.evaluation.worstCase?.maximumContractualLoss).toBe("5");
+    expect(outcomeOf(harness).orders).toEqual(["BUY PARTIALLY_FILLED 5/10", "BUY RESTING 0/5"]);
+    expect(holdingsFloor(harness, "B")).toEqual({ cost: "4.95", shares: "15" });
+    expect(harness.halts.records()).toEqual([]);
+  });
+
+  it("r1: a DELAYED disposition reached through a TRADE's answer (observeTrade's own sweep — a venue clock that lags the loop's): the answer carries the fill, so every evaluation before its harvest judges the order at its 0.34, not its 0.35 limit", async () => {
+    ordinal = 0;
+    const counts: string[] = [];
+    let lagging = false;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      tier1DelaySeconds: 5,
+      script: scheduled({ B: { onFeatures: [[iso(S + 5_000), { kind: "BUY", shares: "10", style: "FAK" }]] } }),
+      beforeEvaluation: (current, input, label) => {
+        if (label === "B" && input.evaluatedAt === iso(S + 11_000)) {
+          counts.push(`${input.callback} (${String(current.loop.health().execution.fillsObserved)} booked): ${counted(current).B}`);
+        }
+      },
+      // The trade reaches the venue after its clock moved past matchableAtNs:
+      // the DELAYED order's disposition is applied by observeTrade's sweep,
+      // and its fill comes back in observeTrade's ANSWER.
+      wrapVenue: (inner, clock): TraderVenue => ({
+        observe: (identity) => inner.observe(identity),
+        observeTrade: (input) => {
+          if (!lagging) return inner.observeTrade(input);
+          clock.positionAt(iso(S + 11_000), 6_000_000_000n);
+          return inner.observeTrade({ ...input, monotonicNs: 6_000_000_000n });
+        },
+        submit: (plan) => inner.submit(plan as Parameters<SimulatedVenue["submit"]>[0]),
+        fillsSince: (sequence) => inner.fillsSince(sequence),
+        orderById: (venueOrderId) => inner.orderById(venueOrderId),
+        orderByPlannedId: (plannedOrderId) => inner.orderByPlannedId(plannedOrderId),
+        acknowledgeTerminal: (venueOrderId) => inner.acknowledgeTerminal(venueOrderId),
+      }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY DELAYED 0/10"]);
+    // observe() runs at 4 s (not yet due); the trade's answer applies it.
+    harness.clock.positionAt(iso(S + 11_000), 4_000_000_000n);
+    lagging = true;
+    await feed(harness, trade(S + 11_000, MARKET_B, "0.3", "5", "ASK"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY FILLED 10/10"]);
+    expect(harness.venue.fills.map((fill) => `${fill.shares}@${fill.price}`)).toEqual(["10@0.34"]);
+    // At B's evaluation of that event — after the trade, BEFORE its harvest
+    // (nothing booked): the FILLED order at its seen 3.40, not its 3.50
+    // limit. Then booked, its fill delivered and its view: 3.40 throughout.
+    expect(counts[0]).toBe("onFeatures (0 booked): 3.4");
+    expect(counts.slice(1).every((entry) => entry.endsWith("(1 booked): 3.4"))).toBe(true);
+    expect(harness.loop.health().execution.fillsObserved).toBe(1);
+    expectInvariant(harness, "after the harvest");
+    expect(harness.halts.records()).toEqual([]);
   });
 });
 
 // ---------------------------------------------------------------------------
 // 3. The seeded property
 // ---------------------------------------------------------------------------
+
+/** Yields to the macrotask queue so a long synchronous stretch never starves the worker (CI-2; `CAP1-R1-GATE-1`). */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
 
 /** `mulberry32`: a small seeded PRNG — deterministic, never a host source. */
 function prng(seed: number): () => number {
@@ -1407,6 +1768,14 @@ interface Coverage {
   worstCaseRefusals: number;
   /** Entries the risk engine admitted, each held under the worst-case limit by the venue's floor. */
   riskAdmissions: number;
+  /**
+   * `CAP-1` r1: evaluations at which a BUY order the venue shows TERMINAL is
+   * still held by the loop (not yet settled): where the cap check judges a
+   * final size the loop has not acted on yet (`CAP1-ASTRA-R1-01`).
+   */
+  terminalUnsettledAtEvaluation: number;
+  /** `CAP-1` r1: risk evaluations presenting a PARTLY FILLED working order (`CAP1-ASTRA-R1-02`). */
+  partlyFilledPresented: number;
 }
 
 /**
@@ -1448,12 +1817,20 @@ function boughtBy(intent: Intent): { readonly cost: string; readonly shares: str
  * venue's floor (`holdingsFloor`), and an admitted entry stays under check
  * 16's limit by that floor.
  *
+ * `CAP-1` r1 (`CAP1-ASTRA-R1-02`, `-03`): and EXACTLY the floor — no more.
+ * Round 0 asserted only the lower bound, so a booked partial fill counted
+ * twice (in the position AND in its order presented whole) and an unbooked
+ * fill priced at its limit both passed. Every fill this property makes is
+ * carried by a venue answer the loop receives (a placement's or a trade's:
+ * Tier 0, no delayed market), so nothing here is priced at a limit it did not
+ * fill at.
+ *
  * - check 16: the evaluating market's lot, less the intent's own leg, holds
- *   at least the floor's cost and shares (its primary measure is that cost);
+ *   exactly the floor's cost and shares (its primary measure is that cost);
  * - check 17: every scenario that marks the lot measures, less the intent's
- *   own loss, at least the floor's loss under the same mark (`cost − shares ×
- *   mark`; the harness's marks never exceed a limit price, so a resting
- *   order's over-count cannot hide an undercount here);
+ *   own loss, exactly the floor's loss under the same mark (`cost − shares ×
+ *   mark`) — the evaluation reports the with-unbooked assessment, which counts
+ *   an unbooked fill exactly as booked;
  * - an APPROVED entry: floor + its bounded cost ≤ `maxWorstCaseContractualLoss`.
  */
 function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worstCaseLimit: string, coverage: Coverage, where: string): void {
@@ -1474,6 +1851,9 @@ function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worst
   expect(countedShares, `${where}: check 16 counts ${countedShares} of the floor's ${floor.shares} shares`).toSatisfy(
     (value: string) => compareDecimal(value, floor.shares) >= 0,
   );
+  // r1: exactly — no share counted twice, no fill above its own price.
+  expect(countedCost, `${where}: check 16 counts the floor's cost exactly`).toBe(floor.cost);
+  expect(countedShares, `${where}: check 16 counts the floor's shares exactly`).toBe(floor.shares);
   for (const outcome of risk.evaluation.scenario?.outcomes ?? []) {
     if (outcome.unmarkedMarketIds.length > 0) continue;
     const mark = risk.document.scenarios
@@ -1486,6 +1866,7 @@ function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worst
     expect(countedLoss, `${where}: check 17 (${outcome.scenarioId}) measures ${countedLoss} of the floor's ${floorLoss}`).toSatisfy(
       (value: string) => compareDecimal(value, floorLoss) >= 0,
     );
+    expect(countedLoss, `${where}: check 17 (${outcome.scenarioId}) measures the floor's loss exactly`).toBe(floorLoss);
   }
   if (risk.evaluation.refusals.some((refusal) => refusal.code === "RISK_WORST_CASE_LOSS_EXCEEDED")) coverage.worstCaseRefusals += 1;
   if (risk.evaluation.approved && risk.context.intent.type !== "CANCEL") {
@@ -1571,6 +1952,10 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
       script: tracking,
       onRisk: (current, risk) => {
         expectRiskFloor(current, risk, worstCaseLimit, coverage, `seed ${String(seed)} at ${risk.label}'s risk check at ${risk.context.evaluatedAt}`);
+        const presented = new Set(risk.context.openOrders.map((open) => open.orderId));
+        if (current.venue.ordersSnapshot().some((order) => presented.has(order.simulatedOrderId) && compareDecimal(order.filledShares, "0") > 0)) {
+          coverage.partlyFilledPresented += 1;
+        }
       },
       beforeEvaluation: (current, input) => {
         coverage.evaluationsChecked += 1;
@@ -1592,6 +1977,13 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
         let filled = "0";
         for (const fill of current.venue.fills) filled = addDecimal(filled, fill.shares);
         if (compareDecimal(filled, held) > 0) coverage.unbookedFillsAtEvaluation += 1;
+        if (
+          current.venue
+            .ordersSnapshot()
+            .some((order) => order.action === "BUY" && TERMINAL.has(order.state) && current.loop.timeInForceFor(order.plannedOrderId) !== undefined)
+        ) {
+          coverage.terminalUnsettledAtEvaluation += 1;
+        }
         expectInvariant(current, `seed ${String(seed)} before ${input.callback} at ${input.evaluatedAt}`);
       },
     });
@@ -1670,7 +2062,7 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
   expect(harness.halts.records(), `seed ${String(seed)}: no halt`).toEqual([]);
 }
 
-describe("CAP-1 property — over random fills, partial fills, cancels, onFill and onOrderUpdate placements, carried and ordinary harvests and restarts, the cap check counts every committed pUSD exactly once, at every evaluation; and (r0) risk checks 16 and 17 count at least the venue's floor at every risk evaluation", () => {
+describe("CAP-1 property — over random fills, partial fills, cancels, onFill and onOrderUpdate placements, carried and ordinary harvests and restarts, the cap check counts every committed pUSD exactly once, at every evaluation; and (r0, r1) risk checks 16 and 17 count exactly the venue's floor at every risk evaluation", () => {
   it("holds for 60 seeds at the PAPER cadence and 30 at the per-frame cadence, and every listed path occurs", async () => {
     const coverage: Coverage = {
       evaluationsChecked: 0,
@@ -1690,9 +2082,20 @@ describe("CAP-1 property — over random fills, partial fills, cancels, onFill a
       scenarioOutcomesChecked: 0,
       worstCaseRefusals: 0,
       riskAdmissions: 0,
+      terminalUnsettledAtEvaluation: 0,
+      partlyFilledPresented: 0,
     };
-    for (let seed = 1; seed <= 60; seed += 1) await propertyRun(seed, PAPER_EVALUATION_CADENCE, 40, coverage);
-    for (let seed = 1_001; seed <= 1_030; seed += 1) await propertyRun(seed, PER_FRAME, 40, coverage);
+    // `CAP1-R1-GATE-1`: one MACROTASK turn per seed (CI-2's helper). A run of
+    // ~50-70 s that never yields starves the worker's RPC with vitest, which
+    // then exits 1 ("Timeout calling onTaskUpdate") with every test passed.
+    for (let seed = 1; seed <= 60; seed += 1) {
+      await propertyRun(seed, PAPER_EVALUATION_CADENCE, 40, coverage);
+      await yieldToEventLoop();
+    }
+    for (let seed = 1_001; seed <= 1_030; seed += 1) {
+      await propertyRun(seed, PER_FRAME, 40, coverage);
+      await yieldToEventLoop();
+    }
     // Non-vacuity: every path the packet lists occurred, and the cap bound.
     for (const [path, count] of Object.entries(coverage)) expect(count, path).toBeGreaterThan(0);
   }, 300_000);

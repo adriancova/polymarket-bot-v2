@@ -150,6 +150,19 @@ export type PortfolioView = z.infer<typeof PortfolioViewSchema>;
  * also states, at its limit, the remainder of a BUY its portfolio view does not
  * present (an order no instance owns, or one the venue cannot show), because
  * the lot builder counts any resting BUY as if it had filled.
+ *
+ * DISJOINT FROM THE OTHER TWO VIEWS (`CAP-1` r1). The lot builder ADDS
+ * positions, these entries and open orders, so a share in two of them is
+ * counted twice. `packages/trading-core` therefore presents a working order in
+ * `openOrders` at its UNFILLED remainder only: its booked fills are positions,
+ * and its filled-but-unbooked shares are entries here.
+ *
+ * BUY-ONLY, AND NOT FAIL-CLOSED FOR AN UNBOOKED SELL (an open item,
+ * `CAP1-OPUS-OBS-1`). A sale the ledger has not booked yet leaves its shares
+ * in the booked position. That over-counts check 16's primary measure (cost),
+ * but credits those shares' value to check 17's scenario loss and to check
+ * 16's resolution limit. When the mark exceeds their cost, both can then admit
+ * what the booked account refuses. This input does not carry sales.
  */
 export const UnbookedFillExposureSchema = z.strictObject({
   marketId: InternalMarketIdSchema,

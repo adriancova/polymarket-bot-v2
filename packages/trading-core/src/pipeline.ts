@@ -252,7 +252,9 @@ export interface RiskInputContext {
   /**
    * `CAP-1` (orchestrator ruling, 2026-10-04): the strategy's
    * filled-but-unbooked BUY exposure — a fill the venue made that no position
-   * carries yet, of an order `openOrders` no longer presents. REQUIRED, so no
+   * carries yet. Since `CAP-1` r1 that includes the filled shares of a WORKING
+   * order, which `openOrders` presents at its unfilled remainder only, so the
+   * three views are disjoint. REQUIRED, so no
    * caller can forget it, and always emitted (an empty list included): the
    * risk engine reads an absent list as "none", which is the measure before
    * `CAP-1`. It is NOT a position (no exit may sell it, §6 invariant 10) and
