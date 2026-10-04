@@ -176,7 +176,7 @@ export interface ResumeRefusedEvent {
 }
 
 /** What one evidence record is about (see {@link EvidenceRecordedEvent}). */
-export const EVIDENCE_KINDS = ["ORDER", "LEG", "TRADE", "UNKEYED_LEG", "SETTLED"] as const;
+export const EVIDENCE_KINDS = ["ORDER", "LEG", "TRADE", "UNKEYED_LEG", "ORPHAN_LEG", "UNKEYED_ORDER", "UNKEYED_TRADE", "HOLDING", "MEMBER", "SETTLED"] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 
 /**
@@ -208,6 +208,22 @@ export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
  * - `SETTLED`: a SOUND run classified the venue order consistently with all of its evidence, up to `level` (the
  *   number of informative records about it then), or an operator released its not-found quarantine. It stops the
  *   order being read by id until new evidence about it arrives.
+ *
+ * (WP-290 r11, the class fix at the coordinator's door layer) Every fragment a door validated reaches the evidence,
+ * and every fragment present but unreadable is an explicit UNREADABLE obligation (`unreadable`: the names of the
+ * fields the observation carried but could not read):
+ * - `ORDER` and `LEG` may be NAMED with every fragment of a row that did not validate in full (its sizes, status,
+ *   fill facts), and `ORDER` from `BY_ID_FOUND` records a by-id answer's `found: true` for the order asked about;
+ * - `UNKEYED_LEG` may also come from a leg with a fact (or its order) unreadable, or from the user stream: no read can
+ *   ever answer those (`venueOrderId` is `null` when the order id was unreadable too);
+ * - `ORPHAN_LEG`: an own leg shown under a readable trade id (`venueTradeId`) whose order id was unreadable;
+ * - `UNKEYED_ORDER`: an order row whose order id was unreadable; `UNKEYED_TRADE`: a trade row whose trade id was
+ *   unreadable and that carried no own leg the door could keep, or a user-stream entry that could not be read;
+ * - `HOLDING`: a position, the collateral balance or an approval an answer showed (`subject`, `value`: detail only);
+ * - `MEMBER`: what one read of a wallet member, by name (`subject`), showed (`status`: its state, `value`: the amount
+ *   credited, `transactionHash`).
+ * A record written before r11 carries none of `unreadable`, `transactionHash`, `subject` and `value`; it is read with
+ * them empty.
  */
 export interface EvidenceRecordedEvent {
   readonly kind: "EVIDENCE_RECORDED";
@@ -238,6 +254,14 @@ export interface EvidenceRecordedEvent {
   readonly feeAssetId: string | null;
   readonly role: "MAKER" | "TAKER" | null;
   readonly matchedAt: string | null;
+  /** (r11) The names of the fields the observation carried but could not read, sorted (empty: none). */
+  readonly unreadable: readonly string[];
+  /** (r11) A trade's, a leg's or a member's transaction hash, as read. */
+  readonly transactionHash: string | null;
+  /** (r11) A `HOLDING`'s key (a token, an asset, a spender); a `MEMBER`'s member. */
+  readonly subject: string | null;
+  /** (r11) A `HOLDING`'s value; a `MEMBER`'s amount credited; a trade row's ownership flag (`DETERMINED`, `UNDETERMINED`). */
+  readonly value: string | null;
   readonly atMs: number;
 }
 
@@ -368,6 +392,10 @@ function isDecimal(value: unknown): value is string {
   return isCanonicalDecimalString(value);
 }
 
+function isPositiveDecimal(value: unknown): value is string {
+  return isCanonicalDecimalString(value, { range: "POSITIVE" });
+}
+
 function isTrigger(value: unknown): value is ReconciliationTrigger {
   return typeof value === "string" && (RECONCILIATION_TRIGGERS as readonly string[]).includes(value);
 }
@@ -437,6 +465,186 @@ const TOKEN_ID = /^(?:0|[1-9][0-9]{0,199})$/u;
 /** An ISO-8601 instant with an offset (a trade leg's match time, as the coordinator's door reads it). */
 const INSTANT = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/u;
 
+/** (r11) The fields an evidence record written from r11 on carries beyond the r10 ones. */
+const EVIDENCE_R11_KEYS = ["unreadable", "transactionHash", "subject", "value"] as const;
+
+/**
+ * (r11) Every name an evidence record's `unreadable` list may carry: the coordinator's door vocabularies (WP-290's
+ * `door.ts`: an order row's, a trade leg's, a trade row's, a holding's, a wallet member's and a user-stream item's
+ * fields, and an answer's own fields). Mirrored there; a name outside it is refused.
+ */
+const UNREADABLE_FIELD_NAMES: ReadonlySet<string> = new Set([
+  "approved",
+  "approvals",
+  "assetId",
+  "balance",
+  "complete",
+  "credited",
+  "entry",
+  "feeAmount",
+  "feeAssetId",
+  "fills",
+  "found",
+  "kind",
+  "liquidityRole",
+  "matchedAt",
+  "observation",
+  "oms",
+  "order",
+  "orders",
+  "originalSize",
+  "ownLegs",
+  "ownershipUndetermined",
+  "positions",
+  "price",
+  "role",
+  "route",
+  "settlements",
+  "shares",
+  "side",
+  "size",
+  "sizeMatched",
+  "source",
+  "spender",
+  "state",
+  "status",
+  "tokenId",
+  "trades",
+  "transactionHash",
+  "venueOrderId",
+  "venueTradeId",
+]);
+
+function isUnreadableNames(value: unknown): value is readonly string[] {
+  if (!Array.isArray(value) || value.length > 64) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const name: unknown = value[index];
+    if (typeof name !== "string" || !UNREADABLE_FIELD_NAMES.has(name)) return false;
+    if (index > 0 && !((value[index - 1] as string) < name)) return false;
+  }
+  return true;
+}
+
+/** (r11) The kind each source introduced in r11 belongs to, and only to (the coordinator's door checks the same). */
+const SOURCE_KIND: Readonly<Record<string, EvidenceKind>> = Object.freeze({
+  TRADES_LEG_UNKEYED_FRAGMENTS: "UNKEYED_LEG",
+  TRADES_LEG_FRAGMENTS: "LEG",
+  TRADES_LEG_ORPHAN: "ORPHAN_LEG",
+  TRADES_ROW_UNKEYED: "UNKEYED_TRADE",
+  OPEN_ORDERS_UNKEYED: "UNKEYED_ORDER",
+  BY_ID_UNKEYED: "UNKEYED_ORDER",
+  BY_ID_FOUND: "ORDER",
+  STREAM_ORDER_UNKEYED: "UNKEYED_ORDER",
+  STREAM_FILL_ORPHAN: "ORPHAN_LEG",
+  STREAM_FILL_UNKEYED: "UNKEYED_LEG",
+  STREAM_SETTLEMENT_ORPHAN: "ORPHAN_LEG",
+  STREAM_SETTLEMENT_UNKEYED: "UNKEYED_LEG",
+  STREAM_UNREADABLE: "UNKEYED_TRADE",
+  POSITIONS: "HOLDING",
+  COLLATERAL: "HOLDING",
+  APPROVALS: "HOLDING",
+  WALLET_MEMBER: "MEMBER",
+});
+const NEW_KINDS: readonly EvidenceKind[] = ["ORPHAN_LEG", "UNKEYED_ORDER", "UNKEYED_TRADE", "HOLDING", "MEMBER"];
+/** (r9) The sources of a TRADE record. */
+const TRADE_SOURCES: readonly string[] = ["TRADES_ROW", "TRADES_ROW_PARTIAL", "TRADES_ROW_ID"];
+
+/**
+ * Whether an evidence record's fields fit its kind (the coordinator's door, `evidence.ts`'s `readEvidenceRecord`,
+ * checks the same): which ids it names, which facts it may carry, which sources it comes from.
+ */
+function evidenceShape(r: {
+  readonly kind: EvidenceKind;
+  readonly venueOrderId: string | null;
+  readonly venueTradeId: string | null;
+  readonly provenance: EvidenceProvenance;
+  readonly source: string;
+  readonly tokenId: string | null;
+  readonly side: string | null;
+  readonly price: string | null;
+  readonly originalSize: string | null;
+  readonly size: string | null;
+  readonly status: string | null;
+  readonly level: number | null;
+  readonly feeAmount: string | null;
+  readonly feeAssetId: string | null;
+  readonly role: string | null;
+  readonly matchedAt: string | null;
+  readonly unreadable: readonly string[];
+  readonly transactionHash: string | null;
+  readonly subject: string | null;
+  readonly value: string | null;
+}): boolean {
+  const { kind, source } = r;
+  const owner = SOURCE_KIND[source];
+  if (owner !== undefined && owner !== kind) return false;
+  if (NEW_KINDS.includes(kind) && owner !== kind) return false;
+  const namesOrder = kind === "ORDER" || kind === "LEG" || kind === "SETTLED";
+  if (namesOrder && r.venueOrderId === null) return false;
+  if (!namesOrder && kind !== "UNKEYED_LEG" && r.venueOrderId !== null) return false;
+  // A leg, a trade (r9) and an orphan leg (r11) name their trade; nothing else does.
+  if ((kind === "LEG" || kind === "TRADE" || kind === "ORPHAN_LEG") !== (r.venueTradeId !== null)) return false;
+  // Only a settlement and (r10) an unkeyed leg carry a level; an unkeyed leg owes at least one trade.
+  if ((kind === "SETTLED" || kind === "UNKEYED_LEG") !== (r.level !== null)) return false;
+  if (kind === "UNKEYED_LEG" && (r.level as number) < 1) return false;
+  // (r9) A trade comes from a trade row (and only a trade does), SHOWN when the row validated in full.
+  if ((kind === "TRADE") !== TRADE_SOURCES.includes(source)) return false;
+  if (kind === "TRADE" && r.provenance !== (source === "TRADES_ROW_ID" ? "NAMED" : "SHOWN")) return false;
+  // Nothing of an order or a fill on a trade, an unkeyed trade, a holding, a member or a settlement.
+  const economics = kind !== "TRADE" && kind !== "UNKEYED_TRADE" && kind !== "HOLDING" && kind !== "MEMBER" && kind !== "SETTLED";
+  if (!economics && (r.tokenId !== null || r.side !== null || r.price !== null || r.originalSize !== null || r.size !== null)) return false;
+  if (kind !== "ORDER" && kind !== "UNKEYED_ORDER" && r.originalSize !== null) return false;
+  // A leg's fill facts (r7): only a leg, an unkeyed leg (r10) and an orphan leg (r11) carry them.
+  const fill = kind === "LEG" || kind === "UNKEYED_LEG" || kind === "ORPHAN_LEG";
+  if (!fill && (r.feeAmount !== null || r.feeAssetId !== null || r.role !== null || r.matchedAt !== null)) return false;
+  if (kind === "HOLDING" && r.status !== null) return false;
+  if (r.transactionHash !== null && !["LEG", "TRADE", "UNKEYED_TRADE", "UNKEYED_LEG", "ORPHAN_LEG", "MEMBER"].includes(kind)) return false;
+  if (kind === "MEMBER" ? r.subject === null : kind !== "HOLDING" && r.subject !== null) return false;
+  if (r.value !== null) {
+    if (kind === "TRADE" || kind === "UNKEYED_TRADE") {
+      if (r.value !== "DETERMINED" && r.value !== "UNDETERMINED") return false;
+    } else if (kind === "HOLDING") {
+      if (source === "APPROVALS" ? r.value !== "true" && r.value !== "false" : !isDecimal(r.value) || r.value.startsWith("-")) return false;
+    } else if (kind === "MEMBER") {
+      if (!isDecimal(r.value) || r.value.startsWith("-")) return false;
+    } else {
+      return false;
+    }
+  }
+  // (r10) Only an unkeyed leg comes from an answer that was not whole.
+  if (source === "TRADES_LEG_UNKEYED_PARTIAL" && kind !== "UNKEYED_LEG") return false;
+  if (kind === "UNKEYED_LEG") {
+    if (source === "TRADES_LEG_UNKEYED" || source === "TRADES_LEG_UNKEYED_PARTIAL") {
+      // (r10) An unkeyed leg was SHOWN in full: its order, its token and side, its price and shares, its role and match
+      // time (its fee may be unfixed), nothing of it unreadable (r11: but its row's status or hash), nothing of an
+      // order's size.
+      if (
+        r.provenance !== "SHOWN" ||
+        r.venueOrderId === null ||
+        r.unreadable.some((name) => name !== "status" && name !== "transactionHash") ||
+        r.tokenId === null ||
+        r.side === null ||
+        r.price === null ||
+        r.size === null ||
+        !isPositiveDecimal(r.size) ||
+        r.role === null ||
+        r.matchedAt === null
+      ) {
+        return false;
+      }
+    } else if (owner !== "UNKEYED_LEG") {
+      return false;
+    } else if (r.provenance !== (source.startsWith("STREAM_") ? "NAMED" : "SHOWN")) {
+      return false;
+    }
+  }
+  if ((kind === "ORPHAN_LEG" || kind === "UNKEYED_ORDER" || kind === "UNKEYED_TRADE") && r.provenance !== "NAMED") return false;
+  if ((kind === "UNKEYED_ORDER" || kind === "UNKEYED_TRADE") && r.venueTradeId !== null) return false;
+  if ((kind === "HOLDING" || kind === "MEMBER") && r.provenance !== (r.unreadable.length === 0 ? "SHOWN" : "NAMED")) return false;
+  if (kind === "ORDER" && source === "BY_ID_FOUND" && (r.provenance !== "NAMED" || r.tokenId !== null || r.size !== null || r.status !== null || r.unreadable.length > 0)) return false;
+  return true;
+}
+
 /** The shape of an evidence record's fields (see {@link EvidenceRecordedEvent}); `undefined` when any is out of its domain. */
 function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | undefined {
   const runId = field(record, "runId");
@@ -456,25 +664,45 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
   const feeAssetId = field(record, "feeAssetId");
   const role = field(record, "role");
   const matchedAt = field(record, "matchedAt");
+  const unreadableField = field(record, "unreadable");
+  const transactionHashField = field(record, "transactionHash");
+  const subjectField = field(record, "subject");
+  const valueField = field(record, "value");
+  const unreadable = unreadableField === undefined ? [] : unreadableField;
+  const transactionHash = transactionHashField === undefined ? null : transactionHashField;
+  const subject = subjectField === undefined ? null : subjectField;
+  const value = valueField === undefined ? null : valueField;
   if (!nullable(runId, isUuidV7) || typeof evidenceKind !== "string" || !(EVIDENCE_KINDS as readonly string[]).includes(evidenceKind)) return undefined;
   if (!nullable(venueOrderId, isIdentifier) || !nullable(venueTradeId, isIdentifier)) return undefined;
   if (typeof provenance !== "string" || !(EVIDENCE_PROVENANCES as readonly string[]).includes(provenance) || typeof source !== "string" || !CODE.test(source)) return undefined;
   if (!(tokenId === null || (typeof tokenId === "string" && TOKEN_ID.test(tokenId))) || !(side === null || side === "BUY" || side === "SELL")) return undefined;
   if (!nullable(price, isDecimal) || !nullable(originalSize, isDecimal) || !nullable(size, isDecimal) || !nullable(status, isIdentifier) || !nullable(level, isCount)) return undefined;
-  // A leg and a trade (r9) name their trade; nothing else does. Only a settlement and (r10) an unkeyed leg carry a level.
-  if ((evidenceKind === "LEG" || evidenceKind === "TRADE") !== (venueTradeId !== null) || (evidenceKind === "SETTLED" || evidenceKind === "UNKEYED_LEG") !== (level !== null)) return undefined;
-  // Only a trade (r9) names no order, and it carries its status alone: nothing of an order, and no economics.
-  if ((evidenceKind === "TRADE") !== (venueOrderId === null)) return undefined;
-  if (evidenceKind === "TRADE" && (tokenId !== null || side !== null || price !== null || originalSize !== null || size !== null)) return undefined;
-  // A leg's fill facts (r7): an exact fee, an id for its asset, a role, an instant; only a leg carries them.
   if (!nullable(feeAmount, isDecimal) || !nullable(feeAssetId, isIdentifier) || !(role === null || role === "MAKER" || role === "TAKER")) return undefined;
   if (!(matchedAt === null || (typeof matchedAt === "string" && INSTANT.test(matchedAt)))) return undefined;
-  if (evidenceKind !== "LEG" && evidenceKind !== "UNKEYED_LEG" && (feeAmount !== null || feeAssetId !== null || role !== null || matchedAt !== null)) return undefined;
-  // (r10) An unkeyed leg was SHOWN in full: its order's token and side, its price and shares, its role and match time
-  // (its fee may be unfixed), nothing of an order's size, and at least one trade owed.
+  if (!isUnreadableNames(unreadable) || !nullable(transactionHash, isIdentifier) || !nullable(subject, isIdentifier) || !nullable(value, isIdentifier)) return undefined;
   if (
-    evidenceKind === "UNKEYED_LEG" &&
-    (provenance !== "SHOWN" || tokenId === null || side === null || price === null || size === null || originalSize !== null || role === null || matchedAt === null || level === null || level < 1)
+    !evidenceShape({
+      kind: evidenceKind as EvidenceKind,
+      venueOrderId,
+      venueTradeId,
+      provenance: provenance as EvidenceProvenance,
+      source,
+      tokenId: tokenId as string | null,
+      side: side as string | null,
+      price,
+      originalSize,
+      size,
+      status,
+      level,
+      feeAmount,
+      feeAssetId,
+      role: role as string | null,
+      matchedAt: matchedAt as string | null,
+      unreadable,
+      transactionHash,
+      subject,
+      value,
+    })
   ) {
     return undefined;
   }
@@ -497,6 +725,10 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
     feeAssetId,
     role: role as "MAKER" | "TAKER" | null,
     matchedAt: matchedAt as string | null,
+    unreadable: Object.freeze([...unreadable]),
+    transactionHash,
+    subject,
+    value,
     atMs: at,
   };
 }
@@ -513,7 +745,10 @@ function readEvent(raw: unknown, withSequence: boolean): ReconciliationJournalEv
   const kind = field(record, "kind");
   if (typeof kind !== "string" || !Object.prototype.hasOwnProperty.call(KEYS, kind)) return undefined;
   const keys = KEYS[kind as ReconciliationJournalInput["kind"]];
-  if (!exactKeys(record, withSequence ? [...keys, "sequence"] : keys)) return undefined;
+  const tail = withSequence ? ["sequence"] : [];
+  // (r11) An evidence record carries the four r11 fields, or (written before r11) none of them.
+  const exact = exactKeys(record, [...keys, ...tail]) || (kind === "EVIDENCE_RECORDED" && exactKeys(record, [...keys, ...EVIDENCE_R11_KEYS, ...tail]));
+  if (!exact) return undefined;
   const at = field(record, "atMs");
   if (!isMs(at)) return undefined;
   let event: ReconciliationJournalInput | undefined;

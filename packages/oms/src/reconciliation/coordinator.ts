@@ -50,6 +50,17 @@
  *    is folded into the EVIDENCE STORE and journaled (`EVIDENCE_RECORDED`)
  *    BEFORE anything is classified, whatever the run's soundness. The store
  *    is rebuilt from the journal at every run, so a restart forgets nothing.
+ *    (r11, the class fix at the door layer) Every door reads every field of
+ *    every row on its own first (`door.ts`: salvage is the default path, and
+ *    every outcome carries it), and every door's outcome, whatever its
+ *    usability, goes into the store through ONE recording function
+ *    (`#recordSalvage`): every fragment a door validated is kept, and every
+ *    fragment present but unreadable is an explicit obligation (of its object
+ *    when its id is readable; an `UNKEYED_*` obligation of the account, which
+ *    holds every run, when its identity is not). Holdings and wallet members
+ *    are recorded too; the user stream's items through its own door. (r11,
+ *    WP290-V11-UNKEYED-STATUS-DROPPED) An unkeyed row's settlement status is
+ *    kept per status and decided on: a witness must agree with it.
  *    Then the store's ONE query (`EvidenceStore.judge`) gives a verdict on
  *    every venue order and trade the run read, or has unsettled evidence of
  *    (and, r7 and r8, every trade the evidence holds, whether a read SHOWED
@@ -205,15 +216,15 @@
 
 import { addDecimal, compareDecimal, type DecimalString } from "@polymarket-bot/decimal";
 
-import { compositeKey, isIdentifier, isNonNegativeAmount, isPositiveAmount, isTokenId, isUnitPrice, isUuidV7, readArray, readField, readFields } from "../guards.js";
+import { compositeKey, isIdentifier, isPositiveAmount, isTokenId, isUnitPrice, isUuidV7, readArray, readField, readFields } from "../guards.js";
 import type { AttemptView, OrderView } from "../order-manager.js";
 import { isVenueId } from "../outcomes.js";
 import type { ReconciliationRequester } from "../ports.js";
 import { TERMINAL_ORDER_STATES, type OrderState } from "../states.js";
 
 import {
+  EMPTY_SALVAGE,
   callRead,
-  isIsoInstant,
   readApprovals,
   readCollateral,
   readOkFlag,
@@ -223,31 +234,40 @@ import {
   readProjectedHoldings,
   readRefusalCode,
   readRemainingBookings,
+  readStreamOutput,
   readTrades,
   readWalletMember,
   tradeStatusOf,
-  type NamedOrders,
+  type LegFragments,
   type ProjectedHoldingsRead,
   type ReadOutcome,
-  type Salvage,
-  type SalvagedLeg,
+  type StreamItemFragments,
+  type TradeFragments,
   type WalletMemberRead,
 } from "./door.js";
 import {
   EvidenceStore,
+  holdingRecord,
   legRecord,
+  memberRecord,
   namedOrder,
+  orderFragmentsRecord,
+  orphanLegRecord,
   readEvidenceRecords,
   sameFillOfLegs,
   settledRecord,
   shownOrder,
   tradeRecord,
+  unkeyedFragmentsLegRecord,
   unkeyedLegRecord,
+  unkeyedOrderRecord,
+  unkeyedTradeRecord,
   type EvidenceRecord,
   type LegEvidence,
   type LegFacts,
   type EvidenceProblem,
   type OrderVerdict,
+  type PartialLeg,
   type TradeVerdict,
 } from "./evidence.js";
 import { compareHolding, pendingDeltas } from "./holdings.js";
@@ -611,7 +631,12 @@ export class ReconciliationCoordinator {
   /** A WP-280 `UserStreamOutput`. Requests are taken at once; events are routed to the OMS in order (buffered during a run). */
   onUserStreamOutput(output: unknown): void {
     const kind = readField(output, "kind");
-    if (kind.kind !== "DATA") return;
+    // (r11, the stream door) An output whose kind cannot be read is routed: it is kept as an unreadable entry.
+    if (kind.kind !== "DATA" || typeof kind.value !== "string") {
+      if (this.#running) this.#streamBuffer.push(output);
+      else this.#enqueueStream(output);
+      return;
+    }
     if (kind.value === "RECONCILIATION_REQUESTED") {
       const request = readField(output, "request");
       this.#receiveStreamRequest(request.kind === "DATA" ? request.value : undefined);
@@ -901,33 +926,12 @@ export class ReconciliationCoordinator {
     const open = openCall.ok ? readOpenOrders(openCall.raw) : failed<readonly VenueOrderView[]>();
     const tradesCall = await callRead(() => ports.listTrades());
     const trades = tradesCall.ok ? readTrades(tradesCall.raw) : failed<readonly VenueTradeView[]>();
-    // EVIDENCE (r6, class A): every validated observation of these reads, from every source, folded into the store
-    // at once (and journaled together once the reads end), whatever the answers' completeness. A row or leg that
-    // validated in full SHOWED its order (its matched size, its trade's shares and status included); the id alone of
-    // a malformed row or leg only NAMED it.
-    if (open.kind === "OK") for (const order of open.value) this.#observe(shownOrder(order, "OPEN_ORDERS_LIST"));
-    for (const order of salvageOf(open).rows) this.#observe(shownOrder(order, "OPEN_ORDERS_ROW"));
-    for (const [id, tokenId] of namedIn(open)) if (tokenId === null) this.#observe(namedOrder(id, "OPEN_ORDERS_ID"));
-    // (r9, WP290-CX-R9-01 and WP290-V9-UNFOLDED-TERMINAL) Every trade row's IDENTITY and status too, whatever its legs:
-    // a valid row with no own leg (its ownership undetermined) shows a status as durable as a leg's, and a row that
-    // did not validate in full still names its trade. Whether the row identified the trade's own legs is kept with it.
-    if (trades.kind === "OK") {
-      for (const trade of trades.value) {
-        this.#observe(tradeRecord(trade.venueTradeId, trade.status, trade.ownershipUndetermined ? "TRADES_ROW_PARTIAL" : "TRADES_ROW"));
-        for (const leg of trade.ownLegs) this.#observe(legRecord(trade.venueTradeId, legFacts(leg), trade.status, "SHOWN", "TRADES_LEG"));
-      }
-    }
-    for (const { venueTradeId, status, shape } of salvageOf(trades).trades) {
-      this.#observe(tradeRecord(venueTradeId, status, shape === "IN_FULL" ? "TRADES_ROW" : shape === "OWNERSHIP_UNDETERMINED" ? "TRADES_ROW_PARTIAL" : "TRADES_ROW_ID"));
-    }
-    // Every leg of an unusable answer that validated in full with its trade's readable id first, so that what the
-    // evidence then holds (this answer's keyed rows included) is what an unkeyed leg is counted against (r10).
-    const salvagedLegs = salvageOf(trades).legs;
-    for (const { venueTradeId, status, leg } of salvagedLegs) {
-      if (venueTradeId !== null) this.#observe(legRecord(venueTradeId, legFacts(leg), status, "SHOWN", "TRADES_LEG_SALVAGED"));
-    }
-    this.#observeUnkeyed(oms, salvagedLegs.filter((entry) => entry.venueTradeId === null), salvageOf(trades).whole === true);
-    for (const [id, tokenId] of namedIn(trades)) if (tokenId === null) this.#observe(namedOrder(id, "TRADES_LEG_ID"));
+    // EVIDENCE (r6, class A; r11, the class fix at the door layer): EVERYTHING these answers showed, whatever their
+    // completeness, folded into the store at once (and journaled together once the reads end) through the ONE
+    // recording function: every row that validated in full SHOWED its object, every row that did not keeps every
+    // fragment it validated, and every fragment present but unreadable is an UNREADABLE obligation.
+    this.#recordSalvage(oms, { door: "open-orders", outcome: open });
+    this.#recordSalvage(oms, { door: "trades", outcome: trades });
     // A venue order id the stream named and the OMS retains (it could not attribute it yet): evidence, only named.
     for (const item of oms.retainedEvidence()) if (isVenueId(item.venueOrderId)) this.#observe(namedOrder(item.venueOrderId, "OMS_RETAINED"));
     // By id (E-14: an order absent from the open-orders list is not proof of cancellation; missing orders are
@@ -958,21 +962,21 @@ export class ReconciliationCoordinator {
       const call = await callRead(() => ports.readOrder(id));
       byId.set(id, call.ok ? readOrderById(call.raw, id) : failed());
     }
-    for (const outcome of byId.values()) {
-      if (outcome.kind === "OK" && outcome.value !== null) this.#observe(shownOrder(outcome.value, "BY_ID"));
-      // (r10, WP290-CX-R10-01) An unusable by-id answer (not found but carrying an order, found unsaid, another order's
-      // row, an invalid row) answers nothing about the order asked about (its read break stands), but what its row
-      // showed is evidence like any unusable answer's: a row that validated in full SHOWED its order, and the id alone
-      // of an invalid one NAMED it, ALWAYS under the id the row itself carries, never the one asked about.
-      for (const order of salvageOf(outcome).rows) this.#observe(shownOrder(order, "BY_ID_ROW"));
-      for (const [id, tokenId] of namedIn(outcome)) if (tokenId === null) this.#observe(namedOrder(id, "BY_ID_ID"));
-    }
+    // (r10, WP290-CX-R10-01; r11) An unusable by-id answer (not found but carrying an order, found unsaid, another
+    // order's row, an invalid row) answers nothing about the order asked about (its read break stands), but what its
+    // row showed is evidence like any unusable answer's, ALWAYS under the id the row itself carries, never the one
+    // asked about; and its `found: true` is the venue's statement that the order asked about exists.
+    for (const [id, outcome] of byId) this.#recordSalvage(oms, { door: "by-id", outcome, asked: id });
     const positionsCall = await callRead(() => ports.readPositions());
     const positions = positionsCall.ok ? readPositions(positionsCall.raw) : failed<ReadonlyMap<string, DecimalString>>();
     const collateralCall = await callRead(() => ports.readCollateral());
     const collateral = collateralCall.ok ? readCollateral(collateralCall.raw, this.#deps.policy.collateralAssetId) : failed<DecimalString>();
     const approvalsCall = await callRead(() => ports.readApprovals());
     const approvals = approvalsCall.ok ? readApprovals(approvalsCall.raw) : failed<ReadonlyMap<string, boolean>>();
+    // (r11) The holdings too: detail only (not monotonic), but nothing an answer showed is lost.
+    this.#recordSalvage(oms, { door: "positions", outcome: positions });
+    this.#recordSalvage(oms, { door: "collateral", outcome: collateral });
+    this.#recordSalvage(oms, { door: "approvals", outcome: approvals });
     const projectedCall = await callRead(() => this.#deps.holdings.projected());
     const projected = projectedCall.ok ? readProjectedHoldings(projectedCall.raw) : failed<ProjectedHoldingsRead>();
     // What the ledger still books of each FAILED fill the trades read shows (r4, WP290-CX-R4-02; ADR-006 §5): the
@@ -986,7 +990,9 @@ export class ReconciliationCoordinator {
         const parsed = parseMember(member);
         if (parsed === null || walletMembers.has(member)) continue;
         const call = await callRead(() => ports.readWalletMember(parsed));
-        walletMembers.set(member, call.ok ? readWalletMember(call.raw) : failed());
+        const outcome = call.ok ? readWalletMember(call.raw) : failed<WalletMemberRead>();
+        walletMembers.set(member, outcome);
+        this.#recordSalvage(oms, { door: "wallet-member", outcome, member });
       }
     }
     return { open, trades, byId, positions, collateral, approvals, projected, bookings, walletMembers };
@@ -1011,6 +1017,17 @@ export class ReconciliationCoordinator {
     if (!run.evidenceReadable) sound(false);
     sound(this.#readProblem(run, "open-orders", reads.open));
     sound(this.#readProblem(run, "trades", reads.trades));
+    // (r11, the class fix) Every account-level UNREADABLE obligation (an order row, a trade row or a leg whose identity
+    // was unreadable; an unreadable user-stream entry): no read can account for it exactly, so it holds the account in
+    // every run (a READ_CONFLICT no run resolves: nothing ever judges its subject consistent).
+    for (const obligation of this.#evidence.accountObligations()) {
+      sound(false);
+      this.#detect(run, {
+        breakClass: "READ_CONFLICT",
+        subjectKey: compositeKey("READ_CONFLICT", "unreadable", String(obligation.ordinal)),
+        detail: obligation.detail,
+      });
+    }
     this.#readProblem(run, "positions", reads.positions);
     this.#readProblem(run, "collateral", reads.collateral);
     this.#readProblem(run, "approvals", reads.approvals);
@@ -2283,6 +2300,28 @@ export class ReconciliationCoordinator {
           });
           continue;
         }
+        // (r11, the class fix) Every observation of this member, an unusable answer's included (its state and amount
+        // validated on their own), must agree: the other terminal state, or another amount credited by a CONFIRMED
+        // member, is a durable contradiction (which is the chain's is unknown): never answered.
+        const held = this.#evidence.memberEvidence(member);
+        const contradiction =
+          held === undefined
+            ? undefined
+            : held.terminals.length > 1
+              ? `observations showed it both ${held.terminals.join(" and ")}`
+              : read.state === "CONFIRMED" && held.credited.length > 1
+                ? `observations showed it credited ${held.credited.join(" and ")}`
+                : undefined;
+        if (contradiction !== undefined) {
+          unanswered += 1;
+          this.#detect(run, {
+            breakClass: "READ_CONFLICT",
+            subjectKey: compositeKey("READ_CONFLICT", "wallet-member", member),
+            walletOperationId: isUuidV7(request.walletOperationId) ? request.walletOperationId : null,
+            detail: `wallet operation ${request.walletOperationId}: member ${member}: ${contradiction}: which is the chain's is unknown, so it is not answered`,
+          });
+          continue;
+        }
         if (parsed.kind === "HASH" && read.transactionHash !== null && read.transactionHash !== parsed.value) {
           unanswered += 1;
           this.#detect(run, {
@@ -2457,42 +2496,41 @@ export class ReconciliationCoordinator {
    * journaled at once, so neither a later lagging read, nor a restart, nor an OMS reopened and bound again forgets it.
    * Each such item triggers a run. Evidence the OMS applied is the OMS's own durable record (its fills, settlements
    * and states).
+   *
+   * (r11, the stream door) The output is read once (`door.ts`, `readStreamOutput`): every item of every list is routed,
+   * whatever its siblings (a list one entry of which is not own data no longer drops the others), and every item the
+   * OMS did not apply keeps EVERY fragment it validated (`#streamRecords`): an item whose shares are inexact still
+   * names its trade and order. Every entry or list present but unreadable is an UNREADABLE obligation of the account.
    */
   async #routeStream(output: unknown): Promise<void> {
-    const kind = readField(output, "kind");
-    const projection = readField(output, "oms");
-    if (kind.kind !== "DATA" || projection.kind !== "DATA") {
+    const read = readStreamOutput(output);
+    const atMs = (): number => Math.max(this.#lastClock, 0);
+    if (read.kind === null && read.unreadable.length === 0) {
       this.trigger("POSITION_BALANCE_DISCREPANCY");
       return;
     }
-    const items: { readonly apply: (oms: ReconciledOms) => Promise<unknown>; readonly evidence: EvidenceRecord | undefined }[] = [];
-    if (kind.value === "ORDER") {
-      const observation = readField(projection.value, "observation");
-      if (observation.kind === "DATA" && observation.value !== null) {
-        items.push({ apply: (oms) => oms.applyOrderObservation(observation.value), evidence: streamEvidence("ORDER", observation.value) });
-      }
-    } else {
-      const fills = readField(projection.value, "fills");
-      const settlements = readField(projection.value, "settlements");
-      for (const fill of (fills.kind === "DATA" ? readArray(fills.value, 1000) : undefined) ?? []) items.push({ apply: (oms) => oms.recordFill(fill), evidence: streamEvidence("FILL", fill) });
-      for (const settlement of (settlements.kind === "DATA" ? readArray(settlements.value, 1000) : undefined) ?? []) {
-        items.push({ apply: (oms) => oms.applySettlement(settlement), evidence: streamEvidence("SETTLEMENT", settlement) });
-      }
-    }
     const oms = this.#oms;
-    let unapplied = oms === null;
-    for (const item of items) {
+    let unapplied = oms === null || read.unreadable.length > 0;
+    for (const entry of read.unreadable) {
+      const record =
+        entry.kind === "ORDER"
+          ? unkeyedOrderRecord({ venueOrderId: null, tokenId: null, side: null, price: null, originalSize: null, sizeMatched: null, status: null, unreadable: [] }, "STREAM_ORDER_UNKEYED")
+          : unkeyedTradeRecord({ status: null, transactionHash: null, ownershipUndetermined: null, unreadable: [entry.field] }, "STREAM_UNREADABLE");
+      await this.#recordEvidenceNow(null, record, atMs());
+    }
+    for (const item of read.items) {
       let result: unknown;
       if (oms !== null) {
         try {
-          result = await item.apply(oms);
+          result =
+            item.fragments.kind === "ORDER" ? await oms.applyOrderObservation(item.raw) : item.fragments.kind === "FILL" ? await oms.recordFill(item.raw) : await oms.applySettlement(item.raw);
         } catch {
           result = undefined;
         }
         if (readOkFlag(result)) continue;
       }
       unapplied = true;
-      if (item.evidence !== undefined) await this.#recordEvidenceNow(null, item.evidence, Math.max(this.#lastClock, 0));
+      for (const record of streamRecords(item.fragments)) await this.#recordEvidenceNow(null, record, atMs());
     }
     if (unapplied) this.trigger("POSITION_BALANCE_DISCREPANCY");
   }
@@ -3251,37 +3289,167 @@ export class ReconciliationCoordinator {
   }
 
   /**
-   * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED) The own legs of one unusable trades answer that validated in full in a row
-   * whose trade id was unreadable. An unkeyed row may be any trade already known on its order, or a new one: fail
-   * closed, it is a new one. So, after this answer's keyed rows were folded:
-   * - each distinct fill (an order and every fill fact) is an obligation (`UNKEYED_LEG`, with how many such legs this
-   *   answer showed): the reads owe that many distinct trades of exactly those facts on the order, shown by a readable
-   *   id, beyond every trade the evidence holds now (this answer's other rows included: they are folded first). When
-   *   the answer was not WHOLE (`door.ts`: partial, or a row of it not identified), a trade it left out could stand in
-   *   for the unkeyed one, so the obligation can never be met (`TRADES_LEG_UNKEYED_PARTIAL`: fail closed);
-   * - each order's matched size is bounded from below (`TRADES_LEG_UNKEYED`) by the shares of every trade known on it
-   *   (the evidence's legs, and the OMS's fills of a tracked order, which the evidence may not hold: a fill the stream
-   *   delivered), PLUS this answer's unkeyed legs' shares. The order's matched size alone is not enough: a leg no
-   *   larger than what the order already showed would add nothing to it.
+   * THE ONE RECORDING FUNCTION (r11, the class fix at the door layer). Every door's outcome, whatever its usability,
+   * goes into the evidence store through here, and nowhere else: its `salvage` (`door.ts`: every row of the answer as
+   * fragments, required on every outcome) becomes evidence records, folded now and journaled with the run's others:
+   * - an ORDER row (open orders, by id): in full, SHOWN (`OPEN_ORDERS_LIST` from a usable list, `OPEN_ORDERS_ROW`,
+   *   `BY_ID`, `BY_ID_ROW`); its id readable but not in full, NAMED with every fragment it validated
+   *   (`OPEN_ORDERS_ID`, `BY_ID_ID`: the order is then read by id until a sound run reads it in full); its id
+   *   unreadable, an `UNKEYED_ORDER` obligation (`OPEN_ORDERS_UNKEYED`, `BY_ID_UNKEYED`). A by-id answer's
+   *   `found: true` is kept for the order asked about (`BY_ID_FOUND`). Never relabelled (r10);
+   * - a TRADE row: its identity and status (r9), its every own leg (`#recordTradeRows`);
+   * - a position, the collateral, an approval: a `HOLDING` record (detail only: not monotonic);
+   * - a wallet member: a `MEMBER` record, under the member read by name.
+   * The answer's own unreadable fields (`salvage.envelope`) are the read's own break (`#readProblem`).
    */
-  #observeUnkeyed(oms: ReconciledOms, entries: readonly SalvagedLeg[], whole: boolean): void {
-    const fills: { readonly leg: VenueTradeLeg; readonly status: string | null; count: number }[] = [];
-    const unkeyedShares = new Map<string, { readonly leg: VenueTradeLeg; shares: DecimalString }>();
-    for (const { status, leg } of entries) {
-      const same = fills.find((fill) => fill.leg.venueOrderId === leg.venueOrderId && sameFillOfLegs(fill.leg, leg));
-      if (same === undefined) fills.push({ leg, status, count: 1 });
-      else same.count += 1;
-      const total = unkeyedShares.get(leg.venueOrderId);
-      if (total === undefined) unkeyedShares.set(leg.venueOrderId, { leg, shares: leg.shares });
-      else total.shares = addDecimal(total.shares, leg.shares);
+  #recordSalvage(
+    oms: ReconciledOms,
+    read:
+      | { readonly door: "open-orders" | "trades" | "positions" | "collateral" | "approvals"; readonly outcome: ReadOutcome<unknown> }
+      | { readonly door: "by-id"; readonly outcome: ReadOutcome<unknown>; readonly asked: string }
+      | { readonly door: "wallet-member"; readonly outcome: ReadOutcome<unknown>; readonly member: string },
+  ): void {
+    const { salvage } = read.outcome;
+    const usable = read.outcome.kind === "OK";
+    switch (read.door) {
+      case "open-orders":
+      case "by-id": {
+        const shown = read.door === "open-orders" ? (usable ? "OPEN_ORDERS_LIST" : "OPEN_ORDERS_ROW") : usable ? "BY_ID" : "BY_ID_ROW";
+        for (const row of salvage.orders) {
+          if (row.inFull !== null) this.#observe(shownOrder(row.inFull, shown));
+          else if (row.venueOrderId !== null) this.#observe(orderFragmentsRecord(row, read.door === "open-orders" ? "OPEN_ORDERS_ID" : "BY_ID_ID"));
+          else this.#observe(unkeyedOrderRecord(row, read.door === "open-orders" ? "OPEN_ORDERS_UNKEYED" : "BY_ID_UNKEYED"));
+        }
+        // (r11) `found: true` in an unusable answer: the order asked about exists (a usable one SHOWED it), unless the
+        // row it carries names another readable id (then the flag may be that row's: kept under that id, never relabelled).
+        const row = salvage.orders[0];
+        if (read.door === "by-id" && !usable && salvage.found === true && (row === undefined || row.venueOrderId === null || row.venueOrderId === read.asked)) {
+          this.#observe(namedOrder(read.asked, "BY_ID_FOUND"));
+        }
+        return;
+      }
+      case "trades":
+        this.#recordTradeRows(oms, salvage.trades, usable, salvage.whole);
+        return;
+      case "positions":
+      case "collateral":
+      case "approvals":
+        for (const holding of salvage.holdings) this.#observe(holdingRecord(holding));
+        return;
+      case "wallet-member":
+        for (const member of salvage.members) this.#observe(memberRecord(read.member, member));
+        return;
     }
-    for (const [venueOrderId, { leg, shares }] of unkeyedShares) {
+  }
+
+  /**
+   * Every row of one trades answer (r6, r9, r10, r11), in this order, so that what the evidence holds when an unkeyed
+   * leg is folded includes the answer's own keyed rows (r10):
+   * 1. each row whose trade id is readable: a TRADE record (its identity, status, hash and ownership flag; r9);
+   * 2. each own leg of such a row on a readable order: in full, SHOWN (`TRADES_LEG` from a usable answer,
+   *    `TRADES_LEG_SALVAGED`); not in full, NAMED with every fact it validated (`TRADES_LEG_FRAGMENTS`);
+   * 3. each own leg of such a row whose order id was unreadable: an `ORPHAN_LEG` of the trade;
+   * 4. the rows whose trade id was unreadable (`#observeUnkeyed`).
+   */
+  #recordTradeRows(oms: ReconciledOms, rows: readonly TradeFragments[], usable: boolean, whole: boolean): void {
+    const keyed = rows.filter((row) => row.venueTradeId !== null);
+    for (const row of keyed) {
+      const source = row.inFull === null ? "TRADES_ROW_ID" : row.inFull.ownershipUndetermined ? "TRADES_ROW_PARTIAL" : "TRADES_ROW";
+      this.#observe(tradeRecord(row.venueTradeId as string, row.status, source, { transactionHash: row.transactionHash, ownershipUndetermined: row.ownershipUndetermined, unreadable: row.unreadable }));
+    }
+    for (const row of keyed) {
+      const tradeId = row.venueTradeId as string;
+      for (const leg of row.legs) {
+        if (leg.venueOrderId === null) continue;
+        if (leg.inFull !== null) this.#observe(legRecord(tradeId, legFacts(leg.inFull), row.status, "SHOWN", usable ? "TRADES_LEG" : "TRADES_LEG_SALVAGED"));
+        else this.#observe(legRecord(tradeId, { ...partialLeg(leg), venueOrderId: leg.venueOrderId }, row.status, "NAMED", "TRADES_LEG_FRAGMENTS", leg.unreadable));
+      }
+    }
+    for (const row of keyed) {
+      for (const leg of row.legs) if (leg.venueOrderId === null) this.#observe(orphanLegRecord(row.venueTradeId as string, partialLeg(leg), row.status, "TRADES_LEG_ORPHAN", row.transactionHash));
+    }
+    this.#observeUnkeyed(
+      oms,
+      rows.filter((row) => row.venueTradeId === null),
+      whole,
+    );
+  }
+
+  /**
+   * (r10, WP290-V10-UNKEYED-LEG-DISCHARGED; r11, WP290-V11-UNKEYED-STATUS-DROPPED and the class fix) The rows of one
+   * trades answer whose trade id was unreadable. An unkeyed row may be any trade already known on its order, or a new
+   * one: fail closed, it is a new one. So, after this answer's keyed rows were folded:
+   * - each own leg that validated in full on a readable order is grouped by order and exact fill facts; each group is
+   *   an obligation recorded ONCE PER SETTLEMENT STATUS its rows showed (`UNKEYED_LEG`, each with the group's whole
+   *   count): the reads owe that many distinct trades of exactly those facts on the order, shown by a readable id,
+   *   beyond every trade the evidence holds now (this answer's other rows included: they are folded first), EVERY one
+   *   of which agrees with EVERY status (`evidence.ts`, `settlementAgrees`). No status is dropped by the grouping, and
+   *   each is journaled and replayed. When the answer was not WHOLE (`door.ts`), a trade it left out could stand in for
+   *   the unkeyed one, so the obligation can never be met (`TRADES_LEG_UNKEYED_PARTIAL`: fail closed);
+   * - each own leg that did not validate in full (or whose order id was unreadable) is an obligation no read can meet
+   *   (`TRADES_LEG_UNKEYED_FRAGMENTS`): on its order when readable, on the account otherwise;
+   * - a row with no own leg at all (its list empty or unreadable) is an `UNKEYED_TRADE` obligation of the account;
+   * - each readable order's matched size is bounded from below (`TRADES_LEG_UNKEYED`) by the shares of every trade known
+   *   on it (the evidence's legs, and the OMS's fills of a tracked order, which the evidence may not hold: a fill the
+   *   stream delivered), PLUS this answer's unkeyed legs' readable shares. The order's matched size alone is not
+   *   enough: a leg no larger than what the order already showed would add nothing to it.
+   */
+  #observeUnkeyed(oms: ReconciledOms, rows: readonly TradeFragments[], whole: boolean): void {
+    type RowFacts = { readonly status: string | null; readonly hash: string | null; readonly unreadable: readonly ("status" | "transactionHash")[] };
+    const groups: { readonly leg: VenueTradeLeg; count: number; readonly statuses: RowFacts[] }[] = [];
+    const bounds = new Map<string, { tokenId: string | null; side: "BUY" | "SELL" | null; shares: DecimalString; shown: boolean }>();
+    const fragments: { readonly leg: LegFragments; readonly row: TradeFragments }[] = [];
+    for (const row of rows) {
+      if (row.legs.length === 0) {
+        this.#observe(unkeyedTradeRecord({ status: row.status, transactionHash: row.transactionHash, ownershipUndetermined: row.ownershipUndetermined, unreadable: [...row.unreadable] }, "TRADES_ROW_UNKEYED"));
+        continue;
+      }
+      for (const leg of row.legs) {
+        if (leg.venueOrderId !== null && leg.shares !== null) {
+          const bound = bounds.get(leg.venueOrderId);
+          if (bound === undefined) bounds.set(leg.venueOrderId, { tokenId: leg.tokenId, side: leg.side, shares: leg.shares, shown: leg.inFull !== null });
+          else {
+            bound.shares = addDecimal(bound.shares, leg.shares);
+            bound.tokenId ??= leg.tokenId;
+            bound.side ??= leg.side;
+            bound.shown ||= leg.inFull !== null;
+          }
+        }
+        if (leg.inFull === null) {
+          fragments.push({ leg, row });
+          continue;
+        }
+        const full = leg.inFull;
+        const same = groups.find((group) => group.leg.venueOrderId === full.venueOrderId && sameFillOfLegs(group.leg, full));
+        // The row's own fragments: its status and hash as read, and which of them were unreadable (named, r11).
+        const entry: RowFacts = { status: row.status, hash: row.transactionHash, unreadable: row.unreadable.filter((name): name is "status" | "transactionHash" => name === "status" || name === "transactionHash") };
+        if (same === undefined) groups.push({ leg: full, count: 1, statuses: [entry] });
+        else {
+          same.count += 1;
+          same.statuses.push(entry);
+        }
+      }
+    }
+    for (const [venueOrderId, bound] of bounds) {
       const known = this.#evidence.order(venueOrderId)?.legSum ?? "0";
       const filled = oms.orders().find((order) => order.venueOrderId === venueOrderId)?.filledShares ?? "0";
-      const atLeast = addDecimal(compareDecimal(filled, known) > 0 ? filled : known, shares);
-      this.#observe(namedOrder(venueOrderId, "TRADES_LEG_UNKEYED", { provenance: "SHOWN", tokenId: leg.tokenId, side: leg.side, size: atLeast }));
+      const atLeast = addDecimal(compareDecimal(filled, known) > 0 ? filled : known, bound.shares);
+      this.#observe(namedOrder(venueOrderId, "TRADES_LEG_UNKEYED", { provenance: bound.shown ? "SHOWN" : "NAMED", tokenId: bound.tokenId, side: bound.side, size: atLeast }));
     }
-    for (const { leg, status, count } of fills) this.#observe(unkeyedLegRecord(leg, status, count, whole));
+    // One record per (fill, status, hash) the rows showed, each with the fill's whole count: no status is dropped.
+    for (const group of groups) {
+      const seen = new Set<string>();
+      for (const { status, hash, unreadable } of group.statuses) {
+        const key = compositeKey(status ?? "\u0000", hash ?? "\u0000", ...unreadable);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        this.#observe(unkeyedLegRecord(group.leg, status, group.count, whole, hash, unreadable));
+      }
+    }
+    for (const { leg, row } of fragments) {
+      const rowUnreadable = row.unreadable.filter((name) => name === "status" || name === "transactionHash");
+      this.#observe(unkeyedFragmentsLegRecord({ ...partialLeg(leg), unreadable: [...leg.unreadable, ...rowUnreadable] }, row.status, 1, "TRADES_LEG_UNKEYED_FRAGMENTS", row.transactionHash));
+    }
   }
 
   /**
@@ -3498,14 +3666,20 @@ interface RunReads {
   readonly walletMembers: ReadonlyMap<string, ReadOutcome<WalletMemberRead>>;
 }
 
-/** The ids the rows of an unusable open-orders, trades or (r10) by-id answer carry (`door.ts`); none for any other outcome. */
-function namedIn(outcome: ReadOutcome<unknown>): NamedOrders {
-  return (outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED") && outcome.named !== undefined ? outcome.named : new Map<string, string | null>();
-}
-
-/** The rows and legs of an unusable answer (open orders, trades, r10: by id) that validated in full (`door.ts`); none for any other outcome. */
-function salvageOf(outcome: ReadOutcome<unknown>): Salvage {
-  return (outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED") && outcome.salvage !== undefined ? outcome.salvage : { rows: [], legs: [], trades: [] };
+/** (r11) The readable facts of one leg's fragments (`door.ts`), with the names of those that were unreadable. */
+function partialLeg(leg: LegFragments): PartialLeg {
+  return {
+    venueOrderId: leg.venueOrderId,
+    tokenId: leg.tokenId,
+    side: leg.side,
+    shares: leg.shares,
+    price: leg.price,
+    feeAmount: leg.feeAmount,
+    feeAssetId: leg.feeAssetId,
+    role: leg.role,
+    matchedAt: leg.matchedAt,
+    unreadable: leg.unreadable,
+  };
 }
 
 /** A leg's facts as the evidence store records them: every fill fact the read fixed (r7, WP290-CX-R7-02). */
@@ -3524,49 +3698,63 @@ function legFacts(leg: VenueTradeLeg): LegFacts {
 }
 
 /**
- * The evidence one routed user-stream item carries (WP-280's normalized OMS inputs), read at its own door: an
- * observation names a venue order and its status; a fill, the trade, the order, its shares and price; a settlement,
- * the trade, the order and its status. `undefined` when it is out of shape (the OMS refuses it too).
+ * (r11, the stream door) The evidence one routed user-stream item the OMS did not apply carries (WP-280's normalized
+ * OMS inputs, `door.ts`'s fragments): EVERY fragment it validated, never guessed, and the names of those it did not:
+ * - an order observation: its order and status (`STREAM_ORDER`); its order id unreadable, an `UNKEYED_ORDER`;
+ * - a fill: its trade, order, shares, price, fee, fee asset, role and match time (`STREAM_FILL`); a settlement: its
+ *   trade, order and status (`STREAM_SETTLEMENT`). Its order id unreadable: an `ORPHAN_LEG` of the trade. Its trade id
+ *   unreadable: an `UNKEYED_LEG` no read can answer (the stream is not an answer that shows every trade).
  */
-function streamEvidence(kind: "ORDER" | "FILL" | "SETTLEMENT", raw: unknown): EvidenceRecord | undefined {
-  if (kind === "ORDER") {
-    const fields = readFields(raw, ["venueOrderId", "status"]);
-    if (fields === undefined || !isVenueId(fields.venueOrderId)) return undefined;
-    return namedOrder(fields.venueOrderId, "STREAM_ORDER", { status: isIdentifier(fields.status) ? fields.status : null });
+function streamRecords(item: StreamItemFragments): readonly EvidenceRecord[] {
+  if (item.kind === "ORDER") {
+    if (item.venueOrderId !== null) return [namedOrder(item.venueOrderId, "STREAM_ORDER", { status: item.status, unreadable: item.unreadable })];
+    return [
+      unkeyedOrderRecord(
+        {
+          venueOrderId: null,
+          tokenId: null,
+          side: null,
+          price: null,
+          originalSize: null,
+          sizeMatched: null,
+          status: item.status,
+          unreadable: item.unreadable.filter((name): name is "venueOrderId" | "status" => name === "venueOrderId" || name === "status"),
+        },
+        "STREAM_ORDER_UNKEYED",
+      ),
+    ];
   }
-  const tradeId = readField(raw, "venueTradeId");
-  const orderId = readField(raw, "venueOrderId");
-  if (tradeId.kind !== "DATA" || !isIdentifier(tradeId.value) || orderId.kind !== "DATA" || !isVenueId(orderId.value)) return undefined;
-  if (kind === "FILL") {
-    const shares = readField(raw, "shares");
-    const price = readField(raw, "price");
-    if (shares.kind !== "DATA" || !isPositiveAmount(shares.value) || price.kind !== "DATA" || !isUnitPrice(price.value)) return undefined;
-    // Every fill fact the stream fixed (r7): each that is out of shape is unknown (`null`), never guessed.
-    const fact = (key: string, valid: (value: unknown) => boolean): unknown => {
-      const read = readField(raw, key);
-      return read.kind === "DATA" && valid(read.value) ? read.value : null;
-    };
-    return legRecord(
-      tradeId.value,
-      {
-        venueOrderId: orderId.value,
-        tokenId: null,
-        side: null,
-        shares: shares.value,
-        price: price.value,
-        feeAmount: fact("feeAmount", isNonNegativeAmount) as DecimalString | null,
-        feeAssetId: fact("feeAssetId", isIdentifier) as string | null,
-        role: fact("liquidityRole", (value) => value === "MAKER" || value === "TAKER") as "MAKER" | "TAKER" | null,
-        matchedAt: fact("matchedAt", isIsoInstant) as string | null,
-      },
-      null,
+  const leg: PartialLeg = {
+    venueOrderId: item.venueOrderId,
+    tokenId: null,
+    side: null,
+    shares: item.shares,
+    price: item.price,
+    feeAmount: item.feeAmount,
+    feeAssetId: item.feeAssetId,
+    role: item.role,
+    matchedAt: item.matchedAt,
+    unreadable: item.unreadable.map((name) => (name === "liquidityRole" ? "role" : name)).filter((name) => name !== "venueTradeId" && name !== "venueOrderId" && name !== "status"),
+  };
+  const status = item.kind === "SETTLEMENT" ? item.status : null;
+  const fill = item.kind === "FILL";
+  if (item.venueTradeId === null) {
+    return [unkeyedFragmentsLegRecord({ ...leg, unreadable: [...leg.unreadable, ...item.unreadable.filter((name) => name === "venueOrderId" || name === "status")] }, status, 1, fill ? "STREAM_FILL_UNKEYED" : "STREAM_SETTLEMENT_UNKEYED", item.transactionHash)];
+  }
+  if (item.venueOrderId === null) {
+    return [orphanLegRecord(item.venueTradeId, { ...leg, unreadable: [...leg.unreadable, ...item.unreadable.filter((name) => name === "status")] }, status, fill ? "STREAM_FILL_ORPHAN" : "STREAM_SETTLEMENT_ORPHAN", item.transactionHash)];
+  }
+  return [
+    legRecord(
+      item.venueTradeId,
+      { venueOrderId: item.venueOrderId, tokenId: null, side: null, shares: item.shares, price: item.price, feeAmount: item.feeAmount, feeAssetId: item.feeAssetId, role: item.role, matchedAt: item.matchedAt },
+      status,
       "NAMED",
-      "STREAM_FILL",
-    );
-  }
-  const status = readField(raw, "status");
-  if (status.kind !== "DATA" || !isIdentifier(status.value)) return undefined;
-  return legRecord(tradeId.value, { venueOrderId: orderId.value, tokenId: null, side: null, shares: null, price: null }, status.value, "NAMED", "STREAM_SETTLEMENT");
+      fill ? "STREAM_FILL" : "STREAM_SETTLEMENT",
+      [...leg.unreadable, ...item.unreadable.filter((name) => name === "status")],
+      item.transactionHash,
+    ),
+  ];
 }
 
 /** Every own leg of a FAILED trade in a valid trades read, by the venue's identity (frozen: handed to a port). */
@@ -3592,7 +3780,7 @@ interface OrderTradeView {
 }
 
 function failed<T>(): ReadOutcome<T> {
-  return Object.freeze({ kind: "FAILED" });
+  return Object.freeze({ kind: "FAILED", salvage: EMPTY_SALVAGE });
 }
 
 function notRun(triggers: readonly ReconciliationTrigger[], reason: string): RunReport {

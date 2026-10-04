@@ -231,7 +231,10 @@ describe("WP-290 r10 (WP290-CX-R10-01): an unusable by-id answer keeps its valid
       expect(await reconcileRounds(r, 4)).toBe(false);
       expect(unresolved(r, "ORDER_UNATTRIBUTED", other.venueOrderId)?.status).toBe("QUARANTINED");
       expect(r.u.violations).toEqual([]);
-      expect(recordsOf(r, other.venueOrderId, "BY_ID_ID")).toEqual([["ORDER", "NAMED", null, null]]);
+      // (r11, the class fix) The row's id is kept NAMED with every fragment that validated on its own (its matched
+      // size 0 among them); its price, which did not, is named unreadable.
+      expect(recordsOf(r, other.venueOrderId, "BY_ID_ID")).toEqual([["ORDER", "NAMED", "0", null]]);
+      expect(r.p.journal.evidence().filter((record) => record.venueOrderId === other.venueOrderId && record.source === "BY_ID_ID").map((record) => record.unreadable)).toEqual([["price"]]);
     });
   }
 
@@ -497,7 +500,12 @@ describe("WP-290 r10 (WP290-V10-UNKEYED-LEG-DISCHARGED): an own leg under an unr
     r.u.world.faults.listTrades = () => twoTrades;
     expect(await reconcileRounds(r, 5)).toBe(false);
     expect(r.u.violations).toEqual([]);
-    expect(recordsOf(r, first.venueOrderId, "TRADES_LEG_UNKEYED").filter((record) => record[0] === "UNKEYED_LEG")).toEqual([["UNKEYED_LEG", "SHOWN", "0.3", 2]]);
+    // (r11) One record per (status, transaction hash) its rows showed, each with the fill's whole count (2): the two
+    // rows carry two transaction hashes, so nothing of either row is dropped by the grouping.
+    expect(recordsOf(r, first.venueOrderId, "TRADES_LEG_UNKEYED").filter((record) => record[0] === "UNKEYED_LEG")).toEqual([
+      ["UNKEYED_LEG", "SHOWN", "0.3", 2],
+      ["UNKEYED_LEG", "SHOWN", "0.3", 2],
+    ]);
     r.u.world.faults = {};
     expect(await reconcileRounds(r, 5)).toBe(true);
     expect(fills(r).sort()).toEqual([first.venueTradeId, second.venueTradeId, third.venueTradeId].sort());

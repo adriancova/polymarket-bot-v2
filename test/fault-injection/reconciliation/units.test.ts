@@ -211,7 +211,8 @@ describe("the read door", () => {
   it("the by-id read must name the order asked for", () => {
     expect(readOrderById({ route: "/data/order", found: true, order: ORDER }, "venue-1").kind).toBe("OK");
     expect(readOrderById({ route: "/data/order", found: true, order: ORDER }, "venue-2").kind).toBe("MALFORMED");
-    expect(readOrderById({ route: "/data/order", found: false }, "venue-2")).toEqual({ kind: "OK", value: null });
+    // (r11) Every outcome carries its salvage now: the outcome's kind and value are what this asserts.
+    expect(readOrderById({ route: "/data/order", found: false }, "venue-2")).toMatchObject({ kind: "OK", value: null });
   });
 
   it("trades: a fee above zero must name its asset; one own order is named once per trade", () => {

@@ -303,7 +303,8 @@ describe("WP-290 r6 (WP290-V6-RETAINED-ID-RESOLVES): an id the OMS retains as st
     expect(first.map((detection) => detection.breakClass)).not.toContain("READ_MISSING");
     expect(oracle(r)).toEqual([]);
     // Asserted last: the stream's report was recorded as evidence the moment it was routed (and is its only source).
-    expect(r.p.journal.evidence().map((record) => [record.venueOrderId, record.source])).toEqual([["venue-phantom-2", "STREAM_ORDER"]]);
+    // (r11) The holdings each run reads are evidence too now (HOLDING, detail only): the venue-object records are these.
+    expect(r.p.journal.evidence().filter((record) => record.evidenceKind !== "HOLDING").map((record) => [record.venueOrderId, record.source])).toEqual([["venue-phantom-2", "STREAM_ORDER"]]);
   });
 
   it("(P6-STREAM-FILL-TWIN) a retained fill of the attempt's own order, a live foreign twin, every read lagging: never PRESENT on the twin, the fill never booked UNATTRIBUTED", async () => {

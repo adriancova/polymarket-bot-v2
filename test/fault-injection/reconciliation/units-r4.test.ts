@@ -21,6 +21,8 @@ import { readOpenOrders, readRemainingBookings, readTrades } from "../../../pack
 import { namesOrderOnly, venueSubjectOf } from "../../../packages/oms/src/reconciliation/subjects.js";
 import { uuid7 } from "../../unit/oms/support/ids.js";
 
+import { namedOf as namedMap } from "./support/salvage.js";
+
 const ACCOUNT = "paper-account-1";
 const MARKET = uuid7(0xc, 1);
 const INSTANCE = uuid7(0xa, 1);
@@ -37,8 +39,9 @@ function trade(venueTradeId: string, legs: unknown[], status = "TRADE_STATUS_MIN
   return { venueTradeId, status, transactionHash: null, ownershipUndetermined: false, ownLegs: legs };
 }
 
+/** (r11) The ids an unusable answer carries, derived from its salvage exactly as the r4 door's `named` was (`support/salvage.ts`). */
 function namedOf(outcome: ReturnType<typeof readOpenOrders> | ReturnType<typeof readTrades>): [string, string | null][] {
-  return outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED" ? [...(outcome.named ?? new Map<string, string | null>())] : [];
+  return [...namedMap(outcome)];
 }
 
 describe("the door keeps the ids an unusable answer carries (r4, WP290-CX-R4-01)", () => {
@@ -65,7 +68,8 @@ describe("the door keeps the ids an unusable answer carries (r4, WP290-CX-R4-01)
     expect(unsaid.kind).toBe("MALFORMED");
     expect(namedOf(unsaid)).toEqual([["venue-1", YES]]);
     // Nothing usable carries nothing: a wrong route, a list that is not a list, a row id that is not a venue id.
-    expect(readOpenOrders({ route: "/orders", complete: false, orders: [ORDER] })).toEqual({ kind: "WRONG_ROUTE", route: "/orders" });
+    // (r11) Every outcome carries its salvage; another readable route's is empty (its rows are another source's).
+    expect(readOpenOrders({ route: "/orders", complete: false, orders: [ORDER] })).toMatchObject({ kind: "WRONG_ROUTE", route: "/orders", salvage: { orders: [], trades: [] } });
     expect(namedOf(readOpenOrders({ route: "/data/orders", complete: false, orders: "venue-1" }))).toEqual([]);
     expect(namedOf(readOpenOrders({ route: "/data/orders", complete: true, orders: [{ venueOrderId: "venue 1" }] }))).toEqual([]);
     // A complete, valid answer is OK, as before.
@@ -173,8 +177,9 @@ describe("a FAILED fill's remaining booking (r4, WP290-CX-R4-02)", () => {
     const asked = [{ venueTradeId: "t1", venueOrderId: "venue-1" }];
     const key = compositeKey("t1", "venue-1");
     const good = readRemainingBookings({ bookings: [{ venueTradeId: "t1", venueOrderId: "venue-1", entries: [{ assetId: PUSD, amount: "-0.2" }] }] }, asked);
-    expect(good).toEqual({ kind: "OK", value: new Map([[key, [{ assetId: PUSD, amount: "-0.2" }]]]) });
-    expect(readRemainingBookings({ bookings: [{ venueTradeId: "t1", venueOrderId: "venue-1", entries: [] }] }, asked)).toEqual({ kind: "OK", value: new Map([[key, []]]) });
+    // (r11) Every outcome carries its salvage (the ledger's own state keeps none): the kind and value are asserted.
+    expect(good).toMatchObject({ kind: "OK", value: new Map([[key, [{ assetId: PUSD, amount: "-0.2" }]]]) });
+    expect(readRemainingBookings({ bookings: [{ venueTradeId: "t1", venueOrderId: "venue-1", entries: [] }] }, asked)).toMatchObject({ kind: "OK", value: new Map([[key, []]]) });
     for (const bad of [
       { bookings: [] },
       { bookings: [{ venueTradeId: "t2", venueOrderId: "venue-1", entries: [] }] },

@@ -21,6 +21,11 @@
  * - (r10) a by-id read answering with the order's TRUE row in an unusable envelope (`found: false`, or `found`
  *   absent), and a trades answer in which a trade not yet shown carries an unreadable trade id (a number), its legs
  *   valid;
+ * - (r11, the class fix at the door layer) DOOR MUTATIONS of a true answer of any door (open orders, by id, trades,
+ *   positions, the collateral, approvals: `mutate.ts`, every mutation the door property draws but the undetectable
+ *   ones, a list truncated or a valid row relabelled), and LAG EPISODES: a consistent snapshot of every read is taken,
+ *   the venue moves on, one run reads the truth through door mutations, then the snapshot is replayed for one to three
+ *   runs (a lagging adapter), possibly mutated too, then the reads are truthful again;
  * - a ledger transaction with UNATTRIBUTED arrivals in two markets;
  * - every read source and answer shape: complete, partial, duplicated, sibling-malformed, by-id found, not found,
  *   thrown or regressing, trades complete, partial, malformed or lagging, positions and collateral failing;
@@ -40,12 +45,19 @@
  *   after a clock fault was injected into that run, nor one naming a venue object a lie touched in that run;
  * - no run resumes when a detectable fault or a clock fault touched it;
  * - no halt obligation is lost or collapsed: after a final truthful settling phase, every ledger arrival and every
- *   OMS halting alert has its own break, and every quarantined break's halt was delivered.
+ *   OMS halting alert has its own break, and every quarantined break's halt was delivered;
+ * - (r11) NO VALIDATED FACT IS LOST: in a run that replays a stale snapshot, nothing resumes once any fact NEWER than
+ *   the snapshot was delivered to the coordinator (by any answer, a mutated one's validated fragments included, or by
+ *   the user stream) in a run that completed since: an order matched further, an order terminal, an order or a trade
+ *   the snapshot does not have, a trade's settlement further or the other terminal one. The delivered facts are counted
+ *   by the property itself, under each row's TRUE identity, only where a delivered fragment equals the truth (a lie is
+ *   never counted). Holdings are not facts of this kind: a position or a balance is not monotonic. When nothing newer
+ *   was delivered, a stale run cannot know, and R1 is excused in it (counted).
  *
  * PAPER only: every port is in-memory; no network, key or signer.
  */
 
-import { addDecimal, compareDecimal } from "../../../../packages/decimal/src/index.js";
+import { addDecimal, compareDecimal, isCanonicalDecimalString } from "../../../../packages/decimal/src/index.js";
 import { projectLedger, projectedHoldings } from "../../../../packages/ledger/src/index.js";
 import { compositeKey } from "../../../../packages/oms/src/guards.js";
 import type { OrderManager } from "../../../../packages/oms/src/index.js";
@@ -54,8 +66,50 @@ import { venueIdFor } from "../../../unit/oms/support/fake-venue.js";
 import { uuid7 } from "../../../unit/oms/support/ids.js";
 
 import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, bookReversal, boot, reopenOms, streamTrade, universe, type Process, type Universe } from "./harness.js";
+import { readApprovals, readCollateral, readOpenOrders, readOrderById, readPositions, readTrades } from "../../../../packages/oms/src/reconciliation/door.js";
+import { isLegalSettlementTransition } from "../../../../packages/oms/src/states.js";
+
+import { LEG_KEYS, MUTATIONS, ORDER_KEYS, UNREADABLE, expectedEntries, expectedRow, mutateAnswer, own, type Door, type Mutation } from "./mutate.js";
 import { G_YES, sequence, submitOne } from "./scenario.js";
 import type { ReadFaults, Transmission, VenueOrder, VenueTrade } from "./world.js";
+
+/** (r11) What the reads and the stream DELIVERED of the venue's truth, under each row's true identity (see the header). */
+interface Delivered {
+  /** Venue order → the most matched delivered, and whether it was delivered terminal. */
+  readonly orders: Map<string, { matched: string; terminal: boolean }>;
+  /** Venue trade → every settlement status delivered (plain spelling), and its legs' shares by order. */
+  readonly trades: Map<string, { statuses: Set<string>; legs: Map<string, string> }>;
+}
+
+function emptyDelivered(): Delivered {
+  return { orders: new Map(), trades: new Map() };
+}
+
+/** (r11) A consistent snapshot of the venue at one instant: what a lagging adapter replays. */
+interface Snapshot {
+  readonly orders: ReadonlyMap<string, VenueOrder>;
+  readonly trades: readonly VenueTrade[];
+  readonly positions: ReadonlyMap<string, string>;
+  readonly collateral: string;
+  readonly approvals: ReadonlyMap<string, boolean>;
+}
+
+/** The mutations the end-to-end property draws: every one a door detects (a list truncated, or a valid list row relabelled, is an undetectable lie: `mutate.ts`). */
+const E2E_MUTATIONS: readonly Mutation[] = MUTATIONS.filter((mutation) => mutation !== "NONE" && mutation !== "TRUNCATE_LIST");
+const MUTATED_DOORS: readonly Door[] = ["open-orders", "by-id", "trades", "positions", "collateral", "approvals"];
+
+function plainStatus(status: string): string {
+  return status.replace(/^TRADE_STATUS_/u, "");
+}
+
+type Settlement = "MATCHED" | "MINED" | "CONFIRMED" | "RETRYING" | "FAILED";
+
+function isSettlement(value: string): value is Settlement {
+  return ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"].includes(value);
+}
+
+/** (r11) A lagging adapter's reads: every answer from a snapshot. */
+type SnapshotAnswers = Required<Pick<ReadFaults, "listOpenOrders" | "readOrder" | "listTrades" | "readPositions" | "readCollateral" | "readApprovals">>;
 
 /** (r9) The fee the TRADES_MALFORMED_LEG lie gives a leg: not an exact decimal, so the door refuses the leg. */
 const MALFORMED_FEE = "not-a-fee";
@@ -88,6 +142,13 @@ export interface SeedResult {
   readonly resumes: number;
   readonly runs: number;
   readonly steps: readonly string[];
+  /** (r11) Lag episodes run, door mutations applied, and R1 messages excused in a stale run that had nothing newer delivered. */
+  readonly lagEpisodes?: number;
+  readonly doorMutations?: number;
+  readonly staleExcused?: number;
+  /** (r11) Stale runs that replayed a snapshot after a newer fact was delivered (each must not resume), and those that resumed with nothing newer. */
+  readonly staleHeld?: number;
+  readonly staleResumed?: number;
 }
 
 const READ_SHAPE_CLASSES: readonly string[] = ["READ_MISSING", "READ_MALFORMED", "READ_INCOMPLETE", "READ_WRONG_ROUTE"];
@@ -111,6 +172,17 @@ class Sim {
   /** Arms a clock fault at the n-th intercepted await of the next reconciliation (0: none). */
   #clockArm = 0;
   #intercepted = 0;
+  /** (r11) Facts delivered since the current lag episode's snapshot (pending until a run of this process completes). */
+  #deliveredPending: Delivered = emptyDelivered();
+  #delivered: Delivered = emptyDelivered();
+  /** (r11) The snapshot of the current lag episode, and whether the current run replays it. */
+  #snapshot: Snapshot | null = null;
+  #replaying = false;
+  lagEpisodes = 0;
+  doorMutations = 0;
+  staleExcused = 0;
+  staleHeld = 0;
+  staleResumed = 0;
 
   private constructor(u: Universe, p: Process, rand: () => number) {
     this.u = u;
@@ -200,6 +272,7 @@ class Sim {
     this.steps.push(`RESTART${plan === null ? "" : `(kill ${plan.phase} call ${String(plan.at)})`}`);
     this.#pending.clear();
     this.#factsPending.clear();
+    this.#deliveredPending = emptyDelivered();
     try {
       this.p = await boot(this.u, plan);
     } catch (error) {
@@ -214,6 +287,7 @@ class Sim {
     this.steps.push("REBOOT");
     this.#pending.clear();
     this.#factsPending.clear();
+    this.#deliveredPending = emptyDelivered();
     this.p = await boot(this.u);
     this.#instrument();
   }
@@ -307,7 +381,8 @@ class Sim {
 
   saw(id: unknown, matched: unknown): void {
     if (typeof id !== "string") return;
-    const amount = typeof matched === "string" && /^[0-9]+(\.[0-9]+)?$/u.test(matched) ? matched : "0";
+    // (r11) A door mutation may deliver an inexact decimal ("0.40"): only a canonical one is an amount.
+    const amount = typeof matched === "string" && isCanonicalDecimalString(matched, { range: "NON_NEGATIVE" }) ? matched : "0";
     const earlier = this.#pending.get(id);
     if (earlier === undefined || compareDecimal(amount, earlier) > 0) this.#pending.set(id, amount);
   }
@@ -320,6 +395,270 @@ class Sim {
     this.#pending.clear();
     for (const key of this.#factsPending) this.#factsSeen.add(key);
     this.#factsPending.clear();
+    // (r11) Deliveries count once a run of the same process completed after them.
+    for (const [id, order] of this.#deliveredPending.orders) this.#mergeOrder(this.#delivered, id, order.matched, order.terminal);
+    for (const [id, trade] of this.#deliveredPending.trades) {
+      for (const status of trade.statuses) this.#mergeTrade(this.#delivered, id, status, null, null);
+      for (const [order, shares] of trade.legs) this.#mergeTrade(this.#delivered, id, null, order, shares);
+      if (trade.statuses.size === 0 && trade.legs.size === 0) this.#mergeTrade(this.#delivered, id, null, null, null);
+    }
+    this.#deliveredPending = emptyDelivered();
+  }
+
+  // ---- (r11) delivered facts, door mutations and lag episodes ------------------------------------------------
+
+  #mergeOrder(into: Delivered, id: string, matched: string, terminal: boolean): void {
+    const known = into.orders.get(id);
+    if (known === undefined) into.orders.set(id, { matched, terminal });
+    else {
+      if (compareDecimal(matched, known.matched) > 0) known.matched = matched;
+      known.terminal ||= terminal;
+    }
+  }
+
+  #mergeTrade(into: Delivered, id: string, status: string | null, order: string | null, shares: string | null): void {
+    let known = into.trades.get(id);
+    if (known === undefined) {
+      known = { statuses: new Set(), legs: new Map() };
+      into.trades.set(id, known);
+    }
+    if (status !== null) known.statuses.add(plainStatus(status));
+    if (order !== null && shares !== null) {
+      const held = known.legs.get(order);
+      if (held === undefined || compareDecimal(shares, held) > 0) known.legs.set(order, shares);
+    }
+  }
+
+  /**
+   * Count what one delivered answer showed of the truth (`truth`: the venue's own answer at that instant), row by
+   * row in the truth's order: a delivered row's fragment counts only when it is own data in its domain AND equal to the
+   * true row's (a lie never counts), and only under the true row's identity when the delivered row's id is that one or
+   * unreadable (a row relabelled with another readable id is not counted for anything).
+   */
+  #deliver(door: "open-orders" | "trades" | "by-id", truth: unknown, delivered: unknown, asked: string | null = null): void {
+    if (this.#snapshot === null || this.#replaying) return;
+    const pairs = (field: string): [Record<string, unknown>, unknown][] => {
+      const trueRows = (own(truth, field).data ? (own(truth, field) as { value: unknown }).value : []) as Record<string, unknown>[];
+      const read = own(delivered, field);
+      const rows = read.data ? (expectedEntries(read.value, 50_000) ?? []) : [];
+      return trueRows.slice(0, rows.length).map((row, index) => [row, rows[index]]);
+    };
+    const orderFacts = (trueRow: Record<string, unknown>, row: unknown): void => {
+      const fragment = expectedRow(row, ORDER_KEYS);
+      const id = trueRow["venueOrderId"] as string;
+      if (fragment["venueOrderId"] !== UNREADABLE && fragment["venueOrderId"] !== id) return;
+      const same = (key: string): boolean => fragment[key] !== UNREADABLE && fragment[key] === trueRow[key];
+      if (!ORDER_KEYS.some((key) => same(key))) return;
+      const matched = same("sizeMatched") ? (trueRow["sizeMatched"] as string) : "0";
+      const terminal = (same("status") && trueRow["status"] === "CANCELED") || (same("sizeMatched") && same("originalSize") && trueRow["sizeMatched"] === trueRow["originalSize"]);
+      this.#mergeOrder(this.#deliveredPending, id, matched, terminal);
+    };
+    if (door === "open-orders") for (const [trueRow, row] of pairs("orders")) orderFacts(trueRow, row);
+    else if (door === "by-id") {
+      const trueOrder = own(truth, "order");
+      const order = own(delivered, "order");
+      if (asked !== null && trueOrder.data && trueOrder.value !== null && typeof trueOrder.value === "object" && order.data) orderFacts(trueOrder.value as Record<string, unknown>, order.value);
+    } else {
+      for (const [trueRow, row] of pairs("trades")) {
+        const fragment = expectedRow(row, ["venueTradeId", "status"]);
+        const id = trueRow["venueTradeId"] as string;
+        if (fragment["venueTradeId"] !== UNREADABLE && fragment["venueTradeId"] !== id) continue;
+        const status = fragment["status"] !== UNREADABLE && fragment["status"] === trueRow["status"] ? (trueRow["status"] as string) : null;
+        const trueLegs = (Array.isArray(trueRow["ownLegs"]) ? trueRow["ownLegs"] : []) as Record<string, unknown>[];
+        const legsRead = own(row === UNREADABLE ? null : row, "ownLegs");
+        const legs = legsRead.data ? (expectedEntries(legsRead.value, 64) ?? []) : [];
+        let any = status !== null || fragment["venueTradeId"] === id;
+        trueLegs.slice(0, legs.length).forEach((trueLeg, index) => {
+          const leg = expectedRow(legs[index], LEG_KEYS);
+          if (leg["venueOrderId"] !== UNREADABLE && leg["venueOrderId"] !== trueLeg["venueOrderId"]) return;
+          const shares = leg["shares"] !== UNREADABLE && leg["shares"] === trueLeg["shares"] ? (trueLeg["shares"] as string) : null;
+          if (shares === null && !LEG_KEYS.some((key) => leg[key] !== UNREADABLE && leg[key] === trueLeg[key])) return;
+          any = true;
+          this.#mergeTrade(this.#deliveredPending, id, null, trueLeg["venueOrderId"] as string, shares ?? "0");
+        });
+        if (any) this.#mergeTrade(this.#deliveredPending, id, status, null, null);
+      }
+    }
+  }
+
+  /** (r11) What the user stream delivered (always the truth here, but for a conflicting fill's economics). */
+  #deliverStream(trade: VenueTrade | null, order: VenueOrder | null, withShares: boolean, withStatus: boolean): void {
+    if (this.#snapshot === null || this.#replaying) return;
+    if (order !== null) this.#mergeOrder(this.#deliveredPending, order.venueOrderId, "0", order.status === "CANCELED");
+    if (trade !== null) this.#mergeTrade(this.#deliveredPending, trade.venueTradeId, withStatus ? trade.status : null, withShares ? trade.venueOrderId : null, withShares ? trade.shares : null);
+  }
+
+  /**
+   * (r11) The first fact delivered (and promoted) since the snapshot that is NEWER than it, or `null`: an order the
+   * snapshot does not have, matched further (by its own row or by its trades' legs), or terminal where it is live; a
+   * trade the snapshot does not have, or a settlement status further than its, or the other terminal one.
+   */
+  #newerThanSnapshot(): string | null {
+    const snapshot = this.#snapshot;
+    if (snapshot === null) return null;
+    const exists = (id: string): boolean => [...this.u.world.orders.values()].some((order) => order.venueOrderId === id);
+    for (const [id, order] of this.#delivered.orders) {
+      if (!exists(id)) continue;
+      const then = snapshot.orders.get(id);
+      if (then === undefined) return `order ${id} was delivered; the snapshot does not have it`;
+      if (compareDecimal(order.matched, then.matched) > 0) return `order ${id} was delivered matched ${order.matched}; the snapshot shows ${then.matched}`;
+      const terminal = then.status === "CANCELED" || compareDecimal(then.matched, then.original) === 0;
+      if (order.terminal && !terminal) return `order ${id} was delivered terminal; the snapshot shows it live`;
+    }
+    for (const [id, trade] of this.#delivered.trades) {
+      if (!this.u.world.trades.some((entry) => entry.venueTradeId === id)) continue;
+      const then = snapshot.trades.find((entry) => entry.venueTradeId === id);
+      if (then === undefined) return `trade ${id} was delivered; the snapshot does not have it`;
+      const was = plainStatus(then.status);
+      for (const status of trade.statuses) {
+        if (status === was) continue;
+        const terminal = (value: string): boolean => value === "CONFIRMED" || value === "FAILED";
+        const forward = isSettlement(was) && isSettlement(status) && isLegalSettlementTransition(was, status);
+        if (forward || (terminal(was) && terminal(status))) return `trade ${id} was delivered ${status}; the snapshot shows ${was}`;
+      }
+      for (const [order, shares] of trade.legs) {
+        const legSum = snapshot.trades.filter((entry) => entry.venueOrderId === order).reduce((sum, entry) => addDecimal(sum, entry.shares), "0");
+        if (compareDecimal(shares, legSum) > 0) return `trade ${id}'s leg on ${order} (${shares}) was delivered; the snapshot's trades on it sum to ${legSum}`;
+      }
+    }
+    return null;
+  }
+
+  #takeSnapshot(): Snapshot {
+    const world = this.u.world;
+    return {
+      orders: new Map([...world.orders.values()].map((order) => [order.venueOrderId, { ...order }])),
+      trades: world.trades.map((trade) => ({ ...trade })),
+      positions: new Map(world.positions),
+      collateral: world.collateral,
+      approvals: new Map(world.approvals),
+    };
+  }
+
+  /** The reads of a lagging adapter: every answer from the snapshot (`world.ts`'s shapes). */
+  #snapshotAnswers(snapshot: Snapshot): SnapshotAnswers {
+    const world = this.u.world;
+    return {
+      listOpenOrders: () => ({
+        route: "/data/orders",
+        complete: true,
+        orders: [...snapshot.orders.values()].filter((order) => order.status === "LIVE" && compareDecimal(order.matched, order.original) < 0).map((order) => world.orderView(order)),
+      }),
+      readOrder: (id) => {
+        const order = snapshot.orders.get(id);
+        return order === undefined ? { route: "/data/order", found: false } : { route: "/data/order", found: true, order: world.orderView(order) };
+      },
+      listTrades: () => ({ route: "/data/trades", complete: true, trades: snapshot.trades.map((trade) => world.tradeView(trade)) }),
+      readPositions: () => ({
+        route: "/v2/positions",
+        complete: true,
+        positions: [...snapshot.positions].filter(([, size]) => compareDecimal(size, "0") !== 0).map(([tokenId, size]) => ({ tokenId, size })),
+      }),
+      readCollateral: () => ({ source: "ONCHAIN_ERC20_BALANCE", assetId: PUSD, balance: snapshot.collateral }),
+      readApprovals: () => ({ route: "/v2/approvals", approvals: [...snapshot.approvals].map(([spender, approved]) => ({ spender, approved })) }),
+    };
+  }
+
+  /**
+   * (r11) A door mutation of one door's answer (the truth, or a snapshot's): drawn now, applied when read. It is a lie
+   * only when the door detects it (the answer is then unusable; a run it touches concludes nothing); a draw the door
+   * would read as usable is not applied.
+   */
+  #mutationOf(door: Door): (answer: unknown, asked: string | null) => unknown {
+    const rand = seeded(Math.floor(this.rand() * 2_147_483_647) + 1);
+    const mutation = this.pick(E2E_MUTATIONS) ?? "DROP_FIELD";
+    const ids = [...this.u.world.orders.values()].map((order) => order.venueOrderId);
+    return (answer, asked) => {
+      const mutated = mutateAnswer(rand, door, answer, mutation, door === "by-id" ? [...ids, "venue-relabelled"] : ids);
+      const outcome =
+        door === "open-orders"
+          ? readOpenOrders(mutated)
+          : door === "trades"
+            ? readTrades(mutated)
+            : door === "by-id"
+              ? readOrderById(mutated, asked ?? "")
+              : door === "positions"
+                ? readPositions(mutated)
+                : door === "collateral"
+                  ? readCollateral(mutated, PUSD)
+                  : readApprovals(mutated);
+      if (outcome.kind === "OK") return answer;
+      this.doorMutations += 1;
+      this.fire(`DOOR_MUTATION(${door} ${mutation})`, true);
+      return mutated;
+    };
+  }
+
+  /** Door mutations on `count` doors of the given answers (the truth when `base` is undefined). */
+  #mutatedFaults(count: number, base?: SnapshotAnswers): ReadFaults {
+    const faults: ReadFaults = {};
+    const doors = [...MUTATED_DOORS].sort(() => this.rand() - 0.5).slice(0, count);
+    for (const door of doors) {
+      const mutate = this.#mutationOf(door);
+      if (door === "by-id") faults.readOrder = (id, answer) => mutate(base === undefined ? answer() : base.readOrder(id, answer), id);
+      else {
+        const key = ({ "open-orders": "listOpenOrders", trades: "listTrades", positions: "readPositions", collateral: "readCollateral", approvals: "readApprovals" } as const)[door as Exclude<Door, "by-id" | "wallet-member" | "stream">];
+        const source = base?.[key];
+        faults[key] = (answer) => mutate(source === undefined ? answer() : source(answer), null);
+      }
+      this.steps.push(`DOOR_MUTATION(${door})`);
+    }
+    return faults;
+  }
+
+  /** The snapshot's answers as read faults. */
+  snapshotFaults(): SnapshotAnswers {
+    return this.#snapshotAnswers(this.#snapshot as Snapshot);
+  }
+
+  /**
+   * (r11) A LAG EPISODE. Only while no attempt is unresolved and nothing is in transit (so a stale run has no request
+   * to answer, and no submission is made during it): a snapshot of every read is taken; the venue moves on (0 to 2
+   * activity steps, the user stream included); ONE run reads the truth through door mutations; then the snapshot is
+   * replayed for 1 to 3 runs (a lagging adapter), possibly through a door mutation too; then the reads are truthful
+   * again. Facts delivered since the snapshot are counted (`#deliver`); in a replaying run, a resume after a NEWER one
+   * was delivered is a violation (`#checkRuns`).
+   */
+  async lagEpisode(): Promise<void> {
+    await this.ensureAlive();
+    const oms = this.oms;
+    if (oms === null || this.u.world.pending.length > 0) return;
+    if (oms.attempts().some((attempt) => ["SIGNED", "SENDING", "SUBMISSION_UNKNOWN", "RECONCILING"].includes(attempt.state))) return;
+    this.lagEpisodes += 1;
+    this.#snapshot = this.#takeSnapshot();
+    this.#delivered = emptyDelivered();
+    this.#deliveredPending = emptyDelivered();
+    this.steps.push("LAG(snapshot)");
+    const activity = Math.floor(this.rand() * 3);
+    for (let step = 0; step < activity; step += 1) {
+      const roll = this.rand();
+      if (roll < 0.35) this.match();
+      else if (roll < 0.55) this.settle();
+      else if (roll < 0.65) this.cancel();
+      else if (roll < 0.75) this.foreign();
+      else await this.stream();
+    }
+    // One run reads the truth through door mutations: what it delivers is the newer facts a stale run must not forget.
+    this.#install(this.#mutatedFaults(1 + Math.floor(this.rand() * 2)));
+    await this.reconcile();
+    const replays = 1 + Math.floor(this.rand() * 3);
+    for (let run = 0; run < replays; run += 1) {
+      if (this.#snapshot === null) break;
+      const answers = this.snapshotFaults();
+      const faults: ReadFaults = this.chance(0.4) ? { ...answers, ...this.#mutatedFaults(1, answers) } : { ...answers };
+      this.steps.push(`LAG(replay ${String(run + 1)} of ${String(replays)})`);
+      this.#replaying = true;
+      this.#install(faults);
+      try {
+        await this.reconcile();
+      } finally {
+        this.#replaying = false;
+      }
+    }
+    this.#snapshot = null;
+    this.#delivered = emptyDelivered();
+    this.#deliveredPending = emptyDelivered();
+    this.#install();
   }
 
   /** A completed run of a living process was shown this venue order matched (above zero). */
@@ -384,12 +723,14 @@ class Sim {
       const full = compareDecimal(order.matched, order.original) === 0;
       const status = order.status === "CANCELED" ? "CANCELED" : full ? "MATCHED" : "LIVE";
       this.saw(order.venueOrderId, "0");
+      this.#deliverStream(null, order, false, false);
       this.steps.push(`STREAM(order ${order.venueOrderId} ${status})`);
       this.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: { venueOrderId: order.venueOrderId, status }, shortfalls: [] } });
     } else if (roll < 0.75) {
       const trade = this.pick(this.u.world.trades.filter((entry) => this.ownOrders().some((order) => order.venueOrderId === entry.venueOrderId)));
       if (trade === undefined) return;
       this.saw(trade.venueOrderId, trade.shares);
+      this.#deliverStream(trade, null, true, false);
       this.steps.push(`STREAM(fill ${trade.venueTradeId})`);
       this.p.coordinator.onUserStreamOutput(streamTrade(this.u, trade.venueTradeId));
     } else if (roll < 0.87) {
@@ -398,6 +739,7 @@ class Sim {
       const trade = this.pick(this.u.world.trades.filter((entry) => this.ownOrders().some((order) => order.venueOrderId === entry.venueOrderId)));
       if (trade === undefined) return;
       this.saw(trade.venueOrderId, "0");
+      this.#deliverStream(trade, null, false, true);
       this.steps.push(`STREAM(settlement ${trade.venueTradeId} ${trade.status})`);
       this.p.coordinator.onUserStreamOutput({
         kind: "TRADE",
@@ -411,6 +753,7 @@ class Sim {
       // A fill reported again with other economics: the OMS refuses it and raises a halting alert (repeated alerts).
       const trade = this.pick(this.u.world.trades);
       if (trade === undefined) return;
+      this.#deliverStream(trade, null, false, false);
       this.steps.push(`STREAM(conflicting fill ${trade.venueTradeId})`);
       const output = streamTrade(this.u, trade.venueTradeId) as { kind: string; oms: { fills: Record<string, unknown>[] } };
       this.p.coordinator.onUserStreamOutput({ ...output, oms: { ...output.oms, fills: output.oms.fills.map((fill) => ({ ...fill, price: "0.01" })) } });
@@ -437,6 +780,7 @@ class Sim {
     const trade = this.pick(tracked.length > 0 ? tracked : own);
     if (trade === undefined) return;
     this.saw(trade.venueOrderId, trade.shares);
+    this.#deliverStream(trade, null, true, false);
     this.steps.push(`STORE_FAULT(fill ${trade.venueTradeId})`);
     this.u.store.hooks.before = (writes) => {
       if (writes.some((write) => write.kind === "INSERT_FILL")) throw new Error("the database is unavailable");
@@ -467,7 +811,7 @@ class Sim {
     const chosen: string[] = [];
     const count = 1 + Math.floor(this.rand() * 2);
     for (let index = 0; index < count; index += 1) {
-      const roll = Math.floor(this.rand() * 21);
+      const roll = Math.floor(this.rand() * 22);
       const target = this.pick([...this.u.world.orders.values()]);
       const trade = this.pick(this.u.world.trades);
       switch (roll) {
@@ -707,6 +1051,13 @@ class Sim {
             };
           };
           break;
+        case 20: {
+          // r11 (the class fix at the door layer): a door mutation of one door's true answer, which the door detects.
+          const mutated = this.#mutatedFaults(1);
+          chosen.push("DOOR_MUTATION");
+          Object.assign(faults, mutated);
+          break;
+        }
         default:
           // A clock fault at a random await of the run (a read or an OMS write).
           this.#clockArm = 1 + Math.floor(this.rand() * 12);
@@ -729,6 +1080,7 @@ class Sim {
       ...chosen,
       listOpenOrders: (answer) => {
         const read = list(answer) as { orders?: unknown };
+        if (this.#snapshot !== null && !this.#replaying) this.#deliver("open-orders", answer(), read);
         if (Array.isArray(read.orders)) {
           for (const row of read.orders as Record<string, unknown>[]) {
             this.saw(row["venueOrderId"], row["sizeMatched"]);
@@ -739,6 +1091,7 @@ class Sim {
       },
       listTrades: (answer) => {
         const read = trades(answer) as { trades?: unknown };
+        if (this.#snapshot !== null && !this.#replaying) this.#deliver("trades", answer(), read);
         if (Array.isArray(read.trades)) {
           for (const trade of read.trades as { venueTradeId?: unknown; ownLegs?: unknown }[]) {
             const legs = Array.isArray(trade.ownLegs) ? (trade.ownLegs as Record<string, unknown>[]) : [];
@@ -756,6 +1109,7 @@ class Sim {
       },
       readOrder: (id, answer) => {
         const read = byId(id, answer) as { found?: unknown; order?: Record<string, unknown> };
+        if (this.#snapshot !== null && !this.#replaying) this.#deliver("by-id", answer(), read, id);
         if (read.found === true && read.order !== undefined) {
           this.saw(id, read.order["sizeMatched"]);
           this.sawFacts(`order:${id}`);
@@ -793,6 +1147,16 @@ class Sim {
 
   #checkRuns(runs: readonly { readonly runId: string | null; readonly resumed: boolean }[], before: number): void {
     const events = this.u.journalEvents.slice(before);
+    // (r11) A run replaying a stale snapshot: once a NEWER fact was delivered, it must not resume.
+    if (this.#replaying) {
+      const newer = this.#newerThanSnapshot();
+      for (const run of runs) {
+        if (run.runId === null) continue;
+        if (newer !== null) this.staleHeld += 1;
+        if (run.resumed && newer !== null) this.violations.push(`run ${run.runId} resumed on a stale snapshot after a newer fact was delivered: ${newer}`);
+        if (run.resumed && newer === null) this.staleResumed += 1;
+      }
+    }
     const breaks = new Map(this.p.journal.breaks().map((view) => [view.breakId, view]));
     for (const run of runs) {
       if (run.runId === null) continue;
@@ -830,7 +1194,14 @@ class Sim {
   /** R1 to R3, as the harness's oracle recorded them, less the disclosed identity limit; and the standing invariants. */
   #checkOracle(): void {
     const recorded = this.u.violations.splice(0);
+    // (r11) In a run replaying a stale snapshot with nothing newer delivered, the coordinator cannot know the venue
+    // moved on: R1 (judged against the venue's truth now) is excused there, and counted.
+    const staleBlind = this.#replaying && this.#newerThanSnapshot() === null;
     for (const message of recorded) {
+      if (staleBlind && message.startsWith("R1 ")) {
+        this.staleExcused += 1;
+        continue;
+      }
       const salt = /for salt (\S+?)[,\s]/u.exec(message)?.[1];
       if (message.startsWith("R2:") && salt !== undefined && this.#identityLimit(salt)) {
         this.exemptions += 1;
@@ -972,11 +1343,24 @@ export async function runSeed(seed: number): Promise<SeedResult> {
     } else if (roll < 0.82) await sim.reconcile();
     else if (roll < 0.88) await sim.restart(sim.chance(0.6));
     else if (roll < 0.94) await sim.release();
+    else if (roll < 0.97) await sim.lagEpisode();
     else {
       sim.steps.push("ADVANCE");
       sim.u.clock.t += sim.u.policy.quiescenceHorizonMs + 1;
     }
   }
   await sim.settleAndCheckObligations();
-  return Object.freeze({ seed, violations: Object.freeze([...sim.violations]), exemptions: sim.exemptions, resumes: sim.u.resumes, runs: sim.runs, steps: Object.freeze([...sim.steps]) });
+  return Object.freeze({
+    seed,
+    violations: Object.freeze([...sim.violations]),
+    exemptions: sim.exemptions,
+    resumes: sim.u.resumes,
+    runs: sim.runs,
+    steps: Object.freeze([...sim.steps]),
+    lagEpisodes: sim.lagEpisodes,
+    doorMutations: sim.doorMutations,
+    staleExcused: sim.staleExcused,
+    staleHeld: sim.staleHeld,
+    staleResumed: sim.staleResumed,
+  });
 }

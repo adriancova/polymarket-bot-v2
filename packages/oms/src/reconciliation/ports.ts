@@ -370,10 +370,11 @@ export type JournalInput =
 export interface JournalEvidenceInput {
   readonly kind: "EVIDENCE_RECORDED";
   readonly runId: string | null;
-  readonly evidenceKind: "ORDER" | "LEG" | "TRADE" | "UNKEYED_LEG" | "SETTLED";
-  /** `null` only for a TRADE record (r9: a trade identity, whatever its legs). */
+  /** (r11) `ORPHAN_LEG`, `UNKEYED_ORDER`, `UNKEYED_TRADE`, `HOLDING`, `MEMBER`: the door layer's class fix (`evidence.ts`). */
+  readonly evidenceKind: "ORDER" | "LEG" | "TRADE" | "UNKEYED_LEG" | "ORPHAN_LEG" | "UNKEYED_ORDER" | "UNKEYED_TRADE" | "HOLDING" | "MEMBER" | "SETTLED";
+  /** The venue order: an ORDER's, a LEG's, a SETTLED's, and an UNKEYED_LEG's when it was readable; `null` otherwise. */
   readonly venueOrderId: string | null;
-  /** LEG and TRADE: the venue trade. */
+  /** LEG, TRADE and (r11) ORPHAN_LEG: the venue trade. */
   readonly venueTradeId: string | null;
   readonly provenance: "SHOWN" | "NAMED";
   readonly source: string;
@@ -385,11 +386,19 @@ export interface JournalEvidenceInput {
   readonly status: string | null;
   /** SETTLED: the level it covers; (r10) UNKEYED_LEG: how many such unkeyed legs its answer showed. */
   readonly level: number | null;
-  /** LEG and (r10) UNKEYED_LEG only (r7): the leg's fill facts as the observation fixed them; `null` on every other record. */
+  /** LEG, (r10) UNKEYED_LEG and (r11) ORPHAN_LEG only (r7): the leg's fill facts as the observation fixed them; `null` on every other record. */
   readonly feeAmount: string | null;
   readonly feeAssetId: string | null;
   readonly role: "MAKER" | "TAKER" | null;
   readonly matchedAt: string | null;
+  /** (r11) The fragments the observation carried but could not read (field names, sorted). */
+  readonly unreadable: readonly string[];
+  /** (r11) A trade's or a member's transaction hash, as read. */
+  readonly transactionHash: string | null;
+  /** (r11) A HOLDING's key; a MEMBER's member. */
+  readonly subject: string | null;
+  /** (r11) A HOLDING's value; a MEMBER's credited amount; a trade row's ownership flag. */
+  readonly value: string | null;
   readonly atMs: number;
 }
 

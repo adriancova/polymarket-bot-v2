@@ -98,6 +98,40 @@ not a fault.
    | (r10) the id alone of an invalid order row of such a by-id answer | named |
    | (r10) the rows of an open-orders, trades or by-id answer one of whose top-level fields, or one of whose list entries, is not own data (an accessor, say), when its route is readable and the right one: kept like any unusable answer's (the answer is unusable) | as above |
    | the id alone of a malformed row or leg (nothing else of it validated) | named |
+   | (r11) a row or leg whose id is readable but that did not validate in full: EVERY fragment of it that validated on its own (an order's token, side, price, sizes and status; a leg's shares, price, fee, fee asset, role, match time, token and side), with the names of those that did not. A matched size so kept bounds every later read; a fixed fact so kept is compared | named |
+   | (r11) an order row (a list's, or a by-id answer's) whose venue order id is unreadable: an `UNKEYED_ORDER` obligation with every fragment it validated | named |
+   | (r11) an own leg whose ORDER id is unreadable, under a readable trade id: an `ORPHAN_LEG` of that trade (the trade's identity is then open, r9), with every fact it showed | named |
+   | (r11) a trade row whose trade id is unreadable and that carried no own leg on a readable order (its leg list empty or unreadable), or an own leg whose trade and order ids are both unreadable: an `UNKEYED_TRADE` or `UNKEYED_LEG` obligation of the account | named |
+   | (r11) a by-id answer's `found: true` when the answer is unusable (its row absent, its id unreadable, or the order asked about's): the order asked about exists (`BY_ID_FOUND`), so a later not-found is a contradiction (E-14), never a ghost | named |
+   | (r11) every position, the collateral balance and every approval an answer showed, valid or not (`HOLDING`): kept as detail only (a holding goes down legitimately, so no later read is judged against it) | shown or named |
+   | (r11) every wallet member read by name (`MEMBER`): its state, hash and amount credited, valid or not; a state that contradicts another terminal one holds the member (section 7) | shown or named |
+   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed | named |
+
+   **(r11) Salvage is the default path.** Every door reads EVERY field of
+   EVERY row of every answer on its own first, whatever the answer's
+   usability, and only then decides the outcome; every outcome carries what
+   was read, and the coordinator records all of it through ONE recording
+   function. Nothing a door validated is lost between the wire and the
+   evidence, and a fragment present but unreadable is never "nothing":
+   - of an object whose id is readable, it is that object's obligation: the
+     order is read by id until a sound run reads it in full (its `SETTLED`);
+     the trade's identity is open until a valid row shows its own legs (r9);
+   - an UNREADABLE IDENTITY (an order row, a trade row or a leg whose id is
+     unreadable) is an obligation of its own. Only an own leg of a WHOLE
+     trades answer, every fill fact of it readable, can ever be answered (by
+     the trades owed: below); every other one holds the account for good
+     (`READ_CONFLICT` keyed `unreadable`): no read can say which object it
+     was (an order leaves the open-orders list when it ends and is found
+     again only by id; a leg with a fact unreadable matches no trade
+     exactly; the stream is not an answer that shows every trade);
+   - the answer's own fields (its route, `complete`, `found`, the list
+     itself) unreadable are the read's own break (`READ_MALFORMED`,
+     `READ_WRONG_ROUTE`), which clears only when a conclusive run reads that
+     door in full.
+   One boundary: an answer whose route (or, for the collateral, its source)
+   is READABLE and names another source (Data API v1, the CLOB balance cache)
+   keeps nothing: its rows are that source's, not this read's (E-15, U-22).
+   An answer whose route is unreadable keeps its rows (fail closed).
    | an id the OMS retains as user-stream evidence | named |
    | what the user stream reported that the OMS did not apply, whatever it answered (it retained it; it refused it as unknown, inconsistent or contradicting; its store failed and it faulted; it was already faulted; it refused the input; it holds no such fill; it threw), or that was routed while no OMS was bound, recorded the moment it is routed, with a run triggered (r7) | named |
 
@@ -295,6 +329,21 @@ not a fault.
      delivered) PLUS the unkeyed legs'. A read showing less is a
      `READ_REGRESSION`. The order's own matched size alone was not enough: a
      leg no larger than what the order already showed added nothing to it.
+   **(r11) Its settlement status is owed too.** The unkeyed row's status is
+   kept (one record per status among the rows of one fill, each owing the
+   fill's whole count; journaled and replayed), and a trade shown by id
+   answers the leg only when its settlement AGREES with it: the same terminal
+   status (a CONFIRMED trade never answers a FAILED row: a terminal
+   contradiction), or, for MATCHED, MINED or RETRYING, that status or one
+   after it (a MINED trade never answers a FAILED row; a MATCHED one never
+   answers a MINED row: a backwards read). EVERY candidate (every trade the
+   evidence did not hold, shown with exactly the leg's facts) must agree, or
+   it holds: the unkeyed row could be any of them. So a FAILED settlement
+   shown under an unreadable id, then a stale snapshot showing the trade
+   CONFIRMED or MINED, holds; once a read shows it FAILED, the keyed FAILED
+   path takes over (its quarantine, its reversal). A status unreadable, or
+   outside the documented vocabulary, fixes nothing a witness must match (as
+   for a keyed row's); it is named on the record.
    A later read of the same garbled answer, with nothing learned since, owes
    nothing new; one made after more trades were learned owes beyond them too
    (section 10).
@@ -660,6 +709,30 @@ returns at once, with no run.
   copy of a trade already known, it owes one trade more than the venue has,
   and the account stays held: no release exists (section 10). Find which
   trade the row was from the adapter's logs and escalate.
+- **A `READ_CONFLICT` whose detail says "each with a settlement that agrees
+  with"** (r11) is the unkeyed leg above, owed with its row's settlement
+  status; "disagreeing: ..." names the trades shown since whose settlement
+  does not agree (a stale snapshot showing an earlier status, or the other
+  terminal one). It clears when the reads show the trade at that status or
+  after it. If a trade was shown both CONFIRMED and FAILED, its own
+  `READ_CONFLICT` ("both CONFIRMED and FAILED") never clears either.
+- **A `READ_CONFLICT` keyed `unreadable`** (r11) is an account-level
+  UNREADABLE obligation: an order row, a trade row or a leg whose id could
+  not be read (its detail says which, its source, and every fragment it
+  showed), or a user-stream entry that could not be read. No read can say
+  which object it was, so it never clears and halts the account until the
+  retraction ADR gives a path (section 10). Find what the row was from the
+  adapter's logs; fix the adapter; escalate.
+- **A `READ_CONFLICT` whose detail says "whose venue order id was
+  unreadable"** (r11) names a trade on which an observation showed an own
+  leg with an unreadable order id, and which a valid row has since shown
+  with its legs in full, none of them that leg: the trade's legs were shown
+  two ways. It never clears (section 10).
+- **A `READ_CONFLICT` on a wallet member** (r11: "observations showed it
+  both FAILED and CONFIRMED", or two amounts credited) means two reads of one
+  member, an unusable one included, contradict each other. The member is
+  never answered; the operation stays reconciling. Establish the chain's
+  receipt; escalate.
 - **A `READ_MALFORMED` on one order's by-id read that does not clear** (r10)
   means the by-id answer for that order is unusable (it says not found but
   carries an order, does not say whether it found it, or returns another
@@ -714,6 +787,14 @@ whose id cannot be read holds its order until the reads show, by id, every
 trade it may have been, and for good when its answer was not whole (a
 partial answer, or one with a row nothing of which could be identified;
 section 3).
+
+(r11) Every answer must state its route (or source) as text, carry each
+row's id as text, and keep every field in its domain: a row whose id cannot
+be read holds the account for good (it can never be matched to an object);
+a field out of its domain is kept as unreadable on its object, which is then
+read again until a sound read shows it in full. WP-280's user-stream outputs
+must carry their lists as plain lists of plain items: an entry that is not
+own data holds the account for good.
 
 The composition also binds `tokenOfGroup` to the execution groups it
 registered with the OMS (`execution.groups.token_id`). An order whose group's
@@ -781,6 +862,39 @@ nothing is judged or booked from it.
   AFTER more trades were learned owes beyond them too. So an adapter that
   garbles the id of a trade the coordinator already knows, or garbles one
   intermittently, holds the account for good.
+- **(r11) Every unreadable identity holds for good.** Since r11, so do: an
+  order row whose venue order id is unreadable (in a list, or in a by-id
+  answer: never relabelled to the id asked about); a trade row whose trade id
+  is unreadable and whose own legs could not be kept on a readable order; an
+  own leg under an unreadable trade id with any fill fact unreadable (or its
+  order id); a user-stream item whose trade id is unreadable, and a stream
+  entry or list that is not own data; a by-id answer's `found: true` for an
+  order the venue later does not find; an orphan leg of a trade that a valid
+  row later shows without it; a wallet member shown both FAILED and
+  CONFIRMED. Each is fail closed: an adapter that garbles one id, once,
+  holds the account until the retraction ADR gives an operator path. The
+  measured cost on the property is in the WP-290 r11 handoff.
+- **(r11) What the doors keep, and what they do not.** Holdings (positions,
+  the collateral balance, approvals) are kept as evidence, as detail only: a
+  holding goes down legitimately (a sale, a FAILED settlement, a
+  redemption), so a past value cannot bound a later read; the activity
+  behind it is evidenced where it is monotonic (trades, orders, wallet
+  members). An answer of another READABLE route or source (Data API v1, the
+  CLOB balance cache) keeps nothing: it is not this read's observation (E-15,
+  U-22); its own break holds. The user stream's `STATE` and
+  `UNRECOGNIZED_MESSAGE` outputs and each output's normalized `event` are
+  not read: the coordinator reads WP-280's OMS projection (its fills,
+  settlements and order observation), which is WP-280's contract with the
+  OMS and with this coordinator; WP-280 raises its own reconciliation
+  requests for what it could not normalize. The ledger's projection and its
+  remaining bookings are the system's own state, not venue observations, and
+  keep nothing.
+- **(r11) An unkeyed row's status outside the documented vocabulary** (C-3's
+  `MATCHED_NOT_BROADCASTED`, say) fixes no constraint on its witness, exactly
+  as for a keyed row (whose unrecognised status holds only the run that read
+  it): such a status cannot be ordered against the documented ones, and no
+  venue document says where it sits. A later CONFIRMED (or FAILED) read of
+  the trade then answers it; the FAILED path still applies to a FAILED one.
 - **What "evidence never goes down" assumes (unverified venue assumptions,
   held as a conservative policy).** No venue document states any of these;
   the code treats a read that disagrees as wrong (it holds), never as a

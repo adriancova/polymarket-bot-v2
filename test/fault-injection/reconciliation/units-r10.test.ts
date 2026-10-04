@@ -26,6 +26,8 @@ import {
   type EvidenceRecord,
 } from "../../../packages/oms/src/reconciliation/evidence.js";
 
+import { legsOf, namedOf, rowsOf, tradesOf } from "./support/salvage.js";
+
 type Row = Record<string, unknown>;
 type Leg = VenueTradeView["ownLegs"][number];
 
@@ -45,9 +47,10 @@ describe("WP-290 r10 units (WP290-CX-R10-01): the by-id door keeps an unusable a
   const answer = (fields: Row): Row => ({ route: "/data/order", ...fields });
 
   it("(door) a usable answer is unchanged: found with the order asked about is OK; not found with no order is OK null", () => {
-    expect(readOrderById(answer({ found: true, order: { ...ORDER } }), "venue-1")).toEqual({ kind: "OK", value: ORDER });
-    expect(readOrderById(answer({ found: false }), "venue-1")).toEqual({ kind: "OK", value: null });
-    expect(readOrderById(answer({ found: false, order: null }), "venue-1")).toEqual({ kind: "OK", value: null });
+    // (r11) Every outcome carries its salvage now (`support/salvage.ts` reads it as the r10 door returned it).
+    expect(readOrderById(answer({ found: true, order: { ...ORDER } }), "venue-1")).toMatchObject({ kind: "OK", value: ORDER });
+    expect(readOrderById(answer({ found: false }), "venue-1")).toMatchObject({ kind: "OK", value: null });
+    expect(readOrderById(answer({ found: false, order: null }), "venue-1")).toMatchObject({ kind: "OK", value: null });
   });
 
   it("(door) not found but carrying a valid order, found absent or not a boolean: MALFORMED for the order asked about, and the row kept (SHOWN) under its own id", () => {
@@ -55,8 +58,8 @@ describe("WP-290 r10 units (WP290-CX-R10-01): the by-id door keeps an unusable a
       const outcome = readOrderById(answer(fields), "venue-1");
       expect(outcome.kind).toBe("MALFORMED");
       if (outcome.kind !== "MALFORMED") continue;
-      expect(outcome.salvage?.rows).toEqual([ORDER]);
-      expect(outcome.named).toEqual(new Map([["venue-1", "1"]]));
+      expect(rowsOf(outcome)).toEqual([ORDER]);
+      expect(namedOf(outcome)).toEqual(new Map([["venue-1", "1"]]));
     }
   });
 
@@ -65,27 +68,31 @@ describe("WP-290 r10 units (WP290-CX-R10-01): the by-id door keeps an unusable a
     expect(outcome.kind).toBe("MALFORMED");
     if (outcome.kind !== "MALFORMED") return;
     expect(outcome.why).toBe("the order answer names another order");
-    expect(outcome.salvage?.rows.map((row) => row.venueOrderId)).toEqual(["venue-2"]);
-    expect([...(outcome.named ?? new Map()).keys()]).toEqual(["venue-2"]);
+    expect(rowsOf(outcome).map((row) => row.venueOrderId)).toEqual(["venue-2"]);
+    expect([...namedOf(outcome).keys()]).toEqual(["venue-2"]);
   });
 
-  it("(door) an invalid row keeps only its readable id (NAMED); one with no readable id, and an answer of another route, keep nothing", () => {
+  it("(door) an invalid row keeps its readable id with no row in full (NAMED); (r11) one with no readable id is kept UNKEYED; an answer of another route keeps nothing", () => {
     const invalid = readOrderById(answer({ found: true, order: { ...ORDER, price: "not a price" } }), "venue-1");
-    expect(invalid.kind === "MALFORMED" ? [invalid.named, invalid.salvage] : undefined).toEqual([new Map([["venue-1", null]]), undefined]);
+    expect(invalid.kind === "MALFORMED" ? [namedOf(invalid), rowsOf(invalid)] : undefined).toEqual([new Map([["venue-1", null]]), []]);
     const notFoundInvalid = readOrderById(answer({ found: false, order: { ...ORDER, venueOrderId: "venue-3", sizeMatched: "2" } }), "venue-1");
-    expect(notFoundInvalid.kind === "MALFORMED" ? [notFoundInvalid.named, notFoundInvalid.salvage] : undefined).toEqual([new Map([["venue-3", null]]), undefined]);
+    expect(notFoundInvalid.kind === "MALFORMED" ? [namedOf(notFoundInvalid), rowsOf(notFoundInvalid)] : undefined).toEqual([new Map([["venue-3", null]]), []]);
     const noId = readOrderById(answer({ found: true, order: { ...ORDER, venueOrderId: 7 } }), "venue-1");
-    expect(noId.kind === "MALFORMED" ? [noId.named, noId.salvage] : undefined).toEqual([undefined, undefined]);
-    expect(readOrderById({ route: "/v1/order", found: false, order: { ...ORDER } }, "venue-1")).toEqual({ kind: "WRONG_ROUTE", route: "/v1/order" });
+    expect(noId.kind === "MALFORMED" ? [namedOf(noId), rowsOf(noId)] : undefined).toEqual([new Map(), []]);
+    // (r11, the class fix) Not dropped: the row is kept with no id (never relabelled to the id asked about), its every
+    // readable fragment, and its unreadable id (an UNKEYED_ORDER obligation once recorded).
+    expect(noId.salvage.orders.map((row) => [row.venueOrderId, row.sizeMatched, row.unreadable])).toEqual([[null, "0.8", ["venueOrderId"]]]);
+    expect(readOrderById({ route: "/v1/order", found: false, order: { ...ORDER } }, "venue-1")).toMatchObject({ kind: "WRONG_ROUTE", route: "/v1/order", salvage: { orders: [] } });
   });
 
-  it("(door audit) a by-id answer whose `found` is an accessor keeps its valid row when its route is the right one; with an unreadable or other route, nothing", () => {
+  it("(door audit) a by-id answer whose `found` is an accessor keeps its valid row when its route is the right one, (r11) or unreadable; with another readable route, nothing", () => {
     const opaque = readOrderById(withAccessor(answer({ found: true, order: { ...ORDER, venueOrderId: "venue-2" } }), "found"), "venue-1");
-    expect(opaque.kind === "MALFORMED" ? [opaque.why, opaque.salvage?.rows.map((row) => row.venueOrderId)] : undefined).toEqual(["the order answer carries a field that is not own data", ["venue-2"]]);
+    expect(opaque.kind === "MALFORMED" ? [opaque.why, rowsOf(opaque).map((row) => row.venueOrderId)] : undefined).toEqual(["the order answer carries a field that is not own data", ["venue-2"]]);
+    // (r11, the class fix) An unreadable route is an unknown provenance, not another source: its row is kept (fail closed).
     const noRoute = readOrderById(withAccessor(answer({ found: true, order: { ...ORDER } }), "route"), "venue-1");
-    expect(noRoute.kind === "MALFORMED" ? [noRoute.named, noRoute.salvage] : undefined).toEqual([undefined, undefined]);
+    expect(noRoute.kind === "MALFORMED" ? [namedOf(noRoute), rowsOf(noRoute)] : undefined).toEqual([new Map([["venue-1", "1"]]), [ORDER]]);
     const otherRoute = readOrderById(withAccessor({ route: "/v1/order", found: true, order: { ...ORDER } }, "found"), "venue-1");
-    expect(otherRoute.kind === "MALFORMED" ? [otherRoute.named, otherRoute.salvage] : undefined).toEqual([undefined, undefined]);
+    expect(otherRoute.kind === "MALFORMED" ? [namedOf(otherRoute), rowsOf(otherRoute), otherRoute.salvage.orders] : undefined).toEqual([new Map(), [], []]);
   });
 });
 
@@ -95,10 +102,10 @@ describe("WP-290 r10 units (the door audit): an answer with an opaque top-level 
     expect(outcome.kind).toBe("MALFORMED");
     if (outcome.kind !== "MALFORMED") return;
     expect(outcome.why).toBe("the open-orders answer carries a field that is not own data");
-    expect(outcome.salvage?.rows).toEqual([ORDER]);
-    expect(outcome.named).toEqual(new Map([["venue-1", "1"], ["venue-9", null]]));
+    expect(rowsOf(outcome)).toEqual([ORDER]);
+    expect(namedOf(outcome)).toEqual(new Map([["venue-1", "1"], ["venue-9", null]]));
     const otherRoute = readOpenOrders(withAccessor({ route: "/v1/orders", complete: true, orders: [{ ...ORDER }] }, "complete"));
-    expect(otherRoute.kind === "MALFORMED" ? [otherRoute.named, otherRoute.salvage] : undefined).toEqual([undefined, undefined]);
+    expect(otherRoute.kind === "MALFORMED" ? [namedOf(otherRoute), otherRoute.salvage.orders] : undefined).toEqual([new Map(), []]);
   });
 
   it("(trades) `complete` an accessor: MALFORMED, every trade identity and every valid leg kept", () => {
@@ -106,10 +113,11 @@ describe("WP-290 r10 units (the door audit): an answer with an opaque top-level 
     const outcome = readTrades(withAccessor({ route: "/data/trades", complete: true, trades: [row] }, "complete"));
     expect(outcome.kind).toBe("MALFORMED");
     if (outcome.kind !== "MALFORMED") return;
-    expect(outcome.salvage?.trades).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "IN_FULL" }]);
-    expect(outcome.salvage?.legs).toEqual([{ venueTradeId: "t", status: "CONFIRMED", leg: LEG }]);
+    expect(tradesOf(outcome)).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "IN_FULL" }]);
+    expect(legsOf(outcome)).toEqual([{ venueTradeId: "t", status: "CONFIRMED", leg: LEG }]);
+    // (r11, the class fix) An unreadable route is an unknown provenance, not another source: its rows are kept.
     const unrouted = readTrades(withAccessor({ route: "/data/trades", complete: true, trades: [row] }, "route"));
-    expect(unrouted.kind === "MALFORMED" ? [unrouted.named, unrouted.salvage] : undefined).toEqual([undefined, undefined]);
+    expect(unrouted.kind === "MALFORMED" ? [tradesOf(unrouted), legsOf(unrouted)] : undefined).toEqual([[{ venueTradeId: "t", status: "CONFIRMED", shape: "IN_FULL" }], [{ venueTradeId: "t", status: "CONFIRMED", leg: LEG }]]);
   });
 
   it("(trades, WHOLE) an answer is whole only when complete, its list and fields readable, and every row identified (a valid row, a readable trade id, or every own leg valid with its ownership determined)", () => {
@@ -117,7 +125,7 @@ describe("WP-290 r10 units (the door audit): an answer with an opaque top-level 
     const whole = (raw: unknown): boolean | undefined => {
       const outcome = readTrades(raw);
       // No salvage at all (nothing kept) is never whole either.
-      return outcome.kind === "MALFORMED" || outcome.kind === "INCOMPLETE" ? (outcome.salvage?.whole ?? false) : undefined;
+      return outcome.kind === "MALFORMED" || outcome.kind === "INCOMPLETE" ? outcome.salvage.whole : undefined;
     };
     const answer = (trades: unknown[], complete: unknown = true): Row => ({ route: "/data/trades", complete, trades });
     const garbled = row({ venueTradeId: 42 });
@@ -146,8 +154,8 @@ describe("WP-290 r10 units (the door audit): an answer with an opaque top-level 
       const outcome = readTrades({ route: "/data/trades", complete: true, trades: [garbled] });
       expect(outcome.kind).toBe("MALFORMED");
       if (outcome.kind !== "MALFORMED") continue;
-      expect(outcome.salvage?.trades).toEqual([]);
-      expect(outcome.salvage?.legs).toEqual([{ venueTradeId: null, status: "CONFIRMED", leg: LEG }]);
+      expect(tradesOf(outcome)).toEqual([]);
+      expect(legsOf(outcome)).toEqual([{ venueTradeId: null, status: "CONFIRMED", leg: LEG }]);
     }
   });
 });
@@ -166,7 +174,9 @@ describe("WP-290 r10 units (WP290-V10-UNKEYED-LEG-DISCHARGED): an unkeyed leg is
       expect(store.keyedTradesShowing("venue-1", fillFactsOfLeg(LEG))).toEqual(["trade-1"]);
       expect(store.unaccountedUnkeyed("venue-1").map((fill) => [fill.need, fill.known, fill.shown])).toEqual([[1, ["trade-1"], []]]);
       expect(judgeOrder(store)).toContain("in a row whose trade id was unreadable");
-      expect(judgeOrder(store)).toContain("the reads owe 1 distinct trade(s) with a leg of exactly those facts on it, shown by a readable id, beyond the 1 it already held there (trade-1), and they have shown 0 (none)");
+      // (r11) The detail now also names the settlement every candidate must agree with.
+      expect(judgeOrder(store)).toContain("the reads owe 1 distinct trade(s) with a leg of exactly those facts on it, shown by a readable id, beyond the 1 it already held there (trade-1)");
+      expect(judgeOrder(store)).toContain("and they have shown 0 (none)");
       // trade-1 shown again cannot answer it: the unkeyed row may have been trade-1.
       store.add(keyed("trade-1", LEG, "TRADES_LEG_SALVAGED"));
       expect(store.unaccountedUnkeyed("venue-1")).toHaveLength(1);
@@ -199,7 +209,8 @@ describe("WP-290 r10 units (WP290-V10-UNKEYED-LEG-DISCHARGED): an unkeyed leg is
     const store = EvidenceStore.fold([shownOrder(ORDER, "OPEN_ORDERS_LIST"), keyed("trade-1"), unkeyedLegRecord(LEG, null, 1, false)]);
     store.add(keyed("trade-2"));
     store.add(keyed("trade-3"));
-    expect(store.unaccountedUnkeyed("venue-1").map((fill) => [fill.partial, fill.known, fill.shown])).toEqual([[true, ["trade-1"], ["trade-2", "trade-3"]]]);
+    // (r11) `partial` is now `never`: no read can answer it (a partial answer's, as here, among others).
+    expect(store.unaccountedUnkeyed("venue-1").map((fill) => [fill.never, fill.known, fill.shown])).toEqual([[true, ["trade-1"], ["trade-2", "trade-3"]]]);
     expect(judgeOrder(store)).toContain("in an answer that did not show every trade of the account");
     // Nothing about the same fill is new information after it; a whole observation before it does not stop it.
     expect(store.add(unkeyedLegRecord(LEG, null, 1, true))).toBe(false);
@@ -207,10 +218,10 @@ describe("WP-290 r10 units (WP290-V10-UNKEYED-LEG-DISCHARGED): an unkeyed leg is
     const after = EvidenceStore.fold([shownOrder(ORDER, "OPEN_ORDERS_LIST"), unkeyedLegRecord(LEG, null, 1, true)]);
     expect(after.add(unkeyedLegRecord(LEG, null, 1, false))).toBe(true);
     after.add(keyed("trade-5"));
-    expect(after.unaccountedUnkeyed("venue-1").map((fill) => fill.partial)).toEqual([true]);
+    expect(after.unaccountedUnkeyed("venue-1").map((fill) => fill.never)).toEqual([true]);
     // Replayed the same.
     const records = [shownOrder(ORDER, "OPEN_ORDERS_LIST"), unkeyedLegRecord(LEG, null, 1, false), keyed("trade-2")];
-    expect(EvidenceStore.fold(records).unaccountedUnkeyed("venue-1").map((fill) => fill.partial)).toEqual([true]);
+    expect(EvidenceStore.fold(records).unaccountedUnkeyed("venue-1").map((fill) => fill.never)).toEqual([true]);
   });
 
   it("(store) a trade is a witness only when a read SHOWED its leg with exactly the same facts: another fee, time, side or shares, a stream-only leg, or a leg shown two ways is not", () => {
@@ -237,11 +248,13 @@ describe("WP-290 r10 units (WP290-V10-UNKEYED-LEG-DISCHARGED): an unkeyed leg is
   it("(store) a record is information only when it owes something new: a new fill, more legs, or a trade learned on the order since; a repeated observation is not", () => {
     const store = EvidenceStore.fold([shownOrder(ORDER, "OPEN_ORDERS_LIST")]);
     expect(store.add(unkeyedLegRecord(LEG, "CONFIRMED", 1, true))).toBe(true);
-    expect(store.add(unkeyedLegRecord(LEG, "MATCHED", 1, true))).toBe(false);
+    // (r11, WP290-V11-UNKEYED-STATUS-DROPPED) Another status of the same fill IS new information now: every status an
+    // unkeyed row showed is kept and decided on (r10 kept only the first, as detail).
+    expect(store.add(unkeyedLegRecord(LEG, "MATCHED", 1, true))).toBe(true);
     expect(store.add(unkeyedLegRecord({ ...LEG, matchedAt: "2026-10-03T00:00:00.000Z" }, "CONFIRMED", 1, true))).toBe(false);
     expect(store.add(unkeyedLegRecord(LEG, "CONFIRMED", 2, true))).toBe(true);
     expect(store.add(unkeyedLegRecord(LEG, "CONFIRMED", 1, true))).toBe(false);
-    expect(store.unaccountedUnkeyed("venue-1").map((fill) => fill.need)).toEqual([1, 2]);
+    expect(store.unaccountedUnkeyed("venue-1").map((fill) => fill.need)).toEqual([1, 1, 2]);
     // A trade of those facts shown since: the same garbled answer read again owes a trade beyond it too (fail closed:
     // the unkeyed row may be a new trade the read omits); it is new information, journaled.
     store.add(keyed("trade-1"));
@@ -322,20 +335,22 @@ describe("WP-290 r10 units (the door audit): one list entry that is not own data
 
   it("(open orders) an opaque row: MALFORMED (the list is not one), every other valid row SHOWN", () => {
     const outcome = readOpenOrders({ route: "/data/orders", complete: true, orders: withOpaqueEntry([{ ...ORDER, venueOrderId: "venue-0" }, { ...ORDER }], 0) });
-    expect(outcome.kind === "MALFORMED" ? [outcome.why, outcome.salvage?.rows] : undefined).toEqual(["the open orders are not a list", [ORDER]]);
+    expect(outcome.kind === "MALFORMED" ? [outcome.why, rowsOf(outcome)] : undefined).toEqual(["the open orders are not a list", [ORDER]]);
     const partial = readOpenOrders({ route: "/data/orders", complete: false, orders: withOpaqueEntry([{ ...ORDER, venueOrderId: "venue-0" }, { ...ORDER }], 0) });
-    expect(partial.kind === "INCOMPLETE" ? partial.salvage?.rows : undefined).toEqual([ORDER]);
+    expect(partial.kind === "INCOMPLETE" ? rowsOf(partial) : undefined).toEqual([ORDER]);
+    // (r11, the class fix) The opaque entry is not dropped: it is a row every fragment of which is unreadable.
+    expect(partial.salvage.orders.map((row) => [row.venueOrderId, row.unreadable.length])).toEqual([[null, 7], ["venue-1", 0]]);
   });
 
   it("(trades) an opaque row: MALFORMED, every other row's identity and valid legs kept; an opaque leg: the row's other legs kept, unkeyed ones included", () => {
     const outcome = readTrades({ route: "/data/trades", complete: true, trades: withOpaqueEntry([tradeRow("t0", [{ ...LEG }]), tradeRow("t", [{ ...LEG }])], 0) });
-    expect(outcome.kind === "MALFORMED" ? [outcome.why, outcome.salvage?.trades.map((trade) => trade.venueTradeId), outcome.salvage?.legs.map((leg) => leg.venueTradeId)] : undefined).toEqual([
+    expect(outcome.kind === "MALFORMED" ? [outcome.why, tradesOf(outcome).map((trade) => trade.venueTradeId), legsOf(outcome).map((leg) => leg.venueTradeId)] : undefined).toEqual([
       "the trades are not a list",
       ["t"],
       ["t"],
     ]);
     const leg2 = { ...LEG, venueOrderId: "venue-2" };
     const opaqueLeg = readTrades({ route: "/data/trades", complete: true, trades: [tradeRow(42, withOpaqueEntry([{ ...LEG }, leg2], 0))] });
-    expect(opaqueLeg.kind === "MALFORMED" ? opaqueLeg.salvage?.legs : undefined).toEqual([{ venueTradeId: null, status: "CONFIRMED", leg: leg2 }]);
+    expect(opaqueLeg.kind === "MALFORMED" ? legsOf(opaqueLeg) : undefined).toEqual([{ venueTradeId: null, status: "CONFIRMED", leg: leg2 }]);
   });
 });

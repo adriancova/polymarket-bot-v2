@@ -14,6 +14,8 @@ import type { VenueTradeView } from "../../../packages/oms/src/index.js";
 import { readTrades } from "../../../packages/oms/src/reconciliation/door.js";
 import { EvidenceStore, legRecord, readEvidenceRecord, readEvidenceRecords, tradeRecord, type EvidenceRecord } from "../../../packages/oms/src/reconciliation/evidence.js";
 
+import { legsOf, tradesOf } from "./support/salvage.js";
+
 type Row = Record<string, unknown>;
 
 describe("WP-290 r9 units: the door keeps every readable trade identity; the store folds TRADE records; the journal keeps them", () => {
@@ -22,21 +24,28 @@ describe("WP-290 r9 units: the door keeps every readable trade identity; the sto
   const answer = (trades: unknown[], complete = true): unknown => ({ route: "/data/trades", complete, trades });
 
   it("(door) a malformed leg, a legless row of an incomplete answer, an unreadable leg list: the trade id is kept with its status; an unreadable trade id keeps no trade", () => {
+    // (r11) The door's salvage is read through `support/salvage.ts`: the same views the r9 door returned.
     const malformedLeg = readTrades(answer([row({ ownLegs: [{ ...LEG, feeAmount: "bad" }] })]));
     expect(malformedLeg.kind).toBe("MALFORMED");
     if (malformedLeg.kind !== "MALFORMED") return;
-    expect(malformedLeg.salvage?.trades).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "MALFORMED" }]);
-    expect(malformedLeg.salvage?.legs ?? []).toEqual([]);
+    expect(tradesOf(malformedLeg)).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "MALFORMED" }]);
+    expect(legsOf(malformedLeg)).toEqual([]);
     const legless = readTrades(answer([row({ ownershipUndetermined: true, ownLegs: [] })], false));
     expect(legless.kind).toBe("INCOMPLETE");
     if (legless.kind !== "INCOMPLETE") return;
-    expect(legless.salvage?.trades).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "OWNERSHIP_UNDETERMINED" }]);
+    expect(tradesOf(legless)).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "OWNERSHIP_UNDETERMINED" }]);
     const inFull = readTrades(answer([row()], false));
-    expect(inFull.kind === "INCOMPLETE" ? inFull.salvage?.trades : undefined).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "IN_FULL" }]);
+    expect(inFull.kind === "INCOMPLETE" ? tradesOf(inFull) : undefined).toEqual([{ venueTradeId: "t", status: "CONFIRMED", shape: "IN_FULL" }]);
     const noList = readTrades(answer([row({ ownLegs: "unreadable", status: 7 })]));
-    expect(noList.kind === "MALFORMED" ? noList.salvage?.trades : undefined).toEqual([{ venueTradeId: "t", status: null, shape: "MALFORMED" }]);
+    expect(noList.kind === "MALFORMED" ? tradesOf(noList) : undefined).toEqual([{ venueTradeId: "t", status: null, shape: "MALFORMED" }]);
     const noId = readTrades(answer([row({ venueTradeId: 7, ownLegs: [{ ...LEG, feeAmount: "bad" }] })]));
-    expect(noId.kind === "MALFORMED" ? noId.salvage : "not malformed").toBeUndefined();
+    expect(noId.kind).toBe("MALFORMED");
+    // No readable trade identity is kept for it (as in r9); (r11, the class fix) but the row is NOT dropped: it is kept
+    // unkeyed, with its leg's every readable fact and its unreadable fee (an UNREADABLE obligation: `units-r11.test.ts`).
+    expect(tradesOf(noId)).toEqual([]);
+    expect(noId.salvage.trades.map((trade) => [trade.venueTradeId, trade.status, trade.unreadable, trade.legs.map((leg) => [leg.venueOrderId, leg.shares, leg.unreadable])])).toEqual([
+      [null, "CONFIRMED", ["venueTradeId"], [["venue-1", "0.4", ["feeAmount"]]]],
+    ]);
   });
 
   it("(store) a FAILED shown with no own leg is kept: a later CONFIRMED read of the trade is the durable CONFLICT, after a rebuild too", () => {

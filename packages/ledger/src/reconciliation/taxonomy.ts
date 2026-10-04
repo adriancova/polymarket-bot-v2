@@ -96,7 +96,20 @@
  * unkeyed legs. Such a leg of an answer that was not WHOLE (partial, or a row
  * of it not identified) is never answered: a trade that answer left out could
  * stand in for it, so its order holds for good. No economics of an unkeyed
- * leg is ever booked.
+ * leg is ever booked. (r11) Its row's settlement status is part of the
+ * obligation: a trade answers it only when its settlement agrees (the same
+ * terminal status, or a status at or after a non-terminal one), and every
+ * candidate must agree, or the order stays a `READ_CONFLICT`.
+ *
+ * (r11, the class fix at the coordinator's door layer) Every fragment a door
+ * validated reaches the evidence, whatever the answer's usability, and every
+ * fragment present but unreadable is an explicit obligation: of an object
+ * whose id is readable, that object's (read again until a sound read shows it
+ * in full); an UNREADABLE IDENTITY (an order row, a trade row or a leg whose
+ * id could not be read, an unreadable user-stream entry) is a
+ * `READ_CONFLICT` of the account keyed `unreadable`, which no run resolves
+ * (no read can say which object it was); a wallet member shown in two
+ * terminal states is a `READ_CONFLICT` on that member, never answered.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
  * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,

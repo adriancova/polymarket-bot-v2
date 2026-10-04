@@ -132,7 +132,12 @@ describe("WP-290 r9 (WP290-CX-R9-01): a readable trade identity of an unusable t
         expect(unresolved(r, "READ_CONFLICT", setup.second)?.detail).toContain("without identifying all of its own legs");
         // The identity was journaled (and so replayed), with its status as read: never its economics.
         expect(journaled).toEqual([[source, provenance, "CONFIRMED"]]);
-        expect(legs).toEqual([]);
+        // (r11, the class fix) The malformed leg is no longer dropped: its every fragment that validated on its own is
+        // kept, NAMED (never SHOWN, so never a witness or a booking), with the fragment it could not read; the identity
+        // stays open until a valid row shows the trade's own legs.
+        expect(legs.map((record) => [record.source, record.provenance, record.size, record.unreadable])).toEqual(
+          shape === "PARTIAL_NO_OWN_LEG" ? [] : [["TRADES_LEG_FRAGMENTS", "NAMED", "0.4", [shape === "MALFORMED_FEE" ? "feeAmount" : "matchedAt"]]],
+        );
         expect(fills(r)).toEqual([setup.first]);
         expect(r.u.violations).toEqual([]);
         // The reads catch up: the trade is shown with its own legs, its fill delivered, and the account resumes.
