@@ -191,6 +191,15 @@ export interface WalletReconciliationRequest {
   readonly unresolvedTransactions: readonly string[];
 }
 
+/**
+ * (r13) `packages/inventory`'s CLOSED `WalletOperationState` vocabulary (`wallet-operations.ts`,
+ * `WALLET_OPERATION_STATES`), mirrored (F13); `port-conformance.test.ts` pins the mirror equal to the original. An event
+ * or view whose state is outside it is unreadable: the coordinator treats the operation as unsettled and in flight,
+ * never as settled.
+ */
+export const RECONCILED_WALLET_OPERATION_STATES = ["PLANNED", "SUBMITTED", "MINED", "CONFIRMED", "FAILED", "UNKNOWN", "RECONCILING"] as const;
+export type ReconciledWalletOperationState = (typeof RECONCILED_WALLET_OPERATION_STATES)[number];
+
 /** `packages/inventory`'s `WalletOperationEvent`. */
 export interface WalletOperationEventView {
   readonly operationId: string;

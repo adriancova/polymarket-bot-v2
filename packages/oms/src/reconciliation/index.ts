@@ -33,6 +33,7 @@ export {
   type PotentialOwner,
 } from "./identity.js";
 export {
+  RECONCILED_WALLET_OPERATION_STATES,
   VENUE_ORDER_STATUSES,
   VENUE_TRADE_STATUSES,
   type AccountReadPort,

@@ -225,6 +225,7 @@ import { TERMINAL_ORDER_STATES, type OrderState } from "../states.js";
 import {
   EMPTY_SALVAGE,
   callRead,
+  classifyStreamOutput,
   readApprovals,
   readCollateral,
   readOkFlag,
@@ -293,6 +294,7 @@ import type {
   VenueTradeView,
   WalletReconciliationRequest,
 } from "./ports.js";
+import { RECONCILED_WALLET_OPERATION_STATES } from "./ports.js";
 import { decodeCompositeKey, venueSubjectOf } from "./subjects.js";
 import { isoFromEpochMs } from "./time.js";
 
@@ -507,6 +509,11 @@ function venueTerminal(order: VenueOrderView): boolean {
   return order.status === "CANCELED" || compareDecimal(order.sizeMatched, order.originalSize) === 0;
 }
 
+/** (r13) A state of WP-300's closed `WalletOperationState` vocabulary (mirrored: `ports.ts`). */
+function isWalletOperationState(state: string): boolean {
+  return (RECONCILED_WALLET_OPERATION_STATES as readonly string[]).includes(state);
+}
+
 /** An attempt still awaiting an authoritative read (the OMS's own `resume()` rule; a held-absent attempt does not). */
 function awaitsRead(attempt: AttemptView): boolean {
   return !isHeld(attempt) && (attempt.state === "SENDING" || attempt.state === "SUBMISSION_UNKNOWN" || attempt.state === "RECONCILING");
@@ -628,21 +635,22 @@ export class ReconciliationCoordinator {
     this.#triggers.push({ trigger, seq: ++this.#seq });
   }
 
-  /** A WP-280 `UserStreamOutput`. Requests are taken at once; events are routed to the OMS in order (buffered during a run). */
+  /**
+   * A WP-280 `UserStreamOutput`. Requests are taken at once; events are routed to the OMS in order (buffered during a
+   * run). How the output is read is decided by the stream door's one classifier (`door.ts`, `classifyStreamOutput`),
+   * which the door itself uses too: (r11) an output whose kind cannot be read, and (r13, WP290-V13-STREAM-UNKNOWN-KIND-
+   * SILENT = WP290-CX-R13-01) one whose kind is readable but outside WP-280's five, or a non-activity output carrying an
+   * ORDER or TRADE output's own key, is ROUTED: the door reads it as an unreadable entry (a journaled obligation of the
+   * account, and a run), never as nothing. Only STATE, UNRECOGNIZED_MESSAGE and RECONCILIATION_REQUESTED outputs, as
+   * WP-280 emits them, carry nothing to route.
+   */
   onUserStreamOutput(output: unknown): void {
-    const kind = readField(output, "kind");
-    // (r11, the stream door) An output whose kind cannot be read is routed: it is kept as an unreadable entry.
-    if (kind.kind !== "DATA" || typeof kind.value !== "string") {
-      if (this.#running) this.#streamBuffer.push(output);
-      else this.#enqueueStream(output);
-      return;
-    }
-    if (kind.value === "RECONCILIATION_REQUESTED") {
+    const read = classifyStreamOutput(output);
+    if (read.request) {
       const request = readField(output, "request");
       this.#receiveStreamRequest(request.kind === "DATA" ? request.value : undefined);
-      return;
     }
-    if (kind.value !== "ORDER" && kind.value !== "TRADE") return;
+    if (read.read === "NOTHING") return;
     if (this.#running) {
       this.#streamBuffer.push(output);
       return;
@@ -2381,7 +2389,7 @@ export class ReconciliationCoordinator {
         breakClass: "WALLET_OPERATION_UNSETTLED",
         subjectKey: compositeKey("WALLET_OPERATION_UNSETTLED", operationId),
         walletOperationId: isUuidV7(operationId) ? operationId : null,
-        detail: `wallet operation ${operationId} is unknown, reconciling or quarantined in the inventory`,
+        detail: `wallet operation ${operationId} is unknown, reconciling or quarantined in the inventory (or, r13, its state or its quarantine flag could not be read)`,
       });
     }
     // The wallet-scoped holds this inspection judges: an operation the inventory no longer holds unsettled (its
@@ -2395,46 +2403,66 @@ export class ReconciliationCoordinator {
     }
   }
 
-  /** Operations in UNKNOWN or RECONCILING, or quarantined (from the inventory's append-only events). */
+  /**
+   * (r13, the closed-vocabulary audit) The inventory's append-only events, read once: each operation's latest state,
+   * and whether any event could not be read. An events answer that is not a list, an event that is not own data, or
+   * one whose operation id or state is not text, is UNREADABLE (never skipped: a skipped event could be an
+   * operation's latest step); a state outside WP-300's closed vocabulary ({@link RECONCILED_WALLET_OPERATION_STATES})
+   * is kept as read, and judged unsettled and in flight by both callers, never settled.
+   */
+  #walletEvents(wallet: ReconciledWalletOperations): { readonly latest: ReadonlyMap<string, string>; readonly unreadable: boolean } {
+    const latest = new Map<string, string>();
+    let events: readonly unknown[] | undefined;
+    try {
+      events = readArray(wallet.events(), 10_000_000);
+    } catch {
+      events = undefined;
+    }
+    if (events === undefined) return { latest, unreadable: true };
+    let unreadable = false;
+    for (const event of events) {
+      const fields = readFields(event, ["operationId", "newState"]);
+      if (fields === undefined || typeof fields.operationId !== "string" || typeof fields.newState !== "string") {
+        unreadable = true;
+        continue;
+      }
+      latest.set(fields.operationId, fields.newState);
+    }
+    return { latest, unreadable };
+  }
+
+  /**
+   * Operations in UNKNOWN or RECONCILING, or quarantined (from the inventory's append-only events). (r13) Also an
+   * operation whose latest state is outside WP-300's vocabulary, or whose view does not say, as own data, that it is
+   * NOT quarantined (`quarantined: false`); and, when any event could not be read, the events themselves.
+   */
   #unsettledWalletOperations(): string[] {
     const wallet = this.#wallet;
     if (wallet === null) return [];
-    const latest = new Map<string, string>();
-    try {
-      for (const event of readArray(wallet.events(), 10_000_000) ?? []) {
-        const fields = readFields(event, ["operationId", "newState"]);
-        if (fields !== undefined && typeof fields.operationId === "string" && typeof fields.newState === "string") latest.set(fields.operationId, fields.newState);
-      }
-    } catch {
-      return [UNREADABLE_WALLET_EVENTS];
-    }
-    const out: string[] = [];
+    const { latest, unreadable } = this.#walletEvents(wallet);
+    const out: string[] = unreadable ? [UNREADABLE_WALLET_EVENTS] : [];
     for (const [operationId, state] of latest) {
-      let quarantined = false;
+      let quarantined: boolean;
       try {
-        quarantined = wallet.operation(operationId)?.quarantined === true;
+        const flag = readField(wallet.operation(operationId), "quarantined");
+        quarantined = !(flag.kind === "DATA" && flag.value === false);
       } catch {
         quarantined = true;
       }
-      if (state === "UNKNOWN" || state === "RECONCILING" || quarantined) out.push(operationId);
+      if (!isWalletOperationState(state) || state === "UNKNOWN" || state === "RECONCILING" || quarantined) out.push(operationId);
     }
     return out;
   }
 
-  /** Any wallet operation whose holdings effect is not settled: in flight, unknown, reconciling, or quarantined. */
+  /**
+   * Any wallet operation whose holdings effect is not settled: in flight, unknown, reconciling, or quarantined. (r13)
+   * Events that could not be read, and a state outside WP-300's vocabulary, are unsettled
+   * ({@link #unsettledWalletOperations}), so in flight too (fail closed).
+   */
   #walletInFlight(): boolean {
     const wallet = this.#wallet;
     if (wallet === null) return false;
-    const latest = new Map<string, string>();
-    try {
-      for (const event of readArray(wallet.events(), 10_000_000) ?? []) {
-        const fields = readFields(event, ["operationId", "newState"]);
-        if (fields !== undefined && typeof fields.operationId === "string" && typeof fields.newState === "string") latest.set(fields.operationId, fields.newState);
-      }
-    } catch {
-      return true;
-    }
-    for (const state of latest.values()) if (state === "SUBMITTED" || state === "MINED" || state === "UNKNOWN" || state === "RECONCILING") return true;
+    for (const state of this.#walletEvents(wallet).latest.values()) if (state === "SUBMITTED" || state === "MINED" || state === "UNKNOWN" || state === "RECONCILING") return true;
     return this.#unsettledWalletOperations().length > 0;
   }
 
@@ -2508,6 +2536,10 @@ export class ReconciliationCoordinator {
     const read = readStreamOutput(output);
     const atMs = (): number => Math.max(this.#lastClock, 0);
     if (read.kind === null && read.unreadable.length === 0) {
+      // (r13) Only an output the stream door's classifier did NOT read as nothing is routed (`onUserStreamOutput`): one
+      // the door now reads as nothing read differently the second time (a proxy, say). It is present but unreadable:
+      // the same durable obligation as an unreadable kind, never "nothing".
+      await this.#recordEvidenceNow(null, unkeyedTradeRecord({ status: null, transactionHash: null, ownershipUndetermined: null, unreadable: ["kind"] }, "STREAM_UNREADABLE"), atMs());
       this.trigger("POSITION_BALANCE_DISCREPANCY");
       return;
     }

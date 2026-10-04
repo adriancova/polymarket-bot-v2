@@ -110,6 +110,10 @@
  *   record per status among one fill's rows (each owing the fill's whole count), journaled and replayed; a candidate
  *   answers it only when its settlement AGREES (`settlementAgrees`), and EVERY candidate must: a terminal contradiction
  *   or a backwards read keeps the hold, and so does an ambiguous assignment;
+ * - (r13, the closed-vocabulary audit) a settlement status no one can ORDER (unreadable, or outside the documented
+ *   vocabulary) is never "nothing to compare": it could have been FAILED. A keyed trade it was shown on is marked
+ *   `unordered` (monotonic, journaled), and holds until an observation shows the trade at a terminal status; an
+ *   unkeyed row showing one is answered only by a witness at one terminal status;
  * - (r11, the class fix at the door layer) every fragment a door validated reaches the store, and every fragment present
  *   but unreadable is an explicit obligation: of its object when its id is readable (a NAMED order is read by id until
  *   a sound run settles it; an ORPHAN_LEG opens its trade's identity, and once the trade is shown in full it must be one
@@ -408,16 +412,16 @@ function describeObligation(record: EvidenceRecord): string {
  *   terminal contradiction);
  * - a status before them (MATCHED, MINED, RETRYING): the witness was shown it, or a status that follows it
  *   (`states.ts`), never one that precedes it;
- * - an unreadable status: nothing to compare (the row's other facts still must match exactly);
- * - an UNRECOGNISED status (C-3's MATCHED_NOT_BROADCASTED, say): not orderable against the documented ones, so, as
- *   for a keyed row (`#foldStatus` keeps its text only, and the run that read it holds on `STATUS_UNRECOGNISED`), it
- *   fixes no constraint on a later read.
+ * - (r13, the closed-vocabulary audit) an unreadable status, or an UNRECOGNISED one (C-3's MATCHED_NOT_BROADCASTED,
+ *   say): not orderable against the documented ones, so it could have been either terminal status, a FAILED among
+ *   them. r11 read it as fixing no constraint, so a witness shown before a terminal status (a lagging read) answered a
+ *   row that may have FAILED. Now, as for a keyed trade (`#foldStatus` marks it `unordered`), only a witness at ONE
+ *   terminal status (final: nothing follows it, and no witness of the same trade is shown past it) answers it.
  */
 export function settlementAgrees(witness: { readonly status: VenueTradeStatus | null; readonly terminals: readonly VenueTradeStatus[] }, shown: string | null): boolean {
-  if (shown === null) return true;
-  const status = tradeStatusOf(shown);
-  if (status === null) return true;
   if (witness.terminals.includes("CONFIRMED") && witness.terminals.includes("FAILED")) return false;
+  const status = shown === null ? null : tradeStatusOf(shown);
+  if (status === null) return witness.terminals.length === 1 && witness.status === witness.terminals[0];
   if (TERMINAL_SETTLEMENTS.includes(status)) return witness.terminals.length === 1 && witness.terminals[0] === status && witness.status === status;
   return witness.status !== null && (witness.status === status || isLegalSettlementTransition(status, witness.status));
 }
@@ -524,6 +528,14 @@ interface TradeEntry {
   hashes: string[];
   /** (r11) Whether its rows said their ownership was DETERMINED or UNDETERMINED, as read (detail only). */
   ownership: string[];
+  /**
+   * (r13, the closed-vocabulary audit) An observation showed the trade's settlement at a status no one can ORDER
+   * against the documented ones: present but unreadable, or text outside the documented vocabulary (a user-stream
+   * settlement outside WP-280's five, `door.ts`; C-3's MATCHED_NOT_BROADCASTED on a read). It could be any status, a
+   * FAILED among them, so a read showing the trade before a terminal status may be behind it: only an observation of
+   * the trade at a terminal status (CONFIRMED and FAILED are final) answers it. Monotonic.
+   */
+  unordered: boolean;
 }
 
 interface MemberEntry {
@@ -997,7 +1009,7 @@ export class EvidenceStore {
       informative = true;
     }
     if (record.transactionHash !== null && pushText(trade.hashes, record.transactionHash)) informative = true;
-    if (this.#foldStatus(trade, record.status)) informative = true;
+    if (this.#foldStatus(trade, record.status, record.unreadable.includes("status"))) informative = true;
     return informative;
   }
 
@@ -1096,6 +1108,7 @@ export class EvidenceStore {
       orphans: [],
       hashes: [],
       ownership: [],
+      unordered: false,
     };
     this.#trades.set(tradeId, trade);
     // (r10) An unkeyed leg seen from now on may be this trade.
@@ -1132,18 +1145,26 @@ export class EvidenceStore {
     }
     if (record.transactionHash !== null && pushText(trade.hashes, record.transactionHash)) informative = true;
     if (record.value !== null && pushText(trade.ownership, record.value)) informative = true;
-    if (this.#foldStatus(trade, record.status)) informative = true;
+    if (this.#foldStatus(trade, record.status, record.unreadable.includes("status"))) informative = true;
     return informative;
   }
 
   /**
    * Fold one observation's settlement status into its trade (a LEG's or a TRADE's): a new status text, a new terminal
    * status (r8: always information, so a restart folds the same contradiction), a legal forward step. `true` when it
-   * added information.
+   * added information. (r13) A status no one can ORDER against the documented ones (`unreadable`: present but not
+   * readable; or text outside the documented vocabulary) marks the trade `unordered`: from then on, only an
+   * observation of the trade at a terminal status answers it (`#judgeTrade`). Marking it is information (journaled, so
+   * a restart folds the mark again).
    */
-  #foldStatus(trade: TradeEntry, text: string | null): boolean {
-    if (text === null) return false;
-    let informative = pushText(trade.statuses, text);
+  #foldStatus(trade: TradeEntry, text: string | null, unreadable: boolean): boolean {
+    let informative = false;
+    if ((text === null ? unreadable : tradeStatusOf(text) === null) && !trade.unordered) {
+      trade.unordered = true;
+      informative = true;
+    }
+    if (text === null) return informative;
+    if (pushText(trade.statuses, text)) informative = true;
     const status = tradeStatusOf(text);
     // (r8, WP290-CX-R8-02) Every terminal status, whatever came before it: a second one is a durable contradiction,
     // so it is information (journaled, and folded again after a restart).
@@ -1213,7 +1234,7 @@ export class EvidenceStore {
       side: record.side,
     };
     for (const fact of LEG_FACTS) if (pushValue(fact, leg.facts[fact], values[fact])) informative = true;
-    if (this.#foldStatus(trade, record.status)) informative = true;
+    if (this.#foldStatus(trade, record.status, record.unreadable.includes("status"))) informative = true;
     return informative;
   }
 
@@ -1310,7 +1331,7 @@ export class EvidenceStore {
       const what = `a ${fill.source === "TRADES_LEG_UNKEYED" || fill.source === "TRADES_LEG_UNKEYED_PARTIAL" || fill.source === "TRADES_LEG_UNKEYED_FRAGMENTS" ? "trades read" : "user-stream item"} showed ${String(fill.need)} own leg(s) on it (${describeFill(fill.facts)}; ${status}${fill.unreadable === "" ? "" : `; unreadable: ${fill.unreadable}`}) in a row whose trade id was unreadable`;
       let detail: string;
       if (!fill.never) {
-        detail = `venue order ${id}: ${what}: each could be a trade the evidence does not know, so the reads owe ${String(fill.need)} distinct trade(s) with a leg of exactly those facts on it, shown by a readable id, beyond the ${String(fill.known.length)} it already held there (${fill.known.join(", ") || "none"}), each with a settlement that agrees with ${status} (the same terminal status; never one before it), and they have shown ${String(fill.shown.length)} (${fill.shown.join(", ") || "none"}${fill.disagreeing.length === 0 ? "" : `; disagreeing: ${fill.disagreeing.join(", ")}`}): the activity is not accounted for under any trade's identity`;
+        detail = `venue order ${id}: ${what}: each could be a trade the evidence does not know, so the reads owe ${String(fill.need)} distinct trade(s) with a leg of exactly those facts on it, shown by a readable id, beyond the ${String(fill.known.length)} it already held there (${fill.known.join(", ") || "none"}), each with a settlement that agrees with ${status} (${fill.status === null || tradeStatusOf(fill.status) === null ? "r13: a status no one can order, so only a witness at one terminal status" : "the same terminal status; never one before it"}), and they have shown ${String(fill.shown.length)} (${fill.shown.join(", ") || "none"}${fill.disagreeing.length === 0 ? "" : `; disagreeing: ${fill.disagreeing.join(", ")}`}): the activity is not accounted for under any trade's identity`;
       } else if (fill.source === "TRADES_LEG_UNKEYED_PARTIAL") {
         detail = `venue order ${id}: ${what}, in an answer that did not show every trade of the account (partial, or a row of it not identified): a trade of exactly those facts that the answer left out could be shown in its place, so no read can answer it (it holds until an operator path exists; trades already held there: ${fill.known.join(", ") || "none"})`;
       } else {
@@ -1457,6 +1478,10 @@ export class EvidenceStore {
         );
       }
     }
+    // (r13, the closed-vocabulary audit) An observation showed the trade's settlement at a status no one can order
+    // (`unordered`): it could have been FAILED. Until an observation shows the trade TERMINAL (this read's status
+    // included), no read is shown not to be behind it.
+    const unorderedOpen = evidence !== undefined && evidence.unordered && terminals.size === 0;
     if (shown === undefined) {
       // (r7, WP290-CX-R7-03; r8, WP290-CX-R8-01) A trade the evidence holds that this COMPLETE trades read omits,
       // while a hold names it or any of its legs is not accounted for under the trade's own identity: the reads (or a
@@ -1469,19 +1494,29 @@ export class EvidenceStore {
       // row has shown with its ownership determined, is OPEN: its legs are unknown, so no per-leg accounting can answer
       // it, and no omission discharges it. Only a read showing the trade with its own legs in full does.
       const open = evidence !== undefined && evidence.legsUnidentified && !evidence.legsInFull;
-      if (evidence !== undefined && (open || reads.held || legs.some((leg) => !reads.accounted(leg)))) {
+      if (evidence !== undefined && (open || unorderedOpen || reads.held || legs.some((leg) => !reads.accounted(leg)))) {
         problems.push(
           problem(
             "READ_CONFLICT",
             open
               ? `trade ${id}, which a trades read carried without identifying all of its own legs (its ownership undetermined, or its row malformed; sources: ${evidence.sources.join(", ")}), is missing from a complete trades read, and no read has shown it with its own legs: its identity is not answered (every trade of the account is in that read)`
-              : evidence.shown
+              : unorderedOpen
+                ? `trade ${id}, whose settlement an observation showed at a status no one can order (unreadable, or outside the documented vocabulary; statuses seen: ${evidence.statuses.join(", ") || "none readable"}; sources: ${evidence.sources.join(", ")}), is missing from a complete trades read, and no observation has shown it terminal: it could have FAILED, so its settlement is not answered (every trade of the account is in that read)`
+                : evidence.shown
                 ? `trade ${id}, which an earlier read showed, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`
                 : `trade ${id}, which the user stream named (a fill or settlement the OMS did not apply) and no read has shown, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`,
           ),
         );
       }
       return problems.length > 0 ? Object.freeze({ kind: "CONFLICT", problems: Object.freeze(problems) }) : Object.freeze({ kind: "UNREAD" });
+    }
+    if (unorderedOpen) {
+      problems.push(
+        problem(
+          "READ_REGRESSION",
+          `trade ${id}: an observation showed its settlement at a status no one can order (unreadable, or outside the documented vocabulary; statuses seen: ${(evidence?.statuses ?? []).join(", ") || "none readable"}; sources: ${(evidence?.sources ?? []).join(", ")}); this read shows it ${shown.status}, not terminal, so it may be behind that observation (which could have been FAILED): only an observation of the trade CONFIRMED or FAILED answers it`,
+        ),
+      );
     }
     if (status === null) {
       problems.push(problem("STATUS_UNRECOGNISED", `trade ${id} has a status outside the documented vocabulary (C-3's MATCHED_NOT_BROADCASTED included)`));

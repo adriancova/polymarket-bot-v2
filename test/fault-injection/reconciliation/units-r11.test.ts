@@ -75,9 +75,17 @@ describe("WP-290 r11 units (WP290-V11-UNKEYED-STATUS-DROPPED): a witness's settl
     expect(settlementAgrees(at("MATCHED"), "MINED")).toBe(false);
     expect(settlementAgrees(at(null), "MATCHED")).toBe(false);
     expect(settlementAgrees(at("FAILED", ["CONFIRMED", "FAILED"]), "MATCHED")).toBe(false);
-    // Nothing to compare: an unreadable status, or one outside the documented vocabulary (as a keyed row's).
-    expect(settlementAgrees(at(null), null)).toBe(true);
-    expect(settlementAgrees(at("MATCHED"), "MATCHED_NOT_BROADCASTED")).toBe(true);
+    // (r13, the closed-vocabulary audit) An unreadable status, or one outside the documented vocabulary, is not
+    // "nothing to compare": it could have been FAILED. Only a witness at ONE terminal status answers it (r11 answered
+    // it with any witness; these two assertions stated that, and are restated here under the r13 rule).
+    expect(settlementAgrees(at(null), null)).toBe(false);
+    expect(settlementAgrees(at("MATCHED"), "MATCHED_NOT_BROADCASTED")).toBe(false);
+    expect(settlementAgrees(at("MINED"), null)).toBe(false);
+    expect(settlementAgrees(at("CONFIRMED", ["CONFIRMED"]), "MATCHED_NOT_BROADCASTED")).toBe(true);
+    expect(settlementAgrees(at("FAILED", ["FAILED"]), null)).toBe(true);
+    expect(settlementAgrees(at("CONFIRMED", ["CONFIRMED"]), "Failed")).toBe(true);
+    expect(settlementAgrees(at("FAILED", ["CONFIRMED", "FAILED"]), null)).toBe(false);
+    expect(settlementAgrees(at("CONFIRMED", ["CONFIRMED", "FAILED"]), "MATCHED_NOT_BROADCASTED")).toBe(false);
   });
 
   it("(store) a FAILED unkeyed leg: a CONFIRMED or MINED witness never answers it; a FAILED one does; after a rebuild too", () => {
@@ -108,13 +116,18 @@ describe("WP-290 r11 units (WP290-V11-UNKEYED-STATUS-DROPPED): a witness's settl
     ]);
   });
 
-  it("(store) an unkeyed row whose STATUS (or hash) was unreadable: named on the record, and answerable by a witness of any settlement, as a keyed row whose status was unreadable", () => {
+  it("(store) an unkeyed row whose STATUS (or hash) was unreadable: named on the record, and (r13) answerable only by a witness at one terminal status, as a keyed trade whose status was unreadable", () => {
     const record = unkeyedLegRecord(LEG, null, 1, true, null, ["status"]);
     expect(record.unreadable).toEqual(["status"]);
     expect(readEvidenceRecord({ ...record })).toEqual(record);
-    for (const witness of ["MATCHED", "CONFIRMED", "FAILED"]) {
+    // r11 answered it with a witness of ANY settlement (MATCHED included); r13: only a terminal one.
+    for (const witness of ["CONFIRMED", "FAILED"]) {
       const store = EvidenceStore.fold([shownOrder(ORDER, "OPEN_ORDERS_LIST"), record, keyed("trade-2", witness)]);
       expect(store.unaccountedUnkeyed("venue-1"), witness).toEqual([]);
+    }
+    for (const witness of ["MATCHED", "MINED", "RETRYING"]) {
+      const store = EvidenceStore.fold([shownOrder(ORDER, "OPEN_ORDERS_LIST"), record, keyed("trade-2", witness)]);
+      expect(store.unaccountedUnkeyed("venue-1").map((fill) => [fill.status, fill.disagreeing]), witness).toEqual([[null, ["trade-2"]]]);
     }
     // A fill fact unreadable is another matter: never answered (and not the answerable source's shape).
     expect(readEvidenceRecord({ ...record, unreadable: ["feeAmount"] })).toBeUndefined();

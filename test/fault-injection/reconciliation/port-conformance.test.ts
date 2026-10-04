@@ -10,10 +10,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import type {
-  ReconciliationRequest as InventoryRequest,
-  ReconciliationRequester as InventoryRequester,
-  WalletOperationManager,
+import {
+  WALLET_OPERATION_STATES,
+  type ReconciliationRequest as InventoryRequest,
+  type ReconciliationRequester as InventoryRequester,
+  type WalletOperationManager,
+  type WalletOperationState,
 } from "../../../packages/inventory/src/index.js";
 import {
   BREAK_CLASSES,
@@ -40,7 +42,14 @@ import type {
   StreamReconciliationRequest,
   WalletReconciliationRequest,
 } from "../../../packages/oms/src/index.js";
-import type { UserStreamManager, UserStreamReconciliationRequest } from "../../../packages/polymarket-secure/src/user-stream/index.js";
+import { RECONCILED_WALLET_OPERATION_STATES, VENUE_TRADE_STATUSES, type ReconciledWalletOperationState } from "../../../packages/oms/src/reconciliation/ports.js";
+import { STREAM_ACTIVITY_KEYS, STREAM_OUTPUT_KINDS } from "../../../packages/oms/src/reconciliation/door.js";
+import {
+  USER_TRADE_STATUSES,
+  type UserStreamManager,
+  type UserStreamOutput,
+  type UserStreamReconciliationRequest,
+} from "../../../packages/polymarket-secure/src/user-stream/index.js";
 
 import { boot, universe } from "./support/harness.js";
 
@@ -50,6 +59,14 @@ type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y 
 const breakClassesEqual: Equal<ReconciliationBreakClass, LedgerBreakClass> = true;
 const breakRulesEqual: Equal<ReconciliationBreakRule, LedgerBreakRule> = true;
 const triggersEqual: Equal<ReconciliationTrigger, LedgerTrigger> = true;
+// (r13, the closed-vocabulary audit) The closed vocabularies the doors and the coordinator read against: WP-280's five
+// outputs, the keys only its ORDER and TRADE outputs carry, and WP-300's seven wallet operation states.
+const streamKindsEqual: Equal<(typeof STREAM_OUTPUT_KINDS)[number], UserStreamOutput["kind"]> = true;
+type NonActivityOutput = Exclude<UserStreamOutput, { readonly kind: "ORDER" | "TRADE" }>;
+type ActivityOutput = Extract<UserStreamOutput, { readonly kind: "ORDER" | "TRADE" }>;
+const activityKeysOnActivity: Equal<Extract<(typeof STREAM_ACTIVITY_KEYS)[number], keyof ActivityOutput>, (typeof STREAM_ACTIVITY_KEYS)[number]> = true;
+const activityKeysNotElsewhere: Equal<Extract<(typeof STREAM_ACTIVITY_KEYS)[number], NonActivityOutput extends infer O ? (O extends unknown ? keyof O : never) : never>, never> = true;
+const walletStatesEqual: Equal<ReconciledWalletOperationState, WalletOperationState> = true;
 
 // The journal's input is the same union in both packages (assignable both ways).
 const journalInputIn = (event: JournalInput): ReconciliationJournalInput => event;
@@ -73,6 +90,14 @@ describe("the coordinator's ports and mirrors", () => {
   it("are pinned at compile time (the typecheck of this file is the proof)", () => {
     expect([breakClassesEqual, breakRulesEqual, triggersEqual]).toEqual([true, true, true]);
     expect([journalInputIn, journalInputOut, breakViewOut, omsPort, journalPort, walletPort, streamPort, inventoryRequest, streamRequest, walletRequester, omsRequester].every((check) => typeof check === "function")).toBe(true);
+  });
+
+  it("(r13) the closed vocabularies are pinned to their producers': WP-280's outputs and settlement statuses, WP-300's wallet operation states (at compile time above, and at run time here)", () => {
+    expect([streamKindsEqual, activityKeysOnActivity, activityKeysNotElsewhere, walletStatesEqual]).toEqual([true, true, true, true]);
+    expect([...RECONCILED_WALLET_OPERATION_STATES].sort()).toEqual([...WALLET_OPERATION_STATES].sort());
+    expect([...VENUE_TRADE_STATUSES].sort()).toEqual([...USER_TRADE_STATUSES].sort());
+    expect([...STREAM_OUTPUT_KINDS].sort()).toEqual(["ORDER", "RECONCILIATION_REQUESTED", "STATE", "TRADE", "UNRECOGNIZED_MESSAGE"]);
+    expect([...STREAM_ACTIVITY_KEYS].sort()).toEqual(["event", "oms"]);
   });
 
   it("at run time: a real OMS opens with the coordinator as its reconciler, and the journal's taxonomy names every class", async () => {

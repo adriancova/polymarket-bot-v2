@@ -105,7 +105,7 @@ not a fault.
    | (r11) a by-id answer's `found: true` when the answer is unusable (its row absent, its id unreadable, or the order asked about's): the order asked about exists (`BY_ID_FOUND`), so a later not-found is a contradiction (E-14), never a ghost | named |
    | (r11) every position, the collateral balance and every approval an answer showed, valid or not (`HOLDING`): kept as detail only (a holding goes down legitimately, so no later read is judged against it) | shown or named |
    | (r11) every wallet member read by name (`MEMBER`): its state, hash and amount credited, valid or not; a state that contradicts another terminal one holds the member (section 7) | shown or named |
-   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed. (r12) A projection key that is MISSING (a TRADE output with no `fills` or no `settlements` key, an ORDER output with no `observation` key) is unreadable too: the same obligation (`UNKEYED_TRADE`, or `UNKEYED_ORDER` for the observation), and a run at once. `observation: null` is WP-280's own shape for an event that named no status, not an obligation | named |
+   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed. (r12) A projection key that is MISSING (a TRADE output with no `fills` or no `settlements` key, an ORDER output with no `observation` key) is unreadable too: the same obligation (`UNKEYED_TRADE`, or `UNKEYED_ORDER` for the observation), and a run at once. `observation: null` is WP-280's own shape for an event that named no status, not an obligation. (r13) An output whose `kind` is READABLE but not one of WP-280's five outputs (`""`, `"Trade"`, `"TRADE "`, `"order"`, ...), or one of its non-activity kinds (`STATE`, `UNRECOGNIZED_MESSAGE`, `RECONCILIATION_REQUESTED`) on an output that carries an ORDER or TRADE output's own key (`oms`, `event`), is unreadable too: the `UNKEYED_TRADE` obligation naming `kind`, and a run at once (a `RECONCILIATION_REQUESTED` output's request is still taken). A settlement whose `status` is not one of WP-280's five (`MATCHED`, `MINED`, `CONFIRMED`, `RETRYING`, `FAILED`, plain spelling) keeps its status as unreadable (step 3) | named |
 
    **(r11) Salvage is the default path.** Every door reads EVERY field of
    EVERY row of every answer on its own first, whatever the answer's
@@ -154,7 +154,15 @@ not a fault.
      row) shows at least everything the evidence holds;
    - **a conflict** (the run's order reads are unsound; nothing is answered
      from them): a status outside the documented vocabulary in any read
-     (`STATUS_UNRECOGNISED`); an observation showing less than an earlier
+     (`STATUS_UNRECOGNISED`); (r13) a trade whose settlement ANY observation
+     showed at a status no one can order (unreadable, or outside the
+     documented vocabulary: C-3's `MATCHED_NOT_BROADCASTED` on a read, a
+     garbled status on a read or on a stream settlement), while no
+     observation has shown the trade terminal (`READ_REGRESSION` when a read
+     shows it before a terminal status, `READ_CONFLICT` when a complete read
+     omits it: the status could have been `FAILED`, so a read showing the
+     trade `MATCHED` may be behind it; a read showing it `CONFIRMED` or
+     `FAILED` answers it, as both are final); an observation showing less than an earlier
      one, from any run or source (less matched, live after terminal, a
      settlement backwards: `READ_REGRESSION`); (r8) a trade that any two
      observations, from any run or source (a valid row of an unusable
@@ -736,6 +744,32 @@ returns at once, with no run.
   member, an unusable one included, contradict each other. The member is
   never answered; the operation stays reconciling. Establish the chain's
   receipt; escalate.
+- **A `READ_CONFLICT` keyed `unreadable` whose detail says "unreadable:
+  kind"** (r13) is a user-stream output whose `kind` was readable but not one
+  of WP-280's five outputs, or a non-activity output (`STATE`,
+  `UNRECOGNIZED_MESSAGE`, `RECONCILIATION_REQUESTED`) that carried an ORDER or
+  TRADE output's projection or event. It may have been an ORDER or a TRADE
+  output, so it holds for good like every unreadable stream entry (section
+  10). Find the output in WP-280's logs; fix the producer; escalate.
+- **A `READ_REGRESSION` or `READ_CONFLICT` on a trade whose detail says "a
+  status no one can order"** (r13) means an observation (a read, or a
+  user-stream settlement the OMS did not apply) showed the trade's settlement
+  at a status that could not be read or is outside the documented vocabulary,
+  and no observation has shown the trade terminal since. It clears on its
+  own when a read shows the trade `CONFIRMED` or `FAILED` (minutes, for a
+  trade that settles normally); a `FAILED` read then takes the FAILED path
+  (its reversal, its quarantine). If the trades history drops the trade
+  before it is shown terminal, it never clears (section 10).
+- **A `WALLET_OPERATION_UNSETTLED` or `WALLET_OPERATION_IN_FLIGHT` that does
+  not clear while the inventory shows the operation settled** (r13) means
+  the inventory's events or view could not be read as WP-300 states them: an
+  event that is not own data, a state outside WP-300's seven
+  (`PLANNED`, `SUBMITTED`, `MINED`, `CONFIRMED`, `FAILED`, `UNKNOWN`,
+  `RECONCILING`), an events answer that is not a list (the subject
+  "(the inventory's events are unreadable)"), or a view that does not say
+  `quarantined: false`. The holdings are not judged meanwhile, so nothing is
+  booked UNATTRIBUTED. Fix the binding of the inventory port; it clears when
+  the inventory reads in its shape.
 - **A `READ_MALFORMED` on one order's by-id read that does not clear** (r10)
   means the by-id answer for that order is unusable (it says not found but
   carries an order, does not say whether it found it, or returns another
@@ -803,6 +837,16 @@ output `oms.fills` and `oms.settlements` (empty lists when nothing was
 projected): an output missing one of them holds the account for good, as
 one whose key is not a list. `oms.shortfalls` is not read here: WP-280
 raises its own `EVENT_NOT_FULLY_APPLICABLE` request for a shortfall.
+(r13) Every output's `kind` must be one of WP-280's five, exactly as
+spelled (`STATE`, `ORDER`, `TRADE`, `UNRECOGNIZED_MESSAGE`,
+`RECONCILIATION_REQUESTED`), and only ORDER and TRADE outputs may carry `oms`
+or `event`: any other output that carries one, and any other `kind`, holds
+the account for good. Every settlement in a TRADE output must carry one of
+WP-280's five statuses in the plain spelling: any other is unreadable, and
+holds the trade until a read shows it terminal. The inventory port must
+report each event's operation id and state as text, each state one of
+WP-300's seven, and each operation's view with `quarantined` as a boolean:
+anything else holds the wallet's operations unsettled and in flight.
 
 The composition also binds `tokenOfGroup` to the execution groups it
 registered with the OMS (`execution.groups.token_id`). An order whose group's
@@ -902,12 +946,27 @@ nothing is judged or booked from it.
   requests for what it could not normalize. The ledger's projection and its
   remaining bookings are the system's own state, not venue observations, and
   keep nothing.
-- **(r11) An unkeyed row's status outside the documented vocabulary** (C-3's
-  `MATCHED_NOT_BROADCASTED`, say) fixes no constraint on its witness, exactly
-  as for a keyed row (whose unrecognised status holds only the run that read
-  it): such a status cannot be ordered against the documented ones, and no
-  venue document says where it sits. A later CONFIRMED (or FAILED) read of
-  the trade then answers it; the FAILED path still applies to a FAILED one.
+- **(r13) A settlement status no one can order holds its trade until the
+  trade is shown terminal.** A status outside the documented vocabulary
+  (C-3's `MATCHED_NOT_BROADCASTED`, say), or one that could not be read, on a
+  read's trade row (keyed or unkeyed) or on a user-stream settlement, cannot
+  be ordered against the documented ones, and no venue document says where
+  it sits: it could have been `FAILED`. r11 read it as fixing no constraint
+  (a keyed row's held only the run that read it; an unkeyed row's was
+  answered by a witness at any status), so a lagging read showing the trade
+  `MATCHED` answered a trade the venue had FAILED, and the account resumed
+  with the fill booked. Since r13 only an observation of the trade at a
+  terminal status answers it (for an unkeyed row: a witness at ONE terminal
+  status). The cost is liveness: a trade the venue shows with a C-3 status
+  holds the account until it settles (minutes), and for good if the trades
+  history drops it first.
+- **(r13) A stream output outside WP-280's vocabulary holds for good.** An
+  output whose `kind` is readable but not one of WP-280's five, or a
+  non-activity output carrying an ORDER or TRADE output's own key, is an
+  unreadable entry, like one whose `kind` cannot be read (r11): the same
+  permanent hold until the retraction ADR. A non-activity output that
+  carries no such key is read as WP-280's own (it carries no fact; a
+  dropped message is WP-280's gap detection's to raise).
 - **What "evidence never goes down" assumes (unverified venue assumptions,
   held as a conservative policy).** No venue document states any of these;
   the code treats a read that disagrees as wrong (it holds), never as a

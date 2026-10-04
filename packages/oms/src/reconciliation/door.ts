@@ -18,6 +18,18 @@
  * WP-280 projection whose `observation`, `fills` or `settlements` key is MISSING carries an unreadable entry (an
  * obligation of the account, and a run), exactly as one whose key is not own data or not in its shape.
  *
+ * CLOSED VOCABULARIES (r13, WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01). A discriminant whose vocabulary
+ * is closed by its producer's contract is read against that vocabulary, and a READABLE value outside it is unreadable
+ * (an obligation), never "nothing" and never "harmless": a user-stream output's `kind` (WP-280's five outputs:
+ * {@link classifyStreamOutput}; a non-activity output that carries an ORDER or TRADE output's own key is unreadable
+ * too), and a user-stream settlement's `status` (WP-280's five settlement statuses, `USER_TRADE_STATUSES`). Every other
+ * closed discriminant a door reads was already so: a route or source naming another source is WRONG_ROUTE; a side,
+ * role, boolean or wallet member state outside its vocabulary is an unreadable fragment (MALFORMED). An order status,
+ * a REST trade status and a stream order observation's status are OPEN by their producers' contracts (C-3; WP-280
+ * passes order statuses through, and the OMS's vocabulary is wider: `EXPIRED`): they are kept as text, and one outside
+ * the documented vocabulary holds (`STATUS_UNRECOGNISED`; the OMS's RECONCILING); a settlement status no one can order
+ * is answered only by an observation of the trade at a terminal status (`evidence.ts`, r13).
+ *
  * A read has exactly one outcome:
  *
  * | Outcome | Meaning | Break |
@@ -823,7 +835,7 @@ export interface StreamItem {
  * One user-stream output (r11, the stream door): every item it carries, each read once into fragments, and the
  * entries and lists present but unreadable (`unreadable`: each an item of the account's activity the stream reported
  * that nothing identifies). `kind` is `null` when the output is not an ORDER or TRADE output (then `unreadable` names
- * its `kind` when that could not be read).
+ * its `kind` when that could not be read, or, r13, was outside WP-280's vocabulary: {@link classifyStreamOutput}).
  */
 export interface StreamOutput {
   readonly kind: "ORDER" | "TRADE" | null;
@@ -837,7 +849,21 @@ const STREAM_KEYS: Readonly<Record<StreamItemFragments["kind"], readonly StreamF
   SETTLEMENT: ["venueTradeId", "venueOrderId", "status", "transactionHash"],
 });
 
-/** One stream item's fragments. A fill's fee and fee asset may be absent (WP-280: a fee of 0, no asset). */
+/**
+ * (r13) WP-280's settlement statuses (`venue-facts.ts`, `USER_TRADE_STATUSES`; `oms-projection.ts` projects a
+ * settlement only for one of them, and the OMS's own `SETTLEMENT_STATES` are the same five): the plain spelling only,
+ * as the stream carries it (E-13). Anything else in a settlement item is outside WP-280's projection: unreadable.
+ */
+export function isStreamSettlementStatus(value: unknown): value is VenueTradeStatus {
+  return typeof value === "string" && (VENUE_TRADE_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * One stream item's fragments. A fill's fee and fee asset may be absent (WP-280: a fee of 0, no asset). (r13) A
+ * settlement's status is read against WP-280's closed settlement vocabulary ({@link isStreamSettlementStatus}); an
+ * order observation's status is open text (WP-280 passes order statuses through, its sentinel `UNRECOGNIZED`
+ * included, and the OMS sends an order it holds to RECONCILING on one it does not recognise).
+ */
 export function streamItemFragments(kind: StreamItemFragments["kind"], raw: Entry): StreamItemFragments {
   const keys = STREAM_KEYS[kind];
   const read = readRow(raw, keys);
@@ -855,7 +881,7 @@ export function streamItemFragments(kind: StreamItemFragments["kind"], raw: Entr
     kind,
     venueOrderId: field("venueOrderId", isVenueId),
     venueTradeId: field("venueTradeId", isIdentifier),
-    status: field("status", isIdentifier),
+    status: field<string>("status", kind === "SETTLEMENT" ? isStreamSettlementStatus : isIdentifier),
     shares: field("shares", isPositiveAmount),
     price: field("price", isUnitPrice),
     role: field("liquidityRole", isRole),
@@ -871,25 +897,65 @@ export function streamItemFragments(kind: StreamItemFragments["kind"], raw: Entr
 export const MAX_STREAM_ITEMS = 1000;
 
 /**
+ * (r13) WP-280's `UserStreamOutput` is a CLOSED vocabulary of five outputs (`manager.ts`): `STATE`, `ORDER`, `TRADE`,
+ * `UNRECOGNIZED_MESSAGE`, `RECONCILIATION_REQUESTED`. Only ORDER and TRADE carry account activity (`event`, `oms`).
+ */
+export const STREAM_OUTPUT_KINDS = ["STATE", "ORDER", "TRADE", "UNRECOGNIZED_MESSAGE", "RECONCILIATION_REQUESTED"] as const;
+/** (r13) The keys only WP-280's ORDER and TRADE outputs carry (the normalized event and its OMS projection). */
+export const STREAM_ACTIVITY_KEYS = ["event", "oms"] as const;
+
+/**
+ * (r13) How one user-stream output is read, decided ONCE, here, for both of the coordinator's entry points
+ * (`coordinator.ts`, `onUserStreamOutput`, and this door's {@link readStreamOutput}), so the two never diverge:
+ * - `read`: `ORDER` or `TRADE` (its items are read); `NOTHING` (a STATE, UNRECOGNIZED_MESSAGE or
+ *   RECONCILIATION_REQUESTED output: none carries an item of the account's activity, and WP-280 raises its own
+ *   reconciliation request for the first two when they matter); `UNREADABLE` (an obligation of the account, and a
+ *   run): a `kind` that cannot be read, a READABLE `kind` outside WP-280's five (WP290-V13-STREAM-UNKNOWN-KIND-SILENT
+ *   = WP290-CX-R13-01: `""`, `"Trade"`, `"TRADE "`, `"order"`, ... may have been an ORDER or a TRADE output, so it is
+ *   never "nothing"), or a non-activity kind whose output carries a key only an ORDER or TRADE output carries (it may
+ *   be one, mis-tagged);
+ * - `request`: a RECONCILIATION_REQUESTED output (its request is taken, whatever else the output carries).
+ */
+export interface StreamOutputClass {
+  readonly read: "ORDER" | "TRADE" | "NOTHING" | "UNREADABLE";
+  readonly request: boolean;
+}
+
+export function classifyStreamOutput(output: unknown): StreamOutputClass {
+  const kind = readField(output, "kind");
+  if (kind.kind !== "DATA" || typeof kind.value !== "string") return Object.freeze({ read: "UNREADABLE", request: false });
+  const value = kind.value;
+  if (value === "ORDER" || value === "TRADE") return Object.freeze({ read: value, request: false });
+  if (!(STREAM_OUTPUT_KINDS as readonly string[]).includes(value)) return Object.freeze({ read: "UNREADABLE", request: false });
+  const request = value === "RECONCILIATION_REQUESTED";
+  const carriesActivity = STREAM_ACTIVITY_KEYS.some((key) => readField(output, key).kind !== "ABSENT");
+  return Object.freeze({ read: carriesActivity ? "UNREADABLE" : "NOTHING", request });
+}
+
+/**
  * Read one WP-280 `UserStreamOutput` (an ORDER or TRADE output) once, into its items and their fragments. Every key
  * of WP-280's projection this door reads (`oms`; an ORDER's `observation`; a TRADE's `fills` and `settlements`) is
  * present in every output WP-280 emits (`oms-projection.ts`): one that is missing, not own data, or not in its shape is
- * an UNREADABLE entry (r12: a missing key too, WP290-CX-R12-01), never "nothing". The projection's `shortfalls` is
- * not read here: WP-280 raises its own `EVENT_NOT_FULLY_APPLICABLE` request for them, from its own projection.
+ * an UNREADABLE entry (r12: a missing key too, WP290-CX-R12-01), never "nothing". (r13) Its `kind` is read against
+ * WP-280's closed vocabulary ({@link classifyStreamOutput}): one outside it is an UNREADABLE entry too. The projection's
+ * `shortfalls` is not read here: WP-280 raises its own `EVENT_NOT_FULLY_APPLICABLE` request for them, from its own
+ * projection.
  */
 export function readStreamOutput(output: unknown): StreamOutput {
-  const kind = readField(output, "kind");
-  // An output whose kind cannot be read may have been any of WP-280's outputs, an ORDER or a TRADE among them: it is
-  // present but unreadable (an obligation). A readable other kind (`STATE`, `UNRECOGNIZED_MESSAGE`, for which WP-280
-  // raises its own reconciliation request) carries no item of the account's activity.
-  if (kind.kind !== "DATA" || typeof kind.value !== "string") {
+  const read = classifyStreamOutput(output);
+  // An output whose kind cannot be read, or (r13) whose kind is readable but outside WP-280's five, or a non-activity
+  // output carrying an activity output's own key, may have been an ORDER or a TRADE output: it is present but
+  // unreadable (an obligation), never "nothing" (WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01).
+  if (read.read === "UNREADABLE") {
     return Object.freeze({ kind: null, items: Object.freeze([]), unreadable: Object.freeze([{ kind: "FILL" as const, field: "kind" as const }]) });
   }
-  if (kind.value !== "ORDER" && kind.value !== "TRADE") return Object.freeze({ kind: null, items: Object.freeze([]), unreadable: Object.freeze([]) });
+  // A STATE, UNRECOGNIZED_MESSAGE or RECONCILIATION_REQUESTED output (WP-280's own vocabulary) carries no item of the
+  // account's activity.
+  if (read.read === "NOTHING") return Object.freeze({ kind: null, items: Object.freeze([]), unreadable: Object.freeze([]) });
   const projection = readField(output, "oms");
   const items: StreamItem[] = [];
   const unreadable: { readonly kind: "ORDER" | "FILL" | "SETTLEMENT"; readonly field: EnvelopeField | "entry" }[] = [];
-  if (kind.value === "ORDER") {
+  if (read.read === "ORDER") {
     if (projection.kind !== "DATA" || !isRecord(projection.value)) {
       unreadable.push({ kind: "ORDER", field: "oms" });
     } else {

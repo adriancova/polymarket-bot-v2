@@ -8,13 +8,20 @@
  * end, or a row cut short), a list entry that is not own data (an accessor or a hole), an envelope field (the route,
  * `complete`, the list itself) dropped or garbled; for a user-stream output (r12, WP290-CX-R12-01), its own keys
  * (`kind`, `oms`, an ORDER's `observation`, a TRADE's `fills` and `settlements`) DELETED, made an accessor, or given a
- * value outside their shape. Every mutated answer is a fresh plain object; nothing of the input is changed.
+ * value outside their shape. (r13, WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01) A closed-vocabulary
+ * discriminant is also given READABLE text outside its vocabulary: a stream output's `kind` (`""`, `"Trade"`,
+ * `"TRADE "`, `"order"`, `"ORDERS"`, `"TRADE_BAD"`, and WP-280's non-activity kinds on an output that still carries its
+ * projection), and a `status` (`"Failed"`, `"BOGUS"`, `"TRADE_STATUS_FAILED"`, `"MATCHED_NOT_BROADCASTED"`). Every
+ * mutated answer is a fresh plain object; nothing of the input is changed.
  *
  * The ORACLE reads a delivered answer field by field, each on its own, with the field domains of `ports.ts` (the
  * guards are the domains' definitions; the oracle's walk over rows, legs and entries is its own): a field that is own
  * data and in its domain is a VALIDATED fragment; one that is present but not (an accessor, the wrong type, out of its
  * domain) or missing is UNREADABLE. An entry of a readable list that is not own data is a row every field of which is
  * unreadable. An answer whose route (or source) is a READABLE string naming another source keeps nothing (E-15, U-22).
+ * (r13) The domains of the closed vocabularies are stated from their PRODUCERS' contracts, not from the door: WP-280's
+ * five output kinds (`manager.ts`, `UserStreamOutput`) and its five settlement statuses (`venue-facts.ts`,
+ * `USER_TRADE_STATUSES`).
  *
  * PAPER only: pure; no network, key or signer.
  */
@@ -100,6 +107,9 @@ function wrongValue(rand: Rand, key: string, value: unknown): unknown {
   if (key === "side") return pick(rand, ["buy", "HOLD", 1]);
   if (key === "role" || key === "liquidityRole") return pick(rand, ["maker", "BOTH"]);
   if (key === "state") return pick(rand, ["confirmed", "DONE", 3]);
+  // (r13) A status: also readable text outside the documented vocabulary (closed for a stream settlement, WP-280's
+  // five; open for an order, a REST trade and a stream order observation, which keep it as text).
+  if (key === "status") return pick(rand, [42, "", ["x"], { x: 1 }, "Failed", "BOGUS", "TRADE_STATUS_FAILED", "MATCHED_NOT_BROADCASTED"]);
   return pick(rand, [42, "", ["x"], { x: 1 }]);
 }
 
@@ -281,19 +291,36 @@ function without(row: Row, key: string): Row {
 }
 
 /**
+ * (r13) Readable `kind` texts outside WP-280's activity kinds: not one of its five outputs (`""`, `"Trade"`,
+ * `"TRADE "`, ...), or one of its three non-activity outputs on an output that still carries its projection.
+ */
+export const STREAM_KIND_TEXTS = ["", "Trade", "TRADE ", "trade", "order", "ORDERS", "TRADE_BAD", "ORDER_BAD", "STATE", "UNRECOGNIZED_MESSAGE", "RECONCILIATION_REQUESTED"] as const;
+
+/** Whether a stream output's `kind` is own data naming one of WP-280's two activity outputs. */
+function activityKind(row: Row): boolean {
+  const kind = own(row, "kind");
+  return kind.data && (kind.value === "ORDER" || kind.value === "TRADE");
+}
+
+/**
  * One mutation of a user-stream output (WP-280's ORDER or TRADE output). ENVELOPE breaks the output's own keys: its
- * `kind` or `oms` (one draw in four), else an ORDER's `observation` or one of a TRADE's lists. Each such key is made an
- * accessor, given a value outside its shape, or (r12, WP290-CX-R12-01) DELETED. A second mutation may meet an output
- * a first one broke (no `oms`, no list): it then mutates what is there.
+ * `kind` or `oms` (two draws in five), else an ORDER's `observation` or one of a TRADE's lists. Each such key is made an
+ * accessor, given a value outside its shape, or (r12, WP290-CX-R12-01) DELETED; (r13) a `kind` is given READABLE text
+ * outside WP-280's activity kinds in one draw in two ({@link STREAM_KIND_TEXTS}). A second mutation may meet an output
+ * a first one broke (no `oms`, no list): it then mutates what is there. It never DELETES the projection of an output
+ * whose kind no longer names an activity output: that would forge a well-formed non-activity output, which carries no
+ * fact at all (indistinguishable from a message never sent; WP-280's own gap detection is the defence there), so the
+ * projection is made an accessor instead.
  */
 function mutateStream(rand: Rand, base: Row, mutation: Mutation): Row {
   const projection = base["oms"];
   const oms: Row = projection !== null && typeof projection === "object" && !Array.isArray(projection) ? (projection as Row) : {};
-  if (mutation === "ENVELOPE" && rand() < 0.25) {
+  if (mutation === "ENVELOPE" && rand() < 0.4) {
     const key = rand() < 0.5 ? "kind" : "oms";
+    if (key === "kind" && rand() < 0.5) return { ...base, kind: pick(rand, STREAM_KIND_TEXTS) };
     const how = rand();
     if (how < 1 / 3) return withAccessor(base, key);
-    if (how < 2 / 3) return without(base, key);
+    if (how < 2 / 3) return key === "oms" && !activityKind(base) ? withAccessor(base, key) : without(base, key);
     return { ...base, [key]: 7 };
   }
   if (base["kind"] === "ORDER") {
@@ -376,11 +403,11 @@ export const DOMAINS: Readonly<Record<string, (value: unknown) => boolean>> = {
 };
 
 /** Every field of one delivered row: its value when validated on its own, `UNREADABLE` otherwise. */
-export function expectedRow(row: unknown, keys: readonly string[], optionalNull: readonly string[] = []): Expected {
+export function expectedRow(row: unknown, keys: readonly string[], optionalNull: readonly string[] = [], domains: Readonly<Record<string, (value: unknown) => boolean>> = {}): Expected {
   const out: Record<string, unknown> = {};
   for (const key of keys) {
     const read = row === UNREADABLE ? ({ data: false } as const) : own(row, key);
-    const domain = DOMAINS[key] as (value: unknown) => boolean;
+    const domain = (domains[key] ?? DOMAINS[key]) as (value: unknown) => boolean;
     if (!read.data && optionalNull.includes(key) && row !== UNREADABLE && row !== null && typeof row === "object" && !Object.prototype.hasOwnProperty.call(row, key)) {
       out[key] = null;
       continue;
@@ -409,6 +436,16 @@ export function expectedRoute(answer: unknown, key: string, right: string): "RIG
   return read.value === right ? "RIGHT" : "OTHER";
 }
 
+/** (r13) WP-280's non-activity outputs (`manager.ts`, `UserStreamOutput`): STATE, UNRECOGNIZED_MESSAGE, RECONCILIATION_REQUESTED. */
+const STREAM_NON_ACTIVITY_KINDS: readonly string[] = ["STATE", "UNRECOGNIZED_MESSAGE", "RECONCILIATION_REQUESTED"];
+/** (r13) The keys of WP-280's ORDER and TRADE outputs that none of its other outputs carries. */
+const STREAM_ACTIVITY_ONLY_KEYS: readonly string[] = ["event", "oms"];
+/** (r13) WP-280's settlement statuses (`venue-facts.ts`, `USER_TRADE_STATUSES`), plain spelling: a stream settlement's domain. */
+const USER_TRADE_STATUSES: readonly string[] = ["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"];
+function isStreamSettlementStatusOracle(value: unknown): boolean {
+  return typeof value === "string" && USER_TRADE_STATUSES.includes(value);
+}
+
 /**
  * (r12) What a delivered user-stream output carries, read by the oracle on its own: every item (a row of fragments) and
  * every unreadable entry BY NAME (`<item kind>:<field>`, as the door names it: `FILL:kind`, `ORDER:oms`, `FILL:oms`,
@@ -423,9 +460,15 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
   // Each unreadable entry by name (`<item kind>:<field>`): r12 states them by name, not by count.
   const unreadable: string[] = [];
   const projection = oms.data && oms.value !== null && typeof oms.value === "object" ? oms.value : undefined;
+  // (r13) Whether the output carries, in any form, a key only WP-280's ORDER and TRADE outputs carry.
+  const carriesActivity = answer !== null && typeof answer === "object" && STREAM_ACTIVITY_ONLY_KEYS.some((key) => key in answer);
   // An output whose own kind cannot be read: one unreadable entry (it may have been any output, a TRADE among them).
   if (!kind.data || typeof kind.value !== "string") unreadable.push("FILL:kind");
-  else if (kind.value === "ORDER") {
+  else if (STREAM_NON_ACTIVITY_KINDS.includes(kind.value)) {
+    // (r13) One of WP-280's non-activity outputs carries nothing, unless it carries an activity output's key: then it
+    // may be an ORDER or TRADE output, mis-tagged (unreadable).
+    if (carriesActivity) unreadable.push("FILL:kind");
+  } else if (kind.value === "ORDER") {
     // (r12, WP290-CX-R12-01) WP-280's ORDER projection always carries `observation` (null: no observation): a key
     // that is MISSING, not own data, or `undefined` is unreadable, never "nothing".
     const observation = projection === undefined ? undefined : Object.getOwnPropertyDescriptor(projection, "observation");
@@ -448,12 +491,17 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
         }
         for (const entry of entries) {
           if (entry === UNREADABLE) unreadable.push(`${itemKind}:entry`);
-          else items.push({ kind: itemKind, row: expectedRow(entry, keys, optional) });
+          else items.push({ kind: itemKind, row: expectedRow(entry, keys, optional, itemKind === "SETTLEMENT" ? { status: isStreamSettlementStatusOracle } : {}) });
         }
       }
     }
+  } else {
+    // (r13, WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01) A readable kind outside WP-280's five outputs
+    // (`""`, `"Trade"`, `"TRADE "`, `"order"`, ...): it may have been an ORDER or TRADE output: unreadable, never nothing.
+    unreadable.push("FILL:kind");
   }
   return { items, unreadable };
 }
+
 
 export { APPROVAL_KEYS, COLLATERAL_KEYS, FILL_KEYS, LEG_KEYS, MEMBER_KEYS, OBSERVATION_KEYS, ORDER_KEYS, POSITION_KEYS, SETTLEMENT_KEYS, TRADE_KEYS, own };

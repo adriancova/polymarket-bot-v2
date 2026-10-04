@@ -10,7 +10,11 @@
  *   the order is canceled and every read lags (no trades, no positions, the collateral as before, the order by id
  *   with nothing matched);
  * - ORDER: an UNKNOWN submission the venue took (LIVE); WP-280's ORDER output for it, mutated; the list reads replay a
- *   snapshot taken before the submission (the by-id read is truthful: it is made only for an id something named).
+ *   snapshot taken before the submission (the by-id read is truthful: it is made only for an id something named);
+ * - (r13) SETTLE: a tracked BUY matched 0.4 (MATCHED), its fill delivered by the stream, resumed; the venue FAILS the
+ *   trade; WP-280's TRADE output for the FAILED event (its settlement), mutated; every read replays the snapshot from
+ *   before the failure. The mutations include (r13) a readable `kind` outside WP-280's activity kinds and a settlement
+ *   status outside WP-280's five (`support/mutate.ts`), each counted and asserted drawn.
  *
  * It asserts, for every seed:
  * 1. NOTHING IS LOST WHILE THE READS LAG: no oracle violation (`harness.ts`: R1, resumed only when consistent; R2,
@@ -32,7 +36,7 @@ import type { OrderManager } from "../../../packages/oms/src/index.js";
 import { MAX_STREAM_ITEMS } from "../../../packages/oms/src/reconciliation/door.js";
 
 import { boot, streamTrade } from "./support/harness.js";
-import { MUTATIONS, expectedStream, mutateAnswer, type Mutation } from "./support/mutate.js";
+import { MUTATIONS, expectedStream, mutateAnswer, own, type Mutation } from "./support/mutate.js";
 import { seeded } from "./support/property.js";
 import { ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 import type { ReadFaults } from "./support/world.js";
@@ -81,6 +85,35 @@ async function listSnapshot(r: Ready): Promise<ReadFaults> {
   return { listOpenOrders: () => open, listTrades: () => trades, readPositions: () => positions, readCollateral: () => collateral };
 }
 
+/** (r13) Every read as the venue answers now, the by-id read of `venueOrderId` included (a lagging adapter replays them). */
+async function fullSnapshot(r: Ready, venueOrderId: string): Promise<ReadFaults> {
+  const faults = await listSnapshot(r);
+  const byId = await r.u.world.readPort().readOrder(venueOrderId);
+  return { ...faults, readOrder: () => byId };
+}
+
+/** (r13) WP-280's projection of one settlement event (no fill: the OMS holds it). */
+function settlementOutput(trade: { readonly venueTradeId: string; readonly venueOrderId: string }, status: string): Row {
+  return { kind: "TRADE", oms: { fills: [], settlements: [{ venueTradeId: trade.venueTradeId, venueOrderId: trade.venueOrderId, status, transactionHash: null, observedAt: "2026-10-03T00:00:01Z" }], shortfalls: [] } };
+}
+
+/** (r13) A delivered output whose kind is READABLE text naming neither activity output. */
+function kindText(answer: unknown): boolean {
+  const kind = own(answer, "kind");
+  return kind.data && typeof kind.value === "string" && kind.value !== "ORDER" && kind.value !== "TRADE";
+}
+
+/** (r13) A delivered output carrying a settlement whose status is READABLE text outside WP-280's five. */
+function settlementStatusText(answer: unknown): boolean {
+  const projection = own(answer, "oms");
+  const list = projection.data ? own(projection.value, "settlements") : { data: false as const };
+  if (!list.data || !Array.isArray(list.value)) return false;
+  return (list.value as unknown[]).some((entry) => {
+    const status = own(entry, "status");
+    return status.data && typeof status.value === "string" && !["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"].includes(status.value);
+  });
+}
+
 async function anyResumed(r: Ready, rounds: number): Promise<boolean> {
   let resumed = false;
   for (let round = 0; round < rounds; round += 1) {
@@ -109,16 +142,22 @@ function journaled(r: Ready, entry: string): boolean {
 
 const SEEDS = 160;
 
-describe("WP-290 r12: the stream door end to end, under lagging reads (WP290-CX-R12-01's class)", () => {
+describe("WP-290 r12, r13: the stream door end to end, under lagging reads (WP290-CX-R12-01's and WP290-CX-R13-01's class)", () => {
   it(`${String(SEEDS)} seeds (1 to ${String(SEEDS)}): a mutated WP-280 output, the reads lagging behind it, a restart in one seed in two: nothing is lost; every unreadable entry is a journaled obligation that holds`, async () => {
     const shapes = new Map<string, number>();
     let unreadableSeeds = 0;
     let unappliedFills = 0;
     let restarts = 0;
     let resumedAfter = 0;
+    let kindTexts = 0;
+    let statusTexts = 0;
+    let unappliedSettlements = 0;
+    const scenarios = new Map<string, number>();
     for (let seed = 1; seed <= SEEDS; seed += 1) {
       const rand = seeded(seed * 104_729);
-      const scenario = rand() < 0.35 ? "ORDER" : "TRADE";
+      const roll = rand();
+      const scenario = roll < 0.3 ? "ORDER" : roll < 0.6 ? "SETTLE" : "TRADE";
+      scenarios.set(scenario, (scenarios.get(scenario) ?? 0) + 1);
       const withRestart = rand() < 0.5;
       const r0 = await ready();
       let attempt: string | null = null;
@@ -138,6 +177,29 @@ describe("WP-290 r12: the stream door end to end, under lagging reads (WP290-CX-
         applied = r0.oms.orders()[0]?.filledShares === "0.4";
         r0.u.world.cancel(trade.venueOrderId);
         lagEveryRead(r0, collateral);
+        if (kindText(draw.delivered)) kindTexts += 1;
+      } else if (scenario === "SETTLE") {
+        await submitOne(r0.oms);
+        expect(await reconcileRounds(r0, 3)).toBe(true);
+        const trade = must(r0.u.world.match(must(r0.u.world.receipts.at(-1), "receipt"), "0.4", { status: "MATCHED" }), "match");
+        r0.p.coordinator.onUserStreamOutput(streamTrade(r0.u, trade.venueTradeId));
+        await r0.p.coordinator.settled();
+        expect(await reconcileRounds(r0, 3)).toBe(true);
+        const stale = await fullSnapshot(r0, trade.venueOrderId);
+        r0.u.world.failTrade(trade);
+        // One draw in three garbles the settlement's status into readable text outside WP-280's five first.
+        const status = rand() < 1 / 3 ? pick(rand, ["Failed", "FAILED ", "BOGUS", "TRADE_STATUS_FAILED", "MATCHED_NOT_BROADCASTED"]) : "FAILED";
+        const draw = mutated(rand, settlementOutput(trade, status));
+        expected = expectedStream(draw.delivered, MAX_STREAM_ITEMS);
+        label = `seed ${String(seed)} SETTLE ${draw.mutation}+${draw.second} unreadable=[${expected.unreadable.join(",")}]`;
+        r0.p.coordinator.onUserStreamOutput(draw.delivered);
+        await r0.p.coordinator.settled();
+        // Applied: the OMS recorded the failure (its halting alert). Otherwise the reads must never let it resume.
+        applied = r0.oms.alerts().some((alert) => (alert as { kind?: string }).kind === "SETTLEMENT_FAILED");
+        if (!applied) unappliedSettlements += 1;
+        r0.u.world.faults = stale;
+        if (kindText(draw.delivered)) kindTexts += 1;
+        if (settlementStatusText(draw.delivered)) statusTexts += 1;
       } else {
         const stale = await listSnapshot(r0);
         r0.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
@@ -149,6 +211,7 @@ describe("WP-290 r12: the stream door end to end, under lagging reads (WP290-CX-
         r0.p.coordinator.onUserStreamOutput(draw.delivered);
         await r0.p.coordinator.settled();
         r0.u.world.faults = stale;
+        if (kindText(draw.delivered)) kindTexts += 1;
       }
       for (const entry of expected.unreadable) shapes.set(`${scenario}:${entry}`, (shapes.get(`${scenario}:${entry}`) ?? 0) + 1);
       if (withRestart) restarts += 1;
@@ -163,10 +226,10 @@ describe("WP-290 r12: the stream door end to end, under lagging reads (WP290-CX-
         expect(resumed, `${label}: resumed after an unreadable entry`).toBe(false);
         for (const entry of expected.unreadable) expect(journaled(r, entry), `${label}: ${entry} journaled`).toBe(true);
       }
-      // 3. A fill the OMS did not apply never lets the account resume on the lagging reads.
+      // 3. A fill (r13: or a failed settlement) the OMS did not apply never lets the account resume on the lagging reads.
       if (!applied) {
-        unappliedFills += 1;
-        expect(resumed, `${label}: resumed with the fill unapplied`).toBe(false);
+        if (scenario === "TRADE") unappliedFills += 1;
+        expect(resumed, `${label}: resumed with the ${scenario === "SETTLE" ? "settlement" : "fill"} unapplied`).toBe(false);
       }
       // 4. Then the reads are truthful: still nothing lost, and an unreadable entry still holds.
       r.u.world.faults = {};
@@ -177,9 +240,13 @@ describe("WP-290 r12: the stream door end to end, under lagging reads (WP290-CX-
       else if (caughtUp) resumedAfter += 1;
     }
     console.log(
-      `STREAM-LAG-PROPERTY seeds=1..${String(SEEDS)} seed=s*104729 restarts=${String(restarts)} withUnreadable=${String(unreadableSeeds)} unappliedFills=${String(unappliedFills)} resumedOnceTruthful=${String(resumedAfter)} byUnreadableEntry=${JSON.stringify(Object.fromEntries([...shapes].sort()))}`,
+      `STREAM-LAG-PROPERTY seeds=1..${String(SEEDS)} seed=s*104729 scenarios=${JSON.stringify(Object.fromEntries([...scenarios].sort()))} restarts=${String(restarts)} withUnreadable=${String(unreadableSeeds)} unappliedFills=${String(unappliedFills)} unappliedSettlements=${String(unappliedSettlements)} kindText=${String(kindTexts)} settlementStatusText=${String(statusTexts)} resumedOnceTruthful=${String(resumedAfter)} byUnreadableEntry=${JSON.stringify(Object.fromEntries([...shapes].sort()))}`,
     );
-    // The draw reaches every missing key the finding named.
-    for (const shape of ["TRADE:FILL:fills", "TRADE:SETTLEMENT:settlements", "ORDER:ORDER:observation"]) expect(shapes.get(shape) ?? 0, shape).toBeGreaterThan(0);
+    // The draw reaches every missing key r12's finding named, and (r13) the readable kinds and settlement statuses
+    // outside their vocabularies r13's finding and audit named.
+    for (const shape of ["TRADE:FILL:fills", "ORDER:ORDER:observation"]) expect(shapes.get(shape) ?? 0, shape).toBeGreaterThan(0);
+    expect((shapes.get("TRADE:SETTLEMENT:settlements") ?? 0) + (shapes.get("SETTLE:SETTLEMENT:settlements") ?? 0), "a missing settlements list").toBeGreaterThan(0);
+    expect(kindTexts, "(r13) a readable kind outside WP-280's activity kinds").toBeGreaterThan(0);
+    expect(statusTexts, "(r13) a readable settlement status outside WP-280's five").toBeGreaterThan(0);
   }, 120_000);
 });

@@ -18,6 +18,10 @@
  *    identity was unreadable is an UNREADABLE obligation that a restart replays and that holds the account in every
  *    run.
  *
+ * (r13, WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01) The closed vocabularies' domains are stated from their
+ * producers' contracts (`support/mutate.ts`), and the mutations give them READABLE text outside the vocabulary: a
+ * stream output's `kind`, and a status (a stream settlement's is closed). Both are counted and asserted drawn.
+ *
  * The seeds and case counts are printed (`DOOR-PROPERTY ...`) for the handoff.
  *
  * PAPER only: pure doors over generated plain data, and the in-memory simulated venue; no network, key or signer.
@@ -326,6 +330,23 @@ function anyUnreadable(value: unknown): boolean {
 
 const SEEDS_PER_DOOR = 2500;
 
+/** (r13) Whether a delivered stream output's kind is READABLE text naming neither of WP-280's activity outputs. */
+function streamKindText(answer: unknown): boolean {
+  const kind = own(answer, "kind");
+  return kind.data && typeof kind.value === "string" && kind.value !== "ORDER" && kind.value !== "TRADE";
+}
+
+/** (r13) Whether a delivered stream output carries a settlement whose status is READABLE text outside WP-280's five. */
+function streamSettlementStatusText(answer: unknown): boolean {
+  const projection = own(answer, "oms");
+  const list = projection.data ? own(projection.value, "settlements") : { data: false as const };
+  if (!list.data || !Array.isArray(list.value)) return false;
+  return (list.value as unknown[]).some((entry) => {
+    const status = own(entry, "status");
+    return status.data && typeof status.value === "string" && !["MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED"].includes(status.value);
+  });
+}
+
 /** (r12) Whether a delivered stream output lacks one of the keys the door reads (`kind`, `oms`, `observation`, `fills`, `settlements`). */
 function streamKeyMissing(answer: unknown): boolean {
   const has = (value: unknown, key: string): boolean => value !== null && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, key);
@@ -344,6 +365,8 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
     let unreadableCases = 0;
     let doubles = 0;
     let streamKeysMissing = 0;
+    let streamKindTexts = 0;
+    let streamStatusTexts = 0;
     for (const door of DOORS) {
       for (let seed = 1; seed <= SEEDS_PER_DOOR; seed += 1) {
         const rand = seeded(seed * 31 + DOORS.indexOf(door));
@@ -362,6 +385,9 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
         if (anyUnreadable(expected) || (door === "stream" && (expected as ReturnType<typeof expectedStream>).unreadable.length > 0)) unreadableCases += 1;
         // (r12) The stream outputs delivered with one of the door's own keys MISSING (WP290-CX-R12-01's shape).
         if (door === "stream" && streamKeyMissing(delivered)) streamKeysMissing += 1;
+        // (r13) The stream outputs delivered with a readable kind, or a settlement status, outside its vocabulary.
+        if (door === "stream" && streamKindText(delivered)) streamKindTexts += 1;
+        if (door === "stream" && streamSettlementStatusText(delivered)) streamStatusTexts += 1;
         if (door !== "stream") {
           const outcome = output as ReadOutcome<unknown>;
           expect(outcome.salvage, `${door} seed ${String(seed)}: an outcome without its salvage`).toBeDefined();
@@ -374,9 +400,11 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
         }
       }
     }
-    console.log(`DOOR-PROPERTY doors=${String(DOORS.length)} seeds=1..${String(SEEDS_PER_DOOR)} cases=${String(cases)} doubleMutations=${String(doubles)} withUnreadable=${String(unreadableCases)} streamKeyMissing=${String(streamKeysMissing)} byMutation=${JSON.stringify(Object.fromEntries([...counts].sort()))}`);
+    console.log(`DOOR-PROPERTY doors=${String(DOORS.length)} seeds=1..${String(SEEDS_PER_DOOR)} cases=${String(cases)} doubleMutations=${String(doubles)} withUnreadable=${String(unreadableCases)} streamKeyMissing=${String(streamKeysMissing)} streamKindText=${String(streamKindTexts)} streamSettlementStatusText=${String(streamStatusTexts)} byMutation=${JSON.stringify(Object.fromEntries([...counts].sort()))}`);
     expect(cases).toBe(DOORS.length * SEEDS_PER_DOOR);
     expect(streamKeysMissing, "the key-deletion mutation is drawn").toBeGreaterThan(0);
+    expect(streamKindTexts, "(r13) a readable kind outside WP-280's activity kinds is drawn").toBeGreaterThan(0);
+    expect(streamStatusTexts, "(r13) a readable settlement status outside WP-280's five is drawn").toBeGreaterThan(0);
     // About 0.5 s alone; a generous bound, so a loaded host never times it out (vitest's default is 5 s).
   }, 120_000);
 
@@ -430,6 +458,42 @@ describe("WP-290 r12 (WP290-CX-R12-01): the stream door's own keys", () => {
       const output = readStreamOutput(answer);
       expect(stated("stream", output), name).toEqual(oracle("stream", answer));
       expect(output.unreadable.map((entry) => `${entry.kind}:${entry.field}`), name).toEqual(names);
+    }
+  });
+});
+
+describe("WP-290 r13 (WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01): the stream door's closed vocabularies", () => {
+  it("(named) a kind outside WP-280's five, a non-activity kind carrying an activity key, a settlement status outside WP-280's five: each unreadable, named, as the oracle states; WP-280's own non-activity outputs and an order observation's open status: as before", () => {
+    const fill = { venueTradeId: "t1", venueOrderId: "venue-1", shares: "0.4", price: "0.5", liquidityRole: "MAKER", feeAmount: "0", feeAssetId: null, matchedAt: "2026-10-03T00:00:00Z" };
+    const settlement = (status: unknown): Row => ({ venueTradeId: "t1", venueOrderId: "venue-1", status, transactionHash: null });
+    const trade: Row = { fills: [fill], settlements: [], shortfalls: [] };
+    const cases: [string, unknown, string[], string[]][] = [
+      ['kind "" on a TRADE output', { kind: "", oms: trade }, ["FILL:kind"], []],
+      ['kind "Trade"', { kind: "Trade", oms: trade }, ["FILL:kind"], []],
+      ['kind "TRADE "', { kind: "TRADE ", oms: trade }, ["FILL:kind"], []],
+      ['kind "order" on an ORDER output', { kind: "order", oms: { observation: { venueOrderId: "venue-1", status: "LIVE" }, shortfalls: [] } }, ["FILL:kind"], []],
+      ['kind "TRADE_BAD", no projection', { kind: "TRADE_BAD" }, ["FILL:kind"], []],
+      ["kind STATE carrying a TRADE projection", { kind: "STATE", oms: trade }, ["FILL:kind"], []],
+      ["kind UNRECOGNIZED_MESSAGE carrying an event", { kind: "UNRECOGNIZED_MESSAGE", event: {} }, ["FILL:kind"], []],
+      ["kind RECONCILIATION_REQUESTED carrying a projection", { kind: "RECONCILIATION_REQUESTED", request: {}, oms: trade }, ["FILL:kind"], []],
+      ['settlement status "Failed"', { kind: "TRADE", oms: { fills: [], settlements: [settlement("Failed")], shortfalls: [] } }, [], ["SETTLEMENT:status"]],
+      ['settlement status "FAILED "', { kind: "TRADE", oms: { fills: [], settlements: [settlement("FAILED ")], shortfalls: [] } }, [], ["SETTLEMENT:status"]],
+      ['settlement status "TRADE_STATUS_FAILED" (the REST spelling)', { kind: "TRADE", oms: { fills: [], settlements: [settlement("TRADE_STATUS_FAILED")], shortfalls: [] } }, [], ["SETTLEMENT:status"]],
+      ["settlement status 7", { kind: "TRADE", oms: { fills: [], settlements: [settlement(7)], shortfalls: [] } }, [], ["SETTLEMENT:status"]],
+      ["control: STATE as WP-280 emits it", { kind: "STATE", from: "CONNECTED", to: "RECONNECTING", cause: null, subscriptionGeneration: 1 }, [], []],
+      ["control: UNRECOGNIZED_MESSAGE as WP-280 emits it", { kind: "UNRECOGNIZED_MESSAGE", reason: "UNKNOWN_EVENT_TYPE", field: null, receipt: {} }, [], []],
+      ["control: RECONCILIATION_REQUESTED as WP-280 emits it", { kind: "RECONCILIATION_REQUESTED", request: {} }, [], []],
+      ["control: settlement FAILED", { kind: "TRADE", oms: { fills: [], settlements: [settlement("FAILED")], shortfalls: [] } }, [], []],
+      ['control: an order observation\'s status "BOGUS" (open: kept as text)', { kind: "ORDER", oms: { observation: { venueOrderId: "venue-1", status: "BOGUS" }, shortfalls: [] } }, [], []],
+    ];
+    for (const [name, answer, entries, fields] of cases) {
+      const output = readStreamOutput(answer);
+      expect(stated("stream", output), name).toEqual(oracle("stream", answer));
+      expect(output.unreadable.map((entry) => `${entry.kind}:${entry.field}`), name).toEqual(entries);
+      expect(
+        output.items.flatMap((item) => item.fragments.unreadable.map((field) => `${item.fragments.kind}:${field}`)),
+        name,
+      ).toEqual(fields);
     }
   });
 });
