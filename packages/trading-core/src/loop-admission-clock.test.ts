@@ -783,7 +783,12 @@ describe("ADR-031 R1-R6: a placement's admission reads the process clock once an
         if (record.decision.intents.length > 0) wired.clock?.set(iso(ENTRY_AT_MS + 5_000));
         return await inner.persistDecision(record, telemetry);
       },
-      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      // `CKPT-1`: a decision that owes a checkpoint is written with it, so the
+      // same clock move applies to the paired write.
+      persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) => {
+        if (record.decision.intents.length > 0) wired.clock?.set(iso(ENTRY_AT_MS + 5_000));
+        return await inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt);
+      },
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
@@ -1130,7 +1135,8 @@ describe("ADR-031 T10: the clock moves while the entry's decision commit is HELD
     };
     const store: TraderStore = {
       persistDecision: (record, telemetry) => inner.persistDecision(record, telemetry),
-      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      persistDecisionWithCheckpoint: (record, telemetry, checkpoint, capturedAt) =>
+        inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),

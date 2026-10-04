@@ -101,7 +101,10 @@ export class InMemoryTraderStore implements TraderStore {
     return this.#decisions;
   }
 
-  /** Every saved checkpoint, in write order. */
+  /**
+   * Every saved checkpoint, in write order — since `CKPT-1` (ADR-027) only
+   * those the decisions owed, each written with its decision.
+   */
   get checkpoints(): readonly StrategyStateCheckpoint[] {
     return this.#checkpoints;
   }
@@ -155,11 +158,19 @@ export class InMemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
-  async saveCheckpoint(
+  /**
+   * `CKPT-1` (ADR-027 D3): records the decision and the checkpoint it owes
+   * together, or neither (a closed store refuses both). Replaces the lone
+   * `saveCheckpoint`, which the loop no longer has a use for.
+   */
+  async persistDecisionWithCheckpoint(
+    record: DecisionRecord,
+    telemetry: DecisionTelemetry,
     checkpoint: StrategyStateCheckpoint,
     capturedAt: string,
   ): Promise<PortResult<null>> {
     if (this.#closed) return await Promise.resolve(closedRefusal());
+    this.#decisions.push({ record, telemetry });
     this.#checkpoints.push(checkpoint);
     this.#checkpointInstants.push(capturedAt);
     return await Promise.resolve(portOk(null));

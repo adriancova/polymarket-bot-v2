@@ -26,6 +26,7 @@ import { describe, expect, it } from "vitest";
 import { foldPnlRecords, computePnlSnapshot } from "@polymarket-bot/pnl";
 import { projectionOf } from "@polymarket-bot/trader";
 
+import { oracleDecisionOf, owedCheckpoints } from "./support/checkpoints.js";
 import { INSTANCE_ID, MARKET_ID, RUN_ID, YES_TOKEN } from "./support/fixture.js";
 import { driveRecordedRun } from "./support/run.js";
 
@@ -239,7 +240,18 @@ describe("acceptance 3 — the end-to-end paper fixture emits a traceable fill a
       (written) => `${written.record.runId}|${String(written.record.evaluationSeq)}`,
     );
     expect(new Set(keys).size).toBe(keys.length);
-    // Every persisted decision has its checkpoint.
-    expect(run.parts.store.checkpoints).toHaveLength(persisted.length);
+    // `CKPT-1` re-pin (ADR-027): this was "every persisted decision has its
+    // checkpoint" (as many checkpoints as decisions). A checkpoint now follows
+    // only a decision that meets ADR-027 Decision 1: the store holds exactly
+    // the checkpoints the independent oracle derives from the persisted
+    // decisions, each with the folded state bytes, and fewer than one per
+    // decision on this fixture.
+    const checkpoints = run.parts.store.checkpoints;
+    const owed = owedCheckpoints(persisted.map((written) => oracleDecisionOf(written.record)));
+    expect(checkpoints.map((checkpoint) => `${checkpoint.instanceId}|${String(checkpoint.checkpointSeq)}`)).toEqual(
+      owed.map((entry) => `${entry.instanceId}|${String(entry.checkpointSeq)}`),
+    );
+    expect(checkpoints.map((checkpoint) => checkpoint.stateJson)).toEqual(owed.map((entry) => entry.stateJson));
+    expect(checkpoints.length).toBeLessThan(persisted.length);
   });
 });

@@ -208,6 +208,24 @@ line and in one health counter only — `snapshotsUnavailable=4`, not `3`
 before its first book, which is no evaluation (ADR-026 D2.3), so the market
 stays owed and the `MarketOpened` close tries it once more.
 
+**Re-pinned by `CKPT-1` (2026-10-03)** — ADR-027 (the user's ruling A2):
+a strategy checkpoint is written only after a decision that changes the
+state, the status or the RNG, at the start, at the stop, or on a 60 s
+event-time heartbeat. Exactly ONE line moved, the `store` line's
+`checkpoints` count, `12 → 10`; every other byte is base's (`ebed242`). It was
+edited by hand and checked mechanically, not re-captured: a scratch probe
+listed this run's durable decisions and checkpoints at base and at the
+candidate (its output is in the round's handoff), and the only difference is
+two checkpoint lines:
+
+- `seq=10` (`onOrderUpdate`, `SB.IDLE`) and `seq=11` (`onMarketClosing`,
+  `SB.REFUSED_MAXIMUM_ENTRIES`) have no `statePatch`, so their state bytes
+  equal `seq=9`'s (the same state hash at base); the status stays `ACTIVE`,
+  Static Bracket draws no randomness, and `09:14:50` is 1 s after the last
+  checkpoint's `09:14:49`. Neither owes a checkpoint, and neither is written.
+- The ten remaining checkpoints (`seq=0…9`) have base's sequence, state hash,
+  status and `capturedAt`; the twelve decisions are unchanged.
+
 ## Relationship to the other goldens
 
 `test/replay-golden/simulation/` (`WP-210`) pins the replay driver and the

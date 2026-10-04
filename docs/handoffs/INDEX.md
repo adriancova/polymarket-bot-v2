@@ -130,3 +130,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-03 | [CADENCE-1.md](CADENCE-1.md) | `CADENCE-1`: ADR-026 evaluation cadence | WP | Complete (2026-10-03) | `8d7086a` | 6 KB |
 | 2026-10-03 | [WP-280.md](WP-280.md) | `WP-280`: the authenticated user-stream adapter | WP | Complete (2026-10-03) | `065716f` | 4 KB |
 | 2026-10-03 | [WP-310.md](WP-310.md) | `WP-310`: rate-limit budgets and matching-engine modes | WP | Complete (2026-10-03) | `fdf27ff` | 7 KB |
+| 2026-10-03 | [CKPT-1.md](CKPT-1.md) | `CKPT-1`: ADR-027, checkpoint on change plus a 60 s heartbeat | Round | Complete (2026-10-03) | `891ccdd` | 5 KB |

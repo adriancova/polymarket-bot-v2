@@ -43,7 +43,7 @@ pnl scope=VIRTUAL_STRATEGY instance=019b1e00-0000-7000-8000-000000000002 asOf=20
 --- health ---
 health healthy=true halts= evaluations=12 decisionsPersisted=12 snapshotsUnavailable=3 riskApprovals=4 riskRefusals=0 refusedExits=0 plansBuilt=4 submissionsAccepted=4 fillsObserved=3 cancelsConfirmed=1 ledgerTransactions=9 pnlRecords=12
 --- store ---
-store decisions=12 checkpoints=12 ledgerTransactions=9 pnlSnapshots=2
+store decisions=12 checkpoints=10 ledgerTransactions=9 pnlSnapshots=2
 --- driver ---
 driver eventsIngested=8 drains=8
 end

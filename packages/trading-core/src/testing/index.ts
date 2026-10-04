@@ -194,6 +194,13 @@ export type TraderStoreWrite =
   | "replacePnlSnapshot";
 
 /**
+ * `CKPT-1`: the writes a {@link MemoryTraderStore.persistDecisionWithCheckpoint}
+ * call consists of. It is ONE transaction, so an injected failure of EITHER
+ * constituent refuses the whole pair and records neither row.
+ */
+const PAIR_WRITES: readonly TraderStoreWrite[] = ["persistDecision", "saveCheckpoint"];
+
+/**
  * An in-memory durable store with failure injection — §4.2's PostgreSQL
  * boundary.
  *
@@ -304,6 +311,35 @@ export class MemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
+  /**
+   * `CKPT-1` (ADR-027 D3): the decision and the checkpoint it owes, recorded
+   * together or not at all — refused (nothing recorded) when an injected
+   * failure names either constituent write ({@link PAIR_WRITES}).
+   */
+  async persistDecisionWithCheckpoint(
+    record: DecisionRecord,
+    telemetry: DecisionTelemetry,
+    checkpoint: StrategyStateCheckpoint,
+    capturedAt: string,
+  ): Promise<PortResult<null>> {
+    for (const write of PAIR_WRITES) {
+      const refused = this.#refusalFor(write);
+      if (refused !== undefined) return await Promise.resolve(refused);
+    }
+    this.decisions.push({ record, telemetry });
+    this.checkpoints.push(checkpoint);
+    this.checkpointInstants.push(capturedAt);
+    return await Promise.resolve(portOk(null));
+  }
+
+  /**
+   * A lone checkpoint write. NOT part of {@link TraderStore} since `CKPT-1`:
+   * the loop never writes a checkpoint apart from its decision. Kept on this
+   * double for the hand-written `GroupCommit` doubles in the suites,
+   * whose `commit` writes a staging's rows one by one — atomically, from the
+   * loop's point of view, since nothing awaits between them but this
+   * in-memory double.
+   */
   async saveCheckpoint(
     checkpoint: StrategyStateCheckpoint,
     capturedAt: string,

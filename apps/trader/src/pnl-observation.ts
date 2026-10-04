@@ -51,8 +51,15 @@ export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): T
     persistDecision(record: DecisionRecord, telemetry: DecisionTelemetry): Promise<PortResult<null>> {
       return store.persistDecision(record, telemetry);
     },
-    saveCheckpoint(checkpoint: StrategyStateCheckpoint, capturedAt: string): Promise<PortResult<null>> {
-      return store.saveCheckpoint(checkpoint, capturedAt);
+    // `CKPT-1`: a decision with the checkpoint it owes, passed through as ONE
+    // write so the store keeps them in one transaction.
+    persistDecisionWithCheckpoint(
+      record: DecisionRecord,
+      telemetry: DecisionTelemetry,
+      checkpoint: StrategyStateCheckpoint,
+      capturedAt: string,
+    ): Promise<PortResult<null>> {
+      return store.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt);
     },
     // `PROVENANCE-1`: refusals pass through untouched, like decisions.
     persistRiskRefusal(refusal: RiskRefusalRecord): Promise<PortResult<null>> {
