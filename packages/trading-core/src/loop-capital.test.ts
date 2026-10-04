@@ -33,13 +33,30 @@
  *    restarts: the invariant at EVERY evaluation (every strategy callback,
  *    every cap check, every reservation), and no admitted intent taking a
  *    strategy over its cap.
+ *
+ * `CAP-1` r0 — THE RULING ON RISK CHECKS 16 AND 17 (2026-10-04). The same
+ * window hid an unbooked fill from §9.8's worst-case and scenario checks: they
+ * read booked positions and NON-terminal orders only. The ruling extends the
+ * invariant to them through a SEPARATE risk input (`unbookedFills`), wired
+ * from the allocator's own commitments. Pinned here, in the real loop:
+ *
+ * 4. the R4-CAP shape with `maxWorstCaseContractualLoss` 8 (allocator caps
+ *    out of the way): the third BUY is refused `RISK_WORST_CASE_LOSS_EXCEEDED`
+ *    on the carried, ordinary and per-frame paths, as the booked control
+ *    refuses it (at `13994b9` all three admitted it);
+ * 5. a protective SELL in the unbooked window: admitted, sized to the BOOKED
+ *    shares only (§6 invariant 10), and the filled order is in no open order
+ *    (§9.8 check 18 never sees it);
+ * 6. the property, extended: at EVERY risk evaluation, the holdings checks 16
+ *    and 17 count are at least the venue's floor, and no admitted entry takes
+ *    the strategy's floor over its worst-case limit.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
 import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 import type { DecisionResult, EventEnvelope, Intent } from "@polymarket-bot/domain";
 import { Ledger } from "@polymarket-bot/ledger";
-import { parseRiskPolicy } from "@polymarket-bot/risk";
+import { parseRiskPolicy, type RiskEvaluation } from "@polymarket-bot/risk";
 import {
   SimulatedVenue,
   deriveStreams,
@@ -57,6 +74,35 @@ import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
+import type * as Pipeline from "./pipeline.js";
+
+/**
+ * `CAP-1` r0: the risk seam, OBSERVED. Every risk input the loop builds and
+ * the real engine's verdict on it reach the current harness (`assemble` sets
+ * `observe`); both functions run unchanged, so nothing the loop decides
+ * differs.
+ */
+const riskSeam = vi.hoisted(() => ({
+  context: undefined as unknown,
+  observe: undefined as ((context: unknown, document: unknown, evaluation: unknown) => void) | undefined,
+}));
+
+vi.mock("./pipeline.js", async (importOriginal) => {
+  const original = await importOriginal<typeof Pipeline>();
+  return {
+    ...original,
+    buildRiskEvaluationInput(context: Parameters<typeof original.buildRiskEvaluationInput>[0]) {
+      riskSeam.context = context;
+      return original.buildRiskEvaluationInput(context);
+    },
+    runRiskCheck(policy: Parameters<typeof original.runRiskCheck>[0], input: unknown) {
+      const evaluation = original.runRiskCheck(policy, input);
+      riskSeam.observe?.(riskSeam.context, input, evaluation);
+      return evaluation;
+    },
+  };
+});
+
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import {
@@ -71,6 +117,7 @@ import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer } from "./loop.js";
 import { MarketState } from "./market-state.js";
+import type { RiskInputContext } from "./pipeline.js";
 import type { IngestedEvent } from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
@@ -129,13 +176,19 @@ function marketDocument(marketId: string, tokens: { readonly yes: string; readon
   };
 }
 
-function traderConfig(perStrategyCap: string, globalAccountCap: string): Record<string, unknown> {
+/** The §9.8 check-16 and check-17 limits a harness runs under (generous unless a pin tightens one). */
+interface RiskLimits {
+  readonly maxWorstCaseContractualLoss?: string;
+  readonly maxScenarioLoss?: string;
+}
+
+function traderConfig(perStrategyCap: string, globalAccountCap: string, risk: RiskLimits = {}): Record<string, unknown> {
   return {
     environment: "PAPER",
     riskPolicy: {
       freshness: { venueBookMaxAgeMs: 3_600_000, referenceFeedMaxAgeMs: 3_600_000, featuresMaxAgeMs: 3_600_000 },
-      limits: { maxWorstCaseContractualLoss: "1000" },
-      scenario: { maxScenarioLoss: "1000" },
+      limits: { maxWorstCaseContractualLoss: risk.maxWorstCaseContractualLoss ?? "1000" },
+      scenario: { maxScenarioLoss: risk.maxScenarioLoss ?? "1000" },
       economics: {},
       participation: {},
       rateLimit: { safetyReserveRequests: 0 },
@@ -341,6 +394,15 @@ interface Harness {
   readonly globalAccountCap: string;
   /** Every runtime invocation: `[instance, callback, evaluatedAt, YES shares shown]`. */
   readonly calls: [Label, string, string, string][];
+  /** `CAP-1` r0: every risk evaluation — the context the loop built, the document, and the engine's verdict. */
+  readonly risks: { readonly label: Label; readonly context: RiskInputContext; readonly document: RiskDocument; readonly evaluation: RiskEvaluation }[];
+}
+
+/** The parts of the risk input DOCUMENT these pins read (what the engine was handed). */
+interface RiskDocument {
+  readonly portfolio: { readonly positions: readonly { readonly shares: string }[]; readonly openOrders: readonly { readonly orderId: string }[] };
+  readonly unbookedFills?: readonly { readonly marketId: string; readonly side: string; readonly shares: string; readonly debit: string }[];
+  readonly scenarios: readonly { readonly scenarioId: string; readonly marks: readonly { readonly marketId: string; readonly yesPrice: string }[] }[];
 }
 
 interface HarnessOptions {
@@ -352,6 +414,10 @@ interface HarnessOptions {
   readonly beforeEvaluation?: (harness: Harness, input: EvaluationInput, label: Label) => void;
   /** A TIER-1 venue on a delayed market (`secondsDelay`, zero latency): how a fill reaches `observe()`. */
   readonly tier1DelaySeconds?: number;
+  /** `CAP-1` r0: the §9.8 check-16 and check-17 limits (generous by default). */
+  readonly risk?: RiskLimits;
+  /** `CAP-1` r0: runs at EVERY risk evaluation, after the engine answered — the property's check-16/17 floor. */
+  readonly onRisk?: (harness: Harness, risk: Harness["risks"][number]) => void;
 }
 
 const ZERO_LATENCY: LatencyModel = {
@@ -373,7 +439,7 @@ const QUEUE_PARAMETERS: QueueModelParameters = {
 
 function assemble(options: HarnessOptions): Harness {
   const globalAccountCap = options.globalAccountCap ?? "10000";
-  const parsed = parseTraderConfig(traderConfig(options.perStrategyCap, globalAccountCap));
+  const parsed = parseTraderConfig(traderConfig(options.perStrategyCap, globalAccountCap, options.risk));
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
   const policy = parseRiskPolicy(config.riskPolicy);
@@ -533,8 +599,20 @@ function assemble(options: HarnessOptions): Harness {
     evaluationCadence: options.cadence,
   });
   wiring.loop = loop;
-  const harness: Harness = { loop, venue, gate, clock, halts, perStrategyCap: options.perStrategyCap, globalAccountCap, calls };
+  const risks: Harness["risks"] = [];
+  const harness: Harness = { loop, venue, gate, clock, halts, perStrategyCap: options.perStrategyCap, globalAccountCap, calls, risks };
   wiring.harness = harness;
+  riskSeam.observe = (context, document, evaluation) => {
+    const built = context as RiskInputContext;
+    const risk = {
+      label: (built.strategyInstanceId === INSTANCE_A ? "A" : "B") as Label,
+      context: built,
+      document: document as RiskDocument,
+      evaluation: evaluation as RiskEvaluation,
+    };
+    risks.push(risk);
+    options.onRisk?.(harness, risk);
+  };
   return harness;
 }
 
@@ -874,6 +952,206 @@ describe("CAP-1 regression — the CADENCE-1 R4-CAP probe (O-R3-01's capital sid
 });
 
 // ---------------------------------------------------------------------------
+// 1b. The named regression for risk checks 16 and 17 (the r0 ruling)
+// ---------------------------------------------------------------------------
+
+/** What §9.8 check 16 measured at each of one strategy's risk evaluations: the maximum contractual loss, holdings plus the intent. */
+function checkSixteen(harness: Harness, label: Label): (string | undefined)[] {
+  return harness.risks.filter((risk) => risk.label === label).map((risk) => risk.evaluation.worstCase?.maximumContractualLoss);
+}
+
+/** The separate `unbookedFills` input each of one strategy's risk evaluations was handed (absent read as none). */
+function unbookedInputs(harness: Harness, label: Label): (readonly unknown[])[] {
+  return harness.risks.filter((risk) => risk.label === label).map((risk) => risk.document.unbookedFills ?? []);
+}
+
+describe("CAP-1 r0 regression — risk check 16 in the same window: the R4-CAP shape with maxWorstCaseContractualLoss 8 (allocator caps out of the way) refuses the third BUY RISK_WORST_CASE_LOSS_EXCEEDED, exactly as the booked control refuses it", () => {
+  /**
+   * The R4-CAP sequence, with the per-strategy cap at 1000 so the allocator
+   * never binds and §9.8 check 16's PRIMARY limit at 8. The third BUY's worst
+   * case is 3.40 booked + 3.40 FILLED and not yet booked + 3.50 (its own
+   * bound) = 10.30 > 8.
+   *
+   * At `13994b9` the second order's fill was in no lot — not a position (its
+   * harvest point had not come), not an open order (FILLED) — so check 16
+   * measured 6.90 and the third BUY was admitted on every path (measured in
+   * round 0: `probes/worst-case-candidate.log`).
+   */
+  const LIMIT = "8";
+  const FIRST = iso(S + 5_000);
+  const BUY10: Act = { kind: "BUY", shares: "10", style: "FAK" };
+
+  async function probe(variant: "carried" | "ordinary" | "control"): Promise<Harness> {
+    ordinal = 0;
+    const third = variant === "control" ? iso(S + 15_000) : iso(S + 10_000);
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      risk: { maxWorstCaseContractualLoss: LIMIT },
+      script: scheduled({ B: { onFeatures: [[FIRST, BUY10], [third, BUY10]], onFill: [[FIRST, BUY10]] } }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    await feed(harness, snapshot(S + 5_000, variant === "ordinary" ? MARKET_A : MARKET_X, "yes"));
+    if (variant === "control") {
+      await feed(harness, level(S + 9_500, MARKET_B, "0.31"));
+      await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+      await feed(harness, snapshot(S + 15_000, MARKET_X, "yes"));
+    } else {
+      await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    }
+    return harness;
+  }
+
+  for (const variant of ["carried", "ordinary"] as const) {
+    it(`${variant} path: the third BUY is REFUSED at check 16, exactly as the booked control refuses it`, async () => {
+      const harness = await probe(variant);
+      const control = await probe("control");
+      expect(outcomeOf(harness)).toEqual({
+        accepted: 2,
+        risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 },
+        allocator: {},
+        fills: ["BUY 10@0.34", "BUY 10@0.34"],
+        orders: ["BUY FILLED 10/10", "BUY FILLED 10/10"],
+      });
+      expect(outcomeOf(control)).toEqual(outcomeOf(harness));
+      // 3.50 (the first BUY's own bound); 3.40 booked + 3.50; 3.40 booked +
+      // 3.40 FILLED and not yet booked + 3.50. The control measures the same
+      // 10.30 with the second fill booked.
+      expect(checkSixteen(harness, "B")).toEqual(["3.5", "6.9", "10.3"]);
+      expect(checkSixteen(control, "B")).toEqual(checkSixteen(harness, "B"));
+      // The unbooked fill reached check 16 through its OWN input — its exact
+      // debit, the second order's 0.10 unused remainder released — while the
+      // control's was a booked position by then.
+      expect(unbookedInputs(harness, "B")).toEqual([[], [], [{ marketId: MARKET_B, side: "YES", shares: "10", debit: "3.4" }]]);
+      expect(unbookedInputs(control, "B")).toEqual([[], [], []]);
+      // The trader always STATES the input — an empty list included — so an
+      // absent one can never stand for "nothing unbooked".
+      expect(harness.risks.map((risk) => Array.isArray(risk.document.unbookedFills))).toEqual([true, true, true]);
+      expect(harness.halts.records()).toEqual([]);
+    });
+  }
+
+  it("per-frame cadence (B's own events at S + 5 000 and S + 10 000): the same refusal", async () => {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PER_FRAME,
+      perStrategyCap: "1000",
+      risk: { maxWorstCaseContractualLoss: LIMIT },
+      script: scheduled({ B: { onFeatures: [[FIRST, BUY10], [iso(S + 10_000), BUY10]], onFill: [[FIRST, BUY10]] } }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    await feed(harness, level(S + 10_000, MARKET_B, "0.3"));
+    expect(outcomeOf(harness)).toMatchObject({
+      accepted: 2,
+      risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 },
+      allocator: {},
+      fills: ["BUY 10@0.34", "BUY 10@0.34"],
+    });
+    expect(checkSixteen(harness, "B")).toEqual(["3.5", "6.9", "10.3"]);
+    expect(harness.halts.records()).toEqual([]);
+  });
+});
+
+describe("CAP-1 r0 — what the separate input is NOT: never a sellable position (§6 invariant 10), never an open order (§9.8 check 18)", () => {
+  /**
+   * The R4-CAP opening (two BUYs of 10 @ 0.34, the second FILLED at once and
+   * not yet booked), then, at a heartbeat in that window, B's take-profit: a
+   * GTC taker SELL of its WHOLE position bounded at 0.32 — below the FILLED
+   * BUY's 0.34 fill and 0.35 limit. Check 16's limit is 7: the holdings alone
+   * (6.80) pass it, any further BUY (+3.50) does not.
+   */
+  const FIRST = iso(S + 5_000);
+  const SECOND = iso(S + 10_000);
+  const BUY10: Act = { kind: "BUY", shares: "10", style: "FAK" };
+
+  async function run(atSecond: Act): Promise<Harness> {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      risk: { maxWorstCaseContractualLoss: "7" },
+      script: scheduled({ B: { onFeatures: [[FIRST, BUY10], [SECOND, atSecond]], onFill: [[FIRST, BUY10]] } }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    return harness;
+  }
+
+  it("a protective SELL in the unbooked window is ADMITTED and sells only the 10 BOOKED shares; the FILLED order is in no open order, and its fill only in the separate input", async () => {
+    const harness = await run({ kind: "SELL_ALL", taker: true });
+    expect(outcomeOf(harness)).toEqual({
+      accepted: 3,
+      risk: {},
+      allocator: {},
+      fills: ["BUY 10@0.34", "BUY 10@0.34", "SELL 10@0.32"],
+      orders: ["BUY FILLED 10/10", "BUY FILLED 10/10", "SELL FILLED 10/10"],
+    });
+    const exit = harness.risks.filter((risk) => risk.label === "B").at(-1);
+    expect(exit?.context.intent).toMatchObject({ type: "POSITION", targetMode: "ABSOLUTE", targetShares: "0" });
+    expect(exit?.evaluation.approved).toBe(true);
+    // What the engine was handed: the BOOKED position only (so the exit's
+    // size, 0 − 10, sells nothing unbooked), NO open order (the FILLED BUY is
+    // not resting, so check 18 cannot read it as one), and the unbooked fill
+    // in its own input, which only checks 16 and 17 read.
+    expect(exit?.document.portfolio.positions.map((position) => position.shares)).toEqual(["10"]);
+    expect(exit?.document.portfolio.openOrders).toEqual([]);
+    expect(exit?.document.unbookedFills).toEqual([{ marketId: MARKET_B, side: "YES", shares: "10", debit: "3.4" }]);
+    expect(harness.halts.records()).toEqual([]);
+  });
+
+  it("an ENTRY in the same window is refused at check 16 (6.80 + 3.50 > 7): the exit above was admitted as an exit, not because the window hid anything", async () => {
+    const harness = await run(BUY10);
+    expect(outcomeOf(harness)).toMatchObject({
+      accepted: 2,
+      risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 },
+      allocator: {},
+      orders: ["BUY FILLED 10/10", "BUY FILLED 10/10"],
+    });
+    expect(checkSixteen(harness, "B")).toEqual(["3.5", "6.9", "10.3"]);
+  });
+});
+
+describe("CAP-1 r0 — exactly what the separate input states, through the real loop", () => {
+  it("an UNSETTLED terminal order (an onOrderUpdate FAK, partly filled and cancelled at once, outside its harvest's view boundary): checks 16 and 17 count exactly its FILLED unbooked shares — at its limit, its fill page unread on this path — and a RESTING order only through openOrders", async () => {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      script: scheduled({
+        B: {
+          onFeatures: [
+            // A resting maker BUY of 10 at 0.30: 3.00, presented as an open order.
+            [iso(S + 5_000), { kind: "BUY", shares: "10", style: "MAKER" }],
+            [iso(S + 10_000), { kind: "BUY", shares: "10", style: "FAK" }],
+          ],
+          // Its RESTING view places a FAK of 10 at ≤ 0.35 against 5 shares at
+          // 0.34: 5 fill, 5 are cancelled — CANCELLED 5/10 at once.
+          onOrderUpdate: [[iso(S + 5_000), { kind: "BUY", shares: "10", style: "FAK" }]],
+        },
+      }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B), askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5"));
+    await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+    expect(outcomeOf(harness).orders).toEqual(["BUY RESTING 0/10", "BUY CANCELLED 5/10"]);
+    expect(harness.loop.health().execution.fillsObserved).toBe(0);
+    // A heartbeat at an event for no configured market: B's third BUY is
+    // judged while the FAK is terminal, unbooked and not yet settled.
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    const third = harness.risks.filter((risk) => risk.label === "B").at(-1);
+    // Exactly the 5 FILLED shares, at the 0.35 limit (never below their
+    // 0.34 debit) — not the 5 cancelled ones, and not the resting order,
+    // which openOrders presents whole.
+    expect(third?.document.unbookedFills).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.75" }]);
+    expect(third?.document.portfolio.openOrders.map((open) => open.orderId)).toHaveLength(1);
+    // Check 16: 3.00 resting + 1.75 unbooked + 3.50 this BUY.
+    expect(third?.evaluation.worstCase?.maximumContractualLoss).toBe("8.25");
+    expect(harness.halts.records()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. One pin per path
 // ---------------------------------------------------------------------------
 
@@ -938,6 +1216,10 @@ describe("CAP-1 paths: each place a commitment could leave the cap check before 
     await feed(harness, level(S + 6_100, MARKET_B, "0.31"));
     // Admitted: 3.50 + 1.50 = 5 ≤ 5 (base counted 5.20 and refused it).
     expect(outcomeOf(harness)).toMatchObject({ accepted: 2, allocator: {} });
+    // `CAP-1` r0: the partly filled order RESTS, so risk's open orders present
+    // it whole and the separate unbooked input states nothing for it.
+    expect(harness.risks.at(-1)?.document.portfolio.openOrders).toHaveLength(1);
+    expect(harness.risks.at(-1)?.document.unbookedFills).toEqual([]);
     expect(counted(harness).B).toBe("5");
     expectInvariant(harness, "with the maker BUY resting");
     await feed(harness, level(S + 7_200, MARKET_B, "0.3"));
@@ -1115,6 +1397,102 @@ interface Coverage {
   ordinaryHarvestFills: number;
   unbookedFillsAtEvaluation: number;
   restarts: number;
+  /** `CAP-1` r0: risk evaluations at which checks 16 and 17's holdings were held to the venue's floor. */
+  riskEvaluationsChecked: number;
+  /** … of which the separate `unbookedFills` input was non-empty. */
+  riskEvaluationsWithUnbooked: number;
+  /** Scenario outcomes (check 17) held to the floor. */
+  scenarioOutcomesChecked: number;
+  /** Entries refused at check 16's primary limit. */
+  worstCaseRefusals: number;
+  /** Entries the risk engine admitted, each held under the worst-case limit by the venue's floor. */
+  riskAdmissions: number;
+}
+
+/**
+ * `CAP-1` r0: the holdings §9.8 checks 16 and 17 MUST count for one strategy's
+ * market at an evaluation — from the venue's own orders and fills, nothing
+ * read from the allocator or the risk input: every BUY fill of the market,
+ * booked or not, at its shares and debit, plus each working BUY's unfilled
+ * shares at its limit (a resting BUY counts as if filled).
+ */
+function holdingsFloor(harness: Harness, label: Label): { readonly cost: string; readonly shares: string } {
+  const marketId = label === "A" ? MARKET_A : MARKET_B;
+  let cost = "0";
+  let shares = "0";
+  for (const fill of harness.venue.fills) {
+    if (fill.action !== "BUY" || fill.marketId !== marketId) continue;
+    cost = addDecimal(cost, mulDecimal(fill.price, fill.shares));
+    shares = addDecimal(shares, fill.shares);
+  }
+  for (const order of harness.venue.ordersSnapshot()) {
+    if (order.action !== "BUY" || order.marketId !== marketId || TERMINAL.has(order.state)) continue;
+    const unfilled = subDecimal(order.requestedShares, order.filledShares);
+    cost = addDecimal(cost, mulDecimal(order.limitPrice, unfilled));
+    shares = addDecimal(shares, unfilled);
+  }
+  return { cost, shares };
+}
+
+/** What the intent itself adds to check 16's lot: a BUY's shares and its bounded cost (the tighter ceiling). */
+function boughtBy(intent: Intent): { readonly cost: string; readonly shares: string } {
+  if (intent.type !== "POSITION" || intent.targetMode !== "DELTA" || intent.maximumBuyPrice === undefined) return { cost: "0", shares: "0" };
+  if (compareDecimal(intent.targetShares, "0") <= 0) return { cost: "0", shares: "0" };
+  const byPrice = mulDecimal(intent.maximumBuyPrice, intent.targetShares);
+  const cost = intent.maximumTotalCost !== undefined && compareDecimal(intent.maximumTotalCost, byPrice) < 0 ? intent.maximumTotalCost : byPrice;
+  return { cost, shares: intent.targetShares };
+}
+
+/**
+ * `CAP-1` r0: at one risk evaluation, §9.8 checks 16 and 17 count at least the
+ * venue's floor (`holdingsFloor`), and an admitted entry stays under check
+ * 16's limit by that floor.
+ *
+ * - check 16: the evaluating market's lot, less the intent's own leg, holds
+ *   at least the floor's cost and shares (its primary measure is that cost);
+ * - check 17: every scenario that marks the lot measures, less the intent's
+ *   own loss, at least the floor's loss under the same mark (`cost − shares ×
+ *   mark`; the harness's marks never exceed a limit price, so a resting
+ *   order's over-count cannot hide an undercount here);
+ * - an APPROVED entry: floor + its bounded cost ≤ `maxWorstCaseContractualLoss`.
+ */
+function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worstCaseLimit: string, coverage: Coverage, where: string): void {
+  const marketId = risk.label === "A" ? MARKET_A : MARKET_B;
+  const floor = holdingsFloor(harness, risk.label);
+  const bought = boughtBy(risk.context.intent);
+  const worstCase = risk.evaluation.worstCase;
+  expect(worstCase, `${where}: check 16 measured`).toBeDefined();
+  if (worstCase === undefined) return;
+  coverage.riskEvaluationsChecked += 1;
+  if ((risk.document.unbookedFills ?? []).length > 0) coverage.riskEvaluationsWithUnbooked += 1;
+  const lot = worstCase.perMarket.find((market) => market.marketId === marketId);
+  const countedCost = subDecimal(lot?.committedCost ?? "0", bought.cost);
+  const countedShares = subDecimal(lot?.yesShares ?? "0", bought.shares);
+  expect(countedCost, `${where}: check 16 counts ${countedCost} of the floor's ${floor.cost} pUSD`).toSatisfy(
+    (value: string) => compareDecimal(value, floor.cost) >= 0,
+  );
+  expect(countedShares, `${where}: check 16 counts ${countedShares} of the floor's ${floor.shares} shares`).toSatisfy(
+    (value: string) => compareDecimal(value, floor.shares) >= 0,
+  );
+  for (const outcome of risk.evaluation.scenario?.outcomes ?? []) {
+    if (outcome.unmarkedMarketIds.length > 0) continue;
+    const mark = risk.document.scenarios
+      .find((scenario) => scenario.scenarioId === outcome.scenarioId)
+      ?.marks.find((entry) => entry.marketId === marketId)?.yesPrice;
+    if (mark === undefined) continue;
+    coverage.scenarioOutcomesChecked += 1;
+    const countedLoss = subDecimal(outcome.loss, subDecimal(bought.cost, mulDecimal(bought.shares, mark)));
+    const floorLoss = subDecimal(floor.cost, mulDecimal(floor.shares, mark));
+    expect(countedLoss, `${where}: check 17 (${outcome.scenarioId}) measures ${countedLoss} of the floor's ${floorLoss}`).toSatisfy(
+      (value: string) => compareDecimal(value, floorLoss) >= 0,
+    );
+  }
+  if (risk.evaluation.refusals.some((refusal) => refusal.code === "RISK_WORST_CASE_LOSS_EXCEEDED")) coverage.worstCaseRefusals += 1;
+  if (risk.evaluation.approved && risk.context.intent.type !== "CANCEL") {
+    coverage.riskAdmissions += 1;
+    const projected = addDecimal(floor.cost, bought.cost);
+    expect(compareDecimal(projected, worstCaseLimit), `${where}: an entry admitted at ${projected} over check 16's ${worstCaseLimit}`).toBeLessThanOrEqual(0);
+  }
 }
 
 /** A configured or unconfigured market, by its short name. */
@@ -1173,6 +1551,9 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
   const script = randomScript(decisions);
   const perStrategyCap = pick(events, ["6", "8", "10.2", "14"]);
   const globalAccountCap = pick(events, ["12", "20", "1000"]);
+  // `CAP-1` r0: check 16's limit, from its OWN stream (so the event sequence
+  // is the one round 0 measured): sometimes binding, sometimes not.
+  const worstCaseLimit = pick(prng(seed ^ 0x0c16_0c17), ["7", "9", "12", "1000"]);
   const tracking: Script = (call) => {
     const act = script(call);
     if (act.kind === "BUY" && call.callback === "onFill") coverage.onFillPlacements += 1;
@@ -1186,7 +1567,11 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
       cadence,
       perStrategyCap,
       globalAccountCap,
+      risk: { maxWorstCaseContractualLoss: worstCaseLimit },
       script: tracking,
+      onRisk: (current, risk) => {
+        expectRiskFloor(current, risk, worstCaseLimit, coverage, `seed ${String(seed)} at ${risk.label}'s risk check at ${risk.context.evaluatedAt}`);
+      },
       beforeEvaluation: (current, input) => {
         coverage.evaluationsChecked += 1;
         if (input.callback === "onFill") {
@@ -1285,7 +1670,7 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
   expect(harness.halts.records(), `seed ${String(seed)}: no halt`).toEqual([]);
 }
 
-describe("CAP-1 property — over random fills, partial fills, cancels, onFill and onOrderUpdate placements, carried and ordinary harvests and restarts, the cap check counts every committed pUSD exactly once, at every evaluation", () => {
+describe("CAP-1 property — over random fills, partial fills, cancels, onFill and onOrderUpdate placements, carried and ordinary harvests and restarts, the cap check counts every committed pUSD exactly once, at every evaluation; and (r0) risk checks 16 and 17 count at least the venue's floor at every risk evaluation", () => {
   it("holds for 60 seeds at the PAPER cadence and 30 at the per-frame cadence, and every listed path occurs", async () => {
     const coverage: Coverage = {
       evaluationsChecked: 0,
@@ -1300,6 +1685,11 @@ describe("CAP-1 property — over random fills, partial fills, cancels, onFill a
       ordinaryHarvestFills: 0,
       unbookedFillsAtEvaluation: 0,
       restarts: 0,
+      riskEvaluationsChecked: 0,
+      riskEvaluationsWithUnbooked: 0,
+      scenarioOutcomesChecked: 0,
+      worstCaseRefusals: 0,
+      riskAdmissions: 0,
     };
     for (let seed = 1; seed <= 60; seed += 1) await propertyRun(seed, PAPER_EVALUATION_CADENCE, 40, coverage);
     for (let seed = 1_001; seed <= 1_030; seed += 1) await propertyRun(seed, PER_FRAME, 40, coverage);

@@ -143,7 +143,7 @@ import {
   type PostingIdentity,
   type TraceLink,
 } from "./accounting.js";
-import { requestFor, type AllocatorGate } from "./allocation.js";
+import { requestFor, type AllocatorGate, type UnbookedExposure } from "./allocation.js";
 import { judgeBasketExecution } from "./basket-execution.js";
 import {
   bookConfirmedAt,
@@ -195,6 +195,7 @@ import {
   runPlanner,
   runRiskCheck,
   OrderTimeInForceBook,
+  type RiskInputContext,
 } from "./pipeline.js";
 import { pnlSnapshotKey } from "./pnl-snapshot-key.js";
 import type {
@@ -2555,7 +2556,14 @@ export class CoreLoop {
       // entry `RISK_FRESHNESS_UNKNOWN`. A CANCEL keeps the constant 0.
       featuresAgeMs: admission === undefined ? 0 : admission.featuresAgeMs,
       positions,
-      openOrders: this.#openOrdersFor(input.instance, marketConfig),
+      // `openOrders`, read where it always was (an owned order the venue
+      // cannot show still halts here, after check 1's halt state was read),
+      // and — `CAP-1` (ruling 2026-10-04) — §9.8 checks 16 and 17's SEPARATE
+      // `unbookedFills`: the fills of this strategy no position carries yet
+      // and no open order presents, from the allocator's own commitments.
+      // Never a position (no exit sells it), never an open order (check 18
+      // never reads it).
+      ...this.#portfolioOrdersFor(input.instance, marketConfig),
       exposures: allocation.exposures,
       allocation: allocation.verdict,
       recentIntentIds: Object.freeze([...this.#recentIntentIds]),
@@ -4790,12 +4798,21 @@ export class CoreLoop {
     return Object.freeze(owners);
   }
 
+  /**
+   * The instance's OWN working orders, as §9.8 reads them (`openOrders`), and
+   * — `CAP-1` — the planned order ids of exactly those, so the allocator can
+   * state what the view does NOT present (`#unbookedFillsFor`).
+   */
   #openOrdersFor(
     instance: RegisteredInstance,
     marketConfig: MarketConfig,
-  ): readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[] {
+  ): {
+    readonly openOrders: readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[];
+    readonly presented: ReadonlySet<string>;
+  } {
+    const presented = new Set<string>();
     const owned = this.#instanceOrders.get(instance.instanceId);
-    if (owned === undefined) return Object.freeze([]);
+    if (owned === undefined) return { openOrders: Object.freeze([]), presented };
     const orders: { orderId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }[] = [];
     // SIM-2: the instance's OWN orders, in venue order (`IF-07`: risk's
     // `openOrders` keep the order the snapshot scan gave them), one lookup each.
@@ -4813,8 +4830,61 @@ export class CoreLoop {
         price: order.limitPrice,
         shares: order.requestedShares,
       });
+      presented.add(order.plannedOrderId);
     }
-    return Object.freeze(orders);
+    return { openOrders: Object.freeze(orders), presented };
+  }
+
+  /** The risk portfolio's order-derived halves: its open orders and (`CAP-1`) its unbooked fills. */
+  #portfolioOrdersFor(
+    instance: RegisteredInstance,
+    marketConfig: MarketConfig,
+  ): Pick<RiskInputContext, "openOrders" | "unbookedFills"> {
+    const open = this.#openOrdersFor(instance, marketConfig);
+    return {
+      openOrders: open.openOrders,
+      unbookedFills: this.#unbookedFillsFor(instance, marketConfig, open.presented),
+    };
+  }
+
+  /**
+   * `CAP-1` (orchestrator ruling, 2026-10-04): the instance's
+   * FILLED-BUT-UNBOOKED BUY exposure in its market — §9.8 checks 16 and 17's
+   * separate input (`packages/risk`'s `unbookedFills`).
+   *
+   * The window: a fill becomes a position only at its harvest point (ADR-024;
+   * ADR-026 for the carried path), and its order leaves `openOrders` as soon
+   * as the venue reports it terminal — an `onFill` decision's order the venue
+   * fills at once is FILLED in the same close. Every evaluation in between saw
+   * the fill in neither view, so the worst-case and scenario checks
+   * undercounted it (the R4-CAP shape, with `maxWorstCaseContractualLoss` 8,
+   * admitted a third BUY at a 10.20 pUSD worst case).
+   *
+   * Derived by the allocator from the SAME commitments the cap check counts
+   * (`AllocatorGate.unbookedExposure`), scoped like `#positionsFor` (this
+   * instance, this market), and minus what `presented` already counts. The
+   * venue is asked one thing only, for a commitment not yet settled: is its
+   * order terminal, and at what final size (`orderByPlannedId`, O(1)). Its
+   * fill page is NOT read on this path (SIM-2: one cursor read per harvest),
+   * so such an order's unbooked shares are stated at its LIMIT — never less
+   * than their debit — until `#settleCapital` reads their prices. Moves
+   * nothing.
+   */
+  #unbookedFillsFor(
+    instance: RegisteredInstance,
+    marketConfig: MarketConfig,
+    presented: ReadonlySet<string>,
+  ): readonly UnbookedExposure[] {
+    return this.#options.allocator.unbookedExposure({
+      instanceId: instance.instanceId,
+      marketId: marketConfig.marketId,
+      presentedOpen: presented,
+      terminalViewOf: (plannedOrderId) => {
+        const order = this.#options.venue.orderByPlannedId(plannedOrderId);
+        if (order === undefined || !this.#isTerminalOrder(order)) return undefined;
+        return { filledShares: order.filledShares, unbookedFills: undefined };
+      },
+    });
   }
 
   /**

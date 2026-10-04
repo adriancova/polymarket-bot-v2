@@ -18,7 +18,14 @@
  *   cost;
  * - resting SELL orders and SELL legs contribute NOTHING — assumed not to fill,
  *   which retains the exposed tokens and forgoes the proceeds. Both halves of
- *   that assumption overstate loss.
+ *   that assumption overstate loss;
+ * - `CAP-1`: a FILLED-BUT-UNBOOKED BUY (`inputs.ts`,
+ *   `UnbookedFillExposureSchema`) contributes its shares and its `debit`,
+ *   EXACTLY as a booked position of the same side and token does. Its order
+ *   is terminal, so it is in no open order, and its fill is not booked yet, so
+ *   it is in no position: without this it would be in no lot at all. This
+ *   builder is its ONLY reader, so it reaches checks 16 and 17 and nothing
+ *   else.
  *
  * UNASSIGNED SHARES. A `QUOTE` level names no outcome token (§7.7). Its bought
  * shares are placed on whichever token makes the market's worst verified
@@ -30,7 +37,7 @@ import { addDecimal, compareDecimal, mulDecimal } from "@polymarket-bot/decimal"
 import type { MoneyString, SharesString } from "@polymarket-bot/domain";
 
 import type { IntentView } from "./intent-view.js";
-import type { PortfolioView } from "./inputs.js";
+import type { PortfolioView, UnbookedFillExposure } from "./inputs.js";
 import { appendData } from "./plain-data.js";
 import {
   settlementValueUnderOutcome,
@@ -81,7 +88,9 @@ function assignUnassigned(lot: MutableLot): { yesShares: SharesString; noShares:
 }
 
 /**
- * Builds the lot set for `portfolio` with `view`'s BUY legs added.
+ * Builds the lot set for `portfolio` with `view`'s BUY legs added — and,
+ * `CAP-1`, with `unbookedFills` counted exactly as booked positions. Omitted
+ * (or empty), the lot set is exactly the booked-only one.
  *
  * Returns `undefined` when any BUY leg has no bounded cost: an unbounded lot
  * set has no worst case, and inventing a price to close the gap is exactly the
@@ -91,6 +100,7 @@ function assignUnassigned(lot: MutableLot): { yesShares: SharesString; noShares:
 export function buildWorstCaseLots(
   portfolio: PortfolioView,
   view: IntentView,
+  unbookedFills: readonly UnbookedFillExposure[] = [],
 ): readonly MarketHoldingLot[] | undefined {
   const lots = new Map<string, MutableLot>();
   const lotFor = (marketId: string): MutableLot => {
@@ -109,6 +119,18 @@ export function buildWorstCaseLots(
       lot.noShares = addDecimal(lot.noShares, position.shares);
     }
     lot.committedCost = addDecimal(lot.committedCost, position.costBasis);
+  }
+
+  // `CAP-1`: a filled-but-unbooked BUY, counted EXACTLY as the booked position
+  // it is about to become — its shares on its token, its debit as its cost.
+  for (const unbooked of unbookedFills) {
+    const lot = lotFor(unbooked.marketId);
+    if (unbooked.side === "YES") {
+      lot.yesShares = addDecimal(lot.yesShares, unbooked.shares);
+    } else {
+      lot.noShares = addDecimal(lot.noShares, unbooked.shares);
+    }
+    lot.committedCost = addDecimal(lot.committedCost, unbooked.debit);
   }
 
   for (const order of portfolio.openOrders) {

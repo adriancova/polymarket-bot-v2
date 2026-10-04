@@ -489,6 +489,132 @@ describe("CAP-1: a commitment is converted, never released, as its fills are see
   });
 });
 
+/**
+ * `CAP-1` r0 (the ruling on §9.8 checks 16 and 17): the SEPARATE risk input,
+ * `unbookedExposure`, is derived from the same commitments the cap check
+ * counts, so the two never disagree about which fill is unbooked or what it
+ * cost. `loop-capital.test.ts` drives it through the real core loop.
+ */
+describe("CAP-1 r0: the filled-but-unbooked risk input comes from the cap check's own commitments", () => {
+  const PLANNED = "planned-cap1-r0";
+  const NOTHING_PRESENTED: ReadonlySet<string> = new Set();
+  const NOT_TERMINAL = (): undefined => undefined;
+
+  /** A projection in which the instance holds 50 YES (the inventory a covered SELL reserves). */
+  const HOLDING_50_YES = {
+    ...EMPTY_PROJECTION,
+    virtualPositions: new Map([
+      ["v-1", { instanceId: INSTANCE, assetId: "token:111", assetKind: "OUTCOME_TOKEN", marketId: MARKET, balance: "50" }],
+    ]),
+  } as unknown as typeof EMPTY_PROJECTION;
+
+  /** A gate holding one applied BUY (default: 50 YES at a 0.35 limit) — or SELL, against 50 YES held. */
+  function holding(leg: Partial<{ side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }> = {}): AllocatorGate {
+    const subject = gate();
+    const request = requestFor({
+      reservationId: "018f4a7e-7000-7abc-8def-0000000000d1",
+      instanceId: INSTANCE,
+      accountingMode: "LIVE",
+      leg: { marketId: MARKET, side: "YES", action: "BUY", price: "0.35", shares: "50", ...leg },
+      market: SCOPE,
+    });
+    const applied = subject.applyForPlan({
+      entries: [{ plannedOrderId: PLANNED, request }],
+      liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+      projection: leg.action === "SELL" ? HOLDING_50_YES : EMPTY_PROJECTION,
+      availableCollateral: "1000",
+    });
+    if (!applied.ok) throw new Error(`the fixture reservation was refused: ${applied.refusals.map((refusal) => refusal.code).join(", ")}`);
+    return subject;
+  }
+
+  function fill(id: string, shares: string, price: string, side: "YES" | "NO" = "YES"): { simulatedFillId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string } {
+    return { simulatedFillId: id, marketId: MARKET, side, action: "BUY", price, shares };
+  }
+
+  function unbooked(
+    subject: AllocatorGate,
+    options: { presented?: ReadonlySet<string>; terminal?: (plannedOrderId: string) => { filledShares: string; unbookedFills: readonly { simulatedFillId: string; price: string; shares: string }[] | undefined } | undefined; instanceId?: string; marketId?: string } = {},
+  ): readonly unknown[] {
+    return subject.unbookedExposure({
+      instanceId: options.instanceId ?? INSTANCE,
+      marketId: options.marketId ?? MARKET,
+      presentedOpen: options.presented ?? NOTHING_PRESENTED,
+      terminalViewOf: options.terminal ?? NOT_TERMINAL,
+    });
+  }
+
+  it("SETTLED: exactly the fills the allocator keeps — the same shares and the same debit the cap check counts — until they are booked", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-2", "10", "0.33")] });
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.3" }]);
+    // The cap check holds exactly that debit for it.
+    expect(subject.metrics().reservedCollateral).toBe("3.3");
+    // Booked: the position carries it now, and the risk input states nothing.
+    subject.observeFill(INSTANCE, fill("f-2", "10", "0.33"), PLANNED);
+    expect(unbooked(subject)).toEqual([]);
+  });
+
+  it("SETTLED with a share whose fill was not seen: that share at the LIMIT, as the allocator keeps it", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: undefined });
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.5" }]);
+    expect(subject.metrics().reservedCollateral).toBe("3.5");
+  });
+
+  it("an order the portfolio PRESENTS as open adds nothing here: the open order counts its whole size at its limit", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    expect(unbooked(subject, { presented: new Set([PLANNED]) })).toEqual([]);
+  });
+
+  it("NOT settled, its order TERMINAL at the venue now: only its FILLED unbooked shares — at the fills' prices when the view carries them, at the limit when it does not — and the read moves nothing", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    const before = subject.metrics();
+    expect(unbooked(subject, { terminal: () => ({ filledShares: "30", unbookedFills: undefined }) })).toEqual([
+      { marketId: MARKET, side: "YES", shares: "10", debit: "3.5" },
+    ]);
+    expect(
+      unbooked(subject, { terminal: () => ({ filledShares: "30", unbookedFills: [fill("f-1", "20", "0.34"), fill("f-2", "10", "0.33")] }) }),
+    ).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.3" }]);
+    // A terminal order with nothing filled, or everything booked: nothing.
+    expect(unbooked(subject, { terminal: () => ({ filledShares: "20", unbookedFills: undefined }) })).toEqual([]);
+    expect(unbooked(holding(), { terminal: () => ({ filledShares: "0", unbookedFills: [] }) })).toEqual([]);
+    // The commitment itself is untouched: the allocator settles it at its own site.
+    expect(subject.metrics()).toEqual(before);
+  });
+
+  it("NOT settled, NOT presented and NOT terminal (an order no instance owns, or one the venue cannot show): its whole unconverted reservation, at the limit, as the allocator counts it", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "30", debit: "10.5" }]);
+  });
+
+  it("a fill booked UNATTRIBUTED is kept at its own price, as the allocator keeps it", () => {
+    const subject = holding();
+    subject.observeUnattributedFill(fill("f-u", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "20", unbookedFills: [fill("f-u", "20", "0.34")] });
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "20", debit: "6.8" }]);
+    expect(subject.metrics().reservedCollateral).toBe("6.8");
+  });
+
+  it("per strategy, per market, per token: another instance or market sees nothing; a NO commitment is stated on NO; a SELL states nothing (its sold shares stay in the position, an over-count)", () => {
+    const subject = holding();
+    expect(unbooked(subject, { instanceId: OTHER })).toEqual([]);
+    expect(unbooked(subject, { marketId: "018f4a7e-1111-7abc-8def-0123456789ac" })).toEqual([]);
+    const no = holding({ side: "NO", price: "0.6", shares: "10" });
+    no.settle(PLANNED, { filledShares: "10", unbookedFills: [fill("f-n", "10", "0.58", "NO")] });
+    expect(unbooked(no)).toEqual([{ marketId: MARKET, side: "NO", shares: "10", debit: "5.8" }]);
+    const sell = holding({ action: "SELL", price: "0.32", shares: "50" });
+    expect(sell.metrics()).toMatchObject({ open: 1 });
+    expect(unbooked(sell)).toEqual([]);
+    expect(unbooked(sell, { terminal: () => ({ filledShares: "50", unbookedFills: undefined }) })).toEqual([]);
+  });
+});
+
 describe("the intent leg derivation", () => {
   it("a TARGET-mode position resolves against the held shares", () => {
     const target = {
@@ -616,6 +742,7 @@ describe("an intent the allocator cannot price is REFUSED downstream", () => {
         referenceFeedAgeMs: 0,
         positions: [],
         openOrders: [],
+        unbookedFills: [],
         // The allocator's OWN answers, passed through exactly as `loop.ts`
         // passes them. Nothing is fabricated for the absent case.
         exposures: allocation.exposures,

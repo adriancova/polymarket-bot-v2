@@ -98,6 +98,17 @@
  * plus in-flight commitments, at the same prices, against the same limits.
  * The change is only that a commitment leaves the in-flight half when, and to
  * the extent that, the position half has taken it over — not before.
+ *
+ * ## `CAP-1` r0: the same commitments feed §9.8 checks 16 and 17
+ *
+ * The window hid an unbooked fill from the risk engine's worst-case and
+ * scenario checks too: they read booked positions and NON-terminal orders.
+ * The orchestrator's ruling (2026-10-04) gives them a SEPARATE input,
+ * `unbookedFills`, and it is derived HERE ({@link AllocatorGate.unbookedExposure})
+ * from the same commitments and the same kept-fills derivation the cap check
+ * counts — so the two cannot disagree about which fill is unbooked. It is never
+ * a position and never an open order; `packages/risk` reads it in its lot
+ * builder only, and never lets it lower a loss measure.
  */
 
 import {
@@ -211,7 +222,7 @@ interface Commitment {
    * loop saw for it that no position carries yet — `fill id -> fill` — or
    * `undefined` while the order may still fill.
    */
-  final: { readonly filledShares: string; readonly unbooked: Map<string, CommitmentFill> } | undefined;
+  final: FinalSize | undefined;
 }
 
 /** `value > 0`, exactly. */
@@ -239,7 +250,7 @@ function positive(value: string): boolean {
  * unique in the state and names the order it belongs to.
  */
 function commitmentRequests(commitment: Commitment): ReservationRequest[] {
-  const { request, bookedShares, final, unattributed } = commitment;
+  const { request, bookedShares, final } = commitment;
   const out: ReservationRequest[] = [];
   if (request.action === "SELL") {
     const reserved = subDecimal(final?.filledShares ?? request.shares, bookedShares);
@@ -256,21 +267,102 @@ function commitmentRequests(commitment: Commitment): ReservationRequest[] {
     }
     return out;
   }
+  for (const part of keptFills(commitment, final)) {
+    if (part.seen) {
+      if (!positive(part.price)) continue;
+      out.push({ ...request, reservationId: `${request.reservationId}/filled@${part.price}`, price: part.price, shares: part.shares });
+    } else {
+      out.push({ ...request, reservationId: `${request.reservationId}/filled@limit`, shares: part.shares });
+    }
+  }
+  return out;
+}
+
+/** A commitment's confirmed final size, with the fills of it no position carries yet. */
+interface FinalSize {
+  readonly filledShares: string;
+  readonly unbooked: Map<string, CommitmentFill>;
+}
+
+/**
+ * `CAP-1`: the fills a BUY commitment KEEPS once its final size is `final` —
+ * the capital no position carries yet. Each fill the loop has seen and no
+ * position carries (unbooked, or booked unattributed) at its own price, grouped
+ * by price in the order seen (`seen: true`); then every share of the final
+ * size the loop has seen no fill for, at the order's limit (`seen: false`,
+ * never less than its debit).
+ *
+ * ONE derivation, two readers, so they cannot disagree: the allocator's
+ * account (`commitmentRequests`, once settled) and §9.8 checks 16 and 17's
+ * filled-but-unbooked input ({@link AllocatorGate.unbookedExposure}).
+ */
+function keptFills(
+  commitment: Commitment,
+  final: FinalSize,
+): { readonly price: string; readonly shares: string; readonly seen: boolean }[] {
   const byPrice = new Map<string, string>();
   let seen = "0";
-  for (const fill of [...final.unbooked.values(), ...unattributed.values()]) {
+  for (const fill of [...final.unbooked.values(), ...commitment.unattributed.values()]) {
     byPrice.set(fill.price, addDecimal(byPrice.get(fill.price) ?? "0", fill.shares));
     seen = addDecimal(seen, fill.shares);
   }
-  for (const [price, shares] of byPrice) {
-    if (!positive(price)) continue;
-    out.push({ ...request, reservationId: `${request.reservationId}/filled@${price}`, price, shares });
+  const parts: { readonly price: string; readonly shares: string; readonly seen: boolean }[] = [];
+  for (const [price, shares] of byPrice) parts.push({ price, shares, seen: true });
+  const unseen = subDecimal(subDecimal(final.filledShares, commitment.bookedShares), seen);
+  if (positive(unseen)) parts.push({ price: commitment.request.price, shares: unseen, seen: false });
+  return parts;
+}
+
+/**
+ * `CAP-1`: the final size `settle` records for `commitment` from the order's
+ * terminal view — every fill of `unbookedFills` this commitment has not
+ * already converted (booked) or kept (booked unattributed), each counted once.
+ * `undefined` when `filledShares` is not an exact decimal: such a size cannot
+ * be shown to be final, and the commitment keeps its whole reservation.
+ */
+function finalSizeOf(
+  commitment: Commitment,
+  view: { readonly filledShares: string; readonly unbookedFills: readonly CommitmentFill[] | undefined },
+): FinalSize | undefined {
+  if (!isCanonicalDecimalString(view.filledShares)) return undefined;
+  const unbooked = new Map<string, CommitmentFill>();
+  for (const fill of view.unbookedFills ?? []) {
+    if (!isCanonicalDecimalString(fill.price) || !isCanonicalDecimalString(fill.shares)) continue;
+    // A fill a position already carries (booked) or none ever will
+    // (unattributed) is counted where it is — never again here.
+    if (commitment.bookedFillIds.has(fill.simulatedFillId)) continue;
+    if (commitment.unattributed.has(fill.simulatedFillId)) continue;
+    unbooked.set(fill.simulatedFillId, {
+      simulatedFillId: fill.simulatedFillId,
+      price: fill.price,
+      shares: fill.shares,
+    });
   }
-  const unseen = subDecimal(subDecimal(final.filledShares, bookedShares), seen);
-  if (positive(unseen)) {
-    out.push({ ...request, reservationId: `${request.reservationId}/filled@limit`, shares: unseen });
-  }
-  return out;
+  return { filledShares: view.filledShares, unbooked };
+}
+
+/**
+ * `CAP-1` (orchestrator ruling, 2026-10-04): one market token's
+ * filled-but-unbooked BUY exposure of a strategy, in the shape
+ * `packages/risk` reads as `unbookedFills` (§9.8 checks 16 and 17 only).
+ */
+export interface UnbookedExposure {
+  readonly marketId: string;
+  readonly side: "YES" | "NO";
+  readonly shares: string;
+  /** Exact `Σ price × shares`: each seen fill at its own price, each unseen share at the limit. */
+  readonly debit: string;
+}
+
+/** The venue's TERMINAL view of a planned order, as `settle` reads it. */
+export interface TerminalOrderView {
+  readonly filledShares: string;
+  /**
+   * Its fills the venue shows past the loop's fill cursor; `undefined` when
+   * the page was not read (or could not be): every unbooked share is then
+   * held at the order's limit.
+   */
+  readonly unbookedFills: readonly CommitmentFill[] | undefined;
 }
 
 interface Lot {
@@ -538,21 +630,9 @@ export class AllocatorGate {
     if (commitment === undefined) return false;
     // A final size that is not an exact decimal cannot be shown to be final:
     // the commitment keeps its whole reservation (fail closed).
-    if (!isCanonicalDecimalString(final.filledShares)) return false;
-    const unbooked = new Map<string, CommitmentFill>();
-    for (const fill of final.unbookedFills ?? []) {
-      if (!isCanonicalDecimalString(fill.price) || !isCanonicalDecimalString(fill.shares)) continue;
-      // A fill a position already carries (booked) or none ever will
-      // (unattributed) is counted where it is — never again here.
-      if (commitment.bookedFillIds.has(fill.simulatedFillId)) continue;
-      if (commitment.unattributed.has(fill.simulatedFillId)) continue;
-      unbooked.set(fill.simulatedFillId, {
-        simulatedFillId: fill.simulatedFillId,
-        price: fill.price,
-        shares: fill.shares,
-      });
-    }
-    commitment.final = { filledShares: final.filledShares, unbooked };
+    const size = finalSizeOf(commitment, final);
+    if (size === undefined) return false;
+    commitment.final = size;
     return this.#closeIfBooked(plannedOrderId, commitment);
   }
 
@@ -571,6 +651,86 @@ export class AllocatorGate {
   /** The exact remaining cost basis of one held position. */
   costBasisOf(instanceId: string, marketId: string, side: "YES" | "NO"): string {
     return this.#costBasis.costBasis(instanceId, marketId, side);
+  }
+
+  /**
+   * `CAP-1` (orchestrator ruling, 2026-10-04): §9.8 checks 16 and 17's
+   * SEPARATE input — `instanceId`'s filled-but-unbooked BUY exposure in
+   * `marketId`, per token (`packages/risk`'s `unbookedFills`).
+   *
+   * THE SAME SOURCE OF TRUTH AS THE CAP CHECK. It is derived from the
+   * commitments `#buildState` counts, through the same derivation
+   * (`keptFills`), so the risk checks and the cap check can never disagree
+   * about which fill is unbooked or what it cost. Per BUY commitment of the
+   * strategy in the market — SELLs add nothing: a sold share the position
+   * still shows is over-counted there, never under-counted:
+   *
+   * - an order the risk portfolio presents as OPEN (`presentedOpen`): nothing
+   *   here — the open order counts its WHOLE size at its limit, every unbooked
+   *   fill of it included;
+   * - SETTLED (its final size confirmed): exactly the fills the allocator
+   *   keeps for it — each seen fill at its own price, each unseen share at the
+   *   limit;
+   * - not settled, and its order TERMINAL at the venue now (`terminalViewOf`):
+   *   what `settle` would keep from that view, computed without applying it —
+   *   only FILLED shares, and each unbooked one at the fills' own prices when
+   *   the view carries them, at the limit when it does not (never less than
+   *   its debit). The allocator meanwhile counts its whole reservation, which
+   *   is never less;
+   * - otherwise — an order the portfolio does not present and the venue does
+   *   not show terminal (one no instance owns; one the venue cannot show): its
+   *   whole unconverted reservation, at its limit, exactly as the allocator
+   *   counts it — it may yet fill, and the lot builder counts a resting BUY as
+   *   if it had.
+   *
+   * It is NEVER a position (no exit can sell it, §6 invariant 10) and NEVER an
+   * open order (check 18 never reads it): `packages/risk` reads it in the lot
+   * builder only. Answers in token order (YES, then NO); a token with nothing
+   * unbooked is absent.
+   */
+  unbookedExposure(input: {
+    readonly instanceId: string;
+    readonly marketId: string;
+    /** Planned order ids of the orders the risk portfolio's `openOrders` presents. */
+    readonly presentedOpen: ReadonlySet<string>;
+    /** The venue's terminal view of a planned order, or `undefined` while it is not terminal (or not shown). */
+    readonly terminalViewOf: (plannedOrderId: string) => TerminalOrderView | undefined;
+  }): readonly UnbookedExposure[] {
+    const totals = { YES: { shares: "0", debit: "0" }, NO: { shares: "0", debit: "0" } };
+    for (const [plannedOrderId, commitment] of this.#commitments) {
+      const { request } = commitment;
+      if (
+        request.action !== "BUY" ||
+        request.strategyInstanceId !== input.instanceId ||
+        request.marketId !== input.marketId ||
+        input.presentedOpen.has(plannedOrderId)
+      ) {
+        continue;
+      }
+      let parts: readonly { readonly price: string; readonly shares: string }[];
+      if (commitment.final !== undefined) {
+        parts = keptFills(commitment, commitment.final);
+      } else {
+        const view = input.terminalViewOf(plannedOrderId);
+        const size = view === undefined ? undefined : finalSizeOf(commitment, view);
+        parts =
+          size === undefined
+            ? [{ price: request.price, shares: subDecimal(request.shares, commitment.bookedShares) }]
+            : keptFills(commitment, size);
+      }
+      const total = totals[request.side];
+      for (const part of parts) {
+        if (!positive(part.shares)) continue;
+        total.shares = addDecimal(total.shares, part.shares);
+        total.debit = addDecimal(total.debit, mulDecimal(part.price, part.shares));
+      }
+    }
+    const out: UnbookedExposure[] = [];
+    for (const side of ["YES", "NO"] as const) {
+      const total = totals[side];
+      if (positive(total.shares)) out.push(Object.freeze({ marketId: input.marketId, side, shares: total.shares, debit: total.debit }));
+    }
+    return Object.freeze(out);
   }
 
   /** The §9.7 scope this gate knows for a market, if it is configured. */
