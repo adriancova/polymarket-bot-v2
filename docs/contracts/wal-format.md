@@ -328,28 +328,6 @@ Two deliberate exceptions:
 - **An empty segment never rotates.** Time-based rotation on an idle writer would
   otherwise produce a stream of empty segments.
 
-> **Corrected 2026-10-04 (`GOV-NOTES-1`): a time rotation can wait at the
-> capacity threshold.** `WALCAP-1` added this third exception. It merged as
-> `da559ca` on 2026-10-03. Its record is `docs/handoffs/WALCAP-1.md`. It
-> qualifies the `maxSegmentAgeMs` row, the age rule of handoff §9.1, and
-> applies only with `maxTotalBytes` set (§11.1).
->
-> - Before `drain()` or `tick()` closes an aged segment by time, the writer
->   checks the frames still unwritten (`#mayCloseByTime` in `writer.ts`).
-> - The rotation waits only if both hold:
->   - closing first would cost those frames more framing than packing them
->     into the open segment;
->   - the counted segment bytes, the unwritten frames, the open segment's
->     footer and that framing would together pass `maxTotalBytes`.
-> - While it waits, the segment stays open past `maxSegmentAgeMs`. Frames go
->   into it by the size rule, and a size rotation can still close it.
-> - The first `drain()` or `tick()` at which either condition fails closes it
->   by time. With no frame unwritten, the first condition always fails.
-> - A waiting rotation does not hold back `tick()`'s interval `fsync`, so
->   §9's data-loss bound is unchanged.
-> - The writer metric `timeRotationsDeferred` counts each waiting segment
->   once.
-
 Rotation writes the footer, fsyncs, writes the manifest, and only then opens the
 next segment. A reader that sees segment *n+1* can therefore rely on segment *n*
 being complete.
@@ -626,11 +604,11 @@ refusal/fault counters. Compaction lag and object-upload status belong to
 
 ### 11.1 The hard capacity threshold
 
-> **Corrected 2026-10-04 (`GOV-NOTES-1`): what the threshold counts, and what
-> admission charges.** `WALCAP-1` changed both. It merged as `da559ca` on
-> 2026-10-03. Its record is `docs/handoffs/WALCAP-1.md`. Where the text below
-> differs, this note states the current rule. Symbols are in
-> `packages/storage-wal/src/`.
+> **Corrected 2026-10-04 (`GOV-NOTES-1`): what the threshold counts, what
+> admission charges, and when a time rotation waits.** `WALCAP-1` changed all
+> three. It merged as `da559ca` on 2026-10-03. Its record is
+> `docs/handoffs/WALCAP-1.md`. Where the text below differs, this note states
+> the current rule. Symbols are in `packages/storage-wal/src/`.
 >
 > - **A ledger, not a running sum.** With `maxTotalBytes` set, the writer
 >   counts a per-file ledger of segment files (`SegmentByteLedger` in
@@ -641,16 +619,17 @@ refusal/fault counters. Compaction lag and object-upload status belong to
 >     manifests do not count.
 >   - When `capacityRootPath` names a WAL root, also every one in the root
 >     and in its immediate subdirectories. The gateway names its WAL root, so
->     every epoch counts.
->   - It assumes one writer per WAL root.
+>     every epoch counts. It then assumes one writer per WAL root, a wider
+>     premise than §2's one writer per directory.
 > - **When it is read.**
 >   - From the disk at open (`openWalWriter`). A read that fails fails the
 >     open.
 >   - Again on every `tick()` while the writer is open, one re-derivation at
 >     a time (`#rescanCapacity`). A re-derivation that fails part-way keeps
 >     the changes it made, and adds one to `capacityRescanFailures`.
-> - **What raises it.** The writer's own writes, and a length read above an
->   entry. A write that fails is counted before the writer faults
+> - **What raises it.** The writer's own writes, and a length read of a file
+>   it does not count yet, or above its entry (`SegmentByteLedger.observe`).
+>   A write that fails is counted before the writer faults
 >   (`#countAfterFailedWrite`).
 > - **What lowers it.**
 >   - An entry is removed only when a direct length read finds its file gone
@@ -669,22 +648,49 @@ refusal/fault counters. Compaction lag and object-upload status belong to
 >   - `ledgerBytes` is the ledger's total.
 >   - `inFlightFrameBytes` are frames `drain()` has taken from the queue and
 >     not yet written. They leave the sum when the ledger counts them.
->   - B is the open segment's footer, if one is open, plus the larger of two
->     packings of the unwritten frames (`CapacityProjection`). Both pack the
->     in-flight frames first, then the queued ones, then the candidate.
+>   - B is the open segment's footer, if one is open, plus the larger
+>     framing overhead of two packings (`CapacityProjection`). Each packs the
+>     in-flight frames first, then the queued ones, then the candidate
+>     (`#packFrames`).
 >   - `bySize` packs them from the open segment's room, as below.
 >   - `closedFirst` packs them from a new segment, as if a time rotation
 >     closed the open one first. It applies only when the open segment holds
 >     a record.
 > - **`capacityRemainingBytes`** is
 >   `maxTotalBytes − ledgerBytes − inFlightFrameBytes − queuedFrameBytes − B`,
->   clamped at zero.
-> - **The third consequence below no longer holds.** `closedFirst` reserves a
->   time rotation's framing. A time rotation that admission could not foresee
->   waits instead (§8's note).
+>   clamped at zero. Here B packs no candidate: it is the open segment's
+>   footer plus the framing of the unwritten frames alone
+>   (`#reservedOverheadBytes`). So a frame of that size may still be refused,
+>   when packing it starts a further segment.
+> - **A time rotation can wait at the threshold.** With `maxTotalBytes` set,
+>   this qualifies §8's `maxSegmentAgeMs` row, where this contract states the
+>   time half of handoff §9.1's "Rotate by size and time".
+>   - Before a time rotation closes an aged segment, the writer checks the
+>     frames still unwritten (`#mayCloseByTime`).
+>   - The rotation waits only if both hold:
+>     - closing first would cost those frames more framing than keeping the
+>       segment open;
+>     - the ledger, the unwritten frames, the open segment's footer and that
+>       framing would together pass `maxTotalBytes`.
+>   - While it waits, the segment stays open past `maxSegmentAgeMs`. Frames
+>     go into it by the size rule, and a size rotation can still close it.
+>   - The aged segment is closed by time at the first rotation check at which
+>     either condition fails. `drain()` checks only before each batch of
+>     frames it writes, so it always sees a frame unwritten. It never checks
+>     on an empty queue. `tick()` checks with or without a backlog. With no
+>     frame unwritten, the first condition always fails, so the first
+>     `tick()` that finds no frame unwritten closes it.
+>   - A waiting rotation does not hold back `tick()`'s interval `fsync`, so
+>     §9's data-loss bound is unchanged.
+>   - `timeRotationsDeferred` counts each waiting segment once.
+> - **The third consequence below, and §12's "Capacity vs. time-driven
+>   rotation" row, no longer hold.** `closedFirst` reserves the framing of a
+>   time rotation that admission can foresee. One it could not foresee waits
+>   rather than pass `maxTotalBytes`.
 > - **The last paragraph's "recovery's tally plus what it has written"** now
->   holds only with no threshold set. The count is still not a `statvfs`
->   reading.
+>   describes only the `totalSegmentBytes` metric with no threshold set, when
+>   `capacityRemainingBytes` is `null`. With a threshold, the count is the
+>   ledger. Neither is a `statvfs` reading.
 > - **Unchanged:** this package deletes nothing, and reaching the threshold
 >   refuses frames with `capacity-exceeded`.
 

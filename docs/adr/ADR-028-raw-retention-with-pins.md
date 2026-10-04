@@ -519,9 +519,14 @@ pruning waits for settlement.
    >     stops counting once a re-derivation finds it gone.
    >   - At the limit the writer still refuses new frames and deletes nothing
    >     (Decision 5.3).
-   >   - `docs/contracts/wal-format.md` §11.1 states the rule.
-   > - **Still open.** The worker's `walCapacity` metric and its 90% alarm
-   >   model the old writer (`WALCAP-LOWS`, O-L5).
+   >   - The dated note in `docs/contracts/wal-format.md` §11.1 states the
+   >     rule.
+   > - **Still open (`WALCAP-LOWS`).**
+   >   - O-L5: the worker's `walCapacity` metric and its 90% alarm model the
+   >     old writer.
+   >   - O-L6: expiry inventories only manifested segments (`inventoryWalRoot`
+   >     in `research-tier/inventory.ts`). So a crashed epoch's unmanifested
+   >     segment is never expired, and it stays counted against the cap.
 
 3. **Pins and the research tier are written with SNAPPY, not ZSTD.**
    - `DatasetCodec` offers only `UNCOMPRESSED` and `SNAPPY`
@@ -594,20 +599,29 @@ Two limits come from the trader, not from this worker.
 >     `apps/trader`).
 >   - Before the trader exits, it writes each latched halt to
 >     `ops.incidents` as a `TRADER_HALT:<scope>` row, bounded to 5 s
->     (`recordHaltsBeforeExit`). A GLOBAL halt writes one row per configured
->     instance.
+>     (`recordHaltsBeforeExit`, `apps/trader`). A GLOBAL halt writes one row
+>     per configured instance.
 >   - `postgresTraderEvidence` reads both. A classified window with a halt
 >     or a refusal, and no fill, now gets a `halt` or `refusal` pin
 >     (`pinClassOf`).
 > - **Still open (`PROV1-LOWS`):**
 >   - **F3.** When PostgreSQL itself failed, a halt's row may not land. The
 >     trader logs `HALT RECORD NOT DURABLE` or `HALT RECORD UNCONFIRMED`.
->     Refusals made after the failure are not written (`#takeRiskRefusals`).
->     The window then lacks that evidence, and may get no pin. Owners:
->     `HOST-1`, to page on those lines, and `BURN-IN`, for the operator-pin
->     procedure.
+>     The window then lacks that evidence, and may get no pin.
 >   - **R2-L1.** A window that overlaps a gateway epoch's end stays
 >     unclassified for good when the gateway and the trader restart
 >     together. It fails closed: the raw WAL it overlaps is kept.
->   - R2-L2 and R2-L3 concern the trader's exit and a log line, not
->     retention.
+>   - Owners: `HOST-1`, to page on the `HALT RECORD NOT DURABLE`,
+>     `HALT RECORD UNCONFIRMED`, `STORE CONNECTION LOST` and
+>     `PROCESS EXIT FORCED` lines, and `BURN-IN`, for the operator-pin
+>     procedure.
+> - **Refusals have a like gap, which `PROV1-LOWS` does not list.** A
+>   refusal not yet written when the store failed, or made after the
+>   failure, may never be written. `#takeRiskRefusals` hands over none once
+>   `#durabilityLost` is set, and no group commit runs after one failed
+>   (`#runCommit`). Both are in `packages/trading-core`. A window can then
+>   lack that refusal.
+> - **Closed since.** `TC-LOWS-1` closed `PROV1-LOWS`'s R2-L2 and R2-L3,
+>   which concerned the trader's exit and a log line, not retention. It
+>   merged as `9033743` on 2026-10-04. Its record is
+>   `docs/handoffs/TC-LOWS-1.md`.
