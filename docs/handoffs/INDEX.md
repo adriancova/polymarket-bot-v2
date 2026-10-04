@@ -133,3 +133,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-03 | [CKPT-1.md](CKPT-1.md) | `CKPT-1`: ADR-027, checkpoint on change plus a 60 s heartbeat | Round | Complete (2026-10-03) | `891ccdd` | 5 KB |
 | 2026-10-03 | [ADR033-REVIEW.md](ADR033-REVIEW.md) | `ADR033-REVIEW`: ADR-033 checked, corrected and accepted (the order heartbeat, C-12) | Round | Complete (2026-10-03) | `47575cf` | 3 KB |
 | 2026-10-04 | [TC-LOWS-1.md](TC-LOWS-1.md) | `TC-LOWS-1`: pin the open trading-core and trader LOWs | Round | Complete (2026-10-04) | `9033743` | 4 KB |
+| 2026-10-04 | [GOV-NOTES-1.md](GOV-NOTES-1.md) | `GOV-NOTES-1`: dated corrections to ADR-028 Amendment 1 rule 6 and wal-format §11.1 | Round | Complete (2026-10-04) | `1f99fcc` | 3 KB |
