@@ -97,7 +97,9 @@ const ControlApiConfigSchema = z.strictObject({
    * `"none"` reads nothing, and the state is `NOT_CONFIGURED` — said on
    * `/v1/health` and `/v1/metrics`, never "no halts". `"postgres"` reads the
    * open `TRADER_HALT:*` rows of `ops.incidents` on every authorized health
-   * and metrics read, each read bounded by `timeoutMs`. The database URL is
+   * and metrics read, each read bounded by `timeoutMs` — at most
+   * `TRADER_HALT_READ_TIMEOUT_MAX_MS` (5000), below the API's answer deadline
+   * and the scrape timeout (`CTL2-F1`). The database URL is
    * NOT a field here: it carries a credential, so it comes from the
    * environment variable `main.ts` names (`TRADER_HALTS_DATABASE_URL_ENV`),
    * read once at startup and never logged. REQUIRED, like `traderHealth`, so

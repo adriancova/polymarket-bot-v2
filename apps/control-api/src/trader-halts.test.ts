@@ -14,8 +14,18 @@ import { describe, expect, it } from "vitest";
 
 import { PLATFORM_METRIC_FAMILIES, platformMetricFamily, renderExpositionFor } from "@polymarket-bot/observability";
 
-import type { ApiRequest, ApiResponse } from "./api.js";
-import { FAKE_OPERATOR_TOKEN, FAKE_READER_TOKEN, bearer, createHarness, traderHaltFetch, traderHaltRow } from "./testing/index.js";
+import { ControlApi, READ_REFRESH_DEADLINE_MS, type ApiRequest, type ApiResponse, type ControlApiOptions } from "./api.js";
+import { OperatorRegistry } from "./auth.js";
+import { TraderHealthCache, type HealthReadResult, type TraderHealthSource } from "./health-source.js";
+import {
+  FAKE_OPERATOR_TOKEN,
+  FAKE_READER_TOKEN,
+  bearer,
+  createHarness,
+  healthDocument,
+  traderHaltFetch,
+  traderHaltRow,
+} from "./testing/index.js";
 import {
   AbsentTraderHaltSource,
   InMemoryTraderHaltSource,
@@ -512,5 +522,156 @@ describe("through the API: the health answer and the metrics carry the halts, re
     expect(fetches).toBe(1);
     expect(haltsOf(responses[0] as ApiResponse)["state"]).toBe("OPEN");
     expect((responses[1] as ApiResponse).body).toContain('control_trader_halts_open{scope="MARKET"} 1');
+  });
+});
+
+describe("CTL2-F1: an authorized health or metrics read ANSWERS by the answer deadline — a read still in flight is not current, and never an earlier NONE_OPEN", () => {
+  const DEADLINE_MS = 80;
+  const NO_ANSWER = "NO ANSWER";
+
+  /** `work`, or {@link NO_ANSWER} once `ms` have passed (a scrape that gave up). */
+  async function within<T>(work: Promise<T>, ms: number): Promise<T | typeof NO_ANSWER> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const gaveUp = new Promise<typeof NO_ANSWER>((resolve) => {
+      timer = setTimeout(() => resolve(NO_ANSWER), ms);
+    });
+    try {
+      return await Promise.race([work, gaveUp]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** A source whose first fetch answers `first` and whose second waits for {@link release}. */
+  function slowSecondRead(first: unknown): { source: TraderHaltSource; fetches: () => number; release: (result: unknown) => void } {
+    let fetches = 0;
+    let release: (result: unknown) => void = () => undefined;
+    const second = new Promise<TraderHaltFetch>((resolve) => {
+      release = (result) => resolve({ fetched: true, result });
+    });
+    return {
+      source: {
+        configured: true,
+        fetch: () => {
+          fetches += 1;
+          if (fetches === 1) return Promise.resolve({ fetched: true, result: first });
+          if (fetches === 2) return second;
+          return Promise.resolve({ fetched: true, result: traderHaltFetch([GLOBAL]) });
+        },
+      },
+      fetches: () => fetches,
+      release: (result) => release(result),
+    };
+  }
+
+  it("a halt read still in flight at the deadline is UNKNOWN (OVERDUE) in /v1/metrics and /v1/health — not the earlier read's NONE_OPEN — and is recorded when it settles", async () => {
+    const slow = slowSecondRead(traderHaltFetch([]));
+    const { api, traderHalts } = createHarness({ traderHaltSource: slow.source, refreshDeadlineMs: DEADLINE_MS });
+    const first = await within(api.handle(request({ path: "/v1/metrics" })), 2_000);
+    expect(first === NO_ANSWER ? NO_ANSWER : first.body).toContain('control_trader_halts_state{state="NONE_OPEN"} 1');
+
+    const started = Date.now();
+    const metrics = await within(api.handle(request({ path: "/v1/metrics" })), DEADLINE_MS + 1_500);
+    expect(metrics, "the scrape got no answer: the halt read held it").not.toBe(NO_ANSWER);
+    if (metrics === NO_ANSWER) return;
+    expect(Date.now() - started).toBeGreaterThanOrEqual(DEADLINE_MS - 10);
+    expect(metrics.status).toBe(200);
+    expect(metrics.body).toContain('control_trader_halts_state{state="UNKNOWN"} 1');
+    expect(metrics.body).toContain('control_trader_halts_state{state="NONE_OPEN"} 0');
+    expect(metrics.body).not.toContain("control_trader_halts_open");
+    // Not counted: the read is still in flight.
+    expect(metrics.body).toContain('control_trader_halt_reads_total{outcome="OK"} 1');
+    expect(metrics.body).not.toContain('outcome="UNAVAILABLE"');
+
+    // A health read now JOINS the outstanding read (single-flight) and is UNKNOWN too.
+    const health = await within(api.handle(request()), DEADLINE_MS + 1_500);
+    expect(health).not.toBe(NO_ANSWER);
+    if (health === NO_ANSWER) return;
+    const halts = haltsOf(health);
+    expect(slow.fetches()).toBe(2);
+    expect(halts["state"]).toBe("UNKNOWN");
+    expect(halts["openTotal"]).toBeNull();
+    expect(halts["openByScope"]).toBeNull();
+    expect(String(halts["detail"])).toBe(
+      `OVERDUE: this request's read of ops.incidents had not settled within the ${String(DEADLINE_MS)} ms answer deadline; it is ` +
+        "still in flight, and a later read reports what it found",
+    );
+    expect(String(halts["note"])).toContain("NOT 'no halts'");
+    // OVERDUE is the answer's, never the cache's: the cache still holds the earlier read.
+    expect(traderHalts.view().state).toBe("NONE_OPEN");
+
+    // The outstanding read settles — OPEN — and the cache records and counts it.
+    slow.release(traderHaltFetch([MARKET]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(traderHalts.view().state).toBe("OPEN");
+    expect({ ...traderHalts.readCounts() }).toEqual({ OK: 2 });
+    const after = await within(api.handle(request({ path: "/v1/metrics" })), 2_000);
+    expect(after === NO_ANSWER ? NO_ANSWER : after.body).toContain('control_trader_halts_open{scope="GLOBAL"} 1');
+  });
+
+  it("a trader health refresh still in flight at the deadline does not hold the halts: OPEN is answered, and the health is NOT current", async () => {
+    let healthReads = 0;
+    const hanging: TraderHealthSource = {
+      read: (): Promise<HealthReadResult> => {
+        healthReads += 1;
+        return healthReads === 1
+          ? Promise.resolve({ outcome: "OK", report: healthDocument() })
+          : new Promise<HealthReadResult>(() => undefined);
+      },
+    };
+    const harness = createHarness({ traderHaltSource: new InMemoryTraderHaltSource(traderHaltFetch([GLOBAL])) });
+    const options: ControlApiOptions = {
+      operators: new OperatorRegistry([{ operatorId: "reader-b", token: FAKE_READER_TOKEN, grants: ["READ"] }]),
+      controlPlane: harness.controlPlane,
+      health: new TraderHealthCache(hanging),
+      environment: harness.environment,
+      auditCapacity: 64,
+      auditSize: () => harness.audit.size,
+      refreshHealthOnRead: true,
+      traderHalts: harness.traderHalts,
+      refreshDeadlineMs: DEADLINE_MS,
+    };
+    const api = new ControlApi(options);
+    const reader = { authorization: bearer(FAKE_READER_TOKEN) };
+    const first = await within(api.handle(request({ ...reader, path: "/v1/metrics" })), 2_000);
+    expect(first === NO_ANSWER ? NO_ANSWER : first.body).toContain("control_trader_health_current 1");
+
+    const metrics = await within(api.handle(request({ ...reader, path: "/v1/metrics" })), DEADLINE_MS + 1_500);
+    expect(metrics, "the scrape got no answer: the trader health refresh held it").not.toBe(NO_ANSWER);
+    if (metrics === NO_ANSWER) return;
+    expect(metrics.body).toContain('control_trader_halts_state{state="OPEN"} 1');
+    expect(metrics.body).toContain('control_trader_halts_open{scope="GLOBAL"} 1');
+    // The report is retained (available), and this read did not refresh it (not current).
+    expect(metrics.body).toContain("control_trader_health_available 1");
+    expect(metrics.body).toContain("control_trader_health_current 0");
+
+    const health = await within(api.handle(request(reader)), DEADLINE_MS + 1_500);
+    expect(health).not.toBe(NO_ANSWER);
+    if (health === NO_ANSWER) return;
+    const body = parse(health);
+    expect(body["current"]).toBe(false);
+    expect(body["available"]).toBe(true);
+    expect(String(body["note"])).toContain(`did not answer within the ${String(DEADLINE_MS)} ms answer deadline`);
+    expect(haltsOf(health)["state"]).toBe("OPEN");
+    expect(healthReads).toBe(2);
+  });
+
+  it("the deadline is 8000 ms, and no composition may give a longer one — or a non-integer", () => {
+    expect(READ_REFRESH_DEADLINE_MS).toBe(8_000);
+    const harness = createHarness();
+    const options = (refreshDeadlineMs: number): ControlApiOptions => ({
+      operators: new OperatorRegistry([{ operatorId: "reader-b", token: FAKE_READER_TOKEN, grants: ["READ"] }]),
+      controlPlane: harness.controlPlane,
+      health: harness.health,
+      environment: harness.environment,
+      auditCapacity: 64,
+      auditSize: () => harness.audit.size,
+      traderHalts: harness.traderHalts,
+      refreshDeadlineMs,
+    });
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, READ_REFRESH_DEADLINE_MS + 1, 60_000]) {
+      expect(() => new ControlApi(options(bad)), String(bad)).toThrow(RangeError);
+    }
+    for (const good of [1, READ_REFRESH_DEADLINE_MS]) expect(() => new ControlApi(options(good)), String(good)).not.toThrow();
   });
 });

@@ -128,6 +128,34 @@
  * — the state is explicit, so a deployment that reads nothing says
  * `NOT_CONFIGURED` rather than nothing — and the open counts only after a read
  * that succeeded.
+ *
+ * ## The answer deadline (`CONTROL-2`, closing `CTL2-F1`)
+ *
+ * Both refreshes are bounded by their SOURCES' bounds, and those are
+ * configuration (`traderHealth.timeoutMs` up to 60 s). A read that waited for
+ * the slower of them could outlast the Prometheus scrape that asked for it: the
+ * scrape is abandoned, the `UNKNOWN` the halt read would have said never
+ * reaches Prometheus, `TraderHaltOpenOrUnknown` cannot fire, and the panel keeps
+ * the last `NONE_OPEN` it saw. So every authorized health and metrics read
+ * answers within {@link READ_REFRESH_DEADLINE_MS} of starting its refreshes,
+ * whatever they do — below the scrape fragment's explicit `scrape_timeout`
+ * (`infra/prometheus/control-api-scrape.yaml`, pinned by
+ * `test/integration/control-api/trader-halt-shape.test.ts`). A refresh still
+ * in flight at the deadline is answered as what it is — not current — and
+ * never as an earlier read's result:
+ *
+ * - the trader halts are `UNKNOWN`, reason `OVERDUE` (`trader-halts.ts`,
+ *   `overdueTraderHaltView`), not the cache's earlier view;
+ * - the trader health is not current (`control_trader_health_current` 0, and
+ *   `current: false` on `/v1/health`); a report retained from an earlier read
+ *   is still shown, as after a failed read, and its `asOf` says how old it is.
+ *
+ * The refreshes run on: single-flight, a later read joins one still in flight,
+ * and the caches record and count it when it settles. The halt read's own bound
+ * is capped below the deadline (`adapters/postgres-trader-halts.ts`,
+ * `TRADER_HALT_READ_TIMEOUT_MAX_MS`), so a database that does not answer is
+ * `UNAVAILABLE` by the read's own timer and `OVERDUE` is the backstop for a
+ * source that does not keep its bound.
  */
 
 import {
@@ -158,7 +186,13 @@ import {
 } from "./doors.js";
 import type { TraderHealthCache } from "./health-source.js";
 import { readInstanceIdParameter } from "./instance-id.js";
-import { traderHaltSamples, traderHaltsDocument, type TraderHaltCache } from "./trader-halts.js";
+import {
+  overdueTraderHaltView,
+  traderHaltSamples,
+  traderHaltsDocument,
+  type TraderHaltCache,
+  type TraderHaltView,
+} from "./trader-halts.js";
 import {
   CONTROL_KILL_SWITCH_ACTIONS,
   CONTROL_KILL_SWITCH_SCOPES,
@@ -229,6 +263,34 @@ export interface ApiEnvironment {
   nextAuditRecordId(): string;
 }
 
+/**
+ * `CONTROL-2` (`CTL2-F1`): the longest an authorized `GET /v1/health` or
+ * `GET /v1/metrics` waits for its refreshes before it answers (module header,
+ * "The answer deadline"). Below the control-api scrape job's explicit
+ * `scrape_timeout` of 10 s, with room for rendering and the transport; above
+ * the halt read's own longest bound, so a halt read that keeps its bound is
+ * always settled by it.
+ */
+export const READ_REFRESH_DEADLINE_MS = 8_000;
+
+/** Which of this answer's refreshes had not settled by the answer deadline. */
+interface OverdueRefreshes {
+  readonly health: boolean;
+  readonly halts: boolean;
+}
+
+/** `work` settled (its rejection propagates), or `ms` passed — whichever is first. The timer is unreferenced. */
+function settledOrDeadline(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+    timer.unref();
+  });
+  return Promise.race([work.then(() => undefined), deadline]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 export interface ControlApiOptions {
   readonly operators: OperatorRegistry;
   readonly controlPlane: ControlPlane;
@@ -254,6 +316,13 @@ export interface ControlApiOptions {
    * single-flight, and never by an unauthorized caller.
    */
   readonly traderHalts: TraderHaltCache;
+  /**
+   * `CTL2-F1`: the answer deadline of an authorized health or metrics read, in
+   * milliseconds — an integer from 1 to {@link READ_REFRESH_DEADLINE_MS}, which
+   * is also the default and what `main.ts` composes. A suite passes a shorter
+   * one; nothing may pass a longer one (the constructor throws `RangeError`).
+   */
+  readonly refreshDeadlineMs?: number;
 }
 
 // --- the request doors ------------------------------------------------------
@@ -534,9 +603,19 @@ export class ControlApi {
   #refreshInFlight: Promise<unknown> | undefined;
   /** The one trader halt read in flight, shared the same way (`CONTROL-2`). */
   #haltReadInFlight: Promise<unknown> | undefined;
+  /** `CTL2-F1`: the answer deadline (module header). */
+  readonly #refreshDeadlineMs: number;
 
   constructor(options: ControlApiOptions) {
+    const deadline = options.refreshDeadlineMs ?? READ_REFRESH_DEADLINE_MS;
+    if (!Number.isSafeInteger(deadline) || deadline < 1 || deadline > READ_REFRESH_DEADLINE_MS) {
+      throw new RangeError(
+        `the refresh answer deadline must be an integer from 1 to ${String(READ_REFRESH_DEADLINE_MS)} ms, below the ` +
+          "scrape timeout a Prometheus job gives this API",
+      );
+    }
     this.#options = options;
+    this.#refreshDeadlineMs = deadline;
   }
 
   /** Authentication failures by reason, sorted, for the metrics surface. */
@@ -635,9 +714,9 @@ export class ControlApi {
       case "KILL_SWITCHES":
         return json(200, { killSwitches: this.#options.controlPlane.killSwitches() });
       case "HEALTH":
-        return this.#fresh(() => this.#health());
+        return this.#fresh((overdue) => this.#health(overdue));
       case "METRICS":
-        return this.#fresh(() => this.#metrics());
+        return this.#fresh((overdue) => this.#metrics(overdue));
       case "STRATEGY_PAUSE":
         return this.#strategy(operator, route, request, resolved.rawInstanceId ?? "", true);
       case "STRATEGY_RESUME":
@@ -736,26 +815,50 @@ export class ControlApi {
    * refresh, so a burst of scrapes is one loopback GET. A refresh never throws
    * — the cache answers every failure as data and counts it — so `produce`
    * always runs.
+   *
+   * `CTL2-F1`: `produce` runs once both refreshes have settled OR the answer
+   * deadline has passed, whichever is first (module header, "The answer
+   * deadline"), and is told which refresh it did not wait for.
    */
-  async #fresh(produce: () => ApiResponse): Promise<ApiResponse> {
-    const pending: Promise<unknown>[] = [];
+  async #fresh(produce: (overdue: OverdueRefreshes) => ApiResponse): Promise<ApiResponse> {
+    let healthRead: Promise<unknown> | undefined;
     if (this.#options.refreshHealthOnRead === true) {
       this.#refreshInFlight ??= this.#options.health.refresh().finally(() => {
         this.#refreshInFlight = undefined;
       });
-      pending.push(this.#refreshInFlight);
+      healthRead = this.#refreshInFlight;
     }
     // `CONTROL-2`: a configured trader halt source is read on the same
     // authorized reads, single-flight; one that is not configured is never
     // read, and its state stays NOT_CONFIGURED. The cache never throws.
+    let haltRead: Promise<unknown> | undefined;
     if (this.#options.traderHalts.configured) {
       this.#haltReadInFlight ??= this.#options.traderHalts.refresh().finally(() => {
         this.#haltReadInFlight = undefined;
       });
-      pending.push(this.#haltReadInFlight);
+      haltRead = this.#haltReadInFlight;
     }
-    await Promise.all(pending);
-    return produce();
+    let healthSettled = healthRead === undefined;
+    let haltsSettled = haltRead === undefined;
+    if (!healthSettled || !haltsSettled) {
+      await settledOrDeadline(
+        Promise.all([
+          healthRead?.then(() => {
+            healthSettled = true;
+          }),
+          haltRead?.then(() => {
+            haltsSettled = true;
+          }),
+        ]),
+        this.#refreshDeadlineMs,
+      );
+    }
+    return produce({ health: !healthSettled, halts: !haltsSettled });
+  }
+
+  /** `CTL2-F1`: the halt view this answer renders — the cache's, or OVERDUE when this request's read is outstanding. */
+  #haltView(overdue: OverdueRefreshes): TraderHaltView {
+    return overdue.halts ? overdueTraderHaltView(this.#refreshDeadlineMs) : this.#options.traderHalts.view();
   }
 
   #authorize(operator: OperatorCredential, grant: OperatorGrant): ApiResponse | undefined {
@@ -905,22 +1008,26 @@ export class ControlApi {
       : mutationProblem(result.code, result.detail);
   }
 
-  #health(): ApiResponse {
+  #health(overdue: OverdueRefreshes): ApiResponse {
     const report = this.#options.health.last();
     const refreshing = this.#options.refreshHealthOnRead === true;
+    // `CTL2-F1`: a refresh this answer did not wait for is not current.
+    const current = !overdue.health && this.#options.health.current;
+    const deadline = `the ${String(this.#refreshDeadlineMs)} ms answer deadline`;
     return json(200, {
       available: this.#options.health.available,
-      current: this.#options.health.current,
+      current,
       reads: this.#options.health.readCounts(),
       report: report ?? null,
       // `CONTROL-2`: open trader halts from ops.incidents — a separate fact
       // from the report above, which a trader that has exited no longer serves.
-      traderHalts: traderHaltsDocument(this.#options.traderHalts),
+      traderHalts: traderHaltsDocument(this.#options.traderHalts, this.#haltView(overdue)),
       note:
         report === undefined
           ? "No trader health report has passed this API's door. " +
             (refreshing
               ? "This read asked the configured trader health endpoint and got no usable report " +
+                (overdue.health ? `within ${deadline} ` : "") +
                 "(see reads); the trader serves GET /health on the loopback when its " +
                 "TRADER_HEALTH_BIND/TRADER_HEALTH_PORT are set, and pointing traderHealth.http at " +
                 "it is this deployment's composition obligation."
@@ -928,24 +1035,28 @@ export class ControlApi {
                 "the trader's loopback GET /health as an http source is the composition obligation " +
                 "this configuration has not discharged.")
           : `The report's asOf field states how old it is${
-              this.#options.health.current
+              current
                 ? refreshing
                   ? " (this read refreshed it)"
                   : ""
-                : "; the most recent read FAILED and this report is retained from an earlier one"
+                : overdue.health
+                  ? `; this read's refresh did not answer within ${deadline}, and this report is retained from an ` +
+                    "earlier read"
+                  : "; the most recent read FAILED and this report is retained from an earlier one"
             }. Economic values in it are EXACT decimal strings and are never converted to numbers ` +
             "by this process.",
     });
   }
 
-  #metrics(): ApiResponse {
+  #metrics(overdue: OverdueRefreshes): ApiResponse {
     const samples: PlatformMetricSample[] = [
       ...controlPlaneSamples({
         ...this.#options.controlPlane.runState(),
         allowRealOrders: false,
         modeRaiseAttemptsRefused: this.#options.controlPlane.modeRaiseAttemptsRefused,
         traderHealthAvailable: this.#options.health.available,
-        traderHealthCurrent: this.#options.health.current,
+        // `CTL2-F1`: a refresh this answer did not wait for is not current.
+        traderHealthCurrent: !overdue.health && this.#options.health.current,
         traderHealthReadsByOutcome: this.#options.health.readCounts(),
         strategyInstancesByState: countStates(this.#options.controlPlane),
         pausedInstanceIds: this.#options.controlPlane
@@ -969,8 +1080,10 @@ export class ControlApi {
     const report = this.#options.health.last();
     if (report !== undefined) samples.push(...traderHealthSamples(report));
     // `CONTROL-2`: the trader halt families, always present (the state is
-    // explicit); the open counts only after a read that succeeded.
-    samples.push(...traderHaltSamples(this.#options.traderHalts));
+    // explicit); the open counts only after a read that succeeded — and
+    // (`CTL2-F1`) UNKNOWN, never an earlier read's state, while this
+    // request's read is outstanding.
+    samples.push(...traderHaltSamples(this.#options.traderHalts, this.#haltView(overdue)));
 
     return {
       status: 200,

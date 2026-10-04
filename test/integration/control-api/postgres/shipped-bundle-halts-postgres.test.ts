@@ -20,13 +20,19 @@
  *   including when PostgreSQL refuses the password;
  * - a reader connection the server terminates is dropped, and the process
  *   keeps serving: the next read is OPEN again;
- * - SIGTERM stops it, and the pool with it.
+ * - SIGTERM stops it, and the pool with it;
+ * - (`CTL2-F1`) with both read bounds at the most the configuration admits, a
+ *   trader that never answers and `ops.incidents` locked, `/v1/metrics` is
+ *   still answered inside the scrape job's `scrape_timeout`, `UNKNOWN 1` — and
+ *   `OPEN 1` once the lock goes; SIGTERM then exits 0 at once, the trader
+ *   read still outstanding (`CTL2-L2`).
  *
  * Docker is required (`vitest.config.ts` beside this file); nothing skips.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -41,10 +47,13 @@ import {
   type TradingChain,
 } from "@polymarket-bot/storage-postgres/testing";
 
+import { TRADER_HALT_READ_TIMEOUT_MAX_MS } from "../../../../apps/control-api/src/adapters/postgres-trader-halts.js";
+import { READ_REFRESH_DEADLINE_MS } from "../../../../apps/control-api/src/api.js";
 import { TRADER_HALTS_APPLICATION_NAME, TRADER_HALTS_DATABASE_URL_ENV } from "../../../../apps/control-api/src/main.js";
 import { PostgresTraderStore } from "../../../../apps/trader/src/adapters/postgres-store.js";
 import { haltIncidentRows } from "../../../../apps/trader/src/halt-record.js";
 import {
+  REPO_ROOT,
   SAFE_PAPER_ENVIRONMENT,
   buildShippedBundle,
   removeBundle,
@@ -112,8 +121,11 @@ async function traderHalts(): Promise<void> {
   expect(await store.recordHalts(rows, 5_000)).toEqual({ status: "written", rows: 1 });
 }
 
-/** Starts the built bundle, configured `postgres`, its URL in the one variable. */
-async function startBundle(url: string): Promise<RunningBundle> {
+/** Starts the built bundle, configured `postgres`, its URL in the one variable; `traderHealth` `none` unless given. */
+async function startBundle(
+  url: string,
+  options: { readonly traderHealth?: unknown; readonly haltTimeoutMs?: number } = {},
+): Promise<RunningBundle> {
   const config = join(directory, `control-api-${String(Date.now())}.json`);
   writeFileSync(
     config,
@@ -123,8 +135,8 @@ async function startBundle(url: string): Promise<RunningBundle> {
       maxRequestBodyBytes: 65_536,
       auditCapacity: 64,
       auditSafetyReserve: 4,
-      traderHealth: { kind: "none" },
-      traderHalts: { kind: "postgres", timeoutMs: 2_000 },
+      traderHealth: options.traderHealth ?? { kind: "none" },
+      traderHalts: { kind: "postgres", timeoutMs: options.haltTimeoutMs ?? 2_000 },
       operators: [{ operatorId: "ctl2-r1-reader", token: TOKEN, grants: ["READ"] }],
     }),
     "utf8",
@@ -136,7 +148,8 @@ async function startBundle(url: string): Promise<RunningBundle> {
   });
 }
 
-function get(port: number, path: string): Promise<{ status: number; body: string }> {
+/** An authorized GET; with `timeoutMs`, it gives up (rejects) when no complete answer has arrived by then — as a scrape does. */
+function get(port: number, path: string, timeoutMs?: number): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
       { host: "127.0.0.1", port, path, method: "GET", headers: { authorization: `Bearer ${TOKEN}` } },
@@ -147,8 +160,25 @@ function get(port: number, path: string): Promise<{ status: number; body: string
       },
     );
     req.on("error", reject);
+    if (timeoutMs !== undefined) {
+      const timer = setTimeout(() => req.destroy(new Error(`no answer to GET ${path} within ${String(timeoutMs)} ms`)), timeoutMs);
+      req.on("close", () => clearTimeout(timer));
+    }
     req.end();
   });
+}
+
+/** The control-api job's stated `scrape_timeout` (`infra/prometheus/control-api-scrape.yaml`), in milliseconds; NaN when unstated. */
+function scrapeTimeoutMs(): number {
+  const job =
+    /- job_name: "control-api"\n[\s\S]*?(?=\n {2}- job_name: |$)/u.exec(
+      readFileSync(join(REPO_ROOT, "infra", "prometheus", "control-api-scrape.yaml"), "utf8")
+        .split("\n")
+        .filter((line) => !/^\s*#/u.test(line))
+        .join("\n"),
+    )?.[0] ?? "";
+  const seconds = /^ +scrape_timeout: (\d+)s$/mu.exec(job)?.[1];
+  return seconds === undefined ? Number.NaN : Number(seconds) * 1_000;
 }
 
 interface HaltsSection {
@@ -250,6 +280,64 @@ describe("the SHIPPED bundle reads an open trader halt from a real PostgreSQL (C
       const exit = await running.stop();
       expect(exit.stdout).toContain("control API stopped.");
       expect(`${exit.stdout}${exit.stderr}`).not.toContain(PASSWORD);
+      await database().pool.query("delete from ops.incidents");
+    }
+  }, 120_000);
+
+  it("CTL2-F1: both read bounds at their most, a trader that NEVER answers and ops.incidents LOCKED — every scrape is answered inside its scrape_timeout: UNKNOWN 1, then OPEN 1; SIGTERM then exits 0 at once", async () => {
+    await traderHalts();
+    const timeoutMs = scrapeTimeoutMs();
+    expect(timeoutMs).toBe(10_000);
+    const traderSockets = new Set<Socket>();
+    const silentTrader = createHttpServer(() => undefined);
+    silentTrader.on("connection", (socket: Socket) => {
+      traderSockets.add(socket);
+    });
+    await new Promise<void>((resolveListen) => silentTrader.listen(0, "127.0.0.1", () => resolveListen()));
+    const address = silentTrader.address();
+    const traderPort = typeof address === "object" && address !== null ? address.port : 0;
+    const locker = await database().pool.connect();
+    let running: RunningBundle | undefined;
+    try {
+      await locker.query("begin");
+      await locker.query("lock table ops.incidents in access exclusive mode");
+      running = await startBundle(readerUrl, {
+        haltTimeoutMs: TRADER_HALT_READ_TIMEOUT_MAX_MS,
+        traderHealth: { kind: "http", url: `http://127.0.0.1:${String(traderPort)}/health`, timeoutMs: 60_000 },
+      });
+      const began = Date.now();
+      const locked = await get(running.port, "/v1/metrics", timeoutMs);
+      const elapsed = Date.now() - began;
+      expect(locked.status).toBe(200);
+      expect(elapsed).toBeLessThan(timeoutMs);
+      expect(elapsed).toBeGreaterThanOrEqual(READ_REFRESH_DEADLINE_MS - 100);
+      expect(locked.body).toContain('control_trader_halts_state{state="UNKNOWN"} 1');
+      expect(locked.body).toContain('control_trader_halts_state{state="NONE_OPEN"} 0');
+      expect(locked.body).not.toContain("control_trader_halts_open");
+      expect(locked.body).toContain("control_trader_health_current 0");
+
+      // The lock goes; the trader still says nothing. The next scrape reads the row.
+      await locker.query("rollback");
+      const unlocked = await get(running.port, "/v1/metrics", timeoutMs);
+      expect(unlocked.status).toBe(200);
+      expect(unlocked.body).toContain('control_trader_halts_state{state="OPEN"} 1');
+      expect(unlocked.body).toContain('control_trader_halts_open{scope="GLOBAL"} 1');
+      expect(traderSockets.size).toBeGreaterThan(0);
+
+      // CTL2-L2: the trader read is still outstanding (its bound is 60 s); the stop does not wait for it.
+      const stopping = Date.now();
+      const exit = await running.stop(10_000);
+      expect(exit.signal, exit.stdout).toBeNull();
+      expect(exit.code, exit.stdout).toBe(0);
+      expect(Date.now() - stopping).toBeLessThan(5_000);
+      expect(exit.stdout).toContain("control API stopped.");
+      expect(`${exit.stdout}${exit.stderr}`).not.toContain(PASSWORD);
+    } finally {
+      await locker.query("rollback").catch(() => undefined);
+      locker.release();
+      if (running?.alive() === true) await running.stop(0);
+      for (const socket of traderSockets) socket.destroy();
+      await new Promise<void>((resolveClose) => silentTrader.close(() => resolveClose()));
       await database().pool.query("delete from ops.incidents");
     }
   }, 120_000);

@@ -19,11 +19,14 @@ import { AUDIT_APPEND_TIMEOUT_MS, CONTROL_PLANE_VOID_ACTOR } from "./control-pla
 import {
   EXIT_CODES,
   TRADER_HALTS_DATABASE_URL_ENV,
+  TRADER_HALTS_URL_SSLMODES,
   composeControlPlane,
   libpqVariablesIn,
   planTraderHalts,
   redactDatabaseUrl,
+  shutdownControlApi,
   startup,
+  type ShutdownSteps,
   type StartupPorts,
 } from "./main.js";
 import { FAKE_OPERATOR_TOKEN, ScriptedEnvironment } from "./testing/index.js";
@@ -174,6 +177,8 @@ describe("exit codes", () => {
       ok: 0,
       unsafeEnvironment: 78,
       configurationRefused: 78,
+      // `CTL2-L2`: a signal's shutdown that could not close what it holds still exits, and says so.
+      stopFailed: 1,
     });
   });
 });
@@ -293,6 +298,56 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
     expect(planTraderHalts({ kind: "none" }, undefined, libpqVariablesIn(env))).toEqual({ ok: true, kind: "none" });
   });
 
+  it("CONTROL2-R1-C2: the URL's query may say one sslmode and nothing else — a ?password= would REPLACE the authority's, past the redaction", () => {
+    const postgres = { kind: "postgres", timeoutMs: 750 } as const;
+    const QUERY_PASSWORD = "Qp4-not-a-credential-ctl2-query";
+    for (const query of [
+      `password=${QUERY_PASSWORD}`,
+      `user=postgres&password=${QUERY_PASSWORD}`,
+      "user=postgres",
+      "host=%2Ftmp",
+      "port=6432",
+      "options=-c%20statement_timeout%3D0",
+      "application_name=not-the-reader",
+      "sslrootcert=%2Fetc%2Fpasswd",
+      "sslcert=%2Fetc%2Fhosts",
+      "sslkey=%2Fetc%2Fhosts",
+      "ssl=true",
+      "uselibpqcompat=true&sslmode=verify-full",
+      "PASSWORD=x",
+      "sslmode=bogus",
+      "sslmode=",
+      // The driver's weaker or aliased modes: refused (`TRADER_HALTS_URL_SSLMODES`).
+      "sslmode=no-verify",
+      "sslmode=prefer",
+      "sslmode=verify-ca",
+      "sslmode=VERIFY-FULL",
+      "sslmode=verify-full&sslmode=disable",
+      "sslmode=verify-full&password=x",
+      "",
+    ]) {
+      const url = query === "" ? `${URL_VALUE}?=${QUERY_PASSWORD}` : `${URL_VALUE}?${query}`;
+      const plan = planTraderHalts(postgres, url);
+      expect(plan.ok, query).toBe(false);
+      if (plan.ok) continue;
+      expect(plan.code, query).toBe("CONTROL_TRADER_HALTS_URL_PARAMETERS");
+      expect(plan.detail).toContain(TRADER_HALTS_DATABASE_URL_ENV);
+      for (const secret of [PASSWORD, QUERY_PASSWORD, "/etc/", "statement_timeout%3D0", "6432"]) expect(plan.detail, query).not.toContain(secret);
+    }
+    // One sslmode the driver names is admitted, and nothing changes about the plan.
+    for (const mode of TRADER_HALTS_URL_SSLMODES) {
+      expect(planTraderHalts(postgres, `${URL_VALUE}?sslmode=${mode}`), mode).toEqual({
+        ok: true,
+        kind: "postgres",
+        url: `${URL_VALUE}?sslmode=${mode}`,
+        timeoutMs: 750,
+      });
+    }
+    expect([...TRADER_HALTS_URL_SSLMODES]).toEqual(["disable", "verify-full"]);
+    // An empty query is no query.
+    expect(planTraderHalts(postgres, `${URL_VALUE}?`).ok).toBe(true);
+  });
+
   it("startup REFUSES each mismatch (78), naming the variable and never printing its value", async () => {
     const cases = [
       { config: configWithHalts({ kind: "postgres", timeoutMs: 750 }), env: BASE, code: "CONTROL_TRADER_HALTS_URL_MISSING" },
@@ -311,6 +366,12 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
         config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
         env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE, PGPASSWORD: PASSWORD },
         code: "CONTROL_TRADER_HALTS_LIBPQ_ENVIRONMENT",
+      },
+      // `CONTROL2-R1-C2`: a query password would be the one the driver sends.
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: `${URL_VALUE}?password=${PASSWORD}-query` },
+        code: "CONTROL_TRADER_HALTS_URL_PARAMETERS",
       },
     ];
     for (const entry of cases) {
@@ -364,5 +425,104 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
     // A URL that does not parse is still redacted whole.
     expect(redactDatabaseUrl("a not-a-url b", "not-a-url")).toBe("a <redacted> b");
     expect(redactDatabaseUrl("nothing here", URL_VALUE)).toBe("nothing here");
+  });
+});
+
+describe("CTL2-L2: a signal's shutdown always ENDS — the frozen pool's connections are ended at the bound, and the process is told to exit", () => {
+  const SECRET_URL = "postgres://halt_reader:Sd3-not-a-credential-ctl2-stop@127.0.0.1:5432/x";
+
+  /** Steps over fakes: the pool closes when `closeHalts` says so; every call is recorded in order. */
+  function steps(overrides: Partial<ShutdownSteps> = {}): { readonly steps: ShutdownSteps; readonly calls: string[]; readonly lines: string[]; readonly exits: number[] } {
+    const calls: string[] = [];
+    const lines: string[] = [];
+    const exits: number[] = [];
+    return {
+      calls,
+      lines,
+      exits,
+      steps: {
+        closeServer: () => {
+          calls.push("closeServer");
+          return Promise.resolve();
+        },
+        closeHalts: () => {
+          calls.push("closeHalts");
+          return Promise.resolve();
+        },
+        terminateHalts: () => {
+          calls.push("terminateHalts");
+          return 0;
+        },
+        log: (line) => lines.push(line),
+        redact: (text) => redactDatabaseUrl(text, SECRET_URL),
+        exit: (code) => {
+          calls.push(`exit ${String(code)}`);
+          exits.push(code);
+        },
+        closeWaitMs: 40,
+        terminateWaitMs: 20,
+        ...overrides,
+      },
+    };
+  }
+
+  it("a clean stop: server, then pool, never terminate; 'control API stopped.'; exit 0, once", async () => {
+    const run = steps();
+    expect(await shutdownControlApi(run.steps)).toBe(EXIT_CODES.ok);
+    expect(run.calls).toEqual(["closeServer", "closeHalts", "exit 0"]);
+    expect(run.lines).toEqual(["control API stopped."]);
+  });
+
+  it("a pool a frozen server holds: at the close bound its connections are ENDED, and once it closes the stop is clean — exit 0", async () => {
+    let release: () => void = () => undefined;
+    const run = steps({
+      closeHalts: () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      terminateHalts: () => {
+        run.calls.push("terminateHalts");
+        // pg destroys the socket; the abandoned read fails, its client is released, and the pool closes.
+        setTimeout(release, 5);
+        return 2;
+      },
+    });
+    expect(await shutdownControlApi(run.steps)).toBe(EXIT_CODES.ok);
+    expect(run.calls).toEqual(["closeServer", "terminateHalts", "exit 0"]);
+    expect(run.lines).toEqual([
+      "trader halts: the ops.incidents pool did not close within 40ms; ending the 2 connection(s) it still holds",
+      "control API stopped.",
+    ]);
+  });
+
+  it("a pool that does not close even then: the stop FAILED, says so, and the process is still told to exit — 1, not a hang", async () => {
+    const run = steps({ closeHalts: () => new Promise<void>(() => undefined) });
+    expect(await shutdownControlApi(run.steps)).toBe(EXIT_CODES.stopFailed);
+    expect(run.exits).toEqual([1]);
+    expect(run.lines.at(-1)).toBe("control API stop failed: Error: the ops.incidents pool did not close within 20ms of ending its connections");
+  });
+
+  it("a server close that fails still closes the pool, and the failure is logged REDACTED — exit 1", async () => {
+    const run = steps({ closeServer: () => Promise.reject(new Error(`close failed near ${SECRET_URL}`)) });
+    expect(await shutdownControlApi(run.steps)).toBe(EXIT_CODES.stopFailed);
+    expect(run.calls).toEqual(["closeHalts", "exit 1"]);
+    expect(run.lines).toEqual(["control API stop failed: Error: close failed near <redacted>"]);
+    expect(run.lines.join("\n")).not.toContain("Sd3-not-a-credential");
+  });
+
+  it("with no exit port (a suite running startup() in its own process) nothing is told to exit, and the code is still returned", async () => {
+    const run = steps({ closeHalts: () => new Promise<void>(() => undefined) });
+    const withoutExit: ShutdownSteps = {
+      closeServer: run.steps.closeServer,
+      closeHalts: run.steps.closeHalts,
+      terminateHalts: run.steps.terminateHalts,
+      log: run.steps.log,
+      redact: run.steps.redact,
+      closeWaitMs: 40,
+      terminateWaitMs: 20,
+    };
+    expect(await shutdownControlApi(withoutExit)).toBe(EXIT_CODES.stopFailed);
+    expect(run.exits).toEqual([]);
+    expect(run.lines.at(-1)).toContain("control API stop failed");
   });
 });

@@ -87,8 +87,30 @@ import {
  * `PGPASSFILE`) and from `USER`; so the URL must name a user, a password, a
  * host and a database ({@link planTraderHalts}), and a `PG*` variable in the
  * environment refuses the start.
+ *
+ * And the URL's AUTHORITY is its one source (`CONTROL2-R1-C2`). The driver's
+ * parser (`pg-connection-string`) copies every query parameter into the
+ * connection parameters FIRST, and takes the user, password, host and port
+ * before the `@` only where the query named none; and the driver lets the URL's
+ * parameters override the pool's own (`options`, which carries the session's
+ * `statement_timeout`, and `application_name`). A `?password=` would therefore
+ * be the password the driver sends, while {@link redactDatabaseUrl} redacts
+ * the authority's. So the only query parameter admitted is one `sslmode` with
+ * a value from {@link TRADER_HALTS_URL_SSLMODES}; any other refuses the start.
  */
 export const TRADER_HALTS_DATABASE_URL_ENV = "CONTROL_API_TRADER_HALTS_DATABASE_URL";
+
+/**
+ * `CONTROL2-R1-C2`: the values the one admitted query parameter, `sslmode`, may
+ * take — no TLS (a loopback database), or TLS with the server's certificate
+ * and name verified. Neither reads a file or names a credential; `sslcert`,
+ * `sslkey`, `sslrootcert` and every other parameter are refused. The driver's
+ * other modes are refused too: it treats `prefer`, `require` and `verify-ca`
+ * as aliases of `verify-full` and warns that its next major version weakens
+ * them, and `no-verify` would send the URL's password to a server whose
+ * certificate nobody checked.
+ */
+export const TRADER_HALTS_URL_SSLMODES: readonly string[] = Object.freeze(["disable", "verify-full"]);
 
 /** libpq's environment namespace, which `pg` reads for every parameter the URL omits. */
 const LIBPQ_VARIABLE = /^PG[A-Z]/u;
@@ -119,8 +141,15 @@ export const TRADER_HALTS_APPLICATION_NAME = "polymarket-bot-control-api";
  */
 export const TRADER_HALTS_POOL_MAX = 2;
 
-/** How long a shutdown waits for the reader's pool to close before it says so and stops waiting. */
+/** How long a shutdown waits for the reader's pool to close before it ENDS the connections the pool still holds. */
 export const TRADER_HALTS_CLOSE_WAIT_MS = 5_000;
+
+/**
+ * `CTL2-L2`: how long a shutdown waits, after ending those connections, before
+ * it stops waiting and reports the stop as failed. The process then exits
+ * either way, through the `exit` port (`StartupPorts`).
+ */
+export const TRADER_HALTS_TERMINATE_WAIT_MS = 1_000;
 
 const REDACTED = "<redacted>";
 
@@ -208,6 +237,25 @@ export function planTraderHalts(
         "may carry a credential)",
     };
   }
+  // `CONTROL2-R1-C2`: the authority is the one source; the query may say one sslmode and nothing else.
+  const keys = [...parsed.searchParams.keys()];
+  const sslmodes = parsed.searchParams.getAll("sslmode");
+  if (
+    keys.some((key) => key !== "sslmode") ||
+    sslmodes.length > 1 ||
+    sslmodes.some((mode) => !TRADER_HALTS_URL_SSLMODES.includes(mode))
+  ) {
+    return {
+      ok: false,
+      code: "CONTROL_TRADER_HALTS_URL_PARAMETERS",
+      detail:
+        `${TRADER_HALTS_DATABASE_URL_ENV} carries a query parameter other than one sslmode ` +
+        `(${TRADER_HALTS_URL_SSLMODES.join(", ")}); its keys and values are not printed. The PostgreSQL driver reads ` +
+        "every query parameter as a connection parameter, and one there replaces the URL's own (a password, user or " +
+        "host given in the query overrides the one before the @, and options or application_name the session's), so " +
+        "put the credential and the host in the URL's authority and nothing else in its query",
+    };
+  }
   const missing = [
     ...(parsed.username === "" ? ["user"] : []),
     ...(parsed.password === "" ? ["password"] : []),
@@ -240,6 +288,13 @@ export function planTraderHalts(
 interface ComposedTraderHalts {
   readonly cache: TraderHaltCache;
   readonly close: () => Promise<void>;
+  /**
+   * `CTL2-L2`: ends every connection the pool still holds — `pg` destroys the
+   * socket of one with a statement outstanding, which a frozen server would
+   * otherwise hold open, and with it `close` and the process — and returns how
+   * many it ended.
+   */
+  readonly terminate: () => number;
 }
 
 /**
@@ -255,6 +310,7 @@ function composeTraderHalts(plan: Extract<TraderHaltsPlan, { ok: true }>, log: (
     return {
       cache: new TraderHaltCache(new AbsentTraderHaltSource(TRADER_HALTS_NOT_CONFIGURED)),
       close: () => Promise.resolve(),
+      terminate: () => 0,
     };
   }
   const { url, timeoutMs } = plan;
@@ -273,9 +329,15 @@ function composeTraderHalts(plan: Extract<TraderHaltsPlan, { ok: true }>, log: (
   });
   // A connection that fails while a read holds it, between two statements, is
   // that read's failure (UNKNOWN); without a listener of its own its `error`
-  // event would be unhandled.
+  // event would be unhandled. `CTL2-L2`: every connection is also held here
+  // until the pool removes it, so a shutdown can end one a frozen server holds.
+  const held = new Set<{ end(): Promise<void> }>();
   pool.on("connect", (client) => {
+    held.add(client);
     client.on("error", () => undefined);
+  });
+  pool.on("remove", (client) => {
+    held.delete(client);
   });
   const db = createDatabase(pool);
   const source = new PostgresTraderHaltSource({ db, timeoutMs });
@@ -290,7 +352,17 @@ function composeTraderHalts(plan: Extract<TraderHaltsPlan, { ok: true }>, log: (
       }
     },
   };
-  return { cache: new TraderHaltCache(redacting), close: () => db.destroy() };
+  return {
+    cache: new TraderHaltCache(redacting),
+    close: () => db.destroy(),
+    terminate: () => {
+      const ending = [...held];
+      for (const client of ending) {
+        client.end().catch(() => undefined);
+      }
+      return ending.length;
+    },
+  };
 }
 
 /** `work`, or `false` once `ms` have passed without it settling (the timer is unreferenced). */
@@ -307,6 +379,76 @@ function settlesWithin(work: Promise<void>, ms: number): Promise<boolean> {
   });
 }
 
+/** What a signal's shutdown closes, logs and exits through (`CTL2-L2`; {@link shutdownControlApi}). */
+export interface ShutdownSteps {
+  readonly closeServer: () => Promise<void>;
+  /** Closes the trader-halt pool; may never settle while a frozen server holds a connection. */
+  readonly closeHalts: () => Promise<void>;
+  /** Ends every connection the pool still holds, and says how many. */
+  readonly terminateHalts: () => number;
+  readonly log: (line: string) => void;
+  /** Every text from a cause passes through it before it is logged (the database URL redacted). */
+  readonly redact: (text: string) => string;
+  /** `StartupPorts.exit`; absent, nothing is told to exit. */
+  readonly exit?: (code: number) => void;
+  /** Defaults to {@link TRADER_HALTS_CLOSE_WAIT_MS}; a suite passes a shorter one. */
+  readonly closeWaitMs?: number;
+  /** Defaults to {@link TRADER_HALTS_TERMINATE_WAIT_MS}; a suite passes a shorter one. */
+  readonly terminateWaitMs?: number;
+}
+
+/**
+ * A signal's shutdown (`CTL2-L2`), in order: close the server; close the
+ * trader-halt pool — whatever the server did — bounded by `closeWaitMs`; at
+ * that bound END the connections the pool still holds (`pg` destroys the
+ * socket of one with a statement outstanding: a frozen server's) and give the
+ * pool `terminateWaitMs` more; log `control API stopped.` or `control API stop
+ * failed: …` (redacted); then tell the process to exit — 0, or
+ * {@link EXIT_CODES.stopFailed} — so nothing still referenced keeps it alive.
+ * Returns that code. Never rejects.
+ */
+export async function shutdownControlApi(steps: ShutdownSteps): Promise<number> {
+  const closeWaitMs = steps.closeWaitMs ?? TRADER_HALTS_CLOSE_WAIT_MS;
+  const terminateWaitMs = steps.terminateWaitMs ?? TRADER_HALTS_TERMINATE_WAIT_MS;
+  let failure: unknown;
+  try {
+    await steps.closeServer();
+  } catch (cause) {
+    failure = cause;
+  }
+  // `CONTROL-2` r1: the reader's pool, whatever the server did, and bounded —
+  // a connection a frozen server still holds must not hold the shutdown with
+  // it. `CTL2-L2`: at the bound the pool's connections are ENDED, and the pool
+  // gets one more, shorter, bound to close.
+  const closing = Promise.resolve()
+    .then(() => steps.closeHalts())
+    .catch((cause: unknown) => {
+      failure ??= cause;
+    });
+  let closed = await settlesWithin(closing, closeWaitMs);
+  if (!closed) {
+    let ended = 0;
+    try {
+      ended = steps.terminateHalts();
+    } catch (cause) {
+      failure ??= cause;
+    }
+    steps.log(
+      `trader halts: the ops.incidents pool did not close within ${String(closeWaitMs)}ms; ` +
+        `ending the ${String(ended)} connection(s) it still holds`,
+    );
+    closed = await settlesWithin(closing, terminateWaitMs);
+    if (!closed) {
+      failure ??= new Error(`the ops.incidents pool did not close within ${String(terminateWaitMs)}ms of ending its connections`);
+    }
+  }
+  const code = failure === undefined ? EXIT_CODES.ok : EXIT_CODES.stopFailed;
+  steps.log(failure === undefined ? "control API stopped." : `control API stop failed: ${steps.redact(describeCause(failure))}`);
+  // `CTL2-L2`: the process ENDS here, whatever is still referenced.
+  steps.exit?.(code);
+  return code;
+}
+
 /** What the process exits with, so an operator can script against it. */
 export const EXIT_CODES = Object.freeze({
   ok: 0,
@@ -314,6 +456,12 @@ export const EXIT_CODES = Object.freeze({
   unsafeEnvironment: 78,
   /** The configuration was refused. */
   configurationRefused: 78,
+  /**
+   * `CTL2-L2`: a signal's shutdown could not close what it holds — the
+   * server's close failed, or the trader-halt pool did not close even after
+   * its connections were ended. The process exits all the same.
+   */
+  stopFailed: 1,
 });
 
 export interface StartupPorts {
@@ -321,6 +469,14 @@ export interface StartupPorts {
   readonly argv: readonly string[];
   readonly readConfig: (path: string) => Promise<string>;
   readonly log: (line: string) => void;
+  /**
+   * `CTL2-L2`: ends the process once a signal's shutdown has run — `0`, or
+   * {@link EXIT_CODES.stopFailed} — so nothing still referenced (a connection
+   * a frozen database holds, a trader health read still within its bound) can
+   * keep a stopped process alive. The shipped process passes `process.exit`;
+   * a suite that runs `startup()` in its own process passes a spy or nothing.
+   */
+  readonly exit?: (code: number) => void;
 }
 
 /**
@@ -541,35 +697,14 @@ export async function startup(
   );
 
   const shutdown = (): void => {
-    void (async (): Promise<void> => {
-      let failure: unknown;
-      try {
-        await server.close();
-      } catch (cause) {
-        failure = cause;
-      }
-      // `CONTROL-2` r1: the reader's pool, whatever the server did, and
-      // bounded — a connection a frozen server still holds must not hold the
-      // shutdown with it.
-      const closed = await settlesWithin(
-        halts.close().catch((cause: unknown) => {
-          failure ??= cause;
-        }),
-        TRADER_HALTS_CLOSE_WAIT_MS,
-      );
-      if (!closed) {
-        ports.log(
-          `trader halts: the ops.incidents pool did not close within ${String(TRADER_HALTS_CLOSE_WAIT_MS)}ms; ` +
-            "not waiting for it",
-        );
-      }
-      if (failure === undefined) {
-        ports.log("control API stopped.");
-      } else {
-        const said = describeCause(failure);
-        ports.log(`control API stop failed: ${haltsPlan.kind === "postgres" ? redactDatabaseUrl(said, haltsPlan.url) : said}`);
-      }
-    })();
+    void shutdownControlApi({
+      closeServer: () => server.close(),
+      closeHalts: () => halts.close(),
+      terminateHalts: () => halts.terminate(),
+      log: ports.log,
+      redact: (text) => (haltsPlan.kind === "postgres" ? redactDatabaseUrl(text, haltsPlan.url) : text),
+      ...(ports.exit === undefined ? {} : { exit: ports.exit }),
+    });
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
@@ -588,6 +723,10 @@ if (invokedDirectly || process.env["CONTROL_API_MAIN"] === "1") {
       readConfig: (path) => readFile(path, "utf8"),
       log: (line) => {
         process.stdout.write(`${line}\n`);
+      },
+      // `CTL2-L2`: a signal's shutdown ends the process once it has run.
+      exit: (exitCode) => {
+        process.exit(exitCode);
       },
     },
     { serve: !argv.includes("--check") },

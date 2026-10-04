@@ -35,7 +35,7 @@
  * | --- | --- |
  * | `OPEN` | the most recent read passed the door and counted at least one open row |
  * | `NONE_OPEN` | the most recent read passed the door and counted none |
- * | `UNKNOWN` | no read yet; or the most recent read failed, timed out, or was refused by the door |
+ * | `UNKNOWN` | no read yet; or the most recent read failed, timed out, or was refused by the door; or (`CTL2-F1`) THIS request's read had not settled by the API's answer deadline |
  * | `NOT_CONFIGURED` | this composition reads no `ops.incidents` ({@link AbsentTraderHaltSource}) |
  *
  * NOTHING IS RETAINED ACROSS A FAILED READ. A count from an earlier read is not
@@ -44,6 +44,13 @@
  * result the door refuses and a source that throws are each `UNKNOWN`, and the
  * open-halt counts are ABSENT until a read succeeds again. `NOT_CONFIGURED` is
  * not `NONE_OPEN` either: it says this process cannot see the rows.
+ *
+ * NOR IS AN EARLIER READ REPORTED WHILE THIS ONE IS OUTSTANDING (`CTL2-F1`).
+ * The API answers by its answer deadline (`api.ts`, `READ_REFRESH_DEADLINE_MS`)
+ * whatever its reads do, so a Prometheus scrape is never abandoned; an answer
+ * given while this request's read is still in flight renders
+ * {@link overdueTraderHaltView} — `UNKNOWN`, reason `OVERDUE` — not the cache's
+ * view, which is an EARLIER read's and could say `NONE_OPEN`.
  *
  * `NONE_OPEN` is "no open row", not "no halt": a halt whose record could not
  * land — the trader logged `HALT RECORD NOT DURABLE` or `HALT RECORD
@@ -486,11 +493,32 @@ export type TraderHaltView =
   | { readonly state: "OPEN" | "NONE_OPEN"; readonly halts: OpenTraderHalts }
   | {
       readonly state: "UNKNOWN";
-      readonly reason: "NOT_READ" | "UNAVAILABLE" | "REFUSED";
+      /** `OVERDUE` (`CTL2-F1`) is never stored: it is {@link overdueTraderHaltView}, rendered for one answer. */
+      readonly reason: "NOT_READ" | "UNAVAILABLE" | "REFUSED" | "OVERDUE";
       readonly detail: string;
       readonly issues: readonly string[];
     }
   | { readonly state: "NOT_CONFIGURED"; readonly detail: string };
+
+/**
+ * `CTL2-F1`: what an answer renders when THIS request's read had not settled by
+ * the API's answer deadline (`api.ts`, `READ_REFRESH_DEADLINE_MS`): `UNKNOWN`,
+ * reason `OVERDUE`. The cache's view at that moment is an EARLIER read's, and
+ * rendering it would carry that read's `NONE_OPEN` — "no halts" — while this
+ * read is outstanding. It is not stored in the cache and not counted as a read:
+ * the read is still in flight, and the cache records and counts it when it
+ * settles.
+ */
+export function overdueTraderHaltView(deadlineMs: number): TraderHaltView {
+  return Object.freeze({
+    state: "UNKNOWN" as const,
+    reason: "OVERDUE" as const,
+    detail:
+      `this request's read of ops.incidents had not settled within the ${String(deadlineMs)} ms answer deadline; it is ` +
+      "still in flight, and a later read reports what it found",
+    issues: Object.freeze([]),
+  });
+}
 
 function bounded(detail: string): string {
   return detail.length > TRADER_HALT_DETAIL_MAX ? `${detail.slice(0, TRADER_HALT_DETAIL_MAX)}…` : detail;
@@ -599,10 +627,11 @@ const STATE_NOTES: Readonly<Record<TraderHaltState, string>> = Object.freeze({
 
 /**
  * The `traderHalts` section of `GET /v1/health`: plain own data, so the
- * response encoder serializes it exactly (`api.ts`, `json`).
+ * response encoder serializes it exactly (`api.ts`, `json`). `view` is the
+ * cache's own unless the answer renders {@link overdueTraderHaltView}
+ * (`CTL2-F1`).
  */
-export function traderHaltsDocument(cache: TraderHaltCache): Readonly<Record<string, unknown>> {
-  const view = cache.view();
+export function traderHaltsDocument(cache: TraderHaltCache, view: TraderHaltView = cache.view()): Readonly<Record<string, unknown>> {
   const base = {
     state: view.state,
     configured: cache.configured,
@@ -651,11 +680,12 @@ export function traderHaltsDocument(cache: TraderHaltCache): Readonly<Record<str
 
 /**
  * The samples of the three trader-halt families (`PLATFORM_METRIC_FAMILIES`,
- * category `halts`) for the cache's current view: the state always, one
- * sample per state; the open counts only after a read that succeeded.
+ * category `halts`) for the cache's current view — or, for an answer given
+ * before this request's read settled, {@link overdueTraderHaltView}
+ * (`CTL2-F1`): the state always, one sample per state; the open counts only
+ * after a read that succeeded.
  */
-export function traderHaltSamples(cache: TraderHaltCache): readonly PlatformMetricSample[] {
-  const view = cache.view();
+export function traderHaltSamples(cache: TraderHaltCache, view: TraderHaltView = cache.view()): readonly PlatformMetricSample[] {
   const samples: PlatformMetricSample[] = TRADER_HALT_STATES.map((state) => ({
     name: "control_trader_halts_state",
     value: state === view.state ? 1 : 0,

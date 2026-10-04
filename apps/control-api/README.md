@@ -628,6 +628,14 @@ Since `PROVENANCE-1` every halt whose record lands leaves an open
 - **When.** On every AUTHORIZED health or metrics read, single-flight, bounded
   by the source's timeout — the trader-health convention ("Refresh-on-read",
   `api.ts`). An anonymous or unauthorized caller causes no read.
+- **Answered by a deadline** (`CTL2-F1`). Every authorized health or metrics
+  read answers within 8 s (`READ_REFRESH_DEADLINE_MS`, `api.ts`, "The answer
+  deadline"), whatever its trader-health refresh and its halt read do. A
+  refresh still in flight then is answered as not current: the halts are
+  `UNKNOWN` (reason `OVERDUE`), never an earlier read's `NONE_OPEN`, and
+  `control_trader_health_current` is 0. Without the deadline a slow trader or
+  database held the answer past Prometheus's scrape timeout: the scrape was
+  abandoned, `UNKNOWN` never reached Prometheus, and nothing paged.
 - **Fail closed.** Four states: `OPEN`, `NONE_OPEN`, `UNKNOWN` (no read yet, a
   failed or timed-out read, or a result the door refused) and `NOT_CONFIGURED`.
   `NONE_OPEN` comes only from a read that succeeded; nothing is retained across
@@ -655,8 +663,23 @@ Since `PROVENANCE-1` every halt whose record lands leaves an open
   starts without a database.
 - `{ "kind": "postgres", "timeoutMs": 2000 }` reads `ops.incidents` on every
   authorized health and metrics read, each read bounded by `timeoutMs` (1 to
-  60000): the server cancels a statement at the bound, and the read answers
+  5000): the server cancels a statement at the bound, and the read answers
   `UNKNOWN` at it whatever the server does.
+
+**Three bounds, in one order** (`CTL2-F1`; pinned by
+`test/integration/control-api/trader-halt-shape.test.ts`):
+
+| Bound | Value | Where |
+| --- | --- | --- |
+| the halt read's longest `timeoutMs` | 5 s | `TRADER_HALT_READ_TIMEOUT_MAX_MS`, `src/adapters/postgres-trader-halts.ts` |
+| the API's answer deadline | 8 s | `READ_REFRESH_DEADLINE_MS`, `src/api.ts` |
+| the control-api job's `scrape_timeout` | 10 s, stated | `infra/prometheus/control-api-scrape.yaml` |
+
+A deployment that scrapes this API must give the job a `scrape_timeout` above
+8 s, as the fragment does; with a shorter one, a slow read again abandons the
+scrape and silences `TraderHaltOpenOrUnknown`. `traderHealth.timeoutMs` may
+still be up to 60 s: a trader read slower than the deadline is answered as not
+current, and the halts are answered without it.
 
 The database URL is not a configuration field, because it carries a
 credential. It comes from ONE environment variable,
@@ -668,11 +691,24 @@ held the URL or its password would reach either with them replaced by
 like libpq, fills a component the URL omits from the `PG*` environment
 variables (`PGPASSWORD`, `PGHOST`, `PGSSLMODE`, …), the password file
 (`~/.pgpass`) or the process user, so the URL must name a user, a password, a
-host and a database, and a `PG*` variable in the environment is refused. The
-process refuses to start (exit 78), naming the variable and never its value,
-when `postgres` has no URL, when the URL is not a PostgreSQL URL or omits one
-of those four, when a `PG*` variable is set, and when the URL variable is set
-while `traderHalts.kind` is `none`.
+host and a database, and a `PG*` variable in the environment is refused.
+
+Its AUTHORITY is the only source of the credential and the host
+(`CONTROL2-R1-C2`). The driver reads every query parameter as a connection
+parameter, and one there replaces the URL's own: `?password=` would be the
+password the driver sends, while the redaction above covers the one before the
+`@`; `?options=` or `?application_name=` would replace the session's. So the
+query may hold one `sslmode`, `disable` (a loopback database) or `verify-full`,
+and nothing else. The driver's other modes are refused: it treats `prefer`,
+`require` and `verify-ca` as aliases of `verify-full` (and warns that its next
+major version weakens them), and `no-verify` would send the password to a
+server whose certificate nobody checked.
+
+The process refuses to start (exit 78), naming the variable and never its
+value, when `postgres` has no URL, when the URL is not a PostgreSQL URL or
+omits one of those four, when its query holds anything but one `sslmode`, when
+a `PG*` variable is set, and when the URL variable is set while
+`traderHalts.kind` is `none`.
 
 **The deployment's duty: a role that can read `ops.incidents` and nothing
 else.** Give the URL a role of its own, with `USAGE` on the schema `ops` and
@@ -691,6 +727,15 @@ The reader's pool holds at most two connections, named
 `polymarket-bot-control-api` in `pg_stat_activity`; a connection that fails
 while idle is logged (redacted) and dropped, and the next read opens another.
 
+**Stopping** (`CTL2-L2`). On SIGTERM or SIGINT the process closes its server,
+then the pool. A database that froze mid-statement holds its connection, and
+with it the pool: after 5 s (`TRADER_HALTS_CLOSE_WAIT_MS`) the process ENDS the
+connections the pool still holds, which destroys a socket whose statement is
+outstanding, and waits 1 s more (`TRADER_HALTS_TERMINATE_WAIT_MS`). Then it
+exits: 0 when everything closed, 1 (`EXIT_CODES.stopFailed`) when something did
+not, with `control API stop failed: …` (redacted) in its log. Nothing still
+referenced keeps a stopped process alive.
+
 **Proven** against a real PostgreSQL by the opt-in suite
 (`pnpm --filter @polymarket-bot/control-api test:integration:postgres`, with
 Docker; CI does not run it yet):
@@ -704,6 +749,12 @@ Docker; CI does not run it yet):
   `postgres` through a role holding only the privileges above, against a
   database holding an open `TRADER_HALT` row: its `/v1/health` and
   `/v1/metrics` say `OPEN`.
+
+Without a container, `test/integration/control-api/trader-halt-shape.test.ts`
+runs the shipped `startup()` and the SHIPPED bundle against loopback servers
+that stand in for a database that froze and a trader that never answers: the
+scrape is answered `UNKNOWN 1` inside the scrape timeout (`CTL2-F1`), and
+SIGTERM exits 0 within the stop's bounds (`CTL2-L2`).
 
 ## The PostgreSQL sink: reached by an opt-in suite, bound by no composition (disclosed)
 

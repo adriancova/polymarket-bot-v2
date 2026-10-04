@@ -81,6 +81,11 @@ export interface HarnessOptions {
    * did not before.
    */
   readonly traderHaltSource?: TraderHaltSource;
+  /**
+   * `CTL2-F1`: the API's answer deadline (`ControlApiOptions.refreshDeadlineMs`).
+   * Absent: the shipped default, `READ_REFRESH_DEADLINE_MS`.
+   */
+  readonly refreshDeadlineMs?: number;
 }
 
 export interface Harness {
@@ -144,6 +149,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     auditCapacity: options.auditCapacity ?? 64,
     auditSize: () => audit.size,
     traderHalts,
+    ...(options.refreshDeadlineMs === undefined ? {} : { refreshDeadlineMs: options.refreshDeadlineMs }),
   });
 
   return { api, controlPlane, audit, auditBudget, health, healthSource, environment, traderHalts, traderHaltSource };

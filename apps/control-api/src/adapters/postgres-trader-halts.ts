@@ -39,7 +39,10 @@
  *   never holds the process open) answers `UNAVAILABLE` at the bound. The
  *   abandoned statement's eventual outcome is swallowed; its connection is the
  *   pool's to end (`createPostgresPool`'s connection timeout and the server's
- *   own `statement_timeout`), and a later read takes another one.
+ *   own `statement_timeout`), and a later read takes another one. A server
+ *   that froze mid-statement never ends it: at shutdown `main.ts` ends every
+ *   connection the pool still holds once its bounded wait expires, and `pg`
+ *   destroys the socket of one with a statement outstanding (`CTL2-L2`).
  *
  * Every failure is DATA (`{ fetched: false }`), never a throw: a control API
  * whose database is down keeps serving its controls, and says the halts are
@@ -75,8 +78,20 @@ import {
   type TraderHaltSource,
 } from "../trader-halts.js";
 
-/** The longest bound a read may be given: a health read is not a report query. */
-export const TRADER_HALT_READ_TIMEOUT_MAX_MS = 60_000;
+/**
+ * The longest bound a read may be given: a health read is not a report query.
+ *
+ * `CTL2-F1`: 5 s, below the API's answer deadline (`api.ts`,
+ * `READ_REFRESH_DEADLINE_MS`, 8 s), which is itself below the control-api
+ * scrape job's explicit `scrape_timeout` (10 s,
+ * `infra/prometheus/control-api-scrape.yaml`). Until `CTL2-F1` it was 60 s, so a
+ * read bound the configuration accepted could outlast the scrape: the scrape
+ * was abandoned and the read's `UNKNOWN` never reached the page. Capped here,
+ * a read that keeps its bound has settled before the answer is due.
+ * `test/integration/control-api/trader-halt-shape.test.ts` pins the order of
+ * the three.
+ */
+export const TRADER_HALT_READ_TIMEOUT_MAX_MS = 5_000;
 
 /** The ISO-8601 UTC rendering the server applies to `opened_at` (microseconds, `Z`). */
 const ISO_UTC_FORMAT = 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"';

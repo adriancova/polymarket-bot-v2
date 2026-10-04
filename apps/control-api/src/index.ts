@@ -112,6 +112,7 @@ export {
   TRADER_HALT_STATES,
   TraderHaltCache,
   inTraderHaltNamespace,
+  overdueTraderHaltView,
   readTraderHaltFetch,
   traderHaltSamples,
   traderHaltScopeOf,
@@ -136,6 +137,7 @@ export {
   MODE_RAISE_REASON_MAX_METHOD,
   MODE_RAISE_REASON_MAX_PATH,
   MUTATION_GRANTS,
+  READ_REFRESH_DEADLINE_MS,
   holdsMutationAuthority,
 } from "./api.js";
 

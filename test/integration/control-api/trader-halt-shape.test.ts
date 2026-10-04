@@ -27,7 +27,16 @@
  * 5. **The PAGE rule and the panel** (`CONTROL-2` r1, S1): the rule in
  *    `infra/prometheus/trader-alerts.yaml`, evaluated against the bodies this
  *    API renders in each state, fires on OPEN and UNKNOWN only; the
- *    operations dashboard's panel binds all three families.
+ *    operations dashboard's panel binds all three families, each target an
+ *    INSTANT query (`CTL2-L1`).
+ * 6. **A slow read cannot silence the page** (`CTL2-F1`): the control-api
+ *    scrape job states its `scrape_timeout`, above the API's answer deadline,
+ *    above the halt read's longest bound; and the shipped `startup()`, with a
+ *    trader that never answers and a database that froze, answers
+ *    `/v1/metrics` inside that timeout with `UNKNOWN 1`.
+ * 7. **A frozen database cannot hold the stop** (`CTL2-L2`): the shipped
+ *    `startup()` ends the pool's connections at the close bound and tells the
+ *    process to exit; the SHIPPED bundle, run with `node`, exits 0 on SIGTERM.
  *
  * The shipped BUNDLE itself — built by the `build` script and run with
  * `node` — is driven against a real PostgreSQL in
@@ -36,17 +45,18 @@
 
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
   AbsentTraderHaltSource,
   InMemoryTraderHaltSource,
+  READ_REFRESH_DEADLINE_MS,
   TRADER_HALT_INCIDENT_KEYS,
   TRADER_HALT_STATES,
   TraderHaltCache,
@@ -58,10 +68,23 @@ import { traderHaltFetch } from "@polymarket-bot/control-api/testing";
 import { PLATFORM_METRIC_FAMILIES, renderExpositionFor } from "@polymarket-bot/observability";
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
-import { PostgresTraderHaltSource } from "../../../apps/control-api/src/adapters/postgres-trader-halts.js";
-import { TRADER_HALTS_DATABASE_URL_ENV, startup } from "../../../apps/control-api/src/main.js";
+import { PostgresTraderHaltSource, TRADER_HALT_READ_TIMEOUT_MAX_MS } from "../../../apps/control-api/src/adapters/postgres-trader-halts.js";
+import {
+  TRADER_HALTS_CLOSE_WAIT_MS,
+  TRADER_HALTS_DATABASE_URL_ENV,
+  TRADER_HALTS_TERMINATE_WAIT_MS,
+  startup,
+} from "../../../apps/control-api/src/main.js";
 import { HALT_INCIDENT_KEYS, haltIncidentRows } from "../../../apps/trader/src/halt-record.js";
 import { serveControlApi, type ServedApi } from "./support/client.js";
+import {
+  REPO_ROOT,
+  SAFE_PAPER_ENVIRONMENT,
+  buildShippedBundle,
+  removeBundle,
+  startShippedBundle,
+  type BuiltBundle,
+} from "./support/shipped-bundle.js";
 
 const TOKEN = "fake-paper-operator-token-not-a-credential-ctl2-0001";
 const OPERATORS = [{ operatorId: "ctl2-reader", token: TOKEN, grants: ["READ" as const] }];
@@ -336,6 +359,56 @@ async function echoingPostgres(): Promise<{ readonly port: number; readonly clos
   };
 }
 
+/**
+ * `CTL2-L2` / `CTL2-F1`: a loopback "PostgreSQL" that completes the startup
+ * handshake (AuthenticationOk, then ReadyForQuery) and then never answers a
+ * statement — a server that froze mid-session. A connection to it stays
+ * checked out, holding a statement outstanding; `open()` counts the client
+ * sockets still open.
+ */
+async function frozenPostgres(): Promise<{ readonly port: number; readonly open: () => number; readonly close: () => Promise<void> }> {
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => undefined);
+    socket.on("close", () => sockets.delete(socket));
+    let buffer = Buffer.alloc(0);
+    let started = false;
+    socket.on("data", (chunk: Buffer) => {
+      // After the handshake every statement is swallowed: the server is frozen.
+      if (started) return;
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 4 || buffer.length < buffer.readInt32BE(0)) return;
+      started = true;
+      const ok = Buffer.alloc(9);
+      ok.write("R", 0, "latin1");
+      ok.writeInt32BE(8, 1);
+      ok.writeInt32BE(0, 5);
+      const ready = Buffer.alloc(6);
+      ready.write("Z", 0, "latin1");
+      ready.writeInt32BE(5, 1);
+      ready.write("I", 5, "latin1");
+      socket.write(Buffer.concat([ok, ready]));
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", () => resolveListen()));
+  const address = server.address();
+  return {
+    port: typeof address === "object" && address !== null ? address.port : 0,
+    open: () => sockets.size,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    },
+  };
+}
+
+/** Polls `condition` every 20 ms until it holds or `ms` pass. */
+async function until(condition: () => boolean, ms: number): Promise<boolean> {
+  for (const began = Date.now(); Date.now() - began < ms; await sleep(20)) if (condition()) return true;
+  return condition();
+}
+
 describe("the SHIPPED startup() composes the trader-halt source its configuration names (CONTROL-2 r1)", () => {
   let directory = "";
   afterEach(async () => {
@@ -343,11 +416,16 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
     directory = "";
   });
 
-  /** Runs `startup()` serving, with `traderHalts` and `env`; returns its log, its port, and a stop. */
+  /**
+   * Runs `startup()` serving, with `traderHalts` and `env`; returns its log, its port, and a stop that
+   * waits up to `stopWaitMs` for "control API stopped.". `traderHealth` defaults to `none`; `exit` is the
+   * `CTL2-L2` port (absent: nothing is told to exit, as before).
+   */
   async function started(
     traderHalts: unknown,
     env: Record<string, string | undefined>,
-  ): Promise<{ readonly lines: string[]; readonly port: number; readonly stop: () => Promise<void> }> {
+    extra: { readonly traderHealth?: unknown; readonly exit?: (code: number) => void } = {},
+  ): Promise<{ readonly lines: string[]; readonly port: number; readonly stop: (stopWaitMs?: number) => Promise<void> }> {
     directory = await mkdtemp(join(tmpdir(), "ctl2-control-api-"));
     const configPath = join(directory, "control-api.json");
     await writeFile(
@@ -358,7 +436,7 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
         maxRequestBodyBytes: 65_536,
         auditCapacity: 64,
         auditSafetyReserve: 4,
-        traderHealth: { kind: "none" },
+        traderHealth: extra.traderHealth ?? { kind: "none" },
         traderHalts,
         operators: OPERATORS.map((operator) => ({ ...operator, grants: [...operator.grants] })),
       }),
@@ -375,6 +453,7 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
         log: (line) => {
           lines.push(line);
         },
+        ...(extra.exit === undefined ? {} : { exit: extra.exit }),
       },
       { serve: true },
     );
@@ -385,10 +464,10 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
     return {
       lines,
       port,
-      stop: async () => {
+      stop: async (stopWaitMs = 2_000) => {
         expect(process.listenerCount("SIGINT")).toBe(1);
         process.emit("SIGINT");
-        for (let i = 0; i < 100 && !lines.includes("control API stopped."); i += 1) await sleep(20);
+        await until(() => lines.includes("control API stopped."), stopWaitMs);
         expect(lines).toContain("control API stopped.");
         // The SIGTERM handler this startup added, and only it.
         for (const listener of process.listeners("SIGTERM")) if (!sigterm.includes(listener)) process.removeListener("SIGTERM", listener);
@@ -506,6 +585,84 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
       await new Promise<void>((resolveClose) => silent.close(() => resolveClose()));
     }
   }, 30_000);
+
+  it("CTL2-F1: a trader that never answers (traderHealth bound 30 s) and a database that froze — /v1/metrics is still answered INSIDE the scrape timeout, UNKNOWN 1, which pages", async () => {
+    const scrapeTimeoutMs = controlApiScrapeTimeoutMs();
+    const traderSockets = new Set<Socket>();
+    const silentTrader = createHttpServer(() => undefined);
+    silentTrader.on("connection", (socket: Socket) => {
+      traderSockets.add(socket);
+    });
+    await new Promise<void>((resolveListen) => silentTrader.listen(0, "127.0.0.1", () => resolveListen()));
+    const traderAddress = silentTrader.address();
+    const traderPort = typeof traderAddress === "object" && traderAddress !== null ? traderAddress.port : 0;
+    const frozen = await frozenPostgres();
+    const run = await started(
+      { kind: "postgres", timeoutMs: 400 },
+      { [TRADER_HALTS_DATABASE_URL_ENV]: `postgres://halt_reader:not-a-credential@127.0.0.1:${String(frozen.port)}/x` },
+      { traderHealth: { kind: "http", url: `http://127.0.0.1:${String(traderPort)}/health`, timeoutMs: 30_000 } },
+    );
+    try {
+      const began = Date.now();
+      // A scrape: it gives up at the job's scrape_timeout, as Prometheus does.
+      const metrics = await get(run.port, "/v1/metrics", scrapeTimeoutMs);
+      const elapsed = Date.now() - began;
+      expect(metrics.status).toBe(200);
+      expect(elapsed).toBeLessThan(scrapeTimeoutMs);
+      // It waited for the trader until the answer deadline, and no longer.
+      expect(elapsed).toBeGreaterThanOrEqual(READ_REFRESH_DEADLINE_MS - 100);
+      expect(metrics.body).toContain('control_trader_halts_state{state="UNKNOWN"} 1');
+      expect(metrics.body).toContain('control_trader_halts_state{state="NONE_OPEN"} 0');
+      expect(metrics.body).not.toContain("control_trader_halts_open");
+      expect(metrics.body).toContain("control_trader_health_current 0");
+      expect(traderSockets.size).toBeGreaterThan(0);
+      expect(frozen.open()).toBeGreaterThan(0);
+    } finally {
+      for (const socket of traderSockets) socket.destroy();
+      await new Promise<void>((resolveClose) => silentTrader.close(() => resolveClose()));
+      await frozen.close();
+      await run.stop(TRADER_HALTS_CLOSE_WAIT_MS + TRADER_HALTS_TERMINATE_WAIT_MS + 2_000);
+    }
+  }, 60_000);
+
+  it("CTL2-L2: a database that froze mid-statement does not hold the stop — the pool's connections are ENDED at the close bound, and the process is told to exit 0", async () => {
+    const frozen = await frozenPostgres();
+    const exits: number[] = [];
+    const run = await started(
+      { kind: "postgres", timeoutMs: 400 },
+      { [TRADER_HALTS_DATABASE_URL_ENV]: `postgres://halt_reader:not-a-credential@127.0.0.1:${String(frozen.port)}/x` },
+      { exit: (code) => exits.push(code) },
+    );
+    try {
+      const health = JSON.parse((await get(run.port, "/v1/health")).body) as { traderHalts: Record<string, unknown> };
+      expect(health.traderHalts["state"]).toBe("UNKNOWN");
+      expect(String(health.traderHalts["detail"])).toContain("did not answer within 400 ms");
+      // The abandoned read's connection: checked out, its statement outstanding, the server silent.
+      expect(frozen.open()).toBe(1);
+      const began = Date.now();
+      await run.stop(TRADER_HALTS_CLOSE_WAIT_MS + 4_000);
+      const elapsed = Date.now() - began;
+      // The frozen server saw the connection go: the process ended it.
+      expect(await until(() => frozen.open() === 0, 1_000), "the frozen server's connection is still open").toBe(true);
+      const said = run.lines.join("\n");
+      expect(said).toContain(
+        `the ops.incidents pool did not close within ${String(TRADER_HALTS_CLOSE_WAIT_MS)}ms; ending the 1 connection(s) it still holds`,
+      );
+      expect(said).not.toContain("stop failed");
+      expect(exits).toEqual([0]);
+      expect(elapsed).toBeLessThan(TRADER_HALTS_CLOSE_WAIT_MS + TRADER_HALTS_TERMINATE_WAIT_MS + 1_000);
+    } finally {
+      await frozen.close();
+    }
+  }, 30_000);
+
+  it("CTL2-L2: a clean stop is told to exit 0 once, after it says it stopped", async () => {
+    const exits: number[] = [];
+    const run = await started({ kind: "none" }, {}, { exit: (code) => exits.push(code) });
+    await run.stop();
+    expect(exits).toEqual([0]);
+    expect(run.lines.at(-1)).toBe("control API stopped.");
+  }, 30_000);
 });
 
 describe("CONTROL-2 r1 (S1): the PAGE rule and the operations panel read the platform's trader-halt families", () => {
@@ -568,9 +725,105 @@ describe("CONTROL-2 r1 (S1): the PAGE rule and the operations panel read the pla
     }
     expect(panel?.description).toContain("TraderHaltOpenOrUnknown");
   });
+
+  it("CTL2-L1: every target of the halt panel is an INSTANT query — a target Prometheus is not scraping shows nothing, never an earlier NONE_OPEN", () => {
+    const dashboard = JSON.parse(readFileSync(resolve(repoRoot, "infra/grafana/control/operations-dashboard.json"), "utf8")) as {
+      panels: { title?: string; type?: string; targets?: { refId?: string; expr?: string; instant?: unknown }[] }[];
+    };
+    const panel = dashboard.panels.find((entry) => entry.title === "Open trader halts (ops.incidents)");
+    expect(panel?.type).toBe("stat");
+    const targets = panel?.targets ?? [];
+    expect(targets.map((target) => target.refId)).toEqual(["A", "B", "C"]);
+    for (const target of targets) expect(target.instant, `${target.refId ?? ""} ${target.expr ?? ""}`).toBe(true);
+  });
+
+  it("CTL2-F1: the control-api job STATES its scrape_timeout (10 s), above the API's answer deadline (8 s, with room), above the halt read's longest bound (5 s) — within its interval", () => {
+    const scrapeTimeoutMs = controlApiScrapeTimeoutMs();
+    expect(scrapeTimeoutMs).toBe(10_000);
+    expect(READ_REFRESH_DEADLINE_MS).toBe(8_000);
+    expect(READ_REFRESH_DEADLINE_MS + 2_000).toBeLessThanOrEqual(scrapeTimeoutMs);
+    expect(TRADER_HALT_READ_TIMEOUT_MAX_MS).toBe(5_000);
+    expect(TRADER_HALT_READ_TIMEOUT_MAX_MS + 2_000).toBeLessThanOrEqual(READ_REFRESH_DEADLINE_MS);
+    expect(scrapeTimeoutMs).toBeLessThanOrEqual(seconds(controlApiJob(), "scrape_interval"));
+  });
 });
 
-function get(port: number, path: string): Promise<{ status: number; body: string }> {
+describe("CTL2-L2: the SHIPPED bundle, run with node, exits on SIGTERM while a frozen database holds its connection", () => {
+  let bundle: BuiltBundle | undefined;
+  let directory = "";
+  beforeAll(async () => {
+    bundle = await buildShippedBundle();
+    directory = await mkdtemp(join(tmpdir(), "ctl2-l2-bundle-"));
+  }, 120_000);
+  afterAll(async () => {
+    removeBundle(bundle);
+    if (directory !== "") await rm(directory, { recursive: true, force: true });
+  });
+
+  it("SIGTERM: the pool's connection is ended at the close bound, and the process exits 0 — it does not wait for the database", async () => {
+    const frozen = await frozenPostgres();
+    const config = join(directory, "control-api.json");
+    await writeFile(
+      config,
+      JSON.stringify({
+        bindHost: "127.0.0.1",
+        bindPort: 0,
+        maxRequestBodyBytes: 65_536,
+        auditCapacity: 64,
+        auditSafetyReserve: 4,
+        traderHealth: { kind: "none" },
+        traderHalts: { kind: "postgres", timeoutMs: 400 },
+        operators: OPERATORS.map((operator) => ({ ...operator, grants: [...operator.grants] })),
+      }),
+      "utf8",
+    );
+    const running = await startShippedBundle(bundle?.file ?? "", {
+      ...SAFE_PAPER_ENVIRONMENT,
+      CONTROL_API_CONFIG: config,
+      [TRADER_HALTS_DATABASE_URL_ENV]: `postgres://halt_reader:not-a-credential@127.0.0.1:${String(frozen.port)}/x`,
+    });
+    try {
+      const health = JSON.parse((await get(running.port, "/v1/health")).body) as { traderHalts: Record<string, unknown> };
+      expect(health.traderHalts["state"]).toBe("UNKNOWN");
+      expect(frozen.open()).toBe(1);
+      const began = Date.now();
+      // SIGTERM, and SIGKILL only if it is still alive well past both bounds.
+      const exit = await running.stop(TRADER_HALTS_CLOSE_WAIT_MS + 5_000);
+      const elapsed = Date.now() - began;
+      expect(exit.signal, exit.stdout).toBeNull();
+      expect(exit.code, exit.stdout).toBe(0);
+      expect(exit.stdout).toContain("ending the 1 connection(s) it still holds");
+      expect(exit.stdout).toContain("control API stopped.");
+      expect(elapsed).toBeLessThan(TRADER_HALTS_CLOSE_WAIT_MS + TRADER_HALTS_TERMINATE_WAIT_MS + 2_000);
+    } finally {
+      if (running.alive()) await running.stop(0);
+      await frozen.close();
+    }
+  }, 60_000);
+});
+
+/** The `control-api` job of `infra/prometheus/control-api-scrape.yaml`, comments removed. */
+function controlApiJob(): string {
+  const source = readFileSync(resolve(REPO_ROOT, "infra/prometheus/control-api-scrape.yaml"), "utf8")
+    .split("\n")
+    .filter((line) => !/^\s*#/u.test(line))
+    .join("\n");
+  return /- job_name: "control-api"\n[\s\S]*?(?=\n {2}- job_name: |$)/u.exec(source)?.[0] ?? "";
+}
+
+/** A `<key>: <n>s` duration of the job, in milliseconds; NaN when the job does not state it. */
+function seconds(job: string, key: string): number {
+  const value = new RegExp(`^ +${key}: (\\d+)s$`, "mu").exec(job)?.[1];
+  return value === undefined ? Number.NaN : Number(value) * 1_000;
+}
+
+/** The control-api job's stated `scrape_timeout`, in milliseconds (NaN when it relies on the default). */
+function controlApiScrapeTimeoutMs(): number {
+  return seconds(controlApiJob(), "scrape_timeout");
+}
+
+/** An authorized GET; with `timeoutMs`, it gives up (rejects) when no complete answer has arrived by then — as a scrape does. */
+function get(port: number, path: string, timeoutMs?: number): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
       { host: "127.0.0.1", port, path, method: "GET", headers: { authorization: `Bearer ${TOKEN}` } },
@@ -581,6 +834,10 @@ function get(port: number, path: string): Promise<{ status: number; body: string
       },
     );
     req.on("error", reject);
+    if (timeoutMs !== undefined) {
+      const timer = setTimeout(() => req.destroy(new Error(`no answer to GET ${path} within ${String(timeoutMs)} ms`)), timeoutMs);
+      req.on("close", () => clearTimeout(timer));
+    }
     req.end();
   });
 }

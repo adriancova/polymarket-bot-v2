@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { TRADER_HALT_READ_TIMEOUT_MAX_MS } from "./adapters/postgres-trader-halts.js";
 import { LOOPBACK_HOSTS, MINIMUM_TOKEN_LENGTH, parseControlApiConfig } from "./config.js";
 
 const TOKEN = "fake-paper-operator-token-not-a-credential-0001";
@@ -257,8 +258,8 @@ describe("the door's own properties", () => {
 });
 
 describe("CONTROL-2 r1: the trader halt source is a required, closed choice", () => {
-  it("ACCEPTS none, and postgres with a bound from 1 to 60000 ms — and the database URL is NOT a field", () => {
-    for (const timeoutMs of [1, 2_000, 60_000]) {
+  it("ACCEPTS none, and postgres with a bound from 1 to 5000 ms — and the database URL is NOT a field", () => {
+    for (const timeoutMs of [1, 2_000, 5_000]) {
       const result = parseControlApiConfig(document({ traderHalts: { kind: "postgres", timeoutMs } }));
       expect(result.ok, String(timeoutMs)).toBe(true);
       if (result.ok) expect({ ...result.config.traderHalts }).toEqual({ kind: "postgres", timeoutMs });
@@ -273,6 +274,9 @@ describe("CONTROL-2 r1: the trader halt source is a required, closed choice", ()
     { kind: "postgres" },
     { kind: "postgres", timeoutMs: 0 },
     { kind: "postgres", timeoutMs: 60_001 },
+    // `CTL2-F1`: a bound the configuration accepted could outlast the scrape; 5000 ms is the most.
+    { kind: "postgres", timeoutMs: 5_001 },
+    { kind: "postgres", timeoutMs: 10_000 },
     { kind: "postgres", timeoutMs: 1.5 },
     { kind: "postgres", timeoutMs: "2000" },
     { kind: "none", timeoutMs: 2_000 },
@@ -283,6 +287,14 @@ describe("CONTROL-2 r1: the trader halt source is a required, closed choice", ()
     null,
   ])("REFUSES traderHalts=%j at the schema", (traderHalts) => {
     expect(codes(document({ traderHalts }))).toEqual(["CONTROL_CONFIG_INVALID"]);
+  });
+
+  it("CTL2-F1: the halt read's longest bound is 5000 ms, and the door refuses the next millisecond", () => {
+    expect(TRADER_HALT_READ_TIMEOUT_MAX_MS).toBe(5_000);
+    expect(parseControlApiConfig(document({ traderHalts: { kind: "postgres", timeoutMs: TRADER_HALT_READ_TIMEOUT_MAX_MS } })).ok).toBe(true);
+    expect(codes(document({ traderHalts: { kind: "postgres", timeoutMs: TRADER_HALT_READ_TIMEOUT_MAX_MS + 1 } }))).toEqual([
+      "CONTROL_CONFIG_INVALID",
+    ]);
   });
 
   it("does not adopt an INHERITED traderHalts (ADR-020: a required field is own data)", () => {
