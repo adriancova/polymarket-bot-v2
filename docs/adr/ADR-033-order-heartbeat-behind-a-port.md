@@ -21,26 +21,42 @@
   venue round: the guide and the API reference disagree (Context 3).
 - **Code cited:** `main` at `85b81e5`. `WP-290`'s coordinator is cited on
   the `wp-290` branch at `1dc6672`, not yet merged. Each cited behavior
-  still holds at the branch tip `ba150f5`.
-- **Revision:** r1, 2026-10-03 (`ADR033-REVIEW`), before acceptance.
-  - Facts corrected or qualified. The old text, on `main` at `85b81e5`:
+  still holds at `ba150f5` and at `6ed3fbe`, the branch tip when r2 was
+  written.
+- **Revision:** r1 and r2, 2026-10-03 (`ADR033-REVIEW`), before acceptance.
+  - Text corrected or qualified. The old text, on `main` at `85b81e5`:
     - Status: "closing list item 2";
     - Context 2, now 3: "The request is an L2-signed
       `POST /v1/heartbeats`";
     - Context 5, now 6: "PAPER forbids credentials and network", citing
       `AGENTS.md`;
     - D3: "(`WP-310` follow_up 4)";
+    - D4: "The controller refuses to construct outside a live run mode";
     - D6: "It requests reconciliation (`WP-290`, §9.17 trigger 'submission
       unknown')";
     - D6: "Once the last confirmed heartbeat is more than 10 s old, plus the
       5 s check interval";
     - "What it amends": "Met for PAPER by the D1 controller behind a port";
+    - Consequences: "`WP-320` can start once `WP-290` merges";
     - Evidence: "`docs/handoffs/WP-280.md`: the signer gate refuses outside
       live modes".
-  - Rules changed. D1's gate drops "the kill switch is not engaged". D1
-    gains the kill-switch scope rule and the explicit stops. D6 gains the
-    clock, the lapse record, the entry block, "starts lapsed" and the lapse
-    end. D2 gains where its tests run.
+  - Rules changed:
+    - D1's gate drops "the kill switch is not engaged", and an unknown
+      result fails it. D1 gains the kill-switch scope rule, the explicit
+      stops, the abandoned `400` retry, and ADR-008 §4's id persistence and
+      alert.
+    - D2's contract becomes provisional. D2 gains where its tests run.
+    - D3 gains the live snapshot's duty and what a refused or queued
+      request means.
+    - D5 gains option 4, a recommendation, and what the venue round checks
+      first. Option 1 gains its hand-written-signing limit, and option 2 an
+      upstream request.
+    - D6 gains the clock, the lapse record, the entry block, the startup
+      lapse and the lapse end. Since r2, the lapse end raises the trigger
+      again 5 s after the confirmation. The block waits for a run that
+      started at least that late.
+    - Consequences gain D6's tests. Since r2, they run against the real
+      `OrderManager` and `ReconciliationCoordinator`.
 
 ## Context
 
@@ -56,10 +72,11 @@
      ADR-008 §3).
    - ADR-008 §4 records the id chain and the `400` recovery.
 
-   This ADR adds how the heartbeat reaches the venue, and what a missing
+   This ADR adds where the heartbeat's transport sits, and what a missing
    confirmation means.
-3. **Two official pages describe the protocol, and they disagree.** Both
-   were byte-identical on 2026-09-30 (`verified-2026-09-30.md` §5).
+3. **Two official pages describe the protocol, and they disagree.** On
+   2026-09-30 both were byte-identical to their 2026-09-16 captures
+   (`verified-2026-09-30.md` §5).
    - **The manage-orders guide (S-D17)** gives a raw L2-signed
      `POST /v1/heartbeats` (`verified-2026-09-16.md` §5; C-12):
      - "Once the first heartbeat is accepted, the CLOB expects the account
@@ -118,11 +135,11 @@
    Each must be confirmed, not assumed: an unknown result fails the gate.
    The controller exists only in the modes D4 allows.
 3. **Kill switches.** Kill-switch state is a health-lease input. A process
-   that cannot read it fails the gate (ADR-008 §8). `WP-320` defines which
-   engaged switches stop the heartbeat, at `GLOBAL` or `ACCOUNT` scope
-   only. A `MARKET` or `STRATEGY_INSTANCE` switch never does. The venue
-   would cancel every order under the credentials, which is wider than the
-   switch's scope (§14.1).
+   that cannot read it fails the gate (ADR-008 §8). Only a `GLOBAL` or
+   `ACCOUNT` switch may stop the heartbeat. `WP-320` defines which of their
+   actions do. A `MARKET` or `STRATEGY_INSTANCE` switch never does: the
+   venue would cancel every order under the credentials, which is wider
+   than that switch's scope (§14.1).
 4. **Explicit stops** also act through the gate. Each fails the fence or
    the health lease:
    - the Incident Controller's "Stop heartbeat", the default for "Account
@@ -223,8 +240,9 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
     never late.
   - A confirmation that arrives 10 s or more after its send time leaves the
     heartbeat lapsed. A late arrival never moves the deadline.
-  - The controller starts lapsed. No live entry precedes the first
-    confirmed heartbeat.
+  - The controller starts lapsed. At startup the composition runs the
+    lapse-start steps with cause "startup". New live entries remain blocked
+    until the first recovery completes the lapse end's steps 4–5.
 - **What a lapse means.** The venue may already have canceled any open
   order under those credentials. During the lapse, the venue may cancel any
   remaining open order. The controller infers neither "resting" nor
@@ -254,17 +272,26 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
      lapse stays outstanding, and a read taken during the lapse may answer
      it;
   3. raises `POSITION_BALANCE_DISCREPANCY` through
-     `ReconciliationCoordinator.trigger`. That pauses new submissions. A
-     run that started before the trigger then cannot resume the OMS. The
-     pending trigger stops it, and so does the hold epoch while it records
-     its result;
-  4. keeps the entry block latched until a run that started after the
-     confirmation completes, passes and resumes the OMS (§9.17 step 8).
-     - Such a run compares every tracked order that has a venue order id
-       with the venue's view. So it sees any cancel made during the lapse.
-     - Every run of a `reconcile()` call made after the confirmation
-       qualifies. A run that started earlier never counts, even when its
-       report arrives later;
+     `ReconciliationCoordinator.trigger`, at the confirmation and again 5 s
+     after it. Each trigger pauses new submissions. A run that started
+     before a trigger then cannot resume the OMS. The pending trigger stops
+     it. If the trigger arrives while that run writes its result, the moved
+     hold epoch stops it instead;
+  4. keeps the entry block latched until a run that started at least 5 s
+     after the confirmation completes, passes and resumes the OMS (§9.17
+     step 8).
+     - The wait covers the venue's sweep. A venue timeout during the lapse
+       fell no later than the confirming heartbeat's receipt, and so before
+       the confirmation. S-D17: "cancellation may occur up to five seconds
+       after the timeout" (ADR-008's timeout plus check interval). Like the
+       10 s, that figure is documentary only.
+     - Such a run reads every open tracked order that has a venue order id,
+       by id when the open-orders list omits it. It compares the order with
+       that read, or answers the order's outstanding request with it. So it
+       sees any cancel made during the lapse or by that sweep.
+     - Every run of a `reconcile()` call made at least 5 s after the
+       confirmation qualifies. A run that started earlier never counts, even
+       when its report arrives later;
   5. lifts the block only if the heartbeat has not lapsed again by then. A
      new lapse voids the recovery, and its own end starts another.
 - **No new trigger.** §9.17 gains none. "Submission unknown" is not used:
@@ -294,11 +321,15 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
   | Ambiguous geoblock result blocks new live entries. | The geoblock check (ADR-008 §7). The heartbeat port is not involved. |
   | Paper mode cannot acquire live fencing. | The fencing lease's PAPER refusal. D4 also refuses the controller: a PAPER context gets `SignerBoundaryRefusal`. |
 
-- **`WP-320`'s D6 tests include,** with a fake port and a fake monotonic
-  clock:
+- **`WP-320`'s D6 tests** run under `test/fault-injection/live-safety/**`,
+  with a fake port and a fake monotonic clock, against the real
+  `OrderManager` and `ReconciliationCoordinator`. §18.3 says "Do not mock
+  away the central behavior being tested". The tests include:
   - a confirmation that arrives while a read taken during the lapse is
     still pending. No run that started before the confirmation lifts the
     entry block;
+  - a venue cancel within 5 s after the confirmation. The block stays
+    latched until a run that sees it;
   - a success that arrives 10 s or more after its port call. The lapse
     does not end;
   - a new lapse between the confirmation and the passing run. The block
@@ -316,7 +347,7 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
   §5 (no heartbeat in the SDK); §11 (C-12); E-17; §16, carried-forward
   item 2; the source index's S-D18 digest, the same as on 2026-09-16.
 - Handoff §1.3, §6 invariants 6 and 16, §9.9, §9.12, §9.13, §9.17, §9.18,
-  §11, §14.1, §14.2, §14.4, §16.3 and §16.6.
+  §11, §14.1, §14.2, §14.4, §16.3, §16.6 and §18.3.
 - Work plan: `WP-320`'s deliverables, acceptance criteria and allowed
   paths; `WP-330`'s "stop-heartbeat guidance".
 - ADR-008 §1–§4, §7, §8 and Consequences; ADR-007; ADR-010 §4.
@@ -335,12 +366,13 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
     already `RECONCILING`; `retryReconciliationRequests`, which skips a
     request delivered and not consumed; and `resume` with its blocker.
 - `WP-290`'s `ReconciliationCoordinator` at `1dc6672` (unchanged in these
-  respects at `ba150f5`):
+  respects at `ba150f5` and `6ed3fbe`):
   - an OMS `ORDER_STATE` request triggers `POSITION_BALANCE_DISCREPANCY`,
     and every trigger pauses new submissions;
   - `trigger`. A pending trigger stops a run from resuming
     (`#workArrivedDuring`). So does any hold while the run records its
     result (the hold epoch);
-  - `reconcile`, and its reads and comparison of every tracked order;
+  - `reconcile`, and its reads and comparison of every open tracked order
+    with a venue order id (`#readAll`, `#compareOrdersAndTrades`);
   - the test "(I-10, X4) a trigger raised during the reads" in
     `test/fault-injection/reconciliation/resume.test.ts`.
