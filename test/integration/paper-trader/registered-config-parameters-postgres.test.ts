@@ -39,20 +39,20 @@
  */
 
 import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { parseTraderConfig } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { assembleDurableTrader, EXIT_CODES, startup, SystemPaperClock } from "../../../apps/trader/src/main.js";
 import { safeEnvironment, strategyParams } from "./support/fixture.js";
 import { documentFor, registerThroughTheRepositories, withFreshDatabase, type Registered } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
   // `TC-LOCAL-FLAKE`: a fresh container's first connect has been seen to fail
   // locally. Prove it answers before anything under test depends on it.
   let lastFailure: unknown;

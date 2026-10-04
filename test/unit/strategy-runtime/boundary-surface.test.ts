@@ -52,7 +52,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { deriveBoundarySurface, type Derivation, type CallableShape } from "./boundary-derivation.js";
 import {
@@ -926,7 +926,26 @@ const PUBLIC_PARTIAL_WITNESSES: Readonly<Record<string, PartialWitness>> = {
   },
 };
 
+/**
+ * `FLAKES-1`: the program is built here, once, under an explicit budget,
+ * rather than inside whichever test first calls {@link surface}.
+ *
+ * The build is deterministic and bounded: one `ts.Program` and its pre-emit
+ * diagnostics over the two packages' own source files. Measured: about 1.1 s
+ * alone on an idle host, and about 2.5 s inside the full `pnpm test`
+ * (`GOV-NOTES-1`'s gate logs). At host load 11-30 the first test, which
+ * built it, ran 5.6-5.9 s and timed out at vitest's default 5,000 ms. 60 s
+ * tolerates about a 50-fold slowdown of the idle cost; the round's handoff
+ * records the load it was measured under. The derivation, and every
+ * assertion on it, is unchanged.
+ */
+const PROGRAM_BUILD_BUDGET_MS = 60_000;
+
 describe("the boundary surface is resolved from the module graph, not scanned", () => {
+  beforeAll(() => {
+    surface();
+  }, PROGRAM_BUILD_BUDGET_MS);
+
   it("every callable the type checker resolves is classified — and vice versa", () => {
     const derivation = surface();
     // Non-empty, both packages parsed, and no id derived twice.

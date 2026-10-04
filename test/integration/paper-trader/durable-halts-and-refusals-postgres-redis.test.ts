@@ -50,9 +50,9 @@
  */
 
 import { RedisStreamsEventTransport, EventBusUnavailableError } from "@polymarket-bot/event-bus";
-import { startFreezableRedisProxy, startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { startFreezableRedisProxy, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { postgresTraderEvidence, type MarketWindow } from "@polymarket-bot/research-worker";
-import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import type { TestContext } from "@polymarket-bot/storage-postgres/testing";
 import type { IngestedEvent, LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -75,19 +75,20 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 /**
  * ONE Redis for the file: no scenario stops it (an outage is a partition, the
  * freezable hop), and each has its own stream — so the suite starts as few
  * containers as it can (`TC-LOCAL-FLAKE`: Docker Desktop's port forwarding has
  * refused connections when many start at once).
  */
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  postgres = await startPostgresContainer();
-  redis = await startRedisContainer();
+  postgres = await startReadyPostgresContainer();
+  redis = await startReadyRedisContainer();
 }, 300_000);
 
 afterAll(async () => {
@@ -375,7 +376,7 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
   }, 240_000);
 
   it("STORE_UNAVAILABLE with the database DOWN: the record cannot land; the process says so and exits 75 within the stated bound — fail closed, not weakened", async () => {
-    const own = await startPostgresContainer();
+    const own = await startReadyPostgresContainer();
     let ownStopped = false;
     try {
       await withFreshDatabase(own.getConnectionUri(), "prov-store-down", async ({ connectionString, context }) => {

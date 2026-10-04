@@ -58,7 +58,7 @@
  */
 
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
-import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import type { TestContext } from "@polymarket-bot/storage-postgres/testing";
 import {
   canonicalJsonStringify,
   DeterministicRng,
@@ -83,11 +83,12 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer } from "./support/containers.js";
 
-let container: Awaited<ReturnType<typeof startPostgresContainer>>;
+let container: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 
 beforeAll(async () => {
-  container = await startPostgresContainer();
+  container = await startReadyPostgresContainer();
 }, 300_000);
 
 afterAll(async () => {

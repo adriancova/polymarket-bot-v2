@@ -82,8 +82,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startFreezableRedisProxy, startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
-import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import { startFreezableRedisProxy, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import type { TestContext } from "@polymarket-bot/storage-postgres/testing";
 import type { IngestedEvent, LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -100,6 +100,7 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
 const execFileAsync = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -115,8 +116,8 @@ const MARGIN_MS = 4_000;
  */
 const SILENCE_TO_EXIT_MS = REDIS_BOUND_MS + HALT_RECORD_DEADLINE_MS + 2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + MARGIN_MS;
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 let workRoot: string;
 let bundle: string;
 const children = new Set<ChildProcess>();
@@ -139,7 +140,7 @@ beforeAll(async () => {
     ],
     { cwd: path.join(repoRoot, "apps/trader") },
   );
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
 }, 300_000);
 
 afterAll(async () => {

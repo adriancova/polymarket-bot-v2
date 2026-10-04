@@ -31,9 +31,9 @@ import { fileURLToPath } from "node:url";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { createDatabase, createPostgresPool, migrateUp, type PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
-import { createIsolatedDatabase, startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
+import { createIsolatedDatabase } from "@polymarket-bot/storage-postgres/testing";
 import type { TransportHealth } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -44,17 +44,18 @@ import { TransportLagSampler } from "../../../apps/trader/src/transport-lag.js";
 import { parseTraderConfig } from "../../../apps/trader/src/index.js";
 import { H1_MARKET_ID, readEnvelope, readEnvelopes, remapMarketId, withMarketOpened } from "./support/throughput/fixture.js";
 import { benchEnvironment, registerForBench } from "./support/throughput/harness.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtures = path.resolve(here, "../../fixtures/trader-throughput");
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 let redisUrl: string;
 let workRoot: string;
 
 beforeAll(async () => {
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
   redisUrl = redis.getConnectionUrl();
   for (let attempt = 1; ; attempt += 1) {
     try {

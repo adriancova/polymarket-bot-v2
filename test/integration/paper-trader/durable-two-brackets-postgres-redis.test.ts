@@ -195,8 +195,7 @@ import { fileURLToPath } from "node:url";
 
 import { addDecimal } from "@polymarket-bot/decimal";
 import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { canonicalJsonStringify } from "@polymarket-bot/strategy-runtime";
 import {
   normalizeToStrictUtc,
@@ -227,12 +226,13 @@ import {
   twoBracketsEvents,
   twoBracketsStrategyParams,
 } from "./support/two-brackets.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
 }, 300_000);
 
 afterAll(async () => {

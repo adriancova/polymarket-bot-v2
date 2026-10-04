@@ -60,9 +60,8 @@ import {
   ManualGatewayTimers,
 } from "@polymarket-bot/data-gateway/testing";
 import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { parseTraderConfig, type IngestedEvent, type MarketEventFeed } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -83,12 +82,13 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
 }, 300_000);
 
 afterAll(async () => {
