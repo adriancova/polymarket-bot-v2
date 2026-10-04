@@ -35,9 +35,15 @@ export {
 
 export {
   ANSWER_CHANNELS,
+  EVIDENCE_KINDS,
+  EVIDENCE_PROVENANCES,
   JOURNAL_REFUSAL_CODES,
   ReconciliationJournal,
   type AnswerChannel,
+  type EvidenceKind,
+  type EvidenceProvenance,
+  type EvidenceRecordView,
+  type EvidenceRecordedEvent,
   type AnswerRecordedEvent,
   type BreakOpenedEvent,
   type BreakQuarantinedEvent,

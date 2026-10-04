@@ -673,3 +673,48 @@ describe("WP-290 r5 (WP290-CX-R5-02): no wallet answer once a clock fault is det
     expect(rig.wallet.operation(split.operationId)?.state).toBe("CONFIRMED");
   });
 });
+
+describe("WP-290 r6 (class B): a hold about a wallet member or a request channel clears only by a positive judgement of that very subject", () => {
+  it("(B, wallet member) a member PENDING, then UNREADABLE: the PENDING hold is not cleared by a run that could not read the member; answered once terminal, both clear", async () => {
+    const r = await ready();
+    const rig = walletRig(r);
+    expect(rig.wallet.plan(split).ok).toBe(true);
+    expect((await rig.wallet.submit(split.operationId)).ok).toBe(true);
+    rig.wallet.observe(split.operationId, { status: "DROPPED", transactionHash: HASH_A });
+    r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "PENDING", transactionHash: HASH_A, credited: null });
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "WALLET_MEMBER_PENDING");
+    const pending = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "WALLET_MEMBER_PENDING");
+    expect(pending).toBeDefined();
+    // The member's read now fails: nothing says it is no longer pending.
+    r.u.world.faults.readWalletMember = () => {
+      throw new Error("timeout");
+    };
+    for (let round = 0; round < 2; round += 1) {
+      r.p.coordinator.trigger("PERIODIC_TIMER");
+      await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "WALLET_MEMBER_UNREADABLE");
+      expect(r.p.journal.unresolvedBreaks().map((view) => view.breakId)).toContain(pending?.breakId);
+    }
+    r.u.world.faults = {};
+    r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "CONFIRMED", transactionHash: HASH_A, credited: null });
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(r.p.journal.breaks().find((view) => view.breakId === pending?.breakId)?.resolution).toBe("NOT_REPRODUCED");
+  });
+
+  it("(B, a request channel) while WP-280 keeps presenting a malformed request, no earlier receipt's hold is cleared; once it stops, every one clears", async () => {
+    const r = await ready();
+    const stream = new FakeStream();
+    r.p.coordinator.bindUserStream(stream);
+    const bad = { requestId: "", cause: "SOCKET_CLOSED", markets: [] };
+    stream.pending.push(bad);
+    r.p.coordinator.onUserStreamOutput({ kind: "RECONCILIATION_REQUESTED", request: bad });
+    for (let round = 0; round < 3; round += 1) {
+      const report = await r.p.coordinator.reconcile();
+      await expectPaused(r, report.resumed, "REQUEST_MALFORMED");
+      const held = r.p.journal.breaks().filter((view) => view.breakClass === "REQUEST_MALFORMED");
+      expect(held.every((view) => view.status !== "RESOLVED")).toBe(true);
+    }
+    stream.pending.splice(0);
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(r.p.journal.breaks().filter((view) => view.breakClass === "REQUEST_MALFORMED").every((view) => view.resolution === "NOT_REPRODUCED")).toBe(true);
+  });
+});

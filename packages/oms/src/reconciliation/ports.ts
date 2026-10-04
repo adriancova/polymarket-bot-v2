@@ -360,7 +360,33 @@ export type JournalInput =
       readonly refusalCode: string | null;
       readonly atMs: number;
     }
-  | { readonly kind: "RESUME_REFUSED"; readonly runId: string; readonly refusalCode: string; readonly atMs: number };
+  | { readonly kind: "RESUME_REFUSED"; readonly runId: string; readonly refusalCode: string; readonly atMs: number }
+  | JournalEvidenceInput;
+
+/**
+ * One validated venue observation (r6, the EvidenceStore: `evidence.ts`), appended the moment it is made, so a
+ * restart rebuilds the coordinator's evidence from the journal alone (`packages/ledger`'s `EvidenceRecordedEvent`).
+ */
+export interface JournalEvidenceInput {
+  readonly kind: "EVIDENCE_RECORDED";
+  readonly runId: string | null;
+  readonly evidenceKind: "ORDER" | "LEG" | "SETTLED";
+  readonly venueOrderId: string;
+  readonly venueTradeId: string | null;
+  readonly provenance: "SHOWN" | "NAMED";
+  readonly source: string;
+  readonly tokenId: string | null;
+  readonly side: "BUY" | "SELL" | null;
+  readonly price: string | null;
+  readonly originalSize: string | null;
+  readonly size: string | null;
+  readonly status: string | null;
+  readonly level: number | null;
+  readonly atMs: number;
+}
+
+/** An evidence record as the journal returns it (its position included). */
+export type JournalEvidenceView = JournalEvidenceInput & { readonly sequence: number };
 
 /** The fields of the journal's break view the coordinator reads. */
 export interface JournalBreakView {
@@ -394,6 +420,8 @@ export interface ReconciliationJournalPort {
   breaks(): readonly JournalBreakView[];
   /** Breaks still OPEN or QUARANTINED. */
   unresolvedBreaks(): readonly JournalBreakView[];
+  /** Every evidence record, in append order (r6): the coordinator's EvidenceStore is rebuilt from it at every run. */
+  evidence(): readonly JournalEvidenceView[];
   append(event: JournalInput): Promise<JournalPortResult>;
 }
 

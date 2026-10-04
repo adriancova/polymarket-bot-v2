@@ -52,55 +52,78 @@ not a fault.
    id, positions (`/v2` only), the collateral balance (on chain), approvals,
    the ledger projection, what the ledger still books of each FAILED fill
    (section 3, step 3), and each wallet-operation member a request names.
-   The orders read by id are: every tracked order still open, every one with
-   fills, terminal or not, every one an unresolved break names, every venue
-   order an unresolved break names (a read problem keyed by the order, an
-   `ORDER_UNRESOLVED` keyed by the venue order, an `ORDER_NOT_FOUND_BY_ID`),
-   and every order id of the account a run observed but could not classify.
-   E-14: an order absent from the open-orders list is not proof of
-   cancellation, and missing orders are resolved by id. **Once observed, an
-   order id is never forgotten** while anything about it is unresolved: a
-   run whose reads are not one consistent view (or are stale) records every
-   unclaimed order id it observed as `ORDER_UNRESOLVED`, keyed by the venue
-   order, so the next runs (after a restart too) read it by id until a sound
-   run classifies it (tracked, still ownable by an attempt, UNATTRIBUTED, or
-   not found). An id is observed in any of five ways, each recorded with its
-   **provenance** (the rows of an unusable answer carry either, row by row):
+   The orders read by id are: **every venue order with evidence that no
+   sound run has settled** (below), every tracked order still open, every one
+   with fills, terminal or not, every one an unresolved break names, every
+   venue order an unresolved break names (a read problem keyed by the order,
+   an `ORDER_UNRESOLVED` keyed by the venue order, an
+   `ORDER_NOT_FOUND_BY_ID`), every id the OMS retains as user-stream
+   evidence, and every tracked order a request names. E-14: an order absent
+   from the open-orders list is not proof of cancellation, and missing orders
+   are resolved by id.
 
-   | Source | Provenance | Recorded as |
-   | --- | --- | --- |
-   | a complete, valid open-orders list | shown | `ORDER_UNRESOLVED` keyed `venue-order` |
-   | a valid trades read's own leg | shown | the same |
-   | a by-id read that found the order | shown | the same |
-   | a row of a partial, malformed or duplicated open-orders answer, or a leg of such a trades answer, that validated in full (the answer is discarded whole; what its valid rows showed is not) | shown | `ORDER_UNRESOLVED` keyed `venue-order` |
-   | the id alone of a malformed row or leg (nothing else of it validated) | named | `ORDER_UNRESOLVED` keyed `venue-order-named` |
-   | a by-id read that did not show the order (it failed, was malformed, or did not find it), for an id the OMS's retained stream evidence or a request named | named | the same |
+   **The evidence (r6).** Every validated observation, from every source and
+   whatever the run's soundness, is recorded BEFORE anything is classified:
+   folded into the coordinator's evidence store and appended to the journal
+   (`EVIDENCE_RECORDED`). Every run rebuilds the store from the journal, so a
+   restart forgets nothing. An observation whose append fails (or that a run
+   folded before it failed outright) is kept in memory, folded into the next
+   rebuild and appended again; a run whose evidence could not be appended
+   concludes nothing (no clearing, no resume) until a later run makes it
+   durable. Per venue order the store keeps whether any
+   source SHOWED it, the most matched any observation showed (and at least
+   the sum of its distinct trades' legs), whether any showed it terminal, and
+   every status seen; per venue trade, its legs and its furthest settlement.
+   These marks only ever go up. The sources:
 
-   The provenance is merged: an order a read once showed stays shown (one
-   `venue-order` record), however a later unsound run observes it.
+   | Source | Provenance |
+   | --- | --- |
+   | a row of a complete, valid open-orders list | shown |
+   | a row that validated in full inside a partial, malformed or duplicated open-orders answer (the answer is discarded; what the row showed is not) | shown |
+   | an own leg of a valid trades read, or one that validated in full inside an unusable trades answer | shown |
+   | a by-id read that found the order | shown |
+   | the id alone of a malformed row or leg (nothing else of it validated) | named |
+   | an id the OMS retains as user-stream evidence | named |
+   | what the user stream reported that the OMS did not apply (it retained it, or refused it as unknown, inconsistent or contradicting), recorded the moment it is routed | named |
+
+   An order with evidence is read by id in every run until a sound run
+   classifies it consistently with ALL its evidence (the run records it
+   `SETTLED`); new evidence about it makes it read again. A run whose reads
+   are not one consistent view (or are stale) also holds every unclaimed
+   order with unsettled evidence as `ORDER_UNRESOLVED`, keyed `venue-order`
+   when shown and `venue-order-named` when only named.
 
    Every read starts after every request the run will answer was received.
    A request that arrives during the reads waits for the next run, which
    starts at once.
-3. Compare, and answer the requests (section 5). Every order observation is
-   checked on its own before the open-orders list and a by-id read of the
-   same order are merged: a status outside the documented vocabulary in
-   either read is `STATUS_UNRECOGNISED`; a later read showing an older state
-   (less matched, or live after the list showed it terminal) is
-   `READ_REGRESSION`; another status at the same stage (`DELAYED`, then
-   `LIVE`) is `READ_CONFLICT`. Only "live, then terminal" is a step forward:
-   no order-status transition table is documented (C-6, C-14). An order an
-   earlier read SHOWED, which its by-id read no longer finds, is a
-   `READ_CONFLICT` (the by-id read finds canceled and fully matched orders).
-   Any of these makes the run's order reads unsound: nothing is answered from
-   them. This holds for a row or leg that validated in full inside a partial,
-   malformed or duplicated answer too: it showed the order, so the contradiction
-   holds identity resolution exactly as after a complete list. An order id
-   only NAMED (no read ever showed it), which a sound run's
-   by-id read does not find, contradicts no earlier read: it is an
-   `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), which keeps
-   the id and is read by id while it stands; once found, the order is
-   classified like any other.
+3. Compare, and answer the requests (section 5). Every venue order and trade
+   the run read, or has unsettled evidence of, gets ONE verdict from the
+   evidence store, against the run's other reads and against all the
+   evidence, and nothing else is ever answered, compared, classified or
+   cleared from a raw read:
+   - **consistent**: the run's latest view of it (its by-id read, else its
+     row) shows at least everything the evidence holds;
+   - **a conflict** (the run's order reads are unsound; nothing is answered
+     from them): a status outside the documented vocabulary in any read
+     (`STATUS_UNRECOGNISED`); an observation showing less than an earlier
+     one, from any run or source (less matched, live after terminal, a
+     settlement backwards: `READ_REGRESSION`; a terminal settlement against
+     another: `READ_CONFLICT`); the list and the by-id read disagreeing about
+     a fixed fact, or about the status at the same stage (`READ_CONFLICT`;
+     only "live, then terminal" is a step forward, since no order-status
+     transition table is documented, C-6, C-14); trades summing to more than
+     the order's matched size; an order a source SHOWED that its by-id read
+     does not find (`READ_CONFLICT`: the by-id read finds canceled and fully
+     matched orders);
+   - **a ghost**: an unclaimed order only NAMED that the by-id read of a
+     sound run does not find. No earlier read is contradicted, so it is an
+     `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), read by id
+     while it stands; and while it stands no attempt is answered by signed
+     identity (section 5). Once found, it is classified like any order;
+   - **acknowledged**: a ghost an operator released, with no new evidence
+     since;
+   - **missing**: a tracked order its by-id read does not find (the OMS's
+     comparison holds it: `ORDER_STATE_MISMATCH`).
 
    Fills are compared with what the OMS recorded durably, by identity (one
    fill per trade and order) and with exact economics, both ways:
@@ -119,14 +142,15 @@ not a fault.
      settlement records it in the OMS when it is a legal step forward; a leg
      compared before the regression was found may have been recorded. Each
      such write is a forward fact the venue showed, which the OMS itself
-     checks, and the run does not resume.)
+     checks, and the run does not resume. Every such write passes the
+     run-validity latch first.)
    - a missed fill the OMS refuses as a contradiction (it raises its own
      halting alert) is offered once per process, not once per run;
    - a trade of a tracked order the venue shows FAILED is a
      `SETTLEMENT_FAILED` quarantine, keyed by the trade and the order, and
      its market is halted: the ledger booked the fill at its match and owes a
      compensating reversal (ADR-006 §5). This is derived from the venue's
-     read in every run. The OMS's own `SETTLEMENT_FAILED` alert lives only in
+     trades read in every run that read it, whatever the run's soundness. The OMS's own `SETTLEMENT_FAILED` alert lives only in
      its memory and is raised once, so a crash after the OMS recorded the
      failure, before the alert was journaled, would otherwise lose the halt.
      FAILED is "terminal failure" (`docs/venue/verified-2026-08-24.md`, the
@@ -150,14 +174,22 @@ not a fault.
 6. Resume if, and only if, everything in section 6 holds.
 
 A run whose reads span more than `maxReadSpanMs`, or during which the clock
-was unreadable or went backwards, concludes nothing (`READ_STALE`). The clock
-fault is latched wherever the coordinator detects it: during the reads, while
-it records an answer, when a request arrives, at the run's closing reading,
-or when an operator's release reads the clock during the run. From that
-moment the run gives no further answer (OMS, wallet or stream; an `ABSENT`
-queued before the fault included), books nothing, acts on no break, clears
-none, and does not resume. What it did before the fault was detected stands.
-A later run, with fresh reads, answers what it withheld.
+was unreadable or went backwards, concludes nothing (`READ_STALE`). **One
+run-validity latch** (r6) is checked immediately before every commit, after
+every await that preceded it: each OMS answer, wallet answer and stream
+acknowledgement, EACH fill delivery of a multi-fill act, each settlement or
+economics write to the OMS, each act, each UNATTRIBUTED booking, each break
+resolution, each evidence settlement, the decision, and the resume. A clock
+fault, wherever the coordinator detects it (during the reads, while it
+records an answer, when a request arrives, at the run's closing reading, or
+when an operator's release reads the clock during an awaited delivery), and a
+journal that faulted, latch the run: from that moment it commits nothing
+more. Recording a hold is never withheld. What it did before the fault was
+detected stands. A later run, with fresh reads, does what it withheld.
+
+The evidence and every halt obligation that needs no consistent view of the
+venue (each ledger arrival, each FAILED settlement, each OMS halting alert)
+are recorded by every run, a stale or unsound one included.
 
 ## 4. Breaks
 
@@ -173,44 +205,33 @@ Its class decides its rule. The full table, with every class's meaning, is
 | `UNATTRIBUTED_HALT` | an operator's release, after the market (or account) was halted | `ORDER_UNATTRIBUTED`, `TRADE_UNATTRIBUTED`, `POSITION_UNATTRIBUTED`, `BALANCE_UNATTRIBUTED`, `LEDGER_UNATTRIBUTED_ARRIVAL` |
 
 **Ambiguity never resumes trading.** Every class that means "we cannot tell"
-is a hold. No release exists for it. It clears only when a complete,
-consistent run no longer finds it, having performed the check that would find
-it, and found the subject consistent:
+is a hold. No release exists for it. **A break leaves the open state by a run
+only through one function** (r6): its EXACT subject must have been judged
+consistent, positively, by the comparison that actually ran in that run, and
+the run must be conclusive (every read complete, consistent and fresh, the
+evidence journal readable, every append recorded, the latch passing).
+Anything not positively judged stays open:
 
-- a run that did not judge the holdings does not clear a holding break;
-- a break whose subject names one venue order a read SHOWED (a
-  `READ_CONFLICT`, `READ_REGRESSION` or `STATUS_UNRECOGNISED` keyed by the
-  order; an `ORDER_UNRESOLVED` keyed `venue-order`) is cleared only by a run
-  that read that order again, by id or in the open-orders list. One whose
-  subject names a venue order only NAMED (a by-id read's problem:
-  `READ_MISSING`, `READ_MALFORMED`, `READ_WRONG_ROUTE` keyed by the order;
-  an `ORDER_UNRESOLVED` keyed `venue-order-named`) is cleared only by a run
-  whose by-id read of that order answered, found or not (not found, the
-  same run records `ORDER_NOT_FOUND_BY_ID`). Every such order is read by id
-  in every run, so a later run can always look again;
-- a break whose subject names one venue trade (`READ_REGRESSION`,
-  `STATUS_UNRECOGNISED` or `READ_INCOMPLETE` keyed by the trade, and
-  `SETTLEMENT_REVERSAL_OWED`, which also needs the holdings judged) is
-  cleared only by a run whose trades read shows that trade. No by-id trade
-  read is documented, so it holds until the trades read shows it again;
-- a break about one tracked order's state or fills (`ORDER_STATE_MISMATCH`,
-  `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`,
-  `TRADE_MISSING_IN_OMS`, `FILL_*`) is cleared only by a run that compared
-  that order in full and found nothing wrong with it. A run that skipped the
-  order (its group's token unknown, its venue facts different, its by-id
-  read missing), could not verify its fills, found anything else wrong with
-  it, or saw it mid-cancel or still reconciling in the OMS clears none of
-  them. Every tracked order such a break names is read by id each run, so
-  the comparison can be made again;
-- a run that did not judge an attempt's identity (or give it an answer) does
-  not clear that attempt's ambiguity (or refused answer).
+| Break about | Positively judged by |
+| --- | --- |
+| one read (or one by-id read): `READ_MISSING`, `READ_MALFORMED`, `READ_INCOMPLETE`, `READ_WRONG_ROUTE` | that read answering in its shape |
+| one venue order (a conflict, regression or unrecognised status keyed by it; `ORDER_UNRESOLVED` keyed by the venue order) | the evidence store's verdict on that order, in this run: consistent (an order only named: its by-id read answered, found or not) |
+| one venue trade (a regression, conflict, unrecognised status or undetermined ownership keyed by it) | the trades read showing that trade, consistent; no by-id trade read is documented, so it holds until the trades read shows it again |
+| one tracked order's state or fills (`ORDER_STATE_MISMATCH`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `TRADE_MISSING_IN_OMS`, `FILL_*`) | a comparison of that order in full that found nothing wrong with it (a run that skipped it for an unknown token or other venue facts, could not verify its fills, saw it mid-cancel or still reconciling, or found anything else wrong with it judges none of them); a refused fill also needs its trade read consistent; a missed fill (`RESOLVE_IN_RUN`) is resolved in its own run only when every delivery was accepted and that run is conclusive |
+| a holding (`HOLDING_*`, `CORRECTION_FAILED`, `APPROVAL_MISSING`, `WALLET_OPERATION_IN_FLIGHT`) | the holding comparison finding that asset matched (that spender approved; no operation in flight) |
+| `SETTLEMENT_REVERSAL_OWED` | that trade read consistent, and the holdings judged with nothing of its fill booked |
+| an attempt's identity ambiguity, or a refused answer | that attempt judged without ambiguity, or an answer for it accepted, or nothing owed for it any more |
+| a wallet member (`WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`) | an answer for that member accepted, or its operation's request gone |
+| `REQUEST_MALFORMED` | a run its channel presented nothing malformed to |
+| a component, the clock, the journal, a halt delivery, retained evidence, an unsettled operation | that check passing in this run |
 
 **A malformed request** (from the OMS, the inventory or the user stream) is
 refused to its requester and recorded as `REQUEST_MALFORMED`, one break per
-receipt. The run that records it cannot pass. A later complete run that no
-longer receives it clears it. A requester that keeps presenting it (the OMS's
-and the inventory's retries, the user stream's backlog) keeps the account
-held: that component needs attention.
+receipt. The run that records it cannot pass. A later complete run to which
+that channel presented nothing malformed clears every one of them. A
+requester that keeps presenting it (the OMS's and the inventory's retries,
+the user stream's backlog) keeps every one of them open and the account held:
+that component needs attention.
 
 **Unmatched activity becomes UNATTRIBUTED** (§6 invariant 7, §9.15):
 
@@ -230,15 +251,25 @@ Each UNATTRIBUTED break halts its market through the halt port. Collateral,
 or a token whose market is unknown, halts the account. The halt is delivered
 again by every run while the break is open: the halt port must be idempotent.
 
-**Every halt obligation has its own break, derived again in every run.**
-The ledger records one obligation per UNATTRIBUTED entry and per breached
-bucket, each with its own asset and market. Each is its own break
+**Every halt obligation has its own break, derived again in every run,
+whatever the run's soundness** (a run whose order reads are unusable, or a
+stale one, included: an obligation never waits on a view the account may not
+get back). Each has its own identity, an occurrence, never a hash of its
+detail. The ledger records one obligation per UNATTRIBUTED entry and per
+breached bucket, each with its own asset and market. Each is its own break
 (`LEDGER_UNATTRIBUTED_ARRIVAL` when no break records it yet), keyed by its
 transaction, movement kind, asset, market and place, and halts its own
-market. A booking made by this coordinator uses the same key, so a crash
-between the booking and its journal entry is recovered as exactly that
-break. Each FAILED settlement is its own `SETTLEMENT_FAILED` break, keyed by
-its trade and order.
+market: one transaction touching two markets is two breaks and two halts. A
+booking made by this coordinator uses the same key, so a crash between the
+booking and its journal entry is recovered as exactly that break. Each FAILED
+settlement is its own `SETTLEMENT_FAILED` break, keyed by its trade and order.
+Each OMS halting alert is its own break (below); the alerts are inspected
+after the reads and again at the end of the run, so an alert the OMS raises
+while the run answers or delivers is recorded by that very run, which then
+does not resume. Each not-found occurrence of
+a venue order id is its own `ORDER_NOT_FOUND_BY_ID`: released, then named
+again by new evidence and still not found, it is a new break (keyed by the id
+and how many were released before).
 
 A crash between a quarantine's `BREAK_OPENED` and its `BREAK_QUARANTINED`
 leaves it OPEN. The next run quarantines it first, before it delivers the
@@ -261,9 +292,11 @@ contradiction (`ORDER_FACTS_MISMATCH`) does not acknowledge it: every run that
 still finds it opens it again, quarantined, with its market halted. The table
 is `RELEASE_ACKNOWLEDGES_SUBJECT` in the taxonomy.
 
-**The journal is append-only.** Runs, breaks, quarantines, resolutions and
-answers are events. The `ops.reconciliation_runs` and
-`ops.reconciliation_breaks` rows are projections of them.
+**The journal is append-only.** Runs, breaks, quarantines, resolutions,
+answers and evidence are events. The `ops.reconciliation_runs` and
+`ops.reconciliation_breaks` rows are projections of them; the evidence
+(`EVIDENCE_RECORDED`) is a third, and a composition must persist it with the
+others (the coordinator rebuilds its evidence from it at every run).
 
 ## 5. How requests are answered
 
@@ -286,7 +319,7 @@ unclaimed orders.
 | exactly one matching order, which no other unresolved attempt could own | `PRESENT` |
 | two or more matching orders, or one that another attempt could own | none: `SIGNED_IDENTITY_AMBIGUOUS` |
 | an unclaimed order on the same token and side that does not match exactly | none: `SIGNED_IDENTITY_AMBIGUOUS` |
-| an unclaimed order id only named (no read showed it) that the venue's by-id read does not find (`ORDER_NOT_FOUND_BY_ID`) | none, for every attempt: `SIGNED_IDENTITY_AMBIGUOUS` (its token is unknown, so it could be any attempt's), until an operator releases it or the venue shows the order |
+| a ghost: an unclaimed order id only named (the id alone of a malformed row or leg, an id the OMS retains as user-stream evidence, one the stream reported) that the venue's by-id read does not find (`ORDER_NOT_FOUND_BY_ID`) | none, for every attempt: `SIGNED_IDENTITY_AMBIGUOUS` (its token is unknown, so it could be any attempt's), until an operator releases it or the venue shows the order |
 | nothing on the same token and side | `ABSENT`, once the reads begin at least `quiescenceHorizonMs` after the coordinator received the request, and the run judged the holdings with no break in the attempt's token or the collateral |
 
 Every `ABSENT` carries `transmissionQuiescent: true`, from the coordinator's
@@ -299,17 +332,25 @@ Why ABSENT also needs clean holdings: a marketable order that matched at once
 is gone from the open-orders list, and its trade may not be visible yet. Its
 fill still moves the holdings once settled, so an unexplained delta in the
 token or the collateral withholds ABSENT. So does any unresolved break that
-names them. A venue order id the user stream named, which the OMS holds as
-retained evidence, is read by id and is a candidate too.
+names them, and any venue order or trade of the run the evidence store could
+not judge without a conflict. A venue order id the user stream named, which
+the OMS holds as retained evidence, is evidence: read by id, a candidate when
+found, a ghost when not (r6).
+
+A `PRESENT` answer carries the venue order's matched size and status from its
+consistent verdict only, so it never fixes a final size below a match any
+source showed, and never names a status older than one any source showed.
 
 ## 6. Resume
 
 Trading resumes only when ALL of these hold at the end of a run:
 
-- every read answered, completely, in its shape, from the required route,
-  with no conflict, regression or unrecognised status, within
-  `maxReadSpanMs`, and with a sound clock from the run's start to its
-  resume (no reading unreadable or backwards anywhere in the run);
+- the run is conclusive: every read answered, completely, in its shape,
+  from the required route, with no conflict, regression or unrecognised
+  status against its own reads or the evidence, within `maxReadSpanMs`, from
+  a readable evidence journal, with every append recorded, and with a sound
+  clock and journal from the run's start to its resume (no reading
+  unreadable or backwards anywhere in the run);
 - holdings were judged in this run;
 - no break is unresolved in the whole journal. Quarantines from before a
   restart count. The journal itself refuses a `PASSED` run otherwise;
@@ -325,7 +366,8 @@ If work arrived while the `PASSED` record was being written, the run does not
 resume: the journal records `RESUME_REFUSED` (`RECON_WORK_ARRIVED`), and the
 next run starts at once. The same holds if a clock fault was detected then
 (an operator's release attempted with an unreadable clock):
-`RESUME_REFUSED` (`RECON_CLOCK_FAULT`), and the next run starts at once. If
+`RESUME_REFUSED` (`RECON_CLOCK_FAULT`), and the next run starts at once; or
+if the journal faulted then (`RECON_JOURNAL_FAULTED`). If
 the OMS's own `resume()` refuses, it stays paused, and the journal records
 `RESUME_REFUSED` with the OMS's code.
 
@@ -379,20 +421,32 @@ returns at once, with no run.
   found by id (E-14). It clears only if a candidate is claimed by its real
   owner (another attempt found `PRESENT` for it). There is no override
   (section 10).
-- **An `ORDER_NOT_FOUND_BY_ID` quarantine** names a venue order id that no
-  read ever showed in full (only a by-id read that did not show it, for an id
-  the user stream's evidence or a request named, or the id alone of a
-  malformed row or leg, named it) and that the venue's by-id read does not
-  find. An order a valid row or leg showed, even inside a partial or
-  malformed answer, is never this quarantine: its not-found is a
-  `READ_CONFLICT`. The account is halted, and while it stands no attempt is
-  answered by signed identity (the id could be any attempt's). Establish
-  whether the id is the account's (the stream's evidence, the adapter's
-  logs). If it may be, do not release it. If it is not, release it: the
-  release acknowledges that id for good, and it is no longer read; the
-  attempts are then answered, and the OMS may raise its own halting alert
-  about stream evidence it retained for that id (a second quarantine). While it stands it is read by id in every
-  run, and if the venue shows it later it is classified like any order.
+- **An `ORDER_NOT_FOUND_BY_ID` quarantine** names a venue order id that only
+  NAMED evidence knows (the id alone of a malformed row or leg, an id the OMS
+  retains as user-stream evidence, one the stream reported) and that the
+  venue's by-id read does not find. An order a source SHOWED (a valid row or
+  leg, even inside a partial or malformed answer; a by-id read that found
+  it) is never this quarantine: its not-found is a `READ_CONFLICT`. The
+  account is halted, and while it stands no attempt is answered by signed
+  identity (the id could be any attempt's). Establish whether the id is the
+  account's (the stream's evidence, the adapter's logs). If it may be, do not
+  release it. If it is not, release it: the release settles that id's
+  evidence ("the venue does not show it"), so it is no longer read or
+  withheld for; the attempts are then answered, and the OMS may raise its own
+  halting alert about stream evidence it retained for that id (a second
+  quarantine). If new evidence names the id again and the venue still does
+  not show it, that is a new occurrence and a new quarantine. While it stands
+  it is read by id in every run, and if the venue shows it later it is
+  classified like any order.
+- **A `READ_CONFLICT` or `READ_REGRESSION` that does not clear** means a read
+  shows less than the evidence holds: an order a source showed is no longer
+  found, a matched size went down, a terminal order reads live, trades sum to
+  more than the order's matched size, or a settlement went backwards. The
+  evidence never goes down, so this holds until a read shows at least what
+  was seen (a lagging read catches up on its own). If the venue truly
+  withdrew what a read once showed (a phantom row, trade or match), the
+  account stays held: no release exists, and no tool retracts evidence today
+  (section 10). Do not edit the journal; escalate.
 
 ## 8. Configuration
 
@@ -449,15 +503,30 @@ nothing is judged or booked from it.
 
 ## 10. Known limits
 
-- An order placed and then cancelled with nothing matched, and NEVER SEEN by
-  any read, is invisible to every read without its id. `ABSENT` then fixes
-  the final size at 0 exactly, but does not prove the order never reached the
-  venue. That matters only to the 425 same-salt resend, whose ADR is owed. An
-  order a read did see is different: it is read by id until classified
-  (section 3), so it is never mistaken for absent.
-- A crash after a run saw an unclassified order but before that run's
-  journal entry (`ORDER_UNRESOLVED`) was written loses the order id. The run
-  that saw it never resumed, and the next runs are back to the case above.
+- **Invisible without its id.** An order placed and then cancelled with
+  nothing matched, and NEVER OBSERVED by any source (no read, no stream event
+  recorded as evidence), is invisible to every read without its id. So is a
+  live order that a complete open-orders list leaves out before any source
+  observed it (E-14 says the list may lag; no venue fact bounds the lag).
+  `ABSENT` then fixes the final size at 0 for the first, but proves nothing
+  about the second: the order may still fill, and is then unattributed
+  activity. No reconciler can see it without the order hash (WP-270's
+  STOPPED item). An order a source did observe is different: its evidence is
+  durable, it is read by id until classified, and a not-found by id never
+  answers for it.
+- **An observation not yet recorded dies with the process.** A run's
+  observations are folded in memory during its reads and journaled together
+  once the reads end; the stream's evidence is journaled the moment it is
+  routed. One whose append fails is kept in memory and appended again by the
+  next run (and a run that could not journal its evidence concludes
+  nothing). A crash before it is journaled loses it. The run that made those
+  reads never resumed; the next one reads afresh.
+- **Evidence never goes down.** A read that showed a match, a trade, a
+  terminal status or an order that the venue later withdraws (a phantom row,
+  a trade id replaced by another, a read that lied upward) holds the account
+  for good (`READ_CONFLICT` or `READ_REGRESSION`, holds with no release), and
+  no tool retracts evidence. Fail closed; an operator path needs an ADR
+  (follow-up).
 - A signed-identity ambiguity between orders the account holds (canceled
   ones included, since a canceled order is still found by id) does not clear
   on its own unless a candidate is claimed by its real owner. No operator
@@ -465,31 +534,20 @@ nothing is judged or booked from it.
 - A break keyed by one venue trade holds until the trades read shows that
   trade again. Trades are read in full today. A windowed trades read would
   need care here.
-- An order a read SHOWED in full that its by-id read no longer finds holds
+- An order a source SHOWED in full that its by-id read no longer finds holds
   the whole account (`READ_CONFLICT`: nothing is answered while it lasts,
   and no release exists). Fail closed. A row or leg that validated in full
   inside a partial, malformed or duplicated answer counts as shown, so an
   adapter that returns a well-formed row for an order the venue does not
-  have holds the account this way too. An order id only NAMED that the venue
-  does not find is a releasable quarantine instead (`ORDER_NOT_FOUND_BY_ID`).
-  While that quarantine stands, the id is not a signed-identity candidate,
-  but nothing rules it out either, so no attempt is answered by signed
-  identity until it is released (r5). An operator who releases it wrongly
-  (the id was the attempt's own order, and the by-id read lied) lets the
-  attempt be answered on the other reads. An id the OMS retains as stream
-  evidence, with no unsound run in between, is not watched this way: the
-  venue's by-id read (E-14) is taken as authoritative for it, and an attempt
-  can be answered while the OMS still retains it (the OMS then raises its own
-  halting alert about the evidence; holdings the evidence moved also withhold
-  `ABSENT`).
+  have holds the account this way too. An id only NAMED that the venue does
+  not find is a releasable quarantine instead (`ORDER_NOT_FOUND_BY_ID`), and
+  while it stands no attempt is answered by signed identity. An operator who
+  releases it wrongly (the id was the attempt's own order, and the by-id read
+  lied) lets the attempt be answered on the other reads.
 - A clock fault latches the run from the moment it is detected, not before.
-  Anything the run did earlier stands: an answer the OMS accepted, a booking,
-  a delivered fill. After the fault the run still compares settlements with
-  the OMS (`applySettlement`) for the orders it has not compared yet. Each
-  such write is a forward fact the venue showed, and the OMS checks it with
-  its own transition rule. The write carries the run's read time as
-  `observedAt`, which is metadata only: a settlement's order is its ordinal.
-  Such writes answer nothing and resolve nothing.
+  Anything the run committed earlier stands: an answer the OMS accepted, a
+  booking, a delivered fill, a settlement written. A forward step that is
+  never corrected is invisible (section 8).
 - A FAILED fill's remaining booking is what the ledger books under its fill
   id (and every reversal linked to one of its transactions). The composition
   must join the OMS's fills to the ledger (`HoldingsPort.remainingBookings`).
@@ -497,41 +555,44 @@ nothing is judged or booked from it.
   names neither the fill nor its transactions does not.
 - One FAILED trade in the process that saw it is three breaks: two
   quarantines (the OMS's alert and the trade's own) and the reversal hold.
-- Trades are read in full each run; nothing is windowed yet.
 - Collateral-kind assets other than pUSD (e.g. USDC.e after an unwrap) have no
   read here, so they are not judged.
 - A wallet operation in flight holds the account paused until it is terminal.
-- The coordinator's in-memory marks are lost on a restart: the out-of-order
-  marks, the unconfirmed deltas, the attempt facts learned from requests, and
-  the contradictions already offered to the OMS. The startup run rebuilds
-  what it needs, conservatively: a settlement read behind the OMS's durable
-  one is a `READ_REGRESSION` whatever the in-memory marks say. Quarantines
-  are in the journal and survive.
-- The out-of-order marks keep the latest status a sound read showed, even one
-  that contradicted the OMS. If a contradicting read later corrects itself,
-  the earlier mark reads the correction as a regression, and holds until a
-  restart. Fail closed: it never resumes early.
+- What a restart still forgets: the unconfirmed holding deltas (their
+  confirmation starts again), the attempt facts learned from requests (the
+  OMS re-issues its requests), and the contradictions already offered to the
+  OMS (offered once more, one more OMS alert each). The evidence and every
+  quarantine are in the journal and survive.
+- The OMS's own alerts live in its memory. An alert raised just before a crash
+  that no run recorded is lost as an alert, but its cause is derived again:
+  a FAILED settlement from the trades read, an unknown venue order from the
+  coordinator's durable stream evidence (read by id, then classified), a
+  fill's contradiction from the comparison (offered again), an evidence
+  conflict and a reservation shortfall by the OMS's own recovery.
 - **A foreign twin.** No order hash exists, so an unknown attempt is matched on
   its economics. Suppose one order placed outside the OMS has exactly the
   attempt's token, side, price and size, and the attempt's own order is not
-  visible (it never arrived, or was cancelled with nothing matched). That
-  order is answered `PRESENT` for the attempt, and the OMS then tracks it as
-  the attempt's. If the attempt's own order is later seen, it is an unclaimed
-  order: `ORDER_UNATTRIBUTED`, or a hold while another attempt could own it.
-  This is detection after the fact, not prevention.
-- Every tracked order with fills is read by id every run, as is every order
-  the trades read names, every tracked order an unresolved break names, and
-  every venue order an unresolved hold names or a run saw but could not
-  classify. All grow with history.
+  visible (it never arrived, or was cancelled with nothing matched, before
+  any source observed it). That order is answered `PRESENT` for the attempt,
+  and the OMS then tracks it as the attempt's. If the attempt's own order is
+  later seen, it is an unclaimed order: `ORDER_UNATTRIBUTED`, or a hold while
+  another attempt could own it. This is detection after the fact, not
+  prevention. (Once any source observed the attempt's own order, it is a
+  candidate or a ghost, and the twin is never adopted.)
+- Every venue order with unsettled evidence, every tracked order with fills,
+  every order the trades read names, every tracked order an unresolved break
+  names, and every venue order an unresolved hold names is read by id every
+  run. The evidence journal grows with history (one record per informative
+  observation).
 - A break about a tracked order holds while that order cannot be compared
   again. That includes a terminal order the venue's by-id read no longer
   finds: E-14 says the by-id read finds canceled and fully matched orders, so
   that is a contradiction, and it holds (fail closed).
 - The two order reads of one run are compared strictly. A status change
   between them other than "live, then terminal" (a delayed order going live,
-  say) holds for that run, and a list that still shows an order live after an
-  earlier sound read showed it terminal holds until the list catches up.
-  Fail closed: a liveness cost.
+  say) holds for that run, and a list that still shows an order live after
+  any earlier observation showed it terminal holds until the list catches
+  up. Fail closed: a liveness cost.
 - Every OMS halting alert is a quarantine of its own, and needs its own
   release. An OMS that raises the same alert repeatedly (re-delivered
   evidence) opens one quarantine per alert. The coordinator offers each

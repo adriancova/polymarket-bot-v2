@@ -22,6 +22,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ReconciliationJournalEvent } from "../../../packages/ledger/src/index.js";
+import { compositeKey } from "../../../packages/oms/src/guards.js";
 import { group, ticket } from "../../unit/oms/support/harness.js";
 import { uuid7 } from "../../unit/oms/support/ids.js";
 
@@ -256,6 +257,33 @@ describe("WP-290 r5 (WP290-CX-R5-02): a clock fault detected after the reads is 
     expect(oracle(r)).toEqual([]);
   });
 
+  it("(r6, R5-C5, a state act) the fault detected while an OMS answer is recorded: a tracked order the venue shows CANCELED is not routed to the OMS by that run (no act, ORDER_STATE_MISMATCH stays open); the next run routes it", async () => {
+    const r = await ready();
+    const second = group(9003, { tokenId: YES, plannedShares: "5" });
+    expect((await r.oms.registerGroup(second)).ok).toBe(true);
+    expect((await r.oms.submitBatch([ticket(G_YES, { n: 972, shares: "1" }), ticket(second, { n: 973, shares: "1" })])).ok).toBe(true);
+    const [first, other] = r.oms.orders();
+    r.u.world.cancel(other?.venueOrderId as string);
+    expect((await r.oms.requestOrderReconciliation(first?.orderId as string)).ok).toBe(true);
+    const routed: string[] = [];
+    const real = r.oms.requestOrderReconciliation.bind(r.oms);
+    r.oms.requestOrderReconciliation = async (orderId) => {
+      routed.push(orderId);
+      return real(orderId);
+    };
+    const restore = faultAfterAnswer(r, "UNREADABLE");
+    const report = await r.p.coordinator.reconcile();
+    expect(report.runs[0]?.detections.map((detection) => detection.breakClass)).toEqual(expect.arrayContaining(["ORDER_STATE_MISMATCH", "READ_STALE"]));
+    // Found, recorded (a hold), but not acted on: the latch is checked before every act.
+    expect(routed).toEqual([]);
+    expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_STATE_MISMATCH")?.status).toBe("OPEN");
+    await expectPaused(r, report.resumed, "READ_STALE");
+    restore();
+    await reconcileRounds(r, 3);
+    expect(routed).toContain(other?.orderId);
+    expect(oracle(r)).toEqual([]);
+  });
+
   it("(R5-02, clearing) the fault detected while an OMS answer is recorded: a hold an earlier run left, which this run's complete reads no longer find, is not cleared by it; the next run clears it", async () => {
     const r = await ready();
     await submitOne(r.oms);
@@ -342,6 +370,38 @@ describe("WP-290 r5 (WP290-CX-R5-02, M08): a clock fault DURING the reads conclu
     // The next run, at once (the request arrived during the first), reads afresh and records it.
     expect(report.runs[1]?.status).toBeDefined();
     expect(states()).toContain("CONFIRMED");
+    expect(oracle(r)).toEqual([]);
+  });
+
+  it("(r6, M08) the same step during the reads, with a foreign order listed: the stale run classifies nothing (no ORDER_UNATTRIBUTED quarantine from those reads; the order is only held, read by id); the next run, at once, classifies it", async () => {
+    const r = await ready();
+    const stream = new FakeStream();
+    r.p.coordinator.bindUserStream(stream);
+    const foreign = r.u.world.placeForeign({ tokenId: YES, side: "BUY", price: "0.3", size: "2" });
+    let stepped = false;
+    r.u.world.faults.onRead = (name) => {
+      if (name !== "listTrades" || stepped) return;
+      stepped = true;
+      r.u.clock.t -= 10;
+      const request = { requestId: "gap-mid-read-2", cause: "SOCKET_CLOSED", markets: [] };
+      stream.pending.push(request);
+      r.p.coordinator.onUserStreamOutput({ kind: "RECONCILIATION_REQUESTED", request });
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    const report = await r.p.coordinator.reconcile();
+    const [first, next] = report.runs;
+    expect(first?.detections.map((detection) => detection.breakClass)).toContain("READ_STALE");
+    // Nothing concluded from the stale reads: the foreign order is held as unclassified, never quarantined by them.
+    expect(first?.detections.map((detection) => detection.breakClass)).not.toContain("ORDER_UNATTRIBUTED");
+    expect(first?.detections.map((detection) => detection.subjectKey)).toContain(compositeKey("ORDER_UNRESOLVED", "venue-order", foreign.venueOrderId));
+    const openedBy = (runId: string | null | undefined): string[] =>
+      events(r, "BREAK_OPENED")
+        .filter((event) => "runId" in event && event.runId === runId)
+        .map((event) => ("breakClass" in event ? event.breakClass : ""));
+    expect(openedBy(first?.runId)).not.toContain("ORDER_UNATTRIBUTED");
+    // The next run, at once (the request arrived during the first), reads afresh and classifies it.
+    expect(next?.detections.map((detection) => detection.breakClass)).toContain("ORDER_UNATTRIBUTED");
+    expect(openedBy(next?.runId)).toContain("ORDER_UNATTRIBUTED");
     expect(oracle(r)).toEqual([]);
   });
 });

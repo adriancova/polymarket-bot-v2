@@ -277,6 +277,12 @@ describe("WP-290 r5 (R5-NAMED's family): an id only named, which the venue's by-
           const read = answer() as { orders: { venueOrderId: string }[] };
           return { ...read, orders: read.orders.map((row) => (row.venueOrderId === real ? { venueOrderId: real, price: "not a price" } : row)) };
         };
+        // (r6) An id with unsettled evidence is read by id in the very run that observed it: here that read fails too,
+        // so only the id is known (the premise of this test: nothing of the order validated).
+        r0.u.world.faults.readOrder = (id, answer) => {
+          if (id === real) throw new Error("timeout");
+          return answer();
+        };
         expect((await r0.p.coordinator.reconcile()).resumed).toBe(false);
         expect(unresolvedSubjects(r0)).toContain(named(real));
         r0.u.world.faults = {

@@ -24,6 +24,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { compositeKey } from "../../../packages/oms/src/guards.js";
 import type { OrderManager } from "../../../packages/oms/src/index.js";
 import { group, ticket } from "../../unit/oms/support/harness.js";
 
@@ -452,6 +453,35 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
   });
 
   it("(I-02) a trade id the OMS never recorded in place of one it did, at equal shares: FILL_MISMATCH, never delivered (nothing double-counted)", async () => {
+    // r6: the OMS learned its fill from the user stream only, so no earlier read showed the trade it recorded: the
+    // venue's trades read shows another trade id in its place, and the OMS's own comparison holds it.
+    const r = await ready();
+    await submitOne(r.oms);
+    const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    r.u.world.faults.listTrades = (answer) => {
+      const read = answer() as { trades: Record<string, unknown>[] };
+      return { ...read, trades: read.trades.map((entry) => ({ ...entry, venueTradeId: "replacement-trade" })) };
+    };
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? ""));
+    await r.p.coordinator.settled();
+    const fills = r.u.store.snapshotSync().fills;
+    expect(fills).toHaveLength(1);
+    for (let round = 0; round < 2; round += 1) {
+      r.p.coordinator.trigger("PERIODIC_TIMER");
+      const report = await r.p.coordinator.reconcile();
+      await expectPaused(r, report.resumed, "FILL_MISMATCH");
+    }
+    expect(r.u.store.snapshotSync().fills).toEqual(fills);
+    expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
+    // r6, class A: the venue has now shown two distinct trades on the order (the replacement, and the original once
+    // the read agrees) summing more than its matched size: no later read can explain that away. It holds.
+    r.u.world.faults = {};
+    expect(await reconcileRounds(r, 3)).toBe(false);
+    await expectPaused(r, false, "READ_CONFLICT");
+    expect(r.u.store.snapshotSync().fills).toEqual(fills);
+  });
+
+  it("(I-02, r6) the same after an earlier read showed the trade the OMS recorded: the evidence holds it (READ_CONFLICT), never delivered, nothing double-counted", async () => {
     const r = await ready();
     await submitOne(r.oms);
     r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
@@ -464,33 +494,69 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     for (let round = 0; round < 2; round += 1) {
       r.p.coordinator.trigger("PERIODIC_TIMER");
       const report = await r.p.coordinator.reconcile();
-      await expectPaused(r, report.resumed, "FILL_MISMATCH");
+      await expectPaused(r, report.resumed, "READ_CONFLICT");
     }
     expect(r.u.store.snapshotSync().fills).toEqual(fills);
     expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
     r.u.world.faults = {};
-    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(await reconcileRounds(r, 3)).toBe(false);
+    expect(r.u.store.snapshotSync().fills).toEqual(fills);
+    expect([...r.u.violations, ...r.u.world.violations]).toEqual([]);
   });
 
   it("(I-02) a settlement contradicting the OMS's terminal one holds for as long as it lasts, even once the OMS's alert is released", async () => {
+    // r6: the OMS learned CONFIRMED from the user stream only (no earlier read showed the trade): the read's FAILED
+    // contradicts the OMS's durable record, and the OMS's own comparison holds it.
+    const r = await ready();
+    await submitOne(r.oms);
+    const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    const tradeId = trade?.venueTradeId ?? "";
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, tradeId));
+    r.p.coordinator.onUserStreamOutput({
+      kind: "TRADE",
+      oms: {
+        fills: [],
+        settlements: [{ venueTradeId: tradeId, venueOrderId: trade?.venueOrderId ?? "", status: "CONFIRMED", transactionHash: trade?.transactionHash ?? null, observedAt: "2026-10-03T00:00:00.000Z" }],
+        shortfalls: [],
+      },
+    });
+    await r.p.coordinator.settled();
+    expect(r.u.store.snapshotSync().settlements.map((settlement) => settlement.state)).toEqual(["CONFIRMED"]);
+    if (trade !== undefined) trade.status = "TRADE_STATUS_FAILED";
+    const first = await r.p.coordinator.reconcile();
+    await expectPaused(r, first.resumed, "FILL_MISMATCH");
+    const alert = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "OMS_HALTING_ALERT");
+    expect(alert?.status).toBe("QUARANTINED");
+    expect((await r.p.coordinator.releaseQuarantine({ breakId: alert?.breakId ?? "", operatorRef: "operator-1", reason: "seen" })).ok).toBe(true);
+    for (let round = 0; round < 2; round += 1) {
+      const report = await r.p.coordinator.reconcile();
+      await expectPaused(r, report.resumed, "FILL_MISMATCH");
+    }
+    expect(r.oms.alerts().filter((entry) => entry.kind === "SETTLEMENT_CONFLICT")).toHaveLength(1);
+  });
+
+  it("(I-02, r6) the same after an earlier read showed the trade CONFIRMED (a restart included): the two reads contradict each other (READ_CONFLICT), nothing is written to the OMS, held until the read agrees", async () => {
     const r = await ready();
     await submitOne(r.oms);
     const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
     expect(await reconcileRounds(r, 3)).toBe(true);
     expect(r.u.store.snapshotSync().settlements.map((settlement) => settlement.state)).toEqual(["CONFIRMED"]);
     if (trade !== undefined) trade.status = "TRADE_STATUS_FAILED";
-    // A fresh process (no in-memory marks): the OMS's durable CONFIRMED is what the read contradicts.
     const again = await restart(r);
-    const first = await again.p.coordinator.reconcile();
-    await expectPaused(again, first.resumed, "FILL_MISMATCH");
-    const alert = again.p.journal.unresolvedBreaks().find((view) => view.breakClass === "OMS_HALTING_ALERT");
-    expect(alert?.status).toBe("QUARANTINED");
-    expect((await again.p.coordinator.releaseQuarantine({ breakId: alert?.breakId ?? "", operatorRef: "operator-1", reason: "seen" })).ok).toBe(true);
-    for (let round = 0; round < 2; round += 1) {
+    for (let round = 0; round < 3; round += 1) {
       const report = await again.p.coordinator.reconcile();
-      await expectPaused(again, report.resumed, "FILL_MISMATCH");
+      await expectPaused(again, report.resumed, "READ_CONFLICT");
     }
-    expect(again.oms.alerts().filter((entry) => entry.kind === "SETTLEMENT_CONFLICT")).toHaveLength(1);
+    expect(again.p.journal.unresolvedBreaks().find((view) => view.subjectKey === compositeKey("READ_CONFLICT", "trade", trade?.venueTradeId ?? "?"))?.detail).toContain("contradict");
+    expect(again.oms.alerts().filter((entry) => entry.kind === "SETTLEMENT_CONFLICT")).toHaveLength(0);
+    expect(again.u.store.snapshotSync().settlements.map((settlement) => settlement.state)).toEqual(["CONFIRMED"]);
+    // The FAILED the read showed is still a halt obligation (class C: derived from the trades read in every run,
+    // whatever its soundness): its market is halted, and an operator releases it once the read is known wrong.
+    const failed = again.p.journal.unresolvedBreaks().find((view) => view.breakClass === "SETTLEMENT_FAILED");
+    expect(failed?.status).toBe("QUARANTINED");
+    if (trade !== undefined) trade.status = "CONFIRMED";
+    expect((await again.p.coordinator.releaseQuarantine({ breakId: failed?.breakId ?? "", operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
+    expect(await reconcileRounds(again, 3)).toBe(true);
   });
 
   it("(I-03) after a restart, a FILLED order whose trade a complete trades read does not show: held, never resumed", async () => {
@@ -837,15 +903,19 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
     return r.p.journal.unresolvedBreaks().find((view) => view.breakClass === breakClass)?.breakId;
   }
 
-  /** A FILL_MISMATCH that persists in the read: the trade the OMS recorded is shown under another id. */
+  /**
+   * A FILL_MISMATCH that persists in the read: the trade the OMS recorded is shown with other economics (its price).
+   * (r6: not under another trade id: two distinct trade ids the venue showed on one order, summing more than its
+   * matched size, are evidence no later read can explain away, so they would hold for good: `(I-02, r6)` above.)
+   */
   async function fillMismatch(): Promise<{ r: Ready; mismatch: string | undefined }> {
     const r = await ready();
     await submitOne(r.oms);
     r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
     expect(await reconcileRounds(r, 3)).toBe(true);
     r.u.world.faults.listTrades = (answer) => {
-      const read = answer() as { trades: Record<string, unknown>[] };
-      return { ...read, trades: read.trades.map((trade) => ({ ...trade, venueTradeId: "replacement-trade" })) };
+      const read = answer() as { trades: { ownLegs: Record<string, unknown>[] }[] };
+      return { ...read, trades: read.trades.map((trade) => ({ ...trade, ownLegs: trade.ownLegs.map((leg) => ({ ...leg, price: "0.45" })) })) };
     };
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await r.p.coordinator.reconcile();
@@ -867,8 +937,12 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "FILL_MISMATCH");
     expect(unresolved(r, "FILL_MISMATCH")).toBe(mismatch);
-    // The read agrees again: compared in full and consistent, it clears.
+    // The read agrees again: compared in full and consistent, it clears (the OMS's own alert about the contradicted
+    // economics is a quarantine an operator releases, as in "(I-02) the same trade with other economics").
     r.u.world.faults = {};
+    for (const view of r.p.journal.unresolvedBreaks().filter((entry) => entry.breakClass === "OMS_HALTING_ALERT")) {
+      expect((await r.p.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
+    }
     expect(await reconcileRounds(r, 3)).toBe(true);
     expect(resolutions(r, mismatch)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
   });
@@ -994,7 +1068,30 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
 });
 
 describe("WP-290 acceptance 1: a break about one tracked order clears once that order is compared again and found consistent (r2, R2-B liveness)", () => {
-  it("(R2-B, liveness) after a restart, a break about a canceled order with nothing filled clears once its by-id read (made because the break names it) finds it consistent", async () => {
+  it("(R2-B, liveness) after a restart, a break about a canceled order with nothing filled clears once its by-id read finds it consistent", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const salt = r.u.world.receipts.at(-1) as string;
+    expect(await reconcileRounds(r, 2)).toBe(true);
+    const venueOrderId = r.u.world.orders.get(salt)?.venueOrderId as string;
+    // The venue cancels the order (the OMS holds it live), and the OMS will not take the authoritative answer yet.
+    r.u.world.cancel(venueOrderId);
+    r.u.seams.applyReconciliation = async () => ({ ok: false, refusal: { code: "OMS_TEST_REFUSED", message: "refused by the test" } });
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "ORDER_STATE_MISMATCH");
+    const mismatch = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_STATE_MISMATCH");
+    expect(mismatch).toBeDefined();
+    // After a restart (nothing in memory), the order is read by id, found canceled with nothing matched, the OMS takes
+    // the answer, the order is compared in full, and the break clears.
+    delete r.u.seams.applyReconciliation;
+    const again = await restart(r);
+    expect(await reconcileRounds(again, 4)).toBe(true);
+    expect([again.oms.orders()[0]?.state, again.oms.orders()[0]?.filledShares]).toEqual(["CANCELED", "0"]);
+    expect(resolutions(again, mismatch?.breakId)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+    expect([...r.u.violations, ...r.u.world.violations]).toEqual([]);
+  });
+
+  it("(R2-B, r6) a match a read showed on a canceled order, which the venue later withdraws, is evidence: the order's breaks never clear on reads that show less; held, never resumed (the r2 liveness setup)", async () => {
     const r = await ready();
     await submitOne(r.oms);
     const salt = r.u.world.receipts.at(-1) as string;
@@ -1004,7 +1101,7 @@ describe("WP-290 acceptance 1: a break about one tracked order clears once that 
     r.p.coordinator.trigger("PERIODIC_TIMER");
     expect(await reconcileRounds(r, 4)).toBe(true);
     expect([r.oms.orders()[0]?.state, r.oms.orders()[0]?.filledShares]).toEqual(["CANCELED", "0"]);
-    // A trades read names the canceled order with a trade the venue later withdraws (the by-id read agrees on its size).
+    // A trades read names the canceled order with a trade, and its by-id read agrees on its size.
     const phantom = {
       venueTradeId: "phantom-1",
       status: "CONFIRMED",
@@ -1024,15 +1121,18 @@ describe("WP-290 acceptance 1: a break about one tracked order clears once that 
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "FILL_REFUSED");
     const named = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "FILL_REFUSED" || view.breakClass === "TRADE_MISSING_IN_OMS");
     expect(named).toHaveLength(2);
-    // The trade is withdrawn. After a restart (no in-memory marks), nothing lists the order and no trade names it: it is
-    // read by id only because the breaks name it, found canceled with nothing matched, compared, and the breaks clear.
+    // The venue withdraws the trade and shows the order with nothing matched. After a restart, the journal's evidence
+    // alone still holds the 0.4 match a read showed: the by-id read showing 0 is a read behind it (READ_REGRESSION),
+    // and nothing about the order is cleared or concluded.
     r.u.world.faults = {};
     const again = await restart(r);
     for (const view of again.p.journal.unresolvedBreaks().filter((entry) => entry.breakClass === "OMS_HALTING_ALERT")) {
       expect((await again.p.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "the phantom trade was withdrawn" })).ok).toBe(true);
     }
-    expect(await reconcileRounds(again, 3)).toBe(true);
-    for (const view of named) expect(resolutions(again, view.breakId)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+    expect(await reconcileRounds(again, 3)).toBe(false);
+    await expectPaused(again, false, "READ_REGRESSION");
+    for (const view of named) expect(resolutions(again, view.breakId)).toEqual([]);
+    expect(again.oms.orders()[0]?.filledShares).toBe("0");
   });
 });
 
@@ -1304,6 +1404,7 @@ describe("WP-290 acceptance 1: a venue order seen once is never forgotten while 
             releaseAcknowledgesSubject: (breakClass) => real.releaseAcknowledgesSubject(breakClass),
             breaks: () => real.breaks(),
             unresolvedBreaks: () => real.unresolvedBreaks(),
+            evidence: () => real.evidence(),
             append: async (event) => {
               const record = event as { kind: string; subjectKey?: string };
               // The journal refuses the record that would name the order (a refusal, not a fault): only memory has it.

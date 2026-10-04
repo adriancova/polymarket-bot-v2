@@ -20,36 +20,42 @@
  * identity) is always `HOLD_UNTIL_CONSISTENT`: it can never be released by an
  * operator, only out-read by a later complete run. That is how "ambiguous
  * state never resumes trading" (work-plan acceptance 1) is a property of the
- * table rather than of a caller's diligence. "No longer reproduces it" means
- * a later COMPLETE run (every read answered, in its shape, consistently) no
- * longer finds it, and, for each kind of subject below, that run performed the
- * check that would find it (the coordinator's `#judged`):
+ * table rather than of a caller's diligence. A run clears a break (r6, class
+ * B) only through ONE function, and only when the comparison that actually
+ * ran in that run POSITIVELY JUDGED the break's exact subject consistent, in
+ * a CONCLUSIVE run (every read answered, in its shape, completely,
+ * consistently and fresh); anything not judged stays open:
  *
- * | Subject | Judged again only by a run that |
+ * | Subject | Positively judged by |
  * | --- | --- |
- * | a holding (`HOLDING_*`, `CORRECTION_FAILED`, `APPROVAL_MISSING`, `WALLET_OPERATION_IN_FLIGHT`) | judged the holdings |
- * | one tracked order's state or fills (`ORDER_STATE_MISMATCH`, `ORDER_FACTS_MISMATCH`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `TRADE_MISSING_IN_OMS`, `FILL_*`) | compared that order in full (not skipped for an unknown token, other venue facts or a missing read) and found nothing wrong with it |
- * | one venue order a read SHOWED (a conflict, regression or unrecognised status keyed by the order; `ORDER_UNRESOLVED` keyed by the venue order) | read that order: by id, or in the open-orders list |
- * | one venue order only NAMED (a by-id read's problem; `ORDER_UNRESOLVED` keyed by a named venue order) | read that order by id, whether the read found it or not |
- * | one venue trade (a read problem keyed by the trade; `SETTLEMENT_REVERSAL_OWED`, which also needs the holdings judged) | read that trade in its trades read |
- * | an attempt's identity ambiguity, or a refused answer | judged that attempt's identity, or answered it |
+ * | a read problem keyed by one read (or one by-id read) | that read answering in its shape |
+ * | a holding (`HOLDING_*`, `CORRECTION_FAILED`, `APPROVAL_MISSING`, `WALLET_OPERATION_IN_FLIGHT`) | the holding comparison finding that asset matched (that spender approved; no operation in flight) |
+ * | one tracked order's state or fills (`ORDER_STATE_MISMATCH`, `ORDER_FACTS_MISMATCH`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `TRADE_MISSING_IN_OMS`, `FILL_*`) | a comparison of that order in full (not skipped for an unknown token, other venue facts or a missing read) that found nothing wrong with it; a refused fill also needs its trade read consistent; a missed fill, its delivery accepted |
+ * | one venue order or trade (a conflict, regression or unrecognised status keyed by it; `ORDER_UNRESOLVED` keyed by the venue order) | the evidence store's verdict on that object, in this run: CONSISTENT (a named id: answered by its by-id read, found or not) |
+ * | `SETTLEMENT_REVERSAL_OWED` | that trade read consistent, and the holdings judged with nothing of its fill booked |
+ * | an attempt's identity ambiguity, or a refused answer | that attempt judged without ambiguity, or an answer accepted (or nothing owed any more) |
+ * | a wallet member's hold | an answer for that member accepted, or its operation's request gone |
+ * | a malformed request | a run its channel presented nothing malformed to |
  *
- * Anything else (a whole read, the run's clock, a component, a request) is
- * judged by every complete run. Every venue order an unresolved break names
- * is read by id in every run, so a later run can always look again. An order
- * id of the account that a run observed but could not classify (its reads
- * were not one consistent view) is recorded as `ORDER_UNRESOLVED` keyed by
- * that venue order, so it is never forgotten, after a restart too, with its
- * PROVENANCE: SHOWN when a read showed the order in full (a complete
- * open-orders list, a valid trades read's leg, a by-id read that found it,
- * and, r5, a row or leg that validated in full inside a partial, malformed or
- * duplicated answer: the answer is discarded, not what its valid rows
- * showed), NAMED otherwise (the id alone of a malformed row or leg, nothing
- * else of which validated; an id only a by-id read was asked about and did
- * not show). A SHOWN order that a later by-id read does not find is a
- * `READ_CONFLICT` (E-14: canceled and fully matched orders are found by id);
- * a NAMED one is an `ORDER_NOT_FOUND_BY_ID` quarantine, which an operator can
- * release.
+ * THE EVIDENCE (r6, class A). Every validated venue observation, from every
+ * source and whatever the run's soundness, is recorded in the journal
+ * (`EVIDENCE_RECORDED`) before anything is classified, so the coordinator's
+ * evidence store is rebuilt from it after a restart. Its PROVENANCE: SHOWN
+ * when a source showed the order in full (a complete open-orders list, a
+ * valid row or leg inside a partial, malformed or duplicated answer, a valid
+ * trades read's leg, a by-id read that found it), NAMED otherwise (the id
+ * alone of a malformed row or leg; an id the OMS retains as user-stream
+ * evidence; one the stream reported). Its HIGH-WATER marks (the most matched
+ * any observation showed, at least the sum of the distinct trades' legs;
+ * terminal once shown terminal; the furthest settlement) are monotonic. Every
+ * venue order with evidence no sound run has settled is read by id in every
+ * run. A read below the high-water mark, live after terminal, or a settlement
+ * backwards is a `READ_REGRESSION` (a contradiction a `READ_CONFLICT`); a
+ * SHOWN order that a later by-id read does not find is a `READ_CONFLICT`
+ * (E-14: canceled and fully matched orders are found by id); a NAMED one is
+ * an `ORDER_NOT_FOUND_BY_ID` quarantine, which an operator can release.
+ * None of these ever resolves an order, answers for it, or fixes its final
+ * size below the evidence: each only holds.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
  * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,
@@ -62,7 +68,13 @@
  * ONE occurrence: each OMS halting alert is keyed by its OMS instance and its
  * ordinal, each FAILED settlement by its trade and order, and each ledger halt
  * obligation by its transaction, movement kind, asset, market and place, so a
- * release never acknowledges another occurrence like it.
+ * release never acknowledges another occurrence like it. Likewise one venue
+ * order id's not-found quarantine: released, then named again by new evidence
+ * and still not found, is a new occurrence with its own subject. Every halt
+ * obligation that needs no consistent view of the venue (a ledger arrival, a
+ * FAILED settlement, an OMS alert) is derived again in EVERY run, whatever its
+ * soundness, so none waits on (or is lost to) a view the account may never
+ * get back.
  *
  * UNMATCHED ACTUAL ACTIVITY becomes UNATTRIBUTED (work-plan acceptance 2;
  * §6 invariant 7; §9.15): an order or a trade of the account that no tracked
@@ -162,21 +174,23 @@ export const BREAK_TAXONOMY = Object.freeze({
   READ_STALE: {
     family: "READ",
     rule: HOLD,
-    meaning: "the run's reads spanned more than the configured bound, or the clock was unreadable or went backwards at any point of the run (its reads, an answer's record, a receipt, its closing reading)",
+    meaning: "the run's reads spanned more than the configured bound, or the clock was unreadable or went backwards at any point of the run (its reads, an answer's record, a receipt, an awaited delivery or write, its closing reading)",
     handling:
       "the run is not trusted as one view of the account: from the moment the fault is detected it gives no further answer, books nothing, acts on no break, clears none and does not resume; submissions stay paused, and a later run with fresh reads (and every pending request's quiescence restarted) answers what it withheld",
   },
   READ_CONFLICT: {
     family: "READ",
     rule: HOLD,
-    meaning: "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs)",
-    handling: "nothing about the subject is concluded; submissions stay paused",
+    meaning:
+      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size, a trade's leg missing or of other shares, a terminal settlement contradicting an earlier one",
+    handling: "nothing about the subject is concluded, the run is not one view of the account (no answer, no classification, no clearing); submissions stay paused until a read agrees with all the evidence",
   },
   READ_REGRESSION: {
     family: "READ",
     rule: HOLD,
-    meaning: "a read shows an older state than an earlier read did (an out-of-order read: matched size down, terminal to open, settlement backwards)",
-    handling: "the newer observation is kept; submissions stay paused until a read catches up",
+    meaning:
+      "a read shows an older state than any earlier validated observation did, from any run or source (an out-of-order read: matched size below the evidence's high-water mark, open after terminal, a settlement backwards, a read behind the OMS's durable settlement)",
+    handling: "the evidence is kept (it never moves down); nothing is answered or settled from the read; submissions stay paused until a read catches up",
   },
   STATUS_UNRECOGNISED: {
     family: "READ",
@@ -189,7 +203,7 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "ORDER",
     rule: HOLD,
     meaning:
-      "more than one venue order could be the unknown attempt's, or one venue order could be more than one attempt's (no order hash exists: WP-270 STOPPED item), or an unclaimed venue order id only named, which the venue's by-id read does not find, stands (its token is unknown, so it could be any attempt's)",
+      "more than one venue order could be the unknown attempt's, or one venue order could be more than one attempt's (no order hash exists: WP-270 STOPPED item), or a GHOST stands: an unclaimed venue order id only named (the id alone of a malformed row or leg, an id the OMS retains as user-stream evidence, one the stream reported), which the venue's by-id read does not find (its token is unknown, so it could be any attempt's)",
     handling: "no answer is given; the attempt stays unresolved and submissions stay paused",
   },
   ORDER_UNATTRIBUTED: {
@@ -232,9 +246,9 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "ORDER",
     rule: QUARANTINE,
     meaning:
-      "a venue order id that no read showed in full (only a by-id read that did not show it, for an id the OMS's retained stream evidence or a request named, or the id alone of a malformed row or leg, nothing else of which validated, named it), recorded while it could not be classified, and that a by-id read of a sound run does not find (E-14: canceled and fully matched orders are found by id)",
+      "a venue order id with evidence that only NAMED it (the id alone of a malformed row or leg, nothing else of which validated; an id the OMS retains as user-stream evidence; one the stream reported), which a by-id read of a sound run does not find (E-14: canceled and fully matched orders are found by id); one subject per occurrence (a new one after each release)",
     handling:
-      "quarantined (the account is halted) until released; while unresolved it is read by id in every run and, once found, classified like any order, and while it is not found no attempt is answered by signed identity (it could be any attempt's); releasing it acknowledges that the venue does not show that id. An id a read did show in full is a READ_CONFLICT instead",
+      "quarantined (the account is halted) until released; while unresolved it is read by id in every run and, once found, classified like any order, and while it is not found no attempt is answered by signed identity (it could be any attempt's); releasing it settles that id's evidence (\"the venue does not show it\"), until new evidence names it again (a new occurrence). An id a source showed in full is a READ_CONFLICT instead",
   },
   // --- trades ----------------------------------------------------------------------------
   TRADE_UNATTRIBUTED: {
@@ -282,7 +296,7 @@ export const BREAK_TAXONOMY = Object.freeze({
     meaning:
       "the venue's trades read shows a trade of a tracked order FAILED (ADR-006 §5: the ledger booked the fill at its match and owes a compensating reversal); one break per trade and order, keyed by the venue's own ids",
     handling:
-      "the order's market is halted; quarantined until released. Derived from the venue's read in every run, not from the OMS's in-memory alert, so a restart never loses it; releasing it acknowledges that one trade's failure",
+      "the order's market is halted; quarantined until released. Derived from the venue's trades read in every run that read it (whatever the run's soundness), not from the OMS's in-memory alert, so a restart never loses it; releasing it acknowledges that one trade's failure",
   },
   // --- holdings (positions and balances against the ledger projection) -------------------
   HOLDING_IN_TRANSIT_AMBIGUOUS: {
@@ -312,8 +326,8 @@ export const BREAK_TAXONOMY = Object.freeze({
   LEDGER_UNATTRIBUTED_ARRIVAL: {
     family: "HOLDING",
     rule: UNATTRIBUTED,
-    meaning: "the ledger holds an UNATTRIBUTED arrival that no break records (e.g. a crash between the booking and the journal)",
-    handling: "the halt obligation is recovered from the ledger: the market is halted; quarantined until released",
+    meaning: "the ledger holds an UNATTRIBUTED arrival that no break records (e.g. a crash between the booking and the journal); one per transaction, movement kind, asset, market and place",
+    handling: "the halt obligation is recovered from the ledger in every run that read the projection (whatever the run's soundness): its market is halted; quarantined until released",
   },
   WALLET_OPERATION_IN_FLIGHT: {
     family: "HOLDING",

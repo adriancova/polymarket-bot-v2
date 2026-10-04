@@ -40,7 +40,15 @@
  * - `RESUME_REFUSED` only right after the latest run completed `PASSED`
  *   (resume happens only once that record is durable; the OMS may still
  *   refuse it, and so may the coordinator itself, when work arrived while
- *   the record was being written).
+ *   the record was being written);
+ * - `EVIDENCE_RECORDED` (r6) names the RUNNING run, or no run (an
+ *   observation recorded between runs: the user stream, an operator's
+ *   release). It is the coordinator's EVIDENCE: every validated venue
+ *   observation, from every source, whatever the run's soundness, so that a
+ *   restart rebuilds it from this journal alone ({@link
+ *   ReconciliationJournal.evidence}). It is a third projection beside the two
+ *   `ops` tables; a composition that persists only the two tables must also
+ *   persist these events (the WP-290 handoff's follow-up).
  *
  * Times are epoch milliseconds from the coordinator's injected clock (safe
  * non-negative integers). Identifiers are caller-minted (this package draws
@@ -167,6 +175,50 @@ export interface ResumeRefusedEvent {
   readonly atMs: number;
 }
 
+/** What one evidence record is about (see {@link EvidenceRecordedEvent}). */
+export const EVIDENCE_KINDS = ["ORDER", "LEG", "SETTLED"] as const;
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+
+/** Whether a source SHOWED the venue order in full (a valid row, a valid leg, a by-id read that found it) or only NAMED its id. */
+export const EVIDENCE_PROVENANCES = ["SHOWN", "NAMED"] as const;
+export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
+
+/**
+ * One VALIDATED VENUE OBSERVATION (WP-290 r6, the coordinator's EvidenceStore), recorded the moment it was made,
+ * whatever the run's soundness or the answer's completeness, so a restart rebuilds the coordinator's evidence from
+ * this journal alone. Append-only, like every event: evidence is never edited or withdrawn.
+ *
+ * - `ORDER`: one observation of one venue order (a list row, a valid row of an unusable answer, the id alone of a
+ *   malformed row, a by-id read that found it, an id the user stream named): `size` is its matched size, `status`
+ *   its status as read, when the source showed them.
+ * - `LEG`: one of the account's own legs of one venue trade (`venueTradeId`): `size` is the leg's shares, `status`
+ *   the trade's settlement status as read.
+ * - `SETTLED`: a SOUND run classified the venue order consistently with all of its evidence, up to `level` (the
+ *   number of informative records about it then), or an operator released its not-found quarantine. It stops the
+ *   order being read by id until new evidence about it arrives.
+ */
+export interface EvidenceRecordedEvent {
+  readonly kind: "EVIDENCE_RECORDED";
+  /** The RUNNING run that observed it, or `null` for an observation recorded between runs (the user stream, a release). */
+  readonly runId: string | null;
+  readonly evidenceKind: EvidenceKind;
+  readonly venueOrderId: string;
+  /** `LEG` only: the venue trade. */
+  readonly venueTradeId: string | null;
+  readonly provenance: EvidenceProvenance;
+  /** Where it was observed (a code, e.g. `OPEN_ORDERS_LIST`, `BY_ID`, `STREAM_FILL`, `OMS_RETAINED`). */
+  readonly source: string;
+  readonly tokenId: string | null;
+  readonly side: "BUY" | "SELL" | null;
+  readonly price: string | null;
+  readonly originalSize: string | null;
+  readonly size: string | null;
+  readonly status: string | null;
+  /** `SETTLED` only. */
+  readonly level: number | null;
+  readonly atMs: number;
+}
+
 /** What a caller hands to {@link ReconciliationJournal.append}. */
 export type ReconciliationJournalInput =
   | RunStartedEvent
@@ -175,7 +227,8 @@ export type ReconciliationJournalInput =
   | BreakQuarantinedEvent
   | BreakResolvedEvent
   | AnswerRecordedEvent
-  | ResumeRefusedEvent;
+  | ResumeRefusedEvent
+  | EvidenceRecordedEvent;
 
 /** An appended event: the input plus its 0-based position in the journal. */
 export type ReconciliationJournalEvent = ReconciliationJournalInput & { readonly sequence: number };
@@ -226,6 +279,9 @@ export interface ReconciliationBreakView {
   readonly openedAtMs: number;
   readonly resolvedAtMs: number | null;
 }
+
+/** One evidence record as appended (its position in the journal included). */
+export type EvidenceRecordView = EvidenceRecordedEvent & { readonly sequence: number };
 
 // ---------------------------------------------------------------------------
 // Results.
@@ -331,7 +387,68 @@ const KEYS: Readonly<Record<ReconciliationJournalInput["kind"], readonly string[
   BREAK_RESOLVED: ["kind", "breakId", "runId", "resolution", "operatorRef", "detail", "atMs"],
   ANSWER_RECORDED: ["kind", "runId", "channel", "requestId", "subjectId", "verdict", "accepted", "refusalCode", "atMs"],
   RESUME_REFUSED: ["kind", "runId", "refusalCode", "atMs"],
+  EVIDENCE_RECORDED: [
+    "kind",
+    "runId",
+    "evidenceKind",
+    "venueOrderId",
+    "venueTradeId",
+    "provenance",
+    "source",
+    "tokenId",
+    "side",
+    "price",
+    "originalSize",
+    "size",
+    "status",
+    "level",
+    "atMs",
+  ],
 });
+
+/** A token id (`internal.token_id`): a canonical unsigned decimal integer string. */
+const TOKEN_ID = /^(?:0|[1-9][0-9]{0,199})$/u;
+
+/** The shape of an evidence record's fields (see {@link EvidenceRecordedEvent}); `undefined` when any is out of its domain. */
+function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | undefined {
+  const runId = field(record, "runId");
+  const evidenceKind = field(record, "evidenceKind");
+  const venueOrderId = field(record, "venueOrderId");
+  const venueTradeId = field(record, "venueTradeId");
+  const provenance = field(record, "provenance");
+  const source = field(record, "source");
+  const tokenId = field(record, "tokenId");
+  const side = field(record, "side");
+  const price = field(record, "price");
+  const originalSize = field(record, "originalSize");
+  const size = field(record, "size");
+  const status = field(record, "status");
+  const level = field(record, "level");
+  if (!nullable(runId, isUuidV7) || typeof evidenceKind !== "string" || !(EVIDENCE_KINDS as readonly string[]).includes(evidenceKind)) return undefined;
+  if (!isIdentifier(venueOrderId) || !nullable(venueTradeId, isIdentifier)) return undefined;
+  if (typeof provenance !== "string" || !(EVIDENCE_PROVENANCES as readonly string[]).includes(provenance) || typeof source !== "string" || !CODE.test(source)) return undefined;
+  if (!(tokenId === null || (typeof tokenId === "string" && TOKEN_ID.test(tokenId))) || !(side === null || side === "BUY" || side === "SELL")) return undefined;
+  if (!nullable(price, isDecimal) || !nullable(originalSize, isDecimal) || !nullable(size, isDecimal) || !nullable(status, isIdentifier) || !nullable(level, isCount)) return undefined;
+  // A leg names its trade; nothing else does. Only a settlement carries a level, and it names no trade.
+  if ((evidenceKind === "LEG") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  return {
+    kind: "EVIDENCE_RECORDED",
+    runId,
+    evidenceKind: evidenceKind as EvidenceKind,
+    venueOrderId,
+    venueTradeId,
+    provenance: provenance as EvidenceProvenance,
+    source,
+    tokenId: tokenId as string | null,
+    side: side as "BUY" | "SELL" | null,
+    price,
+    originalSize,
+    size,
+    status,
+    level,
+    atMs: at,
+  };
+}
 
 /**
  * Read an event's SHAPE: own plain data, exact keys, every field in its
@@ -469,6 +586,11 @@ function readEvent(raw: unknown, withSequence: boolean): ReconciliationJournalEv
       event = { kind, runId, refusalCode, atMs: at };
       break;
     }
+    case "EVIDENCE_RECORDED": {
+      event = readEvidence(record, at);
+      if (event === undefined) return undefined;
+      break;
+    }
     default:
       return undefined;
   }
@@ -495,6 +617,7 @@ export class ReconciliationJournal {
   readonly #events: ReconciliationJournalEvent[] = [];
   readonly #runs = new Map<string, MutableRun>();
   readonly #breaks = new Map<string, MutableBreak>();
+  readonly #evidence: EvidenceRecordView[] = [];
   /** subjectKey → the id of its unresolved (OPEN or QUARANTINED) break. */
   readonly #unresolvedBySubject = new Map<string, string>();
   #runningRunId: string | null = null;
@@ -577,6 +700,11 @@ export class ReconciliationJournal {
   /** Breaks still OPEN or QUARANTINED, in the order they were opened. */
   unresolvedBreaks(): readonly ReconciliationBreakView[] {
     return Object.freeze([...this.#breaks.values()].map((entry) => entry.view).filter((view) => view.status !== "RESOLVED"));
+  }
+
+  /** Every evidence record, in the order it was appended (the coordinator's EvidenceStore is rebuilt from it). */
+  evidence(): readonly EvidenceRecordView[] {
+    return Object.freeze([...this.#evidence]);
   }
 
   /**
@@ -677,6 +805,11 @@ export class ReconciliationJournal {
         }
         return undefined;
       }
+      case "EVIDENCE_RECORDED":
+        // An observation names the RUNNING run, or none (one recorded between runs). A run's classification
+        // (`SETTLED`) is that run's: a settlement naming no run is an operator's release, recorded outside runs.
+        if (event.runId !== null && running !== event.runId) return "evidence names the RUNNING run, or none";
+        return undefined;
     }
     return "unknown event";
   }
@@ -765,6 +898,9 @@ export class ReconciliationJournal {
         this.#unresolvedBySubject.delete(entry.view.subjectKey);
         return;
       }
+      case "EVIDENCE_RECORDED":
+        appendData(this.#evidence, event);
+        return;
       case "ANSWER_RECORDED":
       case "RESUME_REFUSED":
         return;

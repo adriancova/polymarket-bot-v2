@@ -14,14 +14,14 @@
  * | `WRONG_ROUTE` | the answer names another route (Data API v1, E-15) | `READ_WRONG_ROUTE` |
  *
  * None of them is ever read as "empty". A partial or malformed open-orders or
- * trades answer is discarded whole, but the venue order ids its rows carry are
- * NOT forgotten (r4, WP290-CX-R4-01): the outcome keeps them (`named`: each id
- * a row or leg carries, with its token when the row validated in full), so the
- * coordinator records them and reads each by id until it is classified. The
- * token is present exactly when the row (or leg) validated in full: such a
- * row SHOWED its order, and the coordinator records it as shown (r5,
- * R5-NAMED); `null` marks the id alone of a malformed row (only named).
- * Statuses are kept as data: an order
+ * trades answer is discarded whole, but what its rows SHOWED is NOT forgotten
+ * (r4, WP290-CX-R4-01; r5, R5-NAMED; r6, WP290-CX-R6-01): the outcome keeps
+ * `named` (each id a row or leg carries, with its token when the row
+ * validated in full, `null` for the id alone of a malformed row) and
+ * `salvage` (every row and every leg that validated in full, with its matched
+ * size or shares and its status as read). The coordinator records all of it
+ * as evidence (`evidence.ts`) before anything is classified, so a later read
+ * that shows less can never be taken for the truth. Statuses are kept as data: an order
  * or trade status outside the documented vocabulary is not malformed, it is
  * UNRECOGNISED, and the coordinator holds on it (`STATUS_UNRECOGNISED`).
  * Trade statuses are accepted in both documented spellings (E-13, C-5):
@@ -54,11 +54,27 @@ import {
  */
 export type NamedOrders = ReadonlyMap<string, string | null>;
 
+/** One own leg that validated in full inside an unusable trades answer, with its trade's id and status when those validated too. */
+export interface SalvagedLeg {
+  readonly venueTradeId: string | null;
+  readonly status: string | null;
+  readonly leg: VenueTradeLeg;
+}
+
+/**
+ * What the rows of an unusable open-orders or trades answer SHOWED in full (r6, WP290-CX-R6-01): every order row
+ * and every own leg that validated in full. The answer is discarded; these facts are not (`evidence.ts`).
+ */
+export interface Salvage {
+  readonly rows: readonly VenueOrderView[];
+  readonly legs: readonly SalvagedLeg[];
+}
+
 export type ReadOutcome<T> =
   | { readonly kind: "OK"; readonly value: T }
   | { readonly kind: "FAILED" }
-  | { readonly kind: "MALFORMED"; readonly why: string; readonly named?: NamedOrders }
-  | { readonly kind: "INCOMPLETE"; readonly named?: NamedOrders }
+  | { readonly kind: "MALFORMED"; readonly why: string; readonly named?: NamedOrders; readonly salvage?: Salvage }
+  | { readonly kind: "INCOMPLETE"; readonly named?: NamedOrders; readonly salvage?: Salvage }
   | { readonly kind: "WRONG_ROUTE"; readonly route: string };
 
 /** The longest list a read may return (a guard; no venue fact bounds it). */
@@ -73,12 +89,25 @@ function ok<T>(value: T): ReadOutcome<T> {
   return Object.freeze({ kind: "OK", value });
 }
 
-function malformed<T>(why: string, named?: NamedOrders): ReadOutcome<T> {
-  return named === undefined || named.size === 0 ? Object.freeze({ kind: "MALFORMED", why }) : Object.freeze({ kind: "MALFORMED", why, named });
+function frozenSalvage(salvage: Salvage | undefined): Salvage | undefined {
+  if (salvage === undefined || (salvage.rows.length === 0 && salvage.legs.length === 0)) return undefined;
+  return Object.freeze({ rows: Object.freeze([...salvage.rows]), legs: Object.freeze(salvage.legs.map((entry) => Object.freeze({ ...entry }))) });
 }
 
-function incomplete<T>(named: NamedOrders): ReadOutcome<T> {
-  return named.size === 0 ? INCOMPLETE : Object.freeze({ kind: "INCOMPLETE", named });
+function malformed<T>(why: string, named?: NamedOrders, salvage?: Salvage): ReadOutcome<T> {
+  const kept = frozenSalvage(salvage);
+  return Object.freeze({
+    kind: "MALFORMED",
+    why,
+    ...(named === undefined || named.size === 0 ? {} : { named }),
+    ...(kept === undefined ? {} : { salvage: kept }),
+  });
+}
+
+function incomplete<T>(named: NamedOrders, salvage?: Salvage): ReadOutcome<T> {
+  const kept = frozenSalvage(salvage);
+  if (named.size === 0 && kept === undefined) return INCOMPLETE;
+  return Object.freeze({ kind: "INCOMPLETE", ...(named.size === 0 ? {} : { named }), ...(kept === undefined ? {} : { salvage: kept }) });
 }
 
 /** A row's own `venueOrderId` field, when it is a venue id (the rest of the row may be anything). */
@@ -154,6 +183,8 @@ export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderVie
   const list = readArray(fields.orders, MAX_READ_ENTRIES);
   const out: VenueOrderView[] = [];
   const named = new Map<string, string | null>();
+  // Every row that validated in full, a repeated one included (r6): each SHOWED its order.
+  const rows: VenueOrderView[] = [];
   const seen = new Set<string>();
   let problem: string | undefined;
   for (const entry of list ?? []) {
@@ -165,6 +196,7 @@ export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderVie
       continue;
     }
     keepNamed(named, order.venueOrderId, order.tokenId);
+    rows.push(order);
     if (seen.has(order.venueOrderId)) {
       problem ??= "an open order is listed twice";
       continue;
@@ -172,9 +204,12 @@ export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderVie
     seen.add(order.venueOrderId);
     out.push(order);
   }
-  if (fields.complete !== true) return fields.complete === false ? incomplete(named) : malformed("the open-orders answer does not say whether it is complete", named);
+  const salvage: Salvage = { rows, legs: [] };
+  if (fields.complete !== true) {
+    return fields.complete === false ? incomplete(named, salvage) : malformed("the open-orders answer does not say whether it is complete", named, salvage);
+  }
   if (list === undefined) return malformed("the open orders are not a list");
-  if (problem !== undefined) return malformed(problem, named);
+  if (problem !== undefined) return malformed(problem, named, salvage);
   return ok(Object.freeze(out));
 }
 
@@ -246,13 +281,22 @@ function readTradeView(raw: unknown): VenueTradeView | string {
   });
 }
 
-/** The ids an unusable trade row's legs carry (each leg read on its own). */
-function keepLegsOf(named: Map<string, string | null>, row: unknown): void {
+/**
+ * The ids an unusable trade row's legs carry, each leg read on its own; every leg that validated in full is kept
+ * whole (`salvage`), with the row's trade id and status when those are readable (r6).
+ */
+function keepLegsOf(named: Map<string, string | null>, salvage: SalvagedLeg[], row: unknown): void {
+  const tradeId = readField(row, "venueTradeId");
+  const status = readField(row, "status");
+  const venueTradeId = tradeId.kind === "DATA" && isIdentifier(tradeId.value) ? tradeId.value : null;
+  const statusText = status.kind === "DATA" && isIdentifier(status.value) ? status.value : null;
   const legs = readField(row, "ownLegs");
   for (const leg of (legs.kind === "DATA" ? readArray(legs.value, MAX_LEGS_PER_TRADE) : undefined) ?? []) {
     const valid = readLeg(leg);
-    if (typeof valid !== "string") keepNamed(named, valid.venueOrderId, valid.tokenId);
-    else {
+    if (typeof valid !== "string") {
+      keepNamed(named, valid.venueOrderId, valid.tokenId);
+      salvage.push({ venueTradeId, status: statusText, leg: valid });
+    } else {
       const id = rowVenueId(leg);
       if (id !== undefined) keepNamed(named, id, null);
     }
@@ -270,16 +314,20 @@ export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]>
   const list = readArray(fields.trades, MAX_READ_ENTRIES);
   const out: VenueTradeView[] = [];
   const named = new Map<string, string | null>();
+  const legs: SalvagedLeg[] = [];
   const seen = new Set<string>();
   let problem: string | undefined;
   for (const entry of list ?? []) {
     const trade = readTradeView(entry);
     if (typeof trade === "string") {
       problem ??= trade;
-      keepLegsOf(named, entry);
+      keepLegsOf(named, legs, entry);
       continue;
     }
-    for (const leg of trade.ownLegs) keepNamed(named, leg.venueOrderId, leg.tokenId);
+    for (const leg of trade.ownLegs) {
+      keepNamed(named, leg.venueOrderId, leg.tokenId);
+      legs.push({ venueTradeId: trade.venueTradeId, status: trade.status, leg });
+    }
     if (seen.has(trade.venueTradeId)) {
       problem ??= "a trade is listed twice";
       continue;
@@ -287,9 +335,12 @@ export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]>
     seen.add(trade.venueTradeId);
     out.push(trade);
   }
-  if (fields.complete !== true) return fields.complete === false ? incomplete(named) : malformed("the trades answer does not say whether it is complete", named);
+  const salvage: Salvage = { rows: [], legs };
+  if (fields.complete !== true) {
+    return fields.complete === false ? incomplete(named, salvage) : malformed("the trades answer does not say whether it is complete", named, salvage);
+  }
   if (list === undefined) return malformed("the trades are not a list");
-  if (problem !== undefined) return malformed(problem, named);
+  if (problem !== undefined) return malformed(problem, named, salvage);
   return ok(Object.freeze(out));
 }
 

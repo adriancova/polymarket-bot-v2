@@ -399,12 +399,11 @@ describe("WP-290 r4 (WP290-V4-GHOST-ID-PERMANENT-HOLD): an id no read showed, wh
     const r = await ready();
     r.u.world.nextTransmission = sequence(["UNKNOWN_ABSENT"]);
     await submitOne(r.oms);
-    // The stream names the id the next foreign order will carry, before the venue shows any such order.
+    // The stream names the id the next foreign order will carry (an order observation), before the venue shows any
+    // such order. (r6: a FILL the stream reported is evidence of a match; a venue order later shown with less matched
+    // than that is a contradiction, never classified: the "(GHOST, found later, with less matched)" pin below.)
     const id = "venue-foreign-1";
-    r.p.coordinator.onUserStreamOutput({
-      kind: "TRADE",
-      oms: { fills: [{ venueTradeId: "late-trade", venueOrderId: id, shares: "0.1", price: "0.5", liquidityRole: "MAKER", feeAmount: "0", feeAssetId: null, matchedAt: "2026-10-03T00:00:00Z" }], settlements: [], shortfalls: [] },
-    });
+    r.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: { venueOrderId: id, status: "LIVE" }, shortfalls: [] } });
     await r.p.coordinator.settled();
     r.u.world.faults.listTrades = () => {
       throw new Error("timeout");
@@ -424,6 +423,33 @@ describe("WP-290 r4 (WP290-V4-GHOST-ID-PERMANENT-HOLD): an id no read showed, wh
     await expectPaused(again, (await again.p.coordinator.reconcile()).resumed, "ORDER_UNATTRIBUTED");
     expect(reads).toContain(id);
     expect(again.p.journal.unresolvedBreaks().find((view) => view.breakClass === "ORDER_UNATTRIBUTED")?.subjectKey).toBe(compositeKey("ORDER_UNATTRIBUTED", id));
+  });
+
+  it("(GHOST, found later, with less matched) r6: a fill the stream reported for an id is evidence that survives a restart; the venue later showing that order with less matched is a read behind the evidence (READ_REGRESSION), never classified, never resumed", async () => {
+    const r = await ready();
+    r.u.world.nextTransmission = sequence(["UNKNOWN_ABSENT"]);
+    await submitOne(r.oms);
+    const id = "venue-foreign-1";
+    r.p.coordinator.onUserStreamOutput({
+      kind: "TRADE",
+      oms: { fills: [{ venueTradeId: "late-trade", venueOrderId: id, shares: "0.1", price: "0.5", liquidityRole: "MAKER", feeAmount: "0", feeAssetId: null, matchedAt: "2026-10-03T00:00:00Z" }], settlements: [], shortfalls: [] },
+    });
+    await r.p.coordinator.settled();
+    const again = await restart(r);
+    expect(await reconcileRounds(again, 2)).toBe(false);
+    expect(unresolvedSubjects(again)).toContain(compositeKey("ORDER_NOT_FOUND_BY_ID", id));
+    // The venue now shows an order under that id, canceled, with NOTHING matched: less than the fill the stream saw.
+    const foreign = r.u.world.placeForeign({ tokenId: YES, side: "SELL", price: "0.9", size: "3" });
+    expect(foreign.venueOrderId).toBe(id);
+    r.u.world.cancel(id);
+    for (let round = 0; round < 3; round += 1) {
+      again.p.coordinator.trigger("PERIODIC_TIMER");
+      await expectPaused(again, (await again.p.coordinator.reconcile()).resumed, "READ_REGRESSION");
+    }
+    expect(again.p.journal.breaks().map((view) => view.breakClass)).not.toContain("ORDER_UNATTRIBUTED");
+    expect(again.p.journal.unresolvedBreaks().find((view) => view.subjectKey === compositeKey("READ_REGRESSION", "order", id))?.detail).toContain("less than the 0.1");
+    // The fill was durable evidence the moment it was routed (the OMS retained it in memory only).
+    expect(again.p.journal.evidence().map((record) => [record.evidenceKind, record.venueOrderId, record.venueTradeId, record.size, record.source])).toContainEqual(["LEG", id, "late-trade", "0.1", "STREAM_FILL"]);
   });
 
   it("(GHOST, MALFORMED_SIBLING) an id only a malformed row carried, which the venue does not find, is quarantined the same way", async () => {

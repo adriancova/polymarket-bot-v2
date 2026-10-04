@@ -22,7 +22,7 @@
  * | the same, and `READ_MISSING`, `READ_MALFORMED`, `READ_WRONG_ROUTE` | `[class, compositeKey("order", id)]` (a by-id read's problem) | venue order `id` |
  * | `READ_REGRESSION`, `STATUS_UNRECOGNISED`, `READ_INCOMPLETE` | `[class, "trade", id]` | venue trade `id` |
  * | `ORDER_UNRESOLVED` | `[class, "venue-order", id]` or `[class, "venue-order-named", id]` (r4) | venue order `id` |
- * | `ORDER_NOT_FOUND_BY_ID` (r4) | `[class, id]` | venue order `id` |
+ * | `ORDER_NOT_FOUND_BY_ID` (r4; r6 occurrences) | `[class, id]`, or `[class, id, n]` for the occurrence after `n` released ones | venue order `id` |
  * | `SETTLEMENT_REVERSAL_OWED` (r4) | `[class, trade, order]` | venue trade `trade` |
  *
  * Every other subject names no venue object here (`ORDER_UNRESOLVED` by
@@ -108,7 +108,7 @@ export function venueSubjectOf(breakClass: BreakClass, subjectKey: string): Venu
     const id = parts[2];
     if (id !== undefined && id.length > 0) return { kind: "order", id };
   }
-  if (breakClass === "ORDER_NOT_FOUND_BY_ID" && parts.length === 2) {
+  if (breakClass === "ORDER_NOT_FOUND_BY_ID" && (parts.length === 2 || (parts.length === 3 && /^[1-9][0-9]{0,8}$/u.test(parts[2] ?? "")))) {
     const id = parts[1];
     if (id !== undefined && id.length > 0) return { kind: "order", id };
   }

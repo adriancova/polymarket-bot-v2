@@ -168,6 +168,7 @@ describe("WP-290 deliverable 3: resume only when every invariant still holds at 
         if (failing) throw new Error("the journal's read side is down");
         return journal.unresolvedBreaks();
       },
+      evidence: () => journal.evidence(),
       append: (event) => journal.append(event),
     });
     const r = await ready({ seams: { journal: wrap } });
