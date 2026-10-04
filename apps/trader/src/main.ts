@@ -191,7 +191,7 @@ import {
   RedisStreamsEventTransport,
   type EventSubscription,
 } from "@polymarket-bot/event-bus";
-import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
+import { DEFAULT_CONNECTION_TIMEOUT_MS, createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
 import { PostgresTraderStore } from "./adapters/postgres-store.js";
@@ -205,7 +205,7 @@ import {
   type RunningTraderHealthServer,
 } from "./health-server.js";
 import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
-import { exitAfterStartup, processExitPorts } from "./process-exit.js";
+import { PROCESS_EXIT_GRACE_MS, exitAfterStartup, processExitPorts } from "./process-exit.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
@@ -321,8 +321,13 @@ export async function startup(ports: StartupPorts): Promise<number> {
       "outage latches a GLOBAL TRANSPORT_UNAVAILABLE halt within that bound of the first command it " +
       `leaves unanswered, and the process exits ${String(EXIT_CODES.halted)} at most ` +
       `${String(2 * responseTimeoutMs)} ms after the halt (one bound for each connection's courtesy ` +
-      `QUIT) plus the durable halt record (at most ${String(HALT_RECORD_DEADLINE_MS)} ms; a connection ` +
-      "that has not answered by then is destroyed) and the PostgreSQL close (§4.2)",
+      "QUIT) plus the durable halt record, the PostgreSQL close and " +
+      `${String(PROCESS_EXIT_GRACE_MS)} ms for the process to exit. The record answers within ` +
+      `${String(HALT_RECORD_DEADLINE_MS)} ms: at that bound it reports UNCONFIRMED and destroys the ` +
+      "connection it holds; a connection the pool is still opening then is ended only by the pool's " +
+      `${String(DEFAULT_CONNECTION_TIMEOUT_MS)} ms connection timeout, which the PostgreSQL close waits ` +
+      "for. A process that a silent peer still holds open once that grace has passed is exited by " +
+      "force, as soon as every line it logged has reached the log (§4.2)",
   );
 
   // --- 3. infrastructure ----------------------------------------------------
