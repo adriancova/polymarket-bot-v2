@@ -2,18 +2,25 @@
  * `TC-LOWS-1` (`PROV1-R2-L2`) — the process exits once `startup()` has
  * returned, within a bound (`process-exit.ts`).
  *
- * Two layers:
+ * Three layers:
  *
  * 1. the decision, through its ports: the exit code first, nothing forced
  *    while the grace runs, then one line and an exit with the SAME code — once
- *    — and a stuck log bounded too;
- * 2. a REAL Node process (Node 24 strips the module's types, so a child can
- *    import it as is), bound to the real `process` exactly as `main.ts` binds
- *    it: a half-closed socket whose peer never answers — what a frozen
- *    PostgreSQL leaves of the pool's ended idle connections — keeps a process
- *    that only sets `process.exitCode` alive; the same process exits with its
- *    code within the bound once the module runs; and a process nothing holds
- *    exits at once, with no forced line.
+ *    — and only from that line's own write callback: no timer exits ahead of
+ *    the log (`TC-LOWS-1` r1, `TCL1-R1-01`);
+ * 2. {@link processExitPorts}, the binding `main.ts`'s shell hands `process`
+ *    to, against a recording stand-in: a line is "flushed" only from its
+ *    write's callback;
+ * 3. a REAL Node process (Node 24 strips the module's types, so a child can
+ *    import it as is), bound by {@link processExitPorts}`(process)` exactly
+ *    as `main.ts`'s shell binds it: a half-closed socket whose peer never
+ *    answers — what a frozen PostgreSQL leaves of the pool's ended idle
+ *    connections — keeps a process that only sets `process.exitCode` alive;
+ *    the same process exits with its code within the bound once the module
+ *    runs; a process nothing holds exits at once, with no forced line; and a
+ *    process whose log consumer has stalled, with far more than a pipe's
+ *    worth of lines queued, delivers EVERY line — the halt lines included —
+ *    before it exits.
  *
  * The shipped bundle against a frozen PostgreSQL is
  * `test/integration/paper-trader/process-exit-frozen-postgres-redis.test.ts`.
@@ -26,11 +33,11 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
-  PROCESS_EXIT_BOUNDS,
-  PROCESS_EXIT_FLUSH_MS,
   PROCESS_EXIT_GRACE_MS,
   exitAfterStartup,
   forcedExitLine,
+  processExitPorts,
+  type ExitingProcess,
   type ProcessExitPorts,
 } from "./process-exit.js";
 
@@ -58,10 +65,8 @@ function recordingPorts(options: { readonly holders?: () => readonly string[] } 
 }
 
 describe("exitAfterStartup, through its ports", () => {
-  it("the bounds: 1 000 ms of grace, then at most 1 000 ms for the forced line — 2 000 ms after startup() returned", () => {
+  it("the bound: 1 000 ms of grace after startup() returned; the forced exit then waits on the log (TCL1-R1-01)", () => {
     expect(PROCESS_EXIT_GRACE_MS).toBe(1_000);
-    expect(PROCESS_EXIT_FLUSH_MS).toBe(1_000);
-    expect(PROCESS_EXIT_BOUNDS).toStrictEqual({ graceMs: 1_000, flushMs: 1_000 });
   });
 
   it("sets the exit code FIRST and arms one unreferenced grace timer — nothing is written and nothing exits while it runs (a process nothing holds exits on its own)", () => {
@@ -71,29 +76,31 @@ describe("exitAfterStartup, through its ports", () => {
     expect(timers.map((timer) => timer.ms)).toEqual([PROCESS_EXIT_GRACE_MS]);
   });
 
-  it("the grace expired: ONE line naming what holds the process, a flush backstop, and the SAME code's exit once the line is flushed — only once", () => {
+  it("the grace expired: ONE line naming what holds the process, and the SAME code's exit once that line is flushed — only once, and no other timer", () => {
     const { ports, calls, timers, pendingFlushes, lines } = recordingPorts();
     exitAfterStartup(75, ports);
     timers[0]?.fire();
-    expect(calls).toEqual(["exitCode=75", "timer(1000)", "timer(1000)", "writeLine"]);
+    expect(calls).toEqual(["exitCode=75", "timer(1000)", "writeLine"]);
     expect(lines).toEqual([forcedExitLine(75, PROCESS_EXIT_GRACE_MS, ["TCPSocketWrap", "TCPSocketWrap", "PipeWrap"])]);
     expect(lines[0]).toContain("still held open by 1 × PipeWrap, 2 × TCPSocketWrap");
     // Not before the line is out.
     expect(calls).not.toContain("exit(75)");
     pendingFlushes[0]?.();
     expect(calls.filter((call) => call.startsWith("exit("))).toEqual(["exit(75)"]);
-    // The backstop firing afterwards changes nothing.
-    timers[1]?.fire();
+    // A second callback changes nothing.
+    pendingFlushes[0]?.();
     expect(calls.filter((call) => call.startsWith("exit("))).toEqual(["exit(75)"]);
   });
 
-  it("a log that never takes the line does not hold the process either: the backstop exits with the same code", () => {
+  it("a log that has not taken the line HOLDS the exit (TCL1-R1-01): after the grace no timer is armed, so nothing exits until the line's own callback — every line queued before it is out by then", () => {
     const { ports, calls, timers, pendingFlushes } = recordingPorts();
     exitAfterStartup(69, ports);
     timers[0]?.fire();
-    expect(timers.map((timer) => timer.ms)).toEqual([PROCESS_EXIT_GRACE_MS, PROCESS_EXIT_FLUSH_MS]);
-    timers[1]?.fire();
-    expect(calls.filter((call) => call.startsWith("exit("))).toEqual(["exit(69)"]);
+    // Only the grace timer, ever: nothing can fire an exit ahead of the log.
+    expect(timers.map((timer) => timer.ms)).toEqual([PROCESS_EXIT_GRACE_MS]);
+    for (const timer of timers) timer.fire();
+    expect(calls.filter((call) => call.startsWith("exit("))).toEqual([]);
+    // However late the log takes the line, the exit follows it, with the code.
     pendingFlushes[0]?.();
     expect(calls.filter((call) => call.startsWith("exit("))).toEqual(["exit(69)"]);
   });
@@ -133,6 +140,89 @@ describe("exitAfterStartup, through its ports", () => {
   });
 });
 
+/** A stand-in for `process`: records what the binding does with it. */
+function recordingProcess(options: { readonly writeThrows?: boolean } = {}) {
+  const writes: { readonly chunk: string; readonly callback: (() => void) | undefined }[] = [];
+  const exits: number[] = [];
+  const target: ExitingProcess = {
+    exitCode: undefined,
+    exit: (code) => {
+      exits.push(Number(code));
+      return undefined as never;
+    },
+    stderr: {
+      write: (chunk, callback) => {
+        if (options.writeThrows === true) throw new Error("EPIPE");
+        writes.push({
+          chunk,
+          callback:
+            callback === undefined
+              ? undefined
+              : () => {
+                  callback();
+                },
+        });
+        return false;
+      },
+    },
+    getActiveResourcesInfo: () => ["PipeWrap", "TCPSocketWrap"],
+  };
+  return { target, writes, exits };
+}
+
+describe("processExitPorts, the binding main.ts's shell hands process to", () => {
+  it("binds the exit code, the exit, the holders, and stderr — one line, newline-terminated", () => {
+    const { target, writes, exits } = recordingProcess();
+    const ports = processExitPorts(target);
+    ports.setExitCode(75);
+    expect(target.exitCode).toBe(75);
+    expect(ports.holders()).toEqual(["PipeWrap", "TCPSocketWrap"]);
+    ports.writeLine("PROCESS EXIT FORCED: x", () => undefined);
+    expect(writes.map((write) => write.chunk)).toEqual(["PROCESS EXIT FORCED: x\n"]);
+    ports.exit(75);
+    expect(exits).toEqual([75]);
+  });
+
+  it("a line counts as flushed only from its write's OWN callback — never when the write merely returns (TCL1-R1-01: the write returns at once with the line still queued)", () => {
+    const { target, writes } = recordingProcess();
+    const ports = processExitPorts(target);
+    let flushed = 0;
+    ports.writeLine("line", () => {
+      flushed += 1;
+    });
+    expect(flushed).toBe(0);
+    writes[0]?.callback?.();
+    expect(flushed).toBe(1);
+  });
+
+  it("a write that throws counts as flushed: a broken log cannot hold the exit", () => {
+    const { target } = recordingProcess({ writeThrows: true });
+    let flushed = 0;
+    processExitPorts(target).writeLine("line", () => {
+      flushed += 1;
+    });
+    expect(flushed).toBe(1);
+  });
+
+  it("end to end through the binding: the process exits from the forced line's callback, not before", () => {
+    const { target, writes, exits } = recordingProcess();
+    const timers: (() => void)[] = [];
+    const ports: ProcessExitPorts = {
+      ...processExitPorts(target),
+      unrefTimer: (_ms, fire) => {
+        timers.push(fire);
+      },
+    };
+    exitAfterStartup(75, ports);
+    expect(target.exitCode).toBe(75);
+    timers[0]?.();
+    expect(writes).toHaveLength(1);
+    expect(exits).toEqual([]);
+    writes[0]?.callback?.();
+    expect(exits).toEqual([75]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // A real process
 // ---------------------------------------------------------------------------
@@ -141,9 +231,9 @@ const MODULE_URL = new URL("./process-exit.ts", import.meta.url).href;
 
 /**
  * A child Node process. It writes `startup() returned` to stderr, then either
- * binds `exitAfterStartup` to the real process EXACTLY as `main.ts`'s shell
- * does (`bounded`), or only sets `process.exitCode` (the shell before this
- * round).
+ * runs `exitAfterStartup(75, processExitPorts(process))` — `main.ts`'s shell,
+ * call for call (`bounded`) — or only sets `process.exitCode` (the shell
+ * before this round).
  *
  * With `frozenPeerPort`, it first opens a connection to a FROZEN peer — a
  * server in THIS test process that accepts and never reads — and closes it as
@@ -158,7 +248,7 @@ const MODULE_URL = new URL("./process-exit.ts", import.meta.url).href;
 function childScript(options: { readonly bounded: boolean; readonly frozenPeerPort?: number }): string {
   return `
 import { createConnection } from "node:net";
-import { exitAfterStartup } from ${JSON.stringify(MODULE_URL)};
+import { exitAfterStartup, processExitPorts } from ${JSON.stringify(MODULE_URL)};
 ${
   options.frozenPeerPort === undefined
     ? ""
@@ -171,21 +261,7 @@ await new Promise((resolve) => client.write(Buffer.from([0x58, 0, 0, 0, 4]), () 
 `
 }
 process.stderr.write("startup() returned\\n");
-${
-  options.bounded
-    ? `
-exitAfterStartup(75, {
-  setExitCode: (exitCode) => { process.exitCode = exitCode; },
-  exit: (exitCode) => { process.exit(exitCode); },
-  writeLine: (line, flushed) => {
-    try { process.stderr.write(line + "\\n", () => { flushed(); }); } catch { flushed(); }
-  },
-  unrefTimer: (ms, fire) => { setTimeout(fire, ms).unref(); },
-  holders: () => process.getActiveResourcesInfo(),
-});
-`
-    : "process.exitCode = 75;"
-}
+${options.bounded ? "exitAfterStartup(75, processExitPorts(process));" : "process.exitCode = 75;"}
 `;
 }
 
@@ -247,8 +323,8 @@ async function runChild(script: string, deadlineMs: number): Promise<ChildRun> {
   });
 }
 
-/** The bound, plus a margin for a loaded host. */
-const BOUND_MS = PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS;
+/** The bound — the grace, with a log that keeps up — plus a margin for a loaded host. */
+const BOUND_MS = PROCESS_EXIT_GRACE_MS;
 const MARGIN_MS = 1_500;
 
 describe("a real process: a half-closed socket whose peer never answers", () => {
@@ -281,4 +357,136 @@ describe("a real process: a half-closed socket whose peer never answers", () => 
     expect(run.stderr).not.toContain("PROCESS EXIT FORCED");
     expect(run.afterStartupMs).toBeLessThan(PROCESS_EXIT_GRACE_MS);
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// A real process whose log consumer has stalled (TC-LOWS-1 r1, TCL1-R1-01)
+// ---------------------------------------------------------------------------
+
+/** Lines of 1 000 filler bytes queued ahead of the halt lines: 400 KB, far more than a 64 KiB pipe takes. */
+const FILLER_LINES = 400;
+/** The three lines an unconfirmed halt leaves in the log — its ONLY record. */
+const HALT_LINES = [
+  "HALT GLOBAL TRANSPORT_UNAVAILABLE (HALT_ALL): the event transport stopped answering",
+  "HALT RECORD UNCONFIRMED: the halt record did not answer within 5000 ms",
+  'health: {"halts":1}',
+] as const;
+/** How long the log consumer reads nothing after `startup()` returns: longer than the grace and the first version's backstop together. */
+const STALL_MS = 3_000;
+
+function fillerLine(index: number): string {
+  return `filler ${String(index).padStart(6, "0")} ${"f".repeat(1_000)}`;
+}
+
+/**
+ * A child that logs {@link FILLER_LINES} filler lines and then
+ * {@link HALT_LINES} to stderr — every write returns at once, queued behind a
+ * pipe nobody is reading — reports on STDOUT (read at once) how many bytes
+ * its stderr still holds, and runs `exitAfterStartup(75,
+ * processExitPorts(process))` exactly as `main.ts`'s shell does.
+ */
+function stalledLogChildScript(): string {
+  return `
+import { writeSync } from "node:fs";
+import { exitAfterStartup, processExitPorts } from ${JSON.stringify(MODULE_URL)};
+for (let index = 0; index < ${String(FILLER_LINES)}; index += 1) {
+  process.stderr.write("filler " + String(index).padStart(6, "0") + " " + "f".repeat(1000) + "\\n");
+}
+for (const line of ${JSON.stringify(HALT_LINES)}) process.stderr.write(line + "\\n");
+writeSync(1, "startup() returned; stderr still queued " + String(process.stderr.writableLength) + " bytes\\n");
+exitAfterStartup(75, processExitPorts(process));
+`;
+}
+
+interface StalledLogRun {
+  readonly code: number | null;
+  /** Bytes the child's stderr still held when `startup()` returned. */
+  readonly queuedBytes: number;
+  /** Milliseconds from `startup()` returning to the exit, and to the consumer resuming. */
+  readonly exitAfterReturnMs: number;
+  readonly resumedAfterReturnMs: number;
+  /** Every stderr line the consumer received, in order. */
+  readonly lines: readonly string[];
+}
+
+/**
+ * Runs {@link stalledLogChildScript} with a log consumer that reads NOTHING
+ * for {@link STALL_MS} after `startup()` returned, then everything. A
+ * `readable` listener holds the stream without reading it, so what the pipe
+ * already holds is kept even if the child exits during the stall.
+ */
+async function runWithStalledLog(): Promise<StalledLogRun> {
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", stalledLogChildScript()], {
+    cwd: fileURLToPath(new URL(".", import.meta.url)),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let returnedAt: number | undefined;
+  let resumedAt: number | undefined;
+  let stderr = "";
+  let resumed = false;
+  const drain = (): void => {
+    for (let chunk = child.stderr.read() as Buffer | null; chunk !== null; chunk = child.stderr.read() as Buffer | null) {
+      stderr += chunk.toString("utf8");
+    }
+  };
+  child.stderr.on("readable", () => {
+    if (resumed) drain();
+  });
+  const returned = new Promise<void>((resolve) => {
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      if (returnedAt === undefined && stdout.includes("startup() returned")) {
+        returnedAt = Date.now();
+        resolve();
+      }
+    });
+  });
+  const exited = new Promise<{ readonly code: number | null; readonly at: number }>((resolve) => {
+    child.on("exit", (code) => {
+      resolve({ code, at: Date.now() });
+    });
+  });
+  const ended = new Promise<void>((resolve) => {
+    child.stderr.on("end", resolve);
+  });
+  const killer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+  try {
+    await returned;
+    await new Promise((resolve) => setTimeout(resolve, STALL_MS));
+    resumed = true;
+    resumedAt = Date.now();
+    drain();
+    const exit = await exited;
+    await ended;
+    const queued = /stderr still queued (\d+) bytes/u.exec(stdout);
+    if (returnedAt === undefined || queued === null) throw new Error(`the child never reported its return: ${stdout}`);
+    return {
+      code: exit.code,
+      queuedBytes: Number(queued[1]),
+      exitAfterReturnMs: exit.at - returnedAt,
+      resumedAfterReturnMs: resumedAt - returnedAt,
+      lines: stderr.split("\n").filter((line) => line !== ""),
+    };
+  } finally {
+    clearTimeout(killer);
+  }
+}
+
+describe("a real process whose log consumer has stalled: the exit never cuts the log short (TC-LOWS-1 r1, TCL1-R1-01)", () => {
+  it("128 KiB and more still queued at the return, the consumer stalled 3 s: EVERY line arrives, in order — the halt lines and the forced line last — and the process exits 75 only once the consumer has taken them", async () => {
+    const run = await runWithStalledLog();
+    // The premise: far more than a pipe's worth was still queued in the
+    // process when startup() returned.
+    expect(run.queuedBytes).toBeGreaterThanOrEqual(128 * 1_024);
+    expect(run.code).toBe(75);
+    // Every line, in order: none dropped, the halt lines intact, and the
+    // forced line — written after the grace, behind the stalled log — last.
+    const expected = [...Array.from({ length: FILLER_LINES }, (_unused, index) => fillerLine(index)), ...HALT_LINES];
+    expect(run.lines.slice(0, expected.length)).toEqual(expected);
+    expect(run.lines).toHaveLength(expected.length + 1);
+    expect(run.lines.at(-1)).toMatch(/^PROCESS EXIT FORCED: startup\(\) returned 75 1000 ms ago, and the process is still held open by /u);
+    // The exit waited for the log: not before the consumer resumed.
+    expect(run.exitAfterReturnMs).toBeGreaterThanOrEqual(run.resumedAfterReturnMs);
+  }, 30_000);
 });

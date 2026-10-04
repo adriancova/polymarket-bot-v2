@@ -400,11 +400,13 @@ export interface SeamHealth {
  * with nothing having warned anyone. This section is the stream-side number.
  *
  * WHO FILLS IT. The core has no transport, and it reads no clock to build
- * this section. It does read its §12.1 `Clock` port elsewhere: at a
- * placement's admission (ADR-031) and, under ADR-023's
- * `CONNECTION_CONFIRMED`, for book freshness (D7). So the stream positions
- * and the wall-clock fields — the sample's age and the event-time lag — come
- * from a {@link TransportHealthSource} the composition root attaches
+ * this section. It does read its §12.1 `Clock` port elsewhere — among other
+ * places, `now()` at a placement's admission (ADR-031) and, under ADR-023's
+ * `CONNECTION_CONFIRMED`, for book freshness (D7), and `monotonicNs()` for
+ * elapsed-time measurements — but no reading of it reaches this section. So
+ * the stream positions and the wall-clock fields — the sample's age and the
+ * event-time lag — come from a {@link TransportHealthSource} the composition
+ * root attaches
  * ({@link HealthState.attachTransport}) — `apps/trader`'s sampler, which reads
  * the subscription's own §8.3 metrics at a bounded cadence. Until one is
  * attached (every in-memory composition, the backtest, the goldens) the

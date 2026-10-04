@@ -132,10 +132,13 @@
  * had returned 75. The process shell below now hands the code to
  * `exitAfterStartup` (`process-exit.ts`): the process exits on its own when
  * nothing holds it, and otherwise logs `PROCESS EXIT FORCED: …` and exits
- * with the same code, at most `PROCESS_EXIT_GRACE_MS` +
- * `PROCESS_EXIT_FLUSH_MS` (2,000 ms) after `startup()` returned. It runs only
- * once every durable outcome is final, so no acknowledged write and no halt
- * record is lost by it (the reasoning is in that module's header).
+ * with the same code `PROCESS_EXIT_GRACE_MS` (1,000 ms) after `startup()`
+ * returned — from that line's own write callback, so never ahead of a line
+ * already logged: the `HALT …` and `HALT RECORD …` lines reach the log first,
+ * and a log that is not taking lines holds the exit until it does
+ * (`TC-LOWS-1` r1, `TCL1-R1-01`). It runs only once every durable outcome is
+ * final, so no acknowledged write and no halt record is lost by it (the
+ * reasoning is in that module's header).
  *
  * ## The evaluation cadence (`CADENCE-1`, ADR-026)
  *
@@ -202,7 +205,7 @@ import {
   type RunningTraderHealthServer,
 } from "./health-server.js";
 import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
-import { exitAfterStartup } from "./process-exit.js";
+import { exitAfterStartup, processExitPorts } from "./process-exit.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
@@ -876,28 +879,9 @@ if (invokedDirectly) {
     },
   });
   // `TC-LOWS-1` (`PROV1-R2-L2`): the process EXITS with that code within a
-  // bound, even when a peer that never answers holds a socket open
-  // (`process-exit.ts`; see "The process exit" above).
-  exitAfterStartup(code, {
-    setExitCode: (exitCode) => {
-      process.exitCode = exitCode;
-    },
-    exit: (exitCode) => {
-      process.exit(exitCode);
-    },
-    writeLine: (line, flushed) => {
-      try {
-        process.stderr.write(`${line}\n`, () => {
-          flushed();
-        });
-      } catch {
-        flushed();
-      }
-    },
-    unrefTimer: (ms, fire) => {
-      setTimeout(fire, ms).unref();
-    },
-    holders: () => process.getActiveResourcesInfo(),
-  });
+  // bound, even when a peer that never answers holds a socket open, and never
+  // ahead of a line already logged (`process-exit.ts`; see "The process exit"
+  // above). `process` is handed over here, the one file that touches it.
+  exitAfterStartup(code, processExitPorts(process));
 }
 /* c8 ignore stop */

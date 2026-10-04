@@ -652,6 +652,19 @@ function evaluatedSeconds(parts: Run): readonly number[] {
 }
 
 /**
+ * `TC-LOWS-1` r1 (`TCL1-R1-04`): the instants, in seconds after the open, of
+ * the ENTRIES — the `onFeatures` evaluations whose decisions placed an order
+ * (each placed order's provenance names its decision; an `onFill` exit's is
+ * left out).
+ */
+function entryEvaluatedSeconds(parts: Run): readonly number[] {
+  const placing = new Set(parts.trader.loop.orderProvenance().map((link) => link.evaluationSeq));
+  return parts.store.decisions
+    .filter((recorded) => placing.has(recorded.record.evaluationSeq) && recorded.record.callback === "onFeatures")
+    .map((recorded) => (Date.parse(recorded.record.evaluatedAt) - Date.parse(T_OPEN)) / 1000);
+}
+
+/**
  * `TC-LOWS-1` (O07): the quiet-YES timeline's evaluations at the production
  * cadence. The NO changes every 500 ms owe the market an evaluation, and it
  * is evaluated at most once per 1,000 ms (ADR-026 D2.4): at 1.000 s, then at
@@ -1089,6 +1102,24 @@ describeAtEachCadence("r1 X1: a book whose OWN delivery stalls is bounded by the
     );
     expect(past.trader.loop.orderProvenance()).toHaveLength(0);
     expect(past.trader.loop.health().risk.refusalsByCode["RISK_BOOK_STALE"] ?? 0).toBeGreaterThan(0);
+    if (cadence.production) {
+      // `TC-LOWS-1` r1 (`TCL1-R1-04`): the reason the production run lowers
+      // the ceiling, pinned. The market is evaluated at 1.000 s, then by its
+      // HEARTBEAT at 6.000 s — the entry, its fill and the two order updates
+      // harvested at that close — then at the NO snapshot (9.100 s; measured).
+      expect(evaluatedSeconds(within)).toEqual([1, 6, 6, 6, 6, 9.1, 9.1]);
+      // The entry is the heartbeat's: placed at 6.000 s, the YES change then
+      // exactly 5 000 ms old.
+      expect(entryEvaluatedSeconds(within)).toEqual([6]);
+      // And the refusal is check 7's at that same heartbeat: past a 4 000 ms
+      // ceiling, the 5 000 ms-old book is stale.
+      expect(
+        past.store.riskRefusals.map((refusal) => [
+          (Date.parse(refusal.occurredAt) - Date.parse(T_OPEN)) / 1000,
+          refusal.refusals.map((each) => each.code),
+        ]),
+      ).toEqual([[6, ["RISK_BOOK_STALE"]]]);
+    }
   });
 
   /**

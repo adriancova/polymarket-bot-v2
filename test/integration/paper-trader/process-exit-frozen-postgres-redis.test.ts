@@ -35,10 +35,16 @@
  *    freezes at that line; the store's close ends the record's idle
  *    connection, half-closed, against the frozen server. `startup()` returns
  *    75 and the process, held by that socket, logs `PROCESS EXIT FORCED` and
- *    exits 75 within `PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS` (plus the
- *    closes' Redis bounds) — PostgreSQL STILL frozen. Thawed afterwards, the
- *    record the process saw acknowledged is in `ops.incidents`, and every
- *    decision it counted as persisted is in `strategy.decisions`.
+ *    exits 75 within `PROCESS_EXIT_GRACE_MS` (plus the closes' Redis bounds)
+ *    — PostgreSQL STILL frozen. That the PostgreSQL socket is among what
+ *    holds it is READ, not inferred (`TC-LOWS-1` r1, `TCL1-R1-03`): Redis is
+ *    frozen too, and the forced line names only handle types, so the
+ *    process's own socket table (`support/held-sockets.ts`) is sampled until
+ *    the exit, and its last reading — taken after `startup()` returned —
+ *    must hold a connection to the PostgreSQL hop in `FIN_WAIT2`: half-closed
+ *    by the client, never answered. Thawed afterwards, the record the process
+ *    saw acknowledged is in `ops.incidents`, and every decision it counted as
+ *    persisted is in `strategy.decisions`.
  * 2. **PostgreSQL and Redis frozen together.** The halt record answers
  *    `UNCONFIRMED` at its bound, `startup()` returns 75, and the process exits
  *    75 within the same bound. What holds it after the return is the frozen
@@ -59,8 +65,10 @@
  * NON-VACUITY: with the shell's `exitAfterStartup` call removed (the shell
  * before this round), scenario 1 fails: the process is still running at the
  * bound, held by the half-closed PostgreSQL socket. With the shell's grace
- * timer referenced (no `unref()`), scenario 0 fails. Recorded in the
- * `TC-LOWS-1` handoff.
+ * timer referenced (no `unref()`), scenario 0 fails. With PostgreSQL never
+ * frozen in scenario 1 — the race the scenario could lose under load — the
+ * frozen Redis alone still forces the exit, and only the socket-table
+ * reading fails. Recorded in the `TC-LOWS-1` handoffs (r0, r1).
  *
  * Docker: Testcontainers, its own containers, no skip. PAPER only; no venue,
  * no signer, no real order; throwaway credentials that live only for the run.
@@ -81,8 +89,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HALT_RECORD_DEADLINE_MS } from "../../../apps/trader/src/halt-record.js";
 import { EXIT_CODES, REDIS_RESPONSE_TIMEOUT_ENV } from "../../../apps/trader/src/main.js";
-import { PROCESS_EXIT_FLUSH_MS, PROCESS_EXIT_GRACE_MS } from "../../../apps/trader/src/process-exit.js";
+import { PROCESS_EXIT_GRACE_MS } from "../../../apps/trader/src/process-exit.js";
 import { recordedEvents, safeEnvironment } from "./support/fixture.js";
+import { lastHeldSocketsBefore } from "./support/held-sockets.js";
 import { shiftScenario } from "./support/host-clock.js";
 import {
   CONDITION_ID,
@@ -100,9 +109,11 @@ const repoRoot = path.resolve(here, "../../..");
 const REDIS_BOUND_MS = 1_000;
 /** For a loaded host (`CI-FLAKE-STALL-BOUND` precedent). */
 const MARGIN_MS = 4_000;
-/** From the silence to the exit: the halt, the record, two QUIT bounds, the exit's own bound. */
-const SILENCE_TO_EXIT_MS =
-  REDIS_BOUND_MS + HALT_RECORD_DEADLINE_MS + 2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS + MARGIN_MS;
+/**
+ * From the silence to the exit: the halt, the record, two QUIT bounds, the
+ * exit's own grace (the log here keeps up, so the forced line is out at once).
+ */
+const SILENCE_TO_EXIT_MS = REDIS_BOUND_MS + HALT_RECORD_DEADLINE_MS + 2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + MARGIN_MS;
 
 let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
 let redis: Awaited<ReturnType<typeof startRedisContainer>>;
@@ -166,6 +177,7 @@ async function connectPublisher(url: string): Promise<RedisStreamsEventTransport
 }
 
 interface TraderProcess {
+  readonly pid: number;
   /** Settles with the exit code and the instant of the exit. */
   readonly exit: Promise<{ readonly code: number | null; readonly at: number }>;
   /** Every stderr line, with the instant it arrived here. */
@@ -196,7 +208,8 @@ async function startTrader(label: string, document: Record<string, unknown>, env
       resolve({ code, at: Date.now() });
     });
   });
-  return { exit, lines, text: () => lines.map((entry) => entry.line).join("\n") };
+  if (child.pid === undefined) throw new Error("the trader process did not start");
+  return { pid: child.pid, exit, lines, text: () => lines.map((entry) => entry.line).join("\n") };
 }
 
 async function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
@@ -310,8 +323,10 @@ describe("the shipped process exits within a bound once startup() has returned (
         );
         postgresHop.freeze();
         const frozenAt = Date.now();
+        // `TCL1-R1-03`: what the process holds, read until it exits.
+        const heldAtExit = lastHeldSocketsBefore(run.pid, run.exit);
         expect(record.line).toBe("halt record: 1 row(s) written to ops.incidents for 1 halt(s) (GLOBAL TRANSPORT_UNAVAILABLE)");
-        const bound = 2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS + MARGIN_MS;
+        const bound = 2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + MARGIN_MS;
         const exited = await settleWithin(run.exit, bound);
         console.log(
           "[TC-LOWS-1 measured, PostgreSQL frozen after the record] the process " +
@@ -329,6 +344,22 @@ describe("the shipped process exits within a bound once startup() has returned (
         expect(forced.line).toContain(`startup() returned ${String(EXIT_CODES.halted)} ${String(PROCESS_EXIT_GRACE_MS)} ms ago`);
         expect(forced.line).toMatch(/still held open by [^:]*TCPSocketWrap/u);
         console.log(`[TC-LOWS-1 measured] ${forced.line.slice(0, 170)}…`);
+        // `TCL1-R1-03`: one of those sockets is PostgreSQL's — the pool's
+        // ended idle connection, half-closed (`FIN_WAIT2`) against the frozen
+        // hop. The reading is the last one before the exit, and was taken less
+        // than the grace before it: after `startup()` returned (the exit was
+        // forced, so it came at least the grace after the return).
+        const held = await heldAtExit;
+        const postgresHopPort = Number(new URL(postgresHop.url).port);
+        console.log(
+          `[TC-LOWS-1 measured] the process's TCP sockets ${held === undefined ? "were never read" : `${String(exited.at - held.at)} ms before its exit: ${JSON.stringify(held.sockets)}`} (PostgreSQL hop port ${String(postgresHopPort)})`,
+        );
+        if (held === undefined) throw new Error("the process's socket table was never read while it ran");
+        expect(exited.at - held.at).toBeLessThan(PROCESS_EXIT_GRACE_MS);
+        expect(
+          held.sockets.filter((socket) => socket.remotePort === postgresHopPort).map((socket) => socket.state),
+          "a connection to the frozen PostgreSQL, half-closed by the process and never answered",
+        ).toContain("FIN_WAIT2");
         // Thawed only now. The record the process saw acknowledged is durable,
         // and so is every decision it counted as persisted.
         postgresHop.thaw();
@@ -392,7 +423,7 @@ describe("the shipped process exits within a bound once startup() has returned (
         // sockets (measured: about a second after the grace): logged, not pinned.
         console.log(`[TC-LOWS-1 measured] exit ${run.text().includes("PROCESS EXIT FORCED: ") ? "forced" : "on its own"}`);
         // Bounded from the record's answer: two QUIT bounds for the closes, then the exit's own bound.
-        expect(exited.at - record.at).toBeLessThanOrEqual(2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + PROCESS_EXIT_FLUSH_MS + MARGIN_MS);
+        expect(exited.at - record.at).toBeLessThanOrEqual(2 * REDIS_BOUND_MS + PROCESS_EXIT_GRACE_MS + MARGIN_MS);
         // Thawed only now: the record's connection was destroyed at its bound,
         // so nothing of it lands afterwards — exactly as before this round.
         postgresHop.thaw();

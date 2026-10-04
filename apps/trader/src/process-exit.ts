@@ -1,6 +1,7 @@
 /**
  * `TC-LOWS-1` (`PROV1-R2-L2`) — the process EXITS once `startup()` has
- * returned, within a stated bound.
+ * returned, within a stated bound, and never ahead of a line it has already
+ * logged.
  *
  * ## The defect
  *
@@ -25,11 +26,32 @@
  *   every line already written is flushed by Node as it always was;
  * - if something still holds it when the timer fires, one line says so
  *   (`PROCESS EXIT FORCED: …`, naming what holds it), and the process exits
- *   with the SAME code once that line is flushed — or after
- *   {@link PROCESS_EXIT_FLUSH_MS} if the log itself is stuck.
+ *   with the SAME code from that line's own write callback — and from
+ *   nowhere else.
  *
- * WHY THIS IS SAFE. It runs only after `startup()` has RETURNED, and by then
- * every durable outcome is final and nothing is in flight:
+ * ## The log is never cut short (`TC-LOWS-1` r1, `TCL1-R1-01`)
+ *
+ * Writes to one stream complete in the order they were made, so the forced
+ * line's callback runs only once every line before it is out: the `HALT …`
+ * lines, `HALT RECORD NOT DURABLE` / `UNCONFIRMED`, `health: …`. For an
+ * unconfirmed halt those lines are its ONLY record. So there is no backstop
+ * timer. The first version of this module had one: it exited a further
+ * 1,000 ms after the forced line whether or not the log had taken it, and
+ * with a stalled log consumer (more than a pipe's worth of lines unread)
+ * `process.exit` discarded every line still queued — the review measured 0 of
+ * the 3 halt lines delivered, where the shell before this round delivered all
+ * 3. A log that is not taking lines now holds the exit exactly as it held the
+ * process before this round, and the exit follows as soon as the log has
+ * taken them.
+ *
+ * THE BOUND, then: {@link PROCESS_EXIT_GRACE_MS} after `startup()` returned,
+ * plus however long the operator's log takes to accept what was queued ahead
+ * of the forced line — nothing, when the log keeps up.
+ *
+ * ## Why this is safe
+ *
+ * It runs only after `startup()` has RETURNED, and by then every durable
+ * outcome is final and nothing is in flight:
  *
  * - the pump has stopped, and every write the loop made was awaited before it
  *   did (`pump`, `CoreLoop.drain`): each was acknowledged or refused, and a
@@ -43,13 +65,14 @@
  *   which carry no query — only the Terminate of a finished session;
  * - every line `startup()` logged was written before it returned, in order,
  *   and the forced path exits only from the write callback of its OWN line,
- *   which comes after them all.
+ *   which comes after them all (above).
  *
  * So an acknowledged write stays acknowledged — it is the server's, and
  * nothing here can retract it — and no halt record is lost: a record that
  * landed is in `ops.incidents`, and one that could not land was reported as
  * such (`HALT RECORD NOT DURABLE` / `UNCONFIRMED`) before `startup()`
- * returned, beside the `HALT …` line that names it.
+ * returned, beside the `HALT …` line that names it, and that report reaches
+ * the log before the process exits.
  *
  * WHY NOT FIX IT IN THE STORE. Destroying the pool's ended sockets would need
  * `pg`'s private connection objects (`pg-pool` drops a client from its list
@@ -58,11 +81,15 @@
  * exit at the one point where the process is finished covers every handle,
  * and it cannot run early: before `startup()` returns it is not armed.
  *
- * WHY THE PURE PART LIVES HERE. `main.ts` stays the only file in the package
- * that touches `process` (its module header): it binds the {@link ProcessExitPorts}
- * to the real process; everything decided is here, and is tested with ports
- * (`process-exit.test.ts`) and, through the shipped bundle, against a frozen
- * PostgreSQL (`test/integration/paper-trader/process-exit-frozen-postgres-redis.test.ts`).
+ * WHERE `process` IS TOUCHED. `main.ts` stays the only file in the package
+ * that touches `process` (its module header): its shell passes `process` to
+ * {@link processExitPorts}, which takes it as an argument — as everything
+ * else in the package takes what it needs — and binds the
+ * {@link ProcessExitPorts} to it. Everything decided is here, and is tested
+ * with ports, with real child processes bound by {@link processExitPorts}
+ * itself (`process-exit.test.ts`), and, through the shipped bundle, against a
+ * frozen PostgreSQL
+ * (`test/integration/paper-trader/process-exit-frozen-postgres-redis.test.ts`).
  */
 
 /**
@@ -73,10 +100,7 @@
  */
 export const PROCESS_EXIT_GRACE_MS = 1_000;
 
-/** How long the forced exit waits for its own log line to be flushed. */
-export const PROCESS_EXIT_FLUSH_MS = 1_000;
-
-/** What {@link exitAfterStartup} needs from the process. `main.ts` binds them. */
+/** What {@link exitAfterStartup} needs from the process. {@link processExitPorts} binds them. */
 export interface ProcessExitPorts {
   /** Sets the code a NATURAL exit uses (`process.exitCode`). */
   readonly setExitCode: (code: number) => void;
@@ -84,7 +108,8 @@ export interface ProcessExitPorts {
   readonly exit: (code: number) => void;
   /**
    * Writes one line to the operator's log, and calls `flushed` once it has
-   * been handed to the operating system — or has failed. Never throws.
+   * been handed to the operating system — or has failed. Never earlier: the
+   * exit waits on it. Never throws.
    */
   readonly writeLine: (line: string, flushed: () => void) => void;
   /**
@@ -96,40 +121,69 @@ export interface ProcessExitPorts {
   readonly holders: () => readonly string[];
 }
 
-export interface ProcessExitBounds {
-  readonly graceMs: number;
-  readonly flushMs: number;
+/**
+ * The parts of Node's `process` the exit needs. `main.ts`'s shell passes
+ * `process` itself; the real-process tests' children do the same.
+ */
+export interface ExitingProcess {
+  exitCode: number | string | null | undefined;
+  exit(code?: number | string | null): never;
+  readonly stderr: { write(chunk: string, callback?: (error?: Error | null) => void): boolean };
+  getActiveResourcesInfo(): string[];
 }
 
-export const PROCESS_EXIT_BOUNDS: ProcessExitBounds = Object.freeze({
-  graceMs: PROCESS_EXIT_GRACE_MS,
-  flushMs: PROCESS_EXIT_FLUSH_MS,
-});
+/**
+ * The {@link ProcessExitPorts} of a real process: the log is its stderr, and
+ * a line counts as flushed only from that write's own callback.
+ */
+export function processExitPorts(target: ExitingProcess): ProcessExitPorts {
+  return {
+    setExitCode: (code) => {
+      target.exitCode = code;
+    },
+    exit: (code) => {
+      target.exit(code);
+    },
+    writeLine: (line, flushed) => {
+      try {
+        target.stderr.write(`${line}\n`, () => {
+          flushed();
+        });
+      } catch {
+        flushed();
+      }
+    },
+    unrefTimer: (ms, fire) => {
+      setTimeout(fire, ms).unref();
+    },
+    holders: () => target.getActiveResourcesInfo(),
+  };
+}
 
 /**
  * The process's last act, once `startup()` has returned `code`: exit with it
- * within `bounds.graceMs + bounds.flushMs` (see the module header). Called
- * exactly once, by the process shell; never before `startup()` returns.
+ * — on its own when nothing holds the process, otherwise by force after
+ * {@link PROCESS_EXIT_GRACE_MS}, once the forced line (and so every line
+ * before it) is out. See the module header. Called exactly once, by the
+ * process shell; never before `startup()` returns.
  */
-export function exitAfterStartup(code: number, ports: ProcessExitPorts, bounds: ProcessExitBounds = PROCESS_EXIT_BOUNDS): void {
+export function exitAfterStartup(code: number, ports: ProcessExitPorts): void {
   ports.setExitCode(code);
-  ports.unrefTimer(bounds.graceMs, () => {
-    let exited = false;
-    const exitOnce = (): void => {
-      if (exited) return;
-      exited = true;
-      ports.exit(code);
-    };
-    // A log that cannot take the line (a full pipe nobody reads) must not
-    // hold the process either.
-    ports.unrefTimer(bounds.flushMs, exitOnce);
+  ports.unrefTimer(PROCESS_EXIT_GRACE_MS, () => {
     let holders: readonly string[];
     try {
       holders = ports.holders();
     } catch {
       holders = [];
     }
-    ports.writeLine(forcedExitLine(code, bounds.graceMs, holders), exitOnce);
+    let exited = false;
+    // The ONLY exit: from the forced line's own write callback, after every
+    // earlier line (`TCL1-R1-01`). No timer may exit ahead of the log.
+    ports.writeLine(forcedExitLine(code, PROCESS_EXIT_GRACE_MS, holders), () => {
+      if (exited) return;
+      exited = true;
+      ports.exit(code);
+    });
   });
 }
 
