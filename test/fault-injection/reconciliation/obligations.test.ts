@@ -641,3 +641,35 @@ describe("V3-E15: Data API v2 only", () => {
     await expectPaused(r, report.resumed, "READ_WRONG_ROUTE");
   });
 });
+
+describe("WP-290 r5 (WP290-CX-R5-02): no wallet answer once a clock fault is detected in the run", () => {
+  it("(R5-02, wallet) the fault detected while an OMS answer is recorded: a terminal, readable wallet member is not answered by that run; the next run answers it by name", async () => {
+    const r = await ready();
+    await submitOne(r.oms);
+    const rig = walletRig(r);
+    expect(rig.wallet.plan(split).ok).toBe(true);
+    expect((await rig.wallet.submit(split.operationId)).ok).toBe(true);
+    rig.wallet.observe(split.operationId, { status: "DROPPED", transactionHash: HASH_A });
+    r.u.world.walletMembers.set(`hash:${HASH_A}`, { state: "CONFIRMED", transactionHash: HASH_A, credited: null });
+    expect((await r.oms.requestOrderReconciliation(r.oms.orders()[0]?.orderId as string)).ok).toBe(true);
+    const sound = r.u.clock.t;
+    let applied = false;
+    r.u.seams.applyReconciliation = async (raw, real) => {
+      const result = await real(raw);
+      if (!applied) {
+        applied = true;
+        r.u.clock.t = Number.NaN; // the answer's record reads an unreadable clock
+      }
+      return result;
+    };
+    const report = await r.p.coordinator.reconcile();
+    expect(report.runs[0]?.answers.map((answer) => answer.channel)).toEqual(["ORDER"]);
+    expect(rig.answers).toEqual([]);
+    await expectPaused(r, report.resumed, "READ_STALE");
+    delete r.u.seams.applyReconciliation;
+    r.u.clock.t = sound;
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(rig.answers).toEqual([{ source: "AUTHORITATIVE_READ", requestId: rig.requests.at(-1)?.requestId, state: "CONFIRMED", transactionHash: HASH_A, transactionId: null }]);
+    expect(rig.wallet.operation(split.operationId)?.state).toBe("CONFIRMED");
+  });
+});

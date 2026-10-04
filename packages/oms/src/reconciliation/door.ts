@@ -17,7 +17,10 @@
  * trades answer is discarded whole, but the venue order ids its rows carry are
  * NOT forgotten (r4, WP290-CX-R4-01): the outcome keeps them (`named`: each id
  * a row or leg carries, with its token when the row validated in full), so the
- * coordinator records them and reads each by id until it is classified.
+ * coordinator records them and reads each by id until it is classified. The
+ * token is present exactly when the row (or leg) validated in full: such a
+ * row SHOWED its order, and the coordinator records it as shown (r5,
+ * R5-NAMED); `null` marks the id alone of a malformed row (only named).
  * Statuses are kept as data: an order
  * or trade status outside the documented vocabulary is not malformed, it is
  * UNRECOGNISED, and the coordinator holds on it (`STATUS_UNRECOGNISED`).
@@ -46,7 +49,8 @@ import {
 
 /**
  * The venue order ids the rows of an unusable answer carry (venue order id → its token id, or `null` when the row
- * did not validate in full). Only the open-orders and trades reads keep them.
+ * did not validate in full). Only the open-orders and trades reads keep them. A token means the row or leg validated
+ * in full, so it SHOWED its order (the coordinator's provenance, r5); `null`, that only its id was readable.
  */
 export type NamedOrders = ReadonlyMap<string, string | null>;
 

@@ -65,15 +65,20 @@ not a fault.
    order, so the next runs (after a restart too) read it by id until a sound
    run classifies it (tracked, still ownable by an attempt, UNATTRIBUTED, or
    not found). An id is observed in any of five ways, each recorded with its
-   **provenance**:
+   **provenance** (the rows of an unusable answer carry either, row by row):
 
    | Source | Provenance | Recorded as |
    | --- | --- | --- |
    | a complete, valid open-orders list | shown | `ORDER_UNRESOLVED` keyed `venue-order` |
    | a valid trades read's own leg | shown | the same |
    | a by-id read that found the order | shown | the same |
-   | a row of a partial, malformed or duplicated open-orders answer, or a leg of such a trades answer (the answer is discarded whole; the ids its rows carry are not) | named | `ORDER_UNRESOLVED` keyed `venue-order-named` |
+   | a row of a partial, malformed or duplicated open-orders answer, or a leg of such a trades answer, that validated in full (the answer is discarded whole; what its valid rows showed is not) | shown | `ORDER_UNRESOLVED` keyed `venue-order` |
+   | the id alone of a malformed row or leg (nothing else of it validated) | named | `ORDER_UNRESOLVED` keyed `venue-order-named` |
    | a by-id read that did not show the order (it failed, was malformed, or did not find it), for an id the OMS's retained stream evidence or a request named | named | the same |
+
+   The provenance is merged: an order a read once showed stays shown (one
+   `venue-order` record), however a later unsound run observes it.
+
    Every read starts after every request the run will answer was received.
    A request that arrives during the reads waits for the next run, which
    starts at once.
@@ -88,7 +93,10 @@ not a fault.
    earlier read SHOWED, which its by-id read no longer finds, is a
    `READ_CONFLICT` (the by-id read finds canceled and fully matched orders).
    Any of these makes the run's order reads unsound: nothing is answered from
-   them. An order id only NAMED (no read ever showed it), which a sound run's
+   them. This holds for a row or leg that validated in full inside a partial,
+   malformed or duplicated answer too: it showed the order, so the contradiction
+   holds identity resolution exactly as after a complete list. An order id
+   only NAMED (no read ever showed it), which a sound run's
    by-id read does not find, contradicts no earlier read: it is an
    `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), which keeps
    the id and is read by id while it stands; once found, the order is
@@ -142,7 +150,14 @@ not a fault.
 6. Resume if, and only if, everything in section 6 holds.
 
 A run whose reads span more than `maxReadSpanMs`, or during which the clock
-went backwards, concludes nothing (`READ_STALE`).
+was unreadable or went backwards, concludes nothing (`READ_STALE`). The clock
+fault is latched wherever the coordinator detects it: during the reads, while
+it records an answer, when a request arrives, at the run's closing reading,
+or when an operator's release reads the clock during the run. From that
+moment the run gives no further answer (OMS, wallet or stream; an `ABSENT`
+queued before the fault included), books nothing, acts on no break, clears
+none, and does not resume. What it did before the fault was detected stands.
+A later run, with fresh reads, answers what it withheld.
 
 ## 4. Breaks
 
@@ -271,11 +286,14 @@ unclaimed orders.
 | exactly one matching order, which no other unresolved attempt could own | `PRESENT` |
 | two or more matching orders, or one that another attempt could own | none: `SIGNED_IDENTITY_AMBIGUOUS` |
 | an unclaimed order on the same token and side that does not match exactly | none: `SIGNED_IDENTITY_AMBIGUOUS` |
+| an unclaimed order id only named (no read showed it) that the venue's by-id read does not find (`ORDER_NOT_FOUND_BY_ID`) | none, for every attempt: `SIGNED_IDENTITY_AMBIGUOUS` (its token is unknown, so it could be any attempt's), until an operator releases it or the venue shows the order |
 | nothing on the same token and side | `ABSENT`, once the reads begin at least `quiescenceHorizonMs` after the coordinator received the request, and the run judged the holdings with no break in the attempt's token or the collateral |
 
 Every `ABSENT` carries `transmissionQuiescent: true`, from the coordinator's
 own clock. After a clock fault the window starts again; a reading that went
-backwards is never used.
+backwards is never used. A run in which a clock fault is detected gives no
+further answer, so an `ABSENT` it queued before the fault is withheld; the
+attempt's window restarts, and a later run answers it a full horizon later.
 
 Why ABSENT also needs clean holdings: a marketable order that matched at once
 is gone from the open-orders list, and its trade may not be visible yet. Its
@@ -290,7 +308,8 @@ Trading resumes only when ALL of these hold at the end of a run:
 
 - every read answered, completely, in its shape, from the required route,
   with no conflict, regression or unrecognised status, within
-  `maxReadSpanMs`, and with a sound clock;
+  `maxReadSpanMs`, and with a sound clock from the run's start to its
+  resume (no reading unreadable or backwards anywhere in the run);
 - holdings were judged in this run;
 - no break is unresolved in the whole journal. Quarantines from before a
   restart count. The journal itself refuses a `PASSED` run otherwise;
@@ -304,8 +323,11 @@ Trading resumes only when ALL of these hold at the end of a run:
 
 If work arrived while the `PASSED` record was being written, the run does not
 resume: the journal records `RESUME_REFUSED` (`RECON_WORK_ARRIVED`), and the
-next run starts at once. If the OMS's own `resume()` refuses, it stays
-paused, and the journal records `RESUME_REFUSED` with the OMS's code.
+next run starts at once. The same holds if a clock fault was detected then
+(an operator's release attempted with an unreadable clock):
+`RESUME_REFUSED` (`RECON_CLOCK_FAULT`), and the next run starts at once. If
+the OMS's own `resume()` refuses, it stays paused, and the journal records
+`RESUME_REFUSED` with the OMS's code.
 
 One run at a time: a `reconcile()` call made while a run is in progress
 returns at once, with no run.
@@ -358,12 +380,18 @@ returns at once, with no run.
   owner (another attempt found `PRESENT` for it). There is no override
   (section 10).
 - **An `ORDER_NOT_FOUND_BY_ID` quarantine** names a venue order id that no
-  read ever showed in full (the user stream's evidence named it, a request
-  named it, or a row of a partial or malformed answer carried it) and that
-  the venue's by-id read does not find. The account is halted. Establish
+  read ever showed in full (only a by-id read that did not show it, for an id
+  the user stream's evidence or a request named, or the id alone of a
+  malformed row or leg, named it) and that the venue's by-id read does not
+  find. An order a valid row or leg showed, even inside a partial or
+  malformed answer, is never this quarantine: its not-found is a
+  `READ_CONFLICT`. The account is halted, and while it stands no attempt is
+  answered by signed identity (the id could be any attempt's). Establish
   whether the id is the account's (the stream's evidence, the adapter's
-  logs). If it is not, release it: the release acknowledges that id for
-  good, and it is no longer read. While it stands it is read by id in every
+  logs). If it may be, do not release it. If it is not, release it: the
+  release acknowledges that id for good, and it is no longer read; the
+  attempts are then answered, and the OMS may raise its own halting alert
+  about stream evidence it retained for that id (a second quarantine). While it stands it is read by id in every
   run, and if the venue shows it later it is classified like any order.
 
 ## 8. Configuration
@@ -380,7 +408,11 @@ None is a venue fact.
 | `accountRef`, `collateralAssetId` | the account and its pUSD asset id | |
 
 The clock port must be **monotonic**: a forward step would attest quiescence
-early.
+early. A step forward is invisible until the clock is corrected back. The
+correction is a fault the coordinator detects, and from then on the run
+answers nothing more. An answer it gave before the correction stands: an
+`ABSENT` that the OMS accepted is not withdrawn. The OMS then holds the attempt
+for the retransmission decision, or abandons it.
 
 ## 9. What the reads must be (for the composition)
 
@@ -435,11 +467,29 @@ nothing is judged or booked from it.
   need care here.
 - An order a read SHOWED in full that its by-id read no longer finds holds
   the whole account (`READ_CONFLICT`: nothing is answered while it lasts,
-  and no release exists). Fail closed. An order id only NAMED that the venue
+  and no release exists). Fail closed. A row or leg that validated in full
+  inside a partial, malformed or duplicated answer counts as shown, so an
+  adapter that returns a well-formed row for an order the venue does not
+  have holds the account this way too. An order id only NAMED that the venue
   does not find is a releasable quarantine instead (`ORDER_NOT_FOUND_BY_ID`).
-  While that quarantine stands, the id is not a signed-identity candidate:
-  the venue's by-id read (E-14) is taken as authoritative, as it is for an
-  id the OMS retains when no unsound run intervened.
+  While that quarantine stands, the id is not a signed-identity candidate,
+  but nothing rules it out either, so no attempt is answered by signed
+  identity until it is released (r5). An operator who releases it wrongly
+  (the id was the attempt's own order, and the by-id read lied) lets the
+  attempt be answered on the other reads. An id the OMS retains as stream
+  evidence, with no unsound run in between, is not watched this way: the
+  venue's by-id read (E-14) is taken as authoritative for it, and an attempt
+  can be answered while the OMS still retains it (the OMS then raises its own
+  halting alert about the evidence; holdings the evidence moved also withhold
+  `ABSENT`).
+- A clock fault latches the run from the moment it is detected, not before.
+  Anything the run did earlier stands: an answer the OMS accepted, a booking,
+  a delivered fill. After the fault the run still compares settlements with
+  the OMS (`applySettlement`) for the orders it has not compared yet. Each
+  such write is a forward fact the venue showed, and the OMS checks it with
+  its own transition rule. The write carries the run's read time as
+  `observedAt`, which is metadata only: a settlement's order is its ordinal.
+  Such writes answer nothing and resolve nothing.
 - A FAILED fill's remaining booking is what the ledger books under its fill
   id (and every reversal linked to one of its transactions). The composition
   must join the OMS's fills to the ledger (`HoldingsPort.remainingBookings`).

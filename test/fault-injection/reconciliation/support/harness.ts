@@ -124,6 +124,11 @@ export interface Universe {
     haltsFail?: boolean;
     /** The ledger's answer about FAILED fills' remaining bookings (r4), e.g. one that omits a fill or throws. */
     remainingBookings?: (fills: readonly { readonly venueTradeId: string; readonly venueOrderId: string }[], real: () => unknown) => unknown;
+    /**
+     * The coordinator's own clock, when it differs from the venue's time (r5): e.g. one that ran ahead and is then
+     * corrected back (a step the coordinator detects only when it reads the clock again). Default: the venue's.
+     */
+    localClock?: (venueMs: number) => number;
   };
 }
 
@@ -540,7 +545,7 @@ export async function boot(u: Universe, plan: KillPlan | null = null): Promise<P
           u.halts.push({ ...request, marketId: null });
         }),
     },
-    clock: { now: () => u.clock.t },
+    clock: { now: () => (u.seams.localClock === undefined ? u.clock.t : u.seams.localClock(u.clock.t)) },
     newId: u.coordinatorIds,
     marketOfToken: (tokenId) => (tokenId === YES ? MARKET : tokenId === NO ? MARKET_NO : null),
     // The groups the OMS registered, as the composition would bind them (`execution.groups.token_id`).

@@ -82,8 +82,13 @@ describe("WP-290 r4 (WP290-CX-R4-01): the ids an unusable open-orders answer car
       r.u.world.faults.listOpenOrders = corrupt(corruption);
       const first = await r.p.coordinator.reconcile();
       expect(first.resumed).toBe(false);
-      // Run 1 concluded nothing, but recorded both ids its unusable answer carried (NAMED: the answer was discarded).
-      expect(unresolvedSubjects(r)).toEqual(expect.arrayContaining([named(real), named(twin)]));
+      // Run 1 concluded nothing, but recorded both ids its unusable answer carried. Each row validated in full, so
+      // each is SHOWN (r5, R5-NAMED: the answer was discarded, not what its valid rows showed); only the id alone of
+      // a malformed row is NAMED.
+      expect(unresolvedSubjects(r)).toEqual(expect.arrayContaining([shown(real), shown(twin)]));
+      expect(unresolvedSubjects(r)).not.toContain(named(real));
+      expect(unresolvedSubjects(r)).not.toContain(named(twin));
+      if (corruption === "MALFORMED_SIBLING") expect(unresolvedSubjects(r)).toContain(named("broken-sibling"));
       r.u.world.cancel(twin);
       const reads = recordReads(r);
       expect(await reconcileRounds(r, 4)).toBe(false);
@@ -125,7 +130,7 @@ describe("WP-290 r4 (WP290-CX-R4-01): the ids an unusable open-orders answer car
     r.u.world.faults.listOpenOrders = corrupt("INCOMPLETE");
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "READ_INCOMPLETE");
-    const hold = r.p.journal.unresolvedBreaks().find((view) => view.subjectKey === named(foreign));
+    const hold = r.p.journal.unresolvedBreaks().find((view) => view.subjectKey === shown(foreign));
     expect(hold).toMatchObject({ breakClass: "ORDER_UNRESOLVED", scope: "MARKET", marketId: MARKET });
     r.u.world.cancel(foreign);
     const again = await restart(r);
@@ -136,8 +141,8 @@ describe("WP-290 r4 (WP290-CX-R4-01): the ids an unusable open-orders answer car
     expect(quarantined).toMatchObject({ status: "QUARANTINED", marketId: MARKET });
     expect(quarantined?.detail).toContain(foreign);
     expect(r.u.halts.some((halt) => halt.breakId === quarantined?.breakId && halt.marketId === MARKET)).toBe(true);
-    // The NAMED record was judged (its by-id read answered) and is cleared; the order is classified now.
-    expect(unresolvedSubjects(again)).not.toContain(named(foreign));
+    // The SHOWN record was judged (its by-id read found it) and is cleared; the order is classified now.
+    expect(unresolvedSubjects(again)).not.toContain(shown(foreign));
     expect(await reconcileRounds(again, 2)).toBe(false);
     expect((await again.p.coordinator.releaseQuarantine({ breakId: quarantined?.breakId ?? "", operatorRef: "operator-1", reason: "a manual order" })).ok).toBe(true);
     expect(await reconcileRounds(again, 3)).toBe(true);
@@ -155,7 +160,8 @@ describe("WP-290 r4 (WP290-CX-R4-01): the ids an unusable open-orders answer car
     // Run 1: the trades read is partial; the page it has shows x's trade.
     r.u.world.faults.listTrades = (answer) => ({ ...(answer() as object), complete: false });
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "READ_INCOMPLETE");
-    expect(unresolvedSubjects(r)).toContain(named(x));
+    // The leg validated in full: SHOWN (r5, R5-NAMED).
+    expect(unresolvedSubjects(r)).toContain(shown(x));
     const again = await restart(r);
     const reads = recordReads(again);
     r.u.world.faults.listTrades = (answer) => {
@@ -314,11 +320,19 @@ describe("WP-290 r4 (WP290-V4-GHOST-ID-PERMANENT-HOLD): an id no read showed, wh
     expect(r.u.halts.some((halt) => halt.breakId === quarantine?.breakId && halt.marketId === null)).toBe(true);
     expect(unresolvedSubjects(r)).not.toContain(named("venue-ghost"));
     // Every quarantine released (the OMS's own alert too, where its process still has it): the account resumes.
-    for (const view of r.p.journal.unresolvedBreaks()) {
-      if (view.status !== "QUARANTINED") continue;
-      expect((await r.p.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "not the account's order" })).ok).toBe(true);
+    // (r5) While the not-found quarantine stands no attempt is answered by signed identity, so the attempt is answered
+    // only once it is released; where the process still retains the ghost's stream evidence, the OMS then raises its
+    // own halting alert about it (UNKNOWN_VENUE_ORDER), a second quarantine, released the same way.
+    let resumed = false;
+    for (let round = 0; round < 2 && !resumed; round += 1) {
+      for (const view of r.p.journal.unresolvedBreaks()) {
+        if (view.status !== "QUARANTINED") continue;
+        if (round > 0) expect(view.breakClass).toBe("OMS_HALTING_ALERT");
+        expect((await r.p.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "not the account's order" })).ok).toBe(true);
+      }
+      resumed = await reconcileRounds(r, 4);
     }
-    expect(await reconcileRounds(r, 4)).toBe(true);
+    expect(resumed).toBe(true);
     expect(oracle(r)).toEqual([]);
   }
 

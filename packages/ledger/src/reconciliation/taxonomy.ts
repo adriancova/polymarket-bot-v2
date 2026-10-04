@@ -40,13 +40,16 @@
  * id of the account that a run observed but could not classify (its reads
  * were not one consistent view) is recorded as `ORDER_UNRESOLVED` keyed by
  * that venue order, so it is never forgotten, after a restart too, with its
- * PROVENANCE: SHOWN when a read that answered in full showed the order (a
- * complete open-orders list, a valid trades read's leg, a by-id read that
- * found it), NAMED otherwise (a row of a partial or malformed answer, an id
- * only a by-id read was asked about and did not show). A SHOWN order that a
- * later by-id read does not find is a `READ_CONFLICT` (E-14: canceled and
- * fully matched orders are found by id); a NAMED one is an
- * `ORDER_NOT_FOUND_BY_ID` quarantine, which an operator can release.
+ * PROVENANCE: SHOWN when a read showed the order in full (a complete
+ * open-orders list, a valid trades read's leg, a by-id read that found it,
+ * and, r5, a row or leg that validated in full inside a partial, malformed or
+ * duplicated answer: the answer is discarded, not what its valid rows
+ * showed), NAMED otherwise (the id alone of a malformed row or leg, nothing
+ * else of which validated; an id only a by-id read was asked about and did
+ * not show). A SHOWN order that a later by-id read does not find is a
+ * `READ_CONFLICT` (E-14: canceled and fully matched orders are found by id);
+ * a NAMED one is an `ORDER_NOT_FOUND_BY_ID` quarantine, which an operator can
+ * release.
  *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
  * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,
@@ -159,8 +162,9 @@ export const BREAK_TAXONOMY = Object.freeze({
   READ_STALE: {
     family: "READ",
     rule: HOLD,
-    meaning: "the run's reads spanned more than the configured bound, or the clock went backwards during the run",
-    handling: "the run is not trusted as one view of the account; submissions stay paused",
+    meaning: "the run's reads spanned more than the configured bound, or the clock was unreadable or went backwards at any point of the run (its reads, an answer's record, a receipt, its closing reading)",
+    handling:
+      "the run is not trusted as one view of the account: from the moment the fault is detected it gives no further answer, books nothing, acts on no break, clears none and does not resume; submissions stay paused, and a later run with fresh reads (and every pending request's quiescence restarted) answers what it withheld",
   },
   READ_CONFLICT: {
     family: "READ",
@@ -184,7 +188,8 @@ export const BREAK_TAXONOMY = Object.freeze({
   SIGNED_IDENTITY_AMBIGUOUS: {
     family: "ORDER",
     rule: HOLD,
-    meaning: "more than one venue order could be the unknown attempt's, or one venue order could be more than one attempt's (no order hash exists: WP-270 STOPPED item)",
+    meaning:
+      "more than one venue order could be the unknown attempt's, or one venue order could be more than one attempt's (no order hash exists: WP-270 STOPPED item), or an unclaimed venue order id only named, which the venue's by-id read does not find, stands (its token is unknown, so it could be any attempt's)",
     handling: "no answer is given; the attempt stays unresolved and submissions stay paused",
   },
   ORDER_UNATTRIBUTED: {
@@ -227,9 +232,9 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "ORDER",
     rule: QUARANTINE,
     meaning:
-      "a venue order id that no read showed in full (the OMS's retained stream evidence or a request named it, or a row of a partial or malformed answer carried it), recorded while it could not be classified, and that a by-id read of a sound run does not find (E-14: canceled and fully matched orders are found by id)",
+      "a venue order id that no read showed in full (only a by-id read that did not show it, for an id the OMS's retained stream evidence or a request named, or the id alone of a malformed row or leg, nothing else of which validated, named it), recorded while it could not be classified, and that a by-id read of a sound run does not find (E-14: canceled and fully matched orders are found by id)",
     handling:
-      "quarantined (the account is halted) until released; while unresolved it is read by id in every run and, once found, classified like any order; releasing it acknowledges that the venue does not show that id. An id a read did show in full is a READ_CONFLICT instead",
+      "quarantined (the account is halted) until released; while unresolved it is read by id in every run and, once found, classified like any order, and while it is not found no attempt is answered by signed identity (it could be any attempt's); releasing it acknowledges that the venue does not show that id. An id a read did show in full is a READ_CONFLICT instead",
   },
   // --- trades ----------------------------------------------------------------------------
   TRADE_UNATTRIBUTED: {

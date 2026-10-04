@@ -32,8 +32,10 @@
  *    order an unresolved break names in its subject, and every venue order id
  *    a run observed but could not classify, the rows of a partial or
  *    malformed answer included: once observed, an id is never forgotten. One
- *    a read SHOWED in full, which its by-id read no longer finds, is a
- *    READ_CONFLICT; one only NAMED, an ORDER_NOT_FOUND_BY_ID quarantine),
+ *    a read SHOWED in full (a fully valid row or leg of an unusable answer
+ *    included, r5), which its by-id read no longer finds, is a READ_CONFLICT;
+ *    one only NAMED (the id alone of a malformed row; a by-id read that did
+ *    not show it), an ORDER_NOT_FOUND_BY_ID quarantine),
  *    positions (`/v2`), the collateral balance, approvals, the ledger
  *    projection, what the ledger still books of each FAILED fill, and each
  *    wallet-operation member a request names. A read
@@ -82,7 +84,11 @@
  *   a marketable order matched at once leaves the open-orders list, and a
  *   lagging trades read would hide it, but its fill still moves the
  *   holdings. A clock reading that went backwards is never used, and every
- *   pending request's window restarts after a clock fault.
+ *   pending request's window restarts after a clock fault. A fault detected
+ *   at ANY point of a run is latched into it (`#clockSound`, r5): from then
+ *   on the run gives no further answer (an ABSENT queued before the fault
+ *   included), books nothing, acts on no break, clears none, records
+ *   READ_STALE and does not resume.
  * - **Holdings an attempt could explain.** A delta that an unresolved attempt
  *   could explain is held, never booked to UNATTRIBUTED, while that attempt
  *   is unresolved.
@@ -91,7 +97,10 @@
  * - **By signed identity (WP-270 follow_up 3).** An attempt without a venue
  *   order id is resolved only by `identity.ts`'s strict rule: ambiguity in
  *   either direction is refused, never guessed. The expected order hash is
- *   `null` (STOPPED) and is not used.
+ *   `null` (STOPPED) and is not used. While an unclaimed id only NAMED stands
+ *   that the venue's by-id read does not find (`ORDER_NOT_FOUND_BY_ID`), no
+ *   attempt is answered by signed identity at all (r5): its token is unknown,
+ *   so it could be any attempt's.
  * - **Wallet members by name (WP-300 follow_up 3).** Each unresolved member
  *   of a wallet request is read and answered BY NAME, and only with a
  *   terminal state (CONFIRMED or FAILED). A pending, dropped, unknown or
@@ -114,7 +123,10 @@
  *
  * The coordinator calls `OrderManager.resume()` only when ALL hold:
  * - the run read everything, completely, without conflict, regression or an
- *   unrecognised status, within `policy.maxReadSpanMs`, with a sound clock;
+ *   unrecognised status, within `policy.maxReadSpanMs`, with a sound clock
+ *   from its start to its resume (a fault detected at any point latches the
+ *   run stale; one detected while the PASSED record is written refuses the
+ *   resume, `RECON_CLOCK_FAULT`);
  * - no break is unresolved in the WHOLE journal (any rule: a quarantine from
  *   before a restart included). The journal enforces this too: it refuses a
  *   `PASSED` run while any break is unresolved;
@@ -345,6 +357,8 @@ class RunState {
   /** The order and trade reads form one consistent view (no conflict, regression or unrecognised status). */
   orderReadsSound = true;
   stale = false;
+  /** A clock fault was detected after the run started, and latched into it (`#clockSound`; r5, WP290-CX-R5-02). */
+  clockFaulted = false;
   /** Holdings were not judged in this run (the OMS and the venue still disagreed about fills or state). */
   holdingsDeferred = false;
   /** Holdings were compared in this run (all reads sound, nothing deferred, no wallet operation in flight). */
@@ -807,15 +821,23 @@ export class ReconciliationCoordinator {
     const tradesCall = await callRead(() => ports.listTrades());
     const trades = tradesCall.ok ? readTrades(tradesCall.raw) : failed<readonly VenueTradeView[]>();
     // OBSERVED (D-O1, r4 WP290-CX-R4-01): every venue order id this run's reads showed or named, and whether a read
-    // that answered in full SHOWED it. Five sources, each its own line: a complete open-orders list (shown); a row
-    // of a partial or malformed open-orders answer (named: the answer is discarded, its ids are not); a leg of a
-    // valid trades read (shown); a leg of a partial or malformed trades answer (named); and each by-id read below
-    // (shown when it found the order, named otherwise). `#watchUnclassified` records them when the run is unsound.
+    // SHOWED it in full. Five sources, each its own line: a complete open-orders list (shown); a row of a partial,
+    // malformed or duplicated open-orders answer (the answer is discarded, its ids are not); a leg of a valid trades
+    // read (shown); a leg of a partial or malformed trades answer; and each by-id read below (shown when it found
+    // the order, named otherwise). A row or leg of an unusable answer that VALIDATED IN FULL (the door gives it its
+    // token) showed its order as fully as any read does: it is SHOWN, so a later by-id read that does not find it
+    // is a contradiction (READ_CONFLICT), never an id to forget (r5, R5-NAMED). Only an id-only fragment of a
+    // malformed row or leg (no token: nothing else of it validated) is NAMED. `#watchUnclassified` records them
+    // when the run is unsound, with that provenance, durably.
     const observed = new Map<string, Observation>();
     if (open.kind === "OK") for (const order of open.value) observe(observed, order.venueOrderId, true, order.tokenId, "the open-orders list");
-    for (const [id, tokenId] of namedIn(open)) observe(observed, id, false, tokenId, "a row of a partial or malformed open-orders answer");
+    for (const [id, tokenId] of namedIn(open)) {
+      observe(observed, id, tokenId !== null, tokenId, tokenId !== null ? "a fully valid row of a partial, malformed or duplicated open-orders answer" : "the id alone of a malformed open-orders row");
+    }
     if (trades.kind === "OK") for (const trade of trades.value) for (const leg of trade.ownLegs) observe(observed, leg.venueOrderId, true, leg.tokenId, "a leg of the trades read");
-    for (const [id, tokenId] of namedIn(trades)) observe(observed, id, false, tokenId, "a leg of a partial or malformed trades answer");
+    for (const [id, tokenId] of namedIn(trades)) {
+      observe(observed, id, tokenId !== null, tokenId, tokenId !== null ? "a fully valid leg of a partial or malformed trades answer" : "the id alone of a malformed trade leg");
+    }
     // By id (E-14): unclaimed open orders, orders named by our trade legs and not listed, tracked open orders not
     // listed, and every tracked order a current request names.
     const listed = new Set(open.kind === "OK" ? open.value.map((order) => order.venueOrderId) : []);
@@ -928,9 +950,10 @@ export class ReconciliationCoordinator {
             detail: `venue order ${id} was seen by an earlier read, but its by-id read does not find it (E-14: canceled and fully matched orders are found by id)`,
           });
         } else if (run.watched.has(id)) {
-          // Only NAMED (no read showed it in full: retained stream evidence, a request, a row of an unusable answer),
-          // and the venue's by-id read does not find it: no earlier read is contradicted. A sound run records it as
-          // ORDER_NOT_FOUND_BY_ID, a quarantine an operator can release (`#namedNotFound`; r4, GHOST-ID).
+          // Only NAMED (no read showed it in full: a by-id read that did not show it, for an id retained stream
+          // evidence or a request named; the id alone of a malformed row or leg), and the venue's by-id read does not
+          // find it: no earlier read is contradicted. A sound run records it as ORDER_NOT_FOUND_BY_ID, a quarantine
+          // an operator can release (`#namedNotFound`; r4, GHOST-ID).
           run.namedNotFound.add(id);
         }
         continue;
@@ -1069,25 +1092,35 @@ export class ReconciliationCoordinator {
    * A run whose reads are not one consistent view (or are stale) classifies none of the venue orders they showed.
    * Every id it OBSERVED (`RunReads.observed`: the five sources in `#readAll`) that no tracked order claims is
    * recorded as an `ORDER_UNRESOLVED` hold keyed by the venue order, with its provenance (`venue-order` when a read
-   * that answered in full showed it, `venue-order-named` otherwise), and kept in memory: either way it is read by
+   * showed it in full, a fully valid row or leg of an unusable answer included; `venue-order-named` when only its id
+   * was named), and kept in memory: either way it is read by
    * id in every later run (`#readAll`), so it stays a candidate for every unknown attempt and is classified by the
    * first sound run (tracked by a PRESENT answer, `ORDER_UNRESOLVED` while an attempt could own it,
    * `ORDER_UNATTRIBUTED`, or, for a NAMED id its by-id read does not find, `ORDER_NOT_FOUND_BY_ID`). Nothing about
    * the order is concluded here.
+   *
+   * The provenance recorded is the MERGED one (r5, WP290-V5-NAMED-DUPLICATE-RECORD): an id an earlier read showed
+   * (a durable `venue-order` record, or the in-memory watch; `#readAll` merges both into `RunState.watched`) stays SHOWN, even when
+   * this run only named it (its by-id read did not find it, say). So it keeps one record, keyed `venue-order`, and
+   * no record ever says "no read showed it in full" of an order a read did show.
    */
   #watchUnclassified(run: RunState, oms: ReconciledOms, reads: RunReads): void {
     const claimed = claimedVenueIds(oms.orders(), oms.attempts());
     for (const [id, seen] of [...reads.observed].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
       if (claimed.has(id)) continue;
-      if (this.#unclassified.has(id) || this.#unclassified.size < MAX_UNCLASSIFIED) this.#unclassified.set(id, this.#unclassified.get(id) === true || seen.shown);
+      // `run.watched` holds both the durable records' provenance and the in-memory watch's (`#readAll`).
+      const shown = seen.shown || run.watched.get(id) === true;
+      if (this.#unclassified.has(id) || this.#unclassified.size < MAX_UNCLASSIFIED) this.#unclassified.set(id, shown);
       const sources = seen.sources.join("; ");
       this.#detect(run, {
         breakClass: "ORDER_UNRESOLVED",
-        subjectKey: compositeKey("ORDER_UNRESOLVED", seen.shown ? "venue-order" : "venue-order-named", id),
+        subjectKey: compositeKey("ORDER_UNRESOLVED", shown ? "venue-order" : "venue-order-named", id),
         ...(seen.tokenId === null ? {} : this.#marketOf(seen.tokenId)),
         detail: seen.shown
           ? `venue order ${id} was seen by a run whose reads were not one consistent view (shown by ${sources}), and no tracked order claims it: it is read by id in every run until a sound run classifies it (E-14)`
-          : `venue order ${id} was named by a run whose reads were not one consistent view (${sources}), but no read showed it in full, and no tracked order claims it: it is read by id in every run until a sound run classifies it, or finds it nowhere (ORDER_NOT_FOUND_BY_ID)`,
+          : shown
+            ? `venue order ${id} was shown in full by an earlier read, and a run whose reads were not one consistent view only named it (${sources}); no tracked order claims it: it is read by id in every run until a sound run classifies it (E-14), and a by-id read that does not find it is a contradiction (READ_CONFLICT)`
+            : `venue order ${id} was named by a run whose reads were not one consistent view (${sources}), but no read showed it in full, and no tracked order claims it: it is read by id in every run until a sound run classifies it, or finds it nowhere (ORDER_NOT_FOUND_BY_ID)`,
       });
     }
   }
@@ -1108,7 +1141,7 @@ export class ReconciliationCoordinator {
       this.#detect(run, {
         breakClass: "ORDER_NOT_FOUND_BY_ID",
         subjectKey: compositeKey("ORDER_NOT_FOUND_BY_ID", id),
-        detail: `venue order ${id} was named (by retained stream evidence, a request, or a row of a partial or malformed answer) while it could not be classified, no read ever showed it in full, and the venue's by-id read does not find it (E-14: canceled and fully matched orders are found by id): quarantined until an operator releases it`,
+        detail: `venue order ${id} was only named while it could not be classified (by a by-id read that did not show it, for an id retained stream evidence or a request named, or by the id alone of a malformed row or leg, nothing else of which validated), no read ever showed it in full, and the venue's by-id read does not find it (E-14: canceled and fully matched orders are found by id): quarantined until an operator releases it`,
       });
     }
   }
@@ -1192,6 +1225,24 @@ export class ReconciliationCoordinator {
       }
       if (attempt.inFlight) continue; // the OMS refuses ABSENT while its own transmission is pending
       const facts = this.#attemptFacts.get(request.submissionAttemptId) ?? factsOf(request);
+      // (r5, R5-NAMED's family) An id only NAMED (the id alone of a malformed row or leg; a by-id read that did not
+      // show an id the stream or a request named) that the venue's by-id read does not find is not a candidate (E-14
+      // is taken as authoritative for it), but nothing rules it out either: its token is unknown, so any attempt
+      // could own it. While one stands unclaimed, no attempt is answered by signed identity, neither PRESENT on
+      // another candidate nor ABSENT. Its ORDER_NOT_FOUND_BY_ID quarantine halts the account meanwhile; once an
+      // operator releases it (or the venue shows the order), a later run answers.
+      const ghosts = unclaimedNotFound(run, oms);
+      if (ghosts.length > 0) {
+        // Recorded every run while it stands (so it is reproduced, never cleared, whatever `identityJudged` says).
+        this.#detect(run, {
+          breakClass: "SIGNED_IDENTITY_AMBIGUOUS",
+          subjectKey: compositeKey("SIGNED_IDENTITY_AMBIGUOUS", request.submissionAttemptId),
+          marketId: request.marketId,
+          orderId: request.orderId,
+          detail: `attempt ${request.submissionAttemptId}: venue order ${ghosts.join(", ")} was only named, no read showed it, and the venue's by-id read does not find it (ORDER_NOT_FOUND_BY_ID): it could be this attempt's, so no signed-identity answer is given while it stands`,
+        });
+        continue;
+      }
       const verdict = resolveBySignedIdentity(facts, this.#unclaimed(oms, view), this.#potentialOwners(oms));
       run.identityJudged.add(request.submissionAttemptId);
       if (verdict.kind === "AMBIGUOUS") {
@@ -1305,6 +1356,9 @@ export class ReconciliationCoordinator {
 
   async #answerOms(run: RunState, oms: ReconciledOms, received: Received<OmsReconciliationRequest>, answer: Readonly<Record<string, unknown>>): Promise<void> {
     const request = received.request;
+    // (r5, WP290-CX-R5-02) No answer once a clock fault is detected in this run: an ABSENT queued before it would
+    // attest a quiescence the faulted clock measured. The request stays owed; a later run answers it.
+    if (!this.#clockSound(run)) return;
     run.answered.add(request.submissionAttemptId);
     let accepted = false;
     let code: string | null = null;
@@ -1942,6 +1996,20 @@ export class ReconciliationCoordinator {
   ): Promise<void> {
     const assetKind = isCollateral ? "COLLATERAL" : projectedKind ?? "OUTCOME_TOKEN";
     const market = isCollateral ? { scope: "ACCOUNT" as const, marketId: null } : this.#marketOf(assetId);
+    // (r5, WP290-CX-R5-02) Nothing is booked once a clock fault is detected in this run: the confirmation time was
+    // measured by the faulted clock. The delta stays unconfirmed (a hold); a later run books it if it lasts.
+    if (!this.#clockSound(run)) {
+      this.#detect(run, {
+        breakClass: "HOLDING_DELTA_UNCONFIRMED",
+        subjectKey: compositeKey("HOLDING_DELTA_UNCONFIRMED", assetId),
+        ...market,
+        assetId,
+        expectedValue: projected,
+        observedValue: authoritative,
+        detail: `${assetId}: an unexplained delta of ${delta}, not booked: the clock was unreadable or went backwards during the run`,
+      });
+      return;
+    }
     const ledgerTransactionId = this.#drawId();
     const failedBooking = (why: string): void =>
       this.#detect(run, {
@@ -2058,6 +2126,11 @@ export class ReconciliationCoordinator {
           });
           continue;
         }
+        // (r5, WP290-CX-R5-02) No answer once a clock fault is detected in this run: a later run answers the member.
+        if (!this.#clockSound(run)) {
+          unanswered += 1;
+          continue;
+        }
         // By name: the member itself is the identity the answer carries (WP-300 follow_up 3).
         const answer: Record<string, unknown> = {
           source: "AUTHORITATIVE_READ",
@@ -2158,6 +2231,8 @@ export class ReconciliationCoordinator {
   async #acknowledgeStreamRequests(run: RunState, answerable: readonly Received<StreamReconciliationRequest>[]): Promise<void> {
     const stream = this.#stream;
     for (const received of answerable) {
+      // (r5, WP290-CX-R5-02) No acknowledgement once a clock fault is detected in this run: the request stays owed.
+      if (!this.#clockSound(run)) return;
       const requestId = received.request.requestId;
       let accepted = false;
       try {
@@ -2334,7 +2409,7 @@ export class ReconciliationCoordinator {
       const existing = unresolved.get(detection.subjectKey);
       if (existing !== undefined) {
         reproduced.add(existing.breakId);
-        if (detection.act !== null) await this.#safeAct(detection);
+        await this.#act(run, detection);
         return;
       }
       // An operator released this very subject. Immutable history (an UNATTRIBUTED trade stays in the account's
@@ -2382,7 +2457,7 @@ export class ReconciliationCoordinator {
         if (!quarantined.ok) journalOk = false;
       }
       // §9.17 step 7, after step 6: act on what was recorded.
-      const fixed = detection.act === null ? false : await this.#safeAct(detection);
+      const fixed = await this.#act(run, detection);
       if (rule === "RESOLVE_IN_RUN" && fixed) {
         const resolved = await this.#append({
           kind: "BREAK_RESOLVED",
@@ -2410,16 +2485,28 @@ export class ReconciliationCoordinator {
     }
     const bySubject = new Map(unresolvedBefore.map((view) => [view.subjectKey, view]));
     const reproduced = new Set<string>();
-    // Detections can raise detections (a refused delivery): record until none is new.
-    for (let index = 0; index < run.detections.length; index += 1) await record(run.detections[index] as Detection, bySubject, reproduced);
-    // Halts for every quarantine (idempotent; re-delivered every run).
-    const haltDetections = this.#deliverHalts(run);
-    for (const detection of haltDetections) await record(detection, bySubject, reproduced);
-    // Clear what a complete run no longer finds, and judged again (a quarantine never: its rule is a release).
+    // Detections can raise detections (a refused delivery; the READ_STALE of a clock fault latched meanwhile):
+    // record, in order, every one not recorded yet, until none is new.
+    let recordedUpTo = 0;
+    const recordPending = async (): Promise<void> => {
+      while (recordedUpTo < run.detections.length) {
+        const next = run.detections[recordedUpTo] as Detection;
+        recordedUpTo += 1;
+        await record(next, bySubject, reproduced);
+      }
+    };
+    await recordPending();
+    // Halts for every quarantine (idempotent; re-delivered every run). A halt that fails is a detection, recorded.
+    this.#deliverHalts(run);
+    await recordPending();
+    // Clear what a complete run no longer finds, and judged again (a quarantine never: its rule is a release). Never
+    // once a clock fault is detected in the run (r5, WP290-CX-R5-02): checked before each one, so a fault detected
+    // while the run records (a request received meanwhile, an operator's release) stops the clearing too.
     const complete = !run.stale && run.readsComplete && run.orderReadsSound;
     for (const view of unresolvedBefore) {
       if (reproduced.has(view.breakId)) continue;
       if (!complete || !this.#judged(run, view) || view.status !== "OPEN" || (view.rule !== "HOLD_UNTIL_CONSISTENT" && view.rule !== "RESOLVE_IN_RUN")) continue;
+      if (!this.#clockSound(run)) continue;
       const cleared = await this.#append({
         kind: "BREAK_RESOLVED",
         breakId: view.breakId,
@@ -2431,6 +2518,10 @@ export class ReconciliationCoordinator {
       });
       if (!cleared.ok) journalOk = false;
     }
+    // (r5, WP290-CX-R5-02) A clock fault detected at any point of the run so far (an answer's record, the closing
+    // reading, a receipt or a release while the run recorded) is latched before the decision: the run is stale, so
+    // it cannot pass, and its READ_STALE is recorded.
+    if (!this.#clockSound(run)) await recordPending();
     // §9.17 step 8. The decision and the epoch it was taken at are read in one synchronous step.
     const epoch = this.#holdEpoch;
     const rerun = this.#workArrivedDuring(run.readsStartSeq ?? run.runStartSeq) || run.holdingsDeferred;
@@ -2459,6 +2550,13 @@ export class ReconciliationCoordinator {
         rerunNext = true;
         reason = "work arrived while the run's completion was being recorded; it does not resume, and another run follows";
         await this.#append({ kind: "RESUME_REFUSED", runId, refusalCode: "RECON_WORK_ARRIVED", atMs });
+      } else if (this.#clockFaultSeq >= run.runStartSeq) {
+        // (r5, WP290-CX-R5-02) A clock fault detected while the PASSED record was being written (an operator's
+        // release attempted meanwhile reads the clock; no hold advanced the epoch): the run concludes nothing more,
+        // so it does not resume. The next run, at once, reads afresh, with every pending request's window restarted.
+        rerunNext = true;
+        reason = "the clock was unreadable or went backwards while the run's completion was being recorded; it does not resume, and another run follows";
+        await this.#append({ kind: "RESUME_REFUSED", runId, refusalCode: "RECON_CLOCK_FAULT", atMs });
       } else {
         // Resume only after the PASSED record is durable, with nothing new since the decision (synchronous from here).
         const oms = this.#oms as ReconciledOms;
@@ -2536,7 +2634,7 @@ export class ReconciliationCoordinator {
   /** The first required invariant that fails, or `undefined` (see RESUME in the header). */
   #resumeBlocker(run: RunState, complete: boolean, journalOk: boolean, rerun: boolean): string | undefined {
     if (!journalOk || this.#deps.journal.faulted) return "the journal did not record every event";
-    if (run.stale) return "the run's reads were stale";
+    if (run.stale) return run.clockFaulted ? "the clock was unreadable or went backwards during the run (READ_STALE)" : "the run's reads were stale";
     if (!complete) return "the run did not read everything completely and consistently";
     if (run.holdingsDeferred) return "holdings were not judged: the OMS and the venue disagreed about an order this run";
     // Defence in depth: every path that leaves the holdings unjudged also records a break or an incomplete read.
@@ -2607,9 +2705,16 @@ export class ReconciliationCoordinator {
     return fresh;
   }
 
-  async #safeAct(detection: Detection): Promise<boolean> {
+  /**
+   * Take the action a break's rule calls for (§9.17 step 7: deliver a missed fill, route a state mismatch to the
+   * OMS); `true` when it was taken and accepted. Never once a clock fault is detected in the run (r5,
+   * WP290-CX-R5-02): the break stays as recorded (a hold), and a later run acts on it.
+   */
+  async #act(run: RunState, detection: Detection): Promise<boolean> {
+    if (detection.act === null) return false;
+    if (!this.#clockSound(run)) return false;
     try {
-      return detection.act === null ? false : await detection.act();
+      return await detection.act();
     } catch {
       return false;
     }
@@ -2869,6 +2974,34 @@ export class ReconciliationCoordinator {
     for (const [key, entry] of this.#omsRequests) if (entry.atMs !== null) this.#omsRequests.set(key, Object.freeze({ ...entry, atMs: null }));
   }
 
+  /**
+   * Whether the clock has stayed sound since the run started; `false` LATCHES the fault into the run (r5,
+   * WP290-CX-R5-02). A fault the coordinator detects at any point of a run (its reads; the record of an answer; a
+   * request received meanwhile; the run's closing reading; an operator's release attempted meanwhile) means no
+   * earlier reading of the run can be trusted to measure anything: the quiescence an ABSENT attests, the time a
+   * delta was confirmed over. So from the moment it is detected the run concludes nothing more: it is STALE
+   * (`READ_STALE`, a hold), and it gives no further answer (an ABSENT queued before the fault included), books
+   * nothing, acts on no break, clears none, and does not resume. `#clockFault` has restarted every pending OMS
+   * request's quiescence window, so only a later run, whose reads begin after the fault and a full horizon after
+   * that window's new start, may answer what this one withheld. Every effect checks it just before it is taken;
+   * what a run did before the fault was detected stands (it was decided on a clock that read as sound). A fault
+   * before the run started (`runStartSeq`) is not this run's: its reads all came after it.
+   */
+  #clockSound(run: RunState): boolean {
+    if (this.#clockFaultSeq < run.runStartSeq) return true;
+    // Stale: nothing is cleared and the run cannot pass (`#finish`, `#resumeBlocker`). Its reads themselves were
+    // complete and in their shape; every effect a stale view must not have checks this method on its own.
+    run.clockFaulted = true;
+    run.stale = true;
+    this.#detect(run, {
+      breakClass: "READ_STALE",
+      subjectKey: compositeKey("READ_STALE", "run"),
+      detail:
+        "the clock was unreadable or went backwards during the run: nothing more is concluded from it (no further answer, booking, action, clearing or resume), and every pending request's quiescence window restarts",
+    });
+    return false;
+  }
+
   #drawId(): string | undefined {
     let id: unknown;
     try {
@@ -2938,7 +3071,7 @@ interface RunReads {
   readonly walletMembers: ReadonlyMap<string, ReadOutcome<WalletMemberRead>>;
 }
 
-/** One venue order id a run observed: whether a read that answered in full SHOWED it, its token when known, and where. */
+/** One venue order id a run observed: whether a read SHOWED it in full (r5: a row or leg that validated in full counts), its token when known, and where. */
 interface Observation {
   readonly shown: boolean;
   readonly tokenId: string | null;
@@ -3023,6 +3156,12 @@ function detection(partial: Partial<Detection> & Pick<Detection, "breakClass" | 
  */
 function arrivalSubject(ledgerTransactionId: string, kind: "ACTUAL_ARRIVAL" | "UNEXPLAINED_MOVEMENT", assetId: string, marketId: string | null, place: number): string {
   return compositeKey("ledger-arrival", ledgerTransactionId, kind, assetId, marketId ?? "", String(place));
+}
+
+/** The watched ids only NAMED that this run's by-id read did not find (`RunState.namedNotFound`), unclaimed, sorted. */
+function unclaimedNotFound(run: RunState, oms: ReconciledOms): string[] {
+  const claimed = claimedVenueIds(oms.orders(), oms.attempts());
+  return [...run.namedNotFound].filter((id) => !claimed.has(id)).sort();
 }
 
 function claimedVenueIds(orders: readonly OrderView[], attempts: readonly AttemptView[]): Set<string> {
