@@ -500,6 +500,29 @@ pruning waits for settlement.
      `maxTotalBytes`. At the limit the writer refuses new frames and deletes
      nothing (Decision 5.3).
    - Owner: the same data-gateway round (`STORAGE1-MAXBYTES`).
+
+   > **Corrected 2026-10-04 (`GOV-NOTES-1`): items 1 and 2 after
+   > `WALCAP-1`.** `WALCAP-1` merged as `da559ca` on 2026-10-03. Its record
+   > is `docs/handoffs/WALCAP-1.md`. It closed `STORAGE1-MAXBYTES`, except
+   > Decision 5.1's stronger form. Items 1 and 2 describe the code before it.
+   >
+   > - **Item 1.** A gateway config that declares
+   >   `hostProfile: "laptop-paper"` is refused at startup without
+   >   `wal.maxTotalBytes` (`parseGatewayConfig`, `apps/data-gateway`). A
+   >   config without that marker still accepts `null` or no value. Requiring
+   >   the value without the marker awaits a ruling (`WALCAP-LOWS`, O-L3).
+   > - **Item 2 (`J10`).** With `maxTotalBytes` set, the writer no longer
+   >   compares it with `#totalSegmentBytes`. It compares it with a per-file
+   >   ledger of segment files (`capacity-ledger.ts`, `packages/storage-wal`).
+   >   - The gateway's ledger covers every epoch under its WAL root.
+   >   - It is re-derived on every `tick()`. A segment that expiry deleted
+   >     stops counting once a re-derivation finds it gone.
+   >   - At the limit the writer still refuses new frames and deletes nothing
+   >     (Decision 5.3).
+   >   - `docs/contracts/wal-format.md` §11.1 states the rule.
+   > - **Still open.** The worker's `walCapacity` metric and its 90% alarm
+   >   model the old writer (`WALCAP-LOWS`, O-L5).
+
 3. **Pins and the research tier are written with SNAPPY, not ZSTD.**
    - `DatasetCodec` offers only `UNCOMPRESSED` and `SNAPPY`
      (`packages/storage-parquet`). The pinned `hyparquet-writer` 0.16.6 has
@@ -543,3 +566,48 @@ Two limits come from the trader, not from this worker.
     window with a refusal or a halt for 30 days.
 - Owner of both: a trader/storage round that persists decision provenance,
   halts and refusals (`STORAGE-1` follow_up 3).
+
+> **Corrected 2026-10-04 (`GOV-NOTES-1`): both trader limits are lifted.**
+> `PROVENANCE-1` lifted them. It merged as `71d8b80` on 2026-10-03. Its
+> record is `docs/handoffs/PROVENANCE-1.md`. The two items above describe
+> the code before it.
+>
+> - **Decisions carry their dispatch position.** This closed
+>   `H1R1-PROVENANCE`.
+>   - `CoreLoop` now gives a decision's `sourceEvent` its source event's
+>     `eventId`, `gatewayEpoch` and `ingestSeq` (`dispatchPositionOf`,
+>     `packages/trading-core`).
+>   - `decisionRow` (`apps/trader`) writes them to `gateway_epoch` and
+>     `ingest_seq`. They are NULL only for a decision the loop originates:
+>     `onFill` or `onOrderUpdate`.
+>   - So `dispatchFrontiers` returns a frontier for an instance with such
+>     decisions, and a trader window can classify. `classificationBlocker`
+>     checks each responsible instance's frontier against each requirement
+>     (`meetsRequirement` in `retention/wal-index.ts`).
+>   - Where an epoch ended inside the window's range, a frontier inside that
+>     epoch is not enough. A later decision of the same run, in another
+>     epoch, is required (`past-epoch-end`).
+> - **Refusal and halt rows are written.** This closed
+>   `OUT1-R1-HALT-NOT-DURABLE`.
+>   - Each intent the risk engine refuses becomes one `VETOED`
+>     `ops.risk_events` row per refusal code (`riskEventRows`,
+>     `apps/trader`).
+>   - Before the trader exits, it writes each latched halt to
+>     `ops.incidents` as a `TRADER_HALT:<scope>` row, bounded to 5 s
+>     (`recordHaltsBeforeExit`). A GLOBAL halt writes one row per configured
+>     instance.
+>   - `postgresTraderEvidence` reads both. A classified window with a halt
+>     or a refusal, and no fill, now gets a `halt` or `refusal` pin
+>     (`pinClassOf`).
+> - **Still open (`PROV1-LOWS`):**
+>   - **F3.** When PostgreSQL itself failed, a halt's row may not land. The
+>     trader logs `HALT RECORD NOT DURABLE` or `HALT RECORD UNCONFIRMED`.
+>     Refusals made after the failure are not written (`#takeRiskRefusals`).
+>     The window then lacks that evidence, and may get no pin. Owners:
+>     `HOST-1`, to page on those lines, and `BURN-IN`, for the operator-pin
+>     procedure.
+>   - **R2-L1.** A window that overlaps a gateway epoch's end stays
+>     unclassified for good when the gateway and the trader restart
+>     together. It fails closed: the raw WAL it overlaps is kept.
+>   - R2-L2 and R2-L3 concern the trader's exit and a log line, not
+>     retention.
