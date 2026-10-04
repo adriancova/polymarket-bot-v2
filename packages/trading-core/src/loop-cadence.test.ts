@@ -173,7 +173,7 @@ function marketDocument(marketId: string, tokens: { readonly yes: string; readon
   };
 }
 
-function traderConfig(perStrategyCap = "1000"): Record<string, unknown> {
+function traderConfig(perStrategyCap = "1000", globalAccountCap = "10000"): Record<string, unknown> {
   return {
     environment: "PAPER",
     riskPolicy: {
@@ -186,7 +186,7 @@ function traderConfig(perStrategyCap = "1000"): Record<string, unknown> {
       timeToClose: { entryCutoffSeconds: 30 },
     },
     allocatorCaps: {
-      globalAccountCap: "10000",
+      globalAccountCap,
       perStrategyCap,
       liveMicroMaxOrderNotional: "0",
       liveMicroMaxAccountExposure: "0",
@@ -458,6 +458,8 @@ interface HarnessOptions {
   readonly venueRetention?: VenueRetentionBounds;
   /** `CADENCE-1` r3 (A-R3-01): the allocator's per-strategy cap, in pUSD (default 1,000). */
   readonly perStrategyCap?: string;
+  /** `TC-LOWS-1` (CAD1-R4-01, MZ8): the allocator's global account cap, in pUSD (default 10,000). */
+  readonly globalAccountCap?: string;
   /** `CADENCE-1` r3 (O-R3-02): the venue's order budget (default: none modelled). */
   readonly rateLimits?: RateLimitBudget;
   /**
@@ -470,7 +472,7 @@ interface HarnessOptions {
 
 /** `createPaperTrader`'s assembly, with the recording double's runtimes registered. */
 function assemble(options: HarnessOptions): Harness {
-  const parsed = parseTraderConfig(traderConfig(options.perStrategyCap));
+  const parsed = parseTraderConfig(traderConfig(options.perStrategyCap, options.globalAccountCap));
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
   const policy = parseRiskPolicy(config.riskPolicy);
@@ -2269,5 +2271,134 @@ describe("r3 (O-R3-03): each runtime refusal code is classified — a refusal th
       expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced + 1);
     }
     expect(harness.loop.health().loop.refusedEvaluations).toBe(1);
+  });
+});
+
+describe("TC-LOWS-1 (CAD1-R4-01): each round-3 guard of the carried harvest is pinned — the carried path against the ordinary one, and against the values", () => {
+  /** What one run showed at, and after, the close of interest. */
+  interface Close {
+    /** Every non-`onFeatures` callback since `start`, as `[instance, callback, evaluatedAt, YES shares, order status]`. */
+    readonly calls: readonly (readonly [string, string, string, string | undefined, string])[];
+    readonly submissions: { readonly accepted: number; readonly refused: number };
+    readonly riskRefusals: Readonly<Record<string, number>>;
+    readonly allocatorRefusals: Readonly<Record<string, number>>;
+    readonly reservations: ReturnType<CoreLoop["health"]>["seams"]["reservations"];
+    readonly allocator: { readonly open: number; readonly reservedCollateral: string };
+    readonly orders: readonly string[];
+    readonly halts: number;
+  }
+
+  function closeOf(harness: Harness, start: number): Close {
+    const health = harness.loop.health();
+    return {
+      calls: harness.seen
+        .map((entry, index) => ({ entry, shown: harness.shown[index] }))
+        .slice(start)
+        .filter(({ entry }) => entry.callback !== "onFeatures")
+        .map(({ entry, shown }) => [label(entry.instanceId), entry.callback, entry.evaluatedAt, shown?.yesShares, shown?.orderStatus ?? ""] as const),
+      submissions: { accepted: health.execution.submissionsAccepted, refused: health.execution.submissionsRefused },
+      riskRefusals: health.risk.refusalsByCode,
+      allocatorRefusals: health.seams.allocator.refusalsByCode,
+      reservations: health.seams.reservations,
+      allocator: { open: health.seams.allocator.open, reservedCollateral: health.seams.allocator.reservedCollateral },
+      orders: harness.venue.ordersSnapshot().map((order) => `${order.action} ${order.state} ${order.filledShares}`),
+      halts: harness.halts.records().length,
+    };
+  }
+
+  it("MZ9 (`#releaseSettledOwn`'s terminal check): a heartbeat's own RESTING order — nothing filled, so every fill it reports is booked — is NOT terminal: the carried harvest keeps its reservation and allocator commitment, as the ordinary harvest does (§9.14)", async () => {
+    const at = iso(S + 5_000);
+    const run = async (carried: boolean): Promise<Close> => {
+      ordinal = 0;
+      const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: false } });
+      await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+      const start = harness.seen.length;
+      // B's heartbeat at S + 5 000 places a resting maker BUY (10 at 0.30). The
+      // close's source is an event of X (the CARRIED harvest) or of A (ordinary).
+      await feed(harness, snapshot(S + 5_000, carried ? MARKET_X : MARKET_A, "yes"));
+      return closeOf(harness, start);
+    };
+    const ordinary = await run(false);
+    const carried = await run(true);
+    expect(carried.calls).toEqual([["B", "onOrderUpdate", at, "0", "OPEN"]]);
+    expect(carried.orders).toEqual(["BUY RESTING 0"]);
+    // Still reserved: 10 × 0.30 = 3 pUSD in both books.
+    expect(carried.reservations).toMatchObject({ open: 1, taken: 1, released: 0, reservedCollateral: "3" });
+    expect(carried.allocator).toEqual({ open: 1, reservedCollateral: "3" });
+    expect(carried).toEqual(ordinary);
+  });
+
+  it("MZ8 (`#releaseSettledOwn(effects.touched, …)`, not `placed`): a heartbeat that CANCELS A's resting order while B's heartbeat fills — A's cancelled reservation is released BEFORE onFill, so B's onFill BUY is admitted under a 7 pUSD global cap, as at an ordinary harvest", async () => {
+    const at = iso(S + 5_000);
+    const run = async (carried: boolean): Promise<Close> => {
+      ordinal = 0;
+      const harness = assemble({
+        cadence: PAPER_EVALUATION_CADENCE,
+        globalAccountCap: "7",
+        // A rests a maker BUY at its open (10 at 0.30: 3 pUSD reserved).
+        placeOnOpen: true,
+        // At S + 5 000, A's heartbeat cancels it; B's heartbeat BUY fills 10 at 0.34
+        // at once, and B's onFill places another taker BUY (up to 4 pUSD).
+        cancelOnFeatures: { market: MARKET_A, at },
+        placeOnFeatures: { market: MARKET_B, at, immediate: true },
+        placeOnFill: { market: MARKET_B, at },
+      });
+      await feed(harness, ...opening(), opened(S + 100, MARKET_A), opened(S + 150, MARKET_B));
+      const start = harness.seen.length;
+      // The close's source is an event of X (the CARRIED harvest), or a book
+      // of B itself (an ordinary harvest at the same instant).
+      await feed(harness, carried ? snapshot(S + 5_000, MARKET_X, "yes") : level(S + 5_000, MARKET_B, "0.31"));
+      return closeOf(harness, start);
+    };
+    const ordinary = await run(false);
+    const carried = await run(true);
+    // The onFill BUY is admitted: A's 3 pUSD came back before onFill ran.
+    expect(carried.submissions).toEqual({ accepted: 4, refused: 0 });
+    expect(carried.riskRefusals).toEqual({});
+    expect(carried.allocatorRefusals).toEqual({});
+    expect(carried.orders).toEqual(["BUY CANCELLED 0", "BUY FILLED 10", "BUY FILLED 10"]);
+    expect(carried.calls).toEqual([
+      ["B", "onFill", at, "10", ""],
+      ["A", "onOrderUpdate", at, "0", "CANCELED"],
+      ["B", "onOrderUpdate", at, "10", "FILLED"],
+      ["B", "onOrderUpdate", at, "10", "FILLED"],
+    ]);
+    expect(carried.reservations).toMatchObject({ open: 0, taken: 3, released: 3, reservedCollateral: "0" });
+    expect(carried.halts).toBe(0);
+    expect(carried).toEqual(ordinary);
+  });
+
+  it("MZ6 (the view boundary takes `delivered.touched`, not `placed`): an order an onFill decision CANCELS at a carried harvest — fully booked, a resting covered SELL — has its CANCELED view, and its release, at that close, as at an ordinary harvest", async () => {
+    const first = iso(S + 5_000);
+    const second = iso(S + 10_000);
+    const run = async (carried: boolean): Promise<Close> => {
+      ordinal = 0;
+      const harness = assemble({
+        cadence: PAPER_EVALUATION_CADENCE,
+        placeOnFeatures: { market: MARKET_B, at: [first, second], immediate: true },
+        // The first heartbeat's fill: onFill rests a covered SELL of the 10 shares.
+        placeOnFill: { market: MARKET_B, at: first, sells: true },
+        // The second heartbeat's fill: onFill cancels B's working orders (the SELL).
+        cancelOnFill: { market: MARKET_B, at: second },
+      });
+      await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+      await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+      const start = harness.seen.length;
+      await feed(harness, snapshot(S + 10_000, carried ? MARKET_X : MARKET_A, "yes"));
+      return closeOf(harness, start);
+    };
+    const ordinary = await run(false);
+    const carried = await run(true);
+    expect(carried.calls).toEqual([
+      ["B", "onFill", second, "20", ""],
+      // The SELL the onFill decision cancelled: its terminal view, at this close.
+      ["B", "onOrderUpdate", second, "20", "CANCELED"],
+      ["B", "onOrderUpdate", second, "20", "FILLED"],
+    ]);
+    expect(carried.orders).toEqual(["BUY FILLED 10", "SELL CANCELLED 0", "BUY FILLED 10"]);
+    // Every reservation is released: the SELL's with its CANCELED view.
+    expect(carried.reservations).toMatchObject({ open: 0, taken: 3, released: 3, reservedCollateral: "0" });
+    expect(carried.allocator).toEqual({ open: 0, reservedCollateral: "0" });
+    expect(carried).toEqual(ordinary);
   });
 });

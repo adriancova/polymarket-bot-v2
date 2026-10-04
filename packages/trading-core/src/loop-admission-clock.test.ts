@@ -381,6 +381,12 @@ interface Recorded {
   readonly atMs: number;
   readonly source?: "polymarket" | "binance";
   readonly session?: Session;
+  /**
+   * `TC-LOWS-1` (`CO2N1-R1-J4`): one venue frame's key. Events that carry the
+   * same one, delivered consecutively, are ONE frame (`frames.ts`: a shared
+   * `causationId`), evaluated at its close.
+   */
+  readonly frame?: string;
 }
 
 let ordinal = 0;
@@ -403,6 +409,7 @@ function ingested(recorded: Recorded): IngestedEvent {
     ...(recorded.session === undefined
       ? { subscriptionGeneration: 1 }
       : { connectionId: recorded.session.connectionId, subscriptionGeneration: recorded.session.generation }),
+    ...(recorded.frame === undefined ? {} : { causationId: `raw:${GATEWAY_EPOCH}:${recorded.frame}` }),
     payload: recorded.payload,
   };
   return {
@@ -1240,5 +1247,68 @@ describe("ADR-031 T11: under LAST_CHANGE a CANCEL reads no clock and each placem
     expect(first?.verdict.approved).toBe(true);
     expect(featuresAge(second)).toBe(2_001);
     expect(codes(second)).toEqual(["RISK_FEATURES_STALE"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TC-LOWS-1 (CO2N1-R1-J4): the lag is measured from the EVALUATED event's own
+// instant, not from the frame's last event
+// ---------------------------------------------------------------------------
+
+describe("TC-LOWS-1 (CO2N1-R1-J4), ADR-031 R2 with ADR-024 D3: in a frame whose events carry different receipt instants, the lag is measured from the instant the market was evaluated at", () => {
+  // One venue frame (a shared `causationId`): this market's YES book at
+  // 1.400 s, then a book of a market this trader does not run, stamped 9 ms
+  // later (ADR-024 D1: a live frame's events may carry different receipt
+  // instants). The frame owes this market ONE evaluation, at its close, at the
+  // instant of the frame's last event that touched it (ADR-024 D3,
+  // `#closeFrame`): 1.400 s. The loop's last event instant (`#lastEpochMs`) is
+  // the frame's LAST event: 1.409 s. R2's lag is `processNow − eventNow`, and
+  // `eventNow` is the evaluation's own event instant: 1.400 s.
+  const TAIL_MS = ENTRY_AT_MS + 9;
+  const frame = (): Recorded[] => [
+    { ...evaluationAt(ENTRY_AT_MS), frame: "co2n1-j4" },
+    { ...otherMarketBook(TAIL_MS, A1), frame: "co2n1-j4" },
+  ];
+
+  /** The frame, handed to ONE drain, with the process clock at `reading`. */
+  async function driveFrame(harness: Harness, reading: string): Promise<void> {
+    harness.clock.set(reading);
+    for (const recorded of frame()) {
+      if (!harness.loop.ingest(ingested(recorded))) throw new Error(`ingest refused ${recorded.eventType}`);
+    }
+    await harness.loop.drain();
+  }
+
+  it("the process reads 2 001 ms after the evaluated event and 1 992 ms after the frame's last event: featuresAgeMs is 2 001, so the entry is refused RISK_FEATURES_STALE", async () => {
+    const harness = assemble(oneEntry());
+    await drive(harness, opening(), lagging(0));
+    const processed = harness.loop.health().loop.eventsProcessed;
+    await driveFrame(harness, iso(ENTRY_AT_MS + 2_001));
+    // Both events were applied, in ONE frame, and decided ONCE.
+    expect(harness.loop.health().loop.eventsProcessed).toBe(processed + 2);
+    const admissions = harness.admissions();
+    expect(admissions).toHaveLength(1);
+    const [entry] = admissions;
+    // The evaluation is the market's own event's, not the frame tail's.
+    expect(entry?.document.evaluatedAt).toBe(iso(ENTRY_AT_MS));
+    // Measured from that instant: 2 001 ms. From the frame's last event
+    // (`#lastEpochMs`) it would read 1 992 ms — inside the 2 000 ms bound,
+    // and the entry would be approved.
+    expect(featuresAge(entry)).toBe(2_001);
+    expect(codes(entry)).toEqual(["RISK_FEATURES_STALE"]);
+    expect(harness.submitted).toEqual([]);
+    expect(harness.venue.fills).toHaveLength(0);
+  });
+
+  it("the control: the same frame read 2 000 ms after the evaluated event is inside the bound, approved and filled", async () => {
+    const harness = assemble(oneEntry());
+    await drive(harness, opening(), lagging(0));
+    await driveFrame(harness, iso(ENTRY_AT_MS + 2_000));
+    const [entry] = harness.admissions();
+    expect(entry?.document.evaluatedAt).toBe(iso(ENTRY_AT_MS));
+    expect(featuresAge(entry)).toBe(2_000);
+    expect(entry?.verdict.approved).toBe(true);
+    expect(planKinds(harness)).toEqual(["POSITION"]);
+    expect(harness.venue.fills).toHaveLength(1);
   });
 });
