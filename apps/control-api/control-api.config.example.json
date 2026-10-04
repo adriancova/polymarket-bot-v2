@@ -5,6 +5,7 @@
   "auditCapacity": 65536,
   "auditSafetyReserve": 1024,
   "traderHealth": { "kind": "none" },
+  "traderHalts": { "kind": "none" },
   "operators": [
     {
       "operatorId": "local-operator",

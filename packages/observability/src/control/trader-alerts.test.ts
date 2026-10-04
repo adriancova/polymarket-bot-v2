@@ -31,7 +31,7 @@ const rules = alertsSource
   .filter((line) => !/^\s*#/u.test(line))
   .join("\n");
 
-const EXPECTED_ALERTS = ["TraderCadenceForwardJump"];
+const EXPECTED_ALERTS = ["TraderCadenceForwardJump", "TraderHaltOpenOrUnknown"];
 
 /** One alert's block: from its `- alert:` line to the next one, or the end. */
 function alertBlock(name: string): string {

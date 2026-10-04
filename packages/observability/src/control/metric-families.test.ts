@@ -100,10 +100,23 @@ describe("PLATFORM_METRIC_FAMILIES", () => {
   });
 });
 
+/**
+ * `CONTROL-2`: the trader-halt families' producer is `apps/control-api`'s
+ * `traderHaltSamples` (`src/trader-halts.ts`), which this package may not
+ * import; `apps/control-api/src/trader-halts.test.ts` pins that it emits
+ * exactly these three, with the labels this table declares.
+ */
+const PRODUCED_BY_THE_CONTROL_API = [
+  "control_trader_halts_state",
+  "control_trader_halts_open",
+  "control_trader_halt_reads_total",
+];
+
 describe("every declared family has a producer, and every producer a declaration", () => {
   const produced = new Set([
     ...traderHealthSamples(fullTraderHealthReport()).map((sample) => sample.name),
     ...controlPlaneSamples(fullControlPlaneInput()).map((sample) => sample.name),
+    ...PRODUCED_BY_THE_CONTROL_API,
   ]);
 
   it("emits EVERY declared family from a fully populated snapshot", () => {

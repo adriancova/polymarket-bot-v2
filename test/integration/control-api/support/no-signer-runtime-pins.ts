@@ -23,14 +23,14 @@
  * the secure adapter into this worker — and fail.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY } from "./forbidden-targets.js";
+import { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SDK_SIGNING_PACKAGES, SECURE_DIRECTORY } from "./forbidden-targets.js";
 import { NO_SIGNER_GUARD_TAG, noSignerLoad, refusedLanding } from "./no-signer-guard.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
@@ -294,7 +294,7 @@ export function pinNoSignerGuard(runner: string): void {
     it("the landing rule: the secure adapter, every forbidden package's store path, and a symbolic link into either — and nothing else", () => {
       expect(refusedLanding(SECURE_LEAF)).toBeDefined();
       expect(refusedLanding(VENUE_SDK_ENTRY)).toBeDefined();
-      for (const name of [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES]) {
+      for (const name of [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES, ...SDK_SIGNING_PACKAGES]) {
         // As pnpm stores it: `node_modules/.pnpm/<name>@<version>/node_modules/<name>/…`.
         const stored = join(REPO_ROOT, "node_modules", ".pnpm", `${name.replace("/", "+")}@1.0.0`, "node_modules", ...name.split("/"), "index.js");
         expect(refusedLanding(stored), stored).toBeDefined();
@@ -306,6 +306,12 @@ export function pinNoSignerGuard(runner: string): void {
         const stored = join(REPO_ROOT, "node_modules", ".pnpm", `${name.replace("/", "+")}@1.0.0`, "node_modules", ...name.split("/"), "index.js");
         expect(refusedLanding(stored), stored).toBeDefined();
       }
+      // `CONTROL-2` (`CTRL1B-R5-L3`): the SDK's signing closure, spelled from parts the same way.
+      for (const name of [word("@noble/", "cur", "ves"), word("@noble/", "hash", "es"), word("@scure/", "bip", "32"), word("@scure/", "bip", "39")]) {
+        const stored = join(REPO_ROOT, "node_modules", ".pnpm", `${name.replace("/", "+")}@1.0.0`, "node_modules", ...name.split("/"), "index.js");
+        expect(refusedLanding(stored), stored).toBeDefined();
+        expect(refusedLanding(join(REPO_ROOT, "node_modules", ...`${name}-extra`.split("/"), "index.js")), name).toBeUndefined();
+      }
       // …matched EXACTLY: a package whose name only begins like one loads.
       expect(refusedLanding(join(REPO_ROOT, "node_modules", word("o", "xford"), "index.js"))).toBeUndefined();
       expect(refusedLanding(join(REPO_ROOT, "node_modules", "@polymarket", word("types", "cript"), "index.js"))).toBeUndefined();
@@ -316,6 +322,30 @@ export function pinNoSignerGuard(runner: string): void {
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }
+    });
+
+    it("CONTROL-2 (CTRL1B-R5-L3): the SDK's signing closure, INSTALLED, is refused by a computed load through either half", async () => {
+      // CONTROL-1b's round-5 plant: a computed path into the store, loaded in
+      // the guarded project. Each package's real installed directory is found
+      // by listing the store, so the pin follows the lockfile's versions.
+      const store = join(REPO_ROOT, "node_modules", ".pnpm");
+      const names = [word("@noble/", "cur", "ves"), word("@noble/", "hash", "es"), word("@scure/", "bip", "32"), word("@scure/", "bip", "39")];
+      for (const name of names) {
+        const entry = readdirSync(store).find((directory) => directory.startsWith(`${name.replace("/", "+")}@`));
+        expect(entry, name).toBeDefined();
+        const installed = join(store, entry ?? "", "node_modules", ...name.split("/"), "package.json");
+        expect(() => factoryAt(import.meta.url)(installed), name).toThrow(refusedBy("node"));
+        await expect(viteLoader()(installed), name).rejects.toThrow(refusedBy("either"));
+      }
+      // …and the round-5 plant's own target: the curve module the SDK signs with.
+      const curves = readdirSync(store).find((directory) => directory.startsWith(`${(names[0] ?? "").replace("/", "+")}@`));
+      const signer = join(store, curves ?? "", "node_modules", ...(names[0] ?? "").split("/"), word("secp", "256k1.js"));
+      expect(() => factoryAt(import.meta.url)(signer)).toThrow(refusedBy("node"));
+      // Positive control: the same two routes load a sibling the SDK does not sign with.
+      const sibling = readdirSync(store).find((directory) => directory.startsWith(`${word("@scure/", "base").replace("/", "+")}@`));
+      expect(sibling).toBeDefined();
+      const base = join(store, sibling ?? "", "node_modules", ...word("@scure/", "base").split("/"), "package.json");
+      expect(factoryAt(import.meta.url)(base)).toMatchObject({ name: word("@scure/", "base") });
     });
 
     it("the vite half's load hook: refuses a forbidden file with or without a query, and leaves every other id to vite", () => {

@@ -44,6 +44,15 @@ scrape_configs:
   # The control API (WP-240) — the producer of every trader_* / control_* series.
   - job_name: "control-api"
     scrape_interval: 15s
+    # CONTROL-2 (CTL2-F1), for TraderHaltOpenOrUnknown: stated, not left to
+    # Prometheus's default. The control API answers every authorized
+    # /v1/metrics within its answer deadline (apps/control-api/src/api.ts,
+    # READ_REFRESH_DEADLINE_MS, 8 s) whatever its trader-health and
+    # ops.incidents reads do, so a slow database is scraped as
+    # control_trader_halts_state UNKNOWN 1 — which pages — rather than as an
+    # abandoned scrape, which pages nothing. Keep it above that deadline:
+    # test/integration/control-api/trader-halt-shape.test.ts pins the order.
+    scrape_timeout: 10s
     metrics_path: "/v1/metrics"
     authorization:
       type: "Bearer"

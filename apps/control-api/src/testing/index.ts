@@ -18,6 +18,12 @@ import { ControlPlane } from "../control-plane.js";
 import type { TraderHealthDocument } from "../health-door.js";
 import { InMemoryTraderHealthSource, TraderHealthCache } from "../health-source.js";
 import { CONTROL_API_RUN_MODE, REPOSITORY_MAXIMUM_RUN_MODE } from "../safety.js";
+import {
+  AbsentTraderHaltSource,
+  TRADER_HALT_INCIDENT_KEYS,
+  TraderHaltCache,
+  type TraderHaltSource,
+} from "../trader-halts.js";
 
 /**
  * Obviously-fake operator tokens, long enough to pass the weakness check.
@@ -68,6 +74,18 @@ export interface HarnessOptions {
     readonly grants: readonly OperatorGrant[];
   }[];
   readonly healthDocument?: unknown;
+  /**
+   * `CONTROL-2`: the trader halt source. Absent: an `AbsentTraderHaltSource`,
+   * as `main.ts` composes for `traderHalts.kind` `none` — never read, state
+   * `NOT_CONFIGURED` — so a suite that does not ask for halts reads nothing it
+   * did not before.
+   */
+  readonly traderHaltSource?: TraderHaltSource;
+  /**
+   * `CTL2-F1`: the API's answer deadline (`ControlApiOptions.refreshDeadlineMs`).
+   * Absent: the shipped default, `READ_REFRESH_DEADLINE_MS`.
+   */
+  readonly refreshDeadlineMs?: number;
 }
 
 export interface Harness {
@@ -79,6 +97,9 @@ export interface Harness {
   readonly health: TraderHealthCache;
   readonly healthSource: InMemoryTraderHealthSource;
   readonly environment: ScriptedEnvironment;
+  /** `CONTROL-2`: the trader halt cache the API reads, and its source. */
+  readonly traderHalts: TraderHaltCache;
+  readonly traderHaltSource: TraderHaltSource;
 }
 
 /**
@@ -108,6 +129,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   });
   const healthSource = new InMemoryTraderHealthSource(options.healthDocument);
   const health = new TraderHealthCache(healthSource);
+  const traderHaltSource = options.traderHaltSource ?? new AbsentTraderHaltSource();
+  const traderHalts = new TraderHaltCache(traderHaltSource);
 
   const api = new ControlApi({
     operators: new OperatorRegistry([
@@ -125,9 +148,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     environment,
     auditCapacity: options.auditCapacity ?? 64,
     auditSize: () => audit.size,
+    traderHalts,
+    ...(options.refreshDeadlineMs === undefined ? {} : { refreshDeadlineMs: options.refreshDeadlineMs }),
   });
 
-  return { api, controlPlane, audit, auditBudget, health, healthSource, environment };
+  return { api, controlPlane, audit, auditBudget, health, healthSource, environment, traderHalts, traderHaltSource };
 }
 
 /** `Authorization` header value for a token. */
@@ -279,4 +304,51 @@ export function healthDocument(
     asOf: "2026-09-05T00:00:10.000Z",
   };
   return { ...base, ...overrides };
+}
+
+/**
+ * `CONTROL-2`: one open trader halt row as the PostgreSQL source fetches it
+ * (`adapters/postgres-trader-halts.ts`) — the table's column names, every value
+ * text or `null` — shaped as `apps/trader/src/halt-record.ts` writes a
+ * `MARKET` halt unless `overrides` say otherwise.
+ */
+export function traderHaltRow(overrides: Partial<Record<string, string | null>> = {}): Record<string, string | null> {
+  return {
+    incident_id: "01930000-0000-7000-8000-00000000a001",
+    incident_key: TRADER_HALT_INCIDENT_KEYS.MARKET,
+    environment: "PAPER",
+    account_ref: "paper-account",
+    severity: "PAGE",
+    status: "OPEN",
+    failure_class: "STALE_BOOK",
+    action: "HALT_NEW_ENTRIES",
+    market_id: "01930000-0000-7000-8000-00000000b001",
+    instance_id: null,
+    detail: "market book is stale",
+    opened_at: "2026-10-04T00:00:00.000000Z",
+    ...overrides,
+  };
+}
+
+/**
+ * `CONTROL-2`: a whole fetch — the counting statement's one row, computed from
+ * `rows` by their keys unless `counts` overrides it, and the listed rows.
+ */
+export function traderHaltFetch(
+  rows: readonly Record<string, string | null>[],
+  counts: Partial<Record<"total" | "global" | "market" | "strategy_instance", string>> = {},
+): { counts: Record<string, string>[]; rows: Record<string, string | null>[] } {
+  const keyed = (key: string): string => String(rows.filter((row) => row["incident_key"] === key).length);
+  return {
+    counts: [
+      {
+        total: String(rows.length),
+        global: keyed(TRADER_HALT_INCIDENT_KEYS.GLOBAL),
+        market: keyed(TRADER_HALT_INCIDENT_KEYS.MARKET),
+        strategy_instance: keyed(TRADER_HALT_INCIDENT_KEYS.STRATEGY_INSTANCE),
+        ...counts,
+      },
+    ],
+    rows: rows.map((row) => ({ ...row })),
+  };
 }

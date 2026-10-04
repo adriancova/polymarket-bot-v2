@@ -44,6 +44,10 @@ describe("the shipped example configuration", () => {
     // `none`, not a URL to a trader endpoint that does not exist. Shipping a
     // URL would be the false-integration claim this package refuses to make.
     expect(parsed.config.traderHealth).toEqual({ kind: "none" });
+    // `CONTROL-2` r1: `none` too — the example starts with no database, and
+    // says NOT_CONFIGURED rather than "no halts". A deployment that reads the
+    // trader's halts sets `postgres` and the URL variable (README).
+    expect({ ...parsed.config.traderHalts }).toEqual({ kind: "none" });
   });
 
   it("carries no production secret name", () => {

@@ -154,6 +154,34 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     ["scope", "scope_ref", "code", "action"],
     true,
   ),
+  // `CONTROL-2` (closing `H1R1-HALT-INVISIBLE`): the OPEN trader halts in
+  // `ops.incidents`, which outlive a trader that halted and exited. The
+  // control API reads them (`apps/control-api/src/trader-halts.ts` is the
+  // producer; this package may not import an app, so
+  // `metric-families.test.ts` names it), and
+  // `infra/prometheus/trader-alerts.yaml`'s `TraderHaltOpenOrUnknown` pages on
+  // OPEN and on UNKNOWN.
+  family(
+    "control_trader_halts_state",
+    "gauge",
+    "halts",
+    "What this process knows of open trader halts in ops.incidents: 1 for the current state, 0 for the others. OPEN = the most recent read counted at least one open TRADER_HALT row; NONE_OPEN = it counted none; UNKNOWN = no read yet, or the read failed, timed out or was refused (never 'no halts'); NOT_CONFIGURED = this process reads no ops.incidents.",
+    ["state"],
+  ),
+  family(
+    "control_trader_halts_open",
+    "gauge",
+    "halts",
+    "Open (not RESOLVED) TRADER_HALT rows in ops.incidents by scope, from the most recent read. Present ONLY when that read succeeded: absent, never 0, while the state is UNKNOWN or NOT_CONFIGURED. UNRECOGNIZED counts every other key in the TRADER_HALT: namespace.",
+    ["scope"],
+  ),
+  family(
+    "control_trader_halt_reads_total",
+    "counter",
+    "halts",
+    "Reads of ops.incidents for open trader halts, by outcome: OK (passed the door), REFUSED (the door refused the result), UNAVAILABLE (the read failed or timed out).",
+    ["outcome"],
+  ),
 
   // --- §8.3 bounded queues --------------------------------------------------
   family("trader_queue_depth", "gauge", "queues", "Current depth of a trader queue.", ["queue"]),

@@ -100,6 +100,7 @@ describe("CONTROL-1 through the shipped composition root", () => {
         auditCapacity: 7,
         auditSafetyReserve: 2,
         traderHealth: { kind: "none" },
+        traderHalts: { kind: "none" },
         operators: [
           { operatorId: "reader-b", token: READER, grants: ["READ"] },
           { operatorId: "strategist-c", token: STRATEGIST, grants: ["READ", "STRATEGY_CONTROL"] },
@@ -201,6 +202,7 @@ describe("CONTROL-1 through the shipped composition root", () => {
         maxRequestBodyBytes: 65_536,
         auditCapacity: 65_536,
         traderHealth: { kind: "none" },
+        traderHalts: { kind: "none" },
         operators: [{ operatorId: "reader-b", token: READER, grants: ["READ"] }],
       }),
       "utf8",

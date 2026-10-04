@@ -136,6 +136,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   FORBIDDEN_PACKAGES,
   SDK_DEPENDENCY_PACKAGES,
+  SDK_SIGNING_PACKAGES,
   SECURE_DIRECTORY,
   isForbiddenName,
   namesForbiddenSegments,
@@ -146,7 +147,7 @@ import { NO_SIGNER_PLUGIN_NAME, NO_SIGNER_SETUP_FILE, noSignerLoad } from "./no-
 
 // The vocabulary lives in `forbidden-targets.ts` (`CONTROL-1b` r2), which the
 // run-time guard shares; it is re-exported here for the scan's callers.
-export { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY, isForbiddenName };
+export { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SDK_SIGNING_PACKAGES, SECURE_DIRECTORY, isForbiddenName };
 
 /**
  * The Node builtins a scanned file may load — each one that cannot load or
