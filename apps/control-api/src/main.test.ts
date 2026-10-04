@@ -421,6 +421,63 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
     expect(TRADER_HALTS_URL_DRIVER_REWRITES.test("a b")).toBe(true);
   });
 
+  it("CTL2-R3-L1: a user, password, host or database that decodes to a NUL is REFUSED — the driver sends each as a C string, so a server reads, and its error echoes, only the prefix before the NUL, which the redaction does not hold", () => {
+    const postgres = { kind: "postgres", timeoutMs: 750 } as const;
+    const NUL = "\u0000";
+    const at = (password: string): string => `postgres://halt_reader:${password}@127.0.0.1:5432/polymarket_bot`;
+    const refused: readonly (readonly [string, string])[] = [
+      // The verifiers' two forms: an embedded %00, and a terminal one, whose prefix is the whole intended credential.
+      [at("Fk%00secret-r3l1"), "an embedded %00 in the password"],
+      [at("Full-pw-r3l1%00"), "a terminal %00 in the password"],
+      [at("%00Lead-r3l1"), "a leading %00 in the password"],
+      [at("Two%00Nuls%00-r3l1"), "two %00 in the password"],
+      // A raw NUL: WHATWG writes it as %00, and the driver decodes that back to a NUL.
+      [at(`Raw${NUL}Nul-r3l1`), "a raw NUL in the password"],
+      ["postgres://halt%00reader:Zq7-r3l1@127.0.0.1:5432/polymarket_bot", "a %00 in the user"],
+      ["postgres://halt_reader:Zq7-r3l1@db%00x.internal:5432/polymarket_bot", "a %00 in the host"],
+      ["postgres://halt_reader:Zq7-r3l1@127.0.0.1:5432/polymarket%00bot", "a %00 in the database"],
+    ];
+    for (const [url, why] of refused) {
+      // Each is a URL WHATWG reads, the driver's rewrite test passes it, and every component decodes:
+      // only the NUL refuses it.
+      expect(() => new URL(url), why).not.toThrow();
+      expect(TRADER_HALTS_URL_DRIVER_REWRITES.test(url), why).toBe(false);
+      const parsed = new URL(url);
+      const decoded = [parsed.username, parsed.password, parsed.hostname].map((part) => decodeURIComponent(part));
+      expect([...decoded, decodeURI(parsed.pathname)].some((part) => part.includes(NUL)), why).toBe(true);
+      const plan = planTraderHalts(postgres, url);
+      expect(plan.ok, why).toBe(false);
+      if (plan.ok) continue;
+      expect(plan.code, why).toBe("CONTROL_TRADER_HALTS_URL_ENCODING");
+      expect(plan.detail).toContain(TRADER_HALTS_DATABASE_URL_ENV);
+      expect(plan.detail).toContain("NUL");
+      for (const part of ["r3l1", "Fk", "Full-pw", "Lead", "Nuls", "halt_reader", "halt%00reader", "127.0.0.1", "db%00x", "polymarket"]) {
+        expect(plan.detail, why).not.toContain(part);
+      }
+    }
+
+    // Why the refusal is load-bearing: the server reads only the prefix before the NUL, and the
+    // redaction, which holds the URL and the password as written and decoded, leaves that prefix whole.
+    for (const [password, prefix] of [
+      ["Fk%00secret-r3l1", "Fk"],
+      ["Full-pw-r3l1%00", "Full-pw-r3l1"],
+    ] as const) {
+      const url = at(password);
+      const sent = decodeURIComponent(new URL(url).password);
+      expect(sent.slice(0, sent.indexOf(NUL)), password).toBe(prefix);
+      expect(redactDatabaseUrl(`echo: [${prefix}]`, url), password).toBe(`echo: [${prefix}]`);
+    }
+
+    // Admitted: the check reads the DECODED text. A literal "%00" (written %2500) and other control
+    // characters decode to no NUL, and the driver sends them whole, so the redaction holds them.
+    for (const url of [at("Lit%2500-r3l1"), at("Ctl%01%1F%7F-r3l1"), at("Nul0-r3l1"), "postgres://halt_reader:Zq7-r3l1@127.0.0.1:5432/poly%2500bot"]) {
+      expect(planTraderHalts(postgres, url), url).toEqual({ ok: true, kind: "postgres", url, timeoutMs: 750 });
+      const sent = decodeURIComponent(new URL(url).password);
+      expect(sent.includes(NUL), url).toBe(false);
+      expect(redactDatabaseUrl(`echo: [${sent}]`, url), url).toBe("echo: [<redacted>]");
+    }
+  });
+
   it("startup REFUSES each mismatch (78), naming the variable and never printing its value", async () => {
     const cases = [
       { config: configWithHalts({ kind: "postgres", timeoutMs: 750 }), env: BASE, code: "CONTROL_TRADER_HALTS_URL_MISSING" },
@@ -455,6 +512,18 @@ describe("CONTROL-2 r1: the trader halt source — one variable, read once, neve
       {
         config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
         env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE.replace(PASSWORD, `${PASSWORD}%41%zz-nac`) },
+        code: "CONTROL_TRADER_HALTS_URL_ENCODING",
+      },
+      // `CTL2-R3-L1`: the driver would send each password cut at its NUL — a prefix the redaction misses,
+      // and, for the terminal %00, the whole of PASSWORD.
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE.replace(PASSWORD, `${PASSWORD}%00secret`) },
+        code: "CONTROL_TRADER_HALTS_URL_ENCODING",
+      },
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE.replace(PASSWORD, `${PASSWORD}%00`) },
         code: "CONTROL_TRADER_HALTS_URL_ENCODING",
       },
     ];

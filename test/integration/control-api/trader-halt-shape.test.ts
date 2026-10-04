@@ -596,12 +596,15 @@ describe("the SHIPPED startup() composes the trader-halt source its configuratio
     }
   }, 30_000);
 
-  it("CONTROL2-R2-C1: through the shipped startup() and HTTP — a URL the driver would rewrite is REFUSED (78) before any connection, and what the driver would have sent is printed nowhere", async () => {
-    // Each fake password with the one the driver sends for it (measured below, `driverSends`): at
-    // 01f23a9 both URLs were admitted, and /v1/health carried the second column from the echoing server.
+  it("CONTROL2-R2-C1 / CTL2-R3-L1: through the shipped startup() and HTTP — a URL the driver would rewrite, or whose password it would cut at a NUL, is REFUSED (78) before any connection, and what the server would have read is printed nowhere", async () => {
+    // Each fake password with what the server reads of it (measured below, `driverSends`): at
+    // 01f23a9 the first two URLs were admitted, and /v1/health carried the second column from the
+    // echoing server; at 9406bb3 the last two were (`CTL2-R3-L1`), and it carried the prefix before the NUL.
     for (const [password, driverWouldSend] of [
       ["Fake%2FSecret Word-ctl2-r2", "Fake%2FSecret Word-ctl2-r2"],
       ["Ec%41%zz-nac-ctl2-r2", "EcA%zz-nac-ctl2-r2"],
+      ["Fk-embedded-ctl2-r3%00secret", "Fk-embedded-ctl2-r3"],
+      ["Full-pw-ctl2-r3%00", "Full-pw-ctl2-r3"],
     ] as const) {
       const echoing = await echoingPostgres();
       const url = `postgres://halt_reader:${password}@127.0.0.1:${String(echoing.port)}/polymarket_bot`;
@@ -744,7 +747,7 @@ describe("CONTROL2-R2-C1: the password the REAL driver sends, for a URL planTrad
     }
   };
 
-  it("each admitted URL: the driver sends the authority's password percent-decoded, and its echo is <redacted>; each refused rewrite form: the driver, handed it directly, sends a password that is neither the URL's as written nor its decoding", async () => {
+  it("each admitted URL: the driver sends the authority's password percent-decoded, and its echo is <redacted>; each refused rewrite form: the driver, handed it directly, sends a password that is neither the URL's as written nor its decoding; each refused NUL form (CTL2-R3-L1): the server reads it cut at the NUL, and the error carries that prefix, which the redaction leaves whole", async () => {
     const echoing = await echoingPostgres();
     const at = (password: string): string => `postgres://halt_reader:${password}@127.0.0.1:${String(echoing.port)}/polymarket_bot`;
     /** What the driver sends for `url`, and the error it reports, through a pool made as `main.ts` makes it. */
@@ -777,6 +780,9 @@ describe("CONTROL2-R2-C1: the password the REAL driver sends, for a URL planTrad
         "100%25-ctl2-r2",
         "semi;colon=eq-ctl2-r2",
         "%2F%2f%3A%41%7E-ctl2-r2",
+        // `CTL2-R3-L1`: control characters other than NUL, and a literal "%00", are sent whole.
+        "Ctl%01%1F%7F-ctl2-r3",
+        "Lit%2500-ctl2-r3",
       ]) {
         const url = at(password);
         expect(planTraderHalts(POSTGRES, url).ok, password).toBe(true);
@@ -789,7 +795,7 @@ describe("CONTROL2-R2-C1: the password the REAL driver sends, for a URL planTrad
         expect(redacted, password).not.toContain(sent ?? "(nothing)");
         admitted += 1;
       }
-      expect(admitted).toBe(7);
+      expect(admitted).toBe(9);
 
       // The verifiers' two forms, and a third mixing both escapes: each REFUSED — and the positive
       // control: the driver, handed it directly, sends what the URL holds neither as written nor decoded.
@@ -806,6 +812,29 @@ describe("CONTROL2-R2-C1: the password the REAL driver sends, for a URL planTrad
         const written = new URL(url).password;
         expect([written, decoded(written)], password).not.toContain(sent);
       }
+
+      // `CTL2-R3-L1`: the verifiers' embedded and terminal %00, each REFUSED — and the positive control:
+      // the driver, handed it directly, sends the decoded password, NUL and all, as a C string, and the
+      // error it reports carries only the text before the NUL (its parser cuts each field there). The
+      // redaction holds the password as written and decoded, so that prefix — for the terminal %00, the
+      // whole intended credential — passes it untouched.
+      let cut = 0;
+      for (const [password, prefix] of [
+        ["Fk-embedded-ctl2-r3%00secret", "Fk-embedded-ctl2-r3"],
+        ["Full-pw-ctl2-r3%00", "Full-pw-ctl2-r3"],
+      ] as const) {
+        const url = at(password);
+        const plan = planTraderHalts(POSTGRES, url);
+        expect(plan.ok ? "ADMITTED" : plan.code, password).toBe("CONTROL_TRADER_HALTS_URL_ENCODING");
+        const { sent, error } = await driverSends(url);
+        expect(sent, password).toBe(decodeURIComponent(new URL(url).password));
+        expect(sent?.indexOf("\u0000"), password).toBe(prefix.length);
+        expect(error, password).toContain(`this server echoes the password it was sent: ${prefix}`);
+        expect(error, password).not.toContain("\u0000");
+        expect(redactDatabaseUrl(error, url), password).toContain(`this server echoes the password it was sent: ${prefix}`);
+        cut += 1;
+      }
+      expect(cut).toBe(2);
     } finally {
       await echoing.close();
     }
@@ -895,7 +924,7 @@ describe("CONTROL-2 r1 (S1): the PAGE rule and the operations panel read the pla
   });
 });
 
-describe("the SHIPPED bundle, run with node: CTL2-L2 (SIGTERM exits while a frozen database and a silent trader hold it) and CONTROL2-R2-C1 (a URL the driver would rewrite is refused)", () => {
+describe("the SHIPPED bundle, run with node: CTL2-L2 (SIGTERM exits while a frozen database and a silent trader hold it) and CONTROL2-R2-C1 / CTL2-R3-L1 (a URL the driver would rewrite, or whose password it would cut at a NUL, is refused)", () => {
   let bundle: BuiltBundle | undefined;
   let directory = "";
   beforeAll(async () => {
@@ -977,11 +1006,14 @@ describe("the SHIPPED bundle, run with node: CTL2-L2 (SIGTERM exits while a froz
     }
   }, 60_000);
 
-  it("CONTROL2-R2-C1: the bundle refuses both URL forms the driver would rewrite (78), serving or --check, before any connection and printing neither the password nor what the driver would send", async () => {
+  it("CONTROL2-R2-C1 / CTL2-R3-L1: the bundle refuses both URL forms the driver would rewrite, and both whose password it would cut at a NUL (78), serving or --check, before any connection and printing neither the password nor what the server would read", async () => {
     const config = await configWith({ kind: "none" });
     for (const [password, driverWouldSend] of [
       ["Fake%2FSecret Word-ctl2-r2", "Fake%2FSecret Word-ctl2-r2"],
       ["Ec%41%zz-nac-ctl2-r2", "EcA%zz-nac-ctl2-r2"],
+      // `CTL2-R3-L1`: the server would read each password up to its NUL, and echo that prefix.
+      ["Fk-embedded-ctl2-r3%00secret", "Fk-embedded-ctl2-r3"],
+      ["Full-pw-ctl2-r3%00", "Full-pw-ctl2-r3"],
     ] as const) {
       const echoing = await echoingPostgres();
       try {

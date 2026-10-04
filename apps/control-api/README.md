@@ -713,16 +713,26 @@ URL's as written nor its decoding (`Fake%2FSecret Word` is sent as written,
 hold no raw space and no `%` that does not begin a two-hex-digit escape
 (`TRADER_HALTS_URL_DRIVER_REWRITES`, a superset of the driver's own test), and
 its user, password, host and database must percent-decode. Write a space as
-`%20` and a literal `%` as `%25`. For every URL admitted, the password the
-driver sends is the authority's, percent-decoded, which the redaction covers;
-`trader-halt-shape.test.ts` proves it against the real driver.
+`%20` and a literal `%` as `%25`.
+
+No component may decode to a NUL either (`CTL2-R3-L1`): `%00`, or a raw NUL,
+which the URL parser writes as `%00`. The driver sends the user, the database
+and the password as C strings, and reads each field of a server's error up to
+its first NUL, so a server would read, and its error could echo, only the part
+of the password before the NUL. That prefix is not a form the redaction holds,
+and when the `%00` ends the password it is the whole intended credential. So
+for every URL admitted, the password the driver sends is the authority's,
+percent-decoded and free of NUL, all of which a server reads, and the
+redaction covers it; `trader-halt-shape.test.ts` proves it against the real
+driver.
 
 The process refuses to start (exit 78), naming the variable and never its
 value, when `postgres` has no URL, when the URL is not a PostgreSQL URL or
 omits one of those four, when the driver would rewrite it or one of its
-components does not decode (`CONTROL_TRADER_HALTS_URL_ENCODING`), when its
-query holds anything but one `sslmode`, when a `PG*` variable is set, and when
-the URL variable is set while `traderHalts.kind` is `none`.
+components does not decode or decodes to a NUL
+(`CONTROL_TRADER_HALTS_URL_ENCODING`), when its query holds anything but one
+`sslmode`, when a `PG*` variable is set, and when the URL variable is set while
+`traderHalts.kind` is `none`.
 
 **The deployment's duty: a role that can read `ops.incidents` and nothing
 else.** Give the URL a role of its own, with `USAGE` on the schema `ops` and

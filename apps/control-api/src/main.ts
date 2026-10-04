@@ -103,8 +103,11 @@ import {
  * reads it ({@link TRADER_HALTS_URL_DRIVER_REWRITES}), and the password it then
  * sends is neither the authority's as written nor as decoded — past the
  * redaction. So such a URL, and one whose user, password, host or database
- * does not decode, refuses the start; for every URL admitted, the password the
- * driver sends is the authority's, percent-decoded, which
+ * does not decode, or decodes to text that holds a NUL (`CTL2-R3-L1`: the
+ * driver sends each as a C string, so a server reads, and can echo, only what
+ * precedes the NUL — a prefix the redaction does not hold), refuses the start;
+ * for every URL admitted, the password the driver sends is the authority's,
+ * percent-decoded and free of NUL, all of which a server reads, and which
  * {@link redactDatabaseUrl} redacts.
  */
 export const TRADER_HALTS_DATABASE_URL_ENV = "CONTROL_API_TRADER_HALTS_DATABASE_URL";
@@ -195,7 +198,10 @@ const REDACTED = "<redacted>";
  * admits only a URL the driver reads as written, whose password the driver
  * therefore sends as `decodeURIComponent(new URL(url).password)` — the
  * decoded form here. A URL the driver would rewrite first is refused before
- * any pool exists ({@link TRADER_HALTS_URL_DRIVER_REWRITES}).
+ * any pool exists ({@link TRADER_HALTS_URL_DRIVER_REWRITES}), and so is one
+ * whose decoded password holds a NUL (`CTL2-R3-L1`): the driver sends it as a
+ * C string, so a server reads, and its error can echo, only the text before
+ * the NUL — a prefix of the password, which this function does not hold.
  */
 export function redactDatabaseUrl(text: string, url: string): string {
   const secrets = new Set<string>([url]);
@@ -223,17 +229,31 @@ function describeCause(cause: unknown): string {
   return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
 }
 
+/** U+0000, which ends a C string: the driver can send no text that holds it faithfully. */
+const NUL = "\u0000";
+
 /**
  * `CONTROL2-R2-C1`: whether every component the driver decodes does decode —
  * the user, the password and the host as URI components, the database as a
  * URI (`pg-connection-string`'s `parse`). One that does not would fail every
  * read with a bare "URI malformed"; it is refused at startup instead.
+ *
+ * `CTL2-R3-L1`: and whether each decodes to text free of NUL (`%00`, or a raw
+ * NUL, which WHATWG writes as `%00`). The driver (`pg-protocol`) sends the
+ * user, the database and the cleartext password as C strings, and cuts each
+ * field of a server's error at its first NUL; so a server reads, and its
+ * error can echo, only the text before the NUL. For a password that is a
+ * prefix the redaction does not hold — the whole intended credential, when
+ * the `%00` ends it — so such a component is refused, not sent. (A host with
+ * a NUL names no host the driver can reach; it is refused with the rest.)
  */
 function decodesForTheDriver(parsed: URL): boolean {
   try {
-    for (const component of [parsed.username, parsed.password, parsed.hostname]) decodeURIComponent(component);
-    decodeURI(parsed.pathname);
-    return true;
+    const user = decodeURIComponent(parsed.username);
+    const password = decodeURIComponent(parsed.password);
+    const host = decodeURIComponent(parsed.hostname);
+    const database = decodeURI(parsed.pathname);
+    return [user, password, host, database].every((component) => !component.includes(NUL));
   } catch {
     return false;
   }
@@ -291,17 +311,20 @@ export function planTraderHalts(
         "may carry a credential)",
     };
   }
-  // `CONTROL2-R2-C1`: a URL the driver reads as written, so the password it sends is the one redacted.
+  // `CONTROL2-R2-C1`: a URL the driver reads as written, so the password it sends is the one redacted;
+  // `CTL2-R3-L1`: and no component with a NUL, so the server reads the whole of it, not a prefix.
   if (TRADER_HALTS_URL_DRIVER_REWRITES.test(url) || !decodesForTheDriver(parsed)) {
     return {
       ok: false,
       code: "CONTROL_TRADER_HALTS_URL_ENCODING",
       detail:
         `${TRADER_HALTS_DATABASE_URL_ENV} holds a raw space, a % that begins no two-hex-digit escape, or a user, ` +
-        "password, host or database that does not percent-decode (its value is not printed): the PostgreSQL driver " +
-        "rewrites a URL with a raw space or a malformed escape before it reads it, so the password it would send is " +
-        "not the one this process redacts, and it cannot read a component that does not decode; write every space as " +
-        "%20 and every literal % as %25",
+        "password, host or database that does not percent-decode or decodes to a NUL (%00) (its value is not " +
+        "printed): the PostgreSQL driver rewrites a URL with a raw space or a malformed escape before it reads it, so " +
+        "the password it would send is not the one this process redacts; it cannot read a component that does not " +
+        "decode; and it sends the user, the password and the database as C strings, which a NUL cuts short, so a " +
+        "server would read, and could echo, a prefix this process does not redact; write every space as %20 and every " +
+        "literal % as %25, and put no NUL in any component",
     };
   }
   // `CONTROL2-R1-C2`: the authority is the one source; the query may say one sslmode and nothing else.
