@@ -382,6 +382,11 @@ export interface JournalEvidenceInput {
   readonly size: string | null;
   readonly status: string | null;
   readonly level: number | null;
+  /** LEG only (r7): the leg's fill facts as the observation fixed them; `null` on every other record. */
+  readonly feeAmount: string | null;
+  readonly feeAssetId: string | null;
+  readonly role: "MAKER" | "TAKER" | null;
+  readonly matchedAt: string | null;
   readonly atMs: number;
 }
 

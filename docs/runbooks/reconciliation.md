@@ -71,9 +71,12 @@ not a fault.
    rebuild and appended again; a run whose evidence could not be appended
    concludes nothing (no clearing, no resume) until a later run makes it
    durable. Per venue order the store keeps whether any
-   source SHOWED it, the most matched any observation showed (and at least
-   the sum of its distinct trades' legs), whether any showed it terminal, and
-   every status seen; per venue trade, its legs and its furthest settlement.
+   source SHOWED it, every value any observation showed of each of its fixed
+   facts (token, side, price, original size: r7), the most matched any
+   observation showed (and at least the sum of its distinct trades' legs),
+   whether any showed it terminal, and every status seen; per venue trade, its
+   legs, each with every value shown of each fill fact (shares, price, fee,
+   fee asset, liquidity role, match time: r7), and its furthest settlement.
    These marks only ever go up. The sources:
 
    | Source | Provenance |
@@ -84,7 +87,7 @@ not a fault.
    | a by-id read that found the order | shown |
    | the id alone of a malformed row or leg (nothing else of it validated) | named |
    | an id the OMS retains as user-stream evidence | named |
-   | what the user stream reported that the OMS did not apply (it retained it, or refused it as unknown, inconsistent or contradicting), recorded the moment it is routed | named |
+   | what the user stream reported that the OMS did not apply, whatever it answered (it retained it; it refused it as unknown, inconsistent or contradicting; its store failed and it faulted; it was already faulted; it refused the input; it holds no such fill; it threw), or that was routed while no OMS was bound, recorded the moment it is routed, with a run triggered (r7) | named |
 
    An order with evidence is read by id in every run until a sound run
    classifies it consistently with ALL its evidence (the run records it
@@ -112,9 +115,15 @@ not a fault.
      a fixed fact, or about the status at the same stage (`READ_CONFLICT`;
      only "live, then terminal" is a step forward, since no order-status
      transition table is documented, C-6, C-14); trades summing to more than
-     the order's matched size; an order a source SHOWED that its by-id read
-     does not find (`READ_CONFLICT`: the by-id read finds canceled and fully
-     matched orders);
+     the order's matched size, or any trade naming an order a read shows with
+     nothing matched; an order a source SHOWED that its by-id read does not
+     find (`READ_CONFLICT`: the by-id read finds canceled and fully matched
+     orders); (r7) an order's fixed fact, or a fill's economics, that any two
+     observations showed with different values (`READ_CONFLICT`, DURABLE: which
+     value is the venue's is unknown, so no later read ends it; a value newly
+     known, or the same value at another precision, is no contradiction); a
+     trade a read SHOWED that a complete trades read omits, while it is not
+     accounted for under its own identity (`READ_CONFLICT`: below);
    - **a ghost**: an unclaimed order only NAMED that the by-id read of a
      sound run does not find. No earlier read is contradicted, so it is an
      `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), read by id
@@ -169,6 +178,23 @@ not a fault.
 
    A tracked order's token (its execution group's), side, price and size are
    its fixed facts; any difference is `ORDER_FACTS_MISMATCH`.
+
+   **Every trade a read showed carries a classification obligation (r7).** Each
+   run judges every trade its trades read shows AND every trade a read ever
+   showed. A shown trade the complete trades read omits is a `READ_CONFLICT`
+   (the run is unsound) unless it is accounted for under its own identity:
+   every leg a read showed is on an order the OMS tracks (the OMS comparison
+   judges it: `ORDER_FILLS_AHEAD_OF_VENUE`, `ORDER_TRADES_INCOMPLETE`), on an
+   order an unresolved attempt could own (that attempt's resolution
+   classifies it, and holds the account meanwhile), or has a
+   `TRADE_UNATTRIBUTED` break, and no unresolved break names the trade. When no
+   one can own a missing trade's order, the run records `TRADE_UNATTRIBUTED`
+   for each of its shown legs from the evidence, whatever the run's soundness,
+   so the operator sees the trade by its own id. The `READ_CONFLICT` itself
+   clears only when a read shows the trade again, consistent. A trade already
+   accounted for may later age out of the trades history without holding.
+   An UNATTRIBUTED order's `TRADE_UNATTRIBUTED` breaks cover every trade the
+   evidence holds on it, not only those the current read shows.
 4. Record each discrepancy as a break, and each answer.
 5. Act on each break by its rule (section 4).
 6. Resume if, and only if, everything in section 6 holds.
@@ -402,7 +428,10 @@ returns at once, with no run.
 - **A `FILL_MISMATCH` that does not clear** means the OMS's durable fills and
   the venue's trades disagree about a trade, or a settlement contradicts a
   terminal one. The coordinator never rewrites a recorded fill. Establish
-  which side is wrong. A wrong read clears on its own once the read is right.
+  which side is wrong. A wrong read clears on its own once the read is right,
+  but only if no read showed that fill otherwise before: once the venue's
+  reads have shown one fill's economics two ways, it is a durable
+  `READ_CONFLICT` (r7, below).
   A wrong OMS record needs a correction outside this package, after which a
   run must find the two equal. Each contradiction is offered to the OMS once
   per process, so its own halting alert (an `OMS_HALTING_ALERT` quarantine)
@@ -447,6 +476,23 @@ returns at once, with no run.
   withdrew what a read once showed (a phantom row, trade or match), the
   account stays held: no release exists, and no tool retracts evidence today
   (section 10). Do not edit the journal; escalate.
+- **A `READ_CONFLICT` whose detail says "different fixed facts" or
+  "different fill facts"** (r7) means two observations showed one order's
+  token, side, price or size, or one fill's shares, price, fee, fee asset,
+  role or match time, with different values. It never clears: no read can
+  agree with both values, and which one the venue holds is unknown (a signed
+  order's facts and a fill's facts do not change; a difference is a wrong
+  read, from the adapter or the venue). While it stands, nothing about that
+  order or trade is answered (no signed-identity resolution), delivered or
+  concluded. Establish which value is right from the venue's own records;
+  the account stays held until the retraction ADR gives a path (section 10).
+- **A `READ_CONFLICT` whose detail says "missing from a complete trades
+  read"** (r7) names a trade a read showed that the complete trades read now
+  omits, before it was accounted for. When no one can own its order, its
+  `TRADE_UNATTRIBUTED` quarantine names the same trade: handle it as
+  unattributed activity. The conflict clears only when a read shows the trade
+  again (a lagging read catches up on its own); if the venue truly withdrew
+  it, the account stays held (section 10).
 
 ## 8. Configuration
 
@@ -526,7 +572,31 @@ nothing is judged or booked from it.
   a trade id replaced by another, a read that lied upward) holds the account
   for good (`READ_CONFLICT` or `READ_REGRESSION`, holds with no release), and
   no tool retracts evidence. Fail closed; an operator path needs an ADR
-  (follow-up).
+  (follow-up). So, since r7, does any ONE read that showed an order's fixed
+  fact or a fill's economics with another value than an earlier observation
+  (a transient adapter or venue error included), and a trade a read showed
+  that the trades history drops before it was accounted for.
+- **What "evidence never goes down" assumes (unverified venue assumptions,
+  held as a conservative policy).** No venue document states any of these;
+  the code treats a read that disagrees as wrong (it holds), never as a
+  correction:
+  - an order's matched size never decreases, and a canceled or fully matched
+    order is never live again;
+  - a trade id, once shown, is not replaced by another for the same fill, and
+    the trades read keeps every trade not yet accounted for;
+  - an order's token, side, price and original size, and a fill's shares,
+    price, fee, fee asset, liquidity role and match time, never change for
+    one id.
+  E-14 (`docs/venue/verified-2026-09-30.md`, section W.9) says only that a
+  by-id read returns an order "regardless of status, including canceled or
+  fully matched orders"; it says nothing about how these facts evolve.
+  **The FAILED-trade case:** no document states what an order's
+  `size_matched` does after one of its trades FAILS. The evidence keeps the
+  FAILED leg's shares in the order's high-water matched size, so if the venue
+  lowers `size_matched` after a FAILED trade, every later read of that order
+  is a `READ_REGRESSION` (or a `READ_CONFLICT` against the trades' sum) and
+  the account stays held: fail closed, a liveness cost the retraction ADR
+  (or a verified venue fact) must address.
 - A signed-identity ambiguity between orders the account holds (canceled
   ones included, since a canceled order is still found by id) does not clear
   on its own unless a candidate is claimed by its real owner. No operator
@@ -578,7 +648,8 @@ nothing is judged or booked from it.
   later seen, it is an unclaimed order: `ORDER_UNATTRIBUTED`, or a hold while
   another attempt could own it. This is detection after the fact, not
   prevention. (Once any source observed the attempt's own order, it is a
-  candidate or a ghost, and the twin is never adopted.)
+  candidate, a ghost, or, if a later read shows its fixed facts otherwise, a
+  durable contradiction (r7), and the twin is never adopted.)
 - Every venue order with unsettled evidence, every tracked order with fills,
   every order the trades read names, every tracked order an unresolved break
   names, and every venue order an unresolved hold names is read by id every

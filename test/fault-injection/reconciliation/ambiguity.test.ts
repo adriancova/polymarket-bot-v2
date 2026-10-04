@@ -110,8 +110,13 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
     expect(await reconcileRounds(r, 3)).toBe(false);
     await expectPaused(r, false, "READ_CONFLICT");
     expect(r.u.accepted).toEqual([]);
+    // r7 (WP290-CX-R7-01): the two reads showed the order's price two ways, and which is the venue's is unknown: the
+    // contradiction is durable, so reads that agree again do not end it (no tool retracts evidence: runbook §10).
     r.u.world.faults = {};
-    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(await reconcileRounds(r, 3)).toBe(false);
+    await expectPaused(r, false, "READ_CONFLICT");
+    expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "READ_CONFLICT")?.detail).toContain("different fixed facts");
+    expect(r.u.accepted).toEqual([]);
   });
 
   it("conflicting reads (an order's trades sum to more than its matched size): paused", async () => {
@@ -402,10 +407,13 @@ describe("WP-290 acceptance 1: ambiguous state never resumes trading", () => {
 
 describe("WP-290 acceptance 1: what the OMS recorded durably is compared by identity, and a contradiction holds (r1)", () => {
   it("(I-02) the same trade with other economics at equal net collateral: FILL_MISMATCH, nothing changed or booked; offered to the OMS once", async () => {
+    // r7: the OMS learns its fill from the user stream, so the read below is the first to show the trade (a read that
+    // showed it earlier with other economics would make the two reads a durable contradiction: `(I-02, r7)` below).
     const r = await ready();
     await submitOne(r.oms);
-    r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
-    expect(await reconcileRounds(r, 3)).toBe(true);
+    const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? "?"));
+    await r.p.coordinator.settled();
     const fills = r.u.store.snapshotSync().fills;
     expect(fills.map((fill) => [fill.shares, fill.price, fill.feeAmount])).toEqual([["0.4", "0.5", "0"]]);
     // 0.4 at 0.49 plus a fee of 0.004 costs what 0.4 at 0.5 does: the totals agree, the facts do not.
@@ -422,20 +430,51 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     expect(r.u.ledger.transactions().filter((appended) => appended.transaction.eventType === "RECONCILIATION_CORRECTION")).toEqual([]);
     // The OMS raised its own halting alert once: a known contradiction is not offered again every run.
     expect(r.oms.alerts().filter((alert) => alert.kind === "EVIDENCE_CONFLICT")).toHaveLength(1);
-    // The read agrees again: the hold clears; the OMS's alert is a quarantine an operator releases.
+    // r7 (WP290-CX-R7-02): the read agrees again, but the venue's reads have now shown this fill's economics two
+    // ways; which is the venue's is unknown, so the contradiction is durable: the account stays held, the OMS's alert
+    // released or not, and nothing is booked.
     r.u.world.faults = {};
     const alert = r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "OMS_HALTING_ALERT");
     expect(alert?.status).toBe("QUARANTINED");
     expect((await r.p.coordinator.releaseQuarantine({ breakId: alert?.breakId ?? "", operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
-    expect(await reconcileRounds(r, 3)).toBe(true);
+    expect(await reconcileRounds(r, 3)).toBe(false);
+    await expectPaused(r, false, "READ_CONFLICT");
+    expect(r.u.store.snapshotSync().fills).toEqual(fills);
     expect(r.u.violations).toEqual([]);
   });
 
+  it("(I-02, r7) the same, after a read already showed the trade with the economics the OMS holds (a restart included): a durable READ_CONFLICT; nothing compared, offered, changed or booked", async () => {
+    for (const withRestart of [false, true]) {
+      const r0 = await ready();
+      await submitOne(r0.oms);
+      r0.u.world.match(r0.u.world.receipts.at(-1) as string, "0.4");
+      expect(await reconcileRounds(r0, 3)).toBe(true);
+      const fills = r0.u.store.snapshotSync().fills;
+      r0.u.world.faults.listTrades = (answer) => {
+        const read = answer() as { trades: { ownLegs: Record<string, unknown>[] }[] };
+        return { ...read, trades: read.trades.map((trade) => ({ ...trade, ownLegs: trade.ownLegs.map((leg) => ({ ...leg, price: "0.49", feeAmount: "0.004", feeAssetId: PUSD })) })) };
+      };
+      r0.p.coordinator.trigger("PERIODIC_TIMER");
+      await expectPaused(r0, (await r0.p.coordinator.reconcile()).resumed, "READ_CONFLICT");
+      const r = withRestart ? await restart(r0) : r0;
+      r.u.world.faults = {};
+      expect(await reconcileRounds(r, 3)).toBe(false);
+      await expectPaused(r, false, "READ_CONFLICT");
+      expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "READ_CONFLICT")?.detail).toContain("different fill facts");
+      expect(r.u.store.snapshotSync().fills).toEqual(fills);
+      expect(r.oms.alerts().filter((alert) => alert.kind === "EVIDENCE_CONFLICT")).toHaveLength(0);
+      expect(r.u.ledger.transactions().filter((appended) => appended.transaction.eventType === "RECONCILIATION_CORRECTION")).toEqual([]);
+      expect(r.u.violations).toEqual([]);
+    }
+  });
+
   it("(I-02) while a fill's economics are contradicted, the holdings it moves are not judged: nothing is booked UNATTRIBUTED", async () => {
+    // r7: the OMS learns its fill from the user stream, so the read below is the first to show the trade (see above).
     const r = await ready();
     await submitOne(r.oms);
-    r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
-    expect(await reconcileRounds(r, 3)).toBe(true);
+    const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? "?"));
+    await r.p.coordinator.settled();
     // The venue says the fill was at 0.45: the account paid 0.02 less than the OMS recorded, and the chain shows it.
     r.u.world.faults.listTrades = (answer) => {
       const read = answer() as { trades: { ownLegs: Record<string, unknown>[] }[] };
@@ -655,11 +694,15 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     expect(second?.breakId).not.toBe(first?.breakId);
     expect(second?.status).toBe("QUARANTINED");
     expect(r.u.halts.some((halt) => halt.breakId === second?.breakId)).toBe(true);
-    // The venue agrees again: the contradiction is gone; the quarantine still needs its release.
+    // r7 (WP290-CX-R7-01): the venue's reads now show the order's price as the OMS signed it, after showing another:
+    // the reads have shown one order's fixed facts two ways, a durable contradiction. The account stays held, its
+    // quarantine released or not (no tool retracts evidence: runbook §10).
     r.u.world.faults = {};
     expect(await reconcileRounds(r, 2)).toBe(false);
     expect((await r.p.coordinator.releaseQuarantine({ breakId: second?.breakId ?? "", operatorRef: "operator-1", reason: "consistent now" })).ok).toBe(true);
-    expect(await reconcileRounds(r, 2)).toBe(true);
+    expect(await reconcileRounds(r, 2)).toBe(false);
+    await expectPaused(r, false, "READ_CONFLICT");
+    expect(r.p.journal.unresolvedBreaks().find((view) => view.breakClass === "READ_CONFLICT")?.detail).toContain("different fixed facts");
   });
 
   for (const [variant, breakClass, skew] of [
@@ -907,12 +950,15 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
    * A FILL_MISMATCH that persists in the read: the trade the OMS recorded is shown with other economics (its price).
    * (r6: not under another trade id: two distinct trade ids the venue showed on one order, summing more than its
    * matched size, are evidence no later read can explain away, so they would hold for good: `(I-02, r6)` above.)
+   * (r7: the OMS learns its fill from the user stream, so this read is the first to show the trade: a read that showed
+   * it earlier with the OMS's economics would make the two reads a durable contradiction, `(I-02, r7)` above.)
    */
   async function fillMismatch(): Promise<{ r: Ready; mismatch: string | undefined }> {
     const r = await ready();
     await submitOne(r.oms);
-    r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
-    expect(await reconcileRounds(r, 3)).toBe(true);
+    const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? "?"));
+    await r.p.coordinator.settled();
     r.u.world.faults.listTrades = (answer) => {
       const read = answer() as { trades: { ownLegs: Record<string, unknown>[] }[] };
       return { ...read, trades: read.trades.map((trade) => ({ ...trade, ownLegs: trade.ownLegs.map((leg) => ({ ...leg, price: "0.45" })) })) };
@@ -937,14 +983,17 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "FILL_MISMATCH");
     expect(unresolved(r, "FILL_MISMATCH")).toBe(mismatch);
-    // The read agrees again: compared in full and consistent, it clears (the OMS's own alert about the contradicted
-    // economics is a quarantine an operator releases, as in "(I-02) the same trade with other economics").
+    // r7: the read agrees again, but the venue's reads have now shown the fill's economics two ways (a durable
+    // contradiction: "(I-02, r7)"): the view is unsound, the order is not compared, and its FILL_MISMATCH is not
+    // cleared; the account stays held. (A FILL_MISMATCH clears only when a run compares the order in full and finds
+    // it consistent: "(R2-B) ORDER_TRADES_INCOMPLETE and ORDER_FILLS_AHEAD_OF_VENUE ..." below shows that half.)
     r.u.world.faults = {};
     for (const view of r.p.journal.unresolvedBreaks().filter((entry) => entry.breakClass === "OMS_HALTING_ALERT")) {
       expect((await r.p.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
     }
-    expect(await reconcileRounds(r, 3)).toBe(true);
-    expect(resolutions(r, mismatch)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
+    expect(await reconcileRounds(r, 3)).toBe(false);
+    await expectPaused(r, false, "READ_CONFLICT");
+    expect(resolutions(r, mismatch)).toEqual([]);
   });
 
   it("(R2-B) a run that skipped the order (its venue facts differ: ORDER_FACTS_MISMATCH) does not clear its FILL_MISMATCH", async () => {
@@ -955,9 +1004,31 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
     };
     r.p.coordinator.trigger("PERIODIC_TIMER");
     const skipped = await r.p.coordinator.reconcile();
-    await expectPaused(r, skipped.resumed, "ORDER_FACTS_MISMATCH");
+    // r7: the list showed the order's price at 0.5 before (the fixture's run), so its 0.51 now is a durable
+    // contradiction of the order's fixed facts (READ_CONFLICT; the view is unsound, the order not compared).
+    await expectPaused(r, skipped.resumed, "READ_CONFLICT");
     expect(resolutions(r, mismatch)).toEqual([]);
     expect(unresolved(r, "FILL_MISMATCH")).toBe(mismatch);
+  });
+
+  it("(I-06, r7) a tracked order whose FIRST observation shows other facts than the OMS signed: ORDER_FACTS_MISMATCH, no READ_CONFLICT (the reads never showed it two ways)", async () => {
+    // The OMS learns the order and its fill without any read; every read shows the order at another price.
+    const r = await ready();
+    await submitOne(r.oms);
+    const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
+    r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? "?"));
+    await r.p.coordinator.settled();
+    r.u.world.faults.listOpenOrders = (answer) => {
+      const read = answer() as { orders: Record<string, unknown>[] };
+      return { ...read, orders: read.orders.map((order) => ({ ...order, price: "0.51" })) };
+    };
+    r.u.world.faults.readOrder = (_id, answer) => {
+      const read = answer() as { order?: Record<string, unknown> };
+      return { ...read, order: { ...(read.order ?? {}), price: "0.51" } };
+    };
+    r.p.coordinator.trigger("PERIODIC_TIMER");
+    await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "ORDER_FACTS_MISMATCH");
+    expect(r.p.journal.unresolvedBreaks().map((view) => view.breakClass)).not.toContain("READ_CONFLICT");
   });
 
   it("(R2-B) ORDER_TRADES_INCOMPLETE and ORDER_FILLS_AHEAD_OF_VENUE are not cleared by a run that could not verify the order's fills", async () => {
@@ -1010,14 +1081,17 @@ describe("WP-290 acceptance 1: a break about one tracked order is cleared only b
     expect(r.oms.alerts().filter((alert) => alert.kind === "FILL_INCONSISTENT")).toHaveLength(1);
     const alert = r.p.journal.unresolvedBreaks().filter((view) => view.breakClass === "OMS_HALTING_ALERT");
     expect(alert).toHaveLength(1);
-    // Compared again with the venue's true price: delivered, then a run finds the order consistent and clears both.
+    // r7 (WP290-CX-R7-02): compared again with the venue's true price, the reads have now shown the missed fill's
+    // price two ways: a durable contradiction, so it is never delivered (nothing booked with a guess), and neither
+    // break is cleared; the account stays held.
     delete r.u.seams.tokenOfGroup;
     r.u.world.faults = {};
     expect((await r.p.coordinator.releaseQuarantine({ breakId: alert[0]?.breakId ?? "", operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
-    expect(await reconcileRounds(r, 4)).toBe(true);
-    expect(resolutions(r, refused)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
-    expect(resolutions(r, missing)).toEqual([expect.objectContaining({ resolution: "NOT_REPRODUCED" })]);
-    expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
+    expect(await reconcileRounds(r, 4)).toBe(false);
+    await expectPaused(r, false, "READ_CONFLICT");
+    expect(resolutions(r, refused)).toEqual([]);
+    expect(resolutions(r, missing)).toEqual([]);
+    expect(r.oms.orders()[0]?.filledShares).toBe("0");
   });
 
   it("(R2-B) a run that finds the order's state wrong clears none of its other breaks, though its fills now compare equal", async () => {

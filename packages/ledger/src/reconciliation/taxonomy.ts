@@ -57,6 +57,20 @@
  * None of these ever resolves an order, answers for it, or fixes its final
  * size below the evidence: each only holds.
  *
+ * IMMUTABLE FACTS (r7). The evidence keeps EVERY value any observation showed
+ * of an order's fixed facts (token, side, price, original size) and of a
+ * fill's facts (shares, price, fee, fee asset, liquidity role, match time).
+ * Two different values of one fact are a DURABLE `READ_CONFLICT` on that order
+ * or trade: which is the venue's is unknown, so no later read ends it (an
+ * unverified venue assumption, held as a conservative policy: these facts never
+ * change for one id; no venue document states it). A trade a read SHOWED that
+ * a complete trades read omits is a `READ_CONFLICT` while it is not accounted
+ * for under its own identity (its order tracked, or ownable by an unresolved
+ * attempt, or a `TRADE_UNATTRIBUTED` recorded for it, which the coordinator
+ * records from the evidence when no one can own the order). What the user
+ * stream reported that the OMS did not apply, whatever the OMS answered, is
+ * evidence too.
+ *
  * WHAT A RELEASE MEANS ({@link RELEASE_ACKNOWLEDGES_SUBJECT}). Releasing
  * immutable history (an UNATTRIBUTED order or trade, a booking, one OMS alert,
  * one trade's FAILED settlement, one venue order id the venue does not show)
@@ -182,8 +196,9 @@ export const BREAK_TAXONOMY = Object.freeze({
     family: "READ",
     rule: HOLD,
     meaning:
-      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size, a trade's leg missing or of other shares, a terminal settlement contradicting an earlier one",
-    handling: "nothing about the subject is concluded, the run is not one view of the account (no answer, no classification, no clearing); submissions stay paused until a read agrees with all the evidence",
+      "two reads of one run disagree about a fixed fact (an order's token, side, price or size; a trade's legs), or a read contradicts the evidence: an order a source showed in full that its by-id read does not find, trades summing to more than the order's matched size (or a trade naming an order a read shows with nothing matched), a trade's leg missing or of other shares, a terminal settlement contradicting an earlier one; (r7) an order's fixed fact or a fill's economics shown with two values by any observations, of any run or source (a durable contradiction); a trade a read showed that a complete trades read omits while it is not accounted for under its own identity",
+    handling:
+      "nothing about the subject is concluded, the run is not one view of the account (no answer, no signed-identity resolution, no delivery, no classification, no clearing); submissions stay paused until a read agrees with all the evidence. A fact shown with two values never agrees again: it holds for good, and no tool retracts evidence (an ADR is owed)",
   },
   READ_REGRESSION: {
     family: "READ",
@@ -254,7 +269,8 @@ export const BREAK_TAXONOMY = Object.freeze({
   TRADE_UNATTRIBUTED: {
     family: "TRADE",
     rule: UNATTRIBUTED,
-    meaning: "a trade of the account on an order that no tracked order and no unresolved attempt can own",
+    meaning:
+      "a trade of the account on an order that no tracked order and no unresolved attempt can own: one the trades read shows, or (r7) one the evidence holds that the read no longer shows (a trade a read showed and a complete read omits, or one the stream named), under its own trade id",
     handling: "recorded as UNATTRIBUTED activity; its market is halted; quarantined until released",
   },
   TRADE_MISSING_IN_OMS: {

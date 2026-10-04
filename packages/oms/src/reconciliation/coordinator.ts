@@ -46,12 +46,16 @@
  *    BEFORE anything is classified, whatever the run's soundness. The store
  *    is rebuilt from the journal at every run, so a restart forgets nothing.
  *    Then the store's ONE query (`EvidenceStore.judge`) gives a verdict on
- *    every venue order and trade the run read, or has unsettled evidence of,
- *    against this run's other reads and ALL the evidence: CONSISTENT (the only
- *    view anything is answered, compared, classified or settled from), a
- *    CONFLICT (an observation below the high-water matched size, live after
- *    terminal, a settlement backwards, a shown order not found by id: the run
- *    is unsound and holds), a GHOST (an unclaimed id only NAMED that its by-id
+ *    every venue order and trade the run read, or has unsettled evidence of
+ *    (and, r7, every trade a read ever SHOWED), against this run's other
+ *    reads and ALL the evidence: CONSISTENT (the only view anything is
+ *    answered, compared, classified or settled from), a CONFLICT (an
+ *    observation below the high-water matched size, live after terminal, a
+ *    settlement backwards, a shown order not found by id; r7: an order's
+ *    fixed fact or a fill's economics shown with two values, a DURABLE
+ *    contradiction; a shown trade a complete trades read omits while it is
+ *    not accounted for under its own identity: the run is unsound and holds),
+ *    a GHOST (an unclaimed id only NAMED that its by-id
  *    read does not find: no signed-identity answer while it stands, and a
  *    releasable `ORDER_NOT_FOUND_BY_ID`), ACKNOWLEDGED (the same, released by
  *    an operator, nothing new since), MISSING (a claimed order not found: the
@@ -128,7 +132,10 @@
  *   are acknowledged, by id, only after a run whose order and trade reads
  *   began after their receipt and were complete; each acknowledgement is
  *   journaled. Its normalized events are routed to the OMS (outside runs;
- *   buffered during one).
+ *   buffered during one). Every item the OMS did not apply, whatever its
+ *   answer (a refusal of any code, a throw), and every item routed while no
+ *   OMS is bound, is kept as journaled evidence at once and triggers a run
+ *   (r7, WP290-V7-STREAM-REFUSAL-DROPPED).
  * - **Malformed requests.** A request that cannot be read, on any channel, is
  *   refused to its requester (the OMS and the inventory keep it as owed) and
  *   recorded as a REQUEST_MALFORMED break by the next run: a hold, which a
@@ -184,7 +191,7 @@
 
 import { addDecimal, compareDecimal, type DecimalString } from "@polymarket-bot/decimal";
 
-import { compositeKey, isIdentifier, isPositiveAmount, isTokenId, isUnitPrice, isUuidV7, readArray, readField, readFields } from "../guards.js";
+import { compositeKey, isIdentifier, isNonNegativeAmount, isPositiveAmount, isTokenId, isUnitPrice, isUuidV7, readArray, readField, readFields } from "../guards.js";
 import type { AttemptView, OrderView } from "../order-manager.js";
 import { isVenueId } from "../outcomes.js";
 import type { ReconciliationRequester } from "../ports.js";
@@ -192,6 +199,7 @@ import { TERMINAL_ORDER_STATES, type OrderState } from "../states.js";
 
 import {
   callRead,
+  isIsoInstant,
   readApprovals,
   readCollateral,
   readOkFlag,
@@ -218,6 +226,7 @@ import {
   settledRecord,
   shownOrder,
   type EvidenceRecord,
+  type LegFacts,
   type EvidenceProblem,
   type OrderVerdict,
   type TradeVerdict,
@@ -256,10 +265,6 @@ const MAX_DETAIL = 2000;
 const MAX_REQUEST_ID = 2000;
 
 const STREAM_DISCREPANCY_CAUSES: readonly string[] = ["UNRECOGNIZED_MESSAGE", "EVENT_NOT_FULLY_APPLICABLE", "EVENT_NOT_DELIVERED"];
-/** OMS refusals of routed stream evidence that mean the account's activity did not match what the OMS tracks. */
-const DISCREPANCY_REFUSALS: readonly string[] = ["OMS_UNKNOWN_VENUE_ORDER", "OMS_FILL_INCONSISTENT", "OMS_FILL_CONFLICT", "OMS_SETTLEMENT_CONFLICT"];
-/** OMS refusals of routed stream evidence after which the OMS holds none of it: the coordinator keeps it (`#routeStream`). */
-const UNAPPLIED_EVIDENCE: readonly string[] = ["OMS_EVIDENCE_RETAINED", ...DISCREPANCY_REFUSALS];
 /** Order-level disagreements after which the run's ledger projection is known to be behind, or wrong (see `#runOnce`). */
 const DEFERS_HOLDINGS: readonly BreakClass[] = [
   "TRADE_MISSING_IN_OMS",
@@ -427,6 +432,8 @@ class RunState {
   /** The evidence store's verdict on each venue order and trade this run read (`#assembleOrderView`). */
   readonly verdicts = new Map<string, OrderVerdict>();
   readonly tradeVerdicts = new Map<string, TradeVerdict>();
+  /** Trades a read SHOWED that this run's complete trades read omits, judged a CONFLICT (r7, `#unattributedFromEvidence`). */
+  readonly tradesMissing = new Set<string>();
   /** The journal's evidence was readable at the start of the run (otherwise the run concludes nothing). */
   evidenceReadable = true;
   /** Channels a malformed request was taken from by this run (`#takeMalformed`). */
@@ -798,6 +805,9 @@ export class ReconciliationCoordinator {
 
     // ---- §9.17 step 5: compare, and answer ------------------------------------------------------
     const view = this.#assembleOrderView(run, oms, reads);
+    // A trade a read showed that a complete trades read now omits is named under its own identity, whatever this
+    // run's soundness: UNATTRIBUTED when no tracked order or unresolved attempt can own its order (r7, R7-03).
+    this.#unattributedFromEvidence(run, oms);
     // The trades read against the OMS's durable fills, by identity: a read behind the OMS is not one view of the
     // account, and nothing is answered or compared from it, and nothing more is written from it (`#probeFills`).
     if (run.orderReadsSound) await this.#probeFills(run, oms, view, readsStartedAt);
@@ -970,16 +980,22 @@ export class ReconciliationCoordinator {
     this.#readProblem(run, "approvals", reads.approvals);
     this.#readProblem(run, "ledger-projection", reads.projected);
     this.#readProblem(run, "ledger-fill-bookings", reads.bookings);
-    // The trades: each one this run's trades read shows, judged against its evidence.
+    // The trades: each one this run's trades read shows, and (r7) every trade the evidence holds, judged against its
+    // evidence: a fill's economics shown two ways is a durable CONFLICT whether or not this read shows the trade
+    // (WP290-CX-R7-02), and a trade a read SHOWED that this complete read omits, not accounted for under its own
+    // identity, is a CONFLICT (WP290-CX-R7-03: a durable classification obligation for every observed trade).
     const tradesOk = reads.trades.kind === "OK";
     const tradesShown = new Map(reads.trades.kind === "OK" ? reads.trades.value.map((trade) => [trade.venueTradeId, trade]) : []);
-    for (const tradeId of [...tradesShown.keys()].sort()) {
+    const accounted = this.#accountedTrades(oms);
+    const tradeIds = new Set<string>([...tradesShown.keys(), ...(tradesOk ? this.#evidence.tradeIds() : [])]);
+    for (const tradeId of [...tradeIds].sort()) {
       const shown = tradesShown.get(tradeId);
-      const verdict = this.#evidence.judge({ trade: tradeId, reads: { tradesOk, shown } });
+      const verdict = this.#evidence.judge({ trade: tradeId, reads: { tradesOk, shown, accounted: accounted(tradeId) } });
       run.tradeVerdicts.set(tradeId, verdict);
       if (verdict.kind === "CONFLICT") {
         sound(false);
         this.#detectProblems(run, "trade", tradeId, verdict.problems);
+        if (shown === undefined) run.tradesMissing.add(tradeId);
       } else if (verdict.kind === "CONSISTENT") {
         for (const breakClass of VENUE_OBJECT_CLASSES) run.positive.add(compositeKey(breakClass, "trade", tradeId));
       }
@@ -1053,6 +1069,66 @@ export class ReconciliationCoordinator {
         observedValue: entry.observed,
         detail: entry.detail,
       });
+    }
+  }
+
+  /**
+   * Whether a trade's CLASSIFICATION OBLIGATION is discharged (r7, WP290-CX-R7-03), so that a complete trades read may
+   * omit it without a CONFLICT (history may age a classified trade out). It is, when no unresolved break names the
+   * trade (a hold about it is judged until a read shows it consistent) and every leg a read SHOWED is accounted for
+   * under the trade's own identity:
+   * - on a venue order the OMS tracks (an order or an attempt claims it): the OMS comparison judges that order in
+   *   every run it is read, by trade id (`ORDER_FILLS_AHEAD_OF_VENUE` while the OMS holds a fill the read does not
+   *   show; `ORDER_TRADES_INCOMPLETE` while the venue matched more than its trades show);
+   * - on a venue order an unresolved attempt could own (by the leg's token and side): that attempt's resolution
+   *   classifies it (tracked, then the OMS comparison; or unattributed), and the attempt holds the account meanwhile;
+   * - otherwise, by a `TRADE_UNATTRIBUTED` break for that trade and order, in any state (`#unattributedFromEvidence`).
+   * The journal unreadable: nothing is accounted for (fail closed).
+   */
+  #accountedTrades(oms: ReconciledOms): (tradeId: string) => boolean {
+    const breaks = this.#allBreaks();
+    const unresolved = this.#unresolvedBreaks();
+    if (breaks === undefined || unresolved === undefined) return () => false;
+    const unattributed = new Set(breaks.filter((view) => view.breakClass === "TRADE_UNATTRIBUTED").map((view) => view.subjectKey));
+    const held = new Set<string>();
+    for (const view of unresolved) {
+      const named = venueSubjectOf(view.breakClass, view.subjectKey);
+      if (named?.kind === "trade") held.add(named.id);
+    }
+    const claimed = claimedVenueIds(oms.orders(), oms.attempts());
+    const owners = this.#potentialOwners(oms);
+    return (tradeId) => {
+      if (held.has(tradeId)) return false;
+      const legs = (this.#evidence.trade(tradeId)?.legs ?? []).filter((leg) => leg.shown);
+      return legs.every(
+        (leg) => claimed.has(leg.venueOrderId) || ownable(owners, leg) || unattributed.has(compositeKey("TRADE_UNATTRIBUTED", tradeId, leg.venueOrderId)),
+      );
+    };
+  }
+
+  /**
+   * Every trade a read SHOWED that this run's complete trades read omits (`RunState.tradesMissing`: a CONFLICT that
+   * holds the run) is named under its own identity, from its evidence, in any run: each shown leg on a venue order
+   * no tracked order or attempt claims, and that no unresolved attempt could own (by the leg's token and side), is
+   * `TRADE_UNATTRIBUTED` (a quarantine that halts its market). Unmatched actual activity never disappears silently
+   * (r7, WP290-CX-R7-03). A leg an attempt could own waits, held by the trade's conflict.
+   */
+  #unattributedFromEvidence(run: RunState, oms: ReconciledOms): void {
+    if (run.tradesMissing.size === 0) return;
+    const claimed = claimedVenueIds(oms.orders(), oms.attempts());
+    const owners = this.#potentialOwners(oms);
+    for (const tradeId of [...run.tradesMissing].sort()) {
+      for (const leg of this.#evidence.trade(tradeId)?.legs ?? []) {
+        if (!leg.shown || claimed.has(leg.venueOrderId) || ownable(owners, leg)) continue;
+        this.#detect(run, {
+          breakClass: "TRADE_UNATTRIBUTED",
+          subjectKey: compositeKey("TRADE_UNATTRIBUTED", tradeId, leg.venueOrderId),
+          ...(leg.tokenId === null ? {} : this.#marketOf(leg.tokenId)),
+          assetId: leg.tokenId,
+          observedValue: leg.shares,
+          detail: `trade ${tradeId} (${leg.side ?? "?"} ${leg.shares ?? "?"} at ${leg.price ?? "?"}) on venue order ${leg.venueOrderId}, which no tracked order or unresolved attempt can own: an earlier read showed it, and a complete trades read no longer does: UNATTRIBUTED, from its evidence`,
+        });
+      }
     }
   }
 
@@ -1538,7 +1614,9 @@ export class ReconciliationCoordinator {
         observedValue: venue.sizeMatched,
         detail: `venue order ${venue.venueOrderId} (${venue.side} ${venue.originalSize} at ${venue.price}, ${venue.status}) is the account's, and no tracked order or unresolved attempt can own it: UNATTRIBUTED`,
       });
+      const current = new Set<string>();
       for (const entry of view.legsByOrder.get(venue.venueOrderId) ?? []) {
+        current.add(entry.trade.venueTradeId);
         this.#detect(run, {
           breakClass: "TRADE_UNATTRIBUTED",
           subjectKey: compositeKey("TRADE_UNATTRIBUTED", entry.trade.venueTradeId, venue.venueOrderId),
@@ -1546,6 +1624,19 @@ export class ReconciliationCoordinator {
           assetId: entry.leg.tokenId,
           observedValue: entry.leg.shares,
           detail: `trade ${entry.trade.venueTradeId} (${entry.leg.side} ${entry.leg.shares} at ${entry.leg.price}) on untracked venue order ${venue.venueOrderId}: UNATTRIBUTED`,
+        });
+      }
+      // Every trade the evidence holds on it too (r7, WP290-CX-R7-03): one an earlier read showed, or the stream named,
+      // that this run's trades read does not show is unmatched activity all the same, under its own identity.
+      for (const { venueTradeId, leg } of this.#evidence.legsOn(venue.venueOrderId)) {
+        if (current.has(venueTradeId)) continue;
+        this.#detect(run, {
+          breakClass: "TRADE_UNATTRIBUTED",
+          subjectKey: compositeKey("TRADE_UNATTRIBUTED", venueTradeId, venue.venueOrderId),
+          ...market,
+          assetId: leg.tokenId ?? venue.tokenId,
+          observedValue: leg.shares,
+          detail: `trade ${venueTradeId} (${leg.side ?? venue.side} ${leg.shares ?? "?"} at ${leg.price ?? "?"}) on untracked venue order ${venue.venueOrderId}, known from its evidence (this trades read does not show it): UNATTRIBUTED`,
         });
       }
     }
@@ -2279,50 +2370,52 @@ export class ReconciliationCoordinator {
     this.#streamChain = this.#streamChain.then(() => this.#routeStream(output)).catch(() => undefined);
   }
 
-  /** Route one ORDER or TRADE output to the OMS, in order. Evidence the OMS cannot match triggers a run. */
+  /**
+   * Route one ORDER or TRADE output to the OMS, in order. EVERY item the OMS did not apply, whatever its answer (a
+   * retention; a refusal as unknown, inconsistent or contradicting; a store failure that faulted it; a fault already
+   * standing; an input or id-source refusal; an unknown fill; a throw), and every item routed while no OMS is bound,
+   * is the coordinator's to keep (r6 class A; r7, WP290-V7-STREAM-REFUSAL-DROPPED): recorded in the evidence store and
+   * journaled at once, so neither a later lagging read, nor a restart, nor an OMS reopened and bound again forgets it.
+   * Each such item triggers a run. Evidence the OMS applied is the OMS's own durable record (its fills, settlements
+   * and states).
+   */
   async #routeStream(output: unknown): Promise<void> {
-    const oms = this.#oms;
-    if (oms === null) {
-      this.trigger("POSITION_BALANCE_DISCREPANCY");
-      return;
-    }
     const kind = readField(output, "kind");
     const projection = readField(output, "oms");
     if (kind.kind !== "DATA" || projection.kind !== "DATA") {
       this.trigger("POSITION_BALANCE_DISCREPANCY");
       return;
     }
-    const codes: string[] = [];
-    // Evidence the OMS did not apply (it retains it, in memory only; it refuses it as unknown, inconsistent or
-    // contradicting what it holds; it could not be asked) is the coordinator's to keep (r6, class A): recorded in
-    // the evidence store and journaled at once, so neither a later lagging read nor a restart forgets it. Evidence
-    // the OMS applied is the OMS's own durable record (its fills, settlements and states).
-    const apply = async (call: () => Promise<unknown>, evidence: EvidenceRecord | undefined): Promise<void> => {
-      let result: unknown;
-      try {
-        result = await call();
-      } catch {
-        result = undefined;
-      }
-      if (readOkFlag(result)) return;
-      const code = readRefusalCode(result);
-      codes.push(code);
-      if (evidence !== undefined && (UNAPPLIED_EVIDENCE.includes(code) || code === "UNREADABLE")) {
-        await this.#recordEvidenceNow(null, evidence, Math.max(this.#lastClock, 0));
-      }
-    };
+    const items: { readonly apply: (oms: ReconciledOms) => Promise<unknown>; readonly evidence: EvidenceRecord | undefined }[] = [];
     if (kind.value === "ORDER") {
       const observation = readField(projection.value, "observation");
-      if (observation.kind === "DATA" && observation.value !== null) await apply(() => oms.applyOrderObservation(observation.value), streamEvidence("ORDER", observation.value));
+      if (observation.kind === "DATA" && observation.value !== null) {
+        items.push({ apply: (oms) => oms.applyOrderObservation(observation.value), evidence: streamEvidence("ORDER", observation.value) });
+      }
     } else {
       const fills = readField(projection.value, "fills");
       const settlements = readField(projection.value, "settlements");
-      for (const fill of (fills.kind === "DATA" ? readArray(fills.value, 1000) : undefined) ?? []) await apply(() => oms.recordFill(fill), streamEvidence("FILL", fill));
+      for (const fill of (fills.kind === "DATA" ? readArray(fills.value, 1000) : undefined) ?? []) items.push({ apply: (oms) => oms.recordFill(fill), evidence: streamEvidence("FILL", fill) });
       for (const settlement of (settlements.kind === "DATA" ? readArray(settlements.value, 1000) : undefined) ?? []) {
-        await apply(() => oms.applySettlement(settlement), streamEvidence("SETTLEMENT", settlement));
+        items.push({ apply: (oms) => oms.applySettlement(settlement), evidence: streamEvidence("SETTLEMENT", settlement) });
       }
     }
-    if (codes.some((code) => DISCREPANCY_REFUSALS.includes(code) || code === "UNREADABLE")) this.trigger("POSITION_BALANCE_DISCREPANCY");
+    const oms = this.#oms;
+    let unapplied = oms === null;
+    for (const item of items) {
+      let result: unknown;
+      if (oms !== null) {
+        try {
+          result = await item.apply(oms);
+        } catch {
+          result = undefined;
+        }
+        if (readOkFlag(result)) continue;
+      }
+      unapplied = true;
+      if (item.evidence !== undefined) await this.#recordEvidenceNow(null, item.evidence, Math.max(this.#lastClock, 0));
+    }
+    if (unapplied) this.trigger("POSITION_BALANCE_DISCREPANCY");
   }
 
   // ---- OMS health -----------------------------------------------------------------------------
@@ -3302,9 +3395,19 @@ function salvageOf(outcome: ReadOutcome<unknown>): Salvage {
   return (outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED") && outcome.salvage !== undefined ? outcome.salvage : { rows: [], legs: [] };
 }
 
-/** A leg's facts as the evidence store records them. */
-function legFacts(leg: VenueTradeLeg): { venueOrderId: string; tokenId: string; side: "BUY" | "SELL"; shares: DecimalString; price: DecimalString } {
-  return { venueOrderId: leg.venueOrderId, tokenId: leg.tokenId, side: leg.side, shares: leg.shares, price: leg.price };
+/** A leg's facts as the evidence store records them: every fill fact the read fixed (r7, WP290-CX-R7-02). */
+function legFacts(leg: VenueTradeLeg): LegFacts {
+  return {
+    venueOrderId: leg.venueOrderId,
+    tokenId: leg.tokenId,
+    side: leg.side,
+    shares: leg.shares,
+    price: leg.price,
+    feeAmount: leg.feeAmount,
+    feeAssetId: leg.feeAssetId,
+    role: leg.role,
+    matchedAt: leg.matchedAt,
+  };
 }
 
 /**
@@ -3325,7 +3428,28 @@ function streamEvidence(kind: "ORDER" | "FILL" | "SETTLEMENT", raw: unknown): Ev
     const shares = readField(raw, "shares");
     const price = readField(raw, "price");
     if (shares.kind !== "DATA" || !isPositiveAmount(shares.value) || price.kind !== "DATA" || !isUnitPrice(price.value)) return undefined;
-    return legRecord(tradeId.value, { venueOrderId: orderId.value, tokenId: null, side: null, shares: shares.value, price: price.value }, null, "NAMED", "STREAM_FILL");
+    // Every fill fact the stream fixed (r7): each that is out of shape is unknown (`null`), never guessed.
+    const fact = (key: string, valid: (value: unknown) => boolean): unknown => {
+      const read = readField(raw, key);
+      return read.kind === "DATA" && valid(read.value) ? read.value : null;
+    };
+    return legRecord(
+      tradeId.value,
+      {
+        venueOrderId: orderId.value,
+        tokenId: null,
+        side: null,
+        shares: shares.value,
+        price: price.value,
+        feeAmount: fact("feeAmount", isNonNegativeAmount) as DecimalString | null,
+        feeAssetId: fact("feeAssetId", isIdentifier) as string | null,
+        role: fact("liquidityRole", (value) => value === "MAKER" || value === "TAKER") as "MAKER" | "TAKER" | null,
+        matchedAt: fact("matchedAt", isIsoInstant) as string | null,
+      },
+      null,
+      "NAMED",
+      "STREAM_FILL",
+    );
   }
   const status = readField(raw, "status");
   if (status.kind !== "DATA" || !isIdentifier(status.value)) return undefined;
@@ -3397,6 +3521,11 @@ function detection(partial: Partial<Detection> & Pick<Detection, "breakClass" | 
  */
 function arrivalSubject(ledgerTransactionId: string, kind: "ACTUAL_ARRIVAL" | "UNEXPLAINED_MOVEMENT", assetId: string, marketId: string | null, place: number): string {
   return compositeKey("ledger-arrival", ledgerTransactionId, kind, assetId, marketId ?? "", String(place));
+}
+
+/** An unresolved attempt could own the venue order this leg is on (its facts unknown, or the leg's token and side unknown or its own). */
+function ownable(owners: readonly PotentialOwner[], leg: { readonly tokenId: string | null; readonly side: "BUY" | "SELL" | null }): boolean {
+  return owners.some((owner) => owner.facts === null || leg.tokenId === null || leg.side === null || (owner.facts.tokenId === leg.tokenId && owner.facts.side === leg.side));
 }
 
 function claimedVenueIds(orders: readonly OrderView[], attempts: readonly AttemptView[]): Set<string> {

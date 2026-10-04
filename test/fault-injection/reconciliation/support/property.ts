@@ -9,6 +9,10 @@
  *   (exact twins of the account's own, and others), unexplained holding changes;
  * - the user stream: an order's observation, a trade's fill (retained by the OMS while an attempt could own it), a
  *   phantom id, and a fill reported again with other economics (a repeated OMS halting alert);
+ * - (r7) the OMS store refusing a stream fill's write WITHOUT a process kill (the OMS faults: a store failure, then
+ *   `OMS_FAULTED`), after which the composition reopens the OMS from its store and binds it to the SAME coordinator;
+ * - (r7) a by-id read showing another value of an observed order's fixed fact, and a trades read showing an
+ *   observed fill with other economics (an offsetting price and fee);
  * - a ledger transaction with UNATTRIBUTED arrivals in two markets;
  * - every read source and answer shape: complete, partial, duplicated, sibling-malformed, by-id found, not found,
  *   thrown or regressing, trades complete, partial, malformed or lagging, positions and collateral failing;
@@ -41,7 +45,7 @@ import { decodeCompositeKey } from "../../../../packages/oms/src/reconciliation/
 import { venueIdFor } from "../../../unit/oms/support/fake-venue.js";
 import { uuid7 } from "../../../unit/oms/support/ids.js";
 
-import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, YES, bookReversal, boot, streamTrade, universe, type Process, type Universe } from "./harness.js";
+import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, bookReversal, boot, reopenOms, streamTrade, universe, type Process, type Universe } from "./harness.js";
 import { G_YES, sequence, submitOne } from "./scenario.js";
 import type { ReadFaults, Transmission, VenueOrder, VenueTrade } from "./world.js";
 
@@ -184,6 +188,7 @@ class Sim {
     const plan = withKill ? { at: 1 + Math.floor(this.rand() * 60), phase: this.chance(0.5) ? ("before" as const) : ("after" as const) } : null;
     this.steps.push(`RESTART${plan === null ? "" : `(kill ${plan.phase} call ${String(plan.at)})`}`);
     this.#pending.clear();
+    this.#factsPending.clear();
     try {
       this.p = await boot(this.u, plan);
     } catch (error) {
@@ -197,6 +202,7 @@ class Sim {
     if (this.p.inc.alive && this.p.oms !== null) return;
     this.steps.push("REBOOT");
     this.#pending.clear();
+    this.#factsPending.clear();
     this.p = await boot(this.u);
     this.#instrument();
   }
@@ -275,6 +281,18 @@ class Sim {
    */
   readonly #pending = new Map<string, string>();
   readonly #seen = new Map<string, string>();
+  /**
+   * r7: what a READ showed of each object's immutable facts (an order's price, by a list row or a by-id read; a trade's
+   * economics, by a trades answer), promoted with the rest: the r7 lies (`BYID_FACTS`, `TRADES_ECON`) are drawn only
+   * against facts a read already showed, so each is a lie the coordinator can detect (a first observation that lies
+   * is the undetectable kind, outside this fault model).
+   */
+  readonly #factsPending = new Set<string>();
+  readonly #factsSeen = new Set<string>();
+
+  sawFacts(key: string): void {
+    this.#factsPending.add(key);
+  }
 
   saw(id: unknown, matched: unknown): void {
     if (typeof id !== "string") return;
@@ -289,6 +307,8 @@ class Sim {
       if (earlier === undefined || compareDecimal(matched, earlier) > 0) this.#seen.set(id, matched);
     }
     this.#pending.clear();
+    for (const key of this.#factsPending) this.#factsSeen.add(key);
+    this.#factsPending.clear();
   }
 
   /** A completed run of a living process was shown this venue order matched (above zero). */
@@ -376,6 +396,44 @@ class Sim {
     }
   }
 
+  /**
+   * r7 (WP290-V7-STREAM-REFUSAL-DROPPED): the OMS store refuses the write of a fill the user stream delivers, so the
+   * OMS faults (`OMS_STORE_WRITE_FAILED`, then `OMS_FAULTED` for anything after), with NO process kill: the composition
+   * reopens the OMS from its durable store and binds it to the SAME live coordinator.
+   */
+  async storeFault(): Promise<void> {
+    const oms = this.oms;
+    if (oms === null) return;
+    // A fill of a tracked order the OMS has not recorded yet (so its commit is attempted), else any own fill.
+    const own = this.u.world.trades.filter((entry) => this.ownOrders().some((order) => order.venueOrderId === entry.venueOrderId));
+    const recorded = new Set(this.u.store.snapshotSync().fills.map((fill) => fill.venueTradeId));
+    const tracked = own.filter((entry) => !recorded.has(entry.venueTradeId) && oms.orders().some((order) => order.venueOrderId === entry.venueOrderId));
+    const trade = this.pick(tracked.length > 0 ? tracked : own);
+    if (trade === undefined) return;
+    this.saw(trade.venueOrderId, trade.shares);
+    this.steps.push(`STORE_FAULT(fill ${trade.venueTradeId})`);
+    this.u.store.hooks.before = (writes) => {
+      if (writes.some((write) => write.kind === "INSERT_FILL")) throw new Error("the database is unavailable");
+    };
+    try {
+      this.p.coordinator.onUserStreamOutput(streamTrade(this.u, trade.venueTradeId));
+      await this.p.coordinator.settled();
+    } catch (error) {
+      if (!(error instanceof Killed)) throw error;
+    } finally {
+      this.u.store.hooks.before = undefined;
+    }
+    if (this.p.inc.alive && this.p.oms?.faulted === true) {
+      this.steps.push("REBIND");
+      try {
+        this.p = await reopenOms(this.u, this.p);
+      } catch (error) {
+        if (!(error instanceof Killed)) throw error;
+      }
+      this.#instrument();
+    }
+  }
+
   // ---- faults for the next run ------------------------------------------------------------------------------
 
   armFaults(): void {
@@ -383,7 +441,7 @@ class Sim {
     const chosen: string[] = [];
     const count = 1 + Math.floor(this.rand() * 2);
     for (let index = 0; index < count; index += 1) {
-      const roll = Math.floor(this.rand() * 14);
+      const roll = Math.floor(this.rand() * 16);
       const target = this.pick([...this.u.world.orders.values()]);
       const trade = this.pick(this.u.world.trades);
       switch (roll) {
@@ -504,6 +562,33 @@ class Sim {
             };
           };
           break;
+        case 13:
+          // r7 (WP290-CX-R7-01): a by-id read shows an observed order with another limit price (a fixed fact).
+          if (target === undefined || !this.#factsSeen.has(`order:${target.venueOrderId}`)) break;
+          chosen.push(`BYID_FACTS(${target.venueOrderId})`);
+          faults.readOrder = (id, answer) => {
+            const read = answer() as { found?: boolean; order?: Record<string, unknown> };
+            if (id !== target.venueOrderId || read.found !== true) return read;
+            this.fire("BYID_FACTS", false, id);
+            return { ...read, order: { ...read.order, price: target.price === "0.6" ? "0.61" : "0.6" } };
+          };
+          break;
+        case 14:
+          // r7 (WP290-CX-R7-02): a trades read shows an observed fill at a lower price with an offsetting collateral fee.
+          if (trade === undefined || !this.#factsSeen.has(`trade:${trade.venueTradeId}`)) break;
+          chosen.push(`TRADES_ECON(${trade.venueTradeId})`);
+          faults.listTrades = (answer) => {
+            const read = answer() as { trades: { venueTradeId: string; ownLegs: Record<string, unknown>[] }[] };
+            return {
+              ...read,
+              trades: read.trades.map((entry) => {
+                if (entry.venueTradeId !== trade.venueTradeId) return entry;
+                this.fire("TRADES_ECON", false, trade.venueOrderId);
+                return { ...entry, ownLegs: entry.ownLegs.map((leg) => ({ ...leg, price: "0.01", feeAmount: "0.001", feeAssetId: PUSD })) };
+              }),
+            };
+          };
+          break;
         default:
           // A clock fault at a random await of the run (a read or an OMS write).
           this.#clockArm = 1 + Math.floor(this.rand() * 12);
@@ -526,21 +611,30 @@ class Sim {
       ...chosen,
       listOpenOrders: (answer) => {
         const read = list(answer) as { orders?: unknown };
-        if (Array.isArray(read.orders)) for (const row of read.orders as Record<string, unknown>[]) this.saw(row["venueOrderId"], row["sizeMatched"]);
+        if (Array.isArray(read.orders)) {
+          for (const row of read.orders as Record<string, unknown>[]) {
+            this.saw(row["venueOrderId"], row["sizeMatched"]);
+            if (typeof row["price"] === "string") this.sawFacts(`order:${String(row["venueOrderId"])}`);
+          }
+        }
         return read;
       },
       listTrades: (answer) => {
         const read = trades(answer) as { trades?: unknown };
         if (Array.isArray(read.trades)) {
-          for (const trade of read.trades as { ownLegs?: unknown }[]) {
+          for (const trade of read.trades as { venueTradeId?: unknown; ownLegs?: unknown }[]) {
             if (Array.isArray(trade.ownLegs)) for (const leg of trade.ownLegs as Record<string, unknown>[]) this.saw(leg["venueOrderId"], leg["shares"]);
+            if (typeof trade.venueTradeId === "string") this.sawFacts(`trade:${trade.venueTradeId}`);
           }
         }
         return read;
       },
       readOrder: (id, answer) => {
         const read = byId(id, answer) as { found?: unknown; order?: Record<string, unknown> };
-        if (read.found === true && read.order !== undefined) this.saw(id, read.order["sizeMatched"]);
+        if (read.found === true && read.order !== undefined) {
+          this.saw(id, read.order["sizeMatched"]);
+          this.sawFacts(`order:${id}`);
+        }
         return read;
       },
       onRead: (name: string) => this.intercept(`read.${name}`),
@@ -739,7 +833,8 @@ export async function runSeed(seed: number): Promise<SeedResult> {
     else if (roll < 0.29) sim.settle();
     else if (roll < 0.35) sim.foreign();
     else if (roll < 0.39) sim.cancel();
-    else if (roll < 0.52) await sim.stream();
+    else if (roll < 0.49) await sim.stream();
+    else if (roll < 0.52) await sim.storeFault();
     else if (roll < 0.54) sim.adjust();
     else if (roll < 0.56) sim.ledgerTwoMarkets();
     else if (roll < 0.7) {

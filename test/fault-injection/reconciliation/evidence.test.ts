@@ -127,13 +127,111 @@ describe("the one query: a verdict on this run's reads against each other and ag
 
   it("a trade: status backwards is a READ_REGRESSION; CONFIRMED against FAILED a READ_CONFLICT; a leg missing or of other shares a READ_CONFLICT", () => {
     const store = EvidenceStore.fold([leg("0.4", "t", "MINED")]);
-    expect(store.judge({ trade: "t", reads: { tradesOk: true, shown: trade({ status: "MATCHED" }) } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_REGRESSION" }] });
+    expect(store.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: trade({ status: "MATCHED" }) } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_REGRESSION" }] });
     const confirmed = EvidenceStore.fold([leg("0.4", "t", "CONFIRMED")]);
-    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, shown: trade({ status: "FAILED" }) } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_CONFLICT" }] });
-    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, shown: trade({ shares: "0.3" }) } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_CONFLICT" }] });
-    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, shown: trade({ ownLegs: [] , ownershipUndetermined: true }) } })).toMatchObject({ kind: "CONFLICT" });
-    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, shown: trade() } })).toEqual({ kind: "CONSISTENT", status: "CONFIRMED" });
-    expect(confirmed.judge({ trade: "t", reads: { tradesOk: false, shown: undefined } })).toEqual({ kind: "UNREAD" });
+    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: trade({ status: "FAILED" }) } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_CONFLICT" }] });
+    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: trade({ shares: "0.3" }) } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_CONFLICT" }] });
+    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: trade({ ownLegs: [] , ownershipUndetermined: true }) } })).toMatchObject({ kind: "CONFLICT" });
+    expect(confirmed.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: trade() } })).toEqual({ kind: "CONSISTENT", status: "CONFIRMED" });
+    expect(confirmed.judge({ trade: "t", reads: { tradesOk: false, accounted: false, shown: undefined } })).toEqual({ kind: "UNREAD" });
+  });
+});
+
+describe("r7: immutable facts shown two ways are a durable contradiction (WP290-CX-R7-01, R7-02); a shown trade carries a classification obligation (R7-03)", () => {
+  function fullLeg(overrides: Partial<Record<"shares" | "price" | "feeAmount" | "feeAssetId" | "matchedAt", string | null>> & { readonly role?: "MAKER" | "TAKER" } = {}, tradeId = "t"): EvidenceRecord {
+    return legRecord(
+      tradeId,
+      { venueOrderId: "x", tokenId: "1", side: "BUY", shares: "0.4", price: "0.5", feeAmount: "0", feeAssetId: null, role: "MAKER", matchedAt: "2026-10-03T00:00:00Z", ...overrides },
+      "CONFIRMED",
+      "SHOWN",
+      "TRADES_LEG",
+    );
+  }
+
+  it("an order's fixed fact shown with another value is information (journaled) and a contradiction in every later verdict, after a rebuild too", () => {
+    for (const changed of [{ price: "0.6" }, { tokenId: "2" }, { originalSize: "2" }, { side: "SELL" as const }]) {
+      const records = [shownOrder(order(), "OPEN_ORDERS_ROW")];
+      const store = EvidenceStore.fold(records);
+      const second = shownOrder(order(changed), "BY_ID");
+      expect(store.add(second)).toBe(true);
+      expect(store.order("x")?.contradictions).toHaveLength(1);
+      const rebuilt = EvidenceStore.fold([...records, second]);
+      rebuilt.beginRun();
+      // Even a read that agrees with the first value is a conflict now: which value is the venue's is unknown.
+      const verdict = judge(rebuilt, { byId: order({ status: "CANCELED" }) });
+      expect(verdict.kind).toBe("CONFLICT");
+      expect(verdict.kind === "CONFLICT" ? verdict.problems[0]?.detail : "").toContain("different fixed facts");
+    }
+  });
+
+  it("filling in a fixed fact no observation showed yet is not a contradiction; a value seen again is not information", () => {
+    const store = EvidenceStore.fold([namedOrder("x", "OMS_RETAINED")]);
+    expect(store.add(shownOrder(order(), "BY_ID"))).toBe(true);
+    expect(store.add(shownOrder(order(), "OPEN_ORDERS_LIST"))).toBe(false);
+    expect(store.order("x")?.contradictions).toEqual([]);
+    store.beginRun();
+    expect(judge(store, { byId: order() }).kind).toBe("CONSISTENT");
+  });
+
+  it("a leg's fill facts shown two ways (an offsetting price and fee) are a durable contradiction; the same instant at another precision, or a fee newly fixed, is not", () => {
+    const store = EvidenceStore.fold([fullLeg()]);
+    expect(store.add(fullLeg({ matchedAt: "2026-10-03T00:00:00.000Z" }))).toBe(false);
+    expect(store.add(fullLeg({ matchedAt: "2026-10-03T02:00:00+02:00" }))).toBe(false);
+    expect(store.trade("t")?.legs[0]?.contradictions).toEqual([]);
+    const unfixed = EvidenceStore.fold([fullLeg({ feeAmount: null })]);
+    expect(unfixed.add(fullLeg())).toBe(true);
+    expect(unfixed.trade("t")?.legs[0]?.contradictions).toEqual([]);
+    const changes: { readonly first?: Parameters<typeof fullLeg>[0]; readonly then: Parameters<typeof fullLeg>[0] }[] = [
+      { then: { price: "0.49", feeAmount: "0.004", feeAssetId: "pusd" } },
+      { then: { role: "TAKER" } },
+      { then: { matchedAt: "2026-10-03T00:00:01Z" } },
+      { then: { shares: "0.3" } },
+      { first: { feeAssetId: "other" }, then: { feeAssetId: "pusd" } },
+    ];
+    for (const { first, then } of changes) {
+      const records = [fullLeg(first), fullLeg(then)];
+      const rebuilt = EvidenceStore.fold(records);
+      expect(rebuilt.trade("t")?.legs[0]?.contradictions.length).toBeGreaterThan(0);
+      const verdict = rebuilt.judge({ trade: "t", reads: { tradesOk: true, accounted: true, shown: trade() } });
+      expect(verdict.kind).toBe("CONFLICT");
+      // Absent from a complete read, accounted for or not: still a conflict (the contradiction is durable).
+      expect(rebuilt.judge({ trade: "t", reads: { tradesOk: true, accounted: true, shown: undefined } }).kind).toBe("CONFLICT");
+    }
+  });
+
+  it("a SHOWN trade a complete read omits is a CONFLICT until accounted for; a NAMED-only one, an accounted one, or one not read is not judged", () => {
+    const shown = EvidenceStore.fold([fullLeg()]);
+    expect(shown.tradeIds()).toEqual(["t"]);
+    expect(shown.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: undefined } })).toMatchObject({ kind: "CONFLICT", problems: [{ breakClass: "READ_CONFLICT" }] });
+    expect(shown.judge({ trade: "t", reads: { tradesOk: true, accounted: true, shown: undefined } })).toEqual({ kind: "UNREAD" });
+    expect(shown.judge({ trade: "t", reads: { tradesOk: false, accounted: false, shown: undefined } })).toEqual({ kind: "UNREAD" });
+    const named = EvidenceStore.fold([legRecord("t", { venueOrderId: "x", tokenId: null, side: null, shares: "0.4", price: "0.5" }, null, "NAMED", "STREAM_FILL")]);
+    expect(named.tradeIds()).toEqual(["t"]);
+    expect(named.judge({ trade: "t", reads: { tradesOk: true, accounted: false, shown: undefined } })).toEqual({ kind: "UNREAD" });
+  });
+
+  it("an order a trade names (a settlement the stream reported, its shares unknown) matched something: a read showing nothing matched is a CONFLICT", () => {
+    const store = EvidenceStore.fold([legRecord("t", { venueOrderId: "x", tokenId: null, side: null, shares: null, price: null }, "CONFIRMED", "NAMED", "STREAM_SETTLEMENT")]);
+    expect(store.order("x")).toMatchObject({ tradeCount: 1, legSum: "0" });
+    store.beginRun();
+    expect(judge(store, { byId: order({ status: "CANCELED" }) }).kind).toBe("CONFLICT");
+    expect(judge(store, { byId: order({ status: "CANCELED", sizeMatched: "0.4" }) }).kind).toBe("CONSISTENT");
+  });
+
+  it("the journal keeps a leg's fill facts, refuses them on any other record, and refuses one out of shape", async () => {
+    const opened = ReconciliationJournal.open({ accountRef: "account-1", history: [], sink: { append: async () => undefined } });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const journal = opened.value;
+    const event = (record: EvidenceRecord, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ kind: "EVIDENCE_RECORDED", runId: null, ...record, ...extra, atMs: 1 });
+    expect((await journal.append(event(fullLeg({ feeAmount: "0.004", feeAssetId: "pusd" })))).ok).toBe(true);
+    expect(readEvidenceRecords(journal.evidence())?.[0]).toMatchObject({ feeAmount: "0.004", feeAssetId: "pusd", role: "MAKER", matchedAt: "2026-10-03T00:00:00Z" });
+    expect((await journal.append(event(shownOrder(order(), "BY_ID"), { feeAmount: "0" }))).ok).toBe(false);
+    expect((await journal.append(event(fullLeg(), { role: "BOTH" }))).ok).toBe(false);
+    expect((await journal.append(event(fullLeg(), { matchedAt: "yesterday" }))).ok).toBe(false);
+    expect((await journal.append(event(fullLeg(), { feeAmount: "0.10" }))).ok).toBe(false);
+    expect(readEvidenceRecord({ ...fullLeg(), feeAmount: "0.10" })).toBeUndefined();
+    expect(readEvidenceRecord({ ...shownOrder(order(), "BY_ID"), role: "MAKER" })).toBeUndefined();
   });
 });
 

@@ -20,7 +20,7 @@
  * | --- | --- | --- |
  * | `READ_CONFLICT`, `READ_REGRESSION`, `STATUS_UNRECOGNISED`, `READ_INCOMPLETE` | `[class, "order", id]` | venue order `id` |
  * | the same, and `READ_MISSING`, `READ_MALFORMED`, `READ_WRONG_ROUTE` | `[class, compositeKey("order", id)]` (a by-id read's problem) | venue order `id` |
- * | `READ_REGRESSION`, `STATUS_UNRECOGNISED`, `READ_INCOMPLETE` | `[class, "trade", id]` | venue trade `id` |
+ * | `READ_CONFLICT`, `READ_REGRESSION`, `STATUS_UNRECOGNISED`, `READ_INCOMPLETE` | `[class, "trade", id]` | venue trade `id` (r7: a durable contradiction of its economics, or a shown trade a complete read omits, included) |
  * | `ORDER_UNRESOLVED` | `[class, "venue-order", id]` or `[class, "venue-order-named", id]` (r4) | venue order `id` |
  * | `ORDER_NOT_FOUND_BY_ID` (r4; r6 occurrences) | `[class, id]`, or `[class, id, n]` for the occurrence after `n` released ones | venue order `id` |
  * | `SETTLEMENT_REVERSAL_OWED` (r4) | `[class, trade, order]` | venue trade `trade` |

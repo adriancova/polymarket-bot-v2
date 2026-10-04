@@ -216,6 +216,15 @@ export interface EvidenceRecordedEvent {
   readonly status: string | null;
   /** `SETTLED` only. */
   readonly level: number | null;
+  /**
+   * `LEG` only (r7, WP-290 WP290-CX-R7-02): the leg's fill facts as the observation fixed them (`null` when it did
+   * not), so a restart compares every later read of the fill against them: its exact fee, the fee's asset, its
+   * liquidity role and its match time (ISO-8601). Every other record carries `null`.
+   */
+  readonly feeAmount: string | null;
+  readonly feeAssetId: string | null;
+  readonly role: "MAKER" | "TAKER" | null;
+  readonly matchedAt: string | null;
   readonly atMs: number;
 }
 
@@ -402,12 +411,18 @@ const KEYS: Readonly<Record<ReconciliationJournalInput["kind"], readonly string[
     "size",
     "status",
     "level",
+    "feeAmount",
+    "feeAssetId",
+    "role",
+    "matchedAt",
     "atMs",
   ],
 });
 
 /** A token id (`internal.token_id`): a canonical unsigned decimal integer string. */
 const TOKEN_ID = /^(?:0|[1-9][0-9]{0,199})$/u;
+/** An ISO-8601 instant with an offset (a trade leg's match time, as the coordinator's door reads it). */
+const INSTANT = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/u;
 
 /** The shape of an evidence record's fields (see {@link EvidenceRecordedEvent}); `undefined` when any is out of its domain. */
 function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | undefined {
@@ -424,6 +439,10 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
   const size = field(record, "size");
   const status = field(record, "status");
   const level = field(record, "level");
+  const feeAmount = field(record, "feeAmount");
+  const feeAssetId = field(record, "feeAssetId");
+  const role = field(record, "role");
+  const matchedAt = field(record, "matchedAt");
   if (!nullable(runId, isUuidV7) || typeof evidenceKind !== "string" || !(EVIDENCE_KINDS as readonly string[]).includes(evidenceKind)) return undefined;
   if (!isIdentifier(venueOrderId) || !nullable(venueTradeId, isIdentifier)) return undefined;
   if (typeof provenance !== "string" || !(EVIDENCE_PROVENANCES as readonly string[]).includes(provenance) || typeof source !== "string" || !CODE.test(source)) return undefined;
@@ -431,6 +450,10 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
   if (!nullable(price, isDecimal) || !nullable(originalSize, isDecimal) || !nullable(size, isDecimal) || !nullable(status, isIdentifier) || !nullable(level, isCount)) return undefined;
   // A leg names its trade; nothing else does. Only a settlement carries a level, and it names no trade.
   if ((evidenceKind === "LEG") !== (venueTradeId !== null) || (evidenceKind === "SETTLED") !== (level !== null)) return undefined;
+  // A leg's fill facts (r7): an exact fee, an id for its asset, a role, an instant; only a leg carries them.
+  if (!nullable(feeAmount, isDecimal) || !nullable(feeAssetId, isIdentifier) || !(role === null || role === "MAKER" || role === "TAKER")) return undefined;
+  if (!(matchedAt === null || (typeof matchedAt === "string" && INSTANT.test(matchedAt)))) return undefined;
+  if (evidenceKind !== "LEG" && (feeAmount !== null || feeAssetId !== null || role !== null || matchedAt !== null)) return undefined;
   return {
     kind: "EVIDENCE_RECORDED",
     runId,
@@ -446,6 +469,10 @@ function readEvidence(record: unknown, at: number): EvidenceRecordedEvent | unde
     size,
     status,
     level,
+    feeAmount,
+    feeAssetId,
+    role: role as "MAKER" | "TAKER" | null,
+    matchedAt: matchedAt as string | null,
     atMs: at,
   };
 }

@@ -478,7 +478,7 @@ function oracleOms(u: Universe, oms: OrderManager): ReconciledOms {
  * the coordinator, then the OMS (whose recovery issues requests to the
  * coordinator), then the binding (STARTUP).
  */
-export async function boot(u: Universe, plan: KillPlan | null = null): Promise<Process> {
+export async function boot(u: Universe, plan: KillPlan | null = null, options: { readonly openOms?: boolean } = {}): Promise<Process> {
   const inc = new Incarnation(plan);
   const opened = ReconciliationJournal.open({
     accountRef: ACCOUNT,
@@ -555,6 +555,17 @@ export async function boot(u: Universe, plan: KillPlan | null = null): Promise<P
     },
     policy: u.policy,
   });
+  // (r7) `openOms: false`: a process whose coordinator runs with no OMS bound yet (the composition opens it later).
+  const oms = options.openOms === false ? null : await openOms(u, inc, coordinator);
+  if (oms !== null) coordinator.bindOms(oracleOms(u, oms));
+  return { inc, coordinator, journal, oms };
+}
+
+/**
+ * Open an OMS over the universe's durable store for one incarnation (its port calls counted), with the coordinator
+ * as its reconciler. `null` when the incarnation died while opening.
+ */
+async function openOms(u: Universe, inc: Incarnation, coordinator: ReconciliationCoordinator): Promise<OrderManager | null> {
   const venue = u.world.venuePort(() => inc.alive);
   const store: OmsStore = {
     apply: (writes) => inc.call(`store.apply[${writes.map((write) => write.kind).join(",")}]`, () => u.store.apply(writes)),
@@ -601,8 +612,18 @@ export async function boot(u: Universe, plan: KillPlan | null = null): Promise<P
   } catch (error) {
     if (!(error instanceof Killed) && inc.alive) throw error;
   }
-  if (oms !== null) coordinator.bindOms(oracleOms(u, oms));
-  return { inc, coordinator, journal, oms };
+  return oms;
+}
+
+/**
+ * r7 (WP290-V7-STREAM-REFUSAL-DROPPED): the composition reopens a FAULTED OMS from its durable store and binds it to
+ * the SAME live coordinator (no process restart: the coordinator, its journal and its memory stay). Returns the
+ * process with its new OMS.
+ */
+export async function reopenOms(u: Universe, p: Process): Promise<Process> {
+  const oms = await openOms(u, p.inc, p.coordinator);
+  if (oms !== null) p.coordinator.bindOms(oracleOms(u, oms));
+  return { ...p, oms };
 }
 
 /** Log a read at the moment it starts (before the world answers). */
