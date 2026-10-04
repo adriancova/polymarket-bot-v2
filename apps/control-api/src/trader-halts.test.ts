@@ -170,19 +170,23 @@ describe("the door: a self-consistent fetch is classified, every scope counted",
 });
 
 describe("the door REFUSES a fetch it cannot trust — and the state is then UNKNOWN, never NONE_OPEN", () => {
+  const SCHEMA = "failed its schema";
   const cases: readonly { readonly label: string; readonly fetch: () => unknown; readonly says: string }[] = [
     { label: "not data at all", fetch: () => "nothing", says: "" },
     { label: "a fetch with a getter", fetch: () => Object.defineProperty({ rows: [] }, "counts", { get: () => [], enumerable: true }), says: "" },
     { label: "no counting row", fetch: () => ({ counts: [], rows: [] }), says: "" },
     { label: "two counting rows", fetch: () => ({ counts: [...traderHaltFetch([]).counts, ...traderHaltFetch([]).counts], rows: [] }), says: "" },
-    { label: "an extra column", fetch: () => traderHaltFetch([{ ...MARKET, surprise: "x" }]), says: "" },
-    { label: "a missing column", fetch: () => traderHaltFetch([Object.fromEntries(Object.entries(MARKET).filter(([key]) => key !== "detail"))]), says: "" },
-    { label: "a count as a number", fetch: () => ({ ...traderHaltFetch([]), counts: [{ total: 0, global: "0", market: "0", strategy_instance: "0" }] }), says: "" },
-    { label: "a negative count", fetch: () => traderHaltFetch([], { total: "-1" }), says: "" },
-    { label: "a count with a leading zero", fetch: () => traderHaltFetch([], { total: "01" }), says: "" },
-    { label: "a count beyond a safe integer", fetch: () => traderHaltFetch([], { total: "1234567890123456" }), says: "" },
-    { label: "more rows than the limit", fetch: () => traderHaltFetch(Array.from({ length: TRADER_HALT_LIST_LIMIT + 1 }, () => MARKET)), says: "" },
-    { label: "a detail over the column bound", fetch: () => traderHaltFetch([traderHaltRow({ detail: "x".repeat(4001) })]), says: "" },
+    { label: "an extra column", fetch: () => traderHaltFetch([{ ...MARKET, surprise: "x" }]), says: SCHEMA },
+    { label: "a missing column", fetch: () => traderHaltFetch([Object.fromEntries(Object.entries(MARKET).filter(([key]) => key !== "detail"))]), says: SCHEMA },
+    { label: "a count as a number", fetch: () => ({ ...traderHaltFetch([]), counts: [{ total: 0, global: "0", market: "0", strategy_instance: "0" }] }), says: SCHEMA },
+    { label: "a negative count", fetch: () => traderHaltFetch([], { total: "-1" }), says: SCHEMA },
+    { label: "a count with a leading zero", fetch: () => traderHaltFetch([], { total: "01" }), says: SCHEMA },
+    // …refused by the SCHEMA even where the rest of the fetch is consistent with it.
+    { label: "a consistent count with a leading zero", fetch: () => traderHaltFetch([MARKET], { total: "01", market: "01" }), says: SCHEMA },
+    { label: "a count beyond a safe integer", fetch: () => traderHaltFetch([], { total: "1234567890123456" }), says: SCHEMA },
+    // The bound holds at the SCHEMA, before any count is compared.
+    { label: "more rows than the limit", fetch: () => traderHaltFetch(Array.from({ length: TRADER_HALT_LIST_LIMIT + 1 }, () => MARKET)), says: SCHEMA },
+    { label: "a detail over the column bound", fetch: () => traderHaltFetch([traderHaltRow({ detail: "x".repeat(4001) })]), says: SCHEMA },
     { label: "scoped counts above the total", fetch: () => traderHaltFetch([MARKET], { total: "1", global: "1" }), says: "scoped rows" },
     { label: "rows listed but a zero count", fetch: () => traderHaltFetch([MARKET], { total: "0", market: "0" }), says: "listed 1 rows where its own count says 0" },
     { label: "a count with fewer rows listed than it says", fetch: () => traderHaltFetch([MARKET], { total: "2", market: "2" }), says: "listed 1 rows where its own count says 2" },
@@ -293,6 +297,19 @@ describe("the cache: four states, fail closed, nothing retained across a failed 
       source.set({ counts: [], rows: [] });
       expect((await cache.refresh()).state).toBe("UNKNOWN");
       expect(cache.readCounts()).toEqual({ OK: 1, REFUSED: 1, UNAVAILABLE: 1 });
+    }
+  });
+
+  it("a REFUSED read straight after an OPEN or a NONE_OPEN read is UNKNOWN — the earlier count is not kept", async () => {
+    for (const first of [traderHaltFetch([MARKET]), traderHaltFetch([])]) {
+      const source = new InMemoryTraderHaltSource(first);
+      const cache = new TraderHaltCache(source);
+      expect(["OPEN", "NONE_OPEN"]).toContain((await cache.refresh()).state);
+      source.set(traderHaltFetch([MARKET], { total: "0" }));
+      const view = await cache.refresh();
+      expect(view.state).toBe("UNKNOWN");
+      if (view.state === "UNKNOWN") expect(view.reason).toBe("REFUSED");
+      expect(traderHaltsDocument(cache)["openTotal"]).toBeNull();
     }
   });
 
