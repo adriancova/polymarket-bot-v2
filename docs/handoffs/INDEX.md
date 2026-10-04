@@ -132,3 +132,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-03 | [WP-310.md](WP-310.md) | `WP-310`: rate-limit budgets and matching-engine modes | WP | Complete (2026-10-03) | `fdf27ff` | 7 KB |
 | 2026-10-03 | [CKPT-1.md](CKPT-1.md) | `CKPT-1`: ADR-027, checkpoint on change plus a 60 s heartbeat | Round | Complete (2026-10-03) | `891ccdd` | 5 KB |
 | 2026-10-03 | [ADR033-REVIEW.md](ADR033-REVIEW.md) | `ADR033-REVIEW`: ADR-033 checked, corrected and accepted (the order heartbeat, C-12) | Round | Complete (2026-10-03) | `47575cf` | 3 KB |
+| 2026-10-04 | [TC-LOWS-1.md](TC-LOWS-1.md) | `TC-LOWS-1`: pin the open trading-core and trader LOWs | Round | Complete (2026-10-04) | `9033743` | 4 KB |
