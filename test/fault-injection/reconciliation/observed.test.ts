@@ -187,7 +187,7 @@ describe("WP-290 r4 (WP290-V4-BYID-SOURCE-UNPINNED): each observation source kee
    * is unsound (the trades read fails). Then a restart (the retained evidence is gone with its process), and every
    * other read lags: only what run 1 recorded names the order.
    */
-  async function retainedOnly(byIdInRun1: "found" | "failed"): Promise<{ r: Ready; again: Ready; attempt: string; x: string; reads: string[]; run1: string[] }> {
+  async function retainedOnly(byIdInRun1: "found" | "failed"): Promise<{ r: Ready; again: Ready; attempt: string; x: string; reads: string[]; run1: string[]; tradeId: string }> {
     const r = await ready();
     r.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
     const attempt = (await submitOne(r.oms)) as string;
@@ -220,23 +220,37 @@ describe("WP-290 r4 (WP290-V4-BYID-SOURCE-UNPINNED): each observation source kee
       return { ...read, positions: read.positions.filter((position) => position.tokenId !== YES) };
     };
     r.u.world.faults.readCollateral = (answer) => ({ ...(answer() as object), balance: before });
-    return { r, again, attempt, x, reads, run1 };
+    return { r, again, attempt, x, reads, run1, tradeId: trade?.venueTradeId as string };
   }
 
-  it("(BYID-SOURCE, found) an order seen ONLY by its by-id read in an unsound run, then a restart: read by id again, PRESENT, never ABSENT", async () => {
-    const { r, again, attempt, x, reads, run1 } = await retainedOnly("found");
+  it("(BYID-SOURCE, found) an order seen ONLY by its by-id read in an unsound run, then a restart: read by id again, never ABSENT; held while the trades read omits the stream's trade (r8), then PRESENT", async () => {
+    const { r, again, attempt, x, reads, run1, tradeId } = await retainedOnly("found");
     expect(run1).toContain(shown(x));
     expect(await reconcileRounds(again, 5)).toBe(false);
     expect(reads).toContain(x);
+    // r8 (WP290-CX-R8-01): the stream named the fill (kept by the coordinator, journaled) and no read has shown its
+    // trade, while the attempt could own its order: its identity is unanswered, so nothing is answered (never ABSENT).
+    expect(r.u.accepted.filter((answer) => answer.attemptId === attempt)).toEqual([]);
+    expect(unresolvedSubjects(again)).toContain(compositeKey("READ_CONFLICT", "trade", tradeId));
+    // The trades read catches up: PRESENT on the order run 1 recorded.
+    delete r.u.world.faults.listTrades;
+    expect(await reconcileRounds(again, 5)).toBe(false);
     expect(r.u.accepted.filter((answer) => answer.attemptId === attempt).map((answer) => [answer.verdict, answer.venueOrderId])).toEqual([["PRESENT", x]]);
     expect(oracle(again)).toEqual([]);
   });
 
-  it("(BYID-SOURCE, not shown) its by-id read FAILED in the unsound run: the id is kept as NAMED, read by id after the restart, PRESENT, never ABSENT", async () => {
-    const { r, again, attempt, x, reads, run1 } = await retainedOnly("failed");
+  it("(BYID-SOURCE, not shown) its by-id read FAILED in the unsound run: the id is kept as NAMED, read by id after the restart, never ABSENT; held while the trades read omits the stream's trade (r8), then PRESENT", async () => {
+    const { r, again, attempt, x, reads, run1, tradeId } = await retainedOnly("failed");
     expect(run1).toContain(named(x));
     expect(await reconcileRounds(again, 5)).toBe(false);
     expect(reads).toContain(x);
+    // r8 (WP290-CX-R8-01): the stream named the fill (kept by the coordinator, journaled) and no read has shown its
+    // trade, while the attempt could own its order: its identity is unanswered, so nothing is answered (never ABSENT).
+    expect(r.u.accepted.filter((answer) => answer.attemptId === attempt)).toEqual([]);
+    expect(unresolvedSubjects(again)).toContain(compositeKey("READ_CONFLICT", "trade", tradeId));
+    // The trades read catches up: PRESENT on the order run 1 recorded.
+    delete r.u.world.faults.listTrades;
+    expect(await reconcileRounds(again, 5)).toBe(false);
     expect(r.u.accepted.filter((answer) => answer.attemptId === attempt).map((answer) => [answer.verdict, answer.venueOrderId])).toEqual([["PRESENT", x]]);
     expect(oracle(again)).toEqual([]);
   });

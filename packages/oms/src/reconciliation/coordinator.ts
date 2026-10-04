@@ -47,14 +47,19 @@
  *    is rebuilt from the journal at every run, so a restart forgets nothing.
  *    Then the store's ONE query (`EvidenceStore.judge`) gives a verdict on
  *    every venue order and trade the run read, or has unsettled evidence of
- *    (and, r7, every trade a read ever SHOWED), against this run's other
- *    reads and ALL the evidence: CONSISTENT (the only view anything is
- *    answered, compared, classified or settled from), a CONFLICT (an
- *    observation below the high-water matched size, live after terminal, a
- *    settlement backwards, a shown order not found by id; r7: an order's
- *    fixed fact or a fill's economics shown with two values, a DURABLE
- *    contradiction; a shown trade a complete trades read omits while it is
- *    not accounted for under its own identity: the run is unsound and holds),
+ *    (and, r7 and r8, every trade the evidence holds, whether a read SHOWED
+ *    it or only the user stream NAMED it), against this run's other reads
+ *    and ALL the evidence: CONSISTENT (the only view anything is answered,
+ *    compared, classified or settled from), a CONFLICT (an observation below
+ *    the high-water matched size, live after terminal, a settlement
+ *    backwards, a shown order not found by id; r7: an order's fixed fact or
+ *    a fill's economics shown with two values, a DURABLE contradiction; r8: a
+ *    trade shown both CONFIRMED and FAILED, DURABLE too; a trade a complete
+ *    trades read omits while a hold names it or any of its legs is not
+ *    accounted for under its own identity (`#accounting`: a leg only the
+ *    stream named is never answered by a tracked order or by an order's
+ *    matched size), and a leg the stream named that a read of its trade does
+ *    not show: the run is unsound and holds),
  *    a GHOST (an unclaimed id only NAMED that its by-id
  *    read does not find: no signed-identity answer while it stands, and a
  *    releasable `ORDER_NOT_FOUND_BY_ID`), ACKNOWLEDGED (the same, released by
@@ -226,6 +231,7 @@ import {
   settledRecord,
   shownOrder,
   type EvidenceRecord,
+  type LegEvidence,
   type LegFacts,
   type EvidenceProblem,
   type OrderVerdict,
@@ -432,7 +438,7 @@ class RunState {
   /** The evidence store's verdict on each venue order and trade this run read (`#assembleOrderView`). */
   readonly verdicts = new Map<string, OrderVerdict>();
   readonly tradeVerdicts = new Map<string, TradeVerdict>();
-  /** Trades a read SHOWED that this run's complete trades read omits, judged a CONFLICT (r7, `#unattributedFromEvidence`). */
+  /** Trades the evidence holds that this run's complete trades read omits, judged a CONFLICT (r7, r8; `#unattributedFromEvidence` names their SHOWN legs). */
   readonly tradesMissing = new Set<string>();
   /** The journal's evidence was readable at the start of the run (otherwise the run concludes nothing). */
   evidenceReadable = true;
@@ -986,11 +992,11 @@ export class ReconciliationCoordinator {
     // identity, is a CONFLICT (WP290-CX-R7-03: a durable classification obligation for every observed trade).
     const tradesOk = reads.trades.kind === "OK";
     const tradesShown = new Map(reads.trades.kind === "OK" ? reads.trades.value.map((trade) => [trade.venueTradeId, trade]) : []);
-    const accounted = this.#accountedTrades(oms);
+    const accounting = this.#accounting(oms);
     const tradeIds = new Set<string>([...tradesShown.keys(), ...(tradesOk ? this.#evidence.tradeIds() : [])]);
     for (const tradeId of [...tradeIds].sort()) {
       const shown = tradesShown.get(tradeId);
-      const verdict = this.#evidence.judge({ trade: tradeId, reads: { tradesOk, shown, accounted: accounted(tradeId) } });
+      const verdict = this.#evidence.judge({ trade: tradeId, reads: { tradesOk, shown, held: accounting.held(tradeId), accounted: (leg) => accounting.leg(tradeId, leg) } });
       run.tradeVerdicts.set(tradeId, verdict);
       if (verdict.kind === "CONFLICT") {
         sound(false);
@@ -1073,22 +1079,38 @@ export class ReconciliationCoordinator {
   }
 
   /**
-   * Whether a trade's CLASSIFICATION OBLIGATION is discharged (r7, WP290-CX-R7-03), so that a complete trades read may
-   * omit it without a CONFLICT (history may age a classified trade out). It is, when no unresolved break names the
-   * trade (a hold about it is judged until a read shows it consistent) and every leg a read SHOWED is accounted for
-   * under the trade's own identity:
-   * - on a venue order the OMS tracks (an order or an attempt claims it): the OMS comparison judges that order in
-   *   every run it is read, by trade id (`ORDER_FILLS_AHEAD_OF_VENUE` while the OMS holds a fill the read does not
-   *   show; `ORDER_TRADES_INCOMPLETE` while the venue matched more than its trades show);
-   * - on a venue order an unresolved attempt could own (by the leg's token and side): that attempt's resolution
-   *   classifies it (tracked, then the OMS comparison; or unattributed), and the attempt holds the account meanwhile;
-   * - otherwise, by a `TRADE_UNATTRIBUTED` break for that trade and order, in any state (`#unattributedFromEvidence`).
-   * The journal unreadable: nothing is accounted for (fail closed).
+   * The CLASSIFICATION OBLIGATION of every trade identity the evidence holds (r7, WP290-CX-R7-03; r8, WP290-CX-R8-01),
+   * so that a complete trades read may omit the trade without a CONFLICT (history may age a classified trade out).
+   *
+   * HELD: an unresolved break that HOLDS names the trade (a read-problem class or `STATUS_UNRECOGNISED` keyed by the
+   * trade, or `SETTLEMENT_REVERSAL_OWED`: the subjects `subjects.ts` decodes as a trade): a hold about it is judged
+   * until a read shows it consistent. Its own
+   * `TRADE_UNATTRIBUTED` quarantine, released or not, does not hold it: that quarantine IS the trade's classification
+   * under its own identity (below), and it halts its market and blocks every resume until an operator releases it.
+   *
+   * A leg is ACCOUNTED FOR under the trade's own identity:
+   * - whatever its source, by a `TRADE_UNATTRIBUTED` break for that trade and order, in any state (recorded from the
+   *   evidence when no one can own the order: `#unattributedFromEvidence`, and an UNATTRIBUTED order's legs);
+   * - a leg a read SHOWED (r7), also when it is on a venue order the OMS tracks (an order or an attempt claims it: the
+   *   OMS comparison judges that order by trade id, and the leg's shares are in the order's high-water matched size,
+   *   so no other trade can stand in for it), or on one an unresolved attempt could own (by the leg's token and side:
+   *   that attempt's resolution classifies it, and the attempt holds the account meanwhile);
+   * - a leg only the user stream NAMED (r8): the OMS did not apply it, so it holds no fill under that identity, and its
+   *   shares may be unknown (a settlement without its fill, as WP-280 projects every maker leg). A claimed order, or an
+   *   order's matched size that other trades cover, never answers it: only a read showing the trade does. Also
+   *   accounted for: a leg on a venue order no read ever SHOWED and no tracked order claims (its by-id read decides:
+   *   not found, it is a GHOST, whose `ORDER_NOT_FOUND_BY_ID` quarantine covers the trades named on it and withholds
+   *   every signed-identity answer; found, the order is SHOWN, and the leg is judged by the next clause), and a leg on a
+   *   SHOWN, unclaimed venue order no unresolved attempt could own (by the order's token and side): it is unmatched
+   *   activity, recorded `TRADE_UNATTRIBUTED` from the evidence by every sound run that classifies the order
+   *   (`ORDER_UNATTRIBUTED`). A leg on an order an attempt could own is NOT: an answer in the same run could claim the
+   *   order after the trade was judged, with nothing left to stand for the leg.
+   * The journal unreadable: every trade is held and nothing is accounted for (fail closed).
    */
-  #accountedTrades(oms: ReconciledOms): (tradeId: string) => boolean {
+  #accounting(oms: ReconciledOms): { readonly held: (tradeId: string) => boolean; readonly leg: (tradeId: string, leg: LegEvidence) => boolean } {
     const breaks = this.#allBreaks();
     const unresolved = this.#unresolvedBreaks();
-    if (breaks === undefined || unresolved === undefined) return () => false;
+    if (breaks === undefined || unresolved === undefined) return { held: () => true, leg: () => false };
     const unattributed = new Set(breaks.filter((view) => view.breakClass === "TRADE_UNATTRIBUTED").map((view) => view.subjectKey));
     const held = new Set<string>();
     for (const view of unresolved) {
@@ -1097,12 +1119,16 @@ export class ReconciliationCoordinator {
     }
     const claimed = claimedVenueIds(oms.orders(), oms.attempts());
     const owners = this.#potentialOwners(oms);
-    return (tradeId) => {
-      if (held.has(tradeId)) return false;
-      const legs = (this.#evidence.trade(tradeId)?.legs ?? []).filter((leg) => leg.shown);
-      return legs.every(
-        (leg) => claimed.has(leg.venueOrderId) || ownable(owners, leg) || unattributed.has(compositeKey("TRADE_UNATTRIBUTED", tradeId, leg.venueOrderId)),
-      );
+    return {
+      held: (tradeId) => held.has(tradeId),
+      leg: (tradeId, leg) => {
+        if (unattributed.has(compositeKey("TRADE_UNATTRIBUTED", tradeId, leg.venueOrderId))) return true;
+        if (leg.shown) return claimed.has(leg.venueOrderId) || ownable(owners, leg);
+        if (claimed.has(leg.venueOrderId)) return false;
+        const order = this.#evidence.order(leg.venueOrderId);
+        if (order?.shown !== true) return true;
+        return !ownable(owners, { tokenId: leg.tokenId ?? order.tokenId, side: leg.side ?? order.side });
+      },
     };
   }
 

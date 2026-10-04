@@ -21,7 +21,8 @@
  * (token, side, price, original size: r7), the HIGH-WATER matched size (the most any order observation showed, and
  * at least the sum of every distinct trade's leg on it), whether any observation showed it TERMINAL, every status
  * seen. Per venue trade: its legs, each with EVERY value any observation showed of each of its fill facts (shares,
- * price, fee, fee asset, liquidity role, match time, token, side: r7), and the furthest settlement status seen. The
+ * price, fee, fee asset, liquidity role, match time, token, side: r7), the furthest settlement status seen, and EVERY
+ * terminal settlement status any observation showed (CONFIRMED, FAILED: r8). The
  * marks are MONOTONIC and move on validated evidence from ANY run: an unsound, stale or unusable run's observations
  * count as much as a sound run's (r6, WP290-CX-R6-01). What this rests on (a matched size never decreases, a terminal
  * order is never live again, a trade id is not replaced, an order's and a fill's facts never change for one id) is an
@@ -51,8 +52,17 @@
  *   then on, whatever a later read shows, so nothing is answered (no signed-identity resolution either), compared,
  *   delivered, resolved or resumed from it. Filling in a value no observation showed yet is not a contradiction;
  *   a value is compared by what it means (decimals by value, a match time as an instant: `sameInstantText`);
- * - (r7, WP290-CX-R7-03) a trade a read SHOWED that a complete trades read no longer shows, while it is not yet
- *   ACCOUNTED FOR under its own identity (the coordinator decides: `TradeReads.accounted`), is a CONFLICT;
+ * - (r7, WP290-CX-R7-03; r8, WP290-CX-R8-01) EVERY trade identity in the evidence carries a classification
+ *   obligation: a trade that a complete trades read does not show is a CONFLICT while an unresolved break names it
+ *   (`TradeReads.held`) or any of its legs is not ACCOUNTED FOR under the trade's own identity (the coordinator
+ *   decides, leg by leg: `TradeReads.accounted`). That includes a trade only the user stream NAMED (a fill or a
+ *   settlement the OMS did not apply): no read has shown it, so nothing else (a claimed order, an order's matched
+ *   size covered by other trades) answers it. A leg the stream named on a trade a read shows is a CONFLICT too
+ *   while the read does not show that leg and it is not accounted for;
+ * - (r8, WP290-CX-R8-02) a trade that observations showed both CONFIRMED and FAILED, from any source and any run
+ *   (a valid row of an unusable answer and an unapplied stream item included), is a DURABLE CONTRADICTION: both are
+ *   terminal (`states.ts`: either order is a conflict), so no later read ends it. Normal forward progress (MATCHED,
+ *   MINED, RETRYING, then one terminal status) never is;
  * - (r7) an order a trade names (any leg, its shares known or not) matched something: a read showing nothing
  *   matched is a CONFLICT.
  *
@@ -182,6 +192,11 @@ interface TradeEntry {
   /** The furthest settlement status seen (moved only by a legal forward transition). */
   status: VenueTradeStatus | null;
   statuses: string[];
+  /**
+   * (r8) Every TERMINAL settlement status any observation showed (CONFIRMED, FAILED), in the order first shown; kept
+   * apart from `statuses` (whose length is bounded) so a terminal status is never dropped. Both: a durable contradiction.
+   */
+  terminals: VenueTradeStatus[];
 }
 
 /** What the store knows of one venue order (frozen). */
@@ -223,6 +238,8 @@ export interface TradeEvidence {
   /** A read SHOWED it (a leg of a valid trades read, or one that validated in full inside an unusable answer). */
   readonly shown: boolean;
   readonly status: VenueTradeStatus | null;
+  /** (r8) Every terminal settlement status any observation showed: both CONFIRMED and FAILED is a durable contradiction. */
+  readonly terminals: readonly VenueTradeStatus[];
   readonly legs: readonly LegEvidence[];
 }
 
@@ -245,11 +262,17 @@ export interface TradeReads {
   /** The trade as that read showed it (`undefined`: not in the read). */
   readonly shown: VenueTradeView | undefined;
   /**
-   * (r7, WP290-CX-R7-03) The trade's classification obligation is discharged: every leg a read showed is accounted
-   * for under the trade's own identity, and no unresolved break names the trade (the coordinator decides). Only an
-   * accounted trade may be absent from a complete trades read without a CONFLICT.
+   * (r7) An unresolved break that holds names the trade (a read problem keyed by it, or `SETTLEMENT_REVERSAL_OWED`):
+   * a hold about it is judged until a read shows it consistent, so its absence from a complete read is a CONFLICT.
    */
-  readonly accounted: boolean;
+  readonly held: boolean;
+  /**
+   * (r7, WP290-CX-R7-03; r8, WP290-CX-R8-01) Whether one leg of the trade is ACCOUNTED FOR under the trade's own
+   * identity (the coordinator decides, from the journal and this run's reads). Only a trade whose every leg is
+   * accounted for, and that is not held, may be absent from a complete trades read without a CONFLICT; and only an
+   * accounted leg the user stream named may be absent from a read that shows its trade.
+   */
+  readonly accounted: (leg: LegEvidence) => boolean;
 }
 
 export interface EvidenceProblem {
@@ -312,7 +335,7 @@ function cloneOrders(orders: ReadonlyMap<string, OrderEntry>): Map<string, Order
 
 function cloneTrades(trades: ReadonlyMap<string, TradeEntry>): Map<string, TradeEntry> {
   return new Map(
-    [...trades].map(([id, trade]) => [id, { ...trade, statuses: [...trade.statuses], legs: new Map([...trade.legs].map(([order, leg]) => [order, { ...leg, facts: cloneFacts(leg.facts) }])) }]),
+    [...trades].map(([id, trade]) => [id, { ...trade, statuses: [...trade.statuses], terminals: [...trade.terminals], legs: new Map([...trade.legs].map(([order, leg]) => [order, { ...leg, facts: cloneFacts(leg.facts) }])) }]),
   );
 }
 
@@ -451,7 +474,7 @@ export class EvidenceStore {
     let informative = false;
     let trade = this.#trades.get(tradeId);
     if (trade === undefined) {
-      trade = { shown: false, legs: new Map(), status: null, statuses: [] };
+      trade = { shown: false, legs: new Map(), status: null, statuses: [], terminals: [] };
       this.#trades.set(tradeId, trade);
       informative = true;
     }
@@ -490,6 +513,12 @@ export class EvidenceStore {
     if (record.status !== null) {
       if (pushText(trade.statuses, record.status)) informative = true;
       const status = tradeStatusOf(record.status);
+      // (r8, WP290-CX-R8-02) Every terminal status, whatever came before it: a second one is a durable contradiction,
+      // so it is information (journaled, and folded again after a restart).
+      if (status !== null && TERMINAL_SETTLEMENTS.includes(status) && !trade.terminals.includes(status)) {
+        trade.terminals.push(status);
+        informative = true;
+      }
       if (status !== null && (trade.status === null || (status !== trade.status && isLegalSettlementTransition(trade.status, status)))) {
         trade.status = status;
         informative = true;
@@ -511,6 +540,7 @@ export class EvidenceStore {
       venueTradeId: id,
       shown: trade.shown,
       status: trade.status,
+      terminals: Object.freeze([...trade.terminals]),
       legs: Object.freeze(
         [...trade.legs].map(([venueOrderId, leg]) =>
           Object.freeze({
@@ -675,7 +705,9 @@ export class EvidenceStore {
   #judgeTrade(id: string, reads: TradeReads): TradeVerdict {
     if (!reads.tradesOk) return Object.freeze({ kind: "UNREAD" });
     const evidence = this.#trades.get(id);
+    const legs = this.trade(id)?.legs ?? [];
     const shown = reads.shown;
+    const status = shown === undefined ? null : tradeStatusOf(shown.status);
     const problems: EvidenceProblem[] = [];
     // A DURABLE CONTRADICTION (r7, WP290-CX-R7-02): a leg two observations showed with different fill facts (a
     // price and a fee that offset, at equal shares and equal net balances, included). Which is the venue's is
@@ -686,40 +718,61 @@ export class EvidenceStore {
         problems.push(problem("READ_CONFLICT", `trade ${id}: its leg on venue order ${orderId} was shown with different fill facts (${contradictions.join("; ")}): which is the venue's is unknown`));
       }
     }
+    // A DURABLE CONTRADICTION (r8, WP290-CX-R8-02): observations showed the trade both CONFIRMED and FAILED, from any
+    // source and any run (this read's status included; `states.ts`: either order is a conflict). Which is the venue's
+    // is unknown, so a later read repeating either one never ends it: nothing is answered, delivered, compared,
+    // resolved or resumed from it. Forward progress to ONE terminal status never is.
+    const terminals = new Set<VenueTradeStatus>(evidence?.terminals ?? []);
+    if (status !== null && TERMINAL_SETTLEMENTS.includes(status)) terminals.add(status);
+    if (terminals.has("CONFIRMED") && terminals.has("FAILED")) {
+      problems.push(
+        problem(
+          "READ_CONFLICT",
+          `trade ${id}: observations showed it both CONFIRMED and FAILED (both terminal: they contradict each other; statuses seen: ${[...new Set([...(evidence?.statuses ?? []), ...(shown === undefined ? [] : [shown.status])])].join(", ")}): which is the venue's is unknown, so nothing about it is concluded`,
+        ),
+      );
+    }
     if (shown === undefined) {
-      // (r7, WP290-CX-R7-03) A trade a read SHOWED that this COMPLETE trades read omits, while it is not accounted for
-      // under its own identity: the reads contradict each other (`listTrades` is every trade of the account), and
-      // nothing about the trade's order or holdings is concluded. Once accounted for (each shown leg classified under
-      // the trade's id, and no hold naming it), its absence is not judged: history may age a trade out.
-      if (evidence?.shown === true && !reads.accounted) {
+      // (r7, WP290-CX-R7-03; r8, WP290-CX-R8-01) A trade the evidence holds that this COMPLETE trades read omits,
+      // while a hold names it or any of its legs is not accounted for under the trade's own identity: the reads (or a
+      // read and the user stream) contradict each other (`listTrades` is every trade of the account), and nothing
+      // about the trade's orders or holdings is concluded. A trade only the stream NAMED is judged like one a read
+      // SHOWED: no read has answered its identity yet. Once accounted for (each leg classified under the trade's id,
+      // and no hold naming it), its absence is not judged: history may age a trade out.
+      if (evidence !== undefined && (reads.held || legs.some((leg) => !reads.accounted(leg)))) {
         problems.push(
           problem(
             "READ_CONFLICT",
-            `trade ${id}, which an earlier read showed, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`,
+            evidence.shown
+              ? `trade ${id}, which an earlier read showed, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`
+              : `trade ${id}, which the user stream named (a fill or settlement the OMS did not apply) and no read has shown, is missing from a complete trades read, and it is not accounted for under its own identity (every trade of the account is in that read)`,
           ),
         );
       }
       return problems.length > 0 ? Object.freeze({ kind: "CONFLICT", problems: Object.freeze(problems) }) : Object.freeze({ kind: "UNREAD" });
     }
-    const status = tradeStatusOf(shown.status);
     if (status === null) {
       problems.push(problem("STATUS_UNRECOGNISED", `trade ${id} has a status outside the documented vocabulary (C-3's MATCHED_NOT_BROADCASTED included)`));
     } else if (evidence?.status !== null && evidence?.status !== undefined && evidence.status !== status && !isLegalSettlementTransition(evidence.status, status)) {
-      // CONFIRMED against FAILED, either order, is a contradiction (`states.ts`); any other step back is out of order.
-      const contradiction = TERMINAL_SETTLEMENTS.includes(evidence.status) && TERMINAL_SETTLEMENTS.includes(status);
-      problems.push(
-        contradiction
-          ? problem("READ_CONFLICT", `trade ${id}: settlement ${status} read after an earlier read showed ${evidence.status} (both terminal: the reads contradict each other)`)
-          : problem("READ_REGRESSION", `trade ${id}: settlement ${status} read after ${evidence.status} (an out-of-order read)`),
-      );
+      // Any other step back is out of order (a later read may catch up). CONFIRMED against FAILED, either order, is the
+      // durable contradiction above: this read's status is among the terminal statuses judged there.
+      if (!(TERMINAL_SETTLEMENTS.includes(evidence.status) && TERMINAL_SETTLEMENTS.includes(status))) {
+        problems.push(problem("READ_REGRESSION", `trade ${id}: settlement ${status} read after ${evidence.status} (an out-of-order read)`));
+      }
     }
     if (shown.ownershipUndetermined) problems.push(problem("READ_INCOMPLETE", `trade ${id}: the read could not establish which legs are the account's`));
-    for (const [orderId, leg] of evidence?.legs ?? []) {
-      if (!leg.shown) continue;
+    for (const leg of legs) {
+      const orderId = leg.venueOrderId;
       const now = shown.ownLegs.find((candidate) => candidate.venueOrderId === orderId);
       if (now === undefined) {
-        problems.push(problem("READ_CONFLICT", `trade ${id}: its leg on venue order ${orderId}, which an earlier read showed, is missing from this read`));
-      } else if (leg.shares !== null && compareDecimal(now.shares, leg.shares) !== 0) {
+        if (leg.shown) {
+          problems.push(problem("READ_CONFLICT", `trade ${id}: its leg on venue order ${orderId}, which an earlier read showed, is missing from this read`));
+        } else if (!reads.accounted(leg)) {
+          // (r8, WP290-CX-R8-01) A leg only the user stream named, which this read of the trade does not show: its
+          // identity (trade and order) is not answered.
+          problems.push(problem("READ_CONFLICT", `trade ${id}: its leg on venue order ${orderId}, which the user stream named, is not in this read of the trade, and it is not accounted for under the trade's identity`));
+        }
+      } else if (leg.shown && leg.shares !== null && compareDecimal(now.shares, leg.shares) !== 0) {
         problems.push(problem("READ_CONFLICT", `trade ${id}: its leg on venue order ${orderId} shows ${now.shares} shares; an earlier read showed ${leg.shares}`, leg.shares, now.shares));
       }
     }

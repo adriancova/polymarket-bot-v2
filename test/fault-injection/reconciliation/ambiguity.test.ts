@@ -574,7 +574,7 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     expect(r.oms.alerts().filter((entry) => entry.kind === "SETTLEMENT_CONFLICT")).toHaveLength(1);
   });
 
-  it("(I-02, r6) the same after an earlier read showed the trade CONFIRMED (a restart included): the two reads contradict each other (READ_CONFLICT), nothing is written to the OMS, held until the read agrees", async () => {
+  it("(I-02, r6; r8) the same after an earlier read showed the trade CONFIRMED (a restart included): the two reads contradict each other (READ_CONFLICT), nothing is written to the OMS, held for good (a read agreeing again does not end it: WP290-CX-R8-02)", async () => {
     const r = await ready();
     await submitOne(r.oms);
     const trade = r.u.world.match(r.u.world.receipts.at(-1) as string, "0.4");
@@ -595,7 +595,11 @@ describe("WP-290 acceptance 1: what the OMS recorded durably is compared by iden
     expect(failed?.status).toBe("QUARANTINED");
     if (trade !== undefined) trade.status = "CONFIRMED";
     expect((await again.p.coordinator.releaseQuarantine({ breakId: failed?.breakId ?? "", operatorRef: "operator-1", reason: "the read was wrong" })).ok).toBe(true);
-    expect(await reconcileRounds(again, 3)).toBe(true);
+    // r8 (WP290-CX-R8-02): the reads showed the trade CONFIRMED and FAILED, both terminal; a read repeating the first
+    // does not say which is the venue's, so the contradiction is durable (it was cleared here before r8).
+    expect(await reconcileRounds(again, 3)).toBe(false);
+    expect(again.p.journal.unresolvedBreaks().find((view) => view.subjectKey === compositeKey("READ_CONFLICT", "trade", trade?.venueTradeId ?? "?"))?.detail).toContain("both CONFIRMED and FAILED");
+    expect(again.u.store.snapshotSync().settlements.map((settlement) => settlement.state)).toEqual(["CONFIRMED"]);
   });
 
   it("(I-03) after a restart, a FILLED order whose trade a complete trades read does not show: held, never resumed", async () => {

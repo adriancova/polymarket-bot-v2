@@ -110,8 +110,13 @@ not a fault.
      from them): a status outside the documented vocabulary in any read
      (`STATUS_UNRECOGNISED`); an observation showing less than an earlier
      one, from any run or source (less matched, live after terminal, a
-     settlement backwards: `READ_REGRESSION`; a terminal settlement against
-     another: `READ_CONFLICT`); the list and the by-id read disagreeing about
+     settlement backwards: `READ_REGRESSION`); (r8) a trade that any two
+     observations, from any run or source (a valid row of an unusable
+     answer and a stream item the OMS did not apply included), showed
+     CONFIRMED and FAILED (`READ_CONFLICT`, DURABLE: both are terminal, so a
+     later read repeating either one never ends it; MATCHED, MINED, RETRYING,
+     then ONE terminal status, is forward progress, never a contradiction);
+     the list and the by-id read disagreeing about
      a fixed fact, or about the status at the same stage (`READ_CONFLICT`;
      only "live, then terminal" is a step forward, since no order-status
      transition table is documented, C-6, C-14); trades summing to more than
@@ -122,8 +127,10 @@ not a fault.
      observations showed with different values (`READ_CONFLICT`, DURABLE: which
      value is the venue's is unknown, so no later read ends it; a value newly
      known, or the same value at another precision, is no contradiction); a
-     trade a read SHOWED that a complete trades read omits, while it is not
-     accounted for under its own identity (`READ_CONFLICT`: below);
+     trade a read SHOWED, or (r8) only the user stream NAMED, that a complete
+     trades read omits while it is not accounted for under its own identity,
+     and a leg the stream named that a read of its trade does not show
+     (`READ_CONFLICT`: below);
    - **a ghost**: an unclaimed order only NAMED that the by-id read of a
      sound run does not find. No earlier read is contradicted, so it is an
      `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), read by id
@@ -179,20 +186,45 @@ not a fault.
    A tracked order's token (its execution group's), side, price and size are
    its fixed facts; any difference is `ORDER_FACTS_MISMATCH`.
 
-   **Every trade a read showed carries a classification obligation (r7).** Each
-   run judges every trade its trades read shows AND every trade a read ever
-   showed. A shown trade the complete trades read omits is a `READ_CONFLICT`
-   (the run is unsound) unless it is accounted for under its own identity:
-   every leg a read showed is on an order the OMS tracks (the OMS comparison
-   judges it: `ORDER_FILLS_AHEAD_OF_VENUE`, `ORDER_TRADES_INCOMPLETE`), on an
-   order an unresolved attempt could own (that attempt's resolution
-   classifies it, and holds the account meanwhile), or has a
-   `TRADE_UNATTRIBUTED` break, and no unresolved break names the trade. When no
-   one can own a missing trade's order, the run records `TRADE_UNATTRIBUTED`
-   for each of its shown legs from the evidence, whatever the run's soundness,
-   so the operator sees the trade by its own id. The `READ_CONFLICT` itself
-   clears only when a read shows the trade again, consistent. A trade already
-   accounted for may later age out of the trades history without holding.
+   **Every trade identity carries a classification obligation (r7, r8).**
+   Each run judges every trade its trades read shows AND every trade the
+   evidence holds: one a read ever showed, and (r8) one only the user stream
+   named (a fill or a settlement the OMS did not apply; WP-280 projects a
+   settlement without its fill for every maker leg). A trade the complete
+   trades read omits is a `READ_CONFLICT` (the run is unsound) while an
+   unresolved HOLD names it (a read problem such as `READ_CONFLICT`, or
+   `SETTLEMENT_REVERSAL_OWED`, keyed by the trade) or any of its legs is not accounted for under the
+   trade's own identity. A leg is accounted for:
+   - whatever its source, by a `TRADE_UNATTRIBUTED` break for that trade and
+     order, in any state;
+   - a leg a read SHOWED, also when it is on an order the OMS tracks (the OMS
+     comparison judges it by trade id: `ORDER_FILLS_AHEAD_OF_VENUE`,
+     `ORDER_TRADES_INCOMPLETE`; its shares are in the order's high-water
+     matched size, so no other trade stands in for it) or on an order an
+     unresolved attempt could own (that attempt's resolution classifies it,
+     and holds the account meanwhile);
+   - a leg only the stream NAMED (r8): the OMS holds no fill under it, and its
+     shares may be unknown, so a tracked order, or an order's matched size
+     that other trades cover, never answers it: only a read showing the trade
+     does. It is accounted for only on an order no tracked order claims and
+     that either no read ever showed (its by-id read decides: not found, the
+     order's `ORDER_NOT_FOUND_BY_ID` quarantine covers the trades named on
+     it) or that no unresolved attempt could own (by the order's token and
+     side: the sound run that classifies the order `ORDER_UNATTRIBUTED`
+     records the trade `TRADE_UNATTRIBUTED` from the evidence). On an order an
+     attempt could own it is NOT: an answer in the same run could claim the
+     order, with nothing left to stand for the trade.
+   A leg the stream named that a read of its trade does not show is a
+   `READ_CONFLICT` too, while it is not accounted for. When no one can own a
+   missing trade's order, the run records `TRADE_UNATTRIBUTED` for each of its
+   shown legs from the evidence, whatever the run's soundness, so the operator
+   sees the trade by its own id. The `READ_CONFLICT` itself clears only when a
+   read shows the trade again, consistent. A trade already accounted for may
+   later age out of the trades history without holding, and so may one whose
+   `TRADE_UNATTRIBUTED` quarantine is still awaiting its release: that
+   quarantine is the trade's classification under its own identity, it halts
+   its market, and it blocks every resume until an operator releases it (the
+   operator is not told separately that the history no longer shows it).
    An UNATTRIBUTED order's `TRADE_UNATTRIBUTED` breaks cover every trade the
    evidence holds on it, not only those the current read shows.
 4. Record each discrepancy as a break, and each answer.
@@ -493,6 +525,26 @@ returns at once, with no run.
   unattributed activity. The conflict clears only when a read shows the trade
   again (a lagging read catches up on its own); if the venue truly withdrew
   it, the account stays held (section 10).
+- **A `READ_CONFLICT` whose detail says "which the user stream named"** (r8)
+  names a trade (or one leg of it) that the user stream reported, that the
+  OMS could not apply (most often a settlement without its fill: WP-280
+  projects no fill for a maker leg), and that no read has shown yet, on an
+  order the OMS tracks or an unresolved attempt could own. It is usually a
+  lagging trades read, and clears on its own when the read shows the trade,
+  consistent (its missed fill is then delivered). It holds until then, even
+  when the order's matched size and the holdings already look consistent: a
+  snapshot from before that trade looks exactly like that. If the stream was
+  wrong (no such trade at the venue), the account stays held: no release
+  exists (section 10).
+- **A `READ_CONFLICT` whose detail says "both CONFIRMED and FAILED"** (r8)
+  means observations (reads, or a stream settlement the OMS did not apply)
+  showed one trade with both terminal settlements. It never clears: a read
+  repeating either one does not say which is the venue's. Nothing about the
+  trade or its order is answered, delivered or concluded. Establish the
+  trade's real outcome from the chain (its transaction hash); the account
+  stays held until the retraction ADR gives a path (section 10). A FAILED
+  trade of a tracked order also has its `SETTLEMENT_FAILED` quarantine:
+  releasing it does not end this conflict.
 
 ## 8. Configuration
 
@@ -575,7 +627,12 @@ nothing is judged or booked from it.
   (follow-up). So, since r7, does any ONE read that showed an order's fixed
   fact or a fill's economics with another value than an earlier observation
   (a transient adapter or venue error included), and a trade a read showed
-  that the trades history drops before it was accounted for.
+  that the trades history drops before it was accounted for. Since r8, so do
+  a trade the user stream named (a fill or settlement the OMS did not apply)
+  on an order the OMS tracks or an unresolved attempt could own, if no read
+  ever shows it (a stream that named a trade the venue does not have, or a
+  trades history that drops it first), and any ONE observation of a trade's
+  settlement as CONFIRMED against another as FAILED.
 - **What "evidence never goes down" assumes (unverified venue assumptions,
   held as a conservative policy).** No venue document states any of these;
   the code treats a read that disagrees as wrong (it holds), never as a
@@ -584,6 +641,12 @@ nothing is judged or booked from it.
     order is never live again;
   - a trade id, once shown, is not replaced by another for the same fill, and
     the trades read keeps every trade not yet accounted for;
+  - the user stream and the trades read name one trade by the same id, and
+    the trades read shows every trade the stream reported on the account's
+    own orders (the OMS de-duplicates fills across the two by that id too);
+  - a trade's settlement reaches at most one terminal status: CONFIRMED and
+    FAILED are both terminal (the OMS's own transition table, `states.ts`),
+    so a trade shown both ways is a wrong observation;
   - an order's token, side, price and original size, and a fill's shares,
     price, fee, fee asset, liquidity role and match time, never change for
     one id.

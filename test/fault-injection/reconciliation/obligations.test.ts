@@ -81,7 +81,7 @@ describe("WP-270: quiescence, requestId, signed identity", () => {
     expect([...r.u.violations, ...r.u.world.violations]).toEqual([]);
   });
 
-  it("a venue order id the stream named and the OMS retains is a candidate: found PRESENT, not ABSENT", async () => {
+  it("a venue order id the stream named and the OMS retains is a candidate: never ABSENT; held while the trades read omits the stream's trade (r8), then found PRESENT", async () => {
     const r = await ready();
     r.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
     await submitOne(r.oms);
@@ -94,6 +94,17 @@ describe("WP-270: quiescence, requestId, signed identity", () => {
     r.p.coordinator.onUserStreamOutput(streamTrade(r.u, trade?.venueTradeId ?? ""));
     await r.p.coordinator.settled();
     expect(r.oms.retainedEvidence().map((item) => item.kind)).toEqual(["FILL"]);
+    await reconcileRounds(r, 3);
+    // r8 (WP290-CX-R8-01): the stream named the trade and no read has shown it, while an attempt could own its order:
+    // its identity is unanswered, so nothing is answered from these reads (never ABSENT).
+    expect(r.u.accepted).toEqual([]);
+    expect(r.p.journal.unresolvedBreaks().some((view) => view.breakClass === "READ_CONFLICT" && view.subjectKey.includes(trade?.venueTradeId ?? "?"))).toBe(true);
+    // The trades read catches up, and the trade settles on chain (so the truth oracle sees no transit): the order is
+    // found, and the attempt is answered PRESENT.
+    delete r.u.world.faults.listTrades;
+    r.u.world.adjustPosition(YES, "1");
+    r.u.world.adjustCollateral("-0.5");
+    if (trade !== undefined) trade.status = "TRADE_STATUS_CONFIRMED";
     await reconcileRounds(r, 3);
     expect(r.u.accepted.map((answer) => answer.verdict)).toEqual(["PRESENT"]);
     expect(r.oms.alerts().filter((alert) => alert.haltMarket)).toEqual([]);

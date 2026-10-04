@@ -8,11 +8,14 @@
  * - venue activity: matches (settled or in transit), settlement steps, FAILED settlements, cancels, foreign orders
  *   (exact twins of the account's own, and others), unexplained holding changes;
  * - the user stream: an order's observation, a trade's fill (retained by the OMS while an attempt could own it), a
- *   phantom id, and a fill reported again with other economics (a repeated OMS halting alert);
+ *   phantom id, a fill reported again with other economics (a repeated OMS halting alert), and (r8) a trade's
+ *   settlement without its fill (WP-280's projection of a maker leg: the OMS refuses it while it holds no such fill);
  * - (r7) the OMS store refusing a stream fill's write WITHOUT a process kill (the OMS faults: a store failure, then
  *   `OMS_FAULTED`), after which the composition reopens the OMS from its store and binds it to the SAME coordinator;
  * - (r7) a by-id read showing another value of an observed order's fixed fact, and a trades read showing an
  *   observed fill with other economics (an offsetting price and fee);
+ * - (r8) a trades read showing a trade with the OTHER terminal settlement than one a read already showed it with
+ *   (CONFIRMED for FAILED, or the reverse);
  * - a ledger transaction with UNATTRIBUTED arrivals in two markets;
  * - every read source and answer shape: complete, partial, duplicated, sibling-malformed, by-id found, not found,
  *   thrown or regressing, trades complete, partial, malformed or lagging, positions and collateral failing;
@@ -367,7 +370,7 @@ class Sim {
       const id = `venue-phantom-${String(this.#phantoms)}`;
       this.steps.push(`STREAM(order ${id}, phantom)`);
       this.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: { venueOrderId: id, status: "LIVE" }, shortfalls: [] } });
-    } else if (roll < 0.5) {
+    } else if (roll < 0.45) {
       const order = this.pick(this.ownOrders());
       if (order === undefined) return;
       const full = compareDecimal(order.matched, order.original) === 0;
@@ -375,12 +378,27 @@ class Sim {
       this.saw(order.venueOrderId, "0");
       this.steps.push(`STREAM(order ${order.venueOrderId} ${status})`);
       this.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: { venueOrderId: order.venueOrderId, status }, shortfalls: [] } });
-    } else if (roll < 0.85) {
+    } else if (roll < 0.75) {
       const trade = this.pick(this.u.world.trades.filter((entry) => this.ownOrders().some((order) => order.venueOrderId === entry.venueOrderId)));
       if (trade === undefined) return;
       this.saw(trade.venueOrderId, trade.shares);
       this.steps.push(`STREAM(fill ${trade.venueTradeId})`);
       this.p.coordinator.onUserStreamOutput(streamTrade(this.u, trade.venueTradeId));
+    } else if (roll < 0.87) {
+      // r8 (WP290-CX-R8-01): a settlement without its fill, at the trade's true status (WP-280 projects no fill for a
+      // maker leg): the OMS applies it only against a fill it recorded, and refuses it otherwise.
+      const trade = this.pick(this.u.world.trades.filter((entry) => this.ownOrders().some((order) => order.venueOrderId === entry.venueOrderId)));
+      if (trade === undefined) return;
+      this.saw(trade.venueOrderId, "0");
+      this.steps.push(`STREAM(settlement ${trade.venueTradeId} ${trade.status})`);
+      this.p.coordinator.onUserStreamOutput({
+        kind: "TRADE",
+        oms: {
+          fills: [],
+          settlements: [{ venueTradeId: trade.venueTradeId, venueOrderId: trade.venueOrderId, status: trade.status, transactionHash: trade.transactionHash, observedAt: "2026-10-03T00:00:01Z" }],
+          shortfalls: [],
+        },
+      });
     } else {
       // A fill reported again with other economics: the OMS refuses it and raises a halting alert (repeated alerts).
       const trade = this.pick(this.u.world.trades);
@@ -441,7 +459,7 @@ class Sim {
     const chosen: string[] = [];
     const count = 1 + Math.floor(this.rand() * 2);
     for (let index = 0; index < count; index += 1) {
-      const roll = Math.floor(this.rand() * 16);
+      const roll = Math.floor(this.rand() * 17);
       const target = this.pick([...this.u.world.orders.values()]);
       const trade = this.pick(this.u.world.trades);
       switch (roll) {
@@ -589,6 +607,27 @@ class Sim {
             };
           };
           break;
+        case 15: {
+          // r8 (WP290-CX-R8-02): a trades read shows a trade with the other terminal settlement than one a read already
+          // showed it with (a lie the coordinator can detect: both terminal statuses are then in the evidence).
+          const shownTerminal = trade === undefined ? undefined : ["CONFIRMED", "FAILED"].find((status) => this.#factsSeen.has(`status:${trade.venueTradeId}:${status}`));
+          if (trade === undefined || shownTerminal === undefined) break;
+          const other = shownTerminal === "CONFIRMED" ? "FAILED" : "CONFIRMED";
+          chosen.push(`TRADES_TERMINAL(${trade.venueTradeId} ${other})`);
+          faults.listTrades = (answer) => {
+            const read = answer() as { trades: { venueTradeId: string }[] };
+            return {
+              ...read,
+              trades: read.trades.map((entry) => {
+                if (entry.venueTradeId !== trade.venueTradeId) return entry;
+                this.fire("TRADES_TERMINAL", false, trade.venueTradeId);
+                this.fire("TRADES_TERMINAL", false, trade.venueOrderId);
+                return { ...entry, status: other };
+              }),
+            };
+          };
+          break;
+        }
         default:
           // A clock fault at a random await of the run (a read or an OMS write).
           this.#clockArm = 1 + Math.floor(this.rand() * 12);
@@ -625,6 +664,9 @@ class Sim {
           for (const trade of read.trades as { venueTradeId?: unknown; ownLegs?: unknown }[]) {
             if (Array.isArray(trade.ownLegs)) for (const leg of trade.ownLegs as Record<string, unknown>[]) this.saw(leg["venueOrderId"], leg["shares"]);
             if (typeof trade.venueTradeId === "string") this.sawFacts(`trade:${trade.venueTradeId}`);
+            // r8: the terminal settlement a read showed (either spelling), so a TRADES_TERMINAL lie can contradict it.
+            const status = (trade as { status?: unknown }).status;
+            if (typeof trade.venueTradeId === "string" && typeof status === "string") this.sawFacts(`status:${trade.venueTradeId}:${status.replace(/^TRADE_STATUS_/u, "")}`);
           }
         }
         return read;
