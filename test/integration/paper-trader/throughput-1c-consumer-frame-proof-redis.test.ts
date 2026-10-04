@@ -63,7 +63,7 @@
 
 import { IsoTimestampSchema, type EventEnvelope } from "@polymarket-bot/domain";
 import { EventBusUnavailableError, RedisStreamsEventTransport, type EventSubscription } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -85,12 +85,13 @@ import {
   traderConfig,
 } from "./support/fixture.js";
 import { assembleOrThrow, type Run } from "./support/run.js";
+import { startReadyRedisContainer } from "./support/containers.js";
 
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 let redisUrl: string;
 
 beforeAll(async () => {
-  redis = await startRedisContainer();
+  redis = await startReadyRedisContainer();
   redisUrl = redis.getConnectionUrl();
   for (let attempt = 1; ; attempt += 1) {
     try {

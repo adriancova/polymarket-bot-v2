@@ -74,9 +74,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { createPostgresPool, migrateUp } from "@polymarket-bot/storage-postgres";
-import { createIsolatedDatabase, startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
+import { createIsolatedDatabase } from "@polymarket-bot/storage-postgres/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -87,6 +87,7 @@ import {
   withMarketOpened,
 } from "./support/throughput/fixture.js";
 import { runTraderThroughput, type ThroughputReport } from "./support/throughput/harness.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtures = path.resolve(here, "../../fixtures/trader-throughput");
@@ -132,13 +133,13 @@ const CADENCE_NORMALIZED_CHECKPOINTS = "f2692145057e79755fc42dfeec031f7c0139c5c1
 const CKPT1_CHECKPOINTS = 2;
 const CKPT1_NORMALIZED_CHECKPOINTS = "f31a2a92d44ddffd87247f1c4fba9cbbb56a597f3aefe07f461d9b1c1d245fb3";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 let redisUrl: string;
 let workRoot: string;
 
 beforeAll(async () => {
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
   redisUrl = redis.getConnectionUrl();
   // `TC-LOCAL-FLAKE`: prove the fresh Redis answers before the run starts.
   for (let attempt = 1; ; attempt += 1) {

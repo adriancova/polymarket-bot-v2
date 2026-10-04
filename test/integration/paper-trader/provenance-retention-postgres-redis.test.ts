@@ -61,7 +61,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startFreezableRedisProxy, startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { startFreezableRedisProxy, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import {
   NON_FILL_PIN_RETENTION_MS,
   postgresTraderEvidence,
@@ -80,7 +80,6 @@ import {
   readParquetObject,
 } from "@polymarket-bot/storage-parquet";
 import { manualClock } from "@polymarket-bot/storage-parquet/testing";
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import type { IngestedEvent } from "@polymarket-bot/trader";
 import { buildRawFrameRecord, nodeWalFileSystem, openWalWriter, type RawFrameRecord } from "@polymarket-bot/storage-wal";
 import { createManualClock } from "@polymarket-bot/storage-wal/testing";
@@ -100,6 +99,7 @@ import {
 } from "./support/fixture.js";
 import { rebaseSystemPaperClock } from "./support/host-clock.js";
 import { CONDITION_ID, documentFor, registerThroughTheRepositories, withFreshDatabase } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
 const HOUR = 60 * 60 * 1000;
 const MINUTE = 60 * 1000;
@@ -112,13 +112,13 @@ const GRACE_MS = 60 * 1000;
 const RESPONSIBLE_FROM_MS = OPEN_MS - 15 * MINUTE;
 const STRETCH_A_END_MS = Date.parse("2026-03-04T10:10:00.000Z");
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 /** ONE Redis for the file (each scenario has its own stream; an outage is a partition, never a stop). */
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  postgres = await startPostgresContainer();
-  redis = await startRedisContainer();
+  postgres = await startReadyPostgresContainer();
+  redis = await startReadyRedisContainer();
 }, 300_000);
 
 afterAll(async () => {

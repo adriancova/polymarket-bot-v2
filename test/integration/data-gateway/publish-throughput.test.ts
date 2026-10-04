@@ -41,7 +41,6 @@ import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 import {
   readRawStreamEntries,
   startFreezableRedisProxy,
-  startRedisContainer,
   uniqueStreamName,
 } from "@polymarket-bot/event-bus/testing";
 import type { FreezableRedisProxy, RawStreamEntry } from "@polymarket-bot/event-bus/testing";
@@ -53,6 +52,7 @@ import {
   restampEnvelopes,
   runPublishBench,
 } from "./bench/publish-bench.js";
+import { startReadyRedisContainer } from "./support/containers.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -69,7 +69,7 @@ const opened: RedisStreamsEventTransport[] = [];
 const proxies: FreezableRedisProxy[] = [];
 
 beforeAll(async () => {
-  const container = await startRedisContainer();
+  const container = await startReadyRedisContainer();
   redisUrl = container.getConnectionUrl();
   stopRedis = async () => {
     await container.stop();

@@ -158,11 +158,10 @@ import {
 } from "@polymarket-bot/event-bus";
 import {
   startFreezableRedisProxy,
-  startRedisContainer,
   uniqueStreamName,
   writeStoredCheckpoint,
 } from "@polymarket-bot/event-bus/testing";
-import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import type { TestContext } from "@polymarket-bot/storage-postgres/testing";
 import { canonicalJsonStringify } from "@polymarket-bot/strategy-runtime";
 import type { LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -178,11 +177,12 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 
 beforeAll(async () => {
-  postgres = await startPostgresContainer();
+  postgres = await startReadyPostgresContainer();
 }, 300_000);
 
 afterAll(async () => {
@@ -669,7 +669,7 @@ function haltTriples(run: ProcessRun): string[][] {
 
 describe("a Redis outage mid-run HALTS the durable trader within the stated bound (OUTAGE-1, BOOT1-R7)", () => {
   it("decides and fills, then — the container stopped — latches GLOBAL TRANSPORT_UNAVAILABLE and startup() exits 75 within the default bound, trading nothing and writing nothing after it", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     let stopped = false;
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-default", async ({ connectionString, context }) => {
@@ -776,7 +776,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
   }, 240_000);
 
   it("an IDLE stream for five bounds is not an outage; the container stopped, it halts within the CONFIGURED bound", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     let stopped = false;
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-idle", async ({ connectionString, context }) => {
@@ -861,7 +861,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
   }, 240_000);
 
   it("decides and fills, then — a PARTITION: the server silent, no socket closed (the docker-pause shape) — latches GLOBAL TRANSPORT_UNAVAILABLE and exits 75 within the configured bound", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-partition", async ({ connectionString, context }) => {
         const label = "outage-partition";
@@ -944,7 +944,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
 
 describe("Redis refusals at startup are documented refusals, not crashes (OUTAGE-1, B1-R1-REDIS-UNCAUGHT)", () => {
   it("a subscription the transport refuses (a stored position it did not write) is TRADER_EVENT_SUBSCRIPTION_REFUSED, exit 78, with everything it opened closed", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-subscribe", async ({ connectionString, context }) => {
         const label = "outage-subscribe";
