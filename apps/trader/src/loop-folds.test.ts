@@ -170,8 +170,9 @@ const STEP_MS = 100;
  * Each {@link tick} is ONE strategy step: the double's `onFeatures` books ten
  * fills. At the production cadence a market is evaluated at most once per
  * 1,000 ms of event time (ADR-026 D2.4), so there a tick after the first comes
- * 1,000 ms after the previous tick ({@link stepsApart} events; the events
- * between are not sent) and every tick is still one step. A test whose events
+ * 1,000 ms after the previous tick ({@link stepsApart} events), and every tick
+ * is still one step; the nine ticks between are sent, 100 ms apart, and each
+ * is coalesced (D5) — a harvest point that books nothing (D4). A test whose events
  * share an instant, or step backwards, coalesces at the production cadence
  * (D2.4, D2.8): it says so where its assertions differ, and why.
  */
@@ -602,12 +603,19 @@ async function open(harness: Harness): Promise<void> {
  * instant instead of its ordinal's.
  */
 async function tick(harness: Harness, at?: string): Promise<void> {
-  // `TC-LOWS-1` (O07): at the production cadence, 1,000 ms after the previous
-  // tick (ADR-026 D2.4), so that this tick is a strategy step too.
+  // `TC-LOWS-1` (O07): at the production cadence this tick comes 1,000 ms
+  // after the previous one (ADR-026 D2.4), so it is a strategy step too. The
+  // ticks between are SENT, 100 ms apart: each is coalesced — no evaluation,
+  // no fill (D5) — and still a harvest point (D4).
   if (at === undefined && harness.lastTick !== undefined) {
-    harness.ordinal = Math.max(harness.ordinal, harness.lastTick + stepsApart() - 1);
+    while (harness.ordinal < harness.lastTick + stepsApart() - 1) await yesTick(harness);
   }
   if (at === undefined) harness.lastTick = harness.ordinal + 1;
+  await yesTick(harness, at);
+}
+
+/** The deep YES snapshot {@link tick} sends. */
+async function yesTick(harness: Harness, at?: string): Promise<void> {
   await feed(harness, (n) =>
     envelope(
       n,
@@ -693,6 +701,11 @@ describeAtEachCadence("FOLD-1: held equals rebuilt over a long synthetic run (NO
       }
       const health = harness.loop.health();
       expect(health.halts).toEqual([]);
+      // `TC-LOWS-1` (O07): the regime each cadence ran — every tick a step at
+      // the per-frame cadence; at the production one nine coalesced ticks
+      // between two steps (ADR-026 D2.4, D5), each booking nothing.
+      const steps = health.seams.folds.fillsPosted / 10;
+      expect(health.loop.evaluationsCoalesced).toBe(cadence.production ? 9 * (steps - 1) : 0);
       expect(health.seams.folds).toMatchObject({
         checkEveryFills: 1,
         pnlCheck: false,

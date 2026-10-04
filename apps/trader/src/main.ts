@@ -116,9 +116,13 @@
  * (`HALT RECORD NOT DURABLE` / `UNCONFIRMED`) and the process still exits
  * {@link EXIT_CODES.halted}. The write's own connection is destroyed at the
  * bound (`PostgresTraderStore.recordHalts`; `PROVENANCE-1` r1), so the
- * PostgreSQL close that follows does not wait on it. Nothing trades after the
- * halt either way; the record is for the operator and the research worker
- * afterwards.
+ * PostgreSQL close that follows does not wait on it. A connection the pool is
+ * still OPENING at the bound is not the write's yet, and is not destroyed
+ * then: the pool's own connection timeout (`createPostgresPool`, 10,000 ms by
+ * default) ends it, and the PostgreSQL close waits for that (`PROV1-R2-L3`,
+ * measured: `startup()` returned 12,005 ms after the halt). Nothing trades
+ * after the halt either way; the record is for the operator and the research
+ * worker afterwards.
  *
  * ## The process exit (`TC-LOWS-1`, `PROV1-R2-L2`)
  *

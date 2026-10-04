@@ -641,6 +641,12 @@ describeAtEachCadence("a deterministic long synthetic run (NOT a soak — §16.7
       const health = loop.health();
       expect(placed).toBeGreaterThanOrEqual(TARGET_ORDERS);
       expect(health.halts).toEqual([]);
+      // `TC-LOWS-1` (O07): the regime each cadence ran — every tick a step at
+      // the per-frame cadence (nothing coalesced), and at the production one
+      // nine ticks in ten coalesced (ADR-026 D2.4, D5).
+      const steps = harness.evaluations.filter((entry) => entry.input.callback === "onFeatures").length;
+      expect(health.loop.evaluationsCoalesced).toBe(cadence.production ? ticks - steps : 0);
+      if (cadence.production) expect(ticks).toBeGreaterThan(9 * steps);
       // Both cycle kinds really ran: fills were booked, and resting orders were cancelled.
       const states = new Set(harness.venue.ordersSnapshot().map((order) => order.state));
       expect(states).toEqual(new Set(["FILLED", "CANCELLED"]));
@@ -961,6 +967,14 @@ describeAtEachCadence("SIM-2: the venue holds LIVE orders plus bounded, counted 
       // booked EVERY fill the venue produced, though the venue kept only 16.
       const health = harness.loop.health();
       expect(health.halts).toEqual([]);
+      // `TC-LOWS-1` (O07): the regime each cadence ran — nothing coalesced at
+      // the per-frame cadence; at the production one most events are coalesced
+      // (ADR-026 D2.4, D5) and every per-event check above held at them too.
+      if (cadence.production) {
+        expect(health.loop.evaluationsCoalesced).toBeGreaterThan(perEvent.length / 2);
+      } else {
+        expect(health.loop.evaluationsCoalesced).toBe(0);
+      }
       expect(health.execution.fillsObserved).toBe(retention.fills.nextSequence);
       expect(health.execution.duplicateFillsRefused).toBe(0);
       expect(health.seams.orders).toMatchObject({ tracked: retention.live.orders, unownedFills: 0, settleMismatches: 0 });
@@ -1007,8 +1021,14 @@ describeAtEachCadence("SIM-2: the venue holds LIVE orders plus bounded, counted 
     for (const entry of updates) expect(entry.input.orders.map((view) => view.orderId)).toEqual(expected);
     // The next evaluation (the cancel step) reads ctx.orders() in the same order.
     // `TC-LOWS-1` (O07): at the production cadence it is the first event
-    // 1,000 ms after this one (ADR-026 D2.4); the events between are not sent.
-    ordinal += stepsApart();
+    // 1,000 ms after this one; the nine ticks between are coalesced (ADR-026
+    // D2.4) and evaluate no onFeatures (D5).
+    for (let between = 1; between < stepsApart(); between += 1) {
+      ordinal += 1;
+      await feed(harness, tick(ordinal), ordinal);
+      expect(harness.evaluations.filter((entry) => entry.event === ordinal && entry.input.callback === "onFeatures")).toEqual([]);
+    }
+    ordinal += 1;
     await feed(harness, tick(ordinal), ordinal);
     const next = harness.evaluations.find((entry) => entry.event === ordinal && entry.input.callback === "onFeatures");
     expect(next?.input.orders.map((view) => view.orderId)).toEqual(expected);
@@ -1104,8 +1124,15 @@ describeAtEachCadence("SIM-2: the venue holds LIVE orders plus bounded, counted 
     expect(harness.loop.retainedOrderState().owners).toBe(10);
     // Step 1: ONE cancel plan names all ten; the venue cancels them in one call.
     // `TC-LOWS-1` (O07): at the production cadence step 1 is the first event
-    // 1,000 ms after step 0 (ADR-026 D2.4); the events between are not sent.
-    ordinal += stepsApart();
+    // 1,000 ms after step 0; the nine ticks between are coalesced (ADR-026
+    // D2.4): no onFeatures, so no cancel, and the ten slices still rest.
+    for (let between = 1; between < stepsApart(); between += 1) {
+      ordinal += 1;
+      await feed(harness, tick(ordinal), ordinal);
+      expect(harness.evaluations.filter((entry) => entry.event === ordinal && entry.input.callback === "onFeatures")).toEqual([]);
+      expect(harness.venue.retention().live.orders).toBe(10);
+    }
+    ordinal += 1;
     await feed(harness, tick(ordinal), ordinal);
     const health = harness.loop.health();
     expect(health.halts).toEqual([]);
