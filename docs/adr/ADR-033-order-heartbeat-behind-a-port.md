@@ -21,9 +21,9 @@
   venue round: the guide and the API reference disagree (Context 3).
 - **Code cited:** `main` at `85b81e5`. `WP-290`'s coordinator is cited on
   the `wp-290` branch at `1dc6672`, not yet merged. Each cited behavior
-  still holds at `ba150f5` and at `6ed3fbe`, the branch tip when r2 was
-  written.
-- **Revision:** r1 and r2, 2026-10-03 (`ADR033-REVIEW`), before acceptance.
+  still holds at `ba150f5` and at `6ed3fbe`, the branch tip when r2 and r3
+  were written.
+- **Revision:** r1 to r3, 2026-10-03 (`ADR033-REVIEW`), before acceptance.
   - Text corrected or qualified. The old text, on `main` at `85b81e5`:
     - Status: "closing list item 2";
     - Context 2, now 3: "The request is an L2-signed
@@ -41,8 +41,9 @@
     - Evidence: "`docs/handoffs/WP-280.md`: the signer gate refuses outside
       live modes".
   - Rules changed:
-    - D1's gate drops "the kill switch is not engaged", and an unknown
-      result fails it. D1 gains the kill-switch scope rule, the explicit
+    - D1's gate drops "the kill switch is not engaged" and "the run mode
+      is live (D4)"; D4's factory checks the mode once. An unknown result
+      fails the gate. D1 gains the kill-switch scope rule, the explicit
       stops, the abandoned `400` retry, and ADR-008 §4's id persistence and
       alert.
     - D2's contract becomes provisional. D2 gains where its tests run.
@@ -54,9 +55,11 @@
     - D6 gains the clock, the lapse record, the entry block, the startup
       lapse and the lapse end. Since r2, the lapse end raises the trigger
       again 5 s after the confirmation. The block waits for a run that
-      started at least that late.
+      started at least that late. Since r3, step 3 states when a run takes
+      its triggers, and step 4 makes the composition call `reconcile()`.
     - Consequences gain D6's tests. Since r2, they run against the real
-      `OrderManager` and `ReconciliationCoordinator`.
+      `OrderManager` and `ReconciliationCoordinator`. Since r3, they include
+      a lift without the periodic timer.
 
 ## Context
 
@@ -273,25 +276,40 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
      it;
   3. raises `POSITION_BALANCE_DISCREPANCY` through
      `ReconciliationCoordinator.trigger`, at the confirmation and again 5 s
-     after it. Each trigger pauses new submissions. A run that started
-     before a trigger then cannot resume the OMS. The pending trigger stops
-     it. If the trigger arrives while that run writes its result, the moved
-     hold epoch stops it instead;
+     after it. Each trigger pauses new submissions. A run takes the pending
+     triggers after ADR-032 D5's retry cadence and before its reads. It may
+     take a trigger received after its recorded start and still resume. A
+     trigger raised after the run takes its triggers, but before it resumes,
+     prevents that resumption. The pending-trigger check stops it. If the
+     trigger arrives while the run writes its completion, the changed hold
+     epoch stops it instead. Steps 4–5 decide when the entry block lifts;
   4. keeps the entry block latched until a run that started at least 5 s
      after the confirmation completes, passes and resumes the OMS (§9.17
      step 8).
-     - The wait covers the venue's sweep. A venue timeout during the lapse
-       fell no later than the confirming heartbeat's receipt, and so before
-       the confirmation. S-D17: "cancellation may occur up to five seconds
-       after the timeout" (ADR-008's timeout plus check interval). Like the
-       10 s, that figure is documentary only.
+     - The wait covers the venue's sweep. On D6's reading of the 10 s, a
+       valid heartbeat received before the venue's deadline resets it. So
+       any timeout during the lapse fell no later than the confirming
+       heartbeat's receipt, which precedes the confirmation. S-D17 says
+       "cancellation may occur up to five seconds after the timeout"
+       (ADR-008: timeout plus check interval). So the sweep has run by 5 s
+       after the confirmation. Like the 10 s, that figure is documentary
+       only.
      - Such a run reads every open tracked order that has a venue order id,
        by id when the open-orders list omits it. It compares the order with
        that read, or answers the order's outstanding request with it. So it
        sees any cancel made during the lapse or by that sweep.
      - Every run of a `reconcile()` call made at least 5 s after the
        confirmation qualifies. A run that started earlier never counts, even
-       when its report arrives later;
+       when its report arrives later.
+     - The composition makes those calls. The coordinator owns no timer,
+       and a trigger only queues a run. So, from 5 s after the confirmation,
+       the composition calls `reconcile()`. It keeps calling until a
+       qualifying run passes and resumes the OMS, or a new lapse voids the
+       recovery. A call made while another is in progress runs nothing
+       (`NOT_RUN`). The composition then waits for the call in progress to
+       end, and calls again, even if no trigger is pending. A pass from a
+       call made earlier never ends the calls. After a qualifying run that
+       fails, the composition may space its calls;
   5. lifts the block only if the heartbeat has not lapsed again by then. A
      new lapse voids the recovery, and its own end starts another.
 - **No new trigger.** §9.17 gains none. "Submission unknown" is not used:
@@ -330,6 +348,10 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
     entry block;
   - a venue cancel within 5 s after the confirmation. The block stays
     latched until a run that sees it;
+  - a `reconcile()` call made just before 5 s after the confirmation, whose
+    rerun takes the second trigger and resumes the OMS. No trigger is then
+    pending. The composition calls again, and the block lifts without the
+    periodic timer;
   - a success that arrives 10 s or more after its port call. The lapse
     does not end;
   - a new lapse between the confirmation and the passing run. The block
@@ -369,10 +391,14 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
   respects at `ba150f5` and `6ed3fbe`):
   - an OMS `ORDER_STATE` request triggers `POSITION_BALANCE_DISCREPANCY`,
     and every trigger pauses new submissions;
-  - `trigger`. A pending trigger stops a run from resuming
-    (`#workArrivedDuring`). So does any hold while the run records its
-    result (the hold epoch);
-  - `reconcile`, and its reads and comparison of every open tracked order
-    with a venue order id (`#readAll`, `#compareOrdersAndTrades`);
+  - the file's header: "this layer-1 class owns no timer";
+  - `trigger`, which holds and queues a run but starts none. A pending
+    trigger stops a run from resuming (`#workArrivedDuring`). So does any
+    hold while the run records its result (the hold epoch);
+  - `#runOnce`, which reads its start time before `#retryCadence`, then
+    takes the pending triggers (`#takeTriggers`) before `#readAll`;
+  - `reconcile`, which runs nothing (`NOT_RUN`) while a run is in progress,
+    and its reads and comparison of every open tracked order with a venue
+    order id (`#readAll`, `#compareOrdersAndTrades`);
   - the test "(I-10, X4) a trigger raised during the reads" in
     `test/fault-injection/reconciliation/resume.test.ts`.
