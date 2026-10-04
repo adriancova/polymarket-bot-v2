@@ -1,10 +1,14 @@
 # ADR-033: The order heartbeat goes behind a port; the user rules its transport before live
 
-- **Status:** **Proposed, 2026-10-03, by the orchestrator.** The venue report
-  assigns C-12 / E-17 to "the orchestrator, by ADR, before `WP-320`"
-  (`docs/venue/verified-2026-09-30.md` §16, carried-forward item 2). Once
-  accepted, D1–D4 and D6 settle what `WP-320` builds. D5, the transport,
-  stays open. The user rules it before any run mode above PAPER.
+- **Status:** **Accepted for D1–D4 and D6, 2026-10-03, by the orchestrator.**
+  The venue report assigns C-12 / E-17 to "the orchestrator, by ADR, before
+  `WP-320`" (`docs/venue/verified-2026-09-30.md` §16, carried-forward item 2).
+  Proposed the same day; revised r1 to r3 by `ADR033-REVIEW`, with a joint
+  ACCEPT from Opus and gpt-6-astra at r4, merged as `47575cf`. D1–D4 and D6 settle
+  what `WP-320` builds. **D5, the transport, stays open**, and its
+  recommendation is not a ruling: the user rules it before any run mode above
+  PAPER. Three LOWs from r4 (R4-W1, R4-L1, R4-L2) go to the next revision or
+  `WP-320`'s packet.
 - **Date:** 2026-10-03
 - **Recorded by:** the orchestrator, after `WP-310`.
 - **Implemented by:** `WP-320` (D1–D4, D6), not yet. D5 is not implemented.
