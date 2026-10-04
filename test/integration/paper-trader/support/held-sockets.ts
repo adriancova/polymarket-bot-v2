@@ -89,6 +89,14 @@ export async function tcpSocketsHeldBy(pid: number): Promise<readonly HeldTcpSoc
 export interface HeldSocketsSample {
   readonly at: number;
   readonly sockets: readonly HeldTcpSocket[];
+  /**
+   * Milliseconds from this reading to the sampler's NEXT attempt (the one
+   * that found the process gone, or the end of the sampling). For a failure
+   * message only (`TC-LOWS-1` r2, `TCL1-R2-03`): about `everyMs` plus one
+   * read while the sampling process keeps up, so a gap far beyond that says
+   * the SAMPLING process stalled, not the process it reads.
+   */
+  readonly nextAttemptAfterMs: number;
 }
 
 /**
@@ -106,15 +114,21 @@ export async function lastHeldSocketsBefore(
     settled = true;
   };
   until.then(settle, settle);
-  let last: HeldSocketsSample | undefined;
+  let last: { readonly at: number; readonly sockets: readonly HeldTcpSocket[] } | undefined;
+  let nextAttemptAfterMs: number | undefined;
   while (!settled) {
     // `at` is when the descriptors were listed: the process was alive then.
     // A socket table read after it exited lists no inode of it (an orphaned
     // socket reads inode 0), so a late read can only under-report.
     const at = Date.now();
+    if (last !== undefined && nextAttemptAfterMs === undefined) nextAttemptAfterMs = at - last.at;
     const sockets = await tcpSocketsHeldBy(pid);
-    if (sockets !== undefined) last = { at, sockets };
+    if (sockets !== undefined) {
+      last = { at, sockets };
+      nextAttemptAfterMs = undefined;
+    }
     await new Promise((resolve) => setTimeout(resolve, everyMs));
   }
-  return last;
+  if (last === undefined) return undefined;
+  return { ...last, nextAttemptAfterMs: nextAttemptAfterMs ?? Date.now() - last.at };
 }

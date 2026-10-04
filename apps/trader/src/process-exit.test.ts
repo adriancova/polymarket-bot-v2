@@ -20,7 +20,9 @@
  *    runs; a process nothing holds exits at once, with no forced line; and a
  *    process whose log consumer has stalled, with far more than a pipe's
  *    worth of lines queued, delivers EVERY line — the halt lines included —
- *    before it exits.
+ *    before it exits. The forced line explains the hold from what Node names
+ *    (`TC-LOWS-1` r2, `TCL1-R2-01`): the socket in the first case, the log
+ *    still behind in the last — never a socket that is not there.
  *
  * The shipped bundle against a frozen PostgreSQL is
  * `test/integration/paper-trader/process-exit-frozen-postgres-redis.test.ts`.
@@ -129,14 +131,45 @@ describe("exitAfterStartup, through its ports", () => {
     expect(calls.filter((call) => call.startsWith("exit("))).toEqual(["exit(75)"]);
   });
 
-  it("the forced line says what happened, why, that nothing was in flight, and the code", () => {
+  it("the forced line says what happened, why, that nothing was in flight, and the code — only what was true when it was WRITTEN: no 'ago', no 'now' (TCL1-R2-01)", () => {
     expect(forcedExitLine(75, 1_000, ["TCPSocketWrap"])).toBe(
-      "PROCESS EXIT FORCED: startup() returned 75 1000 ms ago, and the process is still held open by " +
+      "PROCESS EXIT FORCED: startup() returned 75, and 1000 ms later the process was still held open by " +
         "1 × TCPSocketWrap: typically a socket whose peer never answers its close (a frozen or partitioned " +
         "PostgreSQL leaves the pool's ended idle connections half-closed). Nothing is in flight: every durable " +
         "write, and the halt record, was final — acknowledged, refused or reported UNCONFIRMED above — when " +
-        "startup() returned. Exiting 75 now",
+        "startup() returned. The process exits 75 once this line has reached the log",
     );
+  });
+
+  it("a process held only by its own log, still behind (a pending write beside the stdio pipes), is NOT blamed on a socket (TCL1-R2-01)", () => {
+    // What Node 24 lists for a stderr pipe whose consumer has stalled (measured).
+    const line = forcedExitLine(75, 1_000, ["SimpleWriteWrap", "PipeWrap", "PipeWrap"]);
+    expect(line).toBe(
+      "PROCESS EXIT FORCED: startup() returned 75, and 1000 ms later the process was still held open by " +
+        "2 × PipeWrap, 1 × SimpleWriteWrap: a write its reader had not yet taken (SimpleWriteWrap): typically " +
+        "this log, still behind on the lines above. Nothing is in flight: every durable write, and the halt " +
+        "record, was final — acknowledged, refused or reported UNCONFIRMED above — when startup() returned. " +
+        "The process exits 75 once this line has reached the log",
+    );
+    expect(line).not.toContain("socket");
+  });
+
+  it("a socket AND a log still behind: the line names both (TCL1-R2-01)", () => {
+    const line = forcedExitLine(75, 1_000, ["TCPSocketWrap", "PipeWrap", "WriteWrap", "SimpleWriteWrap"]);
+    expect(line).toContain(
+      "still held open by 1 × PipeWrap, 1 × SimpleWriteWrap, 1 × TCPSocketWrap, 1 × WriteWrap: typically a socket " +
+        "whose peer never answers its close (a frozen or partitioned PostgreSQL leaves the pool's ended idle " +
+        "connections half-closed); and a write its reader had not yet taken (SimpleWriteWrap, WriteWrap): " +
+        "typically this log, still behind on the lines above. Nothing is in flight",
+    );
+  });
+
+  it("no pending write: the socket explanation stands, whatever else is named — the stdio pipes and a timer included (TCL1-R2-01)", () => {
+    for (const holders of [["PipeWrap", "PipeWrap", "TCPSocketWrap", "TCPSocketWrap", "Timeout"], ["PipeWrap", "Timeout"], []]) {
+      const line = forcedExitLine(75, 1_000, holders);
+      expect(line).toContain(": typically a socket whose peer never answers its close (");
+      expect(line).not.toContain("a write its reader had not yet taken");
+    }
   });
 });
 
@@ -342,11 +375,14 @@ describe("a real process: a half-closed socket whose peer never answers", () => 
     expect(run.outcome, run.stderr).toBe("STILL RUNNING");
   }, 20_000);
 
-  it("the fix: the same process exits 75 within the bound, saying why — the line names the socket that held it", async () => {
+  it("the fix: the same process exits 75 within the bound, saying why — the line names the socket that held it, and blames it (TCL1-R2-01)", async () => {
     const run = await runChild(childScript({ bounded: true, frozenPeerPort: peer.port }), 10_000);
     expect(run.outcome, run.stderr).toBe(75);
-    expect(run.stderr).toContain("PROCESS EXIT FORCED: startup() returned 75 1000 ms ago");
+    expect(run.stderr).toContain("PROCESS EXIT FORCED: startup() returned 75, and 1000 ms later the process was still held open by ");
     expect(run.stderr).toMatch(/still held open by [^:]*TCPSocketWrap/u);
+    // TCL1-R2-01: the log kept up here, so the hold is the socket's alone.
+    expect(run.stderr).toMatch(/still held open by [^:]*: typically a socket whose peer never answers its close \(/u);
+    expect(run.stderr).not.toContain("a write its reader had not yet taken");
     expect(run.afterStartupMs).toBeGreaterThanOrEqual(PROCESS_EXIT_GRACE_MS - 50);
     expect(run.afterStartupMs).toBeLessThanOrEqual(BOUND_MS + MARGIN_MS);
   }, 20_000);
@@ -474,7 +510,7 @@ async function runWithStalledLog(): Promise<StalledLogRun> {
 }
 
 describe("a real process whose log consumer has stalled: the exit never cuts the log short (TC-LOWS-1 r1, TCL1-R1-01)", () => {
-  it("128 KiB and more still queued at the return, the consumer stalled 3 s: EVERY line arrives, in order — the halt lines and the forced line last — and the process exits 75 only once the consumer has taken them", async () => {
+  it("128 KiB and more still queued at the return, the consumer stalled 3 s: EVERY line arrives, in order — the halt lines and the forced line last, blaming the log and not a socket (TCL1-R2-01) — and the process exits 75 only once the consumer has taken them", async () => {
     const run = await runWithStalledLog();
     // The premise: far more than a pipe's worth was still queued in the
     // process when startup() returned.
@@ -485,7 +521,13 @@ describe("a real process whose log consumer has stalled: the exit never cuts the
     const expected = [...Array.from({ length: FILLER_LINES }, (_unused, index) => fillerLine(index)), ...HALT_LINES];
     expect(run.lines.slice(0, expected.length)).toEqual(expected);
     expect(run.lines).toHaveLength(expected.length + 1);
-    expect(run.lines.at(-1)).toMatch(/^PROCESS EXIT FORCED: startup\(\) returned 75 1000 ms ago, and the process is still held open by /u);
+    expect(run.lines.at(-1)).toMatch(/^PROCESS EXIT FORCED: startup\(\) returned 75, and 1000 ms later the process was still held open by /u);
+    // TCL1-R2-01: only the log held this process — a write its reader had
+    // not taken, as Node names it — and the line says so, not "a socket".
+    expect(run.lines.at(-1)).toMatch(
+      /still held open by [^:]*SimpleWriteWrap[^:]*: a write its reader had not yet taken \([^)]*SimpleWriteWrap[^)]*\): typically this log, still behind on the lines above\. /u,
+    );
+    expect(run.lines.at(-1)).not.toContain("socket");
     // The exit waited for the log: not before the consumer resumed.
     expect(run.exitAfterReturnMs).toBeGreaterThanOrEqual(run.resumedAfterReturnMs);
   }, 30_000);

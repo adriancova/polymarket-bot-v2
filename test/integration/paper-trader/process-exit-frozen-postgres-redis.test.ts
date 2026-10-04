@@ -341,21 +341,39 @@ describe("the shipped process exits within a bound once startup() has returned (
         expect(health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
         expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "TRANSPORT_UNAVAILABLE"]]);
         const forced = lineAt(run, "PROCESS EXIT FORCED: ");
-        expect(forced.line).toContain(`startup() returned ${String(EXIT_CODES.halted)} ${String(PROCESS_EXIT_GRACE_MS)} ms ago`);
+        expect(forced.line).toContain(
+          `startup() returned ${String(EXIT_CODES.halted)}, and ${String(PROCESS_EXIT_GRACE_MS)} ms later the process was still held open by `,
+        );
         expect(forced.line).toMatch(/still held open by [^:]*TCPSocketWrap/u);
+        // `TCL1-R2-01`: this log keeps up, so the hold is blamed on the sockets alone.
+        expect(forced.line).toMatch(/still held open by [^:]*: typically a socket whose peer never answers its close \(/u);
+        expect(forced.line).not.toContain("a write its reader had not yet taken");
         console.log(`[TC-LOWS-1 measured] ${forced.line.slice(0, 170)}…`);
         // `TCL1-R1-03`: one of those sockets is PostgreSQL's — the pool's
         // ended idle connection, half-closed (`FIN_WAIT2`) against the frozen
         // hop. The reading is the last one before the exit, and was taken less
         // than the grace before it: after `startup()` returned (the exit was
         // forced, so it came at least the grace after the return).
+        //
+        // NO MARGIN on this bound (`TCL1-R2-03`), unlike every other bound in
+        // this file: it is the proof, not a timing allowance. A reading more
+        // than the grace before the exit could predate the return, so a
+        // margin would let a reading of the sockets BEFORE the store's close
+        // pass. A stall of this test process just before the exit can fail it
+        // falsely, never pass it falsely; the message says which it was.
         const held = await heldAtExit;
         const postgresHopPort = Number(new URL(postgresHop.url).port);
         console.log(
-          `[TC-LOWS-1 measured] the process's TCP sockets ${held === undefined ? "were never read" : `${String(exited.at - held.at)} ms before its exit: ${JSON.stringify(held.sockets)}`} (PostgreSQL hop port ${String(postgresHopPort)})`,
+          `[TC-LOWS-1 measured] the process's TCP sockets ${held === undefined ? "were never read" : `${String(exited.at - held.at)} ms before its exit (the sampler's next attempt +${String(held.nextAttemptAfterMs)} ms): ${JSON.stringify(held.sockets)}`} (PostgreSQL hop port ${String(postgresHopPort)})`,
         );
         if (held === undefined) throw new Error("the process's socket table was never read while it ran");
-        expect(exited.at - held.at).toBeLessThan(PROCESS_EXIT_GRACE_MS);
+        expect(
+          exited.at - held.at,
+          `the last reading of the process's sockets came ${String(exited.at - held.at)} ms before its exit was seen here, ` +
+            `and the sampler's next attempt ${String(held.nextAttemptAfterMs)} ms after that reading. The sampler looks every ` +
+            "20 ms until the exit is seen, so this fails only when THIS test process stalls, not the trader; the two " +
+            "figures show where the stall fell (TCL1-R2-03)",
+        ).toBeLessThan(PROCESS_EXIT_GRACE_MS);
         expect(
           held.sockets.filter((socket) => socket.remotePort === postgresHopPort).map((socket) => socket.state),
           "a connection to the frozen PostgreSQL, half-closed by the process and never answered",

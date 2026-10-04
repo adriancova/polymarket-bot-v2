@@ -25,9 +25,10 @@
  *   code — the timer never fires (an unreferenced timer holds nothing), and
  *   every line already written is flushed by Node as it always was;
  * - if something still holds it when the timer fires, one line says so
- *   (`PROCESS EXIT FORCED: …`, naming what holds it), and the process exits
- *   with the SAME code from that line's own write callback — and from
- *   nowhere else.
+ *   (`PROCESS EXIT FORCED: …`, naming what holds it, and explaining the hold
+ *   from those names: a half-closed socket, or a log still behind —
+ *   `TC-LOWS-1` r2, `TCL1-R2-01`), and the process exits with the SAME code
+ *   from that line's own write callback — and from nowhere else.
  *
  * ## The log is never cut short (`TC-LOWS-1` r1, `TCL1-R1-01`)
  *
@@ -187,15 +188,43 @@ export function exitAfterStartup(code: number, ports: ProcessExitPorts): void {
   });
 }
 
-/** The forced exit's one log line. Exported for its test. */
+/**
+ * The forced exit's one log line. Exported for its test.
+ *
+ * It states only what was true when it was WRITTEN, at the grace's expiry:
+ * the line can reach the log later, behind lines a slow log has not yet
+ * taken, so it neither dates itself ("ago") nor says "now". And it explains
+ * the hold from the holders it names (`TC-LOWS-1` r2, `TCL1-R2-01`): a write
+ * still pending — the log itself, behind — is not blamed on a socket.
+ */
 export function forcedExitLine(code: number, graceMs: number, holders: readonly string[]): string {
   return (
-    `PROCESS EXIT FORCED: startup() returned ${String(code)} ${String(graceMs)} ms ago, and the process is ` +
-    `still held open by ${describeHolders(holders)}: typically a socket whose peer never answers its close ` +
-    "(a frozen or partitioned PostgreSQL leaves the pool's ended idle connections half-closed). Nothing is " +
-    "in flight: every durable write, and the halt record, was final — acknowledged, refused or reported " +
-    `UNCONFIRMED above — when startup() returned. Exiting ${String(code)} now`
+    `PROCESS EXIT FORCED: startup() returned ${String(code)}, and ${String(graceMs)} ms later the process was ` +
+    `still held open by ${describeHolders(holders)}: ${likelyHold(holders)}. Nothing is in flight: every ` +
+    "durable write, and the halt record, was final — acknowledged, refused or reported UNCONFIRMED above — " +
+    `when startup() returned. The process exits ${String(code)} once this line has reached the log`
   );
+}
+
+/**
+ * Node's names (`process.getActiveResourcesInfo`) for a stream write that its
+ * reader has not yet taken. Measured on Node 24: a stderr pipe whose consumer
+ * has stalled reads `SimpleWriteWrap` (beside the stdio `PipeWrap`s, which a
+ * piped process always lists, held or not).
+ */
+const PENDING_WRITE_HOLDERS: ReadonlySet<string> = new Set(["SimpleWriteWrap", "WriteWrap"]);
+/** Node's name for a TCP connection's handle (a half-closed one included). */
+const TCP_SOCKET_HOLDER = "TCPSocketWrap";
+
+/** What most likely holds the process, judged from the holders' names. */
+function likelyHold(holders: readonly string[]): string {
+  const socket =
+    "typically a socket whose peer never answers its close (a frozen or partitioned PostgreSQL leaves the " +
+    "pool's ended idle connections half-closed)";
+  const pending = [...new Set(holders.filter((holder) => PENDING_WRITE_HOLDERS.has(holder)))].sort();
+  if (pending.length === 0) return socket;
+  const write = `a write its reader had not yet taken (${pending.join(", ")}): typically this log, still behind on the lines above`;
+  return holders.includes(TCP_SOCKET_HOLDER) ? `${socket}; and ${write}` : write;
 }
 
 /** `["TCPSocketWrap", "TCPSocketWrap", "Timeout"]` → `2 × TCPSocketWrap, 1 × Timeout`. */
