@@ -22,6 +22,7 @@
  * 5. pump                                ← §8.1's outer loop
  * 5b. checkAccountingRebuild("SHUTDOWN") ← FOLD-1: §6 invariant 8's rebuild, run once the pump stops
  * 5c. recordHaltsBeforeExit(...)         ← PROVENANCE-1: every latched halt to ops.incidents, bounded
+ * 6. exitAfterStartup(code, ...)          ← TC-LOWS-1: the process exits with that code, bounded
  * ```
  *
  * Step 1 runs on the ENVIRONMENT RECORD before a configuration file is opened,
@@ -115,9 +116,29 @@
  * (`HALT RECORD NOT DURABLE` / `UNCONFIRMED`) and the process still exits
  * {@link EXIT_CODES.halted}. The write's own connection is destroyed at the
  * bound (`PostgresTraderStore.recordHalts`; `PROVENANCE-1` r1), so the
- * PostgreSQL close that follows does not wait on it. Nothing trades after the
- * halt either way; the record is for the operator and the research worker
- * afterwards.
+ * PostgreSQL close that follows does not wait on it. A connection the pool is
+ * still OPENING at the bound is not the write's yet, and is not destroyed
+ * then: the pool's own connection timeout (`createPostgresPool`, 10,000 ms by
+ * default) ends it, and the PostgreSQL close waits for that (`PROV1-R2-L3`,
+ * measured: `startup()` returned 12,005 ms after the halt). Nothing trades
+ * after the halt either way; the record is for the operator and the research
+ * worker afterwards.
+ *
+ * ## The process exit (`TC-LOWS-1`, `PROV1-R2-L2`)
+ *
+ * `startup()` returning is not the process exiting. On a frozen PostgreSQL
+ * the pool's close leaves its ended idle connections half-closed, and a
+ * socket whose peer never answers kept the process alive after `startup()`
+ * had returned 75. The process shell below now hands the code to
+ * `exitAfterStartup` (`process-exit.ts`): the process exits on its own when
+ * nothing holds it, and otherwise logs `PROCESS EXIT FORCED: …` and exits
+ * with the same code `PROCESS_EXIT_GRACE_MS` (1,000 ms) after `startup()`
+ * returned — from that line's own write callback, so never ahead of a line
+ * already logged: the `HALT …` and `HALT RECORD …` lines reach the log first,
+ * and a log that is not taking lines holds the exit until it does
+ * (`TC-LOWS-1` r1, `TCL1-R1-01`). It runs only once every durable outcome is
+ * final, so no acknowledged write and no halt record is lost by it (the
+ * reasoning is in that module's header).
  *
  * ## The evaluation cadence (`CADENCE-1`, ADR-026)
  *
@@ -170,7 +191,7 @@ import {
   RedisStreamsEventTransport,
   type EventSubscription,
 } from "@polymarket-bot/event-bus";
-import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
+import { DEFAULT_CONNECTION_TIMEOUT_MS, createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
 import { PostgresTraderStore } from "./adapters/postgres-store.js";
@@ -184,6 +205,7 @@ import {
   type RunningTraderHealthServer,
 } from "./health-server.js";
 import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
+import { PROCESS_EXIT_GRACE_MS, exitAfterStartup, processExitPorts } from "./process-exit.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
@@ -299,8 +321,13 @@ export async function startup(ports: StartupPorts): Promise<number> {
       "outage latches a GLOBAL TRANSPORT_UNAVAILABLE halt within that bound of the first command it " +
       `leaves unanswered, and the process exits ${String(EXIT_CODES.halted)} at most ` +
       `${String(2 * responseTimeoutMs)} ms after the halt (one bound for each connection's courtesy ` +
-      `QUIT) plus the durable halt record (at most ${String(HALT_RECORD_DEADLINE_MS)} ms; a connection ` +
-      "that has not answered by then is destroyed) and the PostgreSQL close (§4.2)",
+      "QUIT) plus the durable halt record, the PostgreSQL close and " +
+      `${String(PROCESS_EXIT_GRACE_MS)} ms for the process to exit. The record answers within ` +
+      `${String(HALT_RECORD_DEADLINE_MS)} ms: at that bound it reports UNCONFIRMED and destroys the ` +
+      "connection it holds; a connection the pool is still opening then is ended only by the pool's " +
+      `${String(DEFAULT_CONNECTION_TIMEOUT_MS)} ms connection timeout, which the PostgreSQL close waits ` +
+      "for. A process that a silent peer still holds open once that grace has passed is exited by " +
+      "force, as soon as every line it logged has reached the log (§4.2)",
   );
 
   // --- 3. infrastructure ----------------------------------------------------
@@ -849,12 +876,17 @@ export class SystemPaperClock implements Clock {
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url.endsWith("/main.mjs");
 if (invokedDirectly) {
-  process.exitCode = await startup({
+  const code = await startup({
     env: process.env,
     readConfig: async (path) => await readFile(path, "utf8"),
     log: (line) => {
       process.stderr.write(`${line}\n`);
     },
   });
+  // `TC-LOWS-1` (`PROV1-R2-L2`): the process EXITS with that code within a
+  // bound, even when a peer that never answers holds a socket open, and never
+  // ahead of a line already logged (`process-exit.ts`; see "The process exit"
+  // above). `process` is handed over here, the one file that touches it.
+  exitAfterStartup(code, processExitPorts(process));
 }
 /* c8 ignore stop */
