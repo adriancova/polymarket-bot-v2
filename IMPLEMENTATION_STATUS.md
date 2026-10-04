@@ -59,6 +59,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `TC-LOWS-1` is Complete (2026-10-04, `9033743`); see [Work packages](#work-packages). It closes `CO2N1-LOWS`, and trims `CADENCE1-LOWS` and `PROV1-LOWS`.
 - `GOV-NOTES-1` is Complete (2026-10-04, `1f99fcc`); see [Work packages](#work-packages).
 - `CONTROL-2` is Complete (2026-10-04, `2f84ad7`); see [Work packages](#work-packages). It closes `H1R1-HALT-INVISIBLE` and `CONTROL1B-LOWS` R5-L1 to R5-L3, under grants S1 and S2 (the record has them).
+- **`FLAKES-1`**: Ready (authorized) 2026-10-04, a residual round, tests only. It makes four known load flakes deterministic: `FLAKE-CANONICAL-ORDER` (plus the `boundary-surface` and `machine-closure` timeouts), the data-gateway "TWICE pace" throughput test, and `TC-LOCAL-FLAKE`. Nothing a test proves may be weakened. Verifier: gpt-6-astra.
 - `CADENCE-1` is Complete (2026-10-03, `8d7086a`): ADR-026. On the H1 burst, catch-up throughput rose from 874 to 8,440 events/s, and paced max lag fell from 8.56 s to 0.07 s. See [Work packages](#work-packages); its grants are recorded in `docs/handoffs/CADENCE-1.md`.
 - `APPROX-REPLAY-1` is Complete (2026-10-03, `86830d9`); see [Work packages](#work-packages).
 - `WALCAP-1` is Complete (2026-10-03, `da559ca`); see [Work packages](#work-packages).
