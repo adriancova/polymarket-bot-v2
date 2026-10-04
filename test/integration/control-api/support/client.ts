@@ -12,16 +12,19 @@
 import { request as httpRequest } from "node:http";
 
 import {
+  AbsentTraderHaltSource,
   ControlApi,
   ControlPlane,
   InMemoryTraderHealthSource,
   OperatorRegistry,
   SafetyReservedAuditSink,
+  TraderHaltCache,
   TraderHealthCache,
   createBudgetedAuditLog,
   startControlHttpServer,
   type ControlHttpTimeouts,
   type RunningControlHttpServer,
+  type TraderHaltSource,
 } from "@polymarket-bot/control-api";
 import { ScriptedEnvironment } from "@polymarket-bot/control-api/testing";
 import { InMemoryControlAuditLog, type ControlAuditSink } from "@polymarket-bot/observability";
@@ -43,6 +46,8 @@ export interface ServedApi {
   readonly controlPlane: ControlPlane;
   readonly healthSource: InMemoryTraderHealthSource;
   readonly health: TraderHealthCache;
+  /** `CONTROL-2`: the trader halt cache the API reads. */
+  readonly traderHalts: TraderHaltCache;
   readonly server: RunningControlHttpServer;
   call(
     method: string,
@@ -81,6 +86,11 @@ export interface ServeOptions {
   readonly auditInner?: (log: InMemoryControlAuditLog) => ControlAuditSink;
   /** `CONTROL-1b`: the control plane's append bound. Absent: its default. */
   readonly auditAppendTimeoutMs?: number;
+  /**
+   * `CONTROL-2`: the trader halt source. Absent: an `AbsentTraderHaltSource`,
+   * as `main.ts` composes today (`NOT_CONFIGURED`).
+   */
+  readonly traderHaltSource?: TraderHaltSource;
 }
 
 /**
@@ -110,6 +120,7 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
   });
   const healthSource = new InMemoryTraderHealthSource();
   const health = new TraderHealthCache(healthSource);
+  const traderHalts = new TraderHaltCache(options.traderHaltSource ?? new AbsentTraderHaltSource());
   const api = new ControlApi({
     operators: new OperatorRegistry([...(options.operators ?? [])]),
     controlPlane,
@@ -117,6 +128,7 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
     environment,
     auditCapacity: options.auditCapacity ?? 64,
     auditSize: () => audit.size,
+    traderHalts,
   });
 
   const server = await startControlHttpServer({
@@ -135,6 +147,7 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
     controlPlane,
     healthSource,
     health,
+    traderHalts,
     server,
     call: (method, path, callOptions = {}) =>
       call(url, method, path, callOptions),

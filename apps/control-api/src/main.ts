@@ -58,6 +58,22 @@ import {
   REPOSITORY_MAXIMUM_RUN_MODE,
   checkControlApiSafety,
 } from "./safety.js";
+import { AbsentTraderHaltSource, TraderHaltCache } from "./trader-halts.js";
+
+/**
+ * Why the shipped process reads no `ops.incidents` (`CONTROL-2`, disclosed).
+ *
+ * `trader-halts.ts` and `adapters/postgres-trader-halts.ts` read the open
+ * trader halts through the API, and the opt-in PostgreSQL suite proves it end
+ * to end. Composing that source HERE needs a PostgreSQL client in the shipped
+ * bundle, which acceptance 3's authoritative shipped-artifact check refuses
+ * today (its exact third-party list and its builtin-only externals); widening
+ * that check is a decision `CONTROL-2` stopped on rather than took. Until it is
+ * made, the state is `NOT_CONFIGURED` — never "no halts".
+ */
+export const TRADER_HALTS_NOT_COMPOSED =
+  "this process holds no PostgreSQL client, so it reads no open TRADER_HALT rows from ops.incidents; " +
+  "read them there directly (status not RESOLVED)";
 
 /** What the process exits with, so an operator can script against it. */
 export const EXIT_CODES = Object.freeze({
@@ -205,6 +221,8 @@ export async function startup(
   // wiring with a sink that answers late.
   const controlPlane = composeControlPlane(sink, environment);
   const health = new TraderHealthCache(healthSourceFor(config));
+  // `CONTROL-2`: stated, never defaulted — see `TRADER_HALTS_NOT_COMPOSED`.
+  const traderHalts = new TraderHaltCache(new AbsentTraderHaltSource(TRADER_HALTS_NOT_COMPOSED));
 
   const api = new ControlApi({
     operators: new OperatorRegistry(
@@ -221,8 +239,11 @@ export async function startup(
     auditSize: () => audit.size,
     // `TRDR-3`: an `http` source is READ — on every authorized health/metrics
     // request (`api.ts`, "Refresh-on-read"). A `none` source has nothing to
-    // read and its surface stays byte-identical to `WP-240`'s.
+    // read, so its trader-health lines are `WP-240`'s.
     refreshHealthOnRead: config.traderHealth.kind === "http",
+    // `CONTROL-2`: always stated; NOT_CONFIGURED here (see above), which adds
+    // the `control_trader_halts_state` lines and the `traderHalts` section.
+    traderHalts,
   });
 
   const server = await startControlHttpServer({
@@ -258,6 +279,10 @@ export async function startup(
           "control_trader_health_current says whether the last read passed"
       : "trader health: none configured; the trader_* families have no producer and " +
           "control_trader_health_available reads 0",
+  );
+  ports.log(
+    `trader halts: NOT CONFIGURED — ${TRADER_HALTS_NOT_COMPOSED}; /v1/health and ` +
+      'control_trader_halts_state say NOT_CONFIGURED, never "no halts"',
   );
 
   const shutdown = (): void => {

@@ -36,8 +36,16 @@
  *   package's `src` under a loader, say — is not the shipped artifact.
  * - Third-party code inside the bundle is judged by its package, not read:
  *   zod v4's JIT compiles object-schema checks with `new Function` from the
- *   schemas' own shapes (the justification on its entry below). Workspace
- *   packages' source is `check:deps`'s (F6, F14, F16).
+ *   schemas' own shapes (the justification on its entry below).
+ * - Workspace packages' source is reviewed code, and `check:deps` holds only
+ *   part of it (`CONTROL-2`, correcting `CTRL1B-R5-L2`): F6 (the venue SDK
+ *   only in `packages/polymarket-secure`) and F16's relative half (no relative
+ *   specifier leaving its package) judge every literal specifier in every
+ *   workspace package, and F14 (no module load a static check cannot read)
+ *   holds only the purity-restricted packages — of the workspace packages this
+ *   bundle holds (`decimal`, `domain`, `observability`, `risk`),
+ *   `packages/domain` alone. A computed load in the other three is no
+ *   `check:deps` finding. {@link BUNDLED_WORKSPACES} pins that set.
  * - The production-source rule's own limits: `support/production-source-rule.ts`,
  *   "What it does not see".
  */
@@ -51,7 +59,7 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
-import { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY } from "./support/forbidden-targets.js";
+import { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SDK_SIGNING_PACKAGES, SECURE_DIRECTORY } from "./support/forbidden-targets.js";
 import { PERMITTED_BUILTINS, discover } from "./support/load-judge.js";
 import { CODE_EXTENSIONS } from "./support/module-loads.js";
 import { refusedLanding } from "./support/no-signer-guard.js";
@@ -100,6 +108,33 @@ const SHIPPED_THIRD_PARTY: readonly { readonly name: string; readonly justificat
     justification: "@polymarket-bot/decimal's arbitrary-precision arithmetic (via domain and risk); it loads no module",
   },
 ]);
+
+/**
+ * `CONTROL-2` (correcting `CTRL1B-R5-L2`): the workspace packages the shipped
+ * bundle holds, EXACTLY, and the purity-restricted ones among them — the only
+ * ones `check:deps` F14 holds (module header). The README and the header state
+ * both; a bundle that gains a workspace package fails here until they are
+ * restated.
+ */
+const BUNDLED_WORKSPACES = Object.freeze(["packages/decimal", "packages/domain", "packages/observability", "packages/risk"]);
+
+/**
+ * The packages `tools/check-dependency-direction.mjs` holds to F14 — its
+ * `isPurityRestricted` — read from the tool's own source, so a change there
+ * fails here rather than leaving the README's statement behind.
+ */
+function purityRestrictedDirectories(): { readonly line: string; readonly restricted: (directory: string) => boolean } {
+  const tool = readFileSync(join(repoRoot, "tools", "check-dependency-direction.mjs"), "utf8");
+  const line = /^\s*const isPurityRestricted = (?<expression>[^;]+);$/mu.exec(tool)?.groups?.["expression"] ?? "";
+  const exact = (name: string): string | undefined => new RegExp(`const ${name} = pkg\\.dir === "(?<dir>[^"]+)";`, "u").exec(tool)?.groups?.["dir"];
+  const strategies = /const isStrategy = matchesGlob\(pkg\.dir, strategyClass\);/u.test(tool);
+  const directories = ["isDomain", "isLedger", "isSimulation"].map(exact);
+  return {
+    line,
+    restricted: (directory) =>
+      directories.includes(directory) || (strategies && directory.startsWith("packages/strategies/")),
+  };
+}
 
 /** The workspace packages (`pnpm-workspace.yaml`: `apps/*`, `packages/*`, `packages/strategies/*`), by name. */
 const WORKSPACES: ReadonlyMap<string, string> = (() => {
@@ -318,6 +353,12 @@ function productionPlants(): readonly { readonly label: string; readonly text: s
     { label: "a computed member of process.versions", text: "export const v = (k) => process.versions[k];\n", rules: ["computed-global"] },
     { label: "a string key on globalThis", text: `export const e = globalThis["${ev}"];\n`, rules: ["computed-global", "name"] },
     { label: "process aliased", text: "const p = process;\nexport const x = (k) => p[k];\n", rules: ["global"] },
+    // `CONTROL-2` (closing `CTRL1B-R5-L1`): a global object reached as a MEMBER of another is that global object.
+    { label: "a global reached as a member of another, aliased", text: "const p = globalThis.process;\nexport const x = (k) => p[k];\n", rules: ["global"] },
+    { label: "a global reached as a member of another, passed", text: "export const x = (k) => Reflect.get(globalThis.process, k);\n", rules: ["global"] },
+    { label: "a global reached two members deep, destructured", text: "export const { env } = global.globalThis.process;\n", rules: ["global"] },
+    { label: "a global reached as a member of another, spread", text: "export const all = { ...globalThis.module };\n", rules: ["global"] },
+    { label: "a global reached as a member of another, returned", text: "export const g = () => (globalThis.global);\n", rules: ["global"] },
     { label: "globalThis passed", text: "export const x = (k) => Reflect.get(globalThis, k);\n", rules: ["global"] },
     { label: "process destructured", text: "export const { env } = process;\n", rules: ["global"] },
     { label: "module shadowed", text: "export const f = (module) => module;\n", rules: ["global"] },
@@ -373,7 +414,48 @@ describe("ACCEPTANCE 3, authoritative: the shipped artifact holds no signer (CON
     for (const entry of SHIPPED_THIRD_PARTY) expect(entry.justification.length, entry.name).toBeGreaterThanOrEqual(40);
     const externals = Object.values(metafile.outputs).flatMap((output) => output.imports.filter((entry) => entry.external === true));
     expect(externals.map((entry) => entry.path)).toContain("node:http");
+    // `CONTROL-2` (correcting `CTRL1B-R5-L2`): the workspace packages it holds,
+    // exactly, and the one among them `check:deps` F14 holds.
+    const workspaces = new Set<string>();
+    for (const input of inputs) {
+      const real = realpathSync(resolve(CONTROL_API, input));
+      for (const directory of CLOSURE) if (within(real, directory)) workspaces.add(relative(repoRoot, directory).split(sep).join("/"));
+    }
+    expect([...workspaces].sort()).toEqual([...BUNDLED_WORKSPACES]);
+    const purity = purityRestrictedDirectories();
+    expect(purity.line).toBe("isDomain || isStrategy || isLedger || isSimulation");
+    expect(BUNDLED_WORKSPACES.filter(purity.restricted)).toEqual(["packages/domain"]);
+    expect(purity.restricted("packages/ledger") && purity.restricted("packages/simulation") && purity.restricted("packages/strategies/x")).toBe(true);
   }, 120_000);
+
+  it("CONTROL-2 (correcting CTRL1B-R5-L2): the README and this header state check:deps' reach exactly — F14 for packages/domain alone", () => {
+    const normalized = (text: string): string =>
+      text
+        .replace(/^\s*\*\s?/gmu, "")
+        .replace(/\s+/gu, " ")
+        .toLowerCase();
+    const readme = readFileSync(join(CONTROL_API, "README.md"), "utf8");
+    const section = readme.slice(readme.indexOf('### 3. "No signer is loaded."'), readme.indexOf("## Authentication (§15)"));
+    const self = readFileSync(fileURLToPath(import.meta.url), "utf8");
+    const header = self.slice(0, self.indexOf("\nimport {"));
+    for (const [name, text] of [
+      ["README", section],
+      ["this header", header],
+    ] as const) {
+      const said = normalized(text);
+      expect(said, name).not.toContain("(f6, f14, f16)");
+      for (const phrase of [
+        "f6 (the venue sdk only in `packages/polymarket-secure`)",
+        "f16's relative half",
+        "every workspace package",
+        "f14 (no module load a static check cannot read) holds only the purity-restricted packages",
+        "(`decimal`, `domain`, `observability`, `risk`), `packages/domain` alone",
+        "a computed load in the other three is no `check:deps` finding",
+      ]) {
+        expect(said, `${name}: ${phrase}`).toContain(phrase);
+      }
+    }
+  });
 
   it("positive control: the same build with an entry that imports the secure adapter names the adapter, the venue SDK, and each of the SDK's own packages", async () => {
     const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-plant-"));
@@ -390,6 +472,16 @@ describe("ACCEPTANCE 3, authoritative: the shipped artifact holds no signer (CON
         ).toBe(true);
       }
       expect([...SDK_DEPENDENCY_PACKAGES].sort()).toEqual([...SDK_OWN_PACKAGES].sort());
+      // `CONTROL-2` (closing `CTRL1B-R5-L3`): the SDK's signing closure, spelled from parts, is FORBIDDEN by name.
+      const signing = [named("@noble/", "cur", "ves"), named("@noble/", "hash", "es"), named("@scure/", "bip", "32"), named("@scure/", "bip", "39")];
+      expect([...SDK_SIGNING_PACKAGES].sort()).toEqual([...signing].sort());
+      for (const name of signing) {
+        expect(
+          forbidden.some((finding) => finding.includes(`/${name}/`)),
+          `${name} among ${JSON.stringify(forbidden.filter((finding) => finding.includes(name.split("/")[0] ?? "")).slice(0, 3))}`,
+        ).toBe(true);
+        expect(findings.some((finding) => finding.includes(`the third-party package ${name},`)), name).toBe(false);
+      }
       // …and the packages beside them that the list does not name.
       expect(findings.some((finding) => finding.includes("which the shipped bundle may not hold"))).toBe(true);
     } finally {
@@ -474,6 +566,9 @@ describe("ACCEPTANCE 3, authoritative: the production source holds no dynamic-lo
       "export function call(f: Function): unknown { return f; }\n",
       "type P = typeof process;\nexport type Q = P;\n",
       "export const o = { process: 1, module: 2 };\nexport const sum = o.process + o.module;\n",
+      // `CONTROL-2`: a global reached as a member, used as the object of a further non-computed access, is not a finding.
+      "export const env = globalThis.process.env;\nexport const first = globalThis.process.argv.slice(2);\n",
+      "export const o = { globalThis: { process: 1 } };\nexport const p = o.globalThis.process;\n",
       'export const message = "this process never loads a signer, and refuses any request that names one";\n',
       "export const lazy = () => import(\"./sibling.js\");\n",
       "export type T = typeof import(\"zod\");\n",

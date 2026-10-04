@@ -111,6 +111,7 @@ import {
   PERMITTED_BUILTINS,
   PROCESS_DEPENDENT_ROOTS,
   SDK_DEPENDENCY_PACKAGES,
+  SDK_SIGNING_PACKAGES,
   SECURE_DIRECTORY,
   aliasesOf,
   discover,
@@ -359,7 +360,8 @@ const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([
   })),
   // `CONTROL-1b` r2: the forbidden targets, each written once in their list
   // (since r4 the venue SDK's own packages too).
-  ...[...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES, SECURE_DIRECTORY].map((name) => ({
+  // `CONTROL-2`: and the venue SDK's signing closure.
+  ...[...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES, ...SDK_SIGNING_PACKAGES, SECURE_DIRECTORY].map((name) => ({
     file: "test/integration/control-api/support/forbidden-targets.ts",
     finding: literalFinding(name),
     count: 1,
@@ -1700,6 +1702,21 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
       expect(isForbiddenName(`${name}/sub`), name).toBe(true);
       expect(isForbiddenName(`${name}ford`), name).toBe(false);
     }
+    // `CONTROL-2` (closing `CTRL1B-R5-L3`): the SDK's signing closure, spelled
+    // from parts so the pin does not lean on the list it pins — exactly these
+    // four, each forbidden by name and with a subpath, none as a prefix.
+    const signing = [named("@noble/", "cur", "ves"), named("@noble/", "hash", "es"), named("@scure/", "bip", "32"), named("@scure/", "bip", "39")];
+    expect([...SDK_SIGNING_PACKAGES].sort()).toEqual([...signing].sort());
+    for (const name of signing) {
+      expect(isForbiddenName(name), name).toBe(true);
+      expect(isForbiddenName(`${name}/secp256k1`), name).toBe(true);
+      expect(isForbiddenName(name.toUpperCase()), name).toBe(true);
+      expect(isForbiddenName(`${name}-extra`), name).toBe(false);
+      expect(findingOf(name), name).not.toBe("ok");
+    }
+    // …and the scope alone, or a sibling the SDK does not sign with, is not.
+    expect(isForbiddenName(named("@noble/", "ciphers"))).toBe(false);
+    expect(isForbiddenName(named("@scure/", "base"))).toBe(false);
   });
 
   it("CONTROL-1b r4: the scan's limits read the same wherever they are stated — best-effort lint, each limit named — the guard's are named where it is described, and no text claims more", () => {
@@ -2179,7 +2196,7 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     };
     const scopeOnly = (specifier: string): boolean => specifier.startsWith("@") && !specifier.includes("/");
     for (const tree of IMPORT_SCAN_TREES) {
-      for (const specifier of [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES]) {
+      for (const specifier of [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES, ...SDK_SIGNING_PACKAGES]) {
         if (scopeOnly(specifier)) {
           // `@ethersproject` is a SCOPE: no package of it may be reachable.
           for (let directory = tree; ; directory = dirname(directory)) {

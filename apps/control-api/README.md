@@ -16,7 +16,7 @@ requires of it.
 | `GET /v1/run-state` | `READ` | the run mode, the process maximum, the repository ceiling, and the statement that none of them is writable here |
 | `GET /v1/strategies` | `READ` | every strategy instance the control plane knows, with its run state |
 | `GET /v1/kill-switch` | `READ` | every latched §14.1 kill switch |
-| `GET /v1/health` | `READ` | the last trader health report that passed the door, verbatim |
+| `GET /v1/health` | `READ` | the last trader health report that passed the door, verbatim, and the open trader halts in `ops.incidents` (`CONTROL-2`) |
 | `GET /v1/metrics` | `READ` | Prometheus text exposition for the three dashboards |
 | `POST /v1/strategies/:instanceId/pause` | `STRATEGY_CONTROL` | pause a **registered** instance |
 | `POST /v1/strategies/:instanceId/resume` | `STRATEGY_CONTROL` | resume a **registered** instance |
@@ -391,8 +391,11 @@ AUTHORITATIVE checks, with a test-tree scan beside them as best-effort lint.
 "Forbidden" means one place throughout
 (`test/integration/control-api/support/forbidden-targets.ts`): the secure
 adapter (`packages/polymarket-secure`), the venue SDKs and signing libraries
-(`FORBIDDEN_PACKAGES`), and the venue SDK's own `ox`, `@polymarket/bindings` and
-`@polymarket/types` (`SDK_DEPENDENCY_PACKAGES`, matched exactly).
+(`FORBIDDEN_PACKAGES`), the venue SDK's own `ox`, `@polymarket/bindings` and
+`@polymarket/types` (`SDK_DEPENDENCY_PACKAGES`, matched exactly), and, since
+`CONTROL-2`, the signing closure the SDK signs with: `@noble/curves`,
+`@noble/hashes`, `@scure/bip32` and `@scure/bip39` (`SDK_SIGNING_PACKAGES`,
+matched exactly).
 
 **1. The shipped artifact (authoritative;
 `test/integration/control-api/acceptance-3-shipped-artifact.test.ts`).**
@@ -422,17 +425,27 @@ adapter (`packages/polymarket-secure`), the venue SDKs and signing libraries
   `createRequire`, `eval`, `Function` in a value position, `getBuiltinModule`,
   `constructor`, `getPrototypeOf` or `__proto__`, or Node's loader internals by
   name; `globalThis`, `global`, `process` and `module` only as the object of a
-  non-computed property access, and no computed member of them but a read of
-  `process.env[…]` or `process.argv[…]`. Each primitive is pinned by a plant
-  that fails, in every code extension.
+  non-computed property access — the same for one reached as a member of
+  another, such as `globalThis.process` (`CONTROL-2`) — and no computed member
+  of them but a read of `process.env[…]` or `process.argv[…]`. Each primitive
+  is pinned by a plant that fails, in every code extension.
 - **What this does not prove.** A deployment that runs anything but
   `dist/main.mjs` is not the shipped artifact. Third-party code in the bundle
   is judged by its package, not read: `zod` v4 compiles object-schema checks
   with `new Function` from the schemas' own shapes, never from a request.
-  Workspace packages' source is `check:deps`'s (F6, F14, F16). And the
-  production-source rule is a rule over source text: a computed key on an
-  ordinary value can still reach a function's constructor. Production source
-  is reviewed code; the rule refuses every primitive it can name.
+  Workspace packages' source is reviewed code, and `check:deps` holds only
+  part of it (`CONTROL-2`, correcting an overstatement): F6 (the venue SDK
+  only in `packages/polymarket-secure`) and F16's relative half (no relative
+  specifier leaving its package) judge every literal specifier in every
+  workspace package, and F14 (no module load a static check cannot read) holds
+  only the purity-restricted packages — of the workspace packages this bundle
+  holds (`decimal`, `domain`, `observability`, `risk`), `packages/domain`
+  alone. A computed load in the other three is no `check:deps` finding. And
+  the production-source rule is a rule over source text: a computed key on an
+  ordinary value can still reach a function's constructor, and a member of a
+  global object that is not itself one (`process.mainModule`) can still be
+  aliased and indexed. Production source is reviewed code; the rule refuses
+  every primitive it can name.
 
 **2. The run-time guard (authoritative in every runner that executes
 control-api code; `test/integration/control-api/support/no-signer-guard.ts`).**
@@ -571,6 +584,49 @@ depends on a seam that does not exist in this repository yet
 same `authoritativeSnapshotApplied: true` evidence this API demands). That
 wiring is a documented composition obligation, not something this package
 claims.
+
+## Open trader halts (`CONTROL-2`)
+
+A trader halt latches in the trader's own process, which then exits 75; a halt
+that exits between two scrapes reached no metric (`H1R1-HALT-INVISIBLE`).
+Since `PROVENANCE-1` every halt whose record lands leaves an open
+`TRADER_HALT:<scope>` row in `ops.incidents` that outlives the trader.
+`src/trader-halts.ts` reads those rows into `GET /v1/health` (its
+`traderHalts` section) and `GET /v1/metrics`.
+
+- **What is read.** Every row whose `incident_key`, upper-cased, begins
+  `TRADER_HALT:` and whose status is not `RESOLVED` (`OPEN` and `MITIGATING`
+  count), in every environment. The trader's three keys are counted by scope;
+  any other key in that namespace counts as `UNRECOGNIZED`, and a row whose
+  columns are not the trader's shape is counted and listed with its
+  irregularities — never dropped. The counts are exact; the newest 50 rows are
+  listed, marked `truncated` beyond that.
+- **When.** On every AUTHORIZED health or metrics read, single-flight, bounded
+  by the source's timeout — the trader-health convention ("Refresh-on-read",
+  `api.ts`). An anonymous or unauthorized caller causes no read.
+- **Fail closed.** Four states: `OPEN`, `NONE_OPEN`, `UNKNOWN` (no read yet, a
+  failed or timed-out read, or a result the door refused) and `NOT_CONFIGURED`.
+  `NONE_OPEN` comes only from a read that succeeded; nothing is retained across
+  a failed read, so an unreadable table is never "no halts". `NONE_OPEN` is
+  still not proof of no halt: a halt whose record could not land has no row.
+- **Read-only.** The PostgreSQL source (`src/adapters/postgres-trader-halts.ts`)
+  runs its two `select`s in one `REPEATABLE READ, READ ONLY` transaction with
+  its own `statement_timeout`; it writes nothing and resolves nothing.
+- **Metrics.** `control_trader_halts_state{state}` (always present),
+  `control_trader_halts_open{scope}` (only after a read that succeeded) and
+  `control_trader_halt_reads_total{outcome}`. They are declared in
+  `trader-halts.ts`, beside the platform table, because `packages/**` was
+  outside `CONTROL-2`'s grant.
+
+**What does not ship yet (disclosed).** The shipped process composes an
+`AbsentTraderHaltSource`, so its state is `NOT_CONFIGURED`: its bundle holds no
+PostgreSQL client, and adding one changes acceptance 3's shipped-artifact check
+(its exact third-party list and its builtin-only externals). The Prometheus
+PAGE rule and the Grafana panel wait on a grant to `packages/observability`,
+whose suites pin both to the platform family table. The PostgreSQL source is
+proven end to end — the trader's own writer, the real API over HTTP, real
+PostgreSQL — by the opt-in suite
+`test/integration/control-api/postgres/trader-halts-postgres.test.ts`.
 
 ## The PostgreSQL sink: reached by an opt-in suite, bound by no composition (disclosed)
 

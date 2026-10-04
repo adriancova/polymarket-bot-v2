@@ -18,7 +18,7 @@
  * | `non-literal` | an `import()` or `require()` whose specifier is not a string literal |
  * | `require-form` | `require` (or `x.require`) anywhere but as the callee of such a call with ONE literal argument |
  * | `name` | an identifier, property name, private name or string key that names a loader or an evaluator — the scan's own vocabulary (`createRequire`, `eval`, `_load`, `_compile`, `_extensions`, `dlopen`, `binding`, `_linkedBinding`, `ShadowRealm`, `constructor`), `getBuiltinModule`, `Function` in a VALUE position, and the prototype reflection that reaches an evaluator BY VALUE (`getPrototypeOf`, `__proto__`) |
- * | `global` | `globalThis`, `global`, `process` or `module` used other than as the object of a non-computed property access (`process.env`): aliased, passed, spread, destructured, shadowed |
+ * | `global` | `globalThis`, `global`, `process` or `module` used other than as the object of a non-computed property access (`process.env`): aliased, passed, spread, destructured, shadowed — and the same for one reached as a non-computed MEMBER of another (`globalThis.process`, `global.globalThis.module`; `CONTROL-2`, closing `CTRL1B-R5-L1`) |
  * | `computed-global` | a COMPUTED member access on one of them, or on a member of one (`process[x]`, `globalThis.process[x]`) — except a read of `process.env[…]` or `process.argv[…]`, which hold strings only |
  * | `import-meta` | `import.meta.glob` / `globEager` |
  * | `unparseable` | a file that does not parse under its extension's grammar |
@@ -30,7 +30,10 @@
  * It is a rule over source text, not a proof about the program. A computed key
  * on an ORDINARY value (`fn[k]` where `k` is built at run time) can still reach
  * a function's constructor, and a value another module exports can be a
- * loader. Production source is reviewed code; this rule refuses every loading
+ * loader. A member of a global object that is not itself one of the four
+ * (`process.mainModule`) can still be aliased and then indexed: its loader is
+ * refused where it is NAMED (`require`), not where it is reached by a computed
+ * key. Production source is reviewed code; this rule refuses every loading
  * primitive it can NAME, and the shipped bundle's metafile states what the
  * shipped artifact holds.
  */
@@ -134,6 +137,19 @@ function dottedPath(node: ts.Expression): string | undefined {
     return head === undefined ? undefined : `${head}.${inner.name.text}`;
   }
   return undefined;
+}
+
+/**
+ * Whether `node` evaluates to one of the {@link GLOBAL_OBJECTS} by NAME: the
+ * identifier itself, or a NON-COMPUTED member chain every link of which is one
+ * of them (`globalThis.process`, `global.globalThis.module`). `CONTROL-2`,
+ * closing `CTRL1B-R5-L1`: `const p = globalThis.process; p[k]` and
+ * `Reflect.get(globalThis.process, k)` reached `process` through `globalThis`
+ * and were never judged as `process`.
+ */
+function namesGlobalObject(node: ts.Expression): boolean {
+  const path = dottedPath(node);
+  return path !== undefined && path.split(".").every((segment) => GLOBAL_OBJECTS.includes(segment));
 }
 
 /** The identifier a member-access chain is rooted at (`process` in `process.a[b].c`), or `undefined`. */
@@ -271,6 +287,17 @@ export function dynamicLoadingIn(text: string, fileName: string, scope: Producti
         const parent = node.parent as ts.Node | undefined;
         const asObject = parent !== undefined && ts.isPropertyAccessExpression(parent) && parent.expression === node;
         if (!asObject) add("global", name, node);
+      } else if (ts.isIdentifier(node) && GLOBAL_OBJECTS.includes(name)) {
+        // `CONTROL-2` (`CTRL1B-R5-L1`): a global object reached as a
+        // NON-COMPUTED member of another (`globalThis.process`) is that global
+        // object, under the same rule: only as the object of a further
+        // non-computed property access.
+        const access = node.parent as ts.Node | undefined;
+        if (access !== undefined && ts.isPropertyAccessExpression(access) && access.name === node && namesGlobalObject(access)) {
+          const outer = access.parent as ts.Node | undefined;
+          const asObject = outer !== undefined && ts.isPropertyAccessExpression(outer) && outer.expression === access;
+          if (!asObject) add("global", dottedPath(access) ?? name, node);
+        }
       }
       return;
     }

@@ -116,9 +116,18 @@
  *   unauthorized caller can make this process ask the trader nothing.
  *
  * The mechanism is enabled by `main.ts` for an `http` source only
- * (`refreshHealthOnRead`); a `none` source is never read, so its metrics body
- * is byte-identical to `WP-240`'s (no `control_trader_health_reads_total`
- * line, `control_trader_health_available 0`).
+ * (`refreshHealthOnRead`); a `none` source is never read, so it adds no
+ * `control_trader_health_reads_total` line and `control_trader_health_available`
+ * reads 0.
+ *
+ * `CONTROL-2` reads the open trader halts in `ops.incidents` the same way
+ * (`trader-halts.ts`): a CONFIGURED halt source is read on every authorized
+ * health and metrics request, single-flight, in parallel with the health
+ * refresh, bounded by the source's own timeout; an unconfigured one is never
+ * read. The metrics body therefore always carries `control_trader_halts_state`
+ * — the state is explicit, so a deployment that reads nothing says
+ * `NOT_CONFIGURED` rather than nothing — and the open counts only after a read
+ * that succeeded.
  */
 
 import {
@@ -149,6 +158,12 @@ import {
 } from "./doors.js";
 import type { TraderHealthCache } from "./health-source.js";
 import { readInstanceIdParameter } from "./instance-id.js";
+import {
+  TRADER_HALT_METRIC_FAMILIES,
+  traderHaltSamples,
+  traderHaltsDocument,
+  type TraderHaltCache,
+} from "./trader-halts.js";
 import {
   CONTROL_KILL_SWITCH_ACTIONS,
   CONTROL_KILL_SWITCH_SCOPES,
@@ -235,7 +250,22 @@ export interface ControlApiOptions {
    * the cache as it stands, byte-identical to before this round.
    */
   readonly refreshHealthOnRead?: boolean;
+  /**
+   * `CONTROL-2` (closing `H1R1-HALT-INVISIBLE`): the open trader halts in
+   * `ops.incidents` (`trader-halts.ts`). REQUIRED, so every composition states
+   * its halt source — an `AbsentTraderHaltSource` says `NOT_CONFIGURED`, which
+   * is never "no halts". A configured source is READ on every authorized
+   * `GET /v1/health` and `GET /v1/metrics` (module header, "Refresh-on-read"),
+   * single-flight, and never by an unauthorized caller.
+   */
+  readonly traderHalts: TraderHaltCache;
 }
+
+/**
+ * Every family `GET /v1/metrics` renders: the platform table, then this
+ * process's own trader halt families (`trader-halts.ts`, `CONTROL-2`).
+ */
+export const CONTROL_API_METRIC_FAMILIES = Object.freeze([...PLATFORM_METRIC_FAMILIES, ...TRADER_HALT_METRIC_FAMILIES]);
 
 // --- the request doors ------------------------------------------------------
 
@@ -513,6 +543,8 @@ export class ControlApi {
   readonly #authorizationFailures = new Map<string, number>();
   /** The one refresh in flight, shared by concurrent authorized reads (`#fresh`). */
   #refreshInFlight: Promise<unknown> | undefined;
+  /** The one trader halt read in flight, shared the same way (`CONTROL-2`). */
+  #haltReadInFlight: Promise<unknown> | undefined;
 
   constructor(options: ControlApiOptions) {
     this.#options = options;
@@ -717,12 +749,23 @@ export class ControlApi {
    * always runs.
    */
   async #fresh(produce: () => ApiResponse): Promise<ApiResponse> {
+    const pending: Promise<unknown>[] = [];
     if (this.#options.refreshHealthOnRead === true) {
       this.#refreshInFlight ??= this.#options.health.refresh().finally(() => {
         this.#refreshInFlight = undefined;
       });
-      await this.#refreshInFlight;
+      pending.push(this.#refreshInFlight);
     }
+    // `CONTROL-2`: a configured trader halt source is read on the same
+    // authorized reads, single-flight; one that is not configured is never
+    // read, and its state stays NOT_CONFIGURED. The cache never throws.
+    if (this.#options.traderHalts.configured) {
+      this.#haltReadInFlight ??= this.#options.traderHalts.refresh().finally(() => {
+        this.#haltReadInFlight = undefined;
+      });
+      pending.push(this.#haltReadInFlight);
+    }
+    await Promise.all(pending);
     return produce();
   }
 
@@ -881,6 +924,9 @@ export class ControlApi {
       current: this.#options.health.current,
       reads: this.#options.health.readCounts(),
       report: report ?? null,
+      // `CONTROL-2`: open trader halts from ops.incidents — a separate fact
+      // from the report above, which a trader that has exited no longer serves.
+      traderHalts: traderHaltsDocument(this.#options.traderHalts),
       note:
         report === undefined
           ? "No trader health report has passed this API's door. " +
@@ -933,11 +979,14 @@ export class ControlApi {
 
     const report = this.#options.health.last();
     if (report !== undefined) samples.push(...traderHealthSamples(report));
+    // `CONTROL-2`: the trader halt families, always present (the state is
+    // explicit); the open counts only after a read that succeeded.
+    samples.push(...traderHaltSamples(this.#options.traderHalts));
 
     return {
       status: 200,
       contentType: "text/plain; version=0.0.4; charset=utf-8",
-      body: renderExpositionFor(PLATFORM_METRIC_FAMILIES, samples),
+      body: renderExpositionFor(CONTROL_API_METRIC_FAMILIES, samples),
     };
   }
 }
