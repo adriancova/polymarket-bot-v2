@@ -264,8 +264,15 @@ export class ReconWorld {
     return order;
   }
 
-  /** The venue matches `shares` of a live order (a maker fill at the order's price, fee 0, settled). */
-  match(salt: string, shares: string, options: { readonly status?: string; readonly feeAmount?: string | null } = {}): VenueTrade | undefined {
+  /**
+   * The venue matches `shares` of a live order (a maker fill at the order's price, fee 0, settled). A fee charged
+   * in the collateral (`feeAssetId`, r4) leaves the collateral too.
+   */
+  match(
+    salt: string,
+    shares: string,
+    options: { readonly status?: string; readonly feeAmount?: string | null; readonly feeAssetId?: string } = {},
+  ): VenueTrade | undefined {
     this.settleArrivals();
     const order = this.orders.get(salt);
     if (order === undefined || order.status !== "LIVE") return undefined;
@@ -283,7 +290,7 @@ export class ReconWorld {
       price: order.price,
       role: "MAKER",
       feeAmount: options.feeAmount === undefined ? "0" : options.feeAmount,
-      feeAssetId: null,
+      feeAssetId: options.feeAssetId ?? null,
       matchedAt: "2026-10-03T00:00:00Z",
       status: options.status ?? "CONFIRMED",
       transactionHash: `0x${String(this.#trade).padStart(64, "0")}`,
@@ -298,7 +305,27 @@ export class ReconWorld {
       this.positions.set(order.tokenId, subDecimal(position, take));
       this.collateral = addDecimal(this.collateral, notional);
     }
+    if (trade.feeAssetId === this.#collateralAsset && trade.feeAmount !== null) this.collateral = subDecimal(this.collateral, trade.feeAmount);
     return trade;
+  }
+
+  /**
+   * The trade's settlement FAILS (r4): a FAILED settlement never moved the chain (ADR-006 §5), so every holding
+   * its match moved here (the token, the collateral, a collateral fee) moves back. The status is the REST
+   * spelling's plain form, as `match` writes it.
+   */
+  failTrade(trade: VenueTrade): void {
+    trade.status = "FAILED";
+    const notional = mulDecimal(trade.shares, trade.price);
+    const position = this.positions.get(trade.tokenId) ?? "0";
+    if (trade.side === "BUY") {
+      this.positions.set(trade.tokenId, subDecimal(position, trade.shares));
+      this.collateral = addDecimal(this.collateral, notional);
+    } else {
+      this.positions.set(trade.tokenId, addDecimal(position, trade.shares));
+      this.collateral = subDecimal(this.collateral, notional);
+    }
+    if (trade.feeAssetId === this.#collateralAsset && trade.feeAmount !== null) this.collateral = addDecimal(this.collateral, trade.feeAmount);
   }
 
   /** A holding change no activity explains (tokens sent to the wallet, a deposit). */

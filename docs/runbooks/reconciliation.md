@@ -50,19 +50,30 @@ not a fault.
    received since the last run that could not be read (`REQUEST_MALFORMED`).
 2. Read, in this order: open orders, trades, each order that must be read by
    id, positions (`/v2` only), the collateral balance (on chain), approvals,
-   the ledger projection, and each wallet-operation member a request names.
+   the ledger projection, what the ledger still books of each FAILED fill
+   (section 3, step 3), and each wallet-operation member a request names.
    The orders read by id are: every tracked order still open, every one with
    fills, terminal or not, every one an unresolved break names, every venue
-   order an unresolved hold names (a read problem keyed by the order, an
-   `ORDER_UNRESOLVED` keyed by the venue order), and every order of the
-   account a run saw but could not classify. E-14: an order absent from the
-   open-orders list is not proof of cancellation, and missing orders are
-   resolved by id. **Once seen, an order is never forgotten** while anything
-   about it is unresolved: a run whose reads are not one consistent view (or
-   are stale) records every unclaimed order it showed as `ORDER_UNRESOLVED`,
-   keyed by the venue order, so the next runs (after a restart too) read it
-   by id until a sound run classifies it (tracked, still ownable by an
-   attempt, or UNATTRIBUTED).
+   order an unresolved break names (a read problem keyed by the order, an
+   `ORDER_UNRESOLVED` keyed by the venue order, an `ORDER_NOT_FOUND_BY_ID`),
+   and every order id of the account a run observed but could not classify.
+   E-14: an order absent from the open-orders list is not proof of
+   cancellation, and missing orders are resolved by id. **Once observed, an
+   order id is never forgotten** while anything about it is unresolved: a
+   run whose reads are not one consistent view (or are stale) records every
+   unclaimed order id it observed as `ORDER_UNRESOLVED`, keyed by the venue
+   order, so the next runs (after a restart too) read it by id until a sound
+   run classifies it (tracked, still ownable by an attempt, UNATTRIBUTED, or
+   not found). An id is observed in any of five ways, each recorded with its
+   **provenance**:
+
+   | Source | Provenance | Recorded as |
+   | --- | --- | --- |
+   | a complete, valid open-orders list | shown | `ORDER_UNRESOLVED` keyed `venue-order` |
+   | a valid trades read's own leg | shown | the same |
+   | a by-id read that found the order | shown | the same |
+   | a row of a partial, malformed or duplicated open-orders answer, or a leg of such a trades answer (the answer is discarded whole; the ids its rows carry are not) | named | `ORDER_UNRESOLVED` keyed `venue-order-named` |
+   | a by-id read that did not show the order (it failed, was malformed, or did not find it), for an id the OMS's retained stream evidence or a request named | named | the same |
    Every read starts after every request the run will answer was received.
    A request that arrives during the reads waits for the next run, which
    starts at once.
@@ -74,10 +85,14 @@ not a fault.
    `READ_REGRESSION`; another status at the same stage (`DELAYED`, then
    `LIVE`) is `READ_CONFLICT`. Only "live, then terminal" is a step forward:
    no order-status transition table is documented (C-6, C-14). An order an
-   earlier read showed, which its by-id read no longer finds, is a
+   earlier read SHOWED, which its by-id read no longer finds, is a
    `READ_CONFLICT` (the by-id read finds canceled and fully matched orders).
    Any of these makes the run's order reads unsound: nothing is answered from
-   them.
+   them. An order id only NAMED (no read ever showed it), which a sound run's
+   by-id read does not find, contradicts no earlier read: it is an
+   `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), which keeps
+   the id and is read by id while it stands; once found, the order is
+   classified like any other.
 
    Fills are compared with what the OMS recorded durably, by identity (one
    fill per trade and order) and with exact economics, both ways:
@@ -106,6 +121,19 @@ not a fault.
      read in every run. The OMS's own `SETTLEMENT_FAILED` alert lives only in
      its memory and is raised once, so a crash after the OMS recorded the
      failure, before the alert was journaled, would otherwise lose the halt.
+     FAILED is "terminal failure" (`docs/venue/verified-2026-08-24.md`, the
+     SDK's `TradeStatus`; ADR-006 §5). That the trades read keeps showing a
+     FAILED trade is an assumption about the read port: no document states
+     how long the venue's trades history keeps a trade;
+   - a FAILED trade never moved the chain, and the ledger books its fill
+     until a compensating reversal cancels it. So, for each FAILED leg, the
+     run reads what the ledger STILL BOOKS of that fill (its principal and
+     its fee, net of every reversal linked to them). That remaining booking
+     is the only holding difference the fill explains: a fully reversed fill
+     explains nothing, so a later unrelated movement of the same size is
+     UNATTRIBUTED. While any of it remains, `SETTLEMENT_REVERSAL_OWED` holds
+     the account. **A release is not a booking:** releasing the FAILED
+     quarantines never clears it; only the ledger's reversal does.
 
    A tracked order's token (its execution group's), side, price and size are
    its fixed facts; any difference is `ORDER_FACTS_MISMATCH`.
@@ -124,9 +152,9 @@ Its class decides its rule. The full table, with every class's meaning, is
 
 | Rule | Who clears it | Classes |
 | --- | --- | --- |
-| `HOLD_UNTIL_CONSISTENT` | a later complete run that judged it again and no longer finds it; **never an operator** | every `READ_*` class, `STATUS_UNRECOGNISED`, `SIGNED_IDENTITY_AMBIGUOUS`, `ORDER_STATE_MISMATCH`, `ORDER_UNRESOLVED`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `FILL_MISMATCH`, `FILL_ECONOMICS_UNFIXED`, `FILL_REFUSED`, `HOLDING_IN_TRANSIT_AMBIGUOUS`, `HOLDING_DELTA_UNCONFIRMED`, `WALLET_OPERATION_IN_FLIGHT`, `APPROVAL_MISSING`, `CORRECTION_FAILED`, `WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`, `WALLET_REQUESTS_OUTSTANDING`, `WALLET_OPERATION_UNSETTLED`, `OMS_EVIDENCE_RETAINED`, `COMPONENT_UNAVAILABLE`, `ANSWER_REFUSED`, `HALT_DELIVERY_FAILED`, `REQUEST_MALFORMED` |
+| `HOLD_UNTIL_CONSISTENT` | a later complete run that judged it again and no longer finds it; **never an operator** | every `READ_*` class, `STATUS_UNRECOGNISED`, `SIGNED_IDENTITY_AMBIGUOUS`, `ORDER_STATE_MISMATCH`, `ORDER_UNRESOLVED`, `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`, `FILL_MISMATCH`, `FILL_ECONOMICS_UNFIXED`, `FILL_REFUSED`, `SETTLEMENT_REVERSAL_OWED`, `HOLDING_IN_TRANSIT_AMBIGUOUS`, `HOLDING_DELTA_UNCONFIRMED`, `WALLET_OPERATION_IN_FLIGHT`, `APPROVAL_MISSING`, `CORRECTION_FAILED`, `WALLET_MEMBER_*`, `WALLET_ANSWER_REFUSED`, `WALLET_REQUESTS_OUTSTANDING`, `WALLET_OPERATION_UNSETTLED`, `OMS_EVIDENCE_RETAINED`, `COMPONENT_UNAVAILABLE`, `ANSWER_REFUSED`, `HALT_DELIVERY_FAILED`, `REQUEST_MALFORMED` |
 | `RESOLVE_IN_RUN` | the run that found it, once its fix is accepted | `TRADE_MISSING_IN_OMS` (a missed fill, delivered with its exact economics) |
-| `QUARANTINE_UNTIL_RELEASED` | an operator's release | `ORDER_FACTS_MISMATCH`, `SETTLEMENT_FAILED`, `OMS_HALTING_ALERT`, `WALLET_OPERATION_UNIDENTIFIABLE` |
+| `QUARANTINE_UNTIL_RELEASED` | an operator's release | `ORDER_FACTS_MISMATCH`, `ORDER_NOT_FOUND_BY_ID`, `SETTLEMENT_FAILED`, `OMS_HALTING_ALERT`, `WALLET_OPERATION_UNIDENTIFIABLE` |
 | `UNATTRIBUTED_HALT` | an operator's release, after the market (or account) was halted | `ORDER_UNATTRIBUTED`, `TRADE_UNATTRIBUTED`, `POSITION_UNATTRIBUTED`, `BALANCE_UNATTRIBUTED`, `LEDGER_UNATTRIBUTED_ARRIVAL` |
 
 **Ambiguity never resumes trading.** Every class that means "we cannot tell"
@@ -135,16 +163,21 @@ consistent run no longer finds it, having performed the check that would find
 it, and found the subject consistent:
 
 - a run that did not judge the holdings does not clear a holding break;
-- a break whose subject names one venue order (a read problem keyed by the
-  order: `READ_MISSING`, `READ_CONFLICT`, `READ_REGRESSION`,
-  `STATUS_UNRECOGNISED` and the like; an `ORDER_UNRESOLVED` keyed by the
-  venue order) is cleared only by a run that read that order, by id or in
-  the open-orders list. Every such order is read by id in every run, so a
-  later run can always look again;
+- a break whose subject names one venue order a read SHOWED (a
+  `READ_CONFLICT`, `READ_REGRESSION` or `STATUS_UNRECOGNISED` keyed by the
+  order; an `ORDER_UNRESOLVED` keyed `venue-order`) is cleared only by a run
+  that read that order again, by id or in the open-orders list. One whose
+  subject names a venue order only NAMED (a by-id read's problem:
+  `READ_MISSING`, `READ_MALFORMED`, `READ_WRONG_ROUTE` keyed by the order;
+  an `ORDER_UNRESOLVED` keyed `venue-order-named`) is cleared only by a run
+  whose by-id read of that order answered, found or not (not found, the
+  same run records `ORDER_NOT_FOUND_BY_ID`). Every such order is read by id
+  in every run, so a later run can always look again;
 - a break whose subject names one venue trade (`READ_REGRESSION`,
-  `STATUS_UNRECOGNISED` or `READ_INCOMPLETE` keyed by the trade) is cleared
-  only by a run whose trades read shows that trade. No by-id trade read is
-  documented, so it holds until the trades read shows it again;
+  `STATUS_UNRECOGNISED` or `READ_INCOMPLETE` keyed by the trade, and
+  `SETTLEMENT_REVERSAL_OWED`, which also needs the holdings judged) is
+  cleared only by a run whose trades read shows that trade. No by-id trade
+  read is documented, so it holds until the trades read shows it again;
 - a break about one tracked order's state or fills (`ORDER_STATE_MISMATCH`,
   `ORDER_TRADES_INCOMPLETE`, `ORDER_FILLS_AHEAD_OF_VENUE`,
   `TRADE_MISSING_IN_OMS`, `FILL_*`) is cleared only by a run that compared
@@ -198,9 +231,12 @@ halts, whether or not it finds the subject again.
 
 **What a release means.** Releasing immutable history (an UNATTRIBUTED order,
 trade or booking; one ledger halt obligation; one trade's FAILED settlement;
-one OMS alert; an operation that never named a transaction) acknowledges that
-subject for good: the same subject does not open again, and new activity opens
-new breaks. Releasing one obligation of a transaction never acknowledges
+one venue order id the venue does not show; one OMS alert; an operation that
+never named a transaction) acknowledges that subject for good. A release is
+never proof that a ledger correction was booked: a FAILED trade's reversal
+is its own hold (`SETTLEMENT_REVERSAL_OWED`), which only the ledger clears.
+An acknowledged subject does not open again, and new activity opens new
+breaks. Releasing one obligation of a transaction never acknowledges
 another obligation of the same transaction. Each OMS halting alert is its own break, keyed
 by its OMS instance and its place in that instance's list: two alerts of one
 kind on one order (two trades of one order FAILED, each owing a reversal) are
@@ -287,8 +323,13 @@ returns at once, with no run.
   has its own `SETTLEMENT_FAILED` break, which names the trade, the order
   and the market. In the process that saw the failure happen, one FAILED
   trade is therefore two quarantines (the OMS's alert and the trade's own).
-  Release both once the reversal is handled. After a restart, only the
-  trade's own break remains. A release does not
+  After a restart, only the trade's own break remains. **Releasing them does
+  not discharge the reversal:** `SETTLEMENT_REVERSAL_OWED` (a hold, never
+  released) stays until the ledger books the compensating reversal of every
+  transaction of that fill (its principal and its fee), each linked to the
+  transaction it reverses (`reversesLedgerTransactionId`: `Ledger.append`
+  accepts only an exact negation). A correction that names neither the
+  fill nor one of its transactions does not discharge it. A release does not
   resume trading: it queues a `MANUAL_REQUEST` run, which must pass on its
   own. Released history is acknowledged: the same order, trade, booking or
   alert does not reopen it, but new activity opens a new break. A released
@@ -310,10 +351,20 @@ returns at once, with no run.
   as the OMS allows.
 - **An ambiguity that does not clear** (two identical orders and one unknown
   attempt, say) needs a person, and today has no tool. Cancelling one of the
-  orders does not remove it as a candidate: once seen, an order is read by id
-  in every run, and a canceled order is still found by id (E-14). It clears
-  only if a candidate is claimed by its real owner (another attempt found
-  `PRESENT` for it). There is no override (section 10).
+  orders does not remove it as a candidate: once observed, an order id is
+  read by id in every run (whether a complete list, a partial or malformed
+  one, a trade, or a by-id read observed it), and a canceled order is still
+  found by id (E-14). It clears only if a candidate is claimed by its real
+  owner (another attempt found `PRESENT` for it). There is no override
+  (section 10).
+- **An `ORDER_NOT_FOUND_BY_ID` quarantine** names a venue order id that no
+  read ever showed in full (the user stream's evidence named it, a request
+  named it, or a row of a partial or malformed answer carried it) and that
+  the venue's by-id read does not find. The account is halted. Establish
+  whether the id is the account's (the stream's evidence, the adapter's
+  logs). If it is not, release it: the release acknowledges that id for
+  good, and it is no longer read. While it stands it is read by id in every
+  run, and if the venue shows it later it is classified like any order.
 
 ## 8. Configuration
 
@@ -357,6 +408,13 @@ The composition also binds `tokenOfGroup` to the execution groups it
 registered with the OMS (`execution.groups.token_id`). An order whose group's
 token is unknown is not compared, and holds (`COMPONENT_UNAVAILABLE`).
 
+The composition binds `HoldingsPort.remainingBookings` by joining the OMS's
+fills (`execution.fills`: venue trade and order to fill id) with the
+ledger's `remainingFillBookings`, one answer per FAILED fill asked about. An
+answer that omits a fill, names one twice, or is unreadable holds the
+account (`READ_MALFORMED` or `READ_MISSING` on `ledger-fill-bookings`), and
+nothing is judged or booked from it.
+
 ## 10. Known limits
 
 - An order placed and then cancelled with nothing matched, and NEVER SEEN by
@@ -375,8 +433,20 @@ token is unknown is not compared, and holds (`COMPONENT_UNAVAILABLE`).
 - A break keyed by one venue trade holds until the trades read shows that
   trade again. Trades are read in full today. A windowed trades read would
   need care here.
-- A seen order that its by-id read no longer finds holds the whole account
-  (`READ_CONFLICT`: nothing is answered while it lasts). Fail closed.
+- An order a read SHOWED in full that its by-id read no longer finds holds
+  the whole account (`READ_CONFLICT`: nothing is answered while it lasts,
+  and no release exists). Fail closed. An order id only NAMED that the venue
+  does not find is a releasable quarantine instead (`ORDER_NOT_FOUND_BY_ID`).
+  While that quarantine stands, the id is not a signed-identity candidate:
+  the venue's by-id read (E-14) is taken as authoritative, as it is for an
+  id the OMS retains when no unsound run intervened.
+- A FAILED fill's remaining booking is what the ledger books under its fill
+  id (and every reversal linked to one of its transactions). The composition
+  must join the OMS's fills to the ledger (`HoldingsPort.remainingBookings`).
+  An unlinked correction that names the fill counts toward it; one that
+  names neither the fill nor its transactions does not.
+- One FAILED trade in the process that saw it is three breaks: two
+  quarantines (the OMS's alert and the trade's own) and the reversal hold.
 - Trades are read in full each run; nothing is windowed yet.
 - Collateral-kind assets other than pUSD (e.g. USDC.e after an unwrap) have no
   read here, so they are not judged.

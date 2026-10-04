@@ -21,10 +21,19 @@
  * | `READ_CONFLICT`, `READ_REGRESSION`, `STATUS_UNRECOGNISED`, `READ_INCOMPLETE` | `[class, "order", id]` | venue order `id` |
  * | the same, and `READ_MISSING`, `READ_MALFORMED`, `READ_WRONG_ROUTE` | `[class, compositeKey("order", id)]` (a by-id read's problem) | venue order `id` |
  * | `READ_REGRESSION`, `STATUS_UNRECOGNISED`, `READ_INCOMPLETE` | `[class, "trade", id]` | venue trade `id` |
- * | `ORDER_UNRESOLVED` | `[class, "venue-order", id]` | venue order `id` |
+ * | `ORDER_UNRESOLVED` | `[class, "venue-order", id]` or `[class, "venue-order-named", id]` (r4) | venue order `id` |
+ * | `ORDER_NOT_FOUND_BY_ID` (r4) | `[class, id]` | venue order `id` |
+ * | `SETTLEMENT_REVERSAL_OWED` (r4) | `[class, trade, order]` | venue trade `trade` |
  *
  * Every other subject names no venue object here (`ORDER_UNRESOLVED` by
  * attempt or by OMS order names this system's ids, not the venue's).
+ *
+ * PROVENANCE (r4, WP290-CX-R4-01, WP290-V4-GHOST-ID-PERMANENT-HOLD): a subject
+ * that names a venue order says whether a read SHOWED that order in full (a
+ * conflict, a regression or an unrecognised status keyed by the order; an
+ * `ORDER_UNRESOLVED` keyed by `venue-order`) or only NAMED it (a by-id read's
+ * problem; an `ORDER_UNRESOLVED` keyed by `venue-order-named`; an
+ * `ORDER_NOT_FOUND_BY_ID`). See {@link namesOrderOnly}.
  *
  * Pure. No I/O, no clock, no randomness, no float coercion.
  */
@@ -95,9 +104,32 @@ export function venueSubjectOf(breakClass: BreakClass, subjectKey: string): Venu
     }
     return null;
   }
-  if (breakClass === "ORDER_UNRESOLVED" && parts.length === 3 && parts[1] === "venue-order") {
+  if (breakClass === "ORDER_UNRESOLVED" && parts.length === 3 && (parts[1] === "venue-order" || parts[1] === "venue-order-named")) {
     const id = parts[2];
     if (id !== undefined && id.length > 0) return { kind: "order", id };
   }
+  if (breakClass === "ORDER_NOT_FOUND_BY_ID" && parts.length === 2) {
+    const id = parts[1];
+    if (id !== undefined && id.length > 0) return { kind: "order", id };
+  }
+  if (breakClass === "SETTLEMENT_REVERSAL_OWED" && parts.length === 3) {
+    const id = parts[1];
+    if (id !== undefined && id.length > 0) return { kind: "trade", id };
+  }
   return null;
+}
+
+/**
+ * Whether a subject that names a venue order only NAMED it (see the header's provenance): no read showed that
+ * order in full, so a by-id read that does not find it is not a contradiction of an earlier read. `false` for a
+ * subject that names a venue order a read showed, and for one that names no venue order.
+ */
+export function namesOrderOnly(breakClass: BreakClass, subjectKey: string): boolean {
+  const named = venueSubjectOf(breakClass, subjectKey);
+  if (named === null || named.kind !== "order") return false;
+  if (breakClass === "ORDER_NOT_FOUND_BY_ID") return true;
+  const parts = decodeCompositeKey(subjectKey) as readonly string[];
+  if (breakClass === "ORDER_UNRESOLVED") return parts[1] === "venue-order-named";
+  // A read problem keyed `[class, compositeKey("order", id)]` is a by-id read's: it did not show the order.
+  return READ_SUBJECT_CLASSES.includes(breakClass) && parts.length === 2;
 }

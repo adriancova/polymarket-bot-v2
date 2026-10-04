@@ -58,8 +58,10 @@ export {
   buildUnattributedCorrection,
   isoFromEpochMs,
   projectedHoldings,
+  remainingFillBookings,
   type ProjectedHoldingLine,
   type ProjectedHoldings,
+  type RemainingBookingLine,
   type UnattributedArrivalView,
   type UnattributedCorrectionInput,
 } from "./holdings.js";

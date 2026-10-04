@@ -94,7 +94,8 @@ async function expectRefused(j: ReconciliationJournal, event: unknown, code: str
 
 describe("the break taxonomy", () => {
   it("every class is a valid internal.code and has a rule, a meaning and a handling", () => {
-    expect(BREAK_CLASSES.length).toBe(41);
+    // r3: SETTLEMENT_FAILED (41). r4: ORDER_NOT_FOUND_BY_ID and SETTLEMENT_REVERSAL_OWED (43).
+    expect(BREAK_CLASSES.length).toBe(43);
     for (const breakClass of BREAK_CLASSES) {
       expect(breakClass).toMatch(/^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u);
       const spec = BREAK_TAXONOMY[breakClass];

@@ -13,7 +13,12 @@
  * | `INCOMPLETE` | a paginated read did not reach its last page | `READ_INCOMPLETE` |
  * | `WRONG_ROUTE` | the answer names another route (Data API v1, E-15) | `READ_WRONG_ROUTE` |
  *
- * None of them is ever read as "empty". Statuses are kept as data: an order
+ * None of them is ever read as "empty". A partial or malformed open-orders or
+ * trades answer is discarded whole, but the venue order ids its rows carry are
+ * NOT forgotten (r4, WP290-CX-R4-01): the outcome keeps them (`named`: each id
+ * a row or leg carries, with its token when the row validated in full), so the
+ * coordinator records them and reads each by id until it is classified.
+ * Statuses are kept as data: an order
  * or trade status outside the documented vocabulary is not malformed, it is
  * UNRECOGNISED, and the coordinator holds on it (`STATUS_UNRECOGNISED`).
  * Trade statuses are accepted in both documented spellings (E-13, C-5):
@@ -22,14 +27,16 @@
  * Pure: no I/O, no clock, no randomness.
  */
 
-import { compareDecimal, isCanonicalDecimalString, type DecimalString } from "@polymarket-bot/decimal";
+import { compareDecimal, isCanonicalDecimalString, isZeroDecimal, type DecimalString } from "@polymarket-bot/decimal";
 
-import { isIdentifier, isNonNegativeAmount, isPositiveAmount, isTokenId, isUnitPrice, readArray, readField, readFields } from "../guards.js";
+import { compositeKey, isIdentifier, isNonNegativeAmount, isPositiveAmount, isTokenId, isUnitPrice, readArray, readField, readFields } from "../guards.js";
 import { isVenueId } from "../outcomes.js";
 
 import {
   VENUE_ORDER_STATUSES,
   VENUE_TRADE_STATUSES,
+  type BookedAmount,
+  type FillIdentity,
   type VenueOrderStatus,
   type VenueOrderView,
   type VenueTradeLeg,
@@ -37,11 +44,17 @@ import {
   type VenueTradeView,
 } from "./ports.js";
 
+/**
+ * The venue order ids the rows of an unusable answer carry (venue order id → its token id, or `null` when the row
+ * did not validate in full). Only the open-orders and trades reads keep them.
+ */
+export type NamedOrders = ReadonlyMap<string, string | null>;
+
 export type ReadOutcome<T> =
   | { readonly kind: "OK"; readonly value: T }
   | { readonly kind: "FAILED" }
-  | { readonly kind: "MALFORMED"; readonly why: string }
-  | { readonly kind: "INCOMPLETE" }
+  | { readonly kind: "MALFORMED"; readonly why: string; readonly named?: NamedOrders }
+  | { readonly kind: "INCOMPLETE"; readonly named?: NamedOrders }
   | { readonly kind: "WRONG_ROUTE"; readonly route: string };
 
 /** The longest list a read may return (a guard; no venue fact bounds it). */
@@ -56,8 +69,23 @@ function ok<T>(value: T): ReadOutcome<T> {
   return Object.freeze({ kind: "OK", value });
 }
 
-function malformed<T>(why: string): ReadOutcome<T> {
-  return Object.freeze({ kind: "MALFORMED", why });
+function malformed<T>(why: string, named?: NamedOrders): ReadOutcome<T> {
+  return named === undefined || named.size === 0 ? Object.freeze({ kind: "MALFORMED", why }) : Object.freeze({ kind: "MALFORMED", why, named });
+}
+
+function incomplete<T>(named: NamedOrders): ReadOutcome<T> {
+  return named.size === 0 ? INCOMPLETE : Object.freeze({ kind: "INCOMPLETE", named });
+}
+
+/** A row's own `venueOrderId` field, when it is a venue id (the rest of the row may be anything). */
+function rowVenueId(row: unknown): string | undefined {
+  const read = readField(row, "venueOrderId");
+  return read.kind === "DATA" && isVenueId(read.value) ? read.value : undefined;
+}
+
+/** Keep an id a row carries; a token learned from a fully valid row replaces an unknown one. */
+function keepNamed(named: Map<string, string | null>, id: string, tokenId: string | null): void {
+  if (!named.has(id) || (named.get(id) === null && tokenId !== null)) named.set(id, tokenId);
 }
 
 function wrongRoute<T>(route: unknown): ReadOutcome<T> {
@@ -111,23 +139,38 @@ function readOrderView(raw: unknown): VenueOrderView | string {
   });
 }
 
-/** `/data/orders`: every live order of the account. */
+/**
+ * `/data/orders`: every live order of the account. Every row is read once, whatever the answer's outcome: an
+ * INCOMPLETE or MALFORMED answer keeps the ids its rows carry (`named`).
+ */
 export function readOpenOrders(raw: unknown): ReadOutcome<readonly VenueOrderView[]> {
   const fields = readFields(raw, ["route", "complete", "orders"]);
   if (fields === undefined) return malformed("the open-orders answer carries a field that is not own data");
   if (fields.route !== "/data/orders") return wrongRoute(fields.route);
-  if (fields.complete !== true) return fields.complete === false ? INCOMPLETE : malformed("the open-orders answer does not say whether it is complete");
   const list = readArray(fields.orders, MAX_READ_ENTRIES);
-  if (list === undefined) return malformed("the open orders are not a list");
   const out: VenueOrderView[] = [];
+  const named = new Map<string, string | null>();
   const seen = new Set<string>();
-  for (const entry of list) {
+  let problem: string | undefined;
+  for (const entry of list ?? []) {
     const order = readOrderView(entry);
-    if (typeof order === "string") return malformed(order);
-    if (seen.has(order.venueOrderId)) return malformed("an open order is listed twice");
+    if (typeof order === "string") {
+      problem ??= order;
+      const id = rowVenueId(entry);
+      if (id !== undefined) keepNamed(named, id, null);
+      continue;
+    }
+    keepNamed(named, order.venueOrderId, order.tokenId);
+    if (seen.has(order.venueOrderId)) {
+      problem ??= "an open order is listed twice";
+      continue;
+    }
     seen.add(order.venueOrderId);
     out.push(order);
   }
+  if (fields.complete !== true) return fields.complete === false ? incomplete(named) : malformed("the open-orders answer does not say whether it is complete", named);
+  if (list === undefined) return malformed("the open orders are not a list");
+  if (problem !== undefined) return malformed(problem, named);
   return ok(Object.freeze(out));
 }
 
@@ -199,23 +242,50 @@ function readTradeView(raw: unknown): VenueTradeView | string {
   });
 }
 
-/** `/data/trades`: every trade of the account, own legs only. */
+/** The ids an unusable trade row's legs carry (each leg read on its own). */
+function keepLegsOf(named: Map<string, string | null>, row: unknown): void {
+  const legs = readField(row, "ownLegs");
+  for (const leg of (legs.kind === "DATA" ? readArray(legs.value, MAX_LEGS_PER_TRADE) : undefined) ?? []) {
+    const valid = readLeg(leg);
+    if (typeof valid !== "string") keepNamed(named, valid.venueOrderId, valid.tokenId);
+    else {
+      const id = rowVenueId(leg);
+      if (id !== undefined) keepNamed(named, id, null);
+    }
+  }
+}
+
+/**
+ * `/data/trades`: every trade of the account, own legs only. Every row is read once, whatever the answer's
+ * outcome: an INCOMPLETE or MALFORMED answer keeps the venue order ids its rows' legs carry (`named`).
+ */
 export function readTrades(raw: unknown): ReadOutcome<readonly VenueTradeView[]> {
   const fields = readFields(raw, ["route", "complete", "trades"]);
   if (fields === undefined) return malformed("the trades answer carries a field that is not own data");
   if (fields.route !== "/data/trades") return wrongRoute(fields.route);
-  if (fields.complete !== true) return fields.complete === false ? INCOMPLETE : malformed("the trades answer does not say whether it is complete");
   const list = readArray(fields.trades, MAX_READ_ENTRIES);
-  if (list === undefined) return malformed("the trades are not a list");
   const out: VenueTradeView[] = [];
+  const named = new Map<string, string | null>();
   const seen = new Set<string>();
-  for (const entry of list) {
+  let problem: string | undefined;
+  for (const entry of list ?? []) {
     const trade = readTradeView(entry);
-    if (typeof trade === "string") return malformed(trade);
-    if (seen.has(trade.venueTradeId)) return malformed("a trade is listed twice");
+    if (typeof trade === "string") {
+      problem ??= trade;
+      keepLegsOf(named, entry);
+      continue;
+    }
+    for (const leg of trade.ownLegs) keepNamed(named, leg.venueOrderId, leg.tokenId);
+    if (seen.has(trade.venueTradeId)) {
+      problem ??= "a trade is listed twice";
+      continue;
+    }
     seen.add(trade.venueTradeId);
     out.push(trade);
   }
+  if (fields.complete !== true) return fields.complete === false ? incomplete(named) : malformed("the trades answer does not say whether it is complete", named);
+  if (list === undefined) return malformed("the trades are not a list");
+  if (problem !== undefined) return malformed(problem, named);
   return ok(Object.freeze(out));
 }
 
@@ -342,6 +412,46 @@ export function readProjectedHoldings(raw: unknown): ReadOutcome<ProjectedHoldin
     );
   }
   return ok(Object.freeze({ lines: outLines, arrivals: Object.freeze(outArrivals) }));
+}
+
+/** The most assets one fill's remaining booking may name (a guard; a fill books its token, its collateral and a fee). */
+export const MAX_BOOKED_ASSETS = 64;
+
+/**
+ * The ledger's remaining booking of each FAILED fill asked about (`HoldingsPort.remainingBookings`), keyed by
+ * `compositeKey(venueTradeId, venueOrderId)`. Exactly one answer per identity asked: one missing, unasked or
+ * repeated is MALFORMED, and so is any amount that is not an exact non-zero decimal.
+ */
+export function readRemainingBookings(raw: unknown, asked: readonly FillIdentity[]): ReadOutcome<ReadonlyMap<string, readonly BookedAmount[]>> {
+  const fields = readFields(raw, ["bookings"]);
+  if (fields === undefined) return malformed("the remaining-bookings answer carries a field that is not own data");
+  const list = readArray(fields.bookings, MAX_READ_ENTRIES);
+  if (list === undefined) return malformed("the remaining bookings are not a list");
+  const wanted = new Set(asked.map((fill) => compositeKey(fill.venueTradeId, fill.venueOrderId)));
+  const out = new Map<string, readonly BookedAmount[]>();
+  for (const entry of list) {
+    const booking = readFields(entry, ["venueTradeId", "venueOrderId", "entries"]);
+    if (booking === undefined || !isIdentifier(booking.venueTradeId) || !isVenueId(booking.venueOrderId)) return malformed("a remaining booking does not name a fill");
+    const key = compositeKey(booking.venueTradeId, booking.venueOrderId);
+    if (!wanted.has(key)) return malformed("a remaining booking names a fill that was not asked about");
+    if (out.has(key)) return malformed("a fill's remaining booking is answered twice");
+    const lines = readArray(booking.entries, MAX_BOOKED_ASSETS);
+    if (lines === undefined) return malformed("a remaining booking's entries are not a list");
+    const amounts: BookedAmount[] = [];
+    const assets = new Set<string>();
+    for (const line of lines) {
+      const read = readFields(line, ["assetId", "amount"]);
+      if (read === undefined || !isIdentifier(read.assetId) || !isCanonicalDecimalString(read.amount) || isZeroDecimal(read.amount)) {
+        return malformed("a remaining booking line is not an asset with an exact non-zero amount");
+      }
+      if (assets.has(read.assetId)) return malformed("a remaining booking names one asset twice");
+      assets.add(read.assetId);
+      amounts.push(Object.freeze({ assetId: read.assetId, amount: read.amount }));
+    }
+    out.set(key, Object.freeze(amounts));
+  }
+  for (const key of wanted) if (!out.has(key)) return malformed("the ledger did not answer for a FAILED fill it was asked about");
+  return ok(out);
 }
 
 /** `{ ok: true }` (own data), or anything else: a refusal. Never throws. */

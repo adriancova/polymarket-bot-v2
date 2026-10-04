@@ -26,7 +26,8 @@ import { describe, expect, it } from "vitest";
 import type { ReconciliationJournal, ReconciliationJournalEvent } from "../../../packages/ledger/src/index.js";
 import type { OmsAlert, OrderManager, ReconciliationJournalPort } from "../../../packages/oms/src/index.js";
 
-import { MARKET, boot } from "./support/harness.js";
+import { MARKET, boot, bookReversal } from "./support/harness.js";
+import type { VenueTrade } from "./support/world.js";
 import { expectPaused, ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 
 /** Run `inject` once, while the coordinator's PASSED completion is being appended (before it is durable). */
@@ -183,7 +184,7 @@ describe("WP-290 deliverable 3: resume only when every invariant still holds at 
 
 describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2, R2-C)", () => {
   /** One BUY order matched by two trades, both MINED; reconciled and resumed. */
-  async function twoTrades(): Promise<{ r: Ready; first: { status: string }; second: { status: string } }> {
+  async function twoTrades(): Promise<{ r: Ready; first: VenueTrade; second: VenueTrade }> {
     const r = await ready();
     await submitOne(r.oms);
     const salt = r.u.world.receipts.at(-1) as string;
@@ -191,7 +192,17 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     const second = r.u.world.match(salt, "0.3", { status: "MINED" });
     expect(first !== undefined && second !== undefined).toBe(true);
     expect(await reconcileRounds(r, 6)).toBe(true);
-    return { r, first: first as { status: string }, second: second as { status: string } };
+    return { r, first: first as VenueTrade, second: second as VenueTrade };
+  }
+
+  /**
+   * r4 (WP290-CX-R4-02): a FAILED settlement never moved the chain (`failTrade` moves the holdings back), and the
+   * ledger owes its compensating reversal (`bookReversal`): the account resumes only once the ledger books it
+   * (`SETTLEMENT_REVERSAL_OWED`), whatever was released. Before r4 these tests released and resumed with the FAILED
+   * fill still booked, which is the defect.
+   */
+  function reverse(r: Ready, trade: VenueTrade): void {
+    expect(bookReversal(r.u, trade.venueTradeId, trade.venueOrderId)).toBe(1);
   }
 
   function alertBreaks(r: Ready): ReturnType<Ready["p"]["journal"]["unresolvedBreaks"]> {
@@ -218,7 +229,7 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
 
   it("(R2-C) a second halting alert of one kind on one order, after the first was released: its own quarantine, its market halted, never resumed past", async () => {
     const { r, first, second } = await twoTrades();
-    first.status = "FAILED"; // the OMS raises SETTLEMENT_FAILED (a compensating reversal is owed)
+    r.u.world.failTrade(first); // the OMS raises SETTLEMENT_FAILED (a compensating reversal is owed)
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
     const firstAlert = alertBreaks(r);
@@ -226,9 +237,11 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     await release(r, firstAlert[0]?.breakId);
     expect(await reconcileRounds(r, 2)).toBe(false); // the trade's own quarantine still holds
     await releaseFailed(r, 1);
+    expect(await reconcileRounds(r, 2)).toBe(false); // released, but the ledger still books the FAILED fill (r4)
+    reverse(r, first);
     expect(await reconcileRounds(r, 4)).toBe(true);
     const haltsBefore = r.u.halts.length;
-    second.status = "FAILED"; // the same kind of alert, on the same order: another reversal is owed
+    r.u.world.failTrade(second); // the same kind of alert, on the same order: another reversal is owed
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
     expect(r.oms.alerts().filter((alert) => alert.kind === "SETTLEMENT_FAILED" && alert.haltMarket)).toHaveLength(2);
@@ -237,16 +250,17 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     expect(secondAlert[0]?.breakId).not.toBe(firstAlert[0]?.breakId);
     expect(secondAlert[0]?.status).toBe("QUARANTINED");
     expect(r.u.halts.slice(haltsBefore).some((halt) => halt.breakId === secondAlert[0]?.breakId && halt.marketId === MARKET)).toBe(true);
-    // Released in turn (the alert, and the second trade's own quarantine), the account resumes.
+    // Released in turn (the alert, and the second trade's own quarantine), and reversed, the account resumes.
     await release(r, secondAlert[0]?.breakId);
     await releaseFailed(r, 1);
+    reverse(r, second);
     expect(await reconcileRounds(r, 4)).toBe(true);
   });
 
   it("(R2-C) two halting alerts raised before one run: two quarantines; releasing one leaves the other holding", async () => {
     const { r, first, second } = await twoTrades();
-    first.status = "FAILED";
-    second.status = "FAILED";
+    r.u.world.failTrade(first);
+    r.u.world.failTrade(second);
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
     const both = alertBreaks(r);
@@ -259,24 +273,27 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     await release(r, both[1]?.breakId);
     expect(await reconcileRounds(r, 2)).toBe(false); // each trade's own quarantine still holds
     await releaseFailed(r, 2);
+    reverse(r, first);
+    reverse(r, second);
     expect(await reconcileRounds(r, 3)).toBe(true);
   });
 
   it("(R2-C) after a restart, a new halting alert is never taken for one released before the restart", async () => {
     const { r, first, second } = await twoTrades();
-    first.status = "FAILED";
+    r.u.world.failTrade(first);
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await r.p.coordinator.reconcile();
     const before = alertBreaks(r);
     expect(before).toHaveLength(1);
     await release(r, before[0]?.breakId);
     await releaseFailed(r, 1);
+    reverse(r, first);
     expect(await reconcileRounds(r, 4)).toBe(true);
     // A fresh process: its OMS's first alert stands where the released one stood before the restart.
     const p = await boot(r.u);
     const again: Ready = { u: r.u, p, oms: p.oms as OrderManager };
     expect(await reconcileRounds(again, 4)).toBe(true);
-    second.status = "FAILED";
+    r.u.world.failTrade(second);
     again.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(again, (await again.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
     const after = alertBreaks(again);
@@ -290,12 +307,13 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
   ] as const) {
     it(`(R2-C) an alert list that is not append-only (${variant}) holds the account: alerts can no longer be told apart`, async () => {
       const { r, first } = await twoTrades();
-      first.status = "FAILED";
+      r.u.world.failTrade(first);
       r.p.coordinator.trigger("PERIODIC_TIMER");
       await r.p.coordinator.reconcile();
       const alert = alertBreaks(r);
       await release(r, alert[0]?.breakId);
       await releaseFailed(r, 1);
+      reverse(r, first);
       expect(await reconcileRounds(r, 4)).toBe(true);
       r.u.seams.alerts = rewrite; // the OMS port breaks its contract
       r.p.coordinator.trigger("PERIODIC_TIMER");

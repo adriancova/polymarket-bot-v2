@@ -23,7 +23,15 @@
  */
 
 import { addDecimal, compareDecimal, mulDecimal, negateDecimal } from "../../../../packages/decimal/src/index.js";
-import { Ledger, buildUnattributedCorrection, projectLedger, projectedHoldings, ReconciliationJournal, type ReconciliationJournalEvent } from "../../../../packages/ledger/src/index.js";
+import {
+  Ledger,
+  buildUnattributedCorrection,
+  projectLedger,
+  projectedHoldings,
+  remainingFillBookings,
+  ReconciliationJournal,
+  type ReconciliationJournalEvent,
+} from "../../../../packages/ledger/src/index.js";
 import {
   OrderManager,
   ReconciliationCoordinator,
@@ -114,6 +122,8 @@ export interface Universe {
     refuseBooking?: boolean;
     /** The halt port throws. */
     haltsFail?: boolean;
+    /** The ledger's answer about FAILED fills' remaining bookings (r4), e.g. one that omits a fill or throws. */
+    remainingBookings?: (fills: readonly { readonly venueTradeId: string; readonly venueOrderId: string }[], real: () => unknown) => unknown;
   };
 }
 
@@ -260,8 +270,86 @@ export function syncLedger(u: Universe): void {
     });
     if (!appended.ok) throw new Error(`fill posting refused: ${JSON.stringify(appended.refusals)}`);
     u.ledger = appended.value.ledger;
+    // A fee charged in the collateral is its own PLATFORM_FEE transaction naming the fill (as `fill-posting.ts`).
+    if (fill.feeAssetId === PUSD && compareDecimal(fill.feeAmount, "0") > 0) {
+      const fee = u.ledger.append({
+        ledgerTransactionId: u.ledgerIds(),
+        eventType: "PLATFORM_FEE",
+        environment: "PAPER",
+        accountRef: ACCOUNT,
+        source: "polymarket",
+        occurredAt: fill.matchedAt,
+        marketId: market,
+        fillId: fill.fillId,
+        entries: [
+          leg("ACTUAL_ACCOUNT", ACCOUNT, PUSD, "COLLATERAL", negateDecimal(fill.feeAmount), { marketId: market }),
+          leg("FEE_EXPENSE", "fee-expense", PUSD, "COLLATERAL", fill.feeAmount, { marketId: market }),
+          leg("VIRTUAL_STRATEGY", ACCOUNT, PUSD, "COLLATERAL", negateDecimal(fill.feeAmount), { marketId: market, instanceId: INSTANCE_A }),
+          leg("EXTERNAL_CLEARING", "clearing-attribution", PUSD, "COLLATERAL", fill.feeAmount),
+        ],
+      });
+      if (!fee.ok) throw new Error(`fee posting refused: ${JSON.stringify(fee.refusals)}`);
+      u.ledger = fee.value.ledger;
+    }
     u.postedFills.add(fill.fillId);
   }
+}
+
+/** The OMS's fill ids for one venue trade on one venue order (`execution.fills`). */
+function fillIdsOf(u: Universe, venueTradeId: string, venueOrderId: string): string[] {
+  return u.store
+    .snapshotSync()
+    .fills.filter((fill) => fill.venueTradeId === venueTradeId && fill.venueOrderId === venueOrderId)
+    .map((fill) => fill.fillId);
+}
+
+/**
+ * The composition's `HoldingsPort.remainingBookings` (r4): the OMS's fills joined with the ledger's
+ * `remainingFillBookings`, one answer per identity asked.
+ */
+export function remainingBookingsOf(u: Universe, fills: readonly { readonly venueTradeId: string; readonly venueOrderId: string }[]): unknown {
+  syncLedger(u);
+  const asked = fills.map((fill) => ({ fill, ids: fillIdsOf(u, fill.venueTradeId, fill.venueOrderId) }));
+  const remaining = remainingFillBookings(u.ledger.transactions(), ACCOUNT, asked.flatMap((entry) => entry.ids));
+  return {
+    bookings: asked.map(({ fill, ids }) => {
+      const sums = new Map<string, string>();
+      for (const id of ids) for (const line of remaining.get(id) ?? []) sums.set(line.assetId, addDecimal(sums.get(line.assetId) ?? "0", line.amount));
+      return {
+        venueTradeId: fill.venueTradeId,
+        venueOrderId: fill.venueOrderId,
+        entries: [...sums].filter(([, amount]) => compareDecimal(amount, "0") !== 0).map(([assetId, amount]) => ({ assetId, amount })),
+      };
+    }),
+  };
+}
+
+/**
+ * The operator's compensating reversal of a FAILED trade's fill (ADR-006 §5): every ledger transaction that books
+ * the trade's fill on `venueOrderId` (its principal, its fee) and is not yet reversed is reversed, exactly, with
+ * `reversesLedgerTransactionId` (`Ledger.append` refuses anything else). `only` limits it to one event type.
+ */
+export function bookReversal(u: Universe, venueTradeId: string, venueOrderId: string, only?: string): number {
+  syncLedger(u);
+  const ids = new Set(fillIdsOf(u, venueTradeId, venueOrderId));
+  const reversed = new Set(u.ledger.transactions().flatMap(({ transaction }) => (transaction.reversesLedgerTransactionId === undefined ? [] : [transaction.reversesLedgerTransactionId])));
+  let count = 0;
+  for (const { transaction } of u.ledger.transactions()) {
+    if (transaction.fillId === undefined || !ids.has(transaction.fillId) || transaction.reversesLedgerTransactionId !== undefined) continue;
+    if (reversed.has(transaction.ledgerTransactionId) || (only !== undefined && transaction.eventType !== only)) continue;
+    const appended = u.ledger.append({
+      ...transaction,
+      ledgerTransactionId: u.ledgerIds(),
+      eventType: "MANUAL_ADJUSTMENT",
+      source: "internal",
+      reversesLedgerTransactionId: transaction.ledgerTransactionId,
+      entries: transaction.entries.map((entry) => ({ ...entry, amount: negateDecimal(entry.amount) })),
+    });
+    if (!appended.ok) throw new Error(`reversal refused: ${JSON.stringify(appended.refusals)}`);
+    u.ledger = appended.value.ledger;
+    count += 1;
+  }
+  return count;
 }
 
 /** The ledger's projected holdings of the account, after the durable fills are folded in. */
@@ -413,6 +501,10 @@ export async function boot(u: Universe, plan: KillPlan | null = null): Promise<P
     journal: u.seams.journal === undefined ? journal : u.seams.journal(journal),
     holdings: {
       projected: () => inc.call("ledger.projected", async () => projectedHoldings(projectLedgerSynced(u), ACCOUNT)),
+      remainingBookings: (fills) =>
+        inc.call("ledger.bookings", async () =>
+          u.seams.remainingBookings === undefined ? remainingBookingsOf(u, fills) : u.seams.remainingBookings(fills, () => remainingBookingsOf(u, fills)),
+        ),
       bookUnattributed: (booking) =>
         inc.call("ledger.book", async () => {
           if (u.seams.refuseBooking === true) return { ok: false };

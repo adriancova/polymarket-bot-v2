@@ -22,12 +22,21 @@
  * so it makes its assets ambiguous while in transit (and is already an
  * UNATTRIBUTED trade).
  *
+ * A FAILED trade never moves the chain, and the ledger books its fill until a
+ * compensating reversal cancels it (ADR-006 §5, decision 2). So a FAILED leg
+ * explains EXACTLY what the ledger still books of its fill (r4,
+ * WP290-CX-R4-02: `remaining`, from `packages/ledger`'s
+ * `remainingFillBookings`), never its nominal delta: a fully reversed fill
+ * explains nothing, and a later unrelated movement equal to it is
+ * UNEXPLAINED. The coordinator holds the account while any of it remains
+ * (`SETTLEMENT_REVERSAL_OWED`), so a remaining booking never resumes trading.
+ *
  * Pure decimal arithmetic. No I/O, no clock, no randomness.
  */
 
 import { addDecimal, compareDecimal, isZeroDecimal, mulDecimal, negateDecimal, subDecimal, type DecimalString } from "@polymarket-bot/decimal";
 
-import type { VenueTradeLeg } from "./ports.js";
+import type { BookedAmount, VenueTradeLeg } from "./ports.js";
 
 export interface PendingDelta {
   /** The summed delta the legs in transit would add to the holding once settled; meaningful only when `exact`. */
@@ -52,11 +61,14 @@ interface MutablePending {
 /**
  * The per-asset deltas of the account's legs still in transit. `attributed`
  * says whether the leg's order is tracked by the OMS (and so booked in the
- * projection at its match).
+ * projection at its match). `remaining` is what the ledger still books of the
+ * FAILED fills (see the header): each amount is booked in the projection and
+ * absent from the chain, exactly.
  */
 export function pendingDeltas(
   legs: readonly { readonly leg: VenueTradeLeg; readonly attributed: boolean }[],
   collateralAssetId: string,
+  remaining: readonly BookedAmount[] = [],
 ): ReadonlyMap<string, PendingDelta> {
   const out = new Map<string, MutablePending>();
   const touch = (assetId: string): MutablePending => {
@@ -85,6 +97,10 @@ export function pendingDeltas(
       token.unattributed = true;
       collateral.unattributed = true;
     }
+  }
+  for (const booked of remaining) {
+    const asset = touch(booked.assetId);
+    asset.delta = addDecimal(asset.delta, booked.amount);
   }
   const frozen = new Map<string, PendingDelta>();
   for (const [assetId, entry] of out) frozen.set(assetId, Object.freeze({ ...entry }));

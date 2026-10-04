@@ -29,11 +29,14 @@
  *    must be read by id (E-14: an order absent from the open list is not
  *    proof of cancellation; every tracked order still open, every one with
  *    fills, terminal or not, every one an unresolved break names, every venue
- *    order an unresolved hold names in its subject, and every venue order a
- *    run saw but could not classify: once seen, an id is never forgotten,
- *    and one its by-id read no longer finds is a READ_CONFLICT),
+ *    order an unresolved break names in its subject, and every venue order id
+ *    a run observed but could not classify, the rows of a partial or
+ *    malformed answer included: once observed, an id is never forgotten. One
+ *    a read SHOWED in full, which its by-id read no longer finds, is a
+ *    READ_CONFLICT; one only NAMED, an ORDER_NOT_FOUND_BY_ID quarantine),
  *    positions (`/v2`), the collateral balance, approvals, the ledger
- *    projection, and each wallet-operation member a request names. A read
+ *    projection, what the ledger still books of each FAILED fill, and each
+ *    wallet-operation member a request names. A read
  *    made before a request was received NEVER answers it (ADR-032 D4;
  *    `WP300C-OBLIGATIONS`): a request that arrives during the reads waits for
  *    the next run, which starts at once.
@@ -59,7 +62,10 @@
  *    obligation is derived again from durable or authoritative state in every
  *    run, never only from process memory: each ledger arrival (per
  *    transaction, movement kind, asset and market) and each FAILED settlement
- *    the venue shows (per trade and order) has its own break.
+ *    the venue shows (per trade and order) has its own break. A FAILED fill
+ *    explains only what the ledger still books of it, and while any of it
+ *    remains, its reversal is owed (`SETTLEMENT_REVERSAL_OWED`, a hold only
+ *    the ledger clears: a release is not proof of a booking).
  * 8. RESUME ONLY IF EVERY REQUIRED INVARIANT PASSES (see RESUME below).
  *
  * ## The obligations other packages put on this one
@@ -129,7 +135,8 @@
  * break about one tracked order's state or fills needs a run that compared
  * that order in full and found nothing wrong with it (an order skipped, or
  * whose fills could not be verified, clears nothing); a break whose subject
- * names one venue order or trade needs a run that read it; an attempt's
+ * names one venue order or trade needs a run that read it (an order a read
+ * showed: found again; an order only named: its by-id read answered); an attempt's
  * ambiguity or refused answer needs a run that judged or answered it. A
  * release acknowledges immutable history only; a live contradiction (a
  * tracked order's facts) opens again while it is found. Each OMS halting
@@ -163,9 +170,11 @@ import {
   readPositions,
   readProjectedHoldings,
   readRefusalCode,
+  readRemainingBookings,
   readTrades,
   readWalletMember,
   tradeStatusOf,
+  type NamedOrders,
   type ProjectedHoldingsRead,
   type ReadOutcome,
   type WalletMemberRead,
@@ -173,9 +182,11 @@ import {
 import { compareHolding, pendingDeltas } from "./holdings.js";
 import { couldBelong, resolveBySignedIdentity, type AttemptFacts, type PotentialOwner } from "./identity.js";
 import type {
+  BookedAmount,
   BreakClass,
   BreakRule,
   BreakScope,
+  FillIdentity,
   JournalBreakView,
   JournalInput,
   OmsReconciliationRequest,
@@ -191,7 +202,7 @@ import type {
   VenueTradeView,
   WalletReconciliationRequest,
 } from "./ports.js";
-import { venueSubjectOf } from "./subjects.js";
+import { namesOrderOnly, venueSubjectOf } from "./subjects.js";
 import { isoFromEpochMs } from "./time.js";
 
 /** The most runs one {@link ReconciliationCoordinator.reconcile} call makes when work keeps arriving during a run. */
@@ -215,7 +226,14 @@ const DEFERS_HOLDINGS: readonly BreakClass[] = [
   "ORDER_TRADES_INCOMPLETE",
 ];
 /** Classes only the holding comparison finds: a run that did not judge the holdings never clears them (it did not look). */
-const JUDGED_WITH_HOLDINGS: readonly BreakClass[] = ["HOLDING_IN_TRANSIT_AMBIGUOUS", "HOLDING_DELTA_UNCONFIRMED", "CORRECTION_FAILED", "APPROVAL_MISSING", "WALLET_OPERATION_IN_FLIGHT"];
+const JUDGED_WITH_HOLDINGS: readonly BreakClass[] = [
+  "HOLDING_IN_TRANSIT_AMBIGUOUS",
+  "HOLDING_DELTA_UNCONFIRMED",
+  "CORRECTION_FAILED",
+  "APPROVAL_MISSING",
+  "WALLET_OPERATION_IN_FLIGHT",
+  "SETTLEMENT_REVERSAL_OWED",
+];
 /**
  * Classes about one tracked order's state or fills (the break names the order): a run clears one only if it
  * compared that order in full and found nothing wrong with it (`RunState.ordersJudged`, `#judged`). A run that
@@ -349,13 +367,19 @@ class RunState {
   /** Subjects this run did not judge again: it never clears them as NOT_REPRODUCED (see `#judged`). */
   readonly unjudged = new Set<string>();
   /**
-   * Venue order ids this run read by id because an earlier observation must not be forgotten (an unresolved hold
-   * names the order, or a run saw it and could not classify it): one its by-id read no longer finds is a contradiction.
+   * Venue order ids this run read by id because an earlier observation must not be forgotten (an unresolved break
+   * names the order, or a run observed it and could not classify it), each with whether a read SHOWED it in full
+   * (`subjects.ts`'s provenance). One a read showed, which its by-id read no longer finds, is a contradiction
+   * (`READ_CONFLICT`); one only NAMED, which a sound run's by-id read does not find, is `ORDER_NOT_FOUND_BY_ID`.
    */
-  readonly watched = new Set<string>();
+  readonly watched = new Map<string, boolean>();
+  /** Watched venue order ids no read showed in full, which this run's by-id read did not find (r4). */
+  readonly namedNotFound = new Set<string>();
   /** Venue orders this run's reads showed (listed, or found by id), and venue trades its trades read showed (`#judged`). */
   readonly venueOrdersRead = new Set<string>();
   readonly tradesRead = new Set<string>();
+  /** Venue orders whose by-id read answered in its shape this run, found or not (`#judged`, for a NAMED subject). */
+  readonly byIdAnswered = new Set<string>();
   constructor(
     readonly runId: string,
     public runStartSeq: number,
@@ -456,11 +480,12 @@ export class ReconciliationCoordinator {
   /** Fill and settlement facts the OMS already refused as contradictions: not offered again (each offer raises an OMS alert). */
   readonly #knownConflicts = new Set<string>();
   /**
-   * Venue order ids a run saw (in the list, by id, on a trade leg) while its reads were not one consistent view, and
-   * no tracked order claims: read by id in every run until a sound run classifies them (E-14). The durable copy is
-   * the `ORDER_UNRESOLVED` break each one is recorded as (`#watchUnclassified`); this one covers a failed journal write.
+   * Venue order ids a run observed (see `#readAll`'s sources) while its reads were not one consistent view, and no
+   * tracked order claims, each with whether a read SHOWED it in full: read by id in every run until a sound run
+   * classifies them (E-14). The durable copy is the `ORDER_UNRESOLVED` break each one is recorded as
+   * (`#watchUnclassified`); this one covers a failed journal write.
    */
-  readonly #unclassified = new Set<string>();
+  readonly #unclassified = new Map<string, boolean>();
   /**
    * Each bound OMS instance's alert identity. `OmsAlert` carries no id, and two alerts can be identical (two trades
    * of one order FAILED): an alert is its instance's incarnation id and its ordinal in the instance's append-only
@@ -718,9 +743,12 @@ export class ReconciliationCoordinator {
       await this.#compareOrdersAndTrades(run, oms, view, readsStartedAt);
     }
     // Every venue order of a sound view is classified now (tracked, ORDER_UNRESOLVED or ORDER_UNATTRIBUTED, each a
-    // durable record); an unsound view classifies nothing, so every unclaimed order it showed is kept (E-14).
-    if (run.orderReadsSound) for (const id of view.venueOrders.keys()) this.#unclassified.delete(id);
-    else this.#watchUnclassified(run, oms, reads);
+    // durable record), and so is every watched id no read showed in full that its by-id read does not find
+    // (ORDER_NOT_FOUND_BY_ID); an unsound view classifies nothing, so every unclaimed id it observed is kept (E-14).
+    if (run.orderReadsSound) {
+      for (const id of view.venueOrders.keys()) this.#unclassified.delete(id);
+      this.#namedNotFound(run, oms);
+    } else this.#watchUnclassified(run, oms, reads);
     await this.#answerWalletRequests(run, answerableWallet, reads.walletMembers);
     if (run.orderReadsSound && run.readsComplete) {
       // The ledger projection was read before this run's fill deliveries and routings: while the OMS and the venue
@@ -778,6 +806,16 @@ export class ReconciliationCoordinator {
     const open = openCall.ok ? readOpenOrders(openCall.raw) : failed<readonly VenueOrderView[]>();
     const tradesCall = await callRead(() => ports.listTrades());
     const trades = tradesCall.ok ? readTrades(tradesCall.raw) : failed<readonly VenueTradeView[]>();
+    // OBSERVED (D-O1, r4 WP290-CX-R4-01): every venue order id this run's reads showed or named, and whether a read
+    // that answered in full SHOWED it. Five sources, each its own line: a complete open-orders list (shown); a row
+    // of a partial or malformed open-orders answer (named: the answer is discarded, its ids are not); a leg of a
+    // valid trades read (shown); a leg of a partial or malformed trades answer (named); and each by-id read below
+    // (shown when it found the order, named otherwise). `#watchUnclassified` records them when the run is unsound.
+    const observed = new Map<string, Observation>();
+    if (open.kind === "OK") for (const order of open.value) observe(observed, order.venueOrderId, true, order.tokenId, "the open-orders list");
+    for (const [id, tokenId] of namedIn(open)) observe(observed, id, false, tokenId, "a row of a partial or malformed open-orders answer");
+    if (trades.kind === "OK") for (const trade of trades.value) for (const leg of trade.ownLegs) observe(observed, leg.venueOrderId, true, leg.tokenId, "a leg of the trades read");
+    for (const [id, tokenId] of namedIn(trades)) observe(observed, id, false, tokenId, "a leg of a partial or malformed trades answer");
     // By id (E-14): unclaimed open orders, orders named by our trade legs and not listed, tracked open orders not
     // listed, and every tracked order a current request names.
     const listed = new Set(open.kind === "OK" ? open.value.map((order) => order.venueOrderId) : []);
@@ -798,15 +836,20 @@ export class ReconciliationCoordinator {
     // Every venue order an unresolved hold names, and every one a run saw but could not classify (E-14: absence from
     // the list is not proof of cancellation; missing orders are resolved by id). Once seen, an id is never forgotten
     // while anything about it is unresolved: it stays a candidate for every unknown attempt, and stays compared.
-    for (const id of [...this.#venueOrdersNamedByHolds(), ...this.#unclassified]) {
+    // Each comes with whether a read SHOWED it in full (`subjects.ts`'s provenance; `RunState.watched`).
+    for (const [id, shown] of [...this.#venueOrdersNamedByHolds(), ...this.#unclassified]) {
       if (!isVenueId(id)) continue;
       ids.add(id);
-      run.watched.add(id);
+      run.watched.set(id, run.watched.get(id) === true || shown);
     }
     const byId = new Map<string, ReadOutcome<VenueOrderView | null>>();
     for (const id of [...ids].sort()) {
       const call = await callRead(() => ports.readOrder(id));
       byId.set(id, call.ok ? readOrderById(call.raw, id) : failed());
+    }
+    for (const [id, outcome] of byId) {
+      const found = outcome.kind === "OK" ? outcome.value : null;
+      observe(observed, id, found !== null, found?.tokenId ?? null, found !== null ? "its by-id read" : "a by-id read that did not show it");
     }
     const positionsCall = await callRead(() => ports.readPositions());
     const positions = positionsCall.ok ? readPositions(positionsCall.raw) : failed<ReadonlyMap<string, DecimalString>>();
@@ -816,6 +859,11 @@ export class ReconciliationCoordinator {
     const approvals = approvalsCall.ok ? readApprovals(approvalsCall.raw) : failed<ReadonlyMap<string, boolean>>();
     const projectedCall = await callRead(() => this.#deps.holdings.projected());
     const projected = projectedCall.ok ? readProjectedHoldings(projectedCall.raw) : failed<ProjectedHoldingsRead>();
+    // What the ledger still books of each FAILED fill the trades read shows (r4, WP290-CX-R4-02; ADR-006 §5): the
+    // only holding difference such a fill explains, and, while any of it remains, a reversal owed.
+    const failedFills = failedFillsOf(trades);
+    const bookingsCall = failedFills.length === 0 ? { ok: true as const, raw: { bookings: [] } } : await callRead(() => this.#deps.holdings.remainingBookings(failedFills));
+    const bookings = bookingsCall.ok ? readRemainingBookings(bookingsCall.raw, failedFills) : failed<ReadonlyMap<string, readonly BookedAmount[]>>();
     const walletMembers = new Map<string, ReadOutcome<WalletMemberRead>>();
     for (const entry of answerableWallet) {
       for (const member of walletMembersOf(entry.request)) {
@@ -825,7 +873,7 @@ export class ReconciliationCoordinator {
         walletMembers.set(member, call.ok ? readWalletMember(call.raw) : failed());
       }
     }
-    return { open, trades, byId, positions, collateral, approvals, projected, walletMembers };
+    return { open, trades, byId, observed, positions, collateral, approvals, projected, bookings, walletMembers };
   }
 
   /** Read-level problems, and the run's one view of the account's orders and trades. */
@@ -843,6 +891,7 @@ export class ReconciliationCoordinator {
     this.#readProblem(run, "collateral", reads.collateral);
     this.#readProblem(run, "approvals", reads.approvals);
     this.#readProblem(run, "ledger-projection", reads.projected);
+    this.#readProblem(run, "ledger-fill-bookings", reads.bookings);
     // Every observation is validated on its own BEFORE two reads of one order are merged, so a later read never
     // erases what an earlier one showed (an unrecognised status, an out-of-order state).
     if (reads.open.kind === "OK") {
@@ -857,6 +906,7 @@ export class ReconciliationCoordinator {
         continue;
       }
       if (outcome.kind !== "OK") continue;
+      run.byIdAnswered.add(id);
       const listed = venueOrders.get(id);
       const order = outcome.value;
       if (order === null) {
@@ -868,8 +918,8 @@ export class ReconciliationCoordinator {
             subjectKey: compositeKey("READ_CONFLICT", "order", id),
             detail: `venue order ${id} is in the open-orders list but its by-id read did not find it`,
           });
-        } else if (run.watched.has(id)) {
-          // An earlier read showed it, and E-14 says the by-id read finds canceled and fully matched orders: the two
+        } else if (run.watched.get(id) === true) {
+          // An earlier read SHOWED it, and E-14 says the by-id read finds canceled and fully matched orders: the two
           // reads contradict each other, and nothing is concluded (it stays a candidate no answer may ignore).
           sound(false);
           this.#detect(run, {
@@ -877,6 +927,11 @@ export class ReconciliationCoordinator {
             subjectKey: compositeKey("READ_CONFLICT", "order", id),
             detail: `venue order ${id} was seen by an earlier read, but its by-id read does not find it (E-14: canceled and fully matched orders are found by id)`,
           });
+        } else if (run.watched.has(id)) {
+          // Only NAMED (no read showed it in full: retained stream evidence, a request, a row of an unusable answer),
+          // and the venue's by-id read does not find it: no earlier read is contradicted. A sound run records it as
+          // ORDER_NOT_FOUND_BY_ID, a quarantine an operator can release (`#namedNotFound`; r4, GHOST-ID).
+          run.namedNotFound.add(id);
         }
         continue;
       }
@@ -1012,38 +1067,61 @@ export class ReconciliationCoordinator {
 
   /**
    * A run whose reads are not one consistent view (or are stale) classifies none of the venue orders they showed.
-   * Every one of them no tracked order claims (in the list, found by id, or named by a trade leg) is recorded as an
-   * `ORDER_UNRESOLVED` hold keyed by the venue order, and kept in memory: either way it is read by id in every later
-   * run (`#readAll`), so it stays a candidate for every unknown attempt and is classified by the first sound run
-   * (tracked by a PRESENT answer, `ORDER_UNRESOLVED` while an attempt could own it, or `ORDER_UNATTRIBUTED`).
-   * Nothing about the order is concluded here.
+   * Every id it OBSERVED (`RunReads.observed`: the five sources in `#readAll`) that no tracked order claims is
+   * recorded as an `ORDER_UNRESOLVED` hold keyed by the venue order, with its provenance (`venue-order` when a read
+   * that answered in full showed it, `venue-order-named` otherwise), and kept in memory: either way it is read by
+   * id in every later run (`#readAll`), so it stays a candidate for every unknown attempt and is classified by the
+   * first sound run (tracked by a PRESENT answer, `ORDER_UNRESOLVED` while an attempt could own it,
+   * `ORDER_UNATTRIBUTED`, or, for a NAMED id its by-id read does not find, `ORDER_NOT_FOUND_BY_ID`). Nothing about
+   * the order is concluded here.
    */
   #watchUnclassified(run: RunState, oms: ReconciledOms, reads: RunReads): void {
-    const seen = new Map<string, string | null>();
-    if (reads.open.kind === "OK") for (const order of reads.open.value) seen.set(order.venueOrderId, order.tokenId);
-    for (const [id, outcome] of reads.byId) if (!seen.has(id)) seen.set(id, outcome.kind === "OK" && outcome.value !== null ? outcome.value.tokenId : null);
-    if (reads.trades.kind === "OK") {
-      for (const trade of reads.trades.value) for (const leg of trade.ownLegs) if (!seen.has(leg.venueOrderId)) seen.set(leg.venueOrderId, leg.tokenId);
-    }
     const claimed = claimedVenueIds(oms.orders(), oms.attempts());
-    for (const [id, tokenId] of [...seen].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    for (const [id, seen] of [...reads.observed].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
       if (claimed.has(id)) continue;
-      if (this.#unclassified.size < MAX_UNCLASSIFIED) this.#unclassified.add(id);
+      if (this.#unclassified.has(id) || this.#unclassified.size < MAX_UNCLASSIFIED) this.#unclassified.set(id, this.#unclassified.get(id) === true || seen.shown);
+      const sources = seen.sources.join("; ");
       this.#detect(run, {
         breakClass: "ORDER_UNRESOLVED",
-        subjectKey: compositeKey("ORDER_UNRESOLVED", "venue-order", id),
-        ...(tokenId === null ? {} : this.#marketOf(tokenId)),
-        detail: `venue order ${id} was seen by a run whose reads were not one consistent view, and no tracked order claims it: it is read by id in every run until a sound run classifies it (E-14)`,
+        subjectKey: compositeKey("ORDER_UNRESOLVED", seen.shown ? "venue-order" : "venue-order-named", id),
+        ...(seen.tokenId === null ? {} : this.#marketOf(seen.tokenId)),
+        detail: seen.shown
+          ? `venue order ${id} was seen by a run whose reads were not one consistent view (shown by ${sources}), and no tracked order claims it: it is read by id in every run until a sound run classifies it (E-14)`
+          : `venue order ${id} was named by a run whose reads were not one consistent view (${sources}), but no read showed it in full, and no tracked order claims it: it is read by id in every run until a sound run classifies it, or finds it nowhere (ORDER_NOT_FOUND_BY_ID)`,
       });
     }
   }
 
-  /** The venue orders unresolved holds name in their subjects (`subjects.ts`). Unreadable: none (that run cannot pass). */
-  #venueOrdersNamedByHolds(): string[] {
-    const out: string[] = [];
+  /**
+   * A sound run's verdict on each watched id no read showed in full, which its by-id read does not find
+   * (`RunState.namedNotFound`; r4, WP290-V4-GHOST-ID-PERMANENT-HOLD). No earlier read is contradicted, so it is not
+   * a `READ_CONFLICT`: the evidence is kept as an `ORDER_NOT_FOUND_BY_ID` quarantine (the account is halted), which
+   * names the id, so it is read by id while the quarantine stands and classified like any order once found; an
+   * operator's release acknowledges that the venue does not show it. A tracked order's id is the OMS's to judge
+   * (`#compareOrdersAndTrades`), not this rule's.
+   */
+  #namedNotFound(run: RunState, oms: ReconciledOms): void {
+    const claimed = claimedVenueIds(oms.orders(), oms.attempts());
+    for (const id of [...run.namedNotFound].sort()) {
+      this.#unclassified.delete(id);
+      if (claimed.has(id)) continue;
+      this.#detect(run, {
+        breakClass: "ORDER_NOT_FOUND_BY_ID",
+        subjectKey: compositeKey("ORDER_NOT_FOUND_BY_ID", id),
+        detail: `venue order ${id} was named (by retained stream evidence, a request, or a row of a partial or malformed answer) while it could not be classified, no read ever showed it in full, and the venue's by-id read does not find it (E-14: canceled and fully matched orders are found by id): quarantined until an operator releases it`,
+      });
+    }
+  }
+
+  /**
+   * The venue orders unresolved breaks name in their subjects (`subjects.ts`), each with whether a read SHOWED it in
+   * full (its provenance). Unreadable: none (that run cannot pass).
+   */
+  #venueOrdersNamedByHolds(): [string, boolean][] {
+    const out: [string, boolean][] = [];
     for (const view of this.#unresolvedBreaks() ?? []) {
       const named = venueSubjectOf(view.breakClass, view.subjectKey);
-      if (named !== null && named.kind === "order") out.push(named.id);
+      if (named !== null && named.kind === "order") out.push([named.id, !namesOrderOnly(view.breakClass, view.subjectKey)]);
     }
     return out;
   }
@@ -1472,9 +1550,13 @@ export class ReconciliationCoordinator {
    * per (trade, order), whatever the OMS remembers. The OMS raises `SETTLEMENT_FAILED` only into its in-memory alert
    * list, once, on the transition into FAILED; a process that dies after the OMS recorded the FAILED settlement
    * durably, but before this coordinator journaled that alert, restarts with no alert (the restore replays the
-   * settlement silently, and a repeated FAILED is idempotent). FAILED is terminal, so the venue keeps showing it,
-   * and the next sound run records this quarantine again until an operator releases it (which acknowledges that
-   * one trade's failure for good). The OMS's own alert, when it is seen, is a quarantine of its own as well.
+   * settlement silently, and a repeated FAILED is idempotent). FAILED is "terminal failure"
+   * (`docs/venue/verified-2026-08-24.md`, the SDK's `TradeStatus`; ADR-006 §5). That the account's trades read
+   * KEEPS showing a FAILED trade is an ASSUMPTION about the read port (no document states how long the venue's
+   * trades history keeps a trade): on it, the next sound run records this quarantine again until an operator
+   * releases it (which acknowledges that one trade's failure for good). The OMS's own alert, when it is seen, is a
+   * quarantine of its own as well. The ledger's compensating reversal is a separate hold that only the ledger
+   * clears (`SETTLEMENT_REVERSAL_OWED`, `#compareHoldings`): a release is not proof that it was booked.
    */
   #failedSettlements(
     run: RunState,
@@ -1686,7 +1768,10 @@ export class ReconciliationCoordinator {
   // ---- holdings -------------------------------------------------------------------------------
 
   async #compareHoldings(run: RunState, oms: ReconciledOms, view: OrderTradeView, reads: RunReads, readsStartedAt: number): Promise<void> {
-    if (reads.positions.kind !== "OK" || reads.collateral.kind !== "OK" || reads.projected.kind !== "OK" || reads.approvals.kind !== "OK") return;
+    if (reads.positions.kind !== "OK" || reads.collateral.kind !== "OK" || reads.projected.kind !== "OK" || reads.approvals.kind !== "OK" || reads.bookings.kind !== "OK") {
+      return;
+    }
+    const bookings = reads.bookings.value;
     const projected = reads.projected.value;
     const policy = this.#deps.policy;
     for (const spender of policy.requiredApprovalSpenders) {
@@ -1738,13 +1823,40 @@ export class ReconciliationCoordinator {
     }
     const claimed = claimedVenueIds(oms.orders(), oms.attempts());
     const inTransit: { readonly leg: VenueTradeLeg; readonly attributed: boolean }[] = [];
+    const stillBooked: BookedAmount[] = [];
     for (const [id, legs] of view.legsByOrder) {
       for (const entry of legs) {
-        // CONFIRMED is settled; MATCHED, MINED, RETRYING are in transit; FAILED awaits the ledger's reversal.
-        if (entry.status !== "CONFIRMED") inTransit.push({ leg: entry.leg, attributed: claimed.has(id) });
+        // CONFIRMED is settled; MATCHED, MINED, RETRYING are in transit.
+        if (entry.status === "CONFIRMED") continue;
+        if (entry.status !== "FAILED") {
+          inTransit.push({ leg: entry.leg, attributed: claimed.has(id) });
+          continue;
+        }
+        // FAILED (r4, WP290-CX-R4-02): the chain never moved, and the ledger books the fill until a linked
+        // compensating reversal cancels it (ADR-006 §5). What it STILL books is the only difference this fill
+        // explains: a fully reversed fill explains nothing, never its nominal delta. While any of it remains, the
+        // reversal is owed, and the account holds, whatever an operator released (a release is not a booking).
+        const remaining = bookings.get(compositeKey(entry.trade.venueTradeId, entry.leg.venueOrderId));
+        if (remaining === undefined) {
+          // Unreachable (the door refuses an answer that leaves an asked fill out); fail closed regardless.
+          inTransit.push({ leg: entry.leg, attributed: false });
+          continue;
+        }
+        if (remaining.length === 0) continue;
+        stillBooked.push(...remaining);
+        const tracked = oms.orders().find((order) => order.venueOrderId === id);
+        this.#detect(run, {
+          breakClass: "SETTLEMENT_REVERSAL_OWED",
+          subjectKey: compositeKey("SETTLEMENT_REVERSAL_OWED", entry.trade.venueTradeId, entry.leg.venueOrderId),
+          ...(tracked === undefined ? this.#marketOf(entry.leg.tokenId) : this.#marketScope(tracked.marketId)),
+          orderId: tracked?.orderId ?? null,
+          assetId: entry.leg.tokenId,
+          observedValue: entry.leg.shares,
+          detail: `trade ${entry.trade.venueTradeId} (venue order ${entry.leg.venueOrderId}) FAILED at the venue, and the ledger still books ${remaining.map((amount) => `${amount.amount} ${amount.assetId}`).join(", ")} of its fill: the compensating reversal is owed (ADR-006 §5); held until the ledger books it`,
+        });
       }
     }
-    const pending = pendingDeltas(inTransit, policy.collateralAssetId);
+    const pending = pendingDeltas(inTransit, policy.collateralAssetId, stillBooked);
     run.holdingsJudged = true;
     // Compared: every outcome token (positions) and the policy's collateral. Another collateral-kind asset (e.g. USDC.e
     // after an unwrap) has no read here, so it is not judged (a known limit, in the handoff).
@@ -2395,8 +2507,13 @@ export class ReconciliationCoordinator {
   #judged(run: RunState, view: JournalBreakView): boolean {
     // A break whose subject names one venue order (or trade) is judged only by a run that read it: by id or in the
     // list (in the trades read). A run that did not look at it did not judge it.
+    // A venue order a read SHOWED needs a run that found it again; one only NAMED needs a run whose by-id read of it
+    // answered, found or not (not found, it becomes ORDER_NOT_FOUND_BY_ID in the same run: `#namedNotFound`).
     const named = venueSubjectOf(view.breakClass, view.subjectKey);
-    if (named !== null && !(named.kind === "order" ? run.venueOrdersRead : run.tradesRead).has(named.id)) return false;
+    if (named !== null) {
+      const read = named.kind === "trade" ? run.tradesRead : namesOrderOnly(view.breakClass, view.subjectKey) ? run.byIdAnswered : run.venueOrdersRead;
+      if (!read.has(named.id)) return false;
+    }
     if (JUDGED_WITH_HOLDINGS.includes(view.breakClass)) return run.holdingsJudged;
     if (JUDGED_WITH_ORDER.includes(view.breakClass)) {
       // A view without its order id is never judged: it holds (fail closed).
@@ -2810,11 +2927,51 @@ interface RunReads {
   readonly open: ReadOutcome<readonly VenueOrderView[]>;
   readonly trades: ReadOutcome<readonly VenueTradeView[]>;
   readonly byId: ReadonlyMap<string, ReadOutcome<VenueOrderView | null>>;
+  /** Every venue order id the reads showed or named (`#readAll`'s five sources). */
+  readonly observed: ReadonlyMap<string, Observation>;
   readonly positions: ReadOutcome<ReadonlyMap<string, DecimalString>>;
   readonly collateral: ReadOutcome<DecimalString>;
   readonly approvals: ReadOutcome<ReadonlyMap<string, boolean>>;
   readonly projected: ReadOutcome<ProjectedHoldingsRead>;
+  /** What the ledger still books of each FAILED fill the trades read shows, by `compositeKey(trade, order)`. */
+  readonly bookings: ReadOutcome<ReadonlyMap<string, readonly BookedAmount[]>>;
   readonly walletMembers: ReadonlyMap<string, ReadOutcome<WalletMemberRead>>;
+}
+
+/** One venue order id a run observed: whether a read that answered in full SHOWED it, its token when known, and where. */
+interface Observation {
+  readonly shown: boolean;
+  readonly tokenId: string | null;
+  readonly sources: readonly string[];
+}
+
+/** Record one observation (`#readAll`): shown by any source is shown; the first known token stands. */
+function observe(observed: Map<string, Observation>, id: string, shown: boolean, tokenId: string | null, source: string): void {
+  const earlier = observed.get(id);
+  observed.set(
+    id,
+    Object.freeze({
+      shown: earlier?.shown === true || shown,
+      tokenId: earlier?.tokenId ?? tokenId,
+      sources: Object.freeze(earlier === undefined ? [source] : earlier.sources.includes(source) ? earlier.sources : [...earlier.sources, source]),
+    }),
+  );
+}
+
+/** The ids the rows of an unusable open-orders or trades answer carry (`door.ts`); none for any other outcome. */
+function namedIn(outcome: ReadOutcome<unknown>): NamedOrders {
+  return (outcome.kind === "INCOMPLETE" || outcome.kind === "MALFORMED") && outcome.named !== undefined ? outcome.named : new Map<string, string | null>();
+}
+
+/** Every own leg of a FAILED trade in a valid trades read, by the venue's identity (frozen: handed to a port). */
+function failedFillsOf(trades: ReadOutcome<readonly VenueTradeView[]>): readonly FillIdentity[] {
+  if (trades.kind !== "OK") return Object.freeze([]);
+  const out: FillIdentity[] = [];
+  for (const trade of trades.value) {
+    if (tradeStatusOf(trade.status) !== "FAILED") continue;
+    for (const leg of trade.ownLegs) out.push(Object.freeze({ venueTradeId: trade.venueTradeId, venueOrderId: leg.venueOrderId }));
+  }
+  return Object.freeze(out);
 }
 
 interface OrderTradeView {

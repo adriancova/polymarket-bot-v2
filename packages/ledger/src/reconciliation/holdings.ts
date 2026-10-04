@@ -31,6 +31,15 @@
  *    `haltRequired: true`. A negative delta (a holding the venue no longer
  *    shows) is the same transaction with every sign flipped.
  *
+ * 3. {@link remainingFillBookings}: what the ledger STILL BOOKS of a fill
+ *    (WP-290 r4). A settlement that reaches `FAILED` produces a compensating
+ *    append-only reversal (ADR-006 §5, decision 2), which `Ledger.append`
+ *    accepts only as the exact negation of the transaction it names
+ *    (`reversesLedgerTransactionId`). The coordinator uses the remaining
+ *    booking of a FAILED fill twice: it is the only holding difference that
+ *    fill explains (a fully reversed fill explains none), and while any of it
+ *    remains, the reversal is owed and the account is held.
+ *
  * The COMPARISON itself (which delta is unexplained) is the coordinator's
  * (`packages/oms/src/reconciliation/holdings.ts`): it needs the venue reads
  * and the trades in transit, which this package never sees.
@@ -38,13 +47,13 @@
  * Pure: no I/O, no clock, no randomness. Exact decimal strings throughout.
  */
 
-import { isCanonicalDecimalString, isZeroDecimal, negateDecimal, type DecimalString } from "@polymarket-bot/decimal";
+import { addDecimal, isCanonicalDecimalString, isZeroDecimal, negateDecimal, type DecimalString } from "@polymarket-bot/decimal";
 import type { RunMode } from "@polymarket-bot/domain";
 import { appendData } from "@polymarket-bot/risk/plain-data";
 
 import type { LedgerProjection } from "../projections.js";
 import { ledgerFailure, ledgerRefusal, readInputAsData, type LedgerResult } from "../refusals.js";
-import { validateTransactionInput, type LedgerEntryInput, type LedgerTransactionInput } from "../transaction.js";
+import { validateTransactionInput, type AppendedLedgerTransaction, type LedgerEntryInput, type LedgerTransactionInput } from "../transaction.js";
 import type { AssetKind } from "../vocabulary.js";
 
 /** One projected actual holding of the account. */
@@ -105,6 +114,57 @@ export function projectedHoldings(projection: LedgerProjection, accountRef: stri
     );
   }
   return Object.freeze({ lines: Object.freeze(lines), unattributedArrivals: Object.freeze(arrivals) });
+}
+
+/** One asset of a fill's remaining booking: the actual-account amount the ledger still books for it. */
+export interface RemainingBookingLine {
+  readonly assetId: string;
+  readonly amount: DecimalString;
+}
+
+/**
+ * The account's REMAINING booking of each named fill (see the header, item 3): per fill id, the sum per asset of
+ * the `ACTUAL_ACCOUNT` entries (for `accountRef`) of every transaction that names the fill (`fillId`: its
+ * principal, its fee, ...) and of every reversal that names one of those (`reversesLedgerTransactionId`,
+ * transitively, whatever fill id the reversal itself carries). `Ledger.append` accepts a reversal only as the
+ * exact negation of its target, leg for leg, so a reversed transaction and its reversal net to zero, and a
+ * reversed reversal books the original again. Zero lines are dropped: a fill never booked, or fully reversed, has
+ * no line. A correction that names neither the fill nor one of its transactions (an UNATTRIBUTED
+ * `RECONCILIATION_CORRECTION`, an adjustment without the fill's id) leaves the fill's booking where it was.
+ *
+ * Every named fill id has an entry, in the order asked. Pure; exact decimal strings.
+ */
+export function remainingFillBookings(
+  transactions: readonly AppendedLedgerTransaction[],
+  accountRef: string,
+  fillIds: readonly string[],
+): ReadonlyMap<string, readonly RemainingBookingLine[]> {
+  const wanted = new Set(fillIds);
+  /** Ledger transaction id → the fill it books or reverses (a reversal follows its target in ledger order). */
+  const member = new Map<string, string>();
+  const sums = new Map<string, Map<string, DecimalString>>();
+  for (const { transaction } of transactions) {
+    const target = transaction.reversesLedgerTransactionId;
+    const fillId = target !== undefined && member.has(target) ? member.get(target) : transaction.fillId !== undefined && wanted.has(transaction.fillId) ? transaction.fillId : undefined;
+    if (fillId === undefined) continue;
+    member.set(transaction.ledgerTransactionId, fillId);
+    const perAsset = sums.get(fillId) ?? new Map<string, DecimalString>();
+    sums.set(fillId, perAsset);
+    for (const entry of transaction.entries) {
+      if (entry.scope !== "ACTUAL_ACCOUNT" || entry.accountRef !== accountRef) continue;
+      perAsset.set(entry.assetId, addDecimal(perAsset.get(entry.assetId) ?? "0", entry.amount));
+    }
+  }
+  const out = new Map<string, readonly RemainingBookingLine[]>();
+  for (const fillId of fillIds) {
+    const lines: RemainingBookingLine[] = [];
+    for (const [assetId, amount] of sums.get(fillId) ?? []) {
+      if (!isZeroDecimal(amount)) appendData(lines, Object.freeze({ assetId, amount }));
+    }
+    lines.sort((a, b) => (a.assetId < b.assetId ? -1 : a.assetId > b.assetId ? 1 : 0));
+    out.set(fillId, Object.freeze(lines));
+  }
+  return out;
 }
 
 /** What a correction books. Every id is caller-minted (this package draws no randomness). */

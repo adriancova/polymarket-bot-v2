@@ -48,6 +48,7 @@ import {
   NO,
   YES,
   boot,
+  bookReversal,
   consistencyProblems,
   reconcileUntilResumed,
   streamTrade,
@@ -232,7 +233,7 @@ const G_FAIL = group(7103, { tokenId: YES, plannedShares: "5" });
 interface FailedRun {
   readonly u: Universe;
   readonly first: Process;
-  readonly trade: { readonly venueTradeId: string; status: string } | undefined;
+  readonly trade: { readonly venueTradeId: string; readonly venueOrderId: string; status: string } | undefined;
   /** The first incarnation's port calls before the trade FAILED. */
   readonly before: number;
 }
@@ -262,7 +263,8 @@ async function failedSettlement(path: "venue" | "stream", plan: KillPlan | null)
     trade = salt === undefined ? undefined : u.world.match(salt, "0.4", { status: "MINED" });
     await reconcileUntilResumed(first, u, 4);
     before = first.inc.calls;
-    if (trade !== undefined) trade.status = "FAILED";
+    // r4: a FAILED settlement never moved the chain (the holdings move back), and the ledger owes its reversal.
+    if (trade !== undefined) u.world.failTrade(trade);
     if (path === "stream" && trade !== undefined) {
       first.coordinator.onUserStreamOutput(failedSettlementOutput(trade));
       await first.coordinator.settled();
@@ -290,12 +292,17 @@ async function checkFailed(label: string, run: FailedRun): Promise<void> {
     u.halts.some((halt) => halt.breakId === failed[0]?.breakId && halt.marketId === MARKET),
     `${label}: the market is halted`,
   ).toBe(true);
-  // The operator handles the reversal and releases every quarantine: the account resumes, consistent.
+  // r4 (WP290-CX-R4-02): the operator releases every quarantine, but a release is not a booking: while the ledger
+  // still books the FAILED fill, its reversal is owed, and the account never resumes.
   for (const view of last.journal.unresolvedBreaks()) {
     if (view.status !== "QUARANTINED") continue;
-    expect((await last.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "the reversal is booked" })).ok, label).toBe(true);
+    expect((await last.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-1", reason: "handled" })).ok, label).toBe(true);
   }
-  expect(await reconcileUntilResumed(last, u, 4), `${label}: resumes once released`).toBe(true);
+  expect(await reconcileUntilResumed(last, u, 3), `${label}: never resumed while the ledger books the FAILED fill`).toBe(false);
+  expect(last.journal.unresolvedBreaks().map((view) => view.breakClass), label).toContain("SETTLEMENT_REVERSAL_OWED");
+  // The operator books the compensating reversal: the account resumes, consistent.
+  expect(bookReversal(u, trade?.venueTradeId ?? "?", trade?.venueOrderId ?? "?"), label).toBe(1);
+  expect(await reconcileUntilResumed(last, u, 4), `${label}: resumes once reversed`).toBe(true);
   expect([...u.violations, ...u.world.violations], `${label}: oracle`).toEqual([]);
 }
 

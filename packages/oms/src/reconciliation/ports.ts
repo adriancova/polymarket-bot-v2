@@ -255,11 +255,13 @@ export type BreakClass =
   | "ORDER_UNRESOLVED"
   | "ORDER_TRADES_INCOMPLETE"
   | "ORDER_FILLS_AHEAD_OF_VENUE"
+  | "ORDER_NOT_FOUND_BY_ID"
   | "TRADE_UNATTRIBUTED"
   | "TRADE_MISSING_IN_OMS"
   | "FILL_ECONOMICS_UNFIXED"
   | "FILL_REFUSED"
   | "FILL_MISMATCH"
+  | "SETTLEMENT_REVERSAL_OWED"
   | "SETTLEMENT_FAILED"
   | "HOLDING_IN_TRANSIT_AMBIGUOUS"
   | "HOLDING_DELTA_UNCONFIRMED"
@@ -411,6 +413,27 @@ export interface HoldingsPort {
    * once the transaction is durable.
    */
   bookUnattributed(correction: UnattributedBooking): Promise<unknown>;
+  /**
+   * What the ledger STILL BOOKS of each named fill (WP-290 r4; ADR-006 §5, decision 2: a settlement that reaches
+   * `FAILED` produces a compensating append-only reversal):
+   * `{ bookings: [{ venueTradeId, venueOrderId, entries: [{ assetId, amount }] }] }`, exactly one per identity
+   * asked, `entries` the non-zero actual-account amounts per asset (empty: never booked, or fully reversed).
+   * The composition joins the OMS's fills (`execution.fills`: venue trade and order → fill id) with
+   * `packages/ledger`'s `remainingFillBookings`. Asked about every FAILED leg the trades read shows.
+   */
+  remainingBookings(fills: readonly FillIdentity[]): Promise<unknown>;
+}
+
+/** One asset of a fill's remaining booking (`HoldingsPort.remainingBookings`): the actual-account amount still booked. */
+export interface BookedAmount {
+  readonly assetId: string;
+  readonly amount: DecimalString;
+}
+
+/** One fill, by the venue's identity (one fill per trade and order: WP-280's convention). */
+export interface FillIdentity {
+  readonly venueTradeId: string;
+  readonly venueOrderId: string;
 }
 
 export interface UnattributedBooking {
