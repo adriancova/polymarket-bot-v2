@@ -22,6 +22,7 @@
  * 5. pump                                ← §8.1's outer loop
  * 5b. checkAccountingRebuild("SHUTDOWN") ← FOLD-1: §6 invariant 8's rebuild, run once the pump stops
  * 5c. recordHaltsBeforeExit(...)         ← PROVENANCE-1: every latched halt to ops.incidents, bounded
+ * 6. exitAfterStartup(code, ...)          ← TC-LOWS-1: the process exits with that code, bounded
  * ```
  *
  * Step 1 runs on the ENVIRONMENT RECORD before a configuration file is opened,
@@ -119,6 +120,19 @@
  * halt either way; the record is for the operator and the research worker
  * afterwards.
  *
+ * ## The process exit (`TC-LOWS-1`, `PROV1-R2-L2`)
+ *
+ * `startup()` returning is not the process exiting. On a frozen PostgreSQL
+ * the pool's close leaves its ended idle connections half-closed, and a
+ * socket whose peer never answers kept the process alive after `startup()`
+ * had returned 75. The process shell below now hands the code to
+ * `exitAfterStartup` (`process-exit.ts`): the process exits on its own when
+ * nothing holds it, and otherwise logs `PROCESS EXIT FORCED: …` and exits
+ * with the same code, at most `PROCESS_EXIT_GRACE_MS` +
+ * `PROCESS_EXIT_FLUSH_MS` (2,000 ms) after `startup()` returned. It runs only
+ * once every durable outcome is final, so no acknowledged write and no halt
+ * record is lost by it (the reasoning is in that module's header).
+ *
  * ## The evaluation cadence (`CADENCE-1`, ADR-026)
  *
  * The trader evaluates each market's `onFeatures` at most once per 1,000 ms of
@@ -184,6 +198,7 @@ import {
   type RunningTraderHealthServer,
 } from "./health-server.js";
 import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
+import { exitAfterStartup } from "./process-exit.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
@@ -849,12 +864,36 @@ export class SystemPaperClock implements Clock {
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url.endsWith("/main.mjs");
 if (invokedDirectly) {
-  process.exitCode = await startup({
+  const code = await startup({
     env: process.env,
     readConfig: async (path) => await readFile(path, "utf8"),
     log: (line) => {
       process.stderr.write(`${line}\n`);
     },
+  });
+  // `TC-LOWS-1` (`PROV1-R2-L2`): the process EXITS with that code within a
+  // bound, even when a peer that never answers holds a socket open
+  // (`process-exit.ts`; see "The process exit" above).
+  exitAfterStartup(code, {
+    setExitCode: (exitCode) => {
+      process.exitCode = exitCode;
+    },
+    exit: (exitCode) => {
+      process.exit(exitCode);
+    },
+    writeLine: (line, flushed) => {
+      try {
+        process.stderr.write(`${line}\n`, () => {
+          flushed();
+        });
+      } catch {
+        flushed();
+      }
+    },
+    unrefTimer: (ms, fire) => {
+      setTimeout(fire, ms).unref();
+    },
+    holders: () => process.getActiveResourcesInfo(),
   });
 }
 /* c8 ignore stop */
