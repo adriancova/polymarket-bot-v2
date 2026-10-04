@@ -18,29 +18,48 @@
  *    real pool pointed at a loopback socket that accepts and stays silent,
  *    answers UNKNOWN at its bound; one pointed at a closed port answers
  *    UNKNOWN at once.
- * 4. **The shipped `startup()`** composes `NOT_CONFIGURED`, logs why, and its
- *    health and metrics say so (`main.ts`, `TRADER_HALTS_NOT_COMPOSED`).
+ * 4. **The shipped `startup()`** (`CONTROL-2` r1): `traderHalts.kind` `none`
+ *    composes `NOT_CONFIGURED`, logs why, and its health and metrics say so;
+ *    `postgres` composes the PostgreSQL source from the ONE environment
+ *    variable, read once, and a database that refuses or never answers is
+ *    UNKNOWN — with the URL and its password in no log line, no health answer
+ *    and no metrics body.
+ * 5. **The PAGE rule and the panel** (`CONTROL-2` r1, S1): the rule in
+ *    `infra/prometheus/trader-alerts.yaml`, evaluated against the bodies this
+ *    API renders in each state, fires on OPEN and UNKNOWN only; the
+ *    operations dashboard's panel binds all three families.
+ *
+ * The shipped BUNDLE itself — built by the `build` script and run with
+ * `node` — is driven against a real PostgreSQL in
+ * `postgres/shipped-bundle-halts-postgres.test.ts`.
  */
 
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  AbsentTraderHaltSource,
   InMemoryTraderHaltSource,
   TRADER_HALT_INCIDENT_KEYS,
+  TRADER_HALT_STATES,
+  TraderHaltCache,
   readTraderHaltFetch,
+  traderHaltSamples,
   type TraderHaltSource,
 } from "@polymarket-bot/control-api";
 import { traderHaltFetch } from "@polymarket-bot/control-api/testing";
+import { PLATFORM_METRIC_FAMILIES, renderExpositionFor } from "@polymarket-bot/observability";
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import { PostgresTraderHaltSource } from "../../../apps/control-api/src/adapters/postgres-trader-halts.js";
-import { startup } from "../../../apps/control-api/src/main.js";
+import { TRADER_HALTS_DATABASE_URL_ENV, startup } from "../../../apps/control-api/src/main.js";
 import { HALT_INCIDENT_KEYS, haltIncidentRows } from "../../../apps/trader/src/halt-record.js";
 import { serveControlApi, type ServedApi } from "./support/client.js";
 
@@ -247,14 +266,88 @@ describe("the REAL PostgreSQL source against a database that does not answer (CO
   });
 });
 
-describe("the SHIPPED startup() composes NOT_CONFIGURED and says why (CONTROL-2)", () => {
+const SAFE_ENVIRONMENT = {
+  RUN_MODE: "PAPER",
+  MAX_RUN_MODE: "PAPER",
+  ALLOW_REAL_ORDERS: "false",
+  LIVE_MICRO_MAX_ORDER_NOTIONAL: "0",
+  LIVE_MICRO_MAX_ACCOUNT_EXPOSURE: "0",
+} as const;
+
+/** A loopback port nothing listens on. */
+async function closedPort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolveListen) => probe.listen(0, "127.0.0.1", () => resolveListen()));
+  const address = probe.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  await new Promise<void>((resolveClose) => probe.close(() => resolveClose()));
+  return port;
+}
+
+/**
+ * A loopback "PostgreSQL" that asks for the password in clear and then
+ * refuses the login with an error that ECHOES it — the worst a driver error
+ * can do with a credential. The composition must redact it.
+ */
+async function echoingPostgres(): Promise<{ readonly port: number; readonly close: () => Promise<void> }> {
+  const field = (code: string, value: string): Buffer => Buffer.concat([Buffer.from(code, "latin1"), Buffer.from(`${value}\0`, "utf8")]);
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => undefined);
+    let buffer = Buffer.alloc(0);
+    let started = false;
+    socket.on("data", (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!started) {
+        if (buffer.length < 4 || buffer.length < buffer.readInt32BE(0)) return;
+        buffer = buffer.subarray(buffer.readInt32BE(0));
+        started = true;
+        // AuthenticationCleartextPassword.
+        const ask = Buffer.alloc(9);
+        ask.write("R", 0, "latin1");
+        ask.writeInt32BE(8, 1);
+        ask.writeInt32BE(3, 5);
+        socket.write(ask);
+      }
+      if (buffer.length < 5 || buffer[0] !== 0x70 || buffer.length < 1 + buffer.readInt32BE(1)) return;
+      const password = buffer.subarray(5, buffer.readInt32BE(1)).toString("utf8");
+      const fields = Buffer.concat([
+        field("S", "FATAL"),
+        field("V", "FATAL"),
+        field("C", "28P01"),
+        field("M", `password authentication failed; this server echoes the password it was sent: ${password}`),
+        Buffer.from([0]),
+      ]);
+      const header = Buffer.alloc(5);
+      header.write("E", 0, "latin1");
+      header.writeInt32BE(4 + fields.length, 1);
+      socket.end(Buffer.concat([header, fields]));
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", () => resolveListen()));
+  const address = server.address();
+  return {
+    port: typeof address === "object" && address !== null ? address.port : 0,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    },
+  };
+}
+
+describe("the SHIPPED startup() composes the trader-halt source its configuration names (CONTROL-2 r1)", () => {
   let directory = "";
   afterEach(async () => {
     if (directory !== "") await rm(directory, { recursive: true, force: true });
     directory = "";
   });
 
-  it("logs the NOT CONFIGURED line, and /v1/health and /v1/metrics say NOT_CONFIGURED — never 'no halts'", async () => {
+  /** Runs `startup()` serving, with `traderHalts` and `env`; returns its log, its port, and a stop. */
+  async function started(
+    traderHalts: unknown,
+    env: Record<string, string | undefined>,
+  ): Promise<{ readonly lines: string[]; readonly port: number; readonly stop: () => Promise<void> }> {
     directory = await mkdtemp(join(tmpdir(), "ctl2-control-api-"));
     const configPath = join(directory, "control-api.json");
     await writeFile(
@@ -266,21 +359,17 @@ describe("the SHIPPED startup() composes NOT_CONFIGURED and says why (CONTROL-2)
         auditCapacity: 64,
         auditSafetyReserve: 4,
         traderHealth: { kind: "none" },
+        traderHalts,
         operators: OPERATORS.map((operator) => ({ ...operator, grants: [...operator.grants] })),
       }),
       "utf8",
     );
+    Object.assign(env, SAFE_ENVIRONMENT, { CONTROL_API_CONFIG: configPath });
+    const sigterm = process.listeners("SIGTERM");
     const lines: string[] = [];
     const code = await startup(
       {
-        env: {
-          RUN_MODE: "PAPER",
-          MAX_RUN_MODE: "PAPER",
-          ALLOW_REAL_ORDERS: "false",
-          LIVE_MICRO_MAX_ORDER_NOTIONAL: "0",
-          LIVE_MICRO_MAX_ACCOUNT_EXPOSURE: "0",
-          CONTROL_API_CONFIG: configPath,
-        },
+        env,
         argv: [],
         readConfig: (path) => readFile(path, "utf8"),
         log: (line) => {
@@ -289,24 +378,196 @@ describe("the SHIPPED startup() composes NOT_CONFIGURED and says why (CONTROL-2)
       },
       { serve: true },
     );
-    expect(code).toBe(0);
+    expect(code, lines.join("\n")).toBe(0);
+    const listening = lines.find((line) => line.startsWith("control API listening on 127.0.0.1:"));
+    const port = Number(/127\.0\.0\.1:(\d+)/u.exec(listening ?? "")?.[1] ?? "0");
+    expect(port).toBeGreaterThan(0);
+    return {
+      lines,
+      port,
+      stop: async () => {
+        expect(process.listenerCount("SIGINT")).toBe(1);
+        process.emit("SIGINT");
+        for (let i = 0; i < 100 && !lines.includes("control API stopped."); i += 1) await sleep(20);
+        expect(lines).toContain("control API stopped.");
+        // The SIGTERM handler this startup added, and only it.
+        for (const listener of process.listeners("SIGTERM")) if (!sigterm.includes(listener)) process.removeListener("SIGTERM", listener);
+      },
+    };
+  }
+
+  it("none: logs the NOT CONFIGURED line, and /v1/health and /v1/metrics say NOT_CONFIGURED — never 'no halts'", async () => {
+    const run = await started({ kind: "none" }, {});
     try {
-      expect(lines.join("\n")).toContain("trader halts: NOT CONFIGURED");
-      expect(lines.join("\n")).toContain("reads no open TRADER_HALT rows from ops.incidents");
-      const listening = lines.find((line) => line.startsWith("control API listening on 127.0.0.1:"));
-      const port = Number(/127\.0\.0\.1:(\d+)/u.exec(listening ?? "")?.[1] ?? "0");
-      expect(port).toBeGreaterThan(0);
-      const health = JSON.parse((await get(port, "/v1/health")).body) as { traderHalts: Record<string, unknown> };
+      expect(run.lines.join("\n")).toContain("trader halts: NOT CONFIGURED");
+      expect(run.lines.join("\n")).toContain("traderHalts.kind is none");
+      const health = JSON.parse((await get(run.port, "/v1/health")).body) as { traderHalts: Record<string, unknown> };
       expect(health.traderHalts["state"]).toBe("NOT_CONFIGURED");
-      expect(String(health.traderHalts["detail"])).toContain("holds no PostgreSQL client");
-      expect((await get(port, "/v1/metrics")).body).toContain('control_trader_halts_state{state="NOT_CONFIGURED"} 1');
+      expect(health.traderHalts["configured"]).toBe(false);
+      expect(String(health.traderHalts["detail"])).toContain("traderHalts.kind is none");
+      expect((await get(run.port, "/v1/metrics")).body).toContain('control_trader_halts_state{state="NOT_CONFIGURED"} 1');
     } finally {
-      expect(process.listenerCount("SIGINT")).toBe(1);
-      process.emit("SIGINT");
-      for (let i = 0; i < 50 && !lines.includes("control API stopped."); i += 1) await sleep(20);
-      expect(lines).toContain("control API stopped.");
+      await run.stop();
     }
   }, 30_000);
+
+  it("postgres: the ONE variable is read once, a database that refuses is UNKNOWN, and the URL and its password are printed NOWHERE", async () => {
+    const password = "Wq4-not-a-credential-ctl2-r1";
+    const url = `postgres://halt_reader:${password}@127.0.0.1:${String(await closedPort())}/polymarket_bot`;
+    let reads = 0;
+    const env: Record<string, string | undefined> = {};
+    Object.defineProperty(env, TRADER_HALTS_DATABASE_URL_ENV, {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        reads += 1;
+        return url;
+      },
+    });
+    const run = await started({ kind: "postgres", timeoutMs: 1_500 }, env);
+    try {
+      const readsAtStartup = reads;
+      // The safety scan reads every variable once; the composition reads this one once.
+      expect(readsAtStartup).toBe(2);
+      const said = run.lines.join("\n");
+      expect(said).toContain("trader halt source postgres");
+      expect(said).toContain(`from the database ${TRADER_HALTS_DATABASE_URL_ENV} names (its value is never logged)`);
+      const bodies: string[] = [];
+      for (let i = 0; i < 3; i += 1) {
+        const health = await get(run.port, "/v1/health");
+        expect(health.status).toBe(200);
+        bodies.push(health.body);
+        const halts = (JSON.parse(health.body) as { traderHalts: Record<string, unknown> }).traderHalts;
+        expect(halts["state"]).toBe("UNKNOWN");
+        expect(halts["configured"]).toBe(true);
+        expect(halts["openTotal"]).toBeNull();
+        expect(String(halts["detail"])).toContain("ops.incidents could not be read");
+        const metrics = await get(run.port, "/v1/metrics");
+        bodies.push(metrics.body);
+        expect(metrics.body).toContain('control_trader_halts_state{state="UNKNOWN"} 1');
+        expect(metrics.body).not.toContain("control_trader_halts_open");
+      }
+      // Read ONCE: serving six authorized reads read the variable no more.
+      expect(reads).toBe(readsAtStartup);
+      for (const text of [...bodies, run.lines.join("\n")]) {
+        expect(text).not.toContain(password);
+        expect(text).not.toContain(url);
+      }
+    } finally {
+      await run.stop();
+    }
+    for (const line of run.lines) expect(line).not.toContain(password);
+  }, 30_000);
+
+  it("postgres against a server whose error ECHOES the password: the driver's error reaches /v1/health with the password <redacted>", async () => {
+    const echoing = await echoingPostgres();
+    const password = "Ec5-not-a-credential-ctl2-r1-echo";
+    const url = `postgres://halt_reader:${password}@127.0.0.1:${String(echoing.port)}/polymarket_bot`;
+    const run = await started({ kind: "postgres", timeoutMs: 2_000 }, { [TRADER_HALTS_DATABASE_URL_ENV]: url });
+    try {
+      const health = await get(run.port, "/v1/health");
+      const halts = (JSON.parse(health.body) as { traderHalts: Record<string, unknown> }).traderHalts;
+      expect(halts["state"]).toBe("UNKNOWN");
+      // The driver's own words arrive — with the credential replaced.
+      expect(String(halts["detail"])).toContain("this server echoes the password it was sent: <redacted>");
+      expect(health.body).not.toContain(password);
+      const metrics = await get(run.port, "/v1/metrics");
+      expect(metrics.body).toContain('control_trader_halts_state{state="UNKNOWN"} 1');
+      expect(metrics.body).not.toContain(password);
+      expect(run.lines.join("\n")).not.toContain(password);
+    } finally {
+      await run.stop();
+      await echoing.close();
+    }
+  }, 30_000);
+
+  it("postgres against a server that accepts and never answers: UNKNOWN at the configured bound, not a hang", async () => {
+    const sockets = new Set<Socket>();
+    const silent = createServer((socket) => {
+      sockets.add(socket);
+    });
+    await new Promise<void>((resolveListen) => silent.listen(0, "127.0.0.1", () => resolveListen()));
+    const address = silent.address();
+    const port = typeof address === "object" && address !== null ? address.port : 0;
+    const run = await started({ kind: "postgres", timeoutMs: 400 }, {
+      [TRADER_HALTS_DATABASE_URL_ENV]: `postgres://halt_reader:not-a-credential@127.0.0.1:${String(port)}/x`,
+    });
+    try {
+      const began = Date.now();
+      const health = JSON.parse((await get(run.port, "/v1/health")).body) as { traderHalts: Record<string, unknown> };
+      const elapsed = Date.now() - began;
+      expect(health.traderHalts["state"]).toBe("UNKNOWN");
+      expect(elapsed).toBeGreaterThanOrEqual(350);
+      expect(elapsed).toBeLessThan(3_000);
+      expect(sockets.size).toBeGreaterThan(0);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await run.stop();
+      await new Promise<void>((resolveClose) => silent.close(() => resolveClose()));
+    }
+  }, 30_000);
+});
+
+describe("CONTROL-2 r1 (S1): the PAGE rule and the operations panel read the platform's trader-halt families", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+  const rules = readFileSync(resolve(repoRoot, "infra/prometheus/trader-alerts.yaml"), "utf8")
+    .split("\n")
+    .filter((line) => !/^\s*#/u.test(line))
+    .join("\n");
+
+  /** The one `- alert: TraderHaltOpenOrUnknown` block. */
+  const block = /- alert: TraderHaltOpenOrUnknown\n[\s\S]*?(?=\n\s*- alert: |\n\s*- name: |$)/u.exec(rules)?.[0] ?? "";
+
+  it("TraderHaltOpenOrUnknown PAGES at once on the state family, in the trader-halts group", () => {
+    expect(rules).toMatch(/- name: trader-halts\n\s+rules:\n\s+- alert: TraderHaltOpenOrUnknown\n/u);
+    expect(block).toContain('expr: max(control_trader_halts_state{state=~"OPEN|UNKNOWN"}) == 1');
+    expect(block).toContain("severity: page");
+    expect(block).toContain("for: 0m");
+  });
+
+  it("evaluated against the body this API renders in each state, the rule fires on OPEN and UNKNOWN — and on nothing else", async () => {
+    const expression = /expr: max\(control_trader_halts_state\{state=~"(?<states>[^"]+)"\}\) == 1/u.exec(block)?.groups?.["states"] ?? "";
+    // PromQL anchors a label regex at both ends.
+    const matcher = new RegExp(`^(?:${expression})$`, "u");
+    const firesOn = (body: string): boolean =>
+      [...body.matchAll(/^control_trader_halts_state\{state="(?<state>[A-Z_]+)"\} (?<value>\d+)$/gmu)].some(
+        (match) => matcher.test(match.groups?.["state"] ?? "") && match.groups?.["value"] === "1",
+      );
+    const cache = async (result: unknown): Promise<TraderHaltCache> => {
+      const read = new TraderHaltCache(new InMemoryTraderHaltSource(result));
+      await read.refresh();
+      return read;
+    };
+    const failed = new TraderHaltCache(new InMemoryTraderHaltSource());
+    await failed.refresh();
+    const states: Record<string, TraderHaltCache> = {
+      OPEN: await cache(traderHaltFetch(fetchedTraderRows())),
+      NONE_OPEN: await cache(traderHaltFetch([])),
+      UNKNOWN: failed,
+      NOT_CONFIGURED: new TraderHaltCache(new AbsentTraderHaltSource()),
+    };
+    expect(Object.keys(states).sort()).toEqual([...TRADER_HALT_STATES].sort());
+    const fired: string[] = [];
+    for (const [state, read] of Object.entries(states)) {
+      const body = renderExpositionFor(PLATFORM_METRIC_FAMILIES, traderHaltSamples(read));
+      expect(body, state).toContain(`control_trader_halts_state{state="${state}"} 1`);
+      if (firesOn(body)) fired.push(state);
+    }
+    expect(fired.sort()).toEqual(["OPEN", "UNKNOWN"]);
+  });
+
+  it("the operations dashboard's panel binds all three families", () => {
+    const dashboard = JSON.parse(readFileSync(resolve(repoRoot, "infra/grafana/control/operations-dashboard.json"), "utf8")) as {
+      panels: { title?: string; targets?: { expr?: string }[]; description?: string }[];
+    };
+    const panel = dashboard.panels.find((entry) => entry.title === "Open trader halts (ops.incidents)");
+    expect(panel).toBeDefined();
+    const exprs = (panel?.targets ?? []).map((target) => target.expr ?? "");
+    for (const family of ["control_trader_halts_state", "control_trader_halts_open", "control_trader_halt_reads_total"]) {
+      expect(exprs.some((expr) => expr.includes(family)), family).toBe(true);
+    }
+    expect(panel?.description).toContain("TraderHaltOpenOrUnknown");
+  });
 });
 
 function get(port: number, path: string): Promise<{ status: number; body: string }> {

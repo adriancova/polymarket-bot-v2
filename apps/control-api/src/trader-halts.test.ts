@@ -12,16 +12,15 @@
 
 import { describe, expect, it } from "vitest";
 
-import { renderExpositionFor } from "@polymarket-bot/observability";
+import { PLATFORM_METRIC_FAMILIES, platformMetricFamily, renderExpositionFor } from "@polymarket-bot/observability";
 
-import { CONTROL_API_METRIC_FAMILIES, type ApiRequest, type ApiResponse } from "./api.js";
+import type { ApiRequest, ApiResponse } from "./api.js";
 import { FAKE_OPERATOR_TOKEN, FAKE_READER_TOKEN, bearer, createHarness, traderHaltFetch, traderHaltRow } from "./testing/index.js";
 import {
   AbsentTraderHaltSource,
   InMemoryTraderHaltSource,
   TRADER_HALT_INCIDENT_KEYS,
   TRADER_HALT_LIST_LIMIT,
-  TRADER_HALT_METRIC_FAMILIES,
   TRADER_HALT_STATES,
   TraderHaltCache,
   inTraderHaltNamespace,
@@ -339,7 +338,7 @@ describe("the namespace and the scope keys", () => {
 });
 
 describe("the metrics: the state is always explicit, the counts only from a read that succeeded", () => {
-  const render = (cache: TraderHaltCache): string => renderExpositionFor(CONTROL_API_METRIC_FAMILIES, traderHaltSamples(cache));
+  const render = (cache: TraderHaltCache): string => renderExpositionFor(PLATFORM_METRIC_FAMILIES, traderHaltSamples(cache));
 
   it("OPEN: the state, every scope's count, and the read", async () => {
     const body = render(await readOnce(traderHaltFetch([MARKET, GLOBAL])));
@@ -379,15 +378,40 @@ describe("the metrics: the state is always explicit, the counts only from a read
     expect(render(notConfigured)).not.toContain("control_trader_halt_reads_total");
   });
 
-  it("every state is one of the four, exactly one is 1, and the families are new names beside the platform's", async () => {
+  it("every state is one of the four, and exactly one is 1", async () => {
     for (const result of [traderHaltFetch([MARKET]), traderHaltFetch([]), { counts: [] }]) {
       const samples = traderHaltSamples(await readOnce(result)).filter((sample) => sample.name === "control_trader_halts_state");
       expect(samples.map((sample) => sample.labels?.["state"])).toEqual([...TRADER_HALT_STATES]);
       expect(samples.filter((sample) => sample.value === 1)).toHaveLength(1);
     }
-    const names = CONTROL_API_METRIC_FAMILIES.map((family) => family.name);
-    expect(new Set(names).size).toBe(names.length);
-    for (const family of TRADER_HALT_METRIC_FAMILIES) expect(names.filter((name) => name === family.name)).toHaveLength(1);
+  });
+
+  // `CONTROL-2` r1 (S1): the families are the PLATFORM table's, category
+  // `halts`, and this is their only producer — the pin
+  // `packages/observability/src/control/metric-families.test.ts` names.
+  it("the producer pin: traderHaltSamples emits EXACTLY the platform table's three trader-halt families, with only declared labels", async () => {
+    const caches = [
+      await readOnce(traderHaltFetch([MARKET, GLOBAL])),
+      await readOnce(traderHaltFetch([])),
+      await readOnce({ counts: [] }),
+      new TraderHaltCache(new AbsentTraderHaltSource()),
+    ];
+    const emitted = new Set<string>();
+    for (const cache of caches) {
+      for (const sample of traderHaltSamples(cache)) {
+        emitted.add(sample.name);
+        const family = platformMetricFamily(sample.name);
+        expect(family, sample.name).toBeDefined();
+        expect(family?.category, sample.name).toBe("halts");
+        for (const key of Object.keys(sample.labels ?? {})) expect(family?.labels ?? [], `${sample.name} ${key}`).toContain(key);
+      }
+    }
+    const declared = PLATFORM_METRIC_FAMILIES.filter((family) => family.name.startsWith("control_trader_halt")).map((family) => family.name);
+    expect([...emitted].sort()).toEqual([...declared].sort());
+    expect(declared.sort()).toEqual(["control_trader_halt_reads_total", "control_trader_halts_open", "control_trader_halts_state"]);
+    expect(platformMetricFamily("control_trader_halts_state")?.type).toBe("gauge");
+    expect(platformMetricFamily("control_trader_halts_open")?.type).toBe("gauge");
+    expect(platformMetricFamily("control_trader_halt_reads_total")?.type).toBe("counter");
   });
 });
 

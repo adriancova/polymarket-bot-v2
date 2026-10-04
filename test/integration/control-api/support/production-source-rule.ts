@@ -14,7 +14,7 @@
  *
  * | Rule | What fails |
  * | --- | --- |
- * | `specifier` | a static import, re-export, `import x = require()`, `import()` or `require()` of anything but a relative path that stays inside the package's `src`, a builtin from `PERMITTED_BUILTINS` (`node:vm`, `node:module`, `node:child_process`, `node:worker_threads` and the rest are not on it) or one of the package's own declared `dependencies` (a subpath included) |
+ * | `specifier` | a static import, re-export, `import x = require()`, `import()` or `require()` of anything but a relative path that stays inside the package's `src`, a builtin from `PERMITTED_BUILTINS` (`node:vm`, `node:module`, `node:child_process`, `node:worker_threads` and the rest are not on it), one of the package's own declared `dependencies` (a subpath included), or — in a driver shim the scope names, and there only — that shim's own `node:` builtin (`CONTROL-2` r1, `driver-shims.ts`) |
  * | `non-literal` | an `import()` or `require()` whose specifier is not a string literal |
  * | `require-form` | `require` (or `x.require`) anywhere but as the callee of such a call with ONE literal argument |
  * | `name` | an identifier, property name, private name or string key that names a loader or an evaluator — the scan's own vocabulary (`createRequire`, `eval`, `_load`, `_compile`, `_extensions`, `dlopen`, `binding`, `_linkedBinding`, `ShadowRealm`, `constructor`), `getBuiltinModule`, `Function` in a VALUE position, and the prototype reflection that reaches an evaluator BY VALUE (`getPrototypeOf`, `__proto__`) |
@@ -164,6 +164,13 @@ export interface ProductionScope {
   readonly dependencies: readonly string[];
   /** The package's `src` directory: a relative specifier must resolve inside it. */
   readonly sourceRoot: string;
+  /**
+   * `CONTROL-2` r1: the driver shims, by ABSOLUTE file, each with the one
+   * builtin it may load — as `node:<builtin>`, from that file only
+   * (`driver-shims.ts`). A builtin outside `PERMITTED_BUILTINS` is admitted
+   * nowhere else.
+   */
+  readonly builtinShims?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -178,6 +185,8 @@ function admitsSpecifier(specifier: string, fileName: string, scope: ProductionS
   }
   const builtin = specifier.startsWith("node:") ? specifier.slice("node:".length) : specifier;
   if ((PERMITTED_BUILTINS as readonly string[]).includes(builtin)) return true;
+  const shim = scope.builtinShims !== undefined && Object.hasOwn(scope.builtinShims, fileName) ? scope.builtinShims[fileName] : undefined;
+  if (shim !== undefined && specifier === `node:${shim}`) return true;
   return scope.dependencies.some((name) => specifier === name || specifier.startsWith(`${name}/`));
 }
 

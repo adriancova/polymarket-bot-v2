@@ -50,16 +50,19 @@
  * The caller hands this source a `Kysely` handle, exactly as
  * `postgres-audit-sink.ts` is handed one: connection configuration is the
  * composition root's business, and this file reads no environment and names
- * no credential. It imports `@polymarket-bot/storage-postgres` for TYPES only,
- * so a bundle that holds it holds no driver because of it.
+ * no credential. It imports `@polymarket-bot/storage-postgres` for TYPES only:
+ * the driver is `main.ts`'s to compose.
  *
- * ## Composed by no shipped process yet (disclosed)
+ * ## Composed by the shipped process (`CONTROL-2` r1)
  *
- * `main.ts` composes an `AbsentTraderHaltSource`: the shipped bundle holds no
- * PostgreSQL client, and adding one is a change to acceptance 3's authoritative
- * shipped-artifact check that `CONTROL-2` stopped on (`docs/handoffs/CONTROL-2.md`).
- * This source is driven against a real PostgreSQL through the real API over
- * HTTP by the opt-in suite above.
+ * Round 0 composed it nowhere, because the shipped bundle held no PostgreSQL
+ * client. Since r1 `main.ts` composes it for `traderHalts.kind` `postgres`,
+ * over a pool of its own built from the one URL variable
+ * (`TRADER_HALTS_DATABASE_URL_ENV`), every failure detail redacted of that
+ * URL; acceptance 3's shipped-artifact check admits the driver exactly
+ * (`test/integration/control-api/support/driver-shims.ts`), and
+ * `postgres/shipped-bundle-halts-postgres.test.ts` runs the SHIPPED bundle
+ * against a real PostgreSQL.
  */
 
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";

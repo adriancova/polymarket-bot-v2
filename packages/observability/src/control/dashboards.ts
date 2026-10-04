@@ -94,6 +94,8 @@ export const CONTROL_DASHBOARDS: readonly ControlDashboardSpec[] = Object.freeze
       // CADENCE-1 (ADR-026 D5.6, D2.10): the evaluation cadence's two counters.
       "Evaluation cadence: coalesced evaluations",
       "Evaluation cadence: forward-jump alarm",
+      // CONTROL-2 (H1R1-HALT-INVISIBLE): open trader halts in ops.incidents, which outlive the trader.
+      "Open trader halts (ops.incidents)",
     ]),
   }),
   Object.freeze({

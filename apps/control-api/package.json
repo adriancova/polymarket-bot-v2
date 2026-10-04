@@ -11,7 +11,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/control-api/tsconfig.json",
-    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --alias:crypto=./src/driver-shims/crypto --alias:dns=./src/driver-shims/dns --alias:events=./src/driver-shims/events --alias:fs=./src/driver-shims/fs --alias:net=./src/driver-shims/net --alias:path=./src/driver-shims/path --alias:stream=./src/driver-shims/stream --alias:string_decoder=./src/driver-shims/string_decoder --alias:tls=./src/driver-shims/tls --alias:util=./src/driver-shims/util --alias:pg-native=./src/driver-shims/pg-native.ts --outfile=dist/main.mjs",
     "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
     "test:integration": "vitest run --config ../../test/integration/control-api/vitest.config.ts",
     "test:integration:postgres": "vitest run --config ../../test/integration/control-api/postgres/vitest.config.ts"

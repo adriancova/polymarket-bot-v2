@@ -16,7 +16,16 @@ import {
 } from "@polymarket-bot/observability";
 
 import { AUDIT_APPEND_TIMEOUT_MS, CONTROL_PLANE_VOID_ACTOR } from "./control-plane.js";
-import { EXIT_CODES, composeControlPlane, startup, type StartupPorts } from "./main.js";
+import {
+  EXIT_CODES,
+  TRADER_HALTS_DATABASE_URL_ENV,
+  composeControlPlane,
+  libpqVariablesIn,
+  planTraderHalts,
+  redactDatabaseUrl,
+  startup,
+  type StartupPorts,
+} from "./main.js";
 import { FAKE_OPERATOR_TOKEN, ScriptedEnvironment } from "./testing/index.js";
 
 function validConfig(): string {
@@ -27,8 +36,14 @@ function validConfig(): string {
     auditCapacity: 4096,
     auditSafetyReserve: 64,
     traderHealth: { kind: "none" },
+    traderHalts: { kind: "none" },
     operators: [{ operatorId: "operator-a", token: FAKE_OPERATOR_TOKEN, grants: ["READ"] }],
   });
+}
+
+/** `validConfig()` with `traderHalts` replaced. */
+function configWithHalts(traderHalts: unknown): string {
+  return JSON.stringify({ ...(JSON.parse(validConfig()) as Record<string, unknown>), traderHalts });
 }
 
 interface Run {
@@ -208,5 +223,146 @@ describe("CONTROL-1b: the control plane the shipped process composes", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("CONTROL-2 r1: the trader halt source — one variable, read once, never printed", () => {
+  const PASSWORD = "Zq7-not-a-credential-ctl2-pw";
+  const URL_VALUE = `postgres://halt_reader:${PASSWORD}@127.0.0.1:5432/polymarket_bot`;
+  const BASE = { CONTROL_API_CONFIG: "/etc/control-api.json" } as const;
+
+  it("names ONE environment variable, and it is no production or credential-shaped name", () => {
+    expect(TRADER_HALTS_DATABASE_URL_ENV).toBe("CONTROL_API_TRADER_HALTS_DATABASE_URL");
+  });
+
+  it("plans: none with no URL; postgres with a postgres URL; every other combination is a refusal that prints no value", () => {
+    expect(planTraderHalts({ kind: "none" }, undefined)).toEqual({ ok: true, kind: "none" });
+    expect(planTraderHalts({ kind: "none" }, "")).toEqual({ ok: true, kind: "none" });
+    expect(planTraderHalts({ kind: "postgres", timeoutMs: 750 }, URL_VALUE)).toEqual({
+      ok: true,
+      kind: "postgres",
+      url: URL_VALUE,
+      timeoutMs: 750,
+    });
+    expect(planTraderHalts({ kind: "postgres", timeoutMs: 750 }, URL_VALUE.replace("postgres:", "postgresql:")).ok).toBe(true);
+    const refusals = [
+      [planTraderHalts({ kind: "none" }, URL_VALUE), "CONTROL_TRADER_HALTS_URL_UNUSED"],
+      [planTraderHalts({ kind: "postgres", timeoutMs: 750 }, undefined), "CONTROL_TRADER_HALTS_URL_MISSING"],
+      [planTraderHalts({ kind: "postgres", timeoutMs: 750 }, ""), "CONTROL_TRADER_HALTS_URL_MISSING"],
+      [planTraderHalts({ kind: "postgres", timeoutMs: 750 }, `http://halt_reader:${PASSWORD}@127.0.0.1/x`), "CONTROL_TRADER_HALTS_URL_INVALID"],
+      [planTraderHalts({ kind: "postgres", timeoutMs: 750 }, `not a url ${PASSWORD}`), "CONTROL_TRADER_HALTS_URL_INVALID"],
+    ] as const;
+    for (const [plan, code] of refusals) {
+      expect(plan.ok, code).toBe(false);
+      if (plan.ok) continue;
+      expect(plan.code).toBe(code);
+      expect(plan.detail).toContain(TRADER_HALTS_DATABASE_URL_ENV);
+      expect(plan.detail).not.toContain(PASSWORD);
+    }
+  });
+
+  it("the URL is the ONE source: a URL missing a user, a password, a host or a database, or a PG* variable beside it, is refused", () => {
+    const postgres = { kind: "postgres", timeoutMs: 750 } as const;
+    for (const [url, missing] of [
+      [`postgres://127.0.0.1:5432/polymarket_bot`, "no user, no password"],
+      [`postgres://halt_reader@127.0.0.1:5432/polymarket_bot`, "no password"],
+      [`postgres://halt_reader:${PASSWORD}@127.0.0.1:5432`, "no database"],
+      [`postgres://halt_reader:${PASSWORD}@127.0.0.1:5432/`, "no database"],
+      [`postgres:///polymarket_bot`, "no user, no password, no host"],
+    ] as const) {
+      const plan = planTraderHalts(postgres, url);
+      expect(plan.ok, url).toBe(false);
+      if (plan.ok) continue;
+      expect(plan.code).toBe("CONTROL_TRADER_HALTS_URL_INCOMPLETE");
+      expect(plan.detail).toContain(`names ${missing}`);
+      expect(plan.detail).not.toContain(PASSWORD);
+    }
+    // Credentials with no host are no URL at all (WHATWG): refused as invalid, the value unprinted.
+    const hostless = planTraderHalts(postgres, `postgres://halt_reader:${PASSWORD}@/polymarket_bot`);
+    expect(hostless.ok ? "" : `${hostless.code} ${hostless.detail}`).toMatch(/^CONTROL_TRADER_HALTS_URL_INVALID (?!.*Zq7)/u);
+    // libpq's namespace beside the URL: refused by NAME, values never printed.
+    const env = { PGPASSWORD: "Hx2-not-a-credential", PGSSLMODE: "disable", PGDATA_EMPTY: "", PG_NOT_LIBPQ: "x", PATH: "/bin" };
+    expect(libpqVariablesIn(env)).toEqual(["PGPASSWORD", "PGSSLMODE"]);
+    const plan = planTraderHalts(postgres, URL_VALUE, libpqVariablesIn(env));
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.code).toBe("CONTROL_TRADER_HALTS_LIBPQ_ENVIRONMENT");
+    expect(plan.detail).toContain("PGPASSWORD, PGSSLMODE");
+    expect(plan.detail).not.toContain("Hx2-not-a-credential");
+    // Under none, the driver is not composed: nothing to refuse.
+    expect(planTraderHalts({ kind: "none" }, undefined, libpqVariablesIn(env))).toEqual({ ok: true, kind: "none" });
+  });
+
+  it("startup REFUSES each mismatch (78), naming the variable and never printing its value", async () => {
+    const cases = [
+      { config: configWithHalts({ kind: "postgres", timeoutMs: 750 }), env: BASE, code: "CONTROL_TRADER_HALTS_URL_MISSING" },
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: `mysql://halt_reader:${PASSWORD}@127.0.0.1/x` },
+        code: "CONTROL_TRADER_HALTS_URL_INVALID",
+      },
+      { config: validConfig(), env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE }, code: "CONTROL_TRADER_HALTS_URL_UNUSED" },
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE.replace(`:${PASSWORD}`, "") },
+        code: "CONTROL_TRADER_HALTS_URL_INCOMPLETE",
+      },
+      {
+        config: configWithHalts({ kind: "postgres", timeoutMs: 750 }),
+        env: { ...BASE, [TRADER_HALTS_DATABASE_URL_ENV]: URL_VALUE, PGPASSWORD: PASSWORD },
+        code: "CONTROL_TRADER_HALTS_LIBPQ_ENVIRONMENT",
+      },
+    ];
+    for (const entry of cases) {
+      const result = await run(entry.env, entry.config);
+      expect(result.code, entry.code).toBe(EXIT_CODES.configurationRefused);
+      const said = result.lines.join("\n");
+      expect(said).toContain(`[${entry.code}]`);
+      expect(said).not.toContain(PASSWORD);
+      expect(said).not.toContain("halt_reader");
+      expect(said).not.toContain("configuration accepted");
+    }
+  });
+
+  it("--check with postgres: accepted, the source named, the URL and its password printed nowhere — and the variable read ONCE by the composition", async () => {
+    let reads = 0;
+    const env: Record<string, string | undefined> = { ...BASE };
+    Object.defineProperty(env, TRADER_HALTS_DATABASE_URL_ENV, {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        reads += 1;
+        return URL_VALUE;
+      },
+    });
+    const result = await run(env, configWithHalts({ kind: "postgres", timeoutMs: 750 }));
+    expect(result.code).toBe(EXIT_CODES.ok);
+    const said = result.lines.join("\n");
+    expect(said).toContain("trader halt source postgres");
+    expect(said).not.toContain(PASSWORD);
+    expect(said).not.toContain(URL_VALUE);
+    // Two reads in all: the safety scan reads EVERY variable's value (a
+    // credential-shaped NAME is refused only when it carries one), and the
+    // composition reads this one once.
+    expect(reads).toBe(2);
+  });
+
+  it("--check with none: accepted and says so", async () => {
+    const result = await run(BASE);
+    expect(result.code).toBe(EXIT_CODES.ok);
+    expect(result.lines.join("\n")).toContain("trader halt source none");
+  });
+
+  it("redactDatabaseUrl: the URL, and its password as written and decoded, become <redacted> — longest first", () => {
+    const encoded = "p%40ss%2Fword-ctl2";
+    const url = `postgres://halt_reader:${encoded}@db.internal:5432/x`;
+    const text = `failed for ${url}; password ${encoded} or p@ss/word-ctl2; user halt_reader`;
+    const redacted = redactDatabaseUrl(text, url);
+    expect(redacted).toBe("failed for <redacted>; password <redacted> or <redacted>; user halt_reader");
+    // No password: only the URL itself.
+    expect(redactDatabaseUrl("x postgres://u@h/d y", "postgres://u@h/d")).toBe("x <redacted> y");
+    // A URL that does not parse is still redacted whole.
+    expect(redactDatabaseUrl("a not-a-url b", "not-a-url")).toBe("a <redacted> b");
+    expect(redactDatabaseUrl("nothing here", URL_VALUE)).toBe("nothing here");
   });
 });

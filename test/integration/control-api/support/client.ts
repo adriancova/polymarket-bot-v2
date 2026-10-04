@@ -88,7 +88,7 @@ export interface ServeOptions {
   readonly auditAppendTimeoutMs?: number;
   /**
    * `CONTROL-2`: the trader halt source. Absent: an `AbsentTraderHaltSource`,
-   * as `main.ts` composes today (`NOT_CONFIGURED`).
+   * as `main.ts` composes for `traderHalts.kind` `none` (`NOT_CONFIGURED`).
    */
   readonly traderHaltSource?: TraderHaltSource;
 }

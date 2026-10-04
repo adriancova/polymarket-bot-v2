@@ -19,7 +19,13 @@
  *    guard judges a landing; every input must be this package's source, a
  *    workspace package it depends on, or a third-party package on an exact,
  *    justified list; and every import the bundle leaves EXTERNAL must be a
- *    builtin that cannot load or run code.
+ *    STATIC import of a builtin that cannot load or run code. Since
+ *    `CONTROL-2` r1 the list holds the PostgreSQL driver the trader-halt read
+ *    needs, exactly (`support/driver-shims.ts`): its fifteen packages, the
+ *    builtins it needs — each imported only by its own shim, the four that
+ *    `PERMITTED_BUILTINS` does not list included — every shim byte for byte,
+ *    and `pg-native` aliased to a stub that refuses to load. The bundle holds
+ *    no `require`, no `import()` and no dynamic-require helper.
  * 2. **The production source** (this file): no dynamic-loading primitive at
  *    all in `apps/control-api/src/**`, its tests excluded
  *    (`support/production-source-rule.ts`). The bundle states what is in the
@@ -43,42 +49,54 @@
  *   specifier leaving its package) judge every literal specifier in every
  *   workspace package, and F14 (no module load a static check cannot read)
  *   holds only the purity-restricted packages — of the workspace packages this
- *   bundle holds (`decimal`, `domain`, `observability`, `risk`),
- *   `packages/domain` alone. A computed load in the other three is no
- *   `check:deps` finding. {@link BUNDLED_WORKSPACES} pins that set.
+ *   bundle holds (`decimal`, `domain`, `observability`, `risk`,
+ *   `storage-postgres`), `packages/domain` alone. A computed load in the other
+ *   four is no `check:deps` finding. {@link BUNDLED_WORKSPACES} pins that set.
  * - The production-source rule's own limits: `support/production-source-rule.ts`,
  *   "What it does not see".
  */
 
-import { execFile } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
+import {
+  DRIVER_BUILTINS,
+  DRIVER_THIRD_PARTY,
+  PG_NATIVE_REFUSAL,
+  PG_NATIVE_STUB,
+  driverAliasTokens,
+  driverShimFile,
+  driverShimText,
+} from "./support/driver-shims.js";
 import { FORBIDDEN_PACKAGES, SDK_DEPENDENCY_PACKAGES, SDK_SIGNING_PACKAGES, SECURE_DIRECTORY } from "./support/forbidden-targets.js";
 import { PERMITTED_BUILTINS, discover } from "./support/load-judge.js";
 import { CODE_EXTENSIONS } from "./support/module-loads.js";
 import { refusedLanding } from "./support/no-signer-guard.js";
 import { dynamicLoadingIn, type DynamicLoadingFinding, type ProductionScope } from "./support/production-source-rule.js";
+import {
+  CONTROL_API,
+  REPO_ROOT,
+  SAFE_PAPER_ENVIRONMENT,
+  buildArguments,
+  buildShippedBundle,
+  removeBundle,
+  runShippedBundle,
+  type BuiltBundle,
+  type Metafile,
+  type MetafileImport,
+} from "./support/shipped-bundle.js";
 
-const run = promisify(execFile);
-
-const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = realpathSync(resolve(here, "../../.."));
-const CONTROL_API = join(repoRoot, "apps", "control-api");
+const repoRoot = REPO_ROOT;
 const SOURCE_ROOT = join(CONTROL_API, "src");
 const SECURE = join(repoRoot, "packages", SECURE_DIRECTORY);
 
 /** A name built from parts: the test-tree scan refuses a literal path through `node_modules`. */
 const named = (...parts: readonly string[]): string => parts.join("");
 const NODE_MODULES = named("node_", "modules");
-
-/** The `esbuild` the `build` script runs: the package's own, as pnpm puts it on the script's PATH. */
-const ESBUILD = join(CONTROL_API, NODE_MODULES, ".bin", "esbuild");
 
 interface Manifest {
   readonly scripts?: Readonly<Record<string, string>>;
@@ -107,6 +125,9 @@ const SHIPPED_THIRD_PARTY: readonly { readonly name: string; readonly justificat
     name: "decimal.js",
     justification: "@polymarket-bot/decimal's arbitrary-precision arithmetic (via domain and risk); it loads no module",
   },
+  // `CONTROL-2` r1 (the S2 grant): the PostgreSQL driver the trader-halt read
+  // needs, exactly — `support/driver-shims.ts` justifies each.
+  ...DRIVER_THIRD_PARTY,
 ]);
 
 /**
@@ -116,7 +137,14 @@ const SHIPPED_THIRD_PARTY: readonly { readonly name: string; readonly justificat
  * both; a bundle that gains a workspace package fails here until they are
  * restated.
  */
-const BUNDLED_WORKSPACES = Object.freeze(["packages/decimal", "packages/domain", "packages/observability", "packages/risk"]);
+const BUNDLED_WORKSPACES = Object.freeze([
+  "packages/decimal",
+  "packages/domain",
+  "packages/observability",
+  "packages/risk",
+  // `CONTROL-2` r1: `createPostgresPool` and `createDatabase`, for the trader-halt read.
+  "packages/storage-postgres",
+]);
 
 /**
  * The packages `tools/check-dependency-direction.mjs` holds to F14 — its
@@ -169,50 +197,17 @@ function workspaceClosure(start: string): ReadonlySet<string> {
 const CLOSURE = workspaceClosure(CONTROL_API);
 
 /**
- * The arguments the `build` script hands esbuild, with its output moved into
- * `outDirectory` and a metafile added. Anything in the script this does not
- * read — another command, shell syntax, a metafile of its own — fails: the
- * bundle checked here must be the one `build` makes.
- */
-function buildArguments(script: string, outDirectory: string): readonly string[] {
-  const tokens = script.split(/\s+/u).filter((token) => token !== "");
-  if (tokens[0] !== "esbuild") throw new Error(`the build script does not run esbuild first: ${script}`);
-  const unread = tokens.filter((token) => !/^[A-Za-z0-9_./=:@-]+$/u.test(token));
-  if (unread.length > 0) throw new Error(`the build script holds what this check does not read: ${unread.join(" ")}`);
-  if (tokens.filter((token) => token.startsWith("--outfile=")).length !== 1) throw new Error(`the build script names no single --outfile: ${script}`);
-  if (tokens.some((token) => token.startsWith("--metafile"))) throw new Error(`the build script writes a metafile of its own: ${script}`);
-  return [
-    ...tokens.slice(1).map((token) => (token.startsWith("--outfile=") ? `--outfile=${join(outDirectory, basename(token.slice("--outfile=".length)))}` : token)),
-    `--metafile=${join(outDirectory, "meta.json")}`,
-  ];
-}
-
-interface MetafileImport {
-  readonly path: string;
-  readonly kind: string;
-  readonly external?: boolean;
-}
-
-interface Metafile {
-  readonly inputs: Readonly<Record<string, { readonly imports: readonly MetafileImport[] }>>;
-  readonly outputs: Readonly<Record<string, { readonly imports: readonly MetafileImport[] }>>;
-}
-
-/**
  * Builds the bundle the `build` script builds — or, for a positive control,
  * the same build with its entry point replaced by `entry` — and returns its
- * metafile. Nothing is written into the repository.
+ * metafile (`support/shipped-bundle.ts`). Nothing is written into the
+ * repository.
  */
 async function bundle(entry?: string): Promise<Metafile> {
-  const script = CONTROL_API_MANIFEST.scripts?.["build"] ?? "";
-  const out = mkdtempSync(join(tmpdir(), "control-1b-r4-bundle-"));
+  const built = await buildShippedBundle(entry);
   try {
-    let args = buildArguments(script, out);
-    if (entry !== undefined) args = args.map((token) => (token === "src/main.ts" ? entry : token));
-    await run(ESBUILD, args, { cwd: CONTROL_API, env: process.env, timeout: 120_000 });
-    return JSON.parse(readFileSync(join(out, "meta.json"), "utf8")) as Metafile;
+    return built.metafile;
   } finally {
-    rmSync(out, { recursive: true, force: true });
+    removeBundle(built);
   }
 }
 
@@ -236,13 +231,23 @@ function isPermittedBuiltin(specifier: string): boolean {
 }
 
 /**
+ * `CONTROL-2` r1: the driver builtin `specifier` names (`node:dns` → `dns`),
+ * when it is one of {@link DRIVER_BUILTINS} spelled as its shim imports it.
+ */
+function driverBuiltinOf(specifier: string): string | undefined {
+  return DRIVER_BUILTINS.find((entry) => specifier === `node:${entry.builtin}`)?.builtin;
+}
+
+/**
  * Every finding on a metafile (module header, check 1): a FORBIDDEN input (the
  * run-time guard's own judgement of a landing, on the path and its real
  * path); an input that is no file on disk; one outside this package's source,
  * its workspace dependencies and `node_modules`; a third-party package
- * {@link SHIPPED_THIRD_PARTY} does not name; and an external import that is
- * not a permitted builtin. `cwd` is where esbuild ran: the inputs are named
- * relative to it.
+ * {@link SHIPPED_THIRD_PARTY} does not name; an external import that is not a
+ * permitted builtin — or (`CONTROL-2` r1) a driver builtin imported by its
+ * own shim only; and an external loaded other than by a STATIC import, which
+ * an ES-module bundle can only do through a run-time loader. `cwd` is where
+ * esbuild ran: the inputs are named relative to it.
  */
 function bundleFindings(metafile: Metafile, cwd: string = CONTROL_API): readonly string[] {
   const findings: string[] = [];
@@ -267,9 +272,28 @@ function bundleFindings(metafile: Metafile, cwd: string = CONTROL_API): readonly
       findings.push(`input ${input}: outside this package's source, its workspace dependencies and ${NODE_MODULES}`);
     }
   }
-  const imports = [...Object.values(metafile.inputs), ...Object.values(metafile.outputs)].flatMap((entry) => entry.imports);
-  for (const specifier of new Set(imports.filter((entry) => entry.external === true).map((entry) => entry.path))) {
-    if (!isPermittedBuiltin(specifier)) findings.push(`external ${specifier}: not a builtin the bundle may leave to the runtime`);
+  // Each external, with the inputs that import it ("" for an output's import).
+  const externals = new Map<string, Set<string>>();
+  const kinds = new Map<string, Set<string>>();
+  const record = (importer: string, entry: MetafileImport): void => {
+    if (entry.external !== true) return;
+    externals.set(entry.path, (externals.get(entry.path) ?? new Set<string>()).add(importer));
+    kinds.set(entry.path, (kinds.get(entry.path) ?? new Set<string>()).add(entry.kind));
+  };
+  for (const [input, entry] of Object.entries(metafile.inputs)) for (const imported of entry.imports) record(input, imported);
+  for (const entry of Object.values(metafile.outputs)) for (const imported of entry.imports) record("", imported);
+  for (const [specifier, importers] of externals) {
+    const driver = driverBuiltinOf(specifier);
+    const shim = driver === undefined ? undefined : driverShimFile(driver);
+    const byItsShimOnly = shim !== undefined && importers.has(shim) && [...importers].every((importer) => importer === "" || importer === shim);
+    if (!isPermittedBuiltin(specifier) && !byItsShimOnly) {
+      findings.push(`external ${specifier}: not a builtin the bundle may leave to the runtime`);
+    }
+    for (const kind of kinds.get(specifier) ?? []) {
+      if (kind !== "import-statement") {
+        findings.push(`external ${specifier} (${kind}): an ES-module bundle loads it only through a run-time loader; a builtin must be a static import`);
+      }
+    }
   }
   return findings;
 }
@@ -288,6 +312,8 @@ function thirdPartyIn(metafile: Metafile, cwd: string = CONTROL_API): ReadonlySe
 const PRODUCTION_SCOPE: ProductionScope = {
   dependencies: Object.keys(CONTROL_API_MANIFEST.dependencies ?? {}),
   sourceRoot: SOURCE_ROOT,
+  // `CONTROL-2` r1: each driver shim may load its own builtin (`support/driver-shims.ts`).
+  builtinShims: Object.fromEntries(DRIVER_BUILTINS.map((entry) => [join(CONTROL_API, driverShimFile(entry.builtin)), entry.builtin])),
 };
 
 /** Whether `path` is a test file, which the production-source rule does not read. */
@@ -388,9 +414,13 @@ describe("ACCEPTANCE 3, authoritative: the shipped artifact holds no signer (CON
       "--platform=node",
       "--format=esm",
       "--target=node24",
+      // `CONTROL-2` r1: each builtin the PostgreSQL driver requires, to its
+      // shim, and `pg-native` to the stub (`support/driver-shims.ts`).
+      ...driverAliasTokens(),
       `--outfile=${join(out, "main.mjs")}`,
       `--metafile=${join(out, "meta.json")}`,
     ]);
+    expect(driverAliasTokens()).toHaveLength(11);
     for (const other of [
       "node build.mjs",
       `${script} && node x.mjs`,
@@ -421,7 +451,7 @@ describe("ACCEPTANCE 3, authoritative: the shipped artifact holds no signer (CON
       const real = realpathSync(resolve(CONTROL_API, input));
       for (const directory of CLOSURE) if (within(real, directory)) workspaces.add(relative(repoRoot, directory).split(sep).join("/"));
     }
-    expect([...workspaces].sort()).toEqual([...BUNDLED_WORKSPACES]);
+    expect([...workspaces].sort()).toEqual([...BUNDLED_WORKSPACES].sort());
     const purity = purityRestrictedDirectories();
     expect(purity.line).toBe("isDomain || isStrategy || isLedger || isSimulation");
     expect(BUNDLED_WORKSPACES.filter(purity.restricted)).toEqual(["packages/domain"]);
@@ -449,13 +479,116 @@ describe("ACCEPTANCE 3, authoritative: the shipped artifact holds no signer (CON
         "f16's relative half",
         "every workspace package",
         "f14 (no module load a static check cannot read) holds only the purity-restricted packages",
-        "(`decimal`, `domain`, `observability`, `risk`), `packages/domain` alone",
-        "a computed load in the other three is no `check:deps` finding",
+        "(`decimal`, `domain`, `observability`, `risk`, `storage-postgres`), `packages/domain` alone",
+        "a computed load in the other four is no `check:deps` finding",
       ]) {
         expect(said, `${name}: ${phrase}`).toContain(phrase);
       }
     }
   });
+
+  it("CONTROL-2 r1 (S2): the PostgreSQL driver ships EXACTLY as granted — its builtins by static import from their own shims, every shim byte for byte, pg-native as the stub, and no run-time loader in the output", async () => {
+    const built = await buildShippedBundle();
+    try {
+      const { metafile } = built;
+      // The builtins the shims import are EXACTLY the driver's, each from its own shim.
+      const fromShims = new Map<string, string[]>();
+      for (const [input, entry] of Object.entries(metafile.inputs)) {
+        if (!input.startsWith("src/driver-shims/")) continue;
+        fromShims.set(
+          input,
+          entry.imports.map((imported) => `${imported.path}:${imported.kind}:${String(imported.external === true)}`),
+        );
+      }
+      const expectedShims = new Map(DRIVER_BUILTINS.map((entry) => [driverShimFile(entry.builtin), [`node:${entry.builtin}:import-statement:true`]]));
+      expectedShims.set(PG_NATIVE_STUB, []);
+      expect(Object.fromEntries([...fromShims].sort())).toEqual(Object.fromEntries([...expectedShims].sort()));
+      for (const entry of DRIVER_BUILTINS) expect(entry.justification.length, entry.builtin).toBeGreaterThanOrEqual(40);
+      expect(DRIVER_BUILTINS.map((entry) => entry.builtin).sort()).toEqual(
+        ["crypto", "dns", "events", "fs", "net", "path", "stream", "string_decoder", "tls", "util", "util/types"].sort(),
+      );
+      // The four the scan's PERMITTED_BUILTINS does not list, admitted for their shims only.
+      expect(DRIVER_BUILTINS.map((entry) => entry.builtin).filter((builtin) => !(PERMITTED_BUILTINS as readonly string[]).includes(builtin)).sort()).toEqual(
+        ["dns", "string_decoder", "tls", "util/types"],
+      );
+      // Every shim on disk is exactly its text; nothing else is in the shim directory.
+      const shimDirectory = join(CONTROL_API, "src", "driver-shims");
+      const onDisk = discover(shimDirectory).code.map((path) => relative(CONTROL_API, path)).sort();
+      expect(onDisk).toEqual([...expectedShims.keys()].sort());
+      for (const entry of DRIVER_BUILTINS) {
+        expect(readFileSync(join(CONTROL_API, driverShimFile(entry.builtin)), "utf8"), entry.builtin).toBe(driverShimText(entry.builtin));
+      }
+      const stub = readFileSync(join(CONTROL_API, PG_NATIVE_STUB), "utf8");
+      expect(stub).toContain(`throw new Error(\n  "${PG_NATIVE_REFUSAL}`);
+      expect(dynamicLoadingIn(stub, join(CONTROL_API, PG_NATIVE_STUB), PRODUCTION_SCOPE)).toEqual([]);
+      expect(stub.split("\n").filter((line) => /^(?:import|export)\b/u.test(line))).toEqual(["export {};"]);
+      // pg-native: pg's native client requires it, and the bundle holds the STUB there — no pg-native package at all.
+      const nativeClient = Object.entries(metafile.inputs).find(([input]) => input.endsWith(["pg", "lib", "native", "client.js"].join("/")));
+      expect(nativeClient?.[1].imports.find((imported) => imported.original === "pg-native")).toEqual({
+        path: PG_NATIVE_STUB,
+        kind: "require-call",
+        original: "pg-native",
+      });
+      expect(Object.keys(metafile.inputs).filter((input) => input.includes("pg-native"))).toEqual([PG_NATIVE_STUB]);
+      // Every require a bundled package makes of a builtin lands on its shim: none is left external.
+      const requires = Object.values(metafile.inputs).flatMap((entry) => entry.imports.filter((imported) => imported.kind === "require-call"));
+      expect(requires.length).toBeGreaterThan(20);
+      expect(requires.filter((imported) => imported.external === true)).toEqual([]);
+      for (const imported of requires.filter((entry) => DRIVER_BUILTINS.some((driver) => driver.builtin === entry.original))) {
+        expect(imported.path, imported.original).toBe(driverShimFile(imported.original ?? ""));
+      }
+      // The OUTPUT holds no run-time loader: no dynamic-require helper, no import(), no createRequire.
+      const output = readFileSync(built.file, "utf8");
+      expect(output).not.toContain("Dynamic require of");
+      expect(output).not.toMatch(/\bimport\(/u);
+      expect(output).not.toContain(named("create", "Require"));
+      expect(output).toContain(PG_NATIVE_REFUSAL);
+    } finally {
+      removeBundle(built);
+    }
+  }, 120_000);
+
+  it("CONTROL-2 r1 (S2): the shipped bundle LOADS the driver (--check), and the stub is what ships — asking pg for its native binding fails with the stub's own refusal", async () => {
+    let built: BuiltBundle | undefined;
+    const directory = mkdtempSync(join(tmpdir(), "control-2-r1-bundle-run-"));
+    try {
+      built = await buildShippedBundle();
+      const config = join(directory, "control-api.json");
+      writeFileSync(
+        config,
+        JSON.stringify({
+          bindHost: "127.0.0.1",
+          bindPort: 0,
+          maxRequestBodyBytes: 65_536,
+          auditCapacity: 64,
+          auditSafetyReserve: 4,
+          traderHealth: { kind: "none" },
+          traderHalts: { kind: "postgres", timeoutMs: 1_000 },
+          operators: [{ operatorId: "r1-reader", token: "fake-paper-operator-token-not-a-credential-r1-0001", grants: ["READ"] }],
+        }),
+        "utf8",
+      );
+      const url = "postgres://halt_reader:Kx9-not-a-credential-r1@127.0.0.1:1/polymarket_bot";
+      const env = { ...SAFE_PAPER_ENVIRONMENT, CONTROL_API_CONFIG: config, CONTROL_API_TRADER_HALTS_DATABASE_URL: url };
+      // The whole module graph — pg, pg-pool, kysely and every shim — loads: a
+      // require left to the runtime would have thrown "Dynamic require" here.
+      const checked = await runShippedBundle(built.file, ["--check"], env);
+      expect(checked.code, `${checked.stdout}\n${checked.stderr}`).toBe(0);
+      expect(checked.stdout).toContain("trader halt source postgres");
+      expect(checked.stdout).toContain("nothing was bound");
+      expect(`${checked.stdout}${checked.stderr}`).not.toContain("Kx9-not-a-credential-r1");
+      expect(checked.stderr).toBe("");
+      // NODE_PG_FORCE_NATIVE makes pg require its native binding at load: the
+      // stub refuses, so the bundle cannot start on a native path.
+      const forced = await runShippedBundle(built.file, ["--check"], { ...env, NODE_PG_FORCE_NATIVE: "1" });
+      expect(forced.code).not.toBe(0);
+      expect(forced.stderr).toContain(PG_NATIVE_REFUSAL);
+      expect(forced.stdout).not.toContain("configuration accepted");
+    } finally {
+      removeBundle(built);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it("positive control: the same build with an entry that imports the secure adapter names the adapter, the venue SDK, and each of the SDK's own packages", async () => {
     const directory = mkdtempSync(join(tmpdir(), "control-1b-r4-plant-"));
@@ -512,6 +645,29 @@ describe("ACCEPTANCE 3, authoritative: the shipped artifact holds no signer (CON
     for (const path of [VIEM_NAME ?? "", "node:vm", "node:child_process", "worker_threads", "module", "zod"]) {
       expect(bundleFindings(external(path)), path).toEqual([`external ${path}: not a builtin the bundle may leave to the runtime`]);
     }
+    // `CONTROL-2` r1: a driver builtin is admitted from ITS shim only — not
+    // from another input, not from another shim, not spelled without `node:`.
+    const from = (input: string, path: string, kind = "import-statement"): Metafile => ({
+      inputs: { [input]: { imports: [{ path, kind, external: true }] } },
+      outputs: {},
+    });
+    expect(bundleFindings(from(driverShimFile("dns"), "node:dns"))).toEqual([]);
+    expect(bundleFindings(from(driverShimFile("util/types"), "node:util/types"))).toEqual([]);
+    for (const [input, path] of [
+      ["src/main.ts", "node:dns"],
+      [driverShimFile("dns"), "node:tls"],
+      [driverShimFile("dns"), "dns"],
+      ["src/main.ts", "node:util/types"],
+    ] as const) {
+      expect(bundleFindings(from(input, path)), `${input} ${path}`).toEqual([`external ${path}: not a builtin the bundle may leave to the runtime`]);
+    }
+    // …and only by a STATIC import: a builtin left to a require or an import()
+    // is a run-time loader in an ES-module bundle, permitted builtin or not.
+    for (const kind of ["require-call", "dynamic-import"]) {
+      expect(bundleFindings(from("src/main.ts", "events", kind)), kind).toEqual([
+        `external events (${kind}): an ES-module bundle loads it only through a run-time loader; a builtin must be a static import`,
+      ]);
+    }
     expect(bundleFindings({ inputs: { "src/nothing-here.ts": empty }, outputs: {} })).toEqual([
       "input src/nothing-here.ts: no file on disk, so no place this check can judge",
     ]);
@@ -553,6 +709,27 @@ describe("ACCEPTANCE 3, authoritative: the production source holds no dynamic-lo
         expect(rulesIn(plant.text, join(SOURCE_ROOT, `planted${extension}`)), `${plant.label} (${extension})`).toEqual([...plant.rules].sort());
       }
     }
+  });
+
+  it("CONTROL-2 r1: a driver builtin is admitted in ITS OWN shim only — any other builtin there, or it anywhere else, is a finding", () => {
+    const shim = (builtin: string): string => join(CONTROL_API, driverShimFile(builtin));
+    for (const entry of DRIVER_BUILTINS) {
+      expect(findingsIn(driverShimText(entry.builtin), shim(entry.builtin)), entry.builtin).toEqual([]);
+    }
+    const rules = (text: string, path: string): readonly string[] => findingsIn(text, path).map((finding) => `${finding.rule} ${finding.text}`);
+    // Another builtin in a shim: refused, permitted elsewhere or not.
+    expect(rules('export * from "node:tls";\n', shim("dns"))).toEqual(["specifier node:tls"]);
+    expect(rules('export * from "node:vm";\n', shim("dns"))).toEqual(["specifier node:vm"]);
+    // The shim's builtin, unprefixed: not what the shim map admits.
+    expect(rules('export * from "dns";\n', shim("dns"))).toEqual(["specifier dns"]);
+    // A driver builtin outside its shim: refused.
+    for (const builtin of ["dns", "tls", "string_decoder", "util/types"]) {
+      expect(rules(`export * from "node:${builtin}";\n`, join(SOURCE_ROOT, "planted.ts")), builtin).toEqual([`specifier node:${builtin}`]);
+      expect(rules(`export * from "node:${builtin}";\n`, shim(builtin === "dns" ? "tls" : "dns")), builtin).toEqual([`specifier node:${builtin}`]);
+    }
+    // The rest of the rule still holds inside a shim.
+    expect(rules(`export const r = ${named("re", "quire")}("node:dns");\n`, shim("dns"))).toEqual([]);
+    expect(rules("export const g = (k) => globalThis[k];\n", shim("dns"))).toEqual(["computed-global a computed member of globalThis"]);
   });
 
   it("negative controls: what production source legitimately does is not a finding", () => {

@@ -158,12 +158,7 @@ import {
 } from "./doors.js";
 import type { TraderHealthCache } from "./health-source.js";
 import { readInstanceIdParameter } from "./instance-id.js";
-import {
-  TRADER_HALT_METRIC_FAMILIES,
-  traderHaltSamples,
-  traderHaltsDocument,
-  type TraderHaltCache,
-} from "./trader-halts.js";
+import { traderHaltSamples, traderHaltsDocument, type TraderHaltCache } from "./trader-halts.js";
 import {
   CONTROL_KILL_SWITCH_ACTIONS,
   CONTROL_KILL_SWITCH_SCOPES,
@@ -260,12 +255,6 @@ export interface ControlApiOptions {
    */
   readonly traderHalts: TraderHaltCache;
 }
-
-/**
- * Every family `GET /v1/metrics` renders: the platform table, then this
- * process's own trader halt families (`trader-halts.ts`, `CONTROL-2`).
- */
-export const CONTROL_API_METRIC_FAMILIES = Object.freeze([...PLATFORM_METRIC_FAMILIES, ...TRADER_HALT_METRIC_FAMILIES]);
 
 // --- the request doors ------------------------------------------------------
 
@@ -986,7 +975,7 @@ export class ControlApi {
     return {
       status: 200,
       contentType: "text/plain; version=0.0.4; charset=utf-8",
-      body: renderExpositionFor(CONTROL_API_METRIC_FAMILIES, samples),
+      body: renderExpositionFor(PLATFORM_METRIC_FAMILIES, samples),
     };
   }
 }

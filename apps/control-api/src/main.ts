@@ -11,6 +11,7 @@
  * ```text
  * 1. checkControlApiSafety(env)      ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration ← ADR-020 D1-D4, §15 loopback
+ *    and the trader-halt database URL ← CONTROL-2 r1: one variable, read once, never printed
  * 3. construct the audit sink         ← in-memory, behind the audit budget
  * 4. construct the control plane      ← audits before it applies
  * 5. bind loopback and serve
@@ -40,7 +41,9 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import type { ControlAuditSink } from "@polymarket-bot/observability";
+import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
+import { PostgresTraderHaltSource } from "./adapters/postgres-trader-halts.js";
 import { ControlApi, type ApiEnvironment } from "./api.js";
 import { createBudgetedAuditLog } from "./audit-budget.js";
 import { OperatorRegistry } from "./auth.js";
@@ -58,22 +61,251 @@ import {
   REPOSITORY_MAXIMUM_RUN_MODE,
   checkControlApiSafety,
 } from "./safety.js";
-import { AbsentTraderHaltSource, TraderHaltCache } from "./trader-halts.js";
+import {
+  AbsentTraderHaltSource,
+  TraderHaltCache,
+  type TraderHaltFetch,
+  type TraderHaltSource,
+} from "./trader-halts.js";
 
 /**
- * Why the shipped process reads no `ops.incidents` (`CONTROL-2`, disclosed).
+ * `CONTROL-2` r1 — the ONE environment variable the trader-halt database URL
+ * comes from (`traderHalts.kind` `postgres`).
  *
- * `trader-halts.ts` and `adapters/postgres-trader-halts.ts` read the open
- * trader halts through the API, and the opt-in PostgreSQL suite proves it end
- * to end. Composing that source HERE needs a PostgreSQL client in the shipped
- * bundle, which acceptance 3's authoritative shipped-artifact check refuses
- * today (its exact third-party list and its builtin-only externals); widening
- * that check is a decision `CONTROL-2` stopped on rather than took. Until it is
- * made, the state is `NOT_CONFIGURED` — never "no halts".
+ * The URL carries a credential, so it is not a configuration field: it is
+ * read from the environment ONCE, in {@link startup}, and handed to the pool.
+ * It is never logged, never part of a refusal, and never echoed in a health
+ * answer — a driver error that held it, or its password, would reach both
+ * with them replaced by `<redacted>` ({@link redactDatabaseUrl}). The role it
+ * names needs `USAGE` on the schema `ops` and `SELECT` on `ops.incidents`, and
+ * nothing else (README, "Open trader halts"); without them every read is
+ * `UNKNOWN`.
+ *
+ * ONE variable is all the driver reads. `pg`, like libpq, fills a component
+ * the URL omits from the `PG*` environment variables (`PGPASSWORD`,
+ * `PGHOST`, `PGSSLMODE`, …), from the password file (`~/.pgpass`, or
+ * `PGPASSFILE`) and from `USER`; so the URL must name a user, a password, a
+ * host and a database ({@link planTraderHalts}), and a `PG*` variable in the
+ * environment refuses the start.
  */
-export const TRADER_HALTS_NOT_COMPOSED =
-  "this process holds no PostgreSQL client, so it reads no open TRADER_HALT rows from ops.incidents; " +
-  "read them there directly (status not RESOLVED)";
+export const TRADER_HALTS_DATABASE_URL_ENV = "CONTROL_API_TRADER_HALTS_DATABASE_URL";
+
+/** libpq's environment namespace, which `pg` reads for every parameter the URL omits. */
+const LIBPQ_VARIABLE = /^PG[A-Z]/u;
+
+/** The names of the `PG*` variables `env` sets to a non-empty value, sorted — never their values. */
+export function libpqVariablesIn(env: Readonly<Record<string, string | undefined>>): readonly string[] {
+  return Object.keys(env)
+    .filter((name) => LIBPQ_VARIABLE.test(name) && (env[name] ?? "") !== "")
+    .sort();
+}
+
+/**
+ * Why a `traderHalts.kind` `none` deployment reads no `ops.incidents`, for its
+ * log and its health answer: the state is `NOT_CONFIGURED`, never "no halts".
+ */
+export const TRADER_HALTS_NOT_CONFIGURED =
+  "traderHalts.kind is none, so this process reads no open TRADER_HALT rows from ops.incidents; " +
+  "read them there directly (status not RESOLVED), or configure traderHalts.kind postgres";
+
+/** What the reader's sessions are called in `pg_stat_activity`, so a stuck read is attributable. */
+export const TRADER_HALTS_APPLICATION_NAME = "polymarket-bot-control-api";
+
+/**
+ * Connections the reader's pool may hold. Reads are single-flight (`api.ts`),
+ * so one is in use at a time; the second lets a read proceed while a read
+ * that missed its bound still holds the first, until the server's own
+ * `statement_timeout` (the same bound) ends it.
+ */
+export const TRADER_HALTS_POOL_MAX = 2;
+
+/** How long a shutdown waits for the reader's pool to close before it says so and stops waiting. */
+export const TRADER_HALTS_CLOSE_WAIT_MS = 5_000;
+
+const REDACTED = "<redacted>";
+
+/**
+ * `text` with every occurrence of the database URL `url`, and of its password
+ * as written and percent-decoded, replaced by `<redacted>` (longest first).
+ * Applied to every driver text that can reach a log line or a health answer.
+ * TOTAL.
+ */
+export function redactDatabaseUrl(text: string, url: string): string {
+  const secrets = new Set<string>([url]);
+  try {
+    const password = new URL(url).password;
+    if (password !== "") {
+      secrets.add(password);
+      try {
+        secrets.add(decodeURIComponent(password));
+      } catch {
+        // A password that is not valid percent-encoding is redacted as written.
+      }
+    }
+  } catch {
+    // A URL that does not parse is refused at startup, before any read.
+  }
+  let redacted = text;
+  for (const secret of [...secrets].filter((value) => value !== "").sort((left, right) => right.length - left.length)) {
+    redacted = redacted.split(secret).join(REDACTED);
+  }
+  return redacted;
+}
+
+function describeCause(cause: unknown): string {
+  return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+}
+
+/**
+ * What a configuration and the one database-URL variable decide about the
+ * trader-halt source: a plan, or a refusal that names the variable and never
+ * its value. TOTAL.
+ */
+export type TraderHaltsPlan =
+  | { readonly ok: true; readonly kind: "none" }
+  | { readonly ok: true; readonly kind: "postgres"; readonly url: string; readonly timeoutMs: number }
+  | { readonly ok: false; readonly code: string; readonly detail: string };
+
+export function planTraderHalts(
+  config: ControlApiConfig["traderHalts"],
+  url: string | undefined,
+  libpqVariables: readonly string[] = [],
+): TraderHaltsPlan {
+  const given = url !== undefined && url !== "";
+  if (config.kind === "none") {
+    return given
+      ? {
+          ok: false,
+          code: "CONTROL_TRADER_HALTS_URL_UNUSED",
+          detail:
+            `${TRADER_HALTS_DATABASE_URL_ENV} is set, but traderHalts.kind is none, so this process would read no ` +
+            "open trader halts while its environment says it should; set traderHalts.kind to postgres, or unset the " +
+            "variable (its value is not printed)",
+        }
+      : { ok: true, kind: "none" };
+  }
+  if (!given) {
+    return {
+      ok: false,
+      code: "CONTROL_TRADER_HALTS_URL_MISSING",
+      detail:
+        `traderHalts.kind is postgres, and ${TRADER_HALTS_DATABASE_URL_ENV} names no database: there is no default, ` +
+        "because which database holds the trader's ops.incidents is a deployment decision",
+    };
+  }
+  let parsed: URL | undefined;
+  try {
+    parsed = new URL(url);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed === undefined || (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:")) {
+    return {
+      ok: false,
+      code: "CONTROL_TRADER_HALTS_URL_INVALID",
+      detail:
+        `${TRADER_HALTS_DATABASE_URL_ENV} is not a postgres:// or postgresql:// URL (its value is not printed: it ` +
+        "may carry a credential)",
+    };
+  }
+  const missing = [
+    ...(parsed.username === "" ? ["user"] : []),
+    ...(parsed.password === "" ? ["password"] : []),
+    ...(parsed.hostname === "" ? ["host"] : []),
+    ...(parsed.pathname === "" || parsed.pathname === "/" ? ["database"] : []),
+  ];
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      code: "CONTROL_TRADER_HALTS_URL_INCOMPLETE",
+      detail:
+        `${TRADER_HALTS_DATABASE_URL_ENV} names no ${missing.join(", no ")} (its value is not printed): the driver would ` +
+        "fill what the URL omits from the PG* environment variables, the password file or the process user, and the " +
+        "URL is to be the one source of the connection",
+    };
+  }
+  if (libpqVariables.length > 0) {
+    return {
+      ok: false,
+      code: "CONTROL_TRADER_HALTS_LIBPQ_ENVIRONMENT",
+      detail:
+        `the environment sets ${libpqVariables.join(", ")} (values not printed), which the PostgreSQL driver reads as ` +
+        `connection parameters beside ${TRADER_HALTS_DATABASE_URL_ENV}; put what they say in the URL and unset them`,
+    };
+  }
+  return { ok: true, kind: "postgres", url, timeoutMs: config.timeoutMs };
+}
+
+/** The composed trader-halt read: the cache the API reads, and how to release what it holds. */
+interface ComposedTraderHalts {
+  readonly cache: TraderHaltCache;
+  readonly close: () => Promise<void>;
+}
+
+/**
+ * Composes the plan (`CONTROL-2` r1). `none`: an `AbsentTraderHaltSource`,
+ * `NOT_CONFIGURED`. `postgres`: the PostgreSQL source over a pool of its own —
+ * the session bounded by the read's own bound, every driver text redacted, and
+ * a connection that fails while idle or between statements logged (redacted)
+ * and dropped rather than left to crash the process as an unhandled `error`
+ * event.
+ */
+function composeTraderHalts(plan: Extract<TraderHaltsPlan, { ok: true }>, log: (line: string) => void): ComposedTraderHalts {
+  if (plan.kind === "none") {
+    return {
+      cache: new TraderHaltCache(new AbsentTraderHaltSource(TRADER_HALTS_NOT_CONFIGURED)),
+      close: () => Promise.resolve(),
+    };
+  }
+  const { url, timeoutMs } = plan;
+  const pool = createPostgresPool({
+    connectionString: url,
+    maxConnections: TRADER_HALTS_POOL_MAX,
+    statementTimeoutMs: timeoutMs,
+    connectionTimeoutMs: timeoutMs,
+    applicationName: TRADER_HALTS_APPLICATION_NAME,
+  });
+  pool.on("error", (cause: unknown) => {
+    log(
+      `trader halts: an idle ops.incidents connection failed and was dropped (${redactDatabaseUrl(describeCause(cause), url)}); ` +
+        "the next read opens another",
+    );
+  });
+  // A connection that fails while a read holds it, between two statements, is
+  // that read's failure (UNKNOWN); without a listener of its own its `error`
+  // event would be unhandled.
+  pool.on("connect", (client) => {
+    client.on("error", () => undefined);
+  });
+  const db = createDatabase(pool);
+  const source = new PostgresTraderHaltSource({ db, timeoutMs });
+  const redacting: TraderHaltSource = {
+    configured: true,
+    fetch: async (): Promise<TraderHaltFetch> => {
+      try {
+        const fetched = await source.fetch();
+        return fetched.fetched ? fetched : { fetched: false, detail: redactDatabaseUrl(fetched.detail, url) };
+      } catch (cause) {
+        return { fetched: false, detail: redactDatabaseUrl(`the trader halt source threw (contained): ${describeCause(cause)}`, url) };
+      }
+    },
+  };
+  return { cache: new TraderHaltCache(redacting), close: () => db.destroy() };
+}
+
+/** `work`, or `false` once `ms` have passed without it settling (the timer is unreferenced). */
+function settlesWithin(work: Promise<void>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => {
+      resolve(false);
+    }, ms);
+    timer.unref();
+  });
+  return Promise.race([work.then(() => true), expired]).finally(() => {
+    clearTimeout(timer);
+  });
+}
 
 /** What the process exits with, so an operator can script against it. */
 export const EXIT_CODES = Object.freeze({
@@ -190,11 +422,20 @@ export async function startup(
   }
   const config = parsed.config;
 
+  // `CONTROL-2` r1: the trader-halt database URL — the one read of the one
+  // variable (`TRADER_HALTS_DATABASE_URL_ENV`). Its value is never printed.
+  const haltsPlan = planTraderHalts(config.traderHalts, ports.env[TRADER_HALTS_DATABASE_URL_ENV], libpqVariablesIn(ports.env));
+  if (!haltsPlan.ok) {
+    ports.log(`REFUSING TO START — [${haltsPlan.code}] ${haltsPlan.detail}`);
+    return EXIT_CODES.configurationRefused;
+  }
+
   ports.log(
     `control API configuration accepted: ${String(config.operators.length)} operator(s), ` +
       `audit bound ${String(config.auditCapacity)} (the last ${String(config.auditSafetyReserve)} ` +
       `for kill-switch engages, the ${String(config.auditSafetyReserve)} before them for ` +
-      `safety-direction actions), trader health source ${config.traderHealth.kind}`,
+      `safety-direction actions), trader health source ${config.traderHealth.kind}, trader halt source ` +
+      config.traderHalts.kind,
   );
 
   if (!options.serve) {
@@ -221,8 +462,9 @@ export async function startup(
   // wiring with a sink that answers late.
   const controlPlane = composeControlPlane(sink, environment);
   const health = new TraderHealthCache(healthSourceFor(config));
-  // `CONTROL-2`: stated, never defaulted — see `TRADER_HALTS_NOT_COMPOSED`.
-  const traderHalts = new TraderHaltCache(new AbsentTraderHaltSource(TRADER_HALTS_NOT_COMPOSED));
+  // `CONTROL-2` r1: stated, never defaulted — `none` is NOT_CONFIGURED, and
+  // `postgres` reads ops.incidents on every authorized health and metrics read.
+  const halts = composeTraderHalts(haltsPlan, ports.log);
 
   const api = new ControlApi({
     operators: new OperatorRegistry(
@@ -241,17 +483,25 @@ export async function startup(
     // request (`api.ts`, "Refresh-on-read"). A `none` source has nothing to
     // read, so its trader-health lines are `WP-240`'s.
     refreshHealthOnRead: config.traderHealth.kind === "http",
-    // `CONTROL-2`: always stated; NOT_CONFIGURED here (see above), which adds
-    // the `control_trader_halts_state` lines and the `traderHalts` section.
-    traderHalts,
+    // `CONTROL-2`: always stated, so the `control_trader_halts_state` lines
+    // and the `traderHalts` section are always there.
+    traderHalts: halts.cache,
   });
 
-  const server = await startControlHttpServer({
-    api,
-    host: config.bindHost,
-    port: config.bindPort,
-    maxRequestBodyBytes: config.maxRequestBodyBytes,
-  });
+  let server: Awaited<ReturnType<typeof startControlHttpServer>>;
+  try {
+    server = await startControlHttpServer({
+      api,
+      host: config.bindHost,
+      port: config.bindPort,
+      maxRequestBodyBytes: config.maxRequestBodyBytes,
+    });
+  } catch (cause) {
+    // The reader's pool holds no connection yet (it connects on the first
+    // read), but it is released all the same before the failure propagates.
+    await halts.close().catch(() => undefined);
+    throw cause;
+  }
 
   ports.log(
     `control API listening on ${config.bindHost}:${String(server.port)} — PAPER, no signer, ` +
@@ -281,19 +531,45 @@ export async function startup(
           "control_trader_health_available reads 0",
   );
   ports.log(
-    `trader halts: NOT CONFIGURED — ${TRADER_HALTS_NOT_COMPOSED}; /v1/health and ` +
-      'control_trader_halts_state say NOT_CONFIGURED, never "no halts"',
+    haltsPlan.kind === "postgres"
+      ? `trader halts: the open TRADER_HALT rows of ops.incidents are read on every authorized /v1/health and ` +
+          `/v1/metrics request (timeout ${String(haltsPlan.timeoutMs)}ms), from the database ` +
+          `${TRADER_HALTS_DATABASE_URL_ENV} names (its value is never logged); control_trader_halts_state says ` +
+          'OPEN, NONE_OPEN or UNKNOWN, and UNKNOWN is never "no halts"'
+      : `trader halts: NOT CONFIGURED — ${TRADER_HALTS_NOT_CONFIGURED}; /v1/health and ` +
+          'control_trader_halts_state say NOT_CONFIGURED, never "no halts"',
   );
 
   const shutdown = (): void => {
-    void server.close().then(
-      () => {
+    void (async (): Promise<void> => {
+      let failure: unknown;
+      try {
+        await server.close();
+      } catch (cause) {
+        failure = cause;
+      }
+      // `CONTROL-2` r1: the reader's pool, whatever the server did, and
+      // bounded — a connection a frozen server still holds must not hold the
+      // shutdown with it.
+      const closed = await settlesWithin(
+        halts.close().catch((cause: unknown) => {
+          failure ??= cause;
+        }),
+        TRADER_HALTS_CLOSE_WAIT_MS,
+      );
+      if (!closed) {
+        ports.log(
+          `trader halts: the ops.incidents pool did not close within ${String(TRADER_HALTS_CLOSE_WAIT_MS)}ms; ` +
+            "not waiting for it",
+        );
+      }
+      if (failure === undefined) {
         ports.log("control API stopped.");
-      },
-      (cause: unknown) => {
-        ports.log(`control API stop failed: ${cause instanceof Error ? cause.message : String(cause)}`);
-      },
-    );
+      } else {
+        const said = describeCause(failure);
+        ports.log(`control API stop failed: ${haltsPlan.kind === "postgres" ? redactDatabaseUrl(said, haltsPlan.url) : said}`);
+      }
+    })();
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);

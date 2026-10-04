@@ -105,6 +105,7 @@ import { ALL_PRODUCTION_NAMES, CREDENTIAL_NAME_PATTERNS } from "@polymarket-bot/
 
 import rootConfig from "../../vitest.config.js";
 import postgresConfig from "./postgres/vitest.config.js";
+import { DRIVER_BUILTINS, driverAliasTokens, driverShimFile } from "./support/driver-shims.js";
 import {
   FORBIDDEN_PACKAGES,
   PERMITTED_BARE_SPECIFIERS,
@@ -386,16 +387,28 @@ const LOAD_ALLOWLIST: readonly LoadAllowlistEntry[] = Object.freeze([
       "only REFUSES, registered before any test file is imported",
   },
   // `CONTROL-1b` r4: the shipped-artifact check runs the package's own esbuild,
-  // as its build script does, in a child process.
+  // as its build script does, in a child process. `CONTROL-2` r1 moved that
+  // into `support/shipped-bundle.ts`, which also RUNS the built bundle.
   {
-    file: "test/integration/control-api/acceptance-3-shipped-artifact.test.ts",
+    file: "test/integration/control-api/support/shipped-bundle.ts",
     finding: named("<builtin:node:", "child_", "process>"),
     count: 1,
     justification:
       "the authoritative bundle check runs this package's own esbuild binary with its build script's arguments " +
-      "(asynchronously, execFile) to read the shipped bundle's metafile; the child bundles, and nothing it builds " +
-      "is loaded into this worker",
+      "(asynchronously, execFile) to read the shipped bundle's metafile, and the halt suites run that built bundle " +
+      "with node in a child process (execFile, spawn); nothing it builds is loaded into this worker",
   },
+  // `CONTROL-2` r1: the PostgreSQL driver's shims for the builtins
+  // PERMITTED_BUILTINS does not list, each re-exporting its own once.
+  ...DRIVER_BUILTINS.filter((entry) => !(PERMITTED_BUILTINS as readonly string[]).includes(entry.builtin)).map((entry) => ({
+    file: `apps/control-api/${driverShimFile(entry.builtin)}`,
+    finding: `<builtin:node:${entry.builtin}>`,
+    count: 1,
+    justification:
+      `the shipped bundle aliases the PostgreSQL driver's require of ${entry.builtin} to this one-line ES module, ` +
+      `which re-exports node:${entry.builtin} and nothing else (pinned byte for byte by the shipped-artifact check): ` +
+      entry.justification,
+  })),
 ]);
 
 /** A file on disk, read every time and parsed once per path and CONTENT (a test rewrites its own fixtures). */
@@ -2151,7 +2164,10 @@ describe("ACCEPTANCE 3: no signer is loaded", () => {
     // names, so any change to these is a change this acceptance must judge.
     expect(manifest.scripts).toEqual({
       typecheck: "tsc --noEmit && tsc --noEmit -p ../../test/integration/control-api/tsconfig.json",
-      build: "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+      // `CONTROL-2` r1: the driver's builtins to their shims, and pg-native to
+      // the stub (`support/driver-shims.ts`) — files under `src`, which the
+      // scan, the production-source rule and the bundle check all read.
+      build: `esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 ${driverAliasTokens().join(" ")} --outfile=dist/main.mjs`,
       start: "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
       "test:integration": "vitest run --config ../../test/integration/control-api/vitest.config.ts",
       "test:integration:postgres": "vitest run --config ../../test/integration/control-api/postgres/vitest.config.ts",

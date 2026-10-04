@@ -85,21 +85,22 @@
  * `escapeAuditText` (injective and reversible): a `U+202E` or an `ESC` in a
  * halt's detail reaches an operator as a visible `\u{HEX}`, never raw.
  *
- * ## The metric families are declared HERE (`CONTROL-2`)
+ * ## The metric families are the platform table's (`CONTROL-2` r1)
  *
- * {@link TRADER_HALT_METRIC_FAMILIES} — `control_trader_halts_state`,
- * `control_trader_halts_open` and `control_trader_halt_reads_total` — are this
- * process's own families. They belong in `@polymarket-bot/observability`'s
- * `PLATFORM_METRIC_FAMILIES` beside `control_trader_health_*`, and the alert
- * rule and dashboard panel that read them are pinned to that table by
- * `packages/observability`'s `trader-alerts.test.ts` and `dashboards.test.ts`.
- * `packages/**` was outside `CONTROL-2`'s grant, so the families are declared
- * here and rendered through the same generic renderer, and the rule and the
- * panel wait on that grant (`docs/handoffs/CONTROL-2.md`).
+ * `control_trader_halts_state`, `control_trader_halts_open` and
+ * `control_trader_halt_reads_total` are `PLATFORM_METRIC_FAMILIES` entries
+ * (`@polymarket-bot/observability`, category `halts`), so the PAGE rule
+ * `TraderHaltOpenOrUnknown` (`infra/prometheus/trader-alerts.yaml`) and the
+ * operations dashboard's "Open trader halts (ops.incidents)" panel are pinned
+ * to them by that package's `trader-alerts.test.ts` and `dashboards.test.ts`.
+ * {@link traderHaltSamples} is their only producer, and `trader-halts.test.ts`
+ * pins that it emits exactly those three families with the labels the table
+ * declares. (Round 0 declared them here, because `packages/**` was outside
+ * the grant; the orchestrator granted the move on 2026-10-04.)
  */
 
 import { z } from "zod";
-import type { PlatformMetricFamily, PlatformMetricSample } from "@polymarket-bot/observability";
+import type { PlatformMetricSample } from "@polymarket-bot/observability";
 
 import { escapeAuditText } from "./audit-text.js";
 import { buildDoor } from "./doors.js";
@@ -648,41 +649,11 @@ export function traderHaltsDocument(cache: TraderHaltCache): Readonly<Record<str
 
 // --- the metrics -------------------------------------------------------------
 
-/** This process's own halt families (module header, "The metric families are declared HERE"). */
-export const TRADER_HALT_METRIC_FAMILIES: readonly PlatformMetricFamily[] = Object.freeze([
-  Object.freeze({
-    name: "control_trader_halts_state",
-    type: "gauge" as const,
-    category: "halts" as const,
-    help:
-      "What this process knows of open trader halts in ops.incidents: 1 for the current state, 0 for the others. " +
-      "OPEN = the most recent read counted at least one open TRADER_HALT row; NONE_OPEN = it counted none; " +
-      "UNKNOWN = no read yet, or the read failed, timed out or was refused (never 'no halts'); NOT_CONFIGURED = " +
-      "this process reads no ops.incidents.",
-    labels: Object.freeze(["state"]),
-  }),
-  Object.freeze({
-    name: "control_trader_halts_open",
-    type: "gauge" as const,
-    category: "halts" as const,
-    help:
-      "Open (not RESOLVED) TRADER_HALT rows in ops.incidents by scope, from the most recent read. Present ONLY when " +
-      "that read succeeded: absent, never 0, while the state is UNKNOWN or NOT_CONFIGURED. UNRECOGNIZED counts every " +
-      "other key in the TRADER_HALT: namespace.",
-    labels: Object.freeze(["scope"]),
-  }),
-  Object.freeze({
-    name: "control_trader_halt_reads_total",
-    type: "counter" as const,
-    category: "halts" as const,
-    help:
-      "Reads of ops.incidents for open trader halts, by outcome: OK (passed the door), REFUSED (the door refused " +
-      "the result), UNAVAILABLE (the read failed or timed out).",
-    labels: Object.freeze(["outcome"]),
-  }),
-]);
-
-/** The samples of {@link TRADER_HALT_METRIC_FAMILIES} for the cache's current view. */
+/**
+ * The samples of the three trader-halt families (`PLATFORM_METRIC_FAMILIES`,
+ * category `halts`) for the cache's current view: the state always, one
+ * sample per state; the open counts only after a read that succeeded.
+ */
 export function traderHaltSamples(cache: TraderHaltCache): readonly PlatformMetricSample[] {
   const view = cache.view();
   const samples: PlatformMetricSample[] = TRADER_HALT_STATES.map((state) => ({

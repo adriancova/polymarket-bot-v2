@@ -323,6 +323,19 @@
       "targets": [
         { "refId": "A", "expr": "increase(trader_cadence_forward_jump_alarms_total[5m])", "legendFormat": "events behind the cadence clock" }
       ]
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "Open trader halts (ops.incidents)",
+      "description": "CONTROL-2 (H1R1-HALT-INVISIBLE). Open (not RESOLVED) TRADER_HALT rows in ops.incidents, read by the control API on every authorized scrape: a halt stays here after the trader has exited, until an operator resolves its row. The state is OPEN, NONE_OPEN, UNKNOWN (the read failed, timed out or was refused: NOT 'no halts') or NOT_CONFIGURED (this control API reads no ops.incidents: traderHalts.kind is none). The per-scope counts are present only after a read that succeeded. Pages on OPEN and on UNKNOWN: TraderHaltOpenOrUnknown (infra/prometheus/trader-alerts.yaml). Rows and reasons: GET /v1/health, traderHalts.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 67 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_trader_halts_state", "legendFormat": "{{state}}" },
+        { "refId": "B", "expr": "control_trader_halts_open", "legendFormat": "open {{scope}}" },
+        { "refId": "C", "expr": "increase(control_trader_halt_reads_total[5m])", "legendFormat": "reads {{outcome}}" }
+      ]
     }
   ]
 }

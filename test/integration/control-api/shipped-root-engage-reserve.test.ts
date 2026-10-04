@@ -106,6 +106,7 @@ async function withShippedProcess(
       auditCapacity,
       auditSafetyReserve,
       traderHealth: { kind: "none" },
+      traderHalts: { kind: "none" },
       operators: [
         { operatorId: "reader-b", token: READER, grants: ["READ"] },
         { operatorId: "strategist-c", token: STRATEGIST, grants: ["READ", "STRATEGY_CONTROL"] },

@@ -409,9 +409,31 @@ matched exactly).
   secure adapter or under a forbidden package's directory, judged on its path
   and its real path exactly as the run-time guard judges a landing. Every
   input must be this package's `src`, a workspace package it depends on, or a
-  third-party package on an exact, justified list (today `zod` and
-  `decimal.js`; a new one fails until it is judged there). Every import the
-  bundle leaves external must be a builtin that cannot load or run code.
+  third-party package on an exact, justified list (`zod`, `decimal.js` and,
+  since `CONTROL-2` r1, the PostgreSQL driver's fifteen: `kysely`, `pg`,
+  `pg-cloudflare`, `pg-connection-string`, `pg-int8`, `pg-pool`,
+  `pg-protocol`, `pg-types`, `pgpass`, `postgres-array`, `postgres-bytea`,
+  `postgres-date`, `postgres-interval`, `split2` and `xtend`; a new one fails
+  until it is judged there). Every import the bundle leaves external must be a
+  STATIC import of a builtin that cannot load or run code.
+- **The PostgreSQL driver (`CONTROL-2` r1).** The trader-halt read needs `pg`,
+  which is CommonJS and `require()`s Node builtins — and an ES-module bundle
+  can only leave such a require to a run-time loader (the first r1 build died
+  at load: "Dynamic require of "events" is not supported"). So `build` aliases
+  each builtin the driver requires (`crypto`, `dns`, `events`, `fs`, `net`,
+  `path`, `stream`, `string_decoder`, `tls` and `util`, with `util/types`
+  through `util`) to a one-line module under `src/driver-shims/` that
+  re-exports it, and every such require resolves at BUILD time: the bundle
+  holds no `require`, no `import()`, no `createRequire` and no dynamic-require
+  helper. `dns`, `string_decoder`, `tls` and `util/types` are not on the
+  builtin allowlist; each is admitted for its own shim only, and every shim is
+  pinned byte for byte. `pg-native`, pg's optional native binding, is aliased
+  to `src/driver-shims/pg-native.ts`, which throws when it is loaded: it never
+  ships, pg's JavaScript client never loads it, and under
+  `NODE_PG_FORCE_NATIVE=1` the bundle refuses to start. The driver's packages,
+  builtins and shims are listed, each justified, in
+  `test/integration/control-api/support/driver-shims.ts`; the forbidden
+  vocabulary is unchanged.
   Positive controls build the same invocation with an entry that imports the
   secure adapter, directly and through a symbolic link, and each forbidden
   input is named.
@@ -421,7 +443,8 @@ matched exactly).
   TypeScript's syntax tree): no `import()` or `require()` but of a string
   literal; no specifier but a relative path that stays in `src`, a permitted
   builtin (`node:vm`, `node:module`, `node:child_process`,
-  `node:worker_threads` and the rest are not) or a declared dependency; no
+  `node:worker_threads` and the rest are not), a declared dependency, or — in
+  a driver shim, and there only — that shim's own builtin; no
   `createRequire`, `eval`, `Function` in a value position, `getBuiltinModule`,
   `constructor`, `getPrototypeOf` or `__proto__`, or Node's loader internals by
   name; `globalThis`, `global`, `process` and `module` only as the object of a
@@ -439,8 +462,9 @@ matched exactly).
   specifier leaving its package) judge every literal specifier in every
   workspace package, and F14 (no module load a static check cannot read) holds
   only the purity-restricted packages — of the workspace packages this bundle
-  holds (`decimal`, `domain`, `observability`, `risk`), `packages/domain`
-  alone. A computed load in the other three is no `check:deps` finding. And
+  holds (`decimal`, `domain`, `observability`, `risk`, `storage-postgres`),
+  `packages/domain` alone. A computed load in the other four is no
+  `check:deps` finding. And
   the production-source rule is a rule over source text: a computed key on an
   ordinary value can still reach a function's constructor, and a member of a
   global object that is not itself one (`process.mainModule`) can still be
@@ -612,21 +636,74 @@ Since `PROVENANCE-1` every halt whose record lands leaves an open
 - **Read-only.** The PostgreSQL source (`src/adapters/postgres-trader-halts.ts`)
   runs its two `select`s in one `REPEATABLE READ, READ ONLY` transaction with
   its own `statement_timeout`; it writes nothing and resolves nothing.
-- **Metrics.** `control_trader_halts_state{state}` (always present),
-  `control_trader_halts_open{scope}` (only after a read that succeeded) and
-  `control_trader_halt_reads_total{outcome}`. They are declared in
-  `trader-halts.ts`, beside the platform table, because `packages/**` was
-  outside `CONTROL-2`'s grant.
+- **Metrics, page and panel.** `control_trader_halts_state{state}` (always
+  present), `control_trader_halts_open{scope}` (only after a read that
+  succeeded) and `control_trader_halt_reads_total{outcome}` are
+  `PLATFORM_METRIC_FAMILIES` entries (`packages/observability`, category
+  `halts`). `TraderHaltOpenOrUnknown` (`infra/prometheus/trader-alerts.yaml`)
+  PAGES at once while the state is `OPEN` or `UNKNOWN`; `NOT_CONFIGURED` does
+  not page, and the operations dashboard's "Open trader halts
+  (ops.incidents)" panel shows every state.
 
-**What does not ship yet (disclosed).** The shipped process composes an
-`AbsentTraderHaltSource`, so its state is `NOT_CONFIGURED`: its bundle holds no
-PostgreSQL client, and adding one changes acceptance 3's shipped-artifact check
-(its exact third-party list and its builtin-only externals). The Prometheus
-PAGE rule and the Grafana panel wait on a grant to `packages/observability`,
-whose suites pin both to the platform family table. The PostgreSQL source is
-proven end to end — the trader's own writer, the real API over HTTP, real
-PostgreSQL — by the opt-in suite
-`test/integration/control-api/postgres/trader-halts-postgres.test.ts`.
+### Configuring the read (`CONTROL-2` r1)
+
+`traderHalts` is a REQUIRED configuration field:
+
+- `{ "kind": "none" }` reads nothing. The state is `NOT_CONFIGURED`, which
+  `/v1/health`, `control_trader_halts_state` and the startup log say, and
+  which is never "no halts". The example configuration uses it, so that it
+  starts without a database.
+- `{ "kind": "postgres", "timeoutMs": 2000 }` reads `ops.incidents` on every
+  authorized health and metrics read, each read bounded by `timeoutMs` (1 to
+  60000): the server cancels a statement at the bound, and the read answers
+  `UNKNOWN` at it whatever the server does.
+
+The database URL is not a configuration field, because it carries a
+credential. It comes from ONE environment variable,
+`CONTROL_API_TRADER_HALTS_DATABASE_URL` (a `postgres://` or `postgresql://`
+URL), which `main.ts` reads once, at startup. Its value is never logged, never
+part of a refusal and never echoed in a health answer: a driver error that
+held the URL or its password would reach either with them replaced by
+`<redacted>`. It is the ONLY source of the connection: the PostgreSQL driver,
+like libpq, fills a component the URL omits from the `PG*` environment
+variables (`PGPASSWORD`, `PGHOST`, `PGSSLMODE`, …), the password file
+(`~/.pgpass`) or the process user, so the URL must name a user, a password, a
+host and a database, and a `PG*` variable in the environment is refused. The
+process refuses to start (exit 78), naming the variable and never its value,
+when `postgres` has no URL, when the URL is not a PostgreSQL URL or omits one
+of those four, when a `PG*` variable is set, and when the URL variable is set
+while `traderHalts.kind` is `none`.
+
+**The deployment's duty: a role that can read `ops.incidents` and nothing
+else.** Give the URL a role of its own, with `USAGE` on the schema `ops` and
+`SELECT` on the one table:
+
+```sql
+CREATE ROLE control_api_halt_reader LOGIN PASSWORD '…';
+GRANT USAGE ON SCHEMA ops TO control_api_halt_reader;
+GRANT SELECT ON ops.incidents TO control_api_halt_reader;
+```
+
+Nothing more is needed and nothing more should be granted: the read runs in a
+`READ ONLY` transaction, and this process never resolves a halt. A role
+without that privilege reads `UNKNOWN`, which pages, rather than "no halts".
+The reader's pool holds at most two connections, named
+`polymarket-bot-control-api` in `pg_stat_activity`; a connection that fails
+while idle is logged (redacted) and dropped, and the next read opens another.
+
+**Proven** against a real PostgreSQL by the opt-in suite
+(`pnpm --filter @polymarket-bot/control-api test:integration:postgres`, with
+Docker; CI does not run it yet):
+
+- `test/integration/control-api/postgres/trader-halts-postgres.test.ts` — the
+  trader's own writer, the real API over HTTP, and every state: open,
+  resolved and mitigating rows, an unknown scope, irregular rows, many rows, a
+  locked table, a role without the privilege, and read-only measured;
+- `test/integration/control-api/postgres/shipped-bundle-halts-postgres.test.ts`
+  — the SHIPPED bundle, built by `build` and run with `node`, configured for
+  `postgres` through a role holding only the privileges above, against a
+  database holding an open `TRADER_HALT` row: its `/v1/health` and
+  `/v1/metrics` say `OPEN`.
 
 ## The PostgreSQL sink: reached by an opt-in suite, bound by no composition (disclosed)
 
@@ -662,6 +739,10 @@ Every field is required. `bindHost` must be `127.0.0.1`, `::1` or `localhost`
 `auditSafetyReserve` (`CONTROL-1`) must be at least 1, and twice it must be
 below `auditCapacity` (see "The audit budget"). A configuration written before
 `CONTROL-1` lacks it and is refused at startup, naming the field.
+`traderHalts` (`CONTROL-2` r1) is `none` or `postgres` with a `timeoutMs`; a
+configuration written before it lacks the field and is refused the same way.
+The `postgres` source's database URL is the environment's, not the file's
+(see "Configuring the read").
 
 The example's token is a placeholder that says so in its own text. **Replace it
 before any real use**, and note that this repository's paper posture means there
@@ -677,7 +758,9 @@ CONTROL_API_CONFIG=apps/control-api/control-api.config.example.json \
 
 `start` typechecks, builds an app-local esbuild bundle (ADR-018), and runs it.
 `node dist/main.mjs --check` validates the environment and configuration and
-exits without binding anything.
+exits without binding anything. The example reads no trader halts
+(`traderHalts.kind` `none`); to read them, set `postgres` and export
+`CONTROL_API_TRADER_HALTS_DATABASE_URL` (see "Configuring the read").
 
 ## Safety defaults (`AGENTS.md`, ADR-010 §1)
 

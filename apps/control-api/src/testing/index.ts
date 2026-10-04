@@ -76,8 +76,9 @@ export interface HarnessOptions {
   readonly healthDocument?: unknown;
   /**
    * `CONTROL-2`: the trader halt source. Absent: an `AbsentTraderHaltSource`,
-   * as `main.ts` composes today — never read, state `NOT_CONFIGURED` — so a
-   * suite that does not ask for halts reads nothing it did not before.
+   * as `main.ts` composes for `traderHalts.kind` `none` — never read, state
+   * `NOT_CONFIGURED` — so a suite that does not ask for halts reads nothing it
+   * did not before.
    */
   readonly traderHaltSource?: TraderHaltSource;
 }
