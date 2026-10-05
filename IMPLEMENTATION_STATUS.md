@@ -54,6 +54,13 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-280` is Complete (2026-10-03, `065716f`); see [Work packages](#work-packages). `WP-290`'s dependencies (`WP-200`, `WP-270`, `WP-280`) are now met; it starts when a slot frees.
 - `WP-310` is Complete (2026-10-03, `fdf27ff`); see [Work packages](#work-packages). `WP-320` still needs `WP-290` and the heartbeat ADR (`V3-C12-HEARTBEAT-ADR`).
 - `ROLLOVER-1` is Complete (2026-10-05, `ae11daa`); see [Work packages](#work-packages). One run admits each reviewed window and spans many windows. Its owed governance records are in `ROLLOVER1-OWED`.
+- **`RTDS-RETIRE`**: Ready (authorized) 2026-10-05. Under the user's V3-C13 ruling, it retires the RTDS reference-price producer before the venue removes its topics (around 2026-10-23):
+  - the gateway refuses to enable it, with a dated reason;
+  - every reader of historical RTDS data stays;
+  - no alert pages on its absence;
+  - ADR-009 §6 gets a dated note.
+
+  Verifier: gpt-6-astra.
 - `WP-290` is Complete (2026-10-04, `7a53988`); see [Work packages](#work-packages). `WP-320`'s dependencies are now met (`WP-260`, `WP-290`, `WP-310`; ADR-033 Accepted for D1–D4 and D6).
 - **`WP-320`**: Ready (authorized) 2026-10-04 under the Wave 3 authorization; its dependencies are met. It covers the heartbeat health lease, fencing, geoblock and kill controls, per ADR-008 and ADR-033 (D1–D4, D6). PAPER only, with no transport written. Paths: the work plan's (`apps/trader/src/live-safety/**`, `packages/polymarket-secure/src/heartbeat/**`, `packages/storage-postgres/src/fencing/**`, `test/fault-injection/live-safety/**`), plus export lines, a fault script and a fencing-race integration test. Verifiers: Opus and gpt-6-astra, reconciled (gate: security review). **CI fix, 2026-10-05:** joint ACCEPT at round 5 (`fed6ec1`), but the PR merge ref failed CONTROL-1b's r4 guard (run `37314515160`). A live-safety PostgreSQL test loads control-api code under an unguarded runner. The orchestrator grants either moving that test into `test/integration/control-api/postgres/**` (preferred), or registering its runner in the guard's lists, with the runtime guard and a justification. Dual review follows.
 - `CI-5` is Complete (2026-10-05, `31b668d`); see [Work packages](#work-packages). CI now runs the OMS and reconciliation fault suites and the control-api PostgreSQL suite.
