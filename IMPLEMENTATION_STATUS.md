@@ -61,6 +61,8 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 
   **Relaunched 2026-10-04** with these grants and the Q3 facts from `VENUE-SETL-1`. Extra paths: `packages/domain/**` (only `SeriesWindowAdmitted@1`) and `packages/strategy-runtime/**` (only the sequence source). Verifiers: Opus and gpt-6-astra, reconciled.
 - `WP-290` is Complete (2026-10-04, `7a53988`); see [Work packages](#work-packages). `WP-320`'s dependencies are now met (`WP-260`, `WP-290`, `WP-310`; ADR-033 Accepted for D1–D4 and D6).
+- **`WP-320`**: Ready (authorized) 2026-10-04 under the Wave 3 authorization; its dependencies are met. It covers the heartbeat health lease, fencing, geoblock and kill controls, per ADR-008 and ADR-033 (D1–D4, D6). PAPER only, with no transport written. Paths: the work plan's (`apps/trader/src/live-safety/**`, `packages/polymarket-secure/src/heartbeat/**`, `packages/storage-postgres/src/fencing/**`, `test/fault-injection/live-safety/**`), plus export lines, a fault script and a fencing-race integration test. Verifiers: Opus and gpt-6-astra, reconciled (gate: security review).
+- **`CI-5`**: Ready (authorized) 2026-10-04. It wires `oms test:fault` and `ledger test:fault:reconciliation` into the root `test:fault` chain and CI, and the control-api `test:integration:postgres` into CI if reliable. Paths: the root `package.json` scripts, `.github/workflows/ci.yml` and `test/unit/tooling/**`. Verifier: gpt-6-astra.
 - `CKPT-1` is Complete (2026-10-03, `891ccdd`); see [Work packages](#work-packages). It closes `DURABLE-1` LOW-3; residual `CKPT1-PG-RNG-STATUS` is open.
 - `TC-LOWS-1` is Complete (2026-10-04, `9033743`); see [Work packages](#work-packages). It closes `CO2N1-LOWS`, and trims `CADENCE1-LOWS` and `PROV1-LOWS`.
 - `GOV-NOTES-1` is Complete (2026-10-04, `1f99fcc`); see [Work packages](#work-packages).
@@ -212,6 +214,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-310` | Rate-limit budgets and matching-engine modes (Wave 3, PAPER only) | Complete (2026-10-03) | `fdf27ff` | [WP-310](docs/handoffs/WP-310.md) |
 | `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Relaunched 2026-10-04 (grants Q1–Q4)** | — | — |
 | `WP-290` | Account reconciliation (Wave 3, PAPER only) | Complete (2026-10-04) | `7a53988` | [WP-290](docs/handoffs/WP-290.md) |
+| `WP-320` | Heartbeat health lease, fencing, geoblock and kill controls (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-04 | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
 | `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
