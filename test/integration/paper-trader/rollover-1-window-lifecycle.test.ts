@@ -29,6 +29,13 @@
  *    never holds more windows — each a runtime evaluated at its cadence — than
  *    the reviewed cap. r1 excluded HELD windows from the cap, and the
  *    verifiers' probe held three funded windows at a cap of 1.
+ * 9. **R3-ASTRA-02** (`ROLLOVER-1` r3) — a window whose `onMarketResolved` a
+ *    halt suppressed (market halt) or skipped (its instance halted) is torn
+ *    down `RESOLVED_UNHANDLED` and counted apart (`tornDownResolvedUnhandled`):
+ *    r2 recorded it `RESOLVED`, as if its strategy had handled the resolution.
+ * 10. **R3-ASTRA-01, the trader's half** (`ROLLOVER-1` r3) — the gateway
+ *    re-publishes a resolution whose publication an earlier epoch could not
+ *    record, so a repeat can arrive: it calls no strategy a second time.
  */
 
 import { RealizedPnlBook, observeRealizedPnl, type AdmissionNotice } from "@polymarket-bot/trader";
@@ -350,5 +357,96 @@ describe("ROLLOVER-1 r1 (R1-03, R1-FABLE-07): two refusals that are about one wi
     expect(run.trader.loop.health().halts).toEqual([]);
     expect(run.trader.markets.has(W1.marketId)).toBe(false);
     expect(run.trader.loop.admissionMetrics()?.refusals).toEqual({ CATALOG_CONFLICT: 1 });
+  });
+});
+
+describe("ROLLOVER-1 r3 (R3-ASTRA-02, R3-ASTRA-01): a resolution the trader could not handle, or receives twice", () => {
+  const series = { ...review(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+
+  /**
+   * W1 funded and HELD past its 300 s bound; then `halt` runs, and W1 resolves
+   * at 22:36 — alone, or (`framed`) as the first of a two-event venue frame
+   * (one `causationId`), so it is applied inside the frame (ADR-024).
+   */
+  async function heldThenResolved(halt: (run: ReturnType<typeof assembleOrThrow>) => void, framed = false) {
+    const stream = w1Entry(new SeriesStream(sampleReviewHash(series)))
+      .book(W1, "2026-10-04T22:16:10.000Z", DEAD_QUOTE)
+      .tick("2026-10-04T22:29:50.000Z")
+      .tick("2026-10-04T22:35:01.000Z");
+    const all: string[] = [];
+    const { run, fills } = await drive(configWith({ exit: HOLD_TO_RESOLUTION, series }), stream, { onNotice: (notice) => all.push(noticeLine(notice)) });
+    expect(fills).toEqual(["W1 BUY 50@0.34"]);
+    expect(run.trader.loop.admissionMetrics()?.heldUnresolved).toBe(1);
+    halt(run);
+    const count = stream.events.length;
+    stream.resolve(W1, "2026-10-04T22:36:00.000Z");
+    if (framed) stream.trade(W1, "2026-10-04T22:36:00.000Z", "0.9");
+    stream.tick("2026-10-04T22:36:01.000Z");
+    const added = stream.events.slice(count).map((event, index) =>
+      framed && index < 2 ? { ...event, envelope: { ...event.envelope, causationId: "raw:r3-pin-frame:1" } } : event,
+    );
+    for (const event of added) run.trader.loop.ingest(event);
+    await run.trader.loop.drain();
+    const resolutions = run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId && entry.record.callback === "onMarketResolved").length;
+    return { run, notices: all, resolutions };
+  }
+
+  it("R3-ASTRA-02: a MARKET halt suppresses W1's onMarketResolved — W1 is torn down RESOLVED_UNHANDLED, never recorded as handled", async () => {
+    const { run, notices, resolutions } = await heldThenResolved((held) => {
+      held.trader.halts.halt({ kind: "MARKET", marketId: W1.marketId }, "BOOK_DESYNCHRONIZED", "r3 pin: a latched market halt", "2026-10-04T22:35:01.000Z");
+    });
+    expect(resolutions).toBe(0);
+    expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `HELD_UNRESOLVED ${W1.marketId}`, `TORN_DOWN ${W1.marketId} RESOLVED_UNHANDLED`]);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 0, tornDownResolvedUnhandled: 1, tornDownUnresolved: 0, heldUnresolved: 0, live: 0 });
+  });
+
+  it("R3-ASTRA-02: the same MARKET halt, the resolution applied inside a two-event venue frame — RESOLVED_UNHANDLED", async () => {
+    const { run, notices, resolutions } = await heldThenResolved((held) => {
+      held.trader.halts.halt({ kind: "MARKET", marketId: W1.marketId }, "BOOK_DESYNCHRONIZED", "r3 pin: a latched market halt", "2026-10-04T22:35:01.000Z");
+    }, true);
+    expect(resolutions).toBe(0);
+    expect(notices.at(-1)).toBe(`TORN_DOWN ${W1.marketId} RESOLVED_UNHANDLED`);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 0, tornDownResolvedUnhandled: 1, live: 0 });
+  });
+
+  it("control: the framed resolution with no halt reaches W1's strategy, and W1 is torn down RESOLVED", async () => {
+    const { notices, resolutions } = await heldThenResolved(() => undefined, true);
+    expect(resolutions).toBe(1);
+    expect(notices.at(-1)).toBe(`TORN_DOWN ${W1.marketId} RESOLVED`);
+  });
+
+  it("R3-ASTRA-02: an INSTANCE halt skips W1's only instance — RESOLVED_UNHANDLED too", async () => {
+    const { run, notices, resolutions } = await heldThenResolved((held) => {
+      const instance = held.trader.registry.forMarket(W1.marketId)[0];
+      expect(instance).toBeDefined();
+      held.trader.halts.halt({ kind: "STRATEGY_INSTANCE", instanceId: instance?.instanceId ?? "" }, "BOOK_DESYNCHRONIZED", "r3 pin: a latched instance halt", "2026-10-04T22:35:01.000Z");
+    });
+    expect(resolutions).toBe(0);
+    expect(notices.at(-1)).toBe(`TORN_DOWN ${W1.marketId} RESOLVED_UNHANDLED`);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 0, tornDownResolvedUnhandled: 1, live: 0 });
+  });
+
+  it("control: with no halt, the same resolution reaches W1's strategy and W1 is torn down RESOLVED", async () => {
+    const { run, notices, resolutions } = await heldThenResolved(() => undefined);
+    expect(resolutions).toBe(1);
+    expect(notices.at(-1)).toBe(`TORN_DOWN ${W1.marketId} RESOLVED`);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 1, tornDownResolvedUnhandled: 0, live: 0 });
+  });
+
+  it("R3-ASTRA-01 (the trader's half): a repeated MarketResolved — the gateway's re-publication — calls no strategy a second time", async () => {
+    // W1 resolves while its take-profit rests (N3), so W1 is still live when the repeat arrives.
+    const stream = w1Entry()
+      .resolve(W1, "2026-10-04T22:20:00.000Z")
+      .tick("2026-10-04T22:20:01.000Z")
+      .resolve(W1, "2026-10-04T22:20:01.500Z", "NO_WIN")
+      .trade(W1, "2026-10-04T22:20:02.000Z", "0.5")
+      .tick("2026-10-04T22:20:04.000Z")
+      .tick("2026-10-04T22:20:05.000Z");
+    const { run, notices, fills } = await drive(configWith(), stream);
+    expect(fills).toEqual(["W1 BUY 50@0.34", "W1 SELL 50@0.5"]);
+    expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `TORN_DOWN ${W1.marketId} RESOLVED`]);
+    const resolutions = run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId && entry.record.callback === "onMarketResolved");
+    expect(resolutions).toHaveLength(1);
+    expect(run.trader.loop.health().halts).toEqual([]);
   });
 });

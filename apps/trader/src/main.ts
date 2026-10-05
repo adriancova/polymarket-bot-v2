@@ -922,12 +922,15 @@ export function admissionLine(notice: AdmissionNotice): string {
     case "REFUSED":
       return `[admission] REFUSED ${notice.code} window ${notice.marketId ?? "(unidentified)"}: ${notice.detail}`;
     case "TORN_DOWN":
-      return `[admission] TORN DOWN window ${notice.window.marketId} (${notice.reason}); its ledger rows stay`;
+      return notice.reason === "RESOLVED_UNHANDLED"
+        ? `[admission] TORN DOWN window ${notice.window.marketId} (${notice.reason}): it resolved, but its onMarketResolved was suppressed by a halt or skipped for an instance, so the resolution was NOT handled by its strategy; its ledger rows stay`
+        : `[admission] TORN DOWN window ${notice.window.marketId} (${notice.reason}); its ledger rows stay`;
     case "HELD_UNRESOLVED":
       return (
         `[admission] HELD window ${notice.window.marketId}: unresolved ${String(notice.window.unresolvedTeardownSeconds)} s ` +
         `after its close ${notice.window.closeAt} and it still holds inventory, so it is kept until its resolution is handled (ADR-030 Decision 4.4); ` +
-        `it keeps its cap slot meanwhile (Decision 1.8), so its series admits no window in its place`
+        `it keeps its cap slot meanwhile (Decision 1.8), so its series admits no window in its place. ` +
+        `If its resolution never reached the gateway, the gateway's operator retirement frees the gateway's slot, not this one: a new run does`
       );
   }
 }

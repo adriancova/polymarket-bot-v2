@@ -722,6 +722,12 @@ export class CoreLoop {
    * not applied in full, however the frame was published, batched or cut.
    */
   readonly #frameGate = new FrameCompletionGate(this.#liveness);
+  /**
+   * `ROLLOVER-1` r3 (R3-ASTRA-02): markets whose resolution's `onMarketResolved`
+   * did not reach every instance (suppressed by a halt, or skipped); read by
+   * `#tearDownWindows`, cleared when the window is torn down.
+   */
+  readonly #resolutionUnhandled = new Set<string>();
 
   // --- the per-order state (`TRDR-4`) ---------------------------------------
   //
@@ -1448,6 +1454,8 @@ export class CoreLoop {
       if (callback === undefined) continue;
       if (this.#options.halts.isMarketHalted(marketId)) {
         this.#cadence.dropOwed(marketId);
+        // `ROLLOVER-1` r3 (R3-ASTRA-02): a halt suppressed the resolution's callback.
+        if (callback.kind === "onMarketResolved") this.#resolutionUnhandled.add(marketId);
         continue;
       }
       // `CADENCE-1` (ADR-026, the ADR-024 D3 one-event row): every callback
@@ -1464,7 +1472,7 @@ export class CoreLoop {
         continue;
       }
       // --- steps 3-9 -------------------------------------------------------
-      await this.#evaluateMarket(market, dispatchPositionOf(envelope), callback, instant.instant, instant.epochMs);
+      await this.#evaluateInPlace(market, dispatchPositionOf(envelope), callback, instant.instant, instant.epochMs);
     }
     // `CADENCE-1` (ADR-026 D2.12): then the carried-over and heartbeat
     // evaluations, in configured order, sourced at this event (D3.2). This
@@ -1543,12 +1551,16 @@ export class CoreLoop {
       market.observeInstant(instant, epochMs);
       const callback = this.#applyEvent(market, envelope, event, instant, epochMs);
       if (callback === undefined) continue;
-      if (this.#options.halts.isMarketHalted(marketId)) continue;
+      if (this.#options.halts.isMarketHalted(marketId)) {
+        // `ROLLOVER-1` r3 (R3-ASTRA-02): a halt suppressed the resolution's callback.
+        if (callback.kind === "onMarketResolved") this.#resolutionUnhandled.add(marketId);
+        continue;
+      }
       if (callback.kind === "onFeatures") {
         oweEvaluation(frame, marketId, market, at);
         continue;
       }
-      await this.#evaluateMarket(market, dispatchPositionOf(envelope), callback, instant, epochMs);
+      await this.#evaluateInPlace(market, dispatchPositionOf(envelope), callback, instant, epochMs);
     }
     frame.harvestAt = instant;
   }
@@ -1899,8 +1911,15 @@ export class CoreLoop {
    * no cancel names its market. A due window that is not idle waits (counted,
    * `teardownsBlocked`). A window is due when:
    *
-   * - its resolution was handled — the market is RESOLVED, and its
-   *   `onMarketResolved` ran in the frame that resolved it; or
+   * - its market is RESOLVED. Torn down `RESOLVED` when its `onMarketResolved`
+   *   reached every instance of the window in the frame that resolved it;
+   *   otherwise `RESOLVED_UNHANDLED` (`ROLLOVER-1` r3, R3-ASTRA-02): a market
+   *   or global halt suppressed the callback, or an instance was halted, had
+   *   no computable snapshot, or refused. A halt is a run-long latch and a
+   *   skipped callback is never redelivered, so keeping the window would only
+   *   hold its cap slot for the rest of the run; the distinct reason and
+   *   counter (`tornDownResolvedUnhandled`) say the resolution was NOT
+   *   handled, where r2 recorded it as handled; or
    * - it is still unresolved `unresolvedTeardownSeconds` (reviewed) after its
    *   scheduled close, on event time, AND it holds no inventory
    *   (`#windowHoldsInventory`): the run has nothing for its resolution to
@@ -1913,7 +1932,12 @@ export class CoreLoop {
    * strategy and the window is then torn down RESOLVED; it is reported once
    * (`HELD_UNRESOLVED`) and counted (`heldUnresolved`). The gateway keeps the
    * window subscribed for that resolution, and never abandons it
-   * (`apps/data-gateway` `feeds/series-admission.ts`). `ROLLOVER-1` r2
+   * (`apps/data-gateway` `feeds/series-admission.ts`); since `ROLLOVER-1` r3
+   * (R3-ASTRA-01) it also re-publishes a resolution a publication halt
+   * swallowed, so a repeat is ignored here (`#applyEvent`). A resolution the
+   * gateway never observed is not delivered: the gateway operator's named
+   * retirement frees the GATEWAY's slot only, and this window stays HELD until
+   * a new run (R3-FABLE-01). `ROLLOVER-1` r2
    * (R2-ASTRA-01): a HELD window is still a live window, evaluated at the
    * run's cadence like any other, so it keeps its cap slot on both sides
    * (`series-admission.ts`, check 8): the run's windows, HELD or not, never
@@ -1936,9 +1960,10 @@ export class CoreLoop {
         if (admission.noteHeldUnresolved(window.marketId)) this.#notifyAdmission({ kind: "HELD_UNRESOLVED", window });
         continue;
       }
-      const reason = resolved ? "RESOLVED" : "UNRESOLVED_AFTER_CLOSE";
+      const reason = !resolved ? "UNRESOLVED_AFTER_CLOSE" : this.#resolutionUnhandled.has(window.marketId) ? "RESOLVED_UNHANDLED" : "RESOLVED";
       const torn = admission.detach(window.marketId, reason);
       this.#cadence.forget(window.marketId);
+      this.#resolutionUnhandled.delete(window.marketId);
       if (torn !== undefined) this.#notifyAdmission({ kind: "TORN_DOWN", window: torn, reason });
     }
   }
@@ -2123,6 +2148,11 @@ export class CoreLoop {
       case "MarketResolved": {
         const outcome = readString(envelope.payload, "outcome");
         if (outcome === undefined) return undefined;
+        // `ROLLOVER-1` r3 (R3-ASTRA-01): a market resolves ONCE. The gateway
+        // re-publishes a resolution whose publication an earlier epoch could
+        // not record, so a repeat can arrive; it changes nothing and calls no
+        // strategy a second time. The first resolution stands.
+        if (market.lifecycle === "RESOLVED") return undefined;
         market.markResolved(outcome, instant);
         return { kind: "onMarketResolved", outcome, resolvedAt: instant };
       }
@@ -2219,6 +2249,29 @@ export class CoreLoop {
   }
 
   /**
+   * A non-`onFeatures` callback, evaluated in place (§8.1 steps 3-9).
+   * `ROLLOVER-1` r3 (R3-ASTRA-02): an `onMarketResolved` that did not reach
+   * EVERY instance of the market — an instance halted, no computable snapshot,
+   * a refusal — leaves the resolution UNHANDLED, which the window's teardown
+   * records as such (`#tearDownWindows`, `RESOLVED_UNHANDLED`).
+   */
+  async #evaluateInPlace(
+    market: MarketState,
+    source: DispatchPosition,
+    callback: TriggeredCallback,
+    instant: string,
+    epochMs: number,
+  ): Promise<void> {
+    if (callback.kind !== "onMarketResolved") {
+      await this.#evaluateMarket(market, source, callback, instant, epochMs);
+      return;
+    }
+    const tally = { notInvoked: 0 };
+    await this.#evaluateMarket(market, source, callback, instant, epochMs, tally);
+    if (tally.notInvoked > 0) this.#resolutionUnhandled.add(market.config.marketId);
+  }
+
+  /**
    * §8.1 steps 3-9 for one market's instances, in §8.2 order.
    *
    * `PROVENANCE-1`: `source` is the triggering event's dispatch position —
@@ -2242,16 +2295,19 @@ export class CoreLoop {
     callback: TriggeredCallback,
     instant: string,
     epochMs: number,
+    tally?: { notInvoked: number },
   ): Promise<MarketEvaluation> {
     let evaluated: MarketEvaluation = "NOT_ELIGIBLE";
     for (const instance of this.#options.registry.forMarket(market.config.marketId)) {
       if (this.#options.halts.isInstanceHalted(instance.instanceId, market.config.marketId)) {
+        if (tally !== undefined) tally.notInvoked += 1;
         continue;
       }
       // --- step 3: update feature snapshots -------------------------------
       const snapshot = this.#computeSnapshot(market, instance, instant, epochMs);
       if (snapshot === undefined) {
         if (evaluated === "NOT_ELIGIBLE") evaluated = "NO_SNAPSHOT";
+        if (tally !== undefined) tally.notInvoked += 1;
         continue;
       }
 
@@ -2274,6 +2330,8 @@ export class CoreLoop {
       } else if (evaluated === "NOT_ELIGIBLE") {
         evaluated = "NOT_INVOKED";
       }
+      // A refusal of any persistence invoked no callback (r3, R3-ASTRA-02).
+      if (tally !== undefined && outcome.kind === "REFUSED") tally.notInvoked += 1;
       await this.#consumeOutcome(instance, market, outcome, source, instant, epochMs);
     }
     return evaluated;

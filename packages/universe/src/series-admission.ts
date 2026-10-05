@@ -209,7 +209,10 @@ export const ReviewedSeriesSchema = z.strictObject({
    * resolution, in its cap slot, and names it in a NOTIFY incident; a trader
    * tears it down only if it holds no inventory and no work (`ROLLOVER-1` r1
    * deviation 2, for ratification); one that holds inventory stays, in its
-   * cap slot, until its resolution is handled (`ROLLOVER-1` r2).
+   * cap slot, until its resolution is handled (`ROLLOVER-1` r2). It is also
+   * the earliest instant at which the gateway applies an operator's named
+   * retirement of a window whose resolution it never observed (`ROLLOVER-1`
+   * r3, R3-FABLE-01; `apps/data-gateway` `seriesAdmission.operatorRetirements`).
    */
   unresolvedTeardownSeconds: z.number().int().min(300).max(7 * 86_400),
 });

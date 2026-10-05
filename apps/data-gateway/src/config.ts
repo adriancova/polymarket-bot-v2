@@ -34,7 +34,7 @@
  * performs and which it does not.
  */
 
-import { IsoTimestampSchema } from "@polymarket-bot/domain";
+import { InternalMarketIdSchema, IsoTimestampSchema } from "@polymarket-bot/domain";
 import { DEFAULT_FSYNC_INTERVAL_MS } from "@polymarket-bot/storage-wal";
 import { parseReviewedSeries, type ReviewedSeries } from "@polymarket-bot/universe";
 import { z } from "zod";
@@ -365,6 +365,34 @@ export const SeriesAdmissionFeedConfigSchema = z.strictObject({
   admissionLeadSeconds: z.number().int().min(0).max(86_400),
   /** The reviewed series, each parsed by the universe door (non-empty, distinct). */
   series: z.array(z.unknown()).min(1).max(8),
+  /**
+   * `ROLLOVER-1` r3 (R3-FABLE-01): the OPERATOR'S RETIREMENTS — the reviewed
+   * recovery for a live window whose `market_resolved` never reached this
+   * gateway (it was down, asleep or disconnected at the resolution instant;
+   * the market channel is not documented to replay it), which would otherwise
+   * hold its cap slot for good. Each entry NAMES one window by its internal
+   * market id and says why. The admission feed applies an entry only to a live
+   * window past its `unresolvedTeardownSeconds` bound with no resolution owed
+   * (one observed and not yet published is re-published instead), records the
+   * retirement `OPERATOR` with the reason, and announces it with a NOTIFY
+   * incident naming the window (`feeds/series-admission.ts`). An entry that
+   * names no window the ledger holds is reported, never guessed at. Read at
+   * start: a change is a restart, as for every reviewed setting. Optional, and
+   * NOT part of any series' review, so it never changes a `seriesConfigHash`.
+   */
+  operatorRetirements: z
+    .array(
+      z.strictObject({
+        internalMarketId: InternalMarketIdSchema,
+        reason: z
+          .string()
+          .min(1)
+          .max(500)
+          .refine((text) => text.trim().length > 0, { message: "an operator retirement must say why" }),
+      }),
+    )
+    .max(32)
+    .optional(),
 });
 
 export const PublisherConfigSchema = z.strictObject({
@@ -752,6 +780,10 @@ function checkSeriesAdmission(
   const gammaIds = parsed.map((series) => series.venue.gammaSeriesId);
   if (new Set(ids).size !== ids.length || new Set(gammaIds).size !== gammaIds.length) {
     throw new GatewayConfigurationError("seriesAdmission.series must name each series, and each Gamma series id, once", { ids, gammaIds });
+  }
+  const retirements = (block.operatorRetirements ?? []).map((entry) => entry.internalMarketId);
+  if (new Set(retirements).size !== retirements.length) {
+    throw new GatewayConfigurationError("seriesAdmission.operatorRetirements must name each window once", { internalMarketIds: retirements });
   }
   if (block.pollIntervalMs < MIN_SERIES_ADMISSION_POLL_INTERVAL_MS) {
     throw new GatewayConfigurationError(

@@ -79,6 +79,7 @@ import type { EnvelopeDraft } from "../envelope.js";
 import type { GatewayJournal } from "../journal.js";
 import type { CancelScheduled, GatewayClock, GatewayTimers } from "../ports.js";
 import { isoFromMs, takeReceipt } from "../ports.js";
+import type { PublishOutcome } from "../publisher.js";
 
 /** Problem codes that are transport observations, not data incidents. */
 const TRANSPORT_OBSERVATION_CODES: ReadonlySet<string> = new Set([
@@ -114,14 +115,34 @@ export interface PolymarketFeedDriverOptions {
   /** Delay before re-attempting a failed snapshot fetch. */
   readonly snapshotRetryDelayMs?: number;
   /**
-   * `ROLLOVER-1`: told the internal market id of every `MarketResolved` this
-   * driver dispatches, so the series-admission feed can tear a resolved
-   * window down (ADR-030 Decision 4.4). It only RECORDS the fact: the
+   * `ROLLOVER-1`: told of every `MarketResolved` this driver dispatches, WITH
+   * its publication's outcome, so the series-admission feed can keep a
+   * resolved window's resolution as an obligation until it is PUBLISHED, and
+   * only then tear the window down (ADR-030 Decision 4.4; `ROLLOVER-1` r3,
+   * R3-ASTRA-01: r2 was told at dispatch, so a resolution a publication halt
+   * swallowed still retired its window). It only RECORDS the facts: the
    * teardown runs on the admission feed's own cycle, never inside a socket
    * callback.
    */
-  readonly onMarketResolved?: (internalMarketId: string) => void;
+  readonly onMarketResolved?: (resolution: DispatchedResolution) => void;
 }
+
+/** `ROLLOVER-1` r3 (R3-ASTRA-01): one `MarketResolved` this driver dispatched. */
+export interface DispatchedResolution {
+  /** The normalized `MarketResolved` payload, exactly as dispatched. */
+  readonly payload: unknown;
+  /** The venue's timestamp on the frame, when it carried one. */
+  readonly venueTimestamp: string | undefined;
+  /** The gateway's receipt instant of the event. */
+  readonly receivedAt: string;
+  /** The WAL ingest sequence of the recorded raw frame it derives from. */
+  readonly rawFrameIngestSeq: string | undefined;
+  /** The publisher's verdict: published, or not (a halt, a refusal). Never rejects. */
+  readonly published: Promise<PublishOutcome>;
+}
+
+/** A buffered frame's resolution, waiting for its publication promise. */
+type PendingResolution = Omit<DispatchedResolution, "published">;
 
 export interface PolymarketFeedDriverMetrics {
   readonly framesRecorded: number;
@@ -154,6 +175,8 @@ export class PolymarketFeedDriver {
    * dispatched; `undefined` outside a message (r6, R6-H1; module header).
    */
   #frame: FrameDispatchEntry[] | undefined;
+  /** `ROLLOVER-1` r3: the buffered frame's `MarketResolved` entries, by their index in it. */
+  #frameResolutions = new Map<number, PendingResolution>();
   /** How many socket callbacks are open (more than one only if a socket re-enters). */
   #frameDepth = 0;
 
@@ -230,9 +253,15 @@ export class PolymarketFeedDriver {
   #flushFrame(): void {
     const frame = this.#frame;
     if (frame === undefined || frame.length === 0) return;
+    const resolutions = this.#frameResolutions;
     this.#frame = [];
+    this.#frameResolutions = new Map();
     this.#eventsDispatched += frame.length;
-    void this.#options.dispatcher.dispatchFrame(frame);
+    const outcomes = this.#options.dispatcher.dispatchFrame(frame);
+    // `ROLLOVER-1` r3 (R3-ASTRA-01): each resolution with ITS entry's outcome.
+    for (const [index, resolution] of resolutions) {
+      this.#noteResolved(resolution, outcomes[index]);
+    }
   }
 
   /** The feed's `onRawFrame` handler: WAL first, always. */
@@ -290,16 +319,26 @@ export class PolymarketFeedDriver {
       receipt,
       ...(raw !== undefined && raw.recorded ? { rawFrameIngestSeq: raw.ingestSeq } : {}),
     };
-    if (event.eventType === "MarketResolved") this.#noteResolved(event.payload);
+    const resolution: PendingResolution | undefined =
+      event.eventType === "MarketResolved"
+        ? {
+            payload: event.payload,
+            venueTimestamp: event.provenance.venueTimestamp,
+            receivedAt: receipt.receivedAt,
+            rawFrameIngestSeq: context.rawFrameIngestSeq,
+          }
+        : undefined;
     if (isMarketData && this.#frame !== undefined) {
       // One of the socket message's own events: dispatched with its frame.
+      if (resolution !== undefined) this.#frameResolutions.set(this.#frame.length, resolution);
       this.#frame.push({ draft, context });
       return;
     }
     // Anything else keeps its place in the stream behind what was buffered.
     this.#flushFrame();
-    void this.#options.dispatcher.dispatch(draft, context);
+    const outcome = this.#options.dispatcher.dispatch(draft, context);
     this.#eventsDispatched += 1;
+    if (resolution !== undefined) this.#noteResolved(resolution, outcome);
 
     if (event.eventType === "FeedStale") {
       // A silent socket stall: the connection is open and the venue's PONG
@@ -328,12 +367,18 @@ export class PolymarketFeedDriver {
     }
   }
 
-  /** `ROLLOVER-1`: hands a dispatched resolution's market id to the admission feed. */
-  #noteResolved(payload: unknown): void {
+  /**
+   * `ROLLOVER-1`: hands a DISPATCHED resolution, with its publication's
+   * outcome, to the admission feed (r3, R3-ASTRA-01: never before dispatch).
+   */
+  #noteResolved(resolution: PendingResolution, published: Promise<PublishOutcome> | undefined): void {
     if (this.#options.onMarketResolved === undefined) return;
-    if (typeof payload !== "object" || payload === null || !Object.hasOwn(payload, "internalMarketId")) return;
-    const id = (payload as Record<string, unknown>)["internalMarketId"];
-    if (typeof id === "string") this.#options.onMarketResolved(id);
+    this.#options.onMarketResolved({
+      ...resolution,
+      published:
+        published ??
+        Promise.resolve({ published: false, reason: "transport-rejected", detail: "the dispatcher answered no outcome for the resolution" }),
+    });
   }
 
   /** The feed's `onProblem` handler. */

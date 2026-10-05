@@ -68,6 +68,19 @@ describe("the seriesAdmission configuration door", () => {
     expect(() => parseGatewayConfig(config({ lifecycle: { baseUrl: "http://gamma.stub", pollIntervalMs: 1_000 } }))).toThrow(/2 markets/u);
   });
 
+  it("R3-FABLE-01: accepts operatorRetirements naming each window once, with a reason that says something; refuses anything else", () => {
+    const entry = { internalMarketId: "0199b1a2-1c20-7000-8000-000000000001", reason: "gateway down 22:20-23:20; resolution missed" };
+    expect(parseGatewayConfig(config({}, { operatorRetirements: [entry] })).seriesAdmission?.operatorRetirements).toEqual([entry]);
+    expect(parseGatewayConfig(config()).seriesAdmission?.operatorRetirements).toBeUndefined();
+    expect(() => parseGatewayConfig(config({}, { operatorRetirements: [entry, { ...entry, reason: "again" }] }))).toThrow(/each window once/u);
+    for (const bad of [{ ...entry, reason: "" }, { ...entry, reason: "   " }, { internalMarketId: entry.internalMarketId }, { ...entry, internalMarketId: "0xaa" }, { ...entry, approved: true }]) {
+      expect(() => parseGatewayConfig(config({}, { operatorRetirements: [bad] }))).toThrow(GatewayConfigurationError);
+    }
+    // Not part of any series' review: the series' hash is unchanged by it.
+    const plain = reviewedSeriesOf(parseGatewayConfig(config()))[0]?.configHash;
+    expect(reviewedSeriesOf(parseGatewayConfig(config({}, { operatorRetirements: [entry] })))[0]?.configHash).toBe(plain);
+  });
+
   it("requires admissionLeadSeconds: how early a run takes on a window is the operator's choice", () => {
     const document = config() as Record<string, Record<string, unknown>>;
     delete document["seriesAdmission"]?.["admissionLeadSeconds"];
@@ -112,6 +125,17 @@ function admitted(key: string, overrides: Partial<AdmissionLedgerRecord> = {}): 
   };
 }
 
+/** `ROLLOVER-1` r3: the resolution the market channel delivered for {@link admitted}'s window. */
+function resolutionOf(key: string, publishedAt?: string): NonNullable<AdmissionLedgerRecord["resolution"]> {
+  return {
+    payload: { internalMarketId: "0199b1a2-1c20-7000-8000-000000000001", conditionId: key, outcome: "YES_WIN", resolvedAt: "2026-10-04T22:31:00.000Z" },
+    venueTimestamp: "2026-10-04T22:31:00.000Z",
+    observedAt: "2026-10-04T22:31:00.100Z",
+    rawFrame: { gatewayEpoch: "0199b1a2-1c20-7000-8000-0000000000e1", ingestSeq: "42" },
+    ...(publishedAt === undefined ? {} : { publishedAt }),
+  };
+}
+
 describe("AdmissionLedger — durable, strict, bounded", () => {
   it("round-trips records through the file and reopens them", async () => {
     const fileSystem = createMemoryFileSystem();
@@ -143,7 +167,7 @@ describe("AdmissionLedger — durable, strict, bounded", () => {
     const fileSystem = createMemoryFileSystem();
     const ledger = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
     await ledger.put(admitted("0xlive"));
-    await ledger.put(admitted("0xold", { status: "RETIRED", retiredAt: "2026-10-04T22:31:00.000Z", retiredReason: "RESOLVED" }));
+    await ledger.put(admitted("0xold", { status: "RETIRED", retiredAt: "2026-10-04T22:31:00.000Z", retiredReason: "RESOLVED", resolution: resolutionOf("0xold", "2026-10-04T22:31:05.000Z") }));
     await ledger.put({ key: "0xref", seriesId: "s", seriesConfigHash: "a".repeat(64), status: "REFUSED", judgedAt: "2026-10-04T22:20:00.000Z", closeAt: "2026-10-04T22:30:00.000Z", mismatches: ["m"] });
     await ledger.put({ key: "0xnoclose", seriesId: "s", seriesConfigHash: "a".repeat(64), status: "REFUSED", judgedAt: "2026-10-04T22:20:00.000Z", mismatches: ["m"] });
     const closeMs = Date.UTC(2026, 9, 4, 22, 30);
@@ -162,6 +186,50 @@ describe("AdmissionLedger — durable, strict, bounded", () => {
     expect(ledger.records()).toEqual([]);
     await fileSystem.writeWholeFile(`/wal/${ADMISSION_LEDGER_FILE_NAME}`, Buffer.from(JSON.stringify({ schemaVersion: 1, windows: { "0xaa": abandoned } }), "utf8"));
     await expect(AdmissionLedger.open({ fileSystem, walRootPath: "/wal" })).rejects.toBeInstanceOf(GatewayStateError);
+  });
+
+  it("R3-ASTRA-01: a RESOLVED retirement carries its PUBLISHED resolution — refused with none, or with one still owed, on write and at open", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const ledger = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    const retired = { status: "RETIRED", retiredAt: "2026-10-04T22:32:00.000Z", retiredReason: "RESOLVED" } as const;
+    // The r2 shape — retired on dispatch, with nothing to say the resolution was published.
+    await expect(ledger.put(admitted("0xaa", retired))).rejects.toThrow(/no published resolution/u);
+    await expect(ledger.put(admitted("0xaa", { ...retired, resolution: resolutionOf("0xaa") }))).rejects.toThrow(/no published resolution/u);
+    expect(ledger.records()).toEqual([]);
+    await ledger.put(admitted("0xaa", { ...retired, resolution: resolutionOf("0xaa", "2026-10-04T22:31:05.000Z") }));
+    const reopened = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    expect(reopened.get("0xaa")?.resolution?.publishedAt).toBe("2026-10-04T22:31:05.000Z");
+    await fileSystem.writeWholeFile(`/wal/${ADMISSION_LEDGER_FILE_NAME}`, Buffer.from(JSON.stringify({ schemaVersion: 1, windows: { "0xaa": admitted("0xaa", retired) } }), "utf8"));
+    await expect(AdmissionLedger.open({ fileSystem, walRootPath: "/wal" })).rejects.toBeInstanceOf(GatewayStateError);
+  });
+
+  it("R3-ASTRA-01: a live record keeps its window's OWED resolution across a reopen; another window's resolution, or one on a refusal, is refused", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const ledger = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    await ledger.put(admitted("0xaa", { admissionConfirmedAt: "2026-10-04T22:20:01.000Z", resolution: resolutionOf("0xaa") }));
+    const reopened = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    expect(reopened.liveWindows().map((record) => record.key)).toEqual(["0xaa"]);
+    expect(reopened.get("0xaa")?.resolution).toEqual(resolutionOf("0xaa"));
+    const foreign = resolutionOf("0xaa");
+    await expect(ledger.put(admitted("0xaa", { resolution: { ...foreign, payload: { ...foreign.payload, internalMarketId: "0199b1a2-1c20-7000-8000-000000000002" } } }))).rejects.toThrow(/not its window's/u);
+    await expect(ledger.put(admitted("0xaa", { resolution: { ...foreign, payload: { ...foreign.payload, outcome: "DISPUTED" as "YES_WIN" } } }))).rejects.toBeInstanceOf(GatewayStateError);
+    await expect(
+      ledger.put({ key: "event:9", seriesId: "s", seriesConfigHash: "a".repeat(64), status: "REFUSED", judgedAt: "2026-10-04T22:20:00.000Z", mismatches: ["m"], resolution: resolutionOf("0xaa") }),
+    ).rejects.toThrow(/REFUSED record carries a resolution/u);
+  });
+
+  it("R3-FABLE-01: an OPERATOR retirement carries the operator's reason and no resolution; a reason on anything else is refused", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const ledger = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    const operator = { status: "RETIRED", retiredAt: "2026-10-04T23:20:00.000Z", retiredReason: "OPERATOR" } as const;
+    await expect(ledger.put(admitted("0xaa", operator))).rejects.toThrow(/operatorReason is present exactly/u);
+    await expect(ledger.put(admitted("0xaa", { ...operator, operatorReason: "gateway down 22:20-23:20; resolution missed", resolution: resolutionOf("0xaa", "2026-10-04T22:31:05.000Z") }))).rejects.toThrow(/carries a resolution/u);
+    await expect(ledger.put(admitted("0xaa", { operatorReason: "not retired" }))).rejects.toThrow(/operatorReason is present exactly/u);
+    await expect(ledger.put(admitted("0xaa", { ...operator, operatorReason: "x".repeat(501) }))).rejects.toBeInstanceOf(GatewayStateError);
+    await ledger.put(admitted("0xaa", { ...operator, operatorReason: "gateway down 22:20-23:20; resolution missed" }));
+    const reopened = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    expect(reopened.get("0xaa")).toMatchObject({ status: "RETIRED", retiredReason: "OPERATOR", operatorReason: "gateway down 22:20-23:20; resolution missed" });
+    expect(reopened.liveWindows()).toEqual([]);
   });
 
   it("bounds a refusal's mismatch list", () => {

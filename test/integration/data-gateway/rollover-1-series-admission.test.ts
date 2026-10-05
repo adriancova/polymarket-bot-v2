@@ -36,6 +36,20 @@
  * 7. **`ROLLOVER-1` r2 (R2-FABLE-02)** — two r1 behaviours that no test held:
  *    a window's CLOB-failure incident is closed by its next successful read,
  *    and the replay re-emits an unconfirmed intent even past its bound.
+ * 8. **`ROLLOVER-1` r3 (R3-ASTRA-01)** — a window is retired only once its
+ *    resolution is PUBLISHED: a resolution a publication halt swallowed keeps
+ *    the window ADMITTED, subscribed, registered and in its cap slot, with the
+ *    resolution kept in the ledger; the next epoch re-publishes it unchanged
+ *    (again and again while publication halts), and only then is the window
+ *    retired `RESOLVED`, carrying the published resolution.
+ * 9. **`ROLLOVER-1` r3 (R3-FABLE-01)** — the operator's named retirement: after
+ *    a stop spanning both live windows' resolutions, `operatorRetirements`
+ *    entries retire each window once it is past its bound (`OPERATOR`, with
+ *    the reason, announced by an incident naming it), and the series resumes;
+ *    an entry never overrides an owed resolution, and one naming no window is
+ *    reported.
+ * 10. **`ROLLOVER-1` r3 (R3-FABLE-02)** — the cap counts unconfirmed intents:
+ *    with publication halted, a later due window is held, and gets no intent.
  */
 
 import { readFileSync } from "node:fs";
@@ -167,13 +181,15 @@ function ledger(fileSystem: MemoryFileSystem): Record<string, Record<string, unk
   return (JSON.parse(text) as { windows: Record<string, Record<string, unknown>> }).windows;
 }
 
-function subscribedTokens(harness: Harness): readonly string[] {
+/** The JSON frames sent on the market sockets (the heartbeat's `PING` text is not one). */
+function sentFrames(harness: Harness): readonly { assets_ids?: string[]; operation?: string }[] {
   return harness.polymarketSockets.sockets.flatMap((socket) =>
-    socket.sent.flatMap((frame) => {
-      const parsed = JSON.parse(frame) as { assets_ids?: string[]; operation?: string };
-      return parsed.operation === "unsubscribe" ? [] : (parsed.assets_ids ?? []);
-    }),
+    socket.sent.filter((frame) => frame !== "PING").map((frame) => JSON.parse(frame) as { assets_ids?: string[]; operation?: string }),
   );
+}
+
+function subscribedTokens(harness: Harness): readonly string[] {
+  return sentFrames(harness).flatMap((parsed) => (parsed.operation === "unsubscribe" ? [] : (parsed.assets_ids ?? [])));
 }
 
 function payloadOf(envelope: EventEnvelope<unknown> | undefined): Record<string, unknown> {
@@ -515,12 +531,7 @@ function clobBodyFor(index: number): Record<string, unknown> {
 }
 
 function unsubscribedTokens(harness: Harness): readonly string[] {
-  return harness.polymarketSockets.sockets.flatMap((socket) =>
-    socket.sent.flatMap((frame) => {
-      const parsed = JSON.parse(frame) as { assets_ids?: string[]; operation?: string };
-      return parsed.operation === "unsubscribe" ? (parsed.assets_ids ?? []) : [];
-    }),
-  );
+  return sentFrames(harness).flatMap((parsed) => (parsed.operation === "unsubscribe" ? (parsed.assets_ids ?? []) : []));
 }
 
 function incidentsNamed(harness: Harness, reasonCode: string): readonly (readonly string[])[] {
@@ -815,5 +826,217 @@ describe("ROLLOVER-1 r1 (R1-FABLE-04): at most maximumConcurrentWindows CLOB rea
     expect(clobReads()).toBe(2);
     expect(ledger(harness.walFileSystem)[WINDOW_2230.conditionId]?.["status"]).toBe("REFUSED");
     await harness.gateway.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ROLLOVER-1 r3: the remediation pins (R3-ASTRA-01, R3-FABLE-01, R3-FABLE-02).
+// ---------------------------------------------------------------------------
+
+function unpublishedResolutions(harness: Harness): number {
+  return harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_SERIES_RESOLUTION_UNPUBLISHED").length;
+}
+
+/** Observer incidents (published or not — a halted publisher publishes none) naming `reasonCode`. */
+function observedIncidents(harness: Harness, reasonCode: string): number {
+  return harness.incidents.filter((incident) => incident.reasonCode === reasonCode).length;
+}
+
+describe("ROLLOVER-1 r3 (R3-ASTRA-01): a window is retired only once its resolution is PUBLISHED", () => {
+  const series = { ...reviewedBtc15mSeriesDocument(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+  /** 22:32: the 22:15 window closed at 22:30; its market_resolved arrives now. */
+  const RESOLVED_AT_MS = Date.UTC(2026, 9, 4, 22, 32);
+
+  /** Epoch 1: W2215 admitted; publication halts; its resolution is dispatched but never published. */
+  async function haltedAtResolution(walFileSystem: MemoryFileSystem): Promise<Harness> {
+    const harness = await started(venueStub({ clob: everyClobBody() }), { walFileSystem, config: admissionConfig({}, series) });
+    expect(admittedIds(harness)).toEqual([WINDOW_2215.id]);
+    harness.clock.advance(RESOLVED_AT_MS - NOW_MS);
+    harness.transport.setUnavailable(true);
+    harness.polymarketSockets.current.message(marketResolvedFrame(WINDOW_2215, RESOLVED_AT_MS));
+    await harness.settle();
+    return harness;
+  }
+
+  it("R3-ASTRA-01: a resolution the publisher did not publish leaves its window ADMITTED, subscribed, registered and in its cap slot, with the resolution kept; the next epoch re-publishes it unchanged, and only then is the window retired RESOLVED and the series moves on", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const halted = await haltedAtResolution(walFileSystem);
+    expect(resolutionsOf(halted, WINDOW_2215.id)).toBe(0);
+    // Cycles later (to 22:41, past the bound): still ADMITTED, with the resolution OWED.
+    for (let index = 0; index < 3; index += 1) await cycleAfter(halted, 3 * 60_000);
+    const owed = ledger(walFileSystem)[WINDOW_2215.conditionId];
+    expect(owed?.["status"]).toBe("ADMITTED");
+    expect(unpublishedResolutions(halted)).toBe(1);
+    const kept = owed?.["resolution"] as Record<string, unknown> | undefined;
+    expect(kept?.["payload"]).toEqual({ internalMarketId: WINDOW_2215.id, conditionId: WINDOW_2215.conditionId, outcome: "YES_WIN", resolvedAt: expect.any(String) as unknown });
+    expect(kept?.["publishedAt"]).toBeUndefined();
+    expect(kept?.["rawFrame"]).toEqual({ gatewayEpoch: halted.gateway.gatewayEpoch, ingestSeq: expect.stringMatching(/^[0-9]+$/u) as unknown });
+    // Its route is kept: never unsubscribed, never released from the directory.
+    expect(unsubscribedTokens(halted)).not.toContain(WINDOW_2215.yes);
+    expect(halted.gateway.metrics().directory?.admittedWindowsReleased).toBe(0);
+    // And its cap slot: the 22:30 window is never admitted, not even as an intent.
+    expect(ledger(walFileSystem)[WINDOW_2230.conditionId]).toBeUndefined();
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsObserved: 1, resolutionsUnpublished: 1, resolutionsOwed: 1, windowsRetiredResolved: 0, liveWindows: 1 });
+    // An owed resolution is not "unresolved": no such incident names it.
+    expect(observedIncidents(halted, "GATEWAY_SERIES_WINDOW_UNRESOLVED")).toBe(0);
+    await halted.gateway.stop();
+
+    // Epoch 2 (22:42): re-attached, and the recorded resolution re-published, unchanged.
+    const restarted = await started(venueStub({ clob: everyClobBody() }), {
+      walFileSystem,
+      idSeed: 1,
+      config: admissionConfig({}, series),
+      clockStartMs: Date.UTC(2026, 9, 4, 22, 42),
+    });
+    expect(subscribedTokens(restarted)).toEqual(expect.arrayContaining([WINDOW_2215.yes, WINDOW_2215.no]));
+    const republished = restarted.publishedOfType("MarketResolved");
+    expect(republished.map((envelope) => payloadOf(envelope))).toEqual([kept?.["payload"]]);
+    expect(restarted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsReplayed: 1, resolutionsUnpublished: 0 });
+    expect((ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"] as Record<string, unknown> | undefined)?.["publishedAt"]).toEqual(expect.any(String));
+    // Only now is it retired RESOLVED — carrying the published resolution — and
+    // unsubscribed, and the 22:30 window, still open, takes the freed slot.
+    await cycleAfter(restarted, 0);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({
+      status: "RETIRED",
+      retiredReason: "RESOLVED",
+      resolution: { payload: kept?.["payload"], publishedAt: expect.any(String) as unknown },
+    });
+    expect(unsubscribedTokens(restarted)).toEqual(expect.arrayContaining([WINDOW_2215.yes, WINDOW_2215.no]));
+    expect(admittedIds(restarted)).toEqual([WINDOW_2230.id]);
+    await restarted.gateway.stop();
+  });
+
+  it("R3-ASTRA-01 (retry): while the re-publication halts too, the resolution stays owed and the window stays; a later epoch that publishes it retires it", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const halted = await haltedAtResolution(walFileSystem);
+    await halted.gateway.stop();
+    // Epoch 2 starts with the transport down: the re-publication halts as well.
+    const down = await started(venueStub({ clob: everyClobBody() }), {
+      walFileSystem,
+      idSeed: 1,
+      startupTransportFailure: "redis down",
+      config: admissionConfig({}, series),
+      clockStartMs: Date.UTC(2026, 9, 4, 22, 42),
+    });
+    await cycleAfter(down, 60_000);
+    expect(down.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsReplayed: 1, resolutionsUnpublished: 1, resolutionsOwed: 1 });
+    const stillOwed = ledger(walFileSystem)[WINDOW_2215.conditionId];
+    expect(stillOwed?.["status"]).toBe("ADMITTED");
+    expect((stillOwed?.["resolution"] as Record<string, unknown> | undefined)?.["publishedAt"]).toBeUndefined();
+    await down.gateway.stop();
+    // Epoch 3: published, then retired.
+    const healthy = await started(venueStub({ clob: everyClobBody() }), {
+      walFileSystem,
+      idSeed: 2,
+      config: admissionConfig({}, series),
+      clockStartMs: Date.UTC(2026, 9, 4, 22, 44),
+    });
+    expect(resolutionsOf(healthy, WINDOW_2215.id)).toBe(1);
+    await cycleAfter(healthy, 0);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
+    await healthy.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r3 (R3-FABLE-01): the operator's named retirement is the recovery for a resolution never observed", () => {
+  const REASON = "gateway stopped 22:20-23:20 across both resolutions; checked resolved on polymarket.com";
+
+  it("R3-FABLE-01: after a stop spanning both live windows' resolutions, each named window is retired OPERATOR once past its bound, with the reason and an incident naming it, and the series resumes", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    // Sample review: cap 2, bound 3,600 s. 22:20: the 22:15 and 22:30 windows are admitted; then the gateway stops.
+    const first = await started(venueStub({ clob: everyClobBody() }), { walFileSystem });
+    expect(admittedIds(first)).toEqual([WINDOW_2215.id, WINDOW_2230.id]);
+    await first.gateway.stop();
+
+    // 23:20: both resolutions fell in the gap. The operator names both windows.
+    const retirements = [
+      { internalMarketId: WINDOW_2215.id, reason: REASON },
+      { internalMarketId: WINDOW_2230.id, reason: REASON },
+    ];
+    const config = admissionConfig({
+      seriesAdmission: { ...(admissionConfig()["seriesAdmission"] as Record<string, unknown>), operatorRetirements: retirements },
+    });
+    const restarted = await started(venueStub({ clob: everyClobBody() }), { walFileSystem, idSeed: 7, config, clockStartMs: NOW_MS + 60 * 60_000 });
+    // Neither is past its bound yet (22:30 + 3,600 s = 23:30; 22:45 + 3,600 s = 23:45): deferred, named, nothing admitted.
+    expect(incidentsNamed(restarted, "GATEWAY_SERIES_OPERATOR_RETIREMENT_DEFERRED")).toEqual([[WINDOW_2215.id], [WINDOW_2230.id]]);
+    expect(Object.values(ledger(walFileSystem)).map((record) => record["status"])).toEqual(["ADMITTED", "ADMITTED"]);
+    expect(admittedIds(restarted)).toEqual([]);
+    expect(restarted.gateway.metrics().seriesAdmission).toMatchObject({ operatorRetirementsDeferred: 2, windowsRetiredByOperator: 0 });
+
+    // 23:35: the 22:15 window is past its bound — retired OPERATOR — and the open 23:30 window takes its slot.
+    await cycleAfter(restarted, 15 * 60_000);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "OPERATOR", operatorReason: REASON });
+    expect(ledger(walFileSystem)[WINDOW_2230.conditionId]?.["status"]).toBe("ADMITTED");
+    expect(incidentsNamed(restarted, "GATEWAY_SERIES_WINDOW_RETIRED_BY_OPERATOR")).toEqual([[WINDOW_2215.id]]);
+    const retiredIncident = restarted.incidents.find((incident) => incident.reasonCode === "GATEWAY_SERIES_WINDOW_RETIRED_BY_OPERATOR");
+    expect(retiredIncident?.detail).toContain(REASON);
+    expect(unsubscribedTokens(restarted)).toEqual(expect.arrayContaining([WINDOW_2215.yes, WINDOW_2215.no]));
+    const open2330 = recordedEvent(5);
+    expect(admittedIds(restarted)).toEqual([windowInternalMarketId(open2330.conditionId, open2330.openMs)]);
+
+    // 23:50: the 22:30 window too; the 23:45 window is admitted. No resolution is ever published for either.
+    await cycleAfter(restarted, 15 * 60_000);
+    expect(ledger(walFileSystem)[WINDOW_2230.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "OPERATOR", operatorReason: REASON });
+    expect(incidentsNamed(restarted, "GATEWAY_SERIES_WINDOW_RETIRED_BY_OPERATOR")).toEqual([[WINDOW_2215.id], [WINDOW_2230.id]]);
+    const open2345 = recordedEvent(6);
+    expect(admittedIds(restarted)).toEqual([windowInternalMarketId(open2330.conditionId, open2330.openMs), windowInternalMarketId(open2345.conditionId, open2345.openMs)]);
+    expect(restarted.publishedOfType("MarketResolved")).toEqual([]);
+    expect(restarted.gateway.metrics().seriesAdmission).toMatchObject({ windowsRetiredByOperator: 2, windowsRetiredResolved: 0, operatorRetirementsDeferred: 0, operatorRetirementsUnmatched: 0 });
+    await restarted.gateway.stop();
+  });
+
+  it("R3-FABLE-01: an operator's retirement never overrides an OWED resolution — it is re-published and retires the window RESOLVED — and one naming no window is reported, retiring nothing", async () => {
+    const series = { ...reviewedBtc15mSeriesDocument(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+    const walFileSystem = createMemoryFileSystem();
+    const halted = await started(venueStub({ clob: everyClobBody() }), { walFileSystem, config: admissionConfig({}, series) });
+    halted.clock.advance(12 * 60_000);
+    halted.transport.setUnavailable(true);
+    halted.polymarketSockets.current.message(marketResolvedFrame(WINDOW_2215, halted.clock.nowMs()));
+    await halted.settle();
+    await halted.gateway.stop();
+
+    const stranger = windowInternalMarketId(WINDOW_2230.conditionId, Date.UTC(2026, 9, 5, 9, 0)) ?? "";
+    const config = admissionConfig(
+      {
+        seriesAdmission: {
+          ...(admissionConfig()["seriesAdmission"] as Record<string, unknown>),
+          series: [series],
+          operatorRetirements: [
+            { internalMarketId: WINDOW_2215.id, reason: REASON },
+            { internalMarketId: stranger, reason: "a typo" },
+          ],
+        },
+      },
+      series,
+    );
+    // 22:42: past the 22:15 window's bound (22:35), with its resolution owed.
+    const restarted = await started(venueStub({ clob: everyClobBody() }), { walFileSystem, idSeed: 1, config, clockStartMs: Date.UTC(2026, 9, 4, 22, 42) });
+    expect(incidentsNamed(restarted, "GATEWAY_SERIES_OPERATOR_RETIREMENT_DEFERRED")).toEqual([[WINDOW_2215.id]]);
+    expect(incidentsNamed(restarted, "GATEWAY_SERIES_OPERATOR_RETIREMENT_UNMATCHED")).toEqual([[stranger]]);
+    expect(resolutionsOf(restarted, WINDOW_2215.id)).toBe(1);
+    await cycleAfter(restarted, 0);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]?.["operatorReason"]).toBeUndefined();
+    expect(restarted.gateway.metrics().seriesAdmission).toMatchObject({ windowsRetiredByOperator: 0, windowsRetiredResolved: 1, operatorRetirementsUnmatched: 1 });
+    await restarted.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r3 (R3-FABLE-02): the cap counts unconfirmed intents", () => {
+  it("R3-FABLE-02: with publication halted, two intents fill the cap of 2 and a later due window is held GATEWAY_SERIES_CAP_REACHED, with no intent of its own", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const stub = venueStub({ clob: everyClobBody() });
+    const halted = await started(stub, { walFileSystem, startupTransportFailure: "redis down" });
+    const intents = Object.values(ledger(walFileSystem)).filter((record) => record["status"] === "ADMITTED" && record["admissionConfirmedAt"] === undefined);
+    expect(intents.map((record) => record["key"])).toEqual([WINDOW_2215.conditionId, WINDOW_2230.conditionId]);
+    expect(observedIncidents(halted, "GATEWAY_SERIES_CAP_REACHED")).toBe(0);
+    // 22:31: the 22:45 window is due (14 minutes ahead) while the two intents are live.
+    await cycleAfter(halted, 11 * 60_000);
+    const third = recordedEvent(2);
+    expect(observedIncidents(halted, "GATEWAY_SERIES_CAP_REACHED")).toBe(1);
+    expect(ledger(walFileSystem)[third.conditionId]).toBeUndefined();
+    expect(stub.requests.some((url) => url.includes(`/clob-markets/${third.conditionId}`))).toBe(false);
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ windowsAdmitted: 2, windowsHeldByCap: 1, liveWindows: 2 });
+    await halted.gateway.stop();
   });
 });

@@ -51,7 +51,11 @@
  * order, no pending cancel — and either:
  *
  * - its resolution was handled (the market is RESOLVED and its
- *   `onMarketResolved` ran in the frame that resolved it): `RESOLVED`; or
+ *   `onMarketResolved` reached every instance in the frame that resolved it):
+ *   `RESOLVED`; or it resolved but the callback was suppressed by a halt or
+ *   skipped for an instance: `RESOLVED_UNHANDLED` (`ROLLOVER-1` r3,
+ *   R3-ASTRA-02 — a halt is a run-long latch and the callback is never
+ *   redelivered, so the window is released, and the record says so); or
  * - it is still unresolved the reviewed `unresolvedTeardownSeconds` after its
  *   close AND holds no inventory — no position on either of its tokens, so
  *   the run has nothing for a resolution to settle: `UNRESOLVED_AFTER_CLOSE`.
@@ -138,11 +142,20 @@ export interface WindowAttachment {
   detach(window: AdmittedWindow): void;
 }
 
+/**
+ * Why a window was torn down: its resolution was handled (`RESOLVED`); it
+ * resolved but its `onMarketResolved` did not reach every instance — a halt
+ * suppressed it, or an instance was skipped (`RESOLVED_UNHANDLED`,
+ * `ROLLOVER-1` r3, R3-ASTRA-02); or it is flat and idle, still unresolved past
+ * its bound (`UNRESOLVED_AFTER_CLOSE`).
+ */
+export type WindowTeardownReason = "RESOLVED" | "RESOLVED_UNHANDLED" | "UNRESOLVED_AFTER_CLOSE";
+
 /** What the loop is told about each admission and teardown (output only). */
 export type AdmissionNotice =
   | { readonly kind: "ADMITTED"; readonly window: AdmittedWindow }
   | { readonly kind: "REFUSED"; readonly code: AdmissionRefusalCode; readonly detail: string; readonly marketId: string | undefined }
-  | { readonly kind: "TORN_DOWN"; readonly window: AdmittedWindow; readonly reason: "RESOLVED" | "UNRESOLVED_AFTER_CLOSE" }
+  | { readonly kind: "TORN_DOWN"; readonly window: AdmittedWindow; readonly reason: WindowTeardownReason }
   /**
    * `ROLLOVER-1` r1 (R1-04): the window is unresolved past its reviewed bound
    * and still HOLDS inventory, so it is kept — its runtime owns the position
@@ -156,6 +169,8 @@ export interface AdmissionMetrics {
   readonly duplicates: number;
   readonly refusals: Readonly<Record<string, number>>;
   readonly tornDownResolved: number;
+  /** `ROLLOVER-1` r3 (R3-ASTRA-02): torn down resolved, with the resolution NOT handled. */
+  readonly tornDownResolvedUnhandled: number;
   readonly tornDownUnresolved: number;
   readonly teardownsBlocked: number;
   /**
@@ -202,6 +217,7 @@ export class SeriesWindowAdmissions {
   #admitted = 0;
   #duplicates = 0;
   #tornDownResolved = 0;
+  #tornDownResolvedUnhandled = 0;
   #tornDownUnresolved = 0;
   #teardownsBlocked = 0;
   /** Live windows kept past the unresolved bound because they hold inventory (R1-04). */
@@ -406,13 +422,14 @@ export class SeriesWindowAdmissions {
   }
 
   /** Tears one live window down (the loop judged it due and idle). */
-  detach(marketId: string, reason: "RESOLVED" | "UNRESOLVED_AFTER_CLOSE"): AdmittedWindow | undefined {
+  detach(marketId: string, reason: WindowTeardownReason): AdmittedWindow | undefined {
     const window = this.#live.get(marketId);
     if (window === undefined) return undefined;
     this.#attachment.detach(window);
     this.#live.delete(marketId);
     this.#heldUnresolved.delete(marketId);
     if (reason === "RESOLVED") this.#tornDownResolved += 1;
+    else if (reason === "RESOLVED_UNHANDLED") this.#tornDownResolvedUnhandled += 1;
     else this.#tornDownUnresolved += 1;
     return window;
   }
@@ -448,6 +465,7 @@ export class SeriesWindowAdmissions {
       duplicates: this.#duplicates,
       refusals: Object.freeze(Object.fromEntries([...this.#refusals].sort(([left], [right]) => (left < right ? -1 : 1)))),
       tornDownResolved: this.#tornDownResolved,
+      tornDownResolvedUnhandled: this.#tornDownResolvedUnhandled,
       tornDownUnresolved: this.#tornDownUnresolved,
       teardownsBlocked: this.#teardownsBlocked,
       heldUnresolved: this.#heldUnresolved.size,

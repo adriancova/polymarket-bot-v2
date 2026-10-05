@@ -491,10 +491,12 @@ export class DataGateway {
         clock: ports.clock,
         timers: ports.timers,
         snapshotFetcher: fetcher,
-        // `ROLLOVER-1`: a dispatched resolution lets the admission feed tear
-        // the window down on its next cycle (ADR-030 Decision 4.4).
-        onMarketResolved: (internalMarketId) => {
-          this.#admissionDriver?.noteResolved(internalMarketId);
+        // `ROLLOVER-1`: a dispatched resolution, with its publication's
+        // outcome, lets the admission feed tear the window down on its next
+        // cycle once the resolution is PUBLISHED (ADR-030 Decision 4.4; r3,
+        // R3-ASTRA-01).
+        onMarketResolved: (resolution) => {
+          this.#admissionDriver?.noteResolution(resolution);
         },
       });
       const connectionIds = new ConnectionIdFactory(feedConfig.feedId);
@@ -762,6 +764,8 @@ export class DataGateway {
       clock: ports.clock,
       timers: ports.timers,
       ledger,
+      gatewayEpoch: this.#sequencer.gatewayEpoch,
+      operatorRetirements: block.operatorRetirements ?? [],
       windows: {
         knows: (conditionId, tokenIds) => directory.knowsMarket(conditionId, tokenIds),
         register: (window) => directory.registerAdmittedWindow(window),

@@ -80,6 +80,7 @@ export {
   type AdmissionVerdict,
   type AdmittedWindow,
   type WindowAttachment,
+  type WindowTeardownReason,
 } from "./series-admission.js";
 
 export {

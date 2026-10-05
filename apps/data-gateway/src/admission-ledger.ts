@@ -22,6 +22,19 @@
  * - **Restart re-attaches the live windows.** An admitted window that is not
  *   retired is re-registered in the directory, re-subscribed and re-polled by
  *   the lifecycle feed at the next start.
+ * - **A resolution is retired only once it is PUBLISHED** (`ROLLOVER-1` r3,
+ *   R3-ASTRA-01). The `MarketResolved` the market channel delivered for a live
+ *   window is recorded on its record (`resolution`) as an OBLIGATION, and
+ *   stamped `publishedAt` only when the publisher reports it published. Until
+ *   then the window stays ADMITTED, attached and registered, and the next epoch
+ *   re-publishes the recorded payload unchanged: a publication halt can no
+ *   longer retire a window whose resolution no consumer received. A RESOLVED
+ *   retirement therefore always carries its published resolution.
+ * - **A resolution never observed is retired only by a named operator act**
+ *   (`ROLLOVER-1` r3, R3-FABLE-01): an `operatorRetirements` entry of the
+ *   gateway configuration, applied by the admission feed to a window past its
+ *   unresolved bound with no resolution owed, recorded `OPERATOR` with the
+ *   operator's reason (`feeds/series-admission.ts`).
  *
  * ## Bounded (§8.3)
  *
@@ -42,7 +55,7 @@
  * re-judging over an unreadable ledger could admit a window twice.
  */
 
-import { IsoTimestampSchema } from "@polymarket-bot/domain";
+import { IsoTimestampSchema, MarketResolvedPayloadSchema } from "@polymarket-bot/domain";
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import type { WalFileSystem } from "@polymarket-bot/storage-wal";
 import { z } from "zod";
@@ -65,6 +78,10 @@ const MAX_MISMATCH_LENGTH = 500;
 
 const Instant = IsoTimestampSchema;
 const Text = z.string().min(1).max(2_000);
+const IngestSeq = z.string().regex(/^(?:0|[1-9][0-9]*)$/u);
+
+/** At most this many characters of an operator's retirement reason are kept. */
+export const MAX_OPERATOR_REASON_LENGTH = 500;
 
 /** One admitted window's facts, as `SeriesWindowAdmitted@1` and its companions carry them. */
 const AdmittedWindowSchema = z.strictObject({
@@ -81,10 +98,29 @@ const AdmittedWindowSchema = z.strictObject({
   /** The universe directory's parameter-version reference for version 1. */
   parameterVersionRef: Text,
   /** The two journaled responses the admission was judged from (§6 invariant 4). */
-  keysetRawIngestSeq: z.string().regex(/^(?:0|[1-9][0-9]*)$/u),
-  clobRawIngestSeq: z.string().regex(/^(?:0|[1-9][0-9]*)$/u),
+  keysetRawIngestSeq: IngestSeq,
+  clobRawIngestSeq: IngestSeq,
 });
 export type AdmittedWindowRecord = z.infer<typeof AdmittedWindowSchema>;
+
+/**
+ * `ROLLOVER-1` r3 (R3-ASTRA-01): the resolution the market channel delivered
+ * for a live window, kept until the publisher has published it — the evidence
+ * a restart re-publishes from, and the proof a RESOLVED retirement carries.
+ */
+const WindowResolutionSchema = z.strictObject({
+  /** The `MarketResolved@1` payload the market feed derived: what is (re-)published, unchanged. */
+  payload: MarketResolvedPayloadSchema,
+  /** The venue's timestamp on the frame, when it carried one. */
+  venueTimestamp: Instant.optional(),
+  /** The gateway's receipt instant of the frame the resolution was derived from. */
+  observedAt: Instant,
+  /** That frame's WAL record (absent only for an event with no recorded frame). */
+  rawFrame: z.strictObject({ gatewayEpoch: Text, ingestSeq: IngestSeq }).optional(),
+  /** When the publisher reported it PUBLISHED. Absent: OWED — the next epoch re-publishes it. */
+  publishedAt: Instant.optional(),
+});
+export type WindowResolutionRecord = z.infer<typeof WindowResolutionSchema>;
 
 const RecordSchema = z.strictObject({
   /** The condition id, or `event:<gammaEventId>` when none was readable. */
@@ -101,13 +137,20 @@ const RecordSchema = z.strictObject({
   admissionConfirmedAt: Instant.optional(),
   retiredAt: Instant.optional(),
   /**
-   * Why the window was retired. `ROLLOVER-1` r2 (R2-ASTRA-02): only its
-   * handled resolution retires a window (ADR-030 Decision 4.4); r0 and r1
-   * also retired an unresolved one (`UNRESOLVED_AFTER_CLOSE`), which cut off
-   * the delivery of its late resolution. That value is no longer written or
-   * read: a ledger carrying it is refused at open (fail closed).
+   * Why the window was retired. `ROLLOVER-1` r2 (R2-ASTRA-02): r0 and r1 also
+   * retired an unresolved window on a timer (`UNRESOLVED_AFTER_CLOSE`), which
+   * cut off the delivery of its late resolution; that value is no longer
+   * written or read, and a ledger carrying it is refused at open (fail
+   * closed). `ROLLOVER-1` r3: `RESOLVED` — its resolution was PUBLISHED
+   * (R3-ASTRA-01; the record carries it, `publishedAt` included); `OPERATOR` —
+   * a named operator act retired a window whose resolution never reached the
+   * gateway (R3-FABLE-01; the record carries the operator's reason).
    */
-  retiredReason: z.enum(["RESOLVED"]).optional(),
+  retiredReason: z.enum(["RESOLVED", "OPERATOR"]).optional(),
+  /** `ROLLOVER-1` r3 (R3-FABLE-01): the operator's reason, exactly on an `OPERATOR` retirement. */
+  operatorReason: z.string().min(1).max(MAX_OPERATOR_REASON_LENGTH).optional(),
+  /** `ROLLOVER-1` r3 (R3-ASTRA-01): the window's observed resolution (see {@link WindowResolutionRecord}). */
+  resolution: WindowResolutionSchema.optional(),
   mismatches: z.array(z.string().min(1).max(MAX_MISMATCH_LENGTH)).min(1).max(MAX_RECORDED_MISMATCHES).optional(),
 });
 export type AdmissionLedgerRecord = z.infer<typeof RecordSchema>;
@@ -122,13 +165,34 @@ function recordProblem(record: AdmissionLedgerRecord): string | undefined {
   if (record.status === "REFUSED") {
     if (record.mismatches === undefined) return "a REFUSED record names no mismatch";
     if (record.window !== undefined || record.admissionConfirmedAt !== undefined) return "a REFUSED record carries an admission";
+    if (record.resolution !== undefined) return "a REFUSED record carries a resolution";
   } else {
     if (record.window === undefined) return `an ${record.status} record carries no window`;
     if (record.window.conditionId !== record.key) return "an admitted record's key is not its condition id";
     if (record.mismatches !== undefined) return "an admitted record carries mismatches";
+    const resolution = record.resolution;
+    if (
+      resolution !== undefined &&
+      (resolution.payload.internalMarketId !== record.window.internalMarketId || resolution.payload.conditionId !== record.window.conditionId)
+    ) {
+      return "a record's resolution is not its window's";
+    }
   }
   if ((record.status === "RETIRED") !== (record.retiredAt !== undefined && record.retiredReason !== undefined)) {
     return "retiredAt and retiredReason are present exactly on a RETIRED record";
+  }
+  // `ROLLOVER-1` r3: a RESOLVED retirement carries its PUBLISHED resolution
+  // (R3-ASTRA-01: never retired on a resolution no consumer received); an
+  // OPERATOR retirement carries the operator's reason and no resolution (one
+  // observed would have been published and retired RESOLVED, R3-FABLE-01).
+  if (record.retiredReason === "RESOLVED" && record.resolution?.publishedAt === undefined) {
+    return "a RESOLVED retirement carries no published resolution";
+  }
+  if ((record.retiredReason === "OPERATOR") !== (record.operatorReason !== undefined)) {
+    return "operatorReason is present exactly on an OPERATOR retirement";
+  }
+  if (record.retiredReason === "OPERATOR" && record.resolution !== undefined) {
+    return "an OPERATOR retirement carries a resolution";
   }
   return undefined;
 }
