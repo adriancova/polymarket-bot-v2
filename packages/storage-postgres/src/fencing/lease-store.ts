@@ -1,0 +1,493 @@
+/**
+ * The PostgreSQL fencing lease (WP-320 deliverable 1; handoff §9.18, §6
+ * invariant 16; ADR-008 §1–§2).
+ *
+ * > "Redis is not sufficient as the only fence. Use a PostgreSQL advisory lock
+ * > or lease with a monotonic fencing token persisted with every live
+ * > submission." — handoff §9.18
+ *
+ * `WP-040` built the fence's database half (`db/migrations/0007_ops.up.sql`,
+ * `0008`): one ACTIVE lease per account and execution realm (a partial unique
+ * index), a token that only ever rises (`ops.fencing_token_high_water` and the
+ * `fencing_leases_monotonic_token` trigger), a forward-only lease state machine
+ * (`fencing_leases_forward_only`, SQLSTATE `PMB10`), a CHECK that refuses a
+ * lease in a simulated run mode (`fencing_leases_real_modes_only`), and a
+ * trigger that refuses a live order or submission attempt naming a lease that
+ * is not ACTIVE and unexpired AT THE DATABASE'S CLOCK
+ * (`internal.assert_valid_fencing_reference`, `PMB06`). This module is the
+ * lease's lifecycle on top of those facts: acquire, renew, record the venue
+ * heartbeat id, release and revoke.
+ *
+ * ## The rules this store adds, and why each is here
+ *
+ * - **Expiry is the database's clock, never the caller's.** `acquire` and
+ *   `renew` take a TTL, and the row's `expires_at` is `clock_timestamp() +
+ *   ttl`, computed by PostgreSQL in the statement. `WP-040`'s repository took a
+ *   caller-supplied `expiresAt`, so a caller whose wall clock ran ahead could
+ *   grant itself a lease that outlives every honest one. The validity trigger
+ *   already judges expiry by `clock_timestamp()`; now the expiry it judges was
+ *   written by the same clock.
+ * - **Every write names the whole grant: lease id, token AND holder.** A
+ *   process may renew, record a heartbeat id on, or release only the lease it
+ *   was granted, and only while that lease is ACTIVE (renew and the heartbeat
+ *   id: and unexpired) at the database's clock. A STALE HOLDER — one whose
+ *   lease expired, was released, revoked, or taken over — matches no row, so
+ *   it can never renew (ADR-008 §2). It can never submit either: the attempt
+ *   insert names its old lease, which the validity trigger refuses.
+ * - **A simulated run mode never reaches SQL.** `acquire` refuses `BACKTEST`,
+ *   `PAPER`, `SHADOW` and anything that is not a §11 run mode before it opens
+ *   a transaction ({@link NonRealModeFencingLeaseError}); the database CHECK is
+ *   the second layer. "Paper mode cannot acquire live fencing" (work plan
+ *   `WP-320` acceptance; ADR-008 §2, ADR-010).
+ * - **A takeover requires the incumbent to have expired**, by the database's
+ *   clock (ADR-008: "Failover is not instant and must not be"). The lapsed
+ *   lease is moved to `EXPIRED` in the statement that ends it, with its
+ *   reason, because a terminal lease can never be annotated afterwards
+ *   (`WP-040` R15/F14), and it happens on the acquisition path (`WP-040` F11).
+ * - **The next token is the high-water mark plus one**, read under a
+ *   transaction-scoped advisory lock on the SAME key `WP-040`'s repository
+ *   takes (`fencing:<account>:<realm>`), so the two acquisition paths
+ *   serialize against each other. The insert trigger advances and re-checks
+ *   the mark; the partial unique index refuses a second ACTIVE lease. A writer
+ *   that bypasses the advisory lock therefore still cannot hold authority
+ *   twice: it gets {@link FencingAcquireOutcome} `CONTENDED`.
+ * - **The heartbeat id is lease state (ADR-008 §4, consequence 1).** It is
+ *   recorded only on the holder's ACTIVE, unexpired lease, and a new grant
+ *   reports the id the realm's previous lease last recorded
+ *   (`inheritedHeartbeatId`), so a failover can resume the venue's id chain
+ *   or bootstrap from empty.
+ *
+ * ## What this store does not do
+ *
+ * It keeps no state and reads no clock of its own: whether the PROCESS may
+ * still act on a grant is the in-process fencing authority's question
+ * (`apps/trader/src/live-safety/fencing-authority.ts`), which measures the
+ * grant's lifetime on the process's monotonic clock from the instant BEFORE
+ * the call that obtained it. It sends nothing to the venue, and it never
+ * writes a lease in a simulated run mode. PAPER only.
+ */
+
+import { sql } from "kysely";
+
+import type { PolymarketBotDatabase } from "../database.js";
+import { inTransaction } from "../database.js";
+import {
+  FencingTokenNotMonotonicError,
+  NonRealModeFencingLeaseError,
+  StoragePostgresError,
+  UniqueViolationError,
+  withMappedErrors,
+} from "../errors.js";
+import { uuidV7 } from "../ids.js";
+import { executionRealm, isRealOrderRunMode, RUN_MODES, type RunModeValue } from "../schema/enums.js";
+import type { IsoTimestamp } from "../timestamps.js";
+
+/** The shortest lease a caller may ask for. A guard on configuration, not a venue fact. */
+export const FENCING_LEASE_MIN_TTL_MS = 1_000;
+/** The longest lease a caller may ask for (one hour). A guard on configuration, not a venue fact. */
+export const FENCING_LEASE_MAX_TTL_MS = 3_600_000;
+/** `internal.identifier`: 1…200 characters. */
+export const FENCING_IDENTIFIER_MAX_LENGTH = 200;
+/** `internal.detail`: at most 2000 characters. */
+export const FENCING_REASON_MAX_LENGTH = 2_000;
+/**
+ * The longest venue heartbeat id this store records. The venue documents no
+ * bound (`docs/venue/verified-2026-09-30.md` §5); this is a guard, and an id
+ * beyond it is refused, never truncated.
+ */
+export const FENCING_HEARTBEAT_ID_MAX_LENGTH = 512;
+
+/** What the realm's lapsed leases are labelled with when an acquisition ends them. */
+const TAKEOVER_EXPIRY_REASON = "lease expired before a new acquisition (ADR-008: a takeover requires the incumbent to have expired)";
+
+/** A request for the account's fence. */
+export interface AcquireFencingLeaseInput {
+  readonly accountRef: string;
+  /** Read as a §11 run mode; anything else, and every simulated mode, is refused before any SQL. */
+  readonly environment: string;
+  readonly holderId: string;
+  readonly holderHostname?: string | null;
+  readonly holderPid?: number | null;
+  /** The lease's lifetime, applied by the DATABASE's clock. */
+  readonly ttlMs: number;
+}
+
+/** A granted lease: the fence a process may act under until `expiresAt` (database clock). */
+export interface FencingGrant {
+  readonly fencingLeaseId: string;
+  /** `bigint` as a decimal string: 2^63 exceeds what a JavaScript number holds. */
+  readonly fencingToken: string;
+  readonly accountRef: string;
+  readonly environment: RunModeValue;
+  readonly holderId: string;
+  readonly acquiredAt: IsoTimestamp;
+  readonly expiresAt: IsoTimestamp;
+  /** The venue heartbeat id the realm's previous lease last recorded (ADR-008 §4), or `null`. */
+  readonly inheritedHeartbeatId: string | null;
+}
+
+export type FencingAcquireOutcome =
+  | { readonly kind: "ACQUIRED"; readonly grant: FencingGrant }
+  /** An unexpired ACTIVE lease exists: one fenced live writer per account and realm (§2, ADR-008 §2). */
+  | { readonly kind: "HELD"; readonly holderId: string; readonly fencingToken: string; readonly expiresAt: IsoTimestamp }
+  /** A concurrent acquisition that bypassed the advisory lock won the race at the database's constraints. */
+  | { readonly kind: "CONTENDED" };
+
+/** The whole grant a write must name: a stale holder's reference matches no row. */
+export interface FencingLeaseRef {
+  readonly fencingLeaseId: string;
+  readonly fencingToken: string;
+  readonly holderId: string;
+}
+
+export type FencingRenewOutcome =
+  | { readonly kind: "RENEWED"; readonly expiresAt: IsoTimestamp }
+  /** The lease is not this holder's ACTIVE, unexpired lease any more. Authority is gone; only a new acquisition (a new token) restores it. */
+  | { readonly kind: "LOST" };
+
+/** The realm's valid lease, as the database sees it now. */
+export interface FencingLeaseView {
+  readonly fencingLeaseId: string;
+  readonly fencingToken: string;
+  readonly accountRef: string;
+  readonly environment: RunModeValue;
+  readonly holderId: string;
+  readonly heartbeatId: string | null;
+  readonly expiresAt: IsoTimestamp;
+}
+
+export interface FencingLeaseStore {
+  /**
+   * Acquire the account's fence for this realm, allocating the next token.
+   *
+   * @throws {NonRealModeFencingLeaseError} for a simulated or unrecognised run mode, before any SQL.
+   * @throws {FencingLeaseInputError} for an invalid input, before any SQL.
+   */
+  acquire(input: AcquireFencingLeaseInput): Promise<FencingAcquireOutcome>;
+  /** Extend this holder's ACTIVE, unexpired lease to `clock_timestamp() + ttlMs`; `LOST` otherwise. */
+  renew(lease: FencingLeaseRef, ttlMs: number): Promise<FencingRenewOutcome>;
+  /** Record the venue's current heartbeat id on this holder's ACTIVE, unexpired lease; `false` otherwise. */
+  recordHeartbeatId(lease: FencingLeaseRef, heartbeatId: string): Promise<boolean>;
+  /** End this holder's ACTIVE lease, recording why in the same statement; `false` when it had already ended. */
+  release(lease: FencingLeaseRef, reason: string): Promise<boolean>;
+  /** An operator's revocation of an ACTIVE lease, with its reason; `false` when it had already ended. */
+  revoke(input: { readonly fencingLeaseId: string; readonly reason: string }): Promise<boolean>;
+  /** Whether `lease` is still ACTIVE and unexpired at the database's clock. */
+  isValid(lease: FencingLeaseRef): Promise<boolean>;
+  /** The realm's ACTIVE, unexpired lease, or `null`. */
+  current(accountRef: string, environment: string): Promise<FencingLeaseView | null>;
+}
+
+/** An input this store refuses before any SQL. Carries a fixed code and the field name only. */
+export class FencingLeaseInputError extends StoragePostgresError {
+  public constructor(public readonly field: string) {
+    super("FENCING_LEASE_INPUT_INVALID", `fencing lease input refused: ${field} is missing or out of bounds`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input readers. Each refuses rather than coerces.
+
+function isRunModeValue(value: unknown): value is RunModeValue {
+  return typeof value === "string" && (RUN_MODES as readonly string[]).includes(value);
+}
+
+/** ASCII control characters and DEL. */
+function hasControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+function identifier(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > FENCING_IDENTIFIER_MAX_LENGTH || hasControl(value)) {
+    throw new FencingLeaseInputError(field);
+  }
+  return value;
+}
+
+function ttl(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < FENCING_LEASE_MIN_TTL_MS || value > FENCING_LEASE_MAX_TTL_MS) {
+    throw new FencingLeaseInputError("ttlMs");
+  }
+  return value;
+}
+
+/** `integer`: a non-negative 32-bit process id. */
+function processId(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 2_147_483_647) throw new FencingLeaseInputError("holderPid");
+  return value;
+}
+
+function reasonText(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > FENCING_REASON_MAX_LENGTH || hasControl(value)) {
+    throw new FencingLeaseInputError("reason");
+  }
+  return value;
+}
+
+/** A positive canonical decimal integer that fits PostgreSQL's `bigint`. */
+function token(value: unknown): string {
+  if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/u.test(value) || BigInt(value) > 9_223_372_036_854_775_807n) {
+    throw new FencingLeaseInputError("fencingToken");
+  }
+  return value;
+}
+
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+function leaseId(value: unknown): string {
+  if (typeof value !== "string" || !UUID_V7.test(value)) throw new FencingLeaseInputError("fencingLeaseId");
+  return value;
+}
+
+function leaseRef(value: FencingLeaseRef): FencingLeaseRef {
+  if (typeof value !== "object" || value === null) throw new FencingLeaseInputError("lease");
+  return { fencingLeaseId: leaseId(value.fencingLeaseId), fencingToken: token(value.fencingToken), holderId: identifier(value.holderId, "holderId") };
+}
+
+function heartbeatIdText(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > FENCING_HEARTBEAT_ID_MAX_LENGTH || hasControl(value)) {
+    throw new FencingLeaseInputError("heartbeatId");
+  }
+  return value;
+}
+
+/**
+ * The run mode, refused unless it is a real-order mode. Checked FIRST, before
+ * any other field is read, so a simulated process is refused for what it is
+ * whatever else it sent.
+ */
+function realMode(environment: unknown, accountRef: unknown): RunModeValue {
+  const account = typeof accountRef === "string" ? accountRef : "(unreadable)";
+  if (!isRunModeValue(environment) || !isRealOrderRunMode(environment)) {
+    throw new NonRealModeFencingLeaseError(typeof environment === "string" ? environment : "(unreadable)", account);
+  }
+  return environment;
+}
+
+/** `clock_timestamp() + ttl`: the database's clock, read in the statement that writes it. */
+function databaseExpiry(ttlMs: number) {
+  return sql<string>`clock_timestamp() + (${ttlMs}::integer * interval '1 millisecond')`;
+}
+
+// ---------------------------------------------------------------------------
+
+export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLeaseStore {
+  return {
+    async acquire(input: AcquireFencingLeaseInput): Promise<FencingAcquireOutcome> {
+      if (typeof input !== "object" || input === null) throw new NonRealModeFencingLeaseError("(unreadable)", "(unreadable)");
+      // 1. The run mode, before anything else: a simulated process never reaches SQL.
+      const environment = realMode(input.environment, input.accountRef);
+      const accountRef = identifier(input.accountRef, "accountRef");
+      const holderId = identifier(input.holderId, "holderId");
+      const holderHostname = input.holderHostname === undefined || input.holderHostname === null ? null : identifier(input.holderHostname, "holderHostname");
+      const holderPid = input.holderPid === undefined || input.holderPid === null ? null : processId(input.holderPid);
+      const ttlMs = ttl(input.ttlMs);
+      const realm = executionRealm(environment);
+
+      try {
+        return await inTransaction(db, async (trx) => {
+          // The same key WP-040's repository takes: both acquisition paths serialize on it.
+          await sql`select pg_advisory_xact_lock(hashtext(${`fencing:${accountRef}:${realm}`}))`.execute(trx);
+
+          // 2. Every lapsed ACTIVE lease of the realm ends now, by the database's clock, with its reason in the
+          // statement that ends it (a terminal lease can never be annotated afterwards: WP-040 R15/F14).
+          await trx
+            .updateTable("ops.fencing_leases")
+            .set({ status: "EXPIRED", released_at: sql<string>`clock_timestamp()`, revoked_reason: TAKEOVER_EXPIRY_REASON })
+            .where("account_ref", "=", accountRef)
+            .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
+            .where("status", "=", "ACTIVE")
+            .where("expires_at", "<=", sql<string>`clock_timestamp()`)
+            .execute();
+
+          // 3. An ACTIVE lease left is unexpired: one fenced live writer per account and realm.
+          const incumbent = await trx
+            .selectFrom("ops.fencing_leases")
+            .select(["holder_id", "fencing_token", "expires_at"])
+            .where("account_ref", "=", accountRef)
+            .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
+            .where("status", "=", "ACTIVE")
+            .executeTakeFirst();
+          if (incumbent !== undefined) {
+            return Object.freeze({
+              kind: "HELD" as const,
+              holderId: incumbent.holder_id,
+              fencingToken: incumbent.fencing_token,
+              expiresAt: incumbent.expires_at,
+            });
+          }
+
+          // 4. The id chain the realm's previous lease last recorded (ADR-008 §4).
+          const previous = await trx
+            .selectFrom("ops.fencing_leases")
+            .select(["heartbeat_id"])
+            .where("account_ref", "=", accountRef)
+            .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
+            .orderBy("fencing_token", "desc")
+            .limit(1)
+            .executeTakeFirst();
+
+          // 5. The next token: the high-water mark plus one (never `max` over rows that can be deleted, ADR-008 §1).
+          const highest = await trx
+            .selectFrom("ops.fencing_token_high_water")
+            .select(["highest_token"])
+            .where("account_ref", "=", accountRef)
+            .where("execution_realm", "=", realm)
+            .executeTakeFirst();
+          const nextToken = (BigInt(highest?.highest_token ?? "0") + 1n).toString();
+
+          const inserted = await trx
+            .insertInto("ops.fencing_leases")
+            .values({
+              fencing_lease_id: uuidV7(),
+              account_ref: accountRef,
+              environment,
+              fencing_token: nextToken,
+              holder_id: holderId,
+              holder_hostname: holderHostname,
+              holder_pid: holderPid,
+              status: "ACTIVE",
+              acquired_at: sql<string>`clock_timestamp()`,
+              expires_at: databaseExpiry(ttlMs),
+            })
+            .returning(["fencing_lease_id", "fencing_token", "account_ref", "environment", "holder_id", "acquired_at", "expires_at"])
+            .executeTakeFirstOrThrow();
+
+          return Object.freeze({
+            kind: "ACQUIRED" as const,
+            grant: Object.freeze({
+              fencingLeaseId: inserted.fencing_lease_id,
+              fencingToken: inserted.fencing_token,
+              accountRef: inserted.account_ref,
+              environment: inserted.environment,
+              holderId: inserted.holder_id,
+              acquiredAt: inserted.acquired_at,
+              expiresAt: inserted.expires_at,
+              inheritedHeartbeatId: previous?.heartbeat_id ?? null,
+            }),
+          });
+        });
+      } catch (error) {
+        // The database's own backstops against a writer that bypassed the advisory lock: the partial unique index
+        // (a second ACTIVE lease) and the monotonic-token trigger (a token not above the high-water mark).
+        if (error instanceof FencingTokenNotMonotonicError) return Object.freeze({ kind: "CONTENDED" as const });
+        if (error instanceof UniqueViolationError && error.constraintName === "fencing_leases_one_active_holder") {
+          return Object.freeze({ kind: "CONTENDED" as const });
+        }
+        throw error;
+      }
+    },
+
+    async renew(lease: FencingLeaseRef, ttlMs: number): Promise<FencingRenewOutcome> {
+      const ref = leaseRef(lease);
+      const lifetime = ttl(ttlMs);
+      const row = await withMappedErrors(async () =>
+        db
+          .updateTable("ops.fencing_leases")
+          .set({ expires_at: databaseExpiry(lifetime) })
+          .where("fencing_lease_id", "=", ref.fencingLeaseId)
+          .where("fencing_token", "=", ref.fencingToken)
+          .where("holder_id", "=", ref.holderId)
+          .where("status", "=", "ACTIVE")
+          .where("expires_at", ">", sql<string>`clock_timestamp()`)
+          .returning(["expires_at"])
+          .executeTakeFirst(),
+      );
+      return row === undefined ? Object.freeze({ kind: "LOST" as const }) : Object.freeze({ kind: "RENEWED" as const, expiresAt: row.expires_at });
+    },
+
+    async recordHeartbeatId(lease: FencingLeaseRef, heartbeatId: string): Promise<boolean> {
+      const ref = leaseRef(lease);
+      const id = heartbeatIdText(heartbeatId);
+      const result = await withMappedErrors(async () =>
+        db
+          .updateTable("ops.fencing_leases")
+          .set({ heartbeat_id: id, last_heartbeat_at: sql<string>`clock_timestamp()` })
+          .where("fencing_lease_id", "=", ref.fencingLeaseId)
+          .where("fencing_token", "=", ref.fencingToken)
+          .where("holder_id", "=", ref.holderId)
+          .where("status", "=", "ACTIVE")
+          .where("expires_at", ">", sql<string>`clock_timestamp()`)
+          .executeTakeFirst(),
+      );
+      return (result.numUpdatedRows ?? 0n) > 0n;
+    },
+
+    async release(lease: FencingLeaseRef, reason: string): Promise<boolean> {
+      const ref = leaseRef(lease);
+      const why = reasonText(reason);
+      const result = await withMappedErrors(async () =>
+        db
+          .updateTable("ops.fencing_leases")
+          .set({ status: "RELEASED", released_at: sql<string>`clock_timestamp()`, revoked_reason: why })
+          .where("fencing_lease_id", "=", ref.fencingLeaseId)
+          .where("fencing_token", "=", ref.fencingToken)
+          .where("holder_id", "=", ref.holderId)
+          .where("status", "=", "ACTIVE")
+          .executeTakeFirst(),
+      );
+      return (result.numUpdatedRows ?? 0n) > 0n;
+    },
+
+    async revoke(input: { readonly fencingLeaseId: string; readonly reason: string }): Promise<boolean> {
+      if (typeof input !== "object" || input === null) throw new FencingLeaseInputError("revocation");
+      const id = leaseId(input.fencingLeaseId);
+      const why = reasonText(input.reason);
+      const result = await withMappedErrors(async () =>
+        db
+          .updateTable("ops.fencing_leases")
+          .set({ status: "REVOKED", released_at: sql<string>`clock_timestamp()`, revoked_reason: why })
+          .where("fencing_lease_id", "=", id)
+          .where("status", "=", "ACTIVE")
+          .executeTakeFirst(),
+      );
+      return (result.numUpdatedRows ?? 0n) > 0n;
+    },
+
+    async isValid(lease: FencingLeaseRef): Promise<boolean> {
+      const ref = leaseRef(lease);
+      const row = await withMappedErrors(async () =>
+        db
+          .selectFrom("ops.fencing_leases")
+          .select(["fencing_lease_id"])
+          .where("fencing_lease_id", "=", ref.fencingLeaseId)
+          .where("fencing_token", "=", ref.fencingToken)
+          .where("holder_id", "=", ref.holderId)
+          .where("status", "=", "ACTIVE")
+          .where("expires_at", ">", sql<string>`clock_timestamp()`)
+          .executeTakeFirst(),
+      );
+      return row !== undefined;
+    },
+
+    async current(accountRef: string, environment: string): Promise<FencingLeaseView | null> {
+      const account = identifier(accountRef, "accountRef");
+      if (!isRunModeValue(environment)) throw new FencingLeaseInputError("environment");
+      const realm = executionRealm(environment);
+      const row = await withMappedErrors(async () =>
+        db
+          .selectFrom("ops.fencing_leases")
+          .select(["fencing_lease_id", "fencing_token", "account_ref", "environment", "holder_id", "heartbeat_id", "expires_at"])
+          .where("account_ref", "=", account)
+          .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
+          .where("status", "=", "ACTIVE")
+          .where("expires_at", ">", sql<string>`clock_timestamp()`)
+          .executeTakeFirst(),
+      );
+      if (row === undefined) return null;
+      return Object.freeze({
+        fencingLeaseId: row.fencing_lease_id,
+        fencingToken: row.fencing_token,
+        accountRef: row.account_ref,
+        environment: row.environment,
+        holderId: row.holder_id,
+        heartbeatId: row.heartbeat_id,
+        expiresAt: row.expires_at,
+      });
+    },
+  };
+}
