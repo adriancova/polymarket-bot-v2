@@ -113,6 +113,14 @@ export interface PolymarketFeedDriverOptions {
   readonly snapshotFetcher: PublicBookSnapshotFetcher;
   /** Delay before re-attempting a failed snapshot fetch. */
   readonly snapshotRetryDelayMs?: number;
+  /**
+   * `ROLLOVER-1`: told the internal market id of every `MarketResolved` this
+   * driver dispatches, so the series-admission feed can tear a resolved
+   * window down (ADR-030 Decision 4.4). It only RECORDS the fact: the
+   * teardown runs on the admission feed's own cycle, never inside a socket
+   * callback.
+   */
+  readonly onMarketResolved?: (internalMarketId: string) => void;
 }
 
 export interface PolymarketFeedDriverMetrics {
@@ -282,6 +290,7 @@ export class PolymarketFeedDriver {
       receipt,
       ...(raw !== undefined && raw.recorded ? { rawFrameIngestSeq: raw.ingestSeq } : {}),
     };
+    if (event.eventType === "MarketResolved") this.#noteResolved(event.payload);
     if (isMarketData && this.#frame !== undefined) {
       // One of the socket message's own events: dispatched with its frame.
       this.#frame.push({ draft, context });
@@ -317,6 +326,14 @@ export class PolymarketFeedDriver {
       // Recovery keys off the feed's own gap state, never off the event alone.
       this.#scheduleRecovery();
     }
+  }
+
+  /** `ROLLOVER-1`: hands a dispatched resolution's market id to the admission feed. */
+  #noteResolved(payload: unknown): void {
+    if (this.#options.onMarketResolved === undefined) return;
+    if (typeof payload !== "object" || payload === null || !Object.hasOwn(payload, "internalMarketId")) return;
+    const id = (payload as Record<string, unknown>)["internalMarketId"];
+    if (typeof id === "string") this.#options.onMarketResolved(id);
   }
 
   /** The feed's `onProblem` handler. */

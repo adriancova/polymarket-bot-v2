@@ -9,9 +9,12 @@
  *   subscription (U-CB-4) are both undocumented; the plan carries whatever
  *   configuration states and leaves chunking to the adapters' own documented
  *   knobs.
- * - It performs no discovery. Markets come from reviewed configuration
- *   (§9.2), and the token set is derived from them — both outcome tokens per
- *   market, which §9.2 requires the catalogue to store.
+ * - It performs no discovery outside reviewed series. Markets come from
+ *   reviewed configuration (§9.2), or are admitted windows of a reviewed
+ *   series (ADR-030 Decision 1; `feeds/series-admission.ts`, which subscribes
+ *   each admitted window's tokens itself, at run time), and the token set is
+ *   derived from them — both outcome tokens per market, which §9.2 requires
+ *   the catalogue to store.
  */
 
 import type { BinanceStreamSubscription } from "@polymarket-bot/binance-adapter";

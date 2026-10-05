@@ -43,7 +43,9 @@ import {
 import { RtdsTwapFeed, RTDS_WEBSOCKET_URL } from "@polymarket-bot/polymarket-public/rtds";
 import type { WalFileSystem, WalWriterMetrics } from "@polymarket-bot/storage-wal";
 
+import { AdmissionLedger, type AdmissionLedgerRecord } from "./admission-ledger.js";
 import type { GatewayConfig } from "./config.js";
+import { reviewedSeriesOf } from "./config.js";
 import { ConnectionIdFactory } from "./connection-ids.js";
 import { UniverseMarketDirectory, type UniverseDirectoryMetrics } from "./directory.js";
 import type { DispatcherMetrics, DispatcherObserver } from "./dispatcher.js";
@@ -60,6 +62,8 @@ import type { PolymarketFeedDriverMetrics } from "./feeds/polymarket.js";
 import { PolymarketFeedDriver } from "./feeds/polymarket.js";
 import type { RtdsFeedDriverMetrics } from "./feeds/rtds.js";
 import { RtdsFeedDriver } from "./feeds/rtds.js";
+import type { SeriesAdmissionDriverMetrics } from "./feeds/series-admission.js";
+import { SeriesAdmissionFeedDriver } from "./feeds/series-admission.js";
 import type { IncidentRegistryMetrics } from "./incidents.js";
 import { IncidentRegistry } from "./incidents.js";
 import { GatewayJournal } from "./journal.js";
@@ -82,6 +86,7 @@ import { GatewayPublisher } from "./publisher.js";
 import { IngestSequencer } from "./sequencer.js";
 import type { SubscriptionPlan } from "./subscription-plan.js";
 import { planSubscriptions } from "./subscription-plan.js";
+import { windowInternalMarketId, type ReviewedSeries } from "@polymarket-bot/universe";
 
 /** Operational visibility, independent of the transport being reachable. */
 export interface GatewayObserver extends DispatcherObserver {
@@ -150,6 +155,13 @@ export interface GatewayPorts {
   readonly binanceSocketFactory?: BinanceSocketFactory;
   readonly coinbaseSocketFactory?: CoinbaseSocketFactory;
   readonly observer?: GatewayObserver;
+  /**
+   * `ROLLOVER-1` (ADR-030 Decision 2.1): the process's run mode, read from its
+   * environment by the composition root (`main.ts`). Consulted ONLY by the
+   * series-admission feed, which refuses to start unless it is `PAPER` or
+   * `BACKTEST`; an absent value is refused too.
+   */
+  readonly runMode?: string;
 }
 
 /**
@@ -181,6 +193,8 @@ export interface GatewayMetrics {
   readonly coinbase: CoinbaseFeedDriverMetrics | undefined;
   /** The market lifecycle feed (`UNIV-4`), when configured. */
   readonly lifecycle: MarketLifecycleDriverMetrics | undefined;
+  /** The series-admission feed (`ROLLOVER-1`), when configured. */
+  readonly seriesAdmission: SeriesAdmissionDriverMetrics | undefined;
 }
 
 type GatewayState = "created" | "running" | "stopped";
@@ -195,8 +209,10 @@ export class DataGateway {
   readonly #plan: SubscriptionPlan;
   readonly #directory: UniverseMarketDirectory | undefined;
   readonly #lifecycleLedger: LifecycleLedger | undefined;
+  readonly #admissionLedger: AdmissionLedger | undefined;
 
   #lifecycleDriver: MarketLifecycleFeedDriver | undefined;
+  #admissionDriver: SeriesAdmissionFeedDriver | undefined;
   #polymarketFeed: PublicMarketFeed | undefined;
   #polymarketDriver: PolymarketFeedDriver | undefined;
   #rtdsFeed: RtdsTwapFeed | undefined;
@@ -225,6 +241,7 @@ export class DataGateway {
     plan: SubscriptionPlan;
     directory: UniverseMarketDirectory | undefined;
     lifecycleLedger: LifecycleLedger | undefined;
+    admissionLedger: AdmissionLedger | undefined;
   }) {
     this.#config = args.config;
     this.#ports = args.ports;
@@ -235,6 +252,7 @@ export class DataGateway {
     this.#plan = args.plan;
     this.#directory = args.directory;
     this.#lifecycleLedger = args.lifecycleLedger;
+    this.#admissionLedger = args.admissionLedger;
     this.#buildFeeds();
   }
 
@@ -401,6 +419,16 @@ export class DataGateway {
               walRootPath: config.wal.rootPath,
             });
 
+      // `ROLLOVER-1`: the admission ledger is read before any feed is built,
+      // so the live windows are re-registered and re-attached at start.
+      const admissionLedger =
+        config.seriesAdmission === undefined
+          ? undefined
+          : await AdmissionLedger.open({
+              fileSystem: ports.walFileSystem,
+              walRootPath: config.wal.rootPath,
+            });
+
       return new DataGateway({
         config,
         ports,
@@ -411,6 +439,7 @@ export class DataGateway {
         plan: planSubscriptions(config),
         directory,
         lifecycleLedger,
+        admissionLedger,
       });
     } catch (error) {
       const cancelDeadline = options.cleanupDeadline?.arm();
@@ -462,6 +491,11 @@ export class DataGateway {
         clock: ports.clock,
         timers: ports.timers,
         snapshotFetcher: fetcher,
+        // `ROLLOVER-1`: a dispatched resolution lets the admission feed tear
+        // the window down on its next cycle (ADR-030 Decision 4.4).
+        onMarketResolved: (internalMarketId) => {
+          this.#admissionDriver?.noteResolved(internalMarketId);
+        },
       });
       const connectionIds = new ConnectionIdFactory(feedConfig.feedId);
       const feed = new PublicMarketFeed(
@@ -537,7 +571,18 @@ export class DataGateway {
         clock: ports.clock,
         timers: ports.timers,
         ledger: this.#lifecycleLedger,
+        // `ROLLOVER-1`: an admitted window's record is never "foreign" — its
+        // internal id is the window's derived id, which certifies it.
+        isAdmittedWindowRecord: (record) => {
+          const id = record.internalMarketId;
+          const openMs = Number.parseInt(id.replaceAll("-", "").slice(0, 12), 16);
+          return Number.isSafeInteger(openMs) && windowInternalMarketId(record.conditionId, openMs) === id;
+        },
       });
+    }
+
+    if (config.seriesAdmission !== undefined) {
+      this.#buildSeriesAdmission(config.seriesAdmission);
     }
 
     if (config.rtds !== undefined) {
@@ -682,6 +727,101 @@ export class DataGateway {
     }
   }
 
+  /**
+   * `ROLLOVER-1`: the series-admission feed, bound to the directory, the market
+   * feed and the lifecycle feed it attaches admitted windows to. Its
+   * constructor refuses a run mode other than PAPER/BACKTEST, which fails
+   * `create()` transactionally (ADR-030 Decision 2.1).
+   */
+  #buildSeriesAdmission(block: NonNullable<GatewayConfig["seriesAdmission"]>): void {
+    const ports = this.#ports;
+    if (ports.polymarketHttpClient === undefined) {
+      throw new GatewayStateError("the series-admission feed is configured but the Polymarket HTTP client port is missing");
+    }
+    const directory = this.#directory;
+    const ledger = this.#admissionLedger;
+    if (directory === undefined || ledger === undefined || this.#lifecycleDriver === undefined) {
+      throw new GatewayStateError("the series-admission feed requires the directory, its ledger and the lifecycle feed");
+    }
+    const series = reviewedSeriesOf(this.#config);
+    for (const entry of series) this.#admittedSeries.set(entry.series.seriesId, entry.series);
+    this.#admissionDriver = new SeriesAdmissionFeedDriver({
+      feedId: block.feedId,
+      gammaBaseUrl: block.gammaBaseUrl,
+      clobBaseUrl: block.clobBaseUrl,
+      pollIntervalMs: block.pollIntervalMs,
+      consecutiveFailureThreshold: block.consecutiveFailureThreshold,
+      pageLimit: block.pageLimit,
+      maximumPages: block.maximumPages,
+      admissionLeadSeconds: block.admissionLeadSeconds,
+      series,
+      runMode: ports.runMode,
+      http: ports.polymarketHttpClient,
+      journal: this.#journal,
+      dispatcher: this.#dispatcher,
+      clock: ports.clock,
+      timers: ports.timers,
+      ledger,
+      windows: {
+        knows: (conditionId, tokenIds) => directory.knowsMarket(conditionId, tokenIds),
+        register: (window) => directory.registerAdmittedWindow(window),
+        attach: (record) => {
+          this.#attachWindow(record);
+        },
+        detach: (record) => {
+          this.#detachWindow(record);
+        },
+        forgetLifecycleRecord: async (internalMarketId) => {
+          await this.#lifecycleLedger?.remove(internalMarketId);
+        },
+      },
+    });
+  }
+
+  /** `ROLLOVER-1`: subscribes an admitted window's tokens and adds it to the lifecycle feed. */
+  #attachWindow(record: AdmissionLedgerRecord): void {
+    const window = record.window;
+    const series = this.#admittedSeries.get(record.seriesId);
+    if (window === undefined || series === undefined) return;
+    this.#lifecycleDriver?.addMarket({
+      internalMarketId: window.internalMarketId,
+      conditionId: window.conditionId,
+      yesTokenId: window.yesTokenId,
+      noTokenId: window.noTokenId,
+      seriesId: record.seriesId,
+      gammaMarketId: window.gammaMarketId,
+      parameters: {
+        tickSize: window.tickSize,
+        minimumOrderSize: series.parameters.minimumOrderSize,
+        negRisk: series.parameters.negRisk,
+        tradingDelaySeconds: series.parameters.catalogTradingDelaySeconds,
+        status: "DISCOVERED",
+        openTime: window.scheduledOpenAt,
+        closeTime: window.scheduledCloseAt,
+      },
+      observedAt: record.judgedAt,
+    });
+    // Before `start()` the feed records the desired set only; after it, a
+    // documented dynamic `subscribe` frame is sent and its gap is recovered
+    // with an authoritative snapshot (`feeds/polymarket.ts`).
+    if (this.#state === "running") this.#polymarketFeed?.subscribe([window.yesTokenId, window.noTokenId]);
+    else this.#pendingWindowTokens.push(window.yesTokenId, window.noTokenId);
+  }
+
+  /** `ROLLOVER-1`: tears an admitted window down in this process (module header of `feeds/series-admission.ts`). */
+  #detachWindow(record: AdmissionLedgerRecord): void {
+    const window = record.window;
+    if (window === undefined) return;
+    if (this.#state === "running") this.#polymarketFeed?.unsubscribe([window.yesTokenId, window.noTokenId]);
+    this.#lifecycleDriver?.removeMarket(window.internalMarketId);
+    this.#directory?.releaseAdmittedWindow(window.internalMarketId);
+  }
+
+  /** `ROLLOVER-1`: admitted windows' tokens attached before `start()`, subscribed with the plan. */
+  readonly #pendingWindowTokens: string[] = [];
+  /** `ROLLOVER-1`: the reviewed series, by id (the admission feed's configuration). */
+  readonly #admittedSeries = new Map<string, ReviewedSeries>();
+
   get gatewayEpoch(): string {
     return this.#sequencer.gatewayEpoch;
   }
@@ -749,14 +889,22 @@ export class DataGateway {
           detail: `${String(this.#config.markets.length)} Polymarket market(s) are configured but no \`polymarket\` feed is: the gateway subscribes to no order book, so no BookSnapshot/BookLevelChanged is ever produced and a consumer that needs a book computes no feature snapshot — configure the \`polymarket\` block (for example {"feedId": "polymarket-market"}) to record books`,
         });
       }
+      // `ROLLOVER-1`: the live, CONFIRMED admitted windows are re-attached
+      // first, so their tokens join the initial subscription and the lifecycle
+      // feed polls them from its first cycle.
+      for (const record of this.#admissionDriver?.confirmedLiveWindows() ?? []) {
+        this.#attachWindow(record);
+      }
       if (this.#polymarketFeed !== undefined) {
-        this.#polymarketFeed.subscribe(this.#plan.polymarketTokenIds);
+        this.#polymarketFeed.subscribe([...this.#plan.polymarketTokenIds, ...this.#pendingWindowTokens]);
+        this.#pendingWindowTokens.length = 0;
         this.#polymarketFeed.start();
       }
       this.#rtdsFeed?.start();
       this.#binanceDriver?.start();
       this.#coinbaseManager?.start();
       this.#lifecycleDriver?.start();
+      this.#admissionDriver?.start();
       this.#scheduleTick();
     } catch (error) {
       // A start that throws must not leave a referenced handle behind: the
@@ -790,6 +938,7 @@ export class DataGateway {
   async settle(): Promise<void> {
     // An in-flight lifecycle poll may still journal and dispatch; it settles
     // first so the publisher and journal settles below see its work.
+    await this.#admissionDriver?.settle();
     await this.#lifecycleDriver?.settle();
     await this.#publisher.settle();
     await this.#journal.settle();
@@ -865,6 +1014,7 @@ export class DataGateway {
       attempt("binance-driver", () => this.#binanceDriver?.stop());
       attempt("coinbase-manager", () => this.#coinbaseManager?.stop());
       attempt("lifecycle-driver", () => this.#lifecycleDriver?.stop());
+      attempt("series-admission-driver", () => this.#admissionDriver?.stop());
       // Round 6 (M-1): the awaited disposals span exactly TWO independent
       // resource families, and BOTH are initiated here before anything is
       // awaited, so a never-settling disposal in one family cannot prevent
@@ -890,6 +1040,9 @@ export class DataGateway {
       // filesystem, no ordering with the transport); they settle before the
       // journal closes so a lifecycle fact emitted this epoch is on disk.
       const walFamily = (async () => {
+        await attemptAsync("series-admission-ledger", async () => {
+          await this.#admissionDriver?.settle();
+        });
         await attemptAsync("lifecycle-ledger", async () => {
           await this.#lifecycleDriver?.settle();
         });
@@ -929,6 +1082,7 @@ export class DataGateway {
       binance: this.#binanceDriver?.metrics(),
       coinbase: this.#coinbaseDriver?.metrics(),
       lifecycle: this.#lifecycleDriver?.metrics(),
+      seriesAdmission: this.#admissionDriver?.metrics(),
     };
   }
 }

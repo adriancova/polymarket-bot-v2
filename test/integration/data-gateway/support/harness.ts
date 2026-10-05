@@ -114,10 +114,18 @@ export interface HarnessOptions {
   readonly idSeed?: number;
   /** Share a WAL filesystem across two harnesses, to model a restart on disk. */
   readonly walFileSystem?: MemoryFileSystem;
+  /**
+   * `ROLLOVER-1`: the process run mode the gateway is handed (`GatewayPorts.runMode`).
+   * Defaults to `PAPER`; the series-admission feed refuses any other but
+   * `BACKTEST`. `null` hands it no run mode at all.
+   */
+  readonly runMode?: string | null;
+  /** `ROLLOVER-1`: the manual clock's start (epoch ms); defaults to the clock's own. */
+  readonly clockStartMs?: number;
 }
 
 export async function buildHarness(options: HarnessOptions = {}): Promise<Harness> {
-  const clock = new ManualGatewayClock();
+  const clock = new ManualGatewayClock(options.clockStartMs);
   const timers = new ManualGatewayTimers(clock);
   const transport = new MemoryEventTransport();
   const walFileSystem = options.walFileSystem ?? createMemoryFileSystem();
@@ -168,6 +176,7 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     rtdsSocketFactory: rtdsSockets.factory,
     binanceSocketFactory: binanceSockets.factory,
     coinbaseSocketFactory: coinbaseSockets,
+    ...(options.runMode === null ? {} : { runMode: options.runMode ?? "PAPER" }),
     observer: {
       onIncident: (incident) => {
         incidents.push(incident);

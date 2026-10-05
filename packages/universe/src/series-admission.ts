@@ -194,6 +194,14 @@ export const ReviewedSeriesSchema = z.strictObject({
   }),
   /** The cap on concurrently admitted windows (ADR-030 Decision 1.8). */
   maximumConcurrentWindows: z.number().int().min(1).max(64),
+  /**
+   * How long after its scheduled close a window whose resolution never arrived
+   * is torn down anyway (ADR-030 Decision 4.4 tears a window down "after its
+   * resolution is handled"; resolution is observed 53 to 152 s after the
+   * close, F-17, so this bound only ends a window the venue never resolved).
+   * One reviewed value, so the gateway and every trader agree on it.
+   */
+  unresolvedTeardownSeconds: z.number().int().min(300).max(7 * 86_400),
 });
 
 export type ReviewedSeries = z.infer<typeof ReviewedSeriesSchema>;

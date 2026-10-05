@@ -95,6 +95,7 @@ export function reviewedBtc15mSeriesDocument(): Record<string, unknown> {
       resolutionWindowKey: "btc-15m-window",
     },
     maximumConcurrentWindows: 2,
+    unresolvedTeardownSeconds: 3600,
   };
 }
 

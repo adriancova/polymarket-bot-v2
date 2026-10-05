@@ -36,6 +36,7 @@
 
 import { IsoTimestampSchema } from "@polymarket-bot/domain";
 import { DEFAULT_FSYNC_INTERVAL_MS } from "@polymarket-bot/storage-wal";
+import { parseReviewedSeries, type ReviewedSeries } from "@polymarket-bot/universe";
 import { z } from "zod";
 
 import {
@@ -79,6 +80,11 @@ const DEFAULT_COINBASE_RECONNECT_LOOP_ESCALATION = 5;
 const DEFAULT_LIFECYCLE_FEED_ID = "polymarket-lifecycle";
 const DEFAULT_LIFECYCLE_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_LIFECYCLE_FAILURE_ESCALATION = 3;
+const DEFAULT_SERIES_ADMISSION_FEED_ID = "polymarket-series-admission";
+const DEFAULT_SERIES_ADMISSION_POLL_INTERVAL_MS = 30_000;
+const DEFAULT_SERIES_ADMISSION_FAILURE_ESCALATION = 3;
+const DEFAULT_SERIES_ADMISSION_PAGE_LIMIT = 20;
+const DEFAULT_SERIES_ADMISSION_MAXIMUM_PAGES = 3;
 
 /**
  * The market lifecycle feed's request budget (`UNIV-4`), as a configuration
@@ -114,6 +120,23 @@ export const LIFECYCLE_MAX_BUDGET_SHARE_PERCENT = 5;
  * spends a shared IP budget.
  */
 export const MIN_LIFECYCLE_POLL_INTERVAL_MS = 1_000;
+
+/**
+ * The series-admission feed's request budget (`ROLLOVER-1`), as a
+ * configuration snapshot with its source (handoff §9.13): the venue's published
+ * limit for Gamma `/events` is **500 requests / 10 s** and the CLOB's general
+ * limit **9,000 / 10 s** (`docs/venue/verified-2026-10-04.md` "Method", S-D24
+ * lines 33-36 and 78, re-fetched 2026-10-04). `GET /events/keyset` is under
+ * `/events`. The feed may use at most {@link SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT}
+ * of each, the lifecycle feed's share: per series, at most `maximumPages`
+ * keyset reads and at most `maximumConcurrentWindows` CLOB reads per cycle.
+ */
+export const GAMMA_EVENTS_RATE_LIMIT_PER_10S = 500;
+export const CLOB_GENERAL_RATE_LIMIT_PER_10S = 9_000;
+export const SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT = 5;
+
+/** Floor on the series-admission cadence: 5 s (a window opens every 15 minutes). */
+export const MIN_SERIES_ADMISSION_POLL_INTERVAL_MS = 5_000;
 
 const FeedIdSchema = z
   .string()
@@ -309,6 +332,35 @@ export const LifecycleFeedConfigSchema = z.strictObject({
  * that exist only in the WAL; crossing either one is a terminal publication
  * halt with a PAGE incident, never a drop.
  */
+/**
+ * The SERIES-ADMISSION feed (`ROLLOVER-1`; ADR-030): in PAPER and BACKTEST
+ * only, each reviewed series admits every new window that matches it exactly.
+ * See `feeds/series-admission.ts` for the cycle, the venue surfaces and the
+ * judge. Each `series` entry is a reviewed series document, parsed by
+ * `@polymarket-bot/universe`'s own door at startup (`checkSeriesAdmission`).
+ */
+export const SeriesAdmissionFeedConfigSchema = z.strictObject({
+  feedId: FeedIdSchema.default(DEFAULT_SERIES_ADMISSION_FEED_ID),
+  /** Defaults to the documented Gamma origin. Overridable for a local stub. */
+  gammaBaseUrl: z.string().min(1).optional(),
+  /** Defaults to the documented CLOB origin. Overridable for a local stub. */
+  clobBaseUrl: z.string().min(1).optional(),
+  pollIntervalMs: z.number().int().positive().default(DEFAULT_SERIES_ADMISSION_POLL_INTERVAL_MS),
+  consecutiveFailureThreshold: z.number().int().positive().default(DEFAULT_SERIES_ADMISSION_FAILURE_ESCALATION),
+  /** `limit` of one keyset page: 1 to 100 (F-07). */
+  pageLimit: z.number().int().min(1).max(100).default(DEFAULT_SERIES_ADMISSION_PAGE_LIMIT),
+  /** Keyset pages read per series per cycle. */
+  maximumPages: z.number().int().min(1).max(10).default(DEFAULT_SERIES_ADMISSION_MAXIMUM_PAGES),
+  /**
+   * How long before its `eventStartTime` a window is judged and admitted.
+   * REQUIRED: how early a run takes on a window is the operator's choice, not
+   * a default nobody made.
+   */
+  admissionLeadSeconds: z.number().int().min(0).max(86_400),
+  /** The reviewed series, each parsed by the universe door (non-empty, distinct). */
+  series: z.array(z.unknown()).min(1).max(8),
+});
+
 export const PublisherConfigSchema = z.strictObject({
   maxQueueDepth: z.number().int().positive().default(DEFAULT_PUBLISH_QUEUE_MAX_DEPTH),
   maxQueueBytes: z.number().int().positive().default(DEFAULT_PUBLISH_QUEUE_MAX_BYTES),
@@ -347,6 +399,8 @@ export const GatewayConfigSchema = z.strictObject({
   binance: BinanceFeedConfigSchema.optional(),
   coinbase: CoinbaseFeedConfigSchema.optional(),
   lifecycle: LifecycleFeedConfigSchema.optional(),
+  /** `ROLLOVER-1` (ADR-030): series auto-admission, PAPER and BACKTEST only. */
+  seriesAdmission: SeriesAdmissionFeedConfigSchema.optional(),
 });
 export type GatewayConfig = z.infer<typeof GatewayConfigSchema>;
 
@@ -400,6 +454,16 @@ export const DEFAULTED_KEYS: BlockDefaults = new Map<
       ["consecutiveFailureThreshold", DEFAULT_LIFECYCLE_FAILURE_ESCALATION],
     ],
   ],
+  [
+    "seriesAdmission",
+    [
+      ["feedId", DEFAULT_SERIES_ADMISSION_FEED_ID],
+      ["pollIntervalMs", DEFAULT_SERIES_ADMISSION_POLL_INTERVAL_MS],
+      ["consecutiveFailureThreshold", DEFAULT_SERIES_ADMISSION_FAILURE_ESCALATION],
+      ["pageLimit", DEFAULT_SERIES_ADMISSION_PAGE_LIMIT],
+      ["maximumPages", DEFAULT_SERIES_ADMISSION_MAXIMUM_PAGES],
+    ],
+  ],
 ]);
 
 /** Top-level keys with a scalar `.default()`. */
@@ -409,8 +473,9 @@ export const DEFAULTED_ROOT_KEYS: readonly (readonly [string, unknown])[] = [
 
 /**
  * Blocks whose WHOLE object the schema defaults, so they exist even when the
- * operator wrote nothing. `publisher` is the only one: the five feed blocks are
- * `.optional()`, and materializing an absent feed would invent a subscription.
+ * operator wrote nothing. `publisher` is the only one: the feed blocks
+ * (`seriesAdmission` included) are `.optional()`, and materializing an absent
+ * feed would invent a subscription.
  */
 export const DEFAULTED_BLOCKS: readonly string[] = ["publisher"];
 
@@ -454,7 +519,8 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
     config.rtds === undefined &&
     config.binance === undefined &&
     config.coinbase === undefined &&
-    config.lifecycle === undefined
+    config.lifecycle === undefined &&
+    config.seriesAdmission === undefined
   ) {
     throw new GatewayConfigurationError(
       "at least one feed must be configured; a gateway recording nothing is a deployment error",
@@ -474,10 +540,17 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
       },
     );
   }
-  if (config.polymarket !== undefined && config.markets.length === 0) {
+  // ADR-030 ("What it amends", `config.ts`): subscriptions and the universe
+  // directory are configuration, not discovery (§9.2) — except for the admitted
+  // windows of a reviewed series, so a gateway whose markets all come from
+  // series admission may configure none.
+  if (config.polymarket !== undefined && config.markets.length === 0 && config.seriesAdmission === undefined) {
     throw new GatewayConfigurationError(
-      "the Polymarket feed requires at least one configured market: subscriptions and the universe directory are configuration, not discovery (§9.2)",
+      "the Polymarket feed requires at least one configured market or a seriesAdmission block: subscriptions and the universe directory are configuration, not discovery (§9.2), except for the admitted windows of a reviewed series (ADR-030)",
     );
+  }
+  if (config.seriesAdmission !== undefined) {
+    checkSeriesAdmission(config, config.seriesAdmission);
   }
   // Round-1 review M2: the WAL's published `dataLossBoundMs` IS
   // `fsyncIntervalMs`, and nothing but this gateway's tick drives an idle
@@ -504,6 +577,7 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
     config.binance?.feedId,
     config.coinbase?.feedId,
     config.lifecycle?.feedId,
+    config.seriesAdmission?.feedId,
   ].filter((id): id is string => id !== undefined);
   if (new Set(feedIds).size !== feedIds.length) {
     throw new GatewayConfigurationError("feed ids must be distinct", { feedIds });
@@ -544,9 +618,9 @@ function checkLifecycleConfiguration(
   config: GatewayConfig,
   lifecycle: NonNullable<GatewayConfig["lifecycle"]>,
 ): void {
-  if (config.markets.length === 0) {
+  if (config.markets.length === 0 && config.seriesAdmission === undefined) {
     throw new GatewayConfigurationError(
-      "the lifecycle feed requires at least one configured market: subscriptions and the universe directory are configuration, not discovery (§9.2)",
+      "the lifecycle feed requires at least one configured market or a seriesAdmission block: subscriptions and the universe directory are configuration, not discovery (§9.2), except for the admitted windows of a reviewed series (ADR-030)",
     );
   }
   for (const market of config.markets) {
@@ -572,19 +646,114 @@ function checkLifecycleConfiguration(
       { pollIntervalMs: lifecycle.pollIntervalMs, minimumMs: MIN_LIFECYCLE_POLL_INTERVAL_MS },
     );
   }
-  const requestsPer10s = lifecycleRequestsPer10s(config.markets.length, lifecycle.pollIntervalMs);
+  // `ROLLOVER-1`: every admitted window is polled too, up to each reviewed
+  // series' cap, so the budget counts the configured markets PLUS the caps.
+  const polled = config.markets.length + admittedWindowCapacity(config);
+  const requestsPer10s = lifecycleRequestsPer10s(polled, lifecycle.pollIntervalMs);
   const budgetPer10s = lifecycleRequestBudgetPer10s();
   if (requestsPer10s > budgetPer10s) {
     throw new GatewayConfigurationError(
-      `the lifecycle feed would issue ${String(config.markets.length)} markets × (10000 ms / ${String(lifecycle.pollIntervalMs)} ms) = ${String(requestsPer10s)} requests per 10 s, over its budget of ${String(budgetPer10s)} per 10 s (${String(LIFECYCLE_MAX_BUDGET_SHARE_PERCENT)} % of the venue's documented ${String(GAMMA_MARKETS_RATE_LIMIT_PER_10S)} / 10 s for Gamma /markets); raise pollIntervalMs or configure fewer markets`,
+      `the lifecycle feed would issue ${String(polled)} markets × (10000 ms / ${String(lifecycle.pollIntervalMs)} ms) = ${String(requestsPer10s)} requests per 10 s, over its budget of ${String(budgetPer10s)} per 10 s (${String(LIFECYCLE_MAX_BUDGET_SHARE_PERCENT)} % of the venue's documented ${String(GAMMA_MARKETS_RATE_LIMIT_PER_10S)} / 10 s for Gamma /markets); raise pollIntervalMs or configure fewer markets (or lower a series' maximumConcurrentWindows)`,
       {
-        markets: config.markets.length,
+        markets: polled,
+        configuredMarkets: config.markets.length,
         pollIntervalMs: lifecycle.pollIntervalMs,
         requestsPer10s,
         budgetPer10s,
         venueRequestsPer10s: GAMMA_MARKETS_RATE_LIMIT_PER_10S,
         budgetSharePercent: LIFECYCLE_MAX_BUDGET_SHARE_PERCENT,
       },
+    );
+  }
+}
+
+/**
+ * `ROLLOVER-1`: the reviewed series a configuration's `seriesAdmission` block
+ * names, each parsed by `@polymarket-bot/universe`'s own door. Throws on a
+ * series the door refuses (the configuration door already ran
+ * {@link checkSeriesAdmission}, so a parsed configuration never does).
+ */
+export function reviewedSeriesOf(config: GatewayConfig): readonly { readonly series: ReviewedSeries; readonly configHash: string }[] {
+  const block = config.seriesAdmission;
+  if (block === undefined) return [];
+  return block.series.map((document, index) => {
+    const parsed = parseReviewedSeries(document);
+    if (!parsed.ok) {
+      throw new GatewayConfigurationError(`seriesAdmission.series[${String(index)}] is not a reviewed series`, { issues: parsed.issues });
+    }
+    return { series: parsed.series, configHash: parsed.configHash };
+  });
+}
+
+/** How many admitted windows the configuration can hold live at once: the sum of the caps. */
+function admittedWindowCapacity(config: GatewayConfig): number {
+  return reviewedSeriesOf(config).reduce((total, entry) => total + entry.series.maximumConcurrentWindows, 0);
+}
+
+/**
+ * The series-admission feed's own startup checks (`ROLLOVER-1`), each a
+ * configuration defect that fails closed at startup:
+ *
+ * 1. the `polymarket` and `lifecycle` blocks are configured — an admitted
+ *    window is subscribed (books) and opened and closed (lifecycle) through
+ *    them; without either it could never trade;
+ * 2. every series is a reviewed series (the universe door), with distinct
+ *    series ids and distinct Gamma series ids;
+ * 3. the cadence floor {@link MIN_SERIES_ADMISSION_POLL_INTERVAL_MS};
+ * 4. the request budget: `Σ maximumPages × 10 000 / pollIntervalMs` per 10 s
+ *    within {@link SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT} % of Gamma
+ *    `/events`, and `Σ maximumConcurrentWindows × 10 000 / pollIntervalMs`
+ *    within the same share of the CLOB's general limit.
+ *
+ * The RUN MODE is not configuration: the feed refuses to start outside PAPER
+ * and BACKTEST from the process environment (`feeds/series-admission.ts`).
+ */
+function checkSeriesAdmission(
+  config: GatewayConfig,
+  block: NonNullable<GatewayConfig["seriesAdmission"]>,
+): void {
+  if (config.polymarket === undefined || config.lifecycle === undefined) {
+    throw new GatewayConfigurationError(
+      "seriesAdmission requires the polymarket and lifecycle blocks: an admitted window is subscribed through the first and opened and closed through the second (ADR-030 Decision 1.3)",
+      { polymarket: config.polymarket !== undefined, lifecycle: config.lifecycle !== undefined },
+    );
+  }
+  const parsed = block.series.map((document, index) => {
+    const result = parseReviewedSeries(document);
+    if (!result.ok) {
+      throw new GatewayConfigurationError(
+        `seriesAdmission.series[${String(index)}] is not a reviewed series: a window is admitted only against reviewed configuration (ADR-030 Decision 1.1)`,
+        { issues: result.issues },
+      );
+    }
+    return result.series;
+  });
+  const ids = parsed.map((series) => series.seriesId);
+  const gammaIds = parsed.map((series) => series.venue.gammaSeriesId);
+  if (new Set(ids).size !== ids.length || new Set(gammaIds).size !== gammaIds.length) {
+    throw new GatewayConfigurationError("seriesAdmission.series must name each series, and each Gamma series id, once", { ids, gammaIds });
+  }
+  if (block.pollIntervalMs < MIN_SERIES_ADMISSION_POLL_INTERVAL_MS) {
+    throw new GatewayConfigurationError(
+      `seriesAdmission.pollIntervalMs must be at least ${String(MIN_SERIES_ADMISSION_POLL_INTERVAL_MS)} ms`,
+      { pollIntervalMs: block.pollIntervalMs },
+    );
+  }
+  const share = SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT / 100;
+  const gammaPer10s = (parsed.length * block.maximumPages * 10_000) / block.pollIntervalMs;
+  const gammaBudget = GAMMA_EVENTS_RATE_LIMIT_PER_10S * share;
+  if (gammaPer10s > gammaBudget) {
+    throw new GatewayConfigurationError(
+      `seriesAdmission would issue ${String(parsed.length)} series × ${String(block.maximumPages)} pages × (10000 ms / ${String(block.pollIntervalMs)} ms) = ${String(gammaPer10s)} keyset requests per 10 s, over its budget of ${String(gammaBudget)} (${String(SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT)} % of Gamma /events' documented ${String(GAMMA_EVENTS_RATE_LIMIT_PER_10S)} / 10 s); raise pollIntervalMs or lower maximumPages`,
+      { gammaPer10s, gammaBudget },
+    );
+  }
+  const clobPer10s = (parsed.reduce((total, series) => total + series.maximumConcurrentWindows, 0) * 10_000) / block.pollIntervalMs;
+  const clobBudget = CLOB_GENERAL_RATE_LIMIT_PER_10S * share;
+  if (clobPer10s > clobBudget) {
+    throw new GatewayConfigurationError(
+      `seriesAdmission could issue ${String(clobPer10s)} CLOB market-info requests per 10 s, over its budget of ${String(clobBudget)} (${String(SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT)} % of the CLOB's documented ${String(CLOB_GENERAL_RATE_LIMIT_PER_10S)} / 10 s)`,
+      { clobPer10s, clobBudget },
     );
   }
 }
