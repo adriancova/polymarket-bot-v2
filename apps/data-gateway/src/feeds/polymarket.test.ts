@@ -4,6 +4,12 @@
  * end to end (`throughput-1c-frame-loss-first.test.ts`); this file pins its
  * edges with hand-made adapter output: what a throw inside the socket
  * callback, a non-frame event inside it, and an event outside it do.
+ *
+ * `ROLLOVER-1` r4 (R4-FABLE-02(a)): a `MarketResolved` inside a frame is
+ * handed to the admission feed with ITS OWN entry's publication outcome
+ * (`#flushFrame`, `outcomes[index]`), whatever its siblings' outcomes are —
+ * so a refused resolution is never discharged by a published sibling, and a
+ * published one is never held owed by a refused sibling (R3-ASTRA-01's class).
  */
 
 import type {
@@ -21,12 +27,12 @@ import { GatewayPublisher } from "../publisher.js";
 import { IngestSequencer } from "../sequencer.js";
 import { deterministicIdSource, ManualGatewayClock, ManualGatewayTimers } from "../testing/index.js";
 import { MemoryEventTransport } from "../testing/memory-transport.js";
-import { PolymarketFeedDriver } from "./polymarket.js";
+import { PolymarketFeedDriver, type DispatchedResolution } from "./polymarket.js";
 
 const EPOCH = "00000000-0000-4000-8000-0000000000c6";
 const MARKET_ID = "01990000-0000-7000-8000-000000000001";
 
-function build() {
+function build(onMarketResolved?: (resolution: DispatchedResolution) => void) {
   const clock = new ManualGatewayClock();
   const sequencer = new IngestSequencer(EPOCH);
   const transport = new MemoryEventTransport();
@@ -50,6 +56,7 @@ function build() {
     clock,
     timers: new ManualGatewayTimers(clock),
     snapshotFetcher: {} as unknown as PublicBookSnapshotFetcher,
+    ...(onMarketResolved === undefined ? {} : { onMarketResolved }),
   });
   let socketHandlers: PublicWebSocketHandlers | undefined;
   const inner: PublicWebSocketFactory = (_url, handlers) => {
@@ -199,5 +206,60 @@ describe("PolymarketFeedDriver frame bracket (THROUGHPUT-1c r6, R6-H1)", () => {
     expect(dispatcher.metrics().dispatched).toBe(1);
     driver.onEvent(snapshot("2"));
     expect(dispatcher.metrics().dispatched).toBe(2);
+  });
+});
+
+const CONDITION_ID = "0x5e196ca7c84c54fb1482ca206df477bba1fb3d8c813580c3838186cedde32b29";
+
+/** A `MarketResolved` as the adapter derives it; `outcome` "MAYBE" fails its frozen contract. */
+function resolved(outcome: string): NormalizedPublicEventAny {
+  return {
+    eventType: "MarketResolved",
+    schemaVersion: 1,
+    payload: { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, outcome, resolvedAt: "2026-03-04T12:00:00.000Z" },
+    provenance,
+  } as unknown as NormalizedPublicEventAny;
+}
+
+/** A book snapshot whose ask price is not a decimal: it fails its frozen contract. */
+function refusedSnapshot(tokenId: string): NormalizedPublicEventAny {
+  return {
+    eventType: "BookSnapshot",
+    schemaVersion: 1,
+    payload: { internalMarketId: MARKET_ID, tokenId, bids: [], asks: [{ price: "not-a-price", size: "10" }] },
+    provenance,
+  } as unknown as NormalizedPublicEventAny;
+}
+
+describe("ROLLOVER-1 r4 (R4-FABLE-02(a)): each resolution of a frame carries its OWN publication outcome", () => {
+  async function frameOf(events: readonly NormalizedPublicEventAny[]) {
+    const resolutions: DispatchedResolution[] = [];
+    const { driver, transport, publisher, socket } = build((resolution) => resolutions.push(resolution));
+    socket((data) => {
+      driver.onRawFrame(rawFrame(data));
+      for (const event of events) driver.onEvent(event);
+    }).onMessage("[]");
+    await publisher.settle();
+    expect(resolutions).toHaveLength(1);
+    const outcome = await resolutions[0]?.published;
+    return { outcome, published: labels(transport) };
+  }
+
+  it("R4-FABLE-02(a): a REFUSED sibling ahead of a valid resolution — the resolution is reported PUBLISHED (its own outcome, not entry 0's)", async () => {
+    const { outcome, published } = await frameOf([refusedSnapshot("1"), resolved("YES_WIN")]);
+    expect(published).toEqual(["Incident(GATEWAY_ENVELOPE_REJECTED)", "MarketResolved"]);
+    expect(outcome?.published).toBe(true);
+  });
+
+  it("R4-FABLE-02(a): a PUBLISHED sibling ahead of a refused resolution — the resolution is reported NOT published, so it is never discharged", async () => {
+    const { outcome, published } = await frameOf([snapshot("1"), resolved("MAYBE")]);
+    expect(published).toEqual(["Incident(GATEWAY_ENVELOPE_REJECTED)", "BookSnapshot(1)"]);
+    expect(outcome?.published).toBe(false);
+  });
+
+  it("control: a frame of two valid events — the resolution is reported published", async () => {
+    const { outcome, published } = await frameOf([snapshot("1"), resolved("YES_WIN")]);
+    expect(published).toEqual(["BookSnapshot(1)", "MarketResolved"]);
+    expect(outcome?.published).toBe(true);
   });
 });

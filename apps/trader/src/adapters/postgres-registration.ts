@@ -133,6 +133,22 @@
  *   a number to its string is the only way a correct registration can match
  *   at all.
  *
+ * ## A series-bound instance pins its SERIES (`ROLLOVER-1`; the user's ruling Q4)
+ *
+ * ADR-030 Decision 4.2: one run spans many windows, and "the run record pins
+ * the reviewed series through the run's configuration version". So a
+ * series-bound instance's registered `strategy.configs.parameters` is the
+ * DOCUMENT `{ "strategy": <its params>, "series": <its reviewed series> }`
+ * ({@link registeredParametersOf}, written by `REGISTER-1`'s series mode),
+ * and this check compares the configuration's two halves against it, field by
+ * field, with {@link compareRegisteredParameters} — unchanged. A changed review
+ * is a different document, so it refuses the run exactly as a changed strategy
+ * parameter does (§9.6; ADR-030 Decision 4.3). A market-bound instance's
+ * document is its bare params, as before. Every other row check applies to a
+ * series-bound instance as to a market-bound one; there is no `catalog.markets`
+ * row to check for it at startup — its windows' rows are written as each is
+ * admitted (`postgres-store.ts` `registerAdmittedMarket`).
+ *
  * ## A run that already has decisions is REFUSED (`BOOT-1` r1, review R1)
  *
  * `status = 'RUNNING'` is not "accepts decisions". A run that persisted
@@ -178,6 +194,45 @@
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
 
 import { PAPER_EVALUATION_CADENCE, type TraderConfig } from "@polymarket-bot/trading-core";
+
+/** One instance of either kind, with the document its registered config must hold. */
+interface RegisteredInstanceView {
+  readonly instanceId: string;
+  readonly runId: string;
+  readonly configId: string;
+  readonly runSeed: string;
+  /** What `strategy.configs.parameters` must hold ({@link registeredParametersOf}). */
+  readonly registered: unknown;
+}
+
+/**
+ * `ROLLOVER-1` (the user's ruling Q4): the document an instance's registered
+ * `strategy.configs.parameters` must hold. A market-bound instance: its params,
+ * as before. A series-bound instance: `{ strategy: <its params>, series: <the
+ * reviewed series it names> }` — the run record's pin of the series (ADR-030
+ * Decision 4.2). `undefined` for an instance id the configuration does not
+ * name, or a series it does not review. TOTAL and pure.
+ */
+export function registeredParametersOf(config: TraderConfig, instanceId: string): unknown {
+  const marketBound = config.instances.find((instance) => instance.instanceId === instanceId);
+  if (marketBound !== undefined) return marketBound.params;
+  const seriesBound = (config.seriesInstances ?? []).find((instance) => instance.instanceId === instanceId);
+  if (seriesBound === undefined) return undefined;
+  const series = (config.series ?? []).find((entry) => entry.seriesId === seriesBound.seriesId);
+  if (series === undefined) return undefined;
+  return { strategy: seriesBound.params, series };
+}
+
+/** Every instance the configuration names, market-bound first, with its registered document. */
+function instancesOf(config: TraderConfig): readonly RegisteredInstanceView[] {
+  return [...config.instances, ...(config.seriesInstances ?? [])].map((instance) => ({
+    instanceId: instance.instanceId,
+    runId: instance.runId,
+    configId: instance.configId,
+    runSeed: instance.runSeed,
+    registered: registeredParametersOf(config, instance.instanceId),
+  }));
+}
 
 export interface RegistrationRefusal {
   readonly code:
@@ -238,11 +293,15 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
 
   // --- catalog.markets --------------------------------------------------------
   const marketIds = config.markets.map((market) => market.marketId);
-  const marketRows = await db
-    .selectFrom("catalog.markets")
-    .select(["market_id", "condition_id"])
-    .where("market_id", "in", marketIds)
-    .execute();
+  // `ROLLOVER-1`: a series-only configuration names no market; `in ()` is not SQL.
+  const marketRows =
+    marketIds.length === 0
+      ? []
+      : await db
+          .selectFrom("catalog.markets")
+          .select(["market_id", "condition_id"])
+          .where("market_id", "in", marketIds)
+          .execute();
   const marketsById = new Map(marketRows.map((row) => [row.market_id, row]));
   for (const market of config.markets) {
     const row = marketsById.get(market.marketId);
@@ -259,15 +318,18 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
     }
   }
 
+  // `ROLLOVER-1`: market-bound AND series-bound instances, checked alike.
+  const instances = instancesOf(config);
+
   // --- strategy.instances -----------------------------------------------------
-  const instanceIds = config.instances.map((instance) => instance.instanceId);
+  const instanceIds = instances.map((instance) => instance.instanceId);
   const instanceRows = await db
     .selectFrom("strategy.instances")
     .select(["instance_id", "environment", "account_ref"])
     .where("instance_id", "in", instanceIds)
     .execute();
   const instancesById = new Map(instanceRows.map((row) => [row.instance_id, row]));
-  for (const instance of config.instances) {
+  for (const instance of instances) {
     const row = instancesById.get(instance.instanceId);
     if (row === undefined) {
       missing.push(`strategy.instances: no row with instance_id ${instance.instanceId}`);
@@ -290,7 +352,7 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
   }
 
   // --- strategy.runs ----------------------------------------------------------
-  const runIds = config.instances.map((instance) => instance.runId);
+  const runIds = instances.map((instance) => instance.runId);
   const runRows = await db
     .selectFrom("strategy.runs")
     .select([
@@ -306,7 +368,7 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
     .where("run_id", "in", runIds)
     .execute();
   const runsById = new Map(runRows.map((row) => [row.run_id, row]));
-  for (const instance of config.instances) {
+  for (const instance of instances) {
     const row = runsById.get(instance.runId);
     if (row === undefined) {
       missing.push(`strategy.runs: no row with run_id ${instance.runId}`);
@@ -359,20 +421,23 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
   }
 
   // --- strategy.configs: the run's pinned parameters (OUTAGE-1) -------------
-  const configIds = [...new Set(config.instances.map((instance) => instance.configId))];
+  const configIds = [...new Set(instances.map((instance) => instance.configId))];
   const configRows = await db
     .selectFrom("strategy.configs")
     .select(["config_id", "parameters"])
     .where("config_id", "in", configIds)
     .execute();
   const configsById = new Map(configRows.map((row) => [row.config_id, row]));
-  for (const instance of config.instances) {
+  for (const instance of instances) {
     const row = configsById.get(instance.configId);
     if (row === undefined) {
       missing.push(`strategy.configs: no row with config_id ${instance.configId}`);
       continue;
     }
-    const differences = compareRegisteredParameters(row.parameters, instance.params);
+    // `ROLLOVER-1` (ruling Q4): a series-bound instance's document is
+    // `{ strategy, series }`, so a changed review refuses the run as a changed
+    // parameter does.
+    const differences = compareRegisteredParameters(row.parameters, instance.registered);
     if (differences.length === 0) continue;
     const shown = differences.slice(0, MAX_REPORTED_PARAMETER_DIFFERENCES);
     const more = differences.length - shown.length;
@@ -398,7 +463,7 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
       .where("run_id", "in", existingRunIds)
       .execute();
     const decidedRunIds = new Set(decided.map((row) => row.run_id));
-    for (const instance of config.instances) {
+    for (const instance of instances) {
       if (!decidedRunIds.has(instance.runId)) continue;
       notResumable.push(
         `strategy.runs ${instance.runId}: the run already holds persisted decisions, and this ` +

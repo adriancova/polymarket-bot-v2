@@ -235,7 +235,17 @@ export type RuntimeCreationRefusalCode =
   /** `CKPT-1`: see `CheckpointRefusalCode` in `checkpoint.ts`. */
   | "RESTORE_POINT_INVALID"
   | "RESTORE_SEQ_INVALID"
-  | "RESTORE_INSTANT_INVALID";
+  | "RESTORE_INSTANT_INVALID"
+  /**
+   * `ROLLOVER-1` (`sequence.ts`): `sequence` is not a run evaluation sequence
+   * this package minted.
+   */
+  | "SEQUENCE_SOURCE_INVALID"
+  /**
+   * `ROLLOVER-1`: the run's evaluation sequence would issue a number at or
+   * below the restore point's highest durable sequence.
+   */
+  | "SEQUENCE_SOURCE_BEHIND";
 
 export interface RuntimeCreationRefusal {
   readonly code: RuntimeCreationRefusalCode;

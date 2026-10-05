@@ -27,7 +27,13 @@ export type PolymarketPublicErrorCode =
   /** A Gamma `GET /markets/{id}` read failed at the transport or HTTP-status level (`UNIV-4`). */
   | "PUBLIC_MARKET_STATE_UNAVAILABLE"
   /** A Gamma `GET /markets/{id}` body did not match the documented `Market` shape (`UNIV-4`). */
-  | "PUBLIC_MARKET_STATE_INVALID";
+  | "PUBLIC_MARKET_STATE_INVALID"
+  /**
+   * A series-window read — Gamma `GET /events/keyset` or CLOB
+   * `GET /clob-markets/{condition_id}` — failed at the transport level
+   * (`ROLLOVER-1`).
+   */
+  | "PUBLIC_SERIES_WINDOW_UNAVAILABLE";
 
 export type PolymarketPublicErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -136,5 +142,25 @@ export class GammaMarketStateUnavailableError extends PolymarketPublicError {
 export class GammaMarketStateInvalidError extends PolymarketPublicError {
   constructor(message: string, details: PolymarketPublicErrorDetails = {}) {
     super("PUBLIC_MARKET_STATE_INVALID", message, details);
+  }
+}
+
+/**
+ * A series-window read failed at the transport level (`ROLLOVER-1`). Like a
+ * failed market-state poll it is NOT an observation: the gateway journals
+ * nothing it did not receive, derives nothing, and reports the failure.
+ */
+export class SeriesWindowUnavailableError extends PolymarketPublicError {
+  constructor(
+    message: string,
+    details: PolymarketPublicErrorDetails = {},
+    cause?: unknown,
+  ) {
+    super(
+      "PUBLIC_SERIES_WINDOW_UNAVAILABLE",
+      message,
+      details,
+      cause === undefined ? {} : { cause },
+    );
   }
 }

@@ -71,7 +71,13 @@ import { pathToFileURL } from "node:url";
 import { StoragePostgresError, mapPostgresError } from "@polymarket-bot/storage-postgres";
 import { checkPaperTraderSafety, formatStrictUtc, normalizeToStrictUtc } from "@polymarket-bot/trading-core";
 
-import { asksForHelp, parseRegisterArguments, REGISTRABLE_LIFECYCLE_STATES, type RegisterArguments } from "./arguments.js";
+import {
+  asksForHelp,
+  parseRegisterArguments,
+  REGISTRABLE_LIFECYCLE_STATES,
+  type RegisterArguments,
+  type SeriesRegisterArguments,
+} from "./arguments.js";
 import { OneTransactionViolation, openOneTransaction, type OneTransaction } from "./one-transaction.js";
 import {
   registerRows,
@@ -79,7 +85,16 @@ import {
   type RegisteredIdentities,
   type RegistrationPlan,
 } from "./registration.js";
-import { completeDocument, dryAssemble, readTemplate, type Template, type TemplateRefusal } from "./template.js";
+import {
+  completeDocument,
+  completeSeriesDocument,
+  dryAssemble,
+  readSeriesTemplate,
+  readTemplate,
+  type SeriesTemplate,
+  type Template,
+  type TemplateRefusal,
+} from "./template.js";
 
 /** What the command exits with (`sysexits` values), so an operator can script against it. */
 export const REGISTER_EXIT_CODES = Object.freeze({
@@ -119,6 +134,8 @@ export const USAGE = `usage: register --template <file> --out <file>
                 --lifecycle-state <${REGISTRABLE_LIFECYCLE_STATES.join("|")}>
                 --yes-label <label> --no-label <label>
                 --code-commit <commit> --created-by <who>
+       register --series --template <file> --out <file>
+                --instance-name <name> --code-commit <commit> --created-by <who>
        register --help
        (pnpm --filter @polymarket-bot/trader run register -- <flags>; one
        leading "--" is ignored)
@@ -193,6 +210,15 @@ What it registers:
                          evaluationPriority.
   strategy.runs          NEW: PAPER, RUNNING, the document's runSeed, the
                          code commit.
+
+With --series (ROLLOVER-1, ADR-030): registers ONE SERIES-BOUND instance and
+its run, and NO market — the series' windows are registered as each is
+admitted. The template has no markets and no instances, and exactly one
+seriesInstances entry with instanceId, runId and configId absent, plus the
+reviewed series it names. strategy.configs.parameters is the document
+{"strategy": <its params>, "series": <the reviewed series>}: the run record's
+pin of the series, which the trader compares at every start. The six market
+flags are refused with --series.
 
 Running it again is REFUSED: a registered conditionId, token id or PAPER
 instance name is a duplicate, and nothing is written (exit 78). A new run for
@@ -308,16 +334,41 @@ async function run(ports: RegisterPorts): Promise<number> {
     );
     return REGISTER_EXIT_CODES.refused;
   }
-  const read = readTemplate(text, ports.env, ports.nowMs);
-  if (!read.ok) return refusedTemplate(log, read.refusal);
-  const template = read.template;
-  const plan = planFor(template, args, formatStrictUtc(ports.nowMs()));
-  if (!plan.ok) return refusedTemplate(log, plan.refusal);
-  log(
-    `template: OK — ${args.template}: condition ${JSON.stringify(plan.plan.market.conditionId)}, ` +
-      `run seed ${plan.plan.run.runSeed}, account ${JSON.stringify(plan.plan.instance.accountRef)}; ` +
-      "the trader's configuration door and its composition root accepted it in memory",
-  );
+  // `ROLLOVER-1`: `--series` reads a series template and registers no market.
+  let complete: (ids: { readonly marketId: string | undefined; readonly instanceId: string; readonly runId: string; readonly configId: string }) => Record<string, unknown>;
+  let plan: ReturnType<typeof planFor>;
+  if (args.series === true) {
+    const read = readSeriesTemplate(text, ports.env, ports.nowMs);
+    if (!read.ok) return refusedTemplate(log, read.refusal);
+    const template = read.template;
+    plan = planForSeries(template, args, formatStrictUtc(ports.nowMs()));
+    complete = (ids) => completeSeriesDocument(template.document, template.instance, ids);
+    if (!plan.ok) return refusedTemplate(log, plan.refusal);
+    log(
+      `template: OK — ${args.template}: series ${JSON.stringify(template.seriesId)} (no market: its windows ` +
+        `are registered as each is admitted), run seed ${plan.plan.run.runSeed}, account ` +
+        `${JSON.stringify(plan.plan.instance.accountRef)}; the trader's configuration door and its ` +
+        "composition root accepted it in memory",
+    );
+  } else {
+    const read = readTemplate(text, ports.env, ports.nowMs);
+    if (!read.ok) return refusedTemplate(log, read.refusal);
+    const template = read.template;
+    plan = planFor(template, args, formatStrictUtc(ports.nowMs()));
+    complete = (ids) =>
+      completeDocument(template.document, template.market, template.instance, {
+        marketId: ids.marketId ?? "",
+        instanceId: ids.instanceId,
+        runId: ids.runId,
+        configId: ids.configId,
+      });
+    if (!plan.ok) return refusedTemplate(log, plan.refusal);
+    log(
+      `template: OK — ${args.template}: condition ${JSON.stringify(plan.plan.market?.conditionId)}, ` +
+        `run seed ${plan.plan.run.runSeed}, account ${JSON.stringify(plan.plan.instance.accountRef)}; ` +
+        "the trader's configuration door and its composition root accepted it in memory",
+    );
+  }
 
   // --- 5. ONE transaction ------------------------------------------------------
   let transaction: OneTransaction;
@@ -346,7 +397,7 @@ async function run(ports: RegisterPorts): Promise<number> {
     const ids = outcome.registered;
 
     // --- 6. the completed document -------------------------------------------
-    const completed = completeDocument(template.document, template.market, template.instance, {
+    const completed = complete({
       marketId: ids.marketId,
       instanceId: ids.instanceId,
       runId: ids.runId,
@@ -378,7 +429,7 @@ async function run(ports: RegisterPorts): Promise<number> {
       return failure.code;
     }
     committed = true;
-    return reportRegistered(ports, ids, out, plan.plan.market.conditionId);
+    return reportRegistered(ports, ids, out, plan.plan.market?.conditionId);
   } catch (cause) {
     // A failure BEFORE the COMMIT. The COMMIT's own failure is `commitFailed`'s,
     // and `reportRegistered` (after it) never throws.
@@ -487,6 +538,44 @@ function planFor(
 }
 
 /**
+ * `ROLLOVER-1`: the plan of a SERIES-bound registration — no market; the config
+ * is the `{ strategy, series }` document (the user's ruling Q4).
+ */
+function planForSeries(
+  template: SeriesTemplate,
+  args: SeriesRegisterArguments,
+  now: string,
+):
+  | { readonly ok: true; readonly plan: RegistrationPlan }
+  | { readonly ok: false; readonly refusal: TemplateRefusal } {
+  const instance = template.config.seriesInstances?.[0];
+  if (instance === undefined) {
+    return {
+      ok: false,
+      refusal: { code: "REGISTER_TEMPLATE_UNREADABLE", detail: "the parsed configuration lost its series-bound instance", issues: [] },
+    };
+  }
+  return {
+    ok: true,
+    plan: {
+      config: {
+        parametersText: template.parametersText,
+        parametersHash: template.parametersHash,
+        validatedAt: now,
+        createdBy: args.createdBy,
+      },
+      instance: {
+        instanceName: args.instanceName,
+        accountRef: template.config.accounting.accountRef,
+        defaultOwnershipMode: instance.ownership === "OWNER" ? "LIVE_OWNER" : "SHADOW",
+        evaluationPriority: instance.evaluationPriority,
+      },
+      run: { codeCommit: args.codeCommit, runSeed: instance.runSeed },
+    },
+  };
+}
+
+/**
  * Reports a COMMITTED registration. TOTAL: by now every row is committed and
  * the completed document written, so nothing that fails here may be reported
  * as the "nothing was registered" of a failure before COMMIT — the caller's
@@ -497,27 +586,35 @@ function reportRegistered(
   ports: RegisterPorts,
   ids: RegisteredIdentities,
   out: string,
-  conditionId: string,
+  conditionId: string | undefined,
 ): number {
   try {
     ports.log(
-      `committed: catalog.markets ${ids.marketId}, strategy.definitions ${ids.definitionId}` +
+      `committed: catalog.markets ${ids.marketId ?? "none (series-bound)"}, strategy.definitions ${ids.definitionId}` +
         `${ids.definitionReused ? " (reused)" : ""}, strategy.configs ${ids.configId} v` +
         `${String(ids.configVersion)}${ids.configReused ? " (reused)" : ""}, strategy.instances ` +
         `${ids.instanceId}, strategy.runs ${ids.runId} — in one transaction`,
     );
     ports.log(`completed trader configuration written to ${out} (start the trader with TRADER_CONFIG_PATH=${out})`);
-    ports.log(
-      "REMINDER (UNIV4-R1): this command did NOT verify any gammaMarketId — nothing in this " +
-        "repository can. Before the run, verify BY HAND that the data gateway's lifecycle block " +
-        `names the market whose conditionId is ${JSON.stringify(conditionId)}, ` +
-        "against GET https://gamma-api.polymarket.com/markets/{id}; a mis-pointed id opens this " +
-        "market on another market's readiness, silently.",
-    );
+    if (conditionId !== undefined) {
+      ports.log(
+        "REMINDER (UNIV4-R1): this command did NOT verify any gammaMarketId — nothing in this " +
+          "repository can. Before the run, verify BY HAND that the data gateway's lifecycle block " +
+          `names the market whose conditionId is ${JSON.stringify(conditionId)}, ` +
+          "against GET https://gamma-api.polymarket.com/markets/{id}; a mis-pointed id opens this " +
+          "market on another market's readiness, silently.",
+      );
+    } else {
+      ports.log(
+        "REMINDER (ROLLOVER-1): the data gateway's seriesAdmission block must review the SAME series " +
+          "document this run pins; a window admitted under another review is refused by the trader " +
+          "(REVIEW_MISMATCH).",
+      );
+    }
     ports.print(
       `${JSON.stringify({
         registered: true,
-        marketId: ids.marketId,
+        marketId: ids.marketId ?? null,
         definitionId: ids.definitionId,
         definitionReused: ids.definitionReused,
         configId: ids.configId,
@@ -669,8 +766,9 @@ function commitFailed(
       `KEPT at ${out}: it names exactly the rows this COMMIT would have landed. To tell which, ` +
       "start the trader on it (its registration check answers 'registration: OK' if they " +
       "landed, and refuses with TRADER_REGISTRATION_MISSING if not), or check whether " +
-      `strategy.runs holds run_id ${runId} (and catalog.markets condition_id ` +
-      `${JSON.stringify(plan.market.conditionId)}). If they landed, start from that document ` +
+      `strategy.runs holds run_id ${runId}` +
+      (plan.market === undefined ? "" : ` (and catalog.markets condition_id ${JSON.stringify(plan.market.conditionId)})`) +
+      ". If they landed, start from that document " +
       "and do NOT run this command again (it is refused as a duplicate); if not, nothing was " +
       "registered: delete that document and run the command again",
   );

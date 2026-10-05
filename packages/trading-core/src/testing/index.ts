@@ -40,6 +40,8 @@ import {
 import {
   portFailed,
   portOk,
+  type AdmittedMarketRegistered,
+  type AdmittedMarketRegistration,
   type Clock,
   type IngestedEvent,
   type MarketEventFeed,
@@ -191,7 +193,9 @@ export type TraderStoreWrite =
   | "saveCheckpoint"
   | "appendLedgerTransaction"
   | "writePnlSnapshot"
-  | "replacePnlSnapshot";
+  | "replacePnlSnapshot"
+  /** `ROLLOVER-1`: an admitted window's catalog row. */
+  | "registerAdmittedMarket";
 
 /**
  * `CKPT-1`: the writes a {@link MemoryTraderStore.persistDecisionWithCheckpoint}
@@ -233,6 +237,13 @@ export class MemoryTraderStore implements TraderStore {
   readonly pnlSnapshots: PnlSnapshot[] = [];
   /** `PROVENANCE-1`: every recorded risk refusal, in write order. */
   readonly riskRefusals: RiskRefusalRecord[] = [];
+  /**
+   * `ROLLOVER-1`: every admitted window's catalog registration, in write order
+   * — one per market id, as the durable store's idempotent insert leaves one
+   * row (a repeat with the same condition id is accepted and not recorded
+   * again; another condition id under the id is refused).
+   */
+  readonly admittedMarkets: AdmittedMarketRegistration[] = [];
   /**
    * `SNAP-1`: the identity of every snapshot recorded — `pnl_snapshots_scope_unique`
    * — and its position in {@link pnlSnapshots} (r1: where a replacement writes).
@@ -398,8 +409,54 @@ export class MemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
+  /**
+   * `ROLLOVER-1`: records one admitted window's catalog row (see
+   * {@link admittedMarkets}). `ROLLOVER-1` r1 (R1-FABLE-07): a CONFLICT with a
+   * recorded row — another condition or tokens under this market id, or this
+   * condition or a token under another market id — is answered
+   * `{ registered: false }` and records nothing, as the durable store answers
+   * it; an injected failure is a failure.
+   */
+  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<AdmittedMarketRegistered>> {
+    const refused = this.#refusalFor("registerAdmittedMarket");
+    if (refused !== undefined && !refused.ok) {
+      return await Promise.resolve(portFailed<AdmittedMarketRegistered>(refused.failure.kind, refused.failure.detail));
+    }
+    const existing = this.admittedMarkets.find((entry) => entry.marketId === market.marketId);
+    if (existing !== undefined) {
+      const same =
+        existing.conditionId === market.conditionId &&
+        existing.yesTokenId === market.yesTokenId &&
+        existing.noTokenId === market.noTokenId;
+      return await Promise.resolve(
+        portOk<AdmittedMarketRegistered>(
+          same
+            ? { registered: true }
+            : { registered: false, conflict: `catalog.markets ${market.marketId} is registered for another condition or tokens` },
+        ),
+      );
+    }
+    const tokens = [market.yesTokenId, market.noTokenId];
+    const clash = this.admittedMarkets.find(
+      (entry) =>
+        entry.conditionId === market.conditionId || tokens.includes(entry.yesTokenId) || tokens.includes(entry.noTokenId),
+    );
+    if (clash !== undefined) {
+      return await Promise.resolve(
+        portOk<AdmittedMarketRegistered>({
+          registered: false,
+          conflict: `condition ${market.conditionId} or one of its tokens is already registered as catalog.markets ${clash.marketId}`,
+        }),
+      );
+    }
+    this.admittedMarkets.push(market);
+    return await Promise.resolve(portOk<AdmittedMarketRegistered>({ registered: true }));
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
     return await Promise.resolve();
   }
 }
+
+export * from "./series.js";

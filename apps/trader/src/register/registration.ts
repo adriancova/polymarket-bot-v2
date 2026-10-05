@@ -44,6 +44,13 @@
  * - **`strategy.runs` — always new.** A run belongs to the instance just
  *   created.
  *
+ * `ROLLOVER-1` (ADR-030; the user's ruling Q4): a SERIES-BOUND registration
+ * (`register --series`) has no `market` in its plan — a series' windows are
+ * registered as each is admitted (`adapters/postgres-store.ts`
+ * `registerAdmittedMarket`) — and its config's `parameters` are the document
+ * `{ strategy, series }`, the run record's pin of the reviewed series. Every
+ * other row is written, and every other rule applies, exactly as above.
+ *
  * So a re-run of the same command is refused before any write, with the
  * existing identities named. Registering a SECOND run for an existing instance
  * (`BOOT-1`'s remedy for a run that already holds decisions) is not this
@@ -101,7 +108,8 @@ const PARAMS_SCHEMA = Object.freeze({
 
 /** Everything the registration writes, decided before the transaction opens. */
 export interface RegistrationPlan {
-  readonly market: {
+  /** Absent for a series-bound registration (`ROLLOVER-1`): it registers no market. */
+  readonly market?: {
     readonly conditionId: string;
     readonly questionTitle: string;
     readonly yesTokenId: string;
@@ -139,7 +147,8 @@ export interface RegistrationPlan {
 
 /** The identities the repositories minted (or, for the two shared rows, found). */
 export interface RegisteredIdentities {
-  readonly marketId: string;
+  /** `undefined` for a series-bound registration (`ROLLOVER-1`): no market is registered. */
+  readonly marketId: string | undefined;
   readonly definitionId: string;
   readonly definitionReused: boolean;
   readonly configId: string;
@@ -177,28 +186,31 @@ export async function registerRows(
 ): Promise<RegistrationOutcome> {
   // --- the duplicate check: every collision at once, before any write --------
   const duplicates: string[] = [];
-  const market = await db
-    .selectFrom("catalog.markets")
-    .select(["market_id"])
-    .where("condition_id", "=", plan.market.conditionId)
-    .executeTakeFirst();
-  if (market !== undefined) {
-    duplicates.push(
-      `catalog.markets: condition_id ${JSON.stringify(plan.market.conditionId)} is already ` +
-        `registered as market_id ${market.market_id}`,
-    );
-  }
-  const tokens = await db
-    .selectFrom("catalog.market_tokens")
-    .select(["token_id", "market_id"])
-    .where("token_id", "in", [plan.market.yesTokenId, plan.market.noTokenId])
-    .orderBy("token_id")
-    .execute();
-  for (const token of tokens) {
-    duplicates.push(
-      `catalog.market_tokens: token_id ${token.token_id} is already registered to market_id ` +
-        token.market_id,
-    );
+  const planned = plan.market;
+  if (planned !== undefined) {
+    const market = await db
+      .selectFrom("catalog.markets")
+      .select(["market_id"])
+      .where("condition_id", "=", planned.conditionId)
+      .executeTakeFirst();
+    if (market !== undefined) {
+      duplicates.push(
+        `catalog.markets: condition_id ${JSON.stringify(planned.conditionId)} is already ` +
+          `registered as market_id ${market.market_id}`,
+      );
+    }
+    const tokens = await db
+      .selectFrom("catalog.market_tokens")
+      .select(["token_id", "market_id"])
+      .where("token_id", "in", [planned.yesTokenId, planned.noTokenId])
+      .orderBy("token_id")
+      .execute();
+    for (const token of tokens) {
+      duplicates.push(
+        `catalog.market_tokens: token_id ${token.token_id} is already registered to market_id ` +
+          token.market_id,
+      );
+    }
   }
   const instance = await db
     .selectFrom("strategy.instances")
@@ -294,30 +306,38 @@ export async function registerRows(
   const strategy = createStrategyRepository(db);
 
   // --- catalog.markets (+ tokens, parameter history v1) ---------------------
-  const marketId = await catalog.registerMarket({
-    conditionId: plan.market.conditionId,
-    questionTitle: plan.market.questionTitle,
-    parameters: {
-      tickSize: plan.market.tickSize,
-      minimumOrderSize: plan.market.minimumOrderSize,
-      tradingDelaySeconds: plan.market.tradingDelaySeconds,
-      negRisk: plan.market.negRisk,
-      lifecycleState: plan.market.lifecycleState,
-      openTime: plan.market.openTime,
-      closeTime: plan.market.closeTime,
-    },
-    tokens: [
-      { tokenId: plan.market.yesTokenId, outcomeSide: "YES", outcomeLabel: plan.market.yesLabel },
-      { tokenId: plan.market.noTokenId, outcomeSide: "NO", outcomeLabel: plan.market.noLabel },
-    ],
-    source: "polymarket",
-    observedAt: plan.market.observedAt,
-  });
-  log(
-    `catalog.markets: registered market_id ${marketId} (condition_id ` +
-      `${JSON.stringify(plan.market.conditionId)}; tokens YES ${plan.market.yesTokenId}, ` +
-      `NO ${plan.market.noTokenId}; parameters version 1) — not yet committed`,
-  );
+  let marketId: string | undefined;
+  if (planned === undefined) {
+    log(
+      "catalog.markets: none — a series-bound instance's windows are registered as each is " +
+        "admitted (ROLLOVER-1, ADR-030)",
+    );
+  } else {
+    marketId = await catalog.registerMarket({
+      conditionId: planned.conditionId,
+      questionTitle: planned.questionTitle,
+      parameters: {
+        tickSize: planned.tickSize,
+        minimumOrderSize: planned.minimumOrderSize,
+        tradingDelaySeconds: planned.tradingDelaySeconds,
+        negRisk: planned.negRisk,
+        lifecycleState: planned.lifecycleState,
+        openTime: planned.openTime,
+        closeTime: planned.closeTime,
+      },
+      tokens: [
+        { tokenId: planned.yesTokenId, outcomeSide: "YES", outcomeLabel: planned.yesLabel },
+        { tokenId: planned.noTokenId, outcomeSide: "NO", outcomeLabel: planned.noLabel },
+      ],
+      source: "polymarket",
+      observedAt: planned.observedAt,
+    });
+    log(
+      `catalog.markets: registered market_id ${marketId} (condition_id ` +
+        `${JSON.stringify(planned.conditionId)}; tokens YES ${planned.yesTokenId}, ` +
+        `NO ${planned.noTokenId}; parameters version 1) — not yet committed`,
+    );
+  }
 
   // --- strategy.definitions: static-bracket 1.1.0 ---------------------------
   const definitionReused = existingDefinition !== undefined;

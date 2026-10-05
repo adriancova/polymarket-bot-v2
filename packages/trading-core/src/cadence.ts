@@ -279,6 +279,15 @@ export class EvaluationCadenceClock {
     this.#carried.delete(marketId);
   }
 
+  /**
+   * `ROLLOVER-1` (ADR-030 Decision 4.4): a torn-down window is forgotten — its
+   * `last` and its owed evaluation — so the cadence holds nothing of it.
+   */
+  forget(marketId: string): void {
+    this.#last.delete(marketId);
+    this.#carried.delete(marketId);
+  }
+
   /** How many markets are still owed from an earlier close (for tests). */
   carriedCount(): number {
     return this.#carried.size;

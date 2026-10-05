@@ -22,7 +22,8 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
+import { configuredFeatureKeys, configuredSeries, parseTraderConfig } from "./config.js";
+import { reviewedSeriesDocument } from "./testing/series.js";
 
 /** A minimal, valid configuration. Every field required; none defaulted. */
 function validConfig(): Record<string, unknown> {
@@ -536,5 +537,100 @@ describe("configuredFeatureKeys", () => {
       "polymarket.executable_sell_price@50",
       "quality.active_incidents@any",
     ]);
+  });
+});
+
+/**
+ * `ROLLOVER-1` (ADR-030): a document may carry reviewed `series` and
+ * `seriesInstances` — instances bound to a SERIES whose windows are admitted
+ * at runtime — beside, or instead of, market-bound ones.
+ */
+describe("the series fields (ROLLOVER-1)", () => {
+  const SERIES_INSTANCE = {
+    instanceId: "b18f4a7e-5555-7abc-8def-0123456789ab",
+    runId: "018f4a7e-6666-7abc-8def-0123456789ab",
+    configId: "018f4a7e-7777-7abc-8def-0123456789ab",
+    runSeed: "77",
+    seriesId: "btc-15m-updown",
+    ownership: "OWNER",
+    evaluationPriority: 1,
+    evaluationBudgetUs: 5000000,
+    params: {
+      entry: { trigger_feature_key: "polymarket.executable_buy_price@25" },
+      exit: { stop: { trigger_feature_key: "polymarket.executable_sell_price@50" } },
+      data_quality: { incident_feature_key: "quality.active_incidents@any" },
+    },
+  };
+
+  function seriesOnly(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      ...validConfig(),
+      markets: [],
+      instances: [],
+      series: [reviewedSeriesDocument()],
+      seriesInstances: [SERIES_INSTANCE],
+      ...overrides,
+    };
+  }
+
+  function issuesOf(document: Record<string, unknown>): readonly string[] {
+    const parsed = parseTraderConfig(document);
+    return parsed.ok ? [] : parsed.refusal.issues;
+  }
+
+  it("accepts a series-only document, hashes each series, and counts series-bound feature keys", () => {
+    const parsed = parseTraderConfig(seriesOnly());
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const series = configuredSeries(parsed.config);
+    expect(series.map((entry) => entry.series.seriesId)).toEqual(["btc-15m-updown"]);
+    expect(series[0]?.configHash).toMatch(/^[0-9a-f]{64}$/u);
+    expect(configuredFeatureKeys(parsed.config)).toContain("polymarket.executable_buy_price@25");
+  });
+
+  it("accepts market-bound and series-bound instances side by side", () => {
+    expect(parseTraderConfig(seriesOnly({ markets: validConfig()["markets"], instances: validConfig()["instances"] })).ok).toBe(true);
+  });
+
+  it("refuses a document with no instance at all, and market-bound instances with no market", () => {
+    expect(issuesOf(seriesOnly({ seriesInstances: undefined, series: undefined }))).toContain(
+      "instances, seriesInstances: at least one instance is required",
+    );
+    expect(issuesOf(seriesOnly({ instances: validConfig()["instances"] }))).toContain(
+      "markets: a market-bound instance needs at least one configured market",
+    );
+  });
+
+  it("refuses a series nothing trades, an instance naming an unreviewed series, two owners, a series twice", () => {
+    expect(issuesOf(seriesOnly({ seriesInstances: undefined })).join("\n")).toContain("has no series-bound instance");
+    expect(issuesOf(seriesOnly({ seriesInstances: [{ ...SERIES_INSTANCE, seriesId: "eth-15m-updown" }] })).join("\n")).toContain(
+      "which this document does not review",
+    );
+    const second = { ...SERIES_INSTANCE, instanceId: "b18f4a7e-8888-7abc-8def-0123456789ab", runId: "018f4a7e-9999-7abc-8def-0123456789ab" };
+    expect(issuesOf(seriesOnly({ seriesInstances: [SERIES_INSTANCE, second] })).join("\n")).toContain("OWNER instances");
+    expect(issuesOf(seriesOnly({ series: [reviewedSeriesDocument(), reviewedSeriesDocument()] }))).toContain(
+      "series: each seriesId may appear once",
+    );
+  });
+
+  it("refuses a shared run id (each run's evaluation sequence is its own) and a shared instance id", () => {
+    const market = validConfig();
+    const marketInstance = (market["instances"] as Record<string, unknown>[])[0] ?? {};
+    const sharedRun = seriesOnly({
+      markets: market["markets"],
+      instances: market["instances"],
+      seriesInstances: [{ ...SERIES_INSTANCE, runId: marketInstance["runId"] }],
+    });
+    expect(issuesOf(sharedRun).join("\n")).toContain("each runId may appear once");
+    const sharedInstance = seriesOnly({
+      markets: market["markets"],
+      instances: market["instances"],
+      seriesInstances: [{ ...SERIES_INSTANCE, instanceId: marketInstance["instanceId"] }],
+    });
+    expect(issuesOf(sharedInstance).join("\n")).toContain("each instanceId may appear once");
+  });
+
+  it("refuses a series the reviewed-series schema refuses", () => {
+    expect(parseTraderConfig(seriesOnly({ series: [{ ...reviewedSeriesDocument(), approved: true }] })).ok).toBe(false);
   });
 });

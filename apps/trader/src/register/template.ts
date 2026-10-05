@@ -48,6 +48,17 @@
  * integer has no exact decimal string (the document's text was already
  * rounded by `JSON.parse`), and is refused rather than rendered.
  * `parameters_hash` is the sha256 of the exact text the column receives.
+ *
+ * ## A series template (`ROLLOVER-1`; the user's ruling Q4)
+ *
+ * `register --series` reads a SERIES template ({@link readSeriesTemplate}):
+ * the trader document with NO market and NO market-bound instance, exactly one
+ * `seriesInstances` entry with its three identities (`instanceId`, `runId`,
+ * `configId`) absent, and the reviewed `series` it names. It is checked by the
+ * same two doors, and its registered parameters are the DOCUMENT
+ * `{ "strategy": <the instance's params>, "series": <the reviewed series> }`,
+ * rendered the same way — the run record's pin of the series (ADR-030
+ * Decision 4.2), which BOOT-1 compares at every start.
  */
 
 import { createHash } from "node:crypto";
@@ -323,16 +334,29 @@ export type CanonicalParameters =
  * string. See the module header.
  */
 export function canonicalParameters(params: unknown): CanonicalParameters {
+  return canonicalDocument(params, "instances[0].params");
+}
+
+/**
+ * `ROLLOVER-1`: the registered document of a series-bound instance,
+ * `{ strategy, series }` (the user's ruling Q4), rendered as
+ * {@link canonicalParameters} renders params.
+ */
+export function canonicalSeriesParameters(params: unknown, series: unknown): CanonicalParameters {
+  return canonicalDocument({ strategy: params, series }, "seriesInstances[0].{strategy,series}");
+}
+
+function canonicalDocument(params: unknown, label: string): CanonicalParameters {
   const problems: string[] = [];
   if (typeof params !== "object" || params === null || Array.isArray(params)) {
-    return { ok: false, problems: ["instances[0].params: must be a JSON object"] };
+    return { ok: false, problems: [`${label}: must be a JSON object`] };
   }
   // `Object.fromEntries` defines OWN data properties, so a key spelled
   // `__proto__` stays a key and never becomes the object's prototype.
   const value: { readonly [key: string]: DecimalSafeJsonValue } = Object.fromEntries(
     Object.entries(params).map(([key, inner]) => [
       key,
-      rendered(inner, `instances[0].params.${key}`, problems),
+      rendered(inner, `${label}.${key}`, problems),
     ]),
   );
   if (problems.length > 0) return { ok: false, problems };
@@ -362,6 +386,128 @@ function rendered(value: unknown, path: string, problems: string[]): DecimalSafe
   }
   problems.push(`${path}: a ${typeof value} is not a JSON value`);
   return null;
+}
+
+/** `ROLLOVER-1`: the three identities a series registration mints. */
+export interface SeriesDocumentIdentities {
+  readonly instanceId: string;
+  readonly runId: string;
+  readonly configId: string;
+}
+
+/** `ROLLOVER-1`: an accepted series template. */
+export interface SeriesTemplate {
+  readonly document: Readonly<Record<string, unknown>>;
+  readonly instance: Readonly<Record<string, unknown>>;
+  readonly config: TraderConfig;
+  /** The reviewed series the instance names, as the trader's door parsed it. */
+  readonly seriesId: string;
+  readonly parametersText: string;
+  readonly parametersHash: string;
+}
+
+export type SeriesTemplateResult =
+  | { readonly ok: true; readonly template: SeriesTemplate }
+  | { readonly ok: false; readonly refusal: TemplateRefusal };
+
+const SERIES_INSTANCE_IDENTITY_FIELDS = ["instanceId", "runId", "configId"] as const;
+
+/**
+ * `ROLLOVER-1`: reads a SERIES template (module header). TOTAL: never throws.
+ * Runs the trader's configuration door and its composition root, in memory.
+ */
+export function readSeriesTemplate(
+  text: string,
+  env: Readonly<Record<string, string | undefined>>,
+  nowMs: () => number,
+): SeriesTemplateResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    return refuse("REGISTER_TEMPLATE_UNREADABLE", "the template is not JSON", [describe(cause)]);
+  }
+  if (!isRecord(parsed)) {
+    return refuse("REGISTER_TEMPLATE_UNREADABLE", "the template is not a JSON object; it is the trader configuration document");
+  }
+  const shape: string[] = [];
+  const markets = parsed["markets"];
+  const instances = parsed["instances"];
+  const seriesInstances = parsed["seriesInstances"];
+  if (!Array.isArray(markets) || markets.length !== 0) shape.push("markets: must be an empty array (a series registration registers no market)");
+  if (!Array.isArray(instances) || instances.length !== 0) shape.push("instances: must be an empty array (a series registration registers no market-bound instance)");
+  if (!Array.isArray(seriesInstances) || seriesInstances.length !== 1 || !isRecord(seriesInstances[0])) {
+    shape.push("seriesInstances: must be an array holding exactly one series-bound instance");
+  }
+  const instance = Array.isArray(seriesInstances) ? seriesInstances[0] : undefined;
+  if (shape.length > 0 || !isRecord(instance)) {
+    return refuse(
+      "REGISTER_TEMPLATE_UNREADABLE",
+      "register --series registers ONE series-bound instance and its run per command, and no market",
+      shape,
+    );
+  }
+  const named = SERIES_INSTANCE_IDENTITY_FIELDS.filter((field) => Object.hasOwn(instance, field)).map(
+    (field) => `seriesInstances[0].${field} is present`,
+  );
+  if (named.length > 0) {
+    return refuse(
+      "REGISTER_TEMPLATE_HAS_IDENTITIES",
+      "the template names identities only the registration mints; remove them and the command fills them with the ids the repositories mint",
+      named,
+    );
+  }
+  const placeholder = completeSeriesDocument(parsed, instance, {
+    instanceId: uuidV7(nowMs()),
+    runId: uuidV7(nowMs()),
+    configId: uuidV7(nowMs()),
+  });
+  const door = parseTraderConfig(placeholder);
+  if (!door.ok) {
+    return refuse(
+      "REGISTER_TEMPLATE_INVALID",
+      `the trader's configuration door refused the template (${door.refusal.code}: ${door.refusal.detail}); ` +
+        "the placeholder identities it was checked with name no row",
+      door.refusal.issues,
+    );
+  }
+  const config = door.config;
+  const configured = config.seriesInstances?.[0];
+  const series = config.series?.find((entry) => entry.seriesId === configured?.seriesId);
+  if (configured === undefined || series === undefined) {
+    return refuse("REGISTER_TEMPLATE_UNREADABLE", "the parsed configuration lost its series-bound instance or its series");
+  }
+  const parameters = canonicalSeriesParameters(configured.params, series);
+  if (!parameters.ok) {
+    return refuse("REGISTER_TEMPLATE_NOT_REGISTRABLE", "the document is not registrable as it states itself", parameters.problems);
+  }
+  const dry = dryAssemble(placeholder, env, nowMs);
+  if (!dry.ok) return { ok: false, refusal: dry.refusal };
+  return {
+    ok: true,
+    template: {
+      document: parsed,
+      instance,
+      config,
+      seriesId: series.seriesId,
+      parametersText: parameters.text,
+      parametersHash: parameters.hash,
+    },
+  };
+}
+
+/** `ROLLOVER-1`: the series template with the three identities filled in, FIRST, every other key kept. */
+export function completeSeriesDocument(
+  document: Readonly<Record<string, unknown>>,
+  instance: Readonly<Record<string, unknown>>,
+  identities: SeriesDocumentIdentities,
+): Record<string, unknown> {
+  return {
+    ...document,
+    seriesInstances: [
+      { instanceId: identities.instanceId, runId: identities.runId, configId: identities.configId, ...instance },
+    ],
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

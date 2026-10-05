@@ -83,6 +83,15 @@ export const CONSUMED_EVENTS: readonly { readonly eventType: string; readonly sc
     { eventType: "ReferenceTradeObserved", schemaVersion: 1 },
     { eventType: "DataQualityIncidentOpened", schemaVersion: 1 },
     { eventType: "DataQualityIncidentClosed", schemaVersion: 1 },
+    // `ROLLOVER-1` (ADR-030 Decision 3.2; the user's ruling Q1): an admitted
+    // series window arrives as `MarketDiscovered@1` and then
+    // `SeriesWindowAdmitted@1`, which the loop's series admissions re-judge
+    // together (`series-admission.ts`). `TradingParametersChanged@1` is still
+    // NOT consumed: following a runtime tick-size change is a change for every
+    // market this trader runs, configured ones included, and the admitted
+    // window's version-1 tick size travels on `SeriesWindowAdmitted@1`.
+    { eventType: "MarketDiscovered", schemaVersion: 1 },
+    { eventType: "SeriesWindowAdmitted", schemaVersion: 1 },
   ]);
 
 function contractKey(eventType: string, schemaVersion: number): string {

@@ -44,6 +44,21 @@
  * non-owner routed into the shared one is a live trade wearing a shadow label,
  * which is precisely the defect that made this paragraph necessary.
  *
+ * ## One instance, many windows (`ROLLOVER-1`, ADR-030 Decision 4)
+ *
+ * A series-bound instance trades every window its series admits, each with its
+ * OWN runtime (fresh per-window strategy state) and all under the instance's
+ * one run. So a registration is keyed by its {@link RegisteredInstance.key}:
+ * the `instanceId` for a market-bound instance — exactly as before — and
+ * `<instanceId>|<marketId>` for one window of a series-bound one
+ * ({@link windowRegistrationKey}). Everything that routes to a RUNTIME (an
+ * order's owner, a fill's delivery, an order view, a PnL stream) uses the key;
+ * everything that names the INSTANCE (risk, the allocator, halts, the ledger's
+ * claims) still uses `instanceId`. A torn-down window's registrations leave
+ * the evaluation order ({@link InstanceRegistry.retireMarket}); their identity
+ * stays readable ({@link InstanceRegistry.identityOf}) for the PnL stream that
+ * outlives them, and nothing else of them is kept.
+ *
  * The registry holds no clock, no I/O and no venue surface. It owns the
  * `StrategyInstanceRuntime` handle each instance evaluates through and the
  * instance's configured identity, and nothing else.
@@ -60,6 +75,16 @@ import type { StrategyInstanceRuntime } from "@polymarket-bot/strategy-runtime";
 export type Ownership = "OWNER" | "SHADOW";
 
 export interface RegisteredInstance {
+  /**
+   * `ROLLOVER-1`: the registration key — `instanceId` for a market-bound
+   * instance, `<instanceId>|<marketId>` for one window of a series-bound one.
+   * DERIVED by {@link InstanceRegistry.register} from `instanceId`, `marketId`
+   * and {@link RegisteredInstance.window}, never taken from its input — so a
+   * registration built by spreading another one cannot carry a stale key.
+   */
+  readonly key: string;
+  /** `ROLLOVER-1`: whether this is one WINDOW of a series-bound instance. */
+  readonly window: boolean;
   readonly instanceId: string;
   readonly runId: string;
   readonly configId: string;
@@ -83,6 +108,28 @@ export interface RegisteredInstance {
   readonly immediateOrderType: "GTC" | "GTD" | "FAK" | "FOK";
   /** `entry.execution.submission_unknown_after_ms`, the §6 invariant 6 bound. */
   readonly submissionUnknownAfterMs: number;
+}
+
+/**
+ * What {@link InstanceRegistry.register} takes: everything but the key, which
+ * it derives. `window` absent or `false`: a market-bound instance, keyed by
+ * its `instanceId`, exactly as before.
+ */
+export type InstanceRegistration = Omit<RegisteredInstance, "key" | "window"> & {
+  readonly window?: boolean;
+};
+
+/** `ROLLOVER-1`: the registration key of one window of a series-bound instance. */
+export function windowRegistrationKey(instanceId: string, marketId: string): string {
+  return `${instanceId}|${marketId}`;
+}
+
+/** The identity a retired registration keeps, for the PnL stream that outlives it. */
+export interface RegistrationIdentity {
+  readonly key: string;
+  readonly instanceId: string;
+  readonly runId: string;
+  readonly marketId: string;
 }
 
 export type RegisterResult =
@@ -119,17 +166,26 @@ export interface ManifestRow {
 }
 
 export class InstanceRegistry {
+  /** Keyed by {@link RegisteredInstance.key}. */
   readonly #instances = new Map<string, RegisteredInstance>();
   readonly #owners = new Map<string, string>();
-  /** Recomputed on registration; registration is a startup act, not a hot path. */
+  /** `ROLLOVER-1`: retired window registrations' identities, by key. */
+  readonly #retired = new Map<string, RegistrationIdentity>();
+  /**
+   * Recomputed on registration — a startup act, and since `ROLLOVER-1` also a
+   * window's admission and teardown: a few per window, not a hot path.
+   */
   #ordered: readonly RegisteredInstance[] = Object.freeze([]);
 
-  register(instance: RegisteredInstance): RegisterResult {
-    if (this.#instances.has(instance.instanceId)) {
+  register(input: InstanceRegistration): RegisterResult {
+    const window = input.window === true;
+    const key = window ? windowRegistrationKey(input.instanceId, input.marketId) : input.instanceId;
+    const instance: RegisteredInstance = Object.freeze({ ...input, key, window });
+    if (this.#instances.has(instance.key) || this.#retired.has(instance.key)) {
       return {
         ok: false,
         code: "DUPLICATE_INSTANCE",
-        detail: `instance ${instance.instanceId} is already registered`,
+        detail: `instance ${instance.instanceId} is already registered (key ${instance.key})`,
       };
     }
     if (instance.ownership === "OWNER") {
@@ -146,9 +202,38 @@ export class InstanceRegistry {
       }
       this.#owners.set(instance.marketId, instance.instanceId);
     }
-    this.#instances.set(instance.instanceId, instance);
+    this.#instances.set(instance.key, instance);
     this.#ordered = Object.freeze([...this.#instances.values()].sort(compareInstances));
     return { ok: true };
+  }
+
+  /**
+   * `ROLLOVER-1`: retires every WINDOW registration of `marketId` (a key other
+   * than its instance id) — the window is torn down (ADR-030 Decision 4.4).
+   * Its owner claim is released, it leaves the evaluation order, and only its
+   * identity is kept. A market-bound registration is never retired. Answers how
+   * many were.
+   */
+  retireMarket(marketId: string): number {
+    let retired = 0;
+    for (const [key, instance] of [...this.#instances]) {
+      if (instance.marketId !== marketId || !instance.window) continue;
+      this.#instances.delete(key);
+      this.#retired.set(key, Object.freeze({ key, instanceId: instance.instanceId, runId: instance.runId, marketId }));
+      if (this.#owners.get(marketId) === instance.instanceId && instance.ownership === "OWNER") {
+        this.#owners.delete(marketId);
+      }
+      retired += 1;
+    }
+    if (retired > 0) this.#ordered = Object.freeze([...this.#instances.values()].sort(compareInstances));
+    return retired;
+  }
+
+  /** The identity of a live or retired registration, by key. */
+  identityOf(key: string): RegistrationIdentity | undefined {
+    const live = this.#instances.get(key);
+    if (live !== undefined) return { key, instanceId: live.instanceId, runId: live.runId, marketId: live.marketId };
+    return this.#retired.get(key);
   }
 
   /** Every registered instance in §8.2 order. */
@@ -161,8 +246,9 @@ export class InstanceRegistry {
     return Object.freeze(this.#ordered.filter((instance) => instance.marketId === marketId));
   }
 
-  get(instanceId: string): RegisteredInstance | undefined {
-    return this.#instances.get(instanceId);
+  /** A live registration by its key (the `instanceId` for a market-bound instance). */
+  get(key: string): RegisteredInstance | undefined {
+    return this.#instances.get(key);
   }
 
   /** The market's live owner, if it has one. */

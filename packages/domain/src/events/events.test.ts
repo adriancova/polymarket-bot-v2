@@ -21,6 +21,11 @@ import {
   isTerminalMarketOutcomeState,
 } from "./market-lifecycle.js";
 import { REFERENCE_VENUES, ReferenceVenueSchema } from "./reference.js";
+import {
+  SeriesConfigHashSchema,
+  SeriesWindowAdmittedContract,
+  SeriesWindowAdmittedPayloadSchema,
+} from "./series-admission.js";
 
 const contractsByType = new Map(
   DOMAIN_EVENT_CONTRACTS.map((contract) => [contract.eventType, contract]),
@@ -65,9 +70,14 @@ function renderPath(path: SamplePath): string {
 }
 
 describe("the §7.4 minimum event list is complete", () => {
-  it("declares exactly the specified 22 event types", () => {
-    expect(DOMAIN_EVENT_TYPES).toHaveLength(22);
-    expect(new Set(DOMAIN_EVENT_TYPES).size).toBe(22);
+  // 22 §7.4 event types, plus `SeriesWindowAdmitted` — the one contract added
+  // since WP-020 froze the list (ADR-030; the user's ruling Q1, 2026-10-04,
+  // `ROLLOVER-1`). The count moves only with a ruling.
+  it("declares exactly the specified 22 event types plus SeriesWindowAdmitted", () => {
+    expect(DOMAIN_EVENT_TYPES).toHaveLength(23);
+    expect(new Set(DOMAIN_EVENT_TYPES).size).toBe(23);
+    expect(DOMAIN_EVENT_TYPES.slice(0, 22)).not.toContain("SeriesWindowAdmitted");
+    expect(DOMAIN_EVENT_TYPES[22]).toBe("SeriesWindowAdmitted");
   });
 
   it("registers one contract per declared event type", () => {
@@ -653,5 +663,74 @@ describe("reference-event provenance agrees with the envelope (§7.1)", () => {
     expect(() =>
       assertEnvelopePayloadProvenance({ source: "binance" }, { venue: 7 }),
     ).toThrow(EventProvenanceMismatchError);
+  });
+});
+
+describe("SeriesWindowAdmitted@1 (ADR-030; the user's ruling Q1, ROLLOVER-1)", () => {
+  const sample = EVENT_SAMPLES.find((entry) => entry.eventType === "SeriesWindowAdmitted");
+  const payload = sample?.payload ?? {};
+
+  it("is registered at version 1, after every §7.4 contract", () => {
+    expect(SeriesWindowAdmittedContract.eventType).toBe("SeriesWindowAdmitted");
+    expect(SeriesWindowAdmittedContract.schemaVersion).toBe(1);
+    expect(DOMAIN_EVENT_REGISTRY.require("SeriesWindowAdmitted", 1)).toBe(SeriesWindowAdmittedContract);
+    expect(DOMAIN_EVENT_REGISTRY.versionsOf("SeriesWindowAdmitted")).toEqual([1]);
+    expect(DOMAIN_EVENT_CONTRACTS.at(-1)).toBe(SeriesWindowAdmittedContract);
+  });
+
+  it("names exactly the ruling's eight fields plus tickSize and windowTitle, every one required", () => {
+    expect(Object.keys(SeriesWindowAdmittedPayloadSchema.shape).sort()).toEqual(
+      [
+        "conditionId",
+        "internalMarketId",
+        "noTokenId",
+        "scheduledCloseAt",
+        "scheduledOpenAt",
+        "seriesConfigHash",
+        "seriesId",
+        "tickSize",
+        "windowTitle",
+        "yesTokenId",
+      ].sort(),
+    );
+    expect(SeriesWindowAdmittedPayloadSchema.safeParse(payload).success).toBe(true);
+    for (const key of Object.keys(SeriesWindowAdmittedPayloadSchema.shape)) {
+      const without: Record<string, unknown> = { ...payload };
+      delete without[key];
+      expect(SeriesWindowAdmittedPayloadSchema.safeParse(without).success, key).toBe(false);
+    }
+  });
+
+  it("is strict: an undeclared key is refused", () => {
+    expect(SeriesWindowAdmittedPayloadSchema.safeParse({ ...payload, gammaMarketId: "5255913" }).success).toBe(
+      false,
+    );
+  });
+
+  it("refuses a seriesConfigHash that is not 64 lowercase hex characters", () => {
+    const hash = String(payload["seriesConfigHash"]);
+    expect(SeriesConfigHashSchema.safeParse(hash).success).toBe(true);
+    expect(SeriesConfigHashSchema.safeParse(hash.toUpperCase()).success).toBe(false);
+    expect(SeriesConfigHashSchema.safeParse(hash.slice(1)).success).toBe(false);
+    expect(SeriesConfigHashSchema.safeParse(`${hash}0`).success).toBe(false);
+  });
+
+  it("refuses a tick size that is a number, zero or negative, and an internal id that is not a UUIDv7", () => {
+    expect(SeriesWindowAdmittedPayloadSchema.safeParse({ ...payload, tickSize: 0.001 }).success).toBe(false);
+    expect(SeriesWindowAdmittedPayloadSchema.safeParse({ ...payload, tickSize: "0" }).success).toBe(false);
+    expect(SeriesWindowAdmittedPayloadSchema.safeParse({ ...payload, tickSize: "-0.01" }).success).toBe(false);
+    expect(
+      SeriesWindowAdmittedPayloadSchema.safeParse({
+        ...payload,
+        internalMarketId: "018f3a5c-1111-4000-8000-000000000001",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("refuses a scheduled instant that is not an ISO-8601 instant, and a series id that is not a code", () => {
+    expect(
+      SeriesWindowAdmittedPayloadSchema.safeParse({ ...payload, scheduledOpenAt: "October 4, 6:15PM ET" }).success,
+    ).toBe(false);
+    expect(SeriesWindowAdmittedPayloadSchema.safeParse({ ...payload, seriesId: "btc 15m" }).success).toBe(false);
   });
 });

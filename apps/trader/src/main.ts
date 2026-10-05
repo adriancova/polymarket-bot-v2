@@ -214,6 +214,7 @@ import { checkPaperTraderSafety } from "@polymarket-bot/trading-core";
 import { createPaperTrader, type PaperTrader } from "@polymarket-bot/trading-core";
 import { createExecutionPolicy, type VenueWiring } from "@polymarket-bot/trading-core";
 import { PAPER_EVALUATION_CADENCE, type CadenceAlarm } from "@polymarket-bot/trading-core";
+import type { AdmissionNotice } from "@polymarket-bot/trading-core";
 import { buildSimulatedVenue } from "@polymarket-bot/trading-core";
 
 export { createExecutionPolicy, type VenueWiring };
@@ -291,6 +292,15 @@ export async function startup(ports: StartupPorts): Promise<number> {
     `configuration: OK — ${String(config.markets.length)} market(s), ` +
       `${String(config.instances.length)} instance(s), environment ${config.environment}`,
   );
+  // `ROLLOVER-1` (ADR-030): the series-bound instances and the series they
+  // trade, on a line of their own so the line above reads as it always did.
+  if (config.seriesInstances !== undefined || config.series !== undefined) {
+    ports.log(
+      `configuration: ${String(config.seriesInstances?.length ?? 0)} series-bound instance(s) over ` +
+        `${String(config.series?.length ?? 0)} reviewed series; each window is traded only once ` +
+        "this trader re-judges its admission against the review its run pins",
+    );
+  }
 
   // --- 2b. the health endpoint's bind, before anything is opened -----------
   const healthEnv = readHealthServerEnv(ports.env);
@@ -605,7 +615,7 @@ export async function assembleDurableTrader(
   }
   log(
     `registration: OK — ${String(config.markets.length)} market(s), ` +
-      `${String(config.instances.length)} instance(s) and their run(s) exist and agree with ` +
+      `${String(config.instances.length + (config.seriesInstances?.length ?? 0))} instance(s) and their run(s) exist and agree with ` +
       "the configuration",
   );
 
@@ -643,12 +653,18 @@ export async function assembleDurableTrader(
     clock: options.clock,
     venue,
     store: observedStore,
-    idNamespace: config.instances.map((instance) => instance.runId).join("|"),
+    // `ROLLOVER-1`: every run this process executes, series-bound ones included.
+    idNamespace: [...config.instances, ...(config.seriesInstances ?? [])].map((instance) => instance.runId).join("|"),
     // `CADENCE-1` (ADR-026 D1.4-D1.5): exactly the cadence step 3b verified
     // every configured run's `strategy.runs` row pins. Never a reproduction.
     evaluationCadence: PAPER_EVALUATION_CADENCE,
     onCadenceAlarm: (alarm) => {
       log(cadenceAlarmLine(alarm));
+    },
+    // `ROLLOVER-1` (ADR-030): every series-window admission, refusal and
+    // teardown is an operator line.
+    onAdmission: (notice) => {
+      log(admissionLine(notice));
     },
   });
   if (!created.ok) {
@@ -890,3 +906,31 @@ if (invokedDirectly) {
   exitAfterStartup(code, processExitPorts(process));
 }
 /* c8 ignore stop */
+
+/**
+ * `ROLLOVER-1`: one operator line per series-window admission, refusal or
+ * teardown (ADR-030). A refusal is the trader's own re-judge saying no: the
+ * window is not traded (fail closed), and the line names why.
+ */
+export function admissionLine(notice: AdmissionNotice): string {
+  switch (notice.kind) {
+    case "ADMITTED":
+      return (
+        `[admission] ADMITTED window ${notice.window.marketId} of ${notice.window.seriesId} ` +
+        `(${notice.window.windowTitle}; ${notice.window.openAt}..${notice.window.closeAt}; tick ${notice.window.tickSize})`
+      );
+    case "REFUSED":
+      return `[admission] REFUSED ${notice.code} window ${notice.marketId ?? "(unidentified)"}: ${notice.detail}`;
+    case "TORN_DOWN":
+      return notice.reason === "RESOLVED_UNHANDLED"
+        ? `[admission] TORN DOWN window ${notice.window.marketId} (${notice.reason}): it resolved, but its onMarketResolved was suppressed by a halt or skipped for an instance, so the resolution was NOT handled by its strategy; its ledger rows stay`
+        : `[admission] TORN DOWN window ${notice.window.marketId} (${notice.reason}); its ledger rows stay`;
+    case "HELD_UNRESOLVED":
+      return (
+        `[admission] HELD window ${notice.window.marketId}: unresolved ${String(notice.window.unresolvedTeardownSeconds)} s ` +
+        `after its close ${notice.window.closeAt} and it still holds inventory, so it is kept until its resolution is handled (ADR-030 Decision 4.4); ` +
+        `it keeps its cap slot meanwhile (Decision 1.8), so its series admits no window in its place. ` +
+        `If its resolution never reached the gateway, the gateway's operator retirement frees the gateway's slot, not this one: a new run does`
+      );
+  }
+}

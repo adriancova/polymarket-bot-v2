@@ -157,14 +157,36 @@ export class MarketState {
     this.#incidents.delete(incidentId);
   }
 
-  markLifecycle(lifecycle: MarketLifecycle): void {
+  /**
+   * Moves the market's lifecycle, and answers whether it moved. A RESOLUTION
+   * IS TERMINAL (`ROLLOVER-1` r4, R4-ASTRA-02): once a resolution is applied
+   * (`markResolved`), a later `MarketOpened` or `MarketClosing` — a lifecycle
+   * poll that answers after the resolution was published, which needs no
+   * fault (the gateway's lifecycle feed and its market channel are separate
+   * paths) — changes nothing and answers `false`. Until r4 it overwrote
+   * `RESOLVED`, which re-armed `onMarketResolved` for a repeated resolution
+   * and hid the resolution from the window teardown.
+   */
+  markLifecycle(lifecycle: MarketLifecycle): boolean {
+    if (this.#resolvedOutcome !== undefined) return false;
     this.#lifecycle = lifecycle;
+    return true;
   }
 
-  markResolved(outcome: string, at: string): void {
+  /**
+   * Applies the market's resolution, and answers whether it was applied. A
+   * market resolves ONCE (`ROLLOVER-1` r3 and r4): a repeat — the gateway
+   * re-publishes a resolution an earlier epoch could not record as published,
+   * and the market channel may deliver one twice — is judged on the
+   * resolution EVIDENCE (`resolvedOutcome`), which nothing overwrites, changes
+   * nothing, and answers `false`. The first resolution stands.
+   */
+  markResolved(outcome: string, at: string): boolean {
+    if (this.#resolvedOutcome !== undefined) return false;
     this.#lifecycle = "RESOLVED";
     this.#resolvedOutcome = outcome;
     this.#resolvedAt = at;
+    return true;
   }
 
   /** Records the instant of the most recent applied event (already strict UTC). */

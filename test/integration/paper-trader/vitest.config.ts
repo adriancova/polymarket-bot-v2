@@ -158,6 +158,13 @@ export default defineConfig({
       pkg("research-worker", "apps/research-worker/src/index.ts"),
       pkg("storage-parquet/testing", "packages/storage-parquet/src/testing/index.ts"),
       pkg("storage-parquet", "packages/storage-parquet/src/index.ts"),
+      // `ROLLOVER-1`: `rollover-1-series-mirror.test.ts` holds the trader's
+      // copy of the reviewed-series rules (`@polymarket-bot/trading-core`
+      // `series.ts`, read through `@polymarket-bot/trader`) to the gateway's
+      // (`@polymarket-bot/universe`). The same rows are carried in
+      // `tsconfig.json` (and `tsconfig.lint.json` already carries them).
+      pkg("universe/testing", "packages/universe/src/testing/index.ts"),
+      pkg("universe", "packages/universe/src/index.ts"),
     ],
   },
   test: {

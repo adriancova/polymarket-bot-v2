@@ -325,6 +325,23 @@ export const EVENT_SAMPLES: readonly EventSample[] = [
     economicFields: [],
     optionalFields: [],
   },
+  {
+    // ADR-030 (`ROLLOVER-1`, the user's ruling Q1): one admitted series window.
+    eventType: "SeriesWindowAdmitted",
+    payload: {
+      ...marketReference,
+      seriesId: "btc-15m-updown",
+      seriesConfigHash: "485ceb1dabc4aa12fb42c76184563b7378f01e5de9ded73df049c0d191cd5ad1",
+      yesTokenId: SAMPLE_YES_TOKEN_ID,
+      noTokenId: SAMPLE_NO_TOKEN_ID,
+      scheduledOpenAt: "2026-10-04T22:15:00.000Z",
+      scheduledCloseAt: "2026-10-04T22:30:00.000Z",
+      tickSize: "0.001",
+      windowTitle: "Bitcoin Up or Down - October 4, 6:15PM-6:30PM ET",
+    },
+    economicFields: ["tickSize"],
+    optionalFields: [],
+  },
 ];
 
 /** A valid §7.7 position intent. */
