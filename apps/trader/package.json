@@ -16,7 +16,7 @@
     "build:register": "esbuild src/register/main.ts --bundle --platform=node --format=esm --target=node24 \"--banner:js=import { createRequire as __bundleCreateRequire } from 'node:module'; const require = __bundleCreateRequire(import.meta.url);\" --outfile=dist/register.mjs",
     "register": "pnpm run typecheck && pnpm run build:register && node ./dist/register.mjs",
     "test:integration": "vitest run --config ../../test/integration/paper-trader/vitest.config.ts",
-    "test:fault:live-safety": "tsc --noEmit -p ../../test/fault-injection/live-safety/tsconfig.json && vitest run --config ../../test/fault-injection/live-safety/vitest.config.ts && vitest run --config ../../test/fault-injection/live-safety/postgres/vitest.config.ts"
+    "test:fault:live-safety": "tsc --noEmit -p ../../test/fault-injection/live-safety/tsconfig.json && vitest run --config ../../test/fault-injection/live-safety/vitest.config.ts"
   },
   "dependencies": {
     "@polymarket-bot/capital-allocator": "workspace:*",

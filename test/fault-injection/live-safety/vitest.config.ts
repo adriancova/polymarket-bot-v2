@@ -3,19 +3,25 @@
  * `pnpm --filter @polymarket-bot/trader test:fault:live-safety`.
  *
  * The root runner (`test/vitest.config.ts`) does not execute
- * `test/fault-injection/**`, and the root `test:fault` chain and CI run only
- * the WAL suite today; wiring this suite into them is the orchestrator's (as
- * `CI-5` does for the OMS and reconciliation suites). The suite imports the
- * packages, `apps/trader/src/live-safety` and the shared test support by
- * relative path, so it needs no alias. The script typechecks this tree first
+ * `test/fault-injection/**`. The root `test:fault` chain and CI run the WAL,
+ * OMS and reconciliation suites (`CI-5`) but not this one; wiring it in is
+ * the orchestrator's. The suite imports the packages,
+ * `apps/trader/src/live-safety` and the shared test support by relative path,
+ * so it needs no alias. The script typechecks this tree first
  * (`./tsconfig.json`): the root `typecheck`'s test program includes only
  * `test/unit`.
  *
  * Nothing here reaches a network, a database, a key or a venue: every port
- * is a fake, and the network tripwire guards every file. The REAL-PostgreSQL
- * half (`postgres/`, Docker) is excluded here and has its own config
- * (`postgres/vitest.config.ts`); the same script runs it after this one (r2
- * O3), so the script needs Docker.
+ * is a fake, and the network tripwire guards every file. The script needs no
+ * Docker.
+ *
+ * `WP-320` r5: this tree once held a real-PostgreSQL half, under a second
+ * runner here. That half drove the process that writes the kill-switch rows,
+ * and that process's code may execute only under its own guarded runners.
+ * This runner loads the secure adapter, so the half now lives in that
+ * process's guarded real-PostgreSQL suite under `test/integration/`. The
+ * suite's `runner-hygiene.test.ts` pins that nothing in this tree names that
+ * process again.
  */
 
 import { dirname, resolve } from "node:path";
@@ -31,7 +37,7 @@ export default defineConfig({
   test: {
     root: here,
     include: ["**/*.test.ts"],
-    exclude: ["**/node_modules/**", "postgres/**"],
+    exclude: ["**/node_modules/**"],
     passWithNoTests: false,
   },
 });

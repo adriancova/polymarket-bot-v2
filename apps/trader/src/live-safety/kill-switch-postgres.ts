@@ -24,8 +24,8 @@
  * pinned by the typechecker against `@polymarket-bot/storage-postgres`'s table
  * types and compiled in `kill-switch-postgres.test.ts`, which also runs
  * `read()` over a recording handle (both orderings, in order); it runs against
- * a real PostgreSQL in
- * `test/fault-injection/live-safety/postgres/kill-switch-reader.pg.test.ts`.
+ * a real PostgreSQL, under the control API's no-signer guard (r5), in
+ * `test/integration/control-api/postgres/trader-kill-switch-postgres.test.ts`.
  */
 
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";

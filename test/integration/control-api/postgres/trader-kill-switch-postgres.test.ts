@@ -22,20 +22,66 @@
  * - I7: the reader's SECOND ordering (`occurred_at`) is what keeps a switch
  *   engaged when the database's `recorded_at` order shows its release last.
  *
+ * ## Why it lives here (`WP-320` r5)
+ *
+ * It used to sit in the live-safety fault tree, under a runner of its own
+ * that did not install the control API's run-time no-signer guard. That broke
+ * `CONTROL-1b` r4's property, that control-api code executes only under a
+ * guarded runner (CI run 37314515160, step "Integration tests 6/7"). That
+ * fault tree's other runner loads the secure adapter, so control-api code
+ * must never share a runner with it. Here it runs under
+ * `vitest.config.ts` beside this file, which installs both halves of the
+ * guard, through
+ * `pnpm --filter @polymarket-bot/control-api test:integration:postgres`
+ * (CI step 7/7), and acceptance 3's scan reads it.
+ *
+ * Of the trader it loads ONLY the reader (`kill-switch-postgres.ts`) and the
+ * monitor (`kill-switch.ts`), by relative path, like
+ * `trader-halts-postgres.test.ts` beside it. Both have type-only imports, so
+ * at run time they load no other module. The monitor's clock and its
+ * release-finality port are the two small doubles below: the trader's shared
+ * fakes module would pull the whole live-safety composition into this runner.
+ *
  * Docker is required (`vitest.config.ts` beside this file). Throwaway
  * credentials only; no venue, no signer, no real credential. PAPER only.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { ControlPlane } from "@polymarket-bot/control-api";
+import type { AuditAppendResult, ControlAuditRecord, ControlAuditSink } from "@polymarket-bot/observability";
+import { uuidV7 } from "@polymarket-bot/storage-postgres";
+import { createIsolatedDatabase, createMigratedContext, startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+
 import { PostgresControlAuditSink } from "../../../../apps/control-api/src/adapters/postgres-audit-sink.js";
-import { ControlPlane } from "../../../../apps/control-api/src/control-plane.js";
-import { FakeReleaseFinality, ManualClock } from "../../../../apps/trader/src/live-safety/fakes.test-support.js";
 import { createPostgresKillSwitchReader } from "../../../../apps/trader/src/live-safety/kill-switch-postgres.js";
-import { KillSwitchMonitor } from "../../../../apps/trader/src/live-safety/kill-switch.js";
-import type { AuditAppendResult, ControlAuditRecord, ControlAuditSink } from "../../../../packages/observability/src/index.js";
-import { uuidV7 } from "../../../../packages/storage-postgres/src/ids.js";
-import { createIsolatedDatabase, createMigratedContext, startPostgresContainer, type TestContext } from "../../../../packages/storage-postgres/src/testing/index.js";
+import { KillSwitchMonitor, type KillSwitchReleaseFinality, type KillSwitchReleaseRef } from "../../../../apps/trader/src/live-safety/kill-switch.js";
+
+/** The monitor's monotonic clock, stepped by hand: the settle window is the monitor's, timed from first sight. */
+class ManualClock {
+  #now = 5_000_000;
+
+  monotonicMs(): number {
+    return this.#now;
+  }
+
+  advance(ms: number): void {
+    this.#now += ms;
+  }
+}
+
+/**
+ * The composition's positive evidence that the control plane APPLIED a release (r2 X2): every release is final when
+ * `all`, and otherwise only those in `confirmed`.
+ */
+class FakeReleaseFinality implements KillSwitchReleaseFinality {
+  all = true;
+  readonly confirmed = new Set<string>();
+
+  isFinal(release: KillSwitchReleaseRef): boolean {
+    return this.all || this.confirmed.has(release.killSwitchEventId);
+  }
+}
 
 const ACCOUNT = "acct-1";
 const SETTLE_MS = 2_000;
@@ -158,7 +204,7 @@ describe("r1 I6: a release the control plane refused and voided never releases t
     const late = await database().pool.query<{ count: string }>(`select count(*)::text as count from ops.kill_switch_events where kill_switch_event_id = $1`, [releaseId]);
     expect(late.rows[0]?.count).toBe("1");
     for (const elapsed of [0, SETTLE_MS - 1]) {
-      await clock.advance(elapsed);
+      clock.advance(elapsed);
       expect(await monitor.refresh()).toBe(true);
       expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: true, blocksAllSubmissions: true } });
     }
@@ -166,7 +212,7 @@ describe("r1 I6: a release the control plane refused and voided never releases t
     // r2 X2: the settle window passes and the VOID is STILL held (late, or never landing): the trader keeps the
     // switch, however long. On 21aee56 this read gave engaged: [] and stopsHeartbeat: false.
     for (let step = 0; step < 5; step += 1) {
-      await clock.advance(SETTLE_MS + 1);
+      clock.advance(SETTLE_MS + 1);
       expect(await monitor.refresh()).toBe(true);
       expect(await voidLanded(releaseId)).toBe(false);
       expect(control.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
@@ -182,7 +228,7 @@ describe("r1 I6: a release the control plane refused and voided never releases t
     await holding.land();
     await waitFor(async () => voidLanded(releaseId));
     for (let step = 0; step < 4; step += 1) {
-      await clock.advance(SETTLE_MS);
+      clock.advance(SETTLE_MS);
       expect(await monitor.refresh()).toBe(true);
       const snapshot = monitor.snapshot();
       expect(snapshot).toMatchObject({ known: true, effects: { stopsHeartbeat: true } });
@@ -208,7 +254,7 @@ describe("r1 I6: a release the control plane refused and voided never releases t
     expect(await monitor.refresh()).toBe(true);
     const pending = monitor.snapshot();
     expect(pending.known && pending.effects.submissionBlockedMarkets.has(MARKET)).toBe(true);
-    await clock.advance(SETTLE_MS);
+    clock.advance(SETTLE_MS);
     expect(await monitor.refresh()).toBe(true);
     // Settled and unvoided, but no positive evidence yet: still the switch (r2 X2).
     const unconfirmed = monitor.snapshot();
@@ -246,7 +292,7 @@ describe("r1 I7: the reader's two orderings and its VOID lookup, on real rows", 
     // Every release FINAL here, so only the engage row (the occurred_at ordering) can keep the switch engaged.
     const monitor = new KillSwitchMonitor({ reader, clock, accountRef: ACCOUNT, releaseSettleMs: SETTLE_MS, releaseFinality: new FakeReleaseFinality() });
     await monitor.refresh();
-    await clock.advance(SETTLE_MS);
+    clock.advance(SETTLE_MS);
     await monitor.refresh();
     const snapshot = monitor.snapshot();
     expect(snapshot.known && snapshot.effects.submissionBlockedMarkets.has(scopeRef)).toBe(true);

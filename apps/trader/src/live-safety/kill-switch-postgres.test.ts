@@ -3,8 +3,8 @@
  * over a RECORDING database handle (no database is reached here) — both
  * orderings are executed and both answers returned, in order, with the VOID
  * lookup's answer mapped fail-closed (r1, findings I6 and I7). The read runs
- * against a real PostgreSQL in
- * `test/fault-injection/live-safety/postgres/kill-switch-reader.pg.test.ts`.
+ * against a real PostgreSQL, under the control API's no-signer guard (r5), in
+ * `test/integration/control-api/postgres/trader-kill-switch-postgres.test.ts`.
  */
 
 import { createDatabase } from "@polymarket-bot/storage-postgres";
