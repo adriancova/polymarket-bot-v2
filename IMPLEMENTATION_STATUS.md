@@ -59,7 +59,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
   - Q3: a venue round records the outcome-token pairing, the discovery surface, the window-schedule fields and the trading-delay field. It is combined with the settlement-spec prep.
   - Q4: the series is pinned by registering `{strategy, series}` in `strategy.configs.parameters`.
 
-  It relaunches after the venue round, from the plan in `~/pmb-rounds/rollover-1/handoff-r0-stop.md`.
+  **Relaunched 2026-10-04** with these grants and the Q3 facts from `VENUE-SETL-1`. Extra paths: `packages/domain/**` (only `SeriesWindowAdmitted@1`) and `packages/strategy-runtime/**` (only the sequence source). Verifiers: Opus and gpt-6-astra, reconciled.
 - **`WP-290`**: Ready (authorized) 2026-10-03 under the Wave 3 authorization; its dependencies `WP-200`, `WP-270` and `WP-280` are met. It is account reconciliation, PAPER only. Paths: the work plan's (`packages/oms/src/reconciliation/**`, `packages/ledger/src/reconciliation/**`, `test/fault-injection/reconciliation/**`, `docs/runbooks/reconciliation.md`), plus export lines and a fault-script line. Verifiers: Opus and gpt-6-astra, reconciled (ruled safety-critical).
 - `CKPT-1` is Complete (2026-10-03, `891ccdd`); see [Work packages](#work-packages). It closes `DURABLE-1` LOW-3; residual `CKPT1-PG-RNG-STATUS` is open.
 - `TC-LOWS-1` is Complete (2026-10-04, `9033743`); see [Work packages](#work-packages). It closes `CO2N1-LOWS`, and trims `CADENCE1-LOWS` and `PROV1-LOWS`.
@@ -212,7 +212,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-270` | OMS and signed-order persistence (Wave 3, PAPER only) | Complete (2026-10-03) | `259c964` | [WP-270](docs/handoffs/WP-270.md) |
 | `WP-280` | Authenticated user-stream adapter (Wave 3, PAPER only) | Complete (2026-10-03) | `065716f` | [WP-280](docs/handoffs/WP-280.md) |
 | `WP-310` | Rate-limit budgets and matching-engine modes (Wave 3, PAPER only) | Complete (2026-10-03) | `fdf27ff` | [WP-310](docs/handoffs/WP-310.md) |
-| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Ruled 2026-10-04; waits on the venue round** | — | — |
+| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | **Relaunched 2026-10-04 (grants Q1–Q4)** | — | — |
 | `WP-290` | Account reconciliation (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-03 | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
