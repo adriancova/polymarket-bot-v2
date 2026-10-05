@@ -46,13 +46,14 @@
  *
  * The control plane's bound applies to EVERY append, the engage that must
  * succeed included. It used to be 25 ms, and on a loaded runner a real insert
- * outlived it: CI run 37332689128 refused the engages of both I6 tests. The
- * held release does not need a short bound, because the holding sink parks
- * its append until the test lands it, so it outlives any bound. The bound is
- * therefore {@link AUDIT_APPEND_BOUND_MS}, far above the measured latency of
- * a real append under load. Its only cost is that the held release waits it
- * out once. The I6 test pins that the refusal is the bound's: the held append
- * is the control plane's one unsettled append until the sink answers it.
+ * outlived it: CI run 37332689128 refused the engage in both tests of the I6
+ * block. The held release needs no short bound, because the holding sink
+ * parks its append until the test lands it, so it outlives any bound. The
+ * bound is therefore {@link AUDIT_APPEND_BOUND_MS}, against real appends that
+ * took under 80 ms in `FLAKE-KS-1`'s load runs. The cost is that the held
+ * release waits the bound out once. The I6 test pins that its refusal is the
+ * bound's: the held append is the control plane's one unsettled append until
+ * the sink answers it.
  *
  * Docker is required (`vitest.config.ts` beside this file). Throwaway
  * credentials only; no venue, no signer, no real credential. PAPER only.
