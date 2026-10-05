@@ -77,7 +77,7 @@ import {
 } from "@polymarket-bot/simulation";
 import { createStrategyInstanceRuntime } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { DeterministicIdFactory, type PostingIdentity } from "@polymarket-bot/trading-core";
@@ -89,7 +89,7 @@ import {
   type AccountingChecks,
 } from "@polymarket-bot/trading-core";
 import { HaltController } from "@polymarket-bot/trading-core";
-import { PER_FRAME_EVALUATION_CADENCE } from "@polymarket-bot/trading-core";
+import { PAPER_EVALUATION_CADENCE, PER_FRAME_EVALUATION_CADENCE, type EvaluationCadenceOption } from "@polymarket-bot/trading-core";
 import { HealthState, RealizedPnlBook } from "@polymarket-bot/trading-core";
 import { healthResponseBody } from "./health-server.js";
 import { InstanceRegistry } from "@polymarket-bot/trading-core";
@@ -159,6 +159,52 @@ const T_START_MS = Date.parse("2026-05-01T09:00:00.000Z");
 const T_OPEN = "2026-05-01T09:00:00.000Z";
 const T_CLOSE = "2026-05-02T09:00:00.000Z";
 const STEP_MS = 100;
+
+/**
+ * `TC-LOWS-1` (O07): every test of this file runs at BOTH evaluation
+ * cadences — ADR-024's per-frame value 0, as a declared reproduction
+ * (ADR-026 D1.6), under the test names it always had, and the production
+ * cadence every new run uses (ADR-026 D1.5: 1,000 ms / 5,000 ms), under the
+ * same names with {@link PRODUCTION_SUFFIX}.
+ *
+ * Each {@link tick} is ONE strategy step: the double's `onFeatures` books ten
+ * fills. At the production cadence a market is evaluated at most once per
+ * 1,000 ms of event time (ADR-026 D2.4), so there a tick after the first comes
+ * 1,000 ms after the previous tick ({@link stepsApart} events), and every tick
+ * is still one step; the nine ticks between are sent, 100 ms apart, and each
+ * is coalesced (D5) — a harvest point that books nothing (D4). A test whose events
+ * share an instant, or step backwards, coalesces at the production cadence
+ * (D2.4, D2.8): it says so where its assertions differ, and why.
+ */
+interface CadenceCase {
+  readonly production: boolean;
+  readonly option: EvaluationCadenceOption;
+}
+const REPRODUCTION: CadenceCase = {
+  production: false,
+  option: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:apps/trader/src/loop-folds.test.ts" },
+};
+const PRODUCTION: CadenceCase = { production: true, option: PAPER_EVALUATION_CADENCE };
+const PRODUCTION_SUFFIX = " [at the production cadence, ADR-026 D1.5: 1,000 ms / 5,000 ms]";
+/** The cadence the tests now running use: set by {@link describeAtEachCadence}. */
+let cadence: CadenceCase = REPRODUCTION;
+
+/** `describe`, twice: at the reproduction cadence (the name as it was), then at the production one. */
+function describeAtEachCadence(name: string, body: () => void): void {
+  for (const each of [REPRODUCTION, PRODUCTION]) {
+    describe(each.production ? `${name}${PRODUCTION_SUFFIX}` : name, () => {
+      beforeAll(() => {
+        cadence = each;
+      });
+      body();
+    });
+  }
+}
+
+/** Events between two strategy steps: 1 at the per-frame cadence, 10 (1,000 ms) at the production one. */
+function stepsApart(): number {
+  return cadence.production ? 1_000 / STEP_MS : 1;
+}
 
 function feeSnapshot(): FeeScheduleSnapshot {
   return {
@@ -343,6 +389,8 @@ interface Harness {
    */
   readonly book: RealizedPnlBook | undefined;
   ordinal: number;
+  /** `TC-LOWS-1` (O07): the ordinal of the last {@link tick} at its ordinal's own instant. */
+  lastTick: number | undefined;
 }
 
 /**
@@ -492,16 +540,13 @@ function assemble(
     // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is FOLD-1 held-
     // ledger and PnL folds, not the cadence — but its timelines were written for
     // ADR-024's per-frame cadence: fills booked at named events, several at one
-    // instant. Under the production cadence (1,000 ms / 5,000 ms) those evaluations
-    // are coalesced, and 15 of this file's 23 tests fail under it (measured in r1; the
-    // failures were not analysed one by one). So it REPRODUCES the ADR-024 behaviour
-    // its timelines pin (the value 0, declared); this subject is NOT exercised here
-    // under the production cadence. The cadence is pinned by `cadence.test.ts` and
-    // `loop-cadence.test.ts`.
-    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:apps/trader/src/loop-folds.test.ts" },
+    // instant. `TC-LOWS-1` (O07): every test now runs at both cadences
+    // ({@link describeAtEachCadence}); where an assertion differs at the
+    // production cadence, the test says where and why.
+    evaluationCadence: cadence.option,
   });
   wiring.loop = loop;
-  return { loop, store, book, ordinal: 0 };
+  return { loop, store, book, ordinal: 0, lastTick: undefined };
 }
 
 function envelope(
@@ -558,6 +603,19 @@ async function open(harness: Harness): Promise<void> {
  * instant instead of its ordinal's.
  */
 async function tick(harness: Harness, at?: string): Promise<void> {
+  // `TC-LOWS-1` (O07): at the production cadence this tick comes 1,000 ms
+  // after the previous one (ADR-026 D2.4), so it is a strategy step too. The
+  // ticks between are SENT, 100 ms apart: each is coalesced — no evaluation,
+  // no fill (D5) — and still a harvest point (D4).
+  if (at === undefined && harness.lastTick !== undefined) {
+    while (harness.ordinal < harness.lastTick + stepsApart() - 1) await yesTick(harness);
+  }
+  if (at === undefined) harness.lastTick = harness.ordinal + 1;
+  await yesTick(harness, at);
+}
+
+/** The deep YES snapshot {@link tick} sends. */
+async function yesTick(harness: Harness, at?: string): Promise<void> {
   await feed(harness, (n) =>
     envelope(
       n,
@@ -619,7 +677,7 @@ function expectPnlEqualsRebuild(loop: CoreLoop): void {
   expect(serializePnlState(held)).toBe(serializePnlState(rebuilt.value));
 }
 
-describe("FOLD-1: held equals rebuilt over a long synthetic run (NOT a soak — §16.7)", () => {
+describeAtEachCadence("FOLD-1: held equals rebuilt over a long synthetic run (NOT a soak — §16.7)", () => {
   it(
     "over 1,000+ fills with the ledger check after EVERY fill: every check ran and matched; the held view and PnL state equal their rebuilds",
     async () => {
@@ -627,7 +685,8 @@ describe("FOLD-1: held equals rebuilt over a long synthetic run (NOT a soak — 
       await open(harness);
       let lastPnlCompare = 0;
       while (harness.loop.health().seams.folds.fillsPosted < 1_000) {
-        expect(harness.ordinal, "the synthetic run stopped filling").toBeLessThan(200);
+        // `TC-LOWS-1` (O07): ten times the ordinals at the production cadence (one step per ten).
+        expect(harness.ordinal, "the synthetic run stopped filling").toBeLessThan(200 * stepsApart());
         await tick(harness);
         const folds = harness.loop.health().seams.folds;
         // Every posted fill was checked, and no check found a difference.
@@ -642,6 +701,11 @@ describe("FOLD-1: held equals rebuilt over a long synthetic run (NOT a soak — 
       }
       const health = harness.loop.health();
       expect(health.halts).toEqual([]);
+      // `TC-LOWS-1` (O07): the regime each cadence ran — every tick a step at
+      // the per-frame cadence; at the production one nine coalesced ticks
+      // between two steps (ADR-026 D2.4, D5), each booking nothing.
+      const steps = health.seams.folds.fillsPosted / 10;
+      expect(health.loop.evaluationsCoalesced).toBe(cadence.production ? 9 * (steps - 1) : 0);
       expect(health.seams.folds).toMatchObject({
         checkEveryFills: 1,
         pnlCheck: false,
@@ -702,7 +766,7 @@ describe("FOLD-1: held equals rebuilt over a long synthetic run (NOT a soak — 
   }, 120_000);
 });
 
-describe("FOLD-1: the PAPER cadence, and no fold from zero per event", () => {
+describeAtEachCadence("FOLD-1: the PAPER cadence, and no fold from zero per event", () => {
   it("checks at posted fill 50, 100, 150 and at the end of the run; projectLedger runs at construction and in those checks ONLY", async () => {
     const before = hooks.projectLedgerCalls;
     const harness = assemble(undefined);
@@ -752,7 +816,7 @@ describe("FOLD-1: the PAPER cadence, and no fold from zero per event", () => {
   }, 120_000);
 });
 
-describe("FOLD-1: a held state that diverges from its rebuild is CAUGHT — GLOBAL ACCOUNTING_REBUILD_MISMATCH", () => {
+describeAtEachCadence("FOLD-1: a held state that diverges from its rebuild is CAUGHT — GLOBAL ACCOUNTING_REBUILD_MISMATCH", () => {
   it("an in-place corruption of the held view (the container guard's documented bypass) halts GLOBAL at the next check, counted; the view is replaced by the rebuild", async () => {
     const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
     await open(harness);
@@ -871,7 +935,7 @@ function unownEveryFill(page: FillsPage): FillsPage {
   };
 }
 
-describe("FOLD1-R1-2: EVERY due posted fill runs every enabled check — unowned fills and the store-failure return included", () => {
+describeAtEachCadence("FOLD1-R1-2: EVERY due posted fill runs every enabled check — unowned fills and the store-failure return included", () => {
   it("UNOWNED fills run the PnL check too: a corrupted held PnL state is caught at the FIRST unowned fill, a GLOBAL halt", async () => {
     const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
     await open(harness);
@@ -921,7 +985,7 @@ describe("FOLD1-R1-2: EVERY due posted fill runs every enabled check — unowned
   });
 });
 
-describe("FOLD1-R1-1: a PnL check never certifies a held stream that is BEHIND its records", () => {
+describeAtEachCadence("FOLD1-R1-1: a PnL check never certifies a held stream that is BEHIND its records", () => {
   it("a ledger-store failure leaves the stream behind (as base's snapshot was); END_OF_RUN catches it up and compares the WHOLE list", async () => {
     // The PnL check is on but never due on the cadence, so only END_OF_RUN runs it.
     const harness = assemble({ everyFills: 1_000, pnl: true });
@@ -975,7 +1039,7 @@ describe("FOLD1-R1-1: a PnL check never certifies a held stream that is BEHIND i
   });
 });
 
-describe("FOLD-1: a fold that fails is a failed posting — the ledger and its view never move apart", () => {
+describeAtEachCadence("FOLD-1: a fold that fails is a failed posting — the ledger and its view never move apart", () => {
   it("a throwing step: the fill is NOT booked, the market halts LEDGER_POSTING_REFUSED (stage VIEW_FOLD), ledgerRefusals counts it", async () => {
     const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
     await open(harness);
@@ -1023,7 +1087,7 @@ describe("FOLD-1: a fold that fails is a failed posting — the ledger and its v
   });
 });
 
-describe("FOLD-1 ruling F3: a refused PnL record stops that instance's snapshots at the SAME fill as a from-zero fold — now counted", () => {
+describeAtEachCadence("FOLD-1 ruling F3: a refused PnL record stops that instance's snapshots at the SAME fill as a from-zero fold — now counted", () => {
   it("a duplicate-ref record planted in the third fill's posting: snapshots for fills 1-2 only (the from-zero model's answer), one counted refusal, no mismatch", async () => {
     const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
     await open(harness);
@@ -1187,7 +1251,7 @@ const exitsOnFill: Strategy<unknown, CyclingState> = {
   },
 };
 
-describe("SNAP-1: one PnL snapshot per instance per instant — the database's key, in the loop", () => {
+describeAtEachCadence("SNAP-1: one PnL snapshot per instance per instant — the database's key, in the loop", () => {
   it("ten fills in one event write ONE row: base's LAST per-fill row at that instant, byte for byte; the per-fill PnL checks are unchanged", async () => {
     const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
     await open(harness);
@@ -1217,6 +1281,23 @@ describe("SNAP-1: one PnL snapshot per instance per instant — the database's k
     await tick(harness, shared); // event 5, SAME receivedAt: SELL 50 @ 0.32 — and the run's LAST event
     const health = harness.loop.health();
     expect(health.halts).toEqual([]);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): at the production cadence event 5 lies 0 ms after
+      // the market's last evaluation (event 4, the same instant), so it does
+      // not evaluate it (ADR-026 D2.4): coalesced, it books nothing (D5), and
+      // the instant's row is not replaced. A second harvest at one instant
+      // that DOES book fills — the replacement this test pins — is reached at
+      // the production cadence by the next test's shape (an exit from
+      // `onFill`, filled at submission, harvested by a later event at the same
+      // instant: D4 leaves that harvest point as it was), which runs at both.
+      expect(health.loop.evaluationsCoalesced).toBe(1);
+      expect(health.seams.folds).toMatchObject({ fillsPosted: 10, pnlChecks: 10, pnlMismatches: 0, pnlRefusals: {} });
+      expect(harness.store.pnlSnapshots).toEqual([...modelRows(harness.loop, 10, shared, "0.34")]);
+      expect(harness.store.pnlSnapshotReplacements).toBe(0);
+      expect(harness.book?.view()).toEqual(bookReads("0"));
+      expect(harness.loop.checkAccountingRebuild("SHUTDOWN").matched).toBe(true);
+      return;
+    }
     expect(health.seams.folds).toMatchObject({ fillsPosted: 20, pnlChecks: 20, pnlMismatches: 0, pnlRefusals: {} });
     // ONE row at the shared instant — the database's key — and it holds the state after ALL
     // twenty fills, marked at the last one's 0.32: the from-zero model's 20th per-fill row.
@@ -1263,6 +1344,33 @@ describe("SNAP-1: one PnL snapshot per instance per instant — the database's k
     await tick(harness, instantOf(5)); // event 4, stamped at instant 5: BUY
     await tick(harness, instantOf(4)); // event 5, stamped EARLIER: SELL — a distinct identity
     expect(harness.loop.health().halts).toEqual([]);
+    if (cadence.production) {
+      // `TC-LOWS-1` (O07): at the production cadence the cadence clock is the
+      // high-water mark of the applied instants (ADR-026 D2.1), so event 5,
+      // stamped earlier, leaves it at instant 5: 0 ms after the market's last
+      // evaluation, coalesced (D2.4, D2.8) — it books nothing, and only
+      // instant 5 has a row.
+      expect(bookedFills(harness.loop)).toBe(10);
+      expect(harness.store.pnlSnapshots).toEqual([...modelRows(harness.loop, 10, instantOf(5), "0.34")]);
+      expect(harness.store.pnlSnapshotReplacements).toBe(0);
+      // The subject at the production cadence: fills HARVESTED at an earlier
+      // instant keep their own row there. An exit from `onFill` fills at
+      // submission, and a backward-stamped event harvests it: its harvest
+      // point is the per-frame one (D4), whatever the cadence.
+      const exits = assemble(EVERY_FILL_ACCOUNTING_CHECKS, { observe: true, strategy: exitsOnFill });
+      await open(exits);
+      await tick(exits, instantOf(5)); // BUY at instant 5; the first onFill SELLS, filled at submission
+      await closing(exits, instantOf(4)); // stamped EARLIER: its harvest books the SELL's ten fills
+      expect(exits.loop.health().halts).toEqual([]);
+      expect(bookedFills(exits.loop)).toBe(20);
+      expect(exits.store.pnlSnapshots).toEqual([
+        ...modelRows(exits.loop, 10, instantOf(5), "0.34"),
+        ...modelRows(exits.loop, 20, instantOf(4), "0.32"),
+      ]);
+      expect(exits.store.pnlSnapshotReplacements).toBe(0);
+      expect(exits.book?.view()).toEqual(bookReads("-1"));
+      return;
+    }
     // Two instants with fills, two rows, each the state after its own last fill: nothing lost,
     // nothing moved to an instant where the instance had no fill.
     expect(harness.store.pnlSnapshots).toEqual([
@@ -1287,7 +1395,7 @@ describe("SNAP-1: one PnL snapshot per instance per instant — the database's k
   });
 });
 
-describe("SNAP-1: a halt latched mid-harvest, and the staged row", () => {
+describeAtEachCadence("SNAP-1: a halt latched mid-harvest, and the staged row", () => {
   it("a REFUSED posting mid-harvest (MARKET LEDGER_POSTING_REFUSED) does not stop the row: it is the state after the last BOOKED fill", async () => {
     const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
     await open(harness);
@@ -1320,6 +1428,8 @@ describe("SNAP-1: a halt latched mid-harvest, and the staged row", () => {
       return await append(transaction);
     };
     await tick(harness); // event 5: the SELL
+    // `TC-LOWS-1` (O07): event 14 at the production cadence (1,000 ms after event 4, ADR-026 D2.4).
+    const sellAt = instantOf(harness.ordinal);
     const health = harness.loop.health();
     expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
     expect(health.halts[0]?.detail).toContain("the ledger transaction could not be persisted");
@@ -1327,7 +1437,7 @@ describe("SNAP-1: a halt latched mid-harvest, and the staged row", () => {
     expect(harness.store.pnlSnapshots).toEqual([
       ...modelRows(harness.loop, 10, instantOf(4), "0.34"),
       // The state after fill 14 — the last row base wrote at instant 5 before fill 15's failure.
-      ...modelRows(harness.loop, 14, instantOf(5), "0.32"),
+      ...modelRows(harness.loop, 14, sellAt, "0.32"),
     ]);
   });
 
@@ -1355,13 +1465,22 @@ describe("SNAP-1: a halt latched mid-harvest, and the staged row", () => {
   });
 
   it("a REPLACEMENT the store refuses: the same GLOBAL STORE_UNAVAILABLE, latched BEFORE that harvest's deliveries; the row keeps the earlier state and the TRDR-3 book does not move (SNAP1-R1)", async () => {
-    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS, { observe: true });
+    // `TC-LOWS-1` (O07): at the production cadence a second TICK at the same
+    // instant is coalesced (ADR-026 D2.4) and books nothing, so it could never
+    // reach the replacement. There the replacement comes from an exit from
+    // `onFill`, filled at submission and harvested by a later event at the
+    // same instant (D4: that harvest point is unchanged) — refused the same way.
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS, cadence.production ? { observe: true, strategy: exitsOnFill } : { observe: true });
     await open(harness);
     const shared = instantOf(4);
     await tick(harness, shared); // event 4: BUY, row inserted, its fills delivered
     const decisionsBefore = harness.loop.decisions().length;
     harness.store.failOnly(["replacePnlSnapshot"], "UNAVAILABLE", "SNAP-1 r1 test: the replacement is refused");
-    await tick(harness, shared); // event 5, SAME instant: SELL — its flush must REPLACE, and is refused
+    if (cadence.production) {
+      await closing(harness, shared); // event 5, SAME instant: its harvest books the SELL — its flush must REPLACE
+    } else {
+      await tick(harness, shared); // event 5, SAME instant: SELL — its flush must REPLACE, and is refused
+    }
     const health = harness.loop.health();
     expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.action, halt.at])).toEqual([
       ["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT", shared],

@@ -7,7 +7,7 @@ not representable in its request grammar.
 
 | File | Title | Reads |
 | --- | --- | --- |
-| `operations-dashboard.json` | Polymarket bot — operations (paper) | the trader health report the control API holds, plus the control plane's own state |
+| `operations-dashboard.json` | Polymarket bot — operations (paper) | the trader health report the control API holds, plus the control plane's own state and (`CONTROL-2`) the open trader halts it reads from `ops.incidents` — the "Open trader halts (ops.incidents)" panel, whose rows outlive a trader that halted and exited |
 | `trading-dashboard.json` | Polymarket bot — trading (paper) | the trader health report: decisions, risk, execution, accounting |
 | `fidelity-dashboard.json` | Polymarket bot — fidelity (paper) | `WP-140`'s recorder exporter, plus three panels with no producer yet |
 

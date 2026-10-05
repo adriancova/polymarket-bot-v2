@@ -145,7 +145,13 @@ function observe(grouped: boolean, refuse: number | undefined): Observed {
           (await write(inner, { record, telemetry }))
             ? portOk(null)
             : portFailed<null>(REFUSAL.kind, REFUSAL.detail),
-        saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+        // `CKPT-1` (ADR-027 D3): a decision that owes a checkpoint is written
+        // WITH it — refused as one write (neither row lands), observed as the
+        // decision's write.
+        persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) => {
+          if (!(await write(inner, { record, telemetry }))) return portFailed<null>(REFUSAL.kind, REFUSAL.detail);
+          return await inner.saveCheckpoint(checkpoint, capturedAt);
+        },
         appendLedgerTransaction: (transaction) => {
           timeline.push({ op: "ledger_write", undurableIntentDecisions: undurable(inner, true) });
           return inner.appendLedgerTransaction(transaction);

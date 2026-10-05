@@ -116,6 +116,63 @@ export const PortfolioViewSchema = z.strictObject({
 export type PortfolioView = z.infer<typeof PortfolioViewSchema>;
 
 /**
+ * `CAP-1` (orchestrator ruling, 2026-10-04): one market token's
+ * FILLED-BUT-UNBOOKED BUY exposure of the evaluating strategy — the shares,
+ * and the exact debit (`price × shares`, summed), of BUY fills the venue has
+ * made that no booked position carries yet.
+ *
+ * THE WINDOW IT CLOSES. A fill becomes a position only at its harvest point
+ * (ADR-024; ADR-026 for the carried path), and its order leaves
+ * `portfolio.openOrders` as soon as it is terminal. An evaluation in between
+ * saw the fill in NEITHER view, so §9.8 checks 16 and 17 undercounted exactly
+ * what the account had just spent (measured on the `CADENCE-1` R4-CAP shape
+ * with `maxWorstCaseContractualLoss` 8: a third BUY admitted at a 10.20 pUSD
+ * worst case that the booked control refuses).
+ *
+ * WHY IT IS A SEPARATE INPUT, and who reads it. Exactly ONE reader:
+ * `lots.ts`, which counts an entry EXACTLY as it counts a booked position of
+ * the same side and token (shares on that token, `debit` as cost) — so only
+ * checks 16 and 17 see it. It is deliberately in neither of the two views
+ * above, because each of them has a second reader:
+ *
+ * - NOT a position: `intent-view.ts`'s `heldShares` reads `positions` only, so
+ *   no exit can sell, and no SELL is "covered" by, a share that is not booked
+ *   (§6 invariant 10);
+ * - NOT an open order: check 18's self-trade guard reads `openOrders` only, so
+ *   a protective SELL is never refused for crossing an order that has already
+ *   FILLED.
+ *
+ * MONOTONE. Counting it may only make checks 16 and 17 more conservative:
+ * `engine.ts` never lets it LOWER a loss measure below the booked-only one
+ * (`unbooked.ts`).
+ *
+ * The caller may state more than fills here, never less: `packages/trading-core`
+ * also states, at its limit, the remainder of a BUY its portfolio view does not
+ * present (an order no instance owns, or one the venue cannot show), because
+ * the lot builder counts any resting BUY as if it had filled.
+ *
+ * DISJOINT FROM THE OTHER TWO VIEWS (`CAP-1` r1). The lot builder ADDS
+ * positions, these entries and open orders, so a share in two of them is
+ * counted twice. `packages/trading-core` therefore presents a working order in
+ * `openOrders` at its UNFILLED remainder only: its booked fills are positions,
+ * and its filled-but-unbooked shares are entries here.
+ *
+ * BUY-ONLY, AND NOT FAIL-CLOSED FOR AN UNBOOKED SELL (an open item,
+ * `CAP1-OPUS-OBS-1`). A sale the ledger has not booked yet leaves its shares
+ * in the booked position. That over-counts check 16's primary measure (cost),
+ * but credits those shares' value to check 17's scenario loss and to check
+ * 16's resolution limit. When the mark exceeds their cost, both can then admit
+ * what the booked account refuses. This input does not carry sales.
+ */
+export const UnbookedFillExposureSchema = z.strictObject({
+  marketId: InternalMarketIdSchema,
+  side: OutcomeSideSchema,
+  shares: NonNegativeSharesStringSchema,
+  debit: NonNegativeMoneyStringSchema,
+});
+export type UnbookedFillExposure = z.infer<typeof UnbookedFillExposureSchema>;
+
+/**
  * STRUCTURAL PORT — one exposure entry as
  * `@polymarket-bot/capital-allocator` publishes it. Loose: the allocator adds
  * `combined`, which this package deliberately RECOMPUTES from the two
@@ -235,6 +292,19 @@ export const RiskEvaluationInputSchema = z.strictObject({
   freshness: z.array(FreshnessObservationSchema).readonly(),
 
   portfolio: PortfolioViewSchema,
+
+  /**
+   * §9.8 checks 16 and 17 ONLY (`CAP-1`): the strategy's filled-but-unbooked
+   * BUY exposure, per market token — see {@link UnbookedFillExposureSchema}.
+   *
+   * ABSENT MEANS THE CALLER STATES NONE, and the checks then measure exactly
+   * what they measured before this field existed: it can only ADD exposure,
+   * so its absence never makes a check less conservative than it was. (Making
+   * it required would refuse every existing caller's input, a CANCEL's
+   * included, which §6 invariant 13 makes the costlier failure.)
+   * `packages/trading-core` always states it, an empty list included.
+   */
+  unbookedFills: z.array(UnbookedFillExposureSchema).readonly().optional(),
 
   /** §9.8 check 15 input; absent + configured cap = fail closed. */
   exposures: ExposureSnapshotViewSchema.optional(),

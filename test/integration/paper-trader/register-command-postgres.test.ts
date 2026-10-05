@@ -50,7 +50,6 @@ import { createHash } from "node:crypto";
 import { access, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import { uuidV7 } from "@polymarket-bot/storage-postgres";
 import {
   STATIC_BRACKET_NAME,
@@ -88,12 +87,13 @@ import {
   withCuttingProxy,
 } from "./support/register-command.js";
 import { registerThroughTheRepositories, withFreshDatabase as withFreshDatabaseOn, type Fresh } from "./support/registration.js";
+import { startReadyPostgresContainer } from "./support/containers.js";
 
-let container: Awaited<ReturnType<typeof startPostgresContainer>>;
+let container: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 const scratch = new Scratch("postgres");
 
 beforeAll(async () => {
-  container = await startPostgresContainer();
+  container = await startReadyPostgresContainer();
 }, 300_000);
 
 afterAll(async () => {

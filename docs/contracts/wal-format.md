@@ -62,6 +62,28 @@ package writes:
 - Exactly one writer may own a directory at a time. Nothing in this package
   enforces that (see §12, open items).
 
+> **Qualified 2026-10-04 (`GOV-NOTES-2`): with a capacity root, one writer
+> per WAL root.** `WALCAP-1` widened the premise. It merged as `da559ca` on
+> 2026-10-03. Its record is `docs/handoffs/WALCAP-1.md`. The rule above still
+> holds for each directory.
+>
+> - **The scope.** The capacity ledger exists only with `maxTotalBytes` set.
+>   It counts the segment files in the writer's own directory. When
+>   `capacityRootPath` names a WAL root, it also counts those in the root and
+>   in its immediate subdirectories (§11.1's note).
+> - **The gateway names its WAL root.** It writes each epoch to
+>   `<walRoot>/<gatewayEpoch>/` (`GatewayJournal.open`, `apps/data-gateway`).
+>   It is the only production caller of `openWalWriter`.
+> - **The premise.** Over a WAL root, the ledger assumes one writer per root
+>   (the module header of `capacity-ledger.ts`). `WALCAP-1` rests it on
+>   ADR-025 Decision 10, item 3: one gateway runs on the host.
+> - **If two writers shared a root,** each would count the other's new
+>   segment bytes only when it next re-derives its ledger, on a `tick()`. It
+>   would reserve nothing for the other's unwritten frames. Together they
+>   could pass `maxTotalBytes`.
+> - **Nothing enforces it,** in this package or in the gateway: no lock file
+>   exists.
+
 ---
 
 ## 3. Framing
@@ -318,7 +340,7 @@ both are observable (§14.3 includes segment age).
 | Bound | Rule |
 | --- | --- |
 | `maxSegmentBytes` | rotate before appending a record that would take the segment past the bound |
-| `maxSegmentAgeMs` | rotate before appending to a segment at least this old, measured on the **monotonic** clock |
+| `maxSegmentAgeMs` | rotate before appending to a segment at least this old, measured on the **monotonic** clock. *Qualified 2026-10-04 (`GOV-NOTES-2`): since `WALCAP-1` (`da559ca`, 2026-10-03), with `maxTotalBytes` set, this rotation can wait at the threshold. See §11.1's note, "A time rotation can wait at the threshold".* |
 
 Two deliberate exceptions:
 
@@ -604,6 +626,99 @@ refusal/fault counters. Compaction lag and object-upload status belong to
 
 ### 11.1 The hard capacity threshold
 
+> **Corrected 2026-10-04 (`GOV-NOTES-1`): what the threshold counts, what
+> admission charges, and when a time rotation waits.** `WALCAP-1` changed all
+> three. It merged as `da559ca` on 2026-10-03. Its record is
+> `docs/handoffs/WALCAP-1.md`. Where the text below differs, this note states
+> the current rule. Symbols are in `packages/storage-wal/src/`.
+>
+> - **A ledger, not a running sum.** With `maxTotalBytes` set, the writer
+>   counts a per-file ledger of segment files (`SegmentByteLedger` in
+>   `capacity-ledger.ts`). The old count, recovery's tally plus what the
+>   writer wrote, was never lowered.
+> - **Its scope.**
+>   - Every `*.wal.jsonl` file in the writer's own directory. Sidecar
+>     manifests do not count.
+>   - When `capacityRootPath` names a WAL root, also every one in the root
+>     and in its immediate subdirectories. The gateway names its WAL root, so
+>     every epoch counts. The ledger then assumes one writer per WAL root, a
+>     wider premise than §2's one writer per directory. Corrected 2026-10-04
+>     (`GOV-NOTES-2`): was 'It then assumes one writer per WAL root'.
+> - **When it is read.**
+>   - From the disk at open (`openWalWriter`). A read that fails fails the
+>     open.
+>   - Again on every `tick()` while the writer is open, one re-derivation at
+>     a time (`#rescanCapacity`). A re-derivation that fails part-way keeps
+>     the changes it made, and adds one to `capacityRescanFailures`.
+> - **What raises it.** The writer's own writes, and a length read of a file
+>   it does not count yet, or above its entry (`SegmentByteLedger.observe`).
+>   A write that fails is counted before the writer faults
+>   (`#countAfterFailedWrite`).
+> - **What lowers it.**
+>   - An entry is removed only when a direct length read finds its file gone
+>     (`SegmentByteLedger.forget`). On a gateway host that is raw-WAL expiry
+>     (ADR-028 Decision 2). A listing alone removes nothing, and the open
+>     segment is never removed.
+>   - Otherwise an entry falls only to a sealed segment's exact size. The
+>     fault path does so when it truncates a torn tail and then writes the
+>     manifest (`#finalizeFaultedSegment`).
+> - **The admission test** at `enqueue` is now:
+>
+>   ```text
+>   ledgerBytes + inFlightFrameBytes + queuedFrameBytes + candidateFrameBytes + B  ≤  maxTotalBytes
+>   ```
+>
+>   - `ledgerBytes` is the ledger's total.
+>   - `inFlightFrameBytes` are frames `drain()` has taken from the queue and
+>     not yet written. They leave the sum when the ledger counts them.
+>   - B is the open segment's footer, if one is open, plus the larger
+>     framing overhead of two packings (`CapacityProjection`). Each packs the
+>     in-flight frames first, then the queued ones, then the candidate
+>     (`#packFrames`).
+>   - `bySize` packs them from the open segment's room, as below.
+>   - `closedFirst` packs them from a new segment, as if a time rotation
+>     closed the open one first. It applies only when the open segment holds
+>     a record.
+> - **`capacityRemainingBytes`** is
+>   `maxTotalBytes − ledgerBytes − inFlightFrameBytes − queuedFrameBytes − B`,
+>   clamped at zero. Here B packs no candidate: it is the open segment's
+>   footer plus the framing of the unwritten frames alone
+>   (`#reservedOverheadBytes`). So a frame of that size may still be refused,
+>   when packing it starts a further segment.
+> - **A time rotation can wait at the threshold.** With `maxTotalBytes` set,
+>   this qualifies §8's `maxSegmentAgeMs` row, where this contract states the
+>   time half of handoff §9.1's "Rotate by size and time".
+>   - Before a time rotation closes an aged segment, the writer checks the
+>     frames still unwritten (`#mayCloseByTime`).
+>   - The rotation waits only if both hold:
+>     - closing first would cost those frames more framing than keeping the
+>       segment open;
+>     - the ledger, the unwritten frames, the open segment's footer and that
+>       framing would together pass `maxTotalBytes`.
+>   - While it waits, the segment stays open past `maxSegmentAgeMs`. Frames
+>     go into it by the size rule, and a size rotation can still close it.
+>   - The aged segment is closed by time at the first rotation check at which
+>     either condition fails. `drain()` checks only before each batch of
+>     frames it writes, so it always sees a frame unwritten: the next frame
+>     it writes is in flight. When `drain()` takes no frame from the queue, it
+>     returns without a check. `tick()` checks with or without a backlog.
+>     With no frame unwritten, the first condition always fails, so the
+>     first `tick()` that finds no frame unwritten closes it. Corrected
+>     2026-10-04 (`GOV-NOTES-2`): was 'It never checks on an empty queue.'
+>   - A waiting rotation does not hold back `tick()`'s interval `fsync`, so
+>     §9's data-loss bound is unchanged.
+>   - `timeRotationsDeferred` counts each waiting segment once.
+> - **The third consequence below, and §12's "Capacity vs. time-driven
+>   rotation" row, no longer hold.** `closedFirst` reserves the framing of a
+>   time rotation that admission can foresee. One it could not foresee waits
+>   rather than pass `maxTotalBytes`.
+> - **The last paragraph's "recovery's tally plus what it has written"** now
+>   describes only the `totalSegmentBytes` metric with no threshold set, when
+>   `capacityRemainingBytes` is `null`. With a threshold, the count is the
+>   ledger. Neither is a `statvfs` reading.
+> - **Unchanged:** this package deletes nothing, and reaching the threshold
+>   refuses frames with `capacity-exceeded`.
+
 The hard capacity threshold (§4.2) is `maxTotalBytes`: when the directory reaches
 it, frames are refused with `capacity-exceeded`. Nothing is deleted and nothing
 is overwritten — filling the disk is the intended failure direction (ADR-004,
@@ -818,6 +933,21 @@ defined, not a change to any byte.)*
 | Accountability retention | The writer holds the active segment's records in memory until that segment is manifested (§10.2), so its resident set is bounded by `maxSegmentBytes` rather than by the fsync interval. Smaller segments buy a smaller one. |
 | Segment id width | Bounded by contract and enforced at open (§11.2). An injected factory is charged the full bound, so it refuses sooner than the default one would. |
 
+> **Corrected 2026-10-04 (`GOV-NOTES-2`): two rows above.** `WALCAP-1`
+> changed both. It merged as `da559ca` on 2026-10-03. Its record is
+> `docs/handoffs/WALCAP-1.md`.
+>
+> - **Capacity vs. time-driven rotation.** With `maxTotalBytes` set, the
+>   residual this row names no longer exists. Admission reserves the framing
+>   of a time rotation it can foresee (`CapacityProjection.closedFirst`). One
+>   it could not foresee waits rather than pass `maxTotalBytes`
+>   (`#mayCloseByTime`). The cost: a waiting segment stays open past
+>   `maxSegmentAgeMs`, and `timeRotationsDeferred` counts it. §11.1's note
+>   states the rule.
+> - **Single-writer-per-directory.** With `maxTotalBytes` and
+>   `capacityRootPath` set, the capacity ledger also assumes one writer per
+>   WAL root (§2's note). Nothing enforces that either.
+
 ---
 
 ## 13. Worked example
@@ -859,6 +989,7 @@ Implementation: `packages/storage-wal/src/`
 | `queue.ts` | the bounded §8.3 queue |
 | `segment-writer.ts` | one open segment: appends, running digest, and the §9.1 durability watermark |
 | `writer.ts` | rotation, durability policy, refusals, fault handling, the §10.2 accountability retention, the §11.1 capacity projection and the §11.2 id bound |
+| `capacity-ledger.ts` | `SegmentByteLedger`, the §11.1 count of segment bytes, one entry per file; `rescanSegmentBytes`, its re-derivation from the disk |
 | `reader.ts` | sequential reads and validation |
 | `recovery.ts` | the §10 decision table |
 | `node-file-system.ts`, `clock.ts` | the only modules that touch a real disk or clock |
@@ -881,8 +1012,27 @@ suite whose job is to try to break them:
 | §11.1 the capacity bound, framing included, for a **queued burst** at cap-exact thresholds | `wal-capacity.test.ts` |
 | §11.2 the bound holds against an injected `segmentIdFactory`, and an over-long id is refused rather than charged | `wal-capacity.test.ts` |
 | §9 the fsync bound and the byte high-water mark | `fsync-policy.test.ts` |
+| §11.1 the ledger. Expiry gives bytes back. Every epoch under the WAL root counts. With no write of the writer in flight, the count is never below the disk. That holds under a stale or partial listing, a failed re-derivation and a deletion during a rotation. With a threshold, a capacity root on a filesystem that cannot list directories is refused at open. An empty capacity root is refused at open. A writer with no threshold reads no listing on `tick()`. | `packages/storage-wal/src/capacity-relief.test.ts` (unit) |
+| §11.1 a write in flight. While a write of the writer is in flight, the ledger can lag the disk. Admission charges the frames a drain took and is still writing. What admission compares with `maxTotalBytes` is never below the disk, at any instant (`capacity-ledger.ts`, module header). With a drain held in a segment's creation, a write or an `fsync`, the disk never passes the cap. What a failed write left on disk is counted before the writer faults. The count at open fails closed. Re-derivations never overlap. A time rotation never takes the disk past the cap. | `packages/storage-wal/src/capacity-in-flight.test.ts` (unit) |
 
 The defects rounds 2 and 3 found are also covered at unit level, in
 `packages/storage-wal/src/writer.test.ts` and
 `packages/storage-wal/src/manifest.test.ts`, because the fault tree is not yet in
 the root gate or in CI.
+
+> **Corrected 2026-10-04 (`GOV-NOTES-2`): `WALCAP-1`'s files, and the fault
+> tree in CI.**
+>
+> - **`WALCAP-1` added three files to `packages/storage-wal/src/`.** They
+>   are `capacity-ledger.ts`, `capacity-relief.test.ts` and
+>   `capacity-in-flight.test.ts`, now in the tables above. `WALCAP-1` merged
+>   as `da559ca` on 2026-10-03. Its record is `docs/handoffs/WALCAP-1.md`.
+>   Both tests are unit tests, so the root `test` gate runs them.
+> - **CI runs the fault tree.** The paragraph above predates the wiring.
+>   Root `test:fault` runs the fault tree, and CI runs that script in the
+>   step "WAL fault-injection tests" (`.github/workflows/ci.yml`). The
+>   orchestrator wired both in `cdfc878` on 2026-08-26, the commit that
+>   recorded `WP-050`'s completion. That entry is archived in
+>   `docs/status-archive/completion-records-wave-0.md`, under "WP-050
+>   completion record". The root `test` gate still does not run the fault
+>   tree.

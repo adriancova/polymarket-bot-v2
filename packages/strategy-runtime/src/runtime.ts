@@ -22,12 +22,20 @@
  *   materializing and validating its `statePatch`, merging it into the state,
  *   serializing the state — happens in one fallible region ahead of
  *   `DecisionSink.persist`, so the commit that follows a persist cannot fail.
- *   The invariants this protects: a persisted decision ALWAYS has its
- *   checkpoint, an evaluation sequence number is NEVER re-used, and no
+ *   So does the ADR-027 checkpoint verdict (`CKPT-1`), which is a pure
+ *   function of values already computed. The invariants this protects: a
+ *   persisted decision that meets ADR-027 Decision 1 ALWAYS has its checkpoint
+ *   (Decision 3), an evaluation sequence number is NEVER re-used, and no
  *   misbehaving strategy value can make `evaluate()` throw;
- * - checkpoint state after every persisted decision;
+ * - checkpoint state after a persisted decision that meets ADR-027 Decision 1
+ *   (`transitions.ts`: a state, status or RNG change, the start, the stop, or
+ *   a 60 s event-time heartbeat). Other decisions have none. Until `CKPT-1`
+ *   this read "checkpoint state after every persisted decision" (`WP-170`
+ *   decision 4);
  * - restore compatible state on restart, refusing incompatibility (§9.6 "new
- *   run for every code, config, model, feature, or state-schema change").
+ *   run for every code, config, model, feature, or state-schema change"),
+ *   from a RESTORE POINT — the last checkpoint plus the highest durable
+ *   evaluation sequence (ADR-027 D2; `checkpoint.ts` `restoreFromPoint`).
  *
  * ONE SNAPSHOT PER BOUNDARY (remediation round 3, review round 3's HIGH). Every
  * value a caller hands this module is read exactly ONCE, into inert data, and
@@ -96,9 +104,10 @@ import {
 
 import {
   MAX_EVALUATION_SEQ,
-  restoreCheckpoint,
+  restoreFromPoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   type InstanceStatus,
+  type StrategyRestorePoint,
   type StrategyStateCheckpoint,
 } from "./checkpoint.js";
 import { buildStrategyContext, type ScopedStrategyContext } from "./context.js";
@@ -129,6 +138,11 @@ import { readOwnFieldsOnce } from "./read-once.js";
 import type { DecisionRecord, DecisionTelemetry } from "./record.js";
 import { isReservedRuntimeReasonCode, RUNTIME_REASON_CODES } from "./reserved-codes.js";
 import { DeterministicRng } from "./rng.js";
+import {
+  checkpointTransitions,
+  type CheckpointMark,
+  type CheckpointTransition,
+} from "./transitions.js";
 
 /** Run identity the composition root assigns (§10.3 `strategy.runs`). */
 export interface RunIdentity {
@@ -154,8 +168,14 @@ export interface StrategyRuntimeDefinition {
   readonly clock: MonotonicClock;
   readonly decisionSink: DecisionSink;
   readonly checkpointStore: CheckpointStore;
-  /** Present on restart; refused unless fully compatible (§9.6). */
-  readonly restoreFrom?: StrategyStateCheckpoint;
+  /**
+   * Present on restart; refused unless fully compatible (§9.6). `CKPT-1`: a
+   * RESTORE POINT — the last durable checkpoint, the highest durable
+   * `evaluationSeq`, and the instant of the checkpointed decision (ADR-027 D2;
+   * {@link StrategyRestorePoint}). Until `CKPT-1` it was the bare checkpoint,
+   * and the restored instance resumed at `checkpointSeq + 1`.
+   */
+  readonly restoreFrom?: StrategyRestorePoint;
 }
 
 export type CreateRuntimeResult =
@@ -504,9 +524,14 @@ export function createStrategyInstanceRuntime(
   let rng = DeterministicRng.fromSeed(capturedRun.runSeed);
   let nextEvaluationSeq = 0;
   let status: InstanceStatus = "ACTIVE";
+  // `CKPT-1`: no mark — the first decision of a fresh runtime is the START
+  // transition (ADR-027 D1.4). A restored runtime resumes from the restored
+  // checkpoint's mark instead, so its first decision is judged exactly as the
+  // uninterrupted runtime would have judged it (D4.2).
+  let mark: CheckpointMark | undefined;
 
   if (restoreFrom !== undefined) {
-    const restored = restoreCheckpoint(restoreFrom as StrategyStateCheckpoint, {
+    const restored = restoreFromPoint(restoreFrom as StrategyRestorePoint, {
       runId: capturedRun.runId,
       instanceId: capturedRun.instanceId,
       strategyName: capturedStrategy.name,
@@ -522,6 +547,7 @@ export function createStrategyInstanceRuntime(
     rng = DeterministicRng.fromState(restored.restored.rngState);
     nextEvaluationSeq = restored.restored.nextEvaluationSeq;
     status = restored.restored.status;
+    mark = restored.restored.mark;
   }
 
   return {
@@ -538,6 +564,7 @@ export function createStrategyInstanceRuntime(
       rng,
       nextEvaluationSeq,
       status,
+      mark,
     ),
   };
 }
@@ -559,6 +586,12 @@ class StrategyInstanceRuntime {
   private evaluationSeq: number;
   private status: InstanceStatus;
   private evaluating = false;
+  /**
+   * `CKPT-1`: what the LAST checkpoint this runtime saved (or was restored
+   * from) pinned — the ADR-027 Decision 1 comparison base. `undefined` until a
+   * fresh runtime's first checkpoint, which is the START transition.
+   */
+  private lastCheckpoint: CheckpointMark | undefined;
 
   constructor(
     private readonly strategy: CapturedStrategy,
@@ -572,7 +605,9 @@ class StrategyInstanceRuntime {
     private readonly rng: DeterministicRng,
     initialEvaluationSeq: number,
     initialStatus: InstanceStatus,
+    initialMark: CheckpointMark | undefined,
   ) {
+    this.lastCheckpoint = initialMark;
     this.state = initialState;
     // Safe here and only here: `initialState` is either the empty object or the
     // materialized copy `restoreCheckpoint` produced — inert data in both
@@ -789,6 +824,19 @@ class StrategyInstanceRuntime {
     const prepared = preparation.prepared;
 
     const record = this.buildRecord(input, "STRATEGY", prepared.decision);
+    // `CKPT-1` — ADR-027 Decision 1's verdict, taken BEFORE the persist from
+    // values already computed: the state bytes the commit will hold, the
+    // status it will set, and the RNG exactly as the callback left it. Pure
+    // and total (`transitions.ts`), so nothing fallible is added between the
+    // persist and the save.
+    const nextStatus: InstanceStatus = input.callback === "onStop" ? "STOPPED" : this.status;
+    const transitions = checkpointTransitions(this.lastCheckpoint, {
+      callback: input.callback,
+      evaluatedAt: input.evaluatedAt,
+      stateJson: prepared.stateJson,
+      status: nextStatus,
+      rngState: this.rng.snapshot(),
+    });
     try {
       this.persistRecord(record, telemetry);
     } catch (cause) {
@@ -797,23 +845,57 @@ class StrategyInstanceRuntime {
 
     // Commit: state, sequence, lifecycle — only after the record is persisted.
     // Every value assigned here was computed above, so this block cannot fail:
-    // a persisted decision always gets its sequence number and its checkpoint.
+    // a persisted decision always gets its sequence number, and — when
+    // ADR-027 Decision 1 says it owes one — its checkpoint.
     this.state = prepared.state;
     this.stateJson = prepared.stateJson;
     const recordedSeq = this.evaluationSeq;
     this.evaluationSeq += 1;
-    if (input.callback === "onStop") {
-      this.status = "STOPPED";
+    this.status = nextStatus;
+
+    const saved = this.saveOwedCheckpoint(transitions, recordedSeq, input.evaluatedAt);
+    if (!saved.ok) {
+      return this.halt("SAVE_CHECKPOINT", record, saved.cause);
     }
 
+    return { kind: "DECIDED", record, telemetry, checkpoint: saved.checkpoint, checkpointTransitions: transitions };
+  }
+
+  /**
+   * `CKPT-1` — writes the checkpoint a persisted decision owes (ADR-027
+   * Decision 1), or none when `transitions` is empty, and moves the comparison
+   * base to it. Called only after the record is persisted and the commit is
+   * applied. A `save` that throws is answered as data (the caller halts);
+   * the base does not move then, and the instance is paused anyway.
+   */
+  private saveOwedCheckpoint(
+    transitions: readonly CheckpointTransition[],
+    recordedSeq: number,
+    evaluatedAt: string,
+  ):
+    | { readonly ok: true; readonly checkpoint: StrategyStateCheckpoint | null }
+    | { readonly ok: false; readonly cause: unknown } {
+    if (transitions.length === 0) {
+      return { ok: true, checkpoint: null };
+    }
     const checkpoint = this.buildCheckpoint(recordedSeq);
+    // The next comparison base, from the runtime's OWN values — taken before
+    // the checkpoint object is handed to a caller-supplied port, so nothing
+    // that port does to it (it is not frozen) can move what the next verdict
+    // compares against, or make a read here throw.
+    const mark: CheckpointMark = {
+      stateJson: this.stateJson,
+      status: this.status,
+      rngState: this.rng.snapshot(),
+      evaluatedAt,
+    };
     try {
       this.saveCheckpoint(checkpoint);
     } catch (cause) {
-      return this.halt("SAVE_CHECKPOINT", record, cause);
+      return { ok: false, cause };
     }
-
-    return { kind: "DECIDED", record, telemetry, checkpoint };
+    this.lastCheckpoint = mark;
+    return { ok: true, checkpoint };
   }
 
   /**
@@ -1186,6 +1268,18 @@ class StrategyInstanceRuntime {
       intents: [],
     }) as unknown as DecisionResult;
     const record = this.buildRecord(input, "RUNTIME", decision);
+    // `CKPT-1`: the same ADR-027 Decision 1 verdict as a decided evaluation,
+    // before the persist. The state is unchanged and the RNG was rolled back,
+    // but the status becomes PAUSED — a STATUS transition — so a contained
+    // evaluation always owes its checkpoint (an instance evaluates only while
+    // ACTIVE).
+    const transitions = checkpointTransitions(this.lastCheckpoint, {
+      callback: input.callback,
+      evaluatedAt: input.evaluatedAt,
+      stateJson: this.stateJson,
+      status: "PAUSED",
+      rngState: this.rng.snapshot(),
+    });
     try {
       this.persistRecord(record, telemetry);
     } catch (cause) {
@@ -1196,18 +1290,17 @@ class StrategyInstanceRuntime {
     this.evaluationSeq += 1;
     this.status = "PAUSED";
 
-    const checkpoint = this.buildCheckpoint(recordedSeq);
-    try {
-      this.saveCheckpoint(checkpoint);
-    } catch (cause) {
-      return this.halt("SAVE_CHECKPOINT", record, cause);
+    const saved = this.saveOwedCheckpoint(transitions, recordedSeq, input.evaluatedAt);
+    if (!saved.ok) {
+      return this.halt("SAVE_CHECKPOINT", record, saved.cause);
     }
 
     return {
       kind: "CONTAINED",
       record,
       telemetry,
-      checkpoint,
+      checkpoint: saved.checkpoint,
+      checkpointTransitions: transitions,
       failure,
       incident: { code: failure.reasonCode, detail: failure.detail },
     };

@@ -158,15 +158,16 @@ import {
 } from "@polymarket-bot/event-bus";
 import {
   startFreezableRedisProxy,
-  startRedisContainer,
   uniqueStreamName,
   writeStoredCheckpoint,
 } from "@polymarket-bot/event-bus/testing";
-import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import type { TestContext } from "@polymarket-bot/storage-postgres/testing";
+import { canonicalJsonStringify } from "@polymarket-bot/strategy-runtime";
 import type { LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { EXIT_CODES, REDIS_RESPONSE_TIMEOUT_ENV, startup } from "../../../apps/trader/src/main.js";
+import { owedCheckpoints } from "./support/checkpoints.js";
 import { GATEWAY_EPOCH, recordedEvents, safeEnvironment } from "./support/fixture.js";
 import { FIXTURE_FIRST_EVENT_AT, rebaseSystemPaperClock } from "./support/host-clock.js";
 import {
@@ -176,11 +177,12 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 
 beforeAll(async () => {
-  postgres = await startPostgresContainer();
+  postgres = await startReadyPostgresContainer();
 }, 300_000);
 
 afterAll(async () => {
@@ -446,9 +448,29 @@ async function publishSixAndSettle(options: {
   // Quiescent: every write the counters promise has landed, and nothing is left in flight.
   expect(settled.health.loop.eventsProcessed).toBe(events.length);
   expect(settled.rows.decisions).toHaveLength(settled.health.loop.decisionsPersisted);
-  // §9.6: one checkpoint per persisted decision, carrying the decision's sequence.
-  expect(settled.rows.checkpoints.map((row) => row.checkpoint_seq)).toEqual(
-    settled.rows.decisions.map((row) => row.evaluation_seq),
+  // `CKPT-1` re-pin (ADR-027 §5 names this settle): this was "§9.6: one
+  // checkpoint per persisted decision, carrying the decision's sequence". A
+  // checkpoint now follows only a decision that meets ADR-027 Decision 1, so
+  // the settle compares the durable checkpoints with the ones the oracle
+  // derives from the durable decision rows — the same sequences and the same
+  // folded state bytes. The quiescence argument is unchanged: a decision and
+  // its checkpoint are now ONE write (ADR-027 D3), so the race the dated note
+  // above describes cannot recur as a checkpoint landing after its decision.
+  const owed = owedCheckpoints(
+    settled.rows.decisions.map((row) => ({
+      instanceId: row.instance_id,
+      evaluationSeq: Number(row.evaluation_seq),
+      callback: row.callback,
+      attribution: row.reason_codes.some((code) => code.startsWith("RUNTIME.")) ? "RUNTIME" : "STRATEGY",
+      evaluatedAt: String(row.evaluated_at),
+      statePatch: row.state_patch as Readonly<Record<string, unknown>> | null,
+    })),
+  );
+  expect(settled.rows.checkpoints.map((row) => Number(row.checkpoint_seq))).toEqual(
+    owed.map((entry) => entry.checkpointSeq),
+  );
+  expect(settled.rows.checkpoints.map((row) => canonicalJsonStringify(row.state))).toEqual(
+    owed.map((entry) => entry.stateJson),
   );
   expect(settled.rows.transactions).toHaveLength(settled.health.accounting.ledgerTransactions);
   expect(settled.rows.snapshots.length).toBe(settled.health.execution.fillsObserved);
@@ -647,7 +669,7 @@ function haltTriples(run: ProcessRun): string[][] {
 
 describe("a Redis outage mid-run HALTS the durable trader within the stated bound (OUTAGE-1, BOOT1-R7)", () => {
   it("decides and fills, then — the container stopped — latches GLOBAL TRANSPORT_UNAVAILABLE and startup() exits 75 within the default bound, trading nothing and writing nothing after it", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     let stopped = false;
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-default", async ({ connectionString, context }) => {
@@ -754,7 +776,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
   }, 240_000);
 
   it("an IDLE stream for five bounds is not an outage; the container stopped, it halts within the CONFIGURED bound", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     let stopped = false;
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-idle", async ({ connectionString, context }) => {
@@ -839,7 +861,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
   }, 240_000);
 
   it("decides and fills, then — a PARTITION: the server silent, no socket closed (the docker-pause shape) — latches GLOBAL TRANSPORT_UNAVAILABLE and exits 75 within the configured bound", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-partition", async ({ connectionString, context }) => {
         const label = "outage-partition";
@@ -922,7 +944,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
 
 describe("Redis refusals at startup are documented refusals, not crashes (OUTAGE-1, B1-R1-REDIS-UNCAUGHT)", () => {
   it("a subscription the transport refuses (a stored position it did not write) is TRADER_EVENT_SUBSCRIPTION_REFUSED, exit 78, with everything it opened closed", async () => {
-    const redis = await startRedisContainer();
+    const redis = await startReadyRedisContainer();
     try {
       await withFreshDatabase(postgres.getConnectionUri(), "outage-subscribe", async ({ connectionString, context }) => {
         const label = "outage-subscribe";

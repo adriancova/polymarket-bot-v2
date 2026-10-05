@@ -11,6 +11,11 @@
  * failing sink is attempted exactly once and never retried; refused
  * evaluations (paused/stopped instance, invalid input) persist NOTHING because
  * the callback never ran.
+ *
+ * `CKPT-1` (ADR-027 §5) re-pins the checkpoint lines here: a checkpoint now
+ * follows a decision that meets ADR-027 Decision 1 (state, status or RNG
+ * change, start, stop, 60 s heartbeat), not every decision. Each re-pin says
+ * what it was. The record lines — one per callback — are unchanged.
  */
 
 import { describe, expect, it } from "vitest";
@@ -53,17 +58,24 @@ describe("acceptance 1: exactly one persisted DecisionResult per callback", () =
       expect(call?.record.callback).toBe(callback);
       expect(call?.record.evaluationSeq).toBe(index);
       expect(call?.record.attribution).toBe("STRATEGY");
-      // One checkpoint follows every persisted decision.
-      expect(store.checkpoints).toHaveLength(index + 1);
-      expect(store.checkpoints[index]?.checkpointSeq).toBe(index);
+      // `CKPT-1` re-pin: this was "one checkpoint follows every persisted
+      // decision" (`index + 1` checkpoints). Every callback here is a no-op
+      // hold at one instant, so only the START (the first, `onStart`) and the
+      // STOP (`onStop`, also a STATUS change to STOPPED) write one.
+      expect(store.checkpoints).toHaveLength(callback === "onStop" ? 2 : 1);
+      expect(outcome.kind === "DECIDED" && outcome.checkpoint !== null).toBe(index === 0 || callback === "onStop");
     }
+    expect(store.checkpoints.map((checkpoint) => [checkpoint.checkpointSeq, checkpoint.status])).toEqual([
+      [0, "ACTIVE"],
+      [8, "STOPPED"],
+    ]);
     // onStop was last: the instance is stopped and the run recorded 9 decisions.
     expect(runtime.instanceStatus()).toBe("STOPPED");
     expect(sink.calls).toHaveLength(9);
   });
 
   it("pins the no-op semantics: a hold with ZERO intents is persisted like any other decision (ADR-005 §2)", () => {
-    const { runtime, sink } = makeHarness();
+    const { runtime, sink, store } = makeHarness();
     const outcome = runtime.evaluate(makeInput("onFeatures"));
     expect(outcome.kind).toBe("DECIDED");
     expect(sink.calls).toHaveLength(1);
@@ -71,6 +83,17 @@ describe("acceptance 1: exactly one persisted DecisionResult per callback", () =
     expect(record?.decision.decisionType).toBe("hold");
     expect(record?.decision.intents).toHaveLength(0);
     expect(record?.attribution).toBe("STRATEGY");
+    // `CKPT-1` re-pin (ADR-027 "What it amends", `WP-170` decision 4): "one
+    // record, one checkpoint" now reads "one record, as before; a checkpoint
+    // only if Decision 1 requires one". The first hold is the START and has
+    // one; a second identical hold is still ONE persisted record, and has none.
+    expect(store.checkpoints).toHaveLength(1);
+    const again = runtime.evaluate(makeInput("onFeatures"));
+    expect(again.kind).toBe("DECIDED");
+    expect(sink.calls).toHaveLength(2);
+    expect(sink.calls[1]?.record.decision.decisionType).toBe("hold");
+    expect(again.kind === "DECIDED" && again.checkpointTransitions).toEqual([]);
+    expect(store.checkpoints).toHaveLength(1);
   });
 
   it("adds the runtime-owned identifiers the strategy cannot forge (§7.5)", () => {
@@ -165,8 +188,9 @@ describe("acceptance 1: exactly one persisted DecisionResult per callback", () =
     expect(record?.attribution).toBe("RUNTIME");
     expect(record?.decision.decisionType).toBe("skip");
     expect(record?.decision.reasonCodes).toEqual(["RUNTIME.WATCHDOG_TIMEOUT"]);
-    // Its statePatch was discarded with it.
-    expect(outcome.checkpoint.stateJson).toBe("{}");
+    // Its statePatch was discarded with it. (`CKPT-1`: a contained
+    // evaluation's pause is a STATUS transition, so its checkpoint exists.)
+    expect(outcome.checkpoint?.stateJson).toBe("{}");
     expect(sink.calls[0]?.telemetry.evaluationDurationUs).toBe(5000);
     expect(runtime.instanceStatus()).toBe("PAUSED");
   });
@@ -382,12 +406,21 @@ describe("acceptance 1: exactly one persisted DecisionResult per callback", () =
     expect(sink.calls).toHaveLength(0);
   });
 
-  it("evaluation sequence numbers are contiguous and match the checkpoint sequence", () => {
-    const { runtime, sink, store } = makeHarness();
+  it("evaluation sequence numbers are contiguous; each checkpoint keeps its decision's sequence, so checkpoint sequences have gaps (ADR-027 D2.3)", () => {
+    // `CKPT-1` re-pin: this was "… and match the checkpoint sequence"
+    // (checkpoints [0, 1, 2]). Evaluation sequences are still contiguous; a
+    // checkpoint now follows only a decision that meets Decision 1, and it
+    // carries THAT decision's `evaluationSeq`. Here `onTimer` changes the state.
+    const { runtime, sink, store } = makeHarness({
+      strategy: makeStrategy({
+        onTimer: (ctx: StrategyContext) => ({ ...holdDecision(ctx), statePatch: { ticked: true } }),
+      }),
+    });
     runtime.evaluate(makeInput("onStart"));
     runtime.evaluate(makeInput("onFeatures"));
     runtime.evaluate(makeInput("onTimer"));
     expect(sink.calls.map((call) => call.record.evaluationSeq)).toEqual([0, 1, 2]);
-    expect(store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toEqual([0, 1, 2]);
+    expect(store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toEqual([0, 2]);
+    expect(store.checkpoints.at(-1)?.stateJson).toBe('{"ticked":true}');
   });
 });

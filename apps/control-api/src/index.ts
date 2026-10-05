@@ -101,12 +101,43 @@ export type {
 } from "./health-source.js";
 
 export {
+  AbsentTraderHaltSource,
+  InMemoryTraderHaltSource,
+  TRADER_HALT_DETAIL_MAX,
+  TRADER_HALT_INCIDENT_KEYS,
+  TRADER_HALT_INCIDENT_KEY_PREFIX,
+  TRADER_HALT_LIST_LIMIT,
+  TRADER_HALT_READ_OUTCOMES,
+  TRADER_HALT_SCOPES,
+  TRADER_HALT_STATES,
+  TraderHaltCache,
+  inTraderHaltNamespace,
+  overdueTraderHaltView,
+  readTraderHaltFetch,
+  traderHaltSamples,
+  traderHaltScopeOf,
+  traderHaltsDocument,
+} from "./trader-halts.js";
+export type {
+  OpenTraderHaltRow,
+  OpenTraderHalts,
+  TraderHaltFetch,
+  TraderHaltReadOutcome,
+  TraderHaltReadResult,
+  TraderHaltScope,
+  TraderHaltSource,
+  TraderHaltState,
+  TraderHaltView,
+} from "./trader-halts.js";
+
+export {
   CONTROL_API_ROUTE_TABLE,
   CONTROL_API_ROUTES,
   ControlApi,
   MODE_RAISE_REASON_MAX_METHOD,
   MODE_RAISE_REASON_MAX_PATH,
   MUTATION_GRANTS,
+  READ_REFRESH_DEADLINE_MS,
   holdsMutationAuthority,
 } from "./api.js";
 

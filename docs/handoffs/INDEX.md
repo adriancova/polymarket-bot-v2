@@ -129,3 +129,13 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-03 | [WP-270.md](WP-270.md) | `WP-270`: the OMS and signed-order persistence | WP | Complete (2026-10-03) | `259c964` | 7 KB |
 | 2026-10-03 | [CADENCE-1.md](CADENCE-1.md) | `CADENCE-1`: ADR-026 evaluation cadence | WP | Complete (2026-10-03) | `8d7086a` | 6 KB |
 | 2026-10-03 | [WP-280.md](WP-280.md) | `WP-280`: the authenticated user-stream adapter | WP | Complete (2026-10-03) | `065716f` | 4 KB |
+| 2026-10-03 | [WP-310.md](WP-310.md) | `WP-310`: rate-limit budgets and matching-engine modes | WP | Complete (2026-10-03) | `fdf27ff` | 7 KB |
+| 2026-10-03 | [CKPT-1.md](CKPT-1.md) | `CKPT-1`: ADR-027, checkpoint on change plus a 60 s heartbeat | Round | Complete (2026-10-03) | `891ccdd` | 5 KB |
+| 2026-10-03 | [ADR033-REVIEW.md](ADR033-REVIEW.md) | `ADR033-REVIEW`: ADR-033 checked, corrected and accepted (the order heartbeat, C-12) | Round | Complete (2026-10-03) | `47575cf` | 3 KB |
+| 2026-10-04 | [TC-LOWS-1.md](TC-LOWS-1.md) | `TC-LOWS-1`: pin the open trading-core and trader LOWs | Round | Complete (2026-10-04) | `9033743` | 4 KB |
+| 2026-10-04 | [GOV-NOTES-1.md](GOV-NOTES-1.md) | `GOV-NOTES-1`: dated corrections to ADR-028 Amendment 1 rule 6 and wal-format §11.1 | Round | Complete (2026-10-04) | `1f99fcc` | 3 KB |
+| 2026-10-04 | [CONTROL-2.md](CONTROL-2.md) | `CONTROL-2`: open trader halts in the control API, fail closed; CONTROL-1b's LOWs | Round | Complete (2026-10-04) | `2f84ad7` | 5 KB |
+| 2026-10-04 | [FLAKES-1.md](FLAKES-1.md) | `FLAKES-1`: make the known load-sensitive tests deterministic | Round | Complete (2026-10-04) | `e476a49` | 3 KB |
+| 2026-10-04 | [VENUE-SETL-1.md](VENUE-SETL-1.md) | `VENUE-SETL-1`: series-admission venue facts and the btc-15m-updown settlement-spec prep | Round | Complete (2026-10-04) | `c373e25` | 4 KB |
+| 2026-10-04 | [CAP-1.md](CAP-1.md) | `CAP-1`: a filled order's capital never vanishes from the cap check or the loss limits | Round | Complete (2026-10-04) | `b72acc7` | 5 KB |
+| 2026-10-04 | [GOV-NOTES-2.md](GOV-NOTES-2.md) | `GOV-NOTES-2`: the remaining stale wal-format and Prometheus README passages | Round | Complete (2026-10-04) | `2776a8c` | 2 KB |

@@ -195,8 +195,7 @@ import { fileURLToPath } from "node:url";
 
 import { addDecimal } from "@polymarket-bot/decimal";
 import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
+import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { canonicalJsonStringify } from "@polymarket-bot/strategy-runtime";
 import {
   normalizeToStrictUtc,
@@ -213,6 +212,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RedisMarketEventFeed } from "../../../apps/trader/src/adapters/redis-feed.js";
 import { assembleDurableTrader } from "../../../apps/trader/src/main.js";
 import { pump } from "../../../apps/trader/src/pump.js";
+import { owedCheckpoints } from "./support/checkpoints.js";
 import { T_OPEN, safeEnvironment } from "./support/fixture.js";
 import { RebasedSystemPaperClock } from "./support/host-clock.js";
 import {
@@ -226,12 +226,13 @@ import {
   twoBracketsEvents,
   twoBracketsStrategyParams,
 } from "./support/two-brackets.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  [postgres, redis] = await Promise.all([startPostgresContainer(), startRedisContainer()]);
+  [postgres, redis] = await Promise.all([startReadyPostgresContainer(), startReadyRedisContainer()]);
 }, 300_000);
 
 afterAll(async () => {
@@ -399,6 +400,8 @@ interface DurableRun {
       readonly evaluatedAt: string;
       readonly instanceId: string;
       readonly marketId: string | null;
+      /** `CKPT-1`: the row's `state_patch`, for the ADR-027 oracle. */
+      readonly statePatch: unknown;
     }[];
     readonly checkpoints: readonly {
       readonly checkpointSeq: string;
@@ -598,6 +601,7 @@ async function runDurableTwoBrackets(options: RunOptions): Promise<DurableRun> {
             evaluatedAt: row.evaluated_at,
             instanceId: row.instance_id,
             marketId: row.market_id,
+            statePatch: row.state_patch as unknown,
           })),
           checkpoints: checkpoints.map((row) => ({
             checkpointSeq: String(row.checkpoint_seq),
@@ -795,20 +799,46 @@ function assertDurableRoundTrip(run: DurableRun, economics: Economics): void {
   expect(byType("enter").map((row) => row.evaluatedAt)).toEqual(["2026-03-04T12:00:02Z", "2026-03-04T12:03:41Z"]);
   expect(run.db.decisions.at(-1)?.reasonCodes).toEqual(["SB.REFUSED_MAXIMUM_ENTRIES"]);
 
-  // --- strategy.state_checkpoints: after every decision, with valid hashes ---
-  expect(run.db.checkpoints.map((row) => row.checkpointSeq)).toEqual(
-    run.db.decisions.map((row) => row.evaluationSeq),
+  // --- strategy.state_checkpoints: after every decision that owes one, with valid hashes ---
+  // `CKPT-1` re-pin (ADR-027): this was "after every decision" (checkpoint
+  // sequences equal to the decisions'). A checkpoint now follows only a
+  // decision that meets ADR-027 Decision 1, so the durable checkpoints are
+  // exactly those the oracle derives from the durable decision rows (their
+  // `state_patch` fold), each storing that fold; fewer than the decisions.
+  const owed = owedCheckpoints(
+    run.db.decisions.map((row) => ({
+      instanceId: row.instanceId,
+      evaluationSeq: Number(row.evaluationSeq),
+      callback: row.callback,
+      attribution: row.reasonCodes.some((code) => code.startsWith("RUNTIME.")) ? "RUNTIME" : "STRATEGY",
+      evaluatedAt: row.evaluatedAt,
+      statePatch: row.statePatch as Readonly<Record<string, unknown>> | null,
+    })),
   );
+  expect(run.db.checkpoints.map((row) => row.checkpointSeq)).toEqual(owed.map((entry) => String(entry.checkpointSeq)));
+  expect(run.db.checkpoints.length).toBeLessThan(run.db.decisions.length);
   run.db.checkpoints.forEach((row, index) => {
     expect(row.instanceId).toBe(run.instanceId);
-    expect(row.capturedAt).toBe(run.db.decisions[index]?.evaluatedAt);
+    // Its decision's instant: the decision at the checkpoint's own sequence.
+    expect(row.capturedAt).toBe(run.db.decisions.find((decision) => decision.evaluationSeq === row.checkpointSeq)?.evaluatedAt);
+    expect(canonicalJsonStringify(row.state)).toBe(owed[index]?.stateJson);
     // The hash names the state the row stores: SHA-256 of its canonical bytes.
     expect(row.stateHash).toBe(
       createHash("sha256").update(canonicalJsonStringify(row.state), "utf8").digest("hex"),
     );
   });
-  const states = run.db.checkpoints.map((row) => bracketState(row.state));
-  for (const state of states) expect(state.instanceState).not.toBe("PAUSED");
+  const checkpointStates = run.db.checkpoints.map((row) => bracketState(row.state));
+  for (const state of checkpointStates) expect(state.instanceState).not.toBe("PAUSED");
+  // The state after the decision at sequence `seq`: its own checkpoint's, or
+  // — when it owed none — the last checkpoint's before it (D2.1).
+  const stateAfter = (seq: number) => {
+    let found: ReturnType<typeof bracketState> | undefined;
+    run.db.checkpoints.forEach((row, index) => {
+      if (Number(row.checkpointSeq) <= seq) found = checkpointStates[index];
+    });
+    return found;
+  };
+  const states = run.db.decisions.map((row) => stateAfter(Number(row.evaluationSeq)));
   const seqOf = (codes: readonly string[], at: string) =>
     run.db.decisions.findIndex(
       (row) => row.evaluatedAt === at && codes.every((code) => row.reasonCodes.includes(code)),

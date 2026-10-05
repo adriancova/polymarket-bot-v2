@@ -258,9 +258,30 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
       (decision) => `${decision.runId}|${String(decision.evaluationSeq)}`,
     );
     expect(new Set(keys).size).toBe(keys.length);
-    // Every persisted decision has its checkpoint, captured at the evaluation's
-    // own instant rather than at a clock read.
-    expect(artifact.checkpointInstants).toHaveLength(artifact.decisions.length);
+    // `CKPT-1` re-pin (ADR-027): this was "every persisted decision has its
+    // checkpoint" (`checkpointInstants` as long as `decisions`). A checkpoint
+    // now follows only a decision that changes the state, the status or the
+    // RNG, or starts, stops or heartbeats the instance (Decision 1). Here:
+    // every checkpoint carries the sequence of a persisted decision of its own
+    // instance, and every decision whose persisted patch CHANGED the folded
+    // state has one — the scenario's last two holds (no patch) have none.
+    const store = run.parts.store;
+    const owed: string[] = [];
+    const folded = new Map<string, Record<string, unknown>>();
+    const lastBytes = new Map<string, string>();
+    for (const entry of store.decisions) {
+      const instance = entry.record.instanceId;
+      // The state fold, done here with the test's own sorted-key bytes rather
+      // than the runtime's serializer, so the oracle is independent of it.
+      const state = { ...(folded.get(instance) ?? {}), ...(entry.record.decision.statePatch ?? {}) };
+      folded.set(instance, state);
+      const bytes = sortedJson(state);
+      if (lastBytes.get(instance) !== bytes) owed.push(`${instance}|${String(entry.record.evaluationSeq)}`);
+      lastBytes.set(instance, bytes);
+    }
+    expect(store.checkpoints.map((checkpoint) => `${checkpoint.instanceId}|${String(checkpoint.checkpointSeq)}`)).toEqual(owed);
+    expect(artifact.checkpointInstants).toHaveLength(store.checkpoints.length);
+    expect(artifact.checkpointInstants.length).toBeLessThan(artifact.decisions.length);
   });
 
   it("§6 invariant 8: the ledger projection is clean and attributes the position", async () => {
@@ -298,3 +319,16 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     expect(cash?.balance).toBe("-1.632");
   });
 });
+
+/** `CKPT-1`: plain JSON with sorted keys — the oracle's own byte form (above). */
+function sortedJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(sortedJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${sortedJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}

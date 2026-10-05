@@ -143,7 +143,7 @@ import {
   type PostingIdentity,
   type TraceLink,
 } from "./accounting.js";
-import { requestFor, type AllocatorGate } from "./allocation.js";
+import { requestFor, type AllocatorGate, type OrderView, type UnbookedExposure } from "./allocation.js";
 import { judgeBasketExecution } from "./basket-execution.js";
 import {
   bookConfirmedAt,
@@ -195,6 +195,7 @@ import {
   runPlanner,
   runRiskCheck,
   OrderTimeInForceBook,
+  type RiskInputContext,
 } from "./pipeline.js";
 import { pnlSnapshotKey } from "./pnl-snapshot-key.js";
 import type {
@@ -202,7 +203,9 @@ import type {
   DispatchPosition,
   GroupCommit,
   IngestedEvent,
+  PortResult,
   RiskRefusalRecord,
+  StagedEvaluations,
   TraderStore,
 } from "./ports.js";
 import type { DecisionRecord, DecisionTelemetry } from "@polymarket-bot/strategy-runtime";
@@ -499,6 +502,19 @@ export interface RetainedOrderState {
 }
 
 /**
+ * `CKPT-1` — one persisted decision as the outbox holds it: the record, its
+ * telemetry, and the checkpoint it owes, if ADR-027 Decision 1 says it owes
+ * one. The checkpoint is ATTACHED to its decision, never queued apart from it,
+ * so every write path — the flush, the group staging and `DURABLE-1`'s
+ * boundary before a placement — takes the two together (ADR-027 D3).
+ */
+export interface OutboxEntry {
+  readonly record: DecisionRecord;
+  readonly telemetry: DecisionTelemetry;
+  readonly checkpoint: StrategyStateCheckpoint | undefined;
+}
+
+/**
  * The bounded, synchronous journal between the runtime and the store.
  *
  * BOUNDED for §8.3's reason: an unbounded outbox is an unbounded memory
@@ -507,65 +523,89 @@ export interface RetainedOrderState {
  * into its own `HALTED` outcome, which this loop turns into a latched halt —
  * so the back pressure reaches the halt controller through the runtime's own
  * contract rather than around it, and nothing is dropped on any path.
+ *
+ * `CKPT-1` (ADR-027 D3): a checkpoint is held ON the decision it follows
+ * ({@link OutboxEntry}). The runtime saves a checkpoint synchronously, inside
+ * the same `evaluate()` call that persisted its decision and with that
+ * decision's `evaluationSeq`, so {@link appendCheckpoint} attaches it to the
+ * entry just appended — and refuses (throws, which the runtime turns into a
+ * `SAVE_CHECKPOINT` halt) a checkpoint that does not follow that entry. Until
+ * `CKPT-1` checkpoints were a second list, drained apart from the decisions by
+ * `DURABLE-1`'s boundary (`DURABLE-1` LOW-3). The bound counts entries; a
+ * checkpoint adds no entry, so attaching one never fails for capacity.
  */
 export class DecisionOutboxBuffer {
   readonly maximumDepth: number;
-  #decisions: { record: DecisionRecord; telemetry: DecisionTelemetry }[] = [];
-  #checkpoints: StrategyStateCheckpoint[] = [];
+  #entries: { record: DecisionRecord; telemetry: DecisionTelemetry; checkpoint: StrategyStateCheckpoint | undefined }[] = [];
 
   constructor(maximumDepth: number) {
     this.maximumDepth = maximumDepth;
   }
 
   appendDecision(record: DecisionRecord, telemetry: DecisionTelemetry): void {
-    if (this.#decisions.length >= this.maximumDepth) {
+    if (this.#entries.length >= this.maximumDepth) {
       throw new Error(
         `the decision outbox is at its maximum depth of ${String(this.maximumDepth)}; §8.3 ` +
           "forbids dropping the record, so the append REFUSES and the runtime halts the instance",
       );
     }
-    this.#decisions.push({ record, telemetry });
-  }
-
-  appendCheckpoint(checkpoint: StrategyStateCheckpoint): void {
-    if (this.#checkpoints.length >= this.maximumDepth) {
-      throw new Error(
-        `the checkpoint outbox is at its maximum depth of ${String(this.maximumDepth)}; the ` +
-          "append REFUSES rather than dropping a checkpoint a persisted decision depends on",
-      );
-    }
-    this.#checkpoints.push(checkpoint);
-  }
-
-  drain(): {
-    readonly decisions: readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[];
-    readonly checkpoints: readonly StrategyStateCheckpoint[];
-  } {
-    const decisions = this.#decisions;
-    const checkpoints = this.#checkpoints;
-    this.#decisions = [];
-    this.#checkpoints = [];
-    return { decisions, checkpoints };
+    this.#entries.push({ record, telemetry, checkpoint: undefined });
   }
 
   /**
-   * `DURABLE-1`: drains the DECISIONS only, leaving every checkpoint where it
-   * is. The loop's durability boundary before a placement
-   * ({@link CoreLoop}'s `#persistDecisionsBeforePlacement`) makes the pending
-   * decisions durable there and then; the checkpoints stay for the flush that
-   * always wrote them, so each is written with exactly the `capturedAt` it
-   * always had (the flush's instant, which inside a venue frame is the
-   * frame's last event, not the event a mid-frame callback fired at).
+   * Attaches a checkpoint to the decision it follows: the entry appended LAST,
+   * which must carry the checkpoint's run, instance and sequence and no
+   * checkpoint yet. Anything else is refused, never queued on its own.
    */
-  drainDecisions(): readonly { record: DecisionRecord; telemetry: DecisionTelemetry }[] {
-    const decisions = this.#decisions;
-    this.#decisions = [];
-    return decisions;
+  appendCheckpoint(checkpoint: StrategyStateCheckpoint): void {
+    const last = this.#entries.at(-1);
+    if (
+      last === undefined ||
+      last.checkpoint !== undefined ||
+      last.record.runId !== checkpoint.runId ||
+      last.record.instanceId !== checkpoint.instanceId ||
+      last.record.evaluationSeq !== checkpoint.checkpointSeq
+    ) {
+      throw new Error(
+        `the checkpoint of run ${checkpoint.runId} / instance ${checkpoint.instanceId} at sequence ` +
+          `${String(checkpoint.checkpointSeq)} does not follow the decision the outbox holds last; ` +
+          "ADR-027 D3 makes a checkpoint durable only together with its decision, so the append " +
+          "REFUSES rather than queue it alone",
+      );
+    }
+    last.checkpoint = checkpoint;
   }
 
-  get depth(): number {
-    return this.#decisions.length + this.#checkpoints.length;
+  /** Every pending entry, in evaluation order, each decision with the checkpoint it owes. */
+  drain(): readonly OutboxEntry[] {
+    const entries = this.#entries;
+    this.#entries = [];
+    return entries;
   }
+
+  /** Pending decisions plus the checkpoints attached to them. */
+  get depth(): number {
+    let depth = this.#entries.length;
+    for (const entry of this.#entries) if (entry.checkpoint !== undefined) depth += 1;
+    return depth;
+  }
+}
+
+/** `CKPT-1`: an outbox drain as one {@link StagedEvaluations} — every checkpoint with its decision. */
+function stagedFrom(
+  entries: readonly OutboxEntry[],
+  capturedAt: string,
+  riskRefusals: readonly RiskRefusalRecord[],
+): StagedEvaluations {
+  const checkpoints: { checkpoint: StrategyStateCheckpoint; capturedAt: string }[] = [];
+  for (const entry of entries) {
+    if (entry.checkpoint !== undefined) checkpoints.push({ checkpoint: entry.checkpoint, capturedAt });
+  }
+  return {
+    decisions: entries.map((entry) => ({ record: entry.record, telemetry: entry.telemetry })),
+    checkpoints,
+    riskRefusals,
+  };
 }
 
 /**
@@ -1955,6 +1995,9 @@ export class CoreLoop {
         if (!traded.ok && traded.refusal?.code === DISPOSITION_NOT_APPLIED) {
           this.#haltOnVenueObservation("observeTrade", traded.refusal, instant);
         }
+        // `CAP-1` r1: the trade's answer carries the fills it made, with their
+        // prices — recorded as SEEN, as a placement answer's are.
+        if (traded.ok && traded.value !== undefined) this.#noteSeenFills(traded.value.fills, undefined);
         // SIM-1 r2 (`SIM1-R2-1`): the trade's instant can resolve a DELAYED
         // order too (a venue clock that lags the loop's), so a watched basket
         // is judged before the caller evaluates this market.
@@ -2305,6 +2348,25 @@ export class CoreLoop {
           outcome.incident.detail,
           instant,
         );
+        if (outcome.stage === "SAVE_CHECKPOINT") {
+          // `CKPT-1` (ADR-027 D3): the decision is in the outbox and the
+          // checkpoint it owes is not, so writing the outbox would make the
+          // decision durable alone. The outbox refuses only a checkpoint that
+          // does not follow the decision appended last (`appendCheckpoint`) —
+          // a broken pairing, not a store outage — and the process answers it
+          // as it answers a staging failure: nothing pending is written, and a
+          // GLOBAL halt stops every further decision.
+          this.#durabilityLost = true;
+          this.#options.outbox.drain();
+          this.#options.halts.halt(
+            { kind: "GLOBAL" },
+            "STORE_UNAVAILABLE",
+            `a decision's owed strategy checkpoint could not be queued with it (${outcome.incident.detail}); ` +
+              "ADR-027 D3 makes a decision and its checkpoint durable together, so neither is written " +
+              "and the process makes no further trading decision",
+            instant,
+          );
+        }
         return;
       case "CONTAINED":
         this.#options.health.countLoop("containedEvaluations");
@@ -2471,6 +2533,9 @@ export class CoreLoop {
         marketId === marketConfig.marketId
           ? (positions.find((position) => position.side === side)?.shares ?? "0")
           : "0",
+      // `CAP-1` r1: a commitment whose order the venue shows terminal is
+      // judged at its final size here, not at the next harvest's settlement.
+      viewOf: (plannedOrderId) => this.#orderViewOf(plannedOrderId),
     });
 
     const riskInput = buildRiskEvaluationInput({
@@ -2497,7 +2562,14 @@ export class CoreLoop {
       // entry `RISK_FRESHNESS_UNKNOWN`. A CANCEL keeps the constant 0.
       featuresAgeMs: admission === undefined ? 0 : admission.featuresAgeMs,
       positions,
-      openOrders: this.#openOrdersFor(input.instance, marketConfig),
+      // `openOrders`, read where it always was (an owned order the venue
+      // cannot show still halts here, after check 1's halt state was read),
+      // and — `CAP-1` (ruling 2026-10-04) — §9.8 checks 16 and 17's SEPARATE
+      // `unbookedFills`: the fills of this strategy no position carries yet
+      // and no open order presents, from the allocator's own commitments.
+      // Never a position (no exit sells it), never an open order (check 18
+      // never reads it).
+      ...this.#portfolioOrdersFor(input.instance, marketConfig),
       exposures: allocation.exposures,
       allocation: allocation.verdict,
       recentIntentIds: Object.freeze([...this.#recentIntentIds]),
@@ -2679,6 +2751,7 @@ export class CoreLoop {
         liveOwners: this.#liveOwners(),
         projection: this.#held.view,
         availableCollateral: this.#cash,
+        viewOf: (plannedOrderId) => this.#orderViewOf(plannedOrderId),
       });
       if (!reserved.ok) {
         // §9.10 is "reserve BEFORE submission", so a reservation the allocator
@@ -2783,6 +2856,13 @@ export class CoreLoop {
         if (input.plan.planKind !== "CANCEL") carried.placed.add(order.simulatedOrderId);
       }
     }
+    // `CAP-1` r1: the answer carries the fills its orders made at once, with
+    // their prices. The allocator records them as SEEN (evidence of price
+    // only; nothing is booked or released here), so an order the venue ended
+    // at once is judged at those prices, not at its limit, before the harvest
+    // that books them (`CAP1-ASTRA-R1-03`). On every outcome: a refused
+    // plan's booked orders may have filled too.
+    this.#noteSeenFills(result.fills, result.orders);
     if (!result.accepted) {
       this.#options.health.countExecution("submissionsRefused");
       if (input.plan.planKind === "CANCEL") {
@@ -3228,6 +3308,9 @@ export class CoreLoop {
     // fill of this harvest is in the ledger, before any evaluation reads the
     // account — closes the window in the fail-closed direction at both ends:
     // nothing is released before the position that replaces it exists.
+    // (`CAP-1`: and the allocator's commitment was CONVERTED fill by fill as
+    // each was booked above, so the position and the commitment never count
+    // the same shares; here only the exact unused remainder goes.)
     this.#releaseSettledReservations();
     // SIM-1 r2 (`SIM1-R2-1`): a cancel or a fill of this iteration can leave a
     // watched basket short; judged before anything below is delivered. Since
@@ -3357,9 +3440,35 @@ export class CoreLoop {
       const order = this.#ownedOrder(venueOrderId, instant);
       if (order === undefined || !this.#isTerminalOrder(order) || !this.#fullyBooked(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
-      this.#options.allocator.release(order.plannedOrderId);
+      this.#settleCapital(order);
       this.#timeInForce.release(order.plannedOrderId);
     }
+  }
+
+  /**
+   * `CAP-1`: a TERMINAL order's final size is confirmed, so the allocator
+   * releases EXACTLY its unused remainder (WP-270 decision 5) and keeps the
+   * capital of every fill of it no position carries yet until the harvest
+   * that books it (`#bookFills`, which converts the commitment fill by fill).
+   * It used to release the whole commitment here, at the FILLED view, so an
+   * order an `onFill` decision placed and the venue filled at once vanished
+   * from every cap check until its fill's harvest point (`CAP-OVERSHOOT`).
+   * Called wherever an order's terminal state is acted on; idempotent.
+   *
+   * `CAP-1` r1: NO fill page is read here. Round 0 read the venue's fill
+   * cursor again for an order not fully booked, which was a second
+   * `fillsSince` in the event that delivers an `onFill` order filled at once,
+   * outside SIM-2's one read per harvest. Each fill a venue answer carried is
+   * already SEEN by the commitment (`#noteSeenFills`), at its own price, and
+   * (r2) so is each fill of every page a harvest has read (`#readFills`). A
+   * share that neither carried is held at the order's limit, never below its
+   * debit, until it is booked.
+   */
+  #settleCapital(order: SimulatedOrder): void {
+    this.#options.allocator.settle(order.plannedOrderId, {
+      filledShares: order.filledShares,
+      unbookedFills: undefined,
+    });
   }
 
   /**
@@ -3404,6 +3513,23 @@ export class CoreLoop {
    * `undefined` after HALTING when the venue refuses the cursor — older than
    * its retained window, so fills this process never read are gone. Nothing
    * is booked or released then.
+   *
+   * `CAP-1` r2 (`CAP1-ASTRA-R2-01`): EVERY fill of a page read here is
+   * recorded as SEEN by its planned order's allocator commitment
+   * (`#noteSeenFills`), at the read and before any harvest filters the page.
+   * This is the ONLY site that reads the cursor, so no page the loop has read
+   * is discarded as evidence:
+   *
+   * - the carried harvest books only its pass's own fills, and the others keep
+   *   their ADR-024 harvest point. Their prices are now kept, so an evaluation
+   *   before that harvest judges each one at its own price, not its order's
+   *   limit;
+   * - the ordinary harvest books every fill it reads. One whose posting is
+   *   REFUSED (`LEDGER_POSTING_REFUSED`), or that a store failure leaves
+   *   unbooked, is judged at its own price too.
+   *
+   * Evidence of PRICE only: nothing is booked, converted, released or
+   * delivered, and the cursor moves exactly where it did. No read is added.
    */
   #readFills(instant: string): { readonly fills: readonly SimulatedFill[]; readonly next: number } | undefined {
     const page = this.#options.venue.fillsSince(this.#knownFills);
@@ -3420,6 +3546,7 @@ export class CoreLoop {
       // earlier harvest flushed before it returned.
       return undefined;
     }
+    this.#noteSeenFills(page.value.fills, undefined);
     return page.value;
   }
 
@@ -3505,7 +3632,13 @@ export class CoreLoop {
       // §9.7's position exposure is "capital already spent", and this is the
       // only place that number can be folded: the ledger projection carries
       // balances, not lots. FIFO, exact, no division (`allocation.ts`).
-      this.#options.allocator.observeFill(instance.instanceId, fill);
+      // `CAP-1`: the same call CONVERTS the order's commitment — the fill's
+      // shares leave its reservation as the position takes them over.
+      this.#options.allocator.observeFill(
+        instance.instanceId,
+        fill,
+        this.#options.venue.orderById(fill.simulatedOrderId)?.plannedOrderId,
+      );
       // `buildFillPosting` emits one stream per OWNER — the actual account's
       // and each claiming instance's — and `applyPnlRecord` refuses a record
       // whose owner is not the stream's. So the instance's stream keeps the
@@ -3641,6 +3774,13 @@ export class CoreLoop {
     this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
     this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
     this.#cash = cashAfter(this.#cash, fill);
+    // `CAP-1`: no position will ever carry this fill, so the commitment of
+    // the order it filled keeps its capital — at the fill's own price — in the
+    // cap check, against the instance that reserved it.
+    this.#options.allocator.observeUnattributedFill(
+      fill,
+      this.#options.venue.orderById(fill.simulatedOrderId)?.plannedOrderId,
+    );
 
     for (const appended of posted.appended) {
       const written = await this.#options.store.appendLedgerTransaction(appended);
@@ -3838,13 +3978,19 @@ export class CoreLoop {
    * Idempotent: a second call for the same order releases nothing and says so,
    * which is why `#deliverOrderViews` may keep its own call for orders that go
    * terminal without producing a fill (a cancel, an expiry, a rejection).
+   *
+   * `CAP-1`: the allocator commitment is SETTLED, not released
+   * (`#settleCapital`): its exact unused remainder goes, and the capital of a
+   * fill no position carries yet stays in the cap check until it is booked.
+   * Here, after this harvest booked every fill it read, that is normally
+   * nothing.
    */
   #releaseSettledReservations(): void {
     for (const venueOrderId of inVenueOrder(this.#orderOwners.keys())) {
       const order = this.#ownedOrder(venueOrderId, this.#lastInstant);
       if (order === undefined || !this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
-      this.#options.allocator.release(order.plannedOrderId);
+      this.#settleCapital(order);
       this.#timeInForce.release(order.plannedOrderId);
     }
     for (const plannedOrderId of inVenueOrder(this.#heldUnowned.keys())) {
@@ -3874,7 +4020,11 @@ export class CoreLoop {
       if (venueOrderId === undefined) this.#heldUnowned.set(plannedOrderId, order.simulatedOrderId);
       if (!this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
-      this.#options.allocator.release(order.plannedOrderId);
+      // `CAP-1`: its fills are booked UNATTRIBUTED (`#bookUnownedFill`), so
+      // no position will ever carry them: the allocator keeps their capital
+      // against the instance that reserved it (fail closed; the market is
+      // halted `UNATTRIBUTED_ACTIVITY` for reconciliation).
+      this.#settleCapital(order);
       this.#timeInForce.release(order.plannedOrderId);
       this.#heldUnowned.delete(plannedOrderId);
       this.#acknowledgeIfDone(order.simulatedOrderId);
@@ -4085,6 +4235,9 @@ export class CoreLoop {
    *   its time-in-force at the first harvest that sees it terminal
    *   (obligation 9: the reservation stands until the order can consume no
    *   more inventory) — unchanged, and never before terminal (ADR-006 §9).
+   *   `CAP-1`: the allocator commitment is SETTLED there (`#settleCapital`):
+   *   only its exact unused remainder goes, and a fill the view reports that
+   *   no position carries yet keeps its capital until it is booked.
    *
    * Every view is read from ONE boundary taken here, at the harvest boundary —
    * after every fill of this harvest was booked — and every retired order is
@@ -4146,8 +4299,12 @@ export class CoreLoop {
         // BOTH books, at the same moment and on the same key: the order can
         // consume no more inventory and commit no more capital (`allocation.ts`
         // §"The two reservation books"). Keyed by the PLANNED order id.
+        // `CAP-1`: the allocator releases only the exact unused remainder; a
+        // fill this view reports and no position carries yet — an `onFill`
+        // decision's order the venue filled at once — keeps its capital in
+        // the cap check until the harvest that books it.
         this.#reservations.releaseForOrder(order.plannedOrderId);
-        this.#options.allocator.release(order.plannedOrderId);
+        this.#settleCapital(order);
         this.#timeInForce.release(order.plannedOrderId);
       }
       if (this.#options.halts.isInstanceHalted(instance.instanceId, instance.marketId)) {
@@ -4305,35 +4462,13 @@ export class CoreLoop {
       if (group.stagedEvents >= GROUP_COMMIT_MAX_EVENTS) await this.#commitStaged();
       return;
     }
-    const drained = this.#options.outbox.drain();
-    for (const entry of drained.decisions) {
-      const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
-      if (!written.ok) {
-        this.#durabilityLost = true;
-        this.#options.halts.halt(
-          { kind: "GLOBAL" },
-          "STORE_UNAVAILABLE",
-          `a decision record could not be persisted (${written.failure.kind}): ` +
-            `${written.failure.detail}; §6 invariant 3 requires exactly one PERSISTED decision ` +
-            "per callback, so the process makes no further trading decision",
-          this.#lastInstant,
-        );
-        return;
-      }
-    }
-    for (const checkpoint of drained.checkpoints) {
-      const written = await this.#options.store.saveCheckpoint(checkpoint, this.#lastInstant);
-      if (!written.ok) {
-        this.#durabilityLost = true;
-        this.#options.halts.halt(
-          { kind: "GLOBAL" },
-          "STORE_UNAVAILABLE",
-          `a strategy checkpoint could not be persisted (${written.failure.kind}): ` +
-            `${written.failure.detail}`,
-          this.#lastInstant,
-        );
-        return;
-      }
+    // `CKPT-1` (ADR-027 D3): each decision is written WITH the checkpoint it
+    // owes, in one store transaction (`persistDecisionWithCheckpoint`), and a
+    // decision that owes none alone. Base wrote every decision of the event
+    // and THEN every checkpoint, so a failure (or a crash) between the two
+    // left decisions durable without their checkpoints.
+    for (const entry of this.#options.outbox.drain()) {
+      if (!(await this.#writeEntry(entry, false))) return;
     }
     // `PROVENANCE-1`: the event's refused intents, after its decisions and
     // checkpoints. Never after a store failure this process has halted on.
@@ -4353,6 +4488,38 @@ export class CoreLoop {
         return;
       }
     }
+  }
+
+  /**
+   * `CKPT-1` — one outbox entry through the per-row store: the decision with
+   * the checkpoint it owes in ONE transaction, or the decision alone when it
+   * owes none (ADR-027 D3). On a refusal: `#durabilityLost`, a GLOBAL
+   * `STORE_UNAVAILABLE` halt, and `false` — neither row of a refused pair is
+   * durable, so the store never holds a decision whose owed checkpoint is
+   * missing.
+   */
+  async #writeEntry(entry: OutboxEntry, beforePlacement: boolean): Promise<boolean> {
+    const store = this.#options.store;
+    const written: PortResult<null> =
+      entry.checkpoint === undefined
+        ? await store.persistDecision(entry.record, entry.telemetry)
+        : await store.persistDecisionWithCheckpoint(entry.record, entry.telemetry, entry.checkpoint, this.#lastInstant);
+    if (written.ok) return true;
+    this.#durabilityLost = true;
+    this.#options.halts.halt(
+      { kind: "GLOBAL" },
+      "STORE_UNAVAILABLE",
+      `a decision record could not be persisted (${written.failure.kind})` +
+        (entry.checkpoint === undefined ? "" : ", nor the strategy checkpoint it owes (ADR-027 D3: one transaction)") +
+        `: ${written.failure.detail}; ` +
+        (beforePlacement
+          ? "§6 invariant 3 requires the decision to be PERSISTED before its placement, so nothing is placed " +
+            "and the process makes no further trading decision"
+          : "§6 invariant 3 requires exactly one PERSISTED decision per callback, so the process makes no " +
+            "further trading decision"),
+      this.#lastInstant,
+    );
+    return false;
   }
 
   /**
@@ -4386,13 +4553,24 @@ export class CoreLoop {
    *   exactly the rows `#stageOutbox` would have staged for them) and the
    *   loop waits until EVERYTHING staged is committed (`#commitStaged`), so
    *   the durable rows stay a prefix of the run's;
-   * - without it, each pending decision is written by `persistDecision`, in
-   *   evaluation order, exactly as `#flushOutbox` would have written it.
+   * - without it, each pending decision is written in evaluation order,
+   *   exactly as `#flushOutbox` would have written it (`#writeEntry`:
+   *   `persistDecision`, or `persistDecisionWithCheckpoint` for one that owes
+   *   a checkpoint).
    *
-   * Checkpoints are NOT drained here ({@link DecisionOutboxBuffer.drainDecisions}):
-   * the flush that follows the callback writes them, with the instant it
-   * always gave them. So the fix changes WHEN a decision row is written, never
-   * WHAT is written.
+   * `CKPT-1` (ADR-027 D3; `DURABLE-1` LOW-3): every pending decision is made
+   * durable WITH the checkpoint it owes — in the same staging (so the same
+   * commit), or by one `persistDecisionWithCheckpoint` per pair. Until
+   * `CKPT-1` this boundary drained the decisions only and left their
+   * checkpoints for the flush after the callback, so in group mode the
+   * decision committed in the transaction this boundary awaits and its
+   * checkpoint in a LATER one — a crash between them left a durable decision
+   * whose checkpoint was not (LOW-3), and per-row did the same with two
+   * autocommits. The checkpoints are now written here, with the instant the
+   * loop holds HERE: for a decision taken at a frame's close or at a
+   * single-event frame that is the instant the flush gives (the frame's last
+   * event); for a lifecycle callback fired inside a longer frame it is that
+   * event's own instant, where the flush used the frame's last.
    *
    * Answers `false` — with a GLOBAL `STORE_UNAVAILABLE` halt latched, the same
    * halt a failed flush latches — when the decisions are not durable. The
@@ -4410,16 +4588,8 @@ export class CoreLoop {
    * placement without asking the store again (`#routingUndurableDecision`),
    * so the refusal never depends on the risk seam reading the halt.
    *
-   * GROUP COMMIT SPLITS A DECISION FROM ITS EVENT'S CHECKPOINT (r1, LOW-3).
-   * The decisions are staged here WITHOUT the checkpoints the outbox still
-   * holds, so the decision rows commit in the transaction this boundary
-   * awaits and the event's checkpoints in a LATER one (the flush stages them;
-   * a crash between the two leaves a durable decision whose checkpoint is not).
-   * Base staged an event's decisions and checkpoints as one staging. Keeping
-   * them together would mean draining the checkpoints here, with an instant
-   * that inside a venue frame is not the one they always had. Per-row stores
-   * never wrote the two atomically. No production path restores from a
-   * checkpoint (`restoreFrom` has no caller outside tests).
+   * GROUP COMMIT USED TO SPLIT A DECISION FROM ITS CHECKPOINT (`DURABLE-1`
+   * r1, LOW-3); `CKPT-1` closes it as stated above.
    */
   async #persistDecisionsBeforePlacement(): Promise<boolean> {
     if (this.#routingUndurableDecision) return false;
@@ -4430,10 +4600,11 @@ export class CoreLoop {
 
   async #persistPendingDecisions(): Promise<boolean> {
     const group = this.#options.store.groupCommit;
-    const decisions = this.#options.outbox.drainDecisions();
+    // `CKPT-1`: the decisions WITH their checkpoints (see above).
+    const entries = this.#options.outbox.drain();
     if (group !== undefined) {
-      if (decisions.length > 0) {
-        const staged = group.stage({ decisions, checkpoints: [], riskRefusals: [] });
+      if (entries.length > 0) {
+        const staged = group.stage(stagedFrom(entries, this.#lastInstant, []));
         if (!staged.ok) {
           this.#durabilityLost = true;
           this.#options.outbox.drain();
@@ -4452,19 +4623,11 @@ export class CoreLoop {
       await this.#commitStaged();
       return !this.#groupCommitFailed;
     }
-    for (const entry of decisions) {
-      const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
-      if (!written.ok) {
-        this.#durabilityLost = true;
+    for (const entry of entries) {
+      if (!(await this.#writeEntry(entry, true))) {
+        // As a failed flush drops what it drained: nothing is written after
+        // the failure the halt reports.
         this.#options.outbox.drain();
-        this.#options.halts.halt(
-          { kind: "GLOBAL" },
-          "STORE_UNAVAILABLE",
-          `a decision record could not be persisted (${written.failure.kind}): ` +
-            `${written.failure.detail}; §6 invariant 3 requires the decision to be PERSISTED before ` +
-            "its placement, so nothing is placed and the process makes no further trading decision",
-          this.#lastInstant,
-        );
         return false;
       }
     }
@@ -4484,12 +4647,9 @@ export class CoreLoop {
     // its remaining rows, so they commit in that batch's transaction, before
     // any later event's decision (the commit chain is in stage order).
     const riskRefusals = this.#takeRiskRefusals();
-    if (drained.decisions.length === 0 && drained.checkpoints.length === 0 && riskRefusals.length === 0) return;
-    const staged = group.stage({
-      decisions: drained.decisions,
-      checkpoints: drained.checkpoints.map((checkpoint) => ({ checkpoint, capturedAt: this.#lastInstant })),
-      riskRefusals,
-    });
+    if (drained.length === 0 && riskRefusals.length === 0) return;
+    // `CKPT-1`: each checkpoint in the staging of its own decision.
+    const staged = group.stage(stagedFrom(drained, this.#lastInstant, riskRefusals));
     if (!staged.ok) {
       this.#durabilityLost = true;
       this.#options.halts.halt(
@@ -4659,12 +4819,31 @@ export class CoreLoop {
     return Object.freeze(owners);
   }
 
+  /**
+   * The instance's OWN working orders, as §9.8 reads them (`openOrders`), and
+   * — `CAP-1` — the planned order ids of exactly those, each with the filled
+   * shares its presentation leaves out (`#unbookedFillsFor`).
+   *
+   * `CAP-1` r1 (`CAP1-ASTRA-R1-02`): a working order is presented at its
+   * UNFILLED remainder, `requested − filled`. Its BOOKED fills are already the
+   * position's, and presenting them again in the order counted them twice
+   * (risk's lot builder adds both). Its filled shares no position carries yet
+   * are stated through the separate `unbookedFills` input, at their own price
+   * when seen. Disjoint, so each share is counted once. A working order with
+   * no unfilled share presents nothing (risk's open order is never
+   * zero-sized); one whose sizes are not exact decimals is presented whole, as
+   * before (fail closed).
+   */
   #openOrdersFor(
     instance: RegisteredInstance,
     marketConfig: MarketConfig,
-  ): readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[] {
+  ): {
+    readonly openOrders: readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[];
+    readonly presented: ReadonlyMap<string, string>;
+  } {
+    const presented = new Map<string, string>();
     const owned = this.#instanceOrders.get(instance.instanceId);
-    if (owned === undefined) return Object.freeze([]);
+    if (owned === undefined) return { openOrders: Object.freeze([]), presented };
     const orders: { orderId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }[] = [];
     // SIM-2: the instance's OWN orders, in venue order (`IF-07`: risk's
     // `openOrders` keep the order the snapshot scan gave them), one lookup each.
@@ -4674,16 +4853,107 @@ export class CoreLoop {
       if (order.state === "FILLED" || order.state === "CANCELLED" || order.state === "EXPIRED" || order.state === "REJECTED") {
         continue;
       }
+      const exact = isCanonicalDecimalString(order.requestedShares) && isCanonicalDecimalString(order.filledShares);
+      const filled = exact ? order.filledShares : "0";
+      const open = exact ? subDecimal(order.requestedShares, filled) : order.requestedShares;
+      if (exact && compareDecimal(open, "0") <= 0) continue;
       orders.push({
         orderId: order.simulatedOrderId,
         marketId: marketConfig.marketId,
         side: order.side,
         action: order.action,
         price: order.limitPrice,
-        shares: order.requestedShares,
+        shares: open,
       });
+      presented.set(order.plannedOrderId, filled);
     }
-    return Object.freeze(orders);
+    return { openOrders: Object.freeze(orders), presented };
+  }
+
+  /** The risk portfolio's order-derived halves: its open orders and (`CAP-1`) its unbooked fills. */
+  #portfolioOrdersFor(
+    instance: RegisteredInstance,
+    marketConfig: MarketConfig,
+  ): Pick<RiskInputContext, "openOrders" | "unbookedFills"> {
+    const open = this.#openOrdersFor(instance, marketConfig);
+    return {
+      openOrders: open.openOrders,
+      unbookedFills: this.#unbookedFillsFor(instance, marketConfig, open.presented),
+    };
+  }
+
+  /**
+   * `CAP-1` (orchestrator ruling, 2026-10-04): the instance's
+   * FILLED-BUT-UNBOOKED BUY exposure in its market — §9.8 checks 16 and 17's
+   * separate input (`packages/risk`'s `unbookedFills`).
+   *
+   * The window: a fill becomes a position only at its harvest point (ADR-024;
+   * ADR-026 for the carried path), and its order leaves `openOrders` as soon
+   * as the venue reports it terminal — an `onFill` decision's order the venue
+   * fills at once is FILLED in the same close. Every evaluation in between saw
+   * the fill in neither view, so the worst-case and scenario checks
+   * undercounted it (the R4-CAP shape, with `maxWorstCaseContractualLoss` 8,
+   * admitted a third BUY at a 10.20 pUSD worst case).
+   *
+   * Derived by the allocator from the SAME commitments the cap check counts
+   * (`AllocatorGate.unbookedExposure`), scoped like `#positionsFor` (this
+   * instance, this market). `presented` names the orders `openOrders` shows
+   * at their unfilled remainder, whose filled-but-unbooked shares belong
+   * here (`CAP-1` r1). For a commitment neither settled nor presented the
+   * venue is asked one thing only, O(1): its order's state and filled size
+   * (`#orderViewOf`). No fill page is read on this path (SIM-2: one cursor
+   * read per harvest); `CAP-1` r1: an unbooked fill is priced from the
+   * placement or trade answer that carried it (`#noteSeenFills`), or (r2)
+   * from the fill page a harvest already read (`#readFills`), and at its
+   * order's limit (never less than its debit) only when neither did. Moves
+   * nothing.
+   */
+  #unbookedFillsFor(
+    instance: RegisteredInstance,
+    marketConfig: MarketConfig,
+    presented: ReadonlyMap<string, string>,
+  ): readonly UnbookedExposure[] {
+    return this.#options.allocator.unbookedExposure({
+      instanceId: instance.instanceId,
+      marketId: marketConfig.marketId,
+      presentedOpen: presented,
+      viewOf: (plannedOrderId) => this.#orderViewOf(plannedOrderId),
+    });
+  }
+
+  /**
+   * `CAP-1` r1: what the venue shows of a planned order NOW, for the
+   * allocator's questions: whether it is terminal (the trader's one terminal
+   * predicate) and its filled size. One O(1) lookup by planned id; it moves
+   * nothing and HALTS on nothing. An order the venue cannot show is
+   * `undefined`, and the allocator then keeps its whole reservation (fail
+   * closed); the loop's own reads of the orders it owns stay where they were
+   * and are loud on a miss.
+   */
+  #orderViewOf(plannedOrderId: string): OrderView | undefined {
+    const order = this.#options.venue.orderByPlannedId(plannedOrderId);
+    if (order === undefined) return undefined;
+    return { terminal: this.#isTerminalOrder(order), filledShares: order.filledShares };
+  }
+
+  /**
+   * `CAP-1` r1: records each of `fills`, which a venue ANSWER carried (a
+   * placement's or a trade's) or (r2) a fill page the loop READ
+   * (`#readFills`), as SEEN by its planned order's allocator commitment:
+   * evidence of its price, nothing booked, released or moved. `orders`, when
+   * the answer lists them, names each fill's planned order; otherwise it is
+   * looked up by the fill's venue order id, O(1) per fill.
+   */
+  #noteSeenFills(
+    fills: readonly Pick<SimulatedFill, "simulatedFillId" | "simulatedOrderId" | "marketId" | "side" | "action" | "price" | "shares">[],
+    orders: readonly SimulatedOrder[] | undefined,
+  ): void {
+    for (const fill of fills) {
+      const plannedOrderId =
+        orders?.find((order) => order.simulatedOrderId === fill.simulatedOrderId)?.plannedOrderId ??
+        this.#options.venue.orderById(fill.simulatedOrderId)?.plannedOrderId;
+      this.#options.allocator.observeVenueFill(fill, plannedOrderId);
+    }
   }
 
   /**

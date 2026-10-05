@@ -107,7 +107,14 @@ async function observe(grouped: boolean, refuseSeq: number | undefined): Promise
           }
           return await inner.persistDecision(record, telemetry);
         },
-        saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+        // `CKPT-1` (ADR-027 D3): the paired write is refused the same way.
+        persistDecisionWithCheckpoint: async (record, telemetry, checkpoint, capturedAt) => {
+          if (record.evaluationSeq === refuseSeq) {
+            timeline.push({ op: "decision_refused", evaluationSeq: record.evaluationSeq });
+            return portFailed<null>("UNAVAILABLE", REFUSAL);
+          }
+          return await inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt);
+        },
         appendLedgerTransaction: (transaction) => {
           const durable = durableSeqs();
           timeline.push({

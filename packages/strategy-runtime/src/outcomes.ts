@@ -12,13 +12,17 @@
  * The four kinds:
  *
  * - `DECIDED` — the callback ran within budget and returned a valid §7.5
- *   `DecisionResult`; exactly one strategy-attributed record was persisted and
- *   one checkpoint saved.
+ *   `DecisionResult`; exactly one strategy-attributed record was persisted,
+ *   and one checkpoint saved when ADR-027 Decision 1 says the decision owes
+ *   one (`checkpointTransitions` non-empty; `CKPT-1`) — otherwise
+ *   `checkpoint` is `null`. Until `CKPT-1` every decision saved one.
  * - `CONTAINED` — the callback threw, timed out, or returned an invalid
  *   result; exactly one RUNTIME-attributed `skip` record was persisted
  *   (ADR-005 §3), the strategy's returned value (if any) was discarded, the
  *   instance is PAUSED, and `incident` describes what to raise. The
- *   evaluation is recorded as having happened and produced no intent.
+ *   evaluation is recorded as having happened and produced no intent. The
+ *   pause is a STATUS transition, so a contained evaluation always saves its
+ *   checkpoint.
  * - `REFUSED` — the callback was NEVER invoked (paused/stopped instance,
  *   re-entrant call, invalid input), so §6 invariant 3 does not bind and NO
  *   record was persisted. A refusal is a caller error surface, not a decision.
@@ -26,11 +30,15 @@
  *   attempt and will not retry (an unknown-fate write must not be retried
  *   blindly — the §6 invariant 6 reasoning); the instance is PAUSED and the
  *   incident must be raised. `stage` says which port; on `SAVE_CHECKPOINT` the
- *   decision record IS durable and only the checkpoint is not.
+ *   decision record WAS handed to the sink and only its owed checkpoint was
+ *   not — a composition root that makes decisions durable must then keep that
+ *   record from becoming durable alone (ADR-027 D3; `packages/trading-core`
+ *   drops it with the rest of its outbox under a GLOBAL halt).
  */
 
 import type { StrategyStateCheckpoint } from "./checkpoint.js";
 import { describeLabel } from "./describe.js";
+import type { CheckpointTransition } from "./transitions.js";
 import type { DecisionRecord, DecisionTelemetry } from "./record.js";
 import type { ReservedRuntimeReasonCode } from "./reserved-codes.js";
 
@@ -82,13 +90,18 @@ export type EvaluationOutcome =
       readonly kind: "DECIDED";
       readonly record: DecisionRecord;
       readonly telemetry: DecisionTelemetry;
-      readonly checkpoint: StrategyStateCheckpoint;
+      /** `null` when the decision met no ADR-027 Decision 1 transition. */
+      readonly checkpoint: StrategyStateCheckpoint | null;
+      /** `CKPT-1`: the ADR-027 Decision 1 transitions it made; empty means no checkpoint. */
+      readonly checkpointTransitions: readonly CheckpointTransition[];
     }
   | {
       readonly kind: "CONTAINED";
       readonly record: DecisionRecord;
       readonly telemetry: DecisionTelemetry;
-      readonly checkpoint: StrategyStateCheckpoint;
+      /** Always a checkpoint in practice: the pause is a STATUS transition. */
+      readonly checkpoint: StrategyStateCheckpoint | null;
+      readonly checkpointTransitions: readonly CheckpointTransition[];
       readonly failure: ContainedFailure;
       readonly incident: IncidentReport;
     }
@@ -218,7 +231,11 @@ export type RuntimeCreationRefusalCode =
   | "CHECKPOINT_SEQ_INVALID"
   | "CHECKPOINT_STATUS_INVALID"
   | "CHECKPOINT_RNG_STATE_INVALID"
-  | "CHECKPOINT_STATE_INVALID";
+  | "CHECKPOINT_STATE_INVALID"
+  /** `CKPT-1`: see `CheckpointRefusalCode` in `checkpoint.ts`. */
+  | "RESTORE_POINT_INVALID"
+  | "RESTORE_SEQ_INVALID"
+  | "RESTORE_INSTANT_INVALID";
 
 export interface RuntimeCreationRefusal {
   readonly code: RuntimeCreationRefusalCode;

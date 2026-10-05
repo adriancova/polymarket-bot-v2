@@ -38,7 +38,7 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `scenario` | the identities, sizes, prices and fee schedule `test/e2e/support/scenario.ts` states |
 | `events` | the eight recorded §7.1 events, by id and ingest sequence |
 | `decisions` | every PERSISTED `DecisionRecord`, as it reached the durable-store port — since golden format 4 (`PROVENANCE-1`) with its triggering event's dispatch position, `sourceGatewayEpoch` and `sourceIngestSeq` |
-| `checkpointInstants` | one per persisted decision, at the evaluation's own instant |
+| `checkpointInstants` | the `capturedAt` of each strategy checkpoint the store holds, in write order — since `CKPT-1` (ADR-027) one per persisted decision that owed a checkpoint (a state, status or RNG change, the start, the stop, or a 60 s heartbeat), no longer one per decision |
 | `traces` | the §6 invariant 4 chains the run produced — one per FILL, so an order that never filled is on none |
 | `orderProvenance` | every order's §6 invariant 4 trace PREFIX as the loop recorded it at SUBMISSION (`CoreLoop.orderProvenance()`), filled or not, in submission order — golden format 2 (`RECON-2`) |
 | `orders` / `fills` | what the simulated venue booked and produced |
@@ -48,6 +48,33 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `evaluationCadence` | since golden format 5 (`CADENCE-1`): the ADR-026 evaluation cadence the core RAN with — `intervalMs` and `heartbeatMs` `0`, the per-frame cadence (ADR-024) this golden was recorded under, and `reproduces`, the golden's own repository path: the harness DECLARES the run a reproduction of this file, the only kind of run that may use the value 0 (ADR-026 D1.6) |
 | `health` | every §14.3-shaped counter the run moved, plus `accounting.realizedPnl` (below), and — golden format 3 (`TRDR-4`) — `seams.orders` (the loop's per-order state: `tracked`, `settled`, the settled-order tombstones, `unownedFills`, `lateFillsAfterSettlement`, `settleMismatches`) and `seams.retention` (`retained / maximumRetained / evicted` for the decision, trace and provenance logs — all `evicted: 0` here, which PINS that this fixture evicts nothing) |
 | `reconciliation` | the projected-vs-realized table, with each difference's named mechanism |
+
+### The `CKPT-1` regeneration (format unchanged): checkpoints on change
+
+ADR-027 (the user's ruling A2): a strategy checkpoint is written only after
+a decision that changes the state, the status or the RNG, at the start, at the
+stop, or on a 60 s event-time heartbeat. The regeneration — ONCE per file,
+with `WP250_WRITE_GOLDEN`, from the committed base bytes (`ebed242`) — moved
+exactly ONE field, `checkpointInstants`, and nothing else; checked
+mechanically against the base files (every other top-level section is equal,
+`goldenFormatVersion` included, since the format did not change):
+
+- `paper-e2e-run.json`: 12 → 10 entries. The decisions at `evaluationSeq`
+  10 (`onOrderUpdate`, `SB.IDLE`, `09:14:49`) and 11 (`onMarketClosing`,
+  `SB.REFUSED_MAXIMUM_ENTRIES`, `09:14:50`) carry no `statePatch`: their state
+  bytes equal those of `seq` 9's checkpoint, the status stays `ACTIVE`, Static
+  Bracket draws no randomness, and neither lies 60 s after `seq` 9. Their two
+  checkpoints (`09:14:49`, `09:14:50`) are gone.
+- `two-brackets-run.json`: 19 → 15 entries. The patch-less decisions at
+  `evaluationSeq` 9 (`09:03:06`), 15 and 17 (`09:04:00`) and 18 (`09:04:10`)
+  repeat the state of the checkpoint before them; their four checkpoints are
+  gone.
+
+A scratch probe listed every durable checkpoint at base and at the candidate,
+as a full canonical-document hash with its `capturedAt` (the output is in the
+round's handoff): the candidate's checkpoints are exactly base's minus those
+six, each remaining one byte-identical. The two fresh in-suite runs of each
+scenario stay byte-identical, so the rule is deterministic under replay.
 
 ### The `CADENCE-1` regeneration (golden format 5): the evaluation cadence, recorded
 

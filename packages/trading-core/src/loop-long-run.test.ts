@@ -62,10 +62,10 @@ import {
   type EvaluationOutcome,
 } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext, StrategyOrderView } from "@polymarket-bot/strategy-sdk";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import { PER_FRAME_EVALUATION_CADENCE } from "./cadence.js";
+import { PAPER_EVALUATION_CADENCE, PER_FRAME_EVALUATION_CADENCE, type EvaluationCadenceOption } from "./cadence.js";
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
@@ -98,6 +98,57 @@ const STEP_MS = 100;
 const TERMINAL = new Set(["FILLED", "CANCELED", "REJECTED", "EXPIRED"]);
 /** One immediate round trip per this many strategy steps (two steps per cycle). */
 const IMMEDIATE_EVERY_STEPS = 40;
+
+/**
+ * `TC-LOWS-1` (O07): every test of this file runs at BOTH evaluation
+ * cadences — ADR-024's per-frame value 0, as a declared reproduction
+ * (ADR-026 D1.6), under the test names it always had, and the production
+ * cadence every new run uses (ADR-026 D1.5: 1,000 ms / 5,000 ms), under the
+ * same names with {@link PRODUCTION_SUFFIX}.
+ *
+ * The events stay {@link STEP_MS} (100 ms) apart at both cadences, so at the
+ * production one the double's `onFeatures` runs at most once per ten events:
+ * an event less than 1,000 ms of event time after the market's last
+ * evaluation does not evaluate it (ADR-026 D2.4) and is coalesced (D5), while
+ * every harvest point — every fill and order view — is unchanged (D4). That
+ * is the production regime of a busy book, and every per-event claim below is
+ * checked at EVERY event of it, coalesced or not. Where a test counts strategy
+ * STEPS in events, it says so at the count and scales it by
+ * {@link STEPS_APART} (1,000 ms / 100 ms = 10 events per step).
+ */
+interface CadenceCase {
+  readonly production: boolean;
+  readonly option: EvaluationCadenceOption;
+}
+const REPRODUCTION: CadenceCase = {
+  production: false,
+  option: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-long-run.test.ts" },
+};
+const PRODUCTION: CadenceCase = { production: true, option: PAPER_EVALUATION_CADENCE };
+const PRODUCTION_SUFFIX = " [at the production cadence, ADR-026 D1.5: 1,000 ms / 5,000 ms]";
+/** The cadence the tests now running use: set by {@link describeAtEachCadence}. */
+let cadence: CadenceCase = REPRODUCTION;
+
+/** `describe`, twice: at the reproduction cadence (the name as it was), then at the production one. */
+function describeAtEachCadence(name: string, body: () => void): void {
+  for (const each of [REPRODUCTION, PRODUCTION]) {
+    describe(each.production ? `${name}${PRODUCTION_SUFFIX}` : name, () => {
+      beforeAll(() => {
+        cadence = each;
+      });
+      body();
+    });
+  }
+}
+
+/**
+ * How many events apart two strategy steps are: 1 at the per-frame cadence,
+ * 10 at the production one (ADR-026 D2.4: 1,000 ms of event time at
+ * {@link STEP_MS}).
+ */
+function stepsApart(): number {
+  return cadence.production ? 1_000 / STEP_MS : 1;
+}
 
 function feeSnapshot(): FeeScheduleSnapshot {
   return {
@@ -451,14 +502,11 @@ function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Har
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
     // `CADENCE-1` (ADR-026 D1.6; r1, O07): this harness's subject is TRDR-4 long-run
     // retention and order settlement, not the cadence — but its timelines were written
-    // for ADR-024's per-frame cadence: a scripted strategy that acts at events often
-    // under a second apart. Under the production cadence (1,000 ms / 5,000 ms) those
-    // evaluations are coalesced, and 4 of this file's 7 tests fail under it (measured
-    // in r1; the failures were not analysed one by one). So it REPRODUCES the ADR-024
-    // behaviour its timelines pin (the value 0, declared); this subject is NOT
-    // exercised here under the production cadence. The cadence is pinned by
-    // `cadence.test.ts` and `loop-cadence.test.ts`.
-    evaluationCadence: { ...PER_FRAME_EVALUATION_CADENCE, reproduces: "adr-024:packages/trading-core/src/loop-long-run.test.ts" },
+    // for ADR-024's per-frame cadence: a scripted strategy that acts at events 100 ms
+    // apart. `TC-LOWS-1` (O07): every test now runs at both cadences
+    // ({@link describeAtEachCadence}); where a count differs at the production
+    // cadence, the test says where and why.
+    evaluationCadence: cadence.option,
   });
   wiring.loop = loop;
 
@@ -535,7 +583,7 @@ function yieldToEventLoop(): Promise<void> {
   });
 }
 
-describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
+describeAtEachCadence("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
   it(
     "over 500+ orders: the per-order maps track WORKING orders, per-event deliveries stay flat, retention evicts oldest-first, counted",
     async () => {
@@ -550,9 +598,17 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
       const deliveriesPerTick: number[] = [];
       const TARGET_ORDERS = 500;
       let ticks = 0;
-      while (harness.venue.ordersSnapshot().length < TARGET_ORDERS || ticks % 2 === 1) {
+      // The run ends after a CANCEL step, so nothing is left working: at the
+      // per-frame cadence that is an even tick. `TC-LOWS-1` (O07): at the
+      // production cadence the double steps once per ten ticks (ADR-026 D2.4),
+      // so the run ends once no order is working.
+      const working = (): number =>
+        harness.venue.ordersSnapshot().filter((order) => !["FILLED", "CANCELLED", "EXPIRED", "REJECTED"].includes(order.state)).length;
+      while (harness.venue.ordersSnapshot().length < TARGET_ORDERS || (cadence.production ? working() > 0 : ticks % 2 === 1)) {
         // A run that stops placing orders fails here instead of looping forever.
-        expect(ticks, "the synthetic run stopped placing orders").toBeLessThan(400);
+        // `TC-LOWS-1` (O07): ten times the events at the production cadence,
+        // where the double steps once per ten (ADR-026 D2.4).
+        expect(ticks, "the synthetic run stopped placing orders").toBeLessThan(400 * stepsApart());
         ordinal += 1;
         ticks += 1;
         const before = harness.evaluations.length;
@@ -585,6 +641,12 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
       const health = loop.health();
       expect(placed).toBeGreaterThanOrEqual(TARGET_ORDERS);
       expect(health.halts).toEqual([]);
+      // `TC-LOWS-1` (O07): the regime each cadence ran — every tick a step at
+      // the per-frame cadence (nothing coalesced), and at the production one
+      // nine ticks in ten coalesced (ADR-026 D2.4, D5).
+      const steps = harness.evaluations.filter((entry) => entry.input.callback === "onFeatures").length;
+      expect(health.loop.evaluationsCoalesced).toBe(cadence.production ? ticks - steps : 0);
+      if (cadence.production) expect(ticks).toBeGreaterThan(9 * steps);
       // Both cycle kinds really ran: fills were booked, and resting orders were cancelled.
       const states = new Set(harness.venue.ordersSnapshot().map((order) => order.state));
       expect(states).toEqual(new Set(["FILLED", "CANCELLED"]));
@@ -620,11 +682,23 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
       // one per working order plus one per newly terminal order (ten each at
       // most), and the busiest late tick is no busier than the busiest early one.
       expect(Math.max(...deliveriesPerTick)).toBeLessThanOrEqual(20);
-      const early = deliveriesPerTick.slice(0, 50);
-      const late = deliveriesPerTick.slice(-50);
+      // `TC-LOWS-1` (O07): the same number of strategy steps per window — 50
+      // events, 500 at the production cadence (ADR-026 D2.4).
+      const early = deliveriesPerTick.slice(0, 50 * stepsApart());
+      const late = deliveriesPerTick.slice(-50 * stepsApart());
       expect(Math.max(...late)).toBeLessThanOrEqual(Math.max(...early));
+      // The windows may differ by ONE resting cycle's deliveries: its ten OPEN
+      // views, their repeats at every event while they rest, and its ten
+      // CANCELED views — 20 at the per-frame cadence, where the cycle's two
+      // steps are adjacent events. `TC-LOWS-1` (O07): at the production
+      // cadence the cycle rests for the nine coalesced events between its
+      // steps (ADR-026 D2.4), and every harvest point still delivers its
+      // working views (D4): 10 + 90 + 10 = 110 (measured: an immediate cycle,
+      // which rests for none, delivers 90 fewer, so the two 500-event windows
+      // differ by 90 when they hold different numbers of immediate cycles).
+      const oneCycle = 10 * (stepsApart() + 1);
       expect(late.reduce((sum, count) => sum + count, 0)).toBeLessThanOrEqual(
-        early.reduce((sum, count) => sum + count, 0) + 20,
+        early.reduce((sum, count) => sum + count, 0) + oneCycle,
       );
       // Every order's TERMINAL view was delivered exactly once.
       const terminalDeliveries = new Map<string, number>();
@@ -745,7 +819,7 @@ function countVenueCalls(venue: SimulatedVenue): { counting: boolean; readonly c
   return probe;
 }
 
-describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and the loop reads none of it", () => {
+describeAtEachCadence("SIM-2: the venue holds LIVE orders plus bounded, counted history, and the loop reads none of it", () => {
   it(
     "over 2,000+ orders and hundreds of public trades (a deterministic synthetic run, NOT a soak — §16.7)",
     async () => {
@@ -838,7 +912,8 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
       let round = 0;
       while (placed() < 2_000) {
         round += 1;
-        expect(round, "the synthetic run stopped placing orders").toBeLessThan(1_000);
+        // `TC-LOWS-1` (O07): ten times the rounds at the production cadence (ADR-026 D2.4).
+        expect(round, "the synthetic run stopped placing orders").toBeLessThan(1_000 * stepsApart());
         await step(tick(ordinal + 1));
         await step(publicTrade(ordinal + 1, "0.33"));
         await step(publicTrade(ordinal + 1, "0.33"));
@@ -853,11 +928,12 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
       let guard = 0;
       while (harness.venue.retention().live.orders === 0) {
         guard += 1;
-        expect(guard).toBeLessThan(5);
+        expect(guard).toBeLessThan(5 * stepsApart());
         await step(tick(ordinal + 1));
       }
       await step(publicTrade(ordinal + 1, "0.2"));
-      for (let index = 0; index < 4; index += 1) await step(tick(ordinal + 1));
+      // `TC-LOWS-1` (O07): four strategy steps — forty events at the production cadence.
+      for (let index = 0; index < 4 * stepsApart(); index += 1) await step(tick(ordinal + 1));
       expect(harness.venue.retention().fills.nextSequence).toBeGreaterThan(roundTrip + 5);
 
       const retention = harness.venue.retention();
@@ -891,6 +967,14 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
       // booked EVERY fill the venue produced, though the venue kept only 16.
       const health = harness.loop.health();
       expect(health.halts).toEqual([]);
+      // `TC-LOWS-1` (O07): the regime each cadence ran — nothing coalesced at
+      // the per-frame cadence; at the production one most events are coalesced
+      // (ADR-026 D2.4, D5) and every per-event check above held at them too.
+      if (cadence.production) {
+        expect(health.loop.evaluationsCoalesced).toBeGreaterThan(perEvent.length / 2);
+      } else {
+        expect(health.loop.evaluationsCoalesced).toBe(0);
+      }
       expect(health.execution.fillsObserved).toBe(retention.fills.nextSequence);
       expect(health.execution.duplicateFillsRefused).toBe(0);
       expect(health.seams.orders).toMatchObject({ tracked: retention.live.orders, unownedFills: 0, settleMismatches: 0 });
@@ -936,6 +1020,14 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
     expect(updates.map((entry) => (entry.input.callback === "onOrderUpdate" ? entry.input.order.orderId : ""))).toEqual(expected);
     for (const entry of updates) expect(entry.input.orders.map((view) => view.orderId)).toEqual(expected);
     // The next evaluation (the cancel step) reads ctx.orders() in the same order.
+    // `TC-LOWS-1` (O07): at the production cadence it is the first event
+    // 1,000 ms after this one; the nine ticks between are coalesced (ADR-026
+    // D2.4) and evaluate no onFeatures (D5).
+    for (let between = 1; between < stepsApart(); between += 1) {
+      ordinal += 1;
+      await feed(harness, tick(ordinal), ordinal);
+      expect(harness.evaluations.filter((entry) => entry.event === ordinal && entry.input.callback === "onFeatures")).toEqual([]);
+    }
     ordinal += 1;
     await feed(harness, tick(ordinal), ordinal);
     const next = harness.evaluations.find((entry) => entry.event === ordinal && entry.input.callback === "onFeatures");
@@ -1031,6 +1123,15 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
     expect(harness.venue.retention().live.orders).toBe(10);
     expect(harness.loop.retainedOrderState().owners).toBe(10);
     // Step 1: ONE cancel plan names all ten; the venue cancels them in one call.
+    // `TC-LOWS-1` (O07): at the production cadence step 1 is the first event
+    // 1,000 ms after step 0; the nine ticks between are coalesced (ADR-026
+    // D2.4): no onFeatures, so no cancel, and the ten slices still rest.
+    for (let between = 1; between < stepsApart(); between += 1) {
+      ordinal += 1;
+      await feed(harness, tick(ordinal), ordinal);
+      expect(harness.evaluations.filter((entry) => entry.event === ordinal && entry.input.callback === "onFeatures")).toEqual([]);
+      expect(harness.venue.retention().live.orders).toBe(10);
+    }
     ordinal += 1;
     await feed(harness, tick(ordinal), ordinal);
     const health = harness.loop.health();

@@ -17,7 +17,6 @@
  * no signer, no real order.
  */
 
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import { parseTraderConfig } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -25,11 +24,12 @@ import { assembleDurableTrader, EXIT_CODES } from "../../../apps/trader/src/main
 import { ingested, safeEnvironment } from "./support/fixture.js";
 import { FIXTURE_FIRST_EVENT_AT, RebasedSystemPaperClock } from "./support/host-clock.js";
 import { RUN_SEED, documentFor, registerThroughTheRepositories, withFreshDatabase } from "./support/registration.js";
+import { startReadyPostgresContainer } from "./support/containers.js";
 
-let container: Awaited<ReturnType<typeof startPostgresContainer>>;
+let container: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 
 beforeAll(async () => {
-  container = await startPostgresContainer();
+  container = await startReadyPostgresContainer();
 }, 300_000);
 
 afterAll(async () => {

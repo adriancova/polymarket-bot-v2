@@ -1,8 +1,8 @@
 /**
  * What acceptance 3 forbids, in one place (`CONTROL-1b` r2): the secure
- * adapter, the venue SDKs and the signing libraries — as package NAMES, as the
- * secure adapter's DIRECTORY, and as the path SEGMENTS either leaves in a file
- * path.
+ * adapter, the venue SDKs and the signing libraries — since `CONTROL-2` the
+ * venue SDK's own signing closure too — as package NAMES, as the secure
+ * adapter's DIRECTORY, and as the path SEGMENTS either leaves in a file path.
  *
  * Four readers share it, and none of them may disagree:
  *
@@ -48,19 +48,33 @@ export const FORBIDDEN_PACKAGES = [
  */
 export const SDK_DEPENDENCY_PACKAGES = ["ox", "@polymarket/bindings", "@polymarket/types"] as const;
 
+/**
+ * `CONTROL-2` (closing `CTRL1B-R5-L3`): the SIGNING CLOSURE the venue SDK's
+ * `ox` signs with — its elliptic curves, its hashes, and its HD-key and
+ * mnemonic derivation. `CONTROL-1b`'s round-5 verifiers loaded the first of
+ * these through a computed path in the guarded project and signed with it: the
+ * shipped bundle's exact third-party list kept it out of what ships, but the
+ * run-time guard and the scan did not know the name. Matched EXACTLY, like
+ * {@link SDK_DEPENDENCY_PACKAGES}: the name, or the name and a subpath.
+ */
+export const SDK_SIGNING_PACKAGES = ["@noble/curves", "@noble/hashes", "@scure/bip32", "@scure/bip39"] as const;
+
 /** The secure adapter's directory name, a forbidden PATH segment too. */
 export const SECURE_DIRECTORY = "polymarket-secure";
 
+/** The names matched EXACTLY — alone or with a subpath, never as a prefix of another name. */
+const EXACT_PACKAGES: readonly string[] = [...SDK_DEPENDENCY_PACKAGES, ...SDK_SIGNING_PACKAGES];
+
 /**
  * A forbidden package NAME: one of {@link FORBIDDEN_PACKAGES} by prefix, so
- * `viem/accounts` counts; one of {@link SDK_DEPENDENCY_PACKAGES} exactly, or
- * with a subpath.
+ * `viem/accounts` counts; one of {@link SDK_DEPENDENCY_PACKAGES} or
+ * {@link SDK_SIGNING_PACKAGES} exactly, or with a subpath.
  */
 export function isForbiddenName(specifier: string): boolean {
   const lower = specifier.toLowerCase();
   return (
     FORBIDDEN_PACKAGES.some((name) => lower.startsWith(name)) ||
-    SDK_DEPENDENCY_PACKAGES.some((name) => lower === name || lower.startsWith(`${name}/`))
+    EXACT_PACKAGES.some((name) => lower === name || lower.startsWith(`${name}/`))
   );
 }
 
@@ -74,7 +88,7 @@ export function namesForbiddenSegments(path: readonly string[]): boolean {
   return segments.some((segment, index) => {
     if (segment === SECURE_DIRECTORY) return true;
     const pair = `${segment}/${segments[index + 1] ?? ""}`;
-    return [...FORBIDDEN_PACKAGES, ...SDK_DEPENDENCY_PACKAGES].some((name) => name === segment || name === pair);
+    return [...FORBIDDEN_PACKAGES, ...EXACT_PACKAGES].some((name) => name === segment || name === pair);
   });
 }
 

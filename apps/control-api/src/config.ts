@@ -36,6 +36,7 @@ import { z } from "zod";
 import { auditBudgetProblem } from "./audit-budget.js";
 import { buildDoor, ownNumber, ownString, type DoorResult } from "./doors.js";
 import { OPERATOR_GRANTS, type OperatorGrant } from "./auth.js";
+import { TRADER_HALT_READ_TIMEOUT_MAX_MS } from "./adapters/postgres-trader-halts.js";
 
 /**
  * The only hosts this process will bind.
@@ -90,6 +91,27 @@ const ControlApiConfigSchema = z.strictObject({
       timeoutMs: z.number().int().positive().max(60_000),
     }),
   ]),
+  /**
+   * `CONTROL-2` r1: where the open trader halts come from (`trader-halts.ts`).
+   *
+   * `"none"` reads nothing, and the state is `NOT_CONFIGURED` — said on
+   * `/v1/health` and `/v1/metrics`, never "no halts". `"postgres"` reads the
+   * open `TRADER_HALT:*` rows of `ops.incidents` on every authorized health
+   * and metrics read, each read bounded by `timeoutMs` — at most
+   * `TRADER_HALT_READ_TIMEOUT_MAX_MS` (5000), below the API's answer deadline
+   * and the scrape timeout (`CTL2-F1`). The database URL is
+   * NOT a field here: it carries a credential, so it comes from the
+   * environment variable `main.ts` names (`TRADER_HALTS_DATABASE_URL_ENV`),
+   * read once at startup and never logged. REQUIRED, like `traderHealth`, so
+   * a deployment cannot omit the choice by accident.
+   */
+  traderHalts: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("none") }),
+    z.strictObject({
+      kind: z.literal("postgres"),
+      timeoutMs: z.number().int().min(1).max(TRADER_HALT_READ_TIMEOUT_MAX_MS),
+    }),
+  ]),
   operators: z.array(OperatorSchema).min(1),
 });
 
@@ -108,6 +130,14 @@ const ControlApiConfigDoor = buildDoor(
             timeoutMs: ownNumber(traderHealthNode, "timeoutMs") ?? 0,
           })
         : Object.assign(Object.create(null) as object, { kind: "none" as const });
+    const traderHaltsNode = (materialized as { traderHalts: unknown }).traderHalts;
+    const traderHalts: ControlApiConfig["traderHalts"] =
+      ownString(traderHaltsNode, "kind") === "postgres"
+        ? Object.assign(Object.create(null) as object, {
+            kind: "postgres" as const,
+            timeoutMs: ownNumber(traderHaltsNode, "timeoutMs") ?? 0,
+          })
+        : Object.assign(Object.create(null) as object, { kind: "none" as const });
 
     return Object.assign(Object.create(null) as object, {
       bindHost: ownString(materialized, "bindHost") ?? "",
@@ -116,6 +146,7 @@ const ControlApiConfigDoor = buildDoor(
       auditCapacity: ownNumber(materialized, "auditCapacity") ?? -1,
       auditSafetyReserve: ownNumber(materialized, "auditSafetyReserve") ?? -1,
       traderHealth,
+      traderHalts,
       operators: operatorsNode.operators.map((entry) =>
         Object.assign(Object.create(null) as object, {
           operatorId: ownString(entry, "operatorId") ?? "",
@@ -152,6 +183,8 @@ export interface ControlApiConfig {
   readonly traderHealth:
     | { readonly kind: "none" }
     | { readonly kind: "http"; readonly url: string; readonly timeoutMs: number };
+  /** `CONTROL-2` r1: the open trader halt source (`trader-halts.ts`); its database URL is the environment's. */
+  readonly traderHalts: { readonly kind: "none" } | { readonly kind: "postgres"; readonly timeoutMs: number };
   readonly operators: readonly ControlApiOperatorConfig[];
 }
 

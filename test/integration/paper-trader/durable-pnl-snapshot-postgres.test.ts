@@ -80,13 +80,13 @@ import {
   createIsolatedDatabase,
   createMigratedContext,
   createTradingChain,
-  startPostgresContainer,
   type TestContext,
 } from "@polymarket-bot/storage-postgres/testing";
 import { computePnlSnapshot, foldPnlRecords, type PnlSnapshot } from "@polymarket-bot/pnl";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { PostgresTraderStore } from "../../../apps/trader/src/adapters/postgres-store.js";
+import { startReadyPostgresContainer } from "./support/containers.js";
 
 /** Every column of `accounting.pnl_snapshots`, from `0006_accounting.up.sql`. */
 const EVERY_COLUMN = [
@@ -122,13 +122,13 @@ const TOKEN_ASSET = "token-x";
 const DENOMINATION = "pUSD";
 const ACCOUNT = "test-account";
 
-let container: Awaited<ReturnType<typeof startPostgresContainer>>;
+let container: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 let context: TestContext;
 let chain: Awaited<ReturnType<typeof createTradingChain>>;
 let store: PostgresTraderStore;
 
 beforeAll(async () => {
-  container = await startPostgresContainer();
+  container = await startReadyPostgresContainer();
   const { connectionString } = await createIsolatedDatabase(
     container.getConnectionUri(),
     "trader-pnl-snapshot",

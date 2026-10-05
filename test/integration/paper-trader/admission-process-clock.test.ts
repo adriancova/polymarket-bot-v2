@@ -275,7 +275,8 @@ function holdingGroupCommit(inner: MemoryTraderStore): {
     release,
     store: {
       persistDecision: (record, telemetry) => inner.persistDecision(record, telemetry),
-      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      persistDecisionWithCheckpoint: (record, telemetry, checkpoint, capturedAt) =>
+        inner.persistDecisionWithCheckpoint(record, telemetry, checkpoint, capturedAt),
       appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
       writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
       replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),

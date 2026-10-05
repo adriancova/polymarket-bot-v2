@@ -16,6 +16,12 @@
  * Restore determinism: a run interrupted at the midpoint checkpoint and
  * restored into a fresh runtime must produce the identical remaining records
  * (§9.6 "Restore compatible state on restart").
+ *
+ * `CKPT-1` (ADR-027 §5) re-pins the restore case: the restore takes a restore
+ * POINT (D2), and the restored run's checkpoints — not only its last state
+ * bytes — must be byte-identical to the uninterrupted run's after the restore
+ * point (D4.2). The fuller ADR-027 restore matrix is
+ * `checkpoint-on-change.test.ts`.
  */
 
 import { describe, expect, it } from "vitest";
@@ -34,6 +40,7 @@ import {
   ManualClock,
   RecordingSink,
   RecordingStore,
+  restorePoint,
 } from "./helpers.js";
 
 /** Decisions and state depend on the seeded RNG and accumulate across events. */
@@ -172,9 +179,13 @@ describe("acceptance 3: same event/config/seed yields identical state and decisi
       decisionSink: sinkB,
       checkpointStore: storeB,
     });
+    // `CKPT-1`: the mid checkpoint follows decision 2, the last durable one
+    // (the interruption is after three evaluations), so the restore point's
+    // highest durable sequence is the checkpoint's own.
+    expect(midCheckpoint.checkpointSeq).toBe(2);
     const createdB = createStrategyInstanceRuntime({
       ...secondHalf.definition,
-      restoreFrom: midCheckpoint,
+      restoreFrom: restorePoint(midCheckpoint, 2),
     });
     expect(createdB.ok).toBe(true);
     if (!createdB.ok) {
@@ -192,6 +203,15 @@ describe("acceptance 3: same event/config/seed yields identical state and decisi
     expect(tailFromRestore).toBe(tailUninterrupted);
     expect(storeB.checkpoints.at(-1)?.stateJson).toBe(
       uninterrupted.store.checkpoints.at(-1)?.stateJson,
+    );
+    // `CKPT-1` (D4.2): every checkpoint the restored runtime wrote is the
+    // uninterrupted run's checkpoint at the same sequence, byte for byte, and
+    // it wrote exactly those (the tail's `onTimer` hold owed none).
+    expect(storeB.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toEqual([4, 5]);
+    expect(canonicalJsonStringify(storeB.checkpoints)).toBe(
+      canonicalJsonStringify(
+        uninterrupted.store.checkpoints.filter((checkpoint) => checkpoint.checkpointSeq > 2),
+      ),
     );
   });
 

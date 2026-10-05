@@ -21,10 +21,17 @@
  *   process's own `SystemPaperClock`, read LIVE on every call — re-based so
  *   that the instant it is created reads as a recorded instant the caller
  *   names (the scenario's first event). From there it advances in real time,
- *   as the process's clock does: the lag the guard measures is the trader's
- *   REAL processing delay over the recorded stream (milliseconds to seconds
- *   here), never zero by construction. Its monotonic reading is the host's,
- *   unchanged.
+ *   as the process's clock does. The offset is FIXED, so the lag the guard
+ *   measures at an event is `max(0, W − E)`: W is the wall time elapsed since
+ *   the clock was re-based, and E is the event's recorded offset from the
+ *   anchor. That is how far the run's real progress has fallen behind the
+ *   recorded pace since the re-basing, setup and publication time included.
+ *   It is NOT the trader's processing delay of that event. An event recorded
+ *   later than the anchor plus W reads lag 0: the clock is behind it
+ *   (ADR-031 T7). So a scenario whose recorded events are minutes apart
+ *   (`durable-two-brackets-postgres-redis.test.ts`, for example) is judged at
+ *   lag 0 once its recorded time runs ahead of the wall time. Its monotonic
+ *   reading is the host's, unchanged.
  * - {@link rebaseSystemPaperClock}: the same reading for a file that runs
  *   `startup()`, which builds its own `SystemPaperClock` and takes no clock
  *   port. It re-bases `SystemPaperClock.prototype.now` — and nothing else: not

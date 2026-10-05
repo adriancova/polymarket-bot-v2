@@ -28,14 +28,31 @@
  *    halt row and the instance's dispatch frontier back from what the real
  *    trader wrote.
  *
+ * ## The process clock (`CO2-N1`, ADR-031; `TC-LOWS-1`, `CO2N1-R1-J2`)
+ *
+ * `startup()` builds its own `SystemPaperClock`, and ADR-031's entry guard
+ * reads it at admission. Against the fixture's `2026-03-04` events the host
+ * clock as-is is months late, so every entry here was ALSO refused
+ * `RISK_FEATURES_STALE` and `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` — which is not
+ * what this file tests (ADR-031 §1.8), and which made scenario 4's
+ * `submissionsAccepted === 0` hold for a reason other than its risk limit.
+ * While recorded events are published and settled ({@link publishAndSettle}),
+ * every `SystemPaperClock` now reads the host clock RE-BASED to the first
+ * event published (`support/host-clock.ts`, `rebaseSystemPaperClock`: the
+ * prototype's `now()` only — not the global `Date`, so the database, the
+ * transport and every bound measured here keep real time), as
+ * `redis-outage-halts-postgres-redis.test.ts` does. The re-basing is restored
+ * once the process is quiescent, before any fault. Scenario 4 now pins that
+ * its entry is refused for its risk limit ALONE.
+ *
  * Docker: Testcontainers, no skip. PAPER only; no venue, no signer, no real
  * order; throwaway credentials that live only for the run.
  */
 
 import { RedisStreamsEventTransport, EventBusUnavailableError } from "@polymarket-bot/event-bus";
-import { startFreezableRedisProxy, startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
+import { startFreezableRedisProxy, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { postgresTraderEvidence, type MarketWindow } from "@polymarket-bot/research-worker";
-import { startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
+import type { TestContext } from "@polymarket-bot/storage-postgres/testing";
 import type { IngestedEvent, LoopHealthSnapshot } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -50,6 +67,7 @@ import {
   riskPolicy,
   safeEnvironment,
 } from "./support/fixture.js";
+import { rebaseSystemPaperClock } from "./support/host-clock.js";
 import {
   CONDITION_ID,
   documentFor,
@@ -57,19 +75,20 @@ import {
   withFreshDatabase,
   type Registered,
 } from "./support/registration.js";
+import { startReadyPostgresContainer, startReadyRedisContainer } from "./support/containers.js";
 
-let postgres: Awaited<ReturnType<typeof startPostgresContainer>>;
+let postgres: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 /**
  * ONE Redis for the file: no scenario stops it (an outage is a partition, the
  * freezable hop), and each has its own stream — so the suite starts as few
  * containers as it can (`TC-LOCAL-FLAKE`: Docker Desktop's port forwarding has
  * refused connections when many start at once).
  */
-let redis: Awaited<ReturnType<typeof startRedisContainer>>;
+let redis: Awaited<ReturnType<typeof startReadyRedisContainer>>;
 
 beforeAll(async () => {
-  postgres = await startPostgresContainer();
-  redis = await startRedisContainer();
+  postgres = await startReadyPostgresContainer();
+  redis = await startReadyRedisContainer();
 }, 300_000);
 
 afterAll(async () => {
@@ -175,7 +194,16 @@ function environment(redisUrl: string, databaseUrl: string, label: string): Reco
   };
 }
 
-/** Publishes and waits until the process's pump committed past every event (quiescent: every write landed). */
+/**
+ * Publishes and waits until the process's pump committed past every event
+ * (quiescent: every write landed).
+ *
+ * `TC-LOWS-1` (`CO2N1-R1-J2`): meanwhile every `SystemPaperClock` reads the
+ * host clock re-based to the first event published, so ADR-031's guard judges
+ * the recorded entries at the run's real lag behind the recorded pace (see
+ * the module header). Restored before this returns: every fault a scenario
+ * injects afterwards meets the unmodified clock.
+ */
 async function publishAndSettle(
   publisher: RedisStreamsEventTransport,
   stream: string,
@@ -183,12 +211,19 @@ async function publishAndSettle(
   events: readonly IngestedEvent[],
   total: number,
 ): Promise<void> {
-  for (const event of events) await publisher.publish(stream, event.envelope);
-  await waitFor(`the pump to commit past all ${String(total)} events`, 60_000, async () => {
-    const metrics = await publisher.streamMetrics(stream);
-    const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
-    return metrics.publishedTotal === total && lag === 0 ? metrics : undefined;
-  });
+  const anchor = events[0]?.envelope.receivedAt;
+  if (anchor === undefined) throw new Error("publishAndSettle needs at least one event");
+  const rebased = rebaseSystemPaperClock(anchor);
+  try {
+    for (const event of events) await publisher.publish(stream, event.envelope);
+    await waitFor(`the pump to commit past all ${String(total)} events`, 60_000, async () => {
+      const metrics = await publisher.streamMetrics(stream);
+      const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
+      return metrics.publishedTotal === total && lag === 0 ? metrics : undefined;
+    });
+  } finally {
+    rebased.restore();
+  }
 }
 
 async function incidents(context: TestContext) {
@@ -341,7 +376,7 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
   }, 240_000);
 
   it("STORE_UNAVAILABLE with the database DOWN: the record cannot land; the process says so and exits 75 within the stated bound — fail closed, not weakened", async () => {
-    const own = await startPostgresContainer();
+    const own = await startReadyPostgresContainer();
     let ownStopped = false;
     try {
       await withFreshDatabase(own.getConnectionUri(), "prov-store-down", async ({ connectionString, context }) => {
@@ -507,6 +542,12 @@ describe("refusals and halts, read back as a window's evidence by the research w
             expect([measures["gatewayEpoch"], measures["ingestSeq"]]).toEqual([decision?.gateway_epoch, decision?.ingest_seq]);
           }
           expect(refusals.map((row) => row.reason_code)).toContain("RISK_WORST_CASE_LOSS_EXCEEDED");
+          // `TC-LOWS-1` (`CO2N1-R1-J2`): judged at the re-based clock, the entry
+          // is refused for its risk limit ALONE — not also `RISK_FEATURES_STALE`
+          // and `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED`, as the months-late host clock
+          // refused it — so `submissionsAccepted === 0` above is that limit's.
+          expect(refusals.map((row) => row.reason_code)).toEqual(["RISK_WORST_CASE_LOSS_EXCEEDED"]);
+          expect(health.risk.refusalsByCode).toEqual({ RISK_WORST_CASE_LOSS_EXCEEDED: 1 });
 
           // --- the research worker's own read-only adapter -----------------------
           const window: MarketWindow = {

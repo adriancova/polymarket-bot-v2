@@ -38,10 +38,18 @@ import {
   baseConfig,
   evaluationInput,
   fillPayload,
+  foldedStateBytes,
   order,
   protectedReductions,
+  stateChangingSeqs,
   type ViewOptions,
 } from "./helpers.js";
+
+/**
+ * `CKPT-1`: each harness's sink, by its store, so {@link currentState} can
+ * check the checkpoint it reads against the record log (ADR-027 §5).
+ */
+const SINK_OF = new WeakMap<RecordingStore, RecordingSink>();
 
 interface Harness {
   readonly runtime: StrategyInstanceRuntime;
@@ -66,6 +74,7 @@ function harness(config: Record<string, unknown> = baseConfig()): Harness {
   if (!created.ok) {
     throw new Error(`the runtime refused the strategy: ${created.refusal.code} ${created.refusal.detail}`);
   }
+  SINK_OF.set(store, sink);
   return { runtime: created.runtime, sink, store, clock };
 }
 
@@ -91,11 +100,24 @@ function step(
   return decided(runtime.evaluate(evaluationInput(callback, options, payload)));
 }
 
-/** The state document the runtime is holding, read out of its last checkpoint. */
+/**
+ * The state document the runtime is holding, read out of its last checkpoint.
+ *
+ * `CKPT-1` (ADR-027 §5 asks this helper be checked): a checkpoint now follows
+ * only a decision that changed the state (or status, or RNG), so the LAST one
+ * still holds the current state (D2.1) — and this asserts it, against the fold
+ * of every persisted `statePatch`, on every read.
+ */
 function currentState(store: RecordingStore): Record<string, unknown> {
   const last = store.checkpoints[store.checkpoints.length - 1];
   expect(last, "the runtime must have checkpointed").toBeDefined();
-  return JSON.parse((last as { stateJson: string }).stateJson) as Record<string, unknown>;
+  const bytes = (last as { stateJson: string }).stateJson;
+  const sink = SINK_OF.get(store);
+  expect(sink, "currentState reads a store that harness() built").toBeDefined();
+  if (sink !== undefined) {
+    expect(bytes, "the last checkpoint is the current state (ADR-027 D2.1)").toBe(foldedStateBytes(sink));
+  }
+  return JSON.parse(bytes) as Record<string, unknown>;
 }
 
 describe("through the real runtime — the happy path to CLOSED", () => {
@@ -138,10 +160,15 @@ describe("through the real runtime — the happy path to CLOSED", () => {
     expect(closed["instanceState"]).toBe("CLOSED");
     expect(closed["exitedShares"]).toBe("50");
 
-    // §6 invariant 3: exactly one persisted decision per evaluation, and a
-    // checkpoint for each.
+    // §6 invariant 3: exactly one persisted decision per evaluation. `CKPT-1`
+    // re-pin (ADR-027 §5): "and a checkpoint for each" still holds here, but
+    // now for a stated reason — each of the six decisions moved the
+    // instance's state (ARMED, ENTRY_PLANNED, ENTRY_WORKING, EXIT_PLANNED,
+    // EXIT_WORKING, CLOSED), the STATE transition; the first is also START.
     expect(sink.calls).toHaveLength(6);
     expect(store.checkpoints).toHaveLength(6);
+    expect(stateChangingSeqs(sink)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toEqual([0, 1, 2, 3, 4, 5]);
     for (const call of sink.calls) {
       expect(call.record.attribution).toBe("STRATEGY");
       expect(call.record.decision.featureSnapshotRef).toBe("snapshot-1");
@@ -541,7 +568,16 @@ describe("through the real runtime — the stale-data path", () => {
     // Every evaluation produced exactly one STRATEGY-attributed record: no
     // callback threw, so the runtime never had to contain one.
     expect(sink.calls.every((call) => call.record.attribution === "STRATEGY")).toBe(true);
-    expect(sink.calls).toHaveLength(store.checkpoints.length);
+    // `CKPT-1` re-pin (ADR-027 §5): this was "as many decision records as
+    // checkpoints". The second stale `onFeatures` hold repeats the PAUSED
+    // state and changes neither state, status nor RNG, so under ADR-027
+    // Decision 1 it writes no checkpoint. Every decision that changed the
+    // state has one, carrying its own sequence, and no other decision does.
+    expect(stillPaused.kind === "DECIDED" && stillPaused.checkpoint).toBeNull();
+    expect(stillPaused.kind === "DECIDED" && stillPaused.checkpointTransitions).toEqual([]);
+    expect(store.checkpoints.length).toBeLessThan(sink.calls.length);
+    expect(store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq)).toEqual(stateChangingSeqs(sink));
+    expect(store.checkpoints.at(-1)?.stateJson).toBe(foldedStateBytes(sink));
   });
 });
 

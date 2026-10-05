@@ -52,7 +52,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import { deriveBoundarySurface, type Derivation, type CallableShape } from "./boundary-derivation.js";
 import {
@@ -76,8 +76,10 @@ import {
   isRngState,
   materializeCheckpointableJson,
   prepareEvaluationView,
+  checkpointTransitions,
   rebuildStateFromPatches,
   restoreCheckpoint,
+  restoreFromPoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   StrategyContextRevokedError,
   validateEvaluationInput,
@@ -158,6 +160,15 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     shape: "function",
     totality: "TOTAL",
     note: "both arguments snapshotted; every failure is a typed CheckpointRefusal",
+  },
+  restoreFromPoint: {
+    params: ["point", "identity"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "TOTAL",
+    note:
+      "CKPT-1 (ADR-027 D2): the restore point's three fields read once; the checkpoint through " +
+      "restoreCheckpoint; every failure is a typed CheckpointRefusal",
   },
   validateEvaluationInput: {
     params: ["input"],
@@ -374,6 +385,15 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
       "round 5: the facade a strategy actually calls. Same deliberate RangeError as the " +
       "generator beneath it, contained by the runtime as one CALLBACK_THREW record",
   },
+  checkpointTransitions: {
+    params: ["last", "next"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "PARTIAL",
+    note:
+      "CKPT-1 (ADR-027 D1): a pure rule over the runtime's OWN mark and candidate values; the " +
+      "runtime computes both itself, so no caller data reaches it on any runtime path",
+  },
 
   // --- package-internal: reachable only through the entry points above -----
   buildStrategyContext: {
@@ -445,6 +465,20 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     totality: "TOTAL",
     note: "round 4, HIGH 2: the params grammar; same path normalization",
   },
+  elapsedAtLeast: {
+    params: ["earlier", "later"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "TOTAL",
+    note: "CKPT-1: exact heartbeat arithmetic; an unreadable instant answers undefined, never a throw",
+  },
+  parseExactInstant: {
+    params: ["value"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "TOTAL",
+    note: "CKPT-1: a typeof guard, then one regex and integer arithmetic; never a Date, never a throw",
+  },
   readOwnFieldsOnce: {
     params: ["owner", "label", "fields"],
     visibility: "PACKAGE",
@@ -474,6 +508,7 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
       "rng",
       "initialEvaluationSeq",
       "initialStatus",
+      "initialMark",
     ],
     visibility: "PACKAGE",
     shape: "constructor",
@@ -626,6 +661,11 @@ const PUBLIC_TOTAL_CALLS: Readonly<Record<string, (args: readonly unknown[]) => 
       args[0] as Parameters<typeof restoreCheckpoint>[0],
       args[1] as Parameters<typeof restoreCheckpoint>[1],
     ),
+  restoreFromPoint: (args) =>
+    restoreFromPoint(
+      args[0] as Parameters<typeof restoreFromPoint>[0],
+      args[1] as Parameters<typeof restoreFromPoint>[1],
+    ),
   validateEvaluationInput: (args) => validateEvaluationInput(args[0]),
   "StrategyContextRevokedError.constructor": (args) =>
     new StrategyContextRevokedError(args[0] as never),
@@ -702,6 +742,13 @@ const MULTI_PARAMETER_BASELINES: Readonly<Record<string, () => readonly unknown[
   // checkpoint in position 0 is what makes a hostile `identity` in position 1
   // reachable at all.
   restoreCheckpoint: () => [validCheckpoint(), validIdentity()],
+  // `CKPT-1`: a VALID restore point in position 0 is what makes a hostile
+  // `identity` reachable (the identity is read only once the point's
+  // checkpoint is being validated).
+  restoreFromPoint: () => [
+    { checkpoint: validCheckpoint(), highestEvaluationSeq: 6, checkpointEvaluatedAt: "2026-01-02T03:04:05.000Z" },
+    validIdentity(),
+  ],
 };
 
 /**
@@ -872,9 +919,33 @@ const PUBLIC_PARTIAL_WITNESSES: Readonly<Record<string, PartialWitness>> = {
     breaks: () => withLiveContext((ctx) => ctx.rng().nextIntBelow(0)),
     throws: RangeError,
   },
+  checkpointTransitions: {
+    precondition: "the runtime's own inert mark and candidate values",
+    breaks: () => checkpointTransitions(undefined, undefined as never),
+    throws: TypeError,
+  },
 };
 
+/**
+ * `FLAKES-1`: the program is built here, once, under an explicit budget,
+ * rather than inside whichever test first calls {@link surface}.
+ *
+ * The build is deterministic and bounded: one `ts.Program` and its pre-emit
+ * diagnostics over the two packages' own source files. Measured: about 1.1 s
+ * alone on an idle host, and about 2.5 s inside the full `pnpm test`
+ * (`GOV-NOTES-1`'s gate logs). At host load 11-30 the first test, which
+ * built it, ran 5.6-5.9 s and timed out at vitest's default 5,000 ms. 60 s
+ * tolerates about a 50-fold slowdown of the idle cost; the round's handoff
+ * records the load it was measured under. The derivation, and every
+ * assertion on it, is unchanged.
+ */
+const PROGRAM_BUILD_BUDGET_MS = 60_000;
+
 describe("the boundary surface is resolved from the module graph, not scanned", () => {
+  beforeAll(() => {
+    surface();
+  }, PROGRAM_BUILD_BUDGET_MS);
+
   it("every callable the type checker resolves is classified — and vice versa", () => {
     const derivation = surface();
     // Non-empty, both packages parsed, and no id derived twice.

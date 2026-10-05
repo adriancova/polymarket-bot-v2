@@ -60,7 +60,6 @@
 import { request as httpRequest } from "node:http";
 
 import { addDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
-import { startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import {
   healthResponseBody,
   parseTraderConfig,
@@ -89,11 +88,12 @@ import {
   registerThroughTheRepositories,
   withFreshDatabase,
 } from "./support/registration.js";
+import { startReadyPostgresContainer } from "./support/containers.js";
 
-let container: Awaited<ReturnType<typeof startPostgresContainer>>;
+let container: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 
 beforeAll(async () => {
-  container = await startPostgresContainer();
+  container = await startReadyPostgresContainer();
 }, 300_000);
 
 afterAll(async () => {

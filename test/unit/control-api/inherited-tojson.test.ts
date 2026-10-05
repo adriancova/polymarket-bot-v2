@@ -62,7 +62,10 @@ import {
   createHarness,
   FAKE_OPERATOR_TOKEN,
   healthDocument,
+  traderHaltFetch,
+  traderHaltRow,
 } from "../../../apps/control-api/src/testing/index.js";
+import { InMemoryTraderHaltSource } from "../../../apps/control-api/src/trader-halts.js";
 import { renderDivergences, sweepInheritedToJson, TOJSON_CONTEXTS } from "../ledger/inherited-tojson.js";
 import type { ToJsonContext } from "../ledger/inherited-tojson.js";
 
@@ -169,6 +172,28 @@ async function apiBodies(): Promise<string> {
   return responses.map((response) => `${String(response.status)}${response.body}`).join("");
 }
 
+/**
+ * `CONTROL-2`: the health answer and the metrics with OPEN trader halts read
+ * on the request — the door, the classification and the `traderHalts` section
+ * all run inside the window. The source answers on a microtask
+ * (`InMemoryTraderHaltSource.fetch` → `Promise.resolve`).
+ */
+async function haltBodies(): Promise<string> {
+  const { api } = createHarness({
+    traderHaltSource: new InMemoryTraderHaltSource(
+      traderHaltFetch([
+        traderHaltRow(),
+        traderHaltRow({ incident_id: "01930000-0000-7000-8000-00000000a002", incident_key: "TRADER_HALT:NEW", market_id: null }),
+      ]),
+    ),
+  });
+  const responses = [
+    await api.handle(request({ path: "/v1/health" })),
+    await api.handle(request({ path: "/v1/metrics" })),
+  ];
+  return responses.map((response) => `${String(response.status)}\u0001${response.body}`).join("\u0002");
+}
+
 /** A fake Kysely handle that captures every row `insertInto(...).values(row).execute()` would write. */
 function capturingDb(): { readonly db: PolymarketBotDatabase; readonly rows: { table: string; row: Record<string, unknown> }[] } {
   const rows: { table: string; row: Record<string, unknown> }[] = [];
@@ -259,6 +284,19 @@ describe("control-api response bodies under an inherited toJSON (SER-3)", () => 
     expect(runState.runModeIsWritable).toBe(false);
     const health = JSON.parse(responses[3]?.[1] ?? "") as { available: boolean };
     expect(health.available).toBe(true);
+  });
+
+  it("CONTROL-2: the health answer's open trader halts and the halt metrics are the clean-process bodies", async () => {
+    const clean = await pinAsync(haltBodies);
+    expect(clean.startsWith("ok:")).toBe(true);
+    const [health, metrics] = clean.slice(3).split("\u0002").map((entry) => entry.split("\u0001"));
+    expect(health?.[0]).toBe("200");
+    expect(health?.[1]).toBe(`${JSON.stringify(JSON.parse(health?.[1] ?? ""), null, 2)}\n`);
+    const halts = (JSON.parse(health?.[1] ?? "") as { traderHalts: { state: string; openTotal: number; listed: unknown[] } }).traderHalts;
+    expect(halts.state).toBe("OPEN");
+    expect(halts.openTotal).toBe(2);
+    expect(halts.listed).toHaveLength(2);
+    expect(metrics?.[1]).toContain('control_trader_halts_open{scope="UNRECOGNIZED"} 1');
   });
 
   it("the transport-level 413 and 400 refusal bodies are the clean-process bodies (http.ts, uniformity)", () => {

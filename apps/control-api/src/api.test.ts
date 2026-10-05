@@ -21,6 +21,7 @@ import {
 import { OperatorRegistry } from "./auth.js";
 import { ControlPlane, REFUSAL_AUDIT_MAX_ISSUES, REFUSAL_AUDIT_MAX_TEXT } from "./control-plane.js";
 import { InMemoryTraderHealthSource, TraderHealthCache } from "./health-source.js";
+import { AbsentTraderHaltSource, TraderHaltCache } from "./trader-halts.js";
 import {
   FAKE_OPERATOR_TOKEN,
   FAKE_READER_TOKEN,
@@ -736,6 +737,7 @@ describe("CONTROL-1b (follow-up 3b): a mode-raise attempt's audit record is boun
       environment,
       auditCapacity: 8,
       auditSize: () => 0,
+      traderHalts: new TraderHaltCache(new AbsentTraderHaltSource()),
     });
     const response = await api.handle(request({ method: "POST", path: "/v1/kill-switch", body: { runMode: "LIVE", reason: "x" } }));
     expect(response.status).toBe(403);

@@ -1,9 +1,11 @@
-# Trader alert rules (CADENCE-1).
+# Trader alert rules (CADENCE-1; CONTROL-2).
 #
 # Severities follow handoff §14.4: `page` and `notify`. Add this file to the
 # deployment's prometheus.yml `rule_files`, beside `control-api-scrape.yaml`'s
-# job: every series here is a `trader_*` family the control API renders on
-# `GET /v1/metrics` from the trader's health report.
+# job: every series here is a family the control API renders on
+# `GET /v1/metrics` — a `trader_*` family from the trader's health report, or
+# (CONTROL-2) `control_trader_halts_state`, from its own read of the open
+# TRADER_HALT rows in ops.incidents.
 #
 # Machine-checked: packages/observability/src/control/trader-alerts.test.ts
 # asserts every series referenced here is a declared PLATFORM metric family,
@@ -39,3 +41,20 @@ groups:
         annotations:
           summary: "A far-future event stamp is holding every onFeatures evaluation (ADR-026 D2.10)"
           description: "Applied events lie more than 5 s behind the trader's evaluation-cadence clock, which one event stamped far ahead moved. Until event time catches up, no market is evaluated, so no stop decided in onFeatures runs; fills, order updates and lifecycle callbacks still fire. Check the gateway's receipt clock; the trader's log carries the CADENCE CLOCK FORWARD JUMP line with both instants."
+
+  - name: trader-halts
+    rules:
+      # CONTROL-2 (H1R1-HALT-INVISIBLE): a halted trader exits 75, often before
+      # a scrape; its OPEN TRADER_HALT row in ops.incidents outlives it, and
+      # the control API reads it on every authorized scrape. Pages on an open
+      # halt AND on a read that failed (UNKNOWN is never "no halts").
+      # NOT_CONFIGURED does not page: it is a deployment that reads nothing,
+      # which the operations panel shows.
+      - alert: TraderHaltOpenOrUnknown
+        expr: max(control_trader_halts_state{state=~"OPEN|UNKNOWN"}) == 1
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "A trader halt is open in ops.incidents, or the control API cannot tell"
+          description: "control_trader_halts_state is OPEN (an unresolved TRADER_HALT row; control_trader_halts_open says which scope) or UNKNOWN (the control API's read of ops.incidents failed, timed out or was refused). Read GET /v1/health's traderHalts section for the rows or the reason. Only an operator resolves a halt row; the control API never does."

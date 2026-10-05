@@ -31,7 +31,20 @@ export interface DecisionSink {
 }
 
 export interface CheckpointStore {
-  /** Called exactly once after every successfully persisted decision. */
+  /**
+   * Called exactly once after a successfully persisted decision that owes a
+   * checkpoint (ADR-027 Decision 1; `CKPT-1`), synchronously, within the same
+   * `evaluate()` call and with the decision's own `evaluationSeq` as
+   * `checkpointSeq` — so an implementation can pair it with the record the
+   * sink was just handed. Not called for a decision that owes none. Until
+   * `CKPT-1`: "after every successfully persisted decision".
+   *
+   * DURABLE TOGETHER (ADR-027 D3, `CKPT-1`'s choice): an implementation that
+   * makes records durable must make this checkpoint durable in the SAME
+   * transaction as the decision it follows. A restore relies on it: it does
+   * not, and cannot, inspect the decisions after the last checkpoint (an RNG
+   * draw leaves no trace in a decision record).
+   */
   save(checkpoint: StrategyStateCheckpoint): void;
 }
 

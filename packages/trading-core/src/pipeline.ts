@@ -194,6 +194,18 @@ export interface PortfolioOpenOrderInput {
   readonly shares: string;
 }
 
+/**
+ * `CAP-1`: one market token's filled-but-unbooked BUY exposure, as the risk
+ * engine's SEPARATE `unbookedFills` input carries it (§9.8 checks 16 and 17
+ * only; `AllocatorGate.unbookedExposure`).
+ */
+export interface UnbookedFillInput {
+  readonly marketId: string;
+  readonly side: "YES" | "NO";
+  readonly shares: string;
+  readonly debit: string;
+}
+
 export interface RiskInputContext {
   readonly intent: Intent;
   readonly evaluatedAt: string;
@@ -237,6 +249,19 @@ export interface RiskInputContext {
   readonly referenceFeedAgeMs: number | undefined;
   readonly positions: readonly PortfolioPositionInput[];
   readonly openOrders: readonly PortfolioOpenOrderInput[];
+  /**
+   * `CAP-1` (orchestrator ruling, 2026-10-04): the strategy's
+   * filled-but-unbooked BUY exposure — a fill the venue made that no position
+   * carries yet. Since `CAP-1` r1 that includes the filled shares of a WORKING
+   * order, which `openOrders` presents at its unfilled remainder only, so the
+   * three views are disjoint. REQUIRED, so no
+   * caller can forget it, and always emitted (an empty list included): the
+   * risk engine reads an absent list as "none", which is the measure before
+   * `CAP-1`. It is NOT a position (no exit may sell it, §6 invariant 10) and
+   * NOT an open order (§9.8 check 18 never sees it); only checks 16 and 17
+   * count it.
+   */
+  readonly unbookedFills: readonly UnbookedFillInput[];
   /**
    * `packages/capital-allocator`'s §9.7 exposure snapshot, covering every scope
    * this evaluation will query (`allocation.ts`). Absent is a real absence and
@@ -327,6 +352,7 @@ export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
       positions: context.positions,
       openOrders: context.openOrders,
     },
+    unbookedFills: context.unbookedFills,
     ...(context.exposures === undefined ? {} : { exposures: context.exposures }),
     ...(context.allocation === undefined ? {} : { allocation: context.allocation }),
     scenarios: context.scenarios,
