@@ -157,3 +157,39 @@ export type {
 } from "./eligibility.js";
 
 export { instantMilliseconds, isAtOrAfter, isBefore, isSameInstant } from "./time.js";
+
+/**
+ * `ROLLOVER-1` (ADR-030): series auto-admission in PAPER — the reviewed
+ * series, the exact-match judge, the run-mode guard, the admitted window's
+ * derived identity, and its schedule from its title.
+ */
+export {
+  ADMISSION_RUN_MODES,
+  ReviewedSeriesSchema,
+  admissionRunModeProblem,
+  canonicalSeriesJson,
+  judgeSeriesWindow,
+  parseReviewedSeries,
+  seriesConfigHash,
+  windowInternalMarketId,
+} from "./series-admission.js";
+export type {
+  AdmittedWindowFacts,
+  ClobMarketInfoReading,
+  GammaWindowEventReading,
+  GammaWindowMarketReading,
+  ReviewedSeries,
+  ReviewedSeriesParse,
+  SeriesWindowVerdict,
+  VenueBooleanReading,
+  VenueDecimalReading,
+  VenueStringReading,
+} from "./series-admission.js";
+export {
+  SERIES_TITLE_TIME_ZONE,
+  SERIES_TITLE_ZONE_LABEL,
+  deriveWindowSchedule,
+  epochMsOfInstant,
+  isoFromEpochMs,
+} from "./series-window-schedule.js";
+export type { SeriesWindowShape, WindowScheduleResult } from "./series-window-schedule.js";

@@ -276,9 +276,17 @@ export interface AccountingHealth extends AccountingCounters {
   readonly realizedPnl: RealizedPnlHealth;
 }
 
-/** The shape {@link RealizedPnlBook.record} reads — `PnlSnapshot`'s two relevant fields. */
+/** The shape {@link RealizedPnlBook.record} reads — `PnlSnapshot`'s relevant fields. */
 export interface RealizedPnlObservation {
   readonly instanceId: string | null;
+  /**
+   * `ROLLOVER-1` r1 (R1-05): the market the snapshot's STREAM is scoped to
+   * (`PnlSnapshot.marketId`). A series-bound instance has one stream per
+   * window, each cumulative for its own window only, so the instance's
+   * realized PnL is the SUM of its streams' latest values. Absent or `null`:
+   * the instance's one unscoped stream, as before.
+   */
+  readonly marketId?: string | null;
   readonly realizedPnl: string;
 }
 
@@ -301,18 +309,28 @@ const NO_REALIZED_PNL: RealizedPnlHealth = Object.freeze({
  * that.
  */
 export class RealizedPnlBook {
-  readonly #byInstance = new Map<string, string>();
+  /**
+   * `instanceId -> (stream market -> the stream's latest realized PnL)`.
+   * `ROLLOVER-1` r1 (R1-05): keyed by STREAM, not by instance — it used to
+   * REPLACE by instance, so a series-bound instance's second window overwrote
+   * its first (window snapshots 5 and 7 read 7, not 12).
+   */
+  readonly #byInstance = new Map<string, Map<string, string>>();
   #observed = 0;
 
   /**
-   * Records one accepted snapshot. A snapshot with no instance id (a
-   * non-strategy stream) is not per-instance and is NOT recorded: the trader
-   * writes only `VIRTUAL_STRATEGY` streams today, and a future account-scope
-   * stream would need its own field rather than being folded into this one.
+   * Records one accepted snapshot: it REPLACES the latest value of its own
+   * stream (the instance and the market it is scoped to) and no other. A
+   * snapshot with no instance id (a non-strategy stream) is not per-instance
+   * and is NOT recorded: the trader writes only `VIRTUAL_STRATEGY` streams
+   * today, and a future account-scope stream would need its own field rather
+   * than being folded into this one.
    */
   record(snapshot: RealizedPnlObservation): void {
     if (snapshot.instanceId === null) return;
-    this.#byInstance.set(snapshot.instanceId, snapshot.realizedPnl);
+    const streams = this.#byInstance.get(snapshot.instanceId) ?? new Map<string, string>();
+    streams.set(snapshot.marketId ?? "", snapshot.realizedPnl);
+    this.#byInstance.set(snapshot.instanceId, streams);
     this.#observed += 1;
   }
 
@@ -327,7 +345,11 @@ export class RealizedPnlBook {
     const byInstance: Record<string, string> = Object.create(null) as Record<string, string>;
     let account = "0";
     for (const instanceId of [...this.#byInstance.keys()].sort()) {
-      const value = this.#byInstance.get(instanceId) ?? "0";
+      const streams = this.#byInstance.get(instanceId) ?? new Map<string, string>();
+      // One stream: its value verbatim, as before. Several (the windows of a
+      // series-bound instance): their exact sum, in a fixed order.
+      const values = [...streams.keys()].sort().map((market) => streams.get(market) ?? "0");
+      const value = values.length === 1 ? (values[0] ?? "0") : values.reduce((sum, next) => addDecimal(sum, next), "0");
       byInstance[instanceId] = value;
       account = addDecimal(account, value);
     }

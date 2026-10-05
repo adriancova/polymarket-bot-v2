@@ -403,6 +403,35 @@ export class LifecycleLedger {
     return write;
   }
 
+  /**
+   * `ROLLOVER-1`: removes one record and rewrites the file durably — ONLY for
+   * an admitted series window the admission feed has retired and whose
+   * retention has passed (`../admission-ledger.ts`): such a window is never
+   * polled or emitted for again, and a configured market's record is never
+   * removed (the module header's "carried, never deleted" rule stands for
+   * them). A failed write restores the record. Resolves to whether one was held.
+   */
+  remove(internalMarketId: string): Promise<boolean> {
+    const removal = this.#chain.then(async () => {
+      const previous = this.#records.get(internalMarketId);
+      if (previous === undefined) return false;
+      this.#records.delete(internalMarketId);
+      try {
+        await this.#fileSystem.writeWholeFile(this.#path, Buffer.from(this.encode(), "utf8"));
+      } catch (error) {
+        this.#records.set(internalMarketId, previous);
+        throw error;
+      }
+      this.#writes += 1;
+      return true;
+    });
+    this.#chain = removal.then(
+      () => undefined,
+      () => undefined,
+    );
+    return removal;
+  }
+
   /** The document as own-data JSON, keys in a stable order. */
   encode(): string {
     const markets: Record<string, unknown> = {};

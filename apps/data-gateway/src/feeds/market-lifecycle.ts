@@ -167,7 +167,8 @@
  * envelope), in lifecycle order — opened, scheduled closing, observed
  * closing — and NEVER past a confirmed later event: an OPEN is not re-emitted
  * for a market whose CLOSING is confirmed (the one regression the trader's
- * unguarded `markLifecycle` cannot absorb); a same-instant `MarketOpened`
+ * `markLifecycle` cannot absorb: it refuses only to leave a resolution,
+ * `ROLLOVER-1` r4); a same-instant `MarketOpened`
  * replay is idempotent for the universe fold. **The replay STOPS at the
  * first event that is not confirmed** (r2, MEDIUM-R1): an intent write that
  * failed, or a dispatch the publisher did not publish, ends the poll's
@@ -226,6 +227,22 @@
  * phase. A record whose `internalMarketId` the configuration no longer
  * names is carried, never deleted, and named in a NOTIFY incident
  * (`GATEWAY_LIFECYCLE_LEDGER_FOREIGN_RECORD`) at every start.
+ *
+ * ## Admitted series windows (`ROLLOVER-1`, ADR-030)
+ *
+ * A window the series-admission feed ADMITS (`./series-admission.ts`) is
+ * added to this feed at run time ({@link MarketLifecycleFeedDriver.addMarket})
+ * with its `gammaMarketId` — the `Market.id` of the documented keyset read,
+ * which is the `id` `GET /markets/{id}` takes (S-D34: the path parameter
+ * `pathId` is an integer, the `Market` schema's `id` the market's own id) —
+ * and its SCHEDULE as `openTime`/`closeTime`: the interval its title states
+ * (ruling Q3), exactly as a reviewed configuration states a configured
+ * market's. Every rule above applies to it unchanged. A torn-down window is
+ * removed ({@link MarketLifecycleFeedDriver.removeMarket}): it is polled no
+ * more, and its ledger record, once its retention has passed, is pruned by
+ * the admission feed rather than carried as a FOREIGN record — a record whose
+ * internal id is a derived window id (`isAdmittedWindowRecord`) is never
+ * reported foreign: its window was admitted, not configured.
  *
  * ## The ordering guarantee, relative to the market-data feed
  *
@@ -316,6 +333,12 @@ export interface MarketLifecycleDriverOptions {
   readonly clock: GatewayClock;
   readonly timers: GatewayTimers;
   readonly ledger: LifecycleLedger;
+  /**
+   * `ROLLOVER-1`: whether a ledger record belongs to an ADMITTED series window
+   * (its internal id is the window's derived id), so it is not reported as a
+   * foreign record when the configuration does not name it. Absent: none is.
+   */
+  readonly isAdmittedWindowRecord?: (record: LifecycleLedgerRecord) => boolean;
 }
 
 export interface MarketLifecycleDriverMetrics {
@@ -403,7 +426,7 @@ function stillPolled(phase: LifecyclePhase, record: LifecycleLedgerRecord | unde
 
 export class MarketLifecycleFeedDriver {
   readonly #options: MarketLifecycleDriverOptions;
-  readonly #markets: MarketState[];
+  #markets: MarketState[];
   readonly #connectionIds: ConnectionIdFactory;
   readonly #foreignRecords: readonly LifecycleLedgerRecord[];
   #cancelInterval: CancelScheduled | undefined;
@@ -471,7 +494,65 @@ export class MarketLifecycleFeedDriver {
     });
     this.#foreignRecords = options.ledger
       .records()
-      .filter((record) => !configured.has(record.internalMarketId));
+      .filter(
+        (record) =>
+          !configured.has(record.internalMarketId) && options.isAdmittedWindowRecord?.(record) !== true,
+      );
+  }
+
+  /**
+   * `ROLLOVER-1`: adds an ADMITTED window to the feed (module header). Its
+   * `gammaMarketId` and `openTime`/`closeTime` are required. The same identity
+   * check as at construction applies: a ledger record for this internal id
+   * under another condition/gamma id refuses the window (`GatewayConfigurationError`).
+   * Adding a window already polled is a no-op.
+   */
+  addMarket(config: MarketConfig): void {
+    if (this.#markets.some((market) => market.config.internalMarketId === config.internalMarketId)) return;
+    const gammaMarketId = config.gammaMarketId;
+    if (gammaMarketId === undefined || config.parameters.openTime === undefined || config.parameters.closeTime === undefined) {
+      throw new GatewayConfigurationError(
+        `the lifecycle feed cannot poll admitted window ${config.internalMarketId}: it needs its gammaMarketId and its scheduled open and close`,
+      );
+    }
+    const record = this.#options.ledger.get(config.internalMarketId);
+    if (record !== undefined && (record.conditionId !== config.conditionId || record.gammaMarketId !== gammaMarketId)) {
+      throw new GatewayConfigurationError(
+        "the lifecycle ledger holds a record for this admitted window's internalMarketId under a different conditionId/gammaMarketId pair",
+        {
+          internalMarketId: config.internalMarketId,
+          admitted: { conditionId: config.conditionId, gammaMarketId },
+          recorded: { conditionId: record.conditionId, gammaMarketId: record.gammaMarketId },
+        },
+      );
+    }
+    this.#markets = [
+      ...this.#markets,
+      {
+        config,
+        gammaMarketId,
+        phase: phaseFromLedger(record),
+        replayOwed: record !== undefined && owedReplays(record).length > 0,
+        unpublishedThisPoll: false,
+        reportedUnconfirmed: undefined,
+      },
+    ];
+  }
+
+  /**
+   * `ROLLOVER-1`: removes a torn-down window: it is polled no more. Its ledger
+   * record is kept (the admission feed prunes it after its retention).
+   * Answers whether it was polled.
+   */
+  removeMarket(internalMarketId: string): boolean {
+    const before = this.#markets.length;
+    this.#markets = this.#markets.filter((market) => market.config.internalMarketId !== internalMarketId);
+    return this.#markets.length !== before;
+  }
+
+  /** `ROLLOVER-1`: the lifecycle phase of one polled market, if it is polled. */
+  phaseOf(internalMarketId: string): LifecyclePhase | undefined {
+    return this.#markets.find((market) => market.config.internalMarketId === internalMarketId)?.phase;
   }
 
   /**
@@ -539,7 +620,9 @@ export class MarketLifecycleFeedDriver {
     // Sequential, never parallel: the fetcher precedent (`snapshot/fetcher.ts`)
     // and the same reason — a fan-out at a rate-limited surface is how a poll
     // becomes a throttled poll.
-    for (const market of this.#markets) {
+    // A snapshot of the list: an admitted window added or removed during the
+    // cycle (`ROLLOVER-1`) takes effect from the next cycle.
+    for (const market of [...this.#markets]) {
       if (this.#stopped) return;
       if (!market.replayOwed && !stillPolled(market.phase, this.#record(market))) continue;
       await this.#pollMarket(market);

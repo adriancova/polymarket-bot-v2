@@ -18,7 +18,8 @@ import { describe, expect, it } from "vitest";
 import { asksForHelp, parseRegisterArguments, REGISTRABLE_LIFECYCLE_STATES } from "./arguments.js";
 import { isProcessEntry, REGISTER_EXIT_CODES, runRegisterCommand, USAGE, writeExclusive } from "./main.js";
 import { mapStatement, REPOSITORY_SAVEPOINT } from "./one-transaction.js";
-import { canonicalParameters, readTemplate } from "./template.js";
+import { canonicalParameters, canonicalSeriesParameters, readSeriesTemplate, readTemplate } from "./template.js";
+import { reviewedSeriesDocument } from "@polymarket-bot/trading-core/testing";
 
 const SAFE_ENV = {
   MAX_RUN_MODE: "PAPER",
@@ -187,7 +188,8 @@ describe("the --help text says what the command does", () => {
     const documented = [...USAGE.matchAll(/--([a-z-]+)/gu)]
       .map((match) => match[1])
       .filter((flag) => flag !== "filter");
-    const taken = FLAGS.filter((token) => token.startsWith("--")).map((token) => token.slice(2));
+    // `ROLLOVER-1`: `--series` is the one boolean flag (FLAGS is the market mode's argv).
+    const taken = [...FLAGS.filter((token) => token.startsWith("--")).map((token) => token.slice(2)), "series"];
     for (const flag of taken) expect(documented, flag).toContain(flag);
     expect([...new Set(documented)].sort()).toEqual([...taken, "help"].sort());
   });
@@ -381,5 +383,127 @@ describe("the shipped example configuration is a usable template", () => {
     // And the example itself, which names identities, is refused as a template.
     const refused = readTemplate(JSON.stringify(example), SAFE_ENV, () => Date.UTC(2026, 8, 28));
     expect(refused.ok ? "accepted" : refused.refusal.code).toBe("REGISTER_TEMPLATE_HAS_IDENTITIES");
+  });
+});
+
+/**
+ * `ROLLOVER-1` (ADR-030; the user's ruling Q4): `register --series` registers
+ * ONE series-bound instance and its run, and NO market; its config's
+ * parameters are the document `{ strategy, series }` — the run record's pin of
+ * the reviewed series, which BOOT-1 compares at every start.
+ */
+describe("register --series (ROLLOVER-1, ruling Q4)", () => {
+  const SERIES_FLAGS = [
+    "--series",
+    "--template",
+    "t.json",
+    "--out",
+    "o.json",
+    "--instance-name",
+    "btc-15m-series",
+    "--code-commit",
+    "abc123",
+    "--created-by",
+    "unit",
+  ];
+
+  it("parses the series mode's five flags, and requires each", () => {
+    const parsed = parseRegisterArguments(SERIES_FLAGS);
+    expect(parsed.ok ? parsed.arguments : parsed.problems).toEqual({
+      series: true,
+      template: "t.json",
+      out: "o.json",
+      instanceName: "btc-15m-series",
+      codeCommit: "abc123",
+      createdBy: "unit",
+    });
+    const missing = parseRegisterArguments(["--series"]);
+    expect(missing.ok ? [] : missing.problems).toEqual([
+      "--template is required",
+      "--out is required",
+      "--instance-name is required",
+      "--code-commit is required",
+      "--created-by is required",
+    ]);
+  });
+
+  it("REFUSES a market flag with --series rather than ignoring it", () => {
+    const parsed = parseRegisterArguments([...SERIES_FLAGS, "--question-title", "Will BTC be up?", "--neg-risk", "false"]);
+    expect(parsed.ok ? [] : parsed.problems).toEqual([
+      "--question-title describes a market, and --series registers none",
+      "--neg-risk describes a market, and --series registers none",
+    ]);
+  });
+
+  it("the market mode is unchanged: without --series every market flag is still required", () => {
+    const parsed = parseRegisterArguments(FLAGS);
+    expect(parsed.ok && parsed.arguments.series).toBe(undefined);
+  });
+
+  it("the help text describes the series mode and its pinned document", () => {
+    expect(USAGE).toContain("register --series --template <file> --out <file>");
+    expect(USAGE).toContain('{"strategy": <its params>, "series": <the reviewed series>}');
+  });
+
+  it("canonicalSeriesParameters renders { strategy, series } as the market mode renders params", () => {
+    const rendered = canonicalSeriesParameters({ b: 1 }, { seriesId: "s", maximumConcurrentWindows: 2 });
+    expect(rendered.ok ? rendered.text : rendered.problems).toBe(
+      '{"strategy":{"b":"1"},"series":{"seriesId":"s","maximumConcurrentWindows":"2"}}',
+    );
+    if (!rendered.ok) return;
+    expect(rendered.hash).toBe(createHash("sha256").update(rendered.text, "utf8").digest("hex"));
+  });
+});
+
+describe("readSeriesTemplate (ROLLOVER-1)", () => {
+  function seriesTemplate(): Record<string, unknown> {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
+    const example = JSON.parse(
+      readFileSync(path.join(repoRoot, "infra/compose/trader/trader.config.example.json"), "utf8"),
+    ) as Record<string, unknown> & { instances: Record<string, unknown>[] };
+    const instance = example.instances[0] ?? {};
+    const minted = ["instanceId", "runId", "configId", "marketId"];
+    const rest = Object.fromEntries(Object.entries(instance).filter(([key]) => !minted.includes(key)));
+    return {
+      ...example,
+      markets: [],
+      instances: [],
+      series: [reviewedSeriesDocument()],
+      seriesInstances: [{ ...rest, seriesId: "btc-15m-updown" }],
+    };
+  }
+
+  it("accepts a series template through the trader's door and composition root, and pins { strategy, series }", () => {
+    const read = readSeriesTemplate(JSON.stringify(seriesTemplate()), SAFE_ENV, () => Date.UTC(2026, 9, 4));
+    expect(read.ok ? "ok" : read.refusal).toBe("ok");
+    if (!read.ok) return;
+    expect(read.template.seriesId).toBe("btc-15m-updown");
+    const pinned = JSON.parse(read.template.parametersText) as { strategy: unknown; series: Record<string, unknown> };
+    expect(Object.keys(pinned)).toEqual(["strategy", "series"]);
+    expect(pinned.series["seriesId"]).toBe("btc-15m-updown");
+    expect(pinned.series["maximumConcurrentWindows"]).toBe("2");
+  });
+
+  it("refuses a series template that names a market, a market-bound instance, or the identities it mints", () => {
+    const withMarket = { ...seriesTemplate(), markets: [{}] };
+    const read = readSeriesTemplate(JSON.stringify(withMarket), SAFE_ENV, () => Date.UTC(2026, 9, 4));
+    expect(read.ok ? "accepted" : read.refusal.code).toBe("REGISTER_TEMPLATE_UNREADABLE");
+    const template = seriesTemplate();
+    const named = {
+      ...template,
+      seriesInstances: [{ ...(template["seriesInstances"] as Record<string, unknown>[])[0], runId: "018f4a7e-3333-7abc-8def-0123456789ab" }],
+    };
+    const refused = readSeriesTemplate(JSON.stringify(named), SAFE_ENV, () => Date.UTC(2026, 9, 4));
+    expect(refused.ok ? "accepted" : refused.refusal.code).toBe("REGISTER_TEMPLATE_HAS_IDENTITIES");
+  });
+
+  it("refuses a series template the trader's door refuses (an instance naming an unreviewed series)", () => {
+    const template = seriesTemplate();
+    const unreviewed = {
+      ...template,
+      seriesInstances: [{ ...(template["seriesInstances"] as Record<string, unknown>[])[0], seriesId: "eth-15m-updown" }],
+    };
+    const read = readSeriesTemplate(JSON.stringify(unreviewed), SAFE_ENV, () => Date.UTC(2026, 9, 4));
+    expect(read.ok ? "accepted" : read.refusal.code).toBe("REGISTER_TEMPLATE_INVALID");
   });
 });

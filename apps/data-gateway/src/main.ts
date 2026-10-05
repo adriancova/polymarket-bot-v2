@@ -103,6 +103,7 @@ import { parseGatewayConfig } from "./config.js";
 import { GatewayConfigurationError } from "./errors.js";
 import type { BatchPublishCapability } from "./publisher.js";
 import { parseCleanupDeadlineMs, runGatewaySequence } from "./run.js";
+import { gatewayRunMode } from "./run-mode.js";
 import {
   systemGatewayClock,
   systemGatewayIdSource,
@@ -156,6 +157,9 @@ async function main(): Promise<void> {
       rtdsSocketFactory: globalWebSocketFactory(),
       binanceSocketFactory: createWebSocketFactory(),
       coinbaseSocketFactory: nodeWebSocketFactory,
+      // `ROLLOVER-1` (ADR-030 Decision 2.1): series admission refuses to start
+      // unless this is PAPER or BACKTEST (`run-mode.ts`).
+      runMode: gatewayRunMode(process.env),
       observer: {
         onIncident: (incident) => {
           console.error(

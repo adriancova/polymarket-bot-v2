@@ -77,6 +77,10 @@ import {
   materializeCheckpointableJson,
   prepareEvaluationView,
   checkpointTransitions,
+  createRunEvaluationSequence,
+  isRunEvaluationSequence,
+  RunEvaluationSequence,
+  runEvaluationSequenceAfter,
   rebuildStateFromPatches,
   restoreCheckpoint,
   restoreFromPoint,
@@ -176,6 +180,63 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     shape: "function",
     totality: "TOTAL",
     note: "materializes first, then validates the snapshot",
+  },
+  // --- ROLLOVER-1 (ADR-030 Decision 4; ruling Q2): the run's sequence ------
+  createRunEvaluationSequence: {
+    params: [],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: a fresh run's counter, starting at 0; takes nothing",
+  },
+  isRunEvaluationSequence: {
+    params: ["value"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: a typeof guard, then WeakSet membership; runs no caller code",
+  },
+  runEvaluationSequenceAfter: {
+    params: ["highestDurableEvaluationSeq"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: typeof and safe-integer checks first; every failure a typed refusal",
+  },
+  "RunEvaluationSequence.fresh": {
+    params: [],
+    visibility: "PUBLIC",
+    shape: "method",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: the factory behind createRunEvaluationSequence",
+  },
+  "RunEvaluationSequence.after": {
+    params: ["highestDurableEvaluationSeq"],
+    visibility: "PUBLIC",
+    shape: "method",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: the factory behind runEvaluationSequenceAfter",
+  },
+  "RunEvaluationSequence.peek": {
+    params: [],
+    visibility: "PUBLIC",
+    shape: "method",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: the counter's own private field (r4: through the module's own read)",
+  },
+  "RunEvaluationSequence.take": {
+    params: [],
+    visibility: "PUBLIC",
+    shape: "method",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: undefined once exhausted; never throws (r4: through the module's own take)",
+  },
+  "RunEvaluationSequence.issued (getter)": {
+    params: [],
+    visibility: "PUBLIC",
+    shape: "getter",
+    totality: "TOTAL",
+    note: "ROLLOVER-1: returns the counter's own private field",
   },
   "StrategyContextRevokedError.constructor": {
     params: ["capability"],
@@ -472,6 +533,25 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     totality: "TOTAL",
     note: "CKPT-1: exact heartbeat arithmetic; an unreadable instant answers undefined, never a throw",
   },
+  peekRunEvaluationSequence: {
+    params: ["sequence"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "PARTIAL",
+    note:
+      "ROLLOVER-1 r4 (R4-ASTRA-01): the runtime's read of a counter's private state, never a " +
+      "property of the counter; precondition: a MINTED counter (the runtime's brand check), " +
+      "anything else is the platform's private-field TypeError",
+  },
+  takeRunEvaluationSequence: {
+    params: ["sequence"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "PARTIAL",
+    note:
+      "ROLLOVER-1 r4 (R4-ASTRA-01): the runtime's take from a counter's private state, never a " +
+      "property of the counter; precondition: a MINTED counter (the runtime's brand check)",
+  },
   parseExactInstant: {
     params: ["value"],
     visibility: "PACKAGE",
@@ -509,6 +589,8 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
       "initialEvaluationSeq",
       "initialStatus",
       "initialMark",
+      // ROLLOVER-1 (ruling Q2): the run's shared evaluation sequence, or undefined.
+      "sequence",
     ],
     visibility: "PACKAGE",
     shape: "constructor",
@@ -667,6 +749,14 @@ const PUBLIC_TOTAL_CALLS: Readonly<Record<string, (args: readonly unknown[]) => 
       args[1] as Parameters<typeof restoreFromPoint>[1],
     ),
   validateEvaluationInput: (args) => validateEvaluationInput(args[0]),
+  createRunEvaluationSequence: () => createRunEvaluationSequence(),
+  isRunEvaluationSequence: (args) => isRunEvaluationSequence(args[0]),
+  runEvaluationSequenceAfter: (args) => runEvaluationSequenceAfter(args[0]),
+  "RunEvaluationSequence.fresh": () => RunEvaluationSequence.fresh(),
+  "RunEvaluationSequence.after": (args) => RunEvaluationSequence.after(args[0]),
+  "RunEvaluationSequence.peek": () => createRunEvaluationSequence().peek(),
+  "RunEvaluationSequence.take": () => createRunEvaluationSequence().take(),
+  "RunEvaluationSequence.issued (getter)": () => createRunEvaluationSequence().issued,
   "StrategyContextRevokedError.constructor": (args) =>
     new StrategyContextRevokedError(args[0] as never),
   // Round 5: these three used to be wired to `() => undefined`, which asserted

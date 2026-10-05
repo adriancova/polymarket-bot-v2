@@ -74,6 +74,21 @@ export { CoinbaseFeedDriver, RecordingCoinbaseSocketFactory } from "./feeds/coin
 export type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
 export { MarketLifecycleFeedDriver } from "./feeds/market-lifecycle.js";
 export type { LifecyclePhase, MarketLifecycleDriverMetrics } from "./feeds/market-lifecycle.js";
+export { SeriesAdmissionFeedDriver, admissionPayloads, incidentReferenceId } from "./feeds/series-admission.js";
+export type {
+  AdmittedSeries,
+  AdmittedWindowSink,
+  SeriesAdmissionDriverMetrics,
+  SeriesAdmissionDriverOptions,
+} from "./feeds/series-admission.js";
+export {
+  ADMISSION_LEDGER_FILE_NAME,
+  ADMISSION_LEDGER_RETENTION_MS,
+  ADMISSION_LEDGER_SCHEMA_VERSION,
+  AdmissionLedger,
+} from "./admission-ledger.js";
+export type { AdmissionLedgerRecord, AdmittedWindowRecord } from "./admission-ledger.js";
+export { gatewayRunMode, REPOSITORY_DEFAULT_RUN_MODE } from "./run-mode.js";
 export {
   LIFECYCLE_LEDGER_FILE_NAME,
   LIFECYCLE_LEDGER_SCHEMA_VERSION,

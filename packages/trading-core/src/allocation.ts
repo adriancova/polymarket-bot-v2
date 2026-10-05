@@ -616,8 +616,12 @@ function scopeOf(market: AllocationMarket): {
 export class AllocatorGate {
   readonly #caps: AllocatorCaps;
   readonly #markets: ReadonlyMap<string, AllocationMarket>;
-  /** `assetId -> (marketId, side)`, inverted from the loop's own token map. */
-  readonly #assets: ReadonlyMap<string, { readonly marketId: string; readonly side: "YES" | "NO" }>;
+  /**
+   * `assetId -> (marketId, side)`, inverted from the loop's own token map at
+   * construction, and — `ROLLOVER-1` r1 (R1-01) — extended by
+   * {@link registerMarketAssets} for every series window admitted later.
+   */
+  readonly #assets = new Map<string, { readonly marketId: string; readonly side: "YES" | "NO" }>();
   readonly #costBasis = new CostBasisBook();
   /**
    * `plannedOrderId -> its commitment`, keyed exactly as `ReservationBook` is.
@@ -636,16 +640,14 @@ export class AllocatorGate {
   }) {
     this.#caps = input.caps;
     this.#markets = input.markets;
-    const assets = new Map<string, { marketId: string; side: "YES" | "NO" }>();
     for (const [key, assetId] of input.tokenAssetIds) {
       const separator = key.lastIndexOf("|");
       if (separator < 0) continue;
       const marketId = key.slice(0, separator);
       const side = key.slice(separator + 1);
       if (side !== "YES" && side !== "NO") continue;
-      assets.set(assetId, { marketId, side });
+      this.#assets.set(assetId, { marketId, side });
     }
-    this.#assets = assets;
   }
 
   /**
@@ -868,9 +870,60 @@ export class AllocatorGate {
     return Object.freeze(out);
   }
 
+  /**
+   * `ROLLOVER-1` r7 (R7-FABLE-03): does any commitment this gate still holds
+   * name `marketId`? Moves nothing.
+   *
+   * A series window's teardown retires its registrations, and with them the
+   * market's live owner (`InstanceRegistry.retireMarket`). A commitment that
+   * names the market is re-applied by {@link #buildState} at EVERY question,
+   * and `packages/capital-allocator` refuses a LIVE commitment on a market
+   * with no live owner (`CAPITAL_LIVE_OWNERSHIP_MISSING`) — so a commitment
+   * that outlived its window's owner would refuse every later question, every
+   * window's entries and protective exits alike, for the rest of the run. One
+   * that never closes (a fill booked UNATTRIBUTED, {@link observeUnattributedFill})
+   * does exactly that. The loop therefore holds a window while this answers
+   * `true` (`#windowHoldsWork`): its capital stays committed against a market
+   * that still has its owner.
+   */
+  holdsCommitmentIn(marketId: string): boolean {
+    for (const commitment of this.#commitments.values()) {
+      if (commitment.request.marketId === marketId) return true;
+    }
+    return false;
+  }
+
   /** The §9.7 scope this gate knows for a market, if it is configured. */
   marketOf(marketId: string): AllocationMarket | undefined {
     return this.#markets.get(marketId);
+  }
+
+  /**
+   * `ROLLOVER-1` r1 (R1-01): makes a market ADMITTED after construction — a
+   * series window (ADR-030) — known to the position projection, BEFORE any
+   * runtime of it can trade (`trader.ts` calls it in the window's attach).
+   *
+   * The constructor inverts the token map it is given ONCE, and
+   * {@link #positionsFrom} skips an asset it does not know. Without this, a
+   * window's booked position was invisible here: its protective exit was
+   * refused `CAPITAL_INVENTORY_INSUFFICIENT` and its exposure counted ZERO
+   * toward every §9.7 cap, so another window could commit past the global cap.
+   *
+   * The mapping is never removed: a torn-down window keeps its ledger rows
+   * (ADR-030 Decision 4.4), so a position or reservation that names its assets
+   * stays counted. Answers `false`, and changes nothing, when either asset is
+   * already mapped to another market or side, or the two assets are the same:
+   * the caller refuses to attach the window (fail closed).
+   */
+  registerMarketAssets(marketId: string, yesAssetId: string, noAssetId: string): boolean {
+    if (yesAssetId === noAssetId) return false;
+    for (const [assetId, side] of [[yesAssetId, "YES"], [noAssetId, "NO"]] as const) {
+      const known = this.#assets.get(assetId);
+      if (known !== undefined && (known.marketId !== marketId || known.side !== side)) return false;
+    }
+    this.#assets.set(yesAssetId, { marketId, side: "YES" });
+    this.#assets.set(noAssetId, { marketId, side: "NO" });
+    return true;
   }
 
   /**

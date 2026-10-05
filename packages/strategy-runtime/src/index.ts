@@ -114,3 +114,16 @@ export {
 } from "./json.js";
 
 export { DeterministicRng, isRngState, type RngState } from "./rng.js";
+
+/**
+ * `ROLLOVER-1` (ADR-030 Decision 4; the user's ruling Q2): the run-scoped
+ * evaluation sequence every runtime of one run shares.
+ */
+export {
+  createRunEvaluationSequence,
+  isRunEvaluationSequence,
+  RunEvaluationSequence,
+  runEvaluationSequenceAfter,
+  type CreateRunEvaluationSequenceResult,
+  type RunEvaluationSequenceRefusal,
+} from "./sequence.js";
