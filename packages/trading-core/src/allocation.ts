@@ -135,13 +135,32 @@
  *   trade answer. That is evidence of price only: it converts nothing.
  *   `keptFills` prices an unbooked fill at its own price when it was seen, and
  *   at the order's limit only when no answer the loop received carried it
- *   (never less than its debit). No fill page is read for it. The loop's
- *   settle-time page read of round 0 is gone too: it was a second
- *   `fillsSince` in one event, and SIM-2 allows one cursor read per harvest.
+ *   (never less than its debit; r2, below: nor any page it read). No fill
+ *   page is read for it. The loop's settle-time page read of round 0 is gone
+ *   too: it was a second `fillsSince` in one event, and SIM-2 allows one
+ *   cursor read per harvest.
  * - **Risk's open orders present a working order at its UNFILLED remainder**
  *   (`CAP1-ASTRA-R1-02`). Its booked fills are the position's, and its
  *   filled-but-unbooked shares are stated by {@link AllocatorGate.unbookedExposure},
  *   so no share of it is counted twice.
+ *
+ * ## `CAP-1` r2: every page the loop READ is evidence too
+ *
+ * `CAP1-ASTRA-R2-01`: the carried harvest reads the venue's fill page, books
+ * only its pass's own fills, and used to discard the others' prices. A
+ * DELAYED disposition's fill on that page was then held at its order's limit
+ * by every later evaluation until its ADR-024 harvest point booked it, and a
+ * booked control admitted what the pending account refused. The loop now
+ * records every fill of every page it reads as SEEN (`loop.ts`,
+ * `#readFills`), with no read added and nothing booked, converted or moved.
+ *
+ * What is still held at the limit is a fill that NO page or answer the loop
+ * has received carries yet: a DELAYED disposition applied by a venue door
+ * whose answer carries no fills (`observe()`, or a cancel's own sweep), and
+ * judged before the next cursor read. This process cannot have its price
+ * without a read that SIM-2's budget does not provide, or an answer that
+ * `packages/simulation` does not give. It therefore stays at the limit, never
+ * below its debit: the r2 STOPPED item, which awaits the orchestrator's ruling.
  */
 
 import {
@@ -255,10 +274,11 @@ interface Commitment {
   readonly unattributed: Map<string, CommitmentFill>;
   /**
    * `CAP-1` r1: every fill of this order the loop has SEEN at the venue, as
-   * `fill id -> fill`, booked or not. The sources are the placement answer
-   * and the trade answer (`observeVenueFill`), and any fill page `settle` is
-   * handed. It is evidence of PRICE only: it converts nothing and releases
-   * nothing, and `keptFills` skips a booked or unattributed id.
+   * `fill id -> fill`, booked or not. The sources are the placement answer,
+   * the trade answer and (r2) every fill page the loop reads
+   * (`observeVenueFill`), and any fill page `settle` is handed. It is
+   * evidence of PRICE only: it converts nothing and releases nothing, and
+   * `keptFills` skips a booked or unattributed id.
    */
   readonly seen: Map<string, CommitmentFill>;
   /**
@@ -365,7 +385,8 @@ function finalSharesNow(commitment: Commitment, view: OrderView | undefined): st
  * - **Unseen shares** (`seen: false`): every share of `filledShares` that is
  *   neither booked nor seen, at the order's LIMIT, which is never less than its
  *   debit. Since `CAP-1` r1 that is only a fill no venue answer the loop
- *   received has carried yet.
+ *   received has carried yet, and since r2 no fill page the loop read has
+ *   carried either (the module header's r2 section).
  *
  * ONE derivation, two readers, so they cannot disagree: the allocator's
  * account (`commitmentRequests`, once the final size is known) and §9.8
@@ -457,7 +478,9 @@ export interface UnbookedExposure {
  * fills of it a caller read past its fill cursor, or `undefined` when no page
  * was read. `CAP-1` r1: any such fills are recorded as SEEN, adding to what the
  * commitment already saw and never replacing it. The trader reads no page
- * here (SIM-2), and passes `undefined`.
+ * here (SIM-2), and passes `undefined`: since r2 every page it reads is
+ * already recorded as seen at the read (`loop.ts`, `#readFills`), and this
+ * parameter is reached from the unit pins only (`CAP1-R2-FABLE-04`).
  */
 export interface TerminalOrderView {
   readonly filledShares: string;
@@ -706,14 +729,15 @@ export class AllocatorGate {
 
   /**
    * `CAP-1` r1: one fill of `plannedOrderId` the loop has SEEN at the venue, in
-   * a placement answer or a trade answer, whether or not it is booked yet.
+   * a placement answer, a trade answer or (r2) a fill page it read, whether
+   * or not it is booked yet.
    *
    * It is evidence of PRICE only: it converts nothing and releases nothing.
    * Once the commitment's final size is known, an unbooked fill it has seen
    * is kept at its own price rather than at the order's limit
-   * (`CAP1-ASTRA-R1-03`). A fill that is not this commitment's (another
-   * market, side or direction), or is not exact, is ignored, and the share it
-   * filled stays at the limit (fail closed).
+   * (`CAP1-ASTRA-R1-03`, `CAP1-ASTRA-R2-01`). A fill that is not this
+   * commitment's (another market, side or direction), or is not exact, is
+   * ignored, and the share it filled stays at the limit (fail closed).
    */
   observeVenueFill(
     fill: Pick<SimulatedFill, "simulatedFillId" | "marketId" | "side" | "action" | "price" | "shares">,
@@ -740,8 +764,8 @@ export class AllocatorGate {
    * Idempotent. The fills of `unbookedFills` are recorded as SEEN, adding to
    * what the commitment already saw, and a fill the commitment has already
    * converted is never counted again. `unbookedFills` `undefined` means the
-   * caller could not read the venue's fills: an unbooked share no answer
-   * carried is then held at the limit.
+   * caller read no page here: an unbooked share that no answer and no page
+   * the loop read carried is then held at the limit.
    */
   settle(plannedOrderId: string, final: TerminalOrderView): boolean {
     const commitment = this.#commitments.get(plannedOrderId);
@@ -784,8 +808,9 @@ export class AllocatorGate {
    *
    * - **Final size known** (settled, or its order TERMINAL in the caller's
    *   view now): exactly the fills the allocator keeps for it. Each seen fill
-   *   is at its own price, and each share no venue answer carried yet is at
-   *   the limit (never less than its debit).
+   *   is at its own price, and each share that no venue answer and (r2) no
+   *   fill page the loop read has carried yet is at the limit (never less
+   *   than its debit).
    * - **Presented as OPEN** (`presentedOpen`; `CAP-1` r1): the open order
    *   presents only its UNFILLED remainder, so its filled shares no position
    *   carries yet are stated here, exactly as above. No share is counted twice:

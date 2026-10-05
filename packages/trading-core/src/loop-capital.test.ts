@@ -71,6 +71,22 @@
  *
  * The property yields to the macrotask queue after every seed
  * (`CAP1-R1-GATE-1`).
+ *
+ * `CAP-1` r2 — THE JOINT REVIEW OF `0c75a17` (`CAP1-ASTRA-R2-01`):
+ *
+ * 11. a DELAYED fill on a fill page the loop has ALREADY READ is priced at
+ *     its own price. That covers the carried harvest's page, where only the
+ *     pass's own fills are booked, and the ordinary harvest's page when a
+ *     posting is refused. A tight-cap booked control and the pending account
+ *     therefore admit the same intent (terminal and working orders, the
+ *     allocator and check 16);
+ * 12. the property also runs on a TIER-1 venue with delayed markets. Its
+ *     oracle is its own evidence of what each answer and page handed the
+ *     loop (`evidenceVenue`). It is exact everywhere except one residual:
+ *     `(limit − price) × shares` for each fill nothing has handed the loop
+ *     yet. That is the r2 STOPPED residual. It is pinned exactly against its
+ *     booked controls and awaits the orchestrator's ruling. In Tier 0 the
+ *     residual is asserted to be zero.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -95,6 +111,7 @@ import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
+import type * as Accounting from "./accounting.js";
 import type * as Pipeline from "./pipeline.js";
 
 /**
@@ -120,6 +137,35 @@ vi.mock("./pipeline.js", async (importOriginal) => {
       const evaluation = original.runRiskCheck(policy, input);
       riskSeam.observe?.(riskSeam.context, input, evaluation);
       return evaluation;
+    },
+  };
+});
+
+/**
+ * `CAP-1` r2: the posting seam, a PASS-THROUGH unless a pin sets `refuse`.
+ * `postFill` then answers a stage-named refusal for each fill `refuse` names,
+ * exactly as a ledger that refused it would, and the loop halts its market
+ * `LEDGER_POSTING_REFUSED`. Every other member is the original module's.
+ */
+const postingSeam = vi.hoisted(() => ({
+  refuse: undefined as ((fill: { readonly simulatedFillId: string; readonly marketId: string }) => boolean) | undefined,
+}));
+
+vi.mock("./accounting.js", async (importOriginal) => {
+  const original = await importOriginal<typeof Accounting>();
+  return {
+    ...original,
+    postFill(input: Parameters<typeof original.postFill>[0]): ReturnType<typeof original.postFill> {
+      if (postingSeam.refuse?.(input.fill) === true) {
+        return {
+          ok: false,
+          stage: "APPEND",
+          code: "CAP1_TEST_POSTING_REFUSED",
+          detail: `cap1 test: the ledger refuses the posting of ${input.fill.simulatedFillId}`,
+          issues: [],
+        };
+      }
+      return original.postFill(input);
     },
   };
 });
@@ -433,8 +479,11 @@ interface HarnessOptions {
   readonly script: Script;
   /** Runs BEFORE each runtime invocation — the property's per-evaluation check. */
   readonly beforeEvaluation?: (harness: Harness, input: EvaluationInput, label: Label) => void;
-  /** A TIER-1 venue on a delayed market (`secondsDelay`, zero latency): how a fill reaches `observe()`. */
-  readonly tier1DelaySeconds?: number;
+  /**
+   * A TIER-1 venue on a delayed market (`secondsDelay`, zero latency): how a
+   * fill reaches `observe()`. `CAP-1` r2: per market, when a function.
+   */
+  readonly tier1DelaySeconds?: number | ((marketId: string) => number);
   /** `CAP-1` r0: the §9.8 check-16 and check-17 limits (generous by default). */
   readonly risk?: RiskLimits;
   /** `CAP-1` r0: runs at EVERY risk evaluation, after the engine answered — the property's check-16/17 floor. */
@@ -584,7 +633,7 @@ function assemble(options: HarnessOptions): Harness {
             marketId,
             tickSize: "0.01",
             minimumOrderSize: "5",
-            secondsDelay: delay,
+            secondsDelay: typeof delay === "function" ? delay(marketId) : delay,
             parametersVersion: 1,
           }),
           queueParameters: QUEUE_PARAMETERS,
@@ -869,10 +918,10 @@ function venueViewOf(harness: Harness, plannedOrderId: string): { readonly termi
  * `unseen` (`CAP-1` r1) names, per strategy, the ONE stated residual: a fill
  * no venue answer the loop received has carried yet. That is a Tier-1
  * DELAYED order's disposition applied inside `observe()`, whose answer
- * carries no fills, until a fill page is read. Such a share is held at its
- * order's limit, so the cap check counts `exact + (limit − price) × shares`,
- * never less. A test that expects it states that excess exactly; every other
- * caller states none.
+ * carries no fills, until a fill page is read (r2: ANY page the loop reads).
+ * Such a share is held at its order's limit, so the cap check counts `exact
+ * + (limit − price) × shares`, never less. A test that expects it states that
+ * excess exactly; every other caller states none.
  */
 function expectInvariant(harness: Harness, where: string, unseen: Partial<Record<Label, string>> = {}): void {
   const now = counted(harness);
@@ -888,6 +937,103 @@ function expectInvariant(harness: Harness, where: string, unseen: Partial<Record
     exactGlobal = addDecimal(exactGlobal, expected);
   }
   expect(now.global, `${where}: the account`).toBe(exactGlobal);
+}
+
+/**
+ * `CAP-1` r2 — the property's INDEPENDENT oracle of what the loop can price
+ * exactly: every venue fill the LOOP has been handed, recorded by a
+ * pass-through wrapper on the port it drives ({@link evidenceVenue}), never
+ * read from the allocator.
+ */
+interface Evidence {
+  /** Fill ids a venue ANSWER the loop received carried: a placement's (`submit`) or a trade's (`observeTrade`). */
+  readonly answered: Set<string>;
+  /** Fill ids a fill PAGE the loop read (`fillsSince`) carried. */
+  readonly paged: Set<string>;
+  /** Fill id -> the batch (`feed` call) during which the venue produced it. */
+  readonly producedIn: Map<string, number>;
+  /** The batch being fed now. */
+  batch: number;
+}
+
+function newEvidence(): Evidence {
+  return { answered: new Set(), paged: new Set(), producedIn: new Map(), batch: 0 };
+}
+
+/** Whether the loop has been handed `fillId`, in an answer or on a page it read. */
+function handed(evidence: Evidence, fillId: string): boolean {
+  return evidence.answered.has(fillId) || evidence.paged.has(fillId);
+}
+
+/**
+ * `CAP-1` r2: the venue port the loop is handed, as a PASS-THROUGH that
+ * records `evidence` — what each answer and each page carried, and the batch
+ * each fill was produced in. It changes nothing the loop reads.
+ */
+function evidenceVenue(evidence: Evidence): (inner: SimulatedVenue) => TraderVenue {
+  return (inner) => {
+    const stamp = (): void => {
+      for (const fill of inner.fills) {
+        if (!evidence.producedIn.has(fill.simulatedFillId)) evidence.producedIn.set(fill.simulatedFillId, evidence.batch);
+      }
+    };
+    return {
+      observe: (identity) => {
+        const answer = inner.observe(identity);
+        stamp();
+        return answer;
+      },
+      observeTrade: (input) => {
+        const answer = inner.observeTrade(input);
+        stamp();
+        if (answer.ok) for (const fill of answer.value.fills) evidence.answered.add(fill.simulatedFillId);
+        return answer;
+      },
+      submit: async (plan) => {
+        const answer = await inner.submit(plan as Parameters<SimulatedVenue["submit"]>[0]);
+        stamp();
+        for (const fill of answer.fills) evidence.answered.add(fill.simulatedFillId);
+        return answer;
+      },
+      fillsSince: (sequence) => {
+        const page = inner.fillsSince(sequence);
+        if (page.ok) for (const fill of page.value.fills) evidence.paged.add(fill.simulatedFillId);
+        return page;
+      },
+      orderById: (venueOrderId) => inner.orderById(venueOrderId),
+      orderByPlannedId: (plannedOrderId) => inner.orderByPlannedId(plannedOrderId),
+      acknowledgeTerminal: (venueOrderId) => inner.acknowledgeTerminal(venueOrderId),
+    };
+  };
+}
+
+/**
+ * `CAP-1` r2: per strategy, the EXCESS the cap check must count over the
+ * venue's exact commitment — `(limit − price) × shares` for each BUY fill the
+ * loop has NOT been handed, which nothing lets it price below its order's
+ * limit — and the fills that make it up. `terminalOnly`: of TERMINAL orders
+ * only (the allocator, which counts a working order at its whole
+ * reservation); otherwise of every order (checks 16 and 17, which state a
+ * working order's filled shares beside its unfilled remainder).
+ */
+function unhandedExcess(
+  harness: Harness,
+  evidence: Evidence,
+  terminalOnly: boolean,
+): { readonly excess: Readonly<Record<Label, string>>; readonly fills: readonly string[] } {
+  const excess = { A: "0", B: "0" };
+  const fills: string[] = [];
+  const orders = new Map(harness.venue.ordersSnapshot().map((order) => [order.simulatedOrderId, order]));
+  for (const fill of harness.venue.fills) {
+    if (fill.action !== "BUY" || handed(evidence, fill.simulatedFillId)) continue;
+    const order = orders.get(fill.simulatedOrderId);
+    expect(order, `the venue's order for fill ${fill.simulatedFillId}`).toBeDefined();
+    if (order === undefined || (terminalOnly && !TERMINAL.has(order.state))) continue;
+    const label: Label = fill.marketId === MARKET_A ? "A" : "B";
+    excess[label] = addDecimal(excess[label], mulDecimal(subDecimal(order.limitPrice, fill.price), fill.shares));
+    fills.push(fill.simulatedFillId);
+  }
+  return { excess, fills };
 }
 
 /** One run's health, reduced to what these pins compare. */
@@ -1399,6 +1545,233 @@ describe("CAP-1 r1 regression (CAP1-ASTRA-R1-02) — a PARTLY FILLED working ord
 });
 
 // ---------------------------------------------------------------------------
+// 1d. Round 2's named regressions (the joint review of 0c75a17)
+// ---------------------------------------------------------------------------
+
+/** `CAP-1` r2: the three arms of `CAP1-ASTRA-R2-01`, each judged at a limit between the pending and the over-counted measure. */
+type DelayedArm = "terminal allocator" | "terminal risk" | "working risk";
+
+/**
+ * `CAP-1` r2 — one run of `CAP1-ASTRA-R2-01`'s shape, on a 5 s DELAYED
+ * market (Tier 1):
+ *
+ * - B places a taker BUY of 10 at ≤ 0.35 at S + 5 000: a FAK (the terminal
+ *   arms), or a GTC against 5 shares at 0.34 (the working arm). It is DELAYED;
+ * - at S + 11 000, an event for market X (which this trader does not run):
+ *   `observe()` applies the disposition — FILLED 10/10 at 0.34, or PARTIALLY
+ *   FILLED 5/10 with 5 resting at 0.35. `observe()`'s answer carries no fill;
+ * - `pageRead`: A's heartbeat at that same close places a maker BUY of 5, so
+ *   the CARRIED harvest reads the venue's fill page, which carries B's fill
+ *   (not the pass's own: it is left to its ADR-024 harvest point);
+ * - `booked`: the booked control. B's own event at S + 11 100 books the fill;
+ * - at S + 17 000, another event for X: B's heartbeat asks for a FAK BUY of 10
+ *   (the terminal arms) or a maker BUY of 5 at 0.30 (the working arm).
+ *
+ * The limits sit 0.05 pUSD above the booked control's measure and below the
+ * measure that prices B's filled shares at their 0.35 limit.
+ */
+async function delayedRun(
+  arm: DelayedArm,
+  options: { readonly pageRead: boolean; readonly booked: boolean },
+): Promise<{ readonly harness: Harness; readonly before: ReturnType<typeof counted>; readonly reads: readonly number[]; readonly pages: readonly (readonly string[])[] }> {
+  ordinal = 0;
+  const working = arm === "working risk";
+  const harness = assemble({
+    cadence: PAPER_EVALUATION_CADENCE,
+    perStrategyCap: arm === "terminal allocator" ? "6.95" : "1000",
+    risk: { maxWorstCaseContractualLoss: arm === "terminal risk" ? "6.95" : working ? "4.97" : "1000" },
+    tier1DelaySeconds: 5,
+    script: scheduled({
+      A: options.pageRead ? { onFeatures: [[iso(S + 11_000), { kind: "BUY", shares: "5", style: "MAKER" }]] } : {},
+      B: {
+        onFeatures: [
+          [iso(S + 5_000), { kind: "BUY", shares: "10", style: working ? "GTC" : "FAK" }],
+          [iso(S + 17_000), working ? { kind: "BUY", shares: "5", style: "MAKER" } : { kind: "BUY", shares: "10", style: "FAK" }],
+        ],
+      },
+    }),
+  });
+  await feed(harness, ...opening(), opened(S + 140, MARKET_A), opened(S + 150, MARKET_B));
+  if (working) await feed(harness, askLevel(S + 210, MARKET_B, "0.34", "5"));
+  await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+  expect(outcomeOf(harness).orders).toEqual(["BUY DELAYED 0/10"]);
+  // Every fill page the loop reads from here on, per event (SIM-2's budget).
+  const cursor = vi.spyOn(harness.venue, "fillsSince");
+  const reads: number[] = [];
+  const at = async (ingested: IngestedEvent): Promise<void> => {
+    const before = cursor.mock.calls.length;
+    await feed(harness, ingested);
+    reads.push(cursor.mock.calls.length - before);
+  };
+  harness.clock.positionAt(iso(S + 11_000), 6_000_000_000n);
+  await at(snapshot(S + 11_000, MARKET_X, "yes"));
+  expect(outcomeOf(harness).orders[0]).toBe(working ? "BUY PARTIALLY_FILLED 5/10" : "BUY FILLED 10/10");
+  // No harvest point at X: nothing booked.
+  expect(harness.loop.health().execution.fillsObserved).toBe(0);
+  if (options.booked) {
+    await at(level(S + 11_100, MARKET_B, "0.31"));
+    expect(harness.loop.health().execution.fillsObserved).toBe(1);
+  }
+  const before = counted(harness);
+  await at(snapshot(S + 17_000, MARKET_X, "yes"));
+  const pages = cursor.mock.results.map((result) => {
+    const page = result.value as ReturnType<SimulatedVenue["fillsSince"]>;
+    return page.ok ? page.value.fills.map((fill) => `${fill.shares}@${fill.price}`) : ["REFUSED"];
+  });
+  expect(harness.halts.records()).toEqual([]);
+  return { harness, before, reads, pages };
+}
+
+describe("CAP-1 r2 regression (CAP1-ASTRA-R2-01) — a DELAYED fill on a page the carried harvest ALREADY READ is judged at its own price: the cap check and check 16 admit exactly what the booked control admits (0c75a17 discarded the page's other fills and held them at their limit)", () => {
+  it("terminal, the allocator (per-strategy cap 6.95): B's third BUY is ADMITTED at 3.40 + 3.50 = 6.90, exactly as the booked control admits it (0c75a17: 3.50 counted, 7.00, refused CAPITAL_STRATEGY_CAP_EXCEEDED)", async () => {
+    const pending = await delayedRun("terminal allocator", { pageRead: true, booked: false });
+    const control = await delayedRun("terminal allocator", { pageRead: true, booked: true });
+    // The carried harvest at S + 11 000 read ONE page, and it carried B's fill; no read was added.
+    expect(pending.reads).toEqual([1, 1]);
+    expect(pending.pages[0]).toEqual(["10@0.34"]);
+    for (const run of [pending, control]) {
+      expect(outcomeOf(run.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+      expect(run.before).toEqual({ A: "1.5", B: "3.4", global: "4.9" });
+    }
+    expect(control.reads).toEqual([1, 1, 1]);
+  });
+
+  it("terminal, check 16 (maxWorstCaseContractualLoss 6.95): ADMITTED at 3.40 + 3.50 = 6.90, its unbooked fill stated at its own 0.34, exactly as the booked control (0c75a17: 3.50 stated, 7.00, refused)", async () => {
+    const pending = await delayedRun("terminal risk", { pageRead: true, booked: false });
+    const control = await delayedRun("terminal risk", { pageRead: true, booked: true });
+    for (const run of [pending, control]) {
+      expect(outcomeOf(run.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+      expect(checkSixteen(run.harness, "B").at(-1)).toBe("6.9");
+    }
+    expect(unbookedInputs(pending.harness, "B").at(-1)).toEqual([{ marketId: MARKET_B, side: "YES", shares: "10", debit: "3.4" }]);
+    expect(unbookedInputs(control.harness, "B").at(-1)).toEqual([]);
+    expect(pending.reads).toEqual([1, 1]);
+  });
+
+  it("WORKING, check 16 (maxWorstCaseContractualLoss 4.97): a maker BUY of 5 is ADMITTED at 1.70 + 1.75 + 1.50 = 4.95, its 5 filled shares stated at 0.34 and its 5 unfilled ones in the open order, exactly as the booked control (0c75a17: 1.75 + 1.75 + 1.50 = 5.00, refused)", async () => {
+    const pending = await delayedRun("working risk", { pageRead: true, booked: false });
+    const control = await delayedRun("working risk", { pageRead: true, booked: true });
+    expect(pending.pages[0]).toEqual(["5@0.34"]);
+    for (const run of [pending, control]) {
+      expect(outcomeOf(run.harness)).toMatchObject({ accepted: 3, risk: {}, allocator: {} });
+      expect(checkSixteen(run.harness, "B").at(-1)).toBe("4.95");
+      const last = run.harness.risks.filter((risk) => risk.label === "B").at(-1);
+      expect(last?.context.openOrders.map((open) => open.shares)).toEqual(["5"]);
+      // While it works, the allocator counts its whole reservation (WP-270 decision 5).
+      expect(run.before.B).toBe("3.5");
+    }
+    expect(unbookedInputs(pending.harness, "B").at(-1)).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.7" }]);
+    expect(unbookedInputs(control.harness, "B").at(-1)).toEqual([]);
+  });
+
+  it("the cap check is EXACT at the pending heartbeat: B's FILLED order at its 3.40 debit, no residual (0c75a17: 0.10 over)", async () => {
+    const pending = await delayedRun("terminal allocator", { pageRead: true, booked: false });
+    // After the third BUY: B holds the FILLED order (3.40, read on the page, unbooked) and the third (DELAYED, 3.50).
+    expectInvariant(pending.harness, "after B's third BUY, the first fill read on the carried harvest's page");
+    expect(counted(pending.harness).B).toBe("6.9");
+  });
+});
+
+describe("CAP-1 r2 regression (CAP1-ASTRA-R2-01, the ordinary page): a fill the ordinary harvest READ but could not book (its posting REFUSED) is counted at its own price, the venue's exact debit, as the booked control counts it (0c75a17: held at its limit)", () => {
+  /**
+   * B's DELAYED FAK BUY of 10 at ≤ 0.35 fills 10 at 0.34 inside `observe()`
+   * at B's own event at S + 11 000, and that event's ORDINARY harvest reads
+   * the page. With `refused`, the ledger refuses the posting: the loop halts
+   * `LEDGER_POSTING_REFUSED` (a FULL_HALT), the fill is never booked, and its
+   * commitment keeps its capital — at 3.40, the price the page carried. At
+   * `0c75a17` the page was not evidence, and the account counted 3.50.
+   *
+   * The halt blocks every ENTRY by the run state (§9.8 check 1), so no
+   * decision turns on the difference here: the measure itself is what is
+   * pinned — the §9.8 check-15 snapshot and the allocator's account — and the
+   * entry A asks for after it is refused by the run state, by nothing else.
+   * The booked control is the same run with the posting allowed.
+   */
+  async function run(refused: boolean): Promise<{ readonly harness: Harness; readonly before: ReturnType<typeof counted> }> {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      tier1DelaySeconds: 5,
+      script: scheduled({
+        A: { onFeatures: [[iso(S + 12_000), { kind: "BUY", shares: "10", style: "FAK" }]] },
+        B: { onFeatures: [[iso(S + 5_000), { kind: "BUY", shares: "10", style: "FAK" }]] },
+      }),
+    });
+    postingSeam.refuse = refused ? (fill) => fill.marketId === MARKET_B : undefined;
+    try {
+      await feed(harness, ...opening(), opened(S + 140, MARKET_A), opened(S + 150, MARKET_B));
+      await feed(harness, level(S + 5_000, MARKET_B, "0.31"));
+      expect(outcomeOf(harness).orders).toEqual(["BUY DELAYED 0/10"]);
+      harness.clock.positionAt(iso(S + 11_000), 6_000_000_000n);
+      await feed(harness, level(S + 11_000, MARKET_B, "0.31"));
+      expect(outcomeOf(harness).orders).toEqual(["BUY FILLED 10/10"]);
+      expect(harness.loop.health().execution.fillsObserved).toBe(1);
+      const before = counted(harness);
+      expectInvariant(harness, `${refused ? "refused" : "booked"} run, before A's BUY`);
+      await feed(harness, level(S + 12_000, MARKET_A, "0.31"));
+      return { harness, before };
+    } finally {
+      postingSeam.refuse = undefined;
+    }
+  }
+
+  it("the refused posting: the account counts B at 3.40, exactly as the booked control, and A's entry is refused by the run state alone", async () => {
+    const pending = await run(true);
+    const control = await run(false);
+    expect(pending.harness.loop.health().halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
+      ["MARKET", "LEDGER_POSTING_REFUSED", "FULL_HALT"],
+    ]);
+    expect(control.harness.halts.records()).toEqual([]);
+    for (const current of [pending, control]) expect(current.before).toEqual({ A: "0", B: "3.4", global: "3.4" });
+    expect(outcomeOf(pending.harness)).toMatchObject({ accepted: 1, risk: { RISK_RUN_STATE_BLOCKS: 1 }, allocator: {} });
+    expect(outcomeOf(control.harness)).toMatchObject({ accepted: 2, risk: {}, allocator: {} });
+    // The refused fill stays in B's commitment (its posting is not retried), at its own price.
+    expect(counted(pending.harness)).toEqual({ A: "0", B: "3.4", global: "3.4" });
+    expectInvariant(pending.harness, "after A's refused entry");
+  });
+});
+
+describe("CAP-1 r2 STOPPED residual (CAP1-ASTRA-R2-01 (ii)) — a DELAYED fill that NO page or answer the loop received has carried yet: held at its order's limit, exactly (limit − price) × shares above the booked control, and nothing else (awaiting the orchestrator's ruling; these pins state the residual, they do not endorse it)", () => {
+  it("terminal, the allocator: no page is read between observe()'s fill and the heartbeat, so B counts 3.50 (the booked control 3.40) and the BUY is refused at 6.95 — exactly 10 × (0.35 − 0.34) = 0.10 over, never under", async () => {
+    const pending = await delayedRun("terminal allocator", { pageRead: false, booked: false });
+    const control = await delayedRun("terminal allocator", { pageRead: false, booked: true });
+    // SIM-2: neither event at X reads a page — no pass touches an order of its
+    // own (the refused BUY places nothing) — so no fill evidence reaches the
+    // loop at all. The control reads one page at B's own event, and one at
+    // S + 17 000, after its admitted BUY.
+    expect(pending.reads).toEqual([0, 0]);
+    expect(control.reads).toEqual([0, 1, 1]);
+    expect(pending.before).toEqual({ A: "0", B: "3.5", global: "3.5" });
+    expect(control.before).toEqual({ A: "0", B: "3.4", global: "3.4" });
+    expect(outcomeOf(pending.harness)).toMatchObject({ accepted: 1, risk: { RISK_ALLOCATION_REFUSED: 1 }, allocator: { CAPITAL_STRATEGY_CAP_EXCEEDED: 1 } });
+    expect(outcomeOf(control.harness)).toMatchObject({ accepted: 2, risk: {}, allocator: {} });
+    // The residual, stated exactly: the venue's exact 3.40 plus 10 × 0.01.
+    expectInvariant(pending.harness, "after the refused heartbeat", { B: "0.1" });
+  });
+
+  it("terminal, check 16: 7.00 measured against the booked control's 6.90 (the 10 filled shares stated at the 0.35 limit), refused at 6.95", async () => {
+    const pending = await delayedRun("terminal risk", { pageRead: false, booked: false });
+    const control = await delayedRun("terminal risk", { pageRead: false, booked: true });
+    expect(checkSixteen(pending.harness, "B").at(-1)).toBe("7");
+    expect(checkSixteen(control.harness, "B").at(-1)).toBe("6.9");
+    expect(unbookedInputs(pending.harness, "B").at(-1)).toEqual([{ marketId: MARKET_B, side: "YES", shares: "10", debit: "3.5" }]);
+    expect(outcomeOf(pending.harness)).toMatchObject({ accepted: 1, risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 } });
+    expect(outcomeOf(control.harness)).toMatchObject({ accepted: 2, risk: {} });
+  });
+
+  it("working, check 16: 5.00 measured against the booked control's 4.95 (the 5 filled shares at the limit: 0.05 over), refused at 4.97", async () => {
+    const pending = await delayedRun("working risk", { pageRead: false, booked: false });
+    const control = await delayedRun("working risk", { pageRead: false, booked: true });
+    expect(checkSixteen(pending.harness, "B").at(-1)).toBe("5");
+    expect(checkSixteen(control.harness, "B").at(-1)).toBe("4.95");
+    expect(unbookedInputs(pending.harness, "B").at(-1)).toEqual([{ marketId: MARKET_B, side: "YES", shares: "5", debit: "1.75" }]);
+    expect(outcomeOf(pending.harness)).toMatchObject({ accepted: 1, risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 } });
+    expect(outcomeOf(control.harness)).toMatchObject({ accepted: 2, risk: {} });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. One pin per path
 // ---------------------------------------------------------------------------
 
@@ -1776,6 +2149,49 @@ interface Coverage {
   terminalUnsettledAtEvaluation: number;
   /** `CAP-1` r1: risk evaluations presenting a PARTLY FILLED working order (`CAP1-ASTRA-R1-02`). */
   partlyFilledPresented: number;
+  /**
+   * `CAP-1` r2 (`CAP1-ASTRA-R2-01`): evaluations at which an UNBOOKED fill
+   * was handed to the loop by a fill PAGE only (no answer carried it): where
+   * the cap check prices a fill from a page a harvest already read.
+   */
+  pageSeenUnbookedAtEvaluation: number;
+  /**
+   * `CAP-1` r2, the STOPPED residual: evaluations at which some fill no
+   * answer or page has handed the loop yet is held at its limit — produced
+   * in the batch being evaluated (no read could have preceded the evaluation
+   * within SIM-2's budget) …
+   */
+  unhandedSameBatchAtEvaluation: number;
+  /** … or in an EARLIER batch, with no page read since (what a trailing read would reach). */
+  unhandedEarlierBatchAtEvaluation: number;
+}
+
+/** `CAP-1` r2: a coverage record with every counter at zero. */
+function newCoverage(): Coverage {
+  return {
+    evaluationsChecked: 0,
+    capChecks: 0,
+    admissions: 0,
+    capRefusals: 0,
+    partialFills: 0,
+    cancelledAfterPartial: 0,
+    onFillPlacements: 0,
+    onOrderUpdatePlacements: 0,
+    carriedHarvestFills: 0,
+    ordinaryHarvestFills: 0,
+    unbookedFillsAtEvaluation: 0,
+    restarts: 0,
+    riskEvaluationsChecked: 0,
+    riskEvaluationsWithUnbooked: 0,
+    scenarioOutcomesChecked: 0,
+    worstCaseRefusals: 0,
+    riskAdmissions: 0,
+    terminalUnsettledAtEvaluation: 0,
+    partlyFilledPresented: 0,
+    pageSeenUnbookedAtEvaluation: 0,
+    unhandedSameBatchAtEvaluation: 0,
+    unhandedEarlierBatchAtEvaluation: 0,
+  };
 }
 
 /**
@@ -1820,10 +2236,15 @@ function boughtBy(intent: Intent): { readonly cost: string; readonly shares: str
  * `CAP-1` r1 (`CAP1-ASTRA-R1-02`, `-03`): and EXACTLY the floor — no more.
  * Round 0 asserted only the lower bound, so a booked partial fill counted
  * twice (in the position AND in its order presented whole) and an unbooked
- * fill priced at its limit both passed. Every fill this property makes is
- * carried by a venue answer the loop receives (a placement's or a trade's:
- * Tier 0, no delayed market), so nothing here is priced at a limit it did not
- * fill at.
+ * fill priced at its limit both passed.
+ *
+ * `CAP-1` r2: `excess` is the ONE stated residual, computed from the
+ * property's own evidence (`unhandedExcess`): `(limit − price) × shares` for
+ * each fill of the market no answer or page has handed the loop yet. In Tier
+ * 0 every fill is carried by an answer, and the Tier-0 run asserts it is
+ * `"0"` at every evaluation; in Tier 1 it is exactly the DELAYED fills that
+ * no page has carried yet. Checks 16 and 17 must count EXACTLY the floor plus
+ * that excess — a fill on a page the loop already read is at its own price.
  *
  * - check 16: the evaluating market's lot, less the intent's own leg, holds
  *   exactly the floor's cost and shares (its primary measure is that cost);
@@ -1833,7 +2254,14 @@ function boughtBy(intent: Intent): { readonly cost: string; readonly shares: str
  *   an unbooked fill exactly as booked;
  * - an APPROVED entry: floor + its bounded cost ≤ `maxWorstCaseContractualLoss`.
  */
-function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worstCaseLimit: string, coverage: Coverage, where: string): void {
+function expectRiskFloor(
+  harness: Harness,
+  risk: Harness["risks"][number],
+  worstCaseLimit: string,
+  coverage: Coverage,
+  where: string,
+  excess: string,
+): void {
   const marketId = risk.label === "A" ? MARKET_A : MARKET_B;
   const floor = holdingsFloor(harness, risk.label);
   const bought = boughtBy(risk.context.intent);
@@ -1852,7 +2280,8 @@ function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worst
     (value: string) => compareDecimal(value, floor.shares) >= 0,
   );
   // r1: exactly — no share counted twice, no fill above its own price.
-  expect(countedCost, `${where}: check 16 counts the floor's cost exactly`).toBe(floor.cost);
+  // r2: … but the stated residual (`excess`, "0" unless a fill is unhanded).
+  expect(countedCost, `${where}: check 16 counts the floor's cost exactly (+ ${excess} unhanded)`).toBe(addDecimal(floor.cost, excess));
   expect(countedShares, `${where}: check 16 counts the floor's shares exactly`).toBe(floor.shares);
   for (const outcome of risk.evaluation.scenario?.outcomes ?? []) {
     if (outcome.unmarkedMarketIds.length > 0) continue;
@@ -1866,7 +2295,9 @@ function expectRiskFloor(harness: Harness, risk: Harness["risks"][number], worst
     expect(countedLoss, `${where}: check 17 (${outcome.scenarioId}) measures ${countedLoss} of the floor's ${floorLoss}`).toSatisfy(
       (value: string) => compareDecimal(value, floorLoss) >= 0,
     );
-    expect(countedLoss, `${where}: check 17 (${outcome.scenarioId}) measures the floor's loss exactly`).toBe(floorLoss);
+    expect(countedLoss, `${where}: check 17 (${outcome.scenarioId}) measures the floor's loss exactly (+ ${excess} unhanded)`).toBe(
+      addDecimal(floorLoss, excess),
+    );
   }
   if (risk.evaluation.refusals.some((refusal) => refusal.code === "RISK_WORST_CASE_LOSS_EXCEEDED")) coverage.worstCaseRefusals += 1;
   if (risk.evaluation.approved && risk.context.intent.type !== "CANCEL") {
@@ -1924,8 +2355,19 @@ function randomEvents(random: () => number, at: number, frameKey: string): { rea
  * - at EVERY reservation the gate admits (`applyForPlan`): the venue's floor
  *   AND exact commitment plus the admitted cost stay within the per-strategy
  *   and the global cap — no admitted intent takes a strategy over its cap.
+ *
+ * `CAP-1` r2 (`CAP1-ASTRA-R2-01`): `tier` `"TIER_1"` runs the same property on
+ * a Tier-1 venue whose market B (and, per seed, A) is DELAYED 5 s, with the
+ * venue's clock positioned at each batch's instant — so dispositions are
+ * applied inside `observe()` and a cancel's own sweep, whose answers carry no
+ * fills. The oracle is the property's own EVIDENCE (`evidenceVenue`): every
+ * check above is EXACT plus `(limit − price) × shares` for each fill no
+ * answer or page has handed the loop yet (`unhandedExcess`), and nothing
+ * else. In Tier 0 that excess is asserted to be zero at every evaluation.
  */
-async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps: number, coverage: Coverage): Promise<void> {
+type VenueTier = "TIER_0" | "TIER_1";
+
+async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps: number, coverage: Coverage, tier: VenueTier = "TIER_0"): Promise<void> {
   ordinal = 0;
   const events = prng(seed);
   const decisions = prng(seed ^ 0x5eed_cafe);
@@ -1942,16 +2384,43 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
     return act;
   };
   let unconfiguredOnly = false;
+  // `CAP-1` r2: Tier 1 — B always DELAYED; A delayed or immediate, from its OWN stream.
+  const delayA = tier === "TIER_1" ? pick(prng(seed ^ 0x0de1_a7ed), [0, 5]) : 0;
+  // The CURRENT process's evidence (a restart starts it afresh).
+  let evidence = newEvidence();
+  /**
+   * The excess the cap check (`terminalOnly`: terminal orders) and checks 16
+   * and 17 (every order) must count for the fills not handed to the loop yet.
+   * Tier 0 hands every fill in an answer, so there it must be none.
+   */
+  const excessNow = (current: Harness, terminalOnly: boolean): ReturnType<typeof unhandedExcess> => {
+    const measured = unhandedExcess(current, evidence, terminalOnly);
+    if (tier === "TIER_0") expect(measured.fills, `seed ${String(seed)}: Tier 0 hands the loop every fill in an answer`).toEqual([]);
+    return measured;
+  };
 
   const start = (): Harness => {
+    const local = newEvidence();
+    evidence = local;
+    // The fills this process BOOKED (converted into a position).
+    const booked = new Set<string>();
     const harness = assemble({
       cadence,
       perStrategyCap,
       globalAccountCap,
       risk: { maxWorstCaseContractualLoss: worstCaseLimit },
       script: tracking,
+      ...(tier === "TIER_1" ? { tier1DelaySeconds: (marketId: string) => (marketId === MARKET_A ? delayA : 5) } : {}),
+      wrapVenue: evidenceVenue(local),
       onRisk: (current, risk) => {
-        expectRiskFloor(current, risk, worstCaseLimit, coverage, `seed ${String(seed)} at ${risk.label}'s risk check at ${risk.context.evaluatedAt}`);
+        expectRiskFloor(
+          current,
+          risk,
+          worstCaseLimit,
+          coverage,
+          `seed ${String(seed)} at ${risk.label}'s risk check at ${risk.context.evaluatedAt}`,
+          excessNow(current, false).excess[risk.label],
+        );
         const presented = new Set(risk.context.openOrders.map((open) => open.orderId));
         if (current.venue.ordersSnapshot().some((order) => presented.has(order.simulatedOrderId) && compareDecimal(order.filledShares, "0") > 0)) {
           coverage.partlyFilledPresented += 1;
@@ -1984,8 +2453,28 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
         ) {
           coverage.terminalUnsettledAtEvaluation += 1;
         }
-        expectInvariant(current, `seed ${String(seed)} before ${input.callback} at ${input.evaluatedAt}`);
+        // r2: a fill a page handed the loop (no answer did) that is not booked yet.
+        for (const fillId of local.paged) {
+          if (local.answered.has(fillId) || booked.has(fillId)) continue;
+          coverage.pageSeenUnbookedAtEvaluation += 1;
+          break;
+        }
+        // r2: the STOPPED residual, by where its fills were produced.
+        const unhanded = excessNow(current, false).fills;
+        if (unhanded.length > 0) {
+          if (unhanded.some((fillId) => (local.producedIn.get(fillId) ?? local.batch) < local.batch)) {
+            coverage.unhandedEarlierBatchAtEvaluation += 1;
+          } else {
+            coverage.unhandedSameBatchAtEvaluation += 1;
+          }
+        }
+        expectInvariant(current, `seed ${String(seed)} before ${input.callback} at ${input.evaluatedAt}`, excessNow(current, true).excess);
       },
+    });
+    const observeFill = harness.gate.observeFill.bind(harness.gate);
+    vi.spyOn(harness.gate, "observeFill").mockImplementation((instanceId, fill, plannedOrderId) => {
+      booked.add(fill.simulatedFillId);
+      observeFill(instanceId, fill, plannedOrderId);
     });
     const evaluate = harness.gate.evaluate.bind(harness.gate);
     vi.spyOn(harness.gate, "evaluate").mockImplementation((input) => {
@@ -1995,7 +2484,7 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
       expect(
         combinedOf(outcome.exposures.byStrategyInstance, input.instanceId),
         `seed ${String(seed)}: the cap check's own snapshot for ${label}`,
-      ).toBe(committed(harness)[label].exact);
+      ).toBe(addDecimal(committed(harness)[label].exact, excessNow(harness, true).excess[label]));
       if (outcome.verdict?.permitted === false && outcome.verdict.refusals.some((refusal) => refusal.code === "CAPITAL_STRATEGY_CAP_EXCEEDED")) {
         coverage.capRefusals += 1;
       }
@@ -2026,14 +2515,23 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
     return harness;
   };
 
+  /**
+   * One batch, as its own drain. `CAP-1` r2: the batch is numbered for the
+   * evidence, and in Tier 1 the venue's clock is positioned at the batch's
+   * instant first (recorded time is what applies a DELAYED disposition).
+   * Tier 0 leaves the clock where it always was, so its runs are unchanged.
+   */
+  const feedBatch = async (current: Harness, at: number, batch: IngestedEvent | readonly IngestedEvent[]): Promise<void> => {
+    evidence.batch += 1;
+    if (tier === "TIER_1") current.clock.positionAt(iso(at), BigInt(at) * 1_000_000n);
+    await feed(current, batch);
+  };
+
   const warmUp = async (harness: Harness, at: number): Promise<void> => {
     unconfiguredOnly = false;
-    await feed(
-      harness,
-      [reference(at), snapshot(at, MARKET_A, "yes"), snapshot(at, MARKET_A, "no"), snapshot(at, MARKET_B, "yes"), snapshot(at, MARKET_B, "no")],
-      opened(at + 10, MARKET_A),
-      opened(at + 20, MARKET_B),
-    );
+    await feedBatch(harness, at, [reference(at), snapshot(at, MARKET_A, "yes"), snapshot(at, MARKET_A, "no"), snapshot(at, MARKET_B, "yes"), snapshot(at, MARKET_B, "no")]);
+    await feedBatch(harness, at + 10, opened(at + 10, MARKET_A));
+    await feedBatch(harness, at + 20, opened(at + 20, MARKET_B));
   };
 
   let harness = start();
@@ -2043,7 +2541,7 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
     at += pick(events, [0, 20, 400, 1_000, 1_500, 3_000, 5_000, 6_000]);
     if (events() < 0.03) {
       // A RESTART: the process ends here; a new one starts from the stream.
-      expectInvariant(harness, `seed ${String(seed)} at the restart`);
+      expectInvariant(harness, `seed ${String(seed)} at the restart`, excessNow(harness, true).excess);
       coverage.restarts += 1;
       harness = start();
       expect(harness.gate.metrics()).toMatchObject({ open: 0, applied: 0 });
@@ -2053,8 +2551,8 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
     }
     const drawn = randomEvents(events, at, `cap1-${String(seed)}-${String(step)}`);
     unconfiguredOnly = drawn.unconfiguredOnly;
-    await feed(harness, drawn.events);
-    expectInvariant(harness, `seed ${String(seed)} after step ${String(step)}`);
+    await feedBatch(harness, at, drawn.events);
+    expectInvariant(harness, `seed ${String(seed)} after step ${String(step)}`, excessNow(harness, true).excess);
   }
   for (const order of harness.venue.ordersSnapshot()) {
     if (order.state === "CANCELLED" && compareDecimal(order.filledShares, "0") > 0) coverage.cancelledAfterPartial += 1;
@@ -2062,29 +2560,32 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
   expect(harness.halts.records(), `seed ${String(seed)}: no halt`).toEqual([]);
 }
 
+/** The coverage counters every Tier-0 run must reach (rounds 0 and 1). */
+const TIER_0_PATHS = [
+  "evaluationsChecked",
+  "capChecks",
+  "admissions",
+  "capRefusals",
+  "partialFills",
+  "cancelledAfterPartial",
+  "onFillPlacements",
+  "onOrderUpdatePlacements",
+  "carriedHarvestFills",
+  "ordinaryHarvestFills",
+  "unbookedFillsAtEvaluation",
+  "restarts",
+  "riskEvaluationsChecked",
+  "riskEvaluationsWithUnbooked",
+  "scenarioOutcomesChecked",
+  "worstCaseRefusals",
+  "riskAdmissions",
+  "terminalUnsettledAtEvaluation",
+  "partlyFilledPresented",
+] as const satisfies readonly (keyof Coverage)[];
+
 describe("CAP-1 property — over random fills, partial fills, cancels, onFill and onOrderUpdate placements, carried and ordinary harvests and restarts, the cap check counts every committed pUSD exactly once, at every evaluation; and (r0, r1) risk checks 16 and 17 count exactly the venue's floor at every risk evaluation", () => {
   it("holds for 60 seeds at the PAPER cadence and 30 at the per-frame cadence, and every listed path occurs", async () => {
-    const coverage: Coverage = {
-      evaluationsChecked: 0,
-      capChecks: 0,
-      admissions: 0,
-      capRefusals: 0,
-      partialFills: 0,
-      cancelledAfterPartial: 0,
-      onFillPlacements: 0,
-      onOrderUpdatePlacements: 0,
-      carriedHarvestFills: 0,
-      ordinaryHarvestFills: 0,
-      unbookedFillsAtEvaluation: 0,
-      restarts: 0,
-      riskEvaluationsChecked: 0,
-      riskEvaluationsWithUnbooked: 0,
-      scenarioOutcomesChecked: 0,
-      worstCaseRefusals: 0,
-      riskAdmissions: 0,
-      terminalUnsettledAtEvaluation: 0,
-      partlyFilledPresented: 0,
-    };
+    const coverage = newCoverage();
     // `CAP1-R1-GATE-1`: one MACROTASK turn per seed (CI-2's helper). A run of
     // ~50-70 s that never yields starves the worker's RPC with vitest, which
     // then exits 1 ("Timeout calling onTaskUpdate") with every test passed.
@@ -2097,6 +2598,24 @@ describe("CAP-1 property — over random fills, partial fills, cancels, onFill a
       await yieldToEventLoop();
     }
     // Non-vacuity: every path the packet lists occurred, and the cap bound.
+    for (const path of TIER_0_PATHS) expect(coverage[path], path).toBeGreaterThan(0);
+    // `CAP-1` r2: and in Tier 0 no evaluation ever met a fill the loop had not been handed.
+    expect(coverage.unhandedSameBatchAtEvaluation + coverage.unhandedEarlierBatchAtEvaluation).toBe(0);
+  }, 300_000);
+
+  it("r2 (CAP1-ASTRA-R2-01): holds EXACTLY on a Tier-1 venue whose DELAYED dispositions are applied inside observe() and a cancel's sweep, for 40 seeds at the PAPER cadence and 20 per-frame — a fill on a page the loop already read is at its own price, and only a fill no page or answer has handed the loop is at its limit, by exactly (limit − price) × shares", async () => {
+    const coverage = newCoverage();
+    for (let seed = 2_001; seed <= 2_040; seed += 1) {
+      await propertyRun(seed, PAPER_EVALUATION_CADENCE, 40, coverage, "TIER_1");
+      await yieldToEventLoop();
+    }
+    for (let seed = 3_001; seed <= 3_020; seed += 1) {
+      await propertyRun(seed, PER_FRAME, 40, coverage, "TIER_1");
+      await yieldToEventLoop();
+    }
+    // Non-vacuity: every path occurred on the Tier-1 venue too, including an
+    // evaluation that priced a fill from a page a harvest had read (the fix),
+    // and the stated residual both within a batch and across batches.
     for (const [path, count] of Object.entries(coverage)) expect(count, path).toBeGreaterThan(0);
   }, 300_000);
 });

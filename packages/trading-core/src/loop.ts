@@ -3459,8 +3459,9 @@ export class CoreLoop {
    * cursor again for an order not fully booked, which was a second
    * `fillsSince` in the event that delivers an `onFill` order filled at once,
    * outside SIM-2's one read per harvest. Each fill a venue answer carried is
-   * already SEEN by the commitment (`#noteSeenFills`), at its own price. A
-   * share no answer carried is held at the order's limit, never below its
+   * already SEEN by the commitment (`#noteSeenFills`), at its own price, and
+   * (r2) so is each fill of every page a harvest has read (`#readFills`). A
+   * share that neither carried is held at the order's limit, never below its
    * debit, until it is booked.
    */
   #settleCapital(order: SimulatedOrder): void {
@@ -3512,6 +3513,23 @@ export class CoreLoop {
    * `undefined` after HALTING when the venue refuses the cursor — older than
    * its retained window, so fills this process never read are gone. Nothing
    * is booked or released then.
+   *
+   * `CAP-1` r2 (`CAP1-ASTRA-R2-01`): EVERY fill of a page read here is
+   * recorded as SEEN by its planned order's allocator commitment
+   * (`#noteSeenFills`), at the read and before any harvest filters the page.
+   * This is the ONLY site that reads the cursor, so no page the loop has read
+   * is discarded as evidence:
+   *
+   * - the carried harvest books only its pass's own fills, and the others keep
+   *   their ADR-024 harvest point. Their prices are now kept, so an evaluation
+   *   before that harvest judges each one at its own price, not its order's
+   *   limit;
+   * - the ordinary harvest books every fill it reads. One whose posting is
+   *   REFUSED (`LEDGER_POSTING_REFUSED`), or that a store failure leaves
+   *   unbooked, is judged at its own price too.
+   *
+   * Evidence of PRICE only: nothing is booked, converted, released or
+   * delivered, and the cursor moves exactly where it did. No read is added.
    */
   #readFills(instant: string): { readonly fills: readonly SimulatedFill[]; readonly next: number } | undefined {
     const page = this.#options.venue.fillsSince(this.#knownFills);
@@ -3528,6 +3546,7 @@ export class CoreLoop {
       // earlier harvest flushed before it returned.
       return undefined;
     }
+    this.#noteSeenFills(page.value.fills, undefined);
     return page.value;
   }
 
@@ -4884,8 +4903,9 @@ export class CoreLoop {
    * venue is asked one thing only, O(1): its order's state and filled size
    * (`#orderViewOf`). No fill page is read on this path (SIM-2: one cursor
    * read per harvest); `CAP-1` r1: an unbooked fill is priced from the
-   * placement or trade answer that carried it (`#noteSeenFills`), and at its
-   * order's limit (never less than its debit) only when no answer did. Moves
+   * placement or trade answer that carried it (`#noteSeenFills`), or (r2)
+   * from the fill page a harvest already read (`#readFills`), and at its
+   * order's limit (never less than its debit) only when neither did. Moves
    * nothing.
    */
   #unbookedFillsFor(
@@ -4918,10 +4938,11 @@ export class CoreLoop {
 
   /**
    * `CAP-1` r1: records each of `fills`, which a venue ANSWER carried (a
-   * placement's or a trade's), as SEEN by its planned order's allocator
-   * commitment: evidence of its price, nothing booked, released or moved.
-   * `orders`, when the answer lists them, names each fill's planned order;
-   * otherwise it is looked up by the fill's venue order id, O(1) per fill.
+   * placement's or a trade's) or (r2) a fill page the loop READ
+   * (`#readFills`), as SEEN by its planned order's allocator commitment:
+   * evidence of its price, nothing booked, released or moved. `orders`, when
+   * the answer lists them, names each fill's planned order; otherwise it is
+   * looked up by the fill's venue order id, O(1) per fill.
    */
   #noteSeenFills(
     fills: readonly Pick<SimulatedFill, "simulatedFillId" | "simulatedOrderId" | "marketId" | "side" | "action" | "price" | "shares">[],
