@@ -24,6 +24,11 @@
  * Each text is unambiguous: an order id, a condition id and an asset id never
  * contain `@` (their grammars, `grammar.ts`), so the first `@` always ends the
  * target; a fencing lease id is a UUID, so the last `:` always starts it.
+ *
+ * Each text is at most `grammar.ts` `MAX_CONFIRM_LENGTH` characters, which is
+ * derived from these formats and the grammar's longest operands and account.
+ * So `--confirm` can carry every scope this module generates (WP-330 r2,
+ * CX330-R2-02).
  */
 
 import type { ParsedCommand } from "./grammar.js";

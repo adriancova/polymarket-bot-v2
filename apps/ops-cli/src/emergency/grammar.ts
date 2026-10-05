@@ -60,8 +60,33 @@ function isReference(value: string): boolean {
 export const MAX_REASON_LENGTH = 2000;
 /** A path is bounded so a record can always hold it. */
 export const MAX_PATH_LENGTH = 1024;
-/** The longest `--confirm` value read; a scope is far shorter. */
-export const MAX_CONFIRM_LENGTH = 300;
+
+/** The longest venue order id {@link VENUE_ORDER_ID} admits. */
+export const MAX_VENUE_ORDER_ID_LENGTH = 200;
+/** The longest account or operator reference {@link REFERENCE} admits. */
+export const MAX_REFERENCE_LENGTH = 200;
+/** A condition id's length ({@link CONDITION_ID}: `0x` and 64 hex digits). */
+export const CONDITION_ID_LENGTH = 66;
+/** The longest asset id {@link ASSET_ID} admits: 78 decimal digits (a `0x` id is at most 66). */
+export const MAX_ASSET_ID_LENGTH = 78;
+/** A fencing lease id: a UUID (WP-320 issues UUIDv7 ids into a `uuid` column), 36 characters. */
+export const FENCING_LEASE_ID_LENGTH = 36;
+
+/**
+ * The longest `--confirm` value read: the longest scope text a destructive
+ * command can generate (`confirmation.ts` `scopeText`), from the longest
+ * operands and account the grammar admits. Every scope `--dry-run` prints can
+ * therefore be passed back as `--confirm` (WP-330 r2, CX330-R2-02). r1 added
+ * `@<account>` to the cancel-order and cancel-market scopes, so the old fixed
+ * 300 no longer covered them. The longest is cancel-order's:
+ * 13 + 200 + 1 + 200 = 414 characters.
+ */
+export const MAX_CONFIRM_LENGTH = Math.max(
+  "cancel-order:".length + MAX_VENUE_ORDER_ID_LENGTH + "@".length + MAX_REFERENCE_LENGTH,
+  "cancel-market:".length + CONDITION_ID_LENGTH + ":".length + MAX_ASSET_ID_LENGTH + "@".length + MAX_REFERENCE_LENGTH,
+  "cancel-all:".length + MAX_REFERENCE_LENGTH,
+  "stop-heartbeat:".length + MAX_REFERENCE_LENGTH + ":".length + FENCING_LEASE_ID_LENGTH,
+);
 
 const BARE_YES_FLAGS = ["--yes", "-y", "--force", "--non-interactive", "--assume-yes"];
 

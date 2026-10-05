@@ -6,14 +6,23 @@
 
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { lstat, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { AUDIT_SCHEMA, AuditTrail, AuditUnavailableError, createFileAuditLog, encodeAuditLine, type AuditRecord } from "./audit-log.js";
+import {
+  AUDIT_SCHEMA,
+  AuditTrail,
+  AuditUnavailableError,
+  createFileAuditLog,
+  encodeAuditLine,
+  NODE_AUDIT_FILE_SYSTEM,
+  type AuditFileSystem,
+  type AuditRecord,
+} from "./audit-log.js";
 import { FakeClock, uuidSource } from "./harness.test-support.js";
 
 let scratch: string;
@@ -130,6 +139,111 @@ describe("the file log", () => {
     });
     await expect(unsynced.append(record(0))).rejects.toMatchObject({ code: "SYNC_FAILED" });
   });
+});
+
+/**
+ * The real file system, observed: `events` gets `file:…` and `dir:…` entries,
+ * and `directorySync` (when given) replaces the directory's `fsync`; it is
+ * handed the real one.
+ */
+function observedFileSystem(file: string, events: string[], directorySync?: (real: () => Promise<void>) => Promise<void>): AuditFileSystem {
+  return {
+    async open(target, flags, mode) {
+      const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+      const name = target === file ? "file" : "dir";
+      return {
+        write: async (data) => (events.push(`${name}:write`), handle.write(data)),
+        sync: async () => {
+          events.push(`${name}:sync`);
+          if (name === "dir" && directorySync !== undefined) await directorySync(() => handle.sync());
+          else await handle.sync();
+          events.push(`${name}:synced`);
+        },
+        stat: () => handle.stat(),
+        close: async () => (events.push(`${name}:close`), handle.close()),
+      };
+    },
+  };
+}
+
+const ONE_DURABLE_APPEND = ["file:write", "file:sync", "file:synced", "file:close", "dir:sync", "dir:synced", "dir:close"];
+
+describe("WP-330 r2 (CX330-R2-01): every append makes the directory entry durable itself; an existing file proves nothing", () => {
+  it("every append syncs the file's directory after the file, whether it created the file or found it", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const events: string[] = [];
+    const log = createFileAuditLog(file, observedFileSystem(file, events));
+    await log.append(record(0)); // creates the file
+    await log.append(record(1)); // finds it
+    await createFileAuditLog(file, observedFileSystem(file, events)).append(record(2)); // a later invocation finds it
+    expect(events).toEqual([...ONE_DURABLE_APPEND, ...ONE_DURABLE_APPEND, ...ONE_DURABLE_APPEND]);
+  });
+
+  it("the retry after a failed directory sync: the file now exists, and an append that finds it still refuses (DIRECTORY_SYNC_FAILED) until a directory sync of its own succeeds", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    let failing = true;
+    let succeeded = 0;
+    const fileSystem = observedFileSystem(file, [], async (real) => {
+      if (failing) throw Object.assign(new Error("EIO"), { code: "EIO" });
+      await real();
+      succeeded += 1;
+    });
+    // The creator: its record reached the file, but the directory entry was not made durable.
+    await expect(createFileAuditLog(file, fileSystem).append(record(0))).rejects.toMatchObject({ name: "AuditUnavailableError", code: "DIRECTORY_SYNC_FAILED" });
+    expect((await lstat(file)).isFile()).toBe(true);
+    // A fresh invocation finds the file (EEXIST): it is refused just the same.
+    await expect(createFileAuditLog(file, fileSystem).append(record(0))).rejects.toMatchObject({ code: "DIRECTORY_SYNC_FAILED" });
+    expect(succeeded).toBe(0);
+    // Once the directory can be synced, the append that does it resolves.
+    failing = false;
+    await createFileAuditLog(file, fileSystem).append(record(0));
+    expect(succeeded).toBe(1);
+  });
+
+  it("overlapping creation: while the creator's directory sync is still pending, another append to the file resolves only after a directory sync of its own has succeeded", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    let releaseCreator: (() => void) | undefined;
+    let creatorWaiting: (() => void) | undefined;
+    const creatorBlocked = new Promise<void>((resolve) => (creatorWaiting = resolve));
+    const creatorEvents: string[] = [];
+    const creator = createFileAuditLog(
+      file,
+      observedFileSystem(file, creatorEvents, async (real) => {
+        creatorWaiting?.();
+        await new Promise<void>((resolve) => (releaseCreator = resolve));
+        await real();
+      }),
+    ).append(record(0));
+    await creatorBlocked;
+    const otherEvents: string[] = [];
+    await createFileAuditLog(file, observedFileSystem(file, otherEvents)).append(record(1));
+    // The other append synced the directory itself before it resolved; the creator's sync is still pending.
+    expect(otherEvents).toEqual(ONE_DURABLE_APPEND);
+    expect(creatorEvents).not.toContain("dir:synced");
+    releaseCreator?.();
+    await creator;
+    expect(creatorEvents).toEqual(ONE_DURABLE_APPEND);
+  });
+
+  // Root ignores directory permissions; the injected cases above cover it there.
+  it.skipIf(process.getuid?.() === 0)(
+    "no fault injection: a directory this user may write but not read (0300) refuses every append, the one that finds the file included (DIRECTORY_SYNC_FAILED)",
+    async () => {
+      const directory = path.join(scratch, "write-only");
+      await mkdir(directory, { mode: 0o700 });
+      const file = path.join(directory, "audit.jsonl");
+      await chmod(directory, 0o300);
+      try {
+        // Creating and writing work (write and search permission); opening the directory to sync it does not (EACCES).
+        await expect(createFileAuditLog(file).append(record(0))).rejects.toMatchObject({ code: "DIRECTORY_SYNC_FAILED" });
+        await expect(createFileAuditLog(file).append(record(1))).rejects.toMatchObject({ code: "DIRECTORY_SYNC_FAILED" });
+      } finally {
+        await chmod(directory, 0o700);
+      }
+      // CONTROL: the file was created and written; only the directory sync was impossible.
+      expect((await readFile(file, "utf8")).trimEnd().split("\n")).toHaveLength(2);
+    },
+  );
 });
 
 describe("the bytes", () => {

@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { scopeText } from "./confirmation.js";
 import { EXIT_CODES } from "./exit-codes.js";
 import { parseArguments, type DestructiveCommand } from "./grammar.js";
-import { ACCOUNT, args, CONDITION, DESTRUCTIVE_REASON, fakeLeases, harness, LEASE_ID, order, phases, TOKEN_YES, typedPrompt, type FakeLeases, type Harness } from "./harness.test-support.js";
+import { ACCOUNT, args, CONDITION, DESTRUCTIVE_REASON, fakeLeases, harness, LEASE_ID, OPERATOR, order, phases, TOKEN_YES, typedPrompt, type FakeLeases, type Harness } from "./harness.test-support.js";
 import { runOpsCli } from "./run.js";
 
 let tripwire: NetworkTripwire;
@@ -167,4 +167,64 @@ describe("acceptance 3: a destructive command acts only on a scoped confirmation
     expect(outcome.exitName).toBe("CONFIRMATION_REFUSED");
     expect(leases.revoked).toEqual([]);
   });
+});
+
+describe("WP-330 r2 (CX330-R2-02): the longest scopes, end to end: the --confirm value --dry-run prints is accepted, and the command acts", () => {
+  // The longest operands and account the grammar admits (200, 200 and 78 characters); literals, so this pin owes nothing to grammar.ts's constants.
+  const LONG_ORDER_ID = `0x${"a".repeat(198)}`;
+  const LONG_ACCOUNT = `acct-${"7".repeat(195)}`;
+  const LONG_ASSET = "9".repeat(78);
+
+  interface LongCase {
+    readonly command: DestructiveCommand;
+    readonly operands: readonly string[];
+    readonly scope: string;
+    readonly length: number;
+    /** What acting looks like for this command. */
+    readonly acted: (h: Harness, leases: FakeLeases) => boolean;
+  }
+  const LONG_CASES: readonly LongCase[] = [
+    {
+      command: "cancel-order",
+      operands: [LONG_ORDER_ID],
+      scope: `cancel-order:${LONG_ORDER_ID}@${LONG_ACCOUNT}`,
+      length: 414,
+      acted: (h) => h.venue.callsOf("cancelOrder").length === 1 && h.venue.open().every((entry) => entry.venueOrderId !== LONG_ORDER_ID),
+    },
+    {
+      command: "cancel-market",
+      operands: [CONDITION, "--asset", LONG_ASSET],
+      scope: `cancel-market:${CONDITION}:${LONG_ASSET}@${LONG_ACCOUNT}`,
+      length: 360,
+      acted: (h) => h.venue.callsOf("cancelMarketOrders").length === 1 && h.venue.open().every((entry) => entry.tokenId !== LONG_ASSET),
+    },
+    // CONTROLS: these two already fit under 94a1518's fixed 300.
+    { command: "cancel-all", operands: [], scope: `cancel-all:${LONG_ACCOUNT}`, length: 211, acted: (h) => h.venue.callsOf("cancelAll").length === 1 },
+    { command: "stop-heartbeat", operands: [], scope: `stop-heartbeat:${LONG_ACCOUNT}:${LEASE_ID}`, length: 252, acted: (_h, leases) => leases.revoked.length === 1 },
+  ];
+
+  for (const testCase of LONG_CASES) {
+    it(`${testCase.command}: a ${String(testCase.length)}-character scope, printed by --dry-run and passed back as --confirm, is accepted and acts`, async () => {
+      expect(testCase.scope).toHaveLength(testCase.length);
+      const argv = (...extra: string[]): string[] => [testCase.command, ...testCase.operands, ...DESTRUCTIVE_REASON, "--account", LONG_ACCOUNT, "--operator", OPERATOR, ...extra];
+      const setUpLong = (): { readonly h: Harness; readonly leases: FakeLeases } => {
+        const h = harness();
+        h.venue.add(order(LONG_ORDER_ID), order("o-in-asset", { tokenId: LONG_ASSET }), order("o-other"));
+        return { h, leases: fakeLeases() };
+      };
+
+      const dry = setUpLong();
+      const shown = await runOpsCli(dry.h.deps(argv("--dry-run"), { leases: dry.leases.factory }));
+      expect(shown.exitName).toBe("DRY_RUN");
+      expect(dry.h.text()).toContain(`scope to confirm: ${testCase.scope}`);
+
+      const live = setUpLong();
+      const outcome = await runOpsCli(live.h.deps(argv("--confirm", testCase.scope), { leases: live.leases.factory }));
+      expect(outcome.exitName).toBe("COMPLETED");
+      expect(testCase.acted(live.h, live.leases)).toBe(true);
+      expect(phases(live.h.audit.records)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+      expect(live.h.audit.records[1]?.detail["scope"]).toBe(testCase.scope);
+      expect(live.h.audit.records[1]?.detail["confirmedVia"]).toBe("FLAG");
+    });
+  }
 });

@@ -125,6 +125,10 @@ never waits.
 Every scope text names the account, so a scripted `--confirm` for one account
 is refused under another `--account`.
 
+`--confirm` can carry every scope the CLI prints. The longest is a
+`cancel-order` scope with a 200-character order id and a 200-character
+account: 414 characters, which is exactly the length `--confirm` accepts.
+
 ## Exit codes
 
 | Code | Name | Meaning |
@@ -171,7 +175,9 @@ Every invocation appends JSON Lines records (schema
 `polymarket-bot/ops-cli-audit@1`) to the local log. This includes usage errors
 when a log is named, and refusals. Each record is written in one `write` on an
 `O_APPEND | O_NOFOLLOW` descriptor, `fsync`ed, then closed. A new file is
-created with mode 0600, and its directory is `fsync`ed.
+created with mode 0600. Then the log's directory is `fsync`ed, for every
+record, not only when the file is created: a log file that already exists does
+not prove that its directory entry is durable.
 
 | Record | When |
 | --- | --- |
@@ -194,6 +200,13 @@ the exit alone and `detailOmitted: "RECORD_TOO_LARGE"`.
 
 The log's path must be a regular file. A symlink is refused, not followed
 (`O_NOFOLLOW`). A FIFO is refused at once, not waited on (`O_NONBLOCK`).
+
+The log's directory must be readable as well as writable by the operator,
+because the CLI opens it read-only to `fsync` it. A directory it cannot sync
+refuses every invocation with `AUDIT_UNAVAILABLE` (exit 5) and the code
+`DIRECTORY_SYNC_FAILED`. Mode 0300 (writable, not readable) is such a
+directory. Before the emergency, use a directory owned by the operator with
+mode 0700.
 
 Records hold only allow-listed fields. WP-260's `redactForLog` runs over them,
 and the own-data JSON encoder writes the bytes. `--reason` is free text,

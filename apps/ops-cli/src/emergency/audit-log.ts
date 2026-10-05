@@ -8,7 +8,8 @@
  *
  * Every invocation appends records to a LOCAL, append-only JSON Lines file.
  * Each record is written with ONE `write` on a descriptor opened
- * `O_WRONLY | O_APPEND`, then `fsync`ed, then closed, BEFORE the CLI goes on:
+ * `O_WRONLY | O_APPEND`, then `fsync`ed, then closed, and the file's
+ * directory is `fsync`ed, BEFORE the CLI goes on:
  *
  * - `INVOKED` once WP-260's signer gate has given its verdict (a pure
  *   evaluation of the run-mode flags; the record carries it) and before the
@@ -27,8 +28,16 @@
  * The file is never truncated or rewritten. It is opened with `O_NOFOLLOW`
  * and `O_NONBLOCK` and must be a regular file, so a symlink planted at the
  * path is refused rather than followed, and a FIFO is refused at once rather
- * than waited on (WP-330 r1, WP330-V1-02). A newly created file's directory is
- * `fsync`ed too, so the file's existence is as durable as its contents.
+ * than waited on (WP-330 r1, WP330-V1-02).
+ *
+ * EVERY append also `fsync`s the file's directory, so the file's existence is
+ * as durable as its contents (WP-330 r2, CX330-R2-01). A record is durable
+ * only once BOTH syncs have succeeded IN THIS APPEND. An existing file proves
+ * nothing about its directory entry: its creator's directory sync may have
+ * failed, or may still be pending in another invocation. A directory that
+ * cannot be opened read-only and synced (for example mode 0300: writable, not
+ * readable) therefore refuses every record (`DIRECTORY_SYNC_FAILED`), not only
+ * the first.
  *
  * ## The database mirror is best effort, and never on the cancel path
  *
@@ -104,7 +113,7 @@ export interface AuditMirror {
 export class AuditUnavailableError extends Error {
   override readonly name = "AuditUnavailableError";
   constructor(
-    readonly code: "OPEN_FAILED" | "NOT_A_REGULAR_FILE" | "WRITE_FAILED" | "SHORT_WRITE" | "SYNC_FAILED" | "ENCODE_FAILED" | "RECORD_TOO_LARGE",
+    readonly code: "OPEN_FAILED" | "NOT_A_REGULAR_FILE" | "WRITE_FAILED" | "SHORT_WRITE" | "SYNC_FAILED" | "DIRECTORY_SYNC_FAILED" | "ENCODE_FAILED" | "RECORD_TOO_LARGE",
     readonly location: string,
   ) {
     super(`the audit log ${location} could not record the invocation (${code})`);
@@ -184,9 +193,10 @@ function errorCode(error: unknown): string | undefined {
 
 /**
  * An append-only JSON Lines audit file. One `append` = open (`O_APPEND`,
- * `O_NOFOLLOW`, `O_NONBLOCK`; created `0600` when absent), check it is a regular file, one
- * write of the whole line, `fsync`, close; and, when the file was just
- * created, `fsync` of its directory.
+ * `O_NOFOLLOW`, `O_NONBLOCK`; created `0600` when absent), check it is a
+ * regular file, one write of the whole line, `fsync`, close; then, ALWAYS,
+ * `fsync` of its directory (CX330-R2-01: whether this append created the file
+ * or found it). `append` resolves only after both syncs.
  */
 export function createFileAuditLog(path: string, fileSystem: AuditFileSystem = NODE_AUDIT_FILE_SYSTEM): AuditSink {
   return Object.freeze({
@@ -202,10 +212,8 @@ export function createFileAuditLog(path: string, fileSystem: AuditFileSystem = N
       if (bytes.length > MAX_AUDIT_LINE_BYTES) throw new AuditUnavailableError("RECORD_TOO_LARGE", path);
 
       let handle: AuditFileHandle;
-      let created = false;
       try {
         handle = await fileSystem.open(path, CREATE_FLAGS, FILE_MODE);
-        created = true;
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw new AuditUnavailableError("OPEN_FAILED", path);
         try {
@@ -237,17 +245,17 @@ export function createFileAuditLog(path: string, fileSystem: AuditFileSystem = N
       } finally {
         await handle.close().catch(() => undefined);
       }
-      if (created) {
-        // The new file's directory entry is made durable too.
-        let directory: AuditFileHandle | undefined;
-        try {
-          directory = await fileSystem.open(dirname(path), DIRECTORY_FLAGS, 0);
-          await directory.sync();
-        } catch {
-          throw new AuditUnavailableError("SYNC_FAILED", path);
-        } finally {
-          await directory?.close().catch(() => undefined);
-        }
+      // The directory entry is made durable by THIS append, every time (CX330-R2-01).
+      // EEXIST says only that the file exists: its creator's directory sync may have
+      // failed, or may still be pending in another invocation.
+      let directory: AuditFileHandle | undefined;
+      try {
+        directory = await fileSystem.open(dirname(path), DIRECTORY_FLAGS, 0);
+        await directory.sync();
+      } catch {
+        throw new AuditUnavailableError("DIRECTORY_SYNC_FAILED", path);
+      } finally {
+        await directory?.close().catch(() => undefined);
       }
     },
   });

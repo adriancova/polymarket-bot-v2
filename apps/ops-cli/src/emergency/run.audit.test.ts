@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -231,7 +231,8 @@ describe("acceptance 2: the real file log, end to end", () => {
     expect(outcome.exitName).toBe("COMPLETED");
     const lines = (await readFile(file, "utf8")).trimEnd().split("\n");
     expect(lines.map((line) => (JSON.parse(line) as AuditRecord).phase)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
-    // write, sync, close for each record; the new file's directory synced once; the cancel after the ACTING sync.
+    // write, sync, close for each record, then its directory synced (every record: WP-330 r2, CX330-R2-01);
+    // the cancel only after the ACTING record's directory sync.
     expect(events).toEqual([
       "file:write",
       "file:sync",
@@ -241,10 +242,14 @@ describe("acceptance 2: the real file log, end to end", () => {
       "file:write",
       "file:sync",
       "file:close",
+      "dir:sync",
+      "dir:close",
       "venue:cancelAll",
       "file:write",
       "file:sync",
       "file:close",
+      "dir:sync",
+      "dir:close",
     ]);
   });
 
@@ -372,6 +377,140 @@ describe("WP330-V1-02: a FIFO at the audit-log path is refused at once, never wa
       await run.catch(() => undefined);
     }
   });
+});
+
+describe("WP-330 r2 (CX330-R2-01): no invocation acts before the log's directory entry is durable, whoever created the file", () => {
+  const cancelAll = (file: string): string[] => args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`, "--audit-log", file);
+  const eio = (): Error => Object.assign(new Error("EIO"), { code: "EIO" });
+
+  /** The real file system, observed; the directory's `fsync` goes through `directorySync`, which is handed the real one. */
+  function observedFileSystem(file: string, events: string[], directorySync: (real: () => Promise<void>) => Promise<void> = (real) => real()): AuditFileSystem {
+    return {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        const name = target === file ? "file" : "dir";
+        return {
+          write: (data) => handle.write(data),
+          sync: async () => {
+            await (name === "dir" ? directorySync(() => handle.sync()) : handle.sync());
+            events.push(`${name}:synced`);
+          },
+          stat: () => handle.stat(),
+          close: () => handle.close(),
+        };
+      },
+    };
+  }
+
+  /** The directory syncs that SUCCEEDED before the venue's first cancel-all. */
+  function directorySyncsBeforeCancel(events: readonly string[]): number {
+    const cancelAt = events.indexOf("venue:cancelAll");
+    expect(cancelAt).toBeGreaterThan(-1);
+    return events.slice(0, cancelAt).filter((event) => event === "dir:synced").length;
+  }
+
+  it("the retry, the directory sync still failing: the invocation that finds the file refuses too (AUDIT_UNAVAILABLE), and nothing is touched", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const failing = observedFileSystem(file, [], () => Promise.reject(eio()));
+    for (const attempt of ["creates the file", "finds the file"]) {
+      const h = harness();
+      h.venue.add(order("o-1"));
+      const outcome = await runOpsCli(h.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, failing) }));
+      expect(outcome.exitName, attempt).toBe("AUDIT_UNAVAILABLE");
+      expect(outcome.exitCode).toBe(EXIT_CODES.AUDIT_UNAVAILABLE);
+      expect(h.text()).toContain(`the audit log ${file} could not record this invocation (DIRECTORY_SYNC_FAILED). Nothing was done`);
+      expect(h.touched, attempt).toEqual([]);
+      expect(h.venue.calls, attempt).toEqual([]);
+      expect(h.venue.open()).toHaveLength(1);
+    }
+  });
+
+  it("the retry after ONE failed directory sync: the next invocation cancels only after its own INVOKED and ACTING records' directory syncs have succeeded", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const events: string[] = [];
+    let failures = 1;
+    const fileSystem = observedFileSystem(file, events, async (real) => {
+      if (failures > 0) {
+        failures -= 1;
+        throw eio();
+      }
+      await real();
+    });
+    const first = harness();
+    first.venue.add(order("o-1"));
+    expect((await runOpsCli(first.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, fileSystem) }))).exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(first.venue.calls).toEqual([]);
+
+    const second = harness();
+    second.venue.add(order("o-1"));
+    second.venue.beforeCall = (method) => {
+      if (method === "cancelAll") events.push("venue:cancelAll");
+    };
+    const outcome = await runOpsCli(second.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, fileSystem) }));
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(directorySyncsBeforeCancel(events)).toBe(2);
+  });
+
+  it("overlapping creation: while the creator's directory sync is still pending, a second invocation on the same log cancels only after directory syncs of its own", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    let signalBlocked: (() => void) | undefined;
+    const creatorBlocked = new Promise<void>((resolve) => (signalBlocked = resolve));
+    let releaseCreator: (() => void) | undefined;
+    const creatorReleased = new Promise<void>((resolve) => (releaseCreator = resolve));
+    const creatorEvents: string[] = [];
+    let creatorDirectorySyncs = 0;
+    const creatorFileSystem = observedFileSystem(file, creatorEvents, async (real) => {
+      creatorDirectorySyncs += 1;
+      if (creatorDirectorySyncs === 1) {
+        signalBlocked?.();
+        await creatorReleased;
+      }
+      await real();
+    });
+    const creatorHarness = harness();
+    creatorHarness.venue.add(order("o-1"));
+    const creatorRun = runOpsCli(creatorHarness.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, creatorFileSystem) }));
+    await creatorBlocked; // its INVOKED line is in the file; its directory sync has not finished
+
+    const events: string[] = [];
+    const second = harness();
+    second.venue.add(order("o-2"));
+    second.venue.beforeCall = (method) => {
+      if (method === "cancelAll") events.push("venue:cancelAll");
+    };
+    const outcome = await runOpsCli(second.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, observedFileSystem(file, events)) }));
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(directorySyncsBeforeCancel(events)).toBe(2);
+    expect(creatorEvents).not.toContain("dir:synced");
+
+    releaseCreator?.();
+    expect((await creatorRun).exitName).toBe("COMPLETED");
+    expect(creatorEvents).toContain("dir:synced");
+  });
+
+  // Root ignores directory permissions; the injected cases above cover it there.
+  it.skipIf(process.getuid?.() === 0)(
+    "no fault injection: a log directory this user may write but not read (0300): the first invocation AND the identical second one refuse (AUDIT_UNAVAILABLE); nothing is canceled",
+    async () => {
+      const directory = path.join(scratch, "write-only");
+      await mkdir(directory, { mode: 0o700 });
+      const file = path.join(directory, "audit.jsonl");
+      await chmod(directory, 0o300);
+      try {
+        for (const attempt of ["creates the file", "finds the file"]) {
+          const h = harness();
+          h.venue.add(order("o-1"));
+          const outcome = await runOpsCli(h.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target) }));
+          expect(outcome.exitName, attempt).toBe("AUDIT_UNAVAILABLE");
+          expect(h.text()).toContain("(DIRECTORY_SYNC_FAILED). Nothing was done");
+          expect(h.venue.calls, attempt).toEqual([]);
+          expect(h.venue.open()).toHaveLength(1);
+        }
+      } finally {
+        await chmod(directory, 0o700);
+      }
+    },
+  );
 });
 
 describe("CX330-R1-03 and WP330-V1-05: operator text that may be a pasted secret reaches no output, log, mirror or lease", () => {

@@ -6,7 +6,25 @@
 import { describe, expect, it } from "vitest";
 
 import { scopeText } from "./confirmation.js";
-import { COMMANDS, DESTRUCTIVE_COMMANDS, echoToken, parseArguments, READ_ONLY_COMMANDS, type ParsedCommand } from "./grammar.js";
+import {
+  ASSET_ID,
+  COMMANDS,
+  CONDITION_ID,
+  CONDITION_ID_LENGTH,
+  DESTRUCTIVE_COMMANDS,
+  echoToken,
+  FENCING_LEASE_ID_LENGTH,
+  MAX_ASSET_ID_LENGTH,
+  MAX_CONFIRM_LENGTH,
+  MAX_REFERENCE_LENGTH,
+  MAX_VENUE_ORDER_ID_LENGTH,
+  parseArguments,
+  READ_ONLY_COMMANDS,
+  REFERENCE,
+  VENUE_ORDER_ID,
+  type DestructiveCommand,
+  type ParsedCommand,
+} from "./grammar.js";
 
 const CONDITION = `0x${"a".repeat(64)}`;
 const BASE = ["--account", "acct-1", "--operator", "op-1"];
@@ -158,5 +176,46 @@ describe("usage errors (nothing is done)", () => {
   it("a usage error still carries the audit path, operator and account it could read, so it is audited", () => {
     const result = parseArguments(["cancel-all", ...BASE, "--yes", "--audit-log", "/tmp/a.jsonl"]);
     expect(result).toMatchObject({ kind: "USAGE_ERROR", command: "cancel-all", auditLogPath: "/tmp/a.jsonl", operator: "op-1", accountRef: "acct-1" });
+  });
+});
+
+describe("WP-330 r2 (CX330-R2-02): every scope the CLI can generate can be passed back as --confirm", () => {
+  const LONGEST_ORDER_ID = `0x${"a".repeat(MAX_VENUE_ORDER_ID_LENGTH - 2)}`;
+  const LONGEST_ACCOUNT = `acct-${"7".repeat(MAX_REFERENCE_LENGTH - 5)}`;
+  const LONGEST_ASSET = "9".repeat(MAX_ASSET_ID_LENGTH);
+  const A_LEASE_ID = "01a10bef-6200-7000-8000-00000000abcd";
+
+  it("the lengths the limit is derived from are the grammar's own: each pattern admits exactly its bound", () => {
+    expect(VENUE_ORDER_ID.test("A".repeat(MAX_VENUE_ORDER_ID_LENGTH))).toBe(true);
+    expect(VENUE_ORDER_ID.test("A".repeat(MAX_VENUE_ORDER_ID_LENGTH + 1))).toBe(false);
+    expect(REFERENCE.test("a".repeat(MAX_REFERENCE_LENGTH))).toBe(true);
+    expect(REFERENCE.test("a".repeat(MAX_REFERENCE_LENGTH + 1))).toBe(false);
+    expect(CONDITION_ID.test(`0x${"c".repeat(CONDITION_ID_LENGTH - 2)}`)).toBe(true);
+    expect(ASSET_ID.test("9".repeat(MAX_ASSET_ID_LENGTH))).toBe(true);
+    expect(ASSET_ID.test("9".repeat(MAX_ASSET_ID_LENGTH + 1))).toBe(false);
+    expect(ASSET_ID.test(`0x${"f".repeat(64)}`)).toBe(true);
+    expect(`0x${"f".repeat(64)}`.length).toBeLessThanOrEqual(MAX_ASSET_ID_LENGTH);
+    expect(ASSET_ID.test(`0x${"f".repeat(65)}`)).toBe(false);
+    expect(A_LEASE_ID).toHaveLength(FENCING_LEASE_ID_LENGTH);
+  });
+
+  it("the longest scope of each destructive command, from the longest arguments the grammar accepts, parses as --confirm; the longest is exactly the limit, and one character more is refused", () => {
+    const longest: Readonly<Record<DestructiveCommand, readonly string[]>> = {
+      "cancel-order": [LONGEST_ORDER_ID],
+      "cancel-market": [`0x${"c".repeat(64)}`, "--asset", LONGEST_ASSET],
+      "cancel-all": [],
+      "stop-heartbeat": [],
+    };
+    const lengths: number[] = [];
+    for (const command of DESTRUCTIVE_COMMANDS) {
+      const argv = [command, ...longest[command], "--account", LONGEST_ACCOUNT, "--operator", "op-1", "--reason", "r"];
+      const scope = scopeText(parsed(argv), command === "stop-heartbeat" ? A_LEASE_ID : null);
+      lengths.push(scope.length);
+      expect(parsed([...argv, "--confirm", scope]).confirm, command).toBe(scope);
+    }
+    // cancel-order 414, cancel-market (with an asset) 360, cancel-all 211, stop-heartbeat 252.
+    expect(lengths).toEqual([414, 360, 211, 252]);
+    expect(MAX_CONFIRM_LENGTH).toBe(Math.max(...lengths));
+    expect(problem(["cancel-all", ...BASE, "--reason", "r", "--confirm", "x".repeat(MAX_CONFIRM_LENGTH + 1)])).toBe("--confirm must be the scope text, as --dry-run prints it");
   });
 });

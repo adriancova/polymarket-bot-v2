@@ -11,6 +11,18 @@
  * 2. The worst case, by construction: any number of attempts, ids and entries,
  *    each field as hostile as its type allows (over-long, every character
  *    JSON must escape, non-ASCII), under the longest header the grammar admits.
+ *
+ * TIME (WP-330 r2, OP-R2-G1). Both tests are CPU-bound. At 94a1518 the worst
+ * case took about 2 s alone, almost all of it encoding a 41.9 MB NON-VACUOUS
+ * control (two attempts' full id lists). Under the concurrent verification
+ * gates that went past vitest's 5,000 ms default (the file took 7,468 ms).
+ * The worst case now reuses its large strings and encodes a control of one
+ * attempt's ids: about 1.2 MB, over four times the bound. A ceiling assertion
+ * pins that size, and the worst case takes about 55 ms alone.
+ * {@link HEAVY_TEST_TIMEOUT_MS} is the per-test timeout for both. It is set far
+ * above any load seen, so only a real regression can reach it, such as an
+ * unbounded builder or a control grown back to megabytes, and the ceiling
+ * assertion catches the latter first.
  */
 
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -41,6 +53,15 @@ afterEach(async () => {
 });
 
 const bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+
+/**
+ * The per-test timeout of this file's two heavy tests (OP-R2-G1). Measured
+ * alone on 2026-10-05 (three runs each): the 3,000-order sweep took 71-83 ms
+ * and the worst case 52-55 ms (94a1518's worst case took 2,180 ms). In
+ * full-suite runs this file took 2-3.5 times its time alone. 30 s is over
+ * 300 times either measurement, so neither load nor concurrent gates reach it.
+ */
+const HEAVY_TEST_TIMEOUT_MS = 30_000;
 
 describe("WP330-V1-01: a large cancel-all keeps its OUTCOME record (the real file sink)", () => {
   it("a sweep of 3,000 orders with 66-character ids: INVOKED, ACTING and OUTCOME are all in the file, each line within MAX_AUDIT_LINE_BYTES, with the full detail", async () => {
@@ -77,7 +98,7 @@ describe("WP330-V1-01: a large cancel-all keeps its OUTCOME record (the real fil
     });
     expect((detail["attempts"] as { itemized: unknown[] }).itemized).toHaveLength(MAX_AUDITED_ATTEMPTS);
     expect((detail["canceled"] as { ids: string[] }).ids).toEqual(ids.slice(0, MAX_AUDITED_IDS));
-  });
+  }, HEAVY_TEST_TIMEOUT_MS);
 });
 
 describe("WP330-V1-01: the worst case, by construction", () => {
@@ -99,18 +120,21 @@ describe("WP330-V1-01: the worst case, by construction", () => {
   });
 
   it("a cancel OUTCOME from 5,000 attempts of 1,000 hostile ids each, under the longest header, is one line within MAX_AUDIT_LINE_BYTES", () => {
-    // Shared arrays (the content, not the identity, is what is measured): 5,000 attempts of their own would be gigabytes.
+    // Shared arrays and strings (the content, not the identity, is what is measured): 5,000 attempts of their own
+    // would be gigabytes, and building a 10,000-character string per attempt only spends time (OP-R2-G1).
     const hostileIds = Array.from({ length: 1_000 }, (_, entry) => hostile(400, `i${String(entry)}`));
-    const hostileEntries = hostileIds.map((orderId) => ({ orderId, reason: hostile(10_000, "r") }));
+    const longReason = hostile(10_000, "r");
+    const hostileEntries = hostileIds.map((orderId) => ({ orderId, reason: longReason }));
     const effects = Array.from({ length: 100 }, (_, index) => ({ kind: hostile(500, `e${String(index)}`) }) as unknown as BudgetEffect);
     const completed: CancelOutcome = { kind: "COMPLETED", canceled: hostileIds, notCanceled: hostileEntries };
     const unknown = { kind: "UNKNOWN", error: { kind: hostile(10_000, "k") } } as unknown as CancelOutcome;
+    const notSent = hostile(10_000, "s");
     const attempts: CancelAttempt[] = Array.from({ length: 5_000 }, (_, index) => ({
       endpoint: "DELETE /orders",
       operationId: "clob.cancel_orders",
       requested: hostileIds,
       sent: true,
-      notSent: hostile(10_000, "s"),
+      notSent,
       waitedMs: Number.MAX_SAFE_INTEGER,
       outcome: index % 2 === 0 ? completed : unknown,
       canceledCount: Number.MAX_SAFE_INTEGER,
@@ -145,9 +169,13 @@ describe("WP330-V1-01: the worst case, by construction", () => {
     };
     const line = encodeAuditLine(record);
     expect(bytes(line)).toBeLessThanOrEqual(MAX_AUDIT_LINE_BYTES);
-    // NON-VACUOUS: the same inputs, unbounded (fb9edcc's shape: every attempt's ids), are far over the bound.
-    const fb9edccShape = attempts.slice(0, 2).map((attempt) => ({ requested: attempt.requested, outcome: attempt.outcome })) as unknown as AuditValue;
+    // NON-VACUOUS: the same inputs, unbounded (fb9edcc's shape: every attempt's ids), are over the bound. One attempt's
+    // requested ids alone, unbounded, already exceed it more than twice over, so the control encodes no more than that.
+    const fb9edccShape = attempts.slice(0, 1).map((attempt) => ({ requested: attempt.requested })) as unknown as AuditValue;
     const unbounded = encodeAuditLine({ ...record, detail: { attempts: fb9edccShape } });
-    expect(bytes(unbounded)).toBeGreaterThan(MAX_AUDIT_LINE_BYTES);
-  });
+    expect(bytes(unbounded)).toBeGreaterThan(2 * MAX_AUDIT_LINE_BYTES);
+    // OP-R2-G1: the control only has to exceed the bound. A control of megabytes (94a1518's was 41.9 MB, about 2 s
+    // to encode) would put this test back near vitest's default timeout under load.
+    expect(bytes(unbounded)).toBeLessThan(8 * MAX_AUDIT_LINE_BYTES);
+  }, HEAVY_TEST_TIMEOUT_MS);
 });
