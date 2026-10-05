@@ -140,3 +140,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-04 | [CAP-1.md](CAP-1.md) | `CAP-1`: a filled order's capital never vanishes from the cap check or the loss limits | Round | Complete (2026-10-04) | `b72acc7` | 5 KB |
 | 2026-10-04 | [GOV-NOTES-2.md](GOV-NOTES-2.md) | `GOV-NOTES-2`: the remaining stale wal-format and Prometheus README passages | Round | Complete (2026-10-04) | `2776a8c` | 2 KB |
 | 2026-10-04 | [WP-290.md](WP-290.md) | `WP-290`: account reconciliation | WP | Complete (2026-10-04) | `7a53988` | 6 KB |
+| 2026-10-05 | [CI-5.md](CI-5.md) | `CI-5`: the OMS and reconciliation fault suites and the control-api PostgreSQL suite in CI | Round | Complete (2026-10-05) | `31b668d` | 2 KB |
