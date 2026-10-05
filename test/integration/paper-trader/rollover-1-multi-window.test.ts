@@ -134,6 +134,14 @@ describe("ROLLOVER-1: one PAPER run trades a series across its windows", () => {
     const envelopes = await stream();
     const first = await trade(envelopes);
     const second = await trade(envelopes);
+    // The replay reproduces the run itself — not merely an empty one twice.
+    expect(first.notices.map(noticeLine)).toEqual([
+      `ADMITTED ${W1.marketId}`,
+      `ADMITTED ${W2.marketId}`,
+      `TORN_DOWN ${W1.marketId} RESOLVED`,
+      `ADMITTED ${W3.marketId}`,
+    ]);
+    expect(first.run.parts.store.decisions.length).toBeGreaterThan(0);
     expect(second.notices.map(noticeLine)).toEqual(first.notices.map(noticeLine));
     expect(second.run.parts.store.admittedMarkets).toEqual(first.run.parts.store.admittedMarkets);
     expect(second.run.parts.store.decisions).toEqual(first.run.parts.store.decisions);
@@ -173,6 +181,9 @@ describe("ROLLOVER-1: one PAPER run trades a series across its windows", () => {
     for (const event of ingestedOf(await stream())) run.trader.loop.ingest(event);
     await run.trader.loop.drain();
     expect(notices[0]).toMatchObject({ kind: "REFUSED", code: "STORE_UNAVAILABLE", marketId: W1.marketId });
+    // No window is EVER attached without its row: every notice is that refusal.
+    expect(notices.every((notice) => notice.kind === "REFUSED" && notice.code === "STORE_UNAVAILABLE")).toBe(true);
+    expect(run.trader.loop.admissionMetrics()?.admitted).toBe(0);
     expect(run.trader.loop.health().halts.map((halt) => halt.code)).toContain("STORE_UNAVAILABLE");
     expect(run.trader.markets.has(W1.marketId)).toBe(false);
     expect(run.parts.store.decisions.some((entry) => entry.record.marketId === W1.marketId)).toBe(false);
