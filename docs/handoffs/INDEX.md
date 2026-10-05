@@ -139,3 +139,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-04 | [VENUE-SETL-1.md](VENUE-SETL-1.md) | `VENUE-SETL-1`: series-admission venue facts and the btc-15m-updown settlement-spec prep | Round | Complete (2026-10-04) | `c373e25` | 4 KB |
 | 2026-10-04 | [CAP-1.md](CAP-1.md) | `CAP-1`: a filled order's capital never vanishes from the cap check or the loss limits | Round | Complete (2026-10-04) | `b72acc7` | 5 KB |
 | 2026-10-04 | [GOV-NOTES-2.md](GOV-NOTES-2.md) | `GOV-NOTES-2`: the remaining stale wal-format and Prometheus README passages | Round | Complete (2026-10-04) | `2776a8c` | 2 KB |
+| 2026-10-04 | [WP-290.md](WP-290.md) | `WP-290`: account reconciliation | WP | Complete (2026-10-04) | `7a53988` | 6 KB |
