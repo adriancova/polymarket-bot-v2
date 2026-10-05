@@ -15,13 +15,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   AUDIT_SCHEMA,
+  auditFailureCode,
   AuditTrail,
   AuditUnavailableError,
   createFileAuditLog,
   encodeAuditLine,
+  lineMayBeInLog,
   NODE_AUDIT_FILE_SYSTEM,
   type AuditFileSystem,
   type AuditRecord,
+  type AuditSink,
 } from "./audit-log.js";
 import { FakeClock, uuidSource } from "./harness.test-support.js";
 
@@ -284,21 +287,18 @@ describe("the bytes", () => {
   });
 });
 
+function memoryTrail(sink: AuditSink): AuditTrail {
+  return new AuditTrail(
+    { sink, mirror: null, clock: new FakeClock(), newId: uuidSource(), invocationId: "inv" },
+    { command: "cancel-all", operator: "op", accountRef: "acct", reason: "r" },
+  );
+}
+
 describe("the trail", () => {
-  it("numbers records in order and stops on the first failure (the failed record is not counted)", async () => {
-    const clock = new FakeClock();
+  it("numbers records in order; a failed record is not counted as durable, and a failed WRITE (its line may be in the log) spends its number (WP-330 r3, WP330-V3-01)", async () => {
     const records: AuditRecord[] = [];
     let fail = false;
-    const trail = new AuditTrail(
-      {
-        sink: { location: "memory", append: (entry) => (fail ? Promise.reject(new AuditUnavailableError("WRITE_FAILED", "memory")) : (records.push(entry), Promise.resolve())) },
-        mirror: null,
-        clock,
-        newId: uuidSource(),
-        invocationId: "inv",
-      },
-      { command: "cancel-all", operator: "op", accountRef: "acct", reason: "r" },
-    );
+    const trail = memoryTrail({ location: "memory", append: (entry) => (fail ? Promise.reject(new AuditUnavailableError("WRITE_FAILED", "memory")) : (records.push(entry), Promise.resolve())) });
     await trail.write("INVOKED", {});
     fail = true;
     await expect(trail.write("ACTING", {})).rejects.toBeInstanceOf(AuditUnavailableError);
@@ -306,8 +306,93 @@ describe("the trail", () => {
     await trail.write("OUTCOME", {});
     expect(records.map((entry) => [entry.phase, entry.sequence])).toEqual([
       ["INVOKED", 0],
-      ["OUTCOME", 1],
+      ["OUTCOME", 2],
     ]);
     expect(trail.records()).toHaveLength(2);
+    expect(trail.notDurable()).toEqual([{ phase: "ACTING", sequence: 1, code: "WRITE_FAILED" }]);
+  });
+});
+
+describe("WP-330 r3 (WP330-V3-01): an append that failed after its write may leave its line; its number is never reused, and the trail names it", () => {
+  it("the refusal says whether its line may be in the log: never before any byte is written; always at or after the write; and a failure that is not the sink's own refusal may have", () => {
+    const before = ["ENCODE_FAILED", "RECORD_TOO_LARGE", "OPEN_FAILED", "NOT_A_REGULAR_FILE"] as const;
+    const atOrAfter = ["WRITE_FAILED", "SHORT_WRITE", "SYNC_FAILED", "DIRECTORY_SYNC_FAILED"] as const;
+    for (const code of before) expect(lineMayBeInLog(new AuditUnavailableError(code, "x")), code).toBe(false);
+    for (const code of atOrAfter) expect(lineMayBeInLog(new AuditUnavailableError(code, "x")), code).toBe(true);
+    expect(lineMayBeInLog(new Error("EIO"))).toBe(true);
+    expect(auditFailureCode(new Error("EIO"))).toBe("WRITE_FAILED");
+    expect(auditFailureCode(new AuditUnavailableError("DIRECTORY_SYNC_FAILED", "x"))).toBe("DIRECTORY_SYNC_FAILED");
+  });
+
+  it("the real file sink, the SECOND append's directory sync failing: its line stays in the file, and the next record takes the NEXT number, never a duplicate", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    let directorySyncs = 0;
+    const trail = memoryTrail(
+      createFileAuditLog(
+        file,
+        observedFileSystem(file, [], async (real) => {
+          directorySyncs += 1;
+          if (directorySyncs === 2) throw Object.assign(new Error("EIO"), { code: "EIO" });
+          await real();
+        }),
+      ),
+    );
+    await trail.write("INVOKED", {});
+    await expect(trail.write("ACTING", {})).rejects.toMatchObject({ code: "DIRECTORY_SYNC_FAILED", lineMayBeInLog: true });
+    await trail.write("OUTCOME", {});
+    const lines = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line) as AuditRecord);
+    expect(lines.map((entry) => [entry.phase, entry.sequence])).toEqual([
+      ["INVOKED", 0],
+      ["ACTING", 1],
+      ["OUTCOME", 2],
+    ]);
+    expect(new Set(lines.map((entry) => entry.sequence)).size).toBe(lines.length);
+    expect(trail.records().map((entry) => [entry.phase, entry.sequence])).toEqual([
+      ["INVOKED", 0],
+      ["OUTCOME", 2],
+    ]);
+    expect(trail.notDurable()).toEqual([{ phase: "ACTING", sequence: 1, code: "DIRECTORY_SYNC_FAILED" }]);
+  });
+
+  it("the file's own fsync failing (SYNC_FAILED) spends the number too", async () => {
+    let syncs = 0;
+    const trail = memoryTrail(
+      createFileAuditLog("/x/a.jsonl", {
+        open: () =>
+          Promise.resolve({
+            write: (data: Uint8Array) => Promise.resolve({ bytesWritten: data.length }),
+            sync: () => ((syncs += 1), syncs === 1 ? Promise.reject(new Error("EIO")) : Promise.resolve()),
+            stat: () => Promise.resolve({ isFile: () => true, isDirectory: () => true }),
+            close: () => Promise.resolve(),
+          }),
+      }),
+    );
+    await expect(trail.write("INVOKED", {})).rejects.toMatchObject({ code: "SYNC_FAILED" });
+    expect((await trail.write("OUTCOME", {})).sequence).toBe(1);
+    expect(trail.notDurable()).toEqual([{ phase: "INVOKED", sequence: 0, code: "SYNC_FAILED" }]);
+  });
+
+  it("a refusal before any byte is written (too large, not opened) spends NO number: the record written next keeps it", async () => {
+    for (const code of ["RECORD_TOO_LARGE", "OPEN_FAILED"] as const) {
+      const records: AuditRecord[] = [];
+      let refuse = false;
+      const trail = memoryTrail({
+        location: "memory",
+        append: (entry) => {
+          if (refuse) {
+            refuse = false;
+            return Promise.reject(new AuditUnavailableError(code, "memory"));
+          }
+          records.push(entry);
+          return Promise.resolve();
+        },
+      });
+      await trail.write("INVOKED", {});
+      refuse = true;
+      await expect(trail.write("OUTCOME", {})).rejects.toMatchObject({ code, lineMayBeInLog: false });
+      await trail.write("OUTCOME", {});
+      expect(records.map((entry) => entry.sequence), code).toEqual([0, 1]);
+      expect(trail.notDurable(), code).toEqual([]);
+    }
   });
 });

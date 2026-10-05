@@ -157,7 +157,7 @@ describe("acceptance 2: every invocation is audited, durably, before it acts", (
     expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
     expect(h.venue.callsOf("cancelAll")).toEqual([]);
     expect(h.venue.open()).toHaveLength(1);
-    expect(h.text()).toContain("the ACTING record could not be written");
+    expect(h.text()).toContain("the ACTING record could not be made durable (WRITE_FAILED), so nothing was sent");
   });
 
   it("the ACTING record cannot be written: stop-heartbeat revokes nothing", async () => {
@@ -287,7 +287,7 @@ describe("WP330-V1-01: an OUTCOME that cannot be written never lets the command'
     expect(h.venue.callsOf("cancelAll")).toHaveLength(1);
     expect(h.venue.open()).toEqual([]);
     expect(phases(h.audit.records)).toEqual(["INVOKED", "ACTING"]);
-    expect(h.text()).toContain("the OUTCOME record could NOT be written to memory://ops-cli-audit (WRITE_FAILED). The command MAY ALREADY HAVE ACTED");
+    expect(h.text()).toContain("the OUTCOME record could NOT be made durable in memory://ops-cli-audit (WRITE_FAILED). The command MAY ALREADY HAVE ACTED");
     expect(h.text()).toContain("OUTCOME_UNRECORDED (exit 18): the command's own outcome, COMPLETED (exit 0), is NOT in the audit log");
     // Not the pre-action wording.
     expect(h.text()).not.toMatch(/Nothing was done|nothing was sent/u);
@@ -320,6 +320,14 @@ describe("WP330-V1-01: an OUTCOME that cannot be written never lets the command'
     expect(outcome.exitCode).toBe(EXIT_CODES.OUTCOME_UNRECORDED);
     expect(h.venue.open()).toEqual([]);
     expect(h.text()).toContain("(SYNC_FAILED). The command MAY ALREADY HAVE ACTED");
+    // WP-330 r3 (WP330-V3-01): the OUTCOME line did reach the file; the output names it as not durable.
+    const lines = (await readFile(file, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line) as AuditRecord);
+    expect(lines.map((record) => [record.phase, record.sequence])).toEqual([
+      ["INVOKED", 0],
+      ["ACTING", 1],
+      ["OUTCOME", 2],
+    ]);
+    expect(h.text()).toContain(`1 more line(s) may be in ${file} WITHOUT being durable, because the append failed after its write: OUTCOME sequence 2 (SYNC_FAILED)`);
   });
 
   it("no ACTING record (a PAPER refusal) and the OUTCOME cannot be written: OUTCOME_UNRECORDED too, and the output says nothing was sent", async () => {
@@ -328,7 +336,7 @@ describe("WP330-V1-01: an OUTCOME that cannot be written never lets the command'
     const outcome = await runOpsCli(h.deps(CANCEL_ALL, { runModeFlags: PAPER_FLAGS }));
     expect(outcome.exitName).toBe("OUTCOME_UNRECORDED");
     expect(phases(h.audit.records)).toEqual(["INVOKED"]);
-    expect(h.text()).toContain("No ACTING record was written, so this invocation sent no cancel and revoked no lease");
+    expect(h.text()).toContain("No ACTING record was made durable, so this invocation sent no cancel and revoked no lease");
     expect(h.text()).toContain("the command's own outcome, RUN_MODE_REFUSED (exit 4), is NOT in the audit log");
     expect(h.touched).toEqual([]);
   });
@@ -559,5 +567,140 @@ describe("CX330-R1-03 and WP330-V1-05: operator text that may be a pasted secret
     expect(h.text()).not.toContain("SECRETKEY");
     expect(h.text()).toContain("unknown command (not repeated: it is not a command or option word)");
     expect(h.text()).toContain("unknown option (not repeated: it is not a command or option word)");
+  });
+});
+
+describe("WP-330 r3 (WP330-V3-01): an append that failed after its write: the log never repeats a sequence number, and the output and the OUTCOME name the line that is not durable", () => {
+  const cancelAll = (file: string): string[] => args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`, "--audit-log", file);
+
+  /** The real file system; the directory's `fsync` number `n` (1-based) fails with EIO when `failing(n)`. */
+  function directorySyncFailing(failing: (n: number) => boolean): AuditFileSystem {
+    let directorySyncs = 0;
+    return {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        const isDirectory = (flags & fsConstants.O_DIRECTORY) !== 0;
+        return {
+          write: (data) => handle.write(data),
+          sync: async () => {
+            if (isDirectory) {
+              directorySyncs += 1;
+              if (failing(directorySyncs)) throw Object.assign(new Error("EIO"), { code: "EIO" });
+            }
+            return handle.sync();
+          },
+          stat: () => handle.stat(),
+          close: () => handle.close(),
+        };
+      },
+    };
+  }
+
+  async function fileRecords(file: string): Promise<AuditRecord[]> {
+    return (await readFile(file, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line) as AuditRecord);
+  }
+
+  it("only ACTING's directory sync fails (probe N1): exit 5 and no cancel; the file holds 0, 1, 2; the output counts 2 durable records and names the ACTING line; the OUTCOME and its database copy list it", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const mirrored: AuditRecord[] = [];
+    const h = harness({ mirror: { append: (record) => (mirrored.push(record), Promise.resolve()) } });
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(h.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, directorySyncFailing((n) => n === 2)) }));
+    expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(h.venue.callsOf("cancelAll")).toEqual([]);
+    expect(h.venue.open()).toHaveLength(1);
+
+    const records = await fileRecords(file);
+    expect(records.map((record) => [record.phase, record.sequence])).toEqual([
+      ["INVOKED", 0],
+      ["ACTING", 1],
+      ["OUTCOME", 2],
+    ]);
+    const notDurable = { count: 1, appends: [{ phase: "ACTING", sequence: 1, code: "DIRECTORY_SYNC_FAILED" }], truncated: false };
+    expect(records[2]?.detail).toMatchObject({ exit: "AUDIT_UNAVAILABLE", auditCode: "DIRECTORY_SYNC_FAILED", auditNotDurable: notDurable });
+    // The database copy holds the durable records only, and its OUTCOME explains the missing number.
+    expect(mirrored.map((record) => [record.phase, record.sequence])).toEqual([
+      ["INVOKED", 0],
+      ["OUTCOME", 2],
+    ]);
+    expect(mirrored[1]?.detail["auditNotDurable"]).toEqual(notDurable);
+
+    const text = h.text();
+    expect(text).toContain(
+      "REFUSED: the ACTING record could not be made durable (DIRECTORY_SYNC_FAILED), so nothing was sent. Its line may be in the log all the same, because the append failed after its write: that line is NOT durable and records nothing done",
+    );
+    expect(text).not.toContain("could not be written");
+    expect(text).toContain(`2 record(s) written and fsynced to ${file}`);
+    expect(text).toContain(`1 more line(s) may be in ${file} WITHOUT being durable, because the append failed after its write: ACTING sequence 1 (DIRECTORY_SYNC_FAILED)`);
+    expect(text).toContain("AUDIT_UNAVAILABLE (exit 5)");
+  });
+
+  it("ACTING's directory sync fails, then the OUTCOME's: exit 18; the output says no ACTING record was made durable, so nothing was sent, and names both lines", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const h = harness();
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(h.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, directorySyncFailing((n) => n >= 2)) }));
+    expect(outcome.exitName).toBe("OUTCOME_UNRECORDED");
+    expect(h.venue.callsOf("cancelAll")).toEqual([]);
+    expect((await fileRecords(file)).map((record) => [record.phase, record.sequence])).toEqual([
+      ["INVOKED", 0],
+      ["ACTING", 1],
+      ["OUTCOME", 2],
+    ]);
+    const text = h.text();
+    expect(text).toContain(`the OUTCOME record could NOT be made durable in ${file} (DIRECTORY_SYNC_FAILED). No ACTING record was made durable, so this invocation sent no cancel and revoked no lease`);
+    expect(text).toContain("2 more line(s) may be in");
+    expect(text).toContain("ACTING sequence 1 (DIRECTORY_SYNC_FAILED); OUTCOME sequence 2 (DIRECTORY_SYNC_FAILED)");
+    expect(text).toContain("the command's own outcome, AUDIT_UNAVAILABLE (exit 5), is NOT in the audit log");
+  });
+
+  it("INVOKED's directory sync fails: the refusal says its line may be in the log, not durable, with no OUTCOME after it; a log that never opened (nothing written) says nothing of the kind", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const synced = harness();
+    synced.venue.add(order("o-1"));
+    expect((await runOpsCli(synced.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, directorySyncFailing(() => true)) }))).exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(synced.text()).toContain(
+      `the audit log ${file} could not record this invocation (DIRECTORY_SYNC_FAILED). Nothing was done. Its INVOKED line may be in the log all the same, because the append failed after its write: that line is NOT durable, records nothing done, and no OUTCOME record follows it`,
+    );
+    expect((await fileRecords(file)).map((record) => [record.phase, record.sequence])).toEqual([["INVOKED", 0]]);
+    expect(synced.venue.calls).toEqual([]);
+
+    const missing = harness();
+    const unopened = path.join(scratch, "no-such-directory", "audit.jsonl");
+    expect((await runOpsCli(missing.deps(cancelAll(unopened), { openAuditLog: (target) => createFileAuditLog(target) }))).exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(missing.text()).toContain("could not record this invocation (OPEN_FAILED). Nothing was done");
+    expect(missing.text()).not.toContain("may be in the log");
+  });
+
+  it("a usage error whose INVOKED append fails after the write: still USAGE (nothing is done), and the output says the record is missing and its line may be in the log; a log that never opened says only that it is missing", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const usage = ["cancel-all", "--account", ACCOUNT, "--operator", OPERATOR, "--yes", "--audit-log"];
+    const synced = harness();
+    expect((await runOpsCli(synced.deps([...usage, file], { openAuditLog: (target) => createFileAuditLog(target, directorySyncFailing(() => true)) }))).exitName).toBe("USAGE");
+    expect(synced.text()).toContain(
+      `the audit log ${file} could not record this usage error (DIRECTORY_SYNC_FAILED). Its INVOKED line may be in the log all the same, because the append failed after its write: that line is NOT durable, records nothing done, and no OUTCOME record follows it`,
+    );
+    expect((await fileRecords(file)).map((record) => [record.phase, record.sequence])).toEqual([["INVOKED", 0]]);
+    expect(synced.touched).toEqual([]);
+
+    const missing = harness();
+    const unopened = path.join(scratch, "no-such-directory", "audit.jsonl");
+    expect((await runOpsCli(missing.deps([...usage, unopened], { openAuditLog: (target) => createFileAuditLog(target) }))).exitName).toBe("USAGE");
+    expect(missing.text()).toContain(`the audit log ${unopened} could not record this usage error (OPEN_FAILED)`);
+    expect(missing.text()).not.toContain("may be in the log");
+  });
+
+  it("CONTROL: every append durable: the AUDIT section names no line, and the OUTCOME carries no auditNotDurable", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const h = harness();
+    h.venue.add(order("o-1"));
+    expect((await runOpsCli(h.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target) }))).exitName).toBe("COMPLETED");
+    const records = await fileRecords(file);
+    expect(records.map((record) => record.sequence)).toEqual([0, 1, 2]);
+    expect(records[2]?.detail["auditNotDurable"]).toBeUndefined();
+    expect(h.text()).not.toContain("WITHOUT being durable");
   });
 });

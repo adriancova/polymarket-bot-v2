@@ -39,6 +39,14 @@
  * readable) therefore refuses every record (`DIRECTORY_SYNC_FAILED`), not only
  * the first.
  *
+ * A FAILED APPEND MAY STILL LEAVE ITS LINE (WP-330 r3, WP330-V3-01). An append
+ * that fails at or after its write (a failed or short write, a failed file or
+ * directory `fsync`) may leave its line in the file, not durable. The trail
+ * spends that line's sequence number, so the numbers stay unique; the output
+ * names the line, and the OUTCOME record lists it (`auditNotDurable`). Such a
+ * line records nothing done: a command acts only after its `ACTING` append
+ * has resolved.
+ *
  * ## The database mirror is best effort, and never on the cancel path
  *
  * When a database is configured, each record is also appended to
@@ -83,7 +91,12 @@ export interface AuditRecord {
   readonly recordId: string;
   /** One id for every record of one invocation. */
   readonly invocationId: string;
-  /** 0 for `INVOKED`, then 1, 2, … in the order written. */
+  /**
+   * 0 for `INVOKED`, then 1, 2, … in the order the appends were made. Unique
+   * within an invocation: an append that failed after its line may have
+   * reached the file spends its number, so no later record reuses it
+   * (WP-330 r3, WP330-V3-01), and the OUTCOME lists it (`auditNotDurable`).
+   */
   readonly sequence: number;
   readonly phase: AuditPhase;
   /** ISO-8601 UTC instant. */
@@ -109,15 +122,39 @@ export interface AuditMirror {
   append(record: AuditRecord): Promise<void>;
 }
 
+export type AuditUnavailableCode = "OPEN_FAILED" | "NOT_A_REGULAR_FILE" | "WRITE_FAILED" | "SHORT_WRITE" | "SYNC_FAILED" | "DIRECTORY_SYNC_FAILED" | "ENCODE_FAILED" | "RECORD_TOO_LARGE";
+
+/**
+ * The refusals raised before any byte of the line can have reached the file:
+ * the line was never encoded, was too large, or the file was never opened as
+ * a regular file. Every other refusal comes from the write or after it (a
+ * failed or short write, a failed file or directory `fsync`), so its line MAY
+ * be in the file without being durable (WP-330 r3, WP330-V3-01).
+ */
+const REFUSED_BEFORE_ANY_WRITE: ReadonlySet<AuditUnavailableCode> = new Set<AuditUnavailableCode>(["ENCODE_FAILED", "RECORD_TOO_LARGE", "OPEN_FAILED", "NOT_A_REGULAR_FILE"]);
+
 /** Why a record could not be made durable. Carries a fixed code and the path; never an OS message with data in it. */
 export class AuditUnavailableError extends Error {
   override readonly name = "AuditUnavailableError";
+  /** The append failed after its line may have reached the file: the line may be in the log, not durable (WP330-V3-01). */
+  readonly lineMayBeInLog: boolean;
   constructor(
-    readonly code: "OPEN_FAILED" | "NOT_A_REGULAR_FILE" | "WRITE_FAILED" | "SHORT_WRITE" | "SYNC_FAILED" | "DIRECTORY_SYNC_FAILED" | "ENCODE_FAILED" | "RECORD_TOO_LARGE",
+    readonly code: AuditUnavailableCode,
     readonly location: string,
   ) {
     super(`the audit log ${location} could not record the invocation (${code})`);
+    this.lineMayBeInLog = !REFUSED_BEFORE_ANY_WRITE.has(code);
   }
+}
+
+/** Whether a failed append may have left its line in the log. A failure that is not the sink's own refusal proves nothing, so it may have. */
+export function lineMayBeInLog(error: unknown): boolean {
+  return !(error instanceof AuditUnavailableError) || error.lineMayBeInLog;
+}
+
+/** The fixed code of a failed append: the sink's own, or `WRITE_FAILED` for any other failure. */
+export function auditFailureCode(error: unknown): string {
+  return error instanceof AuditUnavailableError ? error.code : "WRITE_FAILED";
 }
 
 /**
@@ -287,10 +324,26 @@ export interface AuditHeader {
   readonly reason: string | null;
 }
 
+/** An append that failed after its line may have reached the file (WP330-V3-01). */
+export interface NotDurableAppend {
+  readonly phase: AuditPhase;
+  readonly sequence: number;
+  readonly code: string;
+}
+
 /**
  * The records of one invocation, in order. `write` resolves once the record
  * is durable in the local log and throws {@link AuditUnavailableError}
  * otherwise; the mirror copy is started and not awaited.
+ *
+ * A FAILED append whose line may nonetheless be in the file (the sink
+ * refused it at or after the write: {@link lineMayBeInLog}) spends its
+ * sequence number and is kept in {@link AuditTrail.notDurable}, so the log
+ * never holds two lines with one number, and the output and the OUTCOME
+ * record can name the line that is there but not durable (WP-330 r3,
+ * WP330-V3-01). A refusal before any byte was written (too large, not
+ * encodable, not opened) spends nothing: the OUTCOME written again without
+ * its detail keeps the number.
  */
 export class AuditTrail {
   readonly #options: AuditTrailOptions;
@@ -299,6 +352,7 @@ export class AuditTrail {
   #runMode: string | null = null;
   readonly #mirrors: Promise<"LANDED" | "FAILED">[] = [];
   readonly #written: AuditRecord[] = [];
+  readonly #notDurable: NotDurableAppend[] = [];
 
   constructor(options: AuditTrailOptions, header: AuditHeader) {
     this.#options = options;
@@ -319,6 +373,11 @@ export class AuditTrail {
     return Object.freeze([...this.#written]);
   }
 
+  /** Every append that failed after its line may have reached the file: such a line may be in the log, NOT durable. */
+  notDurable(): readonly NotDurableAppend[] {
+    return Object.freeze([...this.#notDurable]);
+  }
+
   async write(phase: AuditPhase, detail: { readonly [key: string]: AuditValue }): Promise<AuditRecord> {
     const record: AuditRecord = Object.freeze({
       schema: AUDIT_SCHEMA,
@@ -334,7 +393,16 @@ export class AuditTrail {
       runMode: this.#runMode,
       detail,
     });
-    await this.#options.sink.append(record);
+    try {
+      await this.#options.sink.append(record);
+    } catch (error) {
+      if (lineMayBeInLog(error)) {
+        // Its line may be in the file: the number is spent, so no later record reuses it (WP330-V3-01).
+        this.#sequence += 1;
+        this.#notDurable.push(Object.freeze({ phase, sequence: record.sequence, code: auditFailureCode(error) }));
+      }
+      throw error;
+    }
     this.#sequence += 1;
     this.#written.push(record);
     const mirror = this.#options.mirror;

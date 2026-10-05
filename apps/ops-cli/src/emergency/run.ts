@@ -21,7 +21,9 @@
  *    they act (`context.ts`). Write `OUTCOME`, durable; print the exit. An
  *    OUTCOME that cannot be written exits `OUTCOME_UNRECORDED` (18), never
  *    the command's own exit: the output says whether the command may already
- *    have acted (WP330-V1-01).
+ *    have acted (WP330-V1-01). An append that failed after its write may
+ *    have left its line in the log: the AUDIT section names it, and the
+ *    OUTCOME record lists it as `auditNotDurable` (WP-330 r3, WP330-V3-01).
  * 6. Only then release what the command opened (the venue client, the lease
  *    store), each bounded (CX330-R1-02): cleanup never gates the OUTCOME
  *    record or the process's end.
@@ -34,7 +36,7 @@
 
 import { assertSignerGate, SignerBoundaryRefusal, signerGateContextFromSafetyFlags, type SignerGateContext } from "@polymarket-bot/polymarket-secure";
 
-import { AuditTrail, AuditUnavailableError, MAX_AUDIT_LINE_BYTES, type AuditMirror, type AuditSink } from "./audit-log.js";
+import { auditFailureCode, AuditTrail, AuditUnavailableError, lineMayBeInLog, MAX_AUDIT_LINE_BYTES, type AuditMirror, type AuditSink } from "./audit-log.js";
 import { runAccountSnapshot } from "./commands/account-snapshot.js";
 import { runCancelAll, runCancelMarket, runCancelOrder } from "./commands/cancel.js";
 import { runReconcile } from "./commands/reconcile.js";
@@ -103,8 +105,35 @@ function evaluateGate(flags: Readonly<Record<string, string | undefined>>): Gate
 
 type OutcomeRecording = { readonly kind: "RECORDED" } | { readonly kind: "RECORDED_WITHOUT_DETAIL" } | { readonly kind: "FAILED"; readonly code: string };
 
-function auditCodeOf(error: unknown): string {
-  return error instanceof AuditUnavailableError ? error.code : "WRITE_FAILED";
+/** At most this many not-durable appends are itemized in the OUTCOME record; their count is always recorded. By construction there is at most one (ACTING). */
+export const MAX_AUDITED_NOT_DURABLE = 8;
+
+/**
+ * The appends of this invocation that failed after their line may have
+ * reached the file, as the OUTCOME record lists them (WP-330 r3,
+ * WP330-V3-01): a reader of the log learns which line is there but not
+ * durable. Empty when there is none, so an ordinary OUTCOME is unchanged.
+ */
+function notDurableDetail(audit: AuditTrail): CommandResult["result"] {
+  const failed = audit.notDurable();
+  if (failed.length === 0) return {};
+  return {
+    auditNotDurable: {
+      count: failed.length,
+      appends: failed.slice(0, MAX_AUDITED_NOT_DURABLE).map((entry) => ({ phase: entry.phase, sequence: entry.sequence, code: entry.code })),
+      truncated: failed.length > MAX_AUDITED_NOT_DURABLE,
+    },
+  };
+}
+
+/** The AUDIT line naming every line that may be in the log without being durable; none when there is none (WP330-V3-01). */
+function notDurableLines(audit: AuditTrail): string[] {
+  const failed = audit.notDurable();
+  if (failed.length === 0) return [];
+  const listed = failed.map((entry) => `${entry.phase} sequence ${String(entry.sequence)} (${entry.code})`).join("; ");
+  return [
+    `${String(failed.length)} more line(s) may be in ${audit.location} WITHOUT being durable, because the append failed after its write: ${listed}. Such a line records nothing done, and its sequence number is never reused. This invocation's durable OUTCOME record, or, when there is none, this output and the exit, is authoritative`,
+  ];
 }
 
 /**
@@ -116,16 +145,16 @@ function auditCodeOf(error: unknown): string {
 async function recordOutcome(audit: AuditTrail, name: ExitName, result: CommandResult["result"]): Promise<OutcomeRecording> {
   const exit = { exit: name, exitCode: EXIT_CODES[name] };
   try {
-    await audit.write("OUTCOME", { ...exit, ...result });
+    await audit.write("OUTCOME", { ...exit, ...result, ...notDurableDetail(audit) });
     return { kind: "RECORDED" };
   } catch (error) {
-    if (!(error instanceof AuditUnavailableError && error.code === "RECORD_TOO_LARGE")) return { kind: "FAILED", code: auditCodeOf(error) };
+    if (!(error instanceof AuditUnavailableError && error.code === "RECORD_TOO_LARGE")) return { kind: "FAILED", code: auditFailureCode(error) };
   }
   try {
-    await audit.write("OUTCOME", { ...exit, detailOmitted: "RECORD_TOO_LARGE" });
+    await audit.write("OUTCOME", { ...exit, detailOmitted: "RECORD_TOO_LARGE", ...notDurableDetail(audit) });
     return { kind: "RECORDED_WITHOUT_DETAIL" };
   } catch (error) {
-    return { kind: "FAILED", code: auditCodeOf(error) };
+    return { kind: "FAILED", code: auditFailureCode(error) };
   }
 }
 
@@ -157,21 +186,25 @@ async function finish(printer: Printer, audit: AuditTrail | null, name: ExitName
   let exit: ExitName = name;
   if (audit !== null) {
     const recorded = await recordOutcome(audit, name, result);
+    // Durable records only; a line whose append failed after its write is named apart (WP330-V3-01).
     const written = `${String(audit.records().length)} record(s) written and fsynced to ${audit.location}`;
     if (recorded.kind === "RECORDED") {
-      printer.section(SECTIONS.AUDIT, [written]);
+      printer.section(SECTIONS.AUDIT, [written, ...notDurableLines(audit)]);
     } else if (recorded.kind === "RECORDED_WITHOUT_DETAIL") {
       printer.section(SECTIONS.AUDIT, [
         `${written}; the OUTCOME record's detail exceeded ${String(MAX_AUDIT_LINE_BYTES)} bytes, so it records the exit alone (detailOmitted): this output holds the rest; copy it into the incident record`,
+        ...notDurableLines(audit),
       ]);
     } else {
       // The record of what happened is missing: never let the exit claim otherwise (WP330-V1-01).
       exit = "OUTCOME_UNRECORDED";
+      // Acting follows only a DURABLE ACTING record: an ACTING append that failed sent nothing (context.ts).
       const acted = audit.records().some((record) => record.phase === "ACTING");
       printer.section(SECTIONS.AUDIT, [
         acted
-          ? `the OUTCOME record could NOT be written to ${audit.location} (${recorded.code}). The command MAY ALREADY HAVE ACTED: its ACTING record is in the log, and what happened is recorded only in this output. Copy this output into the incident record, and read the account (account-snapshot) before acting again`
-          : `the OUTCOME record could NOT be written to ${audit.location} (${recorded.code}). No ACTING record was written, so this invocation sent no cancel and revoked no lease; its outcome is recorded only in this output: copy it into the incident record`,
+          ? `the OUTCOME record could NOT be made durable in ${audit.location} (${recorded.code}). The command MAY ALREADY HAVE ACTED: its ACTING record is in the log, and what happened is recorded only in this output. Copy this output into the incident record, and read the account (account-snapshot) before acting again`
+          : `the OUTCOME record could NOT be made durable in ${audit.location} (${recorded.code}). No ACTING record was made durable, so this invocation sent no cancel and revoked no lease; its outcome is recorded only in this output: copy it into the incident record`,
+        ...notDurableLines(audit),
       ]);
     }
   }
@@ -215,7 +248,13 @@ export async function runOpsCli(deps: OpsCliDependencies): Promise<OpsCliOutcome
       audit = new AuditTrail({ sink: deps.openAuditLog(auditPath), mirror: deps.auditMirror, clock: deps.clock, newId: deps.newId, invocationId }, header);
       try {
         await audit.write("INVOKED", { usageError: parsed.problem });
-      } catch {
+      } catch (error) {
+        // Nothing is done either way; the output still says the record is missing, and whether its line may be there (WP330-V3-01).
+        printer.section(SECTIONS.AUDIT, [
+          `the audit log ${auditPath} could not record this usage error (${auditFailureCode(error)})${
+            lineMayBeInLog(error) ? ". Its INVOKED line may be in the log all the same, because the append failed after its write: that line is NOT durable, records nothing done, and no OUTCOME record follows it" : ""
+          }`,
+        ]);
         audit = null;
       }
     }
@@ -242,8 +281,11 @@ export async function runOpsCli(deps: OpsCliDependencies): Promise<OpsCliOutcome
       gate: gate.permitted ? { permitted: true, runMode: gate.context.runMode, maximumRunMode: gate.context.maximumRunMode } : { permitted: false, reasons: [...gate.reasons] },
     });
   } catch (error) {
-    const code = error instanceof AuditUnavailableError ? error.code : "WRITE_FAILED";
-    printer.section(SECTIONS.AUDIT, [`REFUSED: the audit log ${auditPath} could not record this invocation (${code}). Nothing was done`]);
+    printer.section(SECTIONS.AUDIT, [
+      `REFUSED: the audit log ${auditPath} could not record this invocation (${auditFailureCode(error)}). Nothing was done${
+        lineMayBeInLog(error) ? ". Its INVOKED line may be in the log all the same, because the append failed after its write: that line is NOT durable, records nothing done, and no OUTCOME record follows it" : ""
+      }`,
+    ]);
     printer.section(SECTIONS.OUTCOME, [`AUDIT_UNAVAILABLE (exit ${String(EXIT_CODES.AUDIT_UNAVAILABLE)})`]);
     return outcome("AUDIT_UNAVAILABLE");
   }
@@ -281,7 +323,11 @@ export async function runOpsCli(deps: OpsCliDependencies): Promise<OpsCliOutcome
     result = await dispatch(context, deps);
   } catch (error) {
     if (error instanceof AuditUnavailableError) {
-      printer.section(SECTIONS.AUDIT, [`REFUSED: the ACTING record could not be written (${error.code}); nothing was sent`]);
+      printer.section(SECTIONS.AUDIT, [
+        `REFUSED: the ACTING record could not be made durable (${error.code}), so nothing was sent${
+          error.lineMayBeInLog ? ". Its line may be in the log all the same, because the append failed after its write: that line is NOT durable and records nothing done" : ""
+        }`,
+      ]);
       return finish(printer, audit, "AUDIT_UNAVAILABLE", { auditCode: error.code }, releases);
     }
     printer.section(SECTIONS.UNKNOWN, ["an unexpected failure stopped the command: treat the account as UNKNOWN and run account-snapshot or reconcile"]);

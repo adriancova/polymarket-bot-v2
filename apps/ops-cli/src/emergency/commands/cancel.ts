@@ -520,7 +520,9 @@ export async function runCancelMarket(context: CommandContext, session: VenueSes
   ]);
 
   const outcome = attempt.outcome;
-  // Verifiable only with --asset: the open-orders read names tokens, not markets.
+  // Verifiable only with --asset: the open-orders read names tokens, not markets. `--asset` is canonical decimal,
+  // the read's own lexeme (grammar.ts ASSET_ID, a sub-language of venue-truth.ts TOKEN_ID), so `targeted` compares
+  // like with like, and an empty selection means no order of that token is listed (WP-330 r3, CX330-R3-01).
   const verified = after.kind === "READ" && after.complete && targetedAfter !== null;
   const exit = cancelExit([attempt], verified && targetedAfter !== null ? { verified: true, stillOpen: targetedAfter.length } : { verified: false });
 

@@ -21,7 +21,8 @@
  *   A destructive command is confirmed only by typing its scope, or by
  *   `--confirm <scope>` naming it exactly (`confirmation.ts`);
  * - `--dry-run` or `--confirm` on a read-only command, `--asset` anywhere but
- *   cancel-market;
+ *   cancel-market, an `--asset` that is not a decimal token id (a `0x` id
+ *   included: WP-330 r3, CX330-R3-01; see {@link ASSET_ID});
  * - a destructive command without `--reason`;
  * - a `--reason` that assigns a value to a credential-like name (WP-330 r1,
  *   CX330-R1-03): see {@link namesCredentialAssignment}.
@@ -35,6 +36,8 @@
 
 import { isSensitiveKey } from "@polymarket-bot/polymarket-secure";
 
+import { EMERGENCY_VENUE_FACTS } from "./venue-facts.js";
+
 export const DESTRUCTIVE_COMMANDS = ["cancel-order", "cancel-market", "cancel-all", "stop-heartbeat"] as const;
 export const READ_ONLY_COMMANDS = ["account-snapshot", "reconcile"] as const;
 export const COMMANDS = [...DESTRUCTIVE_COMMANDS, ...READ_ONLY_COMMANDS] as const;
@@ -47,8 +50,19 @@ export type CommandName = (typeof COMMANDS)[number];
 export const VENUE_ORDER_ID = /^[A-Za-z0-9_\-:.]{1,200}$/u;
 /** A condition id: WP-260's accepted shape for `cancelMarketOrders` (`CONDITION_ID`). */
 export const CONDITION_ID = /^0x[0-9a-fA-F]{64}$/u;
-/** A CTF token id or position id: WP-260's accepted shape (`ASSET_ID`). */
-export const ASSET_ID = /^(?:[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
+/**
+ * cancel-market's `--asset`: a CTF token id in CANONICAL DECIMAL only
+ * (WP-330 r3, CX330-R3-01). It is the lexeme of every official example but
+ * one hex placeholder, and the only one the open-orders read lists
+ * (`venue-truth.ts` `TOKEN_ID`); see `EMERGENCY_VENUE_FACTS.TOKEN_ID_LEXEME`.
+ * cancel-market verifies its cancel by comparing `--asset`, as text, with the
+ * token of every order venue truth lists, so the two must be one lexeme.
+ * WP-260's own `ASSET_ID` also admits a `0x` id; this grammar refuses it. The
+ * wire lexeme of a V2 position id is undocumented (U-13), and a hex `--asset`
+ * never equals a listed decimal token: its verification read would select
+ * nothing, and report COMPLETED while an order in that token is still open.
+ */
+export const ASSET_ID = /^[1-9][0-9]{0,77}$/u;
 /** An account or operator reference: printable, no spaces, within the database's `internal.identifier` (200). */
 export const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,199}$/u;
 /** An `--account` or `--operator` that may be printed and recorded: the grammar, and no credential-like `NAME:value` (`namesCredentialAssignment`). */
@@ -67,7 +81,7 @@ export const MAX_VENUE_ORDER_ID_LENGTH = 200;
 export const MAX_REFERENCE_LENGTH = 200;
 /** A condition id's length ({@link CONDITION_ID}: `0x` and 64 hex digits). */
 export const CONDITION_ID_LENGTH = 66;
-/** The longest asset id {@link ASSET_ID} admits: 78 decimal digits (a `0x` id is at most 66). */
+/** The longest asset id {@link ASSET_ID} admits: 78 decimal digits (2^256 - 1 has 78). */
 export const MAX_ASSET_ID_LENGTH = 78;
 /** A fencing lease id: a UUID (WP-320 issues UUIDv7 ids into a `uuid` column), 36 characters. */
 export const FENCING_LEASE_ID_LENGTH = 36;
@@ -197,7 +211,7 @@ export const USAGE = [
   "  --reason <text>      why; audited (required for destructive commands)",
   "  --dry-run            print the plan and the exact --confirm value; do nothing",
   "  --confirm <scope>    non-interactive confirmation; must name the scope exactly (a bare --yes is refused)",
-  "  --asset <token-id>   cancel-market only: narrow to one outcome token",
+  "  --asset <token-id>   cancel-market only: narrow to one outcome token, in decimal as account-snapshot prints it",
   "  --audit-log <path>   the append-only local audit log (else OPS_CLI_AUDIT_LOG)",
   "",
   "PAPER only in this repository: every venue command runs WP-260's signer gate first and refuses in PAPER,",
@@ -325,7 +339,11 @@ export function parseArguments(argv: readonly string[]): ParseResult {
   const asset = values.get("--asset") ?? null;
   if (asset !== null) {
     if (command !== "cancel-market") return usage("--asset applies to cancel-market only");
-    if (!ASSET_ID.test(asset)) return usage("--asset must be a token id (decimal) or a 0x position id");
+    if (!ASSET_ID.test(asset)) {
+      return usage(
+        `--asset must be a token id in decimal, as account-snapshot prints it (1–78 digits, no leading zero). A 0x id is refused: the venue documents no hex token lexeme, and the open-orders read that verifies cancel-market lists decimal token ids only (${EMERGENCY_VENUE_FACTS.TOKEN_ID_LEXEME.source} ${EMERGENCY_VENUE_FACTS.TOKEN_ID_LEXEME.section})`,
+      );
+    }
   }
   if (auditLogPath !== null && (auditLogPath.length === 0 || auditLogPath.length > MAX_PATH_LENGTH || hasControl(auditLogPath))) {
     return usage(`--audit-log must be a path of 1–${String(MAX_PATH_LENGTH)} characters`);

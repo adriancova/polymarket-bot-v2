@@ -21,10 +21,12 @@ import {
   parseArguments,
   READ_ONLY_COMMANDS,
   REFERENCE,
+  USAGE,
   VENUE_ORDER_ID,
   type DestructiveCommand,
   type ParsedCommand,
 } from "./grammar.js";
+import { TOKEN_ID } from "./venue-truth.js";
 
 const CONDITION = `0x${"a".repeat(64)}`;
 const BASE = ["--account", "acct-1", "--operator", "op-1"];
@@ -193,9 +195,9 @@ describe("WP-330 r2 (CX330-R2-02): every scope the CLI can generate can be passe
     expect(CONDITION_ID.test(`0x${"c".repeat(CONDITION_ID_LENGTH - 2)}`)).toBe(true);
     expect(ASSET_ID.test("9".repeat(MAX_ASSET_ID_LENGTH))).toBe(true);
     expect(ASSET_ID.test("9".repeat(MAX_ASSET_ID_LENGTH + 1))).toBe(false);
-    expect(ASSET_ID.test(`0x${"f".repeat(64)}`)).toBe(true);
-    expect(`0x${"f".repeat(64)}`.length).toBeLessThanOrEqual(MAX_ASSET_ID_LENGTH);
-    expect(ASSET_ID.test(`0x${"f".repeat(65)}`)).toBe(false);
+    // WP-330 r3 (CX330-R3-01): a 0x asset is refused at every length, so the longest asset is decimal.
+    expect(ASSET_ID.test(`0x${"f".repeat(64)}`)).toBe(false);
+    expect(ASSET_ID.test("0x1")).toBe(false);
     expect(A_LEASE_ID).toHaveLength(FENCING_LEASE_ID_LENGTH);
   });
 
@@ -217,5 +219,43 @@ describe("WP-330 r2 (CX330-R2-02): every scope the CLI can generate can be passe
     expect(lengths).toEqual([414, 360, 211, 252]);
     expect(MAX_CONFIRM_LENGTH).toBe(Math.max(...lengths));
     expect(problem(["cancel-all", ...BASE, "--reason", "r", "--confirm", "x".repeat(MAX_CONFIRM_LENGTH + 1)])).toBe("--confirm must be the scope text, as --dry-run prints it");
+  });
+});
+
+describe("WP-330 r3 (CX330-R3-01): --asset is canonical decimal, the lexeme of the read that verifies cancel-market", () => {
+  const HEX_ASSETS = ["0x457", "0X457", "0x0457", "0xabc", `0x${"f".repeat(64)}`, "0x1"];
+
+  it("a 0x --asset is refused as a usage error, whatever its length or case; the refusal says decimal and cites the venue record", () => {
+    for (const asset of HEX_ASSETS) {
+      const text = problem(["cancel-market", CONDITION, ...BASE, "--reason", "r", "--asset", asset]);
+      expect(text, asset).toMatch(/^--asset must be a token id in decimal, as account-snapshot prints it/u);
+      expect(text, asset).toContain("A 0x id is refused");
+      expect(text, asset).toContain("docs/venue/verified-2026-09-30.md §2.1; §12, U-13");
+    }
+    // The dry run is refused too: no plan for a scope that could never be verified.
+    expect(problem(["cancel-market", CONDITION, ...BASE, "--reason", "r", "--asset", "0x457", "--dry-run"])).toMatch(/^--asset must be a token id in decimal/u);
+  });
+
+  it("CONTROL: decimal token ids parse, up to 78 digits", () => {
+    for (const asset of ["1", "1111", "10", "9".repeat(MAX_ASSET_ID_LENGTH)]) {
+      expect(parsed(["cancel-market", CONDITION, ...BASE, "--reason", "r", "--asset", asset]).assetId, asset).toBe(asset);
+    }
+  });
+
+  it("every --asset the grammar admits is a token id the open-orders read can list (venue-truth TOKEN_ID), so text equality there is token equality; no hex lexeme is admitted", () => {
+    const candidates = [...HEX_ASSETS, "1", "1111", "9".repeat(MAX_ASSET_ID_LENGTH), "9".repeat(MAX_ASSET_ID_LENGTH + 1), "01", "0", " 1", "1e3", "-1", "１"];
+    let admitted = 0;
+    for (const candidate of candidates) {
+      if (!ASSET_ID.test(candidate)) continue;
+      admitted += 1;
+      expect(TOKEN_ID.test(candidate), candidate).toBe(true);
+    }
+    expect(admitted).toBe(3); // NON-VACUOUS: the decimal candidates are admitted
+    for (const asset of HEX_ASSETS) expect(TOKEN_ID.test(asset), asset).toBe(false);
+  });
+
+  it("the usage text asks for decimal", () => {
+    expect(USAGE).toContain("--asset <token-id>   cancel-market only: narrow to one outcome token, in decimal as account-snapshot prints it");
+    expect(USAGE).not.toContain("0x position id");
   });
 });

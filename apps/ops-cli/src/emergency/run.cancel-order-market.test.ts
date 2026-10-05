@@ -8,7 +8,7 @@ import { RateLimitBudget, type Grant, type GrantCompletion } from "@polymarket-b
 import { installNetworkTripwire, type NetworkTripwire } from "@polymarket-bot/polymarket-secure/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ACCOUNT, args, CONDITION, DESTRUCTIVE_REASON, harness, order, refusedUnapplied, SIGNER, TOKEN_NO, TOKEN_YES, transportFailure } from "./harness.test-support.js";
+import { ACCOUNT, args, CONDITION, DESTRUCTIVE_REASON, harness, order, phases, refusedUnapplied, SIGNER, TOKEN_NO, TOKEN_YES, transportFailure, type Harness } from "./harness.test-support.js";
 import { runOpsCli } from "./run.js";
 
 let tripwire: NetworkTripwire;
@@ -126,5 +126,65 @@ describe("cancel-market", () => {
     h.venue.scripted.set("cancelMarketOrders", () => ({ kind: "COMPLETED", canceled: [], notCanceled: [] }));
     const outcome = await runOpsCli(h.deps(args("cancel-market", CONDITION, "--asset", TOKEN_YES, ...DESTRUCTIVE_REASON, "--confirm", `cancel-market:${CONDITION}:${TOKEN_YES}@${ACCOUNT}`)));
     expect(outcome.exitName).toBe("NOT_ALL_CANCELED");
+  });
+});
+
+describe("WP-330 r3 (CX330-R3-01): a hex --asset never yields a vacuous verified COMPLETED", () => {
+  // 0x457 is 1111, TOKEN_YES, the token the open order rests in.
+  const HEX_OF_TOKEN_YES = "0x457";
+  const cancelMarket = (asset: string, ...extra: string[]): string[] => args("cancel-market", CONDITION, "--asset", asset, ...DESTRUCTIVE_REASON, ...extra);
+  const confirmed = (asset: string): string[] => cancelMarket(asset, "--confirm", `cancel-market:${CONDITION}:${asset}@${ACCOUNT}`);
+  type Answer = "LOST" | "COMPLETED_NOTHING_CANCELED";
+  function setUp(answer: Answer): Harness {
+    const h = harness();
+    h.venue.add(order("still-live", { tokenId: TOKEN_YES }));
+    h.venue.scripted.set("cancelMarketOrders", () => (answer === "LOST" ? { kind: "UNKNOWN", error: null } : { kind: "COMPLETED", canceled: [], notCanceled: [] }));
+    return h;
+  }
+
+  for (const answer of ["LOST", "COMPLETED_NOTHING_CANCELED"] as const) {
+    it(`hex ${HEX_OF_TOKEN_YES} (= ${TOKEN_YES}), the cancel answer ${answer}: refused as USAGE before anything is read or sent; never COMPLETED while the order of token ${TOKEN_YES} stays open`, async () => {
+      expect(BigInt(HEX_OF_TOKEN_YES).toString()).toBe(TOKEN_YES);
+      const h = setUp(answer);
+      const outcome = await runOpsCli(h.deps(confirmed(HEX_OF_TOKEN_YES)));
+      expect(outcome.exitName).not.toBe("COMPLETED");
+      expect(outcome.exitName).toBe("USAGE");
+      expect(outcome.exitCode).toBe(2);
+      expect(h.touched).toEqual([]);
+      expect(h.venue.calls).toEqual([]);
+      expect(h.venue.open().map((entry) => entry.venueOrderId)).toEqual(["still-live"]);
+      expect(h.text()).toContain("usage error: --asset must be a token id in decimal, as account-snapshot prints it");
+      expect(phases(h.audit.records)).toEqual(["INVOKED", "OUTCOME"]);
+      expect(h.audit.records.at(-1)?.detail).toMatchObject({ exit: "USAGE" });
+      expect(JSON.stringify(h.audit.records)).not.toContain('"verified":true');
+    });
+  }
+
+  it(`hex ${HEX_OF_TOKEN_YES} dry run: refused as USAGE, so no plan claims "0 open order(s) in asset ${HEX_OF_TOKEN_YES}"`, async () => {
+    const h = setUp("LOST");
+    const outcome = await runOpsCli(h.deps(cancelMarket(HEX_OF_TOKEN_YES, "--dry-run")));
+    expect(outcome.exitName).toBe("USAGE");
+    expect(h.venue.calls).toEqual([]);
+    expect(h.text()).not.toContain(`open order(s) in asset ${HEX_OF_TOKEN_YES}`);
+  });
+
+  it(`CONTROL: decimal ${TOKEN_YES}, the cancel answer LOST: verified NOT_ALL_CANCELED (8), the order still listed, and the lost answer's estimate (the 1 order of the asset) passed to the budget as the canceled count`, async () => {
+    const completions = vi.spyOn(RateLimitBudget.prototype, "complete");
+    const h = setUp("LOST");
+    const outcome = await runOpsCli(h.deps(confirmed(TOKEN_YES)));
+    expect(outcome.exitName).toBe("NOT_ALL_CANCELED");
+    expect(outcome.exitCode).toBe(8);
+    expect(h.venue.callsOf("cancelMarketOrders").map((call) => call.args[0])).toEqual([{ market: CONDITION, assetId: TOKEN_YES }]);
+    const completion = completions.mock.calls.find(([grant]) => (grant as Grant).operationId === "clob.cancel_market_orders");
+    expect((completion?.[1] as GrantCompletion).canceledCount).toBe(1);
+    expect(h.audit.records.at(-1)?.detail).toMatchObject({ exit: "NOT_ALL_CANCELED", verified: true, stillListedInAsset: { count: 1, ids: ["still-live"], truncated: false } });
+  });
+
+  it(`CONTROL: decimal ${TOKEN_YES}, the venue answering COMPLETED with nothing canceled: verified NOT_ALL_CANCELED (8)`, async () => {
+    const h = setUp("COMPLETED_NOTHING_CANCELED");
+    const outcome = await runOpsCli(h.deps(confirmed(TOKEN_YES)));
+    expect(outcome.exitName).toBe("NOT_ALL_CANCELED");
+    expect(h.text()).toContain(`venue truth after: 1 open order(s) still listed in asset ${TOKEN_YES} [still-live]`);
+    expect(h.audit.records.at(-1)?.detail).toMatchObject({ verified: true, stillListedInAsset: { count: 1, ids: ["still-live"], truncated: false } });
   });
 });

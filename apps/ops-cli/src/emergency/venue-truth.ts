@@ -34,7 +34,13 @@ export const ROUTES = Object.freeze({
   COLLATERAL: "ONCHAIN_ERC20_BALANCE",
 } as const);
 
-const TOKEN_ID = /^(?:0|[1-9][0-9]{0,199})$/u;
+/**
+ * A token id as venue truth lists it: canonical decimal. cancel-market's
+ * `--asset` (`grammar.ts` `ASSET_ID`) is a sub-language of this one, so a
+ * listed token and an `--asset` are equal as text exactly when they name the
+ * same token (WP-330 r3, CX330-R3-01).
+ */
+export const TOKEN_ID = /^(?:0|[1-9][0-9]{0,199})$/u;
 
 /** Text of 1–200 characters with no ASCII control character (the database's `internal.identifier`). */
 function isIdentifier(value: unknown): value is string {

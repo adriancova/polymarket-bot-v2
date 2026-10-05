@@ -11,7 +11,7 @@
  * | 2 | `USAGE` | The arguments do not parse | no |
  * | 3 | `CONFIRMATION_REFUSED` | No valid scoped confirmation | no |
  * | 4 | `RUN_MODE_REFUSED` | WP-260's signer gate refused (PAPER, BACKTEST, SHADOW, REPLAY, above the maximum, real orders not allowed) | no |
- * | 5 | `AUDIT_UNAVAILABLE` | The local audit log could not be written and fsynced before acting | no |
+ * | 5 | `AUDIT_UNAVAILABLE` | The local audit log could not make a record durable (written, fsynced, its directory fsynced) before acting. A line whose append failed after its write may be in the log all the same: it is not durable and records nothing done (WP-330 r3, WP330-V3-01) | no |
  * | 6 | `CREDENTIALS_UNAVAILABLE` | No emergency credential, or no venue binding for it | no |
  * | 7 | `SCOPE_MISMATCH` | The credential belongs to another account than the one named | no |
  * | 8 | `NOT_ALL_CANCELED` | The venue answered, and at least one order was not canceled or is still listed | yes |
@@ -24,7 +24,7 @@
  * | 15 | `NOTHING_TO_DO` | stop-heartbeat: the realm has no ACTIVE, unexpired lease | no |
  * | 16 | `DATABASE_UNAVAILABLE` | stop-heartbeat: the fencing lease store could not be reached | no |
  * | 17 | `CONFIGURATION_REFUSED` | The ops configuration (rate-limit snapshot, reconciliation policy) is missing or invalid | no |
- * | 18 | `OUTCOME_UNRECORDED` | The command ran, but its OUTCOME record could not be written and fsynced: the printed output, which names the command's own outcome, is the only record of what happened. When the log holds this invocation's ACTING record, the action MAY ALREADY HAVE HAPPENED (WP-330 r1, WP330-V1-01) | maybe |
+ * | 18 | `OUTCOME_UNRECORDED` | The command ran, but its OUTCOME record could not be made durable: the printed output, which names the command's own outcome and whether its ACTING record was made durable, is the only record of what happened. When the log holds this invocation's ACTING record, the action MAY ALREADY HAVE HAPPENED (WP-330 r1, WP330-V1-01) | maybe |
  *
  * `OUTCOME_UNRECORDED` replaces the command's own exit whenever its OUTCOME
  * record is missing, so exit 0 always means the outcome is on the record.

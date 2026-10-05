@@ -62,12 +62,12 @@ development laptop. pnpm runs it in `apps/ops-cli/`, so a relative
 ## Commands
 
 ```text
-ops-cli cancel-order <venue-order-id>                --account <ref> --operator <ref> --reason <text> [--dry-run] [--confirm <scope>]
-ops-cli cancel-market <condition-id> [--asset <id>]  (same options)
-ops-cli cancel-all                                   (same options)
-ops-cli stop-heartbeat                               (same options)
-ops-cli account-snapshot                             --account <ref> --operator <ref> [--reason <text>]
-ops-cli reconcile                                    --account <ref> --operator <ref> [--reason <text>]
+ops-cli cancel-order <venue-order-id>                      --account <ref> --operator <ref> --reason <text> [--dry-run] [--confirm <scope>]
+ops-cli cancel-market <condition-id> [--asset <token-id>]  (same options)
+ops-cli cancel-all                                         (same options)
+ops-cli stop-heartbeat                                     (same options)
+ops-cli account-snapshot                                   --account <ref> --operator <ref> [--reason <text>]
+ops-cli reconcile                                          --account <ref> --operator <ref> [--reason <text>]
 every command: [--audit-log <path>]  (else OPS_CLI_AUDIT_LOG; one of them is required)
 ```
 
@@ -99,9 +99,19 @@ Not every invocation reaches a command:
 | `reconcile` | WP-290's reads | — |
 | `stop-heartbeat` | none: it revokes the fencing lease in PostgreSQL | the lease row |
 
+`--asset` takes a token id in canonical decimal, as `account-snapshot` prints
+it. A `0x` id is refused as a usage error. The verification compares
+`--asset`, as text, with the token of every order the open-orders read lists,
+and that read lists decimal token ids only. The venue documents no hex token
+lexeme: its one hex example is a placeholder, and the wire lexeme of a V2
+position id is undocumented (`docs/venue/verified-2026-09-30.md` §2.1 and §12,
+U-13). A hex `--asset` would select nothing in that read, so `cancel-market`
+could report `COMPLETED` while an order in that token was still open. Convert
+a hex id to decimal before you pass it.
+
 The facts behind each endpoint are in `venue-facts.ts`, and every quote there
 is checked against its dated report:
-- `docs/venue/verified-2026-09-30.md` §2.5, C-11, E-05, E-14, E-15, E-16, §W.3;
+- `docs/venue/verified-2026-09-30.md` §2.1, §2.5, C-11, E-05, E-14, E-15, E-16, §W.3, U-13;
 - `docs/venue/verified-2026-09-16.md` §5 and D-21.
 
 ## Confirmation (destructive commands)
@@ -138,7 +148,7 @@ account: 414 characters, which is exactly the length `--confirm` accepts.
 | 2 | `USAGE` | The arguments do not parse; nothing was done |
 | 3 | `CONFIRMATION_REFUSED` | No valid scoped confirmation; nothing was done |
 | 4 | `RUN_MODE_REFUSED` | WP-260's signer gate refused; nothing was done |
-| 5 | `AUDIT_UNAVAILABLE` | The audit log could not record the invocation before acting; nothing was done |
+| 5 | `AUDIT_UNAVAILABLE` | The audit log could not make a record durable before acting; nothing was done. The failed record's line may still be in the log (see "The audit log") |
 | 6 | `CREDENTIALS_UNAVAILABLE` | No emergency credential, or no venue binding; nothing was sent |
 | 7 | `SCOPE_MISMATCH` | The credential acts for another account than `--account`; nothing was sent |
 | 8 | `NOT_ALL_CANCELED` | The venue answered, but a targeted order is still open or was answered not canceled |
@@ -151,7 +161,7 @@ account: 414 characters, which is exactly the length `--confirm` accepts.
 | 15 | `NOTHING_TO_DO` | `stop-heartbeat` found no ACTIVE lease, or the lease ended before the revoke |
 | 16 | `DATABASE_UNAVAILABLE` | `stop-heartbeat` could not reach the lease store |
 | 17 | `CONFIGURATION_REFUSED` | The ops configuration is missing or invalid |
-| 18 | `OUTCOME_UNRECORDED` | The command ran, but its `OUTCOME` record could not be written. The output names the command's own outcome and is the only record of it. If the log holds this invocation's `ACTING` record, **the action may already have happened**: read the account (`account-snapshot`) before acting again |
+| 18 | `OUTCOME_UNRECORDED` | The command ran, but its `OUTCOME` record could not be written. The output names the command's own outcome and is the only record of it. If the log holds this invocation's `ACTING` record, **the action may already have happened**, unless the output lists that `ACTING` line as not durable. Read the account (`account-snapshot`) before acting again |
 
 `OUTCOME_UNRECORDED` replaces the command's own exit whenever the `OUTCOME`
 record is missing, so exit 0 always means the outcome is on the record.
@@ -189,6 +199,18 @@ A record that cannot be made durable before acting stops the command
 (`AUDIT_UNAVAILABLE`). An `OUTCOME` that cannot be written exits
 `OUTCOME_UNRECORDED` (18), and the output says whether the command may already
 have acted.
+
+An append can fail after its line reached the file, for example when the
+file's `fsync` or the directory's `fsync` fails. Its line may then be in the
+log without being durable.
+- The CLI never reuses that line's sequence number.
+- The AUDIT section names the line, and the `OUTCOME` record lists it under
+  `auditNotDurable`.
+- Such a line records nothing done. In particular, an `ACTING` line listed
+  there sent nothing: a command acts only after its `ACTING` record is durable.
+
+The invocation's durable `OUTCOME` record is authoritative. When there is
+none, the exit code and the printed output are.
 
 **Every record is bounded by construction** below 256 KiB, whatever the
 number of orders or batches. Ids keep the order-id alphabet and at most 200

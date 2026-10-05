@@ -102,6 +102,14 @@ export const EMERGENCY_VENUE_FACTS = Object.freeze({
     section: "§11, E-15",
     quote: "**`WP-330`** (account snapshot): use `/v2` only;",
   },
+  TOKEN_ID_LEXEME: {
+    id: "TOKEN_ID_LEXEME",
+    consequence:
+      "cancel-market's --asset takes a token id in canonical decimal only: the lexeme of every official example but one hex placeholder, and the only one the open-orders read lists, so cancel-market's verification compares the two as text. A 0x id is refused: the wire lexeme of a V2 position id is undocumented (§12, U-13), and a hex --asset never equals a listed decimal token, so its verification would select nothing and report a false COMPLETED (WP-330 r3, CX330-R3-01).",
+    source: REPORT_0930,
+    section: "§2.1; §12, U-13",
+    quote: "(a placeholder in hex form; every other official example is a decimal string — no consequence, U-13 unchanged)",
+  },
   READS_PER_CREDENTIAL: {
     id: "READS_PER_CREDENTIAL",
     consequence:
