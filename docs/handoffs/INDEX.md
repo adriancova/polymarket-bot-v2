@@ -142,3 +142,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-04 | [WP-290.md](WP-290.md) | `WP-290`: account reconciliation | WP | Complete (2026-10-04) | `7a53988` | 6 KB |
 | 2026-10-05 | [CI-5.md](CI-5.md) | `CI-5`: the OMS and reconciliation fault suites and the control-api PostgreSQL suite in CI | Round | Complete (2026-10-05) | `31b668d` | 2 KB |
 | 2026-10-05 | [ROLLOVER-1.md](ROLLOVER-1.md) | `ROLLOVER-1`: ADR-030 series auto-admission and multi-window runs | Round | Complete (2026-10-05) | `ae11daa` | 5 KB |
+| 2026-10-05 | [WP-320.md](WP-320.md) | `WP-320`: heartbeat health lease, fencing, geoblock and kill controls | WP | Complete (2026-10-05) | `ed6e5a0` | 6 KB |
