@@ -97,8 +97,8 @@ const DEFAULT_SERIES_ADMISSION_MAXIMUM_PAGES = 3;
  * `RTDS-RETIRE`, under the user's `V3-C13-REFERENCE-TWAP` ruling of 2026-10-04
  * (`IMPLEMENTATION_STATUS.md`). The venue moved its reference/TWAP prices from
  * the public RTDS service to the authenticated PolyBolt service, which needs
- * CLOB API credentials; the 30-second window has no replacement; and the
- * legacy RTDS price topics are planned for removal "one month after the
+ * CLOB API credentials; the 30-second window has no PolyBolt replacement; and
+ * the legacy RTDS price topics are planned for removal "one month after the
  * `0.11.0` release" — about 2026-10-23 by the venue report's own arithmetic,
  * not a date the venue states (`docs/venue/verified-2026-09-30.md` E-09 to
  * E-12, conflict C-13, register U-20). The ruling is the free route only: no
@@ -117,7 +117,7 @@ export const RTDS_RETIRED_RULING = "V3-C13";
 export const RTDS_RETIRED_REASON =
   `the rtds feed is retired (RTDS-RETIRE, ${RTDS_RETIRED_ON}; ruling ${RTDS_RETIRED_RULING} of 2026-10-04): ` +
   "Polymarket moved its reference/TWAP prices from public RTDS to the authenticated PolyBolt service " +
-  "(CLOB API credentials required; the 30-second window has no replacement) and plans to remove the legacy " +
+  "(CLOB API credentials required; the 30-second window has no PolyBolt replacement) and plans to remove the legacy " +
   "RTDS price topics one month after its 0.11.0 SDK release, about 2026-10-23 by the venue report's arithmetic " +
   "(docs/venue/verified-2026-09-30.md E-09 to E-12, C-13, U-20). " +
   "The ruling is the free route only: no credential is used for prices, so the gateway no longer records " +

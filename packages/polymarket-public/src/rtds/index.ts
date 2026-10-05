@@ -10,9 +10,9 @@
  *
  * The venue moved its reference/TWAP prices from this public service to the
  * authenticated PolyBolt service, which needs CLOB API credentials. The
- * 30-second window has no replacement, and the legacy RTDS price topics are
- * planned for removal one month after the SDK's `0.11.0` release, about
- * 2026-10-23 by the venue report's arithmetic
+ * 30-second window has no PolyBolt replacement, and the legacy RTDS price
+ * topics are planned for removal one month after the SDK's `0.11.0` release,
+ * about 2026-10-23 by the venue report's arithmetic
  * (`docs/venue/verified-2026-09-30.md` E-09 to E-12, C-13, U-20). Under the
  * user's ruling of 2026-10-04 (free route only, no credential for prices), the
  * data gateway no longer runs this adapter's live feed and refuses an `rtds`

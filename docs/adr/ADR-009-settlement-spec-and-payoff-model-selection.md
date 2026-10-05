@@ -202,10 +202,10 @@ rather than interpolate or backfill; no missing history may be fabricated
 (work-plan `WP-100` acceptance; §8.3).
 
 **Correction, 2026-10-05 (`RTDS-RETIRE`; ruling `V3-C13`; facts recorded by
-`VENUE-3` and `VENUE-SETL-1`): the 30-second window is gone, and the platform
-no longer observes any TWAP window.** The text above is unedited; it records
-the venue as verified on 2026-08-24. Since then, by the dated reports and with
-nothing asserted on this ADR's own authority:
+`VENUE-3` and `VENUE-SETL-1`): RTDS's 30-second window has no PolyBolt
+replacement, and this platform no longer ingests RTDS TWAP.** The text above
+is unedited; it records the venue as verified on 2026-08-24. Since then, by
+the dated reports and with nothing asserted on this ADR's own authority:
 
 1. **The 30-second window (`crypto_prices_twap_thirty`) is gone with RTDS.**
    The venue moved its reference/TWAP prices from public RTDS to the
@@ -220,17 +220,20 @@ nothing asserted on this ADR's own authority:
 2. **Polymarket's resolution channel publishes only 60 s.** PolyBolt's
    `price.crypto.twap`, "Chainlink time-weighted average prices used by crypto
    up/down market resolution (gated)", documents `window_seconds` as
-   "Averaging window of the TWAP series. Only 60 exists today." The venue's
+   "Averaging window of the TWAP series. Only 60 exists today." Polymarket's
    changelog moved the 5-minute markets from the 30-second lookback to a
    60-second one on 2026-08-14 (`docs/venue/verified-2026-10-04.md` F-24,
    F-25).
-3. **Chainlink still lists a 30 s stream, which the rules do not name.** Its
-   Data Streams directory shows both `BTC/USD-Streams-TWAP-60s-mainnet-production`
-   and `BTC/USD-Streams-TWAP-30s-mainnet-production` as `live`. The market
-   rules name `btc-usd-twap-60s-streams`, and matching that name to the 60 s
+3. **Chainlink still lists a 30 s stream, which the rules do not name.**
+   Chainlink's Data Streams directory shows both
+   `BTC/USD-Streams-TWAP-60s-mainnet-production` and
+   `BTC/USD-Streams-TWAP-30s-mainnet-production` as `live`. The market rules
+   name `btc-usd-twap-60s-streams`, and matching that name to the 60 s
    directory entry is an inference (`docs/venue/verified-2026-10-04.md` F-32,
-   U-31). Reading either stream's values needs a Chainlink account, a
-   credential this repository may not hold.
+   U-31). The directory documents the streams' identity, not their values, and
+   reading the 60 s stream's values needs a Chainlink account, a credential
+   this repository may not hold. This platform uses neither stream: Chainlink
+   Data Streams is a paid feed, which ruling `V3-C13` declined.
 4. **Ruling `V3-C13` (the user, 2026-10-04): the free route only.** No
    credential is used for prices, and no paid feed is bought. `RTDS-RETIRE`
    therefore retired the gateway's RTDS producer: the data gateway refuses an
@@ -241,13 +244,22 @@ nothing asserted on this ADR's own authority:
    undocumented fields (`VENUE-SETL-1`) that are never presented as
    documented.
 
-What this means for the two binding rules. Under rule 1, the 30-second window
-is no longer one any feed publishes, so a spec naming it cannot be marked
-verified. The one documented resolution window is 60 s, and no feed brings it
-to this platform: its only Polymarket channel is authenticated and unused under
-`V3-C13`. Rule 2 (exact decimals) and the no-replay halt above stand for RTDS
-data recorded before the retirement. This correction does not edit
-`packages/settlement`'s `RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24`
+What this means for the two binding rules. This correction adds no rule and
+widens neither. Rule 1 keeps its scope and its wording: it governs a
+settlement spec "whose `resolution_source` is the RTDS TWAP feed", and the
+windows it lists (30 or 60) are that feed's as of the 2026-08-24
+verification. This platform no longer ingests the RTDS TWAP feed for any
+window: its 30-second topic has no PolyBolt replacement, its legacy topics are
+deprecated with removal planned (U-20), and the gateway refuses an `rtds`
+block. Chainlink's 30 s stream is a different source: rule 1 does not reach
+it, this correction makes no ruling on a spec that names it, and it is unused
+under `V3-C13`. The one documented resolution window is 60 s (F-24, F-25),
+and this platform ingests no documented feed of it: PolyBolt's
+`price.crypto.twap` needs CLOB API credentials and Chainlink's 60 s stream
+needs an account, both unused under `V3-C13`, and the legacy RTDS 60-second
+topic is no longer ingested. Rule 2 (exact decimals) and the no-replay halt
+above stand for RTDS data recorded before the retirement. This correction does
+not edit `packages/settlement`'s `RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24`
 (`[30, 60]`), a dated record of the 2026-08-24 verification that
 `verified-2026-09-30.md` E-10 names for its owner.
 

@@ -28,10 +28,18 @@
  *       exactly as the retired driver drafted it) is read by the domain's
  *       event registry and round-trips the event bus's envelope codec.
  *
+ * 3. THE RECORD: ADR-009 §6's dated correction says what retired without
+ *    widening what binds (round 1, `RTDS-RETIRE-R1-M1`). Every statement it
+ *    makes about a 30-second window names whose window it is. It adds no
+ *    verification prohibition, keeps rule 1 scoped to the RTDS TWAP feed, and
+ *    records Chainlink's separately listed 30 s stream (F-32) as unused under
+ *    V3-C13. Outside the correction, the ADR is byte-identical to its base.
+ *
  * The RTDS adapter's own contract suite (`test/contract/rtds/`) still
  * normalizes the same fixture, through the same read doors.
  */
 
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
@@ -259,5 +267,104 @@ describe("RTDS-RETIRE — RTDS data recorded before the retirement stays readabl
     // (Its doors emit prototype-free trees, so the comparison is by value.)
     expect(validateEnvelope(envelope)).toEqual(envelope);
     expect(decodeEnvelope(encodeEnvelope(envelope))).toEqual(envelope);
+  });
+});
+
+/** ADR-009, the settlement-spec record whose §6 the correction amends. */
+const ADR_009_URL = new URL("../../../docs/adr/ADR-009-settlement-spec-and-payoff-model-selection.md", import.meta.url);
+
+/** sha256 of ADR-009 at this package's base (`096c649`), before the correction. */
+const ADR_009_BEFORE_CORRECTION_SHA256 = "a7d378124e1fe2a1a119b6c0a84fe868a767d0c8980aa131cef41377a020364f";
+
+const SECTION_6_HEADING = "### 6. TWAP specs must name a window the feed actually publishes";
+const SECTION_7_HEADING = "### 7. Neg-risk markets are recorded, not modeled, in v1";
+const CORRECTION_OPENING = "**Correction, 2026-10-05 (`RTDS-RETIRE`; ruling `V3-C13`;";
+
+/** Rule 1's own scope, quoted from the original §6 text. */
+const RULE_1_SCOPE = "whose `resolution_source` is the RTDS TWAP feed";
+
+/** A mention of a 30-second window: "30-second", "30 s", "TWAP-30s-…", "…_thirty". */
+const THIRTY_SECOND_WINDOW = /\b30(?:-second|\s?s\b)|thirty/iu;
+
+/** The sources a 30-second statement can be about. The package name `RTDS-RETIRE` is not one. */
+const NAMED_SOURCE = /RTDS|PolyBolt|Chainlink|Polymarket/u;
+
+interface Adr009Parts {
+  /** §6, from its heading up to §7's, original text and correction together. */
+  readonly section6: string;
+  /** The dated correction block, from its opening to §7's heading. */
+  readonly correction: string;
+  /** The whole record with the correction block cut out. */
+  readonly withoutCorrection: string;
+}
+
+async function adr009Parts(): Promise<Adr009Parts> {
+  const text = await readFile(ADR_009_URL, "utf8");
+  const section6At = text.indexOf(SECTION_6_HEADING);
+  const correctionAt = text.indexOf(CORRECTION_OPENING);
+  const section7At = text.indexOf(SECTION_7_HEADING);
+  // One correction, inside §6, after the original text.
+  expect(section6At).toBeGreaterThan(0);
+  expect(correctionAt).toBeGreaterThan(section6At);
+  expect(section7At).toBeGreaterThan(correctionAt);
+  expect(text.indexOf(CORRECTION_OPENING, correctionAt + 1)).toBe(-1);
+  return {
+    section6: text.slice(section6At, section7At),
+    correction: text.slice(correctionAt, section7At),
+    withoutCorrection: text.slice(0, correctionAt) + text.slice(section7At),
+  };
+}
+
+/** The correction as sentences: line wraps joined, split after `.`, `!` or `?` (and a closing quote). */
+function sentencesOf(markdown: string): readonly string[] {
+  return markdown
+    .replace(/\s+/gu, " ")
+    .split(/(?<=[.!?]["”]?)\s+/u)
+    .filter((sentence) => sentence.trim() !== "");
+}
+
+describe("RTDS-RETIRE — ADR-009 §6's dated correction records the retirement without widening rule 1", () => {
+  it("outside the correction block, ADR-009 is byte-identical to its base: the original §6 text is unedited", async () => {
+    const { withoutCorrection } = await adr009Parts();
+    expect(createHash("sha256").update(withoutCorrection, "utf8").digest("hex")).toBe(ADR_009_BEFORE_CORRECTION_SHA256);
+  });
+
+  it("every statement about a 30-second window names whose window it is (no universal 'no feed publishes it')", async () => {
+    // RTDS-RETIRE-R1-M1: the candidate said "the 30-second window is no longer
+    // one any feed publishes", which F-32 contradicts: Chainlink's directory
+    // lists a live `BTC/USD-Streams-TWAP-30s-mainnet-production` stream.
+    const { correction } = await adr009Parts();
+    const thirtySecondStatements = sentencesOf(correction.replaceAll("`RTDS-RETIRE`", "")).filter((sentence) =>
+      THIRTY_SECOND_WINDOW.test(sentence),
+    );
+    expect(thirtySecondStatements.length).toBeGreaterThanOrEqual(5);
+    for (const sentence of thirtySecondStatements) {
+      expect(sentence, sentence).toMatch(NAMED_SOURCE);
+    }
+    expect(correction).not.toMatch(/\b(?:any|no) feed (?:publishes|brings)\b|\bnothing publishes\b/iu);
+  });
+
+  it("adds no verification prohibition and keeps rule 1 scoped to the RTDS TWAP feed", async () => {
+    const { section6, correction } = await adr009Parts();
+    const flat = correction.replace(/\s+/gu, " ");
+    // "cannot be marked verified" binds only where rule 1 says it, once.
+    expect(section6.split("cannot be marked verified")).toHaveLength(2);
+    expect(flat).not.toContain("cannot be marked verified");
+    // Rule 1's scope, quoted from rule 1 itself, and stated as kept.
+    expect(section6.replace(/\s+/gu, " ")).toContain(`A settlement spec ${RULE_1_SCOPE} may only`);
+    expect(flat).toContain(`"${RULE_1_SCOPE}"`);
+    expect(flat).toContain("This correction adds no rule and widens neither.");
+    expect(flat).toContain("Rule 1 keeps its scope and its wording");
+  });
+
+  it("records Chainlink's separately listed 30 s stream (F-32) as a different source, unused under V3-C13", async () => {
+    const { correction } = await adr009Parts();
+    const flat = correction.replace(/\s+/gu, " ");
+    expect(flat).toContain("`BTC/USD-Streams-TWAP-30s-mainnet-production` as `live`");
+    expect(flat).toContain("F-32");
+    const chainlinkThirty = sentencesOf(correction).filter((sentence) => sentence.startsWith("Chainlink's 30 s stream"));
+    expect(chainlinkThirty).toHaveLength(1);
+    expect(chainlinkThirty[0]).toContain("is a different source: rule 1 does not reach it");
+    expect(chainlinkThirty[0]).toContain("unused under `V3-C13`");
   });
 });

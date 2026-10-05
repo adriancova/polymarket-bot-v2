@@ -154,7 +154,7 @@ describe("parseGatewayConfig", () => {
         "ruling V3-C13 of 2026-10-04",
         "authenticated PolyBolt",
         "CLOB API credentials",
-        "30-second window has no replacement",
+        "30-second window has no PolyBolt replacement",
         "one month after its 0.11.0 SDK release, about 2026-10-23 by the venue report's arithmetic",
         "docs/venue/verified-2026-09-30.md E-09 to E-12",
         "no credential is used for prices",
