@@ -1,0 +1,265 @@
+/**
+ * Work-plan WP-330 acceptance 2: "Output is explicit and audited" (design
+ * requirements 1 and 3).
+ *
+ * - Explicit: every command prints PLAN, RESULT, UNKNOWN and OUTCOME, in that
+ *   order, and the exit code is distinct per outcome.
+ * - Audited: every invocation (a refusal or a usage error included) appends to
+ *   an append-only LOCAL log, each record written and fsynced before the CLI
+ *   goes on: INVOKED before anything is touched, ACTING before the first
+ *   destructive call, OUTCOME after. A log that cannot be written stops the
+ *   command before it acts. The database copy is best effort.
+ * - No secret reaches the log or the output.
+ */
+
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { installNetworkTripwire, type NetworkTripwire } from "@polymarket-bot/polymarket-secure/testing";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { AUDIT_SCHEMA, createFileAuditLog, NODE_AUDIT_FILE_SYSTEM, type AuditFileSystem, type AuditMirror, type AuditRecord } from "./audit-log.js";
+import { EXIT_CODES } from "./exit-codes.js";
+import {
+  ACCOUNT,
+  args,
+  CONDITION,
+  DESTRUCTIVE_REASON,
+  fakeLeases,
+  harness,
+  LEASE_ID,
+  OPERATOR,
+  order,
+  PAPER_FLAGS,
+  phases,
+} from "./harness.test-support.js";
+import { runOpsCli } from "./run.js";
+
+let tripwire: NetworkTripwire;
+let scratch: string;
+beforeEach(async () => {
+  tripwire = installNetworkTripwire();
+  scratch = await mkdtemp(path.join(tmpdir(), "ops-cli-audit-"));
+});
+afterEach(async () => {
+  tripwire.uninstall();
+  expect(tripwire.refused()).toEqual([]);
+  await rm(scratch, { recursive: true, force: true });
+});
+
+const SECTION_ORDER = ["PLAN (what will happen):", "RESULT (what happened):", "UNKNOWN (what is not known):", "OUTCOME:"];
+
+function sectionsInOrder(text: string): boolean {
+  let at = -1;
+  for (const section of SECTION_ORDER) {
+    const next = text.indexOf(section, at + 1);
+    if (next <= at) return false;
+    at = next;
+  }
+  return true;
+}
+
+describe("acceptance 2: explicit output", () => {
+  const invocations: readonly (readonly [string, string[]])[] = [
+    ["cancel-all", args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)],
+    ["cancel-order", args("cancel-order", "o-1", ...DESTRUCTIVE_REASON, "--confirm", "cancel-order:o-1")],
+    ["cancel-market", args("cancel-market", CONDITION, ...DESTRUCTIVE_REASON, "--confirm", `cancel-market:${CONDITION}`)],
+    ["account-snapshot", args("account-snapshot")],
+    ["reconcile", args("reconcile")],
+    ["stop-heartbeat", args("stop-heartbeat", ...DESTRUCTIVE_REASON, "--confirm", `stop-heartbeat:${ACCOUNT}:${LEASE_ID}`)],
+    ["cancel-all --dry-run", args("cancel-all", ...DESTRUCTIVE_REASON, "--dry-run")],
+    ["cancel-all, unconfirmed", args("cancel-all", ...DESTRUCTIVE_REASON)],
+  ];
+  for (const [label, argv] of invocations) {
+    it(`${label}: PLAN, RESULT, UNKNOWN and OUTCOME are all printed, in order, with the exit code`, async () => {
+      const h = harness();
+      h.venue.add(order("o-1"));
+      const leases = fakeLeases();
+      const outcome = await runOpsCli(h.deps(argv, { leases: leases.factory }));
+      const text = h.text();
+      expect(sectionsInOrder(text), text).toBe(true);
+      expect(text).toContain(`${outcome.exitName} (exit ${String(outcome.exitCode)})`);
+    });
+  }
+
+  it("every exit name has its own code", () => {
+    const codes = Object.values(EXIT_CODES);
+    expect(new Set(codes).size).toBe(codes.length);
+    expect(EXIT_CODES.COMPLETED).toBe(0);
+  });
+});
+
+describe("acceptance 2: every invocation is audited, durably, before it acts", () => {
+  it("records share one invocation id, run in sequence, and carry the operator, the account, the reason and the run mode", async () => {
+    const h = harness();
+    h.venue.add(order("o-1"));
+    await runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)));
+    const records = h.audit.records;
+    expect(phases(records)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+    expect(new Set(records.map((record) => record.invocationId)).size).toBe(1);
+    expect(records.map((record) => record.sequence)).toEqual([0, 1, 2]);
+    expect(new Set(records.map((record) => record.recordId)).size).toBe(3);
+    for (const record of records) {
+      expect(record.schema).toBe(AUDIT_SCHEMA);
+      expect(record.command).toBe("cancel-all");
+      expect(record.operator).toBe(OPERATOR);
+      expect(record.accountRef).toBe(ACCOUNT);
+      expect(record.reason).toBe(DESTRUCTIVE_REASON[1]);
+    }
+    expect(records[0]?.runMode).toBeNull();
+    expect(records[2]?.runMode).toBe("LIVE_MICRO");
+  });
+
+  it("INVOKED is durable before the configuration, the credential or the venue is touched", async () => {
+    const h = harness();
+    const touchedAtAppend: number[] = [];
+    const sink = h.audit;
+    const original = sink.append.bind(sink);
+    sink.append = (record: AuditRecord) => {
+      touchedAtAppend.push(h.touched.length);
+      return original(record);
+    };
+    await runOpsCli(h.deps(args("account-snapshot")));
+    expect(touchedAtAppend[0]).toBe(0);
+  });
+
+  it("ACTING is durable before the first cancel reaches the venue", async () => {
+    const h = harness();
+    h.venue.add(order("o-1"));
+    const atCancel: string[][] = [];
+    h.venue.beforeCall = (method) => {
+      if (method.startsWith("cancel")) atCancel.push(phases(h.audit.records));
+    };
+    await runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)));
+    expect(atCancel).toEqual([["INVOKED", "ACTING"]]);
+  });
+
+  it("the INVOKED record cannot be written: AUDIT_UNAVAILABLE, and nothing is touched", async () => {
+    const h = harness();
+    h.audit.failOn = "INVOKED";
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)));
+    expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(outcome.exitCode).toBe(EXIT_CODES.AUDIT_UNAVAILABLE);
+    expect(h.touched).toEqual([]);
+    expect(h.venue.calls).toEqual([]);
+  });
+
+  it("the ACTING record cannot be written: AUDIT_UNAVAILABLE, and no cancel is sent", async () => {
+    const h = harness();
+    h.audit.failOn = "ACTING";
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)));
+    expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(h.venue.callsOf("cancelAll")).toEqual([]);
+    expect(h.venue.open()).toHaveLength(1);
+    expect(h.text()).toContain("the ACTING record could not be written");
+  });
+
+  it("the ACTING record cannot be written: stop-heartbeat revokes nothing", async () => {
+    const h = harness();
+    h.audit.failOn = "ACTING";
+    const leases = fakeLeases();
+    const outcome = await runOpsCli(h.deps(args("stop-heartbeat", ...DESTRUCTIVE_REASON, "--confirm", `stop-heartbeat:${ACCOUNT}:${LEASE_ID}`), { leases: leases.factory }));
+    expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(leases.revoked).toEqual([]);
+  });
+
+  it("no audit log at all: AUDIT_UNAVAILABLE, nothing touched", async () => {
+    const h = harness();
+    const outcome = await runOpsCli(h.deps(args("account-snapshot"), { defaultAuditLogPath: null }));
+    expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(h.touched).toEqual([]);
+    expect(h.text()).toContain("pass --audit-log <path> or set OPS_CLI_AUDIT_LOG");
+  });
+
+  it("a usage error is audited too, when a log is named", async () => {
+    const h = harness();
+    const outcome = await runOpsCli(h.deps(["cancel-all", "--account", ACCOUNT, "--operator", OPERATOR, "--yes"]));
+    expect(outcome.exitName).toBe("USAGE");
+    expect(phases(h.audit.records)).toEqual(["INVOKED", "OUTCOME"]);
+    expect(h.audit.records[0]?.detail["usageError"]).toMatch(/a bare yes names no scope/u);
+    expect(h.audit.records[0]?.operator).toBe(OPERATOR);
+  });
+
+  it("a refused run mode is audited (INVOKED with the gate's reasons, OUTCOME)", async () => {
+    const h = harness();
+    await runOpsCli(h.deps(args("account-snapshot"), { runModeFlags: PAPER_FLAGS }));
+    expect(phases(h.audit.records)).toEqual(["INVOKED", "OUTCOME"]);
+    expect(h.audit.records[1]?.detail["gateReasons"]).toEqual(["RUN_MODE_REQUIRES_NO_SIGNER", "REAL_ORDERS_NOT_ALLOWED"]);
+  });
+
+  it("the database copy: every record is mirrored when it works, and the local log stays the record of truth", async () => {
+    const mirrored: AuditRecord[] = [];
+    const database: AuditMirror = { append: (record) => (mirrored.push(record), Promise.resolve()) };
+    const h = harness({ mirror: database });
+    h.venue.add(order("o-1"));
+    await runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)));
+    expect(mirrored.map((record) => record.recordId)).toEqual(h.audit.records.map((record) => record.recordId));
+    expect(h.text()).toContain("database copy (ops.config_change_audit): 3 landed, 0 failed, 0 still pending");
+  });
+});
+
+describe("acceptance 2: the real file log, end to end", () => {
+  it("cancel-all appends three JSON lines to the file; each is written and fsynced, the ACTING one before the venue's cancel", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const events: string[] = [];
+    const observed: AuditFileSystem = {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        const name = target === file ? "file" : "dir";
+        return {
+          write: async (data) => (events.push(`${name}:write`), handle.write(data)),
+          sync: async () => (events.push(`${name}:sync`), handle.sync()),
+          stat: () => handle.stat(),
+          close: async () => (events.push(`${name}:close`), handle.close()),
+        };
+      },
+    };
+    const h = harness();
+    h.venue.add(order("o-1"), order("o-2"));
+    h.venue.beforeCall = (method) => {
+      if (method === "cancelAll") events.push("venue:cancelAll");
+    };
+    const outcome = await runOpsCli(
+      h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`, "--audit-log", file), { openAuditLog: (target) => createFileAuditLog(target, observed) }),
+    );
+    expect(outcome.exitName).toBe("COMPLETED");
+    const lines = (await readFile(file, "utf8")).trimEnd().split("\n");
+    expect(lines.map((line) => (JSON.parse(line) as AuditRecord).phase)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+    // write, sync, close for each record; the new file's directory synced once; the cancel after the ACTING sync.
+    expect(events).toEqual([
+      "file:write",
+      "file:sync",
+      "file:close",
+      "dir:sync",
+      "dir:close",
+      "file:write",
+      "file:sync",
+      "file:close",
+      "venue:cancelAll",
+      "file:write",
+      "file:sync",
+      "file:close",
+    ]);
+  });
+
+  it("nothing secret reaches the log or the output: a credential that carries secrets is never read past its account", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const secret = "SECRET-WP330-must-never-appear";
+    const h = harness();
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(
+      h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`, "--audit-log", file), {
+        openAuditLog: (target) => createFileAuditLog(target),
+        credentials: {
+          load: () => Promise.resolve({ kind: "LOADED" as const, credential: { accountRef: ACCOUNT, apiKey: secret, secret, passphrase: secret, privateKey: secret } as { accountRef: string } }),
+        },
+      }),
+    );
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(await readFile(file, "utf8")).not.toContain(secret);
+    expect(h.text()).not.toContain(secret);
+  });
+});

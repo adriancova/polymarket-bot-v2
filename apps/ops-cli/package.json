@@ -3,18 +3,27 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder application scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Operations CLI: the offline venue verification run (WP-000) and the independent emergency commands (WP-330: cancel-order, cancel-market, cancel-all, account-snapshot, reconcile, stop-heartbeat). PAPER only: every venue-touching command runs WP-260's signer gate first and refuses in PAPER, BACKTEST, SHADOW and REPLAY; every venue, credential and database surface is an injected port; no credential is loaded and no transport is written.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/ops-cli/tsconfig.json",
     "build": "tsc",
-    "verify-venue": "tsc && node ./dist/verify-venue/main.js"
+    "verify-venue": "tsc && node ./dist/verify-venue/main.js",
+    "test:integration": "vitest run --config ../../test/integration/ops-cli/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/ledger": "workspace:*",
+    "@polymarket-bot/oms": "workspace:*",
+    "@polymarket-bot/polymarket-secure": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
+    "@polymarket-bot/storage-postgres": "workspace:*"
   },
   "devDependencies": {
-    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/observability": "workspace:*",
     "@types/node": "^24.13.3",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"

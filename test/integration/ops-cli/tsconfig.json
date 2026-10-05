@@ -1,0 +1,13 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/storage-postgres": ["packages/storage-postgres/src/index.ts"],
+      "@polymarket-bot/storage-postgres/testing": ["packages/storage-postgres/src/testing/index.ts"]
+    }
+  },
+  "include": ["."]
+}

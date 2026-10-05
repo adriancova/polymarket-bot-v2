@@ -1,0 +1,168 @@
+/**
+ * Structural guarantees of the emergency CLI's production source, read from
+ * TypeScript's own syntax tree (comments and string data in comments are
+ * inert there):
+ *
+ * - INDEPENDENCE (§14.2; ADR-008 §6): no module imports the trader, the
+ *   shared trading core or the control API, by name or by path. The CLI has
+ *   no way to reach trader memory.
+ * - NO TRANSPORT (ADR-033 D2, D5): no module references WP-320's heartbeat
+ *   controller or transport, or names the heartbeat route; no module but the
+ *   composition imports a network module.
+ * - THE CREDENTIAL BOUNDARY (§15; ADR-010 §3): only `main.ts` touches the
+ *   `process` global; the environment names it reads are exactly the three
+ *   ops names (plus the run-mode record handed whole to WP-260's gate), and
+ *   none is sensitive by WP-260's own `isSensitiveKey`, and none trips the
+ *   repository's paper-safety scan (`packages/observability`'s
+ *   `scanEnvironmentForProductionNames`, the table the trader and the control
+ *   API refuse a PAPER environment by), even with a value set.
+ * - V3-E15: no Data API v1 route is named.
+ *
+ * NON-VACUOUS: each detector flags a planted snippet.
+ */
+
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { ALL_PRODUCTION_NAMES, scanEnvironmentForProductionNames } from "@polymarket-bot/observability";
+import { isSensitiveKey } from "@polymarket-bot/polymarket-secure";
+import ts from "typescript";
+import { describe, expect, it } from "vitest";
+
+import { AUDIT_LOG_ENV, CONFIG_ENV, DATABASE_URL_ENV } from "./main.js";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SRC = path.resolve(HERE, "..");
+
+function productionFiles(): string[] {
+  const out: string[] = [];
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts") && !entry.name.endsWith(".test-support.ts")) out.push(full);
+    }
+  };
+  walk(HERE);
+  return out.sort();
+}
+
+interface Findings {
+  readonly imports: string[];
+  processUses: number;
+  readonly envNames: string[];
+  readonly strings: string[];
+  readonly identifiers: Set<string>;
+}
+
+function scan(text: string, fileName: string): Findings {
+  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const found: Findings = { imports: [], processUses: 0, envNames: [], strings: [], identifiers: new Set() };
+  const visit = (node: ts.Node): void => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
+      found.imports.push(node.moduleSpecifier.text);
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments[0] !== undefined && ts.isStringLiteral(node.arguments[0])) {
+      found.imports.push(node.arguments[0].text);
+    } else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      found.strings.push(node.text);
+    }
+    if (ts.isIdentifier(node)) {
+      found.identifiers.add(node.text);
+      if (node.text === "process") found.processUses += 1;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+const FORBIDDEN_IMPORTS = [/^@polymarket-bot\/trader(\/|$)/u, /^@polymarket-bot\/trading-core(\/|$)/u, /^@polymarket-bot\/control-api(\/|$)/u, /apps\/trader|trading-core|control-api/u];
+const NETWORK_MODULES = ["http", "https", "net", "tls", "dgram", "dns", "ws", "undici", "node:http", "node:https", "node:net", "node:tls", "node:dgram", "node:dns"];
+const TRANSPORT_NAMES = ["OrderHeartbeatTransport", "createOrderHeartbeatController", "classifyHeartbeatAnswer", "BOOTSTRAP_HEARTBEAT_ID"];
+const DATA_API_V1 = /^\/(?:v1\/|positions\b|closed-positions\b|activity\b|value\b|holders\b)/u;
+
+describe("the emergency CLI's production source", () => {
+  const files = productionFiles();
+
+  it("is the set this scan expects (non-vacuity)", () => {
+    const names = files.map((file) => path.relative(HERE, file));
+    expect(names).toEqual(expect.arrayContaining(["run.ts", "main.ts", "commands/cancel.ts", "commands/reconcile.ts", "commands/stop-heartbeat.ts", "audit-log.ts"]));
+  });
+
+  it("INDEPENDENCE: imports neither the trader, the trading core nor the control API, by name or by path", () => {
+    const offenders = files.flatMap((file) => scan(readFileSync(file, "utf8"), file).imports.filter((specifier) => FORBIDDEN_IMPORTS.some((rule) => rule.test(specifier))).map((specifier) => `${path.relative(SRC, file)}: ${specifier}`));
+    expect(offenders).toEqual([]);
+  });
+
+  it("INDEPENDENCE: the package manifest declares no trader, trading-core or control-api dependency", () => {
+    const manifest = JSON.parse(readFileSync(path.resolve(SRC, "..", "package.json"), "utf8")) as Record<string, Record<string, string> | undefined>;
+    const declared = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"].flatMap((field) => Object.keys(manifest[field] ?? {}));
+    expect(declared.filter((name) => /trader|trading-core|control-api/u.test(name))).toEqual([]);
+  });
+
+  it("NO TRANSPORT: no heartbeat controller, transport or route, and no network module outside the composition", () => {
+    for (const file of files) {
+      const found = scan(readFileSync(file, "utf8"), file);
+      const relative = path.relative(HERE, file);
+      expect(TRANSPORT_NAMES.filter((name) => found.identifiers.has(name)), relative).toEqual([]);
+      expect(found.strings.filter((text) => /heartbeats\b/u.test(text) && text.startsWith("/")), relative).toEqual([]);
+      expect(found.imports.filter((specifier) => NETWORK_MODULES.includes(specifier)), relative).toEqual([]);
+    }
+  });
+
+  it("THE CREDENTIAL BOUNDARY: only main.ts touches `process`; it reads exactly the three ops names, none sensitive", () => {
+    for (const file of files) {
+      const found = scan(readFileSync(file, "utf8"), file);
+      if (path.basename(file) !== "main.ts") expect(found.processUses, path.relative(HERE, file)).toBe(0);
+    }
+    const names = [AUDIT_LOG_ENV, CONFIG_ENV, DATABASE_URL_ENV];
+    expect(names).toEqual(["OPS_CLI_AUDIT_LOG", "OPS_CLI_CONFIG", "OPS_CLI_DATABASE_URL"]);
+    expect(names.filter((name) => isSensitiveKey(name))).toEqual([]);
+    const main = readFileSync(path.join(HERE, "main.ts"), "utf8");
+    // Every `io.env[...]` read names one of the three constants; the record itself goes whole to the gate.
+    const reads = [...main.matchAll(/io\.env\[([A-Z_]+)\]/gu)].map((match) => match[1]);
+    expect(new Set(reads)).toEqual(new Set(["DATABASE_URL_ENV", "AUDIT_LOG_ENV", "CONFIG_ENV"]));
+    expect(main).toContain("runModeFlags: io.env");
+  });
+
+  it("THE CREDENTIAL BOUNDARY: the CLI's environment names, set, do not trip the paper-safety scan; and no source names a production secret", () => {
+    const environment = { [AUDIT_LOG_ENV]: "/var/lib/pmb/audit.jsonl", [CONFIG_ENV]: "/etc/pmb/ops.json", [DATABASE_URL_ENV]: "postgresql://ops@db/pmb", RUN_MODE: "PAPER", MAX_RUN_MODE: "PAPER", ALLOW_REAL_ORDERS: "false" };
+    expect(scanEnvironmentForProductionNames(environment)).toEqual([]);
+    for (const file of files) {
+      const text = readFileSync(file, "utf8").toUpperCase();
+      expect(ALL_PRODUCTION_NAMES.filter((name) => text.includes(name)), path.relative(HERE, file)).toEqual([]);
+    }
+    // CONTROL: the scan refuses a production name.
+    expect(scanEnvironmentForProductionNames({ POLYMARKET_PRIVATE_KEY: "x" }).length).toBeGreaterThan(0);
+  });
+
+  it("V3-E15: no Data API v1 route is named anywhere", () => {
+    for (const file of files) {
+      const found = scan(readFileSync(file, "utf8"), file);
+      expect(found.strings.filter((text) => DATA_API_V1.test(text)), path.relative(HERE, file)).toEqual([]);
+    }
+  });
+
+  it("NON-VACUOUS: every detector flags a planted snippet", () => {
+    const planted = scan(
+      [
+        'import { x } from "@polymarket-bot/trader";',
+        'import { y } from "../../../apps/trader/src/loop.js";',
+        'import net from "node:net";',
+        'import type { OrderHeartbeatTransport } from "@polymarket-bot/polymarket-secure";',
+        'const route = "/v1/heartbeats";',
+        'const positions = "/positions";',
+        "const key = process.env.SOMETHING;",
+      ].join("\n"),
+      "planted.ts",
+    );
+    expect(planted.imports.filter((specifier) => FORBIDDEN_IMPORTS.some((rule) => rule.test(specifier)))).toHaveLength(2);
+    expect(planted.imports.filter((specifier) => NETWORK_MODULES.includes(specifier))).toEqual(["node:net"]);
+    expect(planted.identifiers.has("OrderHeartbeatTransport")).toBe(true);
+    expect(planted.strings.filter((text) => /heartbeats\b/u.test(text) && text.startsWith("/"))).toEqual(["/v1/heartbeats"]);
+    expect(planted.strings.filter((text) => DATA_API_V1.test(text))).toEqual(["/v1/heartbeats", "/positions"]);
+    expect(planted.processUses).toBe(1);
+    expect(isSensitiveKey("OPS_CLI_CANCEL_API_KEY")).toBe(true);
+  });
+});
