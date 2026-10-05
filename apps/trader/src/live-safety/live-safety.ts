@@ -155,6 +155,7 @@ export class LiveSafety {
   readonly #stops = new Map<HeartbeatStopSource, string>();
   readonly #haltedMarkets = new Set<string>();
   readonly #cancelsDone = new Set<string>();
+  readonly #cancelsInFlight = new Set<string>();
   #accountHalted = false;
   /** Whether the latest kill-switch read succeeded (true before the first: the first failure pages). */
   #killSwitchReadable = true;
@@ -192,12 +193,19 @@ export class LiveSafety {
     interval(options.eligibility.refreshIntervalMs, "eligibility.refreshIntervalMs");
     if (options.killSwitch.refreshIntervalMs >= options.health.maxAgeMs.KILL_SWITCH) throw new LiveSafetyConfigurationError("killSwitch.refreshIntervalMs");
     if (options.eligibility.refreshIntervalMs >= options.eligibility.maxAgeMs) throw new LiveSafetyConfigurationError("eligibility.refreshIntervalMs");
-    this.#killSwitch = new KillSwitchMonitor({ reader: options.killSwitch.reader, clock: options.clock, accountRef: options.accountRef });
+    // A read slower than one refresh interval is abandoned by the next refresh: a hung read never freezes the state.
+    this.#killSwitch = new KillSwitchMonitor({
+      reader: options.killSwitch.reader,
+      clock: options.clock,
+      accountRef: options.accountRef,
+      abandonAfterMs: options.killSwitch.refreshIntervalMs,
+    });
     this.#eligibility = new VenueEligibility({
       geoblock: options.eligibility.geoblock,
       closedOnly: options.eligibility.closedOnly,
       clock: options.clock,
       maxAgeMs: options.eligibility.maxAgeMs,
+      abandonAfterMs: options.eligibility.refreshIntervalMs,
     });
     this.#eventLoop = new EventLoopProbe({
       board: this.#board,
@@ -231,6 +239,10 @@ export class LiveSafety {
       failedRunSpacingMs: options.recovery.failedRunSpacingMs,
       onReport: (report) => {
         this.recordReconcileReport(report);
+      },
+      gateReasonsNow: () => {
+        const verdict = this.#heartbeatGate();
+        return verdict.permitted ? [] : verdict.reasons;
       },
     });
 
@@ -483,30 +495,30 @@ export class LiveSafety {
     if (!snapshot.known) return;
     for (const { directive, killSwitchEventId } of snapshot.effects.cancels) {
       const key = `${killSwitchEventId}:${directive.scope}:${directive.scope === "MARKET" ? directive.marketId : directive.scope === "STRATEGY_INSTANCE" ? directive.instanceId : ""}`;
-      if (this.#cancelsDone.has(key)) continue;
+      if (this.#cancelsDone.has(key) || this.#cancelsInFlight.has(key)) continue;
+      this.#cancelsInFlight.add(key);
       let accepted = false;
       try {
         accepted = (await this.#options.killSwitch.cancels.cancel(directive)) === true;
       } catch {
         accepted = false;
+      } finally {
+        this.#cancelsInFlight.delete(key);
       }
       if (accepted) this.#cancelsDone.add(key);
       this.#record({ kind: "KILL_SWITCH_CANCEL_REQUESTED", directive: key, accepted, atMs: this.#now() ?? 0 });
     }
   }
 
+  /**
+   * Run `work` now and every `intervalMs`. Each tick calls it whether or not the previous call has settled: the
+   * monitors join or abandon a read in progress themselves, and the fence serializes its renewals, so a hung call
+   * never stops the refreshes.
+   */
   #every(intervalMs: number, work: () => Promise<unknown>): void {
-    let running = false;
     const tick = (): void => {
       if (!this.#started) return;
-      if (!running) {
-        running = true;
-        void work()
-          .catch(() => undefined)
-          .finally(() => {
-            running = false;
-          });
-      }
+      void work().catch(() => undefined);
       const handle = this.#options.timers.setTimeout(() => {
         this.#handles.delete(handle);
         tick();

@@ -83,6 +83,11 @@ export class ManualTime implements HeartbeatClock, HeartbeatTimers {
     this.#monotonic -= deltaMs;
   }
 
+  /** A stall: time moves on by `ms` and no timer fires until the next `advance` (a blocked process). */
+  stall(ms: number): void {
+    this.#monotonic += ms;
+  }
+
   setTimeout(callback: () => void, delayMs: number): unknown {
     this.#order += 1;
     const id = this.#order;
@@ -118,9 +123,13 @@ export class ManualTime implements HeartbeatClock, HeartbeatTimers {
   }
 }
 
-/** Let every pending promise continuation run. */
+/** Let every pending promise continuation run: a macrotask turn drains the whole microtask queue, chains included. */
 export async function settle(): Promise<void> {
-  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+  for (let turn = 0; turn < 3; turn += 1) {
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  }
 }
 
 export interface RecordedRequest {

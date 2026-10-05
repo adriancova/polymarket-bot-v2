@@ -139,6 +139,38 @@ describe("the monitor: the latest read decides, and a failed read is unknown sta
     expect(monitor.proofSource().read()).toEqual({ healthy: false, reason: "ENGAGED_STOPS_HEARTBEAT" });
   });
 
+  it("a hung read is abandoned after abandonAfterMs: unknown at once, a new read starts, and the old answer is discarded when it lands", async () => {
+    const clock = new ManualClock();
+    const answers: ((rows: readonly unknown[]) => void)[] = [];
+    let reads = 0;
+    const reader = {
+      read: (): Promise<readonly never[]> => {
+        reads += 1;
+        return new Promise((resolve) => {
+          answers.push((rows) => {
+            resolve(rows as readonly never[]);
+          });
+        });
+      },
+    };
+    const monitor = new KillSwitchMonitor({ reader, clock, accountRef: ACCOUNT, abandonAfterMs: 1_000 });
+    const first = monitor.refresh();
+    await clock.advance(999);
+    void monitor.refresh();
+    expect(reads).toBe(1);
+    await clock.advance(1);
+    const second = monitor.refresh();
+    expect(reads).toBe(2);
+    expect(monitor.snapshot()).toEqual({ known: false, reason: "READ_TIMED_OUT" });
+    // The new read answers "released"; then the abandoned one lands with an engaged switch: it is discarded.
+    answers[1]?.([]);
+    expect(await second).toBe(true);
+    answers[0]?.([engageRow({ id: "old", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })]);
+    expect(await first).toBe(false);
+    expect(monitor.snapshot()).toMatchObject({ known: true });
+    expect(monitor.proofSource().read().healthy).toBe(true);
+  });
+
   it("one read at a time: a refresh during a read joins it", async () => {
     const reader = new FakeKillSwitchReader();
     const monitor = new KillSwitchMonitor({ reader, clock: new ManualClock(), accountRef: ACCOUNT });

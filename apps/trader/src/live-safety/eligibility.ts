@@ -158,9 +158,18 @@ export class VenueEligibility {
   readonly #maxAgeMs: number;
   #geo: Attempt<GeoblockReading> = Object.freeze({ kind: "NEVER" as const });
   #closed: Attempt<ClosedOnlyReading> = Object.freeze({ kind: "NEVER" as const });
-  #inFlight: Promise<void> | null = null;
+  #inFlight: { readonly promise: Promise<void>; readonly startedAtMs: number | null; readonly seq: number } | null = null;
+  #seq = 0;
+  readonly #abandonAfterMs: number;
 
-  constructor(options: { readonly geoblock: GeoblockPort; readonly closedOnly: ClosedOnlyPort; readonly clock: MonotonicClock; readonly maxAgeMs: number }) {
+  constructor(options: {
+    readonly geoblock: GeoblockPort;
+    readonly closedOnly: ClosedOnlyPort;
+    readonly clock: MonotonicClock;
+    readonly maxAgeMs: number;
+    /** A run still in progress after this long is abandoned by the next refresh (its answers discarded). */
+    readonly abandonAfterMs?: number;
+  }) {
     if (typeof options.geoblock?.check !== "function") throw new EligibilityConfigurationError("geoblock");
     if (typeof options.closedOnly?.read !== "function") throw new EligibilityConfigurationError("closedOnly");
     if (!Number.isSafeInteger(options.maxAgeMs) || options.maxAgeMs < 1) throw new EligibilityConfigurationError("maxAgeMs");
@@ -168,17 +177,25 @@ export class VenueEligibility {
     this.#closedOnly = options.closedOnly;
     this.#clock = options.clock;
     this.#maxAgeMs = options.maxAgeMs;
+    this.#abandonAfterMs = options.abandonAfterMs ?? Number.POSITIVE_INFINITY;
   }
 
-  /** Run both checks now (or join the run in progress). */
+  /** Run both checks now (or join the run in progress, unless it is older than `abandonAfterMs`). */
   refresh(): Promise<void> {
-    if (this.#inFlight !== null) return this.#inFlight;
-    const run = Promise.all([this.#checkGeoblock(), this.#checkClosedOnly()]).then(() => undefined);
-    const tracked = run.finally(() => {
-      this.#inFlight = null;
+    const now = this.#started();
+    const current = this.#inFlight;
+    if (current !== null) {
+      const young = now !== null && current.startedAtMs !== null && now - current.startedAtMs < this.#abandonAfterMs;
+      if (young) return current.promise;
+    }
+    this.#seq += 1;
+    const seq = this.#seq;
+    const run = Promise.all([this.#checkGeoblock(seq), this.#checkClosedOnly(seq)]).then(() => undefined);
+    const promise = run.finally(() => {
+      if (this.#inFlight?.seq === seq) this.#inFlight = null;
     });
-    this.#inFlight = tracked;
-    return tracked;
+    this.#inFlight = { promise, startedAtMs: now, seq };
+    return promise;
   }
 
   /** Whether new live entries are permitted NOW, with every reason they are not. */
@@ -224,31 +241,36 @@ export class VenueEligibility {
     }
   }
 
-  async #checkGeoblock(): Promise<void> {
+  async #checkGeoblock(seq: number): Promise<void> {
     const startedAtMs = this.#started();
     if (startedAtMs === null) {
       this.#geo = Object.freeze({ kind: "FAILED" as const, startedAtMs: Number.NEGATIVE_INFINITY });
       return;
     }
+    let next: Attempt<GeoblockReading>;
     try {
       const body = await this.#geoblock.check();
-      this.#geo = Object.freeze({ kind: "READ" as const, reading: readGeoblock(body), startedAtMs });
+      next = Object.freeze({ kind: "READ" as const, reading: readGeoblock(body), startedAtMs });
     } catch {
-      this.#geo = Object.freeze({ kind: "FAILED" as const, startedAtMs });
+      next = Object.freeze({ kind: "FAILED" as const, startedAtMs });
     }
+    // An abandoned run's answer is discarded: a newer run has started.
+    if (seq === this.#seq) this.#geo = next;
   }
 
-  async #checkClosedOnly(): Promise<void> {
+  async #checkClosedOnly(seq: number): Promise<void> {
     const startedAtMs = this.#started();
     if (startedAtMs === null) {
       this.#closed = Object.freeze({ kind: "FAILED" as const, startedAtMs: Number.NEGATIVE_INFINITY });
       return;
     }
+    let next: Attempt<ClosedOnlyReading>;
     try {
       const body = await this.#closedOnly.read();
-      this.#closed = Object.freeze({ kind: "READ" as const, reading: readClosedOnly(body), startedAtMs });
+      next = Object.freeze({ kind: "READ" as const, reading: readClosedOnly(body), startedAtMs });
     } catch {
-      this.#closed = Object.freeze({ kind: "FAILED" as const, startedAtMs });
+      next = Object.freeze({ kind: "FAILED" as const, startedAtMs });
     }
+    if (seq === this.#seq) this.#closed = next;
   }
 }

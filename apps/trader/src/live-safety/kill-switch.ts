@@ -236,7 +236,7 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
 /** The latest read, as the gate and the health lease see it. */
 export type KillSwitchSnapshot =
   | { readonly known: true; readonly effects: KillSwitchEffects; readonly readStartedAtMs: number }
-  | { readonly known: false; readonly reason: "NEVER_READ" | "READ_FAILED" | "READ_IN_FUTURE" | "CLOCK_UNREADABLE" };
+  | { readonly known: false; readonly reason: "NEVER_READ" | "READ_FAILED" | "READ_TIMED_OUT" | "CLOCK_UNREADABLE" };
 
 /**
  * Reads the kill-switch rows on demand ({@link KillSwitchMonitor.refresh}),
@@ -244,28 +244,45 @@ export type KillSwitchSnapshot =
  * the instant before it started (the rows it returns are at least that
  * fresh). The latest outcome failing makes the state unknown at once, whatever
  * an earlier read said.
+ *
+ * A read still in progress after `abandonAfterMs` is ABANDONED by the next
+ * refresh: the state becomes unknown (`READ_TIMED_OUT`) at once, a new read
+ * starts, and the abandoned read's answer, when it lands, is discarded. So a
+ * hung read can never freeze the state at an old answer.
  */
 export class KillSwitchMonitor {
   readonly #reader: KillSwitchReader;
   readonly #clock: MonotonicClock;
   readonly #accountRef: string;
+  readonly #abandonAfterMs: number;
   #latest: KillSwitchSnapshot = Object.freeze({ known: false as const, reason: "NEVER_READ" as const });
-  #reading: Promise<boolean> | null = null;
+  #reading: { readonly promise: Promise<boolean>; readonly startedAtMs: number | null; readonly seq: number } | null = null;
+  #seq = 0;
 
-  constructor(options: { readonly reader: KillSwitchReader; readonly clock: MonotonicClock; readonly accountRef: string }) {
+  constructor(options: { readonly reader: KillSwitchReader; readonly clock: MonotonicClock; readonly accountRef: string; readonly abandonAfterMs?: number }) {
     this.#reader = options.reader;
     this.#clock = options.clock;
     this.#accountRef = options.accountRef;
+    this.#abandonAfterMs = options.abandonAfterMs ?? Number.POSITIVE_INFINITY;
   }
 
-  /** Read now (or join the read in progress). `true` when the read succeeded. */
+  /** Read now (or join the read in progress, unless it is older than `abandonAfterMs`). `true` when the read succeeded. */
   refresh(): Promise<boolean> {
-    if (this.#reading !== null) return this.#reading;
-    const reading = this.#read().finally(() => {
-      this.#reading = null;
+    const now = this.#readClock();
+    const current = this.#reading;
+    if (current !== null) {
+      const young = now !== null && current.startedAtMs !== null && now - current.startedAtMs < this.#abandonAfterMs;
+      if (young) return current.promise;
+      // Abandoned: unknown at once; its answer will be discarded.
+      this.#latest = Object.freeze({ known: false as const, reason: "READ_TIMED_OUT" as const });
+    }
+    this.#seq += 1;
+    const seq = this.#seq;
+    const promise = this.#read(seq, now).finally(() => {
+      if (this.#reading?.seq === seq) this.#reading = null;
     });
-    this.#reading = reading;
-    return reading;
+    this.#reading = { promise, startedAtMs: now, seq };
+    return promise;
   }
 
   snapshot(): KillSwitchSnapshot {
@@ -287,11 +304,17 @@ export class KillSwitchMonitor {
     });
   }
 
-  async #read(): Promise<boolean> {
-    let started: number;
+  #readClock(): number | null {
     try {
-      started = this.#clock.monotonicMs();
+      const value = this.#clock.monotonicMs();
+      return Number.isFinite(value) ? value : null;
     } catch {
+      return null;
+    }
+  }
+
+  async #read(seq: number, started: number | null): Promise<boolean> {
+    if (started === null) {
       this.#latest = Object.freeze({ known: false as const, reason: "CLOCK_UNREADABLE" as const });
       return false;
     }
@@ -299,9 +322,11 @@ export class KillSwitchMonitor {
     try {
       rows = await this.#reader.read();
     } catch {
-      this.#latest = Object.freeze({ known: false as const, reason: "READ_FAILED" as const });
+      if (seq === this.#seq) this.#latest = Object.freeze({ known: false as const, reason: "READ_FAILED" as const });
       return false;
     }
+    // An abandoned read's answer is discarded: a newer read has started.
+    if (seq !== this.#seq) return false;
     if (!Array.isArray(rows)) {
       this.#latest = Object.freeze({ known: false as const, reason: "READ_FAILED" as const });
       return false;

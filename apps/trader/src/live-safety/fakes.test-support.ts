@@ -25,9 +25,13 @@ interface Scheduled {
   readonly callback: () => void;
 }
 
-/** Let every pending promise continuation run. */
+/** Let every pending promise continuation run: a macrotask turn drains the whole microtask queue, chains included. */
 export async function settle(): Promise<void> {
-  for (let turn = 0; turn < 30; turn += 1) await Promise.resolve();
+  for (let turn = 0; turn < 3; turn += 1) {
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  }
 }
 
 /** A manual monotonic clock and timer queue. */
@@ -43,6 +47,11 @@ export class ManualClock implements MonotonicClock, SafetyTimers {
 
   get now(): number {
     return this.#now;
+  }
+
+  /** A stall: time moves on by `ms` and no timer fires until the next `advance` (a blocked process). */
+  stall(ms: number): void {
+    this.#now += ms;
   }
 
   monotonicMs(): number {
@@ -302,6 +311,8 @@ export const BLOCKED_CLOSE_ONLY_TIER = Object.freeze({ blocked: true, ip: "198.5
 export class FakeBodyPort {
   body: unknown;
   failing = false;
+  /** The next calls never answer (a hung endpoint). */
+  hanging = false;
   calls = 0;
   constructor(body: unknown) {
     this.body = body;
@@ -311,6 +322,7 @@ export class FakeBodyPort {
   }
   async read(): Promise<unknown> {
     this.calls += 1;
+    if (this.hanging) await new Promise<never>(() => undefined);
     await Promise.resolve();
     if (this.failing) throw new Error("socket hang up (synthetic)");
     return this.body;

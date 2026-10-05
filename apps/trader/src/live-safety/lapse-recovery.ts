@@ -10,11 +10,12 @@
  *
  * ## When a lapse starts (D6)
  *
- * 1. Record the lapse, with its cause and start. A lapse caused by a failed
- *    health lease (or an explicit stop, which acts through it) while orders
- *    may exist pages "Heartbeat health lease failed while orders may exist"
- *    (§14.4). Orders may exist unless the OMS is readable, not faulted, and
- *    every order it tracks is terminal.
+ * 1. Record the lapse, with its cause and start, and with the heartbeat
+ *    gate's refusal reasons at that moment. A lapse while the health lease
+ *    fails (or an explicit stop, which acts through it, is in force) and
+ *    orders may exist pages "Heartbeat health lease failed while orders may
+ *    exist" (§14.4). Orders may exist unless the OMS is readable, not
+ *    faulted, and every order it tracks is terminal.
  * 2. Send every open order with a venue order id to `RECONCILING` through
  *    `OrderManager.requestOrderReconciliation` (reason `MANUAL_REQUEST`, so the
  *    lapse record is what names the cause). WP-290's coordinator raises each
@@ -48,10 +49,12 @@
  *      class's own calls are judged; a pass reported by any other caller's
  *      call never ends the calls.
  *    - **After a `NOT_RUN` (R4-L1).** A call made while another is in
- *      progress runs nothing. This class then polls the coordinator's
- *      `status().running` every `notRunPollMs` until the call in progress has
- *      ended, and calls again AT ONCE, whether or not a trigger is pending.
- *      There is no other spacing after a `NOT_RUN`.
+ *      progress runs nothing. So this class does not call while the
+ *      coordinator's `status().running` says a call is in progress: it polls
+ *      it every `notRunPollMs` until that call has ended, and then calls AT
+ *      ONCE, whether or not a trigger is pending. A call that still returns
+ *      `NOT_RUN` (another caller claimed the run in between) is treated the
+ *      same way. There is no other spacing after a `NOT_RUN`.
  *    - **After a qualifying run that does not pass and resume**, the next
  *      call waits `failedRunSpacingMs` (D6: "the composition may space its
  *      calls").
@@ -102,6 +105,12 @@ export interface LapseRecoveryOptions {
   readonly failedRunSpacingMs: number;
   /** Every report this class's own calls receive (the composition proves the RECONCILER health input from them). */
   readonly onReport?: (report: { readonly runs: readonly { readonly status: string; readonly resumed: boolean }[] }) => void;
+  /**
+   * The heartbeat gate's refusal reasons AT THIS MOMENT (empty when it permits). A lapse is recorded with them as
+   * well as with the controller's cause: the deadline can fall before the next tick asks the gate, and a failed
+   * health lease or an explicit stop in force at the lapse is what pages.
+   */
+  readonly gateReasonsNow?: () => readonly string[];
 }
 
 export interface LapseEventStart {
@@ -144,10 +153,12 @@ export class LapseRecovery {
     this.#latched = true;
     this.#clearTimers();
     // Step 1.
-    this.#record({ kind: "LAPSE_STARTED", cause: event.cause, gateReasons: Object.freeze([...event.gateReasons]), atMs: event.atMs, epoch });
-    const healthFailed = event.cause === "GATE_REFUSED" && event.gateReasons.some((reason) => reason.startsWith("HEALTH_") || reason.startsWith("STOPPED_"));
+    const reasons = [...event.gateReasons];
+    for (const reason of this.#gateReasonsNow()) if (!reasons.includes(reason)) reasons.push(reason);
+    this.#record({ kind: "LAPSE_STARTED", cause: event.cause, gateReasons: Object.freeze(reasons), atMs: event.atMs, epoch });
+    const healthFailed = reasons.some((reason) => reason.startsWith("HEALTH_") || reason.startsWith("STOPPED_"));
     if (healthFailed && this.#ordersMayExist()) {
-      this.#page("HEARTBEAT_HEALTH_LEASE_FAILED_WHILE_ORDERS_MAY_EXIST", `heartbeat lapsed (${event.gateReasons.join(", ")}) while orders may exist`);
+      this.#page("HEARTBEAT_HEALTH_LEASE_FAILED_WHILE_ORDERS_MAY_EXIST", `heartbeat lapsed (${reasons.join(", ")}) while orders may exist`);
     }
     // Step 2.
     void this.#requestOpenOrders(epoch, false);
@@ -278,6 +289,14 @@ export class LapseRecovery {
         accepted = false;
       }
       this.#record({ kind: "LAPSE_RECONCILIATION_REQUESTED", orderId: order.orderId, accepted, epoch });
+    }
+  }
+
+  #gateReasonsNow(): readonly string[] {
+    try {
+      return this.#options.gateReasonsNow?.() ?? [];
+    } catch {
+      return ["GATE_UNREADABLE"];
     }
   }
 
