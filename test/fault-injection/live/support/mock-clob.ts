@@ -30,7 +30,8 @@
  * | Placement statuses `live` / `unmatched`; the pinned SDK turns `unmatched` into `{ok:false, code:"unmatched"}` | §2.2, C-6; WP-260 handoff |
  * | Batch placement of 1–15 orders; batch cancel ≤ 1,000 ids (C-11, the lower figure) | §W.3 |
  * | Cancel answers `{canceled, not_canceled}` with the documented reasons | §2.5 |
- * | Per-signer order and cancel buckets (Standard tier: order 60 burst, 40/s; cancel 120 burst, 80/s, negative balance allowed), `Poly-RateLimit-*` feedback, `429` with `Retry-After` | §8 (S-D25), WP-310's dated snapshot `rate-limits-2026-09-30` |
+ * | Order and cancel buckets PER SIGNER ADDRESS, shared by every API key of that signer (Standard tier: order 60 burst, 40/s; cancel 120 burst, 80/s); a batch admitted only with tokens for every entry; `Poly-RateLimit-*` feedback, `429` with `Retry-After` | §8 (S-D25), WP-310's dated snapshot `rate-limits-2026-09-30` |
+ * | D-21: a cancel-all or cancel-market request first consumes one cancel token, then one more per order canceled once the result is known, which may put the Standard tier's bucket in debt; later cancel requests stay blocked until the bucket holds enough tokens for the next one | `verified-2026-09-16.md` §8 D-21 |
  * | User channel: `order` events (`PLACEMENT`/`UPDATE`/`CANCELLATION`) and `trade` events (`MATCHED` … `CONFIRMED`), no replay of missed events | §4, §W.4 |
  * | Reads: open orders (an absent order is not proof of cancellation), by id "regardless of status", trades, `/v2/positions`, on-chain collateral, `/v2/approvals` | §W.9 E-14, E-15; `ReconWorld` |
  *
@@ -47,6 +48,14 @@
  * - A6: the check timer's phase is fixed when the venue starts; a valid heartbeat at exactly 10 s still counts.
  * - A7: our orders rest (they never cross on arrival); fills are the venue's later matches, at the order's price,
  *   fee 0, as WP-290's `ReconWorld` books them.
+ * - A8: a user-channel frame is pushed through the shared time line, so it reaches a process only when that time
+ *   line turns, AFTER the REST answer of the request that caused it (REST answers are synchronous here). The venue
+ *   documents no ordering between a REST answer and the push of the same change (WP340-F1's route 3 rests on this).
+ * - A9: the rate-limit details the docs leave open: tokens refill continuously at the tier's rate; a request refused
+ *   `429` (an order batch, or a cancel blocked by D-21) consumes nothing and is answered with the pinned SDK's
+ *   `RateLimitError` (`Retry-After: 2`); a by-id cancel batch, like a placement batch, is admitted only with a token
+ *   for every id; callers sharing one signer's buckets are served in arrival order (bucket arbitration is
+ *   undocumented, `verified-2026-09-16.md` §12); a 425'd cancel consumes nothing (with A5).
  *
  * ## The oracle it keeps (independent of the system under test)
  *
@@ -112,7 +121,7 @@ export const CANCELLATION_CHECK_MS = 5_000;
 export const MAX_CANCEL_IDS = 1_000;
 /** "1 to 15" orders per batch (§W.3). */
 export const MAX_BATCH_ORDERS = 15;
-/** The Standard tier's per-signer buckets (`rate-limits-2026-09-30`, §8): order 60 burst at 40/s; cancel 120 at 80/s, negative allowed (D-21). */
+/** The Standard tier's per-signer-address buckets (`rate-limits-2026-09-30`, §8): order 60 burst at 40/s; cancel 120 at 80/s, negative allowed (D-21). */
 export const STANDARD_TIER = Object.freeze({ tier: "Standard", orderBurst: 60, orderPerSecond: 40, cancelBurst: 120, cancelPerSecond: 80 });
 
 export interface CredentialRecord {
@@ -120,10 +129,16 @@ export interface CredentialRecord {
   readonly account: string;
   /** The user-channel `owner` field this credential's orders carry. */
   readonly owner: string;
+  /**
+   * The signer address the credential's requests are signed and RATE-LIMITED under: §8's buckets are per signer
+   * address, so every API key of one signer draws on the same two buckets. It is the fake SDK's account signer too.
+   */
+  readonly signer: string;
 }
 
+/** A token bucket in THOUSANDTHS of a token (exact integers: the refill of `ms` milliseconds at `r` tokens/s is `ms × r`). */
 interface Bucket {
-  level: number;
+  milli: number;
   atMs: number;
 }
 
@@ -219,7 +234,11 @@ export class MockClob extends ReconWorld {
     super({ now: () => options.time.epochMs(), collateral: options.collateral, collateralAssetId: options.collateralAssetId });
     this.time = options.time;
     this.errors = options.errors;
-    this.credentials = options.credentials ?? { trader: { account: "acct-live-1", owner: OUR_OWNER }, emergency: { account: "acct-live-1", owner: OUR_OWNER } };
+    // The trader's key and the separate emergency key (WP-330, handoff §15) of ONE account and ONE signer.
+    this.credentials = options.credentials ?? {
+      trader: { account: "acct-live-1", owner: OUR_OWNER, signer: DEFAULT_FAKE_ACCOUNT.signer },
+      emergency: { account: "acct-live-1", owner: OUR_OWNER, signer: DEFAULT_FAKE_ACCOUNT.signer },
+    };
     this.#nextCheckAtMs = options.time.now + CANCELLATION_CHECK_MS;
     this.#scheduleCheck();
   }
@@ -253,15 +272,24 @@ export class MockClob extends ReconWorld {
   // -------------------------------------------------------------------------
   // Rate limits (§8).
 
+  /** The signer address a credential's requests are rate-limited under (§8: per signer, not per API key). */
+  signerOf(credential: string): string {
+    const record = this.credentials[credential];
+    if (record === undefined) throw new Error(`unknown credential ${credential}`);
+    return record.signer;
+  }
+
+  /** The two buckets of the credential's SIGNER (shared by every API key of that signer), refilled to now. */
   #bucketsOf(credential: string): { order: Bucket; cancel: Bucket } {
-    let buckets = this.#buckets.get(credential);
+    const signer = this.signerOf(credential);
+    let buckets = this.#buckets.get(signer);
     if (buckets === undefined) {
-      buckets = { order: { level: STANDARD_TIER.orderBurst, atMs: this.time.now }, cancel: { level: STANDARD_TIER.cancelBurst, atMs: this.time.now } };
-      this.#buckets.set(credential, buckets);
+      buckets = { order: { milli: STANDARD_TIER.orderBurst * 1000, atMs: this.time.now }, cancel: { milli: STANDARD_TIER.cancelBurst * 1000, atMs: this.time.now } };
+      this.#buckets.set(signer, buckets);
     }
     const refill = (bucket: Bucket, burst: number, perSecond: number): void => {
       const now = this.time.now;
-      if (now > bucket.atMs) bucket.level = Math.min(burst, bucket.level + ((now - bucket.atMs) * perSecond) / 1000);
+      if (now > bucket.atMs) bucket.milli = Math.min(burst * 1000, bucket.milli + (now - bucket.atMs) * perSecond);
       bucket.atMs = now;
     };
     refill(buckets.order, STANDARD_TIER.orderBurst, STANDARD_TIER.orderPerSecond);
@@ -269,14 +297,19 @@ export class MockClob extends ReconWorld {
     return buckets;
   }
 
-  /** Drain a credential's order bucket (a burst someone else spent): the next placements are refused 429 until it refills. */
+  /** Drain the order bucket of a credential's signer (a burst someone else spent): the next placements are refused 429 until it refills. */
   drainOrderBucket(credential: string): void {
-    this.#bucketsOf(credential).order.level = 0;
+    this.#bucketsOf(credential).order.milli = 0;
+  }
+
+  /** The token balance of a credential's signer's bucket now (the cancel bucket may be negative: D-21). */
+  balance(credential: string, bucket: "order" | "cancel"): number {
+    return this.#bucketsOf(credential)[bucket].milli / 1000;
   }
 
   #feedback(credential: string, bucket: "order" | "cancel"): void {
-    const level = this.#bucketsOf(credential)[bucket].level;
-    const update = { bucket, remaining: Math.floor(level), reset: level <= 0 ? Math.ceil(this.time.epochMs() / 1000) + 1 : undefined, tier: STANDARD_TIER.tier, warning: false };
+    const milli = this.#bucketsOf(credential)[bucket].milli;
+    const update = { bucket, remaining: Math.floor(milli / 1000), reset: milli <= 0 ? Math.ceil(this.time.epochMs() / 1000) + 1 : undefined, tier: STANDARD_TIER.tier, warning: false };
     for (const listener of this.#rateLimitListeners.get(credential) ?? []) listener(update as never);
   }
 
@@ -293,7 +326,7 @@ export class MockClob extends ReconWorld {
     const at = options.checkpoint ?? NO_CHECKPOINT;
     const alive = options.alive ?? ((): boolean => true);
     const script: FakeSdkScript = {
-      account: { ...DEFAULT_FAKE_ACCOUNT },
+      account: { ...DEFAULT_FAKE_ACCOUNT, signer: this.signerOf(credential) },
       createLimitOrder: (request, signer) => this.#sign(credential, source, at, request as unknown as Readonly<Record<string, unknown>>, signer),
       postOrder: (order) => this.#post(credential, source, at, alive, [order as unknown as Readonly<Record<string, unknown>>], false),
       postOrders: (orders) => this.#post(credential, source, at, alive, orders as unknown as readonly Readonly<Record<string, unknown>>[], true),
@@ -416,13 +449,13 @@ export class MockClob extends ReconWorld {
     }
     if (orders.length < 1 || orders.length > MAX_BATCH_ORDERS) throw new Error("the mock CLOB refuses a batch outside 1..15");
     const buckets = this.#bucketsOf(credential);
-    if (buckets.order.level < orders.length) {
-      // §8: per-signer admission is all-or-nothing for a batch.
+    if (buckets.order.milli < orders.length * 1000) {
+      // §8: per-signer admission is all-or-nothing for a batch; the refused request consumes nothing (A9).
       this.#logPlacements(credential, source, orders, false, "429");
       this.#feedback(credential, "order");
       throw this.errors.rateLimited;
     }
-    buckets.order.level -= orders.length;
+    buckets.order.milli -= orders.length * 1000;
     const answers: unknown[] = [];
     let lost = false;
     for (const order of orders) {
@@ -554,14 +587,35 @@ export class MockClob extends ReconWorld {
     return { canceled: true, reason: "" };
   }
 
-  #cancelGate(credential: string, source: string, kind: "CANCEL" | "CANCEL_ALL", detail: string, cost: number): void {
+  /**
+   * Admit one cancel request, or refuse it. A 425 during a restart (nothing consumed: A5, A9). Then D-21's
+   * admission on the SIGNER's cancel bucket: "Future cancel requests remain blocked until the bucket has enough
+   * tokens for the next request", so a request whose up-front cost (1 for cancel-all and cancel-market, one per
+   * submitted id for `DELETE /order(s)`) exceeds the balance is refused `429`, consuming nothing (A9); otherwise the
+   * up-front cost is consumed now.
+   */
+  #cancelGate(credential: string, source: string, kind: "CANCEL" | "CANCEL_ALL", detail: string, upfront: number): void {
     this.catchUp();
     if (this.mode() === "RESTARTING") {
       this.log.push({ kind, credential, source, atMs: this.time.now, detail: `${detail}:425`, effective: false });
       throw this.restartRetryAfter ? this.errors.engineRestartingRetryAfter1 : this.errors.engineRestarting;
     }
-    // D-21: cancels may take the cancel balance negative.
-    this.#bucketsOf(credential).cancel.level -= cost;
+    const bucket = this.#bucketsOf(credential).cancel;
+    if (bucket.milli < upfront * 1000) {
+      this.log.push({ kind, credential, source, atMs: this.time.now, detail: `${detail}:429`, effective: false });
+      this.#feedback(credential, "cancel");
+      throw this.errors.rateLimited;
+    }
+    bucket.milli -= upfront * 1000;
+  }
+
+  /**
+   * D-21's second debit, for cancel-all and cancel-market: "After the cancellation result is known, the bucket is
+   * debited one additional token for every order successfully canceled"; on the Standard tier this "can put the
+   * bucket into debt".
+   */
+  #debitCanceled(credential: string, canceled: number): void {
+    this.#bucketsOf(credential).cancel.milli -= canceled * 1000;
   }
 
   async #cancelIds(credential: string, source: string, at: Checkpoint, alive: () => boolean, ids: readonly string[], kind: "single" | "batch"): Promise<unknown> {
@@ -594,22 +648,24 @@ export class MockClob extends ReconWorld {
   #cancelMarketNow(credential: string, source: string, filter: Readonly<Record<string, unknown>>): unknown {
     const asset = typeof filter["assetId"] === "string" ? filter["assetId"] : undefined;
     const market = typeof filter["market"] === "string" ? filter["market"] : undefined;
+    this.#cancelGate(credential, source, "CANCEL", `market:${asset ?? market ?? "?"}`, 1);
     const ids = this.#openOrders(credential, false)
       .filter((order) => (asset === undefined || order.tokenId === asset) && (market === undefined || market === WP280_MARKET))
       .map((order) => order.venueOrderId);
-    this.#cancelGate(credential, source, "CANCEL", `market:${asset ?? market ?? "?"}`, 1 + ids.length);
     const canceled = ids.filter((id) => this.#cancelOne(id).canceled);
     for (const id of canceled) this.log.push({ kind: "CANCEL", credential, source, atMs: this.time.now, detail: id, effective: true });
+    this.#debitCanceled(credential, canceled.length);
     this.#feedback(credential, "cancel");
     return { canceled, notCanceled: {} };
   }
 
   #cancelAll(credential: string, source: string, at: Checkpoint, alive: () => boolean): Promise<unknown> {
     return this.#through(at, "venue.process.cancelAll", alive, () => {
+      this.#cancelGate(credential, source, "CANCEL_ALL", "cancel-all", 1);
       const ids = this.#openOrders(credential, this.cancelAllScope === "CREDENTIAL").map((order) => order.venueOrderId);
-      this.#cancelGate(credential, source, "CANCEL_ALL", "cancel-all", 1 + ids.length);
       const canceled = ids.filter((id) => this.#cancelOne(id).canceled);
       this.log.push({ kind: "CANCEL_ALL", credential, source, atMs: this.time.now, detail: canceled.join(","), effective: canceled.length > 0 });
+      this.#debitCanceled(credential, canceled.length);
       this.#feedback(credential, "cancel");
       return { canceled, notCanceled: {} };
     });

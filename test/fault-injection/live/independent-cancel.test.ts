@@ -30,8 +30,11 @@
  *
  * Venue assumptions in play (`docs/experiments/phase-3-verification.md`):
  * A1 (one account's API keys see and cancel its orders), A2 (whose orders
- * `DELETE /cancel-all` cancels; both readings are run). No credential exists
- * anywhere in this test: the "emergency credential" is a label.
+ * `DELETE /cancel-all` cancels; both readings are run), A9 (the 429 a cancel
+ * blocked by D-21 gets, and its `Retry-After`). The two keys are keys of ONE
+ * signer, so they share its rate-limit buckets (§8): one case runs the CLI
+ * against the trader's D-21 debt. No credential exists anywhere in this
+ * test: the "emergency credential" is a label.
  */
 
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
@@ -52,6 +55,7 @@ import {
 import type { EmergencyVenueFactory, OpsClock } from "../../../apps/ops-cli/src/emergency/ports.js";
 import { runOpsCli, type OpsCliDependencies } from "../../../apps/ops-cli/src/emergency/run.js";
 import type { OrderManager } from "../../../packages/oms/src/index.js";
+import type { RateLimitObservation } from "../../../packages/polymarket-secure/src/index.js";
 import {
   createMockSignerHandle,
   createSecureVenueClientForTesting,
@@ -59,6 +63,7 @@ import {
   installNetworkTripwire,
   type NetworkTripwire,
 } from "../../../packages/polymarket-secure/src/testing/index.js";
+import { STANDARD_TIER } from "./support/mock-clob.js";
 import { bootNode, liveWorld, NO, reconcileUntilResumedOrReviewed, YES, type LiveWorld } from "./support/live-node.js";
 import { atRest, recoveryProblems, signaturesIn } from "./support/oracle.js";
 import { group, ticket } from "../../unit/oms/support/harness.js";
@@ -91,13 +96,25 @@ interface Downed {
   readonly databaseCalls: string[];
 }
 
-/** A trader that placed orders, part-filled one, and died; then its database became unreachable. */
-async function traderDownDatabaseUnreachable(cancelAllScope: "CREDENTIAL" | "ACCOUNT"): Promise<Downed> {
+/**
+ * A trader that placed orders, part-filled one, and died; then its database became unreachable. With `debtSweep`,
+ * the trader's own last cancel was a market sweep of that many resting orders, which put the cancel bucket of the
+ * signer it SHARES with the emergency key into D-21 debt (J4, WP-340 r1).
+ */
+async function traderDownDatabaseUnreachable(cancelAllScope: "CREDENTIAL" | "ACCOUNT", debtSweep = 0): Promise<Downed> {
   const world = await liveWorld({ cancelAllScope });
-  const trader = await bootNode(world, { credential: "trader", source: "trader" });
+  const headers: RateLimitObservation[] = [];
+  const trader = await bootNode(world, { credential: "trader", source: "trader", onRateLimitUpdate: (observation) => void headers.push(observation) });
   expect(await reconcileUntilResumedOrReviewed(world, trader)).toBe(true);
   const oms = trader.oms as OrderManager;
   for (const spec of [G_YES, G_NO]) expect((await oms.registerGroup(spec)).ok).toBe(true);
+  if (debtSweep > 0) {
+    for (let index = 0; index < debtSweep; index += 1) world.clob.placeForeign({ tokenId: NO, side: "BUY", price: "0.1", size: "1" });
+    const swept = await trader.client.cancelMarketOrders({ assetId: NO });
+    expect(swept.kind === "COMPLETED" ? swept.canceled.length : -1).toBe(debtSweep);
+    // D-21: 120 − 1 (up front) − one per order canceled, on the bucket of the signer the trader shares with the emergency key.
+    expect(headers.at(-1)).toMatchObject({ bucket: "cancel", remaining: STANDARD_TIER.cancelBurst - 1 - debtSweep });
+  }
   expect((await oms.submit(ticket(G_YES, { n: 1, shares: "2" }))).ok).toBe(true);
   expect((await oms.submit(ticket(G_NO, { n: 2, shares: "1" }))).ok).toBe(true);
   world.clob.match(world.clob.receipts[0] as string, "0.5");
@@ -261,7 +278,35 @@ describe("WP-340 scenario 4: ops-cli cancel-all with the trader down and its dat
     // The order the trader never knew was canceled unmatched before the restart: no activity of it is left to attribute.
     expect(down.world.clob.openOrderIds()).toEqual([]);
     expect(recoveryProblems(down.world, trader, resumed)).toEqual([]);
+    // No halt was released or refused by the recovery driver on the way (J1, WP-340 r1).
+    expect(down.world.findings).toEqual([]);
+    expect(down.world.refusedReleases).toEqual([]);
     expect(signaturesIn(down.world, atRest(down.world))).toEqual([]);
+  });
+
+  it("the trader's last market sweep left the cancel bucket of the signer it SHARES with the emergency key in D-21 debt: the CLI's DELETE /cancel-all is refused 429, its by-id sweep waits out Retry-After and cancels every order; COMPLETED, verified, the 429 audited", async () => {
+    // The trader's sweep: 120 − 1 (up front) − 140 (one per order canceled) = −21 (§8, D-21).
+    const down = await traderDownDatabaseUnreachable("CREDENTIAL", 140);
+    const run = cli(down.world, LIVE_FLAGS, CANCEL_ALL);
+    const outcome = await runOpsCli(run.deps);
+    expect(outcome, run.output.join("\n")).toEqual({ exitName: "COMPLETED", exitCode: 0 });
+    expect([...down.world.clob.orders.values()].filter((order) => order.status === "LIVE")).toEqual([]);
+    // The venue's record: the cancel-all was refused (the trader's debt, not the CLI's own spend), then the sweep acted.
+    const byCli = down.world.clob.log.filter((entry) => entry.source === "ops-cli");
+    expect(byCli.map((entry) => [entry.kind, entry.effective])).toEqual([["CANCEL_ALL", false], ["CANCEL", true], ["CANCEL", true], ["CANCEL", true]]);
+    expect(byCli[0]?.detail).toBe("cancel-all:429");
+    expect(byCli.filter((entry) => entry.effective).map((entry) => entry.detail).sort()).toEqual([...down.openBefore].sort());
+    // The audit states what happened: one UNKNOWN (RATE_LIMITED) answer, one COMPLETED sweep, verified by a final read.
+    const records = auditRecords(run.auditPath);
+    expect(records.map((record) => record.phase)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+    expect(records[2]?.detail).toMatchObject({
+      exit: "COMPLETED",
+      verified: true,
+      attempts: { count: 2, answers: { COMPLETED: 1, UNKNOWN: 1 }, itemized: [expect.objectContaining({ endpoint: "DELETE /cancel-all", errorKind: "RATE_LIMITED" }), expect.objectContaining({ endpoint: "DELETE /orders", canceled: 3 })] },
+    });
+    expect(down.databaseCalls).toEqual([]);
+    // The premise: one signer, so one pair of buckets, for both keys.
+    expect(down.world.clob.signerOf("trader")).toBe(down.world.clob.signerOf("emergency"));
   });
 
   it("under the repository's PAPER flags the same invocation is refused by the signer gate before any configuration, credential, venue or lease is touched, and every order stays", async () => {

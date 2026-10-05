@@ -15,8 +15,9 @@
  * flight); at the end, the OMS's orders and fills and the ledger's holdings
  * equal venue truth; no duplicate exposure; nothing lost; reservations
  * conserved; no signature at rest. A stale LIVE frame that lags a terminal
- * read (WP340-F1) is released by the operator's review and counted; any
- * other halt fails the seed.
+ * read (WP340-F1) is released by the operator's review (only when
+ * `classifyQuarantine` binds it to F1) and counted, the total pinned
+ * exactly; any other halt, and any halt the driver refuses, fails the seed.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -26,6 +27,7 @@ import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/
 import { group, ticket } from "../../unit/oms/support/harness.js";
 
 import { bootNode, liveWorld, reconcileUntilResumed, reconcileUntilResumedOrReviewed, YES, type LiveNode, type LiveWorld } from "./support/live-node.js";
+import { F1_RELEASES } from "./support/expected-releases.js";
 import { recoveryProblems } from "./support/oracle.js";
 import { rng, type Rng } from "./support/seeded.js";
 import type { ChannelChaos } from "./support/user-channel.js";
@@ -42,6 +44,8 @@ afterEach(() => {
 
 const SEEDS = 300;
 const STEPS = 16;
+/** WP340-F1 releases over all 300 seeds, exact (J1, J3: WP-340 r1; `support/expected-releases.ts`). */
+const EXPECTED_F1_RELEASES = F1_RELEASES.streamProperty;
 const G = group(34401, { tokenId: YES, plannedShares: "8" });
 
 function chaosOf(random: Rng): ChannelChaos {
@@ -96,7 +100,11 @@ async function seedRun(seed: number, tally: Tally): Promise<readonly string[]> {
       // A cancel the venue made on its own account (an emergency cancel, a heartbeat sweep): the stream may never say.
       const open = world.clob.openOrderIds();
       const id = open[random.int(Math.max(open.length, 1))];
-      if (id !== undefined && world.clob.cancel(id).kind === "COMPLETED") tally.venueCancels += 1;
+      // Counted only when the venue really canceled it (J8b: an attempt is not a cancel).
+      if (id !== undefined) {
+        const outcome = world.clob.cancel(id);
+        if (outcome.kind === "COMPLETED" && outcome.canceled.includes(id)) tally.venueCancels += 1;
+      }
     } else if (roll < 58) {
       const open = oms.orders().filter((order) => ["LIVE", "PARTIALLY_FILLED"].includes(order.state));
       const order = open[random.int(Math.max(open.length, 1))];
@@ -123,7 +131,7 @@ async function seedRun(seed: number, tally: Tally): Promise<readonly string[]> {
   tally.socketLosses += node.outputs.filter((output) => output.kind === "RECONCILIATION_REQUESTED" && ["TRANSPORT_ERROR", "CLOSED_BY_PEER", "SERVER_ERROR"].includes(output.request.cause)).length;
   tally.resumes += world.u.resumes;
   tally.f1 += world.findings.length;
-  return recoveryProblems(world, node, resumed);
+  return [...recoveryProblems(world, node, resumed), ...world.refusedReleases.map((entry) => `the driver refused a halt: ${entry.reason}`)];
 }
 
 describe("WP-340 acceptance 2, seeded: dropped, duplicated, delayed and reordered frames and dropped sockets reconcile", () => {
@@ -135,6 +143,7 @@ describe("WP-340 acceptance 2, seeded: dropped, duplicated, delayed and reordere
     }
     console.info(`WP-340 stream property: ${JSON.stringify(tally)}`);
     expect(failures.slice(0, 20), `${String(failures.length)} failure(s)`).toEqual([]);
+    expect(tally.f1, "WP340-F1 releases (J1, J3)").toBe(EXPECTED_F1_RELEASES);
     // Non-vacuous: the chaos really lost and reordered frames, sockets really dropped, and runs really resumed (each one checked by R1).
     expect(tally.dropped).toBeGreaterThan(SEEDS);
     expect(tally.socketLosses).toBeGreaterThan(SEEDS / 5);

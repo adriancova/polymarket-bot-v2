@@ -23,6 +23,13 @@
  * chosen frame is delivered. Every frame arrives through the shared time
  * line (`setTimeout`), never synchronously inside the venue call that
  * produced it.
+ *
+ * TIMING IS AN ASSUMPTION (A8 in `mock-clob.ts`; report §3.2): a frame
+ * reaches the process only when the time line turns, so it always trails the
+ * synchronous REST answer of the request that caused it. The venue documents
+ * no ordering between a REST answer and the push of the same change.
+ * WP340-F1's route 3 (`findings.test.ts`) rests on this ordering; routes 1
+ * and 2 do not.
  */
 
 import type {

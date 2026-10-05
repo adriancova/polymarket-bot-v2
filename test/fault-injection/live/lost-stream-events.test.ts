@@ -48,6 +48,7 @@ import {
   type LiveNode,
   type LiveWorld,
 } from "./support/live-node.js";
+import { F1_RELEASES } from "./support/expected-releases.js";
 import { recoveryProblems } from "./support/oracle.js";
 import type { ChaosVerdict } from "./support/user-channel.js";
 
@@ -101,8 +102,14 @@ async function periodic(r: Ready): Promise<boolean> {
   return reconcileUntilResumedOrReviewed(r.world, r.node);
 }
 
-function expectReconciled(label: string, r: Ready, resumed: boolean, truthful = true): void {
-  expect(recoveryProblems(r.world, r.node, resumed, { truthful }), label).toEqual([]);
+/**
+ * The end-state oracle, and the recovery driver's record (J1, WP-340 r1): exactly `f1` WP340-F1 releases (0 unless
+ * the case is F1's route 2), and no halting alert the driver refused.
+ */
+function expectReconciled(label: string, r: Ready, resumed: boolean, f1 = 0): void {
+  expect(recoveryProblems(r.world, r.node, resumed), label).toEqual([]);
+  expect(r.world.findings.map((entry) => entry.finding), `${label}: WP340-F1 releases`).toEqual(Array.from({ length: f1 }, () => "WP340-F1"));
+  expect(r.world.refusedReleases, `${label}: halts the driver refused`).toEqual([]);
 }
 
 describe("WP-340 acceptance 2: lost user-stream events reconcile (the real WP-280 manager, chaos on its socket)", () => {
@@ -173,8 +180,7 @@ describe("WP-340 acceptance 2: lost user-stream events reconcile (the real WP-28
     r.node.coordinator.trigger("PERIODIC_TIMER");
     expect(await reconcileUntilResumed(r.world, r.node, 3), "the stale frame holds the account").toBe(false);
     const resumed = await reconcileUntilResumedOrReviewed(r.world, r.node);
-    expect(r.world.findings.map((entry) => entry.finding)).toEqual(["WP340-F1"]);
-    expectReconciled("delayed past a read", r, resumed);
+    expectReconciled("delayed past a read", r, resumed, F1_RELEASES.streamNamed);
   });
 
   it("the SOCKET DROPS at the worst moment (right after the PLACEMENT, before the fill): the manager reconnects and asks; submissions pause until a run that read after the loss passes", async () => {
@@ -251,6 +257,8 @@ describe("WP-340 acceptance 2: unmatched activity becomes UNATTRIBUTED, with its
     expect(view?.detail).toContain(foreign.venueOrderId);
     expect(r.world.u.halts.some((halt) => halt.breakId === view?.breakId && halt.marketId === MARKET)).toBe(true);
     expect((await r.oms.submit(ticket(G, { n: 70, shares: "1" }))).ok).toBe(false);
+    // The driver does not release an UNATTRIBUTED quarantine: only WP340-F1 is its to release (J1).
+    expect(r.world.findings).toEqual([]);
     expect((await r.node.coordinator.releaseQuarantine({ breakId: view?.breakId ?? "", operatorRef: "operator-1", reason: "a manual order, known" })).ok).toBe(true);
     expect(await reconcileUntilResumed(r.world, r.node)).toBe(true);
   });
@@ -265,6 +273,7 @@ describe("WP-340 acceptance 2: unmatched activity becomes UNATTRIBUTED, with its
     expect(view).toMatchObject({ status: "QUARANTINED", marketId: MARKET });
     expect(view?.detail).toContain(trade?.venueTradeId ?? "?");
     expect(r.oms.orders().every((order) => order.filledShares === "0")).toBe(true);
+    expect(r.world.findings).toEqual([]);
   });
 
   it("a HOLDING delta no activity explains (tokens and collateral arriving): confirmed, booked to UNATTRIBUTED in the real ledger, halted, paused", async () => {
@@ -285,5 +294,6 @@ describe("WP-340 acceptance 2: unmatched activity becomes UNATTRIBUTED, with its
       ]),
     );
     expect(r.oms.paused).toBe(true);
+    expect(r.world.findings).toEqual([]);
   });
 });

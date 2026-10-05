@@ -16,7 +16,10 @@
  *   holdings equal to the venue's, reservations conserved);
  * - NOTHING LOST: every salt the venue received is known to the OMS;
  * - RESERVATIONS CONSERVED, exactly, for every order, and every closed
- *   order's unused remainder released;
+ *   order's unused remainder released. Read against WP-300's inventory book,
+ *   which the harness carries across every crash IN MEMORY: WP-300 has no
+ *   journal rebuild (`WP300-PERSIST`), so this holds only under that
+ *   surviving-inventory assumption (`live-node.ts`, `LiveWorld`; report §2);
  * - NO SIGNATURE IN CLEAR: no signature the mock signer produced appears in
  *   the OMS store, the journal's durable events or the ledger;
  * - the journal's durable history replays.

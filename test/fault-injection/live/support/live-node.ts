@@ -53,9 +53,11 @@ import {
   type OmsReservationPort,
   type OmsStore,
   type OmsVenuePort,
+  type OrderEventRecord,
   type OrderManagerDependencies,
   type PayloadCipher,
   type ReconciledOms,
+  type StoreWrite,
   type VenueMode,
 } from "../../../../packages/oms/src/index.js";
 import { SignedOrderEnvelope, type RateLimitObservation, type SecureVenueClient } from "../../../../packages/polymarket-secure/src/index.js";
@@ -86,13 +88,29 @@ import { MockUserChannel, deliverAll, type ChannelChaos } from "./user-channel.j
 
 export { ACCOUNT, Incarnation, Killed, MARKET, MARKET_NO, NO, PUSD, YES, type KillPlan };
 
-/** What survives every crash: the venue, the OMS store, the journal's durable events, the ledger, the inventory and time. */
+/**
+ * What survives every crash: the venue, the OMS store, the journal's durable events, the ledger, the inventory and time.
+ *
+ * THE INVENTORY SURVIVES BY ASSUMPTION (J2, WP-340 r1). WP-300's `InventoryBook` and `ReservationService` (`u.inventory`)
+ * are in memory only, with no journal rebuild (`WP300-PERSIST`): a real process restart would lose them. This harness
+ * (inherited from WP-290's) carries the same book across every crash, so the oracle's RESERVATIONS CONSERVED checks
+ * hold only under that surviving-inventory assumption. WP-300's `WalletOperationManager` is not composed at all.
+ */
 export interface LiveWorld {
   readonly time: ManualTime;
   readonly u: Universe;
   readonly clob: MockClob;
   /** Every quarantine the recovery driver released as a KNOWN FINDING (`releaseKnownFindings`), with its break id. */
   readonly findings: { readonly finding: "WP340-F1"; readonly breakId: string; readonly detail: string }[];
+  /**
+   * Test bookkeeping for the F1 classifier (never an input to the system under test): every CONFLICT-OPENING order
+   * event any incarnation persisted, keyed {@link conflictKey}, with what the VENUE held at the instant it was written.
+   */
+  readonly conflicts: Map<string, ConflictRecord>;
+  /** Every OMS instance any incarnation opened: the runs its coordinator started, and what each of its alerts is bound to. */
+  readonly instances: OmsInstance[];
+  /** Every OMS halting-alert quarantine the driver examined and REFUSED to release as WP340-F1, with why (one entry per break). */
+  readonly refusedReleases: { readonly breakId: string; readonly detail: string; readonly reason: string }[];
 }
 
 /**
@@ -106,19 +124,207 @@ export const WP340_F1_DETAIL = "a terminal order was observed LIVE";
 export const RECOVERED_CONFLICT_DETAIL = "recovered with an open evidence conflict";
 
 /**
- * Is this quarantine WP340-F1? Its alert says so, or it is the recovered alert of a conflict whose every durable
- * record has F1's shape: an `EVIDENCE_CONFLICT` order event out of a TERMINAL state (FILLED or CANCELED) caused by an
- * observation of `LIVE` (WP-270 persists the conflicting observation in the event's payload).
+ * One conflict-opening order event, as the OMS store received it. WP-270 opens a STATE conflict with an event whose
+ * payload says `conflict: true` (`EVIDENCE_CONFLICT` from a stream observation or from a read, `OBSERVATION_UNRECOGNISED`)
+ * and a sticky VENUE-ID conflict with an event naming `conflictingVenueOrderId`.
  */
-export function isWp340F1(world: LiveWorld, view: { readonly breakClass: string; readonly status: string; readonly detail: string; readonly orderId: string | null }): boolean {
-  if (view.breakClass !== "OMS_HALTING_ALERT" || view.status !== "QUARANTINED") return false;
-  if (view.detail.endsWith(WP340_F1_DETAIL)) return true;
-  if (!view.detail.endsWith(RECOVERED_CONFLICT_DETAIL) || view.orderId === null) return false;
-  const conflicts = world.u.store.snapshotSync().events.filter((event) => event.orderId === view.orderId && event.eventType === "EVIDENCE_CONFLICT");
-  return (
-    conflicts.length > 0 &&
-    conflicts.every((event) => (event.previousState === "FILLED" || event.previousState === "CANCELED") && event.payload !== null && event.payload["status"] === "LIVE")
-  );
+export interface ConflictRecord {
+  readonly orderId: string;
+  readonly eventOrdinal: number;
+  readonly eventType: string;
+  readonly previousState: string | null;
+  /** The observed status WP-270 persisted in the payload (`null` when none: a read's conflict, an unrecognised status). */
+  readonly status: string | null;
+  readonly venueIdConflict: boolean;
+  readonly venueOrderId: string | null;
+  /** Whether the venue held that order terminal (CANCELED, or matched up to its size) when the event was written. */
+  readonly venueTerminalWhenWritten: boolean;
+}
+
+/** What one halting alert of one OMS instance is bound to: F1 (with its responsible conflict events), or something else. */
+export type AlertBinding =
+  | { readonly kind: "F1"; readonly orderId: string; readonly detail: string; readonly conflicts: readonly string[] }
+  | { readonly kind: "OTHER"; readonly detail: string; readonly reason: string };
+
+/** One OMS instance (one incarnation's `OrderManager`): WP-290 names its alerts by the run id that first inspected it. */
+export interface OmsInstance {
+  readonly runIds: Set<string>;
+  /** Indexed by the alert's ordinal in the instance's append-only `alerts()` list. */
+  readonly bindings: AlertBinding[];
+}
+
+export function conflictKey(orderId: string, eventOrdinal: number): string {
+  return `${orderId}#${String(eventOrdinal)}`;
+}
+
+/** Whether the venue holds the order with this venue id terminal now. `false` when the venue has no such order. */
+function venueTerminal(world: LiveWorld, venueOrderId: string | null): boolean {
+  if (venueOrderId === null) return false;
+  const order = [...world.clob.orders.values()].find((candidate) => candidate.venueOrderId === venueOrderId);
+  return order !== undefined && (order.status === "CANCELED" || compareDecimal(order.matched, order.original) >= 0);
+}
+
+/** `null` when the conflict event is WP340-F1's (a stale `LIVE` out of FILLED or CANCELED); otherwise why it is not. */
+function notF1(record: ConflictRecord | undefined): string | null {
+  if (record === undefined) return "its conflict event was never seen at the store port";
+  const at = `${record.eventType} (ordinal ${String(record.eventOrdinal)})`;
+  if (record.venueIdConflict) return `${at} is a venue-id conflict`;
+  if (record.eventType !== "EVIDENCE_CONFLICT") return `${at} is not an EVIDENCE_CONFLICT`;
+  if (record.previousState !== "FILLED" && record.previousState !== "CANCELED") return `${at} left ${String(record.previousState)}, not FILLED or CANCELED`;
+  if (record.status !== "LIVE") return `${at} was caused by ${String(record.status)}, not an observation of LIVE`;
+  if (!record.venueTerminalWhenWritten) return `${at}: the venue held the order OPEN when it was written, so the LIVE was true, not stale`;
+  return null;
+}
+
+/** The conflict-opening events among `writes`, with the venue's state now (call BEFORE the store applies them). */
+function conflictsIn(world: LiveWorld, writes: readonly StoreWrite[]): ConflictRecord[] {
+  const records: ConflictRecord[] = [];
+  for (const write of writes) {
+    if (write.kind !== "APPEND_ORDER_EVENT") continue;
+    const event = write.event;
+    const payload = event.payload ?? {};
+    const venueIdConflict = typeof payload["conflictingVenueOrderId"] === "string";
+    if (payload["conflict"] !== true && !venueIdConflict) continue;
+    records.push({
+      orderId: event.orderId,
+      eventOrdinal: event.eventOrdinal,
+      eventType: event.eventType,
+      previousState: event.previousState,
+      status: typeof payload["status"] === "string" ? payload["status"] : null,
+      venueIdConflict,
+      venueOrderId: event.venueOrderId,
+      venueTerminalWhenWritten: venueTerminal(world, event.venueOrderId),
+    });
+  }
+  return records;
+}
+
+/**
+ * Bind the alerts the OMS raised since the last bound one to the conflict events of the write batch that persisted
+ * them (WP-270 raises an alert and appends its event in one commit). An F1-text alert is bound to the F1-shaped
+ * `EVIDENCE_CONFLICT` events of ITS order in this batch, pairwise in order; when their counts differ, every one of
+ * them is ambiguous and bound OTHER. Every other alert is OTHER.
+ */
+function bindLiveAlerts(instance: OmsInstance, oms: OrderManager, batch: readonly ConflictRecord[]): void {
+  const alerts = oms.alerts();
+  const fresh = alerts.slice(instance.bindings.length);
+  const f1Alerts = new Map<string, number[]>();
+  fresh.forEach((alert, offset) => {
+    if (alert.kind === "EVIDENCE_CONFLICT" && alert.detail === WP340_F1_DETAIL && alert.orderId !== null) {
+      f1Alerts.set(alert.orderId, [...(f1Alerts.get(alert.orderId) ?? []), offset]);
+    }
+  });
+  const bound = new Map<number, AlertBinding>();
+  for (const [orderId, offsets] of f1Alerts) {
+    const events = batch.filter((record) => record.orderId === orderId && record.eventType === "EVIDENCE_CONFLICT" && record.status === "LIVE");
+    offsets.forEach((offset, index) => {
+      const record = events[index];
+      bound.set(
+        offset,
+        events.length !== offsets.length || record === undefined
+          ? { kind: "OTHER", detail: WP340_F1_DETAIL, reason: `ambiguous: ${String(offsets.length)} F1-text alert(s) and ${String(events.length)} LIVE conflict event(s) of order ${orderId} in one commit` }
+          : { kind: "F1", orderId, detail: WP340_F1_DETAIL, conflicts: [conflictKey(record.orderId, record.eventOrdinal)] },
+      );
+    });
+  }
+  fresh.forEach((alert, offset) => {
+    instance.bindings.push(bound.get(offset) ?? { kind: "OTHER", detail: alert.detail, reason: `the alert is not WP340-F1's: ${alert.kind} "${alert.detail}"` });
+  });
+}
+
+/**
+ * Bind the alerts an OMS raised while OPENING (WP-270's recovery: "recovered with an open evidence conflict" for every
+ * order whose rebuilt `conflict` flag, the LAST `conflict`-keyed event of its log, is true, or whose log names a
+ * sticky venue-id conflict). The responsible events are every `conflict: true` event after the last `conflict: false`
+ * one, read from the log as the OMS loaded it (`history`); the alert is F1 only when every one of them is.
+ */
+function bindRecoveredAlerts(world: LiveWorld, instance: OmsInstance, oms: OrderManager, history: readonly OrderEventRecord[]): void {
+  for (const alert of oms.alerts().slice(instance.bindings.length)) {
+    if (alert.detail !== RECOVERED_CONFLICT_DETAIL || alert.orderId === null) {
+      instance.bindings.push({ kind: "OTHER", detail: alert.detail, reason: `raised while opening, and not a recovered conflict: ${alert.kind} "${alert.detail}"` });
+      continue;
+    }
+    const orderId = alert.orderId;
+    const events = history.filter((event) => event.orderId === orderId).sort((a, b) => a.eventOrdinal - b.eventOrdinal);
+    if (events.some((event) => typeof (event.payload ?? {})["conflictingVenueOrderId"] === "string")) {
+      instance.bindings.push({ kind: "OTHER", detail: alert.detail, reason: "the recovered order carries a venue-id conflict" });
+      continue;
+    }
+    const lastCleared = events.reduce((last, event, index) => ((event.payload ?? {})["conflict"] === false ? index : last), -1);
+    const open = events.slice(lastCleared + 1).filter((event) => (event.payload ?? {})["conflict"] === true);
+    const reasons = open.map((event) => notF1(world.conflicts.get(conflictKey(event.orderId, event.eventOrdinal)))).filter((reason): reason is string => reason !== null);
+    instance.bindings.push(
+      open.length === 0
+        ? { kind: "OTHER", detail: alert.detail, reason: "no open state conflict in the loaded log" }
+        : reasons.length > 0
+          ? { kind: "OTHER", detail: alert.detail, reason: `a responsible conflict is not F1: ${reasons.join("; ")}` }
+          : { kind: "F1", orderId, detail: alert.detail, conflicts: open.map((event) => conflictKey(event.orderId, event.eventOrdinal)) },
+    );
+  }
+}
+
+/** The length-prefixed parts of a WP-270/WP-290 `compositeKey`, or `null` when it is not one. */
+function compositeParts(key: string): string[] | null {
+  const parts: string[] = [];
+  let at = 0;
+  while (at < key.length) {
+    const colon = key.indexOf(":", at);
+    if (colon < 0) return null;
+    const length = Number(key.slice(at, colon));
+    if (!Number.isSafeInteger(length) || length < 0) return null;
+    const end = colon + 1 + length;
+    if (key[end] !== ";") return null;
+    parts.push(key.slice(colon + 1, end));
+    at = end + 1;
+  }
+  return parts;
+}
+
+/** A quarantine as the journal shows it (`ReconciliationBreakView`'s fields the classifier reads). */
+export interface QuarantineView {
+  readonly breakClass: string;
+  readonly status: string;
+  readonly detail: string;
+  readonly orderId: string | null;
+  readonly subjectKey: string;
+}
+
+/**
+ * Is this quarantine WP340-F1, and if not, why not? (J1, WP-340 r1.) It is when ALL of these hold:
+ *
+ * 1. it is a QUARANTINED `OMS_HALTING_ALERT` whose subject names an OMS instance this world opened (WP-290's subject
+ *    key: the incarnation's first run id and the alert's ordinal), and that alert is bound (`bindLiveAlerts`,
+ *    `bindRecoveredAlerts`) to the conflict event(s) that opened it;
+ * 2. every responsible conflict event is F1's shape (an `EVIDENCE_CONFLICT` out of FILLED or CANCELED caused by an
+ *    observation of `LIVE`, no venue-id conflict) and was STALE when written: the venue already held the order
+ *    terminal at that instant;
+ * 3. the venue STILL holds the order terminal now, at the release.
+ *
+ * Anything else (another conflict type, an ambiguous binding, a `LIVE` that was true) is not F1, and stays.
+ */
+export function classifyQuarantine(world: LiveWorld, view: QuarantineView): { readonly f1: true } | { readonly f1: false; readonly reason: string } {
+  if (view.breakClass !== "OMS_HALTING_ALERT" || view.status !== "QUARANTINED") return { f1: false, reason: `a ${view.status} ${view.breakClass} break` };
+  const parts = compositeParts(view.subjectKey);
+  if (parts === null || parts.length !== 7 || parts[0] !== "OMS_HALTING_ALERT") return { f1: false, reason: "the subject key is not an OMS halting alert's" };
+  const [, incarnation = "", ordinalText = "", , orderId = ""] = parts;
+  const instance = world.instances.find((candidate) => candidate.runIds.has(incarnation));
+  if (instance === undefined) return { f1: false, reason: `no OMS instance of this world was first inspected by run ${incarnation}` };
+  const binding = instance.bindings[Number(ordinalText)];
+  if (binding === undefined) return { f1: false, reason: `alert ${ordinalText} of that instance was never bound to a commit` };
+  if (binding.kind !== "F1") return { f1: false, reason: binding.reason };
+  if (binding.orderId !== orderId || binding.orderId !== view.orderId || !view.detail.endsWith(binding.detail)) return { f1: false, reason: "the break and the bound alert disagree" };
+  for (const key of binding.conflicts) {
+    const record = world.conflicts.get(key);
+    const reason = notF1(record);
+    if (reason !== null) return { f1: false, reason };
+    if (!venueTerminal(world, record?.venueOrderId ?? null)) return { f1: false, reason: `the venue holds ${String(record?.venueOrderId)} open at the release` };
+  }
+  return { f1: true };
+}
+
+/** {@link classifyQuarantine}, as a predicate. */
+export function isWp340F1(world: LiveWorld, view: QuarantineView): boolean {
+  return classifyQuarantine(world, view).f1;
 }
 
 export async function liveWorld(options: { readonly pusd?: string; readonly cancelAllScope?: "CREDENTIAL" | "ACCOUNT" } = {}): Promise<LiveWorld> {
@@ -136,20 +342,26 @@ export async function liveWorld(options: { readonly pusd?: string; readonly canc
   const clob = new MockClob({ time, errors, collateral: options.pusd ?? "1000", collateralAssetId: PUSD });
   if (options.cancelAllScope !== undefined) clob.cancelAllScope = options.cancelAllScope;
   const u: Universe = { ...base, world: clob };
-  return { time, u, clob, findings: [] };
+  return { time, u, clob, findings: [], conflicts: new Map(), instances: [], refusedReleases: [] };
 }
 
 /**
- * The operator's review of a KNOWN finding, and nothing else: every quarantined `OMS_HALTING_ALERT` whose detail is
- * WP340-F1's is released (`ReconciliationCoordinator.releaseQuarantine`, which resumes nothing by itself: it queues a
- * MANUAL_REQUEST run that must pass on its own) and recorded in `world.findings`. Any other quarantine stays. Returns how
- * many were released.
+ * The operator's review of a KNOWN finding, and nothing else: every quarantined `OMS_HALTING_ALERT` that
+ * {@link classifyQuarantine} binds to WP340-F1 is released (`ReconciliationCoordinator.releaseQuarantine`, which
+ * resumes nothing by itself: it queues a MANUAL_REQUEST run that must pass on its own) and recorded in
+ * `world.findings`. Every other halting-alert quarantine stays, and is recorded once in `world.refusedReleases` with
+ * the reason. Returns how many were released.
  */
 export async function releaseKnownFindings(world: LiveWorld, node: LiveNode): Promise<number> {
   let released = 0;
   for (const view of node.journal.unresolvedBreaks()) {
-    if (!isWp340F1(world, view)) continue;
-    const result = await node.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-wp340", reason: "WP340-F1 reviewed: a retained stream observation drained after a terminal answer" });
+    if (view.breakClass !== "OMS_HALTING_ALERT" || view.status !== "QUARANTINED") continue;
+    const verdict = classifyQuarantine(world, view);
+    if (!verdict.f1) {
+      if (!world.refusedReleases.some((entry) => entry.breakId === view.breakId)) world.refusedReleases.push({ breakId: view.breakId, detail: view.detail, reason: verdict.reason });
+      continue;
+    }
+    const result = await node.coordinator.releaseQuarantine({ breakId: view.breakId, operatorRef: "operator-wp340", reason: "WP340-F1 reviewed: a stale LIVE observation of an order the venue holds terminal" });
     if (!result.ok) continue;
     released += 1;
     world.findings.push({ finding: "WP340-F1", breakId: view.breakId, detail: view.detail });
@@ -258,10 +470,20 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
   const checkpoint: Checkpoint = (name, run) => inc.call(name, run);
   const credential = options.credential ?? "trader";
   const source = options.source ?? credential;
+  // The F1 classifier's view of this incarnation's OMS instance: the runs its coordinator started (WP-290 names the
+  // instance's alerts by the first of them) and each alert's binding. Test bookkeeping only.
+  const instance: OmsInstance = { runIds: new Set(), bindings: [] };
+  world.instances.push(instance);
   const opened = ReconciliationJournal.open({
     accountRef: ACCOUNT,
     history: [...u.journalEvents],
-    sink: { append: (event) => inc.call("journal.append", async () => void u.journalEvents.push(event)) },
+    sink: {
+      append: (event) =>
+        inc.call("journal.append", async () => {
+          u.journalEvents.push(event);
+          if (event.kind === "RUN_STARTED") instance.runIds.add(event.runId);
+        }),
+    },
   });
   if (!opened.ok) throw new Error(`the journal history did not replay: ${opened.refusal.message}`);
   const journal = opened.value;
@@ -355,7 +577,14 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
   if (options.wrapVenue !== undefined) venue = options.wrapVenue(venue);
   if (composed.wrapVenue !== undefined) venue = composed.wrapVenue(venue);
   const store: OmsStore = {
-    apply: (writes) => inc.call(`store.apply[${writes.map((write) => write.kind).join(",")}]`, () => u.store.apply(writes)),
+    apply: (writes) =>
+      inc.call(`store.apply[${writes.map((write) => write.kind).join(",")}]`, async () => {
+        // The venue's state at the instant the OMS commits (taken before the write; nothing else runs in between).
+        const batch = conflictsIn(world, writes);
+        await u.store.apply(writes);
+        for (const record of batch) world.conflicts.set(conflictKey(record.orderId, record.eventOrdinal), record);
+        if (oms !== null) bindLiveAlerts(instance, oms, batch);
+      }),
     load: () => inc.call("store.load", () => u.store.load()),
   };
   const cipher: PayloadCipher = {
@@ -381,6 +610,8 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
   };
   if (options.wrapDependencies !== undefined) deps = options.wrapDependencies(deps);
   if (composed.wrapDependencies !== undefined) deps = composed.wrapDependencies(deps);
+  // The order log exactly as the OMS is about to load it: the recovered alerts are bound against it.
+  const loadedHistory = u.store.snapshotSync().events;
   try {
     const result = await OrderManager.open(deps);
     if (result.ok) oms = result.value;
@@ -388,6 +619,7 @@ export async function bootNode(world: LiveWorld, options: NodeOptions = {}): Pro
   } catch (error) {
     if (!(error instanceof Killed) && inc.alive) throw error;
   }
+  if (oms !== null) bindRecoveredAlerts(world, instance, oms, loadedHistory);
   if (oms !== null) coordinator.bindOms(oracleOms(world, oms));
 
   const outputs: UserStreamOutput[] = [];
@@ -496,7 +728,7 @@ export async function drainAfterRestart(world: LiveWorld, node: LiveNode, rounds
   return resumed;
 }
 
-/** Reconcile until resumed; when held only by WP340-F1 quarantines, release those (the operator's review) and go on. */
+/** Reconcile until resumed; when held, release the quarantines {@link classifyQuarantine} binds to WP340-F1 (the operator's review) and go on. */
 export async function reconcileUntilResumedOrReviewed(world: LiveWorld, node: LiveNode): Promise<boolean> {
   let resumed = await reconcileUntilResumed(world, node);
   for (let review = 0; review < 3 && !resumed; review += 1) {

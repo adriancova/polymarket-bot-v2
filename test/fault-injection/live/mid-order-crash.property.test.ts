@@ -15,6 +15,9 @@
  *
  * Seeds 1..SEEDS, each with a no-crash baseline and KILLS random kill
  * points. A failure lists the seed, the kill plan and the oracle's problems.
+ * The recovery driver releases only quarantines bound to WP340-F1
+ * (`classifyQuarantine`); any halt it refuses fails the run, and the total
+ * of its releases is pinned exactly.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -25,6 +28,7 @@ import { group, ticket } from "../../unit/oms/support/harness.js";
 
 import type { PlacementAnswer } from "./support/mock-clob.js";
 import { bootNode, drainAfterRestart, liveWorld, NO, reconcileUntilResumed, survive, YES, type KillPlan, type LiveNode, type LiveWorld } from "./support/live-node.js";
+import { F1_RELEASES } from "./support/expected-releases.js";
 import { recoveryProblems } from "./support/oracle.js";
 import { rng, type Rng } from "./support/seeded.js";
 
@@ -41,6 +45,8 @@ afterEach(() => {
 const SEEDS = 200;
 const KILLS = 4;
 const STEPS = 9;
+/** WP340-F1 releases over all 1,000 runs, exact (J1, J3: WP-340 r1; `support/expected-releases.ts`). */
+const EXPECTED_F1_RELEASES = F1_RELEASES.crashProperty;
 
 const GROUPS: readonly GroupSpec[] = [group(34101, { tokenId: YES, plannedShares: "5" }), group(34102, { tokenId: NO, plannedShares: "5", postOnly: true })];
 const ANSWERS: readonly PlacementAnswer[] = ["ACCEPT", "ACCEPT", "ACCEPT", "LOST_AFTER", "LOST_BEFORE", "LATE", "UNMATCHED", "REJECT"];
@@ -141,7 +147,8 @@ async function execute(
   if (world.clob.mode() === "RESTARTING") await world.time.advance(3_000);
   const last = await bootNode(world);
   const resumed = await drainAfterRestart(world, last, 4);
-  return { problems: recoveryProblems(world, last, resumed), calls: first.inc.calls, killed, trace: first.inc.trace, placed: world.clob.receipts.length, f1: world.findings.length };
+  const refusals = world.refusedReleases.map((entry) => `the driver refused a halt: ${entry.reason}`);
+  return { problems: [...recoveryProblems(world, last, resumed), ...refusals], calls: first.inc.calls, killed, trace: first.inc.trace, placed: world.clob.receipts.length, f1: world.findings.length };
 }
 
 describe("WP-340 acceptance 1, seeded: random programs, random kill points, restart, no duplicate exposure", () => {
@@ -177,6 +184,7 @@ describe("WP-340 acceptance 1, seeded: random programs, random kill points, rest
     console.info(`WP-340 crash property: ${JSON.stringify({ seeds: SEEDS, runs, killedRuns, placements, f1Released: f1, killedAt: Object.fromEntries([...killedAt].sort()) })}`);
     expect(failures.slice(0, 20), `${String(failures.length)} failure(s)`).toEqual([]);
     expect(runs).toBe(SEEDS * (1 + KILLS));
+    expect(f1, "WP340-F1 releases (J1, J3)").toBe(EXPECTED_F1_RELEASES);
     // Non-vacuous: the programs placed orders, and the kills landed on the SDK-level steps and on every port family.
     expect(placements).toBeGreaterThan(SEEDS);
     expect(killedRuns).toBeGreaterThan(SEEDS * KILLS * 0.95);

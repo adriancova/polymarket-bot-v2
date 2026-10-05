@@ -39,7 +39,8 @@
  * (the venue answered two REST calls faster than one push); the cancel's
  * answer made the order CANCELED, and the frame then reads LIVE. Any
  * cancel or replace faster than the push latency can therefore halt its
- * market.
+ * market. That ordering is the mock's push timing, assumption A8 (the venue
+ * documents none); how often the real venue produces it is unmeasured.
  *
  * Safety holds (nothing is sent, the account never resumes until an
  * operator releases the quarantine, and the release resumes only a

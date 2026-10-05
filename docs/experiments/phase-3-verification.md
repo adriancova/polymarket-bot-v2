@@ -4,6 +4,7 @@
 **Date:** 2026-10-05.
 **Subject:** the merged Wave 3 packages on `main` at `f4d73ba`: `WP-260` to `WP-330`.
 **Verifier:** the `WP-340` implementing agent. This report is not a review: two independent verifiers review it.
+**Revision:** r1, 2026-10-05. It remediates the joint round-1 review (J1 to J8, §11).
 **Posture:** PAPER only. No credential, key, signer, wallet or real order exists anywhere in this work. The only connections made are scenario 6's: to the local Docker daemon, and to the throwaway PostgreSQL container it starts.
 
 > **This report authorizes nothing live.** Completing `WP-340` does not raise `MAX_RUN_MODE`, enable real orders, or set a live-micro cap. Every live-shaped context below is a literal that reaches only fakes, a mock venue or a throwaway database. Live trading still needs ADR-033 D5's ruling, a live composition root, credentials, and the human gates of phase 4.
@@ -21,9 +22,11 @@ The four work-plan criteria, each proven by named tests that fail when their gua
 | 3. Heartbeat failure cancels mock open orders | **Yes** | `heartbeat-failure.test.ts` |
 | 4. Live maximum defaults remain zero | **Yes** | `live-defaults.test.ts` |
 
-Packet scenarios 4 (the independent cancel path) and 6 (two writers on real PostgreSQL) hold too: `independent-cancel.test.ts` and `postgres/two-writers.test.ts`. Every file named here lives under `test/fault-injection/live/`.
+Packet scenarios 4 (the independent cancel path) and 6 (two writers on real PostgreSQL) hold too: `independent-cancel.test.ts` and `postgres/two-writers.test.ts`. Scenario 4 also holds against the trader's D-21 cancel debt on the signer both keys share (§4.5). Every file named here lives under `test/fault-injection/live/`.
 
-**One finding needs product code, and is STOPPED:** WP340-F1 (§5). A `LIVE` order event that reaches the OMS after the OMS already holds the order in a terminal state halts the order's market. The account then stays paused until an operator releases the quarantine. Safety holds, but a common, fault-free sequence triggers it. It is pinned as expected failures, never skipped.
+The suites stand in for an operator's review of WP340-F1 with a recovery driver. It releases a quarantine only when the quarantine is bound to F1's conflict and the `LIVE` behind it was stale (§5, `release-driver.test.ts`). Every other halt fails a run, and every population of its releases is pinned exactly.
+
+**One finding needs product code, and is STOPPED:** WP340-F1 (§5). A `LIVE` order event that reaches the OMS after the OMS already holds the order in a terminal state halts the order's market. The account then stays paused until an operator releases the quarantine. Safety holds. A fault-free sequence triggers it in the mock: a place-then-cancel answered before the order's `PLACEMENT` push. That ordering is the mock's push timing (assumption A8), and how often the real venue produces it is unmeasured. It is pinned as expected failures, never skipped. The user ruled its fix on 2026-10-05 (§5).
 
 ---
 
@@ -51,7 +54,7 @@ Every scenario composes the merged packages itself, inside the test tree, agains
 | `WP-270` `packages/oms` | `OrderManager`: state machines, signed-payload persistence, the salt gate, cancel and replace, attribution, reservations, recovery. |
 | `WP-280` user stream | `createUserStreamManager` with a live-shaped context: normalization, projections, reconnects and every reconciliation request. |
 | `WP-290` reconciliation | `ReconciliationCoordinator`, `ReconciliationJournal` and the real `Ledger`. |
-| `WP-300` inventory | `ReservationService` over `InventoryBook`. |
+| `WP-300` inventory | `ReservationService` over `InventoryBook`, in memory. Its book survives every crash only by the surviving-inventory assumption below. `WalletOperationManager` is not composed. |
 | `WP-310` | `VenueModeDetector` with `withModeDetection` and `venueModeSource`, and `RateLimitBudget`, both on their dated venue-valued snapshots. |
 | `WP-320` | `createLiveSafety` (the fencing authority, the health lease, kill-switch enforcement, eligibility, the ADR-033 D6 lapse recovery, the fenced venue port, `OmsProgressMonitor`), `createOrderHeartbeatController`, and `createFencingLeaseStore` on real PostgreSQL. |
 | `WP-330` `apps/ops-cli` | `runOpsCli`, the whole invocation: the gate, the scoped confirmation, the audit (a real file), the budget, the session and the command. |
@@ -62,12 +65,13 @@ Doubled, as the earlier suites double them:
 - **The OMS store** is WP-270's `MemoryStore`, and the payload cipher its `MockCipher`.
 - **The journal sink and the time line** are in memory: WP-320's `ManualTime`.
 - **WP-320's fakes** stand in for the kill-switch reader, the geoblock and closed-only ports and the release finality. WP-320's in-memory `MemoryFencingStore` is used everywhere except scenario 6.
-- **Scenario 6's writers** use WP-320's fake OMS view and coordinator. The fence is that scenario's subject, and a standby may not run an OMS or reconciler against the account (ADR-008 §5). The OMS's own fenced path is in `heartbeat-failure.test.ts`.
+- **WP-300's inventory book is carried across every crash, in memory.** The harness inherits this from WP-290's. WP-300 has no journal rebuild (`WP300-PERSIST`, §9), so a real restart would lose the book. Every "reservations conserved" check after a restart (§4.1) therefore holds only under this **surviving-inventory assumption**.
+- **Scenario 6's writers** use WP-320's fake OMS view and coordinator, because the fence is that scenario's subject. ADR-008 §5 says a standby "may not submit orders or send heartbeats while another holder is live". That neither writer runs an OMS or a reconciler against the account is this harness's own, stricter design choice. The OMS's own fenced path is in `heartbeat-failure.test.ts`.
 
 **Safety rails in the tests:**
 
 - Every test installs WP-260's network tripwire and fails if anything was refused.
-- The real-PostgreSQL file installs a guard of the same kind that admits exactly one TCP port, the throwaway container's.
+- The real-PostgreSQL file installs a guard of the same kind that admits exactly one TCP destination: the throwaway container's host and port. Since r1 it checks the host too, and a self-test pins that (J8a).
 - The pinned SDK's error objects are made by the SDK's own HTTP layer, answered from memory by the tripwire's responder (`support/sdk-errors.ts`), as WP-260's contract suite makes them.
 
 ---
@@ -89,7 +93,8 @@ Doubled, as the earlier suites double them:
 | `live` and `unmatched` placement answers; the pinned SDK turns `unmatched` into `{ok: false, code: "unmatched"}` | §2.2, C-6; the WP-260 handoff |
 | Placements in batches of 1 to 15; batch cancels of at most 1,000 ids (C-11, the lower figure) | `verified-2026-09-16.md` §2.1 D-05; `verified-2026-09-30.md` §2.5 |
 | Cancel answers `{canceled, not_canceled}` with the documented reasons | §2.5 |
-| Per-signer order and cancel buckets: the Standard tier from the dated snapshot; `Poly-RateLimit-*` feedback; `429` with `Retry-After` | §8; `rate-limits-2026-09-30` |
+| Order and cancel buckets **per signer address**, shared by every API key of that signer (the trader's and the emergency key are two keys of one signer); the Standard tier from the dated snapshot; a batch admitted only with tokens for every entry; `Poly-RateLimit-*` feedback; `429` with `Retry-After` | `verified-2026-09-16.md` §8 (S-D25); `rate-limits-2026-09-30` |
+| D-21: a cancel-all or cancel-market first consumes one cancel token, then one more per order canceled once the result is known. On the Standard tier that can put the bucket in debt, and `Remaining` goes negative. Later cancel requests stay blocked until the bucket holds the next request's cost | `verified-2026-09-16.md` §8 D-21 |
 | User channel `order` events (`PLACEMENT`, `UPDATE`, `CANCELLATION`) and `trade` events (`MATCHED` … `CONFIRMED`); `PING` every 10 s answered `PONG`; no replay after a disconnection | `verified-2026-09-16.md` §4; §W.4 |
 | An order missing from the open-orders list is not proof of cancellation; a by-id read returns it whatever its status | §W.9 E-14 |
 
@@ -104,6 +109,8 @@ Doubled, as the earlier suites double them:
 | A5 | A cancel refused `425` during a restart was not applied. | restricted modes |
 | A6 | The 5 s check's phase is fixed when the venue starts. A valid heartbeat received exactly 10 s after the last one still counts. The venue's clock never stalls when a process does. | scenario 3 |
 | A7 | Our orders rest and never cross on arrival. Fills are the venue's later matches at the order's price, fee 0, as `ReconWorld` books them. | every scenario |
+| A8 | A user-channel frame is pushed through the shared time line, so it reaches a process only when that time line turns. It therefore always trails the synchronous REST answer of the request that caused it. The venue documents no ordering between a REST answer and the push of the same change. | WP340-F1's route 3 rests on it; routes 1 and 2 do not |
+| A9 | The rate-limit details the docs leave open. Tokens refill continuously at the tier's rate. A request refused `429` consumes nothing: an order batch, or a cancel blocked by D-21. The refusal is the pinned SDK's `RateLimitError` with `Retry-After: 2`. A by-id cancel batch, like a placement batch, needs a token for every id. Callers sharing one signer are served in arrival order; bucket arbitration is undocumented (`verified-2026-09-16.md` §12). A 425'd cancel consumes nothing, with A5. | the rate-limit pins; scenario 4 under D-21 debt |
 
 The documented timing is documentary only (`verified-2026-09-16.md` §5): no round has observed the venue enforce it.
 
@@ -131,26 +138,30 @@ The oracle (`support/oracle.ts`):
 - no signature at rest: in the OMS store, the journal or the ledger;
 - the journal replays.
 
-| Scenario (`mid-order-crash.test.ts`) | Port calls in the baseline | Kill runs (before and after each) | WP340-F1 releases |
+| Scenario (`mid-order-crash.test.ts`) | Port calls in the baseline | Kill runs (before and after each) | WP340-F1 releases (baseline / kill runs) |
 | --- | --- | --- | --- |
-| Accepted, partly filled (the user channel and a reconciliation deliver it), canceled | 81 | 162 | 0 |
-| MID-ANSWER: the venue acted and the answer was lost; PRESENT by signed identity, then filled; a premature second order refused | 106 | 212 | 151 |
-| MID-TRANSMISSION: the request never arrived; ABSENT after the horizon; then a new salt | 75 | 150 | 0 |
-| A late arrival inside the horizon: never ABSENT, found PRESENT; premature second orders refused | 61 | 122 | 0 |
-| A real 425 (the pinned SDK's own error): held ABSENT, the same signed order resent in the post-only window | 65 | 130 | 0 |
-| `unmatched` (the pinned SDK's UNKNOWN): found PRESENT | 57 | 114 | 0 |
-| A batch whose answer was lost after the venue acted: both PRESENT, one filled | 94 | 188 | 0 |
-| A documented rejection, then a new salt | 51 | 102 | 0 |
-| **Total** | **590** | **1,180** (each killed; plus 8 baselines) | **151** |
+| Accepted, partly filled (the user channel and a reconciliation deliver it), canceled | 81 | 162 | 0 / 0 |
+| MID-ANSWER: the venue acted and the answer was lost; PRESENT by signed identity, then filled; a premature second order refused | 106 | 212 | 1 / 151 |
+| MID-TRANSMISSION: the request never arrived; ABSENT after the horizon; then a new salt | 75 | 150 | 0 / 0 |
+| A late arrival inside the horizon: never ABSENT, found PRESENT; premature second orders refused | 61 | 122 | 0 / 0 |
+| A real 425 (the pinned SDK's own error): held ABSENT, the same signed order resent in the post-only window | 65 | 130 | 0 / 0 |
+| `unmatched` (the pinned SDK's UNKNOWN): found PRESENT | 57 | 114 | 0 / 0 |
+| A batch whose answer was lost after the venue acted: both PRESENT, one filled | 94 | 188 | 0 / 0 |
+| A documented rejection, then a new salt | 51 | 102 | 0 / 0 |
+| **Total** | **590** | **1,180** (each killed; plus 8 baselines) | **1 / 151** |
 
-Every one of the 1,188 runs passed the oracle. The MID-ANSWER scenario meets WP340-F1 by its first route in most runs, because its lost answer, its fill and its timely stream are exactly that route's ingredients.
+Every one of the 1,188 runs passed the oracle, and in none did the recovery driver refuse a halting alert. Each scenario's release counts are pinned exactly (`support/expected-releases.ts`). The MID-ANSWER scenario meets WP340-F1 by its first route in most runs, because its lost answer, its fill and its timely stream are exactly that route's ingredients.
+
+"Reservations conserved" after a restart holds under the surviving-inventory assumption (§2): the inventory book outlives the process here, and no composition can provide that until `WP300-PERSIST` is done.
 
 Named pins on the three moments the packet names (`mid-order-crash.test.ts`, second `describe`):
 
 - **MID-SIGNING.** Killed after the signer produced a signature the SDK never returned. No order exists anywhere, the signature is nowhere at rest, and the group trades again.
 - **MID-TRANSMISSION.** Killed with the durable SENDING mark written and the request not yet out. The venue never sees it, and ABSENT is accepted only with the quiescence attestation.
 - **MID-ANSWER.** Killed after the venue created the order. The restarted process finds it PRESENT by signed identity. Exactly one order exists, and it is never resent.
-- **MID-ANSWER of a reconciliation.** Killed between the OMS's write of the answer and the journal's. Nothing is applied twice.
+- **MID-ANSWER of a reconciliation.** Killed between the OMS's write of the answer and the journal's. Nothing is applied twice. Its no-crash baseline is F1's route 1, with one release; the killed run has none.
+
+Each of the four pins asserts its release count and that the driver refused nothing.
 
 The seeded property runs random programs: placements under every modelled answer, batches, matches, cancels, engine restarts, socket drops, time and reconciliation. Each seed gets a baseline and random kill points.
 
@@ -164,7 +175,7 @@ Seeds 1 to 200, each with a baseline and 4 random kill points: **1,000 runs, all
   - `sdk.signer.signTypedData` 18 (mid-signing), `reconciler.request` 17, `venue.sign` 15, `store.load` 14;
   - `venue.process.placement` 10 (mid-transmission or mid-answer), `inventory.reserve` 9, `venue.post` 7, `inventory.release` 6;
   - `halt.market`, `inventory.consume`, `venue.postBatch` and `venue.process.cancel` 2 each.
-- WP340-F1 was released 71 times.
+- WP340-F1 was released 71 times, pinned exactly; the driver refused no halting alert.
 
 ### 4.2 Criterion 2: lost user-stream events (`lost-stream-events.test.ts`, `lost-stream-events.property.test.ts`)
 
@@ -176,7 +187,7 @@ The real WP-280 manager reads the mock channel through `MockUserChannel`. Its ch
 | A venue CANCELLATION DROPPED | The periodic run reads the order by id (E-14). The OMS closes it and releases its reservation. |
 | Every frame DUPLICATED | Each fill is recorded once, and the ledger books each trade once. |
 | REORDERED (a settlement before its match, an UPDATE before the PLACEMENT) | The reads settle every fill exactly. |
-| DELAYED past a read | WP340-F1, route 2. The account holds until an operator's review, then equals the venue. |
+| DELAYED past a read | WP340-F1, route 2. The account holds until an operator's review, then equals the venue. The one release is pinned. |
 | The socket DROPS right after a PLACEMENT, before the fill | Loss request, pause, reconnect, RESUBSCRIBED, reconcile; consistent. |
 | The socket DROPS DURING a reconciliation run | The run reading at that moment does not resume; a later one does, consistent. |
 | An UNRECOGNISED frame | `UNRECOGNIZED_MESSAGE` request, pause, reconcile; consistent. |
@@ -184,14 +195,16 @@ The real WP-280 manager reads the mock channel through `MockUserChannel`. Its ch
 | A FILL of that foreign order | `TRADE_UNATTRIBUTED`; nothing attributed to a strategy. |
 | A HOLDING delta (tokens, collateral) | `POSITION_UNATTRIBUTED` and `BALANCE_UNATTRIBUTED`, booked to the ledger's UNATTRIBUTED scope; halted; paused. |
 
+Every named case also pins the driver's record: no WP340-F1 release (one in route 2), and no halting alert refused. The three UNATTRIBUTED cases pin that the driver releases none of their quarantines.
+
 The seeded property (`lost-stream-events.property.test.ts`) ran seeds 1 to 300. Each had a random chaos policy and a random program of placements, venue matches, venue-side cancels, OMS cancels, socket drops, time and periodic runs. **All 300 seeds pass.**
 
 - The venue published 1,514 frames. The manager was handed 929 (duplicates included), and 423 were dropped.
 - The socket was lost 117 times.
-- 301 venue matches and 113 venue-side cancels happened.
+- 301 venue matches and 113 venue-side cancels happened. Since r1 a cancel is counted only when the venue really canceled the order (J8b); the count is unchanged.
 - 1,508 resumes occurred, and R1 checked each one: never resumed while the OMS or the ledger differed from the venue.
 - At the end, the OMS and the ledger equal venue truth in every seed.
-- WP340-F1 was released 59 times.
+- WP340-F1 was released 59 times, pinned exactly; the driver refused no halting alert.
 
 ### 4.3 Criterion 3: heartbeat failure (`heartbeat-failure.test.ts`)
 
@@ -222,6 +235,13 @@ The 14.5 s, printed by each case of the final run, comes from the clock phases: 
 - **Cancel-only.** The 503 is UNKNOWN, and placements pause. The order reconciles ABSENT and is closed. Cancels still work at the venue.
 - **A per-signer 429.** The pinned SDK's `RateLimitError` is UNKNOWN, never a rejection, and it reconciles ABSENT. The venue's documented headers reach the composition through WP-260's `onRateLimitUpdate`: `Remaining` 59 after an accepted order, then 0 on the 429, tier `Standard`. Fed with that answer, WP-310's budget grants no `NEW_ORDER` for the signer inside the 2 s `Retry-After`, and grants one after it. A probe with the feedback withheld found it granted at once, so the pin depends on the feedback.
 
+**The rate-limit model itself** (`rate-limits.test.ts`, r1, J4), each case through WP-260's real client:
+
+- **Per signer, not per API key.** The trader key's drained order bucket refuses the emergency key's placement with `429`, and nothing is created. One token later (25 ms) it is admitted. The trader key's spent cancel bucket blocks the emergency key's cancel-all in the same way.
+- **D-21 admission.** The 121st cancel-all at one instant is blocked, and admitted 13 ms later.
+- **D-21 debt.** A cancel-all that cancels 130 orders leaves the bucket at 120 − 1 − 130 = −11. The header's `Remaining` reads −11. Every cancel, by id or cancel-all, stays blocked for 149 ms, and the next one passes at 150 ms. A cancel-market does the same.
+- **All-or-nothing batches.** A by-id batch of 6 ids at a balance of 5 is refused whole, and consumes nothing. The batch of 5 passes.
+
 ### 4.5 Packet scenario 4: the independent cancel path (`independent-cancel.test.ts`)
 
 **Setup:**
@@ -247,6 +267,8 @@ The 14.5 s, printed by each case of the final run, comes from the clock phases: 
   - `OUTCOME` says `verified: true`;
 - no credential or signature in the audit or the output;
 - zero calls to the trader's database, and no lease store opened.
+
+**Against the trader's D-21 debt (r1, J4).** The trader's last act before dying was a market sweep of 140 resting orders. That left the cancel bucket of the signer it shares with the emergency key at −21. The CLI's `DELETE /cancel-all` is then refused `429` (UNKNOWN, `RATE_LIMITED`). Its by-id sweep waits out the `Retry-After`, and cancels all three orders. The exit is `COMPLETED`, `verified: true`, and the audit records the refused cancel-all and the sweep. The CLI's own plan says it cannot see the venue's shared balance; the venue's real `Retry-After` for a blocked cancel is assumption A9.
 
 Under the credential-scoped reading, `DELETE /cancel-all` cancels nothing the trader's key placed; WP-330's by-id sweep of venue truth does. When the trader comes back, its restart reconciles to the emergency cancels: both orders CANCELED (one part-filled), consistent and resumed. Under PAPER flags the same invocation exits `RUN_MODE_REFUSED`. It touches no configuration, credential, venue or lease, and every order stays.
 
@@ -277,6 +299,8 @@ Under the credential-scoped reading, `DELETE /cancel-all` cancels nothing the tr
 
 The time line runs at most 10 times faster than real time and never slower than it. So a holder's local deadline always falls before its lease's real expiry, which is the authority's conservative direction.
 
+The file's network guard admits only the container's host and port. A fourth test pins that: a connect to the database's port on another loopback host, or to another port on its host, is refused (r1, J8a).
+
 ---
 
 ## 5. Findings
@@ -289,25 +313,42 @@ The time line runs at most 10 times faster than real time and never slower than 
 
 1. A placement's answer is lost, and the venue fills or cancels the order. The stream's `PLACEMENT` (LIVE) is retained while the attempt is unknown. The reconciliation's PRESENT answer adopts the terminal state, and only then is the retained `LIVE` drained. It is related to WP270-R4-01: the adoption and the drain are not crash-atomic either. After a restart, the same conflict comes back as "recovered with an open evidence conflict".
 2. A frame lags a reconciliation read that recorded the order FILLED.
-3. With no fault at all, the OMS places and cancels an order before the stream delivers its `PLACEMENT` frame. The venue answered two REST calls faster than one push. Any cancel or replace faster than the push latency can halt its market.
+3. With no fault at all, the OMS places and cancels an order before the stream delivers its `PLACEMENT` frame. The venue answered two REST calls faster than one push. Any cancel or replace faster than the push latency can halt its market. This route rests on the mock's push timing, assumption A8: a frame always trails the REST answer of the request that caused it. The venue documents no such ordering, and how often it occurs live is unmeasured. Routes 1 and 2 do not depend on A8.
 
 **Safety holds.** Nothing is sent while the quarantine stands. The release resumes only a consistent account, and R1 was checked at every resume.
 
-**Liveness does not.** In the suites, the recovery driver released exactly this signature as an operator would, and counted each release:
+**Liveness does not.** In the suites, a recovery driver (`releaseKnownFindings`, `support/live-node.ts`) releases WP340-F1 as an operator would, and nothing else. Since r1 (J1) it releases a quarantine only when `classifyQuarantine` finds all of the following:
 
-- the stream property: 59 releases;
-- the crash property: 71;
-- the named crash runs: 151.
+1. **Provenance.** The quarantine's alert is bound to the conflict event(s) that opened it. WP-290 names the alert by the OMS instance's first run id and the alert's ordinal. A live alert is bound to the `EVIDENCE_CONFLICT` event of its own order in the same commit. A recovered alert ("recovered with an open evidence conflict") is bound to every `conflict: true` event after the last `conflict: false` one, in the log the restarted OMS loaded. Every conflict-opening type counts: `EVIDENCE_CONFLICT`, `OBSERVATION_UNRECOGNISED`, a read's conflict and a venue-id conflict. An ambiguous binding is refused.
+2. **Shape.** Every bound event is F1's: an `EVIDENCE_CONFLICT` out of FILLED or CANCELED, caused by an observation of `LIVE`.
+3. **Staleness.** When each bound event was written, the venue already held the order terminal, so the `LIVE` was stale. The venue still holds it terminal at the release.
 
-Any other halt still fails a run.
+Every other halting-alert quarantine stays and is recorded, with its reason, in the world's refused list. Every suite fails a run on a refusal.
 
-**Owner:** an OMS round in `packages/oms`. The options include:
+`release-driver.test.ts` pins both of round 1's witnesses, each of which the r0 driver released:
 
-- order observations by venue timestamp or sequence;
-- applying retained evidence before an adopted terminal answer;
-- treating `LIVE` after a confirmed terminal state as stale rather than conflicting.
+- **Provenance (astra's witness).** An F1 is released; an unrecognised-status conflict then reopens the same CANCELED order, and the process crashes. The recovered halt is bound to the later conflict, and stays.
+- **Staleness (Opus's witness, without a mutant).** The OMS holds an order CANCELED that the venue rests, and a true `LIVE` arrives. The alert text is F1's, but the `LIVE` was true, so the halt stays.
 
-That needs a ruling, because it relaxes a fail-closed rule. Until then, every `LIVE` after a terminal state needs an operator.
+Two positive controls show a genuine F1, live and recovered after a crash, is still released. Mutant M20 (§6), any partial fill completing the order, now fails the named crash and stream tests. On the r0 tree they passed it, 23 of 23, while its driver released true contradictions: the Opus verifier counted 519 releases of venue-live orders, and r1 reproduced the pass, with 362 and 277 releases in two crash scenarios that release none unmutated.
+
+**Every release the driver makes, by population** (`support/expected-releases.ts`; each pinned exactly by its suite):
+
+| Population | File | Releases |
+| --- | --- | --- |
+| Crash matrix, no-crash baselines | `mid-order-crash.test.ts` | 1 |
+| Crash matrix, kill runs | `mid-order-crash.test.ts` | 151 |
+| Crash named pins (one baseline) | `mid-order-crash.test.ts` | 1 |
+| Crash property | `mid-order-crash.property.test.ts` | 71 |
+| Stream named (route 2) | `lost-stream-events.test.ts` | 1 |
+| Stream property | `lost-stream-events.property.test.ts` | 59 |
+| **The r0 suites** | | **284** |
+| Release-driver pins (r1) | `release-driver.test.ts` | 3 |
+| **Total** | | **287** |
+
+The r0 report gave 151 + 71 + 59 (+1) = 282; it missed the two baselines (J3). The four TODAY tests of `findings.test.ts` release their quarantine by hand and are not counted.
+
+**Owner, and the ruling.** The user ruled on 2026-10-05: venue-time ordering. The venue timestamp is passed into the OMS. A `LIVE` older than the evidence that made the order terminal is recorded as stale, with no halt; a newer one still halts. Before live: a short ADR, then a `packages/oms` round, with a venue check of the stream timestamps' ordering and precision. Until then, every `LIVE` after a terminal state needs an operator. When that round lands, the `it.fails` markers fail, and every count above drops to 0.
 
 **Reproduction:**
 
@@ -328,6 +369,8 @@ The four `it.fails` pins state the wanted behaviour (routes 2 and 3, and route 1
 
 Each row was applied to the real package in a scratch worktree (`git worktree add --detach`, with `node_modules` hardlinked). The relevant suite was run, and the file was restored. Its sha256 was compared with the original, and every row matched. Nothing was committed.
 
+In r1 every row was run again, against the r1 tests, and M20 was added (J1). The table gives the r1 results.
+
 | Id | Criterion | Mutant (real package) | Expected to fail | Observed (`Tests` line; failing tests) |
 | --- | --- | --- | --- | --- |
 | M1 | 1 | `oms` `#saltGate` always open, the whole plan remaining | a new salt while an earlier attempt is unresolved (S2, DUPLICATE_EXPOSURE) | KILLED: 2 failed, 11 passed. The seeded property, and the late-arrival case. In the MID-ANSWER case the OMS's pause refuses the premature order first |
@@ -345,18 +388,19 @@ Each row was applied to the real package in a scratch worktree (`git worktree ad
 | M11 | 4 | `capital-allocator`: `LIVE_MICRO_CAP_FLOOR` raised to `"1"` | the cap floor and the shipped example | KILLED: 2 failed, 13 passed |
 | M12 | 4 | shipped `trader.config.example.json`: `liveMicroMaxOrderNotional` raised to `"25"` | a live cap raised in a shipped config | KILLED: 1 failed, 14 passed |
 | M13 | 4 | `trading-core`: the startup floor accepts a nonzero cap | a raised cap not refused | KILLED: 1 failed, 14 passed |
-| M14 | scenario 4 | `ops-cli` `cancel-all` skips its by-id sweep | under A2's credential scope, the trader's orders stay | KILLED: 2 failed, 2 passed. The account-scoped reading passes, which is what A2 predicts |
-| M15 | scenario 6 | `trader` fenced venue: a placement transmitted whatever the fence says | the old holder's signed order reaches the venue after the takeover | KILLED: 2 failed, 1 passed. It first SURVIVED; the held-back-order pin was added (§5) |
-| M16 | scenario 6 | `trader` fenced venue: a non-holder may sign | the non-holder signs at the venue | KILLED: 3 failed |
+| M14 | scenario 4 | `ops-cli` `cancel-all` skips its by-id sweep | under A2's credential scope, the trader's orders stay | KILLED: 3 failed, 2 passed. The account-scoped reading passes, which is what A2 predicts. Since r1 the D-21 debt case fails too: its refused cancel-all leaves everything resting |
+| M15 | scenario 6 | `trader` fenced venue: a placement transmitted whatever the fence says | the old holder's signed order reaches the venue after the takeover | KILLED: 2 failed, 2 passed (the r1 guard self-test is the fourth test). It first SURVIVED; the held-back-order pin was added (§5) |
+| M16 | scenario 6 | `trader` fenced venue: a non-holder may sign | the non-holder signs at the venue | KILLED: 3 failed, 1 passed (the guard self-test) |
 | M18 | restricted modes | `oms` restricted mode: POST_ONLY reported to the OMS as NORMAL | a non-post-only order sent into the post-only window | KILLED: 1 failed, 2 passed |
+| M20 | 1 and 2 (J1) | `oms` `#applyFill`: any partial fill completes the order, so it is FILLED while the venue still rests the remainder, and a true `LIVE` then raises F1's alert text | the driver releasing a true contradiction as F1 | KILLED: 7 failed, 16 passed, on the NAMED crash and stream tests: the driver refuses those halts, and the runs stay halted. On the r0 tree the same named tests passed it, 23 of 23, with 362 and 277 releases in two crash scenarios (reproduced in r1) |
 
-**19 of 19 killed against the final tests.** Every file was restored byte-identically. Rows M15 and M16 ran on real PostgreSQL. Results: `~/pmb-rounds/wp-340/mutation-results-final.json`; script: `mutate.py`, beside it.
+**20 of 20 killed against the r1 tests.** Every file was restored byte-identically. Rows M15 and M16 ran on real PostgreSQL. Results: `~/pmb-rounds/wp-340/r1/mutation-results-r1.json` (r0: `mutation-results-final.json`); script: `r1/mutate-r1.py`.
 
 ---
 
 ## 7. Gates
 
-Every gate below was run on the final tree, in one sequence, and every one exited 0. Logs: `~/pmb-rounds/wp-340/gates/`.
+Every gate below was run on the r1 tree, in one sequence (r1 logs: `~/pmb-rounds/wp-340/r1/gates/`; r0: `~/pmb-rounds/wp-340/gates/`). Every one exited 0, with one disclosed retry.
 
 | Gate | Result (files / tests) |
 | --- | --- |
@@ -370,16 +414,16 @@ Every gate below was run on the final tree, in one sequence, and every one exite
 | `pnpm test:fault` | WAL 11/89, OMS 1/7, reconciliation 64/848 |
 | `pnpm --filter @polymarket-bot/trader test:fault:live-safety` | 15 / 74 |
 | this suite's typecheck (`test/fault-injection/live/tsconfig.json`) | exit 0 |
-| **this suite** (`test/fault-injection/live/vitest.config.ts`) | **10 / 75** |
-| **this suite's PostgreSQL half** (Docker) | **1 / 3** |
+| **this suite** (`test/fault-injection/live/vitest.config.ts`) | **13 / 95** (r0: 10 / 75) |
+| **this suite's PostgreSQL half** (Docker) | **1 / 4** (r0: 1 / 3) |
 | control-api `test:integration` (CONTROL-1b's whole-repo guard) | 22 / 310 |
 | control-api `test:integration:postgres` | 5 / 36 |
 | storage-postgres `test:integration` (the fencing store's own suite) | 16 / 257 |
-| ops-cli `test:integration` (the emergency CLI's bundle on PostgreSQL) | 1 / 6 |
+| ops-cli `test:integration` (the emergency CLI's bundle on PostgreSQL) | 1 / 6, on a retry. The first attempt failed before any test ran: Testcontainers' "Port 41462 not bound after 120000ms" (6 skipped). Nothing under `apps/ops-cli` or `test/integration` changed in r1 |
 
 Docker was available. The Testcontainers containers this work started were stopped by Testcontainers itself, and no other container was touched.
 
-The first full gate run, with the two end-to-end files under `test/e2e/live-mock/`, failed `test:e2e` at 2 of 235 (§1). They were moved, and every gate was run again.
+In r0, the first full gate run had the two end-to-end files under `test/e2e/live-mock/`. It failed `test:e2e` at 2 of 235 (§1). They were moved, and every gate was run again.
 
 ---
 
@@ -396,6 +440,8 @@ Nothing here can verify the following. Each needs real infrastructure, a credent
 
   The mock signer's signature is never a valid one.
 - **The IP-budget split** with the data gateway and the ops CLI (WP310-LOWS, WP320-FOLLOWUPS): budgets are per process here.
+- **The signer's shared buckets, live.** The mock shares one signer's buckets between the trader's and the emergency key, as §8 documents, and blocks cancels in D-21 debt. Not verified: the venue's real answer to a blocked cancel and its `Retry-After` (A9); bucket arbitration between callers; whether the emergency CLI's single by-id sweep clears a debt deeper than what refills before it is sent.
+- **Restart-safe inventory.** WP-300's book is in memory only, with no journal rebuild (`WP300-PERSIST`). This harness carries it across every crash, so every "reservations conserved" result after a restart holds only under the surviving-inventory assumption (§2). `WalletOperationManager` is not composed, so wallet-operation restart recovery is unverified.
 - **Adapters the composition binds:**
   - the authenticated read adapter (`AccountReadPort` over the SDK and the Data API `/v2`);
   - the OMS store on migration `0005`, with `0008`'s trigger refusing a stale holder's attempt;
@@ -409,7 +455,7 @@ Nothing here can verify the following. Each needs real infrastructure, a credent
 - **The venue's real behaviour:**
   - the timing is documentary only;
   - the venue's deduplication of a same-salt resend after a 425 is undocumented (WP270-DECISIONS);
-  - so are the A1 to A7 assumptions (§3.2);
+  - so are the A1 to A9 assumptions (§3.2);
   - so is whether a lapse's sweep also covers the emergency key's orders.
 
 ---
@@ -426,17 +472,41 @@ Nothing here can verify the following. Each needs real infrastructure, a credent
 | `WP290-RESIDUALS` | V7-PHANTOM-PERMANENT-HOLD | WP340-F1 is a related liveness hold. It is operator-releasable, not permanent |
 | | I-12, a lone foreign exact twin adopted PRESENT | Not reproduced: the mock never creates exact twins |
 | | Composition duties | The suites deliver outputs in order and restart rather than rebind (§8) |
+| `WP300-PERSIST` | WP-300's identity sets, kept observations, quarantines and request map are in memory only; no journal rebuild | **Not exercised; assumed away.** The harness carries the inventory book across every crash (the surviving-inventory assumption, §2), so reservation conservation after a restart is shown only under it. `WalletOperationManager` is not composed: wallet-operation restart recovery is unverified (§8) |
+| `WP300C-OBLIGATIONS` | The composition binds `requestToken` to a CSPRNG and tests that composed ids cannot be derived; it calls `retryReconciliationRequests` on a cadence and alerts on `outstandingReconciliationRequests()`; a journal or replay records the drawn tokens; WP-290 echoes `requestId` and never answers with a read made before receiving the request; INFO J9, R4-01, R4-02 | Run, not asserted here: WP-290's coordinator calls the OMS's `retryReconciliationRequests` at the start of every run and echoes each `requestId` in its answers (WP-290's own suites pin both). Not exercised: the CSPRNG (a deterministic test token source is used), a composition's own cadence, the outstanding-request alert, and the recording of the drawn tokens. They are composition duties (§8) |
 | `WP310-LOWS` | CX310-R3-01, OP-R3-01, the policy numbers | Not targeted. The suite runs on the dated snapshots, which are not operator rulings |
 | `WP320-FOLLOWUPS` | `scopeRef` validation, an OMS cancel deadline, the composition's routes, the `test:fault` wiring, the IP split | The cancel-hang case in §4.3 shows the heartbeat backstop when a cancel never answers. The rest are composition or CI items (§8, §10) |
 | `WP330-LOWS` | CX330-R5-01, WP330-V5-01, the INFO pins | Not targeted. Scenario 4 uses the real file audit, sequentially |
 | `CAP1-RESIDUALS` | `CAP1-TIER1-LIMIT-PRICE`, OBS-1, OBS-2, R4-FABLE-01 | Not exercised: the risk checks are not composed here. R4-FABLE-01 needs a halt released in-run, which no live composition does yet |
 | `ROLLOVER1-RESIDUALS` | R8-FABLE-01, R8-FABLE-02, r7 item 9, the user's confirmation of the amendments | Not exercised: series windows are not composed here |
+| `V3-C12-HEARTBEAT-ADR` | ADR-033 D5, the heartbeat transport; the guide's `POST /v1/heartbeats` against the API reference's `POST /heartbeats` | Not resolvable here. The mock serves S-D17's shapes behind WP-320's transport port (§8) |
+| `WP340-F1` | This report's finding (§5); ruled by the user 2026-10-05, venue-time ordering | Pinned: four `it.fails` and four TODAY tests; every release by the suites' driver is bound and counted (§5) |
 
 ---
 
 ## 10. Follow-up
 
-1. **WP340-F1:** an OMS round, after a ruling (§5).
+1. **WP340-F1:** the ADR and the `packages/oms` round the user's 2026-10-05 ruling names (§5). Then delete the `it.fails` markers and set every count in `support/expected-releases.ts` to 0.
 2. **The orchestrator:** wire `test/fault-injection/live/vitest.config.ts`, with its typecheck, into the root `test:fault` chain and CI. Also wire the PostgreSQL half into the Docker step. Rule whether WP-250's e2e posture scan should admit a live-mock subtree (§1).
 3. **The live composition root,** after ADR-033 D5: bind every adapter and duty in §8, then re-run this suite against it before any mode above PAPER.
-4. **A venue round:** A1, A2 and A3 (§3.2), and the S-D17 / S-D18 conflict.
+4. **A venue round:** A1, A2, A3, A8 and A9 (§3.2), and the S-D17 / S-D18 conflict.
+5. **`WP300-PERSIST`** before any restart-safe composition: until then, reservation conservation across a restart is shown only under the surviving-inventory assumption (§2).
+
+---
+
+## 11. Revision r1
+
+The joint round-1 review (Opus and gpt-6-astra, reconciled) found:
+
+| Id | Severity | What changed |
+| --- | --- | --- |
+| J1 | HIGH | The F1 driver binds each release to its conflict and checks staleness (§5); every release population and the refusals are pinned; two negative pins and mutant M20 |
+| J2 | MEDIUM | `WP300-PERSIST` and `WP300C-OBLIGATIONS` in §9; the surviving-inventory assumption in §2 and §8 |
+| J3 | LOW | Every release population counted and pinned, 284 on the r0 suites (§5) |
+| J4 | MEDIUM | Buckets per signer address, D-21 admission and post-result debit (§3.1, A9); `rate-limits.test.ts`; scenario 4 under the trader's debt |
+| J5 | LOW | The leftover debug line is a labelled count line; a hygiene pin |
+| J6 | LOW | ADR-008 §5 quoted for what it says (§2) |
+| J7 | LOW | The push timing is assumption A8; "common" removed |
+| J8 | INFO | The database guard checks the host (a self-test pins it); venue cancels counted when effective; the single heartbeat phase stays disclosed (§4.3) |
+
+`report.test.ts` and `mock-venue-facts.test.ts` pin the report's side of J2, J3, J6 and J7.

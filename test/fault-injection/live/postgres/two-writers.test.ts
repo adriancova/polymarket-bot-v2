@@ -71,12 +71,13 @@ import { RATE_LIMIT_SNAPSHOT } from "../support/safety-node.js";
 
 let context: TestContext;
 let store: FencingLeaseStore;
-let databaseEndpoint = "";
+/** The throwaway container's endpoint: the one TCP destination the guard admits (host AND port; J8a, WP-340 r1). */
+let databaseEndpoint = { host: "", port: "" };
 
 beforeAll(async () => {
   const { connectionString } = await createIsolatedDatabase(inject("wp340PostgresAdminUrl"), "wp340_two_writers");
   const url = new URL(connectionString);
-  databaseEndpoint = `${url.port}`;
+  databaseEndpoint = { host: url.hostname, port: url.port };
   context = await createMigratedContext(connectionString);
   store = createFencingLeaseStore(context.db);
 });
@@ -88,7 +89,8 @@ afterAll(async () => {
 /**
  * WP-260's network tripwire refuses EVERY TCP connect, and the database pool may open a connection at any query, so
  * this file installs a guard of the same kind with exactly one exception: a TCP connect to the throwaway container's
- * port. Every other connect, and every `fetch`, is refused and recorded; each test asserts none was attempted.
+ * host and port, both. Every other connect (another host on that port included), and every `fetch`, is refused and
+ * recorded; each test asserts none was attempted.
  */
 interface Guard {
   refused(): readonly string[];
@@ -101,11 +103,14 @@ function installDatabaseOnlyGuard(): Guard {
   const originalConnect = prototype.connect;
   const originalFetch = globalThis.fetch;
   prototype.connect = function guardedConnect(this: unknown, ...args: unknown[]): unknown {
+    // `connect(options)`, `connect([options, ...])` or `connect(port, host)`: a missing host is Node's default, localhost.
     const first = Array.isArray(args[0]) ? (args[0] as unknown[])[0] : args[0];
-    const port = typeof first === "object" && first !== null ? String((first as { port?: unknown }).port ?? "") : String(first);
-    if (port !== databaseEndpoint) {
-      refused.push(`net.connect(${port})`);
-      throw new Error(`network guard: a connect to port ${port} refused`);
+    const options = typeof first === "object" && first !== null ? (first as { port?: unknown; host?: unknown; path?: unknown }) : null;
+    const port = options === null ? String(first) : String(options.port ?? "");
+    const host = options === null ? (typeof args[1] === "string" ? args[1] : "localhost") : typeof options.host === "string" ? options.host : "localhost";
+    if (options?.path !== undefined || port !== databaseEndpoint.port || host !== databaseEndpoint.host) {
+      refused.push(`net.connect(${host}:${port})`);
+      throw new Error(`network guard: a connect to ${host}:${port} refused`);
     }
     return originalConnect.apply(this, args);
   };
@@ -325,7 +330,7 @@ describe("WP-340 scenario 6: two live-shaped writers, one fencing lease, real Po
       start(p.a);
       start(p.b);
       for (let index = 0; index < 120; index += 1) await p.tick(250);
-      console.log("holder refusals", JSON.stringify([...new Set(holder.refusals)]), holder.refusals.length, holder.sent, JSON.stringify(holder.safety.gate({ kind: "REDUCTION", marketId: MARKET, instanceId: INSTANCE }).reasons));
+      console.info(`WP-340 two writers, race: ${JSON.stringify({ holderSent: holder.sent, holderRefusals: holder.refusals.length, holderRefusalKinds: [...new Set(holder.refusals)], otherRefusals: other.refusals.length })}`);
       expect(holder.sent).toBeGreaterThan(50);
       expect(other.sent).toBe(0);
       expect(other.refusals.length).toBeGreaterThan(50);
@@ -414,4 +419,29 @@ describe("WP-340 scenario 6: two live-shaped writers, one fencing lease, real Po
       }
     });
   }
+});
+
+describe("WP-340 r1 (J8a): the database-only guard admits exactly the container's host and port", () => {
+  it("refuses a connect to the database's PORT on another host, and any other port on its host; admits the container itself", async () => {
+    const guard = installDatabaseOnlyGuard();
+    try {
+      const port = Number(databaseEndpoint.port);
+      // 127.0.0.2 is loopback too: only the host check stops it.
+      const otherHost = databaseEndpoint.host === "127.0.0.2" ? "127.0.0.3" : "127.0.0.2";
+      for (const attempt of [() => net.connect({ host: otherHost, port }), () => net.connect(port, otherHost), () => net.connect({ host: databaseEndpoint.host, port: port + 1 })]) {
+        let socket: net.Socket | null = null;
+        expect(() => {
+          socket = attempt();
+        }).toThrow(/network guard/u);
+        (socket as net.Socket | null)?.destroy();
+      }
+      expect(guard.refused()).toEqual([`net.connect(${otherHost}:${String(port)})`, `net.connect(${otherHost}:${String(port)})`, `net.connect(${databaseEndpoint.host}:${String(port + 1)})`]);
+      // The container itself is admitted: a query runs (on a fresh connection when the pool has none idle).
+      const answer = await context.pool.query<{ one: number }>("select 1 as one");
+      expect(answer.rows).toEqual([{ one: 1 }]);
+      expect(guard.refused()).toHaveLength(3);
+    } finally {
+      guard.uninstall();
+    }
+  });
 });

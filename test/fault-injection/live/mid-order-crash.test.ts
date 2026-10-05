@@ -49,6 +49,7 @@ import {
   type LiveNode,
   type LiveWorld,
 } from "./support/live-node.js";
+import { CRASH_MATRIX_F1, F1_RELEASES } from "./support/expected-releases.js";
 import { expectRecovered, recoveryProblems } from "./support/oracle.js";
 
 let tripwire: NetworkTripwire;
@@ -194,6 +195,7 @@ describe("WP-340 acceptance 1: a crash before and after every port call, beneath
       const baseline = await execute(scenario, null);
       expect(baseline.killed).toBe(false);
       expectRecovered(`${name} (no crash)`, baseline.world, baseline.last, baseline.resumed);
+      expect(baseline.world.refusedReleases, "the driver refused no halting alert").toEqual([]);
       const calls = baseline.first.inc.calls;
       expect(calls).toBeGreaterThan(20);
       // Every SDK-level step is among the kill points.
@@ -208,11 +210,15 @@ describe("WP-340 acceptance 1: a crash before and after every port call, beneath
           f1 += run.world.findings.length;
           const label = `killed ${phase} call ${String(at)} (${run.first.inc.trace[at - 1] ?? "?"})`;
           for (const problem of recoveryProblems(run.world, run.last, run.resumed)) failures.push(`${label}: ${problem}`);
+          for (const refused of run.world.refusedReleases) failures.push(`${label}: the driver refused a halt: ${refused.reason}`);
         }
       }
       expect(failures).toEqual([]);
       expect(killedRuns).toBe(2 * calls);
-      console.info(`WP-340 crash scenario: ${JSON.stringify({ name, calls, killedRuns, f1Released: f1 })}`);
+      const released = { baseline: baseline.world.findings.length, killed: f1 };
+      console.info(`WP-340 crash scenario: ${JSON.stringify({ name, calls, killedRuns, f1Released: released })}`);
+      // Exact (J1, J3): a halt the driver releases where none is expected (a real OMS defect dressed as F1) fails here.
+      expect(released, "WP340-F1 releases (J1, J3)").toEqual(CRASH_MATRIX_F1[name]);
     }, 600_000);
   }
 });
@@ -238,6 +244,7 @@ describe("WP-340 acceptance 1, named: mid-signing, mid-transmission, mid-answer"
     expect(run.world.clob.signatures.size, "the signature was made").toBe(1);
     expect(run.world.clob.receipts, "nothing reached the venue").toEqual([]);
     expectRecovered("mid-signing", run.world, run.last, run.resumed);
+    expect(run.world.findings, "no WP340-F1 release (J1)").toEqual([]);
     // The group is not blocked by the half-made order: a new submission is signed and placed.
     const oms = run.last.oms as OrderManager;
     const again = await oms.submit(ticket(G1, { n: 90, shares: "1" }));
@@ -256,6 +263,7 @@ describe("WP-340 acceptance 1, named: mid-signing, mid-transmission, mid-answer"
     // Every ABSENT the restarted OMS accepted was quiescent (WP-270: ABSENT needs the attestation).
     expect(run.world.u.accepted.filter((answer) => answer.verdict === "ABSENT").every((answer) => answer.quiescent)).toBe(true);
     expectRecovered("mid-transmission", run.world, run.last, run.resumed);
+    expect(run.world.findings, "no WP340-F1 release (J1)").toEqual([]);
   });
 
   it("MID-ANSWER: killed after the venue created the order and before its answer came back: the restarted process finds it PRESENT by signed identity; exactly one order at the venue, never resent", async () => {
@@ -269,16 +277,22 @@ describe("WP-340 acceptance 1, named: mid-signing, mid-transmission, mid-answer"
     expect(attempt).toMatchObject({ venueOrderId: run.world.clob.venueOrderIdOf(salt) });
     expect(run.world.u.accepted.some((answer) => answer.verdict === "PRESENT" && answer.venueOrderId === run.world.clob.venueOrderIdOf(salt))).toBe(true);
     expectRecovered("mid-answer", run.world, run.last, run.resumed);
+    expect(run.world.findings, "no WP340-F1 release (J1)").toEqual([]);
   });
 
   it("MID-ANSWER of a reconciliation: killed after the coordinator's answer was persisted by the OMS and before the journal recorded it: nothing is applied twice", async () => {
     const lost = SCENARIOS["MID-ANSWER: the venue acted and the answer was lost (the SDK's TransportError); found PRESENT by signed identity, then filled"] as Scenario;
     const baseline = await execute(lost, null);
+    // Its no-crash baseline is WP340-F1's route 1 (a lost answer, a fill, a timely stream): one release (J3).
+    expect(baseline.world.findings).toHaveLength(F1_RELEASES.crashNamedPins);
     const answerAt = baseline.first.inc.trace.findIndex((name, index) => name.startsWith("store.apply[UPDATE_ATTEMPT") && index > baseline.first.inc.trace.indexOf("read.order"));
     expect(answerAt).toBeGreaterThan(0);
     const run = await execute(lost, { at: answerAt + 1, phase: "after" });
     expect(run.killed).toBe(true);
     expect(run.world.clob.orders.size).toBe(1);
     expectRecovered("mid-answer of a reconciliation", run.world, run.last, run.resumed);
+    // Killed here, the order's terminal answer was adopted before any stale LIVE drained: no release, and none refused.
+    expect(run.world.findings, "no WP340-F1 release (J1)").toEqual([]);
+    expect(run.world.refusedReleases).toEqual([]);
   });
 });

@@ -5,7 +5,7 @@
  * VERBATIM (whitespace normalized: the reports wrap their lines), and to the
  * constant the product itself acts on, so the mock and the packages cannot
  * drift apart silently. Every assumption the mock makes where the venue
- * documents nothing (A1–A7 in `support/mock-clob.ts`) must be listed, by id,
+ * documents nothing (A1–A9 in `support/mock-clob.ts`) must be listed, by id,
  * in the security and recovery report.
  *
  * Pure text and constants: nothing reaches a network or a venue (the tripwire
@@ -110,10 +110,27 @@ describe("WP-340: every behaviour the mock CLOB acts on is documented, and agree
     expect(R0930).toContain(quote("every IP limit, the six trading dual limits, the eight per-signer tiers, the negative-cancel-balance rule"));
   });
 
-  it("every undocumented behaviour the mock assumes (A1–A7) is listed, by id, in the security and recovery report", () => {
+  it("rate limits: the buckets are per SIGNER ADDRESS, and a batch is admitted only with a token for every entry (§8, S-D25); J4, WP-340 r1", () => {
+    expect(R0916).toContain(quote("separate order and cancel buckets per signer address"));
+    expect(R0916).toContain(quote("a batch is admitted only when the bucket contains enough tokens for every entry. Otherwise, the entire request is rejected and no entries are processed."));
+  });
+
+  it("D-21: one cancel token first, then one per order canceled once the result is known; debt allowed on Standard; later cancels blocked until the bucket covers the next request (§8); J4, WP-340 r1", () => {
+    expect(R0916).toContain(
+      quote(
+        "Each request first consumes one cancel token. After the cancellation result is known, the bucket is debited one additional token for every order successfully canceled. For tiers that allow a negative cancel balance, this second debit can put the bucket into debt. Future cancel requests remain blocked until the bucket has enough tokens for the next request.",
+      ),
+    );
+    expect(R0916).toContain(quote("`Poly-RateLimit-Remaining` can be negative after `DELETE /cancel-all` or `DELETE /cancel-market-orders` for tiers that allow a negative cancel balance."));
+    // The mock's tier is one that allows the debt.
+    expect(STANDARD_TIER.tier).toBe("Standard");
+  });
+
+  it("every undocumented behaviour the mock assumes (A1–A9) is listed, by id, in the security and recovery report", () => {
     const mock = readFileSync(path.join(REPO_ROOT, "test/fault-injection/live/support/mock-clob.ts"), "utf8");
     const ids = [...mock.matchAll(/^ \* - (A[0-9]+): /gmu)].map((match) => match[1] as string);
-    expect(ids).toEqual(["A1", "A2", "A3", "A4", "A5", "A6", "A7"]);
+    // A8 (the push timing, J7) and A9 (the rate-limit details the docs leave open, J4) were added in WP-340 r1.
+    expect(ids).toEqual(["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9"]);
     const report = readFileSync(path.join(REPO_ROOT, "docs/experiments/phase-3-verification.md"), "utf8");
     for (const id of ids) expect(report, id).toMatch(new RegExp(`\\| ${id} \\|`, "u"));
   });
