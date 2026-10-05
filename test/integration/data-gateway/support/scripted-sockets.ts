@@ -18,7 +18,7 @@ import type {
   PublicWebSocketHandlers,
 } from "@polymarket-bot/polymarket-public";
 
-/** One scripted WHATWG-shaped socket (Polymarket market WS and RTDS). */
+/** One scripted WHATWG-shaped socket (the Polymarket market WS). */
 export class ScriptedPublicSocket implements PublicWebSocket {
   readonly url: string;
   readonly handlers: PublicWebSocketHandlers;

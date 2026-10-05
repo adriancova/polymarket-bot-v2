@@ -183,7 +183,6 @@ async function main(): Promise<void> {
             polymarketSocketFactory: globalWebSocketFactory(),
             polymarketHttpClient: globalHttpClient(),
           }),
-      rtdsSocketFactory: globalWebSocketFactory(),
       binanceSocketFactory: createWebSocketFactory(),
       coinbaseSocketFactory,
       // Round 6 (M-1), evidence retention: same line `main.ts` emits, so the

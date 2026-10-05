@@ -301,7 +301,9 @@ describe("the gateway config door reads only what the operator wrote", () => {
     }
 
     // Each of the other three feed blocks, on the same "at least one feed"
-    // check as `binance`.
+    // check as `binance`. `rtds` is no longer a feed block (`RTDS-RETIRE`,
+    // 2026-10-05): the door refuses an OWN `rtds` key with its dated reason,
+    // and an inherited one must satisfy nothing — this row keeps proving that.
     const inheritedFeeds: readonly (readonly [string, unknown])[] = [
       ["polymarket", { feedId: "polymarket-market" }],
       [
@@ -434,8 +436,9 @@ describe("the gateway config door reads only what the operator wrote", () => {
   });
 
   // D4: the configuration and every block inside it are emitted prototype-free,
-  // so a later `config.rtds?.updateStalenessMs ?? fallback` cannot be answered
-  // by `Object.prototype`.
+  // so a later `config.coinbase?.stalenessThresholdMs ?? fallback` cannot be
+  // answered by `Object.prototype`. (The example was the `rtds` block until
+  // `RTDS-RETIRE` retired it on 2026-10-05.)
   it("the emitted configuration has a null prototype at every level (D4)", () => {
     const config = parseGatewayConfig(BASE);
     expect(Object.getPrototypeOf(config)).toBeNull();
@@ -444,7 +447,24 @@ describe("the gateway config door reads only what the operator wrote", () => {
     expect(Object.getPrototypeOf(config.binance)).toBeNull();
     expect(Object.getPrototypeOf(config.markets[0])).toBeNull();
     // …so an absent optional block reads as absent whatever the prototype says.
-    expect(withInherited("rtds", { feedId: "invented" }, () => config.rtds)).toBeUndefined();
+    expect(withInherited("coinbase", { feedId: "invented" }, () => config.coinbase)).toBeUndefined();
+  });
+
+  // RTDS-RETIRE (2026-10-05, V3-C13): the retirement refusal reads the door's
+  // prototype-free OWN tree, so an inherited `rtds` — in either pollution
+  // variant — neither refuses an honest configuration nor reaches the output,
+  // and an own `rtds` is refused whatever the prototype says.
+  it("an inherited rtds is neither adopted nor refused; an own one is refused (RTDS-RETIRE)", () => {
+    const former = { feedId: "polymarket-rtds-twap", subscriptions: [{ windowSeconds: 60 }], plannedSymbols: ["btc/usd"] };
+    const clean = JSON.stringify(parseGatewayConfig(BASE));
+    for (const install of [withInherited, withInheritedEnumerable]) {
+      const config = install("rtds", former, () => parseGatewayConfig(BASE));
+      expect(Object.hasOwn(config, "rtds")).toBe(false);
+      expect(JSON.stringify(config)).toBe(clean);
+      expect(() => install("rtds", former, () => parseGatewayConfig({ ...BASE, rtds: former }))).toThrow(
+        /the rtds feed is retired \(RTDS-RETIRE, 2026-10-05; ruling V3-C13/u,
+      );
+    }
   });
 
   it("an honest configuration under the same pollution parses identically", () => {

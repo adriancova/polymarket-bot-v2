@@ -90,3 +90,4 @@ export {
 } from "./errors.js";
 export { isSensitiveKey, REDACTED, redactForLog } from "./redaction.js";
 export * from "./user-stream/index.js";
+export * from "./heartbeat/index.js";
