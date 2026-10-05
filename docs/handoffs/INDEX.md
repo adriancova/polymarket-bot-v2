@@ -136,3 +136,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-04 | [GOV-NOTES-1.md](GOV-NOTES-1.md) | `GOV-NOTES-1`: dated corrections to ADR-028 Amendment 1 rule 6 and wal-format §11.1 | Round | Complete (2026-10-04) | `1f99fcc` | 3 KB |
 | 2026-10-04 | [CONTROL-2.md](CONTROL-2.md) | `CONTROL-2`: open trader halts in the control API, fail closed; CONTROL-1b's LOWs | Round | Complete (2026-10-04) | `2f84ad7` | 5 KB |
 | 2026-10-04 | [FLAKES-1.md](FLAKES-1.md) | `FLAKES-1`: make the known load-sensitive tests deterministic | Round | Complete (2026-10-04) | `e476a49` | 3 KB |
+| 2026-10-04 | [VENUE-SETL-1.md](VENUE-SETL-1.md) | `VENUE-SETL-1`: series-admission venue facts and the btc-15m-updown settlement-spec prep | Round | Complete (2026-10-04) | `c373e25` | 4 KB |

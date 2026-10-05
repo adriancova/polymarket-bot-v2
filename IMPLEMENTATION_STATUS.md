@@ -70,14 +70,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
   - (C) accept CAP1-ASTRA-R2-01's half (ii) as residual `CAP1-TIER1-LIMIT-PRICE`: fail-closed, Tier-1 only.
   - Confirm the round-0 monotone guard (OBS-2) as an interim rule.
   - Record OBS-1 (an unbooked SELL fill) as a pre-live residual.
-- **`VENUE-SETL-1`**: Ready (authorized) 2026-10-04, commissioned by the user. A combined venue round and settlement-spec prep for `btc-15m-updown`:
-  - `ROLLOVER-1` Q3's four facts;
-  - the rules text pinned;
-  - the TWAP reading resolved from evidence;
-  - a corrected seed, still UNVERIFIED;
-  - the sign-off path, and a one-page checklist for the user.
-
-  Public unauthenticated reads only. Paths: `docs/venue/verified-2026-10-04.md`, `docs/settlement/**`, the two `btc-15m-updown` seed files (values only), and `test/fixtures/venue/gamma-series/**`. Verifiers: Opus and gpt-6-astra, reconciled.
+- `VENUE-SETL-1` is Complete (2026-10-04, `c373e25`); see [Work packages](#work-packages). It records `ROLLOVER-1` Q3's facts and the `btc-15m-updown` settlement prep. The user's sign-off checklist is `docs/settlement/btc-15m-updown-review-checklist.md`, with U-24 blocking review until Polymarket answers.
 - `CADENCE-1` is Complete (2026-10-03, `8d7086a`): ADR-026. On the H1 burst, catch-up throughput rose from 874 to 8,440 events/s, and paced max lag fell from 8.56 s to 0.07 s. See [Work packages](#work-packages); its grants are recorded in `docs/handoffs/CADENCE-1.md`.
 - `APPROX-REPLAY-1` is Complete (2026-10-03, `86830d9`); see [Work packages](#work-packages).
 - `WALCAP-1` is Complete (2026-10-03, `da559ca`); see [Work packages](#work-packages).
@@ -226,6 +219,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
 | `CONTROL-2` | Open trader halts in the control API, fail closed; `CONTROL-1b`'s LOWs | Complete (2026-10-04) | `2f84ad7` | [CONTROL-2](docs/handoffs/CONTROL-2.md) |
 | `FLAKES-1` | Make the known load-sensitive tests deterministic (tests only) | Complete (2026-10-04) | `e476a49` | [FLAKES-1](docs/handoffs/FLAKES-1.md) |
+| `VENUE-SETL-1` | Series-admission venue facts; `btc-15m-updown` settlement-spec prep (docs and seed values) | Complete (2026-10-04) | `c373e25` | [VENUE-SETL-1](docs/handoffs/VENUE-SETL-1.md) |
 | `CADENCE-1` | ADR-026: evaluation cadence, once per market per second of event time | Complete (2026-10-03) | `8d7086a` | [CADENCE-1](docs/handoffs/CADENCE-1.md) |
 | `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | Complete (2026-10-03) | `86830d9` | [APPROX-REPLAY-1](docs/handoffs/APPROX-REPLAY-1.md) |
 | `WALCAP-1` | the WAL cap after expiry, required on the laptop profile, visible; the stall-bound flake | Complete (2026-10-03) | `da559ca` | [WALCAP-1](docs/handoffs/WALCAP-1.md) |
@@ -430,7 +424,7 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` then `CLOSEOUT-2B` (2026-09-30). Wave 2 is CLOSED WITH QUALIFICATIONS.
-- **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): **the user commissioned the prep round on 2026-10-04.** It pins the market rules text, settles the comparison and window ambiguity, drafts a corrected (still unverified) spec, confirms the sign-off path, and produces a one-page checklist for the user to sign. It is combined with `ROLLOVER-1`'s Q3 venue round. V3-C13 (the reference price now needs credentials) still bears on observing settlement in PAPER.
+- **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): the prep is done (`VENUE-SETL-1`). The user owes the checklist (`docs/settlement/btc-15m-updown-review-checklist.md`, lines 1–9 and decisions D1–D2), and whether PAPER configs may set `settlementReadiness.modelDependentActivationAllowed` so paper entries can fill. U-24 (which stream report counts at each boundary) blocks a recorded review until Polymarket answers the drafted clarification question (review §3.5, Discord `#market-review`).
 
 ### Wave 3 authorization (conditional)
 
