@@ -32,6 +32,13 @@
  * declared defaults itself, and runs every startup check against its own
  * prototype-free record. See `./config-door.ts` for which of D1–D4 this door
  * performs and which it does not.
+ *
+ * ## The RTDS feed is retired (`RTDS-RETIRE`, 2026-10-05; V3-C13)
+ *
+ * There is no `rtds` block any more, and a configuration that carries one is
+ * refused at startup with a dated reason ({@link RTDS_RETIRED_REASON}). The
+ * gateway records and publishes no RTDS data; recorded RTDS data stays
+ * readable by its readers, none of which this retirement touches.
  */
 
 import { InternalMarketIdSchema, IsoTimestampSchema } from "@polymarket-bot/domain";
@@ -69,8 +76,6 @@ const CODE_STRING = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u;
  */
 const DEFAULT_TICK_INTERVAL_MS = 1_000;
 const DEFAULT_POLYMARKET_FEED_ID = "polymarket-market";
-const DEFAULT_RTDS_FEED_ID = "polymarket-rtds-twap";
-const DEFAULT_RTDS_MAX_OBSERVATION_AGE_MS = 300_000;
 const DEFAULT_BINANCE_FEED_ID = "binance-reference";
 const DEFAULT_BINANCE_STALENESS_CHECK_INTERVAL_MS = 5_000;
 const DEFAULT_BINANCE_UNAUTHORIZED_ESCALATION = 3;
@@ -85,6 +90,58 @@ const DEFAULT_SERIES_ADMISSION_POLL_INTERVAL_MS = 30_000;
 const DEFAULT_SERIES_ADMISSION_FAILURE_ESCALATION = 3;
 const DEFAULT_SERIES_ADMISSION_PAGE_LIMIT = 20;
 const DEFAULT_SERIES_ADMISSION_MAXIMUM_PAGES = 3;
+
+/**
+ * The day the gateway's RTDS reference-price producer was retired.
+ *
+ * `RTDS-RETIRE`, under the user's `V3-C13-REFERENCE-TWAP` ruling of 2026-10-04
+ * (`IMPLEMENTATION_STATUS.md`). The venue moved its reference/TWAP prices from
+ * the public RTDS service to the authenticated PolyBolt service, which needs
+ * CLOB API credentials; the 30-second window has no replacement; and the
+ * legacy RTDS price topics are planned for removal "one month after the
+ * `0.11.0` release" — about 2026-10-23 by the venue report's own arithmetic,
+ * not a date the venue states (`docs/venue/verified-2026-09-30.md` E-09 to
+ * E-12, conflict C-13, register U-20). The ruling is the free route only: no
+ * credential is used for prices and no paid feed is bought, so nothing remains
+ * for this gateway to subscribe to.
+ */
+export const RTDS_RETIRED_ON = "2026-10-05";
+
+/** The ruling the retirement executes. */
+export const RTDS_RETIRED_RULING = "V3-C13";
+
+/**
+ * The refusal an `rtds` key meets at startup: dated, with the ruling, the
+ * venue change and its sources, and what the operator should do.
+ */
+export const RTDS_RETIRED_REASON =
+  `the rtds feed is retired (RTDS-RETIRE, ${RTDS_RETIRED_ON}; ruling ${RTDS_RETIRED_RULING} of 2026-10-04): ` +
+  "Polymarket moved its reference/TWAP prices from public RTDS to the authenticated PolyBolt service " +
+  "(CLOB API credentials required; the 30-second window has no replacement) and plans to remove the legacy " +
+  "RTDS price topics one month after its 0.11.0 SDK release, about 2026-10-23 by the venue report's arithmetic " +
+  "(docs/venue/verified-2026-09-30.md E-09 to E-12, C-13, U-20). " +
+  "The ruling is the free route only: no credential is used for prices, so the gateway no longer records " +
+  "or publishes RTDS. Remove the rtds block; RTDS data recorded before the retirement stays readable.";
+
+/**
+ * Refuses an `rtds` key with {@link RTDS_RETIRED_REASON}.
+ *
+ * Runs on the door's prototype-free own tree (D1), BEFORE the schema: the
+ * schema no longer declares the key, so without this the operator would read
+ * a bare "unrecognized key" instead of why. ANY own `rtds` key is refused,
+ * whatever its value (`{}`, `null`, `false` included): a retired producer has
+ * no "disabled" spelling to get wrong. An inherited `rtds` is not on the tree,
+ * so it is neither adopted nor refused.
+ */
+function refuseRetiredRtds(tree: unknown): void {
+  if (isOwnRecord(tree) && Object.hasOwn(tree, "rtds")) {
+    throw new GatewayConfigurationError(RTDS_RETIRED_REASON, {
+      issues: [{ path: "rtds", message: RTDS_RETIRED_REASON }],
+      retiredOn: RTDS_RETIRED_ON,
+      ruling: RTDS_RETIRED_RULING,
+    });
+  }
+}
 
 /**
  * The market lifecycle feed's request budget (`UNIV-4`), as a configuration
@@ -239,39 +296,6 @@ export const PolymarketFeedConfigSchema = z.strictObject({
   pongTimeoutMs: z.number().int().positive().optional(),
   stalenessCheckIntervalMs: z.number().int().positive().optional(),
   snapshotBaseUrl: z.string().min(1).optional(),
-});
-
-export const RtdsFeedConfigSchema = z.strictObject({
-  feedId: FeedIdSchema.default(DEFAULT_RTDS_FEED_ID),
-  url: z.string().min(1).optional(),
-  subscriptions: z
-    .array(
-      z.strictObject({
-        windowSeconds: z.union([z.literal(30), z.literal(60)]),
-        symbols: z.array(z.string().min(1)).optional(),
-      }),
-    )
-    .min(1),
-  /**
-   * Symbols the gateway PUBLISHES, lowercase (`btc/usd`).
-   *
-   * A multi-symbol RTDS subscription receives every symbol (the venue's own
-   * rule); per WP-100's consumer obligations the gateway filters on
-   * `payload.symbol`. An update outside this set is counted, never silently
-   * dropped, and never published.
-   */
-  plannedSymbols: z.array(z.string().min(1)).min(1),
-  updateStalenessMs: z.number().int().positive().optional(),
-  stalenessCheckIntervalMs: z.number().int().positive().optional(),
-  /**
-   * Freshness bound on the Chainlink observation time, in milliseconds.
-   *
-   * An observation whose window end is older than this at receipt FAILS
-   * freshness and opens an incident. A seconds-spelled venue timestamp
-   * produces a visibly-wrong 1970 window (WP-100 round-1 known risk 1), which
-   * this bound is required to fail.
-   */
-  maxObservationAgeMs: z.number().int().positive().default(DEFAULT_RTDS_MAX_OBSERVATION_AGE_MS),
 });
 
 export const BinanceFeedConfigSchema = z.strictObject({
@@ -429,7 +453,6 @@ export const GatewayConfigSchema = z.strictObject({
   tickIntervalMs: z.number().int().positive().default(DEFAULT_TICK_INTERVAL_MS),
   markets: z.array(MarketConfigSchema),
   polymarket: PolymarketFeedConfigSchema.optional(),
-  rtds: RtdsFeedConfigSchema.optional(),
   binance: BinanceFeedConfigSchema.optional(),
   coinbase: CoinbaseFeedConfigSchema.optional(),
   lifecycle: LifecycleFeedConfigSchema.optional(),
@@ -457,13 +480,6 @@ export const DEFAULTED_KEYS: BlockDefaults = new Map<
     ],
   ],
   ["polymarket", [["feedId", DEFAULT_POLYMARKET_FEED_ID]]],
-  [
-    "rtds",
-    [
-      ["feedId", DEFAULT_RTDS_FEED_ID],
-      ["maxObservationAgeMs", DEFAULT_RTDS_MAX_OBSERVATION_AGE_MS],
-    ],
-  ],
   [
     "binance",
     [
@@ -525,6 +541,9 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
     });
   }
   const tree: unknown = read.value;
+  // RTDS-RETIRE: a retired producer is refused with its dated reason before
+  // the schema, which no longer declares the key, can call it merely unknown.
+  refuseRetiredRtds(tree);
 
   const parsed = containedConfigParse(GatewayConfigSchema, tree);
   if (!parsed.ok) {
@@ -550,7 +569,6 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
   ) as GatewayConfig;
   if (
     config.polymarket === undefined &&
-    config.rtds === undefined &&
     config.binance === undefined &&
     config.coinbase === undefined &&
     config.lifecycle === undefined &&
@@ -607,7 +625,6 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
   }
   const feedIds = [
     config.polymarket?.feedId,
-    config.rtds?.feedId,
     config.binance?.feedId,
     config.coinbase?.feedId,
     config.lifecycle?.feedId,

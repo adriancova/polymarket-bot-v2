@@ -33,6 +33,9 @@ export {
   lifecycleRequestsPer10s,
   MIN_LIFECYCLE_POLL_INTERVAL_MS,
   parseGatewayConfig,
+  RTDS_RETIRED_ON,
+  RTDS_RETIRED_REASON,
+  RTDS_RETIRED_RULING,
 } from "./config.js";
 export type { GatewayConfig, MarketConfig } from "./config.js";
 
@@ -66,8 +69,8 @@ export type { UniverseDirectoryMetrics } from "./directory.js";
 
 export { PolymarketFeedDriver } from "./feeds/polymarket.js";
 export type { PolymarketFeedDriverMetrics } from "./feeds/polymarket.js";
-export { RtdsFeedDriver } from "./feeds/rtds.js";
-export type { RtdsFeedDriverMetrics } from "./feeds/rtds.js";
+// `RtdsFeedDriver` was removed by `RTDS-RETIRE` (2026-10-05, ruling V3-C13):
+// the gateway no longer produces RTDS data (`./config.ts`, `RTDS_RETIRED_REASON`).
 export { BinanceFeedDriver } from "./feeds/binance.js";
 export type { BinanceFeedDriverMetrics } from "./feeds/binance.js";
 export { CoinbaseFeedDriver, RecordingCoinbaseSocketFactory } from "./feeds/coinbase.js";

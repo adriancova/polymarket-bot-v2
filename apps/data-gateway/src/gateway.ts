@@ -1,12 +1,19 @@
 /**
  * The Market Data Gateway and Recorder — the WP-120 composition root.
  *
- * Assembles, per handoff §9.1: the venue adapters (WP-070/WP-080/WP-090/
- * WP-100), envelope assignment (`gatewayEpoch`, `ingestSeq`, receipt stamps,
+ * Assembles, per handoff §9.1: the venue adapters (WP-070/WP-080/WP-090),
+ * envelope assignment (`gatewayEpoch`, `ingestSeq`, receipt stamps,
  * connection metadata — ADR-002), the WAL raw-frame recorder (WP-050), the
  * event-bus transport (WP-060), the universe-backed market directory
  * (WP-110), staleness surveillance, gap→snapshot→resync recovery, and
  * data-quality incident emission.
+ *
+ * The WP-100 RTDS Chainlink TWAP feed is no longer assembled: `RTDS-RETIRE`
+ * (2026-10-05, ruling V3-C13) retired the producer, and the configuration
+ * door refuses an `rtds` block with the dated reason (`./config.ts`,
+ * `RTDS_RETIRED_REASON`). The adapter itself stays in
+ * `@polymarket-bot/polymarket-public/rtds`, where it still reads recorded
+ * RTDS data.
  *
  * Failure boundaries (§4.2), as wired here:
  *
@@ -40,7 +47,6 @@ import {
   PublicBookSnapshotFetcher,
   PublicMarketFeed,
 } from "@polymarket-bot/polymarket-public";
-import { RtdsTwapFeed, RTDS_WEBSOCKET_URL } from "@polymarket-bot/polymarket-public/rtds";
 import type { WalFileSystem, WalWriterMetrics } from "@polymarket-bot/storage-wal";
 
 import { AdmissionLedger, type AdmissionLedgerRecord } from "./admission-ledger.js";
@@ -60,8 +66,6 @@ import type { MarketLifecycleDriverMetrics } from "./feeds/market-lifecycle.js";
 import { MarketLifecycleFeedDriver } from "./feeds/market-lifecycle.js";
 import type { PolymarketFeedDriverMetrics } from "./feeds/polymarket.js";
 import { PolymarketFeedDriver } from "./feeds/polymarket.js";
-import type { RtdsFeedDriverMetrics } from "./feeds/rtds.js";
-import { RtdsFeedDriver } from "./feeds/rtds.js";
 import type { SeriesAdmissionDriverMetrics } from "./feeds/series-admission.js";
 import { SeriesAdmissionFeedDriver } from "./feeds/series-admission.js";
 import type { IncidentRegistryMetrics } from "./incidents.js";
@@ -151,7 +155,6 @@ export interface GatewayPorts {
   readonly transport: MarketEventTransport;
   readonly polymarketSocketFactory?: PublicWebSocketFactory;
   readonly polymarketHttpClient?: PublicHttpClient;
-  readonly rtdsSocketFactory?: PublicWebSocketFactory;
   readonly binanceSocketFactory?: BinanceSocketFactory;
   readonly coinbaseSocketFactory?: CoinbaseSocketFactory;
   readonly observer?: GatewayObserver;
@@ -188,7 +191,6 @@ export interface GatewayMetrics {
   readonly incidents: IncidentRegistryMetrics;
   readonly directory: UniverseDirectoryMetrics | undefined;
   readonly polymarket: PolymarketFeedDriverMetrics | undefined;
-  readonly rtds: RtdsFeedDriverMetrics | undefined;
   readonly binance: BinanceFeedDriverMetrics | undefined;
   readonly coinbase: CoinbaseFeedDriverMetrics | undefined;
   /** The market lifecycle feed (`UNIV-4`), when configured. */
@@ -215,8 +217,6 @@ export class DataGateway {
   #admissionDriver: SeriesAdmissionFeedDriver | undefined;
   #polymarketFeed: PublicMarketFeed | undefined;
   #polymarketDriver: PolymarketFeedDriver | undefined;
-  #rtdsFeed: RtdsTwapFeed | undefined;
-  #rtdsDriver: RtdsFeedDriver | undefined;
   #binanceDriver: BinanceFeedDriver | undefined;
   #coinbaseManager: CoinbaseConnectionManager | undefined;
   #coinbaseDriver: CoinbaseFeedDriver | undefined;
@@ -587,62 +587,6 @@ export class DataGateway {
       this.#buildSeriesAdmission(config.seriesAdmission);
     }
 
-    if (config.rtds !== undefined) {
-      if (ports.rtdsSocketFactory === undefined) {
-        throw new GatewayStateError(
-          "the RTDS feed is configured but its socket factory port is missing",
-        );
-      }
-      const feedConfig = config.rtds;
-      const url = feedConfig.url ?? RTDS_WEBSOCKET_URL;
-      const driver = new RtdsFeedDriver({
-        feedId: feedConfig.feedId,
-        endpoint: url,
-        journal: this.#journal,
-        dispatcher: this.#dispatcher,
-        clock: ports.clock,
-        plannedSymbols: this.#plan.rtdsPlannedSymbols,
-        maxObservationAgeMs: feedConfig.maxObservationAgeMs,
-      });
-      const connectionIds = new ConnectionIdFactory(feedConfig.feedId);
-      const feed = new RtdsTwapFeed(
-        {
-          clock: {
-            nowMs: () => ports.clock.nowMs(),
-            monotonicMs: () => Number(ports.clock.monotonicNs() / 1_000_000n),
-          },
-          timers: ports.timers,
-          webSocketFactory: ports.rtdsSocketFactory,
-          connectionId: () => connectionIds.next(),
-        },
-        {
-          onEvent: (event) => {
-            driver.onEvent(event);
-          },
-          onProblem: (problem) => {
-            driver.onProblem(problem);
-          },
-          onRawFrame: (frame) => {
-            driver.onRawFrame(frame);
-          },
-        },
-        {
-          feedId: feedConfig.feedId,
-          url,
-          subscriptions: this.#plan.rtdsSubscriptions,
-          ...(feedConfig.updateStalenessMs === undefined
-            ? {}
-            : { updateStalenessMs: feedConfig.updateStalenessMs }),
-          ...(feedConfig.stalenessCheckIntervalMs === undefined
-            ? {}
-            : { stalenessCheckIntervalMs: feedConfig.stalenessCheckIntervalMs }),
-        },
-      );
-      driver.bind(feed);
-      this.#rtdsFeed = feed;
-      this.#rtdsDriver = driver;
-    }
-
     if (config.binance !== undefined) {
       if (ports.binanceSocketFactory === undefined) {
         throw new GatewayStateError(
@@ -904,7 +848,6 @@ export class DataGateway {
         this.#pendingWindowTokens.length = 0;
         this.#polymarketFeed.start();
       }
-      this.#rtdsFeed?.start();
       this.#binanceDriver?.start();
       this.#coinbaseManager?.start();
       this.#lifecycleDriver?.start();
@@ -1014,7 +957,6 @@ export class DataGateway {
       });
       attempt("polymarket-driver", () => this.#polymarketDriver?.stop());
       attempt("polymarket-feed", () => this.#polymarketFeed?.stop());
-      attempt("rtds-feed", () => this.#rtdsFeed?.stop());
       attempt("binance-driver", () => this.#binanceDriver?.stop());
       attempt("coinbase-manager", () => this.#coinbaseManager?.stop());
       attempt("lifecycle-driver", () => this.#lifecycleDriver?.stop());
@@ -1082,7 +1024,6 @@ export class DataGateway {
       incidents: this.#dispatcher.incidents.metrics(),
       directory: this.#directory?.metrics(),
       polymarket: this.#polymarketDriver?.metrics(),
-      rtds: this.#rtdsDriver?.metrics(),
       binance: this.#binanceDriver?.metrics(),
       coinbase: this.#coinbaseDriver?.metrics(),
       lifecycle: this.#lifecycleDriver?.metrics(),

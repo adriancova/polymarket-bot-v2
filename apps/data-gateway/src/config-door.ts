@@ -55,8 +55,10 @@
  *   truth per default and `./config.test.ts` pins that the door's table covers
  *   every `.default()` the schema declares.
  * - **D4 — emit prototype-free.** The returned configuration and every block
- *   inside it have a null prototype, so a later `config.rtds?.updateStalenessMs
- *   ?? fallback` cannot be answered by `Object.prototype`.
+ *   inside it have a null prototype, so a later
+ *   `config.coinbase?.stalenessThresholdMs ?? fallback` cannot be answered by
+ *   `Object.prototype`. *(The example used to be the `rtds` block, retired by
+ *   `RTDS-RETIRE` on 2026-10-05; see `./config.ts`.)*
  * - **Refusal construction is contained** (ADR-020 amendment 2026-09-06):
  *   `zod` builds a refusal's issues lazily per call even on a warm schema, and
  *   that path reads through the prototype chain, so `safeParse(INVALID)` can

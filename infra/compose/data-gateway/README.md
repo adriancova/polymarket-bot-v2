@@ -95,6 +95,15 @@ such values are refused before any resource is acquired.
 - The gateway consumes **public, unauthenticated market data only**. There is
   no credential field anywhere in the schema, and the schema is strict, so one
   cannot be added by configuration.
+- **There is no `rtds` block any more** (`RTDS-RETIRE`, 2026-10-05, ruling
+  V3-C13). The venue moved its reference/TWAP prices from public RTDS to the
+  authenticated PolyBolt service and plans to remove the legacy RTDS price
+  topics one month after its `0.11.0` SDK release, about 2026-10-23 by the
+  venue report's arithmetic (`docs/venue/verified-2026-09-30.md` E-09 to E-12,
+  U-20).
+  The ruling is the free route only, so a configuration that carries an
+  `rtds` key, whatever its value, is refused at startup with that dated
+  reason. RTDS data recorded before then stays readable by its readers.
 - `tickIntervalMs` **must be at or below** `wal.fsyncIntervalMs` (default
   `1000`), and the schema now refuses a configuration where it is not. The WAL
   writer schedules nothing: an idle recorder is fsynced only by this tick, so a
@@ -187,7 +196,7 @@ stream:
 | `GATEWAY_PUBLISH_QUEUE_FULL` | WP-060's producer queue saturated (`EVENT_BUS_PUBLISH_QUEUE_FULL`) | find why the bus stopped draining; restart the gateway after |
 | `GATEWAY_PUBLISH_ADMISSION_OVERFLOW` | THIS gateway's admission queue filled: the transport was accepting nothing for long enough to reach `publisher.maxQueueDepth`/`maxQueueBytes` | same as above; raise the bounds only with a reason, and know it costs memory |
 | `GATEWAY_PUBLISH_REJECTED` | the transport refused an envelope for a non-outage reason (schema, ordering) | this is a **gateway-side defect** — capture the detail and the WAL segment, then restart; the frames are all on disk |
-| `RTDS_UNRECOVERABLE_GAP` | the RTDS TWAP stream broke; the venue offers no replay, so normalized RTDS publication halted for the epoch | restart to begin a new observation window; the unobserved interval is permanently unobserved and TWAP-dependent consumers must halt (ADR-009 §6) |
+| `RTDS_UNRECOVERABLE_GAP` | **retired** (`RTDS-RETIRE`, 2026-10-05): a current gateway cannot raise it, because it refuses an `rtds` block. Kept for epochs recorded before then: the RTDS TWAP stream broke; the venue offers no replay, so normalized RTDS publication halted for the epoch | for such an old epoch: the unobserved interval is permanently unobserved and TWAP-dependent consumers must halt (ADR-009 §6); a restart now starts a gateway without RTDS |
 
 The procedure, in order:
 

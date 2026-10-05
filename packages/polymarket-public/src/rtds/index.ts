@@ -6,6 +6,27 @@
  * service, normalizing the 30-second and 60-second Chainlink TWAP streams into
  * the frozen `ReferenceTwapObserved` contract.
  *
+ * ## RETIRED as a live producer (2026-10-05, `RTDS-RETIRE`; ruling V3-C13)
+ *
+ * The venue moved its reference/TWAP prices from this public service to the
+ * authenticated PolyBolt service, which needs CLOB API credentials. The
+ * 30-second window has no replacement, and the legacy RTDS price topics are
+ * planned for removal one month after the SDK's `0.11.0` release, about
+ * 2026-10-23 by the venue report's arithmetic
+ * (`docs/venue/verified-2026-09-30.md` E-09 to E-12, C-13, U-20). Under the
+ * user's ruling of 2026-10-04 (free route only, no credential for prices), the
+ * data gateway no longer runs this adapter's live feed and refuses an `rtds`
+ * block at startup.
+ *
+ * What remains is a true record of the venue as verified on 2026-08-24: its
+ * wire, topics, E18 scale and URL are that verification's, not today's venue.
+ * It stays because its READ doors (`decodeInboundRtdsFrame`,
+ * `normalizeRtdsFrame`, `TwapObservationTracker`, `isTwapTopic`) still read
+ * RTDS frames recorded before the retirement, for the research worker's
+ * interpreter and identity reader, and for the contract suite under
+ * `test/contract/rtds/`. Do not point a live configuration at it again
+ * without a new ruling.
+ *
  * ## Why a subpath rather than the package's main entry
  *
  * `../index.ts` is the CLOB market-data adapter's surface and belongs to
