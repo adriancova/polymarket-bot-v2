@@ -1912,8 +1912,12 @@ export class CoreLoop {
    * owner, so a `MarketResolved` that arrives later still reaches the
    * strategy and the window is then torn down RESOLVED; it is reported once
    * (`HELD_UNRESOLVED`) and counted (`heldUnresolved`). The gateway keeps the
-   * window subscribed for that resolution (`apps/data-gateway`
-   * `feeds/series-admission.ts`). Teardown releases the window's books,
+   * window subscribed for that resolution, and never abandons it
+   * (`apps/data-gateway` `feeds/series-admission.ts`). `ROLLOVER-1` r2
+   * (R2-ASTRA-01): a HELD window is still a live window, evaluated at the
+   * run's cadence like any other, so it keeps its cap slot on both sides
+   * (`series-admission.ts`, check 8): the run's windows, HELD or not, never
+   * outnumber the reviewed cap. Teardown releases the window's books,
    * features, strategy state and cadence entry; its ledger rows stay.
    */
   #tearDownWindows(): void {

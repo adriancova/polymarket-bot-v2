@@ -30,9 +30,10 @@
  * 7. it shadows no market this trader already runs (`SHADOWS_KNOWN_MARKET`);
  * 8. the series has fewer live windows than its reviewed cap
  *    (`CAP_REACHED`; ADR-030 Decision 1.8 — the trader enforces the cap
- *    itself, whatever the gateway admitted). A window past its unresolved
- *    bound, kept because it holds inventory, holds no cap slot (`ROLLOVER-1`
- *    r1): it awaits its resolution and trades nothing — the gateway's rule.
+ *    itself, whatever the gateway admitted). EVERY live window counts: a
+ *    window past its unresolved bound, kept because it holds inventory
+ *    (`HELD_UNRESOLVED`), keeps its cap slot until its resolution is handled
+ *    (`ROLLOVER-1` r2, R2-ASTRA-01) — the gateway's rule too.
  *
  * An identical admission seen again (a replayed stream, a gateway re-emission)
  * is a `DUPLICATE` and changes nothing; a different one under the same id is
@@ -59,7 +60,10 @@
  * down (`ROLLOVER-1` r1, R1-04; ADR-030 Decision 4.4, "after its resolution is
  * handled"): its runtime stays the position's owner, so a later
  * `MarketResolved` still reaches the strategy, and it is reported once
- * (`HELD_UNRESOLVED`) and counted (`heldUnresolved`). Teardown releases its
+ * (`HELD_UNRESOLVED`) and counted (`heldUnresolved`). It keeps its cap slot
+ * (`ROLLOVER-1` r2), so the number of windows a run holds — HELD or not, each
+ * a runtime evaluated at the run's cadence — never exceeds the reviewed
+ * `maximumConcurrentWindows`. Teardown releases its
  * books, features, strategy state and cadence entry; its ledger rows, token
  * assets (the loop's and the allocator's) and allocation scope stay (ADR-030
  * Decision 4.4: "Its ledger rows stay").
@@ -142,7 +146,8 @@ export type AdmissionNotice =
   /**
    * `ROLLOVER-1` r1 (R1-04): the window is unresolved past its reviewed bound
    * and still HOLDS inventory, so it is kept — its runtime owns the position
-   * until the resolution is handled. Reported once per window.
+   * until the resolution is handled, and it keeps its cap slot (r2).
+   * Reported once per window.
    */
   | { readonly kind: "HELD_UNRESOLVED"; readonly window: AdmittedWindow };
 
@@ -153,7 +158,11 @@ export interface AdmissionMetrics {
   readonly tornDownResolved: number;
   readonly tornDownUnresolved: number;
   readonly teardownsBlocked: number;
-  /** `ROLLOVER-1` r1 (R1-04): live windows kept past the unresolved bound because they hold inventory. */
+  /**
+   * `ROLLOVER-1` r1 (R1-04): live windows kept past the unresolved bound
+   * because they hold inventory. Each is also counted in `live`, and holds a
+   * cap slot (r2).
+   */
   readonly heldUnresolved: number;
   readonly live: number;
   /** The most recent refusals, newest last (bounded). */
@@ -317,17 +326,18 @@ export class SeriesWindowAdmissions {
     if (this.#isKnownMarket(marketId, conditionId, [yesTokenId, noTokenId])) {
       return refuse("SHADOWS_KNOWN_MARKET", `window ${marketId} (condition ${conditionId}) shadows a market this trader already runs`);
     }
-    // `ROLLOVER-1` r1 (R1-04): a live window past its unresolved bound — kept
-    // only because it holds inventory — awaits its resolution and trades
-    // nothing: it holds no cap slot, exactly as at the gateway, at this
-    // admission's own instant.
-    const live = [...this.#live.values()].filter(
-      (window) => window.seriesId === seriesId && eventEpochMs < window.closeEpochMs + window.unresolvedTeardownSeconds * 1000,
-    ).length;
+    // ADR-030 Decision 1.8: EVERY live window of the series counts — one kept
+    // past its unresolved bound because it holds inventory (HELD) included.
+    // `ROLLOVER-1` r2 (R2-ASTRA-01): r1 excluded those, so at a cap of 1 a run
+    // could hold any number of HELD windows, each a full runtime evaluated at
+    // the run's cadence; counting them bounds the run's windows, whatever
+    // their state, by the reviewed cap — exactly as at the gateway.
+    const live = [...this.#live.values()].filter((window) => window.seriesId === seriesId).length;
     if (live >= review.maximumConcurrentWindows) {
+      const held = [...this.#live.values()].filter((window) => window.seriesId === seriesId && this.#heldUnresolved.has(window.marketId)).length;
       return refuse(
         "CAP_REACHED",
-        `series ${seriesId} has ${String(live)} live windows, its reviewed cap (maximumConcurrentWindows ${String(review.maximumConcurrentWindows)}, ADR-030 Decision 1.8)`,
+        `series ${seriesId} has ${String(live)} live windows, its reviewed cap (maximumConcurrentWindows ${String(review.maximumConcurrentWindows)}, ADR-030 Decision 1.8), ${String(held)} of them HELD awaiting their resolution`,
       );
     }
     const closeEpochMs = epochMsOfInstant(schedule.closeAt);

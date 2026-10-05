@@ -43,8 +43,8 @@ const [KEYSET_PAGE, CLOB_2215, CLOB_2230] = fixture.examples.map((example) => ex
 ];
 
 export const [W1, W2, W3] = RECORDED_SERIES_WINDOWS;
-const GAMMA_BASE = "http://gamma.stub";
-const CLOB_BASE = "http://clob.stub";
+export const GAMMA_BASE = "http://gamma.stub";
+export const CLOB_BASE = "http://clob.stub";
 /** 22:29:00Z: the 22:15 window is about to close; the 22:30 window opens in a minute. */
 export const START_MS = Date.UTC(2026, 9, 4, 22, 29, 0);
 export const SERIES_INSTANCE_ID = "c18f4a7e-1111-7abc-8def-0123456789ab";
@@ -79,7 +79,8 @@ const CONDITION_OF_TOKEN = new Map<string, string>(
   ]),
 );
 
-function venue() {
+/** The stub venue of the series runs: the recorded keyset page, CLOB info for W1-W3, a ready Gamma market, books for any token. */
+export function seriesVenue() {
   const requests: string[] = [];
   const clob: Readonly<Record<string, unknown>> = {
     [W1.conditionId]: CLOB_2215,
@@ -108,7 +109,8 @@ function venue() {
   return { route, requests };
 }
 
-function bookFrame(
+/** A market-channel `book` frame for one token (the documented shape). */
+export function bookFrame(
   conditionId: string,
   tokenId: string,
   bids: readonly (readonly [string, string])[],
@@ -128,27 +130,28 @@ function bookFrame(
   ]);
 }
 
+/** The gateway configuration of the series runs: the market, reference, lifecycle and admission feeds over `series`. */
+export function seriesGatewayConfig(series: Record<string, unknown> = review()): Record<string, unknown> {
+  return {
+    markets: [],
+    polymarket: { feedId: "polymarket-market", customFeatureEnabled: true, snapshotBaseUrl: CLOB_BASE },
+    binance: { feedId: "binance-reference", symbols: ["BTCUSDT"], stalenessThresholdMs: 3_600_000 },
+    lifecycle: { feedId: "polymarket-lifecycle", baseUrl: GAMMA_BASE, pollIntervalMs: 10_000 },
+    seriesAdmission: {
+      gammaBaseUrl: GAMMA_BASE,
+      clobBaseUrl: CLOB_BASE,
+      pollIntervalMs: 30_000,
+      maximumPages: 1,
+      admissionLeadSeconds: 900,
+      series: [series],
+    },
+  };
+}
+
 /** Runs the gateway over the run's timeline and returns everything it published. */
 async function gatewayStream(): Promise<readonly EventEnvelope<unknown>[]> {
-  const stub = venue();
-  const gateway = await buildHarness({
-    config: {
-      markets: [],
-      polymarket: { feedId: "polymarket-market", customFeatureEnabled: true, snapshotBaseUrl: CLOB_BASE },
-      binance: { feedId: "binance-reference", symbols: ["BTCUSDT"], stalenessThresholdMs: 3_600_000 },
-      lifecycle: { feedId: "polymarket-lifecycle", baseUrl: GAMMA_BASE, pollIntervalMs: 10_000 },
-      seriesAdmission: {
-        gammaBaseUrl: GAMMA_BASE,
-        clobBaseUrl: CLOB_BASE,
-        pollIntervalMs: 30_000,
-        maximumPages: 1,
-        admissionLeadSeconds: 900,
-        series: [review()],
-      },
-    },
-    http: stub.route,
-    clockStartMs: START_MS,
-  });
+  const stub = seriesVenue();
+  const gateway = await buildHarness({ config: seriesGatewayConfig(), http: stub.route, clockStartMs: START_MS });
   let tradeId = 0;
   const trade = (): void => {
     tradeId += 1;
@@ -238,4 +241,3 @@ export function ingestedOf(envelopes: readonly EventEnvelope<unknown>[]): readon
     },
   }));
 }
-

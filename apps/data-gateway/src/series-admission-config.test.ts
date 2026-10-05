@@ -154,6 +154,16 @@ describe("AdmissionLedger — durable, strict, bounded", () => {
     expect(ledger.metrics().pruned).toBe(2);
   });
 
+  it("R2-ASTRA-02: only a handled resolution retires a window — a record retired UNRESOLVED_AFTER_CLOSE is refused, on write and at open", async () => {
+    const fileSystem = createMemoryFileSystem();
+    const ledger = await AdmissionLedger.open({ fileSystem, walRootPath: "/wal" });
+    const abandoned = { ...admitted("0xaa"), status: "RETIRED", retiredAt: "2026-10-04T22:50:00.000Z", retiredReason: "UNRESOLVED_AFTER_CLOSE" } as unknown as AdmissionLedgerRecord;
+    await expect(ledger.put(abandoned)).rejects.toBeInstanceOf(GatewayStateError);
+    expect(ledger.records()).toEqual([]);
+    await fileSystem.writeWholeFile(`/wal/${ADMISSION_LEDGER_FILE_NAME}`, Buffer.from(JSON.stringify({ schemaVersion: 1, windows: { "0xaa": abandoned } }), "utf8"));
+    await expect(AdmissionLedger.open({ fileSystem, walRootPath: "/wal" })).rejects.toBeInstanceOf(GatewayStateError);
+  });
+
   it("bounds a refusal's mismatch list", () => {
     expect(boundedMismatches([])).toEqual(["(no mismatch recorded)"]);
     expect(boundedMismatches(Array.from({ length: 30 }, (_, index) => String(index)))).toHaveLength(12);

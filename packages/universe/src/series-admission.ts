@@ -192,19 +192,24 @@ export const ReviewedSeriesSchema = z.strictObject({
     underlyingKey: CodeStringSchema,
     resolutionWindowKey: CodeStringSchema,
   }),
-  /** The cap on concurrently admitted windows (ADR-030 Decision 1.8). */
+  /**
+   * The cap on concurrently admitted windows (ADR-030 Decision 1.8). Every
+   * live window counts, one awaiting its resolution past
+   * `unresolvedTeardownSeconds` included (`ROLLOVER-1` r2, R2-ASTRA-01): at
+   * the cap, admissions are deferred; no live window is evicted for room.
+   */
   maximumConcurrentWindows: z.number().int().min(1).max(64),
   /**
-   * How long after its scheduled close a window still unresolved stops
-   * counting as a LIVE window of the series (resolution is observed 53 to
-   * 152 s after the close, F-17, so this bound only marks a resolution missed
-   * or never made). One reviewed value, so the gateway and every trader agree
-   * on it. `ROLLOVER-1` r1 (R1-04; ADR-030 Decision 4.4, a window is torn down
-   * "after its resolution is handled"): past it, a window holds no cap slot —
-   * the gateway keeps it subscribed, AWAITING its resolution (at most
-   * `maximumConcurrentWindows` per series), and a trader tears it down only
-   * if it holds no inventory; one that holds inventory stays until its
-   * resolution is handled.
+   * How long after its scheduled close a window may stay unresolved before it
+   * is reported (resolution is observed 53 to 152 s after the close, F-17, so
+   * this bound only marks a resolution missed or never made). One reviewed
+   * value, so the gateway and every trader agree on it. ADR-030 Decision 4.4
+   * (a window is torn down "after its resolution is handled"): past it, the
+   * gateway keeps the window ADMITTED and subscribed, AWAITING its
+   * resolution, in its cap slot, and names it in a NOTIFY incident; a trader
+   * tears it down only if it holds no inventory and no work (`ROLLOVER-1` r1
+   * deviation 2, for ratification); one that holds inventory stays, in its
+   * cap slot, until its resolution is handled (`ROLLOVER-1` r2).
    */
   unresolvedTeardownSeconds: z.number().int().min(300).max(7 * 86_400),
 });

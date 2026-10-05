@@ -100,7 +100,14 @@ const RecordSchema = z.strictObject({
   /** When the publisher confirmed the admission's events (absent: an unconfirmed intent). */
   admissionConfirmedAt: Instant.optional(),
   retiredAt: Instant.optional(),
-  retiredReason: z.enum(["RESOLVED", "UNRESOLVED_AFTER_CLOSE"]).optional(),
+  /**
+   * Why the window was retired. `ROLLOVER-1` r2 (R2-ASTRA-02): only its
+   * handled resolution retires a window (ADR-030 Decision 4.4); r0 and r1
+   * also retired an unresolved one (`UNRESOLVED_AFTER_CLOSE`), which cut off
+   * the delivery of its late resolution. That value is no longer written or
+   * read: a ledger carrying it is refused at open (fail closed).
+   */
+  retiredReason: z.enum(["RESOLVED"]).optional(),
   mismatches: z.array(z.string().min(1).max(MAX_MISMATCH_LENGTH)).min(1).max(MAX_RECORDED_MISMATCHES).optional(),
 });
 export type AdmissionLedgerRecord = z.infer<typeof RecordSchema>;

@@ -312,3 +312,21 @@ describe("ROLLOVER-1 r1: the re-judge refuses a malformed calendar date and a cl
     expect(subject.metrics()).toMatchObject({ heldUnresolved: 0, live: 0, tornDownResolved: 1 });
   });
 });
+
+describe("ROLLOVER-1 r2 (R2-ASTRA-01): every live window counts toward the cap", () => {
+  it("R2-ASTRA-01: a window long past its close and its unresolved bound, HELD, still holds its slot — at any later instant", () => {
+    const capOne = configured({ ...reviewedSeriesDocument(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 });
+    const { subject } = admissions({ series: [capOne] });
+    const first = judged(subject, W1, undefined, capOne.configHash);
+    if (first.kind !== "ADMIT") throw new Error(codeOf(first));
+    subject.attach(first.window);
+    expect(subject.noteHeldUnresolved(W1.marketId)).toBe(true);
+    // W1 closed 22:30; its bound passed 22:35. At 22:40 and at 22:59 W2 and W3 are still refused.
+    expect(codeOf(judged(subject, W2, undefined, capOne.configHash, Date.parse("2026-10-04T22:40:00.000Z")))).toBe("CAP_REACHED");
+    expect(codeOf(judged(subject, W3, undefined, capOne.configHash, Date.parse("2026-10-04T22:59:00.000Z")))).toBe("CAP_REACHED");
+    expect(subject.metrics().lastRefusals.at(-1)).toMatch(/has 1 live windows, .*1 of them HELD awaiting their resolution$/u);
+    // Its resolution handled, the slot frees.
+    subject.detach(W1.marketId, "RESOLVED");
+    expect(codeOf(judged(subject, W3, undefined, capOne.configHash, Date.parse("2026-10-04T22:59:00.000Z")))).toBe("ADMIT");
+  });
+});

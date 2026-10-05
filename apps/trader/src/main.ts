@@ -926,7 +926,8 @@ export function admissionLine(notice: AdmissionNotice): string {
     case "HELD_UNRESOLVED":
       return (
         `[admission] HELD window ${notice.window.marketId}: unresolved ${String(notice.window.unresolvedTeardownSeconds)} s ` +
-        `after its close ${notice.window.closeAt} and it still holds inventory, so it is kept until its resolution is handled (ADR-030 Decision 4.4)`
+        `after its close ${notice.window.closeAt} and it still holds inventory, so it is kept until its resolution is handled (ADR-030 Decision 4.4); ` +
+        `it keeps its cap slot meanwhile (Decision 1.8), so its series admits no window in its place`
       );
   }
 }

@@ -11,19 +11,22 @@
  *    after its resolution is handled"). A live window whose `MarketResolved`
  *    this gateway dispatched is RETIRED: its tokens are unsubscribed, the
  *    lifecycle feed stops polling it, the directory releases it, and its
- *    ledger record becomes `RETIRED`. A window still unresolved
- *    `unresolvedTeardownSeconds` (reviewed) after its scheduled close is NOT
- *    retired (`ROLLOVER-1` r1, R1-04): a trader may hold a position in it, and
- *    only this gateway can still deliver its resolution. It stays subscribed,
- *    AWAITING its resolution, with a NOTIFY incident naming it
- *    (`GATEWAY_SERIES_WINDOW_UNRESOLVED`), and it no longer holds a cap slot
- *    (step 4): a closed window past its bound trades nothing, and a
- *    resolution missed while the gateway was down (a restart, a laptop
- *    asleep) must not stop the series for good. Bounded: at most
- *    `maximumConcurrentWindows` windows of a series await their resolution;
- *    past that the OLDEST is retired `UNRESOLVED_AFTER_CLOSE` — its
- *    resolution is no longer tracked, which a NOTIFY incident says by name
- *    (`GATEWAY_SERIES_WINDOW_RESOLUTION_ABANDONED`) for a human to reconcile.
+ *    ledger record becomes `RETIRED`. That is the ONLY way a window is
+ *    retired. A window still unresolved `unresolvedTeardownSeconds` (reviewed)
+ *    after its scheduled close is NOT retired (`ROLLOVER-1` r1, R1-04): a
+ *    trader may hold a position in it, and only this gateway can still
+ *    deliver its resolution. It stays ADMITTED, subscribed and registered in
+ *    the directory, AWAITING its resolution, with a NOTIFY incident naming it
+ *    (`GATEWAY_SERIES_WINDOW_UNRESOLVED`), and it KEEPS its cap slot (step 4;
+ *    `ROLLOVER-1` r2, R2-ASTRA-01 and R2-ASTRA-02): it is still an admitted
+ *    market (ADR-030 Decision 1.8), and it is never abandoned to make room —
+ *    an abandoned window's late resolution would never be delivered, so a
+ *    trader holding a position in it could never handle it (Decision 4.4).
+ *    So at the cap the series DEFERS further admissions until a resolution
+ *    is handled; the cap incident says how many live windows await theirs.
+ *    A resolution missed while the gateway was down (a restart, a laptop
+ *    asleep at the resolution instant) therefore holds its window's slot
+ *    until a human reconciles it: fail closed, named by both incidents.
  * 2. **Discovery** — `GET /events/keyset?series_id=…&closed=false&order=endDate&ascending=true&limit=…&end_date_min=<now>`
  *    and its `after_cursor` pages, up to `maximumPages`
  *    (`docs/venue/verified-2026-10-04.md` F-07, §A2; never `series_slug`,
@@ -36,10 +39,12 @@
  *    receipt — is late and skipped; one whose `eventStartTime` is more than
  *    `admissionLeadSeconds` ahead is not yet due. A window whose condition id
  *    or token a configured market already holds is skipped (never shadowed).
- * 4. **The cap** (Decision 1.8): with `maximumConcurrentWindows` live windows of
- *    the series that are not yet past their unresolved bound (step 1), nothing
- *    more is admitted; a NOTIFY incident naming the held window stands until
- *    room frees, and the window is reconsidered next cycle.
+ * 4. **The cap** (Decision 1.8): with `maximumConcurrentWindows` live
+ *    (ADMITTED, not retired) windows of the series — every one, including a
+ *    window awaiting its resolution past its bound (step 1; `ROLLOVER-1` r2,
+ *    R2-ASTRA-01) — nothing more is admitted; a NOTIFY incident naming the
+ *    held window stands until room frees, and the window is reconsidered
+ *    next cycle (or skipped as late once it has closed).
  * 5. **The CLOB read** — `GET /clob-markets/{condition_id}` (S-D65), journaled
  *    first like every response — for the explicit pairing and `itode`. At
  *    most `maximumConcurrentWindows` are ATTEMPTED per series per cycle,
@@ -213,9 +218,10 @@ export interface SeriesAdmissionDriverMetrics {
   readonly windowsAdmitted: number;
   readonly windowsRefused: number;
   readonly windowsRetiredResolved: number;
-  /** Windows whose resolution was no longer awaited: retired past the bound on awaiting windows (R1-04). */
-  readonly windowsRetiredUnresolved: number;
-  /** Live windows past their unresolved bound, subscribed and awaiting their resolution (R1-04). */
+  /**
+   * Live windows past their unresolved bound, subscribed and awaiting their
+   * resolution (R1-04). Each still holds its cap slot (`ROLLOVER-1` r2).
+   */
   readonly windowsAwaitingResolution: number;
   readonly windowsSkippedLate: number;
   /** Matching windows that closed during discovery, so were not admitted (R1-03). */
@@ -341,7 +347,6 @@ export class SeriesAdmissionFeedDriver {
   #admitted = 0;
   #refused = 0;
   #retiredResolved = 0;
-  #retiredUnresolved = 0;
   #awaitingResolution = 0;
   #skippedLate = 0;
   #closedBeforeAdmission = 0;
@@ -464,8 +469,8 @@ export class SeriesAdmissionFeedDriver {
 
   /**
    * Is a live window past its reviewed unresolved bound at `nowMs`? Such a
-   * window awaits its resolution and holds no cap slot (module header, steps 1
-   * and 4).
+   * window awaits its resolution, named by an incident, and keeps its cap slot
+   * (module header, steps 1 and 4).
    */
   #pastUnresolvedBound(window: AdmittedWindowRecord, entry: AdmittedSeries, nowMs: number): boolean {
     const closeMs = Date.parse(window.scheduledCloseAt);
@@ -477,8 +482,17 @@ export class SeriesAdmissionFeedDriver {
     return `${this.#options.feedId}:${window.internalMarketId}`;
   }
 
+  /**
+   * Retires every live window whose resolution this gateway dispatched, and
+   * names every one still unresolved past its bound. Nothing else retires a
+   * window (`ROLLOVER-1` r2, R2-ASTRA-02): r1 retired the OLDEST awaiting
+   * window once more than `maximumConcurrentWindows` awaited, which
+   * unsubscribed it and released its directory identity, so its resolution —
+   * which the venue may still deliver — could no longer reach a trader
+   * holding a position in it.
+   */
   async #tearDown(nowMs: number): Promise<void> {
-    const awaiting = new Map<string, { readonly record: AdmissionLedgerRecord; readonly window: AdmittedWindowRecord; readonly entry: AdmittedSeries }[]>();
+    let awaiting = 0;
     for (const record of this.#options.ledger.liveWindows()) {
       const window = record.window;
       const entry = this.#seriesById.get(record.seriesId);
@@ -494,57 +508,20 @@ export class SeriesAdmissionFeedDriver {
         continue;
       }
       if (!this.#pastUnresolvedBound(window, entry, nowMs)) continue;
-      // R1-04: NOT retired. A trader may hold a position in it, and only this
-      // gateway can still deliver its resolution; it stays subscribed. The
+      // R1-04 and r2: NOT retired, however long it waits. A trader may hold a
+      // position in it, and only this gateway can still deliver its
+      // resolution; it stays subscribed, registered, and in its cap slot. The
       // incident is opened once (the registry suppresses a repeat while open).
+      awaiting += 1;
       this.#openWindowIncident(
         this.#unresolvedScope(window),
         "GATEWAY_SERIES_WINDOW_UNRESOLVED",
         "NOTIFY",
-        `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) had no MarketResolved ${String(entry.series.unresolvedTeardownSeconds)} s after its scheduled close ${window.scheduledCloseAt}; it stays subscribed, awaiting its resolution (ADR-030 Decision 4.4), and no longer holds a cap slot`,
+        `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) had no MarketResolved ${String(entry.series.unresolvedTeardownSeconds)} s after its scheduled close ${window.scheduledCloseAt}; it stays subscribed, awaiting its resolution (ADR-030 Decision 4.4), and keeps its cap slot until its resolution is handled — the series admits no window in its place (Decision 1.8); a resolution missed while the gateway was down is never delivered, so reconcile it by hand`,
         [window.internalMarketId],
       );
-      const list = awaiting.get(record.seriesId) ?? [];
-      list.push({ record, window, entry });
-      awaiting.set(record.seriesId, list);
     }
-    // Bounded (§8.3): at most `maximumConcurrentWindows` windows of a series
-    // await their resolution; past that the OLDEST (earliest close) is retired
-    // and its resolution is no longer tracked — said by name.
-    let kept = 0;
-    for (const list of awaiting.values()) {
-      const newestFirst = [...list].sort((left, right) =>
-        left.window.scheduledCloseAt === right.window.scheduledCloseAt
-          ? left.window.internalMarketId < right.window.internalMarketId
-            ? -1
-            : 1
-          : left.window.scheduledCloseAt > right.window.scheduledCloseAt
-            ? -1
-            : 1,
-      );
-      for (const [index, { record, window, entry }] of newestFirst.entries()) {
-        if (index < entry.series.maximumConcurrentWindows) {
-          kept += 1;
-          continue;
-        }
-        const retired: AdmissionLedgerRecord = { ...record, status: "RETIRED", retiredAt: isoFromMs(nowMs), retiredReason: "UNRESOLVED_AFTER_CLOSE" };
-        if (!(await this.#persist(retired))) {
-          kept += 1;
-          continue;
-        }
-        this.#options.windows.detach(record);
-        this.#retiredUnresolved += 1;
-        this.#options.dispatcher.markIncidentClosed(this.#unresolvedScope(window), "GATEWAY_SERIES_WINDOW_UNRESOLVED");
-        this.#openWindowIncident(
-          this.#unresolvedScope(window),
-          "GATEWAY_SERIES_WINDOW_RESOLUTION_ABANDONED",
-          "NOTIFY",
-          `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) is still unresolved and ${String(entry.series.maximumConcurrentWindows)} newer windows of ${entry.series.seriesId} also await theirs; it is retired and unsubscribed, so its resolution is no longer delivered — a trader holding a position in it keeps the window until its run ends; reconcile its resolution by hand`,
-          [window.internalMarketId],
-        );
-      }
-    }
-    this.#awaitingResolution = kept;
+    this.#awaitingResolution = awaiting;
   }
 
   async #prune(nowMs: number): Promise<void> {
@@ -656,21 +633,24 @@ export class SeriesAdmissionFeedDriver {
       this.#skippedKnown += 1;
       return;
     }
-    // The cap counts the live windows not yet past their unresolved bound: one
-    // past it awaits its resolution and trades nothing (module header, step 1).
-    const live = this.#options.ledger
-      .liveWindows(entry.series.seriesId)
-      .filter((record) => record.window === undefined || !this.#pastUnresolvedBound(record.window, entry, nowMs)).length;
+    // The cap counts EVERY live window of the series (ADR-030 Decision 1.8),
+    // one awaiting its resolution past its bound included (`ROLLOVER-1` r2,
+    // R2-ASTRA-01: r1 excluded those, so a series could hold more admitted,
+    // subscribed windows than its reviewed cap). At the cap, admissions are
+    // DEFERRED; no live window is ever evicted to make room (R2-ASTRA-02).
+    const liveRecords = this.#options.ledger.liveWindows(entry.series.seriesId);
+    const live = liveRecords.length;
     const capScope = `${this.#options.feedId}:${entry.series.seriesId}:cap`;
     if (live >= entry.series.maximumConcurrentWindows) {
       this.#heldByCap += 1;
+      const awaiting = liveRecords.filter((record) => record.window !== undefined && this.#pastUnresolvedBound(record.window, entry, nowMs)).length;
       // Named by the HELD window's derived id — a market no consumer runs, so
       // the incident neither pauses a live window nor taints the epoch.
       this.#openWindowIncident(
         capScope,
         "GATEWAY_SERIES_CAP_REACHED",
         "NOTIFY",
-        `series ${entry.series.seriesId} has ${String(live)} live windows, its reviewed cap (maximumConcurrentWindows ${String(entry.series.maximumConcurrentWindows)}, ADR-030 Decision 1.8); window ${conditionId ?? key} is held until one is torn down`,
+        `series ${entry.series.seriesId} has ${String(live)} live windows, its reviewed cap (maximumConcurrentWindows ${String(entry.series.maximumConcurrentWindows)}, ADR-030 Decision 1.8), ${String(awaiting)} of them past their unresolved bound and awaiting their resolution; window ${conditionId ?? key} is held until one is torn down after its resolution is handled`,
         derivedWindowIds(conditionId, startMs),
       );
       return;
@@ -713,7 +693,9 @@ export class SeriesAdmissionFeedDriver {
       }
       this.#clobReads += 1;
       this.#requestSucceeded(clobFrame.receipt);
-      // R1-FABLE-03: this window's read succeeded — its failure incidents end.
+      // R1-FABLE-03: this window's read succeeded — its failure incidents end,
+      // so a later failure of the same window opens a NEW incident (pinned,
+      // R2-FABLE-02(a): the gateway suite's "fail, succeed, fail again").
       this.#options.dispatcher.markIncidentClosed(clobScope.scope, "GATEWAY_SERIES_CLOB_READ_FAILED");
       this.#options.dispatcher.markIncidentClosed(clobScope.scope, "GATEWAY_SERIES_CLOB_READ_INVALID");
     }
@@ -905,7 +887,9 @@ export class SeriesAdmissionFeedDriver {
    * re-emission is not a new judgement: a trader that holds the window sees a
    * `DUPLICATE`, and one that does not refuses a window already closed at the
    * re-emission's instant (`WINDOW_CLOSED`, R1-03). Once attached, the window
-   * awaits its resolution like any other (`#tearDown`).
+   * awaits its resolution like any other (`#tearDown`), in its cap slot
+   * (`ROLLOVER-1` r2). Pinned by name (R2-FABLE-02(b)): the gateway suite's
+   * "re-emits an unconfirmed intent even past its bound".
    */
   async #replay(frame: CitedFrame): Promise<boolean> {
     this.#replayOwed = false;
@@ -1072,7 +1056,6 @@ export class SeriesAdmissionFeedDriver {
       windowsAdmitted: this.#admitted,
       windowsRefused: this.#refused,
       windowsRetiredResolved: this.#retiredResolved,
-      windowsRetiredUnresolved: this.#retiredUnresolved,
       windowsAwaitingResolution: this.#awaitingResolution,
       windowsSkippedLate: this.#skippedLate,
       windowsClosedBeforeAdmission: this.#closedBeforeAdmission,

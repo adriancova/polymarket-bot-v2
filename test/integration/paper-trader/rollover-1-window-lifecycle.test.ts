@@ -18,11 +18,17 @@
  *    inventory is kept (ADR-030 Decision 4.4, "after its resolution is
  *    handled"): reported once (`HELD_UNRESOLVED`), its runtime the position's
  *    owner, so a later `MarketResolved` reaches the strategy and only then is
- *    it torn down; and it holds no cap slot meanwhile, as at the gateway.
+ *    it torn down.
  * 6. **R1-03** — an admission whose event time is at or past the window's
  *    close is refused `WINDOW_CLOSED`.
  * 7. **R1-FABLE-07** — a catalog conflict refuses THAT window only
  *    (`CATALOG_CONFLICT`); nothing halts and the next window is admitted.
+ * 8. **R2-ASTRA-01** (`ROLLOVER-1` r2) — a HELD window KEEPS its cap slot
+ *    (ADR-030 Decision 1.8), as at the gateway: the next window is refused
+ *    `CAP_REACHED` until the HELD window's resolution is handled, so a run
+ *    never holds more windows — each a runtime evaluated at its cadence — than
+ *    the reviewed cap. r1 excluded HELD windows from the cap, and the
+ *    verifiers' probe held three funded windows at a cap of 1.
  */
 
 import { RealizedPnlBook, observeRealizedPnl, type AdmissionNotice } from "@polymarket-bot/trader";
@@ -30,7 +36,7 @@ import { describe, expect, it } from "vitest";
 
 import { assembleOrThrow } from "./support/run.js";
 import { DEAD_QUOTE, ENTRY_QUOTE, STOP_QUOTE, SeriesStream, sampleReviewHash } from "./support/series-stream.js";
-import { SERIES_INSTANCE_ID, review, seriesConfig, W1, W2 } from "./support/series-windows.js";
+import { SERIES_INSTANCE_ID, review, seriesConfig, W1, W2, W3 } from "./support/series-windows.js";
 
 /** The series configuration with the strategy's `exit` block and the §9.7 caps overridden. */
 function configWith(
@@ -224,17 +230,83 @@ describe("ROLLOVER-1 r1 (R1-04): a window that holds inventory is never torn dow
     expect(run.trader.loop.health().halts).toEqual([]);
   });
 
-  it("a held window holds no cap slot: with a cap of 1, the next window is admitted while it awaits its resolution", async () => {
-    const series = { ...review(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+});
+
+describe("ROLLOVER-1 r2 (R2-ASTRA-01): a HELD window keeps its cap slot (ADR-030 Decision 1.8)", () => {
+  const series = { ...review(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+
+  it("R2-ASTRA-01: with a cap of 1, the next window is refused CAP_REACHED while W1 is HELD; once W1's resolution is handled, the next is admitted", async () => {
     const stream = w1Entry(new SeriesStream(sampleReviewHash(series)))
       .book(W1, "2026-10-04T22:16:10.000Z", DEAD_QUOTE)
       .tick("2026-10-04T22:29:50.000Z")
       .tick("2026-10-04T22:35:01.000Z")
       .admit(W2, "2026-10-04T22:35:02.000Z")
-      .tick("2026-10-04T22:35:03.000Z");
-    const { run, notices } = await drive(configWith({ exit: HOLD_TO_RESOLUTION, series }), stream);
-    expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `HELD_UNRESOLVED ${W1.marketId}`, `ADMITTED ${W2.marketId}`]);
-    expect(run.trader.loop.admissionMetrics()).toMatchObject({ heldUnresolved: 1, live: 2, refusals: {} });
+      .tick("2026-10-04T22:35:03.000Z")
+      .resolve(W1, "2026-10-04T22:40:00.000Z")
+      .tick("2026-10-04T22:40:01.000Z")
+      .admit(W3, "2026-10-04T22:44:00.000Z")
+      .tick("2026-10-04T22:44:01.000Z");
+    const { run, notices, fills } = await drive(configWith({ exit: HOLD_TO_RESOLUTION, series }), stream);
+    expect(fills).toEqual(["W1 BUY 50@0.34"]);
+    expect(notices).toEqual([
+      `ADMITTED ${W1.marketId}`,
+      `HELD_UNRESOLVED ${W1.marketId}`,
+      `REFUSED CAP_REACHED ${W2.marketId}`,
+      `TORN_DOWN ${W1.marketId} RESOLVED`,
+      `ADMITTED ${W3.marketId}`,
+    ]);
+    expect(run.trader.loop.admissionMetrics()?.lastRefusals).toEqual([
+      expect.stringMatching(/^CAP_REACHED: series btc-15m-updown has 1 live windows, .*1 of them HELD awaiting their resolution$/u),
+    ]);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ admitted: 2, heldUnresolved: 0, live: 1, refusals: { CAP_REACHED: 1 } });
+    expect(run.parts.store.admittedMarkets.map((market) => market.marketId)).toEqual([W1.marketId, W3.marketId]);
+    expect(run.parts.store.decisions.some((entry) => entry.record.marketId === W2.marketId)).toBe(false);
+    expect(run.trader.loop.health().halts).toEqual([]);
+  });
+
+  it("R2-ASTRA-01: cap 1 and three windows each due while the one before it is HELD — one window funded, never more than one live, one runtime (r1 held three)", async () => {
+    // The verifiers' probe stream: under r1 every window was admitted, funded
+    // and HELD (live 3, three runtimes, each evaluated at the run's cadence).
+    const stream = w1Entry(new SeriesStream(sampleReviewHash(series)))
+      .book(W1, "2026-10-04T22:16:10.000Z", DEAD_QUOTE)
+      .tick("2026-10-04T22:29:50.000Z")
+      .tick("2026-10-04T22:35:01.000Z")
+      .admit(W2, "2026-10-04T22:35:02.000Z")
+      .open(W2, "2026-10-04T22:35:03.000Z")
+      .book(W2, "2026-10-04T22:35:04.000Z", ENTRY_QUOTE)
+      .tick("2026-10-04T22:35:06.000Z")
+      .book(W2, "2026-10-04T22:35:10.000Z", DEAD_QUOTE)
+      .tick("2026-10-04T22:44:50.000Z")
+      .tick("2026-10-04T22:50:01.000Z")
+      .admit(W3, "2026-10-04T22:50:02.000Z")
+      .open(W3, "2026-10-04T22:50:03.000Z")
+      .book(W3, "2026-10-04T22:50:04.000Z", ENTRY_QUOTE)
+      .tick("2026-10-04T22:50:06.000Z")
+      .book(W3, "2026-10-04T22:50:10.000Z", DEAD_QUOTE)
+      .tick("2026-10-04T22:59:50.000Z")
+      .tick("2026-10-04T23:05:01.000Z")
+      .tick("2026-10-04T23:05:10.000Z");
+    const bound: { live: number; runtimes: number }[] = [];
+    const { run, notices, fills } = await drive(configWith({ exit: HOLD_TO_RESOLUTION, series }), stream, {
+      onNotice: (_notice, holder) => {
+        bound.push({ live: holder.trader.loop.admissionMetrics()?.live ?? -1, runtimes: holder.trader.registry.evaluationOrder().length });
+      },
+    });
+    expect(fills).toEqual(["W1 BUY 50@0.34"]);
+    expect(notices).toEqual([
+      `ADMITTED ${W1.marketId}`,
+      `HELD_UNRESOLVED ${W1.marketId}`,
+      `REFUSED CAP_REACHED ${W2.marketId}`,
+      `REFUSED CAP_REACHED ${W3.marketId}`,
+    ]);
+    expect(bound).toHaveLength(4);
+    expect(bound.every((entry) => entry.live <= 1 && entry.runtimes <= 1)).toBe(true);
+    expect(run.trader.markets.size).toBe(1);
+    expect(run.trader.registry.evaluationOrder()).toHaveLength(1);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ admitted: 1, heldUnresolved: 1, live: 1, refusals: { CAP_REACHED: 2 } });
+    // Only the one HELD window is ever evaluated: no decision names W2 or W3.
+    expect(new Set(run.parts.store.decisions.map((entry) => entry.record.marketId))).toEqual(new Set([W1.marketId]));
+    expect(run.trader.loop.health().halts).toEqual([]);
   });
 });
 
