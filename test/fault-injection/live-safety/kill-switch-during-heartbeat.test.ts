@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { engageRow, releaseRow } from "../../../apps/trader/src/live-safety/fakes.test-support.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
 
-import { liveProcess, submitOne } from "./support/live-process.js";
+import { liveProcess, REDUCE, submitOne } from "./support/live-process.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -26,7 +26,7 @@ const MARKET = "0190a3e0-0000-7000-8000-00000000000c";
 const INSTANCE = "0190a3e0-0000-7000-8000-00000000000a";
 
 describe("a GLOBAL FULL_HALT engaged while a heartbeat is in flight", () => {
-  it("the in-flight heartbeat completes; no further heartbeat is sent; the lapse follows; cancel-all is requested once; nothing may be submitted", async () => {
+  it("the in-flight heartbeat completes; no further heartbeat is sent; the lapse follows; cancel-all is requested, then confirmed once; nothing may be submitted", async () => {
     const live = await liveProcess();
     await live.step(6_000);
     expect(await submitOne(live.oms)).not.toBeNull();
@@ -38,7 +38,7 @@ describe("a GLOBAL FULL_HALT engaged while a heartbeat is in flight", () => {
     live.reader.rows = [engageRow({ id: "kill-1", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
     // Within one refresh interval the switch is read: every submission is refused at once.
     await live.step(1_000);
-    expect(live.safety.gate({ kind: "TRANSMISSION" }).reasons).toContain("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
+    expect(live.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
     expect(live.entryReasons()).toContain("KILL_SWITCH_ACCOUNT_ENGAGED");
     // The heartbeat already in flight completes (it left before the switch); nothing leaves after it.
     live.transport.resolveDeferred({ kind: "RESPONSE", httpStatus: 200, body: { heartbeat_id: "id-in-flight" } });
@@ -49,10 +49,16 @@ describe("a GLOBAL FULL_HALT engaged while a heartbeat is in flight", () => {
     const lapse = live.journal.of("LAPSE_STARTED").at(-1);
     expect(lapse?.cause).toBe("GATE_REFUSED");
     expect(lapse?.gateReasons).toContain("HEALTH_KILL_SWITCH_ENGAGED_STOPS_HEARTBEAT");
-    expect(live.cancels.calls).toEqual(['{"scope":"ACCOUNT"}']);
+    // The first sweep, and ONE confirming sweep a refresh interval later (r1 I2: an order in flight at the switch).
+    expect(live.cancels.calls).toEqual(['{"scope":"ACCOUNT"}', '{"scope":"ACCOUNT"}']);
+    expect(live.journal.of("KILL_SWITCH_CANCEL_REQUESTED").map((entry) => entry.pass)).toEqual(["FIRST", "CONFIRMING"]);
 
-    // Released: the heartbeat resumes; the D6 recovery lifts the entry block only after a qualifying run.
+    // Released: the release settles (r1 I6), the heartbeat resumes, and the D6 recovery lifts the entry block only
+    // after a qualifying run.
     live.reader.rows = [releaseRow({ id: "kill-2", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    await live.step(1_500);
+    // Not settled yet: still the switch it releases.
+    expect(live.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
     await live.step(6_000);
     expect(live.transport.requests.length).toBeGreaterThan(inFlightSends);
     expect(live.entryReasons()).toContain("HEARTBEAT_RECOVERY_PENDING");
@@ -94,7 +100,28 @@ describe("a MARKET or STRATEGY_INSTANCE switch never stops the heartbeat (ADR-03
       expect(live.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
       expect(live.entryReasons()).toContain(scope === "MARKET" ? "KILL_SWITCH_MARKET_ENGAGED" : "KILL_SWITCH_INSTANCE_ENGAGED");
       expect(live.safety.gate({ kind: "NEW_ENTRY", marketId: "0190a3e0-0000-7000-8000-0000000000ff", instanceId: "0190a3e0-0000-7000-8000-0000000000ee" }).permitted).toBe(true);
-      expect(live.cancels.calls).toEqual([scope === "MARKET" ? `{"scope":"MARKET","marketId":"${MARKET}"}` : `{"scope":"STRATEGY_INSTANCE","instanceId":"${INSTANCE}"}`]);
+      const directive = scope === "MARKET" ? `{"scope":"MARKET","marketId":"${MARKET}"}` : `{"scope":"STRATEGY_INSTANCE","instanceId":"${INSTANCE}"}`;
+      // The first sweep, then one confirming sweep (r1 I2), then nothing more.
+      expect(live.cancels.calls).toEqual([directive, directive]);
     });
   }
+});
+
+describe("r1 I6: a release the control plane REFUSED and voided never lifts the switch", () => {
+  it("a GLOBAL FULL_HALT whose release row landed late and was voided keeps the heartbeat stopped and every order refused, indefinitely", async () => {
+    const live = await liveProcess();
+    await live.step(6_000);
+    live.reader.rows = [engageRow({ id: "kill-1", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    await live.step(2_000);
+    const sends = live.transport.requests.length;
+    // The release's append outlived the control plane's bound: refused 503, its row lands late, then its VOID.
+    live.reader.rows = [releaseRow({ id: "late-release", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    await live.step(500);
+    live.reader.rows = [releaseRow({ id: "late-release", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", voided: true })];
+    await live.step(60_000);
+    expect(live.transport.requests.length - sends).toBeLessThanOrEqual(1);
+    expect(live.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
+    const gate = live.safety.heartbeatGate.evaluate();
+    expect(gate.permitted === false ? gate.reasons : []).toContain("HEALTH_KILL_SWITCH_ENGAGED_STOPS_HEARTBEAT");
+  });
 });

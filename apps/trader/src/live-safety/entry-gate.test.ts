@@ -2,14 +2,15 @@
  * WP-320: the live gate and the submission fence. Kill switches outrank
  * everything (ADR-008 §8); the fence, the health lease and the explicit stops
  * gate every order; the heartbeat, eligibility and reconciliation halts gate
- * new entries.
+ * new entries. The fence asks each order's OWN question at the last moment,
+ * batch members one by one (r1 I2).
  */
 
 import { describe, expect, it } from "vitest";
 
 import { evaluateLiveGate, type GateInputs, type GateRequest } from "./entry-gate.js";
 import { engageRow } from "./fakes.test-support.js";
-import { fenceVenuePort } from "./fenced-venue.js";
+import { fenceVenuePort, type PlacementClassifier, type PlacementScope } from "./fenced-venue.js";
 import { foldKillSwitchRows, killSwitchEffects, type KillSwitchSnapshot } from "./kill-switch.js";
 
 const MARKET = "0190a3e0-0000-7000-8000-00000000000c";
@@ -17,7 +18,7 @@ const OTHER_MARKET = "0190a3e0-0000-7000-8000-00000000000d";
 const INSTANCE = "0190a3e0-0000-7000-8000-00000000000a";
 
 function known(rows: readonly unknown[] = []): KillSwitchSnapshot {
-  return { known: true, effects: killSwitchEffects(foldKillSwitchRows(rows), "acct-1"), readStartedAtMs: 0 };
+  return { known: true, effects: killSwitchEffects(foldKillSwitchRows(rows, () => true), "acct-1"), readStartedAtMs: 0 };
 }
 
 function inputs(overrides: Partial<GateInputs> = {}): GateInputs {
@@ -36,16 +37,15 @@ function inputs(overrides: Partial<GateInputs> = {}): GateInputs {
 
 const ENTRY: GateRequest = { kind: "NEW_ENTRY", marketId: MARKET, instanceId: INSTANCE };
 const REDUCTION: GateRequest = { kind: "REDUCTION", marketId: MARKET, instanceId: INSTANCE };
-const TRANSMISSION: GateRequest = { kind: "TRANSMISSION" };
 
 describe("the live gate", () => {
   it("permits everything when every input holds", () => {
-    for (const request of [ENTRY, REDUCTION, TRANSMISSION]) expect(evaluateLiveGate(inputs(), request)).toEqual({ permitted: true, reasons: [] });
+    for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(inputs(), request)).toEqual({ permitted: true, reasons: [] });
   });
 
   it("unknown kill-switch state blocks EVERYTHING (a process that cannot read it cannot prove it may trade)", () => {
     const gate = inputs({ killSwitch: () => ({ known: false, reason: "READ_FAILED" }) });
-    for (const request of [ENTRY, REDUCTION, TRANSMISSION]) expect(evaluateLiveGate(gate, request)).toEqual({ permitted: false, reasons: ["KILL_SWITCH_UNKNOWN_READ_FAILED"] });
+    for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(gate, request)).toEqual({ permitted: false, reasons: ["KILL_SWITCH_UNKNOWN_READ_FAILED"] });
   });
 
   it("a GLOBAL HALT_NEW_ENTRIES blocks entries only; a GLOBAL FULL_HALT blocks every order", () => {
@@ -53,7 +53,7 @@ describe("the live gate", () => {
     expect(evaluateLiveGate(halt, ENTRY).reasons).toEqual(["KILL_SWITCH_ACCOUNT_ENGAGED"]);
     expect(evaluateLiveGate(halt, REDUCTION).permitted).toBe(true);
     const full = inputs({ killSwitch: () => known([engageRow({ id: "e", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })]) });
-    for (const request of [ENTRY, REDUCTION, TRANSMISSION]) expect(evaluateLiveGate(full, request).permitted).toBe(false);
+    for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(full, request).permitted).toBe(false);
   });
 
   it("a MARKET switch blocks that market only; MANAGE_POSITIONS_ONLY leaves its reductions", () => {
@@ -61,7 +61,6 @@ describe("the live gate", () => {
     expect(evaluateLiveGate(gate, ENTRY).reasons).toEqual(["KILL_SWITCH_MARKET_ENGAGED"]);
     expect(evaluateLiveGate(gate, { ...ENTRY, marketId: OTHER_MARKET }).permitted).toBe(true);
     expect(evaluateLiveGate(gate, REDUCTION).permitted).toBe(true);
-    expect(evaluateLiveGate(gate, TRANSMISSION).permitted).toBe(true);
   });
 
   it("a STRATEGY_INSTANCE CANCEL_ALL blocks that instance's entries and reductions", () => {
@@ -72,11 +71,11 @@ describe("the live gate", () => {
 
   it("the fence, the health lease and an explicit stop gate every order", () => {
     const fence = inputs({ fence: () => ({ held: false, reason: "EXPIRED" }) });
-    for (const request of [ENTRY, REDUCTION, TRANSMISSION]) expect(evaluateLiveGate(fence, request).reasons).toEqual(["FENCE_EXPIRED"]);
+    for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(fence, request).reasons).toEqual(["FENCE_EXPIRED"]);
     const health = inputs({ health: () => ({ healthy: false, failures: [{ input: "OMS", reason: "FAULTED" }], reasons: ["HEALTH_OMS_FAULTED"], atMs: 0 }) });
-    for (const request of [ENTRY, REDUCTION, TRANSMISSION]) expect(evaluateLiveGate(health, request).reasons).toEqual(["HEALTH_LEASE_FAILED", "HEALTH_OMS_FAULTED"]);
+    for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(health, request).reasons).toEqual(["HEALTH_LEASE_FAILED", "HEALTH_OMS_FAULTED"]);
     const stop = inputs({ explicitStops: () => ["INCIDENT_CONTROLLER"] });
-    for (const request of [ENTRY, REDUCTION, TRANSMISSION]) expect(evaluateLiveGate(stop, request).reasons).toEqual(["STOPPED_INCIDENT_CONTROLLER"]);
+    for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(stop, request).reasons).toEqual(["STOPPED_INCIDENT_CONTROLLER"]);
   });
 
   it("the heartbeat lapse, the D6 latch, eligibility and reconciliation halts gate NEW entries only", () => {
@@ -94,7 +93,6 @@ describe("the live gate", () => {
       "RECONCILIATION_MARKET_HALT",
     ]);
     expect(evaluateLiveGate(gate, REDUCTION).permitted).toBe(true);
-    expect(evaluateLiveGate(gate, TRANSMISSION).permitted).toBe(true);
   });
 
   it("an input that throws blocks, and names itself; a malformed request is refused", () => {
@@ -106,6 +104,8 @@ describe("the live gate", () => {
     expect(evaluateLiveGate(gate, ENTRY).reasons).toEqual(["HEARTBEAT_UNREADABLE", "HEARTBEAT_LAPSED"]);
     expect(evaluateLiveGate(inputs(), { kind: "NEW_ENTRY", marketId: "", instanceId: INSTANCE }).reasons).toEqual(["REQUEST_UNREADABLE"]);
     expect(evaluateLiveGate(inputs(), { kind: "SOMETHING" } as never).reasons).toEqual(["REQUEST_UNREADABLE"]);
+    // r1 I2: there is no unscoped question any more.
+    expect(evaluateLiveGate(inputs(), { kind: "TRANSMISSION" } as never).reasons).toEqual(["REQUEST_UNREADABLE"]);
   });
 });
 
@@ -114,8 +114,8 @@ describe("the submission fence in front of the venue port", () => {
     calls: string[];
     venue: {
       createLimitOrder(request: string): Promise<string>;
-      postOrder(order: string): Promise<string>;
-      postOrders(orders: readonly string[]): Promise<readonly string[]>;
+      postOrder(order: { id: string }): Promise<string>;
+      postOrders(orders: readonly { id: string }[]): Promise<readonly string[]>;
       cancelOrder(orderId: string): Promise<string>;
     };
   } {
@@ -125,15 +125,15 @@ describe("the submission fence in front of the venue port", () => {
       venue: {
         createLimitOrder: async (request) => {
           calls.push(`sign:${request}`);
-          return "SIGNED";
+          return `SIGNED:${request}`;
         },
         postOrder: async (order) => {
-          calls.push(`post:${order}`);
-          return "ACCEPTED";
+          calls.push(`post:${order.id}`);
+          return `ACCEPTED:${order.id}`;
         },
         postOrders: async (orders) => {
-          calls.push(`batch:${orders.join(",")}`);
-          return orders.map(() => "ACCEPTED");
+          calls.push(`batch:${orders.map((order) => order.id).join(",")}`);
+          return orders.map((order) => `ACCEPTED:${order.id}`);
         },
         cancelOrder: async (orderId) => {
           calls.push(`cancel:${orderId}`);
@@ -143,22 +143,37 @@ describe("the submission fence in front of the venue port", () => {
     };
   }
   const refusals = { signRefused: (reasons: readonly string[]) => `FAILED(${reasons.join(",")})`, placementRefused: (reasons: readonly string[]) => `NOT_SENT(${reasons.join(",")})` };
+  const OTHER_INSTANCE = "0190a3e0-0000-7000-8000-0000000000ee";
+  const SCOPES: Record<string, PlacementScope> = {
+    entry: { intent: "NEW_ENTRY", marketId: MARKET, instanceId: INSTANCE },
+    reduce: { intent: "REDUCTION", marketId: MARKET, instanceId: INSTANCE },
+    elsewhere: { intent: "NEW_ENTRY", marketId: OTHER_MARKET, instanceId: OTHER_INSTANCE },
+    reduceElsewhere: { intent: "REDUCTION", marketId: OTHER_MARKET, instanceId: OTHER_INSTANCE },
+  };
+  /** Requests and orders are classified by name; a signed order is `{ id: <request> }`. */
+  const classifier: PlacementClassifier<string, string, { id: string }> = {
+    request: (request) => SCOPES[request] ?? null,
+    signedOrder: () => undefined,
+    order: (order) => SCOPES[order.id.split("#")[0] ?? ""] ?? null,
+  };
+  /** The live gate over a kill-switch state, judged per scope. */
+  const gateWith = (rows: readonly unknown[]) => (scope: PlacementScope) => evaluateLiveGate(inputs({ killSwitch: () => known(rows) }), { kind: scope.intent, marketId: scope.marketId, instanceId: scope.instanceId });
 
   it("passes everything through while the gate permits", async () => {
     const { calls, venue } = fakeVenue();
-    const fenced = fenceVenuePort(venue, () => ({ permitted: true, reasons: [] }), refusals);
-    expect(await fenced.createLimitOrder("r")).toBe("SIGNED");
-    expect(await fenced.postOrder("o")).toBe("ACCEPTED");
-    expect(await fenced.postOrders(["a", "b"])).toEqual(["ACCEPTED", "ACCEPTED"]);
-    expect(calls).toEqual(["sign:r", "post:o", "batch:a,b"]);
+    const fenced = fenceVenuePort(venue, () => ({ permitted: true, reasons: [] }), refusals, classifier);
+    expect(await fenced.createLimitOrder("entry")).toBe("SIGNED:entry");
+    expect(await fenced.postOrder({ id: "entry" })).toBe("ACCEPTED:entry");
+    expect(await fenced.postOrders([{ id: "entry#1" }, { id: "reduce#2" }])).toEqual(["ACCEPTED:entry#1", "ACCEPTED:reduce#2"]);
+    expect(calls).toEqual(["sign:entry", "post:entry", "batch:entry#1,reduce#2"]);
   });
 
   it("refuses signing and every transmission WITHOUT calling the venue; cancels still pass", async () => {
     const { calls, venue } = fakeVenue();
-    const fenced = fenceVenuePort(venue, () => ({ permitted: false, reasons: ["FENCE_EXPIRED"] }), refusals);
-    expect(await fenced.createLimitOrder("r")).toBe("FAILED(FENCE_EXPIRED)");
-    expect(await fenced.postOrder("o")).toBe("NOT_SENT(FENCE_EXPIRED)");
-    expect(await fenced.postOrders(["a", "b"])).toEqual(["NOT_SENT(FENCE_EXPIRED)", "NOT_SENT(FENCE_EXPIRED)"]);
+    const fenced = fenceVenuePort(venue, () => ({ permitted: false, reasons: ["FENCE_EXPIRED"] }), refusals, classifier);
+    expect(await fenced.createLimitOrder("entry")).toBe("FAILED(FENCE_EXPIRED)");
+    expect(await fenced.postOrder({ id: "entry" })).toBe("NOT_SENT(FENCE_EXPIRED)");
+    expect(await fenced.postOrders([{ id: "entry#1" }, { id: "reduce#2" }])).toEqual(["NOT_SENT(FENCE_EXPIRED)", "NOT_SENT(FENCE_EXPIRED)"]);
     expect(await fenced.cancelOrder("v")).toBe("CANCELED");
     expect(calls).toEqual(["cancel:v"]);
   });
@@ -171,8 +186,88 @@ describe("the submission fence in front of the venue port", () => {
         throw new Error("x");
       },
       refusals,
+      classifier,
     );
-    expect(await fenced.postOrder("o")).toBe("NOT_SENT(GATE_THREW)");
+    expect(await fenced.postOrder({ id: "entry" })).toBe("NOT_SENT(GATE_THREW)");
     expect(calls).toEqual([]);
+  });
+
+  it("r1 I2: an order with no readable scope is never sent (PLACEMENT_UNCLASSIFIED), whatever the gate would say", async () => {
+    const { calls, venue } = fakeVenue();
+    const fenced = fenceVenuePort(venue, () => ({ permitted: true, reasons: [] }), refusals, {
+      ...classifier,
+      order: (order) => {
+        if (order.id === "throws") throw new Error("x");
+        return order.id === "odd" ? ({ intent: "OPEN", marketId: MARKET, instanceId: INSTANCE } as never) : null;
+      },
+    });
+    expect(await fenced.createLimitOrder("unknown")).toBe("FAILED(PLACEMENT_UNCLASSIFIED)");
+    expect(await fenced.postOrder({ id: "unknown" })).toBe("NOT_SENT(PLACEMENT_UNCLASSIFIED)");
+    expect(await fenced.postOrder({ id: "throws" })).toBe("NOT_SENT(PLACEMENT_UNCLASSIFIED)");
+    expect(await fenced.postOrder({ id: "odd" })).toBe("NOT_SENT(PLACEMENT_UNCLASSIFIED)");
+    expect(calls).toEqual([]);
+  });
+
+  for (const [name, rows, refusedScopes, reason] of [
+    ["a MARKET FULL_HALT", [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })], ["entry", "reduce"], "KILL_SWITCH_MARKET"],
+    ["a STRATEGY_INSTANCE FULL_HALT", [engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })], ["entry", "reduce"], "KILL_SWITCH_INSTANCE"],
+    ["a GLOBAL HALT_NEW_ENTRIES", [engageRow({ id: "g", scope: "GLOBAL", scopeRef: null, action: "HALT_NEW_ENTRIES" })], ["entry", "elsewhere"], "KILL_SWITCH_ACCOUNT_ENGAGED"],
+    ["an own-ACCOUNT MANAGE_POSITIONS_ONLY", [engageRow({ id: "a", scope: "ACCOUNT", scopeRef: "acct-1", action: "MANAGE_POSITIONS_ONLY" })], ["entry", "elsewhere"], "KILL_SWITCH_ACCOUNT_ENGAGED"],
+  ] as const) {
+    it(`r1 I2: ${name} observed after the decision refuses exactly the orders it covers, at transmission and per batch member`, async () => {
+      const { calls, venue } = fakeVenue();
+      const fenced = fenceVenuePort(venue, gateWith(rows), refusals, classifier);
+      for (const scope of Object.keys(SCOPES)) {
+        const refused = (refusedScopes as readonly string[]).includes(scope);
+        const answer = await fenced.postOrder({ id: scope });
+        expect(answer.startsWith("NOT_SENT("), `${scope}`).toBe(refused);
+        if (refused) expect(answer).toContain(reason);
+      }
+      // A batch with a covered member is refused WHOLE (WP-270 reads a mixed answer as unknown for every member):
+      // each covered member names its own reasons, the others BATCH_MEMBER_REFUSED, and nothing is sent.
+      const batch = await fenced.postOrders(Object.keys(SCOPES).map((scope) => ({ id: `${scope}#b` })));
+      expect(batch.every((answer) => answer.startsWith("NOT_SENT("))).toBe(true);
+      for (const [index, scope] of Object.keys(SCOPES).entries()) {
+        if ((refusedScopes as readonly string[]).includes(scope)) expect(batch[index]).toContain(reason);
+        else expect(batch[index]).toBe("NOT_SENT(BATCH_MEMBER_REFUSED)");
+      }
+      // A batch of uncovered members only is sent, in one call.
+      const sent = Object.keys(SCOPES).filter((scope) => !(refusedScopes as readonly string[]).includes(scope));
+      expect(await fenced.postOrders(sent.map((scope) => ({ id: `${scope}#c` })))).toEqual(sent.map((scope) => `ACCEPTED:${scope}#c`));
+      expect(calls.filter((call) => call.startsWith("batch:"))).toEqual([`batch:${sent.map((scope) => `${scope}#c`).join(",")}`]);
+      expect(calls.filter((call) => call.startsWith("post:"))).toEqual(sent.map((scope) => `post:${scope}`));
+    });
+  }
+
+  it("r1 I2: an order signed through the port is judged with the scope of the request that produced it (remembered), not the fallback", async () => {
+    const { calls, venue } = fakeVenue();
+    const signed = { id: "anonymous" };
+    let switches: readonly unknown[] = [];
+    const fenced = fenceVenuePort(
+      {
+        ...venue,
+        createLimitOrder: async (request: string) => {
+          calls.push(`sign:${request}`);
+          return `SIGNED:${request}`;
+        },
+      },
+      (scope) => gateWith(switches)(scope),
+      refusals,
+      { request: (request) => SCOPES[request] ?? null, signedOrder: () => signed, order: () => null },
+    );
+    expect(await fenced.createLimitOrder("entry")).toBe("SIGNED:entry");
+    // Decided and signed; THEN a MARKET switch is observed: the retransmission of the same signed order is refused.
+    switches = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "HALT_NEW_ENTRIES" })];
+    expect(await fenced.postOrder(signed)).toBe("NOT_SENT(KILL_SWITCH_MARKET_ENGAGED)");
+    expect(await fenced.postOrder(signed)).toBe("NOT_SENT(KILL_SWITCH_MARKET_ENGAGED)");
+    switches = [];
+    expect(await fenced.postOrder(signed)).toBe("ACCEPTED:anonymous");
+    expect(calls).toEqual(["sign:entry", "post:anonymous"]);
+  });
+
+  it("a batch of permitted members is passed through unchanged, whatever the venue answers", async () => {
+    const { venue } = fakeVenue();
+    const fenced = fenceVenuePort({ ...venue, postOrders: async () => ["ONLY_ONE", "EXTRA", "MORE"] }, () => ({ permitted: true, reasons: [] }), refusals, classifier);
+    expect(await fenced.postOrders([{ id: "entry#1" }, { id: "elsewhere#2" }])).toEqual(["ONLY_ONE", "EXTRA", "MORE"]);
   });
 });

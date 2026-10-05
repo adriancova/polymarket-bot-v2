@@ -5,8 +5,9 @@
  * the live gate and the submission fence.
  *
  * EXPOSED FOR A LIVE COMPOSITION ROOT; NOT WIRED INTO `main.ts`. Nothing in
- * this repository builds it, and it refuses every run mode that does not
- * submit real orders. See `live-safety.ts`.
+ * this repository builds it, and it refuses every run-mode context that may
+ * not submit real orders (a simulated mode, a mode above `MAX_RUN_MODE`, or
+ * `ALLOW_REAL_ORDERS` not true). See `live-safety.ts`.
  */
 
 export {
@@ -33,8 +34,10 @@ export {
   type GeoblockReading,
 } from "./eligibility.js";
 export { evaluateLiveGate, type GateDecision, type GateInputs, type GateRequest } from "./entry-gate.js";
-export { fenceVenuePort, type FenceRefusals, type PlacementVenuePort } from "./fenced-venue.js";
+export { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementScope, type PlacementVenuePort } from "./fenced-venue.js";
 export {
+  assertLiveFencingContext,
+  evaluateLiveFencingContext,
   FencingAuthority,
   FencingAuthorityConfigurationError,
   isLiveRunMode,
@@ -45,7 +48,10 @@ export {
   type FenceLossReason,
   type FencingAuthorityOptions,
   type FencingLeasePort,
+  type LiveFencingRefusalReason,
+  type PermittedRunModeContext,
   type RenewResult,
+  type RunModeContext,
 } from "./fencing-authority.js";
 export {
   EventLoopProbe,
@@ -78,6 +84,7 @@ export {
 } from "./kill-switch.js";
 export { createPostgresKillSwitchReader, killSwitchLatestRowQueries } from "./kill-switch-postgres.js";
 export { LapseRecovery, LapseRecoveryConfigurationError, VENUE_CANCELLATION_CHECK_INTERVAL_MS, type LapseRecoveryOptions } from "./lapse-recovery.js";
+export { OmsProgressMonitor, type OmsStoreLike } from "./oms-progress.js";
 export type {
   HeartbeatView,
   LiveSafetyAlerts,

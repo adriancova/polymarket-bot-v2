@@ -1,24 +1,29 @@
 /**
- * The live gate (WP-320): may this process start a new live entry, a
- * reduction, or put any order on the wire NOW? Every input is read at the
- * moment of asking; nothing is cached. Every reason that applies is reported,
- * kill switches first ("Kill switches outrank everything", ADR-008 §8).
+ * The live gate (WP-320): may this process start a new live entry, or a
+ * reduction, NOW? Every input is read at the moment of asking; nothing is
+ * cached. Every reason that applies is reported, kill switches first ("Kill
+ * switches outrank everything", ADR-008 §8).
  *
- * | Reason | NEW_ENTRY | REDUCTION | TRANSMISSION |
- * | --- | --- | --- | --- |
- * | kill-switch state unknown (never read, the latest read failed) | blocked | blocked | blocked |
- * | a GLOBAL / own-ACCOUNT switch | blocked | blocked if it ends trading (`kill-switch.ts`) | blocked if it ends trading |
- * | a MARKET / STRATEGY_INSTANCE switch on the request's market or instance | blocked | blocked if it ends trading there | — |
- * | the fence not held (`fencing-authority.ts`) | blocked | blocked | blocked |
- * | the health lease failed (`health-lease.ts`) | blocked | blocked | blocked |
- * | an explicit heartbeat stop (§9.9 "Stop heartbeat", `ops-cli stop-heartbeat`, a fencing conflict) | blocked | blocked | blocked |
- * | the heartbeat lapsed, or the D6 recovery has not lifted the block | blocked | — | — |
- * | venue eligibility not established (`eligibility.ts`) | blocked | — | — |
- * | a reconciliation halt routed from WP-290's coordinator (account, or the request's market) | blocked | — | — |
+ * | Reason | NEW_ENTRY | REDUCTION |
+ * | --- | --- | --- |
+ * | kill-switch state unknown (never read, the latest read failed) | blocked | blocked |
+ * | a GLOBAL / own-ACCOUNT switch | blocked | blocked if it ends trading (`kill-switch.ts`) |
+ * | a MARKET / STRATEGY_INSTANCE switch on the request's market or instance | blocked | blocked if it ends trading there |
+ * | the fence not held (`fencing-authority.ts`) | blocked | blocked |
+ * | the health lease failed (`health-lease.ts`) | blocked | blocked |
+ * | an explicit heartbeat stop (§9.9 "Stop heartbeat", `ops-cli stop-heartbeat`, a fencing conflict) | blocked | blocked |
+ * | the heartbeat lapsed, or the D6 recovery has not lifted the block | blocked | — |
+ * | venue eligibility not established (`eligibility.ts`) | blocked | — |
+ * | a reconciliation halt routed from WP-290's coordinator (account, or the request's market) | blocked | — |
  *
- * `TRANSMISSION` is what `fenced-venue.ts` asks before a signed order is
- * signed or sent: it cannot see the order's market or instance, which the
- * decision-time gate (`NEW_ENTRY` / `REDUCTION`) has already judged.
+ * The SAME question is asked twice for every order: at decision time, by the
+ * composition, and again at the final placement boundary — before every
+ * signing and before EVERY transmission, batch members one by one — by
+ * `fenced-venue.ts`, with the order's market, instance and intent carried
+ * from its decision (r1, finding I2). There is no unscoped "transmission"
+ * question any more: it could not see a MARKET or STRATEGY_INSTANCE switch,
+ * nor an entry-only GLOBAL/ACCOUNT one, so an order approved before such a
+ * switch was observed was still sent after it, and rested under it.
  * Reductions are left to the OMS during a lapse: the coordinator pauses all
  * new submissions while it reconciles (D6 step 2).
  */
@@ -30,8 +35,7 @@ import type { KillSwitchSnapshot } from "./kill-switch.js";
 
 export type GateRequest =
   | { readonly kind: "NEW_ENTRY"; readonly marketId: string; readonly instanceId: string }
-  | { readonly kind: "REDUCTION"; readonly marketId: string; readonly instanceId: string }
-  | { readonly kind: "TRANSMISSION" };
+  | { readonly kind: "REDUCTION"; readonly marketId: string; readonly instanceId: string };
 
 export interface GateDecision {
   readonly permitted: boolean;
@@ -67,11 +71,11 @@ export function evaluateLiveGate(inputs: GateInputs, request: GateRequest): Gate
     }
   };
   if (typeof request !== "object" || request === null) return Object.freeze({ permitted: false, reasons: Object.freeze(["REQUEST_UNREADABLE"]) });
-  const kind = request.kind;
-  if (kind !== "NEW_ENTRY" && kind !== "REDUCTION" && kind !== "TRANSMISSION") return Object.freeze({ permitted: false, reasons: Object.freeze(["REQUEST_UNREADABLE"]) });
-  const marketId = request.kind === "TRANSMISSION" ? null : request.marketId;
-  const instanceId = request.kind === "TRANSMISSION" ? null : request.instanceId;
-  if (kind !== "TRANSMISSION" && (!isIdentifier(marketId) || !isIdentifier(instanceId))) {
+  const kind: unknown = request.kind;
+  if (kind !== "NEW_ENTRY" && kind !== "REDUCTION") return Object.freeze({ permitted: false, reasons: Object.freeze(["REQUEST_UNREADABLE"]) });
+  const marketId: unknown = request.marketId;
+  const instanceId: unknown = request.instanceId;
+  if (!isIdentifier(marketId) || !isIdentifier(instanceId)) {
     return Object.freeze({ permitted: false, reasons: Object.freeze(["REQUEST_UNREADABLE"]) });
   }
 
@@ -84,12 +88,12 @@ export function evaluateLiveGate(inputs: GateInputs, request: GateRequest): Gate
       const effects = snapshot.effects;
       if (kind === "NEW_ENTRY") {
         if (effects.blocksAllEntries) reasons.push("KILL_SWITCH_ACCOUNT_ENGAGED");
-        if (marketId !== null && effects.entryBlockedMarkets.has(marketId)) reasons.push("KILL_SWITCH_MARKET_ENGAGED");
-        if (instanceId !== null && effects.entryBlockedInstances.has(instanceId)) reasons.push("KILL_SWITCH_INSTANCE_ENGAGED");
+        if (effects.entryBlockedMarkets.has(marketId)) reasons.push("KILL_SWITCH_MARKET_ENGAGED");
+        if (effects.entryBlockedInstances.has(instanceId)) reasons.push("KILL_SWITCH_INSTANCE_ENGAGED");
       } else {
         if (effects.blocksAllSubmissions) reasons.push("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
-        if (marketId !== null && effects.submissionBlockedMarkets.has(marketId)) reasons.push("KILL_SWITCH_MARKET_ENDS_TRADING");
-        if (instanceId !== null && effects.submissionBlockedInstances.has(instanceId)) reasons.push("KILL_SWITCH_INSTANCE_ENDS_TRADING");
+        if (effects.submissionBlockedMarkets.has(marketId)) reasons.push("KILL_SWITCH_MARKET_ENDS_TRADING");
+        if (effects.submissionBlockedInstances.has(instanceId)) reasons.push("KILL_SWITCH_INSTANCE_ENDS_TRADING");
       }
     }
   }
@@ -113,7 +117,7 @@ export function evaluateLiveGate(inputs: GateInputs, request: GateRequest): Gate
     const halts = read("HALTS", () => inputs.reconciliationHalts());
     if (halts !== undefined) {
       if (halts.account) reasons.push("RECONCILIATION_ACCOUNT_HALT");
-      if (marketId !== null && halts.markets.has(marketId)) reasons.push("RECONCILIATION_MARKET_HALT");
+      if (halts.markets.has(marketId)) reasons.push("RECONCILIATION_MARKET_HALT");
     }
   }
 

@@ -41,7 +41,7 @@ describe("an ambiguous geoblock answer blocks new live entries", () => {
       await live.safety.refreshEligibility();
       expect(live.entryReasons().some((reason) => reason.startsWith("GEOBLOCK_AMBIGUOUS_"))).toBe(true);
       expect(live.safety.gate(REDUCTION).permitted).toBe(true);
-      expect(live.safety.gate({ kind: "TRANSMISSION" }).permitted).toBe(true);
+      expect(live.safety.gate(REDUCTION).permitted).toBe(true);
       const sends = live.transport.requests.length;
       await live.step(10_000);
       expect(live.transport.requests.length - sends).toBe(2);

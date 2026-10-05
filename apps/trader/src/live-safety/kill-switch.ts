@@ -10,10 +10,28 @@
  * PostgreSQL audit sink writes every applied engage and release to. Why the
  * table, and not a message or an in-memory hand-off:
  *
- * - **It is written BEFORE the switch takes effect.** The control plane audits
+ * - **An engage is written BEFORE it takes effect.** The control plane audits
  *   first and applies only if the append succeeded (`control-plane.ts`,
  *   "AUDIT FIRST, THEN APPLY"), so a switch an operator was told is engaged is
  *   already a row. No message can be "sent but not yet delivered".
+ * - **A release is honoured only once it is SETTLED and not VOIDED** (r1,
+ *   finding I6). The converse does NOT hold for a release: a
+ *   `KILL_SWITCH_RELEASE` whose append outlives the control plane's bound
+ *   (`auditAppendTimeoutMs`) is refused `503` and NOT applied — the switch
+ *   stays engaged — yet its APPLIED row may still land in
+ *   `ops.kill_switch_events` afterwards, and the control plane then appends a
+ *   VOID record naming it (`voidsRecordId`) to `ops.config_change_audit`
+ *   (`ControlPlane.#settledLate`; `PostgresControlAuditSink.append`). So the
+ *   reader reports, per row, whether a VOID names it, and the monitor counts a
+ *   release row as a release only when no VOID names it AND it has been seen,
+ *   continuously, for `releaseSettleMs` on the monotonic clock before the read
+ *   that judges it (the settle window covers the interval before a VOID lands;
+ *   it is timed from first sight, not from `recorded_at`, so neither a
+ *   database clock step nor a late commit shortens it). Until then a release
+ *   row is enforced as the switch it releases (its `action` column), heartbeat
+ *   stop included. Residual (disclosed): a late release whose VOID never lands
+ *   (the control plane counts it as `LANDED_LATE` minus `VOIDED`) is honoured
+ *   once the window has passed.
  * - **It survives every restart** of the trader, the control API, or both:
  *   the state is re-derived from the rows on every read, never carried in
  *   memory.
@@ -35,12 +53,13 @@
  * The reader returns, for each `(environment, scope, scope_ref)`, its latest
  * row under TWO orderings: by `recorded_at` (the database's clock) and by
  * `occurred_at` (the control plane's), each tie broken by the event id. A
- * switch counts as RELEASED only when every latest row for it is a release; a
- * switch any ordering shows engaged is engaged. A row whose state is
- * unreadable counts as a `FULL_HALT` at its scope (or `GLOBAL` when its scope
- * is unreadable). Rows of EVERY environment are honoured: a switch engaged in
- * any run mode's control plane is a switch, and two environments' rows for
- * one scope never release each other, because state is kept per environment.
+ * switch counts as RELEASED only when every latest row for it is a settled,
+ * unvoided release; a switch any ordering shows engaged (or releasing, or
+ * voided-released) is engaged. A row whose state is unreadable counts as a
+ * `FULL_HALT` at its scope (or `GLOBAL` when its scope is unreadable). Rows of
+ * EVERY environment are honoured: a switch engaged in any run mode's control
+ * plane is a switch, and two environments' rows for one scope never release
+ * each other, because state is kept per environment.
  *
  * ## What each switch does to THIS process (accountRef)
  *
@@ -80,6 +99,8 @@ export interface KillSwitchRow {
   readonly scopeRef: string | null;
   readonly action: string;
   readonly resultingState: unknown;
+  /** Whether a control-plane VOID record names this row (`config_change_audit.new_value.voidsRecordId`). Anything but `false` is voided. */
+  readonly voided: boolean;
 }
 
 /** Reads the latest kill-switch rows (`kill-switch-postgres.ts`). A throw or a rejection is a failed read. */
@@ -95,6 +116,12 @@ export interface EngagedSwitch {
   readonly killSwitchEventId: string;
   /** The row could not be read as the control plane writes it; it is enforced as `FULL_HALT`. */
   readonly unreadable: boolean;
+  /**
+   * `NONE` for an engage. `PENDING` for a release not yet settled (seen for less than the settle window): enforced as
+   * the switch it releases, no cancel requested. `VOIDED` for a release the control plane voided: the switch is still
+   * engaged, and enforced in full.
+   */
+  readonly release: "NONE" | "PENDING" | "VOIDED";
 }
 
 export type CancelDirective =
@@ -136,9 +163,12 @@ function actionOf(value: unknown): KillSwitchAction | undefined {
  * Fold the latest rows into the engaged switches. A row is a release only when
  * its resulting state is the control plane's release document
  * (`engaged: "false"`) for the row's own scope; anything else that is not a
- * readable engage is an unreadable row, enforced as `FULL_HALT`.
+ * readable engage is an unreadable row, enforced as `FULL_HALT`. A release
+ * releases only when no VOID names it (`voided` exactly `false`) and
+ * `releaseSettled(killSwitchEventId)` says it has settled (the monitor's
+ * window); otherwise it is enforced as the switch it releases (r1, I6).
  */
-export function foldKillSwitchRows(rows: readonly unknown[]): readonly EngagedSwitch[] {
+export function foldKillSwitchRows(rows: readonly unknown[], releaseSettled: (killSwitchEventId: string) => boolean): readonly EngagedSwitch[] {
   const engaged: EngagedSwitch[] = [];
   for (const raw of rows) {
     const id = ownString(raw, "killSwitchEventId") ?? "(unreadable)";
@@ -153,10 +183,33 @@ export function foldKillSwitchRows(rows: readonly unknown[]): readonly EngagedSw
     const flag = ownString(resulting, "engaged");
     const stateScope = ownString(resulting, "scope");
     const readable = scope !== undefined && scopeRef !== undefined && (scope === "GLOBAL") === (scopeRef === null) && stateScope === scope;
-    if (readable && flag === "false") continue;
+    if (readable && flag === "false") {
+      const voidedDescriptor = typeof raw === "object" && raw !== null ? Object.getOwnPropertyDescriptor(raw, "voided") : undefined;
+      const notVoided = voidedDescriptor !== undefined && "value" in voidedDescriptor && voidedDescriptor.value === false;
+      let settled = false;
+      try {
+        settled = notVoided && releaseSettled(id) === true;
+      } catch {
+        settled = false;
+      }
+      if (settled) continue;
+      // Releasing (not settled yet) or voided: the switch it releases is still engaged. An unreadable action is the strongest.
+      engaged.push(
+        Object.freeze({
+          environment,
+          scope,
+          scopeRef,
+          action: action ?? ("FULL_HALT" as const),
+          killSwitchEventId: id,
+          unreadable: action === undefined,
+          release: notVoided ? ("PENDING" as const) : ("VOIDED" as const),
+        }),
+      );
+      continue;
+    }
     const stateAction = actionOf(ownString(resulting, "action"));
     if (readable && flag === "true" && action !== undefined && stateAction === action) {
-      engaged.push(Object.freeze({ environment, scope, scopeRef, action, killSwitchEventId: id, unreadable: false }));
+      engaged.push(Object.freeze({ environment, scope, scopeRef, action, killSwitchEventId: id, unreadable: false, release: "NONE" as const }));
       continue;
     }
     // Unreadable, or an engage whose action is not the row's: the strongest action, at the row's scope when readable.
@@ -169,6 +222,7 @@ export function foldKillSwitchRows(rows: readonly unknown[]): readonly EngagedSw
         action: "FULL_HALT" as const,
         killSwitchEventId: id,
         unreadable: true,
+        release: "NONE" as const,
       }),
     );
   }
@@ -196,7 +250,7 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
         if (ACCOUNT_ENDING.includes(entry.action)) {
           stopsHeartbeat = true;
           blocksAllSubmissions = true;
-          cancels.push({ directive: Object.freeze({ scope: "ACCOUNT" as const }), killSwitchEventId: entry.killSwitchEventId });
+          if (entry.release !== "PENDING") cancels.push({ directive: Object.freeze({ scope: "ACCOUNT" as const }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
@@ -205,7 +259,8 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
         entryBlockedMarkets.add(entry.scopeRef);
         if (ending) {
           submissionBlockedMarkets.add(entry.scopeRef);
-          cancels.push({ directive: Object.freeze({ scope: "MARKET" as const, marketId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
+          if (entry.release !== "PENDING")
+            cancels.push({ directive: Object.freeze({ scope: "MARKET" as const, marketId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
@@ -214,7 +269,8 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
         entryBlockedInstances.add(entry.scopeRef);
         if (ending) {
           submissionBlockedInstances.add(entry.scopeRef);
-          cancels.push({ directive: Object.freeze({ scope: "STRATEGY_INSTANCE" as const, instanceId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
+          if (entry.release !== "PENDING")
+            cancels.push({ directive: Object.freeze({ scope: "STRATEGY_INSTANCE" as const, instanceId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
@@ -249,20 +305,42 @@ export type KillSwitchSnapshot =
  * refresh: the state becomes unknown (`READ_TIMED_OUT`) at once, a new read
  * starts, and the abandoned read's answer, when it lands, is discarded. So a
  * hung read can never freeze the state at an old answer.
+ *
+ * The release settle window (r1, I6): every row id a completed read returns is
+ * remembered with the monotonic instant that read COMPLETED (the row was
+ * visible by then). A release row settles only when the read judging it
+ * STARTED at least `releaseSettleMs` after that first sight, so the VOID check
+ * it carries was made at least that long after the row became visible. An id
+ * no longer returned is forgotten (its window restarts if it is ever seen
+ * again).
  */
 export class KillSwitchMonitor {
   readonly #reader: KillSwitchReader;
   readonly #clock: MonotonicClock;
   readonly #accountRef: string;
   readonly #abandonAfterMs: number;
+  readonly #releaseSettleMs: number;
+  readonly #firstSeen = new Map<string, number>();
   #latest: KillSwitchSnapshot = Object.freeze({ known: false as const, reason: "NEVER_READ" as const });
   #reading: { readonly promise: Promise<boolean>; readonly startedAtMs: number | null; readonly seq: number } | null = null;
   #seq = 0;
 
-  constructor(options: { readonly reader: KillSwitchReader; readonly clock: MonotonicClock; readonly accountRef: string; readonly abandonAfterMs?: number }) {
+  constructor(options: {
+    readonly reader: KillSwitchReader;
+    readonly clock: MonotonicClock;
+    readonly accountRef: string;
+    /** How long a release row must have been visible before it releases (1 ms … 1 h); see the class comment. */
+    readonly releaseSettleMs: number;
+    readonly abandonAfterMs?: number;
+  }) {
+    const settle = options.releaseSettleMs;
+    if (typeof settle !== "number" || !Number.isSafeInteger(settle) || settle < 1 || settle > 3_600_000) {
+      throw new TypeError("KillSwitchMonitor: releaseSettleMs must be an integer of 1 ms … 1 h");
+    }
     this.#reader = options.reader;
     this.#clock = options.clock;
     this.#accountRef = options.accountRef;
+    this.#releaseSettleMs = settle;
     this.#abandonAfterMs = options.abandonAfterMs ?? Number.POSITIVE_INFINITY;
   }
 
@@ -331,8 +409,26 @@ export class KillSwitchMonitor {
       this.#latest = Object.freeze({ known: false as const, reason: "READ_FAILED" as const });
       return false;
     }
+    const completed = this.#readClock();
+    if (completed === null || completed < started) {
+      this.#latest = Object.freeze({ known: false as const, reason: "CLOCK_UNREADABLE" as const });
+      return false;
+    }
     const list: readonly unknown[] = rows;
-    this.#latest = Object.freeze({ known: true as const, effects: killSwitchEffects(foldKillSwitchRows(list), this.#accountRef), readStartedAtMs: started });
+    // Judged against sightings by EARLIER reads only.
+    const settled = (killSwitchEventId: string): boolean => {
+      const seen = this.#firstSeen.get(killSwitchEventId);
+      return seen !== undefined && started - seen >= this.#releaseSettleMs;
+    };
+    const engaged = foldKillSwitchRows(list, settled);
+    const ids = new Set<string>();
+    for (const row of list) {
+      const id = ownString(row, "killSwitchEventId");
+      if (id !== undefined) ids.add(id);
+    }
+    for (const id of [...this.#firstSeen.keys()]) if (!ids.has(id)) this.#firstSeen.delete(id);
+    for (const id of ids) if (!this.#firstSeen.has(id)) this.#firstSeen.set(id, completed);
+    this.#latest = Object.freeze({ known: true as const, effects: killSwitchEffects(engaged, this.#accountRef), readStartedAtMs: started });
     return true;
   }
 }

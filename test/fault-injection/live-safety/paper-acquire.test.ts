@@ -7,6 +7,12 @@
  * 2. the fencing authority (`FencingAuthority.create`);
  * 3. the PostgreSQL lease store (`createFencingLeaseStore(...).acquire`),
  *    before any SQL: its database handle is never touched;
+ *
+ * and the first three read the process's run-mode CONTEXT, not a run-mode
+ * string (r1, I8): under the repository's defaults (`MAX_RUN_MODE=PAPER`,
+ * `ALLOW_REAL_ORDERS=false`) a LIVE_MICRO context is refused by each, before
+ * it touches the next, exactly as the controller's `assertSignerGate` refuses
+ * it;
  * 4. the order-heartbeat controller (`assertSignerGate`, `SignerBoundaryRefusal`);
  * 5. the database itself (`fencing_leases_real_modes_only`), proven against
  *    PostgreSQL in `test/integration/postgres/fencing-race.test.ts`.
@@ -14,14 +20,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { composition, FakeKillSwitchReader, ManualClock, MemoryFencingStore } from "../../../apps/trader/src/live-safety/fakes.test-support.js";
+import { composition, FakeKillSwitchReader, ManualClock, MemoryFencingStore, REPOSITORY_DEFAULTS_LIVE_MICRO } from "../../../apps/trader/src/live-safety/fakes.test-support.js";
 import { FencingAuthority, LiveFencingRefusal } from "../../../apps/trader/src/live-safety/index.js";
 import { SignerBoundaryRefusal } from "../../../packages/polymarket-secure/src/errors.js";
 import { EventLog, FakeHeartbeatTransport, ManualTime } from "../../../packages/polymarket-secure/src/heartbeat/fakes.test-support.js";
 import { createOrderHeartbeatController } from "../../../packages/polymarket-secure/src/heartbeat/index.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
 import { NonRealModeFencingLeaseError } from "../../../packages/storage-postgres/src/errors.js";
-import { createFencingLeaseStore } from "../../../packages/storage-postgres/src/fencing/index.js";
+import { createFencingLeaseStore, FencingRunModeNotPermittedError } from "../../../packages/storage-postgres/src/fencing/index.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -53,14 +59,23 @@ function untouchedDatabase(): { readonly db: never; readonly touched: string[] }
 describe("a PAPER process tries to acquire the live fence", () => {
   for (const runMode of SIMULATED) {
     it(`${runMode}: the composition refuses before any port is touched`, () => {
-      expect(() => composition({ runMode })).toThrow(LiveFencingRefusal);
+      expect(() => composition({ runModeContext: { runMode, maximumRunMode: "LIVE", allowRealOrders: true } })).toThrow(LiveFencingRefusal);
     });
 
     it(`${runMode}: the fencing authority refuses before the store is touched`, () => {
       const clock = new ManualClock();
       const store = new MemoryFencingStore(() => clock.now);
       expect(() =>
-        FencingAuthority.create({ runMode, accountRef: "acct-1", holderId: "paper-1", store, clock, ttlMs: 30_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 }),
+        FencingAuthority.create({
+          runModeContext: { runMode, maximumRunMode: "LIVE", allowRealOrders: true },
+          accountRef: "acct-1",
+          holderId: "paper-1",
+          store,
+          clock,
+          ttlMs: 30_000,
+          safetyMarginMs: 2_000,
+          transmitMarginMs: 3_000,
+        }),
       ).toThrow(LiveFencingRefusal);
       expect(store.calls).toEqual([]);
     });
@@ -68,7 +83,9 @@ describe("a PAPER process tries to acquire the live fence", () => {
     it(`${runMode}: the PostgreSQL lease store refuses before any SQL`, async () => {
       const { db, touched } = untouchedDatabase();
       const store = createFencingLeaseStore(db);
-      await expect(store.acquire({ accountRef: "acct-1", environment: runMode, holderId: "paper-1", ttlMs: 30_000 })).rejects.toBeInstanceOf(NonRealModeFencingLeaseError);
+      await expect(store.acquire({ accountRef: "acct-1", environment: runMode, maximumRunMode: "LIVE", allowRealOrders: true, holderId: "paper-1", ttlMs: 30_000 })).rejects.toBeInstanceOf(
+        NonRealModeFencingLeaseError,
+      );
       expect(touched).toEqual([]);
     });
 
@@ -98,6 +115,24 @@ describe("a PAPER process tries to acquire the live fence", () => {
     });
   }
 
+  it("r1 I8: under the repository's defaults (MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false) a LIVE_MICRO context builds no composition, no fencing authority, and reaches no SQL", async () => {
+    expect(() => composition({ runModeContext: REPOSITORY_DEFAULTS_LIVE_MICRO })).toThrow(LiveFencingRefusal);
+    const clock = new ManualClock();
+    const memory = new MemoryFencingStore(() => clock.now);
+    expect(() =>
+      FencingAuthority.create({ runModeContext: REPOSITORY_DEFAULTS_LIVE_MICRO, accountRef: "acct-1", holderId: "t", store: memory, clock, ttlMs: 30_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 }),
+    ).toThrow(LiveFencingRefusal);
+    expect(memory.calls).toEqual([]);
+    const { db, touched } = untouchedDatabase();
+    await expect(
+      createFencingLeaseStore(db).acquire({ accountRef: "acct-1", environment: "LIVE_MICRO", maximumRunMode: "PAPER", allowRealOrders: false, holderId: "t", ttlMs: 30_000 }),
+    ).rejects.toBeInstanceOf(FencingRunModeNotPermittedError);
+    await expect(
+      createFencingLeaseStore(db).acquire({ accountRef: "acct-1", environment: "LIVE", maximumRunMode: "LIVE_MICRO", allowRealOrders: true, holderId: "t", ttlMs: 30_000 }),
+    ).rejects.toBeInstanceOf(FencingRunModeNotPermittedError);
+    expect(touched).toEqual([]);
+  });
+
   it("the repository's own defaults (MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false) refuse a LIVE_MICRO controller too", () => {
     const time = new ManualTime();
     expect(() =>
@@ -116,7 +151,7 @@ describe("a PAPER process tries to acquire the live fence", () => {
   it("the in-memory store keeps the database's CHECK: a simulated mode is refused there too", async () => {
     const clock = new ManualClock();
     const store = new MemoryFencingStore(() => clock.now);
-    await expect(store.acquire({ accountRef: "acct-1", environment: "PAPER", holderId: "paper-1", ttlMs: 30_000 })).rejects.toBeInstanceOf(NonRealModeFencingLeaseError);
+    await expect(store.acquire({ accountRef: "acct-1", environment: "PAPER", maximumRunMode: "LIVE", allowRealOrders: true, holderId: "paper-1", ttlMs: 30_000 })).rejects.toBeInstanceOf(NonRealModeFencingLeaseError);
     expect(store.rows).toEqual([]);
     expect(new FakeKillSwitchReader().reads).toBe(0);
   });

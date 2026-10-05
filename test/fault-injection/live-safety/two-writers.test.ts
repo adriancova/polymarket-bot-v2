@@ -3,8 +3,10 @@
  * "Two live writers cannot both hold authority" (§2, §6 invariant 16;
  * ADR-008 §1–§2, §5: no order-submitting hot standby). Two full processes
  * (each its own OMS, coordinator, controller and composition) share one
- * fencing store and one time line. The race against a REAL PostgreSQL is
- * `test/integration/postgres/fencing-race.test.ts`.
+ * fencing store and one time line. A successor waits out the incumbent's
+ * whole lease on its own clock, from its first sight of the ended lease,
+ * whether the incumbent died or was REVOKED (r1, I1). The race against a REAL
+ * PostgreSQL is `test/integration/postgres/fencing-race.test.ts`.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -13,7 +15,7 @@ import { MemoryFencingStore } from "../../../apps/trader/src/live-safety/fakes.t
 import { ManualTime } from "../../../packages/polymarket-secure/src/heartbeat/fakes.test-support.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
 
-import { liveProcess } from "./support/live-process.js";
+import { liveProcess, REDUCE } from "./support/live-process.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -25,30 +27,41 @@ afterEach(() => {
   expect(refused).toEqual([]);
 });
 
-describe("two live writers cannot both hold authority", () => {
-  it("a standby never heartbeats or submits while the holder lives; it takes over only after the holder's lease expires; never both", async () => {
-    const time = new ManualTime();
-    const store = new MemoryFencingStore(() => time.now);
-    const a = await liveProcess({ time, store, holderId: "trader-a" });
-    const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false });
-    expect((await b.safety.acquireFence()).kind).toBe("HELD_ELSEWHERE");
+type Live = Awaited<ReturnType<typeof liveProcess>>;
 
-    let bothPermitted = 0;
-    let bothHeld = 0;
-    const tick = async (ms: number): Promise<void> => {
+/** Two processes stepped together; every 250 ms both gates and both fences are asked. */
+function lockstep(a: Live, b: Live, store: MemoryFencingStore): { tick(ms: number): Promise<void>; bothPermitted(): number; bothHeld(): number } {
+  let bothPermitted = 0;
+  let bothHeld = 0;
+  return {
+    async tick(ms: number): Promise<void> {
       for (let elapsed = 0; elapsed < ms; elapsed += 250) {
         await a.step(125);
         await b.step(125);
         const gateA = a.safety.heartbeatGate.evaluate().permitted;
         const gateB = b.safety.heartbeatGate.evaluate().permitted;
-        const sendA = a.safety.gate({ kind: "TRANSMISSION" }).permitted;
-        const sendB = b.safety.gate({ kind: "TRANSMISSION" }).permitted;
+        const sendA = a.safety.gate(REDUCE).permitted;
+        const sendB = b.safety.gate(REDUCE).permitted;
         if ((gateA && gateB) || (sendA && sendB)) bothPermitted += 1;
         // The fence ALONE (not the health lease, which a dead process also fails): never held by both at once.
         if (a.safety.currentFence() !== null && b.safety.currentFence() !== null) bothHeld += 1;
         expect(store.activeHolders("acct-1").length).toBeLessThanOrEqual(1);
       }
-    };
+    },
+    bothPermitted: () => bothPermitted,
+    bothHeld: () => bothHeld,
+  };
+}
+
+describe("two live writers cannot both hold authority", () => {
+  it("a standby never heartbeats or submits while the holder lives; it takes over only after waiting out the holder's whole lease; never both", async () => {
+    const time = new ManualTime();
+    const store = new MemoryFencingStore(() => time.now);
+    const a = await liveProcess({ time, store, holderId: "trader-a" });
+    const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false });
+    expect((await b.safety.acquireFence()).kind).toBe("HELD_ELSEWHERE");
+    const pairOf = lockstep(a, b, store);
+    const tick = pairOf.tick;
 
     // While A lives: B retries the fence every 5 s and never gets it; B's transport sees nothing.
     for (let round = 0; round < 6; round += 1) {
@@ -57,7 +70,7 @@ describe("two live writers cannot both hold authority", () => {
     }
     expect(a.transport.requests.length).toBeGreaterThan(5);
     expect(b.transport.requests).toEqual([]);
-    expect(b.safety.gate({ kind: "TRANSMISSION" }).reasons).toContain("FENCE_NOT_ACQUIRED");
+    expect(b.safety.gate(REDUCE).reasons).toContain("FENCE_NOT_ACQUIRED");
 
     // A dies: its refreshers and heartbeat stop (no renewal, no release).
     a.safety.stop();
@@ -65,7 +78,7 @@ describe("two live writers cannot both hold authority", () => {
     const aFence = a.safety.currentFence();
     const aSends = a.transport.requests.length;
     let takeover: string | null = null;
-    for (let round = 0; round < 10 && takeover === null; round += 1) {
+    for (let round = 0; round < 20 && takeover === null; round += 1) {
       await tick(5_000);
       const result = await b.safety.acquireFence();
       if (result.kind === "ACQUIRED") takeover = result.fence.fencingToken;
@@ -82,7 +95,37 @@ describe("two live writers cannot both hold authority", () => {
     // A's fence is refused by the database (migration 0008) from the takeover on.
     expect(store.attemptAccepted(aFence)).toBe(false);
     expect(store.attemptAccepted(b.safety.currentFence())).toBe(true);
-    expect(bothPermitted).toBe(0);
-    expect(bothHeld).toBe(0);
+    expect(pairOf.bothPermitted()).toBe(0);
+    expect(pairOf.bothHeld()).toBe(0);
+  });
+
+  it("r1 I1: an operator REVOKES the live holder; the standby asking at once is NOT granted; the holder stops at its next renewal; the standby takes over a whole lease after its first sight; never both, and the revoked holder sends nothing after its loss", async () => {
+    const time = new ManualTime();
+    const store = new MemoryFencingStore(() => time.now);
+    const a = await liveProcess({ time, store, holderId: "trader-a" });
+    const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false });
+    const pairOf = lockstep(a, b, store);
+    await pairOf.tick(6_000);
+    const aFence = a.safety.currentFence();
+    if (aFence === null) throw new Error("A holds no fence");
+    expect(store.revoke(aFence.fencingLeaseId, "operator: suspected second writer")).toBe(true);
+    // The standby asks immediately: on the candidate it was granted here, with A still held.
+    const asked = await b.safety.acquireFence();
+    expect(asked).toMatchObject({ kind: "LAPSED_WAITING", status: "REVOKED" });
+    const firstSight = time.now;
+    let takeoverAt: number | null = null;
+    for (let round = 0; round < 80 && takeoverAt === null; round += 1) {
+      await pairOf.tick(500);
+      if ((await b.safety.acquireFence()).kind === "ACQUIRED") takeoverAt = time.now;
+    }
+    expect(takeoverAt).not.toBeNull();
+    expect((takeoverAt ?? 0) - firstSight).toBeGreaterThanOrEqual(32_000);
+    expect(a.journal.of("FENCE_LOST").map((entry) => entry.reason)).toEqual(["RENEW_LOST"]);
+    const aLastSend = a.transport.requests.at(-1)?.atMs ?? 0;
+    await pairOf.tick(15_000);
+    expect(b.transport.requests.length).toBeGreaterThan(0);
+    expect(b.transport.requests[0]?.atMs ?? 0).toBeGreaterThan(aLastSend);
+    expect(pairOf.bothPermitted()).toBe(0);
+    expect(pairOf.bothHeld()).toBe(0);
   });
 });

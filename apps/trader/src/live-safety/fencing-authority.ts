@@ -37,17 +37,47 @@
  *   passes. A renewal that the database applied but whose answer was lost
  *   leaves the database's lease LONGER than the local one: the safe direction.
  *
- * ## Paper mode cannot acquire live fencing
+ * ## A takeover waits out the incumbent on THIS process's clock (r1, I1)
  *
- * {@link FencingAuthority.create} refuses every run mode that does not submit
- * real orders (`RUN_MODE_REQUIRES_LIVE_SIGNER`: BACKTEST, PAPER, SHADOW) and
- * every value that is not a §11 run mode, before it touches the store. The
- * store refuses them again before any SQL, and the database's
- * `fencing_leases_real_modes_only` CHECK a third time (ADR-008 §2; ADR-010).
+ * The store answers `LAPSED` while the realm's latest lease has ended
+ * (expired by the database's clock, revoked, released) and grants a new
+ * lease only to a caller presenting that lease's exact VERSION back. This
+ * class presents it only after it has seen the SAME version, unchanged, for
+ * {@link FencingAuthority.takeoverWaitMs} = `ttl + safetyMargin` on its own
+ * monotonic clock, timed from the END of the call that first returned it (the
+ * version was committed before then). Why that suffices, whatever the
+ * database's clock did and whether or not the old holder was revoked: the
+ * old holder acts only until ITS local deadline, its last successful
+ * renewal's call start + ttl − safetyMargin; that renewal committed the
+ * version before this process saw it; so a whole lease plus the margin
+ * later, by a clock that runs at the same rate to within the margin (the
+ * assumption the local deadline already makes), the old holder's deadline
+ * has passed, and with it every transmission it started with its transmit
+ * margin left. A version that changes meanwhile restarts the wait. What it
+ * does NOT cover (disclosed residuals): a process paused longer than the
+ * transmit margin between its check and its send, and a clock whose rate
+ * drifts by more than the margin over one lease.
+ *
+ * ## Paper mode cannot acquire live fencing; nor can a process above its ceiling
+ *
+ * {@link FencingAuthority.create} reads the process's RUN-MODE CONTEXT
+ * (`runMode`, `maximumRunMode`, `allowRealOrders`: exactly three own data
+ * properties of a plain object, the context `assertSignerGate` reads) FIRST,
+ * and refuses unless all three conditions of ADR-010 §1 hold at once: the run
+ * mode submits real orders (`RUN_MODE_REQUIRES_LIVE_SIGNER`: not BACKTEST,
+ * PAPER or SHADOW, and nothing that is not a §11 run mode), it does not
+ * exceed `maximumRunMode`, and `allowRealOrders` is the boolean `true`. Under
+ * the repository's defaults (`MAX_RUN_MODE=PAPER`, `ALLOW_REAL_ORDERS=false`)
+ * nothing passes, so no fence is acquired (r1, I8). The store refuses the
+ * same three again before any SQL, and the database's
+ * `fencing_leases_real_modes_only` CHECK refuses a simulated mode a third
+ * time (ADR-008 §2; ADR-010). As with the signer gate, the context is the
+ * composition root's to make true: a root that lies about its own ceiling is
+ * not detectable here.
  */
 
-import { RUN_MODE_REQUIRES_LIVE_SIGNER, RUN_MODES, type RunMode } from "@polymarket-bot/domain";
-import type { FencingAcquireOutcome, FencingLeaseRef, FencingRenewOutcome, FencingGrant } from "@polymarket-bot/storage-postgres";
+import { RUN_MODE_REQUIRES_LIVE_SIGNER, RUN_MODES, runModeExceeds, type RunMode } from "@polymarket-bot/domain";
+import type { FencingAcquireOutcome, FencingIncumbent, FencingLeaseRef, FencingRenewOutcome, FencingGrant, FencingTakeover } from "@polymarket-bot/storage-postgres";
 
 import type { MonotonicClock } from "./ports.js";
 
@@ -56,10 +86,13 @@ export interface FencingLeasePort {
   acquire(input: {
     readonly accountRef: string;
     readonly environment: string;
+    readonly maximumRunMode: string;
+    readonly allowRealOrders: boolean;
     readonly holderId: string;
     readonly holderHostname?: string | null;
     readonly holderPid?: number | null;
     readonly ttlMs: number;
+    readonly takeover?: FencingTakeover | null;
   }): Promise<FencingAcquireOutcome>;
   renew(lease: FencingLeaseRef, ttlMs: number): Promise<FencingRenewOutcome>;
   release(lease: FencingLeaseRef, reason: string): Promise<boolean>;
@@ -81,6 +114,8 @@ export type FenceCheck =
 export type AcquireResult =
   | { readonly kind: "ACQUIRED"; readonly fence: Fence; readonly inheritedHeartbeatId: string | null }
   | { readonly kind: "HELD_ELSEWHERE"; readonly holderId: string; readonly expiresAt: string }
+  /** The incumbent has ended; this process is waiting it out (module header). Ask again after `remainingMs`. */
+  | { readonly kind: "LAPSED_WAITING"; readonly holderId: string; readonly status: string; readonly remainingMs: number }
   | { readonly kind: "CONTENDED" }
   | { readonly kind: "ALREADY_HELD" }
   | { readonly kind: "STORE_FAILED" };
@@ -88,17 +123,107 @@ export type AcquireResult =
 /** `IN_PROGRESS`: another renewal of this grant is still outstanding (renewals are serialized); nothing was asked. */
 export type RenewResult = "RENEWED" | "LOST" | "UNKNOWN" | "NOT_HELD" | "IN_PROGRESS";
 
-/** A run mode that may never hold the live fence. A fixed message; the refused value is named only if it is a §11 mode. */
+/** Why a run-mode context may not hold the live fence (the `assertSignerGate` vocabulary). */
+export type LiveFencingRefusalReason =
+  | "CONTEXT_UNREADABLE"
+  | "RUN_MODE_UNKNOWN"
+  | "RUN_MODE_REQUIRES_NO_SIGNER"
+  | "MAXIMUM_RUN_MODE_UNKNOWN"
+  | "RUN_MODE_ABOVE_MAXIMUM"
+  | "REAL_ORDERS_NOT_ALLOWED";
+
+/** A run-mode context that may never hold the live fence. A fixed message; the refused value is named only if it is a §11 mode. */
 export class LiveFencingRefusal extends Error {
   override readonly name = "LiveFencingRefusal";
   readonly runMode: string;
+  readonly reasons: readonly LiveFencingRefusalReason[];
 
-  constructor(runMode: unknown) {
+  constructor(runMode: unknown, reasons: readonly LiveFencingRefusalReason[]) {
     const named = RUN_MODES.find((candidate) => candidate === runMode) ?? "(not a run mode)";
-    super(`run mode ${named} cannot acquire live fencing (ADR-008 §2; ADR-010)`);
+    super(`run mode ${named} cannot acquire live fencing: ${reasons.join(", ")} (ADR-008 §2; ADR-010)`);
     this.runMode = named;
+    this.reasons = Object.freeze([...reasons]);
     Object.freeze(this);
   }
+}
+
+/**
+ * The process's run-mode context, as its composition root establishes it (`RUN_MODE`, `MAX_RUN_MODE`,
+ * `ALLOW_REAL_ORDERS`): the same three fields `assertSignerGate` reads.
+ */
+export interface RunModeContext {
+  readonly runMode: string;
+  readonly maximumRunMode: string;
+  readonly allowRealOrders: boolean;
+}
+
+/** A context {@link evaluateLiveFencingContext} permitted. */
+export interface PermittedRunModeContext {
+  readonly runMode: RunMode;
+  readonly maximumRunMode: RunMode;
+  readonly allowRealOrders: true;
+}
+
+const CONTEXT_KEYS = ["allowRealOrders", "maximumRunMode", "runMode"] as const;
+
+function isRunMode(value: unknown): value is RunMode {
+  return typeof value === "string" && (RUN_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * ADR-010 §1, as the signer gate applies it: permitted only when the run mode requires a live signer, does not exceed
+ * `maximumRunMode` (a §11 run mode), and `allowRealOrders` is the boolean `true`. The context is read as EXACTLY three
+ * own data properties of a plain object, each read once and copied; anything else — a getter, an extra or inherited
+ * field, a reflection that throws — is `CONTEXT_UNREADABLE`. Never throws.
+ */
+export function evaluateLiveFencingContext(
+  input: unknown,
+): { readonly permitted: true; readonly context: PermittedRunModeContext } | { readonly permitted: false; readonly runMode: unknown; readonly reasons: readonly LiveFencingRefusalReason[] } {
+  let values: Record<string, unknown> | undefined;
+  try {
+    if (typeof input === "object" && input !== null && !Array.isArray(input)) {
+      const prototype: unknown = Object.getPrototypeOf(input);
+      const keys = Reflect.ownKeys(input);
+      if ((prototype === Object.prototype || prototype === null) && keys.length === CONTEXT_KEYS.length) {
+        const read: Record<string, unknown> = {};
+        let complete = true;
+        for (const key of CONTEXT_KEYS) {
+          const descriptor = Object.getOwnPropertyDescriptor(input, key);
+          if (descriptor === undefined || !("value" in descriptor)) {
+            complete = false;
+            break;
+          }
+          read[key] = descriptor.value;
+        }
+        if (complete) values = read;
+      }
+    }
+  } catch {
+    values = undefined;
+  }
+  if (values === undefined) return Object.freeze({ permitted: false as const, runMode: undefined, reasons: Object.freeze(["CONTEXT_UNREADABLE" as const]) });
+  const { runMode, maximumRunMode, allowRealOrders } = values;
+  const reasons: LiveFencingRefusalReason[] = [];
+  if (!isRunMode(runMode)) reasons.push("RUN_MODE_UNKNOWN");
+  else if (!RUN_MODE_REQUIRES_LIVE_SIGNER[runMode]) reasons.push("RUN_MODE_REQUIRES_NO_SIGNER");
+  if (!isRunMode(maximumRunMode)) reasons.push("MAXIMUM_RUN_MODE_UNKNOWN");
+  else if (isRunMode(runMode) && runModeExceeds(runMode, maximumRunMode)) reasons.push("RUN_MODE_ABOVE_MAXIMUM");
+  if (allowRealOrders !== true) reasons.push("REAL_ORDERS_NOT_ALLOWED");
+  if (reasons.length > 0 || !isRunMode(runMode) || !isRunMode(maximumRunMode) || allowRealOrders !== true) {
+    return Object.freeze({ permitted: false as const, runMode, reasons: Object.freeze(reasons.length > 0 ? reasons : ["CONTEXT_UNREADABLE" as const]) });
+  }
+  return Object.freeze({ permitted: true as const, context: Object.freeze({ runMode, maximumRunMode, allowRealOrders: true as const }) });
+}
+
+/**
+ * Throwing form of {@link evaluateLiveFencingContext}.
+ *
+ * @throws {LiveFencingRefusal} with every applicable reason.
+ */
+export function assertLiveFencingContext(input: unknown): PermittedRunModeContext {
+  const verdict = evaluateLiveFencingContext(input);
+  if (!verdict.permitted) throw new LiveFencingRefusal(verdict.runMode, verdict.reasons);
+  return verdict.context;
 }
 
 /** An option this class refuses. */
@@ -117,8 +242,8 @@ export function isLiveRunMode(value: unknown): value is RunMode {
 }
 
 export interface FencingAuthorityOptions {
-  /** The process's run mode. Checked FIRST: a simulated mode is refused before anything else is read. */
-  readonly runMode: string;
+  /** The process's run-mode context. Checked FIRST: a simulated mode, or one above the ceiling, is refused before anything else is read. */
+  readonly runModeContext: RunModeContext;
   readonly accountRef: string;
   readonly holderId: string;
   readonly holderHostname?: string | null;
@@ -138,9 +263,17 @@ function positiveInteger(value: unknown, field: string): number {
   return value;
 }
 
+/** An ended incumbent this process is waiting out, and when it was first seen (monotonic, after the call). */
+interface Observation {
+  readonly incumbent: FencingIncumbent;
+  readonly firstSeenAtMs: number;
+}
+
 export class FencingAuthority {
   readonly #options: FencingAuthorityOptions;
+  readonly #context: PermittedRunModeContext;
   #grant: FencingGrant | null = null;
+  #observed: Observation | null = null;
   /** The local deadline (monotonic), or `null` with no grant. */
   #deadline: number | null = null;
   #lost: FenceLossReason | null = null;
@@ -148,27 +281,36 @@ export class FencingAuthority {
   #renewing = false;
   #acquiring = false;
 
-  private constructor(options: FencingAuthorityOptions) {
+  private constructor(options: FencingAuthorityOptions, context: PermittedRunModeContext) {
     this.#options = options;
+    this.#context = context;
   }
 
   /**
-   * @throws {LiveFencingRefusal} for a run mode that does not submit real orders, before anything else is read.
+   * @throws {LiveFencingRefusal} for a run-mode context that may not submit real orders, before anything else is read.
    * @throws {FencingAuthorityConfigurationError} for margins that leave no usable lease.
    */
   static create(options: FencingAuthorityOptions): FencingAuthority {
-    const runMode: unknown = typeof options === "object" && options !== null ? options.runMode : undefined;
-    if (!isLiveRunMode(runMode)) throw new LiveFencingRefusal(runMode);
+    const context = assertLiveFencingContext(typeof options === "object" && options !== null ? options.runModeContext : undefined);
     const ttl = positiveInteger(options.ttlMs, "ttlMs");
     const safety = positiveInteger(options.safetyMarginMs, "safetyMarginMs");
     const transmit = positiveInteger(options.transmitMarginMs, "transmitMarginMs");
     if (safety + transmit >= ttl) throw new FencingAuthorityConfigurationError("margins");
     if (typeof options.store !== "object" || options.store === null) throw new FencingAuthorityConfigurationError("store");
     if (typeof options.clock !== "object" || options.clock === null) throw new FencingAuthorityConfigurationError("clock");
-    return new FencingAuthority(Object.freeze({ ...options }));
+    return new FencingAuthority(Object.freeze({ ...options }), context);
   }
 
-  /** Acquire the fence: a new grant with a new token. Refused while this process already holds one. */
+  /** How long an ended incumbent's version must stay unchanged, on this clock, before a takeover is presented. */
+  get takeoverWaitMs(): number {
+    return this.#options.ttlMs + this.#options.safetyMarginMs;
+  }
+
+  /**
+   * Acquire the fence: a new grant with a new token. Refused while this process already holds one. Over an ended
+   * incumbent, `LAPSED_WAITING` until its version has stayed unchanged for {@link FencingAuthority.takeoverWaitMs}
+   * on this clock; the composition asks again (module header).
+   */
   async acquire(): Promise<AcquireResult> {
     if (this.#acquiring) return Object.freeze({ kind: "CONTENDED" as const });
     if (this.check().held) return Object.freeze({ kind: "ALREADY_HELD" as const });
@@ -182,22 +324,63 @@ export class FencingAuthority {
         await this.#releaseQuietly(previous, "superseded by a new acquisition of the same process");
       }
       const before = this.#now();
-      if (before === null) return Object.freeze({ kind: "STORE_FAILED" as const });
+      if (before === null) {
+        this.#observed = null;
+        return Object.freeze({ kind: "STORE_FAILED" as const });
+      }
+      const observed = this.#observed;
+      const waitedOut = observed !== null && before - observed.firstSeenAtMs >= this.takeoverWaitMs;
+      const takeover: FencingTakeover | null =
+        waitedOut && observed !== null
+          ? { fencingLeaseId: observed.incumbent.fencingLeaseId, fencingToken: observed.incumbent.fencingToken, version: observed.incumbent.version }
+          : null;
       let outcome: FencingAcquireOutcome;
       try {
         outcome = await this.#options.store.acquire({
           accountRef: this.#options.accountRef,
-          environment: this.#options.runMode,
+          environment: this.#context.runMode,
+          maximumRunMode: this.#context.maximumRunMode,
+          allowRealOrders: this.#context.allowRealOrders,
           holderId: this.#options.holderId,
           holderHostname: this.#options.holderHostname ?? null,
           holderPid: this.#options.holderPid ?? null,
           ttlMs: this.#options.ttlMs,
+          takeover,
         });
       } catch {
         return Object.freeze({ kind: "STORE_FAILED" as const });
       }
-      if (outcome.kind === "HELD") return Object.freeze({ kind: "HELD_ELSEWHERE" as const, holderId: outcome.holderId, expiresAt: outcome.expiresAt });
-      if (outcome.kind === "CONTENDED") return Object.freeze({ kind: "CONTENDED" as const });
+      if (outcome.kind === "HELD") {
+        this.#observed = null;
+        return Object.freeze({ kind: "HELD_ELSEWHERE" as const, holderId: outcome.holderId, expiresAt: outcome.expiresAt });
+      }
+      if (outcome.kind === "CONTENDED") {
+        this.#observed = null;
+        return Object.freeze({ kind: "CONTENDED" as const });
+      }
+      if (outcome.kind === "LAPSED") {
+        // First sight of this version is timed AFTER the call: the version was committed before it returned.
+        const after = this.#now();
+        const incumbent = outcome.incumbent;
+        if (after === null) {
+          this.#observed = null;
+          return Object.freeze({ kind: "STORE_FAILED" as const });
+        }
+        const same =
+          observed !== null &&
+          observed.incumbent.fencingLeaseId === incumbent.fencingLeaseId &&
+          observed.incumbent.fencingToken === incumbent.fencingToken &&
+          observed.incumbent.version === incumbent.version;
+        const current: Observation = same ? observed : { incumbent, firstSeenAtMs: after };
+        this.#observed = current;
+        return Object.freeze({
+          kind: "LAPSED_WAITING" as const,
+          holderId: incumbent.holderId,
+          status: incumbent.status,
+          remainingMs: Math.max(0, current.firstSeenAtMs + this.takeoverWaitMs - after),
+        });
+      }
+      this.#observed = null;
       this.#grant = outcome.grant;
       this.#deadline = before + this.#options.ttlMs - this.#options.safetyMarginMs;
       this.#lost = null;

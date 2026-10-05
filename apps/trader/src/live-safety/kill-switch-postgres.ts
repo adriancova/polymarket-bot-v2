@@ -11,13 +11,21 @@
  * latest row for it is a release, so a clock that steps backwards on either
  * side can make a released switch read as engaged, never the reverse.
  *
- * Read-only: it selects from one append-only table and writes nothing. The
+ * Each row also carries `voided`: whether a control-plane VOID record in
+ * `ops.config_change_audit` (target `ops.kill_switch_events`) names it in
+ * `new_value ->> 'voidsRecordId'` (r1, I6: a release whose append outlived
+ * the control plane's bound was refused and not applied, though its row
+ * landed). Compared case-insensitively: a voided row can only be missed by
+ * NOT matching, which would honour a refused release.
+ *
+ * Read-only: it selects from two append-only tables and writes nothing. The
  * composition binds it to a connection whose role needs `SELECT` on
- * `ops.kill_switch_events` only. Like every adapter in this app written
- * without a database, its SQL is pinned by the typechecker against
- * `@polymarket-bot/storage-postgres`'s table types; an integration test of it
- * against PostgreSQL is a follow-up (this package's integration grant covers
- * the fencing race only).
+ * `ops.kill_switch_events` and `ops.config_change_audit` only. Its SQL is
+ * pinned by the typechecker against `@polymarket-bot/storage-postgres`'s table
+ * types and compiled in `kill-switch-postgres.test.ts`, which also runs
+ * `read()` over a recording handle (both orderings, in order); it runs against
+ * a real PostgreSQL in
+ * `test/fault-injection/live-safety/postgres/kill-switch-reader.pg.test.ts`.
  */
 
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
@@ -31,6 +39,7 @@ interface SelectedRow {
   readonly scope_ref: string | null;
   readonly action: string;
   readonly resulting_state: unknown;
+  readonly voided: unknown;
 }
 
 function toRow(row: SelectedRow): KillSwitchRow {
@@ -41,32 +50,53 @@ function toRow(row: SelectedRow): KillSwitchRow {
     scopeRef: row.scope_ref,
     action: row.action,
     resultingState: row.resulting_state,
+    // Anything but the boolean `false` is voided (fail closed: the fold honours only `voided === false`).
+    voided: row.voided !== false,
   });
+}
+
+/** Whether a VOID record names the row `e` (module header), as a selection of the latest-row queries. */
+function voidedSelection(db: PolymarketBotDatabase) {
+  return db
+    .selectFrom("ops.kill_switch_events as e")
+    .select((eb) =>
+      eb
+        .exists(
+          eb
+            .selectFrom("ops.config_change_audit as v")
+            .select(eb.lit(1).as("one"))
+            .where("v.target_schema", "=", "ops")
+            .where("v.target_table", "=", "kill_switch_events")
+            .where((w) =>
+              w(w.fn<string>("lower", [w.fn<string>("jsonb_extract_path_text", [w.ref("v.new_value"), w.val("voidsRecordId")])]), "=", w.cast<string>("e.kill_switch_event_id", "text")),
+            ),
+        )
+        .as("voided"),
+    );
 }
 
 /** The two queries, built (not run): the latest row per `(environment, scope, scope_ref)` by each ordering. */
 export function killSwitchLatestRowQueries(db: PolymarketBotDatabase) {
-  const byRecorded = db
-    .selectFrom("ops.kill_switch_events")
-    .select(["kill_switch_event_id", "environment", "scope", "scope_ref", "action", "resulting_state"])
-    .distinctOn(["environment", "scope", "scope_ref"])
-    .orderBy("environment")
-    .orderBy("scope")
-    .orderBy("scope_ref")
-    .orderBy("recorded_at", "desc")
-    .orderBy("kill_switch_event_id", "desc");
-  const byOccurred = db
-    .selectFrom("ops.kill_switch_events")
-    .select(["kill_switch_event_id", "environment", "scope", "scope_ref", "action", "resulting_state"])
-    .distinctOn(["environment", "scope", "scope_ref"])
-    .orderBy("environment")
-    .orderBy("scope")
-    .orderBy("scope_ref")
-    .orderBy("occurred_at", "desc")
-    .orderBy("kill_switch_event_id", "desc");
+  const byRecorded = voidedSelection(db)
+    .select(["e.kill_switch_event_id", "e.environment", "e.scope", "e.scope_ref", "e.action", "e.resulting_state"])
+    .distinctOn(["e.environment", "e.scope", "e.scope_ref"])
+    .orderBy("e.environment")
+    .orderBy("e.scope")
+    .orderBy("e.scope_ref")
+    .orderBy("e.recorded_at", "desc")
+    .orderBy("e.kill_switch_event_id", "desc");
+  const byOccurred = voidedSelection(db)
+    .select(["e.kill_switch_event_id", "e.environment", "e.scope", "e.scope_ref", "e.action", "e.resulting_state"])
+    .distinctOn(["e.environment", "e.scope", "e.scope_ref"])
+    .orderBy("e.environment")
+    .orderBy("e.scope")
+    .orderBy("e.scope_ref")
+    .orderBy("e.occurred_at", "desc")
+    .orderBy("e.kill_switch_event_id", "desc");
   return { byRecorded, byOccurred };
 }
 
+/** Both orderings' latest rows, the `recorded_at` ordering first (the fold needs every one; I7). */
 export function createPostgresKillSwitchReader(db: PolymarketBotDatabase): KillSwitchReader {
   return Object.freeze({
     async read(): Promise<readonly KillSwitchRow[]> {

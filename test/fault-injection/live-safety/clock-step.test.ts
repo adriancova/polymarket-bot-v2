@@ -9,8 +9,11 @@
  *    which voids every age — the heartbeat is lapsed and the fence is lost;
  * 3. the DATABASE clock steps forward past the safety margin: the database's
  *    lease ends early; the next renewal finds it lost (within one renewal
- *    interval), a new holder may take over, and the old one's submission is
- *    refused by the database.
+ *    interval), and the old one's submission is refused by the database. A
+ *    successor that asks in the window BEFORE that renewal — while the old
+ *    holder's local deadline still holds — is NOT granted: it waits out a whole
+ *    lease on its own clock from its first sight (r1, I1), so the two never
+ *    both hold, and the database's clock decides nothing about the takeover.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -19,7 +22,7 @@ import { MemoryFencingStore } from "../../../apps/trader/src/live-safety/fakes.t
 import { ManualTime } from "../../../packages/polymarket-secure/src/heartbeat/fakes.test-support.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
 
-import { liveProcess } from "./support/live-process.js";
+import { liveProcess, REDUCE } from "./support/live-process.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -58,11 +61,11 @@ describe("the clock steps", () => {
     await live.step(20_000);
     // The fence is gone, so the gate refuses every heartbeat from here: nothing is sent.
     expect(live.transport.requests.length - sends).toBeLessThanOrEqual(0);
-    expect(live.safety.gate({ kind: "TRANSMISSION" }).reasons).toContain("FENCE_CLOCK_FAULT");
+    expect(live.safety.gate(REDUCE).reasons).toContain("FENCE_CLOCK_FAULT");
     expect(live.entryReasons()).toContain("HEARTBEAT_RECOVERY_PENDING");
   });
 
-  it("a database clock that steps forward past the margin ends the lease early: the holder loses it at its next renewal; a takeover is fenced from the old holder", async () => {
+  it("a database clock that steps forward past the margin ends the lease early: the holder loses it at its next renewal; a later takeover is fenced from the old holder", async () => {
     const time = new ManualTime();
     let dbSkew = 0;
     const store = new MemoryFencingStore(() => time.now + dbSkew);
@@ -79,12 +82,45 @@ describe("the clock steps", () => {
     const sends = a.transport.requests.length;
     await a.step(10_000);
     expect(a.transport.requests.length - sends).toBeLessThanOrEqual(1);
-    // Another process takes the fence with a higher token; A's submissions stay refused.
-    const b = await liveProcess({ time, store, holderId: "trader-b" });
+    // Another process takes the fence with a higher token, after waiting the lease out; A's submissions stay refused.
+    const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false });
+    let acquired = false;
+    for (let round = 0; round < 20 && !acquired; round += 1) {
+      acquired = (await b.safety.acquireFence()).kind === "ACQUIRED";
+      if (!acquired) await b.step(2_000);
+    }
+    expect(acquired).toBe(true);
     const bFence = b.safety.currentFence();
     expect(BigInt(bFence?.fencingToken ?? "0")).toBeGreaterThan(BigInt(aFence?.fencingToken ?? "0"));
     expect(store.attemptAccepted(aFence)).toBe(false);
     expect(store.attemptAccepted(bFence)).toBe(true);
-    expect(a.safety.gate({ kind: "TRANSMISSION" }).permitted).toBe(false);
+    expect(a.safety.gate(REDUCE).permitted).toBe(false);
+  });
+
+  it("r1 I1: a successor that asks in the window the database clock step opened — BEFORE the old holder's next renewal — is not granted; the two never both hold or both may send", async () => {
+    const time = new ManualTime();
+    let dbSkew = 0;
+    const store = new MemoryFencingStore(() => time.now + dbSkew);
+    const a = await liveProcess({ time, store, holderId: "trader-a" });
+    const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false });
+    await a.step(6_000);
+    expect(a.safety.status().fence.held).toBe(true);
+    dbSkew = 40_000;
+    // On the candidate, B was granted here while A's local fence still held (both gates permitted).
+    expect((await b.safety.acquireFence()).kind).toBe("LAPSED_WAITING");
+    expect(a.safety.status().fence.held).toBe(true);
+    let both = 0;
+    let acquired = false;
+    for (let round = 0; round < 160 && !acquired; round += 1) {
+      await a.step(125);
+      await b.step(125);
+      if (a.safety.currentFence() !== null && b.safety.currentFence() !== null) both += 1;
+      if (a.safety.heartbeatGate.evaluate().permitted && b.safety.heartbeatGate.evaluate().permitted) both += 1;
+      if (a.safety.gate(REDUCE).permitted && b.safety.gate(REDUCE).permitted) both += 1;
+      if (round % 4 === 0) acquired = (await b.safety.acquireFence()).kind === "ACQUIRED";
+    }
+    expect(acquired).toBe(true);
+    expect(both).toBe(0);
+    expect(a.safety.status().fence).toMatchObject({ held: false, reason: "RENEW_LOST" });
   });
 });

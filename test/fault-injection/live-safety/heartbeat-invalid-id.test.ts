@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { invalidId } from "../../../packages/polymarket-secure/src/heartbeat/fakes.test-support.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
 
-import { liveProcess, submitOne } from "./support/live-process.js";
+import { liveProcess, REDUCE, submitOne } from "./support/live-process.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -59,7 +59,7 @@ describe("the heartbeat answers invalid or expired id (§16.6)", () => {
     expect(live.transport.requests).toHaveLength(sends);
     expect(live.journal.of("LAPSE_STARTED").at(-1)?.gateReasons).toContain("STOPPED_LIVE_FENCING_CONFLICT");
     expect(live.alerts.pages.map((page) => page.page)).toContain("HEARTBEAT_HEALTH_LEASE_FAILED_WHILE_ORDERS_MAY_EXIST");
-    expect(live.safety.gate({ kind: "TRANSMISSION" }).reasons).toContain("STOPPED_LIVE_FENCING_CONFLICT");
+    expect(live.safety.gate(REDUCE).reasons).toContain("STOPPED_LIVE_FENCING_CONFLICT");
 
     // The operator has looked; the venue answers normally again.
     live.transport.fallback = (_request, index) => ({ answer: { kind: "RESPONSE", httpStatus: 200, body: { heartbeat_id: `id-${String(index)}` } } });

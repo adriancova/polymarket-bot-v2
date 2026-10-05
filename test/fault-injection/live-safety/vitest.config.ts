@@ -12,7 +12,9 @@
  * `test/unit`.
  *
  * Nothing here reaches a network, a database, a key or a venue: every port
- * is a fake, and the network tripwire guards every file.
+ * is a fake, and the network tripwire guards every file. The REAL-PostgreSQL
+ * half (`postgres/`, Docker) is excluded here and has its own config
+ * (`postgres/vitest.config.ts`).
  */
 
 import { dirname, resolve } from "node:path";
@@ -28,7 +30,7 @@ export default defineConfig({
   test: {
     root: here,
     include: ["**/*.test.ts"],
-    exclude: ["**/node_modules/**"],
+    exclude: ["**/node_modules/**", "postgres/**"],
     passWithNoTests: false,
   },
 });

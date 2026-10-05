@@ -121,8 +121,11 @@ export interface LapseRecoveryOptions {
   readonly notRunPollMs: number;
   /** The wait after a qualifying run that does not pass and resume. */
   readonly failedRunSpacingMs: number;
-  /** Every report this class's own calls receive (the composition proves the RECONCILER health input from them). */
-  readonly onReport?: (report: { readonly runs: readonly { readonly status: string; readonly resumed: boolean }[] }) => void;
+  /**
+   * Every report this class's own calls receive, with the monotonic instant read just before the call (the
+   * composition proves the RECONCILER health input from a passing one, at that instant).
+   */
+  readonly onReport?: (report: { readonly runs: readonly { readonly status: string; readonly resumed: boolean }[] }, calledAtMs: number) => void;
   /**
    * The heartbeat gate's refusal reasons AT THIS MOMENT (empty when it permits). A lapse is recorded with them as
    * well as with the controller's cause: the deadline can fall before the next tick asks the gate, and a failed
@@ -239,7 +242,7 @@ export class LapseRecovery {
       const runs = report === null ? [] : [...report.runs];
       if (report !== null) {
         try {
-          this.#options.onReport?.(report);
+          this.#options.onReport?.(report, calledAtMs);
         } catch {
           // The listener's failure is not the recovery's.
         }

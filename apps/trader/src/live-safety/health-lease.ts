@@ -172,29 +172,72 @@ export class HealthLease {
  * evaluation, so a proof recorded once and never again fails the lease once
  * it is older than the input's bound. An input never recorded reads
  * `NO_PROOF`.
+ *
+ * Evidence is ordered by WHEN IT WAS OBSERVED (r1, I9). A failure is stamped
+ * with the board's clock when it is recorded; a proof carries its own
+ * observation instant. A proof replaces the entry only if it is NEWER than
+ * the failure there (strictly) or no older than the proof there, so a slow
+ * operation that started before a failure can never erase it when it lands.
+ * A proof dated in the FUTURE of the board's clock is refused and recorded as
+ * the failure `PROOF_IN_FUTURE` (stamped now), so it cannot block the honest
+ * proofs that follow. A failure always replaces the entry.
  */
 export class ProofBoard {
-  readonly #latest = new Map<HealthInput, HealthProofReading>();
+  readonly #clock: MonotonicClock;
+  readonly #latest = new Map<HealthInput, { readonly reading: HealthProofReading; readonly evidenceAtMs: number }>();
+  /** The latest readable clock value: a failure recorded while the clock is unreadable is stamped with it. */
+  #lastNow = Number.NEGATIVE_INFINITY;
+
+  constructor(options: { readonly clock: MonotonicClock }) {
+    if (typeof options !== "object" || options === null || typeof options.clock !== "object" || options.clock === null) {
+      throw new HealthLeaseConfigurationError("board.clock");
+    }
+    this.#clock = options.clock;
+  }
 
   prove(input: HealthInput, atMs: number): void {
     if (!Number.isFinite(atMs)) {
       this.fail(input, "PROOF_TIME_INVALID");
       return;
     }
+    const now = this.#now();
+    if (now === null) {
+      this.fail(input, "CLOCK_UNREADABLE");
+      return;
+    }
+    if (atMs > now) {
+      this.fail(input, "PROOF_IN_FUTURE");
+      return;
+    }
     const current = this.#latest.get(input);
-    // A proof never moves backwards: an older proof arriving late does not replace a newer one.
-    if (current !== undefined && current.healthy && current.provenAtMs > atMs) return;
+    if (current !== undefined) {
+      // A proof never moves backwards, and never erases a failure observed after (or at) its own evidence.
+      if (current.reading.healthy && current.evidenceAtMs > atMs) return;
+      if (!current.reading.healthy && current.evidenceAtMs >= atMs) return;
+    }
     const proof: HealthProofReading = { healthy: true, provenAtMs: atMs };
-    this.#latest.set(input, Object.freeze(proof));
+    this.#latest.set(input, Object.freeze({ reading: Object.freeze(proof), evidenceAtMs: atMs }));
   }
 
   fail(input: HealthInput, reason: string): void {
     const failure: HealthProofReading = { healthy: false, reason: REASON.test(reason) ? reason : "UNHEALTHY" };
-    this.#latest.set(input, Object.freeze(failure));
+    const now = this.#now();
+    this.#latest.set(input, Object.freeze({ reading: Object.freeze(failure), evidenceAtMs: now ?? this.#lastNow }));
   }
 
   source(input: HealthInput): HealthProofSource {
-    return Object.freeze({ read: (): HealthProofReading => this.#latest.get(input) ?? Object.freeze({ healthy: false as const, reason: "NO_PROOF" }) });
+    return Object.freeze({ read: (): HealthProofReading => this.#latest.get(input)?.reading ?? Object.freeze({ healthy: false as const, reason: "NO_PROOF" }) });
+  }
+
+  #now(): number | null {
+    try {
+      const value = this.#clock.monotonicMs();
+      if (typeof value !== "number" || !Number.isFinite(value)) return null;
+      if (value > this.#lastNow) this.#lastNow = value;
+      return value;
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -247,7 +290,12 @@ export class EventLoopProbe {
     try {
       due = this.#clock.monotonicMs() + this.#intervalMs;
     } catch {
+      // r1, I11: an unreadable clock fails the input, and the probe tries again one interval later (it never dies).
       this.#board.fail("EVENT_LOOP", "CLOCK_UNREADABLE");
+      this.#handle = this.#timers.setTimeout(() => {
+        this.#handle = null;
+        this.#arm();
+      }, this.#intervalMs);
       return;
     }
     this.#handle = this.#timers.setTimeout(() => {

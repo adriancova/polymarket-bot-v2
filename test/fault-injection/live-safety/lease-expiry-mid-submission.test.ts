@@ -11,9 +11,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { composition, HEALTH_MAX_AGE, ManualClock } from "../../../apps/trader/src/live-safety/fakes.test-support.js";
-import type { PlacementOutcome, SignOutcome } from "../../../packages/oms/src/index.js";
+import type { PlacementClassifier } from "../../../apps/trader/src/live-safety/index.js";
+import type { LimitOrderRequest, PlacementOutcome, SignedOrderHandle, SignOutcome } from "../../../packages/oms/src/index.js";
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
-import { group, openHarness, reopen, ticket } from "../../unit/oms/support/harness.js";
+import { group, INSTANCE_A, MARKET, openHarness, reopen, ticket } from "../../unit/oms/support/harness.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -32,6 +33,14 @@ const REFUSALS = {
   placementRefused: (reasons: readonly string[]): PlacementOutcome => ({ kind: "NOT_SENT", error: { kind: reasons[0] ?? "GATE_REFUSED", effect: "NOT_SENT", retryAfterSeconds: null } }),
 };
 
+/** The composition's knowledge of each order's decision. The FENCE alone is under test here, so every order is classified a reduction in the harness's market (no heartbeat is attached, which would block an entry). */
+const REDUCTION_IN_MARKET: PlacementClassifier<LimitOrderRequest, SignOutcome, SignedOrderHandle> = {
+  request: () => ({ intent: "REDUCTION", marketId: MARKET, instanceId: INSTANCE_A }),
+  signedOrder: (outcome) => (outcome.kind === "SIGNED" ? outcome.order : undefined),
+  order: () => null,
+};
+const REDUCE = { kind: "REDUCTION", marketId: MARKET, instanceId: INSTANCE_A } as const;
+
 async function setup(): Promise<{ c: ReturnType<typeof composition>; h: Awaited<ReturnType<typeof openHarness>>; manager: Awaited<ReturnType<typeof reopen>>["manager"] }> {
   const clock = new ManualClock();
   // Every proof may be up to 60 s old here, so that the ONLY thing a 30 s stall can break is the 30 s lease.
@@ -40,9 +49,9 @@ async function setup(): Promise<{ c: ReturnType<typeof composition>; h: Awaited<
   c.safety.start();
   await clock.advance(500);
   c.proveComposition();
-  expect(c.safety.gate({ kind: "TRANSMISSION" })).toEqual({ permitted: true, reasons: [] });
+  expect(c.safety.gate(REDUCE)).toEqual({ permitted: true, reasons: [] });
   const h = await openHarness();
-  const { manager } = await reopen(h, { venue: c.safety.fenceVenue(h.venue, REFUSALS) });
+  const { manager } = await reopen(h, { venue: c.safety.fenceVenue(h.venue, REFUSALS, REDUCTION_IN_MARKET) });
   const registered = await manager.registerGroup(group(1));
   expect(registered.ok).toBe(true);
   return { c, h, manager };
@@ -65,7 +74,7 @@ describe("a lease that expires mid-submission", () => {
       expect(result.value.placement).toMatchObject({ kind: "NOT_SENT" });
       expect(manager.attempt(result.value.submissionAttemptId)?.state).toBe("ABANDONED");
     }
-    expect(c.safety.gate({ kind: "TRANSMISSION" }).reasons).toEqual(["FENCE_EXPIRED"]);
+    expect(c.safety.gate(REDUCE).reasons).toEqual(["FENCE_EXPIRED"]);
     // The database half: an attempt naming the expired lease is refused (migration 0008's trigger).
     expect(c.store.attemptAccepted(fence)).toBe(false);
   });
@@ -80,7 +89,7 @@ describe("a lease that expires mid-submission", () => {
     const result = await manager.submit(ticket(group(1), { n: 2 }));
     expect(h.venue.received).toEqual([]);
     expect(result.ok && result.value.placement?.kind).toBe("NOT_SENT");
-    expect(c.safety.gate({ kind: "TRANSMISSION" }).reasons).toEqual(["FENCE_EXPIRING"]);
+    expect(c.safety.gate(REDUCE).reasons).toEqual(["FENCE_EXPIRING"]);
   });
 
   it("a held fence transmits normally (the control)", async () => {

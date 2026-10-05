@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/network-tripwire.js";
 
-import { liveProcess, submitOne } from "./support/live-process.js";
+import { liveProcess, REDUCE, submitOne } from "./support/live-process.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -41,7 +41,7 @@ describe("the database is lost", () => {
     for (const kind of ["NEW_ENTRY", "REDUCTION"] as const) {
       expect(live.safety.gate({ kind, marketId: "0190a3e0-0000-7000-8000-00000000000c", instanceId: "0190a3e0-0000-7000-8000-00000000000a" }).permitted).toBe(false);
     }
-    expect(live.safety.gate({ kind: "TRANSMISSION" }).reasons).toContain("KILL_SWITCH_UNKNOWN_READ_FAILED");
+    expect(live.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_UNKNOWN_READ_FAILED");
 
     // No heartbeat leaves after the next tick; the lapse follows 10 s after the last confirmed send.
     await live.step(5_000);
@@ -61,12 +61,15 @@ describe("the database is lost", () => {
     await live.step(15_000);
     expect(live.safety.status().fence).toMatchObject({ held: false, reason: "EXPIRED" });
 
-    // PostgreSQL returns. The stale grant is never renewed: only a new acquisition, with a higher token, restores it.
+    // PostgreSQL returns. The stale grant is never renewed: only a new acquisition, with a higher token, restores it,
+    // and only after the process has waited out its own ended lease (r1 I1).
     live.store.down = false;
     live.reader.failing = false;
     await live.step(6_000);
     expect(live.safety.status().fence).toMatchObject({ held: false, reason: "EXPIRED" });
     expect(live.store.attemptAccepted(fenceBefore)).toBe(false);
+    expect((await live.safety.acquireFence()).kind).toBe("LAPSED_WAITING");
+    await live.step(32_000);
     const again = await live.safety.acquireFence();
     expect(again.kind).toBe("ACQUIRED");
     expect(again.kind === "ACQUIRED" ? BigInt(again.fence.fencingToken) : 0n).toBeGreaterThan(BigInt(fenceBefore?.fencingToken ?? "0"));

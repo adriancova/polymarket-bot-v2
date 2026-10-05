@@ -9,15 +9,31 @@
  * `apps/trader/src/main.ts` builds the PAPER trader and is not this package's
  * path. Nothing in this repository calls {@link createLiveSafety}: it is
  * exposed, from `./index.ts`, for the live composition that a later,
- * separately authorized package writes. It refuses to exist in any run mode
- * that does not submit real orders, so under the repository's defaults
- * (`MAX_RUN_MODE=PAPER`) no process can build one.
+ * separately authorized package writes. It reads the process's RUN-MODE
+ * CONTEXT first (`runMode`, `maximumRunMode`, `allowRealOrders`, the context
+ * `assertSignerGate` reads) and refuses unless the run mode submits real
+ * orders, does not exceed the ceiling, and real orders are allowed (r1,
+ * finding I8). So under the repository's defaults (`MAX_RUN_MODE=PAPER`,
+ * `ALLOW_REAL_ORDERS=false`) no process whose composition root passes its
+ * true context can build one. As with the signer gate, a root that lies about
+ * its own context is not detectable here.
  *
  * ## How a live composition root uses it
  *
  * ```text
- * const safety = createLiveSafety({ runMode, accountRef, …ports });
- * const fence = await safety.acquireFence();               // ADR-008 §1–§2
+ * const omsProgress = new OmsProgressMonitor({ clock });   // r1 I5: the OMS input's evidence
+ * let oms = null;                                           // opened below, over the fenced venue
+ * const safety = createLiveSafety({
+ *   runModeContext,                                        // RUN_MODE, MAX_RUN_MODE, ALLOW_REAL_ORDERS (r1 I8)
+ *   oms: { get faulted() { … oms … }, orders: …, requestOrderReconciliation: … }, // a view bound to `oms` once open
+ *   omsProgress, accountRef, …ports,
+ * });
+ * oms = await OrderManager.open({
+ *   store: omsProgress.store(store),                        // every persistence call timed (r1 I5)
+ *   venue: safety.fenceVenue(secureClient, refusals, classifier), // per-order scope at every transmission (r1 I2)
+ *   …,
+ * });
+ * let fence = await safety.acquireFence();                  // ADR-008 §1–§2; LAPSED_WAITING: ask again after remainingMs
  * const controller = createOrderHeartbeatController({      // polymarket-secure, ADR-033 D4
  *   runModeContext, transport,                             // the transport: ADR-033 D5, open
  *   gate: safety.heartbeatGate,                            // fence AND health lease (D1 item 2)
@@ -27,11 +43,10 @@
  * });
  * safety.attachHeartbeat(controller);
  * safety.start(); controller.start();                      // starts lapsed (D6)
- * // the OMS's venue port: safety.fenceVenue(secureClient, refusals)
  * // WP-290's halt port: safety.halts
- * // every decision: safety.gate({ kind: "NEW_ENTRY", marketId, instanceId })
+ * // every decision: safety.gate({ kind: "NEW_ENTRY" | "REDUCTION", marketId, instanceId })
  * // every budget poll's events: controller.onBudgetEvents(events)
- * // every periodic reconcile report: safety.recordReconcileReport(report)
+ * // every periodic reconcile: safety.recordReconcileReport(report, calledAtMs)
  * // market data / user stream evidence: safety.recordProof("MARKET_DATA" | "USER_DATA", atMs)
  * ```
  *
@@ -54,26 +69,32 @@
  * | --- | --- |
  * | MARKET_DATA, USER_DATA | the composition: {@link LiveSafety.recordProof} on fresh evidence |
  * | EVENT_LOOP | this class's event-loop probe (a timer that must fire on time) |
- * | OMS | read at each evaluation: the OMS is not faulted |
+ * | OMS | the OMS not faulted, AND its progress monitor (`oms-progress.ts`): proved at the start of its oldest store call still pending, so a hung persistence call ages it out (r1 I5) |
  * | DATABASE | every fence renewal and kill-switch read that succeeds; each failure fails it |
- * | RECONCILER | every reconcile report in which a run actually ran (the composition's periodic timer, and D6's own calls) |
+ * | RECONCILER | ONLY a reconcile report with a run that PASSED and resumed, proved at the instant before the `reconcile()` call that ran it; a FAILED or QUARANTINED run proves nothing, so a reconciler that keeps failing ages the input out and the heartbeat stops (r1 I3; §9.9 "Account state unknown → Stop heartbeat") |
  * | KILL_SWITCH | the latest kill-switch read: succeeded, and not ending trading |
  *
  * ## Kill-switch cancels
  *
  * After every successful read, each cancel an engaged switch asks for
  * (`kill-switch.ts`) is handed to the injected {@link KillSwitchCancelPort}
- * once per engage, and again after every read until the port answers `true`.
+ * until the port answers `true`, and then ONCE MORE, at the first read that
+ * starts at least one refresh interval after that acceptance (the confirming
+ * sweep, r1 I2): it withdraws an order whose transmission was already in
+ * flight when the switch was observed and landed after the first sweep.
+ * Every order transmitted after the switch was observed is refused by the
+ * per-order fence (`fenced-venue.ts`).
  */
 
 import type { EligibilityVerdict, ClosedOnlyPort, GeoblockPort } from "./eligibility.js";
 import { VenueEligibility } from "./eligibility.js";
 import { evaluateLiveGate, type GateDecision, type GateRequest } from "./entry-gate.js";
-import { fenceVenuePort, type FenceRefusals, type PlacementVenuePort } from "./fenced-venue.js";
-import { FencingAuthority, isLiveRunMode, LiveFencingRefusal, type AcquireResult, type FencingLeasePort } from "./fencing-authority.js";
+import { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementVenuePort } from "./fenced-venue.js";
+import { assertLiveFencingContext, FencingAuthority, type AcquireResult, type FencingLeasePort, type RunModeContext } from "./fencing-authority.js";
 import { EventLoopProbe, HealthLease, ProofBoard, type HealthInput, type HealthProofReading, type HealthVerdict } from "./health-lease.js";
 import { KillSwitchMonitor, type CancelDirective, type KillSwitchReader, type KillSwitchSnapshot } from "./kill-switch.js";
 import { LapseRecovery } from "./lapse-recovery.js";
+import type { OmsProgressMonitor } from "./oms-progress.js";
 import type { HeartbeatView, LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyTimers } from "./ports.js";
 
 /** Carries out a kill switch's cancel (bound by the composition to the OMS or the secure client at `EMERGENCY_CANCEL`). `true` = done. */
@@ -85,13 +106,20 @@ export interface KillSwitchCancelPort {
 export const HEARTBEAT_STOP_SOURCES = Object.freeze(["INCIDENT_CONTROLLER", "OPS_CLI", "LIVE_FENCING_CONFLICT"] as const);
 export type HeartbeatStopSource = (typeof HEARTBEAT_STOP_SOURCES)[number];
 
-/** The health inputs the composition proves itself; the others are this class's. */
-export const COMPOSITION_PROVED_INPUTS = Object.freeze(["MARKET_DATA", "USER_DATA", "RECONCILER", "DATABASE"] as const);
+/**
+ * The health inputs the composition proves itself with {@link LiveSafety.recordProof}; the others are this class's.
+ * RECONCILER is NOT among them: only {@link LiveSafety.recordReconcileReport} proves it, from a passing run (r1 I3).
+ */
+export const COMPOSITION_PROVED_INPUTS = Object.freeze(["MARKET_DATA", "USER_DATA", "DATABASE"] as const);
 export type CompositionProvedInput = (typeof COMPOSITION_PROVED_INPUTS)[number];
 
 export interface LiveSafetyOptions {
-  /** Checked FIRST: a run mode that does not submit real orders is refused before anything else is read. */
-  readonly runMode: string;
+  /**
+   * The process's run-mode context (`RUN_MODE`, `MAX_RUN_MODE`, `ALLOW_REAL_ORDERS`), checked FIRST: a run mode that
+   * does not submit real orders, one above the ceiling, or real orders not allowed, is refused before anything else
+   * is read (ADR-010 §1; r1 I8).
+   */
+  readonly runModeContext: RunModeContext;
   readonly accountRef: string;
   readonly holderId: string;
   readonly holderHostname?: string | null;
@@ -110,9 +138,20 @@ export interface LiveSafetyOptions {
     readonly maxAgeMs: Readonly<Record<HealthInput, number>>;
     readonly eventLoop: { readonly intervalMs: number; readonly maxLagMs: number };
   };
-  readonly killSwitch: { readonly reader: KillSwitchReader; readonly refreshIntervalMs: number; readonly cancels: KillSwitchCancelPort };
+  readonly killSwitch: {
+    readonly reader: KillSwitchReader;
+    readonly refreshIntervalMs: number;
+    readonly cancels: KillSwitchCancelPort;
+    /**
+     * How long a release row must have been visible before it releases (`kill-switch.ts`, r1 I6). It must exceed the
+     * control plane's `auditAppendTimeoutMs` plus the time its VOID record takes to land.
+     */
+    readonly releaseSettleMs: number;
+  };
   readonly eligibility: { readonly geoblock: GeoblockPort; readonly closedOnly: ClosedOnlyPort; readonly refreshIntervalMs: number; readonly maxAgeMs: number };
   readonly oms: SafetyOms;
+  /** The OMS's port-call progress (`oms-progress.ts`): its store must have been wrapped by it (r1 I5). */
+  readonly omsProgress: OmsProgressMonitor;
   readonly coordinator: SafetyCoordinator;
   readonly recovery: { readonly notRunPollMs: number; readonly failedRunSpacingMs: number };
   readonly journal: LiveSafetyJournal;
@@ -146,7 +185,7 @@ function interval(value: unknown, field: string): number {
 export class LiveSafety {
   readonly #options: LiveSafetyOptions;
   readonly #fence: FencingAuthority;
-  readonly #board = new ProofBoard();
+  readonly #board: ProofBoard;
   readonly #health: HealthLease;
   readonly #eventLoop: EventLoopProbe;
   readonly #killSwitch: KillSwitchMonitor;
@@ -154,7 +193,8 @@ export class LiveSafety {
   readonly #recovery: LapseRecovery;
   readonly #stops = new Map<HeartbeatStopSource, string>();
   readonly #haltedMarkets = new Set<string>();
-  readonly #cancelsDone = new Set<string>();
+  /** Per cancel key: when the port first accepted it, and whether the confirming sweep has been accepted too. */
+  readonly #cancels = new Map<string, { readonly acceptedAtMs: number; confirmed: boolean }>();
   readonly #cancelsInFlight = new Set<string>();
   #accountHalted = false;
   /** Whether the latest kill-switch read succeeded (true before the first: the first failure pages). */
@@ -174,8 +214,12 @@ export class LiveSafety {
 
   private constructor(options: LiveSafetyOptions) {
     this.#options = options;
+    this.#board = new ProofBoard({ clock: options.clock });
+    if (typeof options.omsProgress !== "object" || options.omsProgress === null || typeof options.omsProgress.reading !== "function") {
+      throw new LiveSafetyConfigurationError("omsProgress");
+    }
     this.#fence = FencingAuthority.create({
-      runMode: options.runMode,
+      runModeContext: options.runModeContext,
       accountRef: options.accountRef,
       holderId: options.holderId,
       holderHostname: options.holderHostname ?? null,
@@ -193,11 +237,13 @@ export class LiveSafety {
     interval(options.eligibility.refreshIntervalMs, "eligibility.refreshIntervalMs");
     if (options.killSwitch.refreshIntervalMs >= options.health.maxAgeMs.KILL_SWITCH) throw new LiveSafetyConfigurationError("killSwitch.refreshIntervalMs");
     if (options.eligibility.refreshIntervalMs >= options.eligibility.maxAgeMs) throw new LiveSafetyConfigurationError("eligibility.refreshIntervalMs");
+    interval(options.killSwitch.releaseSettleMs, "killSwitch.releaseSettleMs");
     // A read slower than one refresh interval is abandoned by the next refresh: a hung read never freezes the state.
     this.#killSwitch = new KillSwitchMonitor({
       reader: options.killSwitch.reader,
       clock: options.clock,
       accountRef: options.accountRef,
+      releaseSettleMs: options.killSwitch.releaseSettleMs,
       abandonAfterMs: options.killSwitch.refreshIntervalMs,
     });
     this.#eligibility = new VenueEligibility({
@@ -237,8 +283,8 @@ export class LiveSafety {
       heartbeat: () => this.#heartbeat,
       notRunPollMs: options.recovery.notRunPollMs,
       failedRunSpacingMs: options.recovery.failedRunSpacingMs,
-      onReport: (report) => {
-        this.recordReconcileReport(report);
+      onReport: (report, calledAtMs) => {
+        this.recordReconcileReport(report, calledAtMs);
       },
       gateReasonsNow: () => {
         const verdict = this.#heartbeatGate();
@@ -263,11 +309,11 @@ export class LiveSafety {
   }
 
   /**
-   * @throws {LiveFencingRefusal} in every run mode that does not submit real orders (PAPER included), before anything else is read.
+   * @throws {LiveFencingRefusal} in every run mode that does not submit real orders (PAPER included), above the
+   * process's ceiling, or without `allowRealOrders`, before anything else is read.
    */
   static create(options: LiveSafetyOptions): LiveSafety {
-    const runMode: unknown = typeof options === "object" && options !== null ? options.runMode : undefined;
-    if (!isLiveRunMode(runMode)) throw new LiveFencingRefusal(runMode);
+    assertLiveFencingContext(typeof options === "object" && options !== null ? options.runModeContext : undefined);
     return new LiveSafety(options);
   }
 
@@ -310,7 +356,7 @@ export class LiveSafety {
     this.#handles.clear();
   }
 
-  /** The live gate (`entry-gate.ts`). */
+  /** The live gate (`entry-gate.ts`): asked at decision time, and again per order by {@link LiveSafety.fenceVenue}. */
   gate(request: GateRequest): GateDecision {
     return evaluateLiveGate(
       {
@@ -330,12 +376,17 @@ export class LiveSafety {
     );
   }
 
-  /** The OMS's venue port behind the submission fence (`fenced-venue.ts`). */
+  /**
+   * The OMS's venue port behind the submission fence (`fenced-venue.ts`): every signing and every transmission (batch
+   * members one by one) is judged by {@link LiveSafety.gate} with the order's own intent, market and instance, from
+   * `classifier` (r1 I2).
+   */
   fenceVenue<TRequest, TSign, TOrder, TPlacement, TCancel>(
     venue: PlacementVenuePort<TRequest, TSign, TOrder, TPlacement, TCancel>,
     refusals: FenceRefusals<TSign, TPlacement>,
+    classifier: PlacementClassifier<TRequest, TSign, TOrder>,
   ): PlacementVenuePort<TRequest, TSign, TOrder, TPlacement, TCancel> {
-    return fenceVenuePort(venue, () => this.gate({ kind: "TRANSMISSION" }), refusals);
+    return fenceVenuePort(venue, (scope) => this.gate({ kind: scope.intent, marketId: scope.marketId, instanceId: scope.instanceId }), refusals, classifier);
   }
 
   /** The fence a live submission attempt is persisted with (§9.18), while held. */
@@ -362,7 +413,7 @@ export class LiveSafety {
     this.#haltedMarkets.clear();
   }
 
-  /** Positive evidence for an input the composition proves (MARKET_DATA, USER_DATA, RECONCILER, DATABASE), at `atMs` (monotonic). */
+  /** Positive evidence for an input the composition proves (MARKET_DATA, USER_DATA, DATABASE), at `atMs` (monotonic). */
   recordProof(input: CompositionProvedInput, atMs: number): void {
     if (COMPOSITION_PROVED_INPUTS.includes(input)) this.#board.prove(input, atMs);
   }
@@ -371,28 +422,35 @@ export class LiveSafety {
     if (COMPOSITION_PROVED_INPUTS.includes(input)) this.#board.fail(input, reason);
   }
 
-  /** A reconcile report (the composition's periodic timer, or D6's own calls): a run that ran proves the RECONCILER input. */
-  recordReconcileReport(report: { readonly runs: readonly { readonly status: string }[] }): void {
-    const now = this.#now();
-    if (now === null) return;
+  /**
+   * A reconcile report (the composition's periodic timer, or D6's own calls), with the monotonic instant read just
+   * BEFORE the `reconcile()` call that produced it. ONLY a run that PASSED and resumed the OMS proves the RECONCILER
+   * input, and at `calledAtMs` (every run of the call started after it), never at receipt (r1 I3). A FAILED,
+   * QUARANTINED or NOT_RUN report proves nothing: a reconciler that keeps failing ages the input out, and the
+   * heartbeat stops (§9.9: "Account state unknown → Stop heartbeat"). An unreadable report fails the input.
+   */
+  recordReconcileReport(report: { readonly runs: readonly { readonly status: string; readonly resumed?: boolean }[] }, calledAtMs: number): void {
+    let passed: boolean;
     try {
-      if (report.runs.some((run) => run.status !== "NOT_RUN")) this.#board.prove("RECONCILER", now);
+      passed = report.runs.some((run) => run.status === "PASSED" && run.resumed === true);
     } catch {
       this.#board.fail("RECONCILER", "REPORT_UNREADABLE");
+      return;
     }
+    if (passed) this.#board.prove("RECONCILER", calledAtMs);
   }
 
   /** Read the kill-switch rows now, then request every cancel an engaged switch asks for. */
   async refreshKillSwitch(): Promise<boolean> {
     const before = this.#now();
-    const ok = await this.#killSwitch.refresh();
+    const reading = this.#killSwitch.refresh();
+    // A read that HUNG past the abandonment bound is unreadable state NOW (r1 I10): do not wait for its replacement,
+    // which may hang too, to fail the input and page.
+    const snapshot = this.#killSwitch.snapshot();
+    if (!snapshot.known && snapshot.reason === "READ_TIMED_OUT") this.#killSwitchUnreadable("KILL_SWITCH_READ_TIMED_OUT");
+    const ok = await reading;
     if (!ok) {
-      this.#board.fail("DATABASE", "KILL_SWITCH_READ_FAILED");
-      // Paged on the transition into unreadable, not on every failed read.
-      if (this.#killSwitchReadable) {
-        this.#page("KILL_SWITCH_STATE_UNREADABLE", "the kill-switch rows could not be read; every submission is blocked and the heartbeat stops");
-      }
-      this.#killSwitchReadable = false;
+      this.#killSwitchUnreadable("KILL_SWITCH_READ_FAILED");
       return false;
     }
     this.#killSwitchReadable = true;
@@ -472,14 +530,29 @@ export class LiveSafety {
     }
   }
 
+  /**
+   * The OMS input (r1 I5): not faulted, AND the progress monitor's evidence — proved at the start of the oldest OMS
+   * port call still pending (or now, when none is), so a call that never settles ages out of the lease. Reading
+   * `faulted === false` alone proves nothing.
+   */
   #omsProof(): HealthProofReading {
     const now = this.#now();
     if (now === null) return Object.freeze({ healthy: false as const, reason: "CLOCK_UNREADABLE" });
     try {
-      return this.#options.oms.faulted === false ? Object.freeze({ healthy: true as const, provenAtMs: now }) : Object.freeze({ healthy: false as const, reason: "FAULTED" });
+      if (this.#options.oms.faulted !== false) return Object.freeze({ healthy: false as const, reason: "FAULTED" });
+      return this.#options.omsProgress.reading(now);
     } catch {
       return Object.freeze({ healthy: false as const, reason: "UNREADABLE" });
     }
+  }
+
+  /** Unreadable kill-switch state: the DATABASE input fails, and the transition into it pages once. */
+  #killSwitchUnreadable(reason: string): void {
+    this.#board.fail("DATABASE", reason);
+    if (this.#killSwitchReadable) {
+      this.#page("KILL_SWITCH_STATE_UNREADABLE", "the kill-switch rows could not be read; every submission is blocked and the heartbeat stops");
+    }
+    this.#killSwitchReadable = false;
   }
 
   async #renewFence(): Promise<void> {
@@ -493,9 +566,14 @@ export class LiveSafety {
   async #enforceCancels(): Promise<void> {
     const snapshot = this.#killSwitch.snapshot();
     if (!snapshot.known) return;
+    const readAtMs = snapshot.readStartedAtMs;
     for (const { directive, killSwitchEventId } of snapshot.effects.cancels) {
       const key = `${killSwitchEventId}:${directive.scope}:${directive.scope === "MARKET" ? directive.marketId : directive.scope === "STRATEGY_INSTANCE" ? directive.instanceId : ""}`;
-      if (this.#cancelsDone.has(key) || this.#cancelsInFlight.has(key)) continue;
+      const state = this.#cancels.get(key);
+      if (this.#cancelsInFlight.has(key) || state?.confirmed === true) continue;
+      // The confirming sweep waits one refresh interval after the first acceptance (module header).
+      if (state !== undefined && readAtMs - state.acceptedAtMs < this.#options.killSwitch.refreshIntervalMs) continue;
+      const pass = state === undefined ? "FIRST" : "CONFIRMING";
       this.#cancelsInFlight.add(key);
       let accepted = false;
       try {
@@ -505,8 +583,11 @@ export class LiveSafety {
       } finally {
         this.#cancelsInFlight.delete(key);
       }
-      if (accepted) this.#cancelsDone.add(key);
-      this.#record({ kind: "KILL_SWITCH_CANCEL_REQUESTED", directive: key, accepted, atMs: this.#now() ?? 0 });
+      if (accepted) {
+        if (state === undefined) this.#cancels.set(key, { acceptedAtMs: this.#now() ?? readAtMs, confirmed: false });
+        else state.confirmed = true;
+      }
+      this.#record({ kind: "KILL_SWITCH_CANCEL_REQUESTED", directive: key, pass, accepted, atMs: this.#now() ?? 0 });
     }
   }
 

@@ -3,20 +3,24 @@
  * `test/fault-injection/live-safety/**`): a manual monotonic clock with a
  * timer queue, an in-memory fencing lease store that keeps the database's
  * rules (one ACTIVE lease per account and realm, a token above every earlier
- * one, expiry by its OWN clock, holder-keyed writes, migration 0008's
+ * one, expiry by its OWN clock, holder-keyed writes, a takeover only over the
+ * ended incumbent's presented version, the run-mode ceiling, migration 0008's
  * validity check), and recording journals, pagers and readers. Nothing here
- * reaches a network, a database or a venue. PAPER only. The PostgreSQL
+ * reaches a network, a database or a venue. PAPER only: the live-SHAPED
+ * run-mode context below only ever reaches these fakes. The PostgreSQL
  * behaviour itself is proven against a real database by
  * `test/integration/postgres/fencing-race.test.ts`.
  */
 
+import { runModeExceeds, RUN_MODES, type RunMode } from "@polymarket-bot/domain";
 import type { FencingAcquireOutcome, FencingLeaseRef, FencingRenewOutcome } from "@polymarket-bot/storage-postgres";
-import { NonRealModeFencingLeaseError } from "@polymarket-bot/storage-postgres";
+import { FencingRunModeNotPermittedError, NonRealModeFencingLeaseError } from "@polymarket-bot/storage-postgres";
 
-import { isLiveRunMode, type Fence, type FencingLeasePort } from "./fencing-authority.js";
+import { isLiveRunMode, type Fence, type FencingLeasePort, type RunModeContext } from "./fencing-authority.js";
 import type { HealthInput } from "./health-lease.js";
 import type { KillSwitchReader, KillSwitchRow } from "./kill-switch.js";
 import { createLiveSafety, type KillSwitchCancelPort, type LiveSafety, type LiveSafetyOptions } from "./live-safety.js";
+import { OmsProgressMonitor, type OmsStoreLike } from "./oms-progress.js";
 import type { LiveSafetyAlerts, LiveSafetyJournal, LiveSafetyPage, LiveSafetyRecord, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyOrderView, SafetyTimers } from "./ports.js";
 
 interface Scheduled {
@@ -97,6 +101,12 @@ export class ManualClock implements MonotonicClock, SafetyTimers {
   }
 }
 
+/** A live-SHAPED run-mode context: it only ever reaches these fakes (the `LIVE_SHAPED_CONTEXT` convention). */
+export const LIVE_CONTEXT: RunModeContext = Object.freeze({ runMode: "LIVE_MICRO", maximumRunMode: "LIVE_MICRO", allowRealOrders: true });
+
+/** The repository's defaults: `MAX_RUN_MODE=PAPER`, `ALLOW_REAL_ORDERS=false`. */
+export const REPOSITORY_DEFAULTS_LIVE_MICRO: RunModeContext = Object.freeze({ runMode: "LIVE_MICRO", maximumRunMode: "PAPER", allowRealOrders: false });
+
 interface LeaseRow {
   readonly fencingLeaseId: string;
   readonly fencingToken: bigint;
@@ -107,6 +117,12 @@ interface LeaseRow {
   expiresAtMs: number;
   heartbeatId: string | null;
   reason: string | null;
+  /** Advances on every change to the row (the database's `updated_at`). */
+  revision: number;
+}
+
+function versionOf(row: LeaseRow): string {
+  return `${row.status}|${String(row.expiresAtMs)}|${String(row.revision)}`;
 }
 
 /**
@@ -135,26 +151,44 @@ export class MemoryFencingStore implements FencingLeasePort {
     if (this.down) throw new Error("connection terminated unexpectedly (synthetic)");
   }
 
-  #expireLapsed(accountRef: string): void {
-    for (const row of this.rows) {
-      if (row.accountRef === accountRef && row.status === "ACTIVE" && row.expiresAtMs <= this.dbNowMs()) {
-        row.status = "EXPIRED";
-        row.reason = "lease expired before a new acquisition";
-      }
-    }
-  }
-
   async acquire(input: Parameters<FencingLeasePort["acquire"]>[0]): Promise<FencingAcquireOutcome> {
     const environment = input.environment;
     if (!isLiveRunMode(environment)) throw new NonRealModeFencingLeaseError(environment, input.accountRef);
+    const maximum = RUN_MODES.find((mode) => mode === input.maximumRunMode);
+    if (maximum === undefined || runModeExceeds(environment, maximum as RunMode) || input.allowRealOrders !== true) throw new FencingRunModeNotPermittedError(environment);
     this.#guard("acquire");
     await Promise.resolve();
-    this.#expireLapsed(input.accountRef);
-    const incumbent = this.rows.find((row) => row.accountRef === input.accountRef && row.status === "ACTIVE");
+    const realm = this.rows.filter((row) => row.accountRef === input.accountRef);
+    const incumbent = realm.find((row) => row.status === "ACTIVE") ?? [...realm].sort((a, b) => (a.fencingToken < b.fencingToken ? 1 : -1))[0];
     if (incumbent !== undefined) {
-      return { kind: "HELD", holderId: incumbent.holderId, fencingToken: incumbent.fencingToken.toString(), expiresAt: new Date(incumbent.expiresAtMs).toISOString() };
+      if (incumbent.status === "ACTIVE" && incumbent.expiresAtMs > this.dbNowMs()) {
+        return { kind: "HELD", holderId: incumbent.holderId, fencingToken: incumbent.fencingToken.toString(), expiresAt: new Date(incumbent.expiresAtMs).toISOString() };
+      }
+      const takeover = input.takeover ?? null;
+      const presented =
+        takeover !== null &&
+        takeover.fencingLeaseId === incumbent.fencingLeaseId &&
+        takeover.fencingToken === incumbent.fencingToken.toString() &&
+        takeover.version === versionOf(incumbent);
+      if (!presented) {
+        return {
+          kind: "LAPSED",
+          incumbent: {
+            fencingLeaseId: incumbent.fencingLeaseId,
+            fencingToken: incumbent.fencingToken.toString(),
+            holderId: incumbent.holderId,
+            status: incumbent.status,
+            expiresAt: new Date(incumbent.expiresAtMs).toISOString(),
+            version: versionOf(incumbent),
+          },
+        };
+      }
+      if (incumbent.status === "ACTIVE") {
+        incumbent.status = "EXPIRED";
+        incumbent.reason = "lease expired before a new acquisition";
+        incumbent.revision += 1;
+      }
     }
-    const previous = [...this.rows].filter((row) => row.accountRef === input.accountRef).sort((a, b) => (a.fencingToken < b.fencingToken ? 1 : -1))[0];
     const token = (this.#highWater.get(input.accountRef) ?? 0n) + 1n;
     this.#highWater.set(input.accountRef, token);
     this.#ids += 1;
@@ -168,6 +202,7 @@ export class MemoryFencingStore implements FencingLeasePort {
       expiresAtMs: this.dbNowMs() + input.ttlMs,
       heartbeatId: null,
       reason: null,
+      revision: 0,
     };
     this.rows.push(row);
     return {
@@ -180,7 +215,7 @@ export class MemoryFencingStore implements FencingLeasePort {
         holderId: row.holderId,
         acquiredAt: new Date(this.dbNowMs()).toISOString(),
         expiresAt: new Date(row.expiresAtMs).toISOString(),
-        inheritedHeartbeatId: previous?.heartbeatId ?? null,
+        inheritedHeartbeatId: incumbent?.heartbeatId ?? null,
       },
     };
   }
@@ -195,6 +230,7 @@ export class MemoryFencingStore implements FencingLeasePort {
     const row = this.#find(ref);
     if (row === undefined || row.status !== "ACTIVE" || row.expiresAtMs <= this.dbNowMs()) return { kind: "LOST" };
     row.expiresAtMs = this.dbNowMs() + ttlMs;
+    row.revision += 1;
     if (this.loseNextRenewAnswer) {
       this.loseNextRenewAnswer = false;
       throw new Error("connection reset after commit (synthetic)");
@@ -208,6 +244,7 @@ export class MemoryFencingStore implements FencingLeasePort {
     const row = this.#find(ref);
     if (row === undefined || row.status !== "ACTIVE" || row.expiresAtMs <= this.dbNowMs()) return false;
     row.heartbeatId = heartbeatId;
+    row.revision += 1;
     return true;
   }
 
@@ -218,6 +255,7 @@ export class MemoryFencingStore implements FencingLeasePort {
     if (row === undefined || row.status !== "ACTIVE") return false;
     row.status = "RELEASED";
     row.reason = reason;
+    row.revision += 1;
     return true;
   }
 
@@ -227,6 +265,7 @@ export class MemoryFencingStore implements FencingLeasePort {
     if (row === undefined) return false;
     row.status = "REVOKED";
     row.reason = reason;
+    row.revision += 1;
     return true;
   }
 
@@ -268,6 +307,7 @@ export function engageRow(options: {
   readonly environment?: string;
 }): KillSwitchRow {
   return {
+    voided: false,
     killSwitchEventId: options.id,
     environment: options.environment ?? "LIVE_MICRO",
     scope: options.scope,
@@ -285,8 +325,17 @@ export function engageRow(options: {
   };
 }
 
-export function releaseRow(options: { readonly id: string; readonly scope: string; readonly scopeRef: string | null; readonly action: string; readonly environment?: string }): KillSwitchRow {
+export function releaseRow(options: {
+  readonly id: string;
+  readonly scope: string;
+  readonly scopeRef: string | null;
+  readonly action: string;
+  readonly environment?: string;
+  /** Whether a control-plane VOID record names it (default `false`). */
+  readonly voided?: boolean;
+}): KillSwitchRow {
   return {
+    voided: options.voided ?? false,
     killSwitchEventId: options.id,
     environment: options.environment ?? "LIVE_MICRO",
     scope: options.scope,
@@ -351,6 +400,26 @@ export const HEALTH_MAX_AGE: Readonly<Record<HealthInput, number>> = Object.free
   KILL_SWITCH: 3_000,
 });
 
+/** The release settle window the fakes' compositions use (ms). */
+export const RELEASE_SETTLE_MS = 2_000;
+
+/** An OMS store whose `apply` can be held unanswered (a hung persistence call). */
+export class HangableOmsStore implements OmsStoreLike<readonly unknown[], unknown> {
+  hang = false;
+  applied = 0;
+  async apply(): Promise<void> {
+    if (this.hang) await new Promise<never>(() => undefined);
+    this.applied += 1;
+  }
+  async load(): Promise<unknown> {
+    await Promise.resolve();
+    return {};
+  }
+}
+
+/** A passing, resuming reconcile report (the composition's periodic reconcile, when it passes). */
+export const PASSING_REPORT = Object.freeze({ runs: Object.freeze([Object.freeze({ status: "PASSED", resumed: true })]), resumed: true });
+
 /** A minimal OMS: orders a test sets; every reconciliation request recorded. */
 export class FakeOms implements SafetyOms {
   faulted = false;
@@ -400,6 +469,10 @@ export class FakeCancels implements KillSwitchCancelPort {
 export interface Composition {
   readonly clock: ManualClock;
   readonly store: MemoryFencingStore;
+  readonly omsProgress: OmsProgressMonitor;
+  /** The OMS store, through the progress monitor (`omsStore.apply` is what a hung persistence call looks like). */
+  readonly omsStore: OmsStoreLike<readonly unknown[], unknown>;
+  readonly rawOmsStore: HangableOmsStore;
   readonly reader: FakeKillSwitchReader;
   readonly geoblock: FakeBodyPort;
   readonly closedOnly: FakeBodyPort;
@@ -409,7 +482,7 @@ export interface Composition {
   readonly journal: RecordingJournal;
   readonly alerts: RecordingAlerts;
   readonly safety: LiveSafety;
-  /** Prove MARKET_DATA, USER_DATA and RECONCILER now (the composition's own evidence). */
+  /** Prove MARKET_DATA and USER_DATA now, and record a PASSING periodic reconcile called now (the composition's own evidence). */
   proveComposition(): void;
 }
 
@@ -423,17 +496,21 @@ export function composition(overrides: Partial<LiveSafetyOptions> = {}, clock: M
   const cancels = new FakeCancels();
   const journal = new RecordingJournal();
   const alerts = new RecordingAlerts();
+  const omsProgress = new OmsProgressMonitor({ clock });
+  const rawOmsStore = new HangableOmsStore();
+  const omsStore = omsProgress.store(rawOmsStore);
   const safety = createLiveSafety({
-    runMode: "LIVE_MICRO",
+    runModeContext: LIVE_CONTEXT,
     accountRef: ACCOUNT,
     holderId: "trader-a",
     clock,
     timers: clock,
     fencing: { store, ttlMs: 30_000, renewIntervalMs: 5_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 },
     health: { maxAgeMs: HEALTH_MAX_AGE, eventLoop: { intervalMs: 500, maxLagMs: 250 } },
-    killSwitch: { reader, refreshIntervalMs: 1_000, cancels },
+    killSwitch: { reader, refreshIntervalMs: 1_000, cancels, releaseSettleMs: RELEASE_SETTLE_MS },
     eligibility: { geoblock, closedOnly, refreshIntervalMs: 30_000, maxAgeMs: 60_000 },
     oms,
+    omsProgress,
     coordinator,
     recovery: { notRunPollMs: 100, failedRunSpacingMs: 1_000 },
     journal,
@@ -443,6 +520,9 @@ export function composition(overrides: Partial<LiveSafetyOptions> = {}, clock: M
   return {
     clock,
     store,
+    omsProgress,
+    omsStore,
+    rawOmsStore,
     reader,
     geoblock,
     closedOnly,
@@ -455,7 +535,7 @@ export function composition(overrides: Partial<LiveSafetyOptions> = {}, clock: M
     proveComposition: () => {
       safety.recordProof("MARKET_DATA", clock.now);
       safety.recordProof("USER_DATA", clock.now);
-      safety.recordProof("RECONCILER", clock.now);
+      safety.recordReconcileReport(PASSING_REPORT, clock.now);
     },
   };
 }

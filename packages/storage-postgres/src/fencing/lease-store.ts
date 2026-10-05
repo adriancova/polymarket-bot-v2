@@ -34,16 +34,50 @@
  *   lease expired, was released, revoked, or taken over — matches no row, so
  *   it can never renew (ADR-008 §2). It can never submit either: the attempt
  *   insert names its old lease, which the validity trigger refuses.
- * - **A simulated run mode never reaches SQL.** `acquire` refuses `BACKTEST`,
- *   `PAPER`, `SHADOW` and anything that is not a §11 run mode before it opens
- *   a transaction ({@link NonRealModeFencingLeaseError}); the database CHECK is
- *   the second layer. "Paper mode cannot acquire live fencing" (work plan
- *   `WP-320` acceptance; ADR-008 §2, ADR-010).
- * - **A takeover requires the incumbent to have expired**, by the database's
- *   clock (ADR-008: "Failover is not instant and must not be"). The lapsed
- *   lease is moved to `EXPIRED` in the statement that ends it, with its
- *   reason, because a terminal lease can never be annotated afterwards
- *   (`WP-040` R15/F14), and it happens on the acquisition path (`WP-040` F11).
+ * - **A holder write that requires an unexpired lease LOCKS FIRST, then
+ *   judges** (`WP-320` r1, finding I4). `renew` and `recordHeartbeatId` take
+ *   the row lock with a `SELECT … FOR UPDATE` that judges nothing, and only
+ *   then, in a SEPARATE statement of the same transaction, test ACTIVE and
+ *   `expires_at > clock_timestamp()`. A single `UPDATE … WHERE expires_at >
+ *   clock_timestamp()` evaluates its predicate BEFORE it waits for a row lock,
+ *   and PostgreSQL re-checks it after the wait only when the lock holder
+ *   CHANGED the row: a lock-only holder (migration 0008's `FOR SHARE` in the
+ *   attempt-insert trigger) let a renewal that waited past the expiry revive
+ *   the lease. The second statement runs under the lock already held, so it
+ *   waits for nothing and its clock is read after the wait.
+ * - **A simulated run mode, or one above the process's ceiling, never reaches
+ *   SQL.** `acquire` refuses `BACKTEST`, `PAPER`, `SHADOW` and anything that
+ *   is not a §11 run mode ({@link NonRealModeFencingLeaseError}), then a run
+ *   mode above the caller's `maximumRunMode` or without `allowRealOrders:
+ *   true` ({@link FencingRunModeNotPermittedError}; ADR-010 §1–§3, the same
+ *   three conditions `assertSignerGate` applies), before it opens a
+ *   transaction; the database CHECK is the last layer. "Paper mode cannot
+ *   acquire live fencing" (work plan `WP-320` acceptance; ADR-008 §2,
+ *   ADR-010).
+ * - **A takeover waits out the incumbent on the SUCCESSOR's clock, never on
+ *   the database's** (`WP-320` r1, finding I1; ADR-008: "Failover is not
+ *   instant and must not be"). The incumbent is the realm's ACTIVE lease, or
+ *   else its latest lease by token. While it is ACTIVE and unexpired the
+ *   answer is `HELD`. Once it has ENDED in any way — expired by the database's
+ *   clock, revoked by an operator, released by its holder, labelled EXPIRED —
+ *   the answer is `LAPSED`, carrying the incumbent's VERSION (its status,
+ *   expiry and last update, as the database wrote them). A grant is made only
+ *   to a caller that presents that exact version back as `takeover`, which
+ *   the in-process authority (`apps/trader/src/live-safety/fencing-authority.ts`)
+ *   does only after it has watched the SAME version, unchanged, for a whole
+ *   lease (`ttl + safetyMargin`) on its own monotonic clock. Why: the old
+ *   holder acts on a LOCAL deadline (its last successful renewal's start +
+ *   ttl − margin), which neither a revocation nor a database clock that steps
+ *   forward shortens; the version it last wrote was committed before the
+ *   successor saw it, so a successor that waits a whole lease from that
+ *   sighting starts after the old holder's deadline, whatever the database's
+ *   clock did. An immediate takeover — after a revocation, or after an expiry
+ *   the database judged early — left two usable authorities (r1 I1). A
+ *   version that changes while the successor waits (a renewal, a relabel)
+ *   restarts its wait. The ACTIVE incumbent is moved to `EXPIRED`, with its
+ *   reason, in the statement that ends it (a terminal lease can never be
+ *   annotated afterwards: `WP-040` R15/F14), on the acquisition path
+ *   (`WP-040` F11).
  * - **The next token is the high-water mark plus one**, read under a
  *   transaction-scoped advisory lock on the SAME key `WP-040`'s repository
  *   takes (`fencing:<account>:<realm>`), so the two acquisition paths
@@ -51,6 +85,9 @@
  *   the mark; the partial unique index refuses a second ACTIVE lease. A writer
  *   that bypasses the advisory lock therefore still cannot hold authority
  *   twice: it gets {@link FencingAcquireOutcome} `CONTENDED`.
+ *   **`WP-040`'s `createFencingRepository().acquireLease` does not wait out a
+ *   revoked or early-expired incumbent**; the live composition binds THIS
+ *   store, and never that repository's acquisition (disclosed residual).
  * - **The heartbeat id is lease state (ADR-008 §4, consequence 1).** It is
  *   recorded only on the holder's ACTIVE, unexpired lease, and a new grant
  *   reports the id the realm's previous lease last recorded
@@ -67,6 +104,7 @@
  * writes a lease in a simulated run mode. PAPER only.
  */
 
+import { runModeExceeds } from "@polymarket-bot/domain";
 import { sql } from "kysely";
 
 import type { PolymarketBotDatabase } from "../database.js";
@@ -79,7 +117,7 @@ import {
   withMappedErrors,
 } from "../errors.js";
 import { uuidV7 } from "../ids.js";
-import { executionRealm, isRealOrderRunMode, RUN_MODES, type RunModeValue } from "../schema/enums.js";
+import { executionRealm, isRealOrderRunMode, RUN_MODES, type LeaseStatusValue, type RunModeValue } from "../schema/enums.js";
 import type { IsoTimestamp } from "../timestamps.js";
 
 /** The shortest lease a caller may ask for. A guard on configuration, not a venue fact. */
@@ -97,6 +135,9 @@ export const FENCING_REASON_MAX_LENGTH = 2_000;
  */
 export const FENCING_HEARTBEAT_ID_MAX_LENGTH = 512;
 
+/** The longest incumbent version a takeover may present (the store writes far shorter ones). */
+export const FENCING_VERSION_MAX_LENGTH = 200;
+
 /** What the realm's lapsed leases are labelled with when an acquisition ends them. */
 const TAKEOVER_EXPIRY_REASON = "lease expired before a new acquisition (ADR-008: a takeover requires the incumbent to have expired)";
 
@@ -105,11 +146,39 @@ export interface AcquireFencingLeaseInput {
   readonly accountRef: string;
   /** Read as a §11 run mode; anything else, and every simulated mode, is refused before any SQL. */
   readonly environment: string;
+  /** The process's run-mode ceiling (`MAX_RUN_MODE`): `environment` may not exceed it (ADR-010 §1). */
+  readonly maximumRunMode: string;
+  /** `ALLOW_REAL_ORDERS`: exactly the boolean `true`, or the acquisition is refused before any SQL (ADR-010 §1). */
+  readonly allowRealOrders: boolean;
   readonly holderId: string;
   readonly holderHostname?: string | null;
   readonly holderPid?: number | null;
   /** The lease's lifetime, applied by the DATABASE's clock. */
   readonly ttlMs: number;
+  /**
+   * The ended incumbent this caller has watched, unchanged, for a whole lease on its own monotonic clock
+   * (`LAPSED`'s `incumbent`, presented back). A grant over an ended incumbent is made ONLY when this names its
+   * current version exactly; `null` or absent asks, and is answered `LAPSED`.
+   */
+  readonly takeover?: FencingTakeover | null;
+}
+
+/** An ended incumbent, as a takeover presents it back. */
+export interface FencingTakeover {
+  readonly fencingLeaseId: string;
+  readonly fencingToken: string;
+  readonly version: string;
+}
+
+/** The realm's latest lease, ended (expired by the database's clock, revoked, released, or labelled EXPIRED). */
+export interface FencingIncumbent {
+  readonly fencingLeaseId: string;
+  readonly fencingToken: string;
+  readonly holderId: string;
+  readonly status: LeaseStatusValue;
+  readonly expiresAt: IsoTimestamp;
+  /** Its status, expiry and last update as the database wrote them: any change to the row changes it. */
+  readonly version: string;
 }
 
 /** A granted lease: the fence a process may act under until `expiresAt` (database clock). */
@@ -130,6 +199,11 @@ export type FencingAcquireOutcome =
   | { readonly kind: "ACQUIRED"; readonly grant: FencingGrant }
   /** An unexpired ACTIVE lease exists: one fenced live writer per account and realm (§2, ADR-008 §2). */
   | { readonly kind: "HELD"; readonly holderId: string; readonly fencingToken: string; readonly expiresAt: IsoTimestamp }
+  /**
+   * The realm's latest lease has ended, but no takeover naming its current version was presented: the caller must
+   * watch this version, unchanged, for a whole lease on its own clock before presenting it (module header).
+   */
+  | { readonly kind: "LAPSED"; readonly incumbent: FencingIncumbent }
   /** A concurrent acquisition that bypassed the advisory lock won the race at the database's constraints. */
   | { readonly kind: "CONTENDED" };
 
@@ -161,6 +235,7 @@ export interface FencingLeaseStore {
    * Acquire the account's fence for this realm, allocating the next token.
    *
    * @throws {NonRealModeFencingLeaseError} for a simulated or unrecognised run mode, before any SQL.
+   * @throws {FencingRunModeNotPermittedError} for a run mode above `maximumRunMode`, or without `allowRealOrders`, before any SQL.
    * @throws {FencingLeaseInputError} for an invalid input, before any SQL.
    */
   acquire(input: AcquireFencingLeaseInput): Promise<FencingAcquireOutcome>;
@@ -170,7 +245,10 @@ export interface FencingLeaseStore {
   recordHeartbeatId(lease: FencingLeaseRef, heartbeatId: string): Promise<boolean>;
   /** End this holder's ACTIVE lease, recording why in the same statement; `false` when it had already ended. */
   release(lease: FencingLeaseRef, reason: string): Promise<boolean>;
-  /** An operator's revocation of an ACTIVE lease, with its reason; `false` when it had already ended. */
+  /**
+   * An operator's revocation of an ACTIVE lease, with its reason; `false` when it had already ended. The holder's
+   * next renewal finds it LOST; a successor still waits out a whole lease from its first sight of the revoked row.
+   */
   revoke(input: { readonly fencingLeaseId: string; readonly reason: string }): Promise<boolean>;
   /** Whether `lease` is still ACTIVE and unexpired at the database's clock. */
   isValid(lease: FencingLeaseRef): Promise<boolean>;
@@ -182,6 +260,19 @@ export interface FencingLeaseStore {
 export class FencingLeaseInputError extends StoragePostgresError {
   public constructor(public readonly field: string) {
     super("FENCING_LEASE_INPUT_INVALID", `fencing lease input refused: ${field} is missing or out of bounds`);
+  }
+}
+
+/**
+ * A real-order run mode the process is not permitted to run (ADR-010 §1): above its `maximumRunMode`, a ceiling that
+ * is not a §11 run mode, or `allowRealOrders` not exactly `true`. Refused before any SQL. Names the run mode only.
+ */
+export class FencingRunModeNotPermittedError extends StoragePostgresError {
+  public constructor(public readonly environment: string) {
+    super(
+      "FENCING_RUN_MODE_NOT_PERMITTED",
+      `run mode ${environment} is not permitted by this process's ceiling and real-order flag, so it cannot acquire a live fencing lease (ADR-008 §2; ADR-010 §1)`,
+    );
   }
 }
 
@@ -268,9 +359,51 @@ function realMode(environment: unknown, accountRef: unknown): RunModeValue {
   return environment;
 }
 
+/**
+ * ADR-010 §1, checked SECOND: the real-order mode may not exceed the process's ceiling, the ceiling must be a §11
+ * run mode, and `allowRealOrders` must be exactly `true`. Under the repository's defaults (`MAX_RUN_MODE=PAPER`,
+ * `ALLOW_REAL_ORDERS=false`) every real-order mode is refused here.
+ */
+function permittedMode(environment: RunModeValue, maximumRunMode: unknown, allowRealOrders: unknown): void {
+  if (!isRunModeValue(maximumRunMode) || runModeExceeds(environment, maximumRunMode) || allowRealOrders !== true) {
+    throw new FencingRunModeNotPermittedError(environment);
+  }
+}
+
+function takeoverOf(value: unknown): FencingTakeover | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object") throw new FencingLeaseInputError("takeover");
+  const presented = value as Partial<FencingTakeover>;
+  const version = presented.version;
+  if (typeof version !== "string" || version.length < 1 || version.length > FENCING_VERSION_MAX_LENGTH || hasControl(version)) {
+    throw new FencingLeaseInputError("takeover");
+  }
+  return { fencingLeaseId: leaseId(presented.fencingLeaseId), fencingToken: token(presented.fencingToken), version };
+}
+
+/** The row's version: its status, expiry and last update to the microsecond, as the database wrote them. */
+const LEASE_VERSION = sql<string>`concat_ws('|', status::text, to_char(expires_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'), to_char(updated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'))`;
+
 /** `clock_timestamp() + ttl`: the database's clock, read in the statement that writes it. */
 function databaseExpiry(ttlMs: number) {
   return sql<string>`clock_timestamp() + (${ttlMs}::integer * interval '1 millisecond')`;
+}
+
+/**
+ * Take the row lock on this holder's lease, judging NOTHING but its immutable identity (lease id, token, holder), so
+ * that whatever the wait, the caller judges status and expiry afterwards, in its own statement (I4). `false` when no
+ * such row exists.
+ */
+async function lockHolderRow(trx: PolymarketBotDatabase, ref: FencingLeaseRef): Promise<boolean> {
+  const locked = await trx
+    .selectFrom("ops.fencing_leases")
+    .select(["fencing_lease_id"])
+    .where("fencing_lease_id", "=", ref.fencingLeaseId)
+    .where("fencing_token", "=", ref.fencingToken)
+    .where("holder_id", "=", ref.holderId)
+    .forUpdate()
+    .executeTakeFirst();
+  return locked !== undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,13 +412,15 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
   return {
     async acquire(input: AcquireFencingLeaseInput): Promise<FencingAcquireOutcome> {
       if (typeof input !== "object" || input === null) throw new NonRealModeFencingLeaseError("(unreadable)", "(unreadable)");
-      // 1. The run mode, before anything else: a simulated process never reaches SQL.
+      // 1. The run mode, before anything else: a simulated process never reaches SQL; then the process's ceiling.
       const environment = realMode(input.environment, input.accountRef);
+      permittedMode(environment, input.maximumRunMode, input.allowRealOrders);
       const accountRef = identifier(input.accountRef, "accountRef");
       const holderId = identifier(input.holderId, "holderId");
       const holderHostname = input.holderHostname === undefined || input.holderHostname === null ? null : identifier(input.holderHostname, "holderHostname");
       const holderPid = input.holderPid === undefined || input.holderPid === null ? null : processId(input.holderPid);
       const ttlMs = ttl(input.ttlMs);
+      const takeover = takeoverOf(input.takeover);
       const realm = executionRealm(environment);
 
       try {
@@ -293,43 +428,79 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
           // The same key WP-040's repository takes: both acquisition paths serialize on it.
           await sql`select pg_advisory_xact_lock(hashtext(${`fencing:${accountRef}:${realm}`}))`.execute(trx);
 
-          // 2. Every lapsed ACTIVE lease of the realm ends now, by the database's clock, with its reason in the
-          // statement that ends it (a terminal lease can never be annotated afterwards: WP-040 R15/F14).
-          await trx
-            .updateTable("ops.fencing_leases")
-            .set({ status: "EXPIRED", released_at: sql<string>`clock_timestamp()`, revoked_reason: TAKEOVER_EXPIRY_REASON })
-            .where("account_ref", "=", accountRef)
-            .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
-            .where("status", "=", "ACTIVE")
-            .where("expires_at", "<=", sql<string>`clock_timestamp()`)
-            .execute();
-
-          // 3. An ACTIVE lease left is unexpired: one fenced live writer per account and realm.
-          const incumbent = await trx
+          // 2. The incumbent: the realm's ACTIVE lease, or else its latest lease by token. LOCKED FIRST (a renewal
+          // of it serializes behind this transaction, or this one behind the renewal), judged after the lock.
+          const activeRow = await trx
             .selectFrom("ops.fencing_leases")
-            .select(["holder_id", "fencing_token", "expires_at"])
+            .select(["fencing_lease_id"])
             .where("account_ref", "=", accountRef)
             .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
             .where("status", "=", "ACTIVE")
+            .forUpdate()
             .executeTakeFirst();
-          if (incumbent !== undefined) {
-            return Object.freeze({
-              kind: "HELD" as const,
-              holderId: incumbent.holder_id,
-              fencingToken: incumbent.fencing_token,
-              expiresAt: incumbent.expires_at,
-            });
+          const latestRow =
+            activeRow ??
+            (await trx
+              .selectFrom("ops.fencing_leases")
+              .select(["fencing_lease_id"])
+              .where("account_ref", "=", accountRef)
+              .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
+              .orderBy("fencing_token", "desc")
+              .limit(1)
+              .forUpdate()
+              .executeTakeFirst());
+
+          let previousHeartbeatId: string | null = null;
+          if (latestRow !== undefined) {
+            // 3. Judged in a separate statement under the lock: its clock is read after any wait.
+            const incumbent = await trx
+              .selectFrom("ops.fencing_leases")
+              .select(["fencing_lease_id", "fencing_token", "holder_id", "status", "expires_at", "heartbeat_id"])
+              .select(sql<boolean>`expires_at <= clock_timestamp()`.as("expired"))
+              .select(LEASE_VERSION.as("version"))
+              .where("fencing_lease_id", "=", latestRow.fencing_lease_id)
+              .executeTakeFirstOrThrow();
+            // 3a. ACTIVE and unexpired: one fenced live writer per account and realm.
+            if (incumbent.status === "ACTIVE" && incumbent.expired !== true) {
+              return Object.freeze({
+                kind: "HELD" as const,
+                holderId: incumbent.holder_id,
+                fencingToken: incumbent.fencing_token,
+                expiresAt: incumbent.expires_at,
+              });
+            }
+            // 3b. Ended. Granted only over the exact version the caller has waited out (module header).
+            const presented =
+              takeover !== null &&
+              takeover.fencingLeaseId === incumbent.fencing_lease_id &&
+              takeover.fencingToken === incumbent.fencing_token &&
+              takeover.version === incumbent.version;
+            if (!presented) {
+              return Object.freeze({
+                kind: "LAPSED" as const,
+                incumbent: Object.freeze({
+                  fencingLeaseId: incumbent.fencing_lease_id,
+                  fencingToken: incumbent.fencing_token,
+                  holderId: incumbent.holder_id,
+                  status: incumbent.status,
+                  expiresAt: incumbent.expires_at,
+                  version: incumbent.version,
+                }),
+              });
+            }
+            // 3c. A lapsed ACTIVE lease ends now, with its reason in the statement that ends it (WP-040 R15/F14).
+            if (incumbent.status === "ACTIVE") {
+              await trx
+                .updateTable("ops.fencing_leases")
+                .set({ status: "EXPIRED", released_at: sql<string>`clock_timestamp()`, revoked_reason: TAKEOVER_EXPIRY_REASON })
+                .where("fencing_lease_id", "=", incumbent.fencing_lease_id)
+                .where("status", "=", "ACTIVE")
+                .where("expires_at", "<=", sql<string>`clock_timestamp()`)
+                .execute();
+            }
+            // 4. The id chain the realm's previous lease last recorded (ADR-008 §4).
+            previousHeartbeatId = incumbent.heartbeat_id;
           }
-
-          // 4. The id chain the realm's previous lease last recorded (ADR-008 §4).
-          const previous = await trx
-            .selectFrom("ops.fencing_leases")
-            .select(["heartbeat_id"])
-            .where("account_ref", "=", accountRef)
-            .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
-            .orderBy("fencing_token", "desc")
-            .limit(1)
-            .executeTakeFirst();
 
           // 5. The next token: the high-water mark plus one (never `max` over rows that can be deleted, ADR-008 §1).
           const highest = await trx
@@ -367,7 +538,7 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
               holderId: inserted.holder_id,
               acquiredAt: inserted.acquired_at,
               expiresAt: inserted.expires_at,
-              inheritedHeartbeatId: previous?.heartbeat_id ?? null,
+              inheritedHeartbeatId: previousHeartbeatId,
             }),
           });
         });
@@ -385,8 +556,11 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
     async renew(lease: FencingLeaseRef, ttlMs: number): Promise<FencingRenewOutcome> {
       const ref = leaseRef(lease);
       const lifetime = ttl(ttlMs);
-      const row = await withMappedErrors(async () =>
-        db
+      const row = await inTransaction(db, async (trx) => {
+        // Lock first (module header, I4): this statement judges nothing, so a wait here revives nothing.
+        if (!(await lockHolderRow(trx, ref))) return undefined;
+        // Then judge, under the lock already held: no wait, and `clock_timestamp()` is read now.
+        return trx
           .updateTable("ops.fencing_leases")
           .set({ expires_at: databaseExpiry(lifetime) })
           .where("fencing_lease_id", "=", ref.fencingLeaseId)
@@ -395,16 +569,17 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
           .where("status", "=", "ACTIVE")
           .where("expires_at", ">", sql<string>`clock_timestamp()`)
           .returning(["expires_at"])
-          .executeTakeFirst(),
-      );
+          .executeTakeFirst();
+      });
       return row === undefined ? Object.freeze({ kind: "LOST" as const }) : Object.freeze({ kind: "RENEWED" as const, expiresAt: row.expires_at });
     },
 
     async recordHeartbeatId(lease: FencingLeaseRef, heartbeatId: string): Promise<boolean> {
       const ref = leaseRef(lease);
       const id = heartbeatIdText(heartbeatId);
-      const result = await withMappedErrors(async () =>
-        db
+      return inTransaction(db, async (trx) => {
+        if (!(await lockHolderRow(trx, ref))) return false;
+        const result = await trx
           .updateTable("ops.fencing_leases")
           .set({ heartbeat_id: id, last_heartbeat_at: sql<string>`clock_timestamp()` })
           .where("fencing_lease_id", "=", ref.fencingLeaseId)
@@ -412,9 +587,9 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
           .where("holder_id", "=", ref.holderId)
           .where("status", "=", "ACTIVE")
           .where("expires_at", ">", sql<string>`clock_timestamp()`)
-          .executeTakeFirst(),
-      );
-      return (result.numUpdatedRows ?? 0n) > 0n;
+          .executeTakeFirst();
+        return (result.numUpdatedRows ?? 0n) > 0n;
+      });
     },
 
     async release(lease: FencingLeaseRef, reason: string): Promise<boolean> {

@@ -21,7 +21,7 @@ const MAX_AGE: Record<HealthInput, number> = {
 
 function provedLease(): { clock: ManualClock; board: ProofBoard; lease: HealthLease } {
   const clock = new ManualClock();
-  const board = new ProofBoard();
+  const board = new ProofBoard({ clock });
   const sources = Object.fromEntries(HEALTH_INPUTS.map((input) => [input, board.source(input)])) as Record<HealthInput, HealthProofSource>;
   const lease = new HealthLease({ clock, sources, maxAgeMs: MAX_AGE });
   for (const input of HEALTH_INPUTS) board.prove(input, clock.now);
@@ -35,7 +35,7 @@ describe("the seven inputs of §9.18 are all required", () => {
 
   for (const missing of HEALTH_INPUTS) {
     it(`refuses a lease without ${missing}`, () => {
-      const board = new ProofBoard();
+      const board = new ProofBoard({ clock: new ManualClock() });
       const sources: Partial<Record<HealthInput, HealthProofSource>> = Object.fromEntries(HEALTH_INPUTS.map((input) => [input, board.source(input)]));
       delete sources[missing];
       expect(() => new HealthLease({ clock: new ManualClock(), sources: sources as Record<HealthInput, HealthProofSource>, maxAgeMs: MAX_AGE })).toThrow(
@@ -45,7 +45,7 @@ describe("the seven inputs of §9.18 are all required", () => {
   }
 
   it("refuses an input it does not know, and a bound outside 1 ms … 60 s", () => {
-    const board = new ProofBoard();
+    const board = new ProofBoard({ clock: new ManualClock() });
     const sources = Object.fromEntries(HEALTH_INPUTS.map((input) => [input, board.source(input)])) as Record<HealthInput, HealthProofSource>;
     expect(() => new HealthLease({ clock: new ManualClock(), sources: { ...sources, REDIS: board.source("OMS") } as never, maxAgeMs: MAX_AGE })).toThrow(HealthLeaseConfigurationError);
     expect(() => new HealthLease({ clock: new ManualClock(), sources, maxAgeMs: { ...MAX_AGE, OMS: 0 } })).toThrow(HealthLeaseConfigurationError);
@@ -91,14 +91,14 @@ describe("proof is RECENT proof: nothing is cached forever", () => {
 
   it("an input never proved reads NO_PROOF", () => {
     const clock = new ManualClock();
-    const board = new ProofBoard();
+    const board = new ProofBoard({ clock });
     const sources = Object.fromEntries(HEALTH_INPUTS.map((input) => [input, board.source(input)])) as Record<HealthInput, HealthProofSource>;
     const verdict = new HealthLease({ clock, sources, maxAgeMs: MAX_AGE }).evaluate();
     expect(verdict.failures.map((failure) => failure.reason)).toEqual(HEALTH_INPUTS.map(() => "NO_PROOF"));
   });
 
   it("a late, older proof does not replace a newer one; a failure replaces any proof", () => {
-    const board = new ProofBoard();
+    const board = new ProofBoard({ clock: new ManualClock(200) });
     board.prove("OMS", 100);
     board.prove("OMS", 50);
     expect(board.source("OMS").read()).toEqual({ healthy: true, provenAtMs: 100 });
@@ -106,9 +106,37 @@ describe("proof is RECENT proof: nothing is cached forever", () => {
     expect(board.source("OMS").read()).toEqual({ healthy: false, reason: "FAULTED" });
   });
 
+  it("r1 I9: a proof whose evidence is OLDER than a failure recorded since never erases it (a slow read landing late)", async () => {
+    const clock = new ManualClock(100);
+    const board = new ProofBoard({ clock });
+    board.prove("DATABASE", 100);
+    await clock.advance(100);
+    // A fence renewal fails at 200 …
+    board.fail("DATABASE", "FENCE_RENEW_FAILED");
+    // … and a kill-switch read that STARTED at 150 lands afterwards: it is older evidence, and is refused.
+    board.prove("DATABASE", 150);
+    expect(board.source("DATABASE").read()).toEqual({ healthy: false, reason: "FENCE_RENEW_FAILED" });
+    board.prove("DATABASE", 200);
+    expect(board.source("DATABASE").read()).toEqual({ healthy: false, reason: "FENCE_RENEW_FAILED" });
+    // Evidence observed AFTER the failure proves the input again.
+    await clock.advance(10);
+    board.prove("DATABASE", 210);
+    expect(board.source("DATABASE").read()).toEqual({ healthy: true, provenAtMs: 210 });
+  });
+
+  it("r1 I9: a FUTURE-dated proof is refused (recorded as PROOF_IN_FUTURE, stamped now), so the honest proofs that follow are accepted", async () => {
+    const clock = new ManualClock(1_000);
+    const board = new ProofBoard({ clock });
+    board.prove("USER_DATA", 5_000_000);
+    expect(board.source("USER_DATA").read()).toEqual({ healthy: false, reason: "PROOF_IN_FUTURE" });
+    await clock.advance(1);
+    board.prove("USER_DATA", clock.now);
+    expect(board.source("USER_DATA").read()).toEqual({ healthy: true, provenAtMs: clock.now });
+  });
+
   it("a source that throws, or answers outside the two shapes, fails", () => {
     const clock = new ManualClock();
-    const board = new ProofBoard();
+    const board = new ProofBoard({ clock });
     for (const input of HEALTH_INPUTS) board.prove(input, clock.now);
     const sources = Object.fromEntries(HEALTH_INPUTS.map((input) => [input, board.source(input)])) as Record<HealthInput, HealthProofSource>;
     const odd = (read: () => unknown): HealthProofSource => ({ read: read as HealthProofSource["read"] });
@@ -136,7 +164,7 @@ describe("proof is RECENT proof: nothing is cached forever", () => {
 describe("the event-loop input", () => {
   it("proves the loop each time its timer fires on time; stop() clears its timer", async () => {
     const clock = new ManualClock();
-    const board = new ProofBoard();
+    const board = new ProofBoard({ clock });
     const probe = new EventLoopProbe({ board, clock, timers: clock, intervalMs: 500, maxLagMs: 200 });
     probe.start();
     await clock.advance(500);
@@ -150,7 +178,7 @@ describe("the event-loop input", () => {
 
   it("a loop that stalls past the bound fails EVENT_LOOP (LOOP_LAGGING)", async () => {
     const clock = new ManualClock();
-    const board = new ProofBoard();
+    const board = new ProofBoard({ clock });
     let skew = 0;
     const skewed = { monotonicMs: () => clock.monotonicMs() + skew };
     const probe = new EventLoopProbe({ board, clock: skewed, timers: clock, intervalMs: 500, maxLagMs: 200 });
@@ -160,5 +188,30 @@ describe("the event-loop input", () => {
     await clock.advance(500);
     expect(board.source("EVENT_LOOP").read()).toEqual({ healthy: false, reason: "LOOP_LAGGING" });
     probe.stop();
+  });
+
+  it("r1 I11: a clock that throws twice in a row (the timer's read, then the re-arm's) does not kill the probe: it re-arms and proves again", async () => {
+    const clock = new ManualClock();
+    const board = new ProofBoard({ clock });
+    let throws = 0;
+    const flaky = {
+      monotonicMs: (): number => {
+        if (throws > 0) {
+          throws -= 1;
+          throw new Error("clock unreadable (synthetic)");
+        }
+        return clock.monotonicMs();
+      },
+    };
+    const probe = new EventLoopProbe({ board, clock: flaky, timers: clock, intervalMs: 500, maxLagMs: 200 });
+    probe.start();
+    throws = 2;
+    await clock.advance(500);
+    expect(board.source("EVENT_LOOP").read()).toEqual({ healthy: false, reason: "CLOCK_UNREADABLE" });
+    expect(clock.pendingTimers()).toBe(1);
+    await clock.advance(1_000);
+    expect(board.source("EVENT_LOOP").read()).toEqual({ healthy: true, provenAtMs: clock.now });
+    probe.stop();
+    expect(clock.pendingTimers()).toBe(0);
   });
 });

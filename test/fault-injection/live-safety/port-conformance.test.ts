@@ -16,6 +16,8 @@ import {
   type FencingLeasePort,
   type HeartbeatView,
   type LiveSafety,
+  type OmsProgressMonitor,
+  type PlacementClassifier,
   type SafetyCoordinator,
   type SafetyOms,
 } from "../../../apps/trader/src/live-safety/index.js";
@@ -23,6 +25,7 @@ import type {
   CancelOutcome,
   HaltPort,
   LimitOrderRequest,
+  OmsStore,
   OmsVenuePort,
   OrderManager,
   PlacementOutcome,
@@ -68,8 +71,14 @@ export function fencedVenueIsAnOmsVenuePort(
   safety: LiveSafety,
   venue: OmsVenuePort,
   refusals: { signRefused(reasons: readonly string[]): SignOutcome; placementRefused(reasons: readonly string[]): PlacementOutcome },
+  classifier: PlacementClassifier<LimitOrderRequest, SignOutcome, SignedOrderHandle>,
 ): OmsVenuePort {
-  return safety.fenceVenue<LimitOrderRequest, SignOutcome, SignedOrderHandle, PlacementOutcome, CancelOutcome>(venue, refusals);
+  return safety.fenceVenue<LimitOrderRequest, SignOutcome, SignedOrderHandle, PlacementOutcome, CancelOutcome>(venue, refusals, classifier);
+}
+
+/** r1 I5: the progress monitor's wrapped store IS an `OmsStore` (what `OrderManager.open` takes). */
+export function monitoredStoreIsAnOmsStore(monitor: OmsProgressMonitor, store: OmsStore): OmsStore {
+  return monitor.store(store);
 }
 
 // --- run-time agreements ---------------------------------------------------------------------------------------
