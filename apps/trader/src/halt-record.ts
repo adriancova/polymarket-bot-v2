@@ -169,7 +169,7 @@ export type HaltRecordOutcome =
  */
 export async function recordHaltsBeforeExit(input: {
   readonly halts: readonly HaltRecord[];
-  readonly config: Pick<TraderConfig, "accounting" | "instances">;
+  readonly config: Pick<TraderConfig, "accounting" | "instances" | "seriesInstances">;
   readonly write: (rows: readonly HaltIncidentRow[], deadlineMs: number) => Promise<HaltRecordOutcome>;
   readonly log: (line: string) => void;
   readonly deadlineMs?: number;
@@ -178,7 +178,8 @@ export async function recordHaltsBeforeExit(input: {
   const deadlineMs = input.deadlineMs ?? HALT_RECORD_DEADLINE_MS;
   const rows = haltIncidentRows(input.halts, {
     accountRef: input.config.accounting.accountRef,
-    instanceIds: input.config.instances.map((instance) => instance.instanceId),
+    // `ROLLOVER-1`: a GLOBAL halt names every instance, series-bound ones included.
+    instanceIds: [...input.config.instances, ...(input.config.seriesInstances ?? [])].map((instance) => instance.instanceId),
   });
   let outcome: HaltRecordOutcome;
   try {

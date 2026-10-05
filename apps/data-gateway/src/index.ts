@@ -74,7 +74,7 @@ export { CoinbaseFeedDriver, RecordingCoinbaseSocketFactory } from "./feeds/coin
 export type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
 export { MarketLifecycleFeedDriver } from "./feeds/market-lifecycle.js";
 export type { LifecyclePhase, MarketLifecycleDriverMetrics } from "./feeds/market-lifecycle.js";
-export { SeriesAdmissionFeedDriver, admissionPayloads } from "./feeds/series-admission.js";
+export { SeriesAdmissionFeedDriver, admissionPayloads, incidentReferenceId } from "./feeds/series-admission.js";
 export type {
   AdmittedSeries,
   AdmittedWindowSink,

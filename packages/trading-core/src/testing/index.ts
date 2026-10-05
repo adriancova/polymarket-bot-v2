@@ -40,6 +40,7 @@ import {
 import {
   portFailed,
   portOk,
+  type AdmittedMarketRegistration,
   type Clock,
   type IngestedEvent,
   type MarketEventFeed,
@@ -191,7 +192,9 @@ export type TraderStoreWrite =
   | "saveCheckpoint"
   | "appendLedgerTransaction"
   | "writePnlSnapshot"
-  | "replacePnlSnapshot";
+  | "replacePnlSnapshot"
+  /** `ROLLOVER-1`: an admitted window's catalog row. */
+  | "registerAdmittedMarket";
 
 /**
  * `CKPT-1`: the writes a {@link MemoryTraderStore.persistDecisionWithCheckpoint}
@@ -233,6 +236,13 @@ export class MemoryTraderStore implements TraderStore {
   readonly pnlSnapshots: PnlSnapshot[] = [];
   /** `PROVENANCE-1`: every recorded risk refusal, in write order. */
   readonly riskRefusals: RiskRefusalRecord[] = [];
+  /**
+   * `ROLLOVER-1`: every admitted window's catalog registration, in write order
+   * — one per market id, as the durable store's idempotent insert leaves one
+   * row (a repeat with the same condition id is accepted and not recorded
+   * again; another condition id under the id is refused).
+   */
+  readonly admittedMarkets: AdmittedMarketRegistration[] = [];
   /**
    * `SNAP-1`: the identity of every snapshot recorded — `pnl_snapshots_scope_unique`
    * — and its position in {@link pnlSnapshots} (r1: where a replacement writes).
@@ -398,8 +408,26 @@ export class MemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
+  /** `ROLLOVER-1`: records one admitted window's catalog row (see {@link admittedMarkets}). */
+  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<null>> {
+    const refused = this.#refusalFor("registerAdmittedMarket");
+    if (refused !== undefined) return await Promise.resolve(refused);
+    const existing = this.admittedMarkets.find((entry) => entry.marketId === market.marketId);
+    if (existing !== undefined) {
+      return await Promise.resolve(
+        existing.conditionId === market.conditionId
+          ? portOk(null)
+          : portFailed<null>("UNAVAILABLE", `catalog.markets ${market.marketId} is registered for another condition`),
+      );
+    }
+    this.admittedMarkets.push(market);
+    return await Promise.resolve(portOk(null));
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
     return await Promise.resolve();
   }
 }
+
+export * from "./series.js";

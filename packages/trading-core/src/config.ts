@@ -76,6 +76,7 @@ import {
   DEFAULT_BOOK_FRESHNESS_BASIS,
   type BookFreshnessBasis,
 } from "./book-freshness.js";
+import { ReviewedSeriesSchema, seriesConfigHash, type ReviewedSeries } from "./series.js";
 
 /** A positive integer bound in milliseconds, small enough to be a real bound. */
 const BoundedMs = z.number().int().positive().max(86_400_000);
@@ -363,6 +364,32 @@ const InstanceConfigSchema = z.strictObject({
   params: z.unknown(),
 });
 
+/**
+ * `ROLLOVER-1` (ADR-030 Decision 4): a strategy instance bound to a REVIEWED
+ * SERIES instead of one market. Each window the series admits gets this
+ * instance's own runtime — fresh per-window strategy state — and every one of
+ * them belongs to the instance's ONE run (`runId`), numbered by the run's
+ * shared evaluation sequence (`@polymarket-bot/strategy-runtime`
+ * `RunEvaluationSequence`; the user's ruling Q2). Every field but `seriesId`
+ * means what it means on {@link InstanceConfigSchema}.
+ *
+ * The run record pins the series (ruling Q4): the instance's registered
+ * `strategy.configs.parameters` is `{ strategy: <params>, series: <the reviewed
+ * series document> }` (`apps/trader` REGISTER-1 and BOOT-1).
+ */
+const SeriesInstanceConfigSchema = z.strictObject({
+  instanceId: Uuidv7,
+  runId: Uuid,
+  configId: Uuid,
+  runSeed: z.string().regex(/^(?:0|[1-9]\d*)$/u),
+  /** The `seriesId` of one of this document's `series` entries. */
+  seriesId: CodeString,
+  ownership: z.enum(["OWNER", "SHADOW"]),
+  evaluationPriority: z.number().int().min(0).max(1_000_000),
+  evaluationBudgetUs: z.number().int().positive().max(60_000_000),
+  params: z.unknown(),
+});
+
 /** §9.15 / ADR-006 account and asset identity. No implicit "cash" asset exists. */
 const AccountingConfigSchema = z.strictObject({
   accountRef: Identifier,
@@ -516,13 +543,29 @@ export const TraderConfigSchema = z.strictObject({
   /** ADR-023: optional; absent means `LAST_CHANGE` (see the schema's comment). */
   bookFreshness: BookFreshnessConfigSchema.optional(),
   infrastructure: InfrastructureConfigSchema,
-  markets: z.array(MarketConfigSchema).min(1).max(1000).readonly(),
-  instances: z.array(InstanceConfigSchema).min(1).max(1000).readonly(),
+  /**
+   * The configured markets. EMPTY is allowed only when every instance is
+   * series-bound (`ROLLOVER-1`): a run whose markets all come from series
+   * admission configures none ({@link crossFieldRefusal}).
+   */
+  markets: z.array(MarketConfigSchema).min(0).max(1000).readonly(),
+  /** Market-bound instances. Empty only when there is a series-bound one. */
+  instances: z.array(InstanceConfigSchema).min(0).max(1000).readonly(),
+  /**
+   * `ROLLOVER-1` (ADR-030 Decision 1.1): the REVIEWED series this trader admits
+   * windows of — each the same document the gateway's `seriesAdmission` block
+   * names, so the two agree on its configuration hash. Optional: a trader
+   * without it consumes no admission and runs exactly as before.
+   */
+  series: z.array(ReviewedSeriesSchema).min(1).max(8).readonly().optional(),
+  /** `ROLLOVER-1`: the instances bound to a series rather than a market. */
+  seriesInstances: z.array(SeriesInstanceConfigSchema).min(1).max(64).readonly().optional(),
 });
 
 export type TraderConfig = Readonly<z.infer<typeof TraderConfigSchema>>;
 export type MarketConfig = TraderConfig["markets"][number];
 export type InstanceConfig = TraderConfig["instances"][number];
+export type SeriesInstanceConfig = NonNullable<TraderConfig["seriesInstances"]>[number];
 
 /** **D2** — the parsing copy, built and WARMED at module load. */
 const TraderConfigDoor = prototypeFreeParser(TraderConfigSchema);
@@ -670,6 +713,8 @@ function parseTraderConfigInner(input: unknown): ParseConfigResult {
  * MEDIUM-2). The canonical door is what makes the cheap comparison sound.
  */
 function crossFieldRefusal(config: TraderConfig): ConfigRefusal | undefined {
+  const series = seriesRefusal(config);
+  if (series !== undefined) return series;
   if (config.accounting.startingCash === config.simulation.startingCash) return undefined;
   return {
     code: "TRADER_CONFIG_INCONSISTENT",
@@ -721,7 +766,8 @@ export function bookFreshnessCeilingMsOf(config: TraderConfig): number | undefin
  */
 export function configuredFeatureKeys(config: TraderConfig): readonly string[] {
   const keys = new Set<string>();
-  for (const instance of config.instances) {
+  // `ROLLOVER-1`: a series-bound instance's params configure feature keys too.
+  for (const instance of [...config.instances, ...(config.seriesInstances ?? [])]) {
     const params = instance.params;
     if (typeof params !== "object" || params === null) continue;
     collectFeatureKeys(params as Record<string, unknown>, keys);
@@ -749,4 +795,90 @@ function collectFeatureKeys(node: Record<string, unknown>, into: Set<string>): v
       collectFeatureKeys(value as Record<string, unknown>, into);
     }
   }
+}
+
+/**
+ * `ROLLOVER-1`: the cross-field rules of the series fields, each a document no
+ * operator can act on:
+ *
+ * - at least one instance, market-bound or series-bound;
+ * - a market-bound instance needs a configured market (`createPaperTrader`
+ *   names the missing one), and a configured market with no instance at all is
+ *   still accepted as before;
+ * - every series id once; every series has at least one series-bound instance
+ *   (a reviewed series nothing trades would admit windows for no run), at most
+ *   one OWNER (one live owner per window: §6 invariant 11), and every
+ *   series-bound instance names a configured series;
+ * - no `instanceId` and no `runId` twice across BOTH instance lists: a run's
+ *   evaluation sequence is shared by its runtimes (ruling Q2), so two
+ *   instances on one run would interleave one counter, and one instance id on
+ *   two lists would be one deployment run twice.
+ */
+function seriesRefusal(config: TraderConfig): ConfigRefusal | undefined {
+  const issues: string[] = [];
+  const seriesInstances = config.seriesInstances ?? [];
+  const series = config.series ?? [];
+  if (config.instances.length === 0 && seriesInstances.length === 0) {
+    issues.push("instances, seriesInstances: at least one instance is required");
+  }
+  if (config.instances.length > 0 && config.markets.length === 0) {
+    issues.push("markets: a market-bound instance needs at least one configured market");
+  }
+  const seriesIds = series.map((entry) => entry.seriesId);
+  if (new Set(seriesIds).size !== seriesIds.length) issues.push("series: each seriesId may appear once");
+  for (const entry of series) {
+    if (!seriesInstances.some((instance) => instance.seriesId === entry.seriesId)) {
+      issues.push(`series: ${entry.seriesId} has no series-bound instance; a reviewed series nothing trades admits windows for no run`);
+    }
+  }
+  for (const entry of series) {
+    const owners = seriesInstances.filter((instance) => instance.seriesId === entry.seriesId && instance.ownership === "OWNER");
+    if (owners.length > 1) {
+      issues.push(
+        `seriesInstances: series ${entry.seriesId} has ${String(owners.length)} OWNER instances; every window would have two live owners (§6 invariant 11, ADR-011)`,
+      );
+    }
+  }
+  for (const instance of seriesInstances) {
+    if (!seriesIds.includes(instance.seriesId)) {
+      issues.push(`seriesInstances: instance ${instance.instanceId} names series ${instance.seriesId}, which this document does not review`);
+    }
+  }
+  const instanceIds = [...config.instances.map((instance) => instance.instanceId), ...seriesInstances.map((instance) => instance.instanceId)];
+  if (new Set(instanceIds).size !== instanceIds.length) {
+    issues.push("instances, seriesInstances: each instanceId may appear once across both lists");
+  }
+  const runIds = [...config.instances.map((instance) => instance.runId), ...seriesInstances.map((instance) => instance.runId)];
+  if (seriesInstances.length > 0 && new Set(runIds).size !== runIds.length) {
+    issues.push("instances, seriesInstances: each runId may appear once when a series-bound instance runs (its run's evaluation sequence is its own)");
+  }
+  for (const entry of series) {
+    if (!seriesConfigHash(entry).ok) issues.push(`series: ${entry.seriesId} cannot be canonicalized for its configuration hash`);
+  }
+  if (issues.length === 0) return undefined;
+  return {
+    code: "TRADER_CONFIG_INCONSISTENT",
+    detail:
+      "the series fields of the trader configuration do not describe a runnable document (ROLLOVER-1, ADR-030): " +
+      "refused rather than repaired",
+    issues,
+  };
+}
+
+/** `ROLLOVER-1`: one configured reviewed series with its configuration hash. */
+export interface ConfiguredSeries {
+  readonly series: ReviewedSeries;
+  readonly configHash: string;
+}
+
+/**
+ * `ROLLOVER-1`: the configured reviewed series with their configuration hashes,
+ * in document order. A parsed configuration's series always canonicalize
+ * ({@link seriesRefusal}), so this never answers fewer than it was given.
+ */
+export function configuredSeries(config: TraderConfig): readonly ConfiguredSeries[] {
+  return (config.series ?? []).flatMap((series) => {
+    const hash = seriesConfigHash(series);
+    return hash.ok ? [{ series, configHash: hash.hash }] : [];
+  });
 }

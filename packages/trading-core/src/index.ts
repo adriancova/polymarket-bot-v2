@@ -47,13 +47,40 @@ export {
 export {
   TraderConfigSchema,
   configuredFeatureKeys,
+  configuredSeries,
   parseTraderConfig,
   type ConfigRefusal,
+  type ConfiguredSeries,
   type InstanceConfig,
   type MarketConfig,
   type ParseConfigResult,
+  type SeriesInstanceConfig,
   type TraderConfig,
 } from "./config.js";
+
+/** `ROLLOVER-1` (ADR-030): the trader's half of series auto-admission. */
+export {
+  ReviewedSeriesSchema,
+  SERIES_TITLE_TIME_ZONE,
+  SERIES_TITLE_ZONE_LABEL,
+  admissionRunModeProblem,
+  canonicalSeriesJson,
+  deriveWindowSchedule,
+  epochMsOfInstant,
+  seriesConfigHash,
+  windowInternalMarketId,
+  type ReviewedSeries,
+  type WindowScheduleResult,
+} from "./series.js";
+export {
+  SeriesWindowAdmissions,
+  type AdmissionMetrics,
+  type AdmissionNotice,
+  type AdmissionRefusalCode,
+  type AdmissionVerdict,
+  type AdmittedWindow,
+  type WindowAttachment,
+} from "./series-admission.js";
 
 export {
   CONSUMED_EVENTS,
@@ -149,6 +176,7 @@ export {
   type FeedMark,
   type DispatchPosition,
   type RiskRefusalRecord,
+  type AdmittedMarketRegistration,
 } from "./ports.js";
 
 export {
@@ -227,10 +255,13 @@ export {
 export {
   InstanceRegistry,
   compareInstances,
+  windowRegistrationKey,
+  type InstanceRegistration,
   type ManifestRow,
   type Ownership,
   type RegisterResult,
   type RegisteredInstance,
+  type RegistrationIdentity,
 } from "./instances.js";
 
 export {

@@ -83,6 +83,7 @@ import {
   encodeJsonbText,
   LEDGER_SCOPES,
   RUN_MODES,
+  uuidV7,
   type LedgerScopeValue,
   type PolymarketBotDatabase,
   type PostgresPool,
@@ -93,6 +94,7 @@ import { TRADER_RUN_MODE, unreplacedPnlSnapshotProblem } from "@polymarket-bot/t
 import {
   portFailed,
   portOk,
+  type AdmittedMarketRegistration,
   type GroupCommit,
   type PortResult,
   type RiskRefusalRecord,
@@ -298,12 +300,25 @@ function decisionRow(record: DecisionRecord, telemetry: DecisionTelemetry, decis
   };
 }
 
-/** The `strategy.state_checkpoints` row of one checkpoint — shared the same way as {@link decisionRow}. */
-function checkpointRow(checkpoint: StrategyStateCheckpoint, capturedAt: string) {
+/**
+ * The `strategy.state_checkpoints` row of one checkpoint — shared the same way
+ * as {@link decisionRow}.
+ *
+ * `ROLLOVER-1` (the user's ruling Q2): `market_id` NAMES THE WINDOW the
+ * checkpoint's runtime evaluates — the market of the decision it follows
+ * (ADR-027 D3 pairs every checkpoint with that decision, under the same
+ * `(run_id, sequence)`). It was NULL: one run held one market, so the run said
+ * which. Since one run spans many windows, each with its own runtime, a
+ * restore must pick a window's own last checkpoint, and this column is what
+ * says whose it is. No migration: the nullable foreign key into
+ * `catalog.markets` was there from `0004`, and the decision row already binds
+ * the same id.
+ */
+function checkpointRow(checkpoint: StrategyStateCheckpoint, capturedAt: string, marketId: string | null) {
   return {
     run_id: checkpoint.runId,
     instance_id: checkpoint.instanceId,
-    market_id: null,
+    market_id: marketId,
     checkpoint_seq: String(checkpoint.checkpointSeq),
     state_schema_version: checkpoint.stateSchemaVersion,
     state: checkpoint.stateJson,
@@ -384,7 +399,9 @@ export class PostgresGroupCommit implements GroupCommit {
       decisions = evaluations.decisions.map((entry) =>
         decisionRow(entry.record, entry.telemetry, this.#decisionContractVersion),
       );
-      checkpoints = evaluations.checkpoints.map((entry) => checkpointRow(entry.checkpoint, entry.capturedAt));
+      checkpoints = evaluations.checkpoints.map((entry) =>
+        checkpointRow(entry.checkpoint, entry.capturedAt, marketOfCheckpoint(evaluations, entry.checkpoint)),
+      );
       riskEvents = evaluations.riskRefusals.flatMap((refusal) => riskEventRows(refusal, this.#accountRef));
     } catch (cause) {
       return portFailed(
@@ -532,6 +549,26 @@ export class PostgresGroupCommit implements GroupCommit {
 
 function describeCause(cause: unknown): string {
   return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+}
+
+/**
+ * `ROLLOVER-1`: the market of the decision a staged checkpoint follows — the
+ * decision of the same staging with the checkpoint's run, instance and
+ * sequence. The loop never stages a checkpoint apart from it (ADR-027 D3:
+ * `DecisionOutboxBuffer.appendCheckpoint` refuses one that does not follow its
+ * decision, and `stagedFrom` stages every checkpoint with it), so in the
+ * trader this always finds the window. A staging assembled elsewhere without
+ * the decision keeps the pre-`ROLLOVER-1` NULL — the write that was legal
+ * before stays legal — rather than inventing a market.
+ */
+function marketOfCheckpoint(evaluations: StagedEvaluations, checkpoint: StrategyStateCheckpoint): string | null {
+  const decision = evaluations.decisions.find(
+    (entry) =>
+      entry.record.runId === checkpoint.runId &&
+      entry.record.instanceId === checkpoint.instanceId &&
+      entry.record.evaluationSeq === checkpoint.checkpointSeq,
+  );
+  return decision === undefined ? null : decision.record.marketId;
 }
 
 /**
@@ -765,12 +802,124 @@ export class PostgresTraderStore implements TraderStore {
   ): Promise<PortResult<null>> {
     return await this.#contained("persist a decision with its strategy checkpoint", async () => {
       const decision = decisionRow(record, telemetry, this.#decisionContractVersion);
-      const stored = checkpointRow(checkpoint, capturedAt);
+      const stored = checkpointRow(checkpoint, capturedAt, record.marketId);
       await this.#db
         .with("persisted_decision", (db) => db.insertInto("strategy.decisions").values(decision).returning("decision_id"))
         .insertInto("strategy.state_checkpoints")
         .values(stored)
         .execute();
+    });
+  }
+
+  /**
+   * `ROLLOVER-1` (ADR-030) — one ADMITTED series window's catalog row, under
+   * the window's OWN `market_id` (the derived id the gateway published), in
+   * ONE transaction: `catalog.markets`, its first `market_parameter_history`
+   * version and its two `market_tokens` — exactly the rows `WP-040`'s
+   * `registerMarket` writes for a registered market, with the same columns and
+   * the same version-1 `changed_parameters`. That repository MINTS its market
+   * id, and an admitted window's id is not this process's to mint (every
+   * envelope of the window already carries it), so the insert is here, through
+   * the typed builder, as `strategy.decisions`' is (module header).
+   *
+   * BOOT-1's rule — the trader creates no market row from its CONFIGURATION —
+   * is unchanged: this row comes from a recorded admission event, re-judged
+   * against the run's own review (`@polymarket-bot/trading-core`
+   * `series-admission.ts`), before any decision, checkpoint, ledger entry or
+   * PnL row of the window names it.
+   *
+   * Idempotent: a row already registered under this `market_id` with the same
+   * condition id and the same two tokens answers ok (a replayed admission);
+   * anything else — another condition id under the id, or this condition id
+   * or a token under another id — is refused, and the loop halts.
+   */
+  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<null>> {
+    return await this.#contained("register an admitted series window", async () => {
+      await this.#db.transaction().execute(async (trx) => {
+        const existing = await trx
+          .selectFrom("catalog.markets")
+          .select(["market_id", "condition_id"])
+          .where("market_id", "=", market.marketId)
+          .executeTakeFirst();
+        if (existing !== undefined) {
+          const tokens = await trx
+            .selectFrom("catalog.market_tokens")
+            .select(["token_id", "outcome_side"])
+            .where("market_id", "=", market.marketId)
+            .orderBy("token_id")
+            .execute();
+          const registered = tokens.map((token) => `${token.outcome_side}:${token.token_id}`).sort();
+          const admitted = [`NO:${market.noTokenId}`, `YES:${market.yesTokenId}`].sort();
+          if (existing.condition_id !== market.conditionId || registered.join("|") !== admitted.join("|")) {
+            throw new Error(
+              `catalog.markets ${market.marketId} is registered for condition ${existing.condition_id} with tokens ` +
+                `${registered.join(", ")}, not the admitted window's ${market.conditionId} with ${admitted.join(", ")}`,
+            );
+          }
+          return;
+        }
+        const clash = await trx
+          .selectFrom("catalog.markets")
+          .select(["market_id"])
+          .where("condition_id", "=", market.conditionId)
+          .executeTakeFirst();
+        if (clash !== undefined) {
+          throw new Error(
+            `condition ${market.conditionId} is already registered as catalog.markets ${clash.market_id}; an admitted window never shadows a registered market`,
+          );
+        }
+        await trx
+          .insertInto("catalog.markets")
+          .values({
+            market_id: market.marketId,
+            condition_id: market.conditionId,
+            venue_event_id: null,
+            venue_market_slug: null,
+            series_id: null,
+            question_title: market.questionTitle,
+            lifecycle_state: "DISCOVERED",
+            current_parameters_version: 1,
+            neg_risk: market.negRisk,
+            tick_size: market.tickSize,
+            minimum_order_size: market.minimumOrderSize,
+            trading_delay_seconds: market.tradingDelaySeconds,
+            open_time: market.openTime,
+            close_time: market.closeTime,
+            raw_metadata: encodeJsonbText(
+              { admittedBy: "series-admission", windowTitle: market.questionTitle, observedAt: market.observedAt },
+              "markets.raw_metadata",
+            ),
+          })
+          .execute();
+        await trx
+          .insertInto("catalog.market_parameter_history")
+          .values({
+            parameter_version_id: uuidV7(),
+            market_id: market.marketId,
+            parameters_version: 1,
+            previous_parameters_version: null,
+            changed_parameters: ["tick_size", "minimum_order_size", "trading_delay", "neg_risk", "status"],
+            tick_size: market.tickSize,
+            minimum_order_size: market.minimumOrderSize,
+            trading_delay_seconds: market.tradingDelaySeconds,
+            neg_risk: market.negRisk,
+            lifecycle_state: "DISCOVERED",
+            fee_schedule_id: null,
+            open_time: market.openTime,
+            close_time: market.closeTime,
+            source: "polymarket",
+            source_event_id: null,
+            observed_at: market.observedAt,
+          })
+          .execute();
+        await trx
+          .insertInto("catalog.market_tokens")
+          .values([
+            { market_token_id: uuidV7(), market_id: market.marketId, token_id: market.yesTokenId, outcome_side: "YES", outcome_label: market.yesLabel },
+            { market_token_id: uuidV7(), market_id: market.marketId, token_id: market.noTokenId, outcome_side: "NO", outcome_label: market.noLabel },
+          ])
+          .execute();
+      });
     });
   }
 

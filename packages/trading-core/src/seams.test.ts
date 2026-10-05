@@ -331,6 +331,8 @@ describe("obligation 9 — reservations", () => {
 describe("§8.2 — the instance comparator", () => {
   function instance(overrides: Record<string, unknown>) {
     return {
+      // `ROLLOVER-1`: a market-bound registration's key is its instance id.
+      key: typeof overrides["instanceId"] === "string" ? overrides["instanceId"] : "a1",
       instanceId: "a1",
       runId: "r1",
       configId: "c1",

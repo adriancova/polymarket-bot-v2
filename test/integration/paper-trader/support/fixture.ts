@@ -48,6 +48,7 @@ import {
   type TraderStore,
 } from "@polymarket-bot/trader";
 import { ManualClock, MemoryEventFeed, MemoryTraderStore } from "@polymarket-bot/trader/testing";
+import type { AdmissionNotice } from "@polymarket-bot/trader";
 
 export const MARKET_ID = "018f4a7e-1111-7abc-8def-0123456789ab";
 /** The fixture market's venue condition id, as the configuration and the events state it. */
@@ -663,6 +664,8 @@ export function assemble(
      * pins ADR-024's per-frame behaviour passes {@link adr024Reproduction}.
      */
     readonly evaluationCadence?: EvaluationCadenceOption;
+    /** `ROLLOVER-1`: told of every series-window admission, refusal and teardown. */
+    readonly onAdmission?: (notice: AdmissionNotice) => void;
   } = {},
 ): { readonly result: CreateTraderResult; readonly parts: Assembled | undefined } {
   const clock = new ManualClock("2026-03-04T12:00:00.000Z");
@@ -703,6 +706,7 @@ export function assemble(
     // are checked against their rebuilds from zero after EVERY fill.
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
     ...(options.evaluationCadence === undefined ? {} : { evaluationCadence: options.evaluationCadence }),
+    ...(options.onAdmission === undefined ? {} : { onAdmission: options.onAdmission }),
   });
   if (!result.ok) return { result, parts: undefined };
   built.wiring.trader = result.trader;

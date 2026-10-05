@@ -25,8 +25,9 @@
  *    `admissionLeadSeconds` ahead is not yet due. A window whose condition id
  *    or token a configured market already holds is skipped (never shadowed).
  * 4. **The cap** (Decision 1.8): with `maximumConcurrentWindows` live windows of
- *    the series, nothing more is admitted; a NOTIFY incident stands until room
- *    frees, and the window is reconsidered next cycle.
+ *    the series, nothing more is admitted; a NOTIFY incident naming the held
+ *    window stands until room frees, and the window is reconsidered next
+ *    cycle.
  * 5. **The CLOB read** — `GET /clob-markets/{condition_id}` (S-D65), journaled
  *    first like every response — for the explicit pairing and `itode`.
  * 6. **The judge** (`@polymarket-bot/universe` `judgeSeriesWindow`): exact
@@ -60,10 +61,29 @@
  * Every request is one GET, sequential, never stacked (an overlapping cycle is
  * skipped and counted); the configuration door budgets the cadence against the
  * documented limits. Failures (transport, non-2xx, a body the door cannot
- * read) open NOTIFY incidents and derive nothing; `consecutiveFailureThreshold`
- * of them in a row is a STALL (`FeedStale` plus `GATEWAY_FEED_STALL`), as for
- * the lifecycle feed. Retired and refused records are pruned after their
- * retention (`../admission-ledger.ts`).
+ * read) derive nothing: a CLOB read's failure opens a NOTIFY incident naming
+ * its window; a keyset read's is counted (`requestFailures`,
+ * `lastRequestFailure`), and `consecutiveFailureThreshold` failures in a row
+ * is a STALL (`FeedStale` plus `GATEWAY_FEED_STALL`), as for the lifecycle
+ * feed. Retired and refused records are pruned after their retention
+ * (`../admission-ledger.ts`).
+ *
+ * ## Incidents name a window
+ *
+ * A consumer treats a data-quality incident that names NO market as a loss of
+ * the gateway's market data, and taints every book of the epoch for the rest
+ * of it (ADR-023 D2 rule 4). Nothing the admission feed sees — a held window,
+ * a refused one, a failed read — is about the delivery of any book, and the
+ * cap is reached in the ordinary course of a run (two live windows and the
+ * next one due). So every routine admission incident NAMES THE WINDOW it is
+ * about, by its derived id (`windowInternalMarketId`): a market no consumer
+ * runs until it is admitted, so the incident neither pauses a live window nor
+ * taints the epoch; with no window to derive (no condition id or no start
+ * locator) it names its scope's reference id ({@link incidentReferenceId}).
+ * A condition that is about no window — a keyset read's failure, an event
+ * with no identity at all — is counted instead. Only what the
+ * lifecycle feed also raises market-less stays market-less: the STALL, a WAL
+ * refusal and a ledger write failure (both PAGE).
  */
 
 import {
@@ -167,6 +187,10 @@ export interface SeriesAdmissionDriverMetrics {
   readonly windowsSkippedLate: number;
   readonly windowsSkippedKnown: number;
   readonly windowsHeldByCap: number;
+  /** Keyset events with neither a condition id nor an event id: never admitted, counted. */
+  readonly windowsUnidentified: number;
+  /** The last keyset-read failure, bounded; `null` when none happened. */
+  readonly lastRequestFailure: string | null;
   readonly admissionsUnpublished: number;
   readonly admissionsReplayed: number;
   readonly ledgerWriteFailures: number;
@@ -192,6 +216,30 @@ const ADMISSION_CHANGED_PARAMETERS = Object.freeze([
 ] as const);
 
 /** The admission frame's three payloads, from a ledger record (so a replay is byte-for-byte the intent). */
+/**
+ * The derived id of the window a keyset event describes, as a one-element
+ * list, or `[]` when it cannot be derived (no condition id or no start
+ * locator). An admission incident names this — a market no consumer runs
+ * until it is admitted — so it neither pauses a live window nor taints the
+ * epoch (module header, "Incidents name a window").
+ */
+function derivedWindowIds(conditionId: string | null, startMs: number | undefined): readonly string[] {
+  if (conditionId === null || conditionId === "" || startMs === undefined) return [];
+  const id = windowInternalMarketId(conditionId, startMs);
+  return id === undefined ? [] : [id];
+}
+
+/**
+ * The id an admission incident names when there is no window to derive (no
+ * condition id or no start locator): a UUIDv7 derived from the incident's
+ * scope with timestamp 0, so it is stable, distinct per scope, and names no
+ * market any process runs — the incident is reported without tainting the
+ * epoch (module header).
+ */
+export function incidentReferenceId(scope: string): string {
+  return windowInternalMarketId(`series-admission-incident|${scope}`, 0) ?? "00000000-0000-7000-8000-000000000000";
+}
+
 export function admissionPayloads(
   record: AdmissionLedgerRecord,
   window: AdmittedWindowRecord,
@@ -260,6 +308,9 @@ export class SeriesAdmissionFeedDriver {
   #skippedLate = 0;
   #skippedKnown = 0;
   #heldByCap = 0;
+  #unidentified = 0;
+  /** The last keyset failure (counted, not published: see {@link #requestFailed}). */
+  #lastRequestFailure: string | undefined;
   #unpublished = 0;
   #replayed = 0;
   #ledgerWriteFailures = 0;
@@ -477,13 +528,12 @@ export class SeriesAdmissionFeedDriver {
     const key = conditionId ?? (event.eventId === null ? undefined : `event:${event.eventId}`);
     if (key === undefined) {
       // No condition id and no event id: nothing identifies the window, so it
-      // cannot be recorded or judged once. It is reported, never admitted.
-      this.#openIncident(
-        `${this.#options.feedId}:${entry.series.seriesId}:unidentified`,
-        "GATEWAY_SERIES_WINDOW_UNIDENTIFIED",
-        "NOTIFY",
-        `a keyset event of series ${entry.series.seriesId} carries neither a condition id nor an event id; it is not admitted`,
-      );
+      // cannot be recorded or judged once, and it is never admitted. It is
+      // COUNTED (`windowsUnidentified`), not published as an incident: an
+      // incident must name a market, and a market-less one taints every book
+      // of the epoch for every consumer (ADR-023 D2 rule 4) — for a fact about
+      // no book (see "Incidents name a window" in the module header).
+      this.#unidentified += 1;
       return;
     }
     if (this.#options.ledger.get(key) !== undefined) return; // judged once, never again
@@ -504,11 +554,14 @@ export class SeriesAdmissionFeedDriver {
     const capScope = `${this.#options.feedId}:${entry.series.seriesId}:cap`;
     if (live >= entry.series.maximumConcurrentWindows) {
       this.#heldByCap += 1;
-      this.#openIncident(
+      // Named by the HELD window's derived id — a market no consumer runs, so
+      // the incident neither pauses a live window nor taints the epoch.
+      this.#openWindowIncident(
         capScope,
         "GATEWAY_SERIES_CAP_REACHED",
         "NOTIFY",
         `series ${entry.series.seriesId} has ${String(live)} live windows, its reviewed cap (maximumConcurrentWindows ${String(entry.series.maximumConcurrentWindows)}, ADR-030 Decision 1.8); window ${conditionId ?? key} is held until one is torn down`,
+        derivedWindowIds(conditionId, startMs),
       );
       return;
     }
@@ -527,18 +580,18 @@ export class SeriesAdmissionFeedDriver {
           ...(this.#options.clobBaseUrl === undefined ? {} : { baseUrl: this.#options.clobBaseUrl }),
         });
       } catch (error) {
-        this.#requestFailed(entry, "GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId} failed at the transport level: ${describe(error)}; the window is reconsidered next cycle`);
+        this.#requestFailed(entry, "GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId} failed at the transport level: ${describe(error)}; the window is reconsidered next cycle`, derivedWindowIds(conditionId, startMs));
         return;
       }
       clobFrame = this.#journal(url, response.bodyUtf8);
       if (clobFrame === undefined || this.#stopped) return;
       if (response.status < 200 || response.status >= 300) {
-        this.#requestFailed(entry, "GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId} returned HTTP ${String(response.status)}; the window is reconsidered next cycle`);
+        this.#requestFailed(entry, "GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId} returned HTTP ${String(response.status)}; the window is reconsidered next cycle`, derivedWindowIds(conditionId, startMs));
         return;
       }
       clob = readClobMarketInfoBody(response.bodyUtf8);
       if (clob.status === "invalid") {
-        this.#requestFailed(entry, "GATEWAY_SERIES_CLOB_READ_INVALID", `the CLOB market-info body for ${conditionId} was not the documented ClobMarketDetails: ${clob.issues.join("; ")}; the window is reconsidered next cycle`);
+        this.#requestFailed(entry, "GATEWAY_SERIES_CLOB_READ_INVALID", `the CLOB market-info body for ${conditionId} was not the documented ClobMarketDetails: ${clob.issues.join("; ")}; the window is reconsidered next cycle`, derivedWindowIds(conditionId, startMs));
         return;
       }
       this.#clobReads += 1;
@@ -795,10 +848,22 @@ export class SeriesAdmissionFeedDriver {
     this.#consecutiveFailures = 0;
   }
 
-  #requestFailed(entry: AdmittedSeries, reasonCode: string, detail: string): void {
+  /**
+   * One failed request. A CLOB read is about ONE window, so its incident names
+   * that window (`windowIds`); a keyset read is about no window, so it is only
+   * COUNTED — a market-less incident per transient failure would taint every
+   * book of the epoch (ADR-023 D2 rule 4) — and `consecutiveFailureThreshold`
+   * of them in a row is the STALL below, raised exactly as the lifecycle
+   * feed's is.
+   */
+  #requestFailed(entry: AdmittedSeries, reasonCode: string, detail: string, windowIds: readonly string[] = []): void {
     this.#requestFailures += 1;
     this.#consecutiveFailures += 1;
-    this.#openIncident(`${this.#options.feedId}:${entry.series.seriesId}`, reasonCode, "NOTIFY", detail);
+    if (windowIds.length > 0) {
+      this.#openWindowIncident(`${this.#options.feedId}:${entry.series.seriesId}:${reasonCode}`, reasonCode, "NOTIFY", detail, windowIds);
+    } else {
+      this.#lastRequestFailure = `${reasonCode}: ${detail}`.slice(0, 500);
+    }
     if (this.#consecutiveFailures !== this.#options.consecutiveFailureThreshold) return;
     const nowMs = this.#options.clock.nowMs();
     const stale: FeedStalePayload = {
@@ -823,22 +888,17 @@ export class SeriesAdmissionFeedDriver {
     });
   }
 
-  #openIncident(scope: string, reasonCode: string, severity: IncidentSeverity, detail: string): void {
-    this.#options.dispatcher.openIncident({ scope, reasonCode, severity, detail, feedId: this.#options.feedId });
-  }
-
   /** An incident whose envelope names the window(s) it is about (`affectedMarketIds`). */
   #openWindowIncident(
     scope: string,
     reasonCode: string,
     severity: IncidentSeverity,
     detail: string,
-    affectedMarketIds: readonly string[],
+    windowIds: readonly string[],
   ): void {
-    if (affectedMarketIds.length === 0) {
-      this.#openIncident(scope, reasonCode, severity, detail);
-      return;
-    }
+    // Never market-less (module header, "Incidents name a window"): with no
+    // window to derive, the incident names its scope's REFERENCE id.
+    const affectedMarketIds = windowIds.length > 0 ? windowIds : [incidentReferenceId(scope)];
     this.#options.dispatcher.openIncident(
       { scope, reasonCode, severity, detail, feedId: this.#options.feedId },
       (incidentId) => {
@@ -879,6 +939,8 @@ export class SeriesAdmissionFeedDriver {
       windowsSkippedLate: this.#skippedLate,
       windowsSkippedKnown: this.#skippedKnown,
       windowsHeldByCap: this.#heldByCap,
+      windowsUnidentified: this.#unidentified,
+      lastRequestFailure: this.#lastRequestFailure ?? null,
       admissionsUnpublished: this.#unpublished,
       admissionsReplayed: this.#replayed,
       ledgerWriteFailures: this.#ledgerWriteFailures,

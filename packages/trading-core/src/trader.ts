@@ -39,10 +39,12 @@ import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
 import { Ledger } from "@polymarket-bot/ledger";
 import { parseRiskPolicy, type RiskPolicy } from "@polymarket-bot/risk";
 import {
+  createRunEvaluationSequence,
   createStrategyInstanceRuntime,
   type CheckpointStore,
   type DecisionSink,
   type MonotonicClock,
+  type RunEvaluationSequence,
 } from "@polymarket-bot/strategy-runtime";
 import {
   staticBracketParamsSchema,
@@ -53,11 +55,17 @@ import {
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import { evaluationCadenceProblem, type CadenceAlarm, type EvaluationCadenceOption } from "./cadence.js";
-import { configuredFeatureKeys, parseTraderConfig, type TraderConfig } from "./config.js";
+import {
+  configuredFeatureKeys,
+  configuredSeries,
+  parseTraderConfig,
+  type SeriesInstanceConfig,
+  type TraderConfig,
+} from "./config.js";
 import { accountingChecksProblem, type AccountingChecks } from "./folds.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
-import { InstanceRegistry } from "./instances.js";
+import { InstanceRegistry, windowRegistrationKey, type InstanceRegistration } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
 import { retentionBoundsProblem, type RetentionBounds } from "./order-lifecycle.js";
@@ -68,6 +76,8 @@ import {
   TRADER_RUN_MODE,
   type Environment,
 } from "./safety.js";
+import { admissionRunModeProblem } from "./series.js";
+import { SeriesWindowAdmissions, type AdmissionNotice } from "./series-admission.js";
 import { normalizeToStrictUtc } from "./time.js";
 
 export interface CreateTraderOptions {
@@ -119,6 +129,11 @@ export interface CreateTraderOptions {
    * only.
    */
   readonly onCadenceAlarm?: (alarm: CadenceAlarm) => void;
+  /**
+   * `ROLLOVER-1` (ADR-030) — told of every series-window admission, refusal and
+   * teardown; the live root logs them. Output only.
+   */
+  readonly onAdmission?: (notice: AdmissionNotice) => void;
 }
 
 export interface TraderRefusal {
@@ -130,6 +145,8 @@ export interface TraderRefusal {
     | "TRADER_ALLOCATOR_CAPS_REFUSED"
     | "TRADER_MARKET_INVALID"
     | "TRADER_INSTANCE_INVALID"
+    /** `ROLLOVER-1`: series admission may not run in this process's mode (ADR-030 Decision 2.1). */
+    | "TRADER_ADMISSION_REFUSED"
     | "TRADER_LEDGER_REFUSED";
   readonly detail: string;
   readonly issues: readonly string[];
@@ -154,6 +171,12 @@ export interface PaperTrader {
   readonly riskPolicy: RiskPolicy;
   /** The §8.2 run manifest, recorded as the handoff requires. */
   readonly manifest: ReturnType<InstanceRegistry["manifest"]>;
+  /**
+   * `ROLLOVER-1` (ADR-030): the run's series admissions, when the
+   * configuration reviews a series. The admitted windows join {@link markets}
+   * and {@link registry} as they are admitted, and leave both at teardown.
+   */
+  readonly admission: SeriesWindowAdmissions | undefined;
 }
 
 export type CreateTraderResult =
@@ -397,6 +420,114 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     }
   }
 
+  // --- 6b. `ROLLOVER-1`: series-bound instances and the series admissions -----
+  //
+  // ADR-030 Decision 2.1: admission runs only in PAPER or BACKTEST. This
+  // process is PAPER by construction (`safety.ts`), and the guard is applied
+  // anyway, by name, so a mode the guard refuses can never construct one.
+  let admission: SeriesWindowAdmissions | undefined;
+  const reviewed = configuredSeries(config);
+  if (reviewed.length > 0) {
+    const modeProblem = admissionRunModeProblem(TRADER_RUN_MODE);
+    if (modeProblem !== undefined) return refuse("TRADER_ADMISSION_REFUSED", modeProblem);
+    const bound: {
+      readonly instance: SeriesInstanceConfig;
+      readonly params: Extract<ReturnType<typeof validateStaticBracketParams>, { readonly ok: true }>["value"];
+      readonly sequence: RunEvaluationSequence;
+    }[] = [];
+    for (const instance of config.seriesInstances ?? []) {
+      const params = validateStaticBracketParams(instance.params);
+      if (!params.ok) {
+        return refuse(
+          "TRADER_INSTANCE_INVALID",
+          `series-bound instance ${instance.instanceId} carries params the strategy refused`,
+          [params.problem],
+        );
+      }
+      // ONE evaluation sequence per run, shared by every window's runtime
+      // (the user's ruling Q2). A trader start is a new run (ADR-030 Decision
+      // 4.5), so it starts fresh at 0.
+      bound.push({ instance, params: params.value, sequence: createRunEvaluationSequence() });
+    }
+    const maximumTrades = options.maximumTradesPerMarket ?? 512;
+    admission = new SeriesWindowAdmissions({
+      series: reviewed,
+      isKnownMarket: (marketId, conditionId, tokenIds) => {
+        if (markets.has(marketId)) return true;
+        for (const market of markets.values()) {
+          if (market.config.conditionId === conditionId) return true;
+          if (tokenIds.includes(market.config.yesTokenId) || tokenIds.includes(market.config.noTokenId)) return true;
+        }
+        return false;
+      },
+      attachment: {
+        attach: (window) => {
+          const open = normalizeToStrictUtc(window.market.openTime);
+          const close = normalizeToStrictUtc(window.market.closeTime);
+          if (!open.ok || !close.ok) return { ok: false, detail: "the window's schedule is not a strict-UTC instant" };
+          // The runtimes FIRST: a refusal leaves nothing of the window behind.
+          const registrations: InstanceRegistration[] = [];
+          for (const { instance, params, sequence } of bound) {
+            if (instance.seriesId !== window.seriesId) continue;
+            const created = createStrategyInstanceRuntime({
+              strategy: staticBracketStrategy,
+              params: instance.params,
+              run: {
+                runId: instance.runId,
+                instanceId: instance.instanceId,
+                configId: instance.configId,
+                runSeed: instance.runSeed,
+              },
+              watchdog: { evaluationBudgetUs: instance.evaluationBudgetUs },
+              clock: monotonic,
+              decisionSink,
+              checkpointStore,
+              sequence,
+            });
+            if (!created.ok) return { ok: false, detail: `${created.refusal.code}: ${created.refusal.detail}` };
+            registrations.push({
+              key: windowRegistrationKey(instance.instanceId, window.marketId),
+              instanceId: instance.instanceId,
+              runId: instance.runId,
+              configId: instance.configId,
+              marketId: window.marketId,
+              ownership: instance.ownership,
+              evaluationPriority: instance.evaluationPriority,
+              runtime: created.runtime,
+              direction: params.market_selector.direction,
+              params,
+              immediateOrderType: params.entry.execution.immediate_order_type,
+              submissionUnknownAfterMs: params.entry.execution.submission_unknown_after_ms,
+            });
+          }
+          const marketConfig = { ...window.market, openTime: open.instant, closeTime: close.instant };
+          markets.set(
+            window.marketId,
+            new MarketState({ config: marketConfig, tradeWindowMs: config.features.tradeWindowMs, maximumTrades }),
+          );
+          tokenAssetIds.set(`${window.marketId}|YES`, `token:${window.yesTokenId}`);
+          tokenAssetIds.set(`${window.marketId}|NO`, `token:${window.noTokenId}`);
+          allocationMarkets.set(window.marketId, allocationMarketOf(marketConfig));
+          for (const registration of registrations) {
+            const registered = registry.register(registration);
+            if (!registered.ok) {
+              registry.retireMarket(window.marketId);
+              markets.delete(window.marketId);
+              return { ok: false, detail: `${registered.code}: ${registered.detail}` };
+            }
+          }
+          return { ok: true };
+        },
+        detach: (window) => {
+          // Books, features and strategy state go; the token assets and the
+          // allocation scope stay with the ledger rows that name them.
+          registry.retireMarket(window.marketId);
+          markets.delete(window.marketId);
+        },
+      },
+    });
+  }
+
   const posting: PostingIdentity = {
     environment: config.environment,
     accountRef: config.accounting.accountRef,
@@ -443,6 +574,8 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
       : { accountingChecks: options.accountingChecks }),
     ...(options.evaluationCadence === undefined ? {} : { evaluationCadence: options.evaluationCadence }),
     ...(options.onCadenceAlarm === undefined ? {} : { onCadenceAlarm: options.onCadenceAlarm }),
+    ...(admission === undefined ? {} : { admission }),
+    ...(options.onAdmission === undefined ? {} : { onAdmission: options.onAdmission }),
   });
 
   void staticBracketParamsSchema;
@@ -458,6 +591,7 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
       config,
       riskPolicy: policy.value,
       manifest: registry.manifest(),
+      admission,
     },
   };
 }

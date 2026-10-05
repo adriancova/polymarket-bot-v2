@@ -20,6 +20,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CONSUMED_EVENTS, readEventEnvelope } from "./event-door.js";
+import { RECORDED_SERIES_WINDOWS, seriesWindowPayloads } from "./testing/series.js";
 
 const MARKET = "018f4a7e-1111-7abc-8def-0123456789ab";
 const EPOCH = "018f4a7e-5555-7abc-8def-0123456789ab";
@@ -203,5 +204,29 @@ describe("readEventEnvelope", () => {
     expect(CONSUMED_EVENTS.map((consumed) => consumed.eventType)).toContain(
       "ReferenceTradeObserved",
     );
+  });
+
+  it("ROLLOVER-1: reads an admitted window's MarketDiscovered@1 and SeriesWindowAdmitted@1 (ruling Q1), and still refuses TradingParametersChanged", () => {
+    const payloads = seriesWindowPayloads(RECORDED_SERIES_WINDOWS[0], "a".repeat(64));
+    for (const [eventType, payload] of [
+      ["MarketDiscovered", payloads.discovered],
+      ["SeriesWindowAdmitted", payloads.admitted],
+    ] as const) {
+      const read = readEventEnvelope({ ...validEnvelope(), eventType, sourceChannel: "polymarket:series-admission-rest", payload });
+      expect(read.ok ? read.envelope.payload : read.refusal, eventType).toEqual(payload);
+    }
+    const parameters = readEventEnvelope({
+      ...validEnvelope(),
+      eventType: "TradingParametersChanged",
+      payload: { internalMarketId: MARKET, conditionId: "0xc", parametersVersion: 1 },
+    });
+    expect(parameters.ok ? "read" : parameters.refusal.code).toBe("EVENT_TYPE_NOT_CONSUMED");
+    // A malformed admission is refused by its frozen contract, not judged.
+    const malformed = readEventEnvelope({
+      ...validEnvelope(),
+      eventType: "SeriesWindowAdmitted",
+      payload: { ...payloads.admitted, tickSize: "0.0010" },
+    });
+    expect(malformed.ok ? "read" : malformed.refusal.code).toBe("EVENT_INVALID");
   });
 });

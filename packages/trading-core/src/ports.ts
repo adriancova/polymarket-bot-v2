@@ -243,6 +243,17 @@ export interface TraderStore {
    * append-only. A refusal is a store failure like any other: the loop halts.
    */
   replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>>;
+  /**
+   * `ROLLOVER-1` (ADR-030): records one ADMITTED series window's catalog row —
+   * `catalog.markets` with its tokens and its first parameter version — under
+   * the window's own `marketId` (the derived id the gateway published), BEFORE
+   * any durable row references it (every decision, checkpoint, ledger entry
+   * and PnL row of the window does). Idempotent: a row already registered for
+   * this `marketId` with the same condition id and tokens answers ok. A
+   * failure is a store failure like any other: the loop halts and the window is
+   * not admitted. OPTIONAL: an in-memory store has no catalog to write.
+   */
+  registerAdmittedMarket?(market: AdmittedMarketRegistration): Promise<PortResult<null>>;
   close(): Promise<void>;
   /**
    * `THROUGHPUT-1a` — GROUP COMMIT, optional. A store that offers it lets the
@@ -253,6 +264,28 @@ export interface TraderStore {
    * commits.
    */
   readonly groupCommit?: GroupCommit;
+}
+
+/** `ROLLOVER-1`: one admitted window's catalog row ({@link TraderStore.registerAdmittedMarket}). */
+export interface AdmittedMarketRegistration {
+  readonly marketId: string;
+  readonly conditionId: string;
+  /** The window's title, verbatim: the venue's question for it. */
+  readonly questionTitle: string;
+  readonly yesTokenId: string;
+  readonly noTokenId: string;
+  /** The reviewed outcome labels, in order (index 0 the YES outcome). */
+  readonly yesLabel: string;
+  readonly noLabel: string;
+  readonly tickSize: string;
+  readonly minimumOrderSize: string;
+  /** The review's catalog statement (`catalogTradingDelaySeconds`). */
+  readonly tradingDelaySeconds: number;
+  readonly negRisk: boolean;
+  readonly openTime: string;
+  readonly closeTime: string;
+  /** The admission event's instant. */
+  readonly observedAt: string;
 }
 
 /**

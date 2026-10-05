@@ -12,6 +12,16 @@
  * have: a flag given TWICE is refused rather than resolved to the last value.
  * Every problem is reported at once.
  *
+ * `ROLLOVER-1` (ADR-030; the user's ruling Q4): `--series` registers a
+ * SERIES-BOUND instance instead — its definition, its config (`{ strategy,
+ * series }`, the run record's pin of the reviewed series), its instance and
+ * its run — and NO market: a series' windows are registered as each is
+ * admitted. The six market flags (`--question-title`, `--neg-risk`,
+ * `--trading-delay-seconds`, `--lifecycle-state`, `--yes-label`,
+ * `--no-label`) describe a market the series mode does not register, so it
+ * REFUSES them rather than ignoring them; without `--series` every flag is
+ * required, exactly as before.
+ *
  * One leading `--` is dropped: `pnpm run register -- --template …` hands the
  * script the `--` itself (measured with the repository's pnpm), and
  * `parseArgs` would otherwise read it as the end of the options and every
@@ -36,7 +46,10 @@ export function asksForHelp(argv: readonly string[]): boolean {
   return argv.some((token) => token === "--help" || token === "-h");
 }
 
+/** The arguments of the MARKET mode (no `--series`): one market, instance and run. */
 export interface RegisterArguments {
+  /** Absent in the market mode (the discriminant of {@link ParsedRegisterArguments}). */
+  readonly series?: undefined;
   readonly template: string;
   readonly out: string;
   readonly instanceName: string;
@@ -50,8 +63,20 @@ export interface RegisterArguments {
   readonly createdBy: string;
 }
 
+/** `ROLLOVER-1`: the arguments of the SERIES mode (`--series`): one series-bound instance and run. */
+export interface SeriesRegisterArguments {
+  readonly series: true;
+  readonly template: string;
+  readonly out: string;
+  readonly instanceName: string;
+  readonly codeCommit: string;
+  readonly createdBy: string;
+}
+
+export type ParsedRegisterArguments = RegisterArguments | SeriesRegisterArguments;
+
 export type ParsedArguments =
-  | { readonly ok: true; readonly arguments: RegisterArguments }
+  | { readonly ok: true; readonly arguments: ParsedRegisterArguments }
   | { readonly ok: false; readonly problems: readonly string[] };
 
 /** Every flag the command takes: all strings, all required. */
@@ -67,9 +92,20 @@ const OPTIONS = {
   "no-label": { type: "string" },
   "code-commit": { type: "string" },
   "created-by": { type: "string" },
+  series: { type: "boolean" },
 } as const;
 
-type StringFlag = keyof typeof OPTIONS;
+type StringFlag = Exclude<keyof typeof OPTIONS, "series">;
+
+/** The flags that describe the MARKET a market-mode registration registers. */
+const MARKET_FLAGS: readonly StringFlag[] = [
+  "question-title",
+  "neg-risk",
+  "trading-delay-seconds",
+  "lifecycle-state",
+  "yes-label",
+  "no-label",
+];
 
 const STRING_FLAGS: readonly StringFlag[] = [
   "template",
@@ -91,6 +127,7 @@ const MAX_INTEGER_COLUMN = 2_147_483_647;
 /** Parses the command line. TOTAL: never throws. */
 export function parseRegisterArguments(argv: readonly string[]): ParsedArguments {
   let values: Partial<Record<StringFlag, string>>;
+  let series = false;
   const repeated: string[] = [];
   try {
     const parsed = parseArgs({
@@ -111,6 +148,7 @@ export function parseRegisterArguments(argv: readonly string[]): ParsedArguments
       const value = parsed.values[flag];
       if (typeof value === "string") values[flag] = value;
     }
+    series = parsed.values.series === true;
   } catch (cause) {
     return { ok: false, problems: [cause instanceof Error ? cause.message : String(cause)] };
   }
@@ -125,6 +163,21 @@ export function parseRegisterArguments(argv: readonly string[]): ParsedArguments
     if (value.trim() === "") problems.push(`--${flag} must not be empty`);
     return value;
   };
+
+  if (series) {
+    // `ROLLOVER-1`: the series mode registers no market, so a market flag is
+    // a mistake about what is being registered — refused, never ignored.
+    for (const flag of MARKET_FLAGS) {
+      if (values[flag] !== undefined) problems.push(`--${flag} describes a market, and --series registers none`);
+    }
+    const template = required("template");
+    const out = required("out");
+    const instanceName = required("instance-name");
+    const codeCommit = required("code-commit");
+    const createdBy = required("created-by");
+    if (problems.length > 0) return { ok: false, problems };
+    return { ok: true, arguments: { series: true, template, out, instanceName, codeCommit, createdBy } };
+  }
 
   const template = required("template");
   const out = required("out");

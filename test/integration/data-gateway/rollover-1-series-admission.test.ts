@@ -33,7 +33,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
-import { ADMISSION_LEDGER_FILE_NAME, GatewayConfigurationError } from "@polymarket-bot/data-gateway";
+import { ADMISSION_LEDGER_FILE_NAME, GatewayConfigurationError, incidentReferenceId } from "@polymarket-bot/data-gateway";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { createMemoryFileSystem, type MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { reviewedBtc15mSeriesDocument, RECORDED_WINDOW } from "@polymarket-bot/universe/testing";
@@ -334,6 +334,11 @@ describe("ROLLOVER-1: the concurrent-window cap, and teardown", () => {
     expect(harness.publishedOfType("SeriesWindowAdmitted")).toHaveLength(2);
     expect(harness.incidents.map((incident) => incident.reasonCode)).toContain("GATEWAY_SERIES_CAP_REACHED");
     expect(stub.requests.some((url) => url.includes(thirdCondition))).toBe(false);
+    // The cap is reached in the ordinary course of a run, so its incident
+    // names the HELD window (a market no consumer runs) — never no market,
+    // which would taint every book of the epoch (ADR-023 D2 rule 4).
+    const cap = harness.publishedOfType("DataQualityIncidentOpened").find((envelope) => payloadOf(envelope)["reasonCode"] === "GATEWAY_SERIES_CAP_REACHED");
+    expect(payloadOf(cap)["affectedMarketIds"]).toEqual([windowInternalMarketId(thirdCondition, Date.UTC(2026, 9, 4, 22, 45))]);
 
     // The 22:15 window resolves on the market channel: it is torn down on the
     // next cycle — unsubscribed, no longer polled — and the third is admitted.
@@ -418,5 +423,64 @@ describe("ROLLOVER-1: a restart during admission (ADR-030 Decision 5.2)", () => 
     expect(restarted.publishedOfType("SeriesWindowAdmitted")).toEqual([]);
     expect(subscribedTokens(restarted)).toEqual(expect.arrayContaining([WINDOW_2215.yes, WINDOW_2215.no, WINDOW_2230.yes, WINDOW_2230.no]));
     await restarted.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1: an admission incident never names no market (ADR-023 D2 rule 4)", () => {
+  it("a failed keyset read is counted, not published; only the STALL is market-less, as the lifecycle feed's is", async () => {
+    let failing = true;
+    const healthy = venueStub();
+    const route = (request: PublicHttpRequest): PublicHttpResponse =>
+      failing && request.url.startsWith(`${GAMMA_BASE}/events/keyset`) ? { status: 503, body: "{}" } : healthy.route(request);
+    const harness = await started({ route, requests: healthy.requests });
+    const admissionIncidents = () =>
+      harness
+        .publishedOfType("DataQualityIncidentOpened")
+        .filter((envelope) => String(payloadOf(envelope)["feedId"]) === "polymarket-series-admission");
+    expect(admissionIncidents()).toEqual([]);
+    expect(harness.gateway.metrics().seriesAdmission?.requestFailures).toBe(1);
+    expect(harness.gateway.metrics().seriesAdmission?.lastRequestFailure).toMatch(/^GATEWAY_SERIES_DISCOVERY_FAILED: .*HTTP 503/u);
+    harness.timers.advance(30_000);
+    await harness.settle();
+    expect(admissionIncidents()).toEqual([]);
+    // The third failure in a row is the stall: FeedStale and GATEWAY_FEED_STALL.
+    harness.timers.advance(30_000);
+    await harness.settle();
+    expect(admissionIncidents().map((envelope) => payloadOf(envelope)["reasonCode"])).toEqual(["GATEWAY_FEED_STALL"]);
+    expect(harness.publishedOfType("FeedStale").filter((envelope) => envelope.sourceChannel === "polymarket:series-admission-rest")).toHaveLength(1);
+    // Recovery admits as usual.
+    failing = false;
+    harness.timers.advance(30_000);
+    await harness.settle();
+    expect(harness.publishedOfType("SeriesWindowAdmitted")).toHaveLength(2);
+    await harness.gateway.stop();
+  });
+
+  it("a failed CLOB read names the window it was for", async () => {
+    const stub = venueStub({ clob: { [WINDOW_2230.conditionId]: CLOB_2230 } });
+    const harness = await started(stub);
+    const failed = harness
+      .publishedOfType("DataQualityIncidentOpened")
+      .find((envelope) => payloadOf(envelope)["reasonCode"] === "GATEWAY_SERIES_CLOB_READ_FAILED");
+    expect(payloadOf(failed)["affectedMarketIds"]).toEqual([WINDOW_2215.id]);
+    expect(admissionTypes(harness).some((entry) => entry.endsWith(String(WINDOW_2230.id)))).toBe(true);
+    await harness.gateway.stop();
+  });
+
+  it("a refused window with no start locator names its scope's reference id", async () => {
+    const page = (): unknown => {
+      const copy = structuredClone(KEYSET_PAGE);
+      const market = ((copy.events[0] as Record<string, unknown>)["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+      delete market["eventStartTime"];
+      return copy;
+    };
+    const harness = await started(venueStub({ page }));
+    const refused = harness
+      .publishedOfType("DataQualityIncidentOpened")
+      .find((envelope) => payloadOf(envelope)["reasonCode"] === "GATEWAY_SERIES_WINDOW_REFUSED");
+    const ids = payloadOf(refused)["affectedMarketIds"] as string[];
+    expect(ids).toEqual([incidentReferenceId(`polymarket-series-admission:${WINDOW_2215.conditionId}`)]);
+    expect(ids[0]).toMatch(/^00000000-0000-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+    await harness.gateway.stop();
   });
 });

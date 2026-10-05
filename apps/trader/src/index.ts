@@ -64,6 +64,26 @@ export {
   type TraderConfig,
 } from "@polymarket-bot/trading-core";
 
+// `ROLLOVER-1` (ADR-030): the trader's series admissions — its copy of the
+// reviewed-series rules, the re-judge, and the notices `main.ts` logs.
+export {
+  ReviewedSeriesSchema,
+  SeriesWindowAdmissions,
+  admissionRunModeProblem,
+  canonicalSeriesJson,
+  configuredSeries,
+  deriveWindowSchedule,
+  seriesConfigHash,
+  windowInternalMarketId,
+  type AdmissionNotice,
+  type AdmissionRefusalCode,
+  type AdmittedMarketRegistration,
+  type AdmittedWindow,
+  type ConfiguredSeries,
+  type ReviewedSeries,
+  type SeriesInstanceConfig,
+} from "@polymarket-bot/trading-core";
+
 export {
   CONSUMED_EVENTS,
   readEventEnvelope,

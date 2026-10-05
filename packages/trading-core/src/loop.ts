@@ -213,6 +213,7 @@ import { buildStrategyFeatureView, projectFeatureValues } from "./projection.js"
 import { BoundedQueue, type QueueMetrics } from "./queue.js";
 import { ReferenceState } from "./reference-state.js";
 import { ReservationBook } from "./reservations.js";
+import type { AdmissionMetrics, AdmissionNotice, SeriesWindowAdmissions } from "./series-admission.js";
 import { TRADER_RUN_MODE } from "./safety.js";
 import { normalizeToStrictUtc } from "./time.js";
 import type { Ledger, LedgerProjection } from "@polymarket-bot/ledger";
@@ -430,6 +431,17 @@ export interface CoreLoopOptions {
    * decision, and a hook that throws is contained.
    */
   readonly onCadenceAlarm?: (alarm: CadenceAlarm) => void;
+  /**
+   * `ROLLOVER-1` (ADR-030): the run's SERIES ADMISSIONS, present when the
+   * configuration reviews a series (`series-admission.ts`). The loop hands it
+   * every `MarketDiscovered@1` and `SeriesWindowAdmitted@1`, writes an admitted
+   * window's catalog row through the store before attaching it, and tears a
+   * window down at a frame close once it is due and idle (`#tearDownWindows`).
+   * Absent: no admission, exactly as before.
+   */
+  readonly admission?: SeriesWindowAdmissions;
+  /** `ROLLOVER-1`: told of every admission, refusal and teardown. Output only; a throw is contained. */
+  readonly onAdmission?: (notice: AdmissionNotice) => void;
 }
 
 /**
@@ -1223,6 +1235,9 @@ export class CoreLoop {
       const next = this.#queue.peek();
       const closesFrame = next === undefined || !sameFrame(event.envelope, next.envelope);
       await this.#processEvent(event, closesFrame);
+      // `ROLLOVER-1` (ADR-030 Decision 4.4): a window is torn down only at a
+      // frame close — never inside a frame whose events still name it.
+      if (closesFrame) this.#tearDownWindows();
     }
     // Only a group-committing store has anything staged; every other store's
     // drain returns exactly as it always did. `awaitDurable: false` (the
@@ -1324,6 +1339,13 @@ export class CoreLoop {
     // DELAYED order's disposition and a GTD's expiry, so a watched basket is
     // judged here — before this event evaluates any strategy.
     this.#judgeBasketWatches(instant.instant);
+
+    // `ROLLOVER-1` (ADR-030): an admission is applied BEFORE anything reads the
+    // window, in both the single-event and the frame paths, so the event's own
+    // `internalMarketId` names a market the steps below know.
+    if (envelope.eventType === "MarketDiscovered" || envelope.eventType === "SeriesWindowAdmitted") {
+      await this.#observeAdmission(envelope, instant.instant);
+    }
 
     // `THROUGHPUT-2` (ADR-024): an event inside a longer frame — not its
     // last, or its last with earlier events already applied — is applied now
@@ -1794,6 +1816,116 @@ export class CoreLoop {
       if (!this.#options.halts.isInstanceHalted(instance.instanceId, marketId)) return true;
     }
     return false;
+  }
+
+  /**
+   * `ROLLOVER-1` (ADR-030 Decisions 1, 3, 4): one admission event.
+   *
+   * `MarketDiscovered@1` is remembered; `SeriesWindowAdmitted@1` is RE-JUDGED
+   * against this trader's own review (`series-admission.ts`). An admitted
+   * window's catalog row is made durable FIRST (`TraderStore.registerAdmittedMarket`)
+   * — every later durable row of the window references it — and only then is
+   * the window attached: its market state, token assets, allocation scope and
+   * per-window runtimes. A store failure is the GLOBAL `STORE_UNAVAILABLE` halt
+   * every store failure is, and the window is not attached.
+   */
+  async #observeAdmission(envelope: EventEnvelopeOf, instant: string): Promise<void> {
+    const admission = this.#options.admission;
+    if (admission === undefined) return;
+    if (envelope.eventType === "MarketDiscovered") {
+      admission.observeDiscovered(envelope.payload);
+      return;
+    }
+    const verdict = admission.judge(envelope.payload);
+    if (verdict.kind === "DUPLICATE") return;
+    if (verdict.kind === "REFUSE") {
+      this.#notifyAdmission({ kind: "REFUSED", code: verdict.code, detail: verdict.detail, marketId: verdict.marketId });
+      return;
+    }
+    const window = verdict.window;
+    const store = this.#options.store;
+    if (store.registerAdmittedMarket !== undefined) {
+      const written = await store.registerAdmittedMarket({
+        marketId: window.marketId,
+        conditionId: window.conditionId,
+        questionTitle: window.windowTitle,
+        yesTokenId: window.yesTokenId,
+        noTokenId: window.noTokenId,
+        yesLabel: window.catalog.yesLabel,
+        noLabel: window.catalog.noLabel,
+        tickSize: window.tickSize,
+        minimumOrderSize: window.market.minimumOrderSize,
+        tradingDelaySeconds: window.catalog.tradingDelaySeconds,
+        negRisk: window.catalog.negRisk,
+        openTime: window.openAt,
+        closeTime: window.closeAt,
+        observedAt: instant,
+      });
+      if (!written.ok) {
+        const detail = `the admitted window's catalog row could not be written: ${written.failure.detail}`;
+        this.#options.halts.halt({ kind: "GLOBAL" }, "STORE_UNAVAILABLE", detail, instant);
+        admission.refuse("STORE_UNAVAILABLE", detail, window.marketId);
+        this.#notifyAdmission({ kind: "REFUSED", code: "STORE_UNAVAILABLE", detail, marketId: window.marketId });
+        return;
+      }
+    }
+    const attached = admission.attach(window);
+    if (!attached.ok) {
+      this.#notifyAdmission({ kind: "REFUSED", code: "ATTACH_FAILED", detail: attached.detail, marketId: window.marketId });
+      return;
+    }
+    this.#notifyAdmission({ kind: "ADMITTED", window });
+  }
+
+  /**
+   * `ROLLOVER-1` (ADR-030 Decision 4.4): tears every live window down that is
+   * DUE — its resolution was handled (the market is RESOLVED, and its
+   * `onMarketResolved` ran in the frame that resolved it), or it is still
+   * unresolved `unresolvedTeardownSeconds` (reviewed) after its scheduled
+   * close, on event time — and IDLE: no order of any of its registrations is
+   * still tracked, and no cancel names its market. A due window that is not
+   * idle waits (counted). Its books, features, strategy state and cadence
+   * entry are released; its ledger rows stay.
+   */
+  #tearDownWindows(): void {
+    const admission = this.#options.admission;
+    if (admission === undefined) return;
+    for (const window of admission.liveWindows()) {
+      const market = this.#options.markets.get(window.marketId);
+      const resolved = market?.lifecycle === "RESOLVED";
+      const overdue = this.#lastEpochMs >= window.closeEpochMs + window.unresolvedTeardownSeconds * 1000;
+      if (!resolved && !overdue) continue;
+      if (this.#windowHoldsWork(window.marketId)) {
+        admission.noteTeardownBlocked();
+        continue;
+      }
+      const reason = resolved ? "RESOLVED" : "UNRESOLVED_AFTER_CLOSE";
+      const torn = admission.detach(window.marketId, reason);
+      this.#cadence.forget(window.marketId);
+      if (torn !== undefined) this.#notifyAdmission({ kind: "TORN_DOWN", window: torn, reason });
+    }
+  }
+
+  /** `ROLLOVER-1`: does a window still hold an order this process tracks, or a pending cancel? */
+  #windowHoldsWork(marketId: string): boolean {
+    for (const [key, owned] of this.#instanceOrders) {
+      if (owned.size === 0) continue;
+      if (this.#options.registry.identityOf(key)?.marketId === marketId) return true;
+    }
+    return this.#cancels.pending().some((cancel) => cancel.marketId === marketId);
+  }
+
+  #notifyAdmission(notice: AdmissionNotice): void {
+    try {
+      this.#options.onAdmission?.(notice);
+    } catch {
+      // Output only: an observer that throws changes nothing here.
+    }
+  }
+
+  /** `ROLLOVER-1`: the series admissions' counters, or `undefined` when no series is reviewed. */
+  admissionMetrics(): AdmissionMetrics | undefined {
+    return this.#options.admission?.metrics();
   }
 
   /**
@@ -2292,7 +2424,8 @@ export class CoreLoop {
    * per order — O(its orders), not O(every order the venue ever held).
    */
   #orderViews_(instance: RegisteredInstance, instant: string): readonly StrategyOrderView[] {
-    const owned = this.#instanceOrders.get(instance.instanceId);
+    // `ROLLOVER-1`: keyed by REGISTRATION (`instances.ts`): a window's own orders.
+    const owned = this.#instanceOrders.get(instance.key);
     if (owned === undefined) return Object.freeze([]);
     const views: StrategyOrderView[] = [];
     for (const venueOrderId of inVenueOrder(owned)) {
@@ -2909,10 +3042,12 @@ export class CoreLoop {
     for (const order of orders) {
       // Every per-order entry is keyed by the VENUE's order id (see the field
       // comments), created here and deleted only by `#settle`.
-      this.#orderOwners.set(order.simulatedOrderId, input.instance.instanceId);
-      const owned = this.#instanceOrders.get(input.instance.instanceId) ?? new Set<string>();
+      // `ROLLOVER-1`: the owner is the REGISTRATION (`instances.ts`), so a fill
+      // and a view reach the runtime of the window the order was placed in.
+      this.#orderOwners.set(order.simulatedOrderId, input.instance.key);
+      const owned = this.#instanceOrders.get(input.instance.key) ?? new Set<string>();
       owned.add(order.simulatedOrderId);
-      this.#instanceOrders.set(input.instance.instanceId, owned);
+      this.#instanceOrders.set(input.instance.key, owned);
       this.#bookedShares.set(order.simulatedOrderId, "0");
       const prefix = Object.freeze({
         sourceEventId: input.eventId,
@@ -3569,7 +3704,9 @@ export class CoreLoop {
       // whose owner is not the stream's. So the instance's stream keeps the
       // records that name IT, which is §6 invariant 7's separation applied to
       // the PnL projection rather than a filter of convenience.
-      const stream = this.#pnlRecords.get(instance.instanceId) ?? [];
+      // `ROLLOVER-1`: one stream per REGISTRATION — per window of a
+      // series-bound instance — since a stream's identity names its market.
+      const stream = this.#pnlRecords.get(instance.key) ?? [];
       for (const record of posted.pnlRecords as readonly PnlRecord[]) {
         if (
           record.owner.scope === "VIRTUAL_STRATEGY" &&
@@ -3578,7 +3715,7 @@ export class CoreLoop {
           stream.push(record);
         }
       }
-      this.#pnlRecords.set(instance.instanceId, stream);
+      this.#pnlRecords.set(instance.key, stream);
 
       // `FOLD-1` (`FOLD1-R1-2`): the cadence's checks — the ledger, and every
       // PnL stream when `pnl` is on — at this due fill, BEFORE the store
@@ -3814,10 +3951,12 @@ export class CoreLoop {
     }
     for (const instanceId of [...instanceIds].sort()) {
       checked += 1;
-      const instance = this.#options.registry.get(instanceId);
+      // `ROLLOVER-1`: a stream is keyed by registration, and a torn-down
+      // window's identity is still readable for its stream.
+      const identity = this.#options.registry.identityOf(instanceId);
       const mismatch = this.#held.checkPnl(
         instanceId,
-        instance === undefined ? undefined : () => this.#pnlIdentity(instance),
+        identity === undefined ? undefined : () => this.#pnlIdentity(identity),
         this.#pnlRecords.get(instanceId) ?? [],
       );
       if (mismatch === undefined) continue;
@@ -3947,7 +4086,7 @@ export class CoreLoop {
   }
 
   /** The §9.16 stream identity of one instance's VIRTUAL_STRATEGY PnL — the snapshot's, and a check's. */
-  #pnlIdentity(instance: RegisteredInstance): PnlStreamIdentity {
+  #pnlIdentity(instance: Pick<RegisteredInstance, "instanceId" | "runId" | "marketId">): PnlStreamIdentity {
     return {
       scope: "VIRTUAL_STRATEGY",
       environment: this.#options.config.environment,
@@ -3994,10 +4133,10 @@ export class CoreLoop {
    * row base had written.
    */
   #stagePnlSnapshot(instance: RegisteredInstance, fill: SimulatedFill, instant: string): void {
-    const records = this.#pnlRecords.get(instance.instanceId);
+    const records = this.#pnlRecords.get(instance.key);
     if (records === undefined || records.length === 0) return;
-    this.#held.advancePnl(instance.instanceId, () => this.#pnlIdentity(instance), records);
-    const folded = this.#held.completePnlState(instance.instanceId);
+    this.#held.advancePnl(instance.key, () => this.#pnlIdentity(instance), records);
+    const folded = this.#held.completePnlState(instance.key);
     if (folded === undefined) return;
     const tokenAssetId =
       this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId;
@@ -4006,8 +4145,8 @@ export class CoreLoop {
       marks: { [tokenAssetId]: { midpoint: fill.price } },
     });
     if (!snapshots.ok) return;
-    this.#stagedSnapshots.delete(instance.instanceId);
-    this.#stagedSnapshots.set(instance.instanceId, snapshots.value);
+    this.#stagedSnapshots.delete(instance.key);
+    this.#stagedSnapshots.set(instance.key, snapshots.value);
   }
 
   /**
@@ -4175,11 +4314,11 @@ export class CoreLoop {
       if (order !== undefined) boundary.push(order);
     }
     for (const order of boundary) {
-      const instanceId = this.#orderOwners.get(order.simulatedOrderId);
-      if (instanceId === undefined) continue;
+      const ownerKey = this.#orderOwners.get(order.simulatedOrderId);
+      if (ownerKey === undefined) continue;
       // R1: a retired order is never delivered again.
       if (this.#retired.has(order.simulatedOrderId)) continue;
-      const instance = this.#options.registry.get(instanceId);
+      const instance = this.#options.registry.get(ownerKey);
       if (instance === undefined) continue;
       const market = this.#options.markets.get(instance.marketId);
       if (market === undefined) continue;
@@ -4277,6 +4416,7 @@ export class CoreLoop {
    */
   #settle(order: SimulatedOrder): void {
     const venueOrderId = order.simulatedOrderId;
+    // `ROLLOVER-1`: the owner REGISTRATION's key (`#ownBookedOrders`).
     const instanceId = this.#orderOwners.get(venueOrderId);
     if (instanceId === undefined) return;
     const view = toStrategyOrderView(order, { marketId: order.marketId, placedAt: this.#lastInstant });
@@ -4724,7 +4864,7 @@ export class CoreLoop {
     instance: RegisteredInstance,
     marketConfig: MarketConfig,
   ): readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[] {
-    const owned = this.#instanceOrders.get(instance.instanceId);
+    const owned = this.#instanceOrders.get(instance.key);
     if (owned === undefined) return Object.freeze([]);
     const orders: { orderId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }[] = [];
     // SIM-2: the instance's OWN orders, in venue order (`IF-07`: risk's
