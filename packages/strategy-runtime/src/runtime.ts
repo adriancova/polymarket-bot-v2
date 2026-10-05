@@ -138,6 +138,7 @@ import { readOwnFieldsOnce } from "./read-once.js";
 import type { DecisionRecord, DecisionTelemetry } from "./record.js";
 import { isReservedRuntimeReasonCode, RUNTIME_REASON_CODES } from "./reserved-codes.js";
 import { DeterministicRng } from "./rng.js";
+import { isRunEvaluationSequence, type RunEvaluationSequence } from "./sequence.js";
 import {
   checkpointTransitions,
   type CheckpointMark,
@@ -176,6 +177,16 @@ export interface StrategyRuntimeDefinition {
    * and the restored instance resumed at `checkpointSeq + 1`.
    */
   readonly restoreFrom?: StrategyRestorePoint;
+  /**
+   * `ROLLOVER-1` (ADR-030 Decision 4; the user's ruling Q2): the RUN's
+   * evaluation sequence, shared by every runtime of one run — one per admitted
+   * window of a series — so no two of them persist the same
+   * `(run_id, evaluation_seq)` or `(run_id, checkpoint_seq)` (`sequence.ts`).
+   * Only a counter `sequence.ts` minted is accepted (`SEQUENCE_SOURCE_INVALID`).
+   * ABSENT: the runtime numbers its own decisions from 0 (or from its restore
+   * point), exactly as before.
+   */
+  readonly sequence?: RunEvaluationSequence;
 }
 
 export type CreateRuntimeResult =
@@ -194,6 +205,7 @@ const DEFINITION_FIELDS = [
   "decisionSink",
   "checkpointStore",
   "restoreFrom",
+  "sequence",
 ] as const;
 
 const STRATEGY_FIELDS = ["name", "version", "stateSchemaVersion", "paramsSchema"] as const;
@@ -288,6 +300,7 @@ export function createStrategyInstanceRuntime(
   const decisionSink = outer.fields.decisionSink;
   const checkpointStore = outer.fields.checkpointStore;
   const restoreFrom = outer.fields.restoreFrom;
+  const sequenceField = outer.fields.sequence;
 
   // --- strategy shape -----------------------------------------------------
   if (typeof strategy !== "object" || strategy === null) {
@@ -421,6 +434,18 @@ export function createStrategyInstanceRuntime(
     return refuse("PORTS_INVALID", "checkpointStore.save must be a function");
   }
 
+  // --- the run's evaluation sequence (`ROLLOVER-1`, ruling Q2) -------------
+  // Only a counter `sequence.ts` minted: a caller-built object would put caller
+  // code inside `evaluate()`'s numbering, which the brand check rules out.
+  if (sequenceField !== undefined && !isRunEvaluationSequence(sequenceField)) {
+    return refuse(
+      "SEQUENCE_SOURCE_INVALID",
+      "sequence must be a run evaluation sequence minted by createRunEvaluationSequence or " +
+        "runEvaluationSequenceAfter (@polymarket-bot/strategy-runtime); a caller-built counter is refused",
+    );
+  }
+  const sequence: RunEvaluationSequence | undefined = sequenceField;
+
   // --- params: validate against the strategy's own schema, then freeze ----
   // `safeParse` is read ONCE (through the prototype chain, so a Zod schema's
   // method is found) and applied with `Reflect.apply`: the function that was
@@ -548,6 +573,17 @@ export function createStrategyInstanceRuntime(
     nextEvaluationSeq = restored.restored.nextEvaluationSeq;
     status = restored.restored.status;
     mark = restored.restored.mark;
+    // `ROLLOVER-1`: the run's counter must not be BEHIND the restore point —
+    // it would re-issue a sequence the store already holds for this run.
+    if (sequence !== undefined && sequence.peek() < nextEvaluationSeq) {
+      return refuse(
+        "SEQUENCE_SOURCE_BEHIND",
+        `the run's evaluation sequence would issue ${String(sequence.peek())} next, but the restore ` +
+          `point's highest durable evaluation sequence is ${String(nextEvaluationSeq - 1)}; a run's ` +
+          "counter is seeded from its highest durable sequence plus one (runEvaluationSequenceAfter), " +
+          "so this counter would re-issue a durable (run_id, evaluation_seq)",
+      );
+    }
   }
 
   return {
@@ -565,6 +601,7 @@ export function createStrategyInstanceRuntime(
       nextEvaluationSeq,
       status,
       mark,
+      sequence,
     ),
   };
 }
@@ -606,6 +643,11 @@ class StrategyInstanceRuntime {
     initialEvaluationSeq: number,
     initialStatus: InstanceStatus,
     initialMark: CheckpointMark | undefined,
+    /**
+     * `ROLLOVER-1`: the run's shared counter, or `undefined` for a runtime that
+     * numbers its own decisions (every runtime before `ROLLOVER-1`).
+     */
+    private readonly sequence: RunEvaluationSequence | undefined,
   ) {
     this.lastCheckpoint = initialMark;
     this.state = initialState;
@@ -621,8 +663,13 @@ class StrategyInstanceRuntime {
     return this.status;
   }
 
+  /**
+   * The sequence this runtime's next persisted decision would carry: its own
+   * counter, or — with a run sequence (`ROLLOVER-1`) — the run's, which every
+   * runtime of the run shares.
+   */
   nextEvaluationSeq(): number {
-    return this.evaluationSeq;
+    return this.sequence === undefined ? this.evaluationSeq : this.sequence.peek();
   }
 
   /**
@@ -668,7 +715,7 @@ class StrategyInstanceRuntime {
     // record may carry; reaching `MAX_EVALUATION_SEQ + 1` means the NEXT
     // increment would not be exact, and two records under one sequence is
     // precisely what this refuses to do.
-    if (this.evaluationSeq > MAX_EVALUATION_SEQ) {
+    if (this.nextEvaluationSeq() > MAX_EVALUATION_SEQ) {
       return {
         kind: "REFUSED",
         refusal: {
@@ -823,7 +870,13 @@ class StrategyInstanceRuntime {
     }
     const prepared = preparation.prepared;
 
-    const record = this.buildRecord(input, "STRATEGY", prepared.decision);
+    // `ROLLOVER-1`: the sequence is CLAIMED here, as the record that carries it
+    // is built — from the run's counter when there is one (taken, so no other
+    // runtime of the run can carry it), else the runtime's own counter, which
+    // moves only after the persist, exactly as before.
+    const recordedSeq = this.claimSequence();
+    if (recordedSeq === undefined) return this.sequenceExhaustedAfterInvocation(input, rngSnapshot);
+    const record = this.buildRecord(input, "STRATEGY", prepared.decision, recordedSeq);
     // `CKPT-1` — ADR-027 Decision 1's verdict, taken BEFORE the persist from
     // values already computed: the state bytes the commit will hold, the
     // status it will set, and the RNG exactly as the callback left it. Pure
@@ -849,8 +902,7 @@ class StrategyInstanceRuntime {
     // ADR-027 Decision 1 says it owes one — its checkpoint.
     this.state = prepared.state;
     this.stateJson = prepared.stateJson;
-    const recordedSeq = this.evaluationSeq;
-    this.evaluationSeq += 1;
+    if (this.sequence === undefined) this.evaluationSeq += 1;
     this.status = nextStatus;
 
     const saved = this.saveOwedCheckpoint(transitions, recordedSeq, input.evaluatedAt);
@@ -918,6 +970,44 @@ class StrategyInstanceRuntime {
       };
     }
     return { ok: true, value };
+  }
+
+  /**
+   * `ROLLOVER-1`: the sequence the record being built carries. Without a run
+   * sequence, the runtime's own counter (moved after the persist, as before).
+   * With one, a number TAKEN from the run's counter — spent now, so a persist
+   * that then fails leaves a gap and never a re-use — or `undefined` when the
+   * run has consumed its last representable sequence.
+   */
+  private claimSequence(): number | undefined {
+    if (this.sequence === undefined) return this.evaluationSeq;
+    return this.sequence.take();
+  }
+
+  /**
+   * `ROLLOVER-1`: the run's counter was exhausted between the check at the top
+   * of `evaluate()` and the claim. Unreachable while the run's runtimes are
+   * evaluated one at a time (a strategy callback holds no runtime), and kept
+   * because `evaluate()` may not throw and may not persist two records under
+   * one sequence: nothing is persisted, the RNG rolls back, and the instance
+   * pauses, so it cannot evaluate again.
+   */
+  private sequenceExhaustedAfterInvocation(
+    input: EvaluationInput,
+    rngSnapshot: ReturnType<DeterministicRng["snapshot"]>,
+  ): EvaluationOutcome {
+    this.rng.restore(rngSnapshot);
+    this.status = "PAUSED";
+    return {
+      kind: "REFUSED",
+      refusal: {
+        code: "EVALUATION_SEQ_EXHAUSTED",
+        detail:
+          `the run's evaluation sequence was exhausted while strategy callback ${input.callback} ran ` +
+          `(the last representable sequence is ${String(MAX_EVALUATION_SEQ)}); no record was persisted, ` +
+          "the instance is paused, and the run is finished — resumption is a new run (§9.6)",
+      },
+    };
   }
 
   private persistRecord(record: DecisionRecord, telemetry: DecisionTelemetry): void {
@@ -1267,7 +1357,9 @@ class StrategyInstanceRuntime {
       featureSnapshotRef: input.features.snapshotRef,
       intents: [],
     }) as unknown as DecisionResult;
-    const record = this.buildRecord(input, "RUNTIME", decision);
+    const recordedSeq = this.claimSequence();
+    if (recordedSeq === undefined) return this.sequenceExhaustedAfterInvocation(input, rngSnapshot);
+    const record = this.buildRecord(input, "RUNTIME", decision, recordedSeq);
     // `CKPT-1`: the same ADR-027 Decision 1 verdict as a decided evaluation,
     // before the persist. The state is unchanged and the RNG was rolled back,
     // but the status becomes PAUSED — a STATUS transition — so a contained
@@ -1286,8 +1378,7 @@ class StrategyInstanceRuntime {
       return this.halt("PERSIST_DECISION", record, cause);
     }
 
-    const recordedSeq = this.evaluationSeq;
-    this.evaluationSeq += 1;
+    if (this.sequence === undefined) this.evaluationSeq += 1;
     this.status = "PAUSED";
 
     const saved = this.saveOwedCheckpoint(transitions, recordedSeq, input.evaluatedAt);
@@ -1336,6 +1427,7 @@ class StrategyInstanceRuntime {
     input: EvaluationInput,
     attribution: DecisionRecord["attribution"],
     decision: DecisionResult,
+    evaluationSeq: number,
   ): DecisionRecord {
     // Every field here comes from the runtime's own inert snapshots: the
     // acquired evaluation input and the captured run identity. Round 3's HIGH
@@ -1360,7 +1452,7 @@ class StrategyInstanceRuntime {
       runId: this.run.runId,
       instanceId: this.run.instanceId,
       marketId: input.market.marketId,
-      evaluationSeq: this.evaluationSeq,
+      evaluationSeq,
       callback: input.callback satisfies StrategyCallbackName,
       attribution,
       evaluatedAt: input.evaluatedAt,
