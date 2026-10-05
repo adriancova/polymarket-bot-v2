@@ -44,30 +44,36 @@ function toRow(row: SelectedRow): KillSwitchRow {
   });
 }
 
+/** The two queries, built (not run): the latest row per `(environment, scope, scope_ref)` by each ordering. */
+export function killSwitchLatestRowQueries(db: PolymarketBotDatabase) {
+  const byRecorded = db
+    .selectFrom("ops.kill_switch_events")
+    .select(["kill_switch_event_id", "environment", "scope", "scope_ref", "action", "resulting_state"])
+    .distinctOn(["environment", "scope", "scope_ref"])
+    .orderBy("environment")
+    .orderBy("scope")
+    .orderBy("scope_ref")
+    .orderBy("recorded_at", "desc")
+    .orderBy("kill_switch_event_id", "desc");
+  const byOccurred = db
+    .selectFrom("ops.kill_switch_events")
+    .select(["kill_switch_event_id", "environment", "scope", "scope_ref", "action", "resulting_state"])
+    .distinctOn(["environment", "scope", "scope_ref"])
+    .orderBy("environment")
+    .orderBy("scope")
+    .orderBy("scope_ref")
+    .orderBy("occurred_at", "desc")
+    .orderBy("kill_switch_event_id", "desc");
+  return { byRecorded, byOccurred };
+}
+
 export function createPostgresKillSwitchReader(db: PolymarketBotDatabase): KillSwitchReader {
   return Object.freeze({
     async read(): Promise<readonly KillSwitchRow[]> {
-      const byRecorded = await db
-        .selectFrom("ops.kill_switch_events")
-        .select(["kill_switch_event_id", "environment", "scope", "scope_ref", "action", "resulting_state"])
-        .distinctOn(["environment", "scope", "scope_ref"])
-        .orderBy("environment")
-        .orderBy("scope")
-        .orderBy("scope_ref")
-        .orderBy("recorded_at", "desc")
-        .orderBy("kill_switch_event_id", "desc")
-        .execute();
-      const byOccurred = await db
-        .selectFrom("ops.kill_switch_events")
-        .select(["kill_switch_event_id", "environment", "scope", "scope_ref", "action", "resulting_state"])
-        .distinctOn(["environment", "scope", "scope_ref"])
-        .orderBy("environment")
-        .orderBy("scope")
-        .orderBy("scope_ref")
-        .orderBy("occurred_at", "desc")
-        .orderBy("kill_switch_event_id", "desc")
-        .execute();
-      return Object.freeze([...byRecorded.map(toRow), ...byOccurred.map(toRow)]);
+      const { byRecorded, byOccurred } = killSwitchLatestRowQueries(db);
+      const recorded = await byRecorded.execute();
+      const occurred = await byOccurred.execute();
+      return Object.freeze([...recorded.map(toRow), ...occurred.map(toRow)]);
     },
   });
 }

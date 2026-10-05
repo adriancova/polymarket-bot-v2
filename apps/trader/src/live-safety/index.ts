@@ -76,7 +76,7 @@ export {
   type KillSwitchScope,
   type KillSwitchSnapshot,
 } from "./kill-switch.js";
-export { createPostgresKillSwitchReader } from "./kill-switch-postgres.js";
+export { createPostgresKillSwitchReader, killSwitchLatestRowQueries } from "./kill-switch-postgres.js";
 export { LapseRecovery, LapseRecoveryConfigurationError, VENUE_CANCELLATION_CHECK_INTERVAL_MS, type LapseRecoveryOptions } from "./lapse-recovery.js";
 export type {
   HeartbeatView,
