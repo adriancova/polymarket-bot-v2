@@ -26,12 +26,17 @@
  * switch was observed was still sent after it, and rested under it.
  * Reductions are left to the OMS during a lapse: the coordinator pauses all
  * new submissions while it reconciles (D6 step 2).
+ *
+ * A MARKET or STRATEGY_INSTANCE switch's reference and the request's market
+ * and instance are compared in one canonical form (`scopeIdKey`,
+ * `kill-switch.ts`; r4, finding R4-L1): a switch engaged under another
+ * spelling of an id (upper case, say) blocks that id's orders.
  */
 
 import type { EligibilityVerdict } from "./eligibility.js";
 import type { FenceCheck } from "./fencing-authority.js";
 import type { HealthVerdict } from "./health-lease.js";
-import type { KillSwitchSnapshot } from "./kill-switch.js";
+import { scopeIdKey, type KillSwitchSnapshot } from "./kill-switch.js";
 
 export type GateRequest =
   | { readonly kind: "NEW_ENTRY"; readonly marketId: string; readonly instanceId: string }
@@ -86,14 +91,17 @@ export function evaluateLiveGate(inputs: GateInputs, request: GateRequest): Gate
       reasons.push(`KILL_SWITCH_UNKNOWN_${snapshot.reason}`);
     } else {
       const effects = snapshot.effects;
+      // r4 R4-L1: the switches' sets hold each id in its matching form (`kill-switch.ts`); the request's is read alike.
+      const marketKey = scopeIdKey(marketId);
+      const instanceKey = scopeIdKey(instanceId);
       if (kind === "NEW_ENTRY") {
         if (effects.blocksAllEntries) reasons.push("KILL_SWITCH_ACCOUNT_ENGAGED");
-        if (effects.entryBlockedMarkets.has(marketId)) reasons.push("KILL_SWITCH_MARKET_ENGAGED");
-        if (effects.entryBlockedInstances.has(instanceId)) reasons.push("KILL_SWITCH_INSTANCE_ENGAGED");
+        if (effects.entryBlockedMarkets.has(marketKey)) reasons.push("KILL_SWITCH_MARKET_ENGAGED");
+        if (effects.entryBlockedInstances.has(instanceKey)) reasons.push("KILL_SWITCH_INSTANCE_ENGAGED");
       } else {
         if (effects.blocksAllSubmissions) reasons.push("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
-        if (effects.submissionBlockedMarkets.has(marketId)) reasons.push("KILL_SWITCH_MARKET_ENDS_TRADING");
-        if (effects.submissionBlockedInstances.has(instanceId)) reasons.push("KILL_SWITCH_INSTANCE_ENDS_TRADING");
+        if (effects.submissionBlockedMarkets.has(marketKey)) reasons.push("KILL_SWITCH_MARKET_ENDS_TRADING");
+        if (effects.submissionBlockedInstances.has(instanceKey)) reasons.push("KILL_SWITCH_INSTANCE_ENDS_TRADING");
       }
     }
   }

@@ -70,14 +70,19 @@ export interface LiveSafetyJournal {
 
 /**
  * The pages this composition raises: §14.4's "Heartbeat health lease failed while orders may exist" and "Live fencing
- * conflict", and two of this package's own for kill-switch enforcement (§14.4 lists no kill-switch page): the rows
- * could not be read (r1 I10), and a kill switch's cancel went unanswered past its deadline (r3 J2).
+ * conflict", and four of this package's own for kill-switch enforcement (§14.4 lists no kill-switch page): the rows
+ * could not be read (r1 I10); a kill switch's cancel went unanswered past its deadline (r3 J2); an order in a switch's
+ * scope stayed `CANCEL_PENDING` past that deadline, so its cancel's answer never came beneath the OMS and its
+ * reconciliation was requested (r4 CX320-R4-01); and an engaged switch's reference is not in its scope's canonical
+ * form (r4 R4-L1).
  */
 export type LiveSafetyPage =
   | "HEARTBEAT_HEALTH_LEASE_FAILED_WHILE_ORDERS_MAY_EXIST"
   | "LIVE_FENCING_CONFLICT"
   | "KILL_SWITCH_STATE_UNREADABLE"
-  | "KILL_SWITCH_CANCEL_UNANSWERED";
+  | "KILL_SWITCH_CANCEL_UNANSWERED"
+  | "KILL_SWITCH_CANCEL_STRANDED"
+  | "KILL_SWITCH_SCOPE_REF_NOT_CANONICAL";
 
 export interface LiveSafetyAlerts {
   page(page: LiveSafetyPage, detail: string): void;
@@ -102,6 +107,11 @@ export type LiveSafetyRecord =
       /** Answered `true`, answered otherwise (or threw), or abandoned unanswered past its deadline (r3 J2). */
       readonly outcome: "ACCEPTED" | "REFUSED" | "ABANDONED";
       readonly accepted: boolean;
+      /**
+       * Whether the OMS still showed an order resting, or that may rest, in the directive's scope when the outcome was
+       * recorded (r4 CX320-R4-01): an `ACCEPTED` with `true` is a request the port took, NOT a scope that is clear.
+       */
+      readonly scopeStillResting: boolean;
       readonly atMs: number;
     }
   | {
@@ -110,6 +120,20 @@ export type LiveSafetyRecord =
       readonly directive: string;
       readonly attempt: number;
       readonly pass: "FIRST" | "CONFIRMING" | "AFTER_SETTLE" | "RETAINED";
+      readonly accepted: boolean;
+      readonly atMs: number;
+    }
+  | {
+      /**
+       * r4 CX320-R4-01: an order the OMS showed `CANCEL_PENDING` for at least the cancel deadline, in the scope of an
+       * engaged switch's cancel obligation, was sent to WP-270's `requestOrderReconciliation`, which clears a cancel
+       * whose answer never came (its late answer is then recorded only) so the obligation can cancel it again.
+       */
+      readonly kind: "KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED";
+      readonly directive: string;
+      readonly orderId: string;
+      /** The monotonic instant a kill-switch read first saw it `CANCEL_PENDING`, continuously since. */
+      readonly cancelPendingSinceMs: number;
       readonly accepted: boolean;
       readonly atMs: number;
     }

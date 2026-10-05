@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 
 import { engageRow, FakeKillSwitchReader, FakeReleaseFinality, ManualClock, releaseRow } from "./fakes.test-support.js";
-import { foldKillSwitchRows, KILL_SWITCH_ACTIONS, killSwitchEffects, KillSwitchMonitor } from "./kill-switch.js";
+import { canonicalUuid, foldKillSwitchRows, KILL_SWITCH_ACTIONS, killSwitchEffects, KillSwitchMonitor, scopeIdKey } from "./kill-switch.js";
 
 const ACCOUNT = "acct-1";
 const MARKET = "0190a3e0-0000-7000-8000-00000000000c";
@@ -415,5 +415,89 @@ describe("r2 X2: a release releases only with POSITIVE finality; no VOID, at any
     // The next read, which STARTS after the window, settles it.
     await monitor.refresh();
     expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: false, engaged: [] } });
+  });
+});
+
+/**
+ * r4, R4-L1 (LOW). The control plane keys a switch by its reference exactly and accepts any 1–256 characters; at
+ * round 3 the trader matched references with `===`, so a switch engaged under another spelling (upper case) was
+ * engaged at the control plane and enforced on nothing here (Opus N4; astra's offline probe).
+ */
+describe("r4 R4-L1: references are matched in their scope's canonical form, at match time only", () => {
+  const SPELLINGS = [
+    ["upper case", MARKET.toUpperCase()],
+    ["surrounding braces", `{${MARKET}}`],
+    ["no hyphens", MARKET.replaceAll("-", "")],
+    ["surrounding space", `  ${MARKET} `],
+  ] as const;
+
+  for (const [label, spelling] of SPELLINGS) {
+    it(`a MARKET FULL_HALT whose market id is spelt with ${label} is enforced on the canonical id, and reported NOT_CANONICAL`, () => {
+      const effects = effectsOf([engageRow({ id: "m", scope: "MARKET", scopeRef: spelling, action: "FULL_HALT" })]);
+      // On 04be84d: the sets and the directive held the spelling verbatim.
+      expect([...effects.entryBlockedMarkets]).toEqual([MARKET]);
+      expect([...effects.submissionBlockedMarkets]).toEqual([MARKET]);
+      expect(effects.cancels).toEqual([{ directive: { scope: "MARKET", marketId: MARKET }, killSwitchEventId: "m" }]);
+      expect(effects.refNotices).toEqual([{ killSwitchEventId: "m", scope: "MARKET", scopeRef: spelling, kind: "NOT_CANONICAL", enforcedAs: MARKET }]);
+      expect(effects.stopsHeartbeat).toBe(false);
+    });
+  }
+
+  it("a STRATEGY_INSTANCE CANCEL_ALL whose instance id is in upper case is enforced on the canonical id, and reported", () => {
+    const effects = effectsOf([engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE.toUpperCase(), action: "CANCEL_ALL" })]);
+    expect([...effects.submissionBlockedInstances]).toEqual([INSTANCE]);
+    expect(effects.cancels).toEqual([{ directive: { scope: "STRATEGY_INSTANCE", instanceId: INSTANCE }, killSwitchEventId: "i" }]);
+    expect(effects.refNotices.map((notice) => notice.kind)).toEqual(["NOT_CANONICAL"]);
+  });
+
+  it("a MARKET reference that does not read as a UUID (a condition id, say) names no internal id: enforced verbatim, and reported UNRECOGNISED", () => {
+    const effects = effectsOf([engageRow({ id: "m", scope: "MARKET", scopeRef: "0xabc-condition", action: "FULL_HALT" })]);
+    expect([...effects.submissionBlockedMarkets]).toEqual(["0xabc-condition"]);
+    expect(effects.refNotices).toEqual([{ killSwitchEventId: "m", scope: "MARKET", scopeRef: "0xabc-condition", kind: "UNRECOGNISED", enforcedAs: "0xabc-condition" }]);
+  });
+
+  for (const spelling of ["ACCT-1", "Acct-1", " acct-1 "]) {
+    it(`an ACCOUNT FULL_HALT engaged as ${JSON.stringify(spelling)} MAY name this account ("acct-1"): enforced as this account's (heartbeat stopped, every order blocked, the account cancelled), and reported ACCOUNT_SPELLING`, () => {
+      const effects = effectsOf([engageRow({ id: "a", scope: "ACCOUNT", scopeRef: spelling, action: "FULL_HALT" })]);
+      // On 04be84d: another account's switch: nothing.
+      expect(effects.stopsHeartbeat).toBe(true);
+      expect(effects.blocksAllSubmissions).toBe(true);
+      expect(effects.cancels).toEqual([{ directive: { scope: "ACCOUNT" }, killSwitchEventId: "a" }]);
+      expect(effects.refNotices).toEqual([{ killSwitchEventId: "a", scope: "ACCOUNT", scopeRef: spelling, kind: "ACCOUNT_SPELLING", enforcedAs: ACCOUNT }]);
+    });
+  }
+
+  it("another account's ACCOUNT switch is still not this process's, and canonical references are never reported", () => {
+    for (const other of ["acct-2", "acct-10", "acct"]) {
+      const effects = effectsOf([engageRow({ id: "a", scope: "ACCOUNT", scopeRef: other, action: "FULL_HALT" })]);
+      expect(effects.stopsHeartbeat).toBe(false);
+      expect(effects.blocksAllEntries).toBe(false);
+      expect(effects.refNotices).toEqual([]);
+    }
+    const canonical = effectsOf([
+      engageRow({ id: "a", scope: "ACCOUNT", scopeRef: ACCOUNT, action: "HALT_NEW_ENTRIES" }),
+      engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }),
+      engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" }),
+    ]);
+    expect(canonical.refNotices).toEqual([]);
+  });
+
+  it("rows are never merged: a final release under one spelling does not release an engage under another", () => {
+    const effects = effectsOf([
+      engageRow({ id: "e", scope: "MARKET", scopeRef: MARKET.toUpperCase(), action: "FULL_HALT" }),
+      releaseRow({ id: "r", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }),
+      engageRow({ id: "a", scope: "ACCOUNT", scopeRef: "ACCT-1", action: "FULL_HALT" }),
+      releaseRow({ id: "ra", scope: "ACCOUNT", scopeRef: ACCOUNT, action: "FULL_HALT" }),
+    ]);
+    expect(effects.engaged.map((entry) => entry.killSwitchEventId)).toEqual(["e", "a"]);
+    expect([...effects.submissionBlockedMarkets]).toEqual([MARKET]);
+    expect(effects.stopsHeartbeat).toBe(true);
+  });
+
+  it("canonicalUuid reads a UUID in any letter case, within braces, without hyphens or within space, and nothing else; scopeIdKey keeps a non-UUID verbatim", () => {
+    for (const spelling of [MARKET, MARKET.toUpperCase(), `{${MARKET}}`, MARKET.replaceAll("-", ""), ` ${MARKET}\t`]) expect(canonicalUuid(spelling)).toBe(MARKET);
+    for (const other of ["", "acct-1", "0xabc", `${MARKET}0`, MARKET.slice(1), `{${MARKET}`, MARKET.replace("c", "g")]) expect(canonicalUuid(other)).toBeNull();
+    expect(scopeIdKey("m-1")).toBe("m-1");
+    expect(scopeIdKey(MARKET.toUpperCase())).toBe(MARKET);
   });
 });

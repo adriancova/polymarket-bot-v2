@@ -893,6 +893,260 @@ describe("r3 J3: a release that is still PENDING keeps a cancel obligation", () 
   });
 });
 
+/**
+ * r4, CX320-R4-01 (HIGH; astra, agreed by Opus). The r3 attempt deadline bounded the composition's own cancel request,
+ * not the venue call beneath the OMS: WP-270's `requestCancel` persists CANCEL_PENDING, awaits the venue with no
+ * deadline, and refuses to cancel a CANCEL_PENDING order again. A venue cancel that never answered stranded the order:
+ * every later pass was accepted and removed nothing, while a MARKET or STRATEGY_INSTANCE switch kept the heartbeat
+ * running. The fakes below model an OMS-bound cancel port exactly so: a cancellable order (LIVE, RECONCILING) goes
+ * CANCEL_PENDING and its venue cancel is sent; anything else is skipped and the port answers `true`.
+ */
+describe("r4 CX320-R4-01: an order stranded CANCEL_PENDING beneath the OMS is released through requestOrderReconciliation", () => {
+  const OTHER_MARKET = "0190a3e0-0000-7000-8000-0000000000ff";
+  const OTHER_INSTANCE = "0190a3e0-0000-7000-8000-0000000000fe";
+
+  /** An OMS-bound cancel port over the fake OMS: the first venue cancel never answers; the later ones cancel. */
+  function omsBoundCancels(c: ReturnType<typeof composition>): { venueCancels(): number } {
+    let venueCancels = 0;
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      let hang = false;
+      c.oms.views = c.oms.views.map((view) => {
+        const inScope = directive.scope === "ACCOUNT" || (directive.scope === "MARKET" && view.marketId === directive.marketId) || directive.scope === "STRATEGY_INSTANCE";
+        if (!inScope || !["LIVE", "RECONCILING"].includes(view.state)) return view;
+        venueCancels += 1;
+        if (venueCancels === 1) {
+          hang = true;
+          return { ...view, state: "CANCEL_PENDING" };
+        }
+        return { ...view, state: "CANCELED" };
+      });
+      if (hang) return new Promise<never>(() => undefined);
+      return true;
+    };
+    return { venueCancels: () => venueCancels };
+  }
+
+  function stranded(c: ReturnType<typeof composition>): unknown[] {
+    return c.journal.of("KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED").map((entry) => [entry.directive, entry.orderId, entry.accepted]);
+  }
+
+  for (const scope of ["MARKET", "STRATEGY_INSTANCE"] as const) {
+    it(`${scope} FULL_HALT: the venue cancel beneath the OMS never answers; the order, CANCEL_PENDING for cancelTimeoutMs, is sent to requestOrderReconciliation ONCE (journalled, paged once) and the obligation's next pass cancels it again; the heartbeat runs on`, async () => {
+      const c = composition();
+      await ready(c);
+      const venue = omsBoundCancels(c);
+      c.oms.views = [{ orderId: "o-here", state: "LIVE", venueOrderId: "v-here", marketId: MARKET }];
+      c.reader.rows = [engageRow({ id: "k", scope, scopeRef: scope === "MARKET" ? MARKET : INSTANCE, action: "FULL_HALT" })];
+      const readAt = c.clock.now + 500;
+      await c.clock.advance(1_000);
+      expect(c.oms.views.map((view) => view.state)).toEqual(["CANCEL_PENDING"]);
+      await c.clock.advance(1_000);
+      // First seen CANCEL_PENDING at the read after the FIRST request; released one deadline (1 s) later.
+      expect(c.oms.requested).toEqual([]);
+      await c.clock.advance(1_000);
+      const key = `k:${scope}:${scope === "MARKET" ? MARKET : INSTANCE}`;
+      // On 04be84d: never requested; the order stays CANCEL_PENDING and every RETAINED pass is ACCEPTED.
+      expect(c.oms.requested).toEqual(["o-here"]);
+      expect(stranded(c)).toEqual([[key, "o-here", true]]);
+      expect(c.journal.of("KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED")[0]?.cancelPendingSinceMs).toBe(readAt + 1_000);
+      expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_CANCEL_STRANDED")).toHaveLength(1);
+      expect(venue.venueCancels()).toBe(2);
+      expect(c.oms.views.map((view) => view.state)).toEqual(["CANCELED"]);
+      // The journal never reads a stranded scope as clear: ACCEPTED while the order rested says so.
+      expect(c.journal.of("KILL_SWITCH_CANCEL_REQUESTED").map((entry) => [entry.pass, entry.outcome, entry.scopeStillResting])).toEqual([
+        ["FIRST", "ABANDONED", true],
+        ["FIRST", "ACCEPTED", true],
+        ["CONFIRMING", "ACCEPTED", false],
+      ]);
+      // Quiescent: nothing more is asked, nothing more is reconciled.
+      await c.clock.advance(5_000);
+      expect(c.cancels.calls).toHaveLength(3);
+      expect(c.oms.requested).toEqual(["o-here"]);
+      c.proveComposition();
+      expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+    });
+  }
+
+  it("a venue that never answers ANY cancel: each new CANCEL_PENDING is released one deadline after a read first sees it, for as long as the switch is engaged; paged once", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.views = [{ orderId: "o-here", state: "LIVE", venueOrderId: "v-here", marketId: MARKET }];
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      const cancellable = c.oms.views.some((view) => ["LIVE", "RECONCILING"].includes(view.state));
+      c.oms.views = c.oms.views.map((view) => (["LIVE", "RECONCILING"].includes(view.state) ? { ...view, state: "CANCEL_PENDING" } : view));
+      return cancellable ? new Promise<never>(() => undefined) : true;
+    };
+    c.reader.rows = [engageRow({ id: "k", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(12_000);
+    // Twelve reads: FIRST at the 1st (hangs); first seen CANCEL_PENDING at the 2nd; released at the 3rd and every second
+    // read after it (each release lets that read's pass send a new cancel, which hangs and is first seen at the next).
+    expect(c.oms.requested).toEqual(["o-here", "o-here", "o-here", "o-here", "o-here"]);
+    expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_CANCEL_STRANDED")).toHaveLength(1);
+    expect(c.oms.views.map((view) => view.state)).not.toEqual(["CANCELED"]);
+  });
+
+  it("only an order that MAY be in a current obligation's scope is released: another market's is not, nor any while no switch is engaged; one stranded before the switch is released at the first read that has the obligation", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.views = [
+      { orderId: "o-here", state: "CANCEL_PENDING", venueOrderId: "v-here", marketId: MARKET },
+      { orderId: "o-there", state: "CANCEL_PENDING", venueOrderId: "v-there", marketId: OTHER_MARKET },
+    ];
+    await c.clock.advance(5_000);
+    expect(c.oms.requested).toEqual([]);
+    c.reader.rows = [engageRow({ id: "k", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(1_000);
+    expect(c.oms.requested).toEqual(["o-here"]);
+    await c.clock.advance(5_000);
+    expect(c.oms.requested).toEqual(["o-here"]);
+    expect(c.oms.views.find((view) => view.orderId === "o-there")?.state).toBe("CANCEL_PENDING");
+  });
+
+  it("STRATEGY_INSTANCE: an order the attribution port affirmatively names ANOTHER instance's is not released; this instance's, and an unattributed one, are", async () => {
+    const c = compositionWithKillSwitch({
+      instanceAttribution: { instanceOf: (order) => (order.orderId === "theirs" ? OTHER_INSTANCE : order.orderId === "mine" ? INSTANCE : null) },
+    });
+    await ready(c);
+    c.oms.views = ["mine", "theirs", "unknown"].map((orderId) => ({ orderId, state: "CANCEL_PENDING", venueOrderId: `v-${orderId}`, marketId: MARKET }));
+    c.reader.rows = [engageRow({ id: "k", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+    await c.clock.advance(3_000);
+    expect([...c.oms.requested].sort()).toEqual(["mine", "unknown"]);
+  });
+
+  it("the deadline runs from the first read that saw it CANCEL_PENDING, continuously; a request not yet settled is not repeated; a refused one is asked again at the first read that has seen the order CANCEL_PENDING for a deadline since the request", async () => {
+    const c = compositionWithKillSwitch({ cancelTimeoutMs: 2_500 });
+    await ready(c);
+    const answers: ((value: { readonly ok: boolean }) => void)[] = [];
+    c.oms.requestOrderReconciliation = async (orderId) => {
+      c.oms.requested.push(orderId);
+      return new Promise<{ readonly ok: boolean }>((resolve) => {
+        answers.push(resolve);
+      });
+    };
+    const pendingView = { orderId: "o-here", state: "CANCEL_PENDING", venueOrderId: "v-here", marketId: MARKET };
+    c.oms.views = [pendingView];
+    c.reader.rows = [engageRow({ id: "k", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(2_000);
+    // Seen at two reads 1 s apart; then LIVE for one read: forgotten.
+    c.oms.views = [{ ...pendingView, state: "LIVE" }];
+    await c.clock.advance(1_000);
+    c.oms.views = [pendingView];
+    await c.clock.advance(3_000);
+    // Seen again at three reads (0, 1 s, 2 s): not yet one 2.5 s deadline since it was seen again.
+    expect(c.oms.requested).toEqual([]);
+    await c.clock.advance(1_000);
+    expect(c.oms.requested).toEqual(["o-here"]);
+    // Unsettled: never repeated.
+    await c.clock.advance(10_000);
+    expect(c.oms.requested).toEqual(["o-here"]);
+    expect(c.journal.of("KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED")).toEqual([]);
+    // Refused, the order still CANCEL_PENDING as at every read since the request (each read after it timed it afresh):
+    // journalled, and asked again at the next read.
+    answers[0]?.({ ok: false });
+    await c.clock.advance(0);
+    expect(c.journal.of("KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED").map((entry) => entry.accepted)).toEqual([false]);
+    await c.clock.advance(1_000);
+    expect(c.oms.requested).toEqual(["o-here", "o-here"]);
+    // Accepted: the order goes RECONCILING, then a NEW cancel makes it CANCEL_PENDING again: its own deadline starts
+    // at the first read that sees it (reads at 0, 1 s and 2 s: none; at 3 s: released).
+    answers[1]?.({ ok: true });
+    c.oms.views = [{ ...pendingView, state: "RECONCILING" }];
+    await c.clock.advance(1_000);
+    c.oms.views = [pendingView];
+    await c.clock.advance(3_000);
+    expect(c.oms.requested).toEqual(["o-here", "o-here"]);
+    await c.clock.advance(1_000);
+    expect(c.oms.requested).toEqual(["o-here", "o-here", "o-here"]);
+    expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_CANCEL_STRANDED")).toHaveLength(1);
+  });
+
+  it("an OMS view that cannot be read releases nothing, and the obligation's passes go on", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.orders = () => {
+      throw new Error("unreadable");
+    };
+    c.reader.rows = [engageRow({ id: "k", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(5_000);
+    expect(c.oms.requested).toEqual([]);
+    expect(cancelRequests(c).map(([pass]) => pass)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED", "RETAINED"]);
+  });
+});
+
+/**
+ * r4, R4-L1 (LOW; Opus, agreed by astra). Kill-switch references were matched by exact string while the control
+ * plane accepts any 1–256-character reference: a switch engaged under another spelling (upper case) was reported
+ * engaged and enforced on nothing here (Opus probe N4: a REDUCTION permitted in the halted market; an ACCOUNT
+ * FULL_HALT that did not stop the heartbeat).
+ */
+describe("r4 R4-L1: a switch's reference is matched in its scope's canonical form, and a non-canonical one is paged", () => {
+  it("an ACCOUNT FULL_HALT engaged as 'ACCT-1' is this account's ('acct-1'): it stops the heartbeat and blocks every order; paged once", async () => {
+    const c = composition();
+    await ready(c);
+    c.reader.rows = [engageRow({ id: "a", scope: "ACCOUNT", scopeRef: ACCOUNT.toUpperCase(), action: "FULL_HALT" })];
+    await c.clock.advance(5_000);
+    c.proveComposition();
+    // On 04be84d: permitted.
+    expect(c.safety.heartbeatGate.evaluate().permitted).toBe(false);
+    expect(c.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
+    const pages = c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_SCOPE_REF_NOT_CANONICAL");
+    expect(pages).toHaveLength(1);
+    expect(pages[0]?.detail).toContain("ACCOUNT");
+  });
+
+  it("a MARKET FULL_HALT engaged with the market id in upper case blocks that market's reductions, and its obligation is held while the OMS shows that (lower-case) market's order resting; paged once", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.views = [{ orderId: "o-here", state: "LIVE", venueOrderId: "v-here", marketId: MARKET }];
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET.toUpperCase(), action: "FULL_HALT" })];
+    await c.clock.advance(5_000);
+    // On 04be84d: the reduction is permitted, and the obligation stops after its confirming pass.
+    expect(c.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_MARKET_ENDS_TRADING");
+    expect(cancelRequests(c).map(([pass]) => pass)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED", "RETAINED"]);
+    expect(c.cancels.calls[0]).toBe(JSON.stringify({ scope: "MARKET", marketId: MARKET }));
+    expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_SCOPE_REF_NOT_CANONICAL")).toHaveLength(1);
+  });
+
+  it("the other side is read alike: an OMS order, and a placement in flight, whose market id is spelt in upper case are in a canonical MARKET switch's scope", async () => {
+    const c = composition();
+    await ready(c);
+    const { fenced, land } = heldVenueR3(c);
+    const placement = fenced.postOrder({ id: "p", marketId: MARKET.toUpperCase(), instanceId: INSTANCE });
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(4_000);
+    // Held by the pending placement: RETAINED while it is in flight; its settling calls for another cancel.
+    expect(cancelRequests(c).map(([pass]) => pass)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED"]);
+    land("p");
+    expect(await placement).toBe("ACCEPTED:p");
+    c.oms.views = [{ orderId: "o-upper", state: "LIVE", venueOrderId: "v-upper", marketId: MARKET.toUpperCase() }];
+    await c.clock.advance(3_000);
+    expect(cancelRequests(c).slice(4).map(([pass]) => pass)).toEqual(["AFTER_SETTLE", "RETAINED", "RETAINED"]);
+    // ... and the OMS order stranded CANCEL_PENDING in it is released.
+    c.oms.views = [{ orderId: "o-upper", state: "CANCEL_PENDING", venueOrderId: "v-upper", marketId: MARKET.toUpperCase() }];
+    await c.clock.advance(2_000);
+    expect(c.oms.requested).toEqual(["o-upper"]);
+  });
+
+  it("an attribution port answering this instance's id in another spelling holds the instance obligation", async () => {
+    const c = compositionWithKillSwitch({ instanceAttribution: { instanceOf: () => INSTANCE.toUpperCase() } });
+    await ready(c);
+    c.oms.views = [{ orderId: "o-1", state: "LIVE", venueOrderId: "v-1", marketId: MARKET }];
+    c.reader.rows = [engageRow({ id: "s", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+    await c.clock.advance(4_000);
+    expect(cancelRequests(c).map(([pass]) => pass)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED"]);
+  });
+
+  it("a canonical reference is never paged", async () => {
+    const c = composition();
+    await ready(c);
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }), engageRow({ id: "a", scope: "ACCOUNT", scopeRef: "acct-2", action: "FULL_HALT" })];
+    await c.clock.advance(5_000);
+    expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_SCOPE_REF_NOT_CANONICAL")).toEqual([]);
+  });
+});
+
 describe("WP-290's halt port is routed into the gate (WP290-RESIDUALS: route the halt port)", () => {
   it("an account halt and a market halt block new entries until an operator releases them", async () => {
     const c = composition();

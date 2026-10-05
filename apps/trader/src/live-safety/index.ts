@@ -70,11 +70,13 @@ export {
   type HealthVerdict,
 } from "./health-lease.js";
 export {
+  canonicalUuid,
   foldKillSwitchRows,
   KILL_SWITCH_ACTIONS,
   KILL_SWITCH_SCOPES,
   killSwitchEffects,
   KillSwitchMonitor,
+  scopeIdKey,
   type CancelDirective,
   type EngagedSwitch,
   type KillSwitchAction,
@@ -85,6 +87,7 @@ export {
   type KillSwitchRow,
   type KillSwitchScope,
   type KillSwitchSnapshot,
+  type ScopeRefNotice,
 } from "./kill-switch.js";
 export { createPostgresKillSwitchReader, killSwitchLatestRowQueries } from "./kill-switch-postgres.js";
 export { LapseRecovery, LapseRecoveryConfigurationError, VENUE_CANCELLATION_CHECK_INTERVAL_MS, type LapseRecoveryOptions } from "./lapse-recovery.js";

@@ -69,6 +69,22 @@ describe("the live gate", () => {
     expect(evaluateLiveGate(gate, REDUCTION).reasons).toEqual(["KILL_SWITCH_INSTANCE_ENDS_TRADING"]);
   });
 
+  it("r4 R4-L1: a MARKET or STRATEGY_INSTANCE switch engaged under another spelling of the id blocks that id's orders (Opus N4), and so does a request carrying another spelling; an ACCOUNT switch spelt in upper case blocks too", () => {
+    const market = inputs({ killSwitch: () => known([engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET.toUpperCase(), action: "FULL_HALT" })]) });
+    // On 04be84d: permitted, no reasons.
+    expect(evaluateLiveGate(market, REDUCTION).reasons).toEqual(["KILL_SWITCH_MARKET_ENDS_TRADING"]);
+    expect(evaluateLiveGate(market, ENTRY).reasons).toEqual(["KILL_SWITCH_MARKET_ENGAGED"]);
+    expect(evaluateLiveGate(market, { ...REDUCTION, marketId: OTHER_MARKET }).permitted).toBe(true);
+    const instance = inputs({ killSwitch: () => known([engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: `{${INSTANCE}}`, action: "FULL_HALT" })]) });
+    expect(evaluateLiveGate(instance, REDUCTION).reasons).toEqual(["KILL_SWITCH_INSTANCE_ENDS_TRADING"]);
+    const canonical = inputs({ killSwitch: () => known([engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })]) });
+    expect(evaluateLiveGate(canonical, { ...REDUCTION, marketId: MARKET.toUpperCase() }).reasons).toEqual(["KILL_SWITCH_MARKET_ENDS_TRADING"]);
+    const canonicalInstance = inputs({ killSwitch: () => known([engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })]) });
+    expect(evaluateLiveGate(canonicalInstance, { ...ENTRY, instanceId: INSTANCE.toUpperCase() }).reasons).toEqual(["KILL_SWITCH_INSTANCE_ENGAGED"]);
+    const account = inputs({ killSwitch: () => known([engageRow({ id: "a", scope: "ACCOUNT", scopeRef: "ACCT-1", action: "FULL_HALT" })]) });
+    expect(evaluateLiveGate(account, REDUCTION).reasons).toEqual(["KILL_SWITCH_ACCOUNT_ENDS_TRADING"]);
+  });
+
   it("the fence, the health lease and an explicit stop gate every order", () => {
     const fence = inputs({ fence: () => ({ held: false, reason: "EXPIRED" }) });
     for (const request of [ENTRY, REDUCTION]) expect(evaluateLiveGate(fence, request).reasons).toEqual(["FENCE_EXPIRED"]);

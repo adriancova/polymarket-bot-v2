@@ -90,6 +90,41 @@
  * | `STRATEGY_INSTANCE` (any action) | NEVER stops | blocked for that instance | blocked for that instance for `FULL_HALT` / `CANCEL_*` | that instance's orders, for `FULL_HALT` / `CANCEL_*` |
  * | `ACCOUNT` naming another account | — | — | — | — |
  *
+ * ## Matching a switch's reference to this process (r4, finding R4-L1)
+ *
+ * The control plane accepts any reference of 1–256 characters
+ * (`apps/control-api/src/api.ts`, `KillSwitchEngageSchema.scopeRef`) and keys
+ * a switch by it EXACTLY. At round 3 the trader compared references with `===`,
+ * so a switch engaged under another spelling of an id (upper case, say) was
+ * reported engaged by the control plane and enforced on nothing here. Now each
+ * scope's reference is matched in a scope-aware canonical form, and only at
+ * MATCH time: rows are never merged, so a release under one spelling never
+ * releases an engage under another (the reader keys rows by the exact
+ * reference), and canonical matching can only ADD matches (fail closed).
+ *
+ * - `MARKET` and `STRATEGY_INSTANCE`: internal market and strategy-instance
+ *   ids are PostgreSQL `uuid`s (`internal.uuid_v7`, migrations 0001, 0003,
+ *   0004), so letter case, surrounding braces and hyphens do not change which
+ *   id one names; the domain's canonical form is lower-case and hyphenated
+ *   (`packages/domain/src/identifiers.ts`). A reference that reads as a UUID
+ *   ({@link canonicalUuid}: any letter case, one pair of surrounding braces,
+ *   hyphens anywhere or none, surrounding space — a little more lenient than
+ *   PostgreSQL's own `uuid` input, which can only ADD matches) is enforced
+ *   under its canonical form ({@link scopeIdKey}), and
+ *   the gate and the cancel scope compare the other side in the same form. A
+ *   reference that is not already canonical is reported (`NOT_CANONICAL`); one
+ *   that does not read as a UUID at all names no id this process can match,
+ *   is enforced verbatim, and is reported (`UNRECOGNISED`).
+ * - `ACCOUNT`: account references are free text (`internal.identifier`), so
+ *   they are NOT assumed case-insensitive; but a reference that differs from
+ *   this process's only in letter case or surrounding space MAY name it, and a
+ *   kill switch that may name this account is enforced as this account's (as
+ *   an `ACCOUNT` switch with an unreadable reference already is), and reported
+ *   (`ACCOUNT_SPELLING`).
+ *
+ * The composition pages each reported reference once
+ * (`KILL_SWITCH_SCOPE_REF_NOT_CANONICAL`, `live-safety.ts`).
+ *
  * WP-320 defines which GLOBAL and ACCOUNT actions stop the heartbeat
  * (ADR-033 D1 item 3): those that end trading on the account. `FULL_HALT`
  * is §9.9's "full halt" (whose "Account state unknown" default also stops the
@@ -163,6 +198,7 @@ export interface EngagedSwitch {
   readonly release: "NONE" | "PENDING" | "UNCONFIRMED" | "VOIDED";
 }
 
+/** A scope to cancel. A MARKET or STRATEGY_INSTANCE id is in its matching form ({@link scopeIdKey}; r4 R4-L1). */
 export type CancelDirective =
   | { readonly scope: "ACCOUNT" }
   | { readonly scope: "MARKET"; readonly marketId: string }
@@ -179,6 +215,53 @@ export interface KillSwitchEffects {
   readonly submissionBlockedInstances: ReadonlySet<string>;
   /** Each with the event id of the row that asks for it (an engage, or a release that is not final). */
   readonly cancels: readonly { readonly directive: CancelDirective; readonly killSwitchEventId: string }[];
+  /** Engaged switches whose reference is not in its scope's canonical form (r4 R4-L1; module header). */
+  readonly refNotices: readonly ScopeRefNotice[];
+}
+
+/**
+ * An engaged switch whose reference is not in its scope's canonical form (r4, finding R4-L1; module header):
+ *
+ * - `NOT_CANONICAL`: a MARKET or STRATEGY_INSTANCE reference that reads as a UUID, enforced as `enforcedAs`;
+ * - `UNRECOGNISED`: a MARKET or STRATEGY_INSTANCE reference that does not read as a UUID: it names no id this
+ *   process can match, and is enforced verbatim;
+ * - `ACCOUNT_SPELLING`: an ACCOUNT reference that differs from this process's only in letter case or surrounding
+ *   space: enforced as this account's.
+ */
+export interface ScopeRefNotice {
+  readonly killSwitchEventId: string;
+  readonly scope: "ACCOUNT" | "MARKET" | "STRATEGY_INSTANCE";
+  readonly scopeRef: string;
+  readonly kind: "NOT_CANONICAL" | "UNRECOGNISED" | "ACCOUNT_SPELLING";
+  readonly enforcedAs: string;
+}
+
+/**
+ * The canonical form of an internal market or strategy-instance id (r4, R4-L1; module header): both are PostgreSQL
+ * `uuid`s, so a string that reads as one — 32 hexadecimal digits in any letter case, within one pair of surrounding
+ * braces or none, with hyphens anywhere or none, and surrounding space — is its lower-case hyphenated form. Anything
+ * else: `null`. Deliberately a little more lenient than PostgreSQL's own `uuid` input: it can only add matches.
+ */
+export function canonicalUuid(value: string): string | null {
+  let text = value.trim().toLowerCase();
+  if (text.startsWith("{") && text.endsWith("}")) text = text.slice(1, -1);
+  const hex = text.replaceAll("-", "");
+  if (!/^[0-9a-f]{32}$/u.test(hex)) return null;
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * The form a MARKET or STRATEGY_INSTANCE id is matched in (r4, R4-L1): canonical when it reads as a UUID, verbatim
+ * otherwise. The gate, the cancel scope and the switches' blocked sets all use it, so each side is compared alike.
+ */
+export function scopeIdKey(value: string): string {
+  return canonicalUuid(value) ?? value;
+}
+
+/** An ACCOUNT reference compared with this process's (r4, R4-L1): exactly, or only by letter case and surrounding space. */
+function accountMatch(scopeRef: string, accountRef: string): "EXACT" | "SPELLING" | "OTHER" {
+  if (scopeRef === accountRef) return "EXACT";
+  return scopeRef.trim().toLowerCase() === accountRef.trim().toLowerCase() ? "SPELLING" : "OTHER";
 }
 
 const ACCOUNT_ENDING: readonly KillSwitchAction[] = ["FULL_HALT", "CANCEL_ALL", "CANCEL_MARKET"];
@@ -293,13 +376,31 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
   const entryBlockedInstances = new Set<string>();
   const submissionBlockedInstances = new Set<string>();
   const cancels: { readonly directive: CancelDirective; readonly killSwitchEventId: string }[] = [];
+  const refNotices: ScopeRefNotice[] = [];
+  /** A MARKET or STRATEGY_INSTANCE reference's matching form (r4 R4-L1), reported when it is not canonical. */
+  const scopedKey = (killSwitchEventId: string, scope: "MARKET" | "STRATEGY_INSTANCE", scopeRef: string): string => {
+    const canonical = canonicalUuid(scopeRef);
+    if (canonical === null) {
+      refNotices.push(Object.freeze({ killSwitchEventId, scope, scopeRef, kind: "UNRECOGNISED" as const, enforcedAs: scopeRef }));
+      return scopeRef;
+    }
+    if (canonical !== scopeRef) refNotices.push(Object.freeze({ killSwitchEventId, scope, scopeRef, kind: "NOT_CANONICAL" as const, enforcedAs: canonical }));
+    return canonical;
+  };
   for (const entry of engaged) {
     const ending = SCOPE_ENDING.includes(entry.action);
     switch (entry.scope) {
       case "GLOBAL":
       case "ACCOUNT": {
-        // An ACCOUNT switch for another account is not this process's; an ACCOUNT switch with no readable ref is.
-        if (entry.scope === "ACCOUNT" && entry.scopeRef !== null && entry.scopeRef !== accountRef) break;
+        // An ACCOUNT switch for another account is not this process's; an ACCOUNT switch with no readable ref is, and so
+        // is one whose ref differs from this account's only in letter case or surrounding space (r4 R4-L1: it may name it).
+        if (entry.scope === "ACCOUNT" && entry.scopeRef !== null) {
+          const match = accountMatch(entry.scopeRef, accountRef);
+          if (match === "OTHER") break;
+          if (match === "SPELLING") {
+            refNotices.push(Object.freeze({ killSwitchEventId: entry.killSwitchEventId, scope: "ACCOUNT" as const, scopeRef: entry.scopeRef, kind: "ACCOUNT_SPELLING" as const, enforcedAs: accountRef }));
+          }
+        }
         blocksAllEntries = true;
         if (ACCOUNT_ENDING.includes(entry.action)) {
           stopsHeartbeat = true;
@@ -310,19 +411,21 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
       }
       case "MARKET": {
         if (entry.scopeRef === null) break;
-        entryBlockedMarkets.add(entry.scopeRef);
+        const marketId = scopedKey(entry.killSwitchEventId, "MARKET", entry.scopeRef);
+        entryBlockedMarkets.add(marketId);
         if (ending) {
-          submissionBlockedMarkets.add(entry.scopeRef);
-          cancels.push({ directive: Object.freeze({ scope: "MARKET" as const, marketId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
+          submissionBlockedMarkets.add(marketId);
+          cancels.push({ directive: Object.freeze({ scope: "MARKET" as const, marketId }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
       case "STRATEGY_INSTANCE": {
         if (entry.scopeRef === null) break;
-        entryBlockedInstances.add(entry.scopeRef);
+        const instanceId = scopedKey(entry.killSwitchEventId, "STRATEGY_INSTANCE", entry.scopeRef);
+        entryBlockedInstances.add(instanceId);
         if (ending) {
-          submissionBlockedInstances.add(entry.scopeRef);
-          cancels.push({ directive: Object.freeze({ scope: "STRATEGY_INSTANCE" as const, instanceId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
+          submissionBlockedInstances.add(instanceId);
+          cancels.push({ directive: Object.freeze({ scope: "STRATEGY_INSTANCE" as const, instanceId }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
@@ -338,6 +441,7 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
     entryBlockedInstances,
     submissionBlockedInstances,
     cancels: Object.freeze(cancels),
+    refNotices: Object.freeze(refNotices),
   });
 }
 

@@ -117,6 +117,49 @@
  * STRATEGY_INSTANCE switch still never stops the heartbeat (ADR-033 D1
  * item 3): the venue would cancel every order under the credentials.
  *
+ * ### A cancel stranded BENEATH the OMS (r4, finding CX320-R4-01)
+ *
+ * The attempt deadline above bounds the composition's own request, not the
+ * venue call beneath it. When the port is bound through the OMS (as
+ * `KillSwitchCancelPort` allows), WP-270's `OrderManager.requestCancel`
+ * persists `CANCEL_PENDING` and then awaits the venue's cancel with no
+ * deadline of its own (WP-260's client sets none either, `oms-progress.ts`);
+ * and the OMS refuses to cancel an order already `CANCEL_PENDING`
+ * (`OMS_CANCEL_NOT_APPLICABLE`). At round 3 a venue cancel that never answered
+ * therefore stranded the order: every later pass of the obligation was
+ * accepted and removed nothing, the order rested, and a MARKET or
+ * STRATEGY_INSTANCE switch kept the heartbeat running (both verifiers'
+ * reproduction, with the placing OMS and with WP-290's real coordinator: 61
+ * port calls, one venue cancel, the order `CANCEL_PENDING` in the OMS and
+ * `LIVE` at the venue, health green, twelve more heartbeats in 60 s). Now, at
+ * every successful read:
+ *
+ * - the composition notes, per OMS order, the instant a read first saw it
+ *   `CANCEL_PENDING` (continuously since: an order seen in any other state, or
+ *   gone, is forgotten);
+ * - an order that has been `CANCEL_PENDING` for at least `cancelTimeoutMs`
+ *   since then, and that may be in the scope of a current obligation (the
+ *   same scope rule as the venue evidence below), is sent to the OMS's own
+ *   `SafetyOms.requestOrderReconciliation` — WP-270: it "also clears a cancel
+ *   whose answer never came: a late cancel answer is then recorded only" — so
+ *   the order goes to `RECONCILING` (an authoritative read is requested), and
+ *   the OMS may cancel it again;
+ * - it is released BEFORE the read's passes are asked, so this read's pass
+ *   may already cancel it again; the obligation stays open throughout
+ *   (`CANCEL_PENDING` and `RECONCILING` rest or may rest), and only the OMS's
+ *   view showing the scope quiescent — venue evidence — closes it;
+ * - each request is journalled
+ *   (`KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED`), the obligation
+ *   pages `KILL_SWITCH_CANCEL_STRANDED` once, and an order whose request has
+ *   not settled is not asked again; a new `CANCEL_PENDING` after the request
+ *   is a new cancel, whose deadline starts when a read first sees it.
+ *
+ * It works whatever venue port the OMS was opened over. Every
+ * `KILL_SWITCH_CANCEL_REQUESTED` entry also records whether the OMS still
+ * showed the scope resting when its outcome was recorded
+ * (`scopeStillResting`): an ACCEPTED pass is a request the port took, never
+ * evidence that the scope is clear.
+ *
  * Why: every order transmitted AFTER the switch was observed is refused by the
  * per-order fence (`fenced-venue.ts`), but a placement handed to the venue
  * BEFORE it — queued beneath the fence (WP-310's rate-limit ladder ranks
@@ -172,7 +215,7 @@ import { evaluateLiveGate, type GateDecision, type GateRequest } from "./entry-g
 import { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementScope, type PlacementTracker, type PlacementVenuePort } from "./fenced-venue.js";
 import { assertLiveFencingContext, FencingAuthority, type AcquireResult, type FencingLeasePort, type RunModeContext } from "./fencing-authority.js";
 import { EventLoopProbe, HealthLease, ProofBoard, type HealthInput, type HealthProofReading, type HealthVerdict } from "./health-lease.js";
-import { KillSwitchMonitor, type CancelDirective, type KillSwitchReader, type KillSwitchReleaseFinality, type KillSwitchSnapshot } from "./kill-switch.js";
+import { KillSwitchMonitor, scopeIdKey, type CancelDirective, type KillSwitchReader, type KillSwitchReleaseFinality, type KillSwitchSnapshot } from "./kill-switch.js";
 import { LapseRecovery } from "./lapse-recovery.js";
 import type { OmsProgressMonitor } from "./oms-progress.js";
 import type { HeartbeatView, LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyOrderView, SafetyTimers } from "./ports.js";
@@ -180,7 +223,9 @@ import type { HeartbeatView, LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock
 /**
  * Carries out a kill switch's cancel (bound by the composition to the OMS or the secure client at `EMERGENCY_CANCEL`).
  * `true` = accepted. A request not answered within `cancelTimeoutMs` is abandoned and requested again (r3 J2; module
- * header), so the binding must tolerate a repeated request for the same scope.
+ * header), so the binding must tolerate a repeated request for the same scope. Bound through the OMS, an order the
+ * OMS holds `CANCEL_PENDING` cannot be cancelled again by id; one stranded there past `cancelTimeoutMs` is released by
+ * the composition through `SafetyOms.requestOrderReconciliation` (r4 CX320-R4-01; module header).
  */
 export interface KillSwitchCancelPort {
   cancel(directive: CancelDirective): Promise<unknown>;
@@ -279,10 +324,11 @@ export interface LiveSafetyOptions {
      */
     readonly releaseFinality: KillSwitchReleaseFinality;
     /**
-     * How long a cancel request may go unanswered before it is abandoned and requested again (r3 J2; module header).
-     * Default: `refreshIntervalMs`. At most the KILL_SWITCH input's maximum age: no cancel stalls longer than the
-     * switch state it enforces may be stale. It should exceed the cancel path's normal latency, or every request is
-     * abandoned (and repeated) before it answers.
+     * How long a cancel request may go unanswered before it is abandoned and requested again (r3 J2; module header),
+     * and how long an order in a switch's scope may stay `CANCEL_PENDING` in the OMS before its reconciliation is
+     * requested (r4 CX320-R4-01). Default: `refreshIntervalMs`. At most the KILL_SWITCH input's maximum age: no cancel
+     * stalls longer than the switch state it enforces may be stale. It should exceed the cancel path's normal latency,
+     * or every request is abandoned (and repeated) before it answers.
      */
     readonly cancelTimeoutMs?: number;
     /**
@@ -347,6 +393,14 @@ export class LiveSafety {
   /** Cancel keys already paged as unanswered (once per obligation; r3 J2). */
   readonly #cancelsPaged = new Set<string>();
   readonly #cancelTimeoutMs: number;
+  /** Per OMS order id: the monotonic instant a kill-switch read first saw it CANCEL_PENDING, continuously since (r4). */
+  readonly #cancelPendingSince = new Map<string, number>();
+  /** OMS order ids whose stranded-cancel reconciliation request has not settled (r4). */
+  readonly #strandedRequests = new Set<string>();
+  /** Cancel keys already paged as holding a stranded cancel (once per obligation; r4). */
+  readonly #strandedPaged = new Set<string>();
+  /** Kill-switch event ids already paged for a reference not in its scope's canonical form (r4 R4-L1). */
+  readonly #refNoticesPaged = new Set<string>();
   /** Placements the fenced venue has handed to the venue and that have not settled: handle → their scopes (r2 X3). */
   readonly #placements = new Map<number, readonly PlacementScope[]>();
   #nextPlacement = 0;
@@ -639,6 +693,7 @@ export class LiveSafety {
     }
     this.#killSwitchReadable = true;
     if (before !== null) this.#board.prove("DATABASE", before);
+    this.#pageRefNotices();
     await this.#enforceCancels();
     return true;
   }
@@ -739,6 +794,27 @@ export class LiveSafety {
     this.#killSwitchReadable = false;
   }
 
+  /** r4 R4-L1: each engaged switch whose reference is not in its scope's canonical form (`kill-switch.ts`) is paged once. */
+  #pageRefNotices(): void {
+    const snapshot = this.#killSwitch.snapshot();
+    if (!snapshot.known) return;
+    const current = new Set<string>();
+    for (const notice of snapshot.effects.refNotices) {
+      current.add(notice.killSwitchEventId);
+      if (this.#refNoticesPaged.has(notice.killSwitchEventId)) continue;
+      this.#refNoticesPaged.add(notice.killSwitchEventId);
+      const ref = JSON.stringify(notice.scopeRef.slice(0, 256));
+      const effect =
+        notice.kind === "UNRECOGNISED"
+          ? "does not read as a UUID (internal market and strategy-instance ids are UUIDs), so it may match none of this process's orders"
+          : notice.kind === "ACCOUNT_SPELLING"
+            ? "differs from this process's account only in letter case or surrounding space, and is enforced as this account's"
+            : `is enforced under its canonical form ${JSON.stringify(notice.enforcedAs)}`;
+      this.#page("KILL_SWITCH_SCOPE_REF_NOT_CANONICAL", `kill switch ${notice.killSwitchEventId} (${notice.scope} ${ref}) ${effect}; engage and release it under its canonical reference`);
+    }
+    for (const id of [...this.#refNoticesPaged]) if (!current.has(id)) this.#refNoticesPaged.delete(id);
+  }
+
   async #renewFence(): Promise<void> {
     const before = this.#now();
     const result = await this.#fence.renew();
@@ -759,17 +835,28 @@ export class LiveSafety {
     const readAtMs = snapshot.readStartedAtMs;
     const spacing = this.#options.killSwitch.refreshIntervalMs;
     const current = new Set<string>();
-    const requests: Promise<void>[] = [];
+    const obligations: (readonly [string, CancelDirective])[] = [];
     for (const { directive, killSwitchEventId } of snapshot.effects.cancels) {
       const key = `${killSwitchEventId}:${directive.scope}:${directive.scope === "MARKET" ? directive.marketId : directive.scope === "STRATEGY_INSTANCE" ? directive.instanceId : ""}`;
       if (current.has(key)) continue;
       current.add(key);
+      obligations.push([key, directive] as const);
+    }
+    // r4 CX320-R4-01: orders stranded CANCEL_PENDING beneath the OMS are released BEFORE the passes are asked, so this
+    // read's pass may already cancel them again. Never allowed to stop the passes.
+    let requests: Promise<void>[];
+    try {
+      requests = this.#releaseStrandedCancels(obligations);
+    } catch {
+      requests = [];
+    }
+    for (const [key, directive] of obligations) {
       const waiting = this.#cancelAttempts.get(key);
       if (waiting !== undefined) {
         const now = this.#now();
         // Still within its deadline: the obligation waits on it.
         if (now !== null && now - waiting.requestedAtMs < this.#cancelTimeoutMs) continue;
-        this.#abandonCancelAttempt(key, waiting, now);
+        this.#abandonCancelAttempt(key, directive, waiting, now);
       }
       const state = this.#cancels.get(key);
       let pass: CancelPass | null;
@@ -791,8 +878,65 @@ export class LiveSafety {
     for (const key of [...this.#cancels.keys()]) if (!current.has(key)) this.#cancels.delete(key);
     for (const key of [...this.#cancelAttempts.keys()]) if (!current.has(key)) this.#cancelAttempts.delete(key);
     for (const key of [...this.#cancelsPaged]) if (!current.has(key)) this.#cancelsPaged.delete(key);
+    for (const key of [...this.#strandedPaged]) if (!current.has(key)) this.#strandedPaged.delete(key);
     this.#pruneSettles();
     await Promise.all(requests);
+  }
+
+  /**
+   * r4, CX320-R4-01 (module header, "A cancel stranded BENEATH the OMS"): note the instant each OMS order was first
+   * seen CANCEL_PENDING (continuously since), and send every one that has stayed so for `cancelTimeoutMs` and that may
+   * be in the scope of a current obligation to the OMS's `requestOrderReconciliation`. Returns the requests.
+   */
+  #releaseStrandedCancels(obligations: readonly (readonly [string, CancelDirective])[]): Promise<void>[] {
+    const now = this.#now();
+    if (now === null) return [];
+    let pending: SafetyOrderView[];
+    try {
+      pending = this.#options.oms.orders().filter((order) => order.state === "CANCEL_PENDING");
+    } catch {
+      // Unreadable: nothing is released, and every obligation stays open (`#omsShowsResting`).
+      return [];
+    }
+    const pendingIds = new Set(pending.map((order) => order.orderId));
+    for (const id of [...this.#cancelPendingSince.keys()]) if (!pendingIds.has(id)) this.#cancelPendingSince.delete(id);
+    const requests: Promise<void>[] = [];
+    for (const order of pending) {
+      const since = this.#cancelPendingSince.get(order.orderId);
+      if (since === undefined) {
+        this.#cancelPendingSince.set(order.orderId, now);
+        continue;
+      }
+      if (now - since < this.#cancelTimeoutMs || this.#strandedRequests.has(order.orderId)) continue;
+      const covering = obligations.find(([, directive]) => this.#mayBeInScope(directive, order));
+      // No engaged switch's obligation covers it: not this composition's to clear.
+      if (covering === undefined) continue;
+      const [key] = covering;
+      // A CANCEL_PENDING seen after this request is a new cancel: its deadline starts when a read first sees it.
+      this.#cancelPendingSince.delete(order.orderId);
+      this.#strandedRequests.add(order.orderId);
+      if (!this.#strandedPaged.has(key)) {
+        this.#strandedPaged.add(key);
+        this.#page(
+          "KILL_SWITCH_CANCEL_STRANDED",
+          `an order (${order.orderId}) in the scope of a kill-switch cancel (${key}) stayed CANCEL_PENDING for ${String(now - since)} ms: its cancel's answer never came; its reconciliation was requested so it can be cancelled again`,
+        );
+      }
+      requests.push(this.#reconcileStranded(key, order.orderId, since));
+    }
+    return requests;
+  }
+
+  /** One stranded-cancel release (r4): journalled when it settles; the order may be asked again only after that. */
+  async #reconcileStranded(key: string, orderId: string, cancelPendingSinceMs: number): Promise<void> {
+    let accepted = false;
+    try {
+      accepted = (await this.#options.oms.requestOrderReconciliation(orderId)).ok === true;
+    } catch {
+      accepted = false;
+    }
+    this.#strandedRequests.delete(orderId);
+    this.#record({ kind: "KILL_SWITCH_STRANDED_CANCEL_RECONCILIATION_REQUESTED", directive: key, orderId, cancelPendingSinceMs, accepted, atMs: this.#now() ?? 0 });
   }
 
   /** One attempt (r3 J2): only the attempt its obligation is still waiting on may discharge a pass. */
@@ -828,12 +972,13 @@ export class LiveSafety {
       attempt: attempt.attempt,
       outcome: accepted ? "ACCEPTED" : "REFUSED",
       accepted,
+      scopeStillResting: this.#omsShowsResting(directive),
       atMs: atMs ?? 0,
     });
   }
 
   /** An attempt past its deadline (r3 J2): journalled, paged once per obligation, and no longer waited on. */
-  #abandonCancelAttempt(key: string, waiting: CancelAttempt, now: number | null): void {
+  #abandonCancelAttempt(key: string, directive: CancelDirective, waiting: CancelAttempt, now: number | null): void {
     this.#cancelAttempts.delete(key);
     this.#record({
       kind: "KILL_SWITCH_CANCEL_REQUESTED",
@@ -842,6 +987,7 @@ export class LiveSafety {
       attempt: waiting.attempt,
       outcome: "ABANDONED",
       accepted: false,
+      scopeStillResting: this.#omsShowsResting(directive),
       atMs: now ?? 0,
     });
     if (this.#cancelsPaged.has(key)) return;
@@ -865,8 +1011,11 @@ export class LiveSafety {
     const at = this.#now() ?? Number.POSITIVE_INFINITY;
     this.#lastSettleAny = Math.max(this.#lastSettleAny, at);
     for (const scope of scopes) {
-      this.#lastSettleByMarket.set(scope.marketId, Math.max(this.#lastSettleByMarket.get(scope.marketId) ?? Number.NEGATIVE_INFINITY, at));
-      this.#lastSettleByInstance.set(scope.instanceId, Math.max(this.#lastSettleByInstance.get(scope.instanceId) ?? Number.NEGATIVE_INFINITY, at));
+      // Keyed in the form a directive names them (r4 R4-L1).
+      const market = scopeIdKey(scope.marketId);
+      const instance = scopeIdKey(scope.instanceId);
+      this.#lastSettleByMarket.set(market, Math.max(this.#lastSettleByMarket.get(market) ?? Number.NEGATIVE_INFINITY, at));
+      this.#lastSettleByInstance.set(instance, Math.max(this.#lastSettleByInstance.get(instance) ?? Number.NEGATIVE_INFINITY, at));
     }
   }
 
@@ -882,8 +1031,9 @@ export class LiveSafety {
     for (const scopes of this.#placements.values()) {
       for (const scope of scopes) {
         if (directive.scope === "ACCOUNT") return true;
-        if (directive.scope === "MARKET" && scope.marketId === directive.marketId) return true;
-        if (directive.scope === "STRATEGY_INSTANCE" && scope.instanceId === directive.instanceId) return true;
+        // A directive names its id in its matching form (r4 R4-L1): the placement's is read alike.
+        if (directive.scope === "MARKET" && scopeIdKey(scope.marketId) === directive.marketId) return true;
+        if (directive.scope === "STRATEGY_INSTANCE" && scopeIdKey(scope.instanceId) === directive.instanceId) return true;
       }
     }
     return false;
@@ -905,11 +1055,18 @@ export class LiveSafety {
   /**
    * Whether an OMS order may be in the directive's scope. For STRATEGY_INSTANCE (r3 J1; module header): unless the
    * attribution port AFFIRMATIVELY names another instance — no port, a non-identifier answer and a throw all leave the
-   * order in scope, because WP-270's order view carries no instance and missing attribution is not "clear".
+   * order in scope, because WP-270's order view carries no instance and missing attribution is not "clear". Ids are
+   * compared in the form the directive names them (r4 R4-L1, `scopeIdKey`); an unreadable order is in scope.
    */
   #mayBeInScope(directive: CancelDirective, order: SafetyOrderView): boolean {
     if (directive.scope === "ACCOUNT") return true;
-    if (directive.scope === "MARKET") return order.marketId === directive.marketId;
+    if (directive.scope === "MARKET") {
+      try {
+        return scopeIdKey(order.marketId) === directive.marketId;
+      } catch {
+        return true;
+      }
+    }
     const attribution = this.#options.killSwitch.instanceAttribution;
     if (attribution === undefined) return true;
     let answer: unknown;
@@ -918,8 +1075,9 @@ export class LiveSafety {
     } catch {
       return true;
     }
-    const attributed = typeof answer === "string" && answer.length > 0 && answer.length <= 200;
-    return !attributed || answer === directive.instanceId;
+    // Only an identifier attributes; anything else leaves the order in scope.
+    if (typeof answer !== "string" || answer.length === 0 || answer.length > 200) return true;
+    return scopeIdKey(answer) === directive.instanceId;
   }
 
   /** Settle times older than every obligation's latest request can no longer matter: forget them. */
