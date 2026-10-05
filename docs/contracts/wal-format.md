@@ -62,21 +62,20 @@ package writes:
 - Exactly one writer may own a directory at a time. Nothing in this package
   enforces that (see §12, open items).
 
-> **Corrected 2026-10-04 (`GOV-NOTES-2`): with a capacity root, one writer
+> **Qualified 2026-10-04 (`GOV-NOTES-2`): with a capacity root, one writer
 > per WAL root.** `WALCAP-1` widened the premise. It merged as `da559ca` on
 > 2026-10-03. Its record is `docs/handoffs/WALCAP-1.md`. The rule above still
 > holds for each directory.
 >
-> - **The scope.** With `maxTotalBytes` set and `capacityRootPath` naming a
->   WAL root, the capacity ledger counts segment files in the root and in its
->   immediate subdirectories, as well as in the writer's own directory (§11.1,
->   the note). Without `capacityRootPath`, it counts the writer's own
->   directory alone.
+> - **The scope.** The capacity ledger exists only with `maxTotalBytes` set.
+>   It counts the segment files in the writer's own directory. When
+>   `capacityRootPath` names a WAL root, it also counts those in the root and
+>   in its immediate subdirectories (§11.1's note).
 > - **The gateway names its WAL root.** It writes each epoch to
 >   `<walRoot>/<gatewayEpoch>/` (`GatewayJournal.open`, `apps/data-gateway`).
 >   It is the only production caller of `openWalWriter`.
 > - **The premise.** Over a WAL root, the ledger assumes one writer per root
->   (`capacity-ledger.ts`, its module header). `WALCAP-1` rests it on
+>   (the module header of `capacity-ledger.ts`). `WALCAP-1` rests it on
 >   ADR-025 Decision 10, item 3: one gateway runs on the host.
 > - **If two writers shared a root,** each would count the other's new
 >   segment bytes only when it next re-derives its ledger, on a `tick()`. It
@@ -945,9 +944,9 @@ defined, not a change to any byte.)*
 >   (`#mayCloseByTime`). The cost: a waiting segment stays open past
 >   `maxSegmentAgeMs`, and `timeRotationsDeferred` counts it. §11.1's note
 >   states the rule.
-> - **Single-writer-per-directory.** With `capacityRootPath` set, the
->   capacity ledger also assumes one writer per WAL root (§2's note). Nothing
->   enforces that either.
+> - **Single-writer-per-directory.** With `maxTotalBytes` and
+>   `capacityRootPath` set, the capacity ledger also assumes one writer per
+>   WAL root (§2's note). Nothing enforces that either.
 
 ---
 
@@ -990,7 +989,7 @@ Implementation: `packages/storage-wal/src/`
 | `queue.ts` | the bounded §8.3 queue |
 | `segment-writer.ts` | one open segment: appends, running digest, and the §9.1 durability watermark |
 | `writer.ts` | rotation, durability policy, refusals, fault handling, the §10.2 accountability retention, the §11.1 capacity projection and the §11.2 id bound |
-| `capacity-ledger.ts` | the §11.1 per-file ledger `maxTotalBytes` is compared with (`SegmentByteLedger`), and its re-derivation from the disk (`rescanSegmentBytes`) |
+| `capacity-ledger.ts` | `SegmentByteLedger`, the §11.1 count of segment bytes, one entry per file; `rescanSegmentBytes`, its re-derivation from the disk |
 | `reader.ts` | sequential reads and validation |
 | `recovery.ts` | the §10 decision table |
 | `node-file-system.ts`, `clock.ts` | the only modules that touch a real disk or clock |
@@ -1013,8 +1012,8 @@ suite whose job is to try to break them:
 | §11.1 the capacity bound, framing included, for a **queued burst** at cap-exact thresholds | `wal-capacity.test.ts` |
 | §11.2 the bound holds against an injected `segmentIdFactory`, and an over-long id is refused rather than charged | `wal-capacity.test.ts` |
 | §9 the fsync bound and the byte high-water mark | `fsync-policy.test.ts` |
-| §11.1 the ledger: expiry gives bytes back; every epoch under the WAL root counts; the count is never below the disk, under a stale or partial listing, a failed re-derivation or a deletion during a rotation | `packages/storage-wal/src/capacity-relief.test.ts` (unit) |
-| §11.1 admission charges frames a drain took and has not written; what a failed write left on disk is counted before the writer faults; the count at open fails closed; re-derivations never overlap; a time rotation never takes the disk past the cap | `packages/storage-wal/src/capacity-in-flight.test.ts` (unit) |
+| §11.1 the ledger. Expiry gives bytes back. Every epoch under the WAL root counts. With no write of the writer in flight, the count is never below the disk. That holds under a stale or partial listing, a failed re-derivation and a deletion during a rotation. With a threshold, a capacity root on a filesystem that cannot list directories is refused at open. An empty capacity root is refused at open. A writer with no threshold reads no listing on `tick()`. | `packages/storage-wal/src/capacity-relief.test.ts` (unit) |
+| §11.1 a write in flight. While a write of the writer is in flight, the ledger can lag the disk. Admission charges the frames a drain took and is still writing. What admission compares with `maxTotalBytes` is never below the disk, at any instant (`capacity-ledger.ts`, module header). With a drain held in a segment's creation, a write or an `fsync`, the disk never passes the cap. What a failed write left on disk is counted before the writer faults. The count at open fails closed. Re-derivations never overlap. A time rotation never takes the disk past the cap. | `packages/storage-wal/src/capacity-in-flight.test.ts` (unit) |
 
 The defects rounds 2 and 3 found are also covered at unit level, in
 `packages/storage-wal/src/writer.test.ts` and
@@ -1024,15 +1023,16 @@ the root gate or in CI.
 > **Corrected 2026-10-04 (`GOV-NOTES-2`): `WALCAP-1`'s files, and the fault
 > tree in CI.**
 >
-> - **`WALCAP-1` added three files.** They are `capacity-ledger.ts`,
->   `capacity-relief.test.ts` and `capacity-in-flight.test.ts`, now in the
->   tables above. `WALCAP-1` merged as `da559ca` on 2026-10-03. Its record is
->   `docs/handoffs/WALCAP-1.md`. Both tests are unit tests, so the root
->   `test` gate runs them.
+> - **`WALCAP-1` added three files to `packages/storage-wal/src/`.** They
+>   are `capacity-ledger.ts`, `capacity-relief.test.ts` and
+>   `capacity-in-flight.test.ts`, now in the tables above. `WALCAP-1` merged
+>   as `da559ca` on 2026-10-03. Its record is `docs/handoffs/WALCAP-1.md`.
+>   Both tests are unit tests, so the root `test` gate runs them.
 > - **CI runs the fault tree.** The paragraph above predates the wiring.
 >   Root `test:fault` runs the fault tree, and CI runs that script in the
 >   step "WAL fault-injection tests" (`.github/workflows/ci.yml`). The
 >   orchestrator wired both in `cdfc878` on 2026-08-26, the commit that
->   recorded `WP-050`'s completion. The record is `WP-050`'s completion
->   record in `docs/status-archive/completion-records-wave-0.md`. The root
->   `test` gate still does not run the fault tree.
+>   recorded `WP-050`'s completion. That entry is archived in
+>   `docs/status-archive/completion-records-wave-0.md`, under "WP-050
+>   completion record". The root `test` gate still does not run the fault
+>   tree.
