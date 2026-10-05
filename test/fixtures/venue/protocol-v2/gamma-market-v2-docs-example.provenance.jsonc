@@ -1,0 +1,24 @@
+{
+  "fixture": "protocol-v2/gamma-market-v2-docs-example.jsonc",
+  "kind": "documentation-example",
+  "source_id": "S-D16",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://docs.polymarket.com/market-data/market-details.md",
+  "fetched_utc": "2026-10-05T23:06:28Z",
+  "http_status": "200",
+  "raw_bytes": 30471,
+  "raw_sha256": "00be2ab64b017c31524715c4ae43c08571e5bfa444e77ee885d0adc388aafd99",
+  "extract": {
+    "lines": [
+      168,
+      177
+    ],
+    "rule": "the JSON object at these lines of the page, parsed and re-serialized with 2-space indentation; no value changed"
+  },
+  "redactions": [],
+  "authenticated": false,
+  "notes": "The official V2 Gamma market example (market-data/market-details, API tab). NOT a live capture: Gamma returned no V2 market on 2026-10-05 (report §O.1; U-35, U-36). clobTokenIds is null; positionIds is an array of decimal strings.",
+  "fixture_bytes": 315,
+  "fixture_sha256": "725249ca063514923d9f64cce168b844de50d5073bb11277ffb817a7797ea6fe"
+}

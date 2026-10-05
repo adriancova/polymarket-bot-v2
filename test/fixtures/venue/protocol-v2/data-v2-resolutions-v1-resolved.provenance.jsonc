@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/data-v2-resolutions-v1-resolved.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-A10",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/resolutions?condition=0x156b8d520e362e159d70d7428f08371ecc9dc91d3437a903d97ae97908f73bec",
+  "fetched_utc": "2026-10-05T23:11:12Z",
+  "http_status": "200",
+  "raw_bytes": 452,
+  "raw_sha256": "9de68cd8ac82034bd7d67afd9b1f33a063182fb806c7afe791f9a3fdd0915e1d",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "A resolved V1 btc-15m-updown window: status resolved, a transaction hash and log index, no reporter or market_type key.",
+  "fixture_bytes": 452,
+  "fixture_sha256": "9de68cd8ac82034bd7d67afd9b1f33a063182fb806c7afe791f9a3fdd0915e1d"
+}

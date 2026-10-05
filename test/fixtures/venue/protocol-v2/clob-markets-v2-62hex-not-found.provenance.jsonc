@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/clob-markets-v2-62hex-not-found.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-L02",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://clob.polymarket.com/clob-markets/0x017791f201d5a788e0039e511fc1900e5f0000000000000000000000000000",
+  "fetched_utc": "2026-10-05T23:09:00Z",
+  "http_status": "404",
+  "raw_bytes": 29,
+  "raw_sha256": "15b39f9a317495428d04b3871d903b1e05fdf85bb80b89c50f731f631d95e16c",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "The same V2 condition in its 31-byte (62-hex) form: HTTP 404 {\"error\":\"market not found\"} (C-19).",
+  "fixture_bytes": 29,
+  "fixture_sha256": "15b39f9a317495428d04b3871d903b1e05fdf85bb80b89c50f731f631d95e16c"
+}

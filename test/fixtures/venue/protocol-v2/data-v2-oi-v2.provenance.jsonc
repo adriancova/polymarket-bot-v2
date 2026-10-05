@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/data-v2-oi-v2.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-A06",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/oi?condition=0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000",
+  "fetched_utc": "2026-10-05T23:10:40Z",
+  "http_status": "200",
+  "raw_bytes": 108,
+  "raw_sha256": "8b6f9091bddf33d188334d901b3e2b9a1030528140625ccb9c30237f03c679a4",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "/v2/oi for the V2 canary market: a non-paginated {data:[...]} envelope.",
+  "fixture_bytes": 108,
+  "fixture_sha256": "8b6f9091bddf33d188334d901b3e2b9a1030528140625ccb9c30237f03c679a4"
+}

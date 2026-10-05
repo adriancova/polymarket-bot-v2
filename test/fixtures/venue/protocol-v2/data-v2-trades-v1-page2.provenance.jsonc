@@ -1,0 +1,24 @@
+{
+  "fixture": "protocol-v2/data-v2-trades-v1-page2.jsonc",
+  "kind": "live-capture-redacted",
+  "source_id": "S-A09",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/trades?condition=0xcd5f9f505e0c0182746aa65963f72f01e7463259e5ea9f56672c0fe3a37f348a&cursor=eyJkYXRhIjp7InR5cGUiOiJ0cmFkZXMiLCJwYXJhbXMiOnsibCI6MiwidHMiOjE3OTEyNDE4MzIsInNxIjoiOTUwMjQ0NTQwMDA0MTA0NDkwIiwiZCI6Mn19LCJzaWciOiIxYjQ5MjIxZDZkNDQyZDVjNDQ0MjM0NGVjYWUwMTBjMCJ9",
+  "fetched_utc": "2026-10-05T23:10:57Z",
+  "http_status": "200",
+  "raw_bytes": 1736,
+  "raw_sha256": "7969f2e91a266b542964d34c4de233db2ddf284d5a029ee5f2c6b649f2943183",
+  "redactions": [
+    "proxy_wallet: replaced with a synthetic, labelled address 0x00…<page><row> (all leading zeros)",
+    "name, pseudonym: replaced with synthetic-name-p<page>-r<row> and synthetic-pseudonym-p<page>-r<row>",
+    "bio, profile_image, profile_image_optimized: replaced with empty strings",
+    "transaction_hash: replaced with a synthetic 0x00…<page><row> hash (the real hash identifies the trading wallet on chain)",
+    "size: replaced with a synthetic 10 × <row> (with the kept timestamp and price, the real size could locate the trade, and so the wallet, on chain)",
+    "every other byte (market fields, prices, timestamps, pagination and its cursor) is unchanged; the replacement is textual, so key order and number formatting are the venue's"
+  ],
+  "authenticated": false,
+  "notes": "The page fetched with page 1's next_cursor and the same condition filter. Personal data replaced (see redactions).",
+  "fixture_bytes": 1777,
+  "fixture_sha256": "36eddba217eea7d6437e6ee0eecfbeec001aab5460d5594ba8001cc993896a75"
+}

@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/clob-markets-v1.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-L10",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://clob.polymarket.com/clob-markets/0xcd5f9f505e0c0182746aa65963f72f01e7463259e5ea9f56672c0fe3a37f348a",
+  "fetched_utc": "2026-10-05T23:10:09Z",
+  "http_status": "200",
+  "raw_bytes": 441,
+  "raw_sha256": "69c01d4f87b14b9e3aed6845c7067546fb38367a4aa57478a3f1887583d258e8",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "The btc-15m-updown window's CLOB market info: v \"v1\".",
+  "fixture_bytes": 441,
+  "fixture_sha256": "69c01d4f87b14b9e3aed6845c7067546fb38367a4aa57478a3f1887583d258e8"
+}

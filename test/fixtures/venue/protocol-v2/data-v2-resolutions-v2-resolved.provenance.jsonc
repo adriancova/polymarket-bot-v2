@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/data-v2-resolutions-v2-resolved.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-A11",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/resolutions?condition=0x015ecdbafe90dfcb60b2f38afe44f4be85000000000000000000000000000000",
+  "fetched_utc": "2026-10-05T23:18:00Z",
+  "http_status": "200",
+  "raw_bytes": 452,
+  "raw_sha256": "f6a404b7c78f4ef641046612980a42eb1c9e546ebb9ff79d1acd2a403d869db8",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "A resolved V2 canary market: status resolved, reporter CHAINLINK, market_type BINARY, payouts [1000000,0], transaction_hash empty.",
+  "fixture_bytes": 452,
+  "fixture_sha256": "f6a404b7c78f4ef641046612980a42eb1c9e546ebb9ff79d1acd2a403d869db8"
+}
