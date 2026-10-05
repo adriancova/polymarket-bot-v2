@@ -1118,6 +1118,9 @@ export class SeriesAdmissionFeedDriver {
       noTokenId: window.noTokenId,
       tickSize: window.tickSize,
       minimumOrderSize: series.parameters.minimumOrderSize,
+      // The judge admitted the window only if its own `Market.negRisk` (and its
+      // event's flag) is exactly this reviewed value (`ROLLOVER-1` r5,
+      // R5-ASTRA-01), so the reviewed value IS the venue's statement.
       negRisk: series.parameters.negRisk,
       tradingDelaySeconds: series.parameters.catalogTradingDelaySeconds,
       openTime: window.scheduledOpenAt,

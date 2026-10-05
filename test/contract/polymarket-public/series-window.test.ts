@@ -17,6 +17,10 @@
  *    `order`, `ascending`, `limit`, `end_date_min`, `after_cursor`; never
  *    `series_slug`, never `offset`), journal-friendly: the raw layer RETURNS a
  *    non-2xx, and only a transport failure throws.
+ * 5. **`ROLLOVER-1` r5 (R5-ASTRA-01)** — the door reads each market's OWN
+ *    `negRisk` (S-D23 lines 305, 313-315: "a market-level property"), false
+ *    on every recorded window, and reports it as stated (true, `null`,
+ *    absent, unreadable), never defaulted and never taken from the event.
  */
 
 import {
@@ -98,6 +102,36 @@ describe("readGammaSeriesEventsBody — the recorded keyset page (S-G03)", () =>
     const keys = JSON.stringify(first);
     for (const undocumented of ["startDate", "feeType", "eventMetadata", "cryptoMarketConfig", "priceToBeat"]) {
       expect(keys).not.toContain(undocumented);
+    }
+  });
+});
+
+describe("ROLLOVER-1 r5 (R5-ASTRA-01): the door reads the MARKET's own negRisk (S-D23 lines 305, 313-315)", () => {
+  it("reads each recorded window's own Market.negRisk (false on all twelve), beside its event's flag", () => {
+    const verdict = readGammaSeriesEventsBody(keysetBody);
+    if (verdict.status !== "ok") throw new Error("unreadable fixture");
+    expect(verdict.events.map((event) => event.market?.negRisk)).toEqual(Array.from({ length: 12 }, () => false));
+    expect(verdict.events.map((event) => event.eventNegRisk)).toEqual(Array.from({ length: 12 }, () => false));
+  });
+
+  it("reads Market.negRisk as stated — true, null, absent, a string — never defaulted and never taken from the event", () => {
+    const first = (keysetExample.payload as { events: Record<string, unknown>[] }).events[0];
+    if (first === undefined) throw new Error("the series-window fixture lost its first event");
+    const cases: readonly (readonly [string, boolean, (market: Record<string, unknown>) => void, unknown])[] = [
+      ["true under an event of false", false, (market) => (market["negRisk"] = true), true],
+      ["null", false, (market) => (market["negRisk"] = null), null],
+      ["absent under an event of true", true, (market) => delete market["negRisk"], "ABSENT"],
+      ["a string", false, (market) => (market["negRisk"] = "false"), "UNREADABLE"],
+    ];
+    for (const [label, eventFlag, mutate, expected] of cases) {
+      const event = structuredClone(first);
+      event["negRisk"] = eventFlag;
+      mutate((event["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>);
+      const verdict = readGammaSeriesEventsBody(JSON.stringify({ events: [event], next_cursor: "" }));
+      expect(verdict.status, label).toBe("ok");
+      if (verdict.status !== "ok") continue;
+      expect(verdict.events[0]?.market?.negRisk, label).toBe(expected);
+      expect(verdict.events[0]?.eventNegRisk, label).toBe(eventFlag);
     }
   });
 });

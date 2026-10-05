@@ -10,19 +10,33 @@
  * `series-admission.ts` header; this door reads exactly those and no other:
  *
  * - from each `Event` (Gamma OpenAPI S-O01; S-D70/S-D72): `id`, `title`,
- *   `seriesSlug`, `series[].id`, `negRisk`, and `markets`;
+ *   `seriesSlug`, `series[].id`, `negRisk` (S-O01 `Event.negRisk`: a
+ *   cross-check only, see below), and `markets`;
  * - from its market: `id`, `question`, `conditionId`, `description`,
  *   `resolutionSource`, `outcomes`, `clobTokenIds`, `eventStartTime`,
  *   `endDate`, `orderPriceMinTickSize`, `orderMinSize`, `secondsDelay`,
  *   `feesEnabled`, `feeSchedule.{rate, exponent, takerOnly, rebateRate}`,
- *   `makerBaseFee`, `takerBaseFee`;
+ *   `makerBaseFee`, `takerBaseFee`, and `negRisk`;
+ * - **`negRisk` is read from the MARKET** (`ROLLOVER-1` r5, R5-ASTRA-01):
+ *   the official market-details page S-D23 (sha256 `930dd605…`) lists
+ *   `negRisk` among the fields read "from the Gamma response" for a market,
+ *   "Market belongs to a negative-risk group" (line 305), and says
+ *   "Negative-risk membership is a market-level property, but augmented
+ *   negative risk is configured on the event" (lines 313-315). The S-O01
+ *   OpenAPI `Market` schema omits the field, and the CLOB `ClobMarketDetails`
+ *   (S-D65) documents none; the recorded keyset body carries
+ *   `markets[].negRisk` on every event (S-G03). Before r5 only the event's
+ *   flag was read, so a market whose own flag differed was never seen;
  * - from `KeysetEventsResponse`: `events`, `next_cursor` (S-D72 lines 295-300);
  * - from `ClobMarketDetails` (S-D65): `t[].{t, o}`, `mos`, `mts`, `mbf`,
  *   `tbf`, `itode`, `fd.{r, e, to}`.
  *
  * Every other key — `startDate` (not the open, F-15), `feeType`,
- * `cryptoMarketConfig`, `eventMetadata` (U-32), the CLOB `c`, `ao`, `aot`, `v`
- * — is left in the journaled raw body and read by nothing.
+ * `cryptoMarketConfig`, `eventMetadata` (U-32), the event's `enableNegRisk`
+ * and `negRiskAugmented` and the market's `negRiskOther` (augmented negative
+ * risk, which S-D23 places on the event, is not a reviewed parameter), the
+ * CLOB `c`, `ao`, `aot`, `v` — is left in the journaled raw body and read by
+ * nothing.
  *
  * ## A reading is not a verdict
  *
@@ -84,6 +98,12 @@ export interface SeriesWindowMarketReading {
   } | null;
   readonly makerBaseFee: SeriesWindowDecimalReading;
   readonly takerBaseFee: SeriesWindowDecimalReading;
+  /**
+   * `Market.negRisk`: the market's own negative-risk membership (S-D23 lines
+   * 305, 313-315), as stated — absent, `null` and a non-boolean are REPORTED,
+   * never defaulted, and never filled from the event's flag.
+   */
+  readonly negRisk: SeriesWindowBooleanReading;
 }
 
 export interface SeriesWindowEventReading {
@@ -207,6 +227,7 @@ function readMarket(market: OwnWireRecord): SeriesWindowMarketReading {
           },
     makerBaseFee: decimalOf(market, "makerBaseFee"),
     takerBaseFee: decimalOf(market, "takerBaseFee"),
+    negRisk: booleanOf(market, "negRisk"),
   };
 }
 

@@ -125,6 +125,8 @@ export function recordedWindowMarketReading(
     },
     makerBaseFee: { kind: "VALUE", value: "1000" },
     takerBaseFee: { kind: "VALUE", value: "1000" },
+    // S-G03 `markets[0].negRisk` (false on every recorded window; verified-2026-10-04.md, the parameter table).
+    negRisk: false,
     ...overrides,
   };
 }

@@ -41,7 +41,7 @@
  * | outcomes and pairing | `Market.outcomes` ↔ `Market.clobTokenIds` BY INDEX, index 0 the YES outcome; cross-checked against CLOB `t[].{t,o}` | F-01 (S-D23 lines 159, 173), F-03 (S-D65 lines 97-101, 157-169) |
  * | tick size | Gamma `orderPriceMinTickSize`, CLOB `mts` | S-O01; S-D65 `mts`; F-21 (per-window data) |
  * | minimum size | Gamma `orderMinSize`, CLOB `mos` | S-O01; S-D65 `mos` |
- * | negRisk | Gamma `Event.negRisk` | S-O01 `Event.negRisk` (the `Market` schema documents none) |
+ * | negRisk | Gamma `Market.negRisk` (the authority); Gamma `Event.negRisk` (a cross-check: it must agree) | S-D23 line 305 ("`negRisk` … Market belongs to a negative-risk group", read "from the Gamma response") and lines 313-315 ("Negative-risk membership is a market-level property, but augmented negative risk is configured on the event"); S-O01 `Event.negRisk`. The S-O01 `Market` schema omits the field and the CLOB (S-D65) documents none; `ROLLOVER-1` r5, R5-ASTRA-01 |
  * | fees | Gamma `feesEnabled`, `feeSchedule.{rate, exponent, takerOnly, rebateRate}`, `makerBaseFee`, `takerBaseFee`; CLOB `fd.{r, e, to}`, `mbf`, `tbf` | S-O01; S-D65 |
  * | trading delay | CLOB `itode` ("omitted when false"); Gamma `secondsDelay` | F-18, F-19 (S-D65 lines 125-130; S-D23 line 877) |
  *
@@ -142,7 +142,12 @@ export const ReviewedSeriesSchema = z.strictObject({
     allowedTickSizes: z.array(PositiveDecimalStringSchema).min(1).max(8),
     /** Gamma `orderMinSize` and CLOB `mos` (observed 5). */
     minimumOrderSize: PositiveDecimalStringSchema,
-    /** Gamma `Event.negRisk`. */
+    /**
+     * The market's negative-risk membership: Gamma `Market.negRisk`, a
+     * market-level property (S-D23 lines 305, 313-315). Gamma `Event.negRisk`
+     * (S-O01) must state the same value. Augmented negative risk, which S-D23
+     * places on the event, is not reviewed here.
+     */
     negRisk: z.boolean(),
     fees: z.strictObject({
       /** Gamma `feesEnabled`. */
@@ -384,6 +389,7 @@ export interface GammaWindowEventReading {
   readonly eventSeriesSlug: VenueStringReading;
   /** `Event.series[].id`, each a string or `null` when unreadable. */
   readonly eventSeriesIds: readonly VenueStringReading[];
+  /** `Event.negRisk` (S-O01): a cross-check of the market's own flag, which is the authority. */
   readonly eventNegRisk: VenueBooleanReading;
   /** How many `markets` the event carries. */
   readonly marketCount: number;
@@ -416,6 +422,11 @@ export interface GammaWindowMarketReading {
   } | null;
   readonly makerBaseFee: VenueDecimalReading;
   readonly takerBaseFee: VenueDecimalReading;
+  /**
+   * `Market.negRisk`, the market's own negative-risk membership (S-D23 lines
+   * 305, 313-315): absent, `null` or unreadable as stated, never defaulted.
+   */
+  readonly negRisk: VenueBooleanReading;
 }
 
 /**
@@ -648,7 +659,21 @@ export function judgeSeriesWindow(
     if (!secondsMatch) {
       mismatches.push(`parameter: Gamma secondsDelay is ${readingText(seconds)}, not the reviewed ${delay === "NOT_STATED" ? "not-stated (absent or null)" : delay}`);
     }
+    // Negative-risk membership is a MARKET-level property (S-D23 lines 305,
+    // 313-315): the market's own flag must be exactly the reviewed boolean.
+    // Absent, `null` or unreadable is refused (Decision 1.5); neither the
+    // event's flag nor the reviewed value ever stands in for it (`ROLLOVER-1`
+    // r5, R5-ASTRA-01).
+    if (market.negRisk !== parameters.negRisk) {
+      mismatches.push(
+        `parameter: Gamma Market.negRisk is ${booleanText(market.negRisk)}, not the reviewed ${String(parameters.negRisk)} ` +
+          "(negative-risk membership is a market-level property, S-D23)",
+      );
+    }
   }
+  // The event's flag (S-O01 `Event.negRisk`) is a cross-check: it, too, must be
+  // exactly the reviewed boolean. As both flags are held to the same value, an
+  // event that contradicts its market is always refused.
   if (event.eventNegRisk !== parameters.negRisk) {
     mismatches.push(`parameter: Gamma Event.negRisk is ${booleanText(event.eventNegRisk)}, not the reviewed ${String(parameters.negRisk)}`);
   }

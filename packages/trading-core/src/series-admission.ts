@@ -395,6 +395,11 @@ export class SeriesWindowAdmissions {
         catalog: {
           yesLabel: review.outcomes[0] ?? "YES",
           noLabel: review.outcomes[1] ?? "NO",
+          // The gateway admitted this window only if its own `Market.negRisk`
+          // (and its event's flag) is exactly the reviewed value of the review
+          // whose hash the admission carries (`ROLLOVER-1` r5, R5-ASTRA-01;
+          // `@polymarket-bot/universe` `judgeSeriesWindow`). A window that
+          // differs is never published, so it never reaches this row.
           negRisk: review.parameters.negRisk,
           tradingDelaySeconds: review.parameters.catalogTradingDelaySeconds,
         },

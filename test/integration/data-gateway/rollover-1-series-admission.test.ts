@@ -57,6 +57,13 @@
  *    it again; once written, the next epoch re-publishes it and the window is
  *    retired `RESOLVED`. r3 wrote it once and kept it nowhere, while the PAGE
  *    said it was in the ledger.
+ * 12. **`ROLLOVER-1` r5 (R5-ASTRA-01)** — negative-risk membership is judged
+ *    on the MARKET (S-D23 lines 305, 313-315): a window whose own
+ *    `markets[0].negRisk` is true under an event flag of false, `null`,
+ *    absent or not a boolean, or whose event's flag contradicts it, is
+ *    REFUSED with an incident naming the flag; its tokens are never
+ *    subscribed, and the next window is admitted. r4 judged only the event's
+ *    flag, and admitted each of the market cases.
  */
 
 import { readFileSync } from "node:fs";
@@ -1152,4 +1159,65 @@ describe("ROLLOVER-1 r4 (R4-FABLE-01): a resolution whose ledger write fails is 
     expect((ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"] as Record<string, unknown> | undefined)?.["payload"]).toMatchObject({ internalMarketId: WINDOW_2215.id });
     await harness.gateway.stop();
   });
+});
+
+describe("ROLLOVER-1 r5 (R5-ASTRA-01): a window whose MARKET-level negRisk is not the reviewed value is refused, whatever its event says", () => {
+  /** The recorded page with the 22:15 window's event flag set and its market's flag changed. */
+  function pageWithNegRisk(eventFlag: boolean, mutateMarket: (market: Record<string, unknown>) => void): () => unknown {
+    return () => {
+      const page = structuredClone(KEYSET_PAGE);
+      const event = page.events[0] as Record<string, unknown>;
+      event["negRisk"] = eventFlag;
+      mutateMarket((event["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>);
+      return page;
+    };
+  }
+
+  it("control: the market's flag and its event's both false, as reviewed — ADMITTED and subscribed", async () => {
+    const harness = await started(venueStub({ page: pageWithNegRisk(false, (market) => (market["negRisk"] = false)) }));
+    expect(admissionTypes(harness).filter((entry) => entry.endsWith(String(WINDOW_2215.id)))).toEqual([
+      `MarketDiscovered:${String(WINDOW_2215.id)}`,
+      `TradingParametersChanged:${String(WINDOW_2215.id)}`,
+      `SeriesWindowAdmitted:${String(WINDOW_2215.id)}`,
+    ]);
+    expect(ledger(harness.walFileSystem)[WINDOW_2215.conditionId]?.["status"]).toBe("ADMITTED");
+    expect(subscribedTokens(harness)).toContain(WINDOW_2215.yes);
+    expect(harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([]);
+    await harness.gateway.stop();
+  });
+
+  for (const [name, eventFlag, mutateMarket, mismatch] of [
+    ["the market's own flag true under an event flag of false", false, (market: Record<string, unknown>) => {
+      market["negRisk"] = true;
+    }, /Gamma Market\.negRisk is true, not the reviewed false/u],
+    ["the market's flag null", false, (market: Record<string, unknown>) => {
+      market["negRisk"] = null;
+    }, /Gamma Market\.negRisk is null, not the reviewed false/u],
+    ["the market's flag absent", false, (market: Record<string, unknown>) => {
+      delete market["negRisk"];
+    }, /Gamma Market\.negRisk is absent, not the reviewed false/u],
+    ["the market's flag malformed (a string)", false, (market: Record<string, unknown>) => {
+      market["negRisk"] = "false";
+    }, /Gamma Market\.negRisk is unreadable, not the reviewed false/u],
+    ["an event flag of true that contradicts its market's false", true, (market: Record<string, unknown>) => {
+      market["negRisk"] = false;
+    }, /Gamma Event\.negRisk is true, not the reviewed false/u],
+  ] as const) {
+    it(`refuses ${name}: no admission event, a REFUSED record and an incident naming it, its tokens never subscribed; the next window is admitted`, async () => {
+      const harness = await started(venueStub({ page: pageWithNegRisk(eventFlag, mutateMarket) }));
+      expect(admissionTypes(harness).filter((entry) => entry.endsWith(String(WINDOW_2215.id)))).toEqual([]);
+      const record = ledger(harness.walFileSystem)[WINDOW_2215.conditionId];
+      expect(record?.["status"]).toBe("REFUSED");
+      expect(JSON.stringify(record?.["mismatches"])).toMatch(mismatch);
+      const refused = harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_SERIES_WINDOW_REFUSED");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.detail).toMatch(mismatch);
+      expect(subscribedTokens(harness)).not.toContain(WINDOW_2215.yes);
+      expect(subscribedTokens(harness)).not.toContain(WINDOW_2215.no);
+      // Only the mutated window is refused: the 22:30 window, unchanged, is admitted.
+      expect(admissionTypes(harness)).toContain(`SeriesWindowAdmitted:${String(WINDOW_2230.id)}`);
+      expect(subscribedTokens(harness)).toContain(WINDOW_2230.yes);
+      await harness.gateway.stop();
+    });
+  }
 });
