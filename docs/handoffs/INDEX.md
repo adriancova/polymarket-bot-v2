@@ -147,3 +147,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [GOV-NOTES-3.md](GOV-NOTES-3.md) | `GOV-NOTES-3`: ROLLOVER-1's owed governance records | Round | Complete (2026-10-05) | `c10e76e` | 3 KB |
 | 2026-10-05 | [FLAKE-KS-1.md](FLAKE-KS-1.md) | `FLAKE-KS-1`: fix the kill-switch engage flake in CI step 7/7 | Round | Complete (2026-10-05) | `f66201e` | 2 KB |
 | 2026-10-05 | [AUDIT-SWEEP.md](AUDIT-SWEEP.md) | `AUDIT-SWEEP`: remove the latent audit-bound race from control-api tests | Round | Complete (2026-10-05) | `6044450` | 2 KB |
+| 2026-10-05 | [WP-330.md](WP-330.md) | `WP-330`: the independent emergency operations CLI | WP | Complete (2026-10-05) | `c1e6909` | 5 KB |
