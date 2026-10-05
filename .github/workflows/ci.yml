@@ -57,9 +57,9 @@ jobs:
       # bundle build it inside their own tests).
       #
       # CI-2 (CI1-L5): GATE1-R4 holds per STEP, so a script that is an `&&`
-      # chain in the root package.json (`typecheck`, `test:contract`,
-      # `test:integration`) runs here as one step per chained command, in the
-      # chain's order. Otherwise the chain's first failure would hide the rest
+      # chain in the root package.json (`typecheck`, `test:fault`,
+      # `test:contract`, `test:integration`; CI-5 made `test:fault` one) runs
+      # here as one step per chained command, in the chain's order. Otherwise the chain's first failure would hide the rest
       # of it. Each step runs its command exactly as the chain spells it. The
       # one exception is a bare binary: `tsc` in a package script resolves
       # through the `node_modules/.bin` that `pnpm run` puts on PATH, and a
@@ -119,9 +119,25 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:replay
 
-      - name: WAL fault-injection tests
+      # CI-5: the `test:fault` suites, one step each (see the note above the
+      # typecheck steps). CI-5 chained the OMS suite (WP-270) and the account
+      # reconciliation suite (WP-290) after the WAL suite (WP-050), so one step
+      # would let a red OMS suite hide the reconciliation suite. None of the
+      # three starts a container. The WAL tree is typechecked by Typecheck 1/4
+      # (the storage-wal package's own `typecheck`); the OMS and reconciliation
+      # scripts typecheck their own trees (`tsc --noEmit -p …`) before running
+      # them, since no typecheck step covers those two trees.
+      - name: Fault-injection tests 1/3 - storage-wal WAL (no container)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: pnpm test:fault
+        run: pnpm --filter @polymarket-bot/storage-wal test:fault
+
+      - name: Fault-injection tests 2/3 - OMS crash points and restart (WP-270; no container)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/oms test:fault
+
+      - name: Fault-injection tests 3/3 - ledger account reconciliation (WP-290; no container)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/ledger test:fault:reconciliation
 
       # CI-2 (CI1-L5): the `test:contract` suites, one step each (see the note
       # above the typecheck steps). All read offline fixtures. CI-3 added 5/5
@@ -162,8 +178,8 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm audit --audit-level high
 
-      # CI-2 (CI1-L5): the six `test:integration` suites, one step each (see
-      # the note above the typecheck steps).
+      # CI-2 (CI1-L5): the `test:integration` suites, one step each (see the
+      # note above the typecheck steps). CI-2 split six; CI-5 added 7/7.
       #
       # N5, recounted by CI-1 from each chained suite's vitest config and test
       # sources, and re-checked by CI-2: THREE of the six suites start
@@ -180,29 +196,42 @@ jobs:
       # files, 36 of the 62 files start no container. GATE-1 (GOV-2B N5) wrote
       # "two of them", true at its base; TRDR-2, BOOT-1, TRDR-3 and UNIV-4 then
       # added the four paper-trader files.
-      - name: Integration tests 1/6 - storage-postgres (Testcontainers PostgreSQL)
+      #
+      # CI-5 (the CONTROL-1b and CONTROL-2 follow-up) added 7/7: the control
+      # API's real-PostgreSQL suite, `test/integration/control-api/postgres`,
+      # which has its own config and which 6/7's config excludes. It has no
+      # `globalSetup`; 3 of its 4 files start a Testcontainers PostgreSQL in
+      # `beforeAll`, through the same `startPostgresContainer` helper and
+      # `postgres:16.6-alpine` image as 1/7. CI-5 renumbered the steps
+      # above but did not recount the suites: the counts and labels above
+      # are CI-1's and CI-2's, at their base.
+      - name: Integration tests 1/7 - storage-postgres (Testcontainers PostgreSQL)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/storage-postgres test:integration
 
-      - name: Integration tests 2/6 - event-bus (Testcontainers Redis)
+      - name: Integration tests 2/7 - event-bus (Testcontainers Redis)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/event-bus test:integration
 
-      - name: Integration tests 3/6 - research-worker parquet (no container)
+      - name: Integration tests 3/7 - research-worker parquet (no container)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/research-worker test:integration
 
-      - name: Integration tests 4/6 - data-gateway (no container)
+      - name: Integration tests 4/7 - data-gateway (no container)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/data-gateway test:integration
 
-      - name: Integration tests 5/6 - trader paper-trader (Testcontainers PostgreSQL and Redis in 4 of its 14 files)
+      - name: Integration tests 5/7 - trader paper-trader (Testcontainers PostgreSQL and Redis in 4 of its 14 files)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/trader test:integration
 
-      - name: Integration tests 6/6 - control-api (no container)
+      - name: Integration tests 6/7 - control-api (no container)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/control-api test:integration
+
+      - name: Integration tests 7/7 - control-api PostgreSQL (Testcontainers PostgreSQL in 3 of its 4 files)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/control-api test:integration:postgres
 
   compose:
     name: Local infrastructure compose health

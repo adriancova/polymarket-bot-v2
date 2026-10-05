@@ -1,8 +1,8 @@
 /**
  * CI-2 (`CI1-L5`) — `.github/workflows/ci.yml` runs every command of the root
  * `package.json`'s `&&` chains (`typecheck`, `test:contract`,
- * `test:integration`) as its own gated step, and this pin fails when the two
- * drift apart.
+ * `test:integration`, and since `CI-5` `test:fault`) as its own gated step,
+ * and this pin fails when the two drift apart.
  *
  * WHY. `GATE1-R4` (closed by `CI-1`) made every gate run even after an earlier
  * one failed. That holds per STEP. A chain inside one step still stops at its
@@ -24,9 +24,11 @@
  *   `if: ${{ !cancelled() && steps.sync.outcome == 'success' }}` (`CI-2` r1);
  * - a gate that runs an `&&` chain as ONE step outside the split steps: a
  *   root script one of its commands runs (directly or through other root
- *   scripts) is a chain other than the three split ones, or its own `run`
- *   holds `&&` (`CI-2` r1, L5-1). Without this, the `CI1-L5` hazard could
- *   return through any other script, such as `test:fault`. The root script is
+ *   scripts) is a chain other than the split ones (`SPLIT_CHAINS`), or its own
+ *   `run` holds `&&` (`CI-2` r1, L5-1). Without this, the `CI1-L5` hazard could
+ *   return through any other script, such as `test:replay`. (It did return
+ *   through `test:fault` when `CI-5` chained the fault suites, and this rule
+ *   made `CI-5` split it.) The root script is
  *   followed through `pnpm <script>` and `pnpm run <script>`, and since
  *   `DEPCHECK-1` (`CI2-L5-3`) also through the other spellings that run the
  *   ROOT script — `pnpm -C .`, `pnpm --dir .`, `pnpm --filter polymarket-bot`,
@@ -177,6 +179,19 @@ function scriptsOf(packageJson: string): Readonly<Record<string, string>> {
 }
 
 /**
+ * The L5-1 and DEPCHECK-1 cases below need a root script that is not a split
+ * chain and that a gate runs as one step. They used `test:fault` until `CI-5`
+ * made it a split chain; they now use `test:replay`, whose gate still runs
+ * `pnpm test:replay`.
+ */
+const REPLAY_GATE = "Replay determinism goldens (order-book and simulation)";
+
+/** A two-command `test:replay`: the shape of the review's L5-1 case. */
+const REPLAY_SCRIPT_CHAIN =
+  "vitest run --config test/vitest.config.ts test/unit/order-book/replay-golden.test.ts && " +
+  "vitest run --config test/vitest.config.ts test/unit/simulation/golden-replay.test.ts";
+
+/**
  * The gating `if:` of the python job, spelled out here rather than imported,
  * so the pin states the condition itself (`CI-2` r1, RES-PY).
  */
@@ -258,12 +273,20 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
     expect(splitStepDrift(workflow, packageJson)).toEqual([]);
   });
 
-  it("non-vacuity: 4 + 6 + 6 chained commands, each run by exactly one gated step, in chain order", async () => {
+  // CI-5: `test:integration` gained the control API's PostgreSQL suite (6 -> 7),
+  // and `test:fault` became a chain of three (WAL, OMS, reconciliation) that
+  // replaced one gate with three: 24 + 1 + 2 = 27 gates, 16 + 1 + 3 = 20 split.
+  it("non-vacuity: 4 + 6 + 7 + 3 chained commands, each run by exactly one gated step, in chain order", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const chains = chainCommands(packageJson);
-    expect(SPLIT_CHAINS.map(({ script }) => chains.get(script)?.length)).toEqual([4, 6, 6]);
+    expect(SPLIT_CHAINS.map(({ script }) => [script, chains.get(script)?.length])).toEqual([
+      ["typecheck", 4],
+      ["test:contract", 6],
+      ["test:integration", 7],
+      ["test:fault", 3],
+    ]);
     const gateSteps = gates(workflow);
-    expect(gateSteps).toHaveLength(24);
+    expect(gateSteps).toHaveLength(27);
     for (const step of gateSteps) expect(step.condition, step.label).toBe(GATE_IF);
     for (const { script, label } of SPLIT_CHAINS) {
       const commands = chains.get(script) ?? [];
@@ -277,7 +300,32 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
       });
       expect(indices, script).toEqual([...indices].sort((a, b) => a - b));
     }
-    expect(splitSteps(workflow, packageJson)).toHaveLength(16);
+    expect(splitSteps(workflow, packageJson)).toHaveLength(20);
+  });
+
+  it("CI-5: the fault and control-api PostgreSQL commands are chained, and stepped, in the order the round set", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const chains = chainCommands(packageJson);
+    expect(chains.get("test:fault")).toEqual([
+      "pnpm --filter @polymarket-bot/storage-wal test:fault",
+      "pnpm --filter @polymarket-bot/oms test:fault",
+      "pnpm --filter @polymarket-bot/ledger test:fault:reconciliation",
+    ]);
+    expect(chains.get("test:integration")?.slice(-2)).toEqual([
+      "pnpm --filter @polymarket-bot/control-api test:integration",
+      "pnpm --filter @polymarket-bot/control-api test:integration:postgres",
+    ]);
+    // The old one-step fault gate is gone: nothing runs the root `test:fault` as one step.
+    expect(gates(workflow).map((step) => step.run)).not.toContain("pnpm test:fault");
+    expect(
+      splitSteps(workflow, packageJson)
+        .filter(({ script }) => script === "test:fault")
+        .map(({ name }) => name),
+    ).toEqual([
+      "Fault-injection tests 1/3 - storage-wal WAL (no container)",
+      "Fault-injection tests 2/3 - OMS crash points and restart (WP-270; no container)",
+      "Fault-injection tests 3/3 - ledger account reconciliation (WP-290; no container)",
+    ]);
   });
 
   it("normalizes exactly one thing: a bare binary runs through `pnpm exec`, a pnpm command runs verbatim", () => {
@@ -315,10 +363,14 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     const { workflow, packageJson } = await readRealTexts();
     const last = splitSteps(workflow, packageJson).at(-1)?.name ?? "";
     const extras = [
-      gatedStep("Integration tests 7/7 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:integration"),
+      gatedStep("Integration tests 8/8 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:integration"),
       gatedStep("Another suite", "pnpm --filter @polymarket-bot/ops-cli test:contract"),
       gatedStep("Typecheck", "pnpm typecheck"),
       gatedStep("Integration tests", "pnpm test:integration"),
+      // CI-5: `test:fault` is split now, so its old one-step gate is a look-alike too.
+      gatedStep("WAL fault-injection tests", "pnpm test:fault"),
+      gatedStep("Fault-injection tests 4/4 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:fault"),
+      gatedStep("Another fault suite", "pnpm --filter @polymarket-bot/ops-cli test:fault"),
     ];
     for (const extra of extras) {
       expect(splitStepDrift(insertStepAfter(workflow, last, extra), packageJson), extra[0]).toEqual([
@@ -427,13 +479,16 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     }
   });
 
-  it("a copy of package.json whose chain gains a command — each of the three chains", async () => {
+  it("a copy of package.json whose chain gains a command — each of the four chains", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const gained: readonly (readonly [string, string])[] = [
       ["typecheck", "tsc -p test/extra/tsconfig.json --noEmit"],
       ["test:contract", "pnpm --filter @polymarket-bot/ops-cli test:contract"],
       ["test:integration", "pnpm --filter @polymarket-bot/ops-cli test:integration"],
+      ["test:fault", "pnpm --filter @polymarket-bot/ops-cli test:fault"],
     ];
+    // Non-vacuity: one case per split chain.
+    expect(gained.map(([script]) => script)).toEqual(SPLIT_CHAINS.map(({ script }) => script));
     const chains = chainCommands(packageJson);
     for (const [script, command] of gained) {
       const copy = withScript(packageJson, script, [...(chains.get(script) ?? []), command].join(" && "));
@@ -467,14 +522,14 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     // Non-vacuity: every node gate that runs a root script other than a split
     // chain. `pnpm audit --audit-level high` runs pnpm's built-in `audit`,
     // which the check (like this list) takes for the root script of that name:
-    // it can only over-report (see ci-workflow.ts).
+    // it can only over-report (see ci-workflow.ts). `test:fault` left this list
+    // in `CI-5`, when it became a split chain.
     expect(scriptGates.map(({ script }) => script)).toEqual([
       "lint",
       "check:deps",
       "test",
       "test:e2e",
       "test:replay",
-      "test:fault",
       "test:soak-smoke",
       "audit",
     ]);
@@ -491,11 +546,10 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
 
   it("L5-1: the review's two cases, test:fault and test:e2e each becoming a two-command chain", async () => {
     const { workflow, packageJson } = await readRealTexts();
+    // test:e2e is still a one-step gate, so the L5-1 rule reports it. So is
+    // test:replay, which stands in here for test:fault since CI-5.
     const cases: readonly (readonly [string, string])[] = [
-      [
-        "test:fault",
-        "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
-      ],
+      ["test:replay", REPLAY_SCRIPT_CHAIN],
       ["test:e2e", "vitest run --config test/e2e/vitest.config.ts && vitest run --config test/e2e/other.config.ts"],
     ];
     for (const [script, chain] of cases) {
@@ -503,23 +557,43 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
         expect.stringContaining(`runs the root script \`${script}\` as one step`),
       ]);
     }
+    // The review's own test:fault case. Since CI-5, test:fault is a split
+    // chain, so the split checks report it, not the L5-1 rule: the new second
+    // command has no step, the first is named for the wrong position, and the
+    // two steps whose commands left the chain are look-alikes.
+    const fault = splitStepDrift(
+      workflow,
+      withScript(
+        packageJson,
+        "test:fault",
+        "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
+      ),
+    );
+    expect(fault).toEqual([
+      expect.stringContaining('its name must begin with "Fault-injection tests 1/2 - "'),
+      expect.stringContaining('"pnpm --filter @polymarket-bot/storage-postgres test:fault" has no gate step'),
+      expect.stringContaining('"Fault-injection tests 2/3 - OMS crash points and restart (WP-270; no container)" looks like a split step'),
+      expect.stringContaining(
+        '"Fault-injection tests 3/3 - ledger account reconciliation (WP-290; no container)" looks like a split step',
+      ),
+    ]);
   });
 
   it("L5-1: a chain reached through another root script, or written into the step itself", async () => {
     const { workflow, packageJson } = await readRealTexts();
-    // `test:fault` runs a new root script that is a chain.
+    // `test:replay` (`test:fault` before CI-5 split it) runs a new root script that is a chain.
     const through = withAddedScript(
-      withScript(packageJson, "test:fault", "pnpm run test:fault:all"),
-      "test:fault:all",
-      "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
+      withScript(packageJson, "test:replay", "pnpm run test:replay:all"),
+      "test:replay:all",
+      REPLAY_SCRIPT_CHAIN,
     );
     expect(splitStepDrift(workflow, through)).toEqual([
-      expect.stringContaining("runs the root script `test:fault` -> `test:fault:all` as one step"),
+      expect.stringContaining("runs the root script `test:replay` -> `test:replay:all` as one step"),
     ]);
-    // `test:fault` runs a split chain under its own name, which the look-alike
+    // `test:replay` runs a split chain under its own name, which the look-alike
     // check (by name or command) cannot see from the step.
-    expect(splitStepDrift(workflow, withScript(packageJson, "test:fault", "pnpm typecheck"))).toEqual([
-      expect.stringContaining("runs the root script `test:fault` -> `typecheck` as one step"),
+    expect(splitStepDrift(workflow, withScript(packageJson, "test:replay", "pnpm typecheck"))).toEqual([
+      expect.stringContaining("runs the root script `test:replay` -> `typecheck` as one step"),
     ]);
     // The chain written into a step's own `run`.
     expect(splitStepDrift(setStepKey(workflow, "Lint", "run", "pnpm lint && pnpm check:deps"), packageJson)).toEqual([
@@ -704,7 +778,10 @@ describe("the workflow reader and the chain parser refuse what they cannot read 
  * (`docs/handoffs/CI-2.md`; `IMPLEMENTATION_STATUS.md` rows `CI2-L5-2`,
  * `CI2-L5-3`). Every positive case below returns no finding under the drift
  * check at `45c575a`; every negative case fails under a named mutant of the new
- * code. Both proofs are in `docs/handoffs/DEPCHECK-1.md`.
+ * code. Both proofs are in `docs/handoffs/DEPCHECK-1.md`. They were made with
+ * the cases on `test:fault` and its gate; `CI-5` moved the cases to
+ * `test:replay` and its gate (`REPLAY_GATE`), unchanged otherwise, when it made
+ * `test:fault` a split chain.
  */
 describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the other root-script spellings (CI2-L5-3)", () => {
   /** A gated node step whose `run` is a literal block of `lines`. */
@@ -728,15 +805,9 @@ describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the ot
     });
   }
 
-  const FAULT_GATE = "WAL fault-injection tests";
-
-  /** A copy of package.json whose `test:fault` is a two-command chain (the review's L5-1 case). */
-  function withChainedFault(packageJson: string): string {
-    return withScript(
-      packageJson,
-      "test:fault",
-      "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
-    );
+  /** A copy of package.json whose `test:replay` is a two-command chain (the shape of the review's L5-1 case). */
+  function withChainedReplay(packageJson: string): string {
+    return withScript(packageJson, "test:replay", REPLAY_SCRIPT_CHAIN);
   }
 
   it("CI2-L5-2: a gate running two independent gates in one block, or on one line with `;`, is flagged", async () => {
@@ -761,31 +832,31 @@ describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the ot
 
   it("CI2-L5-2: every command of a block is followed to a chained root script, not only the first line", async () => {
     const { workflow, packageJson } = await readRealTexts();
-    const chained = withChainedFault(packageJson);
+    const chained = withChainedReplay(packageJson);
     // A comment is not a command, so this block is one command, on its second line.
-    const commentFirst = setStepRunBlock(workflow, FAULT_GATE, ["# the WAL suite", "pnpm test:fault"]);
+    const commentFirst = setStepRunBlock(workflow, REPLAY_GATE, ["# the replay goldens", "pnpm test:replay"]);
     expect(splitStepDrift(commentFirst, chained)).toEqual([
-      expect.stringContaining(`"${FAULT_GATE}" runs the root script \`test:fault\` as one step`),
+      expect.stringContaining(`"${REPLAY_GATE}" runs the root script \`test:replay\` as one step`),
     ]);
     // Two commands: the chain on the second line, and the block itself.
-    const echoFirst = setStepRunBlock(workflow, FAULT_GATE, ["echo WAL suite", "pnpm test:fault"]);
+    const echoFirst = setStepRunBlock(workflow, REPLAY_GATE, ["echo replay goldens", "pnpm test:replay"]);
     expect(splitStepDrift(echoFirst, chained)).toEqual([
-      expect.stringContaining(`"${FAULT_GATE}" runs the root script \`test:fault\` as one step`),
-      expect.stringContaining(`"${FAULT_GATE}" runs 2 commands in one step ("echo WAL suite", "pnpm test:fault")`),
+      expect.stringContaining(`"${REPLAY_GATE}" runs the root script \`test:replay\` as one step`),
+      expect.stringContaining(`"${REPLAY_GATE}" runs 2 commands in one step ("echo replay goldens", "pnpm test:replay")`),
     ]);
   });
 
   it("CI2-L5-2: blank lines, comments and a `\\` continuation are not extra commands", async () => {
     const { workflow, packageJson } = await readRealTexts();
-    const mutant = setStepRunBlock(workflow, FAULT_GATE, [
+    const mutant = setStepRunBlock(workflow, REPLAY_GATE, [
       "# one command, continued on the next line",
       "",
-      "pnpm test:fault \\",
+      "pnpm test:replay \\",
       "  --reporter=verbose",
     ]);
     expect(splitStepDrift(mutant, packageJson)).toEqual([]);
-    const gate = nodeJobSteps(mutant).find((step) => step.name === FAULT_GATE);
-    expect(shellCommands(gate?.run ?? "").map((command) => command.text)).toEqual(["pnpm test:fault --reporter=verbose"]);
+    const gate = nodeJobSteps(mutant).find((step) => step.name === REPLAY_GATE);
+    expect(shellCommands(gate?.run ?? "").map((command) => command.text)).toEqual(["pnpm test:replay --reporter=verbose"]);
   });
 
   it("CI2-L5-2: the python audit block is recorded as dependent in its exact text; a changed block and its stale record are reported", async () => {
@@ -815,37 +886,37 @@ describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the ot
 
   it("CI2-L5-3: every spelling that runs the ROOT script is followed", async () => {
     const { workflow, packageJson } = await readRealTexts();
-    const chained = withChainedFault(packageJson);
+    const chained = withChainedReplay(packageJson);
     const spellings = [
       // The review's five.
-      "pnpm -C . test:fault",
-      "pnpm --dir . test:fault",
-      "pnpm --filter polymarket-bot test:fault",
-      'pnpm run "test:fault"',
-      "npm run test:fault",
+      "pnpm -C . test:replay",
+      "pnpm --dir . test:replay",
+      "pnpm --filter polymarket-bot test:replay",
+      'pnpm run "test:replay"',
+      "npm run test:replay",
       // Their neighbours.
-      "pnpm -C ./ run test:fault",
-      "pnpm --dir=. test:fault",
-      "pnpm --filter=polymarket-bot run test:fault",
-      "pnpm -F polymarket-bot test:fault",
-      "pnpm --filter polymarket-bot... test:fault",
-      "pnpm --filter . test:fault",
-      "pnpm --filter {.} test:fault",
-      "pnpm -w test:fault",
-      "pnpm --workspace-root run test:fault",
-      "pnpm -r --include-workspace-root run test:fault",
-      "pnpm run 'test:fault'",
-      'pnpm "test:fault"',
-      "pnpm --silent run test:fault",
-      "CI=true pnpm test:fault",
-      "pnpm exec pnpm test:fault",
-      "npm run-script test:fault",
-      "npm --prefix . run test:fault",
-      "npm run --if-present test:fault",
+      "pnpm -C ./ run test:replay",
+      "pnpm --dir=. test:replay",
+      "pnpm --filter=polymarket-bot run test:replay",
+      "pnpm -F polymarket-bot test:replay",
+      "pnpm --filter polymarket-bot... test:replay",
+      "pnpm --filter . test:replay",
+      "pnpm --filter {.} test:replay",
+      "pnpm -w test:replay",
+      "pnpm --workspace-root run test:replay",
+      "pnpm -r --include-workspace-root run test:replay",
+      "pnpm run 'test:replay'",
+      'pnpm "test:replay"',
+      "pnpm --silent run test:replay",
+      "CI=true pnpm test:replay",
+      "pnpm exec pnpm test:replay",
+      "npm run-script test:replay",
+      "npm --prefix . run test:replay",
+      "npm run --if-present test:replay",
     ];
     for (const run of spellings) {
-      expect(splitStepDrift(setStepKey(workflow, FAULT_GATE, "run", run), chained), run).toEqual([
-        expect.stringContaining(`"${FAULT_GATE}" runs the root script \`test:fault\` as one step`),
+      expect(splitStepDrift(setStepKey(workflow, REPLAY_GATE, "run", run), chained), run).toEqual([
+        expect.stringContaining(`"${REPLAY_GATE}" runs the root script \`test:replay\` as one step`),
       ]);
     }
     // npm's own names for the `test` script.
@@ -863,28 +934,29 @@ describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the ot
 
   it("CI2-L5-3: a spelling that runs a workspace package's script, or that the reader cannot read, is not taken for the root's", async () => {
     const { workflow, packageJson } = await readRealTexts();
-    const chained = withChainedFault(packageJson);
+    const chained = withChainedReplay(packageJson);
     const negatives = [
-      // The real step.
-      "pnpm --filter @polymarket-bot/storage-wal test:fault",
-      "pnpm --filter=@polymarket-bot/storage-wal test:fault",
-      "pnpm -F ./packages/storage-wal test:fault",
-      "pnpm --filter polymarket-bot^... test:fault",
-      "pnpm -C packages/storage-wal test:fault",
-      "pnpm --dir packages/storage-wal run test:fault",
-      "pnpm --dir=packages/storage-wal test:fault",
-      "pnpm -r run test:fault",
-      "npm --workspace packages/storage-wal run test:fault",
-      "npm --workspace=packages/storage-wal run test:fault",
-      "npm -w packages/storage-wal run test:fault",
-      "npm --workspaces run test:fault",
-      "npm --prefix packages/storage-wal run test:fault",
+      // A workspace package's script of the same name (the real fault step's
+      // spelling, until CI-5 split `test:fault`).
+      "pnpm --filter @polymarket-bot/storage-wal test:replay",
+      "pnpm --filter=@polymarket-bot/storage-wal test:replay",
+      "pnpm -F ./packages/storage-wal test:replay",
+      "pnpm --filter polymarket-bot^... test:replay",
+      "pnpm -C packages/storage-wal test:replay",
+      "pnpm --dir packages/storage-wal run test:replay",
+      "pnpm --dir=packages/storage-wal test:replay",
+      "pnpm -r run test:replay",
+      "npm --workspace packages/storage-wal run test:replay",
+      "npm --workspace=packages/storage-wal run test:replay",
+      "npm -w packages/storage-wal run test:replay",
+      "npm --workspaces run test:replay",
+      "npm --prefix packages/storage-wal run test:replay",
       // A word the reader cannot read ends the search: it could be anything.
-      "pnpm $FLAGS test:fault",
+      "pnpm $FLAGS test:replay",
       'pnpm run "$SCRIPT"',
     ];
     for (const run of negatives) {
-      expect(splitStepDrift(setStepKey(workflow, FAULT_GATE, "run", run), chained), run).toEqual([]);
+      expect(splitStepDrift(setStepKey(workflow, REPLAY_GATE, "run", run), chained), run).toEqual([]);
     }
   });
 });
