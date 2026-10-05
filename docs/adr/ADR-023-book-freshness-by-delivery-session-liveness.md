@@ -9,7 +9,8 @@
   - the epoch taint of §5, which stays coarse and fail-closed.
 
   Wherever the text below says a ruling is interim or awaits ratification,
-  read it as confirmed on 2026-10-02.
+  read it as confirmed on 2026-10-02. That confirmation does not cover
+  Amendment 1 (2026-10-05), which the user has not ruled on.
 - **Date:** 2026-09-30
 - **Recorded by:** `THROUGHPUT-1c`, which also implements it.
 - **Amended:** [Amendment 1](#amendment-1-2026-10-05-rollover-1)
@@ -1068,9 +1069,12 @@ epoch, and rule 5 applies it to no book.
 ### Why the convention exists
 
 `ROLLOVER-1` added a series-admission feed to the gateway
-(`apps/data-gateway/src/feeds/series-admission.ts`). Its routine incidents
-report a refused window, or a series held at its cap. None is about the
-delivery of a book, and the cap is reached in the ordinary course of a run.
+(`apps/data-gateway/src/feeds/series-admission.ts`). Most of its incidents
+are about one window or one series, such as a refused window, a series held
+at its cap, a failed CLOB read, a window unresolved past its bound, and an
+operator's retirement, applied, deferred or unmatched. None of these is
+about the delivery of a book, and the cap is reached in the ordinary course
+of a run.
 
 A market-less incident taints its epoch (rule 4). Under
 `CONNECTION_CONFIRMED`, every book of the epoch then falls back to the
@@ -1089,9 +1093,14 @@ incident names a market (`#openWindowIncident`).
    `windowInternalMarketId("series-admission-incident|" + scope, 0)`:
    - a UUIDv7 whose 48-bit timestamp is 0, so its text begins
      `00000000-0000-7`;
-   - its other 74 bits are the first bits of the sha256 of
-     `rollover-1/window-market-id/v1|series-admission-incident|<scope>`;
+   - it copies the first ten SHA-256 digest bytes of
+     `rollover-1/window-market-id/v1|series-admission-incident|<scope>`
+     into UUID bytes 6-15, then overwrites the version nibble with 7 and the
+     variant bits with `10`, so 74 digest bits survive;
    - so it is stable across restarts and replays, and distinct per scope.
+
+   The doc comment on `windowInternalMarketId` says the 74 bits are "the
+   first bits" of the digest. The code is as stated above.
 
    The code's literal fallback, `00000000-0000-7000-8000-000000000000`, is
    unreachable: the derivation always succeeds at timestamp 0.
@@ -1108,13 +1117,16 @@ incident names a market (`#openWindowIncident`).
    feed's do: `GATEWAY_FEED_STALL`, `GATEWAY_WAL_FRAME_REFUSED` and
    `GATEWAY_SERIES_LEDGER_WRITE_FAILED`. Each taints the epoch under rule 4.
 
-### Why it names no market and taints no book
+### Why no market carries the id, so no book is tainted
 
 1. **No market any process runs carries the id.** An admitted window's id
-   carries its scheduled open as its timestamp. A window is admitted only
-   before its close, so its open is never the Unix epoch, and the timestamp
-   is never 0. Any other market's id would also have to match the 74 hashed
-   bits.
+   carries its scheduled open as its timestamp. Admission happens at
+   contemporary time: both sides admit a window only if its close is after
+   the admission's receipt, a reading of the gateway's clock (the trader
+   refuses `WINDOW_CLOSED`). A window lasts its reviewed `durationSeconds`,
+   at most 86,400 s. So its open is at most a day before that receipt,
+   never the Unix epoch, and the timestamp is never 0. Any other market's
+   id would also have to match the 74 hashed bits.
 2. **The trader applies it to no market.** `CoreLoop` finds no market it
    runs in the incident's list.
 3. **Rule 4 does not fire,** because the incident's market list is not

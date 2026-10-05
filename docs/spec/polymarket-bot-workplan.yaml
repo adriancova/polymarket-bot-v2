@@ -1547,10 +1547,10 @@ work_packages:
       - docs/handoffs/ROLLOVER-1.md
       # Granted 2026-10-04 by the user (ruling Q2; recorded 2026-10-05 by
       # GOV-NOTES-3): packages/strategy-runtime/**, only for a run-scoped
-      # evaluation sequence, so the window runtimes of one run never share an
-      # evaluation or checkpoint sequence. The relaunch packet added
-      # test/unit/strategy-runtime/** for its tests. Recorded as this note,
-      # not as entries: the package is complete (merged ae11daa).
+      # evaluation sequence shared by the window runtimes of one run, so no
+      # two of them persist the same (run_id, evaluation_seq) or
+      # (run_id, checkpoint_seq). The relaunch packet added
+      # test/unit/strategy-runtime/** for its tests.
     forbidden_paths:
       # Excepted 2026-10-04 by the user (ruling Q1; recorded 2026-10-05 by
       # GOV-NOTES-3): packages/domain/**, only for the new event contract

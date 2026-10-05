@@ -182,12 +182,28 @@ invariant 9, and every live-mode rule.
   R2-FABLE-03.
 - **Source:** `ROLLOVER-1`, merged `ae11daa` (PR #68) after a joint ACCEPT
   at `61a0ab2`. Its record is `docs/handoffs/ROLLOVER-1.md`.
-- **Standing:** rules 1-8 are the orchestrator's interim rulings for PAPER,
-  made 2026-10-05. Each records a policy `ROLLOVER-1` implemented and its
+- **Standing:** rules 1-8 are the orchestrator's interim rulings for PAPER
+  and BACKTEST, the modes admission runs in (Decision 2.1), made
+  2026-10-05. Each records a policy `ROLLOVER-1` implemented and its
   verifiers accepted. The user may confirm or overrule any of them. None
   reaches a live mode (Decision 2).
 - **User rulings:** none is changed. Ruling A5 (2026-09-30) and rulings
   Q1-Q4 (2026-10-04) stand as ruled.
+- **Decision 1, as merged.** Ruling Q3 and `ROLLOVER-1` r7 shape two
+  reviewed parameters. Neither is a new ruling here.
+  - **Tick size** is per-window data (ruling Q3). The review pins
+    `allowedTickSizes`, 1 to 8 values. The gateway and the trader each
+    require the admission's tick size to belong to that list: the gateway
+    in `judgeSeriesWindow` (`packages/universe/src/series-admission.ts`),
+    the trader in `SeriesWindowAdmissions` (refusal `TICK_SIZE`). The
+    gateway also requires the CLOB's `mts` to equal Gamma's tick. This is
+    how Decision 1.4's "every reviewed parameter exactly" applies to tick
+    size.
+  - **Negative risk.** The gateway's and the trader's review schemas accept
+    only `negRisk: false` (`ROLLOVER-1` r7, R6-FABLE-01). A review stating
+    `true` fails parsing, because augmented negative risk is neither
+    reviewed nor read. The gateway refuses a window whose `Market.negRisk`
+    or `Event.negRisk` is not exactly `false`.
 - **Decision 3, as merged.** The existing contracts could not carry a
   window's scheduled open and close, so `ROLLOVER-1` stopped (Decision 3.3).
   The user granted `SeriesWindowAdmitted@1` (Q1). Its records are
@@ -384,12 +400,20 @@ Teardown still waits until the window is idle.
 3. It binds for a commitment that never closes, such as a fill booked
    UNATTRIBUTED. That commitment holds its window, the market's owner and a
    cap slot for the rest of the run.
+4. **Masked today.** A fill booked UNATTRIBUTED also latches its market's
+   `UNATTRIBUTED_ACTIVITY` halt (`#bookUnownedFill`). While any halt is
+   latched, check 1 refuses every non-CANCEL intent: the trader passes
+   `runStatePermitsIntent` as `!halts.anyHalt`. No running trader releases
+   a halt. So today check 1 already refuses every intent the allocator
+   would refuse, exits included, whether or not the window is held. The
+   hold matters once a halt can be released (`FOLD-RELATCH`).
 
 **Why it fails closed:** teardown would remove the market's live owner while
 the allocator still re-applies the commitment. A LIVE commitment without an
 owner is refused `CAPITAL_LIVE_OWNERSHIP_MISSING`, so every later allocator
-question would be refused for the run, protective exits included. Holding
-the window costs a slot: fewer windows, never more.
+question would be refused for the run, protective exits included (item 4
+says why that is masked today). Holding the window costs a slot: fewer
+windows, never more.
 
 ### Rule 8. Checks 16 and 17 judge a series-bound instance across its live windows
 
@@ -400,8 +424,9 @@ the window costs a slot: fewer windows, never more.
    `#otherLiveRegistrationsOf`):
    - each window's booked positions;
    - each window's own working orders, at their unfilled remainder;
-   - each window's filled but unbooked fills, asked of the allocator under
-     the instance id;
+   - each window's allocator-reported unbooked BUY exposure, asked under the
+     instance id (`#unbookedFillsFor`, `AllocatorGate.unbookedExposure`).
+     Unbooked SELLs are not deducted from booked positions (item 7);
    - a check-17 mark for each window, from its own YES book's best bid
      (`#scenariosFor`).
 2. A held window whose YES book has no bid has no mark. Check 17 then
@@ -412,15 +437,27 @@ the window costs a slot: fewer windows, never more.
 4. A market-bound instance has no other registration, so its input is
    unchanged.
 5. A torn-down window is not live, so it leaves both measures. Its ledger
-   rows stay, and the allocator's §9.7 caps still count them.
+   rows stay, and the allocator's §9.7 caps still count them. **Not ruled
+   here:** whether a resolved, torn-down window's holdings should stay in
+   both measures until redemption (`ROLLOVER-1` r7, known risk 2). In PAPER
+   no redemption is booked, so those shares stay in the ledger at cost.
 6. **Not ruled here.** Check 17 nets marked values across windows. A marked
    gain in one window can offset a loss in another, so check 17 can admit
    an entry its window alone would fail. The other windows' marks have no
    freshness bound. `ROLLOVER-1`'s round-8 review raised this
    (R8-FABLE-01). Check 16's primary measure is committed cost, which
    another window can only raise.
+7. **Not ruled here.** Unbooked SELLs are not deducted from booked
+   positions. A sale the ledger has not booked leaves its shares in the
+   position. When their mark exceeds their cost, check 17 and check 16's
+   resolution limit can admit an entry the booked account would refuse.
+   This is `CAP-1`'s pre-existing residual OBS-1
+   (`docs/handoffs/CAP-1.md`, known_risks), named `CAP1-OPUS-OBS-1` in the
+   doc of `AllocatorGate.unbookedExposure`. A market-bound instance has it
+   too. That record owes a risk ADR before any mode above PAPER.
 
 **Why it fails closed:** an instance can no longer pass the primary limit
 window by window while exceeding it in sum. A held window that cannot be
-marked stops entries; it never lets one pass. Item 6 is the exception for
-check 17.
+marked stops entries; it never lets one pass. Items 6 and 7 are the
+exceptions: item 6 for check 17, and item 7 for check 17 and check 16's
+resolution limit.

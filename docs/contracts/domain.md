@@ -609,6 +609,13 @@ after this table was written:
 | §7's `MAX_IDENTIFIER_LENGTH` bound read together with the "no 31/32-byte narrowing" rule — the bound is deliberate repository-wide boundary hardening, beyond it a typed refusal is correct adapter behavior, and raising it requires an ADR plus a `schemaVersion` statement | [ADR-015](../adr/ADR-015-repository-identifier-bound.md) |
 | §8's four previously-unratified inferences: `TokenId` canonical unsigned integer string; **UUIDs lowercase only** (external-boundary rule refined by the ADR's 2026-09-02 amendment: a non-canonical UUID-shaped arrival is **refused**, not case-folded); incident `severity` = `LOG`/`NOTIFY`/`PAGE`; payload field sets beyond §7.4's names as repository design | [ADR-016](../adr/ADR-016-ratified-inferred-domain-shapes.md) |
 
+The following row was added on 2026-10-05 by `GOV-NOTES-3` (additive only;
+no decision in §1–§9 is changed):
+
+| This document | Ratifying ADR |
+| --- | --- |
+| §12 `SeriesWindowAdmitted@1`, added after the freeze under the user's grant Q1 (2026-10-04; [`protected-contracts.md`](./protected-contracts.md) §5) | [ADR-030](../adr/ADR-030-series-auto-admission-and-multi-window-runs.md) Decision 3.3 and [Amendment 1](../adr/ADR-030-series-auto-admission-and-multi-window-runs.md#amendment-1-2026-10-05-rollover-1) |
+
 Runtime parsers built on these contracts must not inherit the `WP-000`
 fixture-only narrowings; the binding list is
 [ADR-002](../adr/ADR-002-event-envelope-and-ordering-semantics.md) §7.
