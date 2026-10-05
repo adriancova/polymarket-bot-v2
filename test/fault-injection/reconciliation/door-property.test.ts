@@ -379,7 +379,8 @@ function stated(door: Door, output: ReturnType<typeof readDoor>): unknown {
       eventCause: request.eventCause,
       venueTradeId: request.venueTradeId,
       venueOrderIds: [...request.venueOrderIds],
-      unordered: request.unordered,
+      shortfalls: request.shortfalls === null ? null : [...request.shortfalls],
+      statusRecognised: request.statusRecognised,
       unreadable: [...request.unreadable],
     };
   }
@@ -392,6 +393,7 @@ function stated(door: Door, output: ReturnType<typeof readDoor>): unknown {
       }),
       unreadable: stream.unreadable.map((entry) => `${entry.kind}:${entry.field}`),
       ...(stream.event === undefined ? {} : { event: statedEvent(stream.event) }),
+      ...(stream.shortfalls === undefined ? {} : { shortfalls: [...stream.shortfalls] }),
     };
   }
   const { salvage } = output as ReadOutcome<unknown>;

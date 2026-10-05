@@ -138,6 +138,20 @@ async function releaseAll(r: Ready, reason: string): Promise<number> {
   return released;
 }
 
+/**
+ * (r15, restated: WP290-V15-EFA-REQUEST-STATUS-ASSUMED) After a restart, WP-280's `EVENT_NOT_FULLY_APPLICABLE` request
+ * comes from its backlog WITHOUT the output it was raised for: which status its event had is unknown to the new process
+ * (it could have been FAILED), so its trade holds while the reads show it MATCHED, and is delivered once a read shows it
+ * terminal. r14 asserted a resume at MATCHED here, which is exactly the finding's fail-open premise (the request alone
+ * ordering its event's status). Without a restart, nothing new holds (the arms above resume at MATCHED).
+ */
+async function heldUntilTerminal(r: Bound, trade: VenueTrade): Promise<void> {
+  expect(await anyResumed(r, 3)).toBe(false);
+  expect(oracle(r)).toEqual([]);
+  expect(r.backlog.acknowledged).toEqual([]);
+  trade.status = "CONFIRMED";
+}
+
 function absentAnswers(r: Ready, attempt: string | null): number {
   return r.u.accepted.filter((answer) => answer.attemptId === attempt && answer.verdict === "ABSENT").length;
 }
@@ -242,8 +256,8 @@ describe("WP-290 r14 (WP290-V14-WP280-EVENT-IDS-DISCARDED): WP-280's own empty p
       ["C: trader side absent", OURS, { traderSide: null }, "TRADER_SIDE_UNKNOWN"],
       ["C: our maker leg listed twice", OURS, { makerOwners: [OUR_OWNER, OUR_OWNER] }, "DUPLICATE_OWN_MAKER_LEG"],
     ] as const) {
-      it(`(P14-${name}${tag}) a maker fill WP-280 cannot attribute (an empty projection and its request), then every read lags: never resumed, nothing lost; the reads catch up: delivered, acknowledged, resumed`, async () => {
-        const { r, emission } = await fillThenLag(options, extra, "OUTPUT", withRestart);
+      it(`(P14-${name}${tag}${withRestart ? "; r15 restated" : ""}) a maker fill WP-280 cannot attribute (an empty projection and its request), then every read lags: never resumed, nothing lost; the reads catch up: delivered, acknowledged, resumed${withRestart ? " once the trade is shown terminal" : ""}`, async () => {
+        const { r, trade, emission } = await fillThenLag(options, extra, "OUTPUT", withRestart);
         expect(emission.shortfalls).toContain(shortfall);
         expect((emission.output["oms"] as { settlements: unknown[] }).settlements).toEqual([]);
         // c3cb404: resumed with the fill lost (OMS 0 vs venue 0.4; collateral 1000 vs 999.8; token 0 vs 0.4).
@@ -251,6 +265,7 @@ describe("WP-290 r14 (WP290-V14-WP280-EVENT-IDS-DISCARDED): WP-280's own empty p
         expect(oracle(r)).toEqual([]);
         expect(r.backlog.acknowledged).toEqual([]);
         r.u.world.faults = {};
+        if (withRestart) await heldUntilTerminal(r, trade);
         expect(await reconcileRounds(r, 6)).toBe(true);
         expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
         expect(oracle(r)).toEqual([]);
@@ -273,12 +288,13 @@ describe("WP-290 r14 (WP290-V14-WP280-EVENT-IDS-DISCARDED): WP-280's own empty p
       expect(oracle(r)).toEqual([]);
     });
 
-    it(`(P14-D, control: our maker leg determined${tag}) WP-280 projects the MATCHED settlement (no fill: MAKER_FEE_NOT_ON_STREAM): held on the lagging reads, delivered once they catch up`, async () => {
-      const { r, emission } = await fillThenLag(OURS, {}, "OUTPUT", withRestart);
+    it(`(P14-D, control: our maker leg determined${tag}${withRestart ? "; r15 restated" : ""}) WP-280 projects the MATCHED settlement (no fill: MAKER_FEE_NOT_ON_STREAM): held on the lagging reads, delivered once they catch up${withRestart ? " and the trade is shown terminal" : ""}`, async () => {
+      const { r, trade, emission } = await fillThenLag(OURS, {}, "OUTPUT", withRestart);
       expect(emission.shortfalls).toEqual(["MAKER_FEE_NOT_ON_STREAM"]);
       expect(await anyResumed(r, 4)).toBe(false);
       expect(oracle(r)).toEqual([]);
       r.u.world.faults = {};
+      if (withRestart) await heldUntilTerminal(r, trade);
       expect(await reconcileRounds(r, 6)).toBe(true);
       expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
       expect(oracle(r)).toEqual([]);
@@ -568,26 +584,26 @@ describe("WP-290 r14, the re-audit: an activity output received during a run is 
 });
 
 describe("WP-290 r14 units: the stream door's event and request reads", () => {
-  it("(P14, the request door) every identity is read on its own; required for an event-level or unknown cause; an event-level request naming nothing is unreadable; the status is ordered only for EVENT_NOT_FULLY_APPLICABLE with no status shortfall", () => {
+  it("(P14, the request door; r15 restated) every identity is read on its own; required for an event-level or unknown cause; an event-level request naming nothing is unreadable; the status is RECOGNISED (never ordered by the request alone: WP290-V15-EFA-REQUEST-STATUS-ASSUMED) only for EVENT_NOT_FULLY_APPLICABLE with no status shortfall", () => {
     const base = { requestId: "q1", afterLoss: null, markets: ["m"], subscriptionGeneration: 1, unrecognized: null, requestedAt: null };
     const read = (fields: Row): unknown => {
       const out = readStreamRequest({ ...base, ...fields });
-      return [out.requestId, out.cause, out.eventCause, out.venueTradeId, out.venueOrderIds, out.unordered, out.unreadable];
+      return [out.requestId, out.cause, out.eventCause, out.venueTradeId, out.venueOrderIds, out.statusRecognised, out.unreadable];
     };
-    expect(read({ cause: "EVENT_NOT_FULLY_APPLICABLE", venueTradeId: "t1", venueOrderIds: ["a", "b"], shortfalls: ["MAKER_FEE_NOT_ON_STREAM"] })).toEqual(["q1", "EVENT_NOT_FULLY_APPLICABLE", true, "t1", ["a", "b"], false, []]);
-    expect(read({ cause: "EVENT_NOT_FULLY_APPLICABLE", venueTradeId: "t1", venueOrderIds: ["a"], shortfalls: ["TRADE_STATUS_C3"] })).toEqual(["q1", "EVENT_NOT_FULLY_APPLICABLE", true, "t1", ["a"], true, []]);
-    expect(read({ cause: "EVENT_NOT_FULLY_APPLICABLE", venueTradeId: "t1", venueOrderIds: ["a"], shortfalls: ["NOT_A_SHORTFALL"] })).toEqual(["q1", "EVENT_NOT_FULLY_APPLICABLE", true, "t1", ["a"], true, []]);
-    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: "t1", venueOrderIds: ["a"], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, "t1", ["a"], true, []]);
-    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: null, venueOrderIds: ["venue-9"], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, ["venue-9"], true, []]);
-    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: null, venueOrderIds: [], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, [], true, ["venueOrderIds"]]);
-    expect(read({ cause: "EVENT_NOT_DELIVERED" })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, [], true, ["shortfalls", "venueOrderIds", "venueTradeId"]]);
-    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: 7, venueOrderIds: ["a", 8, "has space"], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, ["a"], true, ["venueOrderIds", "venueTradeId"]]);
+    expect(read({ cause: "EVENT_NOT_FULLY_APPLICABLE", venueTradeId: "t1", venueOrderIds: ["a", "b"], shortfalls: ["MAKER_FEE_NOT_ON_STREAM"] })).toEqual(["q1", "EVENT_NOT_FULLY_APPLICABLE", true, "t1", ["a", "b"], true, []]);
+    expect(read({ cause: "EVENT_NOT_FULLY_APPLICABLE", venueTradeId: "t1", venueOrderIds: ["a"], shortfalls: ["TRADE_STATUS_C3"] })).toEqual(["q1", "EVENT_NOT_FULLY_APPLICABLE", true, "t1", ["a"], false, []]);
+    expect(read({ cause: "EVENT_NOT_FULLY_APPLICABLE", venueTradeId: "t1", venueOrderIds: ["a"], shortfalls: ["NOT_A_SHORTFALL"] })).toEqual(["q1", "EVENT_NOT_FULLY_APPLICABLE", true, "t1", ["a"], false, []]);
+    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: "t1", venueOrderIds: ["a"], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, "t1", ["a"], false, []]);
+    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: null, venueOrderIds: ["venue-9"], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, ["venue-9"], false, []]);
+    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: null, venueOrderIds: [], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, [], false, ["venueOrderIds"]]);
+    expect(read({ cause: "EVENT_NOT_DELIVERED" })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, [], false, ["shortfalls", "venueOrderIds", "venueTradeId"]]);
+    expect(read({ cause: "EVENT_NOT_DELIVERED", venueTradeId: 7, venueOrderIds: ["a", 8, "has space"], shortfalls: [] })).toEqual(["q1", "EVENT_NOT_DELIVERED", true, null, ["a"], false, ["venueOrderIds", "venueTradeId"]]);
     // A stream-level cause: nothing required, nothing named; a missing field is nothing (WP-280 carries none).
-    expect(read({ cause: "SOCKET_CLOSED" })).toEqual(["q1", "SOCKET_CLOSED", false, null, [], true, []]);
-    expect(read({ cause: "SOCKET_CLOSED", venueTradeId: null, venueOrderIds: [], shortfalls: [] })).toEqual(["q1", "SOCKET_CLOSED", false, null, [], true, []]);
+    expect(read({ cause: "SOCKET_CLOSED" })).toEqual(["q1", "SOCKET_CLOSED", false, null, [], false, []]);
+    expect(read({ cause: "SOCKET_CLOSED", venueTradeId: null, venueOrderIds: [], shortfalls: [] })).toEqual(["q1", "SOCKET_CLOSED", false, null, [], false, []]);
     // A cause outside WP-280's vocabulary (or unreadable): the fields are required.
-    expect(read({ cause: "event_not_delivered" })).toEqual(["q1", "event_not_delivered", false, null, [], true, ["shortfalls", "venueOrderIds", "venueTradeId"]]);
-    expect(read({ cause: 7, venueTradeId: "t1", venueOrderIds: [], shortfalls: [] })).toEqual(["q1", null, false, "t1", [], true, []]);
+    expect(read({ cause: "event_not_delivered" })).toEqual(["q1", "event_not_delivered", false, null, [], false, ["shortfalls", "venueOrderIds", "venueTradeId"]]);
+    expect(read({ cause: 7, venueTradeId: "t1", venueOrderIds: [], shortfalls: [] })).toEqual(["q1", null, false, "t1", [], false, []]);
     // An accessor is not own data: the request is malformed (`opaque`), and its identities are still read.
     const accessor = { ...base, cause: "EVENT_NOT_DELIVERED", venueOrderIds: [], venueTradeId: "t1" };
     Object.defineProperty(accessor, "requestId", { get: () => "q1", enumerable: true });

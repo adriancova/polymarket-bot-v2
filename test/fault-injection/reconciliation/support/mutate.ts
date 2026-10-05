@@ -673,7 +673,7 @@ export function expectedEvent(kind: "ORDER" | "TRADE", answer: unknown, shortfal
  * projection whole (a shortfall, `shortfalls` unreadable, or nothing projected): then an event that cannot be read is
  * `<kind>:event`, and one whose order or trade id cannot be read is `ORDER:venueOrderId` or `FILL:venueTradeId`.
  */
-export function expectedStream(answer: unknown, maxItems: number): { readonly items: { kind: string; row: Expected }[]; readonly unreadable: string[]; readonly event?: Expected } {
+export function expectedStream(answer: unknown, maxItems: number): { readonly items: { kind: string; row: Expected }[]; readonly unreadable: string[]; readonly event?: Expected; readonly shortfalls?: readonly string[] } {
   const kind = own(answer, "kind");
   const oms = own(answer, "oms");
   const items: { kind: string; row: Expected }[] = [];
@@ -735,7 +735,8 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
     else if (activity === "ORDER" && event["venueOrderId"] === UNREADABLE) unreadable.push("ORDER:venueOrderId");
     else if (activity === "TRADE" && event["venueTradeId"] === UNREADABLE) unreadable.push("FILL:venueTradeId");
   }
-  return event === undefined ? { items, unreadable } : { items, unreadable, event };
+  // (r15) The projection's shortfalls, whenever they can be read: a validated fragment like any other.
+  return { items, unreadable, ...(event === undefined ? {} : { event }), ...(shortfalls === undefined ? {} : { shortfalls }) };
 }
 
 
@@ -775,12 +776,13 @@ export function expectedRequest(answer: unknown, causes: readonly string[], shor
   if (eventCause && venueTradeId === null && venueOrderIds.length === 0 && unreadable.size === 0) unreadable.add("venueOrderIds");
   const shortfalls = !present("shortfalls") && !required ? [] : expectedShortfalls(answer);
   if (shortfalls === undefined) unreadable.add("shortfalls");
-  const unordered = cause !== "EVENT_NOT_FULLY_APPLICABLE" || shortfalls === undefined || shortfalls.some((entry) => !shortfallVocabulary.includes(entry) || STATUS_SHORTFALLS.includes(entry));
+  // (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) WP-280 recognised the event's status: never WHICH (a request carries none).
+  const statusRecognised = cause === "EVENT_NOT_FULLY_APPLICABLE" && shortfalls !== undefined && shortfalls.every((entry) => shortfallVocabulary.includes(entry) && !STATUS_SHORTFALLS.includes(entry));
   const marketsRead = own(answer, "markets");
   const marketEntries = marketsRead.data ? expectedEntries(marketsRead.value, 100_000) : undefined;
   const markets = marketEntries === undefined || marketEntries.includes(UNREADABLE) ? [] : marketEntries.filter((entry): entry is string => typeof entry === "string");
   const opaque = (["requestId", "cause", "markets"] as const).some((key) => present(key) && !own(answer, key).data);
-  return { requestId, cause, markets, opaque, eventCause, venueTradeId, venueOrderIds: [...new Set(venueOrderIds)].sort(), unordered, unreadable: [...unreadable].sort() };
+  return { requestId, cause, markets, opaque, eventCause, venueTradeId, venueOrderIds: [...new Set(venueOrderIds)].sort(), shortfalls: shortfalls ?? null, statusRecognised, unreadable: [...unreadable].sort() };
 }
 
 export { APPROVAL_KEYS, COLLATERAL_KEYS, FILL_KEYS, LEG_KEYS, MEMBER_KEYS, OBSERVATION_KEYS, ORDER_KEYS, POSITION_KEYS, SETTLEMENT_KEYS, TRADE_KEYS, own };

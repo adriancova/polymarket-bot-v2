@@ -169,7 +169,12 @@
  *   a trade whose identity is open until a valid trades row shows its own
  *   legs; `unordered` when its status cannot be ordered. An empty projection
  *   or a shortfall requires the event; an identity that cannot be read is an
- *   obligation of the account.
+ *   obligation of the account. (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) A
+ *   request carries no status: the trade it names is `unordered` unless this
+ *   coordinator received the output of the very event the request was raised
+ *   for IMMEDIATELY before it (WP-280's emission order) with an ordered
+ *   status; then the request's record carries that status
+ *   (`requestEventStatus`). A request pulled from WP-280's backlog never does.
  * - **Malformed requests.** A request that cannot be read, on any channel, is
  *   refused to its requester (the OMS and the inventory keep it as owed) and
  *   recorded as a REQUEST_MALFORMED break by the next run: a hold, which a
@@ -587,6 +592,15 @@ export class ReconciliationCoordinator {
   readonly #malformed: MalformedReceipt[] = [];
   #malformedUnitemised = 0;
 
+  /**
+   * (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) The output received immediately before the one being received, when it
+   * was an ORDER or TRADE output (else `undefined`). WP-280 emits an event's `EVENT_NOT_FULLY_APPLICABLE` request right
+   * after the event's output (`manager.ts` `#onFrame`: `#emit`, then `#request`; `#flush` delivers them in that order),
+   * so a request received next names that event, and that output alone says which status it had (`requestEventStatus`).
+   * Every output received replaces it; memory only: a restarted coordinator, and a request pulled from WP-280's backlog,
+   * have none.
+   */
+  #previousActivity: unknown = undefined;
   readonly #streamBuffer: unknown[] = [];
   #streamChain: Promise<void> = Promise.resolve();
   #running = false;
@@ -684,12 +698,17 @@ export class ReconciliationCoordinator {
    * trigger or a request. It advances the hold epoch (so a run deciding to resume while it arrives does not resume),
    * the run reruns (`#workArrivedDuring`), and the next run of the same `reconcile` routes it first (`#drainBetweenRuns`).
    * c3cb404 resumed with it still in the buffer: the fill it carried was unapplied at the resume (R1).
+   *
+   * (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) A request is read beside the output received immediately before it (the
+   * event WP-280 raised it for, when it is one: `requestEventStatus`); every output replaces that output.
    */
   onUserStreamOutput(output: unknown): void {
     const read = classifyStreamOutput(output);
+    const previous = this.#previousActivity;
+    this.#previousActivity = read.read === "ORDER" || read.read === "TRADE" ? output : undefined;
     if (read.request) {
       const request = readField(output, "request");
-      this.#receiveStreamRequest(request.kind === "DATA" ? request.value : undefined);
+      this.#receiveStreamRequest(request.kind === "DATA" ? request.value : undefined, previous);
     }
     if (read.read === "NOTHING") return;
     if (this.#running) {
@@ -3186,14 +3205,16 @@ export class ReconciliationCoordinator {
   /**
    * One WP-280 reconciliation request, read at its door (`door.ts`, `readStreamRequest`). (r14,
    * WP290-V14-WP280-EVENT-IDS-DISCARDED) What it NAMED is journaled at receipt, whatever its usability
-   * (`streamRequestRecords`: a trade it names, NAMED and OPEN, `unordered` unless WP-280 recognised its status; the
+   * (`streamRequestRecords`: a trade it names, NAMED and OPEN, (r15) `unordered` unless `previous`, the output received
+   * immediately before it, is the output of the very event it was raised for, with an ordered status
+   * (`requestEventStatus`: then the record carries that status; WP290-V15-EFA-REQUEST-STATUS-ASSUMED); the
    * orders an order event's request names, NAMED, read by id; an identity that cannot be read, an obligation of the
    * account), and it is acknowledged only once a run has judged every identity it named. A request whose id or cause
    * cannot be read is refused as malformed (a REQUEST_MALFORMED hold), as before.
    */
-  #receiveStreamRequest(raw: unknown): void {
+  #receiveStreamRequest(raw: unknown, previous: unknown = undefined): void {
     const read = readStreamRequest(raw);
-    this.#recordAtReceipt(streamRequestRecords(read));
+    this.#recordAtReceipt(streamRequestRecords(read, requestEventStatus(read, previous)));
     if (read.opaque || read.requestId === null || read.cause === null) {
       this.#receiveMalformed("user-stream", "outside WP-280's request shape", "USER_STREAM_RECONNECT");
       return;
@@ -3988,7 +4009,10 @@ function streamEventRecords(event: StreamEventFragments): readonly EvidenceRecor
  * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) The stream-NAMED evidence a WP-280 reconciliation request carries
  * (`door.ts`, `StreamRequestFragments`), whatever its usability:
  * - the trade it names: `STREAM_TRADE`, its identity OPEN (only a valid row showing its own legs in full answers it),
- *   `unordered` unless WP-280 recognised its status (an `EVENT_NOT_FULLY_APPLICABLE` with no status shortfall). The
+ *   (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) with `eventStatus`, the status of the event the request was raised for
+ *   when it is established ({@link requestEventStatus}), else `unordered`: a request carries no status, and "WP-280
+ *   recognised it" (an `EVENT_NOT_FULLY_APPLICABLE` with no status shortfall: r14's rule) does not say which (FAILED is
+ *   one it recognises). The
  *   orders a trade's request names are every order the trade matched, the counterparties' included (`manager.ts`,
  *   `eventScope`): which are the account's is exactly what that open identity is answered by, so they are not
  *   recorded as the account's orders (no venue document describes a by-id read of another account's order, E-14
@@ -3997,9 +4021,9 @@ function streamEventRecords(event: StreamEventFragments): readonly EvidenceRecor
  * - an identity it names that cannot be read: an obligation of the account (`UNKEYED_TRADE` for its trade, or an
  *   `UNKEYED_ORDER` for its orders).
  */
-function streamRequestRecords(request: StreamRequestFragments): readonly EvidenceRecord[] {
+function streamRequestRecords(request: StreamRequestFragments, eventStatus: string | null): readonly EvidenceRecord[] {
   if (request.venueTradeId !== null) {
-    return [tradeRecord(request.venueTradeId, null, "STREAM_TRADE", { unreadable: [...(request.unordered ? ["status"] : []), ...request.unreadable] })];
+    return [tradeRecord(request.venueTradeId, eventStatus, "STREAM_TRADE", { unreadable: [...(eventStatus === null ? ["status"] : []), ...request.unreadable] })];
   }
   if (request.unreadable.includes("venueTradeId")) {
     return [unkeyedTradeRecord({ status: null, transactionHash: null, ownershipUndetermined: null, unreadable: ["venueTradeId"] }, "STREAM_UNREADABLE")];
@@ -4009,6 +4033,40 @@ function streamRequestRecords(request: StreamRequestFragments): readonly Evidenc
     out.push(unkeyedOrderRecord({ venueOrderId: null, tokenId: null, side: null, price: null, originalSize: null, sizeMatched: null, status: null, unreadable: ["venueOrderId"] }, "STREAM_ORDER_UNKEYED"));
   }
   return out;
+}
+
+/**
+ * (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) The settlement status of the event a WP-280 request was raised for, when it
+ * is ESTABLISHED, else `null` (the request's trade is then `unordered`: only an observation of it at a terminal status
+ * answers it). It is established only by that event's own output, received IMMEDIATELY before the request (`previous`;
+ * WP-280 emits an event's `EVENT_NOT_FULLY_APPLICABLE` request right after its output, `manager.ts` `#onFrame`): the
+ * request is an `EVENT_NOT_FULLY_APPLICABLE` whose status WP-280 recognised, and `previous` is a TRADE output whose
+ * event names the same trade at an ORDERED status and whose projection carried exactly the request's shortfalls, in
+ * the same order. Nothing else establishes it: the request carries no status, and an earlier observation of the same
+ * trade (an earlier event, a read) says nothing of THIS event's (r14 resumed with a FAILED event missed when the
+ * request was its only surviving word and a lagging read showed the trade MATCHED). An `EVENT_NOT_DELIVERED` request
+ * never names a status (its output was not taken), and a request pulled from WP-280's backlog has no `previous`
+ * (`undefined`: no event). A request that names no trade records no trade status (its order event's status is not
+ * used: {@link streamRequestRecords}).
+ *
+ * WP-280's contract this relies on (`manager.ts` `#flush`): an ORDER or TRADE output the listener did not take is
+ * followed by its own `EVENT_NOT_DELIVERED` request (unordered). So a request whose own output this coordinator never
+ * received, but which came right after an EARLIER output of the same trade with the same shortfalls (two listener
+ * failures: that earlier output's request, and this request's output), is matched with the wrong event here, and its
+ * trade is still `unordered` by the `EVENT_NOT_DELIVERED` request that follows (delivered, or pulled from the backlog).
+ */
+function requestEventStatus(request: StreamRequestFragments, previous: unknown): string | null {
+  // `statusRecognised` holds only for an EVENT_NOT_FULLY_APPLICABLE request (`door.ts`).
+  if (!request.statusRecognised) return null;
+  const output = readStreamOutput(previous);
+  const event = output.event;
+  // (An order event names no trade: its `venueTradeId` is `null`.)
+  if (event === undefined || event.venueTradeId !== request.venueTradeId) return null;
+  const requested = request.shortfalls;
+  const projected = output.shortfalls;
+  if (requested === null || projected === undefined || projected.length !== requested.length || projected.some((entry, index) => entry !== requested[index])) return null;
+  // A TRADE event's `status` is its ORDERED status, `null` when it cannot be ordered (`door.ts`, `readEventFragments`).
+  return event.status;
 }
 
 /** (r14) The subjects a stream request's acknowledgement waits on ({@link streamRequestRecords}). */

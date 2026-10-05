@@ -212,6 +212,8 @@ function namedIdentities(
 }
 
 const SEEDS = 160;
+/** (r15) The crash property's seeds. */
+const CRASH_SEEDS = 160;
 
 describe("WP-290 r12, r13, r14: the stream door end to end, under lagging reads (WP290-CX-R12-01's, WP290-CX-R13-01's and WP290-V14-WP280-EVENT-IDS-DISCARDED's class)", () => {
   it(`${String(SEEDS)} seeds (1 to ${String(SEEDS)}): WP-280's real (or a synthetic) output, mutated or not, the reads lagging behind it, a restart in one seed in two: nothing is lost; every unreadable entry is a journaled obligation that holds; every identity named is journaled`, async () => {
@@ -398,5 +400,176 @@ describe("WP-290 r12, r13, r14: the stream door end to end, under lagging reads 
     expect(notDelivered, "(r14) an output the listener did not take").toBeGreaterThan(0);
     expect([...shapes.keys()].some((shape) => /:(event|venueOrderId|venueTradeId)$/u.test(shape)), "(r14) a required event that cannot be read").toBe(true);
     expect(identitiesChecked, "(r14) identities named and checked").toBeGreaterThan(0);
+  }, 300_000);
+
+  /**
+   * (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) THE CRASH WINDOW. WP-280's REAL output (always) and its requests reach a
+   * coordinator that DIES before it journals any of them (between runs: before its stream chain runs; or during a run:
+   * the output buffered and the request's identities waiting for the next run's evidence load), or never reach it (the
+   * output lost, the requests only in WP-280's backlog); WP-280 outlives it: a new process is bound to the SAME backlog
+   * (the suite's `restarted()` model), which re-delivers every request it holds, WITHOUT the output. Every read lags
+   * (r12's scenarios). An output with no request (WP-280 projected it whole), taken and lost in the crash, leaves no word
+   * of the event anywhere (runbook §10: an observation not yet recorded dies with the process): such a seed is drawn
+   * again (`skipped`). The oracle is the venue's truth:
+   * 1. no oracle violation (R1, R2, R3) and never ABSENT, on the lagging reads and once they are truthful;
+   * 2. a fill or failed settlement the dead OMS did not apply never lets the account resume on the lagging reads;
+   * 3. every identity the surviving requests name (`expectedRequest`, from WP-280's contract) is journaled.
+   * d70d7a0 resumed with R1 on the seeds whose FAILED event WP-280 recognised but could not project (its request's
+   * status read as ordered); the counters assert those seeds are drawn in every crash mode.
+   */
+  it(`(r15) ${String(CRASH_SEEDS)} crash seeds (1 to ${String(CRASH_SEEDS)}): WP-280's real output and requests reach a coordinator that dies before journaling them (or never reach it); a new process on the same WP-280 backlog; the reads lag: nothing is lost; every identity the surviving requests name is journaled`, async () => {
+    const modes = new Map<string, number>();
+    const scenarios = new Map<string, number>();
+    const shortfallsDrawn = new Map<string, number>();
+    const recognisedFailed = new Map<string, number>();
+    let notTaken = 0;
+    let skipped = 0;
+    let unapplied = 0;
+    let identitiesChecked = 0;
+    let resumedAfter = 0;
+    for (let seed = 1; seed <= CRASH_SEEDS; seed += 1) {
+      const rand = seeded(seed * 130_363);
+      const roll = rand();
+      const scenario = roll < 0.25 ? "ORDER" : roll < 0.7 ? "SETTLE" : "TRADE";
+      const mode = pick(rand, ["NEVER_RECEIVED", "BEFORE_JOURNALING", "DURING_A_RUN"] as const);
+      const taken = rand() >= 1 / 6;
+      const r0 = await ready();
+      const backlog = new Wp280Backlog();
+      r0.p.coordinator.bindUserStream(backlog);
+      let attempt: string | null = null;
+      let emission: Wp280Emission;
+      let tag: string;
+      let after: () => boolean;
+      if (scenario === "TRADE") {
+        await submitOne(r0.oms);
+        expect(await reconcileRounds(r0, 3)).toBe(true);
+        const collateral = r0.u.world.collateral;
+        const trade = must(r0.u.world.match(must(r0.u.world.receipts.at(-1), "receipt"), "0.4", { status: "MATCHED" }), "match");
+        const wire = wireOfTrade(rand, trade, ["MATCHED", "MATCHED", "TRADE_STATUS_MATCHED", "Matched", "MATCHED_NOT_BROADCASTED"]);
+        emission = wp280Emit(wire.message, wire.options);
+        tag = wire.tag;
+        after = () => {
+          const applied = r0.oms.orders()[0]?.filledShares === "0.4";
+          r0.u.world.cancel(trade.venueOrderId);
+          lagEveryRead(r0, collateral);
+          return applied;
+        };
+      } else if (scenario === "SETTLE") {
+        await submitOne(r0.oms);
+        expect(await reconcileRounds(r0, 3)).toBe(true);
+        const trade = must(r0.u.world.match(must(r0.u.world.receipts.at(-1), "receipt"), "0.4", { status: "MATCHED" }), "match");
+        r0.p.coordinator.onUserStreamOutput(streamTrade(r0.u, trade.venueTradeId));
+        await r0.p.coordinator.settled();
+        expect(await reconcileRounds(r0, 3)).toBe(true);
+        const stale = await fullSnapshot(r0, trade.venueOrderId);
+        r0.u.world.failTrade(trade);
+        const wire = wireOfTrade(rand, trade, ["FAILED", "FAILED", "TRADE_STATUS_FAILED", "Failed", "TRADE_STATUS_REVERTED", "MATCHED_NOT_BROADCASTED"]);
+        emission = wp280Emit(wire.message, wire.options);
+        tag = wire.tag;
+        after = () => {
+          const applied = r0.oms.alerts().some((alert) => (alert as { kind?: string }).kind === "SETTLEMENT_FAILED");
+          r0.u.world.faults = stale;
+          return applied;
+        };
+      } else {
+        const stale = await listSnapshot(r0);
+        r0.u.world.nextTransmission = sequence(["UNKNOWN_EXISTS"]);
+        attempt = await submitOne(r0.oms);
+        const order = must(r0.u.world.orders.get(must(r0.u.world.receipts.at(-1), "receipt")), "venue order");
+        const status = pick(rand, [null, null, "LIVE", "BOGUS"]);
+        const type = pick(rand, ["PLACEMENT", "PLACEMENT", "UPDATE", "WEIRD"]);
+        emission = wp280Emit(wireOrder({ id: order.venueOrderId, assetId: order.tokenId, side: order.side, originalSize: order.original, sizeMatched: order.matched, price: order.price, status, type }));
+        tag = `${String(status)}/${type}`;
+        const byIdLags = rand() < 1 / 3;
+        after = () => {
+          r0.u.world.faults = byIdLags ? { ...stale, readOrder: () => ({ route: "/data/order", found: false }) } : stale;
+          return true;
+        };
+      }
+      // What survives in WP-280's backlog: the event's request, and its EVENT_NOT_DELIVERED request when not taken.
+      const requests: unknown[] = [];
+      if (emission.request !== null) requests.push(emission.request);
+      if (!taken && emission.notDelivered !== null) requests.push(emission.notDelivered);
+      if (requests.length === 0) {
+        skipped += 1;
+        continue;
+      }
+      modes.set(mode, (modes.get(mode) ?? 0) + 1);
+      scenarios.set(scenario, (scenarios.get(scenario) ?? 0) + 1);
+      if (!taken) notTaken += 1;
+      for (const shortfall of emission.shortfalls) shortfallsDrawn.set(shortfall, (shortfallsDrawn.get(shortfall) ?? 0) + 1);
+      const recognised = scenario === "SETTLE" && emission.request !== null && (expectedRequest(emission.request, RECONCILIATION_CAUSES, PROJECTION_SHORTFALLS) as { statusRecognised: boolean }).statusRecognised;
+      if (recognised) recognisedFailed.set(mode, (recognisedFailed.get(mode) ?? 0) + 1);
+      const label = `crash seed ${String(seed)} ${scenario} ${mode} real ${tag} ${taken ? "" : "NOT-TAKEN "}shortfalls=[${emission.shortfalls.join(",")}]`;
+      const handToOld = (): void => {
+        // What WP-280's manager hands the listener, in its order: the output (when taken), then its requests.
+        if (taken) r0.p.coordinator.onUserStreamOutput(emission.output);
+        for (const request of requests) {
+          backlog.pending.push(request as never);
+          r0.p.coordinator.onUserStreamOutput(Object.freeze({ kind: "RECONCILIATION_REQUESTED", request }));
+        }
+      };
+      const before = r0.u.journalEvents.length;
+      if (mode === "NEVER_RECEIVED") {
+        for (const request of requests) backlog.pending.push(request as never);
+      } else if (mode === "BEFORE_JOURNALING") {
+        handToOld();
+        r0.p.inc.alive = false;
+        await r0.p.coordinator.settled();
+        expect(r0.u.journalEvents.length, `${label}: nothing durable`).toBe(before);
+      } else {
+        const faults = r0.u.world.faults;
+        r0.u.world.faults = {
+          ...faults,
+          onRead: (name) => {
+            if (name !== "listTrades" || !r0.p.inc.alive) return;
+            handToOld();
+            r0.p.inc.alive = false;
+          },
+        };
+        r0.p.coordinator.trigger("PERIODIC_TIMER");
+        expect((await r0.p.coordinator.reconcile()).resumed, label).toBe(false);
+        await r0.p.coordinator.settled();
+        expect(r0.p.inc.alive, `${label}: died in the run`).toBe(false);
+        expect(r0.u.journalEvents.slice(before).filter((event) => event.kind === "EVIDENCE_RECORDED"), `${label}: no evidence durable`).toEqual([]);
+        r0.u.world.faults = faults;
+      }
+      const applied = after();
+      const r = await restarted(r0, backlog);
+      const resumed = await anyResumed(r, 4);
+      // 1. Nothing is lost while the reads lag.
+      expect(oracle(r), label).toEqual([]);
+      if (attempt !== null) expect(r.u.accepted.filter((answer) => answer.attemptId === attempt && answer.verdict === "ABSENT"), label).toEqual([]);
+      // 2. A fill or failed settlement the dead OMS did not apply never lets the account resume on the lagging reads.
+      if (!applied) {
+        unapplied += 1;
+        expect(resumed, `${label}: resumed with the ${scenario === "SETTLE" ? "settlement" : "fill"} unapplied`).toBe(false);
+      }
+      // 3. Every identity the surviving requests name is journaled (by the new process, from the backlog).
+      const named = namedIdentities(null, requests);
+      const records = r.p.journal.evidence();
+      for (const tradeId of named.trades) {
+        identitiesChecked += 1;
+        expect(records.some((record) => record.evidenceKind === "TRADE" && record.source === "STREAM_TRADE" && record.venueTradeId === tradeId), `${label}: trade ${tradeId} journaled`).toBe(true);
+      }
+      for (const orderId of named.orders) {
+        identitiesChecked += 1;
+        expect(records.some((record) => record.venueOrderId === orderId), `${label}: order ${orderId} journaled`).toBe(true);
+      }
+      r.u.world.faults = {};
+      const caughtUp = await anyResumed(r, 3);
+      expect(oracle(r), `${label} (truthful reads)`).toEqual([]);
+      if (attempt !== null) expect(r.u.accepted.filter((answer) => answer.attemptId === attempt && answer.verdict === "ABSENT"), `${label} (truthful reads)`).toEqual([]);
+      if (caughtUp) resumedAfter += 1;
+    }
+    console.log(
+      `STREAM-CRASH-PROPERTY seeds=1..${String(CRASH_SEEDS)} seed=s*130363 modes=${JSON.stringify(Object.fromEntries([...modes].sort()))} scenarios=${JSON.stringify(Object.fromEntries([...scenarios].sort()))} skipped=${String(skipped)} notTaken=${String(notTaken)} unapplied=${String(unapplied)} recognisedFailed=${JSON.stringify(Object.fromEntries([...recognisedFailed].sort()))} identitiesChecked=${String(identitiesChecked)} resumedOnceTruthful=${String(resumedAfter)} shortfalls=${JSON.stringify(Object.fromEntries([...shortfallsDrawn].sort()))}`,
+    );
+    // Every crash mode is drawn with a FAILED event WP-280 recognised but could not project (the finding's shape), and
+    // an output the listener did not take.
+    for (const mode of ["NEVER_RECEIVED", "BEFORE_JOURNALING", "DURING_A_RUN"]) expect(recognisedFailed.get(mode) ?? 0, `(r15) ${mode} with a recognised FAILED event`).toBeGreaterThan(0);
+    for (const shortfall of ["TRADER_SIDE_UNKNOWN", "MAKER_LEG_OWNERSHIP_UNDETERMINED"]) expect(shortfallsDrawn.get(shortfall) ?? 0, `(r15) ${shortfall}`).toBeGreaterThan(0);
+    expect(notTaken, "(r15) an output the listener did not take").toBeGreaterThan(0);
+    expect(unapplied, "(r15) a fill or settlement the dead OMS did not apply").toBeGreaterThan(0);
   }, 300_000);
 });

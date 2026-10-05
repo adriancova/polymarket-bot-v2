@@ -314,12 +314,13 @@ describe("WP-290 r12 (WP290-CX-R12-01 = WP290-V12-STREAM-ABSENT-LIST-SILENT): a 
       { kind: "SETTLEMENT", field: "settlements" },
     ]);
     expect(readStreamOutput({ kind: "TRADE", oms: { fills: undefined, settlements: [], shortfalls: [] } }).unreadable).toEqual([{ kind: "FILL", field: "fills" }]);
-    expect(readStreamOutput({ kind: "ORDER", oms: { shortfalls: [] } })).toEqual({ kind: "ORDER", items: [], unreadable: [{ kind: "ORDER", field: "observation" }] });
-    expect(readStreamOutput({ kind: "ORDER", oms: { observation: undefined, shortfalls: [] } })).toEqual({ kind: "ORDER", items: [], unreadable: [{ kind: "ORDER", field: "observation" }] });
+    // (r15, restated: the door's output also carries the projection's `shortfalls` as read, a validated fragment.)
+    expect(readStreamOutput({ kind: "ORDER", oms: { shortfalls: [] } })).toEqual({ kind: "ORDER", items: [], unreadable: [{ kind: "ORDER", field: "observation" }], shortfalls: [] });
+    expect(readStreamOutput({ kind: "ORDER", oms: { observation: undefined, shortfalls: [] } })).toEqual({ kind: "ORDER", items: [], unreadable: [{ kind: "ORDER", field: "observation" }], shortfalls: [] });
     expect(readStreamOutput({ kind: "ORDER" }).unreadable).toEqual([{ kind: "ORDER", field: "oms" }]);
     expect(readStreamOutput({ kind: "TRADE" }).unreadable).toEqual([{ kind: "FILL", field: "oms" }]);
     expect(readStreamOutput({ oms: { fills: [], settlements: [] } }).unreadable).toEqual([{ kind: "FILL", field: "kind" }]);
     // (r14, restated: deviation) an EMPTY projection is not "nothing": its event is required (here missing).
-    expect(readStreamOutput({ kind: "TRADE", oms: { fills: [], settlements: [], shortfalls: [] } })).toEqual({ kind: "TRADE", items: [], unreadable: [{ kind: "FILL", field: "event" }] });
+    expect(readStreamOutput({ kind: "TRADE", oms: { fills: [], settlements: [], shortfalls: [] } })).toEqual({ kind: "TRADE", items: [], unreadable: [{ kind: "FILL", field: "event" }], shortfalls: [] });
   });
 });

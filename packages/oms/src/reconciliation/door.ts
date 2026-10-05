@@ -39,6 +39,11 @@
  * id, that cannot be read is then an unreadable entry), and reads every WP-280 request's identities on their own
  * ({@link readStreamRequest}: required for an event-level cause or one outside WP-280's closed vocabulary).
  *
+ * (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) A door states what its answer SAYS, never what it implies: a request says
+ * whether WP-280 recognised its event's status (`statusRecognised`), never which status that was (a request carries
+ * none). The stream door also returns the projection's `shortfalls` as read, so the coordinator can tell an event's
+ * output from its request ({@link StreamOutput}).
+ *
  * A read has exactly one outcome:
  *
  * | Outcome | Meaning | Break |
@@ -929,12 +934,17 @@ export type StreamUnreadableField = EnvelopeField | "entry" | "venueOrderId" | "
  * its `kind` when that could not be read, or, r13, was outside WP-280's vocabulary: {@link classifyStreamOutput}).
  * (r14) `event`: what the output's event named, whenever it could be read ({@link StreamEventFragments}); absent when
  * the output carries no readable event.
+ * (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED) `shortfalls`: the projection's `shortfalls` as read (each entry's text),
+ * whenever they could be read; absent when missing or unreadable (or the projection is). A validated fragment like any
+ * other: the coordinator compares it with the `EVENT_NOT_FULLY_APPLICABLE` request WP-280 raises right after the output
+ * (`coordinator.ts`, `requestEventStatus`).
  */
 export interface StreamOutput {
   readonly kind: "ORDER" | "TRADE" | null;
   readonly items: readonly StreamItem[];
   readonly unreadable: readonly { readonly kind: "ORDER" | "FILL" | "SETTLEMENT"; readonly field: StreamUnreadableField }[];
   readonly event?: StreamEventFragments;
+  readonly shortfalls?: readonly string[];
 }
 
 const STREAM_KEYS: Readonly<Record<StreamItemFragments["kind"], readonly StreamField[]>> = Object.freeze({
@@ -1254,7 +1264,7 @@ export function readStreamOutput(output: unknown): StreamOutput {
     else if (kind === "ORDER" && event.venueOrderId === null) unreadable.push({ kind: entryKind, field: "venueOrderId" });
     else if (kind === "TRADE" && event.venueTradeId === null) unreadable.push({ kind: entryKind, field: "venueTradeId" });
   }
-  return Object.freeze({ kind, items: Object.freeze(items), unreadable: Object.freeze(unreadable), ...(event === undefined ? {} : { event }) });
+  return Object.freeze({ kind, items: Object.freeze(items), unreadable: Object.freeze(unreadable), ...(event === undefined ? {} : { event }), ...(shortfalls === undefined ? {} : { shortfalls }) });
 }
 
 /**
@@ -1268,9 +1278,19 @@ export function readStreamOutput(output: unknown): StreamOutput {
  *   validated on its own. The fields are REQUIRED (missing is unreadable) when the cause is event-level, or outside
  *   WP-280's closed vocabulary (or unreadable: it may have been an event-level cause); an event-level request that names
  *   no identifier at all is unreadable too (WP-280's `eventScope` always names the event's order or orders);
- * - `unordered`: whether the named trade's status could have been any: only an `EVENT_NOT_FULLY_APPLICABLE` request
- *   whose shortfalls are readable, inside WP-280's vocabulary and name no status shortfall says it was one WP-280
- *   recognised (shortfalls that cannot be read are named in `unreadable`: their only bearing is this mark).
+ * - `shortfalls` (r15): the request's shortfalls as read (each entry's text; empty when the field is absent and not
+ *   required), `null` when they cannot be read (then named in `unreadable` too);
+ * - `statusRecognised` (r15, WP290-V15-EFA-REQUEST-STATUS-ASSUMED; r14's `unordered`, negated): whether WP-280 RECOGNISED
+ *   its event's settlement status: an `EVENT_NOT_FULLY_APPLICABLE` request whose shortfalls are readable, inside
+ *   WP-280's vocabulary and name no status shortfall. It says only THAT the status was one of WP-280's five, never
+ *   WHICH: FAILED is one of them. A request carries no status (`manager.ts`, `UserStreamReconciliationRequest`): the
+ *   value travels only in its event's output, which WP-280 emits immediately before the request (`#onFrame`). So the
+ *   request alone never orders its trade's status. The coordinator orders it only from that output, received
+ *   immediately before the request (`coordinator.ts`, `requestEventStatus`); otherwise the trade is `unordered`. r14
+ *   read a recognised status as an ordered one and journaled the trade with no status and no `unordered` mark: when the
+ *   request was the only surviving word of a FAILED event (a coordinator restart lost the output while WP-280's backlog
+ *   kept the request), a lagging read showing the trade MATCHED answered it, and the account resumed with the failure
+ *   missed (R1).
  */
 export interface StreamRequestFragments {
   readonly requestId: string | null;
@@ -1280,7 +1300,8 @@ export interface StreamRequestFragments {
   readonly eventCause: boolean;
   readonly venueTradeId: string | null;
   readonly venueOrderIds: readonly string[];
-  readonly unordered: boolean;
+  readonly shortfalls: readonly string[] | null;
+  readonly statusRecognised: boolean;
   readonly unreadable: readonly ("venueTradeId" | "venueOrderIds" | "shortfalls")[];
 }
 
@@ -1320,11 +1341,12 @@ export function readStreamRequest(raw: unknown): StreamRequestFragments {
   const shortfallsRead = readField(raw, "shortfalls");
   const shortfalls = shortfallsRead.kind === "ABSENT" && !required ? Object.freeze([] as string[]) : readShortfalls(raw);
   if (shortfalls === undefined) unreadable.push("shortfalls");
-  const unordered =
-    cause !== "EVENT_NOT_FULLY_APPLICABLE" ||
-    shortfalls === undefined ||
-    shortfalls.some((entry) => !(STREAM_PROJECTION_SHORTFALLS as readonly string[]).includes(entry)) ||
-    statusShortfall(shortfalls);
+  // (r15) Recognised, never ordered: which status it was is carried by the event's output alone.
+  const statusRecognised =
+    cause === "EVENT_NOT_FULLY_APPLICABLE" &&
+    shortfalls !== undefined &&
+    shortfalls.every((entry) => (STREAM_PROJECTION_SHORTFALLS as readonly string[]).includes(entry)) &&
+    !statusShortfall(shortfalls);
   return Object.freeze({
     requestId,
     cause,
@@ -1333,7 +1355,8 @@ export function readStreamRequest(raw: unknown): StreamRequestFragments {
     eventCause,
     venueTradeId,
     venueOrderIds: Object.freeze([...new Set(venueOrderIds)].sort()),
-    unordered,
+    shortfalls: shortfalls ?? null,
+    statusRecognised,
     unreadable: Object.freeze([...new Set(unreadable)].sort()),
   });
 }
