@@ -64,6 +64,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - **`GOV-NOTES-3`**: Ready (authorized) 2026-10-05. A docs-only round for `ROLLOVER1-OWED`: a dated ADR-030 amendment recording ROLLOVER-1's admission policies as interim rulings; the records for `SeriesWindowAdmitted@1` (domain.md, protected-contracts.md, the work plan); and an interim ADR-023 ruling on the market-less `incidentReferenceId`. Verifiers: Opus and gpt-6-astra, reconciled.
 - `WP-290` is Complete (2026-10-04, `7a53988`); see [Work packages](#work-packages). `WP-320`'s dependencies are now met (`WP-260`, `WP-290`, `WP-310`; ADR-033 Accepted for D1–D4 and D6).
 - `WP-320` is Complete (2026-10-05, `ed6e5a0`); see [Work packages](#work-packages). `WP-330` (the independent emergency CLI) is unblocked: `WP-260`, `WP-290` and `WP-320` are done.
+- **`WP-330`**: Ready (authorized) 2026-10-05 under the Wave 3 authorization; its dependencies are met. It is the independent emergency operations CLI: cancel-order, cancel-market, cancel-all (no trader state), account-snapshot (`/v2`), read-only reconcile, and stop-heartbeat guidance (revoke the fencing lease). Destructive actions need scoped confirmation, and every invocation is audited to a local log before and after. PAPER only. Paths: the work plan's, plus workspace-internal lockfile links. Verifiers: Opus and gpt-6-astra, reconciled (gate: security review).
 - `CI-5` is Complete (2026-10-05, `31b668d`); see [Work packages](#work-packages). CI now runs the OMS and reconciliation fault suites and the control-api PostgreSQL suite.
 - `CKPT-1` is Complete (2026-10-03, `891ccdd`); see [Work packages](#work-packages). It closes `DURABLE-1` LOW-3; residual `CKPT1-PG-RNG-STATUS` is open.
 - `TC-LOWS-1` is Complete (2026-10-04, `9033743`); see [Work packages](#work-packages). It closes `CO2N1-LOWS`, and trims `CADENCE1-LOWS` and `PROV1-LOWS`.
@@ -217,6 +218,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | Complete (2026-10-05) | `ae11daa` | [ROLLOVER-1](docs/handoffs/ROLLOVER-1.md) |
 | `WP-290` | Account reconciliation (Wave 3, PAPER only) | Complete (2026-10-04) | `7a53988` | [WP-290](docs/handoffs/WP-290.md) |
 | `WP-320` | Heartbeat health lease, fencing, geoblock and kill controls (Wave 3, PAPER only) | Complete (2026-10-05) | `ed6e5a0` | [WP-320](docs/handoffs/WP-320.md) |
+| `WP-330` | Independent emergency operations CLI (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-05 | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
 | `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
