@@ -139,13 +139,35 @@ importers:
         version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/ops-cli:
-    devDependencies:
+    dependencies:
       '@polymarket-bot/decimal':
         specifier: workspace:*
         version: link:../../packages/decimal
+      '@polymarket-bot/ledger':
+        specifier: workspace:*
+        version: link:../../packages/ledger
+      '@polymarket-bot/oms':
+        specifier: workspace:*
+        version: link:../../packages/oms
+      '@polymarket-bot/polymarket-secure':
+        specifier: workspace:*
+        version: link:../../packages/polymarket-secure
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../../packages/risk
+      '@polymarket-bot/storage-postgres':
+        specifier: workspace:*
+        version: link:../../packages/storage-postgres
+    devDependencies:
+      '@polymarket-bot/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
       '@types/node':
         specifier: ^24.13.3
         version: 24.13.3
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
