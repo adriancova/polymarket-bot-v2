@@ -68,7 +68,6 @@ export interface Harness {
   readonly transport: MemoryEventTransport;
   readonly walFileSystem: MemoryFileSystem;
   readonly polymarketSockets: ScriptedPublicSocketFactory;
-  readonly rtdsSockets: ScriptedPublicSocketFactory;
   readonly binanceSockets: ScriptedBinanceSocketFactory;
   readonly coinbaseSockets: FakeCoinbaseSocketFactory;
   readonly incidents: RecordedIncident[];
@@ -130,7 +129,6 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
   const transport = new MemoryEventTransport();
   const walFileSystem = options.walFileSystem ?? createMemoryFileSystem();
   const polymarketSockets = new ScriptedPublicSocketFactory();
-  const rtdsSockets = new ScriptedPublicSocketFactory();
   const binanceSockets = new ScriptedBinanceSocketFactory();
   const coinbaseSockets = new FakeCoinbaseSocketFactory();
 
@@ -173,7 +171,6 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     transport: gatewayTransport,
     polymarketSocketFactory: polymarketSockets.factory,
     polymarketHttpClient: async (request) => httpRoute(request),
-    rtdsSocketFactory: rtdsSockets.factory,
     binanceSocketFactory: binanceSockets.factory,
     coinbaseSocketFactory: coinbaseSockets,
     ...(options.runMode === null ? {} : { runMode: options.runMode ?? "PAPER" }),
@@ -212,7 +209,6 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     transport,
     walFileSystem,
     polymarketSockets,
-    rtdsSockets,
     binanceSockets,
     coinbaseSockets,
     incidents,
@@ -274,29 +270,6 @@ export function binanceTradeFrame(symbol: string, tradeId: number, atMs: number)
       q: "0.50",
       T: atMs,
       m: false,
-    },
-  });
-}
-
-/** An RTDS TWAP update frame. */
-export function rtdsUpdateFrame(options: {
-  readonly symbol: string;
-  readonly observationMs: number;
-  readonly windowSeconds?: 30 | 60;
-  readonly publisherMs?: number;
-  readonly valueE18?: string;
-}): string {
-  const windowSeconds = options.windowSeconds ?? 60;
-  return JSON.stringify({
-    topic: windowSeconds === 30 ? "crypto_prices_twap_thirty" : "crypto_prices_twap_sixty",
-    type: "update",
-    timestamp: options.publisherMs ?? options.observationMs,
-    payload: {
-      symbol: options.symbol,
-      value: 65000.5,
-      full_accuracy_value: options.valueE18 ?? "65000500000000000000000",
-      timestamp: options.observationMs,
-      window_s: windowSeconds,
     },
   });
 }

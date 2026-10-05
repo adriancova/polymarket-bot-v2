@@ -201,6 +201,68 @@ report §10.3). Therefore a TWAP-dependent strategy must **halt** on an RTDS gap
 rather than interpolate or backfill; no missing history may be fabricated
 (work-plan `WP-100` acceptance; §8.3).
 
+**Correction, 2026-10-05 (`RTDS-RETIRE`; ruling `V3-C13`; facts recorded by
+`VENUE-3` and `VENUE-SETL-1`): RTDS's 30-second window has no PolyBolt
+replacement, and this platform no longer ingests RTDS TWAP.** The text above
+is unedited; it records the venue as verified on 2026-08-24. Since then, by
+the dated reports and with nothing asserted on this ADR's own authority:
+
+1. **The 30-second window (`crypto_prices_twap_thirty`) is gone with RTDS.**
+   The venue moved its reference/TWAP prices from public RTDS to the
+   authenticated PolyBolt service ("Reference-price channels require CLOB API
+   credentials"). Its migration table maps `crypto_prices_twap_thirty` to "No
+   PolyBolt replacement for the 30-second window". It deprecated the legacy
+   RTDS price topics, with removal planned "one month after the `0.11.0`
+   release": about 2026-10-23 by the report's arithmetic, which is not a date
+   the venue states. The Chainlink TWAP page this section's source cites is
+   gone, behind a 308 redirect (`docs/venue/verified-2026-09-30.md` E-09 to
+   E-11, conflict C-13, U-20).
+2. **Polymarket's resolution channel publishes only 60 s.** PolyBolt's
+   `price.crypto.twap`, "Chainlink time-weighted average prices used by crypto
+   up/down market resolution (gated)", documents `window_seconds` as
+   "Averaging window of the TWAP series. Only 60 exists today." Polymarket's
+   changelog moved the 5-minute markets from the 30-second lookback to a
+   60-second one on 2026-08-14 (`docs/venue/verified-2026-10-04.md` F-24,
+   F-25).
+3. **Chainlink still lists a 30 s stream, which the rules do not name.**
+   Chainlink's Data Streams directory shows both
+   `BTC/USD-Streams-TWAP-60s-mainnet-production` and
+   `BTC/USD-Streams-TWAP-30s-mainnet-production` as `live`. The market rules
+   name `btc-usd-twap-60s-streams`, and matching that name to the 60 s
+   directory entry is an inference (`docs/venue/verified-2026-10-04.md` F-32,
+   U-31). The directory documents the streams' identity, not their values, and
+   reading the 60 s stream's values needs a Chainlink account, a credential
+   this repository may not hold. This platform uses neither stream: Chainlink
+   Data Streams is a paid feed, which ruling `V3-C13` declined.
+4. **Ruling `V3-C13` (the user, 2026-10-04): the free route only.** No
+   credential is used for prices, and no paid feed is bought. `RTDS-RETIRE`
+   therefore retired the gateway's RTDS producer: the data gateway refuses an
+   `rtds` block at startup with a dated reason, and every reader of RTDS data
+   recorded before then is unchanged. PAPER positions settle from each
+   market's public resolution (`MarketResolved`). An open or close reference
+   comes from Gamma's `eventMetadata.priceToBeat`/`finalPrice`, observed and
+   undocumented fields (`VENUE-SETL-1`) that are never presented as
+   documented.
+
+What this means for the two binding rules. This correction adds no rule and
+widens neither. Rule 1 keeps its scope and its wording: it governs a
+settlement spec "whose `resolution_source` is the RTDS TWAP feed", and the
+windows it lists (30 or 60) are that feed's as of the 2026-08-24
+verification. This platform no longer ingests the RTDS TWAP feed for any
+window: its 30-second topic has no PolyBolt replacement, its legacy topics are
+deprecated with removal planned (U-20), and the gateway refuses an `rtds`
+block. Chainlink's 30 s stream is a different source: rule 1 does not reach
+it, this correction makes no ruling on a spec that names it, and it is unused
+under `V3-C13`. The one documented resolution window is 60 s (F-24, F-25),
+and this platform ingests no documented feed of it: PolyBolt's
+`price.crypto.twap` needs CLOB API credentials and Chainlink's 60 s stream
+needs an account, both unused under `V3-C13`, and the legacy RTDS 60-second
+topic is no longer ingested. Rule 2 (exact decimals) and the no-replay halt
+above stand for RTDS data recorded before the retirement. This correction does
+not edit `packages/settlement`'s `RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24`
+(`[30, 60]`), a dated record of the 2026-08-24 verification that
+`verified-2026-09-30.md` E-10 names for its owner.
+
 ### 7. Neg-risk markets are recorded, not modeled, in v1
 
 Verified (venue report §7, §10.2): negative risk is exposed as

@@ -28,18 +28,8 @@ export interface SubscriptionPlan {
   readonly binanceSubscriptions: readonly BinanceStreamSubscription[];
   /** Venue-native Coinbase product ids, passed through opaquely. */
   readonly coinbaseProductIds: readonly string[];
-  /** RTDS window subscriptions, exactly as configured. */
-  readonly rtdsSubscriptions: readonly {
-    readonly windowSeconds: 30 | 60;
-    readonly symbols?: readonly string[];
-  }[];
-  /**
-   * The RTDS symbols the gateway publishes (lowercase). A multi-symbol
-   * subscription receives every symbol; updates outside this set are counted
-   * and not published (WP-100 consumer obligation: filter on
-   * `payload.symbol`).
-   */
-  readonly rtdsPlannedSymbols: ReadonlySet<string>;
+  // No RTDS plan: the RTDS feed was retired by `RTDS-RETIRE` (2026-10-05,
+  // ruling V3-C13), and the configuration door refuses an `rtds` block.
 }
 
 export function planSubscriptions(config: GatewayConfig): SubscriptionPlan {
@@ -66,17 +56,5 @@ export function planSubscriptions(config: GatewayConfig): SubscriptionPlan {
     polymarketTokenIds: tokenIds,
     binanceSubscriptions,
     coinbaseProductIds: config.coinbase === undefined ? [] : [...config.coinbase.productIds],
-    rtdsSubscriptions:
-      config.rtds === undefined
-        ? []
-        : config.rtds.subscriptions.map((subscription) => ({
-            windowSeconds: subscription.windowSeconds,
-            ...(subscription.symbols === undefined ? {} : { symbols: subscription.symbols }),
-          })),
-    rtdsPlannedSymbols: new Set(
-      config.rtds === undefined
-        ? []
-        : config.rtds.plannedSymbols.map((symbol) => symbol.toLowerCase()),
-    ),
   };
 }
