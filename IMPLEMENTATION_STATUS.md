@@ -61,6 +61,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-290` is Complete (2026-10-04, `7a53988`); see [Work packages](#work-packages). `WP-320`'s dependencies are now met (`WP-260`, `WP-290`, `WP-310`; ADR-033 Accepted for D1–D4 and D6).
 - `WP-320` is Complete (2026-10-05, `ed6e5a0`); see [Work packages](#work-packages). `WP-330` (the independent emergency CLI) is unblocked: `WP-260`, `WP-290` and `WP-320` are done.
 - `WP-330` is Complete (2026-10-05, `c1e6909`); see [Work packages](#work-packages). `WP-340`, the last Wave 3 package, is unblocked.
+- **`WP-340`**: Ready (authorized) 2026-10-05 under the Wave 3 authorization; its dependencies (`WP-270` to `WP-330`) are met. It covers live-micro fault-injection verification: a mock-venue chaos suite over the real Wave 3 packages, and a security and recovery report. Tests and docs only, PAPER only. Paths: `test/fault-injection/live/**`, `test/e2e/live-mock/**` and `docs/experiments/phase-3-verification.md`. Verifiers: Opus and gpt-6-astra, reconciled.
 - `CI-5` is Complete (2026-10-05, `31b668d`); see [Work packages](#work-packages). CI now runs the OMS and reconciliation fault suites and the control-api PostgreSQL suite.
 - `CKPT-1` is Complete (2026-10-03, `891ccdd`); see [Work packages](#work-packages). It closes `DURABLE-1` LOW-3; residual `CKPT1-PG-RNG-STATUS` is open.
 - `TC-LOWS-1` is Complete (2026-10-04, `9033743`); see [Work packages](#work-packages). It closes `CO2N1-LOWS`, and trims `CADENCE1-LOWS` and `PROV1-LOWS`.
@@ -219,6 +220,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `FLAKE-KS-1` | Fix the kill-switch engage flake in CI step 7/7 (one test file) | Complete (2026-10-05) | `f66201e` | [FLAKE-KS-1](docs/handoffs/FLAKE-KS-1.md) |
 | `AUDIT-SWEEP` | Remove the latent audit-bound race from control-api tests (tests only) | Complete (2026-10-05) | `6044450` | [AUDIT-SWEEP](docs/handoffs/AUDIT-SWEEP.md) |
 | `WP-330` | Independent emergency operations CLI (Wave 3, PAPER only) | Complete (2026-10-05) | `c1e6909` | [WP-330](docs/handoffs/WP-330.md) |
+| `WP-340` | Live-micro fault-injection verification (Wave 3, PAPER only) | **Ready (authorized)** 2026-10-05 | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
 | `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
