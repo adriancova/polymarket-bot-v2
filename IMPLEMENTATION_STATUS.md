@@ -56,6 +56,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `ROLLOVER-1` is Complete (2026-10-05, `ae11daa`); see [Work packages](#work-packages). One run admits each reviewed window and spans many windows. Its owed governance records are in `ROLLOVER1-OWED`.
 - `RTDS-RETIRE` is Complete (2026-10-05, `81f683a`); see [Work packages](#work-packages). The gateway refuses any `rtds` key; the historical readers are kept.
 - `FLAKE-KS-1` is Complete (2026-10-05, `f66201e`); see [Work packages](#work-packages). It closes `FLAKE-KILLSWITCH-ENGAGE`.
+- **`AUDIT-SWEEP`**: Ready (authorized) 2026-10-05. It handles `AUDIT-BOUND-SWEEP`: it classifies every control-api test's audit bound against real or asynchronous I/O and fixes the at-risk ones as `FLAKE-KS-1` did. Tests only. Verifier: gpt-6-astra.
 - `GOV-NOTES-3` is Complete (2026-10-05, `c10e76e`); see [Work packages](#work-packages). It closes `ROLLOVER1-OWED`.
 - `WP-290` is Complete (2026-10-04, `7a53988`); see [Work packages](#work-packages). `WP-320`'s dependencies are now met (`WP-260`, `WP-290`, `WP-310`; ADR-033 Accepted for D1–D4 and D6).
 - `WP-320` is Complete (2026-10-05, `ed6e5a0`); see [Work packages](#work-packages). `WP-330` (the independent emergency CLI) is unblocked: `WP-260`, `WP-290` and `WP-320` are done.
