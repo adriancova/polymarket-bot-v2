@@ -14,7 +14,8 @@
  * Nothing here reaches a network, a database, a key or a venue: every port
  * is a fake, and the network tripwire guards every file. The REAL-PostgreSQL
  * half (`postgres/`, Docker) is excluded here and has its own config
- * (`postgres/vitest.config.ts`).
+ * (`postgres/vitest.config.ts`); the same script runs it after this one (r2
+ * O3), so the script needs Docker.
  */
 
 import { dirname, resolve } from "node:path";

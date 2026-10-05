@@ -18,7 +18,7 @@ const OTHER_MARKET = "0190a3e0-0000-7000-8000-00000000000d";
 const INSTANCE = "0190a3e0-0000-7000-8000-00000000000a";
 
 function known(rows: readonly unknown[] = []): KillSwitchSnapshot {
-  return { known: true, effects: killSwitchEffects(foldKillSwitchRows(rows, () => true), "acct-1"), readStartedAtMs: 0 };
+  return { known: true, effects: killSwitchEffects(foldKillSwitchRows(rows, () => true, () => true), "acct-1"), readStartedAtMs: 0 };
 }
 
 function inputs(overrides: Partial<GateInputs> = {}): GateInputs {
@@ -269,5 +269,56 @@ describe("the submission fence in front of the venue port", () => {
     const { venue } = fakeVenue();
     const fenced = fenceVenuePort({ ...venue, postOrders: async () => ["ONLY_ONE", "EXTRA", "MORE"] }, () => ({ permitted: true, reasons: [] }), refusals, classifier);
     expect(await fenced.postOrders([{ id: "entry#1" }, { id: "elsewhere#2" }])).toEqual(["ONLY_ONE", "EXTRA", "MORE"]);
+  });
+
+  it("r2 X3: every placement handed to the venue is reported to the tracker with its scope(s) before the call, and settled after it — answered, rejected or thrown; a refused one is never reported", async () => {
+    const { venue } = fakeVenue();
+    const events: string[] = [];
+    let next = 0;
+    const tracker = {
+      started: (scopes: readonly PlacementScope[]): unknown => {
+        next += 1;
+        events.push(`started#${String(next)}:${scopes.map((scope) => scope.instanceId === INSTANCE ? "mine" : "other").join(",")}`);
+        return next;
+      },
+      settled: (handle: unknown): void => {
+        events.push(`settled#${String(handle)}`);
+      },
+    };
+    let failing = false;
+    const fenced = fenceVenuePort(
+      {
+        ...venue,
+        postOrder: async (order) => {
+          events.push(`post:${order.id}`);
+          if (failing) throw new Error("socket hang up (synthetic)");
+          return `ACCEPTED:${order.id}`;
+        },
+      },
+      (scope) => ({ permitted: scope.marketId === MARKET, reasons: scope.marketId === MARKET ? [] : ["REFUSED"] }),
+      refusals,
+      classifier,
+      tracker,
+    );
+    expect(await fenced.postOrder({ id: "entry#1" })).toBe("ACCEPTED:entry#1");
+    expect(await fenced.postOrder({ id: "elsewhere#2" })).toBe("NOT_SENT(REFUSED)");
+    failing = true;
+    await expect(fenced.postOrder({ id: "reduce#3" })).rejects.toThrow("socket hang up");
+    expect(await fenced.postOrders([{ id: "entry#4" }, { id: "reduce#5" }])).toEqual(["ACCEPTED:entry#4", "ACCEPTED:reduce#5"]);
+    expect(events).toEqual(["started#1:mine", "post:entry#1", "settled#1", "started#2:mine", "post:reduce#3", "settled#2", "started#3:mine,mine", "settled#3"]);
+  });
+
+  it("r2 X3: a placement the tracker cannot track is never sent (PLACEMENT_UNTRACKED), a batch neither", async () => {
+    const { calls, venue } = fakeVenue();
+    const throwing = {
+      started: (): unknown => {
+        throw new Error("tracker broken");
+      },
+      settled: (): void => undefined,
+    };
+    const fenced = fenceVenuePort(venue, () => ({ permitted: true, reasons: [] }), refusals, classifier, throwing);
+    expect(await fenced.postOrder({ id: "entry#1" })).toBe("NOT_SENT(PLACEMENT_UNTRACKED)");
+    expect(await fenced.postOrders([{ id: "entry#1" }, { id: "reduce#2" }])).toEqual(["NOT_SENT(PLACEMENT_UNTRACKED)", "NOT_SENT(PLACEMENT_UNTRACKED)"]);
+    expect(calls).toEqual([]);
   });
 });

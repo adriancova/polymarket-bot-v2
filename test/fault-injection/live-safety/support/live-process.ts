@@ -20,7 +20,12 @@
  * as a live root does before it opens the OMS: WP-290's harness opens the OMS
  * over `u.store`, so the monitor wraps that store's `apply` and `load` before
  * `boot`. `holdStore` holds every later `apply` unanswered (a hung persistence
- * call).
+ * call). Its reservation port and cipher are timed too (r2 X4): the harness
+ * calls `u.inventory.service.reserve|consume|release` and
+ * `u.cipher.encrypt|decrypt` at call time, so the monitor's wrappers are
+ * installed IN FRONT of those methods, and a test that replaces one (a
+ * reservation journal append that never acknowledges) replaces what the
+ * wrapper calls — the port beneath the instrumentation, as in a live root.
  */
 
 import { readFileSync } from "node:fs";
@@ -32,6 +37,7 @@ import {
   FakeBodyPort,
   FakeCancels,
   FakeKillSwitchReader,
+  FakeReleaseFinality,
   HEALTH_MAX_AGE,
   LIVE_CONTEXT,
   MemoryFencingStore,
@@ -78,6 +84,8 @@ export interface LiveProcess {
   readonly geoblock: FakeBodyPort;
   readonly closedOnly: FakeBodyPort;
   readonly cancels: FakeCancels;
+  /** The composition's positive release finality (r2 X2): every release final unless the test says otherwise. */
+  readonly releaseFinality: FakeReleaseFinality;
   readonly journal: RecordingJournal;
   readonly alerts: RecordingAlerts;
   readonly log: EventLog;
@@ -144,6 +152,19 @@ export async function liveProcess(options: LiveProcessOptions = {}): Promise<Liv
   });
   u.store.apply = timed.apply;
   u.store.load = timed.load;
+  instrumentInFront(u.inventory.service, ["reserve", "consume", "release"], (inner) =>
+    omsProgress.reservations({
+      reserve: (input: unknown) => inner.reserve(input),
+      consume: (input: unknown) => inner.consume(input),
+      release: (input: unknown) => inner.release(input),
+    }),
+  );
+  instrumentInFront(u.cipher, ["encrypt", "decrypt"], (inner) =>
+    omsProgress.cipher({
+      encrypt: (plaintext: string) => inner.encrypt(plaintext),
+      decrypt: async (payload: unknown) => String(await inner.decrypt(payload)),
+    }),
+  );
   const p = await boot(u);
   const startupCalledAt = time.now;
   const startup = await p.coordinator.reconcile();
@@ -157,6 +178,7 @@ export async function liveProcess(options: LiveProcessOptions = {}): Promise<Liv
   const geoblock = new FakeBodyPort(NOT_BLOCKED);
   const closedOnly = new FakeBodyPort({ closed_only: false });
   const cancels = new FakeCancels();
+  const releaseFinality = new FakeReleaseFinality();
   const journal = new RecordingJournal();
   const alerts = new RecordingAlerts();
   const log = new EventLog();
@@ -168,7 +190,7 @@ export async function liveProcess(options: LiveProcessOptions = {}): Promise<Liv
     timers: time,
     fencing: { store, ttlMs: 30_000, renewIntervalMs: 5_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 },
     health: { maxAgeMs: HEALTH_MAX_AGE, eventLoop: { intervalMs: 500, maxLagMs: 250 } },
-    killSwitch: { reader, refreshIntervalMs: 1_000, cancels, releaseSettleMs: RELEASE_SETTLE_MS },
+    killSwitch: { reader, refreshIntervalMs: 1_000, cancels, releaseSettleMs: RELEASE_SETTLE_MS, releaseFinality },
     eligibility: { geoblock, closedOnly, refreshIntervalMs: 30_000, maxAgeMs: 60_000 },
     oms,
     omsProgress,
@@ -215,6 +237,7 @@ export async function liveProcess(options: LiveProcessOptions = {}): Promise<Liv
     geoblock,
     closedOnly,
     cancels,
+    releaseFinality,
     journal,
     alerts,
     log,
@@ -259,4 +282,34 @@ export async function liveProcess(options: LiveProcessOptions = {}): Promise<Liv
   await live.step(500);
   if (options.startController !== false) controller.start();
   return live;
+}
+
+/**
+ * Install `wrap`'s timed methods IN FRONT of `target`'s named methods: reading `target[name]` yields the timed method,
+ * and assigning `target[name] = replacement` replaces what the timed method calls (r2 X4; module header).
+ */
+function instrumentInFront<TName extends string, TWrapped extends Record<TName, unknown>>(
+  target: object,
+  names: readonly TName[],
+  wrap: (inner: Record<TName, (...args: unknown[]) => Promise<unknown>>) => TWrapped,
+): void {
+  const methods = target as Record<string, unknown>;
+  const inner: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+  for (const name of names) {
+    const original = methods[name];
+    if (typeof original !== "function") throw new Error(`${name} is not a method`);
+    inner[name] = (original as (...args: unknown[]) => Promise<unknown>).bind(target);
+  }
+  const wrapped = wrap(inner as Record<TName, (...args: unknown[]) => Promise<unknown>>);
+  for (const name of names) {
+    Object.defineProperty(target, name, {
+      configurable: true,
+      enumerable: true,
+      get: () => wrapped[name],
+      set: (replacement: unknown) => {
+        if (typeof replacement !== "function") throw new Error(`${name} must stay a method`);
+        inner[name] = replacement as (...args: unknown[]) => Promise<unknown>;
+      },
+    });
+  }
 }

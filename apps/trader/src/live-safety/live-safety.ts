@@ -26,13 +26,15 @@
  * const safety = createLiveSafety({
  *   runModeContext,                                        // RUN_MODE, MAX_RUN_MODE, ALLOW_REAL_ORDERS (r1 I8)
  *   oms: { get faulted() { … oms … }, orders: …, requestOrderReconciliation: … }, // a view bound to `oms` once open
+ *   killSwitch: { …, releaseSettleMs, releaseFinality },   // r2 X2: POSITIVE evidence a release was applied
+ *   fencing: { ttlMs, … },                                // r2 X1: ttlMs ≤ FENCING_LEASE_MAX_TTL_MS, the bound every successor waits out
  *   omsProgress, accountRef, …ports,
  * });
- * oms = await OrderManager.open({
- *   store: omsProgress.store(store),                        // every persistence call timed (r1 I5)
- *   venue: safety.fenceVenue(secureClient, refusals, classifier), // per-order scope at every transmission (r1 I2)
+ * oms = await OrderManager.open(omsProgress.dependencies({   // r2 X4: store, reservations AND cipher timed
+ *   store, reservations, cipher,
+ *   venue: safety.fenceVenue(secureClient, refusals, classifier), // per-order scope (r1 I2); placements tracked (r2 X3)
  *   …,
- * });
+ * }));
  * let fence = await safety.acquireFence();                  // ADR-008 §1–§2; LAPSED_WAITING: ask again after remainingMs
  * const controller = createOrderHeartbeatController({      // polymarket-secure, ADR-033 D4
  *   runModeContext, transport,                             // the transport: ADR-033 D5, open
@@ -69,30 +71,54 @@
  * | --- | --- |
  * | MARKET_DATA, USER_DATA | the composition: {@link LiveSafety.recordProof} on fresh evidence |
  * | EVENT_LOOP | this class's event-loop probe (a timer that must fire on time) |
- * | OMS | the OMS not faulted, AND its progress monitor (`oms-progress.ts`): proved at the start of its oldest store call still pending, so a hung persistence call ages it out (r1 I5) |
+ * | OMS | the OMS not faulted, AND its progress monitor (`oms-progress.ts`): nothing until its store, reservation port AND cipher are all instrumented (r2 X4), then proved at the start of its oldest call still pending on any of them, so a hung persistence call ages it out (r1 I5) |
  * | DATABASE | every fence renewal and kill-switch read that succeeds; each failure fails it |
  * | RECONCILER | ONLY a reconcile report with a run that PASSED and resumed, proved at the instant before the `reconcile()` call that ran it; a FAILED or QUARANTINED run proves nothing, so a reconciler that keeps failing ages the input out and the heartbeat stops (r1 I3; §9.9 "Account state unknown → Stop heartbeat") |
  * | KILL_SWITCH | the latest kill-switch read: succeeded, and not ending trading |
  *
- * ## Kill-switch cancels
+ * ## Kill-switch cancels: an OBLIGATION, held until the scope is quiescent (r1 I2; r2 X3)
  *
  * After every successful read, each cancel an engaged switch asks for
- * (`kill-switch.ts`) is handed to the injected {@link KillSwitchCancelPort}
- * until the port answers `true`, and then ONCE MORE, at the first read that
- * starts at least one refresh interval after that acceptance (the confirming
- * sweep, r1 I2): it withdraws an order whose transmission was already in
- * flight when the switch was observed and landed after the first sweep.
- * Every order transmitted after the switch was observed is refused by the
- * per-order fence (`fenced-venue.ts`).
+ * (`kill-switch.ts`) is a standing obligation, discharged through the
+ * injected {@link KillSwitchCancelPort} (`true` = accepted):
+ *
+ * | Pass | When |
+ * | --- | --- |
+ * | `FIRST` | at every read until the port first accepts it |
+ * | `CONFIRMING` | once, at the first read at least one refresh interval after the latest acceptance (r1 I2) |
+ * | `AFTER_SETTLE` | at the first read after a placement IN THE DIRECTIVE'S SCOPE settled at or after the latest accepted request STARTED (r2 X3), whatever the spacing |
+ * | `RETAINED` | after the confirming pass, at most once per refresh interval, while a placement in the scope is still pending, or while the OMS shows an order in the scope that rests or may rest at the venue (r2 X3) |
+ *
+ * Why: every order transmitted AFTER the switch was observed is refused by the
+ * per-order fence (`fenced-venue.ts`), but a placement handed to the venue
+ * BEFORE it — queued beneath the fence (WP-310's rate-limit ladder ranks
+ * `EMERGENCY_CANCEL` above `NEW_ORDER`, so a queued placement can be granted
+ * after the cancels), or simply slow — can land after any fixed number of
+ * sweeps. At round 1 the obligation ended after the confirming sweep, and such
+ * a placement rested indefinitely under a MARKET or STRATEGY_INSTANCE
+ * FULL_HALT while the account's heartbeat kept it alive (r2 X3, reproduced
+ * with the real OMS). The fenced venue now reports every placement it hands
+ * to the venue until it settles ({@link LiveSafety.fenceVenue}); a placement
+ * still pending keeps the obligation open, and its settling — accepted,
+ * refused or unknown — calls for another cancel requested after it. Venue
+ * evidence closes it: for MARKET and account-wide directives the OMS's own
+ * view (`SafetyOms.orders()`, which WP-270 keeps from venue answers and
+ * reconciliation) must show no order in the scope in a state that rests or
+ * may rest at the venue (`SENDING`, `ACKNOWLEDGED`, `LIVE`, `DELAYED`,
+ * `PARTIALLY_FILLED`, `CANCEL_PENDING`, `SUBMISSION_UNKNOWN`,
+ * `RECONCILING`); an unreadable view keeps it open. WP-270's order view
+ * carries no strategy instance, so a STRATEGY_INSTANCE directive is held by
+ * its tracked placements only (disclosed). An obligation is dropped when its
+ * switch is no longer engaged.
  */
 
 import type { EligibilityVerdict, ClosedOnlyPort, GeoblockPort } from "./eligibility.js";
 import { VenueEligibility } from "./eligibility.js";
 import { evaluateLiveGate, type GateDecision, type GateRequest } from "./entry-gate.js";
-import { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementVenuePort } from "./fenced-venue.js";
+import { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementScope, type PlacementTracker, type PlacementVenuePort } from "./fenced-venue.js";
 import { assertLiveFencingContext, FencingAuthority, type AcquireResult, type FencingLeasePort, type RunModeContext } from "./fencing-authority.js";
 import { EventLoopProbe, HealthLease, ProofBoard, type HealthInput, type HealthProofReading, type HealthVerdict } from "./health-lease.js";
-import { KillSwitchMonitor, type CancelDirective, type KillSwitchReader, type KillSwitchSnapshot } from "./kill-switch.js";
+import { KillSwitchMonitor, type CancelDirective, type KillSwitchReader, type KillSwitchReleaseFinality, type KillSwitchSnapshot } from "./kill-switch.js";
 import { LapseRecovery } from "./lapse-recovery.js";
 import type { OmsProgressMonitor } from "./oms-progress.js";
 import type { HeartbeatView, LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyTimers } from "./ports.js";
@@ -102,9 +128,33 @@ export interface KillSwitchCancelPort {
   cancel(directive: CancelDirective): Promise<unknown>;
 }
 
+/** The OMS order states that rest, or may rest, at the venue: an order in one keeps a cancel obligation open (r2 X3). */
+export const VENUE_RESTING_OR_UNKNOWN_STATES = Object.freeze([
+  "SENDING",
+  "ACKNOWLEDGED",
+  "LIVE",
+  "DELAYED",
+  "PARTIALLY_FILLED",
+  "CANCEL_PENDING",
+  "SUBMISSION_UNKNOWN",
+  "RECONCILING",
+] as const);
+
+/** A kill-switch cancel obligation (module header, "Kill-switch cancels"). */
+interface CancelObligation {
+  /** Monotonic instant the latest ACCEPTED request STARTED (read before the port was called). */
+  lastRequestAtMs: number;
+  /** Monotonic instant the latest acceptance was seen (the port answered). */
+  lastAcceptedAtMs: number;
+  /** Whether the confirming pass has been accepted. */
+  confirmed: boolean;
+}
+
 /** The sources of an explicit heartbeat stop (ADR-033 D1 item 4). */
 export const HEARTBEAT_STOP_SOURCES = Object.freeze(["INCIDENT_CONTROLLER", "OPS_CLI", "LIVE_FENCING_CONFLICT"] as const);
 export type HeartbeatStopSource = (typeof HEARTBEAT_STOP_SOURCES)[number];
+
+type CancelPass = "FIRST" | "CONFIRMING" | "AFTER_SETTLE" | "RETAINED";
 
 /**
  * The health inputs the composition proves itself with {@link LiveSafety.recordProof}; the others are this class's.
@@ -144,13 +194,21 @@ export interface LiveSafetyOptions {
     readonly cancels: KillSwitchCancelPort;
     /**
      * How long a release row must have been visible before it releases (`kill-switch.ts`, r1 I6). It must exceed the
-     * control plane's `auditAppendTimeoutMs` plus the time its VOID record takes to land.
+     * control plane's `auditAppendTimeoutMs` plus the time its VOID record usually takes to land.
      */
     readonly releaseSettleMs: number;
+    /**
+     * POSITIVE evidence that the control plane applied a release (`kill-switch.ts`, r2 X2). Required: a settled,
+     * unvoided release row with no such evidence stays enforced as the switch it releases, in full.
+     */
+    readonly releaseFinality: KillSwitchReleaseFinality;
   };
   readonly eligibility: { readonly geoblock: GeoblockPort; readonly closedOnly: ClosedOnlyPort; readonly refreshIntervalMs: number; readonly maxAgeMs: number };
   readonly oms: SafetyOms;
-  /** The OMS's port-call progress (`oms-progress.ts`): its store must have been wrapped by it (r1 I5). */
+  /**
+   * The OMS's port-call progress (`oms-progress.ts`): its store, reservation port and cipher must all have been wrapped
+   * by it (r1 I5; r2 X4), or the OMS input proves nothing.
+   */
   readonly omsProgress: OmsProgressMonitor;
   readonly coordinator: SafetyCoordinator;
   readonly recovery: { readonly notRunPollMs: number; readonly failedRunSpacingMs: number };
@@ -193,9 +251,17 @@ export class LiveSafety {
   readonly #recovery: LapseRecovery;
   readonly #stops = new Map<HeartbeatStopSource, string>();
   readonly #haltedMarkets = new Set<string>();
-  /** Per cancel key: when the port first accepted it, and whether the confirming sweep has been accepted too. */
-  readonly #cancels = new Map<string, { readonly acceptedAtMs: number; confirmed: boolean }>();
+  /** Per cancel key (switch event and directive): its obligation, once the port has first accepted it. */
+  readonly #cancels = new Map<string, CancelObligation>();
   readonly #cancelsInFlight = new Set<string>();
+  /** Placements the fenced venue has handed to the venue and that have not settled: handle → their scopes (r2 X3). */
+  readonly #placements = new Map<number, readonly PlacementScope[]>();
+  #nextPlacement = 0;
+  /** When a placement last settled (monotonic): any, per market, per strategy instance (r2 X3). */
+  #lastSettleAny = Number.NEGATIVE_INFINITY;
+  readonly #lastSettleByMarket = new Map<string, number>();
+  readonly #lastSettleByInstance = new Map<string, number>();
+  readonly #tracker: PlacementTracker;
   #accountHalted = false;
   /** Whether the latest kill-switch read succeeded (true before the first: the first failure pages). */
   #killSwitchReadable = true;
@@ -238,12 +304,17 @@ export class LiveSafety {
     if (options.killSwitch.refreshIntervalMs >= options.health.maxAgeMs.KILL_SWITCH) throw new LiveSafetyConfigurationError("killSwitch.refreshIntervalMs");
     if (options.eligibility.refreshIntervalMs >= options.eligibility.maxAgeMs) throw new LiveSafetyConfigurationError("eligibility.refreshIntervalMs");
     interval(options.killSwitch.releaseSettleMs, "killSwitch.releaseSettleMs");
+    const finality: unknown = options.killSwitch.releaseFinality;
+    if (typeof finality !== "object" || finality === null || typeof (finality as { isFinal?: unknown }).isFinal !== "function") {
+      throw new LiveSafetyConfigurationError("killSwitch.releaseFinality");
+    }
     // A read slower than one refresh interval is abandoned by the next refresh: a hung read never freezes the state.
     this.#killSwitch = new KillSwitchMonitor({
       reader: options.killSwitch.reader,
       clock: options.clock,
       accountRef: options.accountRef,
       releaseSettleMs: options.killSwitch.releaseSettleMs,
+      releaseFinality: options.killSwitch.releaseFinality,
       abandonAfterMs: options.killSwitch.refreshIntervalMs,
     });
     this.#eligibility = new VenueEligibility({
@@ -292,6 +363,12 @@ export class LiveSafety {
       },
     });
 
+    this.#tracker = Object.freeze({
+      started: (scopes: readonly PlacementScope[]): unknown => this.#placementStarted(scopes),
+      settled: (handle: unknown): void => {
+        this.#placementSettled(handle);
+      },
+    });
     this.heartbeatGate = Object.freeze({ evaluate: () => this.#heartbeatGate() });
     this.heartbeatIdSink = Object.freeze({ persist: (heartbeatId: string) => this.#fence.recordHeartbeatId(heartbeatId) });
     this.onHeartbeatEvent = (event: unknown): void => {
@@ -379,14 +456,20 @@ export class LiveSafety {
   /**
    * The OMS's venue port behind the submission fence (`fenced-venue.ts`): every signing and every transmission (batch
    * members one by one) is judged by {@link LiveSafety.gate} with the order's own intent, market and instance, from
-   * `classifier` (r1 I2).
+   * `classifier` (r1 I2); every placement handed to the venue is tracked until it settles, for the kill-switch cancel
+   * obligations (r2 X3).
    */
   fenceVenue<TRequest, TSign, TOrder, TPlacement, TCancel>(
     venue: PlacementVenuePort<TRequest, TSign, TOrder, TPlacement, TCancel>,
     refusals: FenceRefusals<TSign, TPlacement>,
     classifier: PlacementClassifier<TRequest, TSign, TOrder>,
   ): PlacementVenuePort<TRequest, TSign, TOrder, TPlacement, TCancel> {
-    return fenceVenuePort(venue, (scope) => this.gate({ kind: scope.intent, marketId: scope.marketId, instanceId: scope.instanceId }), refusals, classifier);
+    return fenceVenuePort(venue, (scope) => this.gate({ kind: scope.intent, marketId: scope.marketId, instanceId: scope.instanceId }), refusals, classifier, this.#tracker);
+  }
+
+  /** How many placements handed to the venue through {@link LiveSafety.fenceVenue} have not settled. */
+  pendingPlacements(): number {
+    return this.#placements.size;
   }
 
   /** The fence a live submission attempt is persisted with (§9.18), while held. */
@@ -563,18 +646,33 @@ export class LiveSafety {
     if (result === "LOST") this.#record({ kind: "FENCE_LOST", reason: this.#fence.lossReason() ?? "RENEW_LOST", atMs: this.#now() ?? 0 });
   }
 
+  /**
+   * Discharge the engaged switches' cancel obligations (module header, "Kill-switch cancels"). Each obligation is
+   * asked once per read, its passes in the order of the table; an obligation whose switch is no longer engaged is
+   * dropped.
+   */
   async #enforceCancels(): Promise<void> {
     const snapshot = this.#killSwitch.snapshot();
     if (!snapshot.known) return;
     const readAtMs = snapshot.readStartedAtMs;
+    const spacing = this.#options.killSwitch.refreshIntervalMs;
+    const current = new Set<string>();
     for (const { directive, killSwitchEventId } of snapshot.effects.cancels) {
       const key = `${killSwitchEventId}:${directive.scope}:${directive.scope === "MARKET" ? directive.marketId : directive.scope === "STRATEGY_INSTANCE" ? directive.instanceId : ""}`;
+      if (current.has(key)) continue;
+      current.add(key);
+      if (this.#cancelsInFlight.has(key)) continue;
       const state = this.#cancels.get(key);
-      if (this.#cancelsInFlight.has(key) || state?.confirmed === true) continue;
-      // The confirming sweep waits one refresh interval after the first acceptance (module header).
-      if (state !== undefined && readAtMs - state.acceptedAtMs < this.#options.killSwitch.refreshIntervalMs) continue;
-      const pass = state === undefined ? "FIRST" : "CONFIRMING";
+      let pass: CancelPass | null;
+      if (state === undefined) pass = "FIRST";
+      else if (this.#lastCoveredSettle(directive) >= state.lastRequestAtMs) pass = "AFTER_SETTLE";
+      else if (readAtMs - state.lastAcceptedAtMs < spacing) pass = null;
+      else if (!state.confirmed) pass = "CONFIRMING";
+      else if (this.#pendingCovered(directive) || this.#omsShowsResting(directive)) pass = "RETAINED";
+      else pass = null;
+      if (pass === null) continue;
       this.#cancelsInFlight.add(key);
+      const requestedAtMs = this.#now() ?? readAtMs;
       let accepted = false;
       try {
         accepted = (await this.#options.killSwitch.cancels.cancel(directive)) === true;
@@ -584,10 +682,85 @@ export class LiveSafety {
         this.#cancelsInFlight.delete(key);
       }
       if (accepted) {
-        if (state === undefined) this.#cancels.set(key, { acceptedAtMs: this.#now() ?? readAtMs, confirmed: false });
-        else state.confirmed = true;
+        const acceptedAtMs = this.#now() ?? requestedAtMs;
+        const latest = this.#cancels.get(key);
+        if (latest === undefined) {
+          this.#cancels.set(key, { lastRequestAtMs: requestedAtMs, lastAcceptedAtMs: acceptedAtMs, confirmed: false });
+        } else {
+          latest.lastRequestAtMs = Math.max(latest.lastRequestAtMs, requestedAtMs);
+          latest.lastAcceptedAtMs = Math.max(latest.lastAcceptedAtMs, acceptedAtMs);
+          if (pass === "CONFIRMING") latest.confirmed = true;
+        }
       }
       this.#record({ kind: "KILL_SWITCH_CANCEL_REQUESTED", directive: key, pass, accepted, atMs: this.#now() ?? 0 });
+    }
+    // A switch no longer engaged (released, or superseded by a newer row) carries no obligation.
+    for (const key of [...this.#cancels.keys()]) if (!current.has(key)) this.#cancels.delete(key);
+    this.#pruneSettles();
+  }
+
+  #placementStarted(scopes: readonly PlacementScope[]): number {
+    this.#nextPlacement += 1;
+    const handle = this.#nextPlacement;
+    this.#placements.set(handle, Object.freeze([...scopes]));
+    return handle;
+  }
+
+  #placementSettled(handle: unknown): void {
+    if (typeof handle !== "number") return;
+    const scopes = this.#placements.get(handle);
+    if (scopes === undefined) return;
+    this.#placements.delete(handle);
+    // Unreadable: +∞, so every obligation it may cover asks again.
+    const at = this.#now() ?? Number.POSITIVE_INFINITY;
+    this.#lastSettleAny = Math.max(this.#lastSettleAny, at);
+    for (const scope of scopes) {
+      this.#lastSettleByMarket.set(scope.marketId, Math.max(this.#lastSettleByMarket.get(scope.marketId) ?? Number.NEGATIVE_INFINITY, at));
+      this.#lastSettleByInstance.set(scope.instanceId, Math.max(this.#lastSettleByInstance.get(scope.instanceId) ?? Number.NEGATIVE_INFINITY, at));
+    }
+  }
+
+  /** When a placement the directive covers last settled. */
+  #lastCoveredSettle(directive: CancelDirective): number {
+    if (directive.scope === "ACCOUNT") return this.#lastSettleAny;
+    if (directive.scope === "MARKET") return this.#lastSettleByMarket.get(directive.marketId) ?? Number.NEGATIVE_INFINITY;
+    return this.#lastSettleByInstance.get(directive.instanceId) ?? Number.NEGATIVE_INFINITY;
+  }
+
+  /** Whether a placement the directive covers is still pending. */
+  #pendingCovered(directive: CancelDirective): boolean {
+    for (const scopes of this.#placements.values()) {
+      for (const scope of scopes) {
+        if (directive.scope === "ACCOUNT") return true;
+        if (directive.scope === "MARKET" && scope.marketId === directive.marketId) return true;
+        if (directive.scope === "STRATEGY_INSTANCE" && scope.instanceId === directive.instanceId) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Venue evidence: whether the OMS shows an order in the directive's scope that rests, or may rest, at the venue.
+   * Unreadable is "yes". WP-270's order view carries no strategy instance: an instance directive reads "no" here.
+   */
+  #omsShowsResting(directive: CancelDirective): boolean {
+    if (directive.scope === "STRATEGY_INSTANCE") return false;
+    try {
+      const resting: readonly string[] = VENUE_RESTING_OR_UNKNOWN_STATES;
+      return this.#options.oms
+        .orders()
+        .some((order) => resting.includes(order.state) && (directive.scope === "ACCOUNT" || order.marketId === directive.marketId));
+    } catch {
+      return true;
+    }
+  }
+
+  /** Settle times older than every obligation's latest request can no longer matter: forget them. */
+  #pruneSettles(): void {
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const state of this.#cancels.values()) oldest = Math.min(oldest, state.lastRequestAtMs);
+    for (const map of [this.#lastSettleByMarket, this.#lastSettleByInstance]) {
+      for (const [id, at] of map) if (at < oldest) map.delete(id);
     }
   }
 

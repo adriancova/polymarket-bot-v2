@@ -62,14 +62,15 @@ describe("the database is lost", () => {
     expect(live.safety.status().fence).toMatchObject({ held: false, reason: "EXPIRED" });
 
     // PostgreSQL returns. The stale grant is never renewed: only a new acquisition, with a higher token, restores it,
-    // and only after the process has waited out its own ended lease (r1 I1).
+    // and only after the process has waited out the bound on every lease (r1 I1; r2 X1).
     live.store.down = false;
     live.reader.failing = false;
     await live.step(6_000);
     expect(live.safety.status().fence).toMatchObject({ held: false, reason: "EXPIRED" });
     expect(live.store.attemptAccepted(fenceBefore)).toBe(false);
     expect((await live.safety.acquireFence()).kind).toBe("LAPSED_WAITING");
-    await live.step(32_000);
+    // r2 X1: the bound on every lease (one minute) plus the margin.
+    await live.step(62_000);
     const again = await live.safety.acquireFence();
     expect(again.kind).toBe("ACQUIRED");
     expect(again.kind === "ACQUIRED" ? BigInt(again.fence.fencingToken) : 0n).toBeGreaterThan(BigInt(fenceBefore?.fencingToken ?? "0"));

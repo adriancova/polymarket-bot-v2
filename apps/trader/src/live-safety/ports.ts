@@ -87,6 +87,13 @@ export type LiveSafetyRecord =
   | { readonly kind: "ENTRY_BLOCK_LIFTED"; readonly atMs: number; readonly epoch: number }
   | { readonly kind: "HEARTBEAT_STOP_ENGAGED"; readonly source: string; readonly reason: string; readonly atMs: number }
   | { readonly kind: "HEARTBEAT_STOP_RELEASED"; readonly source: string; readonly operatorRef: string; readonly atMs: number }
-  | { readonly kind: "KILL_SWITCH_CANCEL_REQUESTED"; readonly directive: string; readonly pass: "FIRST" | "CONFIRMING"; readonly accepted: boolean; readonly atMs: number }
+  | {
+      readonly kind: "KILL_SWITCH_CANCEL_REQUESTED";
+      readonly directive: string;
+      /** `live-safety.ts`, "Kill-switch cancels": the pass of the cancel obligation this request discharges (r2 X3). */
+      readonly pass: "FIRST" | "CONFIRMING" | "AFTER_SETTLE" | "RETAINED";
+      readonly accepted: boolean;
+      readonly atMs: number;
+    }
   | { readonly kind: "FENCE_ACQUIRED"; readonly fencingToken: string; readonly atMs: number }
   | { readonly kind: "FENCE_LOST"; readonly reason: string; readonly atMs: number };

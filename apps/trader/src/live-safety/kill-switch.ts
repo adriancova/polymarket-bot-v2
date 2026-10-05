@@ -14,24 +14,39 @@
  *   first and applies only if the append succeeded (`control-plane.ts`,
  *   "AUDIT FIRST, THEN APPLY"), so a switch an operator was told is engaged is
  *   already a row. No message can be "sent but not yet delivered".
- * - **A release is honoured only once it is SETTLED and not VOIDED** (r1,
- *   finding I6). The converse does NOT hold for a release: a
- *   `KILL_SWITCH_RELEASE` whose append outlives the control plane's bound
- *   (`auditAppendTimeoutMs`) is refused `503` and NOT applied — the switch
- *   stays engaged — yet its APPLIED row may still land in
- *   `ops.kill_switch_events` afterwards, and the control plane then appends a
- *   VOID record naming it (`voidsRecordId`) to `ops.config_change_audit`
- *   (`ControlPlane.#settledLate`; `PostgresControlAuditSink.append`). So the
- *   reader reports, per row, whether a VOID names it, and the monitor counts a
- *   release row as a release only when no VOID names it AND it has been seen,
- *   continuously, for `releaseSettleMs` on the monotonic clock before the read
- *   that judges it (the settle window covers the interval before a VOID lands;
- *   it is timed from first sight, not from `recorded_at`, so neither a
- *   database clock step nor a late commit shortens it). Until then a release
- *   row is enforced as the switch it releases (its `action` column), heartbeat
- *   stop included. Residual (disclosed): a late release whose VOID never lands
- *   (the control plane counts it as `LANDED_LATE` minus `VOIDED`) is honoured
- *   once the window has passed.
+ * - **A release is honoured only on POSITIVE evidence that the control plane
+ *   APPLIED it** (r1 I6; r2, finding X2). The converse of "written before it
+ *   takes effect" does NOT hold for a release: a `KILL_SWITCH_RELEASE` whose
+ *   append outlives the control plane's bound (`auditAppendTimeoutMs`) is
+ *   refused `503` and NOT applied — the switch stays engaged — yet its APPLIED
+ *   row may still land in `ops.kill_switch_events` afterwards. The control
+ *   plane then tries ONCE to append a VOID record naming it (`voidsRecordId`)
+ *   to `ops.config_change_audit` (`ControlPlane.#settledLate`;
+ *   `PostgresControlAuditSink.append`), best effort: an ordinary record, which
+ *   a full ordinary audit tier refuses, with no retry, and never written if
+ *   the control plane dies first or has no record source. The failures that
+ *   lose or delay the VOID are the same sink stalls that made the release
+ *   late, so "no VOID yet" is NOT evidence that the release was applied, at
+ *   any age (r2 X2: at round 1 a release whose VOID was late or missing was
+ *   honoured once `releaseSettleMs` had passed, while the control plane still
+ *   held GLOBAL FULL_HALT). Nothing in the rows tells an applied release from
+ *   a refused one whose VOID has not landed (the control plane writes no
+ *   finalization record, and `recorded_at − occurred_at` is not a safe
+ *   discriminator). So a release row counts as a release only when ALL of:
+ *   - no VOID names it (the reader's `voided` column is exactly `false`);
+ *   - it has been seen, continuously, for `releaseSettleMs` on the monotonic
+ *     clock before the read that judges it STARTED (timed from first sight,
+ *     not from `recorded_at`, so neither a database clock step nor a late
+ *     commit shortens it); and
+ *   - the injected {@link KillSwitchReleaseFinality} answers `true` for it:
+ *     POSITIVE evidence, bound by the composition, that the control plane
+ *     applied that exact release (e.g. a finalization record a control-plane
+ *     grant adds, or an operator's attestation of the control plane's `200`).
+ *     Anything else — `false`, a throw, no answer — is not final.
+ *   Until then a release row is enforced as the switch it releases (its
+ *   `action` column), heartbeat stop included: `PENDING` inside the settle
+ *   window (no cancel requested), `UNCONFIRMED` after it (enforced in full,
+ *   cancels included), `VOIDED` once a VOID names it (in full, for good).
  * - **It survives every restart** of the trader, the control API, or both:
  *   the state is re-derived from the rows on every read, never carried in
  *   memory.
@@ -103,6 +118,26 @@ export interface KillSwitchRow {
   readonly voided: boolean;
 }
 
+/** A release row, as {@link KillSwitchReleaseFinality} is asked about it. */
+export interface KillSwitchReleaseRef {
+  readonly killSwitchEventId: string;
+  readonly environment: string;
+  readonly scope: KillSwitchScope;
+  readonly scopeRef: string | null;
+}
+
+/**
+ * POSITIVE evidence that the control plane APPLIED a release (r2, X2; module header). `true` only when the
+ * composition holds such evidence for exactly this row: the control plane's own finalization of the release (no
+ * such record exists today: an `apps/control-api` grant is the follow-up), or an operator's attestation that the
+ * control plane answered this release `200`. Anything but the boolean `true`, and a throw, is "not final": the
+ * release stays enforced as the switch it releases. Synchronous and side-effect free: it is asked inside every
+ * read's fold.
+ */
+export interface KillSwitchReleaseFinality {
+  isFinal(release: KillSwitchReleaseRef): boolean;
+}
+
 /** Reads the latest kill-switch rows (`kill-switch-postgres.ts`). A throw or a rejection is a failed read. */
 export interface KillSwitchReader {
   read(): Promise<readonly KillSwitchRow[]>;
@@ -118,10 +153,11 @@ export interface EngagedSwitch {
   readonly unreadable: boolean;
   /**
    * `NONE` for an engage. `PENDING` for a release not yet settled (seen for less than the settle window): enforced as
-   * the switch it releases, no cancel requested. `VOIDED` for a release the control plane voided: the switch is still
-   * engaged, and enforced in full.
+   * the switch it releases, no cancel requested. `UNCONFIRMED` for a settled, unvoided release with no positive
+   * finality (r2 X2): enforced in full, cancels included, for as long as it stays unconfirmed. `VOIDED` for a release
+   * the control plane voided: the switch is still engaged, and enforced in full.
    */
-  readonly release: "NONE" | "PENDING" | "VOIDED";
+  readonly release: "NONE" | "PENDING" | "UNCONFIRMED" | "VOIDED";
 }
 
 export type CancelDirective =
@@ -164,11 +200,17 @@ function actionOf(value: unknown): KillSwitchAction | undefined {
  * its resulting state is the control plane's release document
  * (`engaged: "false"`) for the row's own scope; anything else that is not a
  * readable engage is an unreadable row, enforced as `FULL_HALT`. A release
- * releases only when no VOID names it (`voided` exactly `false`) and
+ * releases only when no VOID names it (`voided` exactly `false`),
  * `releaseSettled(killSwitchEventId)` says it has settled (the monitor's
- * window); otherwise it is enforced as the switch it releases (r1, I6).
+ * window), AND `releaseFinal(release)` answers exactly `true` (positive
+ * finality, r2 X2); otherwise it is enforced as the switch it releases (r1,
+ * I6). A predicate that throws answers "no".
  */
-export function foldKillSwitchRows(rows: readonly unknown[], releaseSettled: (killSwitchEventId: string) => boolean): readonly EngagedSwitch[] {
+export function foldKillSwitchRows(
+  rows: readonly unknown[],
+  releaseSettled: (killSwitchEventId: string) => boolean,
+  releaseFinal: (release: KillSwitchReleaseRef) => boolean,
+): readonly EngagedSwitch[] {
   const engaged: EngagedSwitch[] = [];
   for (const raw of rows) {
     const id = ownString(raw, "killSwitchEventId") ?? "(unreadable)";
@@ -192,8 +234,17 @@ export function foldKillSwitchRows(rows: readonly unknown[], releaseSettled: (ki
       } catch {
         settled = false;
       }
-      if (settled) continue;
-      // Releasing (not settled yet) or voided: the switch it releases is still engaged. An unreadable action is the strongest.
+      let final = false;
+      if (settled) {
+        try {
+          final = releaseFinal(Object.freeze({ killSwitchEventId: id, environment, scope, scopeRef })) === true;
+        } catch {
+          final = false;
+        }
+      }
+      if (final) continue;
+      // Releasing (not settled yet), unconfirmed or voided: the switch it releases is still engaged. An unreadable
+      // action is the strongest.
       engaged.push(
         Object.freeze({
           environment,
@@ -202,7 +253,7 @@ export function foldKillSwitchRows(rows: readonly unknown[], releaseSettled: (ki
           action: action ?? ("FULL_HALT" as const),
           killSwitchEventId: id,
           unreadable: action === undefined,
-          release: notVoided ? ("PENDING" as const) : ("VOIDED" as const),
+          release: !notVoided ? ("VOIDED" as const) : settled ? ("UNCONFIRMED" as const) : ("PENDING" as const),
         }),
       );
       continue;
@@ -312,7 +363,8 @@ export type KillSwitchSnapshot =
  * STARTED at least `releaseSettleMs` after that first sight, so the VOID check
  * it carries was made at least that long after the row became visible. An id
  * no longer returned is forgotten (its window restarts if it is ever seen
- * again).
+ * again). A settled release still releases only with positive finality from
+ * the injected `releaseFinality` (r2, X2; module header), which is required.
  */
 export class KillSwitchMonitor {
   readonly #reader: KillSwitchReader;
@@ -320,6 +372,7 @@ export class KillSwitchMonitor {
   readonly #accountRef: string;
   readonly #abandonAfterMs: number;
   readonly #releaseSettleMs: number;
+  readonly #releaseFinality: KillSwitchReleaseFinality;
   readonly #firstSeen = new Map<string, number>();
   #latest: KillSwitchSnapshot = Object.freeze({ known: false as const, reason: "NEVER_READ" as const });
   #reading: { readonly promise: Promise<boolean>; readonly startedAtMs: number | null; readonly seq: number } | null = null;
@@ -331,12 +384,19 @@ export class KillSwitchMonitor {
     readonly accountRef: string;
     /** How long a release row must have been visible before it releases (1 ms … 1 h); see the class comment. */
     readonly releaseSettleMs: number;
+    /** Positive evidence that the control plane applied a release (r2 X2). Required: without it no release is final. */
+    readonly releaseFinality: KillSwitchReleaseFinality;
     readonly abandonAfterMs?: number;
   }) {
     const settle = options.releaseSettleMs;
     if (typeof settle !== "number" || !Number.isSafeInteger(settle) || settle < 1 || settle > 3_600_000) {
       throw new TypeError("KillSwitchMonitor: releaseSettleMs must be an integer of 1 ms … 1 h");
     }
+    const finality: unknown = options.releaseFinality;
+    if (typeof finality !== "object" || finality === null || typeof (finality as { isFinal?: unknown }).isFinal !== "function") {
+      throw new TypeError("KillSwitchMonitor: releaseFinality (positive evidence that a release was applied) is required");
+    }
+    this.#releaseFinality = options.releaseFinality;
     this.#reader = options.reader;
     this.#clock = options.clock;
     this.#accountRef = options.accountRef;
@@ -420,7 +480,7 @@ export class KillSwitchMonitor {
       const seen = this.#firstSeen.get(killSwitchEventId);
       return seen !== undefined && started - seen >= this.#releaseSettleMs;
     };
-    const engaged = foldKillSwitchRows(list, settled);
+    const engaged = foldKillSwitchRows(list, settled, (release) => this.#releaseFinality.isFinal(release));
     const ids = new Set<string>();
     for (const row of list) {
       const id = ownString(row, "killSwitchEventId");

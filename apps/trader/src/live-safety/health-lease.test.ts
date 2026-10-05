@@ -89,6 +89,23 @@ describe("proof is RECENT proof: nothing is cached forever", () => {
     expect(lease.evaluate().failures).toEqual([{ input: "DATABASE", reason: "PROOF_IN_FUTURE" }]);
   });
 
+  /**
+   * r2 O2 (Opus R2-L2, mutant M13): the LEASE refuses a future-dated proof itself, whatever source answers it. The
+   * test above goes through `ProofBoard`, which refuses a future proof first (r1 I9), so it never reached this check;
+   * here the sources are not boards (the OMS monitor and the kill-switch monitor are not).
+   */
+  it("r2 O2 (M13): the lease itself refuses a future-dated proof from a source that is not a board, for every input", () => {
+    const clock = new ManualClock();
+    for (const input of HEALTH_INPUTS) {
+      const sources = Object.fromEntries(
+        HEALTH_INPUTS.map((name) => [name, { read: () => ({ healthy: true as const, provenAtMs: name === input ? clock.now + 1 : clock.now }) }]),
+      ) as Record<HealthInput, HealthProofSource>;
+      const verdict = new HealthLease({ clock, sources, maxAgeMs: MAX_AGE }).evaluate();
+      expect(verdict.healthy).toBe(false);
+      expect(verdict.failures).toEqual([{ input, reason: "PROOF_IN_FUTURE" }]);
+    }
+  });
+
   it("an input never proved reads NO_PROOF", () => {
     const clock = new ManualClock();
     const board = new ProofBoard({ clock });

@@ -54,6 +54,12 @@
  *   transaction; the database CHECK is the last layer. "Paper mode cannot
  *   acquire live fencing" (work plan `WP-320` acceptance; ADR-008 §2,
  *   ADR-010).
+ * - **No lease is ever longer than {@link FENCING_LEASE_MAX_TTL_MS}** (`WP-320`
+ *   r2, finding X1). `acquire` and `renew` — every grant and every renewal
+ *   this store makes — refuse a TTL above it before any SQL. It is a CODE
+ *   constant, not configuration: it is the bound every successor waits out
+ *   (next rule), so two processes can never disagree about it, whatever each
+ *   was configured with.
  * - **A takeover waits out the incumbent on the SUCCESSOR's clock, never on
  *   the database's** (`WP-320` r1, finding I1; ADR-008: "Failover is not
  *   instant and must not be"). The incumbent is the realm's ACTIVE lease, or
@@ -64,20 +70,31 @@
  *   expiry and last update, as the database wrote them). A grant is made only
  *   to a caller that presents that exact version back as `takeover`, which
  *   the in-process authority (`apps/trader/src/live-safety/fencing-authority.ts`)
- *   does only after it has watched the SAME version, unchanged, for a whole
- *   lease (`ttl + safetyMargin`) on its own monotonic clock. Why: the old
- *   holder acts on a LOCAL deadline (its last successful renewal's start +
- *   ttl − margin), which neither a revocation nor a database clock that steps
- *   forward shortens; the version it last wrote was committed before the
- *   successor saw it, so a successor that waits a whole lease from that
- *   sighting starts after the old holder's deadline, whatever the database's
- *   clock did. An immediate takeover — after a revocation, or after an expiry
- *   the database judged early — left two usable authorities (r1 I1). A
- *   version that changes while the successor waits (a renewal, a relabel)
- *   restarts its wait. The ACTIVE incumbent is moved to `EXPIRED`, with its
- *   reason, in the statement that ends it (a terminal lease can never be
- *   annotated afterwards: `WP-040` R15/F14), on the acquisition path
- *   (`WP-040` F11).
+ *   does only after it has watched the SAME version, unchanged, for
+ *   {@link FENCING_LEASE_MAX_TTL_MS} plus its safety margin on its own
+ *   monotonic clock — the longest lease ANY holder can have been granted, not
+ *   the successor's own TTL (r2 X1: a successor configured with a shorter TTL
+ *   took over while a longer-lived incumbent still held). Why: the old holder
+ *   acts on a LOCAL deadline (its last successful renewal's start + its ttl −
+ *   its margin, its ttl at most the bound), which neither a revocation nor a
+ *   database clock that steps forward shortens; the version it last wrote was
+ *   committed before the successor saw it, so a successor that waits the
+ *   bound from that sighting starts after the old holder's deadline, whatever
+ *   the database's clock did and whatever either was configured with. An
+ *   immediate takeover — after a revocation, or after an expiry the database
+ *   judged early — left two usable authorities (r1 I1). A version that changes
+ *   while the successor waits (a renewal, a relabel) restarts its wait.
+ * - **And the incumbent's own expiry must have passed at the database's
+ *   clock** (r2 X1, the durable bound). Even with its exact version presented,
+ *   a takeover over an incumbent whose `expires_at` still lies ahead (a lease
+ *   revoked or released early) is answered `LAPSED`, with the time left by
+ *   the database's clock (`databaseRemainingMs`). For every grant this store
+ *   made the local wait already covers it; it bounds the grants this store did
+ *   NOT make — `WP-040`'s `acquireLease` and `recordHeartbeat` take a caller's
+ *   `expiresAt`, which no TTL bound reaches — by the expiry they wrote. The
+ *   ACTIVE incumbent is moved to `EXPIRED`, with its reason, in the statement
+ *   that ends it (a terminal lease can never be annotated afterwards: `WP-040`
+ *   R15/F14), on the acquisition path (`WP-040` F11).
  * - **The next token is the high-water mark plus one**, read under a
  *   transaction-scoped advisory lock on the SAME key `WP-040`'s repository
  *   takes (`fencing:<account>:<realm>`), so the two acquisition paths
@@ -122,8 +139,14 @@ import type { IsoTimestamp } from "../timestamps.js";
 
 /** The shortest lease a caller may ask for. A guard on configuration, not a venue fact. */
 export const FENCING_LEASE_MIN_TTL_MS = 1_000;
-/** The longest lease a caller may ask for (one hour). A guard on configuration, not a venue fact. */
-export const FENCING_LEASE_MAX_TTL_MS = 3_600_000;
+/**
+ * The longest lease ANY holder may be granted or renewed to (one minute): `acquire` and `renew` refuse more, before
+ * any SQL. Not configuration but part of the fencing protocol (module header, r2 X1): every successor waits THIS out,
+ * plus its safety margin, on its own clock before it presents a takeover, so it covers every incumbent this store
+ * granted, whatever TTL either side was configured with. A protocol bound, not a venue fact; a longer lease makes
+ * every failover slower by the same amount.
+ */
+export const FENCING_LEASE_MAX_TTL_MS = 60_000;
 /** `internal.identifier`: 1…200 characters. */
 export const FENCING_IDENTIFIER_MAX_LENGTH = 200;
 /** `internal.detail`: at most 2000 characters. */
@@ -179,6 +202,11 @@ export interface FencingIncumbent {
   readonly expiresAt: IsoTimestamp;
   /** Its status, expiry and last update as the database wrote them: any change to the row changes it. */
   readonly version: string;
+  /**
+   * How long until `expiresAt` by the DATABASE's clock, in whole milliseconds rounded up (0 once it has passed;
+   * capped at 2^31 − 1). A takeover is granted only once it is 0, whatever was presented (module header, r2 X1).
+   */
+  readonly databaseRemainingMs: number;
 }
 
 /** A granted lease: the fence a process may act under until `expiresAt` (database clock). */
@@ -200,8 +228,10 @@ export type FencingAcquireOutcome =
   /** An unexpired ACTIVE lease exists: one fenced live writer per account and realm (§2, ADR-008 §2). */
   | { readonly kind: "HELD"; readonly holderId: string; readonly fencingToken: string; readonly expiresAt: IsoTimestamp }
   /**
-   * The realm's latest lease has ended, but no takeover naming its current version was presented: the caller must
-   * watch this version, unchanged, for a whole lease on its own clock before presenting it (module header).
+   * The realm's latest lease has ended, but no takeover naming its current version was presented, or its expiry
+   * still lies ahead by the database's clock: the caller must watch this version, unchanged, for
+   * {@link FENCING_LEASE_MAX_TTL_MS} plus its margin on its own clock before presenting it, and is granted only once
+   * `databaseRemainingMs` is 0 (module header).
    */
   | { readonly kind: "LAPSED"; readonly incumbent: FencingIncumbent }
   /** A concurrent acquisition that bypassed the advisory lock won the race at the database's constraints. */
@@ -247,7 +277,8 @@ export interface FencingLeaseStore {
   release(lease: FencingLeaseRef, reason: string): Promise<boolean>;
   /**
    * An operator's revocation of an ACTIVE lease, with its reason; `false` when it had already ended. The holder's
-   * next renewal finds it LOST; a successor still waits out a whole lease from its first sight of the revoked row.
+   * next renewal finds it LOST; a successor still waits out {@link FENCING_LEASE_MAX_TTL_MS} plus its margin from its
+   * first sight of the revoked row, and the revoked row's own expiry by the database's clock (module header).
    */
   revoke(input: { readonly fencingLeaseId: string; readonly reason: string }): Promise<boolean>;
   /** Whether `lease` is still ACTIVE and unexpired at the database's clock. */
@@ -384,6 +415,9 @@ function takeoverOf(value: unknown): FencingTakeover | null {
 /** The row's version: its status, expiry and last update to the microsecond, as the database wrote them. */
 const LEASE_VERSION = sql<string>`concat_ws('|', status::text, to_char(expires_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'), to_char(updated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US'))`;
 
+/** Milliseconds until `expires_at` by the database's clock, rounded up, clamped to 0 … 2^31 − 1 (r2 X1). */
+const DATABASE_REMAINING_MS = sql<number>`least(greatest(ceil(extract(epoch from (expires_at - clock_timestamp())) * 1000), 0), 2147483647)::integer`;
+
 /** `clock_timestamp() + ttl`: the database's clock, read in the statement that writes it. */
 function databaseExpiry(ttlMs: number) {
   return sql<string>`clock_timestamp() + (${ttlMs}::integer * interval '1 millisecond')`;
@@ -458,6 +492,7 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
               .select(["fencing_lease_id", "fencing_token", "holder_id", "status", "expires_at", "heartbeat_id"])
               .select(sql<boolean>`expires_at <= clock_timestamp()`.as("expired"))
               .select(LEASE_VERSION.as("version"))
+              .select(DATABASE_REMAINING_MS.as("remaining_ms"))
               .where("fencing_lease_id", "=", latestRow.fencing_lease_id)
               .executeTakeFirstOrThrow();
             // 3a. ACTIVE and unexpired: one fenced live writer per account and realm.
@@ -469,13 +504,15 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
                 expiresAt: incumbent.expires_at,
               });
             }
-            // 3b. Ended. Granted only over the exact version the caller has waited out (module header).
+            // 3b. Ended. Granted only over the exact version the caller has waited out, and only once the incumbent's
+            // own expiry has passed by the database's clock too (module header, r2 X1: the durable bound).
             const presented =
               takeover !== null &&
               takeover.fencingLeaseId === incumbent.fencing_lease_id &&
               takeover.fencingToken === incumbent.fencing_token &&
               takeover.version === incumbent.version;
-            if (!presented) {
+            if (!presented || incumbent.expired !== true) {
+              const remaining = Number(incumbent.remaining_ms);
               return Object.freeze({
                 kind: "LAPSED" as const,
                 incumbent: Object.freeze({
@@ -485,6 +522,8 @@ export function createFencingLeaseStore(db: PolymarketBotDatabase): FencingLease
                   status: incumbent.status,
                   expiresAt: incumbent.expires_at,
                   version: incumbent.version,
+                  // Unreadable is "not yet": the grant itself is decided by `expired` above, never by this number.
+                  databaseRemainingMs: incumbent.expired === true ? 0 : Number.isSafeInteger(remaining) && remaining > 0 ? remaining : 1,
                 }),
               });
             }

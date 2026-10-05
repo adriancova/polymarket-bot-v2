@@ -3,10 +3,12 @@
  * "Two live writers cannot both hold authority" (§2, §6 invariant 16;
  * ADR-008 §1–§2, §5: no order-submitting hot standby). Two full processes
  * (each its own OMS, coordinator, controller and composition) share one
- * fencing store and one time line. A successor waits out the incumbent's
- * whole lease on its own clock, from its first sight of the ended lease,
- * whether the incumbent died or was REVOKED (r1, I1). The race against a REAL
- * PostgreSQL is `test/integration/postgres/fencing-race.test.ts`.
+ * fencing store and one time line. A successor waits out the bound on EVERY
+ * lease (`FENCING_LEASE_MAX_TTL_MS`, plus its margin) on its own clock, from
+ * its first sight of the ended lease, whether the incumbent died or was
+ * REVOKED (r1, I1), and whatever lease either was configured with (r2, X1).
+ * The race against a REAL PostgreSQL is
+ * `test/integration/postgres/fencing-race.test.ts`.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -78,7 +80,7 @@ describe("two live writers cannot both hold authority", () => {
     const aFence = a.safety.currentFence();
     const aSends = a.transport.requests.length;
     let takeover: string | null = null;
-    for (let round = 0; round < 20 && takeover === null; round += 1) {
+    for (let round = 0; round < 30 && takeover === null; round += 1) {
       await tick(5_000);
       const result = await b.safety.acquireFence();
       if (result.kind === "ACQUIRED") takeover = result.fence.fencingToken;
@@ -114,12 +116,13 @@ describe("two live writers cannot both hold authority", () => {
     expect(asked).toMatchObject({ kind: "LAPSED_WAITING", status: "REVOKED" });
     const firstSight = time.now;
     let takeoverAt: number | null = null;
-    for (let round = 0; round < 80 && takeoverAt === null; round += 1) {
+    for (let round = 0; round < 160 && takeoverAt === null; round += 1) {
       await pairOf.tick(500);
       if ((await b.safety.acquireFence()).kind === "ACQUIRED") takeoverAt = time.now;
     }
     expect(takeoverAt).not.toBeNull();
-    expect((takeoverAt ?? 0) - firstSight).toBeGreaterThanOrEqual(32_000);
+    // r2 X1: the bound on every lease (one minute) plus the standby's margin, not its own lease.
+    expect((takeoverAt ?? 0) - firstSight).toBeGreaterThanOrEqual(62_000);
     expect(a.journal.of("FENCE_LOST").map((entry) => entry.reason)).toEqual(["RENEW_LOST"]);
     const aLastSend = a.transport.requests.at(-1)?.atMs ?? 0;
     await pairOf.tick(15_000);
@@ -127,5 +130,35 @@ describe("two live writers cannot both hold authority", () => {
     expect(b.transport.requests[0]?.atMs ?? 0).toBeGreaterThan(aLastSend);
     expect(pairOf.bothPermitted()).toBe(0);
     expect(pairOf.bothHeld()).toBe(0);
+  });
+
+  it("r2 X1: a standby configured with a SHORTER lease (2 s) than the holder (60 s): the holder is revoked right after a renewal and stays connected; the standby asks at once and keeps asking; never both held or both permitted", async () => {
+    const time = new ManualTime();
+    const store = new MemoryFencingStore(() => time.now);
+    const a = await liveProcess({ time, store, holderId: "trader-a", safety: { fencing: { store, ttlMs: 60_000, renewIntervalMs: 5_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 } } });
+    const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false, safety: { fencing: { store, ttlMs: 2_000, renewIntervalMs: 500, safetyMarginMs: 250, transmitMarginMs: 250 } } });
+    const pairOf = lockstep(a, b, store);
+    await pairOf.tick(6_000);
+    // Revoke right after one of A's renewals: A learns of it only at its NEXT renewal, up to 5 s later.
+    const renewals = store.calls.filter((call) => call === "renew").length;
+    for (let guard = 0; guard < 40 && store.calls.filter((call) => call === "renew").length === renewals; guard += 1) await pairOf.tick(250);
+    const aFence = a.safety.currentFence();
+    if (aFence === null) throw new Error("A holds no fence");
+    expect(store.revoke(aFence.fencingLeaseId, "operator: suspected second writer")).toBe(true);
+    expect((await b.safety.acquireFence()).kind).toBe("LAPSED_WAITING");
+    const firstSight = time.now;
+    let takeoverAt: number | null = null;
+    for (let round = 0; round < 160 && takeoverAt === null; round += 1) {
+      await pairOf.tick(500);
+      if ((await b.safety.acquireFence()).kind === "ACQUIRED") takeoverAt = time.now;
+    }
+    // Both fences and both gates are sampled on after the grant too.
+    await pairOf.tick(5_000);
+    // On 21aee56 the standby presented after its OWN 2.25 s, while A held until its next renewal: both held.
+    expect(pairOf.bothHeld()).toBe(0);
+    expect(pairOf.bothPermitted()).toBe(0);
+    expect(takeoverAt).not.toBeNull();
+    expect((takeoverAt ?? 0) - firstSight).toBeGreaterThanOrEqual(60_250);
+    expect(a.journal.of("FENCE_LOST").map((entry) => entry.reason)).toEqual(["RENEW_LOST"]);
   });
 });

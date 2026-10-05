@@ -37,26 +37,43 @@
  *   passes. A renewal that the database applied but whose answer was lost
  *   leaves the database's lease LONGER than the local one: the safe direction.
  *
- * ## A takeover waits out the incumbent on THIS process's clock (r1, I1)
+ * ## A takeover waits out the BOUND on THIS process's clock (r1 I1; r2 X1)
  *
  * The store answers `LAPSED` while the realm's latest lease has ended
  * (expired by the database's clock, revoked, released) and grants a new
  * lease only to a caller presenting that lease's exact VERSION back. This
  * class presents it only after it has seen the SAME version, unchanged, for
- * {@link FencingAuthority.takeoverWaitMs} = `ttl + safetyMargin` on its own
- * monotonic clock, timed from the END of the call that first returned it (the
- * version was committed before then). Why that suffices, whatever the
- * database's clock did and whether or not the old holder was revoked: the
- * old holder acts only until ITS local deadline, its last successful
- * renewal's call start + ttl − safetyMargin; that renewal committed the
- * version before this process saw it; so a whole lease plus the margin
- * later, by a clock that runs at the same rate to within the margin (the
- * assumption the local deadline already makes), the old holder's deadline
- * has passed, and with it every transmission it started with its transmit
- * margin left. A version that changes meanwhile restarts the wait. What it
- * does NOT cover (disclosed residuals): a process paused longer than the
- * transmit margin between its check and its send, and a clock whose rate
- * drifts by more than the margin over one lease.
+ * {@link FencingAuthority.takeoverWaitMs} = `FENCING_LEASE_MAX_TTL_MS +
+ * safetyMargin` on its own monotonic clock, timed from the END of the call
+ * that first returned it (the version was committed before then).
+ *
+ * The wait is the CODE-LEVEL bound on every lease, not this process's own
+ * `ttlMs` (r2, finding X1). The store refuses a TTL above
+ * `FENCING_LEASE_MAX_TTL_MS` on every acquisition and every renewal, and
+ * {@link FencingAuthority.create} refuses it in the configuration, so no
+ * incumbent can hold a grant longer than the bound, whatever it — or this
+ * process — was configured with. At round 1 the successor waited its OWN
+ * `ttl + safetyMargin`, so a successor configured with a shorter TTL than
+ * its incumbent took over while the incumbent still held: two usable
+ * authorities.
+ *
+ * Why the bound suffices, whatever the database's clock did and whether or
+ * not the old holder was revoked: the old holder acts only until ITS local
+ * deadline, its last successful renewal's call start + its ttl − its margin,
+ * with its ttl at most the bound; that renewal committed the version before
+ * this process saw it; so the bound plus this process's margin later, by a
+ * clock that runs at the same rate to within the margins (the assumption the
+ * local deadline already makes), the old holder's deadline has passed, and
+ * with it every transmission it started with its transmit margin left. A
+ * version that changes meanwhile restarts the wait. The store adds the
+ * durable half: the incumbent's own expiry must have passed by the
+ * database's clock too, so a grant some other path made longer than the
+ * bound (`WP-040`'s caller-supplied `expiresAt`) is waited out to the expiry
+ * it wrote; `LAPSED_WAITING`'s `remainingMs` is the larger of the two waits.
+ * What it does NOT cover (disclosed residuals): a process paused longer than
+ * the transmit margin between its check and its send; a clock whose rate
+ * drifts by more than the margins over one bound; and a grant longer than the
+ * bound made outside this store under a database clock that also stepped.
  *
  * ## Paper mode cannot acquire live fencing; nor can a process above its ceiling
  *
@@ -77,7 +94,16 @@
  */
 
 import { RUN_MODE_REQUIRES_LIVE_SIGNER, RUN_MODES, runModeExceeds, type RunMode } from "@polymarket-bot/domain";
-import type { FencingAcquireOutcome, FencingIncumbent, FencingLeaseRef, FencingRenewOutcome, FencingGrant, FencingTakeover } from "@polymarket-bot/storage-postgres";
+import {
+  FENCING_LEASE_MAX_TTL_MS,
+  FENCING_LEASE_MIN_TTL_MS,
+  type FencingAcquireOutcome,
+  type FencingIncumbent,
+  type FencingLeaseRef,
+  type FencingRenewOutcome,
+  type FencingGrant,
+  type FencingTakeover,
+} from "@polymarket-bot/storage-postgres";
 
 import type { MonotonicClock } from "./ports.js";
 
@@ -114,7 +140,7 @@ export type FenceCheck =
 export type AcquireResult =
   | { readonly kind: "ACQUIRED"; readonly fence: Fence; readonly inheritedHeartbeatId: string | null }
   | { readonly kind: "HELD_ELSEWHERE"; readonly holderId: string; readonly expiresAt: string }
-  /** The incumbent has ended; this process is waiting it out (module header). Ask again after `remainingMs`. */
+  /** The incumbent has ended; this process is waiting out the bound and its expiry (module header). Ask again after `remainingMs`. */
   | { readonly kind: "LAPSED_WAITING"; readonly holderId: string; readonly status: string; readonly remainingMs: number }
   | { readonly kind: "CONTENDED" }
   | { readonly kind: "ALREADY_HELD" }
@@ -250,7 +276,7 @@ export interface FencingAuthorityOptions {
   readonly holderPid?: number | null;
   readonly store: FencingLeasePort;
   readonly clock: MonotonicClock;
-  /** The lease's lifetime, applied by the database's clock. */
+  /** The lease's lifetime, applied by the database's clock: `FENCING_LEASE_MIN_TTL_MS` … `FENCING_LEASE_MAX_TTL_MS` (r2 X1). */
   readonly ttlMs: number;
   /** Subtracted from every local deadline: the clock-rate drift and scheduling allowance. */
   readonly safetyMarginMs: number;
@@ -293,6 +319,8 @@ export class FencingAuthority {
   static create(options: FencingAuthorityOptions): FencingAuthority {
     const context = assertLiveFencingContext(typeof options === "object" && options !== null ? options.runModeContext : undefined);
     const ttl = positiveInteger(options.ttlMs, "ttlMs");
+    // r2 X1: no lease longer than the bound every successor waits out (module header); the store refuses it too.
+    if (ttl < FENCING_LEASE_MIN_TTL_MS || ttl > FENCING_LEASE_MAX_TTL_MS) throw new FencingAuthorityConfigurationError("ttlMs");
     const safety = positiveInteger(options.safetyMarginMs, "safetyMarginMs");
     const transmit = positiveInteger(options.transmitMarginMs, "transmitMarginMs");
     if (safety + transmit >= ttl) throw new FencingAuthorityConfigurationError("margins");
@@ -301,9 +329,12 @@ export class FencingAuthority {
     return new FencingAuthority(Object.freeze({ ...options }), context);
   }
 
-  /** How long an ended incumbent's version must stay unchanged, on this clock, before a takeover is presented. */
+  /**
+   * How long an ended incumbent's version must stay unchanged, on this clock, before a takeover is presented: the
+   * code-level bound on EVERY lease plus this process's margin, never this process's own `ttlMs` (r2 X1).
+   */
   get takeoverWaitMs(): number {
-    return this.#options.ttlMs + this.#options.safetyMarginMs;
+    return FENCING_LEASE_MAX_TTL_MS + this.#options.safetyMarginMs;
   }
 
   /**
@@ -373,11 +404,13 @@ export class FencingAuthority {
           observed.incumbent.version === incumbent.version;
         const current: Observation = same ? observed : { incumbent, firstSeenAtMs: after };
         this.#observed = current;
+        // The larger of the two waits: this clock's, and the incumbent's own expiry by the database's (r2 X1).
+        const databaseRemaining = typeof incumbent.databaseRemainingMs === "number" && Number.isFinite(incumbent.databaseRemainingMs) ? Math.max(0, incumbent.databaseRemainingMs) : 0;
         return Object.freeze({
           kind: "LAPSED_WAITING" as const,
           holderId: incumbent.holderId,
           status: incumbent.status,
-          remainingMs: Math.max(0, current.firstSeenAtMs + this.takeoverWaitMs - after),
+          remainingMs: Math.max(0, current.firstSeenAtMs + this.takeoverWaitMs - after, databaseRemaining),
         });
       }
       this.#observed = null;

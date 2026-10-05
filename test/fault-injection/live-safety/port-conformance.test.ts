@@ -25,9 +25,12 @@ import type {
   CancelOutcome,
   HaltPort,
   LimitOrderRequest,
+  OmsReservationPort,
   OmsStore,
   OmsVenuePort,
   OrderManager,
+  OrderManagerDependencies,
+  PayloadCipher,
   PlacementOutcome,
   ReconciliationCoordinator,
   SignOutcome,
@@ -81,11 +84,40 @@ export function monitoredStoreIsAnOmsStore(monitor: OmsProgressMonitor, store: O
   return monitor.store(store);
 }
 
+/** r2 X4: its wrapped reservation port IS an `OmsReservationPort`, and its wrapped cipher a `PayloadCipher`. */
+export function monitoredReservationsAreAnOmsReservationPort(monitor: OmsProgressMonitor, port: OmsReservationPort): OmsReservationPort {
+  return monitor.reservations(port);
+}
+
+export function monitoredCipherIsAPayloadCipher(monitor: OmsProgressMonitor, cipher: PayloadCipher): PayloadCipher {
+  return monitor.cipher(cipher);
+}
+
+/** r2 X4: `dependencies()` takes, and gives back, WP-270's whole dependency object. */
+export function monitoredDependenciesAreOrderManagerDependencies(monitor: OmsProgressMonitor, deps: OrderManagerDependencies): OrderManagerDependencies {
+  return monitor.dependencies(deps);
+}
+
+/**
+ * r2 X4: the keys of WP-270's `OrderManagerDependencies` whose value is (or has a method that returns) a Promise —
+ * the ports the OMS awaits, and so the ones a hung call can wedge it on. Exactly the three the monitor times plus the
+ * venue (module header of `oms-progress.ts`). A port WP-270 adds later fails this assignment until it is classified.
+ */
+type ReturnsPromise<T> = T extends (...args: never[]) => infer R ? (R extends PromiseLike<unknown> ? true : false) : false;
+type HasAsyncMethod<T> = T extends (...args: never[]) => unknown ? ReturnsPromise<T> : true extends { [K in keyof T]: ReturnsPromise<T[K]> }[keyof T] ? true : false;
+type AsyncPortsOf<T> = { [K in keyof T]-?: HasAsyncMethod<T[K]> extends true ? K : never }[keyof T];
+type Exactly<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+export const OMS_ASYNC_PORTS_ARE_CLASSIFIED: Exactly<AsyncPortsOf<OrderManagerDependencies>, "store" | "reservations" | "cipher" | "venue"> = true;
+
 // --- run-time agreements ---------------------------------------------------------------------------------------
 
 describe("the structural ports agree with the real objects", () => {
   it("the 5 s sweep allowance is the same figure on both sides (S-D17: the cancellation check runs every five seconds)", () => {
     expect(LIVE_SAFETY_SWEEP_MS).toBe(CONTROLLER_SWEEP_MS);
+  });
+
+  it("r2 X4: the OMS's asynchronous dependency ports are the three the progress monitor times, plus the venue (compile-time; see the type above)", () => {
+    expect(OMS_ASYNC_PORTS_ARE_CLASSIFIED).toBe(true);
   });
 
   it("the controller's lapse cause for a refused gate is the one the composition pages on", () => {

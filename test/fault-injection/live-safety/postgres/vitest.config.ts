@@ -4,19 +4,21 @@
  * every migration applied, written by the REAL control plane through its
  * REAL PostgreSQL audit sink.
  *
- * Why a second config: `../vitest.config.ts` (`test:fault:live-safety`)
- * reaches no database and needs no Docker, and this package's grant adds one
- * script line only (that one). So this directory is EXCLUDED there and runs
- * here, with Docker:
+ * Why a second config: `../vitest.config.ts` reaches no database and needs
+ * no Docker, so this directory is EXCLUDED there and runs here, with Docker.
+ * Since r2 (finding O3) the package's ONE fault-script line runs both, the
+ * Docker-free half first:
  *
- *   pnpm --filter @polymarket-bot/trader exec vitest run --config ../../test/fault-injection/live-safety/postgres/vitest.config.ts
+ *   pnpm --filter @polymarket-bot/trader test:fault:live-safety
  *
+ * so the real-PostgreSQL proof of the VOID lookup, the two orderings and the
+ * release finality (r1 I6/I7, r2 X2) fails that script when it regresses.
  * Following the `test/integration/control-api/postgres` precedent, the
  * container is started in the test file's own `beforeAll`, with no
  * `globalSetup`, and nothing skips when Docker is absent: the run fails.
- * Wiring it into a script and CI is an orchestrator follow-up. The suite
- * imports by relative path, so it needs no alias. Throwaway Testcontainers
- * credentials only; no venue, no signer, no real credential.
+ * Wiring the script into CI is the orchestrator's. The suite imports by
+ * relative path, so it needs no alias. Throwaway Testcontainers credentials
+ * only; no venue, no signer, no real credential.
  */
 
 import { dirname, resolve } from "node:path";

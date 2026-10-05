@@ -21,6 +21,7 @@ export {
   type KillSwitchCancelPort,
   type LiveSafetyOptions,
   type LiveSafetyStatus,
+  VENUE_RESTING_OR_UNKNOWN_STATES,
 } from "./live-safety.js";
 export {
   readClosedOnly,
@@ -34,7 +35,7 @@ export {
   type GeoblockReading,
 } from "./eligibility.js";
 export { evaluateLiveGate, type GateDecision, type GateInputs, type GateRequest } from "./entry-gate.js";
-export { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementScope, type PlacementVenuePort } from "./fenced-venue.js";
+export { fenceVenuePort, type FenceRefusals, type PlacementClassifier, type PlacementScope, type PlacementTracker, type PlacementVenuePort } from "./fenced-venue.js";
 export {
   assertLiveFencingContext,
   evaluateLiveFencingContext,
@@ -78,13 +79,23 @@ export {
   type KillSwitchAction,
   type KillSwitchEffects,
   type KillSwitchReader,
+  type KillSwitchReleaseFinality,
+  type KillSwitchReleaseRef,
   type KillSwitchRow,
   type KillSwitchScope,
   type KillSwitchSnapshot,
 } from "./kill-switch.js";
 export { createPostgresKillSwitchReader, killSwitchLatestRowQueries } from "./kill-switch-postgres.js";
 export { LapseRecovery, LapseRecoveryConfigurationError, VENUE_CANCELLATION_CHECK_INTERVAL_MS, type LapseRecoveryOptions } from "./lapse-recovery.js";
-export { OmsProgressMonitor, type OmsStoreLike } from "./oms-progress.js";
+export {
+  OMS_INSTRUMENTED_PORTS,
+  OmsProgressMonitor,
+  type OmsCipherLike,
+  type OmsInstrumentedPort,
+  type OmsPersistenceDependencies,
+  type OmsReservationsLike,
+  type OmsStoreLike,
+} from "./oms-progress.js";
 export type {
   HeartbeatView,
   LiveSafetyAlerts,

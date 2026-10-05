@@ -17,6 +17,10 @@ import {
   FakeCoordinator,
   FakeKillSwitchReader,
   FakeOms,
+  FakeReleaseFinality,
+  HangableCipher,
+  HangableOmsStore,
+  HangableReservations,
   HEALTH_MAX_AGE,
   LIVE_CONTEXT,
   ManualClock,
@@ -27,6 +31,7 @@ import {
   RELEASE_SETTLE_MS,
   REPOSITORY_DEFAULTS_LIVE_MICRO,
 } from "./fakes.test-support.js";
+import type { PlacementVenuePort } from "./fenced-venue.js";
 import { LiveFencingRefusal, type RunModeContext } from "./fencing-authority.js";
 import { COMPOSITION_PROVED_INPUTS, createLiveSafety, LiveSafetyConfigurationError } from "./live-safety.js";
 import { OmsProgressMonitor } from "./oms-progress.js";
@@ -65,7 +70,7 @@ describe("paper mode cannot build the live-safety composition (ADR-008 §2; ADR-
           timers: clock,
           fencing: { store, ttlMs: 30_000, renewIntervalMs: 5_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 },
           health: { maxAgeMs: HEALTH_MAX_AGE, eventLoop: { intervalMs: 500, maxLagMs: 250 } },
-          killSwitch: { reader, refreshIntervalMs: 1_000, cancels: new FakeCancels(), releaseSettleMs: RELEASE_SETTLE_MS },
+          killSwitch: { reader, refreshIntervalMs: 1_000, cancels: new FakeCancels(), releaseSettleMs: RELEASE_SETTLE_MS, releaseFinality: new FakeReleaseFinality() },
           eligibility: { geoblock, closedOnly: geoblock, refreshIntervalMs: 30_000, maxAgeMs: 60_000 },
           oms: new FakeOms(),
           omsProgress: new OmsProgressMonitor({ clock }),
@@ -86,12 +91,20 @@ describe("paper mode cannot build the live-safety composition (ADR-008 §2; ADR-
   });
 
   it("refuses refresh intervals that would let a proof age out between refreshes", () => {
-    expect(() => composition({ killSwitch: { reader: new FakeKillSwitchReader(), refreshIntervalMs: 3_000, cancels: new FakeCancels(), releaseSettleMs: RELEASE_SETTLE_MS } })).toThrow(LiveSafetyConfigurationError);
+    expect(() => composition({ killSwitch: { reader: new FakeKillSwitchReader(), refreshIntervalMs: 3_000, cancels: new FakeCancels(), releaseSettleMs: RELEASE_SETTLE_MS, releaseFinality: new FakeReleaseFinality() } })).toThrow(LiveSafetyConfigurationError);
   });
 
   it("refuses a missing release settle window and a missing OMS progress monitor", () => {
     expect(() => composition({ killSwitch: { reader: new FakeKillSwitchReader(), refreshIntervalMs: 1_000, cancels: new FakeCancels() } as never })).toThrow(LiveSafetyConfigurationError);
     expect(() => composition({ omsProgress: undefined as never })).toThrow(LiveSafetyConfigurationError);
+  });
+
+  it("r2 X2: refuses a missing (or unusable) release finality port: without positive evidence no release could ever be judged", () => {
+    for (const releaseFinality of [undefined, null, {}, { isFinal: true }]) {
+      expect(() =>
+        composition({ killSwitch: { reader: new FakeKillSwitchReader(), refreshIntervalMs: 1_000, cancels: new FakeCancels(), releaseSettleMs: RELEASE_SETTLE_MS, releaseFinality: releaseFinality as never } }),
+      ).toThrow(LiveSafetyConfigurationError);
+    }
   });
 });
 
@@ -304,6 +317,57 @@ describe("r1 I5: the OMS input ages while an OMS port call hangs", () => {
     expect(verdict.permitted === false ? verdict.reasons : []).toEqual(["HEALTH_OMS_STORE_NOT_INSTRUMENTED"]);
   });
 
+  /**
+   * r2, X4 (HIGH). At round 1 only the store had to be wrapped: an OMS stuck on its reservation port (WP-300's journal
+   * append that never acknowledges) had nothing tracked pending, so the input read healthy and the heartbeat ran on
+   * (reproduced with the real OMS). Every asynchronous persistence port must now be instrumented, or nothing is proved.
+   */
+  it("r2 X4: coverage is evidence: a monitor with only the store wrapped proves nothing (RESERVATIONS_NOT_INSTRUMENTED), nor with the cipher missing (CIPHER_NOT_INSTRUMENTED); all three wrapped through dependencies() proves", async () => {
+    const clock = new ManualClock();
+    const onlyStore = new OmsProgressMonitor({ clock });
+    onlyStore.store(new HangableOmsStore());
+    const c = composition({ omsProgress: onlyStore }, clock);
+    await ready(c);
+    // On 21aee56 the store alone sufficed: this gate was permitted.
+    expect(c.safety.heartbeatGate.evaluate()).toMatchObject({ permitted: false, reasons: ["HEALTH_OMS_RESERVATIONS_NOT_INSTRUMENTED"] });
+    onlyStore.reservations(new HangableReservations());
+    expect(c.safety.heartbeatGate.evaluate()).toMatchObject({ permitted: false, reasons: ["HEALTH_OMS_CIPHER_NOT_INSTRUMENTED"] });
+    onlyStore.cipher(new HangableCipher());
+    expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+    expect(onlyStore.instrumented()).toEqual(["store", "reservations", "cipher"]);
+
+    const whole = new OmsProgressMonitor({ clock });
+    const other = { newId: () => "id-1" };
+    const deps = whole.dependencies({ store: new HangableOmsStore(), reservations: new HangableReservations(), cipher: new HangableCipher(), ...other });
+    expect(whole.reading(clock.now)).toEqual({ healthy: true, provenAtMs: clock.now });
+    expect(deps.newId).toBe(other.newId);
+    expect(Object.keys(deps).sort()).toEqual(["cipher", "newId", "reservations", "store"]);
+  });
+
+  for (const port of ["reservations", "cipher"] as const) {
+    it(`r2 X4: a ${port} call that never settles fails OMS after its maximum age, with no store call pending and \`faulted\` false; the heartbeat stops`, async () => {
+      const c = composition();
+      await ready(c);
+      expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+      if (port === "reservations") {
+        c.rawReservations.hang = true;
+        void c.omsReservations.reserve({});
+      } else {
+        c.rawCipher.hang = true;
+        void c.omsCipher.encrypt("signed-order-payload");
+      }
+      expect(c.omsProgress.pendingCount()).toBe(1);
+      await c.clock.advance(HEALTH_MAX_AGE.OMS);
+      c.proveComposition();
+      expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+      await c.clock.advance(1);
+      c.proveComposition();
+      expect(c.oms.faulted).toBe(false);
+      const verdict = c.safety.heartbeatGate.evaluate();
+      expect(verdict.permitted === false ? verdict.reasons : []).toEqual(["HEALTH_OMS_PROOF_STALE"]);
+    });
+  }
+
   it("calls that settle leave the input proved now; a refused store write still faults the OMS at once", async () => {
     const c = composition();
     await ready(c);
@@ -347,6 +411,181 @@ describe("r1 I2: the composition's fenced venue judges every order with its OWN 
     expect(sent).toEqual(["there"]);
     // An order with no scope is never sent.
     expect(await fenced.createLimitOrder("anything")).toBe("FAILED(PLACEMENT_UNCLASSIFIED)");
+  });
+});
+
+/**
+ * r2, X3 (HIGH). At round 1 a switch's cancel ended after the confirming sweep: a placement already handed to the
+ * venue when a MARKET FULL_HALT was observed, landing after both sweeps, rested indefinitely while the account's
+ * heartbeat kept it alive (reproduced with the real OMS). The cancel is now an obligation held while a placement in
+ * its scope is pending, renewed after one settles, and held while the OMS shows an order in the scope resting.
+ */
+describe("r2 X3: a kill switch's cancel is an obligation held until its scope is quiescent", () => {
+  const OTHER_MARKET = "0190a3e0-0000-7000-8000-0000000000ff";
+  const OTHER_INSTANCE = "0190a3e0-0000-7000-8000-0000000000fe";
+
+  /** A fenced venue whose placements are held in flight until the test lands them. */
+  interface HeldOrder {
+    readonly id: string;
+    readonly marketId: string;
+    readonly instanceId: string;
+  }
+
+  function heldVenue(c: ReturnType<typeof composition>): { fenced: PlacementVenuePort<string, string, HeldOrder, string, string>; land(id: string): void } {
+    const pending = new Map<string, () => void>();
+    const venue: PlacementVenuePort<string, string, HeldOrder, string, string> = {
+      createLimitOrder: async (request: string) => `SIGNED:${request}`,
+      postOrder: async (order: HeldOrder) => {
+        await new Promise<void>((resolve) => {
+          pending.set(order.id, resolve);
+        });
+        return `ACCEPTED:${order.id}`;
+      },
+      postOrders: async (orders: readonly HeldOrder[]) => orders.map((order) => `ACCEPTED:${order.id}`),
+      cancelOrder: async () => "CANCELED",
+    };
+    const fenced = c.safety.fenceVenue(
+      venue,
+      { signRefused: (reasons) => `FAILED(${reasons.join(",")})`, placementRefused: (reasons) => `NOT_SENT(${reasons.join(",")})` },
+      { request: () => null, signedOrder: () => undefined, order: (order) => ({ intent: "REDUCTION", marketId: order.marketId, instanceId: order.instanceId }) },
+    );
+    return {
+      fenced,
+      land: (id: string): void => {
+        const resolve = pending.get(id);
+        if (resolve === undefined) throw new Error(`${id} is not in flight`);
+        pending.delete(id);
+        resolve();
+      },
+    };
+  }
+
+  function passes(c: ReturnType<typeof composition>): string[] {
+    return c.journal.of("KILL_SWITCH_CANCEL_REQUESTED").map((entry) => entry.pass);
+  }
+
+  it("a placement in flight when a MARKET FULL_HALT is observed, landing after the first and confirming cancels: the obligation is RETAINED while it is pending, and the market is cancelled AFTER it settles; then nothing more", async () => {
+    const c = composition();
+    await ready(c);
+    const { fenced, land } = heldVenue(c);
+    const placement = fenced.postOrder({ id: "in-flight", marketId: MARKET, instanceId: INSTANCE });
+    await c.clock.advance(0);
+    expect(c.safety.pendingPlacements()).toBe(1);
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(4_000);
+    // FIRST, CONFIRMING, then RETAINED once per refresh interval while the placement is pending.
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED"]);
+    land("in-flight");
+    expect(await placement).toBe("ACCEPTED:in-flight");
+    expect(c.safety.pendingPlacements()).toBe(0);
+    const before = c.cancels.calls.length;
+    await c.clock.advance(1_000);
+    // On 21aee56 nothing was requested after the confirming sweep: the late acceptance rested.
+    expect(passes(c).at(-1)).toBe("AFTER_SETTLE");
+    expect(c.cancels.calls.slice(before)).toEqual([JSON.stringify({ scope: "MARKET", marketId: MARKET })]);
+    await c.clock.advance(5_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED", "AFTER_SETTLE"]);
+    // The heartbeat is never stopped by a MARKET switch (ADR-033 D1 item 3).
+    c.proveComposition();
+    expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+  });
+
+  it("a placement that settles while the confirming cancel is in flight still calls for a cancel requested after it", async () => {
+    const c = composition();
+    await ready(c);
+    const { fenced, land } = heldVenue(c);
+    const placement = fenced.postOrder({ id: "racing", marketId: MARKET, instanceId: INSTANCE });
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(1_000);
+    expect(passes(c)).toEqual(["FIRST"]);
+    let releaseCancel: () => void = () => undefined;
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      await new Promise<void>((resolve) => {
+        releaseCancel = resolve;
+      });
+      return true;
+    };
+    await c.clock.advance(1_000);
+    // The confirming cancel was requested; the placement settles before it is answered.
+    land("racing");
+    await placement;
+    releaseCancel();
+    await c.clock.advance(0);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING"]);
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      return true;
+    };
+    await c.clock.advance(1_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "AFTER_SETTLE"]);
+  });
+
+  it("venue evidence: after the confirming cancel, an order the OMS shows resting in the halted market keeps the obligation (RETAINED once per refresh interval) until the OMS shows it CANCELED; an order in another market does not", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.views = [
+      { orderId: "o-here", state: "LIVE", venueOrderId: "v-here", marketId: MARKET },
+      { orderId: "o-there", state: "LIVE", venueOrderId: "v-there", marketId: OTHER_MARKET },
+    ];
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(4_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED"]);
+    for (const state of ["SUBMISSION_UNKNOWN", "CANCEL_PENDING"]) {
+      c.oms.views = [{ orderId: "o-here", state, venueOrderId: "v-here", marketId: MARKET }];
+      await c.clock.advance(1_000);
+      expect(passes(c).at(-1)).toBe("RETAINED");
+    }
+    const count = passes(c).length;
+    c.oms.views = [
+      { orderId: "o-here", state: "CANCELED", venueOrderId: "v-here", marketId: MARKET },
+      { orderId: "o-there", state: "LIVE", venueOrderId: "v-there", marketId: OTHER_MARKET },
+    ];
+    await c.clock.advance(5_000);
+    expect(passes(c)).toHaveLength(count);
+    // An unreadable OMS view is not evidence the scope is clear.
+    c.oms.orders = () => {
+      throw new Error("unreadable");
+    };
+    await c.clock.advance(1_000);
+    expect(passes(c).at(-1)).toBe("RETAINED");
+  });
+
+  it("a STRATEGY_INSTANCE FULL_HALT: a pending placement of that instance holds the obligation and its settling calls for another cancel; a placement of another instance does neither", async () => {
+    const c = composition();
+    await ready(c);
+    const { fenced, land } = heldVenue(c);
+    const mine = fenced.postOrder({ id: "mine", marketId: MARKET, instanceId: INSTANCE });
+    const theirs = fenced.postOrder({ id: "theirs", marketId: MARKET, instanceId: OTHER_INSTANCE });
+    c.reader.rows = [engageRow({ id: "s", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+    await c.clock.advance(3_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED"]);
+    land("theirs");
+    await theirs;
+    await c.clock.advance(1_000);
+    expect(passes(c).at(-1)).toBe("RETAINED");
+    land("mine");
+    await mine;
+    await c.clock.advance(1_000);
+    expect(passes(c).at(-1)).toBe("AFTER_SETTLE");
+    await c.clock.advance(3_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED", "AFTER_SETTLE"]);
+  });
+
+  it("an account-ending GLOBAL switch is held by a pending placement in ANY market; an obligation whose switch is released is dropped", async () => {
+    const c = composition();
+    await ready(c);
+    const { fenced, land } = heldVenue(c);
+    const placement = fenced.postOrder({ id: "anywhere", marketId: OTHER_MARKET, instanceId: OTHER_INSTANCE });
+    c.reader.rows = [engageRow({ id: "g", scope: "GLOBAL", scopeRef: null, action: "CANCEL_ALL" })];
+    await c.clock.advance(3_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED"]);
+    c.reader.rows = [];
+    await c.clock.advance(1_000);
+    land("anywhere");
+    await placement;
+    await c.clock.advance(3_000);
+    expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED"]);
   });
 });
 

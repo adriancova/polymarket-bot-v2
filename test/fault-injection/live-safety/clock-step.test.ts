@@ -85,7 +85,7 @@ describe("the clock steps", () => {
     // Another process takes the fence with a higher token, after waiting the lease out; A's submissions stay refused.
     const b = await liveProcess({ time, store, holderId: "trader-b", acquire: false });
     let acquired = false;
-    for (let round = 0; round < 20 && !acquired; round += 1) {
+    for (let round = 0; round < 40 && !acquired; round += 1) {
       acquired = (await b.safety.acquireFence()).kind === "ACQUIRED";
       if (!acquired) await b.step(2_000);
     }
@@ -111,7 +111,7 @@ describe("the clock steps", () => {
     expect(a.safety.status().fence.held).toBe(true);
     let both = 0;
     let acquired = false;
-    for (let round = 0; round < 160 && !acquired; round += 1) {
+    for (let round = 0; round < 320 && !acquired; round += 1) {
       await a.step(125);
       await b.step(125);
       if (a.safety.currentFence() !== null && b.safety.currentFence() !== null) both += 1;

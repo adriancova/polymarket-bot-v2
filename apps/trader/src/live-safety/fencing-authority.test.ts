@@ -7,6 +7,7 @@
  * `test/integration/postgres/fencing-race.test.ts`.
  */
 
+import { FENCING_LEASE_MAX_TTL_MS, FENCING_LEASE_MIN_TTL_MS } from "@polymarket-bot/storage-postgres";
 import { describe, expect, it } from "vitest";
 
 import { LIVE_CONTEXT, ManualClock, MemoryFencingStore, REPOSITORY_DEFAULTS_LIVE_MICRO } from "./fakes.test-support.js";
@@ -23,8 +24,8 @@ import {
 const TTL = 30_000;
 const SAFETY = 2_000;
 const TRANSMIT = 3_000;
-/** The takeover wait: a whole lease plus the safety margin, on the successor's own clock. */
-const WAIT = TTL + SAFETY;
+/** The takeover wait: the code-level bound on EVERY lease plus the safety margin, on the successor's own clock (r2 X1). */
+const WAIT = FENCING_LEASE_MAX_TTL_MS + SAFETY;
 
 function context(runMode: string): RunModeContext {
   return { runMode, maximumRunMode: "LIVE", allowRealOrders: true };
@@ -300,7 +301,7 @@ describe("work-plan acceptance: two live writers cannot both hold authority", ()
     const { clock, store, a, b } = pair();
     expect((await a.acquire()).kind).toBe("ACQUIRED");
     expect((await b.acquire()).kind).toBe("HELD_ELSEWHERE");
-    for (let step = 0; step < 160; step += 1) {
+    for (let step = 0; step < 240; step += 1) {
       await clock.advance(500);
       if (step % 7 === 0) await b.acquire();
       expect(a.check().held && b.check().held).toBe(false);
@@ -343,7 +344,7 @@ describe("work-plan acceptance: two live writers cannot both hold authority", ()
     let bothHeld = 0;
     let acquiredAt: number | null = null;
     const firstSight = clock.now;
-    for (let step = 0; step < 80 && acquiredAt === null; step += 1) {
+    for (let step = 0; step < 160 && acquiredAt === null; step += 1) {
       await clock.advance(500);
       if (step % 10 === 0) await a.renew();
       const result = await b.acquire();
@@ -373,7 +374,7 @@ describe("work-plan acceptance: two live writers cannot both hold authority", ()
     expect(b.check().held).toBe(false);
     let bothHeld = 0;
     let acquired = false;
-    for (let step = 0; step < 80 && !acquired; step += 1) {
+    for (let step = 0; step < 160 && !acquired; step += 1) {
       await clock.advance(500);
       if (step % 10 === 0) await a.renew();
       acquired = (await b.acquire()).kind === "ACQUIRED";
@@ -409,5 +410,134 @@ describe("work-plan acceptance: two live writers cannot both hold authority", ()
     expect(await b.acquire()).toMatchObject({ kind: "LAPSED_WAITING", remainingMs: 1 });
     await clock.advance(1);
     expect((await b.acquire()).kind).toBe("ACQUIRED");
+  });
+});
+
+/**
+ * r2, X1 (CRITICAL). At round 1 the successor waited its OWN `ttl + safetyMargin`: a successor configured with a
+ * shorter TTL than its incumbent presented its takeover while the incumbent's local deadline still held, and both
+ * fenced ports sent (reproduced on real PostgreSQL by both verifiers). The wait is now the code-level bound on every
+ * lease, which the store enforces on every grant and renewal, plus the successor's margin; and the store grants over
+ * an incumbent only once its own expiry has passed by the database's clock.
+ */
+describe("r2 X1: the takeover wait is the code-level bound on EVERY lease, never the successor's own ttl", () => {
+  it("the bound is one minute; takeoverWaitMs is the bound plus this process's margin, whatever its own ttl", () => {
+    expect(FENCING_LEASE_MAX_TTL_MS).toBe(60_000);
+    for (const ttlMs of [1_000, 5_000, 30_000, 60_000]) {
+      const { authority } = setup({ ttlMs, safetyMarginMs: 300, transmitMarginMs: 300 });
+      expect(authority.takeoverWaitMs).toBe(60_300);
+    }
+  });
+
+  it("a ttl above the bound (or below the minimum) is refused at create, before the store is touched; the store refuses it on renewal too", async () => {
+    for (const ttlMs of [60_001, 3_600_000, 999]) {
+      const clock = new ManualClock();
+      const store = new MemoryFencingStore(() => clock.now);
+      expect(() => FencingAuthority.create({ runModeContext: LIVE_CONTEXT, accountRef: "acct-1", holderId: "a", store, clock, ttlMs, safetyMarginMs: 100, transmitMarginMs: 100 })).toThrow(FencingAuthorityConfigurationError);
+      expect(store.calls).toEqual([]);
+    }
+    expect(FENCING_LEASE_MIN_TTL_MS).toBe(1_000);
+  });
+
+  it("a successor configured with a SHORTER ttl than its incumbent never holds while the incumbent does: A (ttl 60 s) is revoked right after renewing and does not renew again; B (ttl 1 s) asks at once and keeps asking; never both held", async () => {
+    const clock = new ManualClock();
+    const store = new MemoryFencingStore(() => clock.now);
+    const common = { runModeContext: LIVE_CONTEXT, accountRef: "acct-1", store, clock };
+    const a = FencingAuthority.create({ ...common, holderId: "trader-a", ttlMs: 60_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 });
+    const b = FencingAuthority.create({ ...common, holderId: "trader-b", ttlMs: 1_000, safetyMarginMs: 100, transmitMarginMs: 100 });
+    const first = await a.acquire();
+    if (first.kind !== "ACQUIRED") throw new Error("not acquired");
+    await clock.advance(5_000);
+    expect(await a.renew()).toBe("RENEWED");
+    expect(store.revoke(first.fence.fencingLeaseId, "operator: suspected second writer")).toBe(true);
+    // A is partitioned from here (or simply between renewals): its local deadline (+5 s + 60 s − 2 s) stands.
+    expect((await b.acquire()).kind).toBe("LAPSED_WAITING");
+    const firstSight = clock.now;
+    let bothHeld = 0;
+    let acquiredAt: number | null = null;
+    for (let step = 0; step < 400 && acquiredAt === null; step += 1) {
+      await clock.advance(250);
+      if ((await b.acquire()).kind === "ACQUIRED") acquiredAt = clock.now;
+      if (a.check().held && b.check().held) bothHeld += 1;
+    }
+    // On 21aee56, B was granted 1.1 s after its first sight while A held for another ~57 s.
+    expect(bothHeld).toBe(0);
+    expect(acquiredAt).not.toBeNull();
+    expect((acquiredAt ?? 0) - firstSight).toBeGreaterThanOrEqual(60_100);
+    expect(a.check()).toMatchObject({ held: false, reason: "EXPIRED" });
+  });
+
+  it("the durable bound: a grant made OUTSIDE the TTL bound (a WP-040-style caller-supplied expiry 10 min ahead), revoked, is waited out to the expiry it wrote, however long the successor has waited locally", async () => {
+    const clock = new ManualClock();
+    const store = new MemoryFencingStore(() => clock.now);
+    const foreign = store.insertForeignGrant({ accountRef: "acct-1", holderId: "legacy-writer", expiresInMs: 600_000 });
+    expect(store.revoke(foreign, "operator revocation")).toBe(true);
+    const b = FencingAuthority.create({ runModeContext: LIVE_CONTEXT, accountRef: "acct-1", holderId: "trader-b", store, clock, ttlMs: TTL, safetyMarginMs: SAFETY, transmitMarginMs: TRANSMIT });
+    expect(await b.acquire()).toMatchObject({ kind: "LAPSED_WAITING", status: "REVOKED", remainingMs: 600_000 });
+    await clock.advance(WAIT);
+    // Waited out locally, presented, and still refused: the revoked grant's own expiry lies ahead.
+    expect(await b.acquire()).toMatchObject({ kind: "LAPSED_WAITING", remainingMs: 600_000 - WAIT });
+    expect(b.check().held).toBe(false);
+    await clock.advance(600_000 - WAIT - 1);
+    expect(await b.acquire()).toMatchObject({ kind: "LAPSED_WAITING", remainingMs: 1 });
+    await clock.advance(1);
+    expect((await b.acquire()).kind).toBe("ACQUIRED");
+  });
+
+  /**
+   * r2 O1 (Opus R2-L1): the wait is timed from first sight AFTER the call that returned the version, never from the
+   * instant before it. A slow call (a pool or row-lock wait) can START before the incumbent's last renewal and
+   * return after a revocation; timed from its start, the successor would hand over early. The database clock steps
+   * forward after the sighting, so the store's own expiry check (the durable bound) does not mask the anchor.
+   */
+  it("r2 O1: the wait is anchored at the END of the call that first returned the version: a call that started before the incumbent's last renewal never hands over early", async () => {
+    const clock = new ManualClock();
+    let skew = 0;
+    const store = new MemoryFencingStore(() => clock.now + skew);
+    let open: () => void = () => undefined;
+    let gated = false;
+    const slowForB: FencingLeasePort = {
+      acquire: async (input) => {
+        if (gated && input.holderId === "trader-b") {
+          await new Promise<void>((resolve) => {
+            open = resolve;
+          });
+          gated = false;
+        }
+        return store.acquire(input);
+      },
+      renew: async (ref, ttl) => store.renew(ref, ttl),
+      release: async (ref, reason) => store.release(ref, reason),
+      recordHeartbeatId: async (ref, id) => store.recordHeartbeatId(ref, id),
+    };
+    const common = { runModeContext: LIVE_CONTEXT, accountRef: "acct-1", store: slowForB, clock, ttlMs: 60_000 };
+    const a = FencingAuthority.create({ ...common, holderId: "trader-a", safetyMarginMs: 2_000, transmitMarginMs: 3_000 });
+    const b = FencingAuthority.create({ ...common, holderId: "trader-b", safetyMarginMs: 100, transmitMarginMs: 100 });
+    const first = await a.acquire();
+    if (first.kind !== "ACQUIRED") throw new Error("not acquired");
+    // B's call starts now and waits (a pool or lock wait) …
+    gated = true;
+    const slow = b.acquire();
+    await clock.advance(8_000);
+    // … while A renews (its deadline: +8 s + 60 s − 2 s) and is then revoked …
+    expect(await a.renew()).toBe("RENEWED");
+    await clock.advance(500);
+    expect(store.revoke(first.fence.fencingLeaseId, "operator revocation")).toBe(true);
+    await clock.advance(1_500);
+    // … and B's read lands only now, 10 s after its call started.
+    open();
+    expect(await slow).toMatchObject({ kind: "LAPSED_WAITING", status: "REVOKED" });
+    const firstSight = clock.now;
+    // The database's clock steps 40 s ahead: by it, A's lease has long expired.
+    skew = 40_000;
+    let bothHeld = 0;
+    let acquiredAt: number | null = null;
+    for (let step = 0; step < 400 && acquiredAt === null; step += 1) {
+      await clock.advance(250);
+      if ((await b.acquire()).kind === "ACQUIRED") acquiredAt = clock.now;
+      if (a.check().held && b.check().held) bothHeld += 1;
+    }
+    expect(bothHeld).toBe(0);
+    expect((acquiredAt ?? 0) - firstSight).toBeGreaterThanOrEqual(b.takeoverWaitMs);
   });
 });

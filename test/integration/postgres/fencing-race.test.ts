@@ -15,7 +15,13 @@
  *   trigger refuses its attempt);
  * - r1 I1 end to end: the REAL `FencingAuthority` of two processes over this
  *   store, an operator's revocation, and both gates asked throughout: the
- *   successor is granted only a whole lease after its first sight;
+ *   successor is granted only the bound (`FENCING_LEASE_MAX_TTL_MS` plus its
+ *   margin) after its first sight;
+ * - r2 X1: a successor configured with a SHORTER TTL than its incumbent (both
+ *   verifiers' reproduction) never holds while the incumbent does; the store
+ *   refuses a TTL above the bound on acquisition and renewal, and grants over
+ *   an ended lease only once its own expiry has passed by the database's
+ *   clock;
  * - r1 I4: a renewal that waits on a lock-only holder (migration 0008's
  *   `FOR SHARE`) past the expiry finds the lease LOST, never revives it;
  * - r1 I12 (N6): a renewal or heartbeat-id write naming another holder;
@@ -36,6 +42,8 @@ import { createTradingChain } from "@polymarket-bot/storage-postgres/testing";
 import {
   ConstraintViolationError,
   createFencingLeaseStore,
+  FENCING_LEASE_MAX_TTL_MS,
+  FencingLeaseInputError,
   FencingReferenceInvalidError,
   FencingRunModeNotPermittedError,
   NonRealModeFencingLeaseError,
@@ -48,6 +56,7 @@ import {
 } from "@polymarket-bot/storage-postgres";
 import { beforeAll, describe, expect, it } from "vitest";
 
+import { fenceVenuePort } from "../../../apps/trader/src/live-safety/fenced-venue.js";
 import { FencingAuthority } from "../../../apps/trader/src/live-safety/fencing-authority.js";
 
 import { captureRejection, useMigratedDatabase } from "./context.js";
@@ -223,25 +232,28 @@ describe("a takeover happens only over an ENDED incumbent whose exact version is
     expect(await store.isValid(refOf(a))).toBe(false);
   });
 
-  it("an operator's revocation ends the lease at once, with its reason; the holder cannot renew; the next grant (over the presented REVOKED version) has a higher token", async () => {
+  it("an operator's revocation ends the lease at once, with its reason; the holder cannot renew; the next grant (over the presented REVOKED version, once its own expiry has passed) has a higher token", async () => {
     const account = "live-account-revoke";
-    const a = grantOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 60_000 }));
+    const a = grantOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 1_000 }));
     expect(await store.revoke({ fencingLeaseId: a.fencingLeaseId, reason: "operator: suspected second writer" })).toBe(true);
     expect(await store.revoke({ fencingLeaseId: a.fencingLeaseId, reason: "again" })).toBe(false);
     expect(await store.renew(refOf(a), 60_000)).toEqual({ kind: "LOST" });
     const row = await context.pool.query<{ status: string; revoked_reason: string }>(`select status, revoked_reason from ops.fencing_leases where fencing_lease_id = $1`, [a.fencingLeaseId]);
     expect(row.rows[0]).toEqual({ status: "REVOKED", revoked_reason: "operator: suspected second writer" });
+    await sleep(1_200);
     const again = await takeOver({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 60_000 });
     expect(BigInt(again.fencingToken)).toBe(BigInt(a.fencingToken) + 1n);
   });
 
-  it("r1 I1: a REVOKED lease is never granted over at once: the answer is LAPSED; a stale or forged version is refused; only the exact version is granted", async () => {
+  it("r1 I1: a REVOKED lease is never granted over at once: the answer is LAPSED; a stale or forged version is refused; only the exact version is granted (r2 X1: and only once the revoked lease's own expiry has passed by the database's clock)", async () => {
     const account = "live-account-revoke-takeover";
-    const a = grantOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 60_000 }));
+    const a = grantOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 2_000 }));
     expect(await store.revoke({ fencingLeaseId: a.fencingLeaseId, reason: "operator revocation" })).toBe(true);
-    // On the candidate this acquisition was granted at once (step 3 looked only at ACTIVE rows).
+    // On the round-0 candidate this acquisition was granted at once (step 3 looked only at ACTIVE rows).
     const incumbent = lapsedOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-b", ttlMs: 60_000 }));
     expect(incumbent).toMatchObject({ fencingLeaseId: a.fencingLeaseId, fencingToken: a.fencingToken, holderId: "trader-a", status: "REVOKED" });
+    expect(incumbent.databaseRemainingMs).toBeGreaterThan(0);
+    expect(incumbent.databaseRemainingMs).toBeLessThanOrEqual(2_000);
     for (const forged of [
       { fencingLeaseId: a.fencingLeaseId, fencingToken: a.fencingToken, version: `${incumbent.version}x` },
       { fencingLeaseId: a.fencingLeaseId, fencingToken: "999", version: incumbent.version },
@@ -249,11 +261,28 @@ describe("a takeover happens only over an ENDED incumbent whose exact version is
     ]) {
       expect((await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-b", ttlMs: 60_000, takeover: forged })).kind).toBe("LAPSED");
     }
+    const exact = { fencingLeaseId: incumbent.fencingLeaseId, fencingToken: incumbent.fencingToken, version: incumbent.version };
+    // r2 X1, the durable bound: the EXACT version, presented while the revoked lease's expiry lies ahead, is refused.
+    const early = lapsedOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-b", ttlMs: 60_000, takeover: exact }));
+    expect(early.version).toBe(incumbent.version);
+    expect(early.databaseRemainingMs).toBeGreaterThan(0);
     expect(await activeCount(account)).toBe(0);
-    const b = grantOf(
-      await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-b", ttlMs: 60_000, takeover: { fencingLeaseId: incumbent.fencingLeaseId, fencingToken: incumbent.fencingToken, version: incumbent.version } }),
-    );
+    await sleep(2_200);
+    const b = grantOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-b", ttlMs: 60_000, takeover: exact }));
     expect(BigInt(b.fencingToken)).toBe(BigInt(a.fencingToken) + 1n);
+  });
+
+  it("r2 X1: the store refuses a TTL above the bound (one minute) on acquisition AND on renewal, before any SQL", async () => {
+    const account = "live-account-ttl-bound";
+    expect(FENCING_LEASE_MAX_TTL_MS).toBe(60_000);
+    const refused = await captureRejection(async () => acquire({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 60_001 }));
+    expect(refused).toBeInstanceOf(FencingLeaseInputError);
+    expect(await activeCount(account)).toBe(0);
+    const a = grantOf(await acquire({ accountRef: account, environment: "LIVE", holderId: "trader-a", ttlMs: 60_000 }));
+    const before = await context.pool.query<{ expires_at: string }>(`select expires_at::text from ops.fencing_leases where fencing_lease_id = $1`, [a.fencingLeaseId]);
+    expect(await captureRejection(async () => store.renew(refOf(a), 3_600_000))).toBeInstanceOf(FencingLeaseInputError);
+    const after = await context.pool.query<{ expires_at: string }>(`select expires_at::text from ops.fencing_leases where fencing_lease_id = $1`, [a.fencingLeaseId]);
+    expect(after.rows[0]).toEqual(before.rows[0]);
   });
 
   it("r1 I1: a version that changes while the successor waits (the housekeeping relabel of an expired lease) is not granted over: the wait restarts on the new version", async () => {
@@ -270,10 +299,25 @@ describe("a takeover happens only over an ENDED incumbent whose exact version is
   });
 });
 
+/**
+ * The authorities' monotonic clock: real time plus an offset the test moves forward, so a whole bound (one minute)
+ * passes for the PROCESSES in seconds while the DATABASE keeps real time. Both authorities share it, as two processes
+ * on one host share a clock rate.
+ */
+function fastClock(): { monotonicMs(): number; skip(ms: number): void } {
+  let offset = 0;
+  return {
+    monotonicMs: (): number => performance.now() + offset,
+    skip: (ms: number): void => {
+      offset += ms;
+    },
+  };
+}
+
 describe("r1 I1 end to end: two REAL fencing authorities over this store, an operator's revocation, both gates asked throughout", () => {
-  it("the successor asking at once is not granted; the revoked holder stops at its next renewal; the successor is granted only a whole lease after its first sight; never both held", async () => {
+  it("the successor asking at once is not granted; the revoked holder stops at its next renewal; the successor is granted only the bound after its first sight; never both held", async () => {
     const account = "live-account-authorities";
-    const clock = { monotonicMs: (): number => performance.now() };
+    const clock = fastClock();
     const options = { runModeContext: { runMode: "LIVE", maximumRunMode: "LIVE", allowRealOrders: true }, accountRef: account, store, clock, ttlMs: 1_500, safetyMarginMs: 200, transmitMarginMs: 300 };
     const a = FencingAuthority.create({ ...options, holderId: "trader-a" });
     const b = FencingAuthority.create({ ...options, holderId: "trader-b" });
@@ -287,16 +331,71 @@ describe("r1 I1 end to end: two REAL fencing authorities over this store, an ope
     expect(b.check().held).toBe(false);
     let bothHeld = 0;
     let grantedAt: number | null = null;
-    for (let round = 0; round < 80 && grantedAt === null; round += 1) {
+    for (let round = 0; round < 200 && grantedAt === null; round += 1) {
       await sleep(50);
+      clock.skip(950);
       if (round % 4 === 0) await a.renew();
       if ((await b.acquire()).kind === "ACQUIRED") grantedAt = clock.monotonicMs();
       if (a.check().held && b.check().held) bothHeld += 1;
     }
     expect(bothHeld).toBe(0);
     expect(grantedAt).not.toBeNull();
-    expect((grantedAt ?? 0) - firstSight).toBeGreaterThanOrEqual(b.takeoverWaitMs - 50);
+    expect((grantedAt ?? 0) - firstSight).toBeGreaterThanOrEqual(b.takeoverWaitMs);
     expect(a.lossReason()).toBe("RENEW_LOST");
+    expect(await activeCount(account)).toBe(1);
+  });
+});
+
+/**
+ * r2, X1 (CRITICAL), both verifiers' reproduction on real PostgreSQL: A held a 30 s lease, B was configured with 1 s;
+ * after a revocation B acquired 1.2 s later while A had ~28.7 s left, and both fenced ports sent (`["A","B"]`). A
+ * longer TTL than the bound can no longer be configured, so A holds 5 s here (still five times B's).
+ */
+describe("r2 X1 end to end: a successor configured with a SHORTER ttl than its incumbent (two REAL authorities, real PostgreSQL)", () => {
+  it("A (ttl 5 s) is revoked and never renews; B (ttl 1 s) asks at once and keeps asking; never both held, and A's fenced port never sends once B's may", async () => {
+    const account = "live-account-shorter-successor";
+    const clock = fastClock();
+    const common = { runModeContext: { runMode: "LIVE", maximumRunMode: "LIVE", allowRealOrders: true }, accountRef: account, store, clock, safetyMarginMs: 100, transmitMarginMs: 100 };
+    const a = FencingAuthority.create({ ...common, holderId: "trader-a", ttlMs: 5_000 });
+    const b = FencingAuthority.create({ ...common, holderId: "trader-b", ttlMs: 1_000 });
+    const first = await a.acquire();
+    if (first.kind !== "ACQUIRED") throw new Error(`A not acquired: ${first.kind}`);
+    expect(await store.revoke({ fencingLeaseId: first.fence.fencingLeaseId, reason: "operator revocation" })).toBe(true);
+    expect((await b.acquire()).kind).toBe("LAPSED_WAITING");
+    const firstSight = clock.monotonicMs();
+    const sends: string[] = [];
+    const classifier = {
+      request: () => ({ intent: "REDUCTION" as const, marketId: "m", instanceId: "i" }),
+      signedOrder: (x: object) => x,
+      order: () => ({ intent: "REDUCTION" as const, marketId: "m", instanceId: "i" }),
+    };
+    const portOf = (name: string, authority: FencingAuthority) =>
+      fenceVenuePort(
+        { createLimitOrder: async (x: object) => x, postOrder: async () => { sends.push(name); return "SENT"; }, postOrders: async () => [], cancelOrder: async () => true },
+        () => ({ permitted: authority.check().held, reasons: [] }),
+        { signRefused: () => ({}), placementRefused: () => "NOT_SENT" },
+        classifier,
+      );
+    const venueA = portOf("A", a);
+    const venueB = portOf("B", b);
+    let bothHeld = 0;
+    let grantedAt: number | null = null;
+    for (let round = 0; round < 200 && grantedAt === null; round += 1) {
+      await sleep(50);
+      clock.skip(450);
+      if ((await b.acquire()).kind === "ACQUIRED") grantedAt = clock.monotonicMs();
+      if (a.check().held && b.check().held) bothHeld += 1;
+      await venueA.postOrder({});
+      await venueB.postOrder({});
+    }
+    // On 21aee56: B granted 1.1 s after its first sight, A held for ~3.8 s more, and both ports sent.
+    expect(bothHeld).toBe(0);
+    expect(grantedAt).not.toBeNull();
+    expect((grantedAt ?? 0) - firstSight).toBeGreaterThanOrEqual(b.takeoverWaitMs);
+    const firstB = sends.indexOf("B");
+    expect(firstB).toBeGreaterThan(0);
+    expect(sends.slice(firstB)).not.toContain("A");
+    expect(a.check()).toMatchObject({ held: false, reason: "EXPIRED" });
     expect(await activeCount(account)).toBe(1);
   });
 });
@@ -397,11 +496,13 @@ describe("the token is monotonic, and expiry is the database's clock", () => {
     const account = "monotonic-account";
     let previous = 0n;
     for (let index = 0; index < 10; index += 1) {
-      const input = { accountRef: account, environment: index % 2 === 0 ? "LIVE" : "EXECUTION_PROBE", holderId: `trader-${String(index)}`, ttlMs: 60_000 };
+      const input = { accountRef: account, environment: index % 2 === 0 ? "LIVE" : "EXECUTION_PROBE", holderId: `trader-${String(index)}`, ttlMs: 1_000 };
       const grant = index === 0 ? grantOf(await acquire(input)) : await takeOver(input);
       expect(BigInt(grant.fencingToken)).toBe(previous + 1n);
       previous = BigInt(grant.fencingToken);
       expect(await store.release(refOf(grant), "rotation")).toBe(true);
+      // r2 X1: a released lease is granted over only once its own expiry has passed by the database's clock.
+      await sleep(1_100);
     }
     const highWater = await context.pool.query<{ highest_token: string }>(`select highest_token::text from ops.fencing_token_high_water where account_ref = $1`, [account]);
     expect(highWater.rows[0]?.highest_token).toBe("10");

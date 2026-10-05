@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { engageRow, FakeKillSwitchReader, ManualClock, releaseRow } from "./fakes.test-support.js";
+import { engageRow, FakeKillSwitchReader, FakeReleaseFinality, ManualClock, releaseRow } from "./fakes.test-support.js";
 import { foldKillSwitchRows, KILL_SWITCH_ACTIONS, killSwitchEffects, KillSwitchMonitor } from "./kill-switch.js";
 
 const ACCOUNT = "acct-1";
@@ -16,10 +16,25 @@ const INSTANCE = "0190a3e0-0000-7000-8000-00000000000a";
 /** Every release settled (the monitor's window passed): the fold alone. */
 const SETTLED = (): boolean => true;
 const UNSETTLED = (): boolean => false;
+/** Every release positively final (the composition holds evidence the control plane applied it), or none (r2 X2). */
+const FINAL = (): boolean => true;
+const NOT_FINAL = (): boolean => false;
 const SETTLE = 2_000;
 
 function effectsOf(rows: readonly unknown[]): ReturnType<typeof killSwitchEffects> {
-  return killSwitchEffects(foldKillSwitchRows(rows, SETTLED), ACCOUNT);
+  return killSwitchEffects(foldKillSwitchRows(rows, SETTLED, FINAL), ACCOUNT);
+}
+
+/** A monitor whose releases are all final unless the test says otherwise (`finality.all = false`). */
+function monitorOf(options: { readonly reader: ConstructorParameters<typeof KillSwitchMonitor>[0]["reader"]; readonly clock: ManualClock; readonly abandonAfterMs?: number; readonly finality?: FakeReleaseFinality }): KillSwitchMonitor {
+  return new KillSwitchMonitor({
+    reader: options.reader,
+    clock: options.clock,
+    accountRef: ACCOUNT,
+    releaseSettleMs: SETTLE,
+    releaseFinality: options.finality ?? new FakeReleaseFinality(),
+    ...(options.abandonAfterMs === undefined ? {} : { abandonAfterMs: options.abandonAfterMs }),
+  });
 }
 
 describe("ADR-033 D1 item 3: which switches stop the heartbeat", () => {
@@ -72,11 +87,11 @@ describe("ADR-033 D1 item 3: which switches stop the heartbeat", () => {
 
 describe("the fold fails closed", () => {
   it("a SETTLED, unvoided release row is not engaged", () => {
-    expect(foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })], SETTLED)).toEqual([]);
+    expect(foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })], SETTLED, FINAL)).toEqual([]);
   });
 
   it("r1 I6: a release a VOID names is still the switch it released, engaged in full: heartbeat stopped, cancels requested", () => {
-    const engaged = foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", voided: true })], SETTLED);
+    const engaged = foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", voided: true })], SETTLED, FINAL);
     expect(engaged).toEqual([{ environment: "LIVE_MICRO", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", killSwitchEventId: "r", unreadable: false, release: "VOIDED" }]);
     const effects = killSwitchEffects(engaged, ACCOUNT);
     expect(effects.stopsHeartbeat).toBe(true);
@@ -84,13 +99,13 @@ describe("the fold fails closed", () => {
   });
 
   it("r1 I6: a release not yet SETTLED is still the switch it releases (heartbeat stopped, entries and submissions blocked) but asks for no cancel", () => {
-    const engaged = foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })], UNSETTLED);
+    const engaged = foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })], UNSETTLED, FINAL);
     expect(engaged).toMatchObject([{ scope: "GLOBAL", action: "FULL_HALT", release: "PENDING", unreadable: false }]);
     const effects = killSwitchEffects(engaged, ACCOUNT);
     expect(effects.stopsHeartbeat).toBe(true);
     expect(effects.blocksAllSubmissions).toBe(true);
     expect(effects.cancels).toEqual([]);
-    const market = killSwitchEffects(foldKillSwitchRows([releaseRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "HALT_NEW_ENTRIES" })], UNSETTLED), ACCOUNT);
+    const market = killSwitchEffects(foldKillSwitchRows([releaseRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "HALT_NEW_ENTRIES" })], UNSETTLED, FINAL), ACCOUNT);
     expect([...market.entryBlockedMarkets]).toEqual([MARKET]);
     expect(market.stopsHeartbeat).toBe(false);
   });
@@ -98,17 +113,17 @@ describe("the fold fails closed", () => {
   it("r1 I6: a release whose `voided` is anything but the boolean false counts as voided; an unreadable released action is a FULL_HALT", () => {
     for (const voided of [undefined, "false", 0, null]) {
       const row = { ...releaseRow({ id: "r", scope: "MARKET", scopeRef: MARKET, action: "HALT_NEW_ENTRIES" }), voided };
-      expect(foldKillSwitchRows([row], SETTLED)).toMatchObject([{ release: "VOIDED", action: "HALT_NEW_ENTRIES" }]);
+      expect(foldKillSwitchRows([row], SETTLED, FINAL)).toMatchObject([{ release: "VOIDED", action: "HALT_NEW_ENTRIES" }]);
     }
     const garbled = { ...releaseRow({ id: "r", scope: "MARKET", scopeRef: MARKET, action: "HALT_NEW_ENTRIES" }), action: "SOMETHING" };
-    expect(foldKillSwitchRows([garbled], UNSETTLED)).toMatchObject([{ action: "FULL_HALT", unreadable: true, release: "PENDING" }]);
+    expect(foldKillSwitchRows([garbled], UNSETTLED, FINAL)).toMatchObject([{ action: "FULL_HALT", unreadable: true, release: "PENDING" }]);
   });
 
   it("a settle predicate that throws settles nothing", () => {
     const throwing = (): boolean => {
       throw new Error("x");
     };
-    expect(foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "CANCEL_ALL" })], throwing)).toMatchObject([{ release: "PENDING" }]);
+    expect(foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "CANCEL_ALL" })], throwing, FINAL)).toMatchObject([{ release: "PENDING" }]);
   });
 
   it("when the two orderings disagree (one shows the engage, one the release), the switch is engaged", () => {
@@ -139,7 +154,7 @@ describe("the fold fails closed", () => {
     ["a state whose scope is not the row's", { ...releaseRow({ id: "x", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }), scope: "GLOBAL", scopeRef: null }],
   ] as const) {
     it(`${name} is a FULL_HALT at the row's scope`, () => {
-      const engaged = foldKillSwitchRows([row], SETTLED);
+      const engaged = foldKillSwitchRows([row], SETTLED, FINAL);
       expect(engaged).toHaveLength(1);
       expect(engaged[0]).toMatchObject({ action: "FULL_HALT", unreadable: true });
     });
@@ -156,7 +171,7 @@ describe("the monitor: the latest read decides, and a failed read is unknown sta
   it("never read, read, failed: unknown, known, unknown again", async () => {
     const clock = new ManualClock();
     const reader = new FakeKillSwitchReader();
-    const monitor = new KillSwitchMonitor({ reader, clock, accountRef: ACCOUNT, releaseSettleMs: SETTLE });
+    const monitor = monitorOf({ reader, clock });
     expect(monitor.snapshot()).toEqual({ known: false, reason: "NEVER_READ" });
     expect(monitor.proofSource().read()).toEqual({ healthy: false, reason: "NEVER_READ" });
     expect(await monitor.refresh()).toBe(true);
@@ -171,7 +186,7 @@ describe("the monitor: the latest read decides, and a failed read is unknown sta
   it("the KILL_SWITCH health input fails while an account-ending switch is engaged, and holds for a MARKET switch", async () => {
     const clock = new ManualClock();
     const reader = new FakeKillSwitchReader();
-    const monitor = new KillSwitchMonitor({ reader, clock, accountRef: ACCOUNT, releaseSettleMs: SETTLE });
+    const monitor = monitorOf({ reader, clock });
     reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
     await monitor.refresh();
     expect(monitor.proofSource().read().healthy).toBe(true);
@@ -194,7 +209,7 @@ describe("the monitor: the latest read decides, and a failed read is unknown sta
         });
       },
     };
-    const monitor = new KillSwitchMonitor({ reader, clock, accountRef: ACCOUNT, releaseSettleMs: SETTLE, abandonAfterMs: 1_000 });
+    const monitor = monitorOf({ reader, clock, abandonAfterMs: 1_000 });
     const first = monitor.refresh();
     await clock.advance(999);
     void monitor.refresh();
@@ -214,14 +229,14 @@ describe("the monitor: the latest read decides, and a failed read is unknown sta
 
   it("one read at a time: a refresh during a read joins it", async () => {
     const reader = new FakeKillSwitchReader();
-    const monitor = new KillSwitchMonitor({ reader, clock: new ManualClock(), accountRef: ACCOUNT, releaseSettleMs: SETTLE });
+    const monitor = monitorOf({ reader, clock: new ManualClock() });
     await Promise.all([monitor.refresh(), monitor.refresh(), monitor.refresh()]);
     expect(reader.reads).toBe(1);
   });
 
   it("refuses a settle window outside 1 ms … 1 h", () => {
     for (const releaseSettleMs of [0, -1, 1.5, 3_600_001, Number.NaN]) {
-      expect(() => new KillSwitchMonitor({ reader: new FakeKillSwitchReader(), clock: new ManualClock(), accountRef: ACCOUNT, releaseSettleMs })).toThrow(TypeError);
+      expect(() => new KillSwitchMonitor({ reader: new FakeKillSwitchReader(), clock: new ManualClock(), accountRef: ACCOUNT, releaseSettleMs, releaseFinality: new FakeReleaseFinality() })).toThrow(TypeError);
     }
   });
 });
@@ -230,7 +245,7 @@ describe("r1 I6: a release releases only once SETTLED (seen for the window) and 
   async function released(): Promise<{ clock: ManualClock; reader: FakeKillSwitchReader; monitor: KillSwitchMonitor }> {
     const clock = new ManualClock();
     const reader = new FakeKillSwitchReader();
-    const monitor = new KillSwitchMonitor({ reader, clock, accountRef: ACCOUNT, releaseSettleMs: SETTLE });
+    const monitor = monitorOf({ reader, clock });
     reader.rows = [engageRow({ id: "e", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
     await monitor.refresh();
     return { clock, reader, monitor };
@@ -280,5 +295,111 @@ describe("r1 I6: a release releases only once SETTLED (seen for the window) and 
     await clock.advance(SETTLE - 1);
     await monitor.refresh();
     expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: true } });
+  });
+});
+
+/**
+ * r2, X2 (HIGH). At round 1 a settled, unvoided release was honoured on elapsed time alone. The control plane's VOID
+ * of a refused release is one best-effort append (no retry; refused when the ordinary audit tier is full; lost if the
+ * control plane dies), so a release whose VOID is late or never lands was honoured while the control plane still
+ * held the switch (both verifiers reproduced it on real PostgreSQL with GLOBAL FULL_HALT). A release now needs
+ * POSITIVE finality from the injected port; without it the switch stays enforced in full, for as long as it is seen.
+ */
+describe("r2 X2: a release releases only with POSITIVE finality; no VOID, at any age, is not evidence", () => {
+  it("a settled, unvoided release with no finality stays a GLOBAL FULL_HALT for as long as it is seen: heartbeat stopped, every submission blocked, cancels requested (UNCONFIRMED); it releases at the first read after the port confirms it", async () => {
+    const clock = new ManualClock();
+    const reader = new FakeKillSwitchReader();
+    const finality = new FakeReleaseFinality();
+    finality.all = false;
+    const monitor = monitorOf({ reader, clock, finality });
+    reader.rows = [engageRow({ id: "e", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    await monitor.refresh();
+    reader.rows = [releaseRow({ id: "late-release", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    await monitor.refresh();
+    for (let step = 0; step < 20; step += 1) {
+      await clock.advance(SETTLE);
+      expect(await monitor.refresh()).toBe(true);
+      // On 21aee56 this read released the switch (engaged: [], stopsHeartbeat: false) from the first settled read on.
+      expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: true, blocksAllEntries: true, blocksAllSubmissions: true } });
+      expect(monitor.proofSource().read()).toEqual({ healthy: false, reason: "ENGAGED_STOPS_HEARTBEAT" });
+    }
+    const snapshot = monitor.snapshot();
+    expect(snapshot.known ? snapshot.effects.engaged : null).toEqual([
+      { environment: "LIVE_MICRO", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT", killSwitchEventId: "late-release", unreadable: false, release: "UNCONFIRMED" },
+    ]);
+    expect(snapshot.known ? snapshot.effects.cancels : null).toEqual([{ directive: { scope: "ACCOUNT" }, killSwitchEventId: "late-release" }]);
+    expect(finality.asked).toContain("late-release");
+    // The composition obtains positive evidence that the control plane applied THIS release: it releases.
+    finality.confirmed.add("late-release");
+    await monitor.refresh();
+    expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: false, engaged: [] } });
+  });
+
+  it("the port is asked only about a SETTLED, unvoided release; an answer that is not the boolean true, or a throw, is not final", () => {
+    const row = releaseRow({ id: "r", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" });
+    const asked: unknown[] = [];
+    const recording = (release: unknown): boolean => {
+      asked.push(release);
+      return true;
+    };
+    expect(foldKillSwitchRows([row], UNSETTLED, recording)).toMatchObject([{ release: "PENDING" }]);
+    expect(foldKillSwitchRows([{ ...row, voided: true }], SETTLED, recording)).toMatchObject([{ release: "VOIDED" }]);
+    expect(asked).toEqual([]);
+    expect(foldKillSwitchRows([row], SETTLED, recording)).toEqual([]);
+    expect(asked).toEqual([{ killSwitchEventId: "r", environment: "LIVE_MICRO", scope: "MARKET", scopeRef: MARKET }]);
+    for (const answer of [false, "true", 1, undefined, null]) {
+      expect(foldKillSwitchRows([row], SETTLED, () => answer as never)).toMatchObject([{ release: "UNCONFIRMED", action: "FULL_HALT", scope: "MARKET" }]);
+    }
+    const throwing = (): boolean => {
+      throw new Error("x");
+    };
+    expect(foldKillSwitchRows([row], SETTLED, throwing)).toMatchObject([{ release: "UNCONFIRMED" }]);
+    const effects = killSwitchEffects(foldKillSwitchRows([row], SETTLED, NOT_FINAL), ACCOUNT);
+    expect(effects.submissionBlockedMarkets.has(MARKET)).toBe(true);
+    expect(effects.stopsHeartbeat).toBe(false);
+    expect(effects.cancels).toEqual([{ directive: { scope: "MARKET", marketId: MARKET }, killSwitchEventId: "r" }]);
+  });
+
+  it("a monitor without a usable finality port is refused at construction", () => {
+    for (const releaseFinality of [undefined, null, {}, { isFinal: "yes" }]) {
+      expect(() => new KillSwitchMonitor({ reader: new FakeKillSwitchReader(), clock: new ManualClock(), accountRef: ACCOUNT, releaseSettleMs: SETTLE, releaseFinality: releaseFinality as never })).toThrow(TypeError);
+    }
+  });
+
+  /**
+   * r2 O2 (Opus R2-L2, mutant M12): the settle window is judged from the START of the read that judges the release,
+   * never its completion. A read that started inside the window and completed after it carries a VOID check made
+   * inside the window, so it must not settle the release.
+   */
+  it("r2 O2 (M12): a read that STARTED inside the window and COMPLETED after it does not settle the release", async () => {
+    const clock = new ManualClock();
+    let hold: (() => void) | null = null;
+    let rows: readonly unknown[] = [engageRow({ id: "e", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    const reader = {
+      read: async (): Promise<readonly never[]> => {
+        if (hold !== null) {
+          await new Promise<void>((resolve) => {
+            hold = resolve;
+          });
+        }
+        return rows as readonly never[];
+      },
+    };
+    const monitor = monitorOf({ reader, clock });
+    await monitor.refresh();
+    rows = [releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
+    await monitor.refresh();
+    // First sight now. The next read starts 500 ms before the window ends and completes 500 ms after it.
+    await clock.advance(SETTLE - 500);
+    hold = (): void => undefined;
+    const slow = monitor.refresh();
+    await clock.advance(1_000);
+    (hold as () => void)();
+    hold = null;
+    expect(await slow).toBe(true);
+    expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: true, engaged: [{ killSwitchEventId: "r", release: "PENDING" }] } });
+    // The next read, which STARTS after the window, settles it.
+    await monitor.refresh();
+    expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: false, engaged: [] } });
   });
 });

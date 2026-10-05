@@ -4,8 +4,9 @@
  * timer queue, an in-memory fencing lease store that keeps the database's
  * rules (one ACTIVE lease per account and realm, a token above every earlier
  * one, expiry by its OWN clock, holder-keyed writes, a takeover only over the
- * ended incumbent's presented version, the run-mode ceiling, migration 0008's
- * validity check), and recording journals, pagers and readers. Nothing here
+ * ended incumbent's presented version and only once its expiry has passed by
+ * that clock, the run-mode ceiling, migration 0008's validity check), and
+ * recording journals, pagers and readers. Nothing here
  * reaches a network, a database or a venue. PAPER only: the live-SHAPED
  * run-mode context below only ever reaches these fakes. The PostgreSQL
  * behaviour itself is proven against a real database by
@@ -14,13 +15,13 @@
 
 import { runModeExceeds, RUN_MODES, type RunMode } from "@polymarket-bot/domain";
 import type { FencingAcquireOutcome, FencingLeaseRef, FencingRenewOutcome } from "@polymarket-bot/storage-postgres";
-import { FencingRunModeNotPermittedError, NonRealModeFencingLeaseError } from "@polymarket-bot/storage-postgres";
+import { FENCING_LEASE_MAX_TTL_MS, FENCING_LEASE_MIN_TTL_MS, FencingLeaseInputError, FencingRunModeNotPermittedError, NonRealModeFencingLeaseError } from "@polymarket-bot/storage-postgres";
 
 import { isLiveRunMode, type Fence, type FencingLeasePort, type RunModeContext } from "./fencing-authority.js";
 import type { HealthInput } from "./health-lease.js";
-import type { KillSwitchReader, KillSwitchRow } from "./kill-switch.js";
+import type { KillSwitchReader, KillSwitchReleaseFinality, KillSwitchReleaseRef, KillSwitchRow } from "./kill-switch.js";
 import { createLiveSafety, type KillSwitchCancelPort, type LiveSafety, type LiveSafetyOptions } from "./live-safety.js";
-import { OmsProgressMonitor, type OmsStoreLike } from "./oms-progress.js";
+import { OmsProgressMonitor, type OmsCipherLike, type OmsReservationsLike, type OmsStoreLike } from "./oms-progress.js";
 import type { LiveSafetyAlerts, LiveSafetyJournal, LiveSafetyPage, LiveSafetyRecord, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyOrderView, SafetyTimers } from "./ports.js";
 
 interface Scheduled {
@@ -121,6 +122,11 @@ interface LeaseRow {
   revision: number;
 }
 
+/** The real store's TTL bound (r2 X1): refused before anything else, on every acquisition and renewal. */
+function checkTtl(ttlMs: number): void {
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < FENCING_LEASE_MIN_TTL_MS || ttlMs > FENCING_LEASE_MAX_TTL_MS) throw new FencingLeaseInputError("ttlMs");
+}
+
 function versionOf(row: LeaseRow): string {
   return `${row.status}|${String(row.expiresAtMs)}|${String(row.revision)}`;
 }
@@ -156,6 +162,7 @@ export class MemoryFencingStore implements FencingLeasePort {
     if (!isLiveRunMode(environment)) throw new NonRealModeFencingLeaseError(environment, input.accountRef);
     const maximum = RUN_MODES.find((mode) => mode === input.maximumRunMode);
     if (maximum === undefined || runModeExceeds(environment, maximum as RunMode) || input.allowRealOrders !== true) throw new FencingRunModeNotPermittedError(environment);
+    checkTtl(input.ttlMs);
     this.#guard("acquire");
     await Promise.resolve();
     const realm = this.rows.filter((row) => row.accountRef === input.accountRef);
@@ -170,7 +177,9 @@ export class MemoryFencingStore implements FencingLeasePort {
         takeover.fencingLeaseId === incumbent.fencingLeaseId &&
         takeover.fencingToken === incumbent.fencingToken.toString() &&
         takeover.version === versionOf(incumbent);
-      if (!presented) {
+      // r2 X1, the durable bound: never over an incumbent whose own expiry lies ahead by this store's clock.
+      const databaseRemainingMs = Math.max(0, incumbent.expiresAtMs - this.dbNowMs());
+      if (!presented || databaseRemainingMs > 0) {
         return {
           kind: "LAPSED",
           incumbent: {
@@ -180,6 +189,7 @@ export class MemoryFencingStore implements FencingLeasePort {
             status: incumbent.status,
             expiresAt: new Date(incumbent.expiresAtMs).toISOString(),
             version: versionOf(incumbent),
+            databaseRemainingMs,
           },
         };
       }
@@ -225,6 +235,7 @@ export class MemoryFencingStore implements FencingLeasePort {
   }
 
   async renew(ref: FencingLeaseRef, ttlMs: number): Promise<FencingRenewOutcome> {
+    checkTtl(ttlMs);
     this.#guard("renew");
     await Promise.resolve();
     const row = this.#find(ref);
@@ -257,6 +268,30 @@ export class MemoryFencingStore implements FencingLeasePort {
     row.reason = reason;
     row.revision += 1;
     return true;
+  }
+
+  /**
+   * A grant this store's TTL bound never saw (`WP-040`'s `acquireLease` / `recordHeartbeat` take a caller's
+   * `expiresAt`): an ACTIVE lease expiring `expiresInMs` from now by this store's clock. Returns its lease id.
+   */
+  insertForeignGrant(input: { readonly accountRef: string; readonly holderId: string; readonly expiresInMs: number }): string {
+    const token = (this.#highWater.get(input.accountRef) ?? 0n) + 1n;
+    this.#highWater.set(input.accountRef, token);
+    this.#ids += 1;
+    const fencingLeaseId = `0190a3e0-0000-7000-8000-${String(this.#ids).padStart(12, "0")}`;
+    this.rows.push({
+      fencingLeaseId,
+      fencingToken: token,
+      accountRef: input.accountRef,
+      environment: "LIVE",
+      holderId: input.holderId,
+      status: "ACTIVE",
+      expiresAtMs: this.dbNowMs() + input.expiresInMs,
+      heartbeatId: null,
+      reason: null,
+      revision: 0,
+    });
+    return fencingLeaseId;
   }
 
   /** An operator's revocation. */
@@ -358,6 +393,21 @@ export class FakeKillSwitchReader implements KillSwitchReader {
   }
 }
 
+/**
+ * The composition's positive release finality (r2 X2), settable: `all` (default) answers every release final, as a
+ * control plane that applied every release would; otherwise only the ids in `confirmed` are. Every question is
+ * recorded.
+ */
+export class FakeReleaseFinality implements KillSwitchReleaseFinality {
+  all = true;
+  readonly confirmed = new Set<string>();
+  readonly asked: string[] = [];
+  isFinal(release: KillSwitchReleaseRef): boolean {
+    this.asked.push(release.killSwitchEventId);
+    return this.all || this.confirmed.has(release.killSwitchEventId);
+  }
+}
+
 /** The geoblock fixture's documented examples (`test/fixtures/venue/geoblock/geoblock.json`), as plain bodies. */
 export const NOT_BLOCKED = Object.freeze({ blocked: false, ip: "192.0.2.10", country: "AR", region: "" });
 export const BLOCKED_CLOSE_ONLY_TIER = Object.freeze({ blocked: true, ip: "198.51.100.20", country: "US", region: "NY" });
@@ -417,6 +467,39 @@ export class HangableOmsStore implements OmsStoreLike<readonly unknown[], unknow
   }
 }
 
+/** An OMS reservation port whose calls can be held unanswered (WP-300's journal append that never acknowledges). */
+export class HangableReservations implements OmsReservationsLike<unknown, unknown, unknown, { readonly ok: true; readonly value: null }> {
+  hang = false;
+  calls = 0;
+  async #answer(): Promise<{ readonly ok: true; readonly value: null }> {
+    this.calls += 1;
+    if (this.hang) await new Promise<never>(() => undefined);
+    return { ok: true, value: null };
+  }
+  reserve(): Promise<{ readonly ok: true; readonly value: null }> {
+    return this.#answer();
+  }
+  consume(): Promise<{ readonly ok: true; readonly value: null }> {
+    return this.#answer();
+  }
+  release(): Promise<{ readonly ok: true; readonly value: null }> {
+    return this.#answer();
+  }
+}
+
+/** An OMS payload cipher whose calls can be held unanswered (a key service that never answers). */
+export class HangableCipher implements OmsCipherLike<{ readonly keyId: string; readonly ciphertext: string }> {
+  hang = false;
+  async encrypt(plaintext: string): Promise<{ readonly keyId: string; readonly ciphertext: string }> {
+    if (this.hang) await new Promise<never>(() => undefined);
+    return { keyId: "test-key-1", ciphertext: `sealed:${plaintext}` };
+  }
+  async decrypt(payload: { readonly keyId: string; readonly ciphertext: string }): Promise<string> {
+    if (this.hang) await new Promise<never>(() => undefined);
+    return payload.ciphertext.replace(/^sealed:/u, "");
+  }
+}
+
 /** A passing, resuming reconcile report (the composition's periodic reconcile, when it passes). */
 export const PASSING_REPORT = Object.freeze({ runs: Object.freeze([Object.freeze({ status: "PASSED", resumed: true })]), resumed: true });
 
@@ -473,12 +556,18 @@ export interface Composition {
   /** The OMS store, through the progress monitor (`omsStore.apply` is what a hung persistence call looks like). */
   readonly omsStore: OmsStoreLike<readonly unknown[], unknown>;
   readonly rawOmsStore: HangableOmsStore;
+  /** The OMS reservation port and cipher, through the progress monitor (r2 X4), and their raw fakes. */
+  readonly omsReservations: OmsReservationsLike<unknown, unknown, unknown, { readonly ok: true; readonly value: null }>;
+  readonly rawReservations: HangableReservations;
+  readonly omsCipher: OmsCipherLike<{ readonly keyId: string; readonly ciphertext: string }>;
+  readonly rawCipher: HangableCipher;
   readonly reader: FakeKillSwitchReader;
   readonly geoblock: FakeBodyPort;
   readonly closedOnly: FakeBodyPort;
   readonly oms: FakeOms;
   readonly coordinator: FakeCoordinator;
   readonly cancels: FakeCancels;
+  readonly releaseFinality: FakeReleaseFinality;
   readonly journal: RecordingJournal;
   readonly alerts: RecordingAlerts;
   readonly safety: LiveSafety;
@@ -494,11 +583,17 @@ export function composition(overrides: Partial<LiveSafetyOptions> = {}, clock: M
   const oms = new FakeOms();
   const coordinator = new FakeCoordinator();
   const cancels = new FakeCancels();
+  const releaseFinality = new FakeReleaseFinality();
   const journal = new RecordingJournal();
   const alerts = new RecordingAlerts();
   const omsProgress = new OmsProgressMonitor({ clock });
   const rawOmsStore = new HangableOmsStore();
+  const rawReservations = new HangableReservations();
+  const rawCipher = new HangableCipher();
+  // Every persistence port the OMS awaits, instrumented as a live root does before it opens the OMS (r1 I5; r2 X4).
   const omsStore = omsProgress.store(rawOmsStore);
+  const omsReservations = omsProgress.reservations(rawReservations);
+  const omsCipher = omsProgress.cipher(rawCipher);
   const safety = createLiveSafety({
     runModeContext: LIVE_CONTEXT,
     accountRef: ACCOUNT,
@@ -507,7 +602,7 @@ export function composition(overrides: Partial<LiveSafetyOptions> = {}, clock: M
     timers: clock,
     fencing: { store, ttlMs: 30_000, renewIntervalMs: 5_000, safetyMarginMs: 2_000, transmitMarginMs: 3_000 },
     health: { maxAgeMs: HEALTH_MAX_AGE, eventLoop: { intervalMs: 500, maxLagMs: 250 } },
-    killSwitch: { reader, refreshIntervalMs: 1_000, cancels, releaseSettleMs: RELEASE_SETTLE_MS },
+    killSwitch: { reader, refreshIntervalMs: 1_000, cancels, releaseSettleMs: RELEASE_SETTLE_MS, releaseFinality },
     eligibility: { geoblock, closedOnly, refreshIntervalMs: 30_000, maxAgeMs: 60_000 },
     oms,
     omsProgress,
@@ -523,12 +618,17 @@ export function composition(overrides: Partial<LiveSafetyOptions> = {}, clock: M
     omsProgress,
     omsStore,
     rawOmsStore,
+    omsReservations,
+    rawReservations,
+    omsCipher,
+    rawCipher,
     reader,
     geoblock,
     closedOnly,
     oms,
     coordinator,
     cancels,
+    releaseFinality,
     journal,
     alerts,
     safety,
