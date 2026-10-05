@@ -9,7 +9,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:fault:reconciliation": "tsc --noEmit -p ../../test/fault-injection/reconciliation/tsconfig.json && vitest run --config ../../test/fault-injection/reconciliation/vitest.config.ts"
   },
   "dependencies": {
     "@polymarket-bot/decimal": "workspace:*",
