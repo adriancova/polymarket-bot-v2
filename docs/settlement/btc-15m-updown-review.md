@@ -19,33 +19,43 @@ not documentation) and **UNDOCUMENTED**.
 1. **The rules text is pinned.** Its sha256 is
    `485ceb1dabc4aa12fb42c76184563b7378f01e5de9ded73df049c0d191cd5ad1`. It is
    byte-identical on all 31 windows read that open at or after
-   2026-08-07T00:00Z, 19 of them resolved. An earlier version (sha256
-   `41fa2f31…`) governed windows before then (§1).
-2. **The reading.** The evidence supports **R2**: the settlement value is the
-   Chainlink BTC/USD **60-second** TWAP stream's value at the window's close.
-   It is compared, **greater than or equal**, with the same stream's value at
-   the window's open.
-   - The official changelog says so in substance: "Both the price to beat and
-     the final settlement price come from the applicable TWAP feed", with "a
-     `60-second` lookback" for 15-minute markets.
-   - Polymarket's TWAP channel reference and Chainlink's documentation agree.
-   - Two public reads agree: `cryptoMarketConfig` and `eventMetadata`.
+   2026-08-07T00:00Z, 19 of them resolved, and on 100 more resolved windows
+   read later the same day. An earlier version (sha256 `41fa2f31…`) governed
+   windows before then (§1).
+2. **The reading.** The evidence best supports **R2**: the settlement value is
+   the Chainlink BTC/USD **60-second** TWAP stream's value for the window's
+   close. It is compared, **greater than or equal**, with the same stream's
+   value for the window's open.
+   - **Documented:** the official changelog says "Both the price to beat and
+     the final settlement price come from the applicable TWAP feed", and that
+     15-minute markets "use a `60-second` lookback". Polymarket's TWAP channel
+     reference says its 60-second series is the one "used by crypto up/down
+     market resolution".
+   - **Not documented:** no fetched document says at which instants the two
+     values are read. That they are read at the open and at the close is an
+     inference from the rules' "price at the beginning of that range", the
+     changelog's "final settlement price" and the previous rules' "at the end
+     of".
+   - **Observed:** two undocumented fields agree with that inference,
+     `cryptoMarketConfig` and `eventMetadata`. They are finite observations,
+     not proof.
 
    The rules sentence, read literally, describes a TWAP "of the time range", a
    whole-window average (R1). That conflict (C-15) is real (§3).
-3. **Documentation alone does not settle everything.** It fixes the
-   observation type and the 60-second window. It does not fix which Chainlink
-   report is read at each boundary, whether a boundary is inclusive, the
-   comparison's precision, the fallback, or whether a resolution can be
-   disputed. §3.5 drafts the question to ask Polymarket.
+3. **Documentation alone does not settle everything.** It establishes a
+   60-second Chainlink TWAP feed for both prices. It does not state the read
+   instants, which Chainlink report is used for each boundary, whether a
+   boundary is inclusive, the comparison's precision, the fallback, or whether
+   a resolution can be disputed. §3.5 drafts the question to ask Polymarket.
 4. **The seed is corrected and stays unverified.** It now has `TWAP`, a 60 s
-   window, `GTE`, explicit open and close rules and the reference-open rule.
-   The package's own door accepts it, and activation stays blocked
+   window, `GTE`, the title's ET range as the market window, and open and
+   close rules that name no report selection (U-24 stays open and blocks a
+   review). The package's own door accepts it, and activation stays blocked
    `SPEC_UNVERIFIED` (§4).
 5. **The sign-off path.** The code can represent a review, but nothing records
    one, and the trader does not read one. Today the trader's settlement veto is
    lifted only by an operator setting a configuration boolean. §5 lists the
-   steps and eleven gaps.
+   steps and ten gaps.
 6. **V3-C13.** §6 sets out six ways to observe, or avoid observing, the
    settlement value in PAPER. It decides nothing.
 
@@ -122,6 +132,12 @@ Result:
 - every row has one market, outcomes `["Up","Down"]`, and the slug epoch equal
   to `eventStartTime` (F-15).
 
+A second read at 23:57Z (S-G09, `/events/keyset?series_id=10192&closed=true&limit=100`)
+returned the 100 most recently resolved windows, opening 2026-10-03T22:45Z to
+2026-10-04T23:30Z. All 100 carry the same 613-byte text and
+`resolutionSource`, outcomes `["Up","Down"]`, and a title range equal to
+`[eventStartTime, endDate]` (F-15, F-22).
+
 ### 1.3 The previous version, and when it changed
 
 Windows of 2026-08-01T12:00Z and 2026-08-06T12:00Z carry this text (sha256
@@ -155,6 +171,20 @@ evidence (U-31). What the stream is comes from Chainlink's documentation:
 - "The window length is part of the stream's name and metadata" (F-26).
 
 The stream's name ends `twap-60s`.
+
+Chainlink's public stream directory (S-C15, F-32) lists, in its embedded page
+data, a live stream `BTC/USD-Streams-TWAP-60s-mainnet-production`: schema
+`v2`, attribute type `TWAP`, feed ID
+`0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f`, stream
+ID `1000006341`. It also lists a separate live BTC/USD 30 s TWAP stream
+(`BTC/USD-Streams-TWAP-30s-mainnet-production`, stream ID `1000006323`).
+
+- **Documented:** that the 60 s stream exists, is live, and has that schema
+  and feed ID.
+- **Inference:** that it is the stream behind the rules' URL. The rules' slug
+  `btc-usd-twap-60s-streams` appears nowhere in the directory, whose path for
+  the stream is `btc-usd-streams-twap-60s-mainnet-production`. The two names
+  share the asset pair and the window.
 
 ## 2. What a rules version is here, and how to identify one for these markets
 
@@ -225,9 +255,20 @@ versioned." In code:
 - **R1, the whole-range TWAP.** [A] is a time-weighted average of BTC/USD over
   the full 15-minute range, `[open, close]`.
 - **R2, the 60-second TWAP at the close.** [A] is the 60-second TWAP stream's
-  value at the range's end: the average over `[close − 60 s, close]`. [B] is
-  the same stream's value at the range's start, the average over
-  `[open − 60 s, open]`.
+  value for the range's end, and [B] the same stream's value for the range's
+  start. Each value is the price of one stream report: the report selected
+  for that boundary.
+  - Its averaging window is 60 seconds anchored to that report's latest
+    observation. Chainlink, S-C14 line 49: "A TWAP window is anchored to the
+    latest observation and moves forward with each new report. Unlike standard
+    streams, it doesn't align to the clock or snap to round numbers." Its
+    example (line 51) puts the anchor at the window's end: "a 60-second TWAP
+    requested "at `12:05:01`" covers `12:04:01` → `12:05:01`". That the
+    window ends at the latest observation in general is a reading of those
+    two lines, not a sentence Chainlink wrote.
+  - That window ends exactly at the market instant only if the selected
+    report's `observationsTimestamp` equals the instant. Which report is
+    selected is undocumented (U-24).
 - **R3, other variants:**
   - R3a: the average of the 60-second stream's values over the range (R1
     computed from the named stream);
@@ -242,80 +283,145 @@ versioned." In code:
 | 1 | The rules sentence: TWAP "of the time range specified in the title" (§3.1) | rules text | Read literally, **R1**. Nothing in the sentence says 60 seconds or "at the end" |
 | 2 | The rules' named source: "the BTC/USD TWAP data stream available at …/btc-usd-twap-60s-streams", and "this market is about the price according to the TWAP Chainlink data stream" | rules text | Both [A] and [B] are values of one 60-second stream. A 60-second stream does not publish a 15-minute average. Favors **R2** over R1; R3a stays possible |
 | 3 | The previous rules: "the Bitcoin price **at the end of** the time range … greater than or equal to the price at the beginning of that range" (§1.3) | rules text | The 2026-08-07 edit swapped the end-of-range spot price for the TWAP. Continuity favors **R2** |
-| 4 | Changelog, 2026-08-07: "Crypto up/down markets now resolve using Chainlink-computed time-weighted average prices **instead of a single price snapshot**."; "Both the price to beat and the final settlement price come from the applicable TWAP feed."; "5-minute markets use a `30-second` lookback; **15-minute and 4-hour markets use a `60-second` lookback**." (S-D85 lines 62-67) | DOCUMENTED | **R2**, and [B] from the same feed. It contradicts R1 (a whole-range average has a 900 s lookback) and R3b |
+| 4 | Changelog, 2026-08-07: "Crypto up/down markets now resolve using Chainlink-computed time-weighted average prices **instead of a single price snapshot**."; "Both the price to beat and the final settlement price come from the applicable TWAP feed."; "5-minute markets use a `30-second` lookback; **15-minute and 4-hour markets use a `60-second` lookback**." (S-D85 lines 62-67) | DOCUMENTED | Both [A] and [B] come from one TWAP feed with a 60 s lookback. That conflicts with R1 (a whole-range average looks back 900 s) and with R3b (a spot [B]). It weighs against R3a, whose average spans the range, but does not say how the feed's values become the settlement price, nor at which instant each is read |
 | 5 | Changelog, 2026-08-14: "All 5-minute crypto markets now resolve using a `60-second` Chainlink TWAP, replacing the `30-second` window" (S-D85 lines 50-53) | DOCUMENTED | The window is a property of the feed, not of the range: **R2** |
-| 6 | `price.crypto.twap`: "Chainlink time-weighted average prices used by crypto up/down market resolution (gated)"; `window_seconds`: "Only 60 exists today." (S-D45 lines 1550-1554, 1616). "a fixed 60-second window"; "`windowSeconds: 60` describes the lookback period" (S-D13 lines 1621, 1727) | DOCUMENTED | **R2**: the series used for resolution is a 60-second lookback |
-| 7 | Chainlink v2: "Each TWAP stream is scoped to one asset and one window length … The window length is part of the stream's name" (S-C13) | DOCUMENTED (Chainlink) | The named stream publishes 60-second TWAPs only: **R2** |
-| 8 | Chainlink: "a 60-second TWAP requested "at `12:05:01`" covers `12:04:01` → `12:05:01`"; the window "doesn't align to the clock"; "the price … is the price of the report whose window contains that moment" (S-C14) | DOCUMENTED (Chainlink) | It defines what "the stream's value at an instant" is under R2. It does not say which report Polymarket uses |
-| 9 | `cryptoMarketConfig` `{"id":"btc-15m-twap-60", "twapEnabled": true, "twapLookbackSeconds": 60}` on all 31 TWAP-text windows; `twapEnabled: false` on 2026-08-06 (F-29) | OBSERVED, undocumented field | **R2** (a 60 s lookback) |
-| 10 | `eventMetadata`: in 21 of 21 resolved windows, Up exactly when `finalPrice >= priceToBeat`. In 12 of 12 adjacent windows, a window's `priceToBeat` equals the previous window's `finalPrice` exactly (F-28) | OBSERVED, undocumented field | [A] at a window's close and [B] at the next window's open are **the same point value** at the shared instant. That fits **R2**, which reads one stream at one instant. Under R1 or R3a, `finalPrice` would be a range average and would not equal the next `priceToBeat` |
+| 6 | `price.crypto.twap`: "Chainlink time-weighted average prices used by crypto up/down market resolution (gated)"; `window_seconds`: "Only 60 exists today." (S-D45 lines 1550-1554, 1616). "a fixed 60-second window"; "`windowSeconds: 60` describes the lookback period" (S-D13 lines 1621, 1727) | DOCUMENTED | The series Polymarket names for resolution has a 60-second lookback: **R2**'s feed. It does not say at which instants resolution reads it |
+| 7 | Chainlink v2: "Each TWAP stream is scoped to one asset and one window length … The window length is part of the stream's name" (S-C13). Chainlink's directory lists a live `BTC/USD-Streams-TWAP-60s-mainnet-production` stream and a separate live 30 s one (S-C15, F-32) | DOCUMENTED (Chainlink) | The named stream publishes 60-second TWAPs only: **R2**. That the directory's 60 s stream is the rules' stream is an inference (§1.4) |
+| 8 | Chainlink: "the "current" price at any given moment is the price of the report whose window contains that moment" (S-C14 line 28); in its gap example, "the price for `12:05:00` is observed one second later at `12:05:01`" (line 41); "A TWAP window is anchored to the latest observation and moves forward with each new report" (line 49); "a 60-second TWAP requested "at `12:05:01`" covers `12:04:01` → `12:05:01`" (line 51) | DOCUMENTED (Chainlink) | Chainlink's own meaning of a stream's price at a moment. A report's averaging window is anchored to its latest observation, so it need not end at the moment. It does not say which report Polymarket uses (U-24) |
+| 9 | `cryptoMarketConfig` `{"id":"btc-15m-twap-60", "twapEnabled": true, "twapLookbackSeconds": 60}` on all 31 TWAP-text windows and on the 100 windows of S-G09; `twapEnabled: false` on 2026-08-06 (F-29) | OBSERVED, undocumented field | **R2** (a 60 s lookback) |
+| 10 | `eventMetadata`: in 21 of 21 resolved windows, Up exactly when `finalPrice >= priceToBeat`. In 12 of 12 adjacent windows, a window's `priceToBeat` equals the previous window's `finalPrice` exactly. The 23:57Z read (S-G09) gives 99 of 99 and 99 of 99 (F-28) | OBSERVED, undocumented field | [A] at a window's close and [B] at the next window's open are **the same point value** at the shared instant. That fits **R2**, which reads one stream at one instant. Under R1 or R3a, `finalPrice` would be a range average and would equal the next `priceToBeat` only by coincidence. This assumes the two fields carry the two settlement values, which is itself undocumented. These are finite observations of fields with no documented meaning (U-32): they corroborate, and prove nothing about unobserved windows |
 | 11 | Polymarket's resolution page: "The market title describes the question, but the **rules** define how it resolves." (S-D33 lines 27-30) | DOCUMENTED | The rules sentence (row 1) is the governing text. The changelog explains it but does not amend it. This is why C-15 needs an answer from Polymarket |
 
 ### 3.4 Answers
 
-1. **Which reading does the evidence support?** **R2.** Every documentation
-   source except the literal grammar of one clause supports it (rows 2-8), and
-   both observations agree (rows 9-10). R1 rests on row 1 alone and conflicts
-   with rows 4-7 and 10. R3b conflicts with row 4. R3c is not excluded,
-   because the boundary report is undocumented (U-24).
+1. **Which reading does the evidence support?** **R2**, as the best-supported
+   reading, not as a documented one.
+   - **What documentation supports:** the observation type and the 60-second
+     window, for both prices (rows 2, 4-7). No document states the instants
+     at which the two values are read.
+   - **What rests on inference:** reading [A] at the close and [B] at the
+     open. It follows from the rules' "the price at the beginning of that
+     range" (row 1), the changelog's "final settlement price" (row 4) and the
+     previous rules' "at the end of" (row 3). The undocumented `eventMetadata`
+     agrees (row 10).
+   - **R1** rests on row 1 alone. It conflicts with the documented 60-second
+     lookback (rows 4-6) and with the observations (rows 9-10).
+   - **R3a**, an average of the 60-second stream's values over the range, is
+     not excluded by any document. The changelog names the averaging window
+     as 60 seconds and the source as replacing "a single price snapshot"
+     (row 4), which weighs against a 15-minute average of averages, but it
+     does not say how the feed's values become the settlement price. Only
+     the undocumented `eventMetadata` (row 10) is inconsistent with R3a, and
+     that is a finite observation, not proof. R3a therefore stays open, and
+     the clarification question asks about it (§3.5, question 1).
+   - **R3b** (a spot [B]) conflicts with row 4.
+   - **R3c** (R2 with a different boundary report) is not excluded, because
+     the report selection is undocumented (U-24).
 2. **What is "the price at the beginning of that range"?** The 60-second TWAP
-   stream's value at the window's open instant, that is, the average over
-   `[open − 60 s, open]`.
+   stream's value for the window's open: the price of the stream report
+   selected for the open.
    - That the price to beat "come[s] from the applicable TWAP feed" is
      documented (row 4).
-   - That it is the value at the open instant follows from the rules' "at the
-     beginning of that range", and observation agrees (row 10).
+   - That it is the value for the open instant follows from the rules' "at the
+     beginning of that range". The undocumented `eventMetadata` agrees
+     (row 10).
    - It is not a spot price, and not a TWAP over the range.
-   - Which Chainlink report is "at" the open (one ending exactly at the open,
-     or the one containing it) is not documented by Polymarket.
+   - Its averaging window is 60 seconds anchored to that report's latest
+     observation (row 8), so it need not end at the open instant.
+   - Which Chainlink report is selected for the open (the report observed
+     exactly at the open, the one whose window contains it, or the first one
+     after it) is not documented by Polymarket (U-24).
 3. **Which time zone, which boundaries, inclusive or exclusive?**
-   - The rules define the range by the title, in ET: America/New_York, UTC−4
-     until 2026-11-01 and UTC−5 after.
-   - On 33 of 33 windows, the title range equals `[eventStartTime, endDate]`
-     in UTC, 900 s long (F-15).
-   - The settlement value is read at `endDate`, and the reference at
-     `eventStartTime`.
-   - Each averaging window is the 60 s ending at its instant (row 8).
+   - **The window is the title's range.** The rules define it as "the time
+     range specified in the title", and the title says ET: America/New_York
+     time, under its rules (UTC−4 until 2026-11-01T06:00Z, UTC−5 from then).
+   - **Gamma's fields equal it by observation only.** On all 115 windows
+     read, the title range equals `[eventStartTime, endDate]` in UTC, 900 s
+     long, and the slug epoch equals `eventStartTime` (F-15). The fields'
+     meanings are undocumented (U-29), so they can locate a window but do not
+     define it. `startDate` is about 24 h before the open and is not the open.
+   - **The repeated hour.** When daylight saving time ends, an ET clock range
+     can name two intervals. On 2026-11-01, the windows opening at 05:00Z
+     and 06:00Z would both read "1:00AM-1:15AM ET", and likewise 05:15Z and
+     06:15Z, and 05:30Z and 06:30Z. This is computed with the IANA rules for
+     America/New_York, not observed: those markets do not exist yet (U-34).
+     The seed treats any title that does not convert to exactly one 900 s
+     interval as ambiguous, and halts entries for that window.
+   - **Report selection is unresolved, and it blocks a review.** Each value
+     is the price of the stream report selected for its boundary, and that
+     report's 60 s averaging window is anchored to its latest observation
+     (row 8). It ends at the boundary only if the report's
+     `observationsTimestamp` equals the boundary. When no report is observed
+     exactly at an instant, Chainlink's rule makes the containing report
+     apply, with its price "observed one second later" (S-C14 line 41).
+     Whether Polymarket uses that report, the one observed exactly at the
+     instant, or the first one after it is U-24. The seed names no selection,
+     and the checklist makes U-24 a blocker.
    - **Inclusivity is undocumented**, for both the instants and the 60 s
      windows. Chainlink writes its window as `12:04:01 → 12:05:01` with no
-     open or closed notation. When no report ends exactly at an instant,
-     Chainlink's rule is that the containing report applies, with its price
-     "observed one second later". Whether Polymarket follows that rule is
-     U-24.
+     open or closed notation (U-24).
 4. **Is the comparison GTE?** **Yes.** The rules say "greater than or equal
    to", so a tie resolves **Up**. The old seed's `GT` was wrong: it would have
    settled a tie as Down. Observation cannot tell GT from GTE, because no tie
-   occurred in 21 windows (F-28).
+   occurred in the 21 windows of §1.2, nor in the 99 of S-G09 (F-28).
+
+   **Precision is a separate question (U-25).**
+   - **The spec's own arithmetic:** the seed compares exact decimals at the
+     stream's published precision, with no rounding. The package does the
+     same: in the probe of §4.2, open 100.004 against close 100.003 gives
+     `NO_WIN`.
+   - **The venue's comparison:** its precision is undocumented. Polymarket's
+     TWAP channel documents `full_accuracy_value` as "Exact decimal price as
+     published by the source" (F-25), but no page says at what precision
+     resolution compares the two prices. The `eventMetadata` numbers are
+     binary floats (F-28).
+   - **Why it matters:** rounding can flip a near-tie. Rounded to 2 decimal
+     places, 100.004 and 100.003 both become 100.00, a tie, so Up under GTE.
+     That is a constructed example, not an observed window. Checklist line 4
+     asks the reviewer to accept the exact-decimal rule while U-25 is open,
+     and §3.5 question 4 asks Polymarket.
 5. **Is the ambiguity resolvable from documentation alone?** **Not fully.**
-   - Documentation settles the observation type and the window: a 60-second
-     Chainlink TWAP read at the open and at the close (rows 4-8). It does so,
-     though, through the changelog and the channel reference, while
-     Polymarket's own resolution page says the **rules** govern (row 11), and
-     the rules sentence reads as R1. So C-15 is a conflict between official
-     texts, and only Polymarket can close it.
-   - Documentation does not settle: the boundary report and inclusivity
-     (U-24); the comparison's precision (U-25); what happens when the stream
-     has no report (U-26); and whether, and for how long, an automatic
-     resolution can be disputed (U-27).
+   - Documentation establishes the observation type and the 60-second window
+     for both prices: a 60-second Chainlink TWAP feed (rows 4-7). It does not
+     state at which instants the values are read; that is an inference
+     (answer 1). And it establishes even the feed only through the changelog
+     and the channel reference, while Polymarket's own resolution page says
+     the **rules** govern (row 11), and the rules sentence reads as R1. So
+     C-15 is a conflict between official texts, and only Polymarket can close
+     it.
+   - Documentation does not settle: the read instants, and whether R3a is
+     meant (answer 1); the boundary report and inclusivity (U-24); the
+     comparison's precision (U-25); what happens when the stream has no
+     report (U-26); whether, and for how long, an automatic resolution can be
+     disputed (U-27); and how titles name the repeated hour when daylight
+     saving time ends (U-34).
 
 ### 3.5 Recommendation, and the question to ask Polymarket
 
-**The recommended reading is R2**, as the corrected seed states it (§4). It is
-the reading the documentation and both observations support. The open points
-are each written into the seed as prose that fails closed, and each is a line
-on the checklist.
+**The recommended reading is R2**, as the corrected seed states it (§4). The
+documentation supports its feed and its 60-second window; its read instants
+are an inference that both observations agree with (§3.4, answer 1). The open
+points are each written into the seed as prose that fails closed, and each
+is on the checklist:
+
+- U-24, the report selection and inclusivity: a blocker, whatever is ticked;
+- U-25, the precision: line 4;
+- U-29 and U-34, the Gamma fields and the repeated hour: line 5;
+- U-31, the stream page: line 6;
+- U-26 and U-27, the fallback and disputes: lines 7a and 7b.
 
 The documented channel for a clarification request is the Polymarket Discord
 `#market-review` channel (S-D33 lines 108-111). The draft question:
 
 > For the "Bitcoin Up or Down" 15-minute markets (series `btc-up-or-down-15m`), the rules say: "This market will resolve to "Up" if the time-weighted average price (TWAP) of Bitcoin, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range," with the resolution source https://data.chain.link/streams/btc-usd-twap-60s-streams. Your changelog of 7 August 2026 says 15-minute markets use a 60-second lookback and that both the price to beat and the final settlement price come from the TWAP feed. Please confirm:
 >
-> 1. Is the final settlement price the value of the Chainlink BTC/USD 60-second TWAP stream at the end of the title's time range, that is, the average over the last 60 seconds before the end, and not an average over the whole 15 minutes?
+> 1. Is the final settlement price the value of the Chainlink BTC/USD 60-second TWAP stream at the end of the title's time range, and not an average over the whole 15 minutes, whether an average of the underlying prices or an average of the 60-second stream's values over the range?
 > 2. Is "the price at the beginning of that range" (the price to beat) that same 60-second TWAP stream's value at the start of the range?
 > 3. Which Chainlink report is used at each of those two instants: the report whose `observationsTimestamp` equals the instant, the report whose `validFromTimestamp`–`observationsTimestamp` window contains it, or the first report after it? Is each instant inclusive?
 > 4. Are the two values compared at the stream's full published precision, and does an exact tie resolve "Up"?
 > 5. If the stream has no report at either instant, what value is used?
 > 6. Can these markets' automatic resolutions be disputed, and if so, how and for how long after the close?
+> 7. When daylight saving time ends and the 1:00-2:00 AM ET hour repeats, how are the titles of the windows in that hour written, and which UTC interval does each cover?
 
 ## 4. The corrected spec
 
@@ -325,17 +431,17 @@ The seed is `db/seeds/settlement-specs/specs/btc-15m-updown.settlement-spec.json
 
 | Field | Before | Now | Evidence | Still open |
 | --- | --- | --- | --- | --- |
-| `resolutionSource` | "Chainlink TWAP published on the venue real-time data service (UNVERIFIED …)" | The Chainlink Data Streams BTC/USD 60-second TWAP stream named by the rules; Polymarket documents its 60-second series as the one "used by crypto up/down market resolution" (PolyBolt `price.crypto.twap`, credentials required) | §1.1; rows 2, 6, 7 | The stream page is unreadable (U-31) |
+| `resolutionSource` | "Chainlink TWAP published on the venue real-time data service (UNVERIFIED …)" | The Chainlink Data Streams BTC/USD 60-second TWAP stream named by the rules; the directory's live `BTC/USD-Streams-TWAP-60s-mainnet-production` stream, matched to the rules' URL by inference; a separate live 30 s stream the rules do not name; Polymarket documents its 60-second series as the one "used by crypto up/down market resolution" (PolyBolt `price.crypto.twap`, credentials required) | §1.1, §1.4; rows 2, 6, 7 | The stream page is unreadable (U-31) |
 | `observationType` | `TWAP` | `TWAP` (unchanged) | rows 4-8 | — |
 | `windowSeconds` | `30` | **`60`** | rows 4-7, 9 | — |
-| `windowStartRule` | "Thirty seconds before the market close instant, exclusive of the start boundary." | 60 s before the window end; Chainlink's "T minus 60 seconds through T"; inclusivity undocumented | row 8 | U-24 |
-| `windowEndRule` | "The market close instant, inclusive." | The market close: Gamma `endDate` (= `eventStartTime` + 900 s = the end of the ET title range). The value is the stream's 60 s TWAP at that instant. Chainlink's containing-report rule applies; Polymarket's choice is undocumented | §1.1, F-15, row 8 | U-24 |
+| `windowStartRule` | "Thirty seconds before the market close instant, exclusive of the start boundary." | 60 s before the end of the averaging window that `windowEndRule` defines, so not necessarily 60 s before the market close. Chainlink's example is quoted as an example, not as a general rule. Inclusivity undocumented | rows 4, 8 | U-24 |
+| `windowEndRule` | "The market close instant, inclusive." | The settlement value is the price of the stream report selected for the market close (reading R2, labelled an inference). Its 60 s window is anchored to that report's latest observation, so it ends at the close only if the report was observed exactly then. The selection is undocumented, and the spec names none; a value not tied to an identified report halts entries | row 8 | U-24 (blocking) |
 | `comparison` | `GT` | **`GTE`** | the rules text | U-25 (precision) |
-| `referenceOpenSource` | "The reference price published for the market open instant, used as the up/down strike." | The same 60 s TWAP stream's value at the market open (Gamma `eventStartTime`, the start of the ET title range): the average over the 60 s ending at the open, which Polymarket calls the price to beat | row 4, row 10 | U-24 |
-| `timestampBoundary` | "All boundaries are venue-published instants in UTC; the close instant is included in the window." | UTC instants: open `eventStartTime`, close `endDate`, 900 s apart. ET = America/New_York (UTC−4 until 2026-11-01, UTC−5 after). `startDate` is the creation time, not the open. Inclusivity undocumented | F-14, F-15 | U-24, U-29 |
-| `roundingRule` | "No rounding: the feed's exact full-accuracy decimal value is compared as published." | No rounding: exact decimals at the stream's published precision. Polymarket's comparison precision is undocumented; the `eventMetadata` floats are never used | F-25 (`full_accuracy_value`), F-28 | U-25 |
-| `fallbackSource` | "None. … halt the series and escalate …" | "None." Halt entries and escalate if a value at either instant is unavailable or ambiguous; no substitute, no interpolation; Polymarket documents no fallback | — | U-26 |
-| `disputePolicy` | halt entries; a dispute is in flight, not an outcome | the same, plus: windows were observed to resolve automatically about a minute after the close, and whether such a resolution can be disputed is undocumented | F-17, F-30 | U-27 |
+| `referenceOpenSource` | "The reference price published for the market open instant, used as the up/down strike." | The same stream's value for the market open, the rules' "price at the beginning of that range", which Polymarket calls the price to beat: the price of the report selected for the open, whose 60 s window need not end at the open. Selection undocumented, none named | row 4, row 8, row 10 | U-24 (blocking) |
+| `timestampBoundary` | "All boundaries are venue-published instants in UTC; the close instant is included in the window." | The window is the title's ET range, read under America/New_York rules; 900 s. A title that does not convert to exactly one 900 s interval (the repeated hour of 2026-11-01) halts entries for that window. Gamma `eventStartTime`/`endDate` and the slug epoch match it by observation only; `startDate` is about 24 h before the open and is not the open. Inclusivity undocumented | F-14 … F-16 | U-24, U-29, U-34 |
+| `roundingRule` | "No rounding: the feed's exact full-accuracy decimal value is compared as published." | No rounding: exact decimals at the stream's published precision. Polymarket's comparison precision is undocumented, and rounding can flip a near-tie; the `eventMetadata` floats are never used | F-25 (`full_accuracy_value`), F-28, §3.4 Q4 | U-25 |
+| `fallbackSource` | "None. … halt the series and escalate …" | "None." Halt entries and escalate if a value for either boundary is unavailable or ambiguous, including one whose report cannot be identified; no substitute, no interpolation; Polymarket documents no fallback | — | U-26 |
+| `disputePolicy` | halt entries; a dispute is in flight, not an outcome | the same, plus: windows were observed to resolve automatically 53 to 152 s after the close (100 windows, median 55 s, dated), and whether such a resolution can be disputed is undocumented | F-17, F-30 | U-27 |
 | `clarificationPolicy` | halt and re-review on any post-open clarification | the same, naming an "Additional context" update or any change to the rules text or its sha256 as the trigger | F-31, §1.3 | gap G-8 (nothing watches for it) |
 | `payoffModel` | `ReferenceOpenUpDownModel` | unchanged | §4.3 | — |
 | `verification` | `{"status":"UNVERIFIED"}` | unchanged | — | — |
@@ -353,13 +459,29 @@ The seed is `db/seeds/settlement-specs/specs/btc-15m-updown.settlement-spec.json
 
 The notice text was updated to name the evidence and the remaining
 preconditions. In the series seed, only `description` changed: it records the
-observed venue series identity (id 10192, slug `btc-up-or-down-15m`), marked
-as observed. `binding` and `status` are unchanged.
+observed venue series identity (id 10192, slug `btc-up-or-down-15m`), and the
+window as the title's ET range that the Gamma fields matched, marked as
+observed. `binding` and `status` are unchanged.
+
+**Two seed-directory README statements, for their owner** (outside this
+round's paths, so not edited; the `WP-110` line owner):
+
+- `db/seeds/settlement-specs/README.md` §5 says the files "contain no
+  credential, key, address, endpoint, or account identifier". The spec's
+  `resolutionSource` now quotes the rules' public page URL,
+  `https://data.chain.link/streams/btc-usd-twap-60s-streams`. That is a public
+  web page, not an API endpoint, and carries no credential, but the sentence
+  is now literally contradicted and should be reworded.
+- README §4 item 2 cites the published windows "30 s and 60 s" recorded by
+  `verified-2026-08-24.md` §10.3. That is a dated record of the RTDS feed,
+  not a stale statement. Whether a current list belongs there depends on which
+  feed gap G-4 names (§5.3).
 
 ### 4.2 The package's door accepts it
 
 This was checked with a probe kept outside the tree, run through the package's
-own entry points:
+own entry points. It was re-run on the revised seed (review round 1), with
+the last two rows added:
 
 | Check | Result |
 | --- | --- |
@@ -373,6 +495,8 @@ own entry points:
 | A tie under `GTE` (this seed) / under `GT` (the old seed) | `YES_WIN` / `NO_WIN` |
 | An observation with a 30 s window | refused, `SETTLEMENT_OBSERVATION_WINDOW_MISMATCH` |
 | Probe only, never written to the repo: the same spec with a `VERIFIED` block, a `rulesVersionId` and `publishedWindowSeconds: [60]` | `REVIEWED_MODEL_BACKED` |
+| Precision: open 100.004, close 100.003 / both rounded to 2 dp (`100`, `100`) | `NO_WIN` / `YES_WIN` |
+| A 60 s window anchored 1 s after the close (22:14:01Z-22:15:01Z) / a 59 s window | accepted / refused, `SETTLEMENT_OBSERVATION_WINDOW_MISMATCH` |
 
 The repository's own gates also pass: `packages/settlement/src/seeds.test.ts`
 and `packages/universe/src/seeds.test.ts` (see the round's handoff).
@@ -388,8 +512,9 @@ Its observation carries `referenceOpen` and `referenceOpenAt`, an
 `observedValue` and `observedAt`, and a window whose span must equal
 `windowSeconds` exactly (`packages/settlement/src/models/registry.ts:160-243`
 and `:376-464`; `packages/settlement/src/observation.ts:77-92`). A 60 s window
-ending at the close fits. So would Chainlink's shifted window when no report
-ends exactly at the close, because it is still 60 s.
+ending at the close fits. So does a 60 s window anchored to a report observed
+after the close, as in Chainlink's gap case (§4.2: one ending 1 s after the
+close is accepted).
 
 Two limits, for the owners:
 
@@ -398,7 +523,12 @@ Two limits, for the owners:
    value of the same stream. A producer of observations has to honor
    `referenceOpenSource`.
 2. **The boundary-report rule is prose only.** It lives in `windowEndRule` and
-   `timestampBoundary`. No field encodes "the containing report".
+   `referenceOpenSource`, and today it names no selection (U-24). No spec
+   field encodes one. The observation carries the settlement value's
+   averaging-window instants (`windowStartAt`, `windowEndAt`) and the
+   reference open's instant (`referenceOpenAt`), not a report's
+   `validFromTimestamp` or `observationsTimestamp`
+   (`packages/settlement/src/observation.ts:77-92`).
 
 R1 would also be expressible (`windowSeconds: 900`), so the vocabulary does not
 force the choice.
@@ -461,9 +591,19 @@ force the choice.
    The **published-window check** (ADR-009 §6 rule 1) takes the list from the
    caller. The only dated value in code is
    `RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24 = [30, 60]`, which names the
-   deprecated RTDS feed (`spec.ts:1952-1954`). The feed the rules name
-   publishes **60 only** (F-25, F-26). Nothing supplies a current list, and
-   ADR-009 §6 still names "the RTDS TWAP feed" (G-4).
+   deprecated RTDS feed (`spec.ts:1952-1954`). Which list applies depends on
+   which feed is meant, and the candidates differ:
+   - the stream the rules name publishes one window, **60 s**: Chainlink
+     scopes each TWAP stream to one window length, carried in its name (F-26);
+   - Chainlink Data Streams as a whole publishes live BTC/USD TWAP streams of
+     **30 s and 60 s** (F-32);
+   - Polymarket's resolution channel, PolyBolt `price.crypto.twap`, has "Only
+     60" (F-25);
+   - the RTDS list recorded on 2026-08-24 is **30 and 60**.
+
+   `windowSeconds: 60` is in all four. Nothing supplies a current list, and
+   ADR-009 §6 rule 1 is written for a spec "whose `resolution_source` is the
+   RTDS TWAP feed", which this spec's source is not (G-4).
 6. **Universe readiness.** `evaluateMarketReadiness`
    (`packages/universe/src/eligibility.ts:89`) correlates the verdict with the
    market's series, spec and rules version, and returns
@@ -523,14 +663,20 @@ event (`packages/trading-core/src/event-door.ts:79`;
 | **G-1** | No command, API, tool or loader records a review or loads a spec. Nothing writes `catalog.settlement_specs`, and seed files may not carry a review | `packages/storage-postgres`, `apps/ops-cli`, `apps/control-api` | a new authorized round |
 | **G-2** | Rules versions are per market; a series spec names one row, so it can match at most one window | `0002_catalog` (FK), `packages/settlement` (`rulesVersionId`), `packages/universe/src/eligibility.ts:400-430` | needs a ruling, then a contract or migration change |
 | **G-3** | Nothing records a market's rules text or hash (`recordRuleVersion` has no caller), and nothing produces `MarketRulesChanged` | `apps/data-gateway`, `apps/trader` | `ROLLOVER-1` or a successor |
-| **G-4** | No current published-window list. The only constant is the dated RTDS `[30, 60]`, and ADR-009 §6 names the RTDS feed (deprecated, E-10, E-11) | `packages/settlement/src/spec.ts:1952`; ADR-009 §6 | ADR owner, then `packages/settlement` |
+| **G-4** | No current published-window list, and no named feed for it. The only constant is the dated RTDS `[30, 60]`, and ADR-009 §6 rule 1 is scoped to specs sourced from the RTDS feed (deprecated, E-10, E-11). This spec's source is the Chainlink Data Streams stream the rules name (60 s only by its name), while Chainlink also publishes a live BTC/USD 30 s TWAP stream and PolyBolt's resolution channel has "Only 60" (§5.1 step 5). The ADR owner must name the feed whose list the check uses before anyone writes a current list, including in `db/seeds/settlement-specs/README.md` §4 item 2 | `packages/settlement/src/spec.ts:1952`; ADR-009 §6 | ADR owner, then `packages/settlement` |
 | **G-5** | No composition root runs `classifySettlementActivation` or `evaluateMarketReadiness` | `apps/trader` | the `WP-110` obligation |
 | **G-6** | The trader reads an operator-stated boolean, not the review | `packages/trading-core/src/config.ts:305`, `loop.ts:2565` | as G-5 |
 | **G-7** | Nothing writes series-binding approval or the active spec id, and markets are registered with no series | `catalog.series`; `apps/trader/src/register/registration.ts:297-312` | as G-1 |
 | **G-8** | Nothing watches for clarifications (Gamma `/market-clarifications` is SDK-only; there is the bulletin board) or for a change in the rules hash, so the clarification policy has no trigger | gateway or universe | `ROLLOVER-1` or a successor |
 | **G-9** | Nothing observes resolution or dispute state beyond the `market_resolved` push (U-27) | gateway | as G-8 |
 | **G-10** | The immutability trigger does not freeze `rules_version_id`, `dispute_policy` or `clarification_policy`, so a reviewed row's policies can be edited in place (`0002_catalog.up.sql:346-353`) | `db/migrations` | migration owner |
-| **G-11** | `payoff_model` is `not null` in the database but optional in the schema (a known `WP-110` divergence). It is not a blocker here: the seed names a model | `0002_catalog.up.sql:311` | already recorded |
+
+Not a gap: the first draft of this review listed a G-11, saying that
+`payoff_model` was `NOT NULL` in the database. Migration
+`0009_catalog_payoff_model_optional.up.sql` (`WP-210`) already drops that
+constraint (line 45) and adds `settlement_specs_model_only_where_one_exists`
+(lines 48-50). This is the repository's migration history, not a statement
+about any deployed database.
 
 ## 6. The V3-C13 coupling: observing the settlement value in PAPER
 
@@ -554,7 +700,7 @@ event (`packages/trading-core/src/event-door.ts:79`;
 | --- | --- | --- |
 | **O1** Legacy RTDS `crypto_prices_twap_sixty` | Public, unauthenticated; the repository's RTDS adapter already handles a 60 s window (`RTDS_TWAP_WINDOWS = [30, 60]`) | Lasts only until the removal, then nothing. Legacy wire (E18 fixed point). "No snapshot, history, or replay after a disconnect" (the frozen report §10.3). That it is the same Chainlink series as `price.crypto.twap` is not stated. No credential |
 | **O2** PolyBolt `price.crypto.twap` | The documented "used by crypto up/down market resolution" series: 60 s, exact decimal `full_accuracy_value`, a two-minute snapshot on subscribe | Needs **CLOB API credentials**, which the PAPER rules forbid (AGENTS.md; handoff §0.2). It would need a user ruling and an ADR: the secure-boundary rule (§9.12), and the undocumented "readonly" key (U-19) |
-| **O3** Chainlink Data Streams directly | The stream the rules name | Needs a **Chainlink account** (S-C13: "Sign up … to get started"). That is a credential too, so it needs the same kind of ruling. The public stream page cannot be read without JavaScript (F-27) |
+| **O3** Chainlink Data Streams directly | The stream the rules name | Needs a **Chainlink account** (S-C13: "Sign up … to get started"). That is a credential too, so it needs the same kind of ruling. The public stream page cannot be read without JavaScript (F-27); Chainlink's public directory gives the stream's feed ID, not its values (F-32) |
 | **O4** Do not observe the value; use the venue's outcome | The `market_resolved` push (documented); Gamma `closed` and `outcomePrices`; CLOB `tokens[].winner` (documented schema) | Public, no credential, and **what the trader does today**. No independent check of the venue's settlement, and no reference value for strategy inputs. Activation still needs a reviewed spec (check 6) |
 | **O5** Record Gamma `eventMetadata` | `priceToBeat` once a window opens, and `finalPrice` after it resolves | Public, but **undocumented** and binary floats (U-32). May change without notice. Never a settlement value. Informational only |
 | **O6** A proxy from the trader's reference venue (Binance today) | A 60 s average of a spot feed the trader already has | Strategy inputs only. The rules exclude "any other sources or spot markets", and ADR-009 §2 forbids approximating. Carries basis risk against Chainlink's price |
@@ -568,9 +714,10 @@ V3-C13. This round decides nothing.
 - Venue report: [`docs/venue/verified-2026-10-04.md`](../venue/verified-2026-10-04.md),
   sections:
   - A1 (pairing), A3 (window), A4 (delay and tick size);
-  - B (F-22 … F-31);
-  - 11 (C-15 … C-17) and 12 (U-23 … U-33);
+  - B (F-22 … F-32);
+  - 11 (C-15 … C-17) and 12 (U-23 … U-34);
   - 14 (the source index).
 - Code: every path above is cited with its line numbers as of base `7830a5c`.
 - Raw bodies and the probe are in the round's scratch directory, mirrored to
-  `~/pmb-rounds/venue-setl/r0/`. They are not committed.
+  `~/pmb-rounds/venue-setl/r0/` and, for review round 1,
+  `~/pmb-rounds/venue-setl/r1/`. They are not committed.
