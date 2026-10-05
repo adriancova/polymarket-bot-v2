@@ -29,11 +29,12 @@ import {
   RecordingAlerts,
   RecordingJournal,
   RELEASE_SETTLE_MS,
+  releaseRow,
   REPOSITORY_DEFAULTS_LIVE_MICRO,
 } from "./fakes.test-support.js";
 import type { PlacementVenuePort } from "./fenced-venue.js";
 import { LiveFencingRefusal, type RunModeContext } from "./fencing-authority.js";
-import { COMPOSITION_PROVED_INPUTS, createLiveSafety, LiveSafetyConfigurationError } from "./live-safety.js";
+import { COMPOSITION_PROVED_INPUTS, createLiveSafety, LiveSafetyConfigurationError, type LiveSafetyOptions } from "./live-safety.js";
 import { OmsProgressMonitor } from "./oms-progress.js";
 
 const MARKET = "0190a3e0-0000-7000-8000-00000000000c";
@@ -586,6 +587,309 @@ describe("r2 X3: a kill switch's cancel is an obligation held until its scope is
     await placement;
     await c.clock.advance(3_000);
     expect(passes(c)).toEqual(["FIRST", "CONFIRMING", "RETAINED"]);
+  });
+});
+
+/** A fenced venue whose placements are held in flight until the test lands them, or loses their answer (a throw). */
+function heldVenueR3(c: ReturnType<typeof composition>): {
+  fenced: PlacementVenuePort<string, string, { readonly id: string; readonly marketId: string; readonly instanceId: string }, string, string>;
+  land(id: string): void;
+  lose(id: string): void;
+} {
+  const pending = new Map<string, { readonly resolve: () => void; readonly reject: (error: Error) => void }>();
+  const venue: PlacementVenuePort<string, string, { readonly id: string; readonly marketId: string; readonly instanceId: string }, string, string> = {
+    createLimitOrder: async (request: string) => `SIGNED:${request}`,
+    postOrder: async (order) => {
+      await new Promise<void>((resolve, reject) => {
+        pending.set(order.id, { resolve, reject });
+      });
+      return `ACCEPTED:${order.id}`;
+    },
+    postOrders: async (orders) => orders.map((order) => `ACCEPTED:${order.id}`),
+    cancelOrder: async () => "CANCELED",
+  };
+  const fenced = c.safety.fenceVenue(
+    venue,
+    { signRefused: (reasons) => `FAILED(${reasons.join(",")})`, placementRefused: (reasons) => `NOT_SENT(${reasons.join(",")})` },
+    { request: () => null, signedOrder: () => undefined, order: (order) => ({ intent: "REDUCTION", marketId: order.marketId, instanceId: order.instanceId }) },
+  );
+  const take = (id: string): { readonly resolve: () => void; readonly reject: (error: Error) => void } => {
+    const held = pending.get(id);
+    if (held === undefined) throw new Error(`${id} is not in flight`);
+    pending.delete(id);
+    return held;
+  };
+  return {
+    fenced,
+    land: (id: string): void => {
+      take(id).resolve();
+    },
+    lose: (id: string): void => {
+      take(id).reject(new Error("socket hang up: the answer was lost (synthetic)"));
+    },
+  };
+}
+
+function cancelRequests(c: ReturnType<typeof composition>): (readonly [string, string])[] {
+  return c.journal.of("KILL_SWITCH_CANCEL_REQUESTED").map((entry) => [entry.pass, entry.outcome] as const);
+}
+
+/** A composition whose kill-switch options carry `extra` (its own reader, cancel port and finality, returned). */
+function compositionWithKillSwitch(extra: Partial<LiveSafetyOptions["killSwitch"]>): ReturnType<typeof composition> {
+  const reader = new FakeKillSwitchReader();
+  const cancels = new FakeCancels();
+  const releaseFinality = new FakeReleaseFinality();
+  const c = composition({ killSwitch: { reader, refreshIntervalMs: 1_000, cancels, releaseSettleMs: RELEASE_SETTLE_MS, releaseFinality, ...extra } });
+  return { ...c, reader, cancels, releaseFinality };
+}
+
+/**
+ * r3, J1 (HIGH; Opus R3-M-1 = astra CX320-R3-02). WP-270's order view carries no strategy instance, and at round 2
+ * an instance directive therefore read "nothing resting": its obligation ended after the confirming or settling
+ * pass, so an instance order still resting — already resting with its cancel accepted, or a placement whose answer
+ * was lost and that reconciliation later showed LIVE — rested under the instance's FULL_HALT while the heartbeat
+ * kept it alive. Missing attribution is no longer "clear".
+ */
+describe("r3 J1: a STRATEGY_INSTANCE obligation is held while the OMS shows an order not PROVED to be another instance's", () => {
+  const OTHER_INSTANCE = "0190a3e0-0000-7000-8000-0000000000fe";
+
+  it("an instance order already resting: FIRST and CONFIRMING are accepted and it still rests: RETAINED once per refresh interval until the OMS shows it ended; the account heartbeat runs on", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.views = [{ orderId: "o-instance", state: "LIVE", venueOrderId: "v-instance", marketId: MARKET }];
+    c.reader.rows = [engageRow({ id: "s", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+    await c.clock.advance(6_000);
+    // On f42019a: ["FIRST", "CONFIRMING"], then nothing while the order rested.
+    expect(cancelRequests(c).map(([pass]) => pass)).toEqual(["FIRST", "CONFIRMING", "RETAINED", "RETAINED", "RETAINED", "RETAINED"]);
+    c.proveComposition();
+    expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+    c.oms.views = [{ orderId: "o-instance", state: "CANCELED", venueOrderId: "v-instance", marketId: MARKET }];
+    await c.clock.advance(5_000);
+    expect(cancelRequests(c)).toHaveLength(6);
+  });
+
+  it("UNKNOWN, then reconciled LIVE: a placement in flight at the switch whose answer is lost settles (the OMS shows it SUBMISSION_UNKNOWN, then LIVE): the obligation is RETAINED after the settling pass for as long as it rests", async () => {
+    const c = composition();
+    await ready(c);
+    const { fenced, lose } = heldVenueR3(c);
+    const placement = fenced.postOrder({ id: "lost", marketId: MARKET, instanceId: INSTANCE });
+    c.oms.views = [{ orderId: "lost", state: "SENDING", venueOrderId: null, marketId: MARKET }];
+    c.reader.rows = [engageRow({ id: "s", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+    await c.clock.advance(3_000);
+    lose("lost");
+    await expect(placement).rejects.toThrow("answer was lost");
+    c.oms.views = [{ orderId: "lost", state: "SUBMISSION_UNKNOWN", venueOrderId: null, marketId: MARKET }];
+    await c.clock.advance(1_000);
+    expect(cancelRequests(c).at(-1)?.[0]).toBe("AFTER_SETTLE");
+    const atSettle = cancelRequests(c).length;
+    // The venue processed it after all; reconciliation shows it LIVE.
+    c.oms.views = [{ orderId: "lost", state: "LIVE", venueOrderId: "v-lost", marketId: MARKET }];
+    await c.clock.advance(20_000);
+    // On f42019a: nothing after AFTER_SETTLE for 20 s while it rested.
+    expect(cancelRequests(c).slice(atSettle).map(([pass]) => pass)).toEqual(Array.from({ length: 20 }, () => "RETAINED"));
+    c.proveComposition();
+    expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+  });
+
+  const THROWS = Symbol("throws");
+  for (const [label, answer, holds] of [
+    ["attributed to ANOTHER instance", OTHER_INSTANCE, false],
+    ["attributed to this instance", INSTANCE, true],
+    ["unattributed (null)", null, true],
+    ["an empty answer", "", true],
+    ["a non-identifier answer", 42, true],
+    ["a port that throws", THROWS, true],
+  ] as const) {
+    it(`with an attribution port, a resting order ${label} ${holds ? "holds" : "does not hold"} the obligation`, async () => {
+      const c = compositionWithKillSwitch({
+        instanceAttribution: {
+          instanceOf: (order) => {
+            expect(order.orderId).toBe("o-1");
+            if (answer === THROWS) throw new Error("attribution store unreachable (synthetic)");
+            return answer;
+          },
+        },
+      });
+      await ready(c);
+      c.oms.views = [{ orderId: "o-1", state: "LIVE", venueOrderId: "v-1", marketId: MARKET }];
+      c.reader.rows = [engageRow({ id: "s", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+      await c.clock.advance(5_000);
+      expect(cancelRequests(c).map(([pass]) => pass)).toEqual(holds ? ["FIRST", "CONFIRMING", "RETAINED", "RETAINED", "RETAINED"] : ["FIRST", "CONFIRMING"]);
+    });
+  }
+
+  it("refuses an unusable attribution port", () => {
+    for (const instanceAttribution of [null, {}, { instanceOf: "yes" }]) {
+      expect(() => compositionWithKillSwitch({ instanceAttribution: instanceAttribution as never })).toThrow(LiveSafetyConfigurationError);
+    }
+  });
+});
+
+/**
+ * r3, J2 (HIGH; astra CX320-R3-01). At round 2 the obligation waited on its request for good: one cancel that never
+ * answered stopped every later cancel of that switch, while health stayed green and a MARKET or STRATEGY_INSTANCE
+ * switch kept the heartbeat running. Every request is now a numbered attempt with a deadline.
+ */
+describe("r3 J2: every kill-switch cancel request is a numbered attempt with a deadline", () => {
+  it("a FIRST cancel that never answers is abandoned at the first read past cancelTimeoutMs, paged once, and requested again at that read; the working service then discharges it and the obligation goes on", async () => {
+    const c = composition();
+    await ready(c);
+    c.oms.views = [{ orderId: "o-here", state: "LIVE", venueOrderId: "v-here", marketId: MARKET }];
+    let calls = 0;
+    c.cancels.cancel = async (directive) => {
+      calls += 1;
+      c.cancels.calls.push(JSON.stringify(directive));
+      if (calls === 1) return new Promise<never>(() => undefined);
+      return true;
+    };
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(1_000);
+    expect(calls).toBe(1);
+    await c.clock.advance(4_000);
+    // On f42019a: still one call, and nothing journalled.
+    expect(cancelRequests(c)).toEqual([
+      ["FIRST", "ABANDONED"],
+      ["FIRST", "ACCEPTED"],
+      ["CONFIRMING", "ACCEPTED"],
+      ["RETAINED", "ACCEPTED"],
+      ["RETAINED", "ACCEPTED"],
+    ]);
+    expect(c.journal.of("KILL_SWITCH_CANCEL_REQUESTED").map((entry) => entry.attempt)).toEqual([1, 2, 3, 4, 5]);
+    expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_CANCEL_UNANSWERED")).toHaveLength(1);
+    // A MARKET switch never stops the account's heartbeat (ADR-033 D1 item 3).
+    c.proveComposition();
+    expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+  });
+
+  it("a cancel service that never answers is asked again at EVERY read (not once), and paged once", async () => {
+    const c = composition();
+    await ready(c);
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      return new Promise<never>(() => undefined);
+    };
+    c.reader.rows = [engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" })];
+    await c.clock.advance(10_000);
+    // On f42019a: 1.
+    expect(c.cancels.calls).toHaveLength(10);
+    expect(cancelRequests(c)).toEqual(Array.from({ length: 9 }, () => ["FIRST", "ABANDONED"]));
+    expect(c.alerts.pages.filter((page) => page.page === "KILL_SWITCH_CANCEL_UNANSWERED")).toHaveLength(1);
+    c.proveComposition();
+    expect(c.safety.heartbeatGate.evaluate()).toEqual({ permitted: true });
+  });
+
+  it("a late answer of an abandoned attempt discharges nothing, and does not release the newer attempt it was replaced by", async () => {
+    const c = composition();
+    await ready(c);
+    const answers: ((value: unknown) => void)[] = [];
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      return new Promise<unknown>((resolve) => {
+        answers.push(resolve);
+      });
+    };
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(2_000);
+    // Attempt 1 was abandoned at the second read and attempt 2 requested; attempt 1 now answers `true`.
+    expect(answers).toHaveLength(2);
+    answers[0]?.(true);
+    await c.clock.advance(0);
+    expect(c.journal.of("KILL_SWITCH_CANCEL_LATE_ANSWER_DISCARDED")).toMatchObject([{ attempt: 1, pass: "FIRST", accepted: true }]);
+    // Nothing was discharged: at the next read attempt 2 is abandoned in turn and FIRST is requested again (not CONFIRMING).
+    await c.clock.advance(1_000);
+    expect(answers).toHaveLength(3);
+    expect(cancelRequests(c)).toEqual([
+      ["FIRST", "ABANDONED"],
+      ["FIRST", "ABANDONED"],
+    ]);
+    answers[2]?.(true);
+    await c.clock.advance(1_000);
+    expect(cancelRequests(c)).toEqual([
+      ["FIRST", "ABANDONED"],
+      ["FIRST", "ABANDONED"],
+      ["FIRST", "ACCEPTED"],
+    ]);
+    // The confirming pass comes one refresh interval after that acceptance, as for any obligation.
+    await c.clock.advance(1_000);
+    expect(answers).toHaveLength(4);
+    answers[3]?.(true);
+    await c.clock.advance(0);
+    expect(cancelRequests(c).at(-1)).toEqual(["CONFIRMING", "ACCEPTED"]);
+  });
+
+  it("one directive's silent cancel does not delay another's: the attempts of one read run side by side", async () => {
+    const c = composition();
+    await ready(c);
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      if (directive.scope === "MARKET") return new Promise<never>(() => undefined);
+      return true;
+    };
+    c.reader.rows = [
+      engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }),
+      engageRow({ id: "i", scope: "STRATEGY_INSTANCE", scopeRef: INSTANCE, action: "FULL_HALT" }),
+    ];
+    await c.clock.advance(1_000);
+    expect(c.journal.of("KILL_SWITCH_CANCEL_REQUESTED").map((entry) => [entry.directive, entry.pass, entry.outcome])).toEqual([[`i:STRATEGY_INSTANCE:${INSTANCE}`, "FIRST", "ACCEPTED"]]);
+  });
+
+  it("refuses a cancel deadline that is not an integer of 1 ms up to the KILL_SWITCH input's maximum age", () => {
+    for (const cancelTimeoutMs of [0, -1, 1.5, Number.NaN, HEALTH_MAX_AGE.KILL_SWITCH + 1, "1000"]) {
+      expect(() => compositionWithKillSwitch({ cancelTimeoutMs: cancelTimeoutMs as never })).toThrow(LiveSafetyConfigurationError);
+    }
+    expect(() => compositionWithKillSwitch({ cancelTimeoutMs: HEALTH_MAX_AGE.KILL_SWITCH })).not.toThrow();
+  });
+
+  it("a configured deadline longer than the refresh interval: the attempt is waited on until it passes, then abandoned", async () => {
+    const c = compositionWithKillSwitch({ cancelTimeoutMs: 2_500 });
+    await ready(c);
+    c.cancels.cancel = async (directive) => {
+      c.cancels.calls.push(JSON.stringify(directive));
+      return new Promise<never>(() => undefined);
+    };
+    c.reader.rows = [engageRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(3_000);
+    expect(c.cancels.calls).toHaveLength(1);
+    await c.clock.advance(1_000);
+    expect(c.cancels.calls).toHaveLength(2);
+    expect(cancelRequests(c)).toEqual([["FIRST", "ABANDONED"]]);
+  });
+});
+
+/**
+ * r3, J3 (LOW; Opus R3-L2). At round 2 a PENDING release asked for no cancel, and the engage's obligation was dropped
+ * at the read that first saw the release: a placement landing inside the settle window was cancelled only once the
+ * release settled (to UNCONFIRMED), up to `releaseSettleMs` later, while the scope's submissions stayed blocked.
+ */
+describe("r3 J3: a release that is still PENDING keeps a cancel obligation", () => {
+  it("a placement in flight at a MARKET FULL_HALT lands inside its (never final) release's settle window: it is cancelled at the next read, while the release is still PENDING", async () => {
+    const c = composition();
+    await ready(c);
+    c.releaseFinality.all = false;
+    const { fenced, land } = heldVenueR3(c);
+    const placement = fenced.postOrder({ id: "p", marketId: MARKET, instanceId: INSTANCE });
+    c.reader.rows = [engageRow({ id: "e", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(3_000);
+    c.reader.rows = [releaseRow({ id: "r", scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" })];
+    await c.clock.advance(1_000);
+    const cancelledAt: number[] = [];
+    const inner = c.cancels.cancel.bind(c.cancels);
+    c.cancels.cancel = async (directive) => {
+      cancelledAt.push(c.clock.now);
+      return inner(directive);
+    };
+    land("p");
+    expect(await placement).toBe("ACCEPTED:p");
+    const landedAt = c.clock.now;
+    await c.clock.advance(1_000);
+    const status = c.safety.status().killSwitch;
+    expect(status.known ? status.effects.engaged.map((entry) => [entry.killSwitchEventId, entry.release]) : null).toEqual([["r", "PENDING"]]);
+    // On f42019a: no cancel until the release settled (UNCONFIRMED), 1.5 s after landing.
+    expect(cancelledAt.filter((at) => at >= landedAt)).toHaveLength(1);
+    expect((cancelledAt[0] ?? Number.POSITIVE_INFINITY) - landedAt).toBeLessThanOrEqual(1_000);
+    expect(c.journal.of("KILL_SWITCH_CANCEL_REQUESTED").at(-1)).toMatchObject({ directive: `r:MARKET:${MARKET}`, pass: "AFTER_SETTLE", outcome: "ACCEPTED" });
+    // Submissions in the scope stay blocked throughout.
+    expect(c.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_MARKET_ENDS_TRADING");
   });
 });
 

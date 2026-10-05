@@ -21,6 +21,7 @@ export {
   type KillSwitchCancelPort,
   type LiveSafetyOptions,
   type LiveSafetyStatus,
+  type OrderInstanceAttribution,
   VENUE_RESTING_OR_UNKNOWN_STATES,
 } from "./live-safety.js";
 export {

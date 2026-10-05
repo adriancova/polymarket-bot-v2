@@ -98,13 +98,27 @@ describe("the fold fails closed", () => {
     expect(effects.cancels).toEqual([{ directive: { scope: "ACCOUNT" }, killSwitchEventId: "r" }]);
   });
 
-  it("r1 I6: a release not yet SETTLED is still the switch it releases (heartbeat stopped, entries and submissions blocked) but asks for no cancel", () => {
+  /**
+   * r3, J3 (Opus R3-L2): at round 2 a PENDING release asked for no cancel, so the engage's cancel obligation lapsed for
+   * up to `releaseSettleMs` while the scope's submissions stayed blocked. A release that is not final is now the
+   * switch it releases IN FULL, cancels included, under its own event id.
+   */
+  it("r1 I6 / r3 J3: a release not yet SETTLED is still the switch it releases, in full: heartbeat stopped, entries and submissions blocked, and its cancels requested under the release's own event id", () => {
     const engaged = foldKillSwitchRows([releaseRow({ id: "r", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })], UNSETTLED, FINAL);
     expect(engaged).toMatchObject([{ scope: "GLOBAL", action: "FULL_HALT", release: "PENDING", unreadable: false }]);
     const effects = killSwitchEffects(engaged, ACCOUNT);
     expect(effects.stopsHeartbeat).toBe(true);
     expect(effects.blocksAllSubmissions).toBe(true);
-    expect(effects.cancels).toEqual([]);
+    // On f42019a: [] (no cancel while PENDING).
+    expect(effects.cancels).toEqual([{ directive: { scope: "ACCOUNT" }, killSwitchEventId: "r" }]);
+    for (const [scope, scopeRef, directive] of [
+      ["MARKET", MARKET, { scope: "MARKET", marketId: MARKET }],
+      ["STRATEGY_INSTANCE", INSTANCE, { scope: "STRATEGY_INSTANCE", instanceId: INSTANCE }],
+    ] as const) {
+      const scoped = killSwitchEffects(foldKillSwitchRows([releaseRow({ id: `p-${scope}`, scope, scopeRef, action: "FULL_HALT" })], UNSETTLED, FINAL), ACCOUNT);
+      expect(scoped.cancels, scope).toEqual([{ directive, killSwitchEventId: `p-${scope}` }]);
+      expect(scoped.stopsHeartbeat, scope).toBe(false);
+    }
     const market = killSwitchEffects(foldKillSwitchRows([releaseRow({ id: "m", scope: "MARKET", scopeRef: MARKET, action: "HALT_NEW_ENTRIES" })], UNSETTLED, FINAL), ACCOUNT);
     expect([...market.entryBlockedMarkets]).toEqual([MARKET]);
     expect(market.stopsHeartbeat).toBe(false);

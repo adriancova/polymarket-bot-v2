@@ -43,10 +43,14 @@
  *     applied that exact release (e.g. a finalization record a control-plane
  *     grant adds, or an operator's attestation of the control plane's `200`).
  *     Anything else — `false`, a throw, no answer — is not final.
- *   Until then a release row is enforced as the switch it releases (its
- *   `action` column), heartbeat stop included: `PENDING` inside the settle
- *   window (no cancel requested), `UNCONFIRMED` after it (enforced in full,
- *   cancels included), `VOIDED` once a VOID names it (in full, for good).
+ *   Until then a release row is enforced, IN FULL, as the switch it releases
+ *   (its `action` column), heartbeat stop and cancels included: `PENDING`
+ *   inside the settle window, `UNCONFIRMED` after it, `VOIDED` once a VOID
+ *   names it (for good). Its cancels carry the release row's own event id, so
+ *   the composition's cancel obligation (`live-safety.ts`) continues under it
+ *   from the first read that sees it (r3, finding J3: at round 2 a `PENDING`
+ *   release asked for no cancel, and the engage's obligation lapsed for up to
+ *   `releaseSettleMs` while the scope's submissions stayed blocked).
  * - **It survives every restart** of the trader, the control API, or both:
  *   the state is re-derived from the rows on every read, never carried in
  *   memory.
@@ -152,10 +156,9 @@ export interface EngagedSwitch {
   /** The row could not be read as the control plane writes it; it is enforced as `FULL_HALT`. */
   readonly unreadable: boolean;
   /**
-   * `NONE` for an engage. `PENDING` for a release not yet settled (seen for less than the settle window): enforced as
-   * the switch it releases, no cancel requested. `UNCONFIRMED` for a settled, unvoided release with no positive
-   * finality (r2 X2): enforced in full, cancels included, for as long as it stays unconfirmed. `VOIDED` for a release
-   * the control plane voided: the switch is still engaged, and enforced in full.
+   * `NONE` for an engage. `PENDING` for a release not yet settled (seen for less than the settle window), `UNCONFIRMED`
+   * for a settled, unvoided release with no positive finality (r2 X2), `VOIDED` for a release the control plane voided:
+   * each is enforced in full as the switch it releases, cancels included (r3 J3), for as long as it is seen so.
    */
   readonly release: "NONE" | "PENDING" | "UNCONFIRMED" | "VOIDED";
 }
@@ -174,7 +177,7 @@ export interface KillSwitchEffects {
   readonly submissionBlockedMarkets: ReadonlySet<string>;
   readonly entryBlockedInstances: ReadonlySet<string>;
   readonly submissionBlockedInstances: ReadonlySet<string>;
-  /** Each with the event id that asked for it, so a cancel is requested once per engage. */
+  /** Each with the event id of the row that asks for it (an engage, or a release that is not final). */
   readonly cancels: readonly { readonly directive: CancelDirective; readonly killSwitchEventId: string }[];
 }
 
@@ -301,7 +304,7 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
         if (ACCOUNT_ENDING.includes(entry.action)) {
           stopsHeartbeat = true;
           blocksAllSubmissions = true;
-          if (entry.release !== "PENDING") cancels.push({ directive: Object.freeze({ scope: "ACCOUNT" as const }), killSwitchEventId: entry.killSwitchEventId });
+          cancels.push({ directive: Object.freeze({ scope: "ACCOUNT" as const }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
@@ -310,8 +313,7 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
         entryBlockedMarkets.add(entry.scopeRef);
         if (ending) {
           submissionBlockedMarkets.add(entry.scopeRef);
-          if (entry.release !== "PENDING")
-            cancels.push({ directive: Object.freeze({ scope: "MARKET" as const, marketId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
+          cancels.push({ directive: Object.freeze({ scope: "MARKET" as const, marketId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }
@@ -320,8 +322,7 @@ export function killSwitchEffects(engaged: readonly EngagedSwitch[], accountRef:
         entryBlockedInstances.add(entry.scopeRef);
         if (ending) {
           submissionBlockedInstances.add(entry.scopeRef);
-          if (entry.release !== "PENDING")
-            cancels.push({ directive: Object.freeze({ scope: "STRATEGY_INSTANCE" as const, instanceId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
+          cancels.push({ directive: Object.freeze({ scope: "STRATEGY_INSTANCE" as const, instanceId: entry.scopeRef }), killSwitchEventId: entry.killSwitchEventId });
         }
         break;
       }

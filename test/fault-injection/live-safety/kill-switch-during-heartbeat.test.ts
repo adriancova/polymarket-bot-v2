@@ -64,8 +64,12 @@ describe("a GLOBAL FULL_HALT engaged while a heartbeat is in flight", () => {
     // after a qualifying run.
     live.reader.rows = [releaseRow({ id: "kill-2", scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" })];
     await live.step(1_500);
-    // Not settled yet: still the switch it releases; the released switch's obligation is dropped (no cancel since).
+    // Not settled yet (PENDING): still the switch it releases, IN FULL. The engage's obligation is dropped, and the
+    // release carries its own from the read that first saw it (r3 J3: at round 2 nothing was requested while PENDING).
     expect(live.safety.gate(REDUCE).reasons).toContain("KILL_SWITCH_ACCOUNT_ENDS_TRADING");
+    const pending = live.safety.status().killSwitch;
+    expect(pending.known ? pending.effects.engaged.map((entry) => entry.release) : null).toEqual(["PENDING"]);
+    expect(live.journal.of("KILL_SWITCH_CANCEL_REQUESTED").filter((entry) => entry.directive.startsWith("kill-2:")).map((entry) => entry.pass)).toEqual(["FIRST", "CONFIRMING"]);
     const cancelsAtRelease = live.cancels.calls.length;
     await live.step(6_000);
     expect(live.transport.requests.length).toBeGreaterThan(inFlightSends);
@@ -110,7 +114,8 @@ describe("a MARKET or STRATEGY_INSTANCE switch never stops the heartbeat (ADR-03
       expect(live.entryReasons()).toContain(scope === "MARKET" ? "KILL_SWITCH_MARKET_ENGAGED" : "KILL_SWITCH_INSTANCE_ENGAGED");
       expect(live.safety.gate({ kind: "NEW_ENTRY", marketId: "0190a3e0-0000-7000-8000-0000000000ff", instanceId: "0190a3e0-0000-7000-8000-0000000000ee" }).permitted).toBe(true);
       const directive = scope === "MARKET" ? `{"scope":"MARKET","marketId":"${MARKET}"}` : `{"scope":"STRATEGY_INSTANCE","instanceId":"${INSTANCE}"}`;
-      // The first sweep, then one confirming sweep (r1 I2), then nothing more.
+      // The first sweep, then one confirming sweep (r1 I2), then nothing more: no placement is pending and the OMS shows
+      // no order resting or unknown (for an instance switch, any such order it could not attribute would hold it: r3 J1).
       expect(live.cancels.calls).toEqual([directive, directive]);
     });
   }

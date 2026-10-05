@@ -87,7 +87,35 @@
  * | `FIRST` | at every read until the port first accepts it |
  * | `CONFIRMING` | once, at the first read at least one refresh interval after the latest acceptance (r1 I2) |
  * | `AFTER_SETTLE` | at the first read after a placement IN THE DIRECTIVE'S SCOPE settled at or after the latest accepted request STARTED (r2 X3), whatever the spacing |
- * | `RETAINED` | after the confirming pass, at most once per refresh interval, while a placement in the scope is still pending, or while the OMS shows an order in the scope that rests or may rest at the venue (r2 X3) |
+ * | `RETAINED` | after the confirming pass, at most once per refresh interval, while a placement in the scope is still pending, or while the OMS shows an order that rests or may rest at the venue and that is not PROVED to be outside the scope (r2 X3; r3 J1) |
+ *
+ * ### Every request is a numbered ATTEMPT with a deadline (r3, finding J2)
+ *
+ * The port is the composition's (WP-260's client puts no deadline on a venue
+ * call, `oms-progress.ts`), so a request may never answer. At round 2 the
+ * obligation waited on its request for good: one cancel that never settled
+ * stopped every later cancel of that switch, while health stayed green and a
+ * MARKET or STRATEGY_INSTANCE switch kept the heartbeat running (both
+ * verifiers' reproduction: one call, the order resting, twelve more
+ * heartbeats in 60 s). Now:
+ *
+ * - each request is an attempt with its own number; the obligation waits on at
+ *   most ONE attempt, and only that attempt's answer may discharge a pass;
+ * - an attempt not answered within `cancelTimeoutMs` (default: one refresh
+ *   interval; at most the KILL_SWITCH input's maximum age) is ABANDONED by the
+ *   first read that finds it so: journalled (`outcome: "ABANDONED"`), paged
+ *   once per obligation (`KILL_SWITCH_CANCEL_UNANSWERED`), and the
+ *   obligation's due pass — which the abandoned attempt did not discharge —
+ *   is requested again at that same read;
+ * - an abandoned attempt's answer, when it comes, is DISCARDED (journalled as
+ *   `KILL_SWITCH_CANCEL_LATE_ANSWER_DISCARDED`): it neither discharges a pass
+ *   nor touches the newer attempt;
+ * - the attempts of one read run side by side, so one directive's silence
+ *   never delays another's request.
+ *
+ * Paging is the operator's signal; it is not the enforcement. A MARKET or
+ * STRATEGY_INSTANCE switch still never stops the heartbeat (ADR-033 D1
+ * item 3): the venue would cancel every order under the credentials.
  *
  * Why: every order transmitted AFTER the switch was observed is refused by the
  * per-order fence (`fenced-venue.ts`), but a placement handed to the venue
@@ -101,15 +129,41 @@
  * to the venue until it settles ({@link LiveSafety.fenceVenue}); a placement
  * still pending keeps the obligation open, and its settling — accepted,
  * refused or unknown — calls for another cancel requested after it. Venue
- * evidence closes it: for MARKET and account-wide directives the OMS's own
- * view (`SafetyOms.orders()`, which WP-270 keeps from venue answers and
- * reconciliation) must show no order in the scope in a state that rests or
- * may rest at the venue (`SENDING`, `ACKNOWLEDGED`, `LIVE`, `DELAYED`,
- * `PARTIALLY_FILLED`, `CANCEL_PENDING`, `SUBMISSION_UNKNOWN`,
- * `RECONCILING`); an unreadable view keeps it open. WP-270's order view
- * carries no strategy instance, so a STRATEGY_INSTANCE directive is held by
- * its tracked placements only (disclosed). An obligation is dropped when its
- * switch is no longer engaged.
+ * evidence closes it: the OMS's own view (`SafetyOms.orders()`, which WP-270
+ * keeps from venue answers and reconciliation) must show no order in the
+ * scope in a state that rests or may rest at the venue (`SENDING`,
+ * `ACKNOWLEDGED`, `LIVE`, `DELAYED`, `PARTIALLY_FILLED`, `CANCEL_PENDING`,
+ * `SUBMISSION_UNKNOWN`, `RECONCILING`); an unreadable view keeps it open.
+ *
+ * ### STRATEGY_INSTANCE scope: missing attribution is NOT "clear" (r3, finding J1)
+ *
+ * WP-270's order view carries a market but no strategy instance. At round 2 an
+ * instance directive therefore read "nothing resting" from the OMS, and its
+ * obligation ended after the confirming or settling pass: an instance order
+ * already resting whose cancel was accepted but that still rested, or a
+ * placement whose answer was lost (`SUBMISSION_UNKNOWN`) and that
+ * reconciliation later showed `LIVE`, rested under the instance's FULL_HALT
+ * while the heartbeat kept it alive (both verifiers' reproduction with the
+ * real OMS). Now an order resting or unknown in the OMS's view is OUTSIDE an
+ * instance's scope only when the injected {@link OrderInstanceAttribution}
+ * AFFIRMATIVELY attributes it to another instance. With no port bound, a
+ * port that answers anything but an identifier, or one that throws, the
+ * order counts as the instance's: the obligation is held while the OMS shows
+ * any order of the account resting or unknown — the account's quiescence is
+ * then the evidence. (Tracking only the markets of the instance's tracked
+ * placements would miss its orders that were already resting.)
+ *
+ * ### Which switch carries the obligation
+ *
+ * Every engaged switch that ends trading in its scope does, including a
+ * release that is not final — `PENDING` inside its settle window,
+ * `UNCONFIRMED`, `VOIDED` (`kill-switch.ts`) — under the release row's own
+ * event id from the first read that sees it: so no read between an engage and
+ * a FINAL release lacks one (r3, finding J3: at round 2 a `PENDING` release
+ * asked for no cancel, and the engage's obligation was dropped while the
+ * scope's submissions stayed blocked). An obligation is dropped when its
+ * switch is no longer engaged: released with positive finality, or superseded
+ * by a newer row of its scope, which carries its own.
  */
 
 import type { EligibilityVerdict, ClosedOnlyPort, GeoblockPort } from "./eligibility.js";
@@ -121,11 +175,25 @@ import { EventLoopProbe, HealthLease, ProofBoard, type HealthInput, type HealthP
 import { KillSwitchMonitor, type CancelDirective, type KillSwitchReader, type KillSwitchReleaseFinality, type KillSwitchSnapshot } from "./kill-switch.js";
 import { LapseRecovery } from "./lapse-recovery.js";
 import type { OmsProgressMonitor } from "./oms-progress.js";
-import type { HeartbeatView, LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyTimers } from "./ports.js";
+import type { HeartbeatView, LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyOrderView, SafetyTimers } from "./ports.js";
 
-/** Carries out a kill switch's cancel (bound by the composition to the OMS or the secure client at `EMERGENCY_CANCEL`). `true` = done. */
+/**
+ * Carries out a kill switch's cancel (bound by the composition to the OMS or the secure client at `EMERGENCY_CANCEL`).
+ * `true` = accepted. A request not answered within `cancelTimeoutMs` is abandoned and requested again (r3 J2; module
+ * header), so the binding must tolerate a repeated request for the same scope.
+ */
 export interface KillSwitchCancelPort {
   cancel(directive: CancelDirective): Promise<unknown>;
+}
+
+/**
+ * The strategy instance an OMS order carries out (r3, finding J1; module header), from the composition's own records
+ * (WP-270's `OrderView` has none: e.g. its `orderId` or `executionGroupId` mapped to the decision that produced it).
+ * ONLY an answer that is an identifier counts; anything else, or a throw, leaves the order in every instance's scope.
+ * Synchronous and side-effect free: it is asked at every read for every order resting or unknown in the OMS's view.
+ */
+export interface OrderInstanceAttribution {
+  instanceOf(order: SafetyOrderView): unknown;
 }
 
 /** The OMS order states that rest, or may rest, at the venue: an order in one keeps a cancel obligation open (r2 X3). */
@@ -148,6 +216,14 @@ interface CancelObligation {
   lastAcceptedAtMs: number;
   /** Whether the confirming pass has been accepted. */
   confirmed: boolean;
+}
+
+/** The ONE request an obligation is waiting on (r3 J2): only its answer may discharge a pass. */
+interface CancelAttempt {
+  readonly attempt: number;
+  readonly pass: CancelPass;
+  /** Monotonic instant it was requested (read just before the port was called). */
+  readonly requestedAtMs: number;
 }
 
 /** The sources of an explicit heartbeat stop (ADR-033 D1 item 4). */
@@ -202,6 +278,18 @@ export interface LiveSafetyOptions {
      * unvoided release row with no such evidence stays enforced as the switch it releases, in full.
      */
     readonly releaseFinality: KillSwitchReleaseFinality;
+    /**
+     * How long a cancel request may go unanswered before it is abandoned and requested again (r3 J2; module header).
+     * Default: `refreshIntervalMs`. At most the KILL_SWITCH input's maximum age: no cancel stalls longer than the
+     * switch state it enforces may be stale. It should exceed the cancel path's normal latency, or every request is
+     * abandoned (and repeated) before it answers.
+     */
+    readonly cancelTimeoutMs?: number;
+    /**
+     * Which strategy instance an OMS order carries out (r3 J1; module header). Optional: without it, every order
+     * resting or unknown in the OMS's view holds every STRATEGY_INSTANCE cancel obligation open.
+     */
+    readonly instanceAttribution?: OrderInstanceAttribution;
   };
   readonly eligibility: { readonly geoblock: GeoblockPort; readonly closedOnly: ClosedOnlyPort; readonly refreshIntervalMs: number; readonly maxAgeMs: number };
   readonly oms: SafetyOms;
@@ -253,7 +341,12 @@ export class LiveSafety {
   readonly #haltedMarkets = new Set<string>();
   /** Per cancel key (switch event and directive): its obligation, once the port has first accepted it. */
   readonly #cancels = new Map<string, CancelObligation>();
-  readonly #cancelsInFlight = new Set<string>();
+  /** Per cancel key: the one attempt its obligation is waiting on (r3 J2). */
+  readonly #cancelAttempts = new Map<string, CancelAttempt>();
+  #nextCancelAttempt = 0;
+  /** Cancel keys already paged as unanswered (once per obligation; r3 J2). */
+  readonly #cancelsPaged = new Set<string>();
+  readonly #cancelTimeoutMs: number;
   /** Placements the fenced venue has handed to the venue and that have not settled: handle → their scopes (r2 X3). */
   readonly #placements = new Map<number, readonly PlacementScope[]>();
   #nextPlacement = 0;
@@ -307,6 +400,14 @@ export class LiveSafety {
     const finality: unknown = options.killSwitch.releaseFinality;
     if (typeof finality !== "object" || finality === null || typeof (finality as { isFinal?: unknown }).isFinal !== "function") {
       throw new LiveSafetyConfigurationError("killSwitch.releaseFinality");
+    }
+    // r3 J2: every cancel request has a deadline, no longer than the switch state it enforces may be stale.
+    const cancelTimeout = options.killSwitch.cancelTimeoutMs ?? options.killSwitch.refreshIntervalMs;
+    if (interval(cancelTimeout, "killSwitch.cancelTimeoutMs") > options.health.maxAgeMs.KILL_SWITCH) throw new LiveSafetyConfigurationError("killSwitch.cancelTimeoutMs");
+    this.#cancelTimeoutMs = cancelTimeout;
+    const attribution: unknown = options.killSwitch.instanceAttribution;
+    if (attribution !== undefined && (typeof attribution !== "object" || attribution === null || typeof (attribution as { instanceOf?: unknown }).instanceOf !== "function")) {
+      throw new LiveSafetyConfigurationError("killSwitch.instanceAttribution");
     }
     // A read slower than one refresh interval is abandoned by the next refresh: a hung read never freezes the state.
     this.#killSwitch = new KillSwitchMonitor({
@@ -648,8 +749,9 @@ export class LiveSafety {
 
   /**
    * Discharge the engaged switches' cancel obligations (module header, "Kill-switch cancels"). Each obligation is
-   * asked once per read, its passes in the order of the table; an obligation whose switch is no longer engaged is
-   * dropped.
+   * asked once per read, its passes in the order of the table; an attempt past its deadline is abandoned and its pass
+   * requested again (r3 J2); an obligation whose switch is no longer engaged is dropped. The read's attempts run side
+   * by side.
    */
   async #enforceCancels(): Promise<void> {
     const snapshot = this.#killSwitch.snapshot();
@@ -657,11 +759,18 @@ export class LiveSafety {
     const readAtMs = snapshot.readStartedAtMs;
     const spacing = this.#options.killSwitch.refreshIntervalMs;
     const current = new Set<string>();
+    const requests: Promise<void>[] = [];
     for (const { directive, killSwitchEventId } of snapshot.effects.cancels) {
       const key = `${killSwitchEventId}:${directive.scope}:${directive.scope === "MARKET" ? directive.marketId : directive.scope === "STRATEGY_INSTANCE" ? directive.instanceId : ""}`;
       if (current.has(key)) continue;
       current.add(key);
-      if (this.#cancelsInFlight.has(key)) continue;
+      const waiting = this.#cancelAttempts.get(key);
+      if (waiting !== undefined) {
+        const now = this.#now();
+        // Still within its deadline: the obligation waits on it.
+        if (now !== null && now - waiting.requestedAtMs < this.#cancelTimeoutMs) continue;
+        this.#abandonCancelAttempt(key, waiting, now);
+      }
       const state = this.#cancels.get(key);
       let pass: CancelPass | null;
       if (state === undefined) pass = "FIRST";
@@ -671,32 +780,73 @@ export class LiveSafety {
       else if (this.#pendingCovered(directive) || this.#omsShowsResting(directive)) pass = "RETAINED";
       else pass = null;
       if (pass === null) continue;
-      this.#cancelsInFlight.add(key);
-      const requestedAtMs = this.#now() ?? readAtMs;
-      let accepted = false;
-      try {
-        accepted = (await this.#options.killSwitch.cancels.cancel(directive)) === true;
-      } catch {
-        accepted = false;
-      } finally {
-        this.#cancelsInFlight.delete(key);
-      }
-      if (accepted) {
-        const acceptedAtMs = this.#now() ?? requestedAtMs;
-        const latest = this.#cancels.get(key);
-        if (latest === undefined) {
-          this.#cancels.set(key, { lastRequestAtMs: requestedAtMs, lastAcceptedAtMs: acceptedAtMs, confirmed: false });
-        } else {
-          latest.lastRequestAtMs = Math.max(latest.lastRequestAtMs, requestedAtMs);
-          latest.lastAcceptedAtMs = Math.max(latest.lastAcceptedAtMs, acceptedAtMs);
-          if (pass === "CONFIRMING") latest.confirmed = true;
-        }
-      }
-      this.#record({ kind: "KILL_SWITCH_CANCEL_REQUESTED", directive: key, pass, accepted, atMs: this.#now() ?? 0 });
+      // Registered NOW, before any await: a read running concurrently sees the obligation waiting on it.
+      this.#nextCancelAttempt += 1;
+      const attempt: CancelAttempt = Object.freeze({ attempt: this.#nextCancelAttempt, pass, requestedAtMs: this.#now() ?? readAtMs });
+      this.#cancelAttempts.set(key, attempt);
+      requests.push(this.#requestCancel(key, directive, attempt));
     }
-    // A switch no longer engaged (released, or superseded by a newer row) carries no obligation.
+    // A switch no longer engaged (released with finality, or superseded by a newer row) carries no obligation, and an
+    // attempt still waiting for it is abandoned: its answer, when it comes, is discarded.
     for (const key of [...this.#cancels.keys()]) if (!current.has(key)) this.#cancels.delete(key);
+    for (const key of [...this.#cancelAttempts.keys()]) if (!current.has(key)) this.#cancelAttempts.delete(key);
+    for (const key of [...this.#cancelsPaged]) if (!current.has(key)) this.#cancelsPaged.delete(key);
     this.#pruneSettles();
+    await Promise.all(requests);
+  }
+
+  /** One attempt (r3 J2): only the attempt its obligation is still waiting on may discharge a pass. */
+  async #requestCancel(key: string, directive: CancelDirective, attempt: CancelAttempt): Promise<void> {
+    let accepted = false;
+    try {
+      accepted = (await this.#options.killSwitch.cancels.cancel(directive)) === true;
+    } catch {
+      accepted = false;
+    }
+    const atMs = this.#now();
+    if (this.#cancelAttempts.get(key)?.attempt !== attempt.attempt) {
+      // Abandoned past its deadline (or its switch is gone): a newer attempt, or none, owns the obligation.
+      this.#record({ kind: "KILL_SWITCH_CANCEL_LATE_ANSWER_DISCARDED", directive: key, attempt: attempt.attempt, pass: attempt.pass, accepted, atMs: atMs ?? 0 });
+      return;
+    }
+    this.#cancelAttempts.delete(key);
+    if (accepted) {
+      const acceptedAtMs = atMs ?? attempt.requestedAtMs;
+      const latest = this.#cancels.get(key);
+      if (latest === undefined) {
+        this.#cancels.set(key, { lastRequestAtMs: attempt.requestedAtMs, lastAcceptedAtMs: acceptedAtMs, confirmed: false });
+      } else {
+        latest.lastRequestAtMs = Math.max(latest.lastRequestAtMs, attempt.requestedAtMs);
+        latest.lastAcceptedAtMs = Math.max(latest.lastAcceptedAtMs, acceptedAtMs);
+        if (attempt.pass === "CONFIRMING") latest.confirmed = true;
+      }
+    }
+    this.#record({
+      kind: "KILL_SWITCH_CANCEL_REQUESTED",
+      directive: key,
+      pass: attempt.pass,
+      attempt: attempt.attempt,
+      outcome: accepted ? "ACCEPTED" : "REFUSED",
+      accepted,
+      atMs: atMs ?? 0,
+    });
+  }
+
+  /** An attempt past its deadline (r3 J2): journalled, paged once per obligation, and no longer waited on. */
+  #abandonCancelAttempt(key: string, waiting: CancelAttempt, now: number | null): void {
+    this.#cancelAttempts.delete(key);
+    this.#record({
+      kind: "KILL_SWITCH_CANCEL_REQUESTED",
+      directive: key,
+      pass: waiting.pass,
+      attempt: waiting.attempt,
+      outcome: "ABANDONED",
+      accepted: false,
+      atMs: now ?? 0,
+    });
+    if (this.#cancelsPaged.has(key)) return;
+    this.#cancelsPaged.add(key);
+    this.#page("KILL_SWITCH_CANCEL_UNANSWERED", `a kill-switch cancel (${key}) went unanswered for ${String(this.#cancelTimeoutMs)} ms; it was abandoned and the obligation requests it again`);
   }
 
   #placementStarted(scopes: readonly PlacementScope[]): number {
@@ -740,19 +890,36 @@ export class LiveSafety {
   }
 
   /**
-   * Venue evidence: whether the OMS shows an order in the directive's scope that rests, or may rest, at the venue.
-   * Unreadable is "yes". WP-270's order view carries no strategy instance: an instance directive reads "no" here.
+   * Venue evidence: whether the OMS shows an order that rests, or may rest, at the venue and is not proved to be
+   * outside the directive's scope. Unreadable is "yes".
    */
   #omsShowsResting(directive: CancelDirective): boolean {
-    if (directive.scope === "STRATEGY_INSTANCE") return false;
     try {
       const resting: readonly string[] = VENUE_RESTING_OR_UNKNOWN_STATES;
-      return this.#options.oms
-        .orders()
-        .some((order) => resting.includes(order.state) && (directive.scope === "ACCOUNT" || order.marketId === directive.marketId));
+      return this.#options.oms.orders().some((order) => resting.includes(order.state) && this.#mayBeInScope(directive, order));
     } catch {
       return true;
     }
+  }
+
+  /**
+   * Whether an OMS order may be in the directive's scope. For STRATEGY_INSTANCE (r3 J1; module header): unless the
+   * attribution port AFFIRMATIVELY names another instance — no port, a non-identifier answer and a throw all leave the
+   * order in scope, because WP-270's order view carries no instance and missing attribution is not "clear".
+   */
+  #mayBeInScope(directive: CancelDirective, order: SafetyOrderView): boolean {
+    if (directive.scope === "ACCOUNT") return true;
+    if (directive.scope === "MARKET") return order.marketId === directive.marketId;
+    const attribution = this.#options.killSwitch.instanceAttribution;
+    if (attribution === undefined) return true;
+    let answer: unknown;
+    try {
+      answer = attribution.instanceOf(order);
+    } catch {
+      return true;
+    }
+    const attributed = typeof answer === "string" && answer.length > 0 && answer.length <= 200;
+    return !attributed || answer === directive.instanceId;
   }
 
   /** Settle times older than every obligation's latest request can no longer matter: forget them. */
@@ -766,8 +933,9 @@ export class LiveSafety {
 
   /**
    * Run `work` now and every `intervalMs`. Each tick calls it whether or not the previous call has settled: the
-   * monitors join or abandon a read in progress themselves, and the fence serializes its renewals, so a hung call
-   * never stops the refreshes.
+   * monitors join or abandon a read in progress themselves, the fence serializes its renewals, and a kill-switch
+   * cancel attempt past its deadline is abandoned by the next read (r3 J2), so a hung call never stops the refreshes
+   * or the obligations they carry.
    */
   #every(intervalMs: number, work: () => Promise<unknown>): void {
     const tick = (): void => {

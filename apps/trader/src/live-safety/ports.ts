@@ -68,11 +68,16 @@ export interface LiveSafetyJournal {
   record(entry: LiveSafetyRecord): void;
 }
 
-/** §14.4's pages this composition raises. */
+/**
+ * The pages this composition raises: §14.4's "Heartbeat health lease failed while orders may exist" and "Live fencing
+ * conflict", and two of this package's own for kill-switch enforcement (§14.4 lists no kill-switch page): the rows
+ * could not be read (r1 I10), and a kill switch's cancel went unanswered past its deadline (r3 J2).
+ */
 export type LiveSafetyPage =
   | "HEARTBEAT_HEALTH_LEASE_FAILED_WHILE_ORDERS_MAY_EXIST"
   | "LIVE_FENCING_CONFLICT"
-  | "KILL_SWITCH_STATE_UNREADABLE";
+  | "KILL_SWITCH_STATE_UNREADABLE"
+  | "KILL_SWITCH_CANCEL_UNANSWERED";
 
 export interface LiveSafetyAlerts {
   page(page: LiveSafetyPage, detail: string): void;
@@ -91,6 +96,19 @@ export type LiveSafetyRecord =
       readonly kind: "KILL_SWITCH_CANCEL_REQUESTED";
       readonly directive: string;
       /** `live-safety.ts`, "Kill-switch cancels": the pass of the cancel obligation this request discharges (r2 X3). */
+      readonly pass: "FIRST" | "CONFIRMING" | "AFTER_SETTLE" | "RETAINED";
+      /** The attempt's number (r3 J2): one per request, increasing. */
+      readonly attempt: number;
+      /** Answered `true`, answered otherwise (or threw), or abandoned unanswered past its deadline (r3 J2). */
+      readonly outcome: "ACCEPTED" | "REFUSED" | "ABANDONED";
+      readonly accepted: boolean;
+      readonly atMs: number;
+    }
+  | {
+      /** An abandoned attempt answered after all (r3 J2): the answer discharged nothing. */
+      readonly kind: "KILL_SWITCH_CANCEL_LATE_ANSWER_DISCARDED";
+      readonly directive: string;
+      readonly attempt: number;
       readonly pass: "FIRST" | "CONFIRMING" | "AFTER_SETTLE" | "RETAINED";
       readonly accepted: boolean;
       readonly atMs: number;
