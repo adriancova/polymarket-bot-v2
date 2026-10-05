@@ -132,6 +132,12 @@ describe("ROLLOVER-1: the trader's series rules mirror the gateway's", () => {
   });
 
   const SHAPE = { titlePrefix: "Bitcoin Up or Down - ", durationSeconds: 900 };
+  const IMPOSSIBLE_LOCATORS: readonly (readonly [string, string, string])[] = [
+    ["Bitcoin Up or Down - March 2, 5:15PM-5:30PM ET", "2026-02-30T22:15:00Z", "2026-02-30T22:30:00Z"],
+    ["Bitcoin Up or Down - March 2, 5:15PM-5:30PM ET", "2026-03-02T22:15:00Z", "2026-02-30T22:30:00Z"],
+    ["Bitcoin Up or Down - May 1, 6:15PM-6:30PM ET", "2026-04-31T22:15:00Z", "2026-04-31T22:30:00Z"],
+    ["Bitcoin Up or Down - October 4, 7:45PM-8:00PM ET", "2026-10-04T23:45:00Z", "2026-10-04T24:00:00Z"],
+  ];
   const SCHEDULE_CORPUS: readonly (readonly [string, string, string])[] = [
     ...RECORDED_SERIES_WINDOWS.map((window) => [window.title, window.openAt, window.closeAt] as const),
     ["Bitcoin Up or Down - October 4, 11:45PM-12:00AM ET", "2026-10-05T03:45:00Z", "2026-10-05T04:00:00Z"],
@@ -146,6 +152,10 @@ describe("ROLLOVER-1: the trader's series rules mirror the gateway's", () => {
     ["Bitcoin Up or Down - Octember 4, 6:15PM-6:30PM ET", "2026-10-04T22:15:00Z", "2026-10-04T22:30:00Z"],
     ["Bitcoin Up or Down - October 4, 6:15PM-6:30PM ET", "2026-10-04 22:15", "2026-10-04T22:30:00Z"],
     ["Ethereum Up or Down - October 4, 6:15PM-6:30PM ET", "2026-10-04T22:15:00Z", "2026-10-04T22:30:00Z"],
+    // `ROLLOVER-1` r1 (R1-02): locators on dates the calendar does not have —
+    // `Date.parse` normalizes them into the titled interval (February 30 is
+    // March 2, April 31 is May 1, 24:00 is the next day's 00:00).
+    ...IMPOSSIBLE_LOCATORS,
   ];
 
   it.each(SCHEDULE_CORPUS)("the two schedule derivations agree on %j at %s", (title, open, close) => {
@@ -161,6 +171,13 @@ describe("ROLLOVER-1: the trader's series rules mirror the gateway's", () => {
       ]);
     }
     if (!core.ok && !universe.ok) expect(core.ambiguous).toBe(universe.ambiguous);
+  });
+
+  it("R1-02: a locator on a date the calendar does not have is refused by BOTH, never normalized into the titled interval", () => {
+    for (const [title, open, close] of IMPOSSIBLE_LOCATORS) {
+      expect(universeSchedule(title, SHAPE, open, close).ok, `${open} ${close}`).toBe(false);
+      expect(coreSchedule(title, SHAPE, open, close).ok, `${open} ${close}`).toBe(false);
+    }
   });
 
   it("the daylight-saving repeat is refused as ambiguous by both (U-34)", () => {

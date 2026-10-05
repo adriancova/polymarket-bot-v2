@@ -923,5 +923,10 @@ export function admissionLine(notice: AdmissionNotice): string {
       return `[admission] REFUSED ${notice.code} window ${notice.marketId ?? "(unidentified)"}: ${notice.detail}`;
     case "TORN_DOWN":
       return `[admission] TORN DOWN window ${notice.window.marketId} (${notice.reason}); its ledger rows stay`;
+    case "HELD_UNRESOLVED":
+      return (
+        `[admission] HELD window ${notice.window.marketId}: unresolved ${String(notice.window.unresolvedTeardownSeconds)} s ` +
+        `after its close ${notice.window.closeAt} and it still holds inventory, so it is kept until its resolution is handled (ADR-030 Decision 4.4)`
+      );
   }
 }

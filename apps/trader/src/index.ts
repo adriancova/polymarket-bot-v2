@@ -77,6 +77,7 @@ export {
   windowInternalMarketId,
   type AdmissionNotice,
   type AdmissionRefusalCode,
+  type AdmittedMarketRegistered,
   type AdmittedMarketRegistration,
   type AdmittedWindow,
   type ConfiguredSeries,

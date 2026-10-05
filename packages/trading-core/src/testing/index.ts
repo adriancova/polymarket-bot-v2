@@ -40,6 +40,7 @@ import {
 import {
   portFailed,
   portOk,
+  type AdmittedMarketRegistered,
   type AdmittedMarketRegistration,
   type Clock,
   type IngestedEvent,
@@ -408,20 +409,48 @@ export class MemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
-  /** `ROLLOVER-1`: records one admitted window's catalog row (see {@link admittedMarkets}). */
-  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<null>> {
+  /**
+   * `ROLLOVER-1`: records one admitted window's catalog row (see
+   * {@link admittedMarkets}). `ROLLOVER-1` r1 (R1-FABLE-07): a CONFLICT with a
+   * recorded row — another condition or tokens under this market id, or this
+   * condition or a token under another market id — is answered
+   * `{ registered: false }` and records nothing, as the durable store answers
+   * it; an injected failure is a failure.
+   */
+  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<AdmittedMarketRegistered>> {
     const refused = this.#refusalFor("registerAdmittedMarket");
-    if (refused !== undefined) return await Promise.resolve(refused);
+    if (refused !== undefined && !refused.ok) {
+      return await Promise.resolve(portFailed<AdmittedMarketRegistered>(refused.failure.kind, refused.failure.detail));
+    }
     const existing = this.admittedMarkets.find((entry) => entry.marketId === market.marketId);
     if (existing !== undefined) {
+      const same =
+        existing.conditionId === market.conditionId &&
+        existing.yesTokenId === market.yesTokenId &&
+        existing.noTokenId === market.noTokenId;
       return await Promise.resolve(
-        existing.conditionId === market.conditionId
-          ? portOk(null)
-          : portFailed<null>("UNAVAILABLE", `catalog.markets ${market.marketId} is registered for another condition`),
+        portOk<AdmittedMarketRegistered>(
+          same
+            ? { registered: true }
+            : { registered: false, conflict: `catalog.markets ${market.marketId} is registered for another condition or tokens` },
+        ),
+      );
+    }
+    const tokens = [market.yesTokenId, market.noTokenId];
+    const clash = this.admittedMarkets.find(
+      (entry) =>
+        entry.conditionId === market.conditionId || tokens.includes(entry.yesTokenId) || tokens.includes(entry.noTokenId),
+    );
+    if (clash !== undefined) {
+      return await Promise.resolve(
+        portOk<AdmittedMarketRegistered>({
+          registered: false,
+          conflict: `condition ${market.conditionId} or one of its tokens is already registered as catalog.markets ${clash.marketId}`,
+        }),
       );
     }
     this.admittedMarkets.push(market);
-    return await Promise.resolve(portOk(null));
+    return await Promise.resolve(portOk<AdmittedMarketRegistered>({ registered: true }));
   }
 
   async close(): Promise<void> {

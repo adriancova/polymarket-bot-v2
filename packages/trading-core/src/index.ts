@@ -176,6 +176,7 @@ export {
   type FeedMark,
   type DispatchPosition,
   type RiskRefusalRecord,
+  type AdmittedMarketRegistered,
   type AdmittedMarketRegistration,
 } from "./ports.js";
 

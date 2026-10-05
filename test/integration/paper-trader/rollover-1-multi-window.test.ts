@@ -55,6 +55,8 @@ function noticeLine(notice: AdmissionNotice): string {
       return `REFUSED ${notice.code} ${notice.marketId ?? "-"}`;
     case "TORN_DOWN":
       return `TORN_DOWN ${notice.window.marketId} ${notice.reason}`;
+    case "HELD_UNRESOLVED":
+      return `HELD_UNRESOLVED ${notice.window.marketId}`;
   }
 }
 
@@ -123,6 +125,17 @@ describe("ROLLOVER-1: one PAPER run trades a series across its windows", () => {
     expect(decisions.some((record) => record.marketId === W2.marketId && record.decision.decisionType === "enter")).toBe(true);
     const health = run.trader.loop.health();
     expect(health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
+    // `ROLLOVER-1` r1 (R1-01): W2's protective take-profit after its entry is
+    // APPROVED — W2's 50 shares are inventory the allocator sees. It was
+    // refused CAPITAL_INVENTORY_INSUFFICIENT when the allocator never learned
+    // an admitted window's tokens.
+    expect(decisions.some((record) => record.marketId === W2.marketId && record.decision.decisionType === "exit")).toBe(true);
+    expect(health.risk).toMatchObject({ refusals: 0, refusedExits: 0 });
+    expect(health.seams.allocator.refusalsByCode).toEqual({});
+    expect(run.parts.venue.ordersSnapshot().filter((order) => order.marketId === W2.marketId).map((order) => `${order.action} ${order.state}`)).toEqual([
+      "BUY FILLED",
+      "SELL RESTING",
+    ]);
     // W1 was evaluated and held (quoted above the trigger) — and nothing after its teardown names it.
     expect(decisions.filter((record) => record.marketId === W1.marketId).every((record) => record.decision.decisionType !== "enter")).toBe(true);
     // Each window's checkpoints follow its own decisions, on the run's one sequence.

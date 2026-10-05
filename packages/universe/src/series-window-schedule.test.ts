@@ -119,6 +119,40 @@ describe("deriveWindowSchedule: the title is the authority", () => {
     expect(deriveWindowSchedule(title("February 30, 6:15PM-6:30PM ET"), SHAPE, "2027-03-02T23:15:00Z", "2027-03-02T23:30:00Z").ok).toBe(false);
   });
 
+  it("ROLLOVER-1 r1 (R1-02): REFUSES a LOCATOR on a date the calendar does not have — never normalized into the titled interval", () => {
+    const march2 = title("March 2, 5:15PM-5:30PM ET");
+    // The well-formed locators of that window are admitted…
+    expect(deriveWindowSchedule(march2, SHAPE, "2026-03-02T22:15:00Z", "2026-03-02T22:30:00Z").ok).toBe(true);
+    // …and `Date.parse` alone reads February 30 as March 2: refused, by name.
+    const refused = deriveWindowSchedule(march2, SHAPE, "2026-02-30T22:15:00Z", "2026-02-30T22:30:00Z");
+    expect(refused).toMatchObject({ ok: false, ambiguous: false });
+    if (!refused.ok) {
+      expect(refused.problems).toEqual([
+        "the window's start locator (eventStartTime) is absent or not an ISO-8601 instant",
+        "the window's end locator (endDate) is absent or not an ISO-8601 instant",
+      ]);
+    }
+    for (const impossible of [
+      "2026-02-30T22:15:00Z",
+      "2026-02-29T22:15:00Z",
+      "2026-04-31T22:15:00Z",
+      "2026-13-01T00:00:00Z",
+      "2026-00-10T00:00:00Z",
+      "2026-10-00T00:00:00Z",
+      "2026-10-04T24:00:00Z",
+      "2026-10-04T23:60:00Z",
+      "2026-10-04T23:59:60Z",
+      "2026-10-04T18:15:00-24:00",
+      "2026-10-04T18:15:00+05:60",
+    ]) {
+      expect(epochMsOfInstant(impossible), impossible).toBeUndefined();
+    }
+    expect(epochMsOfInstant("2028-02-29T22:15:00Z")).toBe(Date.UTC(2028, 1, 29, 22, 15));
+    expect(epochMsOfInstant("2000-02-29T00:00:00Z")).toBe(Date.UTC(2000, 1, 29));
+    expect(epochMsOfInstant("2100-02-29T00:00:00Z")).toBeUndefined();
+    expect(epochMsOfInstant("2026-10-04T18:15-04:00")).toBe(Date.UTC(2026, 9, 4, 22, 15));
+  });
+
   it("reads ISO-8601 instants with an offset or Z only", () => {
     expect(epochMsOfInstant("2026-10-04T22:15:00Z")).toBe(Date.UTC(2026, 9, 4, 22, 15));
     expect(epochMsOfInstant("2026-10-04T18:15:00-04:00")).toBe(Date.UTC(2026, 9, 4, 22, 15));

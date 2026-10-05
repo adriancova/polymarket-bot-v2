@@ -249,11 +249,19 @@ export interface TraderStore {
    * the window's own `marketId` (the derived id the gateway published), BEFORE
    * any durable row references it (every decision, checkpoint, ledger entry
    * and PnL row of the window does). Idempotent: a row already registered for
-   * this `marketId` with the same condition id and tokens answers ok. A
-   * failure is a store failure like any other: the loop halts and the window is
-   * not admitted. OPTIONAL: an in-memory store has no catalog to write.
+   * this `marketId` with the same condition id and tokens answers
+   * `{ registered: true }`.
+   *
+   * `ROLLOVER-1` r1 (R1-FABLE-07): a CONFLICT with what the catalog already
+   * holds — another condition or tokens under this `marketId`, or this
+   * condition or a token under another market — is an ANSWER, not a failure:
+   * `{ registered: false, conflict }`, nothing written. The loop refuses that
+   * one window (`CATALOG_CONFLICT`) and goes on. A FAILURE (the database could
+   * not answer) is a store failure like any other: the loop halts and the
+   * window is not admitted. OPTIONAL: an in-memory store has no catalog to
+   * write.
    */
-  registerAdmittedMarket?(market: AdmittedMarketRegistration): Promise<PortResult<null>>;
+  registerAdmittedMarket?(market: AdmittedMarketRegistration): Promise<PortResult<AdmittedMarketRegistered>>;
   close(): Promise<void>;
   /**
    * `THROUGHPUT-1a` — GROUP COMMIT, optional. A store that offers it lets the
@@ -265,6 +273,15 @@ export interface TraderStore {
    */
   readonly groupCommit?: GroupCommit;
 }
+
+/**
+ * `ROLLOVER-1` r1 (R1-FABLE-07): what {@link TraderStore.registerAdmittedMarket}
+ * answers when the store could answer — the row is registered (now, or already
+ * with the same facts), or it CONFLICTS with what the catalog holds.
+ */
+export type AdmittedMarketRegistered =
+  | { readonly registered: true }
+  | { readonly registered: false; readonly conflict: string };
 
 /** `ROLLOVER-1`: one admitted window's catalog row ({@link TraderStore.registerAdmittedMarket}). */
 export interface AdmittedMarketRegistration {

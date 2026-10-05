@@ -94,6 +94,7 @@ import { TRADER_RUN_MODE, unreplacedPnlSnapshotProblem } from "@polymarket-bot/t
 import {
   portFailed,
   portOk,
+  type AdmittedMarketRegistered,
   type AdmittedMarketRegistration,
   type GroupCommit,
   type PortResult,
@@ -829,13 +830,20 @@ export class PostgresTraderStore implements TraderStore {
    * PnL row of the window names it.
    *
    * Idempotent: a row already registered under this `market_id` with the same
-   * condition id and the same two tokens answers ok (a replayed admission);
-   * anything else — another condition id under the id, or this condition id
-   * or a token under another id — is refused, and the loop halts.
+   * condition id and the same two tokens answers `{ registered: true }` (a
+   * replayed admission). `ROLLOVER-1` r1 (R1-FABLE-07): anything else —
+   * another condition id or tokens under the id, or this condition id or a
+   * token under another id — is a CONFLICT the store ANSWERS,
+   * `{ registered: false, conflict }`, writing nothing: the loop refuses that
+   * one window (`CATALOG_CONFLICT`) and goes on. It used to throw, which the
+   * containment turned into `UNAVAILABLE` and the loop into a GLOBAL
+   * `STORE_UNAVAILABLE` halt of the whole series trader. Only a database that
+   * cannot answer is a failure.
    */
-  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<null>> {
-    return await this.#contained("register an admitted series window", async () => {
-      await this.#db.transaction().execute(async (trx) => {
+  async registerAdmittedMarket(market: AdmittedMarketRegistration): Promise<PortResult<AdmittedMarketRegistered>> {
+    const answer: { value?: AdmittedMarketRegistered } = {};
+    const written = await this.#contained("register an admitted series window", async () => {
+      answer.value = await this.#db.transaction().execute(async (trx): Promise<AdmittedMarketRegistered> => {
         const existing = await trx
           .selectFrom("catalog.markets")
           .select(["market_id", "condition_id"])
@@ -851,12 +859,14 @@ export class PostgresTraderStore implements TraderStore {
           const registered = tokens.map((token) => `${token.outcome_side}:${token.token_id}`).sort();
           const admitted = [`NO:${market.noTokenId}`, `YES:${market.yesTokenId}`].sort();
           if (existing.condition_id !== market.conditionId || registered.join("|") !== admitted.join("|")) {
-            throw new Error(
-              `catalog.markets ${market.marketId} is registered for condition ${existing.condition_id} with tokens ` +
+            return {
+              registered: false,
+              conflict:
+                `catalog.markets ${market.marketId} is registered for condition ${existing.condition_id} with tokens ` +
                 `${registered.join(", ")}, not the admitted window's ${market.conditionId} with ${admitted.join(", ")}`,
-            );
+            };
           }
-          return;
+          return { registered: true };
         }
         const clash = await trx
           .selectFrom("catalog.markets")
@@ -864,9 +874,23 @@ export class PostgresTraderStore implements TraderStore {
           .where("condition_id", "=", market.conditionId)
           .executeTakeFirst();
         if (clash !== undefined) {
-          throw new Error(
-            `condition ${market.conditionId} is already registered as catalog.markets ${clash.market_id}; an admitted window never shadows a registered market`,
-          );
+          return {
+            registered: false,
+            conflict: `condition ${market.conditionId} is already registered as catalog.markets ${clash.market_id}; an admitted window never shadows a registered market`,
+          };
+        }
+        // `market_tokens_token_unique`: a token another market holds would make
+        // the insert below throw — a conflict, answered as one.
+        const tokenClash = await trx
+          .selectFrom("catalog.market_tokens")
+          .select(["market_id", "token_id"])
+          .where("token_id", "in", [market.yesTokenId, market.noTokenId])
+          .executeTakeFirst();
+        if (tokenClash !== undefined) {
+          return {
+            registered: false,
+            conflict: `token ${tokenClash.token_id} is already registered for catalog.markets ${tokenClash.market_id}; an admitted window never shadows a registered market`,
+          };
         }
         await trx
           .insertInto("catalog.markets")
@@ -919,8 +943,11 @@ export class PostgresTraderStore implements TraderStore {
             { market_token_id: uuidV7(), market_id: market.marketId, token_id: market.noTokenId, outcome_side: "NO", outcome_label: market.noLabel },
           ])
           .execute();
+        return { registered: true };
       });
     });
+    if (!written.ok) return portFailed(written.failure.kind, written.failure.detail);
+    return portOk(answer.value ?? { registered: true });
   }
 
   /**

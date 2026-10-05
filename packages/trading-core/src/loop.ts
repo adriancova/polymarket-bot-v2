@@ -437,7 +437,11 @@ export interface CoreLoopOptions {
    * every `MarketDiscovered@1` and `SeriesWindowAdmitted@1`, writes an admitted
    * window's catalog row through the store before attaching it, and tears a
    * window down at a frame close once it is due and idle (`#tearDownWindows`).
-   * Absent: no admission, exactly as before.
+   * Absent: nothing is admitted — no window is attached, no catalog row is
+   * written and nothing is torn down. The two admission events are still
+   * CONSUMED (`event-door.ts`), so, as any consumed event that names no
+   * configured market, each can source a `CADENCE-1` carried or heartbeat
+   * pass (`ROLLOVER-1` r1, R1-FABLE-08); nothing else about the loop changes.
    */
   readonly admission?: SeriesWindowAdmissions;
   /** `ROLLOVER-1`: told of every admission, refusal and teardown. Output only; a throw is contained. */
@@ -1344,7 +1348,7 @@ export class CoreLoop {
     // window, in both the single-event and the frame paths, so the event's own
     // `internalMarketId` names a market the steps below know.
     if (envelope.eventType === "MarketDiscovered" || envelope.eventType === "SeriesWindowAdmitted") {
-      await this.#observeAdmission(envelope, instant.instant);
+      await this.#observeAdmission(envelope, instant.instant, instant.epochMs);
     }
 
     // `THROUGHPUT-2` (ADR-024): an event inside a longer frame — not its
@@ -1827,16 +1831,22 @@ export class CoreLoop {
    * — every later durable row of the window references it — and only then is
    * the window attached: its market state, token assets, allocation scope and
    * per-window runtimes. A store failure is the GLOBAL `STORE_UNAVAILABLE` halt
-   * every store failure is, and the window is not attached.
+   * every store failure is, and the window is not attached. A CONFLICT the
+   * store answers (the catalog already holds the window's condition or a
+   * token under another market) refuses THAT window only, `CATALOG_CONFLICT`
+   * (`ROLLOVER-1` r1, R1-FABLE-07): nothing is wrong with the store.
+   *
+   * `epochMs` is the admission envelope's own `receivedAt`: the re-judge
+   * refuses a window already closed at it (`WINDOW_CLOSED`, R1-03).
    */
-  async #observeAdmission(envelope: EventEnvelopeOf, instant: string): Promise<void> {
+  async #observeAdmission(envelope: EventEnvelopeOf, instant: string, epochMs: number): Promise<void> {
     const admission = this.#options.admission;
     if (admission === undefined) return;
     if (envelope.eventType === "MarketDiscovered") {
       admission.observeDiscovered(envelope.payload);
       return;
     }
-    const verdict = admission.judge(envelope.payload);
+    const verdict = admission.judge(envelope.payload, epochMs);
     if (verdict.kind === "DUPLICATE") return;
     if (verdict.kind === "REFUSE") {
       this.#notifyAdmission({ kind: "REFUSED", code: verdict.code, detail: verdict.detail, marketId: verdict.marketId });
@@ -1868,6 +1878,12 @@ export class CoreLoop {
         this.#notifyAdmission({ kind: "REFUSED", code: "STORE_UNAVAILABLE", detail, marketId: window.marketId });
         return;
       }
+      if (!written.value.registered) {
+        const detail = `the durable catalog refuses window ${window.marketId}: ${written.value.conflict}`;
+        admission.refuse("CATALOG_CONFLICT", detail, window.marketId);
+        this.#notifyAdmission({ kind: "REFUSED", code: "CATALOG_CONFLICT", detail, marketId: window.marketId });
+        return;
+      }
     }
     const attached = admission.attach(window);
     if (!attached.ok) {
@@ -1879,13 +1895,26 @@ export class CoreLoop {
 
   /**
    * `ROLLOVER-1` (ADR-030 Decision 4.4): tears every live window down that is
-   * DUE — its resolution was handled (the market is RESOLVED, and its
-   * `onMarketResolved` ran in the frame that resolved it), or it is still
-   * unresolved `unresolvedTeardownSeconds` (reviewed) after its scheduled
-   * close, on event time — and IDLE: no order of any of its registrations is
-   * still tracked, and no cancel names its market. A due window that is not
-   * idle waits (counted). Its books, features, strategy state and cadence
-   * entry are released; its ledger rows stay.
+   * DUE and IDLE — no order of any of its registrations is still tracked, and
+   * no cancel names its market. A due window that is not idle waits (counted,
+   * `teardownsBlocked`). A window is due when:
+   *
+   * - its resolution was handled — the market is RESOLVED, and its
+   *   `onMarketResolved` ran in the frame that resolved it; or
+   * - it is still unresolved `unresolvedTeardownSeconds` (reviewed) after its
+   *   scheduled close, on event time, AND it holds no inventory
+   *   (`#windowHoldsInventory`): the run has nothing for its resolution to
+   *   settle.
+   *
+   * `ROLLOVER-1` r1 (R1-04): an unresolved window past the bound that still
+   * HOLDS inventory is NOT torn down — "a closed window is torn down after its
+   * resolution is handled" (Decision 4.4). Its runtime stays the position's
+   * owner, so a `MarketResolved` that arrives later still reaches the
+   * strategy and the window is then torn down RESOLVED; it is reported once
+   * (`HELD_UNRESOLVED`) and counted (`heldUnresolved`). The gateway keeps the
+   * window subscribed for that resolution (`apps/data-gateway`
+   * `feeds/series-admission.ts`). Teardown releases the window's books,
+   * features, strategy state and cadence entry; its ledger rows stay.
    */
   #tearDownWindows(): void {
     const admission = this.#options.admission;
@@ -1897,6 +1926,10 @@ export class CoreLoop {
       if (!resolved && !overdue) continue;
       if (this.#windowHoldsWork(window.marketId)) {
         admission.noteTeardownBlocked();
+        continue;
+      }
+      if (!resolved && this.#windowHoldsInventory(window.marketId)) {
+        if (admission.noteHeldUnresolved(window.marketId)) this.#notifyAdmission({ kind: "HELD_UNRESOLVED", window });
         continue;
       }
       const reason = resolved ? "RESOLVED" : "UNRESOLVED_AFTER_CLOSE";
@@ -1913,6 +1946,29 @@ export class CoreLoop {
       if (this.#options.registry.identityOf(key)?.marketId === marketId) return true;
     }
     return this.#cancels.pending().some((cancel) => cancel.marketId === marketId);
+  }
+
+  /**
+   * `ROLLOVER-1` r1 (R1-04): does the account hold any of the window's two
+   * tokens — an ACTUAL holding, or any instance's virtual position (the
+   * partition of it)? Read from the HELD ledger view, which every booked fill
+   * has already advanced.
+   */
+  #windowHoldsInventory(marketId: string): boolean {
+    const assets = new Set<string>();
+    for (const side of ["YES", "NO"] as const) {
+      const assetId = this.#options.tokenAssetIds.get(`${marketId}|${side}`);
+      if (assetId !== undefined) assets.add(assetId);
+    }
+    if (assets.size === 0) return false;
+    const projection = this.#held.view;
+    for (const line of projection.balances.values()) {
+      if (line.scope === "ACTUAL_ACCOUNT" && assets.has(line.assetId) && compareDecimal(line.balance, "0") !== 0) return true;
+    }
+    for (const line of projection.virtualPositions.values()) {
+      if (assets.has(line.assetId) && compareDecimal(line.balance, "0") !== 0) return true;
+    }
+    return false;
   }
 
   #notifyAdmission(notice: AdmissionNotice): void {

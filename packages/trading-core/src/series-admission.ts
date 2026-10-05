@@ -21,11 +21,18 @@
  *    derived internal id that IS the window's (`windowInternalMarketId`), and
  *    a title that converts to exactly the admitted interval of the reviewed
  *    length (ruling Q3; `MALFORMED`, `IDENTITY_NOT_DERIVED`, `SCHEDULE`);
- * 5. the tick size is one the review accepts (`TICK_SIZE`);
- * 6. it shadows no market this trader already runs (`SHADOWS_KNOWN_MARKET`);
- * 7. the series has fewer live windows than its reviewed cap
+ * 5. the window is still OPEN at the admission's own event time: its derived
+ *    close is strictly after the envelope's `receivedAt` (`WINDOW_CLOSED`;
+ *    `ROLLOVER-1` r1, R1-03). The gateway stamps the admission with the
+ *    receipt of the CLOB read it judged from and refuses on the same instant,
+ *    so the two sides decide alike, and a replay decides the same;
+ * 6. the tick size is one the review accepts (`TICK_SIZE`);
+ * 7. it shadows no market this trader already runs (`SHADOWS_KNOWN_MARKET`);
+ * 8. the series has fewer live windows than its reviewed cap
  *    (`CAP_REACHED`; ADR-030 Decision 1.8 — the trader enforces the cap
- *    itself, whatever the gateway admitted).
+ *    itself, whatever the gateway admitted). A window past its unresolved
+ *    bound, kept because it holds inventory, holds no cap slot (`ROLLOVER-1`
+ *    r1): it awaits its resolution and trades nothing — the gateway's rule.
  *
  * An identical admission seen again (a replayed stream, a gateway re-emission)
  * is a `DUPLICATE` and changes nothing; a different one under the same id is
@@ -39,11 +46,23 @@
  * the event's per-window facts and the review's parameters, and, for every
  * series-bound instance of its series, a runtime of its own on the instance's
  * run (the run's shared evaluation sequence, ruling Q2). The loop tears a
- * window down once its resolution was handled — or, never resolved, once the
- * reviewed `unresolvedTeardownSeconds` have passed since its close — and it
- * holds no working order: its books, features, strategy state and cadence
- * entry are released; its ledger rows, token assets and allocation scope stay
- * (ADR-030 Decision 4.4: "Its ledger rows stay").
+ * window down (`loop.ts` `#tearDownWindows`) only when it is IDLE — no working
+ * order, no pending cancel — and either:
+ *
+ * - its resolution was handled (the market is RESOLVED and its
+ *   `onMarketResolved` ran in the frame that resolved it): `RESOLVED`; or
+ * - it is still unresolved the reviewed `unresolvedTeardownSeconds` after its
+ *   close AND holds no inventory — no position on either of its tokens, so
+ *   the run has nothing for a resolution to settle: `UNRESOLVED_AFTER_CLOSE`.
+ *
+ * A window still unresolved past that bound that HOLDS inventory is NOT torn
+ * down (`ROLLOVER-1` r1, R1-04; ADR-030 Decision 4.4, "after its resolution is
+ * handled"): its runtime stays the position's owner, so a later
+ * `MarketResolved` still reaches the strategy, and it is reported once
+ * (`HELD_UNRESOLVED`) and counted (`heldUnresolved`). Teardown releases its
+ * books, features, strategy state and cadence entry; its ledger rows, token
+ * assets (the loop's and the allocator's) and allocation scope stay (ADR-030
+ * Decision 4.4: "Its ledger rows stay").
  *
  * Everything here runs on EVENT time, from the stream, so a replay of the same
  * envelopes admits and tears down the same windows (acceptance 3).
@@ -61,11 +80,19 @@ export type AdmissionRefusalCode =
   | "MALFORMED"
   | "IDENTITY_NOT_DERIVED"
   | "SCHEDULE"
+  /** `ROLLOVER-1` r1 (R1-03): the window's close is at or before the admission's event time. */
+  | "WINDOW_CLOSED"
   | "TICK_SIZE"
   | "SHADOWS_KNOWN_MARKET"
   | "CAP_REACHED"
   | "DUPLICATE_DISAGREES"
   | "STORE_UNAVAILABLE"
+  /**
+   * `ROLLOVER-1` r1 (R1-FABLE-07): the durable catalog already holds the
+   * window's condition or a token under another market (a market registered
+   * for another run, for example). This window is refused; nothing halts.
+   */
+  | "CATALOG_CONFLICT"
   | "ATTACH_FAILED";
 
 /** One window this run admitted. */
@@ -111,7 +138,13 @@ export interface WindowAttachment {
 export type AdmissionNotice =
   | { readonly kind: "ADMITTED"; readonly window: AdmittedWindow }
   | { readonly kind: "REFUSED"; readonly code: AdmissionRefusalCode; readonly detail: string; readonly marketId: string | undefined }
-  | { readonly kind: "TORN_DOWN"; readonly window: AdmittedWindow; readonly reason: "RESOLVED" | "UNRESOLVED_AFTER_CLOSE" };
+  | { readonly kind: "TORN_DOWN"; readonly window: AdmittedWindow; readonly reason: "RESOLVED" | "UNRESOLVED_AFTER_CLOSE" }
+  /**
+   * `ROLLOVER-1` r1 (R1-04): the window is unresolved past its reviewed bound
+   * and still HOLDS inventory, so it is kept — its runtime owns the position
+   * until the resolution is handled. Reported once per window.
+   */
+  | { readonly kind: "HELD_UNRESOLVED"; readonly window: AdmittedWindow };
 
 export interface AdmissionMetrics {
   readonly admitted: number;
@@ -120,6 +153,8 @@ export interface AdmissionMetrics {
   readonly tornDownResolved: number;
   readonly tornDownUnresolved: number;
   readonly teardownsBlocked: number;
+  /** `ROLLOVER-1` r1 (R1-04): live windows kept past the unresolved bound because they hold inventory. */
+  readonly heldUnresolved: number;
   readonly live: number;
   /** The most recent refusals, newest last (bounded). */
   readonly lastRefusals: readonly string[];
@@ -160,6 +195,8 @@ export class SeriesWindowAdmissions {
   #tornDownResolved = 0;
   #tornDownUnresolved = 0;
   #teardownsBlocked = 0;
+  /** Live windows kept past the unresolved bound because they hold inventory (R1-04). */
+  readonly #heldUnresolved = new Set<string>();
 
   constructor(options: {
     readonly series: readonly ConfiguredSeries[];
@@ -190,8 +227,12 @@ export class SeriesWindowAdmissions {
     }
   }
 
-  /** The RE-JUDGE of one `SeriesWindowAdmitted@1` payload (module header). Pure apart from counters. */
-  judge(payload: unknown): AdmissionVerdict {
+  /**
+   * The RE-JUDGE of one `SeriesWindowAdmitted@1` payload (module header),
+   * at `eventEpochMs`, the admission envelope's own `receivedAt`. Pure apart
+   * from counters.
+   */
+  judge(payload: unknown, eventEpochMs: number): AdmissionVerdict {
     const marketId = ownString(payload, "internalMarketId");
     const refuse = (code: AdmissionRefusalCode, detail: string): AdmissionVerdict => this.#refuse(code, detail, marketId);
     const conditionId = ownString(payload, "conditionId");
@@ -260,13 +301,29 @@ export class SeriesWindowAdmissions {
     if (windowInternalMarketId(conditionId, schedule.openEpochMs) !== marketId) {
       return refuse("IDENTITY_NOT_DERIVED", `window ${marketId} is not the derived id of condition ${conditionId} opening ${schedule.openAt}`);
     }
+    // `ROLLOVER-1` r1 (R1-03): a window that is already closed at the
+    // admission's own instant is never attached — the gateway refuses on the
+    // same instant (the receipt of the CLOB read it judged from, which the
+    // admission envelope carries as its `receivedAt`).
+    if (!Number.isFinite(eventEpochMs) || schedule.closeEpochMs <= eventEpochMs) {
+      return refuse(
+        "WINDOW_CLOSED",
+        `window ${marketId} closes ${schedule.closeAt}, at or before its admission's event time; a closed window is never admitted`,
+      );
+    }
     if (!review.parameters.allowedTickSizes.includes(tickSize)) {
       return refuse("TICK_SIZE", `window ${marketId}: tick size ${tickSize} is not one of the reviewed ${JSON.stringify(review.parameters.allowedTickSizes)}`);
     }
     if (this.#isKnownMarket(marketId, conditionId, [yesTokenId, noTokenId])) {
       return refuse("SHADOWS_KNOWN_MARKET", `window ${marketId} (condition ${conditionId}) shadows a market this trader already runs`);
     }
-    const live = [...this.#live.values()].filter((window) => window.seriesId === seriesId).length;
+    // `ROLLOVER-1` r1 (R1-04): a live window past its unresolved bound — kept
+    // only because it holds inventory — awaits its resolution and trades
+    // nothing: it holds no cap slot, exactly as at the gateway, at this
+    // admission's own instant.
+    const live = [...this.#live.values()].filter(
+      (window) => window.seriesId === seriesId && eventEpochMs < window.closeEpochMs + window.unresolvedTeardownSeconds * 1000,
+    ).length;
     if (live >= review.maximumConcurrentWindows) {
       return refuse(
         "CAP_REACHED",
@@ -344,6 +401,7 @@ export class SeriesWindowAdmissions {
     if (window === undefined) return undefined;
     this.#attachment.detach(window);
     this.#live.delete(marketId);
+    this.#heldUnresolved.delete(marketId);
     if (reason === "RESOLVED") this.#tornDownResolved += 1;
     else this.#tornDownUnresolved += 1;
     return window;
@@ -352,6 +410,17 @@ export class SeriesWindowAdmissions {
   /** Counts a teardown the loop postponed because the window still holds work. */
   noteTeardownBlocked(): void {
     this.#teardownsBlocked += 1;
+  }
+
+  /**
+   * `ROLLOVER-1` r1 (R1-04): records that a live window past its unresolved
+   * bound is KEPT because it holds inventory. Answers `true` the first time
+   * for the window (the loop reports it once), `false` after.
+   */
+  noteHeldUnresolved(marketId: string): boolean {
+    if (!this.#live.has(marketId) || this.#heldUnresolved.has(marketId)) return false;
+    this.#heldUnresolved.add(marketId);
+    return true;
   }
 
   /** The live windows, in admission order. */
@@ -371,6 +440,7 @@ export class SeriesWindowAdmissions {
       tornDownResolved: this.#tornDownResolved,
       tornDownUnresolved: this.#tornDownUnresolved,
       teardownsBlocked: this.#teardownsBlocked,
+      heldUnresolved: this.#heldUnresolved.size,
       live: this.#live.size,
       lastRefusals: Object.freeze([...this.#lastRefusals]),
     });

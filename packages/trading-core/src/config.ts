@@ -555,7 +555,13 @@ export const TraderConfigSchema = z.strictObject({
    * `ROLLOVER-1` (ADR-030 Decision 1.1): the REVIEWED series this trader admits
    * windows of — each the same document the gateway's `seriesAdmission` block
    * names, so the two agree on its configuration hash. Optional: a trader
-   * without it consumes no admission and runs exactly as before.
+   * without it ADMITS no window — it attaches none, writes no catalog row and
+   * tears nothing down. It still CONSUMES `MarketDiscovered@1` and
+   * `SeriesWindowAdmitted@1` (`event-door.ts`), as every trader does, so each
+   * such event a gateway publishes is, like any consumed event that names no
+   * configured market, a possible source of a `CADENCE-1` carried or
+   * heartbeat pass (`ROLLOVER-1` r1, R1-FABLE-08: it does not run "exactly as
+   * before" a gateway that admits windows).
    */
   series: z.array(ReviewedSeriesSchema).min(1).max(8).readonly().optional(),
   /** `ROLLOVER-1`: the instances bound to a series rather than a market. */

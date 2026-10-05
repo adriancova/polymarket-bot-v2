@@ -165,9 +165,42 @@ export function isoFromEpochMs(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
-/** Epoch milliseconds of an ISO-8601 instant WITH an offset or `Z`, or `undefined`. */
+/** The ISO-8601 instant grammar {@link epochMsOfInstant} reads, with its calendar fields captured. */
+const INSTANT_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:Z|[+-](\d{2}):(\d{2}))$/u;
+
+/** Days in `month` (1-12) of the proleptic Gregorian `year`. */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+/**
+ * Epoch milliseconds of an ISO-8601 instant WITH an offset or `Z`, or
+ * `undefined`.
+ *
+ * `ROLLOVER-1` r1 (R1-02): every calendar field is checked BEFORE conversion.
+ * `Date.parse` normalizes a date the calendar does not have — on Node 24,
+ * `2026-02-30T22:15:00Z` is March 2 and `2026-04-31` is May 1 — so a malformed
+ * per-window fact would otherwise convert to another, well-formed instant and
+ * be admitted (ADR-030 Decisions 1.2 and 1.5: present, well formed, and fail
+ * closed). A month outside 1-12, a day the month does not have, an hour past
+ * 23, a minute or second past 59 (no leap second, no `24:00`), or an offset
+ * past 23:59 is refused here.
+ */
 export function epochMsOfInstant(value: string): number | undefined {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/u.test(value)) {
+  const match = INSTANT_PATTERN.exec(value);
+  if (match === null) return undefined;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offsetHourText, offsetMinuteText] = match;
+  const year = Number.parseInt(yearText ?? "", 10);
+  const month = Number.parseInt(monthText ?? "", 10);
+  const day = Number.parseInt(dayText ?? "", 10);
+  const hour = Number.parseInt(hourText ?? "", 10);
+  const minute = Number.parseInt(minuteText ?? "", 10);
+  const second = secondText === undefined ? 0 : Number.parseInt(secondText, 10);
+  if (month < 1 || month > 12) return undefined;
+  if (day < 1 || day > daysInMonth(year, month)) return undefined;
+  if (hour > 23 || minute > 59 || second > 59) return undefined;
+  if (offsetHourText !== undefined && (Number.parseInt(offsetHourText, 10) > 23 || Number.parseInt(offsetMinuteText ?? "", 10) > 59)) {
     return undefined;
   }
   const parsed = Date.parse(value);

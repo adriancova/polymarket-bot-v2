@@ -18,7 +18,13 @@
  *    checkpoint_seq)` unique across the windows (ruling Q2), and every
  *    checkpoint row names its window (`market_id`, no migration).
  * 4. **`registerAdmittedMarket` is idempotent** for the same window and
- *    REFUSES another condition under a registered id.
+ *    answers a CONFLICT — another condition or tokens under a registered id,
+ *    or a registered condition or token under a new id — writing nothing
+ *    (`ROLLOVER-1` r1, R1-FABLE-07: an answer, not a failure).
+ * 5. **A catalog conflict refuses that one window** (R1-FABLE-07): a durable
+ *    trader whose catalog already holds a window's condition under another
+ *    market refuses that window `CATALOG_CONFLICT`, does NOT halt, and admits
+ *    and trades the next windows.
  */
 
 import { readFile } from "node:fs/promises";
@@ -193,7 +199,7 @@ describe("ROLLOVER-1: a series-bound run, durable (REGISTER-1 --series, BOOT-1, 
         await store.close();
       }
 
-      // --- the catalog write is idempotent, and refuses another condition ---
+      // --- the catalog write is idempotent, and ANSWERS a conflict ----------
       const direct = new PostgresTraderStore({ db: context.db, decisionContractVersion: 1 });
       const again = {
         marketId: W2.marketId,
@@ -211,12 +217,80 @@ describe("ROLLOVER-1: a series-bound run, durable (REGISTER-1 --series, BOOT-1, 
         closeTime: W2.closeAt,
         observedAt: W2.openAt,
       };
-      expect(await direct.registerAdmittedMarket(again)).toEqual({ ok: true, value: null });
-      const other = await direct.registerAdmittedMarket({ ...again, conditionId: W3.conditionId });
-      expect(other.ok).toBe(false);
-      const swapped = await direct.registerAdmittedMarket({ ...again, yesTokenId: W2.noTokenId, noTokenId: W2.yesTokenId });
-      expect(swapped.ok).toBe(false);
+      expect(await direct.registerAdmittedMarket(again)).toEqual({ ok: true, value: { registered: true } });
+      const conflict = (pattern: RegExp) => ({ ok: true, value: { registered: false, conflict: expect.stringMatching(pattern) as unknown } });
+      // Another condition, or swapped tokens, under the registered id.
+      expect(await direct.registerAdmittedMarket({ ...again, conditionId: W3.conditionId })).toEqual(conflict(/is registered for condition/u));
+      expect(await direct.registerAdmittedMarket({ ...again, yesTokenId: W2.noTokenId, noTokenId: W2.yesTokenId })).toEqual(
+        conflict(/is registered for condition/u),
+      );
+      // A registered condition, or a registered token, under a NEW id.
+      const fresh = "018f4a7e-0000-7abc-8def-00000000c0de";
+      expect(await direct.registerAdmittedMarket({ ...again, marketId: fresh })).toEqual(conflict(/already registered as catalog\.markets/u));
+      expect(
+        await direct.registerAdmittedMarket({ ...again, marketId: fresh, conditionId: "0xnot-registered", noTokenId: "1" }),
+      ).toEqual(conflict(/token .* is already registered/u));
       expect(await context.db.selectFrom("catalog.markets").select("market_id").execute()).toHaveLength(3);
+    });
+  }, 120_000);
+
+  it("R1-FABLE-07: a catalog that holds a window's condition under another market refuses THAT window, and the trader does not halt", async () => {
+    await withFreshDatabase("rollover1-conflict", async ({ connectionString, context }) => {
+      const { completed } = await registerSeries("conflict", connectionString);
+      // W1's condition, registered under another market (another run's row).
+      const direct = new PostgresTraderStore({ db: context.db, decisionContractVersion: 1 });
+      expect(
+        await direct.registerAdmittedMarket({
+          marketId: "018f4a7e-0000-7abc-8def-00000000c0de",
+          conditionId: W1.conditionId,
+          questionTitle: W1.title,
+          yesTokenId: W1.yesTokenId,
+          noTokenId: W1.noTokenId,
+          yesLabel: "Up",
+          noLabel: "Down",
+          tickSize: W1.tickSize,
+          minimumOrderSize: "5",
+          tradingDelaySeconds: 0,
+          negRisk: false,
+          openTime: W1.openAt,
+          closeTime: W1.closeAt,
+          observedAt: W1.openAt,
+        }),
+      ).toEqual({ ok: true, value: { registered: true } });
+      const envelopes = await seriesStream();
+      const last = envelopes.at(-1)?.receivedAt ?? FIXTURE_FIRST_EVENT_AT;
+      const parsed = parseTraderConfig(completed);
+      if (!parsed.ok) throw new Error(parsed.refusal.issues.join("; "));
+      const lines: string[] = [];
+      const assembled = await assembleDurableTrader({
+        env: registerEnvironment(connectionString),
+        config: parsed.config,
+        document: completed,
+        postgresUrl: connectionString,
+        clock: new RebasedSystemPaperClock(last),
+        log: (line) => {
+          lines.push(line);
+        },
+      });
+      if (!assembled.ok) throw new Error(lines.join("\n"));
+      const { trader, store } = assembled;
+      try {
+        for (const event of ingestedOf(envelopes)) expect(trader.loop.ingest(event)).toBe(true);
+        await trader.loop.drain();
+        expect(trader.loop.health().halts).toEqual([]);
+        expect(lines.filter((line) => line.startsWith("[admission]")).map((line) => line.split(" ").slice(1, 4).join(" "))).toEqual([
+          `REFUSED CATALOG_CONFLICT window`,
+          `ADMITTED window ${W2.marketId}`,
+          `ADMITTED window ${W3.marketId}`,
+        ]);
+        const decided = new Set(
+          (await context.db.selectFrom("strategy.decisions").select("market_id").execute()).map((row) => row.market_id),
+        );
+        expect(decided.has(W2.marketId)).toBe(true);
+        expect(decided.has(W1.marketId)).toBe(false);
+      } finally {
+        await store.close();
+      }
     });
   }, 120_000);
 });

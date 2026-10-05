@@ -17,7 +17,7 @@ function config(overrides: Record<string, unknown> = {}, block: Record<string, u
     streamName: "market-events",
     wal: { rootPath: "/wal" },
     markets: [],
-    polymarket: { feedId: "polymarket-market" },
+    polymarket: { feedId: "polymarket-market", customFeatureEnabled: true },
     lifecycle: { baseUrl: "http://gamma.stub", pollIntervalMs: 10_000 },
     seriesAdmission: { admissionLeadSeconds: 900, series: [reviewedBtc15mSeriesDocument()], ...block },
     ...overrides,
@@ -43,6 +43,13 @@ describe("the seriesAdmission configuration door", () => {
   it("requires the polymarket and lifecycle blocks: an admitted window is subscribed and opened through them", () => {
     expect(() => parseGatewayConfig(config({ polymarket: undefined }))).toThrow(/polymarket and lifecycle/u);
     expect(() => parseGatewayConfig(config({ lifecycle: undefined }))).toThrow(/polymarket and lifecycle/u);
+  });
+
+  it("R1-FABLE-02: requires polymarket.customFeatureEnabled: true — without it no market_resolved arrives (F-13)", () => {
+    for (const polymarket of [{ feedId: "polymarket-market" }, { feedId: "polymarket-market", customFeatureEnabled: false }]) {
+      expect(() => parseGatewayConfig(config({ polymarket }))).toThrow(/customFeatureEnabled: true/u);
+    }
+    expect(() => parseGatewayConfig(config())).not.toThrow();
   });
 
   it("refuses a series the universe door refuses, and a series named twice", () => {

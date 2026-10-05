@@ -484,3 +484,207 @@ describe("ROLLOVER-1: an admission incident never names no market (ADR-023 D2 ru
     await harness.gateway.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// ROLLOVER-1 r1: the remediation pins (R1-02, R1-03, R1-04 with R1-FABLE-01's
+// N5, R1-FABLE-03, R1-FABLE-04). Each fails against the r0 candidate.
+// ---------------------------------------------------------------------------
+
+/** The keyset event at `index` of the recorded page, with its window's facts. */
+function recordedEvent(index: number): { readonly conditionId: string; readonly yes: string; readonly no: string; readonly openMs: number } {
+  const event = KEYSET_PAGE.events[index] as Record<string, unknown>;
+  const market = (event["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+  const [yes, no] = JSON.parse(String(market["clobTokenIds"])) as [string, string];
+  return { conditionId: String(market["conditionId"]), yes, no, openMs: Date.parse(String(market["eventStartTime"])) };
+}
+
+/** S-K04a's CLOB shape with the window's own condition and tokens (the r0 cap test's convention). */
+function clobBodyFor(index: number): Record<string, unknown> {
+  const window = recordedEvent(index);
+  return { ...CLOB_2230, c: window.conditionId, t: [{ t: window.yes, o: "Up" }, { t: window.no, o: "Down" }] };
+}
+
+function unsubscribedTokens(harness: Harness): readonly string[] {
+  return harness.polymarketSockets.sockets.flatMap((socket) =>
+    socket.sent.flatMap((frame) => {
+      const parsed = JSON.parse(frame) as { assets_ids?: string[]; operation?: string };
+      return parsed.operation === "unsubscribe" ? (parsed.assets_ids ?? []) : [];
+    }),
+  );
+}
+
+function incidentsNamed(harness: Harness, reasonCode: string): readonly (readonly string[])[] {
+  return harness
+    .publishedOfType("DataQualityIncidentOpened")
+    .filter((envelope) => payloadOf(envelope)["reasonCode"] === reasonCode)
+    .map((envelope) => payloadOf(envelope)["affectedMarketIds"] as string[]);
+}
+
+/** One admission cycle after moving the clock `ms` forward. */
+async function cycleAfter(harness: Harness, ms: number): Promise<void> {
+  harness.clock.advance(ms);
+  harness.timers.advance(30_000);
+  await harness.settle();
+}
+
+describe("ROLLOVER-1 r1 (R1-03): a window that closes during discovery is not admitted", () => {
+  it("a CLOB read answered after the window's close admits nothing for it, records nothing, and admits the next window", async () => {
+    // 22:29:59: the 22:15 window closes in one second; its CLOB read takes two.
+    const clock: { current?: { advance(ms: number): void } } = {};
+    const base = venueStub();
+    const route = (request: PublicHttpRequest): PublicHttpResponse => {
+      if (request.url.includes(`/clob-markets/${WINDOW_2215.conditionId}`)) clock.current?.advance(2_000);
+      return base.route(request);
+    };
+    const harness = await buildHarness({ config: admissionConfig(), http: route, clockStartMs: Date.UTC(2026, 9, 4, 22, 29, 59) });
+    clock.current = harness.clock;
+    harness.gateway.start();
+    harness.polymarketSockets.current.open();
+    await harness.settle();
+
+    expect(base.requests.filter((url) => url.includes(`/clob-markets/${WINDOW_2215.conditionId}`))).toHaveLength(1);
+    expect(admissionTypes(harness).filter((entry) => entry.endsWith(String(WINDOW_2215.id)))).toEqual([]);
+    expect(ledger(harness.walFileSystem)[WINDOW_2215.conditionId]).toBeUndefined();
+    expect(subscribedTokens(harness)).not.toContain(WINDOW_2215.yes);
+    expect(harness.gateway.metrics().seriesAdmission?.windowsClosedBeforeAdmission).toBe(1);
+    // The open window after it is admitted as usual, stamped with its own CLOB receipt.
+    const admitted = harness.publishedOfType("SeriesWindowAdmitted");
+    expect(admitted.map((envelope) => payloadOf(envelope)["internalMarketId"])).toEqual([WINDOW_2230.id]);
+    expect(Date.parse(String(admitted[0]?.receivedAt))).toBeLessThan(Date.parse("2026-10-04T22:45:00Z"));
+    // Never offered again: the next cycle reads no CLOB for it (it is late).
+    await cycleAfter(harness, 0);
+    expect(base.requests.filter((url) => url.includes(`/clob-markets/${WINDOW_2215.conditionId}`))).toHaveLength(1);
+    await harness.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r1 (R1-02): a locator on a day the calendar does not have is refused, never normalized", () => {
+  it("February 30 under a March 2 title: REFUSED with the locator named, no admission", async () => {
+    const title = "Bitcoin Up or Down - March 2, 5:15PM-5:30PM ET";
+    const page = (): unknown => {
+      const copy = structuredClone(KEYSET_PAGE);
+      copy.events = [copy.events[0] as Record<string, unknown>];
+      const event = copy.events[0] as Record<string, unknown>;
+      const market = (event["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+      event["title"] = title;
+      market["question"] = title;
+      market["eventStartTime"] = "2026-02-30T22:15:00Z";
+      market["endDate"] = "2026-02-30T22:30:00Z";
+      return copy;
+    };
+    const harness = await started(venueStub({ page }), { clockStartMs: Date.UTC(2026, 2, 2, 22, 20) });
+    expect(admissionTypes(harness)).toEqual([]);
+    const record = ledger(harness.walFileSystem)[WINDOW_2215.conditionId];
+    expect(record?.["status"]).toBe("REFUSED");
+    expect(JSON.stringify(record?.["mismatches"])).toMatch(/start locator \(eventStartTime\) is absent or not an ISO-8601 instant/u);
+    expect(harness.incidents.map((incident) => incident.reasonCode)).toContain("GATEWAY_SERIES_WINDOW_REFUSED");
+    await harness.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r1 (R1-04, N5): an unresolved window is never retired merely because its bound passed", () => {
+  const series = { ...reviewedBtc15mSeriesDocument(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+  const clob = { [WINDOW_2215.conditionId]: CLOB_2215, [WINDOW_2230.conditionId]: CLOB_2230, [recordedEvent(2).conditionId]: clobBodyFor(2) };
+  const W2245 = { ...recordedEvent(2), id: windowInternalMarketId(recordedEvent(2).conditionId, recordedEvent(2).openMs) };
+
+  it("past its bound it stays ADMITTED and subscribed, awaiting its resolution, names itself in an incident, and frees its cap slot; its resolution then retires it", async () => {
+    const harness = await started(venueStub({ clob }), { config: admissionConfig({}, series) });
+    expect(harness.publishedOfType("SeriesWindowAdmitted").map((envelope) => payloadOf(envelope)["internalMarketId"])).toEqual([WINDOW_2215.id]);
+
+    // 22:35: the 22:15 window closed at 22:30 and is unresolved 300 s later.
+    await cycleAfter(harness, 15 * 60_000);
+    const record = ledger(harness.walFileSystem)[WINDOW_2215.conditionId];
+    expect(record?.["status"]).toBe("ADMITTED");
+    expect(unsubscribedTokens(harness)).not.toContain(WINDOW_2215.yes);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_UNRESOLVED")).toEqual([[WINDOW_2215.id]]);
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsAwaitingResolution: 1, windowsRetiredUnresolved: 0 });
+    // It holds no cap slot: the open 22:30 window is admitted in its place.
+    expect(harness.publishedOfType("SeriesWindowAdmitted").map((envelope) => payloadOf(envelope)["internalMarketId"])).toEqual([
+      WINDOW_2215.id,
+      WINDOW_2230.id,
+    ]);
+    // The incident is raised once, not every cycle.
+    await cycleAfter(harness, 0);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_UNRESOLVED")).toEqual([[WINDOW_2215.id]]);
+
+    // Its resolution arrives late: it is retired RESOLVED and unsubscribed.
+    harness.polymarketSockets.current.message(
+      JSON.stringify([
+        {
+          event_type: "market_resolved",
+          id: "5255913",
+          market: WINDOW_2215.conditionId,
+          assets_ids: [WINDOW_2215.yes, WINDOW_2215.no],
+          winning_asset_id: WINDOW_2215.yes,
+          winning_outcome: "Up",
+          timestamp: String(harness.clock.nowMs()),
+        },
+      ]),
+    );
+    await harness.settle();
+    await cycleAfter(harness, 0);
+    expect(ledger(harness.walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
+    expect(unsubscribedTokens(harness)).toEqual(expect.arrayContaining([WINDOW_2215.yes, WINDOW_2215.no]));
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsAwaitingResolution: 0, windowsRetiredResolved: 1 });
+    await harness.gateway.stop();
+  });
+
+  it("bounded: past maximumConcurrentWindows awaiting windows, the OLDEST is retired UNRESOLVED_AFTER_CLOSE and named", async () => {
+    const harness = await started(venueStub({ clob }), { config: admissionConfig({}, series) });
+    await cycleAfter(harness, 15 * 60_000); // 22:35: 22:15 awaits; 22:30 admitted
+    await cycleAfter(harness, 15 * 60_000); // 22:50: 22:30 awaits too; one may await
+    expect(ledger(harness.walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "UNRESOLVED_AFTER_CLOSE" });
+    expect(ledger(harness.walFileSystem)[WINDOW_2230.conditionId]?.["status"]).toBe("ADMITTED");
+    expect(unsubscribedTokens(harness)).toEqual(expect.arrayContaining([WINDOW_2215.yes, WINDOW_2215.no]));
+    expect(unsubscribedTokens(harness)).not.toContain(WINDOW_2230.yes);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_RESOLUTION_ABANDONED")).toEqual([[WINDOW_2215.id]]);
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsAwaitingResolution: 1, windowsRetiredUnresolved: 1 });
+    // And the series goes on: the open 22:45 window holds the one cap slot.
+    expect(harness.publishedOfType("SeriesWindowAdmitted").map((envelope) => payloadOf(envelope)["internalMarketId"])).toContain(W2245.id);
+    await harness.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r1 (R1-FABLE-03): a failed CLOB read's incident names its own window", () => {
+  it("two windows whose reads fail in one cycle open TWO incidents, each naming its own window (not one per series and reason)", async () => {
+    let failing = true;
+    const healthy = venueStub();
+    const route = (request: PublicHttpRequest): PublicHttpResponse =>
+      failing && request.url.includes("/clob-markets/") ? { status: 503, body: "{}" } : healthy.route(request);
+    const harness = await started({ route, requests: healthy.requests });
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_CLOB_READ_FAILED")).toEqual([[WINDOW_2215.id], [WINDOW_2230.id]]);
+    // A repeat of the same window's failure is suppressed while its incident is open.
+    await cycleAfter(harness, 0);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_CLOB_READ_FAILED")).toEqual([[WINDOW_2215.id], [WINDOW_2230.id]]);
+    // Both recover and are admitted.
+    failing = false;
+    await cycleAfter(harness, 0);
+    expect(harness.publishedOfType("SeriesWindowAdmitted")).toHaveLength(2);
+    await harness.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r1 (R1-FABLE-04): at most maximumConcurrentWindows CLOB reads are attempted per series per cycle", () => {
+  it("cap 1 and two due windows the review refuses: one read this cycle, the other next cycle", async () => {
+    const page = (): unknown => {
+      const copy = structuredClone(KEYSET_PAGE);
+      for (const event of copy.events.slice(0, 2)) {
+        const market = ((event as Record<string, unknown>)["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+        market["feeSchedule"] = { exponent: 1, rate: 0.0625, takerOnly: true, rebateRate: 0.2 };
+      }
+      return copy;
+    };
+    const stub = venueStub({ page });
+    const series = { ...reviewedBtc15mSeriesDocument(), maximumConcurrentWindows: 1 };
+    const harness = await started(stub, { config: admissionConfig({}, series) });
+    const clobReads = (): number => stub.requests.filter((url) => url.includes("/clob-markets/")).length;
+    expect(clobReads()).toBe(1);
+    expect(harness.gateway.metrics().seriesAdmission?.windowsDeferredByReadBudget).toBe(1);
+    expect(ledger(harness.walFileSystem)[WINDOW_2215.conditionId]?.["status"]).toBe("REFUSED");
+    expect(ledger(harness.walFileSystem)[WINDOW_2230.conditionId]).toBeUndefined();
+    await cycleAfter(harness, 0);
+    expect(clobReads()).toBe(2);
+    expect(ledger(harness.walFileSystem)[WINDOW_2230.conditionId]?.["status"]).toBe("REFUSED");
+    await harness.gateway.stop();
+  });
+});

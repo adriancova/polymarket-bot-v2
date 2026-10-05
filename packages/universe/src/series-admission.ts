@@ -195,11 +195,16 @@ export const ReviewedSeriesSchema = z.strictObject({
   /** The cap on concurrently admitted windows (ADR-030 Decision 1.8). */
   maximumConcurrentWindows: z.number().int().min(1).max(64),
   /**
-   * How long after its scheduled close a window whose resolution never arrived
-   * is torn down anyway (ADR-030 Decision 4.4 tears a window down "after its
-   * resolution is handled"; resolution is observed 53 to 152 s after the
-   * close, F-17, so this bound only ends a window the venue never resolved).
-   * One reviewed value, so the gateway and every trader agree on it.
+   * How long after its scheduled close a window still unresolved stops
+   * counting as a LIVE window of the series (resolution is observed 53 to
+   * 152 s after the close, F-17, so this bound only marks a resolution missed
+   * or never made). One reviewed value, so the gateway and every trader agree
+   * on it. `ROLLOVER-1` r1 (R1-04; ADR-030 Decision 4.4, a window is torn down
+   * "after its resolution is handled"): past it, a window holds no cap slot —
+   * the gateway keeps it subscribed, AWAITING its resolution (at most
+   * `maximumConcurrentWindows` per series), and a trader tears it down only
+   * if it holds no inventory; one that holds inventory stays until its
+   * resolution is handled.
    */
   unresolvedTeardownSeconds: z.number().int().min(300).max(7 * 86_400),
 });

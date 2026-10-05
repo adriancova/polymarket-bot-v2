@@ -130,6 +130,12 @@ export const MIN_LIFECYCLE_POLL_INTERVAL_MS = 1_000;
  * `/events`. The feed may use at most {@link SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT}
  * of each, the lifecycle feed's share: per series, at most `maximumPages`
  * keyset reads and at most `maximumConcurrentWindows` CLOB reads per cycle.
+ * `ROLLOVER-1` r1 (R1-FABLE-04): the CLOB figure is a BOUND the driver
+ * enforces — every CLOB read a cycle ATTEMPTS counts against it, whether the
+ * window is then admitted, refused or the read fails, and a candidate past it
+ * waits for the next cycle (`feeds/series-admission.ts`). It used to be an
+ * assumption: a refused or failed candidate read the CLOB without holding a
+ * cap slot, so a cycle could read more than its cap.
  */
 export const GAMMA_EVENTS_RATE_LIMIT_PER_10S = 500;
 export const CLOB_GENERAL_RATE_LIMIT_PER_10S = 9_000;
@@ -696,14 +702,22 @@ function admittedWindowCapacity(config: GatewayConfig): number {
  *
  * 1. the `polymarket` and `lifecycle` blocks are configured — an admitted
  *    window is subscribed (books) and opened and closed (lifecycle) through
- *    them; without either it could never trade;
+ *    them; without either it could never trade — and the market channel has
+ *    `customFeatureEnabled: true` (`ROLLOVER-1` r1, R1-FABLE-02): only then does
+ *    the venue send `market_resolved` (`docs/venue/verified-2026-10-04.md`
+ *    F-13: it "Enable[s] best_bid_ask, new_market, and market_resolved
+ *    events"), and a window is retired only after its resolution (ADR-030
+ *    Decision 4.4), so without it every admitted window would hold its cap
+ *    slot for good;
  * 2. every series is a reviewed series (the universe door), with distinct
  *    series ids and distinct Gamma series ids;
  * 3. the cadence floor {@link MIN_SERIES_ADMISSION_POLL_INTERVAL_MS};
  * 4. the request budget: `Σ maximumPages × 10 000 / pollIntervalMs` per 10 s
  *    within {@link SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT} % of Gamma
  *    `/events`, and `Σ maximumConcurrentWindows × 10 000 / pollIntervalMs`
- *    within the same share of the CLOB's general limit.
+ *    within the same share of the CLOB's general limit — both bounds the
+ *    driver enforces per cycle (`maximumPages` keyset reads, and
+ *    `maximumConcurrentWindows` attempted CLOB reads, per series).
  *
  * The RUN MODE is not configuration: the feed refuses to start outside PAPER
  * and BACKTEST from the process environment (`feeds/series-admission.ts`).
@@ -716,6 +730,12 @@ function checkSeriesAdmission(
     throw new GatewayConfigurationError(
       "seriesAdmission requires the polymarket and lifecycle blocks: an admitted window is subscribed through the first and opened and closed through the second (ADR-030 Decision 1.3)",
       { polymarket: config.polymarket !== undefined, lifecycle: config.lifecycle !== undefined },
+    );
+  }
+  if (config.polymarket.customFeatureEnabled !== true) {
+    throw new GatewayConfigurationError(
+      "seriesAdmission requires polymarket.customFeatureEnabled: true — the market channel sends market_resolved only with custom features (docs/venue/verified-2026-10-04.md F-13), and an admitted window is retired only after its resolution (ADR-030 Decision 4.4)",
+      { customFeatureEnabled: config.polymarket.customFeatureEnabled ?? null },
     );
   }
   const parsed = block.series.map((document, index) => {

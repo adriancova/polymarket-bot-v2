@@ -32,6 +32,12 @@ function configured(document: Record<string, unknown> = reviewedSeriesDocument()
 
 const SERIES = configured();
 
+/**
+ * The admission envelope's event time the re-judge is asked at (R1-03): before
+ * every sample window's close (W1 closes 22:30, W2 22:45, W3 23:00).
+ */
+const ADMITTED_AT_MS = Date.parse("2026-10-04T22:00:00.000Z");
+
 function admissions(
   options: {
     readonly series?: readonly ConfiguredSeries[];
@@ -64,12 +70,13 @@ function judged(
   window = W1,
   change: (payload: Record<string, unknown>) => void = () => undefined,
   hash = SERIES.configHash,
+  atMs = ADMITTED_AT_MS,
 ) {
   const payloads = seriesWindowPayloads(window, hash);
   subject.observeDiscovered(payloads.discovered);
   const admitted = { ...payloads.admitted };
   change(admitted);
-  return subject.judge(admitted);
+  return subject.judge(admitted, atMs);
 }
 
 function codeOf(verdict: ReturnType<SeriesWindowAdmissions["judge"]>): string {
@@ -178,22 +185,22 @@ describe("SeriesWindowAdmissions — the re-judge admits only an exact match", (
 
   it("refuses DISCOVERY_MISSING without a MarketDiscovered@1 first, and DISCOVERY_DISAGREES when they differ", () => {
     const { subject } = admissions();
-    expect(codeOf(subject.judge(seriesWindowPayloads(W1, SERIES.configHash).admitted))).toBe("DISCOVERY_MISSING");
+    expect(codeOf(subject.judge(seriesWindowPayloads(W1, SERIES.configHash).admitted, ADMITTED_AT_MS))).toBe("DISCOVERY_MISSING");
     const payloads = seriesWindowPayloads(W1, SERIES.configHash);
     subject.observeDiscovered({ ...payloads.discovered, yesTokenId: W1.noTokenId, noTokenId: W1.yesTokenId });
-    expect(codeOf(subject.judge(payloads.admitted))).toBe("DISCOVERY_DISAGREES");
+    expect(codeOf(subject.judge(payloads.admitted, ADMITTED_AT_MS))).toBe("DISCOVERY_DISAGREES");
   });
 
   it("refuses MALFORMED tokens (presence and form only) and IDENTITY_NOT_DERIVED for an id that is not the window's", () => {
     const tokens = admissions();
     const payloads = seriesWindowPayloads(W1, SERIES.configHash);
     tokens.subject.observeDiscovered({ ...payloads.discovered, noTokenId: W1.yesTokenId });
-    expect(codeOf(tokens.subject.judge({ ...payloads.admitted, noTokenId: W1.yesTokenId }))).toBe("MALFORMED");
+    expect(codeOf(tokens.subject.judge({ ...payloads.admitted, noTokenId: W1.yesTokenId }, ADMITTED_AT_MS))).toBe("MALFORMED");
 
     const identity = admissions();
     const foreign = "018f4a7e-1111-7abc-8def-0123456789ab";
     identity.subject.observeDiscovered({ ...payloads.discovered, internalMarketId: foreign });
-    expect(codeOf(identity.subject.judge({ ...payloads.admitted, internalMarketId: foreign }))).toBe("IDENTITY_NOT_DERIVED");
+    expect(codeOf(identity.subject.judge({ ...payloads.admitted, internalMarketId: foreign }, ADMITTED_AT_MS))).toBe("IDENTITY_NOT_DERIVED");
   });
 
   it("refuses SHADOWS_KNOWN_MARKET for a window over a market this trader already runs", () => {
@@ -241,8 +248,67 @@ describe("SeriesWindowAdmissions — the re-judge admits only an exact match", (
   it("ignores a MarketDiscovered@1 of a series it does not review, and keeps a bounded refusal log", () => {
     const { subject } = admissions();
     subject.observeDiscovered({ ...seriesWindowPayloads(W1, SERIES.configHash).discovered, seriesId: "eth-15m-updown" });
-    expect(codeOf(subject.judge(seriesWindowPayloads(W1, SERIES.configHash).admitted))).toBe("DISCOVERY_MISSING");
-    for (let index = 0; index < 40; index += 1) subject.judge({});
+    expect(codeOf(subject.judge(seriesWindowPayloads(W1, SERIES.configHash).admitted, ADMITTED_AT_MS))).toBe("DISCOVERY_MISSING");
+    for (let index = 0; index < 40; index += 1) subject.judge({}, ADMITTED_AT_MS);
     expect(subject.metrics().lastRefusals).toHaveLength(32);
+  });
+});
+
+describe("ROLLOVER-1 r1: the re-judge refuses a malformed calendar date and a closed window", () => {
+  it("R1-02: a locator on a day the calendar does not have (February 30) is refused SCHEDULE, never normalized into March 2", () => {
+    const shape = { titlePrefix: "Bitcoin Up or Down - ", durationSeconds: 900 };
+    const title = "Bitcoin Up or Down - March 2, 5:15PM-5:30PM ET";
+    // `Date.parse` alone reads 2026-02-30T22:15Z as 2026-03-02T22:15Z: the
+    // well-formed locators of the same window are admitted, the impossible ones not.
+    expect(deriveWindowSchedule(title, shape, "2026-03-02T22:15:00Z", "2026-03-02T22:30:00Z").ok).toBe(true);
+    const impossible = deriveWindowSchedule(title, shape, "2026-02-30T22:15:00Z", "2026-02-30T22:30:00Z");
+    expect(impossible.ok).toBe(false);
+    if (!impossible.ok) expect(impossible.problems.join(" | ")).toMatch(/start locator.*not an ISO-8601 instant/u);
+    expect(deriveWindowSchedule(title, shape, "2026-03-02T22:15:00Z", "2026-02-30T22:30:00Z").ok).toBe(false);
+
+    // Through the re-judge: an admission whose facts are internally consistent
+    // under the normalization (its id derived from the March 2 open) is refused.
+    const { subject, attached } = admissions();
+    const marchOpenMs = Date.UTC(2026, 2, 2, 22, 15);
+    const marketId = windowInternalMarketId(W1.conditionId, marchOpenMs);
+    const discovered = { ...seriesWindowPayloads(W1, SERIES.configHash).discovered, internalMarketId: marketId };
+    subject.observeDiscovered(discovered);
+    const verdict = subject.judge(
+      {
+        ...seriesWindowPayloads(W1, SERIES.configHash).admitted,
+        internalMarketId: marketId,
+        windowTitle: title,
+        scheduledOpenAt: "2026-02-30T22:15:00Z",
+        scheduledCloseAt: "2026-02-30T22:30:00Z",
+      },
+      marchOpenMs - 60_000,
+    );
+    expect(codeOf(verdict)).toBe("SCHEDULE");
+    expect(attached).toEqual([]);
+  });
+
+  it("R1-03: a window whose close is at or before the admission's event time is refused WINDOW_CLOSED", () => {
+    const closeMs = Date.parse(W1.closeAt);
+    const closed = admissions();
+    expect(codeOf(judged(closed.subject, W1, undefined, SERIES.configHash, closeMs))).toBe("WINDOW_CLOSED");
+    expect(codeOf(judged(closed.subject, W1, undefined, SERIES.configHash, closeMs + 2_000))).toBe("WINDOW_CLOSED");
+    expect(closed.subject.metrics().refusals).toEqual({ WINDOW_CLOSED: 2 });
+    expect(closed.attached).toEqual([]);
+    // One millisecond before its close it is still open, and admitted.
+    const open = admissions();
+    expect(codeOf(judged(open.subject, W1, undefined, SERIES.configHash, closeMs - 1))).toBe("ADMIT");
+  });
+
+  it("R1-04: a live window kept past its bound is reported ONCE, counted while live, and released by its teardown", () => {
+    const { subject } = admissions();
+    const verdict = judged(subject);
+    if (verdict.kind !== "ADMIT") throw new Error(codeOf(verdict));
+    subject.attach(verdict.window);
+    expect(subject.noteHeldUnresolved(W2.marketId)).toBe(false); // not live: never held
+    expect(subject.noteHeldUnresolved(W1.marketId)).toBe(true);
+    expect(subject.noteHeldUnresolved(W1.marketId)).toBe(false);
+    expect(subject.metrics()).toMatchObject({ heldUnresolved: 1, live: 1 });
+    subject.detach(W1.marketId, "RESOLVED");
+    expect(subject.metrics()).toMatchObject({ heldUnresolved: 0, live: 0, tornDownResolved: 1 });
   });
 });

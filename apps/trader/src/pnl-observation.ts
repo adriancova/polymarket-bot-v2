@@ -6,7 +6,9 @@
  * `observeRealizedPnl(store, book)` answers a `TraderStore` that forwards every
  * call to `store` unchanged and, when `writePnlSnapshot` — or, since `SNAP-1`
  * r1, `replacePnlSnapshot` — SUCCEEDS, records the snapshot's `realizedPnl` in
- * the {@link RealizedPnlBook} the health surface reads. The value recorded is
+ * the {@link RealizedPnlBook} the health surface reads, under the snapshot's
+ * own stream (`ROLLOVER-1` r1, R1-05: its instance AND its market, so the
+ * windows of a series-bound instance sum rather than overwrite). The value recorded is
  * the PnL engine's own `PnlSnapshot.realizedPnl` — the same object, the same
  * field, that `packages/storage-postgres` just persisted — so the health
  * surface can only ever say what the database holds.
@@ -71,7 +73,7 @@ export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): T
     async writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
       const written = await store.writePnlSnapshot(snapshot);
       if (written.ok) {
-        book.record({ instanceId: snapshot.instanceId, realizedPnl: snapshot.realizedPnl });
+        book.record({ instanceId: snapshot.instanceId, marketId: snapshot.marketId, realizedPnl: snapshot.realizedPnl });
       }
       return written;
     },
@@ -81,7 +83,7 @@ export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): T
     async replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
       const replaced = await store.replacePnlSnapshot(snapshot);
       if (replaced.ok) {
-        book.record({ instanceId: snapshot.instanceId, realizedPnl: snapshot.realizedPnl });
+        book.record({ instanceId: snapshot.instanceId, marketId: snapshot.marketId, realizedPnl: snapshot.realizedPnl });
       }
       return replaced;
     },

@@ -420,6 +420,19 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     }
   }
 
+  // The §9.7 allocator, built from the caps this root parsed. It is a
+  // CONSTRUCTOR ARGUMENT of the loop rather than an optional collaborator: §8.1
+  // places "allocate capital" before the risk checks and §9.8 check 14 fails
+  // closed without its verdict, so a loop that could be built without one is a
+  // loop that can fabricate the verdict (review round 1, HIGH-1).
+  // `ROLLOVER-1` r1 (R1-01): built BEFORE the series admissions, so a window's
+  // attach can make the window's assets known to it (`registerMarketAssets`).
+  const allocator = new AllocatorGate({
+    caps: caps.value,
+    markets: allocationMarkets,
+    tokenAssetIds,
+  });
+
   // --- 6b. `ROLLOVER-1`: series-bound instances and the series admissions -----
   //
   // ADR-030 Decision 2.1: admission runs only in PAPER or BACKTEST. This
@@ -500,13 +513,22 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
               submissionUnknownAfterMs: params.entry.execution.submission_unknown_after_ms,
             });
           }
+          // `ROLLOVER-1` r1 (R1-01): the window's assets are known to the
+          // allocator BEFORE any runtime of it is registered, so its booked
+          // position is inventory an exit may sell and exposure every §9.7
+          // cap counts. A clash refuses the window with nothing attached.
+          const yesAssetId = `token:${window.yesTokenId}`;
+          const noAssetId = `token:${window.noTokenId}`;
+          if (!allocator.registerMarketAssets(window.marketId, yesAssetId, noAssetId)) {
+            return { ok: false, detail: "the window's token assets are already mapped to another market or side" };
+          }
           const marketConfig = { ...window.market, openTime: open.instant, closeTime: close.instant };
           markets.set(
             window.marketId,
             new MarketState({ config: marketConfig, tradeWindowMs: config.features.tradeWindowMs, maximumTrades }),
           );
-          tokenAssetIds.set(`${window.marketId}|YES`, `token:${window.yesTokenId}`);
-          tokenAssetIds.set(`${window.marketId}|NO`, `token:${window.noTokenId}`);
+          tokenAssetIds.set(`${window.marketId}|YES`, yesAssetId);
+          tokenAssetIds.set(`${window.marketId}|NO`, noAssetId);
           allocationMarkets.set(window.marketId, allocationMarketOf(marketConfig));
           for (const registration of registrations) {
             const registered = registry.register(registration);
@@ -519,8 +541,9 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
           return { ok: true };
         },
         detach: (window) => {
-          // Books, features and strategy state go; the token assets and the
-          // allocation scope stay with the ledger rows that name them.
+          // Books, features and strategy state go; the token assets (the
+          // loop's map and the allocator's, R1-01) and the allocation scope
+          // stay with the ledger rows that name them.
           registry.retireMarket(window.marketId);
           markets.delete(window.marketId);
         },
@@ -536,17 +559,6 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     attributionClearingRef: config.accounting.attributionClearingRef,
     feeExpenseRef: config.accounting.feeExpenseRef,
   };
-
-  // The §9.7 allocator, built from the caps this root parsed. It is a
-  // CONSTRUCTOR ARGUMENT of the loop rather than an optional collaborator: §8.1
-  // places "allocate capital" before the risk checks and §9.8 check 14 fails
-  // closed without its verdict, so a loop that could be built without one is a
-  // loop that can fabricate the verdict (review round 1, HIGH-1).
-  const allocator = new AllocatorGate({
-    caps: caps.value,
-    markets: allocationMarkets,
-    tokenAssetIds,
-  });
 
   const loop = new CoreLoop({
     config,
