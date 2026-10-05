@@ -50,6 +50,13 @@
  *    reported.
  * 10. **`ROLLOVER-1` r3 (R3-FABLE-02)** — the cap counts unconfirmed intents:
  *    with publication halted, a later due window is held, and gets no intent.
+ * 11. **`ROLLOVER-1` r4 (R4-FABLE-01)** — a resolution whose ledger write AND
+ *    publication both fail is not lost: it is held in memory, owed (its
+ *    window keeps its slot, is not "unresolved", and no operator retirement
+ *    applies), its PAGE says it is NOT in the ledger, and every cycle writes
+ *    it again; once written, the next epoch re-publishes it and the window is
+ *    retired `RESOLVED`. r3 wrote it once and kept it nowhere, while the PAGE
+ *    said it was in the ledger.
  */
 
 import { readFileSync } from "node:fs";
@@ -1038,5 +1045,111 @@ describe("ROLLOVER-1 r3 (R3-FABLE-02): the cap counts unconfirmed intents", () =
     expect(stub.requests.some((url) => url.includes(`/clob-markets/${third.conditionId}`))).toBe(false);
     expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ windowsAdmitted: 2, windowsHeldByCap: 1, liveWindows: 2 });
     await halted.gateway.stop();
+  });
+});
+
+describe("ROLLOVER-1 r4 (R4-FABLE-01): a resolution whose ledger write fails is held, owed, and written again", () => {
+  const series = { ...reviewedBtc15mSeriesDocument(), maximumConcurrentWindows: 1, unresolvedTeardownSeconds: 300 };
+  /** 22:32: the 22:15 window closed at 22:30; its market_resolved arrives now. */
+  const RESOLVED_AT_MS = Date.UTC(2026, 9, 4, 22, 32);
+
+  /** A memory WAL root whose admission-ledger writes fail while `failing.ledger` is set. */
+  function failingLedger(): { readonly walFileSystem: MemoryFileSystem; readonly failing: { ledger: boolean } } {
+    const walFileSystem = createMemoryFileSystem();
+    const failing = { ledger: false };
+    const writeWholeFile = walFileSystem.writeWholeFile.bind(walFileSystem);
+    walFileSystem.writeWholeFile = async (path: string, bytes: Uint8Array): Promise<void> => {
+      if (failing.ledger && path === LEDGER_PATH) throw new Error("injected: the admission ledger cannot be written");
+      await writeWholeFile(path, bytes);
+    };
+    return { walFileSystem, failing };
+  }
+
+  /** W2215 admitted; then publication halts AND the ledger fails; then W2215's market_resolved arrives. */
+  async function doubleFailure(walFileSystem: MemoryFileSystem, failing: { ledger: boolean }): Promise<Harness> {
+    const harness = await started(venueStub({ clob: everyClobBody() }), { walFileSystem, config: admissionConfig({}, series) });
+    expect(admittedIds(harness)).toEqual([WINDOW_2215.id]);
+    harness.clock.advance(RESOLVED_AT_MS - NOW_MS);
+    harness.transport.setUnavailable(true);
+    failing.ledger = true;
+    harness.polymarketSockets.current.message(marketResolvedFrame(WINDOW_2215, RESOLVED_AT_MS));
+    await harness.settle();
+    return harness;
+  }
+
+  function pageDetail(harness: Harness): string | undefined {
+    return harness.incidents.find((incident) => incident.reasonCode === "GATEWAY_SERIES_RESOLUTION_UNPUBLISHED")?.detail;
+  }
+
+  it("R4-FABLE-01: the write and the publication both fail — the PAGE says the resolution is NOT in the ledger; the next cycle writes it; the next epoch re-publishes it and retires the window RESOLVED", async () => {
+    const { walFileSystem, failing } = failingLedger();
+    const halted = await doubleFailure(walFileSystem, failing);
+    expect(resolutionsOf(halted, WINDOW_2215.id)).toBe(0);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"]).toBeUndefined();
+    // The PAGE says where the resolution is: not in the ledger, and lost by a stop.
+    expect(pageDetail(halted)).toMatch(/is NOT in the admission ledger/u);
+    expect(pageDetail(halted)).toMatch(/LOST/u);
+    expect(pageDetail(halted)).not.toMatch(/kept in the admission ledger/u);
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsObserved: 1, resolutionsUnpublished: 1, resolutionsUnrecorded: 1 });
+    expect(halted.gateway.metrics().seriesAdmission?.ledgerWriteFailures).toBeGreaterThanOrEqual(1);
+
+    // The ledger heals: the next cycle writes the held resolution, owed.
+    failing.ledger = false;
+    await cycleAfter(halted, 30_000);
+    const owed = ledger(walFileSystem)[WINDOW_2215.conditionId];
+    expect(owed?.["status"]).toBe("ADMITTED");
+    expect(owed?.["resolution"]).toBeDefined();
+    const kept = owed?.["resolution"] as Record<string, unknown> | undefined;
+    expect(kept?.["payload"]).toEqual({ internalMarketId: WINDOW_2215.id, conditionId: WINDOW_2215.conditionId, outcome: "YES_WIN", resolvedAt: expect.any(String) as unknown });
+    expect(kept?.["publishedAt"]).toBeUndefined();
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsUnrecorded: 0, resolutionsOwed: 1, liveWindows: 1 });
+    await halted.gateway.stop();
+
+    // Epoch 2 (22:42): re-published unchanged; then retired RESOLVED, and the 22:30 window takes the slot.
+    const restarted = await started(venueStub({ clob: everyClobBody() }), {
+      walFileSystem,
+      idSeed: 4,
+      config: admissionConfig({}, series),
+      clockStartMs: Date.UTC(2026, 9, 4, 22, 42),
+    });
+    expect(restarted.publishedOfType("MarketResolved").map((envelope) => payloadOf(envelope))).toEqual([kept?.["payload"]]);
+    await cycleAfter(restarted, 0);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
+    expect(admittedIds(restarted)).toEqual([WINDOW_2230.id]);
+    await restarted.gateway.stop();
+  });
+
+  it("R4-FABLE-01: while the ledger stays unwritable, the held resolution is OWED past the window's bound — not 'unresolved', its slot kept — and the write lands once the ledger heals", async () => {
+    const { walFileSystem, failing } = failingLedger();
+    const halted = await doubleFailure(walFileSystem, failing);
+    // Cycles to 22:41, past the 22:35 bound, with every ledger write failing.
+    for (let index = 0; index < 3; index += 1) await cycleAfter(halted, 3 * 60_000);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"]).toBeUndefined();
+    // Owed, not "unresolved": r3 knew nothing of it and named the window unresolved.
+    expect(observedIncidents(halted, "GATEWAY_SERIES_WINDOW_UNRESOLVED")).toBe(0);
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsOwed: 1, windowsAwaitingResolution: 0, liveWindows: 1 });
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsUnrecorded: 1 });
+    // Its slot is kept: the 22:30 window is not admitted.
+    expect(ledger(walFileSystem)[WINDOW_2230.conditionId]).toBeUndefined();
+    expect(unsubscribedTokens(halted)).not.toContain(WINDOW_2215.yes);
+    failing.ledger = false;
+    await cycleAfter(halted, 60_000);
+    expect(ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"]).toBeDefined();
+    expect((ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"] as Record<string, unknown> | undefined)?.["payload"]).toMatchObject({ internalMarketId: WINDOW_2215.id });
+    expect(halted.gateway.metrics().seriesAdmission).toMatchObject({ resolutionsUnrecorded: 0, resolutionsOwed: 1 });
+    await halted.gateway.stop();
+  });
+
+  it("control: with the ledger healthy, the same unpublished resolution's PAGE says it is kept in the ledger", async () => {
+    const { walFileSystem, failing } = failingLedger();
+    const harness = await started(venueStub({ clob: everyClobBody() }), { walFileSystem, config: admissionConfig({}, series) });
+    harness.clock.advance(RESOLVED_AT_MS - NOW_MS);
+    harness.transport.setUnavailable(true);
+    harness.polymarketSockets.current.message(marketResolvedFrame(WINDOW_2215, RESOLVED_AT_MS));
+    await harness.settle();
+    expect(failing.ledger).toBe(false);
+    expect(pageDetail(harness)).toMatch(/its resolution is kept in the admission ledger/u);
+    expect((ledger(walFileSystem)[WINDOW_2215.conditionId]?.["resolution"] as Record<string, unknown> | undefined)?.["payload"]).toMatchObject({ internalMarketId: WINDOW_2215.id });
+    await harness.gateway.stop();
   });
 });

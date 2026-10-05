@@ -36,10 +36,20 @@
  * 10. **R3-ASTRA-01, the trader's half** (`ROLLOVER-1` r3) — the gateway
  *    re-publishes a resolution whose publication an earlier epoch could not
  *    record, so a repeat can arrive: it calls no strategy a second time.
+ * 11. **R4-ASTRA-02** (`ROLLOVER-1` r4) — a resolution is TERMINAL: a
+ *    `MarketOpened` or `MarketClosing` that arrives after it (a lifecycle poll
+ *    answering after the resolution, which needs no fault) calls no strategy,
+ *    does not re-arm `onMarketResolved` for a repeat, and does not hide the
+ *    resolution from the teardown — W1's take-profit fills and W1 is torn
+ *    down `RESOLVED`. r3 overwrote `RESOLVED` with the late lifecycle.
+ * 12. **R4-FABLE-02(b)** (`ROLLOVER-1` r4) — the two r3 `RESOLVED_UNHANDLED`
+ *    branches no pin reached: the resolution found no computable snapshot (no
+ *    book ever arrived), or the window's runtime REFUSED it.
  */
 
 import { RealizedPnlBook, observeRealizedPnl, type AdmissionNotice } from "@polymarket-bot/trader";
-import { describe, expect, it } from "vitest";
+import type { EvaluationInput, EvaluationOutcome } from "@polymarket-bot/strategy-runtime";
+import { describe, expect, it, vi } from "vitest";
 
 import { assembleOrThrow } from "./support/run.js";
 import { DEAD_QUOTE, ENTRY_QUOTE, STOP_QUOTE, SeriesStream, sampleReviewHash } from "./support/series-stream.js";
@@ -448,5 +458,117 @@ describe("ROLLOVER-1 r3 (R3-ASTRA-02, R3-ASTRA-01): a resolution the trader coul
     const resolutions = run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId && entry.record.callback === "onMarketResolved");
     expect(resolutions).toHaveLength(1);
     expect(run.trader.loop.health().halts).toEqual([]);
+  });
+});
+
+describe("ROLLOVER-1 r4 (R4-ASTRA-02): a resolution is terminal in the trader", () => {
+  /** W1's decisions' callbacks, in order. */
+  function callbacksOf(run: ReturnType<typeof assembleOrThrow>): readonly string[] {
+    return run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId).map((entry) => entry.record.callback);
+  }
+
+  /**
+   * astra's r4 probe: W1 buys 50 at 0.34 and rests its take-profit; W1
+   * resolves at its close (22:30), while the take-profit still works; then a
+   * LATE lifecycle event for W1 (and, with `repeat`, the resolution again);
+   * then a print at 0.5 fills the take-profit.
+   */
+  async function lateLifecycle(late: "open" | "closing" | "none", repeat: boolean) {
+    const stream = w1Entry().resolve(W1, "2026-10-04T22:30:00.000Z").tick("2026-10-04T22:30:01.000Z");
+    if (late === "open") stream.open(W1, "2026-10-04T22:30:01.200Z");
+    if (late === "closing") stream.closing(W1, "2026-10-04T22:30:01.200Z");
+    if (repeat) stream.resolve(W1, "2026-10-04T22:30:01.500Z", "NO_WIN");
+    stream.trade(W1, "2026-10-04T22:30:02.000Z", "0.5").tick("2026-10-04T22:30:04.000Z");
+    const { run, notices, fills } = await drive(configWith({ exit: HOLD_TO_RESOLUTION }), stream);
+    return { run, notices, fills, callbacks: callbacksOf(run) };
+  }
+
+  for (const late of ["open", "closing"] as const) {
+    it(`R4-ASTRA-02: a late ${late === "open" ? "MarketOpened" : "MarketClosing"} after W1's resolution, then the resolution again — ONE onMarketResolved, no late lifecycle callback, and W1 is torn down RESOLVED once its take-profit fills`, async () => {
+      const { run, notices, fills, callbacks } = await lateLifecycle(late, true);
+      expect(fills).toEqual(["W1 BUY 50@0.34", "W1 SELL 50@0.5"]);
+      expect(callbacks.filter((callback) => callback === "onMarketResolved")).toHaveLength(1);
+      // Nothing after the resolution re-opens or closes W1 for its strategy.
+      const resolvedAt = callbacks.indexOf("onMarketResolved");
+      expect(callbacks.slice(resolvedAt + 1).filter((callback) => callback === "onMarketOpen" || callback === "onMarketClosing")).toEqual([]);
+      expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `TORN_DOWN ${W1.marketId} RESOLVED`]);
+      expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 1, tornDownResolvedUnhandled: 0, heldUnresolved: 0, live: 0 });
+      expect(run.trader.loop.health().halts).toEqual([]);
+    });
+
+    it(`R4-ASTRA-02: a late ${late === "open" ? "MarketOpened" : "MarketClosing"} alone cannot keep a resolved window live — the take-profit fills and W1 is torn down RESOLVED`, async () => {
+      const { run, notices, fills, callbacks } = await lateLifecycle(late, false);
+      expect(fills).toEqual(["W1 BUY 50@0.34", "W1 SELL 50@0.5"]);
+      expect(callbacks.filter((callback) => callback === "onMarketResolved")).toHaveLength(1);
+      expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `TORN_DOWN ${W1.marketId} RESOLVED`]);
+      expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 1, live: 0 });
+    });
+  }
+
+  it("control: with no late lifecycle event, the same window is torn down RESOLVED after its take-profit fills", async () => {
+    const { run, notices, fills, callbacks } = await lateLifecycle("none", false);
+    expect(fills).toEqual(["W1 BUY 50@0.34", "W1 SELL 50@0.5"]);
+    expect(callbacks.filter((callback) => callback === "onMarketResolved")).toHaveLength(1);
+    expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `TORN_DOWN ${W1.marketId} RESOLVED`]);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 1, live: 0 });
+  });
+});
+
+describe("ROLLOVER-1 r4 (R4-FABLE-02(b)): the two other RESOLVED_UNHANDLED branches, pinned", () => {
+  it("R4-FABLE-02(b): a resolution that finds NO computable snapshot (W1 opened, no book ever arrived) is RESOLVED_UNHANDLED — no strategy saw it", async () => {
+    const stream = new SeriesStream()
+      .tick("2026-10-04T22:16:00.000Z")
+      .admit(W1, "2026-10-04T22:16:01.000Z")
+      .open(W1, "2026-10-04T22:16:02.000Z")
+      .tick("2026-10-04T22:16:05.000Z")
+      .resolve(W1, "2026-10-04T22:30:30.000Z")
+      .tick("2026-10-04T22:30:31.000Z");
+    const { run, notices, fills } = await drive(configWith(), stream);
+    expect(fills).toEqual([]);
+    const resolutions = run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId && entry.record.callback === "onMarketResolved");
+    expect(resolutions).toHaveLength(0);
+    expect(notices).toEqual([`ADMITTED ${W1.marketId}`, `TORN_DOWN ${W1.marketId} RESOLVED_UNHANDLED`]);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 0, tornDownResolvedUnhandled: 1, live: 0 });
+  });
+
+  for (const code of ["INPUT_INVALID", "INSTANCE_PAUSED"] as const) {
+    it(`R4-FABLE-02(b): W1's runtime REFUSES its onMarketResolved (${code}) — RESOLVED_UNHANDLED`, async () => {
+      const stream = w1Entry()
+        .book(W1, "2026-10-04T22:16:10.000Z", DEAD_QUOTE)
+        .resolve(W1, "2026-10-04T22:30:30.000Z")
+        .tick("2026-10-04T22:30:31.000Z");
+      let refused = 0;
+      const { run, notices } = await drive(configWith({ exit: HOLD_TO_RESOLUTION }), stream, {
+        onNotice: (notice, held) => {
+          if (notice.kind !== "ADMITTED") return;
+          const instance = held.trader.registry.forMarket(W1.marketId)[0];
+          if (instance === undefined) throw new Error("W1 has no instance");
+          const runtime = instance.runtime;
+          const evaluate = runtime.evaluate.bind(runtime);
+          vi.spyOn(runtime, "evaluate").mockImplementation((input: EvaluationInput): EvaluationOutcome => {
+            if (input.callback !== "onMarketResolved") return evaluate(input);
+            refused += 1;
+            return { kind: "REFUSED", refusal: { code, detail: "r4 pin: the runtime refuses this resolution" } };
+          });
+        },
+      });
+      expect(refused).toBe(1);
+      const resolutions = run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId && entry.record.callback === "onMarketResolved");
+      expect(resolutions).toHaveLength(0);
+      expect(notices.at(-1)).toBe(`TORN_DOWN ${W1.marketId} RESOLVED_UNHANDLED`);
+      expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 0, tornDownResolvedUnhandled: 1, live: 0 });
+    });
+  }
+
+  it("control: the same stream with no refusal — W1's strategy handles its resolution and W1 is torn down RESOLVED", async () => {
+    const stream = w1Entry()
+      .book(W1, "2026-10-04T22:16:10.000Z", DEAD_QUOTE)
+      .resolve(W1, "2026-10-04T22:30:30.000Z")
+      .tick("2026-10-04T22:30:31.000Z");
+    const { run, notices } = await drive(configWith({ exit: HOLD_TO_RESOLUTION }), stream);
+    const resolutions = run.parts.store.decisions.filter((entry) => entry.record.marketId === W1.marketId && entry.record.callback === "onMarketResolved");
+    expect(resolutions).toHaveLength(1);
+    expect(notices.at(-1)).toBe(`TORN_DOWN ${W1.marketId} RESOLVED`);
+    expect(run.trader.loop.admissionMetrics()).toMatchObject({ tornDownResolved: 1, tornDownResolvedUnhandled: 0, live: 0 });
   });
 });

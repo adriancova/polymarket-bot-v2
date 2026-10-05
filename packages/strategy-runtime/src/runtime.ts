@@ -138,7 +138,12 @@ import { readOwnFieldsOnce } from "./read-once.js";
 import type { DecisionRecord, DecisionTelemetry } from "./record.js";
 import { isReservedRuntimeReasonCode, RUNTIME_REASON_CODES } from "./reserved-codes.js";
 import { DeterministicRng } from "./rng.js";
-import { isRunEvaluationSequence, type RunEvaluationSequence } from "./sequence.js";
+import {
+  isRunEvaluationSequence,
+  peekRunEvaluationSequence,
+  takeRunEvaluationSequence,
+  type RunEvaluationSequence,
+} from "./sequence.js";
 import {
   checkpointTransitions,
   type CheckpointMark,
@@ -436,7 +441,12 @@ export function createStrategyInstanceRuntime(
 
   // --- the run's evaluation sequence (`ROLLOVER-1`, ruling Q2) -------------
   // Only a counter `sequence.ts` minted: a caller-built object would put caller
-  // code inside `evaluate()`'s numbering, which the brand check rules out.
+  // code inside `evaluate()`'s numbering, which the brand check rules out. And
+  // the counter is read ONLY through `sequence.ts`'s own operations
+  // (`peekRunEvaluationSequence`, `takeRunEvaluationSequence`), never through
+  // a property of the object: a minted counter whose `peek`/`take` a holder
+  // replaced (on the instance or its prototype, or with a throwing accessor)
+  // numbers exactly as before (r4, R4-ASTRA-01).
   if (sequenceField !== undefined && !isRunEvaluationSequence(sequenceField)) {
     return refuse(
       "SEQUENCE_SOURCE_INVALID",
@@ -575,10 +585,11 @@ export function createStrategyInstanceRuntime(
     mark = restored.restored.mark;
     // `ROLLOVER-1`: the run's counter must not be BEHIND the restore point —
     // it would re-issue a sequence the store already holds for this run.
-    if (sequence !== undefined && sequence.peek() < nextEvaluationSeq) {
+    const runNext = sequence === undefined ? undefined : peekRunEvaluationSequence(sequence);
+    if (runNext !== undefined && runNext < nextEvaluationSeq) {
       return refuse(
         "SEQUENCE_SOURCE_BEHIND",
-        `the run's evaluation sequence would issue ${String(sequence.peek())} next, but the restore ` +
+        `the run's evaluation sequence would issue ${String(runNext)} next, but the restore ` +
           `point's highest durable evaluation sequence is ${String(nextEvaluationSeq - 1)}; a run's ` +
           "counter is seeded from its highest durable sequence plus one (runEvaluationSequenceAfter), " +
           "so this counter would re-issue a durable (run_id, evaluation_seq)",
@@ -669,7 +680,8 @@ class StrategyInstanceRuntime {
    * runtime of the run shares.
    */
   nextEvaluationSeq(): number {
-    return this.sequence === undefined ? this.evaluationSeq : this.sequence.peek();
+    // r4 (R4-ASTRA-01): the module's own read, never the counter's `peek`.
+    return this.sequence === undefined ? this.evaluationSeq : peekRunEvaluationSequence(this.sequence);
   }
 
   /**
@@ -981,7 +993,9 @@ class StrategyInstanceRuntime {
    */
   private claimSequence(): number | undefined {
     if (this.sequence === undefined) return this.evaluationSeq;
-    return this.sequence.take();
+    // r4 (R4-ASTRA-01): the module's own take, never the counter's `take`: no
+    // caller code runs here, after the callback, and nothing here can throw.
+    return takeRunEvaluationSequence(this.sequence);
   }
 
   /**

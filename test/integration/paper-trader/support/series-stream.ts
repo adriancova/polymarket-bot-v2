@@ -58,6 +58,11 @@ export class SeriesStream {
     return this.#push("MarketOpened", { internalMarketId: window.marketId, conditionId: window.conditionId, openedAt: window.openAt }, at);
   }
 
+  /** `MarketClosing@1` (the lifecycle feed's scheduled or observed closing), naming the window's close. */
+  closing(window: RecordedSeriesWindow, at: string): this {
+    return this.#push("MarketClosing", { internalMarketId: window.marketId, conditionId: window.conditionId, closesAt: window.closeAt }, at);
+  }
+
   /** Both tokens' books: the YES ladder given, the NO ladder its complement-ish fixture levels. */
   book(window: RecordedSeriesWindow, at: string, yes: { readonly bids: readonly Level[]; readonly asks: readonly Level[] }): this {
     const levels = (side: readonly Level[]) => side.map(([price, size]) => ({ price, size }));

@@ -222,14 +222,14 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     visibility: "PUBLIC",
     shape: "method",
     totality: "TOTAL",
-    note: "ROLLOVER-1: returns the counter's own private field",
+    note: "ROLLOVER-1: the counter's own private field (r4: through the module's own read)",
   },
   "RunEvaluationSequence.take": {
     params: [],
     visibility: "PUBLIC",
     shape: "method",
     totality: "TOTAL",
-    note: "ROLLOVER-1: undefined once exhausted; never throws",
+    note: "ROLLOVER-1: undefined once exhausted; never throws (r4: through the module's own take)",
   },
   "RunEvaluationSequence.issued (getter)": {
     params: [],
@@ -532,6 +532,25 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     shape: "function",
     totality: "TOTAL",
     note: "CKPT-1: exact heartbeat arithmetic; an unreadable instant answers undefined, never a throw",
+  },
+  peekRunEvaluationSequence: {
+    params: ["sequence"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "PARTIAL",
+    note:
+      "ROLLOVER-1 r4 (R4-ASTRA-01): the runtime's read of a counter's private state, never a " +
+      "property of the counter; precondition: a MINTED counter (the runtime's brand check), " +
+      "anything else is the platform's private-field TypeError",
+  },
+  takeRunEvaluationSequence: {
+    params: ["sequence"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "PARTIAL",
+    note:
+      "ROLLOVER-1 r4 (R4-ASTRA-01): the runtime's take from a counter's private state, never a " +
+      "property of the counter; precondition: a MINTED counter (the runtime's brand check)",
   },
   parseExactInstant: {
     params: ["value"],

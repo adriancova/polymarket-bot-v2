@@ -23,8 +23,15 @@
  *    re-publishes the recorded payload before anything else is admitted
  *    (step 7); r2 retired the window at dispatch, so the resolution reached
  *    no consumer and a trader holding the window kept it HELD for the rest of
- *    its run. A window still unresolved `unresolvedTeardownSeconds` (reviewed)
- *    after its scheduled close is NOT retired by a timer (`ROLLOVER-1` r1,
+ *    its run. `ROLLOVER-1` r4 (R4-FABLE-01): a resolution whose ledger write
+ *    fails is held in memory, owed exactly like a recorded one, and written
+ *    again at the start of every cycle until the ledger holds it
+ *    (`resolutionsUnrecorded`); its PAGE says whether the resolution is in the
+ *    ledger, and that a stop before the write succeeds loses it (the window
+ *    then awaits its resolution like one never observed, below).
+ *
+ *    A window still unresolved `unresolvedTeardownSeconds` (reviewed) after
+ *    its scheduled close is NOT retired by a timer (`ROLLOVER-1` r1,
  *    R1-04): a trader may hold a position in it, and only this gateway can
  *    still deliver its resolution. It stays ADMITTED, subscribed and
  *    registered in the directory, AWAITING its resolution, with a NOTIFY
@@ -105,7 +112,9 @@
  *    Then the next epoch re-publishes every OWED resolution (step 1), citing
  *    the same journaled keyset response the admission replay cites, with the
  *    recorded payload unchanged; the ledger keeps the WAL position of the
- *    market-channel frame it was first derived from.
+ *    market-channel frame it was first derived from. So the re-publication
+ *    waits for that epoch's first SUCCESSFUL keyset read: while Gamma's keyset
+ *    read fails, an owed resolution stays owed (and its window in its slot).
  *
  * ## PAPER or BACKTEST only (Decision 2; acceptance 2)
  *
@@ -291,6 +300,12 @@ export interface SeriesAdmissionDriverMetrics {
   readonly resolutionsReplayed: number;
   /** Live windows whose observed resolution is still owed publication. */
   readonly resolutionsOwed: number;
+  /**
+   * `ROLLOVER-1` r4 (R4-FABLE-01): observed resolutions the admission ledger
+   * could not record yet — held in memory and written again every cycle. While
+   * it is above 0, a stop loses them (their PAGE says so).
+   */
+  readonly resolutionsUnrecorded: number;
   /** `ROLLOVER-1` r3 (R3-FABLE-01): windows retired by an operator's named retirement. */
   readonly windowsRetiredByOperator: number;
   /** Operator retirements naming a live window not yet retirable (before its bound, or a resolution owed). */
@@ -392,6 +407,15 @@ export class SeriesAdmissionFeedDriver {
    * ledger write that records the publication failed.
    */
   readonly #published = new Map<string, WindowResolutionRecord & { readonly publishedAt: string }>();
+  /**
+   * `ROLLOVER-1` r4 (R4-FABLE-01): observed resolutions whose ledger write has
+   * not succeeded yet, by ledger key — kept in memory, owed exactly like a
+   * recorded one, and written again at the start of every cycle until the
+   * ledger holds them (or the window is no longer live). r3 wrote the evidence
+   * once: when that write AND the publication failed, the resolution was kept
+   * nowhere, while its PAGE said it was in the ledger.
+   */
+  readonly #unrecorded = new Map<string, WindowResolutionRecord>();
   /** `ROLLOVER-1` r3 (R3-FABLE-01): the operator's named retirements, by window id. */
   readonly #operatorRetirements: ReadonlyMap<string, string>;
   #operatorRetirementsChecked = false;
@@ -510,13 +534,43 @@ export class SeriesAdmissionFeedDriver {
         ? {}
         : { rawFrame: { gatewayEpoch: this.#options.gatewayEpoch, ingestSeq: resolution.rawFrameIngestSeq } }),
     };
-    // Recorded at once (the obligation), on the serial mutation chain.
-    void this.#mutate(record.key, (current) =>
-      current?.status === "ADMITTED" && current.resolution === undefined ? { ...current, resolution: evidence } : undefined,
-    );
+    // Recorded at once (the obligation), on the serial mutation chain; held in
+    // memory until the ledger holds it (r4, R4-FABLE-01). The first observed
+    // resolution of a window stands.
+    if (!this.#unrecorded.has(record.key)) this.#unrecorded.set(record.key, evidence);
+    const recorded = this.#recordResolution(record.key);
     void resolution.published.then(async (outcome) => {
+      // The outcome is judged once the first write has settled, so its PAGE
+      // says truthfully whether the resolution is in the ledger.
+      await recorded;
       await this.#resolutionOutcome(record.key, evidence, outcome);
     });
+  }
+
+  /**
+   * `ROLLOVER-1` r4 (R4-FABLE-01): writes a held resolution onto its window's
+   * ledger record, and forgets the in-memory copy once the ledger holds it —
+   * or once it is no longer needed (the record already carries a resolution,
+   * or is no longer live). A failed write keeps the copy for the next cycle.
+   */
+  async #recordResolution(key: string): Promise<void> {
+    const evidence = this.#unrecorded.get(key);
+    if (evidence === undefined) return;
+    const attempt = { needed: false };
+    const written = await this.#mutate(key, (current) => {
+      if (current?.status !== "ADMITTED" || current.resolution !== undefined) return undefined;
+      attempt.needed = true;
+      return { ...current, resolution: evidence };
+    });
+    if ((written !== undefined || !attempt.needed) && this.#unrecorded.get(key) === evidence) this.#unrecorded.delete(key);
+  }
+
+  /** Writes every held resolution again (each cycle, before teardown; R4-FABLE-01). */
+  async #recordUnrecorded(): Promise<void> {
+    for (const key of [...this.#unrecorded.keys()]) {
+      if (this.#stopped) return;
+      await this.#recordResolution(key);
+    }
   }
 
   /** Discharges a resolution's obligation on publication, or pages that it is owed. */
@@ -524,11 +578,15 @@ export class SeriesAdmissionFeedDriver {
     const id = evidence.payload.internalMarketId;
     if (!outcome.published) {
       this.#resolutionsUnpublished += 1;
+      const failure = `the resolution of admitted window ${id} (condition ${evidence.payload.conditionId}, ${evidence.payload.outcome}) was dispatched but not published (${outcome.reason}: ${outcome.detail}); the window stays admitted, subscribed and in its cap slot`;
+      // r4 (R4-FABLE-01): the text says where the resolution IS kept.
       this.#openWindowIncident(
         `${this.#options.feedId}:${id}:resolution`,
         "GATEWAY_SERIES_RESOLUTION_UNPUBLISHED",
         "PAGE",
-        `the resolution of admitted window ${id} (condition ${evidence.payload.conditionId}, ${evidence.payload.outcome}) was dispatched but not published (${outcome.reason}: ${outcome.detail}); the window stays admitted, subscribed and in its cap slot, its resolution is kept in the admission ledger, and the next start re-publishes it before the window is retired`,
+        this.#unrecorded.has(key)
+          ? `${failure}. Its resolution is NOT in the admission ledger: the ledger write failed (GATEWAY_SERIES_LEDGER_WRITE_FAILED), so it is held in memory only and written again every admission cycle (resolutionsUnrecorded). Once that write succeeds, the next start re-publishes it before the window is retired; if this gateway stops first, the resolution is LOST — the window then awaits its resolution like one never observed, and its recovery is the operator's named retirement (seriesAdmission.operatorRetirements)`
+          : `${failure}, its resolution is kept in the admission ledger, and the next start re-publishes it before the window is retired`,
         [id],
       );
       return;
@@ -631,6 +689,7 @@ export class SeriesAdmissionFeedDriver {
   async #runCycle(): Promise<void> {
     this.#cycles += 1;
     const nowMs = this.#options.clock.nowMs();
+    await this.#recordUnrecorded();
     await this.#tearDown(nowMs);
     await this.#prune(nowMs);
     for (const entry of this.#options.series) {
@@ -704,9 +763,11 @@ export class SeriesAdmissionFeedDriver {
       }
       const pastBound = this.#pastUnresolvedBound(window, entry, nowMs);
       const operatorReason = this.#operatorRetirements.get(window.internalMarketId);
-      if (record.resolution !== undefined) {
+      if (record.resolution !== undefined || this.#unrecorded.has(record.key)) {
         // Observed, NOT published (R3-ASTRA-01): owed. It keeps its route and
         // its slot; the next epoch re-publishes it, and only then is it retired.
+        // r4 (R4-FABLE-01): a resolution held in memory, its ledger write not
+        // yet successful, is owed too, and no operator retirement overrides it.
         owed += 1;
         if (operatorReason !== undefined) {
           deferred += 1;
@@ -1395,6 +1456,7 @@ export class SeriesAdmissionFeedDriver {
       resolutionsUnpublished: this.#resolutionsUnpublished,
       resolutionsReplayed: this.#resolutionsReplayed,
       resolutionsOwed: this.#resolutionsOwed,
+      resolutionsUnrecorded: this.#unrecorded.size,
       windowsRetiredByOperator: this.#retiredByOperator,
       operatorRetirementsDeferred: this.#operatorDeferred,
       operatorRetirementsUnmatched: this.#operatorUnmatched,

@@ -23,7 +23,16 @@
  *    never a re-use;
  * 6. exhaustion is refused before the callback is invoked;
  * 7. ADR-027 Decision 1 is unchanged: each window's runtime checkpoints its own
- *    START, and a contained evaluation is numbered from the run's counter too.
+ *    START, and a contained evaluation is numbered from the run's counter too;
+ * 8. `ROLLOVER-1` r4 (R4-ASTRA-01): a runtime numbers through the module's own
+ *    operations, never a property of the counter. A holder that replaces
+ *    `take`/`peek` on a minted counter — on the instance or its prototype, by
+ *    assignment or with a throwing accessor — changes nothing a runtime
+ *    records: no `[0, 0]`, a restored run still persists 42 (not a durable
+ *    sequence), `evaluate()` never throws, a counter BEHIND its restore point
+ *    is still refused, and exhaustion cannot be faked. A counter is
+ *    constructed only by the module's factories: `new` through the class, a
+ *    minted counter's `constructor`, or a subclass is refused, never branded.
  */
 
 import { describe, expect, it } from "vitest";
@@ -33,8 +42,8 @@ import {
   createStrategyInstanceRuntime,
   isRunEvaluationSequence,
   MAX_EVALUATION_SEQ,
+  RunEvaluationSequence,
   runEvaluationSequenceAfter,
-  type RunEvaluationSequence,
   type StrategyInstanceRuntime,
 } from "../../../packages/strategy-runtime/src/index.js";
 import {
@@ -248,5 +257,198 @@ describe("ROLLOVER-1: the run-scoped evaluation sequence", () => {
     expect(invoked).toBe(0);
     expect(sink.calls).toHaveLength(0);
     expect(seeded.sequence.take()).toBeUndefined();
+  });
+});
+
+describe("ROLLOVER-1 r4 (R4-ASTRA-01): a minted counter's public methods are not what a runtime numbers with", () => {
+  /** The run's decision sequences, then its checkpoint sequences. */
+  function numbering(harness: { readonly sink: RecordingSink; readonly store: RecordingStore }): {
+    readonly decisions: readonly number[];
+    readonly checkpoints: readonly number[];
+  } {
+    return {
+      decisions: harness.sink.calls.map((call) => call.record.evaluationSeq),
+      checkpoints: harness.store.checkpoints.map((checkpoint) => checkpoint.checkpointSeq),
+    };
+  }
+
+  /** A mutation a holder attempts; one the platform refuses outright is as good as one that changes nothing. */
+  function attempt(mutation: () => void): void {
+    try {
+      mutation();
+    } catch {
+      // refused at the holder: nothing changed
+    }
+  }
+
+  const throwingAccessor = (): PropertyDescriptor => ({
+    configurable: true,
+    get() {
+      throw new Error("holder accessor");
+    },
+  });
+
+  it("R4-ASTRA-01: `take` replaced on the INSTANCE (assignment, or a defined value) — two windows still never share a sequence", () => {
+    const sequence = createRunEvaluationSequence();
+    const { a, b, sink, store } = twoWindows(sequence);
+    a.evaluate(onWindow("onMarketOpen", WINDOW_A));
+    attempt(() => {
+      Object.defineProperty(sequence, "take", { configurable: true, writable: true, value: () => 0 });
+    });
+    b.evaluate(onWindow("onMarketOpen", WINDOW_B));
+    attempt(() => {
+      (sequence as unknown as { take: () => number }).take = () => 1;
+    });
+    a.evaluate(onWindow("onFeatures", WINDOW_A));
+    b.evaluate(onWindow("onFeatures", WINDOW_B));
+    // astra's probe persisted [0, 0, ...] here.
+    expect(numbering({ sink, store })).toEqual({ decisions: [0, 1, 2, 3], checkpoints: [0, 1] });
+    expect(a.nextEvaluationSeq()).toBe(4);
+  });
+
+  it("R4-ASTRA-01: a THROWING accessor for `take` and `peek` on the instance never escapes evaluate() or nextEvaluationSeq(), and the record is numbered", () => {
+    const sequence = createRunEvaluationSequence();
+    const { a, sink, store } = twoWindows(sequence);
+    attempt(() => {
+      Object.defineProperty(sequence, "take", throwingAccessor());
+    });
+    attempt(() => {
+      Object.defineProperty(sequence, "peek", throwingAccessor());
+    });
+    let outcome: ReturnType<StrategyInstanceRuntime["evaluate"]> | undefined;
+    expect(() => {
+      outcome = a.evaluate(onWindow("onMarketOpen", WINDOW_A));
+    }).not.toThrow();
+    expect(outcome?.kind).toBe("DECIDED");
+    expect(a.instanceStatus()).toBe("ACTIVE");
+    expect(numbering({ sink, store })).toEqual({ decisions: [0], checkpoints: [0] });
+    expect(() => a.nextEvaluationSeq()).not.toThrow();
+    expect(a.nextEvaluationSeq()).toBe(1);
+  });
+
+  it("R4-ASTRA-01: `take` and `peek` replaced on the PROTOTYPE (a value, then a throwing accessor) change nothing a runtime records", () => {
+    const prototype = RunEvaluationSequence.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      take: Object.getOwnPropertyDescriptor(prototype, "take"),
+      peek: Object.getOwnPropertyDescriptor(prototype, "peek"),
+    };
+    const sequence = createRunEvaluationSequence();
+    const { a, b, sink, store } = twoWindows(sequence);
+    try {
+      a.evaluate(onWindow("onMarketOpen", WINDOW_A));
+      attempt(() => {
+        Object.defineProperty(prototype, "take", { configurable: true, writable: true, value: () => 0 });
+        Object.defineProperty(prototype, "peek", { configurable: true, writable: true, value: () => MAX_EVALUATION_SEQ + 1 });
+      });
+      b.evaluate(onWindow("onMarketOpen", WINDOW_B));
+      attempt(() => {
+        Object.defineProperty(prototype, "take", throwingAccessor());
+        Object.defineProperty(prototype, "peek", throwingAccessor());
+      });
+      expect(() => a.evaluate(onWindow("onFeatures", WINDOW_A))).not.toThrow();
+      expect(() => a.nextEvaluationSeq()).not.toThrow();
+      expect(a.nextEvaluationSeq()).toBe(3);
+    } finally {
+      for (const [name, descriptor] of Object.entries(saved)) {
+        if (descriptor !== undefined) Object.defineProperty(prototype, name, descriptor);
+      }
+    }
+    expect(numbering({ sink, store })).toEqual({ decisions: [0, 1, 2], checkpoints: [0, 1] });
+  });
+
+  it("R4-ASTRA-01: a RESTORED run's counter whose `take` is replaced still persists 42 — never a durable sequence", () => {
+    const first = makeHarness();
+    first.runtime.evaluate(makeInput("onMarketOpen"));
+    const checkpoint = first.store.checkpoints[0];
+    expect(checkpoint).toBeDefined();
+    if (checkpoint === undefined) return;
+    const point = restorePoint(checkpoint, 41);
+    const seeded = runEvaluationSequenceAfter(41);
+    expect(seeded.ok).toBe(true);
+    if (!seeded.ok) return;
+    const restored = makeHarness({ restoreFrom: point, sequence: seeded.sequence });
+    attempt(() => {
+      (seeded.sequence as unknown as { take: () => number }).take = () => 0;
+    });
+    restored.runtime.evaluate(makeInput("onFeatures"));
+    restored.runtime.evaluate(makeInput("onFeatures"));
+    expect(restored.sink.calls.map((call) => call.record.evaluationSeq)).toEqual([42, 43]);
+  });
+
+  it("R4-ASTRA-01: a replaced `peek` cannot pass a counter BEHIND its restore point, nor fake the counter's exhaustion", () => {
+    const first = makeHarness();
+    first.runtime.evaluate(makeInput("onMarketOpen"));
+    const checkpoint = first.store.checkpoints[0];
+    expect(checkpoint).toBeDefined();
+    if (checkpoint === undefined) return;
+    // A fresh counter (next 0) is BEHIND a restore point whose highest durable sequence is 41.
+    const behind = createRunEvaluationSequence();
+    attempt(() => {
+      (behind as unknown as { peek: () => number }).peek = () => 1_000;
+    });
+    const { definition } = makeDefinition({ restoreFrom: restorePoint(checkpoint, 41), sequence: behind });
+    const refused = createStrategyInstanceRuntime(definition);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.refusal.code).toBe("SEQUENCE_SOURCE_BEHIND");
+
+    // A counter with every number left is not exhausted, whatever its `peek` says.
+    const fresh = createRunEvaluationSequence();
+    const { runtime, sink } = makeHarness({ sequence: fresh });
+    attempt(() => {
+      (fresh as unknown as { peek: () => number }).peek = () => MAX_EVALUATION_SEQ + 1;
+    });
+    expect(runtime.evaluate(makeInput("onMarketOpen")).kind).toBe("DECIDED");
+    expect(sink.calls.map((call) => call.record.evaluationSeq)).toEqual([0]);
+    expect(runtime.nextEvaluationSeq()).toBe(1);
+  });
+
+  it("R4-ASTRA-01: a counter is constructed only by the factories — `new` through the class, a minted counter's `constructor`, or a subclass is refused and never branded", () => {
+    type AnyConstructor = new (...args: unknown[]) => object;
+    const viaClass = RunEvaluationSequence as unknown as AnyConstructor;
+    const viaInstance = createRunEvaluationSequence().constructor as unknown as AnyConstructor;
+    const built: object[] = [];
+    for (const construct of [
+      () => new viaClass(-5),
+      () => new viaClass(undefined, 0),
+      () => new viaClass(Symbol("RunEvaluationSequence.mint"), -5),
+      () => new viaInstance(-5),
+      () => Reflect.construct(viaClass, [0]),
+    ]) {
+      expect(() => built.push(construct())).toThrow(TypeError);
+    }
+    class Subclass extends viaClass {
+      constructor() {
+        super(-5);
+      }
+      take(): number {
+        return 0;
+      }
+    }
+    expect(() => built.push(new Subclass())).toThrow(TypeError);
+    expect(built).toEqual([]);
+
+    // A runtime refuses anything this module did not mint — a forged counter
+    // whose prototype is the real one included.
+    const forged = Object.create(RunEvaluationSequence.prototype) as RunEvaluationSequence;
+    expect(isRunEvaluationSequence(forged)).toBe(false);
+    const { definition } = makeDefinition({ sequence: forged });
+    const created = createStrategyInstanceRuntime(definition);
+    expect(created.ok).toBe(false);
+    if (!created.ok) expect(created.refusal.code).toBe("SEQUENCE_SOURCE_INVALID");
+  });
+
+  it("R4-ASTRA-01: the factories still mint, and gaps on a failed persist are unchanged (CKPT-1 D2/D3 kept)", () => {
+    const sequence = createRunEvaluationSequence();
+    expect(isRunEvaluationSequence(sequence)).toBe(true);
+    expect(RunEvaluationSequence.fresh().peek()).toBe(0);
+    const after = RunEvaluationSequence.after(9);
+    expect(after.ok && after.sequence.peek()).toBe(10);
+    const { a, b, sink, store } = twoWindows(sequence);
+    a.evaluate(onWindow("onMarketOpen", WINDOW_A));
+    sink.failNext = true;
+    expect(a.evaluate(onWindow("onFeatures", WINDOW_A)).kind).toBe("HALTED");
+    b.evaluate(onWindow("onMarketOpen", WINDOW_B));
+    expect(numbering({ sink, store })).toEqual({ decisions: [0, 2], checkpoints: [0, 2] });
+    expect(sequence.issued).toBe(3);
   });
 });

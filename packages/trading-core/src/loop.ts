@@ -1934,7 +1934,10 @@ export class CoreLoop {
    * window subscribed for that resolution, and never abandons it
    * (`apps/data-gateway` `feeds/series-admission.ts`); since `ROLLOVER-1` r3
    * (R3-ASTRA-01) it also re-publishes a resolution a publication halt
-   * swallowed, so a repeat is ignored here (`#applyEvent`). A resolution the
+   * swallowed, so a repeat is ignored here (`#applyEvent`). Since r4
+   * (R4-ASTRA-02) a resolution is TERMINAL (`MarketState.markLifecycle`): a
+   * `MarketOpened` or `MarketClosing` that arrives after it neither re-arms
+   * the callback nor hides the resolution from this teardown. A resolution the
    * gateway never observed is not delivered: the gateway operator's named
    * retirement frees the GATEWAY's slot only, and this window stays HELD until
    * a new run (R3-FABLE-01). `ROLLOVER-1` r2
@@ -2128,11 +2131,14 @@ export class CoreLoop {
       receivedAt: instant,
     };
     switch (envelope.eventType) {
+      // `ROLLOVER-1` r4 (R4-ASTRA-02): a resolution is TERMINAL. A lifecycle
+      // event after it (`markLifecycle` answers `false`) changes nothing and
+      // calls no strategy: a resolved market is neither re-opened nor closing.
       case "MarketOpened":
-        market.markLifecycle("OPEN");
+        if (!market.markLifecycle("OPEN")) return undefined;
         return { kind: "onMarketOpen" };
       case "MarketClosing": {
-        market.markLifecycle("CLOSING");
+        if (!market.markLifecycle("CLOSING")) return undefined;
         // §7.4 gives `MarketClosing` a `closesAt` INSTANT, and §9.6 gives
         // `onMarketClosing` a `secondsRemaining` DURATION. The conversion is the
         // root's, and it is measured against the event's own instant rather
@@ -2151,9 +2157,10 @@ export class CoreLoop {
         // `ROLLOVER-1` r3 (R3-ASTRA-01): a market resolves ONCE. The gateway
         // re-publishes a resolution whose publication an earlier epoch could
         // not record, so a repeat can arrive; it changes nothing and calls no
-        // strategy a second time. The first resolution stands.
-        if (market.lifecycle === "RESOLVED") return undefined;
-        market.markResolved(outcome, instant);
+        // strategy a second time. The first resolution stands. r4
+        // (R4-ASTRA-02): judged on the resolution evidence, which no later
+        // lifecycle event can erase (`markResolved` answers `false`).
+        if (!market.markResolved(outcome, instant)) return undefined;
         return { kind: "onMarketResolved", outcome, resolvedAt: instant };
       }
       case "BookSnapshot": {

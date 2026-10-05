@@ -167,7 +167,8 @@
  * envelope), in lifecycle order — opened, scheduled closing, observed
  * closing — and NEVER past a confirmed later event: an OPEN is not re-emitted
  * for a market whose CLOSING is confirmed (the one regression the trader's
- * unguarded `markLifecycle` cannot absorb); a same-instant `MarketOpened`
+ * `markLifecycle` cannot absorb: it refuses only to leave a resolution,
+ * `ROLLOVER-1` r4); a same-instant `MarketOpened`
  * replay is idempotent for the universe fold. **The replay STOPS at the
  * first event that is not confirmed** (r2, MEDIUM-R1): an intent write that
  * failed, or a dispatch the publisher did not publish, ends the poll's
