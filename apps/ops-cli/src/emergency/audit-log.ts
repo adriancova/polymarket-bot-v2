@@ -47,6 +47,20 @@
  * line records nothing done: a command acts only after its `ACTING` append
  * has resolved.
  *
+ * A SHORT WRITE LEAVES A FRAGMENT, AND NO RECORD IS JOINED TO IT (WP-330 r4,
+ * WP330-V4-01). A short write (`SHORT_WRITE`), or a crash in the middle of a
+ * write, can leave part of a line with no newline after it. Every append to
+ * a file it did not create first reads the file's last byte; when that is not
+ * a newline, it writes one before its record, in the same `write`. The
+ * fragment stays in the file as a line of its own that does not parse, and
+ * the record after it, in this invocation or a later one, parses. The byte is
+ * read through a second, read-only descriptor (`O_NOFOLLOW`, `O_NONBLOCK`),
+ * and only when that descriptor names the same file (device and inode) as the
+ * one written. The check is best effort: when it cannot be made (the file
+ * cannot be read, or the path now names another file), the record is written
+ * as before. Two invocations appending to one log at the same instant may
+ * then leave an empty line; an empty line carries nothing.
+ *
  * ## The database mirror is best effort, and never on the cancel path
  *
  * When a database is configured, each record is also appended to
@@ -195,6 +209,38 @@ export interface AuditFileHandle {
   sync(): Promise<void>;
   stat(): Promise<{ isFile(): boolean; isDirectory(): boolean }>;
   close(): Promise<void>;
+  /**
+   * Whether the file this descriptor writes is not empty and its last byte is
+   * not a newline: a line was left unterminated (WP330-V4-01). A handle that
+   * cannot tell answers `false`, or omits the method; the append is then
+   * written as it would have been without the check.
+   */
+  endsMidLine?(): Promise<boolean>;
+}
+
+const NEWLINE = 0x0a;
+/** The second descriptor `endsMidLine` reads the last byte through: read-only, never following a symlink, never waiting on a FIFO. */
+const READ_FLAGS = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+
+/**
+ * The last byte of the file `written` names, read through a new read-only
+ * descriptor on `path`, and only when that descriptor names the SAME file
+ * (device and inode): a path that now names another file is not read, and
+ * the answer is `false`.
+ */
+async function fileEndsMidLine(path: string, written: FileHandle): Promise<boolean> {
+  const own = await written.stat({ bigint: true });
+  if (!own.isFile() || own.size === 0n) return false;
+  const reader = await open(path, READ_FLAGS);
+  try {
+    const seen = await reader.stat({ bigint: true });
+    if (!seen.isFile() || seen.dev !== own.dev || seen.ino !== own.ino || seen.size === 0n) return false;
+    const last = new Uint8Array(1);
+    const { bytesRead } = await reader.read(last, 0, 1, seen.size - 1n);
+    return bytesRead === 1 && last[0] !== NEWLINE;
+  } finally {
+    await reader.close().catch(() => undefined);
+  }
 }
 
 export const NODE_AUDIT_FILE_SYSTEM: AuditFileSystem = Object.freeze({
@@ -205,9 +251,27 @@ export const NODE_AUDIT_FILE_SYSTEM: AuditFileSystem = Object.freeze({
       sync: () => handle.sync(),
       stat: () => handle.stat(),
       close: () => handle.close(),
+      endsMidLine: () => fileEndsMidLine(path, handle),
     };
   },
 });
+
+function withNewlineFirst(bytes: Uint8Array): Uint8Array {
+  const payload = new Uint8Array(bytes.length + 1);
+  payload[0] = NEWLINE;
+  payload.set(bytes, 1);
+  return payload;
+}
+
+/** Whether to write a newline before the record: only when the handle says, for certain, that a line was left unterminated. */
+async function mustTerminateFirst(handle: AuditFileHandle): Promise<boolean> {
+  if (handle.endsMidLine === undefined) return false;
+  try {
+    return (await handle.endsMidLine()) === true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * `O_NONBLOCK` (WP330-V1-02): opening a FIFO for writing with no reader would
@@ -231,9 +295,10 @@ function errorCode(error: unknown): string | undefined {
 /**
  * An append-only JSON Lines audit file. One `append` = open (`O_APPEND`,
  * `O_NOFOLLOW`, `O_NONBLOCK`; created `0600` when absent), check it is a
- * regular file, one write of the whole line, `fsync`, close; then, ALWAYS,
- * `fsync` of its directory (CX330-R2-01: whether this append created the file
- * or found it). `append` resolves only after both syncs.
+ * regular file, one write of the whole line (after a newline, when a line
+ * was left unterminated: WP330-V4-01), `fsync`, close; then, ALWAYS, `fsync`
+ * of its directory (CX330-R2-01: whether this append created the file or
+ * found it). `append` resolves only after both syncs.
  */
 export function createFileAuditLog(path: string, fileSystem: AuditFileSystem = NODE_AUDIT_FILE_SYSTEM): AuditSink {
   return Object.freeze({
@@ -249,10 +314,12 @@ export function createFileAuditLog(path: string, fileSystem: AuditFileSystem = N
       if (bytes.length > MAX_AUDIT_LINE_BYTES) throw new AuditUnavailableError("RECORD_TOO_LARGE", path);
 
       let handle: AuditFileHandle;
+      let created = true;
       try {
         handle = await fileSystem.open(path, CREATE_FLAGS, FILE_MODE);
       } catch (error) {
         if (errorCode(error) !== "EEXIST") throw new AuditUnavailableError("OPEN_FAILED", path);
+        created = false;
         try {
           handle = await fileSystem.open(path, APPEND_FLAGS, FILE_MODE);
         } catch {
@@ -267,13 +334,16 @@ export function createFileAuditLog(path: string, fileSystem: AuditFileSystem = N
           regular = false;
         }
         if (!regular) throw new AuditUnavailableError("NOT_A_REGULAR_FILE", path);
+        // A fragment left by a short write or a crash is ended first, in the same write, so this record
+        // is never joined to it (WP330-V4-01). A file this append created is empty: nothing to end.
+        const payload = !created && (await mustTerminateFirst(handle)) ? withNewlineFirst(bytes) : bytes;
         let written: number;
         try {
-          written = (await handle.write(bytes)).bytesWritten;
+          written = (await handle.write(payload)).bytesWritten;
         } catch {
           throw new AuditUnavailableError("WRITE_FAILED", path);
         }
-        if (written !== bytes.length) throw new AuditUnavailableError("SHORT_WRITE", path);
+        if (written !== payload.length) throw new AuditUnavailableError("SHORT_WRITE", path);
         try {
           await handle.sync();
         } catch {
@@ -341,7 +411,9 @@ export interface NotDurableAppend {
  * sequence number and is kept in {@link AuditTrail.notDurable}, so the log
  * never holds two lines with one number, and the output and the OUTCOME
  * record can name the line that is there but not durable (WP-330 r3,
- * WP330-V3-01). A refusal before any byte was written (too large, not
+ * WP330-V3-01). After a short write that line is only a fragment: a line of
+ * its own that does not parse, because the file sink's next append starts a
+ * new line after it (WP-330 r4, WP330-V4-01). A refusal before any byte was written (too large, not
  * encodable, not opened) spends nothing: the OUTCOME written again without
  * its detail keeps the number.
  */

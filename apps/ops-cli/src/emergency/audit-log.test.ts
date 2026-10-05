@@ -6,7 +6,7 @@
 
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -394,5 +394,111 @@ describe("WP-330 r3 (WP330-V3-01): an append that failed after its write may lea
       expect(records.map((entry) => entry.sequence), code).toEqual([0, 1]);
       expect(trail.notDurable(), code).toEqual([]);
     }
+  });
+});
+
+describe("WP-330 r4 (WP330-V4-01): a line left unterminated is ended before the next record, so no record is joined to a fragment", () => {
+  /** The real file system, but the `cut`-th write to `file` writes only half its bytes (a SHORT_WRITE); every other call is the real one. */
+  function halfWrite(file: string, cut: number): AuditFileSystem {
+    let writes = 0;
+    return {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        if (target !== file) return handle;
+        return {
+          ...handle,
+          write: (data: Uint8Array) => {
+            writes += 1;
+            return handle.write(writes === cut ? data.subarray(0, Math.floor(data.length / 2)) : data);
+          },
+        };
+      },
+    };
+  }
+
+  /** Each line of the file: the record's sequence, or FRAGMENT for a line that does not parse. */
+  async function lineKinds(file: string): Promise<(number | "FRAGMENT" | "EMPTY")[]> {
+    const text = await readFile(file, "utf8");
+    expect(text.endsWith("\n")).toBe(true);
+    return text
+      .slice(0, -1)
+      .split("\n")
+      .map((line) => {
+        if (line === "") return "EMPTY";
+        try {
+          return (JSON.parse(line) as AuditRecord).sequence;
+        } catch {
+          return "FRAGMENT";
+        }
+      });
+  }
+
+  it("a SHORT_WRITE leaves a fragment; the next append (this invocation's, then a later one's) starts a new line, and its record parses", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const log = createFileAuditLog(file, halfWrite(file, 2));
+    await log.append(record(0));
+    await expect(log.append(record(1))).rejects.toMatchObject({ code: "SHORT_WRITE", lineMayBeInLog: true });
+    await log.append(record(2));
+    await createFileAuditLog(file).append(record(3)); // a later invocation, the plain real sink
+    expect(await lineKinds(file)).toEqual([0, "FRAGMENT", 2, 3]);
+    // The fragment is exactly the half that reached the file: the newline that ends it is the next append's.
+    const lines = (await readFile(file, "utf8")).split("\n");
+    expect(encodeAuditLine(record(1)).startsWith(lines[1] ?? "")).toBe(true);
+  });
+
+  it("a fragment left by anything else (a crash in the middle of a write): the next append starts a new line", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    await writeFile(file, `${encodeAuditLine(record(0))}${encodeAuditLine(record(1)).slice(0, 40)}`, { mode: 0o600 });
+    await createFileAuditLog(file).append(record(2));
+    expect(await lineKinds(file)).toEqual([0, "FRAGMENT", 2]);
+  });
+
+  it("CONTROL: a file that ends in a newline gets no empty line; the log's bytes are exactly its lines", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const log = createFileAuditLog(file);
+    await log.append(record(0));
+    await log.append(record(1));
+    await createFileAuditLog(file).append(record(2));
+    expect(await readFile(file, "utf8")).toBe([0, 1, 2].map((sequence) => encodeAuditLine(record(sequence))).join(""));
+  });
+
+  it("the check reads only the file it writes: a path that now names ANOTHER file (one that ends mid-line) is not read, and nothing is added", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    await writeFile(file, encodeAuditLine(record(0)), { mode: 0o600 });
+    const handle = await NODE_AUDIT_FILE_SYSTEM.open(file, fsConstants.O_WRONLY | fsConstants.O_APPEND, 0o600);
+    try {
+      expect(await handle.endsMidLine?.()).toBe(false);
+      // The path is swapped for another file whose last byte is not a newline; the descriptor still writes the first.
+      const other = path.join(scratch, "other.jsonl");
+      await writeFile(other, "partial", { mode: 0o600 });
+      await rename(other, file);
+      expect(await handle.endsMidLine?.()).toBe(false);
+      // CONTROL: a descriptor opened on that other file does see its unterminated line.
+      const fresh = await NODE_AUDIT_FILE_SYSTEM.open(file, fsConstants.O_WRONLY | fsConstants.O_APPEND, 0o600);
+      try {
+        expect(await fresh.endsMidLine?.()).toBe(true);
+      } finally {
+        await fresh.close();
+      }
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("an empty file, or one the check cannot read, is written as before: no newline is added", async () => {
+    const empty = path.join(scratch, "empty.jsonl");
+    await writeFile(empty, "", { mode: 0o600 });
+    await createFileAuditLog(empty).append(record(0));
+    expect(await readFile(empty, "utf8")).toBe(encodeAuditLine(record(0)));
+    // A handle whose check fails: the append goes on, unchanged (the check never stops an emergency action).
+    const failing = path.join(scratch, "failing.jsonl");
+    await writeFile(failing, "partial", { mode: 0o600 });
+    await createFileAuditLog(failing, {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        return { ...handle, endsMidLine: () => Promise.reject(new Error("EACCES")) };
+      },
+    }).append(record(0));
+    expect(await readFile(failing, "utf8")).toBe(`partial${encodeAuditLine(record(0))}`);
   });
 });

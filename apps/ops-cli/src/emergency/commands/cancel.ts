@@ -23,6 +23,15 @@
  * waiting for the cancel bucket's debt (D-21); then it reads once more.
  * It never retries beyond that one sweep: what is still listed is reported.
  *
+ * THE BATCH SIZE IS RECOMPUTED BEFORE EVERY BATCH (WP-330 r4, CX330-R4-01),
+ * from the tier the venue last reported (`Poly-RateLimit-Tier`, applied by
+ * WP-310) and the snapshot in effect then, never carried over from the plan.
+ * A batch the budget still refuses UNSENT as larger than the cancel bucket
+ * can ever admit (`COST_EXCEEDS_CAPACITY`: the capacity fell while it waited,
+ * e.g. a later snapshot took effect) is rebuilt at the capacity now, when
+ * that is smaller, at most {@link MAX_SWEEP_RESPLITS} times per sweep; the
+ * cursor advances only past ids a SENT request carried.
+ *
  * THE OUTCOME RECORD IS BOUNDED BY CONSTRUCTION (WP-330 r1, WP330-V1-01),
  * whatever the number of orders and batches: {@link auditAttempts} records
  * totals over every attempt, itemizes at most {@link MAX_AUDITED_ATTEMPTS}
@@ -62,6 +71,16 @@ export interface CancelAttempt {
   readonly effects: readonly BudgetEffect[];
   /** No answer came within `venueAnswerBoundMs`: the outcome is UNKNOWN, and may still apply. */
   readonly unanswered?: boolean;
+  /** The budget's refusal code, when it refused the request (unsent). */
+  readonly budgetRefusal?: string;
+  /**
+   * A by-id sweep batch the budget refused UNSENT as larger than the cancel
+   * bucket can ever admit, after the capacity fell: its ids were split again,
+   * at most this many per batch, into the attempts that follow (WP-330 r4,
+   * CX330-R4-01). Nothing was sent by it, and the attempts that carry its ids
+   * decide the result, not it.
+   */
+  readonly resplitTo?: number;
 }
 
 /**
@@ -82,7 +101,18 @@ async function sendCancel(
       acquired.kind === "REFUSED"
         ? `the rate-limit budget refused it (${acquired.code}: ${acquired.message})`
         : `the cancel bucket would not admit it within maxBudgetWaitMs (${String(session.configuration.maxBudgetWaitMs)} ms)${acquired.wakeAtMs === null ? "" : `; earliest grant ${new Date(acquired.wakeAtMs).toISOString()}`}`;
-    return { endpoint, operationId: request.operationId, requested, sent: false, notSent, waitedMs: acquired.kind === "TIMED_OUT" ? acquired.waitedMs : 0, outcome: null, canceledCount: null, effects: [] };
+    return {
+      endpoint,
+      operationId: request.operationId,
+      requested,
+      sent: false,
+      notSent,
+      waitedMs: acquired.kind === "TIMED_OUT" ? acquired.waitedMs : 0,
+      outcome: null,
+      canceledCount: null,
+      effects: [],
+      ...(acquired.kind === "REFUSED" ? { budgetRefusal: acquired.code } : {}),
+    };
   }
   let outcome: CancelOutcome;
   let unanswered = false;
@@ -107,6 +137,11 @@ function errorText(error: { readonly kind: string; readonly httpStatus: number |
 /** The RESULT lines of one attempt: canceled, and every not-canceled order with its reason (ADR-008 §6). */
 function describeAttempt(attempt: CancelAttempt): string[] {
   const head = `${attempt.endpoint}${attempt.requested === null ? "" : ` (${String(attempt.requested.length)} id${attempt.requested.length === 1 ? "" : "s"})`}`;
+  if (!attempt.sent && attempt.resplitTo !== undefined) {
+    return [
+      `${head}: NOT SENT: ${attempt.notSent ?? "not granted"}; the cancel bucket's capacity fell while it waited, so its ids were split again into batches of at most ${String(attempt.resplitTo)} (below)`,
+    ];
+  }
   if (!attempt.sent) return [`${head}: NOT SENT: ${attempt.notSent ?? "not granted"}`];
   const sent = `${head}: sent${attempt.waitedMs > 0 ? ` after waiting ${String(attempt.waitedMs)} ms for the rate-limit budget` : ""}`;
   const outcome = attempt.outcome;
@@ -158,6 +193,8 @@ function auditAttempt(attempt: CancelAttempt): AuditValue {
     canceledCount: attempt.canceledCount,
     budgetEffects: attempt.effects.slice(0, MAX_AUDITED_EFFECTS).map((effect) => auditText(effect.kind, MAX_AUDITED_CODE_LENGTH)),
     budgetEffectCount: attempt.effects.length,
+    // Split again at this batch size: its ids are carried by the attempts after it (CX330-R4-01).
+    resplitTo: attempt.resplitTo ?? null,
   };
 }
 
@@ -166,9 +203,11 @@ function auditAttempt(attempt: CancelAttempt): AuditValue {
  * bounded by construction whatever their number (WP330-V1-01):
  *
  * - `attempts`: totals over EVERY attempt (sent, each answer kind, no answer
- *   in time, ids requested, canceled counts passed to the budget), and the
- *   first {@link MAX_AUDITED_ATTEMPTS} attempts itemized (`truncated` says
- *   whether more were made);
+ *   in time, ids requested, canceled counts passed to the budget, batches
+ *   split again), and the first {@link MAX_AUDITED_ATTEMPTS} attempts
+ *   itemized (`truncated` says whether more were made). `requestedIds` does
+ *   not count a batch that was split again (`resplit`): the attempts after it
+ *   carry its ids, and are counted;
  * - `canceled`: every id the venue answered canceled, over all attempts: the
  *   count, and the first `MAX_AUDITED_IDS` ids;
  * - `notCanceled`: every entry the venue answered not canceled, over all
@@ -186,7 +225,12 @@ export function auditAttempts(attempts: readonly CancelAttempt[]): { readonly [k
   let canceledCountMissing = 0;
   let canceledTotal = 0;
   let notCanceledTotal = 0;
+  let resplit = 0;
   for (const attempt of attempts) {
+    if (attempt.resplitTo !== undefined) {
+      resplit += 1;
+      continue;
+    }
     if (attempt.requested !== null) requestedIds += attempt.requested.length;
     if (!attempt.sent) continue;
     sent += 1;
@@ -223,6 +267,7 @@ export function auditAttempts(attempts: readonly CancelAttempt[]): { readonly [k
       requestedIds,
       canceledCountPassed,
       canceledCountMissing,
+      resplit,
       itemized: attempts.slice(0, MAX_AUDITED_ATTEMPTS).map(auditAttempt),
       truncated: attempts.length > MAX_AUDITED_ATTEMPTS,
     },
@@ -263,13 +308,16 @@ function nothingApplied(attempts: readonly CancelAttempt[]): boolean {
  * 3. no verification: the answers alone. Any answer UNKNOWN: `UNKNOWN`; any
  *    request unsent, refused, or naming an order not canceled:
  *    `NOT_ALL_CANCELED`; every answer COMPLETED with nothing not canceled:
- *    `COMPLETED`.
+ *    `COMPLETED`. A batch split again (`resplitTo`) is judged by the attempts
+ *    that carry its ids, not by itself (CX330-R4-01).
  */
 export function cancelExit(attempts: readonly CancelAttempt[], verification: { readonly verified: true; readonly stillOpen: number } | { readonly verified: false }): ExitName {
   if (nothingApplied(attempts)) return "VENUE_REFUSED";
   if (verification.verified) return verification.stillOpen === 0 ? "COMPLETED" : "NOT_ALL_CANCELED";
   if (attempts.some((attempt) => attempt.sent && (attempt.outcome === null || attempt.outcome.kind === "UNKNOWN"))) return "UNKNOWN";
-  const allCompleted = attempts.every((attempt) => attempt.sent && attempt.outcome?.kind === "COMPLETED" && attempt.outcome.notCanceled.length === 0);
+  const allCompleted = attempts
+    .filter((attempt) => attempt.resplitTo === undefined)
+    .every((attempt) => attempt.sent && attempt.outcome?.kind === "COMPLETED" && attempt.outcome.notCanceled.length === 0);
   return allCompleted ? "COMPLETED" : "NOT_ALL_CANCELED";
 }
 
@@ -293,6 +341,74 @@ const ALWAYS_UNKNOWN = [
 
 // ---------------------------------------------------------------------------
 // cancel-all.
+
+/** At most this many sweep batches are split again in one cancel-all (CX330-R4-01); past it the sweep stops, and says why. */
+export const MAX_SWEEP_RESPLITS = 8;
+
+/**
+ * The by-id sweep of cancel-all (WP-310 follow_up 4; WP-330 r4, CX330-R4-01).
+ *
+ * - The batch size is read from the budget BEFORE EVERY BATCH: the tier the
+ *   venue has reported since the plan (on the cancel-all's own answer, or on
+ *   a batch's) and the snapshot in effect now. A size carried over from the
+ *   plan is refused as `COST_EXCEEDS_CAPACITY` once the tier falls, and would
+ *   strand every order still listed.
+ * - The cursor advances only past the ids of a request that was SENT.
+ * - A batch the budget refused UNSENT as `COST_EXCEEDS_CAPACITY` (its
+ *   capacity fell while it waited for its grant) is rebuilt from the same
+ *   cursor at the capacity now, only when that is strictly smaller than the
+ *   refused batch, and at most {@link MAX_SWEEP_RESPLITS} times per sweep.
+ *   Any other unsent batch stops the sweep, as before: nothing is retried.
+ *
+ * Every attempt, the refused batch included, goes into `attempts` (the
+ * output and the OUTCOME record); a rebuilt one carries `resplitTo`.
+ */
+async function sweepByIds(
+  session: VenueSession,
+  ids: readonly string[],
+  plannedSize: number,
+  attempts: CancelAttempt[],
+): Promise<{ readonly stopped: string | null; readonly resized: readonly string[] }> {
+  const resized: string[] = [];
+  const sizes = new Set<number>([plannedSize]);
+  let resplits = 0;
+  let cursor = 0;
+  while (cursor < ids.length) {
+    const capacity = session.budget.batchCapacity();
+    if ("problem" in capacity) return { stopped: capacity.problem, resized };
+    const basis = `tier ${capacity.tier}: cancel burst ${String(capacity.cancelBurst)} minus ${String(capacity.headroomPermille)}‰ headroom`;
+    if (capacity.maxEntries < 1) return { stopped: `no batch fits the cancel bucket (${basis})`, resized };
+    if (!sizes.has(capacity.maxEntries)) {
+      sizes.add(capacity.maxEntries);
+      resized.push(`the by-id batch size changed after the plan: at most ${String(capacity.maxEntries)} ids per DELETE /orders now (${basis})`);
+    }
+    const chunk = ids.slice(cursor, cursor + capacity.maxEntries);
+    const attempt = await sendCancel(
+      session,
+      { operationId: EMERGENCY_OPERATIONS.CANCEL_ORDERS, priority: CANCEL_PRIORITY, signer: session.identity.signerAddress, entries: chunk.length },
+      "DELETE /orders",
+      chunk,
+      () => session.venue.cancels.cancelOrders(chunk),
+      chunk.length,
+    );
+    if (attempt.sent) {
+      attempts.push(attempt);
+      cursor += chunk.length;
+      continue;
+    }
+    const now = session.budget.batchCapacity();
+    const smaller = attempt.budgetRefusal === "COST_EXCEEDS_CAPACITY" && !("problem" in now) && now.maxEntries >= 1 && now.maxEntries < chunk.length;
+    if (smaller && resplits < MAX_SWEEP_RESPLITS) {
+      resplits += 1;
+      attempts.push({ ...attempt, resplitTo: now.maxEntries });
+      continue;
+    }
+    attempts.push(attempt);
+    const why = attempt.notSent ?? "not granted";
+    return { stopped: smaller ? `${why}; ${String(MAX_SWEEP_RESPLITS)} batches were already split again in this sweep` : why, resized };
+  }
+  return { stopped: null, resized };
+}
 
 export async function runCancelAll(context: CommandContext, session: VenueSession): Promise<CommandResult> {
   const { parsed, printer } = context;
@@ -323,7 +439,7 @@ export async function runCancelAll(context: CommandContext, session: VenueSessio
   plan.push(
     "problem" in capacity
       ? `then: re-read the open orders; NO by-id sweep is possible (${capacity.problem})`
-      : `then: re-read the open orders; cancel every order still listed by id (DELETE /orders, ${EMERGENCY_OPERATIONS.CANCEL_ORDERS} at ${CANCEL_PRIORITY}) in batches of at most ${String(capacity.maxEntries)} ids (tier ${capacity.tier}: cancel burst ${String(capacity.cancelBurst)} minus ${String(capacity.headroomPermille)}‰ headroom; at most 1,000 per C-11); then read once more`,
+      : `then: re-read the open orders; cancel every order still listed by id (DELETE /orders, ${EMERGENCY_OPERATIONS.CANCEL_ORDERS} at ${CANCEL_PRIORITY}) in batches of at most ${String(capacity.maxEntries)} ids (tier ${capacity.tier}: cancel burst ${String(capacity.cancelBurst)} minus ${String(capacity.headroomPermille)}‰ headroom; at most 1,000 per C-11), the size recomputed before each batch from the tier the venue reports and the snapshot then in effect; then read once more`,
     "nothing else is read or written: no trader state, no trader process, no database, no fencing lease (handoff §14.2)",
     `scope to confirm: ${scope}`,
   );
@@ -357,21 +473,11 @@ export async function runCancelAll(context: CommandContext, session: VenueSessio
   let final = after;
   const sweepIds = after.kind === "READ" ? after.value.map((order) => order.venueOrderId) : [];
   let sweepStopped: string | null = null;
+  const resized: string[] = [];
   if (sweepIds.length > 0) {
-    if (batchSize < 1) sweepStopped = "problem" in capacity ? capacity.problem : "no batch fits the cancel bucket";
-    for (let start = 0; start < sweepIds.length && sweepStopped === null; start += batchSize) {
-      const chunk = sweepIds.slice(start, start + batchSize);
-      const attempt = await sendCancel(
-        session,
-        { operationId: EMERGENCY_OPERATIONS.CANCEL_ORDERS, priority: CANCEL_PRIORITY, signer: session.identity.signerAddress, entries: chunk.length },
-        "DELETE /orders",
-        chunk,
-        () => session.venue.cancels.cancelOrders(chunk),
-        chunk.length,
-      );
-      attempts.push(attempt);
-      if (!attempt.sent) sweepStopped = attempt.notSent;
-    }
+    const swept = await sweepByIds(session, sweepIds, batchSize, attempts);
+    sweepStopped = swept.stopped;
+    resized.push(...swept.resized);
     final = await readChecked(() => session.reads.listOpenOrders(), checkOpenOrders);
   }
 
@@ -379,6 +485,7 @@ export async function runCancelAll(context: CommandContext, session: VenueSessio
   for (const attempt of attempts) result.push(...describeAttempt(attempt));
   result.push(listedText(after, "venue truth after DELETE /cancel-all"));
   if (sweepIds.length > 0) {
+    result.push(...resized);
     if (sweepStopped !== null) result.push(`the by-id sweep stopped: ${sweepStopped}`);
     result.push(listedText(final, "venue truth after the by-id sweep"));
   }

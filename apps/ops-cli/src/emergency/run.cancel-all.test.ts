@@ -5,11 +5,21 @@
  * D-21 debt, and batch cancels split to at most the burst minus headroom.
  */
 
-import { RateLimitBudget, type Grant, type GrantCompletion } from "@polymarket-bot/polymarket-secure";
-import { installNetworkTripwire, type NetworkTripwire } from "@polymarket-bot/polymarket-secure/testing";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RateLimitBudget, type Grant, type GrantCompletion, type SecureVenueClient, type SignerGateContext } from "@polymarket-bot/polymarket-secure";
+import {
+  createFakeSdkFactory,
+  createMockSignerHandle,
+  createSecureVenueClientForTesting,
+  installNetworkTripwire,
+  MOCK_SIGNER_ADDRESS,
+  type FakeSdkScript,
+  type NetworkTripwire,
+} from "@polymarket-bot/polymarket-secure/testing";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 
 import type { AuditMirror, AuditRecord } from "./audit-log.js";
+import { EmergencyBudget, type AcquireResult } from "./budget.js";
+import { MAX_SWEEP_RESPLITS } from "./commands/cancel.js";
 import { EXIT_CODES } from "./exit-codes.js";
 import {
   ACCOUNT,
@@ -22,9 +32,12 @@ import {
   rateLimited,
   refusedUnapplied,
   SIGNER,
+  T0,
   testConfiguration,
   transportFailure,
+  type Harness,
 } from "./harness.test-support.js";
+import type { EmergencyVenueFactory } from "./ports.js";
 import { runOpsCli } from "./run.js";
 
 let tripwire: NetworkTripwire;
@@ -318,8 +331,9 @@ describe("the RESULT and the exit say exactly what happened", () => {
       requestedIds: 0,
       canceledCountPassed: 2,
       canceledCountMissing: 0,
+      resplit: 0,
       itemized: [
-        expect.objectContaining({ endpoint: "DELETE /cancel-all", operationId: "clob.cancel_all", requested: null, sent: true, answer: "COMPLETED", canceled: 2, notCanceled: 0, canceledCount: 2 }),
+        expect.objectContaining({ endpoint: "DELETE /cancel-all", operationId: "clob.cancel_all", requested: null, sent: true, answer: "COMPLETED", canceled: 2, notCanceled: 0, canceledCount: 2, resplitTo: null }),
       ],
       truncated: false,
     });
@@ -344,5 +358,229 @@ describe("the RESULT and the exit say exactly what happened", () => {
     expect((await runOpsCli(unverified.deps(cancelAll(...CONFIRM)))).exitName).toBe("COMPLETED");
     expect(unverified.audit.records.at(-1)?.detail["verified"]).toBe(false);
     expect(unverified.text()).toContain("the account's open orders after the cancels: the read failed");
+  });
+});
+
+describe("WP-330 r4 (CX330-R4-01): the sweep's batch size is recomputed before every batch (WP-310 follow_up 4), through WP-260's client and WP-310's real budget", () => {
+  /** Bronze (cancel burst 240) assumed by the operator's snapshot: a venue that reports Standard (120) LOWERS the tier. */
+  const bronzeAssumed = (): ReturnType<typeof testConfiguration> =>
+    testConfiguration({ rateLimitSnapshots: [contractSnapshot({ assumedSignerTier: "Bronze" })], maxBudgetWaitMs: 60_000 });
+
+  /**
+   * The cancels are WP-260's client over its fake SDK and key-less mock signer (as in secure-client.test.ts); the
+   * reads are the harness's. `reportTier` delivers a tier on the cancel bucket the way the SDK's `onRateLimitUpdate`
+   * does (`Poly-RateLimit-Tier`), through the listener WP-260 handed the SDK, to the CLI's real budget.
+   */
+  function secureTierVenue(h: Harness, script: (reportTier: (tier: string) => void) => FakeSdkScript): EmergencyVenueFactory {
+    let listener: ((tier: string) => void) | null = null;
+    const reportTier = (tier: string): void => {
+      if (listener === null) throw new Error("the SDK was never built");
+      listener(tier);
+    };
+    const sdk = createFakeSdkFactory(script(reportTier));
+    return {
+      open: async ({ gate, onRateLimitUpdate }: { readonly gate: SignerGateContext; readonly onRateLimitUpdate: Parameters<EmergencyVenueFactory["open"]>[0]["onRateLimitUpdate"] }) => {
+        const cancels: SecureVenueClient = await createSecureVenueClientForTesting({ runModeContext: { ...gate }, signer: createMockSignerHandle().handle, onRateLimitUpdate }, sdk.factory);
+        const handed = sdk.recorder.factoryCalls[0]?.onRateLimitUpdate;
+        if (handed === undefined) throw new Error("WP-260 handed the SDK no rate-limit listener");
+        listener = (tier) => handed({ bucket: "cancel", tier, warning: false });
+        return { kind: "OPEN" as const, venue: { cancels, reads: h.venue.reads } };
+      },
+    };
+  }
+
+  /** The SDK's cancelOrders over the harness's orders: every id canceled; the batch sizes recorded. */
+  function cancelOrdersApplying(h: Harness, batches: number[], after?: (batch: number) => void): NonNullable<FakeSdkScript["cancelOrders"]> {
+    return (request: { orderIds: string[] }) => {
+      batches.push(request.orderIds.length);
+      for (const id of request.orderIds) {
+        const entry = h.venue.orders.get(id);
+        if (entry !== undefined) entry.status = "CANCELED";
+      }
+      after?.(batches.length);
+      return { canceled: request.orderIds, notCanceled: {} } as never;
+    };
+  }
+
+  function batchRequests(requests: MockInstance<RateLimitBudget["request"]>): unknown[] {
+    return requests.mock.calls.filter(([request]) => request.operationId === "clob.cancel_orders").map(([request]) => request);
+  }
+
+  function refusedRequests(requests: MockInstance<RateLimitBudget["request"]>, polls: MockInstance<RateLimitBudget["poll"]>): string[] {
+    const atRequest = requests.mock.results.flatMap((result) => (result.type === "return" && result.value.kind === "REFUSED" ? [result.value.refusal.code] : []));
+    const atPoll = polls.mock.results.flatMap((result) => (result.type === "return" ? result.value.flatMap((event) => (event.kind === "REFUSED" ? [event.refusal.code] : [])) : []));
+    return [...atRequest, ...atPoll];
+  }
+
+  it("a LOWER tier reported on the cancel-all's own (lost) answer: 300 orders are swept at Standard's 120 (120, 120, 60), every order canceled, nothing refused", async () => {
+    const requests = vi.spyOn(RateLimitBudget.prototype, "request");
+    const polls = vi.spyOn(RateLimitBudget.prototype, "poll");
+    const completions = vi.spyOn(RateLimitBudget.prototype, "complete");
+    const h = harness({ configuration: bronzeAssumed() });
+    const listed = ids("t", 300);
+    h.venue.add(...listed.map((id) => order(id)));
+    const batches: number[] = [];
+    const venues = secureTierVenue(h, (reportTier) => ({
+      cancelAll: () => {
+        reportTier("Standard");
+        throw new Error("simulated lost cancel-all answer");
+      },
+      cancelOrders: cancelOrdersApplying(h, batches),
+    }));
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM), { venues }));
+    expect(batches).toEqual([120, 120, 60]);
+    expect(h.venue.open()).toEqual([]);
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(refusedRequests(requests, polls)).toEqual([]);
+    expect(h.text()).not.toContain("COST_EXCEEDS_CAPACITY");
+    // The plan said Bronze's 240; the sweep followed the tier the venue reported, and said so.
+    expect(h.text()).toContain("in batches of at most 240 ids (tier Bronze: cancel burst 240 minus 0‰ headroom");
+    expect(h.text()).toContain("the by-id batch size changed after the plan: at most 120 ids per DELETE /orders now (tier Standard: cancel burst 120 minus 0‰ headroom)");
+    // EMERGENCY_CANCEL, the entry count, and the canceled count, batch by batch (WP-310 follow_up 4, OP-R1-09).
+    expect(batchRequests(requests)).toEqual([120, 120, 60].map((entries) => ({ operationId: "clob.cancel_orders", priority: "EMERGENCY_CANCEL", signer: MOCK_SIGNER_ADDRESS, entries })));
+    const counts = completions.mock.calls.filter(([grant]) => (grant as Grant).operationId === "clob.cancel_orders").map(([, completion]) => (completion as GrantCompletion).canceledCount);
+    expect(counts).toEqual([120, 120, 60]);
+    expect(phases(h.audit.records)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+    expect(h.audit.records.at(-1)?.detail["attempts"]).toMatchObject({ count: 4, sent: 4, requestedIds: 300, resplit: 0 });
+  });
+
+  it("the same with 200 orders (more than Standard's 120, fewer than Bronze's 240): 120, then 80", async () => {
+    const h = harness({ configuration: bronzeAssumed() });
+    h.venue.add(...ids("u", 200).map((id) => order(id)));
+    const batches: number[] = [];
+    const venues = secureTierVenue(h, (reportTier) => ({
+      cancelAll: () => {
+        reportTier("Standard");
+        throw new Error("simulated lost cancel-all answer");
+      },
+      cancelOrders: cancelOrdersApplying(h, batches),
+    }));
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM), { venues }));
+    expect(batches).toEqual([120, 80]);
+    expect(h.venue.open()).toEqual([]);
+    expect(outcome.exitName).toBe("COMPLETED");
+  });
+
+  it("a LOWER tier reported on the FIRST batch's answer: the batches after it are split at the new size (240, then 120, 120, 120)", async () => {
+    const requests = vi.spyOn(RateLimitBudget.prototype, "request");
+    const polls = vi.spyOn(RateLimitBudget.prototype, "poll");
+    const h = harness({ configuration: bronzeAssumed() });
+    const listed = ids("v", 600);
+    h.venue.add(...listed.map((id) => order(id)));
+    const batches: number[] = [];
+    let report: ((tier: string) => void) | null = null;
+    const venues = secureTierVenue(h, (reportTier) => {
+      report = reportTier;
+      return {
+        cancelAll: () => {
+          throw new Error("simulated lost cancel-all answer");
+        },
+        cancelOrders: cancelOrdersApplying(h, batches, (batch) => {
+          if (batch === 1) report?.("Standard");
+        }),
+      };
+    });
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM), { venues }));
+    expect(batches).toEqual([240, 120, 120, 120]);
+    expect(h.venue.open()).toEqual([]);
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(refusedRequests(requests, polls)).toEqual([]);
+  });
+
+  /** The dated snapshot, then the same with a 500‰ emergency headroom taking effect 1 s after T0: the batch falls from 120 to 60. */
+  function headroomRaisedAt(effectiveMs: number): ReturnType<typeof testConfiguration> {
+    // The ladder's headroom may not fall from one class to the next (WP-310): every class below the emergency one is raised with it.
+    const later = contractSnapshot({ headroomPermille: { ORDER_HEARTBEAT: 0, EMERGENCY_CANCEL: 500, RECONCILIATION_READ: 500, RISK_REDUCING_ORDER: 500, STALE_QUOTE_CANCEL: 500, NEW_ORDER: 500, METADATA_ANALYTICS: 500 } });
+    later["snapshotId"] = "wp330-r4-test-emergency-headroom";
+    later["effectiveFrom"] = new Date(effectiveMs).toISOString();
+    return testConfiguration({ rateLimitSnapshots: [contractSnapshot(), later], maxBudgetWaitMs: 60_000 });
+  }
+
+  it("the snapshot in effect changes WHILE a batch waits for its grant: the budget refuses it unsent (COST_EXCEEDS_CAPACITY), and only that batch is rebuilt at the new size; every id is sent exactly once", async () => {
+    const h = harness({ configuration: headroomRaisedAt(T0 + 1_000) });
+    const listed = ids("c", 300);
+    h.venue.add(...listed.map((id) => order(id)));
+    for (const id of listed) h.venue.ignoreCancelAll.add(id);
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM)));
+    const sent = h.venue.callsOf("cancelOrders").map((call) => call.args[0] as string[]);
+    expect(sent.map((batch) => batch.length)).toEqual([60, 60, 60, 60, 60]);
+    expect(sent.flat()).toEqual(listed); // in order, each once: the cursor moved only past ids a sent request carried
+    expect(h.venue.open()).toEqual([]);
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(h.text()).toContain(
+      "DELETE /orders (120 ids): NOT SENT: the rate-limit budget refused it (COST_EXCEEDS_CAPACITY: the token cost exceeds the bucket's burst capacity: split the request); the cancel bucket's capacity fell while it waited, so its ids were split again into batches of at most 60 (below)",
+    );
+    expect(h.text()).toContain("the by-id batch size changed after the plan: at most 60 ids per DELETE /orders now (tier Standard: cancel burst 120 minus 500‰ headroom)");
+    expect(h.text()).not.toContain("the by-id sweep stopped");
+    const attempts = h.audit.records.at(-1)?.detail["attempts"] as { itemized: Record<string, unknown>[] };
+    expect(attempts).toMatchObject({ count: 7, sent: 6, requestedIds: 300, resplit: 1, truncated: false });
+    expect(attempts.itemized[1]).toMatchObject({ endpoint: "DELETE /orders", requested: 120, sent: false, resplitTo: 60 });
+    expect(attempts.itemized.filter((entry) => entry["resplitTo"] !== null)).toHaveLength(1);
+  });
+
+  it("a rebuilt batch does not decide an UNVERIFIED exit: the final read fails, every sent answer is COMPLETED with nothing not canceled, so COMPLETED", async () => {
+    const h = harness({ configuration: headroomRaisedAt(T0 + 1_000) });
+    const listed = ids("n", 300);
+    h.venue.add(...listed.map((id) => order(id)));
+    for (const id of listed) h.venue.ignoreCancelAll.add(id);
+    let reads = 0;
+    h.venue.scripted.set("listOpenOrders", () => {
+      reads += 1;
+      if (reads >= 3) return Promise.reject(transportFailure("FETCH_ORDER"));
+      return {
+        route: "/data/orders",
+        complete: true,
+        orders: h.venue.open().map(({ venueOrderId, tokenId, side, price, originalSize, sizeMatched, status }) => ({ venueOrderId, tokenId, side, price, originalSize, sizeMatched, status })),
+      };
+    });
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM)));
+    expect(h.venue.callsOf("cancelOrders").map((call) => (call.args[0] as string[]).length)).toEqual([60, 60, 60, 60, 60]);
+    expect(h.audit.records.at(-1)?.detail).toMatchObject({ verified: false, attempts: { resplit: 1 } });
+    expect(outcome.exitName).toBe("COMPLETED");
+  });
+
+  /** Refuse every DELETE /orders at admission, as WP-310 does a batch above its capacity; `refusals` counts them. */
+  function refuseEveryBatch(): { readonly refusals: () => number } {
+    let refusals = 0;
+    const acquire = EmergencyBudget.prototype.acquire;
+    vi.spyOn(EmergencyBudget.prototype, "acquire").mockImplementation(function (this: EmergencyBudget, request): Promise<AcquireResult> {
+      if (request.operationId !== "clob.cancel_orders") return acquire.call(this, request);
+      refusals += 1;
+      return Promise.resolve({ kind: "REFUSED", code: "COST_EXCEEDS_CAPACITY", message: "the token cost exceeds the bucket's burst capacity: split the request" });
+    });
+    return { refusals: () => refusals };
+  }
+
+  it("a COST_EXCEEDS_CAPACITY refusal while the capacity has NOT fallen is not retried at the same size: the sweep stops at once and says why", async () => {
+    const refused = refuseEveryBatch();
+    const h = harness();
+    // More orders than one batch holds, so the refused batch is exactly the capacity (120): not rebuilt at 120 again.
+    h.venue.add(...ids("a", 130).map((id) => order(id)));
+    for (const entry of h.venue.open()) h.venue.ignoreCancelAll.add(entry.venueOrderId);
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM)));
+    expect(refused.refusals()).toBe(1);
+    expect(h.text()).toContain("DELETE /orders (120 ids): NOT SENT: the rate-limit budget refused it (COST_EXCEEDS_CAPACITY");
+    expect(h.text()).toContain("the by-id sweep stopped: the rate-limit budget refused it (COST_EXCEEDS_CAPACITY");
+    expect(h.audit.records.at(-1)?.detail["attempts"]).toMatchObject({ count: 2, resplit: 0 });
+    expect(outcome.exitName).toBe("NOT_ALL_CANCELED");
+  });
+
+  it(`the rebuilding is bounded: a capacity that keeps falling is followed at most MAX_SWEEP_RESPLITS (${String(MAX_SWEEP_RESPLITS)}) times, then the sweep stops and says so`, async () => {
+    const refused = refuseEveryBatch();
+    // Each refusal lowers the capacity by one id: every refused batch could be rebuilt smaller, forever but for the bound.
+    const capacity = EmergencyBudget.prototype.batchCapacity;
+    vi.spyOn(EmergencyBudget.prototype, "batchCapacity").mockImplementation(function (this: EmergencyBudget) {
+      const real = capacity.call(this);
+      return "problem" in real ? real : { ...real, maxEntries: real.maxEntries - refused.refusals() };
+    });
+    const h = harness();
+    h.venue.add(...ids("b", 130).map((id) => order(id)));
+    for (const entry of h.venue.open()) h.venue.ignoreCancelAll.add(entry.venueOrderId);
+    const outcome = await runOpsCli(h.deps(cancelAll(...CONFIRM)));
+    expect(refused.refusals()).toBe(MAX_SWEEP_RESPLITS + 1);
+    expect(h.text()).toContain(`; ${String(MAX_SWEEP_RESPLITS)} batches were already split again in this sweep`);
+    expect(h.audit.records.at(-1)?.detail["attempts"]).toMatchObject({ count: MAX_SWEEP_RESPLITS + 2, sent: 1, resplit: MAX_SWEEP_RESPLITS });
+    expect(h.venue.callsOf("cancelOrders")).toEqual([]);
+    expect(outcome.exitName).toBe("NOT_ALL_CANCELED");
   });
 });

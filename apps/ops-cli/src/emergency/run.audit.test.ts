@@ -704,3 +704,72 @@ describe("WP-330 r3 (WP330-V3-01): an append that failed after its write: the lo
     expect(h.text()).not.toContain("WITHOUT being durable");
   });
 });
+
+describe("WP-330 r4 (WP330-V4-01): a SHORT_WRITE leaves a fragment, and the record after it (this invocation's OUTCOME, or the next invocation's INVOKED) still parses on a line of its own", () => {
+  const cancelAll = (file: string): string[] => args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`, "--audit-log", file);
+
+  /** The real file system; the `cut`-th write to `file` (1-based) writes only half its bytes, as the verifiers' probes P1 and P6 did. */
+  function halfWrite(file: string, cut: number): AuditFileSystem {
+    let writes = 0;
+    return {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        if (target !== file) return handle;
+        return {
+          ...handle,
+          write: (data: Uint8Array) => {
+            writes += 1;
+            return handle.write(writes === cut ? data.subarray(0, Math.floor(data.length / 2)) : data);
+          },
+        };
+      },
+    };
+  }
+
+  /** Each line of the file, parsed, or FRAGMENT for a line that does not parse. */
+  async function lines(file: string): Promise<(AuditRecord | "FRAGMENT")[]> {
+    const text = await readFile(file, "utf8");
+    expect(text.endsWith("\n")).toBe(true);
+    return text
+      .slice(0, -1)
+      .split("\n")
+      .map((line) => {
+        try {
+          return JSON.parse(line) as AuditRecord;
+        } catch {
+          return "FRAGMENT" as const;
+        }
+      });
+  }
+
+  const shape = (entries: (AuditRecord | "FRAGMENT")[]): unknown[] => entries.map((entry) => (entry === "FRAGMENT" ? entry : [entry.phase, entry.sequence]));
+
+  it("probe P1: ACTING's write is cut short: exit 5, no cancel; the file is INVOKED, the ACTING fragment, and an OUTCOME that parses and lists it", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const h = harness();
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(h.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, halfWrite(file, 2)) }));
+    expect(outcome.exitName).toBe("AUDIT_UNAVAILABLE");
+    expect(h.venue.callsOf("cancelAll")).toEqual([]);
+    const found = await lines(file);
+    expect(shape(found)).toEqual([["INVOKED", 0], "FRAGMENT", ["OUTCOME", 2]]);
+    const last = found[2] as AuditRecord;
+    expect(last.detail).toMatchObject({ exit: "AUDIT_UNAVAILABLE", auditCode: "SHORT_WRITE", auditNotDurable: { count: 1, appends: [{ phase: "ACTING", sequence: 1, code: "SHORT_WRITE" }], truncated: false } });
+    expect(h.text()).toContain(`2 record(s) written and fsynced to ${file}`);
+    expect(h.text()).toContain(
+      "ACTING sequence 1 (SHORT_WRITE). Such a line records nothing done, and its sequence number is never reused. A SHORT_WRITE leaves only part of its line: a fragment that does not parse, on a line of its own, since the next append starts a new line after it",
+    );
+  });
+
+  it("probe P6: invocation 1's OUTCOME write is cut short (exit 18); invocation 2 cancels, and ALL its records parse, its INVOKED included", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    const first = harness();
+    first.venue.add(order("o-1"));
+    expect((await runOpsCli(first.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target, halfWrite(file, 3)) }))).exitName).toBe("OUTCOME_UNRECORDED");
+    expect(first.venue.callsOf("cancelAll")).toHaveLength(1);
+    const second = harness();
+    second.venue.add(order("o-2"));
+    expect((await runOpsCli(second.deps(cancelAll(file), { openAuditLog: (target) => createFileAuditLog(target) }))).exitName).toBe("COMPLETED");
+    expect(shape(await lines(file))).toEqual([["INVOKED", 0], ["ACTING", 1], "FRAGMENT", ["INVOKED", 0], ["ACTING", 1], ["OUTCOME", 2]]);
+  });
+});

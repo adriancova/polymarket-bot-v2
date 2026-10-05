@@ -208,6 +208,17 @@ log without being durable.
   `auditNotDurable`.
 - Such a line records nothing done. In particular, an `ACTING` line listed
   there sent nothing: a command acts only after its `ACTING` record is durable.
+- A short write (`SHORT_WRITE`) leaves only part of the line: a fragment that
+  does not parse. So may a crash in the middle of a write. The next append
+  reads the file's last byte, and when it is not a newline it writes one
+  before its record. The fragment then stays on a line of its own, and the
+  record after it parses, in the same invocation or a later one. This check
+  is best effort: when the file cannot be read, or its path now names another
+  file, the record is written as before.
+
+Read the log line by line. A line that does not parse is such a fragment and
+records nothing done; an empty line carries nothing (two invocations writing
+to one log at the same instant may leave one).
 
 The invocation's durable `OUTCOME` record is authoritative. When there is
 none, the exit code and the printed output are.
@@ -273,6 +284,14 @@ emergency credential.
 - **Batch size.** A `DELETE /orders` batch carries at most the cancel bucket's
   burst minus the emergency headroom. It never carries more than 1,000 ids
   (C-11). On the dated snapshot's Standard tier that is 120.
+  - The size is recomputed before every batch. It follows the tier the venue
+    reports (`Poly-RateLimit-Tier`, applied by WP-310), on the cancel-all's
+    answer or on any batch's, and the snapshot in effect at that instant. The
+    plan prints the size at plan time; the RESULT says when it changed.
+  - A batch the budget refuses unsent as `COST_EXCEEDS_CAPACITY`, because the
+    capacity fell while it waited (a later snapshot took effect), is split
+    again at the new size. This happens at most 8 times per sweep. Any other
+    batch that is not sent stops the sweep, and the output says why.
 - **Debt and waiting.** The plan prints the D-21 debt estimate. Every grant is
   waited for up to `maxBudgetWaitMs`. A request that would wait longer is not
   sent, and the output says so.

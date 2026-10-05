@@ -15,7 +15,9 @@
  * - **Batch size.** A batch cancel by id carries at most the cancel bucket's
  *   burst minus the emergency class's headroom ({@link EmergencyBudget.batchCapacity}),
  *   and never more than WP-260's `MAX_CANCEL_IDS_PER_REQUEST` (C-11): a larger
- *   batch "can never be admitted as one request" and WP-310 refuses it.
+ *   batch "can never be admitted as one request" and WP-310 refuses it. The
+ *   capacity follows the tier the venue reports and the snapshot in effect,
+ *   so cancel-all reads it again before every batch (CX330-R4-01).
  * - **Debt.** After a large cancel-all the cancel bucket may be in debt on
  *   the tiers that allow it (D-21). {@link EmergencyBudget.cancelDebtPlan}
  *   prints the estimate before acting, and {@link EmergencyBudget.acquire}

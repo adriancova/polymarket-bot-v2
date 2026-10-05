@@ -131,8 +131,12 @@ function notDurableLines(audit: AuditTrail): string[] {
   const failed = audit.notDurable();
   if (failed.length === 0) return [];
   const listed = failed.map((entry) => `${entry.phase} sequence ${String(entry.sequence)} (${entry.code})`).join("; ");
+  // WP330-V4-01: a short write leaves part of its line; the file sink starts its next record on a new line after it.
+  const fragment = failed.some((entry) => entry.code === "SHORT_WRITE")
+    ? ". A SHORT_WRITE leaves only part of its line: a fragment that does not parse, on a line of its own, since the next append starts a new line after it"
+    : "";
   return [
-    `${String(failed.length)} more line(s) may be in ${audit.location} WITHOUT being durable, because the append failed after its write: ${listed}. Such a line records nothing done, and its sequence number is never reused. This invocation's durable OUTCOME record, or, when there is none, this output and the exit, is authoritative`,
+    `${String(failed.length)} more line(s) may be in ${audit.location} WITHOUT being durable, because the append failed after its write: ${listed}. Such a line records nothing done, and its sequence number is never reused${fragment}. This invocation's durable OUTCOME record, or, when there is none, this output and the exit, is authoritative`,
   ];
 }
 
