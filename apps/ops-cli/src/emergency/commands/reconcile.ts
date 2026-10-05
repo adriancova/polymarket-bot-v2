@@ -36,12 +36,15 @@ import {
 
 import type { AuditValue } from "../audit-log.js";
 import { READ_PRIORITY } from "../budget.js";
-import type { CommandContext, CommandResult } from "../context.js";
+import { auditText, MAX_AUDITED_IDS, type CommandContext, type CommandResult } from "../context.js";
 import type { ProjectionSource } from "../ports.js";
 import { SECTIONS } from "../printer.js";
 import type { VenueSession } from "../session.js";
 
 const EMPTY: readonly never[] = Object.freeze([]);
+
+/** The longest break text (`<break class> <subject key>`) an OUTCOME record holds; the record is bounded by construction (WP330-V1-01). */
+export const MAX_AUDITED_BREAK_LENGTH = 300;
 
 function refusal<T>(code: OmsRefusalCode, message: string): OmsResult<T> {
   return Object.freeze({ ok: false as const, refusal: Object.freeze({ code, message, details: Object.freeze({}) }) });
@@ -223,12 +226,15 @@ export async function runReconcile(context: CommandContext, session: VenueSessio
   printer.section(SECTIONS.UNKNOWN, unknown);
 
   const notRun = report.runs.every((run) => run.status === "NOT_RUN");
-  const breaks: AuditValue = report.runs.flatMap((run) => run.detections.map((detection) => `${detection.breakClass} ${detection.subjectKey}`)).slice(0, 200);
+  const detected = report.runs.flatMap((run) => run.detections.map((detection) => `${detection.breakClass} ${detection.subjectKey}`));
+  // Bounded by construction: at most MAX_AUDITED_IDS breaks of bounded text; the count is always recorded.
+  const breaks: AuditValue = detected.slice(0, MAX_AUDITED_IDS).map((text) => auditText(text, MAX_AUDITED_BREAK_LENGTH));
   return {
     exit: notRun ? "READ_INCOMPLETE" : passed ? "COMPLETED" : "RECONCILE_BREAKS",
     result: {
       runs: report.runs.map((run) => ({ runId: run.runId, status: runs.find((view) => view.runId === run.runId)?.status ?? run.status, resumed: run.resumed })),
       breaks,
+      breakCount: detected.length,
       haltsRequested: halts.length,
       bookingsRefused: refusedBookings.length,
       journalEvents: events.length,

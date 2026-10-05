@@ -71,7 +71,7 @@ ops-cli reconcile                                    --account <ref> --operator 
 every command: [--audit-log <path>]  (else OPS_CLI_AUDIT_LOG; one of them is required)
 ```
 
-Each command prints, in order:
+A command the gate permits prints, in order:
 - **PLAN**: what will happen;
 - **CONFIRMATION**: for destructive commands;
 - **RESULT**: what happened;
@@ -79,7 +79,16 @@ Each command prints, in order:
 - **AUDIT**;
 - **OUTCOME**: the exit name and code.
 
-No section is ever left out; an empty one says `none`.
+A section it prints is never left empty silently: an empty one says `none`.
+
+Not every invocation reaches a command:
+- **Stopped before any command runs:** a usage error, no audit log, an
+  `INVOKED` record that cannot be written, or the gate's refusal. It prints no
+  PLAN, RESULT or UNKNOWN. It prints what stopped it (the usage, AUDIT, RUN
+  MODE, and stop-heartbeat's GUIDANCE), that nothing was read or sent, and the
+  OUTCOME.
+- **Stopped part-way:** its `ACTING` record cannot be written, or an unexpected
+  failure. It prints the sections it reached, what stopped it, and the OUTCOME.
 
 | Command | Venue endpoint (cited) | Verified afterwards by |
 | --- | --- | --- |
@@ -108,16 +117,19 @@ never waits.
 
 | Command | Scope text |
 | --- | --- |
-| `cancel-order` | `cancel-order:<venue-order-id>` |
-| `cancel-market` | `cancel-market:<condition-id>`, or `cancel-market:<condition-id>:<asset-id>` |
+| `cancel-order` | `cancel-order:<venue-order-id>@<account>` |
+| `cancel-market` | `cancel-market:<condition-id>@<account>`, or `cancel-market:<condition-id>:<asset-id>@<account>` |
 | `cancel-all` | `cancel-all:<account>` |
 | `stop-heartbeat` | `stop-heartbeat:<account>:<fencing-lease-id>`: the lease as read now. A confirmation for an older lease never matches |
+
+Every scope text names the account, so a scripted `--confirm` for one account
+is refused under another `--account`.
 
 ## Exit codes
 
 | Code | Name | Meaning |
 | --- | --- | --- |
-| 0 | `COMPLETED` | Everything asked for happened, as the answers and the verification read show |
+| 0 | `COMPLETED` | Everything asked for happened, as far as the evidence shows. For a cancel this is either a complete verification read, or, when that read failed, the answers alone (rule 3 below). The OUTCOME record's `verified` says which, and the UNKNOWN section names the failed read |
 | 1 | `INTERNAL_ERROR` | An unexpected failure. Treat the account as unknown, and run `account-snapshot` or `reconcile` |
 | 2 | `USAGE` | The arguments do not parse; nothing was done |
 | 3 | `CONFIRMATION_REFUSED` | No valid scoped confirmation; nothing was done |
@@ -135,6 +147,10 @@ never waits.
 | 15 | `NOTHING_TO_DO` | `stop-heartbeat` found no ACTIVE lease, or the lease ended before the revoke |
 | 16 | `DATABASE_UNAVAILABLE` | `stop-heartbeat` could not reach the lease store |
 | 17 | `CONFIGURATION_REFUSED` | The ops configuration is missing or invalid |
+| 18 | `OUTCOME_UNRECORDED` | The command ran, but its `OUTCOME` record could not be written. The output names the command's own outcome and is the only record of it. If the log holds this invocation's `ACTING` record, **the action may already have happened**: read the account (`account-snapshot`) before acting again |
+
+`OUTCOME_UNRECORDED` replaces the command's own exit whenever the `OUTCOME`
+record is missing, so exit 0 always means the outcome is on the record.
 
 A cancel command's exit is decided by the evidence, in this order:
 1. If every request was unsent or refused, the exit is `VENUE_REFUSED`.
@@ -144,7 +160,7 @@ A cancel command's exit is decided by the evidence, in this order:
    - any lost answer gives `UNKNOWN`;
    - any order answered not canceled, or any request not sent, gives
      `NOT_ALL_CANCELED`;
-   - otherwise the exit is `COMPLETED`.
+   - otherwise the exit is `COMPLETED`, unverified (`verified: false`).
 
 `cancel-order` treats a read by id that finds the order as its verification:
 `CANCELED`, or still open.
@@ -159,14 +175,35 @@ created with mode 0600, and its directory is `fsync`ed.
 
 | Record | When |
 | --- | --- |
-| `INVOKED` | After the gate is evaluated, before any configuration, credential, database or venue is touched. It carries the gate's verdict |
+| `INVOKED` | After the gate is evaluated, before any configuration, credential, lease store or venue is touched. It carries the gate's verdict |
 | `ACTING` | Immediately before the first cancel or the revoke. It carries the confirmed scope and the plan |
-| `OUTCOME` | After the result is known. It carries the exit, the attempts and bounded id lists |
+| `OUTCOME` | After the result is known, and before anything is released. It carries the exit, totals over every attempt, and bounded samples of the ids |
 
-A record that cannot be made durable stops the command before it acts. Records
-hold only allow-listed fields. WP-260's `redactForLog` runs over them, and the
-own-data JSON encoder writes the bytes. Do not paste a secret into `--reason`:
-it is free text, and it is recorded as typed.
+A record that cannot be made durable before acting stops the command
+(`AUDIT_UNAVAILABLE`). An `OUTCOME` that cannot be written exits
+`OUTCOME_UNRECORDED` (18), and the output says whether the command may already
+have acted.
+
+**Every record is bounded by construction** below 256 KiB, whatever the
+number of orders or batches. Ids keep the order-id alphabet and at most 200
+characters. An id list keeps 200 samples and its count. A cancel command's
+`OUTCOME` itemizes at most 20 attempts, by counts, with totals over all of
+them. Free text has a fixed length. A sweep of 3,000 orders keeps its full
+`OUTCOME`. Should a record still be too large, the `OUTCOME` is written with
+the exit alone and `detailOmitted: "RECORD_TOO_LARGE"`.
+
+The log's path must be a regular file. A symlink is refused, not followed
+(`O_NOFOLLOW`). A FIFO is refused at once, not waited on (`O_NONBLOCK`).
+
+Records hold only allow-listed fields. WP-260's `redactForLog` runs over them,
+and the own-data JSON encoder writes the bytes. `--reason` is free text,
+recorded as typed, with one exception: a reason that assigns a value to a
+credential-like name (`NAME=value` or `NAME: value`, where NAME reads as a key,
+token, secret, passphrase, signature or the like, by WP-260's
+`isSensitiveKey`) is refused as a usage error and is neither repeated nor
+recorded. `--account` and `--operator` are refused the same way. A bare secret
+with no name cannot be told from prose: do not paste one. A usage error repeats an unknown command or option only when it reads as
+a command word (lowercase letters and hyphens).
 
 When `OPS_CLI_DATABASE_URL` is set, each record is also appended to
 `ops.config_change_audit`, with the same id. The change kind is
@@ -214,7 +251,9 @@ emergency credential.
 No heartbeat transport exists in this repository, and this CLI writes none
 (ADR-033 D2, D5). `stop-heartbeat` revokes the ACTIVE fencing lease of the
 account in this process's run-mode realm, through WP-320's
-`FencingLeaseStore.revoke`. Then:
+`FencingLeaseStore.revoke`. It reads only that realm. When it finds no lease
+there, it says that other realms were not inspected: run it with the trader's
+`RUN_MODE`. Then:
 
 1. The holder's next renewal finds the lease LOST, and its fencing authority
    latches lost. At the latest this happens at its local deadline: at most
@@ -259,9 +298,12 @@ The file has schema `polymarket-bot/ops-cli-configuration@1` and four fields:
   the operator must add it, or approvals are not read.
 - `maxBudgetWaitMs`: the longest one rate-limit grant is waited for.
 - `venueAnswerBoundMs`: the longest one answer is waited for, from the venue,
-  the credential source or the venue binding. Past it, a cancel is UNKNOWN
-  (it may still apply) and a read is missing, never empty. The CLI never hangs
-  on a silent venue.
+  the credential source or the venue binding, and the longest the venue
+  client's release is waited for. Past it, a cancel is UNKNOWN (it may still
+  apply) and a read is missing, never empty. The CLI does not hang on a silent
+  venue: the venue client and the lease store (2 s) are released only after
+  the `OUTCOME` record is written, each bounded, and a release that does not
+  finish is reported and changes nothing.
 - `reconciliation`: the collateral asset, the three durations and the required
   spenders. It has no defaults.
 

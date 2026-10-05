@@ -20,6 +20,9 @@
  *   `scanEnvironmentForProductionNames`, the table the trader and the control
  *   API refuse a PAPER environment by), even with a value set.
  * - V3-E15: no Data API v1 route is named.
+ * - DOCUMENTATION (WP-330 r1, WP330-V1-03): three statements that claimed
+ *   more than the code does stay corrected; each corrected statement matches
+ *   behaviour pinned elsewhere.
  *
  * NON-VACUOUS: each detector flags a planted snippet.
  */
@@ -163,6 +166,30 @@ describe("the emergency CLI's production source", () => {
       const found = scan(readFileSync(file, "utf8"), file);
       expect(found.strings.filter((text) => DATA_API_V1.test(text)), path.relative(HERE, file)).toEqual([]);
     }
+  });
+
+  it("DOCUMENTATION (WP330-V1-03): the overclaims are gone, and the corrected statements are those the behaviour pins hold", () => {
+    // Comment text, flattened: no line breaks, no leading `*`.
+    const flat = (file: string): string =>
+      readFileSync(file, "utf8")
+        .replace(/\n\s*\*\s?/gu, " ")
+        .replace(/\s+/gu, " ");
+    const run = flat(path.join(HERE, "run.ts"));
+    const auditLog = flat(path.join(HERE, "audit-log.ts"));
+    const printer = flat(path.join(HERE, "printer.ts"));
+    const runbook = flat(path.resolve(SRC, "..", "..", "..", "docs", "runbooks", "emergency.md"));
+    // 1. A refused process with a database configured does write its audit copies there
+    //    (main.test.ts "an UNREACHABLE database"; test/integration/ops-cli "a PAPER refusal is mirrored").
+    expect(run).not.toContain("no configuration, credential, database or venue is touched by a process it refuses");
+    expect(run).toContain("their best-effort copies in `ops.config_change_audit`, which do connect to that database");
+    // 2. INVOKED is written once the (pure) gate has given its verdict (run.gate.test.ts).
+    expect(auditLog).not.toContain("`INVOKED` before the gate,");
+    expect(auditLog).toContain("`INVOKED` once WP-260's signer gate has given its verdict");
+    // 3. A refusal prints no PLAN, RESULT or UNKNOWN (test/unit/tooling/app-bundles-load.test.ts).
+    expect(printer).not.toContain("a section is never omitted");
+    expect(runbook).not.toContain("No section is ever left out");
+    expect(printer).toContain("it prints no PLAN, RESULT or UNKNOWN");
+    expect(runbook).toContain("It prints no PLAN, RESULT or UNKNOWN");
   });
 
   it("NON-VACUOUS: every detector flags a planted snippet", () => {

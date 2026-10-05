@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 
 import { scopeText } from "./confirmation.js";
-import { COMMANDS, DESTRUCTIVE_COMMANDS, parseArguments, READ_ONLY_COMMANDS, type ParsedCommand } from "./grammar.js";
+import { COMMANDS, DESTRUCTIVE_COMMANDS, echoToken, parseArguments, READ_ONLY_COMMANDS, type ParsedCommand } from "./grammar.js";
 
 const CONDITION = `0x${"a".repeat(64)}`;
 const BASE = ["--account", "acct-1", "--operator", "op-1"];
@@ -49,7 +49,7 @@ describe("well-formed invocations", () => {
   it("cancel-market <condition> --asset <token>, options in any order and in --name=value form", () => {
     const command = parsed(["--operator=op-1", "cancel-market", "--asset", "12345", CONDITION, "--account=acct-1", "--reason=x", "--dry-run", "--audit-log", "/var/log/a.jsonl"]);
     expect(command).toMatchObject({ command: "cancel-market", target: CONDITION, assetId: "12345", dryRun: true, auditLogPath: "/var/log/a.jsonl" });
-    expect(scopeText(command)).toBe(`cancel-market:${CONDITION}:12345`);
+    expect(scopeText(command)).toBe(`cancel-market:${CONDITION}:12345@acct-1`);
   });
 
   it("cancel-all, stop-heartbeat, account-snapshot and reconcile take no operand", () => {
@@ -101,6 +101,59 @@ describe("usage errors (nothing is done)", () => {
       expect(problem(argv)).toMatch(expected);
     });
   }
+
+  it("WP-330 r1 (CX330-R1-03): a --reason that assigns a value to a credential-like name is refused, and the problem repeats no part of it", () => {
+    const canary = "CANARY-v4lu3";
+    for (const reason of [
+      `apiKey=${canary}`,
+      `api_key = ${canary}`,
+      `passphrase: ${canary}`,
+      `{"secret":"${canary}"}`,
+      `'privateKey': ${canary}`,
+      `Authorization: Bearer ${canary}`,
+      `incident 9; signature=${canary}`,
+      `token: ${canary}`,
+      `Clob-Passphrase:${canary}`,
+    ]) {
+      const text = problem(["cancel-all", ...BASE, "--reason", reason]);
+      expect(text, reason).toMatch(/^--reason is refused: it assigns a value to a credential-like name/u);
+      expect(text, reason).not.toContain(canary);
+    }
+  });
+
+  it("an --account or --operator that reads as a credential pair is refused too, and is not carried into the usage error's audit record", () => {
+    expect(problem(["cancel-all", "--account", "apiKey:CANARY9", "--operator", "op-1", "--reason", "r"])).toMatch(/^--account is refused/u);
+    expect(problem(["cancel-all", "--account", "acct-1", "--operator", "secret:CANARY9", "--reason", "r"])).toMatch(/^--operator is refused/u);
+    const result = parseArguments(["cancel-all", "--account", "token:CANARY9", "--operator", "passphrase:CANARY9", "--reason", "r", "--yes"]);
+    expect(result).toMatchObject({ kind: "USAGE_ERROR", operator: null, accountRef: null });
+    expect(JSON.stringify(result)).not.toContain("CANARY9");
+    // Ordinary references, colons included, are untouched.
+    expect(parsed(["cancel-all", "--account", "acct:main@desk-2", "--operator", "ops.ana", "--reason", "r"])).toMatchObject({ accountRef: "acct:main@desk-2", operator: "ops.ana" });
+  });
+
+  it("a --reason that names no credential is accepted, as typed (the detector is WP-260's key-name heuristic, not a content filter)", () => {
+    for (const reason of [
+      "incident 42: stop all exposure",
+      "token 1111 is stuck; see runbook",
+      "tokenId: 1111 halted",
+      "asset_id=2222 halted",
+      "market: 0xabc, re: outage at 12:30",
+      "reconcile after https://status.example/incident",
+    ]) {
+      expect(parsed(["cancel-all", ...BASE, "--reason", reason]).reason, reason).toBe(reason);
+    }
+  });
+
+  it("WP-330 r1 (WP330-V1-05): an unknown command or option is repeated only when it reads as a command or option word", () => {
+    expect(echoToken("cancel-everything")).toBe("cancel-everything");
+    expect(echoToken("--all-markets")).toBe("--all-markets");
+    for (const token of ["0xdeadbeefSECRETKEY", "5f1c2a9e-0b7d-4e57-9a1e-3c2b1a0f9e8d", "abcDEF", "a".repeat(41), "--Key9SECRET", "über"]) {
+      expect(echoToken(token), token).toBe("(not repeated: it is not a command or option word)");
+    }
+    expect(problem(["0xdeadbeefSECRETKEY", ...BASE])).not.toContain("SECRETKEY");
+    expect(problem(["cancel-all", ...BASE, "--reason", "r", "--X9SECRETKEY=1"])).not.toContain("SECRETKEY");
+    expect(problem(["cancel-all", ...BASE, "--reason", "--X9SECRETKEY=1"])).not.toContain("SECRETKEY");
+  });
 
   it("a usage error still carries the audit path, operator and account it could read, so it is audited", () => {
     const result = parseArguments(["cancel-all", ...BASE, "--yes", "--audit-log", "/tmp/a.jsonl"]);

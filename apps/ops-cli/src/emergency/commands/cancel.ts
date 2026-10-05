@@ -22,16 +22,23 @@
  * bucket's burst minus the emergency headroom (≤ 1,000, C-11), each batch
  * waiting for the cancel bucket's debt (D-21); then it reads once more.
  * It never retries beyond that one sweep: what is still listed is reported.
+ *
+ * THE OUTCOME RECORD IS BOUNDED BY CONSTRUCTION (WP-330 r1, WP330-V1-01),
+ * whatever the number of orders and batches: {@link auditAttempts} records
+ * totals over every attempt, itemizes at most {@link MAX_AUDITED_ATTEMPTS}
+ * attempts (counts, no ids), and samples the ids canceled and not canceled,
+ * over all attempts, at most `MAX_AUDITED_IDS` each, with their counts.
+ * `audit-bounds.test.ts` pins the worst case below `MAX_AUDIT_LINE_BYTES`.
  */
 
-import type { BudgetEffect, BudgetRequest, CancelOutcome, CancelMarketFilter } from "@polymarket-bot/polymarket-secure";
+import type { BudgetEffect, BudgetRequest, CancelOutcome, CancelMarketFilter, NotCanceledEntry } from "@polymarket-bot/polymarket-secure";
 import type { VenueOrderView } from "@polymarket-bot/oms";
 
 import type { AuditValue } from "../audit-log.js";
 import { withinBound } from "../bounded.js";
 import { canceledCountOf, completionErrorOf, CANCEL_PRIORITY, EMERGENCY_OPERATIONS } from "../budget.js";
 import { scopeDescription, scopeText } from "../confirmation.js";
-import { auditedIds, confirmThenRecord, printedIds, type CommandContext, type CommandResult } from "../context.js";
+import { auditedIds, auditId, auditText, confirmThenRecord, MAX_AUDITED_IDS, printedIds, type CommandContext, type CommandResult } from "../context.js";
 import type { ExitName } from "../exit-codes.js";
 import { SECTIONS } from "../printer.js";
 import type { VenueSession } from "../session.js";
@@ -124,20 +131,107 @@ function describeAttempt(attempt: CancelAttempt): string[] {
   }
 }
 
+/** At most this many attempts are itemized in one OUTCOME record; every attempt is counted in its totals. */
+export const MAX_AUDITED_ATTEMPTS = 20;
+/** At most this many budget effects are itemized per attempt; their count is recorded. */
+export const MAX_AUDITED_EFFECTS = 8;
+/** The longest text an itemized attempt carries: why it was not sent; a code (an answer, an error kind, an effect kind). */
+export const MAX_AUDITED_NOT_SENT_LENGTH = 300;
+export const MAX_AUDITED_CODE_LENGTH = 40;
+/** The longest not-canceled reason recorded (WP-260 maps every venue reason to a documented one or `UNDOCUMENTED`). */
+export const MAX_AUDITED_REASON_LENGTH = 64;
+
+/** One attempt, itemized: counts and codes, NO ids (the ids are sampled once, over all attempts). */
 function auditAttempt(attempt: CancelAttempt): AuditValue {
   const outcome = attempt.outcome;
   return {
     endpoint: attempt.endpoint,
     operationId: attempt.operationId,
-    requested: attempt.requested === null ? null : auditedIds(attempt.requested),
+    requested: attempt.requested === null ? null : attempt.requested.length,
     sent: attempt.sent,
-    notSent: attempt.notSent,
-    answer: outcome === null ? null : outcome.kind,
-    canceled: outcome?.kind === "COMPLETED" ? auditedIds(outcome.canceled) : null,
-    notCanceled: outcome?.kind === "COMPLETED" ? outcome.notCanceled.slice(0, 200).map((entry) => ({ orderId: entry.orderId, reason: entry.reason })) : null,
-    errorKind: outcome === null || outcome.kind === "COMPLETED" ? null : (outcome.error?.kind ?? null),
+    notSent: attempt.notSent === null ? null : auditText(attempt.notSent, MAX_AUDITED_NOT_SENT_LENGTH),
+    answer: outcome === null ? null : auditText(outcome.kind, MAX_AUDITED_CODE_LENGTH),
+    unanswered: attempt.unanswered === true,
+    canceled: outcome?.kind === "COMPLETED" ? outcome.canceled.length : null,
+    notCanceled: outcome?.kind === "COMPLETED" ? outcome.notCanceled.length : null,
+    errorKind: outcome === null || outcome.kind === "COMPLETED" || outcome.error === null ? null : auditText(outcome.error.kind, MAX_AUDITED_CODE_LENGTH),
     canceledCount: attempt.canceledCount,
-    budgetEffects: attempt.effects.map((effect) => effect.kind),
+    budgetEffects: attempt.effects.slice(0, MAX_AUDITED_EFFECTS).map((effect) => auditText(effect.kind, MAX_AUDITED_CODE_LENGTH)),
+    budgetEffectCount: attempt.effects.length,
+  };
+}
+
+/**
+ * The attempts of one cancel command as its OUTCOME record holds them,
+ * bounded by construction whatever their number (WP330-V1-01):
+ *
+ * - `attempts`: totals over EVERY attempt (sent, each answer kind, no answer
+ *   in time, ids requested, canceled counts passed to the budget), and the
+ *   first {@link MAX_AUDITED_ATTEMPTS} attempts itemized (`truncated` says
+ *   whether more were made);
+ * - `canceled`: every id the venue answered canceled, over all attempts: the
+ *   count, and the first `MAX_AUDITED_IDS` ids;
+ * - `notCanceled`: every entry the venue answered not canceled, over all
+ *   attempts: the count, and the first `MAX_AUDITED_IDS` entries with their
+ *   reasons.
+ */
+export function auditAttempts(attempts: readonly CancelAttempt[]): { readonly [key: string]: AuditValue } {
+  const answers = { COMPLETED: 0, NOT_SENT: 0, REFUSED: 0, UNKNOWN: 0 };
+  const canceled: string[] = [];
+  const notCanceled: NotCanceledEntry[] = [];
+  let sent = 0;
+  let unanswered = 0;
+  let requestedIds = 0;
+  let canceledCountPassed = 0;
+  let canceledCountMissing = 0;
+  let canceledTotal = 0;
+  let notCanceledTotal = 0;
+  for (const attempt of attempts) {
+    if (attempt.requested !== null) requestedIds += attempt.requested.length;
+    if (!attempt.sent) continue;
+    sent += 1;
+    if (attempt.unanswered === true) unanswered += 1;
+    if (attempt.canceledCount === null) canceledCountMissing += 1;
+    else canceledCountPassed += attempt.canceledCount;
+    const outcome = attempt.outcome;
+    if (outcome === null) continue;
+    switch (outcome.kind) {
+      case "COMPLETED":
+      case "NOT_SENT":
+      case "REFUSED":
+      case "UNKNOWN":
+        answers[outcome.kind] += 1;
+    }
+    if (outcome.kind !== "COMPLETED") continue;
+    canceledTotal += outcome.canceled.length;
+    notCanceledTotal += outcome.notCanceled.length;
+    for (const id of outcome.canceled) {
+      if (canceled.length >= MAX_AUDITED_IDS) break;
+      canceled.push(id);
+    }
+    for (const entry of outcome.notCanceled) {
+      if (notCanceled.length >= MAX_AUDITED_IDS) break;
+      notCanceled.push(entry);
+    }
+  }
+  return {
+    attempts: {
+      count: attempts.length,
+      sent,
+      answers,
+      unanswered,
+      requestedIds,
+      canceledCountPassed,
+      canceledCountMissing,
+      itemized: attempts.slice(0, MAX_AUDITED_ATTEMPTS).map(auditAttempt),
+      truncated: attempts.length > MAX_AUDITED_ATTEMPTS,
+    },
+    canceled: { count: canceledTotal, ids: canceled.map(auditId), truncated: canceledTotal > canceled.length },
+    notCanceled: {
+      count: notCanceledTotal,
+      entries: notCanceled.map((entry) => ({ orderId: auditId(entry.orderId), reason: auditText(entry.reason, MAX_AUDITED_REASON_LENGTH) })),
+      truncated: notCanceledTotal > notCanceled.length,
+    },
   };
 }
 
@@ -256,7 +350,7 @@ export async function runCancelAll(context: CommandContext, session: VenueSessio
   if (!first.sent) {
     printer.section(SECTIONS.RESULT, describeAttempt(first));
     printer.section(SECTIONS.UNKNOWN, ALWAYS_UNKNOWN);
-    return { exit: "BUDGET_REFUSED", result: { attempts: attempts.map(auditAttempt) } };
+    return { exit: "BUDGET_REFUSED", result: { ...auditAttempts(attempts), verified: false } };
   }
 
   const after = await readChecked(() => session.reads.listOpenOrders(), checkOpenOrders);
@@ -297,13 +391,16 @@ export async function runCancelAll(context: CommandContext, session: VenueSessio
   else if (!final.complete) unknown.push("the account's full open-order list: the venue marked it incomplete");
   printer.section(SECTIONS.UNKNOWN, unknown);
 
+  const verified = final.kind === "READ" && final.complete;
   const exit = cancelExit(attempts, final.kind === "READ" && final.complete ? { verified: true, stillOpen: final.value.length } : { verified: false });
   return {
     exit,
     result: {
-      attempts: attempts.map(auditAttempt),
+      ...auditAttempts(attempts),
       stillListed: final.kind === "READ" ? auditedIds(final.value.map((order) => order.venueOrderId)) : null,
-      finalReadComplete: final.kind === "READ" && final.complete,
+      finalReadComplete: verified,
+      // Whether a complete read of venue truth decided the exit; false: the venue's answers alone did (D8).
+      verified,
     },
   };
 }
@@ -343,7 +440,7 @@ export async function runCancelOrder(context: CommandContext, session: VenueSess
   if (!attempt.sent) {
     printer.section(SECTIONS.RESULT, describeAttempt(attempt));
     printer.section(SECTIONS.UNKNOWN, []);
-    return { exit: "BUDGET_REFUSED", result: { target: orderId, attempts: [auditAttempt(attempt)] } };
+    return { exit: "BUDGET_REFUSED", result: { target: orderId, ...auditAttempts([attempt]), verified: false } };
   }
   const after = await readChecked(() => session.reads.readOrder(orderId), (answer) => checkOrderById(answer, orderId));
   printer.section(SECTIONS.RESULT, [...describeAttempt(attempt), describeRead(after, "venue truth after"), ...effectLines([attempt], session)]);
@@ -351,6 +448,7 @@ export async function runCancelOrder(context: CommandContext, session: VenueSess
   const outcome = attempt.outcome;
   // A read by id that FINDS the order verifies it: CANCELED, or not canceled (still live, or matched). The venue's
   // answer decides only when the read fails or does not find it (E-14: absent is not canceled).
+  const verified = after.kind === "READ" && after.value !== null;
   const exit =
     after.kind === "READ" && after.value !== null
       ? cancelExit([attempt], { verified: true, stillOpen: after.value.status === "CANCELED" ? 0 : 1 })
@@ -365,7 +463,7 @@ export async function runCancelOrder(context: CommandContext, session: VenueSess
   if (after.kind !== "READ") unknown.push("the order's state afterwards: the read by id failed");
   else if (after.value === null) unknown.push(`the venue does not show order ${orderId} by id: whether it was canceled or never existed is not known`);
   printer.section(SECTIONS.UNKNOWN, unknown);
-  return { exit, result: { target: orderId, attempts: [auditAttempt(attempt)], statusAfter: after.kind === "READ" ? (after.value?.status ?? "NOT_FOUND") : null } };
+  return { exit, result: { target: orderId, ...auditAttempts([attempt]), statusAfter: after.kind === "READ" ? (after.value?.status ?? "NOT_FOUND") : null, verified } };
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +509,7 @@ export async function runCancelMarket(context: CommandContext, session: VenueSes
   if (!attempt.sent) {
     printer.section(SECTIONS.RESULT, describeAttempt(attempt));
     printer.section(SECTIONS.UNKNOWN, []);
-    return { exit: "BUDGET_REFUSED", result: { target: market, attempts: [auditAttempt(attempt)] } };
+    return { exit: "BUDGET_REFUSED", result: { target: market, asset, ...auditAttempts([attempt]), verified: false } };
   }
   const after = await readChecked(() => session.reads.listOpenOrders(), checkOpenOrders);
   const targetedAfter = targeted(after);
@@ -423,15 +521,16 @@ export async function runCancelMarket(context: CommandContext, session: VenueSes
 
   const outcome = attempt.outcome;
   // Verifiable only with --asset: the open-orders read names tokens, not markets.
-  const exit = cancelExit(
-    [attempt],
-    after.kind === "READ" && after.complete && targetedAfter !== null ? { verified: true, stillOpen: targetedAfter.length } : { verified: false },
-  );
+  const verified = after.kind === "READ" && after.complete && targetedAfter !== null;
+  const exit = cancelExit([attempt], verified && targetedAfter !== null ? { verified: true, stillOpen: targetedAfter.length } : { verified: false });
 
   const unknown = [...ALWAYS_UNKNOWN];
   if (outcome?.kind === "UNKNOWN") unknown.push("which orders DELETE /cancel-market-orders canceled: its answer was lost or unreadable");
   if (asset === null) unknown.push("which open orders belong to this market: the open-orders read carries no market id, so the result is the venue's answer alone");
   if (after.kind !== "READ") unknown.push("the account's open orders afterwards: the read failed");
   printer.section(SECTIONS.UNKNOWN, unknown);
-  return { exit, result: { target: market, asset, attempts: [auditAttempt(attempt)], stillListedInAsset: targetedAfter === null ? null : auditedIds(targetedAfter.map((order) => order.venueOrderId)) } };
+  return {
+    exit,
+    result: { target: market, asset, ...auditAttempts([attempt]), stillListedInAsset: targetedAfter === null ? null : auditedIds(targetedAfter.map((order) => order.venueOrderId)), verified },
+  };
 }

@@ -10,18 +10,25 @@
  * Each record is written with ONE `write` on a descriptor opened
  * `O_WRONLY | O_APPEND`, then `fsync`ed, then closed, BEFORE the CLI goes on:
  *
- * - `INVOKED` before the gate, the credentials, the configuration, the
- *   database or the venue are touched (a refusal is audited too);
+ * - `INVOKED` once WP-260's signer gate has given its verdict (a pure
+ *   evaluation of the run-mode flags; the record carries it) and before the
+ *   configuration, the credentials, the lease store or the venue are touched
+ *   (a refusal is audited too). Only the record's own best-effort database
+ *   copy (below) may touch the database before it;
  * - `ACTING` immediately before the first venue cancel or the lease revoke,
  *   naming the confirmed scope and the plan;
- * - `OUTCOME` after the result is known, with the exit code.
+ * - `OUTCOME` after the result is known, with the exit code, and BEFORE any
+ *   resource is released (`run.ts`).
  *
- * A record that cannot be written and synced STOPS the command before it acts
+ * A record that cannot be written and synced before acting STOPS the command
  * (`AUDIT_UNAVAILABLE`, exit 5): nothing is done that is not on the record.
+ * An OUTCOME record that cannot be written exits `OUTCOME_UNRECORDED` (18):
+ * the command may already have acted, and the output says so (`run.ts`).
  * The file is never truncated or rewritten. It is opened with `O_NOFOLLOW`
- * and must be a regular file, so a symlink planted at the path is refused
- * rather than followed. A newly created file's directory is `fsync`ed too, so
- * the file's existence is as durable as its contents.
+ * and `O_NONBLOCK` and must be a regular file, so a symlink planted at the
+ * path is refused rather than followed, and a FIFO is refused at once rather
+ * than waited on (WP-330 r1, WP330-V1-02). A newly created file's directory is
+ * `fsync`ed too, so the file's existence is as durable as its contents.
  *
  * ## The database mirror is best effort, and never on the cancel path
  *
@@ -40,7 +47,10 @@
  * encoded with the repository's own-data JSON encoder
  * (`@polymarket-bot/risk/plain-json`: no inherited `toJSON` can substitute
  * bytes). The operator's own `--reason` text is free text and is recorded as
- * typed (bounded, no control characters); do not paste a secret into it.
+ * typed (bounded, no control characters), EXCEPT that the grammar refuses a
+ * reason that assigns a value to a credential-like name (`grammar.ts`
+ * `namesCredentialAssignment`, by WP-260's `isSensitiveKey`); a bare secret
+ * with no name cannot be told from prose, so do not paste one into it.
  */
 
 import { constants as fsConstants } from "node:fs";
@@ -101,7 +111,19 @@ export class AuditUnavailableError extends Error {
   }
 }
 
-/** A record line is bounded; the record builders bound their lists far below this. */
+/**
+ * A record line is bounded. Every record builder is bounded BY CONSTRUCTION
+ * below this, whatever the venue answers (WP-330 r1, WP330-V1-01): ids are
+ * kept to the order-id alphabet and 200 characters, id lists to 200 samples
+ * with their count, a cancel command's itemized attempts to 20 with totals
+ * over all of them, and free text to fixed lengths (`context.ts`
+ * `auditId`/`auditText`; `commands/cancel.ts` `auditAttempts`). The worst
+ * case of a cancel command's OUTCOME, and the realistic 3,000-order sweep,
+ * are pinned below this by `audit-bounds.test.ts`. A line that still exceeds
+ * it is refused before any byte is written (`RECORD_TOO_LARGE`); for an
+ * OUTCOME record, `run.ts` then records the exit alone, with
+ * `detailOmitted: "RECORD_TOO_LARGE"`.
+ */
 export const MAX_AUDIT_LINE_BYTES = 256 * 1024;
 
 /** The record as one JSON line: allow-listed fields, then WP-260's redaction, then own-data JSON. */
@@ -141,7 +163,14 @@ export const NODE_AUDIT_FILE_SYSTEM: AuditFileSystem = Object.freeze({
   },
 });
 
-const APPEND_FLAGS = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW;
+/**
+ * `O_NONBLOCK` (WP330-V1-02): opening a FIFO for writing with no reader would
+ * block forever, before the regular-file check could refuse it; with
+ * `O_NONBLOCK` the open fails at once (`ENXIO`, so `OPEN_FAILED`), and with a
+ * reader it opens and the check refuses it. On a regular file it changes
+ * nothing.
+ */
+const APPEND_FLAGS = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
 const CREATE_FLAGS = APPEND_FLAGS | fsConstants.O_CREAT | fsConstants.O_EXCL;
 const DIRECTORY_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY;
 /** Owner read/write only: the log names accounts and operators. */
@@ -155,7 +184,7 @@ function errorCode(error: unknown): string | undefined {
 
 /**
  * An append-only JSON Lines audit file. One `append` = open (`O_APPEND`,
- * `O_NOFOLLOW`; created `0600` when absent), check it is a regular file, one
+ * `O_NOFOLLOW`, `O_NONBLOCK`; created `0600` when absent), check it is a regular file, one
  * write of the whole line, `fsync`, close; and, when the file was just
  * created, `fsync` of its directory.
  */

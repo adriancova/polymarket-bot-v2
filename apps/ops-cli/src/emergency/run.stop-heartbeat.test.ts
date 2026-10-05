@@ -90,6 +90,10 @@ describe("WP-320: stop-heartbeat revokes the fencing lease, and only that", () =
     expect(outcome.exitName).toBe("NOTHING_TO_DO");
     expect(outcome.exitCode).toBe(EXIT_CODES.NOTHING_TO_DO);
     expect(leases.revoked).toEqual([]);
+    // WP-330 r1 (WP330-V1-04): only this process's realm was read, and the output says any other was not.
+    expect(leases.currentCalls).toEqual([{ accountRef: ACCOUNT, environment: "LIVE_MICRO" }]);
+    expect(h.text()).toContain("no ACTIVE, unexpired lease is held for this account in the LIVE_MICRO realm");
+    expect(h.text()).toContain("whether a lease is held for this account in ANOTHER run-mode realm: only the LIVE_MICRO realm (this process's RUN_MODE) was read");
   });
 
   it("the lease ended between the read and the revoke: NOTHING_TO_DO, reported", async () => {

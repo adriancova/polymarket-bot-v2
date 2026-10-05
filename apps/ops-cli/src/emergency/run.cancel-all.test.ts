@@ -303,15 +303,46 @@ describe("the RESULT and the exit say exactly what happened", () => {
     expect(h.text()).toContain("the account's full open-order list: the venue marked it incomplete");
   });
 
-  it("the OUTCOME record carries every attempt, bounded, with no secret", async () => {
+  it("the OUTCOME record carries every attempt (totals, and each attempt itemized by counts) and the canceled ids, bounded, with no secret", async () => {
     const h = harness();
     h.venue.add(order("o-1"), order("o-2"));
     await runOpsCli(h.deps(cancelAll(...CONFIRM)));
     const outcome = h.audit.records.at(-1) as AuditRecord;
     expect(outcome.phase).toBe("OUTCOME");
     expect(outcome.detail["exit"]).toBe("COMPLETED");
-    expect(outcome.detail["attempts"]).toEqual([
-      expect.objectContaining({ endpoint: "DELETE /cancel-all", operationId: "clob.cancel_all", sent: true, answer: "COMPLETED", canceledCount: 2, canceled: { count: 2, ids: ["o-1", "o-2"], truncated: false } }),
-    ]);
+    expect(outcome.detail["attempts"]).toEqual({
+      count: 1,
+      sent: 1,
+      answers: { COMPLETED: 1, NOT_SENT: 0, REFUSED: 0, UNKNOWN: 0 },
+      unanswered: 0,
+      requestedIds: 0,
+      canceledCountPassed: 2,
+      canceledCountMissing: 0,
+      itemized: [
+        expect.objectContaining({ endpoint: "DELETE /cancel-all", operationId: "clob.cancel_all", requested: null, sent: true, answer: "COMPLETED", canceled: 2, notCanceled: 0, canceledCount: 2 }),
+      ],
+      truncated: false,
+    });
+    expect(outcome.detail["canceled"]).toEqual({ count: 2, ids: ["o-1", "o-2"], truncated: false });
+    expect(outcome.detail["notCanceled"]).toEqual({ count: 0, entries: [], truncated: false });
+  });
+
+  it("D8 (WP-330 r1, WP330-V1-07): exit 0 is COMPLETED either way, and the OUTCOME record says whether a complete read verified it", async () => {
+    const verified = harness();
+    verified.venue.add(order("o-1"));
+    expect((await runOpsCli(verified.deps(cancelAll(...CONFIRM)))).exitName).toBe("COMPLETED");
+    expect(verified.audit.records.at(-1)?.detail["verified"]).toBe(true);
+
+    // The answers alone: every answer COMPLETED, nothing named not canceled, and no verification read (runbook rule 3).
+    const unverified = harness();
+    unverified.venue.add(order("o-1"));
+    let reads = 0;
+    unverified.venue.scripted.set("listOpenOrders", () => {
+      reads += 1;
+      return reads === 1 ? { route: "/data/orders", complete: true, orders: [] } : Promise.reject(transportFailure("FETCH_ORDER"));
+    });
+    expect((await runOpsCli(unverified.deps(cancelAll(...CONFIRM)))).exitName).toBe("COMPLETED");
+    expect(unverified.audit.records.at(-1)?.detail["verified"]).toBe(false);
+    expect(unverified.text()).toContain("the account's open orders after the cancels: the read failed");
   });
 });

@@ -7,17 +7,23 @@
  * - interactively, by typing the scope text when asked; or
  * - non-interactively, with `--confirm <scope>` equal to that text exactly.
  *
- * The scope text names what the command will touch, so a confirmation for one
- * order, one market, one account or one lease can never be replayed onto
- * another. A bare `--yes` is refused by the grammar (`grammar.ts`). With no
- * `--confirm` and no terminal, the command is REFUSED; it never waits.
+ * The scope text names what the command will touch AND the account whose
+ * credentials act, so a confirmation for one order, one market, one account
+ * or one lease can never be replayed onto another, nor a scripted `--confirm`
+ * onto another `--account` (WP-330 r1, WP330-V1-06). A bare `--yes` is
+ * refused by the grammar (`grammar.ts`). With no `--confirm` and no terminal,
+ * the command is REFUSED; it never waits.
  *
  * | Command | Scope text |
  * | --- | --- |
- * | cancel-order | `cancel-order:<venue-order-id>` |
- * | cancel-market | `cancel-market:<condition-id>` or `cancel-market:<condition-id>:<asset-id>` |
+ * | cancel-order | `cancel-order:<venue-order-id>@<account>` |
+ * | cancel-market | `cancel-market:<condition-id>@<account>` or `cancel-market:<condition-id>:<asset-id>@<account>` |
  * | cancel-all | `cancel-all:<account>` |
  * | stop-heartbeat | `stop-heartbeat:<account>:<fencing-lease-id>` (the lease read now: a confirmation for a lease that has since changed never matches) |
+ *
+ * Each text is unambiguous: an order id, a condition id and an asset id never
+ * contain `@` (their grammars, `grammar.ts`), so the first `@` always ends the
+ * target; a fencing lease id is a UUID, so the last `:` always starts it.
  */
 
 import type { ParsedCommand } from "./grammar.js";
@@ -31,9 +37,9 @@ export type ConfirmationVerdict =
 export function scopeText(command: ParsedCommand, leaseId: string | null = null): string {
   switch (command.command) {
     case "cancel-order":
-      return `cancel-order:${command.target ?? ""}`;
+      return `cancel-order:${command.target ?? ""}@${command.accountRef}`;
     case "cancel-market":
-      return command.assetId === null ? `cancel-market:${command.target ?? ""}` : `cancel-market:${command.target ?? ""}:${command.assetId}`;
+      return command.assetId === null ? `cancel-market:${command.target ?? ""}@${command.accountRef}` : `cancel-market:${command.target ?? ""}:${command.assetId}@${command.accountRef}`;
     case "cancel-all":
       return `cancel-all:${command.accountRef}`;
     case "stop-heartbeat":
@@ -47,11 +53,11 @@ export function scopeText(command: ParsedCommand, leaseId: string | null = null)
 export function scopeDescription(command: ParsedCommand, leaseId: string | null = null): string {
   switch (command.command) {
     case "cancel-order":
-      return `cancel venue order ${command.target ?? ""}`;
+      return `cancel venue order ${command.target ?? ""} with the credentials of account ${command.accountRef}`;
     case "cancel-market":
       return command.assetId === null
-        ? `cancel every open order of market ${command.target ?? ""}`
-        : `cancel every open order of market ${command.target ?? ""} in asset ${command.assetId}`;
+        ? `cancel every open order of market ${command.target ?? ""} owned by the credentials of account ${command.accountRef}`
+        : `cancel every open order of market ${command.target ?? ""} in asset ${command.assetId} owned by the credentials of account ${command.accountRef}`;
     case "cancel-all":
       return `cancel EVERY open order owned by the credentials of account ${command.accountRef}`;
     case "stop-heartbeat":

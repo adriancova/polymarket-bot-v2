@@ -29,17 +29,28 @@
  * for the scope `stop-heartbeat:<account>:<lease-id>`, writes the `ACTING`
  * record, and revokes exactly that lease (a lease that changed since it was
  * read is not revoked: `revoke` matches it by id and ACTIVE).
+ *
+ * THE REALM. A lease is held per account AND run-mode realm (WP-320); the
+ * command reads only the realm of its own process's `RUN_MODE`, and says that
+ * any other realm was not inspected (WP-330 r1, WP330-V1-04).
+ *
+ * The lease store is released after the OUTCOME record, bounded by
+ * {@link LEASE_STORE_RELEASE_MS} (CX330-R1-02).
  */
 
 import { HEARTBEAT_TIMEOUT_MS, HEARTBEAT_VENUE_FACTS, VENUE_CANCELLATION_CHECK_INTERVAL_MS } from "@polymarket-bot/polymarket-secure";
 import { FENCING_LEASE_MAX_TTL_MS, FENCING_REASON_MAX_LENGTH } from "@polymarket-bot/storage-postgres";
 
+import { releaseWithin } from "../bounded.js";
 import { scopeDescription, scopeText } from "../confirmation.js";
 import { confirmThenRecord, type CommandContext, type CommandResult } from "../context.js";
 import type { FencingLeaseAccessFactory } from "../ports.js";
 import { SECTIONS, type Printer } from "../printer.js";
 
 const SECONDS = 1000;
+
+/** The longest the CLI waits for the lease store to release, after the OUTCOME record. A CLI policy (as `main.ts`'s database release), not a venue fact. */
+export const LEASE_STORE_RELEASE_MS = 2_000;
 
 /** The guidance, printed by every stop-heartbeat invocation, before the gate's verdict. */
 export function stopHeartbeatGuidance(): readonly string[] {
@@ -81,62 +92,61 @@ export async function runStopHeartbeat(context: CommandContext, leasesFactory: F
     printer.section(SECTIONS.UNKNOWN, ["whether a lease is held, and by whom"]);
     return { exit: "DATABASE_UNAVAILABLE", result: { reason: opened.reason } };
   }
+  const store = opened;
+  context.deferRelease({ what: "the fencing lease store", boundMs: LEASE_STORE_RELEASE_MS, release: () => releaseWithin(LEASE_STORE_RELEASE_MS, () => store.close()) });
+  let lease;
   try {
-    let lease;
-    try {
-      lease = await opened.leases.current(parsed.accountRef, gate.runMode);
-    } catch {
-      printer.section(SECTIONS.PLAN, [`read the ACTIVE fencing lease of ${parsed.accountRef} in the ${gate.runMode} realm`]);
-      printer.section(SECTIONS.RESULT, ["nothing was done: the lease could not be read"]);
-      printer.section(SECTIONS.UNKNOWN, ["whether a lease is held, and by whom"]);
-      return { exit: "DATABASE_UNAVAILABLE", result: { reason: "READ_FAILED" } };
-    }
-    if (lease === null) {
-      printer.section(SECTIONS.PLAN, [`read the ACTIVE fencing lease of ${parsed.accountRef} in the ${gate.runMode} realm`]);
-      printer.section(SECTIONS.RESULT, [
-        "nothing was done: no ACTIVE, unexpired lease is held for this account and realm, so no holder may heartbeat under the fence (ADR-008 §2)",
-      ]);
-      printer.section(SECTIONS.UNKNOWN, [
-        "whether a process heartbeats WITHOUT the fence: only the fence's holder may (§6 invariant 16); repeated invalid-id 400s would page as a live fencing conflict (ADR-008 §4). Verify the open orders with account-snapshot",
-      ]);
-      return { exit: "NOTHING_TO_DO", result: { lease: null } };
-    }
-    const scope = scopeText(parsed, lease.fencingLeaseId);
-    printer.section(SECTIONS.PLAN, [
-      `the ACTIVE lease of ${parsed.accountRef} (${gate.runMode} realm): ${lease.fencingLeaseId}, holder ${lease.holderId}, fencing token ${lease.fencingToken}, expires ${lease.expiresAt} (database clock), ${lease.heartbeatId === null ? "no venue heartbeat id recorded" : "a venue heartbeat id is recorded (not printed)"}`,
-      `revoke exactly that lease, with the reason recorded on the row: "${revocationReason(parsed.operator, parsed.reason)}"`,
-      "nothing is sent to the venue, and no order is canceled by this command itself",
-      `scope to confirm: ${scope}`,
-    ]);
-    const go = await confirmThenRecord(context, scope, scopeDescription(parsed, lease.fencingLeaseId), { target: lease.fencingLeaseId, holderId: lease.holderId });
-    if (go !== "GO") {
-      printer.section(SECTIONS.RESULT, ["nothing was revoked"]);
-      printer.section(SECTIONS.UNKNOWN, []);
-      return go;
-    }
-    let revoked: boolean;
-    try {
-      revoked = await opened.leases.revoke({ fencingLeaseId: lease.fencingLeaseId, reason: revocationReason(parsed.operator, parsed.reason) });
-    } catch {
-      printer.section(SECTIONS.RESULT, [`the revoke of ${lease.fencingLeaseId} failed or was not answered`]);
-      printer.section(SECTIONS.UNKNOWN, ["whether the lease was revoked: read it again (a revoke is idempotent: an ended lease answers false)"]);
-      return { exit: "UNKNOWN", result: { target: lease.fencingLeaseId, revoked: null } };
-    }
-    if (!revoked) {
-      printer.section(SECTIONS.RESULT, [`lease ${lease.fencingLeaseId} had already ended when the revoke ran: nothing was revoked`]);
-      printer.section(SECTIONS.UNKNOWN, ["whether a new lease has been granted since: run stop-heartbeat again to read the current one"]);
-      return { exit: "NOTHING_TO_DO", result: { target: lease.fencingLeaseId, revoked: false } };
-    }
+    lease = await opened.leases.current(parsed.accountRef, gate.runMode);
+  } catch {
+    printer.section(SECTIONS.PLAN, [`read the ACTIVE fencing lease of ${parsed.accountRef} in the ${gate.runMode} realm`]);
+    printer.section(SECTIONS.RESULT, ["nothing was done: the lease could not be read"]);
+    printer.section(SECTIONS.UNKNOWN, ["whether a lease is held, and by whom"]);
+    return { exit: "DATABASE_UNAVAILABLE", result: { reason: "READ_FAILED" } };
+  }
+  if (lease === null) {
+    printer.section(SECTIONS.PLAN, [`read the ACTIVE fencing lease of ${parsed.accountRef} in the ${gate.runMode} realm`]);
     printer.section(SECTIONS.RESULT, [
-      `lease ${lease.fencingLeaseId} REVOKED (holder ${lease.holderId}): its next renewal finds it LOST, and its heartbeat stops`,
-      `expect the venue's cancellation of resting orders ${String(HEARTBEAT_TIMEOUT_MS / SECONDS)}–${String((HEARTBEAT_TIMEOUT_MS + VENUE_CANCELLATION_CHECK_INTERVAL_MS) / SECONDS)} s after the last valid heartbeat, which itself comes at most ${String(FENCING_LEASE_MAX_TTL_MS / SECONDS)} s after the holder's last renewal`,
+      `nothing was done: no ACTIVE, unexpired lease is held for this account in the ${gate.runMode} realm, so no holder may heartbeat under that realm's fence (ADR-008 §2)`,
     ]);
     printer.section(SECTIONS.UNKNOWN, [
-      "when the holder's heartbeat actually stops, and when the venue actually cancels: both are inferred from documentation, not observed. Verify with account-snapshot",
-      "whether the holder process is healthy enough to notice: a holder that cannot renew at all stops at its local deadline anyway (WP-320)",
+      `whether a lease is held for this account in ANOTHER run-mode realm: only the ${gate.runMode} realm (this process's RUN_MODE) was read. If the trader runs in another mode, run stop-heartbeat with that RUN_MODE`,
+      "whether a process heartbeats WITHOUT the fence: only the fence's holder may (§6 invariant 16); repeated invalid-id 400s would page as a live fencing conflict (ADR-008 §4). Verify the open orders with account-snapshot",
     ]);
-    return { exit: "COMPLETED", result: { target: lease.fencingLeaseId, revoked: true, holderId: lease.holderId } };
-  } finally {
-    await opened.close().catch(() => undefined);
+    return { exit: "NOTHING_TO_DO", result: { lease: null } };
   }
+  const scope = scopeText(parsed, lease.fencingLeaseId);
+  printer.section(SECTIONS.PLAN, [
+    `the ACTIVE lease of ${parsed.accountRef} (${gate.runMode} realm): ${lease.fencingLeaseId}, holder ${lease.holderId}, fencing token ${lease.fencingToken}, expires ${lease.expiresAt} (database clock), ${lease.heartbeatId === null ? "no venue heartbeat id recorded" : "a venue heartbeat id is recorded (not printed)"}`,
+    `revoke exactly that lease, with the reason recorded on the row: "${revocationReason(parsed.operator, parsed.reason)}"`,
+    "nothing is sent to the venue, and no order is canceled by this command itself",
+    `scope to confirm: ${scope}`,
+  ]);
+  const go = await confirmThenRecord(context, scope, scopeDescription(parsed, lease.fencingLeaseId), { target: lease.fencingLeaseId, holderId: lease.holderId });
+  if (go !== "GO") {
+    printer.section(SECTIONS.RESULT, ["nothing was revoked"]);
+    printer.section(SECTIONS.UNKNOWN, []);
+    return go;
+  }
+  let revoked: boolean;
+  try {
+    revoked = await opened.leases.revoke({ fencingLeaseId: lease.fencingLeaseId, reason: revocationReason(parsed.operator, parsed.reason) });
+  } catch {
+    printer.section(SECTIONS.RESULT, [`the revoke of ${lease.fencingLeaseId} failed or was not answered`]);
+    printer.section(SECTIONS.UNKNOWN, ["whether the lease was revoked: read it again (a revoke is idempotent: an ended lease answers false)"]);
+    return { exit: "UNKNOWN", result: { target: lease.fencingLeaseId, revoked: null } };
+  }
+  if (!revoked) {
+    printer.section(SECTIONS.RESULT, [`lease ${lease.fencingLeaseId} had already ended when the revoke ran: nothing was revoked`]);
+    printer.section(SECTIONS.UNKNOWN, ["whether a new lease has been granted since: run stop-heartbeat again to read the current one"]);
+    return { exit: "NOTHING_TO_DO", result: { target: lease.fencingLeaseId, revoked: false } };
+  }
+  printer.section(SECTIONS.RESULT, [
+    `lease ${lease.fencingLeaseId} REVOKED (holder ${lease.holderId}): its next renewal finds it LOST, and its heartbeat stops`,
+    `expect the venue's cancellation of resting orders ${String(HEARTBEAT_TIMEOUT_MS / SECONDS)}–${String((HEARTBEAT_TIMEOUT_MS + VENUE_CANCELLATION_CHECK_INTERVAL_MS) / SECONDS)} s after the last valid heartbeat, which itself comes at most ${String(FENCING_LEASE_MAX_TTL_MS / SECONDS)} s after the holder's last renewal`,
+  ]);
+  printer.section(SECTIONS.UNKNOWN, [
+    "when the holder's heartbeat actually stops, and when the venue actually cancels: both are inferred from documentation, not observed. Verify with account-snapshot",
+    "whether the holder process is healthy enough to notice: a holder that cannot renew at all stops at its local deadline anyway (WP-320)",
+  ]);
+  return { exit: "COMPLETED", result: { target: lease.fencingLeaseId, revoked: true, holderId: lease.holderId } };
 }

@@ -1,10 +1,11 @@
 /**
  * A bound on how long the CLI waits for one answer from a port it does not
  * control: a venue call, a venue read, the emergency credential source, the
- * venue binding. An emergency command that waits forever helps nobody: past
- * the operator's `venueAnswerBoundMs` (configuration, no default) the call is
- * treated as UNANSWERED, which every caller reads as UNKNOWN or as a missing
- * read, never as success or as empty.
+ * venue binding, and the release of the venue client or the lease store
+ * ({@link releaseWithin}). An emergency command that waits forever helps
+ * nobody: past the operator's `venueAnswerBoundMs` (configuration, no
+ * default) the call is treated as UNANSWERED, which every caller reads as
+ * UNKNOWN or as a missing read, never as success or as empty.
  *
  * The bound is wall time (a real timer, cleared as soon as the answer
  * arrives), not the injected clock: the clock measures the budget's waits,
@@ -31,5 +32,22 @@ export async function withinBound<T>(boundMs: number, call: () => Promise<T>): P
     return await Promise.race([answer, timeout]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** How a resource release ended. Cleanup only: it never changes a command's outcome. */
+export type ReleaseResult = "RELEASED" | "UNANSWERED" | "FAILED";
+
+/**
+ * Release a resource (the venue client, the lease store), waiting at most
+ * `boundMs` (WP-330 r1, CX330-R1-02). A release is cleanup, not an action: a
+ * close that never settles must neither hold an emergency CLI open nor keep
+ * its OUTCOME record from being written. TOTAL: it never throws.
+ */
+export async function releaseWithin(boundMs: number, release: () => Promise<unknown>): Promise<ReleaseResult> {
+  try {
+    return (await withinBound(boundMs, release)).kind === "ANSWERED" ? "RELEASED" : "UNANSWERED";
+  } catch {
+    return "FAILED";
   }
 }

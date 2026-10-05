@@ -1,8 +1,19 @@
 /**
- * Explicit output (WP-330 design requirement 1): every command prints what
- * will happen (PLAN), what happened (RESULT) and what is not known (UNKNOWN),
- * then the OUTCOME with its exit code. Sections are printed in that order and
- * a section is never omitted: an empty one says "none".
+ * Explicit output (WP-330 design requirement 1). A command the gate permitted
+ * prints what will happen (PLAN), what happened (RESULT) and what is not
+ * known (UNKNOWN), in that order, then the OUTCOME with its exit code; a
+ * section it prints is never left empty silently: an empty one says "none".
+ *
+ * Not every invocation reaches a command (WP-330 r1, WP330-V1-03):
+ *
+ * - stopped BEFORE any command runs (a usage error, no audit log, an INVOKED
+ *   record that cannot be written, the signer gate's refusal), it prints no
+ *   PLAN, RESULT or UNKNOWN: only what stopped it (the usage, AUDIT, RUN
+ *   MODE, and stop-heartbeat's GUIDANCE), that nothing was read or sent, and
+ *   the OUTCOME;
+ * - stopped PART-WAY (its ACTING record cannot be written; an unexpected
+ *   failure), it prints the sections it reached, what stopped it, and the
+ *   OUTCOME.
  */
 
 import type { OutputPort } from "./ports.js";

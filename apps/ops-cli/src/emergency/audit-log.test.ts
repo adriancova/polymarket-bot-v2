@@ -4,9 +4,12 @@
  * immune to an inherited `toJSON` (the SER lesson: the own-data encoder).
  */
 
-import { lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -67,6 +70,44 @@ describe("the file log", () => {
 
   it("a directory at the path is refused", async () => {
     await expect(createFileAuditLog(scratch).append(record(0))).rejects.toBeInstanceOf(AuditUnavailableError);
+  });
+
+  it("WP-330 r1 (WP330-V1-02): a FIFO with NO reader is refused at once (O_NONBLOCK: ENXIO, OPEN_FAILED), never waited on", async () => {
+    const fifo = path.join(scratch, "audit.fifo");
+    await promisify(execFile)("mkfifo", [fifo]);
+    const attempt = createFileAuditLog(fifo).append(record(0));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = await Promise.race([
+        attempt.then(
+          () => "WRITTEN" as const,
+          (error: unknown) => error,
+        ),
+        new Promise<"HUNG">((resolve) => (timer = setTimeout(() => resolve("HUNG"), 2_000))),
+      ]);
+      expect(settled).not.toBe("HUNG");
+      expect(settled).toMatchObject({ name: "AuditUnavailableError", code: "OPEN_FAILED" });
+    } finally {
+      clearTimeout(timer);
+      // Release a writer blocked in open(2) (fb9edcc's flags), so no thread is left behind.
+      const reader = await open(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+      await reader.close();
+      await attempt.catch(() => undefined);
+    }
+  });
+
+  it("a FIFO WITH a reader opens, and is then refused as not a regular file: the reader receives nothing", async () => {
+    const fifo = path.join(scratch, "audit.fifo");
+    await promisify(execFile)("mkfifo", [fifo]);
+    const reader = await open(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    try {
+      await expect(createFileAuditLog(fifo).append(record(0))).rejects.toMatchObject({ code: "NOT_A_REGULAR_FILE" });
+      const buffer = Buffer.alloc(64);
+      const read = await reader.read(buffer, 0, buffer.length, null).catch((error: NodeJS.ErrnoException) => ({ bytesRead: error.code === "EAGAIN" ? 0 : -1 }));
+      expect(read.bytesRead).toBe(0);
+    } finally {
+      await reader.close();
+    }
   });
 
   it("a missing directory is refused (nothing is created silently elsewhere)", async () => {

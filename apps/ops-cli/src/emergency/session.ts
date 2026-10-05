@@ -7,12 +7,17 @@
  * Nothing here touches the trader, its process, its memory or its database
  * (§14.2; ADR-008 §6): the session is built from the operator's
  * configuration, the emergency credential and venue truth only.
+ *
+ * RELEASING THE VENUE CLIENT IS BOUNDED (WP-330 r1, CX330-R1-02), like every
+ * other venue call: `close` waits at most `venueAnswerBoundMs`, and `run.ts`
+ * calls it only after the OUTCOME record is written. WP-260's `close` awaits
+ * the SDK's `closeSubscriptions()` with no bound of its own.
  */
 
 import type { AccountReadPort } from "@polymarket-bot/oms";
 import type { SignerGateContext, VenueAccountIdentity } from "@polymarket-bot/polymarket-secure";
 
-import { withinBound } from "./bounded.js";
+import { releaseWithin, withinBound, type ReleaseResult } from "./bounded.js";
 import { EmergencyBudget } from "./budget.js";
 import { parseOpsConfiguration, type OpsConfiguration } from "./configuration.js";
 import type { ExitName } from "./exit-codes.js";
@@ -28,7 +33,8 @@ export interface VenueSession {
   readonly reads: AccountReadPort;
   readonly readLog: ReadRecord[];
   readonly identity: VenueAccountIdentity;
-  close(): Promise<void>;
+  /** Release the venue client, waiting at most `venueAnswerBoundMs`. Never throws. */
+  close(): Promise<ReleaseResult>;
 }
 
 export type SessionOpen =
@@ -113,7 +119,8 @@ export async function openVenueSession(parsed: ParsedCommand, gate: SignerGateCo
     identity = venue.cancels.identity;
     if (typeof identity.signerAddress !== "string" || typeof identity.walletAddress !== "string") throw new TypeError("identity");
   } catch {
-    await venue.cancels.close().catch(() => undefined);
+    // Bounded: a binding with no identity whose close also never settles must not hold the CLI.
+    await releaseWithin(bound, () => venue.cancels.close());
     return { kind: "STOPPED", exit: "CREDENTIALS_UNAVAILABLE", problem: "the venue binding reports no account identity" };
   }
   budget.signer = identity.signerAddress;
@@ -127,9 +134,7 @@ export async function openVenueSession(parsed: ParsedCommand, gate: SignerGateCo
       reads: budgetedReads(venue.reads, budget, readLog, bound),
       readLog,
       identity,
-      close: async () => {
-        await venue.cancels.close().catch(() => undefined);
-      },
+      close: () => releaseWithin(bound, () => venue.cancels.close()),
     },
   };
 }

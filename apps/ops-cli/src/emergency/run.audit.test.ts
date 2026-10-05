@@ -12,14 +12,17 @@
  * - No secret reaches the log or the output.
  */
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import { installNetworkTripwire, type NetworkTripwire } from "@polymarket-bot/polymarket-secure/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { AUDIT_SCHEMA, createFileAuditLog, NODE_AUDIT_FILE_SYSTEM, type AuditFileSystem, type AuditMirror, type AuditRecord } from "./audit-log.js";
+import { AUDIT_SCHEMA, AuditUnavailableError, createFileAuditLog, NODE_AUDIT_FILE_SYSTEM, type AuditFileSystem, type AuditMirror, type AuditRecord, type AuditSink } from "./audit-log.js";
 import { EXIT_CODES } from "./exit-codes.js";
 import {
   ACCOUNT,
@@ -63,8 +66,8 @@ function sectionsInOrder(text: string): boolean {
 describe("acceptance 2: explicit output", () => {
   const invocations: readonly (readonly [string, string[]])[] = [
     ["cancel-all", args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`)],
-    ["cancel-order", args("cancel-order", "o-1", ...DESTRUCTIVE_REASON, "--confirm", "cancel-order:o-1")],
-    ["cancel-market", args("cancel-market", CONDITION, ...DESTRUCTIVE_REASON, "--confirm", `cancel-market:${CONDITION}`)],
+    ["cancel-order", args("cancel-order", "o-1", ...DESTRUCTIVE_REASON, "--confirm", `cancel-order:o-1@${ACCOUNT}`)],
+    ["cancel-market", args("cancel-market", CONDITION, ...DESTRUCTIVE_REASON, "--confirm", `cancel-market:${CONDITION}@${ACCOUNT}`)],
     ["account-snapshot", args("account-snapshot")],
     ["reconcile", args("reconcile")],
     ["stop-heartbeat", args("stop-heartbeat", ...DESTRUCTIVE_REASON, "--confirm", `stop-heartbeat:${ACCOUNT}:${LEASE_ID}`)],
@@ -261,5 +264,161 @@ describe("acceptance 2: the real file log, end to end", () => {
     expect(outcome.exitName).toBe("COMPLETED");
     expect(await readFile(file, "utf8")).not.toContain(secret);
     expect(h.text()).not.toContain(secret);
+  });
+});
+
+describe("WP330-V1-01: an OUTCOME that cannot be written never lets the command's own exit stand", () => {
+  const CANCEL_ALL = args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`);
+
+  it("the OUTCOME WRITE fails after the cancel: OUTCOME_UNRECORDED (18), and the output says the command MAY ALREADY HAVE ACTED", async () => {
+    const h = harness();
+    h.audit.failOn = "OUTCOME";
+    h.venue.add(order("o-1"));
+    const outcome = await runOpsCli(h.deps(CANCEL_ALL));
+    expect(EXIT_CODES.OUTCOME_UNRECORDED).toBe(18);
+    expect(outcome.exitName).toBe("OUTCOME_UNRECORDED");
+    expect(outcome.exitCode).toBe(18);
+    // It did act: the cancel was sent and applied; only its record is missing.
+    expect(h.venue.callsOf("cancelAll")).toHaveLength(1);
+    expect(h.venue.open()).toEqual([]);
+    expect(phases(h.audit.records)).toEqual(["INVOKED", "ACTING"]);
+    expect(h.text()).toContain("the OUTCOME record could NOT be written to memory://ops-cli-audit (WRITE_FAILED). The command MAY ALREADY HAVE ACTED");
+    expect(h.text()).toContain("OUTCOME_UNRECORDED (exit 18): the command's own outcome, COMPLETED (exit 0), is NOT in the audit log");
+    // Not the pre-action wording.
+    expect(h.text()).not.toMatch(/Nothing was done|nothing was sent/u);
+  });
+
+  it("the OUTCOME FSYNC fails after the cancel, through the real file sink: OUTCOME_UNRECORDED (18)", async () => {
+    const file = path.join(scratch, "audit.jsonl");
+    let fileSyncs = 0;
+    const failingThirdSync: AuditFileSystem = {
+      async open(target, flags, mode) {
+        const handle = await NODE_AUDIT_FILE_SYSTEM.open(target, flags, mode);
+        return {
+          write: (data) => handle.write(data),
+          sync: async () => {
+            if (target === file) {
+              fileSyncs += 1;
+              if (fileSyncs === 3) throw Object.assign(new Error("EIO"), { code: "EIO" });
+            }
+            return handle.sync();
+          },
+          stat: () => handle.stat(),
+          close: () => handle.close(),
+        };
+      },
+    };
+    const h = harness();
+    h.venue.add(order("o-1"), order("o-2"));
+    const outcome = await runOpsCli(h.deps([...CANCEL_ALL, "--audit-log", file], { openAuditLog: (target) => createFileAuditLog(target, failingThirdSync) }));
+    expect(outcome.exitName).toBe("OUTCOME_UNRECORDED");
+    expect(outcome.exitCode).toBe(EXIT_CODES.OUTCOME_UNRECORDED);
+    expect(h.venue.open()).toEqual([]);
+    expect(h.text()).toContain("(SYNC_FAILED). The command MAY ALREADY HAVE ACTED");
+  });
+
+  it("no ACTING record (a PAPER refusal) and the OUTCOME cannot be written: OUTCOME_UNRECORDED too, and the output says nothing was sent", async () => {
+    const h = harness();
+    h.audit.failOn = "OUTCOME";
+    const outcome = await runOpsCli(h.deps(CANCEL_ALL, { runModeFlags: PAPER_FLAGS }));
+    expect(outcome.exitName).toBe("OUTCOME_UNRECORDED");
+    expect(phases(h.audit.records)).toEqual(["INVOKED"]);
+    expect(h.text()).toContain("No ACTING record was written, so this invocation sent no cancel and revoked no lease");
+    expect(h.text()).toContain("the command's own outcome, RUN_MODE_REFUSED (exit 4), is NOT in the audit log");
+    expect(h.touched).toEqual([]);
+  });
+
+  it("an OUTCOME refused as too large is written again with the exit alone (detailOmitted): the outcome is never lost to its own size", async () => {
+    const h = harness();
+    h.venue.add(order("o-1"));
+    let refusedOnce = false;
+    const sink: AuditSink = {
+      location: h.audit.location,
+      append(record: AuditRecord): Promise<void> {
+        if (record.phase === "OUTCOME" && !refusedOnce) {
+          refusedOnce = true;
+          return Promise.reject(new AuditUnavailableError("RECORD_TOO_LARGE", h.audit.location));
+        }
+        return h.audit.append(record);
+      },
+    };
+    const outcome = await runOpsCli(h.deps(CANCEL_ALL, { openAuditLog: () => sink }));
+    expect(outcome.exitName).toBe("COMPLETED");
+    expect(phases(h.audit.records)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+    expect(h.audit.records[2]?.sequence).toBe(2);
+    expect(h.audit.records[2]?.detail).toEqual({ exit: "COMPLETED", exitCode: 0, detailOmitted: "RECORD_TOO_LARGE" });
+    expect(h.text()).toContain("so it records the exit alone (detailOmitted)");
+  });
+});
+
+describe("WP330-V1-02: a FIFO at the audit-log path is refused at once, never waited on", () => {
+  it("a FIFO with no reader: AUDIT_UNAVAILABLE (OPEN_FAILED) at once, and nothing is touched", async () => {
+    const fifo = path.join(scratch, "audit.fifo");
+    await promisify(execFile)("mkfifo", [fifo]);
+    const h = harness();
+    h.venue.add(order("o-1"));
+    const run = runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`, "--audit-log", fifo), { openAuditLog: (target) => createFileAuditLog(target) }));
+    try {
+      const settled = await Promise.race([run, new Promise<"HUNG">((resolve) => setTimeout(() => resolve("HUNG"), 2_000))]);
+      expect(settled).not.toBe("HUNG");
+      expect(settled).toMatchObject({ exitName: "AUDIT_UNAVAILABLE" });
+      expect(h.text()).toContain("could not record this invocation (OPEN_FAILED). Nothing was done");
+      expect(h.touched).toEqual([]);
+      expect(h.venue.calls).toEqual([]);
+    } finally {
+      // Release a writer blocked in open(2) (fb9edcc's flags), so no thread is left behind.
+      const reader = await open(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+      await reader.close();
+      await run.catch(() => undefined);
+    }
+  });
+});
+
+describe("CX330-R1-03 and WP330-V1-05: operator text that may be a pasted secret reaches no output, log, mirror or lease", () => {
+  const CANARY = "FAKE-CANARY-not-a-secret-7f3a";
+
+  it("a --reason assigning a value to a credential name, in a PAPER refusal: a usage error that repeats nothing, in the file, the mirror or the output", async () => {
+    for (const reason of [`apiKey=${CANARY}`, `passphrase: ${CANARY}`, `{"secret":"${CANARY}"}`, `Authorization: Bearer ${CANARY}`, `incident 7, my_private_key = ${CANARY}`]) {
+      const file = path.join(scratch, `paper-${String(reason.length)}.jsonl`);
+      const mirrored: AuditRecord[] = [];
+      const h = harness({ mirror: { append: (record) => (mirrored.push(record), Promise.resolve()) } });
+      const outcome = await runOpsCli(
+        h.deps(args("cancel-all", "--reason", reason, "--dry-run", "--audit-log", file), { runModeFlags: PAPER_FLAGS, openAuditLog: (target) => createFileAuditLog(target) }),
+      );
+      expect(outcome.exitName, reason).toBe("USAGE");
+      expect(await readFile(file, "utf8"), reason).not.toContain(CANARY);
+      expect(JSON.stringify(mirrored), reason).not.toContain(CANARY);
+      expect(h.text(), reason).not.toContain(CANARY);
+      expect(h.text()).toContain("--reason is refused: it assigns a value to a credential-like name");
+      expect(mirrored.map((record) => record.reason)).toEqual([null, null]);
+    }
+  });
+
+  it("live-shaped: cancel-all sends nothing, and stop-heartbeat opens no lease store and revokes nothing, with such a reason", async () => {
+    const h = harness();
+    h.venue.add(order("o-1"));
+    const cancel = await runOpsCli(h.deps(args("cancel-all", "--reason", `apiKey=${CANARY}`, "--confirm", `cancel-all:${ACCOUNT}`)));
+    expect(cancel.exitName).toBe("USAGE");
+    expect(h.venue.calls).toEqual([]);
+    const leases = fakeLeases();
+    const stop = await runOpsCli(h.deps(args("stop-heartbeat", "--reason", `token: ${CANARY}`, "--confirm", `stop-heartbeat:${ACCOUNT}:${LEASE_ID}`), { leases: leases.factory }));
+    expect(stop.exitName).toBe("USAGE");
+    expect(leases.opened).toBe(0);
+    expect(leases.revoked).toEqual([]);
+    expect(JSON.stringify(h.audit.records)).not.toContain(CANARY);
+    expect(h.text()).not.toContain(CANARY);
+  });
+
+  it("an unknown command or option that is not a command word is not repeated, in the file or the output", async () => {
+    const file = path.join(scratch, "unknown.jsonl");
+    const h = harness();
+    for (const argv of [["0xdeadbeefSECRETKEY", "--account", "a1", "--operator", "op"], ["cancel-all", "--account", "a1", "--operator", "op", "--reason", "r", "--Key9SECRETKEY=x"]]) {
+      const outcome = await runOpsCli(h.deps([...argv, "--audit-log", file], { openAuditLog: (target) => createFileAuditLog(target) }));
+      expect(outcome.exitName).toBe("USAGE");
+    }
+    expect(await readFile(file, "utf8")).not.toContain("SECRETKEY");
+    expect(h.text()).not.toContain("SECRETKEY");
+    expect(h.text()).toContain("unknown command (not repeated: it is not a command or option word)");
+    expect(h.text()).toContain("unknown option (not repeated: it is not a command or option word)");
   });
 });

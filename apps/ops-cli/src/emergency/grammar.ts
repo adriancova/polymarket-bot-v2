@@ -22,8 +22,18 @@
  *   `--confirm <scope>` naming it exactly (`confirmation.ts`);
  * - `--dry-run` or `--confirm` on a read-only command, `--asset` anywhere but
  *   cancel-market;
- * - a destructive command without `--reason`.
+ * - a destructive command without `--reason`;
+ * - a `--reason` that assigns a value to a credential-like name (WP-330 r1,
+ *   CX330-R1-03): see {@link namesCredentialAssignment}.
+ *
+ * WHAT IS ECHOED. A usage error is printed and audited, so its text never
+ * repeats operator input that may be a pasted value: an unknown command or
+ * option is named only when it reads as a command or option word
+ * ({@link echoToken}), and a refused `--reason` is never repeated (WP-330 r1,
+ * WP330-V1-05).
  */
+
+import { isSensitiveKey } from "@polymarket-bot/polymarket-secure";
 
 export const DESTRUCTIVE_COMMANDS = ["cancel-order", "cancel-market", "cancel-all", "stop-heartbeat"] as const;
 export const READ_ONLY_COMMANDS = ["account-snapshot", "reconcile"] as const;
@@ -41,6 +51,11 @@ export const CONDITION_ID = /^0x[0-9a-fA-F]{64}$/u;
 export const ASSET_ID = /^(?:[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
 /** An account or operator reference: printable, no spaces, within the database's `internal.identifier` (200). */
 export const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,199}$/u;
+/** An `--account` or `--operator` that may be printed and recorded: the grammar, and no credential-like `NAME:value` (`namesCredentialAssignment`). */
+function isReference(value: string): boolean {
+  return REFERENCE.test(value) && !namesCredentialAssignment(value);
+}
+
 /** The database's `internal.detail` bound. */
 export const MAX_REASON_LENGTH = 2000;
 /** A path is bounded so a record can always hold it. */
@@ -49,6 +64,45 @@ export const MAX_PATH_LENGTH = 1024;
 export const MAX_CONFIRM_LENGTH = 300;
 
 const BARE_YES_FLAGS = ["--yes", "-y", "--force", "--non-interactive", "--assume-yes"];
+
+/** The longest operator token a usage error repeats. */
+export const MAX_ECHOED_TOKEN_LENGTH = 40;
+/** A command or option word: lowercase letters in hyphen-joined groups, optionally after `-` or `--`. No digit, no capital: a pasted key, id or secret never reads as one. */
+const ECHOABLE_WORD = /^-{0,2}[a-z]+(?:-[a-z]+)*$/u;
+
+/**
+ * An operator token as a usage error repeats it: itself when it reads as a
+ * command or option word of at most {@link MAX_ECHOED_TOKEN_LENGTH}
+ * characters (a typo of one), and a fixed placeholder otherwise, so a value
+ * pasted where a command was expected reaches neither the output nor the
+ * audit log.
+ */
+export function echoToken(token: string): string {
+  return token.length <= MAX_ECHOED_TOKEN_LENGTH && ECHOABLE_WORD.test(token) ? token : "(not repeated: it is not a command or option word)";
+}
+
+/** `NAME=value` or `NAME: value` (a quoted JSON key's closing quote allowed) in free text. */
+const ASSIGNMENT = /([A-Za-z][A-Za-z0-9_-]*)["']?\s*[:=]/gu;
+
+/**
+ * True when free text assigns a value to a credential-like NAME:
+ * `apiKey=…`, `passphrase: …`, `"secret": …`, `Authorization: …`. NAME is
+ * judged by WP-260's own key-name heuristic, `isSensitiveKey` (the list
+ * `redactForLog` redacts by), so the CLI and WP-260 agree on what a credential
+ * name is. A heuristic over NAMES, like WP-260's: a bare secret with no name
+ * is not detected, and a harmless pair such as `tokens: 5` is refused (the
+ * operator rephrases). The operator's `--reason` is free text that is printed,
+ * audited, mirrored to the database and written on a revoked lease, so a
+ * reason that names a credential is refused rather than recorded (WP-330 r1,
+ * CX330-R1-03).
+ */
+export function namesCredentialAssignment(text: string): boolean {
+  for (const match of text.matchAll(ASSIGNMENT)) {
+    const name = match[1];
+    if (name !== undefined && isSensitiveKey(name)) return true;
+  }
+  return false;
+}
 
 export interface ParsedCommand {
   readonly command: CommandName;
@@ -166,7 +220,7 @@ export function parseArguments(argv: readonly string[]): ParseResult {
           index += 1;
           // `--reason --dry-run` almost certainly forgot the value: an option is never taken as one.
           if (typeof value === "string" && value.startsWith("--")) {
-            fail(`${option} needs a value (found the option ${value.split("=")[0] ?? value} instead)`);
+            fail(`${option} needs a value (found the option ${echoToken(value.split("=")[0] ?? value)} instead)`);
             continue;
           }
         }
@@ -175,7 +229,7 @@ export function parseArguments(argv: readonly string[]): ParseResult {
         else values.set(option, value);
         continue;
       }
-      fail(`unknown option ${name.length > 40 ? `${name.slice(0, 40)}…` : name}`);
+      fail(`unknown option ${echoToken(name)}`);
       continue;
     }
     operands.push(raw);
@@ -192,8 +246,8 @@ export function parseArguments(argv: readonly string[]): ParseResult {
       problem: text,
       command,
       auditLogPath: auditLogPath !== null && auditLogPath.length > 0 && auditLogPath.length <= MAX_PATH_LENGTH && !hasControl(auditLogPath) ? auditLogPath : null,
-      operator: operatorRaw !== undefined && REFERENCE.test(operatorRaw) ? operatorRaw : null,
-      accountRef: accountRaw !== undefined && REFERENCE.test(accountRaw) ? accountRaw : null,
+      operator: operatorRaw !== undefined && isReference(operatorRaw) ? operatorRaw : null,
+      accountRef: accountRaw !== undefined && isReference(accountRaw) ? accountRaw : null,
     });
 
   if (flags.has("--help") && problem === null) {
@@ -201,7 +255,7 @@ export function parseArguments(argv: readonly string[]): ParseResult {
   }
   if (problem !== null) return usage(problem);
   if (commandText === undefined) return flags.has("--help") ? Object.freeze({ kind: "HELP" as const, topic: null }) : usage("no command given");
-  if (command === null) return usage(`unknown command ${commandText.length > 40 ? `${commandText.slice(0, 40)}…` : commandText}`);
+  if (command === null) return usage(`unknown command ${echoToken(commandText)} (the commands: ${COMMANDS.join(", ")})`);
 
   // Operands.
   let target: string | null = null;
@@ -219,12 +273,19 @@ export function parseArguments(argv: readonly string[]): ParseResult {
   const accountRef = values.get("--account");
   if (accountRef === undefined) return usage("--account is required: it names the account whose credentials act, and the scope you confirm");
   if (!REFERENCE.test(accountRef)) return usage("--account must be 1–200 of A-Z a-z 0-9 _ . : @ -, starting with a letter or digit");
+  if (namesCredentialAssignment(accountRef)) return usage("--account is refused: it reads as a credential-like NAME: value pair. It is neither repeated nor recorded");
   const operator = values.get("--operator");
   if (operator === undefined) return usage("--operator is required: every invocation is audited with who acted");
   if (!REFERENCE.test(operator)) return usage("--operator must be 1–200 of A-Z a-z 0-9 _ . : @ -, starting with a letter or digit");
+  if (namesCredentialAssignment(operator)) return usage("--operator is refused: it reads as a credential-like NAME: value pair. It is neither repeated nor recorded");
   const reason = values.get("--reason") ?? null;
   if (reason !== null && (reason.trim().length === 0 || reason.length > MAX_REASON_LENGTH || hasControl(reason))) {
     return usage(`--reason must be 1–${String(MAX_REASON_LENGTH)} characters with no control characters`);
+  }
+  if (reason !== null && namesCredentialAssignment(reason)) {
+    return usage(
+      "--reason is refused: it assigns a value to a credential-like name (NAME=value or NAME: value, where NAME reads as a key, token, secret, passphrase, signature or the like). It is neither repeated nor recorded. Describe the incident without the value",
+    );
   }
   if (isDestructive(command) && reason === null) return usage(`${command} is destructive: --reason is required, and audited`);
   const dryRun = flags.has("--dry-run");

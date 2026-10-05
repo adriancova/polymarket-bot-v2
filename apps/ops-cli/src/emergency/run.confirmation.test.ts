@@ -11,8 +11,9 @@
 import { installNetworkTripwire, type NetworkTripwire } from "@polymarket-bot/polymarket-secure/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { scopeText } from "./confirmation.js";
 import { EXIT_CODES } from "./exit-codes.js";
-import type { DestructiveCommand } from "./grammar.js";
+import { parseArguments, type DestructiveCommand } from "./grammar.js";
 import { ACCOUNT, args, CONDITION, DESTRUCTIVE_REASON, fakeLeases, harness, LEASE_ID, order, phases, TOKEN_YES, typedPrompt, type FakeLeases, type Harness } from "./harness.test-support.js";
 import { runOpsCli } from "./run.js";
 
@@ -34,8 +35,8 @@ interface Case {
 }
 
 const CASES: readonly Case[] = [
-  { command: "cancel-order", operands: ["o-1"], scope: "cancel-order:o-1", otherScope: "cancel-order:o-2" },
-  { command: "cancel-market", operands: [CONDITION], scope: `cancel-market:${CONDITION}`, otherScope: `cancel-market:0x${"d".repeat(64)}` },
+  { command: "cancel-order", operands: ["o-1"], scope: `cancel-order:o-1@${ACCOUNT}`, otherScope: `cancel-order:o-2@${ACCOUNT}` },
+  { command: "cancel-market", operands: [CONDITION], scope: `cancel-market:${CONDITION}@${ACCOUNT}`, otherScope: `cancel-market:0x${"d".repeat(64)}@${ACCOUNT}` },
   { command: "cancel-all", operands: [], scope: `cancel-all:${ACCOUNT}`, otherScope: "cancel-all:acct-other" },
   { command: "stop-heartbeat", operands: [], scope: `stop-heartbeat:${ACCOUNT}:${LEASE_ID}`, otherScope: `stop-heartbeat:${ACCOUNT}:01a10bef-6200-7000-8000-00000000ffff` },
 ];
@@ -73,6 +74,18 @@ describe("acceptance 3: a destructive command acts only on a scoped confirmation
         expect(outcome.exitName).toBe("CONFIRMATION_REFUSED");
         expect(acted(h, leases)).toBe(false);
         expect(h.text()).toContain(`it must be exactly ${testCase.scope}`);
+      });
+
+      it("WP-330 r1 (WP330-V1-06): the scope names the account, so the --confirm a script uses for one account is refused under another", async () => {
+        const forAccount = parseArguments(argv("--confirm", "x"));
+        if (forAccount.kind !== "COMMAND") throw new Error("expected a command");
+        const accepted = scopeText(forAccount.command, testCase.command === "stop-heartbeat" ? LEASE_ID : null);
+        expect(accepted).toBe(testCase.scope);
+        const { h, leases } = setUp();
+        const otherAccount = [testCase.command, ...testCase.operands, ...DESTRUCTIVE_REASON, "--account", "acct-other", "--operator", "operator-ana", "--confirm", accepted];
+        const outcome = await runOpsCli(h.deps(otherAccount, { leases: leases.factory }));
+        expect(outcome.exitName).toBe("CONFIRMATION_REFUSED");
+        expect(acted(h, leases)).toBe(false);
       });
 
       it("--confirm naming the scope exactly: it acts, with the ACTING record written first", async () => {
@@ -140,9 +153,9 @@ describe("acceptance 3: a destructive command acts only on a scoped confirmation
 
   it("cancel-market's scope includes the asset when one is given: the market-wide scope does not confirm it", async () => {
     const { h, leases } = setUp();
-    const outcome = await runOpsCli(h.deps(args("cancel-market", CONDITION, "--asset", TOKEN_YES, ...DESTRUCTIVE_REASON, "--confirm", `cancel-market:${CONDITION}`), { leases: leases.factory }));
+    const outcome = await runOpsCli(h.deps(args("cancel-market", CONDITION, "--asset", TOKEN_YES, ...DESTRUCTIVE_REASON, "--confirm", `cancel-market:${CONDITION}@${ACCOUNT}`), { leases: leases.factory }));
     expect(outcome.exitName).toBe("CONFIRMATION_REFUSED");
-    expect(h.text()).toContain(`cancel-market:${CONDITION}:${TOKEN_YES}`);
+    expect(h.text()).toContain(`cancel-market:${CONDITION}:${TOKEN_YES}@${ACCOUNT}`);
   });
 
   it("stop-heartbeat's scope is the lease read now: a confirmation for a lease since replaced never matches", async () => {

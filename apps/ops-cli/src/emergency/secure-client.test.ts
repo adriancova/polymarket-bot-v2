@@ -19,7 +19,7 @@ import {
 } from "@polymarket-bot/polymarket-secure/testing";
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it } from "vitest";
 
-import { ACCOUNT, args, DESTRUCTIVE_REASON, harness, order, PAPER_FLAGS } from "./harness.test-support.js";
+import { ACCOUNT, args, DESTRUCTIVE_REASON, harness, order, PAPER_FLAGS, phases, testConfiguration } from "./harness.test-support.js";
 import type { EmergencyCancelClient, EmergencyVenueFactory } from "./ports.js";
 import { runOpsCli } from "./run.js";
 
@@ -96,6 +96,29 @@ describe("WP-260: the cancel path is WP-260's secure client", () => {
     // o-1 is still listed (the fake SDK applied nothing), so the by-id sweep goes through WP-260's cancelOrders too.
     expect(h.text()).toContain("DELETE /orders (1 id): sent");
     expect(outcome.exitName).toBe("COMPLETED");
+  });
+
+  it("CX330-R1-02: WP-260's own close awaits the SDK's closeSubscriptions() unbounded; one that never settles still lets cancel-all end, with its OUTCOME recorded", async () => {
+    const h = harness({ configuration: testConfiguration({ venueAnswerBoundMs: 50 }) });
+    h.venue.add(order("o-1"));
+    const { factory, sdk } = secureVenues(h, {
+      cancelAll: () => {
+        for (const entry of h.venue.open()) entry.status = "CANCELED";
+        return { canceled: ["o-1"], notCanceled: {} } as never;
+      },
+      closeSubscriptions: () => new Promise(() => undefined),
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      runOpsCli(h.deps(args("cancel-all", ...DESTRUCTIVE_REASON, "--confirm", `cancel-all:${ACCOUNT}`), { venues: factory })),
+      new Promise<"HUNG">((resolve) => (timer = setTimeout(() => resolve("HUNG"), 3_000))),
+    ]);
+    clearTimeout(timer);
+    expect(outcome).not.toBe("HUNG");
+    expect(outcome).toMatchObject({ exitName: "COMPLETED" });
+    expect(sdk.recorder.calls.get("closeSubscriptions")).toBe(1);
+    expect(phases(h.audit.records)).toEqual(["INVOKED", "ACTING", "OUTCOME"]);
+    expect(h.text()).toContain("release: the venue client did not finish releasing within 50 ms");
   });
 
   it("WP-260's own gate stands behind the CLI's: a factory handed a PAPER context refuses to build the client", async () => {
