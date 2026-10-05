@@ -155,12 +155,21 @@
  *   answered.
  * - **The user stream (WP-280).** Its reconciliation requests trigger runs and
  *   are acknowledged, by id, only after a run whose order and trade reads
- *   began after their receipt and were complete; each acknowledgement is
- *   journaled. Its normalized events are routed to the OMS (outside runs;
- *   buffered during one). Every item the OMS did not apply, whatever its
- *   answer (a refusal of any code, a throw), and every item routed while no
- *   OMS is bound, is kept as journaled evidence at once and triggers a run
- *   (r7, WP290-V7-STREAM-REFUSAL-DROPPED).
+ *   began after their receipt and were complete, and (r14) that judged every
+ *   identity the request named; each acknowledgement is journaled. Its
+ *   normalized events are routed to the OMS (outside runs; buffered during
+ *   one, and (r14) an output buffered during a run is work that arrived: the
+ *   run does not resume, and the next run routes it before it reads). Every
+ *   item the OMS did not apply, whatever its answer (a refusal of any code, a
+ *   throw), and every item routed while no OMS is bound, is kept as journaled
+ *   evidence at once and triggers a run (r7, WP290-V7-STREAM-REFUSAL-DROPPED).
+ *   (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) What an output's EVENT names,
+ *   and what every request names, is journaled as stream-NAMED evidence at
+ *   once (`streamEventRecords`, `streamRequestRecords`): an order read by id;
+ *   a trade whose identity is open until a valid trades row shows its own
+ *   legs; `unordered` when its status cannot be ordered. An empty projection
+ *   or a shortfall requires the event; an identity that cannot be read is an
+ *   obligation of the account.
  * - **Malformed requests.** A request that cannot be read, on any channel, is
  *   refused to its requester (the OMS and the inventory keep it as owed) and
  *   recorded as a REQUEST_MALFORMED break by the next run: a hold, which a
@@ -184,7 +193,8 @@
  *   (except one held for the retransmission decision, as the OMS allows);
  *   no evidence is retained;
  * - no OMS, wallet or stream request is unanswered, and none arrived during
- *   the run; the inventory holds no undelivered request;
+ *   the run; (r14) no user-stream activity output arrived during it (it waits,
+ *   unrouted, in the buffer); the inventory holds no undelivered request;
  * - `RUN_COMPLETED` with `PASSED` is durable, AND nothing held the account
  *   while it was being written (a trigger, any request receipt, a pause: the
  *   hold epoch). The decision is taken, the record awaited, and the epoch
@@ -236,13 +246,16 @@ import {
   readRefusalCode,
   readRemainingBookings,
   readStreamOutput,
+  readStreamRequest,
   readTrades,
   readWalletMember,
   tradeStatusOf,
   type LegFragments,
   type ProjectedHoldingsRead,
   type ReadOutcome,
+  type StreamEventFragments,
   type StreamItemFragments,
+  type StreamRequestFragments,
   type TradeFragments,
   type WalletMemberRead,
 } from "./door.js";
@@ -367,6 +380,22 @@ interface Received<T> {
   readonly seq: number;
   /** The clock at receipt; `null` until a sound reading was taken (it is then stamped, conservatively, later). */
   readonly atMs: number | null;
+}
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) What a WP-280 request named of the account's activity (its event-level
+ * identities), each a subject its acknowledgement waits on: it is acknowledged only by a run that judged every one of
+ * them (`#streamRequestDischarged`), never by a run that merely read everything.
+ */
+interface StreamRequestSubjects {
+  readonly trades: readonly string[];
+  readonly orders: readonly string[];
+  /** An identity it named could not be read: its obligation holds the account, and the request is never acknowledged. */
+  readonly unreadable: boolean;
+}
+
+interface ReceivedStreamRequest extends Received<StreamReconciliationRequest> {
+  readonly named: StreamRequestSubjects;
 }
 
 /** A reconciliation request that could not be read, awaiting the run that records it. */
@@ -552,8 +581,8 @@ export class ReconciliationCoordinator {
   readonly #attemptFacts = new Map<string, AttemptFacts>();
   /** wallet operation id → its latest request. */
   readonly #walletRequests = new Map<string, Received<WalletReconciliationRequest>>();
-  /** stream request id → the request. */
-  readonly #streamRequests = new Map<string, Received<StreamReconciliationRequest>>();
+  /** stream request id → the request, and (r14) what it named. */
+  readonly #streamRequests = new Map<string, ReceivedStreamRequest>();
   /** Malformed request receipts, each recorded as a REQUEST_MALFORMED break by the next run (`#takeMalformed`). */
   readonly #malformed: MalformedReceipt[] = [];
   #malformedUnitemised = 0;
@@ -584,6 +613,12 @@ export class ReconciliationCoordinator {
   #evidenceLoaded = false;
   /** Records folded during this run's reads, journaled together once the reads end (`#flushEvidence`). */
   readonly #evidenceQueue: EvidenceRecord[] = [];
+  /**
+   * (r14) The identities a stream request named, received while a run was in progress: a run never folds evidence it
+   * did not judge (it settles what it judged at the store's level), so they wait for the next run's evidence load
+   * (`#loadEvidence`), or, once the run ends, are recorded at once (`#flushReceipts`).
+   */
+  readonly #receiptEvidence: EvidenceRecord[] = [];
   /**
    * Each bound OMS instance's alert identity. `OmsAlert` carries no id, and two alerts can be identical (two trades
    * of one order FAILED): an alert is its instance's incarnation id and its ordinal in the instance's append-only
@@ -643,6 +678,12 @@ export class ReconciliationCoordinator {
    * ORDER or TRADE output's own key, is ROUTED: the door reads it as an unreadable entry (a journaled obligation of the
    * account, and a run), never as nothing. Only STATE, UNRECOGNIZED_MESSAGE and RECONCILIATION_REQUESTED outputs, as
    * WP-280 emits them, carry nothing to route.
+   *
+   * (r14, the re-audit of WP290-V14-WP280-EVENT-IDS-DISCARDED) An activity output received DURING a run is account
+   * activity that run's reads may predate, held unrouted in the buffer: it is work that arrived during the run, like a
+   * trigger or a request. It advances the hold epoch (so a run deciding to resume while it arrives does not resume),
+   * the run reruns (`#workArrivedDuring`), and the next run of the same `reconcile` routes it first (`#drainBetweenRuns`).
+   * c3cb404 resumed with it still in the buffer: the fill it carried was unapplied at the resume (R1).
    */
   onUserStreamOutput(output: unknown): void {
     const read = classifyStreamOutput(output);
@@ -653,6 +694,7 @@ export class ReconciliationCoordinator {
     if (read.read === "NOTHING") return;
     if (this.#running) {
       this.#streamBuffer.push(output);
+      this.#hold();
       return;
     }
     this.#enqueueStream(output);
@@ -679,6 +721,8 @@ export class ReconciliationCoordinator {
     try {
       await this.#streamChain;
       for (let index = 0; index < MAX_RUNS_PER_RECONCILE; index += 1) {
+        // (r14) What arrived during the previous run is taken in before this one reads.
+        if (index > 0) await this.#drainBetweenRuns();
         let report: RunReport;
         try {
           report = await this.#runOnce();
@@ -692,9 +736,20 @@ export class ReconciliationCoordinator {
       }
     } finally {
       this.#running = false;
+      this.#flushReceipts();
       for (const output of this.#streamBuffer.splice(0)) this.#enqueueStream(output);
     }
     return Object.freeze({ runs: Object.freeze(runs), resumed: runs.some((run) => run.resumed) });
+  }
+
+  /**
+   * (r14) Between two runs of one `reconcile`: every output buffered during the previous run is routed (in order) before
+   * the next run reads (the identities a request named during it are taken in by that run's evidence load). No run is
+   * in progress here.
+   */
+  async #drainBetweenRuns(): Promise<void> {
+    for (const output of this.#streamBuffer.splice(0)) this.#enqueueStream(output);
+    await this.#streamChain;
   }
 
   /**
@@ -2473,11 +2528,14 @@ export class ReconciliationCoordinator {
    * in the journal like every other answer (WP-280's manager keeps its backlog in memory only: the journal is
    * the durable record that a request was answered, and by which run).
    */
-  async #acknowledgeStreamRequests(run: RunState, answerable: readonly Received<StreamReconciliationRequest>[]): Promise<void> {
+  async #acknowledgeStreamRequests(run: RunState, answerable: readonly ReceivedStreamRequest[]): Promise<void> {
     const stream = this.#stream;
     for (const received of answerable) {
       // (r5, WP290-CX-R5-02) No acknowledgement once a clock fault is detected in this run: the request stays owed.
       if (!this.#mayCommit(run)) return;
+      // (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) A request that named the account's activity is acknowledged only by
+      // a run that judged every identity it named: until then it stays owed (and holds the account).
+      if (!this.#streamRequestDischarged(run, received.named)) continue;
       const requestId = received.request.requestId;
       let accepted = false;
       try {
@@ -2490,6 +2548,27 @@ export class ReconciliationCoordinator {
       const subjectId = isIdentifier(requestId) ? requestId : "user-stream";
       await this.#recordAnswer(run, "USER_STREAM", requestId, subjectId, "ACKNOWLEDGED", accepted, accepted ? null : "STREAM_UNKNOWN_REQUEST");
     }
+  }
+
+  /**
+   * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) Whether this run judged every identity a stream request named: each
+   * trade without a conflict (the store's verdict, against this run's complete trades read and all the evidence: its
+   * identity answered, its status ordered or terminal, its legs accounted for); each order CONSISTENT, ACKNOWLEDGED, or
+   * settled by an earlier sound run. A request one of whose identities could not be read never is.
+   */
+  #streamRequestDischarged(run: RunState, named: StreamRequestSubjects): boolean {
+    if (named.unreadable) return false;
+    for (const tradeId of named.trades) {
+      const verdict = run.tradeVerdicts.get(tradeId);
+      if (verdict === undefined || verdict.kind === "CONFLICT") return false;
+    }
+    for (const orderId of named.orders) {
+      const verdict = run.verdicts.get(orderId);
+      if (verdict?.kind === "CONSISTENT" || verdict?.kind === "ACKNOWLEDGED") continue;
+      if (verdict === undefined && this.#evidence.order(orderId)?.settled === true) continue;
+      return false;
+    }
+    return true;
   }
 
   #pullStreamRequests(): void {
@@ -2531,6 +2610,14 @@ export class ReconciliationCoordinator {
    * names its trade and order. Every entry or list present but unreadable is an UNREADABLE obligation of the account.
    * (r12, WP290-CX-R12-01) So is a projection key that is MISSING (an ORDER's `observation`, a TRADE's `fills` or
    * `settlements`): the door names it unreadable, so it is journaled here as an obligation and a run is triggered.
+   *
+   * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) What the output's EVENT named is journaled here too, whatever the
+   * projection carried (`streamEventRecords`): an order event's order (NAMED, with the facts the event stated: it is read
+   * by id until a sound run settles it, so an unknown attempt is never answered ABSENT while it stands); a trade event's
+   * trade (its identity OPEN until a valid row shows its own legs in full; `unordered` when its status cannot be
+   * ordered) and each leg the event attributes to the account. An output whose projection WP-280 did not attest whole
+   * (an empty projection, a shortfall) triggers a run; one whose required event, or its id, cannot be read is an
+   * obligation (the door's unreadable entry).
    */
   async #routeStream(output: unknown): Promise<void> {
     const read = readStreamOutput(output);
@@ -2551,6 +2638,10 @@ export class ReconciliationCoordinator {
           ? unkeyedOrderRecord({ venueOrderId: null, tokenId: null, side: null, price: null, originalSize: null, sizeMatched: null, status: null, unreadable: [] }, "STREAM_ORDER_UNKEYED")
           : unkeyedTradeRecord({ status: null, transactionHash: null, ownershipUndetermined: null, unreadable: [entry.field] }, "STREAM_UNREADABLE");
       await this.#recordEvidenceNow(null, record, atMs());
+    }
+    if (read.event !== undefined) {
+      for (const record of streamEventRecords(read.event)) await this.#recordEvidenceNow(null, record, atMs());
+      if (read.event.required) unapplied = true;
     }
     for (const item of read.items) {
       let result: unknown;
@@ -3092,17 +3183,46 @@ export class ReconciliationCoordinator {
     this.trigger(request.trigger === "WALLET_OPERATION_UNKNOWN" ? "WALLET_OPERATION_UNKNOWN" : "POSITION_BALANCE_DISCREPANCY");
   }
 
+  /**
+   * One WP-280 reconciliation request, read at its door (`door.ts`, `readStreamRequest`). (r14,
+   * WP290-V14-WP280-EVENT-IDS-DISCARDED) What it NAMED is journaled at receipt, whatever its usability
+   * (`streamRequestRecords`: a trade it names, NAMED and OPEN, `unordered` unless WP-280 recognised its status; the
+   * orders an order event's request names, NAMED, read by id; an identity that cannot be read, an obligation of the
+   * account), and it is acknowledged only once a run has judged every identity it named. A request whose id or cause
+   * cannot be read is refused as malformed (a REQUEST_MALFORMED hold), as before.
+   */
   #receiveStreamRequest(raw: unknown): void {
-    const fields = readFields(raw, ["requestId", "cause", "markets"]);
-    if (fields === undefined || !isText(fields.requestId, MAX_REQUEST_ID) || typeof fields.cause !== "string") {
+    const read = readStreamRequest(raw);
+    this.#recordAtReceipt(streamRequestRecords(read));
+    if (read.opaque || read.requestId === null || read.cause === null) {
       this.#receiveMalformed("user-stream", "outside WP-280's request shape", "USER_STREAM_RECONNECT");
       return;
     }
-    const markets = (readArray(fields.markets, 100_000) ?? []).filter((market): market is string => typeof market === "string");
-    const request: StreamReconciliationRequest = Object.freeze({ requestId: fields.requestId, cause: fields.cause, markets: Object.freeze(markets) });
+    const request: StreamReconciliationRequest = Object.freeze({ requestId: read.requestId, cause: read.cause, markets: read.markets });
     const seq = ++this.#seq;
-    this.#streamRequests.set(request.requestId, Object.freeze({ request, seq, atMs: this.#now() }));
+    this.#streamRequests.set(request.requestId, Object.freeze({ request, seq, atMs: this.#now(), named: streamRequestSubjects(read) }));
     this.trigger(STREAM_DISCREPANCY_CAUSES.includes(request.cause) ? "POSITION_BALANCE_DISCREPANCY" : "USER_STREAM_RECONNECT");
+  }
+
+  /**
+   * (r14) Journal what a stream request named: now (on the stream chain, in order with the outputs) between runs; during
+   * a run, by the next run's evidence load (a run never folds evidence it did not judge).
+   */
+  #recordAtReceipt(records: readonly EvidenceRecord[]): void {
+    if (records.length === 0) return;
+    this.#receiptEvidence.push(...records);
+    if (!this.#running) this.#flushReceipts();
+  }
+
+  /** (r14) Record, on the stream chain, every identity a request named that no run has taken in yet. */
+  #flushReceipts(): void {
+    const records = this.#receiptEvidence.splice(0);
+    if (records.length === 0) return;
+    this.#streamChain = this.#streamChain
+      .then(async () => {
+        for (const record of records) await this.#recordEvidenceNow(null, record, Math.max(this.#lastClock, 0));
+      })
+      .catch(() => undefined);
   }
 
   /** A request that could not be read: recorded (a REQUEST_MALFORMED break, by the next run), and a run is triggered. */
@@ -3175,9 +3295,13 @@ export class ReconciliationCoordinator {
     return taken;
   }
 
-  /** A trigger is pending, or a request arrived after the run's reads began (its answer needs a fresh read). */
+  /**
+   * A trigger is pending, or a request arrived after the run's reads began (its answer needs a fresh read), or (r14) an
+   * activity output arrived during the run (it waits, unrouted, in the buffer: the run's reads may predate it).
+   */
   #workArrivedDuring(sinceSeq: number): boolean {
     if (this.#triggers.length > 0) return true;
+    if (this.#streamBuffer.length > 0) return true;
     for (const entry of this.#omsRequests.values()) if (entry.seq > sinceSeq) return true;
     for (const entry of this.#walletRequests.values()) if (entry.seq > sinceSeq) return true;
     for (const entry of this.#streamRequests.values()) if (entry.seq > sinceSeq) return true;
@@ -3294,6 +3418,11 @@ export class ReconciliationCoordinator {
     this.#evidence = EvidenceStore.fold([...records, ...pending]);
     this.#evidenceLoaded = true;
     for (const record of pending) if (!(await this.#appendEvidence(run.runId, record, atMs))) run.journalOk = false;
+    // (r14) What a stream request named while a run was in progress (or as this run started): folded now, before
+    // anything is read, and journaled when it adds information.
+    for (const record of this.#receiptEvidence.splice(0)) {
+      if (this.#evidence.add(record) && !(await this.#appendEvidence(run.runId, record, atMs))) run.journalOk = false;
+    }
   }
 
   /** The journal's evidence records, read at their door; `undefined` when unreadable. */
@@ -3789,6 +3918,104 @@ function streamRecords(item: StreamItemFragments): readonly EvidenceRecord[] {
       item.transactionHash,
     ),
   ];
+}
+
+/** (r14) Every fill fact of a leg, named: an orphan leg the event attributes to the account fixes none of them. */
+const EVENT_ORPHAN_UNREADABLE: readonly string[] = ["feeAmount", "feeAssetId", "matchedAt", "price", "role", "shares", "side", "tokenId", "venueOrderId"];
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) The stream-NAMED evidence an activity output's EVENT carries
+ * (`door.ts`, `StreamEventFragments`), whatever its projection carried:
+ * - an order event: its order, NAMED (`STREAM_ORDER`), with every fact the event stated (token, side, price, sizes,
+ *   status) and the names of those it did not: the order is read by id until a sound run settles it, its matched size
+ *   is a lower bound a later read may not go below, and while it stands no attempt is answered ABSENT for it;
+ * - a trade event: its trade (`STREAM_TRADE`: its identity OPEN until a valid trades row shows its own legs in full),
+ *   and each leg the event attributes to the account (`STREAM_SETTLEMENT`: the trade and the order, no economics: the
+ *   stream fixes no fill fact exactly), its status when it can be ordered, else `unordered` (`status` named: only an
+ *   observation of the trade at a terminal status answers it); an own leg whose order id cannot be read is an ORPHAN_LEG.
+ * An event whose identity cannot be read carries nothing here; when it was required, it is the door's unreadable entry.
+ */
+function streamEventRecords(event: StreamEventFragments): readonly EvidenceRecord[] {
+  if (event.kind === "ORDER") {
+    if (event.venueOrderId === null) return [];
+    const unreadable = event.unreadable.map((name) => (name === "assetId" ? "tokenId" : name)).filter((name): name is "tokenId" | "side" | "price" | "originalSize" | "sizeMatched" | "status" => name !== "venueOrderId");
+    return [
+      orderFragmentsRecord(
+        {
+          venueOrderId: event.venueOrderId,
+          tokenId: event.tokenId,
+          side: event.side,
+          price: event.price,
+          originalSize: event.originalSize,
+          sizeMatched: event.sizeMatched,
+          status: event.status,
+          unreadable,
+          inFull: null,
+        },
+        "STREAM_ORDER",
+      ),
+    ];
+  }
+  const tradeId = event.venueTradeId;
+  if (tradeId === null) return [];
+  const status = event.ordered ? event.status : null;
+  const statusNames = event.ordered ? [] : ["status"];
+  const out: EvidenceRecord[] = [
+    tradeRecord(tradeId, status, "STREAM_TRADE", {
+      transactionHash: event.transactionHash,
+      ownershipUndetermined: !event.legsDetermined,
+      unreadable: event.unreadable.filter((name) => name !== "venueTradeId"),
+    }),
+  ];
+  for (const venueOrderId of event.ownOrderIds) {
+    out.push(legRecord(tradeId, { venueOrderId, tokenId: null, side: null, shares: null, price: null }, status, "NAMED", "STREAM_SETTLEMENT", statusNames, event.transactionHash));
+  }
+  if (event.ownOrphans > 0) {
+    out.push(
+      orphanLegRecord(
+        tradeId,
+        { venueOrderId: null, tokenId: null, side: null, shares: null, price: null, feeAmount: null, feeAssetId: null, role: null, matchedAt: null, unreadable: [...EVENT_ORPHAN_UNREADABLE, ...statusNames] },
+        status,
+        "STREAM_SETTLEMENT_ORPHAN",
+        event.transactionHash,
+      ),
+    );
+  }
+  return out;
+}
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) The stream-NAMED evidence a WP-280 reconciliation request carries
+ * (`door.ts`, `StreamRequestFragments`), whatever its usability:
+ * - the trade it names: `STREAM_TRADE`, its identity OPEN (only a valid row showing its own legs in full answers it),
+ *   `unordered` unless WP-280 recognised its status (an `EVENT_NOT_FULLY_APPLICABLE` with no status shortfall). The
+ *   orders a trade's request names are every order the trade matched, the counterparties' included (`manager.ts`,
+ *   `eventScope`): which are the account's is exactly what that open identity is answered by, so they are not
+ *   recorded as the account's orders (no venue document describes a by-id read of another account's order, E-14
+ *   covers the account's own, and a NAMED id the by-id read does not find is a ghost: an operator's quarantine);
+ * - with no trade: the orders it names (an order event's own order): NAMED, read by id until a sound run settles them;
+ * - an identity it names that cannot be read: an obligation of the account (`UNKEYED_TRADE` for its trade, or an
+ *   `UNKEYED_ORDER` for its orders).
+ */
+function streamRequestRecords(request: StreamRequestFragments): readonly EvidenceRecord[] {
+  if (request.venueTradeId !== null) {
+    return [tradeRecord(request.venueTradeId, null, "STREAM_TRADE", { unreadable: [...(request.unordered ? ["status"] : []), ...request.unreadable] })];
+  }
+  if (request.unreadable.includes("venueTradeId")) {
+    return [unkeyedTradeRecord({ status: null, transactionHash: null, ownershipUndetermined: null, unreadable: ["venueTradeId"] }, "STREAM_UNREADABLE")];
+  }
+  const out: EvidenceRecord[] = request.venueOrderIds.map((venueOrderId) => namedOrder(venueOrderId, "STREAM_ORDER", { unreadable: ["status"] }));
+  if (request.unreadable.includes("venueOrderIds")) {
+    out.push(unkeyedOrderRecord({ venueOrderId: null, tokenId: null, side: null, price: null, originalSize: null, sizeMatched: null, status: null, unreadable: ["venueOrderId"] }, "STREAM_ORDER_UNKEYED"));
+  }
+  return out;
+}
+
+/** (r14) The subjects a stream request's acknowledgement waits on ({@link streamRequestRecords}). */
+function streamRequestSubjects(request: StreamRequestFragments): StreamRequestSubjects {
+  if (request.venueTradeId !== null) return Object.freeze({ trades: Object.freeze([request.venueTradeId]), orders: Object.freeze([]), unreadable: false });
+  const unreadable = request.unreadable.includes("venueTradeId") || request.unreadable.includes("venueOrderIds");
+  return Object.freeze({ trades: Object.freeze([]), orders: Object.freeze([...request.venueOrderIds]), unreadable });
 }
 
 /** Every own leg of a FAILED trade in a valid trades read, by the venue's identity (frozen: handed to a port). */

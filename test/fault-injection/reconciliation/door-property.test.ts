@@ -42,12 +42,14 @@ import {
   readOrderById,
   readPositions,
   readStreamOutput,
+  readStreamRequest,
   readTrades,
   readWalletMember,
   type LegFragments,
   type OrderFragments,
   type ReadOutcome,
   type Salvage,
+  type StreamEventFragments,
   type TradeFragments,
 } from "../../../packages/oms/src/reconciliation/door.js";
 import { EvidenceStore, readEvidenceRecords } from "../../../packages/oms/src/reconciliation/evidence.js";
@@ -69,6 +71,7 @@ import {
   expectedEntries,
   expectedRoute,
   expectedRow,
+  expectedRequest,
   expectedStream,
   mutateAnswer,
   own,
@@ -78,6 +81,8 @@ import {
 } from "./support/mutate.js";
 import { seeded } from "./support/property.js";
 import { ready, type Ready } from "./support/scenario.js";
+import { OUR_OWNER, OURS, THEIR_OWNER, wireOrder, wireTrade, wp280Emit } from "./support/wp280.js";
+import { PROJECTION_SHORTFALLS, RECONCILIATION_CAUSES, type NormalizeOptions } from "../../../packages/polymarket-secure/src/user-stream/index.js";
 
 type Row = Record<string, unknown>;
 type Rand = () => number;
@@ -121,6 +126,61 @@ function tradeRow(rand: Rand, id: string, orderIds: readonly string[]): Row {
   return { venueTradeId: id, status: pick(rand, ["CONFIRMED", "TRADE_STATUS_MINED", "MATCHED", "FAILED"]), transactionHash: rand() < 0.3 ? null : `0x${id}`, ownershipUndetermined: undetermined, ownLegs: orders.map((orderId) => legRow(rand, orderId)) };
 }
 
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) A venue user-channel wire message, for WP-280's REAL normalizer and
+ * projection: an order event (its status absent, recognised or not; its lifecycle recognised or not), or a trade event
+ * (its status in either spelling, C-3's, garbled; its trader side known, absent or garbled; maker legs ours, another
+ * account's, or undetermined; fees zero or not; a match time or none), and the `isAccountOwner` binding (ours, none, one
+ * that throws).
+ */
+function wireMessage(rand: Rand): { readonly message: Row; readonly options: NormalizeOptions } {
+  const orderIds = ["venue-1", "venue-2", "venue-3"];
+  if (rand() < 0.35) {
+    const original = decimal(rand, ["1", "2"]);
+    return {
+      message: wireOrder({
+        id: pick(rand, orderIds),
+        assetId: pick(rand, TOKENS),
+        side: pick(rand, ["BUY", "SELL"]),
+        originalSize: original,
+        sizeMatched: decimal(rand, ["0", "0.4", original]),
+        price: decimal(rand, ["0.5", "0.45"]),
+        status: pick(rand, [null, null, "LIVE", "MATCHED", "CANCELED", "BOGUS"]),
+        type: pick(rand, ["PLACEMENT", "UPDATE", "CANCELLATION", "WEIRD"]),
+      }),
+      options: OURS,
+    };
+  }
+  const side = pick(rand, ["BUY", "SELL"] as const);
+  const price = decimal(rand, ["0.5", "0.4"]);
+  const token = pick(rand, TOKENS);
+  const makers = [0, 1].slice(0, 1 + Math.floor(rand() * 2)).map(() => ({
+    orderId: pick(rand, [...orderIds, "their-maker-1"]),
+    owner: pick(rand, [OUR_OWNER, THEIR_OWNER]),
+    matchedAmount: decimal(rand, ["0.4", "0.2"]),
+    price: rand() < 0.85 ? price : "0.45",
+    assetId: token,
+    side: side === "BUY" ? ("SELL" as const) : ("BUY" as const),
+  }));
+  return {
+    message: wireTrade({
+      id: pick(rand, ["t1", "t2"]),
+      takerOrderId: pick(rand, ["venue-2", "their-taker-1"]),
+      assetId: token,
+      side,
+      size: rand() < 0.8 ? makers.reduce((sum, maker) => String(Number(sum) + Number(maker.matchedAmount)), "0") : "1",
+      price,
+      status: pick(rand, ["MATCHED", "MATCHED", "MINED", "CONFIRMED", "RETRYING", "FAILED", "TRADE_STATUS_CONFIRMED", "MATCHED_NOT_BROADCASTED", "Failed", "TRADE_STATUS_REVERTED"]),
+      traderSide: pick(rand, ["TAKER", "MAKER", "MAKER", null, "BOGUS"]),
+      makers,
+      feeRateBps: pick(rand, ["0", "0", "10"]),
+      ...(rand() < 0.85 ? {} : { matchTime: null }),
+      transactionHash: rand() < 0.5 ? null : "0xhash1",
+    }),
+    options: pick(rand, [OURS, OURS, {}, { isAccountOwner: (): boolean => { throw new Error("transport"); } }]),
+  };
+}
+
 /** A valid answer of one door (and, for the stream, one output). */
 function validAnswer(rand: Rand, door: Door): unknown {
   const orderIds = ["venue-1", "venue-2", "venue-3", "venue-4"];
@@ -141,7 +201,21 @@ function validAnswer(rand: Rand, door: Door): unknown {
       const state = pick(rand, ["CONFIRMED", "FAILED", "PENDING", "DROPPED"]);
       return { state, transactionHash: state === "CONFIRMED" || rand() < 0.5 ? "0xhash" : null, credited: state === "CONFIRMED" && rand() < 0.6 ? "5" : null };
     }
+    case "stream-request": {
+      // (r14) What WP-280 raises: an event's EVENT_NOT_FULLY_APPLICABLE or EVENT_NOT_DELIVERED request (from its REAL
+      // normalizer and projection), or a stream-level request.
+      if (rand() < 0.25) return { requestId: "user-stream-reconcile-1", cause: pick(rand, ["SOCKET_CLOSED", "RESUBSCRIBED", "UNRECOGNIZED_MESSAGE", "BACKLOG_OVERFLOW"]), afterLoss: null, markets: ["0xm"], subscriptionGeneration: 1, shortfalls: [], unrecognized: null, venueOrderIds: [], venueTradeId: null, requestedAt: null };
+      const { message, options } = wireMessage(rand);
+      const emission = wp280Emit(message, options);
+      return (rand() < 0.5 && emission.request !== null ? emission.request : emission.notDelivered ?? emission.request) as unknown;
+    }
     case "stream":
+      // (r14) Half the outputs are WP-280's REAL outputs (its normalizer and projection over a wire message: `event`,
+      // `oms` and its shortfalls, exactly as its manager emits them); half are r11's synthetic projections.
+      if (rand() < 0.5) {
+        const { message, options } = wireMessage(rand);
+        return wp280Emit(message, options).output;
+      }
       if (rand() < 0.35) return { kind: "ORDER", oms: { observation: { venueOrderId: pick(rand, orderIds), status: pick(rand, ["LIVE", "CANCELED"]) }, shortfalls: [] } };
       return {
         kind: "TRADE",
@@ -161,7 +235,7 @@ function validAnswer(rand: Rand, door: Door): unknown {
 }
 
 /** The door's output for one delivered answer. */
-function readDoor(door: Door, answer: unknown): ReadOutcome<unknown> | ReturnType<typeof readStreamOutput> {
+function readDoor(door: Door, answer: unknown): ReadOutcome<unknown> | ReturnType<typeof readStreamOutput> | ReturnType<typeof readStreamRequest> {
   switch (door) {
     case "open-orders":
       return readOpenOrders(answer);
@@ -179,6 +253,8 @@ function readDoor(door: Door, answer: unknown): ReadOutcome<unknown> | ReturnTyp
       return readWalletMember(answer);
     case "stream":
       return readStreamOutput(answer);
+    case "stream-request":
+      return readStreamRequest(answer);
   }
 }
 
@@ -253,6 +329,8 @@ function oracle(door: Door, answer: unknown): unknown {
       return [expectedRow(answer !== null && typeof answer === "object" ? answer : UNREADABLE, MEMBER_KEYS)];
     case "stream":
       return expectedStream(answer, MAX_STREAM_ITEMS);
+    case "stream-request":
+      return expectedRequest(answer, RECONCILIATION_CAUSES, PROJECTION_SHORTFALLS);
   }
 }
 
@@ -291,6 +369,20 @@ function envelopeOracle(door: Door, answer: unknown): string[] {
 
 /** The door's output, stated as the oracle states it. */
 function stated(door: Door, output: ReturnType<typeof readDoor>): unknown {
+  if (door === "stream-request") {
+    const request = output as ReturnType<typeof readStreamRequest>;
+    return {
+      requestId: request.requestId,
+      cause: request.cause,
+      markets: [...request.markets],
+      opaque: request.opaque,
+      eventCause: request.eventCause,
+      venueTradeId: request.venueTradeId,
+      venueOrderIds: [...request.venueOrderIds],
+      unordered: request.unordered,
+      unreadable: [...request.unreadable],
+    };
+  }
   if (door === "stream") {
     const stream = output as ReturnType<typeof readStreamOutput>;
     return {
@@ -299,6 +391,7 @@ function stated(door: Door, output: ReturnType<typeof readDoor>): unknown {
         return { kind: item.fragments.kind, row: asExpected(item.fragments as unknown as Readonly<Record<string, unknown>> & { unreadable: readonly string[] }, keys, { liquidityRole: "role" }) };
       }),
       unreadable: stream.unreadable.map((entry) => `${entry.kind}:${entry.field}`),
+      ...(stream.event === undefined ? {} : { event: statedEvent(stream.event) }),
     };
   }
   const { salvage } = output as ReadOutcome<unknown>;
@@ -318,6 +411,30 @@ function stated(door: Door, output: ReturnType<typeof readDoor>): unknown {
     case "wallet-member":
       return salvage.members.map((member) => asExpected(member as unknown as Readonly<Record<string, unknown>> & { unreadable: readonly string[] }, MEMBER_KEYS));
   }
+}
+
+/** (r14) The stream door's event fragments, stated as the oracle states them (`support/mutate.ts`, `expectedEvent`). */
+function statedEvent(event: StreamEventFragments): Expected {
+  const named = (field: string, value: unknown): unknown => ((event.unreadable as readonly string[]).includes(field) ? UNREADABLE : value);
+  if (event.kind === "ORDER") {
+    return {
+      venueOrderId: named("venueOrderId", event.venueOrderId),
+      tokenId: named("assetId", event.tokenId),
+      side: named("side", event.side),
+      price: named("price", event.price),
+      originalSize: named("originalSize", event.originalSize),
+      sizeMatched: named("sizeMatched", event.sizeMatched),
+      status: named("status", event.status),
+    };
+  }
+  return {
+    venueTradeId: named("venueTradeId", event.venueTradeId),
+    status: event.ordered ? event.status : UNREADABLE,
+    transactionHash: named("transactionHash", event.transactionHash),
+    own: [...event.ownOrderIds],
+    orphans: event.ownOrphans,
+    determined: event.legsDetermined,
+  };
 }
 
 /** Whether any fragment of a stated output is unreadable. */
@@ -367,6 +484,10 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
     let streamKeysMissing = 0;
     let streamKindTexts = 0;
     let streamStatusTexts = 0;
+    let streamEvents = 0;
+    let streamEventRequired = 0;
+    let streamEventUnreadable = 0;
+    let requestUnreadable = 0;
     for (const door of DOORS) {
       for (let seed = 1; seed <= SEEDS_PER_DOOR; seed += 1) {
         const rand = seeded(seed * 31 + DOORS.indexOf(door));
@@ -382,13 +503,22 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
         const expected = oracle(door, delivered);
         const actual = stated(door, output);
         expect(actual, `${door} seed ${String(seed)} ${mutation}`).toEqual(expected);
-        if (anyUnreadable(expected) || (door === "stream" && (expected as ReturnType<typeof expectedStream>).unreadable.length > 0)) unreadableCases += 1;
+        if (anyUnreadable(expected) || (door === "stream" && (expected as ReturnType<typeof expectedStream>).unreadable.length > 0) || (door === "stream-request" && (expected as { unreadable: string[] }).unreadable.length > 0)) unreadableCases += 1;
+        // (r14) The stream outputs that carry an event, those whose event the oracle states required, and those whose
+        // required event (or its id) cannot be read; the requests whose identity cannot be read.
+        if (door === "stream") {
+          const stream = expected as ReturnType<typeof expectedStream>;
+          if (stream.event !== undefined) streamEvents += 1;
+          if (stream.unreadable.some((entry) => /:(event|venueOrderId|venueTradeId)$/u.test(entry))) streamEventUnreadable += 1;
+          if (own(delivered, "event").data && stream.unreadable.length === 0 && ((own(own(delivered, "oms").data ? (own(delivered, "oms") as { value: unknown }).value : null, "shortfalls") as { value?: unknown }).value as unknown[] | undefined)?.length) streamEventRequired += 1;
+        }
+        if (door === "stream-request" && (expected as { unreadable: string[] }).unreadable.some((name) => name !== "shortfalls")) requestUnreadable += 1;
         // (r12) The stream outputs delivered with one of the door's own keys MISSING (WP290-CX-R12-01's shape).
         if (door === "stream" && streamKeyMissing(delivered)) streamKeysMissing += 1;
         // (r13) The stream outputs delivered with a readable kind, or a settlement status, outside its vocabulary.
         if (door === "stream" && streamKindText(delivered)) streamKindTexts += 1;
         if (door === "stream" && streamSettlementStatusText(delivered)) streamStatusTexts += 1;
-        if (door !== "stream") {
+        if (door !== "stream" && door !== "stream-request") {
           const outcome = output as ReadOutcome<unknown>;
           expect(outcome.salvage, `${door} seed ${String(seed)}: an outcome without its salvage`).toBeDefined();
           // Every envelope field present but unreadable is named (the read's own break is its obligation).
@@ -400,11 +530,15 @@ describe("WP-290 r11: the door property (the class fix at the door layer)", () =
         }
       }
     }
-    console.log(`DOOR-PROPERTY doors=${String(DOORS.length)} seeds=1..${String(SEEDS_PER_DOOR)} cases=${String(cases)} doubleMutations=${String(doubles)} withUnreadable=${String(unreadableCases)} streamKeyMissing=${String(streamKeysMissing)} streamKindText=${String(streamKindTexts)} streamSettlementStatusText=${String(streamStatusTexts)} byMutation=${JSON.stringify(Object.fromEntries([...counts].sort()))}`);
+    console.log(`DOOR-PROPERTY doors=${String(DOORS.length)} seeds=1..${String(SEEDS_PER_DOOR)} cases=${String(cases)} doubleMutations=${String(doubles)} withUnreadable=${String(unreadableCases)} streamKeyMissing=${String(streamKeysMissing)} streamKindText=${String(streamKindTexts)} streamSettlementStatusText=${String(streamStatusTexts)} streamEvent=${String(streamEvents)} streamEventWithShortfall=${String(streamEventRequired)} streamEventUnreadable=${String(streamEventUnreadable)} requestUnreadable=${String(requestUnreadable)} byMutation=${JSON.stringify(Object.fromEntries([...counts].sort()))}`);
     expect(cases).toBe(DOORS.length * SEEDS_PER_DOOR);
     expect(streamKeysMissing, "the key-deletion mutation is drawn").toBeGreaterThan(0);
     expect(streamKindTexts, "(r13) a readable kind outside WP-280's activity kinds is drawn").toBeGreaterThan(0);
     expect(streamStatusTexts, "(r13) a readable settlement status outside WP-280's five is drawn").toBeGreaterThan(0);
+    expect(streamEvents, "(r14) an output carrying WP-280's event is drawn").toBeGreaterThan(0);
+    expect(streamEventRequired, "(r14) an output whose event is required (a shortfall) and readable is drawn").toBeGreaterThan(0);
+    expect(streamEventUnreadable, "(r14) an output whose required event, or its id, cannot be read is drawn").toBeGreaterThan(0);
+    expect(requestUnreadable, "(r14) a request whose identity cannot be read is drawn").toBeGreaterThan(0);
     // About 0.5 s alone; a generous bound, so a loaded host never times it out (vitest's default is 5 s).
   }, 120_000);
 
@@ -450,8 +584,10 @@ describe("WP-290 r12 (WP290-CX-R12-01): the stream door's own keys", () => {
       ["ORDER, oms missing", { kind: "ORDER" }, ["ORDER:oms"]],
       ["TRADE, oms missing", { kind: "TRADE" }, ["FILL:oms"]],
       ["kind missing", { oms: { fills: [fill], settlements: [], shortfalls: [] } }, ["FILL:kind"]],
-      ["control: ORDER, observation null", { kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } }, []],
-      ["control: TRADE, shortfalls missing", { kind: "TRADE", oms: { fills: [fill], settlements: [settlement] } }, []],
+      // (r14, restated: deviation) r12's two controls, observation null and shortfalls missing, are not the whole event
+      // (WP290-V14-WP280-EVENT-IDS-DISCARDED): their event is required, and here it is missing.
+      ["(r14) ORDER, observation null, no event", { kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } }, ["ORDER:event"]],
+      ["(r14) TRADE, shortfalls missing, no event", { kind: "TRADE", oms: { fills: [fill], settlements: [settlement] } }, ["FILL:event"]],
       ["control: TRADE, well formed", { kind: "TRADE", oms: { fills: [fill], settlements: [settlement], shortfalls: [] } }, []],
     ];
     for (const [name, answer, names] of cases) {
@@ -495,6 +631,51 @@ describe("WP-290 r13 (WP290-V13-STREAM-UNKNOWN-KIND-SILENT = WP290-CX-R13-01): t
         name,
       ).toEqual(fields);
     }
+  });
+});
+
+describe("WP-290 r14 (WP290-V14-WP280-EVENT-IDS-DISCARDED): the stream door reads WP-280's event and shortfalls", () => {
+  it("(named) WP-280's real outputs for events it could not project, their event and shortfalls broken: each fragment as the oracle states; a required event or id that cannot be read is an entry; a status a shortfall contradicts is unordered", () => {
+    const ours = "venue-1";
+    const maker = (status: string, traderSide: string | null, owners: readonly string[]): Row =>
+      wp280Emit(
+        wireTrade({
+          id: "t1",
+          takerOrderId: "their-taker-1",
+          assetId: YES,
+          side: "SELL",
+          size: String(owners.length * 0.4),
+          price: "0.5",
+          status,
+          traderSide,
+          makers: owners.map((owner) => ({ orderId: ours, owner, matchedAmount: "0.4", price: "0.5", assetId: YES, side: "BUY" as const })),
+        }),
+      ).output;
+    const order = (status: string | null): Row => wp280Emit(wireOrder({ id: ours, assetId: YES, side: "BUY", originalSize: "1", sizeMatched: "0", price: "0.5", status })).output;
+    const withEvent = (output: Row, change: Row): Row => ({ ...output, event: { ...(output["event"] as Row), ...change } });
+    const withShortfalls = (output: Row, shortfalls: unknown): Row => ({ ...output, oms: { ...(output["oms"] as Row), shortfalls } });
+    const cases: [string, Row, string[]][] = [
+      ["a FAILED event WP-280 did not recognise (\"Failed\"): empty projection, its event read", maker("Failed", "MAKER", [OUR_OWNER]), []],
+      ["C-3's MATCHED_NOT_BROADCASTED", maker("MATCHED_NOT_BROADCASTED", "MAKER", [OUR_OWNER]), []],
+      ["the trader side garbled", maker("MATCHED", "BOGUS", [OUR_OWNER]), []],
+      ["our maker leg listed twice", maker("MATCHED", "MAKER", [OUR_OWNER, OUR_OWNER]), []],
+      ["an order event with no status (observation null)", order(null), []],
+      ["the same with no event", { kind: "ORDER", oms: (order(null)["oms"] as Row) }, ["ORDER:event"]],
+      ["the trade event's id a number", withEvent(maker("Failed", "MAKER", [OUR_OWNER]), { venueTradeId: 7 }), ["FILL:venueTradeId"]],
+      ["the order event's id unreadable", withEvent(order(null), { venueOrderId: "" }), ["ORDER:venueOrderId"]],
+      ["a KNOWN status a status shortfall contradicts: unordered", withShortfalls(maker("MATCHED", "MAKER", [OUR_OWNER]), ["TRADE_STATUS_UNRECOGNIZED"]), []],
+      ["shortfalls not a list: the event required (here readable)", withShortfalls(maker("MATCHED", "MAKER", [OUR_OWNER]), "none"), []],
+      ["a maker entry's account outside WP-280's three: named, undetermined", withEvent(maker("MATCHED", "MAKER", [OUR_OWNER]), { makerOrders: [{ venueOrderId: ours, account: "own" }] }), []],
+      ["control: a whole projection (a MINED event, our leg determined): its event read, not required", maker("MINED", "MAKER", [OUR_OWNER]), []],
+    ];
+    for (const [name, answer, entries] of cases) {
+      const output = readStreamOutput(answer);
+      expect(stated("stream", output), name).toEqual(oracle("stream", answer));
+      expect(output.unreadable.map((entry) => `${entry.kind}:${entry.field}`), name).toEqual(entries);
+    }
+    const contradicted = readStreamOutput(withShortfalls(maker("MATCHED", "MAKER", [OUR_OWNER]), ["TRADE_STATUS_UNRECOGNIZED"])).event;
+    expect(contradicted).toMatchObject({ status: null, ordered: false });
+    expect(readStreamOutput(maker("MINED", "MAKER", [OUR_OWNER])).event).toMatchObject({ required: false, status: "MINED", ordered: true, ownOrderIds: [ours] });
   });
 });
 

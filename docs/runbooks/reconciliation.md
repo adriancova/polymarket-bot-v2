@@ -105,7 +105,7 @@ not a fault.
    | (r11) a by-id answer's `found: true` when the answer is unusable (its row absent, its id unreadable, or the order asked about's): the order asked about exists (`BY_ID_FOUND`), so a later not-found is a contradiction (E-14), never a ghost | named |
    | (r11) every position, the collateral balance and every approval an answer showed, valid or not (`HOLDING`): kept as detail only (a holding goes down legitimately, so no later read is judged against it) | shown or named |
    | (r11) every wallet member read by name (`MEMBER`): its state, hash and amount credited, valid or not; a state that contradicts another terminal one holds the member (section 7) | shown or named |
-   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed. (r12) A projection key that is MISSING (a TRADE output with no `fills` or no `settlements` key, an ORDER output with no `observation` key) is unreadable too: the same obligation (`UNKEYED_TRADE`, or `UNKEYED_ORDER` for the observation), and a run at once. `observation: null` is WP-280's own shape for an event that named no status, not an obligation. (r13) An output whose `kind` is READABLE but not one of WP-280's five outputs (`""`, `"Trade"`, `"TRADE "`, `"order"`, ...), or one of its non-activity kinds (`STATE`, `UNRECOGNIZED_MESSAGE`, `RECONCILIATION_REQUESTED`) on an output that carries an ORDER or TRADE output's own key (`oms`, `event`), is unreadable too: the `UNKEYED_TRADE` obligation naming `kind`, and a run at once (a `RECONCILIATION_REQUESTED` output's request is still taken). A settlement whose `status` is not one of WP-280's five (`MATCHED`, `MINED`, `CONFIRMED`, `RETRYING`, `FAILED`, plain spelling) keeps its status as unreadable (step 3) | named |
+   | (r11) a user-stream item the OMS did not apply: every fragment of it, an inexact fill included (its trade and order still named); its order id unreadable: an `ORPHAN_LEG` (or, for an order observation, an `UNKEYED_ORDER`); its trade id unreadable: an `UNKEYED_LEG`; an entry or a list of it that is not own data: an `UNKEYED_TRADE` obligation. Every readable sibling is still routed. (r12) A projection key that is MISSING (a TRADE output with no `fills` or no `settlements` key, an ORDER output with no `observation` key) is unreadable too: the same obligation (`UNKEYED_TRADE`, or `UNKEYED_ORDER` for the observation), and a run at once. (r14) `observation: null`, and a TRADE projection with no fill and no settlement, are WP-280's own shapes for an event it could NOT project: never "nothing" (see the next row). (r13) An output whose `kind` is READABLE but not one of WP-280's five outputs (`""`, `"Trade"`, `"TRADE "`, `"order"`, ...), or one of its non-activity kinds (`STATE`, `UNRECOGNIZED_MESSAGE`, `RECONCILIATION_REQUESTED`) on an output that carries an ORDER or TRADE output's own key (`oms`, `event`), is unreadable too: the `UNKEYED_TRADE` obligation naming `kind`, and a run at once (a `RECONCILIATION_REQUESTED` output's request is still taken). A settlement whose `status` is not one of WP-280's five (`MATCHED`, `MINED`, `CONFIRMED`, `RETRYING`, `FAILED`, plain spelling) keeps its status as unreadable (step 3) | named |
 
    **(r11) Salvage is the default path.** Every door reads EVERY field of
    EVERY row of every answer on its own first, whatever the answer's
@@ -133,6 +133,7 @@ not a fault.
    keeps nothing: its rows are that source's, not this read's (E-15, U-22).
    An answer whose route is unreadable keeps its rows (fail closed).
    | an id the OMS retains as user-stream evidence | named |
+   | (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) what a user-stream output's `event` names, whenever it can be read, journaled the moment it is routed: an order event's order (`STREAM_ORDER`, with the facts the event stated: token, side, price, sizes, status), read by id until a sound run settles it, its matched size a floor no later read may go below; a trade event's trade (`STREAM_TRADE`), its identity OPEN until a valid trades row shows its own legs in full (so a complete trades read that omits it holds), `unordered` when its status cannot be ordered (WP-280 did not recognise it, or C-3's), and each leg the event attributes to the account (the taker order of a TAKER trade, every maker leg WP-280's `isAccountOwner` called `OWN`: `STREAM_SETTLEMENT`, its trade and order, no economics). When WP-280 did not attest that its projection is the whole event (a shortfall, `shortfalls` missing or unreadable, or nothing projected), the event is REQUIRED: one that cannot be read, or whose order or trade id cannot be read, is the account's `UNKEYED_*` obligation. And what every WP-280 reconciliation request names, journaled the moment it is received: an event-level request's trade (`STREAM_TRADE`, `unordered` unless it is an `EVENT_NOT_FULLY_APPLICABLE` naming no status shortfall), or, with no trade, the order an order event's request names (`STREAM_ORDER`); an identity it names that cannot be read is an obligation of the account. The orders a TRADE's request names are every order the trade matched, the counterparties' included: they are not recorded as the account's (the trade's open identity is what answers which are) | named |
    | what the user stream reported that the OMS did not apply, whatever it answered (it retained it; it refused it as unknown, inconsistent or contradicting; its store failed and it faulted; it was already faulted; it refused the input; it holds no such fill; it threw), or that was routed while no OMS was bound, recorded the moment it is routed, with a run triggered (r7) | named |
 
    An order with evidence is read by id in every run until a sound run
@@ -187,7 +188,8 @@ not a fault.
      trades read omits while it is not accounted for under its own identity,
      a leg the stream named that a read of its trade does not show, (r9)
      a trade whose own legs no read has identified that a complete trades
-     read omits, and (r10) an order carrying an own leg a trades read showed
+     read omits (r14: among them a trade the user stream named that WP-280
+     could not attribute, `STREAM_TRADE`), and (r10) an order carrying an own leg a trades read showed
      under an unreadable trade id, until the reads have shown by id the
      new trades it owes (`READ_CONFLICT`: below);
    - **a ghost**: an unclaimed order only NAMED that the by-id read of a
@@ -491,7 +493,7 @@ others (the coordinator rebuilds its evidence from it at every run).
 | OMS, a known venue order (`ORDER_STATE`, `FINAL_SIZE`) | `PRESENT`, from a by-id read made after the request was received. Not given if the venue shows less matched than the OMS recorded (`ORDER_FILLS_AHEAD_OF_VENUE`) or other fixed facts: token, side, price or size (`ORDER_FACTS_MISMATCH`). |
 | OMS, a lost placement (`SUBMISSION_UNKNOWN`) | By signed identity, strictly (next table). |
 | Inventory, a wallet operation | Each unresolved member read by name. Only CONFIRMED or FAILED is answered, one answer per member. A pending, dropped, not-found or unrecognised report is waited out. |
-| User stream (`WP-280`) | Acknowledged by id after a complete run whose order and trade reads began after the request arrived. Each acknowledgement is journaled (`ANSWER_RECORDED`, channel `USER_STREAM`): WP-280 keeps its backlog in memory only. |
+| User stream (`WP-280`) | Acknowledged by id after a complete run whose order and trade reads began after the request arrived, and (r14) that judged every identity the request named: its trade without a conflict (its identity answered, its status ordered or terminal, its legs accounted for), each order it names consistent, released, or settled by an earlier sound run. A request one of whose identities could not be read is never acknowledged (its obligation holds the account). Each acknowledgement is journaled (`ANSWER_RECORDED`, channel `USER_STREAM`): WP-280 keeps its backlog in memory only. |
 
 Every answer echoes the request's id verbatim.
 
@@ -751,6 +753,23 @@ returns at once, with no run.
   TRADE output's projection or event. It may have been an ORDER or a TRADE
   output, so it holds for good like every unreadable stream entry (section
   10). Find the output in WP-280's logs; fix the producer; escalate.
+- **A user-stream request that stays pending (`pendingStreamRequests`), or a
+  `READ_CONFLICT` naming a trade "which a trades read carried without
+  identifying all of its own legs" whose sources are `STREAM_TRADE`** (r14)
+  means WP-280 named a trade it could not project (its ownership
+  undetermined, its trader side unknown, its status unrecognised, an own leg
+  listed twice), or an event the listener did not take: the trade's identity
+  is open until a trades read shows it with its own legs, and the request is
+  acknowledged only then. Normally the next trades read shows it and both
+  clear on their own. If the trades read never shows it, check the trades
+  adapter (pagination, the time window) before anything else.
+- **A `READ_CONFLICT` keyed `unreadable` whose detail says "unreadable:
+  event", "unreadable: venueTradeId", "unreadable: venueOrderIds" or names an
+  order row from `STREAM_ORDER_UNKEYED`** (r14) is a WP-280 output whose
+  projection it did not attest whole but whose `event` (or its id) could not
+  be read, or a WP-280 request whose identity could not be read. It holds for
+  good like every unreadable stream entry (section 10). Find the output or
+  request in WP-280's logs; fix the producer; escalate.
 - **A `READ_REGRESSION` or `READ_CONFLICT` on a trade whose detail says "a
   status no one can order"** (r13) means an observation (a read, or a
   user-stream settlement the OMS did not apply) showed the trade's settlement
@@ -835,8 +854,21 @@ own data holds the account for good. (r12) Every ORDER output must carry
 `oms.observation` (`null` when the event named no status) and every TRADE
 output `oms.fills` and `oms.settlements` (empty lists when nothing was
 projected): an output missing one of them holds the account for good, as
-one whose key is not a list. `oms.shortfalls` is not read here: WP-280
-raises its own `EVENT_NOT_FULLY_APPLICABLE` request for a shortfall.
+one whose key is not a list. (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED; the
+r12 text said `oms.shortfalls` was not read because WP-280's own request
+sufficed, and both verifiers withdrew that premise) Every ORDER and TRADE
+output must carry its `event` (WP-280's normalized event, its ids as the
+venue sent them) and `oms.shortfalls` (a list of WP-280's shortfall codes):
+an output whose shortfalls are missing, unreadable or not empty, or whose
+projection is empty, REQUIRES its event, and holds the account for good when
+the event or its id cannot be read. Every reconciliation request must carry
+`venueOrderIds` (a list of order ids), `venueTradeId` (an id or `null`) and
+`shortfalls`, as WP-280's manager builds them; an event-level request
+(`EVENT_NOT_FULLY_APPLICABLE`, `EVENT_NOT_DELIVERED`) or one whose cause is
+outside WP-280's vocabulary that lacks them, or names nothing, holds the
+account for good. The coordinator reads the request's identities and the
+event's, journals them, and acknowledges the request only once a run has
+judged them.
 (r13) Every output's `kind` must be one of WP-280's five, exactly as
 spelled (`STATE`, `ORDER`, `TRADE`, `UNRECOGNIZED_MESSAGE`,
 `RECONCILIATION_REQUESTED`), and only ORDER and TRADE outputs may carry `oms`
@@ -939,11 +971,16 @@ nothing is judged or booked from it.
   members). An answer of another READABLE route or source (Data API v1, the
   CLOB balance cache) keeps nothing: it is not this read's observation (E-15,
   U-22); its own break holds. The user stream's `STATE` and
-  `UNRECOGNIZED_MESSAGE` outputs and each output's normalized `event` are
-  not read: the coordinator reads WP-280's OMS projection (its fills,
-  settlements and order observation), which is WP-280's contract with the
-  OMS and with this coordinator; WP-280 raises its own reconciliation
-  requests for what it could not normalize. The ledger's projection and its
+  `UNRECOGNIZED_MESSAGE` outputs carry no account activity and are not
+  read (WP-280 raises its own reconciliation requests for what it could not
+  normalize). (r14) Each ORDER and TRADE output's normalized `event` IS read
+  (its identities, and an order event's facts), but not a trade event's
+  economics: the stream fixes no fill fact exactly (WP-280's own rule), so a
+  trade event's legs are journaled by identity only. When WP-280's projection
+  is whole (no shortfall, something projected), its items are the event's
+  OMS inputs and a missing event is not an obligation; a projection that
+  disagrees with its own event (a WP-280 contract violation that keeps its
+  shape) is not detected. The ledger's projection and its
   remaining bookings are the system's own state, not venue observations, and
   keep nothing.
 - **(r13) A settlement status no one can order holds its trade until the
@@ -960,6 +997,32 @@ nothing is judged or booked from it.
   status). The cost is liveness: a trade the venue shows with a C-3 status
   holds the account until it settles (minutes), and for good if the trades
   history drops it first.
+- **(r14) A trade the user stream named but could not attribute holds until a
+  trades read shows it in full.** WP-280 projects nothing for a trade whose
+  ownership it cannot determine, whose trader side it cannot read, whose
+  status it does not recognise, or that names an own leg twice; the
+  coordinator keeps the trade's identity open (and its status `unordered`
+  when WP-280 did not recognise it) until a valid trades row shows it with
+  its own legs (and a terminal status). Every trade an event names is
+  recorded so, whether or not WP-280 projected it (an own maker trade's
+  MATCHED event always has a shortfall: its fee is not on the stream), so
+  every trade the stream reports holds until a trades read shows it with its
+  own legs. The cost is liveness: normally the next run; a trades adapter
+  that windows or drops recent trades holds the account until it shows them.
+  An `EVENT_NOT_DELIVERED` request says nothing of the event's status,
+  so its trade holds until shown terminal (minutes, normally); for good if
+  the trades history drops it first. A by-id read that does not find an
+  order an event named makes it a ghost (`ORDER_NOT_FOUND_BY_ID`): an
+  operator's release, once the venue shows it, acknowledges that history.
+- **(r14) Activity received during a run waits for the next run.** An ORDER
+  or TRADE output that arrives while a run is in progress is buffered: that
+  run does not resume (work arrived), and the next run of the same
+  `reconcile` routes it before it reads. The cost is liveness: while outputs
+  keep arriving during every run (a busy stream), no run resumes, and after
+  four runs `reconcile` returns paused; the next one (the periodic timer)
+  tries again. Activity at the venue after a run's reads and before its
+  resume that NO source reported (no stream output, no read) is invisible to
+  any reconciler: the next trigger finds it.
 - **(r13) A stream output outside WP-280's vocabulary holds for good.** An
   output whose `kind` is readable but not one of WP-280's five, or a
   non-activity output carrying an ORDER or TRADE output's own key, is an

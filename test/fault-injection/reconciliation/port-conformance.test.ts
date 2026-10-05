@@ -42,10 +42,24 @@ import type {
   StreamReconciliationRequest,
   WalletReconciliationRequest,
 } from "../../../packages/oms/src/index.js";
-import { RECONCILED_WALLET_OPERATION_STATES, VENUE_TRADE_STATUSES, type ReconciledWalletOperationState } from "../../../packages/oms/src/reconciliation/ports.js";
+import {
+  RECONCILED_WALLET_OPERATION_STATES,
+  STREAM_EVENT_CAUSES,
+  STREAM_PROJECTION_SHORTFALLS,
+  STREAM_RECONCILIATION_CAUSES,
+  STREAM_STATUS_SHORTFALLS,
+  VENUE_TRADE_STATUSES,
+  type ReconciledWalletOperationState,
+  type StreamProjectionShortfall,
+  type StreamReconciliationCause,
+} from "../../../packages/oms/src/reconciliation/ports.js";
 import { STREAM_ACTIVITY_KEYS, STREAM_OUTPUT_KINDS } from "../../../packages/oms/src/reconciliation/door.js";
 import {
+  PROJECTION_SHORTFALLS,
+  RECONCILIATION_CAUSES,
   USER_TRADE_STATUSES,
+  type ProjectionShortfall,
+  type ReconciliationCause,
   type UserStreamManager,
   type UserStreamOutput,
   type UserStreamReconciliationRequest,
@@ -67,6 +81,10 @@ type ActivityOutput = Extract<UserStreamOutput, { readonly kind: "ORDER" | "TRAD
 const activityKeysOnActivity: Equal<Extract<(typeof STREAM_ACTIVITY_KEYS)[number], keyof ActivityOutput>, (typeof STREAM_ACTIVITY_KEYS)[number]> = true;
 const activityKeysNotElsewhere: Equal<Extract<(typeof STREAM_ACTIVITY_KEYS)[number], NonActivityOutput extends infer O ? (O extends unknown ? keyof O : never) : never>, never> = true;
 const walletStatesEqual: Equal<ReconciledWalletOperationState, WalletOperationState> = true;
+// (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) WP-280's request causes and projection shortfalls, which the stream door
+// reads against (an event-level cause; a cause outside the vocabulary; a status shortfall).
+const streamCausesEqual: Equal<StreamReconciliationCause, ReconciliationCause> = true;
+const streamShortfallsEqual: Equal<StreamProjectionShortfall, ProjectionShortfall> = true;
 
 // The journal's input is the same union in both packages (assignable both ways).
 const journalInputIn = (event: JournalInput): ReconciliationJournalInput => event;
@@ -98,6 +116,14 @@ describe("the coordinator's ports and mirrors", () => {
     expect([...VENUE_TRADE_STATUSES].sort()).toEqual([...USER_TRADE_STATUSES].sort());
     expect([...STREAM_OUTPUT_KINDS].sort()).toEqual(["ORDER", "RECONCILIATION_REQUESTED", "STATE", "TRADE", "UNRECOGNIZED_MESSAGE"]);
     expect([...STREAM_ACTIVITY_KEYS].sort()).toEqual(["event", "oms"]);
+  });
+
+  it("(r14) WP-280's request causes and projection shortfalls are pinned to WP-280's (at compile time above, and at run time here)", () => {
+    expect([streamCausesEqual, streamShortfallsEqual]).toEqual([true, true]);
+    expect([...STREAM_RECONCILIATION_CAUSES].sort()).toEqual([...RECONCILIATION_CAUSES].sort());
+    expect([...STREAM_PROJECTION_SHORTFALLS].sort()).toEqual([...PROJECTION_SHORTFALLS].sort());
+    expect([...STREAM_EVENT_CAUSES].sort()).toEqual(["EVENT_NOT_DELIVERED", "EVENT_NOT_FULLY_APPLICABLE"]);
+    expect([...STREAM_STATUS_SHORTFALLS].sort()).toEqual(["TRADE_STATUS_C3", "TRADE_STATUS_UNRECOGNIZED"]);
   });
 
   it("at run time: a real OMS opens with the coordinator as its reconciler, and the journal's taxonomy names every class", async () => {

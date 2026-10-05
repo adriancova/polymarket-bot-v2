@@ -30,8 +30,9 @@ import { isCanonicalDecimalString } from "../../../../packages/decimal/src/index
 import { isIdentifier, isNonNegativeAmount, isPositiveAmount, isTokenId, isUnitPrice } from "../../../../packages/oms/src/guards.js";
 import { isVenueId } from "../../../../packages/oms/src/outcomes.js";
 
-export type Door = "open-orders" | "by-id" | "trades" | "positions" | "collateral" | "approvals" | "wallet-member" | "stream";
-export const DOORS: readonly Door[] = ["open-orders", "by-id", "trades", "positions", "collateral", "approvals", "wallet-member", "stream"];
+export type Door = "open-orders" | "by-id" | "trades" | "positions" | "collateral" | "approvals" | "wallet-member" | "stream" | "stream-request";
+/** (r14) The ninth door: a WP-280 reconciliation request (`door.ts`, `readStreamRequest`). */
+export const DOORS: readonly Door[] = ["open-orders", "by-id", "trades", "positions", "collateral", "approvals", "wallet-member", "stream", "stream-request"];
 
 export type Mutation =
   | "NONE"
@@ -200,6 +201,7 @@ export function mutateAnswer(rand: Rand, door: Door, answer: unknown, mutation: 
   const base = clone(answer) as Row;
   if (mutation === "NONE") return base;
   if (door === "stream") return mutateStream(rand, base, mutation);
+  if (door === "stream-request") return mutateRequest(rand, base, mutation);
   if (mutation === "ENVELOPE") return mutateEnvelope(rand, door, base);
   const list = LISTS[door];
   if (list !== undefined) {
@@ -290,6 +292,128 @@ function without(row: Row, key: string): Row {
   return copy;
 }
 
+/** (r14) The fields of WP-280's normalized events the stream door reads (`door.ts`, `EVENT_FIELDS`). */
+const EVENT_ORDER_KEYS = ["venueOrderId", "assetId", "side", "price", "originalSize", "sizeMatched", "status"] as const;
+const EVENT_TRADE_KEYS = ["venueTradeId", "takerOrderId", "status", "traderSide", "makerOrders", "transactionHash"] as const;
+const EVENT_MUTATIONS: readonly Mutation[] = ["DROP_FIELD", "WRONG_TYPE", "ACCESSOR", "WRONG_ID", "TRUNCATE_ROW", "OPAQUE_ENTRY", "HOLE_ENTRY"];
+
+/** (r14) A value of the wrong shape for one of WP-280's `WireEnum` fields, or one outside its vocabulary. */
+const WIRE_ENUM_WRONG: readonly unknown[] = [
+  7,
+  "MATCHED",
+  { kind: "KNOWN", value: 7 },
+  { kind: "KNOWN", value: "Failed" },
+  { kind: "KNOWN" },
+  { kind: "WEIRD", value: "MATCHED" },
+  { kind: "ABSENT" },
+  { kind: "UNRECOGNIZED", lexeme: null, reason: "NOT_IN_VERIFIED_VOCABULARY" },
+];
+
+/** (r14) The output's `event` broken (deleted, an accessor, not a record), or the projection's `shortfalls` (deleted, an accessor, out of shape, changed). */
+function mutateEventEnvelope(rand: Rand, base: Row, oms: Row): Row {
+  if (rand() < 0.5) {
+    const how = rand();
+    if (how < 1 / 3) return without(base, "event");
+    if (how < 2 / 3) return withAccessor(base, "event");
+    return { ...base, event: pick(rand, [7, null, "not an event", []]) };
+  }
+  const how = rand();
+  if (how < 0.25) return { ...base, oms: without(oms, "shortfalls") };
+  if (how < 0.5) return { ...base, oms: withAccessor(oms, "shortfalls") };
+  return { ...base, oms: { ...oms, shortfalls: pick(rand, ["none", 7, [7], ["TRADE_STATUS_UNRECOGNIZED"], ["TRADE_STATUS_C3"], ["NOT_A_SHORTFALL"], [], ["MAKER_FEE_NOT_ON_STREAM"]]) } };
+}
+
+/** (r14) One field of WP-280's event broken: deleted, an accessor, relabelled, the wrong type or out of its vocabulary, a maker entry unreadable. */
+function mutateEvent(rand: Rand, event: Row, kind: "ORDER" | "TRADE", mutation: Mutation): Row {
+  const keys: readonly string[] = kind === "ORDER" ? EVENT_ORDER_KEYS : EVENT_TRADE_KEYS;
+  const key = pick(rand, keys);
+  const makers = Array.isArray(event["makerOrders"]) ? (event["makerOrders"] as Row[]) : [];
+  switch (mutation) {
+    case "DROP_FIELD":
+      return without(event, key);
+    case "ACCESSOR":
+      return withAccessor(event, key);
+    case "TRUNCATE_ROW": {
+      const kept = Math.floor(rand() * keys.length);
+      const copy = { ...event };
+      for (const name of keys.slice(kept)) delete copy[name];
+      return copy;
+    }
+    case "WRONG_ID": {
+      if (kind === "ORDER") return { ...event, venueOrderId: pick(rand, ["venue-9", "venue-2", "has space", 7]) };
+      const which = pick(rand, ["venueTradeId", "takerOrderId", "makerOrders"]);
+      if (which !== "makerOrders" || makers.length === 0) return { ...event, [which === "makerOrders" ? "takerOrderId" : which]: pick(rand, ["t9", "venue-9", "", 42]) };
+      const index = Math.floor(rand() * makers.length);
+      return { ...event, makerOrders: makers.map((maker, at) => (at === index ? { ...maker, venueOrderId: pick(rand, ["venue-9", "", 7]) } : maker)) };
+    }
+    case "OPAQUE_ENTRY":
+    case "HOLE_ENTRY": {
+      if (kind === "ORDER" || makers.length === 0) return withAccessor(event, key);
+      const index = Math.floor(rand() * makers.length);
+      return { ...event, makerOrders: mutation === "OPAQUE_ENTRY" ? opaqueEntry(makers, index) : holeEntry(makers, index) };
+    }
+    default: {
+      if (key === "status" || key === "traderSide") return { ...event, [key]: pick(rand, WIRE_ENUM_WRONG) };
+      if (key === "makerOrders") {
+        const index = Math.floor(rand() * Math.max(makers.length, 1));
+        return {
+          ...event,
+          makerOrders: pick(rand, [
+            "not a list",
+            [7],
+            makers.map((maker, at) => (at === index ? { ...maker, account: pick(rand, ["own", 7, "OWNED"]) } : maker)),
+            makers.map((maker, at) => (at === index ? without(maker, "account") : maker)),
+          ]),
+        };
+      }
+      if (key === "assetId") return { ...event, assetId: pick(rand, ["0xabc", "x", 7]) };
+      return { ...event, [key]: wrongValue(rand, key, event[key]) };
+    }
+  }
+}
+
+/** (r14) One mutation of a WP-280 reconciliation request: a field dropped, an accessor, the wrong type, a cause outside the vocabulary, an id relabelled, its order list's entries broken. */
+function mutateRequest(rand: Rand, base: Row, mutation: Mutation): Row {
+  const keys = ["requestId", "cause", "markets", "shortfalls", "venueOrderIds", "venueTradeId"] as const;
+  const key = pick(rand, keys);
+  const ids = Array.isArray(base["venueOrderIds"]) ? (base["venueOrderIds"] as unknown[]) : [];
+  switch (mutation) {
+    case "DROP_FIELD":
+      return without(base, key);
+    case "ACCESSOR":
+      return withAccessor(base, key);
+    case "ENVELOPE":
+      return { ...base, cause: pick(rand, ["EVENT_NOT_DELIVERED ", "event_not_delivered", "SOCKET_CLOSED", "EVENT_NOT_FULLY_APPLICABLE", "EVENT_NOT_DELIVERED", 7, ""]) };
+    case "WRONG_ID":
+      return rand() < 0.5 ? { ...base, venueTradeId: pick(rand, ["t9", null, "trade-x"]) } : { ...base, venueOrderIds: [...ids, pick(rand, ["venue-9", "their-maker-9"])] };
+    case "OPAQUE_ENTRY":
+    case "HOLE_ENTRY":
+      if (ids.length === 0) return withAccessor(base, "venueOrderIds");
+      return { ...base, venueOrderIds: mutation === "OPAQUE_ENTRY" ? opaqueEntry(ids, 0) : holeEntry(ids, 0) };
+    case "DUPLICATE":
+      return { ...base, venueOrderIds: [...ids, ...ids.slice(0, 1)] };
+    case "TRUNCATE_LIST":
+      return { ...base, venueOrderIds: ids.slice(0, Math.floor(rand() * ids.length)) };
+    default:
+      return {
+        ...base,
+        [key]: pick<unknown>(
+          rand,
+          (
+            {
+              requestId: [7, "", "has\u0001control"],
+              cause: [7, null],
+              markets: ["m", [7]],
+              shortfalls: ["x", [7], ["TRADE_STATUS_C3"], ["NOT_A_SHORTFALL"]],
+              venueOrderIds: ["venue-1", [7], ["has space"], null],
+              venueTradeId: [7, "", ["t1"], "has\u0000nul"],
+            } as Readonly<Record<string, readonly unknown[]>>
+          )[key] as readonly unknown[],
+        ),
+      };
+  }
+}
+
 /**
  * (r13) Readable `kind` texts outside WP-280's activity kinds: not one of its five outputs (`""`, `"Trade"`,
  * `"TRADE "`, ...), or one of its three non-activity outputs on an output that still carries its projection.
@@ -315,6 +439,13 @@ function activityKind(row: Row): boolean {
 function mutateStream(rand: Rand, base: Row, mutation: Mutation): Row {
   const projection = base["oms"];
   const oms: Row = projection !== null && typeof projection === "object" && !Array.isArray(projection) ? (projection as Row) : {};
+  // (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) WP-280's event and the projection's shortfalls: one ENVELOPE draw in
+  // four goes to them; and, on an output that carries an event, two field mutations in five break one of its fields.
+  if (mutation === "ENVELOPE" && rand() < 0.25) return mutateEventEnvelope(rand, base, oms);
+  const event = Object.getOwnPropertyDescriptor(base, "event");
+  if (event !== undefined && "value" in event && event.value !== null && typeof event.value === "object" && EVENT_MUTATIONS.includes(mutation) && rand() < 0.4) {
+    return { ...base, event: mutateEvent(rand, event.value as Row, base["kind"] === "ORDER" ? "ORDER" : "TRADE", mutation) };
+  }
   if (mutation === "ENVELOPE" && rand() < 0.4) {
     const key = rand() < 0.5 ? "kind" : "oms";
     if (key === "kind" && rand() < 0.5) return { ...base, kind: pick(rand, STREAM_KIND_TEXTS) };
@@ -446,14 +577,103 @@ function isStreamSettlementStatusOracle(value: unknown): boolean {
   return typeof value === "string" && USER_TRADE_STATUSES.includes(value);
 }
 
+/** (r14) WP-280's projection shortfalls whose presence says the trade status is one no one can order (`oms-projection.ts`). */
+const STATUS_SHORTFALLS: readonly string[] = ["TRADE_STATUS_UNRECOGNIZED", "TRADE_STATUS_C3"];
+
+/** (r14) A projection's `shortfalls` as the oracle reads it: a list of own-data texts, else `undefined` (unreadable). */
+function expectedShortfalls(projection: unknown): string[] | undefined {
+  const read = own(projection, "shortfalls");
+  const entries = read.data ? expectedEntries(read.value, 60) : undefined;
+  if (entries === undefined || entries.some((entry) => typeof entry !== "string")) return undefined;
+  return entries as string[];
+}
+
+/** (r14) One of WP-280's `WireEnum` values as the oracle reads it: the KNOWN value, else `undefined`. */
+function knownValue(value: unknown): string | undefined {
+  const kind = own(value, "kind");
+  const known = own(value, "value");
+  return kind.data && kind.value === "KNOWN" && known.data && isIdentifier(known.value) ? known.value : undefined;
+}
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) What a delivered output's EVENT names, read by the oracle on its own from
+ * WP-280's contract (`normalize.ts`: the event's fields; `oms-projection.ts` `ownLegs`: which legs are the account's):
+ * - ORDER: its order and facts (`assetId` is the token), its status when WP-280 recognised it (`KNOWN`);
+ * - TRADE: its trade; its status when it is one of WP-280's five, recognised, and no status shortfall says otherwise;
+ *   its transaction hash; the orders of the legs it attributes to the account (the taker order of a TAKER trade, every
+ *   maker leg called OWN), how many such legs have no readable order id, and whether every leg's ownership was
+ *   determined (a KNOWN trader side, a readable maker list, no maker leg UNDETERMINED or unreadable).
+ * `undefined` when the event is not an own-data record.
+ */
+export function expectedEvent(kind: "ORDER" | "TRADE", answer: unknown, shortfalls: readonly string[] | undefined): Expected | undefined {
+  const read = own(answer, "event");
+  if (!read.data || read.value === null || typeof read.value !== "object") return undefined;
+  const event = read.value;
+  const value = (key: string, valid: (candidate: unknown) => boolean): unknown => {
+    const field = own(event, key);
+    return field.data && valid(field.value) ? field.value : UNREADABLE;
+  };
+  if (kind === "ORDER") {
+    const statusField = own(event, "status");
+    const status = statusField.data ? knownValue(statusField.value) : undefined;
+    return {
+      venueOrderId: value("venueOrderId", isVenueId),
+      tokenId: value("assetId", isTokenId),
+      side: value("side", DOMAINS["side"] as (candidate: unknown) => boolean),
+      price: value("price", isUnitPrice),
+      originalSize: value("originalSize", isPositiveAmount),
+      sizeMatched: value("sizeMatched", isNonNegativeAmount),
+      status: status ?? UNREADABLE,
+    };
+  }
+  const statusField = own(event, "status");
+  const status = statusField.data ? knownValue(statusField.value) : undefined;
+  const ordered = status !== undefined && USER_TRADE_STATUSES.includes(status) && !(shortfalls ?? []).some((entry) => STATUS_SHORTFALLS.includes(entry));
+  const sideField = own(event, "traderSide");
+  const side = sideField.data ? knownValue(sideField.value) : undefined;
+  const traderSide = side === "TAKER" || side === "MAKER" ? side : undefined;
+  let determined = traderSide !== undefined;
+  const ownIds = new Set<string>();
+  let orphans = 0;
+  const taker = own(event, "takerOrderId");
+  if (traderSide === "TAKER") {
+    if (taker.data && isVenueId(taker.value)) ownIds.add(taker.value);
+    else orphans += 1;
+  }
+  const makersField = own(event, "makerOrders");
+  const makers = makersField.data ? (makersField.value === null ? [] : expectedEntries(makersField.value, 1024)) : undefined;
+  if (makers === undefined || makers.includes(UNREADABLE)) determined = false;
+  for (const maker of makers ?? []) {
+    const account = maker === UNREADABLE ? ({ data: false } as const) : own(maker, "account");
+    const id = maker === UNREADABLE ? ({ data: false } as const) : own(maker, "venueOrderId");
+    if (account.data && account.value === "OWN") {
+      if (id.data && isVenueId(id.value)) ownIds.add(id.value);
+      else orphans += 1;
+    } else if (!(account.data && account.value === "OTHER")) {
+      determined = false;
+    }
+  }
+  return {
+    venueTradeId: value("venueTradeId", isIdentifier),
+    status: ordered ? status : UNREADABLE,
+    transactionHash: value("transactionHash", (candidate) => candidate === null || isIdentifier(candidate)),
+    own: [...ownIds].sort(),
+    orphans,
+    determined,
+  };
+}
+
 /**
  * (r12) What a delivered user-stream output carries, read by the oracle on its own: every item (a row of fragments) and
  * every unreadable entry BY NAME (`<item kind>:<field>`, as the door names it: `FILL:kind`, `ORDER:oms`, `FILL:oms`,
  * `ORDER:observation`, `FILL:fills`, `SETTLEMENT:settlements`, `<kind>:entry`). Every key of WP-280's projection the
  * door reads is present in every output WP-280 emits: one that is MISSING is unreadable, never "nothing"
- * (WP290-CX-R12-01).
+ * (WP290-CX-R12-01). (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) And its `event` ({@link expectedEvent}), whenever it is
+ * an own-data record; the event is REQUIRED when every projection key was readable and WP-280 did not attest the
+ * projection whole (a shortfall, `shortfalls` unreadable, or nothing projected): then an event that cannot be read is
+ * `<kind>:event`, and one whose order or trade id cannot be read is `ORDER:venueOrderId` or `FILL:venueTradeId`.
  */
-export function expectedStream(answer: unknown, maxItems: number): { readonly items: { kind: string; row: Expected }[]; readonly unreadable: string[] } {
+export function expectedStream(answer: unknown, maxItems: number): { readonly items: { kind: string; row: Expected }[]; readonly unreadable: string[]; readonly event?: Expected } {
   const kind = own(answer, "kind");
   const oms = own(answer, "oms");
   const items: { kind: string; row: Expected }[] = [];
@@ -462,6 +682,7 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
   const projection = oms.data && oms.value !== null && typeof oms.value === "object" ? oms.value : undefined;
   // (r13) Whether the output carries, in any form, a key only WP-280's ORDER and TRADE outputs carry.
   const carriesActivity = answer !== null && typeof answer === "object" && STREAM_ACTIVITY_ONLY_KEYS.some((key) => key in answer);
+  let activity: "ORDER" | "TRADE" | undefined;
   // An output whose own kind cannot be read: one unreadable entry (it may have been any output, a TRADE among them).
   if (!kind.data || typeof kind.value !== "string") unreadable.push("FILL:kind");
   else if (STREAM_NON_ACTIVITY_KINDS.includes(kind.value)) {
@@ -469,6 +690,7 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
     // may be an ORDER or TRADE output, mis-tagged (unreadable).
     if (carriesActivity) unreadable.push("FILL:kind");
   } else if (kind.value === "ORDER") {
+    activity = "ORDER";
     // (r12, WP290-CX-R12-01) WP-280's ORDER projection always carries `observation` (null: no observation): a key
     // that is MISSING, not own data, or `undefined` is unreadable, never "nothing".
     const observation = projection === undefined ? undefined : Object.getOwnPropertyDescriptor(projection, "observation");
@@ -476,6 +698,7 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
     else if (observation === undefined || !("value" in observation) || observation.value === undefined) unreadable.push("ORDER:observation");
     else if (observation.value !== null) items.push({ kind: "ORDER", row: expectedRow(observation.value, OBSERVATION_KEYS) });
   } else if (kind.value === "TRADE") {
+    activity = "TRADE";
     if (projection === undefined) unreadable.push("FILL:oms");
     else {
       for (const [field, itemKind, keys, optional] of [
@@ -500,8 +723,64 @@ export function expectedStream(answer: unknown, maxItems: number): { readonly it
     // (`""`, `"Trade"`, `"TRADE "`, `"order"`, ...): it may have been an ORDER or TRADE output: unreadable, never nothing.
     unreadable.push("FILL:kind");
   }
-  return { items, unreadable };
+  if (activity === undefined) return { items, unreadable };
+  // (r14) The event: stated whenever readable; required when the projection's keys were all readable and WP-280 did not
+  // attest it whole.
+  const shortfalls = projection === undefined ? undefined : expectedShortfalls(projection);
+  const required = unreadable.length === 0 && (shortfalls === undefined || shortfalls.length > 0 || items.length === 0);
+  const event = expectedEvent(activity, answer, shortfalls);
+  const prefix = activity === "ORDER" ? "ORDER" : "FILL";
+  if (required) {
+    if (event === undefined) unreadable.push(`${prefix}:event`);
+    else if (activity === "ORDER" && event["venueOrderId"] === UNREADABLE) unreadable.push("ORDER:venueOrderId");
+    else if (activity === "TRADE" && event["venueTradeId"] === UNREADABLE) unreadable.push("FILL:venueTradeId");
+  }
+  return event === undefined ? { items, unreadable } : { items, unreadable, event };
 }
 
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) A WP-280 reconciliation request as the oracle reads it, on its own, from
+ * WP-280's contract (`manager.ts`, `UserStreamReconciliationRequest`, `RECONCILIATION_CAUSES`, `eventScope`;
+ * `oms-projection.ts`, `PROJECTION_SHORTFALLS`): its id and cause; the identities it names (required, a missing field
+ * unreadable, when the cause is event-level or outside WP-280's vocabulary; an event-level request naming nothing is
+ * unreadable); whether its trade's status could have been any.
+ */
+export function expectedRequest(answer: unknown, causes: readonly string[], shortfallVocabulary: readonly string[]): Expected {
+  const present = (key: string): boolean => answer !== null && typeof answer === "object" && Object.prototype.hasOwnProperty.call(answer, key);
+  const id = own(answer, "requestId");
+  // eslint-disable-next-line no-control-regex
+  const requestId = id.data && typeof id.value === "string" && id.value.length > 0 && id.value.length <= 2000 && !/[\u0000-\u001f\u007f]/u.test(id.value) ? id.value : null;
+  const causeRead = own(answer, "cause");
+  const cause = causeRead.data && typeof causeRead.value === "string" ? causeRead.value : null;
+  const eventCause = cause === "EVENT_NOT_FULLY_APPLICABLE" || cause === "EVENT_NOT_DELIVERED";
+  const required = eventCause || cause === null || !causes.includes(cause);
+  const unreadable = new Set<string>();
+  const trade = own(answer, "venueTradeId");
+  let venueTradeId: string | null = null;
+  if (trade.data && isIdentifier(trade.value)) venueTradeId = trade.value;
+  else if (!(trade.data && trade.value === null) && !(!present("venueTradeId") && !required)) unreadable.add("venueTradeId");
+  const orders = own(answer, "venueOrderIds");
+  const venueOrderIds: string[] = [];
+  if (orders.data) {
+    const entries = expectedEntries(orders.value, 1024);
+    if (entries === undefined) unreadable.add("venueOrderIds");
+    for (const entry of entries ?? []) {
+      if (entry !== UNREADABLE && isVenueId(entry)) venueOrderIds.push(entry);
+      else unreadable.add("venueOrderIds");
+    }
+  } else if (present("venueOrderIds") || required) {
+    unreadable.add("venueOrderIds");
+  }
+  if (eventCause && venueTradeId === null && venueOrderIds.length === 0 && unreadable.size === 0) unreadable.add("venueOrderIds");
+  const shortfalls = !present("shortfalls") && !required ? [] : expectedShortfalls(answer);
+  if (shortfalls === undefined) unreadable.add("shortfalls");
+  const unordered = cause !== "EVENT_NOT_FULLY_APPLICABLE" || shortfalls === undefined || shortfalls.some((entry) => !shortfallVocabulary.includes(entry) || STATUS_SHORTFALLS.includes(entry));
+  const marketsRead = own(answer, "markets");
+  const marketEntries = marketsRead.data ? expectedEntries(marketsRead.value, 100_000) : undefined;
+  const markets = marketEntries === undefined || marketEntries.includes(UNREADABLE) ? [] : marketEntries.filter((entry): entry is string => typeof entry === "string");
+  const opaque = (["requestId", "cause", "markets"] as const).some((key) => present(key) && !own(answer, key).data);
+  return { requestId, cause, markets, opaque, eventCause, venueTradeId, venueOrderIds: [...new Set(venueOrderIds)].sort(), unordered, unreadable: [...unreadable].sort() };
+}
 
 export { APPROVAL_KEYS, COLLATERAL_KEYS, FILL_KEYS, LEG_KEYS, MEMBER_KEYS, OBSERVATION_KEYS, ORDER_KEYS, POSITION_KEYS, SETTLEMENT_KEYS, TRADE_KEYS, own };

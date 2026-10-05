@@ -26,7 +26,9 @@
  * | `TRADES_LEG_FRAGMENTS` (r11) | NAMED | a LEG on a readable trade and order that did not validate in full: every fact it validated |
  * | `TRADES_LEG_ORPHAN`, `STREAM_*_ORPHAN` (r11) | NAMED | an ORPHAN_LEG: an own leg under a readable trade id whose order id was unreadable |
  * | `OPEN_ORDERS_UNKEYED`, `BY_ID_UNKEYED`, `STREAM_ORDER_UNKEYED` (r11) | NAMED | an UNKEYED_ORDER: an order row (or observation) whose id was unreadable |
- * | `TRADES_ROW_UNKEYED`, `STREAM_UNREADABLE` (r11) | NAMED | an UNKEYED_TRADE: a trade row whose id was unreadable with no own leg kept on a readable order; an unreadable stream entry or list (r12: a missing one included) |
+ * | `TRADES_ROW_UNKEYED`, `STREAM_UNREADABLE` (r11) | NAMED | an UNKEYED_TRADE: a trade row whose id was unreadable with no own leg kept on a readable order; an unreadable stream entry or list (r12: a missing one included); (r14) a required event, or the trade id of one, or an identity a WP-280 request names, that could not be read |
+ * | `STREAM_TRADE` (r14) | NAMED | a TRADE record: a trade a user-stream event, or a WP-280 event-level request, named (WP290-V14-WP280-EVENT-IDS-DISCARDED): its identity OPEN until a valid row shows its own legs in full; `unordered` when the event's status cannot be ordered |
+ * | `STREAM_ORDER`, `STREAM_SETTLEMENT` (r14, from the event) | NAMED | an order event's order (with the facts the event stated), and each leg a trade event attributes to the account (its order and status, no economics), whatever the projection carried |
  * | `TRADES_LEG_UNKEYED_FRAGMENTS`, `STREAM_*_UNKEYED` (r11) | SHOWN / NAMED | an UNKEYED_LEG no read can answer (a fact or its order unreadable; the stream's) |
  * | `BY_ID_FOUND` (r11) | NAMED | a by-id answer's `found: true` in an unusable answer: the order asked about exists |
  * | `POSITIONS`, `COLLATERAL`, `APPROVALS` (r11) | SHOWN / NAMED | a HOLDING: detail only (not monotonic) |
@@ -114,6 +116,11 @@
  *   vocabulary) is never "nothing to compare": it could have been FAILED. A keyed trade it was shown on is marked
  *   `unordered` (monotonic, journaled), and holds until an observation shows the trade at a terminal status; an
  *   unkeyed row showing one is answered only by a witness at one terminal status;
+ * - (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) a trade the user stream NAMED (an event, or WP-280's event-level
+ *   request: `STREAM_TRADE`) is a TRADE record whose identity is OPEN (the r9 rule) until a valid trades row shows its own
+ *   legs in full: WP-280 projects nothing for an own trade it cannot attribute, so no omission discharges it; its status,
+ *   when the stream could not order it, marks it `unordered` (the r13 rule); an order an event named (`STREAM_ORDER`) is
+ *   NAMED evidence with the facts the event stated, read by id until a sound run settles it;
  * - (r11, the class fix at the door layer) every fragment a door validated reaches the store, and every fragment present
  *   but unreadable is an explicit obligation: of its object when its id is readable (a NAMED order is read by id until
  *   a sound run settles it; an ORPHAN_LEG opens its trade's identity, and once the trade is shown in full it must be one
@@ -132,6 +139,7 @@ import { isLegalSettlementTransition } from "../states.js";
 
 import {
   ENVELOPE_FIELDS,
+  EVENT_FIELDS,
   HOLDING_FIELDS,
   LEG_FIELDS,
   MEMBER_FIELDS,
@@ -188,6 +196,7 @@ export const EVIDENCE_SOURCES = [
   "STREAM_SETTLEMENT_ORPHAN",
   "STREAM_SETTLEMENT_UNKEYED",
   "STREAM_UNREADABLE",
+  "STREAM_TRADE",
   "POSITIONS",
   "COLLATERAL",
   "APPROVALS",
@@ -204,9 +213,13 @@ export type EvidenceSource = (typeof EVIDENCE_SOURCES)[number];
  *   showed (each its own LEG record);
  * - `TRADES_ROW_PARTIAL` (SHOWN): the row validated in full, but its ownership is undetermined: it may not show (or
  *   show none of) the account's own legs;
- * - `TRADES_ROW_ID` (NAMED): the trade id of a row that did not validate in full, with its status when that is text.
+ * - `TRADES_ROW_ID` (NAMED): the trade id of a row that did not validate in full, with its status when that is text;
+ * - (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) `STREAM_TRADE` (NAMED): a trade a user-stream event or a WP-280
+ *   reconciliation request NAMED (its id), with its status when the event's status can be ordered (else `null`, and
+ *   `status` named unreadable: the trade is then `unordered`). The stream never shows a trade's own legs in full, so its
+ *   identity is OPEN until a valid row shows it with its ownership determined (`TRADES_ROW`).
  */
-export const TRADE_SOURCES = ["TRADES_ROW", "TRADES_ROW_PARTIAL", "TRADES_ROW_ID"] as const;
+export const TRADE_SOURCES = ["TRADES_ROW", "TRADES_ROW_PARTIAL", "TRADES_ROW_ID", "STREAM_TRADE"] as const;
 export type TradeSource = (typeof TRADE_SOURCES)[number];
 
 /** One record (the journal's `EVIDENCE_RECORDED` without its run, time and position). */
@@ -1557,7 +1570,7 @@ export class EvidenceStore {
  * (r11) Every name a record's `unreadable` list may carry: a field of one of the doors' vocabularies (`door.ts`).
  */
 export const UNREADABLE_NAMES: readonly string[] = Object.freeze([
-  ...new Set<string>([...ORDER_FIELDS, ...LEG_FIELDS, ...TRADE_FIELDS, ...HOLDING_FIELDS, ...MEMBER_FIELDS, ...STREAM_FIELDS, ...ENVELOPE_FIELDS, "entry"]),
+  ...new Set<string>([...ORDER_FIELDS, ...LEG_FIELDS, ...TRADE_FIELDS, ...HOLDING_FIELDS, ...MEMBER_FIELDS, ...STREAM_FIELDS, ...ENVELOPE_FIELDS, ...EVENT_FIELDS, "entry"]),
 ].sort());
 
 /** (r11) The kind each source introduced in r11 belongs to, and only to (both doors check it). */
@@ -1575,6 +1588,7 @@ const SOURCE_KIND: Readonly<Record<string, EvidenceKind>> = Object.freeze({
   STREAM_SETTLEMENT_ORPHAN: "ORPHAN_LEG",
   STREAM_SETTLEMENT_UNKEYED: "UNKEYED_LEG",
   STREAM_UNREADABLE: "UNKEYED_TRADE",
+  STREAM_TRADE: "TRADE",
   POSITIONS: "HOLDING",
   COLLATERAL: "HOLDING",
   APPROVALS: "HOLDING",
@@ -1713,7 +1727,7 @@ function evidenceShapeHolds(r: {
   if (kind === "UNKEYED_LEG" && (r.level as number) < 1) return false;
   // (r9) A TRADE comes from a trade row (and only a TRADE does), SHOWN when the row validated in full.
   if ((kind === "TRADE") !== (TRADE_SOURCES as readonly string[]).includes(source)) return false;
-  if (kind === "TRADE" && r.provenance !== (source === "TRADES_ROW_ID" ? "NAMED" : "SHOWN")) return false;
+  if (kind === "TRADE" && r.provenance !== (source === "TRADES_ROW_ID" || source === "STREAM_TRADE" ? "NAMED" : "SHOWN")) return false;
   // Nothing of an order or a fill on a TRADE, an UNKEYED_TRADE, a HOLDING, a MEMBER or a SETTLED.
   const economics = kind !== "TRADE" && kind !== "UNKEYED_TRADE" && kind !== "HOLDING" && kind !== "MEMBER" && kind !== "SETTLED";
   if (!economics && (r.tokenId !== null || r.side !== null || r.price !== null || r.originalSize !== null || r.size !== null)) return false;
@@ -1931,7 +1945,7 @@ export function tradeRecord(
     evidenceKind: "TRADE",
     venueOrderId: null,
     venueTradeId,
-    provenance: source === "TRADES_ROW_ID" ? "NAMED" : "SHOWN",
+    provenance: source === "TRADES_ROW_ID" || source === "STREAM_TRADE" ? "NAMED" : "SHOWN",
     source,
     tokenId: null,
     side: null,

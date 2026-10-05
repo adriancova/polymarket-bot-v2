@@ -30,6 +30,7 @@ import { readStreamOutput } from "../../../packages/oms/src/reconciliation/door.
 import { boot, streamTrade } from "./support/harness.js";
 import { ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 import type { ReadFaults } from "./support/world.js";
+import { wireOrder, wp280Emit } from "./support/wp280.js";
 
 type Row = Record<string, unknown>;
 type Output = { readonly kind: string; readonly oms: Row };
@@ -264,23 +265,43 @@ describe("WP-290 r12 (WP290-CX-R12-01 = WP290-V12-STREAM-ABSENT-LIST-SILENT): a 
     expect(streamObligations(r)).toEqual([]);
   });
 
-  it("(P12, control: observation null) WP-280's own shape for an event that named no status (it raises its own request for it): not an obligation, no run from this output", async () => {
+  // (r14, restated: deviation) r12 held these two shapes as controls: an ORDER output with `observation: null`, and a
+  // TRADE output with no `shortfalls` key, "carry nothing". WP290-V14-WP280-EVENT-IDS-DISCARDED refutes that premise
+  // (both verifiers withdrew it): an empty projection, or one whose shortfalls cannot be read, is not the whole event,
+  // so the output's EVENT is required. With WP-280's own shape (its `event` present) the event's order is journaled as
+  // stream-named evidence and read by id; without it, the output is an obligation of the account.
+  it("(P12, control: observation null; r14 restated) WP-280's own shape for an event that named no status: its event's order is stream-named evidence (here a tracked order the evidence knows: nothing new), not an account obligation; a run, which resumes", async () => {
     const r = await ready();
-    expect(readStreamOutput({ kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } }).unreadable).toEqual([]);
-    r.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } });
+    await submitOne(r.oms);
+    expect(await reconcileRounds(r, 3)).toBe(true);
+    const order = must(r.u.world.orders.get(must(r.u.world.receipts.at(-1), "receipt")), "venue order");
+    const emission = wp280Emit(wireOrder({ id: order.venueOrderId, assetId: order.tokenId, side: order.side, originalSize: order.original, sizeMatched: order.matched, price: order.price, status: null }));
+    expect(emission.shortfalls).toEqual(["ORDER_STATUS_ABSENT"]);
+    expect(readStreamOutput(emission.output).unreadable).toEqual([]);
+    r.p.coordinator.onUserStreamOutput(emission.output);
     await r.p.coordinator.settled();
-    expect(r.p.coordinator.status().holding).toBe(false);
-    expect(r.p.coordinator.status().pendingTriggers).toEqual([]);
+    expect(r.p.coordinator.status().pendingTriggers).toEqual(["POSITION_BALANCE_DISCREPANCY"]);
     expect(streamObligations(r)).toEqual([]);
     expect(await reconcileRounds(r, 2)).toBe(true);
+    expect(oracle(r)).toEqual([]);
   });
 
-  it("(P12, control: shortfalls missing) the projection's shortfalls are not read here (WP-280 raises its own request for them): a TRADE output with every list present but no shortfalls key is applied as usual", async () => {
+  it("(P12, observation null with no event; r14 restated) the event is required and missing: an obligation of the account, a run; it holds", async () => {
+    const r = await ready();
+    expect(readStreamOutput({ kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } }).unreadable).toEqual([{ kind: "ORDER", field: "event" }]);
+    r.p.coordinator.onUserStreamOutput({ kind: "ORDER", oms: { observation: null, shortfalls: ["ORDER_STATUS_ABSENT"] } });
+    await r.p.coordinator.settled();
+    expect(r.p.coordinator.status().holding).toBe(true);
+    expect(streamObligations(r)).toEqual([["UNKEYED_ORDER", "STREAM_ORDER_UNKEYED", []]]);
+    expect(await reconcileRounds(r, 2)).toBe(false);
+  });
+
+  it("(P12, shortfalls missing; r14 restated) a TRADE output with every list present but no shortfalls key cannot be shown whole: its event is required; with none, an obligation that holds (the fill itself is applied)", async () => {
     const { r } = await fillThenLag((full) => withoutKeys(full, "shortfalls"), false);
     expect(r.oms.orders()[0]?.filledShares).toBe("0.4");
-    expect(streamObligations(r)).toEqual([]);
+    expect(streamObligations(r)).toEqual([["UNKEYED_TRADE", "STREAM_UNREADABLE", ["event"]]]);
     r.u.world.faults = {};
-    expect(await reconcileRounds(r, 6)).toBe(true);
+    expect(await reconcileRounds(r, 6)).toBe(false);
     expect(oracle(r)).toEqual([]);
   });
 
@@ -298,6 +319,7 @@ describe("WP-290 r12 (WP290-CX-R12-01 = WP290-V12-STREAM-ABSENT-LIST-SILENT): a 
     expect(readStreamOutput({ kind: "ORDER" }).unreadable).toEqual([{ kind: "ORDER", field: "oms" }]);
     expect(readStreamOutput({ kind: "TRADE" }).unreadable).toEqual([{ kind: "FILL", field: "oms" }]);
     expect(readStreamOutput({ oms: { fills: [], settlements: [] } }).unreadable).toEqual([{ kind: "FILL", field: "kind" }]);
-    expect(readStreamOutput({ kind: "TRADE", oms: { fills: [], settlements: [], shortfalls: [] } })).toEqual({ kind: "TRADE", items: [], unreadable: [] });
+    // (r14, restated: deviation) an EMPTY projection is not "nothing": its event is required (here missing).
+    expect(readStreamOutput({ kind: "TRADE", oms: { fills: [], settlements: [], shortfalls: [] } })).toEqual({ kind: "TRADE", items: [], unreadable: [{ kind: "FILL", field: "event" }] });
   });
 });

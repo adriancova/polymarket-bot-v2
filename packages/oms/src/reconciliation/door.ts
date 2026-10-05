@@ -30,6 +30,15 @@
  * the documented vocabulary holds (`STATUS_UNRECOGNISED`; the OMS's RECONCILING); a settlement status no one can order
  * is answered only by an observation of the trade at a terminal status (`evidence.ts`, r13).
  *
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) An EMPTY stream projection is never "nothing" either. WP-280 projects nothing
+ * (an ORDER's `observation: null`; a TRADE with no fill and no settlement) exactly for an account event it could NOT
+ * project, and says why in `shortfalls`; its event-level reconciliation request names "the identifiers the event named,
+ * exactly". So the stream door reads the output's `event` whenever it can (`StreamEventFragments`: an order event's
+ * order and facts; a trade event's trade, status, and the legs it attributes to the account), REQUIRES it when the
+ * projection is not attested whole (a shortfall, `shortfalls` missing or unreadable, nothing projected: an event, or its
+ * id, that cannot be read is then an unreadable entry), and reads every WP-280 request's identities on their own
+ * ({@link readStreamRequest}: required for an event-level cause or one outside WP-280's closed vocabulary).
+ *
  * A read has exactly one outcome:
  *
  * | Outcome | Meaning | Break |
@@ -64,6 +73,10 @@ import { compositeKey, isIdentifier, isNonNegativeAmount, isPositiveAmount, isTo
 import { isVenueId } from "../outcomes.js";
 
 import {
+  STREAM_EVENT_CAUSES,
+  STREAM_PROJECTION_SHORTFALLS,
+  STREAM_RECONCILIATION_CAUSES,
+  STREAM_STATUS_SHORTFALLS,
   VENUE_ORDER_STATUSES,
   VENUE_TRADE_STATUSES,
   type BookedAmount,
@@ -96,9 +109,50 @@ export type MemberField = (typeof MEMBER_FIELDS)[number];
 /** The fields of one user-stream item (WP-280's OMS inputs): an order observation, a fill, a settlement. */
 export const STREAM_FIELDS = ["venueOrderId", "venueTradeId", "status", "shares", "price", "liquidityRole", "feeAmount", "feeAssetId", "matchedAt", "transactionHash"] as const;
 export type StreamField = (typeof STREAM_FIELDS)[number];
-/** An answer's own fields. */
-export const ENVELOPE_FIELDS = ["route", "complete", "found", "order", "orders", "trades", "positions", "approvals", "source", "fills", "settlements", "observation", "oms", "kind"] as const;
+/**
+ * An answer's own fields. (r14) A user-stream output's `event` and its projection's `shortfalls`, and a WP-280
+ * request's `venueOrderIds` (its `venueTradeId` is a stream field).
+ */
+export const ENVELOPE_FIELDS = [
+  "route",
+  "complete",
+  "found",
+  "order",
+  "orders",
+  "trades",
+  "positions",
+  "approvals",
+  "source",
+  "fills",
+  "settlements",
+  "observation",
+  "oms",
+  "kind",
+  "event",
+  "shortfalls",
+  "venueOrderIds",
+] as const;
 export type EnvelopeField = (typeof ENVELOPE_FIELDS)[number];
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) The fields of WP-280's normalized EVENT (`normalize.ts`,
+ * `NormalizedOrderEvent` and `NormalizedTradeEvent`) the stream door reads: an order event's order and its facts; a
+ * trade event's trade, status, trader side, taker order, maker legs and transaction hash.
+ */
+export const EVENT_FIELDS = [
+  "venueOrderId",
+  "assetId",
+  "side",
+  "price",
+  "originalSize",
+  "sizeMatched",
+  "status",
+  "venueTradeId",
+  "traderSide",
+  "takerOrderId",
+  "makerOrders",
+  "transactionHash",
+] as const;
+export type EventField = (typeof EVENT_FIELDS)[number];
 
 /**
  * What one order row SHOWED, field by field (r11): each field's value when it validated on its own, `null` when it
@@ -832,15 +886,55 @@ export interface StreamItem {
 }
 
 /**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) What an activity output's EVENT named (WP-280's normalized event, read by
+ * own data property, each field on its own): the account's activity that the event identifies, whatever the projection
+ * carried.
+ * - ORDER: the order (`venueOrderId`) and its facts as the event stated them (its token, side, price, sizes); `status`
+ *   is the event's status when WP-280 recognised it (`KNOWN`), else `null` (and `status` is named in `unreadable`).
+ * - TRADE: the trade (`venueTradeId`); `status` is the event's settlement status only when it can be ORDERED (one of
+ *   WP-280's five, `KNOWN`, and no status shortfall: `ordered`); the orders of the legs the event attributes to the
+ *   account (`ownOrderIds`: the taker order of a TAKER trade, every maker leg WP-280's `isAccountOwner` called `OWN`),
+ *   the own legs whose order id could not be read (`ownOrphans`), and whether every leg's ownership was determined
+ *   (`legsDetermined`: the trader side KNOWN, and no maker leg undetermined or unreadable).
+ * `required`: WP-280 did not attest that its projection carried the whole event (a shortfall; its shortfalls missing
+ * or unreadable; or an empty projection: no observation, no fill and no settlement), so the event's identity is
+ * REQUIRED: one that cannot be read is an unreadable entry of the output (an obligation), never nothing.
+ */
+export interface StreamEventFragments {
+  readonly kind: "ORDER" | "TRADE";
+  readonly required: boolean;
+  readonly venueOrderId: string | null;
+  readonly tokenId: string | null;
+  readonly side: "BUY" | "SELL" | null;
+  readonly price: DecimalString | null;
+  readonly originalSize: DecimalString | null;
+  readonly sizeMatched: DecimalString | null;
+  readonly status: string | null;
+  readonly venueTradeId: string | null;
+  readonly ordered: boolean;
+  readonly ownOrderIds: readonly string[];
+  readonly ownOrphans: number;
+  readonly legsDetermined: boolean;
+  readonly transactionHash: string | null;
+  readonly unreadable: readonly EventField[];
+}
+
+/** The field an unreadable entry of a stream output names (r14: the event, or a required event's identity, included). */
+export type StreamUnreadableField = EnvelopeField | "entry" | "venueOrderId" | "venueTradeId";
+
+/**
  * One user-stream output (r11, the stream door): every item it carries, each read once into fragments, and the
  * entries and lists present but unreadable (`unreadable`: each an item of the account's activity the stream reported
  * that nothing identifies). `kind` is `null` when the output is not an ORDER or TRADE output (then `unreadable` names
  * its `kind` when that could not be read, or, r13, was outside WP-280's vocabulary: {@link classifyStreamOutput}).
+ * (r14) `event`: what the output's event named, whenever it could be read ({@link StreamEventFragments}); absent when
+ * the output carries no readable event.
  */
 export interface StreamOutput {
   readonly kind: "ORDER" | "TRADE" | null;
   readonly items: readonly StreamItem[];
-  readonly unreadable: readonly { readonly kind: "ORDER" | "FILL" | "SETTLEMENT"; readonly field: EnvelopeField | "entry" }[];
+  readonly unreadable: readonly { readonly kind: "ORDER" | "FILL" | "SETTLEMENT"; readonly field: StreamUnreadableField }[];
+  readonly event?: StreamEventFragments;
 }
 
 const STREAM_KEYS: Readonly<Record<StreamItemFragments["kind"], readonly StreamField[]>> = Object.freeze({
@@ -932,14 +1026,159 @@ export function classifyStreamOutput(output: unknown): StreamOutputClass {
   return Object.freeze({ read: carriesActivity ? "UNREADABLE" : "NOTHING", request });
 }
 
+/** (r14) WP-280's `WireEnum` (`normalize.ts`): a recognised value, an absent one, or an unrecognised one. */
+type WireEnumRead = { readonly kind: "KNOWN"; readonly value: string } | { readonly kind: "ABSENT" } | { readonly kind: "UNRECOGNIZED" } | { readonly kind: "UNREADABLE" };
+
+/** (r14) Read one of WP-280's `WireEnum` values by own data property: anything outside its three shapes is unreadable. */
+function readWireEnum(raw: FieldRead): WireEnumRead {
+  if (raw.kind !== "DATA" || !isRecord(raw.value)) return { kind: "UNREADABLE" };
+  const kind = readField(raw.value, "kind");
+  if (kind.kind !== "DATA") return { kind: "UNREADABLE" };
+  if (kind.value === "ABSENT") return { kind: "ABSENT" };
+  if (kind.value === "UNRECOGNIZED") return { kind: "UNRECOGNIZED" };
+  if (kind.value !== "KNOWN") return { kind: "UNREADABLE" };
+  const value = readField(raw.value, "value");
+  return value.kind === "DATA" && isIdentifier(value.value) ? { kind: "KNOWN", value: value.value } : { kind: "UNREADABLE" };
+}
+
+/**
+ * (r14) The projection's `shortfalls` (WP-280's closed vocabulary, `STREAM_PROJECTION_SHORTFALLS`): the list as read
+ * (each entry's text), or `undefined` when it is missing, not a list, or carries an entry that is not text. A text
+ * outside the vocabulary is kept as read: it is a shortfall all the same (the projection is not the whole event).
+ */
+function readShortfalls(source: unknown): readonly string[] | undefined {
+  const field = readField(source, "shortfalls");
+  const list = field.kind === "DATA" ? listEntries(field.value, STREAM_PROJECTION_SHORTFALLS.length * 4) : undefined;
+  if (list === undefined || !list.whole) return undefined;
+  const out: string[] = [];
+  for (const entry of list.entries) {
+    if (typeof entry !== "string") return undefined;
+    out.push(entry);
+  }
+  return Object.freeze(out);
+}
+
+/** (r14) Whether the shortfalls say the event's trade status is one no one can order (or may: unreadable). */
+function statusShortfall(shortfalls: readonly string[] | undefined): boolean {
+  return shortfalls !== undefined && shortfalls.some((entry) => (STREAM_STATUS_SHORTFALLS as readonly string[]).includes(entry));
+}
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) Read an activity output's EVENT (WP-280's normalized event) once, each field
+ * on its own ({@link StreamEventFragments}). `undefined` when the event is not own data or not a record.
+ */
+function readEventFragments(kind: "ORDER" | "TRADE", raw: FieldRead, required: boolean, shortfalls: readonly string[] | undefined): StreamEventFragments | undefined {
+  if (raw.kind !== "DATA" || !isRecord(raw.value)) return undefined;
+  const event = raw.value;
+  const unreadable: EventField[] = [];
+  const field = <T>(key: EventField, valid: (value: unknown) => value is T): T | null => {
+    const read = readField(event, key);
+    if (read.kind === "DATA" && valid(read.value)) return read.value;
+    unreadable.push(key);
+    return null;
+  };
+  const none = { venueOrderId: null, tokenId: null, side: null, price: null, originalSize: null, sizeMatched: null, venueTradeId: null, ownOrderIds: Object.freeze([]), ownOrphans: 0 } as const;
+  if (kind === "ORDER") {
+    const venueOrderId = field("venueOrderId", isVenueId);
+    const tokenId = field("assetId", isTokenId);
+    const side = field("side", isSide);
+    const price = field("price", isUnitPrice);
+    const originalSize = field("originalSize", isPositiveAmount);
+    const sizeMatched = field("sizeMatched", isNonNegativeAmount);
+    // WP-280's order status: recognised (KNOWN), or absent or unrecognised (its own shapes: kept as no status, named).
+    const status = readWireEnum(readField(event, "status"));
+    if (status.kind !== "KNOWN") unreadable.push("status");
+    return Object.freeze({
+      ...none,
+      kind,
+      required,
+      venueOrderId,
+      tokenId,
+      side,
+      price,
+      originalSize,
+      sizeMatched,
+      status: status.kind === "KNOWN" ? status.value : null,
+      ordered: status.kind === "KNOWN",
+      legsDetermined: true,
+      transactionHash: null,
+      unreadable: Object.freeze([...new Set(unreadable)]),
+    });
+  }
+  const venueTradeId = field("venueTradeId", isIdentifier);
+  // A settlement status that can be ORDERED: one of WP-280's five (plain spelling), recognised, and no status shortfall.
+  const status = readWireEnum(readField(event, "status"));
+  const ordered = status.kind === "KNOWN" && isStreamSettlementStatus(status.value) && !statusShortfall(shortfalls);
+  if (!ordered) unreadable.push("status");
+  const transactionHash = field("transactionHash", isNullOr(isIdentifier));
+  // The legs the event attributes to the account (WP-280's own rule, `oms-projection.ts` `ownLegs`): the taker order of
+  // a TAKER trade; every maker leg its `isAccountOwner` called OWN (on either side: an own maker leg on a TAKER trade is
+  // a same-account match WP-280 does not project, but the leg is the account's all the same).
+  const traderSide = readWireEnum(readField(event, "traderSide"));
+  if (traderSide.kind === "UNREADABLE") unreadable.push("traderSide");
+  const side = traderSide.kind === "KNOWN" && (traderSide.value === "TAKER" || traderSide.value === "MAKER") ? traderSide.value : null;
+  let legsDetermined = side !== null;
+  const own = new Set<string>();
+  let ownOrphans = 0;
+  const taker = readField(event, "takerOrderId");
+  const takerId = taker.kind === "DATA" && isVenueId(taker.value) ? taker.value : null;
+  if (takerId === null) unreadable.push("takerOrderId");
+  if (side === "TAKER") {
+    if (takerId !== null) own.add(takerId);
+    else ownOrphans += 1;
+  }
+  const makersField = readField(event, "makerOrders");
+  const makers = makersField.kind === "DATA" ? (makersField.value === null ? { entries: [], whole: true } : listEntries(makersField.value, MAX_LEGS_PER_TRADE * 16)) : undefined;
+  if (makers === undefined || !makers.whole) {
+    unreadable.push("makerOrders");
+    legsDetermined = false;
+  }
+  for (const entry of makers?.entries ?? []) {
+    const account = entry === UNREADABLE_ENTRY ? OPAQUE_READ : readField(entry, "account");
+    const orderId = entry === UNREADABLE_ENTRY ? OPAQUE_READ : readField(entry, "venueOrderId");
+    const id = orderId.kind === "DATA" && isVenueId(orderId.value) ? orderId.value : null;
+    if (account.kind === "DATA" && account.value === "OWN") {
+      if (id !== null) own.add(id);
+      else {
+        ownOrphans += 1;
+        unreadable.push("makerOrders");
+      }
+    } else if (!(account.kind === "DATA" && account.value === "OTHER")) {
+      // UNDETERMINED (WP-280's own verdict), or a verdict that cannot be read: the leg may be the account's.
+      legsDetermined = false;
+      if (!(account.kind === "DATA" && account.value === "UNDETERMINED")) unreadable.push("makerOrders");
+    }
+  }
+  return Object.freeze({
+    ...none,
+    kind,
+    required,
+    venueTradeId,
+    status: ordered && status.kind === "KNOWN" ? status.value : null,
+    ordered,
+    ownOrderIds: Object.freeze([...own].sort()),
+    ownOrphans,
+    legsDetermined,
+    transactionHash,
+    unreadable: Object.freeze([...new Set(unreadable)]),
+  });
+}
+
 /**
  * Read one WP-280 `UserStreamOutput` (an ORDER or TRADE output) once, into its items and their fragments. Every key
  * of WP-280's projection this door reads (`oms`; an ORDER's `observation`; a TRADE's `fills` and `settlements`) is
  * present in every output WP-280 emits (`oms-projection.ts`): one that is missing, not own data, or not in its shape is
  * an UNREADABLE entry (r12: a missing key too, WP290-CX-R12-01), never "nothing". (r13) Its `kind` is read against
- * WP-280's closed vocabulary ({@link classifyStreamOutput}): one outside it is an UNREADABLE entry too. The projection's
- * `shortfalls` is not read here: WP-280 raises its own `EVENT_NOT_FULLY_APPLICABLE` request for them, from its own
- * projection.
+ * WP-280's closed vocabulary ({@link classifyStreamOutput}): one outside it is an UNREADABLE entry too.
+ *
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) An EMPTY projection is never "nothing": WP-280 projects nothing (an ORDER's
+ * `observation: null`; a TRADE with no fill and no settlement) exactly when it could not project the event, and says
+ * why in `shortfalls`. So the projection's `shortfalls` IS read, and the output's `event` too: whenever it can be read,
+ * what it names is returned (`event`: the coordinator journals it as stream-NAMED evidence), and when WP-280 did not
+ * attest that its projection carried the whole event (a shortfall, `shortfalls` missing or unreadable, or an empty
+ * projection) the event is REQUIRED: an event, or its order or trade id, that cannot be read is an UNREADABLE entry (an
+ * obligation of the account). A projection one of whose keys is unreadable already carries that obligation; its event
+ * is then read for what it names, and nothing more is required of it.
  */
 export function readStreamOutput(output: unknown): StreamOutput {
   const read = classifyStreamOutput(output);
@@ -952,49 +1191,151 @@ export function readStreamOutput(output: unknown): StreamOutput {
   // A STATE, UNRECOGNIZED_MESSAGE or RECONCILIATION_REQUESTED output (WP-280's own vocabulary) carries no item of the
   // account's activity.
   if (read.read === "NOTHING") return Object.freeze({ kind: null, items: Object.freeze([]), unreadable: Object.freeze([]) });
+  const kind = read.read;
   const projection = readField(output, "oms");
   const items: StreamItem[] = [];
-  const unreadable: { readonly kind: "ORDER" | "FILL" | "SETTLEMENT"; readonly field: EnvelopeField | "entry" }[] = [];
-  if (read.read === "ORDER") {
+  const unreadable: { readonly kind: "ORDER" | "FILL" | "SETTLEMENT"; readonly field: StreamUnreadableField }[] = [];
+  // (r14) Whether every key of the projection was readable, and whether it carried anything at all.
+  let keysReadable = true;
+  let carried = false;
+  if (kind === "ORDER") {
     if (projection.kind !== "DATA" || !isRecord(projection.value)) {
       unreadable.push({ kind: "ORDER", field: "oms" });
+      keysReadable = false;
     } else {
       const observation = readField(projection.value, "observation");
       // (r12, WP290-CX-R12-01) WP-280's ORDER projection always carries `observation`: `null` when the event named no
-      // status (WP-280 then raises its own request), else the observation. A MISSING key (or one holding `undefined`)
-      // is unreadable, an obligation of the account, exactly as one that is not own data: never "no observation".
-      if (observation.kind !== "DATA" || observation.value === undefined) unreadable.push({ kind: "ORDER", field: "observation" });
-      else if (observation.value !== null) {
+      // status (r14: an EMPTY projection, so the event is required), else the observation. A MISSING key (or one
+      // holding `undefined`) is unreadable, an obligation of the account, exactly as one that is not own data.
+      if (observation.kind !== "DATA" || observation.value === undefined) {
+        unreadable.push({ kind: "ORDER", field: "observation" });
+        keysReadable = false;
+      } else if (observation.value !== null) {
         items.push(Object.freeze({ raw: observation.value, fragments: streamItemFragments("ORDER", observation.value) }));
+        carried = true;
       }
     }
-    return Object.freeze({ kind: "ORDER", items: Object.freeze(items), unreadable: Object.freeze(unreadable) });
-  }
-  if (projection.kind !== "DATA" || !isRecord(projection.value)) {
+  } else if (projection.kind !== "DATA" || !isRecord(projection.value)) {
     unreadable.push({ kind: "FILL", field: "oms" });
-    return Object.freeze({ kind: "TRADE", items: Object.freeze(items), unreadable: Object.freeze(unreadable) });
-  }
-  for (const [field, itemKind] of [
-    ["fills", "FILL"],
-    ["settlements", "SETTLEMENT"],
-  ] as const) {
-    // (r12, WP290-CX-R12-01) WP-280's TRADE projection always carries both lists (empty when it projected nothing): a
-    // MISSING list is unreadable, an obligation of the account, exactly as one that is not a list: never "nothing".
-    const listField = readField(projection.value, field);
-    const list = listField.kind === "DATA" ? listEntries(listField.value, MAX_STREAM_ITEMS) : undefined;
-    if (list === undefined) {
-      unreadable.push({ kind: itemKind, field });
-      continue;
-    }
-    for (const entry of list.entries) {
-      if (entry === UNREADABLE_ENTRY) {
-        unreadable.push({ kind: itemKind, field: "entry" });
+    keysReadable = false;
+  } else {
+    for (const [field, itemKind] of [
+      ["fills", "FILL"],
+      ["settlements", "SETTLEMENT"],
+    ] as const) {
+      // (r12, WP290-CX-R12-01) WP-280's TRADE projection always carries both lists (empty when it projected nothing):
+      // a MISSING list is unreadable, an obligation of the account, exactly as one that is not a list: never "nothing".
+      const listField = readField(projection.value, field);
+      const list = listField.kind === "DATA" ? listEntries(listField.value, MAX_STREAM_ITEMS) : undefined;
+      if (list === undefined) {
+        unreadable.push({ kind: itemKind, field });
+        keysReadable = false;
         continue;
       }
-      items.push(Object.freeze({ raw: entry, fragments: streamItemFragments(itemKind, entry) }));
+      for (const entry of list.entries) {
+        if (entry === UNREADABLE_ENTRY) {
+          unreadable.push({ kind: itemKind, field: "entry" });
+          keysReadable = false;
+          continue;
+        }
+        items.push(Object.freeze({ raw: entry, fragments: streamItemFragments(itemKind, entry) }));
+        carried = true;
+      }
     }
   }
-  return Object.freeze({ kind: "TRADE", items: Object.freeze(items), unreadable: Object.freeze(unreadable) });
+  // (r14) The projection is the whole event only when WP-280 says so: its shortfalls readable and empty, and something
+  // projected. Otherwise the event's identity is required.
+  const shortfalls = projection.kind === "DATA" && isRecord(projection.value) ? readShortfalls(projection.value) : undefined;
+  const required = keysReadable && (shortfalls === undefined || shortfalls.length > 0 || !carried);
+  const entryKind = kind === "ORDER" ? ("ORDER" as const) : ("FILL" as const);
+  const event = readEventFragments(kind, readField(output, "event"), required, shortfalls);
+  if (required) {
+    if (event === undefined) unreadable.push({ kind: entryKind, field: "event" });
+    else if (kind === "ORDER" && event.venueOrderId === null) unreadable.push({ kind: entryKind, field: "venueOrderId" });
+    else if (kind === "TRADE" && event.venueTradeId === null) unreadable.push({ kind: entryKind, field: "venueTradeId" });
+  }
+  return Object.freeze({ kind, items: Object.freeze(items), unreadable: Object.freeze(unreadable), ...(event === undefined ? {} : { event }) });
+}
+
+/**
+ * (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) One WP-280 reconciliation request (`manager.ts`,
+ * `UserStreamReconciliationRequest`), read once by own data property, every field on its own, WHATEVER its usability
+ * (a request whose id or cause cannot be read still names what it names):
+ * - `requestId` (text, at most 2000 characters), `cause` (text), `markets` (the texts of its list): `null`, and `opaque`
+ *   (one of the three is not own data), exactly where the request's door refused them before r14 (the coordinator
+ *   records such a request as REQUEST_MALFORMED);
+ * - `venueTradeId`, `venueOrderIds`: "the identifiers the event named, exactly", for an event-level cause; each id
+ *   validated on its own. The fields are REQUIRED (missing is unreadable) when the cause is event-level, or outside
+ *   WP-280's closed vocabulary (or unreadable: it may have been an event-level cause); an event-level request that names
+ *   no identifier at all is unreadable too (WP-280's `eventScope` always names the event's order or orders);
+ * - `unordered`: whether the named trade's status could have been any: only an `EVENT_NOT_FULLY_APPLICABLE` request
+ *   whose shortfalls are readable, inside WP-280's vocabulary and name no status shortfall says it was one WP-280
+ *   recognised (shortfalls that cannot be read are named in `unreadable`: their only bearing is this mark).
+ */
+export interface StreamRequestFragments {
+  readonly requestId: string | null;
+  readonly cause: string | null;
+  readonly markets: readonly string[];
+  readonly opaque: boolean;
+  readonly eventCause: boolean;
+  readonly venueTradeId: string | null;
+  readonly venueOrderIds: readonly string[];
+  readonly unordered: boolean;
+  readonly unreadable: readonly ("venueTradeId" | "venueOrderIds" | "shortfalls")[];
+}
+
+/** The longest request id the coordinator keeps. */
+export const MAX_STREAM_REQUEST_ID = 2000;
+
+export function readStreamRequest(raw: unknown): StreamRequestFragments {
+  const unreadable: ("venueTradeId" | "venueOrderIds" | "shortfalls")[] = [];
+  const idRead = readField(raw, "requestId");
+  // eslint-disable-next-line no-control-regex
+  const requestId = idRead.kind === "DATA" && typeof idRead.value === "string" && idRead.value.length > 0 && idRead.value.length <= MAX_STREAM_REQUEST_ID && !/[\u0000-\u001f\u007f]/u.test(idRead.value) ? idRead.value : null;
+  const causeRead = readField(raw, "cause");
+  const cause = causeRead.kind === "DATA" && typeof causeRead.value === "string" ? causeRead.value : null;
+  const marketsRead = readField(raw, "markets");
+  const markets = marketsRead.kind === "DATA" ? (readArray(marketsRead.value, 100_000) ?? []).filter((market): market is string => typeof market === "string") : [];
+  const eventCause = cause !== null && (STREAM_EVENT_CAUSES as readonly string[]).includes(cause);
+  const knownCause = cause !== null && (STREAM_RECONCILIATION_CAUSES as readonly string[]).includes(cause);
+  // The identity fields are required where the request may be an event's.
+  const required = eventCause || !knownCause;
+  const tradeRead = readField(raw, "venueTradeId");
+  let venueTradeId: string | null = null;
+  if (tradeRead.kind === "DATA" && isIdentifier(tradeRead.value)) venueTradeId = tradeRead.value;
+  else if (!(tradeRead.kind === "DATA" && tradeRead.value === null) && !(tradeRead.kind === "ABSENT" && !required)) unreadable.push("venueTradeId");
+  const ordersRead = readField(raw, "venueOrderIds");
+  const venueOrderIds: string[] = [];
+  if (ordersRead.kind === "DATA") {
+    const list = listEntries(ordersRead.value, MAX_LEGS_PER_TRADE * 16);
+    if (list === undefined || !list.whole) unreadable.push("venueOrderIds");
+    for (const entry of list?.entries ?? []) {
+      if (entry !== UNREADABLE_ENTRY && isVenueId(entry)) venueOrderIds.push(entry);
+      else unreadable.push("venueOrderIds");
+    }
+  } else if (!(ordersRead.kind === "ABSENT" && !required)) {
+    unreadable.push("venueOrderIds");
+  }
+  if (eventCause && venueTradeId === null && venueOrderIds.length === 0 && unreadable.length === 0) unreadable.push("venueOrderIds");
+  const shortfallsRead = readField(raw, "shortfalls");
+  const shortfalls = shortfallsRead.kind === "ABSENT" && !required ? Object.freeze([] as string[]) : readShortfalls(raw);
+  if (shortfalls === undefined) unreadable.push("shortfalls");
+  const unordered =
+    cause !== "EVENT_NOT_FULLY_APPLICABLE" ||
+    shortfalls === undefined ||
+    shortfalls.some((entry) => !(STREAM_PROJECTION_SHORTFALLS as readonly string[]).includes(entry)) ||
+    statusShortfall(shortfalls);
+  return Object.freeze({
+    requestId,
+    cause,
+    markets: Object.freeze(markets),
+    opaque: marketsRead.kind === "OPAQUE" || idRead.kind === "OPAQUE" || causeRead.kind === "OPAQUE",
+    eventCause,
+    venueTradeId,
+    venueOrderIds: Object.freeze([...new Set(venueOrderIds)].sort()),
+    unordered,
+    unreadable: Object.freeze([...new Set(unreadable)].sort()),
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -232,12 +232,79 @@ export interface ReconciledWalletOperations {
 // ---------------------------------------------------------------------------
 // The user stream (WP-280's `UserStreamManager`, structurally).
 
-/** The fields of `UserStreamReconciliationRequest` the coordinator reads. */
+/**
+ * The fields of `UserStreamReconciliationRequest` the coordinator reads. (r14, WP290-V14-WP280-EVENT-IDS-DISCARDED) An
+ * event-level request (`EVENT_NOT_FULLY_APPLICABLE`, `EVENT_NOT_DELIVERED`) names "the identifiers the event named,
+ * exactly" (`manager.ts`): its trade, and every order the event named. WP-280 always carries the three fields (an empty
+ * list, `null`); they are optional here only so that a stand-in for a stream-level request may omit them. The stream
+ * door (`door.ts`, `readStreamRequest`) reads them on every request; one that an event-level request lacks is unreadable.
+ */
 export interface StreamReconciliationRequest {
   readonly requestId: string;
   readonly cause: string;
   readonly markets: readonly string[];
+  readonly shortfalls?: readonly string[];
+  readonly venueOrderIds?: readonly string[];
+  readonly venueTradeId?: string | null;
 }
+
+/**
+ * (r14) WP-280's CLOSED `ReconciliationCause` vocabulary (`manager.ts`, `RECONCILIATION_CAUSES`), mirrored (F12);
+ * `port-conformance.test.ts` pins the mirror equal to the original at compile and run time. A request whose cause is
+ * outside it may have been an event-level one: its identity fields are read, and required, as for one.
+ */
+export const STREAM_RECONCILIATION_CAUSES = [
+  "SOCKET_CLOSED",
+  "SERVER_ERROR",
+  "AUTH_REJECTED",
+  "TRANSPORT_ERROR",
+  "UNCLASSIFIED_CLOSE",
+  "HEARTBEAT_STALE",
+  "CONNECT_TIMEOUT",
+  "CONNECT_FAILED",
+  "SEND_FAILED",
+  "CONNECTION_SCOPE_FULL",
+  "SUBSCRIPTION_STARTED",
+  "RESUBSCRIBED",
+  "MARKETS_ADDED",
+  "UNRECOGNIZED_MESSAGE",
+  "EVENT_NOT_FULLY_APPLICABLE",
+  "EVENT_NOT_DELIVERED",
+  "STREAM_STOPPED",
+  "MANAGER_FAULT",
+  "BACKLOG_OVERFLOW",
+] as const;
+export type StreamReconciliationCause = (typeof STREAM_RECONCILIATION_CAUSES)[number];
+
+/** (r14) The event-level causes: such a request names the event's own identifiers (`manager.ts`, `eventScope`). */
+export const STREAM_EVENT_CAUSES: readonly StreamReconciliationCause[] = Object.freeze(["EVENT_NOT_FULLY_APPLICABLE", "EVENT_NOT_DELIVERED"]);
+
+/**
+ * (r14) WP-280's CLOSED `ProjectionShortfall` vocabulary (`oms-projection.ts`, `PROJECTION_SHORTFALLS`), mirrored (F12)
+ * and pinned equal. A projection with any shortfall did not carry the whole event (WP-280 raises one for every fact of
+ * the event it could not project), so the event's own identities are required.
+ */
+export const STREAM_PROJECTION_SHORTFALLS = [
+  "ORDER_STATUS_UNRECOGNIZED",
+  "ORDER_STATUS_ABSENT",
+  "ORDER_LIFECYCLE_UNRECOGNIZED",
+  "TRADE_STATUS_UNRECOGNIZED",
+  "TRADE_STATUS_C3",
+  "TRADER_SIDE_UNKNOWN",
+  "MAKER_LEG_OWNERSHIP_UNDETERMINED",
+  "NO_OWN_MAKER_LEG",
+  "OWN_MAKER_LEG_ON_TAKER_TRADE",
+  "DUPLICATE_OWN_MAKER_LEG",
+  "MATCH_TIME_ABSENT",
+  "TAKER_ECONOMICS_UNVERIFIABLE",
+  "TAKER_FEE_NOT_ON_STREAM",
+  "MAKER_FEE_NOT_ON_STREAM",
+  "FILL_SIZE_NOT_POSITIVE",
+] as const;
+export type StreamProjectionShortfall = (typeof STREAM_PROJECTION_SHORTFALLS)[number];
+
+/** (r14) The shortfalls that say the event's trade status is one no one can order (WP-280 then projects no settlement). */
+export const STREAM_STATUS_SHORTFALLS: readonly StreamProjectionShortfall[] = Object.freeze(["TRADE_STATUS_UNRECOGNIZED", "TRADE_STATUS_C3"]);
 
 export interface ReconciledUserStream {
   pendingReconciliationRequests(): readonly StreamReconciliationRequest[];

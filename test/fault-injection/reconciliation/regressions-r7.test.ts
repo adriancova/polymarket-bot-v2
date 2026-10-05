@@ -18,6 +18,7 @@ import type { OrderManager } from "../../../packages/oms/src/index.js";
 
 import { NO, PUSD, YES, boot, reopenOms, streamTrade } from "./support/harness.js";
 import { ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
+import { OUR_OWNER, wireTrade, wp280Emit } from "./support/wp280.js";
 
 type Row = Record<string, unknown>;
 
@@ -432,7 +433,23 @@ describe("WP-290 r7 (WP290-V7-STREAM-REFUSAL-DROPPED): every stream item the OMS
       const trade = r0.u.world.match(salt, "0.4");
       const settlement = { venueTradeId: trade?.venueTradeId, venueOrderId: trade?.venueOrderId, status: "CONFIRMED", transactionHash: trade?.transactionHash, observedAt: "2026-10-03T00:00:01Z" };
       expect((await r0.oms.applySettlement(settlement)).ok).toBe(false);
-      r0.p.coordinator.onUserStreamOutput({ kind: "TRADE", oms: { fills: [], settlements: [settlement], shortfalls: ["MAKER_FEE_NOT_ON_STREAM"] } });
+      // (r14) WP-280 always emits the output's `event` (its normalized event): here the venue's maker trade, our order the
+      // OWN maker leg. Its projection's shortfall makes the event required (WP290-V14-WP280-EVENT-IDS-DISCARDED).
+      const event = wp280Emit(
+        wireTrade({
+          id: trade?.venueTradeId ?? "?",
+          takerOrderId: "their-taker-order-1",
+          assetId: trade?.tokenId ?? "?",
+          side: trade?.side === "BUY" ? "SELL" : "BUY",
+          size: trade?.shares ?? "?",
+          price: trade?.price ?? "?",
+          status: "CONFIRMED",
+          traderSide: "MAKER",
+          transactionHash: trade?.transactionHash ?? null,
+          makers: [{ orderId: trade?.venueOrderId ?? "?", owner: OUR_OWNER, matchedAmount: trade?.shares ?? "?", price: trade?.price ?? "?", assetId: trade?.tokenId ?? "?", side: trade?.side ?? "BUY" }],
+        }),
+      ).output["event"];
+      r0.p.coordinator.onUserStreamOutput({ kind: "TRADE", event, oms: { fills: [], settlements: [settlement], shortfalls: ["MAKER_FEE_NOT_ON_STREAM"] } });
       await r0.p.coordinator.settled();
       const kept = r0.p.journal.evidence().filter((record) => record.source === "STREAM_SETTLEMENT").map((record) => record.venueTradeId);
       const triggered = r0.p.coordinator.status().pendingTriggers;

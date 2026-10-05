@@ -597,7 +597,7 @@ class Sim {
       const mutate = this.#mutationOf(door);
       if (door === "by-id") faults.readOrder = (id, answer) => mutate(base === undefined ? answer() : base.readOrder(id, answer), id);
       else {
-        const key = ({ "open-orders": "listOpenOrders", trades: "listTrades", positions: "readPositions", collateral: "readCollateral", approvals: "readApprovals" } as const)[door as Exclude<Door, "by-id" | "wallet-member" | "stream">];
+        const key = ({ "open-orders": "listOpenOrders", trades: "listTrades", positions: "readPositions", collateral: "readCollateral", approvals: "readApprovals" } as const)[door as Exclude<Door, "by-id" | "wallet-member" | "stream" | "stream-request">];
         const source = base?.[key];
         faults[key] = (answer) => mutate(source === undefined ? answer() : source(answer), null);
       }

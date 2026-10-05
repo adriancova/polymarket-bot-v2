@@ -198,7 +198,9 @@ export type EvidenceProvenance = (typeof EVIDENCE_PROVENANCES)[number];
  *   the trade's settlement status as read.
  * - `TRADE` (WP-290 r9): one trade row's trade identity (`venueTradeId`), whatever its legs, and its settlement
  *   `status` as read: a row that validated in full (its ownership determined or not, legless or not), or the readable
- *   id of a row that did not. It names no order (`venueOrderId` is `null`) and carries nothing else: no economics.
+ *   id of a row that did not; (WP-290 r14) or a trade the user stream NAMED (an event, or WP-280's event-level
+ *   request: source `STREAM_TRADE`, NAMED). It names no order (`venueOrderId` is `null`) and carries nothing else: no
+ *   economics.
  * - `UNKEYED_LEG` (WP-290 r10): one of the account's own legs, SHOWN in full on its venue order in a trade row whose
  *   trade id was unreadable (`venueTradeId` is `null`): `size` is its shares, with every fill fact, and `level` is how
  *   many such legs of exactly those facts its answer showed on the order (at least one). The coordinator holds the
@@ -482,12 +484,14 @@ const UNREADABLE_FIELD_NAMES: ReadonlySet<string> = new Set([
   "complete",
   "credited",
   "entry",
+  "event",
   "feeAmount",
   "feeAssetId",
   "fills",
   "found",
   "kind",
   "liquidityRole",
+  "makerOrders",
   "matchedAt",
   "observation",
   "oms",
@@ -502,6 +506,7 @@ const UNREADABLE_FIELD_NAMES: ReadonlySet<string> = new Set([
   "route",
   "settlements",
   "shares",
+  "shortfalls",
   "side",
   "size",
   "sizeMatched",
@@ -509,10 +514,13 @@ const UNREADABLE_FIELD_NAMES: ReadonlySet<string> = new Set([
   "spender",
   "state",
   "status",
+  "takerOrderId",
   "tokenId",
+  "traderSide",
   "trades",
   "transactionHash",
   "venueOrderId",
+  "venueOrderIds",
   "venueTradeId",
 ]);
 
@@ -541,14 +549,15 @@ const SOURCE_KIND: Readonly<Record<string, EvidenceKind>> = Object.freeze({
   STREAM_SETTLEMENT_ORPHAN: "ORPHAN_LEG",
   STREAM_SETTLEMENT_UNKEYED: "UNKEYED_LEG",
   STREAM_UNREADABLE: "UNKEYED_TRADE",
+  STREAM_TRADE: "TRADE",
   POSITIONS: "HOLDING",
   COLLATERAL: "HOLDING",
   APPROVALS: "HOLDING",
   WALLET_MEMBER: "MEMBER",
 });
 const NEW_KINDS: readonly EvidenceKind[] = ["ORPHAN_LEG", "UNKEYED_ORDER", "UNKEYED_TRADE", "HOLDING", "MEMBER"];
-/** (r9) The sources of a TRADE record. */
-const TRADE_SOURCES: readonly string[] = ["TRADES_ROW", "TRADES_ROW_PARTIAL", "TRADES_ROW_ID"];
+/** (r9) The sources of a TRADE record; (r14) a trade the user stream named (`STREAM_TRADE`, NAMED). */
+const TRADE_SOURCES: readonly string[] = ["TRADES_ROW", "TRADES_ROW_PARTIAL", "TRADES_ROW_ID", "STREAM_TRADE"];
 
 /**
  * Whether an evidence record's fields fit its kind (the coordinator's door, `evidence.ts`'s `readEvidenceRecord`,
@@ -590,7 +599,7 @@ function evidenceShape(r: {
   if (kind === "UNKEYED_LEG" && (r.level as number) < 1) return false;
   // (r9) A trade comes from a trade row (and only a trade does), SHOWN when the row validated in full.
   if ((kind === "TRADE") !== TRADE_SOURCES.includes(source)) return false;
-  if (kind === "TRADE" && r.provenance !== (source === "TRADES_ROW_ID" ? "NAMED" : "SHOWN")) return false;
+  if (kind === "TRADE" && r.provenance !== (source === "TRADES_ROW_ID" || source === "STREAM_TRADE" ? "NAMED" : "SHOWN")) return false;
   // Nothing of an order or a fill on a trade, an unkeyed trade, a holding, a member or a settlement.
   const economics = kind !== "TRADE" && kind !== "UNKEYED_TRADE" && kind !== "HOLDING" && kind !== "MEMBER" && kind !== "SETTLED";
   if (!economics && (r.tokenId !== null || r.side !== null || r.price !== null || r.originalSize !== null || r.size !== null)) return false;
