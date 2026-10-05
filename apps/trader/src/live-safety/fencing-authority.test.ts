@@ -136,6 +136,15 @@ describe("the local deadline (monotonic, from the instant before the call)", () 
     }
   });
 
+  it("renewals are serialized: a renewal asked while another is outstanding asks nothing (IN_PROGRESS)", async () => {
+    const { store, authority } = setup();
+    await authority.acquire();
+    const first = authority.renew();
+    expect(await authority.renew()).toBe("IN_PROGRESS");
+    expect(await first).toBe("RENEWED");
+    expect(store.calls.filter((call) => call === "renew")).toHaveLength(1);
+  });
+
   it("a monotonic reading that goes backwards loses the grant (CLOCK_FAULT)", async () => {
     const { clock, authority } = setup();
     await authority.acquire();

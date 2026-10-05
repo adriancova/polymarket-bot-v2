@@ -64,6 +64,24 @@
  *    starts another.
  *
  * No new §9.17 trigger is used, and "submission unknown" is not (D6).
+ *
+ * ## D6's coordinator, re-cited on `main` (ADR033-REVIEW follow_up 2; `WP-290` merged at `7a53988`)
+ *
+ * By symbol, in `packages/oms/src/reconciliation/coordinator.ts`:
+ * `ReconciliationCoordinator.trigger` (holds — `#hold`, which calls
+ * `OrderManager.pause` — and queues one pending entry per kind; starts no run),
+ * `ReconciliationCoordinator.reconcile` (claims the run synchronously, and
+ * returns `NOT_RUN` "a run is already in progress" while one is), `status()`
+ * (`running`, `pendingTriggers`), `#runOnce` (reads its start time, then
+ * `#retryCadence`, then `#takeTriggers`, then `#readAll`), `#workArrivedDuring`
+ * (a pending trigger makes the run rerun instead of resuming) and the hold
+ * epoch checked in `#finish` before `resume()`; the `omsRequester` that raises
+ * an OMS `ORDER_STATE` request as `POSITION_BALANCE_DISCREPANCY`. In
+ * `packages/oms/src/order-manager.ts`: `OrderManager.requestOrderReconciliation`
+ * (open states ACKNOWLEDGED, LIVE, DELAYED, PARTIALLY_FILLED, CANCEL_PENDING;
+ * reason code `MANUAL_REQUEST`; `OMS_ILLEGAL_TRANSITION` otherwise) and `resume`
+ * (`#resumeBlocker`: refused while any order is `RECONCILING`). The D6 tests run
+ * against both, unmocked (`test/fault-injection/live-safety/heartbeat-lapse-recovery.test.ts`).
  */
 
 import type { LiveSafetyAlerts, LiveSafetyJournal, MonotonicClock, SafetyCoordinator, SafetyOms, SafetyOrderView, SafetyTimers, HeartbeatView } from "./ports.js";

@@ -85,7 +85,8 @@ export type AcquireResult =
   | { readonly kind: "ALREADY_HELD" }
   | { readonly kind: "STORE_FAILED" };
 
-export type RenewResult = "RENEWED" | "LOST" | "UNKNOWN" | "NOT_HELD";
+/** `IN_PROGRESS`: another renewal of this grant is still outstanding (renewals are serialized); nothing was asked. */
+export type RenewResult = "RENEWED" | "LOST" | "UNKNOWN" | "NOT_HELD" | "IN_PROGRESS";
 
 /** A run mode that may never hold the live fence. A fixed message; the refused value is named only if it is a §11 mode. */
 export class LiveFencingRefusal extends Error {
@@ -216,7 +217,7 @@ export class FencingAuthority {
     if (grant === null || this.#lost !== null) return "NOT_HELD";
     // A deadline that has passed is lost now, whatever the database would say.
     if (!this.check().held && this.#lost !== null) return "NOT_HELD";
-    if (this.#renewing) return "UNKNOWN";
+    if (this.#renewing) return "IN_PROGRESS";
     this.#renewing = true;
     try {
       const before = this.#now();
