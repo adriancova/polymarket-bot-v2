@@ -65,7 +65,7 @@ import {
 import { accountingChecksProblem, type AccountingChecks } from "./folds.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
-import { InstanceRegistry, windowRegistrationKey, type InstanceRegistration } from "./instances.js";
+import { InstanceRegistry, type InstanceRegistration } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
 import { retentionBoundsProblem, type RetentionBounds } from "./order-lifecycle.js";
@@ -486,7 +486,7 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
             });
             if (!created.ok) return { ok: false, detail: `${created.refusal.code}: ${created.refusal.detail}` };
             registrations.push({
-              key: windowRegistrationKey(instance.instanceId, window.marketId),
+              window: true,
               instanceId: instance.instanceId,
               runId: instance.runId,
               configId: instance.configId,

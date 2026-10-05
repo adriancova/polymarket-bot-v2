@@ -78,8 +78,13 @@ export interface RegisteredInstance {
   /**
    * `ROLLOVER-1`: the registration key — `instanceId` for a market-bound
    * instance, `<instanceId>|<marketId>` for one window of a series-bound one.
+   * DERIVED by {@link InstanceRegistry.register} from `instanceId`, `marketId`
+   * and {@link RegisteredInstance.window}, never taken from its input — so a
+   * registration built by spreading another one cannot carry a stale key.
    */
   readonly key: string;
+  /** `ROLLOVER-1`: whether this is one WINDOW of a series-bound instance. */
+  readonly window: boolean;
   readonly instanceId: string;
   readonly runId: string;
   readonly configId: string;
@@ -105,8 +110,14 @@ export interface RegisteredInstance {
   readonly submissionUnknownAfterMs: number;
 }
 
-/** What {@link InstanceRegistry.register} takes: `key` defaults to `instanceId`. */
-export type InstanceRegistration = Omit<RegisteredInstance, "key"> & { readonly key?: string };
+/**
+ * What {@link InstanceRegistry.register} takes: everything but the key, which
+ * it derives. `window` absent or `false`: a market-bound instance, keyed by
+ * its `instanceId`, exactly as before.
+ */
+export type InstanceRegistration = Omit<RegisteredInstance, "key" | "window"> & {
+  readonly window?: boolean;
+};
 
 /** `ROLLOVER-1`: the registration key of one window of a series-bound instance. */
 export function windowRegistrationKey(instanceId: string, marketId: string): string {
@@ -167,7 +178,9 @@ export class InstanceRegistry {
   #ordered: readonly RegisteredInstance[] = Object.freeze([]);
 
   register(input: InstanceRegistration): RegisterResult {
-    const instance: RegisteredInstance = Object.freeze({ ...input, key: input.key ?? input.instanceId });
+    const window = input.window === true;
+    const key = window ? windowRegistrationKey(input.instanceId, input.marketId) : input.instanceId;
+    const instance: RegisteredInstance = Object.freeze({ ...input, key, window });
     if (this.#instances.has(instance.key) || this.#retired.has(instance.key)) {
       return {
         ok: false,
@@ -204,7 +217,7 @@ export class InstanceRegistry {
   retireMarket(marketId: string): number {
     let retired = 0;
     for (const [key, instance] of [...this.#instances]) {
-      if (instance.marketId !== marketId || key === instance.instanceId) continue;
+      if (instance.marketId !== marketId || !instance.window) continue;
       this.#instances.delete(key);
       this.#retired.set(key, Object.freeze({ key, instanceId: instance.instanceId, runId: instance.runId, marketId }));
       if (this.#owners.get(marketId) === instance.instanceId && instance.ownership === "OWNER") {
