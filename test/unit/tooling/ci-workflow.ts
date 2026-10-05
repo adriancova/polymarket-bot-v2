@@ -4,11 +4,12 @@
  *
  * WHY. `GATE1-R4` holds per STEP: a failing gate no longer hides the gates
  * after it. But `typecheck`, `test:contract` and `test:integration` are `&&`
- * chains in the root `package.json`. When one ran as a single step, the
- * chain's first failure hid the rest of that step. So `ci.yml` now runs every
- * chained command as its own gated step. The commands still live in the
- * PROTECTED `package.json`, so the two copies can drift apart. The drift check
- * here fails when they do.
+ * chains in the root `package.json`, and since `CI-5` so is `test:fault`
+ * (the WAL, OMS and reconciliation fault suites). When one ran as a single
+ * step, the chain's first failure hid the rest of that step. So `ci.yml` now
+ * runs every chained command as its own gated step. The commands still live
+ * in the PROTECTED `package.json`, so the two copies can drift apart. The
+ * drift check here fails when they do.
  *
  * THE READER. No YAML library is declared, and `package.json` and the lockfile
  * are protected, so this module reads the workflow itself. It accepts a
@@ -36,8 +37,8 @@
  *   `continue-on-error`);
  * - a gate that runs an `&&` chain as ONE step, other than through the split
  *   steps (`CI-2` r1, L5-1). Either its own `run` holds `&&`, or one of its
- *   commands runs a root script that is an `&&` chain other than the three
- *   split ones. A root script of a spelling below is followed to the script
+ *   commands runs a root script that is an `&&` chain other than the split
+ *   ones (`SPLIT_CHAINS`). A root script of a spelling below is followed to the script
  *   it runs;
  * - a gate that runs MORE THAN ONE command in one step (`DEPCHECK-1`,
  *   `CI2-L5-2`). GitHub runs a `run` block with `bash -e`, so its first failing
@@ -314,11 +315,16 @@ export const GATED_JOBS = [
   { job: "python", setup: "sync" },
 ] as const;
 
-/** The root scripts that are `&&` chains, and the label their split steps' names begin with. */
+/**
+ * The root scripts that are `&&` chains, and the label their split steps' names
+ * begin with. `CI-5` added `test:fault`, when the OMS (`WP-270`) and
+ * reconciliation (`WP-290`) suites joined the WAL suite in that script.
+ */
 export const SPLIT_CHAINS = [
   { script: "typecheck", label: "Typecheck" },
   { script: "test:contract", label: "Venue contract tests" },
   { script: "test:integration", label: "Integration tests" },
+  { script: "test:fault", label: "Fault-injection tests" },
 ] as const;
 
 /**
@@ -634,8 +640,13 @@ function rootPackageName(packageJsonText: string): string | undefined {
   return typeof name === "string" ? name : undefined;
 }
 
-/** Words that mark a step as running one of the chains, split or not. */
-const CHAIN_WORD = /\b(?:typecheck|tsc|test:contract|test:integration)\b/u;
+/**
+ * Words that mark a step as running one of the chains, split or not. Like
+ * `test:contract` in `test:contract:rtds`, `test:fault` also matches inside
+ * `test:fault:reconciliation`; a step that runs a chained command is exempt
+ * before this is consulted.
+ */
+const CHAIN_WORD = /\b(?:typecheck|tsc|test:contract|test:integration|test:fault)\b/u;
 
 /** The keys a gate step may have. Anything else is reported. */
 const GATE_KEYS = new Set(["name", "if", "run"]);

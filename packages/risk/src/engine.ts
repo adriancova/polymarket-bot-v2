@@ -83,6 +83,7 @@ import {
 import { contained, riskRefusal, type RiskRefusal } from "./result.js";
 import { assessScenarios, type ScenarioAssessment } from "./scenario.js";
 import { isExpired } from "./time.js";
+import { comparedScenarioLoss, notBelowBookedOnly } from "./unbooked.js";
 import { assessWorstCase, type WorstCaseAssessment } from "./worst-case.js";
 
 /**
@@ -787,7 +788,17 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   }
 
   // --- §9.8 check 16: worst-case contractual loss — PRIMARY ----------------
-  const lots = buildWorstCaseLots(data.portfolio, view);
+  //
+  // `CAP-1` (ruling 2026-10-04): the lot set counts the strategy's
+  // filled-but-unbooked BUYs EXACTLY as booked positions (`lots.ts`; the
+  // input's only reader, so they reach checks 16 and 17 and nothing else).
+  // `bookedOnlyLots` is the same lot set without them — what both checks
+  // measured before `CAP-1` — and no loss either check compares may go below
+  // its booked-only value (`unbooked.ts`). Nothing unbooked: ONE lot set.
+  const unbookedFills = data.unbookedFills ?? [];
+  const lots = buildWorstCaseLots(data.portfolio, view, unbookedFills);
+  const bookedOnlyLots =
+    unbookedFills.length === 0 ? lots : buildWorstCaseLots(data.portfolio, view);
   let worstCase: WorstCaseAssessment | undefined;
   if (lots === undefined) {
     appendData(
@@ -828,19 +839,24 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         );
       }
       if (policy.limits.maxWorstCaseResolutionLoss !== undefined) {
-        if (
-          compareDecimal(
-            worstCase.worstCaseResolutionLoss,
-            policy.limits.maxWorstCaseResolutionLoss,
-          ) > 0
-        ) {
+        // `CAP-1`: a held pair redeems `1` under every verified outcome, so an
+        // unbooked fill can LOWER this measure; the compared figure never goes
+        // below the booked-only one. (The primary measure above cannot fall:
+        // an unbooked entry only adds its debit to the committed cost.)
+        const resolutionLoss = notBelowBookedOnly(
+          worstCase.worstCaseResolutionLoss,
+          bookedOnlyLots === undefined || bookedOnlyLots === lots
+            ? worstCase.worstCaseResolutionLoss
+            : assessWorstCase(bookedOnlyLots).worstCaseResolutionLoss,
+        );
+        if (compareDecimal(resolutionLoss, policy.limits.maxWorstCaseResolutionLoss) > 0) {
           appendData(
             accumulator.refusals,
             riskRefusal(
               "RISK_WORST_CASE_RESOLUTION_LOSS_EXCEEDED",
               "projected worst-case resolution loss over the three VERIFIED terminal outcomes exceeds its limit",
               {
-                worstCaseResolutionLoss: worstCase.worstCaseResolutionLoss,
+                worstCaseResolutionLoss: resolutionLoss,
                 limit: policy.limits.maxWorstCaseResolutionLoss,
               },
             ),
@@ -878,15 +894,24 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
           ),
         );
       }
+      // `CAP-1`: an unbooked fill bought below a shocked mark would LOWER a
+      // scenario's loss; the compared worst never goes below the booked-only
+      // one (`unbooked.ts`).
+      const compared = comparedScenarioLoss(
+        scenario,
+        bookedOnlyLots === undefined || bookedOnlyLots === lots
+          ? scenario
+          : assessScenarios(data.scenarios, bookedOnlyLots, policy.scenario.requiredKinds),
+      );
       if (
-        scenario.worstLoss !== undefined &&
-        compareDecimal(scenario.worstLoss, policy.scenario.maxScenarioLoss) > 0
+        compared.worstLoss !== undefined &&
+        compareDecimal(compared.worstLoss, policy.scenario.maxScenarioLoss) > 0
       ) {
         appendData(
           accumulator.refusals,
           riskRefusal("RISK_SCENARIO_LOSS_EXCEEDED", "worst scenario loss exceeds its limit", {
-            worstLoss: scenario.worstLoss,
-            worstScenarioId: scenario.worstScenarioId,
+            worstLoss: compared.worstLoss,
+            worstScenarioId: compared.worstScenarioId,
             limit: policy.scenario.maxScenarioLoss,
           }),
         );

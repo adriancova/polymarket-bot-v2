@@ -1778,7 +1778,13 @@ describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a p
     // entries released.
     expect(loop.timeInForceFor(resting.plannedOrderId)).toBeUndefined();
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
-    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
+    // `CAP-1`: the allocator releases only the unused remainder (none: the
+    // order FILLED 5/5 at its 0.2 limit). Its fill was booked UNATTRIBUTED, so
+    // no position carries it, and its exact debit — 5 × 0.2 = 1 pUSD — stays
+    // in the cap check against the instance that reserved it (this read
+    // `open: 0, released: 10, reservedCollateral: "0"`: the capital gone).
+    expect(harness.venue.fills.map((fill) => `${fill.shares}@${fill.price}`)).toEqual(["5@0.2"]);
+    expect(health.seams.allocator).toMatchObject({ open: 1, applied: 10, released: 9, reservedCollateral: "1" });
     expect(health.execution.reservationsReleasedOnRefusal).toBe(9);
     // SIM-2: released, so no longer tracked — and (r1) the venue is told it
     // may forget the order now, and not before.
