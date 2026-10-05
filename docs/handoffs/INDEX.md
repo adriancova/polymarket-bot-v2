@@ -143,3 +143,7 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [CI-5.md](CI-5.md) | `CI-5`: the OMS and reconciliation fault suites and the control-api PostgreSQL suite in CI | Round | Complete (2026-10-05) | `31b668d` | 2 KB |
 | 2026-10-05 | [ROLLOVER-1.md](ROLLOVER-1.md) | `ROLLOVER-1`: ADR-030 series auto-admission and multi-window runs | Round | Complete (2026-10-05) | `ae11daa` | 5 KB |
 | 2026-10-05 | [WP-320.md](WP-320.md) | `WP-320`: heartbeat health lease, fencing, geoblock and kill controls | WP | Complete (2026-10-05) | `ed6e5a0` | 6 KB |
+| 2026-10-05 | [RTDS-RETIRE.md](RTDS-RETIRE.md) | `RTDS-RETIRE`: retire the RTDS reference-price producer (V3-C13) | Round | Complete (2026-10-05) | `81f683a` | 3 KB |
+| 2026-10-05 | [GOV-NOTES-3.md](GOV-NOTES-3.md) | `GOV-NOTES-3`: ROLLOVER-1's owed governance records | Round | Complete (2026-10-05) | `c10e76e` | 3 KB |
+| 2026-10-05 | [FLAKE-KS-1.md](FLAKE-KS-1.md) | `FLAKE-KS-1`: fix the kill-switch engage flake in CI step 7/7 | Round | Complete (2026-10-05) | `f66201e` | 2 KB |
+| 2026-10-05 | [AUDIT-SWEEP.md](AUDIT-SWEEP.md) | `AUDIT-SWEEP`: remove the latent audit-bound race from control-api tests | Round | Complete (2026-10-05) | `6044450` | 2 KB |

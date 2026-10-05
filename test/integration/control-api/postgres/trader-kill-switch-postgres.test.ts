@@ -42,6 +42,19 @@
  * release-finality port are the two small doubles below: the trader's shared
  * fakes module would pull the whole live-safety composition into this runner.
  *
+ * ## The append bound (`FLAKE-KS-1`)
+ *
+ * The control plane's bound applies to EVERY append, the engage that must
+ * succeed included. It used to be 25 ms, and on a loaded runner a real insert
+ * outlived it: CI run 37332689128 refused the engage in both tests of the I6
+ * block. The held release needs no short bound, because the holding sink
+ * parks its append until the test lands it, so it outlives any bound. The
+ * bound is therefore {@link AUDIT_APPEND_BOUND_MS}, against real appends that
+ * took under 80 ms in `FLAKE-KS-1`'s load runs. The cost is that the held
+ * release waits the bound out once. The I6 test pins that its refusal is the
+ * bound's: the held append is the control plane's one unsettled append until
+ * the sink answers it.
+ *
  * Docker is required (`vitest.config.ts` beside this file). Throwaway
  * credentials only; no venue, no signer, no real credential. PAPER only.
  */
@@ -85,6 +98,11 @@ class FakeReleaseFinality implements KillSwitchReleaseFinality {
 
 const ACCOUNT = "acct-1";
 const SETTLE_MS = 2_000;
+/**
+ * The control plane's bound on one audit append (module header, "The append bound"): far above a real append's
+ * latency under load, so only the HELD release outlives it.
+ */
+const AUDIT_APPEND_BOUND_MS = 2_000;
 const MARKET = "0190a3e0-0000-7000-8000-00000000000c";
 
 let container: Awaited<ReturnType<typeof startPostgresContainer>> | undefined;
@@ -161,7 +179,7 @@ function setup(): {
     runMode: "PAPER",
     maximumRunMode: "PAPER",
     repositoryMaximumRunMode: "PAPER",
-    auditAppendTimeoutMs: 25,
+    auditAppendTimeoutMs: AUDIT_APPEND_BOUND_MS,
     auditRecordSource: { now: () => new Date().toISOString(), nextAuditRecordId: () => uuidV7() },
   });
   const clock = new ManualClock();
@@ -187,20 +205,27 @@ async function voidLanded(recordId: string): Promise<boolean> {
 describe("r1 I6: a release the control plane refused and voided never releases the trader (real control plane, real sink, real PostgreSQL)", () => {
   it("a GLOBAL FULL_HALT: the late release row is enforced as the switch before its VOID lands, and for good after; the control plane agrees", async () => {
     const { control, holding, monitor, clock } = setup();
-    expect((await control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, ctx())).ok).toBe(true);
+    const engaged = await control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, ctx());
+    expect(engaged.ok, JSON.stringify(engaged)).toBe(true);
     expect(await monitor.refresh()).toBe(true);
     expect(monitor.snapshot()).toMatchObject({ known: true, effects: { stopsHeartbeat: true } });
 
-    // The release's append outlives the 25 ms bound: refused 503, not applied.
+    // The release's append is HELD, so it outlives the bound: refused 503, not applied.
     const releaseId = uuidV7();
     holding.hold((record) => record.recordId === releaseId || voidsOf(record) === releaseId);
+    expect(control.unsettledAuditAppends).toBe(0);
     const refused = await control.releaseKillSwitch({ scope: "GLOBAL", scopeRef: null, release: { authoritativeSnapshotApplied: true, reason: "reconciled" } }, ctx(releaseId));
     expect(refused.ok).toBe(false);
+    // FLAKE-KS-1: refused because the bound expired on the held append, the control plane's one unsettled append.
+    expect(refused).toMatchObject({ code: "CONTROL_NOT_AUDITABLE" });
+    expect(holding.held()).toBe(1);
+    expect(control.unsettledAuditAppends).toBe(1);
     expect(control.killSwitches().map((entry) => entry.action)).toEqual(["FULL_HALT"]);
 
     // The APPLIED release row lands late; its VOID is held: the window BEFORE the VOID.
     await holding.land();
     await waitFor(async () => holding.held() === 1);
+    expect(control.unsettledAuditAppends).toBe(0);
     const late = await database().pool.query<{ count: string }>(`select count(*)::text as count from ops.kill_switch_events where kill_switch_event_id = $1`, [releaseId]);
     expect(late.rows[0]?.count).toBe("1");
     for (const elapsed of [0, SETTLE_MS - 1]) {
@@ -244,13 +269,15 @@ describe("r1 I6: a release the control plane refused and voided never releases t
 
   it("the control: a release the control plane APPLIED releases the trader once seen for the settle window AND confirmed by the finality port, not before", async () => {
     const { control, monitor, clock, finality } = setup();
-    expect((await control.engageKillSwitch({ scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }, ctx())).ok).toBe(true);
+    const engaged = await control.engageKillSwitch({ scope: "MARKET", scopeRef: MARKET, action: "FULL_HALT" }, ctx());
+    expect(engaged.ok, JSON.stringify(engaged)).toBe(true);
     expect(await monitor.refresh()).toBe(true);
     expect(monitor.snapshot()).toMatchObject({ known: true });
     const snapshot = monitor.snapshot();
     expect(snapshot.known && snapshot.effects.submissionBlockedMarkets.has(MARKET)).toBe(true);
     const releaseId = uuidV7();
-    expect((await control.releaseKillSwitch({ scope: "MARKET", scopeRef: MARKET, release: { authoritativeSnapshotApplied: true, reason: "reconciled" } }, ctx(releaseId))).ok).toBe(true);
+    const applied = await control.releaseKillSwitch({ scope: "MARKET", scopeRef: MARKET, release: { authoritativeSnapshotApplied: true, reason: "reconciled" } }, ctx(releaseId));
+    expect(applied.ok, JSON.stringify(applied)).toBe(true);
     expect(await monitor.refresh()).toBe(true);
     const pending = monitor.snapshot();
     expect(pending.known && pending.effects.submissionBlockedMarkets.has(MARKET)).toBe(true);

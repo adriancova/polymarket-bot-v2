@@ -154,7 +154,6 @@ async function main(): Promise<void> {
       walFileSystem: nodeWalFileSystem(),
       polymarketSocketFactory: globalWebSocketFactory(),
       polymarketHttpClient: globalHttpClient(),
-      rtdsSocketFactory: globalWebSocketFactory(),
       binanceSocketFactory: createWebSocketFactory(),
       coinbaseSocketFactory: nodeWebSocketFactory,
       // `ROLLOVER-1` (ADR-030 Decision 2.1): series admission refuses to start

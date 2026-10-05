@@ -322,10 +322,11 @@ describe("DataGateway.stop() per-resource disposal isolation (round 4)", () => {
   it("still closes the journal and the transport when an earlier feed's socket close throws mid-stop", async () => {
     // The round-4 item-2 probe: an already-started feed whose socket `close()`
     // throws SYNCHRONOUSLY during `stop()`'s disposal sequence. Every one of
-    // the four feed teardowns ends in an unguarded `socket.close()`
-    // (`PublicMarketFeed`/`RtdsTwapFeed` via `#withSocket`, the Binance driver's
+    // the socket feed teardowns ends in an unguarded `socket.close()`
+    // (`PublicMarketFeed` via `#withSocket`, the Binance driver's
     // `this.#socket?.close()`, `CoinbaseConnectionManager.stop()`'s
-    // `socket?.close()`), so this ordering is reachable IN-REPO with nothing
+    // `socket?.close()`; `RtdsTwapFeed` was a fourth until `RTDS-RETIRE`
+    // removed the RTDS feed on 2026-10-05), so this ordering is reachable IN-REPO with nothing
     // contract-violating on the transport side. At `95c8aa9` the throw
     // abandoned every later disposal — `settle()`, `journal.close()`, and
     // `transport.close()` — leaving a connected transport referenced: the hang

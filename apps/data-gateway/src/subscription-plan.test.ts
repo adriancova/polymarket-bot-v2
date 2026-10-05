@@ -58,27 +58,6 @@ describe("planSubscriptions", () => {
     ]);
   });
 
-  it("carries RTDS subscriptions as configured and lowercases the planned-symbol filter", () => {
-    const config = parseGatewayConfig({
-      streamName: "market-events",
-      wal: { rootPath: "/wal" },
-      markets: [],
-      rtds: {
-        feedId: "polymarket-rtds-twap",
-        subscriptions: [{ windowSeconds: 30 }, { windowSeconds: 60, symbols: ["btc/usd"] }],
-        plannedSymbols: ["BTC/usd", "eth/usd"],
-      },
-    });
-    const plan = planSubscriptions(config);
-    expect(plan.rtdsSubscriptions).toEqual([
-      { windowSeconds: 30 },
-      { windowSeconds: 60, symbols: ["btc/usd"] },
-    ]);
-    expect(plan.rtdsPlannedSymbols.has("btc/usd")).toBe(true);
-    expect(plan.rtdsPlannedSymbols.has("eth/usd")).toBe(true);
-    expect(plan.rtdsPlannedSymbols.has("BTC/usd")).toBe(false);
-  });
-
   it("passes Coinbase product ids through opaquely (U-CB-4: no invented cap)", () => {
     const config = parseGatewayConfig({
       streamName: "market-events",

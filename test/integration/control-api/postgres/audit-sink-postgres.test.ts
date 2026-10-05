@@ -20,6 +20,28 @@
  *    mutation, refusal, mode-raise attempt and void record is appended to
  *    both, and each row read back equals the in-memory record field for field.
  *
+ * ## The append bound (`AUDIT-SWEEP`)
+ *
+ * The control plane races each mutation's and each refusal's audit append
+ * against one bound; only a VOID record's append is unbounded. An append that
+ * outlives the bound is treated as unwritten: its mutation is refused
+ * `CONTROL_NOT_AUDITABLE`, and a refusal's record is reported unaudited. In
+ * the second block, eight such appends MUST land in time, and each is a real
+ * PostgreSQL insert: the door refusal, two engages, the plane refusal, the
+ * escalation, the release, the unknown-instance refusal and the mode-raise
+ * record. The bound used to be 250 ms.
+ *
+ * - Under load, real inserts here took up to 51.5 ms (`AUDIT-SWEEP`).
+ *   `FLAKE-KS-1` saw 77.6 ms, and CI lost a 25 ms bound to one.
+ * - An insert held 400 ms behind a table lock failed the first engage.
+ *
+ * The one append that must NOT land in time, the late engage, needs no short
+ * bound. The test's own sink holds it until the test settles it, so it
+ * outlives any bound. The bound is therefore {@link AUDIT_APPEND_BOUND_MS},
+ * and the late engage waits it out once. The test pins that its refusal is
+ * the bound's: the held append is the control plane's one unsettled append
+ * until it is settled.
+ *
  * The characters under test are built from code points, so this file holds
  * none of them raw. Docker is required (`vitest.config.ts` beside this file).
  */
@@ -50,6 +72,12 @@ const HIGH = String.fromCharCode(0xd800);
 const LOW = String.fromCharCode(0xdc00);
 const REPLACEMENT = String.fromCodePoint(0xfffd);
 const HOSTILE = `a${NUL}b${HIGH}c${RLO}d${ESC}[2J${LOW}e`;
+
+/**
+ * The control plane's bound on one audit append (module header, "The append bound"): far above a real insert's
+ * latency under load, so only the HELD late engage outlives it.
+ */
+const AUDIT_APPEND_BOUND_MS = 2_000;
 
 let container: Awaited<ReturnType<typeof startPostgresContainer>> | undefined;
 let context: TestContext | undefined;
@@ -180,7 +208,7 @@ describe("CONTROL-1b 3c: through the REAL control plane every hostile record LAN
       runMode: "PAPER",
       maximumRunMode: "PAPER",
       repositoryMaximumRunMode: "PAPER",
-      auditAppendTimeoutMs: 250,
+      auditAppendTimeoutMs: AUDIT_APPEND_BOUND_MS,
       auditRecordSource: { now: () => new Date().toISOString(), nextAuditRecordId: () => uuidV7() },
     });
     const ctx = (reason = "a stated reason"): Parameters<ControlPlane["pauseStrategy"]>[1] => ({
@@ -192,7 +220,8 @@ describe("CONTROL-1b 3c: through the REAL control plane every hostile record LAN
 
     // A door refusal carrying the joint INFO's key, a lone surrogate, a
     // terminal escape and a megabyte of text in its issues.
-    await control.refuseRequest(
+    // AUDIT-SWEEP: its record must land in time; a refusal prints its detail.
+    const doorRefusal = await control.refuseRequest(
       "STRATEGY_PAUSE",
       { scope: "STRATEGY_INSTANCE", scopeRef: "sb-1" },
       "REQUEST_BODY",
@@ -203,26 +232,36 @@ describe("CONTROL-1b 3c: through the REAL control plane every hostile record LAN
       },
       ctx(HOSTILE),
     );
+    expect(doorRefusal).toEqual({ audited: true });
     // APPLIED engages whose scopeRef and reason hold the same bytes — one with a
     // 256-character scopeRef and a 1024-NUL reason, both legal at the API.
+    // AUDIT-SWEEP: each must-succeed step prints its refusal if it is refused.
     const market = { scope: "MARKET", scopeRef: `m${HOSTILE}` } as const;
-    expect((await control.engageKillSwitch({ ...market, action: "HALT_NEW_ENTRIES" }, ctx(HOSTILE))).ok).toBe(true);
+    const halting = await control.engageKillSwitch({ ...market, action: "HALT_NEW_ENTRIES" }, ctx(HOSTILE));
+    expect(halting.ok, JSON.stringify(halting)).toBe(true);
     const longRef = RLO.repeat(256);
-    expect((await control.engageKillSwitch({ scope: "MARKET", scopeRef: longRef, action: "FULL_HALT" }, ctx(NUL.repeat(1_024)))).ok).toBe(true);
+    const longHalt = await control.engageKillSwitch({ scope: "MARKET", scopeRef: longRef, action: "FULL_HALT" }, ctx(NUL.repeat(1_024)));
+    expect(longHalt.ok, JSON.stringify(longHalt)).toBe(true);
     // Refusals at the plane, an escalation and a release.
     expect((await control.engageKillSwitch({ ...market, action: "HALT_NEW_ENTRIES" }, ctx(HOSTILE))).ok).toBe(false);
-    expect((await control.engageKillSwitch({ ...market, action: "FULL_HALT" }, ctx(HOSTILE))).ok).toBe(true);
-    expect(
-      (await control.releaseKillSwitch({ ...market, release: { authoritativeSnapshotApplied: true, reason: HOSTILE } }, ctx(HOSTILE))).ok,
-    ).toBe(true);
+    const escalated = await control.engageKillSwitch({ ...market, action: "FULL_HALT" }, ctx(HOSTILE));
+    expect(escalated.ok, JSON.stringify(escalated)).toBe(true);
+    const released = await control.releaseKillSwitch({ ...market, release: { authoritativeSnapshotApplied: true, reason: HOSTILE } }, ctx(HOSTILE));
+    expect(released.ok, JSON.stringify(released)).toBe(true);
     expect((await control.pauseStrategy(`ghost${RLO}${HIGH}`, ctx(HOSTILE))).ok).toBe(false);
     // A mode-raise attempt naming forty keys, behind a hostile reason.
     const keys = Array.from({ length: 40 }, (_, index) => `runMode${String(index)}`);
     expect(await control.refuseModeRaise(keys, ctx(`request to POST /${HOSTILE.repeat(400)}`))).toEqual({ audited: true });
     // An APPLIED record that lands after its bound, and the void beside it.
+    // AUDIT-SWEEP: the append is HELD, so only the bound answers it. The
+    // refusal is the bound's: the held append is the one unsettled append.
     stalling = true;
+    expect(control.unsettledAuditAppends).toBe(0);
     const late = await control.engageKillSwitch({ scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" }, ctx(HOSTILE));
     expect(late).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+    expect(!late.ok && late.detail).toContain(`did not answer within the ${String(AUDIT_APPEND_BOUND_MS)} ms append bound`);
+    expect(held).toHaveLength(1);
+    expect(control.unsettledAuditAppends).toBe(1);
     for (const settle of held.splice(0)) settle();
     await vi.waitFor(
       () => {
@@ -230,6 +269,7 @@ describe("CONTROL-1b 3c: through the REAL control plane every hostile record LAN
       },
       { timeout: 10_000 },
     );
+    expect(control.unsettledAuditAppends).toBe(0);
     expect(control.killSwitches().map((entry) => entry.scopeRef)).toEqual([longRef]);
 
     // NOTHING was refused by PostgreSQL, and nothing went unaudited but the

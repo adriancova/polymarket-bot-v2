@@ -10,6 +10,9 @@ import {
   lifecycleRequestsPer10s,
   MIN_LIFECYCLE_POLL_INTERVAL_MS,
   parseGatewayConfig,
+  RTDS_RETIRED_ON,
+  RTDS_RETIRED_REASON,
+  RTDS_RETIRED_RULING,
 } from "./config.js";
 import { GatewayConfigurationError } from "./errors.js";
 
@@ -110,17 +113,77 @@ describe("parseGatewayConfig", () => {
     ).toThrow(GatewayConfigurationError);
   });
 
-  it("requires at least one planned RTDS symbol when RTDS is configured", () => {
-    expect(() =>
-      parseGatewayConfig({
-        ...BASE,
-        rtds: {
-          feedId: "polymarket-rtds-twap",
-          subscriptions: [{ windowSeconds: 60 }],
-          plannedSymbols: [],
-        },
-      }),
-    ).toThrow(GatewayConfigurationError);
+  // RTDS-RETIRE (2026-10-05, ruling V3-C13): the RTDS producer is retired, so
+  // an `rtds` block is refused at startup with a DATED reason that names the
+  // ruling and the venue change — never accepted, never a bare "unknown key".
+  describe("the retired RTDS feed (RTDS-RETIRE, V3-C13)", () => {
+    // The block a configuration written before the retirement carried.
+    const FORMER_RTDS_BLOCK = {
+      feedId: "polymarket-rtds-twap",
+      subscriptions: [{ windowSeconds: 60 }],
+      plannedSymbols: ["btc/usd"],
+    };
+
+    function refusalOf(value: unknown): GatewayConfigurationError {
+      let thrown: unknown;
+      try {
+        parseGatewayConfig(value);
+      } catch (error: unknown) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(GatewayConfigurationError);
+      return thrown as GatewayConfigurationError;
+    }
+
+    it("refuses a formerly valid rtds block with the dated V3-C13 reason", () => {
+      const refusal = refusalOf({ ...BASE, rtds: FORMER_RTDS_BLOCK });
+      expect(refusal.code).toBe("GATEWAY_CONFIGURATION");
+      expect(refusal.message).toBe(RTDS_RETIRED_REASON);
+      expect(refusal.details).toStrictEqual({
+        issues: [{ path: "rtds", message: RTDS_RETIRED_REASON }],
+        retiredOn: "2026-10-05",
+        ruling: "V3-C13",
+      });
+    });
+
+    it("says when, under which ruling, what the venue changed, and where that is recorded", () => {
+      expect(RTDS_RETIRED_ON).toBe("2026-10-05");
+      expect(RTDS_RETIRED_RULING).toBe("V3-C13");
+      for (const fragment of [
+        "RTDS-RETIRE, 2026-10-05",
+        "ruling V3-C13 of 2026-10-04",
+        "authenticated PolyBolt",
+        "CLOB API credentials",
+        "30-second window has no PolyBolt replacement",
+        "one month after its 0.11.0 SDK release, about 2026-10-23 by the venue report's arithmetic",
+        "docs/venue/verified-2026-09-30.md E-09 to E-12",
+        "no credential is used for prices",
+        "Remove the rtds block",
+      ]) {
+        expect(RTDS_RETIRED_REASON).toContain(fragment);
+      }
+    });
+
+    it("refuses ANY own rtds key, whatever its value: a retired producer has no 'disabled' spelling", () => {
+      for (const value of [{}, null, false, true, [], "off", 0, { enabled: false }]) {
+        expect(refusalOf({ ...BASE, rtds: value }).message, JSON.stringify(value)).toBe(RTDS_RETIRED_REASON);
+      }
+    });
+
+    it("refuses it before the schema: an rtds-only configuration gets the dated reason, not 'no feed'", () => {
+      const rtdsOnly = { streamName: "market-events", wal: { rootPath: "/wal" }, markets: [], rtds: FORMER_RTDS_BLOCK };
+      expect(refusalOf(rtdsOnly).message).toBe(RTDS_RETIRED_REASON);
+      // …and the dated reason wins over an unrelated defect elsewhere in the file.
+      expect(refusalOf({ ...BASE, streamName: "not a code string!", rtds: FORMER_RTDS_BLOCK }).message).toBe(
+        RTDS_RETIRED_REASON,
+      );
+    });
+
+    it("leaves a configuration without an rtds key exactly as it was", () => {
+      const config = parseGatewayConfig(BASE);
+      expect(Object.hasOwn(config, "rtds")).toBe(false);
+      expect(config.binance?.feedId).toBe("binance-reference");
+    });
   });
 
   // ROUND-1 REVIEW M2: this pair was accepted, and it FALSIFIES the WAL's
@@ -456,5 +519,17 @@ describe("the shipped example configuration (infra/compose/data-gateway)", () =>
     );
     const config = parseGatewayConfig(JSON.parse(await readFile(path, "utf8")) as unknown);
     expect(config.wal.maxTotalBytes).toBe(100_000_000_000);
+  });
+
+  // RTDS-RETIRE (2026-10-05, V3-C13): the example enables no RTDS feed. The
+  // door would refuse one anyway, so the first test above would fail; this
+  // pins the file itself, so a reader of the example never meets the block.
+  it("carries no rtds key (RTDS-RETIRE)", async () => {
+    const path = new URL(
+      "../../../infra/compose/data-gateway/gateway.config.example.json",
+      import.meta.url,
+    );
+    const example = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    expect(Object.hasOwn(example, "rtds")).toBe(false);
   });
 });
