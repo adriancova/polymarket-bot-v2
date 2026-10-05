@@ -52,7 +52,7 @@
  * stated as values below. No network, no credential, no signer, no real order.
  */
 
-import { addDecimal } from "@polymarket-bot/decimal";
+import { addDecimal, compareDecimal, mulDecimal } from "@polymarket-bot/decimal";
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import {
   SimulatedVenue,
@@ -109,6 +109,11 @@ import type { RetentionBounds } from "./order-lifecycle.js";
 import type { IngestedEvent } from "./ports.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
 import { createPaperTrader, type PaperTrader } from "./trader.js";
+
+/** `CAP-1`: the exact capital `fills` spent — Σ `price × shares` — as the cap check counts it. */
+function debitOf(fills: readonly Pick<SimulatedFill, "price" | "shares">[]): string {
+  return fills.reduce((total, fill) => addDecimal(total, mulDecimal(fill.price, fill.shares)), "0");
+}
 
 const MARKET_ID = "018f5c20-1000-7a10-8b00-000000000001";
 const CONDITION_ID = "0xwp250condition";
@@ -1214,7 +1219,18 @@ describe("an ownerless fill is never skipped — UNATTRIBUTED, halted, counted (
     // held (FILLED) slice's entries came back at the terminal harvest.
     expect(health.execution.reservationsReleasedOnRefusal).toBe(1);
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 2, released: 2, reservedCollateral: "0" });
-    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 2, released: 2, reservedCollateral: "0" });
+    // `CAP-1`: except the CAPITAL its fills spent. They were booked
+    // UNATTRIBUTED, so no position carries them, and the allocator keeps
+    // exactly their debit — at each fill's own price — against the instance
+    // that reserved it, instead of letting it vanish from every cap check
+    // (this read `open: 0, released: 2, reservedCollateral: "0"`).
+    expect(health.seams.allocator).toMatchObject({
+      open: 1,
+      applied: 2,
+      released: 1,
+      reservedCollateral: debitOf(parts.venue.inner.fills),
+    });
+    expect(compareDecimal(debitOf(parts.venue.inner.fills), "0")).toBe(1);
     expect(loop.timeInForceFor(held.plannedOrderId)).toBeUndefined();
     // The account side follows the venue: the ledger holds the shares, all of
     // them UNATTRIBUTED; no instance holds any.
@@ -1773,7 +1789,15 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
     // The harvest saw it FILLED: all three entries released, the entry forgotten.
     expect(loop.retainedOrderState().heldUnowned).toBe(0);
     expect(health.seams.reservations).toMatchObject({ open: 0, released: 1 });
-    expect(health.seams.allocator).toMatchObject({ open: 0, released: 1 });
+    // `CAP-1`: the allocator released only the unused remainder; its fills
+    // were booked UNATTRIBUTED, so their exact debit stays in the cap check
+    // (this read `open: 0, released: 1`: the capital gone).
+    expect(health.seams.allocator).toMatchObject({
+      open: 1,
+      released: 0,
+      reservedCollateral: debitOf(parts.venue.inner.fills),
+    });
+    expect(compareDecimal(debitOf(parts.venue.inner.fills), "0")).toBe(1);
     expect(loop.timeInForceFor(entry.plannedOrderId)).toBeUndefined();
     // Its fills are posted UNATTRIBUTED and halt the market (TRDR-4), unchanged.
     expect(health.seams.orders.unownedFills).toBe(parts.venue.inner.fills.length);

@@ -20,6 +20,7 @@ import {
   intentLegs,
   requestFor,
   type AllocationMarket,
+  type OrderViewOf,
 } from "./allocation.js";
 import type { MarketConfig } from "./config.js";
 import { MarketState } from "./market-state.js";
@@ -37,6 +38,9 @@ const SCOPE: AllocationMarket = {
 };
 
 const EMPTY_PROJECTION = projectionOf(Ledger.empty("PAPER"));
+
+/** `CAP-1` r1: a venue that shows no order (every commitment is judged as before). */
+const NO_VIEW: OrderViewOf = () => undefined;
 
 function gate(caps: Record<string, unknown> = {}): AllocatorGate {
   const parsed = parseAllocatorCaps({
@@ -96,6 +100,7 @@ function evaluate(
     readonly cash?: string;
     readonly accountingMode?: "LIVE" | "SHADOW";
     readonly held?: string;
+    readonly viewOf?: OrderViewOf;
   } = {},
 ): ReturnType<AllocatorGate["evaluate"]> {
   return subject.evaluate({
@@ -107,6 +112,7 @@ function evaluate(
     availableCollateral: overrides.cash ?? "1000",
     approvedIntentId: "018f4a7e-7000-7abc-8def-000000000001",
     heldShares: () => overrides.held ?? "0",
+    viewOf: overrides.viewOf ?? NO_VIEW,
   });
 }
 
@@ -261,6 +267,7 @@ describe("the allocator gate", () => {
       liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
       projection: EMPTY_PROJECTION,
       availableCollateral: "20",
+      viewOf: NO_VIEW,
     });
     expect(applied.ok).toBe(true);
     expect(subject.metrics().open).toBe(1);
@@ -305,6 +312,7 @@ describe("the allocator gate", () => {
       liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
       projection: EMPTY_PROJECTION,
       availableCollateral: "20",
+      viewOf: NO_VIEW,
     });
     expect(applied.ok).toBe(false);
     expect(subject.metrics().open).toBe(0);
@@ -338,6 +346,409 @@ describe("the allocator gate", () => {
     expect(outcome.verdict?.refusals.map((refusal) => refusal.code)).toContain(
       "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
     );
+  });
+});
+
+/**
+ * `CAP-1` (`CAP-OVERSHOOT`): one planned order's commitment is CONVERTED as
+ * its fills are booked, SETTLED to exactly its unused remainder once its final
+ * size is confirmed, and CLOSED only when every share of that size is booked.
+ * `loop-capital.test.ts` drives the same through the real core loop; these
+ * pin each transition's exact numbers at the gate.
+ */
+describe("CAP-1: a commitment is converted, never released, as its fills are seen", () => {
+  const PLANNED = "planned-cap1";
+
+  /** A gate holding one applied BUY of 50 at a 0.35 limit: 17.5 pUSD. */
+  function holding(caps: Record<string, unknown> = {}): AllocatorGate {
+    const subject = gate(caps);
+    const request = requestFor({
+      reservationId: "018f4a7e-7000-7abc-8def-0000000000c1",
+      instanceId: INSTANCE,
+      accountingMode: "LIVE",
+      leg: { marketId: MARKET, side: "YES", action: "BUY", price: "0.35", shares: "50" },
+      market: SCOPE,
+    });
+    const applied = subject.applyForPlan({
+      entries: [{ plannedOrderId: PLANNED, request }],
+      liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+      projection: EMPTY_PROJECTION,
+      availableCollateral: "1000",
+      viewOf: NO_VIEW,
+    });
+    if (!applied.ok) throw new Error("the fixture reservation was refused");
+    return subject;
+  }
+
+  function fill(
+    id: string,
+    shares: string,
+    price: string,
+  ): { simulatedFillId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string } {
+    return { simulatedFillId: id, marketId: MARKET, side: "YES", action: "BUY", price, shares };
+  }
+
+  /** What the cap check counts for the instance — the commitment alone (the projection is empty). */
+  function countedFor(subject: AllocatorGate): string {
+    return (
+      evaluate(subject, { type: "CANCEL", marketId: MARKET, reason: "read" } as unknown as Intent).exposures
+        .byStrategyInstance[INSTANCE]?.combined ?? "missing"
+    );
+  }
+
+  it("a BOOKED fill converts its shares: the commitment holds the reservation less the fill's debit, its better price still reserved", () => {
+    const subject = holding();
+    expect(countedFor(subject)).toBe("17.5");
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    // 30 × 0.35 still reserved + 20 × (0.35 − 0.34) unused: 17.5 − 6.8.
+    expect(subject.metrics()).toMatchObject({ open: 1, released: 0, reservedCollateral: "10.7" });
+    expect(countedFor(subject)).toBe("10.7");
+    // The position carries the debit: the cost basis the cap check counts.
+    expect(subject.costBasisOf(INSTANCE, MARKET, "YES")).toBe("6.8");
+  });
+
+  it("SETTLE releases EXACTLY the unused remainder and keeps an unbooked fill at its own price until it is booked; then the commitment CLOSES", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    // Final size 30: 20 booked, 10 filled at 0.33 and not booked yet.
+    expect(subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-2", "10", "0.33")] })).toBe(false);
+    // Released: 17.5 − 6.8 − 3.3 = 7.4. Kept: the unbooked fill's 3.3.
+    expect(subject.metrics()).toMatchObject({ open: 1, released: 0, reservedCollateral: "3.3" });
+    expect(countedFor(subject)).toBe("3.3");
+    subject.observeFill(INSTANCE, fill("f-2", "10", "0.33"), PLANNED);
+    expect(subject.metrics()).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+    expect(subject.costBasisOf(INSTANCE, MARKET, "YES")).toBe("10.1");
+  });
+
+  it("a share of the final size whose fill was not seen is held at the order's LIMIT — never less than its debit", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: undefined });
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "3.5" });
+    // A later settle that SEES it replaces the limit with the fill's own price.
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-2", "10", "0.33")] });
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "3.3" });
+  });
+
+  it("a final size fully booked CLOSES at once; a second settle releases nothing more", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "50", "0.34"), PLANNED);
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "0.5" });
+    expect(subject.settle(PLANNED, { filledShares: "50", unbookedFills: [] })).toBe(true);
+    expect(subject.metrics()).toMatchObject({ open: 0, applied: 1, released: 1, reservedCollateral: "0" });
+    expect(subject.settle(PLANNED, { filledShares: "50", unbookedFills: [] })).toBe(false);
+    expect(subject.metrics().released).toBe(1);
+  });
+
+  it("a cancel with nothing filled closes the whole commitment (final size 0)", () => {
+    const subject = holding();
+    expect(subject.settle(PLANNED, { filledShares: "0", unbookedFills: [] })).toBe(true);
+    expect(subject.metrics()).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+  });
+
+  it("RELEASE (a planned order the venue never booked) closes it whole", () => {
+    const subject = holding();
+    expect(subject.release(PLANNED)).toBe(true);
+    expect(subject.release(PLANNED)).toBe(false);
+    expect(subject.metrics()).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+  });
+
+  it("a fill booked UNATTRIBUTED keeps its debit in the commitment for good: no position will carry it", () => {
+    const subject = holding();
+    subject.observeUnattributedFill(fill("f-u", "20", "0.34"), PLANNED);
+    // Before the final size: still the whole reservation.
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "17.5" });
+    expect(subject.settle(PLANNED, { filledShares: "20", unbookedFills: [fill("f-u", "20", "0.34")] })).toBe(false);
+    expect(subject.metrics()).toMatchObject({ open: 1, released: 0, reservedCollateral: "6.8" });
+    expect(subject.costBasisOf(INSTANCE, MARKET, "YES")).toBe("0");
+  });
+
+  it("a fill that is not this commitment's — another market, side, direction or instance — converts nothing", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, { ...fill("f-x", "20", "0.34"), side: "NO" }, PLANNED);
+    subject.observeFill(INSTANCE, { ...fill("f-y", "20", "0.34"), action: "SELL" }, PLANNED);
+    subject.observeFill(OTHER, fill("f-z", "20", "0.34"), PLANNED);
+    subject.observeFill(INSTANCE, fill("f-w", "20", "0.34"), "planned-unknown");
+    subject.observeFill(INSTANCE, fill("f-v", "20", "0.34"));
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "17.5" });
+  });
+
+  it("a fill is converted ONCE: observing it again converts nothing more", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "10.7" });
+  });
+
+  it("a fill the commitment already converted, offered again as UNBOOKED at settle (a carried harvest booked it ahead of the cursor), is not counted twice", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-ahead", "20", "0.34"), PLANNED);
+    // The venue's page past the cursor still lists the booked-ahead fill.
+    expect(
+      subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-ahead", "20", "0.34"), fill("f-2", "10", "0.33")] }),
+    ).toBe(false);
+    // Only the truly unbooked fill is kept: 3.3, not 3.3 + 6.8.
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "3.3" });
+  });
+
+  it("a final size that is not an exact decimal settles nothing: the whole reservation stays", () => {
+    const subject = holding();
+    expect(subject.settle(PLANNED, { filledShares: "1e1", unbookedFills: [] })).toBe(false);
+    expect(subject.metrics()).toMatchObject({ open: 1, reservedCollateral: "17.5" });
+  });
+});
+
+/**
+ * `CAP-1` r0 (the ruling on §9.8 checks 16 and 17): the SEPARATE risk input,
+ * `unbookedExposure`, is derived from the same commitments the cap check
+ * counts, so the two never disagree about which fill is unbooked or what it
+ * cost. `loop-capital.test.ts` drives it through the real core loop.
+ *
+ * `CAP-1` r1: the commitment knows the fills the loop has SEEN
+ * (`observeVenueFill`), and the input is asked with the venue's view
+ * (`viewOf`) and the open orders' presentation at their UNFILLED remainder
+ * (`presentedOpen`: planned id -> the filled shares it leaves out).
+ */
+describe("CAP-1 r0: the filled-but-unbooked risk input comes from the cap check's own commitments", () => {
+  const PLANNED = "planned-cap1-r0";
+  const NOTHING_PRESENTED: ReadonlyMap<string, string> = new Map();
+
+  /** A projection in which the instance holds 50 YES (the inventory a covered SELL reserves). */
+  const HOLDING_50_YES = {
+    ...EMPTY_PROJECTION,
+    virtualPositions: new Map([
+      ["v-1", { instanceId: INSTANCE, assetId: "token:111", assetKind: "OUTCOME_TOKEN", marketId: MARKET, balance: "50" }],
+    ]),
+  } as unknown as typeof EMPTY_PROJECTION;
+
+  /** A gate holding one applied BUY (default: 50 YES at a 0.35 limit) — or SELL, against 50 YES held. */
+  function holding(leg: Partial<{ side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }> = {}): AllocatorGate {
+    const subject = gate();
+    const request = requestFor({
+      reservationId: "018f4a7e-7000-7abc-8def-0000000000d1",
+      instanceId: INSTANCE,
+      accountingMode: "LIVE",
+      leg: { marketId: MARKET, side: "YES", action: "BUY", price: "0.35", shares: "50", ...leg },
+      market: SCOPE,
+    });
+    const applied = subject.applyForPlan({
+      entries: [{ plannedOrderId: PLANNED, request }],
+      liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+      projection: leg.action === "SELL" ? HOLDING_50_YES : EMPTY_PROJECTION,
+      availableCollateral: "1000",
+      viewOf: NO_VIEW,
+    });
+    if (!applied.ok) throw new Error(`the fixture reservation was refused: ${applied.refusals.map((refusal) => refusal.code).join(", ")}`);
+    return subject;
+  }
+
+  function fill(id: string, shares: string, price: string, side: "YES" | "NO" = "YES"): { simulatedFillId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string } {
+    return { simulatedFillId: id, marketId: MARKET, side, action: "BUY", price, shares };
+  }
+
+  function unbooked(
+    subject: AllocatorGate,
+    options: { presented?: ReadonlyMap<string, string>; view?: OrderViewOf; instanceId?: string; marketId?: string } = {},
+  ): readonly unknown[] {
+    return subject.unbookedExposure({
+      instanceId: options.instanceId ?? INSTANCE,
+      marketId: options.marketId ?? MARKET,
+      presentedOpen: options.presented ?? NOTHING_PRESENTED,
+      viewOf: options.view ?? NO_VIEW,
+    });
+  }
+
+  it("SETTLED: exactly the fills the allocator keeps — the same shares and the same debit the cap check counts — until they are booked", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: [fill("f-2", "10", "0.33")] });
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.3" }]);
+    // The cap check holds exactly that debit for it.
+    expect(subject.metrics().reservedCollateral).toBe("3.3");
+    // Booked: the position carries it now, and the risk input states nothing.
+    subject.observeFill(INSTANCE, fill("f-2", "10", "0.33"), PLANNED);
+    expect(unbooked(subject)).toEqual([]);
+  });
+
+  it("SETTLED with a share whose fill was not seen: that share at the LIMIT, as the allocator keeps it", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "30", unbookedFills: undefined });
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.5" }]);
+    expect(subject.metrics().reservedCollateral).toBe("3.5");
+  });
+
+  it("r1 (CAP1-ASTRA-R1-02): an order PRESENTED as open at its unfilled remainder states here its FILLED shares no position carries yet — never its booked ones (the position's) and never its unfilled ones (the open order's)", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    // Presented at 50 − 20: every filled share is booked, so nothing here.
+    expect(unbooked(subject, { presented: new Map([[PLANNED, "20"]]) })).toEqual([]);
+    // Presented at 50 − 30: 10 filled and not booked, no answer seen: at the limit.
+    expect(unbooked(subject, { presented: new Map([[PLANNED, "30"]]) })).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.5" }]);
+    // Seen in a venue answer: at its own price.
+    subject.observeVenueFill(fill("f-2", "10", "0.33"), PLANNED);
+    expect(unbooked(subject, { presented: new Map([[PLANNED, "30"]]) })).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.3" }]);
+    // The presented order is not looked up.
+    expect(unbooked(subject, { presented: new Map([[PLANNED, "30"]]), view: () => { throw new Error("a presented order is not looked up"); } })).toHaveLength(1);
+  });
+
+  it("r1 (CAP1-ASTRA-R1-03): NOT settled, its order TERMINAL in the view: only its FILLED unbooked shares — at the price a venue answer carried, at the limit only when none did — and the read moves nothing", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    const before = subject.metrics();
+    const terminal30: OrderViewOf = () => ({ terminal: true, filledShares: "30" });
+    // A terminal order with nothing filled beyond its booked shares: nothing.
+    expect(unbooked(subject, { view: () => ({ terminal: true, filledShares: "20" }) })).toEqual([]);
+    expect(unbooked(holding(), { view: () => ({ terminal: true, filledShares: "0" }) })).toEqual([]);
+    expect(unbooked(subject, { view: terminal30 })).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.5" }]);
+    subject.observeVenueFill(fill("f-2", "10", "0.33"), PLANNED);
+    expect(unbooked(subject, { view: terminal30 })).toEqual([{ marketId: MARKET, side: "YES", shares: "10", debit: "3.3" }]);
+    // The commitment itself is untouched: seeing a fill and reading a view settle nothing.
+    expect(subject.metrics()).toEqual(before);
+  });
+
+  it("NOT settled and NOT presented: WORKING in the view (an order no instance owns), its unbooked fills plus its unfilled shares at the limit; the venue showing NO order, its whole unconverted reservation at the limit", () => {
+    const subject = holding();
+    subject.observeFill(INSTANCE, fill("f-1", "20", "0.34"), PLANNED);
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "30", debit: "10.5" }]);
+    expect(unbooked(subject, { view: () => ({ terminal: false, filledShares: "30" }) })).toEqual([
+      { marketId: MARKET, side: "YES", shares: "30", debit: "10.5" },
+    ]);
+    subject.observeVenueFill(fill("f-2", "10", "0.33"), PLANNED);
+    // 10 seen at 0.33 + 20 unfilled at 0.35.
+    expect(unbooked(subject, { view: () => ({ terminal: false, filledShares: "30" }) })).toEqual([
+      { marketId: MARKET, side: "YES", shares: "30", debit: "10.3" },
+    ]);
+    // A size that is not an exact decimal: the whole unconverted reservation.
+    expect(unbooked(subject, { view: () => ({ terminal: true, filledShares: "3e1" }) })).toEqual([
+      { marketId: MARKET, side: "YES", shares: "30", debit: "10.5" },
+    ]);
+  });
+
+  it("a fill booked UNATTRIBUTED is kept at its own price, as the allocator keeps it", () => {
+    const subject = holding();
+    subject.observeUnattributedFill(fill("f-u", "20", "0.34"), PLANNED);
+    subject.settle(PLANNED, { filledShares: "20", unbookedFills: [fill("f-u", "20", "0.34")] });
+    expect(unbooked(subject)).toEqual([{ marketId: MARKET, side: "YES", shares: "20", debit: "6.8" }]);
+    expect(subject.metrics().reservedCollateral).toBe("6.8");
+  });
+
+  it("per strategy, per market, per token: another instance or market sees nothing; a NO commitment is stated on NO; a SELL states nothing (see the open item on unbooked SELLs)", () => {
+    const subject = holding();
+    expect(unbooked(subject, { instanceId: OTHER })).toEqual([]);
+    expect(unbooked(subject, { marketId: "018f4a7e-1111-7abc-8def-0123456789ac" })).toEqual([]);
+    const no = holding({ side: "NO", price: "0.6", shares: "10" });
+    no.settle(PLANNED, { filledShares: "10", unbookedFills: [fill("f-n", "10", "0.58", "NO")] });
+    expect(unbooked(no)).toEqual([{ marketId: MARKET, side: "NO", shares: "10", debit: "5.8" }]);
+    const sell = holding({ action: "SELL", price: "0.32", shares: "50" });
+    expect(sell.metrics()).toMatchObject({ open: 1 });
+    expect(unbooked(sell)).toEqual([]);
+    expect(unbooked(sell, { view: () => ({ terminal: true, filledShares: "50" }) })).toEqual([]);
+  });
+});
+
+/**
+ * `CAP-1` r1 (`CAP1-ASTRA-R1-01`): the cap check judges a commitment whose
+ * order the venue shows TERMINAL at that final size — the exact unused
+ * remainder released — at the FIRST question that can see it, not at the
+ * next harvest's settlement. `loop-capital.test.ts` drives the same through
+ * the real loop.
+ */
+describe("CAP-1 r1: the final size is judged where the evaluation can see it", () => {
+  const PLANNED = "planned-cap1-r1";
+
+  function holding(caps: Record<string, unknown> = {}): AllocatorGate {
+    const subject = gate(caps);
+    const request = requestFor({
+      reservationId: "018f4a7e-7000-7abc-8def-0000000000e1",
+      instanceId: INSTANCE,
+      accountingMode: "LIVE",
+      leg: { marketId: MARKET, side: "YES", action: "BUY", price: "0.35", shares: "10" },
+      market: SCOPE,
+    });
+    const applied = subject.applyForPlan({
+      entries: [{ plannedOrderId: PLANNED, request }],
+      liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+      projection: EMPTY_PROJECTION,
+      availableCollateral: "1000",
+      viewOf: NO_VIEW,
+    });
+    if (!applied.ok) throw new Error("the fixture reservation was refused");
+    return subject;
+  }
+
+  const seenFill = { simulatedFillId: "f-r1", marketId: MARKET, side: "YES" as const, action: "BUY" as const, price: "0.34", shares: "5" };
+
+  function countedFor(subject: AllocatorGate, viewOf: OrderViewOf): string {
+    return (
+      evaluate(subject, { type: "CANCEL", marketId: MARKET, reason: "read" } as unknown as Intent, { viewOf }).exposures
+        .byStrategyInstance[INSTANCE]?.combined ?? "missing"
+    );
+  }
+
+  it("an UNSETTLED commitment whose order the view shows TERMINAL is counted at its final size — 5 seen at 0.34 = 1.70, its 1.80 unused remainder released — and the question moves nothing", () => {
+    const subject = holding();
+    subject.observeVenueFill(seenFill, PLANNED);
+    const before = subject.metrics();
+    expect(countedFor(subject, () => ({ terminal: true, filledShares: "5" }))).toBe("1.7");
+    // Still WORKING in the view: the whole reservation, as before.
+    expect(countedFor(subject, () => ({ terminal: false, filledShares: "5" }))).toBe("3.5");
+    // No view, or a size that is not an exact decimal: the whole reservation (fail closed).
+    expect(countedFor(subject, NO_VIEW)).toBe("3.5");
+    expect(countedFor(subject, () => ({ terminal: true, filledShares: "5.0" }))).toBe("3.5");
+    // The question changed nothing: the commitment is settled at its own site.
+    expect(subject.metrics()).toEqual(before);
+  });
+
+  it("a filled share no venue answer carried is held at the LIMIT (never below its debit); a terminal order with nothing filled counts nothing", () => {
+    const subject = holding();
+    expect(countedFor(subject, () => ({ terminal: true, filledShares: "5" }))).toBe("1.75");
+    expect(countedFor(subject, () => ({ terminal: true, filledShares: "0" }))).toBe("0");
+  });
+
+  it("the cap is judged on that account: at a per-strategy cap of 5.20, a 3.50 BUY is ADMITTED against the terminal order's 1.70 (base: 3.50 + 3.50, refused) — by evaluate AND applyForPlan, which see the same view", () => {
+    const subject = holding({ perStrategyCap: "5.2" });
+    subject.observeVenueFill(seenFill, PLANNED);
+    const view: OrderViewOf = (plannedOrderId) => (plannedOrderId === PLANNED ? { terminal: true, filledShares: "5" } : undefined);
+    expect(evaluate(subject, buyIntent("10", "0.35"), { viewOf: view }).verdict).toMatchObject({ permitted: true });
+    expect(evaluate(subject, buyIntent("10", "0.35")).verdict).toMatchObject({ permitted: false });
+    const second = requestFor({
+      reservationId: "018f4a7e-7000-7abc-8def-0000000000e2",
+      instanceId: INSTANCE,
+      accountingMode: "LIVE",
+      leg: { marketId: MARKET, side: "YES", action: "BUY", price: "0.35", shares: "10" },
+      market: SCOPE,
+    });
+    const apply = (viewOf: OrderViewOf): boolean =>
+      subject.applyForPlan({
+        entries: [{ plannedOrderId: "planned-cap1-r1-second", request: second }],
+        liveOwners: [{ marketId: MARKET, strategyInstanceId: INSTANCE }],
+        projection: EMPTY_PROJECTION,
+        availableCollateral: "1000",
+        viewOf,
+      }).ok;
+    expect(apply(NO_VIEW)).toBe(false);
+    expect(apply(view)).toBe(true);
+  });
+
+  it("a SETTLED commitment is never looked up again; settle records its page as SEEN, adding to what was seen before", () => {
+    const subject = holding();
+    subject.observeVenueFill(seenFill, PLANNED);
+    subject.settle(PLANNED, { filledShares: "10", unbookedFills: [{ simulatedFillId: "f-r1b", price: "0.33", shares: "5" }] });
+    // 5 × 0.34 (seen earlier) + 5 × 0.33 (the page).
+    expect(subject.metrics().reservedCollateral).toBe("3.35");
+    expect(countedFor(subject, () => { throw new Error("a settled commitment is not looked up"); })).toBe("3.35");
+  });
+
+  it("a fill that is not the commitment's (another side or direction) or not exact is not evidence: its share stays at the limit", () => {
+    const subject = holding();
+    subject.observeVenueFill({ ...seenFill, side: "NO" }, PLANNED);
+    subject.observeVenueFill({ ...seenFill, action: "SELL" }, PLANNED);
+    subject.observeVenueFill({ ...seenFill, marketId: "018f4a7e-1111-7abc-8def-0123456789ac" }, PLANNED);
+    subject.observeVenueFill({ ...seenFill, price: "3.4e-1" }, PLANNED);
+    subject.observeVenueFill(seenFill, "planned-unknown");
+    subject.observeVenueFill(seenFill, undefined);
+    expect(countedFor(subject, () => ({ terminal: true, filledShares: "5" }))).toBe("1.75");
   });
 });
 
@@ -436,6 +847,7 @@ describe("an intent the allocator cannot price is REFUSED downstream", () => {
       availableCollateral: "1000",
       approvedIntentId: "018f4a7e-7000-7abc-8def-000000000021",
       heldShares: () => "0",
+      viewOf: NO_VIEW,
     });
     const market = new MarketState({ config: marketConfig, tradeWindowMs: 60_000, maximumTrades: 8 });
     market.markLifecycle("OPEN");
@@ -468,6 +880,7 @@ describe("an intent the allocator cannot price is REFUSED downstream", () => {
         referenceFeedAgeMs: 0,
         positions: [],
         openOrders: [],
+        unbookedFills: [],
         // The allocator's OWN answers, passed through exactly as `loop.ts`
         // passes them. Nothing is fabricated for the absent case.
         exposures: allocation.exposures,
@@ -494,6 +907,7 @@ describe("an intent the allocator cannot price is REFUSED downstream", () => {
       availableCollateral: "1000",
       approvedIntentId: "018f4a7e-7000-7abc-8def-000000000021",
       heldShares: () => "0",
+      viewOf: NO_VIEW,
     });
     // ABSENT, not a permissive verdict. The distinction is the whole check.
     expect(outcome.verdict).toBeUndefined();
