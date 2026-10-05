@@ -1057,8 +1057,8 @@ r8 adds these pins (review round 8, R8-H1, and the class):
   R1-FABLE-03(b).
 - **Source:** `ROLLOVER-1`, merged `ae11daa` after a joint ACCEPT at
   `61a0ab2`. Its record is `docs/handoffs/ROLLOVER-1.md`.
-- **Standing:** the orchestrator's interim ruling, made 2026-10-05. It is
-  open to the user, who may confirm or overrule it.
+- **Standing:** **confirmed by the user, 2026-10-05.** It was recorded as
+  the orchestrator's interim ruling the same day.
 - **Scope:** one producer convention. It changes no rule of D2. Rule 4
   still taints an epoch on every incident that names no market.
 
