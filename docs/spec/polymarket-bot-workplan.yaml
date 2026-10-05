@@ -1545,12 +1545,27 @@ work_packages:
       - test/integration/paper-trader/**
       - test/contract/polymarket-public/**
       - docs/handoffs/ROLLOVER-1.md
+      # Granted 2026-10-04 by the user (ruling Q2; recorded 2026-10-05 by
+      # GOV-NOTES-3): packages/strategy-runtime/**, only for a run-scoped
+      # evaluation sequence, so the window runtimes of one run never share an
+      # evaluation or checkpoint sequence. The relaunch packet added
+      # test/unit/strategy-runtime/** for its tests. Recorded as this note,
+      # not as entries: the package is complete (merged ae11daa).
     forbidden_paths:
+      # Excepted 2026-10-04 by the user (ruling Q1; recorded 2026-10-05 by
+      # GOV-NOTES-3): packages/domain/**, only for the new event contract
+      # SeriesWindowAdmitted@1, its registry entry, its tests and its sample.
+      # Every other domain change stayed forbidden. Records:
+      # docs/contracts/protected-contracts.md §5 and docs/contracts/domain.md §12.
       - packages/domain/**
       - db/migrations/**
       - packages/polymarket-secure/**
     deliverables:
       - series admission in the gateway and the trader, journaled before it is derived
+      # Confirmed 2026-10-04 by the user (ruling Q4; recorded 2026-10-05 by
+      # GOV-NOTES-3): a series-bound instance's strategy.configs.parameters is
+      # the document {strategy, series}. REGISTER-1's register --series writes
+      # it, and BOOT-1 compares it field by field. No migration was needed.
       - the run record pinning the series configuration, with each admission an ordered event (ADR-030 Decision 4.2)
       - teardown of closed windows
       - a concurrent-market cap

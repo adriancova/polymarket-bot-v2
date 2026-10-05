@@ -12,6 +12,10 @@
   read it as confirmed on 2026-10-02.
 - **Date:** 2026-09-30
 - **Recorded by:** `THROUGHPUT-1c`, which also implements it.
+- **Amended:** [Amendment 1](#amendment-1-2026-10-05-rollover-1)
+  (2026-10-05) records the orchestrator's interim ruling on the reference id
+  that a series-admission incident names when it has no window id
+  (`ROLLOVER-1`). The user has not ruled on it.
 - **Supersedes / Superseded by:** none. It changes how a venue book's AGE is
   measured, when a configuration opts in. It does not change any bound, any
   gate's direction, the §9.9 stale-book response, or the clock semantics
@@ -1045,3 +1049,102 @@ r8 adds these pins (review round 8, R8-H1, and the class):
 - the r1, r6 and r7 end-to-end tests whose outcome turns on a whole frame
   vouching (or on its taint) now send a successor message, so the frame is
   proven and the taint, not the r8 rule, decides.
+
+## Amendment 1 (2026-10-05, ROLLOVER-1)
+
+- **Recorded by:** `GOV-NOTES-3`, from `ROLLOVER-1`'s known risk
+  R1-FABLE-03(b).
+- **Source:** `ROLLOVER-1`, merged `ae11daa` after a joint ACCEPT at
+  `61a0ab2`. Its record is `docs/handoffs/ROLLOVER-1.md`.
+- **Standing:** the orchestrator's interim ruling, made 2026-10-05. It is
+  open to the user, who may confirm or overrule it.
+- **Scope:** one producer convention. It changes no rule of D2. Rule 4
+  still taints an epoch on every incident that names no market.
+
+**The ruling.** A series-admission incident that names only its scope's
+reference id is not a market-less incident under D2 rule 4. It taints no
+epoch, and rule 5 applies it to no book.
+
+### Why the convention exists
+
+`ROLLOVER-1` added a series-admission feed to the gateway
+(`apps/data-gateway/src/feeds/series-admission.ts`). Its routine incidents
+report a refused window, or a series held at its cap. None is about the
+delivery of a book, and the cap is reached in the ordinary course of a run.
+
+A market-less incident taints its epoch (rule 4). Under
+`CONNECTION_CONFIRMED`, every book of the epoch then falls back to the
+last-change rule until the gateway restarts. `ROLLOVER-1` found that its
+admission incidents would do this, and fixed it: each routine admission
+incident names a market (`#openWindowIncident`).
+
+### The convention, as merged
+
+1. An incident about one window names the window's derived id
+   (`windowInternalMarketId`, `packages/universe/src/series-admission.ts`).
+2. When no window id can be derived, the incident names its scope's
+   reference id, `incidentReferenceId(scope)`. No id can be derived when the
+   keyset event has no condition id, or no usable start locator.
+3. `incidentReferenceId(scope)` is
+   `windowInternalMarketId("series-admission-incident|" + scope, 0)`:
+   - a UUIDv7 whose 48-bit timestamp is 0, so its text begins
+     `00000000-0000-7`;
+   - its other 74 bits are the first bits of the sha256 of
+     `rollover-1/window-market-id/v1|series-admission-incident|<scope>`;
+   - so it is stable across restarts and replays, and distinct per scope.
+
+   The code's literal fallback, `00000000-0000-7000-8000-000000000000`, is
+   unreachable: the derivation always succeeds at timestamp 0.
+4. Two incidents can name it, both NOTIFY:
+   - `GATEWAY_SERIES_WINDOW_REFUSED`, scoped `<feedId>:<key>`, where the key
+     is the condition id or `event:<eventId>`;
+   - `GATEWAY_SERIES_CAP_REACHED`, scoped `<feedId>:<seriesId>:cap`, when the
+     held window has no derivable id.
+5. Some conditions publish nothing. A keyset event with neither a condition
+   id nor an event id is only counted (`windowsUnidentified`). So is a failed
+   read with no window id (`requestFailures`). Enough failed reads in a row
+   raise the stall of item 6.
+6. Three admission-feed incidents still name no market, as the lifecycle
+   feed's do: `GATEWAY_FEED_STALL`, `GATEWAY_WAL_FRAME_REFUSED` and
+   `GATEWAY_SERIES_LEDGER_WRITE_FAILED`. Each taints the epoch under rule 4.
+
+### Why it names no market and taints no book
+
+1. **No market any process runs carries the id.** An admitted window's id
+   carries its scheduled open as its timestamp. A window is admitted only
+   before its close, so its open is never the Unix epoch, and the timestamp
+   is never 0. Any other market's id would also have to match the 74 hashed
+   bits.
+2. **The trader applies it to no market.** `CoreLoop` finds no market it
+   runs in the incident's list.
+3. **Rule 4 does not fire,** because the incident's market list is not
+   empty (`CoreLoop.#observeDeliverySession`). **Rule 5 does not fire,**
+   because no market has the id. So no book is tainted, and no market is
+   paused.
+4. **Pinned:**
+   - the gateway: `test/integration/data-gateway/rollover-1-series-admission.test.ts`,
+     "a refused window with no start locator names its scope's reference
+     id";
+   - the trader, for an incident that names a market it does not run:
+     `packages/trading-core/src/book-freshness.test.ts`, "an incident naming
+     ANOTHER market neither taints the session nor touches this market";
+   - a multi-window run publishes no market-less admission incident:
+     `test/integration/paper-trader/rollover-1-multi-window.test.ts`.
+
+### Why it is safe, and fails closed where it matters
+
+1. **Neither condition concerns delivery.** Rule 4 exists because a loss of
+   data breaks the inference from "another asset's frame arrived" to "this
+   asset's frames are being delivered". A refused or held window loses,
+   delays and reorders no market-data frame, so the inference still holds.
+2. **Admission still fails closed.** A refused window is never admitted, and
+   a held one is not admitted until a slot frees (ADR-030 Decisions 1.4 and
+   1.5, and ADR-030 Amendment 1, rule 1).
+3. **Rule 4 is unchanged for every loss of data.** Each admission-feed
+   incident about the gateway's own data stays market-less (item 6 above),
+   and so does every such incident of the other feeds.
+4. **Only `CONNECTION_CONFIRMED` is affected.** Under any other basis the
+   trader records no taint at all (`#observeDeliverySession` returns first).
+5. **The cost** is an incident that names an id no catalog holds. Its
+   `detail` names the window by the condition id or event id it carried. A
+   refusal is also in the admission ledger, as a `REFUSED` record.

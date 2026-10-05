@@ -4,8 +4,9 @@
   its sub-ruling).
 - **Date:** 2026-09-30
 - **Recorded by:** `LEAN-GOV`
-- **Implemented by:** `ROLLOVER-1`, after `THROUGHPUT-1c` merges. Not yet
-  implemented.
+- **Implemented by:** `ROLLOVER-1`, merged `ae11daa` (2026-10-05).
+  [Amendment 1](#amendment-1-2026-10-05-rollover-1) (2026-10-05) records the
+  admission policies it implemented, as the orchestrator's interim rulings.
 - **Supersedes / Superseded by:** none. It **amends** handoff §9.2 for PAPER,
   the gateway's "no discovery" contract, and the run-boundary semantics. It
   does not amend ADR-009 §1 (see "What it amends"). It is **not**
@@ -174,3 +175,252 @@ invariant 9, and every live-mode rule.
 - No venue fact is relied on. The 15-minute window length in Context 1 comes
   from the series name and the H1 recordings. `ROLLOVER-1` must ground
   admission in the verified venue documents.
+
+## Amendment 1 (2026-10-05, ROLLOVER-1)
+
+- **Recorded by:** `GOV-NOTES-3`, from `ROLLOVER-1`'s known risk
+  R2-FABLE-03.
+- **Source:** `ROLLOVER-1`, merged `ae11daa` (PR #68) after a joint ACCEPT
+  at `61a0ab2`. Its record is `docs/handoffs/ROLLOVER-1.md`.
+- **Standing:** rules 1-8 are the orchestrator's interim rulings for PAPER,
+  made 2026-10-05. Each records a policy `ROLLOVER-1` implemented and its
+  verifiers accepted. The user may confirm or overrule any of them. None
+  reaches a live mode (Decision 2).
+- **User rulings:** none is changed. Ruling A5 (2026-09-30) and rulings
+  Q1-Q4 (2026-10-04) stand as ruled.
+- **Decision 3, as merged.** The existing contracts could not carry a
+  window's scheduled open and close, so `ROLLOVER-1` stopped (Decision 3.3).
+  The user granted `SeriesWindowAdmitted@1` (Q1). Its records are
+  `docs/contracts/protected-contracts.md` §5 and `docs/contracts/domain.md`
+  §12.
+  - One frame publishes `MarketDiscovered@1`, `TradingParametersChanged@1`
+    and `SeriesWindowAdmitted@1`.
+  - The trader consumes `MarketDiscovered@1` and `SeriesWindowAdmitted@1`
+    (`CONSUMED_EVENTS`, `packages/trading-core/src/event-door.ts`).
+    Decision 3.2 also named `TradingParametersChanged@1`, which the trader
+    does not consume. A window's version-1 tick size travels on
+    `SeriesWindowAdmitted@1`.
+
+Each rule names the decision it refines and why it fails closed. Code is
+cited by symbol. "The gateway" is `SeriesAdmissionFeedDriver`
+(`apps/data-gateway/src/feeds/series-admission.ts`) and its
+`AdmissionLedger` (`apps/data-gateway/src/admission-ledger.ts`). "The
+trader" is `CoreLoop` (`packages/trading-core/src/loop.ts`) and
+`SeriesWindowAdmissions` (`packages/trading-core/src/series-admission.ts`).
+The rules are numbered within this amendment. From outside it, cite one as
+"ADR-030 Amendment 1, rule 3".
+
+### Rule 1. The cap counts every live window and never evicts one
+
+**Refines:** Decision 1.8.
+
+1. The cap is per reviewed series: `maximumConcurrentWindows`, 1 to 64, part
+   of the series' review. Configured markets do not count toward it. A run's
+   admitted windows are bounded by the sum of its series' caps.
+2. Every live window counts, on both sides.
+   - **The gateway** counts every `ADMITTED` ledger record of the series
+     (`AdmissionLedger.liveWindows`). That includes an admission intent not
+     yet confirmed, a window past its unresolved bound, and a window whose
+     resolution is owed (rule 2).
+   - **The trader** counts every window the run admitted and has not torn
+     down, a `HELD_UNRESOLVED` window included.
+3. At the cap the gateway admits nothing more. It opens
+   `GATEWAY_SERIES_CAP_REACHED` (NOTIFY), naming the held window, and
+   reconsiders that window next cycle. Once the window has closed, it is
+   skipped as late. A held window with no derivable id is named by a
+   reference id (ADR-023 Amendment 1).
+4. The trader refuses an admission past its own cap (`CAP_REACHED`).
+5. No live window is retired to make room. A window still unresolved
+   `unresolvedTeardownSeconds` after its scheduled close is not retired by a
+   timer. The gateway keeps it subscribed and in its slot, and opens
+   `GATEWAY_SERIES_WINDOW_UNRESOLVED` (NOTIFY) naming it.
+
+**Why it fails closed:** a run never holds more windows than its reviews
+allow, whatever their state. Evicting a window would cut the only route its
+resolution has to a trader that may hold it. The cost is liveness: windows
+awaiting a resolution can stop a series' admissions. Rule 4 is the recovery.
+
+### Rule 2. The gateway retires a window only once its resolution is published
+
+**Refines:** Decision 4.4 ("torn down after its resolution is handled").
+
+1. The gateway's market feed (`feeds/polymarket.ts`) hands each
+   `MarketResolved` it dispatched to `noteResolution`, with that envelope's
+   publication outcome.
+2. The resolution is first recorded on the window's ledger record, as owed.
+   Only a `published: true` outcome discharges it (`publishedAt`). Only a
+   discharged resolution retires the window `RESOLVED` (`#tearDown`).
+3. While its resolution is owed, a window stays `ADMITTED`: subscribed,
+   registered and in its cap slot.
+   - A `published: false` outcome opens
+     `GATEWAY_SERIES_RESOLUTION_UNPUBLISHED` (PAGE).
+   - The next gateway epoch re-publishes the recorded payload unchanged
+     (`#replayResolutions`), after that epoch's first successful keyset read.
+4. If the ledger write fails, the resolution is held in memory, owed, and
+   written again every cycle (`#recordUnrecorded`). If the gateway stops
+   before a write succeeds, the resolution is lost. The window then waits
+   like one whose resolution was never observed (rule 4).
+5. The ledger refuses a `RESOLVED` retirement without a published
+   resolution, on write and at open.
+6. Retirement detaches the window: its tokens are unsubscribed, the
+   lifecycle feed stops polling it, and the directory releases it
+   (`#detach`).
+
+**Why it fails closed:** a window keeps its route until its resolution has
+reached the stream. A publication halt delays a resolution but cannot
+swallow it, unless its ledger write also fails before a stop (item 4). The
+cost is at-least-once delivery: a resolution whose
+`publishedAt` write was lost is published again. Rule 3 makes a repeat
+harmless at the trader.
+
+### Rule 3. A resolution is final at the trader
+
+**Refines:** Decision 4.4.
+
+1. A market resolves once. `MarketState.markResolved` refuses a repeat, and
+   the first resolution stands. A repeat calls no `onMarketResolved`.
+2. After the resolution, a `MarketOpened` or `MarketClosing` changes nothing
+   and calls no strategy (`MarketState.markLifecycle`).
+3. Both hold for every market the trader runs, configured markets included.
+
+Why it is needed: delivery is at least once (rule 2). The gateway's
+lifecycle feed polls a window until the cycle that retires it, so it can
+report `MarketClosing` after the resolution.
+
+**Why it fails closed:** a strategy never sees a resolved market reopen, and
+never handles one resolution twice. A late lifecycle event cannot hide the
+resolution from teardown.
+
+### Rule 4. An operator may retire a named window whose resolution never arrived
+
+**Refines:** Decisions 1.8 and 4.4.
+
+A resolution the gateway never observes would hold its window's slot for
+good. That happens when the gateway is down, asleep or disconnected at the
+resolution instant. The market channel is not documented to replay it.
+
+1. The recovery is configuration: `seriesAdmission.operatorRetirements`,
+   at most 32 entries of `{ internalMarketId, reason }`.
+   - Each entry names one window, and a window is named once.
+   - The reason is 1 to 500 characters and not blank.
+   - The list is outside every series' review, so it changes no
+     `seriesConfigHash`. It is read at start, so a change takes a restart.
+2. The gateway applies an entry only to a live window past its
+   `unresolvedTeardownSeconds` bound with no resolution owed, in the ledger
+   or in memory (rule 2).
+3. Such a window is retired `OPERATOR`, with the reason (`operatorReason`).
+   It is detached like a resolved window and announced by
+   `GATEWAY_SERIES_WINDOW_RETIRED_BY_OPERATOR` (NOTIFY).
+4. An entry for a window not yet past its bound, or with a resolution owed,
+   is not applied. It opens `GATEWAY_SERIES_OPERATOR_RETIREMENT_DEFERRED`
+   (NOTIFY). An owed resolution is re-published instead, and retires the
+   window `RESOLVED`.
+5. An entry naming no window in the ledger retires nothing. It is reported
+   once per epoch (`GATEWAY_SERIES_OPERATOR_RETIREMENT_UNMATCHED`, NOTIFY).
+6. The ledger requires the reason exactly on an `OPERATOR` retirement, and
+   refuses one that carries a resolution.
+7. Nothing else retires a window.
+8. It frees the gateway's slot only. No resolution is published for the
+   window. A trader holding inventory in it keeps it `HELD_UNRESOLVED`, in
+   the trader's cap slot, until a new run. If that fills the trader's cap,
+   the trader refuses later windows `CAP_REACHED` while the gateway admits
+   them.
+
+**Why it fails closed:** the act is bounded. It never retires a window
+whose resolution may still arrive inside the bound. It never overrides an
+observed resolution. The operator must judge that the window really
+resolved, because the gateway cannot verify it. The gateway stays the
+ledger's only writer, and each retirement is announced in the stream.
+
+### Rule 5. A flat, idle window may be torn down unresolved
+
+**Refines:** Decision 4.4.
+
+1. The trader tears a window down `UNRESOLVED_AFTER_CLOSE` when it is still
+   unresolved `unresolvedTeardownSeconds` after its scheduled close, on event
+   time, holds no inventory and is idle (`CoreLoop.#tearDownWindows`).
+   - No inventory: no actual balance and no instance's virtual position on
+     either of its tokens (`#windowHoldsInventory`).
+   - Idle: no tracked order, no pending cancel, and no allocator commitment
+     naming its market (`#windowHoldsWork`; rule 7).
+2. A window past the bound that holds inventory is not torn down. It is
+   reported once (`HELD_UNRESOLVED`), counted (`heldUnresolved`), and keeps
+   its cap slot. A later `MarketResolved` still reaches its strategy.
+3. The gateway has no such exception. It keeps an unresolved window until
+   it resolves or rule 4 retires it.
+
+**Why it fails closed:** a flat window leaves nothing for its resolution to
+settle. Any holding keeps the window, so no position loses its owner before
+it resolves. As Decision 4.4 says, the window's ledger rows stay.
+
+### Rule 6. A resolution a halt suppressed still releases its window
+
+**Refines:** Decision 4.4.
+
+1. A resolution is handled when its `onMarketResolved` reached every
+   instance of the window's market.
+2. It is not handled when a MARKET or GLOBAL halt suppressed the callback,
+   or an instance was halted, had no computable snapshot, or refused
+   (`#resolutionUnhandled`).
+3. Such a window is still torn down once idle, with the reason
+   `RESOLVED_UNHANDLED`. Its counter is `tornDownResolvedUnhandled`, and
+   `tornDownResolved` counts handled resolutions only.
+
+**Why it fails closed:** halts latch for the run, and a skipped callback is
+never redelivered, so keeping the window would only hold its slot. The
+record never claims the resolution was handled, and the halt stays latched.
+Teardown still waits until the window is idle.
+
+### Rule 7. A window is held while capital is committed against its market
+
+**Refines:** Decision 4.4.
+
+1. The trader does not tear a window down while any allocator commitment
+   names its market (`AllocatorGate.holdsCommitmentIn`, read by
+   `#windowHoldsWork`). The wait is counted (`teardownsBlocked`).
+2. On ordinary paths this never binds. An owned order leaves tracking only
+   once settled with every filled share booked, which closes its
+   commitment.
+3. It binds for a commitment that never closes, such as a fill booked
+   UNATTRIBUTED. That commitment holds its window, the market's owner and a
+   cap slot for the rest of the run.
+
+**Why it fails closed:** teardown would remove the market's live owner while
+the allocator still re-applies the commitment. A LIVE commitment without an
+owner is refused `CAPITAL_LIVE_OWNERSHIP_MISSING`, so every later allocator
+question would be refused for the run, protective exits included. Holding
+the window costs a slot: fewer windows, never more.
+
+### Rule 8. Checks 16 and 17 judge a series-bound instance across its live windows
+
+**Refines:** Decision 4.1, for handoff §9.8 checks 16 and 17.
+
+1. For a series-bound instance, a placement's §9.8 portfolio covers every
+   live window of the instance (`CoreLoop.#riskPortfolioFor`,
+   `#otherLiveRegistrationsOf`):
+   - each window's booked positions;
+   - each window's own working orders, at their unfilled remainder;
+   - each window's filled but unbooked fills, asked of the allocator under
+     the instance id;
+   - a check-17 mark for each window, from its own YES book's best bid
+     (`#scenariosFor`).
+2. A held window whose YES book has no bid has no mark. Check 17 then
+   refuses the entry `RISK_SCENARIO_MARKS_INCOMPLETE`.
+3. Checks 16 and 17 refuse entries only (`evaluateIntent`,
+   `packages/risk/src/engine.ts`). So another window's holdings never block
+   an exit through them.
+4. A market-bound instance has no other registration, so its input is
+   unchanged.
+5. A torn-down window is not live, so it leaves both measures. Its ledger
+   rows stay, and the allocator's §9.7 caps still count them.
+6. **Not ruled here.** Check 17 nets marked values across windows. A marked
+   gain in one window can offset a loss in another, so check 17 can admit
+   an entry its window alone would fail. The other windows' marks have no
+   freshness bound. `ROLLOVER-1`'s round-8 review raised this
+   (R8-FABLE-01). Check 16's primary measure is committed cost, which
+   another window can only raise.
+
+**Why it fails closed:** an instance can no longer pass the primary limit
+window by window while exceeding it in sum. A held window that cannot be
+marked stops entries; it never lets one pass. Item 6 is the exception for
+check 17.

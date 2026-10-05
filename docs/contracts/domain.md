@@ -35,7 +35,7 @@ The frozen versioned contracts every other package consumes.
 | `envelope.ts` | §7.1 event envelope |
 | `identifiers.ts` | §7.2 canonical identifiers |
 | `decimals.ts` | §7.3 decimal boundary types |
-| `events/**` | §7.4 normalized market events (all 22) |
+| `events/**` | §7.4 normalized market events (all 22), plus `SeriesWindowAdmitted` ([§12](#12-serieswindowadmitted1-added-after-the-freeze)) |
 | `decision.ts` | §7.5 strategy callback result |
 | `intents.ts` | §7.7 intent types |
 | `provenance.ts` | §7.1 envelope/payload provenance agreement |
@@ -242,7 +242,7 @@ per-site in `packages/strategy-runtime` (`topOf`).
 
 Every economic schema is built on `z.string()`, so a `number`, `bigint`,
 `Number` object, or numeric-looking object fails before any canonicalization
-check runs. This is asserted generically in the tests: for every one of the 22
+check runs. This is asserted generically in the tests: for every one of the 23
 event contracts, replacing *any* string-valued field with a JavaScript number
 must fail validation. The mutation walk is **recursive** — it enumerates every
 string path in a sample payload including inside nested objects and arrays
@@ -250,6 +250,10 @@ string path in a sample payload including inside nested objects and arrays
 payload immutably at that path, and requires rejection. The walk itself is
 covered by its own tests, so it cannot regress to a shallow scan and start
 passing vacuously.
+
+Corrected 2026-10-05 (`GOV-NOTES-3`): was 'every one of the 22 event
+contracts'. `SeriesWindowAdmitted` (§12) is the 23rd, and the walk covers its
+sample too.
 
 | Contract type | Schema | Range |
 | --- | --- | --- |
@@ -663,3 +667,49 @@ once registered is never reused or redefined. A producer (any app) may not
 emit a *new* machine-parseable convention inside `causationId` without
 registering it here first; consumers (`WP-210` replay, `WP-230`) may rely on
 exactly the registered set and the opacity rule above.
+
+---
+
+## 12. `SeriesWindowAdmitted@1`, added after the freeze
+
+Added 2026-10-05 by `GOV-NOTES-3`. `ROLLOVER-1` added this contract under the
+user's grant Q1 (2026-10-04), and merged as `ae11daa` on 2026-10-05. The
+grant's record is [`protected-contracts.md`](./protected-contracts.md) §5.
+
+- **Why it exists.** It carries one admitted window of a reviewed series
+  (ADR-030). The existing contracts could not carry the window's scheduled
+  open and close, so `ROLLOVER-1` stopped and asked (ADR-030 Decision 3.3).
+- **Module:** `events/series-admission.ts` (`SeriesWindowAdmittedContract`,
+  `SeriesWindowAdmittedPayloadSchema`).
+- **Version:** 1.
+- **Registration:** after every §7.4 contract, so no existing entry moves. It
+  is last in `DOMAIN_EVENT_CONTRACTS`, at index 22 of `DOMAIN_EVENT_TYPES`.
+  The registry now holds 23 event contracts.
+- **Fields:** every field is required, and the payload is strict (§7).
+
+| Field | Schema | Meaning |
+| --- | --- | --- |
+| `internalMarketId` | `InternalMarketIdSchema` (UUIDv7) | the window's derived id |
+| `conditionId` | `ConditionIdSchema` | the venue market |
+| `seriesId` | `CodeStringSchema` | the reviewed series' configuration key, never a venue id |
+| `seriesConfigHash` | `SeriesConfigHashSchema` (64 lowercase hex) | sha256 of the reviewed series document the window was judged against |
+| `yesTokenId`, `noTokenId` | `TokenIdSchema` | the two outcome tokens, YES first |
+| `scheduledOpenAt`, `scheduledCloseAt` | `IsoTimestampSchema` | the scheduled interval, derived from the title |
+| `tickSize` | `PositiveDecimalStringSchema` | the tick size at admission, version 1 of the window's parameters |
+| `windowTitle` | `DetailStringSchema` | the venue's title, verbatim: the schedule's authority |
+
+- **Which fields the grant named.** Ruling Q1 names the eight fields above
+  `tickSize`. It allowed more if each was justified. `tickSize` and
+  `windowTitle` are the two added, and the module header justifies each.
+- **Cross-field rules** are the consumer's, as for `MarketDiscovered@1`:
+  distinct tokens, the close after the open, and the interval the title
+  states.
+- **Producer:** the gateway's series-admission feed. One frame publishes it
+  with `MarketDiscovered@1` and `TradingParametersChanged@1`.
+- **Consumer:** the trader (`CONSUMED_EVENTS`,
+  `packages/trading-core/src/event-door.ts`). It re-judges each admission
+  against its own review.
+- **Schema-version consequence for recorded data:** a new event type at
+  version 1. No existing contract's field set changed, so no existing
+  `schemaVersion` changed. Data recorded by an earlier build holds no such
+  event, and its envelopes parse as before.
