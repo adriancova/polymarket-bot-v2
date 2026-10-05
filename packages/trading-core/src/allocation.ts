@@ -870,6 +870,29 @@ export class AllocatorGate {
     return Object.freeze(out);
   }
 
+  /**
+   * `ROLLOVER-1` r7 (R7-FABLE-03): does any commitment this gate still holds
+   * name `marketId`? Moves nothing.
+   *
+   * A series window's teardown retires its registrations, and with them the
+   * market's live owner (`InstanceRegistry.retireMarket`). A commitment that
+   * names the market is re-applied by {@link #buildState} at EVERY question,
+   * and `packages/capital-allocator` refuses a LIVE commitment on a market
+   * with no live owner (`CAPITAL_LIVE_OWNERSHIP_MISSING`) — so a commitment
+   * that outlived its window's owner would refuse every later question, every
+   * window's entries and protective exits alike, for the rest of the run. One
+   * that never closes (a fill booked UNATTRIBUTED, {@link observeUnattributedFill})
+   * does exactly that. The loop therefore holds a window while this answers
+   * `true` (`#windowHoldsWork`): its capital stays committed against a market
+   * that still has its owner.
+   */
+  holdsCommitmentIn(marketId: string): boolean {
+    for (const commitment of this.#commitments.values()) {
+      if (commitment.request.marketId === marketId) return true;
+    }
+    return false;
+  }
+
   /** The §9.7 scope this gate knows for a market, if it is configured. */
   marketOf(marketId: string): AllocationMarket | undefined {
     return this.#markets.get(marketId);

@@ -145,10 +145,17 @@ export const ReviewedSeriesSchema = z.strictObject({
     /**
      * The market's negative-risk membership: Gamma `Market.negRisk`, a
      * market-level property (S-D23 lines 305, 313-315). Gamma `Event.negRisk`
-     * (S-O01) must state the same value. Augmented negative risk, which S-D23
-     * places on the event, is not reviewed here.
+     * (S-O01) must state the same value.
+     *
+     * `ROLLOVER-1` r7 (R6-FABLE-01): ONLY `false` is reviewable. S-D23 makes
+     * augmented negative risk (`Event.enableNegRisk`, `Event.negRiskAugmented`;
+     * "Identify Augmented Negative Risk", lines 311-367) relevant exactly when
+     * a market's `negRisk` is true, and nothing here reads or judges it. A
+     * review stating `true` would admit a window whatever its augmentation, so
+     * it is refused at parse — on both sides, before any hash is pinned —
+     * until the review states and the door reads augmentation (r5 follow_up 2).
      */
-    negRisk: z.boolean(),
+    negRisk: z.literal(false),
     fees: z.strictObject({
       /** Gamma `feesEnabled`. */
       feesEnabled: z.boolean(),

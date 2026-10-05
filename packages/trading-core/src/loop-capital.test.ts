@@ -87,6 +87,17 @@
  *     yet. That is the r2 STOPPED residual. It is pinned exactly against its
  *     booked controls and awaits the orchestrator's ruling. In Tier 0 the
  *     residual is asserted to be zero.
+ *
+ * `ROLLOVER-1` r7 — ONE SERIES-BOUND INSTANCE, TWO WINDOWS (`windows: true`:
+ * A and B registered as `trader.ts`'s window attach registers them, under one
+ * instance id with distinct registration keys):
+ *
+ * 13. R7-FABLE-02: the R4-CAP check-16 pin inside one window — the unbooked
+ *     fill is asked of the allocator under the INSTANCE id, never the
+ *     window's key;
+ * 14. R7-FABLE-01: window A's booked position, unbooked fill, working order
+ *     and mark all reach window B's checks 16 and 17, each at its exact
+ *     boundary; two market-bound instances in the same shape stay apart.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -106,7 +117,7 @@ import {
   type LatencyModel,
   type QueueModelParameters,
 } from "@polymarket-bot/simulation";
-import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
+import { createRunEvaluationSequence, createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -490,6 +501,14 @@ interface HarnessOptions {
   readonly onRisk?: (harness: Harness, risk: Harness["risks"][number]) => void;
   /** `CAP-1` r1: the venue port the LOOP is handed, wrapping the simulated venue (the harness's own reads stay on it). */
   readonly wrapVenue?: (venue: SimulatedVenue, clock: ManualClock) => TraderVenue;
+  /**
+   * `ROLLOVER-1` r7: A and B are two WINDOWS of ONE series-bound instance
+   * (`INSTANCE_A`, `RUN_A`, one run-scoped evaluation sequence), registered
+   * as `trader.ts`'s window attach registers them — each its own runtime and
+   * registration key (`<instanceId>|<marketId>`), both under one instance id.
+   * Absent: two market-bound instances, as before.
+   */
+  readonly windows?: boolean;
 }
 
 const ZERO_LATENCY: LatencyModel = {
@@ -532,11 +551,15 @@ function assemble(options: HarnessOptions): Harness {
   const registry = new InstanceRegistry();
   const calls: [Label, string, string, string][] = [];
   const wiring: { harness: Harness | undefined; loop: CoreLoop | undefined } = { harness: undefined, loop: undefined };
+  const windows = options.windows === true;
+  // `ROLLOVER-1` r7: one run's windows share ONE evaluation sequence (ruling Q2).
+  const sequence = windows ? createRunEvaluationSequence() : undefined;
   for (const [instanceId, runId, marketId, label] of [
     [INSTANCE_A, RUN_A, MARKET_A, "A"],
-    [INSTANCE_B, RUN_B, MARKET_B, "B"],
+    windows ? ([INSTANCE_A, RUN_A, MARKET_B, "B"] as const) : ([INSTANCE_B, RUN_B, MARKET_B, "B"] as const),
   ] as const) {
     const created = createStrategyInstanceRuntime({
+      ...(sequence === undefined ? {} : { sequence }),
       strategy: scriptedStrategy(marketId, label, options.script),
       params: {},
       run: { runId, instanceId, configId: CONFIG_ID, runSeed: "7" },
@@ -553,6 +576,7 @@ function assemble(options: HarnessOptions): Harness {
       return evaluate(input);
     });
     const registered = registry.register({
+      ...(windows ? { window: true } : {}),
       instanceId,
       runId,
       configId: CONFIG_ID,
@@ -677,7 +701,9 @@ function assemble(options: HarnessOptions): Harness {
   riskSeam.observe = (context, document, evaluation) => {
     const built = context as RiskInputContext;
     const risk = {
-      label: (built.strategyInstanceId === INSTANCE_A ? "A" : "B") as Label,
+      // By MARKET: A's market is MARKET_A in both shapes (`ROLLOVER-1` r7:
+      // two windows share one instance id).
+      label: (built.marketConfig.marketId === MARKET_A ? "A" : "B") as Label,
       context: built,
       document: document as RiskDocument,
       evaluation: evaluation as RiskEvaluation,
@@ -2618,4 +2644,166 @@ describe("CAP-1 property — over random fills, partial fills, cancels, onFill a
     // and the stated residual both within a batch and across batches.
     for (const [path, count] of Object.entries(coverage)) expect(count, path).toBeGreaterThan(0);
   }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// `ROLLOVER-1` r7 — one series-bound instance, two live windows
+// ---------------------------------------------------------------------------
+
+/** The markets one risk document's portfolio and scenarios name, in order (positions, unbooked fills, marks). */
+function portfolioMarkets(risk: Harness["risks"][number]): {
+  readonly positions: readonly string[];
+  readonly unbooked: readonly string[];
+  readonly marks: readonly string[];
+} {
+  const named = (marketId: string): string => (marketId === MARKET_A ? "A" : marketId === MARKET_B ? "B" : marketId);
+  const positions = risk.context.positions.map((position) => `${named(position.marketId)} ${position.side} ${position.shares} @ ${position.costBasis}`);
+  return {
+    positions,
+    unbooked: (risk.document.unbookedFills ?? []).map((entry) => `${named(entry.marketId)} ${entry.side} ${entry.shares} / ${entry.debit}`),
+    marks: (risk.document.scenarios[0]?.marks ?? []).map((mark) => `${named(mark.marketId)} ${mark.yesPrice}`),
+  };
+}
+
+describe("ROLLOVER-1 r7 (R7-FABLE-02): the R4-CAP check-16 shape inside ONE WINDOW of a series-bound instance — its filled-but-unbooked fill reaches check 16 under the INSTANCE id, never the window's registration key", () => {
+  /**
+   * CAP-1's carried-path pin, unchanged except that A and B are two windows
+   * of one instance (`windows: true`): B's registration key is
+   * `<INSTANCE_A>|<MARKET_B>`, never equal to the instance id the allocator's
+   * commitments carry. B places 10 @ 0.34 twice at S + 5 000 (the second from
+   * its `onFill`, filled at once and unbooked until the next harvest), then a
+   * third at S + 10 000: 3.40 booked + 3.40 unbooked + 3.50 = 10.30 > 8.
+   *
+   * Asking the allocator under the registration key (mutant R7-U1, which
+   * survived every suite at `95a0b76`) states no unbooked fill for a window:
+   * check 16 measures 6.90 and the third BUY is admitted.
+   */
+  it("the third BUY is REFUSED RISK_WORST_CASE_LOSS_EXCEEDED at 10.30, its unbooked 10 @ 0.34 stated through the separate input", async () => {
+    ordinal = 0;
+    const FIRST = iso(S + 5_000);
+    const BUY10: Act = { kind: "BUY", shares: "10", style: "FAK" };
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      risk: { maxWorstCaseContractualLoss: "8" },
+      windows: true,
+      script: scheduled({ B: { onFeatures: [[FIRST, BUY10], [iso(S + 10_000), BUY10]], onFill: [[FIRST, BUY10]] } }),
+    });
+    await feed(harness, ...opening(), opened(S + 150, MARKET_B));
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    expect(outcomeOf(harness)).toEqual({
+      accepted: 2,
+      risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 },
+      allocator: {},
+      fills: ["BUY 10@0.34", "BUY 10@0.34"],
+      orders: ["BUY FILLED 10/10", "BUY FILLED 10/10"],
+    });
+    expect(checkSixteen(harness, "B")).toEqual(["3.5", "6.9", "10.3"]);
+    expect(unbookedInputs(harness, "B")).toEqual([[], [], [{ marketId: MARKET_B, side: "YES", shares: "10", debit: "3.4" }]]);
+    // Both registrations are the ONE instance's windows.
+    expect(harness.risks.map((risk) => risk.context.strategyInstanceId)).toEqual([INSTANCE_A, INSTANCE_A, INSTANCE_A]);
+    expect(harness.halts.records()).toEqual([]);
+  });
+});
+
+describe("ROLLOVER-1 r7 (R7-FABLE-01): checks 16 and 17 judge the series-bound INSTANCE — window A's booked position, its filled-but-unbooked fill and its mark all reach window B's evaluation", () => {
+  /**
+   * Window A places 10 @ 0.34 at S + 5 000 and, from its `onFill`, another
+   * that fills at once and stays UNBOOKED until the next harvest; window B's
+   * first BUY (10, bound 3.50) is evaluated at S + 10 000. The instance holds
+   * 3.40 booked + 3.40 unbooked in A, so B's worst case is 10.30; B ALONE —
+   * what `95a0b76` measured — is 3.50.
+   *
+   * Check 17 (`spot.down`, −0.1): A and B are each marked from their own YES
+   * book, bid 0.32 → 0.22. The instance's 30 YES are worth 6.60 against
+   * 10.30 of cost: a loss of 3.70 (B alone: 3.50 − 2.20 = 1.30).
+   */
+  const FIRST = iso(S + 5_000);
+  const BUY10: Act = { kind: "BUY", shares: "10", style: "FAK" };
+
+  async function run(risk: RiskLimits): Promise<Harness> {
+    ordinal = 0;
+    const harness = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      risk,
+      windows: true,
+      script: scheduled({ A: { onFeatures: [[FIRST, BUY10]], onFill: [[FIRST, BUY10]] }, B: { onFeatures: [[iso(S + 10_000), BUY10]] } }),
+    });
+    await feed(harness, ...opening(), opened(S + 100, MARKET_A), opened(S + 150, MARKET_B));
+    await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+    await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+    return harness;
+  }
+
+  it("check 16: B's entry is measured at 3.40 + 3.40 + 3.50 = 10.30 — REFUSED under 10.29, ADMITTED under 10.30 (95a0b76: 3.50, admitted under both)", async () => {
+    const under = await run({ maxWorstCaseContractualLoss: "10.29" });
+    expect(outcomeOf(under)).toMatchObject({ accepted: 2, risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 }, allocator: {}, fills: ["BUY 10@0.34", "BUY 10@0.34"] });
+    expect(checkSixteen(under, "B")).toEqual(["10.3"]);
+    const judged = under.risks.find((risk) => risk.label === "B");
+    if (judged === undefined) throw new Error("B was never risk-checked");
+    // The portfolio B was judged on: A's booked position, A's unbooked fill
+    // (under the INSTANCE id), and both markets marked — B's first.
+    expect(portfolioMarkets(judged)).toEqual({
+      positions: ["A YES 10 @ 3.4"],
+      unbooked: ["A YES 10 / 3.4"],
+      marks: ["B 0.22", "A 0.22"],
+    });
+    expect(under.halts.records()).toEqual([]);
+
+    const at = await run({ maxWorstCaseContractualLoss: "10.3" });
+    expect(outcomeOf(at)).toMatchObject({ accepted: 3, risk: {}, allocator: {}, fills: ["BUY 10@0.34", "BUY 10@0.34", "BUY 10@0.34"] });
+  });
+
+  it("check 17: B's entry is measured at the instance's scenario loss, 10.30 − 30 × 0.22 = 3.70 — REFUSED under 3.69, ADMITTED under 3.70 (95a0b76: 1.30, admitted under both)", async () => {
+    const under = await run({ maxScenarioLoss: "3.69" });
+    expect(outcomeOf(under)).toMatchObject({ accepted: 2, risk: { RISK_SCENARIO_LOSS_EXCEEDED: 1 }, allocator: {} });
+    const judged = under.risks.find((risk) => risk.label === "B");
+    expect(judged?.evaluation.scenario?.worstLoss).toBe("3.7");
+    const at = await run({ maxScenarioLoss: "3.7" });
+    expect(outcomeOf(at)).toMatchObject({ accepted: 3, risk: {} });
+  });
+
+  it("a WORKING order of window A (a maker BUY of 10 resting at 0.30) is one of B's open orders: B's entry measures 3.00 + 3.50 = 6.50 — REFUSED under 6.49, ADMITTED under 6.50 (95a0b76: 3.50)", async () => {
+    async function working(limit: string): Promise<Harness> {
+      ordinal = 0;
+      const harness = assemble({
+        cadence: PAPER_EVALUATION_CADENCE,
+        perStrategyCap: "1000",
+        risk: { maxWorstCaseContractualLoss: limit },
+        windows: true,
+        script: scheduled({ A: { onFeatures: [[FIRST, { kind: "BUY", shares: "10", style: "MAKER" }]] }, B: { onFeatures: [[iso(S + 10_000), BUY10]] } }),
+      });
+      await feed(harness, ...opening(), opened(S + 100, MARKET_A), opened(S + 150, MARKET_B));
+      await feed(harness, snapshot(S + 5_000, MARKET_X, "yes"));
+      await feed(harness, snapshot(S + 10_000, MARKET_X, "yes"));
+      return harness;
+    }
+    const under = await working("6.49");
+    expect(outcomeOf(under)).toMatchObject({ accepted: 1, risk: { RISK_WORST_CASE_LOSS_EXCEEDED: 1 }, fills: [], orders: ["BUY RESTING 0/10"] });
+    expect(checkSixteen(under, "B")).toEqual(["6.5"]);
+    const judged = under.risks.find((risk) => risk.label === "B");
+    expect(judged?.document.portfolio.openOrders).toHaveLength(1);
+    const at = await working("6.5");
+    expect(outcomeOf(at)).toMatchObject({ accepted: 2, risk: {}, fills: ["BUY 10@0.34"] });
+  });
+
+  it("control: A's OWN evaluations are judged on A — B holds nothing, so A's first BUY measures 3.50 and its onFill BUY 6.90 — and two MARKET-BOUND instances in the same shape never see each other (B measures 3.50)", async () => {
+    const windows = await run({});
+    expect(checkSixteen(windows, "A")).toEqual(["3.5", "6.9"]);
+    ordinal = 0;
+    const bound = assemble({
+      cadence: PAPER_EVALUATION_CADENCE,
+      perStrategyCap: "1000",
+      script: scheduled({ A: { onFeatures: [[FIRST, BUY10]], onFill: [[FIRST, BUY10]] }, B: { onFeatures: [[iso(S + 10_000), BUY10]] } }),
+    });
+    await feed(bound, ...opening(), opened(S + 100, MARKET_A), opened(S + 150, MARKET_B));
+    await feed(bound, snapshot(S + 5_000, MARKET_X, "yes"));
+    await feed(bound, snapshot(S + 10_000, MARKET_X, "yes"));
+    expect(checkSixteen(bound, "B")).toEqual(["3.5"]);
+    const judged = bound.risks.find((risk) => risk.label === "B");
+    if (judged === undefined) throw new Error("B was never risk-checked");
+    expect(portfolioMarkets(judged)).toEqual({ positions: [], unbooked: [], marks: ["B 0.22"] });
+  });
 });

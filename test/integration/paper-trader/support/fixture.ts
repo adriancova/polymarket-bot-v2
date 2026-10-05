@@ -46,6 +46,7 @@ import {
   type IngestedEvent,
   type PaperTrader,
   type TraderStore,
+  type TraderVenue,
 } from "@polymarket-bot/trader";
 import { ManualClock, MemoryEventFeed, MemoryTraderStore } from "@polymarket-bot/trader/testing";
 import type { AdmissionNotice } from "@polymarket-bot/trader";
@@ -666,6 +667,13 @@ export function assemble(
     readonly evaluationCadence?: EvaluationCadenceOption;
     /** `ROLLOVER-1`: told of every series-window admission, refusal and teardown. */
     readonly onAdmission?: (notice: AdmissionNotice) => void;
+    /**
+     * `ROLLOVER-1` r7: the venue port the TRADER is handed, built around the
+     * fixture's real venue (`parts.venue` stays that inner venue, which the
+     * builder's book and time-in-force wiring still serve). Absent: the venue
+     * itself, as before.
+     */
+    readonly wrapVenue?: (venue: SimulatedVenue) => TraderVenue;
   } = {},
 ): { readonly result: CreateTraderResult; readonly parts: Assembled | undefined } {
   const clock = new ManualClock("2026-03-04T12:00:00.000Z");
@@ -699,7 +707,7 @@ export function assemble(
     env: options.env ?? safeEnvironment(),
     config: document,
     clock,
-    venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
+    venue: (options.wrapVenue === undefined ? venue : options.wrapVenue(venue)) as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
     store: options.wrapStore === undefined ? store : options.wrapStore(store),
     idNamespace: options.idNamespace ?? "wp-230-fixture",
     // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams

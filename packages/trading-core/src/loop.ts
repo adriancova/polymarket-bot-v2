@@ -1908,9 +1908,10 @@ export class CoreLoop {
 
   /**
    * `ROLLOVER-1` (ADR-030 Decision 4.4): tears every live window down that is
-   * DUE and IDLE — no order of any of its registrations is still tracked, and
-   * no cancel names its market. A due window that is not idle waits (counted,
-   * `teardownsBlocked`). A window is due when:
+   * DUE and IDLE — no order of any of its registrations is still tracked, no
+   * cancel names its market, and (r7, R7-FABLE-03) no allocator commitment
+   * names it (`#windowHoldsWork`). A due window that is not idle waits
+   * (counted, `teardownsBlocked`). A window is due when:
    *
    * - its market is RESOLVED. Torn down `RESOLVED` when its `onMarketResolved`
    *   reached every instance of the window in the frame that resolved it;
@@ -1972,13 +1973,31 @@ export class CoreLoop {
     }
   }
 
-  /** `ROLLOVER-1`: does a window still hold an order this process tracks, or a pending cancel? */
+  /**
+   * `ROLLOVER-1`: does a window still hold an order this process tracks, a
+   * pending cancel, or — r7 (R7-FABLE-03) — capital the allocator still holds
+   * committed against its market?
+   *
+   * The last is not reached on any ordinary path: an owned order is pruned
+   * only once settled with every filled share booked, which closes its
+   * commitment. It IS reached by a commitment that never closes — an order
+   * held without an owner (`#heldUnowned`: `TRDR-4`'s defensive path, or a
+   * lost placement answer) whose fill was booked UNATTRIBUTED. Tearing that
+   * window down would delete its market's live owner while the commitment is
+   * still re-applied at every allocator question, and every later question —
+   * every window's entry and protective exit — would be refused
+   * `CAPITAL_LIVE_OWNERSHIP_MISSING` for the rest of the run. Holding the
+   * window keeps the owner; the window is counted `teardownsBlocked`, keeps
+   * its cap slot (fail closed: fewer windows, never more), and its market
+   * stays halted `UNATTRIBUTED_ACTIVITY` for reconciliation.
+   */
   #windowHoldsWork(marketId: string): boolean {
     for (const [key, owned] of this.#instanceOrders) {
       if (owned.size === 0) continue;
       if (this.#options.registry.identityOf(key)?.marketId === marketId) return true;
     }
-    return this.#cancels.pending().some((cancel) => cancel.marketId === marketId);
+    if (this.#cancels.pending().some((cancel) => cancel.marketId === marketId)) return true;
+    return this.#options.allocator.holdsCommitmentIn(marketId);
   }
 
   /**
@@ -2819,15 +2838,18 @@ export class CoreLoop {
       // `undefined` (an unreadable reading) is OMITTED, so check 7 refuses an
       // entry `RISK_FRESHNESS_UNKNOWN`. A CANCEL keeps the constant 0.
       featuresAgeMs: admission === undefined ? 0 : admission.featuresAgeMs,
-      positions,
-      // `openOrders`, read where it always was (an owned order the venue
-      // cannot show still halts here, after check 1's halt state was read),
-      // and — `CAP-1` (ruling 2026-10-04) — §9.8 checks 16 and 17's SEPARATE
-      // `unbookedFills`: the fills of this strategy no position carries yet
-      // and no open order presents, from the allocator's own commitments.
-      // Never a position (no exit sells it), never an open order (check 18
-      // never reads it).
-      ...this.#portfolioOrdersFor(input.instance, marketConfig),
+      // `positions`, `openOrders` (read where it always was: an owned order
+      // the venue cannot show still halts here, after check 1's halt state was
+      // read), §9.8 check 17's `scenarios` and — `CAP-1` (ruling 2026-10-04) —
+      // checks 16 and 17's SEPARATE `unbookedFills`: the fills of this
+      // strategy no position carries yet and no open order presents, from the
+      // allocator's own commitments. Never a position (no exit sells it),
+      // never an open order (check 18 never reads it).
+      //
+      // `ROLLOVER-1` r7 (R7-FABLE-01): the STRATEGY INSTANCE's portfolio —
+      // this window's holdings first, then every other live window of the
+      // same instance, each marked for check 17 (`#riskPortfolioFor`).
+      ...this.#riskPortfolioFor(input.instance, input.market, positions, projection),
       exposures: allocation.exposures,
       allocation: allocation.verdict,
       recentIntentIds: Object.freeze([...this.#recentIntentIds]),
@@ -2835,7 +2857,6 @@ export class CoreLoop {
       parametersVersion: marketConfig.parametersVersion,
       modelDependentActivationAllowed:
         marketConfig.settlementReadiness.modelDependentActivationAllowed,
-      scenarios: this.#scenariosFor(input.market, marketConfig),
       ...this.#economicsFor(input.intent, input.market, marketConfig),
       referenceFeedAgeMs: this.#reference.ageMs(input.epochMs),
     });
@@ -5033,9 +5054,16 @@ export class CoreLoop {
     }
   }
 
+  /**
+   * The instance's booked positions in ONE market (`marketConfig.marketId`):
+   * its virtual lines on that market's two tokens, each at its exact FIFO cost
+   * basis. The allocator's held shares read exactly this (the evaluating
+   * window); §9.8's portfolio reads it for every live window of the instance
+   * (`#riskPortfolioFor`, `ROLLOVER-1` r7).
+   */
   #positionsFor(
     instance: RegisteredInstance,
-    marketConfig: MarketConfig,
+    marketConfig: Pick<MarketConfig, "marketId">,
     projection: LedgerProjection,
   ): readonly { readonly marketId: string; readonly side: "YES" | "NO"; readonly shares: string; readonly costBasis: string }[] {
     const yesAsset = this.#options.tokenAssetIds.get(`${marketConfig.marketId}|YES`);
@@ -5101,7 +5129,7 @@ export class CoreLoop {
    */
   #openOrdersFor(
     instance: RegisteredInstance,
-    marketConfig: MarketConfig,
+    marketConfig: Pick<MarketConfig, "marketId">,
   ): {
     readonly openOrders: readonly { readonly orderId: string; readonly marketId: string; readonly side: "YES" | "NO"; readonly action: "BUY" | "SELL"; readonly price: string; readonly shares: string }[];
     readonly presented: ReadonlyMap<string, string>;
@@ -5135,16 +5163,114 @@ export class CoreLoop {
     return { openOrders: Object.freeze(orders), presented };
   }
 
-  /** The risk portfolio's order-derived halves: its open orders and (`CAP-1`) its unbooked fills. */
+  /**
+   * The risk portfolio's order-derived halves IN ONE REGISTRATION'S MARKET:
+   * its open orders and (`CAP-1`) its unbooked fills.
+   */
   #portfolioOrdersFor(
     instance: RegisteredInstance,
-    marketConfig: MarketConfig,
+    marketConfig: Pick<MarketConfig, "marketId">,
   ): Pick<RiskInputContext, "openOrders" | "unbookedFills"> {
     const open = this.#openOrdersFor(instance, marketConfig);
     return {
       openOrders: open.openOrders,
       unbookedFills: this.#unbookedFillsFor(instance, marketConfig, open.presented),
     };
+  }
+
+  /**
+   * `ROLLOVER-1` r7 (R7-FABLE-01): the §9.8 portfolio of ONE evaluation — the
+   * STRATEGY INSTANCE's holdings, not only the evaluating window's.
+   *
+   * `packages/risk` defines the portfolio as "the strategy's own virtual
+   * position view", and check 16 (`maxWorstCaseContractualLoss`, "the primary
+   * hard limit") and check 17 (scenario loss) sum its lot set over every
+   * market in it. Before `ROLLOVER-1` one instance traded one market, so one
+   * market's view WAS the strategy's. A series-bound instance trades every
+   * live window of its series, each its own registration, and a view built
+   * from the evaluating window alone let two windows each pass a limit that
+   * the instance as a whole exceeded (the verifier's P3: two 50 @ 0.34 entries,
+   * 34 pUSD of worst case, both admitted under a limit of 20).
+   *
+   * So the portfolio is assembled over EVERY LIVE REGISTRATION OF THIS
+   * INSTANCE (`#otherLiveRegistrationsOf`):
+   *
+   * - **positions** — the booked virtual lines of each window's two tokens,
+   *   at their exact cost basis (`#positionsFor`);
+   * - **open orders** — each window's own working orders, at their unfilled
+   *   remainder (`#openOrdersFor`, keyed by REGISTRATION: each window's order
+   *   set is its own);
+   * - **unbooked fills** — each window's filled-but-unbooked BUYs, from the
+   *   allocator's commitments under the INSTANCE id (`#unbookedFillsFor`);
+   * - **scenario marks** — every one of those markets marked from its own
+   *   YES book (`#scenariosFor`). A held window whose book has no bid has no
+   *   mark, and check 17 then refuses the entry
+   *   `RISK_SCENARIO_MARKS_INCOMPLETE`: a partially-marked portfolio is not a
+   *   measured one (fail closed).
+   *
+   * Every other reader of the portfolio is PER MARKET (an exit's held shares,
+   * §6 invariant 12's unknown-position test, a quote's inventory, check 18's
+   * self-trade guard, check 20's held-near-close), so another window's
+   * holdings change nothing but the two sums. The allocator's held shares
+   * stay this window's own (`positions`, the caller's).
+   *
+   * The evaluating window comes first and the others follow by market id, so
+   * a market-bound instance — the only registration of its id — sees exactly
+   * the portfolio it saw before. A TORN-DOWN window is not live and is not
+   * here: it was torn down RESOLVED (its outcome fixed its holdings' value) or
+   * unresolved with no inventory (`#tearDownWindows`), and, since r7
+   * (R7-FABLE-03), never while a commitment names its market
+   * (`#windowHoldsWork`).
+   */
+  #riskPortfolioFor(
+    instance: RegisteredInstance,
+    market: MarketState,
+    positions: RiskInputContext["positions"],
+    projection: LedgerProjection,
+  ): Pick<RiskInputContext, "positions" | "openOrders" | "unbookedFills" | "scenarios"> {
+    const own = this.#portfolioOrdersFor(instance, market.config);
+    const others = this.#otherLiveRegistrationsOf(instance);
+    if (others.length === 0) {
+      return { positions, ...own, scenarios: this.#scenariosFor([market]) };
+    }
+    const allPositions = [...positions];
+    const openOrders = [...own.openOrders];
+    const unbookedFills = [...own.unbookedFills];
+    const marked: MarketState[] = [market];
+    for (const other of others) {
+      const scope = { marketId: other.marketId };
+      allPositions.push(...this.#positionsFor(other, scope, projection));
+      const orders = this.#portfolioOrdersFor(other, scope);
+      openOrders.push(...orders.openOrders);
+      unbookedFills.push(...orders.unbookedFills);
+      // A live registration's market is always present (attach sets it
+      // before registering; detach retires before deleting). Were it absent,
+      // its holdings would still be counted and left unmarked: check 17
+      // refuses, never passes on a missing mark.
+      const state = this.#options.markets.get(other.marketId);
+      if (state !== undefined) marked.push(state);
+    }
+    return {
+      positions: Object.freeze(allPositions),
+      openOrders: Object.freeze(openOrders),
+      unbookedFills: Object.freeze(unbookedFills),
+      scenarios: this.#scenariosFor(marked),
+    };
+  }
+
+  /**
+   * `ROLLOVER-1` r7: every OTHER live registration of `instance`'s strategy
+   * instance — for a series-bound instance its other live windows; for a
+   * market-bound one nothing (its id is its only key). In market-id order.
+   */
+  #otherLiveRegistrationsOf(instance: RegisteredInstance): readonly RegisteredInstance[] {
+    const others: RegisteredInstance[] = [];
+    for (const registration of this.#options.registry.evaluationOrder()) {
+      if (registration.instanceId !== instance.instanceId || registration.key === instance.key) continue;
+      others.push(registration);
+    }
+    others.sort((left, right) => (left.marketId < right.marketId ? -1 : left.marketId > right.marketId ? 1 : 0));
+    return others;
   }
 
   /**
@@ -5162,12 +5288,15 @@ export class CoreLoop {
    *
    * Derived by the allocator from the SAME commitments the cap check counts
    * (`AllocatorGate.unbookedExposure`), scoped like `#positionsFor` (this
-   * instance, this market). `presented` names the orders `openOrders` shows
-   * at their unfilled remainder, whose filled-but-unbooked shares belong
-   * here (`CAP-1` r1). For a commitment neither settled nor presented the
-   * venue is asked one thing only, O(1): its order's state and filled size
-   * (`#orderViewOf`). No fill page is read on this path (SIM-2: one cursor
-   * read per harvest); `CAP-1` r1: an unbooked fill is priced from the
+   * instance, ONE market: `ROLLOVER-1` r7 asks it once per live window of the
+   * instance, `#riskPortfolioFor`). The allocator's commitments name the
+   * INSTANCE id, never a window's registration key, so it is asked under
+   * `instance.instanceId` (R7-FABLE-02). `presented` names the orders
+   * `openOrders` shows at their unfilled remainder, whose filled-but-unbooked
+   * shares belong here (`CAP-1` r1). For a commitment neither settled nor
+   * presented the venue is asked one thing only, O(1): its order's state and
+   * filled size (`#orderViewOf`). No fill page is read on this path (SIM-2:
+   * one cursor read per harvest); `CAP-1` r1: an unbooked fill is priced from the
    * placement or trade answer that carried it (`#noteSeenFills`), or (r2)
    * from the fill page a harvest already read (`#readFills`), and at its
    * order's limit (never less than its debit) only when neither did. Moves
@@ -5175,7 +5304,7 @@ export class CoreLoop {
    */
   #unbookedFillsFor(
     instance: RegisteredInstance,
-    marketConfig: MarketConfig,
+    marketConfig: Pick<MarketConfig, "marketId">,
     presented: ReadonlyMap<string, string>,
   ): readonly UnbookedExposure[] {
     return this.#options.allocator.unbookedExposure({
@@ -5301,29 +5430,33 @@ export class CoreLoop {
    * policy inside a risk input. A market whose bid side is empty produces NO
    * mark, so the scenario is incomplete and `assessScenarios` refuses the
    * entry: an unmeasurable scenario is not a passed one.
+   *
+   * `ROLLOVER-1` r7 (R7-FABLE-01): one mark per market of the portfolio
+   * (`#riskPortfolioFor`: the evaluating market first, then the instance's
+   * other live windows), each from that market's OWN book. A market-bound
+   * instance passes its one market, and its scenarios are exactly as before.
    */
   #scenariosFor(
-    market: MarketState,
-    marketConfig: MarketConfig,
+    markets: readonly MarketState[],
   ): readonly {
     readonly scenarioId: string;
     readonly kind: "SPOT" | "VOLATILITY" | "TIME" | "LIQUIDITY";
     readonly marks: readonly { readonly marketId: string; readonly yesPrice: string }[];
   }[] {
-    const mark = market.bookFor("YES").topOfBook().bestBidPrice;
+    const measured: { readonly marketId: string; readonly mark: string }[] = [];
+    for (const market of markets) {
+      const mark = market.bookFor("YES").topOfBook().bestBidPrice;
+      if (mark !== undefined) measured.push({ marketId: market.config.marketId, mark });
+    }
     return Object.freeze(
       this.#options.config.scenarios.map((scenario) => ({
         scenarioId: scenario.scenarioId,
         kind: scenario.kind,
-        marks:
-          mark === undefined
-            ? Object.freeze([])
-            : Object.freeze([
-                {
-                  marketId: marketConfig.marketId,
-                  yesPrice: clampProbability(addDecimal(mark, scenario.yesPriceShock)),
-                },
-              ]),
+        marks: Object.freeze(
+          measured.map(({ marketId, mark }) =>
+            Object.freeze({ marketId, yesPrice: clampProbability(addDecimal(mark, scenario.yesPriceShock)) }),
+          ),
+        ),
       })),
     );
   }

@@ -86,7 +86,12 @@ export const ReviewedSeriesSchema = z.strictObject({
   parameters: z.strictObject({
     allowedTickSizes: z.array(decimal("POSITIVE")).min(1).max(8),
     minimumOrderSize: decimal("POSITIVE"),
-    negRisk: z.boolean(),
+    /**
+     * `ROLLOVER-1` r7 (R6-FABLE-01): `false` only, as the gateway's schema —
+     * augmented negative risk is neither read nor judged, so a review stating
+     * `true` is refused at parse (see `@polymarket-bot/universe`).
+     */
+    negRisk: z.literal(false),
     fees: z.strictObject({
       feesEnabled: z.boolean(),
       rate: decimal("NON_NEGATIVE"),

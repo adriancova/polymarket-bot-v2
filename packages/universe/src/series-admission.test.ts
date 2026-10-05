@@ -194,60 +194,76 @@ describe("judgeSeriesWindow — every other window is REFUSED, naming what diffe
 });
 
 describe("ROLLOVER-1 r5 (R5-ASTRA-01): negative-risk membership is judged on the MARKET (S-D23 lines 305, 313-315)", () => {
-  /** The recorded review with `negRisk` set to `value`, parsed so its hash is its own. */
-  function reviewedWith(value: boolean): { readonly series: ReviewedSeries; readonly hash: string } {
-    const document = reviewedBtc15mSeriesDocument();
-    const parameters = document["parameters"] as Record<string, unknown>;
-    const parsed = parseReviewedSeries({ ...document, parameters: { ...parameters, negRisk: value } });
-    if (!parsed.ok) throw new Error(parsed.issues.join("; "));
-    return { series: parsed.series, hash: parsed.configHash };
-  }
-
+  /**
+   * The judge under the recorded review (`negRisk: false`, the only value a
+   * review may state since r7, R6-FABLE-01), with the event's and the
+   * market's flags as given.
+   */
   function judgeUnder(
-    reviewedNegRisk: boolean,
     eventNegRisk: GammaWindowEventReading["eventNegRisk"],
     marketNegRisk: GammaWindowMarketReading["negRisk"],
   ): SeriesWindowVerdict {
-    const { series, hash } = reviewedWith(reviewedNegRisk);
+    const { series, hash } = reviewed();
     return judgeSeriesWindow(series, hash, recordedWindowEventReading({ eventNegRisk }, { negRisk: marketNegRisk }), recordedClobReading());
   }
 
   it("control: the recorded window (market false, event false, reviewed false) is ADMITTED", () => {
-    expect(judgeUnder(false, false, false).verdict).toBe("ADMIT");
-  });
-
-  it("control: a review that accepts negRisk true admits a window whose market AND event both state true", () => {
-    expect(judgeUnder(true, true, true).verdict).toBe("ADMIT");
+    expect(judgeUnder(false, false).verdict).toBe("ADMIT");
   });
 
   it("a market whose OWN flag is true is REFUSED, although its event's flag matches the reviewed false", () => {
-    const verdict = judgeUnder(false, false, true);
+    const verdict = judgeUnder(false, true);
     refusedFor(verdict, /Gamma Market\.negRisk is true, not the reviewed false/u);
     if (verdict.verdict === "REFUSE") expect(verdict.mismatches.join(" | ")).not.toMatch(/Event\.negRisk/u);
   });
 
   it("a market flag that is absent, null or not a boolean is REFUSED: never defaulted, never filled from the event or the review", () => {
-    refusedFor(judgeUnder(false, false, "ABSENT"), /Gamma Market\.negRisk is absent, not the reviewed false/u);
-    refusedFor(judgeUnder(false, false, null), /Gamma Market\.negRisk is null, not the reviewed false/u);
-    refusedFor(judgeUnder(false, false, "UNREADABLE"), /Gamma Market\.negRisk is unreadable, not the reviewed false/u);
-    // Under a review of true, an event of true never vouches for a missing market flag.
-    refusedFor(judgeUnder(true, true, "ABSENT"), /Gamma Market\.negRisk is absent, not the reviewed true/u);
-    refusedFor(judgeUnder(true, true, null), /Gamma Market\.negRisk is null, not the reviewed true/u);
+    refusedFor(judgeUnder(false, "ABSENT"), /Gamma Market\.negRisk is absent, not the reviewed false/u);
+    refusedFor(judgeUnder(false, null), /Gamma Market\.negRisk is null, not the reviewed false/u);
+    refusedFor(judgeUnder(false, "UNREADABLE"), /Gamma Market\.negRisk is unreadable, not the reviewed false/u);
+    // An event that states the reviewed value never vouches for a missing market flag.
+    refusedFor(judgeUnder(true, "ABSENT"), /Gamma Market\.negRisk is absent, not the reviewed false/u);
+    refusedFor(judgeUnder(true, null), /Gamma Market\.negRisk is null, not the reviewed false/u);
   });
 
   it("an event that contradicts its market is REFUSED, whichever of the two matches the review", () => {
     // The event differs from the review; the market matches it.
-    refusedFor(judgeUnder(false, true, false), /Gamma Event\.negRisk is true, not the reviewed false/u);
-    refusedFor(judgeUnder(true, false, true), /Gamma Event\.negRisk is false, not the reviewed true/u);
+    refusedFor(judgeUnder(true, false), /Gamma Event\.negRisk is true, not the reviewed false/u);
     // The market differs from the review; the event matches it.
-    refusedFor(judgeUnder(false, false, true), /Gamma Market\.negRisk is true, not the reviewed false/u);
-    refusedFor(judgeUnder(true, true, false), /Gamma Market\.negRisk is false, not the reviewed true/u);
+    refusedFor(judgeUnder(false, true), /Gamma Market\.negRisk is true, not the reviewed false/u);
   });
 
   it("a market AND event that agree with each other but not with the review are REFUSED, each named", () => {
-    const verdict = judgeUnder(false, true, true);
+    const verdict = judgeUnder(true, true);
     refusedFor(verdict, /Gamma Market\.negRisk is true/u);
     refusedFor(verdict, /Gamma Event\.negRisk is true/u);
+  });
+});
+
+describe("ROLLOVER-1 r7 (R6-FABLE-01): a review may state negRisk false ONLY — augmented negative risk (S-D23 lines 311-367) is neither read nor judged", () => {
+  function withNegRisk(value: unknown): Record<string, unknown> {
+    const document = reviewedBtc15mSeriesDocument();
+    const parameters = document["parameters"] as Record<string, unknown>;
+    return { ...document, parameters: { ...parameters, negRisk: value } };
+  }
+
+  it("a review stating negRisk TRUE is REFUSED at parse, naming the field — so no window can be admitted under it, whatever its augmentation", () => {
+    const parsed = parseReviewedSeries(withNegRisk(true));
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.issues.join(" | ")).toMatch(/negRisk/u);
+  });
+
+  it("a review stating negRisk as anything but the boolean false (null, absent, a string) is REFUSED at parse", () => {
+    for (const value of [null, "false", 0]) expect(parseReviewedSeries(withNegRisk(value)).ok).toBe(false);
+    const document = reviewedBtc15mSeriesDocument();
+    const withoutFlag = Object.fromEntries(Object.entries(document["parameters"] as Record<string, unknown>).filter(([key]) => key !== "negRisk"));
+    expect(parseReviewedSeries({ ...document, parameters: withoutFlag }).ok).toBe(false);
+  });
+
+  it("control: the recorded review (negRisk false) parses, and its hash is unchanged by the narrowing", () => {
+    const parsed = parseReviewedSeries(withNegRisk(false));
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.configHash).toBe(reviewed().hash);
   });
 });
 

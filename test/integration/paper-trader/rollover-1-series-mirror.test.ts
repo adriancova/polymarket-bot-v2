@@ -80,6 +80,7 @@ const SCHEMA_CORPUS: readonly Mutation[] = [
   ["a teardown bound of 7 days", (d) => void (d["unresolvedTeardownSeconds"] = 604_800 as never)],
   ["a teardown bound over 7 days", (d) => void (d["unresolvedTeardownSeconds"] = 604_801 as never)],
   ["a non-boolean negRisk", (d) => void (d["parameters"] = { ...d["parameters"], negRisk: "false" })],
+  ["negRisk true (r7, R6-FABLE-01: refused on both sides)", (d) => void (d["parameters"] = { ...d["parameters"], negRisk: true })],
 ];
 
 function mutated(mutation: Mutation[1]): Record<string, Record<string, unknown>> {
@@ -98,6 +99,30 @@ describe("ROLLOVER-1: the trader's series rules mirror the gateway's", () => {
     const universe = parseReviewedSeries(document).ok;
     const core = CoreSchema.safeParse(document).success;
     expect(core).toBe(universe);
+  });
+
+  it("ROLLOVER-1 r7 (R6-FABLE-01): a review stating negRisk TRUE is refused by BOTH sides — the gateway's parse, the trader's schema and the trader's configuration door — because augmented negative risk is neither read nor judged", () => {
+    const document = mutated((d) => void (d["parameters"] = { ...d["parameters"], negRisk: true }));
+    expect(parseReviewedSeries(document).ok).toBe(false);
+    expect(CoreSchema.safeParse(document).success).toBe(false);
+    const base = traderConfig();
+    const instance = (base["instances"] as Record<string, unknown>[])[0] ?? {};
+    const rest = Object.fromEntries(Object.entries(instance).filter(([key]) => key !== "marketId"));
+    const config = (series: unknown): ReturnType<typeof parseTraderConfig> =>
+      parseTraderConfig({
+        ...base,
+        markets: [],
+        instances: [],
+        series: [series],
+        seriesInstances: [
+          { ...rest, instanceId: "c18f4a7e-1111-7abc-8def-0123456789ab", runId: "018f4a7e-1212-7abc-8def-0123456789ab", seriesId: "btc-15m-updown" },
+        ],
+      });
+    const refused = config(document);
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.refusal.issues.join(" | ")).toMatch(/negRisk/u);
+    // Control: the recorded review (negRisk false) passes the same door.
+    expect(config(coreDocument()).ok).toBe(true);
   });
 
   it("the corpus exercises both answers", () => {
