@@ -126,6 +126,23 @@ describe("the local deadline (monotonic, from the instant before the call)", () 
     expect(await authority.renew()).toBe("NOT_HELD");
   });
 
+  it("a renewal the database APPLIED but whose answer was lost: the local deadline stands, the grant lapses, and it is never renewed again although the database would still accept it", async () => {
+    const { clock, store, authority } = setup();
+    const acquired = await authority.acquire();
+    if (acquired.kind !== "ACQUIRED") throw new Error("not acquired");
+    await clock.advance(20_000);
+    store.loseNextRenewAnswer = true;
+    expect(await authority.renew()).toBe("UNKNOWN");
+    // The database extended the lease to +50 s; the process still believes +28 s.
+    await clock.advance(8_000);
+    expect(authority.check()).toMatchObject({ held: false, reason: "EXPIRED" });
+    expect(store.attemptAccepted(acquired.fence)).toBe(true);
+    const asked = store.calls.length;
+    expect(await authority.renew()).toBe("NOT_HELD");
+    expect(store.calls.length).toBe(asked);
+    expect(authority.check().held).toBe(false);
+  });
+
   it("the local deadline never falls after the database's expiry", async () => {
     const { clock, store, authority } = setup();
     const acquired = await authority.acquire();

@@ -214,9 +214,11 @@ export class FencingAuthority {
   /** Extend the grant. A lost grant is never renewed: only a new acquisition restores authority. */
   async renew(): Promise<RenewResult> {
     const grant = this.#grant;
-    if (grant === null || this.#lost !== null) return "NOT_HELD";
-    // A deadline that has passed is lost now, whatever the database would say.
-    if (!this.check().held && this.#lost !== null) return "NOT_HELD";
+    if (grant === null) return "NOT_HELD";
+    // A deadline that has passed is lost now (`check` latches it), whatever the database would say; a lost grant is
+    // never renewed, even when the database would still accept it (a renewal it applied but whose answer was lost).
+    this.check();
+    if (this.#lost !== null) return "NOT_HELD";
     if (this.#renewing) return "IN_PROGRESS";
     this.#renewing = true;
     try {

@@ -118,6 +118,8 @@ export class MemoryFencingStore implements FencingLeasePort {
   readonly rows: LeaseRow[] = [];
   readonly #highWater = new Map<string, bigint>();
   down = false;
+  /** The next renewal is APPLIED, and then its answer is lost (the call rejects). */
+  loseNextRenewAnswer = false;
   /** Calls, in order, for assertions (e.g. that a refused run mode reached nothing). */
   readonly calls: string[] = [];
   #ids = 0;
@@ -193,6 +195,10 @@ export class MemoryFencingStore implements FencingLeasePort {
     const row = this.#find(ref);
     if (row === undefined || row.status !== "ACTIVE" || row.expiresAtMs <= this.dbNowMs()) return { kind: "LOST" };
     row.expiresAtMs = this.dbNowMs() + ttlMs;
+    if (this.loseNextRenewAnswer) {
+      this.loseNextRenewAnswer = false;
+      throw new Error("connection reset after commit (synthetic)");
+    }
     return { kind: "RENEWED", expiresAt: new Date(row.expiresAtMs).toISOString() };
   }
 

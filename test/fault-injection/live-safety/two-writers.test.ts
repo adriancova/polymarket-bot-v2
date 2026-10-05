@@ -34,6 +34,7 @@ describe("two live writers cannot both hold authority", () => {
     expect((await b.safety.acquireFence()).kind).toBe("HELD_ELSEWHERE");
 
     let bothPermitted = 0;
+    let bothHeld = 0;
     const tick = async (ms: number): Promise<void> => {
       for (let elapsed = 0; elapsed < ms; elapsed += 250) {
         await a.step(125);
@@ -43,6 +44,8 @@ describe("two live writers cannot both hold authority", () => {
         const sendA = a.safety.gate({ kind: "TRANSMISSION" }).permitted;
         const sendB = b.safety.gate({ kind: "TRANSMISSION" }).permitted;
         if ((gateA && gateB) || (sendA && sendB)) bothPermitted += 1;
+        // The fence ALONE (not the health lease, which a dead process also fails): never held by both at once.
+        if (a.safety.currentFence() !== null && b.safety.currentFence() !== null) bothHeld += 1;
         expect(store.activeHolders("acct-1").length).toBeLessThanOrEqual(1);
       }
     };
@@ -80,5 +83,6 @@ describe("two live writers cannot both hold authority", () => {
     expect(store.attemptAccepted(aFence)).toBe(false);
     expect(store.attemptAccepted(b.safety.currentFence())).toBe(true);
     expect(bothPermitted).toBe(0);
+    expect(bothHeld).toBe(0);
   });
 });
