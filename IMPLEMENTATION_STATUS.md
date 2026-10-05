@@ -55,6 +55,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-310` is Complete (2026-10-03, `fdf27ff`); see [Work packages](#work-packages). `WP-320` still needs `WP-290` and the heartbeat ADR (`V3-C12-HEARTBEAT-ADR`).
 - `ROLLOVER-1` is Complete (2026-10-05, `ae11daa`); see [Work packages](#work-packages). One run admits each reviewed window and spans many windows. Its owed governance records are in `ROLLOVER1-OWED`.
 - `RTDS-RETIRE` is Complete (2026-10-05, `81f683a`); see [Work packages](#work-packages). The gateway refuses any `rtds` key; the historical readers are kept.
+- **`FLAKE-KS-1`**: Ready (authorized) 2026-10-05. It fixes `FLAKE-KILLSWITCH-ENGAGE` in one test file, with no product change and no weakened assertion. Verifier: gpt-6-astra.
 - **`GOV-NOTES-3`**: Ready (authorized) 2026-10-05. A docs-only round for `ROLLOVER1-OWED`: a dated ADR-030 amendment recording ROLLOVER-1's admission policies as interim rulings; the records for `SeriesWindowAdmitted@1` (domain.md, protected-contracts.md, the work plan); and an interim ADR-023 ruling on the market-less `incidentReferenceId`. Verifiers: Opus and gpt-6-astra, reconciled.
 - `WP-290` is Complete (2026-10-04, `7a53988`); see [Work packages](#work-packages). `WP-320`'s dependencies are now met (`WP-260`, `WP-290`, `WP-310`; ADR-033 Accepted for D1–D4 and D6).
 - `WP-320` is Complete (2026-10-05, `ed6e5a0`); see [Work packages](#work-packages). `WP-330` (the independent emergency CLI) is unblocked: `WP-260`, `WP-290` and `WP-320` are done.
