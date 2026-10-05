@@ -9,6 +9,9 @@
  * - NO TRANSPORT (ADR-033 D2, D5): no module references WP-320's heartbeat
  *   controller or transport, or names the heartbeat route; no module but the
  *   composition imports a network module.
+ * - THE SHIPPED ENTRY (WP-330 r0): `src/main.ts`, the file the ADR-018 bundle
+ *   is built from, is scanned with the rest; it touches no `process` and only
+ *   hands its URL to the composition's single entry guard.
  * - THE CREDENTIAL BOUNDARY (§15; ADR-010 §3): only `main.ts` touches the
  *   `process` global; the environment names it reads are exactly the three
  *   ops names (plus the run-mode record handed whole to WP-260's gate), and
@@ -35,8 +38,11 @@ import { AUDIT_LOG_ENV, CONFIG_ENV, DATABASE_URL_ENV } from "./main.js";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.resolve(HERE, "..");
 
+/** The bundle's entry (`build` bundles `src/main.ts`), outside `emergency/`. */
+const SHIPPED_ENTRY = path.join(SRC, "main.ts");
+
 function productionFiles(): string[] {
-  const out: string[] = [];
+  const out: string[] = [SHIPPED_ENTRY];
   const walk = (directory: string): void => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const full = path.join(directory, entry.name);
@@ -87,7 +93,22 @@ describe("the emergency CLI's production source", () => {
 
   it("is the set this scan expects (non-vacuity)", () => {
     const names = files.map((file) => path.relative(HERE, file));
-    expect(names).toEqual(expect.arrayContaining(["run.ts", "main.ts", "commands/cancel.ts", "commands/reconcile.ts", "commands/stop-heartbeat.ts", "audit-log.ts"]));
+    expect(names).toEqual(expect.arrayContaining(["../main.ts", "run.ts", "main.ts", "commands/cancel.ts", "commands/reconcile.ts", "commands/stop-heartbeat.ts", "audit-log.ts"]));
+  });
+
+  it("THE SHIPPED ENTRY: src/main.ts imports only the composition, touches no `process`, and hands its own URL to the single entry guard", () => {
+    const text = readFileSync(SHIPPED_ENTRY, "utf8");
+    const found = scan(text, SHIPPED_ENTRY);
+    expect(found.imports).toEqual(["./emergency/main.js"]);
+    expect(found.processUses).toBe(0);
+    expect(text).toContain("await runIfProcessEntry(import.meta.url);");
+    // The composition runs nothing at load (no top-level `if` or statement
+    // expression, so no entry guard of its own): exactly one guard per bundle.
+    const composition = ts.createSourceFile("main.ts", readFileSync(path.join(HERE, "main.ts"), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    expect(composition.statements.filter((statement) => ts.isIfStatement(statement) || ts.isExpressionStatement(statement)).map((statement) => statement.getText().slice(0, 60))).toEqual([]);
+    // The entry's one statement is that call (non-vacuity of the detector).
+    const entry = ts.createSourceFile("entry.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    expect(entry.statements.filter((statement) => ts.isExpressionStatement(statement))).toHaveLength(1);
   });
 
   it("INDEPENDENCE: imports neither the trader, the trading core nor the control API, by name or by path", () => {
@@ -114,7 +135,7 @@ describe("the emergency CLI's production source", () => {
   it("THE CREDENTIAL BOUNDARY: only main.ts touches `process`; it reads exactly the three ops names, none sensitive", () => {
     for (const file of files) {
       const found = scan(readFileSync(file, "utf8"), file);
-      if (path.basename(file) !== "main.ts") expect(found.processUses, path.relative(HERE, file)).toBe(0);
+      if (path.relative(HERE, file) !== "main.ts") expect(found.processUses, path.relative(HERE, file)).toBe(0);
     }
     const names = [AUDIT_LOG_ENV, CONFIG_ENV, DATABASE_URL_ENV];
     expect(names).toEqual(["OPS_CLI_AUDIT_LOG", "OPS_CLI_CONFIG", "OPS_CLI_DATABASE_URL"]);

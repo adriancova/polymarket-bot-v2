@@ -73,9 +73,9 @@
  *   `EventBusUnavailableError`, and the process dies with exit 1 and a stack
  *   trace. That behaviour belongs to the trader's source, not its bundle, and
  *   is reported rather than pinned.
- * - `apps/ops-cli` ships no bundle (ADR-018 §4 exception). The first test
- *   below fails if any other app starts shipping one without being listed
- *   here.
+ * - Every app whose `build` is an esbuild bundle is listed in
+ *   {@link BUNDLED_APPS}; the first test below fails if another app starts
+ *   shipping one without being listed here.
  *
  * A SECOND ENTRY IN ONE APP (`REGISTER-1`, 2026-09-28). `apps/trader` ships a
  * second bundle: the operator registration command, `src/register/main.ts`,
@@ -96,7 +96,7 @@
  * space, and it still refuses.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,13 +104,15 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { EXIT_USAGE as BACKTEST_EXIT_USAGE } from "../../../apps/backtest-cli/src/main.js";
 import { EXIT_CODES as CONTROL_API_EXIT_CODES } from "../../../apps/control-api/src/main.js";
+import { AUDIT_SCHEMA as OPS_CLI_AUDIT_SCHEMA } from "../../../apps/ops-cli/src/emergency/audit-log.js";
+import { EXIT_CODES as OPS_CLI_EXIT_CODES } from "../../../apps/ops-cli/src/emergency/exit-codes.js";
 import { EXIT_CODES as TRADER_EXIT_CODES } from "../../../apps/trader/src/main.js";
 import { REGISTER_EXIT_CODES } from "../../../apps/trader/src/register/main.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 /** Every app that ships an ADR-018 esbuild bundle. */
-const BUNDLED_APPS = ["trader", "data-gateway", "control-api", "backtest-cli", "research-worker"] as const;
+const BUNDLED_APPS = ["trader", "data-gateway", "control-api", "backtest-cli", "research-worker", "ops-cli"] as const;
 type BundledApp = (typeof BUNDLED_APPS)[number];
 
 /**
@@ -226,7 +228,7 @@ async function bundleScripts(app: BundledApp): Promise<BundleScripts> {
 }
 
 describe("the bundles the runnable apps ship (ADR-018)", () => {
-  it("every app whose build is an esbuild bundle is covered here, and ops-cli still is not one", async () => {
+  it("every app whose build is an esbuild bundle is covered here (ops-cli since WP-330 r0)", async () => {
     const entries = await readdir(path.join(repoRoot, "apps"), { withFileTypes: true });
     const bundled: string[] = [];
     for (const entry of entries) {
@@ -319,11 +321,18 @@ const liveChildren = new Set<ChildProcess>();
 function runChild(
   command: string,
   args: readonly string[],
-  options: { readonly cwd: string; readonly env: NodeJS.ProcessEnv; readonly deadlineMs: number },
+  options: {
+    readonly cwd: string;
+    readonly env: NodeJS.ProcessEnv;
+    readonly deadlineMs: number;
+    /** Close this end of the child's stdout at once, so its first write fails with `EPIPE`. */
+    readonly closeStdout?: boolean;
+  },
 ): Promise<ChildOutcome> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"] });
     liveChildren.add(child);
+    if (options.closeStdout === true) child.stdout.destroy();
     const chunks: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
     const bytes = { stdout: 0, stderr: 0 };
     let error: Error | undefined;
@@ -406,6 +415,15 @@ async function copyOf(bundle: BuiltBundle, relative: string): Promise<string> {
   if (!file.startsWith(`${bundle.directory}${path.sep}`)) throw new Error(`${relative} leaves the bundle directory`);
   await mkdir(path.dirname(file), { recursive: true });
   await copyFile(bundle.file, file);
+  return file;
+}
+
+/** A symbolic link to a built bundle at `relative` under its directory (a case's `linkAs`). */
+async function linkOf(bundle: BuiltBundle, relative: string): Promise<string> {
+  const file = path.join(bundle.directory, relative);
+  if (!file.startsWith(`${bundle.directory}${path.sep}`)) throw new Error(`${relative} leaves the bundle directory`);
+  await mkdir(path.dirname(file), { recursive: true });
+  await symlink(bundle.file, file);
   return file;
 }
 
@@ -497,6 +515,16 @@ interface BundleCase {
    * residual).
    */
   readonly runAs?: string;
+  /**
+   * Run through a SYMBOLIC LINK to the built bundle at this path, relative to
+   * the bundle's directory: Node names its main module by the link's target,
+   * so only a guard that resolves the path it was given still fires.
+   */
+  readonly linkAs?: string;
+  /** Close the child's stdout before it writes anything (`EPIPE` on its first write). */
+  readonly closeStdout?: boolean;
+  /** ops-cli: the audit log the run must leave behind (see {@link AuditExpectation}). */
+  readonly audit?: AuditExpectation;
   readonly name: string;
   readonly argv: readonly string[];
   readonly env: Readonly<Record<string, string>>;
@@ -505,6 +533,191 @@ interface BundleCase {
   readonly printed: readonly string[];
   /** Lines that must NOT appear. */
   readonly notPrinted: readonly string[];
+}
+
+/*
+ * OPS-CLI (`WP-330` r0, the orchestrator's 2026-10-05 grant). Until WP-330,
+ * `apps/ops-cli` was the ADR-018 §4 exception: its `tsc` build ran because
+ * its executable path imported no workspace package. The emergency CLI does
+ * (WP-260's signer gate, WP-290's coordinator, WP-320's lease store), so its
+ * `tsc` output crashed with `ERR_MODULE_NOT_FOUND`, and it now ships the
+ * bundle §4 requires: the trader's `build` flags and banner byte for byte,
+ * over its own `src/main.ts`, reusing the workspace's pinned esbuild. The
+ * forcing dependency for the banner is `pg`, through
+ * `packages/storage-postgres`: without it the bundle dies at load with
+ * `Dynamic require of "events"`. `verify-venue` keeps its own `tsc` path.
+ *
+ * Its cases run the bundle in PAPER with no credential, one per emergency
+ * command, and each must refuse with WP-260's gate (`RUN_MODE_REFUSED`) AND
+ * leave its audit log: exactly `INVOKED` then `OUTCOME`, under one invocation
+ * id, the OUTCOME naming the exit. So the bundle runs exactly one invocation
+ * per process. Its entry guard compares URLs, never names: a renamed copy and
+ * a symlink without an extension still run. And a stdout closed before the
+ * first write (`EPIPE`) changes neither the exit nor the log.
+ *
+ * This header is kept below the imports on purpose: the control API's
+ * CONTROL-1b r4 guard pins the line of this file's control-api import.
+ */
+
+/**
+ * The audit log an ops-cli run must leave, read after it exits: one JSON
+ * record per line, every one under the same invocation id (one invocation per
+ * process), numbered 0, 1, … in order.
+ */
+interface AuditExpectation {
+  /** The log's path, relative to the bundle's directory (the run's working directory). */
+  readonly file: string;
+  /** The records' phases, in order; empty: no log is written at all. */
+  readonly phases: readonly string[];
+  /** The command every record names. */
+  readonly command?: string;
+  /** The OUTCOME record's exit name. */
+  readonly exit?: keyof typeof OPS_CLI_EXIT_CODES;
+}
+
+/** A PAPER process, explicitly: the four defaults, and the run mode itself. */
+const OPS_CLI_PAPER = { ...SAFE_PAPER_DEFAULTS, RUN_MODE: "PAPER" } as const;
+const OPS_CLI_ACCOUNT = "acct-bundle";
+const OPS_CLI_WHO = ["--account", OPS_CLI_ACCOUNT, "--operator", "operator-bundle"] as const;
+const OPS_CLI_WHY = ["--reason", "bundle-load pin"] as const;
+const OPS_CLI_CONDITION = `0x${"c".repeat(64)}`;
+/** What WP-260's gate prints for a PAPER process, and what no refused run may print. */
+const OPS_CLI_PAPER_REFUSAL = [
+  "REFUSED by WP-260's signer gate (RUN_MODE_REQUIRES_NO_SIGNER, REAL_ORDERS_NOT_ALLOWED)",
+  "nothing was read, sent or written but this audit record",
+  `RUN_MODE_REFUSED (exit ${String(OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED)})`,
+] as const;
+const OPS_CLI_NEVER_IN_A_REFUSAL = ["permitted by WP-260's signer gate", "PLAN:", "CONFIRMATION:", "RESULT:"] as const;
+
+/**
+ * One case per venue-touching command (and stop-heartbeat, whose lease store
+ * is refused the same way): PAPER, no credential, the audit log named by the
+ * environment (cancel-all's dry run names it with `--audit-log` instead).
+ */
+const OPS_CLI_REFUSED_COMMANDS: readonly { readonly command: string; readonly argv: readonly string[]; readonly printed?: readonly string[] }[] = [
+  { command: "cancel-order", argv: ["cancel-order", "bundle-order-1", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", "cancel-order:bundle-order-1"] },
+  {
+    command: "cancel-market",
+    argv: ["cancel-market", OPS_CLI_CONDITION, "--asset", "1111", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-market:${OPS_CLI_CONDITION}:1111`],
+  },
+  { command: "cancel-all", argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-all:${OPS_CLI_ACCOUNT}`] },
+  { command: "account-snapshot", argv: ["account-snapshot", ...OPS_CLI_WHO] },
+  { command: "reconcile", argv: ["reconcile", ...OPS_CLI_WHO] },
+  {
+    command: "stop-heartbeat",
+    argv: ["stop-heartbeat", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `stop-heartbeat:${OPS_CLI_ACCOUNT}:no-lease`],
+    printed: [
+      "stop-heartbeat revokes the account's ACTIVE fencing lease (WP-320 FencingLeaseStore.revoke)",
+      "10–15 s after the last valid heartbeat (ADR-033 D6). Documented, not observed",
+      "there is nothing to revoke",
+    ],
+  },
+];
+
+const OPS_CLI_CASES: readonly BundleCase[] = [
+  {
+    app: "ops-cli",
+    name: "--help prints the usage, writes no audit log and reads nothing",
+    argv: ["--help"],
+    env: { OPS_CLI_AUDIT_LOG: "audit-help.jsonl" },
+    exitCode: OPS_CLI_EXIT_CODES.COMPLETED,
+    printed: [
+      "usage: ops-cli <command> [operand] --account <ref> --operator <ref> [options]",
+      "PAPER only in this repository: every venue command runs WP-260's signer gate first and refuses in PAPER,",
+    ],
+    notPrinted: ["REFUSED", "record(s) written"],
+    audit: { file: "audit-help.jsonl", phases: [] },
+  },
+  ...OPS_CLI_REFUSED_COMMANDS.map(
+    (entry): BundleCase => ({
+      app: "ops-cli",
+      name: `${entry.command} in PAPER with no credential: refused by WP-260's gate, INVOKED and OUTCOME audited`,
+      argv: entry.argv,
+      env: { ...OPS_CLI_PAPER, OPS_CLI_AUDIT_LOG: `audit-${entry.command}.jsonl` },
+      exitCode: OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED,
+      printed: [...OPS_CLI_PAPER_REFUSAL, ...(entry.printed ?? []), `2 record(s) written and fsynced to audit-${entry.command}.jsonl`],
+      notPrinted: OPS_CLI_NEVER_IN_A_REFUSAL,
+      audit: { file: `audit-${entry.command}.jsonl`, phases: ["INVOKED", "OUTCOME"], command: entry.command, exit: "RUN_MODE_REFUSED" },
+    }),
+  ),
+  {
+    app: "ops-cli",
+    name: "cancel-all --dry-run in PAPER, the log named by --audit-log: the gate refuses before any plan",
+    argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--dry-run", "--audit-log", "audit-cancel-all-dry-run.jsonl"],
+    env: { ...OPS_CLI_PAPER },
+    exitCode: OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED,
+    printed: [...OPS_CLI_PAPER_REFUSAL, "2 record(s) written and fsynced to audit-cancel-all-dry-run.jsonl"],
+    notPrinted: [...OPS_CLI_NEVER_IN_A_REFUSAL, "--confirm cancel-all:"],
+    audit: { file: "audit-cancel-all-dry-run.jsonl", phases: ["INVOKED", "OUTCOME"], command: "cancel-all", exit: "RUN_MODE_REFUSED" },
+  },
+  {
+    app: "ops-cli",
+    name: "cancel-all with an EMPTY environment (the repository defaults): refused by the gate, audited",
+    argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-all:${OPS_CLI_ACCOUNT}`],
+    env: { OPS_CLI_AUDIT_LOG: "audit-empty-environment.jsonl" },
+    exitCode: OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED,
+    printed: ["REFUSED by WP-260's signer gate (RUN_MODE_UNKNOWN, REAL_ORDERS_NOT_ALLOWED)", `RUN_MODE_REFUSED (exit ${String(OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED)})`],
+    notPrinted: OPS_CLI_NEVER_IN_A_REFUSAL,
+    audit: { file: "audit-empty-environment.jsonl", phases: ["INVOKED", "OUTCOME"], command: "cancel-all", exit: "RUN_MODE_REFUSED" },
+  },
+  {
+    app: "ops-cli",
+    name: "cancel-all with NO audit log named: refused before anything, AUDIT_UNAVAILABLE",
+    argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-all:${OPS_CLI_ACCOUNT}`],
+    env: { ...OPS_CLI_PAPER },
+    exitCode: OPS_CLI_EXIT_CODES.AUDIT_UNAVAILABLE,
+    printed: ["REFUSED: no audit log: pass --audit-log <path> or set OPS_CLI_AUDIT_LOG. Nothing is done unaudited", `AUDIT_UNAVAILABLE (exit ${String(OPS_CLI_EXIT_CODES.AUDIT_UNAVAILABLE)})`],
+    notPrinted: OPS_CLI_NEVER_IN_A_REFUSAL,
+  },
+  {
+    app: "ops-cli",
+    runAs: "renamed copy/pmb-ops-renamed.mjs",
+    name: "a RENAMED copy, in a directory whose name holds a space, still runs (the entry guard is not keyed on the file name)",
+    argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-all:${OPS_CLI_ACCOUNT}`],
+    env: { ...OPS_CLI_PAPER, OPS_CLI_AUDIT_LOG: "audit-renamed.jsonl" },
+    exitCode: OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED,
+    printed: OPS_CLI_PAPER_REFUSAL,
+    notPrinted: OPS_CLI_NEVER_IN_A_REFUSAL,
+    audit: { file: "audit-renamed.jsonl", phases: ["INVOKED", "OUTCOME"], command: "cancel-all", exit: "RUN_MODE_REFUSED" },
+  },
+  {
+    app: "ops-cli",
+    linkAs: "linked dir/pmb-emergency",
+    name: "a SYMLINK with no extension (an operator's bin entry), in a directory whose name holds a space, still runs (the guard resolves the path it was given)",
+    argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-all:${OPS_CLI_ACCOUNT}`],
+    env: { ...OPS_CLI_PAPER, OPS_CLI_AUDIT_LOG: "audit-symlink.jsonl" },
+    exitCode: OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED,
+    printed: OPS_CLI_PAPER_REFUSAL,
+    notPrinted: OPS_CLI_NEVER_IN_A_REFUSAL,
+    audit: { file: "audit-symlink.jsonl", phases: ["INVOKED", "OUTCOME"], command: "cancel-all", exit: "RUN_MODE_REFUSED" },
+  },
+  {
+    app: "ops-cli",
+    closeStdout: true,
+    name: "a stdout CLOSED before the first write (EPIPE) kills nothing: the same exit, and both records are still written",
+    argv: ["cancel-all", ...OPS_CLI_WHO, ...OPS_CLI_WHY, "--confirm", `cancel-all:${OPS_CLI_ACCOUNT}`],
+    env: { ...OPS_CLI_PAPER, OPS_CLI_AUDIT_LOG: "audit-closed-stdout.jsonl" },
+    exitCode: OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED,
+    // stdout is gone; stderr must stay empty of any crash (checked for every case).
+    printed: [],
+    notPrinted: ["EPIPE", "Unhandled 'error' event"],
+    audit: { file: "audit-closed-stdout.jsonl", phases: ["INVOKED", "OUTCOME"], command: "cancel-all", exit: "RUN_MODE_REFUSED" },
+  },
+];
+
+/** The records of an ops-cli audit log, or none when the file was never created. */
+async function auditRecords(file: string): Promise<readonly Record<string, unknown>[]> {
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return text
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 const CASES: readonly BundleCase[] = [
@@ -681,11 +894,17 @@ const CASES: readonly BundleCase[] = [
     ],
     notPrinted: [],
   },
+  ...OPS_CLI_CASES,
 ];
 
 describe.concurrent("each app's bundle, built by its own build script, loads and reaches its own startup path", () => {
   it("every bundled app has at least one case", ({ expect: localExpect }) => {
     localExpect([...new Set(CASES.map((entry) => entry.app))].sort()).toEqual([...BUNDLED_APPS].sort());
+  });
+
+  it("ops-cli: every emergency command has a PAPER refusal case that checks its audit log (WP-330 r0)", ({ expect: localExpect }) => {
+    const covered = CASES.flatMap((entry) => (entry.app === "ops-cli" && entry.exitCode === OPS_CLI_EXIT_CODES.RUN_MODE_REFUSED && entry.audit?.command !== undefined ? [entry.audit.command] : []));
+    localExpect([...new Set(covered)].sort()).toEqual(["account-snapshot", "cancel-all", "cancel-market", "cancel-order", "reconcile", "stop-heartbeat"]);
   });
 
   it("every secondary entry has at least one case (REGISTER-1)", ({ expect: localExpect }) => {
@@ -699,11 +918,13 @@ describe.concurrent("each app's bundle, built by its own build script, loads and
       `${entry.bundle ?? entry.app}: ${entry.name}`,
       async ({ expect: localExpect }) => {
         const bundle = await bundleFor(entry.bundle ?? entry.app);
-        const file = entry.runAs === undefined ? bundle.file : await copyOf(bundle, entry.runAs);
+        const file =
+          entry.runAs !== undefined ? await copyOf(bundle, entry.runAs) : entry.linkAs !== undefined ? await linkOf(bundle, entry.linkAs) : bundle.file;
         const outcome = await runChild(process.execPath, [file, ...entry.argv], {
           cwd: bundle.directory,
           env: { ...entry.env },
           deadlineMs: RUN_DEADLINE_MS,
+          ...(entry.closeStdout === true ? { closeStdout: true } : {}),
         });
         const report = describeOutcome(`node ${file} ${entry.argv.join(" ")}`, outcome);
         const output = `${outcome.stdout}${outcome.stderr}`;
@@ -712,6 +933,25 @@ describe.concurrent("each app's bundle, built by its own build script, loads and
         localExpect(outcome.status, report).toBe(entry.exitCode);
         for (const line of entry.printed) localExpect(output, report).toContain(line);
         for (const line of entry.notPrinted) localExpect(output, report).not.toContain(line);
+        if (entry.audit !== undefined) {
+          const records = await auditRecords(path.join(bundle.directory, entry.audit.file));
+          const audited = `${report}\n--- audit ---\n${JSON.stringify(records, null, 1)}`;
+          localExpect(records.map((record) => record["phase"]), audited).toEqual(entry.audit.phases);
+          // One invocation per process, its records numbered in order.
+          localExpect(new Set(records.map((record) => record["invocationId"])).size, audited).toBe(Math.min(records.length, 1));
+          localExpect(records.map((record) => record["sequence"]), audited).toEqual(records.map((_record, index) => index));
+          for (const record of records) {
+            localExpect(record["schema"], audited).toBe(OPS_CLI_AUDIT_SCHEMA);
+            if (entry.audit.command !== undefined) localExpect(record["command"], audited).toBe(entry.audit.command);
+          }
+          const last = records.at(-1);
+          if (entry.audit.exit !== undefined) {
+            localExpect(last?.["detail"], audited).toMatchObject({ exit: entry.audit.exit, exitCode: OPS_CLI_EXIT_CODES[entry.audit.exit] });
+          }
+          if (entry.audit.exit === "RUN_MODE_REFUSED") {
+            localExpect(records[0]?.["detail"], audited).toMatchObject({ gate: { permitted: false } });
+          }
+        }
       },
       CASE_TIMEOUT_MS,
     );

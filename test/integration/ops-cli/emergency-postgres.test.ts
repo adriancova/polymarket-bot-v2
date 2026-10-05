@@ -13,13 +13,20 @@
  *    connection, no tripwire): cancel-all completes from venue truth and the
  *    emergency credential alone, with the real PostgreSQL audit mirror failing
  *    beside it. No trader process exists in this test.
+ * 4. The SHIPPED BUNDLE (WP-330 r0; ADR-018 §4), built by the app's own
+ *    `build` script and run as a child process in PAPER: refused by the gate,
+ *    and both audit records land in this database through the BUNDLED `pg`
+ *    driver. `pg` loads `net` only when it connects (`pg/lib/stream.js`), so
+ *    this, not a load check, is what proves the bundle's `createRequire`
+ *    banner serves the driver's connect path.
  *
  * Throwaway container credentials only. The lease is a DATABASE ROW acquired
  * with live-shaped inputs (the WP-320 `fencing-race` precedent): no order, no
  * heartbeat and no venue call exists anywhere in this file.
  */
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -27,8 +34,8 @@ import { createDatabase, createFencingLeaseStore, createPostgresPool, type Fenci
 import { createIsolatedDatabase, createMigratedContext, startPostgresContainer, type TestContext } from "@polymarket-bot/storage-postgres/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createFileAuditLog, createPostgresAuditMirror, runOpsCli, type AuditRecord } from "../../../apps/ops-cli/src/emergency/index.js";
-import { ACCOUNT, args, DESTRUCTIVE_REASON, harness, LIVE_FLAGS, NON_INTERACTIVE, OPERATOR, order } from "../../../apps/ops-cli/src/emergency/harness.test-support.js";
+import { createFileAuditLog, createPostgresAuditMirror, EXIT_CODES, runOpsCli, type AuditRecord } from "../../../apps/ops-cli/src/emergency/index.js";
+import { ACCOUNT, args, DESTRUCTIVE_REASON, harness, LIVE_FLAGS, NON_INTERACTIVE, OPERATOR, order, REPO_ROOT } from "../../../apps/ops-cli/src/emergency/harness.test-support.js";
 import { AUDIT_LOG_ENV, DATABASE_URL_ENV, main } from "../../../apps/ops-cli/src/emergency/main.js";
 
 let container: Awaited<ReturnType<typeof startPostgresContainer>>;
@@ -168,6 +175,91 @@ describe("acceptance 1, with a database that is really unreachable", () => {
       expect(h.text()).toMatch(/database copy \(ops\.config_change_audit\): 0 landed/u);
     } finally {
       await Promise.race([unreachable.destroy().catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    }
+  });
+});
+
+interface ChildRun {
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** Runs a child process asynchronously (CI-1: never a synchronous child in a vitest worker), killed past 60 s. */
+function runChild(command: string, argv: readonly string[], options: { readonly cwd: string; readonly env: NodeJS.ProcessEnv }): Promise<ChildRun> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, argv, { cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => void stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => void stderr.push(chunk));
+    const deadline = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`${command} did not finish within 60 s`));
+    }, 60_000);
+    child.on("error", (cause) => {
+      clearTimeout(deadline);
+      reject(cause);
+    });
+    child.on("close", (status) => {
+      clearTimeout(deadline);
+      resolve({ status, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") });
+    });
+  });
+}
+
+describe("the SHIPPED bundle against the real database (WP-330 r0; ADR-018 §4)", () => {
+  it("built by the app's own build script and run as a child in PAPER: refused by the gate, and both records land in ops.config_change_audit through the BUNDLED pg driver", async () => {
+    const appDirectory = path.join(REPO_ROOT, "apps", "ops-cli");
+    const manifest = JSON.parse(await readFile(path.join(appDirectory, "package.json"), "utf8")) as { readonly scripts?: Readonly<Record<string, string>> };
+    const build = manifest.scripts?.["build"] ?? "";
+    expect(build.startsWith("esbuild src/main.ts ")).toBe(true);
+    expect(build.split("--outfile=dist/")).toHaveLength(2);
+    const directory = await realpath(await mkdtemp(path.join(tmpdir(), "ops-cli-bundle-")));
+    // Substituted into a `sh -c` script unquoted, so it must be shell-safe.
+    expect(directory).toMatch(/^[A-Za-z0-9_./-]+$/u);
+    try {
+      const built = await runChild("sh", ["-c", build.replace("--outfile=dist/", `--outfile=${directory}/`)], {
+        cwd: appDirectory,
+        env: {
+          ...process.env,
+          PATH: [path.join(appDirectory, "node_modules", ".bin"), path.join(REPO_ROOT, "node_modules", ".bin"), path.dirname(process.execPath), process.env["PATH"] ?? ""].join(path.delimiter),
+        },
+      });
+      expect(built.status, built.stderr).toBe(0);
+
+      const audit = path.join(directory, "audit.jsonl");
+      // An explicit environment: nothing is inherited. PAPER, no credential; only the audit log and this test's database.
+      const ran = await runChild(process.execPath, [path.join(directory, "main.mjs"), ...args("account-snapshot")], {
+        cwd: directory,
+        env: {
+          MAX_RUN_MODE: "PAPER",
+          RUN_MODE: "PAPER",
+          ALLOW_REAL_ORDERS: "false",
+          LIVE_MICRO_MAX_ORDER_NOTIONAL: "0",
+          LIVE_MICRO_MAX_ACCOUNT_EXPOSURE: "0",
+          [AUDIT_LOG_ENV]: audit,
+          [DATABASE_URL_ENV]: url,
+        },
+      });
+      const report = `status ${String(ran.status)}\n--- stdout ---\n${ran.stdout}\n--- stderr ---\n${ran.stderr}`;
+      expect(ran.status, report).toBe(EXIT_CODES.RUN_MODE_REFUSED);
+      expect(ran.stderr, report).toBe("");
+      expect(ran.stdout, report).toContain("REFUSED by WP-260's signer gate (RUN_MODE_REQUIRES_NO_SIGNER, REAL_ORDERS_NOT_ALLOWED)");
+      expect(ran.stdout, report).toContain("database copy (ops.config_change_audit): 2 landed, 0 failed, 0 still pending");
+      // The connection string, and its password, are never printed.
+      expect(ran.stdout, report).not.toContain(url);
+      const password = new URL(url).password;
+      expect(password.length).toBeGreaterThan(0);
+      expect(ran.stdout, report).not.toContain(password);
+
+      const records = await localRecords(audit);
+      expect(records.map((record) => record.phase)).toEqual(["INVOKED", "OUTCOME"]);
+      const rows = await auditRows(records.map((record) => record.recordId));
+      expect(rows.map((entry) => entry.change_kind)).toEqual(["OPS_CLI_ACCOUNT_SNAPSHOT_INVOKED", "OPS_CLI_ACCOUNT_SNAPSHOT_OUTCOME"]);
+      expect(rows.every((entry) => entry.environment === null && entry.target_id === ACCOUNT)).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
     }
   });
 });

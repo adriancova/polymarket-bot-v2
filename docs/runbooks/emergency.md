@@ -3,7 +3,7 @@
 Handoff §14.2, §9.18 and §15; ADR-008 §6; ADR-033 D1 item 4. Code:
 `apps/ops-cli/src/emergency/`.
 
-## Status: PAPER only, and not yet runnable from a shell
+## Status: PAPER only
 
 - **Every venue-touching command runs WP-260's signer gate first.** It refuses
   in PAPER, BACKTEST, SHADOW and REPLAY. It also refuses when the mode is above
@@ -13,15 +13,51 @@ Handoff §14.2, §9.18 and §15; ADR-008 §6; ADR-033 D1 item 4. Code:
   - The credential source answers `NO_EMERGENCY_CREDENTIAL_SOURCE`.
   - The venue answers `NO_LIVE_VENUE_BINDING`.
   - The live composition binds both after ADR-033 D5 and the live-micro gate.
-- **No shell entry point yet.** `main.ts` imports workspace packages, so
-  ADR-018 §4 requires an esbuild bundle. Adding one needs two things outside
-  WP-330's paths:
-  - a grant on `test/unit/tooling/app-bundles-load.test.ts`, which pins that
-    ops-cli ships no bundle;
-  - an `esbuild` devDependency.
 
-  The `verify-venue` script is unchanged. The commands run in-process in the
-  tests (`main.test.ts`, `test/integration/ops-cli/`).
+## Running it from a shell
+
+The CLI ships as an ADR-018 app-local esbuild bundle, `apps/ops-cli/dist/main.mjs`.
+Its code imports workspace packages, so ADR-018 §4 requires the bundle; a
+`tsc` build of it cannot run (`ERR_MODULE_NOT_FOUND`).
+
+**Build it before you need it.** Run this from the repository root, ahead of
+any incident:
+
+```sh
+pnpm --filter @polymarket-bot/ops-cli build
+```
+
+Then run the bundle with Node directly:
+
+```sh
+node apps/ops-cli/dist/main.mjs --help
+node apps/ops-cli/dist/main.mjs cancel-all --account <ref> --operator <ref> --reason "<why>" --dry-run --audit-log /var/lib/pmb/ops-audit.jsonl
+```
+
+- The process's exit code is the CLI's own (see "Exit codes").
+- The bundle needs nothing from the repository at run time. It can be copied,
+  renamed, or linked from a `bin` directory, and it still runs: its entry guard
+  compares the module's URL with the file Node runs, resolving symlinks. It does
+  not test a file name.
+- Output is safe to pipe, for example to `head`. A closed output (`EPIPE`) does
+  not stop a command part-way: the command runs to its end, and the audit log
+  still gets its `OUTCOME` record.
+
+`pnpm --filter @polymarket-bot/ops-cli start <command> …` also works. It is
+slower: it typechecks, then builds, then runs, which takes about 10 s on the
+development laptop. pnpm runs it in `apps/ops-cli/`, so a relative
+`--audit-log` or `OPS_CLI_CONFIG` path resolves there. Pass absolute paths.
+
+**The pins.**
+- `test/unit/tooling/app-bundles-load.test.ts` builds the bundle with the
+  app's own `build` script and runs it as a child process. With PAPER and no
+  credential, each emergency command must:
+  - refuse with `RUN_MODE_REFUSED` (exit 4);
+  - leave exactly two audit records, `INVOKED` then `OUTCOME`.
+- `test/integration/ops-cli/` runs the bundle against a real PostgreSQL. Both
+  records land in `ops.config_change_audit` through the bundled driver.
+- `verify-venue` keeps its own `tsc` path: its code imports no workspace
+  package.
 
 ## Commands
 

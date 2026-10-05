@@ -10,7 +10,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/ops-cli/tsconfig.json",
-    "build": "tsc",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 \"--banner:js=import { createRequire as __bundleCreateRequire } from 'node:module'; const require = __bundleCreateRequire(import.meta.url);\" --outfile=dist/main.mjs",
+    "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
     "verify-venue": "tsc && node ./dist/verify-venue/main.js",
     "test:integration": "vitest run --config ../../test/integration/ops-cli/vitest.config.ts"
   },
@@ -25,6 +26,7 @@
   "devDependencies": {
     "@polymarket-bot/observability": "workspace:*",
     "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   }

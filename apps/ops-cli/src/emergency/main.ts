@@ -17,15 +17,19 @@
  * store (its value is never printed), and the rest are paths and the three
  * run-mode flags.
  *
- * NOT YET RUNNABLE FROM A SHELL (disclosed, `docs/runbooks/emergency.md`).
- * This module imports workspace packages, so ADR-018 §4 requires an esbuild
- * bundle for it, and adding one needs a grant on
- * `test/unit/tooling/app-bundles-load.test.ts` (which pins that ops-cli ships
- * no bundle) and an `esbuild` devDependency: both outside WP-330's paths. The
- * shipped `verify-venue` script is unchanged. Until then `main` is exercised
- * in-process by `main.test.ts`.
+ * RUN FROM A SHELL through the app's ADR-018 bundle (WP-330 r0, under the
+ * orchestrator's 2026-10-05 grant). This module imports workspace packages,
+ * so ADR-018 §4 requires a bundle: `build` bundles `src/main.ts`, the shipped
+ * entry, to `dist/main.mjs`, and `start` (or `node dist/main.mjs <command>`)
+ * runs it. `src/main.ts` only calls {@link runIfProcessEntry}; THIS module has
+ * no top-level side effect, so the bundle holds exactly one entry guard and an
+ * importer (a test) never runs a command. The shipped bundle is built and run
+ * by `test/unit/tooling/app-bundles-load.test.ts`; `main` itself is also
+ * exercised in-process by `main.test.ts`. The `verify-venue` script keeps its
+ * own `tsc` path (its executable imports no workspace package).
  */
 
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
@@ -135,17 +139,36 @@ export async function main(io: ProcessIo): Promise<OpsCliOutcome> {
   }
 }
 
-/** The real terminal, clock and environment of this process. */
-export function processIo(): ProcessIo {
-  const interactive = process.stdin.isTTY && process.stdout.isTTY;
+/** The terminal streams `processIo` binds: the process's own, unless a test passes its own. */
+export interface ProcessStreams {
+  readonly stdin: NodeJS.ReadableStream & { readonly isTTY?: boolean | undefined };
+  readonly stdout: NodeJS.WritableStream & { readonly isTTY?: boolean | undefined };
+}
+
+/**
+ * The real terminal, clock and environment of this process.
+ *
+ * A CLOSED STDOUT NEVER KILLS A COMMAND. Output piped to `head`, or a terminal
+ * that goes away, makes the next write fail with `EPIPE`, which Node raises as
+ * an `error` event; with no listener that is an uncaught exception, and the
+ * process would die mid-command, after its ACTING record and before its
+ * OUTCOME record (measured on the bundle: `--help | head -3` died so). So an
+ * error sink is installed first: the lost output stays lost, the command runs
+ * to its bounded end, and the audit log, written and fsynced independently of
+ * stdout, stays the record of truth.
+ */
+export function processIo(streams: ProcessStreams = { stdin: process.stdin, stdout: process.stdout }): ProcessIo {
+  const { stdin, stdout } = streams;
+  stdout.on("error", () => undefined);
+  const interactive = stdin.isTTY === true && stdout.isTTY === true;
   return {
     argv: process.argv.slice(2),
     env: process.env,
-    out: { line: (text: string) => void process.stdout.write(`${text}\n`) },
+    out: { line: (text: string) => void stdout.write(`${text}\n`) },
     prompt: {
       interactive,
       async ask(question: string): Promise<string | null> {
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const rl = createInterface({ input: stdin, output: stdout });
         try {
           return await rl.question(question);
         } catch {
@@ -163,10 +186,39 @@ export function processIo(): ProcessIo {
   };
 }
 
-const entry = process.argv[1];
-if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
+/**
+ * Whether the module at `moduleUrl` is the file Node was asked to run (`argv1`
+ * is `process.argv[1]`). Compared by URL with that path as given (for
+ * `--preserve-symlinks-main`) and resolved through symlinks (as Node names its
+ * main module), NEVER by file name: an entry guard keyed on a name exits 0
+ * having done nothing when the bundle is renamed, copied or reached through a
+ * symlink (ADR-018's renamed-bundle residual), and for an emergency CLI exit 0
+ * is `COMPLETED`, a false success. An importer (a test, another module) is
+ * never the entry. The trader's `isProcessEntry` (REGISTER-1) is the
+ * precedent; it is restated here because ops-cli may not import the trader
+ * (§14.2 independence). TOTAL: it never throws.
+ */
+export function isProcessEntry(moduleUrl: string, argv1: string | undefined): boolean {
+  if (argv1 === undefined || argv1 === "") return false;
+  try {
+    if (pathToFileURL(argv1).href === moduleUrl) return true;
+    return pathToFileURL(realpathSync(argv1)).href === moduleUrl;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The process shell: when `moduleUrl` (the shipped entry's `import.meta.url`)
+ * is the file Node runs, run ONE invocation as this process and set its exit
+ * code; otherwise do nothing. `src/main.ts` is its only caller, so the bundle
+ * holds exactly one guard.
+ */
+export async function runIfProcessEntry(moduleUrl: string): Promise<OpsCliOutcome | null> {
+  if (!isProcessEntry(moduleUrl, process.argv[1])) return null;
   const result = await main(processIo());
   process.exitCode = result.exitCode;
   // The outcome is printed and audited; nothing may keep the process alive past a short grace.
   setTimeout(() => process.exit(result.exitCode), EXIT_GRACE_MS).unref();
+  return result;
 }

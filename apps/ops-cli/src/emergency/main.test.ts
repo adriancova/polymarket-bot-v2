@@ -6,15 +6,17 @@
  * one changes no outcome. The database URL is never printed.
  */
 
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
+import { pathToFileURL } from "node:url";
 
 import { installNetworkTripwire, type NetworkTripwire } from "@polymarket-bot/polymarket-secure/testing";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ACCOUNT, args, DESTRUCTIVE_REASON, FakeClock, LIVE_FLAGS, NON_INTERACTIVE, testConfiguration } from "./harness.test-support.js";
-import { AUDIT_LOG_ENV, CONFIG_ENV, DATABASE_URL_ENV, main, UNBOUND_VENUE, UNCONFIGURED_CREDENTIALS, type ProcessIo } from "./main.js";
+import { AUDIT_LOG_ENV, CONFIG_ENV, DATABASE_URL_ENV, isProcessEntry, main, processIo, runIfProcessEntry, UNBOUND_VENUE, UNCONFIGURED_CREDENTIALS, type ProcessIo } from "./main.js";
 
 let tripwire: NetworkTripwire;
 let scratch: string;
@@ -92,5 +94,58 @@ describe("main: the shipped composition binds nothing live", () => {
     expect((await main(process)).exitName).toBe("COMPLETED");
     expect(process.lines.join("\n")).toContain("usage: ops-cli <command>");
     expect(tripwire.refused()).toEqual([]);
+  });
+});
+
+describe("the process shell (WP-330 r0: the shell-runnable bundle)", () => {
+  it("isProcessEntry: the file Node runs, as given or through a symlink, is the entry; a same-named file elsewhere, an importer, a missing path and no path are not", async () => {
+    const root = await realpath(scratch);
+    await mkdir(path.join(root, "real dir"));
+    await mkdir(path.join(root, "elsewhere"));
+    const bundle = path.join(root, "real dir", "main.mjs");
+    await writeFile(bundle, "");
+    await writeFile(path.join(root, "elsewhere", "main.mjs"), "");
+    await symlink(path.join(root, "real dir"), path.join(root, "linked"));
+    // Node names its main module by its real path (the URL escapes the space).
+    const moduleUrl = pathToFileURL(bundle).href;
+    expect(moduleUrl).toContain("real%20dir");
+
+    expect(isProcessEntry(moduleUrl, bundle)).toBe(true);
+    // Through a symlinked directory: the as-given URL differs, the real path matches.
+    expect(pathToFileURL(path.join(root, "linked", "main.mjs")).href).not.toBe(moduleUrl);
+    expect(isProcessEntry(moduleUrl, path.join(root, "linked", "main.mjs"))).toBe(true);
+    // A file name is not an identity.
+    expect(isProcessEntry(moduleUrl, path.join(root, "elsewhere", "main.mjs"))).toBe(false);
+    // An importer (this test file) is never the entry; nor is a missing path, or none.
+    expect(isProcessEntry(import.meta.url, process.argv[1])).toBe(false);
+    expect(isProcessEntry(moduleUrl, path.join(root, "missing", "main.mjs"))).toBe(false);
+    expect(isProcessEntry(moduleUrl, undefined)).toBe(false);
+    expect(isProcessEntry(moduleUrl, "")).toBe(false);
+  });
+
+  it("runIfProcessEntry from an importer runs nothing and leaves the exit code alone", async () => {
+    const before = process.exitCode;
+    expect(await runIfProcessEntry(import.meta.url)).toBeNull();
+    expect(process.exitCode).toBe(before);
+  });
+
+  it("a CLOSED stdout (EPIPE) never kills the command: processIo installs an error sink before anything is written", () => {
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    const closed = new Writable({
+      write(_chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+        callback(epipe);
+      },
+    });
+    // CONTROL: with no listener, an error event throws (Node's uncaught-exception path).
+    expect(() => new Writable().emit("error", epipe)).toThrow("write EPIPE");
+
+    const io = processIo({ stdin: Readable.from([]), stdout: closed });
+    expect(closed.listenerCount("error")).toBeGreaterThan(0);
+    expect(() => closed.emit("error", epipe)).not.toThrow();
+    expect(() => {
+      io.out.line("RESULT: …");
+    }).not.toThrow();
+    // Neither stream is a terminal: a destructive command never waits on a prompt.
+    expect(io.prompt.interactive).toBe(false);
   });
 });
