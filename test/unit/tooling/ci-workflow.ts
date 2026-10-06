@@ -102,7 +102,41 @@
  * `pnpm x`. A chain command with any shell syntax beyond single spaces
  * between words is refused, because splitting on ` && ` would no longer be
  * faithful.
+ *
+ * THE INTEGRATION-SCRIPT RULE (`CI-7`, CLOSEOUT-3 L1). The split check above
+ * holds the steps to the chains, but nothing held the chains to the packages:
+ * WP-330's `ops-cli` `test:integration` ran in no gate from its merge
+ * (`c1e6909`) until CLOSEOUT-3 found it.
+ * `integrationScriptFindings` reports:
+ * - a workspace package's `test:integration` script, or `test:integration:<x>`
+ *   one, that the root `test:integration` chain does not run as
+ *   `pnpm --filter <package name> <script>` and that `UNCHAINED_INTEGRATION_SCRIPTS`
+ *   does not exempt with a reason. Only that spelling counts as chained, so a
+ *   misread can only over-report;
+ * - a `pnpm --filter <name> <script>` command of any split chain whose package
+ *   is not in the workspace, or has no such script. pnpm 11 exits 0 when a
+ *   filter matches no package ("No projects matched the filters"), so a
+ *   renamed package would otherwise leave a green step that ran nothing;
+ * - an exemption that no longer applies: its script is chained after all, its
+ *   package or script is gone, or it gives no reason.
+ * The workspace's packages are the ones `readWorkspaceManifests` finds. It reads
+ * the globs from `pnpm-workspace.yaml` (`workspacePackageGlobs`), then lists each
+ * glob's directory. Since `CI-7` r1 (CI7-R1-01), it admits exactly what pnpm
+ * 11.17.0 admits wherever it can read the package, and THROWS wherever it cannot.
+ * - A directory symlink is followed, as pnpm's glob follows it. r0 skipped one
+ *   silently, so a symlinked package's suite could stay ungated.
+ * - A `package.yaml` or `package.json5` manifest is refused. pnpm admits one,
+ *   but the rule reads only `package.json`.
+ * - An entry that does not resolve is refused, such as a broken symlink. Its
+ *   target may exist on another machine, where pnpm would admit it.
+ * - A hidden, `node_modules` or `bower_components` directory is refused when it
+ *   holds a manifest. pnpm skips such a directory, so its package could not
+ *   run; r0 admitted one of the last two, so a chained command naming it
+ *   passed the existence check.
  */
+
+import { readFile, readdir, stat } from "node:fs/promises";
+import path from "node:path";
 
 /** A value of the YAML subset: a string, `null` for an empty value, a sequence or a mapping. */
 export type YamlValue = string | null | readonly YamlValue[] | ReadonlyMap<string, YamlValue>;
@@ -322,7 +356,8 @@ export const GATED_JOBS = [
  * reconciliation (`WP-290`) suites joined the WAL suite in that script.
  * `CI-6` chained the live-safety (`WP-320`) and live chaos (`WP-340`) suites
  * after them, and the live chaos suite's PostgreSQL half to
- * `test:integration`.
+ * `test:integration`. `CI-7` chained the emergency CLI's PostgreSQL suite
+ * (`WP-330`) to `test:integration`.
  */
 export const SPLIT_CHAINS = [
   { script: "typecheck", label: "Typecheck" },
@@ -899,6 +934,255 @@ export function jobTimeoutFindings(workflowText: string): string[] {
     } else if (!/^[1-9][0-9]*$/u.test(timeout) || Number(timeout) >= GITHUB_JOB_TIMEOUT_CEILING_MINUTES) {
       findings.push(`job \`${id}\` has \`timeout-minutes: ${timeout}\`; expected a whole number of minutes below 360`);
     }
+  }
+  return findings;
+}
+
+// ---------------------------------------------------------------------------
+// CI-7 (CLOSEOUT-3 L1): every workspace package's integration script is
+// chained. See THE INTEGRATION-SCRIPT RULE above.
+
+/**
+ * A workspace package's manifest: its directory relative to the repository
+ * root, and its `package.json` text. For a directory symlink, `dir` is the
+ * link's path, which is the path pnpm lists it at.
+ */
+export interface WorkspaceManifest {
+  readonly dir: string;
+  readonly text: string;
+}
+
+/** A package integration script the root `test:integration` chain deliberately does not run, and why. */
+export interface UnchainedIntegrationScript {
+  readonly package: string;
+  readonly script: string;
+  readonly why: string;
+}
+
+/**
+ * The workspace packages' integration scripts that the root `test:integration`
+ * chain deliberately does NOT run, each with its reason (`CI-7`). EMPTY at
+ * `CI-7`: every such script is chained. An entry would read, for example,
+ * `{ package: "@polymarket-bot/example", script: "test:integration:soak",
+ * why: "a manual multi-hour soak, not a gate" }`. An entry whose script is
+ * chained after all, whose package or script is gone, or that gives no reason
+ * is itself a finding, so a stale entry cannot silently excuse a script that
+ * comes back.
+ */
+export const UNCHAINED_INTEGRATION_SCRIPTS: readonly UnchainedIntegrationScript[] = [];
+
+/** The package scripts the rule covers: `test:integration`, and `test:integration:<x>` (CI-5 chained control-api's `:postgres`). */
+const INTEGRATION_SCRIPT = /^test:integration(?::[A-Za-z0-9_.-]+)*$/u;
+
+/** The root chain that must run them. */
+const INTEGRATION_CHAIN = "test:integration";
+
+/** The one spelling the rule accepts as "chained": the one every chained package suite uses. */
+export function packageScriptCommand(packageName: string, script: string): string {
+  return `pnpm --filter ${packageName} ${script}`;
+}
+
+/** A chained command of that spelling, read back into its package name and script. */
+const PACKAGE_SCRIPT_COMMAND = /^pnpm --filter (\S+) (\S+)$/u;
+
+/** A workspace glob the reader accepts: a directory path, then `/*`, as pnpm-workspace.yaml spells each today. */
+const DIRECTORY_GLOB = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\/\*$/u;
+
+/**
+ * The `packages:` globs of `pnpm-workspace.yaml` text. It reads only that
+ * top-level block: `  - <glob>` items, plain or quoted, with blank and comment
+ * lines between them. It throws on anything else in the block, and on any
+ * glob other than `<directory>/*` (a `**`, a `!` exclusion, a brace), rather
+ * than guess which packages the workspace admits.
+ */
+export function workspacePackageGlobs(workspaceYamlText: string): readonly string[] {
+  if (workspaceYamlText.includes("\r")) throw new Error("pnpm-workspace.yaml: CR line ends are refused");
+  const lines = workspaceYamlText.split("\n");
+  const start = lines.findIndex((line) => line === "packages:");
+  if (start < 0 || lines.filter((line) => /^packages\s*:/u.test(line)).length !== 1) {
+    throw new Error("pnpm-workspace.yaml: expected exactly one top-level `packages:` line, with its items below it");
+  }
+  const globs: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === "" || /^\s*#/u.test(line)) continue;
+    if (/^\S/u.test(line)) break; // the next top-level key
+    const item = /^ {2}- (?:"([^"]*)"|'([^']*)'|([^\s"'#]+))(?: +#.*)?$/u.exec(line);
+    const glob = item === null ? undefined : (item[1] ?? item[2] ?? item[3]);
+    if (glob === undefined || !DIRECTORY_GLOB.test(glob)) {
+      throw new Error(
+        `pnpm-workspace.yaml: ${JSON.stringify(line)} is not a \`  - <directory>/*\` item; ` +
+          "the integration-script rule reads only that form (extend test/unit/tooling/ci-workflow.ts deliberately)",
+      );
+    }
+    if (globs.includes(glob)) throw new Error(`pnpm-workspace.yaml: the glob ${JSON.stringify(glob)} appears twice`);
+    globs.push(glob);
+  }
+  if (globs.length === 0) throw new Error("pnpm-workspace.yaml: `packages:` lists no glob");
+  return globs;
+}
+
+/**
+ * The manifest file names pnpm 11 reads for a workspace project. Its reader
+ * globs `<pattern>/package.{json,yaml,json5}`; the rule reads only `package.json`.
+ */
+const PNPM_MANIFEST_NAMES: ReadonlySet<string> = new Set(["package.json", "package.yaml", "package.json5"]);
+
+/**
+ * Directory names pnpm 11.17.0 never admits under a `<directory>/*` glob.
+ * `node_modules` and `bower_components` are on its workspace reader's ignore
+ * list, and `*` does not match a hidden name, since tinyglobby leaves `dot` off.
+ */
+function pnpmSkipsDirectory(name: string): boolean {
+  return name.startsWith(".") || name === "node_modules" || name === "bower_components";
+}
+
+/** The workspace as `readWorkspaceManifests` reads it. */
+export interface WorkspaceRead {
+  readonly globs: readonly string[];
+  readonly manifests: readonly WorkspaceManifest[];
+}
+
+const byCodeUnits = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * The globs of `<root>/pnpm-workspace.yaml`, and the manifest of every workspace
+ * package they admit, in the order of the globs and then of the directory names
+ * (CI-7 r1, CI7-R1-01). Each glob is `<directory>/*`, so listing that directory
+ * gives the whole match. Every entry is resolved through any symlink, as pnpm's
+ * glob resolves it (tinyglobby's `followSymbolicLinks` defaults to true).
+ * - An entry that resolves to anything but a directory is not a package.
+ * - So is a directory that holds none of `PNPM_MANIFEST_NAMES`.
+ * Every case where pnpm and this reader could disagree THROWS (see THE
+ * INTEGRATION-SCRIPT RULE above): an entry that does not resolve, a
+ * `package.yaml` or `package.json5` manifest, and a directory pnpm skips that
+ * holds a manifest.
+ */
+export async function readWorkspaceManifests(root: string): Promise<WorkspaceRead> {
+  const globs = workspacePackageGlobs(await readFile(path.join(root, "pnpm-workspace.yaml"), "utf8"));
+  const manifests: WorkspaceManifest[] = [];
+  const advice = "the integration-script rule refuses to guess (extend test/unit/tooling/ci-workflow.ts deliberately)";
+  for (const glob of globs) {
+    const parent = glob.slice(0, -"/*".length);
+    for (const name of (await readdir(path.join(root, parent))).sort(byCodeUnits)) {
+      const dir = `${parent}/${name}`;
+      const where = path.join(root, dir);
+      const target = await stat(where).catch((error: unknown) => {
+        const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : String(error);
+        throw new Error(
+          `${dir} does not resolve (${code}). A broken symlink may resolve on another machine, where pnpm would ` +
+            `admit its package, so ${advice}`,
+        );
+      });
+      if (!target.isDirectory()) continue;
+      const found = (await readdir(where)).filter((entry) => PNPM_MANIFEST_NAMES.has(entry)).sort(byCodeUnits);
+      if (found.length === 0) continue;
+      if (pnpmSkipsDirectory(name)) {
+        throw new Error(
+          `${dir} holds ${found.join(" and ")}, but pnpm 11 admits no hidden, node_modules or bower_components ` +
+            `directory as a workspace package, so no \`--filter\` could run it; ${advice}`,
+        );
+      }
+      if (found.length !== 1 || found[0] !== "package.json") {
+        throw new Error(
+          `${dir} holds ${found.join(" and ")}. pnpm 11 admits a package.yaml or package.json5 manifest, but the ` +
+            `integration-script rule reads only package.json, so ${advice}`,
+        );
+      }
+      manifests.push({ dir, text: await readFile(path.join(where, "package.json"), "utf8") });
+    }
+  }
+  return { globs, manifests };
+}
+
+/** A workspace package as the rule reads it. Throws on a manifest without a name, or with a non-string script. */
+function readManifest(manifest: WorkspaceManifest): { readonly name: string; readonly scripts: readonly string[] } {
+  const parsed: unknown = JSON.parse(manifest.text);
+  const record = typeof parsed === "object" && parsed !== null ? (parsed as { readonly name?: unknown; readonly scripts?: unknown }) : {};
+  if (typeof record.name !== "string" || record.name === "") {
+    throw new Error(`${manifest.dir}/package.json: no \`name\`, so no \`--filter\` can select it`);
+  }
+  const scripts = record.scripts ?? {};
+  if (typeof scripts !== "object" || scripts === null || Array.isArray(scripts)) {
+    throw new Error(`${manifest.dir}/package.json: \`scripts\` is not an object`);
+  }
+  const names = Object.entries(scripts as Readonly<Record<string, unknown>>).map(([name, text]) => {
+    if (typeof text !== "string") throw new Error(`${manifest.dir}/package.json: script \`${name}\` is not a string`);
+    return name;
+  });
+  return { name: record.name, scripts: names };
+}
+
+/**
+ * Every way the root chains and the workspace packages' scripts disagree (see
+ * THE INTEGRATION-SCRIPT RULE above). An empty list means every package
+ * integration script runs in the root `test:integration` chain or is exempted
+ * with a reason, and every `pnpm --filter` command of a chain runs a script
+ * that exists. Throws when a text is outside what the check can read.
+ */
+export function integrationScriptFindings(
+  packageJsonText: string,
+  manifests: readonly WorkspaceManifest[],
+  exemptions: readonly UnchainedIntegrationScript[] = UNCHAINED_INTEGRATION_SCRIPTS,
+): string[] {
+  const chains = chainCommands(packageJsonText);
+  const chained = new Set(chains.get(INTEGRATION_CHAIN) ?? []);
+  const packages = new Map<string, { readonly dir: string; readonly scripts: readonly string[] }>();
+  for (const manifest of [...manifests].sort((a, b) => (a.dir < b.dir ? -1 : a.dir > b.dir ? 1 : 0))) {
+    const { name, scripts } = readManifest(manifest);
+    const other = packages.get(name);
+    if (other !== undefined) {
+      throw new Error(`${other.dir}/package.json and ${manifest.dir}/package.json are both named ${name}`);
+    }
+    packages.set(name, { dir: manifest.dir, scripts });
+  }
+  const isExempt = (name: string, script: string): boolean =>
+    exemptions.some((entry) => entry.package === name && entry.script === script);
+
+  const findings: string[] = [];
+  for (const [name, { dir, scripts }] of packages) {
+    for (const script of scripts) {
+      if (!INTEGRATION_SCRIPT.test(script)) continue;
+      const command = packageScriptCommand(name, script);
+      if (chained.has(command) || isExempt(name, script)) continue;
+      findings.push(
+        `${dir}/package.json's \`${script}\` script runs in no gate: the root \`${INTEGRATION_CHAIN}\` chain has no ` +
+          `${JSON.stringify(command)}; chain it (the split-step check then requires its own CI step), or record it ` +
+          "in UNCHAINED_INTEGRATION_SCRIPTS in test/unit/tooling/ci-workflow.ts with the reason",
+      );
+    }
+  }
+
+  for (const { script: chain } of SPLIT_CHAINS) {
+    for (const command of chains.get(chain) ?? []) {
+      const match = PACKAGE_SCRIPT_COMMAND.exec(command);
+      if (match === null) continue;
+      const name = match[1] ?? "";
+      const script = match[2] ?? "";
+      const found = packages.get(name);
+      if (found === undefined) {
+        findings.push(
+          `the root \`${chain}\` command ${JSON.stringify(command)} names ${name}, which is no workspace package; ` +
+            "pnpm exits 0 when a filter matches nothing, so its step would pass having run nothing",
+        );
+      } else if (!found.scripts.includes(script)) {
+        findings.push(
+          `the root \`${chain}\` command ${JSON.stringify(command)} runs \`${script}\`, which ${found.dir}/package.json does not define`,
+        );
+      }
+    }
+  }
+
+  for (const entry of exemptions) {
+    const label = `UNCHAINED_INTEGRATION_SCRIPTS exempts ${entry.package} \`${entry.script}\``;
+    const found = packages.get(entry.package);
+    if (!INTEGRATION_SCRIPT.test(entry.script)) {
+      findings.push(`${label}, which is not an integration script the rule covers; remove the entry`);
+    } else if (found === undefined || !found.scripts.includes(entry.script)) {
+      findings.push(`${label}, but no workspace package defines that script any more; remove the entry`);
+    } else if (chained.has(packageScriptCommand(entry.package, entry.script))) {
+      findings.push(`${label}, but the root \`${INTEGRATION_CHAIN}\` chain runs it; remove the entry`);
+    }
+    if (entry.why.trim() === "") findings.push(`${label} without a reason`);
   }
   return findings;
 }

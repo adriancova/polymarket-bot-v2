@@ -7,8 +7,10 @@
  * Run with `pnpm --filter @polymarket-bot/ops-cli test:integration`. The
  * container is started in the file's own `beforeAll` (the precedent of the
  * control API's PostgreSQL suite, `CONTROL-1b`), and nothing skips when
- * Docker is absent: the run fails. Wiring it into the root `test:integration`
- * chain and CI is an orchestrator follow-up (both are protected paths).
+ * Docker is absent: the run fails. `CI-7` (CLOSEOUT-3 L1) chained it into
+ * the root `test:integration` as command 9/9, and CI runs it as
+ * "Integration tests 9/9"; `test/unit/tooling/ci-step-split.test.ts` fails
+ * if it leaves the chain.
  *
  * No venue, no signer, no real credential: Testcontainers' credentials are
  * throwaway, and every venue surface is the in-memory fake of

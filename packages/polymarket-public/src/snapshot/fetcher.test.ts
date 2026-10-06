@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -232,5 +236,87 @@ describe("fetchSnapshots", () => {
           maximumBooksPerRequest: 501,
         }),
     ).toThrow(PublicMarketConfigurationError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Polymarket Protocol V2 (`V2-2`, plan row A10)
+// ---------------------------------------------------------------------------
+
+describe("Protocol V2: books are seeded by the V2 position id (A10)", () => {
+  // `VENUE-4`'s capture of `GET /book?token_id=<V2 position id>` (S-L03,
+  // `docs/venue/verified-2026-10-05.md` O.2): the response body, byte for byte.
+  const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+  const BOOK_V2_BODY = readFileSync(resolve(REPO_ROOT, "test/fixtures/venue/protocol-v2/book-v2.jsonc"), "utf8");
+  const BOOK_V2_PROVENANCE = JSON.parse(
+    readFileSync(resolve(REPO_ROOT, "test/fixtures/venue/protocol-v2/book-v2.provenance.jsonc"), "utf8"),
+  ) as { readonly url: string; readonly http_status: string; readonly redactions: readonly unknown[] };
+  const V2_YES = "663574927012476832975694178961957910328055987427402067619466963999000625152";
+  const V2_NO = "663574927012476832975694178961957910328055987427402067619466963999000625153";
+  const V2_MARKET = {
+    internalMarketId: "0199f0a0-0000-7000-8000-000000000002",
+    // Gamma's documented 31-byte width (F-43); the book names the 32-byte form.
+    conditionId: "0x017791f201d5a788e0039e511fc1900e5f0000000000000000000000000000",
+    yesTokenId: V2_YES,
+    noTokenId: V2_NO,
+  };
+
+  function v2Fetcher(respond: Parameters<typeof stubHttpClient>[0]) {
+    const http = stubHttpClient(respond);
+    return {
+      http,
+      subject: new PublicBookSnapshotFetcher({
+        http: http.client,
+        directory: staticMarketDirectory({ known: [V2_MARKET] }),
+      }),
+    };
+  }
+
+  it("GETs the documented single-book endpoint with the 75-digit id unchanged, and normalizes the V2 body", async () => {
+    const { http, subject } = v2Fetcher(() => ({ status: 200, body: BOOK_V2_BODY }));
+    const result = await subject.fetchSnapshot(V2_YES, { subscriptionGeneration: 3 });
+    expect(http.exchanges.map((exchange) => exchange.request)).toEqual([
+      { method: "GET", url: `https://clob.polymarket.com/book?token_id=${V2_YES}` },
+    ]);
+    // It is the very URL `VENUE-4` fetched (its provenance sidecar), which answered 200 with this body, unredacted.
+    expect(http.exchanges[0]?.request.url).toBe(BOOK_V2_PROVENANCE.url);
+    expect(BOOK_V2_PROVENANCE.http_status).toBe("200");
+    expect(BOOK_V2_PROVENANCE.redactions).toEqual([]);
+    expect(BOOK_V2_BODY).toContain(`"asset_id":"${V2_YES}"`);
+    expect(BOOK_V2_BODY).toContain(`"version":"v2"`);
+    expect(result.problems).toEqual([]);
+    expect(result.events.map((event) => event.payload)).toEqual([
+      {
+        internalMarketId: V2_MARKET.internalMarketId,
+        tokenId: V2_YES,
+        bids: [],
+        asks: [],
+        venueBookHash: "fc3846cab0c35a0977b6e5f605a4e5ff0d0b2277",
+      },
+    ]);
+    expect(result.events[0]?.provenance).toMatchObject({
+      sourceChannel: "polymarket:clob-book-rest",
+      subscriptionGeneration: 3,
+      venueTimestamp: "2026-10-05T22:20:58.575Z",
+    });
+  });
+
+  it("POSTs both V2 ids to /books in the documented body; the venue's answer to that is unverified (U-42)", async () => {
+    // `POST /books` with V2 ids was not tried by `VENUE-4` (U-42). This pins
+    // only what this client sends and that a V2-shaped batch body normalizes;
+    // it is not evidence of the venue's behaviour.
+    const { http, subject } = v2Fetcher(() => ({ status: 200, body: `[${BOOK_V2_BODY}]` }));
+    const result = await subject.fetchSnapshots([V2_YES, V2_NO]);
+    expect(http.exchanges.map((exchange) => exchange.request)).toEqual([
+      {
+        method: "POST",
+        url: "https://clob.polymarket.com/books",
+        jsonBody: [{ token_id: V2_YES }, { token_id: V2_NO }],
+      },
+    ]);
+    expect(result.problems).toEqual([]);
+    expect(result.events.map((event) => [event.eventType, (event.payload as { tokenId: string }).tokenId])).toEqual([
+      ["BookSnapshot", V2_YES],
+    ]);
   });
 });

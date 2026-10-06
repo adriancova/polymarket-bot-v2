@@ -91,6 +91,17 @@
  * parameter — into the recorded book. Requiredness above is therefore now
  * enforced twice: by the schema, and by the door's own read of the
  * materialized tree ({@link VENUE_ORDER_BOOK_FIELDS}).
+ *
+ * ## Polymarket Protocol V2 (`V2-2`, 2026-10-05; plan rows A10, A11)
+ *
+ * A V2 market's book is read by its position id, a decimal string like any
+ * token id (`docs/venue/verified-2026-10-05.md` F-44, F-60; OBSERVED 200, O.2).
+ * The V2 body carries an eleventh key, `"version":"v2"`, which the OpenAPI's
+ * `OrderBookSummary` does not declare (C-21, U-39). It is undocumented, so it
+ * is never read: the projection above emits declared fields only, and the V2
+ * body decodes to exactly what the same body without the key decodes to. No
+ * requiredness or value rule changed for V2. The contract suite pins it on
+ * `VENUE-4`'s capture (`test/contract/polymarket-public/market-ws-fixtures.test.ts`).
  */
 
 import { z } from "zod";

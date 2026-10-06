@@ -22,6 +22,34 @@ about the venue is assumed.
   `clobTokenIds` and `outcomes` are typed `string`; the value observed on
   2026-09-29 and 2026-09-30 is a JSON-encoded array
   (`docs/handoffs/H1-RUN-1.md`), so both spellings are accepted here.
+- Polymarket Protocol V2 (`docs/venue/verified-2026-10-05.md`, `V2-2`): the
+  Market fields `version` (a nullable string) and `positionIds` (a nullable
+  array of strings) are in the Gamma OpenAPI since 2026-10-04 (F-41, E-23).
+  The trading ids are chosen by `version`, "even when both fields are
+  present": `"v2"` reads `positionIds`, an "Array of decimal strings";
+  `"v1"` reads `clobTokenIds`, a "JSON-encoded array of decimal strings"
+  (F-38, https://docs.polymarket.com/migrate/polymarket-v2/api-integrations.md
+  lines 23-28). "Reject missing or unsupported versions ... and missing or
+  non-decimal IDs" (F-39, lines 33-35); "If the selected field is absent, the
+  IDs are not yet available. Treat versions other than `v1` and `v2` as
+  unsupported" (F-40, https://docs.polymarket.com/market-data/market-details.md
+  lines 213-215). `select_token_ids` below applies exactly that, plus two
+  refusals of its own: not exactly two ids, and two equal ids. The documented
+  V2 example carries `"clobTokenIds": null`, which this recorder used to skip,
+  so it recorded nothing for a V2 window (plan row A15).
+- A V2 condition id is `bytes31`, and "Compatibility boundaries that accept or
+  return `bytes32` use the same values right-padded with zero bytes" (F-43,
+  https://docs.polymarket.com/resources/onchain-position-data.md lines
+  152-155). The documented Gamma example is the 31-byte form (62 hex digits);
+  the market channel's V2 `book` frame was OBSERVED carrying the 32-byte form
+  (the S-W01 capture, F-62). Which width Gamma serves for a real V2 window is unknown (U-36).
+  `window_for_market` therefore attributes a frame to a window under either
+  width; it narrows a 32-byte id only when its final byte is zero ("validate
+  its final byte is zero before narrowing", F-43,
+  https://docs.polymarket.com/migrate/polymarket-v2/contract-integrations.md
+  line 54).
+- Undocumented, and NOT read: the V2 `book` frame's `"version":"v2"` key and
+  the CLOB market record's `v` (C-21, U-39). Nothing here depends on them.
 - The series slugs themselves (`btc-up-or-down-15m`, ...) are OBSERVED values
   of `seriesSlug`, not documented constants. `record_markets.py --list-series`
   prints what the venue lists today; pass `--series` to override the default.
@@ -85,7 +113,19 @@ DEFAULT_SERIES: tuple[str, ...] = (
 
 UNATTRIBUTED = "(unattributed)"
 
+# The protocol versions whose id field is documented (F-38, F-40).
+SUPPORTED_VERSIONS: tuple[str, ...] = ("v1", "v2")
+# The id field each version selects (F-38).
+ID_FIELD_BY_VERSION: dict[str, str] = {"v1": "clobTokenIds", "v2": "positionIds"}
+
 _FRACTION = re.compile(r"\.(\d+)(?=[+-]\d\d:\d\d$|$)")
+# A canonical unsigned decimal integer in ASCII digits: the repository's own
+# `TokenIdSchema` form (packages/domain/src/identifiers.ts). `[0-9]`, never
+# `\d`, which would admit non-ASCII digits.
+_DECIMAL_ID = re.compile(r"(?:0|[1-9][0-9]*)")
+# A condition id in its 31-byte form, and a 32-byte one whose final byte is zero (F-43).
+_CONDITION_BYTES31 = re.compile(r"0x[0-9a-fA-F]{62}")
+_CONDITION_BYTES32_ZERO_FINAL = re.compile(r"0x[0-9a-fA-F]{62}00")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +221,90 @@ def _string_list(value: Any) -> list[str] | None:
     return list(value)
 
 
+def select_token_ids(market: dict[str, Any]) -> tuple[tuple[str, str] | None, str | None]:
+    """The market's two outcome ids, chosen by its `version`, or why there are none.
+
+    Returns `(ids, None)` or `(None, reason)`. The rule is the documented one
+    (module docstring, F-38 to F-40): `"v2"` reads `positionIds`, `"v1"` reads
+    `clobTokenIds`, whichever other field is also present. Each of these is
+    refused, by name:
+
+    - a missing, `null`, non-string or unknown `version`;
+    - the selected field absent or `null` ("the IDs are not yet available");
+    - a selected field that is not the documented shape: for `"v2"`, anything
+      but an array of strings (a JSON-encoded string is NOT accepted for
+      `positionIds`); for `"v1"`, anything but a JSON-encoded array of strings
+      or an array of strings (the two spellings this recorder has always
+      accepted for `clobTokenIds`). A V1 field that is absent, null, malformed
+      or empty keeps the exact refusal text it had before V2-2;
+    - not exactly two ids;
+    - an id that is not a canonical decimal integer string;
+    - two equal ids.
+
+    Nothing else about the market is read here: no outcome label, no CLOB
+    record, no undocumented key.
+    """
+    if "version" not in market:
+        return None, "no version, so the id field cannot be chosen (F-39)"
+    version = market["version"]
+    if version is None:
+        return None, "version is null, so the id field cannot be chosen (F-39)"
+    if not isinstance(version, str) or version not in SUPPORTED_VERSIONS:
+        return None, f"unsupported version {version!r} (F-39, F-40)"
+    field_name = ID_FIELD_BY_VERSION[version]
+    raw = market.get(field_name)
+    if version == "v1":
+        ids = _string_list(raw)
+        if not ids:
+            # Absent, null, malformed or empty: word for word the refusal this
+            # recorder gave such a market before V2-2, so V1 output is unchanged.
+            return None, f"{field_name} missing or malformed"
+    else:
+        if raw is None:
+            return None, f"version v2: {field_name} is absent or null, so the ids are not yet available (F-40)"
+        # Exactly the documented shape: an array of strings, never a JSON-encoded string.
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            return None, f"version v2: {field_name} is malformed, not an array of strings (F-38)"
+        ids = list(raw)
+    if len(ids) != 2:
+        return None, f"version {version}: {field_name} holds {len(ids)} ids, not exactly two"
+    for item in ids:
+        if not _DECIMAL_ID.fullmatch(item):
+            return None, f"version {version}: {field_name} holds the non-decimal id {item[:80]!r} (F-39)"
+    if ids[0] == ids[1]:
+        return None, f"version {version}: {field_name} holds the same id twice"
+    return (ids[0], ids[1]), None
+
+
+def _other_condition_width(condition: str) -> str | None:
+    """The same condition id at its other documented width, or None (F-43).
+
+    A 31-byte id is right-padded with one zero byte; a 32-byte id is narrowed
+    only when its final byte is zero. Any other string has no other width."""
+    if _CONDITION_BYTES32_ZERO_FINAL.fullmatch(condition):
+        return condition[:-2]
+    if _CONDITION_BYTES31.fullmatch(condition):
+        return condition + "00"
+    return None
+
+
+def window_for_market(registry: dict[str, Window], condition: str | None) -> Window | None:
+    """The window a frame's `market` (a condition id) names, under either documented width.
+
+    The exact id is tried first, so a V1 window (always 32 bytes, O.5) is
+    found exactly as before. Only when that misses is the other width of the
+    same id tried (module docstring: Gamma's V2 width is U-36, the channel's is
+    OBSERVED 32 bytes)."""
+    if condition is None:
+        return None
+    window = registry.get(condition)
+    if window is None:
+        other = _other_condition_width(condition)
+        if other is not None:
+            window = registry.get(other)
+    return window
+
+
 def event_series_slug(event: dict[str, Any]) -> str | None:
     """The event's `seriesSlug`, else the slug of its first `series` entry."""
     slug = event.get("seriesSlug")
@@ -200,8 +324,8 @@ def parse_gamma_events(
     """The windows of the wanted series in one `/events` response, and why any market was skipped.
 
     A market is skipped (and the reason returned) when a field this recorder
-    needs is missing or malformed. A market Gamma marks `closed: true` is
-    skipped silently.
+    needs is missing or malformed, or when `select_token_ids` refuses its ids.
+    A market Gamma marks `closed: true` is skipped silently.
     """
     wanted = None if series_filter is None else set(series_filter)
     windows: dict[str, Window] = {}
@@ -230,7 +354,6 @@ def parse_gamma_events(
             condition = market.get("conditionId")
             start = parse_iso(market.get("eventStartTime"))
             end = parse_iso(market.get("endDate"))
-            tokens = _string_list(market.get("clobTokenIds"))
             outcomes = _string_list(market.get("outcomes")) or []
             if not isinstance(condition, str) or condition == "":
                 problems.append(f"{label}: no conditionId")
@@ -238,8 +361,9 @@ def parse_gamma_events(
             if start is None or end is None or end <= start:
                 problems.append(f"{label}: eventStartTime/endDate missing or not increasing")
                 continue
-            if not tokens:
-                problems.append(f"{label}: clobTokenIds missing or malformed")
+            tokens, refusal = select_token_ids(market)
+            if tokens is None:
+                problems.append(f"{label}: {refusal}")
                 continue
             windows[condition] = Window(
                 series=series,
@@ -464,9 +588,14 @@ class Stats:
         touched_series: set[str] = set()
         for event, share in zip(decoded.events, apportion_bytes(nbytes, decoded.events)):
             condition = event_market(event)
-            window = registry.get(condition) if condition is not None else None
+            window = window_for_market(registry, condition)
             series = window.series if window is not None else series_hint
-            market_key = condition if condition is not None else UNATTRIBUTED
+            # An attributed event is counted under its window's own id, so the
+            # summary's per-window row finds it whichever width the frame used.
+            if window is not None:
+                market_key = window.condition_id
+            else:
+                market_key = condition if condition is not None else UNATTRIBUTED
             envelopes = envelope_estimate(event)
             totals = self.markets.get(market_key)
             if totals is None:

@@ -1,0 +1,71 @@
+{
+ "_provenance": "Protocol V2 Gamma GET /events entries for the host-bench recorder (V2-2, plan row D10; docs/venue/verified-2026-10-05.md). The first market is the official V2 example: its version, outcomes, clobTokenIds (null) and positionIds are the market-details page's example (F-40; S-D16 lines 168-177, fixture test/fixtures/venue/protocol-v2/gamma-market-v2-docs-example.jsonc) and its conditionId is the 31-byte (62-hex) form of the documented V2 event (F-43; S-D17 line 281, fixture test/fixtures/venue/protocol-v2/gamma-event-v2-docs-example.jsonc). Its id, slugs, series and times are SYNTHETIC: no V2 market has been served by Gamma (O.1), so no live V2 /events entry exists to capture. The other two markets are SYNTHETIC (condition ids 0x00..0b, a 31-byte form, and 0x00..0c, a 32-byte form; V2-shaped position ids 10^74+n, 75 digits, and CTF-shaped token ids 10^76+n, 77 digits): a version v2 market with both id fields populated, and a version v1 market with both populated, for the documented rule 'Choose the ID field by version, even when both fields are present' (F-38; S-D02 line 23). No authenticated call, wallet or order produced any of it.",
+ "events": [
+  {
+   "id": "v2-0",
+   "slug": "btc-updown-5m-v2-docs-example",
+   "seriesSlug": "btc-up-or-down-5m",
+   "markets": [
+    {
+     "id": "1",
+     "version": "v2",
+     "conditionId": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+     "slug": "btc-updown-5m-v2-docs-example",
+     "eventStartTime": "2026-11-02T00:00:00Z",
+     "endDate": "2026-11-02T00:05:00Z",
+     "outcomes": "[\"Yes\", \"No\"]",
+     "clobTokenIds": null,
+     "positionIds": [
+      "651150819117105875331414918119047680898421632356043490229292782433651916800",
+      "651150819117105875331414918119047680898421632356043490229292782433651916801"
+     ],
+     "closed": false
+    }
+   ]
+  },
+  {
+   "id": "v2-1",
+   "slug": "btc-updown-5m-v2-both-fields",
+   "seriesSlug": "btc-up-or-down-5m",
+   "markets": [
+    {
+     "id": "9100001",
+     "version": "v2",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000b",
+     "slug": "btc-updown-5m-v2-both-fields",
+     "eventStartTime": "2026-11-02T00:05:00Z",
+     "endDate": "2026-11-02T00:10:00Z",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000000000021\", \"10000000000000000000000000000000000000000000000000000000000000000000000000022\"]",
+     "positionIds": [
+      "100000000000000000000000000000000000000000000000000000000000000000000000021",
+      "100000000000000000000000000000000000000000000000000000000000000000000000022"
+     ],
+     "closed": false
+    }
+   ]
+  },
+  {
+   "id": "v2-2",
+   "slug": "btc-updown-5m-v1-both-fields",
+   "seriesSlug": "btc-up-or-down-5m",
+   "markets": [
+    {
+     "id": "9100002",
+     "version": "v1",
+     "conditionId": "0x000000000000000000000000000000000000000000000000000000000000000c",
+     "slug": "btc-updown-5m-v1-both-fields",
+     "eventStartTime": "2026-11-02T00:10:00Z",
+     "endDate": "2026-11-02T00:15:00Z",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000000000031\", \"10000000000000000000000000000000000000000000000000000000000000000000000000032\"]",
+     "positionIds": [
+      "100000000000000000000000000000000000000000000000000000000000000000000000031",
+      "100000000000000000000000000000000000000000000000000000000000000000000000032"
+     ],
+     "closed": false
+    }
+   ]
+  }
+ ]
+}

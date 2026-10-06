@@ -137,7 +137,7 @@ jobs:
       # scripts spell them; each step runs its binary through `pnpm exec`. No
       # other typecheck step covers `test/fault-injection/live` (Typecheck 2/4
       # includes only `test/unit`), and 5/6 typechecks the tree's `postgres/`
-      # half too, which Integration tests 8/8 runs. As separate steps, a type
+      # half too, which Integration tests 8/9 runs. As separate steps, a type
       # error in 5/6 no longer hides 6/6's results.
       - name: Fault-injection tests 1/6 - storage-wal WAL (no container)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -204,7 +204,7 @@ jobs:
 
       # CI-2 (CI1-L5): the `test:integration` suites, one step each (see the
       # note above the typecheck steps). CI-2 split six; CI-5 added 7/7; CI-6
-      # added 8/8.
+      # added 8/8; CI-7 added 9/9.
       #
       # N5, recounted by CI-1 from each chained suite's vitest config and test
       # sources, and re-checked by CI-2: THREE of the six suites start
@@ -243,37 +243,67 @@ jobs:
       # drift pin holds it as a chained command, as CI-5 did for 7/7. Fault
       # tests 5/6 typechecks it. CI-6 renumbered 1/7 to 7/7 without
       # recounting them, as CI-5 did.
-      - name: Integration tests 1/8 - storage-postgres (Testcontainers PostgreSQL)
+      #
+      # CI-7 (CLOSEOUT-3 L1) added 9/9: the emergency CLI's real-PostgreSQL
+      # suite, `test/integration/ops-cli` (1 file, 6 tests). It runs WP-330's
+      # stop-heartbeat against WP-320's real fencing lease store, the
+      # `ops.config_change_audit` mirror, cancel-all with a really unreachable
+      # database, and the SHIPPED bundle. Until CI-7 no gate ran it. Its file
+      # starts a Testcontainers PostgreSQL in `beforeAll` through the same
+      # `startPostgresContainer` helper and `postgres:16.6-alpine` image as
+      # 1/9, so there is no new image pull and no secret. Every venue is an
+      # in-memory fake. Its bundle case runs the app's own esbuild `build`
+      # script; the Unit tests step already builds that bundle the same way on
+      # this runner (`test/unit/tooling/app-bundles-load.test.ts`). The drift
+      # pin now also fails when a workspace package's `test:integration`
+      # script, or a `test:integration:<x>` one, is missing from the chain and
+      # not recorded as an exemption (`UNCHAINED_INTEGRATION_SCRIPTS`).
+      #
+      # CI-7 also recounted every label below at its base (`28333f2`), from
+      # each config's `include` and `exclude` and the test files that call a
+      # container helper. 1/9 (16 files), 2/9 (10) and 8/9 (1) start theirs in
+      # `globalSetup`. Parquet starts a PostgreSQL in 1 of its 6 files
+      # (`trader-evidence-postgres`), and data-gateway a Redis in 1 of its 16
+      # (`publish-throughput`). Paper-trader starts its own in 22 of its 50:
+      # PostgreSQL alone in 9, Redis alone in 1, both in 12. Control-api starts
+      # none in its 22, control-api PostgreSQL one in 4 of its 5, and ops-cli
+      # one in its 1. The counts in the paragraphs above are their rounds' own,
+      # at their bases.
+      - name: Integration tests 1/9 - storage-postgres (Testcontainers PostgreSQL)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/storage-postgres test:integration
 
-      - name: Integration tests 2/8 - event-bus (Testcontainers Redis)
+      - name: Integration tests 2/9 - event-bus (Testcontainers Redis)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/event-bus test:integration
 
-      - name: Integration tests 3/8 - research-worker parquet (no container)
+      - name: Integration tests 3/9 - research-worker parquet (Testcontainers PostgreSQL in 1 of its 6 files)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/research-worker test:integration
 
-      - name: Integration tests 4/8 - data-gateway (no container)
+      - name: Integration tests 4/9 - data-gateway (Testcontainers Redis in 1 of its 16 files)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/data-gateway test:integration
 
-      - name: Integration tests 5/8 - trader paper-trader (Testcontainers PostgreSQL and Redis in 4 of its 14 files)
+      - name: Integration tests 5/9 - trader paper-trader (Testcontainers PostgreSQL and Redis in 22 of its 50 files)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/trader test:integration
 
-      - name: Integration tests 6/8 - control-api (no container)
+      - name: Integration tests 6/9 - control-api (no container)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/control-api test:integration
 
-      - name: Integration tests 7/8 - control-api PostgreSQL (Testcontainers PostgreSQL in 3 of its 4 files)
+      - name: Integration tests 7/9 - control-api PostgreSQL (Testcontainers PostgreSQL in 4 of its 5 files)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/control-api test:integration:postgres
 
-      - name: Integration tests 8/8 - live-micro fault-injection PostgreSQL half (WP-340; Testcontainers PostgreSQL; mock venue)
+      - name: Integration tests 8/9 - live-micro fault-injection PostgreSQL half (WP-340; Testcontainers PostgreSQL; mock venue)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm exec vitest run --config test/fault-injection/live/postgres/vitest.config.ts
+
+      - name: Integration tests 9/9 - ops-cli emergency CLI (WP-330; Testcontainers PostgreSQL)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/ops-cli test:integration
 
   compose:
     name: Local infrastructure compose health
