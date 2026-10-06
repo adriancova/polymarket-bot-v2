@@ -197,7 +197,7 @@ CARRIED_FACTS = [
      ("Ratified by the user on 2026-09-30", "evaluated once, half-applied"), TREE),
     # Re-anchored (RECORDS-W3): once both conditions were met, the "- Wave 3 is authorized" bullet says so;
     # the condition's wording is the first bullet of the brief's Wave 3 authorization section.
-    ("Wave 3's second condition is the CLOSED grade, not the audit (L3)",
+    ("Wave 3's closeout condition is the CLOSED grade, not the audit (L3)",
      "- the fresh Wave 2 closeout audit grades Wave 2 CLOSED",
      ["grades Wave 2 CLOSED"],
      "IMPLEMENTATION_STATUS.md", "grades Wave 2 CLOSED"),

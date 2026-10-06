@@ -119,7 +119,7 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-01 | [CONTROL-1.md](CONTROL-1.md) | `CONTROL-1`: CO2-N8, the kill switch cannot be starved via the audit log | Round | Complete (2026-10-01) | `b9d9818` | 6 KB |
 | 2026-10-01 | [CO2-N1-ADR.md](CO2-N1-ADR.md) | `CO2-N1-ADR`: ADR-031 (Proposed), admitting entries when the trader lags | Governance | Complete (2026-10-01): Proposed | `1770be3` | 5 KB |
 | 2026-10-01 | [CONTROL-1b.md](CONTROL-1b.md) | `CONTROL-1b`: authoritative no-signer checks; lock key; durable-sink prerequisites | Round | Complete (2026-10-01) | `80a06e2` | 7 KB |
-| 2026-10-02 | [THROUGHPUT-1c.md](THROUGHPUT-1c.md) | `THROUGHPUT-1c`: book freshness by feed liveness (ADR-023) | Round | Complete (2026-10-02) | `0c270df` | 6 KB |
+| 2026-10-02 | [THROUGHPUT-1c.md](THROUGHPUT-1c.md) | `THROUGHPUT-1c`: book freshness by feed liveness (ADR-023) | Round | Complete (2026-10-02) | `0c270df` | 9 KB |
 | 2026-10-02 | [WP-300c.md](WP-300c.md) | `WP-300c`: hostile evidence, refusal codes, module-load tripwires, unguessable request ids | Round | Complete (2026-10-02) | `7e05702` | 5 KB |
 | 2026-10-02 | [ADR031-ACCEPT.md](ADR031-ACCEPT.md) | `ADR031-ACCEPT`: ADR-031 Accepted; ADR-032 | Governance | Complete (2026-10-02) | `a60ee27` | 3 KB |
 | 2026-10-03 | [APPROX-REPLAY-1.md](APPROX-REPLAY-1.md) | `APPROX-REPLAY-1`: approximate replay over the research tier | WP | Complete (2026-10-03) | `86830d9` | 3 KB |
@@ -147,7 +147,7 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [GOV-NOTES-3.md](GOV-NOTES-3.md) | `GOV-NOTES-3`: ROLLOVER-1's owed governance records | Round | Complete (2026-10-05) | `c10e76e` | 3 KB |
 | 2026-10-05 | [FLAKE-KS-1.md](FLAKE-KS-1.md) | `FLAKE-KS-1`: fix the kill-switch engage flake in CI step 7/7 | Round | Complete (2026-10-05) | `f66201e` | 2 KB |
 | 2026-10-05 | [AUDIT-SWEEP.md](AUDIT-SWEEP.md) | `AUDIT-SWEEP`: remove the latent audit-bound race from control-api tests | Round | Complete (2026-10-05) | `6044450` | 2 KB |
-| 2026-10-05 | [WP-330.md](WP-330.md) | `WP-330`: the independent emergency operations CLI | WP | Complete (2026-10-05) | `c1e6909` | 5 KB |
+| 2026-10-05 | [WP-330.md](WP-330.md) | `WP-330`: the independent emergency operations CLI | WP | Complete (2026-10-05) | `c1e6909` | 6 KB |
 | 2026-10-05 | [WP-340.md](WP-340.md) | `WP-340`: live-micro fault-injection verification | WP | Complete (2026-10-05) | `73e1ba2` | 7 KB |
 | 2026-10-05 | [DEPS-3.md](DEPS-3.md) | `DEPS-3`: patch tinypool and source-map-js advisories | CI health | Complete (2026-10-05) | `1237afe` | 2 KB |
 | 2026-10-05 | [CI-6.md](CI-6.md) | `CI-6`: the Wave 3 live fault suites in CI | CI | Complete (2026-10-05) | `46aba42` | 2 KB |
