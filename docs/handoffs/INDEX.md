@@ -1,6 +1,6 @@
 # Handoff index
 
-One line per handoff in this directory, oldest first. "Added" is the date git first recorded the file. Status and merge SHAs come from `IMPLEMENTATION_STATUS.md`. Kinds: WP (a work package), FU (a follow-up to one), Governance, Audit, Round (a bounded round), Operational, Session.
+One line per handoff in this directory, oldest first. "Added" is the date git first recorded the file. A Complete package's row here is its only status row: the brief, `IMPLEMENTATION_STATUS.md`, lists open packages only ([`README.md`](README.md) rules 1 and 10). A completed package with no handoff (`DEPS-1`) has a row that links its archived row; its "Added" is its merge date. Kinds: WP (a work package), FU (a follow-up to one), Governance, Audit, Round (a bounded round), Operational, Session.
 
 After a merge, add or update the handoff's single row here (see [`README.md`](README.md)).
 
@@ -17,7 +17,7 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-08-26 | [wave-0-closeout-remediation.md](wave-0-closeout-remediation.md) | Wave 0 closeout remediation | Round | Complete (Wave 0 closed) | — | 24 KB |
 | 2026-08-27 | [WP-060.md](WP-060.md) | `WP-060`: Redis Streams event transport | WP | Complete (2026-08-27) | `af29b08` | 71 KB |
 | 2026-08-27 | [WP-070.md](WP-070.md) | `WP-070`: Polymarket public market-data adapter | WP | Complete (2026-08-27) | `f2f0258` | 106 KB |
-| 2026-08-27 | [WP-080.md](WP-080.md) | `WP-080`: Binance reference adapter; also `WP-080-FU1` (ADR-014 takerSide conformance, merged `ebda609`) | WP | Complete (2026-08-28) | `d0d66bf` | 179 KB |
+| 2026-08-27 | [WP-080.md](WP-080.md) | `WP-080`: Binance reference adapter; also `WP-080-FU1` (ADR-014 takerSide conformance; Complete (2026-08-31), merged `ebda609`) | WP | Complete (2026-08-28) | `d0d66bf` | 179 KB |
 | 2026-08-27 | [WP-090.md](WP-090.md) | `WP-090`: Coinbase reference adapter | WP | Complete (2026-08-27) | `335b1b0` | 70 KB |
 | 2026-08-28 | [GOV-1B.md](GOV-1B.md) | `GOV-1B`: contract-owner governance round | Governance | Complete (2026-08-28) | `dd61e1e` | 28 KB |
 | 2026-08-28 | [WP-100.md](WP-100.md) | `WP-100`: Polymarket RTDS Chainlink TWAP adapter | WP | Complete (2026-08-30) | `e3ac6a3` + wiring `eaf18f4` | 40 KB |
@@ -26,8 +26,8 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-01 | [WP-120.md](WP-120.md) | `WP-120`: Data gateway integration | WP | Complete (2026-09-01) | `0622f45` + wiring `2a49153` | 160 KB |
 | 2026-09-02 | [GOV-1C.md](GOV-1C.md) | `GOV-1C`: contract-owner governance round at Wave 1 closeout | Governance | Complete (2026-09-02) | `3272c4b` | 37 KB |
 | 2026-09-02 | [GOV-1D.md](GOV-1D.md) | `GOV-1D`: C-2 resolution: USDC vs pUSD denomination | Governance | Complete (2026-09-04) | `61a7ba5` | 27 KB |
-| 2026-09-02 | [WP-140.md](WP-140.md) | `WP-140`: Recorder observability and soak harness | WP | Evidence pending: the ≥24h soak (H4); the gate is open | `735d330` + wiring `5757ef3` | 53 KB |
-| 2026-09-02 | [WP-150.md](WP-150.md) | `WP-150`: Local exact-decimal order books | WP | Complete (2026-09-02) | `70c7f1f` | 32 KB |
+| 2026-09-02 | [WP-140.md](WP-140.md) | `WP-140`: Recorder observability and soak harness | WP | Evidence pending: the ≥24h soak (H4); the evidence gate is unmet. Corrected 2026-10-06 (RECORDS-W3B): was 'the gate is open'. | `735d330` + wiring `5757ef3` | 53 KB |
+| 2026-09-02 | [WP-150.md](WP-150.md) | `WP-150`: Local exact-decimal order books; a second, superseded row (its review trail) is archived | WP | Complete (2026-09-02) | `70c7f1f` | 32 KB |
 | 2026-09-02 | [WP-170.md](WP-170.md) | `WP-170`: Strategy SDK and deterministic runtime | WP | Complete (2026-09-03) | `9d0971b` | 314 KB |
 | 2026-09-02 | [WP-180.md](WP-180.md) | `WP-180`: Capital allocator and scenario risk | WP | Complete (2026-09-04) | `98a6cc1` | 339 KB |
 | 2026-09-02 | [WP-200.md](WP-200.md) | `WP-200`: Append-only ledger, allocations, positions, and PnL | WP | Complete (2026-09-03) | `7e75f9a` | 100 KB |
@@ -103,25 +103,26 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |
 | 2026-09-30 | [DURABLE-1.md](DURABLE-1.md) | `DURABLE-1`: a decision is durable before its order and ledger effects (`X1`) | Round | Complete (2026-09-30) | `6e01228` | 23 KB |
 | 2026-09-30 | [CLOSEOUT-2B-wave-2-regrade.md](CLOSEOUT-2B-wave-2-regrade.md) | `CLOSEOUT-2B`: focused re-grade of Wave 2 after `DURABLE-1` | Audit | WAVE 2 CLOSED WITH QUALIFICATIONS (with the user's CANCEL ruling) | — (an audit) | 13 KB |
-| 2026-09-30 | [LEAN-1.md](LEAN-1.md) | `LEAN-1`: a sub-$100/mo first deployment (plan and the user's rulings) | Governance | Planned; ruled H, A1-A5 | — (a plan) | 26 KB |
-| 2026-09-30 | [DEPS-2.md](DEPS-2.md) | `DEPS-2`: patch `@grpc/grpc-js` for GHSA-m9gg-hp2v-232j | Round | Complete (2026-09-30) | `c5967b4` | 1 KB |
+| 2026-09-30 | [LEAN-1.md](LEAN-1.md) | `LEAN-1`: a sub-$100/mo first deployment (plan and the user's rulings) | Governance | Complete (2026-09-30): planned; ruled H, A1-A5 | — (a plan) | 26 KB |
+| 2026-09-30 | none: [the archived row](../status-archive/work-packages-rounds.md) | `DEPS-1`: CI health: new high advisories in dev/test-only transitive dependencies | CI health | Complete (2026-09-30) | `f6a2714` | — |
+| 2026-09-30 | [DEPS-2.md](DEPS-2.md) | `DEPS-2`: patch `@grpc/grpc-js` for GHSA-m9gg-hp2v-232j (dev/test-only) | Round | Complete (2026-09-30) | `c5967b4` | 1 KB |
 | 2026-09-30 | [WP-260.md](WP-260.md) | `WP-260`: secure unified-SDK adapter and signer boundary | WP | Complete (2026-09-30) | `32d10be` | 38 KB |
 | 2026-09-30 | [HOST-BENCH-PREP.md](HOST-BENCH-PREP.md) | `HOST-BENCH-PREP`: the laptop guide and host measurement tools | Round | Complete (2026-09-30) | `1710a86` | 23 KB |
-| 2026-09-30 | [CI-3.md](CI-3.md) | `CI-3`: run the secure-SDK contract suite in CI | Round | Complete (2026-09-30) | `a145fa4` | 1 KB |
+| 2026-09-30 | [CI-3.md](CI-3.md) | `CI-3`: run the secure-SDK contract suite in CI (`WP260-L1`) | Round | Complete (2026-09-30) | `a145fa4` | 1 KB |
 | 2026-09-30 | [LEAN-GOV.md](LEAN-GOV.md) | `LEAN-GOV`: ADR-025..030 and work-plan rows for the LEAN-1 rulings | Governance | Complete (2026-09-30) | `78ba39b` | 6 KB |
 | 2026-10-01 | [WP-300.md](WP-300.md) | `WP-300`: collateral inventory and wallet operations | WP | Complete (2026-10-01) | `9cdbf32` | 9 KB |
 | 2026-10-01 | [STORAGE-1.md](STORAGE-1.md) | `STORAGE-1`: research tier, pinned windows, verified raw expiry, disk metrics | WP | Complete (2026-10-01) | `a22502b` | 10 KB |
-| 2026-10-01 | [CI-4.md](CI-4.md) | `CI-4`: run the wallet-operations contract suite in CI | Round | Complete (2026-10-01) | `4628541` | 2 KB |
+| 2026-10-01 | [CI-4.md](CI-4.md) | `CI-4`: run the wallet-operations contract suite in CI (`WP300-R1-07`) | Round | Complete (2026-10-01) | `4628541` | 2 KB |
 | 2026-10-01 | [STORAGE-GOV.md](STORAGE-GOV.md) | `STORAGE-GOV`: ADR-028 Amendment 1 | Governance | Complete (2026-10-01) | `1f75ac0` | 3 KB |
-| 2026-10-01 | [STORAGE-1b.md](STORAGE-1b.md) | `STORAGE-1b`: the storage cycle lock's round-6 LOWs | Round | Complete (2026-10-01) | `7b6499e` | 4 KB |
+| 2026-10-01 | [STORAGE-1b.md](STORAGE-1b.md) | `STORAGE-1b`: the storage cycle lock's round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Round | Complete (2026-10-01) | `7b6499e` | 4 KB |
 | 2026-10-01 | [WP-300b.md](WP-300b.md) | `WP-300b`: WP300-R10-01 and the contract suite fetch tripwire | Round | Complete (2026-10-01) | `05535ae` | 4 KB |
 | 2026-10-01 | [STORAGE-GOV2.md](STORAGE-GOV2.md) | `STORAGE-GOV2`: ADR-028 Amendment 1 corrections; ADR-029 header | Governance | Complete (2026-10-01) | `a428ba3` | 2 KB |
 | 2026-10-01 | [CONTROL-1.md](CONTROL-1.md) | `CONTROL-1`: CO2-N8, the kill switch cannot be starved via the audit log | Round | Complete (2026-10-01) | `b9d9818` | 6 KB |
-| 2026-10-01 | [CO2-N1-ADR.md](CO2-N1-ADR.md) | `CO2-N1-ADR`: ADR-031 (Proposed), admitting entries when the trader lags | Governance | Complete (2026-10-01): Proposed | `1770be3` | 5 KB |
+| 2026-10-01 | [CO2-N1-ADR.md](CO2-N1-ADR.md) | `CO2-N1-ADR`: ADR-031 (Proposed; now Accepted), admitting entries when the trader lags | Governance | Complete (2026-10-01): Proposed; ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | 5 KB |
 | 2026-10-01 | [CONTROL-1b.md](CONTROL-1b.md) | `CONTROL-1b`: authoritative no-signer checks; lock key; durable-sink prerequisites | Round | Complete (2026-10-01) | `80a06e2` | 7 KB |
-| 2026-10-02 | [THROUGHPUT-1c.md](THROUGHPUT-1c.md) | `THROUGHPUT-1c`: book freshness by feed liveness (ADR-023) | Round | Complete (2026-10-02) | `0c270df` | 9 KB |
+| 2026-10-02 | [THROUGHPUT-1c.md](THROUGHPUT-1c.md) | `THROUGHPUT-1c`: book freshness by feed liveness (ADR-023) | Round | Complete (2026-10-02): ADR-023 Accepted (ratified by the user) | `0c270df` | 9 KB |
 | 2026-10-02 | [WP-300c.md](WP-300c.md) | `WP-300c`: hostile evidence, refusal codes, module-load tripwires, unguessable request ids | Round | Complete (2026-10-02) | `7e05702` | 5 KB |
-| 2026-10-02 | [ADR031-ACCEPT.md](ADR031-ACCEPT.md) | `ADR031-ACCEPT`: ADR-031 Accepted; ADR-032 | Governance | Complete (2026-10-02) | `a60ee27` | 3 KB |
+| 2026-10-02 | [ADR031-ACCEPT.md](ADR031-ACCEPT.md) | `ADR031-ACCEPT`: ADR-031 Accepted; ADR-032 (the `WP-300c` request-token design) | Governance | Complete (2026-10-02) | `a60ee27` | 3 KB |
 | 2026-10-03 | [APPROX-REPLAY-1.md](APPROX-REPLAY-1.md) | `APPROX-REPLAY-1`: approximate replay over the research tier | WP | Complete (2026-10-03) | `86830d9` | 3 KB |
 | 2026-10-03 | [PROVENANCE-1.md](PROVENANCE-1.md) | `PROVENANCE-1`: decision provenance, durable halts and refusals | Round | Complete (2026-10-03) | `71d8b80` | 5 KB |
 | 2026-10-03 | [CO2-N1.md](CO2-N1.md) | `CO2-N1`: ADR-031's entry guard on the process clock | Round | Complete (2026-10-03) | `9869e53` | 4 KB |
@@ -132,11 +133,11 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-03 | [WP-310.md](WP-310.md) | `WP-310`: rate-limit budgets and matching-engine modes | WP | Complete (2026-10-03) | `fdf27ff` | 7 KB |
 | 2026-10-03 | [CKPT-1.md](CKPT-1.md) | `CKPT-1`: ADR-027, checkpoint on change plus a 60 s heartbeat | Round | Complete (2026-10-03) | `891ccdd` | 5 KB |
 | 2026-10-03 | [ADR033-REVIEW.md](ADR033-REVIEW.md) | `ADR033-REVIEW`: ADR-033 checked, corrected and accepted (the order heartbeat, C-12) | Round | Complete (2026-10-03) | `47575cf` | 3 KB |
-| 2026-10-04 | [TC-LOWS-1.md](TC-LOWS-1.md) | `TC-LOWS-1`: pin the open trading-core and trader LOWs | Round | Complete (2026-10-04) | `9033743` | 4 KB |
+| 2026-10-04 | [TC-LOWS-1.md](TC-LOWS-1.md) | `TC-LOWS-1`: pin the open trading-core and trader LOWs (residual round) | Round | Complete (2026-10-04) | `9033743` | 4 KB |
 | 2026-10-04 | [GOV-NOTES-1.md](GOV-NOTES-1.md) | `GOV-NOTES-1`: dated corrections to ADR-028 Amendment 1 rule 6 and wal-format §11.1 | Round | Complete (2026-10-04) | `1f99fcc` | 3 KB |
 | 2026-10-04 | [CONTROL-2.md](CONTROL-2.md) | `CONTROL-2`: open trader halts in the control API, fail closed; CONTROL-1b's LOWs | Round | Complete (2026-10-04) | `2f84ad7` | 5 KB |
-| 2026-10-04 | [FLAKES-1.md](FLAKES-1.md) | `FLAKES-1`: make the known load-sensitive tests deterministic | Round | Complete (2026-10-04) | `e476a49` | 3 KB |
-| 2026-10-04 | [VENUE-SETL-1.md](VENUE-SETL-1.md) | `VENUE-SETL-1`: series-admission venue facts and the btc-15m-updown settlement-spec prep | Round | Complete (2026-10-04) | `c373e25` | 4 KB |
+| 2026-10-04 | [FLAKES-1.md](FLAKES-1.md) | `FLAKES-1`: make the known load-sensitive tests deterministic (tests only) | Round | Complete (2026-10-04) | `e476a49` | 3 KB |
+| 2026-10-04 | [VENUE-SETL-1.md](VENUE-SETL-1.md) | `VENUE-SETL-1`: series-admission venue facts and the btc-15m-updown settlement-spec prep (docs and seed values) | Round | Complete (2026-10-04) | `c373e25` | 4 KB |
 | 2026-10-04 | [CAP-1.md](CAP-1.md) | `CAP-1`: a filled order's capital never vanishes from the cap check or the loss limits | Round | Complete (2026-10-04) | `b72acc7` | 5 KB |
 | 2026-10-04 | [GOV-NOTES-2.md](GOV-NOTES-2.md) | `GOV-NOTES-2`: the remaining stale wal-format and Prometheus README passages | Round | Complete (2026-10-04) | `2776a8c` | 2 KB |
 | 2026-10-04 | [WP-290.md](WP-290.md) | `WP-290`: account reconciliation | WP | Complete (2026-10-04) | `7a53988` | 6 KB |
@@ -145,17 +146,17 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [WP-320.md](WP-320.md) | `WP-320`: heartbeat health lease, fencing, geoblock and kill controls | WP | Complete (2026-10-05) | `ed6e5a0` | 6 KB |
 | 2026-10-05 | [RTDS-RETIRE.md](RTDS-RETIRE.md) | `RTDS-RETIRE`: retire the RTDS reference-price producer (V3-C13) | Round | Complete (2026-10-05) | `81f683a` | 3 KB |
 | 2026-10-05 | [GOV-NOTES-3.md](GOV-NOTES-3.md) | `GOV-NOTES-3`: ROLLOVER-1's owed governance records | Round | Complete (2026-10-05) | `c10e76e` | 3 KB |
-| 2026-10-05 | [FLAKE-KS-1.md](FLAKE-KS-1.md) | `FLAKE-KS-1`: fix the kill-switch engage flake in CI step 7/7 | Round | Complete (2026-10-05) | `f66201e` | 2 KB |
-| 2026-10-05 | [AUDIT-SWEEP.md](AUDIT-SWEEP.md) | `AUDIT-SWEEP`: remove the latent audit-bound race from control-api tests | Round | Complete (2026-10-05) | `6044450` | 2 KB |
+| 2026-10-05 | [FLAKE-KS-1.md](FLAKE-KS-1.md) | `FLAKE-KS-1`: fix the kill-switch engage flake in CI step 7/7 (one test file) | Round | Complete (2026-10-05) | `f66201e` | 2 KB |
+| 2026-10-05 | [AUDIT-SWEEP.md](AUDIT-SWEEP.md) | `AUDIT-SWEEP`: remove the latent audit-bound race from control-api tests (tests only) | Round | Complete (2026-10-05) | `6044450` | 2 KB |
 | 2026-10-05 | [WP-330.md](WP-330.md) | `WP-330`: the independent emergency operations CLI | WP | Complete (2026-10-05) | `c1e6909` | 6 KB |
 | 2026-10-05 | [WP-340.md](WP-340.md) | `WP-340`: live-micro fault-injection verification | WP | Complete (2026-10-05) | `73e1ba2` | 7 KB |
-| 2026-10-05 | [DEPS-3.md](DEPS-3.md) | `DEPS-3`: patch tinypool and source-map-js advisories | CI health | Complete (2026-10-05) | `1237afe` | 2 KB |
+| 2026-10-05 | [DEPS-3.md](DEPS-3.md) | `DEPS-3`: patch tinypool and source-map-js advisories (dev/test only) | CI health | Complete (2026-10-05) | `1237afe` | 2 KB |
 | 2026-10-05 | [CI-6.md](CI-6.md) | `CI-6`: the Wave 3 live fault suites in CI | CI | Complete (2026-10-05) | `46aba42` | 2 KB |
 | 2026-10-05 | [TRADER-SIGNALS.md](TRADER-SIGNALS.md) | `TRADER-SIGNALS`: graceful stop; paper fills in the example PAPER config | Round | Complete (2026-10-05) | `3926f5f` | 4 KB |
 | 2026-10-05 | [VENUE-4.md](VENUE-4.md) | `VENUE-4`: Protocol V2 and Data API v2 venue facts, and the migration plan | Venue | Complete (2026-10-05) | `f925a43` | 6 KB |
 | 2026-10-06 | [CLOSEOUT-3-wave-3-closeout.md](CLOSEOUT-3-wave-3-closeout.md) | `CLOSEOUT-3`: fresh Wave 3 closeout audit (runbook §10) | Audit | WAVE 3 IS COMPLETE WITH QUALIFICATIONS | — (an audit) | 35 KB |
-| 2026-10-06 | [V2-0.md](V2-0.md) | `V2-0`: Protocol V2 ADR amendments and the user's rulings | Governance | Complete (2026-10-06) | `5f2b3c8` | 4 KB |
-| 2026-10-06 | [CI-7.md](CI-7.md) | `CI-7`: the ops-cli real-PostgreSQL suite in the integration chain and CI | CI | Complete (2026-10-06) | `9e28bc2` | 2 KB |
+| 2026-10-06 | [V2-0.md](V2-0.md) | `V2-0`: Protocol V2 ADR amendments and the user's rulings (docs only) | Governance | Complete (2026-10-06) | `5f2b3c8` | 4 KB |
+| 2026-10-06 | [CI-7.md](CI-7.md) | `CI-7`: the ops-cli real-PostgreSQL suite in the integration chain and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | CI | Complete (2026-10-06) | `9e28bc2` | 2 KB |
 | 2026-10-06 | [V2-2.md](V2-2.md) | `V2-2`: Protocol V2 market-data path and recorded-data readers | WP | Complete (2026-10-06) | `9836ab0` | 3 KB |
 | 2026-10-06 | [V2-1.md](V2-1.md) | `V2-1`: Protocol V2 version-selected identifiers and series admission | WP | Complete (2026-10-06) | `8558053` | 3 KB |
 | 2026-10-06 | [RECORDS-W3.md](RECORDS-W3.md) | `RECORDS-W3`: records hygiene after the Wave 3 closeout | Records | Complete (2026-10-06) | `b008a26` | 4 KB |

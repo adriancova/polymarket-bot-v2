@@ -35,173 +35,25 @@ This file is the brief: current state only, one entry per item. The full history
 
 ## Authorized now
 
-Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id). Completed packages are under [Work packages](#work-packages); what each closed is under [Open blockers](#open-blockers).
+Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id). Completed packages are in [`docs/handoffs/INDEX.md`](docs/handoffs/INDEX.md); what each closed is under [Open blockers](#open-blockers).
 
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - Wave 3 is authorized, and both conditions hold ([Wave 3 authorization](#wave-3-authorization-conditional)).
 
 ## Work packages
 
-One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000` to `WP-250` in [`work-packages-waves-0-2.md`](docs/status-archive/work-packages-waves-0-2.md); `WP-180-FU3` onward in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md). Completion records are in the `completion-records-*` archive files.
+One line per open package. Full rows (chains, reviews, scope, paths, gates): `WP-000` to `WP-250` in [`work-packages-waves-0-2.md`](docs/status-archive/work-packages-waves-0-2.md); `WP-180-FU3` onward in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md). Completion records are in the `completion-records-*` archive files.
+
+Completed packages are listed in [`docs/handoffs/INDEX.md`](docs/handoffs/INDEX.md), one row each, with the merge SHA and the handoff link.
 
 | Package | Scope | Status | Merge | Record |
 | --- | --- | --- | --- | --- |
-| `WP-000` | Venue verification and sanitized fixtures | Complete (2026-08-26) | `d427f00` | [WP-000](docs/handoffs/WP-000.md) |
-| `WP-010` | Monorepo, CI, compose, and quality gates | Complete (2026-08-22) | `12ce0ab` | [WP-010](docs/handoffs/WP-010.md) |
-| `WP-020` | Domain contracts and exact decimal types | Complete (2026-08-26) | `25bc451` | [WP-020](docs/handoffs/WP-020.md) |
-| `WP-030` | Initial ADR and contract documentation | Complete (2026-08-26) | `59cf254` | [WP-030](docs/handoffs/WP-030.md) |
-| `WP-015` | Dependency-direction CI enforcement | Complete (2026-08-27) | `d77b2ba` | [WP-015](docs/handoffs/WP-015.md) |
-| `WP-040` | PostgreSQL schemas and migrations | Complete (2026-08-26) | `d23bb67` | [WP-040](docs/handoffs/WP-040.md) |
-| `WP-050` | WAL, segment manifests, and crash recovery | Complete (2026-08-26) | `8a607ec` | [WP-050](docs/handoffs/WP-050.md) |
-| `WP-060` | Redis Streams event transport | Complete (2026-08-27) | `af29b08` | [WP-060](docs/handoffs/WP-060.md) |
-| `WP-090` | Coinbase reference adapter | Complete (2026-08-27) | `335b1b0` | [WP-090](docs/handoffs/WP-090.md) |
-| `WP-070` | Polymarket public market-data adapter | Complete (2026-08-27) | `f2f0258` | [WP-070](docs/handoffs/WP-070.md) |
-| `WP-080` | Binance reference adapter | Complete (2026-08-28) | `d0d66bf` | [WP-080](docs/handoffs/WP-080.md) |
-| `WP-100` | Polymarket RTDS Chainlink TWAP adapter | Complete (2026-08-30) | `e3ac6a3` + wiring `eaf18f4` | [WP-100](docs/handoffs/WP-100.md) |
-| `WP-110` | Universe and settlement specifications | Complete (2026-08-31) | `ea81f5f` | [WP-110](docs/handoffs/WP-110.md) |
-| `GOV-1B` | contract-owner governance round | Complete (2026-08-28) | `dd61e1e` | [GOV-1B](docs/handoffs/GOV-1B.md) |
-| `WP-130` | Parquet compactor and dataset manifests | Complete (2026-08-31) | `cfa353b` + wiring `24903d2` | [WP-130](docs/handoffs/WP-130.md) |
-| `WP-080-FU1` | ADR-014 takerSide conformance | Complete (2026-08-31) | `ebda609` | [WP-080](docs/handoffs/WP-080.md), FU1 section |
-| `WP-120` | Data gateway integration | Complete (2026-09-01) | `0622f45` + wiring `2a49153` | [WP-120](docs/handoffs/WP-120.md) |
 | `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
-| `GOV-1C` | contract-owner governance round at Wave 1 closeout | Complete (2026-09-02) | `3272c4b` | [GOV-1C](docs/handoffs/GOV-1C.md) |
-| `WP-150` | Local exact-decimal order books | Complete (2026-09-02) | `70c7f1f` | [WP-150](docs/handoffs/WP-150.md) |
-| `WP-170` | Strategy SDK and deterministic runtime | Complete (2026-09-03) | `9d0971b` | [WP-170](docs/handoffs/WP-170.md) |
-| `WP-180` | Capital allocator and scenario risk | Complete (2026-09-04) | `98a6cc1` | [WP-180](docs/handoffs/WP-180.md) |
-| `WP-200` | Append-only ledger, allocations, positions, and PnL | Complete (2026-09-03) | `7e75f9a` | [WP-200](docs/handoffs/WP-200.md) |
-| `WP-210` | Replay clock, event source, simulated venue, and fill models | Complete (2026-09-04) | `bebdd85` + wiring `5b73461` | [WP-210](docs/handoffs/WP-210.md) |
-| `WP-180-FU2` | mirror collapse to canonical `packages/risk` | Complete (2026-09-04) | `625c83b` | [WP-180-FU2](docs/handoffs/WP-180-FU2.md) |
-| `WP-220` | Static Bracket strategy | Complete (2026-09-05) | `b8f7864` | [WP-220](docs/handoffs/WP-220.md) |
-| `WP-200-FU1` | ledger/pnl schema-boundary door | Complete (2026-09-05) | `a30fec8` | [WP-200-FU1](docs/handoffs/WP-200-FU1.md) |
-| `GOV-2A` | cross-package schema-boundary governance round | Complete (2026-09-04) | `b4b720a` | [GOV-2A](docs/handoffs/GOV-2A.md) |
-| `GOV-1D` | C-2 resolution: USDC vs pUSD denomination | Complete (2026-09-04) | `61a7ba5` | [GOV-1D](docs/handoffs/GOV-1D.md) |
-| `WP-160` | Versioned feature engine | Complete (2026-09-04) | `3d49946` | [WP-160](docs/handoffs/WP-160.md) |
-| `WP-190` | Execution planner contracts and paper implementation | Complete (2026-09-04) | `5aa11e3` | [WP-190](docs/handoffs/WP-190.md) |
-| `WP-150` | superseded row: the WP-150 review trail | Superseded | — | [WP-150](docs/handoffs/WP-150.md) |
-| `WP-020-FU1` | decimal/risk index-0 family round | Complete (2026-09-05) | `edf6b1d` | [WP-020-FU1](docs/handoffs/WP-020-FU1.md) |
-| `WP-230` | Paper trader integration | Complete (2026-09-05) | `8425e03` + wiring `af059d7` | [WP-230](docs/handoffs/WP-230.md) |
-| `WP-170-FU1` | strategy-runtime schema-boundary door | Complete (2026-09-06) | `d89841d` | [WP-170-FU1](docs/handoffs/WP-170-FU1.md) |
-| `WP-240` | Control API and paper dashboards | Complete (2026-09-06) | `0e7227d` + wiring `80126e8` | [WP-240](docs/handoffs/WP-240.md) |
-| `WP-250` | Determinism and paper end-to-end verification | Complete (2026-09-06) | `ce7fbe0` + wiring `da37a0c` | [WP-250](docs/handoffs/WP-250.md) |
-| `WP-180-FU3` | packages/risk remainder round | Complete (2026-09-06) | `8c14b47` | [WP-180-FU3](docs/handoffs/WP-180-FU3.md) |
-| `WP-160-FU1` | features output-side hardening | Complete (2026-09-06) | `5faf16b` | [WP-160-FU1](docs/handoffs/WP-160-FU1.md) |
-| `REC-1` | recorder-pipeline hardening round | Complete (2026-09-06) | `327cae7` | [REC-1](docs/handoffs/REC-1.md) |
-| `ALLOC-1` | capital-allocator strategyInstanceId re-typing | Complete (2026-09-06) | `d9f70a6` | [ALLOC-1](docs/handoffs/ALLOC-1.md) |
-| `TRDR-1` | apps/trader instanceId relaxation | Complete (2026-09-07) | `65ae56c` | [TRDR-1](docs/handoffs/TRDR-1.md) |
-| `UNIV-1` | packages/universe lifecycle door | Complete (2026-09-07) | `4d7443b` | [UNIV-1](docs/handoffs/UNIV-1.md) |
-| `SETL-1` | packages/settlement spec door | Complete (2026-09-07) | `af991ee` | [SETL-1](docs/handoffs/SETL-1.md) |
-| `CLOB-1` | polymarket-public CLOB doors | Complete (2026-09-07) | `eb0c586` | [CLOB-1](docs/handoffs/CLOB-1.md) |
-| `UNIV-2` | universe registration + envelope doors | Complete (2026-09-07) | `f90ff05` | [UNIV-2](docs/handoffs/UNIV-2.md) |
-| `SETL-2` | settlement observation/evaluation door | Complete (2026-09-07) | `6142e66` | [SETL-2](docs/handoffs/SETL-2.md) |
-| `UNIV-3` | universe state-side round | Complete (2026-09-07) | `cbc1ed3` | [UNIV-3](docs/handoffs/UNIV-3.md) |
-| `WP-060-FU1` | event-bus envelope door | Complete (2026-09-11) | `d869868` | [WP-060-FU1](docs/handoffs/WP-060-FU1.md) |
-| `WP-200-FU2` | ledger/pnl own accumulators | Complete (2026-09-07) | `af4aacc` | [WP-200-FU2](docs/handoffs/WP-200-FU2.md) |
-| `SER-1` | own-data JSON encoder + accounting keys | Complete (2026-09-15) | `c065d63` | [SER-1](docs/handoffs/SER-1.md) |
-| `SER-2` | durable bytes: WAL, Parquet, PostgreSQL | Complete (2026-09-15) | `0d8b6a0` | [SER-2](docs/handoffs/SER-2.md) |
-| `SER-3` | outbound bytes, runtime decisions, soak artifacts | Complete (2026-09-15) | `603a49c` | [SER-3](docs/handoffs/SER-3.md) |
-| `GOV-2B` | Wave 2 closeout audit | Complete (2026-09-15) | — (an audit; no merge) | [GOV-2B-wave-2-closeout](docs/handoffs/GOV-2B-wave-2-closeout.md) |
-| `TRDR-2` | the pnl_snapshots column binding — GOV-2B **B1** | Complete (2026-09-15) | `f3da220` | [TRDR-2](docs/handoffs/TRDR-2.md) |
-| `RISK-2` | protective-reduction recognition — GOV-2B **B2** | Complete (2026-09-15) | `133eac1` | [RISK-2](docs/handoffs/RISK-2.md) |
-| `GATE-1` | gate the evidence; clear the audit step — GOV-2B **B6**, **B7**, N4, N5 | Complete (2026-09-15) | `0434c82` | [GATE-1](docs/handoffs/GATE-1.md) |
-| `BOOT-1` | the durable trader's bootstrap rows — GOV-2B **B9**, raised by the TRDR-2 review | Complete (2026-09-16) | `0d09eb5` | [BOOT-1](docs/handoffs/BOOT-1.md) |
-| `BACKTEST-1` | the replay composition root — GOV-2B **B3** | Complete (2026-09-16) | `b462501` | [BACKTEST-1](docs/handoffs/BACKTEST-1.md) |
-| `GOV-2C` | ledger integrity and the contract-owner docs debt — GOV-2B **B8**, N2, N3, N6, N7, N9, N10, G-13 | Complete (2026-09-16) | `33c36f9` | [GOV-2C](docs/handoffs/GOV-2C.md) |
-| `VENUE-2` | the phase-2 venue gate — GOV-2B **G-01** | Complete (2026-09-17) | `d6aedee` | [VENUE-2](docs/handoffs/VENUE-2.md) |
-| `UNIV-4` | the market lifecycle producer — closeout blocker **B10**, found by `BACKTEST-1` | Complete (2026-09-17) | `7c08af7` | [UNIV-4](docs/handoffs/UNIV-4.md) |
-| `TRDR-3` | the trader health endpoint and an exact-decimal PnL producer — GOV-2B **B5**'s code half, R4 | Complete (2026-09-17) | `da9c58e` | [TRDR-3](docs/handoffs/TRDR-3.md) |
-| `CI-1` | the first real CI run's failure; GATE1-R4; N5 | Complete (2026-09-26) | `7248073` | [CI-1](docs/handoffs/CI-1.md) |
-| `RECON-1` | the e2e reconciler's two latent traps — `RISK2-R3`, `RISK2-R4` | Complete (2026-09-26) | `de58d83` | [RECON-1](docs/handoffs/RECON-1.md) |
-| `CI-2` | four of `CI-1`'s review LOWs — `CI1-L1`, `CI1-L3`, `CI1-L4`, `CI1-L5`; `CI1-L2` is `LINT-1` | Complete (2026-09-26) | `6325d10` | [CI-2](docs/handoffs/CI-2.md) |
-| `RECON-2` | `RECON-1`'s four residuals — `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE` | Complete (2026-09-26) | `a4d1159` | [RECON-2](docs/handoffs/RECON-2.md) |
-| `LINT-1` | `CI1-L2`: nothing catches a floating promise | Complete (2026-09-26) | `e3a3389` | [LINT-1](docs/handoffs/LINT-1.md) |
-| `TRDR-4` | the trader loop's unbounded state — `RECON2-LOOPMEM`, widened by scoping | Complete (2026-09-27) | `fea251f` | [TRDR-4](docs/handoffs/TRDR-4.md) |
-| `SIM-1` | LOOPMEM-SIM part 1: `SimulatedVenue` CORRECTNESS, which bounding depends on | Complete (2026-09-27) | `93c7bbd` | [SIM-1](docs/handoffs/SIM-1.md) |
-| `SIM-2` | LOOPMEM-SIM part 2: BOUND `SimulatedVenue` | Complete (2026-09-27) | `04bf9d8` | [SIM-2](docs/handoffs/SIM-2.md) |
-| `FOLD-1` | LOOPMEM-FOLD Option 2: the ledger view and PnL updated IN PLACE, with a rebuild-equals-incremental check | Complete (2026-09-27) | `2c0bd21` | [FOLD-1](docs/handoffs/FOLD-1.md) |
-| `BRACKET-1a` | RISK-2 residual 5: the protective reduce gets an order track, so an instance survives its own exit | Complete (2026-09-28) | `11969f3` | [BRACKET-1a](docs/handoffs/BRACKET-1a.md) |
-| `BRACKET-1b` | §7 item 1 evidence: a two-bracket e2e run with a FILLED take-profit; the reconciler learns two brackets; `RECON2-EVENTHOP` | Complete (2026-09-28) | `7252150` | [BRACKET-1b](docs/handoffs/BRACKET-1b.md) |
-| `BRACKET-1c` | §7 item 1: one DURABLE two-bracket round trip — real PostgreSQL + real Redis through the real composition root | Complete (2026-09-28) | `6e06c50` | [BRACKET-1c](docs/handoffs/BRACKET-1c.md) |
-| `BUNDLE-1` | H1 blocker M18: the trader's shipped bundle crashes at load | Complete (2026-09-28) | `fd30e5f` | [BUNDLE-1](docs/handoffs/BUNDLE-1.md) |
-| `SNAP-1` | H1 blocker `BRACKET1C-SNAPKEY`: one PnL snapshot per instance per instant | Complete (2026-09-28) | `fff844d` | [SNAP-1](docs/handoffs/SNAP-1.md) |
-| `H8-GOV` | the H8 track, round 1: ADR-022 + a staged dependency-contract amendment + work-plan ratification; documentation only | Complete (2026-09-28) | `bb58edb` | [H8-GOV](docs/handoffs/H8-GOV.md) |
-| `DEPCHECK-1` | the H8 track's checker-hardening round: F10, app-endpoint CHK, F16's relative half, stale-row CHK; ride-alongs `CI2-L5-2`/`CI2-L5-3` | Complete (2026-09-28) | `d7f2906` | [DEPCHECK-1](docs/handoffs/DEPCHECK-1.md) |
-| `CORE-MOVE` | the H8 track, round 3: MOVE the paper core into `packages/trading-core`; move-only | Complete (2026-09-28) | `33b7d0b` | [CORE-MOVE](docs/handoffs/CORE-MOVE.md) |
-| `BACKTEST-2` | the H8 track, round 4: the backtest CLI builds the real trading core; closes blocker B3 | Complete (2026-09-28) | `fd12be0` | [BACKTEST-2](docs/handoffs/BACKTEST-2.md) |
-| `DOCS-1` | append-only documentation owed by the H8 track | Complete (2026-09-28) | `2e7f618` | [DOCS-1](docs/handoffs/DOCS-1.md) |
-| `OUTAGE-1` | pre-H1 outage hardening: Redis unreachable at start → a documented refusal; a Redis outage mid-run → a bounded, fail-closed halt instead of a hang; registered config parameters checked | Complete (2026-09-29) | `143ad8d` | [OUTAGE-1](docs/handoffs/OUTAGE-1.md) |
-| `REGISTER-1` | pre-H1: an operator registration command | Complete (2026-09-29) | `7f1ebc0` | [REGISTER-1](docs/handoffs/REGISTER-1.md) |
-| `OUTAGE-2` | make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt | Complete (2026-09-29) | `a618752` | [OUTAGE-2](docs/handoffs/OUTAGE-2.md) |
-| `THROUGHPUT-1a` | the trader keeps pace with a live 15-minute market; its stream lag is visible | Complete (2026-09-30) | `229d58a` | [THROUGHPUT-1a](docs/handoffs/THROUGHPUT-1a.md) |
-| `THROUGHPUT-1b` | the gateway publishes a window-open burst without overflowing; the example config subscribes to books | Complete (2026-09-30) | `c179095` | [THROUGHPUT-1b](docs/handoffs/THROUGHPUT-1b.md) |
-| `THROUGHPUT-1c` | book freshness by feed liveness, not by the last change | Complete (2026-10-02): ADR-023 Accepted (ratified by the user) | `0c270df` | [THROUGHPUT-1c](docs/handoffs/THROUGHPUT-1c.md) |
-| `DEPS-1` | CI health: new high advisories in dev/test-only transitive dependencies | Complete (2026-09-30) | `f6a2714` | the archived row |
-| `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Complete (2026-09-30) | `7d59fd3` | [THROUGHPUT-2](docs/handoffs/THROUGHPUT-2.md) |
-| `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
-| `LOGS-1` | records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim | Complete (2026-09-30) | `7ac7985` | [LOGS-1](docs/handoffs/LOGS-1.md) |
-| `CLOSEOUT-2` | fresh Wave 2 closeout audit (runbook §10) | Complete (2026-09-30): WAVE 2 NOT CLOSED, blocker `X1` | — (an audit; no merge) | [CLOSEOUT-2](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md) |
-| `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | Complete (2026-09-30) | `6e01228` | [DURABLE-1](docs/handoffs/DURABLE-1.md) |
-| `CLOSEOUT-2B` | focused re-grade of Wave 2 after `DURABLE-1` | Complete (2026-09-30): WAVE 2 CLOSED WITH QUALIFICATIONS, after the user's CANCEL ruling | — (an audit; no merge) | [CLOSEOUT-2B](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md) |
-| `WP-260` | Secure unified-SDK adapter and signer boundary | Complete (2026-09-30) | `32d10be` | [WP-260](docs/handoffs/WP-260.md) |
-| `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
-| `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
-| `WP-300` | Collateral inventory and wallet operations | Complete (2026-10-01) | `9cdbf32` | [WP-300](docs/handoffs/WP-300.md) |
-| `CI-4` | run WP-300's wallet-operations contract suite in CI (`WP300-R1-07`) | Complete (2026-10-01) | `4628541` | [CI-4](docs/handoffs/CI-4.md) |
-| `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
-| `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | Complete (2026-09-30) | `78ba39b` | [LEAN-GOV](docs/handoffs/LEAN-GOV.md) |
-| `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
-| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | Complete (2026-10-01) | `a22502b` | [STORAGE-1](docs/handoffs/STORAGE-1.md) |
-| `STORAGE-GOV` | ADR-028 amendment: the retention-safety rules as implemented | Complete (2026-10-01) | `1f75ac0` | [STORAGE-GOV](docs/handoffs/STORAGE-GOV.md) |
-| `STORAGE-1b` | the storage cycle lock's two round-6 LOWs (`STORAGE1-LOCK-LOWS`) | Complete (2026-10-01) | `7b6499e` | [STORAGE-1b](docs/handoffs/STORAGE-1b.md) |
-| `WP-300b` | `WP300-R10-01` and the contract suite's fetch tripwire | Complete (2026-10-01) | `05535ae` | [WP-300b](docs/handoffs/WP-300b.md) |
-| `CONTROL-1` | `CO2-N8`: the control API's M-1 and M-3 (kill-switch starvation) and owned LOWs | Complete (2026-10-01) | `b9d9818` | [CONTROL-1](docs/handoffs/CONTROL-1.md) |
-| `CO2-N1-ADR` | ADR-031: the design decision `CO2-N1` needs (now Accepted) | Complete (2026-10-01): ADR-031 ruled by the user 2026-10-02, option (a) | `1770be3` | [CO2-N1-ADR](docs/handoffs/CO2-N1-ADR.md) |
-| `PROVENANCE-1` | decision provenance, durable halts and refusals; raw WAL expiry where a trader runs | Complete (2026-10-03) | `71d8b80` | [PROVENANCE-1](docs/handoffs/PROVENANCE-1.md) |
-| `CO2-N1` | ADR-031 option (a): the entry guard on the process clock | Complete (2026-10-03) | `9869e53` | [CO2-N1](docs/handoffs/CO2-N1.md) |
-| `WP-270` | OMS and signed-order persistence (Wave 3, PAPER only) | Complete (2026-10-03) | `259c964` | [WP-270](docs/handoffs/WP-270.md) |
-| `WP-280` | Authenticated user-stream adapter (Wave 3, PAPER only) | Complete (2026-10-03) | `065716f` | [WP-280](docs/handoffs/WP-280.md) |
-| `WP-310` | Rate-limit budgets and matching-engine modes (Wave 3, PAPER only) | Complete (2026-10-03) | `fdf27ff` | [WP-310](docs/handoffs/WP-310.md) |
-| `ADR033-REVIEW` | ADR-033: the order heartbeat behind a port, checked, corrected and accepted (docs only) | Complete (2026-10-03) | `47575cf` | [ADR033-REVIEW](docs/handoffs/ADR033-REVIEW.md) |
-| `ROLLOVER-1` | ADR-030: series auto-admission and multi-window runs | Complete (2026-10-05) | `ae11daa` | [ROLLOVER-1](docs/handoffs/ROLLOVER-1.md) |
-| `WP-290` | Account reconciliation (Wave 3, PAPER only) | Complete (2026-10-04) | `7a53988` | [WP-290](docs/handoffs/WP-290.md) |
-| `WP-320` | Heartbeat health lease, fencing, geoblock and kill controls (Wave 3, PAPER only) | Complete (2026-10-05) | `ed6e5a0` | [WP-320](docs/handoffs/WP-320.md) |
-| `RTDS-RETIRE` | Retire the RTDS reference-price producer (V3-C13); keep historical readers | Complete (2026-10-05) | `81f683a` | [RTDS-RETIRE](docs/handoffs/RTDS-RETIRE.md) |
-| `GOV-NOTES-3` | ROLLOVER-1's owed governance records: ADR-030 and ADR-023 amendments, `SeriesWindowAdmitted@1` records (docs only) | Complete (2026-10-05) | `c10e76e` | [GOV-NOTES-3](docs/handoffs/GOV-NOTES-3.md) |
-| `FLAKE-KS-1` | Fix the kill-switch engage flake in CI step 7/7 (one test file) | Complete (2026-10-05) | `f66201e` | [FLAKE-KS-1](docs/handoffs/FLAKE-KS-1.md) |
-| `AUDIT-SWEEP` | Remove the latent audit-bound race from control-api tests (tests only) | Complete (2026-10-05) | `6044450` | [AUDIT-SWEEP](docs/handoffs/AUDIT-SWEEP.md) |
-| `WP-330` | Independent emergency operations CLI (Wave 3, PAPER only) | Complete (2026-10-05) | `c1e6909` | [WP-330](docs/handoffs/WP-330.md) |
-| `WP-340` | Live-micro fault-injection verification (Wave 3, PAPER only) | Complete (2026-10-05) | `73e1ba2` | [WP-340](docs/handoffs/WP-340.md) |
-| `CI-6` | The Wave 3 live fault suites run in `test:fault` and CI | Complete (2026-10-05) | `46aba42` | [CI-6](docs/handoffs/CI-6.md) |
-| `TRADER-SIGNALS` | A graceful SIGINT/SIGTERM stop; paper fills in the example PAPER config | Complete (2026-10-05) | `3926f5f` | [TRADER-SIGNALS](docs/handoffs/TRADER-SIGNALS.md) |
-| `DEPS-3` | Patch the `tinypool` and `source-map-js` advisories (dev/test only) | Complete (2026-10-05) | `1237afe` | [DEPS-3](docs/handoffs/DEPS-3.md) |
-| `VENUE-4` | Protocol V2 and Data API v2 venue facts, and the migration plan | Complete (2026-10-05) | `f925a43` | [VENUE-4](docs/handoffs/VENUE-4.md) |
-| `CLOSEOUT-3` | The fresh read-only Wave 3 closeout audit (runbook §10) | WAVE 3 IS COMPLETE WITH QUALIFICATIONS (2026-10-06) | — (an audit) | [CLOSEOUT-3](docs/handoffs/CLOSEOUT-3-wave-3-closeout.md) |
-| `V2-0` | Protocol V2 governance: the dated ADR amendments and the user's rulings (docs only) | Complete (2026-10-06) | `5f2b3c8` | [V2-0](docs/handoffs/V2-0.md) |
-| `V2-1` | Protocol V2 version-selected identifiers and series admission (class A, PAPER) | Complete (2026-10-06) | `8558053` | [V2-1](docs/handoffs/V2-1.md) |
 | `V2-3` | Protocol V2 resolution via a journaled `/v2/resolutions` read, and not-yet-admissible windows (class A, PAPER; dual verifiers; due 2026-10-28) | **Running** (authorized 2026-10-06) | — | — |
-| `V2-5` | `@polymarket/client` 0.11.0 → 0.12.0 in `polymarket-secure` (security review) | Complete (2026-10-06) | `1d9bfb0` | [V2-5](docs/handoffs/V2-5.md) |
 | `V2-10` | Simulation fill fidelity: F-63 floor in base units; FOK/FAK BUYs target collateral | **Running** (authorized 2026-10-06) | — | — |
 | `RECORDS-W3B` | Completed packages leave this table for `docs/handoffs/INDEX.md` (budget fix) | **Running** (authorized 2026-10-06) | — | — |
-| `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER) | Complete (2026-10-06) | `9836ab0` | [V2-2](docs/handoffs/V2-2.md) |
-| `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | Complete (2026-10-06) | `9e28bc2` | [CI-7](docs/handoffs/CI-7.md) |
-| `RECORDS-W3` | Records hygiene after `CLOSEOUT-3` (brief under budget, ADR headers, runbook, tooling) | Complete (2026-10-06) | `b008a26` | [RECORDS-W3](docs/handoffs/RECORDS-W3.md) |
-| `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
-| `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
-| `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
-| `CONTROL-2` | Open trader halts in the control API, fail closed; `CONTROL-1b`'s LOWs | Complete (2026-10-04) | `2f84ad7` | [CONTROL-2](docs/handoffs/CONTROL-2.md) |
-| `FLAKES-1` | Make the known load-sensitive tests deterministic (tests only) | Complete (2026-10-04) | `e476a49` | [FLAKES-1](docs/handoffs/FLAKES-1.md) |
-| `VENUE-SETL-1` | Series-admission venue facts; `btc-15m-updown` settlement-spec prep (docs and seed values) | Complete (2026-10-04) | `c373e25` | [VENUE-SETL-1](docs/handoffs/VENUE-SETL-1.md) |
-| `CAP-1` | A filled order's capital never vanishes from the cap check or the loss limits (`CAP-OVERSHOOT`) | Complete (2026-10-04) | `b72acc7` | [CAP-1](docs/handoffs/CAP-1.md) |
-| `GOV-NOTES-2` | Remaining stale wal-format and Prometheus README passages (docs only) | Complete (2026-10-04) | `2776a8c` | [GOV-NOTES-2](docs/handoffs/GOV-NOTES-2.md) |
-| `CI-5` | The OMS and reconciliation fault suites, and the control-api PostgreSQL suite, run in CI | Complete (2026-10-05) | `31b668d` | [CI-5](docs/handoffs/CI-5.md) |
-| `CADENCE-1` | ADR-026: evaluation cadence, once per market per second of event time | Complete (2026-10-03) | `8d7086a` | [CADENCE-1](docs/handoffs/CADENCE-1.md) |
-| `APPROX-REPLAY-1` | approximate replay over the research tier (ADR-029) | Complete (2026-10-03) | `86830d9` | [APPROX-REPLAY-1](docs/handoffs/APPROX-REPLAY-1.md) |
-| `WALCAP-1` | the WAL cap after expiry, required on the laptop profile, visible; the stall-bound flake | Complete (2026-10-03) | `da559ca` | [WALCAP-1](docs/handoffs/WALCAP-1.md) |
-| `ADR031-ACCEPT` | ADR-031 Accepted with the user's ruling and its round-2 LOWs; ADR-032 (the `WP-300c` request-token design) | Complete (2026-10-02) | `a60ee27` | [ADR031-ACCEPT](docs/handoffs/ADR031-ACCEPT.md) |
-| `CONTROL-1b` | `CONTROL1-LOWS`: the no-signer scan, the lock key, durable-sink prerequisites | Complete (2026-10-01) | `80a06e2` | [CONTROL-1b](docs/handoffs/CONTROL-1b.md) |
-| `WP-300c` | `WP300B-LOWS`: hostile evidence, refusal-code docs, module-load tripwires, predictable ids | Complete (2026-10-02) | `7e05702` | [WP-300c](docs/handoffs/WP-300c.md) |
-| `STORAGE-GOV2` | ADR-028 Amendment 1 corrections after `STORAGE-1b`; ADR-029's header | Complete (2026-10-01) | `a428ba3` | [STORAGE-GOV2](docs/handoffs/STORAGE-GOV2.md) |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>`. The user starts it later on 2026-10-05 and reports back | — | — |
-| All other packages | — | Blocked | — | See work plan |
+| All other packages not in `docs/handoffs/INDEX.md` | — | Blocked | — | See work plan |
 
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents may begin in the current run; "Dependency-ready" rows must not start until this table says otherwise.
 
@@ -336,7 +188,7 @@ The authority is `docs/contracts/schema-boundary.md` §3 (2 LIVE / 13 CLOSED / 5
 
 ### Residuals recorded in Complete package rows
 
-These packages are Complete, but their archived rows name residuals or follow-ups that no later row records as closed. Each bullet states them as the row does. Where a bullet names no owner, the owner is in the handoff linked from the package's row under Work packages. File:line citations are as of `8fde4df`. The disposition of every Complete row that mentions a residual is in the coverage list of [`REWRITES.md`](docs/status-archive/REWRITES.md).
+These packages are Complete, but their archived rows name residuals or follow-ups that no later row records as closed. Each bullet states them as the row does. Where a bullet names no owner, the owner is in the handoff linked from the package's row in [`INDEX.md`](docs/handoffs/INDEX.md). File:line citations are as of `8fde4df`. The disposition of every Complete row that mentions a residual is in the coverage list of [`REWRITES.md`](docs/status-archive/REWRITES.md).
 
 - `WP-080-FU1`: §1's biconditional parser remains whole-document/first-match (LOW). It is a dormant future-edit risk: no duplicate exists in the ADR today. Optional follow-up: §1 parser span-scoping, to `### 1`–`### 2`. A cross-venue aggressor-imbalance comparison is owed once two adapters' trades land in one store; it bears on WP-090's open U-CB-3.
 - `GOV-1C`: the F14 rename is dual-surface: the human id is F14, but the machine `rule` keeps accepted alias F-OPAQUE. A strict swap cannot pass the no-test-change gate, because the pinned tooling suite asserts the legacy id. The tool+suite swap is a bounded follow-up: a future tooling grant changes the tool and its pinned `test/unit/tooling` assertions together.

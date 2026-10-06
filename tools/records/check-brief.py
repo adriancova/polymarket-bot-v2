@@ -42,12 +42,15 @@ K24 the SER-3 bullet of the Complete-row residual subsection writes "SER-3's N4"
 K25 every brief section that cites a file line (`name.ext:NNN`) states the commit its citations
     are valid at ("as of `<sha>`" or "at `<sha>`"), in the section or on the citing line.
 K26 the Complete-row residual intro sends a reader to the handoff linked from the package's row
-    for an owner a bullet does not name, and every package with a bullet there has a handoff link
-    in its Work packages row.
+    for an owner a bullet does not name, and every package with a bullet there has an INDEX.md row
+    that links its handoff. Re-anchored (RECORDS-W3B): Complete rows left the Work packages table,
+    so the package's row is its INDEX.md row.
 K27 the brief does not list the `catalog.settlement_specs.payoff_model NOT NULL` divergence as
     owed: `WP-210`'s migration 0009 resolved it.
 K28 in "Obligations in completion records", a sentence whose subject is a package that is not
-    Complete in the brief states an obligation ("must", "owes", "owed"), not a present fact.
+    Complete states an obligation ("must", "owes", "owed"), not a present fact. Complete means the
+    package's INDEX.md row reads "Complete". Re-anchored (RECORDS-W3B): the brief's table no longer
+    lists Complete packages.
 K29 no line of REWRITES.md's intro and coverage prose (before the first declaration block), and no
     line of the archive README, runs over 80 words: split dense paragraphs into lists or tables.
 K30 no verbless fragment where r4 had one: the WP-210 bullet's "landing: contract owner
@@ -77,6 +80,14 @@ K37 re-cut consistency (LOGS-1-RECUT r1): in a section whose intro says its cita
     `<sha>`", no line that cites a file line pins another commit ("at `<other>`") unless it says the
     file is "unchanged" there; and RECUT_REFUSED, a fixed list of wordings review refused at the
     re-cut (brief or REWRITES.md), does not come back.
+K38 no Work packages row's status starts "Complete": a completed package's row leaves the brief,
+    and its INDEX.md row carries it (docs/handoffs/README.md rules 1 and 10; RECORDS-W3B).
+K39 every package the brief names as Complete has an INDEX.md row: each id in backticks in a sentence
+    that says it "is" or "are" complete (any case), and each Complete-row residual bullet's package.
+    Where the id is followed by its merge SHA ("`ID` (`sha`"), the INDEX.md row names that SHA
+    (RECORDS-W3B).
+An INDEX.md row stands for the package its "Package or round" cell starts with, and for any package it
+names as "also `<id>`" (WP-080's row also carries WP-080-FU1).
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
 records" subsections. K21 also requires C16, refuses the claim "so a partial carry fails" in
 REWRITES.md and the archive README, and requires both to say reviewers check the rest of a clause.
@@ -87,7 +98,7 @@ case). K30 also refuses the r6 clause chains "its N3, unparsed" and "; its N4, t
 
 Rules are re-checked, not dropped silently: a rule whose source text is gone is re-anchored to
 current evidence or retired, with a one-line reason at the rule (RECORDS-W3: K33's `:906`, and
-K36's LOGS-1, H1R1 and Wave 3 rules).
+K36's LOGS-1, H1R1 and Wave 3 rules; RECORDS-W3B: K26 and K28, re-anchored to INDEX.md).
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -120,6 +131,36 @@ SECTIONS = ["## Safety state", "## Current phase", "## Authorized now", "## Work
 def read(root, rel):
     with open(os.path.join(root, rel), encoding="utf-8") as fh:
         return fh.read()
+
+
+INDEX = "docs/handoffs/INDEX.md"
+
+
+def index_rows(root):
+    """INDEX.md's rows: [{ids, link, outcome, merge, package, line}]. ids: the package the "Package or
+    round" cell starts with, and each it names as "also `<id>`". link: the Handoff cell's link target
+    when the cell is one link, else None."""
+    out = []
+    for n, l in enumerate(read(root, INDEX).split("\n"), 1):
+        if not re.match(r"^\| \d{4}-\d{2}-\d{2} \|", l):
+            continue
+        c = [x.strip() for x in re.split(r"(?<!\\)\|", l)[1:-1]]
+        if len(c) < 7:
+            continue
+        lead = re.match(r"^`([^`]+)`", c[2])
+        link = re.match(r"^\[[^\]]+\]\(([^)]+)\)$", c[1])
+        out.append({"ids": ([lead.group(1)] if lead else []) + re.findall(r"\balso `([^`]+)`", c[2]),
+                    "link": link.group(1) if link else None, "outcome": c[4], "merge": c[5], "package": c[2], "line": n})
+    return out
+
+
+def index_by_id(rows):
+    """{package id: its first INDEX.md row}."""
+    by = {}
+    for r in rows:
+        for pid in r["ids"]:
+            by.setdefault(pid, r)
+    return by
 
 
 def table_rows(lines, h3_prefix):
@@ -312,6 +353,7 @@ def main() -> int:
     brief = read(root, S.STATUS)
     lines = brief.split("\n")
     fails = []
+    index = index_by_id(index_rows(root))
 
     # K1
     bb, bl = len(base.encode("utf-8")), len(S.split_lines(base))
@@ -494,9 +536,13 @@ def main() -> int:
                 if re.search(r"\bN\d\b", rest):
                     fails.append(f"K24: line {i + 1}: the ALLOC-1 bullet must write \"ALLOC-1's review N1/N2\", \"its N3\" "
                                  "and \"its N4\" (GOV-2B's N2-N4 are different items)")
+            # Re-anchored (RECORDS-W3B): a Complete package's row is its INDEX.md row, not a Work packages row.
             m = re.match(r"^- `([A-Za-z0-9-]+)`", l)
-            if m and not any(re.match(r"^\| `" + re.escape(m.group(1)) + r"` \|.*\]\(docs/handoffs/[^)]+\.md\)", r) for r in lines):
-                fails.append(f"K26: line {i + 1}: {m.group(1)}'s Work packages row links no handoff")
+            if m:
+                row = index.get(m.group(1))
+                link = row["link"] if row else None
+                if not link or "/" in link or not os.path.isfile(os.path.join(root, "docs/handoffs", link)):
+                    fails.append(f"K26: line {i + 1}: {m.group(1)} has no INDEX.md row that links its handoff")
             if re.search(r"landing: contract owner recording\.|^- `UNIV-1`: LOW-2 drifts|its N3, unparsed|; its N4, the", l):
                 fails.append(f"K30: line {i + 1}: a verbless fragment; write a full sentence")
             i += 1
@@ -509,7 +555,9 @@ def main() -> int:
     # K28
     h = "### Obligations in completion records"
     if h in lines:
-        complete = {c[0].strip("`") for c in table_rows(lines, "## Work packages") if len(c) > 2 and c[2].startswith("Complete")}
+        # Re-anchored (RECORDS-W3B): Complete packages are read from INDEX.md; the brief's table lists open ones.
+        complete = {pid for pid, r in index.items() if r["outcome"].startswith("Complete")}
+        complete |= {c[0].strip("`") for c in table_rows(lines, "## Work packages") if len(c) > 2 and c[2].startswith("Complete")}
         i = lines.index(h) + 1
         while i < len(lines) and not lines[i].startswith("#"):
             l = lines[i]
@@ -629,6 +677,37 @@ def main() -> int:
         text = brief if rel == "IMPLEMENTATION_STATUS.md" else read(root, rel)
         if bad in text:
             fails.append(f"K37: {label}: {rel} has {bad!r} again")
+    # K38
+    for cells in table_rows(lines, "## Work packages"):
+        if len(cells) > 2 and cells[2].strip("* ").lower().startswith("complete"):
+            fails.append(f"K38: Work packages row {cells[0]} is Complete; move it to {INDEX} (README rules 1 and 10)")
+    # K39
+    named, wp, h = [], False, "### Residuals recorded in Complete package rows"
+    for n, l in enumerate(lines, 1):
+        if l.startswith("#"):
+            wp = l == "## Work packages"
+            continue
+        if wp and l.startswith("|"):
+            continue  # K38's
+        for cell in (re.split(r"(?<!\\)\|", l)[1:-1] if l.startswith("|") else [l]):
+            for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z(`*\[])", cell.strip()):
+                if re.search(r"\b(?:is|are)\s+(?:\*\*)?complete\b", sent, flags=re.I):
+                    for m in re.finditer(r"`([A-Z][A-Z0-9]*(?:-[A-Za-z0-9]+)+)`(?: \(`([0-9a-f]{7,40})`)?", sent):
+                        named.append((n, m.group(1), m.group(2)))
+    if h in lines:
+        i = lines.index(h) + 1
+        while i < len(lines) and not lines[i].startswith("#"):
+            m = re.match(r"^- `([A-Za-z0-9-]+)`", lines[i])
+            if m:
+                named.append((i + 1, m.group(1), None))
+            i += 1
+    for n, pid, merge in named:
+        row = index.get(pid)
+        if row is None:
+            fails.append(f"K39: line {n}: the brief names {pid} as Complete, but {INDEX} has no row for it")
+        elif merge and merge not in row["merge"] + row["package"]:
+            fails.append(f"K39: line {n}: the brief gives {pid}'s merge as {merge}, but its {INDEX} row (line {row['line']}) does not")
+
     # K25
     sec, sec_lines = None, []
     def k25(sec, sec_lines):
@@ -649,7 +728,8 @@ def main() -> int:
 
     print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]}); "
           f"evidence at the cut {cut[:12]}")
-    print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}")
+    print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}, "
+          f"work-package rows {len(table_rows(lines, '## Work packages'))}, INDEX.md packages {len(index)}, named Complete {len(named)}")
     for f in fails:
         print("  " + f)
     print("RESULT: " + ("FAIL" if fails else "PASS"))

@@ -383,8 +383,10 @@ BRIEF_MUTATIONS = [
                                  "(no single-bracket row reads it); same-event fill ties keep the fill-id convention; there is no per-bracket engine checkpoint in the artifact; two internal", 1), "K23:"),
     ("the SER-3 bullet writes a bare N4 again", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("SER-3's N4, the one sentence owed", "**N4**, the one sentence owed", 1), "K24:"),
+    # RECORDS-W3B: the intro now sends a reader to the package's INDEX.md row; the pin is unchanged.
     ("the Complete-row subsection intro without its citation pin", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("under Work packages. File:line citations are as of `8fde4df`. The disposition", "under Work packages. The disposition", 1), "K25:"),
+     lambda t: t.replace("(docs/handoffs/INDEX.md). File:line citations are as of `8fde4df`. The disposition",
+                         "(docs/handoffs/INDEX.md). The disposition", 1), "K25:"),
     # r5
     ("the WP-110 bullet lists the payoff_model divergence as owed again (CX-R5-02)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace(" A `MarketClosed`-equivalent venue signal remains unconfirmed.",
@@ -401,8 +403,10 @@ BRIEF_MUTATIONS = [
     # present-tense sentence about a package that is not Complete (`WP-360`) still fails.
     ("an obligation of a package that is not Complete reads as a fact (R5-01's rule)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("- `WP-060`: the 5 ms p99", "- `WP-060`: `WP-360` calibrates the fill model. The 5 ms p99", 1), "K28:"),
+    # RECORDS-W3B: the intro names the package's INDEX.md row; the refused wording is unchanged.
     ("the Complete-row intro promises every owner again (R5-02)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("Each bullet states them as the row does. Where a bullet names no owner, the owner is in the handoff linked from the package's row under Work packages.",
+     lambda t: t.replace("Each bullet states them as the row does. Where a bullet names no owner, the owner is in the handoff linked "
+                         "from the package's row in [`INDEX.md`](docs/handoffs/INDEX.md).",
                          "Each bullet states them as the row does, with the owner the row or its handoff names.", 1), "K26:"),
     ("the ALLOC-1 bullet writes bare N1/N2 again (R5-03)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("ALLOC-1's review N1/N2 report", "N1/N2 report", 1), "K24:"),
@@ -485,8 +489,10 @@ BRIEF_MUTATIONS = [
     ("exceed the 15% budget", "IMPLEMENTATION_STATUS.md",
      lambda t: t + ("filler " * 9000) + "\n", "K1:"),
     # RECORDS-W3: one pin per changed rule
+    # RECORDS-W3B: the brief fell to about 290 lines, so 60 blank lines no longer reach the line budget. 450
+    # exceed the whole line budget (441 lines at `f43efe6`, 443 at `8fde4df`) while adding only 450 bytes.
     ("exceed the line budget alone (K1 counts lines too)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t + "\n" * 60, "K1:"),
+     lambda t: t + "\n" * 450, "K1:"),
     ("a section pins its citations as of another commit than the cut (K33)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("File:line citations are as of `8fde4df`.", "File:line citations are as of `f43efe6`.", 1), "K33:"),
     ("an unregistered file:line citation comes back (K33; `:906` is retired)", "IMPLEMENTATION_STATUS.md",
@@ -497,6 +503,33 @@ BRIEF_MUTATIONS = [
      lambda t: t.replace("Ratified by the user on 2026-09-30", "Pending the user's ratification", 1), "K36:"),
     ("Wave 3's first condition no longer names the CLOSED grade (K36, re-anchored)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("- the fresh Wave 2 closeout audit grades Wave 2 CLOSED:", "- the fresh Wave 2 closeout audit has run:", 1), "K36:"),
+    # RECORDS-W3B: K26 and K28 read INDEX.md (re-anchored); K38 and K39 are new.
+    ("a Complete-row residual package's INDEX.md row links no handoff (K26, re-anchored)", "docs/handoffs/INDEX.md",
+     lambda t: t.replace("| [GOV-1C.md](GOV-1C.md) |", "| GOV-1C.md |", 1), "K26:"),
+    ("a Complete-row residual package's INDEX.md row links a file that does not exist (K26)", "docs/handoffs/INDEX.md",
+     lambda t: t.replace("| [GOV-1C.md](GOV-1C.md) |", "| [GOV-1C.md](GOV-1C-missing.md) |", 1), "K26:"),
+    ("WP-070's INDEX.md row is not Complete, so its present-tense obligation fails (K28 reads INDEX.md)", "docs/handoffs/INDEX.md",
+     lambda t: t.replace("| WP | Complete (2026-08-27) | `f2f0258` |", "| WP | Evidence pending | `f2f0258` |", 1), "K28:"),
+    ("a Complete row back in the Work packages table (K38)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("| All other packages not in",
+                         "| `WP-000` | Venue verification and sanitized fixtures | Complete (2026-08-26) | `d427f00` | [WP-000](docs/handoffs/WP-000.md) |\n"
+                         "| All other packages not in", 1), "K38:"),
+    ("a bold **Complete** row in the Work packages table (K38)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("| All other packages not in",
+                         "| `V2-99` | a package | **Complete** (2026-10-06) | `1234567` | — |\n| All other packages not in", 1), "K38:"),
+    ("the brief names as Complete a package with no INDEX.md row (K39)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- **The inherited-`toJSON` sweep is complete:**",
+                         "- **`V2-99` is Complete** (`1234567`).\n- **The inherited-`toJSON` sweep is complete:**", 1), "K39:"),
+    ("the brief gives a Complete package's merge SHA that its INDEX.md row lacks (K39)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("`SER-0` (`9a44167`, the measurement)", "`SER-0` (`9a44168`, the measurement)", 1), "K39:"),
+    ("INDEX.md loses the row of a package the brief names as Complete (K39)", "docs/handoffs/INDEX.md",
+     drop_line(r"^\| 2026-09-15 \| \[SER-0-sweep\.md\]"), "K39:"),
+    ("INDEX.md loses the audit row the brief names as COMPLETE, upper case (K39)", "docs/handoffs/INDEX.md",
+     drop_line(r"^\| 2026-10-06 \| \[CLOSEOUT-3-wave-3-closeout\.md\]"), "K39:"),
+    ("WP-080's INDEX.md row no longer carries WP-080-FU1 with 'also' (K39)", "docs/handoffs/INDEX.md",
+     lambda t: t.replace("; also `WP-080-FU1` (", "; `WP-080-FU1` (", 1), "K39:"),
+    ("a Complete-row residual bullet for a package with no INDEX.md row (K39)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- `GOV-1C`: the F14 rename", "- `WP-999`: an owed residual.\n- `GOV-1C`: the F14 rename", 1), "K39:"),
 ]
 
 # check-brief.py runs with other arguments: (name, extra arguments, the report line that must appear)
