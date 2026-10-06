@@ -50,6 +50,9 @@ Docs only.
 1. **The orchestrator:** update the `docs/adr/README.md` rows for ADR-023 and ADR-030. Done in the governance commit.
 2. **A risk ruling and a test round** for R8-FABLE-01 and R8-FABLE-02, before any mode above PAPER.
 3. **The user** may confirm or overrule ADR-030 Amendment 1 and ADR-023 Amendment 1.
+   Done 2026-10-05: the user confirmed both (`ab5033a`). Noted 2026-10-06 (`RECORDS-W3`).
+4. **A code-comment fix, in the next round granted `packages/universe/**`** (GN3-ASTRA-01's follow-up). `windowInternalMarketId`'s doc comment (`packages/universe/src/series-admission.ts`) says its 74 bits are "the first bits" of the digest. The code copies the first ten digest bytes into UUID bytes 6-15, then overwrites the version nibble and the variant bits, as ADR-023 Amendment 1 states.
+   Added 2026-10-06 (`RECORDS-W3`, `CLOSEOUT-3` L6): the round's handoff-r1 listed it as follow-up 2, and this record omitted it.
 
 ## commit_sha
 `26caa9e`
