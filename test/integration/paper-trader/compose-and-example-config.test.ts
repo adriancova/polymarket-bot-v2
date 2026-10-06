@@ -49,15 +49,42 @@ describe("infra/compose/trader — the example configuration", () => {
     expect(caps["liveMicroMaxAccountExposure"]).toBe("0");
   });
 
-  it("states settlement readiness as FALSE — the truthful value for btc-15m-updown", () => {
+  it("states settlement readiness as TRUE for btc-15m-updown — the owner's PAPER-only operator assertion (TRADER-SIGNALS), not a review", () => {
+    // Changed on purpose by `TRADER-SIGNALS` (2026-10-05). This test used to
+    // pin `false`: the series has no recorded settlement review, so §9.8
+    // check 6 refused every entry, and no paper fill was possible. The owner
+    // then ruled that PAPER configurations may set `true` for this series
+    // (`docs/settlement/btc-15m-updown-review-checklist.md`). That is an
+    // operator assertion, not a recorded review: the spec stays `UNVERIFIED`
+    // and gaps G-1 to G-10 still prevent recording one. So this pins the new
+    // value for the one series the ruling names, and the next test pins that
+    // the example is PAPER whenever the flag is true.
     const document = JSON.parse(readFileSync(EXAMPLE, "utf8")) as Record<string, unknown>;
     const markets = document["markets"] as Record<string, unknown>[];
+    expect(markets.length).toBeGreaterThan(0);
     for (const market of markets) {
+      expect(market["seriesKey"]).toBe("btc-15m-updown");
       const readiness = market["settlementReadiness"] as Record<string, unknown>;
-      // That series has NO human-reviewed settlement specification in this
-      // repository, so §9.8 check 6 refuses every entry under this example —
-      // which is correct, and is what an example must not quietly override.
-      expect(readiness["modelDependentActivationAllowed"]).toBe(false);
+      expect(readiness["modelDependentActivationAllowed"]).toBe(true);
+    }
+  });
+
+  it("sets modelDependentActivationAllowed TRUE only in a PAPER document (the ruling is PAPER-only; a live configuration must not copy it)", () => {
+    const document = JSON.parse(readFileSync(EXAMPLE, "utf8")) as Record<string, unknown>;
+    const markets = document["markets"] as Record<string, unknown>[];
+    const assertsReadiness = markets.some(
+      (market) => (market["settlementReadiness"] as Record<string, unknown>)["modelDependentActivationAllowed"] === true,
+    );
+    expect(assertsReadiness).toBe(true);
+    if (assertsReadiness) expect(document["environment"]).toBe("PAPER");
+    // And the READMEs an operator reads say what the value is and is not.
+    for (const readme of ["infra/compose/trader/README.md", "apps/trader/README.md"]) {
+      const text = readFileSync(resolve(REPO_ROOT, readme), "utf8");
+      expect(text, readme).toContain("PAPER-only operator assertion");
+      expect(text, readme).toContain("not a recorded settlement review");
+      expect(text, readme).toContain("A live configuration must not copy it");
+      expect(text, readme).toContain("G-1 to G-10");
+      expect(text, readme).toContain("docs/settlement/btc-15m-updown-review-checklist.md");
     }
   });
 

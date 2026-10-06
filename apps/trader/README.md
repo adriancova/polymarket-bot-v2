@@ -62,6 +62,57 @@ rather than conventional:
    discards; a refusal latches a `QUEUE_BACKPRESSURE` halt, and
    `messagesDropped` is reported as `0` because nothing can move it.
 
+## Stopping it (`TRADER-SIGNALS`)
+
+SIGINT (Ctrl-C) or SIGTERM **requests** a stop; it does not kill the process.
+`src/graceful-stop.ts` handles the signals and the deadline. `src/main.ts`
+(`runUntilStopped`) runs the stop, which is the same sequence a halt runs:
+
+1. The pump reads no new batch. The batch in hand finishes its durable writes
+   and records its stream position (`src/pump.ts`, which now returns
+   `STOPPED`).
+2. The `FOLD-1` SHUTDOWN rebuild check runs and is reported as before.
+3. Every latched halt is written to `ops.incidents` (`PROVENANCE-1`).
+4. Everything `startup()` opened is closed, in the reverse order of opening:
+   - the transport-lag sampler;
+   - the event subscription;
+   - the health endpoint (the only listener; there is no metrics listener);
+   - the PostgreSQL pool;
+   - the Redis transport.
+
+   A close that fails is logged, and the next close still runs.
+5. The exit, logged as `trader stopped: exit <code> — …`.
+
+| Exit | `EXIT_CODES` | Meaning |
+| --- | --- | --- |
+| `0` | `ok` | A clean stop: no halt is latched, and the SHUTDOWN check matched. |
+| `75` | `halted` | A halt is latched. A requested stop never clears one. |
+| `70` | `shutdownCheckFailed` | The SHUTDOWN rebuild check failed (`sysexits` EX_SOFTWARE). It takes precedence over `75`, whatever stopped the pump. |
+| `124` | `shutdownDeadlineExceeded` | The stop did not finish within `TRADER_SHUTDOWN_DEADLINE_MS`. |
+| `130` | `shutdownForced` | A second SIGINT or SIGTERM arrived during the stop. |
+
+- **The deadline.** `TRADER_SHUTDOWN_DEADLINE_MS` defaults to 8,000 ms; an
+  integer from 1,000 to 60,000 is accepted, and anything else is refused at
+  startup (78). The default is above the halt record's 5,000 ms bound, so an
+  unconfirmed halt record still reports, and below the 10 s a supervisor such
+  as `docker stop` waits before SIGKILL. The full reasoning is in
+  `src/graceful-stop.ts`.
+- **The forced exits.** A late or forced exit writes one line saying where the
+  stop was and what that leaves. It exits from that line's write callback, so
+  the line is never lost. If the log is not taking lines, one more signal
+  exits at once.
+- **What a stop records.** Nothing that a halt exit did not already record.
+  `strategy.runs.status` is not written on any exit, so the row stays
+  `RUNNING`. `BOOT-1` already makes the next start a new run.
+
+Evidence:
+
+- `src/graceful-stop.test.ts`: the signal handling, through ports and in real
+  child processes.
+- `src/graceful-stop-sequence.test.ts`: the stop's order, with injected fakes.
+- `test/integration/paper-trader/graceful-stop-postgres-redis.test.ts`: the
+  shipped bundle, against real PostgreSQL and Redis.
+
 ## `ownership: "SHADOW"` means OBSERVE here
 
 §6 invariant 11: "One active live strategy owns a market in v1. Other strategies
@@ -255,10 +306,24 @@ book at evaluation time (the operator states only the shock), and the rate-limit
 headroom counts this process's OWN submissions against the stated capacity.
 
 `markets[].settlementReadiness.modelDependentActivationAllowed` deserves its own
-sentence: it is `false` in the shipped example, because `btc-15m-updown` has no
-human-reviewed settlement specification in this repository, and under `false`
-§9.8 check 6 refuses every entry. That is the truthful configuration for that
-series.
+paragraph. Under `false`, §9.8 check 6 refuses every entry
+(`RISK_SETTLEMENT_UNVERIFIED`), and the shipped example said `false` until
+2026-10-05, because `btc-15m-updown` has no recorded settlement review.
+
+Since `TRADER-SIGNALS` (2026-10-05) the example
+(`infra/compose/trader/trader.config.example.json`, `environment: PAPER`) says
+`true`. That is the repository owner's **PAPER-only operator assertion**,
+recorded in `docs/settlement/btc-15m-updown-review-checklist.md` on 2026-10-05:
+PAPER configurations may set it for `btc-15m-updown`, so a paper run can fill.
+
+- **It is not a recorded settlement review.** Nothing can record one yet
+  (gaps G-1 to G-10, `docs/settlement/btc-15m-updown-review.md` §5.3), this
+  process reads none, and the series' spec stays `UNVERIFIED`.
+- **A live configuration must not copy it** until a review can be recorded and
+  has been.
+- `test/integration/paper-trader/compose-and-example-config.test.ts` pins the
+  value, and fails if the example sets it `true` in any environment other than
+  `PAPER`.
 
 ### 3. `packages/risk` requires cost estimates the planner produces later
 

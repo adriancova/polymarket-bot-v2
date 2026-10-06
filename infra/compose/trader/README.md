@@ -74,6 +74,42 @@ same Redis — see [`../data-gateway/README.md`](../data-gateway/README.md). Wit
 no publisher, the trader starts, reports its §8.2 run manifest, polls an empty
 stream and decides nothing, which is the correct behaviour and not a fault.
 
+## Stopping it (`TRADER-SIGNALS`)
+
+Press **Ctrl-C** (SIGINT), or send **SIGTERM**. Either one **requests** a stop,
+and the trader logs `STOP REQUESTED: …`. It then stops in order:
+
+1. the pump reads no new batch, and the batch in hand finishes its durable
+   writes and records its stream position;
+2. the `FOLD-1` SHUTDOWN rebuild check runs, and its line says whether the
+   held ledger view equals its rebuild from zero;
+3. every latched halt is written to `ops.incidents`;
+4. everything the trader opened is closed, in the reverse order of opening;
+5. the last line, `trader stopped: exit <code> — …`, says how it ended.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | A clean stop: no halt is latched and the SHUTDOWN check matched. |
+| `75` | Halted. A stop never clears a halt: a halt latched before or during the stop keeps this code. |
+| `70` | The SHUTDOWN rebuild check **failed** (`ACCOUNTING_REBUILD_MISMATCH`). It takes precedence over `75`. |
+| `124` | The stop did not finish within `TRADER_SHUTDOWN_DEADLINE_MS` (default `8000`; accepted `1000`…`60000`). One `SHUTDOWN DEADLINE EXCEEDED` line says where it was. |
+| `130` | A **second** Ctrl-C or SIGTERM forced the exit before the stop finished. One `SHUTDOWN FORCED` line says where it was. |
+
+The other codes are startup refusals (`78`, `69`), as before.
+
+**A stop records nothing new.** The trader does not update its run's
+`strategy.runs.status` on any exit; the row stays `RUNNING`. The next start
+must use a new run in any case: `BOOT-1` refuses to resume a run that holds
+decisions.
+
+**Under `pnpm … start`**, Ctrl-C reaches pnpm, its shell and the trader
+together. Measured with pnpm 11.17: the trader receives it once and stops as
+above, and pnpm waits for it. pnpm then reports
+`Command failed with signal "SIGINT"`, because its shell was interrupted; that
+is not the trader's exit code. To read the trader's own
+code, run the built bundle directly: `node apps/trader/dist/main.mjs`, with the
+same environment.
+
 ## Registering the run first (`REGISTER-1`)
 
 Since `BOOT-1` the trader **refuses to start** unless the `catalog.markets`,
@@ -144,13 +180,35 @@ the full reference (every flag, every exit code). In short:
 ## The example configuration is an EXAMPLE, and two fields say so
 
 `trader.config.example.json` is a complete, valid document — every field in the
-trader's schema is required and none is defaulted — but two values in it are
-placeholders an operator must replace, and both are safety-relevant:
+trader's schema is required and none is defaulted — but two values in it must be
+read before it is copied, and both are safety-relevant:
 
-| Field | Why it is a placeholder |
+| Field | What it says, and why |
 | --- | --- |
-| `markets[].conditionId` | `REPLACE-WITH-A-REAL-CONDITION-ID`. A market identity is a venue fact; this file invents none. |
-| `markets[].settlementReadiness.modelDependentActivationAllowed` | `false`, deliberately. It is the structural echo of the §9.2/§9.3 readiness answer `packages/universe`'s `evaluateMarketReadiness` produces, and `btc-15m-updown` has **no human-reviewed settlement specification in this repository** (`packages/strategies/static-bracket/README.md`). With `false`, §9.8 check 6 refuses every entry — which is the truthful configuration for that series, and changing it is an operator's assertion about a review that has happened. |
+| `markets[].conditionId` | `REPLACE-WITH-A-REAL-CONDITION-ID`, a placeholder. A market identity is a venue fact; this file invents none. |
+| `markets[].settlementReadiness.modelDependentActivationAllowed` | `true`, in this **PAPER** example only (since `TRADER-SIGNALS`, 2026-10-05). See below. |
+
+**`modelDependentActivationAllowed: true` is a PAPER-only operator assertion,
+not a settlement review.**
+
+- **What it is.** The repository owner ruled on 2026-10-05 that PAPER
+  configurations may set it for `btc-15m-updown`. The ruling is recorded in
+  [`docs/settlement/btc-15m-updown-review-checklist.md`](../../../docs/settlement/btc-15m-updown-review-checklist.md).
+  With it, a paper run can pass §9.8 check 6 and fill.
+- **What it is not.** It is not a recorded settlement review. Nothing in the
+  repository can record one yet: see gaps G-1 to G-10 in
+  [`docs/settlement/btc-15m-updown-review.md`](../../../docs/settlement/btc-15m-updown-review.md)
+  §5.3. The trader reads no review, and the series' spec stays `UNVERIFIED`.
+- **A live configuration must not copy it** until a review can be recorded
+  for the series and has been. The example's `environment` is `PAPER`, and a
+  test (`test/integration/paper-trader/compose-and-example-config.test.ts`)
+  fails if the example ever sets the flag `true` in any other environment.
+- **What `false` does.** The field echoes the §9.2/§9.3 readiness answer
+  that `packages/universe`'s `evaluateMarketReadiness` would produce, if a
+  composition root called it. With `false`, §9.8 check 6 refuses every entry
+  (`RISK_SETTLEMENT_UNVERIFIED`), so no paper fill is possible. The example
+  shipped `false` until 2026-10-05, and H1 runs 2-8 ran with `false`
+  ([`docs/handoffs/H1-RUNS-2-8.md`](../../../docs/handoffs/H1-RUNS-2-8.md)).
 
 `simulation.fillModelParametersHash` is likewise all zeros: Tier 0 is the
 pipeline-smoke model, whose `deploymentDecisionUse` is `FORBIDDEN` (ADR-012
