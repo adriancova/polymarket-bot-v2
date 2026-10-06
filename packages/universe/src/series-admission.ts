@@ -12,9 +12,12 @@
  *   admits a window ONLY if it matches the reviewed pattern and every reviewed
  *   parameter exactly; anything else is REFUSED, naming every mismatch.
  * - **Per-window facts are checked for presence and form only** (Decision
- *   1.2): the outcome token ids, the condition id, and the open and close
- *   times. They are compared with no reviewed value; the close must follow the
- *   open.
+ *   1.2, as ADR-030 Amendment 2 rule 1 item 5 amends it): the outcome trading
+ *   ids, selected by the window's `version` ({@link selectTradingIds}), the
+ *   condition id, and the open and close times. They are compared with no
+ *   reviewed value; the close must follow the open. The version itself is
+ *   checked against the review (`parameters.acceptedProtocolVersions`,
+ *   Amendment 2 rule 2).
  * - **Fail closed** (Decision 1.5): a fact that is absent, unreadable or
  *   unclear refuses the window.
  * - **PAPER or BACKTEST only** (Decision 2.1, acceptance 2):
@@ -28,8 +31,10 @@
  * ## The venue surfaces, and only those (acceptance 4; ADR-030 Decision 1.7)
  *
  * Every venue field the judge reads is DOCUMENTED, with its source in
- * `docs/venue/verified-2026-10-04.md` (VENUE-SETL-1) or the Gamma / CLOB
- * OpenAPI files that report fetched (S-O01, S-O02, S-D65):
+ * `docs/venue/verified-2026-10-04.md` (VENUE-SETL-1), the Gamma / CLOB
+ * OpenAPI files that report fetched (S-O01, S-O02, S-D65), or
+ * `docs/venue/verified-2026-10-05.md` (VENUE-4; the Protocol V2 rows) — with
+ * the one refusal-only exception below:
  *
  * | judged | venue field | documented by |
  * | --- | --- | --- |
@@ -38,7 +43,9 @@
  * | the title and question | `Event.title`, `Market.question` | Gamma OpenAPI (S-O01) `Event.title`, `Market.question` |
  * | the schedule | the title's ET range; `Market.eventStartTime`, `Market.endDate` as locators | F-14 … F-16, U-29, U-34; `./series-window-schedule.ts` |
  * | the rules | `Market.description`, `Market.resolutionSource` | S-O01; F-22 (the rules text and its digest) |
- * | outcomes and pairing | `Market.outcomes` ↔ `Market.clobTokenIds` BY INDEX, index 0 the YES outcome; cross-checked against CLOB `t[].{t,o}` | F-01 (S-D23 lines 159, 173), F-03 (S-D65 lines 97-101, 157-169) |
+ * | the protocol version | Gamma `Market.version`: `"v1"` or `"v2"`, else refused; it must be one of the review's `acceptedProtocolVersions` | `docs/venue/verified-2026-10-05.md` F-38, F-39, F-40, F-41; ADR-030 Amendment 2 rules 1 and 2 |
+ * | outcomes and pairing | `Market.outcomes` ↔ the trading ids `Market.version` selects, BY INDEX, index 0 the YES outcome: `positionIds` (an array of decimal strings) for `"v2"`, the decoded `clobTokenIds` (a JSON-encoded array) for `"v1"`, "even when both fields are present"; cross-checked against CLOB `t[].{t,o}` | F-01 (S-D23 lines 159, 173), F-03 (S-D65 lines 97-101, 157-169); F-38, F-40 (index 0 is YES); O.3 (`t[].t` carries a V2 market's position ids) |
+ * | the condition id | Gamma `Market.conditionId`, kept as Gamma serves it (the window's identity); the CLOB read sends its 32-byte form ({@link paddedConditionId}) | F-43, F-70, C-19; ADR-030 Amendment 2 rule 3 |
  * | tick size | Gamma `orderPriceMinTickSize`, CLOB `mts` | S-O01; S-D65 `mts`; F-21 (per-window data) |
  * | minimum size | Gamma `orderMinSize`, CLOB `mos` | S-O01; S-D65 `mos` |
  * | negRisk | Gamma `Market.negRisk` (the authority); Gamma `Event.negRisk` (a cross-check: it must agree) | S-D23 line 305 ("`negRisk` … Market belongs to a negative-risk group", read "from the Gamma response") and lines 313-315 ("Negative-risk membership is a market-level property, but augmented negative risk is configured on the event"); S-O01 `Event.negRisk`. The S-O01 `Market` schema omits the field and the CLOB (S-D65) documents none; `ROLLOVER-1` r5, R5-ASTRA-01 |
@@ -47,10 +54,18 @@
  *
  * Never read: `startDate` (not the open, F-15), `markets-by-token`'s
  * primary/secondary tokens (C-17), the `new_market` arrays (F-13),
- * `series_slug` (U-30), and every field the documents do not name (`feeType`,
- * `cryptoMarketConfig`, `eventMetadata`, the CLOB `ao`, `aot`, `c`, `v`). The
- * delay's LENGTH is not judged: two official pages disagree on it (C-16); the
- * per-market fact is `itode`.
+ * `series_slug` (U-30), the field `Market.version` does NOT select (never read
+ * as an id, Amendment 2 rule 1 item 2), and every field the documents do not
+ * name (`feeType`, `cryptoMarketConfig`, `eventMetadata`, the CLOB `ao`, `aot`,
+ * `c`). The delay's LENGTH is not judged: two official pages disagree on it
+ * (C-16); the per-market fact is `itode`.
+ *
+ * **One UNDOCUMENTED field is read, and it can only refuse:** the CLOB's `v`
+ * (C-21; O.3 observed `"v1"` and `"v2"`). It is never an authority and never
+ * admits a window (ADR-030 Amendment 2 rule 1 item 7, refining Decision 1.7):
+ * a present `v` that is not Gamma's `version` refuses the window; an absent
+ * `v` refuses nothing. The CLOB's `c` stays unread, so no CLOB answer's
+ * condition id is compared with anything (rule 3 item 5).
  *
  * The candidate the judge reads is assembled by
  * `@polymarket-bot/polymarket-public`'s series-window door from the raw
@@ -89,6 +104,43 @@ const Sha256Hex = z.string().regex(/^[0-9a-f]{64}$/u, "must be a sha256 digest: 
 const UnsignedIntegerString = z.string().regex(/^(?:0|[1-9][0-9]{0,17})$/u, "must be a canonical unsigned integer string");
 /** Gamma's `Series.id`: a string (F-08) the keyset filter takes as an integer (F-07). */
 const GammaSeriesId = z.string().regex(/^[1-9][0-9]{0,17}$/u, "must be the Gamma series id: digits, no leading zero");
+
+/**
+ * The protocol versions a Gamma market may state (`docs/venue/verified-2026-10-05.md`
+ * F-38: `"v2"` selects `positionIds`, `"v1"` selects `clobTokenIds`; F-39/F-40:
+ * any other value is unsupported). ADR-030 Amendment 2 rule 1.
+ */
+export const PROTOCOL_VERSIONS = Object.freeze(["v1", "v2"] as const);
+export type ProtocolVersion = (typeof PROTOCOL_VERSIONS)[number];
+
+/** What an operator must state, and the refusal of a review that does not state it. */
+export const ACCEPTED_PROTOCOL_VERSIONS_REQUIRED =
+  'acceptedProtocolVersions is required: a non-empty list of distinct protocol versions, each "v1" or "v2" ' +
+  '(ADR-030 Amendment 2 rule 2; e.g. ["v1"], or ["v1","v2"] once a review accepts V2 windows). It is never inferred';
+
+/**
+ * `parameters.acceptedProtocolVersions` (ADR-030 Amendment 2 rule 2): the
+ * versions a window may carry, a REVIEWED parameter like `allowedTickSizes`.
+ * Required — a review written before the field existed is REFUSED at parse,
+ * never read as some default (rule 2 item 1: "The gateway never infers it").
+ * Distinctness is checked by index, not by iteration: the trader's mirror runs
+ * this rule through a prototype-free parsing arena, whose empty array has no
+ * iterator (`@polymarket-bot/trading-core` `series.ts`).
+ */
+const AcceptedProtocolVersions = z
+  .array(z.enum(PROTOCOL_VERSIONS), { error: ACCEPTED_PROTOCOL_VERSIONS_REQUIRED })
+  .min(1)
+  .max(PROTOCOL_VERSIONS.length)
+  .superRefine((versions, ctx) => {
+    for (let left = 0; left < versions.length; left += 1) {
+      for (let right = left + 1; right < versions.length; right += 1) {
+        if (versions[left] === versions[right]) {
+          ctx.addIssue({ code: "custom", message: "the accepted protocol versions must be distinct" });
+          return;
+        }
+      }
+    }
+  });
 
 /**
  * One REVIEWED series (ADR-030 Decision 1.1). STRICT at every level and with
@@ -134,6 +186,14 @@ export const ReviewedSeriesSchema = z.strictObject({
   outcomes: z.tuple([NonEmptyStringSchema, NonEmptyStringSchema]),
   /** Every market parameter the review accepted (Decision 1.1). */
   parameters: z.strictObject({
+    /**
+     * The Gamma `Market.version` values the review accepts (ADR-030 Amendment
+     * 2 rule 2). A window whose version is not listed is refused. Part of the
+     * review, so part of {@link seriesConfigHash}: only a review that changes
+     * the list changes the hash — the venue moving the series from `"v1"` to
+     * `"v2"` changes none (rule 2 item 3).
+     */
+    acceptedProtocolVersions: AcceptedProtocolVersions,
     /**
      * The tick sizes the review accepts. Tick size is PER-WINDOW data — the
      * venue changes it near the price limits (F-21; ruling Q3) — so the review
@@ -385,6 +445,16 @@ export type VenueBooleanReading = boolean | null | "ABSENT" | "UNREADABLE";
 export type VenueStringReading = string | null;
 
 /**
+ * One venue field whose absence, `null` and wrong type are each REPORTED, never
+ * defaulted (ADR-030 Amendment 2 rule 1 item 3 refuses each by name).
+ */
+export type VenueFieldReading<T> =
+  | { readonly kind: "ABSENT" }
+  | { readonly kind: "NULL" }
+  | { readonly kind: "VALUE"; readonly value: T }
+  | { readonly kind: "UNREADABLE"; readonly detail: string };
+
+/**
  * A window as the Gamma keyset read stated it (`GET /events/keyset`, S-D72):
  * one `Event` and the fields of its markets the judge reads. Assembled by
  * `@polymarket-bot/polymarket-public`'s door; every field is the venue's own,
@@ -413,8 +483,23 @@ export interface GammaWindowMarketReading {
   readonly resolutionSource: VenueStringReading;
   /** The JSON-encoded `outcomes` string, verbatim (F-01). */
   readonly outcomes: VenueStringReading;
-  /** The JSON-encoded `clobTokenIds` string, verbatim (F-01). */
+  /**
+   * `Market.version` (F-41: a nullable string), as stated. It selects the
+   * trading ids (F-38); a missing, `null` or unsupported one is refused (F-39,
+   * F-40).
+   */
+  readonly version: VenueFieldReading<string>;
+  /**
+   * The JSON-encoded `clobTokenIds` string, verbatim (F-01): the trading ids
+   * when `version` is `"v1"` (F-38), and never read as ids otherwise.
+   */
   readonly clobTokenIds: VenueStringReading;
+  /**
+   * `Market.positionIds` (F-41: a nullable array of strings), as stated: the
+   * trading ids when `version` is `"v2"` (F-38), and never read as ids
+   * otherwise. Each element is the string, or `null` when it is not one.
+   */
+  readonly positionIds: VenueFieldReading<readonly VenueStringReading[]>;
   readonly eventStartTime: VenueStringReading;
   readonly endDate: VenueStringReading;
   readonly orderPriceMinTickSize: VenueDecimalReading;
@@ -454,6 +539,13 @@ export interface ClobMarketInfoReading {
     readonly exponent: VenueDecimalReading;
     readonly takerOnly: VenueBooleanReading;
   } | null;
+  /**
+   * `v`: **UNDOCUMENTED** (C-21; observed `"v1"` and `"v2"`, O.3). A
+   * refusal-only cross-check of Gamma's `Market.version`, never an authority
+   * (ADR-030 Amendment 2 rule 1 item 7): present and different refuses the
+   * window; absent refuses nothing.
+   */
+  readonly undocumentedProtocolVersion: VenueFieldReading<string>;
 }
 
 /** What an ADMITTED window is: the per-window facts, checked for presence and form. */
@@ -524,6 +616,177 @@ function encodedStringArray(text: VenueStringReading): readonly string[] | undef
 
 function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function fieldText(reading: VenueFieldReading<unknown>): string {
+  switch (reading.kind) {
+    case "ABSENT":
+      return "absent";
+    case "NULL":
+      return "null";
+    case "VALUE":
+      return JSON.stringify(reading.value);
+    case "UNREADABLE":
+      return `not of its documented type (${reading.detail})`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The trading ids, selected by the window's version (ADR-030 Amendment 2, rule 1)
+// ---------------------------------------------------------------------------
+
+/** Whether `value` is one of {@link PROTOCOL_VERSIONS} — exactly, case included. */
+export function isProtocolVersion(value: unknown): value is ProtocolVersion {
+  return value === "v1" || value === "v2";
+}
+
+export type TradingIdSelection =
+  | {
+      readonly ok: true;
+      readonly version: ProtocolVersion;
+      /** The field the version selected: `positionIds` for `"v2"`, `clobTokenIds` for `"v1"`. */
+      readonly field: "positionIds" | "clobTokenIds";
+      /** Index 0 (the YES outcome, F-40). */
+      readonly yesTokenId: string;
+      /** Index 1 (the NO outcome). */
+      readonly noTokenId: string;
+    }
+  | {
+      readonly ok: false;
+      /** The window's version when it is a supported one, else `undefined`. */
+      readonly version: ProtocolVersion | undefined;
+      /** Every reason the ids could not be selected, each named. */
+      readonly problems: readonly string[];
+    };
+
+/**
+ * THE SELECTION (ADR-030 Amendment 2 rule 1; F-38-F-40): a window's trading
+ * ids come from the field its Gamma `Market.version` selects —
+ * `"v2"`: `positionIds`, an array of decimal strings; `"v1"`: `clobTokenIds`,
+ * a JSON-encoded array of decimal strings, decoded first — "even when both
+ * fields are present". Presence never selects the protocol, and the other
+ * field is never read as an id. Index 0 is YES, index 1 is NO.
+ *
+ * Refused, each by name: a missing, `null` or unsupported version (any value
+ * but exactly `"v1"` or `"v2"`); a selected field that is absent or `null`
+ * ("the IDs are not yet available", F-40) or of another type; not exactly two
+ * ids; an id that is not a canonical decimal string (`TokenIdSchema`; F-39);
+ * two equal ids. The outcomes are judged by {@link judgeSeriesWindow}. TOTAL
+ * and pure.
+ */
+export function selectTradingIds(market: GammaWindowMarketReading): TradingIdSelection {
+  const version = market.version;
+  if (version.kind !== "VALUE") {
+    return {
+      ok: false,
+      version: undefined,
+      problems: [
+        `fact: Market.version is ${fieldText(version)}; the trading ids are chosen by the version, and a missing version is refused (F-38, F-39)`,
+      ],
+    };
+  }
+  if (!isProtocolVersion(version.value)) {
+    return {
+      ok: false,
+      version: undefined,
+      problems: [
+        `fact: Market.version is ${JSON.stringify(version.value)}, not a supported protocol version ("v1" or "v2"); an unsupported version is refused (F-39, F-40)`,
+      ],
+    };
+  }
+  if (version.value === "v2") return selectedPair("v2", "positionIds", positionIdsOf(market.positionIds));
+  return selectedPair("v1", "clobTokenIds", clobTokenIdsOf(market.clobTokenIds));
+}
+
+type SelectedField = { readonly ok: true; readonly ids: readonly VenueStringReading[] } | { readonly ok: false; readonly problem: string };
+
+function positionIdsOf(reading: GammaWindowMarketReading["positionIds"]): SelectedField {
+  switch (reading.kind) {
+    case "ABSENT":
+    case "NULL":
+      return {
+        ok: false,
+        problem: `fact: Market.positionIds, the field Market.version "v2" selects, is ${fieldText(reading)}: the window's ids are not yet available (F-40)`,
+      };
+    case "UNREADABLE":
+      return {
+        ok: false,
+        problem: `fact: Market.positionIds, the field Market.version "v2" selects, is not an array of decimal strings (${reading.detail}; F-38, F-41)`,
+      };
+    case "VALUE":
+      if (reading.value.length !== 2) {
+        return { ok: false, problem: `fact: Market.positionIds is ${JSON.stringify(reading.value)}, not exactly two position ids` };
+      }
+      return { ok: true, ids: reading.value };
+  }
+}
+
+function clobTokenIdsOf(text: VenueStringReading): SelectedField {
+  if (text === null) {
+    return {
+      ok: false,
+      problem:
+        'fact: Market.clobTokenIds, the field Market.version "v1" selects, is absent, null or not a string: the window\'s ids are not yet available (F-40)',
+    };
+  }
+  const decoded = encodedStringArray(text);
+  if (decoded === undefined || decoded.length !== 2) {
+    return { ok: false, problem: `fact: Market.clobTokenIds is ${JSON.stringify(text)}, not a JSON array of exactly two token ids` };
+  }
+  return { ok: true, ids: decoded };
+}
+
+function selectedPair(
+  version: ProtocolVersion,
+  field: "positionIds" | "clobTokenIds",
+  selected: SelectedField,
+): TradingIdSelection {
+  if (!selected.ok) return { ok: false, version, problems: [selected.problem] };
+  const what = field === "positionIds" ? "position id" : "token id";
+  const problems: string[] = [];
+  const [first, second] = selected.ids;
+  const yes = first !== undefined && first !== null && TokenIdSchema.safeParse(first).success ? first : undefined;
+  const no = second !== undefined && second !== null && TokenIdSchema.safeParse(second).success ? second : undefined;
+  if (yes === undefined) problems.push(`fact: the index-0 ${what} ${JSON.stringify(first ?? null)} is not a canonical token id`);
+  if (no === undefined) problems.push(`fact: the index-1 ${what} ${JSON.stringify(second ?? null)} is not a canonical token id`);
+  if (first !== undefined && first !== null && first === second) {
+    problems.push(field === "positionIds" ? "fact: the two position ids are the same id" : "fact: the two outcome tokens are the same token");
+  }
+  if (problems.length > 0 || yes === undefined || no === undefined) return { ok: false, version, problems };
+  return { ok: true, version, field, yesTokenId: yes, noTokenId: no };
+}
+
+// ---------------------------------------------------------------------------
+// The condition id at the CLOB and Data API boundary (ADR-030 Amendment 2, rule 3)
+// ---------------------------------------------------------------------------
+
+const CONDITION_ID_31_BYTES = /^0x[0-9a-fA-F]{62}$/u;
+const CONDITION_ID_32_BYTES = /^0x[0-9a-fA-F]{64}$/u;
+
+/**
+ * The form of a window's condition id that a condition-keyed CLOB or Data API
+ * read sends (ADR-030 Amendment 2 rule 3; F-43: "Compatibility boundaries that
+ * accept or return `bytes32` use the same values right-padded with zero
+ * bytes"; F-70 and C-19: `/clob-markets` answers the 31-byte form with 404):
+ *
+ * - a 31-byte id (`0x` and 62 hex digits) is right-padded with one zero byte;
+ * - a 32-byte id (`0x` and 64 hex digits) is sent unchanged;
+ * - any other text is refused, and the caller makes no read.
+ *
+ * Gamma's text stays the window's identity ({@link windowInternalMarketId},
+ * the events, the ledger); this form exists only at the read. PURE.
+ */
+export function paddedConditionId(
+  conditionId: string,
+): { readonly ok: true; readonly conditionId: string; readonly padded: boolean } | { readonly ok: false; readonly problem: string } {
+  if (CONDITION_ID_31_BYTES.test(conditionId)) return { ok: true, conditionId: `${conditionId}00`, padded: true };
+  if (CONDITION_ID_32_BYTES.test(conditionId)) return { ok: true, conditionId, padded: false };
+  return {
+    ok: false,
+    problem:
+      `the condition id ${JSON.stringify(conditionId)} is neither 31 bytes (0x and 62 hex digits) nor 32 bytes (0x and 64 hex digits), ` +
+      "so no CLOB or Data API read is made for it (ADR-030 Amendment 2 rule 3; F-43)",
+  };
 }
 
 /**
@@ -597,18 +860,29 @@ export function judgeSeriesWindow(
       `pattern: Market.outcomes is ${JSON.stringify(market?.outcomes ?? null)}, not the reviewed labels in order ${JSON.stringify(series.outcomes)}`,
     );
   }
-  const tokens = market === null ? undefined : encodedStringArray(market.clobTokenIds);
+  // The trading ids, selected by `Market.version` (ADR-030 Amendment 2 rule 1),
+  // and the version checked against the review (rule 2).
   let yesTokenId: string | undefined;
   let noTokenId: string | undefined;
-  if (tokens === undefined || tokens.length !== 2) {
-    mismatches.push(`fact: Market.clobTokenIds is ${JSON.stringify(market?.clobTokenIds ?? null)}, not a JSON array of exactly two token ids`);
+  let version: ProtocolVersion | undefined;
+  if (market === null) {
+    mismatches.push("fact: Market.clobTokenIds is null, not a JSON array of exactly two token ids");
   } else {
-    const [first, second] = tokens;
-    if (first === undefined || !TokenIdSchema.safeParse(first).success) mismatches.push(`fact: the index-0 token id ${JSON.stringify(first)} is not a canonical token id`);
-    else yesTokenId = first;
-    if (second === undefined || !TokenIdSchema.safeParse(second).success) mismatches.push(`fact: the index-1 token id ${JSON.stringify(second)} is not a canonical token id`);
-    else noTokenId = second;
-    if (first !== undefined && first === second) mismatches.push("fact: the two outcome tokens are the same token");
+    const selection = selectTradingIds(market);
+    version = selection.version;
+    if (selection.ok) {
+      yesTokenId = selection.yesTokenId;
+      noTokenId = selection.noTokenId;
+    } else {
+      for (const problem of selection.problems) mismatches.push(problem);
+    }
+    const accepted: readonly string[] = series.parameters.acceptedProtocolVersions;
+    if (version !== undefined && !accepted.includes(version)) {
+      mismatches.push(
+        `parameter: Market.version is ${JSON.stringify(version)}, not one of the reviewed acceptedProtocolVersions ` +
+          `${JSON.stringify(accepted)}: a series admits a protocol version only after a review accepts it (ADR-030 Amendment 2 rule 2)`,
+      );
+    }
   }
   if (clob === undefined) {
     mismatches.push("fact: no CLOB market-info read for the window; the pairing, itode and the CLOB parameters cannot be judged");
@@ -626,6 +900,20 @@ export function judgeSeriesWindow(
       mismatches.push(
         `pairing: CLOB t[] is ${JSON.stringify(pairs)}, not Gamma's index pairing ${JSON.stringify(expected)} (F-01, F-03)`,
       );
+    }
+    // The UNDOCUMENTED CLOB `v` (C-21) can only REFUSE (ADR-030 Amendment 2
+    // rule 1 item 7): present and not exactly Gamma's version — `null` and a
+    // non-string included — refuses; absent refuses nothing. It never stands
+    // in for a missing Gamma version, so it can never admit a window.
+    const crossCheck = clob.undocumentedProtocolVersion;
+    if (crossCheck.kind !== "ABSENT") {
+      const gamma = market?.version ?? ({ kind: "ABSENT" } as const);
+      if (crossCheck.kind !== "VALUE" || gamma.kind !== "VALUE" || crossCheck.value !== gamma.value) {
+        mismatches.push(
+          `cross-check: CLOB v (undocumented, C-21) is ${fieldText(crossCheck)}, but Gamma Market.version is ${fieldText(gamma)}; ` +
+            "the venue's facts disagree (ADR-030 Amendment 2 rule 1 item 7)",
+        );
+      }
     }
   }
 
@@ -712,6 +1000,12 @@ export function judgeSeriesWindow(
 
   // --- per-window facts: presence and form only -------------------------------
   if (conditionId === undefined) mismatches.push(`fact: Market.conditionId ${JSON.stringify(conditionText)} is absent or malformed`);
+  else {
+    // ADR-030 Amendment 2 rule 3: only a width the CLOB and the Data API can
+    // be asked by — 31 bytes, sent padded, or 32 — is a well-formed fact.
+    const venueForm = paddedConditionId(conditionId);
+    if (!venueForm.ok) mismatches.push(`fact: Market.conditionId: ${venueForm.problem}`);
+  }
   const gammaMarketId = market?.marketId ?? null;
   if (gammaMarketId === null || !/^[1-9][0-9]{0,18}$/u.test(gammaMarketId)) {
     mismatches.push(`fact: Market.id ${JSON.stringify(gammaMarketId)} is not the integer id GET /markets/{id} takes (S-D34)`);
@@ -722,6 +1016,7 @@ export function judgeSeriesWindow(
     schedule === undefined ||
     !schedule.ok ||
     conditionId === undefined ||
+    version === undefined ||
     yesTokenId === undefined ||
     noTokenId === undefined ||
     tickSize === undefined ||

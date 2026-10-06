@@ -71,6 +71,10 @@ export function reviewedBtc15mSeriesDocument(): Record<string, unknown> {
     },
     outcomes: ["Up", "Down"],
     parameters: {
+      // ADR-030 Amendment 2 rule 2. This sample review predates Protocol V2 and
+      // accepts V1 windows only, as every recorded window is (S-G03 `version`
+      // "v1"); a review that accepts V2 windows states ["v1","v2"].
+      acceptedProtocolVersions: ["v1"],
       allowedTickSizes: ["0.01", "0.001"],
       minimumOrderSize: "5",
       negRisk: false,
@@ -110,7 +114,12 @@ export function recordedWindowMarketReading(
     description: BTC_15M_RULES_TEXT,
     resolutionSource: "https://data.chain.link/streams/btc-usd-twap-60s-streams",
     outcomes: '["Up", "Down"]',
+    // S-G03 `markets[0].version` is "v1" and `positionIds` is absent on every
+    // recorded window (`docs/venue/verified-2026-10-05.md` S-G04, the fixture
+    // `gamma-market-v1-btc15m`): `version` selects `clobTokenIds` (F-38).
+    version: { kind: "VALUE", value: "v1" },
     clobTokenIds: JSON.stringify([RECORDED_WINDOW.yesTokenId, RECORDED_WINDOW.noTokenId]),
+    positionIds: { kind: "ABSENT" },
     eventStartTime: RECORDED_WINDOW.eventStartTime,
     endDate: RECORDED_WINDOW.endDate,
     orderPriceMinTickSize: { kind: "VALUE", value: RECORDED_WINDOW.tickSize },
@@ -165,6 +174,69 @@ export function recordedClobReading(overrides: Partial<ClobMarketInfoReading> = 
       exponent: { kind: "VALUE", value: "1" },
       takerOnly: true,
     },
+    // S-K03a carries the undocumented `"v": "v1"` (C-21).
+    undocumentedProtocolVersion: { kind: "VALUE", value: "v1" },
+    ...overrides,
+  };
+}
+
+/**
+ * `V2-1` (ADR-030 Amendment 2) samples, quoted from
+ * `docs/venue/verified-2026-10-05.md` (VENUE-4) and its public fixtures under
+ * `test/fixtures/venue/protocol-v2/`. No V2 market of our series has been
+ * observed on Gamma (U-36), so a V2 WINDOW is built from the documented
+ * example's SHAPE (S-D16, `gamma-market-v2-docs-example`: `version` "v2",
+ * `clobTokenIds` null, `positionIds` an array) carrying the canary market's
+ * observed ids (S-L01, `clob-markets-v2`), on the recorded window's other
+ * facts.
+ */
+export const PROTOCOL_V2_SAMPLES = Object.freeze({
+  /** The documentation's example position ids (S-D16 lines 168-177; F-40). */
+  documentedPositionIds: Object.freeze([
+    "651150819117105875331414918119047680898421632356043490229292782433651916800",
+    "651150819117105875331414918119047680898421632356043490229292782433651916801",
+  ] as const),
+  /** The documentation's V2 condition id: 31 bytes, 62 hex digits (S-D17 line 281; F-43). */
+  documentedConditionId31: "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+  /** The canary's position ids, `t[].t` of S-L01 (O.3), "Up" then "Down". */
+  canaryPositionIds: Object.freeze([
+    "663574927012476832975694178961957910328055987427402067619466963999000625152",
+    "663574927012476832975694178961957910328055987427402067619466963999000625153",
+  ] as const),
+  /** The canary's condition id as the CLOB answers it (S-L01 `c`): 32 bytes, right-padded (F-43, F-70). */
+  canaryConditionId32: "0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000",
+  /** The same condition in its 31-byte form, as a V2 Gamma market states one (F-43). */
+  canaryConditionId31: "0x017791f201d5a788e0039e511fc1900e5f0000000000000000000000000000",
+});
+
+/**
+ * The recorded window's market as a V2 market would state it: the documented
+ * example's shape with the canary's ids and 31-byte condition id, and the
+ * canary's tick size (S-L01 `mts` 0.01, one of the reviewed sizes).
+ */
+export function protocolV2WindowMarketOverrides(
+  overrides: Partial<GammaWindowMarketReading> = {},
+): Partial<GammaWindowMarketReading> {
+  return {
+    conditionId: PROTOCOL_V2_SAMPLES.canaryConditionId31,
+    version: { kind: "VALUE", value: "v2" },
+    clobTokenIds: null,
+    positionIds: { kind: "VALUE", value: [...PROTOCOL_V2_SAMPLES.canaryPositionIds] },
+    orderPriceMinTickSize: { kind: "VALUE", value: "0.01" },
+    ...overrides,
+  };
+}
+
+/** The canary's CLOB market info (S-L01) as the door reads it: the series' parameters, `t[]` the position ids, `v` "v2". */
+export function protocolV2ClobOverrides(overrides: Partial<ClobMarketInfoReading> = {}): Partial<ClobMarketInfoReading> {
+  const [up, down] = PROTOCOL_V2_SAMPLES.canaryPositionIds;
+  return {
+    tokens: [
+      { tokenId: up, outcome: "Up" },
+      { tokenId: down, outcome: "Down" },
+    ],
+    minimumTickSize: { kind: "VALUE", value: "0.01" },
+    undocumentedProtocolVersion: { kind: "VALUE", value: "v2" },
     ...overrides,
   };
 }

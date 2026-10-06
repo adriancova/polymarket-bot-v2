@@ -634,3 +634,56 @@ describe("the series fields (ROLLOVER-1)", () => {
     expect(parseTraderConfig(seriesOnly({ series: [{ ...reviewedSeriesDocument(), approved: true }] })).ok).toBe(false);
   });
 });
+
+/**
+ * `V2-1` (ADR-030 Amendment 2 rule 2): the review's `acceptedProtocolVersions`
+ * is required at the trader's configuration door too. A configuration written
+ * before the field existed is REFUSED, naming the field and what to add —
+ * never read as a default. The schema rule itself is pinned in `series.test.ts`.
+ */
+describe("the series' acceptedProtocolVersions at the configuration door (V2-1)", () => {
+  const REFUSAL =
+    'acceptedProtocolVersions is required: a non-empty list of distinct protocol versions, each "v1" or "v2" ' +
+    '(ADR-030 Amendment 2 rule 2; e.g. ["v1"], or ["v1","v2"] once a review accepts V2 windows). It is never inferred';
+
+  function withAccepted(accepted: unknown | undefined): Record<string, unknown> {
+    const document = reviewedSeriesDocument();
+    const parameters = { ...(document["parameters"] as Record<string, unknown>) };
+    if (accepted === undefined) delete parameters["acceptedProtocolVersions"];
+    else parameters["acceptedProtocolVersions"] = accepted;
+    return { ...document, parameters };
+  }
+
+  function seriesOnly(series: Record<string, unknown>): Record<string, unknown> {
+    const instance = (validConfig()["instances"] as Record<string, unknown>[])[0] ?? {};
+    const rest = Object.fromEntries(Object.entries(instance).filter(([key]) => key !== "marketId"));
+    return {
+      ...validConfig(),
+      markets: [],
+      instances: [],
+      series: [series],
+      seriesInstances: [{ ...rest, seriesId: "btc-15m-updown" }],
+    };
+  }
+
+  it("refuses a series without the field, naming it and what to add", () => {
+    const parsed = parseTraderConfig(seriesOnly(withAccepted(undefined)));
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
+      expect(parsed.refusal.issues).toContain(`series.0.parameters.acceptedProtocolVersions: ${REFUSAL}`);
+    }
+  });
+
+  it("refuses an empty, duplicated or unknown list, and accepts a reviewed one, whose hash includes it", () => {
+    for (const bad of [[], ["v1", "v1"], ["v3"], ["V2"], "v1"]) {
+      expect(parseTraderConfig(seriesOnly(withAccepted(bad))).ok, JSON.stringify(bad)).toBe(false);
+    }
+    const v1 = parseTraderConfig(seriesOnly(withAccepted(["v1"])));
+    const both = parseTraderConfig(seriesOnly(withAccepted(["v1", "v2"])));
+    expect(v1.ok && both.ok).toBe(true);
+    if (!v1.ok || !both.ok) return;
+    expect(configuredSeries(v1.config)[0]?.configHash).toBe("27a746ce86cb3329920762611f47e7557a188a4a545ad991b0594333a7fcb759");
+    expect(configuredSeries(both.config)[0]?.configHash).toBe("f833fbbca4aaf9c15f0025c041f80471f49aabff0b0979224c4e11518d2beb97");
+  });
+});

@@ -161,15 +161,22 @@ export { instantMilliseconds, isAtOrAfter, isBefore, isSameInstant } from "./tim
 /**
  * `ROLLOVER-1` (ADR-030): series auto-admission in PAPER — the reviewed
  * series, the exact-match judge, the run-mode guard, the admitted window's
- * derived identity, and its schedule from its title.
+ * derived identity, and its schedule from its title. `V2-1` (ADR-030
+ * Amendment 2): the trading ids selected by `Market.version`, the reviewed
+ * `acceptedProtocolVersions`, and the 32-byte condition id of a venue read.
  */
 export {
+  ACCEPTED_PROTOCOL_VERSIONS_REQUIRED,
   ADMISSION_RUN_MODES,
+  PROTOCOL_VERSIONS,
   ReviewedSeriesSchema,
   admissionRunModeProblem,
   canonicalSeriesJson,
+  isProtocolVersion,
   judgeSeriesWindow,
+  paddedConditionId,
   parseReviewedSeries,
+  selectTradingIds,
   seriesConfigHash,
   windowInternalMarketId,
 } from "./series-admission.js";
@@ -178,11 +185,14 @@ export type {
   ClobMarketInfoReading,
   GammaWindowEventReading,
   GammaWindowMarketReading,
+  ProtocolVersion,
   ReviewedSeries,
   ReviewedSeriesParse,
   SeriesWindowVerdict,
+  TradingIdSelection,
   VenueBooleanReading,
   VenueDecimalReading,
+  VenueFieldReading,
   VenueStringReading,
 } from "./series-admission.js";
 export {
