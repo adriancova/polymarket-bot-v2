@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/data-v2-resolutions-v2-active.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-L04",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/resolutions?condition=0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000",
+  "fetched_utc": "2026-10-05T23:09:02Z",
+  "http_status": "200",
+  "raw_bytes": 311,
+  "raw_sha256": "7603270de994df1ad0582259c7fd6cc8991a8b8e824f7b844cdf17b347bd216a",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "GET /v2/resolutions?condition=<64-hex V2 condition>: an open V2 market, status active.",
+  "fixture_bytes": 311,
+  "fixture_sha256": "7603270de994df1ad0582259c7fd6cc8991a8b8e824f7b844cdf17b347bd216a"
+}

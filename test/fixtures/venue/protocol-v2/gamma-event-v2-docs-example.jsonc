@@ -1,0 +1,19 @@
+{
+  "id": "<event_id>",
+  "slug": "<event_slug>",
+  "title": "<event_title>",
+  "markets": [
+    {
+      "id": "1",
+      "version": "v2",
+      "slug": "<market_slug>",
+      "question": "<market_question>",
+      "conditionId": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+      "clobTokenIds": null,
+      "positionIds": [
+        "651150819117105875331414918119047680898421632356043490229292782433651916800",
+        "651150819117105875331414918119047680898421632356043490229292782433651916801"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/clob-markets-v2.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-L01",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://clob.polymarket.com/clob-markets/0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000",
+  "fetched_utc": "2026-10-05T23:08:59Z",
+  "http_status": "200",
+  "raw_bytes": 448,
+  "raw_sha256": "729762a0a6c71e4118012f4623d3810614bab1138d0544f5a3d41b25be8ed010",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "GET /clob-markets/{condition_id} with the 64-hex (bytes32, right-padded) V2 condition id: t[].t carries the V2 position ids with their labels; c, ao, aot, cbos and v are undocumented keys (C-21).",
+  "fixture_bytes": 448,
+  "fixture_sha256": "729762a0a6c71e4118012f4623d3810614bab1138d0544f5a3d41b25be8ed010"
+}

@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/data-v2-prices-history-page2.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-A03",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/prices-history?token_id=25070934348813416902477876984955073880416401960631253331845590271167412497744&interval=1h&bucket_seconds=300&cursor=eyJkYXRhIjp7InR5cGUiOiJwcmljZXNfaGlzdG9yeSIsInBhcmFtcyI6eyJsIjozLCJ0cyI6MTc5MTIzOTEwMCwic3EiOiIzMDAiLCJkIjozfX0sInNpZyI6IjQ1MGNjZDQ1ZWU0NmI5NTgwZWQ5ODNhMDkzZThkYjBlIn0",
+  "fetched_utc": "2026-10-05T23:10:36Z",
+  "http_status": "200",
+  "raw_bytes": 438,
+  "raw_sha256": "04999230e2e1149d66819cd589dc986339f5448ecdf19ec74304a9e31e00f531",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "The page fetched with page 1's next_cursor (no limit sent): limit 3 and offset 3 come from the cursor.",
+  "fixture_bytes": 438,
+  "fixture_sha256": "04999230e2e1149d66819cd589dc986339f5448ecdf19ec74304a9e31e00f531"
+}

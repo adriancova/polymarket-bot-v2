@@ -1,0 +1,27 @@
+{
+  "fixture": "protocol-v2/data-v2-trades-v1-page2.jsonc",
+  "kind": "live-capture-redacted",
+  "source_id": "S-A09",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/trades?condition=0xcd5f9f505e0c0182746aa65963f72f01e7463259e5ea9f56672c0fe3a37f348a&cursor=synthetic-cursor-trades-p1-next",
+  "fetched_utc": "2026-10-05T23:10:57Z",
+  "http_status": "200",
+  "raw_bytes": 1736,
+  "raw_sha256": "7969f2e91a266b542964d34c4de233db2ddf284d5a029ee5f2c6b649f2943183",
+  "redactions": [
+    "proxy_wallet: replaced with a synthetic, labelled address 0x00…<page><row> (all leading zeros)",
+    "name, pseudonym: replaced with synthetic-name-p<page>-r<row> and synthetic-pseudonym-p<page>-r<row>",
+    "bio, profile_image, profile_image_optimized: replaced with empty strings",
+    "transaction_hash: replaced with a synthetic 0x00…<page><row> hash (the real hash names the trading wallet on chain)",
+    "size: replaced with a synthetic 10 × <row> (the real size, with the market, side and price, could single the trade out)",
+    "timestamp (round 1): replaced with a synthetic epoch second, 1700000001 + the rank of the real value among the four rows of both pages, so the rows keep their order and ties (the real block timestamp could single the trade out of the market's public trade feed)",
+    "pagination.next_cursor (round 1): replaced with the labelled synthetic value synthetic-cursor-trades-p<page>-next. The real cursors are signed and opaque, but a feed cursor carries the seek anchor of the last row (S-O06: 'The trades/activity feed cursors carry only the seek anchor and page size'), and a GET of the real page-2 URL returned the unredacted page byte for byte (VENUE-4 round-1 review)",
+    "every other byte (market fields, side, outcome, prices, the rest of the pagination object) is unchanged; the replacement is textual, so key order and number formatting are the venue's",
+    "url (round 1): the cursor query value is replaced with page 1's synthetic next_cursor, so the committed URL no longer re-fetches the unredacted page. The real URL is row S-A09 of the round's scratch fetch log; raw_sha256 is the digest of that real response"
+  ],
+  "authenticated": false,
+  "notes": "The page fetched with page 1's next_cursor and the same condition filter. Personal data, timestamps and cursors replaced (see redactions).",
+  "fixture_bytes": 1632,
+  "fixture_sha256": "3fc177b0e33a61cedb5c371be75eecdfd5de5b9d8475a1bbe22fbe5ccd7c59eb"
+}

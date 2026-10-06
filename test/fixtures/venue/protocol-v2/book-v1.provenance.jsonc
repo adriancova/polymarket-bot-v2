@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/book-v1.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-L11",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://clob.polymarket.com/book?token_id=25070934348813416902477876984955073880416401960631253331845590271167412497744",
+  "fetched_utc": "2026-10-05T23:10:10Z",
+  "http_status": "200",
+  "raw_bytes": 2886,
+  "raw_sha256": "5449bd35334c63fc1f852af5150b524af4d1c9a15977c886c5d8e2b61a7b521a",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "GET /book for the V1 window's Up token: no version key.",
+  "fixture_bytes": 2886,
+  "fixture_sha256": "5449bd35334c63fc1f852af5150b524af4d1c9a15977c886c5d8e2b61a7b521a"
+}

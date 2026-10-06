@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/gamma-events-keyset-series10192.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-G05",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://gamma-api.polymarket.com/events/keyset?series_id=10192&closed=false&limit=2",
+  "fetched_utc": "2026-10-05T23:10:59Z",
+  "http_status": "200",
+  "raw_bytes": 13606,
+  "raw_sha256": "e28e186ea93f0156a833bd05d0de64db06e0aed4226543dbb89adbbfc265fdd4",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "GET /events/keyset?series_id=10192&closed=false&limit=2: two open windows (both v1) and a next_cursor. Tag createdBy/updatedBy are Gamma's numeric staff-record ids, kept as published.",
+  "fixture_bytes": 13606,
+  "fixture_sha256": "e28e186ea93f0156a833bd05d0de64db06e0aed4226543dbb89adbbfc265fdd4"
+}

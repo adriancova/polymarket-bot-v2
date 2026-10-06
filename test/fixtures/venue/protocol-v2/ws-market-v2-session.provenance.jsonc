@@ -1,0 +1,19 @@
+{
+  "fixture": "protocol-v2/ws-market-v2-session.jsonl",
+  "kind": "live-capture-redacted",
+  "source_id": "S-W01",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "WebSocket session",
+  "url": "wss://ws-subscriptions-clob.polymarket.com/ws/market (assets_ids=[663574…625152], custom_feature_enabled=true, 60 s)",
+  "fetched_utc": "2026-10-05T23:15:25Z",
+  "http_status": "WS",
+  "raw_bytes": 35316,
+  "raw_sha256": "3024eabbb25ef7f514bba9b93deee7b5b96690f72fc4cf3a8eba41f2a5293445",
+  "redactions": [
+    "3 of the 4 new_market frames (unrelated markets; raw lines 13, 14 and 17 of the capture) removed to keep the file small; the first new_market frame is kept as the example"
+  ],
+  "authenticated": false,
+  "notes": "One record per line: {t: local UTC receive/send time, dir: open|send|recv|local-close|close, data: the frame text exactly as received}. Subscription to one V2 position id with custom_feature_enabled. The book snapshot carries \"version\":\"v2\"; new_market frames carry no version.",
+  "fixture_bytes": 9957,
+  "fixture_sha256": "d38c050a708933e6f7355057ce27687945bc1e169acde70b754788326b5cb006"
+}

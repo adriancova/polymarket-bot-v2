@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/gamma-market-v1-btc15m.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-G04",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://gamma-api.polymarket.com/markets/5308512",
+  "fetched_utc": "2026-10-05T23:10:07Z",
+  "http_status": "200",
+  "raw_bytes": 3041,
+  "raw_sha256": "ec1abfdb433c4a0d0d9834aed3898362451c66de8dac9f577f95f9d8b8291571",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "GET /markets/{id} for the btc-15m-updown window opening 2026-10-05T23:00:00Z: version v1, clobTokenIds a JSON-encoded string; the positionIds, umaResolutionStatus and resolutionStatus keys are absent.",
+  "fixture_bytes": 3041,
+  "fixture_sha256": "ec1abfdb433c4a0d0d9834aed3898362451c66de8dac9f577f95f9d8b8291571"
+}

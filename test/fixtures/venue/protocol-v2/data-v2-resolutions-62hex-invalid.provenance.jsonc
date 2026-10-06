@@ -1,0 +1,17 @@
+{
+  "fixture": "protocol-v2/data-v2-resolutions-62hex-invalid.jsonc",
+  "kind": "live-capture",
+  "source_id": "S-L05",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://data-api.polymarket.com/v2/resolutions?condition=0x017791f201d5a788e0039e511fc1900e5f0000000000000000000000000000",
+  "fetched_utc": "2026-10-05T23:09:04Z",
+  "http_status": "400",
+  "raw_bytes": 222,
+  "raw_sha256": "864498688ff5e19f73d572f4207e6fc3b74007cd4fc8ba3c4122f923fff98294",
+  "redactions": [],
+  "authenticated": false,
+  "notes": "The 31-byte (62-hex) condition form: HTTP 400 with code invalid_request, parameter condition, retryable false (C-19).",
+  "fixture_bytes": 222,
+  "fixture_sha256": "864498688ff5e19f73d572f4207e6fc3b74007cd4fc8ba3c4122f923fff98294"
+}

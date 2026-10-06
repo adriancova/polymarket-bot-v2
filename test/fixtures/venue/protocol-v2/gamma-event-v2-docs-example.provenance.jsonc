@@ -1,0 +1,24 @@
+{
+  "fixture": "protocol-v2/gamma-event-v2-docs-example.jsonc",
+  "kind": "documentation-example",
+  "source_id": "S-D17",
+  "report": "docs/venue/verified-2026-10-05.md",
+  "method": "GET",
+  "url": "https://docs.polymarket.com/market-data/discover-markets.md",
+  "fetched_utc": "2026-10-05T23:06:30Z",
+  "http_status": "200",
+  "raw_bytes": 56450,
+  "raw_sha256": "b570fc4cb67910455b4958e7a38ebf3f6427b51bf588b7b764c336e832b9c085",
+  "extract": {
+    "lines": [
+      271,
+      289
+    ],
+    "rule": "the JSON object at these lines of the page, parsed and re-serialized with 2-space indentation; no value changed"
+  },
+  "redactions": [],
+  "authenticated": false,
+  "notes": "The official V2 Gamma event example (market-data/discover-markets, API tab). NOT a live capture. Its conditionId is the 31-byte (62-hex) form; placeholders such as <event_id> are the documentation's own.",
+  "fixture_bytes": 542,
+  "fixture_sha256": "61a846f2d1a52bdaffeb3ec8701c3211aa2dffdd586ecab2d9ad7ce74e015743"
+}
