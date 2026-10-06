@@ -178,7 +178,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `V2-0` | Protocol V2 governance: the dated ADR amendments and the user's rulings (docs only) | Complete (2026-10-06) | `5f2b3c8` | [V2-0](docs/handoffs/V2-0.md) |
 | `V2-1` | Protocol V2 version-selected identifiers and series admission (class A, PAPER) | Complete (2026-10-06) | `8558053` | [V2-1](docs/handoffs/V2-1.md) |
 | `V2-3` | Protocol V2 resolution via a journaled `/v2/resolutions` read, and not-yet-admissible windows (class A, PAPER; dual verifiers; due 2026-10-28) | **Running** (authorized 2026-10-06) | — | — |
-| `V2-5` | `@polymarket/client` 0.11.0 → 0.12.x in `polymarket-secure` (class C, PAPER; security review) | **Running** (authorized 2026-10-06) | — | — |
+| `V2-5` | `@polymarket/client` 0.11.0 → 0.12.0 in `polymarket-secure` (security review) | Complete (2026-10-06) | `1d9bfb0` | [V2-5](docs/handoffs/V2-5.md) |
 | `V2-10` | Simulation fill fidelity: F-63 floor in base units; FOK/FAK BUYs target collateral | **Running** (authorized 2026-10-06) | — | — |
 | `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER) | Complete (2026-10-06) | `9836ab0` | [V2-2](docs/handoffs/V2-2.md) |
 | `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | Complete (2026-10-06) | `9e28bc2` | [CI-7](docs/handoffs/CI-7.md) |
