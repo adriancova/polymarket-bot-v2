@@ -5,7 +5,8 @@
  * WHY. `GATE1-R4` holds per STEP: a failing gate no longer hides the gates
  * after it. But `typecheck`, `test:contract` and `test:integration` are `&&`
  * chains in the root `package.json`, and since `CI-5` so is `test:fault`
- * (the WAL, OMS and reconciliation fault suites). When one ran as a single
+ * (the WAL, OMS and reconciliation fault suites, and since `CI-6` the
+ * live-safety and live chaos suites). When one ran as a single
  * step, the chain's first failure hid the rest of that step. So `ci.yml` now
  * runs every chained command as its own gated step. The commands still live
  * in the PROTECTED `package.json`, so the two copies can drift apart. The
@@ -319,6 +320,9 @@ export const GATED_JOBS = [
  * The root scripts that are `&&` chains, and the label their split steps' names
  * begin with. `CI-5` added `test:fault`, when the OMS (`WP-270`) and
  * reconciliation (`WP-290`) suites joined the WAL suite in that script.
+ * `CI-6` chained the live-safety (`WP-320`) and live chaos (`WP-340`) suites
+ * after them, and the live chaos suite's PostgreSQL half to
+ * `test:integration`.
  */
 export const SPLIT_CHAINS = [
   { script: "typecheck", label: "Typecheck" },
