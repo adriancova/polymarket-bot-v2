@@ -10,15 +10,22 @@ Inputs:
   `book`, `price_change` and `last_trade_price` frames, and `PONG`.
 - fixtures/gamma-events.json: a trimmed Gamma `/events` response; see its
   `_provenance` field.
+- fixtures/gamma-events-v2.json: Polymarket Protocol V2 markets, the first of
+  them the official V2 example; see its `_provenance` field.
+- test/fixtures/venue/protocol-v2/ (repository root): VENUE-4's V2 captures,
+  read in place (the documented V2 market and event, a V2 CLOB market record,
+  and a 60 s market-channel session on a V2 position id).
 No network is used.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -373,6 +380,229 @@ class Summary(unittest.TestCase):
         self.assertEqual(summary["all"]["events"], 0)
         self.assertIsNone(summary["all"]["bytesPerDay"])
         self.assertEqual(summary["perSeries"]["btc-up-or-down-5m"]["atWindowOpens"]["opens"], 0)
+
+
+# ---------------------------------------------------------------------------
+# Polymarket Protocol V2 (V2-2: plan rows A15 and D10). The official V2
+# captures are VENUE-4's, under test/fixtures/venue/protocol-v2/ (README
+# there); `fixtures/gamma-events-v2.json` derives its V2 market from them.
+# ---------------------------------------------------------------------------
+
+PROTOCOL_V2 = HERE.parents[3] / "test" / "fixtures" / "venue" / "protocol-v2"
+V2_SERIES = "btc-up-or-down-5m"
+DROP = object()
+
+
+def load_v2_events() -> list:
+    return json.loads((FIXTURES / "gamma-events-v2.json").read_text(encoding="utf-8"))["events"]
+
+
+def protocol_v2(name: str) -> Any:
+    """One VENUE-4 capture, read as the strict JSON its README says it is."""
+    return json.loads((PROTOCOL_V2 / name).read_text(encoding="utf-8"))
+
+
+def v2_session_records() -> list[dict]:
+    """The VENUE-4 market-channel session (S-W01), one `{t, dir, data}` record per line."""
+    lines = (PROTOCOL_V2 / "ws-market-v2-session.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def docs_example_market() -> dict:
+    """A fresh copy of the documented V2 market as the V2 fixture carries it."""
+    return copy.deepcopy(load_v2_events()[0]["markets"][0])
+
+
+def one_market_event(market: dict) -> list:
+    return [{"slug": "btc-updown-5m-case", "seriesSlug": V2_SERIES, "markets": [market]}]
+
+
+class ProtocolV2Selection(unittest.TestCase):
+    """`select_token_ids`: the documented rule (F-38 to F-40) and A1's refusals."""
+
+    def test_the_documented_v2_market_is_admitted_by_its_position_ids(self) -> None:
+        windows, problems = core.parse_gamma_events(load_v2_events(), [V2_SERIES])
+        self.assertEqual(problems, [])
+        docs = next(w for w in windows if w.event_slug == "btc-updown-5m-v2-docs-example")
+        official = protocol_v2("gamma-market-v2-docs-example.jsonc")
+        official_event = protocol_v2("gamma-event-v2-docs-example.jsonc")
+        # The fixture's V2 market is the documentation's, field for field.
+        self.assertEqual(official["version"], "v2")
+        self.assertIsNone(official["clobTokenIds"])
+        self.assertEqual(docs.token_ids, tuple(official["positionIds"]))
+        self.assertEqual(docs.condition_id, official_event["markets"][0]["conditionId"])
+        self.assertEqual(len(docs.condition_id), 2 + 62)  # Gamma's documented 31-byte form, kept as the identity
+        self.assertEqual([len(token) for token in docs.token_ids], [75, 75])
+        self.assertEqual(docs.outcomes, ("Yes", "No"))
+        # They are what the recorder subscribes.
+        self.assertEqual(core.subscribe_frame(core.tokens_of([docs]))["assets_ids"], sorted(official["positionIds"]))
+
+    def test_v2_chooses_position_ids_even_when_clob_token_ids_is_populated(self) -> None:
+        windows, _ = core.parse_gamma_events(load_v2_events(), [V2_SERIES])
+        both = next(w for w in windows if w.event_slug == "btc-updown-5m-v2-both-fields")
+        market = load_v2_events()[1]["markets"][0]
+        self.assertEqual(both.token_ids, tuple(market["positionIds"]))
+        self.assertTrue(set(both.token_ids).isdisjoint(json.loads(market["clobTokenIds"])))
+
+    def test_v1_chooses_clob_token_ids_even_when_position_ids_is_populated(self) -> None:
+        windows, _ = core.parse_gamma_events(load_v2_events(), [V2_SERIES])
+        v1 = next(w for w in windows if w.event_slug == "btc-updown-5m-v1-both-fields")
+        market = load_v2_events()[2]["markets"][0]
+        self.assertEqual(v1.token_ids, tuple(json.loads(market["clobTokenIds"])))
+        self.assertTrue(set(v1.token_ids).isdisjoint(market["positionIds"]))
+
+    def test_the_v1_fixture_gives_the_windows_and_problems_it_gave_before(self) -> None:
+        windows, problems = core.parse_gamma_events(load_events(), WANTED)
+        self.assertEqual(len(windows), 7)
+        self.assertEqual(
+            sorted(problems),
+            [
+                "sol-up-or-down-5m sol-updown-5m-1790767800 market '9000009': eventStartTime/endDate missing or not increasing",
+                # Word for word the problem fdc3430 reported for this market.
+                "xrp-up-or-down-5m xrp-updown-5m-1790767800 market '9000008': clobTokenIds missing or malformed",
+            ],
+        )
+        for window in windows:
+            self.assertEqual(len(window.token_ids), 2)
+
+    def test_a_market_without_version_is_refused_by_name(self) -> None:
+        # The trimmed V1 fixture as it was before V2-2 added `version`: every market is refused, none admitted.
+        events = load_events()
+        for event in events:
+            for market in event.get("markets", []):
+                del market["version"]
+        windows, problems = core.parse_gamma_events(events, ["btc-up-or-down-15m"])
+        self.assertEqual(windows, [])
+        self.assertEqual(len(problems), 4)
+        self.assertTrue(all(p.endswith("no version, so the id field cannot be chosen (F-39)") for p in problems))
+
+    def test_each_refusal_is_named_and_admits_nothing(self) -> None:
+        ids = docs_example_market()["positionIds"]
+        first, second = ids
+
+        def v2(**changes: Any) -> dict:
+            market = docs_example_market()
+            for key, value in changes.items():
+                if value is DROP:
+                    del market[key]
+                else:
+                    market[key] = value
+            return market
+
+        def v1(**changes: Any) -> dict:
+            return v2(**{"version": "v1", "clobTokenIds": json.dumps(ids), **changes})
+
+        non_decimal = "version v2: positionIds holds the non-decimal id {!r} (F-39)"
+        cases: list[tuple[str, dict, str]] = [
+            ("version absent", v2(version=DROP), "no version, so the id field cannot be chosen (F-39)"),
+            ("version null", v2(version=None), "version is null, so the id field cannot be chosen (F-39)"),
+            ("version unknown", v2(version="v3"), "unsupported version 'v3' (F-39, F-40)"),
+            ("version in another case", v2(version="V2"), "unsupported version 'V2' (F-39, F-40)"),
+            ("version empty", v2(version=""), "unsupported version '' (F-39, F-40)"),
+            ("version a number", v2(version=2), "unsupported version 2 (F-39, F-40)"),
+            ("version a list", v2(version=["v2"]), "unsupported version ['v2'] (F-39, F-40)"),
+            ("positionIds absent", v2(positionIds=DROP), "version v2: positionIds is absent or null, so the ids are not yet available (F-40)"),
+            ("positionIds null", v2(positionIds=None), "version v2: positionIds is absent or null, so the ids are not yet available (F-40)"),
+            ("positionIds JSON-encoded", v2(positionIds=json.dumps(ids)), "version v2: positionIds is malformed, not an array of strings (F-38)"),
+            ("positionIds numbers", v2(positionIds=[int(first), int(second)]), "version v2: positionIds is malformed, not an array of strings (F-38)"),
+            ("positionIds an object", v2(positionIds={"0": first, "1": second}), "version v2: positionIds is malformed, not an array of strings (F-38)"),
+            ("no id", v2(positionIds=[]), "version v2: positionIds holds 0 ids, not exactly two"),
+            ("one id", v2(positionIds=[first]), "version v2: positionIds holds 1 ids, not exactly two"),
+            ("three ids", v2(positionIds=[first, second, "7"]), "version v2: positionIds holds 3 ids, not exactly two"),
+            ("hex id", v2(positionIds=["0x1", second]), non_decimal.format("0x1")),
+            ("leading zero", v2(positionIds=["0" + first, second]), non_decimal.format("0" + first)),
+            ("signed id", v2(positionIds=["+" + first, second]), non_decimal.format("+" + first)),
+            ("padded id", v2(positionIds=[first + " ", second]), non_decimal.format(first + " ")),
+            ("trailing newline", v2(positionIds=[first, second + "\n"]), non_decimal.format(second + "\n")),
+            ("fraction", v2(positionIds=[first + ".0", second]), non_decimal.format(first + ".0")),
+            ("empty id", v2(positionIds=["", second]), non_decimal.format("")),
+            ("non-ASCII digits", v2(positionIds=["١٢", second]), non_decimal.format("١٢")),
+            ("equal ids", v2(positionIds=[first, first]), "version v2: positionIds holds the same id twice"),
+            # A V1 field that is absent, null, malformed or empty keeps fdc3430's exact refusal text.
+            ("v1 clobTokenIds absent", v1(clobTokenIds=DROP), "clobTokenIds missing or malformed"),
+            ("v1 clobTokenIds null", v1(clobTokenIds=None), "clobTokenIds missing or malformed"),
+            ("v1 clobTokenIds not JSON", v1(clobTokenIds="not json"), "clobTokenIds missing or malformed"),
+            ("v1 clobTokenIds empty", v1(clobTokenIds="[]"), "clobTokenIds missing or malformed"),
+            ("v1 one id", v1(clobTokenIds=json.dumps([first])), "version v1: clobTokenIds holds 1 ids, not exactly two"),
+            ("v1 non-decimal id", v1(clobTokenIds=json.dumps(["abc", second])), "version v1: clobTokenIds holds the non-decimal id 'abc' (F-39)"),
+            ("v1 equal ids", v1(clobTokenIds=json.dumps([second, second])), "version v1: clobTokenIds holds the same id twice"),
+        ]
+        for name, market, reason in cases:
+            with self.subTest(name):
+                windows, problems = core.parse_gamma_events(one_market_event(market), [V2_SERIES])
+                self.assertEqual(windows, [])
+                self.assertEqual(problems, [f"{V2_SERIES} btc-updown-5m-case market '1': {reason}"])
+                self.assertEqual(core.select_token_ids(market), (None, reason))
+
+    def test_the_admitted_shapes(self) -> None:
+        ids = docs_example_market()["positionIds"]
+        self.assertEqual(core.select_token_ids(docs_example_market()), (tuple(ids), None))
+        # V1 keeps both spellings it has always accepted for clobTokenIds.
+        for spelling in (json.dumps(ids), list(ids)):
+            self.assertEqual(core.select_token_ids({"version": "v1", "clobTokenIds": spelling}), (tuple(ids), None))
+        self.assertEqual(core.select_token_ids({"version": "v2", "positionIds": ["0", "1"]}), (("0", "1"), None))
+
+
+class ProtocolV2Attribution(unittest.TestCase):
+    """`window_for_market`: a frame's condition id finds its window under either width (F-43, F-62)."""
+
+    def setUp(self) -> None:
+        canary = protocol_v2("clob-markets-v2.jsonc")
+        self.c64 = canary["c"]  # the 32-byte form the CLOB and the market channel served (S-L01, S-W01)
+        self.assertTrue(self.c64.endswith("00"))
+        self.c62 = self.c64[:-2]  # the 31-byte form: Gamma's documented width (F-40, F-43)
+        self.ids = tuple(entry["t"] for entry in canary["t"])  # index 0 Up (YES), index 1 Down (NO)
+        start = at("2026-10-05T23:15:00Z")
+        # Gamma lists no canary (O.1): this window is SYNTHETIC apart from its ids.
+        self.window = core.Window(V2_SERIES, "btc", "synthetic-v2-canary", "", self.c62, start, start + 300, self.ids, ("Up", "Down"))
+
+    def test_the_v2_session_is_attributed_to_its_31_byte_window(self) -> None:
+        records = [r for r in v2_session_records() if r["dir"] == "recv"]
+        self.assertEqual(len(records), 7)
+        stats = core.Stats()
+        registry = {self.c62: self.window}
+        for record in records:
+            stats.record_frame(at(record["t"]), V2_SERIES, record["data"], registry)
+        # The one V2 `book` frame lands on the window, under the window's own id.
+        self.assertNotIn(self.c64, stats.markets)
+        self.assertEqual(stats.markets[self.c62].counts[core.EVENTS], 1)
+        self.assertEqual(stats.markets[self.c62].event_types, {"book": 1})
+        self.assertEqual(stats.control[V2_SERIES][0], 5)  # the five PONGs
+        start, end = at("2026-10-05T23:15:25Z"), at("2026-10-05T23:16:26Z")
+        summary = core.summarize(stats, registry, [V2_SERIES], start, end)
+        self.assertEqual(
+            [(row["conditionId"], row["events"], row["eventTypes"]) for row in summary["windows"]],
+            [(self.c62, 1, {"book": 1})],
+        )
+        # The unrelated `new_market` frame stays under its own condition id.
+        others = [key for key in stats.markets if key != self.c62]
+        self.assertEqual(len(others), 1)
+        self.assertEqual(stats.markets[others[0]].event_types, {"new_market": 1})
+
+    def test_the_exact_id_wins_and_the_other_width_is_only_a_fallback(self) -> None:
+        exact = core.Window(V2_SERIES, "btc", "exact", "", self.c64, 0.0, 300.0, ("1", "2"), ())
+        both = {self.c62: self.window, self.c64: exact}
+        self.assertIs(core.window_for_market(both, self.c64), exact)
+        self.assertIs(core.window_for_market(both, self.c62), self.window)
+        self.assertIs(core.window_for_market({self.c62: self.window}, self.c64), self.window)
+        # A 31-byte id on the wire finds a 32-byte window too.
+        self.assertIs(core.window_for_market({self.c64: exact}, self.c62), exact)
+
+    def test_a_nonzero_final_byte_and_other_strings_are_never_narrowed(self) -> None:
+        registry = {self.c62: self.window}
+        self.assertIsNone(core.window_for_market(registry, self.c62 + "01"))
+        self.assertIsNone(core.window_for_market(registry, None))
+        self.assertIsNone(core.window_for_market(registry, "0xunknown"))
+        self.assertIsNone(core.window_for_market(registry, self.c62[:-2]))
+        self.assertIsNone(core._other_condition_width("0x" + "ab" * 33))
+        self.assertIsNone(core._other_condition_width(self.c62 + "0"))
+
+    def test_v1_attribution_is_unchanged(self) -> None:
+        # A V1 condition id is 32 bytes and Gamma serves that form (O.5): found exactly, as before.
+        windows, _ = core.parse_gamma_events(load_events(), WANTED)
+        registry = {w.condition_id: w for w in windows}
+        self.assertIs(core.window_for_market(registry, RUN8_CONDITION), registry[RUN8_CONDITION])
+        self.assertIsNone(core.window_for_market(registry, RUN8_CONDITION[:-2]))
 
 
 if __name__ == "__main__":

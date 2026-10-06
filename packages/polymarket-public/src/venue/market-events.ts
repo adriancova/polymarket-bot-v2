@@ -32,6 +32,20 @@
  * emitted event is projected from the tree onto a null prototype using the
  * `*_FIELDS` tables below — which `./venue-fields.test.ts` re-derives from the
  * schemas they mirror.
+ *
+ * ## Polymarket Protocol V2 (`V2-2`, 2026-10-05; plan rows A11, A12)
+ *
+ * The market channel serves a V2 position id like any asset id, subscribed by
+ * `assets_ids` (`docs/venue/verified-2026-10-05.md` F-60, F-62). Its `book`
+ * event carries `"version":"v2"`, which the channel reference does not
+ * document (C-21, U-39). The `book` projection emits declared fields only, so
+ * the key is never read and a V2 `book` normalizes exactly as its V1 shape
+ * does. Identity comes from `asset_id` alone (`../normalize/market-events.ts`),
+ * so the 32-byte `market` the V2 frame was observed carrying never has to
+ * match the catalogue's condition id width. Every other V2 event type is
+ * unobserved (U-38) and decoded by the unchanged schemas below; `V2-3` owns
+ * `market_resolved` for V2 (A13). The contract suite pins the V2 capture
+ * (`test/contract/polymarket-public/market-ws-fixtures.test.ts`).
  */
 
 import { z } from "zod";

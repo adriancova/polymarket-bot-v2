@@ -30,6 +30,12 @@
  *    from the whole-read layer, an undocumented body is
  *    `PUBLIC_MARKET_STATE_INVALID`, and the raw layer RETURNS a non-2xx so a
  *    recorder can journal it before judging it.
+ * 6. Polymarket Protocol V2 (`V2-2`, plan row A14; acceptance 3): the V2
+ *    `resolutionStatus` (`docs/venue/verified-2026-10-05.md` F-54, C-18) is
+ *    recorded as the venue spells it and never interpreted. Readiness is the
+ *    same with it, without it, and whatever its value. The documented V2
+ *    example and the guide's resolution snippet are admitted; with no state
+ *    field present they are not ready (fail closed, U-36).
  */
 
 import {
@@ -75,6 +81,9 @@ const EXPECTED_READINESS: Readonly<Record<string, boolean>> = {
   "restricted-but-trade-ready": true,
   "sports-with-game-start-time": true,
   "extra-undocumented-keys": true,
+  "v2-documented-example": false,
+  "v2-resolution-snippet": false,
+  "v2-trade-ready-resolution-active": true,
 };
 
 function admitted(value: unknown): GammaMarketState {
@@ -497,5 +506,98 @@ describe("5. the fetcher", () => {
       () => undefined,
     );
     expect(http.exchanges).toHaveLength(2);
+  });
+});
+
+describe("6. Protocol V2: resolutionStatus is recorded, never interpreted (A14; F-54, C-18)", () => {
+  const V2_BODY = example("v2-trade-ready-resolution-active") as Record<string, unknown>;
+
+  /** Everything the door derives from a body, apart from the recorded scalars. */
+  function interpreted(state: GammaMarketState): string {
+    return (
+      `active=${String(state.active)};closed=${String(state.closed)};archived=${String(state.archived)};` +
+      `acceptingOrders=${String(state.acceptingOrders)};restricted=${String(state.restricted)};` +
+      `gameStartTime=${String(state.gameStartTime)};ready=${String(isGammaMarketTradeReady(state))}`
+    );
+  }
+
+  function withoutResolutionStatus(): Record<string, unknown> {
+    const copy = { ...V2_BODY };
+    delete copy["resolutionStatus"];
+    return copy;
+  }
+
+  it("the synthetic V2 body is the trade-ready example plus the V2 fields, and nothing else", () => {
+    const base = example("trade-ready") as Record<string, unknown>;
+    const added = Object.keys(V2_BODY).filter((key) => !Object.hasOwn(base, key)).sort();
+    expect(added).toEqual(["clobTokenIds", "positionIds", "resolutionStatus", "version"]);
+    for (const { key } of GAMMA_MARKET_DOCUMENTED_FIELDS) expect(V2_BODY[key], key).toEqual(base[key]);
+  });
+
+  it("records resolutionStatus and version exactly as the venue spelled them", () => {
+    const state = admitted(V2_BODY);
+    expect(state.recorded["resolutionStatus"]).toBe("active");
+    expect(state.recorded["version"]).toBe("v2");
+    expect(state.recorded["clobTokenIds"]).toBeNull();
+  });
+
+  it.each([
+    ["inactive"],
+    ["active"],
+    ["resolved"],
+    // A value the guide does not list (F-54) is recorded too: the door records, it does not judge.
+    ["disputed"],
+    [""],
+    [null],
+  ] as const)("resolutionStatus %j is recorded and moves nothing the door derives", (value) => {
+    const state = admitted({ ...V2_BODY, resolutionStatus: value });
+    expect(Object.hasOwn(state.recorded, "resolutionStatus")).toBe(true);
+    expect(state.recorded["resolutionStatus"]).toBe(value);
+    expect(interpreted(state)).toBe(interpreted(admitted(withoutResolutionStatus())));
+    expect(isGammaMarketTradeReady(state)).toBe(true);
+  });
+
+  it("a 'resolved' status does not make an open order book unready: lifecycle reads the three documented fields only", () => {
+    const resolved = admitted({ ...V2_BODY, resolutionStatus: "resolved" });
+    expect(isGammaMarketTradeReady(resolved)).toBe(true);
+    // ...and an 'active' status does not make a closed market ready.
+    const closed = admitted({ ...V2_BODY, closed: true, acceptingOrders: false, resolutionStatus: "active" });
+    expect(isGammaMarketTradeReady(closed)).toBe(false);
+  });
+
+  it("without resolutionStatus the verdict is the same apart from the recorded key", () => {
+    const withIt = admitted(V2_BODY);
+    const withoutIt = admitted(withoutResolutionStatus());
+    expect(interpreted(withIt)).toBe(interpreted(withoutIt));
+    expect(Object.keys(withIt.recorded).filter((key) => !Object.hasOwn(withoutIt.recorded, key))).toEqual([
+      "resolutionStatus",
+    ]);
+  });
+
+  it("the documented V2 example is admitted; positionIds, an array, is not carried; with no state field it is not ready (U-36)", () => {
+    const state = admitted(example("v2-documented-example"));
+    expect(state.recorded["version"]).toBe("v2");
+    expect(state.recorded["clobTokenIds"]).toBeNull();
+    expect(Object.hasOwn(state.recorded, "positionIds")).toBe(false);
+    for (const { key } of GAMMA_MARKET_DOCUMENTED_FIELDS) expect(state[key], key).toBeNull();
+    expect(isGammaMarketTradeReady(state)).toBe(false);
+  });
+
+  it("the guide's resolution snippet is admitted and recorded, and asserts no readiness", () => {
+    const state = admitted(example("v2-resolution-snippet"));
+    expect(state.recorded["resolutionStatus"]).toBe("resolved");
+    expect(state.recorded["version"]).toBe("v2");
+    expect(isGammaMarketTradeReady(state)).toBe(false);
+  });
+
+  it("a resolutionStatus that is not a scalar is not carried, like every nested value: the raw body is journaled", () => {
+    const state = admitted({ ...V2_BODY, resolutionStatus: { status: "resolved" } });
+    expect(Object.hasOwn(state.recorded, "resolutionStatus")).toBe(false);
+    expect(isGammaMarketTradeReady(state)).toBe(true);
+  });
+
+  it("the documented field table is unchanged: V2 adds no interpreted field", () => {
+    expect(GAMMA_MARKET_DOCUMENTED_FIELDS.map((field) => field.key)).not.toContain("resolutionStatus");
+    expect(GAMMA_MARKET_DOCUMENTED_FIELDS).toHaveLength(6);
   });
 });

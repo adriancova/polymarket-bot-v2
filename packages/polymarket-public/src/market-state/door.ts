@@ -62,6 +62,22 @@
  * suite pins both halves (an extra key is admitted and lands in `recorded`; a
  * non-boolean `active` is refused).
  *
+ * ## Polymarket Protocol V2 (`V2-2`, 2026-10-05; plan row A14)
+ *
+ * Per `docs/venue/verified-2026-10-05.md`: the Gamma OpenAPI's `Market` now
+ * documents `version` (a nullable string) and `positionIds` (a nullable array
+ * of strings) (F-41, E-23). The API-integration guide documents
+ * `resolutionStatus` for V2 markets, "`inactive`, `active`, or `resolved`"
+ * (F-54), which the OpenAPI and the SDK omit (C-18); no V2 market has been read
+ * from Gamma (O.1), so whether V2 markets keep the state fields above is
+ * unknown (U-36). None of the three carries a state this door interprets, so
+ * the passthrough above applies to them unchanged: `version` and
+ * `resolutionStatus` are recorded as the venue spells them, `positionIds` (an
+ * array) is not carried, and the readiness predicate still reads `active`,
+ * `closed` and `acceptingOrders` only. A V2 body without those three is not
+ * ready (the `null` rule below). Resolution is not read here: `V2-3` owns it.
+ * The contract suite's section 6 pins all of it.
+ *
  * ## One refusal the venue could trigger, disclosed (r1, LOW-4)
  *
  * The materializer this door shares with the CLOB door, `readOwnWireValue`,
