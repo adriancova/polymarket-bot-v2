@@ -524,10 +524,13 @@ describe("V2-9 trade and activity captures (report §15; plan acceptance 5)", ()
         row["transaction_hash"] = "0x9f2c1a7d3e5b4c6a8d0e2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e";
       }),
     );
+    // Each refused once: the wallet and pseudonym by the personal-key scan,
+    // the name and hash by the feed rule.
+    expect(result.errors.length).toBe(4);
     for (const fragment of [
       "$.data[0].proxy_wallet: a wallet must be a labelled synthetic address",
       "$.data[0].name: a name must be a labelled synthetic value",
-      "$.data[0].pseudonym: a name must be a labelled synthetic value",
+      "$.data[0].pseudonym: a pseudonym must be a labelled synthetic value",
       "$.data[0].transaction_hash: a hash must be a labelled synthetic hash",
     ]) {
       expect(hasError(result, fragment), fragment).toBe(true);

@@ -39,8 +39,8 @@
  *      that decodes to a venue feed cursor is refused, because a feed cursor
  *      carries the seek anchor of the last row (S-O06) and re-fetches the
  *      unredacted page; any other cursor must be a labelled synthetic value;
- *    - a row's wallet, name, pseudonym or transaction hash must be a labelled
- *      synthetic value;
+ *    - a row's name and transaction hash must be labelled synthetic values
+ *      (its wallet and pseudonym already must be, by rule 5);
  *    - a page that carries a row or a cursor must have a sidecar whose
  *      redactions list `timestamp` and `next_cursor`.
  * 7. **The pins.** The venue facts the capture is committed to show (a
@@ -513,13 +513,12 @@ export function feedErrors(view: unknown, sidecar: CaptureSidecar): string[] {
       errors.push(`${where}: a feed row must be an object`);
       return;
     }
-    if (Object.hasOwn(row, "proxy_wallet") && !isLabelledSyntheticHex(row["proxy_wallet"], 40)) {
-      errors.push(`${where}.proxy_wallet: a wallet must be a labelled synthetic address (0x00…)`);
-    }
-    for (const key of ["name", "pseudonym"]) {
-      if (Object.hasOwn(row, key) && !isLabelledSyntheticText(row[key])) {
-        errors.push(`${where}.${key}: a name must be a labelled synthetic value (synthetic-…)`);
-      }
+    // The wallet and pseudonym are refused by the personal-key scan (rule 5),
+    // in every capture; `name` and `transaction_hash` are generic keys
+    // elsewhere (a resolution's transaction is public), so they are refused
+    // here, in feed rows.
+    if (Object.hasOwn(row, "name") && !isLabelledSyntheticText(row["name"])) {
+      errors.push(`${where}.name: a name must be a labelled synthetic value (synthetic-…)`);
     }
     if (
       Object.hasOwn(row, "transaction_hash") &&
