@@ -27,7 +27,10 @@
  *   available", F-40) — is neither admitted nor refused:
  *   {@link judgeSeriesWindow} answers `NOT_YET_ADMISSIBLE` with its scheduled
  *   open, and the caller judges it again, refusing it finally at or after that
- *   open. Every other refusal stays final.
+ *   open. Every other refusal stays final. Only a `"v2"` window's
+ *   `positionIds` can be known absent or `null`: a `"v1"` window's
+ *   `clobTokenIds` reading cannot tell absent or `null` from another type,
+ *   and is refused at once (`V2-3` r1, V23-R1-CODEX-01).
  * - **PAPER or BACKTEST only** (Decision 2.1, acceptance 2):
  *   {@link admissionRunModeProblem}. Admission is NEVER auto-approval for live
  *   trading (Decision 2.2).
@@ -683,11 +686,13 @@ export type TradingIdSelection =
       readonly problems: readonly string[];
       /**
        * `V2-3` item 7: `true` exactly when the version is supported and the
-       * field it selects is absent or `null` — "the IDs are not yet
-       * available" (F-40). For `"v1"` the series-window door reads
-       * `clobTokenIds` as a string or `null`, and its `null` also covers a
-       * value of another type (`@polymarket-bot/polymarket-public`
-       * `series-window/door.ts`, `stringOf`).
+       * field it selects is KNOWN to be absent or `null` — "the IDs are not
+       * yet available" (F-40). Only `"v2"`'s `positionIds` can be: the
+       * series-window door reads `"v1"`'s `clobTokenIds` as a string or
+       * `null`, and its `null` also covers a value of another type
+       * (`@polymarket-bot/polymarket-public` `series-window/door.ts`,
+       * `stringOf`), so for `"v1"` this is always `false` (`V2-3` r1,
+       * V23-R1-CODEX-01).
        */
       readonly idsNotYetAvailable: boolean;
     };
@@ -767,13 +772,25 @@ function positionIdsOf(reading: GammaWindowMarketReading["positionIds"]): Select
   }
 }
 
+/**
+ * `"v1"`'s `clobTokenIds`, as the series-window door reads it: a string, or
+ * `null` — and that `null` covers absent, `null` AND a value of another type
+ * alike (`@polymarket-bot/polymarket-public` `series-window/door.ts`,
+ * `stringOf`). So a `null` reading never shows that the field is absent or
+ * `null`, which is all `V2-3` item 7 defers (ADR-030 Amendment 2 rule 1, note
+ * of 2026-10-06: "Every other refusal reason stays final"). It is an unclear
+ * fact, and is refused at once, as `V2-1` refused it (Decision 1.5; `V2-3` r1,
+ * V23-R1-CODEX-01): `notYetAvailable` is `false`.
+ */
 function clobTokenIdsOf(text: VenueStringReading): SelectedField {
   if (text === null) {
     return {
       ok: false,
       problem:
-        'fact: Market.clobTokenIds, the field Market.version "v1" selects, is absent, null or not a string: the window\'s ids are not yet available (F-40)',
-      notYetAvailable: true,
+        'fact: Market.clobTokenIds, the field Market.version "v1" selects, is absent, null or not a string: the window\'s ids are not yet available (F-40) ' +
+        "or unreadable; the series-window door does not tell these apart, so a \"v1\" window is refused at once (ADR-030 Decision 1.5; " +
+        "Amendment 2 rule 1, note of 2026-10-06, defers only a field known to be absent or null)",
+      notYetAvailable: false,
     };
   }
   const decoded = encodedStringArray(text);

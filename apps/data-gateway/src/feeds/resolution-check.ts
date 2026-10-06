@@ -232,8 +232,13 @@ function outcomeOfPayouts(elements: readonly DataApiPayoutElement[]): { readonly
   };
 }
 
-function fieldText(reading: { readonly kind: string; readonly detail?: string }): string {
-  return reading.kind === "ABSENT" ? "absent" : reading.kind === "NULL" ? "null" : `not a string (${reading.detail ?? "unreadable"})`;
+/**
+ * How a field that is not a usable value is named: absent, `null`, or not of
+ * the kind the field holds — `expected` is that kind ("a string" for a text
+ * field, "a list" for `payouts`; V2-3 r1, FABLE-R1-05).
+ */
+function fieldText(reading: { readonly kind: string; readonly detail?: string }, expected = "a string"): string {
+  return reading.kind === "ABSENT" ? "absent" : reading.kind === "NULL" ? "null" : `not ${expected} (${reading.detail ?? "unreadable"})`;
 }
 
 /**
@@ -283,7 +288,7 @@ export function judgeResolutionAnswer(answer: ResolutionAnswer, paddedConditionI
   const problems: string[] = [];
   let outcome: RowOutcome | undefined;
   if (row.payouts.kind !== "VALUE") {
-    problems.push(`a "resolved" row's payouts are ${fieldText(row.payouts)} (F-57: "present on resolved condition-keyed rows")`);
+    problems.push(`a "resolved" row's payouts are ${fieldText(row.payouts, "a list")} (F-57: "present on resolved condition-keyed rows")`);
   } else {
     const mapped = outcomeOfPayouts(row.payouts.value);
     if (mapped.ok) outcome = mapped.outcome;

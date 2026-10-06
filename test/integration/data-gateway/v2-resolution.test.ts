@@ -30,7 +30,13 @@
  * 5. **Two sources** — the first resolution stands; an agreeing late row is a
  *    harmless repeat (R2-OPUS-L1); a disagreement, in either order, publishes
  *    nothing from the row and is raised under a scope of its own that outlives
- *    the window's retirement; the market channel is never held back.
+ *    the window's retirement — also when the frame arrives while that
+ *    retirement is being written (r1, FABLE-R1-01); the market channel is
+ *    never held back.
+ *
+ * Round 1 adds: the raw body journaled byte for byte (FABLE-R1-03), a WAL
+ * refusal through the gateway (FABLE-R1-04), non-integer payouts near the
+ * targets (FABLE-R1-02) and a payouts that is not a list (FABLE-R1-05).
  */
 
 import { readFileSync } from "node:fs";
@@ -38,7 +44,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
-import { ADMISSION_LEDGER_FILE_NAME, IncidentRegistry } from "@polymarket-bot/data-gateway";
+import { ADMISSION_LEDGER_FILE_NAME, GatewayJournal, IncidentRegistry, type RawFrameInput, type RecordOutcome } from "@polymarket-bot/data-gateway";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { createMemoryFileSystem, type MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { RECORDED_WINDOW, reviewedBtc15mSeriesDocument } from "@polymarket-bot/universe/testing";
@@ -355,6 +361,62 @@ describe("V2-3 acceptance 1-3: the read, journal before derive, and a publishabl
     expect(unresolvedIncidents(harness)).toEqual([]);
     await harness.gateway.stop();
   });
+
+  it("FABLE-R1-03: the RAW body is journaled byte for byte — whitespace, a trailing newline, the 1e6 spelling — and the row publishes from it", async () => {
+    const body = `{ "data" : [\n  { "condition_id": "${V2_WINDOW.padded}", "status": "resolved",\n    "payouts": [ 1e6, 0.0 ], "resolved_at": "2026-10-04T22:30:41Z" }\n] }\n`;
+    const stub = venueStub(V2_WINDOW, () => ({ status: 200, body }));
+    const harness = await started(stub);
+    await pastClose(harness);
+    const frames = resolutionFrames(harness);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]?.payloadUtf8).toBe(body);
+    expect(Buffer.from(frames[0]?.payloadUtf8 ?? "", "utf8").equals(Buffer.from(body, "utf8"))).toBe(true);
+    const resolved = resolutionsOf(harness, V2_WINDOW);
+    expect(resolved.map(payloadOf)).toEqual([{ internalMarketId: V2_WINDOW.id, conditionId: V2_WINDOW.conditionId, outcome: "YES_WIN", resolvedAt: "2026-10-04T22:30:41Z" }]);
+    expect(resolved[0]?.causationId).toBe(`raw:${harness.gateway.gatewayEpoch}:${frames[0]?.ingestSeq ?? ""}`);
+    // A replay of those exact bytes derives the same.
+    expect(replayJournaledResolutionAnswer(frames[0] ?? { endpoint: "", payloadUtf8: "" })?.finding).toMatchObject({ kind: "PUBLISHABLE", outcome: "YES_WIN" });
+    await harness.gateway.stop();
+  });
+
+  it("FABLE-R1-04: a response the WAL REFUSES derives nothing through the gateway — the PAGE opens, nothing publishes, the row path stays open, and the next cycle reads again", async () => {
+    // The WAL refuses exactly the first /v2/resolutions response (a qualifying row); every other frame is recorded.
+    const record = GatewayJournal.prototype.record;
+    let refusals = 0;
+    vi.spyOn(GatewayJournal.prototype, "record").mockImplementation(function (this: GatewayJournal, input: RawFrameInput): RecordOutcome {
+      if (refusals === 0 && input.endpoint.startsWith(`${DATA_BASE}/v2/resolutions?`)) {
+        refusals += 1;
+        return { recorded: false, reason: "queue-overflow", detail: "injected: the WAL refuses this response", ingestSeq: "0" };
+      }
+      return record.call(this, input);
+    });
+    const stub = venueStub(V2_WINDOW, () => RESOLVED_YES(V2_WINDOW));
+    const harness = await started(stub);
+    await pastClose(harness);
+    expect(refusals).toBe(1);
+    expect(stub.resolutionReads()).toHaveLength(1);
+    // The PAGE, from the admission feed; nothing derived from the unrecorded response.
+    const pages = harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_WAL_FRAME_REFUSED");
+    expect(pages).toHaveLength(1);
+    expect(pages[0]).toMatchObject({ severity: "PAGE", feedId: FEED_ID });
+    expect(pages[0]?.detail).toMatch(/nothing is derived from an unrecorded response/u);
+    expect(resolutionFrames(harness)).toEqual([]);
+    expect(resolutionsOf(harness, V2_WINDOW)).toEqual([]);
+    expect(unresolvedIncidents(harness)).toEqual([]);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId]).toMatchObject({ status: "ADMITTED" });
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId]?.["resolution"]).toBeUndefined();
+    expect(ledger(harness.walFileSystem)[`resolution-row-refused:${V2_WINDOW.conditionId}`]).toBeUndefined();
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ resolutionReads: 1, resolutionReadsFailed: 1, resolutionRowsPublished: 0, resolutionRowPathsEnded: 0, framesRefusedByWal: 1 });
+    // The row path stays open: the next cycle reads again, journals, and publishes from THAT response.
+    await cycleAfter(harness, 0);
+    expect(stub.resolutionReads()).toHaveLength(2);
+    const frames = resolutionFrames(harness);
+    expect(frames).toHaveLength(1);
+    const resolved = resolutionsOf(harness, V2_WINDOW);
+    expect(resolved.map((envelope) => payloadOf(envelope)["outcome"])).toEqual(["YES_WIN"]);
+    expect(resolved[0]?.causationId).toBe(`raw:${harness.gateway.gatewayEpoch}:${frames[0]?.ingestSeq ?? ""}`);
+    await harness.gateway.stop();
+  });
 });
 
 describe("V2-3 acceptance 4: pending, failed and refused reads", () => {
@@ -453,6 +515,11 @@ describe("V2-3 acceptance 4: pending, failed and refused reads", () => {
     ["a split payout", row(V2_WINDOW, { status: "resolved", payouts: [500_000, 500_000], resolved_at: "2026-10-04T22:30:41Z" }), /a split payout/u],
     ["[1,0]", row(V2_WINDOW, { status: "resolved", payouts: [1, 0], resolved_at: "2026-10-04T22:30:41Z" }), /payouts \[1,0\] is neither/u],
     ["[1000000,0,0]", row(V2_WINDOW, { status: "resolved", payouts: [1_000_000, 0, 0], resolved_at: "2026-10-04T22:30:41Z" }), /payouts \[1000000,0,0\] is neither/u],
+    // FABLE-R1-02: exact, never rounded nor within a tolerance.
+    ["[1000000.4,0]", row(V2_WINDOW, { status: "resolved", payouts: [1_000_000.4, 0], resolved_at: "2026-10-04T22:30:41Z" }), /payouts \[1000000\.4,0\] is neither/u],
+    ["[999999.6,0.4]", row(V2_WINDOW, { status: "resolved", payouts: [999_999.6, 0.4], resolved_at: "2026-10-04T22:30:41Z" }), /payouts \[999999\.6,0\.4\] is (neither|a split)/u],
+    // FABLE-R1-05: named as not a list.
+    ["payouts that are not a list", row(V2_WINDOW, { status: "resolved", payouts: { yes: 1_000_000 }, resolved_at: "2026-10-04T22:30:41Z" }), /payouts are not a list \(an object\)/u],
     ["no payouts", row(V2_WINDOW, { status: "resolved", resolved_at: "2026-10-04T22:30:41Z" }), /payouts are absent/u],
     ["no resolved_at", row(V2_WINDOW, { status: "resolved", payouts: [1_000_000, 0] }), /resolved_at is absent, and MarketResolved\.resolvedAt has no substitute/u],
     ["a malformed resolved_at", row(V2_WINDOW, { status: "resolved", payouts: [1_000_000, 0], resolved_at: "2026-10-04 22:30" }), /is not a well-formed instant/u],
@@ -628,6 +695,76 @@ describe("V2-3 acceptance 5: two sources — the first stands; a disagreement in
     const record = ledger(walFileSystem)[V2_WINDOW.conditionId];
     expect(record).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
     expect((record?.["resolution"] as Record<string, Record<string, unknown>>)["payload"]?.["outcome"]).toBe("NO_WIN");
+    await harness.gateway.stop();
+  });
+
+  /** A WAL filesystem that delivers `frame` (once) from INSIDE the window's RESOLVED retirement write, while it is in flight. */
+  function frameDuringRetirementWrite(winner: (window: Window) => string): { walFileSystem: MemoryFileSystem; gate: { harness?: Harness; delivered: boolean } } {
+    const walFileSystem = createMemoryFileSystem();
+    const writeWholeFile = walFileSystem.writeWholeFile.bind(walFileSystem);
+    const gate: { harness?: Harness; delivered: boolean } = { delivered: false };
+    walFileSystem.writeWholeFile = async (path: string, bytes: Uint8Array): Promise<void> => {
+      if (path === LEDGER_PATH && !gate.delivered && gate.harness !== undefined) {
+        const record = (JSON.parse(Buffer.from(bytes).toString("utf8")) as { windows: Record<string, Record<string, unknown>> }).windows[V2_WINDOW.conditionId];
+        if (record?.["status"] === "RETIRED") {
+          gate.delivered = true;
+          // The ledger already holds the record RETIRED in memory; the window is still subscribed (#detach runs after this write).
+          gate.harness.polymarketSockets.current.message(marketResolvedFrame(V2_WINDOW, winner(V2_WINDOW), gate.harness.clock.nowMs()));
+        }
+      }
+      await writeWholeFile(path, bytes);
+    };
+    return { walFileSystem, gate };
+  }
+
+  it("FABLE-R1-01: row first, then a frame that DISAGREES while the window's RESOLVED retirement is being written: still raised under its own scope, which outlives the retirement", async () => {
+    const spies = registrySpies();
+    const { walFileSystem, gate } = frameDuringRetirementWrite((window) => window.yes);
+    const stub = venueStub(V2_WINDOW, () => RESOLVED_NO(V2_WINDOW));
+    const harness = await started(stub, { walFileSystem });
+    gate.harness = harness;
+    await pastClose(harness);
+    expect(resolutionsOf(harness, V2_WINDOW).map((envelope) => payloadOf(envelope)["outcome"])).toEqual(["NO_WIN"]);
+    expect(unresolvedIncidents(harness)).toEqual([]);
+    // The next cycle retires the window RESOLVED; the frame arrives while that write is in flight.
+    await cycleAfter(harness, 0);
+    expect(gate.delivered).toBe(true);
+    // Never held back: the frame reached the stream, after the row's.
+    expect(resolutionsOf(harness, V2_WINDOW).map((envelope) => [envelope.sourceChannel, payloadOf(envelope)["outcome"]])).toEqual([
+      ["polymarket:data-api-resolutions-rest", "NO_WIN"],
+      [expect.not.stringMatching(/data-api/u), "YES_WIN"],
+    ]);
+    const incidents = unresolvedIncidents(harness);
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]?.ids).toEqual([V2_WINDOW.id]);
+    expect(incidents[0]?.detail).toMatch(
+      /two resolutions that DISAGREE .*: NO_WIN from the \/v2\/resolutions row .*published first, and YES_WIN from the market channel's market_resolved .*observed second while the window's RESOLVED retirement was being written, and published as received/u,
+    );
+    // The first resolution stands: the window retired on the row's.
+    const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId];
+    expect(record).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
+    expect((record?.["resolution"] as Record<string, Record<string, unknown>>)["payload"]?.["outcome"]).toBe("NO_WIN");
+    expect(spies.closedScopes()).not.toContain(`${FEED_ID}:${V2_WINDOW.id}:resolution-disagreement`);
+    expect(spies.registry().isOpen(`${FEED_ID}:${V2_WINDOW.id}:resolution-disagreement`, UNRESOLVED)).toBe(true);
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ resolutionDisagreements: 1, windowsRetiredResolved: 1, liveWindows: 0 });
+    // A frame AFTER the retirement (the window detached, unsubscribed) is the ADR's stated residual: nothing more is judged.
+    harness.polymarketSockets.current.message(marketResolvedFrame(V2_WINDOW, V2_WINDOW.yes, harness.clock.nowMs()));
+    await harness.settle();
+    expect(unresolvedIncidents(harness)).toHaveLength(1);
+    await harness.gateway.stop();
+  });
+
+  it("FABLE-R1-01: a frame that AGREES while the retirement is being written is a harmless repeat — no incident", async () => {
+    const { walFileSystem, gate } = frameDuringRetirementWrite((window) => window.no);
+    const stub = venueStub(V2_WINDOW, () => RESOLVED_NO(V2_WINDOW));
+    const harness = await started(stub, { walFileSystem });
+    gate.harness = harness;
+    await pastClose(harness);
+    await cycleAfter(harness, 0);
+    expect(gate.delivered).toBe(true);
+    expect(resolutionsOf(harness, V2_WINDOW).map((envelope) => payloadOf(envelope)["outcome"])).toEqual(["NO_WIN", "NO_WIN"]);
+    expect(unresolvedIncidents(harness)).toEqual([]);
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ resolutionDisagreements: 0, windowsRetiredResolved: 1 });
     await harness.gateway.stop();
   });
 

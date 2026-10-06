@@ -153,7 +153,11 @@
  *    earlier epoch's recorded resolution, whose source is not recorded) —
  *    publishes nothing from the row, and raises `GATEWAY_SERIES_WINDOW_UNRESOLVED`
  *    at once under a scope of its own (`<feedId>:<window>:resolution-disagreement`),
- *    which the window's retirement does not close.
+ *    which the window's retirement does not close. A frame that arrives while
+ *    the window's `RESOLVED` retirement is being written — the ledger already
+ *    holds it `RETIRED`, and it is still subscribed until `#detach` — is
+ *    judged the same way (r1, FABLE-R1-01). Only a frame after `#detach` (the
+ *    unsubscription) goes unseen, the ADR's stated residual.
  *
  * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06; V2-1's
  * V21-FABLE-03): a window whose accepted `version` selects an id field that is
@@ -562,6 +566,14 @@ export class SeriesAdmissionFeedDriver {
    * was recorded by an earlier epoch, whose source the ledger does not keep.
    */
   readonly #resolutionSources = new Map<string, ResolutionSource>();
+  /**
+   * `V2-3` r1 (FABLE-R1-01): the windows whose `RESOLVED` retirement is being
+   * written, by window id, with the record and the published resolution they
+   * retire on. The ledger holds the record `RETIRED` in memory before its
+   * write settles, and the window stays subscribed until `#detach`; a frame in
+   * that interval is still judged against the standing resolution.
+   */
+  readonly #retiring = new Map<string, { readonly record: AdmissionLedgerRecord; readonly published: WindowResolutionRecord }>();
   #resolutionReads = 0;
   #resolutionReadsDeferred = 0;
   #resolutionReadsPending = 0;
@@ -638,7 +650,10 @@ export class SeriesAdmissionFeedDriver {
     const record = this.#options.ledger
       .liveWindows()
       .find((candidate) => candidate.window?.internalMarketId === payload.internalMarketId);
-    if (record === undefined) return;
+    if (record === undefined) {
+      this.#noteResolutionWhileRetiring(payload, resolution);
+      return;
+    }
     this.#resolutionsObserved += 1;
     const evidence: WindowResolutionRecord = {
       payload,
@@ -666,6 +681,26 @@ export class SeriesAdmissionFeedDriver {
       });
     }
     this.#observeResolution(record.key, evidence, resolution.published);
+  }
+
+  /**
+   * `V2-3` r1 (FABLE-R1-01): a frame for a window whose `RESOLVED` retirement
+   * is being written. The window is still subscribed (`#detach` runs once the
+   * write settles), so its frame was dispatched as received; it is judged
+   * against the resolution the window retires on, exactly as for a live
+   * window ("Two sources"), and a disagreement is raised under its own scope.
+   * Nothing is recorded: the window retires on its first resolution. A frame
+   * after `#detach` (the unsubscription) stays the ADR's stated residual.
+   */
+  #noteResolutionWhileRetiring(payload: MarketResolvedPayload, resolution: DispatchedResolution): void {
+    const retiring = this.#retiring.get(payload.internalMarketId);
+    if (retiring === undefined) return;
+    const standing = this.#standingResolution(retiring.record) ?? retiring.published;
+    if (standing.payload.outcome === payload.outcome || this.#resolutionSources.get(payload.internalMarketId) === "MARKET_CHANNEL") return;
+    this.#reportDisagreement(retiring.record, standing, {
+      outcome: payload.outcome,
+      source: `the market channel's market_resolved${resolution.rawFrameIngestSeq === undefined ? "" : ` (raw frame ingestSeq ${resolution.rawFrameIngestSeq})`}, observed second while the window's RESOLVED retirement was being written, and published as received`,
+    });
   }
 
   /**
@@ -1126,20 +1161,27 @@ export class SeriesAdmissionFeedDriver {
         record.resolution?.publishedAt === undefined ? this.#published.get(window.internalMarketId) : { ...record.resolution, publishedAt: record.resolution.publishedAt };
       if (published !== undefined) {
         // Its resolution was PUBLISHED: retired, as ADR-030 Decision 4.4 says.
-        const retired = await this.#mutate(record.key, (current) =>
-          current?.status === "ADMITTED"
-            ? {
-                ...current,
-                status: "RETIRED",
-                retiredAt: isoFromMs(nowMs),
-                retiredReason: "RESOLVED",
-                resolution: current.resolution?.publishedAt === undefined ? published : current.resolution,
-              }
-            : undefined,
-        );
-        if (retired === undefined) continue;
-        this.#detach(retired);
-        this.#retiredResolved += 1;
+        // `V2-3` r1 (FABLE-R1-01): until `#detach`, a frame is still judged
+        // against the resolution it retires on (`#noteResolutionWhileRetiring`).
+        this.#retiring.set(window.internalMarketId, { record, published });
+        try {
+          const retired = await this.#mutate(record.key, (current) =>
+            current?.status === "ADMITTED"
+              ? {
+                  ...current,
+                  status: "RETIRED",
+                  retiredAt: isoFromMs(nowMs),
+                  retiredReason: "RESOLVED",
+                  resolution: current.resolution?.publishedAt === undefined ? published : current.resolution,
+                }
+              : undefined,
+          );
+          if (retired === undefined) continue;
+          this.#detach(retired);
+          this.#retiredResolved += 1;
+        } finally {
+          this.#retiring.delete(window.internalMarketId);
+        }
         continue;
       }
       const pastBound = this.#pastUnresolvedBound(window, entry, nowMs);

@@ -9,10 +9,14 @@
  *   window's scheduled open (the gateway refuses it finally at or after that
  *   open; the gateway suite pins that part).
  * - Every other refusal reason stays a `REFUSE`, including beside missing ids.
+ *   A `"v1"` window's `clobTokenIds` read as `null` stays one too (r1,
+ *   V23-R1-CODEX-01): the series-window door reads absent, `null` and another
+ *   type alike, so that reading never shows the ids are merely not yet given.
  * - The ids, once filled, are judged in full: the admission is the one a
  *   window with its ids at first sight gets.
  *
- * Each `it` fails at the base `51c0213`, whose judge refuses all of these.
+ * Each `it` on a not-yet verdict fails at the base `51c0213`, whose judge
+ * refuses all of these; the CODEX-01 pin fails at `d2d0441`, which held it.
  */
 
 import { describe, expect, it } from "vitest";
@@ -105,9 +109,11 @@ describe("V2-3 item 7: ids not yet available are NOT YET ADMISSIBLE — not admi
     expect(JSON.stringify(verdict)).not.toContain(RECORDED_WINDOW.yesTokenId);
   });
 
-  it('"v1" with clobTokenIds absent or null (the door\'s null reading): not yet admissible, never a fall-back to positionIds', () => {
+  it('V23-R1-CODEX-01: "v1" with clobTokenIds read as null — absent, null OR another type, which the door does not tell apart — is REFUSED at once, never held: a malformed value stays final', () => {
     const verdict = judgeV1({ clobTokenIds: null, positionIds: { kind: "VALUE", value: [CANARY_UP, CANARY_DOWN] } });
-    expect(verdict).toMatchObject({ verdict: "NOT_YET_ADMISSIBLE", conditionId: RECORDED_WINDOW.conditionId, scheduledOpenEpochMs: OPEN_MS });
+    expect(refusal(verdict)).toMatch(
+      /Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string: the window's ids are not yet available \(F-40\) or unreadable; the series-window door does not tell these apart, so a "v1" window is refused at once/u,
+    );
     expect(JSON.stringify(verdict)).not.toContain(CANARY_UP);
   });
 
@@ -116,8 +122,9 @@ describe("V2-3 item 7: ids not yet available are NOT YET ADMISSIBLE — not admi
       selectTradingIds(recordedWindowMarketReading(protocolV2WindowMarketOverrides({ positionIds })));
     expect(v2({ kind: "ABSENT" })).toMatchObject({ ok: false, version: "v2", idsNotYetAvailable: true });
     expect(v2({ kind: "NULL" })).toMatchObject({ ok: false, version: "v2", idsNotYetAvailable: true });
-    expect(selectTradingIds(recordedWindowMarketReading({ clobTokenIds: null }))).toMatchObject({ ok: false, version: "v1", idsNotYetAvailable: true });
     for (const failed of [
+      // V23-R1-CODEX-01: "v1"'s null reading is never "known absent or null".
+      selectTradingIds(recordedWindowMarketReading({ clobTokenIds: null })),
       v2({ kind: "UNREADABLE", detail: "a string" }),
       v2({ kind: "VALUE", value: [CANARY_UP] }),
       v2({ kind: "VALUE", value: [CANARY_UP, CANARY_UP] }),

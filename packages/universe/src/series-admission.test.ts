@@ -126,12 +126,7 @@ describe("judgeSeriesWindow — every other window is REFUSED, naming what diffe
     refusedFor(judge({}, { clobTokenIds: JSON.stringify([RECORDED_WINDOW.yesTokenId]) }), /exactly two/u);
     refusedFor(judge({}, { clobTokenIds: JSON.stringify([RECORDED_WINDOW.yesTokenId, RECORDED_WINDOW.yesTokenId]) }), /same token/u);
     refusedFor(judge({}, { clobTokenIds: JSON.stringify(["0123", RECORDED_WINDOW.noTokenId]) }), /canonical token id/u);
-    // `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06): ids not
-    // yet available are NOT YET ADMISSIBLE, never admitted; the gateway refuses
-    // the window finally at its scheduled open (`./series-admission-not-yet.test.ts`).
-    const notYet = judge({}, { clobTokenIds: null });
-    expect(notYet.verdict).toBe("NOT_YET_ADMISSIBLE");
-    if (notYet.verdict === "NOT_YET_ADMISSIBLE") expect(notYet.mismatches.join(" | ")).toMatch(/clobTokenIds/u);
+    refusedFor(judge({}, { clobTokenIds: null }), /clobTokenIds/u);
     refusedFor(
       judge({}, {}, {
         tokens: [

@@ -584,8 +584,15 @@ CTF ids (plan A1).
   - With no ids, the CLOB `t[]` pairing cannot compare ids, so only its
     labels are judged until the ids arrive.
   - For `"v1"`, the series-window door reads `clobTokenIds` as a string or
-    `null`, and its `null` also covers a value of another type. Such a value
-    is therefore held until the open too, then refused.
+    `null`, and its `null` also covers a value of another type. So that
+    reading never shows that the field is absent or `null`, and ruling 3
+    keeps a malformed value final. A `"v1"` window whose `clobTokenIds`
+    reads `null` is therefore refused at once, as `V2-1` refused it
+    (Decision 1.5; `V2-3` r1, V23-R1-CODEX-01). Only a `"v2"` window's
+    `positionIds`, which the door reads as absent, `null` or of another
+    type, is held until the open. Holding a `"v1"` field known to be absent
+    or `null` needs that door to tell the three apart; that change is
+    outside `V2-3`'s paths and was not made.
 - **Why it fails closed:** a not-yet-admissible window is never admitted, and
   holds no cap slot. Once its ids arrive, it is judged in full, exactly as at
   first sight. Past its open, the refusal is final, as before.

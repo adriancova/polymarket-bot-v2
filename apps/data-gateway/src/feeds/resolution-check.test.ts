@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import type { PublicHttpResponse } from "@polymarket-bot/polymarket-public";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { reviewedBtc15mSeriesDocument } from "@polymarket-bot/universe/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { AdmissionLedgerRecord } from "../admission-ledger.js";
 import { AdmissionLedger } from "../admission-ledger.js";
@@ -194,6 +194,14 @@ describe("V2-3: Refused — anything else (rule 5 kind 4)", () => {
     refusedWith(judgeResolutionAnswer(ok(rawPayoutsBody("[0,1]")), RESOLVED_V2), /is neither/u);
   });
 
+  it("FABLE-R1-02: a non-integer near a target is REFUSED — compared exactly, never rounded nor within a tolerance (ADR-009 §8, note of 2026-10-05)", () => {
+    for (const payouts of ["[1000000.4,0]", "[999999.6,0.4]", "[0,1000000.000001]", "[1000000.0000000001,0]", "[0.4,999999.6]", "[1000000,0.4]", "[999999.5,0]", "[1000000.5,0]"]) {
+      const finding = judgeResolutionAnswer(ok(rawPayoutsBody(payouts)), RESOLVED_V2);
+      refusedWith(finding, /payouts .* is (neither|a split)/u);
+      expect(finding).not.toHaveProperty("outcome");
+    }
+  });
+
   it("a split payout (F-73; plan D18), and every other vector", () => {
     refusedWith(judgeResolutionAnswer(ok(rawPayoutsBody("[500000,500000]")), RESOLVED_V2), /is a split payout \(F-73; plan D18\)/u);
     refusedWith(judgeResolutionAnswer(ok(rawPayoutsBody("[999999,1]")), RESOLVED_V2), /is a split payout/u);
@@ -205,7 +213,11 @@ describe("V2-3: Refused — anything else (rule 5 kind 4)", () => {
   it("a resolved row whose payouts are missing, null or not a list", () => {
     refusedWith(judgeResolutionAnswer(ok(rowBody({ payouts: undefined })), RESOLVED_V2), /a "resolved" row's payouts are absent/u);
     refusedWith(judgeResolutionAnswer(ok(rowBody({ payouts: null })), RESOLVED_V2), /payouts are null/u);
-    refusedWith(judgeResolutionAnswer(ok(rowBody({ payouts: "[1000000,0]" })), RESOLVED_V2), /payouts are not a string|payouts are not/u);
+    // FABLE-R1-05: a payouts that is neither a list nor null is named as not a LIST.
+    refusedWith(judgeResolutionAnswer(ok(rowBody({ payouts: "[1000000,0]" })), RESOLVED_V2), /a "resolved" row's payouts are not a list \(a string\)/u);
+    refusedWith(judgeResolutionAnswer(ok(rowBody({ payouts: { 0: 1_000_000, 1: 0 } })), RESOLVED_V2), /a "resolved" row's payouts are not a list \(an object\)/u);
+    refusedWith(judgeResolutionAnswer(ok(rowBody({ payouts: 1_000_000 })), RESOLVED_V2), /a "resolved" row's payouts are not a list \(a number\)/u);
+    expect(judgeResolutionAnswer(ok(rowBody({ payouts: {} })), RESOLVED_V2).detail).not.toMatch(/not a string/u);
   });
 
   it("a resolved row without a well-formed resolved_at — nothing stands in for it", () => {
@@ -241,6 +253,13 @@ describe("V2-3: journal before derive, and replay without the venue (rule 4 item
     const order: string[] = [];
     const journaled: { endpoint: string; body: string }[] = [];
     const clock = new ManualGatewayClock(Date.parse("2026-10-04T22:31:00Z"));
+    // V23-R1-CODEX-02: derivation is OBSERVED — the judgement's first step is
+    // the door's parse of the response body; only a parse of THIS body counts.
+    const parse = JSON.parse.bind(JSON);
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text: string, reviver?: Parameters<typeof JSON.parse>[1]): unknown => {
+      if (!(response instanceof Error) && text === response.body) order.push("derive");
+      return parse(text, reviver);
+    });
     const read = await readResolutionOnce({
       http: async (request) => {
         order.push(`GET ${request.url}`);
@@ -256,6 +275,8 @@ describe("V2-3: journal before derive, and replay without the venue (rule 4 item
         journaled.push({ endpoint, body });
         return journalAccepts ? { receipt, rawFrameIngestSeq: "7", connectionId: "c-1" } : undefined;
       },
+    }).finally(() => {
+      spy.mockRestore();
     });
     return { read, order, journaled };
   }
@@ -269,15 +290,28 @@ describe("V2-3: journal before derive, and replay without the venue (rule 4 item
       [200, "<html>"],
     ] as const) {
       const { read, order, journaled } = await readWith({ status, body });
-      expect(order).toEqual([`GET http://data.stub/v2/resolutions?condition=${RESOLVED_V2}`, "journal"]);
+      // V23-R1-CODEX-02: journaled, THEN derived (a 2xx body is parsed; an error status is Failed unparsed).
+      expect(order).toEqual([`GET http://data.stub/v2/resolutions?condition=${RESOLVED_V2}`, "journal", ...(status === 200 ? ["derive"] : [])]);
       expect(journaled).toEqual([{ endpoint: `http://data.stub/v2/resolutions?condition=${RESOLVED_V2}#http-status=${String(status)}`, body }]);
       expect(read.frame).toEqual({ receipt, rawFrameIngestSeq: "7", connectionId: "c-1" });
     }
   });
 
-  it("a response the WAL refuses derives NOTHING — even a publishable row is only Failed", async () => {
-    const { read } = await readWith({ status: 200, body: capture("data-v2-resolutions-v2-resolved") }, false);
+  it("FABLE-R1-03: the RAW body is journaled byte for byte — whitespace, a trailing newline, the 1e6 spelling — never a re-serialization", async () => {
+    const body = `{ "data" : [\n  { "condition_id": "${RESOLVED_V2}", "status": "resolved",\n    "payouts": [ 1e6, 0.0 ], "resolved_at": "2026-10-05T21:35:56Z", "extra": "\\u00e9" }\n] }\n`;
+    const { read, order, journaled } = await readWith({ status: 200, body });
+    expect(journaled).toHaveLength(1);
+    expect(journaled[0]?.body).toBe(body);
+    expect(Buffer.from(journaled[0]?.body ?? "", "utf8").equals(Buffer.from(body, "utf8"))).toBe(true);
+    expect(order).toEqual([`GET http://data.stub/v2/resolutions?condition=${RESOLVED_V2}`, "journal", "derive"]);
+    expect(read.finding).toMatchObject({ kind: "PUBLISHABLE", outcome: "YES_WIN", resolvedAt: "2026-10-05T21:35:56Z" });
+  });
+
+  it("a response the WAL refuses derives NOTHING — even a publishable row is only Failed, and its body is never parsed", async () => {
+    const { read, order } = await readWith({ status: 200, body: capture("data-v2-resolutions-v2-resolved") }, false);
     expect(read).toEqual({ finding: { kind: "FAILED", detail: "the WAL refused the response, so nothing is derived from it" }, frame: undefined });
+    // V23-R1-CODEX-02: no derivation at all, before or after the refused journal.
+    expect(order).toEqual([`GET http://data.stub/v2/resolutions?condition=${RESOLVED_V2}`, "journal"]);
   });
 
   it("no answer journals nothing (nothing was received), and is Failed", async () => {

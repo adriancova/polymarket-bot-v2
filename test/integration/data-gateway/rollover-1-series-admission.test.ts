@@ -83,7 +83,10 @@
  *    REFUSED finally; every other refusal stays final, at once. And two
  *    `V2-1` pins (V21-FABLE-01, V21-FABLE-02): a condition id of another
  *    width spends no CLOB read budget, and when the selection fails the
- *    collision check reads the condition id only.
+ *    collision check reads the condition id only. `V2-3` r1
+ *    (V23-R1-CODEX-01): a `"v1"` window whose `clobTokenIds` reads `null`
+ *    (absent, `null` or another type, which the door does not tell apart) is
+ *    refused at once and stays refused when corrected before its open.
  */
 
 import { createHash } from "node:crypto";
@@ -1704,6 +1707,68 @@ describe("V2-3 item 7: ids not yet available are not yet admissible — judged a
       await harness.gateway.stop();
     });
   }
+});
+
+describe("V2-3 r1 (V23-R1-CODEX-01): a \"v1\" window's clobTokenIds read as null is a FINAL refusal — never held until the open", () => {
+  // The series-window door reads "v1"'s clobTokenIds as a string or null, and
+  // its null covers absent, null AND another type alike, so the reading never
+  // shows the ids are merely not yet given (item 7 defers only that). "Every
+  // other refusal reason stays final": d2d0441 held each of these as not yet
+  // admissible, and a correction before the open then ADMITTED a window the
+  // base refused for good (astra's reproduction).
+  for (const [name, value] of [
+    ["the number 42", 42],
+    ["an object", {}],
+    ["true", true],
+    ["null", null],
+    ["absent", undefined],
+  ] as const) {
+    it(`clobTokenIds ${name} at 22:20, corrected at 22:25 before the 22:30 open: REFUSED at first sight, with the incident, and never admitted`, async () => {
+      const state = { corrected: false };
+      const page = (): unknown => {
+        const copy = structuredClone(KEYSET_PAGE);
+        copy.events = [copy.events[1] as Record<string, unknown>];
+        const market = ((copy.events[0] as Record<string, unknown>)["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+        if (!state.corrected) {
+          if (value === undefined) delete market["clobTokenIds"];
+          else market["clobTokenIds"] = value;
+        }
+        return copy;
+      };
+      const stub = venueStub({ page });
+      const harness = await started(stub);
+      const record = ledger(harness.walFileSystem)[WINDOW_2230.conditionId];
+      expect(record?.["status"]).toBe("REFUSED");
+      expect(mismatchesOf(record)).toMatch(/Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string/u);
+      expect(mismatchesOf(record)).toMatch(/the series-window door does not tell these apart, so a "v1" window is refused at once/u);
+      expect(mismatchesOf(record)).not.toMatch(/not yet admissible until/u);
+      expect(refusedIncidents(harness)).toHaveLength(1);
+      expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[WINDOW_2230.id]]);
+      expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsNotYetAdmissible: 0, windowsRefused: 1 });
+      // Corrected before the open: never judged again, never admitted.
+      const reads = clobReadsOf(stub, WINDOW_2230.conditionId);
+      state.corrected = true;
+      await cycleAfter(harness, 5 * 60_000);
+      expect(admittedIds(harness)).toEqual([]);
+      expect(ledger(harness.walFileSystem)[WINDOW_2230.conditionId]?.["status"]).toBe("REFUSED");
+      expect(clobReadsOf(stub, WINDOW_2230.conditionId)).toBe(reads);
+      await harness.gateway.stop();
+    });
+  }
+
+  it("the control: the same page, uncorrupted, admits the 22:30 window at first sight", async () => {
+    const harness = await started(
+      venueStub({
+        page: () => {
+          const copy = structuredClone(KEYSET_PAGE);
+          copy.events = [copy.events[1] as Record<string, unknown>];
+          return copy;
+        },
+      }),
+    );
+    expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+    await harness.gateway.stop();
+  });
 });
 
 describe("V2-3: two V2-1 LOWs pinned (V21-FABLE-01, V21-FABLE-02)", () => {
