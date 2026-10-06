@@ -42,33 +42,53 @@
  *   and reason is exempt (today the python audit step, whose second line reads
  *   the file its first line writes), and a record no gate matches is itself a
  *   finding;
- * - a job without a `timeout-minutes` below GitHub's 360-minute default.
+ * - a job without a `timeout-minutes` below GitHub's 360-minute default;
+ * - since `CI-7` (CLOSEOUT-3 L1), a workspace package's `test:integration`
+ *   (or `test:integration:<x>`) script that the root `test:integration` chain
+ *   does not run and `UNCHAINED_INTEGRATION_SCRIPTS` does not exempt with a
+ *   reason, as WP-330's `ops-cli` suite was from its merge to CLOSEOUT-3;
+ *   a chained `pnpm --filter` command whose package or script does not
+ *   exist (pnpm exits 0 when a filter matches nothing); and a stale
+ *   exemption. Since `CI-7` r1 (CI7-R1-01), the workspace is read as pnpm
+ *   11.17.0 reads it, through directory symlinks. Every layout where the two
+ *   could disagree is refused (`readWorkspaceManifests`).
  *
  * HOW. `ci-workflow.ts` reads the workflow with a conservative YAML-subset
  * reader, because no YAML library is declared and `package.json` and the
  * lockfile are protected. It throws on anything outside that subset, rather
  * than guessing. The drift check is a pure function of the two texts, so every
  * mutant below, including a `package.json` whose chain gains a command, is an
- * in-memory copy; no tracked file is touched. The one normalization, a bare
+ * in-memory copy; no tracked file is touched. The workspace-discovery
+ * fixtures (`CI-7` r1) need a real filesystem: each is a temporary directory
+ * outside the repository, removed after the file. The one normalization, a bare
  * binary such as `tsc` run as `pnpm exec tsc`, is explained in `ci-workflow.ts`.
  */
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   DEPENDENT_RUN_BLOCKS,
   GATE_IF,
   SPLIT_CHAINS,
+  UNCHAINED_INTEGRATION_SCRIPTS,
+  type UnchainedIntegrationScript,
+  type WorkspaceManifest,
+  type WorkspaceRead,
   type YamlValue,
   chainCommands,
+  integrationScriptFindings,
   jobSteps,
   jobTimeoutFindings,
   nodeJobSteps,
+  packageScriptCommand,
   parseWorkflowYaml,
+  readWorkspaceManifests,
   shellCommands,
   splitStepDrift,
   stepRunFor,
+  workspacePackageGlobs,
 } from "./ci-workflow.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -87,6 +107,20 @@ function readRealTexts(): Promise<RealTexts> {
     readFile(path.join(repoRoot, "package.json"), "utf8"),
   ]).then(([workflow, packageJson]) => ({ workflow, packageJson }));
   return realTexts;
+}
+
+let realWorkspace: Promise<WorkspaceRead> | undefined;
+
+/**
+ * The tracked `pnpm-workspace.yaml` globs, and the manifest of every workspace
+ * package they admit, read once (`CI-7`). Since `CI-7` r1 (CI7-R1-01),
+ * `readWorkspaceManifests` admits what pnpm 11.17.0 admits, including a package
+ * reached through a directory symlink, and throws wherever the two could
+ * disagree. The fixtures below pin that against a real filesystem.
+ */
+function readRealWorkspace(): Promise<WorkspaceRead> {
+  realWorkspace ??= readWorkspaceManifests(repoRoot);
+  return realWorkspace;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,17 +315,19 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
   // typecheck and runner (3 -> 6), and `test:integration` gained the live
   // chaos suite's PostgreSQL half (7 -> 8): 27 + 3 + 1 = 31 gates, 20 + 4 = 24
   // split.
-  it("non-vacuity: 4 + 6 + 8 + 6 chained commands, each run by exactly one gated step, in chain order", async () => {
+  // CI-7: `test:integration` gained the emergency CLI's PostgreSQL suite
+  // (8 -> 9): 31 + 1 = 32 gates, 24 + 1 = 25 split.
+  it("non-vacuity: 4 + 6 + 9 + 6 chained commands, each run by exactly one gated step, in chain order", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const chains = chainCommands(packageJson);
     expect(SPLIT_CHAINS.map(({ script }) => [script, chains.get(script)?.length])).toEqual([
       ["typecheck", 4],
       ["test:contract", 6],
-      ["test:integration", 8],
+      ["test:integration", 9],
       ["test:fault", 6],
     ]);
     const gateSteps = gates(workflow);
-    expect(gateSteps).toHaveLength(31);
+    expect(gateSteps).toHaveLength(32);
     for (const step of gateSteps) expect(step.condition, step.label).toBe(GATE_IF);
     for (const { script, label } of SPLIT_CHAINS) {
       const commands = chains.get(script) ?? [];
@@ -305,10 +341,10 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
       });
       expect(indices, script).toEqual([...indices].sort((a, b) => a - b));
     }
-    expect(splitSteps(workflow, packageJson)).toHaveLength(24);
+    expect(splitSteps(workflow, packageJson)).toHaveLength(25);
   });
 
-  it("CI-5 and CI-6: the fault and PostgreSQL commands are chained, and stepped, in the order the rounds set", async () => {
+  it("CI-5, CI-6 and CI-7: the fault and PostgreSQL commands are chained, and stepped, in the order the rounds set", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const chains = chainCommands(packageJson);
     expect(chains.get("test:fault")).toEqual([
@@ -323,12 +359,21 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
       "tsc --noEmit -p test/fault-injection/live/tsconfig.json",
       "vitest run --config test/fault-injection/live/vitest.config.ts",
     ]);
-    expect(chains.get("test:integration")?.slice(-3)).toEqual([
+    expect(chains.get("test:integration")).toEqual([
+      // CI-2: the six suites it split.
+      "pnpm --filter @polymarket-bot/storage-postgres test:integration",
+      "pnpm --filter @polymarket-bot/event-bus test:integration",
+      "pnpm --filter @polymarket-bot/research-worker test:integration",
+      "pnpm --filter @polymarket-bot/data-gateway test:integration",
+      "pnpm --filter @polymarket-bot/trader test:integration",
       "pnpm --filter @polymarket-bot/control-api test:integration",
       // CI-5: the control API's real-PostgreSQL suite.
       "pnpm --filter @polymarket-bot/control-api test:integration:postgres",
       // CI-6: WP-340's real-PostgreSQL half, beside it.
       "vitest run --config test/fault-injection/live/postgres/vitest.config.ts",
+      // CI-7 (CLOSEOUT-3 L1): WP-330's emergency CLI suite (real PostgreSQL,
+      // the lease revocation, the audit mirror, the shipped bundle).
+      "pnpm --filter @polymarket-bot/ops-cli test:integration",
     ]);
     // CI-6: the fault chain stays Docker-free. The live chaos suite's
     // PostgreSQL half is an integration command, not a fault one.
@@ -366,20 +411,45 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
         "pnpm exec vitest run --config test/fault-injection/live/vitest.config.ts",
       ],
     ]);
-    expect(stepped("test:integration").slice(-2)).toEqual([
+    // CI-7 recounted the container labels at its base (see the ci.yml comment
+    // above these steps): 3/9, 4/9, 5/9 and 7/9 were stale (CLOSEOUT-3 I5,
+    // CI-6's known risk, CLOSEOUT-2 L3).
+    expect(stepped("test:integration")).toEqual([
+      ["Integration tests 1/9 - storage-postgres (Testcontainers PostgreSQL)", "pnpm --filter @polymarket-bot/storage-postgres test:integration"],
+      ["Integration tests 2/9 - event-bus (Testcontainers Redis)", "pnpm --filter @polymarket-bot/event-bus test:integration"],
       [
-        "Integration tests 7/8 - control-api PostgreSQL (Testcontainers PostgreSQL in 3 of its 4 files)",
+        "Integration tests 3/9 - research-worker parquet (Testcontainers PostgreSQL in 1 of its 6 files)",
+        "pnpm --filter @polymarket-bot/research-worker test:integration",
+      ],
+      [
+        "Integration tests 4/9 - data-gateway (Testcontainers Redis in 1 of its 16 files)",
+        "pnpm --filter @polymarket-bot/data-gateway test:integration",
+      ],
+      [
+        "Integration tests 5/9 - trader paper-trader (Testcontainers PostgreSQL and Redis in 22 of its 50 files)",
+        "pnpm --filter @polymarket-bot/trader test:integration",
+      ],
+      ["Integration tests 6/9 - control-api (no container)", "pnpm --filter @polymarket-bot/control-api test:integration"],
+      [
+        "Integration tests 7/9 - control-api PostgreSQL (Testcontainers PostgreSQL in 4 of its 5 files)",
         "pnpm --filter @polymarket-bot/control-api test:integration:postgres",
       ],
       [
-        "Integration tests 8/8 - live-micro fault-injection PostgreSQL half (WP-340; Testcontainers PostgreSQL; mock venue)",
+        "Integration tests 8/9 - live-micro fault-injection PostgreSQL half (WP-340; Testcontainers PostgreSQL; mock venue)",
         "pnpm exec vitest run --config test/fault-injection/live/postgres/vitest.config.ts",
+      ],
+      [
+        "Integration tests 9/9 - ops-cli emergency CLI (WP-330; Testcontainers PostgreSQL)",
+        "pnpm --filter @polymarket-bot/ops-cli test:integration",
       ],
     ]);
     // CI-6: the PostgreSQL half's step sits directly beside the control API's.
+    // CI-7: the emergency CLI's step sits directly after it, the job's last step.
     const at = (script: string, position: number): number =>
       gates(workflow).find((step) => step.name === splitStep(workflow, packageJson, script, position).name)?.index ?? -1;
     expect(at("test:integration", 8)).toBe(at("test:integration", 7) + 1);
+    expect(at("test:integration", 9)).toBe(at("test:integration", 8) + 1);
+    expect(gates(workflow).at(-1)?.name).toBe(splitStep(workflow, packageJson, "test:integration", 9).name);
   });
 
   it("normalizes exactly one thing: a bare binary runs through `pnpm exec`, a pnpm command runs verbatim", () => {
@@ -417,7 +487,8 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     const { workflow, packageJson } = await readRealTexts();
     const last = splitSteps(workflow, packageJson).at(-1)?.name ?? "";
     const extras = [
-      gatedStep("Integration tests 9/9 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:integration"),
+      // CI-7 chained ops-cli's suite, so this case now names a package no chain runs.
+      gatedStep("Integration tests 10/10 - another app (no container)", "pnpm --filter @polymarket-bot/another-app test:integration"),
       gatedStep("Another suite", "pnpm --filter @polymarket-bot/ops-cli test:contract"),
       gatedStep("Typecheck", "pnpm typecheck"),
       gatedStep("Integration tests", "pnpm test:integration"),
@@ -523,8 +594,8 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
         splitStep(workflow, packageJson, "test:contract", 2),
         "pnpm --filter  @polymarket-bot/polymarket-public test:contract:rtds",
       ],
-      // A different package with the same script.
-      [splitStep(workflow, packageJson, "test:integration", 4), "pnpm --filter @polymarket-bot/ops-cli test:integration"],
+      // A different package with the same script (one no chain runs: CI-7 chained ops-cli's).
+      [splitStep(workflow, packageJson, "test:integration", 4), "pnpm --filter @polymarket-bot/another-app test:integration"],
       // CI-6: the live chaos suite's bare binaries without `pnpm exec`.
       [splitStep(workflow, packageJson, "test:fault", 5), "tsc --noEmit -p test/fault-injection/live/tsconfig.json"],
       [splitStep(workflow, packageJson, "test:fault", 6), "vitest run --config test/fault-injection/live/vitest.config.ts"],
@@ -557,7 +628,8 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     const gained: readonly (readonly [string, string])[] = [
       ["typecheck", "tsc -p test/extra/tsconfig.json --noEmit"],
       ["test:contract", "pnpm --filter @polymarket-bot/ops-cli test:contract"],
-      ["test:integration", "pnpm --filter @polymarket-bot/ops-cli test:integration"],
+      // CI-7 chained ops-cli's suite, so a second copy would be refused as a duplicate.
+      ["test:integration", "pnpm --filter @polymarket-bot/another-app test:integration"],
       ["test:fault", "pnpm --filter @polymarket-bot/ops-cli test:fault"],
     ];
     // Non-vacuity: one case per split chain.
@@ -1032,5 +1104,407 @@ describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the ot
     for (const run of negatives) {
       expect(splitStepDrift(setStepKey(workflow, REPLAY_GATE, "run", run), chained), run).toEqual([]);
     }
+  });
+});
+
+/**
+ * `CI-7` (CLOSEOUT-3 L1). WP-330's `pnpm --filter @polymarket-bot/ops-cli
+ * test:integration` ran in no gate from its merge (`c1e6909`) until
+ * CLOSEOUT-3 found it: neither the root `test:integration` chain nor `ci.yml`
+ * named it, and the split check above only holds the steps to the chains. This rule holds the chains to the
+ * workspace packages' scripts (see THE INTEGRATION-SCRIPT RULE in
+ * `ci-workflow.ts`). Every mutant below is an in-memory copy of the root
+ * `package.json`, of `ci.yml` or of the workspace manifests.
+ */
+describe("CI-7 (CLOSEOUT-3 L1): every workspace package's integration script runs in the root test:integration chain, or is exempted with a reason", () => {
+  const OPS_CLI_COMMAND = "pnpm --filter @polymarket-bot/ops-cli test:integration";
+
+  /** The finding for an unchained `script` of the package in `dir`, up to the advice that follows it. */
+  function unchained(dir: string, name: string, script: string): string {
+    return (
+      `${dir}/package.json's \`${script}\` script runs in no gate: the root \`test:integration\` chain has no ` +
+      JSON.stringify(packageScriptCommand(name, script))
+    );
+  }
+
+  /** A copy of `manifests` whose manifest in `dir` is changed by `change`. */
+  function withManifest(
+    manifests: readonly WorkspaceManifest[],
+    dir: string,
+    change: (manifest: { name?: unknown; scripts?: Record<string, string> }) => void,
+  ): WorkspaceManifest[] {
+    if (manifests.filter((manifest) => manifest.dir === dir).length !== 1) throw new Error(`mutant: no single manifest in ${dir}`);
+    return manifests.map((manifest) => {
+      if (manifest.dir !== dir) return manifest;
+      const parsed = JSON.parse(manifest.text) as { name?: unknown; scripts?: Record<string, string> };
+      change(parsed);
+      const text = `${JSON.stringify(parsed, null, 2)}\n`;
+      if (JSON.stringify(JSON.parse(text)) === JSON.stringify(JSON.parse(manifest.text))) {
+        throw new Error(`mutant: the edit of ${dir} changed nothing`);
+      }
+      return { dir, text };
+    });
+  }
+
+  /** A new workspace package in `dir` with these scripts. */
+  function newManifest(dir: string, name: string, scripts: Readonly<Record<string, string>>): WorkspaceManifest {
+    return { dir, text: `${JSON.stringify({ name, private: true, scripts }, null, 2)}\n` };
+  }
+
+  /** A copy of `package.json` text whose `test:integration` chain lacks `command`. */
+  function withoutIntegrationCommand(packageJson: string, command: string): string {
+    const commands = chainCommands(packageJson).get("test:integration") ?? [];
+    if (!commands.includes(command)) throw new Error(`mutant: the chain has no ${command}`);
+    return withScript(packageJson, "test:integration", commands.filter((each) => each !== command).join(" && "));
+  }
+
+  /**
+   * The integration scripts of `manifests`, read here without the rule under
+   * test: every script named `test:integration` or `test:integration:<x>`.
+   */
+  function integrationScripts(manifests: readonly WorkspaceManifest[]): (readonly [string, string, string])[] {
+    return manifests
+      .flatMap((manifest) => {
+        const parsed = JSON.parse(manifest.text) as { readonly name: string; readonly scripts?: Readonly<Record<string, string>> };
+        return Object.keys(parsed.scripts ?? {})
+          .filter((script) => script === "test:integration" || script.startsWith("test:integration:"))
+          .map((script) => [manifest.dir, parsed.name, script] as const);
+      })
+      .sort((a, b) => (`${a[0]} ${a[2]}` < `${b[0]} ${b[2]}` ? -1 : 1));
+  }
+
+  it("the real workspace and root chain agree: no finding, and no exemption", async () => {
+    const { packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    expect(integrationScriptFindings(packageJson, manifests)).toEqual([]);
+    expect(UNCHAINED_INTEGRATION_SCRIPTS).toEqual([]);
+  });
+
+  it("non-vacuity: three workspace globs, 35 packages, and eight integration scripts of seven packages, each chained", async () => {
+    const { packageJson } = await readRealTexts();
+    const { globs, manifests } = await readRealWorkspace();
+    expect(globs).toEqual(["apps/*", "packages/*", "packages/strategies/*"]);
+    // `pnpm -r run typecheck` reports 35 workspace projects besides the root, and check:deps 35 packages.
+    expect(manifests).toHaveLength(35);
+    expect(manifests.map(({ dir }) => dir)).toEqual(expect.arrayContaining(["apps/ops-cli", "packages/strategies/static-bracket"]));
+    const scripts = integrationScripts(manifests);
+    expect(scripts).toEqual([
+      ["apps/control-api", "@polymarket-bot/control-api", "test:integration"],
+      ["apps/control-api", "@polymarket-bot/control-api", "test:integration:postgres"],
+      ["apps/data-gateway", "@polymarket-bot/data-gateway", "test:integration"],
+      ["apps/ops-cli", "@polymarket-bot/ops-cli", "test:integration"],
+      ["apps/research-worker", "@polymarket-bot/research-worker", "test:integration"],
+      ["apps/trader", "@polymarket-bot/trader", "test:integration"],
+      ["packages/event-bus", "@polymarket-bot/event-bus", "test:integration"],
+      ["packages/storage-postgres", "@polymarket-bot/storage-postgres", "test:integration"],
+    ]);
+    const chain = chainCommands(packageJson).get("test:integration") ?? [];
+    for (const [, name, script] of scripts) expect(chain, script).toContain(packageScriptCommand(name, script));
+  });
+
+  it("L1, the mutant: a chain that drops the ops-cli command fails the rule, which the split check alone did not", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    const dropped = withoutIntegrationCommand(packageJson, OPS_CLI_COMMAND);
+    const finding = unchained("apps/ops-cli", "@polymarket-bot/ops-cli", "test:integration");
+    expect(integrationScriptFindings(dropped, manifests)).toEqual([expect.stringContaining(finding)]);
+    // With today's ci.yml, the split check also reports the 9/9 step, which now runs no chained command.
+    const nine = splitStep(workflow, packageJson, "test:integration", 9).name;
+    expect(splitStepDrift(workflow, dropped)).toContainEqual(
+      expect.stringContaining(`${JSON.stringify(nine)} looks like a split step (its name) but runs no command`),
+    );
+    // The tree before CI-7: no 9/9 step, and every other step named x/8. The
+    // split check finds nothing, which is how the suite stayed ungated; the
+    // new rule reports it.
+    const before = removeStep(workflow, nine).replaceAll(/(Integration tests [1-8])\/9 - /gu, "$1/8 - ");
+    expect(splitStepDrift(before, dropped)).toEqual([]);
+    expect(integrationScriptFindings(dropped, manifests)).toHaveLength(1);
+  });
+
+  it("each chained package integration script, dropped from the chain in turn, is reported, and only it", async () => {
+    const { packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    const scripts = integrationScripts(manifests);
+    expect(scripts).toHaveLength(8);
+    for (const [dir, name, script] of scripts) {
+      const dropped = withoutIntegrationCommand(packageJson, packageScriptCommand(name, script));
+      expect(integrationScriptFindings(dropped, manifests), `${dir} ${script}`).toEqual([
+        expect.stringContaining(unchained(dir, name, script)),
+      ]);
+    }
+  });
+
+  it("a new integration script, in a new package or an existing one, is reported until it is chained or exempted", async () => {
+    const { packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    const another = newManifest("apps/another-app", "@polymarket-bot/another-app", {
+      "test:integration": "vitest run --config ../../test/integration/another-app/vitest.config.ts",
+    });
+    expect(integrationScriptFindings(packageJson, [...manifests, another])).toEqual([
+      expect.stringContaining(unchained("apps/another-app", "@polymarket-bot/another-app", "test:integration")),
+    ]);
+    // A `test:integration:<x>` script of a package that is already chained (the CI-5 shape).
+    const soak = withManifest(manifests, "packages/event-bus", (manifest) => {
+      manifest.scripts = { ...manifest.scripts, "test:integration:soak": "vitest run --config ../../test/integration/event-bus/soak.config.ts" };
+    });
+    expect(integrationScriptFindings(packageJson, soak)).toEqual([
+      expect.stringContaining(unchained("packages/event-bus", "@polymarket-bot/event-bus", "test:integration:soak")),
+    ]);
+    // Chained: nothing to report.
+    const chained = withScript(
+      packageJson,
+      "test:integration",
+      [...(chainCommands(packageJson).get("test:integration") ?? []), "pnpm --filter @polymarket-bot/another-app test:integration"].join(" && "),
+    );
+    expect(integrationScriptFindings(chained, [...manifests, another])).toEqual([]);
+    // Exempted, with a reason: nothing to report.
+    const exemption: UnchainedIntegrationScript = {
+      package: "@polymarket-bot/another-app",
+      script: "test:integration",
+      why: "a manual multi-hour soak, not a gate",
+    };
+    expect(integrationScriptFindings(packageJson, [...manifests, another], [exemption])).toEqual([]);
+    // Scripts outside the rule are not reported.
+    const others = newManifest("apps/other-app", "@polymarket-bot/other-app", {
+      "test:integrationx": "vitest run",
+      "test:contract": "vitest run",
+      "test:e2e": "vitest run",
+      integration: "vitest run",
+    });
+    expect(integrationScriptFindings(packageJson, [...manifests, others])).toEqual([]);
+  });
+
+  it("an exemption that no longer applies, or that gives no reason, is itself a finding", async () => {
+    const { packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    const another = newManifest("apps/another-app", "@polymarket-bot/another-app", { "test:integration": "vitest run" });
+    const cases: readonly (readonly [UnchainedIntegrationScript, readonly WorkspaceManifest[], string])[] = [
+      [{ package: "@polymarket-bot/ops-cli", script: "test:integration", why: "x" }, manifests, "but the root `test:integration` chain runs it"],
+      [{ package: "@polymarket-bot/another-app", script: "test:integration", why: "x" }, manifests, "no workspace package defines that script any more"],
+      [{ package: "@polymarket-bot/ops-cli", script: "test:integration:soak", why: "x" }, manifests, "no workspace package defines that script any more"],
+      [{ package: "@polymarket-bot/ops-cli", script: "build", why: "x" }, manifests, "which is not an integration script the rule covers"],
+      [{ package: "@polymarket-bot/another-app", script: "test:integration", why: "  " }, [...manifests, another], "without a reason"],
+    ];
+    for (const [entry, workspace, expected] of cases) {
+      expect(integrationScriptFindings(packageJson, workspace, [entry]), JSON.stringify(entry)).toEqual([
+        expect.stringContaining(`UNCHAINED_INTEGRATION_SCRIPTS exempts ${entry.package} \`${entry.script}\``),
+      ]);
+      expect(integrationScriptFindings(packageJson, workspace, [entry])[0], JSON.stringify(entry)).toContain(expected);
+    }
+  });
+
+  it("a chained `pnpm --filter` command whose package or script is gone (pnpm exits 0 when a filter matches nothing)", async () => {
+    const { packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    // ops-cli renamed: its script is unchained under the new name, and the chain's command selects nothing.
+    const renamed = withManifest(manifests, "apps/ops-cli", (manifest) => {
+      manifest.name = "@polymarket-bot/emergency-cli";
+    });
+    expect(integrationScriptFindings(packageJson, renamed)).toEqual([
+      expect.stringContaining(unchained("apps/ops-cli", "@polymarket-bot/emergency-cli", "test:integration")),
+      `the root \`test:integration\` command ${JSON.stringify(OPS_CLI_COMMAND)} names @polymarket-bot/ops-cli, which is no ` +
+        "workspace package; pnpm exits 0 when a filter matches nothing, so its step would pass having run nothing",
+    ]);
+    // The script removed from the package.
+    const removed = withManifest(manifests, "apps/ops-cli", (manifest) => {
+      delete manifest.scripts?.["test:integration"];
+    });
+    expect(integrationScriptFindings(packageJson, removed)).toEqual([
+      `the root \`test:integration\` command ${JSON.stringify(OPS_CLI_COMMAND)} runs \`test:integration\`, which ` +
+        "apps/ops-cli/package.json does not define",
+    ]);
+    // The same check holds for the other split chains' package commands.
+    const noInventory = manifests.filter(({ dir }) => dir !== "packages/inventory");
+    expect(noInventory).toHaveLength(manifests.length - 1);
+    expect(integrationScriptFindings(packageJson, noInventory)).toEqual([
+      expect.stringContaining('the root `test:contract` command "pnpm --filter @polymarket-bot/inventory test:contract" names'),
+    ]);
+    const noWalFault = withManifest(manifests, "packages/storage-wal", (manifest) => {
+      delete manifest.scripts?.["test:fault"];
+    });
+    expect(integrationScriptFindings(packageJson, noWalFault)).toEqual([
+      expect.stringContaining('the root `test:fault` command "pnpm --filter @polymarket-bot/storage-wal test:fault" runs `test:fault`'),
+    ]);
+  });
+
+  it("reads the workspace globs it claims, and refuses a workspace file or a manifest it cannot read", async () => {
+    expect(
+      workspacePackageGlobs(
+        ["# a comment", "packages:", "  # a comment between items", '  - "apps/*"', "", "  - 'packages/*' # trailing", "  - packages/strategies/*", "other: x", ""].join("\n"),
+      ),
+    ).toEqual(["apps/*", "packages/*", "packages/strategies/*"]);
+    const refused: readonly (readonly [string, string])[] = [
+      ["an exclusion", 'packages:\n  - "apps/*"\n  - "!apps/legacy"\n'],
+      ["a recursive glob", 'packages:\n  - "apps/**"\n'],
+      ["a brace glob", 'packages:\n  - "apps/{a,b}"\n'],
+      ["a bare directory", "packages:\n  - apps\n"],
+      ["a flow sequence", "packages: [apps/*]\n"],
+      ["an indentless sequence", "packages:\n- apps/*\n"],
+      ["a deeper indentation", "packages:\n    - apps/*\n"],
+      ["no packages key", "allowBuilds:\n  esbuild: true\n"],
+      ["two packages keys", "packages:\n  - apps/*\npackages:\n  - packages/*\n"],
+      ["a duplicate glob", "packages:\n  - apps/*\n  - apps/*\n"],
+      ["an empty list", "packages:\nallowBuilds:\n  esbuild: true\n"],
+      ["a CR line end", "packages:\r\n  - apps/*\r\n"],
+    ];
+    for (const [what, text] of refused) {
+      expect(() => workspacePackageGlobs(text), what).toThrow(/^pnpm-workspace\.yaml: /u);
+    }
+    const { packageJson } = await readRealTexts();
+    const { manifests } = await readRealWorkspace();
+    const nameless = withManifest(manifests, "apps/ops-cli", (manifest) => {
+      delete manifest.name;
+    });
+    expect(() => integrationScriptFindings(packageJson, nameless)).toThrow(/apps\/ops-cli\/package\.json: no `name`/u);
+    const twin = newManifest("apps/ops-cli-copy", "@polymarket-bot/ops-cli", {});
+    expect(() => integrationScriptFindings(packageJson, [...manifests, twin])).toThrow(/are both named @polymarket-bot\/ops-cli/u);
+    const badScript = { dir: "apps/bad-app", text: JSON.stringify({ name: "@polymarket-bot/bad-app", scripts: { "test:integration": 1 } }) };
+    expect(() => integrationScriptFindings(packageJson, [...manifests, badScript])).toThrow(/script `test:integration` is not a string/u);
+  });
+
+  // CI-7 r1 (CI7-R1-01): r0 listed each glob's directory and skipped every entry
+  // that was not itself a directory, so a package reached through a directory
+  // symlink was silently left out, although pnpm admits it and `pnpm --filter`
+  // runs its scripts. These fixtures are temporary workspaces on a real
+  // filesystem, admitting `apps/*`, with real symlinks.
+  const fixtureRoots: string[] = [];
+  afterAll(async () => {
+    await Promise.all(fixtureRoots.map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  /** Writes a `package.json` named `name` with these scripts into `<root>/<dir>`. */
+  async function writePackage(root: string, dir: string, name: string, scripts: Readonly<Record<string, string>>): Promise<void> {
+    await mkdir(path.join(root, dir), { recursive: true });
+    await writeFile(path.join(root, dir, "package.json"), `${JSON.stringify({ name, private: true, scripts }, null, 2)}\n`);
+  }
+
+  /** A temporary workspace admitting `apps/*`, holding the ordinary package `apps/real-app`; `build` adds the rest. */
+  async function fixtureWorkspace(build: (root: string) => Promise<void>): Promise<string> {
+    const root = await mkdtemp(path.join(tmpdir(), "ci7-workspace-"));
+    fixtureRoots.push(root);
+    await writeFile(path.join(root, "pnpm-workspace.yaml"), 'packages:\n  - "apps/*"\n');
+    await writePackage(root, "apps/real-app", "@fx/real-app", { "test:integration": "exit 17" });
+    await build(root);
+    return root;
+  }
+
+  /** A root `package.json` whose `test:integration` chain runs `commands`, and whose other split chains run no package script. */
+  function fixtureRootPackageJson(commands: readonly string[]): string {
+    const scripts = {
+      typecheck: "tsc -b",
+      "test:contract": "vitest run --project contract",
+      "test:integration": commands.join(" && "),
+      "test:fault": "vitest run --project fault",
+    };
+    return `${JSON.stringify({ name: "fixture-root", private: true, scripts }, null, 2)}\n`;
+  }
+
+  it("CI7-R1-01: discovery follows a directory symlink and a symlinked manifest, as pnpm 11.17.0 does, and the rule reports their unchained scripts", async () => {
+    const root = await fixtureWorkspace(async (root) => {
+      // The review's mutant: a package reached through a directory symlink.
+      await writePackage(root, "elsewhere/linked-pkg", "@fx/linked", { "test:integration": "exit 17" });
+      await symlink(path.join("..", "elsewhere", "linked-pkg"), path.join(root, "apps", "linked"), "dir");
+      // A package whose manifest is a symlink.
+      await writePackage(root, "elsewhere/manifest-src", "@fx/manifest-link", { "test:integration": "exit 17" });
+      await mkdir(path.join(root, "apps", "manifest-link"));
+      await symlink(
+        path.join("..", "..", "elsewhere", "manifest-src", "package.json"),
+        path.join(root, "apps", "manifest-link", "package.json"),
+        "file",
+      );
+      // pnpm 11's workspace reader ignores only node_modules and bower_components, so a `test` directory is a package.
+      await writePackage(root, "apps/test", "@fx/test-dir", {});
+      // Not packages, for pnpm or for the reader: a file, a symlink to it, and two directories without a manifest.
+      await writeFile(path.join(root, "apps", "README.md"), "not a package\n");
+      await symlink("README.md", path.join(root, "apps", "file-link"), "file");
+      await mkdir(path.join(root, "apps", "empty"));
+      await mkdir(path.join(root, "apps", ".cache"));
+    });
+    const { globs, manifests } = await readWorkspaceManifests(root);
+    expect(globs).toEqual(["apps/*"]);
+    // The four packages `pnpm ls -r --depth -1` lists for this layout besides the root, measured with pnpm 11.17.0 (CI-7 r1 handoff).
+    expect(manifests.map(({ dir }) => dir)).toEqual(["apps/linked", "apps/manifest-link", "apps/real-app", "apps/test"]);
+    const packageJson = fixtureRootPackageJson(["pnpm --filter @fx/real-app test:integration"]);
+    expect(integrationScriptFindings(packageJson, manifests)).toEqual([
+      expect.stringContaining(unchained("apps/linked", "@fx/linked", "test:integration")),
+      expect.stringContaining(unchained("apps/manifest-link", "@fx/manifest-link", "test:integration")),
+    ]);
+    // Chained, both are workspace packages to the existence check as well: nothing to report.
+    const chained = fixtureRootPackageJson([
+      "pnpm --filter @fx/real-app test:integration",
+      "pnpm --filter @fx/linked test:integration",
+      "pnpm --filter @fx/manifest-link test:integration",
+    ]);
+    expect(integrationScriptFindings(chained, manifests)).toEqual([]);
+  });
+
+  /** One entry the reader must refuse, the fixture that adds it, and the refusal. */
+  const REFUSED_ENTRIES: readonly (readonly [string, (root: string) => Promise<void>, RegExp])[] = [
+    [
+      "a package.yaml manifest, which pnpm admits",
+      async (root) => {
+        await mkdir(path.join(root, "apps", "yaml-app"));
+        await writeFile(path.join(root, "apps", "yaml-app", "package.yaml"), 'name: "@fx/yaml-app"\n');
+      },
+      /^apps\/yaml-app holds package\.yaml\. pnpm 11 admits a package\.yaml or package\.json5 manifest/u,
+    ],
+    [
+      "a package.json5 manifest, which pnpm admits",
+      async (root) => {
+        await mkdir(path.join(root, "apps", "json5-app"));
+        await writeFile(path.join(root, "apps", "json5-app", "package.json5"), '{ name: "@fx/json5-app" }\n');
+      },
+      /^apps\/json5-app holds package\.json5\. pnpm 11 admits/u,
+    ],
+    [
+      "a package.json beside a package.yaml",
+      async (root) => {
+        await writePackage(root, "apps/both", "@fx/both", { "test:integration": "exit 17" });
+        await writeFile(path.join(root, "apps", "both", "package.yaml"), 'name: "@fx/both"\n');
+      },
+      /^apps\/both holds package\.json and package\.yaml\. pnpm 11 admits/u,
+    ],
+    [
+      "a broken directory symlink, whose target may exist elsewhere",
+      async (root) => {
+        await symlink(path.join("..", "nowhere"), path.join(root, "apps", "broken-link"), "dir");
+      },
+      /^apps\/broken-link does not resolve \(ENOENT\)\. A broken symlink may resolve on another machine/u,
+    ],
+    [
+      "a hidden directory holding a manifest",
+      async (root) => {
+        await writePackage(root, "apps/.hidden-app", "@fx/hidden", { "test:integration": "exit 17" });
+      },
+      /^apps\/\.hidden-app holds package\.json, but pnpm 11 admits no hidden, node_modules or bower_components directory/u,
+    ],
+    [
+      "a node_modules directory holding a manifest",
+      async (root) => {
+        await writePackage(root, "apps/node_modules", "@fx/nm", { "test:integration": "exit 17" });
+      },
+      /^apps\/node_modules holds package\.json, but pnpm 11 admits no hidden/u,
+    ],
+    [
+      "a bower_components directory holding a manifest",
+      async (root) => {
+        await writePackage(root, "apps/bower_components", "@fx/bower", { "test:integration": "exit 17" });
+      },
+      /^apps\/bower_components holds package\.json, but pnpm 11 admits no hidden/u,
+    ],
+  ];
+
+  it.each(REFUSED_ENTRIES)("CI7-R1-01: discovery refuses, rather than skips or admits, %s", async (_what, add, refusal) => {
+    const root = await fixtureWorkspace(add);
+    await expect(readWorkspaceManifests(root)).rejects.toThrow(refusal);
+  });
+
+  it("CI7-R1-01: the pnpm parity was measured with pnpm 11.17.0, the version the root package.json pins", async () => {
+    const { packageJson } = await readRealTexts();
+    const { packageManager } = JSON.parse(packageJson) as { readonly packageManager?: unknown };
+    expect(
+      packageManager,
+      "readWorkspaceManifests mirrors pnpm 11.17.0's workspace discovery; on a pnpm change, re-measure it (the CI-7 r1 handoff's probe) and update this pin",
+    ).toBe("pnpm@11.17.0");
   });
 });

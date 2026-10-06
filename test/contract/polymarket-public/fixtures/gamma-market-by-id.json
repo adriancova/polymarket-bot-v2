@@ -3,7 +3,7 @@
   "source": "https://docs.polymarket.com/api-reference/markets/get-market-by-id.md",
   "retrieved": "2026-09-16",
   "sanitized": true,
-  "notes": "The documented polled market-state surface, GET https://gamma-api.polymarket.com/markets/{id} (the Gamma OpenAPI, source index S-D34 of docs/venue/verified-2026-09-16.md, fetched read-only and unauthenticated 2026-09-16T17:19:25Z, sha256 8da3b4b2…; the same fields on the market-details page S-D23). Owned by UNIV-4, NOT part of the frozen WP-000 catalogue under test/fixtures/venue/ (the WP-070 precedent, ./clob-book-rest.json): the ops-cli validator claims every file in that tree and rejects an explicit null outside four documented fields, while every field here is documented nullable. RECONSTRUCTED FROM THE DOCUMENTED PROPERTY LIST, NOT FROM A CAPTURED BODY: the repository holds D-30's property list with OpenAPI line numbers (endDate 90, startDate 106, active 146, closed 161, closedTime 178, archived 193, restricted 199, enableOrderBook 217, gameStartTime 268, acceptingOrders 322, all nullable) and S-D23's MarketState type (lines 199–209: active, closed, archived, acceptingOrders, enableOrderBook, negRisk as boolean | null; startDate, endDate, closedTime as IsoDateTimeString | null), but not S-D34's published example body, so every value is synthetic and only the FIELD NAMES and NULLABILITY are evidence. Fields whose wire type D-30 does not record (id, slug, clobTokenIds, acceptingOrdersTimestamp, ready, funded, automaticallyActive, clearBookOnStart, manualActivation, new, umaEndDate, startDateIso, endDateIso) are deliberately omitted; conditionId is a synthetic full-length 66-character hex string in the form the SDK's ConditionIdSchema requires (D-08); question is a synthetic string. The documented readiness predicate is isTradeReady = active && !closed && acceptingOrders (S-D23 lines 227–231); the package's door evaluates it fail-closed (a null in any of the three is not ready). Six fields carry documented semantics (active, closed, acceptingOrders, restricted, archived, gameStartTime); every other property is recorded, never interpreted. The extra-undocumented-keys example carries version and comboStatus (properties D-19 records the SDK adding) and umaResolutionStatus: null (documented nullable string, register U-11 do-not-parse) to pin that an unknown top-level key is admitted, not refused. Nothing here was produced by placing an order or calling an authenticated endpoint; no credential existed in the environment.",
+  "notes": "The documented polled market-state surface, GET https://gamma-api.polymarket.com/markets/{id} (the Gamma OpenAPI, source index S-D34 of docs/venue/verified-2026-09-16.md, fetched read-only and unauthenticated 2026-09-16T17:19:25Z, sha256 8da3b4b2…; the same fields on the market-details page S-D23). Owned by UNIV-4, NOT part of the frozen WP-000 catalogue under test/fixtures/venue/ (the WP-070 precedent, ./clob-book-rest.json): the ops-cli validator claims every file in that tree and rejects an explicit null outside four documented fields, while every field here is documented nullable. RECONSTRUCTED FROM THE DOCUMENTED PROPERTY LIST, NOT FROM A CAPTURED BODY: the repository holds D-30's property list with OpenAPI line numbers (endDate 90, startDate 106, active 146, closed 161, closedTime 178, archived 193, restricted 199, enableOrderBook 217, gameStartTime 268, acceptingOrders 322, all nullable) and S-D23's MarketState type (lines 199–209: active, closed, archived, acceptingOrders, enableOrderBook, negRisk as boolean | null; startDate, endDate, closedTime as IsoDateTimeString | null), but not S-D34's published example body, so every value is synthetic and only the FIELD NAMES and NULLABILITY are evidence. Fields whose wire type D-30 does not record (id, slug, clobTokenIds, acceptingOrdersTimestamp, ready, funded, automaticallyActive, clearBookOnStart, manualActivation, new, umaEndDate, startDateIso, endDateIso) are deliberately omitted; conditionId is a synthetic full-length 66-character hex string in the form the SDK's ConditionIdSchema requires (D-08); question is a synthetic string. The documented readiness predicate is isTradeReady = active && !closed && acceptingOrders (S-D23 lines 227–231); the package's door evaluates it fail-closed (a null in any of the three is not ready). Six fields carry documented semantics (active, closed, acceptingOrders, restricted, archived, gameStartTime); every other property is recorded, never interpreted. The extra-undocumented-keys example carries version and comboStatus (properties D-19 records the SDK adding) and umaResolutionStatus: null (documented nullable string, register U-11 do-not-parse) to pin that a top-level key outside the six is admitted and recorded, not refused. Its name predates 2026-10-04: version is now a documented nullable string of the Gamma OpenAPI Market schema (docs/venue/verified-2026-10-05.md F-41, E-23; S-O01 lines 2038-2040), and comboStatus is still absent from it; neither carries state semantics, so what the example pins is unchanged (V2-2, plan row D6). Nothing here was produced by placing an order or calling an authenticated endpoint; no credential existed in the environment. POLYMARKET PROTOCOL V2 (V2-2, 2026-10-05; docs/venue/verified-2026-10-05.md): the Gamma OpenAPI Market schema now documents version (nullable string) and positionIds (nullable array of strings) (F-41, E-23). The API-integration guide documents resolutionStatus for V2 markets, 'inactive, active, or resolved', with the snippet {\"version\": \"v2\", \"resolutionStatus\": \"resolved\"} (F-54; S-D02 lines 109-121); the OpenAPI and the SDK omit it (C-18), and no V2 market has been read from Gamma (O.1), so whether V2 markets keep the state fields is unknown (U-36). The door records resolutionStatus and version as scalars, does not carry positionIds (an array), and interprets none of them; readiness still reads active, closed and acceptingOrders only. Three examples were added: v2-documented-example is the market-details page's V2 example verbatim (F-40; S-D16 lines 168-177; test/fixtures/venue/protocol-v2/gamma-market-v2-docs-example.jsonc); v2-resolution-snippet is the guide's resolution snippet verbatim; v2-trade-ready-resolution-active is SYNTHETIC (the trade-ready example's synthetic values with the V2 fields added: the documented example's positionIds, clobTokenIds null, resolutionStatus active), to pin that resolutionStatus never moves readiness.",
   "examples": [
     {
       "name": "trade-ready",
@@ -157,6 +157,51 @@
         "version": "v2",
         "comboStatus": "enabled",
         "umaResolutionStatus": null
+      }
+    },
+    {
+      "name": "v2-documented-example",
+      "payload": {
+        "version": "v2",
+        "outcomes": "[\"Yes\", \"No\"]",
+        "outcomePrices": "[\"0.085\", \"0.915\"]",
+        "clobTokenIds": null,
+        "positionIds": [
+          "651150819117105875331414918119047680898421632356043490229292782433651916800",
+          "651150819117105875331414918119047680898421632356043490229292782433651916801"
+        ]
+      }
+    },
+    {
+      "name": "v2-resolution-snippet",
+      "payload": {
+        "version": "v2",
+        "resolutionStatus": "resolved"
+      }
+    },
+    {
+      "name": "v2-trade-ready-resolution-active",
+      "payload": {
+        "conditionId": "0xab0aab0aab0aab0aab0aab0aab0aab0aab0aab0aab0aab0aab0aab0aab0aab0a",
+        "question": "Synthetic question: a Protocol V2 market whose order book is open",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": true,
+        "restricted": false,
+        "enableOrderBook": true,
+        "negRisk": false,
+        "startDate": "2026-09-01T00:00:00Z",
+        "endDate": "2026-12-31T00:00:00Z",
+        "closedTime": null,
+        "gameStartTime": null,
+        "version": "v2",
+        "clobTokenIds": null,
+        "positionIds": [
+          "651150819117105875331414918119047680898421632356043490229292782433651916800",
+          "651150819117105875331414918119047680898421632356043490229292782433651916801"
+        ],
+        "resolutionStatus": "active"
       }
     }
   ]
