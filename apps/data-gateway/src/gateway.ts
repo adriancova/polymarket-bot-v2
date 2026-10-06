@@ -695,6 +695,8 @@ export class DataGateway {
       feedId: block.feedId,
       gammaBaseUrl: block.gammaBaseUrl,
       clobBaseUrl: block.clobBaseUrl,
+      // `V2-3`: the `/v2/resolutions` read's origin (`feeds/resolution-check.ts`).
+      dataApiBaseUrl: block.dataApiBaseUrl,
       pollIntervalMs: block.pollIntervalMs,
       consecutiveFailureThreshold: block.consecutiveFailureThreshold,
       pageLimit: block.pageLimit,

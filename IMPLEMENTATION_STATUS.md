@@ -23,7 +23,7 @@ This file is the brief: current state only, one entry per item. The full history
 - **Wave 3 IS COMPLETE WITH QUALIFICATIONS** (`CLOSEOUT-3`, at `fdc3430`, 2026-10-06). No blocker or HIGH was found, and all six runbook §8 items are met. See [the report](docs/handoffs/CLOSEOUT-3-wave-3-closeout.md).
   - Every package, `WP-260` to `WP-340`, is merged. `CI-6` runs the live fault suites in CI. `TRADER-SIGNALS` adds the graceful stop and paper fills. `DEPS-3` patched the `tinypool` and `source-map-js` advisories.
   - Its unowned findings are the rows `CO3-N1`, `CO3-N2`, `CO3-N3`, `CO3-LOWS` and `CO3-L6`. Only `WP-350` is released, and only the user can start it.
-- **Protocol V2** (folded into Wave 3 by the user, 2026-10-05): `VENUE-4` (`f925a43`), `V2-0` (`5f2b3c8`), `V2-2` (`9836ab0`) and `V2-1` (`8558053`) are Complete. `V2-3` runs now, due 2026-10-28. The facts are in `docs/venue/verified-2026-10-05.md`, and the plan in `docs/venue/protocol-v2-migration-plan.md`.
+- **Protocol V2** (folded into Wave 3 by the user, 2026-10-05): `VENUE-4` (`f925a43`), `V2-0` (`5f2b3c8`), `V2-2` (`9836ab0`) and `V2-1` (`8558053`) and `V2-3` (`3ee3e1d`) are Complete: class A is done. The facts are in `docs/venue/verified-2026-10-05.md`, and the plan in `docs/venue/protocol-v2-migration-plan.md`.
   - **Dates:** Data API v1 retires on 2026-10-24, which breaks nothing here. New markets switch over about 2026-11-02. Reviewed series must list `acceptedProtocolVersions` `["v1","v2"]` by then.
   - **The user's rulings (2026-10-05):** the SDK's per-surface scope; ADR-033 D5 option 1; the ADR-001 bounded number rule. See [VENUE-4](docs/handoffs/VENUE-4.md). `V2-0` recorded them in the ADRs.
 - **Wave 2 is CLOSED WITH QUALIFICATIONS** (2026-09-30). `CLOSEOUT-2` found one blocker, `X1`. `DURABLE-1` fixed it, and `CLOSEOUT-2B` confirmed the fix. The user ruled the CANCEL exemption. Records: [`CLOSEOUT-2`](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md), [`CLOSEOUT-2B`](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md).
@@ -49,7 +49,6 @@ Completed packages are listed in [`docs/handoffs/INDEX.md`](docs/handoffs/INDEX.
 | Package | Scope | Status | Merge | Record |
 | --- | --- | --- | --- | --- |
 | `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
-| `V2-3` | Protocol V2 resolution via a journaled `/v2/resolutions` read, and not-yet-admissible windows (class A, PAPER; dual verifiers; due 2026-10-28) | **Running** (authorized 2026-10-06) | — | — |
 | `V2-10` | Simulation fill fidelity: F-63 floor in base units; FOK/FAK BUYs target collateral | **Running** (authorized 2026-10-06) | — | — |
 | `RECORDS-W3B` | Completed packages leave this table for `docs/handoffs/INDEX.md` (budget fix) | **Running** (authorized 2026-10-06) | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>`. The user starts it later on 2026-10-05 and reports back | — | — |

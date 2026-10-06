@@ -76,3 +76,5 @@ export * from "./snapshot/fetcher.js";
 export * from "./market-state/index.js";
 
 export * from "./series-window/index.js";
+
+export * from "./resolution/index.js";
