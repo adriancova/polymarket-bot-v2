@@ -34,6 +34,7 @@ import {
   DEFAULT_FOK_FAK_BUY_TARGET,
   FOK_FAK_BUY_TARGETS,
   SimulatedVenue,
+  checkBandOrdering,
   collateralTargetAtLimitPrice,
   consumeDepth,
   counterAmount,
@@ -55,6 +56,7 @@ import {
   type PlannedOrderView,
   type QueueModelParameters,
   type RecordedEventIdentity,
+  type RestingFillBand,
   type SimulatedVenueOptions,
   type SimulationResult,
   type TimeInForce,
@@ -781,5 +783,434 @@ describe("V2-10 (4): the fee path is UNCHANGED — fills and fees reconcile sepa
     await venue.submit(plan(order()));
     expect(venue.fills.map((fill) => [fill.collateralAmount, fill.feeAmount])).toEqual([["5", "0.21"]]);
     expect(await cash(venue)).toBe("994.79");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Round 1 (V2-10 r1): the budget a resting BUY signs, the exhausted level,
+//    and the band's order in the maker's asset
+// ---------------------------------------------------------------------------
+
+/** A canonical non-negative decimal of at most six places, as base units. Exact. */
+function units(value: string): bigint {
+  const [whole = "0", fraction = ""] = value.split(".");
+  if (fraction.length > 6) throw new Error(`${value} is finer than one base unit`);
+  return BigInt(whole) * BASE_UNITS_PER_WHOLE + BigInt(fraction.padEnd(6, "0"));
+}
+
+/** Σ of the fills' pUSD legs, in base units. */
+function spentUnits(fills: readonly { readonly collateralAmount: string }[]): bigint {
+  return fills.reduce((total, fill) => total + units(fill.collateralAmount), 0n);
+}
+
+/** A Tier-1 band for a resting order over the given trades, each 1 ns after the last. */
+function restingBand(input: {
+  readonly action: "BUY" | "SELL";
+  readonly price: string;
+  readonly shares: string;
+  readonly queueAhead?: string;
+  readonly trades: readonly { readonly price: string; readonly shares: string }[];
+}): SimulationResult<RestingFillBand> {
+  return simulateResting({
+    model: TIER1,
+    order: {
+      simulatedOrderId: "rest-r1",
+      marketId: MARKET,
+      tokenId: TOKEN,
+      side: "YES",
+      action: input.action,
+      restingPrice: input.price,
+      shares: input.shares,
+      queueAheadAtPlacement: input.queueAhead ?? "0",
+      sameInstantAdditions: "NOT_OBSERVED",
+      restingFromNs: START_NS,
+    },
+    trades: input.trades.map((trade, index) => ({
+      price: trade.price,
+      shares: trade.shares,
+      monotonicNs: START_NS + BigInt(index + 1),
+      atEvent: event(index + 2),
+    })),
+    parameters: QUEUE,
+    feeSnapshot: FEES,
+  });
+}
+
+function scenarios(band: RestingFillBand) {
+  return [band.optimistic, band.base, band.conservative] as const;
+}
+
+describe("V2-10 r1 (R1-01): a resting BUY's maker fills spend, TOGETHER, at most the collateral it signed", () => {
+  it("BUY 10 at 0.6, filled in ten pieces of 1.000002: exactly the 6 pUSD it signed, never 6.000003", () => {
+    // Signed: makerAmount 6 000 000 (pUSD), takerAmount 10 000 000 (shares).
+    // Fills 1-9: pUSD floor(1 000 002 × 0.6) = 600 001, shares
+    // floor(600 001 / 0.6) = 1 000 001; after nine, 5 400 009 spent and
+    // 599 991 left. Fill 10: the 999 991 shares still unfilled are worth
+    // floor(599 994.6) = 599 994 > 599 991, so it is CAPPED at 599 991, and
+    // moves floor(599 991 / 0.6) = 999 985 shares. Total: 9 999 994 shares for
+    // exactly 6 000 000. The 6 share units left are the formula's floors; the
+    // eleventh trade fills nothing, because the budget is spent.
+    const band = unwrap(
+      restingBand({
+        action: "BUY",
+        price: "0.6",
+        shares: "10",
+        trades: Array.from({ length: 11 }, () => ({ price: "0.6", shares: "1.000002" })),
+      }),
+    );
+    for (const scenario of scenarios(band)) {
+      expect(scenario.fills.map((fill) => [fill.shares, fill.collateralAmount])).toEqual([
+        ...Array.from({ length: 9 }, () => ["1.000001", "0.600001"]),
+        ["0.999985", "0.599991"],
+      ]);
+      expect(spentUnits(scenario.fills)).toBe(6_000_000n);
+      expect(scenario).toMatchObject({ filledShares: "9.999994", remainingShares: "0.000006" });
+    }
+  });
+
+  it("a trade THROUGH the price after partial fills spends exactly what is left of the budget", () => {
+    // Three fills of 1.000001 for 0.600001 leave 4 199 997 of 6 000 000 and
+    // 6 999 997 share units. The through trade fills the remainder, worth
+    // floor(6 999 997 × 0.6) = floor(4 199 998.2) = 4 199 998 — one MORE than
+    // is left — so it is capped at 4 199 997 and moves floor(4 199 997 / 0.6)
+    // = 6 999 995 shares. Total spend: exactly 6.
+    const band = unwrap(
+      restingBand({
+        action: "BUY",
+        price: "0.6",
+        shares: "10",
+        trades: [
+          { price: "0.6", shares: "1.000002" },
+          { price: "0.6", shares: "1.000002" },
+          { price: "0.6", shares: "1.000002" },
+          { price: "0.59", shares: "50" },
+        ],
+      }),
+    );
+    for (const scenario of scenarios(band)) {
+      expect(scenario.fills.map((fill) => [fill.shares, fill.collateralAmount])).toEqual([
+        ["1.000001", "0.600001"],
+        ["1.000001", "0.600001"],
+        ["1.000001", "0.600001"],
+        ["6.999995", "4.199997"],
+      ]);
+      expect(spentUnits(scenario.fills)).toBe(6_000_000n);
+      expect(scenario).toMatchObject({ filledShares: "9.999998", remainingShares: "0.000002" });
+    }
+  });
+
+  it("CONSERVES the signed collateral over a grid of prices, sizes, queues and partial-fill sequences", () => {
+    // The budget is floor(size in whole base units × price). For every band:
+    // every arm's fills spend at most it, and a final trade THROUGH the price
+    // spends it exactly. Every band is also ACCEPTED by `checkBandOrdering`
+    // (`unwrap` throws on a refusal), which orders a BUY band in pUSD.
+    const pieces: readonly (readonly string[])[] = [
+      Array.from({ length: 12 }, () => "1.000002"),
+      Array.from({ length: 31 }, () => "0.333333"),
+      ["0.000003", "1.7", "2.000001", "0.5", "0.000001", "3.333337", "0.9", "1.000009"],
+      ["2.5", "2.5", "2.5", "2.5", "2.5"],
+    ];
+    let bands = 0;
+    for (const price of ["0.6", "0.47", "0.35", "0.03", "0.97", "0.333"]) {
+      for (const shares of ["10", "7.5", "1.000003"]) {
+        for (const queueAhead of ["0", "0.5", "2.000004"]) {
+          for (const sequence of pieces) {
+            const budget = (units(shares) * units(price)) / BASE_UNITS_PER_WHOLE;
+            const atPrice = sequence.map((size) => ({ price, shares: size }));
+            const partial = unwrap(restingBand({ action: "BUY", price, shares, queueAhead, trades: atPrice }));
+            for (const scenario of scenarios(partial)) {
+              expect(spentUnits(scenario.fills) <= budget, `${price} ${shares} ${queueAhead} ${scenario.scenario}`).toBe(
+                true,
+              );
+            }
+            const through = unwrap(
+              restingBand({
+                action: "BUY",
+                price,
+                shares,
+                queueAhead,
+                trades: [...atPrice, { price: "0.01", shares: "1000" }],
+              }),
+            );
+            for (const scenario of scenarios(through)) {
+              expect(spentUnits(scenario.fills), `${price} ${shares} ${queueAhead} ${scenario.scenario}`).toBe(budget);
+            }
+            bands += 2;
+          }
+        }
+      }
+    }
+    expect(bands).toBe(432);
+  });
+
+  it("reaches the venue: a Tier-1 resting BUY's band never spends more than the order signed", async () => {
+    // GTC BUY 10 at 0.6 against asks at 0.7: nothing crosses, so it rests, with
+    // nothing ahead at 0.6 (the bid is 0.3). Ten observed trades of 1.000002.
+    const venue = tier1Venue("GTC", [{ price: "0.7", size: "100" }]);
+    const submitted = await venue.submit(plan(order({ limitPrice: "0.6" })));
+    expect(booked(venue).state).toBe("RESTING");
+    expect(submitted.fills).toEqual([]);
+    let last: RestingFillBand | undefined;
+    for (let index = 0; index < 10; index += 1) {
+      const observed = unwrap(
+        venue.observeTrade({
+          marketId: MARKET,
+          side: "YES",
+          price: "0.6",
+          shares: "1.000002",
+          monotonicNs: START_NS + 1_000n + BigInt(index),
+          atEvent: event(index + 2),
+        }),
+      );
+      last = observed.bands[0];
+    }
+    if (last === undefined) throw new Error("the venue reported no band");
+    for (const scenario of scenarios(last)) {
+      expect(spentUnits(scenario.fills)).toBe(6_000_000n);
+      expect(scenario.filledShares).toBe("9.999994");
+    }
+  });
+});
+
+describe("V2-10 r1 (self-found): a resting band is ordered in the MAKER'S ASSET — pUSD for a BUY, shares for a SELL", () => {
+  // Resting at 0.6 behind 2.000004; trades 2.000004 then 20. OPTIMISTIC
+  // (ratio 0.5) is reached by 1.000002 of the first trade and fills the rest
+  // from the second; BASE (ratio 0.1) by 0.2000004 of it, floored to 0.2;
+  // CONSERVATIVE (ratio 0) by none of it. All three fill from the second.
+  const trades = [
+    { price: "0.6", shares: "2.000004" },
+    { price: "0.6", shares: "20" },
+  ];
+
+  it("a BUY band whose arms receive different SHARES for the same pUSD is a valid band", () => {
+    // OPTIMISTIC: 1.000001 shares for 0.600001, then the 8.999999 unfilled are
+    // worth floor(5 399 999.4) = 5 399 999 — exactly what is left of 6 — for
+    // floor(5 399 999 / 0.6) = 8 999 998 shares: 9.999999 for 6. BASE: 0.2 for
+    // 0.12, then 9.8 for 5.88: 10 for 6. CONSERVATIVE: 10 for 6. F-63 floors
+    // each fill's share counter, so the arm filled in more pieces receives
+    // fewer shares for the same pUSD: shares are NOT ordered, pUSD is.
+    const band = unwrap(restingBand({ action: "BUY", price: "0.6", shares: "10", queueAhead: "2.000004", trades }));
+    expect(scenarios(band).map((scenario) => [scenario.filledShares, spentUnits(scenario.fills)])).toEqual([
+      ["9.999999", 6_000_000n],
+      ["10", 6_000_000n],
+      ["10", 6_000_000n],
+    ]);
+    expect(checkBandOrdering(band).ok).toBe(true);
+  });
+
+  it("a SELL band whose arms receive different pUSD for the same SHARES is a valid band", () => {
+    // The maker's asset is shares: OPTIMISTIC sells 1.000002 for 0.600001 and
+    // 8.999998 for floor(5 399 998.8) = 5.399998 — 10 shares for 5.999999;
+    // BASE and CONSERVATIVE sell 10 for 6. pUSD is NOT ordered, shares are.
+    const band = unwrap(restingBand({ action: "SELL", price: "0.6", shares: "10", queueAhead: "2.000004", trades }));
+    expect(scenarios(band).map((scenario) => [scenario.filledShares, spentUnits(scenario.fills)])).toEqual([
+      ["10", 5_999_999n],
+      ["10", 6_000_000n],
+      ["10", 6_000_000n],
+    ]);
+  });
+
+  it("carries each arm's post-cancel pUSD beside its post-cancel shares", () => {
+    // BUY 10 at 0.6, cancel requested at +2 ns; OPTIMISTIC's cancel takes
+    // effect 10 ms later, so both trades fill it, the second after the request.
+    const band = unwrap(
+      simulateResting({
+        model: TIER1,
+        order: {
+          simulatedOrderId: "rest-r1-cancel",
+          marketId: MARKET,
+          tokenId: TOKEN,
+          side: "YES",
+          action: "BUY",
+          restingPrice: "0.6",
+          shares: "10",
+          queueAheadAtPlacement: "0",
+          sameInstantAdditions: "NOT_OBSERVED",
+          restingFromNs: START_NS,
+          cancelRequestedAtNs: START_NS + 2n,
+        },
+        trades: [
+          { price: "0.6", shares: "1.000002", monotonicNs: START_NS + 1n, atEvent: event(2) },
+          { price: "0.6", shares: "1.000002", monotonicNs: START_NS + 3n, atEvent: event(3) },
+        ],
+        parameters: QUEUE,
+        feeSnapshot: FEES,
+      }),
+    );
+    expect(band.optimistic).toMatchObject({
+      filledShares: "2.000002",
+      fillsAfterCancelRequest: "1.000001",
+      collateralAfterCancelRequest: "0.600001",
+    });
+  });
+
+  it("checkBandOrdering REFUSES an inverted BUY band in pUSD, a band of two sides, and an impossible post-cancel spend", () => {
+    // BUY 1000 at 0.5 behind 100 (+50 same-instant for CONSERVATIVE), one trade
+    // of 100. OPTIMISTIC (ratio 1): 100 of the queue cancels, the trade fills
+    // 100 for 50. BASE (ratio 0.6): 60 cancels, 40 trades ahead, 60 fills for
+    // 30. CONSERVATIVE (ratio 0, 150 ahead): nothing.
+    const built = unwrap(
+      simulateResting({
+        model: TIER1,
+        order: {
+          simulatedOrderId: "rest-r1-order",
+          marketId: MARKET,
+          tokenId: TOKEN,
+          side: "YES",
+          action: "BUY",
+          restingPrice: "0.5",
+          shares: "1000",
+          queueAheadAtPlacement: "100",
+          sameInstantAdditions: { observedShares: "50" },
+          restingFromNs: START_NS,
+        },
+        trades: [{ price: "0.5", shares: "100", monotonicNs: START_NS + 1n, atEvent: event(2) }],
+        parameters: { ...QUEUE, cancellationRatio: { OPTIMISTIC: "1", BASE: "0.6", CONSERVATIVE: "0" } },
+        feeSnapshot: FEES,
+      }),
+    );
+    expect(scenarios(built).map((scenario) => spentUnits(scenario.fills))).toEqual([50_000_000n, 30_000_000n, 0n]);
+
+    const swapped = checkBandOrdering({
+      ...built,
+      optimistic: { ...built.conservative, scenario: "OPTIMISTIC" as const },
+      conservative: { ...built.optimistic, scenario: "CONSERVATIVE" as const },
+    });
+    expect(swapped).toMatchObject({
+      ok: false,
+      refusal: { code: "FILL_MODEL_BAND_INCONSISTENT", details: { makerAsset: "PUSD", optimistic: "0", conservative: "50" } },
+    });
+
+    const [first, ...rest] = built.optimistic.fills;
+    if (first === undefined) throw new Error("the optimistic arm filled nothing");
+    const twoSides = checkBandOrdering({
+      ...built,
+      optimistic: { ...built.optimistic, fills: [{ ...first, action: "SELL" as const }, ...rest] },
+    });
+    expect(twoSides).toMatchObject({ ok: false, refusal: { code: "FILL_MODEL_BAND_INCONSISTENT" } });
+    expect(twoSides.ok ? "" : twoSides.refusal.message).toContain("both a BUY and a SELL");
+
+    // On the CONSERVATIVE arm, which spent nothing: its pre-cancel pUSD would
+    // be −999, which the ORDERING check alone would accept (30 ≥ −999), so only
+    // the post-cancel bound can refuse it.
+    const impossible = checkBandOrdering({
+      ...built,
+      conservative: { ...built.conservative, collateralAfterCancelRequest: "999" },
+    });
+    expect(impossible).toMatchObject({ ok: false, refusal: { code: "FILL_MODEL_BAND_INCONSISTENT" } });
+    expect(impossible.ok ? "" : impossible.refusal.message).toContain("more pUSD after a cancel request");
+
+    const withoutField: Record<string, unknown> = { ...built.base };
+    delete withoutField["collateralAfterCancelRequest"];
+    const missing = checkBandOrdering({ ...built, base: withoutField as never });
+    expect(missing).toMatchObject({ ok: false, refusal: { code: "SIMULATION_INPUT_INVALID" } });
+  });
+});
+
+describe("V2-10 r1 (R1-02): a collateral walk leaves a level only once it is EXHAUSTED, then spends what the floor left", () => {
+  const DOCUMENTED = { fokFakBuyTarget: "COLLATERAL_AT_LIMIT_PRICE" } as const;
+  /** 10.638297 at 0.47 is worth 4.99999959: a 5-pUSD budget buys it EXACTLY and keeps 1 base unit. */
+  const EXACT_THEN_DEEPER: readonly BookLevelView[] = [
+    { price: "0.47", size: "10.638297" },
+    { price: "0.5", size: "100" },
+  ];
+
+  it("a budget that buys a level exactly moves the base unit the floor left on to the next level", () => {
+    // Level 1: affordable floor(5 000 000 × 100 / 47) = 10 638 297 = the level:
+    // EXHAUSTED, spending floor(10 638 297 × 0.47) = 4 999 999. Level 2: the 1
+    // left buys floor(1 / 0.5) = 2 share units for floor(2 × 0.5) = 1. Spent: 5.
+    const walk = unwrap(consumeDepth({ ladder: EXACT_THEN_DEEPER, action: "BUY", limitPrice: "0.5", collateral: "5" }));
+    expect(walk.matched).toEqual([
+      { price: "0.47", shares: "10.638297", collateral: "4.999999" },
+      { price: "0.5", shares: "0.000002", collateral: "0.000001" },
+    ]);
+    expect(walk).toMatchObject({
+      filledShares: "10.638299",
+      collateral: "5",
+      remainingCollateral: "0",
+      complete: true,
+      stoppedAtLimit: false,
+    });
+  });
+
+  it("with no reachable level after it, the unspent base unit leaves the walk INCOMPLETE", () => {
+    const ladderEnds = unwrap(
+      consumeDepth({ ladder: [{ price: "0.47", size: "10.638297" }], action: "BUY", limitPrice: "0.5", collateral: "5" }),
+    );
+    expect(ladderEnds).toMatchObject({
+      filledShares: "10.638297",
+      remainingCollateral: "0.000001",
+      complete: false,
+      stoppedAtLimit: false,
+    });
+    const limitEnds = unwrap(
+      consumeDepth({
+        ladder: [
+          { price: "0.47", size: "10.638297" },
+          { price: "0.6", size: "100" },
+        ],
+        action: "BUY",
+        limitPrice: "0.5",
+        collateral: "5",
+      }),
+    );
+    expect(limitEnds).toMatchObject({ remainingCollateral: "0.000001", complete: false, stoppedAtLimit: true });
+  });
+
+  it("a budget that buys LESS than a level still ends the walk there (price priority): unchanged", () => {
+    // One more share unit at 0.47 (10.638298): affordable 10 638 297 < the
+    // level, so the budget BOUND it. The 1 base unit left cannot buy one more
+    // unit at 0.47 within the budget (10 638 298 × 0.47 = 5 000 000.06), and the
+    // 0.5 level sits behind the size still resting at 0.47.
+    const walk = unwrap(
+      consumeDepth({
+        ladder: [
+          { price: "0.47", size: "10.638298" },
+          { price: "0.5", size: "100" },
+        ],
+        action: "BUY",
+        limitPrice: "0.5",
+        collateral: "5",
+      }),
+    );
+    expect(walk.matched).toEqual([{ price: "0.47", shares: "10.638297", collateral: "4.999999" }]);
+    expect(walk).toMatchObject({ remainingCollateral: "0.000001", complete: true });
+  });
+
+  it("the venue: a FAK and a FOK BUY, under both tiers, FILL 10.638299 shares for exactly 5 pUSD", async () => {
+    // Fees: 10.638297 at 0.47 → 0.1855 (section 2); 0.000002 at 0.5 →
+    // 0.000002 × 0.07 × 0.25 = 0.000000035, so the 0.00001 minimum charge.
+    // Cash: 1000 − 5 − 0.1855 − 0.00001 = 994.81449.
+    for (const make of [tier0Venue, tier1Venue]) {
+      for (const timeInForce of ["FAK", "FOK"] as const) {
+        const venue = make(timeInForce, EXACT_THEN_DEEPER, DOCUMENTED);
+        await venue.submit(plan(order()));
+        expect(booked(venue), `${make.name} ${timeInForce}`).toMatchObject({
+          state: "FILLED",
+          filledShares: "10.638299",
+          collateralTarget: "5",
+        });
+        expect(venue.fills.map((fill) => [fill.price, fill.shares, fill.collateralAmount, fill.feeAmount])).toEqual([
+          ["0.47", "10.638297", "4.999999", "0.1855"],
+          ["0.5", "0.000002", "0.000001", "0.00001"],
+        ]);
+        expect(await cash(venue)).toBe("994.81449");
+      }
+    }
+  });
+
+  it("the venue: with nothing reachable after the exhausted level, a FAK CANCELS what is unspent and a FOK is REJECTED (both tiers)", async () => {
+    const onlyLevel: readonly BookLevelView[] = [{ price: "0.47", size: "10.638297" }];
+    for (const make of [tier0Venue, tier1Venue]) {
+      const fak = make("FAK", onlyLevel, DOCUMENTED);
+      await fak.submit(plan(order()));
+      expect(booked(fak), make.name).toMatchObject({ state: "CANCELLED", filledShares: "10.638297" });
+      expect(await cash(fak)).toBe("994.814501");
+      const fok = make("FOK", onlyLevel, DOCUMENTED);
+      await fok.submit(plan(order()));
+      expect(booked(fok), make.name).toMatchObject({ state: "REJECTED", filledShares: "0" });
+      expect(fok.fills).toEqual([]);
+      expect(await cash(fok)).toBe("1000");
+    }
   });
 });

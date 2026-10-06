@@ -278,10 +278,16 @@ export interface DepthConsumption {
    * `true` when the TARGET ended the walk: it is filled to the last whole base
    * unit F-63 can move at the maker's price. A share target can then still
    * show a sub-base-unit, or a floor-sized, remainder (`./base-units.js`
-   * inference 2), and a collateral target an unspent budget under one share's
-   * base unit at that price: that remainder is the formula's, never missing
-   * liquidity, so the order is complete. `false` when the limit price or the
-   * ladder ended it first: the order has a remainder to rest, cancel or reject.
+   * inference 2); a collateral target is complete once its budget is spent,
+   * or once it bound a level it could not buy whole — whose leftover (at most
+   * the one base unit the counter's floor gave back) buys no more share base
+   * units within the budget at that level's price, while price priority keeps
+   * the later levels behind it (`./base-units.js` inference 5). That remainder
+   * is the formula's, never missing liquidity, so the order is complete.
+   * `false` when the limit price or the ladder ended it first — for a
+   * collateral target, also when it EXHAUSTED its last reachable level with
+   * whole base units of budget left (V2-10 r1, R1-02): the order has a
+   * remainder to rest, cancel or reject.
    */
   readonly complete: boolean;
 }
@@ -454,8 +460,11 @@ function consumeDepthInner(input: {
       const budgeted = makerSellForBudget(price, remaining, size);
       if (!budgeted.ok) return budgeted;
       legs = budgeted.value;
-      // The budget decided this level, or it cannot buy one more base unit of
-      // a share at it — and every later ask is dearer, so not there either.
+      // The budget bound a level it could not buy whole: the walk is done
+      // (`./base-units.js` inference 5). A level it EXHAUSTED — even one it
+      // bought exactly — does not end it: what F-63's floor left of the budget
+      // goes on to the next level (V2-10 r1, R1-02), and the check below ends
+      // the walk only once nothing is left.
       if (budgeted.value.boundByBudget) targetReached = true;
     } else {
       const boundByTarget = compareDecimal(remaining, size) <= 0;

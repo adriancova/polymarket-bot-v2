@@ -55,6 +55,29 @@
  * 3. **A quantity finer than one base unit is floored** before it is filled:
  *    a fill moves whole base units (F-73). Rounding up would fill a fraction no
  *    order could have signed.
+ * 4. **A resting BUY's collateral budget is its maker amount** (V2-10 r1,
+ *    R1-01): its size in whole base units at its price, floored
+ *    ({@link makerBuyBudget}) — what an order signed at exactly its price
+ *    (inference 1) signs as `makerAmount`. F-63: "ExchangeV3 reduces a BUY's
+ *    remaining collateral budget by the amount actually spent", so its maker
+ *    fills are capped, TOGETHER, by that budget: each one by what the earlier
+ *    ones left of it ({@link makerFillForShares}'s `collateralBudget`). Every
+ *    fill floors its share counter, so a BUY filled in several pieces receives
+ *    fewer shares for the same pUSD than one filled whole — the remainder that
+ *    leaves is the formula's, and no further fill can move it once the budget
+ *    is spent. A remainder that comes to rest after an immediate partial fill
+ *    gets the budget of its own size at the limit, which is never more than
+ *    the signed order has left: its taker fills paid at most their shares ×
+ *    the limit.
+ * 5. **One maker fill per level, and a level is left only once it is
+ *    EXHAUSTED** (V2-10 r1, R1-02). A collateral budget that buys the whole
+ *    level — including one that buys it EXACTLY, when F-63's floor still
+ *    leaves a base unit of the budget unspent — moves on to the next level
+ *    with whatever is left. A budget that buys LESS than the level ends the
+ *    walk: price priority keeps every later, dearer level behind the size
+ *    still resting at this one, and at this level's price the leftover (at
+ *    most one base unit, which the counter's floor gave back) cannot buy one
+ *    more share base unit within the budget.
  */
 
 import { isCanonicalDecimalString } from "@polymarket-bot/decimal";
@@ -169,8 +192,21 @@ export interface MakerFillLegs {
  * The legs of one maker fill selected by a SHARE quantity (inference 2 of the
  * module header). Internal: its callers validated `price` (strictly positive)
  * and `shares` (non-negative) as canonical decimals first.
+ *
+ * `collateralBudget` (V2-10 r1, R1-01; inference 4) is, for a maker BUY, the
+ * pUSD its earlier fills left of its signed collateral, in base units: the
+ * fill's pUSD is capped by it, so the maker's fills never spend more, in
+ * total, than it signed. The caller debits the returned `collateral`. Absent,
+ * the fill is the maker's only one (Tier 0, a taker walk), whose pUSD is at
+ * most the shares' worth at the price anyway. Ignored for a maker SELL, whose
+ * asset is shares and whose caller caps those.
  */
-export function makerFillForShares(makerSide: MakerSide, price: string, shares: string): SimulationResult<MakerFillLegs> {
+export function makerFillForShares(
+  makerSide: MakerSide,
+  price: string,
+  shares: string,
+  collateralBudget?: bigint,
+): SimulationResult<MakerFillLegs> {
   const ratio = exactRatio(price);
   const wanted = floorToBaseUnits(shares);
   if (makerSide === "SELL") {
@@ -181,17 +217,39 @@ export function makerFillForShares(makerSide: MakerSide, price: string, shares: 
     return simulationOk({ shares: fromBaseUnits(wanted), collateral: fromBaseUnits(collateral.value) });
   }
   // The maker's asset is pUSD: its fill is what the shares are worth at its
-  // price, floored, and the shares that move are F-63's counter of THAT at
+  // price, floored — and never more than what is left of its signed budget —
+  // and the shares that move are F-63's counter of THAT at
   // `makerAmount : takerAmount = a : 10^k`.
-  const makerAssetFill = (wanted * ratio.numerator) / ratio.denominator;
+  const worth = (wanted * ratio.numerator) / ratio.denominator;
+  // A negative budget is no budget: `counterAmount` refuses the fill it yields.
+  const makerAssetFill = collateralBudget !== undefined && collateralBudget < worth ? collateralBudget : worth;
   const shareLeg = counterAmount(makerAssetFill, ratio.numerator, ratio.denominator);
   if (!shareLeg.ok) return shareLeg;
   return simulationOk({ shares: fromBaseUnits(shareLeg.value), collateral: fromBaseUnits(makerAssetFill) });
 }
 
+/**
+ * The collateral a resting BUY of `shares` at `price` signs, in base units
+ * (V2-10 r1, R1-01; inference 4 of the module header): its size in whole base
+ * units at its price, floored — the `makerAmount` of an order signed at exactly
+ * its price. Its maker fills spend, TOGETHER, at most this. Internal: its
+ * callers validated `price` (strictly positive) and `shares` (non-negative) as
+ * canonical decimals first.
+ */
+export function makerBuyBudget(price: string, shares: string): bigint {
+  const ratio = exactRatio(price);
+  return (floorToBaseUnits(shares) * ratio.numerator) / ratio.denominator;
+}
+
 /** The legs of one maker SELL filled from a collateral budget, and whether the budget bound it. */
 export interface BudgetedMakerFill extends MakerFillLegs {
-  /** `true` when the budget, not the level's size, decided the fill. */
+  /**
+   * `true` when the budget, not the level's size, decided the fill: the budget
+   * buys LESS than the level, which still has size after it (inference 5).
+   * `false` when the level is EXHAUSTED — including when the budget buys it
+   * exactly, since F-63's floor can then leave a base unit of the budget
+   * unspent, which the next level may still take (V2-10 r1, R1-02).
+   */
   readonly boundByBudget: boolean;
 }
 
@@ -213,7 +271,10 @@ export function makerSellForBudget(
   const budgetUnits = floorToBaseUnits(budget);
   const levelUnits = floorToBaseUnits(levelShares);
   const affordable = (budgetUnits * ratio.denominator) / ratio.numerator;
-  const boundByBudget = affordable <= levelUnits;
+  // STRICT (V2-10 r1, R1-02): a budget that buys the level exactly has
+  // EXHAUSTED it, and the floor below may leave a base unit of the budget for
+  // the next level; only a level the budget cannot buy whole bound the fill.
+  const boundByBudget = affordable < levelUnits;
   const makerAssetFill = boundByBudget ? affordable : levelUnits;
   const collateral = counterAmount(makerAssetFill, ratio.denominator, ratio.numerator);
   if (!collateral.ok) return collateral;
