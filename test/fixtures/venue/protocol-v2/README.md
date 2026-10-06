@@ -43,7 +43,7 @@ listed, the fixture is the raw response, byte for byte, so its sha256 equals
 | `data-v2-resolutions-v1-resolved` | S-A10 | live | A resolved V1 window |
 | `data-v2-resolutions-62hex-invalid` | S-L05 | live | The 31-byte condition form: HTTP 400 `invalid_request` |
 | `data-v2-prices-history-page1`, `-page2` | S-A02, S-A03 | live | Cursor pagination: page 2 fetched with page 1's `next_cursor` |
-| `data-v2-trades-v1-page1`, `-page2` | S-A08, S-A09 | live, redacted | `/v2/trades?condition=…` with cursor pagination; personal data replaced |
+| `data-v2-trades-v1-page1`, `-page2` | S-A08, S-A09 | live, redacted | `/v2/trades?condition=…` with cursor pagination; personal data, sizes, timestamps, hashes and cursors replaced |
 | `data-v2-trades-v2-empty` | S-A07 | live | An empty page: `next_cursor` `null` |
 | `data-v2-oi-v2` | S-A06 | live | A non-paginated `{data: […]}` envelope |
 
@@ -52,10 +52,34 @@ listed, the fixture is the raw response, byte for byte, so its sha256 equals
 - **No personal data.** The Data API trade rows carry wallet addresses,
   display names, pseudonyms, bios, profile images and transaction hashes. Each
   is replaced with a synthetic value labelled `synthetic-…` or an all-zero
-  address or hash, and each row's `size` with a synthetic number. The
-  sidecars list the replacements.
+  address or hash. Each row's `size` and block `timestamp` are replaced with
+  synthetic numbers that keep the rows' order. The sidecars list every
+  replacement.
+- **The trade cursors are synthetic** (round 1). Both pages'
+  `pagination.next_cursor` and the cursor in the page-2 sidecar's `url` read
+  `synthetic-cursor-trades-p<page>-next`. A real feed cursor carries the seek
+  anchor of the last row (S-O06), and a GET of the real page-2 URL returned
+  the unredacted page byte for byte. So the committed URL no longer re-fetches
+  it. The real URL is row S-A09 of the round's scratch fetch log.
+- **What the redaction does not do.** These trades stay in Polymarket's own
+  public feed, which anyone can read without credentials. The rows were the
+  market's newest trades at the sidecar's `fetched_utc`, while its window was
+  still open (OBS: the feed pages newest first). A walk of
+  `/v2/trades?condition=<this market>` back to that time, matched on side,
+  outcome and price, could find them again with their real wallets. The fixtures commit no personal data, and add
+  nothing that the public feed does not already serve; they do not make the
+  trades unfindable.
 - **Contract addresses** and public market identifiers (condition ids,
-  position and token ids, slugs) are kept.
+  position and token ids, slugs) are kept, and so are observed prices and
+  times outside the trade rows.
+- **This departs from the parent tree's rules.**
+  [`../README.md`](../README.md) "Sanitization rules" allows only identifiers
+  "already published as examples in the official documentation, or synthetic
+  values", and monetary values that are "the documentation's example values or
+  small round numbers". These captures exist to pin live V2 shapes that the
+  documentation does not show, so they keep live public identifiers and
+  observed prices. `V2-9` (the migration plan) amends the parent README, or
+  replaces these values, when it claims this directory.
 - **Nothing here** came from an authenticated call, a wallet query or an order.
   No credential existed in the environment.
 - **The raw responses** are kept outside the repository, in the round's scratch

@@ -9,6 +9,11 @@
 - **Inferences** are marked **INF**.
 - **Safety:** every proposed package is PAPER-only, tested with fixtures and
   fakes, and touches no credential, signer or wallet.
+- **Round 1 (2026-10-05),** after the joint review of `2f4629a`: the A14 and
+  D6 owners; new row D18; `V2-1` acceptance 8; `V2-3` payouts; `V2-6`
+  rewritten (account trades out, a number policy, the approvals dependency,
+  the binding site, the dust floor); `V2-9`, `V2-11`; §5 item 5; §7.1 S4 and
+  S5, §7.2, §7.3 and §7.4; §8 (H-3 and option 1).
 
 ## 1. Classes, owners and status words
 
@@ -61,7 +66,7 @@ Class A is planned to the 2026-10-30 date, which the user named.
 | A11 | `packages/polymarket-public/src/venue/order-book.ts:119-131`, `packages/polymarket-public/src/venue/market-events.ts:67` (`z.object` decoders; D3 projection of declared fields) | Unknown keys are stripped, not refused | The V2 book's undocumented `"version":"v2"` (C-21) is ignored. No change; add a fixture test | `WP-070` | A, Dependent |
 | A12 | `apps/data-gateway/src/directory.ts:172` (`identityForToken`); `packages/polymarket-public/src/normalize/market-events.ts:218`, `:289-290` (`resolveIdentity(asset_id)`) | Maps every book, price-change, last-trade and tick-size event to a market by `asset_id` | Right once A1 admits `positionIds` (F-60). Other V2 frame types are unobserved (U-38) | `ROLLOVER-1`, `WP-120`, `WP-070` | A, Dependent (Verify: U-38) |
 | A13 | `packages/polymarket-public/src/normalize/market-events.ts:664-705` (`market_resolved`) | Matches `winning_asset_id` against the window's yes and no ids, giving `YES_WIN` or `NO_WIN`; otherwise `UNRESOLVED_MARKET` or `UNKNOWN_WINNING_TOKEN` | Whether a V2 `market_resolved` names the position id, or fires at all, is undocumented and unobserved (U-38). If it does not match, no resolution is published. ADR-030 then holds the window until an operator retires it (`apps/data-gateway/src/config.ts:393-404`; `feeds/series-admission.ts:800-833`), and the series cap fills. This fails closed, but stops admissions | `WP-070`, `ROLLOVER-1` | **A** (Verify: U-38) |
-| A14 | `packages/polymarket-public/src/market-state/door.ts:150-165` (six documented fields), `:340-343` (`isGammaMarketTradeReady`); `apps/data-gateway/src/feeds/market-lifecycle.ts:815`, `:892` | Lifecycle comes from Gamma `active`, `closed`, `acceptingOrders` and `archived`. Other scalars, `umaResolutionStatus` among them, are recorded and not interpreted | V2 adds `resolutionStatus` (F-54), which this door would record, not interpret. Whether V2 markets keep the four state fields is U-36 | `UNIV-4`/`WP-070` (door); `ROLLOVER-1`, `WP-120` (gateway) | A (Verify: U-36) |
+| A14 | `packages/polymarket-public/src/market-state/door.ts:150-165` (six documented fields), `:340-343` (`isGammaMarketTradeReady`); `apps/data-gateway/src/feeds/market-lifecycle.ts:815`, `:892` | Lifecycle comes from Gamma `active`, `closed`, `acceptingOrders` and `archived`. Other scalars, `umaResolutionStatus` among them, are recorded and not interpreted | V2 adds `resolutionStatus` (F-54), which this door would record, not interpret. Whether V2 markets keep the four state fields is U-36 | `ROLLOVER-1`, `WP-070` (door); `ROLLOVER-1`, `WP-120` (gateway) | A (Verify: U-36) |
 | A15 | `tools/bench/host/recorder_core.py:18-22`, `:233-243` | The host-bench recorder requires `clobTokenIds` and drops any window without it | Records nothing for a V2 window with `clobTokenIds: null` | No work-plan entry covers `tools/bench/host/**` (`HOST-BENCH-PREP` commits `0340727`, `4c27e0f`; `HOST-BENCH` lists `tools/host-bench/**`) | **A, Breaks** (bench tooling) |
 | A16 | `apps/research-worker/src/research-tier/identity.ts:79-80` (`TOKEN_KEYS`); `apps/backtest-cli/src/approximate/translate.ts:446-533` (token to configured market); `python/research/compaction/manifest.py:175` (`polymarket_token_ids`) | Read ids from recorded frames and configuration as opaque decimal strings | V2 ids are decimal strings of 75 digits (F-44), which these readers already accept (INF). Prove with a V2 fixture | `STORAGE-1`, `APPROX-REPLAY-1`, `WP-130` | A, Dependent |
 | A17 | `packages/domain/src/identifiers.ts:58-62` (`TokenIdSchema`: canonical unsigned integer, at most `MAX_IDENTIFIER_LENGTH`); `packages/domain/src/events/series-admission.ts:80-81`; `db/migrations/0002_catalog` (`catalog.market_tokens.token_id`) | Decimal ids | V2 position ids fit (F-44). **No change in a protected path is needed for PAPER** | `WP-020`, `WP-040` (protected) | A, None |
@@ -76,7 +81,7 @@ Class A is planned to the 2026-10-30 date, which the user named.
 
 | # | `file:line` | What it does today | What V2 changes | Owner | Class |
 | --- | --- | --- | --- | --- | --- |
-| C1 | `packages/oms/src/reconciliation/ports.ts:31-38`, `:136-141`; `packages/oms/src/reconciliation/door.ts:683-724` | The read surface names `/v2/positions` and `/v2/approvals`. The wire adapter is owed by the composition round | The adapter meets the `data` envelope, cursor pagination and `snake_case` (F-65, F-66). Whether `token_id` carries the position id for V2 holdings is U-45 | `WP-290`; the composition round | C |
+| C1 | `packages/oms/src/reconciliation/ports.ts:31-38`, `:136-141`; `packages/oms/src/reconciliation/door.ts:683-724` | The read surface names `/v2/positions` and `/v2/approvals`. The wire adapter is owed by the composition round | The adapter meets the `data` envelope, cursor pagination and `snake_case` (F-65, F-66). Sizes are JSON doubles, and holdings under 0.1 shares are hidden by default (F-77; U-47). Whether `token_id` carries the position id for V2 holdings is U-45 | `WP-290`; the composition round | C |
 | C2 | `apps/ops-cli/src/emergency/venue-truth.ts:31-33`, `:149-190`; `commands/account-snapshot.ts:9`; `commands/reconcile.ts:141` | Reads `/v2/positions` and `/v2/approvals` only | The same adapter duties as C1 | `WP-330` | C |
 | C3 | `packages/polymarket-secure/package.json:18` (`"@polymarket/client": "0.11.0"`) | The SDK is pinned exactly | "Upgrade … (0.12.0 or later)" (F-37). 0.11.0 lacks `CONDITIONAL-V2` (F-53), and its position operations select by which ids are present (F-74). The upgrade changes `pnpm-lock.yaml` (protected) | `WP-260` | C |
 | C4 | `packages/polymarket-secure/src/sdk-port.ts:17-29` (a `Pick` of 10 members) | A breaking SDK type change fails `typecheck` by design | No export was removed in 0.12.0 (§S.2). None of the 10 members returns account trade pages, whose `transactionHash` became optional (INF) | `WP-260` | C |
@@ -102,7 +107,7 @@ Class A is planned to the 2026-10-30 date, which the user named.
 | D3 | `test/contract/polymarket-public/fixtures/series-window.json` (V1 only); `series-window.test.ts:74` | A V1 capture | Add V2 cases from `test/fixtures/venue/protocol-v2/` | `ROLLOVER-1`, `WP-070` | D (with A1-A4) |
 | D4 | `packages/universe/src/testing/series-admission.ts:113`; `packages/universe/src/series-admission.test.ts:126-129` | The testkit builds `clobTokenIds` candidates only | V2 candidates: `positionIds` with `clobTokenIds` null, with both populated, and with `version` missing or unknown | `ROLLOVER-1`, `WP-110` | D (with A1) |
 | D5 | `test/integration/data-gateway/rollover-1-series-admission.test.ts:98`, `:360`, `:537` | Reads `clobTokenIds` from fixture markets | Select by version | `ROLLOVER-1`, `WP-120` | D (with A1) |
-| D6 | `test/contract/polymarket-public/fixtures/gamma-market-by-id.json:157`; `gamma-market-state.test.ts:296`, `:318-323` | Treats `version` as an undocumented extra key | `version` and `positionIds` are now documented (E-23); `resolutionStatus` is not (C-18). The fixture's notes are stale | `UNIV-4`, `WP-070` | D |
+| D6 | `test/contract/polymarket-public/fixtures/gamma-market-by-id.json:157`; `gamma-market-state.test.ts:296`, `:318-323` | Treats `version` as an undocumented extra key | `version` and `positionIds` are now documented (E-23); `resolutionStatus` is not (C-18). The fixture's notes are stale | `ROLLOVER-1`, `WP-070` | D |
 | D7 | `test/fixtures/venue/positions/split-merge-redeem.json:16-90`; `test/contract/wallet-operations/split-merge-redeem-fixtures.test.ts:148`; `venue-citations.test.ts:68`, `:85` | CTF only | Add V2 Router and PositionManager cases (F-73) | `WP-000` (fixtures); `WP-300` (contract tests) | D |
 | D8 | `test/fixtures/venue/market-ws/lifecycle.json`; `apps/ops-cli/src/verify-venue/checks.ts:960-1000` (strict `new_market` with `clob_token_ids`) | No V2 frames. The strict schema applies to fixtures only | Add V2 frames once observed (U-38); add the V2 `book` frame with `version` | `WP-000` (`apps/ops-cli/src/verify-venue/**`) | D |
 | D9 | `apps/ops-cli/src/verify-venue/fixtures.test.ts:265-272` | Every `.json` under `test/fixtures/venue/` must be claimed by one check | It is why `protocol-v2/` uses `.jsonc` and `.jsonl` (report §15). Add a check that claims them, then rename them to `.json` | `WP-000` (`apps/ops-cli/src/verify-venue/**`) | D |
@@ -114,8 +119,9 @@ Class A is planned to the 2026-10-30 date, which the user named.
 | D15 | `docs/runbooks/emergency.md:102-110` (says the wire lexeme of a V2 position id is undocumented, citing U-13); `apps/ops-cli/src/emergency/grammar.test.ts:233` (asserts the U-13 citation); `docs/runbooks/signer.md:18`, `:373` (the pin) | Documentation | U-13 is resolved (decimal). The pin moves with C3 | `WP-330`, `WP-260` | D |
 | D16 | `packages/universe/src/series-admission.ts:31-49` (header venue table, F-01 `clobTokenIds`); `packages/polymarket-public/src/series-window/door.ts:12-28`; `packages/polymarket-public/src/market-state/door.ts:57-63` | Documentation in code | Update with A1-A3 | `ROLLOVER-1`, `WP-070` | D |
 | D17 | `IMPLEMENTATION_STATUS.md` (`V3-E15-DATA-API-V1-SUNSET`; the "Venue drift carried forward" U-15 line) | Brief items | V3-E15: nothing calls v1 at `ab5033a` (B1). U-15: resolved (report §12) | the orchestrator | D |
+| D18 | `packages/settlement/src/payout.ts:56`, `:73-86`, `:121-130` (`YES_WIN`, `NO_WIN`, `SPLIT_50_50` at `"0.5"` each); `packages/risk/src/worst-case.ts:14`, `:67-70` | Models win, lose and the 50/50 split only, from the 2026-08-28 resolution pages | New on S-D13 line 92 (F-73, E-22): "A binary market can resolve to a split payout instead of a full `$1` or `$0`, in which case each side redeems for its share". The page states no ratio, and this plan infers none. Whether a split other than 50/50 exists for our series is for the settlement review. Until then `V2-3` refuses every payout vector except `[1000000,0]` and `[0,1000000]`. The review is proposed under `V2-11` | `WP-110` (`packages/settlement/**`), `WP-180` (`packages/risk/**`) | D |
 
-**Rows: A 17, B 1, C 16, D 17.**
+**Rows: A 17, B 1, C 16, D 18.**
 
 ## 4. Proposed migration packages
 
@@ -141,8 +147,9 @@ reasons in §7.
 
 - **Goal:** the dated ADR amendments of §5, items 1-3. Also the SDK-scope ADR
   (§7.3), **only if the user overrules this plan's recommendation** for the
-  public surfaces. The orchestrator writes them; this plan only lists what
-  each must decide.
+  public surfaces; and the approvals exception (§5 item 5), **only if** no
+  stable SDK release reads `/v2/approvals` when `V2-6` starts. The
+  orchestrator writes them; this plan only lists what each must decide.
 - **Allowed paths:** `docs/adr/ADR-030-*.md`, `docs/adr/ADR-033-*.md`,
   `docs/adr/ADR-009-*.md`, `docs/adr/README.md`, and
   `docs/handoffs/V2-0.md`.
@@ -183,8 +190,11 @@ reasons in §7.
      window built from the documented example.
   7. Every V1 fixture and test passes unchanged. The V1 admission output is
      byte-identical on `series-window.json`.
-  8. CLOB `v` is read only as a labelled cross-check (C-21). If it disagrees
-     with Gamma `version`, the window is refused.
+  8. CLOB `v` is read only as a labelled cross-check (C-21). If it is
+     present and disagrees with Gamma `version`, the window is refused. An
+     absent `v` alone does not refuse, because the plan relies on no
+     undocumented field (§6). Tests cover all three cases: present and
+     equal, present and different, and absent.
 - **Gate:** review, by two verifiers. **Deadline:** 2026-10-20.
 
 ### V2-2: the market-data path and recorded-data readers (class A)
@@ -234,6 +244,10 @@ reasons in §7.
   2. It **journals the raw body before deriving** (ADR-030 Decision 3.1).
   3. A row with `status` `"resolved"` and `payouts` `[1000000,0]` or
      `[0,1000000]` is mapped to YES or NO by index (F-40: index 0 is YES).
+     The door reads the raw wire tuple, in integer micro-USDC per share
+     (F-57). The SDK's normalized form is collateral units, `["1","0"]`
+     (F-78), and never reaches this door; a test proves that a
+     collateral-unit tuple is refused, not read a millionfold low.
   4. Any other row, or a disagreement with a `market_resolved` frame, raises
      the existing unresolved-window incident and publishes nothing.
   5. Whether a mapped row may itself publish `MarketResolved`, or may only
@@ -287,28 +301,70 @@ reasons in §7.
   7. The ops-cli bundle builds and loads (`app-bundles-load.test.ts`).
 - **Gate:** security review, by two verifiers.
 
-### V2-6: account reads on the SDK (class C; the `WP-290` and `WP-330` lines)
+### V2-6: Data API account reads on the SDK (class C; the `WP-290` and `WP-330` lines)
 
-- **Goal:** C1 and C2, on the SDK inside `packages/polymarket-secure` (§7, S4).
+- **Goal:** C1 and C2, the `readPositions` and `readApprovals` halves of
+  `AccountReadPort`, on the SDK inside `packages/polymarket-secure` (§7.1
+  S4). Account trades are not in it: `listTrades` stays on CLOB
+  `/data/trades` (S4(a)).
 - **Allowed paths:**
-  - a new `packages/polymarket-secure/src/account-reads/**`;
-  - the composition wiring in `packages/oms/src/reconciliation/**` and
-    `apps/ops-cli/src/emergency/**`;
+  - a new `packages/polymarket-secure/src/account-reads/**`, the adapter,
+    which satisfies the `oms` port structurally;
+  - `test/fault-injection/reconciliation/port-conformance.test.ts` (the
+    `WP-290` line), extended to prove at compile time that the adapter
+    satisfies those two `AccountReadPort` methods;
+  - `packages/oms/src/reconciliation/ports.ts`, for **port shapes only**, and
+    only if a shape must change. `packages/oms` is layer 1 and "may not
+    import `packages/polymarket-secure`" (`ports.ts:21-23`); a composition
+    root binds its ports (`:7`). No wiring goes into `packages/oms`;
+  - `apps/ops-cli/src/emergency/**`, the one binding site in the repository:
+    its `EmergencyVenueFactory` turns a credential into the reads
+    (`apps/ops-cli/src/emergency/ports.ts:32-38`). "No live binding exists in
+    this repository: the live composition binds them after ADR-033 D5 and the
+    live-micro gate" (`:37-38`), and `V2-6` adds none;
   - their tests, and `docs/handoffs/V2-6.md`.
-- **Depends on:** `V2-5`. Also a release that carries the approvals read, or a
-  hand-written `GET /v2/approvals` inside `polymarket-secure`; that is a plain
-  public GET, not signing.
+- **Depends on:**
+  - `V2-5`;
+  - **for the approvals half,** a stable SDK release whose public API reads
+    `/v2/approvals`. Today only the canary's `fetchTradingApprovalsState`
+    does, and it returns only the approvals missing from the SDK's own
+    catalog. In 0.11.0 and 0.12.0 the method of that name reads on chain at
+    the environment's RPC, by default `https://polygon.drpc.org` (report §S.2),
+    so it must never stand behind the `/v2/approvals` tag.
+  - **No hand-written `GET /v2/approvals` inside `polymarket-secure`.** Handoff
+    §9.12 says "Wrap only the official unified SDK", and ADR-033 D5 calls a
+    request the secure package sends itself "a reviewed, named exception to
+    'wrap only the SDK'". `polymarket-secure/src` has no such request today.
+    If the release is not out when `V2-6` starts, the approvals half waits,
+    or `V2-0` writes the ADR of §5 item 5 and `V2-6` depends on it.
 - **Acceptance:**
-  1. `/v2/positions` is walked to `next_cursor: null`, with the filters re-sent
-     on every page (F-66).
-  2. Every size is re-validated as a canonical decimal; an exponent form is
-     refused.
+  1. `/v2/positions` is walked to `next_cursor: null`, with the filters
+     re-sent on every page (F-66).
+  2. **Numbers, under the policy of §7.1 S4.** A size is accepted only in the
+     domain D: a canonical non-negative decimal with at most 6 fractional
+     digits and at most 15 significant digits. Anything else is a malformed
+     read, never an empty one. Tests, through fake `fetch` bodies:
+     - every value of D round-trips unchanged through the SDK path (a full
+       range plus a seeded random sample, as in the report's F-78 probe);
+     - the lexemes `1e3` and `1E3` are accepted as `"1000"`. They denote the
+       same double, and the exponent form cannot be seen after the SDK parse;
+     - `0.123456789012345678`, `0.1234567`, `1e-7`, `1e21`,
+       `12345678901234567`, `123456789012.123456` and `5.263157894736842` are
+       each refused, whatever string the SDK makes of them;
+     - a CLOSED-arm "~0 residual" outside D is refused, not rounded to zero
+       (F-77).
   3. Condition ids are padded to 32 bytes before any call.
   4. A row whose `token_id` is neither the version-selected id nor a known V1
      id is refused (U-45).
-  5. The SDK's hidden 429 retries are counted against the §9.13 read budget.
-  6. Every test uses fakes behind the tripwire. No live call is made.
-- **Gate:** automated, with security review for the wiring.
+  5. **The dust floor** (F-77). The read sends `filterType: "TOKENS"` and
+     `filterAmount: 0`. Until U-47 shows that the venue honours 0, the
+     adapter states that holdings under 0.1 shares may be missing from the
+     read.
+  6. The SDK's hidden 429 retries are counted against the §9.13 read budget.
+  7. The SDK's `listTrades` (Data API `/v2/trades`) is never bound to
+     `AccountReadPort.listTrades` (S4(a)).
+  8. Every test uses fakes behind the tripwire. No live call is made.
+- **Gate:** automated, with security review for the binding.
 
 ### V2-7: inventory and wallet operations (class C; the `WP-300` line)
 
@@ -356,6 +412,16 @@ reasons in §7.
      with their sidecars, leaving the fixtures' bytes and digests unchanged.
   2. A V2 `book` frame and V2 Router fixtures are added.
   3. The heartbeat fixture's notes cite C-20.
+  4. **The parent fixture rules.** `test/fixtures/venue/README.md`
+     ("Sanitization rules") allows only documentation-example or synthetic
+     identifiers, and documentation-example or small round monetary values.
+     `protocol-v2/` keeps live public identifiers and observed prices (report
+     §15). Either the parent README gains a dated, scoped exception for
+     sanitized live public captures, or the values are replaced.
+  5. In any trade or activity fixture, the check refuses a cursor that
+     decodes to a feed seek anchor, and a wallet, name or hash that is not a
+     labelled synthetic value. It also refuses a sidecar whose redactions do
+     not list `timestamp` and `next_cursor` (report §15).
 - **Gate:** automated.
 
 ### V2-10: simulation fill fidelity (class D; the `STORAGE-1` and `WP-210` line)
@@ -372,8 +438,10 @@ reasons in §7.
 
 ### V2-11: documents and registers (class D)
 
-- **Goal:** D13, D14, D15 and D17. Also the register rows: C-18…C-23 and
-  U-35…U-46, with U-13, U-15, U-22 and U-33 resolved.
+- **Goal:** D13, D14, D15, D17 and D18 (the settlement review records the
+  documented binary split payout without inferring a ratio). Also the
+  register rows: C-18…C-23 and U-35…U-47, with U-13, U-15, U-22 and U-33
+  resolved.
 - **Allowed paths:** `docs/contracts/protected-contracts.md`,
   `docs/settlement/**`, `docs/runbooks/**`, `IMPLEMENTATION_STATUS.md` and
   `docs/handoffs/V2-11.md`.
@@ -416,11 +484,22 @@ reasons in §7.
    are micro-USDC per share (F-57). The settlement spec's evidence source then
    changes, and so does the U-11 note.
 3. **ADR-033.** A dated note of D5's venue facts (§8): H-1 to H-3, C-20 and
-   U-40. D2's provisional contract (the `/v1/heartbeats` shapes) stands. If the
-   ruling picks `POST /heartbeats`, which carries no id, D1, D2 and D6 change:
-   D6 defines "Confirmed" as "a success response that carries the next id".
+   U-40. The documented route of the 10 s cancellation is `/v1/heartbeats`
+   (H-3), so D2's provisional contract (the `/v1/heartbeats` shapes) stands.
+   If the ruling picks `POST /heartbeats`, which carries no id, D1, D2 and D6
+   change: D6 defines "Confirmed" as "a success response that carries the
+   next id".
 4. Only if the user overrules §7's recommendation: a new ADR amending handoff
    §9.12 and F6 (§7.3).
+5. Only if no stable SDK release reads `/v2/approvals` when `V2-6` starts:
+   an ADR naming one unsigned, credential-free `GET /v2/approvals` inside
+   `packages/polymarket-secure` as an exception to handoff §9.12's "Wrap only
+   the official unified SDK". It must decide the exception's scope (that one
+   route, read only), its transport rules (timeout, no retry beyond the §9.13
+   budget, the response journaled or not), its exact-number handling (the
+   route's `amount` is a string, F-77), and when it lapses (the first stable
+   release that reads the route). ADR-033 D5 option 1 would be a second such
+   exception, so the two should be decided together.
 
 No change is needed to ADR-010 §4, ADR-004, ADR-020 or ADR-023 under this
 plan's recommendation.
@@ -564,17 +643,55 @@ prices.**
   change on this path is nil (F-60, F-62).
 
 **S4. Data API v2.**
-- **What the SDK offers:** `listPositions` (`/v2/positions`), `listTrades`,
-  `listActivity`, `fetchResolutions`, open interest, holders and price
-  history.
+- **What the SDK offers:** `listPositions` (`/v2/positions`), `listTrades`
+  (`/v2/trades`), `listActivity`, `fetchResolutions`, open interest, holders
+  and price history.
   - The `{data, pagination}` envelope is unwrapped, and filters are re-sent on
     every page.
-  - `/v2/approvals` exists only in the canary (§S.2-§S.3).
+  - `/v2/approvals` is read only by the canary's `fetchTradingApprovalsState`.
+    In 0.11.0 and 0.12.0 that method reads on chain through a third-party RPC
+    instead (report §S.2-§S.3).
 - **V2:**
   - condition ids are padded for positions, resolutions, open interest and
     holders, but not for trades and activity (§S.3);
-  - resolution `status`, `reporter` and `payouts` are modelled, as closed
-    enums.
+  - resolution `status` and `reporter` are closed enums (bindings
+    `data/resolutions.ts` lines 32, 58);
+  - **`payouts` is a two-element tuple, converted in units.** On the wire it
+    is two non-negative integers in micro-USDC per share, `[1000000,0]`
+    (F-57, F-59). The SDK turns them into collateral-unit decimal strings,
+    `["1","0"]` (F-78). A reader must know which form it holds: one is a
+    million times the other.
+- **Numbers.** The Data API types sizes and prices as JSON `number`,
+  `format: double` (F-77). The SDK parses the body with `response.json()` and
+  turns each number into `String(value)` (F-78). So the lexeme is gone before
+  any adapter sees it: `1e3` arrives as `"1000"`, and `0.123456789012345678`
+  as `"0.12345678901234568"`. Re-validating the string afterwards cannot
+  refuse an exponent form or detect a lost digit. The plan therefore promises
+  no lexeme check on this path. It states the numeric domain instead (`V2-6`
+  acceptance 2):
+  - **The domain D:** a canonical non-negative decimal with at most 6
+    fractional digits and at most 15 significant digits. Six decimals is the
+    venue's base unit: "`1_000_000` is one pUSD or one share" (F-73).
+  - **Why it is exact (INF, checked by the F-78 probe).** A double keeps 15
+    significant decimal digits, and ECMAScript prints a double in its shortest
+    round-trip form. So each member of D is the SDK string of every lexeme
+    that denotes its nearest double, and of nothing else. A double that is not
+    the nearest double of a member of D prints outside D, and is refused. A
+    string in D therefore cannot hide another value of D.
+  - **What it gives up.** Two lexemes of one double (`1e3` and `1000`) cannot
+    be told apart. Under the documented `double` type they are one value, so
+    nothing documented is lost. A value finer than 10^-6, or longer than 15
+    significant digits, is refused, never rounded. The CLOSED arm's "~0
+    residual" (F-77) may be such a value; its exact form is undocumented.
+  - **Prices are not read.** The port reads `tokenId` and `size` only
+    (`packages/oms/src/reconciliation/ports.ts:136`). `avg_price` and the
+    other ratios are never a money authority on this path.
+  - **The alternative.** Exact lexemes need a boundary before
+    `response.json()`: the raw-capture shim of §7.3 item 2, and that ADR. The
+    plan does not recommend it for `V2-6`.
+- **The dust floor.** `/v2/positions` omits holdings under 0.1 shares unless
+  `filter_amount` lowers the floor, and whether `0` is honoured is U-47 (F-77,
+  F-78).
 - **Raw bodies:** **no.**
 - **Control:**
   - Data API reads are wrapped in `withRateLimitRetry`: two retries, waiting
@@ -584,14 +701,27 @@ prices.**
   - no rate-limit headers are visible for the Data API client.
 - **Cost:** none inside `polymarket-secure`, which already depends on the SDK.
 - **Recommendations:**
-  - **(a) Account-truth reads** (positions, approvals, account trades) for
+  - **(a) Account-truth Data API reads, positions and approvals,** for
     reconciliation and the emergency CLI: **adopt, inside
     `packages/polymarket-secure`**, behind the existing `AccountReadPort`
-    (`V2-6`). No §9.12 or F6 change is needed: the port is already "the secure
-    adapter's authenticated reads" (`packages/oms/src/reconciliation/ports.ts:11`),
-    and `apps/ops-cli` already depends on `polymarket-secure`. Conditions:
-    re-validate decimals, pad condition ids, and count the hidden 429 retries
-    in the budget.
+    (`V2-6`). The port is already "the secure adapter's authenticated reads"
+    (`packages/oms/src/reconciliation/ports.ts:11`), and `apps/ops-cli`
+    already depends on `polymarket-secure`. Conditions: the numeric domain
+    above, padded condition ids, the hidden 429 retries counted in the budget,
+    and the approvals half only on a stable release that reads
+    `/v2/approvals` (`V2-6` "Depends on").
+  - **Account trades are not a Data API read.** `AccountReadPort.listTrades`
+    is `/data/trades`, returning `VenueTradeView`, which needs a trade id, a
+    status and the account's own legs with order id and maker or taker role
+    (`ports.ts:35`, `:100-122`, `:134-135`). The SDK's `listTrades` calls Data
+    API `/v2/trades` (client `actions/activity.ts` lines 139-151), and its
+    `Trade` has none of those fields (bindings `data/activity.ts` lines
+    389-432). It must never back that port. The matching SDK method is
+    `listAccountTrades`, an authenticated CLOB read of `/data/trades` (client
+    `actions/account.ts` lines 337-347), whose `ClobTrade` carries `id`,
+    `status`, `takerOrderId`, `traderSide` and `makerOrders`, with `price` and
+    `size` as strings (F-78). It belongs with S5, and its adapter is owed by
+    the composition round that binds `AccountReadPort` (C1).
   - **(b) The gateway's public `/v2/resolutions` read** (`V2-3`): **keep
     hand-written** in `packages/polymarket-public`. It derives resolution
     events, so its raw body must be journaled first, as in S1.
@@ -599,7 +729,9 @@ prices.**
 **S5. The authenticated surfaces already in `polymarket-secure`.**
 - **What the SDK offers:** `createLimitOrder`, `postOrder(s)`, the cancels,
   `fetchOrder` and `account`, through a 10-member port
-  (`packages/polymarket-secure/src/sdk-port.ts:17-29`).
+  (`packages/polymarket-secure/src/sdk-port.ts:17-29`). Account trades
+  (`listAccountTrades`, `/data/trades`; S4(a)) would join that port when the
+  composition round binds `AccountReadPort.listTrades`.
 - **V2:** routing by the id's bits (F-47); `CONDITIONAL-V2` only from 0.12.0
   (F-53).
 - **Raw bodies:** no.
@@ -623,7 +755,8 @@ prices.**
 | S1 Gamma | Keep hand-written; the SDK may serve as a test-only oracle | No raw body to journal; fields the door reads are dropped; no V2 selection |
 | S2 Public CLOB | Keep hand-written | No raw body; `clob-markets` fields dropped and silently defaulted |
 | S3 Market WebSocket | Keep hand-written | Frames dropped silently and reconnects hidden: breaks the WAL and ADR-023 |
-| S4a Account-truth Data API reads | **Adopt, inside `polymarket-secure`** | Envelope, cursor and `snake_case` handled; no §9.12 or F6 change |
+| S4a Account-truth Data API reads (positions, approvals) | **Adopt, inside `polymarket-secure`**, under the numeric domain; approvals only on a stable release that reads `/v2/approvals` | Envelope, cursor and `snake_case` handled; no §9.12 or F6 change while the reads stay on the SDK |
+| Account trades (`/data/trades`) | On the SDK's `listAccountTrades` (S5), never the Data API `listTrades` | The Data API `Trade` has no trade id, status, order id or role |
 | S4b Gateway `/v2/resolutions` | Keep hand-written | It derives events: journal before derive |
 | S5 Authenticated | Keep on the SDK, upgrade to 0.12.x | `CONDITIONAL-V2` and version-selected position operations |
 
@@ -641,9 +774,11 @@ S1-S3** (INF):
 
 ### 7.3 The governance a change of scope needs
 
-The recommendation above needs **no** change to §9.12 or F6. If the user
-nonetheless wants `packages/polymarket-public` or the gateway to use the SDK's
-`PublicClient`, an ADR amending handoff §9.12, F6 and ADR-010 §4 must decide:
+The recommendation above needs **no** change to §9.12 or F6, provided every
+read in `polymarket-secure` stays on the SDK. A hand-written approvals request
+there would need the ADR of §5 item 5. If the user nonetheless wants
+`packages/polymarket-public` or the gateway to use the SDK's `PublicClient`,
+an ADR amending handoff §9.12, F6 and ADR-010 §4 must decide:
 
 1. **Scope:** which packages may import which SDK entry points. For example,
    `PublicClient` only, with no signer, no `SecureClient` and no
@@ -678,8 +813,9 @@ nonetheless wants `packages/polymarket-public` or the gateway to use the SDK's
 - **Class B needs no SDK work** (B1).
 - **Class C lands on the SDK:**
   - `V2-5` upgrades it;
-  - `V2-6` implements the account-truth Data API reads on it, inside
-    `polymarket-secure`;
+  - `V2-6` implements the positions and approvals reads on it, inside
+    `polymarket-secure`, under the numeric domain of §7.1 S4; account trades
+    stay on `/data/trades`;
   - `V2-7` and `V2-8` use the upgraded SDK's `CONDITIONAL-V2` and
     version-selected position operations, through the secure package's port.
 - **If the user overrules §7.2 for S1-S3:** `V2-0` gains the §7.3 ADR. `V2-1`
@@ -701,8 +837,15 @@ nonetheless wants `packages/polymarket-public` or the gateway to use the SDK's
     keyed `error`;
   - `POST /heartbeats`: no body; a `200` with `{status: "ok"}`.
 
-  The guide documents only the first, and keys its `400` `error_msg`. Which
-  route arms the 10 s cancel is undocumented (C-20, U-40).
+  The guide documents only the first, keys its `400` `error_msg`, and ties
+  the 10 s cancellation to it: "If a valid heartbeat is not received within 10
+  seconds, all open orders owned by those CLOB API credentials are canceled",
+  then "Send an empty `heartbeat_id` to `POST /v1/heartbeats`" (S-D20 lines
+  1486-1497). The OpenAPI puts "all open orders for the user will be
+  automatically canceled" on both operations (S-O02 lines 4115, 4162).
+  **So the documented route of the 10 s cancellation is `/v1/heartbeats`.**
+  Still open: `/heartbeats`' timing and its relation to `/v1/heartbeats`
+  (U-40), and the `400` key (C-20).
 - **V2.** Nothing in Protocol V2 changes the heartbeat. Whether it protects
   ExchangeV3 orders is unstated (U-40; INF: yes, since it is per credential).
 
@@ -713,9 +856,12 @@ nonetheless wants `packages/polymarket-public` or the gateway to use the SDK's
      (H-2), so it needs no hand-written signing. It is still the reviewed,
      named exception to "wrap only the SDK", because it sends its own HTTP
      request.
-   - **Still open:** the route (C-20). `/v1/heartbeats` fits ADR-033 D1, D2
-     and D6 as written. `/heartbeats` would amend D6's "Confirmed". The `400`
-     key must be read as either `error_msg` or `error`.
+   - **The route is documented:** `/v1/heartbeats` carries the 10 s
+     cancellation and the id (H-3), and it fits ADR-033 D1, D2 and D6 as
+     written.
+   - **Still open:** the `400` key, which must be read as either `error_msg`
+     or `error` (C-20). Only a ruling that chose `/heartbeats` instead would
+     meet its undocumented timing (U-40) and amend D6's "Confirmed".
 2. **Wait for SDK support, and ask upstream.** **What changed:** nothing. 0.12.0
    and the canary have no method, and no official page announces one. Every
    live-signer mode stays blocked meanwhile.

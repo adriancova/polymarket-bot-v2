@@ -13,12 +13,14 @@
     "proxy_wallet: replaced with a synthetic, labelled address 0x00…<page><row> (all leading zeros)",
     "name, pseudonym: replaced with synthetic-name-p<page>-r<row> and synthetic-pseudonym-p<page>-r<row>",
     "bio, profile_image, profile_image_optimized: replaced with empty strings",
-    "transaction_hash: replaced with a synthetic 0x00…<page><row> hash (the real hash identifies the trading wallet on chain)",
-    "size: replaced with a synthetic 10 × <row> (with the kept timestamp and price, the real size could locate the trade, and so the wallet, on chain)",
-    "every other byte (market fields, prices, timestamps, pagination and its cursor) is unchanged; the replacement is textual, so key order and number formatting are the venue's"
+    "transaction_hash: replaced with a synthetic 0x00…<page><row> hash (the real hash names the trading wallet on chain)",
+    "size: replaced with a synthetic 10 × <row> (the real size, with the market, side and price, could single the trade out)",
+    "timestamp (round 1): replaced with a synthetic epoch second, 1700000001 + the rank of the real value among the four rows of both pages, so the rows keep their order and ties (the real block timestamp could single the trade out of the market's public trade feed)",
+    "pagination.next_cursor (round 1): replaced with the labelled synthetic value synthetic-cursor-trades-p<page>-next. The real cursors are signed and opaque, but a feed cursor carries the seek anchor of the last row (S-O06: 'The trades/activity feed cursors carry only the seek anchor and page size'), and a GET of the real page-2 URL returned the unredacted page byte for byte (VENUE-4 round-1 review)",
+    "every other byte (market fields, side, outcome, prices, the rest of the pagination object) is unchanged; the replacement is textual, so key order and number formatting are the venue's"
   ],
   "authenticated": false,
-  "notes": "GET /v2/trades?condition=<V1 window>&limit=2. Personal data replaced (see redactions).",
-  "fixture_bytes": 1771,
-  "fixture_sha256": "6afc9145d55c616b00c2ab872215dc813ab3774e3aed2f2ad6e319602948f591"
+  "notes": "GET /v2/trades?condition=<V1 window>&limit=2. Personal data, timestamps and the cursor replaced (see redactions).",
+  "fixture_bytes": 1626,
+  "fixture_sha256": "2cfe6934c07042de3e25066646a9dd7c5f17b32c56f3492385f855eaeeb1abc7"
 }
