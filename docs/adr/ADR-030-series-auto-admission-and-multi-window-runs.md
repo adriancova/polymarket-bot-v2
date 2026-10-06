@@ -588,11 +588,16 @@ CTF ids (plan A1).
     reading never shows that the field is absent or `null`, and ruling 3
     keeps a malformed value final. A `"v1"` window whose `clobTokenIds`
     reads `null` is therefore refused at once, as `V2-1` refused it
-    (Decision 1.5; `V2-3` r1, V23-R1-CODEX-01). Only a `"v2"` window's
-    `positionIds`, which the door reads as absent, `null` or of another
-    type, is held until the open. Holding a `"v1"` field known to be absent
-    or `null` needs that door to tell the three apart; that change is
-    outside `V2-3`'s paths and was not made.
+    (Decision 1.5; `V2-3` r1, V23-R1-CODEX-01).
+  - A `"v2"` window's `positionIds` is held until the open only when the
+    door reads it as absent or `null`; read as another type, it is refused
+    at once.
+  - **Open for `"v1"`** (`V2-3` r2, I-1): ruling 1 is not met for `"v1"`.
+    Holding a `"v1"` field known to be absent or `null` needs the door to
+    tell absent, `null` and another type apart. That change is outside
+    `V2-3`'s paths and was not made. It awaits either a grant of that door
+    or a ruling that narrows ruling 1 for `"v1"`; until then, `"v1"` fails
+    closed, as above.
 - **Why it fails closed:** a not-yet-admissible window is never admitted, and
   holds no cap slot. Once its ids arrive, it is judged in full, exactly as at
   first sight. Past its open, the refusal is final, as before.
