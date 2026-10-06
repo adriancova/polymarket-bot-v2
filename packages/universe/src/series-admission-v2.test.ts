@@ -183,7 +183,7 @@ describe("V2-1 acceptance 2: each unclear window is REFUSED, by name", () => {
     refusedFor(judgeV2({ positionIds: { kind: "UNREADABLE", detail: "an object" } }), /is not an array of decimal strings \(an object/u);
   });
 
-  it('"v1" with clobTokenIds absent, null or not a string: not yet available — never a fall-back to positionIds (V2-3 r1: still refused at once, the reading being unclear)', () => {
+  it('"v1" with clobTokenIds absent, null or not a string: not yet available — never a fall-back to positionIds (V2-3: still refused at once and for good — the hold for ids not yet available is narrowed to "v2")', () => {
     refusedFor(
       judgeV1({ clobTokenIds: null, positionIds: { kind: "VALUE", value: [CANARY_UP, CANARY_DOWN] } }),
       /Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string: the window's ids are not yet available \(F-40\)/u,

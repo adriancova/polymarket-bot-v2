@@ -3,20 +3,22 @@
  * orchestrator's interim ruling for PAPER and BACKTEST; `V2-1`'s known risk
  * V21-FABLE-03): the judge's `NOT_YET_ADMISSIBLE`.
  *
- * - A window whose ACCEPTED `version` selects an id field that is absent or
- *   `null` — and that matches in every other respect — is neither admitted
- *   nor refused: the verdict names the cause a final refusal would, and the
- *   window's scheduled open (the gateway refuses it finally at or after that
- *   open; the gateway suite pins that part).
+ * - A `"v2"` window whose ACCEPTED `version` selects a `positionIds` that is
+ *   absent or `null` — and that matches in every other respect — is neither
+ *   admitted nor refused: the verdict names the cause a final refusal would,
+ *   and the window's scheduled open (the gateway refuses it finally at or
+ *   after that open; the gateway suite pins that part).
  * - Every other refusal reason stays a `REFUSE`, including beside missing ids.
- *   A `"v1"` window's `clobTokenIds` read as `null` stays one too (r1,
- *   V23-R1-CODEX-01): the series-window door reads absent, `null` and another
- *   type alike, so that reading never shows the ids are merely not yet given.
+ * - The hold is narrowed to `"v2"` (the orchestrator's interim ruling,
+ *   2026-10-06; `V2-3` r3, I-1). A `"v1"` window's `clobTokenIds` read as
+ *   `null` — absent, `null` or another type, which the series-window door
+ *   reads alike — is a `REFUSE` at once, and the refusal names the narrowing.
  * - The ids, once filled, are judged in full: the admission is the one a
  *   window with its ids at first sight gets.
  *
  * Each `it` on a not-yet verdict fails at the base `51c0213`, whose judge
- * refuses all of these; the CODEX-01 pin fails at `d2d0441`, which held it.
+ * refuses all of these; the `"v1"` pin fails at `d2d0441`, which held it, and
+ * at `15bcb4f`, whose refusal did not name the narrowing.
  */
 
 import { describe, expect, it } from "vitest";
@@ -109,10 +111,11 @@ describe("V2-3 item 7: ids not yet available are NOT YET ADMISSIBLE — not admi
     expect(JSON.stringify(verdict)).not.toContain(RECORDED_WINDOW.yesTokenId);
   });
 
-  it('V23-R1-CODEX-01: "v1" with clobTokenIds read as null — absent, null OR another type, which the door does not tell apart — is REFUSED at once, never held: a malformed value stays final', () => {
+  it('I-1 (the hold narrowed to "v2", 2026-10-06): "v1" with clobTokenIds read as null — absent, null OR another type — is REFUSED at once and for good, never held, and the refusal names the narrowing', () => {
     const verdict = judgeV1({ clobTokenIds: null, positionIds: { kind: "VALUE", value: [CANARY_UP, CANARY_DOWN] } });
+    expect(verdict.verdict).toBe("REFUSE");
     expect(refusal(verdict)).toMatch(
-      /Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string: the window's ids are not yet available \(F-40\) or unreadable; the series-window door does not tell these apart, so a "v1" window is refused at once/u,
+      /Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string: the window's ids are not yet available \(F-40\) or unreadable; a "v1" window is refused at once and for good: the hold for ids not yet available is narrowed to "v2" \(ADR-030 Decision 1\.5; Amendment 2 rule 1, note of 2026-10-06, as narrowed by the orchestrator's interim ruling of 2026-10-06\)/u,
     );
     expect(JSON.stringify(verdict)).not.toContain(CANARY_UP);
   });
@@ -123,7 +126,7 @@ describe("V2-3 item 7: ids not yet available are NOT YET ADMISSIBLE — not admi
     expect(v2({ kind: "ABSENT" })).toMatchObject({ ok: false, version: "v2", idsNotYetAvailable: true });
     expect(v2({ kind: "NULL" })).toMatchObject({ ok: false, version: "v2", idsNotYetAvailable: true });
     for (const failed of [
-      // V23-R1-CODEX-01: "v1"'s null reading is never "known absent or null".
+      // I-1: the hold is narrowed to "v2"; "v1"'s null reading is never held.
       selectTradingIds(recordedWindowMarketReading({ clobTokenIds: null })),
       v2({ kind: "UNREADABLE", detail: "a string" }),
       v2({ kind: "VALUE", value: [CANARY_UP] }),

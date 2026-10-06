@@ -166,7 +166,10 @@
  * is REFUSED, finally and with the existing incident, if the field is still
  * absent or `null` when it is judged at or after its scheduled open, on the
  * receipt instant of the read it was judged from. Every other refusal stays
- * final.
+ * final. The hold is for `"v2"`'s `positionIds` only: the orchestrator's
+ * interim ruling of 2026-10-06 narrowed it (`V2-3` r3, I-1). A `"v1"` window
+ * whose `clobTokenIds` is absent, `null` or of another type is refused at
+ * once and for good; the judge never answers `NOT_YET_ADMISSIBLE` for it.
  *
  * ## PAPER or BACKTEST only (Decision 2; acceptance 2)
  *

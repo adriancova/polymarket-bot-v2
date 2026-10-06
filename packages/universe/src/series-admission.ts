@@ -27,10 +27,10 @@
  *   available", F-40) — is neither admitted nor refused:
  *   {@link judgeSeriesWindow} answers `NOT_YET_ADMISSIBLE` with its scheduled
  *   open, and the caller judges it again, refusing it finally at or after that
- *   open. Every other refusal stays final. Only a `"v2"` window's
- *   `positionIds` can be known absent or `null`: a `"v1"` window's
- *   `clobTokenIds` reading cannot tell absent or `null` from another type,
- *   and is refused at once (`V2-3` r1, V23-R1-CODEX-01).
+ *   open. Every other refusal stays final. The hold is for `"v2"` only: the
+ *   orchestrator's interim ruling of 2026-10-06 narrowed it (`V2-3` r3, I-1).
+ *   A `"v1"` window whose `clobTokenIds` is absent, `null` or of another type
+ *   is refused at once and for good, as since `V2-1`.
  * - **PAPER or BACKTEST only** (Decision 2.1, acceptance 2):
  *   {@link admissionRunModeProblem}. Admission is NEVER auto-approval for live
  *   trading (Decision 2.2).
@@ -590,10 +590,11 @@ export type SeriesWindowVerdict =
     }
   | {
       /**
-       * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06): the
-       * window matches in every respect but one — its accepted `version`
-       * selects an id field that is absent or `null` ("the IDs are not yet
-       * available", F-40). It is not admitted, and it is not refused: the
+       * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06, as
+       * narrowed to `"v2"`): the window matches in every respect but one —
+       * its accepted `"v2"` `version` selects a `positionIds` that is absent
+       * or `null` ("the IDs are not yet available", F-40). It is not
+       * admitted, and it is not refused: the
        * caller judges it again later, and refuses it finally (with these
        * mismatches) if it is still so at or after `scheduledOpenEpochMs`.
        */
@@ -685,14 +686,11 @@ export type TradingIdSelection =
       /** Every reason the ids could not be selected, each named. */
       readonly problems: readonly string[];
       /**
-       * `V2-3` item 7: `true` exactly when the version is supported and the
-       * field it selects is KNOWN to be absent or `null` — "the IDs are not
-       * yet available" (F-40). Only `"v2"`'s `positionIds` can be: the
-       * series-window door reads `"v1"`'s `clobTokenIds` as a string or
-       * `null`, and its `null` also covers a value of another type
-       * (`@polymarket-bot/polymarket-public` `series-window/door.ts`,
-       * `stringOf`), so for `"v1"` this is always `false` (`V2-3` r1,
-       * V23-R1-CODEX-01).
+       * `V2-3` item 7: `true` exactly when the version is `"v2"` and its
+       * `positionIds` is KNOWN to be absent or `null` — "the IDs are not yet
+       * available" (F-40). For `"v1"` it is always `false`: the hold is
+       * narrowed to `"v2"` (ADR-030 Amendment 2 rule 1, note of 2026-10-06;
+       * the orchestrator's interim ruling of 2026-10-06; `V2-3` r3, I-1).
        */
       readonly idsNotYetAvailable: boolean;
     };
@@ -710,9 +708,9 @@ export type TradingIdSelection =
  * ("the IDs are not yet available", F-40) or of another type; not exactly two
  * ids; an id that is not a canonical decimal string (`TokenIdSchema`; F-39);
  * two equal ids. The outcomes are judged by {@link judgeSeriesWindow}. A
- * failure whose only reason is a selected field absent or `null` says so
- * (`idsNotYetAvailable`; `V2-3` item 7), and the judge then answers
- * `NOT_YET_ADMISSIBLE` rather than refusing. TOTAL and pure.
+ * failure whose only reason is a `"v2"` `positionIds` absent or `null` says
+ * so (`idsNotYetAvailable`; `V2-3` item 7, narrowed to `"v2"`), and the judge
+ * then answers `NOT_YET_ADMISSIBLE` rather than refusing. TOTAL and pure.
  */
 export function selectTradingIds(market: GammaWindowMarketReading): TradingIdSelection {
   const version = market.version;
@@ -776,11 +774,12 @@ function positionIdsOf(reading: GammaWindowMarketReading["positionIds"]): Select
  * `"v1"`'s `clobTokenIds`, as the series-window door reads it: a string, or
  * `null` — and that `null` covers absent, `null` AND a value of another type
  * alike (`@polymarket-bot/polymarket-public` `series-window/door.ts`,
- * `stringOf`). So a `null` reading never shows that the field is absent or
- * `null`, which is all `V2-3` item 7 defers (ADR-030 Amendment 2 rule 1, note
- * of 2026-10-06: "Every other refusal reason stays final"). It is an unclear
- * fact, and is refused at once, as `V2-1` refused it (Decision 1.5; `V2-3` r1,
- * V23-R1-CODEX-01): `notYetAvailable` is `false`.
+ * `stringOf`). A `null` reading is refused at once and for good, as `V2-1`
+ * refused it (Decision 1.5): `notYetAvailable` is `false`. `V2-3` item 7's
+ * hold is narrowed to `"v2"` (ADR-030 Amendment 2 rule 1, note of 2026-10-06;
+ * the orchestrator's interim ruling of 2026-10-06; `V2-3` r3, I-1): V1
+ * windows have always been listed with their ids, and V1 ends at the
+ * switchover. The refusal names that narrowing.
  */
 function clobTokenIdsOf(text: VenueStringReading): SelectedField {
   if (text === null) {
@@ -788,8 +787,8 @@ function clobTokenIdsOf(text: VenueStringReading): SelectedField {
       ok: false,
       problem:
         'fact: Market.clobTokenIds, the field Market.version "v1" selects, is absent, null or not a string: the window\'s ids are not yet available (F-40) ' +
-        "or unreadable; the series-window door does not tell these apart, so a \"v1\" window is refused at once (ADR-030 Decision 1.5; " +
-        "Amendment 2 rule 1, note of 2026-10-06, defers only a field known to be absent or null)",
+        'or unreadable; a "v1" window is refused at once and for good: the hold for ids not yet available is narrowed to "v2" ' +
+        "(ADR-030 Decision 1.5; Amendment 2 rule 1, note of 2026-10-06, as narrowed by the orchestrator's interim ruling of 2026-10-06)",
       notYetAvailable: false,
     };
   }
@@ -858,9 +857,10 @@ export function paddedConditionId(
  * reviewed parameter exactly, and every per-window fact is present and well
  * formed; otherwise refuses, naming EVERY mismatch (module header, the table).
  *
- * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06): when the
- * ONLY reason a window would be refused is that its accepted `version` selects
- * an id field that is absent or `null` — that selection problem, and the CLOB
+ * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06, as narrowed
+ * to `"v2"`): when the ONLY reason a window would be refused is that its
+ * accepted `"v2"` `version` selects a `positionIds` that is absent or `null`
+ * — that selection problem, and the CLOB
  * pairing it leaves unjudgeable (`t[]` two tokens labelled with the reviewed
  * outcomes in order, its ids not comparable with ids not yet given) — the
  * verdict is `NOT_YET_ADMISSIBLE`, carrying the mismatches a final refusal

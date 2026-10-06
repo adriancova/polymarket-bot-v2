@@ -83,10 +83,11 @@
  *    REFUSED finally; every other refusal stays final, at once. And two
  *    `V2-1` pins (V21-FABLE-01, V21-FABLE-02): a condition id of another
  *    width spends no CLOB read budget, and when the selection fails the
- *    collision check reads the condition id only. `V2-3` r1
- *    (V23-R1-CODEX-01): a `"v1"` window whose `clobTokenIds` reads `null`
- *    (absent, `null` or another type, which the door does not tell apart) is
- *    refused at once and stays refused when corrected before its open.
+ *    collision check reads the condition id only. The hold is narrowed to
+ *    `"v2"` (the orchestrator's interim ruling, 2026-10-06; `V2-3` r3, I-1):
+ *    a `"v1"` window whose `clobTokenIds` is absent, `null` or of another type
+ *    is refused at once, naming the narrowing, and stays refused when
+ *    corrected before its open.
  */
 
 import { createHash } from "node:crypto";
@@ -1634,29 +1635,37 @@ describe("V2-3 item 7: ids not yet available are not yet admissible — judged a
     await harness.gateway.stop();
   });
 
-  it("still null when judged at or after the open: REFUSED finally, with the existing incident naming the open; ids that arrive later admit nothing", async () => {
-    const state: { positionIds: unknown } = { positionIds: null };
-    const stub = v2Stub2230(state);
-    const harness = await startedUnder(stub, ["v1", "v2"]);
-    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
-    // 22:30:30: judged after its open, still null.
-    await cycleAfter(harness, 10 * 60_000);
-    const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
-    expect(record?.["status"]).toBe("REFUSED");
-    expect(mismatchesOf(record)).toMatch(/Market\.positionIds, the field Market\.version "v2" selects, is null: the window's ids are not yet available \(F-40\)/u);
-    expect(mismatchesOf(record)).toMatch(
-      /not yet admissible until its scheduled open 2026-10-04T22:30:00\.000Z, and judged at 2026-10-04T22:30:30\.000Z: the selected id field was still absent or null when the window opened, so the refusal is final \(ADR-030 Amendment 2 rule 1, note of 2026-10-06\)/u,
-    );
-    expect(refusedIncidents(harness)).toHaveLength(1);
-    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[V2_WINDOW_2230_ID]]);
-    // Final: filled ids are never judged again.
-    const reads = clobReadsOf(stub, V2_WINDOW.conditionId32);
-    state.positionIds = [V2_WINDOW.up, V2_WINDOW.down];
-    await cycleAfter(harness, 0);
-    expect(admittedIds(harness)).toEqual([]);
-    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(reads);
-    await harness.gateway.stop();
-  });
+  for (const [name, positionIds] of [
+    ["null", null],
+    ["absent", undefined],
+  ] as const) {
+    it(`still ${name} when judged at or after the open: REFUSED finally, with the existing incident naming the open; ids that arrive later admit nothing`, async () => {
+      const state: { positionIds: unknown } = { positionIds };
+      const stub = v2Stub2230(state);
+      const harness = await startedUnder(stub, ["v1", "v2"]);
+      // 22:20: held, not refused (the hold is "v2"'s).
+      expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+      expect(refusedIncidents(harness)).toEqual([]);
+      expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsNotYetAdmissible: 1, windowsRefused: 0 });
+      // 22:30:30: judged after its open, still absent or null.
+      await cycleAfter(harness, 10 * 60_000);
+      const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+      expect(record?.["status"]).toBe("REFUSED");
+      expect(mismatchesOf(record)).toMatch(new RegExp(`Market\\.positionIds, the field Market\\.version "v2" selects, is ${name}: the window's ids are not yet available \\(F-40\\)`, "u"));
+      expect(mismatchesOf(record)).toMatch(
+        /not yet admissible until its scheduled open 2026-10-04T22:30:00\.000Z, and judged at 2026-10-04T22:30:30\.000Z: the selected id field was still absent or null when the window opened, so the refusal is final \(ADR-030 Amendment 2 rule 1, note of 2026-10-06\)/u,
+      );
+      expect(refusedIncidents(harness)).toHaveLength(1);
+      expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[V2_WINDOW_2230_ID]]);
+      // Final: filled ids are never judged again.
+      const reads = clobReadsOf(stub, V2_WINDOW.conditionId32);
+      state.positionIds = [V2_WINDOW.up, V2_WINDOW.down];
+      await cycleAfter(harness, 0);
+      expect(admittedIds(harness)).toEqual([]);
+      expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(reads);
+      await harness.gateway.stop();
+    });
+  }
 
   it("the open is the bound, on the read's receipt: judged one millisecond before it, not yet admissible; judged exactly AT it, refused", async () => {
     const early = await started(v2Stub2230({ positionIds: null }), {
@@ -1709,17 +1718,19 @@ describe("V2-3 item 7: ids not yet available are not yet admissible — judged a
   }
 });
 
-describe("V2-3 r1 (V23-R1-CODEX-01): a \"v1\" window's clobTokenIds read as null is a FINAL refusal — never held until the open", () => {
-  // The series-window door reads "v1"'s clobTokenIds as a string or null, and
-  // its null covers absent, null AND another type alike, so the reading never
-  // shows the ids are merely not yet given (item 7 defers only that). "Every
-  // other refusal reason stays final": d2d0441 held each of these as not yet
-  // admissible, and a correction before the open then ADMITTED a window the
-  // base refused for good (astra's reproduction).
+describe("V2-3 r3 (I-1; V23-R1-CODEX-01): the hold is narrowed to \"v2\" — a \"v1\" window whose clobTokenIds is absent, null or of another type is a FINAL refusal at first sight, never held until the open", () => {
+  // The orchestrator's interim ruling of 2026-10-06 (ADR-030 Amendment 2 rule
+  // 1, the note of 2026-10-06, "Ruling 1 is narrowed to \"v2\""): item 7's
+  // hold is for "v2"'s positionIds only. A "v1" window whose clobTokenIds is
+  // absent, null or of another type is refused at once and for good, as since
+  // V2-1; the series-window door reads all of these as null. d2d0441 held each
+  // of these as not yet admissible, and a correction before the open then
+  // ADMITTED a window the base refused for good (astra's reproduction).
   for (const [name, value] of [
     ["the number 42", 42],
     ["an object", {}],
     ["true", true],
+    ["an array of the window's two ids, not JSON-encoded", [WINDOW_2230.yes, WINDOW_2230.no]],
     ["null", null],
     ["absent", undefined],
   ] as const) {
@@ -1740,7 +1751,9 @@ describe("V2-3 r1 (V23-R1-CODEX-01): a \"v1\" window's clobTokenIds read as null
       const record = ledger(harness.walFileSystem)[WINDOW_2230.conditionId];
       expect(record?.["status"]).toBe("REFUSED");
       expect(mismatchesOf(record)).toMatch(/Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string/u);
-      expect(mismatchesOf(record)).toMatch(/the series-window door does not tell these apart, so a "v1" window is refused at once/u);
+      expect(mismatchesOf(record)).toMatch(
+        /a "v1" window is refused at once and for good: the hold for ids not yet available is narrowed to "v2" \(ADR-030 Decision 1\.5; Amendment 2 rule 1, note of 2026-10-06, as narrowed by the orchestrator's interim ruling of 2026-10-06\)/u,
+      );
       expect(mismatchesOf(record)).not.toMatch(/not yet admissible until/u);
       expect(refusedIncidents(harness)).toHaveLength(1);
       expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[WINDOW_2230.id]]);
