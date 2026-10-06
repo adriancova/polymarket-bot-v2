@@ -9,7 +9,8 @@
  * socket manager is NOT used for this, on purpose: it silently skips any
  * message its schema rejects (`if (!parsed.success) continue;`) and
  * reconnects without telling its subscriber (`websockets/clob/user.ts`,
- * `@polymarket/client` 0.11.0), and this adapter must surface both.
+ * `@polymarket/client` 0.11.0, unchanged in the pinned 0.12.0), and this
+ * adapter must surface both.
  *
  * WHAT THE OUTPUT GUARANTEES
  *

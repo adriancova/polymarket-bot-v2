@@ -20,6 +20,17 @@
  *   Amendment 2 rule 2).
  * - **Fail closed** (Decision 1.5): a fact that is absent, unreadable or
  *   unclear refuses the window.
+ * - **Not yet admissible** (`V2-3` item 7; ADR-030 Amendment 2 rule 1, note
+ *   of 2026-10-06, the orchestrator's interim ruling for PAPER and BACKTEST):
+ *   a window that matches in every respect but one — its accepted `version`
+ *   selects an id field that is absent or `null` ("the IDs are not yet
+ *   available", F-40) — is neither admitted nor refused:
+ *   {@link judgeSeriesWindow} answers `NOT_YET_ADMISSIBLE` with its scheduled
+ *   open, and the caller judges it again, refusing it finally at or after that
+ *   open. Every other refusal stays final. The hold is for `"v2"` only: the
+ *   orchestrator's interim ruling of 2026-10-06 narrowed it (`V2-3` r3, I-1).
+ *   A `"v1"` window whose `clobTokenIds` is absent, `null` or of another type
+ *   is refused at once and for good, as since `V2-1`.
  * - **PAPER or BACKTEST only** (Decision 2.1, acceptance 2):
  *   {@link admissionRunModeProblem}. Admission is NEVER auto-approval for live
  *   trading (Decision 2.2).
@@ -576,6 +587,23 @@ export type SeriesWindowVerdict =
       readonly conditionId: string | undefined;
       /** `true` when the schedule itself was ambiguous (the DST repeat, U-34). */
       readonly scheduleAmbiguous: boolean;
+    }
+  | {
+      /**
+       * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06, as
+       * narrowed to `"v2"`): the window matches in every respect but one —
+       * its accepted `"v2"` `version` selects a `positionIds` that is absent
+       * or `null` ("the IDs are not yet available", F-40). It is not
+       * admitted, and it is not refused: the
+       * caller judges it again later, and refuses it finally (with these
+       * mismatches) if it is still so at or after `scheduledOpenEpochMs`.
+       */
+      readonly verdict: "NOT_YET_ADMISSIBLE";
+      /** What a final refusal names: the unavailable ids, and the CLOB pairing they leave unjudgeable. */
+      readonly mismatches: readonly string[];
+      readonly conditionId: string;
+      readonly scheduledOpenAt: string;
+      readonly scheduledOpenEpochMs: number;
     };
 
 function readingText(reading: VenueDecimalReading): string {
@@ -657,6 +685,14 @@ export type TradingIdSelection =
       readonly version: ProtocolVersion | undefined;
       /** Every reason the ids could not be selected, each named. */
       readonly problems: readonly string[];
+      /**
+       * `V2-3` item 7: `true` exactly when the version is `"v2"` and its
+       * `positionIds` is KNOWN to be absent or `null` — "the IDs are not yet
+       * available" (F-40). For `"v1"` it is always `false`: the hold is
+       * narrowed to `"v2"` (ADR-030 Amendment 2 rule 1, note of 2026-10-06;
+       * the orchestrator's interim ruling of 2026-10-06; `V2-3` r3, I-1).
+       */
+      readonly idsNotYetAvailable: boolean;
     };
 
 /**
@@ -671,8 +707,10 @@ export type TradingIdSelection =
  * but exactly `"v1"` or `"v2"`); a selected field that is absent or `null`
  * ("the IDs are not yet available", F-40) or of another type; not exactly two
  * ids; an id that is not a canonical decimal string (`TokenIdSchema`; F-39);
- * two equal ids. The outcomes are judged by {@link judgeSeriesWindow}. TOTAL
- * and pure.
+ * two equal ids. The outcomes are judged by {@link judgeSeriesWindow}. A
+ * failure whose only reason is a `"v2"` `positionIds` absent or `null` says
+ * so (`idsNotYetAvailable`; `V2-3` item 7, narrowed to `"v2"`), and the judge
+ * then answers `NOT_YET_ADMISSIBLE` rather than refusing. TOTAL and pure.
  */
 export function selectTradingIds(market: GammaWindowMarketReading): TradingIdSelection {
   const version = market.version;
@@ -683,6 +721,7 @@ export function selectTradingIds(market: GammaWindowMarketReading): TradingIdSel
       problems: [
         `fact: Market.version is ${fieldText(version)}; the trading ids are chosen by the version, and a missing version is refused (F-38, F-39)`,
       ],
+      idsNotYetAvailable: false,
     };
   }
   if (!isProtocolVersion(version.value)) {
@@ -692,13 +731,21 @@ export function selectTradingIds(market: GammaWindowMarketReading): TradingIdSel
       problems: [
         `fact: Market.version is ${JSON.stringify(version.value)}, not a supported protocol version ("v1" or "v2"); an unsupported version is refused (F-39, F-40)`,
       ],
+      idsNotYetAvailable: false,
     };
   }
   if (version.value === "v2") return selectedPair("v2", "positionIds", positionIdsOf(market.positionIds));
   return selectedPair("v1", "clobTokenIds", clobTokenIdsOf(market.clobTokenIds));
 }
 
-type SelectedField = { readonly ok: true; readonly ids: readonly VenueStringReading[] } | { readonly ok: false; readonly problem: string };
+/**
+ * The selected field, read: its ids, or why not — and whether the "why not"
+ * is that the field is absent or `null`, the ids not yet available (F-40;
+ * `V2-3` item 7).
+ */
+type SelectedField =
+  | { readonly ok: true; readonly ids: readonly VenueStringReading[] }
+  | { readonly ok: false; readonly problem: string; readonly notYetAvailable: boolean };
 
 function positionIdsOf(reading: GammaWindowMarketReading["positionIds"]): SelectedField {
   switch (reading.kind) {
@@ -707,31 +754,47 @@ function positionIdsOf(reading: GammaWindowMarketReading["positionIds"]): Select
       return {
         ok: false,
         problem: `fact: Market.positionIds, the field Market.version "v2" selects, is ${fieldText(reading)}: the window's ids are not yet available (F-40)`,
+        notYetAvailable: true,
       };
     case "UNREADABLE":
       return {
         ok: false,
         problem: `fact: Market.positionIds, the field Market.version "v2" selects, is not an array of decimal strings (${reading.detail}; F-38, F-41)`,
+        notYetAvailable: false,
       };
     case "VALUE":
       if (reading.value.length !== 2) {
-        return { ok: false, problem: `fact: Market.positionIds is ${JSON.stringify(reading.value)}, not exactly two position ids` };
+        return { ok: false, problem: `fact: Market.positionIds is ${JSON.stringify(reading.value)}, not exactly two position ids`, notYetAvailable: false };
       }
       return { ok: true, ids: reading.value };
   }
 }
 
+/**
+ * `"v1"`'s `clobTokenIds`, as the series-window door reads it: a string, or
+ * `null` — and that `null` covers absent, `null` AND a value of another type
+ * alike (`@polymarket-bot/polymarket-public` `series-window/door.ts`,
+ * `stringOf`). A `null` reading is refused at once and for good, as `V2-1`
+ * refused it (Decision 1.5): `notYetAvailable` is `false`. `V2-3` item 7's
+ * hold is narrowed to `"v2"` (ADR-030 Amendment 2 rule 1, note of 2026-10-06;
+ * the orchestrator's interim ruling of 2026-10-06; `V2-3` r3, I-1): V1
+ * windows have always been listed with their ids, and V1 ends at the
+ * switchover. The refusal names that narrowing.
+ */
 function clobTokenIdsOf(text: VenueStringReading): SelectedField {
   if (text === null) {
     return {
       ok: false,
       problem:
-        'fact: Market.clobTokenIds, the field Market.version "v1" selects, is absent, null or not a string: the window\'s ids are not yet available (F-40)',
+        'fact: Market.clobTokenIds, the field Market.version "v1" selects, is absent, null or not a string: the window\'s ids are not yet available (F-40) ' +
+        'or unreadable; a "v1" window is refused at once and for good: the hold for ids not yet available is narrowed to "v2" ' +
+        "(ADR-030 Decision 1.5; Amendment 2 rule 1, note of 2026-10-06, as narrowed by the orchestrator's interim ruling of 2026-10-06)",
+      notYetAvailable: false,
     };
   }
   const decoded = encodedStringArray(text);
   if (decoded === undefined || decoded.length !== 2) {
-    return { ok: false, problem: `fact: Market.clobTokenIds is ${JSON.stringify(text)}, not a JSON array of exactly two token ids` };
+    return { ok: false, problem: `fact: Market.clobTokenIds is ${JSON.stringify(text)}, not a JSON array of exactly two token ids`, notYetAvailable: false };
   }
   return { ok: true, ids: decoded };
 }
@@ -741,7 +804,7 @@ function selectedPair(
   field: "positionIds" | "clobTokenIds",
   selected: SelectedField,
 ): TradingIdSelection {
-  if (!selected.ok) return { ok: false, version, problems: [selected.problem] };
+  if (!selected.ok) return { ok: false, version, problems: [selected.problem], idsNotYetAvailable: selected.notYetAvailable };
   const what = field === "positionIds" ? "position id" : "token id";
   const problems: string[] = [];
   const [first, second] = selected.ids;
@@ -752,7 +815,7 @@ function selectedPair(
   if (first !== undefined && first !== null && first === second) {
     problems.push(field === "positionIds" ? "fact: the two position ids are the same id" : "fact: the two outcome tokens are the same token");
   }
-  if (problems.length > 0 || yes === undefined || no === undefined) return { ok: false, version, problems };
+  if (problems.length > 0 || yes === undefined || no === undefined) return { ok: false, version, problems, idsNotYetAvailable: false };
   return { ok: true, version, field, yesTokenId: yes, noTokenId: no };
 }
 
@@ -793,6 +856,17 @@ export function paddedConditionId(
  * THE JUDGE. Admits a window only if it matches the reviewed pattern and every
  * reviewed parameter exactly, and every per-window fact is present and well
  * formed; otherwise refuses, naming EVERY mismatch (module header, the table).
+ *
+ * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06, as narrowed
+ * to `"v2"`): when the ONLY reason a window would be refused is that its
+ * accepted `"v2"` `version` selects a `positionIds` that is absent or `null`
+ * — that selection problem, and the CLOB
+ * pairing it leaves unjudgeable (`t[]` two tokens labelled with the reviewed
+ * outcomes in order, its ids not comparable with ids not yet given) — the
+ * verdict is `NOT_YET_ADMISSIBLE`, carrying the mismatches a final refusal
+ * names and the window's scheduled open. Any other mismatch beside it, or a
+ * window whose derived id cannot be formed, is a `REFUSE` exactly as before.
+ *
  * TOTAL and pure: never throws, reads nothing but its arguments.
  */
 export function judgeSeriesWindow(
@@ -865,6 +939,8 @@ export function judgeSeriesWindow(
   let yesTokenId: string | undefined;
   let noTokenId: string | undefined;
   let version: ProtocolVersion | undefined;
+  /** `V2-3` item 7: the mismatches that only say the ids are not yet available. */
+  const notYetAvailable = new Set<string>();
   if (market === null) {
     mismatches.push("fact: Market.clobTokenIds is null, not a JSON array of exactly two token ids");
   } else {
@@ -874,7 +950,10 @@ export function judgeSeriesWindow(
       yesTokenId = selection.yesTokenId;
       noTokenId = selection.noTokenId;
     } else {
-      for (const problem of selection.problems) mismatches.push(problem);
+      for (const problem of selection.problems) {
+        mismatches.push(problem);
+        if (selection.idsNotYetAvailable) notYetAvailable.add(problem);
+      }
     }
     const accepted: readonly string[] = series.parameters.acceptedProtocolVersions;
     if (version !== undefined && !accepted.includes(version)) {
@@ -897,9 +976,18 @@ export function judgeSeriesWindow(
       pairs.length !== 2 ||
       pairs.some((pair, index) => pair.tokenId !== expected[index]?.tokenId || pair.outcome !== expected[index]?.outcome)
     ) {
-      mismatches.push(
-        `pairing: CLOB t[] is ${JSON.stringify(pairs)}, not Gamma's index pairing ${JSON.stringify(expected)} (F-01, F-03)`,
-      );
+      const pairing = `pairing: CLOB t[] is ${JSON.stringify(pairs)}, not Gamma's index pairing ${JSON.stringify(expected)} (F-01, F-03)`;
+      mismatches.push(pairing);
+      // `V2-3` item 7: with no Gamma ids yet, the pairing's ids cannot be
+      // compared; its labels can, and a label mismatch stays a refusal.
+      if (
+        notYetAvailable.size > 0 &&
+        pairs !== null &&
+        pairs.length === 2 &&
+        pairs.every((pair, index) => pair.outcome === expected[index]?.outcome)
+      ) {
+        notYetAvailable.add(pairing);
+      }
     }
     // The UNDOCUMENTED CLOB `v` (C-21) can only REFUSE (ADR-030 Amendment 2
     // rule 1 item 7): present and not exactly Gamma's version — `null` and a
@@ -1011,6 +1099,25 @@ export function judgeSeriesWindow(
     mismatches.push(`fact: Market.id ${JSON.stringify(gammaMarketId)} is not the integer id GET /markets/{id} takes (S-D34)`);
   }
 
+  // `V2-3` item 7: refused ONLY because the ids are not yet available — the
+  // version supported and accepted, the schedule and the identity derivable.
+  if (
+    notYetAvailable.size > 0 &&
+    mismatches.every((mismatch) => notYetAvailable.has(mismatch)) &&
+    version !== undefined &&
+    series.parameters.acceptedProtocolVersions.includes(version) &&
+    schedule?.ok === true &&
+    conditionId !== undefined &&
+    windowInternalMarketId(conditionId, schedule.openEpochMs) !== undefined
+  ) {
+    return {
+      verdict: "NOT_YET_ADMISSIBLE",
+      mismatches,
+      conditionId,
+      scheduledOpenAt: schedule.openAt,
+      scheduledOpenEpochMs: schedule.openEpochMs,
+    };
+  }
   if (
     mismatches.length > 0 ||
     schedule === undefined ||

@@ -217,9 +217,10 @@ describe("the repository: only packages/polymarket-secure imports @polymarket/cl
     // Positive control: the owner package's real imports are seen.
     expect(ownedSdkImports).toContain(`${OWNER_DIR}/src/error-mapping.ts -> ${UNIFIED_SDK}`);
     expect(ownedSdkImports).toContain(`${OWNER_DIR}/src/sdk-port.ts -> ${UNIFIED_SDK}`);
-    // And the lockfile shows the SDK resolved for this package, pinned exactly.
+    // And the lockfile shows the SDK resolved for this package, pinned exactly
+    // (V2-5: 0.12.0; the integrity is pinned in the secure contract suite).
     const lock = files.find((file) => file.path === "pnpm-lock.yaml")?.text ?? "";
-    expect(lock).toMatch(/ {2}packages\/polymarket-secure:\n(?: {4}.*\n)*? {6}'@polymarket\/client':\n {8}specifier: 0\.11\.0\n/u);
+    expect(lock).toMatch(/ {2}packages\/polymarket-secure:\n(?: {4}.*\n)*? {6}'@polymarket\/client':\n {8}specifier: 0\.12\.0\n {8}version: 0\.12\.0\(/u);
   });
 });
 

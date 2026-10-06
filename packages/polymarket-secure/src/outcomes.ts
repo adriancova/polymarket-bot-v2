@@ -22,7 +22,8 @@ export type AcceptedPlacementStatus = "LIVE" | "MATCHED" | "DELAYED";
 
 /**
  * Rejections the pinned SDK classifies from the venue's response
- * (`OrderResponseErrorCode`, `@polymarket/client@0.11.0`), minus the two it
+ * (`OrderResponseErrorCode`, `@polymarket/client@0.12.0`; its
+ * `clob/order-response.ts` is unchanged from 0.11.0), minus the two it
  * cannot vouch for: `unknown` and `unmatched` (see {@link PlacementOutcome}).
  */
 export type PlacementRejectionReason =
@@ -67,8 +68,9 @@ export type PlacementOutcome =
   | { readonly kind: "NOT_SENT"; readonly error: SecureVenueError }
   /**
    * The venue refused with a documented condition whose code the pinned SDK
-   * could only have kept because the venue sent it (503 `post_only_mode`).
-   * Not placed. A 401, 425 or 429 is never REFUSED: the pinned SDK can
+   * could only have kept because the venue sent it (503 `post_only_mode`; a
+   * code the SDK may have inferred from the `error` text never counts,
+   * `error-mapping.ts` rule 4c). Not placed. A 401, 425 or 429 is never REFUSED: the pinned SDK can
    * discard the body's code, so "no code" is unproven and the outcome is
    * UNKNOWN, with the kind still following the status (CX-R3-01, CX-R2-02).
    */

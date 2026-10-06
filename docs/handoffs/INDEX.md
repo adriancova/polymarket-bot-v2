@@ -159,3 +159,5 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-06 | [V2-2.md](V2-2.md) | `V2-2`: Protocol V2 market-data path and recorded-data readers | WP | Complete (2026-10-06) | `9836ab0` | 3 KB |
 | 2026-10-06 | [V2-1.md](V2-1.md) | `V2-1`: Protocol V2 version-selected identifiers and series admission | WP | Complete (2026-10-06) | `8558053` | 3 KB |
 | 2026-10-06 | [RECORDS-W3.md](RECORDS-W3.md) | `RECORDS-W3`: records hygiene after the Wave 3 closeout | Records | Complete (2026-10-06) | `b008a26` | 4 KB |
+| 2026-10-06 | [V2-5.md](V2-5.md) | `V2-5`: @polymarket/client 0.12.0 in polymarket-secure | WP | Complete (2026-10-06) | `1d9bfb0` | 3 KB |
+| 2026-10-06 | [V2-3.md](V2-3.md) | `V2-3`: V2 resolution via /v2/resolutions; not-yet-admissible V2 windows | WP | Complete (2026-10-06) | `3ee3e1d` | 5 KB |
