@@ -31,10 +31,16 @@
  * ADR-012 §5.8 / ADR-013: `price_change.size` is CONFIRMED absolute with `"0"`
  * removing a level, so a ladder is a set of aggregate levels and no delta
  * reconstruction happens here.
+ *
+ * V2-10 (F-63, F-73): each consumed level is ONE maker fill whose two legs —
+ * shares and pUSD — are computed in whole base units by the documented
+ * formula (`./base-units.js`), and a FOK/FAK BUY may target pUSD instead of
+ * shares. Every fill carries its pUSD leg as `collateralAmount`.
  */
 
 import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 
+import { floorToBaseUnits, makerFillForShares, makerSellForBudget } from "./base-units.js";
 import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type {
   BookLevelView,
@@ -87,6 +93,17 @@ export interface SimulatedFill {
   readonly action: "BUY" | "SELL";
   readonly price: string;
   readonly shares: string;
+  /**
+   * V2-10 (F-63): the pUSD this fill moved, BEFORE any fee — what a BUY paid,
+   * what a SELL received — computed in whole base units by the documented
+   * formula (`./base-units.js`). It is `price × shares` exactly whenever that
+   * is a whole number of base units, and otherwise that value floored: never
+   * re-derive it from `price × shares`. The fee is NOT in it: "Reconcile
+   * fills and fees separately: BUY fees add to collateral spend; SELL fees
+   * are deducted from proceeds" (F-63), which is how the venue's cash applies
+   * the two.
+   */
+  readonly collateralAmount: string;
   readonly feeAmount: string;
   readonly liquidityRole: "MAKER" | "TAKER";
   readonly evidenceClass: SimulatedEvidenceClass;
@@ -107,6 +124,7 @@ export function simulatedFill(input: {
   readonly action: "BUY" | "SELL";
   readonly price: string;
   readonly shares: string;
+  readonly collateralAmount: string;
   readonly feeAmount: string;
   readonly liquidityRole: "MAKER" | "TAKER";
   readonly model: FillModelIdentity;
@@ -216,37 +234,81 @@ function isThreeScenarioBand(value: unknown): boolean {
 // Depth arithmetic
 // ---------------------------------------------------------------------------
 
-/** One matched slice of a ladder walk. */
+/** One matched slice of a ladder walk: ONE maker fill (`./base-units.js` inference 1). */
 export interface MatchedLevel {
   readonly price: string;
   readonly shares: string;
-}
-
-/** The outcome of consuming a ladder up to a limit price and a size. */
-export interface DepthConsumption {
-  readonly matched: readonly MatchedLevel[];
-  readonly filledShares: string;
-  readonly remainingShares: string;
-  /** Exact `Σ price × shares` across the matched levels. */
-  readonly notional: string;
-  /** Levels the walk stopped at because the limit price was crossed. */
-  readonly stoppedAtLimit: boolean;
+  /** V2-10: the pUSD this maker fill moved, by F-63, in whole base units. */
+  readonly collateral: string;
 }
 
 /**
- * Walks a ladder best-first, consuming up to `shares` at prices the limit allows.
+ * What a walk is asked to fill (V2-10; F-63: "CLOB GTC/GTD BUY targets are
+ * shares; FOK/FAK BUY targets are collateral").
+ *
+ * - `SHARES` — every SELL, and a GTC/GTD BUY.
+ * - `COLLATERAL` — a FOK/FAK BUY whose composition root adopted the documented
+ *   target (`SimulatedVenueOptions.fokFakBuyTarget`). The amount is the pUSD
+ *   to spend before fees; the shares follow from the fills.
+ */
+export type DepthTargetKind = "SHARES" | "COLLATERAL";
+
+/** The outcome of consuming a ladder up to a limit price and a target. */
+export interface DepthConsumption {
+  readonly matched: readonly MatchedLevel[];
+  readonly target: DepthTargetKind;
+  readonly filledShares: string;
+  /**
+   * `SHARES` target: the requested shares minus the filled ones. `COLLATERAL`
+   * target: always `"0"` — such a walk has no share remainder, and what it
+   * did not spend is {@link remainingCollateral}.
+   */
+  readonly remainingShares: string;
+  /** Exact `Σ price × shares` across the matched levels, before F-63's floor. */
+  readonly notional: string;
+  /** `Σ collateral` across the matched levels: the pUSD the fills moved (F-63). */
+  readonly collateral: string;
+  /** The collateral target, or `null` for a `SHARES` target. */
+  readonly collateralTarget: string | null;
+  /** The collateral target minus what the fills spent, or `null` for a `SHARES` target. */
+  readonly remainingCollateral: string | null;
+  /** Levels the walk stopped at because the limit price was crossed. */
+  readonly stoppedAtLimit: boolean;
+  /**
+   * `true` when the TARGET ended the walk: it is filled to the last whole base
+   * unit F-63 can move at the maker's price. A share target can then still
+   * show a sub-base-unit, or a floor-sized, remainder (`./base-units.js`
+   * inference 2), and a collateral target an unspent budget under one share's
+   * base unit at that price: that remainder is the formula's, never missing
+   * liquidity, so the order is complete. `false` when the limit price or the
+   * ladder ended it first: the order has a remainder to rest, cancel or reject.
+   */
+  readonly complete: boolean;
+}
+
+/**
+ * Walks a ladder best-first, consuming up to a target at prices the limit allows.
  *
  * `BUY` consumes the ASK ladder at prices `<= limitPrice`; `SELL` consumes the
  * BID ladder at prices `>= limitPrice`. Every planned order is a capped limit
  * order (WP-190 acceptance 2), so there is no unbounded market-order path here
  * and none can be added without changing the plan contract first.
+ *
+ * V2-10: each consumed level is ONE maker fill, computed in whole base units by
+ * F-63 (`./base-units.js`): the maker is a SELL on the ask ladder and a BUY on
+ * the bid ladder. The target is EITHER `shares` (every SELL; a GTC/GTD BUY) OR
+ * `collateral` (a FOK/FAK BUY, BUY only), never both.
  */
-export function consumeDepth(input: {
-  readonly ladder: readonly BookLevelView[];
-  readonly action: "BUY" | "SELL";
-  readonly limitPrice: string;
-  readonly shares: string;
-}): SimulationResult<DepthConsumption> {
+export function consumeDepth(
+  input: {
+    readonly ladder: readonly BookLevelView[];
+    readonly action: "BUY" | "SELL";
+    readonly limitPrice: string;
+  } & (
+    | { readonly shares: string; readonly collateral?: undefined }
+    | { readonly collateral: string; readonly shares?: undefined }
+  ),
+): SimulationResult<DepthConsumption> {
   return totally("consuming depth", () => consumeDepthInner(input));
 }
 
@@ -254,9 +316,10 @@ function consumeDepthInner(input: {
   readonly ladder: readonly BookLevelView[];
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
-  readonly shares: string;
+  readonly shares?: string | undefined;
+  readonly collateral?: string | undefined;
 }): SimulationResult<DepthConsumption> {
-  const { ladder: offeredLadder, action, limitPrice, shares } = input;
+  const { ladder: offeredLadder, action, limitPrice, shares, collateral: collateralTarget } = input;
   // D1 (round-3 review, MEDIUM-1, same class): a ladder is the ANSWER of a
   // `BookView` PORT, but what it hands back is DATA — and the walk below reads
   // each level's `price` six times (validate, order-check, limit-check, record,
@@ -278,20 +341,51 @@ function consumeDepthInner(input: {
       offered: String(action),
     });
   }
-  if (!isCanonicalDecimalString(limitPrice) || !isCanonicalDecimalString(shares)) {
+  // V2-10: exactly one target, and a collateral one only for a BUY (F-63: "FOK/FAK
+  // BUY targets are collateral"; nothing documents a collateral-targeted SELL).
+  const target: DepthTargetKind = collateralTarget === undefined ? "SHARES" : "COLLATERAL";
+  if ((shares === undefined) === (collateralTarget === undefined)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
-      "limitPrice and shares must be canonical decimal strings (§6 invariant 1)",
+      "a depth walk targets EITHER shares OR collateral, exactly one of them (F-63)",
     );
   }
-  if (compareDecimal(shares, "0") <= 0) {
-    return simulationFailure("SIMULATION_INPUT_INVALID", "shares must be strictly positive");
+  if (target === "COLLATERAL" && action !== "BUY") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "only a BUY may target collateral (F-63: \"FOK/FAK BUY targets are collateral\"); a SELL targets shares",
+    );
+  }
+  const amount = target === "SHARES" ? shares : collateralTarget;
+  if (!isCanonicalDecimalString(limitPrice) || !isCanonicalDecimalString(amount)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "limitPrice and the target (shares or collateral) must be canonical decimal strings (§6 invariant 1)",
+    );
+  }
+  if (compareDecimal(amount, "0") <= 0) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      target === "SHARES" ? "shares must be strictly positive" : "the collateral target must be strictly positive",
+    );
+  }
+  // V2-10 (F-73): a fill moves whole base units, so a target under one cannot
+  // be filled at all — refused, rather than "completed" with nothing filled.
+  if (floorToBaseUnits(amount) <= 0n) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "the target is under one base unit (F-73: \"`1_000_000` is one pUSD or one share\"), so no fill can move any of it",
+      { target, amount },
+    );
   }
 
   const matched: MatchedLevel[] = [];
-  let remaining = shares;
+  let remaining = amount;
   let notional = "0";
+  let collateral = "0";
+  let filled = "0";
   let stoppedAtLimit = false;
+  let targetReached = false;
   let previousPrice: string | undefined;
 
   for (const level of ladder) {
@@ -312,6 +406,15 @@ function consumeDepthInner(input: {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "a book level carries a non-positive size; an aggregate level of size 0 is a removed level and must not be in the ladder (ADR-013)",
+        { price, size },
+      );
+    }
+    // V2-10: F-63's counter divides by the maker's amount, which a level at a
+    // non-positive price cannot have; and no price is not a price.
+    if (compareDecimal(price, "0") <= 0) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a book level carries a non-positive price; a maker fill's counter amount (F-63) is defined only at a strictly positive price",
         { price, size },
       );
     }
@@ -338,25 +441,53 @@ function consumeDepthInner(input: {
     // not stop at its limit price, it stopped because it was done. The other
     // order round-1 review probe P6 found reports `stoppedAtLimit` on a complete
     // fill, which reads as "the limit bound this execution" when it did not.
-    if (compareDecimal(remaining, "0") <= 0) break;
+    if (targetReached) break;
     if (!withinLimit) {
       stoppedAtLimit = true;
       break;
     }
 
-    const take = compareDecimal(size, remaining) <= 0 ? size : remaining;
-    matched.push({ price, shares: take });
-    notional = addDecimal(notional, mulDecimal(price, take));
-    remaining = subDecimal(remaining, take);
+    // ONE maker fill per level: a SELL maker on the ask ladder, a BUY maker on
+    // the bid ladder (`./base-units.js`).
+    let legs: { readonly shares: string; readonly collateral: string };
+    if (target === "COLLATERAL") {
+      const budgeted = makerSellForBudget(price, remaining, size);
+      if (!budgeted.ok) return budgeted;
+      legs = budgeted.value;
+      // The budget decided this level, or it cannot buy one more base unit of
+      // a share at it — and every later ask is dearer, so not there either.
+      if (budgeted.value.boundByBudget) targetReached = true;
+    } else {
+      const boundByTarget = compareDecimal(remaining, size) <= 0;
+      const maker = makerFillForShares(action === "BUY" ? "SELL" : "BUY", price, boundByTarget ? remaining : size);
+      if (!maker.ok) return maker;
+      legs = maker.value;
+      if (boundByTarget) targetReached = true;
+    }
+    if (compareDecimal(legs.shares, "0") > 0) {
+      matched.push({ price, shares: legs.shares, collateral: legs.collateral });
+      notional = addDecimal(notional, mulDecimal(price, legs.shares));
+      collateral = addDecimal(collateral, legs.collateral);
+      filled = addDecimal(filled, legs.shares);
+      remaining = subDecimal(remaining, target === "SHARES" ? legs.shares : legs.collateral);
+    }
+    // Done once what is left of the target is under one base unit (F-73): no
+    // fill could move it, whatever depth followed.
+    if (floorToBaseUnits(remaining) <= 0n) targetReached = true;
   }
 
   return simulationOk(
     ownFrozenTree<DepthConsumption>({
       matched,
-      filledShares: subDecimal(shares, remaining),
-      remainingShares: remaining,
+      target,
+      filledShares: filled,
+      remainingShares: target === "SHARES" ? remaining : "0",
       notional,
+      collateral,
+      collateralTarget: target === "COLLATERAL" ? amount : null,
+      remainingCollateral: target === "COLLATERAL" ? remaining : null,
       stoppedAtLimit,
+      complete: targetReached,
     }),
   );
 }

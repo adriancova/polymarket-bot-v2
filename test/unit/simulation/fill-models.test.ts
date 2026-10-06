@@ -109,14 +109,18 @@ describe("exact depth arithmetic (§6 invariant 1)", () => {
     });
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
+    // V2-10: each level is one maker fill carrying its F-63 collateral leg,
+    // here whole base units at the price, so equal to `price × shares`.
     expect(outcome.value.matched).toEqual([
-      { price: "0.5", shares: "10" },
-      { price: "0.51", shares: "10" },
+      { price: "0.5", shares: "10", collateral: "5" },
+      { price: "0.51", shares: "10", collateral: "5.1" },
     ]);
     expect(outcome.value.filledShares).toBe("20");
     expect(outcome.value.remainingShares).toBe("5");
     expect(outcome.value.notional).toBe("10.1");
+    expect(outcome.value.collateral).toBe("10.1");
     expect(outcome.value.stoppedAtLimit).toBe(true);
+    expect(outcome.value.complete).toBe(false);
   });
 
   it("walks the bid ladder downward for a SELL", () => {

@@ -120,6 +120,7 @@ describe("every simulated fill is labelled as not-real evidence", () => {
       action: "BUY",
       price: "0.5",
       shares: "1",
+      collateralAmount: "0.5",
       feeAmount: "0",
       liquidityRole: "TAKER",
       model,

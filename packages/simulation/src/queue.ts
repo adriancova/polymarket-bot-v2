@@ -52,6 +52,7 @@
 
 import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 
+import { makerFillForShares } from "./base-units.js";
 import { computeFee, readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import { simulatedFill, type FillModelIdentity, type SimulatedFill } from "./fill-model.js";
 import { isNonEmptyString, isNonNegativeInteger, isUnsignedIntegerString } from "./grammar.js";
@@ -440,6 +441,15 @@ function simulateRestingInner(input: {
       "a resting order's price is strictly positive; a non-positive price is not a price, and the fee this door charges is computed from it",
       { field: "restingPrice", offered: order.restingPrice },
     );
+  }
+  // V2-10: the action names which side of F-63's formula the resting order is
+  // the maker on (`./base-units.js`), so it is read as one of the two, never
+  // defaulted to either.
+  if (order.action !== "BUY" && order.action !== "SELL") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a resting order's action is BUY or SELL", {
+      field: "action",
+      offered: describeForRefusal(order.action),
+    });
   }
   // THE HYPOTHESES OF THE DERIVATION, ENFORCED WHERE IT IS CITED (round-2 review,
   // MEDIUM-2). `checkBandOrdering`'s pre-cancel ordering proof reasons over
@@ -936,18 +946,28 @@ function runScenario<TScenario extends QueueScenario>(input: {
 
     if (compareDecimal(fillsUs, "0") <= 0) continue;
 
+    // V2-10: our resting order is the MAKER, signed at its resting price, so
+    // the estimated fill moves F-63's legs in whole base units
+    // (`./base-units.js`): a resting SELL's shares whole and its pUSD floored;
+    // a resting BUY's pUSD floored and its shares the formula's counter of it.
+    // An estimate under one base unit moves nothing (F-73).
+    const legs = makerFillForShares(order.action, order.restingPrice, fillsUs);
+    if (!legs.ok) return legs;
+    const moved = legs.value.shares;
+    if (compareDecimal(moved, "0") <= 0) continue;
+
     const fee = computeFee({
-      shares: fillsUs,
+      shares: moved,
       price: order.restingPrice,
       liquidityRole: "MAKER",
       snapshot: input.feeSnapshot,
     });
     if (!fee.ok) return fee;
 
-    remaining = subDecimal(remaining, fillsUs);
-    filled = addDecimal(filled, fillsUs);
+    remaining = subDecimal(remaining, moved);
+    filled = addDecimal(filled, moved);
     if (order.cancelRequestedAtNs !== undefined && trade.monotonicNs >= order.cancelRequestedAtNs) {
-      fillsAfterCancel = addDecimal(fillsAfterCancel, fillsUs);
+      fillsAfterCancel = addDecimal(fillsAfterCancel, moved);
     }
     fills.push(
       simulatedFill({
@@ -958,7 +978,8 @@ function runScenario<TScenario extends QueueScenario>(input: {
         side: order.side,
         action: order.action,
         price: order.restingPrice,
-        shares: fillsUs,
+        shares: moved,
+        collateralAmount: legs.value.collateral,
         feeAmount: fee.value.feeAmount,
         liquidityRole: "MAKER",
         model: input.model,

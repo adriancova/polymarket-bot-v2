@@ -318,6 +318,16 @@ export interface SimulatedOrder {
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
   readonly requestedShares: string;
+  /**
+   * V2-10 (F-63: "FOK/FAK BUY targets are collateral"): present exactly when
+   * this order is a FOK or FAK BUY executed against a collateral target — the
+   * pUSD it could spend before fees, converted ONCE from `requestedShares` at
+   * `limitPrice` (`collateralTargetAtLimitPrice`). Its `filledShares` then
+   * follow from the fills and may EXCEED `requestedShares` (asks below the
+   * limit buy more shares with the same pUSD). Absent for every order that
+   * targets shares.
+   */
+  readonly collateralTarget?: string;
   readonly filledShares: string;
   readonly state: SimulatedOrderState;
   readonly postOnly: boolean;
@@ -555,6 +565,12 @@ export interface SimulatedFillLike {
   readonly action: "BUY" | "SELL";
   readonly price: string;
   readonly shares: string;
+  /**
+   * V2-10 (F-63): the pUSD the fill moved before fees, in whole base units —
+   * the cash leg; never re-derive it from `price × shares`. See
+   * `SimulatedFill.collateralAmount`.
+   */
+  readonly collateralAmount: string;
   readonly feeAmount: string;
   readonly liquidityRole: "MAKER" | "TAKER";
   readonly evidenceClass: SimulatedEvidenceClass;

@@ -409,6 +409,7 @@ function fillNamed(simulatedFillId: string) {
     action: "BUY",
     price: "0.5",
     shares: "10",
+    collateralAmount: "5",
     feeAmount: "0.175",
     liquidityRole: "TAKER",
     model: TIER1,
