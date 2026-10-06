@@ -14,6 +14,14 @@
   rewritten (account trades out, a number policy, the approvals dependency,
   the binding site, the dust floor); `V2-9`, `V2-11`; §5 item 5; §7.1 S4 and
   S5, §7.2, §7.3 and §7.4; §8 (H-3 and option 1).
+- **Round 2 (2026-10-05),** after the joint review of `00d793a`:
+  - the Data API number rule now rests on a ruling, §5 item 6 (ADR-001 §8).
+    Its domain is bounded, and the lexeme-level refusals are withdrawn
+    (§7.1 S4; `V2-6` acceptance 2);
+  - `V2-6` reports positions incomplete until U-47 and U-48 settle. It names
+    the status arm it reads and never reads CLOSED (acceptance 5);
+  - `V2-0`'s paths cover every ADR its goal names;
+  - row C1.
 
 ## 1. Classes, owners and status words
 
@@ -81,7 +89,7 @@ Class A is planned to the 2026-10-30 date, which the user named.
 
 | # | `file:line` | What it does today | What V2 changes | Owner | Class |
 | --- | --- | --- | --- | --- | --- |
-| C1 | `packages/oms/src/reconciliation/ports.ts:31-38`, `:136-141`; `packages/oms/src/reconciliation/door.ts:683-724` | The read surface names `/v2/positions` and `/v2/approvals`. The wire adapter is owed by the composition round | The adapter meets the `data` envelope, cursor pagination and `snake_case` (F-65, F-66). Sizes are JSON doubles, and holdings under 0.1 shares are hidden by default (F-77; U-47). Whether `token_id` carries the position id for V2 holdings is U-45 | `WP-290`; the composition round | C |
+| C1 | `packages/oms/src/reconciliation/ports.ts:31-38`, `:136-141`; `packages/oms/src/reconciliation/door.ts:683-724` | The read surface names `/v2/positions` and `/v2/approvals`. The wire adapter is owed by the composition round | The adapter meets the `data` envelope, cursor pagination and `snake_case` (F-65, F-66). Sizes are JSON doubles. Holdings under 0.1 shares are hidden by default, and positions on inactive markets are never listed (F-77; U-47, U-48). Whether `token_id` carries the position id for V2 holdings is U-45 | `WP-290`; the composition round | C |
 | C2 | `apps/ops-cli/src/emergency/venue-truth.ts:31-33`, `:149-190`; `commands/account-snapshot.ts:9`; `commands/reconcile.ts:141` | Reads `/v2/positions` and `/v2/approvals` only | The same adapter duties as C1 | `WP-330` | C |
 | C3 | `packages/polymarket-secure/package.json:18` (`"@polymarket/client": "0.11.0"`) | The SDK is pinned exactly | "Upgrade … (0.12.0 or later)" (F-37). 0.11.0 lacks `CONDITIONAL-V2` (F-53), and its position operations select by which ids are present (F-74). The upgrade changes `pnpm-lock.yaml` (protected) | `WP-260` | C |
 | C4 | `packages/polymarket-secure/src/sdk-port.ts:17-29` (a `Pick` of 10 members) | A breaking SDK type change fails `typecheck` by design | No export was removed in 0.12.0 (§S.2). None of the 10 members returns account trade pages, whose `transactionHash` became optional (INF) | `WP-260` | C |
@@ -135,7 +143,7 @@ reasons in §7.
 
 | Step | Package | Class | Start | Done by |
 | --- | --- | --- | --- | --- |
-| 1 | `V2-0` governance (ADR amendments) | D, gates A | now | 2026-10-09 |
+| 1 | `V2-0` governance (ADR amendments) | D, gates A | now | 2026-10-09 for §5 items 1-3; item 6 before `V2-6` starts |
 | 2 | `V2-1` admission and identifiers; `V2-2` market-data path and readers (in parallel; disjoint paths) | A | after `V2-0` | 2026-10-20 |
 | 3 | `V2-3` V2 resolution | A | after `V2-1` merges | 2026-10-28 |
 | 4 | `V2-4` Data API v1 guard (optional; the grep is the minimum) | B | any time | 2026-10-23 |
@@ -145,18 +153,30 @@ reasons in §7.
 
 ### V2-0: governance, before the class-A code
 
-- **Goal:** the dated ADR amendments of §5, items 1-3. Also the SDK-scope ADR
-  (§7.3), **only if the user overrules this plan's recommendation** for the
-  public surfaces; and the approvals exception (§5 item 5), **only if** no
-  stable SDK release reads `/v2/approvals` when `V2-6` starts. The
-  orchestrator writes them; this plan only lists what each must decide.
-- **Allowed paths:** `docs/adr/ADR-030-*.md`, `docs/adr/ADR-033-*.md`,
-  `docs/adr/ADR-009-*.md`, `docs/adr/README.md`, and
-  `docs/handoffs/V2-0.md`.
+- **Goal:**
+  - the dated ADR amendments of §5, items 1-3;
+  - the ADR-001 §8 amendment of §5 item 6, which records the user's ruling on
+    the Data API number rule. It is needed before `V2-6`, not before class A;
+  - the SDK-scope ADR (§5 item 4, §7.3), **only if the user overrules this
+    plan's recommendation** for the public surfaces;
+  - the approvals exception (§5 item 5), **only if** no stable SDK release
+    reads `/v2/approvals` when `V2-6` starts.
+
+  The orchestrator writes them; this plan only lists what each must decide.
+- **Allowed paths:**
+  - `docs/adr/ADR-030-*.md`, `docs/adr/ADR-033-*.md`, `docs/adr/ADR-009-*.md`
+    and `docs/adr/ADR-001-*.md`;
+  - `docs/adr/README.md` and `docs/handoffs/V2-0.md`;
+  - for each new ADR of §5 items 4 and 5 that triggers, one new file,
+    `docs/adr/ADR-0NN-*.md`. `NN` is the next free number when the orchestrator
+    authorizes that item; at `ab5033a` that is `ADR-034`. The grant names the
+    file. A new ADR outside such a grant is out of scope.
 - **Depends on:** this report.
-- **Acceptance:** each amendment cites the facts by id; nothing silently
-  overrides the handoff; ADR-033 gains a dated note of the D5 facts (§8) and no
-  ruling.
+- **Acceptance:**
+  - each amendment cites the facts by id;
+  - nothing silently overrides the handoff;
+  - ADR-033 gains a dated note of the D5 facts (§8) and no ruling;
+  - the ADR-001 amendment states the ruling and who made it.
 - **Gate:** review, by two verifiers (Opus and gpt-6-astra).
 
 ### V2-1: version-selected identifiers and admission (class A)
@@ -322,15 +342,26 @@ reasons in §7.
     (`apps/ops-cli/src/emergency/ports.ts:32-38`). "No live binding exists in
     this repository: the live composition binds them after ADR-033 D5 and the
     live-micro gate" (`:37-38`), and `V2-6` adds none;
+  - a new `test/fault-injection/reconciliation/v2-positions-completeness.test.ts`
+    (acceptance 5);
   - their tests, and `docs/handoffs/V2-6.md`.
 - **Depends on:**
   - `V2-5`;
+  - **for the positions half,** the ruling of §5 item 6 (ADR-001 §8) on the
+    number rule (acceptance 2);
   - **for the approvals half,** a stable SDK release whose public API reads
     `/v2/approvals`. Today only the canary's `fetchTradingApprovalsState`
     does, and it returns only the approvals missing from the SDK's own
     catalog. In 0.11.0 and 0.12.0 the method of that name reads on chain at
     the environment's RPC, by default `https://polygon.drpc.org` (report §S.2),
     so it must never stand behind the `/v2/approvals` tag.
+  - **The approvals result is derived.** The port wants
+    `{spender, approved}` rows (`ports.ts:140`). The canary returns only
+    `isFullyApproved` and the `missing` entries, judged against its own
+    catalog (canary client `actions/approvals.ts` lines 394-420). That catalog
+    includes the perps deposit contract and asks for `MAX_UINT256` ERC-20
+    allowances (lines 578-618). How "missing" maps to `approved`, and against
+    which spenders, is a `V2-6` design decision, recorded in its handoff.
   - **No hand-written `GET /v2/approvals` inside `polymarket-secure`.** Handoff
     §9.12 says "Wrap only the official unified SDK", and ADR-033 D5 calls a
     request the secure package sends itself "a reviewed, named exception to
@@ -340,26 +371,97 @@ reasons in §7.
 - **Acceptance:**
   1. `/v2/positions` is walked to `next_cursor: null`, with the filters
      re-sent on every page (F-66).
-  2. **Numbers, under the policy of §7.1 S4.** A size is accepted only in the
-     domain D: a canonical non-negative decimal with at most 6 fractional
-     digits and at most 15 significant digits. Anything else is a malformed
-     read, never an empty one. Tests, through fake `fetch` bodies:
-     - every value of D round-trips unchanged through the SDK path (a full
-       range plus a seeded random sample, as in the report's F-78 probe);
-     - the lexemes `1e3` and `1E3` are accepted as `"1000"`. They denote the
-       same double, and the exponent form cannot be seen after the SDK parse;
-     - `0.123456789012345678`, `0.1234567`, `1e-7`, `1e21`,
-       `12345678901234567`, `123456789012.123456` and `5.263157894736842` are
-       each refused, whatever string the SDK makes of them;
-     - a CLOSED-arm "~0 residual" outside D is refused, not rounded to zero
-       (F-77).
-  3. Condition ids are padded to 32 bytes before any call.
+  2. **Numbers, under the ruling of §5 item 6** (§7.1 S4).
+     - **The check:** each size is checked **on the SDK's string**, against
+       the domain D: a canonical non-negative decimal below 10^9, with at most
+       6 fractional digits and at most 15 significant digits (the first two
+       imply the third).
+     - **Outside D:** a string outside D fails the whole read, as a rejection
+       or as an answer the door refuses. The adapter never drops the row and
+       never rounds the string itself.
+     - **No lexeme-level promise.** The adapter makes none: the lexeme is gone
+       before the adapter sees the value (F-78).
+
+     Under item 6's binary64 rule, tests through fake `fetch` bodies show:
+     - **round trip:** every value of D round-trips unchanged, over an
+       exhaustive range plus a seeded sample, as in the F-78 probes;
+     - **aliases and underflow are accepted as their double's string:**
+       - the lexemes `1e3` and `1E3` are accepted as `"1000"`;
+       - `0.99999999999999999` and `1.00000000000000001` as `"1"`;
+       - `0.00000099999999999999999` as `"0.000001"`;
+       - `1e-400`, `-1e-400` and `-0` as `"0"`;
+     - **refused, by the string the SDK makes of them:**
+       `0.123456789012345678`, `0.1234567`, `1e-7`, `5e-7`, `1e21`, `1e400`,
+       `12345678901234567`, `123456789012.123456`, `5.263157894736842`,
+       `999999999999999.06`, `4294967295.0000002`, `1000000000` and `-0.5`;
+     - **the bound:** a seeded property test over plain, exponent and
+       near-alias lexemes. It shows that every accepted size is within 2^-23
+       share of its lexeme's exact decimal value, by exact decimal arithmetic
+       (§7.1 S4).
+
+     If the ruling rejects the binary64 rule, these tests give way to the
+     exact-boundary tests named by the ADR that ruling requires, and the
+     positions half waits for that ADR.
+  3. Any condition id the adapter sends is padded to 32 bytes. The positions
+     read sends none (acceptance 5).
   4. A row whose `token_id` is neither the version-selected id nor a known V1
      id is refused (U-45).
-  5. **The dust floor** (F-77). The read sends `filterType: "TOKENS"` and
-     `filterAmount: 0`. Until U-47 shows that the venue honours 0, the
-     adapter states that holdings under 0.1 shares may be missing from the
-     read.
+  5. **Completeness: the read never claims more than it holds** (F-77; U-47,
+     U-48). Why it matters:
+     - the port promises "every position, whatever its status"
+       (`packages/oms/src/reconciliation/ports.ts:136`);
+     - the coordinator reads a token the answer omits as `"0"`
+       (`coordinator.ts:2170`);
+     - once that delta is confirmed and unexplained, it becomes an
+       UNATTRIBUTED ledger correction and a halt (`:2234`, `:2297`).
+
+     So:
+     - **The arm read:** `status` `OPEN` only, the documented superset of held
+       positions, REDEEMABLE rows included (F-77).
+       - The request sends `filterType: "TOKENS"`, `filterAmount: 0` and
+         `includeArchived: true`.
+       - It sends no `conditionId`, `eventId`, `title`, `start` or `end`,
+         because each narrows the set (F-77).
+     - **CLOSED is never read.** Its rows are exited positions, whose
+       `current_size` is "~0 by construction" (F-77): a residual, not a
+       holding. So no CLOSED row reaches the number rule, and no residual can
+       make a read malformed.
+       - If U-47 finds that a non-zero holding can be served only on the
+         CLOSED arm, the read stays incomplete.
+       - A residual cannot be told from a holding there, so `V2-6` does not
+         read CLOSED to work around it.
+     - **`complete: false` until completeness is shown.** The adapter answers
+       `complete: false` on every read, terminal cursor or not, until all
+       three of these hold:
+       - **U-47 is settled:** `OPEN` with `filterAmount: 0` lists every
+         non-zero holding, and lists no row whose size is a residual outside
+         D;
+       - **U-48 is settled:** no held position can sit on a market the route
+         never lists;
+       - **the walk is one page,** or the documentation says a walk is
+         consistent. **INF:** `OPEN` is ordered by `CURRENT_VALUE` by default
+         (F-77), which moves with the live price. A keyset walk of several
+         pages can therefore skip a row whose key crosses the cursor.
+
+       The port allows this. "`complete: true` only when it reached the last
+       page" (`ports.ts:126-127`) names a necessary condition, not a
+       sufficient one. The door then answers INCOMPLETE, and the coordinator
+       judges no holding (`coordinator.ts:2092`). The break's detail says the
+       read "did not reach its last page" (`coordinator.ts:1371`); the
+       adapter's handoff records the real reason.
+     - **Test**
+       (`test/fault-injection/reconciliation/v2-positions-completeness.test.ts`):
+       - **setup:** the adapter runs on a fake `fetch`, then through the real
+         door (`readPositions`) and the real coordinator, with fake holdings;
+       - **the walk:** it ends at `next_cursor: null` and omits a token the
+         ledger projects at `"0.05"`;
+       - **asserted:** the outcome is INCOMPLETE, no holding is judged, and no
+         UNATTRIBUTED correction is booked. This holds over runs that span
+         more than `holdingConfirmationMs`.
+     - **Consequence:** until U-47 and U-48 settle, no reconciliation run that
+       needs positions can be CONCLUSIVE, so no live gate can pass on this
+       read. That is the intended fail-closed result. A different source of
+       position truth would need its own review; this plan proposes none.
   6. The SDK's hidden 429 retries are counted against the §9.13 read budget.
   7. The SDK's `listTrades` (Data API `/v2/trades`) is never bound to
      `AccountReadPort.listTrades` (S4(a)).
@@ -440,7 +542,7 @@ reasons in §7.
 
 - **Goal:** D13, D14, D15, D17 and D18 (the settlement review records the
   documented binary split payout without inferring a ratio). Also the
-  register rows: C-18…C-23 and U-35…U-47, with U-13, U-15, U-22 and U-33
+  register rows: C-18…C-23 and U-35…U-48, with U-13, U-15, U-22 and U-33
   resolved.
 - **Allowed paths:** `docs/contracts/protected-contracts.md`,
   `docs/settlement/**`, `docs/runbooks/**`, `IMPLEMENTATION_STATUS.md` and
@@ -500,6 +602,39 @@ reasons in §7.
    route's `amount` is a string, F-77), and when it lapses (the first stable
    release that reads the route). ADR-033 D5 option 1 would be a second such
    exception, so the two should be decided together.
+6. **ADR-001**, a dated §8 amendment, before `V2-6` starts. It governs the
+   number rule for Data API v2 sizes that the SDK parses (§7.1 S4).
+   - **Why ADR-001 §8.** §8 records the adapter obligations at the venue edge.
+     Its item 2 accepts the same `DecimalishSchema` path (`String(value)` of a
+     JSON number) for Gamma reward fields only
+     (`docs/adr/ADR-001-exact-decimal-representation.md:231-241`). The
+     repository's `normalizeVenueDecimal` reads Gamma numbers the same way,
+     citing §8.2 (`packages/polymarket-public/src/normalize/values.ts`).
+     Neither covers account truth.
+   - **What it must decide:**
+     - **the rule:** whether a size documented as a JSON `double` (F-77) may
+       be read as its binary64 value. Under that rule the adapter checks D on
+       the SDK's string, accepts aliases and underflow, and refuses every
+       string outside D (`V2-6` acceptance 2). The ruling accepts or rejects
+       the bound of §7.1 S4:
+       - a whole number of base units below 10^9 shares is read exactly,
+         whatever its spelling;
+       - a value more than 2^-23 share from every whole base unit is refused;
+       - a value nearer than that may be read as that base unit.
+     - **the other branch:** if it rejects the rule, an exact boundary before
+       `response.json()` (§7.1 S4, "The alternative"). That needs its own ADR,
+       and `V2-6`'s positions half waits for it;
+     - **handoff §6 invariant 1** ("No binary floating point for economics"):
+       whether the rule is consistent with it. **INF:** the value at our
+       boundary is a decimal string, and the binary64 step is inside the SDK,
+       as under §8.2;
+     - **its authority:** the user's ruling, which `V2-0` records in
+       `docs/adr/ADR-001-*.md`.
+   - **`V2-3`'s payouts are outside it.** Our own door reads them after the
+     same `JSON.parse`. But they only select one of two outcomes against fixed
+     integer vectors (`V2-3` acceptance 3), and no amount is taken from them.
+     If item 2 lets a Data API row settle, ADR-009 should state the same rule
+     for them.
 
 No change is needed to ADR-010 §4, ADR-004, ADR-020 or ADR-023 under this
 plan's recommendation.
@@ -667,31 +802,58 @@ prices.**
   any adapter sees it: `1e3` arrives as `"1000"`, and `0.123456789012345678`
   as `"0.12345678901234568"`. Re-validating the string afterwards cannot
   refuse an exponent form or detect a lost digit. The plan therefore promises
-  no lexeme check on this path. It states the numeric domain instead (`V2-6`
-  acceptance 2):
-  - **The domain D:** a canonical non-negative decimal with at most 6
-    fractional digits and at most 15 significant digits. Six decimals is the
+  no lexeme check on this path. It proposes a **binary64 rule** instead,
+  which is a departure from exact lexemes and so needs the ruling of §5
+  item 6 (`V2-6` acceptance 2).
+  - **The domain D, checked on the SDK's string:** a canonical non-negative
+    decimal below 10^9, with at most 6 fractional digits and at most 15
+    significant digits (the first two imply the third). Six decimals is the
     venue's base unit: "`1_000_000` is one pUSD or one share" (F-73).
-  - **Why it is exact (INF, checked by the F-78 probe).** A double keeps 15
-    significant decimal digits, and ECMAScript prints a double in its shortest
-    round-trip form. So each member of D is the SDK string of every lexeme
-    that denotes its nearest double, and of nothing else. A double that is not
-    the nearest double of a member of D prints outside D, and is refused. A
-    string in D therefore cannot hide another value of D.
-  - **What it gives up.** Two lexemes of one double (`1e3` and `1000`) cannot
-    be told apart. Under the documented `double` type they are one value, so
-    nothing documented is lost. A value finer than 10^-6, or longer than 15
-    significant digits, is refused, never rounded. The CLOSED arm's "~0
-    residual" (F-77) may be such a value; its exact form is undocumented.
+    10^9 shares is far above any holding this repository can take; a larger
+    size is refused.
+  - **What the rule accepts.** A lexeme is read as the double it denotes, and
+    that double's string is accepted when it is in D:
+    - aliases and underflow are accepted as their double's string: `1e3` as
+      `"1000"`, `0.99999999999999999` as `"1"`, and `1e-400` and `-1e-400` as
+      `"0"`;
+    - every other string is refused, and the whole read with it.
+  - **The bound (INF, checked by the round-2 probe in F-78).**
+    - **The argument.** Each member m of D prints back unchanged from its
+      nearest double x. A lexeme L whose string is m therefore parses to the
+      same x. So |L − m| ≤ ulp(x), which is at most 2^-23 share below 10^9:
+      about 1.2 × 10^-7, under half a base unit.
+    - **A whole number of base units** is read exactly, whatever its
+      spelling. An on-chain balance is always one (F-73).
+    - **A value more than 2^-23 share from every whole base unit** is
+      refused.
+    - **A value nearer than that to a whole base unit** is read as that base
+      unit, or refused. This is the precision the rule gives up, and the
+      ruling accepts or rejects it.
+  - **Why D needs the bound.** Without it, `999999999999999.06` reads as
+    `"999999999999999"`, which hides 0.06 share, and `4294967295.0000002`
+    reads as `"4294967295"`. Under D's bound both are refused.
+  - **CLOSED residuals never reach the rule.** `V2-6` reads only the OPEN arm
+    (acceptance 5).
   - **Prices are not read.** The port reads `tokenId` and `size` only
     (`packages/oms/src/reconciliation/ports.ts:136`). `avg_price` and the
     other ratios are never a money authority on this path.
-  - **The alternative.** Exact lexemes need a boundary before
-    `response.json()`: the raw-capture shim of §7.3 item 2, and that ADR. The
-    plan does not recommend it for `V2-6`.
-- **The dust floor.** `/v2/positions` omits holdings under 0.1 shares unless
-  `filter_amount` lowers the floor, and whether `0` is honoured is U-47 (F-77,
-  F-78).
+  - **The alternative: an exact boundary before `response.json()`.**
+    - **The SDK gives no hook for it.** `ServiceClient` builds its `ky`
+      instance with only `prefixUrl` and `throwHttpErrors` (client
+      `ServiceClient.ts` line 79), and `ky` reads `globalThis.fetch` per
+      request (§7.2).
+    - **So the boundary would be one of two things:**
+      - a process-global `fetch` wrapper. **INF:** in the live composition it
+        would sit under every SDK request, orders and cancels included;
+      - a hand-written read through our own door, under an exception like §5
+        item 5's.
+    - **Each needs its own ADR.** The plan does not recommend either, but
+      this is the other branch of item 6's ruling.
+- **The dust floor and inactive markets.** `/v2/positions` omits holdings
+  under 0.1 shares unless `filter_amount` lowers the floor; whether `0` is
+  honoured is U-47. It never lists positions on inactive markets (U-48).
+  `V2-6` therefore reports the read incomplete until both settle (F-77, F-78;
+  `V2-6` acceptance 5).
 - **Raw bodies:** **no.**
 - **Control:**
   - Data API reads are wrapped in `withRateLimitRetry`: two retries, waiting
@@ -706,10 +868,13 @@ prices.**
     `packages/polymarket-secure`**, behind the existing `AccountReadPort`
     (`V2-6`). The port is already "the secure adapter's authenticated reads"
     (`packages/oms/src/reconciliation/ports.ts:11`), and `apps/ops-cli`
-    already depends on `polymarket-secure`. Conditions: the numeric domain
-    above, padded condition ids, the hidden 429 retries counted in the budget,
-    and the approvals half only on a stable release that reads
-    `/v2/approvals` (`V2-6` "Depends on").
+    already depends on `polymarket-secure`. Conditions:
+    - the number rule above, once the ruling of §5 item 6 accepts it;
+    - positions reported incomplete until U-47 and U-48 settle;
+    - padded condition ids;
+    - the hidden 429 retries counted in the budget;
+    - the approvals half only on a stable release that reads `/v2/approvals`
+      (`V2-6` "Depends on").
   - **Account trades are not a Data API read.** `AccountReadPort.listTrades`
     is `/data/trades`, returning `VenueTradeView`, which needs a trade id, a
     status and the account's own legs with order id and maker or taker role
@@ -755,7 +920,7 @@ prices.**
 | S1 Gamma | Keep hand-written; the SDK may serve as a test-only oracle | No raw body to journal; fields the door reads are dropped; no V2 selection |
 | S2 Public CLOB | Keep hand-written | No raw body; `clob-markets` fields dropped and silently defaulted |
 | S3 Market WebSocket | Keep hand-written | Frames dropped silently and reconnects hidden: breaks the WAL and ADR-023 |
-| S4a Account-truth Data API reads (positions, approvals) | **Adopt, inside `polymarket-secure`**, under the numeric domain; approvals only on a stable release that reads `/v2/approvals` | Envelope, cursor and `snake_case` handled; no §9.12 or F6 change while the reads stay on the SDK |
+| S4a Account-truth Data API reads (positions, approvals) | **Adopt, inside `polymarket-secure`**, under the number rule once the ruling of §5 item 6 accepts it; positions reported incomplete until U-47 and U-48 settle; approvals only on a stable release that reads `/v2/approvals` | Envelope, cursor and `snake_case` handled; no §9.12 or F6 change while the reads stay on the SDK |
 | Account trades (`/data/trades`) | On the SDK's `listAccountTrades` (S5), never the Data API `listTrades` | The Data API `Trade` has no trade id, status, order id or role |
 | S4b Gateway `/v2/resolutions` | Keep hand-written | It derives events: journal before derive |
 | S5 Authenticated | Keep on the SDK, upgrade to 0.12.x | `CONDITIONAL-V2` and version-selected position operations |
@@ -776,7 +941,8 @@ S1-S3** (INF):
 
 The recommendation above needs **no** change to §9.12 or F6, provided every
 read in `polymarket-secure` stays on the SDK. A hand-written approvals request
-there would need the ADR of §5 item 5. If the user nonetheless wants
+there would need the ADR of §5 item 5. The positions read's number rule needs
+the ADR-001 §8 ruling of §5 item 6. If the user nonetheless wants
 `packages/polymarket-public` or the gateway to use the SDK's `PublicClient`,
 an ADR amending handoff §9.12, F6 and ADR-010 §4 must decide:
 
@@ -814,8 +980,9 @@ an ADR amending handoff §9.12, F6 and ADR-010 §4 must decide:
 - **Class C lands on the SDK:**
   - `V2-5` upgrades it;
   - `V2-6` implements the positions and approvals reads on it, inside
-    `polymarket-secure`, under the numeric domain of §7.1 S4; account trades
-    stay on `/data/trades`;
+    `polymarket-secure`, under the number rule of §7.1 S4 once §5 item 6
+    rules on it, and reports positions incomplete until U-47 and U-48 settle;
+    account trades stay on `/data/trades`;
   - `V2-7` and `V2-8` use the upgraded SDK's `CONDITIONAL-V2` and
     version-selected position operations, through the secure package's port.
 - **If the user overrules §7.2 for S1-S3:** `V2-0` gains the §7.3 ADR. `V2-1`
