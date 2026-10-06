@@ -237,7 +237,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `V2-0` | Protocol V2 governance: the dated ADR amendments and the user's rulings (docs only) | Complete (2026-10-06) | `5f2b3c8` | [V2-0](docs/handoffs/V2-0.md) |
 | `V2-1` | Protocol V2 version-selected identifiers and series admission (class A, PAPER; dual verifiers; due 2026-10-20) | **Running** (authorized 2026-10-06) | — | — |
 | `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER; astra) | **Running** (authorized 2026-10-05) | — | — |
-| `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | **Running** (authorized 2026-10-06) | — | — |
+| `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | Complete (2026-10-06) | `9e28bc2` | [CI-7](docs/handoffs/CI-7.md) |
 | `RECORDS-W3` | Records hygiene after `CLOSEOUT-3`: the brief back under budget, ADR headers, the emergency-runbook correction, the records tooling (docs only; dual verifiers) | **Running** (authorized 2026-10-06) | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |

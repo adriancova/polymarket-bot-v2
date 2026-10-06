@@ -155,3 +155,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [VENUE-4.md](VENUE-4.md) | `VENUE-4`: Protocol V2 and Data API v2 venue facts, and the migration plan | Venue | Complete (2026-10-05) | `f925a43` | 6 KB |
 | 2026-10-06 | [CLOSEOUT-3-wave-3-closeout.md](CLOSEOUT-3-wave-3-closeout.md) | `CLOSEOUT-3`: fresh Wave 3 closeout audit (runbook §10) | Audit | WAVE 3 IS COMPLETE WITH QUALIFICATIONS | — (an audit) | 35 KB |
 | 2026-10-06 | [V2-0.md](V2-0.md) | `V2-0`: Protocol V2 ADR amendments and the user's rulings | Governance | Complete (2026-10-06) | `5f2b3c8` | 4 KB |
+| 2026-10-06 | [CI-7.md](CI-7.md) | `CI-7`: the ops-cli real-PostgreSQL suite in the integration chain and CI | CI | Complete (2026-10-06) | `9e28bc2` | 2 KB |
