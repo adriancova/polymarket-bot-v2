@@ -66,8 +66,9 @@
  *
  * A healthy stop takes milliseconds: the batch in hand, a rebuild check in
  * memory, and the closes, each answered at once. Measured on the shipped
- * bundle with a paper fill in its ledger: 18 to 22 ms from the signal to the
- * exit (`test/integration/paper-trader/graceful-stop-postgres-redis.test.ts`
+ * bundle with a paper fill in its ledger, ten stops (SIGTERM and SIGINT, in
+ * five runs of this round): 18 to 200 ms from the signal to the exit, the
+ * higher figures under a host load of 15 to 20 (`test/integration/paper-trader/graceful-stop-postgres-redis.test.ts`
  * logs the figure on every run). The deadline is a backstop for a stop that HANGS, and its
  * value sits between two bounds:
  *
