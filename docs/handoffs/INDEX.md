@@ -153,3 +153,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [CI-6.md](CI-6.md) | `CI-6`: the Wave 3 live fault suites in CI | CI | Complete (2026-10-05) | `46aba42` | 2 KB |
 | 2026-10-05 | [TRADER-SIGNALS.md](TRADER-SIGNALS.md) | `TRADER-SIGNALS`: graceful stop; paper fills in the example PAPER config | Round | Complete (2026-10-05) | `3926f5f` | 4 KB |
 | 2026-10-05 | [VENUE-4.md](VENUE-4.md) | `VENUE-4`: Protocol V2 and Data API v2 venue facts, and the migration plan | Venue | Complete (2026-10-05) | `f925a43` | 6 KB |
+| 2026-10-06 | [CLOSEOUT-3-wave-3-closeout.md](CLOSEOUT-3-wave-3-closeout.md) | `CLOSEOUT-3`: fresh Wave 3 closeout audit (runbook §10) | Audit | WAVE 3 IS COMPLETE WITH QUALIFICATIONS | — (an audit) | 35 KB |
