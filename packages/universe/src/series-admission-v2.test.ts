@@ -103,6 +103,17 @@ function refusedFor(verdict: SeriesWindowVerdict, pattern: RegExp): void {
   if (verdict.verdict === "REFUSE") expect(verdict.mismatches.join(" | ")).toMatch(pattern);
 }
 
+/**
+ * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06): a window
+ * whose ONLY problem is that its selected id field is absent or `null` is not
+ * refused but NOT YET ADMISSIBLE — naming the same cause its final refusal
+ * would (`./series-admission-not-yet.test.ts` pins the verdict in full).
+ */
+function notYetFor(verdict: SeriesWindowVerdict, pattern: RegExp): void {
+  expect(verdict.verdict).toBe("NOT_YET_ADMISSIBLE");
+  if (verdict.verdict === "NOT_YET_ADMISSIBLE") expect(verdict.mismatches.join(" | ")).toMatch(pattern);
+}
+
 describe("V2-1 acceptance 1: the trading ids are selected by Market.version (F-38, F-40)", () => {
   it('"v2" selects positionIds: the V2 window is ADMITTED with the position ids, index 0 YES', () => {
     const window = admitted(judgeV2());
@@ -161,10 +172,10 @@ describe("V2-1 acceptance 2: each unclear window is REFUSED, by name", () => {
     }
   });
 
-  it('"v2" with positionIds absent or null: "the IDs are not yet available" (F-40) — never a fall-back to clobTokenIds', () => {
+  it('"v2" with positionIds absent or null: "the IDs are not yet available" (F-40) — never a fall-back to clobTokenIds (since V2-3 item 7: not yet admissible, never admitted)', () => {
     const ctf = JSON.stringify([RECORDED_WINDOW.yesTokenId, RECORDED_WINDOW.noTokenId]);
-    refusedFor(judgeV2({ positionIds: { kind: "ABSENT" }, clobTokenIds: ctf }), /Market\.positionIds, the field Market\.version "v2" selects, is absent: the window's ids are not yet available \(F-40\)/u);
-    refusedFor(judgeV2({ positionIds: { kind: "NULL" }, clobTokenIds: ctf }), /Market\.positionIds, the field Market\.version "v2" selects, is null: the window's ids are not yet available \(F-40\)/u);
+    notYetFor(judgeV2({ positionIds: { kind: "ABSENT" }, clobTokenIds: ctf }), /Market\.positionIds, the field Market\.version "v2" selects, is absent: the window's ids are not yet available \(F-40\)/u);
+    notYetFor(judgeV2({ positionIds: { kind: "NULL" }, clobTokenIds: ctf }), /Market\.positionIds, the field Market\.version "v2" selects, is null: the window's ids are not yet available \(F-40\)/u);
   });
 
   it('"v2" with positionIds that is not an array — a JSON-encoded string, an object', () => {
@@ -172,7 +183,7 @@ describe("V2-1 acceptance 2: each unclear window is REFUSED, by name", () => {
     refusedFor(judgeV2({ positionIds: { kind: "UNREADABLE", detail: "an object" } }), /is not an array of decimal strings \(an object/u);
   });
 
-  it('"v1" with clobTokenIds absent, null or not a string: not yet available — never a fall-back to positionIds', () => {
+  it('"v1" with clobTokenIds absent, null or not a string: not yet available — never a fall-back to positionIds (V2-3: still refused at once and for good — the hold for ids not yet available is narrowed to "v2")', () => {
     refusedFor(
       judgeV1({ clobTokenIds: null, positionIds: { kind: "VALUE", value: [CANARY_UP, CANARY_DOWN] } }),
       /Market\.clobTokenIds, the field Market\.version "v1" selects, is absent, null or not a string: the window's ids are not yet available \(F-40\)/u,
