@@ -49,20 +49,25 @@
  *   reason, as WP-330's `ops-cli` suite was from its merge to CLOSEOUT-3;
  *   a chained `pnpm --filter` command whose package or script does not
  *   exist (pnpm exits 0 when a filter matches nothing); and a stale
- *   exemption.
+ *   exemption. Since `CI-7` r1 (CI7-R1-01), the workspace is read as pnpm
+ *   11.17.0 reads it, through directory symlinks. Every layout where the two
+ *   could disagree is refused (`readWorkspaceManifests`).
  *
  * HOW. `ci-workflow.ts` reads the workflow with a conservative YAML-subset
  * reader, because no YAML library is declared and `package.json` and the
  * lockfile are protected. It throws on anything outside that subset, rather
  * than guessing. The drift check is a pure function of the two texts, so every
  * mutant below, including a `package.json` whose chain gains a command, is an
- * in-memory copy; no tracked file is touched. The one normalization, a bare
+ * in-memory copy; no tracked file is touched. The workspace-discovery
+ * fixtures (`CI-7` r1) need a real filesystem: each is a temporary directory
+ * outside the repository, removed after the file. The one normalization, a bare
  * binary such as `tsc` run as `pnpm exec tsc`, is explained in `ci-workflow.ts`.
  */
-import { readFile, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   DEPENDENT_RUN_BLOCKS,
   GATE_IF,
@@ -70,6 +75,7 @@ import {
   UNCHAINED_INTEGRATION_SCRIPTS,
   type UnchainedIntegrationScript,
   type WorkspaceManifest,
+  type WorkspaceRead,
   type YamlValue,
   chainCommands,
   integrationScriptFindings,
@@ -78,6 +84,7 @@ import {
   nodeJobSteps,
   packageScriptCommand,
   parseWorkflowYaml,
+  readWorkspaceManifests,
   shellCommands,
   splitStepDrift,
   stepRunFor,
@@ -102,35 +109,17 @@ function readRealTexts(): Promise<RealTexts> {
   return realTexts;
 }
 
-interface RealWorkspace {
-  readonly globs: readonly string[];
-  readonly manifests: readonly WorkspaceManifest[];
-}
-
-let realWorkspace: Promise<RealWorkspace> | undefined;
+let realWorkspace: Promise<WorkspaceRead> | undefined;
 
 /**
- * The tracked `pnpm-workspace.yaml` globs, and the manifest of every
- * directory each glob admits that holds a `package.json`, read once (`CI-7`).
- * Each glob is `<directory>/*` (`workspacePackageGlobs` refuses any other
- * form), so listing the directory is the whole match, as pnpm makes it;
- * hidden directories are skipped, as pnpm's globbing does.
+ * The tracked `pnpm-workspace.yaml` globs, and the manifest of every workspace
+ * package they admit, read once (`CI-7`). Since `CI-7` r1 (CI7-R1-01),
+ * `readWorkspaceManifests` admits what pnpm 11.17.0 admits, including a package
+ * reached through a directory symlink, and throws wherever the two could
+ * disagree. The fixtures below pin that against a real filesystem.
  */
-function readRealWorkspace(): Promise<RealWorkspace> {
-  realWorkspace ??= (async () => {
-    const globs = workspacePackageGlobs(await readFile(path.join(repoRoot, "pnpm-workspace.yaml"), "utf8"));
-    const manifests: WorkspaceManifest[] = [];
-    for (const glob of globs) {
-      const parent = glob.slice(0, -"/*".length);
-      for (const entry of await readdir(path.join(repoRoot, parent), { withFileTypes: true })) {
-        if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-        const dir = `${parent}/${entry.name}`;
-        if (!(await readdir(path.join(repoRoot, dir))).includes("package.json")) continue;
-        manifests.push({ dir, text: await readFile(path.join(repoRoot, dir, "package.json"), "utf8") });
-      }
-    }
-    return { globs, manifests };
-  })();
+function readRealWorkspace(): Promise<WorkspaceRead> {
+  realWorkspace ??= readWorkspaceManifests(repoRoot);
   return realWorkspace;
 }
 
@@ -1371,5 +1360,151 @@ describe("CI-7 (CLOSEOUT-3 L1): every workspace package's integration script run
     expect(() => integrationScriptFindings(packageJson, [...manifests, twin])).toThrow(/are both named @polymarket-bot\/ops-cli/u);
     const badScript = { dir: "apps/bad-app", text: JSON.stringify({ name: "@polymarket-bot/bad-app", scripts: { "test:integration": 1 } }) };
     expect(() => integrationScriptFindings(packageJson, [...manifests, badScript])).toThrow(/script `test:integration` is not a string/u);
+  });
+
+  // CI-7 r1 (CI7-R1-01): r0 listed each glob's directory and skipped every entry
+  // that was not itself a directory, so a package reached through a directory
+  // symlink was silently left out, although pnpm admits it and `pnpm --filter`
+  // runs its scripts. These fixtures are temporary workspaces on a real
+  // filesystem, admitting `apps/*`, with real symlinks.
+  const fixtureRoots: string[] = [];
+  afterAll(async () => {
+    await Promise.all(fixtureRoots.map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  /** Writes a `package.json` named `name` with these scripts into `<root>/<dir>`. */
+  async function writePackage(root: string, dir: string, name: string, scripts: Readonly<Record<string, string>>): Promise<void> {
+    await mkdir(path.join(root, dir), { recursive: true });
+    await writeFile(path.join(root, dir, "package.json"), `${JSON.stringify({ name, private: true, scripts }, null, 2)}\n`);
+  }
+
+  /** A temporary workspace admitting `apps/*`, holding the ordinary package `apps/real-app`; `build` adds the rest. */
+  async function fixtureWorkspace(build: (root: string) => Promise<void>): Promise<string> {
+    const root = await mkdtemp(path.join(tmpdir(), "ci7-workspace-"));
+    fixtureRoots.push(root);
+    await writeFile(path.join(root, "pnpm-workspace.yaml"), 'packages:\n  - "apps/*"\n');
+    await writePackage(root, "apps/real-app", "@fx/real-app", { "test:integration": "exit 17" });
+    await build(root);
+    return root;
+  }
+
+  /** A root `package.json` whose `test:integration` chain runs `commands`, and whose other split chains run no package script. */
+  function fixtureRootPackageJson(commands: readonly string[]): string {
+    const scripts = {
+      typecheck: "tsc -b",
+      "test:contract": "vitest run --project contract",
+      "test:integration": commands.join(" && "),
+      "test:fault": "vitest run --project fault",
+    };
+    return `${JSON.stringify({ name: "fixture-root", private: true, scripts }, null, 2)}\n`;
+  }
+
+  it("CI7-R1-01: discovery follows a directory symlink and a symlinked manifest, as pnpm 11.17.0 does, and the rule reports their unchained scripts", async () => {
+    const root = await fixtureWorkspace(async (root) => {
+      // The review's mutant: a package reached through a directory symlink.
+      await writePackage(root, "elsewhere/linked-pkg", "@fx/linked", { "test:integration": "exit 17" });
+      await symlink(path.join("..", "elsewhere", "linked-pkg"), path.join(root, "apps", "linked"), "dir");
+      // A package whose manifest is a symlink.
+      await writePackage(root, "elsewhere/manifest-src", "@fx/manifest-link", { "test:integration": "exit 17" });
+      await mkdir(path.join(root, "apps", "manifest-link"));
+      await symlink(
+        path.join("..", "..", "elsewhere", "manifest-src", "package.json"),
+        path.join(root, "apps", "manifest-link", "package.json"),
+        "file",
+      );
+      // pnpm 11's workspace reader ignores only node_modules and bower_components, so a `test` directory is a package.
+      await writePackage(root, "apps/test", "@fx/test-dir", {});
+      // Not packages, for pnpm or for the reader: a file, a symlink to it, and two directories without a manifest.
+      await writeFile(path.join(root, "apps", "README.md"), "not a package\n");
+      await symlink("README.md", path.join(root, "apps", "file-link"), "file");
+      await mkdir(path.join(root, "apps", "empty"));
+      await mkdir(path.join(root, "apps", ".cache"));
+    });
+    const { globs, manifests } = await readWorkspaceManifests(root);
+    expect(globs).toEqual(["apps/*"]);
+    // The four packages `pnpm ls -r --depth -1` lists for this layout besides the root, measured with pnpm 11.17.0 (CI-7 r1 handoff).
+    expect(manifests.map(({ dir }) => dir)).toEqual(["apps/linked", "apps/manifest-link", "apps/real-app", "apps/test"]);
+    const packageJson = fixtureRootPackageJson(["pnpm --filter @fx/real-app test:integration"]);
+    expect(integrationScriptFindings(packageJson, manifests)).toEqual([
+      expect.stringContaining(unchained("apps/linked", "@fx/linked", "test:integration")),
+      expect.stringContaining(unchained("apps/manifest-link", "@fx/manifest-link", "test:integration")),
+    ]);
+    // Chained, both are workspace packages to the existence check as well: nothing to report.
+    const chained = fixtureRootPackageJson([
+      "pnpm --filter @fx/real-app test:integration",
+      "pnpm --filter @fx/linked test:integration",
+      "pnpm --filter @fx/manifest-link test:integration",
+    ]);
+    expect(integrationScriptFindings(chained, manifests)).toEqual([]);
+  });
+
+  /** One entry the reader must refuse, the fixture that adds it, and the refusal. */
+  const REFUSED_ENTRIES: readonly (readonly [string, (root: string) => Promise<void>, RegExp])[] = [
+    [
+      "a package.yaml manifest, which pnpm admits",
+      async (root) => {
+        await mkdir(path.join(root, "apps", "yaml-app"));
+        await writeFile(path.join(root, "apps", "yaml-app", "package.yaml"), 'name: "@fx/yaml-app"\n');
+      },
+      /^apps\/yaml-app holds package\.yaml\. pnpm 11 admits a package\.yaml or package\.json5 manifest/u,
+    ],
+    [
+      "a package.json5 manifest, which pnpm admits",
+      async (root) => {
+        await mkdir(path.join(root, "apps", "json5-app"));
+        await writeFile(path.join(root, "apps", "json5-app", "package.json5"), '{ name: "@fx/json5-app" }\n');
+      },
+      /^apps\/json5-app holds package\.json5\. pnpm 11 admits/u,
+    ],
+    [
+      "a package.json beside a package.yaml",
+      async (root) => {
+        await writePackage(root, "apps/both", "@fx/both", { "test:integration": "exit 17" });
+        await writeFile(path.join(root, "apps", "both", "package.yaml"), 'name: "@fx/both"\n');
+      },
+      /^apps\/both holds package\.json and package\.yaml\. pnpm 11 admits/u,
+    ],
+    [
+      "a broken directory symlink, whose target may exist elsewhere",
+      async (root) => {
+        await symlink(path.join("..", "nowhere"), path.join(root, "apps", "broken-link"), "dir");
+      },
+      /^apps\/broken-link does not resolve \(ENOENT\)\. A broken symlink may resolve on another machine/u,
+    ],
+    [
+      "a hidden directory holding a manifest",
+      async (root) => {
+        await writePackage(root, "apps/.hidden-app", "@fx/hidden", { "test:integration": "exit 17" });
+      },
+      /^apps\/\.hidden-app holds package\.json, but pnpm 11 admits no hidden, node_modules or bower_components directory/u,
+    ],
+    [
+      "a node_modules directory holding a manifest",
+      async (root) => {
+        await writePackage(root, "apps/node_modules", "@fx/nm", { "test:integration": "exit 17" });
+      },
+      /^apps\/node_modules holds package\.json, but pnpm 11 admits no hidden/u,
+    ],
+    [
+      "a bower_components directory holding a manifest",
+      async (root) => {
+        await writePackage(root, "apps/bower_components", "@fx/bower", { "test:integration": "exit 17" });
+      },
+      /^apps\/bower_components holds package\.json, but pnpm 11 admits no hidden/u,
+    ],
+  ];
+
+  it.each(REFUSED_ENTRIES)("CI7-R1-01: discovery refuses, rather than skips or admits, %s", async (_what, add, refusal) => {
+    const root = await fixtureWorkspace(add);
+    await expect(readWorkspaceManifests(root)).rejects.toThrow(refusal);
+  });
+
+  it("CI7-R1-01: the pnpm parity was measured with pnpm 11.17.0, the version the root package.json pins", async () => {
+    const { packageJson } = await readRealTexts();
+    const { packageManager } = JSON.parse(packageJson) as { readonly packageManager?: unknown };
+    expect(
+      packageManager,
+      "readWorkspaceManifests mirrors pnpm 11.17.0's workspace discovery; on a pnpm change, re-measure it (the CI-7 r1 handoff's probe) and update this pin",
+    ).toBe("pnpm@11.17.0");
   });
 });
