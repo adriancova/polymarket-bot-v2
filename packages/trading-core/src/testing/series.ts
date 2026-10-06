@@ -93,6 +93,9 @@ export function reviewedSeriesDocument(): Record<string, unknown> {
     },
     outcomes: ["Up", "Down"],
     parameters: {
+      // ADR-030 Amendment 2 rule 2: V1 windows only, as the gateway's sample
+      // review (`@polymarket-bot/universe/testing`) states it.
+      acceptedProtocolVersions: ["v1"],
       allowedTickSizes: ["0.01", "0.001"],
       minimumOrderSize: "5",
       negRisk: false,

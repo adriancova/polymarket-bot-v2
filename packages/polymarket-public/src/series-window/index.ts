@@ -29,6 +29,7 @@ export {
   type SeriesWindowBooleanReading,
   type SeriesWindowDecimalReading,
   type SeriesWindowEventReading,
+  type SeriesWindowFieldReading,
   type SeriesWindowMarketReading,
   type SeriesWindowStringReading,
 } from "./door.js";

@@ -64,21 +64,38 @@
  *    REFUSED with an incident naming the flag; its tokens are never
  *    subscribed, and the next window is admitted. r4 judged only the event's
  *    flag, and admitted each of the market cases.
+ * 13. **`V2-1` (ADR-030 Amendment 2 rules 1-3)** — a Protocol V2 window, built
+ *    from the documented example (S-D16) with the canary's observed ids, is
+ *    admitted with the ids its `version` selects (`positionIds`, even beside
+ *    a populated `clobTokenIds`); the CLOB read sends its condition id
+ *    right-padded to 32 bytes, and `t[]` pairs on `clob-markets-v2.jsonc`;
+ *    Gamma's 31-byte id stays the identity. Every unclear window is REFUSED by
+ *    name with the existing incident: a missing or unknown version, ids not
+ *    yet available, a version the review does not accept, a condition id of
+ *    another width (no read is made), and a CLOB `v` that disagrees. The
+ *    collision check reads the selected ids. The V1 admission output on
+ *    `series-window.json` is byte-identical to `af3a1c9`'s.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import { ADMISSION_LEDGER_FILE_NAME, GatewayConfigurationError, incidentReferenceId } from "@polymarket-bot/data-gateway";
-import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
+import {
+  readClobMarketInfoBody,
+  readGammaSeriesEventsBody,
+  type PublicHttpRequest,
+  type PublicHttpResponse,
+} from "@polymarket-bot/polymarket-public";
 import { createMemoryFileSystem, type MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
-import { reviewedBtc15mSeriesDocument, RECORDED_WINDOW } from "@polymarket-bot/universe/testing";
-import { windowInternalMarketId } from "@polymarket-bot/universe";
+import { PROTOCOL_V2_SAMPLES, reviewedBtc15mSeriesDocument, RECORDED_WINDOW } from "@polymarket-bot/universe/testing";
+import { judgeSeriesWindow, parseReviewedSeries, windowInternalMarketId } from "@polymarket-bot/universe";
 import { describe, expect, it } from "vitest";
 
-import { buildHarness, polymarketRestBook, type Harness } from "./support/harness.js";
+import { buildHarness, MARKET, polymarketRestBook, type Harness } from "./support/harness.js";
 import { recordedFrames } from "./support/wal.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -91,14 +108,34 @@ const [KEYSET_PAGE, CLOB_2215, CLOB_2230] = fixture.examples.map((example) => ex
   Record<string, unknown>,
 ];
 
-/** Every recorded window's token → its condition id, for the CLOB book stub. */
-const CONDITION_OF_TOKEN = new Map<string, string>(
-  KEYSET_PAGE.events.flatMap((event) => {
+/**
+ * `V2-1` (plan row D5): a fixture market's trading ids, selected by its
+ * `version` as the judge selects them (ADR-030 Amendment 2 rule 1; F-38):
+ * `positionIds` for `"v2"`, the decoded `clobTokenIds` for `"v1"`, none else.
+ */
+function tradingIdsOf(market: Record<string, unknown>): readonly string[] {
+  if (market["version"] === "v2") return market["positionIds"] as string[];
+  if (market["version"] === "v1") return JSON.parse(String(market["clobTokenIds"])) as string[];
+  return [];
+}
+
+/** `V2-1`: the public V2 captures of `VENUE-4` (`test/fixtures/venue/protocol-v2/`, strict JSON). */
+function protocolV2Capture(name: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(resolve(here, "../../fixtures/venue/protocol-v2", `${name}.jsonc`), "utf8")) as Record<string, unknown>;
+}
+/** S-L01: `GET /clob-markets/{64-hex}` for the V2 canary — `t[].t` its position ids, `"v":"v2"`. */
+const CLOB_V2 = protocolV2Capture("clob-markets-v2");
+/** S-D16: the documented V2 Gamma market — `version` "v2", `clobTokenIds` null, `positionIds` an array. */
+const GAMMA_V2_EXAMPLE = protocolV2Capture("gamma-market-v2-docs-example");
+
+/** Every recorded window's token → its condition id, for the CLOB book stub (the V2 canary's ids → its 32-byte `c`, as O.2 observed). */
+const CONDITION_OF_TOKEN = new Map<string, string>([
+  ...KEYSET_PAGE.events.flatMap((event) => {
     const market = (event["markets"] as Record<string, unknown>[])[0] ?? {};
-    const tokens = JSON.parse(String(market["clobTokenIds"])) as string[];
-    return tokens.map((token): [string, string] => [token, String(market["conditionId"])]);
+    return tradingIdsOf(market).map((token): [string, string] => [token, String(market["conditionId"])]);
   }),
-);
+  ...(CLOB_V2["t"] as { t: string }[]).map((token): [string, string] => [token.t, String(CLOB_V2["c"])]),
+]);
 
 const GAMMA_BASE = "http://gamma.stub";
 const CLOB_BASE = "http://clob.stub";
@@ -357,7 +394,7 @@ describe("ROLLOVER-1: the concurrent-window cap, and teardown", () => {
     const third = KEYSET_PAGE.events[2] as Record<string, unknown>;
     const thirdMarket = (third["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
     const thirdCondition = String(thirdMarket["conditionId"]);
-    const thirdTokens = JSON.parse(String(thirdMarket["clobTokenIds"])) as [string, string];
+    const thirdTokens = tradingIdsOf(thirdMarket) as [string, string];
     const clob = {
       [WINDOW_2215.conditionId]: CLOB_2215,
       [WINDOW_2230.conditionId]: CLOB_2230,
@@ -534,7 +571,7 @@ describe("ROLLOVER-1: an admission incident never names no market (ADR-023 D2 ru
 function recordedEvent(index: number): { readonly conditionId: string; readonly yes: string; readonly no: string; readonly openMs: number } {
   const event = KEYSET_PAGE.events[index] as Record<string, unknown>;
   const market = (event["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
-  const [yes, no] = JSON.parse(String(market["clobTokenIds"])) as [string, string];
+  const [yes, no] = tradingIdsOf(market) as [string, string];
   return { conditionId: String(market["conditionId"]), yes, no, openMs: Date.parse(String(market["eventStartTime"])) };
 }
 
@@ -1220,4 +1257,291 @@ describe("ROLLOVER-1 r5 (R5-ASTRA-01): a window whose MARKET-level negRisk is no
       await harness.gateway.stop();
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// V2-1 (ADR-030 Amendment 2 rules 1-3; `docs/venue/protocol-v2-migration-plan.md`
+// package V2-1, rows A1, A4-A8, D3, D5): Protocol V2 windows through the real
+// gateway. No V2 market of our series has been observed on Gamma (U-36), so
+// the V2 window is the recorded 22:15 window carrying the documented example's
+// V2 fields (S-D16: `version`, `clobTokenIds`, `positionIds`) with the
+// canary's observed ids (S-L01), its 31-byte condition id (F-43) and its tick.
+// ---------------------------------------------------------------------------
+
+const [V2_UP, V2_DOWN] = (CLOB_V2["t"] as { t: string }[]).map((token) => token.t) as [string, string];
+const V2_WINDOW = {
+  conditionId31: PROTOCOL_V2_SAMPLES.canaryConditionId31,
+  conditionId32: String(CLOB_V2["c"]),
+  up: V2_UP,
+  down: V2_DOWN,
+  id: windowInternalMarketId(PROTOCOL_V2_SAMPLES.canaryConditionId31, Date.UTC(2026, 9, 4, 22, 15)),
+};
+/** The live V1 btc-15m window's CTF ids (S-G04): a populated `clobTokenIds` beside a V2 market's `positionIds`. */
+const OTHER_CTF_IDS = [
+  "25070934348813416902477876984955073880416401960631253331845590271167412497744",
+  "111614563957165270026378011809694313565736745512637881727398424401624030147043",
+] as const;
+
+/** A review accepting V1 and V2 windows (the operator's step before the switchover, `V2-0` follow-up 3). */
+function reviewAccepting(accepted: readonly string[]): Record<string, unknown> {
+  const document = reviewedBtc15mSeriesDocument();
+  return { ...document, parameters: { ...(document["parameters"] as Record<string, unknown>), acceptedProtocolVersions: accepted } };
+}
+
+/** The recorded page with its first window as a V2 market (then `mutate`d); the 22:30 window stays V1. */
+function v2Page(mutate: (market: Record<string, unknown>) => void = () => undefined): () => unknown {
+  return () => {
+    const page = structuredClone(KEYSET_PAGE);
+    const market = ((page.events[0] as Record<string, unknown>)["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+    market["version"] = GAMMA_V2_EXAMPLE["version"];
+    market["clobTokenIds"] = GAMMA_V2_EXAMPLE["clobTokenIds"];
+    market["positionIds"] = [V2_WINDOW.up, V2_WINDOW.down];
+    market["conditionId"] = V2_WINDOW.conditionId31;
+    market["orderPriceMinTickSize"] = CLOB_V2["mts"];
+    mutate(market);
+    return page;
+  };
+}
+
+/** The stub CLOB: the canary's body under its 32-byte id ONLY — the 31-byte form is a 404, as F-70 observed. */
+function v2Stub(options: { readonly mutate?: (market: Record<string, unknown>) => void; readonly clobV2?: Record<string, unknown> } = {}) {
+  return venueStub({
+    page: v2Page(options.mutate),
+    clob: { [V2_WINDOW.conditionId32]: options.clobV2 ?? CLOB_V2, [WINDOW_2230.conditionId]: CLOB_2230 },
+  });
+}
+
+/** A ledger record's mismatches as one text, quotes unescaped. */
+function mismatchesOf(record: Record<string, unknown> | undefined): string {
+  return ((record?.["mismatches"] as string[] | undefined) ?? []).join(" | ");
+}
+
+function clobReadsOf(stub: { readonly requests: readonly string[] }, conditionId: string): number {
+  return stub.requests.filter((url) => url === `${CLOB_BASE}/clob-markets/${conditionId}`).length;
+}
+
+async function startedUnder(stub: ReturnType<typeof venueStub>, accepted: readonly string[], overrides: Record<string, unknown> = {}): Promise<Harness> {
+  return started(stub, { config: admissionConfig(overrides, reviewAccepting(accepted)) });
+}
+
+describe("V2-1 acceptance 1, 5 and 6: a V2 window is admitted with the ids its version selects, read at 32 bytes, identified at 31", () => {
+  it("built from the documented example: positionIds admitted, the CLOB read sent right-padded, t[] paired on clob-markets-v2.jsonc, Gamma's 31-byte id the identity", async () => {
+    const stub = v2Stub();
+    const harness = await startedUnder(stub, ["v1", "v2"]);
+
+    const admitted = harness.publishedOfType("SeriesWindowAdmitted").map(payloadOf);
+    expect(admitted.map((payload) => payload["internalMarketId"])).toEqual([V2_WINDOW.id, WINDOW_2230.id]);
+    expect(admitted[0]).toMatchObject({
+      internalMarketId: V2_WINDOW.id,
+      conditionId: V2_WINDOW.conditionId31,
+      yesTokenId: V2_WINDOW.up,
+      noTokenId: V2_WINDOW.down,
+      tickSize: "0.01",
+    });
+    expect(payloadOf(harness.publishedOfType("MarketDiscovered")[0])).toMatchObject({
+      conditionId: V2_WINDOW.conditionId31,
+      yesTokenId: V2_WINDOW.up,
+      noTokenId: V2_WINDOW.down,
+    });
+    // The read went to the 32-byte form, once; never to the 31-byte form (a 404 at the venue, F-70).
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(1);
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId31)).toBe(0);
+    // The journaled frame the admission cites is that 32-byte read.
+    const frames = recordedFrames(harness.walFileSystem, harness.gateway.gatewayEpoch);
+    const causation = harness.publishedOfType("SeriesWindowAdmitted")[0]?.causationId ?? "";
+    const cited = frames.find((frame) => frame.ingestSeq === causation.split(":").at(-1));
+    expect(cited?.endpoint).toBe(`${CLOB_BASE}/clob-markets/${V2_WINDOW.conditionId32}`);
+    // Gamma's text is the identity: the ledger key, the derived id.
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]?.["status"]).toBe("ADMITTED");
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId32]).toBeUndefined();
+    expect(subscribedTokens(harness)).toEqual(expect.arrayContaining([V2_WINDOW.up, V2_WINDOW.down]));
+    await harness.gateway.stop();
+  });
+
+  it("with BOTH fields populated, \"v2\" admits positionIds: the CTF ids reach no event and no subscription", async () => {
+    const stub = v2Stub({ mutate: (market) => void (market["clobTokenIds"] = JSON.stringify(OTHER_CTF_IDS)) });
+    const harness = await startedUnder(stub, ["v1", "v2"]);
+    expect(payloadOf(harness.publishedOfType("SeriesWindowAdmitted")[0])).toMatchObject({ yesTokenId: V2_WINDOW.up, noTokenId: V2_WINDOW.down });
+    const published = JSON.stringify(harness.published().map((envelope) => envelope.payload));
+    for (const ctf of OTHER_CTF_IDS) {
+      expect(published).not.toContain(ctf);
+      expect(subscribedTokens(harness)).not.toContain(ctf);
+    }
+    await harness.gateway.stop();
+  });
+});
+
+describe("V2-1 acceptance 2, 3 and 4: every unclear V2 window is REFUSED by name, with the existing incident", () => {
+  for (const [name, mutate, mismatch] of [
+    ["a missing version", (m: Record<string, unknown>) => void delete m["version"], /Market\.version is absent/u],
+    ["a null version", (m: Record<string, unknown>) => void (m["version"] = null), /Market\.version is null/u],
+    ["an unknown version", (m: Record<string, unknown>) => void (m["version"] = "v3"), /Market\.version is "v3", not a supported protocol version/u],
+    ["positionIds null beside populated clobTokenIds (not yet available, F-40)", (m: Record<string, unknown>) => {
+      m["positionIds"] = null;
+      m["clobTokenIds"] = JSON.stringify(OTHER_CTF_IDS);
+    }, /Market\.positionIds, the field Market\.version "v2" selects, is null: the window's ids are not yet available/u],
+    ["positionIds absent", (m: Record<string, unknown>) => void delete m["positionIds"], /Market\.positionIds, the field Market\.version "v2" selects, is absent/u],
+    ["positionIds as a JSON-encoded string", (m: Record<string, unknown>) => void (m["positionIds"] = JSON.stringify([V2_WINDOW.up, V2_WINDOW.down])), /is not an array of decimal strings/u],
+    ["one position id", (m: Record<string, unknown>) => void (m["positionIds"] = [V2_WINDOW.up]), /not exactly two position ids/u],
+    ["a non-decimal position id", (m: Record<string, unknown>) => void (m["positionIds"] = [`+${V2_WINDOW.up}`, V2_WINDOW.down]), /index-0 position id .* is not a canonical token id/u],
+    ["two equal position ids", (m: Record<string, unknown>) => void (m["positionIds"] = [V2_WINDOW.up, V2_WINDOW.up]), /the two position ids are the same id/u],
+    ["the documented example's outcomes (Yes/No)", (m: Record<string, unknown>) => void (m["outcomes"] = GAMMA_V2_EXAMPLE["outcomes"]), /Market\.outcomes/u],
+  ] as const) {
+    it(`refuses ${name}: a REFUSED record naming it, GATEWAY_SERIES_WINDOW_REFUSED naming the window, no admission`, async () => {
+      const harness = await startedUnder(v2Stub({ mutate }), ["v1", "v2"]);
+      expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+      const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+      expect(record?.["status"]).toBe("REFUSED");
+      expect(mismatchesOf(record)).toMatch(mismatch);
+      const refused = harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_SERIES_WINDOW_REFUSED");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.detail).toMatch(mismatch);
+      expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[V2_WINDOW.id]]);
+      expect(subscribedTokens(harness)).not.toContain(V2_WINDOW.up);
+      await harness.gateway.stop();
+    });
+  }
+
+  it("acceptance 4: under the sample review (acceptedProtocolVersions [\"v1\"]) the V2 window is REFUSED, naming the reviewed list; the V1 window beside it is admitted", async () => {
+    const harness = await startedUnder(v2Stub(), ["v1"]);
+    expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+    const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+    expect(record?.["status"]).toBe("REFUSED");
+    expect(mismatchesOf(record)).toMatch(/Market\.version is "v2", not one of the reviewed acceptedProtocolVersions \["v1"\]/u);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[V2_WINDOW.id]]);
+    await harness.gateway.stop();
+  });
+
+  it("acceptance 4: a review that accepts only v2 refuses the V1 window and admits the V2 one", async () => {
+    const harness = await startedUnder(v2Stub(), ["v2"]);
+    expect(admittedIds(harness)).toEqual([V2_WINDOW.id]);
+    expect(ledger(harness.walFileSystem)[WINDOW_2230.conditionId]?.["status"]).toBe("REFUSED");
+    await harness.gateway.stop();
+  });
+
+  it("acceptance 4: a review without acceptedProtocolVersions stops the gateway at its configuration door", async () => {
+    const document = reviewedBtc15mSeriesDocument();
+    const parameters = { ...(document["parameters"] as Record<string, unknown>) };
+    delete parameters["acceptedProtocolVersions"];
+    await expect(
+      buildHarness({ config: admissionConfig({}, { ...document, parameters }), http: venueStub().route, clockStartMs: NOW_MS }),
+    ).rejects.toThrow(GatewayConfigurationError);
+  });
+});
+
+describe("V2-1 acceptance 5: a condition id of another width gets NO CLOB read and is refused by name (rule 3)", () => {
+  for (const [name, conditionId] of [
+    ["63 hex digits", `${PROTOCOL_V2_SAMPLES.canaryConditionId31}0`],
+    ["65 hex digits", `${PROTOCOL_V2_SAMPLES.canaryConditionId32}0`],
+    ["a short id", "0xab"],
+  ] as const) {
+    it(`${name}: no request, a REFUSED record naming rule 3, the incident, and the read budget kept for the next window`, async () => {
+      const stub = v2Stub({ mutate: (market) => void (market["conditionId"] = conditionId) });
+      const harness = await startedUnder(stub, ["v1", "v2"]);
+      expect(stub.requests.filter((url) => url.startsWith(`${CLOB_BASE}/clob-markets/${conditionId.slice(0, 40)}`))).toEqual([]);
+      const record = ledger(harness.walFileSystem)[conditionId];
+      expect(record?.["status"]).toBe("REFUSED");
+      expect(mismatchesOf(record)).toMatch(/is neither 31 bytes \(0x and 62 hex digits\) nor 32 bytes/u);
+      expect(harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_SERIES_WINDOW_REFUSED")).toHaveLength(1);
+      expect(harness.incidents.map((incident) => incident.reasonCode)).not.toContain("GATEWAY_SERIES_CLOB_READ_FAILED");
+      expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+      await harness.gateway.stop();
+    });
+  }
+
+  it("a 32-byte V1 id is sent unchanged (the recorded windows)", async () => {
+    const stub = venueStub();
+    const harness = await started(stub);
+    expect(clobReadsOf(stub, WINDOW_2215.conditionId)).toBe(1);
+    expect(clobReadsOf(stub, `${WINDOW_2215.conditionId}00`)).toBe(0);
+    await harness.gateway.stop();
+  });
+});
+
+describe("V2-1 acceptance 8: CLOB v is a labelled, refusal-only cross-check (C-21)", () => {
+  it("present and equal (\"v2\" on the canary's body): admitted — the first test above", async () => {
+    const harness = await startedUnder(v2Stub(), ["v1", "v2"]);
+    expect(admittedIds(harness)).toContain(V2_WINDOW.id);
+    await harness.gateway.stop();
+  });
+
+  it("present and different: REFUSED, naming both versions, with the incident", async () => {
+    const harness = await startedUnder(v2Stub({ clobV2: { ...CLOB_V2, v: "v1" } }), ["v1", "v2"]);
+    expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+    const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+    expect(record?.["status"]).toBe("REFUSED");
+    expect(mismatchesOf(record)).toMatch(/cross-check: CLOB v \(undocumented, C-21\) is "v1", but Gamma Market\.version is "v2"/u);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[V2_WINDOW.id]]);
+    await harness.gateway.stop();
+  });
+
+  it("absent: refuses nothing", async () => {
+    const body = { ...CLOB_V2 };
+    delete body["v"];
+    const harness = await startedUnder(v2Stub({ clobV2: body }), ["v1", "v2"]);
+    expect(admittedIds(harness)).toEqual([V2_WINDOW.id, WINDOW_2230.id]);
+    await harness.gateway.stop();
+  });
+});
+
+describe("V2-1 (plan row A8): the collision check reads the ids the version selects, and only those", () => {
+  it("a configured market holding a selected position id: the V2 window is skipped as known, with no CLOB read", async () => {
+    const stub = v2Stub();
+    const harness = await startedUnder(stub, ["v1", "v2"], { markets: [{ ...MARKET, gammaMarketId: "999", yesTokenId: V2_WINDOW.up }] });
+    expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(0);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+    expect(harness.gateway.metrics().seriesAdmission?.windowsSkippedKnown).toBeGreaterThanOrEqual(1);
+    await harness.gateway.stop();
+  });
+
+  it("a configured market holding an id of the field the version does NOT select: not a collision, the V2 window is admitted", async () => {
+    const stub = v2Stub({ mutate: (market) => void (market["clobTokenIds"] = JSON.stringify(OTHER_CTF_IDS)) });
+    const harness = await startedUnder(stub, ["v1", "v2"], { markets: [{ ...MARKET, gammaMarketId: "999", yesTokenId: OTHER_CTF_IDS[0] }] });
+    expect(admittedIds(harness)).toEqual([V2_WINDOW.id, WINDOW_2230.id]);
+    await harness.gateway.stop();
+  });
+});
+
+describe("V2-1 acceptance 7: the V1 admission output on series-window.json is byte-identical to af3a1c9's", () => {
+  /**
+   * The judge's verdicts on the twelve recorded windows, read through the
+   * door, under the sample review — `acceptedProtocolVersions: ["v1"]` now —
+   * and the review hash af3a1c9's sample review had (the hash is an INPUT of
+   * the judge; the review's own hash changed with the added field, as ADR-030
+   * Amendment 2 rule 2 item 3 says a review change does). The digests were
+   * taken at af3a1c9 with the same code path.
+   */
+  const AF3A1C9_REVIEW_HASH = "2ec9d02c2ec78cb81a3f115db1c5e3c99ff43d137c41a0148204aa30346309f0";
+
+  function verdictsDigest(clobFor: (index: number, market: Record<string, unknown>) => Record<string, unknown> | undefined): string {
+    const parsed = parseReviewedSeries(reviewedBtc15mSeriesDocument());
+    if (!parsed.ok) throw new Error(parsed.issues.join("; "));
+    const page = readGammaSeriesEventsBody(JSON.stringify(KEYSET_PAGE));
+    if (page.status !== "ok") throw new Error("unreadable fixture");
+    const verdicts = page.events.map((event, index) => {
+      const market = (KEYSET_PAGE.events[index]?.["markets"] as Record<string, unknown>[])[0] ?? {};
+      const body = clobFor(index, market);
+      const clob = body === undefined ? undefined : readClobMarketInfoBody(JSON.stringify(body));
+      if (clob !== undefined && clob.status !== "ok") throw new Error("unreadable CLOB body");
+      return judgeSeriesWindow(parsed.series, AF3A1C9_REVIEW_HASH, event, clob?.reading);
+    });
+    return createHash("sha256").update(JSON.stringify(verdicts), "utf8").digest("hex");
+  }
+
+  it("the recorded reads (S-G03 with S-K03a and S-K04a): two admitted, ten refused for the missing read", () => {
+    const recorded: Record<string, Record<string, unknown>> = { [WINDOW_2215.conditionId]: CLOB_2215, [WINDOW_2230.conditionId]: CLOB_2230 };
+    expect(verdictsDigest((_index, market) => recorded[String(market["conditionId"])])).toBe(
+      "49d98f225ec7126becad1481e3bc6c054bd5d586f8e839b8ed57633a557a1ba9",
+    );
+  });
+
+  it("every window with its own CLOB body (S-K04a's shape): twelve admitted", () => {
+    expect(
+      verdictsDigest((_index, market) => {
+        const [yes, no] = tradingIdsOf(market) as [string, string];
+        return { ...CLOB_2230, t: [{ t: yes, o: "Up" }, { t: no, o: "Down" }], mts: market["orderPriceMinTickSize"], c: market["conditionId"] };
+      }),
+    ).toBe("65645da112e340d891697ffe1bbd4846e3ece1e82b325fc5766ce433b62f8752");
+  });
 });
