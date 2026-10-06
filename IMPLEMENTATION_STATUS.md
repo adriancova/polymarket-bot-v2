@@ -175,11 +175,11 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `DEPS-3` | Patch the `tinypool` and `source-map-js` advisories (dev/test only) | Complete (2026-10-05) | `1237afe` | [DEPS-3](docs/handoffs/DEPS-3.md) |
 | `VENUE-4` | Protocol V2 and Data API v2 venue facts, and the migration plan | Complete (2026-10-05) | `f925a43` | [VENUE-4](docs/handoffs/VENUE-4.md) |
 | `CLOSEOUT-3` | The fresh read-only Wave 3 closeout audit (runbook §10) | WAVE 3 IS COMPLETE WITH QUALIFICATIONS (2026-10-06) | — (an audit) | [CLOSEOUT-3](docs/handoffs/CLOSEOUT-3-wave-3-closeout.md) |
-| `V2-0` | Protocol V2 governance: the dated ADR amendments and the user's rulings (docs only) | Complete (2026-10-06) | `5f2b3c8` | [V2-0](docs/handoffs/V2-0.md) |
 | `V2-1` | Protocol V2 version-selected identifiers and series admission (class A, PAPER) | Complete (2026-10-06) | `8558053` | [V2-1](docs/handoffs/V2-1.md) |
 | `V2-3` | Protocol V2 resolution via a journaled `/v2/resolutions` read; not-yet-admissible V2 windows (class A) | Complete (2026-10-06) | `3ee3e1d` | [V2-3](docs/handoffs/V2-3.md) |
 | `V2-5` | `@polymarket/client` 0.11.0 → 0.12.0 in `polymarket-secure` (security review) | Complete (2026-10-06) | `1d9bfb0` | [V2-5](docs/handoffs/V2-5.md) |
 | `V2-10` | Simulation fill fidelity (F-63 floor; opt-in FOK/FAK collateral target; `V2-10B` owed) | Complete (2026-10-06) | `fd794dd` | [V2-10](docs/handoffs/V2-10.md) |
+| `ADR-034` | Pre-live order-lifecycle design (WP340-F1, CO3-N1, CO3-N2, V2-10B) + venue addendum | **Running** (authorized 2026-10-06) | — | — |
 | `RECORDS-W3B` | Completed packages leave this table for `docs/handoffs/INDEX.md` (budget fix) | **Running** (authorized 2026-10-06) | — | — |
 | `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER) | Complete (2026-10-06) | `9836ab0` | [V2-2](docs/handoffs/V2-2.md) |
 | `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | Complete (2026-10-06) | `9e28bc2` | [CI-7](docs/handoffs/CI-7.md) |
