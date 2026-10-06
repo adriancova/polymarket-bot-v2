@@ -558,6 +558,38 @@ only refuse.
 Gamma record also carries `clobTokenIds` can no longer be admitted with the
 CTF ids (plan A1).
 
+**Note, 2026-10-06 (`V2-3` item 7): ids not yet available.**
+- **Standing:** the orchestrator's interim ruling for PAPER and BACKTEST,
+  made 2026-10-06, on `V2-1`'s known risk V21-FABLE-03. The user may confirm
+  or overrule it. It refines item 3's second bullet only.
+- **The problem.** The gateway judges a window once, and a refusal is final
+  (Decision 1.4). Gamma lists a series' windows up to about a day ahead.
+  Whether `positionIds` is present at listing is unknown (U-I3). If a V2
+  window's ids are filled in later, every V2 window would be refused at first
+  sight.
+- **The ruling.**
+  1. A window whose `version` is accepted (rule 2), but whose selected id
+     field is absent or `null` ("the IDs are not yet available", F-40), is
+     **not yet admissible**. It is not a refusal: no `REFUSED` record is
+     written and no incident is raised, and it is judged again at each later
+     discovery poll.
+  2. It becomes a final refusal, with the existing incident, if the field is
+     still absent or `null` when it is judged at or after the window's
+     scheduled open, on event time: the receipt instant of the read it was
+     judged from.
+  3. Every other refusal reason stays final, as `V2-1` made it. A window that
+     has another mismatch beside its missing ids is refused at once.
+- **As implemented** (`judgeSeriesWindow`'s `NOT_YET_ADMISSIBLE`,
+  `packages/universe/src/series-admission.ts`; `SeriesAdmissionFeedDriver`).
+  - With no ids, the CLOB `t[]` pairing cannot compare ids, so only its
+    labels are judged until the ids arrive.
+  - For `"v1"`, the series-window door reads `clobTokenIds` as a string or
+    `null`, and its `null` also covers a value of another type. Such a value
+    is therefore held until the open too, then refused.
+- **Why it fails closed:** a not-yet-admissible window is never admitted, and
+  holds no cap slot. Once its ids arrive, it is judged in full, exactly as at
+  first sight. Past its open, the refusal is final, as before.
+
 ### Rule 2. The accepted protocol versions are a reviewed series parameter
 
 **Refines:** Decisions 1.1 and 1.4, and Decision 4.3.

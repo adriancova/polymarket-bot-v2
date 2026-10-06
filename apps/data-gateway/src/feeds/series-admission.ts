@@ -126,6 +126,43 @@
  *    market-channel frame it was first derived from. So the re-publication
  *    waits for that epoch's first SUCCESSFUL keyset read: while Gamma's keyset
  *    read fails, an owed resolution stays owed (and its window in its slot).
+ * 8. **`V2-3`: the resolution check** (ADR-030 Amendment 2 rules 4 and 5, the
+ *    orchestrator's interim ruling for PAPER and BACKTEST; `./resolution-check.ts`
+ *    states the rule, the interval, the budget and the journal). After
+ *    discovery, every live, confirmed window past its scheduled close with no
+ *    resolution owed or published, and whose row path has not ended, gets one
+ *    journaled `GET /v2/resolutions?condition=<32-byte form>` read, at most
+ *    `maximumConcurrentWindows` per series per cycle. A PUBLISHABLE row
+ *    publishes `MarketResolved@1` (`sourceChannel`
+ *    `polymarket:data-api-resolutions-rest`, citing the journaled response),
+ *    recorded, owed and discharged exactly like a frame's (step 1), so the
+ *    window retires `RESOLVED`. A PENDING or FAILED read raises nothing; the
+ *    unresolved-window incident still opens at the bound, carrying the latest
+ *    read's result. A REFUSED row ends the window's row path — in memory and
+ *    in the ledger (a `resolution-row-refused:` record), so a restart does
+ *    not read it again — and raises `GATEWAY_SERIES_WINDOW_UNRESOLVED` at
+ *    once, with the reason.
+ *
+ *    **Two sources.** The market channel is never held back: a frame's
+ *    `MarketResolved` is dispatched as before ({@link SeriesAdmissionFeedDriver.noteResolution}).
+ *    The FIRST resolution observed stands, here and at the trader (Amendment
+ *    1, rule 3), so a row publishes only while nothing is owed. A row that
+ *    AGREES with a resolution observed while it was read is a harmless repeat
+ *    and raises nothing (V2-0's R2-OPUS-L1). A DISAGREEMENT, in either order
+ *    — a row against a frame observed first, or a frame against a row (or an
+ *    earlier epoch's recorded resolution, whose source is not recorded) —
+ *    publishes nothing from the row, and raises `GATEWAY_SERIES_WINDOW_UNRESOLVED`
+ *    at once under a scope of its own (`<feedId>:<window>:resolution-disagreement`),
+ *    which the window's retirement does not close.
+ *
+ * `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06; V2-1's
+ * V21-FABLE-03): a window whose accepted `version` selects an id field that is
+ * absent or `null` is NOT YET ADMISSIBLE (the judge's `NOT_YET_ADMISSIBLE`):
+ * nothing is recorded and it is judged again at each later discovery poll. It
+ * is REFUSED, finally and with the existing incident, if the field is still
+ * absent or `null` when it is judged at or after its scheduled open, on the
+ * receipt instant of the read it was judged from. Every other refusal stays
+ * final.
  *
  * ## PAPER or BACKTEST only (Decision 2; acceptance 2)
  *
@@ -171,6 +208,7 @@
  */
 
 import {
+  DATA_API_RESOLUTIONS_REST_CHANNEL,
   readClobMarketInfoBody,
   readGammaSeriesEventsBody,
   requestClobMarketInfo,
@@ -188,6 +226,7 @@ import {
   type FeedStalePayload,
   type IncidentSeverity,
   type MarketDiscoveredPayload,
+  type MarketResolvedPayload,
   type SeriesWindowAdmittedPayload,
   type TradingParametersChangedPayload,
 } from "@polymarket-bot/domain";
@@ -221,6 +260,20 @@ import { isoFromMs, takeReceipt } from "../ports.js";
 import type { PublishOutcome } from "../publisher.js";
 
 import type { DispatchedResolution } from "./polymarket.js";
+import {
+  readResolutionOnce,
+  RESOLUTION_READ_TIMEOUT_MS,
+  ResolutionRowPaths,
+  rowRefusalMarker,
+  rowRefusalMarkerOf,
+  type JournaledAnswerFrame,
+  type ResolutionFinding,
+  type ResolutionRead,
+  type RowOutcome,
+} from "./resolution-check.js";
+
+/** Where a window's standing resolution came from, in this epoch (`V2-3`, "Two sources"). */
+type ResolutionSource = "MARKET_CHANNEL" | "DATA_API_ROW";
 
 /** One reviewed series as the configuration door parsed it. */
 export interface AdmittedSeries {
@@ -265,6 +318,10 @@ export interface SeriesAdmissionDriverOptions {
   readonly gatewayEpoch: string;
   /** `ROLLOVER-1` r3 (R3-FABLE-01): the operator's named retirements (`config.ts`). */
   readonly operatorRetirements?: readonly OperatorRetirement[];
+  /** `V2-3`: the Data API origin of the `/v2/resolutions` read; the documented one when absent. */
+  readonly dataApiBaseUrl?: string | undefined;
+  /** `V2-3`: one `/v2/resolutions` read's timeout (`RESOLUTION_READ_TIMEOUT_MS` when absent). */
+  readonly resolutionReadTimeoutMs?: number;
 }
 
 /** One `seriesAdmission.operatorRetirements` entry. */
@@ -325,6 +382,29 @@ export interface SeriesAdmissionDriverMetrics {
   readonly operatorRetirementsDeferred: number;
   /** Operator retirements naming no window the ledger holds. */
   readonly operatorRetirementsUnmatched: number;
+  /**
+   * `V2-3` item 7: judgements of a window whose selected id field was absent
+   * or `null` before its scheduled open — not recorded, judged again next poll.
+   */
+  readonly windowsNotYetAdmissible: number;
+  /** `V2-3`: `/v2/resolutions` reads attempted (each within the cycle's budget). */
+  readonly resolutionReads: number;
+  /** `V2-3`: eligible windows left for the next cycle because the cycle's read budget was spent. */
+  readonly resolutionReadsDeferredByBudget: number;
+  /** `V2-3`: reads that found a miss or a pending row. */
+  readonly resolutionReadsPending: number;
+  /** `V2-3`: reads that failed (no answer, an error status, a body that is not JSON, a WAL refusal). */
+  readonly resolutionReadsFailed: number;
+  /** `V2-3`: rows refused (each ends its window's row path, with an incident). */
+  readonly resolutionRowsRefused: number;
+  /** `V2-3`: resolutions published from a row. */
+  readonly resolutionRowsPublished: number;
+  /** `V2-3` (R2-OPUS-L1): rows that agreed with a resolution observed while they were read — harmless repeats. */
+  readonly resolutionRowsRepeated: number;
+  /** `V2-3`: disagreements between a row and a frame (or an earlier epoch's resolution), each reported once. */
+  readonly resolutionDisagreements: number;
+  /** `V2-3`: windows whose row path has ended (refused or published), this epoch or recorded by an earlier one. */
+  readonly resolutionRowPathsEnded: number;
 }
 
 /** A journaled response the derived events cite. */
@@ -473,6 +553,23 @@ export class SeriesAdmissionFeedDriver {
   #retiredByOperator = 0;
   #operatorDeferred = 0;
   #operatorUnmatched = 0;
+  #notYetAdmissible = 0;
+  /** `V2-3`: each window's latest `/v2/resolutions` read, and the windows whose row path has ended. */
+  readonly #rowPaths = new ResolutionRowPaths();
+  /**
+   * `V2-3` ("Two sources"): the source of each window's FIRST resolution
+   * observed in this epoch, by window id. A standing resolution with no entry
+   * was recorded by an earlier epoch, whose source the ledger does not keep.
+   */
+  readonly #resolutionSources = new Map<string, ResolutionSource>();
+  #resolutionReads = 0;
+  #resolutionReadsDeferred = 0;
+  #resolutionReadsPending = 0;
+  #resolutionReadsFailed = 0;
+  #resolutionRowsRefused = 0;
+  #resolutionRowsPublished = 0;
+  #resolutionRowsRepeated = 0;
+  #resolutionDisagreements = 0;
 
   constructor(options: SeriesAdmissionDriverOptions) {
     // ADR-030 Decision 2.1 (acceptance 2): refuse to START outside PAPER/BACKTEST.
@@ -516,6 +613,12 @@ export class SeriesAdmissionFeedDriver {
     }
     this.#replayOwed = owed;
     this.#resolutionReplayOwed = resolutionOwed;
+    // `V2-3` (R2-OPUS-L2): a row an earlier epoch refused ended its window's
+    // row path, durably; this epoch never reads that window again.
+    for (const record of options.ledger.records()) {
+      const marker = rowRefusalMarkerOf(record);
+      if (marker !== undefined) this.#rowPaths.end(marker.windowKey, `its row was refused by an earlier gateway epoch, at ${record.judgedAt}: ${marker.reason}`);
+    }
   }
 
   /**
@@ -547,17 +650,85 @@ export class SeriesAdmissionFeedDriver {
         ? {}
         : { rawFrame: { gatewayEpoch: this.#options.gatewayEpoch, ingestSeq: resolution.rawFrameIngestSeq } }),
     };
+    // `V2-3` ("Two sources"): the frame was dispatched as received — the
+    // market channel is never held back. Against a standing resolution from
+    // a row (or from an earlier epoch, whose source is not recorded), a frame
+    // naming the OTHER outcome is a disagreement, reported at once under its
+    // own scope; the first resolution still stands. A frame-against-frame
+    // repeat is the market channel's own, and unchanged.
+    const standing = this.#standingResolution(record);
+    if (standing === undefined) {
+      this.#resolutionSources.set(payload.internalMarketId, "MARKET_CHANNEL");
+    } else if (standing.payload.outcome !== payload.outcome && this.#resolutionSources.get(payload.internalMarketId) !== "MARKET_CHANNEL") {
+      this.#reportDisagreement(record, standing, {
+        outcome: payload.outcome,
+        source: `the market channel's market_resolved${resolution.rawFrameIngestSeq === undefined ? "" : ` (raw frame ingestSeq ${resolution.rawFrameIngestSeq})`}, observed second and published as received`,
+      });
+    }
+    this.#observeResolution(record.key, evidence, resolution.published);
+  }
+
+  /**
+   * Records an observed resolution as owed and discharges it on publication
+   * (`ROLLOVER-1` r3/r4; the market channel's and, since `V2-3`, a row's).
+   * The first observed resolution of a window stands.
+   */
+  #observeResolution(key: string, evidence: WindowResolutionRecord, published: Promise<PublishOutcome>): void {
     // Recorded at once (the obligation), on the serial mutation chain; held in
     // memory until the ledger holds it (r4, R4-FABLE-01). The first observed
     // resolution of a window stands.
-    if (!this.#unrecorded.has(record.key)) this.#unrecorded.set(record.key, evidence);
-    const recorded = this.#recordResolution(record.key);
-    void resolution.published.then(async (outcome) => {
+    if (!this.#unrecorded.has(key)) this.#unrecorded.set(key, evidence);
+    const recorded = this.#recordResolution(key);
+    void published.then(async (outcome) => {
       // The outcome is judged once the first write has settled, so its PAGE
       // says truthfully whether the resolution is in the ledger.
       await recorded;
-      await this.#resolutionOutcome(record.key, evidence, outcome);
+      await this.#resolutionOutcome(key, evidence, outcome);
     });
+  }
+
+  /**
+   * `V2-3`: the window's STANDING resolution — owed or published, in the
+   * ledger or in memory (Amendment 1, rule 2) — or `undefined` when none was
+   * observed. The first observed stands (Amendment 1, rule 3).
+   */
+  #standingResolution(record: AdmissionLedgerRecord): WindowResolutionRecord | undefined {
+    const current = this.#options.ledger.get(record.key) ?? record;
+    const id = current.window?.internalMarketId;
+    return current.resolution ?? this.#unrecorded.get(record.key) ?? (id === undefined ? undefined : this.#published.get(id));
+  }
+
+  /** `V2-3`: how a standing resolution's source is named (its source in this epoch, or an earlier epoch's). */
+  #standingSourceText(standing: WindowResolutionRecord): string {
+    const source = this.#resolutionSources.get(standing.payload.internalMarketId);
+    const raw = standing.rawFrame === undefined ? "" : ` (raw frame ingestSeq ${standing.rawFrame.ingestSeq} of epoch ${standing.rawFrame.gatewayEpoch})`;
+    if (source === "MARKET_CHANNEL") return `the market channel's market_resolved${raw}, observed first`;
+    if (source === "DATA_API_ROW") return `the /v2/resolutions row${raw}, resolved_at ${standing.payload.resolvedAt}, published first`;
+    return `the resolution an earlier gateway epoch recorded${raw} — its source is not recorded`;
+  }
+
+  /**
+   * `V2-3` ("Two sources", rule 5 "How it fits" item 2): two resolutions of a
+   * window disagree. Raised at once under a scope of its own, which the
+   * window's retirement does NOT close (`#detach` closes only the window's
+   * unresolved scope), naming the window, both outcomes and both sources. The
+   * first resolution stands (Amendment 1, rule 3).
+   */
+  #reportDisagreement(
+    record: AdmissionLedgerRecord,
+    standing: WindowResolutionRecord,
+    second: { readonly outcome: MarketResolvedPayload["outcome"]; readonly source: string },
+  ): void {
+    const window = record.window;
+    if (window === undefined) return;
+    this.#resolutionDisagreements += 1;
+    this.#openWindowIncident(
+      this.#disagreementScope(window),
+      "GATEWAY_SERIES_WINDOW_UNRESOLVED",
+      "NOTIFY",
+      `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) has two resolutions that DISAGREE (ADR-030 Amendment 2 rule 5): ${standing.payload.outcome} from ${this.#standingSourceText(standing)}, and ${second.outcome} from ${second.source}. The first resolution observed stands, here and at the trader (Amendment 1 rule 3); nothing is published from a disagreeing row. The venue's two sources contradict each other: review the window before trusting its settlement`,
+      [window.internalMarketId],
+    );
   }
 
   /**
@@ -613,7 +784,11 @@ export class SeriesAdmissionFeedDriver {
   /** Records a resolution PUBLISHED (in memory at once; durably on the chain). */
   async #discharge(key: string, evidence: WindowResolutionRecord): Promise<void> {
     const publishedAt = isoFromMs(this.#options.clock.nowMs());
-    this.#published.set(evidence.payload.internalMarketId, { ...evidence, publishedAt });
+    // `V2-3`: the FIRST published resolution stands in memory too — a later
+    // one (a repeat, or a disagreeing frame after a row) never replaces it.
+    if (!this.#published.has(evidence.payload.internalMarketId)) {
+      this.#published.set(evidence.payload.internalMarketId, { ...evidence, publishedAt });
+    }
     await this.#mutate(key, (current) =>
       current?.status === "ADMITTED" && current.resolution?.publishedAt === undefined
         ? { ...current, resolution: { ...(current.resolution ?? evidence), publishedAt } }
@@ -709,6 +884,11 @@ export class SeriesAdmissionFeedDriver {
       if (this.#stopped) return;
       await this.#discover(entry);
     }
+    // `V2-3` (step 8): after discovery, so a slow Data API delays no admission.
+    for (const entry of this.#options.series) {
+      if (this.#stopped) return;
+      await this.#checkResolutions(entry);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -733,6 +913,194 @@ export class SeriesAdmissionFeedDriver {
   /** The incident scope of an operator retirement that cannot be applied yet. */
   #operatorScope(window: AdmittedWindowRecord): string {
     return `${this.#options.feedId}:${window.internalMarketId}:operator`;
+  }
+
+  /** `V2-3`: the incident scope of a disagreement between two resolutions — never closed by retirement. */
+  #disagreementScope(window: AdmittedWindowRecord): string {
+    return `${this.#options.feedId}:${window.internalMarketId}:resolution-disagreement`;
+  }
+
+  /** `V2-3`: the latest `/v2/resolutions` read of a window, as the unresolved-window incident states it. */
+  #latestReadText(windowKey: string): string {
+    const ended = this.#rowPaths.endedWhy(windowKey);
+    if (ended !== undefined) return `Its /v2/resolutions row path has ENDED, so no row will publish its resolution: ${ended}.`;
+    const latest = this.#rowPaths.latest(windowKey);
+    if (latest === undefined) return "No /v2/resolutions read has been made for it yet.";
+    const seq = latest.rawFrameIngestSeq === undefined ? "" : `, journaled as ingestSeq ${latest.rawFrameIngestSeq}`;
+    return `The latest /v2/resolutions read (at ${latest.at}${seq}) was ${latest.kind}: ${latest.detail}; it is read again every cycle (ADR-030 Amendment 2 rule 5).`;
+  }
+
+  // --------------------------------------------------------------------------
+  // `V2-3`: the resolution check (`./resolution-check.ts`; module header, step 8)
+  // --------------------------------------------------------------------------
+
+  /**
+   * One cycle's `/v2/resolutions` reads for one series: every live, confirmed
+   * window at or past its scheduled close, with no resolution standing and
+   * its row path not ended, at most `maximumConcurrentWindows` reads ATTEMPTED
+   * (the configuration door budgets exactly that figure; `../config.ts`).
+   */
+  async #checkResolutions(entry: AdmittedSeries): Promise<void> {
+    const budget = { remaining: entry.series.maximumConcurrentWindows };
+    for (const listed of this.#options.ledger.liveWindows(entry.series.seriesId)) {
+      if (this.#stopped) return;
+      const record = this.#options.ledger.get(listed.key) ?? listed;
+      const window = record.window;
+      if (record.status !== "ADMITTED" || window === undefined || record.admissionConfirmedAt === undefined) continue;
+      const closeMs = Date.parse(window.scheduledCloseAt);
+      if (!Number.isFinite(closeMs) || this.#options.clock.nowMs() < closeMs) continue;
+      if (this.#standingResolution(record) !== undefined) continue;
+      if (this.#rowPaths.endedWhy(record.key) !== undefined) continue;
+      // Rule 3: the read sends the 32-byte form. An admitted window always has
+      // one (the judge refuses any other width), so this only guards: no read
+      // is made, no budget is spent, and the row path ends, said at once.
+      const venueCondition = paddedConditionId(window.conditionId);
+      if (!venueCondition.ok) {
+        await this.#refuseRow(record, window, undefined, `no /v2/resolutions read can be made: ${venueCondition.problem}`);
+        continue;
+      }
+      if (budget.remaining <= 0) {
+        this.#resolutionReadsDeferred += 1;
+        continue;
+      }
+      budget.remaining -= 1;
+      this.#resolutionReads += 1;
+      const read = await readResolutionOnce({
+        http: this.#options.http,
+        baseUrl: this.#options.dataApiBaseUrl,
+        timers: this.#options.timers,
+        timeoutMs: this.#options.resolutionReadTimeoutMs ?? RESOLUTION_READ_TIMEOUT_MS,
+        paddedConditionId: venueCondition.conditionId,
+        journal: (endpoint, bodyUtf8) => this.#journal(endpoint, bodyUtf8),
+      });
+      // Journaled; after a stop nothing more is derived (the publisher and the
+      // ledger are closing), and the window is read again by the next epoch.
+      if (this.#stopped) return;
+      await this.#actOnResolutionRead(record.key, read);
+    }
+  }
+
+  /** Acts on one read's finding (rule 5, "What a read finds" and "How it fits"). */
+  async #actOnResolutionRead(key: string, read: ResolutionRead): Promise<void> {
+    const record = this.#options.ledger.get(key);
+    const window = record?.window;
+    if (record === undefined || record.status !== "ADMITTED" || window === undefined) return; // retired meanwhile: nothing derived
+    const finding: ResolutionFinding = read.finding;
+    this.#rowPaths.note(key, {
+      at: read.frame?.receipt.receivedAt ?? isoFromMs(this.#options.clock.nowMs()),
+      kind: finding.kind,
+      detail: finding.detail,
+      rawFrameIngestSeq: read.frame?.rawFrameIngestSeq,
+    });
+    // Judged NOW, after the read: a frame may have been observed while it was
+    // in flight (rule 5 condition 6; "How it fits", item 2).
+    const standing = this.#standingResolution(record);
+    switch (finding.kind) {
+      case "PENDING":
+        this.#resolutionReadsPending += 1;
+        return;
+      case "FAILED":
+        this.#resolutionReadsFailed += 1;
+        return;
+      case "REFUSED":
+        await this.#refuseRow(record, window, read.frame, finding.detail, standing);
+        return;
+      case "PUBLISHABLE":
+        if (read.frame === undefined) return; // unreachable: a publishable finding was judged from a journaled response
+        if (standing !== undefined) {
+          this.#rowPaths.end(key, `a resolution was observed while its row was read (${this.#standingSourceText(standing)})`);
+          if (standing.payload.outcome === finding.outcome) {
+            // R2-OPUS-L1: an agreeing row is a harmless repeat — nothing is
+            // published from it, and nothing is raised.
+            this.#resolutionRowsRepeated += 1;
+            return;
+          }
+          this.#reportDisagreement(record, standing, {
+            outcome: finding.outcome,
+            source: `the /v2/resolutions row (journaled as ingestSeq ${read.frame.rawFrameIngestSeq}), resolved_at ${finding.resolvedAt}, read second — nothing is published from it`,
+          });
+          return;
+        }
+        this.#publishRowResolution(record, window, finding.outcome, finding.resolvedAt, read.frame);
+        return;
+    }
+  }
+
+  /**
+   * Publishes the window's resolution from a PUBLISHABLE row (rule 5): one
+   * `MarketResolved@1` citing the journaled response, recorded, owed and
+   * discharged like a frame's ("How it fits", item 1). Synchronous up to the
+   * dispatch, so no frame can interleave between the check of condition 6
+   * and the record of the resolution.
+   */
+  #publishRowResolution(record: AdmissionLedgerRecord, window: AdmittedWindowRecord, outcome: RowOutcome, resolvedAt: string, frame: JournaledAnswerFrame): void {
+    const payload: MarketResolvedPayload = {
+      internalMarketId: window.internalMarketId,
+      conditionId: window.conditionId,
+      outcome,
+      resolvedAt,
+    };
+    const evidence: WindowResolutionRecord = {
+      payload,
+      observedAt: frame.receipt.receivedAt,
+      rawFrame: { gatewayEpoch: this.#options.gatewayEpoch, ingestSeq: frame.rawFrameIngestSeq },
+    };
+    this.#rowPaths.end(record.key, `a /v2/resolutions row published ${outcome} (journaled as ingestSeq ${frame.rawFrameIngestSeq}, resolved_at ${resolvedAt})`);
+    this.#resolutionSources.set(window.internalMarketId, "DATA_API_ROW");
+    this.#resolutionRowsPublished += 1;
+    const published = this.#options.dispatcher.dispatch(
+      {
+        eventType: "MarketResolved",
+        schemaVersion: 1,
+        source: "polymarket",
+        sourceChannel: DATA_API_RESOLUTIONS_REST_CHANNEL,
+        connectionId: frame.connectionId,
+        subscriptionGeneration: 0,
+        payload,
+      },
+      { receipt: frame.receipt, rawFrameIngestSeq: frame.rawFrameIngestSeq },
+    );
+    this.#observeResolution(record.key, evidence, published);
+  }
+
+  /**
+   * A REFUSED row (rule 5, "Polling and the incident", items 3 and 4): the
+   * window's row path ends — in memory at once, and in the ledger (R2-OPUS-L2)
+   * — and `GATEWAY_SERIES_WINDOW_UNRESOLVED` is raised at once, with the
+   * reason, before the bound if need be. It is raised under the window's own
+   * unresolved scope, which is first closed so the refusal's reason is
+   * published even when the bound's incident is already open.
+   */
+  async #refuseRow(
+    record: AdmissionLedgerRecord,
+    window: AdmittedWindowRecord,
+    frame: JournaledAnswerFrame | undefined,
+    reason: string,
+    standing: WindowResolutionRecord | undefined = undefined,
+  ): Promise<void> {
+    this.#rowPaths.end(record.key, `its row was refused: ${reason}`);
+    this.#resolutionRowsRefused += 1;
+    const judgedAt = frame?.receipt.receivedAt ?? isoFromMs(this.#options.clock.nowMs());
+    const durable = await this.#persist(rowRefusalMarker(record, judgedAt, reason));
+    const entry = this.#seriesById.get(record.seriesId);
+    const bound = entry === undefined ? "its unresolved bound" : `${String(entry.series.unresolvedTeardownSeconds)} s after its close ${window.scheduledCloseAt}`;
+    const seq = frame === undefined ? "" : ` (journaled as ingestSeq ${frame.rawFrameIngestSeq})`;
+    const remembered = durable
+      ? "The refusal is recorded in the admission ledger, so a restart does not read this window again."
+      : "The refusal could NOT be recorded in the admission ledger (GATEWAY_SERIES_LEDGER_WRITE_FAILED): this epoch reads the window no more, but a restart WILL read it again.";
+    const after =
+      standing === undefined
+        ? `Its resolution may still arrive on the market channel; if it does not, the recovery is the operator's named retirement (seriesAdmission.operatorRetirements) once it is unresolved ${bound}.`
+        : `Its resolution ${standing.payload.outcome} was already observed (${this.#standingSourceText(standing)}) and stands.`;
+    const scope = this.#unresolvedScope(window);
+    this.#options.dispatcher.markIncidentClosed(scope, "GATEWAY_SERIES_WINDOW_UNRESOLVED");
+    this.#openWindowIncident(
+      scope,
+      "GATEWAY_SERIES_WINDOW_UNRESOLVED",
+      "NOTIFY",
+      `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}): its /v2/resolutions row was REFUSED${seq} — ${reason}. Its row path has ended: no more reads, and no row publishes its resolution (ADR-030 Amendment 2 rule 5). ${remembered} ${after}`,
+      [window.internalMarketId],
+    );
   }
 
   /**
@@ -835,7 +1203,7 @@ export class SeriesAdmissionFeedDriver {
         this.#unresolvedScope(window),
         "GATEWAY_SERIES_WINDOW_UNRESOLVED",
         "NOTIFY",
-        `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) had no MarketResolved ${String(entry.series.unresolvedTeardownSeconds)} s after its scheduled close ${window.scheduledCloseAt}; it stays subscribed, awaiting its resolution (ADR-030 Decision 4.4), and keeps its cap slot until its resolution is handled — the series admits no window in its place (Decision 1.8). A resolution missed while the gateway was down or disconnected is not redelivered: to recover the slot, name this window in seriesAdmission.operatorRetirements with a reason and restart`,
+        `admitted window ${window.internalMarketId} (${window.windowTitle}, condition ${window.conditionId}) had no MarketResolved ${String(entry.series.unresolvedTeardownSeconds)} s after its scheduled close ${window.scheduledCloseAt}; it stays subscribed, awaiting its resolution (ADR-030 Decision 4.4), and keeps its cap slot until its resolution is handled — the series admits no window in its place (Decision 1.8). ${this.#latestReadText(record.key)} A resolution missed while the gateway was down or disconnected is not redelivered on the market channel: to recover the slot, name this window in seriesAdmission.operatorRetirements with a reason and restart`,
         [window.internalMarketId],
       );
     }
@@ -848,8 +1216,12 @@ export class SeriesAdmissionFeedDriver {
   #detach(record: AdmissionLedgerRecord): void {
     const window = record.window;
     this.#options.windows.detach(record);
+    this.#rowPaths.forget(record.key);
     if (window === undefined) return;
     this.#published.delete(window.internalMarketId);
+    this.#resolutionSources.delete(window.internalMarketId);
+    // `V2-3`: the disagreement scope (`#disagreementScope`) is deliberately
+    // NOT closed here — a disagreement outlives the window's retirement.
     this.#options.dispatcher.markIncidentClosed(this.#unresolvedScope(window), "GATEWAY_SERIES_WINDOW_UNRESOLVED");
     this.#options.dispatcher.markIncidentClosed(this.#operatorScope(window), "GATEWAY_SERIES_OPERATOR_RETIREMENT_DEFERRED");
   }
@@ -1065,7 +1437,30 @@ export class SeriesAdmissionFeedDriver {
     }
 
     const verdict = judgeSeriesWindow(entry.series, entry.configHash, event, clob?.status === "ok" ? clob.reading : undefined);
-    const judgedAt = (clobFrame ?? keysetFrame).receipt.receivedAt;
+    const judgedOn = (clobFrame ?? keysetFrame).receipt;
+    const judgedAt = judgedOn.receivedAt;
+    if (verdict.verdict === "NOT_YET_ADMISSIBLE") {
+      // `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06): the
+      // ids are not yet available. Before the window's scheduled open — on the
+      // receipt instant of the read it was judged from — nothing is recorded,
+      // nothing is raised, and it is judged again at the next poll. At or
+      // after its open it is REFUSED, finally, like any other mismatch.
+      if (judgedOn.nowMs < verdict.scheduledOpenEpochMs) {
+        this.#notYetAdmissible += 1;
+        return;
+      }
+      await this.#refuse(
+        entry,
+        key,
+        event,
+        [
+          ...verdict.mismatches,
+          `not yet admissible until its scheduled open ${verdict.scheduledOpenAt}, and judged at ${judgedAt}: the selected id field was still absent or null when the window opened, so the refusal is final (ADR-030 Amendment 2 rule 1, note of 2026-10-06)`,
+        ],
+        judgedAt,
+      );
+      return;
+    }
     if (verdict.verdict === "REFUSE") {
       await this.#refuse(entry, key, event, verdict.mismatches, judgedAt);
       return;
@@ -1480,6 +1875,16 @@ export class SeriesAdmissionFeedDriver {
       windowsRetiredByOperator: this.#retiredByOperator,
       operatorRetirementsDeferred: this.#operatorDeferred,
       operatorRetirementsUnmatched: this.#operatorUnmatched,
+      windowsNotYetAdmissible: this.#notYetAdmissible,
+      resolutionReads: this.#resolutionReads,
+      resolutionReadsDeferredByBudget: this.#resolutionReadsDeferred,
+      resolutionReadsPending: this.#resolutionReadsPending,
+      resolutionReadsFailed: this.#resolutionReadsFailed,
+      resolutionRowsRefused: this.#resolutionRowsRefused,
+      resolutionRowsPublished: this.#resolutionRowsPublished,
+      resolutionRowsRepeated: this.#resolutionRowsRepeated,
+      resolutionDisagreements: this.#resolutionDisagreements,
+      resolutionRowPathsEnded: this.#rowPaths.endedCount,
     };
   }
 }

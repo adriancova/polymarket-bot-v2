@@ -75,6 +75,15 @@
  *    another width (no read is made), and a CLOB `v` that disagrees. The
  *    collision check reads the selected ids. The V1 admission output on
  *    `series-window.json` is byte-identical to `af3a1c9`'s.
+ * 14. **`V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06)** — a
+ *    V2 window whose accepted version selects ids not yet available is NOT
+ *    YET ADMISSIBLE: no record, no incident, judged again at each poll; ids
+ *    filled before its open admit it, exactly as at first sight; still absent
+ *    or null when judged at or after its open (the read's receipt), it is
+ *    REFUSED finally; every other refusal stays final, at once. And two
+ *    `V2-1` pins (V21-FABLE-01, V21-FABLE-02): a condition id of another
+ *    width spends no CLOB read budget, and when the selection fails the
+ *    collision check reads the condition id only.
  */
 
 import { createHash } from "node:crypto";
@@ -1543,5 +1552,200 @@ describe("V2-1 acceptance 7: the V1 admission output on series-window.json is by
         return { ...CLOB_2230, t: [{ t: yes, o: "Up" }, { t: no, o: "Down" }], mts: market["orderPriceMinTickSize"], c: market["conditionId"] };
       }),
     ).toBe("65645da112e340d891697ffe1bbd4846e3ece1e82b325fc5766ce433b62f8752");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `V2-3` item 7 (ADR-030 Amendment 2 rule 1, note of 2026-10-06, the
+// orchestrator's interim ruling for PAPER and BACKTEST; `V2-1`'s known risk
+// V21-FABLE-03): ids not yet available. The window is the recorded 22:30
+// window (open 22:30, close 22:45; due at 22:20 under the 900 s lead) as a V2
+// market carrying the canary's condition and position ids (S-L01).
+// ---------------------------------------------------------------------------
+
+const V2_WINDOW_2230_ID = windowInternalMarketId(PROTOCOL_V2_SAMPLES.canaryConditionId31, Date.UTC(2026, 9, 4, 22, 30));
+
+/** The page holding only the 22:30 window, as a V2 market whose `positionIds` is `state.positionIds` (`undefined`: absent). */
+function v2Page2230(state: { positionIds: unknown; mutate?: (market: Record<string, unknown>) => void }): () => unknown {
+  return () => {
+    const page = structuredClone(KEYSET_PAGE);
+    page.events = [page.events[1] as Record<string, unknown>];
+    const market = ((page.events[0] as Record<string, unknown>)["markets"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+    market["version"] = GAMMA_V2_EXAMPLE["version"];
+    market["clobTokenIds"] = GAMMA_V2_EXAMPLE["clobTokenIds"];
+    if (state.positionIds === undefined) delete market["positionIds"];
+    else market["positionIds"] = state.positionIds;
+    market["conditionId"] = V2_WINDOW.conditionId31;
+    market["orderPriceMinTickSize"] = CLOB_V2["mts"];
+    state.mutate?.(market);
+    return page;
+  };
+}
+
+function v2Stub2230(state: { positionIds: unknown; mutate?: (market: Record<string, unknown>) => void }) {
+  return venueStub({ page: v2Page2230(state), clob: { [V2_WINDOW.conditionId32]: CLOB_V2 } });
+}
+
+function refusedIncidents(harness: Harness): readonly string[] {
+  return harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_SERIES_WINDOW_REFUSED").map((incident) => incident.detail);
+}
+
+/** The three admission payloads of a window, as published, in order. */
+function admissionPayloadsOf(harness: Harness, internalMarketId: string | undefined): readonly string[] {
+  return harness
+    .published()
+    .filter((envelope) => ["MarketDiscovered", "TradingParametersChanged", "SeriesWindowAdmitted"].includes(envelope.eventType))
+    .filter((envelope) => payloadOf(envelope)["internalMarketId"] === internalMarketId)
+    .map((envelope) => `${envelope.eventType}:${JSON.stringify(envelope.payload)}`);
+}
+
+describe("V2-3 item 7: ids not yet available are not yet admissible — judged again until the window's open", () => {
+  it("ids filled BEFORE the open admit the window: until then no record, no incident, judged at every poll; the admission is byte-identical to one with the ids at first sight", async () => {
+    const state: { positionIds: unknown } = { positionIds: null };
+    const stub = v2Stub2230(state);
+    const harness = await startedUnder(stub, ["v1", "v2"]);
+    // 22:20 (null), then 22:20:30 (absent): not yet admissible — nothing recorded, nothing raised.
+    expect(admittedIds(harness)).toEqual([]);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+    expect(refusedIncidents(harness)).toEqual([]);
+    state.positionIds = undefined;
+    await cycleAfter(harness, 0);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+    expect(refusedIncidents(harness)).toEqual([]);
+    // Judged at every poll: one CLOB read each, within the cycle's budget.
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(2);
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsNotYetAdmissible: 2, windowsRefused: 0, liveWindows: 0 });
+
+    // 22:25:30, before the 22:30 open: the ids are filled — admitted at once.
+    state.positionIds = [V2_WINDOW.up, V2_WINDOW.down];
+    await cycleAfter(harness, 5 * 60_000);
+    expect(admittedIds(harness)).toEqual([V2_WINDOW_2230_ID]);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toMatchObject({ status: "ADMITTED", admissionConfirmedAt: expect.any(String) });
+    expect(subscribedTokens(harness)).toEqual(expect.arrayContaining([V2_WINDOW.up, V2_WINDOW.down]));
+
+    // The control: the same window with its ids at first sight.
+    const control = await startedUnder(v2Stub2230({ positionIds: [V2_WINDOW.up, V2_WINDOW.down] }), ["v1", "v2"]);
+    expect(admissionPayloadsOf(harness, V2_WINDOW_2230_ID)).toEqual(admissionPayloadsOf(control, V2_WINDOW_2230_ID));
+    expect(admissionPayloadsOf(control, V2_WINDOW_2230_ID)).toHaveLength(3);
+    await control.gateway.stop();
+    await harness.gateway.stop();
+  });
+
+  it("still null when judged at or after the open: REFUSED finally, with the existing incident naming the open; ids that arrive later admit nothing", async () => {
+    const state: { positionIds: unknown } = { positionIds: null };
+    const stub = v2Stub2230(state);
+    const harness = await startedUnder(stub, ["v1", "v2"]);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+    // 22:30:30: judged after its open, still null.
+    await cycleAfter(harness, 10 * 60_000);
+    const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+    expect(record?.["status"]).toBe("REFUSED");
+    expect(mismatchesOf(record)).toMatch(/Market\.positionIds, the field Market\.version "v2" selects, is null: the window's ids are not yet available \(F-40\)/u);
+    expect(mismatchesOf(record)).toMatch(
+      /not yet admissible until its scheduled open 2026-10-04T22:30:00\.000Z, and judged at 2026-10-04T22:30:30\.000Z: the selected id field was still absent or null when the window opened, so the refusal is final \(ADR-030 Amendment 2 rule 1, note of 2026-10-06\)/u,
+    );
+    expect(refusedIncidents(harness)).toHaveLength(1);
+    expect(incidentsNamed(harness, "GATEWAY_SERIES_WINDOW_REFUSED")).toEqual([[V2_WINDOW_2230_ID]]);
+    // Final: filled ids are never judged again.
+    const reads = clobReadsOf(stub, V2_WINDOW.conditionId32);
+    state.positionIds = [V2_WINDOW.up, V2_WINDOW.down];
+    await cycleAfter(harness, 0);
+    expect(admittedIds(harness)).toEqual([]);
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(reads);
+    await harness.gateway.stop();
+  });
+
+  it("the open is the bound, on the read's receipt: judged one millisecond before it, not yet admissible; judged exactly AT it, refused", async () => {
+    const early = await started(v2Stub2230({ positionIds: null }), {
+      config: admissionConfig({}, reviewAccepting(["v1", "v2"])),
+      clockStartMs: Date.UTC(2026, 9, 4, 22, 29, 59, 999),
+    });
+    expect(ledger(early.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+    expect(early.gateway.metrics().seriesAdmission?.windowsNotYetAdmissible).toBe(1);
+    await early.gateway.stop();
+    const atOpen = await started(v2Stub2230({ positionIds: null }), {
+      config: admissionConfig({}, reviewAccepting(["v1", "v2"])),
+      clockStartMs: Date.UTC(2026, 9, 4, 22, 30, 0, 0),
+    });
+    expect(ledger(atOpen.walFileSystem)[V2_WINDOW.conditionId31]?.["status"]).toBe("REFUSED");
+    expect(mismatchesOf(ledger(atOpen.walFileSystem)[V2_WINDOW.conditionId31])).toMatch(/judged at 2026-10-04T22:30:00\.000Z/u);
+    await atOpen.gateway.stop();
+  });
+
+  for (const [name, accepted, mutate, mismatch] of [
+    [
+      "a Gamma fee rate that differs, beside positionIds null",
+      ["v1", "v2"],
+      (market: Record<string, unknown>) => void ((market["feeSchedule"] as Record<string, unknown>)["rate"] = 0.08),
+      /feeSchedule\.rate/u,
+    ],
+    ["positionIds as a JSON-encoded string (not an array)", ["v1", "v2"], (market: Record<string, unknown>) => void (market["positionIds"] = JSON.stringify([V2_WINDOW.up, V2_WINDOW.down])), /is not an array of decimal strings/u],
+    ["one position id", ["v1", "v2"], (market: Record<string, unknown>) => void (market["positionIds"] = [V2_WINDOW.up]), /not exactly two position ids/u],
+    ["an unknown version", ["v1", "v2"], (market: Record<string, unknown>) => void (market["version"] = "v3"), /not a supported protocol version/u],
+    ["a version the review does not accept, beside positionIds null", ["v1"], () => undefined, /not one of the reviewed acceptedProtocolVersions \["v1"\]/u],
+  ] as const) {
+    it(`every other refusal stays FINAL, at once, before the open — ${name}`, async () => {
+      const state = { positionIds: null as unknown, mutate };
+      const stub = v2Stub2230(state);
+      const harness = await startedUnder(stub, accepted);
+      const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+      expect(record?.["status"]).toBe("REFUSED");
+      expect(mismatchesOf(record)).toMatch(mismatch);
+      expect(mismatchesOf(record)).not.toMatch(/not yet admissible until/u);
+      expect(refusedIncidents(harness)).toHaveLength(1);
+      expect(harness.gateway.metrics().seriesAdmission?.windowsNotYetAdmissible).toBe(0);
+      // Never judged again, even once everything is right.
+      const reads = clobReadsOf(stub, V2_WINDOW.conditionId32);
+      state.positionIds = [V2_WINDOW.up, V2_WINDOW.down];
+      state.mutate = () => undefined;
+      await cycleAfter(harness, 0);
+      expect(admittedIds(harness)).toEqual([]);
+      expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(reads);
+      await harness.gateway.stop();
+    });
+  }
+});
+
+describe("V2-3: two V2-1 LOWs pinned (V21-FABLE-01, V21-FABLE-02)", () => {
+  it("V21-FABLE-01: a condition id of another width spends NO CLOB read budget — under a cap of 1, the next window is still read and admitted in the same cycle", async () => {
+    const bad = `${PROTOCOL_V2_SAMPLES.canaryConditionId32}0`;
+    const page = (): unknown => {
+      const copy = structuredClone(KEYSET_PAGE);
+      ((copy.events[0] as Record<string, unknown>)["markets"] as Record<string, unknown>[])[0]!["conditionId"] = bad;
+      return copy;
+    };
+    const stub = venueStub({ page });
+    const harness = await started(stub, { config: admissionConfig({}, { ...reviewedBtc15mSeriesDocument(), maximumConcurrentWindows: 1 }) });
+    // One cycle: the 63-byte id is refused with no read, and the cycle's one read goes to 22:30.
+    expect(ledger(harness.walFileSystem)[bad]?.["status"]).toBe("REFUSED");
+    expect(stub.requests.filter((url) => url.includes("/clob-markets/"))).toEqual([`${CLOB_BASE}/clob-markets/${WINDOW_2230.conditionId}`]);
+    expect(admittedIds(harness)).toEqual([WINDOW_2230.id]);
+    expect(harness.gateway.metrics().seriesAdmission).toMatchObject({ windowsDeferredByReadBudget: 0, cycles: 1 });
+    await harness.gateway.stop();
+  });
+
+  it("V21-FABLE-02 (a): when the selection FAILS, the collision check still reads the condition id — a known condition is skipped, with no read and no record", async () => {
+    const stub = v2Stub({ mutate: (market) => void (market["version"] = "v3") });
+    const harness = await startedUnder(stub, ["v1", "v2"], { markets: [{ ...MARKET, gammaMarketId: "999", conditionId: V2_WINDOW.conditionId31 }] });
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(0);
+    expect(ledger(harness.walFileSystem)[V2_WINDOW.conditionId31]).toBeUndefined();
+    expect(harness.gateway.metrics().seriesAdmission?.windowsSkippedKnown).toBeGreaterThanOrEqual(1);
+    await harness.gateway.stop();
+  });
+
+  it("V21-FABLE-02 (b): when the selection FAILS, the collision check reads NO ids — the other field's tokens never make it a collision; the judge refuses it by name", async () => {
+    const stub = v2Stub({
+      mutate: (market) => {
+        market["version"] = "v3";
+        market["clobTokenIds"] = JSON.stringify(OTHER_CTF_IDS);
+      },
+    });
+    const harness = await startedUnder(stub, ["v1", "v2"], { markets: [{ ...MARKET, gammaMarketId: "999", yesTokenId: OTHER_CTF_IDS[0] }] });
+    expect(clobReadsOf(stub, V2_WINDOW.conditionId32)).toBe(1);
+    const record = ledger(harness.walFileSystem)[V2_WINDOW.conditionId31];
+    expect(record?.["status"]).toBe("REFUSED");
+    expect(mismatchesOf(record)).toMatch(/Market\.version is "v3", not a supported protocol version/u);
+    expect(harness.gateway.metrics().seriesAdmission?.windowsSkippedKnown).toBe(0);
+    await harness.gateway.stop();
   });
 });

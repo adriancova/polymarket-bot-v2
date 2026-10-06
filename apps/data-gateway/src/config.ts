@@ -198,6 +198,22 @@ export const GAMMA_EVENTS_RATE_LIMIT_PER_10S = 500;
 export const CLOB_GENERAL_RATE_LIMIT_PER_10S = 9_000;
 export const SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT = 5;
 
+/**
+ * `V2-3`: the `/v2/resolutions` read's budget (handoff §9.13), as a
+ * configuration snapshot with its source: the venue's published Data API v2
+ * limit, "General (all `/v2` endpoints)", is **800 requests / 10 s**
+ * (`docs/venue/verified-2026-09-16.md` §8, S-D24 lines 57-66; the page is
+ * byte-identical on 2026-10-05, `docs/venue/verified-2026-10-05.md` S-D34).
+ * `/v2/resolutions` has no row of its own, so the general figure governs. The
+ * feed may use {@link SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT} of it, as for
+ * its other reads: at most `maximumConcurrentWindows` resolution reads per
+ * series per cycle, a BOUND the driver enforces (`feeds/series-admission.ts`,
+ * `feeds/resolution-check.ts`), so `Σ maximumConcurrentWindows × 10 000 /
+ * pollIntervalMs` per 10 s must be ≤ 40. At the default 30 s cycle that
+ * admits 120 concurrent windows in all; at the 5 s floor, 20.
+ */
+export const DATA_API_V2_RATE_LIMIT_PER_10S = 800;
+
 /** Floor on the series-admission cadence: 5 s (a window opens every 15 minutes). */
 export const MIN_SERIES_ADMISSION_POLL_INTERVAL_MS = 5_000;
 
@@ -375,6 +391,12 @@ export const SeriesAdmissionFeedConfigSchema = z.strictObject({
   gammaBaseUrl: z.string().min(1).optional(),
   /** Defaults to the documented CLOB origin. Overridable for a local stub. */
   clobBaseUrl: z.string().min(1).optional(),
+  /**
+   * `V2-3`: the origin of the `/v2/resolutions` read (ADR-030 Amendment 2
+   * rules 4 and 5). Defaults to the documented Data API origin (F-65).
+   * Overridable for a local stub.
+   */
+  dataApiBaseUrl: z.string().min(1).optional(),
   pollIntervalMs: z.number().int().positive().default(DEFAULT_SERIES_ADMISSION_POLL_INTERVAL_MS),
   consecutiveFailureThreshold: z.number().int().positive().default(DEFAULT_SERIES_ADMISSION_FAILURE_ESCALATION),
   /** `limit` of one keyset page: 1 to 100 (F-07). */
@@ -762,7 +784,11 @@ function admittedWindowCapacity(config: GatewayConfig): number {
  *    `/events`, and `Σ maximumConcurrentWindows × 10 000 / pollIntervalMs`
  *    within the same share of the CLOB's general limit — both bounds the
  *    driver enforces per cycle (`maximumPages` keyset reads, and
- *    `maximumConcurrentWindows` attempted CLOB reads, per series).
+ *    `maximumConcurrentWindows` attempted CLOB reads, per series) — and
+ *    (`V2-3`) the same `Σ maximumConcurrentWindows` figure within the same
+ *    share of the Data API v2 general limit, for the `/v2/resolutions` reads
+ *    ({@link DATA_API_V2_RATE_LIMIT_PER_10S}; at most `maximumConcurrentWindows`
+ *    attempted per series per cycle).
  *
  * The RUN MODE is not configuration: the feed refuses to start outside PAPER
  * and BACKTEST from the process environment (`feeds/series-admission.ts`).
@@ -823,6 +849,16 @@ function checkSeriesAdmission(
     throw new GatewayConfigurationError(
       `seriesAdmission could issue ${String(clobPer10s)} CLOB market-info requests per 10 s, over its budget of ${String(clobBudget)} (${String(SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT)} % of the CLOB's documented ${String(CLOB_GENERAL_RATE_LIMIT_PER_10S)} / 10 s)`,
       { clobPer10s, clobBudget },
+    );
+  }
+  // `V2-3`: the `/v2/resolutions` reads — at most `maximumConcurrentWindows`
+  // per series per cycle (`feeds/series-admission.ts`, `#checkResolutions`).
+  const resolutionsPer10s = clobPer10s;
+  const resolutionsBudget = DATA_API_V2_RATE_LIMIT_PER_10S * share;
+  if (resolutionsPer10s > resolutionsBudget) {
+    throw new GatewayConfigurationError(
+      `seriesAdmission could issue ${String(resolutionsPer10s)} Data API /v2/resolutions requests per 10 s (Σ maximumConcurrentWindows × 10000 ms / ${String(block.pollIntervalMs)} ms), over its budget of ${String(resolutionsBudget)} (${String(SERIES_ADMISSION_MAX_BUDGET_SHARE_PERCENT)} % of the Data API v2's documented ${String(DATA_API_V2_RATE_LIMIT_PER_10S)} / 10 s); raise pollIntervalMs or lower a series' maximumConcurrentWindows`,
+      { resolutionsPer10s, resolutionsBudget },
     );
   }
 }
