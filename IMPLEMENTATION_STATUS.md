@@ -50,7 +50,6 @@ Completed packages are listed in [`docs/handoffs/INDEX.md`](docs/handoffs/INDEX.
 | --- | --- | --- | --- | --- |
 | `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
 | `ADR-034` | Pre-live order-lifecycle design (WP340-F1, CO3-N1, CO3-N2, V2-10B) + venue addendum | **Running** (authorized 2026-10-06) | — | — |
-| `RECORDS-W3B` | Completed packages leave this table for `docs/handoffs/INDEX.md` (budget fix) | **Running** (authorized 2026-10-06) | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>`. The user starts it later on 2026-10-05 and reports back | — | — |
 | All other packages not in `docs/handoffs/INDEX.md` | — | Blocked | — | See work plan |
 
