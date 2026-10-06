@@ -1,7 +1,7 @@
 /**
  * Contract: matching-engine restricted-mode HTTP responses → the PINNED
  * SDK's own HTTP error construction (`ServiceClient` → `RequestRejectedError`
- * / `RateLimitError`, `@polymarket/client@0.11.0`) → the secure client's
+ * / `RateLimitError`, `@polymarket/client@0.12.0` since V2-5) → the secure client's
  * outcome (venue report 2026-09-30 §9, E-05, E-06, §2.4; conflict C-9; U-4).
  *
  * The SDK is driven with one unauthenticated public-client request whose

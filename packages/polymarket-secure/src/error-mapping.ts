@@ -5,7 +5,7 @@
  * CLASSIFICATION RULES, in the order they are applied:
  *
  * 1. The SDK error class decides the family, by `instanceof` against the
- *    classes of the pinned `@polymarket/client@0.11.0`. A look-alike object
+ *    classes of the pinned `@polymarket/client@0.12.0`. A look-alike object
  *    that is not an instance (a plain object named `RequestRejectedError`, a
  *    class from another SDK copy) is `UNKNOWN`. Failing towards UNKNOWN is
  *    the safe direction: it forces reconciliation, never a guess.
@@ -14,24 +14,25 @@
  *    different strings for the same cancel-only/disabled condition (C-9), and
  *    its codes are examples, not an enumeration (U-4).
  * 3. Only own DATA properties of the SDK error are read (`status`, `code`,
- *    `retryAfter`). A getter is never invoked. An own ACCESSOR `code` is not
- *    "no code": it is a code that is present but unreadable, and reads as an
- *    undocumented code (so the effect is `UNKNOWN`, rule 4).
+ *    `retryAfter`, and `message` for the one prefix test of rule 4c). A
+ *    getter is never invoked. An own ACCESSOR `code` is not "no code": it is
+ *    a code that is present but unreadable, and reads as an undocumented code
+ *    (so the effect is `UNKNOWN`, rule 4).
  * 4. `NOT_APPLIED` (a documented refusal) is given ONLY to 503 with the
- *    documented code `post_only_mode`: a code the pinned SDK could only have
- *    kept because the venue sent it. 401, 425 and 429 are ALWAYS effect
- *    `UNKNOWN` (the kind still follows the status, so a caller can back off),
- *    whether or not a code is present. ADR-007 §6: "an unrecognized code is
- *    surfaced as UNKNOWN and never ... silently treated as a rejection" — and
- *    with the pinned SDK the ABSENCE of a code can never be established:
- * 4a. The pinned `@polymarket/client@0.11.0` `ServiceClient` keeps a JSON
+ *    documented code `post_only_mode`, and only when the venue provably SENT
+ *    that code in its `code` field (rule 4c). 401, 425 and 429 are ALWAYS
+ *    effect `UNKNOWN` (the kind still follows the status, so a caller can
+ *    back off), whether or not a code is present. ADR-007 §6: "an
+ *    unrecognized code is surfaced as UNKNOWN and never ... silently treated
+ *    as a rejection" — and with the pinned SDK the ABSENCE of a code can
+ *    never be established:
+ * 4a. The pinned `@polymarket/client@0.12.0` `ServiceClient` keeps a JSON
  *    body's `code` only when the body's `error` is truthy AND the code is a
- *    non-empty string (`if (error) return {message, ...(typeof code ==
- *    "string" && code !== "" ? {code} : {})}`); a text or HTML body, or a
- *    missing, empty or null `error`, discards the code entirely (CX-R3-01).
- *    So a code-less `RequestRejectedError` may still be a venue answer that
- *    carried an undocumented code, and it is UNKNOWN. The SDK message text is
- *    never consulted to tell these apart (rule 2).
+ *    non-empty string; a text or HTML body, or a missing, empty or null
+ *    `error`, discards the code entirely (CX-R3-01; `ServiceClient.ts` lines
+ *    308-327 of 0.12.0). So a code-less `RequestRejectedError` may still be a
+ *    venue answer that carried an undocumented code, and it is UNKNOWN. The
+ *    SDK message text is never consulted to tell these apart (rule 2).
  * 4b. A `RateLimitError` is ALWAYS effect `UNKNOWN` (kind `RATE_LIMITED`, so
  *    a caller still backs off). The pinned SDK throws it for EVERY 429
  *    BEFORE it reads the response body (`ServiceClient`: `if (status === 429)
@@ -39,6 +40,26 @@
  *    code, if any, is discarded. This is the only 429 the pinned SDK
  *    produces; a `RequestRejectedError` 429 (which it never builds) is
  *    UNKNOWN too, by rule 4.
+ * 4c. AN INFERRED CODE IS NEVER A DOCUMENTED CODE (V2-5; venue report
+ *    2026-09-30 §2.4: "`WP-260` must not treat an inferred `code` as a
+ *    venue-documented code"). From 0.12.0 the SDK INFERS a `code` from the
+ *    body's `error` TEXT when the body has no usable `code`, the status is
+ *    not 400 and the text is a snake_case identifier (`ServiceClient.ts`
+ *    lines 309-318: `inferredCode = … /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/
+ *    .test(error) ? error : undefined`). The error object does not say which
+ *    kind of code it holds. But an inferred code IS the `error` text, and the
+ *    SDK builds the message as `${error} (${url})` (line 320), which
+ *    `mapTradingRestrictionError` keeps verbatim when it re-wraps a 425 or a
+ *    503 (`restrictions.ts` line 21). So a DOCUMENTED code is trusted only
+ *    when the message is an own data string that does NOT begin with
+ *    `${code} (`. Otherwise it may have come from free text (rule 2), and it
+ *    reads as present but unprovable: `venueCode` null, and
+ *    `undocumentedVenueCode` true. The message is compared with that one
+ *    prefix and dropped. It is never carried, parsed or matched against
+ *    anything else, so it can only WITHDRAW trust from a code, never grant
+ *    it. A venue body whose `error` text is itself the documented code AND
+ *    that also sends the code explicitly is refused too: the fail-closed
+ *    direction.
  * 5. Reflection is contained. `instanceof` and property descriptors can run
  *    foreign code (a proxy trap); if any of it throws, the result is a fresh
  *    `UNKNOWN` error, and the thrown value is dropped unread.
@@ -90,6 +111,21 @@ function ownCode(target: object): CodeReading {
     return { venueCode: null, undocumentedVenueCode: true };
   }
   return codeOf(descriptor?.value);
+}
+
+/**
+ * Rule 4c: a DOCUMENTED code survives only when the SDK cannot have inferred
+ * it from the `error` text, that is, when the error's own data `message` is a
+ * string that does not begin with `${code} (`. Anything else (that prefix, a
+ * missing or non-string message, an accessor) makes the code unprovable: it
+ * reads as present but undocumented. A reading with no documented code is
+ * returned as it is. The message is not kept.
+ */
+function provenDocumentedCode(target: object, reading: CodeReading): CodeReading {
+  if (reading.venueCode === null) return reading;
+  const message = ownData(target, "message");
+  const sdkMayHaveInferredIt = typeof message !== "string" || message.startsWith(`${reading.venueCode} (`);
+  return sdkMayHaveInferredIt ? { venueCode: null, undocumentedVenueCode: true } : reading;
 }
 
 function httpStatusOf(value: unknown): number | null {
@@ -226,7 +262,7 @@ function classifyThrown(error: unknown, operation: SecureOperation): SecureVenue
   }
   if (error instanceof RequestRejectedError) {
     const status = httpStatusOf(ownData(error, "status"));
-    const code = ownCode(error);
+    const code = provenDocumentedCode(error, ownCode(error));
     return new SecureVenueError({
       ...base,
       ...classifyHttpRejection(status, code),

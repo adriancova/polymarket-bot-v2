@@ -1,6 +1,7 @@
 /**
  * The error taxonomy (handoff §9.12; ADR-007 §6–§7; U-4; C-9; E-05–E-07),
- * driven with REAL error instances of the pinned `@polymarket/client@0.11.0`.
+ * driven with REAL error instances of the pinned `@polymarket/client` (0.11.0
+ * when written; 0.12.0 since V2-5, whose error classes are a superset).
  */
 
 import {

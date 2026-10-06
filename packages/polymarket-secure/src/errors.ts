@@ -51,7 +51,9 @@ export type SecureVenueErrorKind =
  * - `NOT_SENT`: nothing left the process.
  * - `NOT_APPLIED`: the venue answered with a documented refusal whose code
  *   the pinned SDK could only have kept because the venue sent it: 503 with
- *   `post_only_mode`. 401, 425 and 429 are always `UNKNOWN`: the pinned SDK
+ *   `post_only_mode`, never one the SDK may have inferred from the `error`
+ *   text (`error-mapping.ts` rule 4c, from 0.12.0). 401, 425 and 429 are
+ *   always `UNKNOWN`: the pinned SDK
  *   discards the body of every 429, and drops a 401/425 body's `code`
  *   whenever the body's `error` is missing, empty or null (or the body is
  *   not JSON), so "no code" can never be established (ADR-007 §6; CX-R3-01).

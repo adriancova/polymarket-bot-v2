@@ -13,10 +13,13 @@
  *   (fees);
  * - `docs/venue/verified-2026-08-24.md` §4 (the raw SDK wire schemas
  *   `UserOrderEventSchema` / `UserTradeEventSchema`, the wire value types);
- * - the pinned SDK `@polymarket/client` 0.11.0 and its `@polymarket/bindings`
- *   0.11.0 (`subscriptions/clob.ts`, `shared.ts`, read from the installed
- *   package's source maps), which the reports record as byte-identical to the
- *   2026-09-16 bodies (`verified-2026-09-30.md` §4);
+ * - the pinned SDK `@polymarket/client` 0.12.0 and its `@polymarket/bindings`
+ *   0.12.0 (`subscriptions/clob.ts`, `shared.ts`, read from the installed
+ *   package's source maps). WP-280 read them in 0.11.0, which the reports
+ *   record as byte-identical to the 2026-09-16 bodies
+ *   (`verified-2026-09-30.md` §4). In 0.12.0 `subscriptions/clob.ts` is
+ *   unchanged and `shared.ts` only gains the `emptyStringToUndefined` helper
+ *   (V2-5, the 0.11.0 → 0.12.0 release diff);
  * - `docs/adr/ADR-002-event-envelope-and-ordering-semantics.md` (an adapter
  *   must accept either trade-status spelling on either layer, and must treat
  *   an unrecognized enumerated value as first-class UNKNOWN).
@@ -95,7 +98,8 @@ export const TRADE_STATUS_PREFIX = "TRADE_STATUS_" as const;
  * (the user AsyncAPI S-D15, the order-lifecycle page S-D41, the CLOB OpenAPI
  * `Trade.status` enum S-D56, and the SDK, whose `TradeStatus` comment reads
  * "`MatchedNotBroadcasted` currently appears only on trades read via REST, not
- * on user stream trade events" — unchanged in the pinned 0.11.0 bindings).
+ * on user stream trade events" — unchanged in the pinned 0.12.0 bindings,
+ * `shared.ts` line 31).
  * The report's position is that the REST-only modelling stands and the user
  * stream carries the five plain values.
  *

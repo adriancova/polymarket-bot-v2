@@ -17,9 +17,16 @@
  *    name no venue contract uses (the venue's are `ClobAuthDomain` and the
  *    exchange domains, venue report §W.2). `signMessage` and
  *    `sendTransaction` always refuse.
- * 3. IT CANNOT REACH THE REAL SDK. It is sealed with provenance
- *    `TEST_MOCK`, and `createSecureVenueClient` (the real SDK binding)
- *    refuses that provenance before the signer is ever unsealed.
+ * 3. IT CANNOT REACH THE REAL SDK THROUGH THE PRODUCTION FACTORY. It is
+ *    sealed with provenance `TEST_MOCK`, and `createSecureVenueClient` (the
+ *    real SDK binding) refuses that provenance before the signer is ever
+ *    unsealed. The contract suite DOES hand it to the real SDK code (V2-5:
+ *    `createSecureVenueClientForTesting` over the contract factory of
+ *    `./sdk-contract.ts`, with FAKE credentials, behind the network
+ *    tripwire); there the SDK asks it to sign a venue order domain, and it
+ *    refuses (reason 2). {@link MockSignerProbe.signTypedDataRequests}
+ *    records what it was asked to sign, which is how that suite reads the
+ *    domain the SDK chose. No signature is produced for any venue domain.
  *
  * The address is a fixed marker (`0x7e57…0260`, "test"/"WP-260"); no key for
  * it exists in this repository.
@@ -41,6 +48,19 @@ export class MockSignerRefusal extends Error {
   override readonly name = "MockSignerRefusal";
 }
 
+/**
+ * One `signTypedData` request, recorded before the mock decides (V2-5). Only
+ * NON-SECRET data is kept: the EIP-712 domain, the primary type and the
+ * message's top-level scalar fields as strings (`bigint` in decimal). An
+ * order message carries no signature; nested objects are not copied.
+ */
+export interface MockSignRequest {
+  readonly domain: Readonly<Record<string, string>>;
+  readonly primaryType: string;
+  readonly message: Readonly<Record<string, string>>;
+  readonly refused: boolean;
+}
+
 /** Counters a test can read to prove the signer was, or was not, reached. */
 export interface MockSignerProbe {
   readonly getAddressCalls: number;
@@ -48,6 +68,20 @@ export interface MockSignerProbe {
   readonly signMessageCalls: number;
   readonly sendTransactionCalls: number;
   readonly refusals: number;
+  /** Every `signTypedData` request, in call order (a fresh frozen copy). */
+  readonly signTypedDataRequests: readonly MockSignRequest[];
+}
+
+/** Top-level scalar fields of a typed-data object, as strings; anything else is skipped. */
+function scalars(value: unknown): Readonly<Record<string, string>> {
+  const out: Record<string, string> = {};
+  if (typeof value !== "object" || value === null) return Object.freeze(out);
+  for (const key of Object.keys(value)) {
+    const entry: unknown = (value as Record<string, unknown>)[key];
+    if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean") out[key] = String(entry);
+    else if (typeof entry === "bigint") out[key] = entry.toString(10);
+  }
+  return Object.freeze(out);
 }
 
 function canonical(value: unknown): string {
@@ -76,6 +110,7 @@ export function createMockSignerHandle(): { readonly handle: SignerHandle; reado
     sendTransactionCalls: 0,
     refusals: 0,
   };
+  const requests: MockSignRequest[] = [];
   const refuse = (what: string): never => {
     counts.refusals += 1;
     throw new MockSignerRefusal(`the WP-260 test mock signer refuses ${what}`);
@@ -87,7 +122,11 @@ export function createMockSignerHandle(): { readonly handle: SignerHandle; reado
     },
     signTypedData: async (payload) => {
       counts.signTypedDataCalls += 1;
-      if (payload.domain.name !== MOCK_FIXTURE_DOMAIN_NAME) {
+      const refused = payload.domain.name !== MOCK_FIXTURE_DOMAIN_NAME;
+      requests.push(
+        Object.freeze({ domain: scalars(payload.domain), primaryType: String(payload.primaryType), message: scalars(payload.message), refused }),
+      );
+      if (refused) {
         return refuse("a payload that is not an in-memory fixture");
       }
       return fakeSignature(payload) as unknown as Awaited<ReturnType<SdkSigner["signTypedData"]>>;
@@ -116,6 +155,9 @@ export function createMockSignerHandle(): { readonly handle: SignerHandle; reado
     },
     get refusals() {
       return counts.refusals;
+    },
+    get signTypedDataRequests() {
+      return Object.freeze([...requests]);
     },
   };
   return { handle: sealSigner(signer, "TEST_MOCK"), probe };

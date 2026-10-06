@@ -10,7 +10,9 @@
  *   a fake SDK, accepting only the mock signer;
  * - {@link installNetworkTripwire}: makes every network attempt throw and
  *   records it;
- * - the SDK contract hooks used by `test/contract/polymarket-secure/**`.
+ * - the SDK contract hooks used by `test/contract/polymarket-secure/**`,
+ *   among them (V2-5) a factory over the REAL SDK code with FAKE
+ *   credentials, usable only with the test factory and the mock signer.
  */
 
 import { buildSecureVenueClient, type CreateSecureVenueClientOptions, type SecureVenueClient } from "../venue-client.js";
@@ -23,6 +25,7 @@ export {
   MOCK_SIGNER_ADDRESS,
   MockSignerRefusal,
   type MockSignerProbe,
+  type MockSignRequest,
 } from "./mock-signer.js";
 export {
   createFakeSdkFactory,
@@ -38,7 +41,22 @@ export {
   type NetworkAttempt,
   type NetworkTripwire,
 } from "./network-tripwire.js";
-export { answerAsPinnedSdk, parseOrderResponseWithPinnedSdk, provokeSdkHttpRejection } from "./sdk-contract.js";
+export {
+  answerAsPinnedSdk,
+  CONTRACT_CLOB_ORIGIN,
+  contractVenueResponder,
+  createPinnedSdkFactoryForContract,
+  createRecordingPinnedSdkFactoryForContract,
+  parseOrderResponseWithPinnedSdk,
+  pinnedSdkAssetTypes,
+  pinnedSdkErrorClassNames,
+  provokeSdkHttpRejection,
+  readBalanceAllowanceWithPinnedSdk,
+  type BalanceAllowanceReading,
+  type ContractMarket,
+  type ContractRequest,
+  type ContractVenue,
+} from "./sdk-contract.js";
 
 /**
  * Construct a secure venue client over a FAKE SDK. The run-mode gate still
