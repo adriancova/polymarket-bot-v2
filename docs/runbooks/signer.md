@@ -199,8 +199,9 @@ keeps it verbatim when it re-wraps a 425 or 503). So a documented code is
 trusted only when the error's own data `message` is a string that does **not**
 begin with `${code} (`. Otherwise the code is unprovable: `venueCode` null,
 `undocumentedVenueCode` true. A 503 `{"error": "post_only_mode"}` is
-therefore `TRADING_UNAVAILABLE` / `UNKNOWN`, exactly what `0.11.0` produced for
-it. The message is compared with that one prefix and dropped, never carried
+therefore `TRADING_UNAVAILABLE` / `UNKNOWN`, the kind and effect `0.11.0`
+produced for it (only `undocumentedVenueCode` differs: `0.11.0` carried no code
+at all, so it was `false`). The message is compared with that one prefix and dropped, never carried
 or matched against anything else, so it can only withdraw trust from a code,
 never grant it. A venue body whose `error` text is itself `post_only_mode`
 and that also sends the code is `UNKNOWN` too: the fail-closed direction. The

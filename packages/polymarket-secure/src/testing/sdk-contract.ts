@@ -8,7 +8,9 @@
  * No hook performs I/O on its own. Every hook that reaches the SDK's HTTP
  * layer needs the CALLER to have installed the network tripwire with a
  * fixture responder; with no responder each request is refused and the SDK
- * reports a transport failure.
+ * reports a transport failure. V2-5: those hooks REFUSE TO RUN (they throw
+ * {@link ContractHookOutsideTripwire} before any SDK code runs) unless a
+ * tripwire is installed, so a test that forgot it cannot reach the venue.
  *
  * - {@link parseOrderResponseWithPinnedSdk} runs the SDK's own
  *   `OrderResponseSchema` (from `@polymarket/bindings/clob`, the SDK's pinned
@@ -31,10 +33,12 @@
  *   `fetchBalanceAllowance` action (not a port member; the port has no
  *   balance read) on such a client, for the `CONDITIONAL-V2` pin (F-53).
  * - V2-5: {@link pinnedSdkAssetTypes} and {@link pinnedSdkErrorClassNames}
- *   read the SDK root's exports.
+ *   read the SDK root's exports; {@link pinnedSdkDistDirectory} names the
+ *   directory of the shipped JS (a path only: this module reads no file).
  */
 
 import { createRequire } from "node:module";
+import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -52,7 +56,18 @@ import { makeRealSdkClientFactory, type SdkClientFactory, type SdkClientFactoryA
 import { unsealSigner } from "../signer.js";
 import { FAKE_SDK_CREDENTIALS } from "./fake-sdk.js";
 import { createMockSignerHandle, MOCK_SIGNER_ADDRESS } from "./mock-signer.js";
-import type { FetchResponder } from "./network-tripwire.js";
+import { isNetworkTripwireInstalled, type FetchResponder } from "./network-tripwire.js";
+
+/** Thrown by a hook that would run real SDK code while no network tripwire is installed. */
+export class ContractHookOutsideTripwire extends Error {
+  override readonly name = "ContractHookOutsideTripwire";
+}
+
+function requireTripwire(hook: string): void {
+  if (!isNetworkTripwireInstalled()) {
+    throw new ContractHookOutsideTripwire(`${hook} runs the real SDK code only behind the network tripwire; install it first`);
+  }
+}
 
 interface ZodLikeSchema {
   safeParse(value: unknown): { success: true; data: unknown } | { success: false; error: unknown };
@@ -98,6 +113,7 @@ export async function answerAsPinnedSdk(raw: unknown): Promise<unknown> {
  * / `RateLimitError` from the status, headers and body the responder serves.
  */
 export async function provokeSdkHttpRejection(): Promise<unknown> {
+  requireTripwire("provokeSdkHttpRejection");
   try {
     await createPublicClient().fetchMidpoint({ assetId: "1" });
     return undefined;
@@ -125,14 +141,15 @@ export const CONTRACT_CLOB_ORIGIN = "https://clob.polymarket.com";
  * Deposit Wallet and reads the chain, which the tripwire refuses.
  */
 export function createPinnedSdkFactoryForContract(): SdkClientFactory {
-  return makeRealSdkClientFactory((options) =>
-    createSecureClient({
+  return makeRealSdkClientFactory((options) => {
+    requireTripwire("createPinnedSdkFactoryForContract");
+    return createSecureClient({
       signer: options.signer,
       ...(options.wallet === undefined ? {} : { wallet: options.wallet }),
       ...(options.onRateLimitUpdate === undefined ? {} : { onRateLimitUpdate: options.onRateLimitUpdate }),
       credentials: { ...FAKE_SDK_CREDENTIALS } as unknown as ApiKeyCreds,
-    }),
-  );
+    });
+  });
 }
 
 /**
@@ -252,6 +269,7 @@ export async function readBalanceAllowanceWithPinnedSdk(request: {
   readonly assetType: string;
   readonly assetId: string;
 }): Promise<BalanceAllowanceReading> {
+  requireTripwire("readBalanceAllowanceWithPinnedSdk");
   const sealed = unsealSigner(createMockSignerHandle().handle);
   if (sealed === undefined) throw new Error("the mock signer handle did not unseal");
   const client = await createPinnedSdkFactoryForContract()({ signer: sealed.signer, wallet: MOCK_SIGNER_ADDRESS });
@@ -266,6 +284,16 @@ export async function readBalanceAllowanceWithPinnedSdk(request: {
   } finally {
     await client.closeSubscriptions();
   }
+}
+
+/**
+ * The directory of the pinned SDK's shipped JS (`…/@polymarket/client/dist`),
+ * resolved from this package. A path only: this module reads no file
+ * (`source-hygiene.test.ts`); the contract suite reads the bundle to pin
+ * selection logic no port member can reach at runtime.
+ */
+export function pinnedSdkDistDirectory(): string {
+  return dirname(createRequire(import.meta.url).resolve("@polymarket/client"));
 }
 
 /** The pinned SDK root's `AssetType` values (`CONDITIONAL-V2` is new in 0.12.0, F-53). */

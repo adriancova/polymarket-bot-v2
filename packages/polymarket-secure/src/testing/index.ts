@@ -36,6 +36,7 @@ export {
 } from "./fake-sdk.js";
 export {
   installNetworkTripwire,
+  isNetworkTripwireInstalled,
   NetworkTripwireError,
   type FetchResponder,
   type NetworkAttempt,
@@ -44,11 +45,13 @@ export {
 export {
   answerAsPinnedSdk,
   CONTRACT_CLOB_ORIGIN,
+  ContractHookOutsideTripwire,
   contractVenueResponder,
   createPinnedSdkFactoryForContract,
   createRecordingPinnedSdkFactoryForContract,
   parseOrderResponseWithPinnedSdk,
   pinnedSdkAssetTypes,
+  pinnedSdkDistDirectory,
   pinnedSdkErrorClassNames,
   provokeSdkHttpRejection,
   readBalanceAllowanceWithPinnedSdk,

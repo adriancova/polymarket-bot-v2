@@ -72,6 +72,20 @@ function describeTarget(input: unknown): string {
   return "[unrecognised fetch input]";
 }
 
+/** Every `fetch` replacement this module has installed (V2-5: {@link isNetworkTripwireInstalled}). */
+const TRIPPED_FETCHES = new WeakSet<object>();
+
+/**
+ * True when the CURRENT `globalThis.fetch` is a tripwire's replacement, that
+ * is, a tripwire is installed and not uninstalled. The hooks that run the
+ * real SDK code (`./sdk-contract.ts`) refuse to run otherwise (V2-5), so a
+ * test that forgot the tripwire fails instead of reaching the venue.
+ */
+export function isNetworkTripwireInstalled(): boolean {
+  const current: unknown = globalThis.fetch;
+  return typeof current === "function" && TRIPPED_FETCHES.has(current);
+}
+
 /** A DNS function name the tripwire refuses (every query-making function). */
 const DNS_QUERY = /^(?:lookup|lookupService|resolve[A-Za-z0-9]*|reverse)$/u;
 
@@ -133,6 +147,7 @@ export function installNetworkTripwire(options: { readonly responder?: FetchResp
     refused.push({ via: "fetch", target });
     throw new NetworkTripwireError(`network tripwire: fetch(${target}) refused`);
   };
+  TRIPPED_FETCHES.add(trippedFetch);
   globalThis.fetch = trippedFetch as typeof fetch;
 
   class TrippedWebSocket {

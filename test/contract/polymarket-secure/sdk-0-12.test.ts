@@ -16,6 +16,10 @@
  *    `"2"`. Read from the domain the SDK asks the mock signer to sign.
  * 3. F-53: `CONDITIONAL-V2` exists in the pinned SDK, and a balance read for
  *    a V2 SELL selected that way reaches the wire as `asset_type=CONDITIONAL-V2`.
+ *    The SDK's OWN choice for a V2 SELL (`resolveBalanceAllowanceAssetType`,
+ *    used only by the `place*` allowance recovery this package never calls)
+ *    is pinned statically in the shipped JS, tied to the same reserved-bit
+ *    predicate that picks the signing domain (2).
  * 4. `place*` is never touched: every venue-client method, run over the real
  *    SDK client, reads only the ten port members.
  * 5. ky (the SDK's transport, 1.14.3): a DELETE (every cancel) and a GET are
@@ -31,7 +35,7 @@
  *    client's cross-check accepts exactly those amounts.
  */
 
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +53,7 @@ import {
   MOCK_FIXTURE_DOMAIN_NAME,
   MOCK_SIGNER_ADDRESS,
   pinnedSdkAssetTypes,
+  pinnedSdkDistDirectory,
   readBalanceAllowanceWithPinnedSdk,
   type ContractMarket,
   type ContractRequest,
@@ -279,6 +284,26 @@ describe("3. F-53: a V2 SELL's balance and allowance read uses CONDITIONAL-V2", 
     const { reading, reads } = await balanceRead("CONDITIONAL", V1_UP);
     expect(reading).toBe("RESOLVED");
     expect(new URLSearchParams(reads[0]?.query).get("asset_type")).toBe("CONDITIONAL");
+  });
+
+  it("the SDK's own SELL selector (shipped JS): BUY → COLLATERAL, a V2-shaped id → CONDITIONAL-V2, else CONDITIONAL, with the predicate that picks domain \"3\"", async () => {
+    const dist = pinnedSdkDistDirectory();
+    const chunks = (await readdir(dist)).filter((name) => name.endsWith(".js"));
+    const texts = await Promise.all(chunks.map((name) => readFile(resolve(dist, name), "utf8")));
+    const shipped = texts.filter((text) => text.includes("AssetType.CONDITIONAL_V2"));
+    expect(shipped).toHaveLength(1);
+    const bundle = shipped[0] ?? "";
+    // resolveBalanceAllowanceAssetType (actions/orders/allowance.ts lines 8-20), minified.
+    const selectors = [
+      ...bundle.matchAll(
+        /function [\w$]+\(([\w$]+),([\w$]+)\)\{return \1===OrderSide\.BUY\?AssetType\.COLLATERAL:([\w$]+)\(\2\)\?AssetType\.CONDITIONAL_V2:AssetType\.CONDITIONAL\}/gu,
+      ),
+    ];
+    expect(selectors).toHaveLength(1);
+    // createUnsignedOrder's domain choice (actions/orders/orders.ts lines 31-33), whose behaviour section 2 pins at runtime.
+    const domains = [...bundle.matchAll(/protocolVersion:([\w$]+)\([\w$]+\.assetId\)\?"3":"2"/gu)];
+    expect(domains).toHaveLength(1);
+    expect(selectors[0]?.[3]).toBe(domains[0]?.[1]);
   });
 
   it("guard: an asset type the SDK does not know is refused before anything is sent (as 0.11.0 refused CONDITIONAL-V2)", async () => {

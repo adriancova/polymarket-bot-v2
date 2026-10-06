@@ -16,6 +16,7 @@
  *   the user stream's `ASSET_ID`.
  * - C4: the SDK port is the same ten members, with no `place*`.
  * - LOGGABLE_ERROR_NAMES covers the pinned SDK's error classes.
+ * - The hooks that run real SDK code refuse to run without the tripwire.
  */
 
 import { readdir, readFile } from "node:fs/promises";
@@ -31,15 +32,18 @@ import { LOGGABLE_ERROR_NAMES } from "./redaction.js";
 import type { SdkSecureClientPort } from "./sdk-port.js";
 import { SignedOrderEnvelope } from "./signed-order.js";
 import {
+  ContractHookOutsideTripwire,
   contractVenueResponder,
   createFakeSdkFactory,
   createMockSignerHandle,
   createPinnedSdkFactoryForContract,
   createSecureVenueClientForTesting,
   installNetworkTripwire,
+  isNetworkTripwireInstalled,
   MOCK_SIGNER_ADDRESS,
   pinnedSdkErrorClassNames,
   provokeSdkHttpRejection,
+  readBalanceAllowanceWithPinnedSdk,
   type FetchResponder,
   type NetworkTripwire,
 } from "./testing/index.js";
@@ -348,6 +352,47 @@ describe("C4: the SDK port is the same ten members, and none is `place*`", () =>
     };
     await walk(SRC);
     expect(offenders).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("the hooks that run real SDK code refuse to run without the network tripwire", () => {
+  it("each hook throws ContractHookOutsideTripwire before any request when no tripwire is installed", async () => {
+    tripwire.uninstall();
+    expect(tripwire.refused()).toEqual([]);
+    expect(isNetworkTripwireInstalled()).toBe(false);
+    const realFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (() => {
+      fetches += 1;
+      return Promise.reject(new Error("a counting stub, never a network"));
+    }) as typeof fetch;
+    try {
+      await expect(createPinnedSdkFactoryForContract()({ signer: {} as never, wallet: MOCK_SIGNER_ADDRESS })).rejects.toBeInstanceOf(ContractHookOutsideTripwire);
+      await expect(readBalanceAllowanceWithPinnedSdk({ assetType: "CONDITIONAL-V2", assetId: V2_POSITION_ID })).rejects.toBeInstanceOf(ContractHookOutsideTripwire);
+      await expect(provokeSdkHttpRejection()).rejects.toBeInstanceOf(ContractHookOutsideTripwire);
+      // Through the boundary too: the client cannot be built.
+      await expect(
+        createSecureVenueClientForTesting(
+          { runModeContext: LIVE_SHAPED_CONTEXT, signer: createMockSignerHandle().handle, wallet: MOCK_SIGNER_ADDRESS },
+          createPinnedSdkFactoryForContract(),
+        ),
+      ).rejects.toThrow();
+      expect(fetches).toBe(0);
+    } finally {
+      globalThis.fetch = realFetch;
+      tripwire = installNetworkTripwire();
+    }
+    expect(isNetworkTripwireInstalled()).toBe(true);
+  });
+
+  it("control: isNetworkTripwireInstalled follows install and uninstall", () => {
+    expect(isNetworkTripwireInstalled()).toBe(true);
+    tripwire.uninstall();
+    expect(isNetworkTripwireInstalled()).toBe(false);
+    tripwire = installNetworkTripwire();
+    expect(isNetworkTripwireInstalled()).toBe(true);
   });
 });
 
