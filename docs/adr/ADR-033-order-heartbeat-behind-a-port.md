@@ -1,21 +1,25 @@
 # ADR-033: The order heartbeat goes behind a port; the user rules its transport before live
 
-- **Status:** **Accepted for D1–D4 and D6, 2026-10-03, by the orchestrator.**
+- **Status:** **Accepted.** D1–D4 and D6 were accepted on 2026-10-03 by the
+  orchestrator. **D5 was decided on 2026-10-05 by the user: option 1**
+  ([Amendment 1](#amendment-1-2026-10-05-v2-0-d5-decided)), on the facts of
+  the venue round `VENUE-4`.
   The venue report assigns C-12 / E-17 to "the orchestrator, by ADR, before
   `WP-320`" (`docs/venue/verified-2026-09-30.md` §16, carried-forward item 2).
   Proposed the same day; revised r1 to r3 by `ADR033-REVIEW`, with a joint
   ACCEPT from Opus and gpt-6-astra at r4, merged as `47575cf`. D1–D4 and D6 settle
-  what `WP-320` builds. **D5, the transport, stays open**, and its
-  recommendation is not a ruling: the user rules it before any run mode above
-  PAPER. Three LOWs from r4 (R4-W1, R4-L1, R4-L2) go to the next revision or
-  `WP-320`'s packet.
+  what `WP-320` builds. Three LOWs from r4 (R4-W1, R4-L1, R4-L2) go to the
+  next revision or `WP-320`'s packet.
 - **Date:** 2026-10-03
-- **Recorded by:** the orchestrator, after `WP-310`.
-- **Implemented by:** `WP-320` (D1–D4, D6), not yet. D5 is not implemented.
+- **Recorded by:** the orchestrator, after `WP-310`. Amendment 1 by `V2-0`.
+- **Implemented by:** `WP-320` (D1–D4, D6), merged `ed6e5a0` (2026-10-05).
+  D5 is not implemented: a pre-live package builds its transport
+  (Amendment 1).
 - **Supersedes / Superseded by:** none. It refines how §9.12's "heartbeat
   orders" is met while the SDK has no heartbeat method. It amends no
   invariant and no ADR. Under D1–D4 and D6, nothing but the SDK reaches the
-  venue.
+  venue. Amendment 1 adds one named exception to §9.12's "Wrap only the
+  official unified SDK": D5's heartbeat request, on the user's ruling.
 - **Handoff sections:** §6 (invariants 6 and 16), §9.9, §9.12, §9.13,
   §9.17, §9.18, §14.1, §14.2, §14.4.
   **ADRs:** ADR-008 §2–§4 and §8, applied unchanged; ADR-007; ADR-010 §4.
@@ -23,6 +27,12 @@
   (`docs/venue/verified-2026-09-30.md` §5, §11; brief row
   `V3-C12-HEARTBEAT-ADR`). It carries one more, unresolved, to the next
   venue round: the guide and the API reference disagree (Context 3).
+  - *Note, 2026-10-05 (`V2-0`):* that round, `VENUE-4`, recorded the
+    conflict as C-20 and resolved it in part. The 10 s cancellation is
+    documented for `POST /v1/heartbeats`, which carries the id chain (H-3).
+    Still open: the `400` message key (C-20) and U-40. See
+    [Amendment 1](#amendment-1-2026-10-05-v2-0-d5-decided), "The facts the
+    ruling rests on".
 - **Code cited:** `main` at `85b81e5`. `WP-290`'s coordinator is cited on
   the `wp-290` branch at `1dc6672`, not yet merged. Each cited behavior
   still holds at `ba150f5` and at `6ed3fbe`, the branch tip when r2 and r3
@@ -64,6 +74,14 @@
     - Consequences gain D6's tests. Since r2, they run against the real
       `OrderManager` and `ReconciliationCoordinator`. Since r3, they include
       a lift without the periodic timer.
+- **Amendment 1:** 2026-10-05 (`V2-0`), after acceptance. It records the
+  user's D5 ruling. Dated pointers to it were added, without editing the
+  text they follow, to "Conflict it resolves for PAPER", Context 3, D1
+  item 1 and D2. The header's old text:
+  - Status: "**D5, the transport, stays open**, and its recommendation is
+    not a ruling: the user rules it before any run mode above PAPER.";
+  - Implemented by: "`WP-320` (D1–D4, D6), not yet. D5 is not
+    implemented."
 
 ## Context
 
@@ -106,6 +124,10 @@
      `POST /v1/heartbeats`". The S-D18 body that both reports verified, by
      digest `983e93c1…`, reads `post /heartbeats`. This ADR carries the
      conflict as unverified, for the next venue round (D5).
+     *Note, 2026-10-05 (`V2-0`):* `VENUE-4` recorded it as C-20. The page
+     renders the CLOB OpenAPI's other operation, and `/v1/heartbeats` is the
+     documented route of the 10 s cancellation (H-3). The `400` message key
+     and U-40 stay open (Amendment 1).
    - Every figure is documentary only. No verification round has observed
      the protocol (`verified-2026-09-16.md` §5, "Documentary-only limit";
      §12).
@@ -135,6 +157,8 @@
    - the documented `400` recovery: one new request with the expected id.
      Repeated `400`s raise the live-fencing-conflict alert (ADR-008 §4);
    - the 5 s cadence.
+   - *Note, 2026-10-05 (`V2-0`):* no longer provisional in its route or its
+     id chain (H-3; D2's note; Amendment 1).
 2. **The gate.** A heartbeat is sent only while both hold:
    - the process holds the current fencing token;
    - the health lease holds.
@@ -165,6 +189,11 @@
   shapes (S-D17), as the fixture records them. The venue round before D5
   resolves the conflict with S-D18. A different answer amends D1, D2 and
   D6.
+  - *Note, 2026-10-05 (`V2-0`):* the round, `VENUE-4`, gave no different
+    answer. The OpenAPI documents the same `/v1/heartbeats` shapes (H-3),
+    so D1, D2 and D6 stand. The contract is no longer provisional in its
+    route or its id chain. The `400` message key stays open (C-20), and
+    Amendment 1's transport rule 4 covers it. U-40 stays open.
 - Tests use a fake port. `WP-320`'s allowed paths have no
   `test/contract/**` entry today.
   - §16.3's "Heartbeat protocol" contract test runs beside the code, in
@@ -229,6 +258,10 @@ facts. The round is `VENUE-4`, combined with the Protocol V2 migration
 facts, since the SDK upgrade bears on the same questions.
 
 The ruling needs the user. It is recorded as an amendment to this ADR.
+
+**2026-10-05, the user ruled option 1.**
+[Amendment 1](#amendment-1-2026-10-05-v2-0-d5-decided) records the
+decision, its scope, its transport rules and when it lapses.
 
 ### D6. A lapsed heartbeat
 
@@ -333,6 +366,9 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
 
 "Wrap only the official unified SDK" is unchanged.
 
+Amendment 1 (2026-10-05) adds one named exception to it, for D5's heartbeat
+request only. Its own table gives the effect.
+
 ## Consequences
 
 - **`WP-320` can start once `WP-290` merges and this ADR is accepted.** Its
@@ -410,3 +446,166 @@ The ruling needs the user. It is recorded as an amendment to this ADR.
     order id (`#readAll`, `#compareOrdersAndTrades`);
   - the test "(I-10, X4) a trigger raised during the reads" in
     `test/fault-injection/reconciliation/resume.test.ts`.
+
+## Amendment 1 (2026-10-05, V2-0): D5 decided
+
+- **Recorded by:** `V2-0`.
+- **Ruled by:** **the user, 2026-10-05**, in the session, on `VENUE-4`'s
+  facts: "ADR-033 D5: option 1". `docs/handoffs/VENUE-4.md` records it
+  ("The user's rulings on this plan (2026-10-05)", item 2).
+- **Facts:** `docs/venue/verified-2026-10-05.md` §H, cited by id. That
+  report numbers its sources afresh: its guide is S-D20 (S-D17 above), its
+  API-reference page S-D23 (S-D18 above), and the CLOB OpenAPI S-O02.
+- **The handoff:** it departs from §9.12's "Wrap only the official unified
+  SDK" for one request, on the user's ruling. It is not hand-written
+  signing, so §1.3's SDK-replacement gate is not reached (ADR-010 §4). It
+  removes no heartbeat control.
+- **Mode:** it enables no mode. What it allows once a mode above PAPER is
+  otherwise permitted is stated below.
+- **Not implemented.** A pre-live package builds the transport. `WP-320`'s
+  controller and port are unchanged.
+
+### The facts the ruling rests on
+
+- **H-1.** No release has a public order-heartbeat method: not 0.11.0, not
+  0.12.0, not the canary. The guide's TypeScript tab reads "Content coming
+  soon." So the port cannot wrap an SDK method, and C-12 stands.
+- **H-2.** `buildHmacSignature` is a public root export, and `SecureClient`'s
+  own L2 headers are built with it. `credentials` and `account` are public
+  getters. The authenticated transport, `secureClob`, is still `@internal`.
+- **H-3.** The CLOB OpenAPI documents two routes:
+  - `POST /v1/heartbeats`: the id chain; a `200` that requires
+    `heartbeat_id`; a `400` that requires `error` and `heartbeat_id`;
+  - `POST /heartbeats`: no body; a `200` with `{"status": "ok"}`.
+
+  The guide documents only the first, keys its `400` `error_msg`, and ties
+  the 10 s cancellation to it. **So the documented route of the 10 s
+  cancellation is `/v1/heartbeats`.**
+- **C-20** is resolved in part. Open: the `400` message key, `error_msg` in
+  the guide and `error` in the OpenAPI.
+- **U-40** is open: the timing of `/heartbeats`' cancellation; whether it and
+  `/v1/heartbeats` are one mechanism; and whether heartbeats protect
+  ExchangeV3 orders. INF: yes, since the cancel is per credential, but no
+  page says so.
+- **Protocol V2 changes nothing here.** The guide's order-heartbeat section
+  is unchanged apart from one punctuation mark (F-75).
+
+**What this means for D1, D2 and D6.**
+- The venue round found D2's provisional shapes documented for
+  `/v1/heartbeats` by both the guide and the OpenAPI (H-3). D2 said a
+  different answer would amend D1, D2 and D6. The answer was not different,
+  so all three stand as written.
+- D2's contract is no longer provisional in its route or its id chain. The
+  `400` message key is the one open point (C-20), and transport rule 4
+  below covers it.
+- `classifyHeartbeatAnswer` already reads a `400` by its `heartbeat_id`,
+  never by its message.
+
+### The decision: option 1
+
+1. **What.** D1's `OrderHeartbeatTransport` port is bound to one request:
+   an L2-signed `POST /v1/heartbeats` on the CLOB host, sent by
+   `packages/polymarket-secure` itself.
+2. **Signing.** The L2 headers are built as the SDK's own `SecureClient`
+   builds them (H-2):
+   - `POLY_SIGNATURE` comes from the public `buildHmacSignature`, over the
+     timestamp, `"POST"`, `"/v1/heartbeats"` and the exact body sent (H-2,
+     quoting S-D20 lines 1518-1523);
+   - the key, passphrase and secret come from the public `credentials`
+     getter, and `POLY_ADDRESS` from the public `account` getter;
+   - no signature code of our own is written, and `secureClob` stays unused.
+     Option 3 stays rejected.
+3. **The exception.** The package sends this request itself, so it is a
+   named, reviewed exception to "Wrap only the official unified SDK"
+   (§9.12).
+   - D2's "no hand-built signature" and "no use of an `@internal` SDK
+     member" stand.
+   - D2's "no raw HTTP request" is lifted for this one request.
+
+### Its scope: this route only
+
+- Only `POST /v1/heartbeats`. Never `POST /heartbeats` (U-40), and no other
+  route.
+- Only inside `packages/polymarket-secure`, and only as the binding of D1's
+  port.
+- It permits no other request that the secure package sends itself. Every
+  other venue call stays on the SDK. A second exception needs its own ADR.
+
+### The transport rules
+
+1. **A timeout.** Every request has a fixed timeout. The implementing
+   package sets it and pins it with a test.
+   - It is no longer than the controller's `responseTimeoutMs`, a client
+     choice of 4 s by default (`createOrderHeartbeatController`). So a call
+     the controller abandons leaves no request open.
+   - A timed-out request is an unknown outcome, so the heartbeat is
+     unconfirmed (D6).
+2. **No retry beyond the §9.13 budget.**
+   - The transport makes one attempt per call of the port. It never
+     retries: not on a network error, a `429` or any other status.
+   - Every resend is the controller's: the next 5 s tick, or D1's one `400`
+     recovery. Each is filed with the budget as `clob.heartbeat` at
+     `ORDER_HEARTBEAT` (D3).
+   - A `Retry-After` is reported to the controller, not waited on.
+3. **The id chain, as D1, D2 and D6 state it.**
+   - An empty `heartbeat_id` first, then each returned id (H-3).
+   - Confirmed means a success response that carries the next id (D6).
+   - A success without one, such as `/heartbeats`' `{"status": "ok"}`,
+     confirms nothing.
+4. **The `400` body is read under both documented keys** (C-20).
+   - Its message is under `error_msg` in the guide and `error` in the
+     OpenAPI. Either or both may be present.
+   - A reader accepts either key and depends on neither. The message text
+     classifies nothing.
+   - The expected id is `heartbeat_id`, which both sources document (H-3).
+5. **What it reports.** The venue's answer, unparsed, as D2's port contract
+   says (`HeartbeatTransportAnswer`). It never throws.
+6. **Secrecy.** The headers, the credentials and the heartbeat id are never
+   logged and never put in an event (§15; ADR-010 §6).
+7. **Mode.** The transport's factory runs `assertSignerGate` first, as the
+   controller's does (D4). In PAPER it is never built.
+8. **Tests.** Contract tests pin the request, the headers built through the
+   SDK's exports, the timeout, the single attempt and both `400` keys. They
+   run on fakes behind the network tripwire. No test sends a heartbeat.
+
+### When the exception lapses
+
+- It lapses at the first stable release of `@polymarket/client` with a public
+  order-heartbeat method. A canary or beta release does not count.
+- Then the port wraps that method, as D5 already says: "the port wraps it
+  and no exception is needed". The hand-sent request is removed in the same
+  package, after a fresh pin check.
+- Until then, each venue round re-checks H-1.
+
+### What it allows, and what it does not
+
+- **Now, nothing runs.** `MAX_RUN_MODE=PAPER`, `ALLOW_REAL_ORDERS=false`,
+  `LIVE_MICRO_MAX_ORDER_NOTIONAL=0` and `LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0`
+  are unchanged. PAPER holds no credential (ADR-010 §3).
+- **Once a mode above PAPER is otherwise permitted** (ADR-010 §1's human
+  gates): the live composition may bind D1's port to this transport, in the
+  modes D4 allows. It allows nothing else.
+- **Still owed before a live gate relies on it for V2 orders:** U-40's
+  ExchangeV3 question. It is settled by documentation, or by an
+  authenticated observation in a mode that permits credentials (U-40).
+- "Live stays impossible until D5 is ruled and implemented" (Consequences):
+  D5 is now ruled, and not yet implemented.
+
+### Related, not yet triggered
+
+The migration plan's §5 item 5 is a possible second exception: one
+unsigned, credential-free `GET /v2/approvals` inside
+`packages/polymarket-secure`.
+- It triggers only if no stable SDK release reads `/v2/approvals` when
+  `V2-6` starts. Today only the canary does (§S.2, §S.3).
+- It is not decided here, and this amendment's scope does not cover it.
+- If it triggers, its ADR states its scope, transport rules, number handling
+  and lapse in the same form, and names this exception.
+
+### Effect on the handoff and the brief
+
+| Item | Before | After |
+|---|---|---|
+| §9.12 "Wrap only the official unified SDK" | Unchanged | One named exception: D5's `POST /v1/heartbeats`, on the user's ruling |
+| §9.12 "heartbeat orders" | `WP-320` built the controller behind a port; no transport | The transport is option 1, built pre-live |
+| Brief row `V3-C12-HEARTBEAT-ADR` | D5 open for the user | D5 ruled; its transport is owed before any mode above PAPER |

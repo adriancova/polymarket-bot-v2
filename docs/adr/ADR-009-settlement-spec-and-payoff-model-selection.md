@@ -15,6 +15,11 @@
   register row is `docs/contracts/protected-contracts.md` §8 U-6. `CANCELLED`
   mechanics remain unverified (new register row **U-10**) and §4's
   `MarketDisputed` condition remains unmet.
+  2026-10-05 (`V2-0`), two dated notes:
+  - §8: a journaled Data API `/v2/resolutions` row may publish a window's
+    resolution in PAPER, under ADR-030 Amendment 2, rule 5. Its payouts
+    only select `YES_WIN` or `NO_WIN`. `V2-3` implements it; not yet;
+  - §5: what U-11 means for Protocol V2 markets.
 
 ## Context
 
@@ -173,6 +178,25 @@ does not change §4 (no dispute transition event was found; the
 and it claims nothing observational (handoff §1.2 keeps the fact volatile;
 each phase gate re-verifies).
 
+**Note, 2026-10-05 (`V2-0`): U-11 and Protocol V2.** The amendment above
+says the `umaResolutionStatus` vocabulary is undocumented (U-11). That still
+holds for V1 markets (`docs/venue/verified-2026-10-05.md` §12). A V2 market
+uses other fields:
+- **Gamma `resolutionStatus`,** documented for V2 as `inactive`, `active`
+  or `resolved` (F-54). The Gamma OpenAPI and the SDK lack it (C-18), and no
+  V2 market has been read from Gamma (U-36). It is recorded, not
+  interpreted (plan `V2-2`), and it never publishes a resolution (ADR-030
+  Amendment 2, rule 5).
+- **Data API `/v2/resolutions`,** a row per condition with its own `status`
+  vocabulary, a `reporter` and `payouts` (F-57). Its vocabulary differs from
+  Gamma's: two fields, not one (F-57, INF).
+- **`disputed` is one of the row's statuses** (F-57). A `disputed` row
+  publishes nothing: it is pending, and the window is read again (§8, note
+  of 2026-10-05). §4 is unchanged: this note adds no `MarketDisputed`
+  event.
+
+This note adds no rule of its own, and changes nothing above PAPER.
+
 ### 6. TWAP specs must name a window the feed actually publishes
 
 Verified (venue report §10.3): Chainlink TWAP arrives over RTDS at
@@ -288,6 +312,62 @@ resolution" (venue report §10.2).
 
 A position's economic value at resolution and the pUSD actually received are
 separate facts, recorded separately, and reconciled (§9.17).
+
+**Note, 2026-10-05 (`V2-0`): a Data API resolution row as evidence.**
+ADR-030 Amendment 2, rule 5 lets a journaled `/v2/resolutions` row publish
+a window's `MarketResolved`. It is the orchestrator's interim ruling for
+PAPER and BACKTEST, and the user may confirm or overrule it. The facts are
+`docs/venue/verified-2026-10-05.md`, cited by id.
+
+1. **The evidence source.** PAPER positions settle from each market's public
+   resolution, `MarketResolved` (§6, correction of 2026-10-05, item 4). That
+   resolution now has two venue sources:
+   - the market channel's `market_resolved`, as before
+     (`docs/venue/verified-2026-08-24.md` §3, under Evidence);
+   - a `/v2/resolutions` row (F-57), only under rule 5's conditions, when the
+     first does not arrive or does not match.
+2. **The unit.** `payouts` is "Per-outcome payout in micro-USDC per share,
+   `[outcome0, outcome1]`" (F-57). On the wire it is two JSON integers, such
+   as `[1000000,0]` (F-59). The SDK turns them into collateral units,
+   `["1","0"]` (F-78). That form never reaches this read.
+3. **How the vector is read.** ADR-001 §8 item 6's binary64 rule governs
+   SDK sizes, not payouts; this note states the same rule for payouts (plan
+   §5 item 6).
+   - It is compared by value, as a fixed integer vector, with exactly
+     `[1000000,0]` and `[0,1000000]`. Every other vector is refused.
+   - Our door reads it after `JSON.parse`. A spelling that parses to the
+     same integers, such as `1e6`, is that vector, as an alias is under
+     item 6.
+   - It only selects `YES_WIN` or `NO_WIN`; index 0 is YES (F-40). No
+     amount is taken from it. The payoff follows from the outcome, as for a
+     `market_resolved` frame.
+4. **Not settled from a row:** `SPLIT_50_50`, `CANCELLED`, and every
+   `status` but `"resolved"`.
+   - The venue documents a binary split payout, with no ratio (F-73;
+     plan D18). U-10 stands.
+   - A row whose `status` is another of F-57's values is pending. It
+     publishes nothing, the window is read again, and the unresolved-window
+     incident opens at its usual bound.
+   - A `"resolved"` row that does not qualify, a split among them, is
+     refused. It publishes nothing and raises that incident at once (ADR-030
+     Amendment 2, rule 5, "What a read finds").
+5. **The resolution instant.** `MarketResolved`'s `resolvedAt` is the row's
+   `resolved_at`, unchanged. A row without a well-formed one is refused.
+   - `resolved_at` is observed (F-59), and is not among the documented
+     fields the report quotes (F-57). Its use is part of rule 5's interim
+     ruling, and a gap for the next venue round (ADR-030 Amendment 2,
+     rule 5, "The resolution instant").
+   - It dates the resolution and settles nothing. The payoff follows from
+     the outcome alone (item 3).
+6. **The resolution source.** Up/down markets resolve from Chainlink TWAP
+   (F-58), and a V2 canary row named `reporter` `CHAINLINK` (F-59). The row
+   is the venue's record of the outcome, not a price this platform reads.
+   Ruling `V3-C13` is unchanged.
+7. **What is unchanged:** §1's reviewed spec and its fields, §2's model
+   selection, §3's terminal subset and §4's ruling. Whether a series' spec
+   names this source is for its settlement review (plan D14).
+8. **Mode.** PAPER and BACKTEST only (ADR-030 Decision 2.1). It changes
+   nothing above PAPER.
 
 ## Consequences
 

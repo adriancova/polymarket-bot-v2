@@ -8,6 +8,8 @@
   `WP-240`, `WP-260`, and `WP-320` carry the enforcement points; `WP-350` and
   `WP-370` are the human-approval gates that could ever raise a cap.
 - **Supersedes / Superseded by:** none
+- **Notes:** 2026-10-05 (`V2-0`): §4 records the user's ruling on the SDK's
+  scope, per surface. It changes no rule.
 
 ## Context
 
@@ -128,6 +130,59 @@ Rules derived from that split:
   with a fresh check. Everything verified about the SDK is pinned to commit
   `7fdbed42484b5d279c71aa36d3757d18968260da` (venue report §1). No SDK dependency
   exists in this repository today.
+
+**Note, 2026-10-05 (`V2-0`): the SDK's scope, per surface, ruled by the
+user.**
+- **The ruling.** The user ruled on 2026-10-05, in the session: the SDK's
+  scope is the per-surface recommendation of
+  `docs/venue/protocol-v2-migration-plan.md` §7. `docs/handoffs/VENUE-4.md`
+  records it ("The user's rulings on this plan (2026-10-05)", item 1). The
+  facts are `docs/venue/verified-2026-10-05.md`, cited by id.
+- **Why it is recorded here.** This section owns the SDK boundary
+  (`docs/adr/README.md`, "Which change requires which ADR"). The plan names
+  this section as the one a change of scope would amend (§7.3).
+- **What it changes:** no rule above, and no handoff text. Under it, §9.12
+  and F6 need no change, because every read inside
+  `packages/polymarket-secure` stays on the SDK (plan §7.3). The one request
+  that package sends itself is ADR-033's D5 heartbeat, a separate named
+  exception on the user's ruling (ADR-033 Amendment 1).
+
+| Surface | Served by | Why, by fact id |
+| --- | --- | --- |
+| Trading: create, post, cancel and query orders | The SDK, inside `packages/polymarket-secure`, upgraded to 0.12.x | Protocol V2 needs 0.12.0: the guide's floor (F-37), `CONDITIONAL-V2` (F-53) and version-selected position operations (F-74) |
+| Account reads: positions and approvals (Data API v2) | The SDK, inside `packages/polymarket-secure` | "Data API v2 is supported starting with version `0.10.0` in both official SDKs" (F-65). 0.12.0 calls `/v2/positions` (§S.3) and parses its rows (F-78). The package already wraps the SDK, so §9.12 and F6 need no change |
+| Account trades (CLOB `/data/trades`) | The SDK's `listAccountTrades`, never the Data API `listTrades` | `listAccountTrades` reads `price` and `size` as strings (F-78). The Data API `Trade` serves them as JSON `double`s (F-77) |
+| Public market data: Gamma, the public CLOB, the market WebSocket, `/v2/resolutions` | Our own clients, in `packages/polymarket-public` | The SDK exposes no raw body to journal before deriving. Its normalized models drop fields, and its market WebSocket drops frames silently (§S.4). It turns `payouts` into collateral units (F-78) |
+
+The reasons above are the ones the report records. Plan §7.1 and §7.2 give
+more, read in the SDK's sources but not recorded in the report. This note
+does not restate them, and the ruling does not rest on them.
+
+The account reads carry these conditions (plan §7.1 S4(a)):
+- position sizes are read under ADR-001 §8 item 6;
+- positions are reported incomplete until U-47 and U-48 settle;
+- condition ids are sent in the 32-byte form (F-43; ADR-030 Amendment 2,
+  rule 3);
+- every request the SDK sends counts against the §9.13 budget, its own
+  retries included. ky's defaults retry a GET whose `fetch` rejects up to
+  2 times (§S.4).
+  - Whether the SDK also retries a `429` (F-66) is not in the report. That
+    is a gap for the next venue round. `V2-6` pins the behaviour it finds
+    with a test.
+- approvals are read only on a stable release that reads `/v2/approvals`.
+  Today only the canary does. In 0.11.0 and 0.12.0 the method of that name
+  reads on chain through a third-party RPC (§S.2, §S.3). If no such release
+  exists when `V2-6` starts, the plan's §5 item 5 ADR comes first.
+
+Also:
+- The SDK may serve as a test-only oracle for the public surfaces, through
+  the `testing` entry of `packages/polymarket-secure`. That needs no F6
+  change (plan §7.1 S1).
+- Moving a public surface onto the SDK would need an ADR amending §9.12,
+  F6 and this section (plan §7.3).
+- The pin has moved since this section was written: `WP-260` pinned
+  `0.11.0` (§S.1), and `V2-5` moves it to 0.12.x (F-37; plan C3).
+- **Mode.** It changes nothing above PAPER.
 
 ### 5. Geographic eligibility, and the ordering of the live gate
 
