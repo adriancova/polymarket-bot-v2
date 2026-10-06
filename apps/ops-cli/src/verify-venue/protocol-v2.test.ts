@@ -15,8 +15,10 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import {
   decodeFeedCursor,
+  duplicateKeys,
   evaluatePins,
   isLabelledSyntheticHex,
+  isLabelledSyntheticText,
   loadCapture,
   parseSourceIndex,
   redactionSubjects,
@@ -34,6 +36,7 @@ import type {
 import {
   PROTOCOL_V2_CAPTURES,
   PROTOCOL_V2_REPORT_PATH,
+  PUBLIC_CONTRACT_ADDRESSES,
   VENUE_CHECKS,
   assertBookV2,
   assertHeartbeatNotesCiteC20,
@@ -60,10 +63,12 @@ import {
 
 const V2_REPORT = readFileSync(join(REPO_ROOT, PROTOCOL_V2_REPORT_PATH), "utf8");
 
+/** The context the gate passes (`index.ts` `runVenueVerification`). */
 const CONTEXT: CaptureContext = {
   report: PROTOCOL_V2_REPORT_PATH,
   reportContent: V2_REPORT,
   sourceIndex: parseSourceIndex(reportSectionText(V2_REPORT, "14") ?? ""),
+  publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
 };
 
 function checkById(id: string): VenueCheck {
@@ -524,8 +529,8 @@ describe("V2-9 trade and activity captures (report §15; plan acceptance 5)", ()
         row["transaction_hash"] = "0x9f2c1a7d3e5b4c6a8d0e2f4a6c8e0b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e";
       }),
     );
-    // Each refused once: the wallet and pseudonym by the personal-key scan,
-    // the name and hash by the feed rule.
+    // Each refused once, by the personal-data scan: the wallet and pseudonym
+    // by their keys, the name and hash because a feed row is a person's row.
     expect(result.errors.length).toBe(4);
     for (const fragment of [
       "$.data[0].proxy_wallet: a wallet must be a labelled synthetic address",
@@ -600,6 +605,426 @@ describe("V2-9 trade and activity captures (report §15; plan acceptance 5)", ()
     expect(redactionSubjects("pagination.next_cursor (round 1): replaced …")).toEqual(["next_cursor"]);
     expect(redactionSubjects("timestamp (round 1): replaced …")).toEqual(["timestamp"]);
     expect(redactionSubjects("every other byte (market fields, side) is unchanged")).toEqual([]);
+  });
+});
+
+// --- round 1: personal data everywhere (V2-9-R1-01) --------------------------------
+
+/**
+ * SYNTHETIC probe values, invented for these mutants (the verifier's round-1
+ * probes): a 40-hex address with no leading zeros, a 64-hex hash, a spaced
+ * name and an `example.invalid` email. None is a real person or account.
+ */
+const PROBE_WALLET = `0x${"1234567890".repeat(4)}`;
+const PROBE_HASH = `0x${"1234567890abcdef".repeat(4)}`;
+const PROBE_NAME = "Reviewer Probe";
+const PROBE_EMAIL = "reviewer-probe@example.invalid";
+const PROBE_DISCLOSURE = ` Original proxy_wallet: ${PROBE_WALLET}; original name: ${PROBE_NAME}; email: ${PROBE_EMAIL}`;
+
+/**
+ * Marks an edited live capture as redacted, so the kind rule (a live-capture
+ * IS the raw body) does not mask the rule under test.
+ */
+function asRedacted(sidecar: Record<string, unknown>): void {
+  sidecar["kind"] = "live-capture-redacted";
+  sidecar["redactions"] = ["probe: a test mutant edit"];
+}
+
+/** Appends one record, whose `data` is this frame text, to a `.jsonl` capture. */
+function appendRecord(frameText: string): (text: string) => string {
+  return (text) =>
+    `${text}${JSON.stringify({ t: "2026-10-05T23:16:26.000Z", dir: "recv", data: frameText })}\n`;
+}
+
+describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1-01)", () => {
+  it("every committed sidecar's text and every committed capture pass the round-1 policy", () => {
+    for (const spec of PROTOCOL_V2_CAPTURES) {
+      expect(validateEdited(spec.fixture.replace("protocol-v2/", "")).errors, spec.fixture).toEqual([]);
+    }
+  });
+
+  it("MUTANT (verifier probe): a trade sidecar's notes disclosing a wallet, a name and an email are refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string}${PROBE_DISCLOSURE}`;
+    });
+    expect(result.errors).toEqual([
+      "sidecar.notes: an email address may not be committed (personal data)",
+      "sidecar.notes: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet",
+      "sidecar.notes: proxy_wallet is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+      "sidecar.notes: name is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+      "sidecar.notes: email is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+    ]);
+    // The refusals never echo the probe values.
+    for (const value of [PROBE_WALLET, PROBE_NAME, PROBE_EMAIL]) {
+      expect(result.errors.join("\n")).not.toContain(value);
+    }
+  });
+
+  it("MUTANT: the same disclosure is refused in EVERY sidecar, feed or not", () => {
+    for (const spec of PROTOCOL_V2_CAPTURES) {
+      const name = spec.fixture.replace("protocol-v2/", "");
+      const result = validateEdited(name, undefined, (sidecar) => {
+        sidecar["notes"] = `${sidecar["notes"] as string}${PROBE_DISCLOSURE}`;
+      });
+      expect(hasError(result, "sidecar.notes: an email address"), name).toBe(true);
+      expect(hasError(result, "sidecar.notes: a 0x 40-hex address"), name).toBe(true);
+      expect(hasError(result, "sidecar.notes: name is written with a value"), name).toBe(true);
+    }
+  });
+
+  it("MUTANT: a redaction's description, a docs extract rule and the URL are scanned too", () => {
+    const redaction = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["redactions"] = [
+        ...(sidecar["redactions"] as string[]),
+        `pseudonym: the original was pseudonym=Real-Handle, wallet ${PROBE_WALLET}`,
+      ];
+    });
+    expect(hasError(redaction, "sidecar.redactions[9]: a 0x 40-hex address")).toBe(true);
+    expect(hasError(redaction, "sidecar.redactions[9]: pseudonym is written with a value")).toBe(true);
+    const rule = validateEdited("gamma-market-v2-docs-example.jsonc", undefined, (sidecar) => {
+      const extract = sidecar["extract"] as Record<string, unknown>;
+      extract["rule"] = `${extract["rule"] as string}; reviewed by ${PROBE_EMAIL}`;
+    });
+    expect(rule.errors).toEqual([
+      "sidecar.extract.rule: an email address may not be committed (personal data)",
+    ]);
+    const url = validateEdited("data-v2-oi-v2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&market=${PROBE_WALLET}&note=${PROBE_EMAIL}`;
+    });
+    expect(url.errors).toEqual([
+      "sidecar.url: an email address may not be committed (personal data)",
+      "sidecar.url: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet",
+    ]);
+  });
+
+  it("MUTANT: a live hash in sidecar prose is refused; the condition its URL or capture carries is not", () => {
+    const hash = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} First row's transaction ${PROBE_HASH}.`;
+    });
+    expect(hash.errors).toEqual([
+      "sidecar.notes: a hex id, hash or number of 40 or more digits that is not a labelled synthetic value and that neither the capture nor the URL carries; name it by placeholder (<V1 window>)",
+    ]);
+    const bare = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Wallet ${PROBE_WALLET.slice(2)}.`;
+    });
+    expect(bare.errors).toEqual(hash.errors);
+    const condition = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Condition 0xcd5f9f505e0c0182746aa65963f72f01e7463259e5ea9f56672c0fe3a37f348a; synthetic hash 0x${"0".repeat(61)}101; address 0x00…<page><row>.`;
+    });
+    expect(condition.errors).toEqual([]);
+  });
+
+  it("placeholders, empty values and labelled synthetic values may follow a personal key in prose", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Shape: name: <name>, "pseudonym":"synthetic-pseudonym-p1-r1", bio: "", proxy_wallet=0x0000000000000000000000000000000000000101, user=<wallet>, email: null, transaction_hash: 0x00…<page><row>.`;
+    });
+    expect(result.errors).toEqual([]);
+  });
+
+  it("MUTANT (verifier probe): an email in a feed row, under its own key or inside a public field, is refused", () => {
+    const ownKey = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["email"] = PROBE_EMAIL;
+      }),
+    );
+    expect(ownKey.errors).toEqual([
+      "$.data[0].email: an email field must be empty or a labelled synthetic value (synthetic-…)",
+      "$.data[0].email: not a Trade or Activity field (S-O06); an unrecognized field may carry personal data, so classify it in FEED_ROW_FIELDS, with its source, before committing it",
+    ]);
+    const inTitle = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["title"] = `Bitcoin Up or Down (ask ${PROBE_EMAIL})`;
+      }),
+    );
+    expect(inTitle.errors).toEqual([
+      "$.data[0].title: an email address may not be committed (personal data)",
+    ]);
+  });
+
+  it("MUTANT (verifier probe): a nested name or hash, or any unrecognized field, in a trade or activity page is refused", () => {
+    const nested = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["profile"] = { name: PROBE_NAME, transaction_hash: PROBE_HASH };
+      }),
+    );
+    // The nested name is refused twice over: in a Data API capture every
+    // `name` is a wallet's display name (S-O06), and `profile` is no Trade field.
+    expect(nested.errors).toEqual([
+      "$.data[0].profile.name: a name must be a labelled synthetic value (synthetic-…)",
+      "$.data[0].profile: not a Trade or Activity field (S-O06); an unrecognized field may carry personal data, so classify it in FEED_ROW_FIELDS, with its source, before committing it",
+    ]);
+    const objectInKnownField = validateEdited(
+      "data-v2-trades-v1-page2.jsonc",
+      editJson((body) => {
+        firstRow(body)["title"] = { text: PROBE_NAME };
+      }),
+    );
+    expect(objectInKnownField.errors).toEqual([
+      "$.data[0].title: a feed-row field must be a scalar (S-O06 rows are flat)",
+    ]);
+    const extraPageAndPagination = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        body["users"] = [{ handle: "x" }];
+        pagination(body)["last_trader"] = "synthetic-x";
+      }),
+    );
+    expect(extraPageAndPagination.errors).toEqual([
+      "$.users[0].handle: a user name or handle must be empty or a labelled synthetic value (synthetic-…)",
+      "$.users: not a field of a trade or activity page (S-O06: data, pagination)",
+      "$.pagination.last_trader: not a Pagination field (S-O06: limit, offset, has_more, next_cursor)",
+    ]);
+  });
+
+  it("MUTANT: a live address in ANY capture value is refused; a documented contract address is not", () => {
+    const live = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      (text) => text.replace('"marketMakerAddress":""', `"marketMakerAddress":"${PROBE_WALLET}"`),
+      asRedacted,
+    );
+    expect(live.errors).toEqual([
+      "$.marketMakerAddress: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet",
+    ]);
+    const router = "0x12121212006e4CD160D18e3f00711DA5c3372600";
+    expect(PUBLIC_CONTRACT_ADDRESSES).toContain(router);
+    const documented = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      (text) => text.replace('"marketMakerAddress":""', `"marketMakerAddress":"${router}"`),
+      asRedacted,
+    );
+    expect(documented.errors).toEqual([]);
+    const withoutAllowList = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      (text) => text.replace('"marketMakerAddress":""', `"marketMakerAddress":"${router}"`),
+      asRedacted,
+      { ...CONTEXT, publicAddresses: [] },
+    );
+    expect(withoutAllowList.errors).toEqual(live.errors);
+  });
+
+  it("MUTANT: an address or a JSON-escaped email inside a WebSocket frame is refused, once", () => {
+    // The frame text spells the email's `@` as the JSON escape @, so only
+    // the parsed frame shows it: the scan reads the frame, not just the text.
+    const frameText = `{"event_type":"probe","maker":"${PROBE_WALLET}","contact":"reviewer-probe\\u0040example.invalid"}`;
+    expect(frameText).not.toContain("@");
+    const session = validateEdited("ws-market-v2-session.jsonl", appendRecord(frameText));
+    expect(session.errors).toEqual([
+      "$[16].frame.maker: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet",
+      "$[16].frame.contact: an email address may not be committed (personal data)",
+    ]);
+  });
+
+  it("MUTANT: any wallet-named or email-named key in a NON-feed capture is refused, and makes its object a person's row", () => {
+    const result = validateEdited(
+      "data-v2-resolutions-v2-active.jsonc",
+      editJson((body) => {
+        firstRow(body)["maker_wallet"] = PROBE_WALLET;
+        firstRow(body)["contactEmail"] = "someone";
+      }),
+      asRedacted,
+    );
+    // A wallet key makes the resolution row a person's row, so its (empty)
+    // transaction hash must now be a labelled synthetic one.
+    expect(result.errors).toEqual([
+      "$.data[0].transaction_hash: a hash must be a labelled synthetic hash (0x00…)",
+      "$.data[0].maker_wallet: a wallet must be a labelled synthetic address (0x00…), not a live value",
+      "$.data[0].contactEmail: an email field must be empty or a labelled synthetic value (synthetic-…)",
+    ]);
+  });
+
+  it("MUTANT: a personal URL parameter, a percent-encoded one, and a full-width email are refused", () => {
+    const named = validateEdited("gamma-events-keyset-series10192.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&name=Reviewer%20Probe`;
+    });
+    expect(named.errors).toEqual([
+      "sidecar.url: name is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+    ]);
+    const encoded = validateEdited("gamma-events-keyset-series10192.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&pseudo%6Eym=Real-Handle`;
+    });
+    expect(encoded.errors).toEqual([
+      "sidecar.url: pseudonym is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
+    ]);
+    const synthetic = validateEdited("gamma-events-keyset-series10192.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&name=synthetic-name-p1-r1`;
+    });
+    expect(synthetic.errors).toEqual([]);
+    const fullWidth = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Contact reviewer-probe\uFF20example.invalid.`;
+    });
+    expect(fullWidth.errors).toEqual([
+      "sidecar.notes: an email address may not be committed (personal data)",
+    ]);
+  });
+
+  it("MUTANT: a profile object at any depth of a NON-Data-API capture is a person's row (camelCase keys too)", () => {
+    const result = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      editJson((body) => {
+        body["creator"] = {
+          proxyWallet: PROBE_WALLET,
+          name: PROBE_NAME,
+          profileImage: "https://example.invalid/avatar.png",
+          xUsername: "reviewer_probe",
+        };
+      }),
+      asRedacted,
+    );
+    expect(result.errors).toEqual([
+      "$.creator.proxyWallet: a wallet must be a labelled synthetic address (0x00…), not a live value",
+      "$.creator.name: a name must be a labelled synthetic value (synthetic-…)",
+      "$.creator.profileImage: a profile field must be empty or a labelled synthetic value (synthetic-…)",
+      "$.creator.xUsername: a user name or handle must be empty or a labelled synthetic value (synthetic-…)",
+    ]);
+    // Without a profile key, a Gamma `name` is market metadata and stays.
+    const metadata = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      editJson((body) => {
+        body["category"] = { name: "Crypto" };
+      }),
+      asRedacted,
+    );
+    expect(metadata.errors).toEqual([]);
+  });
+
+  it("MUTANT: a synthetic label cannot carry an email, a space, a capital or a base64url cursor", () => {
+    expect(isLabelledSyntheticText("synthetic-name-p1-r1")).toBe(true);
+    for (const value of [
+      "synthetic-reviewer@example.invalid",
+      "synthetic-Reviewer Probe",
+      "synthetic-Reviewer",
+      `synthetic-${SYNTHETIC_SEEK_ANCHOR_CURSOR}`,
+    ]) {
+      expect(isLabelledSyntheticText(value), value).toBe(false);
+    }
+    const result = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["pseudonym"] = "synthetic-reviewer@example.invalid";
+      }),
+    );
+    expect(result.errors).toEqual([
+      "$.data[0].pseudonym: a pseudonym must be a labelled synthetic value (synthetic-…)",
+    ]);
+  });
+});
+
+// --- round 1: every URL cursor (V2-9-R1-02) ------------------------------------------
+
+describe("V2-9 r1: every cursor in a trade or activity sidecar URL (V2-9-R1-02)", () => {
+  it("MUTANT (verifier probe): a second cursor parameter carrying a seek anchor is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&cursor=synthetic-cursor-test&cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(result.errors).toEqual([
+      "sidecar.url: 2 cursor parameters (cursor, cursor); a trade or activity URL carries at most one",
+      "sidecar url cursor: the cursor decodes to a venue feed cursor (params l, ts, sq, d), which carries the seek anchor of the last row (S-O06) and re-fetches the unredacted page; replace it with a labelled synthetic value",
+      `sidecar url cursor: a trade or activity cursor must be a labelled synthetic value (synthetic-cursor-…), got ${JSON.stringify(SYNTHETIC_SEEK_ANCHOR_CURSOR.slice(0, 24))}…`,
+    ]);
+  });
+
+  it("MUTANT: a repeated cursor is refused even when both values are labelled synthetic", () => {
+    const result = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&cursor=synthetic-cursor-trades-p1-next`;
+    });
+    expect(result.errors).toEqual([
+      "sidecar.url: 2 cursor parameters (cursor, cursor); a trade or activity URL carries at most one",
+    ]);
+  });
+
+  it("MUTANT: a cursor under another or a percent-encoded name, in the path or fragment, or in sidecar prose, is refused", () => {
+    const otherName = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&type=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(otherName.errors).toEqual([
+      "sidecar url type: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
+    ]);
+    const undocumented = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&after=${SYNTHETIC_SEEK_ANCHOR_CURSOR}&tx=${PROBE_HASH}`;
+    });
+    expect(undocumented.errors).toEqual([
+      "sidecar url after: not a query parameter S-O06 documents for /v2/trades or /v2/activity",
+      "sidecar url after: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
+      "sidecar url tx: not a query parameter S-O06 documents for /v2/trades or /v2/activity",
+    ]);
+    const encodedName = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&%43ursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(hasError(encodedName, "sidecar.url: 2 cursor parameters (cursor, Cursor)")).toBe(true);
+    expect(hasError(encodedName, "sidecar url Cursor: the cursor decodes to a venue feed cursor")).toBe(true);
+    const fragment = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}#${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(fragment.errors).toEqual([
+      "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
+    ]);
+    const prose = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} The real cursor was ${SYNTHETIC_SEEK_ANCHOR_CURSOR}.`;
+    });
+    expect(prose.errors).toEqual([
+      "sidecar.notes: a token decodes to a venue cursor, which carries the seek anchor of the last row (S-O06); name a cursor by its labelled synthetic value",
+    ]);
+    const row = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["slug"] = SYNTHETIC_SEEK_ANCHOR_CURSOR;
+      }),
+    );
+    expect(row.errors).toEqual(["$.data[0].slug: a token decodes to a venue cursor (S-O06)"]);
+  });
+
+  it("MUTANT: a repeated key that hides a seek anchor or a live wallet from JSON.parse is refused, in a capture, a frame or a sidecar", () => {
+    expect(duplicateKeys('{"a":"x\\"}","a":1}')).toEqual(["a"]);
+    expect(duplicateKeys('{"a":{"a":1},"b":[{"a":2},{"a":3}]}')).toEqual([]);
+    const cursor = validateEdited("data-v2-trades-v1-page1.jsonc", (text) =>
+      text.replace(
+        '"next_cursor":"synthetic-cursor-trades-p1-next"',
+        `"next_cursor":"${SYNTHETIC_SEEK_ANCHOR_CURSOR}","next_cursor":"synthetic-cursor-trades-p1-next"`,
+      ),
+    );
+    expect(cursor.errors).toEqual([
+      'the capture: the key "next_cursor" occurs twice in one object; JSON.parse keeps only the last value, so an earlier one would escape every check',
+    ]);
+    const wallet = validateEdited("data-v2-trades-v1-page2.jsonc", (text) =>
+      text.replace(
+        '"proxy_wallet":"0x0000000000000000000000000000000000000201"',
+        `"proxy_wallet":"${PROBE_WALLET}","proxy_wallet":"0x0000000000000000000000000000000000000201"`,
+      ),
+    );
+    expect(wallet.errors).toEqual([
+      'the capture: the key "proxy_wallet" occurs twice in one object; JSON.parse keeps only the last value, so an earlier one would escape every check',
+    ]);
+    const frame = validateEdited(
+      "ws-market-v2-session.jsonl",
+      appendRecord(`{"event_type":"probe","maker":"${PROBE_WALLET}","maker":"synthetic-x"}`),
+      asRedacted,
+    );
+    expect(frame.errors).toEqual([
+      'line 17 frame: the key "maker" occurs twice in one object; JSON.parse keeps only the last value, so an earlier one would escape every check',
+    ]);
+    const spec = captureSpec("data-v2-trades-v1-page1.jsonc");
+    const sidecarText = fixtureText(sidecarPathOf(spec.fixture)).replace(
+      '"notes": ',
+      `"notes": "Original name: ${PROBE_NAME}",\n  "notes": `,
+    );
+    const sidecar = validateCapture(
+      spec,
+      Buffer.from(fixtureText(spec.fixture), "utf8"),
+      sidecarText,
+      CONTEXT,
+    );
+    expect(sidecar.errors).toEqual([
+      'protocol-v2/data-v2-trades-v1-page1.provenance.jsonc: the key "notes" occurs twice in one object; JSON.parse keeps only the last value, so an earlier one would escape every check',
+    ]);
+  });
+
+  it("a non-feed capture keeps its public time-series cursor (prices-history page 2)", () => {
+    const sidecar = sidecarOf(captureSpec("data-v2-prices-history-page2.jsonc"));
+    expect(decodeFeedCursor(new URL(sidecar["url"] as string).searchParams.get("cursor") ?? "")).toBeDefined();
+    expect(validateEdited("data-v2-prices-history-page2.jsonc").errors).toEqual([]);
   });
 });
 
@@ -928,5 +1353,19 @@ describe("V2-9 parent fixture rules: the dated, scoped exception", () => {
     expect(readme).toContain("## Exception 2026-10-06 (V2-9): sanitized live public captures");
     expect(readme).toContain("protocol-v2/");
     expect(readme).toContain("market-ws/book-snapshot-v2.json");
+  });
+
+  it("round 1: the exception states the enforced personal-data policy, sidecars included, and what the gate cannot check (V2-9-R1-01)", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "**Sidecar text** (`url`, `notes`, each redaction, `extract.rule`)",
+      "**A person's row**",
+      "every cursor parameter of the sidecar URL",
+      "at most one cursor parameter, and only the query parameters S-O06 documents",
+      "**What the gate cannot check.**",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    expect(readme).not.toContain("The trade size and\n  block timestamp are replaced too.");
   });
 });

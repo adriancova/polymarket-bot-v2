@@ -279,31 +279,87 @@ live public identifiers and observed prices and times. They stay, because:
 
 Within that scope, these may be live: public market identifiers (condition,
 position, token, market, event and series ids; slugs, questions and titles),
-public contract addresses, observed prices, book sizes and times, public
-venue metadata as served (for example Gamma's numeric `createdBy` and
-`updatedBy` record ids), and the bodies of public, unauthenticated GETs and of
-the public market channel.
+documented public contract addresses (today the V2 proxies; another needs an
+entry, with its source, in `PUBLIC_CONTRACT_ADDRESSES` in
+`apps/ops-cli/src/verify-venue/checks.ts`), observed prices, book sizes and
+times, public venue metadata as served (for example Gamma's numeric
+`createdBy` and `updatedBy` record ids), and the bodies of public,
+unauthenticated GETs and of the public market channel.
 
-**Still replaced, and enforced by `verify-venue`, in every capture:**
+**Still replaced, and enforced by `verify-venue`** (round 1 of V2-9 widened
+this from the payload to the sidecars and to every field; the policy is set
+out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
 
-- anything that identifies a person or an account: wallets (`proxy_wallet`),
-  names, pseudonyms, bios and profile images;
-- in a Data API trade or activity row: the wallet, name, pseudonym and
-  transaction hash, each with a labelled synthetic value (`synthetic-…`, or
-  `0x` and zeros and at most eight significant hex digits). The trade size and
-  block timestamp are replaced too;
-- a trade or activity feed cursor, in the page or in the sidecar URL. Such a
-  cursor carries the seek anchor of the last row (S-O06) and re-fetches the
-  unredacted page. It must be a labelled synthetic value (`synthetic-cursor-…`),
-  and one that decodes to a venue cursor is refused;
-- a sidecar of a trade or activity page with rows or a cursor must list
-  `timestamp` and `next_cursor` among its redactions;
-- no credential-shaped value anywhere; `authenticated` is exactly `false`;
+- **Personal keys, at any depth of any capture.** Keys compare without case
+  or separators (`proxy_wallet`, `proxyWallet`). A key containing `wallet`,
+  when it holds a string, holds a labelled synthetic address; `pseudonym` a labelled synthetic value;
+  `bio`, `profile_image…`, any key containing `email`, and a user name or
+  handle (`user_name`, `x_username`, `display_name`, `handle`) are empty or a
+  labelled synthetic value.
+- **A person's row**: a trade or activity row, or any object carrying one of
+  those keys. Its `name` and `transaction_hash` are labelled synthetic values
+  (the hash names the wallet on chain). In a Data API capture every `name`
+  is, because S-O06 uses `name` for the wallet's display name in `Trade`,
+  `Activity`, `Holder` and `Position`.
+- **Personal values, anywhere in a capture or in its sidecar's text**,
+  after NFKC normalization: no email address; no `0x` 40-hex address other
+  than a labelled synthetic one or a documented V2 contract address
+  (`PUBLIC_CONTRACT_ADDRESSES`, F-71).
+- **A trade or activity page** carries only the S-O06 fields: `data` and
+  `pagination`; in a row only the `Trade` and `Activity` fields, each a
+  scalar; in `pagination` only `limit`, `offset`, `has_more` and
+  `next_cursor`. An unrecognized field (an email, a nested profile) is
+  refused, since it may carry personal data. A package that captures a new
+  field classifies it, with its source.
+- **Labelled synthetic** means: `synthetic-` and lowercase letters, digits and
+  hyphens (so no email, spaced name or base64url cursor fits); or `0x`, zeros
+  and at most eight significant hex digits; or, for a cursor,
+  `synthetic-cursor-…`. VENUE-4 also replaced the trade sizes and block
+  timestamps; the gate does not judge those values, only that the redactions
+  list `timestamp` (below).
+- **Feed cursors.** A trade or activity cursor carries the seek anchor of the
+  last row (S-O06) and re-fetches the unredacted page, so the page's
+  `next_cursor` and every cursor parameter of the sidecar URL (every
+  occurrence, whatever its case or percent-encoding) is a labelled synthetic
+  value, and one that decodes to a venue cursor is refused. The URL carries
+  at most one cursor parameter, and only the query parameters S-O06 documents
+  for the feeds (`FEED_QUERY_PARAMETERS`). No other query value, path,
+  fragment, row value or sidecar prose token of a trade or activity capture
+  may decode to a cursor.
+- A sidecar of a trade or activity page with rows or a cursor lists
+  `timestamp` and `next_cursor` among its redactions.
+- **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`). A
+  personal field written with a value (`name: …`, `name=…`, `"name":"…"`, or
+  a URL query parameter such as `name=`) holds a labelled synthetic value, a
+  `<placeholder>`, `null` or nothing; a redaction's subject list before its
+  first colon names fields and is not a value. Prose carries no hex id, hash
+  or number of 40 or more digits that is not labelled synthetic, unless the
+  capture or the URL carries it or it is the sidecar's own digest: a market is
+  named by placeholder (`<V1 window>`), as the committed sidecars do.
+- **No repeated key** in any object of a capture, a WebSocket frame or a
+  sidecar: `JSON.parse` keeps only the last value, so an earlier one (a live
+  wallet, a venue cursor) would sit in the committed bytes and escape every
+  check above.
+- No credential-shaped value anywhere; `authenticated` is exactly `false`;
   the URL is on a public Polymarket host (documentation, Gamma, CLOB, Data
   API, the market channel); a CLOB URL is one of the public market reads the
   report observed (F-76, O.3), not an order, trade or balance route; and no
   Data API URL is keyed by a wallet (`user`, `address`, `proxy_wallet`,
   `wallet`).
+
+**What the gate cannot check.** These are not machine-detectable:
+
+- a person's name written as plain prose with no field label ("traded by
+  Jane Doe");
+- a personal value encoded (base64, for example), other than a venue cursor;
+- outside the Data API, a name under a generic key (`name`, `title`) of an
+  object with no personal key: Gamma's `name` is market metadata;
+- an address without its `0x` under a generic key of a non-feed capture: the
+  market channel's book `hash` is a bare 40-hex value.
+
+So the capture author writes personal values in a sidecar only as labelled
+synthetic values or `<placeholders>`, and the reviewer of a new capture reads
+the capture's keys and its sidecar prose.
 
 **Not covered.** Every other fixture in this tree keeps the rules above. The
 V2 Router fixture (`positions/router-v2.json`) needs no exception: its ids

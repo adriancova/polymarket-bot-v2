@@ -28,19 +28,33 @@
  * 4. **The parse.** A `.jsonc` capture is ONE strict RFC 8259 JSON document
  *    (`JSON.parse`, which refuses comments and trailing commas), and a
  *    `.jsonl` capture is one strict JSON record `{t, dir, data}` per line.
- *    The text must be valid UTF-8.
- * 5. **No credential and no unlabelled personal field** anywhere, in any
- *    capture: the WP-000 credential scan, and the Data API personal keys
- *    (`proxy_wallet`, `pseudonym`, `bio`, `profile_image`,
- *    `profile_image_optimized`) must carry labelled synthetic values.
+ *    The text must be valid UTF-8. No object of a capture, a frame or a
+ *    sidecar repeats a key (round 1): `JSON.parse` would keep only the last
+ *    value, and an earlier one would escape every check below.
+ * 5. **No credential and no unlabelled personal data**, in any capture or
+ *    sidecar (the policy is set out at "personal data" below): the WP-000
+ *    credential scan; the personal keys (any `…wallet…` key, `pseudonym`,
+ *    `bio`, `profile_image…`, any `…email…` key, a user name or handle)
+ *    carry labelled synthetic values; no email address and no unlabelled
+ *    `0x` 40-hex address in any capture value or sidecar text; a person's
+ *    row (a feed row, or an object with a personal key) carries a labelled
+ *    synthetic name and transaction hash; and sidecar text writes no
+ *    personal field with a live value and no unlabelled long id that the
+ *    capture or URL does not carry.
  * 6. **Trade and activity feeds** (Data API `/v2/trades`, `/v2/activity…`,
  *    or any capture whose `data` rows carry a wallet), report §15:
- *    - a cursor (the page's `next_cursor`, or a `cursor` in the sidecar URL)
- *      that decodes to a venue feed cursor is refused, because a feed cursor
- *      carries the seek anchor of the last row (S-O06) and re-fetches the
- *      unredacted page; any other cursor must be a labelled synthetic value;
- *    - a row's name and transaction hash must be labelled synthetic values
- *      (its wallet and pseudonym already must be, by rule 5);
+ *    - a cursor (the page's `next_cursor`, or any cursor parameter of the
+ *      sidecar URL, every occurrence) that decodes to a venue feed cursor is
+ *      refused, because a feed cursor carries the seek anchor of the last
+ *      row (S-O06) and re-fetches the unredacted page; any other cursor must
+ *      be a labelled synthetic value; the URL carries at most one cursor, and
+ *      no other URL part, row value or sidecar prose token may decode to one;
+ *    - the page carries only the S-O06 fields (`data`, `pagination`; the
+ *      `Trade` and `Activity` row fields, flat; the `Pagination` fields), so
+ *      an unrecognized field is refused;
+ *    - each row is a person's row, so its wallet, pseudonym, profile
+ *      fields, name and transaction hash must be labelled synthetic values
+ *      (rule 5);
  *    - a page that carries a row or a cursor must have a sidecar whose
  *      redactions list `timestamp` and `next_cursor`.
  * 7. **The pins.** The venue facts the capture is committed to show (a
@@ -351,9 +365,14 @@ export function isLabelledSyntheticHex(
   );
 }
 
-/** A labelled synthetic text value: `synthetic-…`. */
+/**
+ * A labelled synthetic text value: `synthetic-` and lowercase slug characters
+ * only (`synthetic-name-p1-r1`). Round 1: no `@`, `.`, space or capital, so
+ * neither an email (`synthetic-alice@mail.example`) nor a base64url venue
+ * cursor (`synthetic-eyJ…`) can pass under the label.
+ */
 export function isLabelledSyntheticText(value: unknown): boolean {
-  return typeof value === "string" && /^synthetic-\S+$/.test(value);
+  return typeof value === "string" && /^synthetic-[a-z0-9-]+$/.test(value);
 }
 
 /** The labelled synthetic cursor form the trade captures use. */
@@ -437,36 +456,340 @@ export function redactionSubjects(redaction: string): readonly string[] {
 }
 
 // --- personal data -----------------------------------------------------------
+//
+// The personal-data policy (V2-9 round 1), enforced in every capture and every
+// sidecar. Keys compare normalized (lowercase letters and digits), so
+// `proxy_wallet`, `proxyWallet` and `Proxy-Wallet` are one key.
+//
+// - **Personal keys, at any depth of any capture:**
+//   - a key containing `wallet`, holding a string: a labelled synthetic
+//     address;
+//   - `pseudonym`: a labelled synthetic value;
+//   - `bio`, `profile_image…`, a key containing `email`, and a user name or
+//     handle (a key ending in `username`, `display_name`, `screen_name`,
+//     `handle`): empty, `null` or a labelled synthetic value.
+// - **A person's row:** a trade or activity row, or any object carrying one of
+//   the keys above. Its `name` (S-O06: "Profile display name of the wallet")
+//   and its `transaction_hash` (it names the wallet on chain) hold labelled
+//   synthetic values. In a Data API capture every `name` does: S-O06 uses
+//   `name` for the wallet's display name in `Trade`, `Activity`, `Holder` and
+//   `Position`.
+// - **Personal values, anywhere in a capture or its sidecar's text** (keys
+//   included, after NFKC normalization): no email address, and no `0x` 40-hex
+//   address other than a labelled synthetic one or a documented public
+//   contract address (`CaptureContext.publicAddresses`).
+// - **Trade and activity pages** carry only the S-O06 fields
+//   (`FEED_ROW_FIELDS`, rule 6); an unrecognized field is refused.
+// - **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`):
+//   - no personal field written with a value (`name: …`, `name=…`,
+//     `"name":"…"`, or a URL query parameter) other than a labelled synthetic
+//     value, a `<placeholder>`, `null` or an empty string;
+//   - in prose, no hex id, hash or number of 40 or more digits that is not a
+//     labelled synthetic value, unless the capture or the URL carries it or it
+//     is the sidecar's own digest;
+//   - for a trade or activity capture, no token that decodes to a venue cursor.
+//
+// The limit, stated in `test/fixtures/venue/README.md`: a person's name
+// written as plain prose with no field label, or encoded, is not
+// machine-detectable. Sidecar prose names personal values by placeholder or
+// synthetic label only, and the reviewer reads it.
 
-/** Data API v2 personal keys, which must be synthetic in EVERY capture. */
-const PERSONAL_TEXT_KEYS = ["pseudonym"];
-const PERSONAL_BLANKABLE_KEYS = ["bio", "profile_image", "profile_image_optimized"];
+/** An email address, anywhere in a string. */
+const EMAIL_RE = /[\w.%+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}/;
 
-function scanPersonalKeys(value: unknown, path: string, errors: string[]): void {
+/** A `0x` 40-hex token (an address), not part of a longer hex run. */
+const ADDRESS_TOKEN_RE = /(?<![0-9A-Za-z_])0[xX][0-9a-fA-F]{40}(?![0-9a-fA-F])/g;
+
+/**
+ * A long id in prose: `0x` and more than 40 hex digits (an id or a hash), or
+ * 40 or more bare hex or decimal digits (an unprefixed address or hash, a
+ * position id).
+ */
+const LONG_ID_TOKEN_RE =
+  /(?<![0-9A-Za-z_])(?:0[xX][0-9a-fA-F]{41,}|[0-9a-fA-F]{40,})(?![0-9a-fA-F])/g;
+
+/** A key compared without case or separators. */
+function normalizedKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function isUserNameKey(normalized: string): boolean {
+  return (
+    normalized.endsWith("username") ||
+    normalized === "displayname" ||
+    normalized === "screenname" ||
+    normalized === "handle"
+  );
+}
+
+const isBlankOrSynthetic = (value: unknown): boolean =>
+  value === "" || value === null || isLabelledSyntheticText(value);
+
+interface PersonalKeyRule {
+  readonly applies: (normalized: string) => boolean;
+  readonly allows: (value: unknown) => boolean;
+  readonly message: string;
+}
+
+/** Personal keys anywhere; each also marks its object as a person's row. */
+const PERSONAL_KEY_RULES: readonly PersonalKeyRule[] = [
+  {
+    applies: (key) => key.includes("wallet"),
+    allows: (value) => typeof value !== "string" || isLabelledSyntheticHex(value, 40),
+    message: "a wallet must be a labelled synthetic address (0x00…), not a live value",
+  },
+  {
+    applies: (key) => key === "pseudonym",
+    allows: isLabelledSyntheticText,
+    message: "a pseudonym must be a labelled synthetic value (synthetic-…)",
+  },
+  {
+    applies: (key) => key === "bio" || key.startsWith("profileimage"),
+    allows: isBlankOrSynthetic,
+    message: "a profile field must be empty or a labelled synthetic value (synthetic-…)",
+  },
+  {
+    applies: (key) => key.includes("email"),
+    allows: isBlankOrSynthetic,
+    message: "an email field must be empty or a labelled synthetic value (synthetic-…)",
+  },
+  {
+    applies: isUserNameKey,
+    allows: isBlankOrSynthetic,
+    message: "a user name or handle must be empty or a labelled synthetic value (synthetic-…)",
+  },
+];
+
+/** The keys of a person's row (see the policy above). */
+const PERSON_ROW_RULES: readonly PersonalKeyRule[] = [
+  {
+    applies: (key) => key === "name",
+    allows: isLabelledSyntheticText,
+    message: "a name must be a labelled synthetic value (synthetic-…)",
+  },
+  {
+    applies: (key) => key === "transactionhash" || key === "txhash",
+    allows: (value) => isLabelledSyntheticHex(value, 64),
+    message: "a hash must be a labelled synthetic hash (0x00…)",
+  },
+];
+
+/** What the personal-data scan of one capture knows. */
+interface PersonalDataPolicy {
+  /** Documented public contract addresses, lowercased. */
+  readonly publicAddresses: ReadonlySet<string>;
+  /** The capture's trade or activity rows (person's rows by position). */
+  readonly feedRows: ReadonlySet<unknown>;
+  /** A Data API capture: every `name` is a wallet's display name (S-O06). */
+  readonly dataApi: boolean;
+}
+
+/**
+ * The refusals of one string, wherever it sits: an email address, or a `0x`
+ * 40-hex address that is neither labelled synthetic nor a documented public
+ * contract address. NFKC-normalized first, so a full-width `＠` counts. The
+ * value itself is never echoed.
+ */
+export function personalValueErrors(
+  text: string,
+  where: string,
+  publicAddresses: ReadonlySet<string> = new Set(),
+): string[] {
+  const normalized = text.normalize("NFKC");
+  const errors: string[] = [];
+  if (EMAIL_RE.test(normalized)) {
+    errors.push(`${where}: an email address may not be committed (personal data)`);
+  }
+  for (const [token] of normalized.matchAll(ADDRESS_TOKEN_RE)) {
+    if (!isLabelledSyntheticHex(token, 40) && !publicAddresses.has(token.toLowerCase())) {
+      errors.push(
+        `${where}: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet`,
+      );
+      break;
+    }
+  }
+  return errors;
+}
+
+/**
+ * Rule 5: every personal key and every string (keys included) of a capture.
+ * A value under a personal key is judged by its key's rule alone, so each
+ * field is refused once.
+ */
+function scanPersonalData(
+  value: unknown,
+  path: string,
+  errors: string[],
+  policy: PersonalDataPolicy,
+): void {
+  if (typeof value === "string") {
+    errors.push(...personalValueErrors(value, path, policy.publicAddresses));
+    return;
+  }
   if (Array.isArray(value)) {
     value.forEach((entry, index) => {
-      scanPersonalKeys(entry, `${path}[${index}]`, errors);
+      scanPersonalData(entry, `${path}[${index}]`, errors, policy);
     });
     return;
   }
   if (!isRecord(value)) {
     return;
   }
+  const keys = Object.keys(value).map(normalizedKey);
+  const personRow =
+    policy.feedRows.has(value) ||
+    keys.some((key) => PERSONAL_KEY_RULES.some((rule) => rule.applies(key)));
   for (const [key, entry] of Object.entries(value)) {
     const where = `${path}.${key}`;
-    if (key === "proxy_wallet" && !isLabelledSyntheticHex(entry, 40)) {
-      errors.push(`${where}: a wallet must be a labelled synthetic address (0x00…), not a live value`);
-    } else if (PERSONAL_TEXT_KEYS.includes(key) && !isLabelledSyntheticText(entry)) {
-      errors.push(`${where}: a pseudonym must be a labelled synthetic value (synthetic-…)`);
-    } else if (
-      PERSONAL_BLANKABLE_KEYS.includes(key) &&
-      entry !== "" &&
-      !isLabelledSyntheticText(entry)
-    ) {
-      errors.push(`${where}: a profile field must be empty or a labelled synthetic value (synthetic-…)`);
+    const normalized = normalizedKey(key);
+    errors.push(...personalValueErrors(key, `${path} key`, policy.publicAddresses));
+    const rule =
+      PERSONAL_KEY_RULES.find((candidate) => candidate.applies(normalized)) ??
+      (personRow || (policy.dataApi && normalized === "name")
+        ? PERSON_ROW_RULES.find((candidate) => candidate.applies(normalized))
+        : undefined);
+    if (rule !== undefined) {
+      if (!rule.allows(entry)) {
+        errors.push(`${where}: ${rule.message}`);
+      }
+      if (typeof entry === "string") {
+        continue;
+      }
     }
-    scanPersonalKeys(entry, where, errors);
+    scanPersonalData(entry, where, errors, policy);
   }
+}
+
+/**
+ * The view the personal-data scan walks: a `.jsonl` record whose `data` text
+ * parsed is scanned through its parsed `frame` (JSON escapes decoded), so its
+ * `data` text is not scanned twice.
+ */
+function personalScanTarget(view: unknown, format: CaptureSpec["format"]): unknown {
+  if (format !== "jsonl" || !Array.isArray(view)) {
+    return view;
+  }
+  return view.map((record: unknown) => {
+    if (!isRecord(record) || !Object.hasOwn(record, "frame")) {
+      return record;
+    }
+    return Object.fromEntries(Object.entries(record).filter(([key]) => key !== "data"));
+  });
+}
+
+/**
+ * Personal keys written with a value in sidecar text: `name: v`, `name=v`,
+ * `"name":"v"` (case-insensitive, `_` or `-` optional). Group 1 is the key,
+ * group 2 the value token.
+ */
+const PERSONAL_ASSIGNMENT_RE = new RegExp(
+  `(?<![\\w-])(proxy[_-]?wallet|wallet|x[_-]?user[_-]?name|user[_-]?name|display[_-]?name|screen[_-]?name|handle|user|address|name|pseudonym|bio|profile[_-]?image(?:[_-]?optimized)?|e-?mail|transaction[_-]?hash|tx[_-]?hash)["']?\\s*[:=]\\s*("(?:[^"\\\\]|\\\\.)*"|'[^']*'|[^\\s,;)\\]}&#]*)`,
+  "gi",
+);
+
+/**
+ * Whether a value written after a personal key is not personal: empty,
+ * `null`, a `<placeholder>`, a labelled synthetic value, or the elided
+ * synthetic form `0x00…`.
+ */
+function isProsePlaceholder(token: string): boolean {
+  const value = token.replace(/^["']/, "").replace(/["']$/, "");
+  return (
+    value === "" ||
+    value === "null" ||
+    value.startsWith("<") ||
+    isLabelledSyntheticText(value) ||
+    isLabelledSyntheticCursor(value) ||
+    isLabelledSyntheticHex(value, value.length - 2) ||
+    /^0x0+(?:…|\.\.\.)/.test(value)
+  );
+}
+
+function personalAssignmentErrors(text: string, where: string): string[] {
+  const errors: string[] = [];
+  for (const match of text.normalize("NFKC").matchAll(PERSONAL_ASSIGNMENT_RE)) {
+    if (!isProsePlaceholder(match[2] ?? "")) {
+      errors.push(
+        `${where}: ${(match[1] ?? "").toLowerCase()} is written with a value that is not a labelled synthetic value, a <placeholder> or empty`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * The tokens of a text that decode to a JSON object, as a venue cursor does
+ * (`decodeFeedCursor`): base64url, base64 or plain JSON, 16 characters or
+ * more.
+ */
+export function cursorLikeTokens(text: string): string[] {
+  const tokens = text.match(/[A-Za-z0-9+/_=-]{16,}/g) ?? [];
+  return tokens.filter((token) => decodeFeedCursor(token) !== undefined);
+}
+
+function safeDecodeUri(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * Rule 5 for the sidecar: its free text (`url`, `notes`, each redaction,
+ * `extract.rule`); see the policy above. A redaction's subject list, before
+ * its first colon, names fields and is not a value.
+ */
+export function sidecarPersonalDataErrors(
+  sidecar: CaptureSidecar,
+  captureText: string,
+  feed: boolean,
+  publicAddresses: ReadonlySet<string> = new Set(),
+): string[] {
+  const errors: string[] = [];
+  const url = sidecar.url.toLowerCase();
+  const capture = captureText.toLowerCase();
+  const decodedUrl = safeDecodeUri(sidecar.url);
+  errors.push(
+    ...personalValueErrors(decodedUrl, "sidecar.url", publicAddresses),
+    ...personalAssignmentErrors(decodedUrl, "sidecar.url"),
+  );
+  const prose: { readonly where: string; readonly text: string; readonly values: string }[] = [
+    { where: "sidecar.notes", text: sidecar.notes, values: sidecar.notes },
+    ...sidecar.redactions.map((entry, index) => ({
+      where: `sidecar.redactions[${index}]`,
+      text: entry,
+      values: entry.includes(":") ? entry.slice(entry.indexOf(":") + 1) : entry,
+    })),
+    ...(sidecar.extract === undefined
+      ? []
+      : [{ where: "sidecar.extract.rule", text: sidecar.extract.rule, values: sidecar.extract.rule }]),
+  ];
+  for (const { where, text, values } of prose) {
+    errors.push(...personalValueErrors(text, where, publicAddresses));
+    for (const [token] of text.normalize("NFKC").matchAll(LONG_ID_TOKEN_RE)) {
+      const lower = token.toLowerCase();
+      if (
+        !isLabelledSyntheticHex(token, token.length - 2) &&
+        !url.includes(lower) &&
+        !capture.includes(lower) &&
+        lower !== sidecar.raw_sha256 &&
+        lower !== sidecar.fixture_sha256
+      ) {
+        errors.push(
+          `${where}: a hex id, hash or number of 40 or more digits that is not a labelled synthetic value and that neither the capture nor the URL carries; name it by placeholder (<V1 window>)`,
+        );
+        break;
+      }
+    }
+    errors.push(...personalAssignmentErrors(values, where));
+    if (feed && cursorLikeTokens(text).length > 0) {
+      errors.push(
+        `${where}: a token decodes to a venue cursor, which carries the seek anchor of the last row (S-O06); name a cursor by its labelled synthetic value`,
+      );
+    }
+  }
+  return errors;
 }
 
 const FEED_ROUTE_RE =
@@ -492,12 +815,121 @@ export function isFeedCapture(url: string, view: unknown): boolean {
   );
 }
 
-function urlCursor(url: string): string | null {
+/**
+ * The fields a trade or activity row may carry: S-O06
+ * `components.schemas.Trade` and `components.schemas.Activity` (the Data API
+ * v2 OpenAPI, report §14), every one a scalar. Their personal fields
+ * (`proxy_wallet`, `name`, `pseudonym`, `bio`, `profile_image`,
+ * `profile_image_optimized`, `transaction_hash`) must hold labelled synthetic
+ * values (rules 5 and 6). A field outside this list is refused: it may carry
+ * personal data (an email, a nested profile). Fail closed: the package that
+ * captures a new field classifies it here, with its source. `ComboActivity`
+ * rows (`/v2/activity/combos`, nested legs) are not classified, so are
+ * refused.
+ */
+export const FEED_ROW_FIELDS = [
+  "bio",
+  "condition_id",
+  "event_slug",
+  "icon",
+  "is_combo",
+  "name",
+  "outcome",
+  "outcome_index",
+  "price",
+  "profile_image",
+  "profile_image_optimized",
+  "proxy_wallet",
+  "pseudonym",
+  "side",
+  "size",
+  "slug",
+  "timestamp",
+  "title",
+  "token_id",
+  "transaction_hash",
+  "type",
+  "usdc_size",
+] as const;
+
+/** S-O06 `TradesPage`, `ActivityPage`: `{ data, pagination }`. */
+const FEED_PAGE_FIELDS = ["data", "pagination"];
+
+/** S-O06 `components.schemas.Pagination`. */
+const FEED_PAGINATION_FIELDS = ["limit", "offset", "has_more", "next_cursor"];
+
+/**
+ * The query parameters S-O06 documents for `/v2/trades`, `/v2/activity` and
+ * `/v2/activity/combos` (`paths.*.get.parameters`), with the combos page's
+ * stated aliases `condition_id` and `conditionId`. `user` is documented but
+ * refused (`captureUrlErrors`: a read keyed by a wallet).
+ */
+export const FEED_QUERY_PARAMETERS = [
+  "condition",
+  "condition_id",
+  "conditionId",
+  "cursor",
+  "end",
+  "event_id",
+  "exclude_deposits_withdrawals",
+  "filter_amount",
+  "filter_type",
+  "limit",
+  "side",
+  "sort_by",
+  "sort_direction",
+  "start",
+  "taker_only",
+  "type",
+  "user",
+] as const;
+
+function isCursorParameter(key: string): boolean {
+  return /cursor/i.test(key);
+}
+
+/**
+ * The URL refusals of a trade or activity sidecar: a query parameter S-O06
+ * does not document for the feeds (so no other value, a transaction hash for
+ * example, rides on the URL); every cursor parameter (any name containing
+ * `cursor`, every occurrence), at most one of them; and no other query value,
+ * path segment or fragment that decodes to a venue cursor. A server's
+ * handling of a repeated parameter is not assumed.
+ */
+export function feedUrlErrors(url: string): string[] {
+  let parsed: URL;
   try {
-    return new URL(url).searchParams.get("cursor");
+    parsed = new URL(url);
   } catch {
-    return null;
+    return [];
   }
+  const errors: string[] = [];
+  const cursorKeys = [...parsed.searchParams.keys()].filter(isCursorParameter);
+  if (cursorKeys.length > 1) {
+    errors.push(
+      `sidecar.url: ${cursorKeys.length} cursor parameters (${cursorKeys.join(", ")}); a trade or activity URL carries at most one`,
+    );
+  }
+  for (const [key, value] of parsed.searchParams) {
+    if (!(FEED_QUERY_PARAMETERS as readonly string[]).includes(key)) {
+      errors.push(
+        `sidecar url ${key}: not a query parameter S-O06 documents for /v2/trades or /v2/activity`,
+      );
+    }
+    if (isCursorParameter(key)) {
+      errors.push(...feedCursorErrors(value, `sidecar url ${key}`));
+    } else if (decodeFeedCursor(value) !== undefined) {
+      errors.push(
+        `sidecar url ${key}: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter`,
+      );
+    }
+  }
+  if (cursorLikeTokens(`${parsed.pathname} ${parsed.hash}`).length > 0) {
+    errors.push(
+      "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
+    );
+  }
+  return errors;
 }
 
 /** Rule 6: the trade and activity feed refusals. */
@@ -507,30 +939,46 @@ export function feedErrors(view: unknown, sidecar: CaptureSidecar): string[] {
   if (!Array.isArray(rows)) {
     return ["$.data: a trade or activity capture must carry its data[] rows"];
   }
+  for (const key of Object.keys(view as Record<string, unknown>)) {
+    if (!FEED_PAGE_FIELDS.includes(key)) {
+      errors.push(`$.${key}: not a field of a trade or activity page (S-O06: data, pagination)`);
+    }
+  }
   rows.forEach((row, index) => {
     const where = `$.data[${index}]`;
     if (!isRecord(row)) {
       errors.push(`${where}: a feed row must be an object`);
       return;
     }
-    // The wallet and pseudonym are refused by the personal-key scan (rule 5),
-    // in every capture; `name` and `transaction_hash` are generic keys
-    // elsewhere (a resolution's transaction is public), so they are refused
-    // here, in feed rows.
-    if (Object.hasOwn(row, "name") && !isLabelledSyntheticText(row["name"])) {
-      errors.push(`${where}.name: a name must be a labelled synthetic value (synthetic-…)`);
+    for (const [key, entry] of Object.entries(row)) {
+      if (!(FEED_ROW_FIELDS as readonly string[]).includes(key)) {
+        errors.push(
+          `${where}.${key}: not a Trade or Activity field (S-O06); an unrecognized field may carry personal data, so classify it in FEED_ROW_FIELDS, with its source, before committing it`,
+        );
+      } else if (entry !== null && typeof entry === "object") {
+        errors.push(`${where}.${key}: a feed-row field must be a scalar (S-O06 rows are flat)`);
+      } else if (typeof entry === "string" && cursorLikeTokens(entry).length > 0) {
+        errors.push(`${where}.${key}: a token decodes to a venue cursor (S-O06)`);
+      }
     }
-    if (
-      Object.hasOwn(row, "transaction_hash") &&
-      !isLabelledSyntheticHex(row["transaction_hash"], 64)
-    ) {
-      errors.push(`${where}.transaction_hash: a hash must be a labelled synthetic hash (0x00…)`);
-    }
+    // The row's wallet, pseudonym, profile, name and transaction hash are
+    // refused by the personal-data scan (rule 5): a feed row is a person's
+    // row. `name` and `transaction_hash` are generic keys elsewhere (a
+    // resolution's transaction is public).
   });
   const pagination = isRecord(view) ? view["pagination"] : undefined;
+  if (isRecord(pagination)) {
+    for (const [key, entry] of Object.entries(pagination)) {
+      if (!FEED_PAGINATION_FIELDS.includes(key)) {
+        errors.push(`$.pagination.${key}: not a Pagination field (S-O06: limit, offset, has_more, next_cursor)`);
+      } else if (entry !== null && typeof entry === "object") {
+        errors.push(`$.pagination.${key}: a Pagination field must be a scalar (S-O06)`);
+      }
+    }
+  }
   const cursor = isRecord(pagination) ? pagination["next_cursor"] : undefined;
   errors.push(...feedCursorErrors(cursor, "$.pagination.next_cursor"));
-  errors.push(...feedCursorErrors(urlCursor(sidecar.url) ?? undefined, "sidecar url cursor"));
+  errors.push(...feedUrlErrors(sidecar.url));
   // A page with nothing to replace (no row, no cursor) may be the raw body;
   // the kind rules then require it to equal the raw response byte for byte.
   if (rows.length > 0 || typeof cursor === "string") {
@@ -697,6 +1145,12 @@ export interface CaptureContext {
   readonly reportContent: string | null;
   /** Its source index (§14), parsed. */
   readonly sourceIndex: ReadonlyMap<string, SourceIndexRow>;
+  /**
+   * Documented public contract addresses a capture or sidecar may carry as
+   * `0x` 40-hex values (rule 5). Any other 40-hex address must be a labelled
+   * synthetic value. Absent: none.
+   */
+  readonly publicAddresses?: readonly string[];
 }
 
 export interface CaptureValidationResult {
@@ -710,6 +1164,53 @@ export interface CaptureValidationResult {
 
 function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * The keys that occur twice in one object of a JSON text (which must already
+ * parse). `JSON.parse` keeps only the last value of a repeated key, so an
+ * earlier one, a live wallet or a venue cursor for example, would sit in the
+ * committed bytes and escape every check of the parsed view. RFC 8259 §4: the
+ * names within an object SHOULD be unique.
+ */
+export function duplicateKeys(jsonText: string): string[] {
+  const objects: (Set<string> | null)[] = [];
+  const duplicates: string[] = [];
+  let index = 0;
+  while (index < jsonText.length) {
+    const char = jsonText[index];
+    if (char === '"') {
+      let end = index + 1;
+      while (end < jsonText.length && jsonText[end] !== '"') {
+        end += jsonText[end] === "\\" ? 2 : 1;
+      }
+      const literal = jsonText.slice(index, end + 1);
+      index = end + 1;
+      let next = index;
+      while (next < jsonText.length && /\s/.test(jsonText[next] ?? "")) {
+        next += 1;
+      }
+      const keys = objects.at(-1);
+      if (jsonText[next] === ":" && keys !== undefined && keys !== null) {
+        const key = JSON.parse(literal) as string;
+        if (keys.has(key)) {
+          duplicates.push(key);
+        } else {
+          keys.add(key);
+        }
+      }
+      continue;
+    }
+    if (char === "{") {
+      objects.push(new Set());
+    } else if (char === "[") {
+      objects.push(null);
+    } else if (char === "}" || char === "]") {
+      objects.pop();
+    }
+    index += 1;
+  }
+  return duplicates;
 }
 
 /**
@@ -730,14 +1231,24 @@ export function parseCapture(
     errors.push("the capture is not valid UTF-8");
     return null;
   }
+  const refuseDuplicates = (jsonText: string, where: string): void => {
+    for (const key of duplicateKeys(jsonText)) {
+      errors.push(
+        `${where}: the key ${JSON.stringify(key)} occurs twice in one object; JSON.parse keeps only the last value, so an earlier one would escape every check`,
+      );
+    }
+  };
   if (format === "json") {
+    let document: unknown;
     try {
-      return JSON.parse(text) as unknown;
+      document = JSON.parse(text) as unknown;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       errors.push(`the capture is not one strict JSON document (no comment, no trailing comma): ${message}`);
       return null;
     }
+    refuseDuplicates(text, "the capture");
+    return document;
   }
   const lines = text.split("\n");
   if (lines.at(-1) === "") {
@@ -752,6 +1263,7 @@ export function parseCapture(
       errors.push(`line ${index + 1}: not one strict JSON record`);
       return;
     }
+    refuseDuplicates(line, `line ${index + 1}`);
     const recordErrors: string[] = [];
     validateField(
       record,
@@ -778,6 +1290,9 @@ export function parseCapture(
         frame = JSON.parse(data);
       } catch {
         frame = undefined;
+      }
+      if (frame !== undefined) {
+        refuseDuplicates(data, `line ${index + 1} frame`);
       }
     }
     records.push(frame === undefined ? { ...record } : { ...record, frame });
@@ -819,6 +1334,11 @@ export function validateCapture(
     return result(null);
   }
   const sidecarErrors: string[] = [];
+  for (const key of duplicateKeys(sidecarText)) {
+    sidecarErrors.push(
+      `${sidecarPath}: the key ${JSON.stringify(key)} occurs twice in one object; JSON.parse keeps only the last value, so an earlier one would escape every check`,
+    );
+  }
   validateField(rawSidecar, SIDECAR_SPEC, "sidecar", sidecarErrors);
   if (sidecarErrors.length > 0) {
     errors.push(...sidecarErrors);
@@ -915,12 +1435,30 @@ export function validateCapture(
     return result(null);
   }
 
-  // 5. Credentials and personal keys, everywhere.
+  // 5. Credentials and personal data, everywhere: the capture and the
+  //    sidecar's text.
+  const feed = isFeedCapture(sidecar.url, view);
+  const feedRows = isRecord(view) && Array.isArray(view["data"]) ? view["data"] : [];
+  const policy: PersonalDataPolicy = {
+    publicAddresses: new Set(
+      (context.publicAddresses ?? []).map((address) => address.toLowerCase()),
+    ),
+    feedRows: new Set<unknown>(feed ? feedRows : []),
+    dataApi: sidecar.url.startsWith("https://data-api.polymarket.com/"),
+  };
   scanForCredentials(view, "$", errors);
-  scanPersonalKeys(view, "$", errors);
+  scanPersonalData(personalScanTarget(view, spec.format), "$", errors, policy);
+  errors.push(
+    ...sidecarPersonalDataErrors(
+      sidecar,
+      new TextDecoder("utf-8").decode(fixtureBytes),
+      feed,
+      policy.publicAddresses,
+    ),
+  );
 
   // 6. Trade and activity feeds.
-  if (isFeedCapture(sidecar.url, view)) {
+  if (feed) {
     errors.push(...feedErrors(view, sidecar));
   }
 

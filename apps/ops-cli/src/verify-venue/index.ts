@@ -47,6 +47,7 @@ import {
 } from "./captures.js";
 import type { CaptureValidationResult } from "./captures.js";
 import {
+  PUBLIC_CONTRACT_ADDRESSES,
   SDK_PERMALINK_PREFIX,
   SDK_REFERENCE_COMMIT,
   VENUE_CHECKS,
@@ -482,6 +483,7 @@ export function runVenueVerification(): VenueVerificationReport {
           report: reportOf(check),
           reportContent: checkReport,
           sourceIndex,
+          publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
         }),
       );
       const errors = [

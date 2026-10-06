@@ -97,9 +97,13 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
   - that a capture with no redaction is the raw response, byte for byte;
   - the sidecar's fetch time, HTTP status, raw size and raw sha256, against the
     report's source index (§14);
-  - strict JSON, or strict JSONL;
-  - no credential, and no unlabelled personal field;
-  - the trade-feed rules of `../README.md` ("Exception 2026-10-06");
+  - strict JSON, or strict JSONL, with no key repeated in one object (round 1);
+  - no credential, and no unlabelled personal data: in the capture, at any
+    depth, and in the sidecar's text (`url`, `notes`, redactions,
+    `extract.rule`); round 1 of V2-9 added the sidecar text, the email and
+    user-name keys, person's rows and the S-O06 field list of a trade page;
+  - the trade-feed rules of `../README.md` ("Exception 2026-10-06"),
+    including every cursor parameter of the sidecar URL;
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no
