@@ -1,8 +1,9 @@
 /**
  * CI-2 (`CI1-L5`) — `.github/workflows/ci.yml` runs every command of the root
  * `package.json`'s `&&` chains (`typecheck`, `test:contract`,
- * `test:integration`, and since `CI-5` `test:fault`) as its own gated step,
- * and this pin fails when the two drift apart.
+ * `test:integration`, and since `CI-5` `test:fault`; `CI-6` lengthened the
+ * last two) as its own gated step, and this pin fails when the two drift
+ * apart.
  *
  * WHY. `GATE1-R4` (closed by `CI-1`) made every gate run even after an earlier
  * one failed. That holds per STEP. A chain inside one step still stops at its
@@ -276,17 +277,21 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
   // CI-5: `test:integration` gained the control API's PostgreSQL suite (6 -> 7),
   // and `test:fault` became a chain of three (WAL, OMS, reconciliation) that
   // replaced one gate with three: 24 + 1 + 2 = 27 gates, 16 + 1 + 3 = 20 split.
-  it("non-vacuity: 4 + 6 + 7 + 3 chained commands, each run by exactly one gated step, in chain order", async () => {
+  // CI-6: `test:fault` gained the live-safety suite and the live chaos suite's
+  // typecheck and runner (3 -> 6), and `test:integration` gained the live
+  // chaos suite's PostgreSQL half (7 -> 8): 27 + 3 + 1 = 31 gates, 20 + 4 = 24
+  // split.
+  it("non-vacuity: 4 + 6 + 8 + 6 chained commands, each run by exactly one gated step, in chain order", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const chains = chainCommands(packageJson);
     expect(SPLIT_CHAINS.map(({ script }) => [script, chains.get(script)?.length])).toEqual([
       ["typecheck", 4],
       ["test:contract", 6],
-      ["test:integration", 7],
-      ["test:fault", 3],
+      ["test:integration", 8],
+      ["test:fault", 6],
     ]);
     const gateSteps = gates(workflow);
-    expect(gateSteps).toHaveLength(27);
+    expect(gateSteps).toHaveLength(31);
     for (const step of gateSteps) expect(step.condition, step.label).toBe(GATE_IF);
     for (const { script, label } of SPLIT_CHAINS) {
       const commands = chains.get(script) ?? [];
@@ -300,32 +305,81 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
       });
       expect(indices, script).toEqual([...indices].sort((a, b) => a - b));
     }
-    expect(splitSteps(workflow, packageJson)).toHaveLength(20);
+    expect(splitSteps(workflow, packageJson)).toHaveLength(24);
   });
 
-  it("CI-5: the fault and control-api PostgreSQL commands are chained, and stepped, in the order the round set", async () => {
+  it("CI-5 and CI-6: the fault and PostgreSQL commands are chained, and stepped, in the order the rounds set", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const chains = chainCommands(packageJson);
     expect(chains.get("test:fault")).toEqual([
+      // CI-5: the WAL (WP-050), OMS (WP-270) and reconciliation (WP-290) suites.
       "pnpm --filter @polymarket-bot/storage-wal test:fault",
       "pnpm --filter @polymarket-bot/oms test:fault",
       "pnpm --filter @polymarket-bot/ledger test:fault:reconciliation",
+      // CI-6: WP-320's live-safety suite, through the trader's script, which
+      // typechecks its own tree first. Then WP-340's live chaos suite, which
+      // has no package script: its typecheck, then its runner.
+      "pnpm --filter @polymarket-bot/trader test:fault:live-safety",
+      "tsc --noEmit -p test/fault-injection/live/tsconfig.json",
+      "vitest run --config test/fault-injection/live/vitest.config.ts",
     ]);
-    expect(chains.get("test:integration")?.slice(-2)).toEqual([
+    expect(chains.get("test:integration")?.slice(-3)).toEqual([
       "pnpm --filter @polymarket-bot/control-api test:integration",
+      // CI-5: the control API's real-PostgreSQL suite.
       "pnpm --filter @polymarket-bot/control-api test:integration:postgres",
+      // CI-6: WP-340's real-PostgreSQL half, beside it.
+      "vitest run --config test/fault-injection/live/postgres/vitest.config.ts",
     ]);
+    // CI-6: the fault chain stays Docker-free. The live chaos suite's
+    // PostgreSQL half is an integration command, not a fault one.
+    expect((chains.get("test:fault") ?? []).filter((command) => command.includes("postgres"))).toEqual([]);
     // The old one-step fault gate is gone: nothing runs the root `test:fault` as one step.
     expect(gates(workflow).map((step) => step.run)).not.toContain("pnpm test:fault");
-    expect(
-      splitSteps(workflow, packageJson)
-        .filter(({ script }) => script === "test:fault")
-        .map(({ name }) => name),
-    ).toEqual([
-      "Fault-injection tests 1/3 - storage-wal WAL (no container)",
-      "Fault-injection tests 2/3 - OMS crash points and restart (WP-270; no container)",
-      "Fault-injection tests 3/3 - ledger account reconciliation (WP-290; no container)",
+    const stepped = (script: string): (readonly [string, string | undefined])[] => {
+      const byName = new Map(gates(workflow).map((step) => [step.name, step.run]));
+      return splitSteps(workflow, packageJson)
+        .filter((step) => step.script === script)
+        .map(({ name }) => [name, byName.get(name)] as const);
+    };
+    // Each step's name, and the `run` it holds: a bare binary of the chain
+    // runs through `pnpm exec` (THE ONE NORMALIZATION in ci-workflow.ts).
+    expect(stepped("test:fault")).toEqual([
+      ["Fault-injection tests 1/6 - storage-wal WAL (no container)", "pnpm --filter @polymarket-bot/storage-wal test:fault"],
+      [
+        "Fault-injection tests 2/6 - OMS crash points and restart (WP-270; no container)",
+        "pnpm --filter @polymarket-bot/oms test:fault",
+      ],
+      [
+        "Fault-injection tests 3/6 - ledger account reconciliation (WP-290; no container)",
+        "pnpm --filter @polymarket-bot/ledger test:fault:reconciliation",
+      ],
+      [
+        "Fault-injection tests 4/6 - trader live safety (WP-320; no container)",
+        "pnpm --filter @polymarket-bot/trader test:fault:live-safety",
+      ],
+      [
+        "Fault-injection tests 5/6 - live-micro chaos suite typecheck (WP-340; test/fault-injection/live/tsconfig.json)",
+        "pnpm exec tsc --noEmit -p test/fault-injection/live/tsconfig.json",
+      ],
+      [
+        "Fault-injection tests 6/6 - live-micro chaos suite (WP-340; mock venue; no container)",
+        "pnpm exec vitest run --config test/fault-injection/live/vitest.config.ts",
+      ],
     ]);
+    expect(stepped("test:integration").slice(-2)).toEqual([
+      [
+        "Integration tests 7/8 - control-api PostgreSQL (Testcontainers PostgreSQL in 3 of its 4 files)",
+        "pnpm --filter @polymarket-bot/control-api test:integration:postgres",
+      ],
+      [
+        "Integration tests 8/8 - live-micro fault-injection PostgreSQL half (WP-340; Testcontainers PostgreSQL; mock venue)",
+        "pnpm exec vitest run --config test/fault-injection/live/postgres/vitest.config.ts",
+      ],
+    ]);
+    // CI-6: the PostgreSQL half's step sits directly beside the control API's.
+    const at = (script: string, position: number): number =>
+      gates(workflow).find((step) => step.name === splitStep(workflow, packageJson, script, position).name)?.index ?? -1;
+    expect(at("test:integration", 8)).toBe(at("test:integration", 7) + 1);
   });
 
   it("normalizes exactly one thing: a bare binary runs through `pnpm exec`, a pnpm command runs verbatim", () => {
@@ -363,14 +417,18 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     const { workflow, packageJson } = await readRealTexts();
     const last = splitSteps(workflow, packageJson).at(-1)?.name ?? "";
     const extras = [
-      gatedStep("Integration tests 8/8 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:integration"),
+      gatedStep("Integration tests 9/9 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:integration"),
       gatedStep("Another suite", "pnpm --filter @polymarket-bot/ops-cli test:contract"),
       gatedStep("Typecheck", "pnpm typecheck"),
       gatedStep("Integration tests", "pnpm test:integration"),
       // CI-5: `test:fault` is split now, so its old one-step gate is a look-alike too.
       gatedStep("WAL fault-injection tests", "pnpm test:fault"),
-      gatedStep("Fault-injection tests 4/4 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:fault"),
+      gatedStep("Fault-injection tests 7/7 - ops-cli (no container)", "pnpm --filter @polymarket-bot/ops-cli test:fault"),
       gatedStep("Another fault suite", "pnpm --filter @polymarket-bot/ops-cli test:fault"),
+      // CI-6: a fault step whose bare-binary command is in no chain (its name
+      // is the tell), and a typecheck of another tree (its `tsc` is).
+      gatedStep("Fault-injection tests 7/7 - another tree", "pnpm exec vitest run --config test/fault-injection/other/vitest.config.ts"),
+      gatedStep("Another tree typecheck", "pnpm exec tsc --noEmit -p test/fault-injection/other/tsconfig.json"),
     ];
     for (const extra of extras) {
       expect(splitStepDrift(insertStepAfter(workflow, last, extra), packageJson), extra[0]).toEqual([
@@ -467,6 +525,13 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
       ],
       // A different package with the same script.
       [splitStep(workflow, packageJson, "test:integration", 4), "pnpm --filter @polymarket-bot/ops-cli test:integration"],
+      // CI-6: the live chaos suite's bare binaries without `pnpm exec`.
+      [splitStep(workflow, packageJson, "test:fault", 5), "tsc --noEmit -p test/fault-injection/live/tsconfig.json"],
+      [splitStep(workflow, packageJson, "test:fault", 6), "vitest run --config test/fault-injection/live/vitest.config.ts"],
+      [
+        splitStep(workflow, packageJson, "test:integration", 8),
+        "vitest run --config test/fault-injection/live/postgres/vitest.config.ts",
+      ],
     ];
     for (const [step, run] of cases) {
       // Each mutant differs from the command the step ran before.
@@ -477,6 +542,14 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
         expect.stringContaining("looks like a split step"),
       ]);
     }
+    // CI-6: the PostgreSQL half's step running the Docker-free runner beside it
+    // instead. That runner's command then runs in two steps, and the half's in none.
+    const { name } = splitStep(workflow, packageJson, "test:integration", 8);
+    const docker = setStepKey(workflow, name, "run", "pnpm exec vitest run --config test/fault-injection/live/vitest.config.ts");
+    expect(splitStepDrift(docker, packageJson)).toEqual([
+      expect.stringContaining('"vitest run --config test/fault-injection/live/postgres/vitest.config.ts" has no gate step'),
+      expect.stringContaining('"vitest run --config test/fault-injection/live/vitest.config.ts" runs in 2 gate steps'),
+    ]);
   });
 
   it("a copy of package.json whose chain gains a command — each of the four chains", async () => {
@@ -560,7 +633,7 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     // The review's own test:fault case. Since CI-5, test:fault is a split
     // chain, so the split checks report it, not the L5-1 rule: the new second
     // command has no step, the first is named for the wrong position, and the
-    // two steps whose commands left the chain are look-alikes.
+    // steps whose commands left the chain (five since CI-6) are look-alikes.
     const fault = splitStepDrift(
       workflow,
       withScript(
@@ -569,13 +642,14 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
         "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
       ),
     );
+    const leftTheChain = splitSteps(workflow, packageJson)
+      .filter(({ script, position }) => script === "test:fault" && position > 1)
+      .map(({ name }) => name);
+    expect(leftTheChain).toHaveLength(5);
     expect(fault).toEqual([
       expect.stringContaining('its name must begin with "Fault-injection tests 1/2 - "'),
       expect.stringContaining('"pnpm --filter @polymarket-bot/storage-postgres test:fault" has no gate step'),
-      expect.stringContaining('"Fault-injection tests 2/3 - OMS crash points and restart (WP-270; no container)" looks like a split step'),
-      expect.stringContaining(
-        '"Fault-injection tests 3/3 - ledger account reconciliation (WP-290; no container)" looks like a split step',
-      ),
+      ...leftTheChain.map((name) => expect.stringContaining(`${JSON.stringify(name)} looks like a split step`)),
     ]);
   });
 
