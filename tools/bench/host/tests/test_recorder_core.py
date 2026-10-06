@@ -605,5 +605,53 @@ class ProtocolV2Attribution(unittest.TestCase):
         self.assertIsNone(core.window_for_market(registry, RUN8_CONDITION[:-2]))
 
 
+class HistoricalUnversionedInput(unittest.TestCase):
+    """The 2026-09-30 trim of `fixtures/gamma-events.json`, as it was before V2-2
+    added `"version": "v1"` to every market (its `_provenance`), is refused
+    market by market (V2-2 review finding V2-2-R1-02).
+
+    Acceptance 4 refuses a missing `version` (F-39), and the refusal is not
+    relaxed for old input. This version-less shape is therefore the one V1 input
+    whose output V2-2 changes; the change is visible (each market is named) and
+    admits nothing. With `version: "v1"` present, the output is fdc3430's
+    (`ProtocolV2Selection.test_the_v1_fixture_gives_the_windows_and_problems_it_gave_before`).
+    """
+
+    NO_VERSION = "no version, so the id field cannot be chosen (F-39)"
+
+    def historical_events(self) -> list:
+        """The fixture without the key V2-2 added; every market carried it as "v1"."""
+        events = load_events()
+        for event in events:
+            for market in event.get("markets", []):
+                self.assertEqual(market.pop("version"), "v1")
+        return events
+
+    def test_the_whole_historical_input_is_refused_market_by_market(self) -> None:
+        windows, problems = core.parse_gamma_events(self.historical_events(), WANTED)
+        self.assertEqual(windows, [])
+        self.assertEqual(
+            sorted(problems),
+            [
+                f"btc-up-or-down-15m btc-updown-15m-1790766900 market '9000003': {self.NO_VERSION}",
+                f"btc-up-or-down-15m btc-updown-15m-1790767800 market '5121969': {self.NO_VERSION}",
+                f"btc-up-or-down-15m btc-updown-15m-1790768700 market '9000001': {self.NO_VERSION}",
+                f"btc-up-or-down-15m btc-updown-15m-1790769600 market '9000002': {self.NO_VERSION}",
+                f"eth-up-or-down-5m eth-updown-5m-1790767800 market '9000004': {self.NO_VERSION}",
+                f"eth-up-or-down-5m eth-updown-5m-1790768100 market '9000005': {self.NO_VERSION}",
+                f"eth-up-or-down-5m eth-updown-5m-1790768400 market '9000006': {self.NO_VERSION}",
+                # Checked before the ids, so its fdc3430 text stands.
+                "sol-up-or-down-5m sol-updown-5m-1790767800 market '9000009': eventStartTime/endDate missing or not increasing",
+                # Without a version there is no id field to read, malformed or not.
+                f"xrp-up-or-down-5m xrp-updown-5m-1790767800 market '9000008': {self.NO_VERSION}",
+            ],
+        )
+
+    def test_no_series_admits_a_window_from_it(self) -> None:
+        windows, problems = core.parse_gamma_events(self.historical_events(), None)
+        self.assertEqual(windows, [])
+        self.assertEqual(sum(p.endswith(self.NO_VERSION) for p in problems), len(problems) - 1)
+
+
 if __name__ == "__main__":
     unittest.main()

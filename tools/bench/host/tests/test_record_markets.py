@@ -596,5 +596,61 @@ class ProtocolV2Recording(unittest.TestCase):
         self.assertEqual(summary["control"]["unparsableFrames"], 0)
 
 
+# ---------------------------------------------------------------------------
+# Historical, version-less input (V2-2 review finding V2-2-R1-02).
+# ---------------------------------------------------------------------------
+
+
+def unversioned(events: list[dict]) -> list[dict]:
+    """The same events in the shape `synthetic_events` had before V2-2: every
+    market without `version` (each carried it as "v1")."""
+    for event in events:
+        for market in event["markets"]:
+            assert market.pop("version") == "v1"
+    return events
+
+
+class HistoricalUnversionedInput(unittest.TestCase):
+    """A Gamma response without `version`, as this file's synthetic one was before
+    V2-2, is refused market by market, visibly, and nothing is subscribed.
+    Acceptance 4 refuses a missing `version` (F-39); V2-2 does not relax it for
+    old input. With the key present, the same response records as before
+    (`RecorderRun`, `GammaPolling`)."""
+
+    def test_a_version_less_response_subscribes_nothing_and_names_each_refusal(self) -> None:
+        connect = FakeConnect()
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = rm.Recorder(recorder_args(tmp, connect=connect))
+            try:
+                with mock.patch.object(rm, "fetch_events", side_effect=lambda *a: (unversioned(synthetic_events(time.time())), False)):
+                    status = asyncio.run(recorder.run())
+            finally:
+                close_files(recorder)
+            log = (Path(tmp) / "recorder.log").read_text(encoding="utf-8")
+        # 2: "Gamma lists no window of the wanted series". The poll itself succeeded.
+        self.assertEqual(status, 2)
+        self.assertEqual(recorder.gamma_polls, 1)
+        self.assertEqual(recorder.gamma_failures, 0)
+        self.assertEqual(recorder.known, {})
+        self.assertEqual(connect.calls, [])
+        reason = "no version, so the id field cannot be chosen (F-39)"
+        expected = {
+            f"{SERIES} btc-updown-5m-a market {CONDITION[-6:]!r}: {reason}": 1,
+            f"{SERIES} btc-updown-5m-b market {('0x' + 'cd' * 32)[-6:]!r}: {reason}": 1,
+        }
+        self.assertEqual(recorder.gamma_problems, expected)
+        for problem in expected:
+            self.assertIn(f"gamma: skipped: {problem}", log)
+        self.assertIn("Gamma lists no window of the wanted series", log)
+
+    def test_with_version_v1_the_same_response_gives_both_windows(self) -> None:
+        now = time.time()
+        windows, problems = core.parse_gamma_events(synthetic_events(now), [SERIES])
+        self.assertEqual(problems, [])
+        self.assertEqual(sorted(w.token_ids for w in windows), [TOKENS, ("2001", "2002")])
+        windows, problems = core.parse_gamma_events(unversioned(synthetic_events(now)), [SERIES])
+        self.assertEqual((windows, len(problems)), ([], 2))
+
+
 if __name__ == "__main__":
     unittest.main()
