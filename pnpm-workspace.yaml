@@ -11,3 +11,12 @@ allowBuilds:
   cpu-features: false
   protobufjs: false
   ssh2: false
+# DEPS-3 (2026-10-05): tinypool <2.1.2 has two critical advisories
+# (GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr). vitest 3.2.7, the last 3.x,
+# requires tinypool ^1.1.1, and no 1.x is patched; vitest 4 and later do not
+# use tinypool. The selector matches only vitest 3.x's tinypool, so a vitest
+# major leaves this entry inert; remove it then. tinypool 1.1.1 -> 2.2.0
+# changes no API that vitest 3.2.7 calls (see the DEPS-3 handoff).
+# pnpm 11 reads overrides only from this file, not from package.json.
+overrides:
+  vitest@3>tinypool: ^2.2.0
