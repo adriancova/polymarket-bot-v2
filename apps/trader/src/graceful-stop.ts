@@ -10,8 +10,7 @@
  * Every durable write was already committed per event, so nothing PostgreSQL
  * had acknowledged was lost; but the `FOLD-1` SHUTDOWN rebuild check (§6
  * invariant 8, user ruling F2) never ran, a latched halt was never recorded,
- * and nothing was closed. H1's runs ended that way, so their evidence holds no
- * SHUTDOWN check.
+ * and nothing was closed. A run ended that way logged no SHUTDOWN check.
  *
  * ## The stop
  *
@@ -31,7 +30,8 @@
  *
  * The signal changes HOW the pump stops and nothing after it. In particular it
  * never clears or hides a halt: a halt latched before, during or after the
- * signal keeps the exit non-zero, and is recorded as every halt is.
+ * signal keeps the exit non-zero and is logged, and one latched before the
+ * halt record is recorded, as every halt is.
  *
  * ## The two exits that do not wait for the stop
  *
@@ -65,9 +65,10 @@
  * ## The deadline: 8,000 ms by default, and why
  *
  * A healthy stop takes milliseconds: the batch in hand, a rebuild check in
- * memory, and four closes, each answered at once (the shipped bundle,
- * measured: `test/integration/paper-trader/graceful-stop-postgres-redis.test.ts`
- * logs the figure). The deadline is a backstop for a stop that HANGS, and its
+ * memory, and the closes, each answered at once. Measured on the shipped
+ * bundle with a paper fill in its ledger: 18 to 22 ms from the signal to the
+ * exit (`test/integration/paper-trader/graceful-stop-postgres-redis.test.ts`
+ * logs the figure on every run). The deadline is a backstop for a stop that HANGS, and its
  * value sits between two bounds:
  *
  * - **Above 5,000 ms.** The longest fixed bound inside the stop is the halt

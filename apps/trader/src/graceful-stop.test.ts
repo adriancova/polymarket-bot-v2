@@ -23,6 +23,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -42,7 +44,7 @@ import {
   type SignallingProcess,
   type StopSignal,
 } from "./graceful-stop.js";
-import { EXIT_CODES } from "./main.js";
+import { EXIT_CODES, startup } from "./main.js";
 
 describe(`${SHUTDOWN_DEADLINE_ENV}: the stop's stated deadline`, () => {
   it("unset or empty is the default, 8 000 ms; the range is seconds, not minutes", () => {
@@ -70,6 +72,57 @@ describe(`${SHUTDOWN_DEADLINE_ENV}: the stop's stated deadline`, () => {
   it("reads an OWN property only: a value inherited through the environment's prototype is not a statement", () => {
     const inherited = Object.create({ [SHUTDOWN_DEADLINE_ENV]: "1000" }) as Record<string, string | undefined>;
     expect(readShutdownDeadline(inherited)).toStrictEqual({ ok: true, deadlineMs: 8_000, defaulted: true });
+  });
+});
+
+describe(`${SHUTDOWN_DEADLINE_ENV} through startup(): step 2d, before anything is opened`, () => {
+  const example = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../infra/compose/trader/trader.config.example.json");
+  /** The real startup() on the shipped example, with Redis and PostgreSQL at a loopback port nothing listens on. */
+  async function run(overrides: Record<string, string>): Promise<{ readonly code: number; readonly text: string }> {
+    const lines: string[] = [];
+    const code = await startup({
+      env: {
+        MAX_RUN_MODE: "PAPER",
+        RUN_MODE: "PAPER",
+        ALLOW_REAL_ORDERS: "false",
+        LIVE_MICRO_MAX_ORDER_NOTIONAL: "0",
+        LIVE_MICRO_MAX_ACCOUNT_EXPOSURE: "0",
+        TRADER_CONFIG_PATH: example,
+        REDIS_URL: "redis://127.0.0.1:1",
+        DATABASE_URL: "postgres://bundle:bundle@127.0.0.1:1/bundle",
+        ...overrides,
+      },
+      readConfig: async (file) => await readFile(file, "utf8"),
+      log: (line) => {
+        lines.push(line);
+      },
+    });
+    return { code, text: lines.join("\n") };
+  }
+
+  it("a deadline it cannot accept is refused (78) before any connection is attempted", async () => {
+    const outcome = await run({ [SHUTDOWN_DEADLINE_ENV]: "8s" });
+    expect(outcome.code).toBe(EXIT_CODES.configurationRefused);
+    expect(outcome.text).toContain(
+      `REFUSING TO START: TRADER_SHUTDOWN_DEADLINE_REFUSED: ${SHUTDOWN_DEADLINE_ENV}="8s" is not an integer number of milliseconds in [1000, 60000]`,
+    );
+    expect(outcome.text).toContain("safety: OK");
+    expect(outcome.text).not.toContain("graceful stop:");
+    expect(outcome.text).not.toContain("TRADER_REDIS_UNAVAILABLE");
+  });
+
+  it("the deadline in force is stated, with the exit codes, before Redis is tried", async () => {
+    const stated = await run({ [SHUTDOWN_DEADLINE_ENV]: "2500" });
+    expect(stated.code).toBe(EXIT_CODES.infrastructureUnavailable);
+    expect(stated.text).toContain(
+      "graceful stop: SIGINT or SIGTERM stops the trader in order — the pump reads no new batch, the batch in hand " +
+        "finishes its durable writes, the SHUTDOWN rebuild check runs, every latched halt is recorded and everything " +
+        "opened is closed — and it exits 0 (75 with a halt latched, 70 if the check fails). A stop not finished " +
+        `within 2500 ms (${SHUTDOWN_DEADLINE_ENV}) exits 124, and a second signal exits 130 at once`,
+    );
+    expect(stated.text.indexOf("graceful stop:")).toBeLessThan(stated.text.indexOf("TRADER_REDIS_UNAVAILABLE"));
+    const defaulted = await run({});
+    expect(defaulted.text).toContain(`within 8000 ms (${SHUTDOWN_DEADLINE_ENV} unset; the default) exits 124`);
   });
 });
 
