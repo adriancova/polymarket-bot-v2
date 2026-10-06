@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Check the brief's budget and the measurable parts of the writing standard (LOGS-1).
 
-Usage: python3 tools/records/check-brief.py --base <rev> [--repo .] [--root .]
+Usage: python3 tools/records/check-brief.py --base <rev> [--cut <rev>] [--repo .] [--root .]
+
+--base is the file the budget (K1) and K13's archived rows are measured against.
+--cut is the commit the brief's citations and carried facts are pinned to: K31-K34 and K36
+read their evidence there. It defaults to the archive's cut, the base= of the archive files'
+verbatim-begin markers (one value), which is the commit the brief's "as of" pins name. The two
+differ when the brief is measured against the first cut (`f43efe6`) while the archive and the
+brief's pins are at the re-cut (`8fde4df`) (RECORDS-W3).
 
 K1  budget: IMPLEMENTATION_STATUS.md is at most 15% of the base file, in bytes and in lines.
 K2  the sections an agent needs before acting exist, and the safety state is verbatim.
@@ -56,14 +63,16 @@ K32 the WP-240 bullet names every fidelity panel still pending at the cut: each 
 K33 every file:line citation in the brief (`name.ext:NNN` or a bare `:NNN`) lies inside a literal
     of CITATIONS, and each literal's needle is on the cited lines of that file AT THE CUT. A
     "quote" entry is a stale citation a row quotes from another file: its needle must be in that
-    file at the cut. This makes "File:line citations are as of `<cut>`" a checked sentence.
+    file at the cut. This makes "File:line citations are as of `<cut>`" a checked sentence, so
+    K33 also requires every "as of `<sha>`" pin in the brief to name the cut (RECORDS-W3).
 K34 every id in `BINANCE_UNVERIFIED` (packages/binance-adapter/src/venue.ts at the cut) is named
     in the brief in backticks.
 K35 the archive README describes K31 as regression checks for exactly len(CLOSED_BEFORE_CUT)
     specific closures and says it is not a detector.
 K36 carried qualifiers (r8): each CARRIED_FACTS rule names a brief row or bullet (by its line prefix),
     the words it must hold, and the source text that states the fact AT THE CUT; if the source text
-    is gone, the rule fails too. Like K31, it is a fixed list, not a detector.
+    is gone, the rule fails too. Like K31, it is a fixed list, not a detector. A rule whose fact
+    changed after the cut reads its source in the checked tree instead (TREE), and says why.
 K37 re-cut consistency (LOGS-1-RECUT r1): in a section whose intro says its citations are "as of
     `<sha>`", no line that cites a file line pins another commit ("at `<other>`") unless it says the
     file is "unchanged" there; and RECUT_REFUSED, a fixed list of wordings review refused at the
@@ -75,6 +84,10 @@ K24 also requires the ALLOC-1 bullet to write "ALLOC-1's review N1/N2", "its N3"
 case). K30 also refuses the r6 clause chains "its N3, unparsed" and "; its N4, the" (r7, D2),
 "Two more fidelity panels", which had no referent (r7, D5), the WP-180-FU3 fragment chain
 "r1 N1, ...; r1 N2, the ...; r1 N4, the ..." (r8, CX-R8-03) and the phrase "a fixed depth 2 levels more" (r8, R8-02).
+
+Rules are re-checked, not dropped silently: a rule whose source text is gone is re-anchored to
+current evidence or retired, with a one-line reason at the rule (RECORDS-W3: K33's `:906`, and
+K36's LOGS-1, H1R1 and Wave 3 rules).
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -161,7 +174,10 @@ CLOSED_BEFORE_CUT = [
     ("GATE1-R3: the first real CI run's fresh install (CI-1 discharged H2)", r"^\| `GATE1-R3` \|",
      "docs/handoffs/CI-1.md", "(`H2` DISCHARGED)", True),
 ]
-# K36: (label, brief line prefix, words the line must hold, source path, source text at the cut)
+# TREE as a K36 rule's evidence revision: read the source from the checked tree (--root), not the cut.
+TREE = "tree"
+# K36: (label, brief line prefix, words the line must hold, source path, source text (one, or a tuple)
+# at the cut[, evidence revision: TREE])
 CARRIED_FACTS = [
     ("WP-190 R1-L1: the composed entries are total (CX-R8-01)", "| `N3` |",
      ["`buildExecutionPlan`", "`sealExecutionPlan`", "are total"],
@@ -170,14 +186,20 @@ CARRIED_FACTS = [
      ["`packages/simulation`", "`apps/backtest-cli`"],
      "packages/observability/src/control/dashboards.ts", "a future packages/simulation or apps/backtest-cli grant"),
     # LOGS-1-RECUT r1
-    ("LOGS-1's gate names its reviewer, Fable (CX-RECUT-01)", "  - Gate: a Fable",
-     ["Fable review", "preservation", "green CI run on GitHub"],
-     "IMPLEMENTATION_STATUS.md", "Fable review (preservation) + green CI"),
+    # Retired (RECORDS-W3): "LOGS-1's gate names its reviewer, Fable (CX-RECUT-01)". LOGS-1 is Complete
+    # (`7ac7985`), and governance `ae1180b` removed its Authorized-now bullet, gate included; the archived
+    # row keeps the gate, and K37's RECUT_REFUSED still refuses the reviewer-less wording.
+    # Re-anchored (RECORDS-W3): the user ratified ADR-024 on 2026-09-30 (`68e2fc2`), after the cut, so
+    # "accepted provisionally" is history. The rule now reads the ratified ADR in the checked tree.
     ("H1R1-FRAME-ATOMICITY's closure carries ADR-024's qualifiers (L1)", "Closed, done or ruled",
-     ["accepted provisionally", "ratification", "D2 exception", "half-applied"],
-     "docs/adr/ADR-024-evaluate-once-per-venue-frame.md", "evaluated once, half-applied"),
-    ("Wave 3's second condition is the CLOSED grade, not the audit (L3)", "- Wave 3 is authorized",
-     ["must grade Wave 2 CLOSED"],
+     ["ratified by the user", "D2 exception", "half-applied"],
+     "docs/adr/ADR-024-evaluate-once-per-venue-frame.md",
+     ("Ratified by the user on 2026-09-30", "evaluated once, half-applied"), TREE),
+    # Re-anchored (RECORDS-W3): once both conditions were met, the "- Wave 3 is authorized" bullet says so;
+    # the condition's wording is the first bullet of the brief's Wave 3 authorization section.
+    ("Wave 3's second condition is the CLOSED grade, not the audit (L3)",
+     "- the fresh Wave 2 closeout audit grades Wave 2 CLOSED",
+     ["grades Wave 2 CLOSED"],
      "IMPLEMENTATION_STATUS.md", "grades Wave 2 CLOSED"),
     ("V3-E15 keeps the imperative check (L3)", "| `V3-E15-DATA-API-V1-SUNSET` |",
      ["Check whether any current code calls v1."],
@@ -246,8 +268,8 @@ CITATIONS = [
        "Static Bracket runs in replay and live-data paper mode through the same code")]),
     ("(`:514` at `f43efe6`)",
      [("docs/spec/polymarket-bot-agent-orchestration-runbook.md", 514, 514, "accumulating meaningful live-data paper evidence")]),
-    ("`:906` at `f43efe6`",
-     [("docs/spec/polymarket-bot-agent-orchestration-runbook.md", 906, 906, "fresh read-only wave closeout")]),
+    # Retired (RECORDS-W3): "`:906` at `f43efe6`". Governance `ae1180b` rewrote the human item that cited
+    # the runbook's old §14 there, once CLOSEOUT-2 had run; the brief no longer cites it.
 ]
 # K32: panel name in PENDING_PRODUCER_PANELS -> the phrase the brief uses for it
 PENDING_PANEL_PHRASES = {
@@ -255,6 +277,19 @@ PENDING_PANEL_PHRASES = {
     "Predicted versus actual fills": "predicted-vs-actual",
     "Markout": "markout",
 }
+
+
+def archive_cut(root):
+    """The cut the archive records: the one base= of every docs/status-archive verbatim-begin marker."""
+    adir = os.path.join(root, S.ARCHIVE)
+    bases = set()
+    for name in sorted(os.listdir(adir)):
+        if name.endswith(".md"):
+            with open(os.path.join(adir, name), encoding="utf-8") as fh:
+                bases.update(m.group("base") for m in map(S.BEGIN_RE.match, fh.read().split("\n")) if m)
+    if len(bases) != 1:
+        raise SystemExit(f"the archive's verbatim-begin markers name {len(bases)} cuts, not one: {sorted(bases)}")
+    return bases.pop()
 
 
 def show(repo, sha, path):
@@ -266,12 +301,14 @@ def show(repo, sha, path):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--base", required=True)
+    ap.add_argument("--cut", default=None, help="default: the archive's cut (the verbatim-begin markers' base=)")
     ap.add_argument("--repo", default=".")
     ap.add_argument("--root", default=None)
     args = ap.parse_args()
     root = args.root or args.repo
     sha = S.resolve(args.repo, args.base)
     base = S.base_text(args.repo, sha)
+    cut = S.resolve(args.repo, args.cut or archive_cut(root))
     brief = read(root, S.STATUS)
     lines = brief.split("\n")
     fails = []
@@ -492,14 +529,14 @@ def main() -> int:
             fails.append(f"K29: the archive README line {n}: {len(l.split())} words on one line (max 80)")
     # K31
     for label, pat, path, needle, present in CLOSED_BEFORE_CUT:
-        ev = show(args.repo, sha, path)
+        ev = show(args.repo, cut, path)
         if ev is None or (needle in ev) != present:
-            fails.append(f"K31: {label}: the evidence at {sha[:12]} is gone ({path}); re-check the item before keeping this rule")
+            fails.append(f"K31: {label}: the evidence at {cut[:12]} is gone ({path}); re-check the item before keeping this rule")
         for n, l in enumerate(lines, 1):
             if re.search(pat, l):
                 fails.append(f"K31: line {n}: {label} was closed before the cut ({path}); drop it with the evidence")
     # K32
-    dash = show(args.repo, sha, "packages/observability/src/control/dashboards.ts") or ""
+    dash = show(args.repo, cut, "packages/observability/src/control/dashboards.ts") or ""
     block = dash.split("PENDING_PRODUCER_PANELS", 1)[-1]
     panels = re.findall(r'panel: "([^"]+)"', block)
     if not panels:
@@ -526,26 +563,30 @@ def main() -> int:
             fails.append(f"K33: the citation {lit!r} is registered but not in the brief; update CITATIONS")
         spans += [(s, s + len(lit)) for s in at]
         for path, a, b, needle in checks:
-            ev = show(args.repo, sha, path)
+            ev = show(args.repo, cut, path)
             if ev is None:
-                fails.append(f"K33: {lit!r}: {path} does not exist at {sha[:12]}")
+                fails.append(f"K33: {lit!r}: {path} does not exist at {cut[:12]}")
                 continue
             where = ev if a is None else "\n".join(ev.split("\n")[a - 1:b])
             if needle not in where:
                 span = "the file" if a is None else f"lines {a}-{b}"
-                fails.append(f"K33: {lit!r}: {needle!r} is not on {span} of {path} at {sha[:12]}")
+                fails.append(f"K33: {lit!r}: {needle!r} is not on {span} of {path} at {cut[:12]}")
+    for m in re.finditer(r"as of `([0-9a-f]{7,40})`", brief):
+        if not cut.startswith(m.group(1)):
+            n = brief.count("\n", 0, m.start()) + 1
+            fails.append(f"K33: line {n}: the brief pins its citations as of `{m.group(1)}`, but they are checked at the cut {cut[:12]}")
     for m in re.finditer(r"(?<![0-9]):\d+", brief):
         if not any(s <= m.start() < e for s, e in spans):
             n = brief.count("\n", 0, m.start()) + 1
             fails.append(f"K33: line {n}: the citation {brief[max(0, m.start() - 40):m.end()]!r} is not registered in CITATIONS")
     # K34
-    venue = show(args.repo, sha, "packages/binance-adapter/src/venue.ts") or ""
+    venue = show(args.repo, cut, "packages/binance-adapter/src/venue.ts") or ""
     unverified = re.findall(r'id: "(BNC-U\d+)"', venue.split("BINANCE_UNVERIFIED = [", 1)[-1].split("] as const", 1)[0])
     if not unverified:
         fails.append("K34: no BINANCE_UNVERIFIED id found at the cut; re-check the rule")
     for bid in unverified:
         if f"`{bid}`" not in brief:
-            fails.append(f"K34: {bid} is still in BINANCE_UNVERIFIED at {sha[:12]}, but the brief does not name it")
+            fails.append(f"K34: {bid} is still in BINANCE_UNVERIFIED at {cut[:12]}, but the brief does not name it")
     # K35
     readme = read(root, f"{S.ARCHIVE}/README.md")
     want = f"regression checks for {len(CLOSED_BEFORE_CUT)} specific closures"
@@ -554,10 +595,14 @@ def main() -> int:
     if "refuses an item the brief carries as owed when" in readme:
         fails.append("K35: the archive README claims K31 refuses any item closed before the cut")
     # K36
-    for label, prefix, words, path, needle in CARRIED_FACTS:
-        ev = show(args.repo, sha, path)
-        if ev is None or needle not in ev:
-            fails.append(f"K36: {label}: the source text is gone at {sha[:12]} ({path}); re-check the rule")
+    for label, prefix, words, path, needle, *at in CARRIED_FACTS:
+        if at and at[0] == TREE:
+            where, ev = "the checked tree", (read(root, path) if os.path.isfile(os.path.join(root, path)) else None)
+        else:
+            where, ev = cut[:12], show(args.repo, cut, path)
+        needles = (needle,) if isinstance(needle, str) else needle
+        if ev is None or any(n not in ev for n in needles):
+            fails.append(f"K36: {label}: the source text is gone at {where} ({path}); re-check the rule")
         hits = [l for l in lines if l.startswith(prefix)]
         if len(hits) != 1:
             fails.append(f"K36: {label}: expected one brief line starting {prefix!r}, found {len(hits)}")
@@ -602,7 +647,8 @@ def main() -> int:
     if sec:
         k25(sec, sec_lines)
 
-    print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]})")
+    print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]}); "
+          f"evidence at the cut {cut[:12]}")
     print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}")
     for f in fails:
         print("  " + f)
