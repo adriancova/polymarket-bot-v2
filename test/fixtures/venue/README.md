@@ -263,9 +263,10 @@ live public identifiers and observed prices and times. They stay, because:
    (§14), which `verify-venue` now checks.
 3. **They name no person or account.** They are public market data, served to
    anyone without credentials.
-4. **Readers outside this tree rely on them.** About fifteen tests in other
-   packages use the live ids, for example to show the SDK routes a V2 id to
-   ExchangeV3.
+4. **Readers outside this tree rely on them.** Fourteen test files in other
+   packages and tools read these captures and use the live ids, for example
+   to show the SDK routes a V2 id to ExchangeV3
+   (`test/contract/polymarket-secure/sdk-0-12.test.ts`).
 
 **Scope.** The exception covers only:
 

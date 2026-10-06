@@ -111,9 +111,10 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
 - **The rename to `.json` is deferred.** Readers outside V2-9's paths open
   these files by name, so renaming them needs a package that may edit those
   readers. They are in `apps/backtest-cli`, `apps/data-gateway`,
-  `apps/research-worker`, `packages/polymarket-public`, `packages/universe`,
-  `test/contract`, `test/integration/data-gateway`, `python/research` and
-  `tools/bench/host`. The session file stays `.jsonl` in any case: one record
+  `apps/research-worker`, `packages/polymarket-public`, `test/contract`,
+  `test/integration/data-gateway` and `tools/bench/host`
+  (`python/research` already accepts both suffixes). The session file stays
+  `.jsonl` in any case: one record
   per line is not one JSON document, and wrapping it would change its bytes.
 - **The departure from the parent rules** recorded under "Sanitization" is now
   the parent README's dated, scoped exception, "Exception 2026-10-06 (V2-9):
