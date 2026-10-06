@@ -62,6 +62,9 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 - `WP-320` is Complete (2026-10-05, `ed6e5a0`); see [Work packages](#work-packages). `WP-330` (the independent emergency CLI) is unblocked: `WP-260`, `WP-290` and `WP-320` are done.
 - `WP-330` is Complete (2026-10-05, `c1e6909`); see [Work packages](#work-packages). `WP-340`, the last Wave 3 package, is unblocked.
 - `WP-340` is Complete (2026-10-05, `73e1ba2`). **Every Wave 3 package (`WP-260` to `WP-340`) is now merged.** Next: `CI-6` puts the live fault suites into CI, then the fresh Wave 3 closeout audit (runbook §10). The Protocol V2 migration, folded into Wave 3 by the user, follows `VENUE-4`.
+- **Running (2026-10-05), side by side:**
+  - **`CI-6`:** WP-320's `trader test:fault:live-safety` and WP-340's live chaos suite join the root `test:fault` chain and CI, and the live PostgreSQL half joins the Docker step. Single astra verifier. Paths: the root `package.json` scripts, `ci.yml` and `test/unit/tooling/**`.
+  - **`TRADER-SIGNALS`:** the graceful stop, plus paper fills in the example PAPER config. Fable verifier, since its evidence spawns processes.
 - **`VENUE-4`** (Protocol V2): **authorized and running** 2026-10-05, folded into Wave 3 at the user's request.
   - **The announcement (2026-10-05):** Protocol V2 brings ExchangeV3, signing domain version `"3"`, V2 position IDs selected by the market's `version`, PositionManager and Router, and `resolutionStatus`.
   - **Dates:** Data API v1 retires on **2026-10-24**; canary markets run through 2026-10-30; new markets switch over about **2026-11-02**.
