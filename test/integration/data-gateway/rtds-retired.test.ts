@@ -33,7 +33,9 @@
  *    makes about a 30-second window names whose window it is. It adds no
  *    verification prohibition, keeps rule 1 scoped to the RTDS TWAP feed, and
  *    records Chainlink's separately listed 30 s stream (F-32) as unused under
- *    V3-C13. Outside the correction, the ADR is byte-identical to its base.
+ *    V3-C13. §6's original text is byte-identical to its base, and the
+ *    correction block to its form as merged; dated notes elsewhere in the ADR
+ *    are outside this pin.
  *
  * The RTDS adapter's own contract suite (`test/contract/rtds/`) still
  * normalizes the same fixture, through the same read doors.
@@ -273,8 +275,18 @@ describe("RTDS-RETIRE — RTDS data recorded before the retirement stays readabl
 /** ADR-009, the settlement-spec record whose §6 the correction amends. */
 const ADR_009_URL = new URL("../../../docs/adr/ADR-009-settlement-spec-and-payoff-model-selection.md", import.meta.url);
 
-/** sha256 of ADR-009 at this package's base (`096c649`), before the correction. */
-const ADR_009_BEFORE_CORRECTION_SHA256 = "a7d378124e1fe2a1a119b6c0a84fe868a767d0c8980aa131cef41377a020364f";
+/**
+ * sha256 of §6's original text at this package's base (`096c649`), before the
+ * correction: from §6's heading up to §7's. Today the same bytes run from §6's
+ * heading up to the correction's opening.
+ */
+const ADR_009_SECTION_6_ORIGINAL_SHA256 = "b7dad2d8404410f104aade08cfe9de8f66c0b3b75615620dad74a8a9dbbf0390";
+
+/**
+ * sha256 of the correction block as this package merged it (`1e80d4d`, merged
+ * at `81f683a`): from its opening up to §7's heading.
+ */
+const ADR_009_CORRECTION_AS_MERGED_SHA256 = "e8a555a6f0894005cb399360e22888365ac1cbfe0153d84f7c0f4c54b2b6880b";
 
 const SECTION_6_HEADING = "### 6. TWAP specs must name a window the feed actually publishes";
 const SECTION_7_HEADING = "### 7. Neg-risk markets are recorded, not modeled, in v1";
@@ -292,10 +304,10 @@ const NAMED_SOURCE = /RTDS|PolyBolt|Chainlink|Polymarket/u;
 interface Adr009Parts {
   /** §6, from its heading up to §7's, original text and correction together. */
   readonly section6: string;
+  /** §6's original text, from its heading to the correction's opening. */
+  readonly section6Original: string;
   /** The dated correction block, from its opening to §7's heading. */
   readonly correction: string;
-  /** The whole record with the correction block cut out. */
-  readonly withoutCorrection: string;
 }
 
 async function adr009Parts(): Promise<Adr009Parts> {
@@ -310,8 +322,8 @@ async function adr009Parts(): Promise<Adr009Parts> {
   expect(text.indexOf(CORRECTION_OPENING, correctionAt + 1)).toBe(-1);
   return {
     section6: text.slice(section6At, section7At),
+    section6Original: text.slice(section6At, correctionAt),
     correction: text.slice(correctionAt, section7At),
-    withoutCorrection: text.slice(0, correctionAt) + text.slice(section7At),
   };
 }
 
@@ -324,9 +336,14 @@ function sentencesOf(markdown: string): readonly string[] {
 }
 
 describe("RTDS-RETIRE — ADR-009 §6's dated correction records the retirement without widening rule 1", () => {
-  it("outside the correction block, ADR-009 is byte-identical to its base: the original §6 text is unedited", async () => {
-    const { withoutCorrection } = await adr009Parts();
-    expect(createHash("sha256").update(withoutCorrection, "utf8").digest("hex")).toBe(ADR_009_BEFORE_CORRECTION_SHA256);
+  it("the original §6 text is byte-identical to its base, and the correction block to its form as merged", async () => {
+    // Narrowed by `V2-0` (CI run 37423357424). The pin hashed the whole record
+    // minus the correction, so a later dated note elsewhere in ADR-009 (`V2-0`'s
+    // §5 and §8 notes) broke it. It now hashes §6 only, in its two parts, which
+    // together cover every byte from §6's heading up to §7's.
+    const { section6Original, correction } = await adr009Parts();
+    expect(createHash("sha256").update(section6Original, "utf8").digest("hex")).toBe(ADR_009_SECTION_6_ORIGINAL_SHA256);
+    expect(createHash("sha256").update(correction, "utf8").digest("hex")).toBe(ADR_009_CORRECTION_AS_MERGED_SHA256);
   });
 
   it("every statement about a 30-second window names whose window it is (no universal 'no feed publishes it')", async () => {
