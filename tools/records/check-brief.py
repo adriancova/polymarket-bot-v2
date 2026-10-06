@@ -81,11 +81,31 @@ K37 re-cut consistency (LOGS-1-RECUT r1): in a section whose intro says its cita
     file is "unchanged" there; and RECUT_REFUSED, a fixed list of wordings review refused at the
     re-cut (brief or REWRITES.md), does not come back.
 K38 no Work packages row's status starts "Complete": a completed package's row leaves the brief,
-    and its INDEX.md row carries it (docs/handoffs/README.md rules 1 and 10; RECORDS-W3B).
-K39 every package the brief names as Complete has an INDEX.md row: each id in backticks in a sentence
-    that says it "is" or "are" complete (any case), and each Complete-row residual bullet's package.
-    Where the id is followed by its merge SHA ("`ID` (`sha`"), the INDEX.md row names that SHA
-    (RECORDS-W3B).
+    and its INDEX.md row carries it (docs/handoffs/README.md rules 1 and 10; RECORDS-W3B). Every
+    data line of the table counts, whatever its id cell looks like (plain, bold or backticked).
+K39 every package the brief names as Complete has an INDEX.md row (RECORDS-W3B). Outside the Work
+    packages table, a completion is "complete" or "completed" (any case) after "is", "are", "was" or
+    "were" (up to two words between, none of them a hedge such as "not" or "almost"), after "has been",
+    or after a colon ("`ID`: Complete"). The ids it names are the list of ids just before that verb
+    (its subject, unless "when", "once", "until" and the like introduce it), and, after "complete:"
+    (with or without a verb), every id to the sentence's end; after "complete (", the ids in that
+    parenthesis, and in "Label (...): X is complete", the ids in the label's parenthesis (a
+    completion's record, such as CLOSEOUT-3's). An id is in backticks, or plain with a
+    prefix of two or more characters ("WP-150/WP-170"); "ADR-" numbers are not packages. Each
+    Complete-row residual bullet's package is named too. Where the brief gives an id's merge SHA
+    ("`ID` (`sha`"), the INDEX.md row names that SHA for that id. An "also" id's SHA is its own
+    "merged `sha`", not its host row's. Other wordings ("merged", "done", "closed") are not read; K40
+    guards the INDEX.md rows themselves.
+K40 INDEX.md keeps a row for every completed package: each handoff file in docs/handoffs/ is linked from
+    an INDEX.md row, and each INDEX.md link to a handoff file resolves. README.md, INDEX.md and names
+    starting "_" are exempt, as in check-preservation's C7, and so is a draft: the handoff of a package
+    whose Work packages row links no handoff yet (written before its INDEX.md row; WP-140's row links its
+    handoff, so WP-140.md is not a draft). Each package whose row in the frozen
+    archived Work packages tables reads Complete has an INDEX.md row. This covers `DEPS-1`, which has
+    no handoff, and the "also" id WP-080-FU1 (RECORDS-W3B r1).
+K41 an INDEX.md row whose package has no Work packages row in the brief says the package is complete
+    ("complete" in its Outcome cell, any case, not after "not"): that row is its only status row.
+    Operational and Session rows are exempt (RECORDS-W3B r1).
 An INDEX.md row stands for the package its "Package or round" cell starts with, and for any package it
 names as "also `<id>`" (WP-080's row also carries WP-080-FU1).
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
@@ -98,7 +118,8 @@ case). K30 also refuses the r6 clause chains "its N3, unparsed" and "; its N4, t
 
 Rules are re-checked, not dropped silently: a rule whose source text is gone is re-anchored to
 current evidence or retired, with a one-line reason at the rule (RECORDS-W3: K33's `:906`, and
-K36's LOGS-1, H1R1 and Wave 3 rules; RECORDS-W3B: K26 and K28, re-anchored to INDEX.md).
+K36's LOGS-1, H1R1 and Wave 3 rules; RECORDS-W3B: K26 and K28, re-anchored to INDEX.md; RECORDS-W3B
+r1: K38 and K39 widened, each with its reason at the rule).
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -137,9 +158,11 @@ INDEX = "docs/handoffs/INDEX.md"
 
 
 def index_rows(root):
-    """INDEX.md's rows: [{ids, link, outcome, merge, package, line}]. ids: the package the "Package or
-    round" cell starts with, and each it names as "also `<id>`". link: the Handoff cell's link target
-    when the cell is one link, else None."""
+    """INDEX.md's rows: [{ids, lead, link, links, kind, outcome, merge, merges, package, line}]. ids: the
+    package the "Package or round" cell starts with (lead), and each it names as "also `<id>`". link:
+    the Handoff cell's link target when the cell is one link, else None; links: every link target in
+    it. merges: {id: its SHAs}: the lead's are the Merge cell's; an "also" id's are the "merged `sha`"
+    in its own parenthesis (RECORDS-W3B r1: not its host row's)."""
     out = []
     for n, l in enumerate(read(root, INDEX).split("\n"), 1):
         if not re.match(r"^\| \d{4}-\d{2}-\d{2} \|", l):
@@ -149,8 +172,14 @@ def index_rows(root):
             continue
         lead = re.match(r"^`([^`]+)`", c[2])
         link = re.match(r"^\[[^\]]+\]\(([^)]+)\)$", c[1])
-        out.append({"ids": ([lead.group(1)] if lead else []) + re.findall(r"\balso `([^`]+)`", c[2]),
-                    "link": link.group(1) if link else None, "outcome": c[4], "merge": c[5], "package": c[2], "line": n})
+        merges = {lead.group(1): re.findall(r"`([0-9a-f]{7,40})`", c[5])} if lead else {}
+        also = []
+        for m in re.finditer(r"\balso `([^`]+)`(?:\s*\(((?:[^()]|\([^()]*\))*)\))?", c[2]):
+            also.append(m.group(1))
+            merges.setdefault(m.group(1), re.findall(r"\bmerged `([0-9a-f]{7,40})`", m.group(2) or ""))
+        out.append({"ids": ([lead.group(1)] if lead else []) + also, "lead": lead.group(1) if lead else None,
+                    "link": link.group(1) if link else None, "links": re.findall(r"\]\(([^)]+)\)", c[1]),
+                    "kind": c[3], "outcome": c[4], "merge": c[5], "merges": merges, "package": c[2], "line": n})
     return out
 
 
@@ -173,6 +202,91 @@ def table_rows(lines, h3_prefix):
         if on and re.match(r"^\| `", line):
             cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:-1]]
             out.append(cells)
+    return out
+
+
+def cells_of(line):
+    """A table line's cells; a line that does not end with "|" (a row continued below) keeps its last."""
+    cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:]]
+    return cells[:-1] if line.rstrip().endswith("|") else cells
+
+
+SEPARATOR = re.compile(r"^\|\s*:?-{3,}")
+
+
+def data_lines(lines, heading):
+    """[(line number, line)]: every table line under the heading (h2 or h3) that starts with `heading`,
+    except separator lines and the header line above each separator, whatever its id cell looks like."""
+    on, rows = False, []
+    for n, l in enumerate(lines, 1):
+        if l.startswith("#"):
+            on = l.startswith(heading)
+            continue
+        if on and l.startswith("|"):
+            rows.append((n, l))
+    return [(n, l) for k, (n, l) in enumerate(rows)
+            if not SEPARATOR.match(l) and not (k + 1 < len(rows) and SEPARATOR.match(rows[k + 1][1]))]
+
+
+def row_id(cells):
+    """The package id a row's first cell starts with (backticked, bold or plain), else the cell."""
+    m = re.match(r"^(?:\*\*)?`?([^`*|\s]+)", cells[0]) if cells else None
+    return m.group(1) if m else (cells[0] if cells else "")
+
+
+# K39: what names a package as Complete (see the docstring).
+_ID = (r"(?:`[A-Z][A-Z0-9]*(?:-[A-Za-z0-9]+)+`"
+       r"|(?<![\w`.-])(?!ADR-)[A-Z][A-Z0-9]+(?:-[A-Za-z0-9]+)+(?![\w`-]|\.\w))")
+_ITEM = rf"(?:\*\*)?{_ID}(?:\*\*)?(?:\s*\([^()]*\))?(?:\*\*)?"
+_SEP = r"(?:\s*,\s*(?:and\s+)?|\s+and\s+(?:(?:its|their|the)\s+(?:\w+\s+){0,2})?|\s*/\s*|\s+&\s+)"
+K39_SUBJECT = re.compile(rf"{_ITEM}(?:{_SEP}{_ITEM})*\s*$")
+K39_ID = re.compile(r"`(?P<bt>[A-Z][A-Z0-9]*(?:-[A-Za-z0-9]+)+)`"
+                    r"|(?<![\w`.-])(?P<plain>(?!ADR-)[A-Z][A-Z0-9]+(?:-[A-Za-z0-9]+)+)(?![\w`-]|\.\w)")
+K39_SHA = re.compile(r"(?:\*\*)?\s*\(`(?P<sha>[0-9a-f]{7,40})`")
+K39_COMPLETE = re.compile(r"(?<![\w-])completed?(?![\w-])", re.I)
+K39_VERB = re.compile(r"(?:\b(?:is|are|was|were)|\b(?:has|have|had)(?:\s+\w+)?\s+been|:)(?P<adv>(?:\s+\w+){0,2}?)\s*(?:\*\*)?\s*$",
+                      re.I)
+K39_AFTER = re.compile(r"(?:\s+with\s+qualifications?)?(?:\*\*)?\s*(?::|\((?P<paren>[^()]*)\))", re.I)
+K39_HEDGES = {"not", "never", "no", "almost", "nearly", "partly", "partially", "mostly", "largely", "yet", "only",
+              "half", "barely", "hardly", "incompletely"}
+K39_SUBORDINATE = {"when", "once", "until", "till", "if", "unless", "after", "before", "whether", "while"}
+# The brief's sentences, as K23 splits them, except after "i.e." and "e.g." (the historical
+# "COMPLETE: batches 2A-2G, i.e. WP-150/..." line continues past them).
+K39_SENTENCE = re.compile(r"(?<=[.!?])(?<!\bi\.e\.)(?<!\be\.g\.)\s+(?=[A-Z(`*\[])")
+
+
+def ids_in(text):
+    """[(id, the merge SHA given right after it, or None)] for each package id in text."""
+    out = []
+    for m in K39_ID.finditer(text):
+        sha = K39_SHA.match(text, m.end())
+        out.append((m.group("bt") or m.group("plain"), sha.group("sha") if sha else None))
+    return out
+
+
+def named_complete(sentence):
+    """[(id, merge SHA or None, how)]: the packages one sentence names as Complete (K39)."""
+    out = []
+    for m in K39_COMPLETE.finditer(sentence):
+        before, after = sentence[:m.start()], sentence[m.end():]
+        verb = K39_VERB.search(before)
+        words = (verb.group("adv").split() if verb else []) + re.findall(r"(\w+)\W*$", before)[-1:]
+        if any(w.lower() in K39_HEDGES for w in words):
+            continue
+        if verb:
+            subject = before[:verb.start()]
+            lst = K39_SUBJECT.search(subject)
+            lead = re.findall(r"(\w+)\W*$", subject[:lst.start()]) if lst else []
+            if lst and not (lead and lead[-1].lower() in K39_SUBORDINATE):
+                out += [(pid, sha, "its subject") for pid, sha in ids_in(lst.group(0))]
+            label = re.search(r"\(([^()]*)\)(?:\*\*)?\s*:[^:]*$", subject)  # "The closeout (`ID`, ...): X is complete"
+            if label:
+                out += [(pid, sha, "the record cited for the completion") for pid, sha in ids_in(label.group(1))]
+        comp = K39_AFTER.match(after)
+        if comp and comp.group("paren") is not None:
+            out += [(pid, sha, "the record cited for the completion") for pid, sha in ids_in(comp.group("paren"))]
+        elif comp:
+            out += [(pid, sha, "listed after 'complete:'") for pid, sha in ids_in(after[comp.end():])]
     return out
 
 
@@ -353,7 +467,8 @@ def main() -> int:
     brief = read(root, S.STATUS)
     lines = brief.split("\n")
     fails = []
-    index = index_by_id(index_rows(root))
+    irows = index_rows(root)
+    index = index_by_id(irows)
 
     # K1
     bb, bl = len(base.encode("utf-8")), len(S.split_lines(base))
@@ -678,35 +793,75 @@ def main() -> int:
         if bad in text:
             fails.append(f"K37: {label}: {rel} has {bad!r} again")
     # K38
-    for cells in table_rows(lines, "## Work packages"):
+    # Widened (RECORDS-W3B r1, RW3B-I1): every data line counts; table_rows saw only backticked ids.
+    wp_rows = data_lines(lines, "## Work packages")
+    wp_ids = {row_id(cells_of(l)) for _n, l in wp_rows}
+    # K40's drafts: open rows whose Record cell links no handoff yet.
+    wp_drafts = {row_id(cells_of(l)) for _n, l in wp_rows if not re.search(r"\]\(docs/handoffs/", (cells_of(l) or [""])[-1])}
+    for n, l in wp_rows:
+        cells = cells_of(l)
         if len(cells) > 2 and cells[2].strip("* ").lower().startswith("complete"):
-            fails.append(f"K38: Work packages row {cells[0]} is Complete; move it to {INDEX} (README rules 1 and 10)")
+            fails.append(f"K38: line {n}: Work packages row {row_id(cells)} is Complete; move it to {INDEX} (README rules 1 and 10)")
     # K39
+    # Widened (RECORDS-W3B r1, RW3B-I2/I3/I4): r0 read only "is/are complete" and took every id in such a
+    # sentence; the brief once wrote "is also complete" (27ac802), and "The sweep is complete, and `V2-3`
+    # is running." named V2-3. Ids are now bound to the verb, and an "also" id's SHA is its own.
     named, wp, h = [], False, "### Residuals recorded in Complete package rows"
     for n, l in enumerate(lines, 1):
         if l.startswith("#"):
-            wp = l == "## Work packages"
+            wp = l.startswith("## Work packages")
             continue
         if wp and l.startswith("|"):
             continue  # K38's
-        for cell in (re.split(r"(?<!\\)\|", l)[1:-1] if l.startswith("|") else [l]):
-            for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z(`*\[])", cell.strip()):
-                if re.search(r"\b(?:is|are)\s+(?:\*\*)?complete\b", sent, flags=re.I):
-                    for m in re.finditer(r"`([A-Z][A-Z0-9]*(?:-[A-Za-z0-9]+)+)`(?: \(`([0-9a-f]{7,40})`)?", sent):
-                        named.append((n, m.group(1), m.group(2)))
+        for cell in (cells_of(l) if l.startswith("|") else [l]):
+            for sent in K39_SENTENCE.split(cell.strip()):
+                named += [(n, pid, merge, how) for pid, merge, how in named_complete(sent)]
     if h in lines:
         i = lines.index(h) + 1
         while i < len(lines) and not lines[i].startswith("#"):
             m = re.match(r"^- `([A-Za-z0-9-]+)`", lines[i])
             if m:
-                named.append((i + 1, m.group(1), None))
+                named.append((i + 1, m.group(1), None, "a Complete-row residual bullet"))
             i += 1
-    for n, pid, merge in named:
+    for n, pid, merge, how in named:
         row = index.get(pid)
         if row is None:
-            fails.append(f"K39: line {n}: the brief names {pid} as Complete, but {INDEX} has no row for it")
-        elif merge and merge not in row["merge"] + row["package"]:
-            fails.append(f"K39: line {n}: the brief gives {pid}'s merge as {merge}, but its {INDEX} row (line {row['line']}) does not")
+            fails.append(f"K39: line {n}: the brief names {pid} as Complete ({how}), but {INDEX} has no row for it")
+        elif merge and not any(s.startswith(merge) or merge.startswith(s) for s in row["merges"].get(pid, [])):
+            fails.append(f"K39: line {n}: the brief gives {pid}'s merge as {merge}, but its {INDEX} row (line {row['line']}) "
+                         f"gives {', '.join(row['merges'].get(pid, [])) or 'none'} for {pid}")
+    # K40
+    hdir = os.path.join(root, "docs/handoffs")
+    links = {t for r in irows for t in r["links"]}
+    for name in sorted(os.listdir(hdir)):
+        if not name.endswith(".md") or name in ("README.md", "INDEX.md") or name.startswith("_"):
+            continue
+        if name not in links and name[:-3] not in wp_drafts:
+            fails.append(f"K40: docs/handoffs/{name} has no {INDEX} row (one row per handoff; README rule 10)")
+    for r in irows:
+        for t in r["links"]:
+            if "/" not in t and not os.path.isfile(os.path.join(hdir, t)):
+                fails.append(f"K40: {INDEX} line {r['line']} links {t}, which does not exist")
+    archived = {}
+    adir = os.path.join(root, S.ARCHIVE)
+    for name in sorted(os.listdir(adir)):
+        if not name.startswith("work-packages-"):
+            continue
+        for n, l in enumerate(read(root, f"{S.ARCHIVE}/{name}").split("\n"), 1):
+            m = re.match(r"^\| `([A-Za-z0-9-]+)`", l)
+            cells = cells_of(l) if m else []
+            if len(cells) > 1 and cells[1].strip("* ").lower().startswith("complete"):
+                archived.setdefault(m.group(1), f"{name}:{n}")
+    for pid, where in archived.items():
+        if pid not in index:
+            fails.append(f"K40: {pid} is Complete in the archive ({where}), but {INDEX} has no row for it")
+    # K41
+    for r in irows:
+        if not r["lead"] or r["kind"] in ("Operational", "Session") or r["lead"] in wp_ids:
+            continue
+        if not re.search(r"(?<!not )\bcomplete\b", r["outcome"], flags=re.I):
+            fails.append(f"K41: {INDEX} line {r['line']}: {r['lead']} has no Work packages row, so its row must say it is "
+                         f"Complete; its Outcome reads {r['outcome'][:60]!r}")
 
     # K25
     sec, sec_lines = None, []
@@ -729,7 +884,8 @@ def main() -> int:
     print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]}); "
           f"evidence at the cut {cut[:12]}")
     print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}, "
-          f"work-package rows {len(table_rows(lines, '## Work packages'))}, INDEX.md packages {len(index)}, named Complete {len(named)}")
+          f"work-package rows {len(wp_rows)}, INDEX.md packages {len(index)}, named Complete {len(named)}, "
+          f"archived Complete {len(archived)}")
     for f in fails:
         print("  " + f)
     print("RESULT: " + ("FAIL" if fails else "PASS"))

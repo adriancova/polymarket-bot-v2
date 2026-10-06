@@ -57,7 +57,7 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-07 | [WP-200-FU2.md](WP-200-FU2.md) | `WP-200-FU2`: ledger/pnl own accumulators | FU | Complete (2026-09-07) | `af4aacc` | 5 KB |
 | 2026-09-11 | [WP-060-FU1.md](WP-060-FU1.md) | `WP-060-FU1`: event-bus envelope door | FU | Complete (2026-09-11) | `d869868` | 14 KB |
 | 2026-09-15 | [GATE-1.md](GATE-1.md) | `GATE-1`: gate the evidence; clear the audit step — GOV-2B **B6**, **B7**, N4, N5 | Round | Complete (2026-09-15) | `0434c82` | 8 KB |
-| 2026-09-15 | [GOV-2B-wave-2-closeout.md](GOV-2B-wave-2-closeout.md) | `GOV-2B`: the Wave 2 closeout audit (runbook §10) | Audit | Verdict: WAVE 2 IS NOT CLOSED | — (audited `b9bacc1`) | 11 KB |
+| 2026-09-15 | [GOV-2B-wave-2-closeout.md](GOV-2B-wave-2-closeout.md) | `GOV-2B`: the Wave 2 closeout audit (runbook §10) | Audit | Complete (2026-09-15). Verdict: WAVE 2 IS NOT CLOSED | — (audited `b9bacc1`) | 11 KB |
 | 2026-09-15 | [RISK-2.md](RISK-2.md) | `RISK-2`: protective-reduction recognition — GOV-2B **B2** | Round | Complete (2026-09-15) | `133eac1` | 10 KB |
 | 2026-09-15 | [SER-0-sweep.md](SER-0-sweep.md) | `SER-0`: the inherited-`toJSON` measurement | Round | Measurement complete | `9a44167` | 19 KB |
 | 2026-09-15 | [SER-1.md](SER-1.md) | `SER-1`: own-data JSON encoder + accounting keys | Round | Complete (2026-09-15) | `c065d63` | 10 KB |
@@ -100,9 +100,9 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [VENUE-3.md](VENUE-3.md) | `VENUE-3`: the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Round | Complete (2026-09-30) | `6a15131` | 15 KB |
 | 2026-09-30 | [H1-RUNS-2-8.md](H1-RUNS-2-8.md) | `H1` runs 2-8: live-data PAPER runs after THROUGHPUT-1a/1b/2 | Operational | H1 discharged under H5 (decisions and vetoes; no fill) | — | 5 KB |
 | 2026-09-30 | [LOGS-1.md](LOGS-1.md) | `LOGS-1`: `IMPLEMENTATION_STATUS.md` becomes a brief; history archived verbatim | Round | Complete (2026-09-30) | `7ac7985` | 13 KB |
-| 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |
+| 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | Complete (2026-09-30). WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |
 | 2026-09-30 | [DURABLE-1.md](DURABLE-1.md) | `DURABLE-1`: a decision is durable before its order and ledger effects (`X1`) | Round | Complete (2026-09-30) | `6e01228` | 23 KB |
-| 2026-09-30 | [CLOSEOUT-2B-wave-2-regrade.md](CLOSEOUT-2B-wave-2-regrade.md) | `CLOSEOUT-2B`: focused re-grade of Wave 2 after `DURABLE-1` | Audit | WAVE 2 CLOSED WITH QUALIFICATIONS (with the user's CANCEL ruling) | — (an audit) | 13 KB |
+| 2026-09-30 | [CLOSEOUT-2B-wave-2-regrade.md](CLOSEOUT-2B-wave-2-regrade.md) | `CLOSEOUT-2B`: focused re-grade of Wave 2 after `DURABLE-1` | Audit | Complete (2026-09-30). WAVE 2 CLOSED WITH QUALIFICATIONS (with the user's CANCEL ruling) | — (an audit) | 13 KB |
 | 2026-09-30 | [LEAN-1.md](LEAN-1.md) | `LEAN-1`: a sub-$100/mo first deployment (plan and the user's rulings) | Governance | Complete (2026-09-30): planned; ruled H, A1-A5 | — (a plan) | 26 KB |
 | 2026-09-30 | none: [the archived row](../status-archive/work-packages-rounds.md) | `DEPS-1`: CI health: new high advisories in dev/test-only transitive dependencies | CI health | Complete (2026-09-30) | `f6a2714` | — |
 | 2026-09-30 | [DEPS-2.md](DEPS-2.md) | `DEPS-2`: patch `@grpc/grpc-js` for GHSA-m9gg-hp2v-232j (dev/test-only) | Round | Complete (2026-09-30) | `c5967b4` | 1 KB |
