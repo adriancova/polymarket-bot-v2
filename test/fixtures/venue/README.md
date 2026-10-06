@@ -239,3 +239,88 @@ The payloads remain true records of what the venue documented on
 | `fees/fee-reward-parameters.json` | **stale field** | `liquidity-rewards-market-settings.samples_per_epoch: 10080` — the page now says "An epoch is one UTC day … up to 1,440 samples" (E-04). All fee rates, rebate shares and tiers are unchanged. |
 | `orders/restricted-modes.json` | **contested** | `http-503-cancel-only`: the matching-engine guide now shows `{"error": "trading is disabled"}` for both cancel-only and fully disabled trading and says the response "does not establish whether cancels are available" (E-05); the CLOB OpenAPI still shows this fixture's string (conflict C-9). The post-only example's `Retry-After: 79`, marked illustrative above, now matches the guide's own example. The 425 example stays valid; a `Retry-After` header is now documented as optional on 425 (E-06). |
 | every other fixture | valid, unchanged | The market-stream section, both AsyncAPI pages, manage-orders, rate-limit, geoblock (response shape), positions and contracts pages are byte-identical or identical after table-format normalization; the SDK's `subscriptions/clob.ts`, `shared.ts`, `clob/account.ts` and `clob/order-response.ts` are byte-identical to VENUE-2's. `orders/rest-trades.json`'s prefixed statuses are now also what the CLOB OpenAPI enumerates for `GET /data/trades` (E-13). |
+
+## Exception 2026-10-06 (V2-9): sanitized live public captures
+
+Added by `V2-9` (`docs/venue/protocol-v2-migration-plan.md`, package `V2-9`,
+acceptance 4); everything above this heading is unchanged. It answers
+`docs/venue/verified-2026-10-05.md` §15, which recorded that `protocol-v2/`
+departs from the "Sanitization rules" above.
+
+**The decision: a dated, scoped exception, not replacement.** The rules above
+allow only documentation-example or synthetic identifiers, and
+documentation-example or small round monetary values. `protocol-v2/` keeps
+live public identifiers and observed prices and times. They stay, because:
+
+1. **They are the evidence.** These captures pin live V2 shapes that no
+   documentation example shows: 75-digit position ids whose `>> 8` is the
+   condition (F-44), the 32-byte right-padded condition the CLOB serves
+   (C-19), the 404 and 400 on the 31-byte form (F-70), and the undocumented
+   `"version":"v2"` (C-21). A replaced id would no longer derive, pair or
+   route as the venue's does, so the facts would be lost.
+2. **Replacing them changes the payload bytes and digests.** V2-9 must keep
+   both, and each raw digest is the one the report's source index records
+   (§14), which `verify-venue` now checks.
+3. **They name no person or account.** They are public market data, served to
+   anyone without credentials.
+4. **Readers outside this tree rely on them.** About fifteen tests in other
+   packages use the live ids, for example to show the SDK routes a V2 id to
+   ExchangeV3.
+
+**Scope.** The exception covers only:
+
+- the captures under `protocol-v2/` that the `protocol-v2-captures` check
+  claims, each with its provenance sidecar; and
+- fixtures copied value for value from such a capture, which name the capture
+  and the line. Today that is only `market-ws/book-snapshot-v2.json`, from
+  `protocol-v2/ws-market-v2-session.jsonl` line 3, and its check refuses any
+  other value.
+
+Within that scope, these may be live: public market identifiers (condition,
+position, token, market, event and series ids; slugs, questions and titles),
+public contract addresses, observed prices, book sizes and times, public
+venue metadata as served (for example Gamma's numeric `createdBy` and
+`updatedBy` record ids), and the bodies of public, unauthenticated GETs and of
+the public market channel.
+
+**Still replaced, and enforced by `verify-venue`, in every capture:**
+
+- anything that identifies a person or an account: wallets (`proxy_wallet`),
+  names, pseudonyms, bios and profile images;
+- in a Data API trade or activity row: the wallet, name, pseudonym and
+  transaction hash, each with a labelled synthetic value (`synthetic-…`, or
+  `0x` and zeros and at most eight significant hex digits). The trade size and
+  block timestamp are replaced too;
+- a trade or activity feed cursor, in the page or in the sidecar URL. Such a
+  cursor carries the seek anchor of the last row (S-O06) and re-fetches the
+  unredacted page. It must be a labelled synthetic value (`synthetic-cursor-…`),
+  and one that decodes to a venue cursor is refused;
+- a sidecar of a trade or activity page with rows or a cursor must list
+  `timestamp` and `next_cursor` among its redactions;
+- no credential-shaped value anywhere; `authenticated` is exactly `false`;
+  the URL is on a public Polymarket host (documentation, Gamma, CLOB, Data
+  API, the market channel); a CLOB URL is one of the public market reads the
+  report observed (F-76, O.3), not an order, trade or balance route; and no
+  Data API URL is keyed by a wallet (`user`, `address`, `proxy_wallet`,
+  `wallet`).
+
+**Not covered.** Every other fixture in this tree keeps the rules above. The
+V2 Router fixture (`positions/router-v2.json`) needs no exception: its ids
+are the documentation's own, and its synthetic values are labelled. A new
+live capture needs a sidecar and a catalogue entry in
+`apps/ops-cli/src/verify-venue/checks.ts` (`PROTOCOL_V2_CAPTURES`). An
+unclaimed file fails the gate, whatever its suffix.
+
+**The rest of V2-9 in this tree:**
+
+- `verify-venue` now claims every file here except a `README.md`, whatever
+  its suffix. `protocol-v2/` is under the gate with its `.jsonc` and `.jsonl`
+  names. No `.jsonc` held a comment, so nothing moved into a sidecar and no
+  digest changed. The rename to `.json` is deferred: the readers outside
+  V2-9's paths open the files by name (`protocol-v2/README.md`).
+- `market-ws/book-snapshot-v2.json` is the V2 `book` frame, with its
+  `version` (plan row D8).
+- `positions/router-v2.json` holds the V2 Router and PositionManager
+  operations (plan row D7, the V2 half).
+- The notes of `heartbeat/heartbeat.json` now cite C-20. Its examples are
+  unchanged.

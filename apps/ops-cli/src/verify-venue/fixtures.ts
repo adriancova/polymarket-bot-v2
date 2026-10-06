@@ -277,11 +277,16 @@ export function isSanitizedPlaceholder(value: unknown): boolean {
   );
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function scanForCredentials(
+/**
+ * Recursively reports every credential-shaped key whose value is not a
+ * sanitized placeholder. Exported for the `protocol-v2/` capture gate
+ * (`captures.ts`, V2-9), which scans raw captures with the same rule.
+ */
+export function scanForCredentials(
   value: unknown,
   path: string,
   errors: string[],
@@ -359,7 +364,12 @@ export function isCanonicalPriceString(value: unknown): value is string {
 const DIGIT_STRING_RE = /^\d+$/;
 const HEX_STRING_RE = /^0x[0-9a-fA-F]*$/;
 
-function validateField(
+/**
+ * Validates one value against a field spec, appending errors. Exported for the
+ * `protocol-v2/` capture gate (`captures.ts`, V2-9), which validates sidecars
+ * and pinned capture values with the same field grammar.
+ */
+export function validateField(
   value: unknown,
   spec: FieldSpec,
   path: string,

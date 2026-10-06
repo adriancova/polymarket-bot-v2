@@ -84,3 +84,37 @@ listed, the fixture is the raw response, byte for byte, so its sha256 equals
   No credential existed in the environment.
 - **The raw responses** are kept outside the repository, in the round's scratch
   directory. Their digests are in the sidecars and in the report's source index.
+
+## V2-9 (2026-10-06): under the gate, names kept
+
+Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
+
+- **Claimed.** The `verify-venue` check `protocol-v2-captures`
+  (`apps/ops-cli/src/verify-venue/checks.ts`, `PROTOCOL_V2_CAPTURES`;
+  `captures.ts`) claims all 20 captures and their 20 sidecars. For each one it
+  checks:
+  - the sidecar's keys, and that the capture's bytes and sha256 match it;
+  - that a capture with no redaction is the raw response, byte for byte;
+  - the sidecar's fetch time, HTTP status, raw size and raw sha256, against the
+    report's source index (§14);
+  - strict JSON, or strict JSONL;
+  - no credential, and no unlabelled personal field;
+  - the trade-feed rules of `../README.md` ("Exception 2026-10-06");
+  - the V2 facts each capture pins, with the report ids it cites.
+
+  The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no
+  longer keep a file outside it. The "Why not `.json`" bullet above is
+  historical.
+- **No `.jsonc` held a comment.** Every file here parses with `JSON.parse`.
+  So nothing moved into a sidecar, no payload byte changed, and every digest
+  above still holds.
+- **The rename to `.json` is deferred.** Readers outside V2-9's paths open
+  these files by name, so renaming them needs a package that may edit those
+  readers. They are in `apps/backtest-cli`, `apps/data-gateway`,
+  `apps/research-worker`, `packages/polymarket-public`, `packages/universe`,
+  `test/contract`, `test/integration/data-gateway`, `python/research` and
+  `tools/bench/host`. The session file stays `.jsonl` in any case: one record
+  per line is not one JSON document, and wrapping it would change its bytes.
+- **The departure from the parent rules** recorded under "Sanitization" is now
+  the parent README's dated, scoped exception, "Exception 2026-10-06 (V2-9):
+  sanitized live public captures".
