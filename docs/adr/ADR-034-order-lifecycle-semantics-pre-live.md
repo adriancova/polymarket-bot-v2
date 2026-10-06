@@ -9,7 +9,11 @@
   - D2 to D4 are for the orchestrator to accept after the joint review.
     D4.1's conversion basis departs from the round's packet ("at the limit
     price") and is put to the orchestrator (Open item 9).
-- **Date:** 2026-10-06. Revised the same day (round 1 of the review).
+  - The share caps cannot be hard for a collateral-targeted FAK or FOK BUY
+    (D4.1). Whether they become plan-time caps for it, or such entries are
+    refused, is put to the user (Open item 10). R3's D4 part waits for that
+    ruling.
+- **Date:** 2026-10-06. Revised the same day (rounds 1 and 2 of the review).
 - **Recorded by:** the round `ADR-034` (docs only), authorized at `3294201`.
 - **Implemented by:** not yet. Three rounds are proposed under "Implementation
   plan", strictly in this order: `OMS-QTY` (D2), `OMS-VENUE-TIME` (D1), and
@@ -163,6 +167,10 @@
      rejection (§3), identity is the signed order (§4), and persisted payloads
      are secrets (§11).
    - ADR-008: fencing, and the heartbeat as the backstop for resting orders.
+     In the trader, the live-safety fence implements the OMS's venue port and
+     judges every signing and every transmission per order
+     (`apps/trader/src/live-safety/fenced-venue.ts:77-82`, `:200-244`;
+     `LiveSafety.fenceVenue`, `live-safety.ts:617-622`).
    - ADR-020: new port fields are read as own data through the doors.
    - ADR-022 D10: live packages attach through the core's ports. A hook inside
      the loop is a bounded `packages/trading-core/**` grant.
@@ -208,17 +216,34 @@
   using it would place the match too late, which is the unsafe direction. Its
   instant is then its `match_time`.
 - **Representation.** An instant is an integer epoch value with a unit, `MS`
-  or `S`, never a float.
-- **Its interval is widened by one unit on each side.** No source says
-  whether the venue truncates or rounds a value to its unit (U-52). So a
-  value `v` in unit `u` (1 ms, or 1000 ms for `S`) stands for the interval
-  `[(v − 1)·u, (v + 1)·u)` ms. It contains the true instant whether the venue
-  truncates (`[v·u, (v + 1)·u)`), rounds to nearest (`[v·u − u/2, v·u + u/2)`)
-  or rounds up (`((v − 1)·u, v·u]`).
+  or `S`, never a float. It takes part in a comparison in one of two forms.
+- **A point** (`CX034-R2-02`). A user-channel `timestamp` is a point: an order
+  event's, or a `MATCHED` trade event's. Two points compare by their values.
+  - **Why the values order the instants.** No source says whether the venue
+    truncates, rounds to nearest or rounds up to the millisecond (U-52). All
+    three are non-decreasing: if `t₁ ≥ t₂` then `r(t₁) ≥ r(t₂)`. So, for one
+    rounding function `r`, `r(t₁) < r(t₂)` proves `t₁ < t₂`. Equal values
+    prove nothing.
+  - **Assumption A12** (a reading of U-52): every user-channel `timestamp`,
+    of an order event or of a trade event, comes from one venue clock and is
+    rounded to milliseconds by one function. Nothing documents it, and
+    nothing contradicts it. D1.7 analyses what happens if it is wrong, and
+    the first authenticated observation checks it (Open item 2).
+  - Example: a `LIVE` at 1790000000099 and a `CANCELED` at 1790000000100 are
+    one millisecond apart, so the `LIVE` is STALE. Round 1 widened each value
+    on its own and halted this pair at once; that rule is withdrawn.
+- **An interval**, for every other comparison. It is used for a `match_time`
+  (`S`), and for a point compared with an interval: two fields whose roundings
+  are not known to relate. A value `v` in unit `u` (1 ms, or 1000 ms for `S`)
+  then stands for `[(v − 1)·u, (v + 1)·u)` ms, widened by one unit on each
+  side. It contains the true instant whether the venue truncates (`[v·u,
+  (v + 1)·u)`), rounds to nearest (`[v·u − u/2, v·u + u/2)`) or rounds up
+  (`((v − 1)·u, v·u]`).
   - Example: `match_time` 1790000001 is `[1790000000000, 1790000002000)` ms.
-    A `LIVE` at 1790000000900 ms is therefore not STALE against it. Under
-    truncation alone it would have been, and if the venue rounds, that
-    `LIVE` may follow the match.
+    A `LIVE` at 1790000000900 ms, widened to `[1790000000899,
+    1790000000901)`, is therefore not STALE against it. Under truncation
+    alone it would have been, and if the venue rounds, that `LIVE` may follow
+    the match.
 - **Missing instants are refused.** An observation without a readable instant
   is refused at the port (`OMS_INVALID_INPUT`) and never applied. WP-280
   already treats a missing or implausible `timestamp` as a malformed event and
@@ -235,34 +260,39 @@
 | --- | --- |
 | CANCELED, by a stream `CANCELED` observation (a `CANCELLATION` event) | its `timestamp` (`MS`) |
 | CANCELED, by a cancel answer, a FAK's answer or a reconciliation read | **PENDING** (A F-93, F-96), until a stream `CANCELED` observation of the same venue order id arrives; then its `timestamp` |
-| FILLED, however it was reached (fills, a FAK or FOK answer, or a read) | the **completion instant C**: the latest instant among the fills that make up its final size. `C.lo = max F.lo` and `C.hi = max F.hi` over those fills. **PENDING** while the fills received do not yet sum to the final size. Every fill has at least its `match_time` |
+| FILLED, however it was reached (fills, a FAK or FOK answer, or a read) | the **completion instant C**: the latest instant among the fills that make up its final size. When every fill instant is a point, C is the latest point. Otherwise C is an interval: `C.lo = max F.lo` and `C.hi = max F.hi` over those fills, each point widened as an interval (D1.2). **PENDING** while the fills received do not yet sum to the final size. Every fill has at least its `match_time` |
 | EXPIRED | the `timestamp` of the stream observation that made it EXPIRED, if one did; else **PENDING**. No documented stream status names an expiry (A U-54), so in practice PENDING |
 | REJECTED | **none.** A rejected order never rested, and it has no venue order id an observation could name. A LIVE-class observation that reached one would halt at once, as today |
 
 - **A fill's instant F.**
-  - It is the `timestamp` (`MS`) of its trade's `MATCHED` event when that
-    event was received, whichever arrived first. Otherwise it is the trade's
-    `match_time` (`S`), from any trade event or REST read.
+  - It is the `timestamp` (`MS`) of its trade's `MATCHED` event, a point, when
+    that event was received, whichever arrived first. Otherwise it is the
+    trade's `match_time` (`S`), an interval, from any trade event or REST read.
   - **Narrowing.** When a fill first recorded with `match_time` later gets its
-    `MATCHED` event, and the `MS` interval lies inside the `S` interval, the
-    `MS` one replaces it. That is the only way an instant narrows.
-  - **Disagreement.** When the `MS` interval does not lie inside the `S`
-    interval, the two disagree. F is then the hull of both, the smallest
-    interval containing both. That can only make fewer pairs STALE.
-- **Evidence that widens T after a classification.** A disagreeing fill
-  instant, or a second `CANCELED` observation of the order with another
-  `timestamp`, makes T the hull of what it was and the new instant. Every
-  observation already classified STALE against the narrower T is then
-  compared again, and anything but STALE raises the halting conflict: the
-  proof it was cleared on no longer holds.
+    `MATCHED` event, and the point's widened interval lies inside the `S`
+    interval, the point replaces it. That is the only way an instant narrows.
+  - **Disagreement.** When the point's widened interval does not lie inside
+    the `S` interval, the two disagree. F is then the hull of both, the
+    smallest interval containing both. That can only make fewer pairs STALE.
+- **Evidence that widens T after a classification.**
+  - A disagreeing fill instant makes T the hull of what it was and the new
+    instant.
+  - A second `CANCELED` observation of the order with another `timestamp`
+    makes T the span `[a, b]` of the two points: D1.4 compares a point with
+    a span.
+  - Every observation already classified STALE against the narrower T is
+    then compared again. Anything but STALE raises the halting conflict: the
+    proof it was cleared on no longer holds.
 - **Why the latest fill, and not the completing one** (`CX034-R1-04`). The OMS
   completes an order when the fills it has *received* sum to its size
   (`order-manager.ts:1267-1271`). The fill that arrives last can be an
   earlier match. T is computed from all the fills, independently of arrival
   order and of REST pagination.
-  - Example: fills `5@200` then `5@100` (ms) give `C = [199, 201)`, so a `LIVE`
-    at 150 is STALE. Taking the arrival-order completing fill (`[99, 101)`)
+  - Example: fills `5@200` then `5@100` (ms points) give `C = 200`, so a
+    `LIVE` at 150 is STALE. Taking the arrival-order completing fill (100)
     would have made it NEWER, and halted.
+  - With intervals the rule is the same: fills whose instants are
+    `[199, 201)` and `[99, 101)` give `C = [199, 201)`.
 - **A PENDING T is fixed** by the first later venue-timed evidence of the same
   terminal fact, for the same venue order id: a `CANCELED` observation for a
   canceled order, or the fills' instants for a filled one.
@@ -270,19 +300,27 @@
   recorded in the payload of the order event that fixed it
   (`execution.order_events.payload` is `jsonb`).
 
-**D1.4 The comparison.** Let L be the observation's interval and T the
-terminal interval, both widened as D1.2 says.
-- **STALE**: L ends no later than T starts (`L.hi ≤ T.lo`).
-- **NEWER**: L starts no earlier than T ends (`L.lo ≥ T.hi`).
-- **UNORDERED**: anything else. It has two kinds:
-  - **OPEN**: T is PENDING, or T rests on a fill instant still in `S` (its
-    `MATCHED` event could still narrow it). Venue-timed evidence may yet order
-    the pair.
-  - **CLOSED**: the intervals overlap, and both are final `MS` intervals.
-    Venue time will never order the pair. This covers equal and adjacent
-    milliseconds.
+**D1.4 The comparison.** L is the observation's instant, always a point (an
+order event's `timestamp`, D1.2). T is the terminal instant (D1.3).
+- **T is a point `t`** (`CX034-R2-02`):
+  - **STALE**: `l < t`;
+  - **NEWER**: `l > t`;
+  - **UNORDERED, CLOSED**: `l = t`.
+- **T is a span `[a, b]` of points** (two `CANCELED` observations): STALE if
+  `l < a`, NEWER if `l > b`, and UNORDERED, CLOSED otherwise.
+- **T is an interval** (it rests on a `match_time`, or on a hull). L is then
+  widened to `[l − 1, l + 1)` ms, as D1.2 says:
+  - **STALE**: L ends no later than T starts (`L.hi ≤ T.lo`);
+  - **NEWER**: L starts no earlier than T ends (`L.lo ≥ T.hi`);
+  - **UNORDERED**: anything else. It is **OPEN** when T rests on a fill
+    instant still in `S`, whose `MATCHED` event could still narrow it to a
+    point, and **CLOSED** when T is final (a hull).
+- **T is PENDING:** UNORDERED, OPEN. Venue-timed evidence may yet order the
+  pair.
 
-Ties are never STALE and never NEWER.
+So **CLOSED** means venue time will never order the pair: equal millisecond
+values, a value inside a span, or an overlap with a final interval. Adjacent
+milliseconds are ordered. Ties are never STALE and never NEWER.
 
 **D1.5 The outcomes.**
 
@@ -367,9 +405,11 @@ Ties are never STALE and never NEWER.
   STALE before the horizon read.
 
 **D1.6 Why this is the ruling.**
-- **STALE needs a proof in venue time,** and only that: L ends before the
-  earliest instant T can have, both widened by a unit. No read and no
-  inference about lifecycles classifies an observation STALE.
+- **STALE needs a proof in venue time,** and only that. Against a point T, L
+  is a strictly smaller value of the same clock and rounding (A12). Against an
+  interval T, L's widened interval ends before the earliest instant T can
+  have. No read and no inference about lifecycles classifies an observation
+  STALE.
 - **A strictly newer observation always halts.** When T is known, it halts at
   once. When T is PENDING, the observation is held, and the hold ends in a
   halt whichever comes first: T, which shows NEWER, or the horizon read,
@@ -390,6 +430,15 @@ Ties are never STALE and never NEWER.
   order matched", A F-89). That fill still reaches the OMS's fill checks, and
   a fill beyond a confirmed final size halts. No new salt opens without a read
   made after the terminal evidence either.
+- **If A12 is wrong** (order events and trade events stamped by different
+  clocks or roundings), a point comparison between an order event and a fill
+  can misjudge the pair by the clocks' disagreement.
+  - A pair misjudged NEWER halts: a cost to liveness.
+  - A pair misjudged STALE is the case above. It releases nothing: the fill
+    checks still halt on a fill beyond the final size, and no new salt opens
+    without a read made after the terminal evidence.
+  - A CANCELED T compares two order events, one field of one event type, so
+    it rests on A12 for order events only.
 - So a misread instant can cost liveness, not exposure. The first
   authenticated observation checks the reading (Open item 2).
 
@@ -449,27 +498,46 @@ Ties are never STALE and never NEWER.
      `world.ts`) stamp each frame with the venue instant of the change it
      reports, on the shared time line: milliseconds for `timestamp`, seconds
      for `match_time`. They stop using one constant.
-   - The mock's venue clock gives each venue change its own instant, at least
-     2 ms after the previous one, so that widened instants (D1.2) can order
-     them.
+   - The mock's venue clock gives each distinct venue change its own
+     millisecond value, strictly greater than the previous change's. One
+     millisecond apart is enough: points compare by value (D1.2).
    - The mock emits a `CANCELLATION` frame for every cancel, a REST cancel
      included.
    - These are labelled mock assumption **A10**: a reading of U-52 and U-54.
+   - **A10's scope** (`NEW-L4`). A10 orders distinct changes; it does not
+     claim the venue never stamps two changes with one value. A FAK's
+     placement and the cancel of its remainder might share one; whether they
+     do is unobserved (U-50). So the route tests rest on A10, and the
+     equal-value cases are tested on their own (item 5; D3.7 item 2), where
+     they halt.
    - The live suite's `orderingHorizonMs` is at most its
      `quiescenceHorizonMs`, which `reconcileUntilResumed` waits between runs
      (`support/live-node.ts:695`).
+   - **The OMS crash suite** (`NEW-M2`).
+     `test/fault-injection/oms/crash-points.test.ts:148` applies a `LIVE`
+     observation with no instant, which D1.2 refuses. It gains the instant of
+     the venue change it reports, on its world's time line, and keeps its
+     retention assertion (`:149`). That suite is type-checked and run by the
+     OMS package's `test:fault` (`packages/oms/package.json:13`), inside the
+     root fault chain (`package.json:18`).
 5. **Unit tests in `test/unit/oms/**`:**
-   - STALE, NEWER, UNORDERED CLOSED (equal and adjacent milliseconds: a halt
-     at once) and UNORDERED OPEN (a PENDING T; a `S` T: a hold);
+   - STALE, NEWER, UNORDERED CLOSED (equal milliseconds: a halt at once) and
+     UNORDERED OPEN (a PENDING T; a `S` T: a hold);
+   - **one millisecond** (`CX034-R2-02`), against a `CANCELED` at
+     1790000000100: a `LIVE` at 1790000000099 is STALE, with no halt; one at
+     1790000000100 is UNORDERED, CLOSED, a halt at once; one at
+     1790000000101 is NEWER, a halt. The same three against a fill point from
+     a `MATCHED` event at 1790000000100;
+   - **a span:** two `CANCELED` observations at 100 and 104 make T `[100,
+     104]`. A `LIVE` at 99 is STALE, at 102 CLOSED, at 105 NEWER;
    - **the widened interval** (`MEDIUM-2`): with T from `match_time`
      1790000001, a `LIVE` at 1790000000900 is held, not STALE, and a `LIVE` at
      1789999999899 is STALE;
    - **arrival order** (`CX034-R1-04`): fills `5@200` then `5@100` give a T
-     of `[199, 201)`, and a `LIVE` at 150 is STALE. A REST read whose fills
-     come in two pages, in either order, gives the same T. A seconds fill
-     instant is narrowed by its `MATCHED` event, and a disagreeing one makes
-     the hull. A hull that undoes an earlier STALE raises the halting
-     conflict;
+     of 200, and a `LIVE` at 150 is STALE. A REST read whose fills come in
+     two pages, in either order, gives the same T. A seconds fill instant is
+     narrowed by its `MATCHED` event, and a disagreeing one makes the hull. A
+     hull that undoes an earlier STALE raises the halting conflict;
    - **both permutations** (`CX034-R1-01`). A cancel answer (T PENDING) is
      followed by a `LIVE` at 200:
      - then `CANCELED@100`, or the horizon read finding the order CANCELED,
@@ -488,9 +556,10 @@ Ties are never STALE and never NEWER.
      halts; an observation without an instant is refused; a hold survives a
      restart as an `ORDERING` request with no alert.
    - **Mutation rows,** each failing a named test: flip the comparison; read
-     ties as STALE; drop the widening; take the arrival-order completing fill;
-     let a terminal read close a hold as STALE; drop the horizon; let a hold
-     resume; drop the hold's gate blocker.
+     ties as STALE; widen two points (the one-millisecond test fails); drop
+     the widening against an interval; take the arrival-order completing
+     fill; let a terminal read close a hold as STALE; drop the horizon; let a
+     hold resume; drop the hold's gate blocker.
 6. **A seeded property** over frame delays shorter than the horizon,
    duplicates, and the order of terminal frames against the horizon read, in
    a truthful mock: no halt. With an injected contradiction (a LIVE stamped
@@ -654,13 +723,39 @@ golden moves in this round.
      the PLANNED event's payload.
    - Its `execution.orders` column needs a migration, which is a protected
      path (Open item 4).
-4. **Carried to the SDK call.**
-   - `OmsVenuePort` gains `createMarketOrder`.
+4. **Carried to the SDK call, through every wrapper of the port** (`NEW-H1`).
+   - `OmsVenuePort` (`packages/oms/src/ports.ts:111-116`) gains a required
+     `createMarketOrder`, which answers a `SignOutcome` like
+     `createLimitOrder`. No wrapper may omit it or make it optional.
    - `SdkSecureClientPort` gains the SDK's `createMarketOrder`. It is a
      `create*` member, so the port still has no `place*` member
      (`sdk-port.ts:18-22`).
    - The adapter validates its request and cross-checks its signed amounts by
      D2.4's table.
+   - **The live-safety fence** (ADR-008; WP-320). The fence implements the
+     port: `PlacementVenuePort` (`apps/trader/src/live-safety/fenced-venue.ts:77-82`)
+     and `fenceVenuePort` (`:143-245`), through `LiveSafety.fenceVenue`
+     (`live-safety.ts:617-622`).
+     - `PlacementVenuePort` gains the member. `fenceVenuePort` wraps it
+       exactly as it wraps `createLimitOrder` (`:201-213`). It classifies the
+       request; the classifier gains a member for market requests, and a
+       `null` scope refuses. It then asks the gate (`decide`), and on a
+       refusal returns `signRefused` without calling the venue: no signed
+       order exists. When permitted, it signs, and remembers the signed
+       order's scope by identity (`remembered`, `:151`, `:212`).
+     - Transmission is unchanged. `postOrder` and `postOrders` judge every
+       order they send by its remembered scope, else by the classifier
+       (`:168-178`, `:215-240`). So a market order is judged at signing and
+       again at every transmission, like a limit order. Cancels stay
+       unfenced (§6 invariant 13).
+     - `LiveSafety.fenceVenue` carries the member through its type
+       parameters, and changes nothing else.
+   - **The restricted-mode wrapper** `withModeDetection`
+     (`packages/oms/src/restricted-mode/venue-port.ts:60-90`) passes
+     `createMarketOrder` through untouched, as it does `createLimitOrder`
+     (`:62-64`). A signing is not a venue answer the detector reads.
+   - **Every other implementer** gains the member: the OMS's test venues and
+     the harnesses' literals. The plan lists their paths (R3).
 5. **Kept on retransmission.** `orderType` and `expiration` are unsigned wire
    fields (A F-81, F-85). A retransmission (ADR-007 §2 step 9) re-posts the
    persisted signed order unchanged. A restored envelope whose `orderType` or
@@ -790,6 +885,10 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
 - The OMS and the adapter keep their layers, and attach through the core's
   ports. No dependency edge is added from the core to `packages/oms` or
   `packages/polymarket-secure`.
+- The live-safety fence is WP-320's, in `apps/trader`. Its change is bounded
+  to carrying the new member with the same per-order judgement (D3.1 item 4).
+  It adds no dependency: the fence keeps the OMS's types as type parameters
+  (`fenced-venue.ts:69-72`).
 
 **D3.7 Test obligations.**
 1. **Probe E02 ported, for FAK and FOK.** The OMS signs `orderType` FAK or FOK
@@ -799,6 +898,15 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
    - the order is terminal with its matched part;
    - a read fixes its final size;
    - the unused reservation is released.
+
+   **With D1** (`NEW-L4`), it runs in three arrangements of a late
+   `PLACEMENT` frame, delivered after the answer, against the remainder's
+   `CANCELLATION`:
+   - stamped one millisecond earlier: STALE, with no halt;
+   - stamped with the same value: UNORDERED, CLOSED, a halt at once. The test
+     asserts that halt, which is D1's designed outcome until Open item 3
+     settles it;
+   - with no `PLACEMENT` frame at all: no hold, no halt.
 3. **A FOK partial-liquidity case.** The mock's kill answer is a labelled
    assumption (U-49). The OMS follows D3.5, opens no new salt until the read
    resolves the order, and never exposes the position twice.
@@ -811,8 +919,8 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
      `createMarketOrder`, against D2.4's table;
    - `expiration` is 0, and `orderType` is as requested.
 
-   `v2-5.test.ts`'s port pin moves to eleven members, and keeps its no-`place*`
-   rule.
+   `v2-5.test.ts`'s SDK-port pin moves to eleven members, and keeps its
+   no-`place*` rule.
 6. **A restart test.** A restored signed order keeps its `orderType`, and a
    restored payload whose `orderType` was altered is refused.
 7. **The PAPER goldens do not change for D3 alone.** The time-in-force values
@@ -827,6 +935,24 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
    - **in the live composition round, before any mode above PAPER,** the
      same, with heartbeats succeeding throughout: the heartbeat gate closes
      at the bound and stays closed until an operator release.
+9. **The fence and the wrappers** (`NEW-H1`):
+   - **Conformance, at compile time:** the fenced venue is an `OmsVenuePort`
+     with `createMarketOrder`
+     (`test/fault-injection/live-safety/port-conformance.test.ts:73-80`, with
+     the new member); the secure client is one
+     (`test/unit/oms/port-conformance.test.ts`); and so is
+     `withModeDetection`'s result.
+   - **The fence, at run time** (`apps/trader/src/live-safety/*.test.ts`):
+     - a market order whose scope the gate refuses returns `FAILED` with its
+       reasons, and the venue's `createMarketOrder` is never called;
+     - an unclassified market request is refused `PLACEMENT_UNCLASSIFIED`;
+     - a permitted one is signed, and its later `postOrder` is judged with
+       the remembered scope: a switch engaged between signing and
+       transmission refuses it `NOT_SENT`, with no send.
+   - **The mode wrapper:** `createMarketOrder` passes through untouched, and
+     the detector observes nothing for it.
+   - **One mutation row** makes the fence's `createMarketOrder` call the venue
+     without asking the gate, and fails the refusal test.
 
 **D3 is pre-live for the OMS and the adapter.** For PAPER it is plumbing only,
 with no change in output.
@@ -844,28 +970,77 @@ pUSD.
   `packages/trading-core/src/pipeline.ts:446`). With no best ask, a FAK or FOK
   BUY is refused (`PLAN_BOOK_REQUIRED`): no bound could be computed.
 - **Why the best ask, and not the limit** (`CX034-R1-02`).
-  - Every fill of the order is at or below the limit. While no ask below the
-    snapshot's best ask appears, every fill is also at or above that best
-    ask. Then the shares bought are `Σ cᵢ ÷ pᵢ ≤ collateralTarget ÷ bestAsk ≤
-    plannedShares`.
-  - So the strategy's share caps, which it checks on `plannedShares` at the
-    same snapshot, hold for the fill too: `maximum_position_shares` and
-    `maximum_book_participation` (`applyEntryCaps`, `decide.ts:1194-1207`,
-    `:1248-1265`).
-  - The money caps hold too: the target is at most `plannedShares × bestAsk`,
-    which is at most the strategy's quote cost for `plannedShares`, which it
-    checked against `maximum_total_cost` and `maximum_contractual_loss`
-    (`decide.ts:1210-1231`). Fees come on top, and the reservation covers
-    them (D4.2).
   - **At the limit price** (the round's packet; `V2-10`'s
     `collateralTargetAtLimitPrice`), the target buys more than
-    `plannedShares` whenever the book asks less than the limit. 50 at a limit
-    of 0.35 is a target of 17.50: it buys 51.470588 shares if it all fills at
-    0.34, and probe B's book (0.34 × 30, then 0.35) bought 50.857142. Both
-    exceed the handoff's §13.2 reference configuration, whose
-    `maximum_position_shares` equals its `size_shares` (50). Checking the
-    caps on that larger count instead would refuse every such entry. This is
-    a named departure (Relation; Open item 9).
+    `plannedShares` whenever the book asks less than the limit: on every such
+    book, not by chance. 50 at a limit of 0.35 is a target of 17.50: it buys
+    51.470588 shares if it all fills at 0.34, and probe B's book (0.34 × 30,
+    then 0.35) bought 50.857142. Both exceed the handoff's §13.2 reference
+    configuration, whose `maximum_position_shares` equals its `size_shares`
+    (50). This is a named departure (Relation; Open item 9).
+  - At `q = min(limitPrice, bestAsk)`, the target is sized for
+    `plannedShares` at the snapshot's best price.
+- **What the conversion bounds, exactly** (`SHARE-CAP`).
+  - Let the order's fills come from `n` maker legs of `mᵢ` shares at `pᵢ`.
+    F-63 charges each leg `eᵢ = floor₆(mᵢ × pᵢ)`, for a maker whose signed
+    amounts equal its price (D4.2). The venue never spends more than the
+    target, so `Σ eᵢ ≤ collateralTarget ≤ plannedShares × q`. Since `eᵢ > mᵢ
+    × pᵢ − 10⁻⁶`, each leg has `mᵢ < (eᵢ + 10⁻⁶) ÷ pᵢ`.
+  - **On a stationary book** (every `pᵢ ≥ q`: no ask below the snapshot's
+    best ask appears before the match), `Σ mᵢ < (collateralTarget + n ×
+    10⁻⁶) ÷ q ≤ plannedShares + n × 10⁻⁶ ÷ q`. The per-leg floor can buy a
+    sub-grid **rounding excess**. Example: three legs of 16.666668 at 0.35
+    buy 50.000004 shares for 17.499999 pUSD, below the bound of 50 + 3 ×
+    10⁻⁶ ÷ 0.35 ≈ 50.0000086.
+  - **Under price improvement** (an ask below `q` appears between the
+    snapshot and the match), no useful bound exists. A 17.00 target filled at
+    0.17 buys 100 shares. The only bound that holds on every book is
+    `(collateralTarget + n × 10⁻⁶) ÷ tickSize`: over 1,700 shares for 17.00 at
+    a tick of 0.01.
+  - **The money caps do hold, on every book.** The venue never spends more
+    than the target. The target is at most `plannedShares × bestAsk`, which is
+    at most the strategy's quote cost for `plannedShares`, which it checked
+    against `maximum_total_cost` and `maximum_contractual_loss`
+    (`decide.ts:1210-1231`). Fees come on top, and the reservation covers them
+    (D4.2).
+- **So the share caps are not hard for the fill.** Three caps count shares,
+  and all three are judged on `plannedShares`, the intent's size, before the
+  conversion:
+  - Static Bracket's `maximum_position_shares` and
+    `maximum_book_participation` (`applyEntryCaps`, `decide.ts:1194-1207`,
+    `:1248-1265`);
+  - the risk engine's `participation.maxOrderShares` (§9.8 check 13,
+    `packages/risk/src/engine.ts:643-653`), on the intent's `buyShares`.
+
+  A fill can exceed them by the rounding excess on any book, and by any amount
+  under price improvement. **This ADR does not claim that they hold.** What to
+  do is put to the user (Open item 10), as two variants, each fully
+  specified:
+  - **Variant P, plan-time share caps (proposed).**
+    - The share caps of a collateral-targeted FAK or FOK BUY entry are judged
+      at plan time, on `plannedShares`, against the planning snapshot. The
+      fill's excess is accepted. It is detected and contained (D4.2): it is
+      attributed; the caps count it at once, so the next entry is trimmed or
+      refused (D4.3); it is alerted beyond the rounding excess; and the exit
+      reduces it. The money caps stay hard.
+    - This relaxes handoff §13.2's share caps, for these orders only. It is a
+      named departure (Relation).
+    - Why it is proposed: it is the venue's FAK and FOK BUY (F-63), which the
+      packet asks for; the breach is event-driven, not systematic as at the
+      limit price; and money stays capped.
+  - **Variant H, hard share caps.**
+    - The planner refuses a collateral-targeted FAK or FOK BUY entry whenever
+      a share cap applies to it (`PLAN_SHARE_CAP_UNENFORCEABLE`), because its
+      only book-independent bound exceeds any useful cap.
+    - An immediate entry is then a share-targeted GTC with a deadline cancel
+      (D3.4; Static Bracket's `immediate_order_type: GTC`, `params.ts:139`).
+      The venue caps its shares (F-63), at the cost of a remainder that rests
+      until the cancel lands.
+    - Under H, the §13.2 reference configuration's FAK entry is refused. The
+      PAPER goldens of D4.6 then show that refusal, or move to a GTC
+      configuration with a recorded reason.
+  - **Until the ruling,** R3 may implement D3, but not D4 (Implementation
+    plan). D3 does not depend on the ruling.
 - **What it costs.** When the order must walk above the best ask, it buys
   fewer than `plannedShares`. Over probe B's book (0.34 × 30, then 0.35), the
   target is 17.00, which buys 30 + 19.428571 = 49.428571. The intent's
@@ -883,20 +1058,26 @@ pUSD.
 - **The minimum** is checked on the signed share side (D2.3; A F-105).
 - **A departure from `V2-10`.** Its `collateralTargetAtLimitPrice` converts
   at the limit price and floors to whole base units (6 decimals). D4 converts
-  at `min(limitPrice, bestAsk)`, for the caps, and floors to 0.01, because the
-  SDK signs that amount and the simulator must match it. Authority: handoff
-  §13.2 for the first (its `risk` block), and the venue documentation and the
-  SDK for the second (handoff §1.1).
+  at `min(limitPrice, bestAsk)`, so that the target does not buy beyond
+  `plannedShares` on every book that asks below the limit, and floors to
+  0.01, because the SDK signs that amount and the simulator must match it.
+  Authority: handoff §13.2 for the first (its `risk` block), and the venue
+  documentation and the SDK for the second (handoff §1.1).
 
 **D4.2 The OMS and reconciliation, for a collateral-targeted BUY.**
-- **When fills exceed `plannedShares`** (an ask below the snapshot's best ask
-  was taken):
+- **When fills exceed `plannedShares`** (variant P of D4.1; under variant H no
+  such order exists):
   - the excess is real and is kept: no rule can undo a fill;
-  - the OMS allocates it (attribution, below), and raises a non-halting
-    `ENTRY_SHARE_BOUND_EXCEEDED` alert, with a metric;
-  - the strategy's caps count the actual position at once, so no further
-    entry is admitted while it exceeds them;
-  - the exit sells the actual position (D4.3).
+  - the OMS allocates it (attribution, below);
+  - **beyond the rounding excess** (`SHARE-CAP`), that is when the order's
+    shares reach the stationary-book bound `plannedShares + n × 10⁻⁶ ÷ q`
+    (D4.1), at least one leg was below `q`. The OMS then raises a non-halting
+    `ENTRY_SHARE_BOUND_EXCEEDED` alert, with a metric. The rounding excess
+    alone, below that bound, is a valid fill and raises nothing. PAPER runs
+    no OMS and raises no alert; the excess shows in its fills;
+  - the strategy's caps count the actual position at once, rounding excess
+    included, so the next entry is trimmed to the headroom or refused (D4.3);
+  - the exit sells the actual position, floored to the grid (D4.3).
 
   Why the alert does not halt: a halt cannot undo the fill, and a market
   quarantine would block the exit that reduces it.
@@ -905,30 +1086,77 @@ pUSD.
   order. Its fills exceed the signed `takerAmount` whenever the book asks
   less than the limit: "ExchangeV3 reduces a BUY's remaining collateral budget
   by the amount actually spent" (F-63).
-- **A collateral bound applies instead, per maker leg** (`CX034-R1-05`).
+- **The collateral spent, per maker leg** (`CX034-R1-05`, `CX034-R2-03`).
   - F-63 floors each maker fill: `counterAmount = floor(makerAssetFill ×
-    takerAmount / makerAmount)`. One OMS fill can aggregate several maker
+    takerAmount / makerAmount)`. For a maker SELL that is the collateral it
+    receives, which our BUY spends. One OMS fill can aggregate several maker
     matches. WP-280 emits one fill per own taker leg, of the summed maker
     amounts, and requires every maker leg at the fill's price
     (`oms-projection.ts:180-191`, `:235-247`).
-  - So `FillReport` carries the fill's maker legs: their matched amounts.
-    They come from the stream's `maker_orders` and from the REST trade's
-    (A F-106).
-  - Over the order's `n` distinct maker legs, the collateral it spent, `S`,
-    satisfies `Σ(m × p) − n × 10⁻⁶ < S ≤ Σ(m × p)`. That holds for every
-    maker whose signed amounts equal its price, which on-grid makers do (A
-    F-102). For any other maker it is an inference.
-  - The venue never spends more than the target. So a contradiction is
-    `Σ(m × p) − n × 10⁻⁶ ≥ collateralTarget`, and it halts as today.
-    Example: three legs of 16.666668 at 0.35 give `Σ(m × p)` = 17.5000014,
-    below 17.50 + 0.000003, so they pass.
+  - So `FillReport` carries the fill's maker legs: their matched amounts `mᵢ`
+    and prices `pᵢ`. They come from the stream's `maker_orders` and from the
+    REST trade's (A F-106).
+  - **A leg's spend** is `eᵢ = floor₆(mᵢ × pᵢ)`, in base units. It equals
+    F-63's `counterAmount` for every maker whose signed amounts equal its
+    price, as on-grid makers' amounts do (A F-102). For any other maker it is an
+    inference. It sharpens round 1's interval, `Σ(m × p) − n × 10⁻⁶ < S ≤
+    Σ(m × p)`, by applying the floor per leg.
+  - **The guard.** The venue never spends more than the target. So `Σ eᵢ >
+    collateralTarget`, over the order's distinct legs, is a contradiction. It
+    raises the halting conflict as today ("a fill beyond the order"), before
+    anything is consumed. Example: three legs of 16.666668 at 0.35 spend 3 ×
+    5.833333 = 17.499999, within 17.50, and pass. The same fill reported as
+    one leg spends `floor₆(17.5000014)` = 17.500001, and halts.
   - A duplicate delivery counts once. Fills are deduplicated by trade id,
-    order id and discriminator (§10.7), so the allowance is not multiplied.
+    order id and discriminator (§10.7), so a leg is never counted twice.
+- **The OMS's reservation accounting** (`CX034-R2-03`).
+  - **Today:** `#debitOf` debits a BUY at shares × price
+    (`order-manager.ts:2307-2311`). `InventoryBook.consume` refuses any
+    amount above the reservation's remainder (`INVENTORY_OVER_CONSUMPTION`,
+    `packages/inventory/src/inventory-book.ts:462-468`). `#consume` then
+    raises a halting `RESERVATION_SHORTFALL` (`order-manager.ts:2334-2337`).
+    For the three legs above that debit is 50.000004 × 0.35 = 17.5000014,
+    above a zero-fee reservation of 17.50: a valid fill would halt.
+  - **For a collateral-targeted BUY:**
+    1. **Reserve** the target plus the fee bound (the last bullet of D4.2).
+    2. **Debit** each fill by its spend `Σ eᵢ`, plus its collateral fee as
+       today. Never by shares × price.
+    3. **Persist** the debit in the FILL event's payload, as every debit is
+       persisted today (`payload.debit`, `order-manager.ts:1269`; restored on
+       recovery at `:3674`), with the fill's legs (Open item 4).
+    4. **Consume** that debit through `#consume`. The guard keeps `Σ eᵢ` within
+       the target, so the principal never over-consumes. A fee beyond the fee
+       bound still raises `RESERVATION_SHORTFALL`, as today.
+    5. **Release** by `#maybeRelease`'s rule, unchanged: the order is
+       terminal, its final size is fixed by a read, its fills sum to it, and
+       every consume succeeded. The remainder released is the reservation
+       less the debits: 0.000001 in the example, plus any unused fee bound.
+    6. **Reconcile** the order's shares as today: the read's `size_matched`
+       against the fills, under A11. No read carries the spend (A F-106), so
+       the spend is reconciled at the account. WP-290 compares the collateral
+       balance with its projection (`compareHolding`, `coordinator.ts:2172`).
+       A debit that differs from the venue's real spend, as an off-ratio
+       maker could cause, shows there as a collateral delta. The existing
+       holding-break rules handle it (`HOLDING_DELTA_UNCONFIRMED`, then
+       `BALANCE_UNATTRIBUTED`, `:2313`). Nothing adjusts it silently.
+- **A fill with no maker legs** (`NEW-L3`). The stream's `maker_orders` is
+  optional, and the REST examples show an empty array (A F-106). Without legs,
+  the OMS can neither compute nor bound a collateral-targeted BUY's spend:
+  - WP-280 already withholds such a fill as a shortfall
+    (`TAKER_ECONOMICS_UNVERIFIABLE`, `oms-projection.ts:180-186`), which
+    requests reconciliation;
+  - the OMS refuses, with `OMS_INVALID_INPUT`, a `FillReport` without legs
+    for such an order;
+  - a REST trade without legs fixes nothing either. No fill is recorded, so
+    the order's fills cannot sum to its final size. The salt gate stays
+    closed and the reservation stays held (`#maybeRelease`), until a read
+    carries the legs or an operator resolves the order. Nothing is inferred.
+  - Whether such trades carry their legs is part of U-51.
 - **The group's remaining is in collateral.** For such a group, the salt
   gate's `remaining` (`#saltGate`, `order-manager.ts:2384`) is the target less
-  `Σ(m × p)` of its orders' fills, and 0 when that falls below 0 within the
-  leg allowance. Shares beyond `plannedShares` never trip the gate's
-  invariant ("a group's final sizes exceed its plan").
+  the spend `Σ eᵢ` of its orders' fills. The guard keeps it at 0 or above.
+  Shares beyond `plannedShares` never trip the gate's invariant ("a group's
+  final sizes exceed its plan").
 - **Attribution** (`MEDIUM-3`).
   - The ticket's attributions still sum exactly to `plannedShares`
     (`order-manager.ts:294-295`).
@@ -953,7 +1181,7 @@ pUSD.
 
     A11 is U-51: what the venue reports for a market order is undocumented.
   - **`size_matched` may exceed `original_size`** for such a BUY (U-51). It is
-    not bounded by it; the collateral bound bounds the fills.
+    not bounded by it; the spend guard above bounds the fills.
   - **A read that differs never matches.** For a lost answer, the matcher
     gives `AMBIGUOUS`, and the attempt stays unresolved with submissions
     paused. For an order whose venue id is known, the read raises the halting
@@ -1014,7 +1242,8 @@ pUSD.
     remainder is a residual can close;
   - still real exposure. It stays in the position projections, it counts in
     the directional exposure that `maximum_position_shares` and the entry
-    bounds cap, and its PnL is valued at worst-case resolution;
+    bounds cap (so the next entry is trimmed to the headroom, below), and
+    its PnL is valued at worst-case resolution;
   - on the direct leg, held to resolution and redeemed through WP-300's
     REDEEM, which takes an explicit base-unit amount
     (`verified-2026-10-05.md` F-73), or merged with a held complement.
@@ -1026,10 +1255,35 @@ pUSD.
   departure (Relation).
 - **The effect.** The bracket reaches `CLOSED`, handoff §13.3's own state.
   No new state is added; the residual and its reason are recorded with it.
-  So a `SUB_GRID` residual (`V2-10`'s probe B left 0.000002) no longer keeps
-  the bracket open, and the next bracket can enter. After a `SUB_MINIMUM`
-  residual, a new entry is allowed only within the caps, which count the
-  residual.
+  So a residual (`V2-10`'s probe B left 0.000002) no longer keeps the bracket
+  open.
+- **Re-entry after a residual** (`NEW-M1`).
+  - **The cap counts the residual,** as it counts any held share. Today
+    `applyEntryCaps` refuses `held + size > maximum_position_shares`, and
+    never trims (`decide.ts:1194-1208`; `held` is the instance's virtual
+    holding, `observe.ts:314-316`).
+  - **Why that blocks re-entry.** In the reference configuration
+    `maximum_position_shares` equals `size_shares`, 50
+    (`test/e2e/support/scenario.ts:220`, `:262`), and the two-bracket run
+    re-enters the same market (`two-brackets.ts:69-70`). Any residual would
+    refuse every later full-size entry: D4.6's 0.008571 gives 50.008571 >
+    50. That would defeat `V2-10B`'s liveness.
+  - **So the entry is trimmed to the headroom, on the grid.** When every
+    share the instance holds in its direction is a recorded residual, the
+    entry's size is `floor₀.₀₁(min(size_shares, maximum_position_shares −
+    held))`.
+    - It is computed where the size is chosen today (`decide.ts:1017`),
+      before the minimum check and the leg's quote. So every later check
+      (minimum, quote, cost, loss, slippage, participation, edge) is made on
+      the trimmed size.
+    - A trimmed entry records `POSITION_CAP_HEADROOM`, with both sizes.
+    - A trimmed size of 0, or one below the market minimum, is refused as
+      today. Any other held quantity (an excess not yet exited, D4.2) refuses
+      as today, untrimmed.
+    - Example: after D4.6's residual of 0.008571, the next entry is 49.99,
+      and the position stays within 50.
+  - The cap itself is unchanged. This refines Static Bracket's entry sizing
+    (§13); it is within R3's grant.
 - **A named departure from handoff §13.3,** whose rule is "Exit size equals
   actual allocated filled size". An allocation off the 0.01 grid cannot be
   traded whole: the SDK floors every limit order's size to 0.01 (A F-101), and
@@ -1055,12 +1309,23 @@ pUSD.
   pUSD leg. That is a contract change for its owner, WP-200's package.
 
 **D4.6 Golden and replay changes.** Each is regenerated with a recorded
-reason:
+reason. The list assumes variant P of D4.1; under variant H, the FAK entries
+below become refusals or a GTC configuration instead:
 - `test/replay-golden/paper-e2e/paper-e2e-run.json`. Its entry, 50 at limit
-  0.35 over asks 0.34 × 30 and 0.35 × 100, now targets 17.00 and buys
-  49.428571. The exit sells 49.42, leaving a `SUB_GRID` residual of 0.008571;
-- `test/replay-golden/paper-e2e/two-brackets-run.json`, which must now show
-  the second bracket entering;
+  0.35 over the asks 0.34 × 30 and 0.35 × 40
+  (`test/e2e/support/scenario.ts:122-125`), now targets 17.00 and buys 30 +
+  19.428571 = 49.428571. The exit sells 49.42, leaving a `SUB_GRID` residual
+  of 0.008571;
+- `test/replay-golden/paper-e2e/two-brackets-run.json`. Its brackets' best
+  asks (0.34 × 60 for bracket 1, 0.33 × 60 for bracket 2;
+  `two-brackets.ts:72-82`) convert to exactly 50 shares each (17.00 ÷ 0.34,
+  16.50 ÷ 0.33) and leave no residual, so it shows both entries at 50;
+- **a new residual-producing two-bracket scenario** (`NEW-M1`), in
+  `test/e2e/support/scenarios/`, with its golden beside the others in
+  `test/replay-golden/paper-e2e/`. Bracket 1 enters over the paper-e2e
+  ladder (0.34 × 30, 0.35 × 40) and leaves the residual of 0.008571.
+  Bracket 2's entry is trimmed to 49.99 (D4.3), enters, and the position
+  never exceeds 50;
 - `test/replay-golden/backtest/static-bracket/expected-artifact.txt`, and its
   `run-pins.json` version pin;
 - `test/replay-golden/simulation/golden-replay.json`,
@@ -1089,20 +1354,33 @@ STOPPED S1).
    - **the minimum** (`MEDIUM-5`): 5 shares with a limit and a best ask of
      0.347 give a target of 1.73 and a share side of 4.98560, refused below a
      minimum of 5.
-2. **The caps** (`CX034-R1-02`). With `maximum_position_shares` 50, a 50-share
-   FAK BUY against a book whose asks are all at or above the snapshot's best
-   ask buys at most 50, and the participation allowance holds. One mutation
-   row converts at the limit price instead, and fails the test.
-3. **A fill below the snapshot's best ask** (an ask that appeared after the
-   snapshot): the excess is kept, attributed to the last band, raises
-   `ENTRY_SHARE_BOUND_EXCEEDED`, and refuses the next entry; the exit sells
-   the whole position.
-4. **The OMS** (`MEDIUM-3`, `CX034-R1-05`):
+2. **The caps** (`CX034-R1-02`), with `SHARE-CAP`, under the ruled variant:
+   - **variant P:** with `maximum_position_shares` 50, a 50-share FAK BUY
+     against a book whose asks are all at or above the snapshot's best ask
+     buys less than `plannedShares + n × 10⁻⁶ ÷ q`. The three-leg case buys
+     50.000004, raises no alert, and after its exit the next entry is
+     trimmed to 49.99. One mutation row converts at the limit price instead,
+     and fails the test;
+   - **variant H:** the same entry is refused `PLAN_SHARE_CAP_UNENFORCEABLE`
+     before any reservation, and the GTC route signs a share-targeted order
+     of 50.
+3. **A fill below the snapshot's best ask** (variant P; an ask that appeared
+   after the snapshot): the excess is kept, attributed to the last band,
+   raises `ENTRY_SHARE_BOUND_EXCEEDED`, and refuses the next entry until the
+   exit; the exit sells the whole position, floored to 0.01.
+4. **The OMS** (`MEDIUM-3`, `CX034-R1-05`, `CX034-R2-03`):
    - bands of 30 and 20 and fills of 51.470588 allocate 30 and 21.470588, with
      nothing UNATTRIBUTED;
-   - three maker legs of 16.666668 at 0.35 against a target of 17.50 pass;
-     the same fill reported as one leg halts; a duplicate delivery does not
-     double the allowance;
+   - three maker legs of 16.666668 at 0.35 against a target of 17.50 pass the
+     guard; the same fill reported as one leg halts; a duplicate delivery
+     does not count a leg twice;
+   - **the composed accounting case:** with a zero fee and a reservation of
+     exactly 17.50, the three-leg fill debits 17.499999, consumes with no
+     `RESERVATION_SHORTFALL`, and, once a read fixes the final size, releases
+     0.000001. One mutation row debits shares × price (17.5000014) instead,
+     and fails it with the shortfall;
+   - a `FillReport` without maker legs for such an order is refused, and the
+     order's reservation stays held (`NEW-L3`);
    - the group's remaining is in collateral, and never trips the gate's
      invariant.
 5. **Identity** (`HIGH-1`). The mock's reads carry exactly the fields the
@@ -1116,7 +1394,12 @@ STOPPED S1).
 6. **Exits by side** (`CX034-R1-03`):
    - a direct-leg FAK BUY with price improvement: the exit sells the held
      position floored to 0.01; the residual is `SUB_GRID`, and the bracket
-     closes; the two-bracket run enters twice;
+     closes;
+   - **re-entry after a residual** (`NEW-M1`): the residual-producing
+     two-bracket scenario of D4.6 enters twice, the second time at 49.99,
+     and the position never exceeds 50. A held excess that is not a residual
+     refuses the next entry, untrimmed. One mutation row removes the trim,
+     and the second entry is refused, failing the test;
    - a complement-leg bracket that sold all 50 held tokens: its stop, its
      take-profit and a partial exit each BUY from `openShares`, never 0; an
      off-grid `openShares` of 49.995 buys 49.99 and records a `SUB_GRID`
@@ -1133,15 +1416,32 @@ STOPPED S1).
 ## Implementation plan
 
 The three rounds run **strictly in order: R1, then R2, then R3** (`LOW-8`).
-Never two at once: R1 and R2 share `packages/oms/**` and the live and
-reconciliation fault suites; R2 and R3 share `packages/oms/**`,
-`packages/polymarket-secure/**` and `test/fault-injection/live/**`.
+Never two at once: R1 and R2 share `packages/oms/**` and the live,
+reconciliation and OMS fault suites; R2 and R3 share `packages/oms/**`,
+`packages/polymarket-secure/**`, `test/fault-injection/live/**` and
+`test/fault-injection/oms/**`.
 
 | Round | Decisions | Paths it needs | Order | Label | Acceptance |
 | --- | --- | --- | --- | --- | --- |
-| R1 `OMS-QTY` | D2 | `packages/execution-planner/**`, but not `src/probes/**` (WP-350's); `packages/oms/**`; `packages/polymarket-secure/src/venue-client.ts` and its tests; `packages/strategies/static-bracket/src/params.ts` and its tests; `test/unit/{execution-planner,oms,strategies}/**`; `test/contract/polymarket-secure/**`; `test/fault-injection/live/**`; `test/fault-injection/reconciliation/**` | first | pre-live; a latent PAPER change, with no golden change | D2.6; all gates; the goldens byte-identical |
-| R2 `OMS-VENUE-TIME` | D1 | `packages/oms/**`, including `src/reconciliation/**`; `packages/polymarket-secure/src/user-stream/**`; `test/unit/oms/**`; `test/contract/user-stream/**`; `test/fault-injection/reconciliation/**`; `test/fault-injection/live/**`; `apps/ops-cli/src/emergency/**`, only where it builds the `ReconciliationPolicy` (the new `orderingHorizonMs`) and its tests; `docs/runbooks/reconciliation.md` (the policy table's new row); `docs/experiments/phase-3-verification.md` (§5's counts to 0, with a dated note) | after R1 is merged | pre-live only | D1.10; all gates |
-| R3 `TIF-COLLATERAL` | D3, then D4 | `packages/trading-core/**` (the bounded ADR-022 D10 grant of D3.6 and D4.5), its tests included; `packages/execution-planner/**`; `packages/oms/**`; `packages/polymarket-secure/**`; `packages/simulation/**`; `packages/strategies/static-bracket/**`; `packages/ledger/src/allocation.ts` (`FillFact`, with WP-200's owner); `packages/risk/**`, only if the incident needs a new cause; the matching `test/unit/**`, `test/contract/polymarket-secure/**`, `test/fault-injection/live/**`, `test/fault-injection/reconciliation/**`, `test/e2e/**` and `test/replay-golden/**`; and, from `apps/**`, **test files only:** `apps/backtest-cli/src/**/*.test.ts` (`backtest.test.ts`, `run-command.test.ts`) and `apps/trader/src/**/*.test.ts` (`loop-folds.test.ts` included) (`MEDIUM-4`). **Not** `db/migrations/**`, `packages/domain/**`, `packages/decimal/**`, or any non-test `apps/**` file: if one must change, the round stops and reports it | after R2 is merged. D3 with D4: one round, or two rounds merged back to back before any PAPER run is cited as evidence | D3: pre-live, plumbing only for PAPER. **D4: changes PAPER fills and exits** | D3.7, D4.7; each golden with a reason; all gates |
+| R1 `OMS-QTY` | D2 | `packages/execution-planner/**`, but not `src/probes/**` (WP-350's); `packages/oms/**`; `packages/polymarket-secure/src/venue-client.ts` and its tests; `packages/strategies/static-bracket/src/params.ts` and its tests; `test/unit/{execution-planner,oms,strategies}/**`; `test/contract/polymarket-secure/**`; `test/fault-injection/live/**`; `test/fault-injection/reconciliation/**`; and, test files only, `test/fault-injection/oms/**` and `test/fault-injection/live-safety/**`, which run on the OMS's shared test supports (`test/unit/oms/support/**`) whose signed amounts D2.4 checks | first | pre-live; a latent PAPER change, with no golden change | D2.6; all gates; the goldens byte-identical |
+| R2 `OMS-VENUE-TIME` | D1 | `packages/oms/**`, including `src/reconciliation/**`; `packages/polymarket-secure/src/user-stream/**`; `test/unit/oms/**`; `test/contract/user-stream/**`; `test/fault-injection/reconciliation/**`; `test/fault-injection/live/**`; `test/fault-injection/oms/**` (`crash-points.test.ts:148`'s observation gains a venue instant, D1.10 item 4; `NEW-M2`); `apps/ops-cli/src/emergency/**`, only where it builds the `ReconciliationPolicy` (the new `orderingHorizonMs`) and its tests; `docs/runbooks/reconciliation.md` (the policy table's new row); `docs/experiments/phase-3-verification.md` (§5's counts to 0, with a dated note) | after R1 is merged | pre-live only | D1.10; all gates |
+| R3 `TIF-COLLATERAL` | D3, then D4 | `packages/trading-core/**` (the bounded ADR-022 D10 grant of D3.6 and D4.5), its tests included; `packages/execution-planner/**`; `packages/oms/**`; `packages/polymarket-secure/**`; `packages/simulation/**`; `packages/strategies/static-bracket/**`; `packages/ledger/src/allocation.ts` (`FillFact`, with WP-200's owner); `packages/risk/**`, only if the incident needs a new cause; the matching `test/unit/**`, `test/contract/polymarket-secure/**`, `test/fault-injection/live/**`, `test/fault-injection/reconciliation/**`, `test/e2e/**` and `test/replay-golden/**`. **The fence** (`NEW-H1`; WP-320's paths, with its owner's consent): `apps/trader/src/live-safety/fenced-venue.ts`; `apps/trader/src/live-safety/live-safety.ts` and `index.ts`, only to carry the new member through `fenceVenue`'s types and the module's exports (D3.1 item 4); and the test files `test/fault-injection/live-safety/**` (`port-conformance.test.ts:73-80`), `test/fault-injection/oms/**` (`support/crash-harness.ts:125-130`) and `test/integration/postgres/fencing-race.test.ts` (its port literal at `:373-374`, type-checked by `packages/storage-postgres`'s `typecheck`, inside the root `typecheck`). From the rest of `apps/**`, **test files only:** `apps/backtest-cli/src/**/*.test.ts` (`backtest.test.ts`, `run-command.test.ts`) and `apps/trader/src/**/*.test.ts` (`loop-folds.test.ts` included) (`MEDIUM-4`). **Not** `db/migrations/**`, `packages/domain/**`, `packages/decimal/**`, or any other non-test `apps/**` file: if one must change, the round stops and reports it | after R2 is merged. D4 only after the user's ruling on Open item 10; D3 does not wait for it. D3 with D4: one round, or two rounds merged back to back before any PAPER run is cited as evidence | D3: pre-live, plumbing only for PAPER. **D4: changes PAPER fills and exits** | D3.7, D4.7 (for the ruled variant); each golden with a reason; all gates |
+
+**How the test grants were found** (`NEW-H1`, `NEW-M2`). At `3294201`, `grep
+-rln` over every `*.ts` file listed each file that names a port the round
+changes, or calls a method whose input it changes:
+- for R3, `OmsVenuePort`, `PlacementVenuePort`, `fenceVenue` and
+  `createLimitOrder`;
+- for R2, `applyOrderObservation`, `OrderObservation` and
+  `quiescenceHorizonMs`;
+- for R1, the OMS's ticket and its test venues.
+
+Each match was read, to see whether it builds such a value or passes such an
+input. Every one that does lies inside its round's paths above. Files that
+only receive a wrapped port need no change, for example
+`test/contract/rate-limits/oms-integration.test.ts`, which wraps the shared
+test venue. If a gate shows that any other path must change, the round stops
+and reports it.
 
 **For every round:**
 - PAPER only, with no credential and no network. The four live defaults stay
@@ -1175,7 +1475,9 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
     secret, and on the order record, which is not.
 - **ADR-008 and ADR-033 D1 item 4:** unchanged. D3.4's escalation uses the
   Incident Controller's explicit heartbeat stop, latched until an operator
-  releases it; it does not rely on a lapse.
+  releases it; it does not rely on a lapse. The submission fence judges a
+  market order at signing and at every transmission, exactly as a limit
+  order, and remembers its scope (D3.1 item 4; `NEW-H1`).
 - **ADR-020:** every new port field is read as own data through the existing
   doors.
 - **ADR-022 D10:** D3's and D4's core hooks are a bounded grant (D3.6).
@@ -1192,10 +1494,24 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
   attributed to its last band (D4.2).
 - **Handoff §6 invariant 10:** exits still come from confirmed allocation, now
   on the venue's grid and by the leg's exit side (D4.3).
-- **Handoff §13.2, the `risk` block:** D4.1 converts at `min(limitPrice,
-  bestAsk)` so that the share caps hold for the fill. The case they cannot
-  cover, a fill below the snapshot's best ask, is detected and contained
-  (D4.2).
+- **Handoff §13.2, the `risk` block, and §9.8 check 13** (`SHARE-CAP`).
+  - D4.1 converts at `min(limitPrice, bestAsk)`, so that the target does not
+    buy beyond `plannedShares` on every book that asks below the limit.
+  - The money caps hold on every book. The share caps
+    (`maximum_position_shares`, `maximum_book_participation`,
+    `participation.maxOrderShares`) **do not hold for the fill** of a
+    collateral-targeted FAK or FOK BUY: rounding can exceed them by a
+    sub-grid amount, and price improvement by any amount (D4.1).
+  - Variant P, proposed, is a **named departure**: those caps become
+    plan-time caps for these orders, with the excess detected and contained
+    (D4.2, D4.3). Variant H keeps them hard by refusing such entries. Neither
+    is adopted without the user's ruling (Open item 10). Authority for P,
+    if ruled: the venue's FAK and FOK BUY targets collateral (F-63, handoff
+    §1.1), so no share bound can be signed.
+- **Static Bracket's entry size (§13):** after a residual, an entry is
+  trimmed to the position cap's headroom on the grid (D4.3, `NEW-M1`). The
+  cap is unchanged; today's refusal of every later full-size entry becomes a
+  smaller entry within it.
 - **Handoff §13.2, `allow_resolution_hold: false` and `final_policy`:** a
   named departure (`LOW-5`). A residual (D4.3) is held to resolution even when
   the configuration forbids it, because no venue order can reduce it. The
@@ -1216,8 +1532,9 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
   - `WP340-F1`'s 287 scripted releases go to 0, and a place-then-cancel no
     longer needs an operator, when its terminal frame arrives before the
     horizon read.
-  - FAK and FOK reach the venue port.
-  - A residue no longer blocks the next bracket.
+  - FAK and FOK reach the venue port, through the fence.
+  - A residue no longer blocks the next bracket: the next entry is trimmed to
+    the cap's headroom (D4.3).
 - **One number and one value.** The OMS, the reservation, reconciliation, the
   signed order and the mock agree on one quantity. PAPER and live read one
   time-in-force from the plan.
@@ -1227,9 +1544,26 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
   - A STALE observation whose terminal frame arrives after the horizon read
     halts. If the venue emits no `CANCELLATION` for a REST cancel (U-54),
     every route-3 case halts after the horizon.
-  - Overlapping millisecond instants halt at once.
+  - Equal millisecond values halt at once, and so does an overlap with a
+    final interval. Adjacent values are ordered (D1.4).
+  - **FAK and FOK under D1** (`NEW-L4`; conditional on U-50, not observed).
+    - A FAK or FOK made terminal by its answer has a PENDING T, until the
+      remainder's `CANCELLATION` or, for a filled one, its `MATCHED` events
+      fix it (D1.3).
+    - If the venue emits a `PLACEMENT` frame for such an order, delivers it
+      after the answer, and stamps it with the same millisecond as that
+      terminal evidence, the pair is UNORDERED, CLOSED: a halt at once. A
+      placement one millisecond earlier is STALE.
+    - Whether FAK and FOK emit order events at all, and with which values, is
+      U-50. A10 does not decide it (D1.10 item 4), and D3.7 item 2 tests the
+      equal-value halt.
+    - The execution probe that gates FAK and FOK above PAPER observes it
+      (Open item 3).
   - A collateral-targeted BUY converted at the best ask can buy fewer than its
     planned shares when it walks the book (D4.1).
+  - A re-entry after a residual is smaller than `size_shares`, by the
+    residual rounded up to the grid (D4.3). Under variant H, the reference
+    configuration's FAK entries are refused.
   - Residual inventory is held to resolution.
   - The PAPER goldens and the simulator's version pin change with D4. Runs
     before and after it are not comparable.
@@ -1240,8 +1574,16 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
   - What the venue reports for collateral-targeted BUYs (U-51, A11) and for a
     killed FOK (U-49) is unknown, so FAK and FOK orders stay in PAPER until an
     execution probe observes them.
-  - The share caps rest on the planning snapshot. A fill below its best ask
-    exceeds them; D4.2 detects and contains it, but cannot prevent it.
+  - Under variant P, the share caps of a collateral-targeted BUY are
+    plan-time caps. Its fill can exceed them, by a sub-grid rounding excess
+    on any book and by any amount under price improvement. D4.2 detects and
+    contains the excess, but cannot prevent it. The money caps hold.
+  - The OMS's spend of a collateral-targeted BUY is `Σ floor₆(mᵢ × pᵢ)`. It
+    is exact for makers whose signed amounts equal their price, and an
+    inference for any other. A wrong spend surfaces as a collateral balance
+    break in reconciliation (D4.2).
+  - A12 (one clock and one rounding for every user-channel `timestamp`) is an
+    assumption. If it is wrong, the cost is liveness (D1.7).
   - C-7 sets the `SUB_MINIMUM` threshold and the minimum check.
 
 ## Alternatives considered
@@ -1272,6 +1614,11 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
 - **Read seconds as truncated** (round 0). No source says so; under rounding
   a newer observation could be classed STALE (`MEDIUM-2`). Rejected for the
   widened interval.
+- **Widen every millisecond value on its own** (round 1). It treated two
+  values of one clock as if their roundings were unrelated, so a `LIVE` one
+  millisecond older than its `CANCELED` halted at once (`CX034-R2-02`).
+  Rejected for points compared by value, under A12. Widening stays for a
+  `match_time` and for mixed comparisons.
 
 **For D2:**
 - **Refuse every off-grid quantity.** It strands exits sized by the held
@@ -1295,6 +1642,11 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
 - **Rely on the heartbeat lapse when a deadline cancel cannot be sent**
   (round 0). Nothing makes the heartbeat lapse in that case
   (`CX034-R1-06`). Rejected for the explicit, latched stop.
+- **Make `createMarketOrder` optional on the port, and leave the fence
+  alone** (`NEW-H1`). Transmission would still be judged, since the fence's
+  `postOrder` and `postOrders` classify every order. But a market order
+  would be signed with no gate decision and no remembered scope. Rejected:
+  the fence judges signing too, for every order kind.
 
 **For D4:**
 - **Keep FAK BUYs in shares.** That is contrary to the venue (F-63).
@@ -1311,8 +1663,22 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
   an operator can still configure that route through D3.4.
 - **A book-independent share bound.** None useful exists: a collateral target
   buys up to `target ÷ tick size` shares at the venue's lowest price, 1750
-  shares for 17.50 at a tick of 0.01. Checking the caps on that would refuse
-  every entry.
+  shares for 17.50 at a tick of 0.01. Checking the caps on that refuses every
+  entry. That is variant H (D4.1), kept as the alternative put to the user,
+  with the GTC route for immediate entries.
+- **Absorb the rounding excess by lowering the target.** The excess is under
+  `n × 10⁻⁶ ÷ q` shares, but `n`, the number of maker legs, is not known
+  before the match. No fixed reduction covers every `n`, and none covers
+  price improvement. Rejected: the excess is counted, and the next entry
+  trimmed (D4.3).
+- **Refuse every re-entry after a residual,** or exempt residuals from the
+  position cap. The first blocks `V2-10B`'s liveness under the reference
+  configuration; the second breaks the cap by up to 0.01 share per bracket.
+  Rejected for the trim to the headroom (D4.3, `NEW-M1`).
+- **Debit a collateral-targeted BUY at shares × price** (today's
+  `#debitOf`). It over-debits by up to the rounding excess, and halts a
+  valid fill with `RESERVATION_SHORTFALL` (`CX034-R2-03`). Rejected for the
+  per-leg spend (D4.2).
 - **Exit the planned share count.** It leaves the extra shares behind, and is
   contrary to §6 invariant 10.
 - **Clamp every exit to the held inventory.** It sizes a complement leg's
@@ -1329,8 +1695,9 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
      PENDING terminal instant, or one in seconds. It pauses every submission
      of the account until that evidence orders the pair, or a read made
      `orderingHorizonMs` after the hold halts it;
-   - **a halt at once** for pairs that venue time can never order:
-     overlapping millisecond instants;
+   - **a halt at once** for pairs that venue time can never order: equal
+     millisecond values, or an overlap with a final interval. Adjacent
+     millisecond values are ordered, under assumption A12 (D1.2);
    - **the extension** of both of the ruling's outcomes from `LIVE` to
      `DELAYED` and `UNMATCHED` (D1.1).
 
@@ -1344,16 +1711,24 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
    it is monotonic, and how a push is ordered against an answer.
    - The first authenticated observation, in a mode that permits one (the
      execution-probe phase), checks a placement's `timestamp` against its
-     `created_at` and against when its answer arrived.
-   - Until then D1 rests on A F-98, an inference. D1.7 analyses what happens
-     if it is wrong.
+     `created_at` and against when its answer arrived. It also checks A12:
+     that a fill's `MATCHED` event and its order's `UPDATE` carry consistent
+     values.
+   - Until then D1 rests on A F-98, an inference, and on A12, an assumption.
+     D1.7 analyses what happens if either is wrong.
    - `orderingHorizonMs` needs the same live-mode decision as
      `quiescenceHorizonMs`.
 3. **U-49, U-50 and U-51 (A11):** the killed FOK's answer, FAK and FOK events
    on the stream, and what the venue reports for a market order's
-   `original_size`, `size_matched` and `price`. The first execution probe
-   (`WP-350`/`WP-360`) observes them. No FAK or FOK order runs above PAPER
-   before then.
+   `original_size`, `size_matched` and `price`, and whether its trades carry
+   their maker legs. The first execution probe (`WP-350`/`WP-360`) observes
+   them. No FAK or FOK order runs above PAPER before then.
+   - **The D1 × D3 case** (`NEW-L4`). The probe also observes whether a FAK
+     or FOK emits a `PLACEMENT` frame, and its value against the remainder's
+     `CANCELLATION` and the `MATCHED` events. If equal values occur, they
+     halt under D1 (Consequences). A tie-break, "a `PLACEMENT` precedes its
+     own order's terminal transition" (Alternatives), is then put to the user
+     before FAK or FOK runs above PAPER.
 4. **A migration, before any PostgreSQL OMS store** (`CO3-N3`), for
    (`LOW-7`):
    - `execution.orders.time_in_force`, and the plan's time-in-force;
@@ -1361,7 +1736,7 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
    - D2.3's `unexecutableRemainder` and its reason, on the plan;
    - the intent-to-plan link's two quantities, requested and executable
      (`execution.intent_order_links` has one, `attributed_shares`);
-   - a fill's venue instant (D1.2) and its maker legs (D4.2), on
+   - a fill's venue instant (D1.2), its maker legs and its spend (D4.2), on
      `execution.fills`.
 
    Today `db/migrations/0005_execution.up.sql` has none of them
@@ -1380,10 +1755,31 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
    map D3.4's `ACCOUNT_STATE_UNKNOWN` incident to the explicit heartbeat stop,
    with D3.7 item 8's test, before any deadline-bounded GTC runs above PAPER.
 9. **The orchestrator confirms D4.1's conversion basis,** `min(limitPrice,
-   bestAsk)`. The round's packet said "at the limit price", which breaks the
-   share caps (D4.1). If the orchestrator keeps the limit price, D4 needs
-   another answer to `CX034-R1-02`: wider caps in the configurations, or a
-   refusal of every entry whose share bound exceeds them.
+   bestAsk)`. The round's packet said "at the limit price", which buys beyond
+   `plannedShares` on every book that asks below the limit (D4.1). If the
+   orchestrator keeps the limit price, D4 needs another answer to
+   `CX034-R1-02`: wider caps in the configurations, or variant H.
+10. **The user rules on the share caps of a collateral-targeted FAK or FOK BUY
+    entry** (`SHARE-CAP`). This ruling is a precondition of R3's D4 part.
+    - **The facts** (D4.1). The venue targets such a BUY in collateral (F-63),
+      so no share count can be signed. Three share caps are judged on
+      `plannedShares` before the conversion: `maximum_position_shares`,
+      `maximum_book_participation` and the risk engine's
+      `participation.maxOrderShares`. A fill can exceed them by a sub-grid
+      rounding excess, under `n × 10⁻⁶ ÷ q` shares, on any book; and by any
+      amount when an ask below the snapshot's best ask appears before the
+      match (a 17.00 target filled at 0.17 buys 100 shares). The money caps
+      hold on every book.
+    - **Variant P (proposed):** plan-time share caps for these orders only.
+      The excess is accepted, attributed, counted by the caps at once (the
+      next entry is trimmed or refused), alerted beyond the rounding excess,
+      and reduced by the exit. A named departure from handoff §13.2's share
+      caps.
+    - **Variant H:** hard share caps. The planner refuses such an entry
+      whenever a share cap applies (`PLAN_SHARE_CAP_UNENFORCEABLE`). An
+      immediate entry is made as a share-targeted GTC with a deadline cancel
+      instead. The reference configuration's FAK entries are then refused.
+    - Until the ruling, R3 may implement D3 only.
 
 ## Evidence
 
@@ -1402,12 +1798,17 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
     `~/pmb-rounds/`.
 - **Code, at `3294201`:**
   - `packages/oms/src/order-manager.ts:285-296, 320-323, 631-646,
-    1159-1168, 1243-1276, 2114-2181, 2217-2288, 2346-2379, 2384, 2434,
-    2905-2909, 3028-3037, 3062-3075`;
+    1159-1168, 1243-1276, 2114-2181, 2217-2288, 2307-2339, 2346-2379, 2384,
+    2434, 2905-2909, 3028-3037, 3062-3075, 3674`;
   - `packages/oms/src/reconciliation/identity.ts:28-34, 64-71`;
   - `packages/oms/src/reconciliation/coordinator.ts:679-684, 1021-1044,
-    3334-3338`, and its header's "Quiescence";
+    2172, 2313, 3334-3338`, and its header's "Quiescence";
   - `packages/oms/src/ports.ts:30-116, 343`;
+  - `packages/oms/src/restricted-mode/venue-port.ts:60-90`;
+  - `packages/oms/package.json:13` (`test:fault`); the root `package.json:18`
+    (the fault chain);
+  - `packages/inventory/src/inventory-book.ts:462-468`;
+  - `packages/risk/src/engine.ts:643-653`;
   - `packages/polymarket-secure/src/venue-client.ts:295-313, 369-383, 438-455`;
   - `packages/polymarket-secure/src/sdk-port.ts:18-39`;
   - `packages/polymarket-secure/src/rate-limit/priority.ts`;
@@ -1421,14 +1822,20 @@ reconciliation fault suites; R2 and R3 share `packages/oms/**`,
     `slice.ts:1-31`;
   - `packages/simulation/src/venue.ts:221-269`;
   - `packages/strategies/static-bracket/src/decide.ts:21-30, 437, 704-713,
-    843-847, 897, 1194-1265`, `params.ts:547`;
+    843-847, 897, 1017, 1194-1265`, `params.ts:139, 547`, `observe.ts:314-316`;
   - `packages/ledger/src/allocation.ts:65`;
-  - `apps/trader/src/live-safety/live-safety.ts:636-640`,
-    `oms-progress.ts:43-54`;
+  - `apps/trader/src/live-safety/live-safety.ts:617-622, 636-640`,
+    `fenced-venue.ts:69-72, 77-82, 143-245`, `oms-progress.ts:43-54`;
   - `test/fault-injection/live/findings.test.ts`,
     `support/expected-releases.ts`, `support/live-node.ts:683-698`,
     `support/mock-clob.ts:525-537, 733-737, 886-897`;
   - `test/fault-injection/reconciliation/support/wp280.ts:36, 81, 112`;
+  - `test/fault-injection/oms/crash-points.test.ts:148-149`,
+    `support/crash-harness.ts:125-130`;
+  - `test/fault-injection/live-safety/port-conformance.test.ts:73-80`;
+  - `test/integration/postgres/fencing-race.test.ts:373-374`;
+  - `test/e2e/support/scenario.ts:122-125, 220, 262`,
+    `support/scenarios/two-brackets.ts:69-82`;
   - `infra/compose/trader/trader.config.example.json:126-130`;
   - `db/migrations/0005_execution.up.sql` (`execution.plans.deadline_at`; no
     time-in-force column on `execution.orders`).
