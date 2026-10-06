@@ -214,11 +214,23 @@ log without being durable.
   before its record. The fragment then stays on a line of its own, and the
   record after it parses, in the same invocation or a later one. This check
   is best effort: when the file cannot be read, or its path now names another
-  file, the record is written as before.
+  file, the record is written as before. The check and the write are also
+  separate operations, so another invocation can write between them (below).
 
-Read the log line by line. A line that does not parse is such a fragment and
-records nothing done; an empty line carries nothing (two invocations writing
-to one log at the same instant may leave one).
+Read the log line by line. A line that does not parse holds a fragment, and it
+can also hold a complete record (`CX330-R5-01`, WP-330 round 5). Two
+invocations appending to one log at the same time can interleave:
+1. invocation A finds that the log ends with a newline;
+2. invocation B then leaves a fragment (a `SHORT_WRITE`);
+3. A's `ACTING` or `OUTCOME` record is written onto the fragment's line.
+
+A's record is durable all the same, and A may have acted. So a line that does
+not parse is not proof that nothing was done: read the whole line for a joined
+record. An empty line carries nothing (two invocations writing to one log at
+the same instant may leave one).
+
+Corrected 2026-10-06 (`RECORDS-W3`, `CLOSEOUT-3` L2): was 'A line that does
+not parse is such a fragment and records nothing done'.
 
 The invocation's durable `OUTCOME` record is authoritative. When there is
 none, the exit code and the printed output are.
