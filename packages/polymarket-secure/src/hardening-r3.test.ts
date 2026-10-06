@@ -13,6 +13,14 @@
  *   SDK HTTP LAYER (an in-memory responder behind the network tripwire).
  * - I-R3-1 (folded into CX-R3-01): a `RequestRejectedError` 429 with no code
  *   is UNKNOWN too.
+ *
+ * V2-5 (SDK 0.11.0 → 0.12.0). 0.12.0's `ServiceClient` INFERS a code from the
+ * `error` text when it is a snake_case identifier and the status is not 400,
+ * so the bodies below that paired a usable code with `error: "x"` would now
+ * reach the adapter WITH the inferred code `x`. Their `error` text is
+ * {@link NOT_AN_IDENTIFIER}, so each case still exercises the path its label
+ * names (the SDK dropped the code). The inferred path, for 401 and 425, is
+ * pinned at the end of this file; rule 4c is in `v2-5.test.ts`.
  */
 
 import { RequestRejectedError } from "@polymarket/client";
@@ -32,6 +40,8 @@ import {
 const LIVE_SHAPED_CONTEXT = Object.freeze({ runMode: "LIVE_MICRO", maximumRunMode: "LIVE_MICRO", allowRealOrders: true });
 const CLOB_ORIGIN = "https://clob.polymarket.com/";
 const UNDOCUMENTED = "future_undocumented_code";
+/** An `error` text the 0.12.0 SDK cannot turn into an inferred code (it is not a snake_case identifier). */
+const NOT_AN_IDENTIFIER = "Not an identifier";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -91,9 +101,9 @@ describe("CX-R3-01: a 401/425 whose code the pinned SDK dropped is effect UNKNOW
     ["a JSON body with a code and an EMPTY `error`", (status) => json(status, { error: "", code: UNDOCUMENTED })],
     ["a JSON body with a code and a NULL `error`", (status) => json(status, { error: null, code: UNDOCUMENTED })],
     ["a JSON body with a code and a FALSE `error`", (status) => json(status, { error: false, code: UNDOCUMENTED })],
-    ["a JSON body with a truthy `error` and a NUMERIC code", (status) => json(status, { error: "x", code: 7 })],
-    ["a JSON body with a truthy `error` and an EMPTY code", (status) => json(status, { error: "x", code: "" })],
-    ["a JSON body with only an `error`", (status) => json(status, { error: "x" })],
+    ["a JSON body with a truthy `error` and a NUMERIC code", (status) => json(status, { error: NOT_AN_IDENTIFIER, code: 7 })],
+    ["a JSON body with a truthy `error` and an EMPTY code", (status) => json(status, { error: NOT_AN_IDENTIFIER, code: "" })],
+    ["a JSON body with only an `error`", (status) => json(status, { error: NOT_AN_IDENTIFIER })],
     ["a text/plain body", (status) => ({ status, contentType: "text/plain", body: `{"code":"${UNDOCUMENTED}"}` })],
     ["no body at all", (status) => ({ status })],
   ];
@@ -181,6 +191,30 @@ describe("I-R3-1: a RequestRejectedError 429 with no code is UNKNOWN (the pinned
       kind: "RATE_LIMITED",
       effect: "UNKNOWN",
       source: "RequestRejectedError",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("V2-5: a 401/425 whose `error` text the 0.12.0 SDK turns into an inferred code is UNKNOWN, and the code is only flagged", () => {
+  describe.each([401, 425])("status %i", (status) => {
+    it.each([
+      ["only an identifier `error`", { error: "x" }],
+      ["an identifier `error` and a NUMERIC code", { error: "x", code: 7 }],
+      ["an identifier `error` and an EMPTY code", { error: "x", code: "" }],
+    ])("%s → the SDK keeps code `x`; placement and cancel UNKNOWN", async (_label, body) => {
+      const sdkError = await sdkErrorFor(json(status, body));
+      expect((sdkError as RequestRejectedError).code).toBe("x");
+      expect(mapVenueError(sdkError, "POST_ORDER").toData()).toMatchObject({
+        kind: KIND_BY_STATUS[status],
+        effect: "UNKNOWN",
+        venueCode: null,
+        undocumentedVenueCode: true,
+      });
+      const { placed, cancelled } = await outcomesFor(sdkError);
+      expect(placed).toMatchObject({ kind: "UNKNOWN", reason: "ERROR", error: { kind: KIND_BY_STATUS[status], effect: "UNKNOWN" } });
+      expect(cancelled).toMatchObject({ kind: "UNKNOWN", error: { kind: KIND_BY_STATUS[status], effect: "UNKNOWN" } });
     });
   });
 });

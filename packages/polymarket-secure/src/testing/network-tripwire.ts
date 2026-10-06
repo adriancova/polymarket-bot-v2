@@ -23,7 +23,11 @@
  *
  * A test that needs the SDK to see an HTTP RESPONSE (the contract tests)
  * installs a `responder` for `fetch`: it answers from in-memory fixtures and
- * is still recorded; it never delegates to the real `fetch`.
+ * is still recorded; it never delegates to the real `fetch`. A responder may
+ * answer with a promise (V2-5: a promise that never settles is how the
+ * transport's timeout is exercised), or THROW to stand for a network failure
+ * (V2-5: how the transport's retries are exercised); a throw is recorded as
+ * answered and re-thrown as the `fetch` rejection.
  */
 
 import dgram from "node:dgram";
@@ -49,13 +53,37 @@ export interface NetworkTripwire {
   uninstall(): void;
 }
 
-export type FetchResponder = (url: string, init: RequestInit | undefined) => Response | undefined;
+/**
+ * Answers one `fetch` from memory. `method` is the request's HTTP method (the
+ * SDK's `ky` passes a `Request` object, whose method is not in `init`).
+ * `undefined` refuses the request.
+ */
+export type FetchResponder = (url: string, init: RequestInit | undefined, method: string) => Response | Promise<Response> | undefined;
+
+function describeMethod(input: unknown, init: RequestInit | undefined): string {
+  if (typeof Request !== "undefined" && input instanceof Request) return input.method;
+  return typeof init?.method === "string" ? init.method.toUpperCase() : "GET";
+}
 
 function describeTarget(input: unknown): string {
   if (typeof input === "string") return input;
   if (input instanceof URL) return input.href;
   if (typeof Request !== "undefined" && input instanceof Request) return input.url;
   return "[unrecognised fetch input]";
+}
+
+/** Every `fetch` replacement this module has installed (V2-5: {@link isNetworkTripwireInstalled}). */
+const TRIPPED_FETCHES = new WeakSet<object>();
+
+/**
+ * True when the CURRENT `globalThis.fetch` is a tripwire's replacement, that
+ * is, a tripwire is installed and not uninstalled. The hooks that run the
+ * real SDK code (`./sdk-contract.ts`) refuse to run otherwise (V2-5), so a
+ * test that forgot the tripwire fails instead of reaching the venue.
+ */
+export function isNetworkTripwireInstalled(): boolean {
+  const current: unknown = globalThis.fetch;
+  return typeof current === "function" && TRIPPED_FETCHES.has(current);
 }
 
 /** A DNS function name the tripwire refuses (every query-making function). */
@@ -103,7 +131,15 @@ export function installNetworkTripwire(options: { readonly responder?: FetchResp
 
   const trippedFetch = async (input: unknown, init?: RequestInit): Promise<Response> => {
     const target = describeTarget(input);
-    const response = options.responder?.(target, init);
+    let response: Response | Promise<Response> | undefined;
+    try {
+      response = options.responder?.(target, init, describeMethod(input, init));
+    } catch (failure) {
+      // The responder stands for a network failure: answered from memory,
+      // never delegated, and surfaced as the fetch rejection.
+      answered.push({ via: "fetch", target });
+      throw failure;
+    }
     if (response !== undefined) {
       answered.push({ via: "fetch", target });
       return response;
@@ -111,6 +147,7 @@ export function installNetworkTripwire(options: { readonly responder?: FetchResp
     refused.push({ via: "fetch", target });
     throw new NetworkTripwireError(`network tripwire: fetch(${target}) refused`);
   };
+  TRIPPED_FETCHES.add(trippedFetch);
   globalThis.fetch = trippedFetch as typeof fetch;
 
   class TrippedWebSocket {

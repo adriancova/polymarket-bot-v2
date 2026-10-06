@@ -66,7 +66,8 @@ const ADDRESS = /^0x[0-9a-fA-F]{40}$/u;
 const HEX = /^0x[0-9a-fA-F]*$/u;
 const NON_EMPTY_HEX = /^0x[0-9a-fA-F]+$/u;
 const UNSIGNED_INTEGER = /^(?:0|[1-9][0-9]{0,77})$/u;
-const TOKEN_ID = /^(?:0|[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
+/** A decimal token or position id; the `0x…` hex branch was removed by V2-5 (plan row C6; U-13 resolved: "a V2 id is a decimal string"). */
+const TOKEN_ID = /^(?:0|[1-9][0-9]{0,77})$/u;
 const ORDER_TYPES = new Set(["GTC", "GTD", "FOK", "FAK"]);
 const SIDES = new Set(["BUY", "SELL"]);
 const SIGNATURE_TYPES = new Set([0, 1, 2, 3]);

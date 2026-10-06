@@ -101,8 +101,11 @@ export function redactForLog(value: unknown): unknown {
 
 /**
  * The error names {@link redactForLog} keeps: the standard ECMAScript error
- * classes, this package's own, and the pinned SDK's. A name is free text an
- * error's creator chooses, so only these fixed values are carried.
+ * classes, this package's own, and the pinned SDK's (every class in its
+ * `errors.ts`; `PaginationLimitError`, `OperationAbortedError` and
+ * `PerpsCancelRetryError` are new in 0.12.0, re-verified by V2-5). A name is
+ * free text an error's creator chooses, so only these fixed values are
+ * carried.
  */
 export const LOGGABLE_ERROR_NAMES: ReadonlySet<string> = new Set([
   "Error",
@@ -128,6 +131,9 @@ export const LOGGABLE_ERROR_NAMES: ReadonlySet<string> = new Set([
   "InsufficientLiquidityError",
   "AutoCancelDailyLimitError",
   "SigningError",
+  "PaginationLimitError",
+  "OperationAbortedError",
+  "PerpsCancelRetryError",
 ]);
 
 const MAX_ENTRIES = 10_000;

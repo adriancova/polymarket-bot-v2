@@ -53,7 +53,11 @@ import { unsealSigner, type SignerHandle, type SignerProvenance } from "./signer
 
 /** A limit order to sign locally. Price and size are exact decimal strings (ADR-001). */
 export interface LimitOrderRequest {
-  /** CTF token id (decimal) or Polymarket V2 position id. */
+  /**
+   * CTF token id or Polymarket V2 position id, as a DECIMAL string (venue
+   * report 2026-10-05 F-39: "Keep the selected ID as a decimal string"; U-13
+   * resolved). A `0x…` hex id is refused (`NOT_SENT`, plan row C6).
+   */
   readonly assetId: string;
   readonly side: "BUY" | "SELL";
   /** Exact decimal string strictly between 0 and 1, e.g. `"0.52"`. Never a `number`. */
@@ -112,11 +116,19 @@ export interface SecureVenueClient {
   /**
    * Create and sign an order LOCALLY. The ORDER is never transmitted here
    * (ADR-007 §2 step 2), but the pinned SDK's `prepareLimitOrder` does make
-   * PUBLIC, unauthenticated reads to build it (market metadata and tick size,
-   * `actions/orders/cache.ts`), so a `FAILED` outcome can carry an
-   * HTTP-derived kind (a transport failure, a 429). Whatever its kind or
-   * effect, a `FAILED` sign outcome means NO ORDER EXISTS: nothing was signed
-   * that the caller can hold, so nothing can have been posted.
+   * PUBLIC, unauthenticated reads to build it (`actions/orders/cache.ts`:
+   * `GET /markets-by-token/{id}`, cached for the SDK client's life, and
+   * `GET /clob-markets/{condition}`, cached for 10 minutes, lines 16-17; a
+   * price off the cached tick grid forces one fresh read), so a `FAILED`
+   * outcome can carry an HTTP-derived kind (a transport failure, a 429).
+   * Whatever its kind or effect, a `FAILED` sign outcome means NO ORDER
+   * EXISTS: nothing was signed that the caller can hold, so nothing can have
+   * been posted.
+   *
+   * The SDK chooses the signing domain from the id's reserved bits, not from
+   * Gamma `version` (venue report 2026-10-05 F-47): ExchangeV3 and domain
+   * version `"3"` for a V2-shaped id, the CTF or Neg Risk exchange and `"2"`
+   * otherwise.
    *
    * The SDK's signed order is checked against the request (token, side,
    * post-only, expiration and order type, and amounts within the pinned
@@ -153,7 +165,13 @@ type PrepareLimitOrderRequest = Parameters<SdkSecureClientPort["createLimitOrder
 const DECIMAL = /^(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,30})?$/u;
 /** A price strictly between 0 and 1 (a probability price; venue report §2.3). */
 const UNIT_PRICE = /^0\.[0-9]{1,30}$/u;
-const ASSET_ID = /^(?:[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
+/**
+ * A CTF token id or a Polymarket V2 position id: a canonical DECIMAL string
+ * (a uint256 has at most 78 digits). V2-5 (plan row C6) removed the `0x…` hex
+ * branch: U-13 is resolved, "a V2 id is a decimal string" (venue report
+ * 2026-10-05 F-39, F-44; S-D02 lines 27, 34; S-D11 line 126).
+ */
+const ASSET_ID = /^[1-9][0-9]{0,77}$/u;
 const ORDER_ID = /^[A-Za-z0-9_\-:.]{1,200}$/u;
 const CONDITION_ID = /^0x[0-9a-fA-F]{64}$/u;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/u;
@@ -280,10 +298,14 @@ function toSdkLimitOrder(order: ValidatedLimitOrder): PrepareLimitOrderRequest {
 /** Base units per share and per pUSD/USDC unit: both have 6 decimals. */
 const BASE_UNITS = 1_000_000n;
 /**
- * The pinned SDK's limit-order rounding (`@polymarket/client@0.11.0`, its
- * tick-size table): the share amount is rounded DOWN to 2 decimals (10^4 base
- * units) for every tick size, and the quote amount is rounded DOWN to at
- * least 3 decimals (10^3 base units, tick 0.1; finer ticks round finer).
+ * The pinned SDK's limit-order rounding (`@polymarket/client@0.12.0`,
+ * `resolveRoundingConfig` in `actions/orders/context.ts` lines 14-31 and
+ * `computeLimitOrderAmounts` in `actions/orders/amounts.ts` lines 34-71; both
+ * unchanged from 0.11.0, re-pinned by V2-5 against the real SDK in
+ * `test/contract/polymarket-secure/sdk-0-12.test.ts`): the share amount is
+ * rounded DOWN to 2 decimals (10^4 base units) for every tick size, and the
+ * quote amount is rounded DOWN to 3 (tick 0.1), 4 (0.01), 5 (0.005, 0.001) or
+ * 6 (0.0025, 0.0001) decimals, so at most 10^3 base units.
  * A signed order is accepted only within these bounds; a change in the SDK's
  * rounding therefore fails closed (`FAILED`), never open.
  */
@@ -313,7 +335,8 @@ const SIGNATURE_TYPE_POLY_1271 = 3;
 /**
  * Is the signed order's maker/signer/signature type the one the pinned SDK
  * derives from the client's account? From `@polymarket/client@0.11.0`
- * (`Tr` / `Ee` in its bundle): `signatureType` is the account's `walletType`
+ * (`Tr` / `Ee` in its bundle), unchanged in 0.12.0 (`wallet.ts` is not in
+ * the 0.11.0 → 0.12.0 release diff): `signatureType` is the account's `walletType`
  * (EOA 0, POLY_PROXY 1, GNOSIS_SAFE 2, DEPOSIT_WALLET 3 map to signature
  * types 0, 1, 2, 3); `maker` is the account's `wallet`; `signer` is the
  * `wallet` for signature type 3 (POLY_1271) and the account's `signer`

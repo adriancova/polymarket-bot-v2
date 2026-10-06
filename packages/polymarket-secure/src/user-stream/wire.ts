@@ -43,8 +43,16 @@ import {
 const VENUE_NUMERAL = /^([0-9]{1,40})(?:\.([0-9]{1,40}))?$/u;
 const SAFE_ID = /^[A-Za-z0-9_\-:.]{1,200}$/u;
 const CONDITION_ID = /^0x(?:[0-9a-fA-F]{62}|[0-9a-fA-F]{64})$/u;
-/** A CTF token id (decimal) or a Polymarket V2 position id (hex); the same grammar as `venue-client.ts`. */
-const ASSET_ID = /^(?:[1-9][0-9]{0,77}|0x[0-9a-fA-F]{1,64})$/u;
+/**
+ * A CTF token id or a Polymarket V2 position id, both DECIMAL strings; the
+ * same grammar as `venue-client.ts`. V2-5 removed the `0x…` hex branch (plan
+ * row C6; U-13 resolved, venue report 2026-10-05 F-39 and F-44). That the
+ * user channel's `asset_id` is that same decimal id is an inference from F-60
+ * ("Use the same asset ID for prices, orders, and market subscriptions"). A
+ * hex `asset_id` is refused, so its event is malformed and requests
+ * reconciliation (fail closed).
+ */
+const ASSET_ID = /^[1-9][0-9]{0,77}$/u;
 const DIGITS = /^[0-9]{1,16}$/u;
 /**
  * CLIENT CHOICE, not a venue fact: the plausible window for a venue instant,

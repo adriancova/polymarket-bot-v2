@@ -1,7 +1,8 @@
 /**
  * Contract: sanitized venue order-response fixtures → the PINNED SDK's own
- * response parser (`@polymarket/client@0.11.0` → `@polymarket/bindings`
- * `OrderResponseSchema`) → the secure client's placement outcome.
+ * response parser (`@polymarket/client@0.12.0` since V2-5 → `@polymarket/bindings`
+ * `OrderResponseSchema`; `clob/order-response.ts` is unchanged from 0.11.0)
+ * → the secure client's placement outcome.
  *
  * Fixture: `test/fixtures/venue/orders/order-responses.json` (docs
  * `trading/place-orders`, retrieved 2026-08-24; venue report 2026-09-30 §2.2
