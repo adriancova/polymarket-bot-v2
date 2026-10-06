@@ -47,8 +47,6 @@
  *   module adds one, and `SimulatedFill` has no field to put one in.
  */
 
-import { compareDecimal } from "@polymarket-bot/decimal";
-
 import { addMilliseconds } from "./clock.js";
 import { computeFee, readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import {
@@ -133,8 +131,18 @@ export interface Tier1ImmediateOutcome {
   readonly tokenId: string | null;
   readonly fills: readonly SimulatedFill[];
   readonly filledShares: string;
+  /**
+   * The walk's {@link DepthConsumption.remainingShares} — `"0"` for a
+   * collateral target (V2-10), whose remainder is the consumption's
+   * `remainingCollateral` — except when nothing executed at all (a GTD past
+   * its expiry, a FOK that could not fill whole), when it is the order's whole
+   * planned size.
+   */
   readonly remainingShares: string;
-  /** What happened to the size that did not fill. */
+  /**
+   * What happened to the size that did not fill. V2-10: decided by the walk's
+   * `complete`, so a remainder F-63's floor leaves is `"NONE"`, never `RESTS`.
+   */
   readonly remainderDisposition:
     | "RESTS"
     | "CANCELLED_BY_FAK"
@@ -170,6 +178,14 @@ export function tier1Immediate(input: {
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
   readonly shares: string;
+  /**
+   * V2-10 (F-63: "FOK/FAK BUY targets are collateral"): when present, a FOK or
+   * FAK BUY spends up to this much pUSD before fees and its shares follow
+   * from the fills; `shares` is the planned size it was converted from
+   * (`collateralTargetAtLimitPrice`). Refused on any other order: a GTC/GTD
+   * BUY targets shares, and so does every SELL.
+   */
+  readonly collateralTarget?: string;
   readonly timeInForce: TimeInForce;
   readonly postOnly: boolean;
   readonly submittedAtNs: bigint;
@@ -192,6 +208,7 @@ function tier1ImmediateInner(input: {
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
   readonly shares: string;
+  readonly collateralTarget?: string;
   readonly timeInForce: TimeInForce;
   readonly postOnly: boolean;
   readonly submittedAtNs: bigint;
@@ -239,6 +256,16 @@ function tier1ImmediateInner(input: {
       "a GTD order must state its expiration",
     );
   }
+  if (
+    input.collateralTarget !== undefined &&
+    (input.action !== "BUY" || (input.timeInForce !== "FAK" && input.timeInForce !== "FOK"))
+  ) {
+    return simulationFailure(
+      "SIMULATED_VENUE_PLAN_UNSUPPORTED",
+      "only a FOK or FAK BUY targets collateral (F-63: \"CLOB GTC/GTD BUY targets are shares; FOK/FAK BUY targets are collateral\"); every other order targets shares",
+      { action: describeForRefusal(input.action), timeInForce: describeForRefusal(input.timeInForce) },
+    );
+  }
 
   // The latency model is READ here, on the execution path, not merely offered.
   // `sampleLatencyMs` falls back to `?? 0` on a distribution with nothing to
@@ -282,6 +309,7 @@ function tier1ImmediateInner(input: {
           matchableAtNs,
           delayedByMarket,
           shares: input.shares,
+          collateralTarget: input.collateralTarget,
           disposition: "EXPIRED_BEFORE_MATCHING",
           tokenId: null,
           atEvent: null,
@@ -304,18 +332,27 @@ function tier1ImmediateInner(input: {
   }
 
   const ladder = observed.book.ladder(input.action === "BUY" ? "ASK" : "BID");
-  const consumed = consumeDepth({
-    ladder,
-    action: input.action,
-    limitPrice: input.limitPrice,
-    shares: input.shares,
-  });
+  const consumed =
+    input.collateralTarget === undefined
+      ? consumeDepth({
+          ladder,
+          action: input.action,
+          limitPrice: input.limitPrice,
+          shares: input.shares,
+        })
+      : consumeDepth({
+          ladder,
+          action: input.action,
+          limitPrice: input.limitPrice,
+          collateral: input.collateralTarget,
+        });
   if (!consumed.ok) return consumed;
   const consumption = consumed.value;
 
   // FOK is all-or-nothing (venue report §2.3): a partial fill is not a legal
-  // outcome, so nothing is booked at all.
-  if (input.timeInForce === "FOK" && compareDecimal(consumption.remainingShares, "0") > 0) {
+  // outcome, so nothing is booked at all. V2-10: "partial" is the walk's own
+  // `complete` — the limit or the ladder ended it before its target did.
+  if (input.timeInForce === "FOK" && !consumption.complete) {
     return simulationOk(
       emptyOutcome({
         model,
@@ -325,6 +362,7 @@ function tier1ImmediateInner(input: {
         matchableAtNs,
         delayedByMarket,
         shares: input.shares,
+        collateralTarget: input.collateralTarget,
         disposition: "REJECTED_BY_FOK",
         tokenId: observed.book.tokenId,
         atEvent: observed.atEvent,
@@ -354,6 +392,7 @@ function tier1ImmediateInner(input: {
         action: input.action,
         price: level.price,
         shares: level.shares,
+        collateralAmount: level.collateral,
         feeAmount: fee.value.feeAmount,
         liquidityRole: "TAKER",
         model,
@@ -362,8 +401,7 @@ function tier1ImmediateInner(input: {
     );
   }
 
-  const hasRemainder = compareDecimal(consumption.remainingShares, "0") > 0;
-  const remainderDisposition: Tier1ImmediateOutcome["remainderDisposition"] = !hasRemainder
+  const remainderDisposition: Tier1ImmediateOutcome["remainderDisposition"] = consumption.complete
     ? "NONE"
     : input.timeInForce === "FAK"
       ? "CANCELLED_BY_FAK"
@@ -396,6 +434,7 @@ function emptyOutcome(input: {
   readonly matchableAtNs: bigint;
   readonly delayedByMarket: boolean;
   readonly shares: string;
+  readonly collateralTarget: string | undefined;
   readonly disposition: Tier1ImmediateOutcome["remainderDisposition"];
   readonly tokenId: string | null;
   readonly atEvent: RecordedEventIdentity | null;
@@ -414,10 +453,15 @@ function emptyOutcome(input: {
     remainderDisposition: input.disposition,
     consumption: {
       matched: [],
+      target: input.collateralTarget === undefined ? "SHARES" : "COLLATERAL",
       filledShares: "0",
-      remainingShares: input.shares,
+      remainingShares: input.collateralTarget === undefined ? input.shares : "0",
       notional: "0",
+      collateral: "0",
+      collateralTarget: input.collateralTarget ?? null,
+      remainingCollateral: input.collateralTarget ?? null,
       stoppedAtLimit: false,
+      complete: false,
     },
     atEvent: input.atEvent,
   });

@@ -299,7 +299,13 @@ export const REPLAY_PATH_ECONOMICS_KEYS: readonly string[] = Object.freeze([
  */
 export interface ReplayPathEconomics {
   readonly basis: "REALIZED_IN_REPLAY_PATH";
+  /**
+   * `Σ collateralAmount` over the BUY fills: the pUSD they paid before fees.
+   * V2-10: each fill's F-63 collateral leg, in whole base units, which is
+   * `price × shares` exactly whenever that is a whole number of base units.
+   */
   readonly buyNotional: string;
+  /** `Σ collateralAmount` over the SELL fills: the pUSD they received before fees. */
   readonly sellNotional: string;
   readonly fees: string;
   /** `sellNotional − buyNotional − fees`, exactly. */
@@ -358,6 +364,7 @@ function replayPathEconomicsInner(
     if (
       !isCanonicalDecimalString(fill.price) ||
       !isCanonicalDecimalString(fill.shares) ||
+      !isCanonicalDecimalString(fill.collateralAmount) ||
       !isCanonicalDecimalString(fill.feeAmount)
     ) {
       return simulationFailure(
@@ -367,6 +374,7 @@ function replayPathEconomicsInner(
           index,
           price: String(fill.price),
           shares: String(fill.shares),
+          collateralAmount: String(fill.collateralAmount),
           feeAmount: String(fill.feeAmount),
         },
       );
@@ -377,7 +385,9 @@ function replayPathEconomicsInner(
         offered: String(fill.action),
       });
     }
-    const notional = mulDecimal(fill.price, fill.shares);
+    // V2-10 (F-63): the cash leg the fill moved, never re-derived from
+    // `price × shares`; fees are folded separately, below.
+    const notional = fill.collateralAmount;
     if (fill.action === "BUY") {
       buyNotional = addDecimal(buyNotional, notional);
       sharesBought = addDecimal(sharesBought, fill.shares);

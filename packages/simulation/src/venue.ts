@@ -70,7 +70,11 @@
  * What the immediate path leaves (SIM-1): FILLED when nothing remains; a FAK
  * remainder CANCELLED, keeping what filled (O1); a FOK that cannot fill whole
  * REJECTED with nothing filled, under both tiers (O2); a GTC or GTD remainder
- * REGISTERED to rest at its limit, whatever the planned style (O3). On a
+ * REGISTERED to rest at its limit, whatever the planned style (O3). V2-10:
+ * "nothing remains" is the walk's `complete` (its target, not the limit or the
+ * ladder, ended it), every fill's cash leg is its F-63 `collateralAmount`, and
+ * a FOK/FAK BUY targets pUSD when the root states `fokFakBuyTarget:
+ * "COLLATERAL_AT_LIMIT_PRICE"` (README §5 items 18 and 19). On a
  * delayed market the order is DELAYED — nothing filled — until the recorded
  * clock reaches `matchableAtNs`, when that same disposition applies (O5). So
  * every order this venue holds is TERMINAL or can still change: RESTING and
@@ -85,8 +89,9 @@
  * a Tier-1 result quoted as a single number has already violated the ADR.
  */
 
-import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
+import { addDecimal, compareDecimal, isCanonicalDecimalString, subDecimal } from "@polymarket-bot/decimal";
 
+import { collateralTargetAtLimitPrice } from "./base-units.js";
 import { addMilliseconds } from "./clock.js";
 import { readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import { sizeAtPrice, type FillModelIdentity, type SimulatedFill } from "./fill-model.js";
@@ -210,6 +215,19 @@ export interface SimulatedVenueOptions {
   /** Required for a Tier-1 venue that rests orders (§12.2 resting scenarios). */
   readonly queueParameters?: QueueModelParameters;
   /**
+   * V2-10: what a FOK or FAK BUY's size targets ({@link FokFakBuyTarget}).
+   *
+   * OPTIONAL, and its absence is {@link DEFAULT_FOK_FAK_BUY_TARGET} —
+   * `"SHARES_UNDOCUMENTED"`, this venue's behaviour before V2-10 — for one
+   * reason, stated rather than hidden: every composition root and golden
+   * outside this package was built on it, and adopting the documented target
+   * moves their fills (the V2-10 handoff names each). A root that adopts it
+   * states `"COLLATERAL_AT_LIMIT_PRICE"`. Any other value makes the
+   * constructor THROW a `RangeError`, as a bad retention bound does: a
+   * composition-root mistake, refused before the venue answers anything.
+   */
+  readonly fokFakBuyTarget?: FokFakBuyTarget;
+  /**
    * SIM-2: the bounds of the venue's HISTORY. Each is optional and defaults to
    * {@link DEFAULT_VENUE_RETENTION}; a supplied bound must be a positive safe
    * integer, and the constructor THROWS a `RangeError` naming it otherwise — a
@@ -217,6 +235,38 @@ export interface SimulatedVenueOptions {
    */
   readonly retention?: VenueRetentionBounds;
 }
+
+/**
+ * V2-10: what a FOK or FAK BUY's planned size targets.
+ *
+ * F-63 (`docs/venue/verified-2026-10-05.md`): "CLOB GTC/GTD BUY targets are
+ * shares; FOK/FAK BUY targets are collateral." A planned order's size is in
+ * SHARES (WP-190), so a collateral target needs ONE conversion, and it is made
+ * once, at submission, before anything is booked:
+ *
+ * - `"COLLATERAL_AT_LIMIT_PRICE"` — the documented venue behaviour. A FOK or
+ *   FAK BUY's target is `collateralTargetAtLimitPrice(shares, limitPrice)`:
+ *   the planned shares times the order's LIMIT price, floored to whole base
+ *   units (F-73). The order spends up to that pUSD before fees, and its shares
+ *   follow from the fills — MORE than planned when it takes asks below its
+ *   limit. Its order record carries the target as `collateralTarget`, so the
+ *   conversion is never silent. A GTC/GTD BUY and every SELL still target
+ *   shares.
+ * - `"SHARES_UNDOCUMENTED"` — this venue before V2-10: every order type
+ *   targets its planned shares. NOT what the venue documents for FOK/FAK BUYs;
+ *   kept, and the default, only until the composition roots outside this
+ *   package adopt the documented target (see {@link SimulatedVenueOptions.fokFakBuyTarget}).
+ */
+export type FokFakBuyTarget = "COLLATERAL_AT_LIMIT_PRICE" | "SHARES_UNDOCUMENTED";
+
+/** Every {@link FokFakBuyTarget}, in a closed list a root's value is checked against. */
+export const FOK_FAK_BUY_TARGETS: readonly FokFakBuyTarget[] = Object.freeze([
+  "COLLATERAL_AT_LIMIT_PRICE",
+  "SHARES_UNDOCUMENTED",
+]);
+
+/** What an absent {@link SimulatedVenueOptions.fokFakBuyTarget} means: the pre-V2-10 behaviour. */
+export const DEFAULT_FOK_FAK_BUY_TARGET: FokFakBuyTarget = "SHARES_UNDOCUMENTED";
 
 /** SIM-2: the history bounds a composition root may override. */
 export interface VenueRetentionBounds {
@@ -385,6 +435,12 @@ interface PreflightedOrder {
   readonly planned: PlannedOrderView;
   readonly timeInForce: TimeInForce;
   readonly statedExpiryNs: bigint | undefined;
+  /**
+   * V2-10: the pUSD a FOK/FAK BUY targets under `"COLLATERAL_AT_LIMIT_PRICE"`,
+   * converted once, at pre-flight; `undefined` for every order that targets
+   * shares.
+   */
+  readonly collateralTarget: string | undefined;
 }
 
 /** A resting registration, staged: it reaches `#resting` / `#bands` only at commit. */
@@ -587,10 +643,19 @@ export class SimulatedVenue implements ExecutionVenue {
   readonly #unapplied: UnappliedDisposition[] = [];
   #cash: string;
   #atEvent: RecordedEventIdentity | undefined;
+  /** V2-10: what this venue's FOK/FAK BUYs target, read once at construction. */
+  readonly #fokFakBuyTarget: FokFakBuyTarget;
 
   constructor(options: SimulatedVenueOptions) {
     this.#options = options;
     this.#cash = options.startingCash;
+    const fokFakBuyTarget: unknown = options.fokFakBuyTarget ?? DEFAULT_FOK_FAK_BUY_TARGET;
+    if (fokFakBuyTarget !== "COLLATERAL_AT_LIMIT_PRICE" && fokFakBuyTarget !== "SHARES_UNDOCUMENTED") {
+      throw new RangeError(
+        `fokFakBuyTarget must be one of ${FOK_FAK_BUY_TARGETS.join(", ")} (V2-10, F-63); offered ${describeForRefusal(fokFakBuyTarget)}`,
+      );
+    }
+    this.#fokFakBuyTarget = fokFakBuyTarget;
     // The options bag is a call-site literal; each bound is read ONCE.
     const bounds: VenueRetentionBounds = options.retention ?? {};
     const ordersBound = bounds.orders ?? DEFAULT_VENUE_RETENTION.orders;
@@ -1460,11 +1525,25 @@ export class SimulatedVenue implements ExecutionVenue {
         if ("refusal" in policy.value) {
           return { ok: false, failedAt: plannedOrderId, refusal: policy.value.refusal };
         }
+        // V2-10 (F-63): a FOK/FAK BUY's ONE conversion to its collateral
+        // target, made here so a target that cannot be formed fails the plan's
+        // pre-flight with nothing booked (R3 rule a).
+        let collateralTarget: string | undefined;
+        if (
+          this.#fokFakBuyTarget === "COLLATERAL_AT_LIMIT_PRICE" &&
+          planned.action === "BUY" &&
+          (policy.value.timeInForce === "FAK" || policy.value.timeInForce === "FOK")
+        ) {
+          const converted = collateralTargetAtLimitPrice(planned.shares, planned.limitPrice);
+          if (!converted.ok) return { ok: false, failedAt: plannedOrderId, refusal: converted.refusal };
+          collateralTarget = converted.value;
+        }
         entries.push({
           marketId: group.marketId,
           planned,
           timeInForce: policy.value.timeInForce,
           statedExpiryNs: policy.value.statedExpiryNs,
+          collateralTarget,
         });
       }
     }
@@ -1538,7 +1617,7 @@ export class SimulatedVenue implements ExecutionVenue {
     atEvent: RecordedEventIdentity,
     feeSnapshot: FeeScheduleSnapshot,
   ): SimulationResult<StagedOrder> {
-    const { planned, marketId, timeInForce, statedExpiryNs } = entry;
+    const { planned, marketId, timeInForce, statedExpiryNs, collateralTarget } = entry;
     const books = this.#options.books;
     if (books === undefined) {
       return simulationFailure(
@@ -1604,14 +1683,20 @@ export class SimulatedVenue implements ExecutionVenue {
       action: planned.action,
       limitPrice: planned.limitPrice,
       shares: planned.shares,
+      ...(collateralTarget === undefined ? {} : { collateralTarget }),
       feeSnapshot,
       atEvent,
     });
     if (!outcome.ok) return outcome;
-    const { fills, filledShares, remainingShares } = outcome.value;
-    if (compareDecimal(remainingShares, "0") === 0) {
+    const { fills, filledShares, remainingShares, complete } = outcome.value;
+    // V2-10: FILLED when the walk's TARGET ended it (`DepthConsumption.complete`)
+    // — for a share target that is "nothing remains" whenever the sizes are
+    // whole base units at the price, and a remainder F-63's floor leaves is
+    // the formula's, not liquidity's; a collateral target has no share
+    // remainder at all.
+    if (complete) {
       return simulationOk(
-        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills, filledShares, state: "FILLED", atEvent }),
+        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills, filledShares, state: "FILLED", atEvent, collateralTarget }),
       );
     }
     if (timeInForce === "FOK") {
@@ -1621,7 +1706,7 @@ export class SimulatedVenue implements ExecutionVenue {
       // no fill, no cash, no position, and the order is REJECTED with nothing
       // filled.
       return simulationOk(
-        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills: [], filledShares: "0", state: "REJECTED", atEvent }),
+        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills: [], filledShares: "0", state: "REJECTED", atEvent, collateralTarget }),
       );
     }
     if (timeInForce === "FAK") {
@@ -1630,7 +1715,7 @@ export class SimulatedVenue implements ExecutionVenue {
       // TERMINAL — CANCELLED — and keeps the size it did fill. It used to be
       // left PARTIALLY_FILLED, which nothing ever moved again.
       return simulationOk(
-        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills, filledShares, state: "CANCELLED", atEvent }),
+        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills, filledShares, state: "CANCELLED", atEvent, collateralTarget }),
       );
     }
     // O3 (`TERM-B`). A GTC or GTD remainder "remains active until it fills or
@@ -1667,7 +1752,7 @@ export class SimulatedVenue implements ExecutionVenue {
     atEvent: RecordedEventIdentity,
     feeSnapshot: FeeScheduleSnapshot,
   ): SimulationResult<StagedOrder> {
-    const { planned, marketId, timeInForce, statedExpiryNs } = entry;
+    const { planned, marketId, timeInForce, statedExpiryNs, collateralTarget } = entry;
     const timeline = this.#options.timeline;
     const latencyModel = this.#options.latencyModel;
     const streams = this.#options.streams;
@@ -1766,6 +1851,7 @@ export class SimulatedVenue implements ExecutionVenue {
       action: planned.action,
       limitPrice: planned.limitPrice,
       shares: planned.shares,
+      ...(collateralTarget === undefined ? {} : { collateralTarget }),
       timeInForce,
       postOnly: planned.postOnly,
       submittedAtNs: this.#options.clock.monotonicNs(),
@@ -1863,6 +1949,7 @@ export class SimulatedVenue implements ExecutionVenue {
               filledShares: outcome.value.filledShares,
               state: settled.state,
               atEvent: executedAt,
+              collateralTarget,
             }),
       );
     }
@@ -1885,6 +1972,7 @@ export class SimulatedVenue implements ExecutionVenue {
       state: "DELAYED",
       fillEstimateKind: "POINT",
       atEvent,
+      collateralTarget,
     });
     return simulationOk({
       order: delayed,
@@ -1911,6 +1999,7 @@ export class SimulatedVenue implements ExecutionVenue {
     readonly state: SimulatedOrder["state"];
     readonly fillEstimateKind: SimulatedOrder["fillEstimateKind"];
     readonly atEvent: RecordedEventIdentity;
+    readonly collateralTarget?: string | undefined;
   }): SimulatedOrder {
     return ownFrozenTree<SimulatedOrder>({
       simulatedOrderId: input.planned.plannedOrderId,
@@ -1928,6 +2017,7 @@ export class SimulatedVenue implements ExecutionVenue {
       executionStyle: input.planned.executionStyle,
       fillEstimateKind: input.fillEstimateKind,
       atEvent: input.atEvent,
+      ...(input.collateralTarget === undefined ? {} : { collateralTarget: input.collateralTarget }),
     });
   }
 
@@ -1946,6 +2036,7 @@ export class SimulatedVenue implements ExecutionVenue {
     readonly filledShares: string;
     readonly state: "FILLED" | "CANCELLED" | "REJECTED" | "EXPIRED";
     readonly atEvent: RecordedEventIdentity;
+    readonly collateralTarget?: string | undefined;
   }): StagedOrder {
     return {
       order: this.#orderRecord({ ...input, fillEstimateKind: "POINT" }),
@@ -2523,17 +2614,24 @@ export class SimulatedVenue implements ExecutionVenue {
    * as they were (O10's all-or-nothing commit). The order of the arithmetic is
    * the order it always was — one fill after another — so every balance is the
    * same exact decimal.
+   *
+   * V2-10 (F-63): the cash leg is the fill's `collateralAmount` — the pUSD the
+   * maker fill moved, in whole base units — never `price × shares` again, and
+   * fills and fees are reconciled separately, as documented: "BUY fees add to
+   * collateral spend; SELL fees are deducted from proceeds". So a BUY costs
+   * `collateralAmount + feeAmount` and a SELL brings `collateralAmount −
+   * feeAmount`, which is the rule this method always applied.
    */
   #applyFills(fills: readonly SimulatedFill[]): void {
     if (fills.length === 0) return;
     let cash = this.#cash;
     const touched = new Map<string, { marketId: string; tokenId: string; side: "YES" | "NO"; shares: string }>();
     for (const fill of fills) {
-      const notional = mulDecimal(fill.price, fill.shares);
+      const collateral = fill.collateralAmount;
       cash =
         fill.action === "BUY"
-          ? subDecimal(subDecimal(cash, notional), fill.feeAmount)
-          : subDecimal(addDecimal(cash, notional), fill.feeAmount);
+          ? subDecimal(subDecimal(cash, collateral), fill.feeAmount)
+          : subDecimal(addDecimal(cash, collateral), fill.feeAmount);
       const key = positionKey({ marketId: fill.marketId, side: fill.side });
       const current = touched.get(key) ?? this.#positions.get(key);
       const delta = fill.action === "BUY" ? fill.shares : subDecimal("0", fill.shares);
@@ -2885,6 +2983,16 @@ function validatePlannedOrder(planned: PlannedOrderView): SimulationResult<Plann
   if (compareDecimal(planned.shares, "0") <= 0) {
     return simulationFailure("SIMULATION_INPUT_INVALID", "a planned order's size is positive", {
       plannedOrderId: planned.plannedOrderId,
+    });
+  }
+  // V2-10: the order's limit is the ratio it is signed at when it rests as a
+  // maker, and F-63's counter divides by the maker's amount — a non-positive
+  // limit has no such ratio, so it is refused here, at pre-flight, rather than
+  // at the first trade that reaches it.
+  if (compareDecimal(planned.limitPrice, "0") <= 0) {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a planned order's limit price is strictly positive", {
+      plannedOrderId: planned.plannedOrderId,
+      limitPrice: planned.limitPrice,
     });
   }
   return simulationOk(planned);

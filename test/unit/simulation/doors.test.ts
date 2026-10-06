@@ -1229,6 +1229,7 @@ const SIMULATED_FILL = (): Record<string, unknown> => ({
   action: "BUY",
   price: "0.5",
   shares: "10",
+  collateralAmount: "5",
   feeAmount: "0",
   liquidityRole: "TAKER",
   evidenceClass: "SIMULATED_NOT_REAL_EVIDENCE",
@@ -1759,6 +1760,8 @@ function manifestFixture(): never {
  * rather than a place to hide a door.
  */
 const NON_RECORD_DOORS: Readonly<Record<string, string>> = Object.freeze({
+  collateralTargetAtLimitPrice: "PRIMITIVES — a size and a limit price, each a decimal string read once (V2-10)",
+  counterAmount: "PRIMITIVES — three bigints, F-63's formula over integer base units (V2-10)",
   decodeUtf8Strict: "BYTES — a Uint8Array; there is no record to materialize",
   encodeUtf8Strict: "a PRIMITIVE string",
   loadDataset:

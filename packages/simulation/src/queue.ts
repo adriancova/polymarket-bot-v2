@@ -52,6 +52,7 @@
 
 import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 
+import { floorToBaseUnits, makerBuyBudget, makerFillForShares } from "./base-units.js";
 import { computeFee, readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import { simulatedFill, type FillModelIdentity, type SimulatedFill } from "./fill-model.js";
 import { isNonEmptyString, isNonNegativeInteger, isUnsignedIntegerString } from "./grammar.js";
@@ -311,6 +312,14 @@ export interface RestingScenarioOutcome<TScenario extends QueueScenario = QueueS
    * stop, and a reader needs all three of them.
    */
   readonly fillsAfterCancelRequest: string;
+  /**
+   * V2-10 r1: the pUSD leg of {@link fillsAfterCancelRequest} — the sum of
+   * those fills' `collateralAmount`. A resting BUY's maker asset is pUSD, so
+   * its band is ordered in pUSD, not in shares ({@link checkBandOrdering}
+   * item 4), and the pre-cancel part of that is this subtracted from the
+   * scenario's whole spend.
+   */
+  readonly collateralAfterCancelRequest: string;
   readonly cancelEffectiveAtNs: string | null;
   readonly fills: readonly SimulatedFill[];
 }
@@ -441,6 +450,15 @@ function simulateRestingInner(input: {
       { field: "restingPrice", offered: order.restingPrice },
     );
   }
+  // V2-10: the action names which side of F-63's formula the resting order is
+  // the maker on (`./base-units.js`), so it is read as one of the two, never
+  // defaulted to either.
+  if (order.action !== "BUY" && order.action !== "SELL") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a resting order's action is BUY or SELL", {
+      field: "action",
+      offered: describeForRefusal(order.action),
+    });
+  }
   // THE HYPOTHESES OF THE DERIVATION, ENFORCED WHERE IT IS CITED (round-2 review,
   // MEDIUM-2). `checkBandOrdering`'s pre-cancel ordering proof reasons over
   // NON-NEGATIVE quantities: `q' = max(0, max(0, q − ratio × s) − s)` is monotone
@@ -569,7 +587,10 @@ function simulateRestingInner(input: {
  *    `cancelEffectiveAfterMs.OPTIMISTIC <= BASE <= CONSERVATIVE` applied to one
  *    shared request instant, and it is the axis on which "conservative" means
  *    "the safety cancel lands latest".
- * 4. **Fills BEFORE the cancel request are ordered `OPT >= BASE >= CONS`.**
+ * 4. **Fills BEFORE the cancel request are ordered `OPT >= BASE >= CONS`,
+ *    in the resting order's MAKER ASSET** (V2-10 r1): shares for a resting
+ *    SELL, pUSD for a resting BUY — see "the maker's asset" below for why a
+ *    BUY's shares are not ordered once F-63 floors every fill.
  *    Proof: a pre-request trade has `monotonicNs < cancelRequestedAtNs <=
  *    cancelEffectiveAtNs` in every scenario, so the effectiveness window cuts
  *    none of them and all three scenarios walk the SAME pre-request trades (the
@@ -584,6 +605,35 @@ function simulateRestingInner(input: {
  *    (behind-same-instant-additions) queue only in `CONSERVATIVE`, so both
  *    inputs point the same way and the ordering follows. A trade THROUGH the
  *    price fills the whole remainder in every scenario, which preserves it.
+ *
+ * ## The maker's asset (V2-10 r1)
+ *
+ * The proof above is over EXACT quantities. Since V2-10 every estimated fill
+ * moves F-63's legs in whole base units (`./base-units.js`), and the ordering
+ * survives that only in the asset the formula fills by — the maker's:
+ *
+ * - **A resting SELL** fills by shares: each fill moves its estimated size
+ *   floored to whole base units, capped by the whole base units still
+ *   unfilled. `floor` is monotone, so a scenario that is never smaller per
+ *   trade until its remainder binds stays ordered, and one whose remainder
+ *   binds has filled the order's every whole base unit — the most any
+ *   scenario can.
+ * - **A resting BUY** fills by pUSD, capped TOGETHER by the collateral it
+ *   signed (`./base-units.js` inference 4; R1-01): each fill spends
+ *   `min(floor(estimated shares × price), what is left of the budget)`. The
+ *   share remainder never binds tighter than the budget (each fill's shares
+ *   are at most its pUSD ÷ price), so cumulative pUSD obeys the same
+ *   induction as a SELL's shares, and a THROUGH trade spends the whole
+ *   remaining budget in every scenario. Its SHARES are not ordered: F-63
+ *   floors each fill's counter, so a scenario filled in more pieces receives
+ *   fewer shares for the same pUSD. Measured at `8523450`: BUY 10 at 0.6
+ *   behind 2.000004, trades 2.000004 then 20 — the optimistic arm fills
+ *   1.000001 then 8.999998 (9.999999 shares), the base and conservative arms
+ *   10 shares, all three for 6 pUSD; the share check refused that valid band.
+ *
+ * So item 4 compares pre-cancel shares for a SELL band and pre-cancel pUSD
+ * for a BUY band. The order's side is read from its fills, which must all name
+ * one; a band with no fills has nothing to order.
  *
  * ## Where the derivation's HYPOTHESES are enforced (round-2 review, MEDIUM-2)
  *
@@ -628,6 +678,11 @@ function checkBandOrderingInner(offered: RestingFillBand): SimulationResult<Rest
     ["base", "BASE", band.base],
     ["conservative", "CONSERVATIVE", band.conservative],
   ];
+  // V2-10 r1: the side of the ONE resting order the band estimates, read from
+  // its fills (item 4 orders the band in that side's maker asset), and each
+  // scenario's pre-cancel pUSD.
+  let makerSide: "BUY" | "SELL" | undefined;
+  const preCancelCollateral = new Map<string, string>();
 
   for (const [member, expected, outcome] of members) {
     if (outcome === null || typeof outcome !== "object") {
@@ -650,6 +705,7 @@ function checkBandOrderingInner(offered: RestingFillBand): SimulationResult<Rest
       ["queueAheadAtPlacement", outcome.queueAheadAtPlacement],
       ["queueAheadRemaining", outcome.queueAheadRemaining],
       ["fillsAfterCancelRequest", outcome.fillsAfterCancelRequest],
+      ["collateralAfterCancelRequest", outcome.collateralAfterCancelRequest],
     ] as const) {
       if (!isCanonicalDecimalString(value)) {
         return simulationFailure(
@@ -678,6 +734,7 @@ function checkBandOrderingInner(offered: RestingFillBand): SimulationResult<Rest
       );
     }
     let summed = "0";
+    let spent = "0";
     for (const fill of outcome.fills) {
       if (!isCanonicalDecimalString(fill.shares)) {
         return simulationFailure(
@@ -686,8 +743,39 @@ function checkBandOrderingInner(offered: RestingFillBand): SimulationResult<Rest
           { member, offered: String(fill.shares) },
         );
       }
+      if (!isCanonicalDecimalString(fill.collateralAmount)) {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          `a fill in the band's ${member} scenario carries a non-canonical pUSD leg (V2-10)`,
+          { member, offered: describeForRefusal(fill.collateralAmount) },
+        );
+      }
+      if (fill.action !== "BUY" && fill.action !== "SELL") {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          `a fill in the band's ${member} scenario names neither side of F-63's formula`,
+          { member, offered: describeForRefusal(fill.action) },
+        );
+      }
+      if (makerSide === undefined) makerSide = fill.action;
+      if (fill.action !== makerSide) {
+        return simulationFailure(
+          "FILL_MODEL_BAND_INCONSISTENT",
+          "the band's fills name both a BUY and a SELL; a band estimates ONE resting order",
+          { member, sides: `${makerSide},${fill.action}` },
+        );
+      }
       summed = addDecimal(summed, fill.shares);
+      spent = addDecimal(spent, fill.collateralAmount);
     }
+    if (compareDecimal(outcome.collateralAfterCancelRequest, spent) > 0) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        `the band's ${member} scenario moves more pUSD after a cancel request than its fills move in total`,
+        { member, collateralAfterCancelRequest: outcome.collateralAfterCancelRequest, spent },
+      );
+    }
+    preCancelCollateral.set(member, subDecimal(spent, outcome.collateralAfterCancelRequest));
     if (compareDecimal(summed, outcome.filledShares) !== 0) {
       return simulationFailure(
         "FILL_MODEL_BAND_INCONSISTENT",
@@ -751,19 +839,24 @@ function checkBandOrderingInner(offered: RestingFillBand): SimulationResult<Rest
     }
   }
 
-  const preCancel = (outcome: RestingScenarioOutcome): string =>
-    subDecimal(outcome.filledShares, outcome.fillsAfterCancelRequest);
-  if (
-    compareDecimal(preCancel(band.optimistic), preCancel(band.base)) < 0 ||
-    compareDecimal(preCancel(band.base), preCancel(band.conservative)) < 0
-  ) {
+  // Item 4, in the maker's asset (V2-10 r1): pUSD for a resting BUY, shares
+  // for a resting SELL — and for a band with no fills, where both are zero.
+  const preCancel = (member: string, outcome: RestingScenarioOutcome): string =>
+    makerSide === "BUY"
+      ? (preCancelCollateral.get(member) ?? "0")
+      : subDecimal(outcome.filledShares, outcome.fillsAfterCancelRequest);
+  const optimisticPre = preCancel("optimistic", band.optimistic);
+  const basePre = preCancel("base", band.base);
+  const conservativePre = preCancel("conservative", band.conservative);
+  if (compareDecimal(optimisticPre, basePre) < 0 || compareDecimal(basePre, conservativePre) < 0) {
     return simulationFailure(
       "FILL_MODEL_BAND_INCONSISTENT",
-      "the band is not ordered: fills before a cancel is requested must satisfy OPTIMISTIC >= BASE >= CONSERVATIVE, which follows from the parameter ordering because every scenario walks the same pre-request trades",
+      `the band is not ordered: fills before a cancel is requested must satisfy OPTIMISTIC >= BASE >= CONSERVATIVE in the resting order's maker asset (${makerSide === "BUY" ? "pUSD, for a resting BUY" : "shares, for a resting SELL"}), which follows from the parameter ordering because every scenario walks the same pre-request trades`,
       {
-        optimistic: preCancel(band.optimistic),
-        base: preCancel(band.base),
-        conservative: preCancel(band.conservative),
+        makerAsset: makerSide === "BUY" ? "PUSD" : "SHARES",
+        optimistic: optimisticPre,
+        base: basePre,
+        conservative: conservativePre,
       },
     );
   }
@@ -894,6 +987,16 @@ function runScenario<TScenario extends QueueScenario>(input: {
   let remaining = order.shares;
   let filled = "0";
   let fillsAfterCancel = "0";
+  let collateralAfterCancel = "0";
+  // V2-10 r1 (R1-01): a resting BUY's maker asset is pUSD, and F-63's venue
+  // "reduces a BUY's remaining collateral budget by the amount actually
+  // spent". So the scenario carries what is left of the collateral the order
+  // signed, in base units, caps every fill by it and debits each fill's actual
+  // spend: the fills never spend more, together, than the order signed
+  // (`./base-units.js` inference 4). A SELL's maker asset is shares, which
+  // `remaining` already caps.
+  let remainingBudget: bigint | undefined =
+    order.action === "BUY" ? makerBuyBudget(order.restingPrice, order.shares) : undefined;
   const fills: SimulatedFill[] = [];
 
   for (let index = 0; index < input.trades.length; index += 1) {
@@ -936,18 +1039,34 @@ function runScenario<TScenario extends QueueScenario>(input: {
 
     if (compareDecimal(fillsUs, "0") <= 0) continue;
 
+    // V2-10: our resting order is the MAKER, signed at its resting price, so
+    // the estimated fill moves F-63's legs in whole base units
+    // (`./base-units.js`): a resting SELL's shares whole and its pUSD floored;
+    // a resting BUY's pUSD floored — and capped by what is left of its signed
+    // collateral (r1, R1-01) — and its shares the formula's counter of it.
+    // An estimate under one base unit moves nothing (F-73), and neither does
+    // any estimate once a BUY's budget is spent, however many shares F-63's
+    // floors left unfilled.
+    const legs = makerFillForShares(order.action, order.restingPrice, fillsUs, remainingBudget);
+    if (!legs.ok) return legs;
+    const moved = legs.value.shares;
+    if (compareDecimal(moved, "0") <= 0) continue;
+
     const fee = computeFee({
-      shares: fillsUs,
+      shares: moved,
       price: order.restingPrice,
       liquidityRole: "MAKER",
       snapshot: input.feeSnapshot,
     });
     if (!fee.ok) return fee;
 
-    remaining = subDecimal(remaining, fillsUs);
-    filled = addDecimal(filled, fillsUs);
+    remaining = subDecimal(remaining, moved);
+    filled = addDecimal(filled, moved);
+    // The ACTUAL spend, debited (F-63): whole base units, so exact.
+    if (remainingBudget !== undefined) remainingBudget -= floorToBaseUnits(legs.value.collateral);
     if (order.cancelRequestedAtNs !== undefined && trade.monotonicNs >= order.cancelRequestedAtNs) {
-      fillsAfterCancel = addDecimal(fillsAfterCancel, fillsUs);
+      fillsAfterCancel = addDecimal(fillsAfterCancel, moved);
+      collateralAfterCancel = addDecimal(collateralAfterCancel, legs.value.collateral);
     }
     fills.push(
       simulatedFill({
@@ -958,7 +1077,8 @@ function runScenario<TScenario extends QueueScenario>(input: {
         side: order.side,
         action: order.action,
         price: order.restingPrice,
-        shares: fillsUs,
+        shares: moved,
+        collateralAmount: legs.value.collateral,
         feeAmount: fee.value.feeAmount,
         liquidityRole: "MAKER",
         model: input.model,
@@ -975,6 +1095,7 @@ function runScenario<TScenario extends QueueScenario>(input: {
       queueAheadAtPlacement,
       queueAheadRemaining: queueAhead,
       fillsAfterCancelRequest: fillsAfterCancel,
+      collateralAfterCancelRequest: collateralAfterCancel,
       cancelEffectiveAtNs: cancelEffectiveAtNs === null ? null : cancelEffectiveAtNs.toString(),
       fills,
     }),
