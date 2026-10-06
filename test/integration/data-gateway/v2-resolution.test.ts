@@ -40,7 +40,7 @@ import { fileURLToPath } from "node:url";
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import { ADMISSION_LEDGER_FILE_NAME, IncidentRegistry } from "@polymarket-bot/data-gateway";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
-import type { MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
+import { createMemoryFileSystem, type MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { RECORDED_WINDOW, reviewedBtc15mSeriesDocument } from "@polymarket-bot/universe/testing";
 import { windowInternalMarketId } from "@polymarket-bot/universe";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -600,6 +600,34 @@ describe("V2-3 acceptance 5: two sources — the first stands; a disagreement in
     expect((record?.["resolution"] as Record<string, Record<string, unknown>>)["payload"]?.["outcome"]).toBe("NO_WIN");
     expect(spies.closedScopes()).not.toContain(`${FEED_ID}:${V2_WINDOW.id}:resolution-disagreement`);
     expect(spies.registry().isOpen(`${FEED_ID}:${V2_WINDOW.id}:resolution-disagreement`, UNRESOLVED)).toBe(true);
+    await harness.gateway.stop();
+  });
+
+  it("the FIRST published resolution stands in memory too: with every discharge write failing, the retirement carries the row's resolution, never a later disagreeing frame's", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const writeWholeFile = walFileSystem.writeWholeFile.bind(walFileSystem);
+    // Refuse exactly the ledger writes that DISCHARGE the window's resolution while it is live:
+    // the record keeps it owed, and teardown retires on the in-memory publication (ROLLOVER-1 r3).
+    walFileSystem.writeWholeFile = async (path: string, bytes: Uint8Array): Promise<void> => {
+      if (path === LEDGER_PATH) {
+        const record = (JSON.parse(Buffer.from(bytes).toString("utf8")) as { windows: Record<string, Record<string, unknown>> }).windows[V2_WINDOW.conditionId];
+        if (record?.["status"] === "ADMITTED" && (record["resolution"] as Record<string, unknown> | undefined)?.["publishedAt"] !== undefined) {
+          throw new Error("injected: the discharge cannot be written");
+        }
+      }
+      await writeWholeFile(path, bytes);
+    };
+    const stub = venueStub(V2_WINDOW, () => RESOLVED_NO(V2_WINDOW));
+    const harness = await started(stub, { walFileSystem });
+    await pastClose(harness);
+    harness.polymarketSockets.current.message(marketResolvedFrame(V2_WINDOW, V2_WINDOW.yes, harness.clock.nowMs()));
+    await harness.settle();
+    expect(resolutionsOf(harness, V2_WINDOW).map((envelope) => payloadOf(envelope)["outcome"])).toEqual(["NO_WIN", "YES_WIN"]);
+    expect(harness.gateway.metrics().seriesAdmission?.ledgerWriteFailures).toBeGreaterThanOrEqual(1);
+    await cycleAfter(harness, 0);
+    const record = ledger(walFileSystem)[V2_WINDOW.conditionId];
+    expect(record).toMatchObject({ status: "RETIRED", retiredReason: "RESOLVED" });
+    expect((record?.["resolution"] as Record<string, Record<string, unknown>>)["payload"]?.["outcome"]).toBe("NO_WIN");
     await harness.gateway.stop();
   });
 
