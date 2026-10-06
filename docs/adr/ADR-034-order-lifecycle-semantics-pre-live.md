@@ -71,7 +71,7 @@
    | --- | --- | --- | --- |
    | Stream order event (`PLACEMENT`, `UPDATE`, `CANCELLATION`) | `timestamp`, required, "Event timestamp in milliseconds" | ms | A F-88, F-89, F-91 |
    | Stream trade event | `timestamp` (ms); `match_time` and `last_update` | ms; s | A F-88, F-89, F-91 |
-   | REST order read (`/data/order`, `/data/orders`) | `created_at` only; no instant of the current status | s | A F-93 |
+   | REST order read (`/data/order`, `/data/orders`) | `created_at` (and the order's `expiration`); no instant of the current status | s | A F-93 |
    | REST trade read (`/data/trades`) | `match_time`, `last_update`. The OpenAPI's optional `match_time_nano` is dropped by SDK 0.12.0 | s | A F-94, F-95 |
    | Placement answer, cancel answer | none | — | A F-96 |
 
@@ -884,8 +884,10 @@ hung under the flipped default (`V2-10` round-0 handoff, known risk 7).
    third, for pairs that venue time cannot order: equal instants, a
    millisecond instant inside a seconds instant, or a PENDING terminal
    instant. If the user rules instead that such pairs halt, D1.5's UNORDERED
-   row becomes NEWER, and route 3 stays an operator release. Its pin would
-   then stay failing.
+   row becomes NEWER. Route 3 (a cancel answer has no instant) and route 1
+   (its terminal evidence is a read) would then stay operator releases, and
+   their pins would stay failing. Only route 2, against a fill whose stream
+   event carries milliseconds, would be judged by venue time alone.
 2. **U-52 and C-25:** what `timestamp` names, its unit, whether it is
    monotonic, and how a push is ordered against an answer.
    - The first authenticated observation, in a mode that permits one (the
