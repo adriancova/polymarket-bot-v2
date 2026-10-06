@@ -27,6 +27,12 @@
   (`docs/venue/verified-2026-09-30.md` §5, §11; brief row
   `V3-C12-HEARTBEAT-ADR`). It carries one more, unresolved, to the next
   venue round: the guide and the API reference disagree (Context 3).
+  - *Note, 2026-10-05 (`V2-0`):* that round, `VENUE-4`, recorded the
+    conflict as C-20 and resolved it in part. The 10 s cancellation is
+    documented for `POST /v1/heartbeats`, which carries the id chain (H-3).
+    Still open: the `400` message key (C-20) and U-40. See
+    [Amendment 1](#amendment-1-2026-10-05-v2-0-d5-decided), "The facts the
+    ruling rests on".
 - **Code cited:** `main` at `85b81e5`. `WP-290`'s coordinator is cited on
   the `wp-290` branch at `1dc6672`, not yet merged. Each cited behavior
   still holds at `ba150f5` and at `6ed3fbe`, the branch tip when r2 and r3
@@ -69,7 +75,9 @@
       `OrderManager` and `ReconciliationCoordinator`. Since r3, they include
       a lift without the periodic timer.
 - **Amendment 1:** 2026-10-05 (`V2-0`), after acceptance. It records the
-  user's D5 ruling. The header's old text:
+  user's D5 ruling. Dated pointers to it were added, without editing the
+  text they follow, to "Conflict it resolves for PAPER", Context 3, D1
+  item 1 and D2. The header's old text:
   - Status: "**D5, the transport, stays open**, and its recommendation is
     not a ruling: the user rules it before any run mode above PAPER.";
   - Implemented by: "`WP-320` (D1–D4, D6), not yet. D5 is not
@@ -116,6 +124,10 @@
      `POST /v1/heartbeats`". The S-D18 body that both reports verified, by
      digest `983e93c1…`, reads `post /heartbeats`. This ADR carries the
      conflict as unverified, for the next venue round (D5).
+     *Note, 2026-10-05 (`V2-0`):* `VENUE-4` recorded it as C-20. The page
+     renders the CLOB OpenAPI's other operation, and `/v1/heartbeats` is the
+     documented route of the 10 s cancellation (H-3). The `400` message key
+     and U-40 stay open (Amendment 1).
    - Every figure is documentary only. No verification round has observed
      the protocol (`verified-2026-09-16.md` §5, "Documentary-only limit";
      §12).
@@ -145,6 +157,8 @@
    - the documented `400` recovery: one new request with the expected id.
      Repeated `400`s raise the live-fencing-conflict alert (ADR-008 §4);
    - the 5 s cadence.
+   - *Note, 2026-10-05 (`V2-0`):* no longer provisional in its route or its
+     id chain (H-3; D2's note; Amendment 1).
 2. **The gate.** A heartbeat is sent only while both hold:
    - the process holds the current fencing token;
    - the health lease holds.
@@ -175,6 +189,11 @@
   shapes (S-D17), as the fixture records them. The venue round before D5
   resolves the conflict with S-D18. A different answer amends D1, D2 and
   D6.
+  - *Note, 2026-10-05 (`V2-0`):* the round, `VENUE-4`, gave no different
+    answer. The OpenAPI documents the same `/v1/heartbeats` shapes (H-3),
+    so D1, D2 and D6 stand. The contract is no longer provisional in its
+    route or its id chain. The `400` message key stays open (C-20), and
+    Amendment 1's transport rule 4 covers it. U-40 stays open.
 - Tests use a fake port. `WP-320`'s allowed paths have no
   `test/contract/**` entry today.
   - §16.3's "Heartbeat protocol" contract test runs beside the code, in

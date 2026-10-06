@@ -191,8 +191,9 @@ uses other fields:
   vocabulary, a `reporter` and `payouts` (F-57). Its vocabulary differs from
   Gamma's: two fields, not one (F-57, INF).
 - **`disputed` is one of the row's statuses** (F-57). A `disputed` row
-  publishes nothing (§8, note of 2026-10-05). §4 is unchanged: this note
-  adds no `MarketDisputed` event.
+  publishes nothing: it is pending, and the window is read again (§8, note
+  of 2026-10-05). §4 is unchanged: this note adds no `MarketDisputed`
+  event.
 
 This note adds no rule of its own, and changes nothing above PAPER.
 
@@ -344,16 +345,28 @@ PAPER and BACKTEST, and the user may confirm or overrule it. The facts are
    `status` but `"resolved"`.
    - The venue documents a binary split payout, with no ratio (F-73;
      plan D18). U-10 stands.
-   - Such a row publishes nothing and raises the unresolved-window incident
-     (ADR-030 Amendment 2, rule 5).
-5. **The resolution source.** Up/down markets resolve from Chainlink TWAP
+   - A row whose `status` is another of F-57's values is pending. It
+     publishes nothing, the window is read again, and the unresolved-window
+     incident opens at its usual bound.
+   - A `"resolved"` row that does not qualify, a split among them, is
+     refused. It publishes nothing and raises that incident at once (ADR-030
+     Amendment 2, rule 5, "What a read finds").
+5. **The resolution instant.** `MarketResolved`'s `resolvedAt` is the row's
+   `resolved_at`, unchanged. A row without a well-formed one is refused.
+   - `resolved_at` is observed (F-59), and is not among the documented
+     fields the report quotes (F-57). Its use is part of rule 5's interim
+     ruling, and a gap for the next venue round (ADR-030 Amendment 2,
+     rule 5, "The resolution instant").
+   - It dates the resolution and settles nothing. The payoff follows from
+     the outcome alone (item 3).
+6. **The resolution source.** Up/down markets resolve from Chainlink TWAP
    (F-58), and a V2 canary row named `reporter` `CHAINLINK` (F-59). The row
    is the venue's record of the outcome, not a price this platform reads.
    Ruling `V3-C13` is unchanged.
-6. **What is unchanged:** §1's reviewed spec and its fields, §2's model
+7. **What is unchanged:** §1's reviewed spec and its fields, §2's model
    selection, §3's terminal subset and §4's ruling. Whether a series' spec
    names this source is for its settlement review (plan D14).
-7. **Mode.** PAPER and BACKTEST only (ADR-030 Decision 2.1). It changes
+8. **Mode.** PAPER and BACKTEST only (ADR-030 Decision 2.1). It changes
    nothing above PAPER.
 
 ## Consequences
