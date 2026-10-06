@@ -150,3 +150,6 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-05 | [WP-330.md](WP-330.md) | `WP-330`: the independent emergency operations CLI | WP | Complete (2026-10-05) | `c1e6909` | 5 KB |
 | 2026-10-05 | [WP-340.md](WP-340.md) | `WP-340`: live-micro fault-injection verification | WP | Complete (2026-10-05) | `73e1ba2` | 7 KB |
 | 2026-10-05 | [DEPS-3.md](DEPS-3.md) | `DEPS-3`: patch tinypool and source-map-js advisories | CI health | Complete (2026-10-05) | `1237afe` | 2 KB |
+| 2026-10-05 | [CI-6.md](CI-6.md) | `CI-6`: the Wave 3 live fault suites in CI | CI | Complete (2026-10-05) | `46aba42` | 2 KB |
+| 2026-10-05 | [TRADER-SIGNALS.md](TRADER-SIGNALS.md) | `TRADER-SIGNALS`: graceful stop; paper fills in the example PAPER config | Round | Complete (2026-10-05) | `3926f5f` | 4 KB |
+| 2026-10-05 | [VENUE-4.md](VENUE-4.md) | `VENUE-4`: Protocol V2 and Data API v2 venue facts, and the migration plan | Venue | Complete (2026-10-05) | `f925a43` | 6 KB |

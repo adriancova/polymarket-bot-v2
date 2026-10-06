@@ -499,3 +499,5 @@ Scratch probes (none inside the repository):
 ## commit_sha
 
 1e6e0571e32a94ed03e4542127106f2bc0220be2 (branch `fold-1`, one commit on top of `b0403c6`; not pushed, not amended)
+
+**Correction (2026-10-05, `TRADER-SIGNALS`, `3926f5f`):** a SHUTDOWN rebuild mismatch now exits 70 (`shutdownCheckFailed`), where it used to exit halted (75). The SHUTDOWN path through `startup()` now runs on every graceful stop and is exercised by tests, which closes this record's residual that no repository test reached it.
