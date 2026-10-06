@@ -236,6 +236,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CLOSEOUT-3` | The fresh read-only Wave 3 closeout audit (runbook §10) | WAVE 3 IS COMPLETE WITH QUALIFICATIONS (2026-10-06) | — (an audit) | [CLOSEOUT-3](docs/handoffs/CLOSEOUT-3-wave-3-closeout.md) |
 | `V2-0` | Protocol V2 governance: the dated ADR amendments and the user's rulings (docs only; dual verifiers) | **Running** (authorized 2026-10-05) | — | — |
 | `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER; astra) | **Running** (authorized 2026-10-05) | — | — |
+| `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | **Running** (authorized 2026-10-06) | — | — |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
 | `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
