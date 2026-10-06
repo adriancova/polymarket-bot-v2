@@ -23,6 +23,7 @@
 
 import { describe, expect, it } from "vitest";
 
+import { mulDecimal } from "../../../packages/decimal/src/index.js";
 import {
   MARKOUT_HORIZONS,
   REPLAY_PATH_ECONOMICS_KEYS,
@@ -55,6 +56,8 @@ const AT_EVENT = {
 };
 
 function fill(overrides: Partial<SimulatedFill> = {}): SimulatedFill {
+  const price = overrides.price ?? "0.5";
+  const shares = overrides.shares ?? "100";
   return simulatedFill({
     simulatedFillId: "f-1",
     simulatedOrderId: "o-1",
@@ -62,8 +65,12 @@ function fill(overrides: Partial<SimulatedFill> = {}): SimulatedFill {
     tokenId: "1234",
     side: "YES",
     action: "BUY",
-    price: "0.5",
-    shares: "100",
+    price,
+    shares,
+    // V2-10: the cash leg a venue fill carries; every fill here is whole base
+    // units at its price, so it is `price × shares` exactly unless a probe
+    // overrides it.
+    collateralAmount: mulDecimal(price, shares),
     feeAmount: "0",
     liquidityRole: "TAKER",
     model: MODEL,

@@ -28,6 +28,7 @@ chronology).
 | `seed.ts` | SplitMix64 named streams — the only randomness (§6 invariant 2) |
 | `latency.ts` | The Tier-1 latency model (§12.2 step 1) |
 | `fees.ts` | `fee = C × feeRate × p × (1 − p)` from a PINNED snapshot (§6 invariant 9) |
+| `base-units.ts` | V2-10: F-73's six-decimal base units, F-63's maker-fill formula (`counterAmount`), the two legs every simulated maker fill moves, and the ONE conversion of a FOK/FAK BUY's size to its collateral target (§5 items 18 and 19) |
 | `fill-model.ts` | The evidence labels, exact depth arithmetic, and the ledger bridge |
 | `tier0.ts` | §12.2 Tier 0 — pipeline smoke, never for deployment decisions |
 | `tier1.ts` | §12.2 Tier 1 immediate orders — latency, delay, GTD, FAK/FOK |
@@ -447,3 +448,86 @@ key.
     - **No health seam** carries these counters yet (queued with
       `TRDR4-GAUGES`): a counter on an object the paper-e2e artifact copies
       wholesale would change that golden.
+18. **Every simulated maker fill moves F-63's two legs, in whole base units**
+    (V2-10; `docs/venue/verified-2026-10-05.md` F-63, F-73). The documented
+    formula is `counterAmount = floor(makerAssetFill × takerAmount /
+    makerAmount)` over integer base units (`1_000_000` is one pUSD or one
+    share), and `base-units.ts`'s `counterAmount` is exactly that, in bigint
+    arithmetic. Every fill — a taker fill on either ladder (Tier 0 and
+    Tier 1), a Tier-0 maker fill, and a Tier-1 band's estimated fills — now
+    carries `collateralAmount`, the pUSD it moved before fees, and the venue's
+    cash and `replayPathEconomics` move by it rather than by `price × shares`.
+    For a size that is a whole number of base units at the price (every
+    golden, fixture and backtest in the repository) the two are equal, so no
+    replay golden moved. Where they differ:
+    - a maker SELL's pUSD leg is floored (a BUY taking an ask pays up to one
+      base unit less than `price × shares`; our resting SELL receives up to
+      one less);
+    - a maker BUY's asset is pUSD, so the floor lands on the SHARES: its pUSD
+      fill is `floor(shares × price)` and the shares that move are F-63's
+      counter of that — exactly the shares asked for whenever `shares × price`
+      is whole base units, otherwise up to `ceil(1 / price)` base units fewer,
+      which stay with the order as a remainder the formula left. A walk whose
+      TARGET ended it is `complete` whatever that remainder (`DepthConsumption`),
+      so such a remainder is never rested, cancelled or rejected as if
+      liquidity were missing;
+    - a quantity finer than one base unit is floored before it fills, and a
+      target under one base unit is refused;
+    - a resting BUY's maker fills are capped TOGETHER by the collateral it
+      signs, `floor(size × price)` in base units (V2-10 r1): "ExchangeV3
+      reduces a BUY's remaining collateral budget by the amount actually
+      spent", so each Tier-1 band fill spends at most what the earlier ones
+      left of it. A BUY filled in several pieces receives fewer shares for
+      the same pUSD than one filled whole (each piece floors its share
+      counter); the shares left over are the formula's, and no fill moves them
+      once the budget is spent. For the same reason a band of a resting BUY
+      is ORDERED in pUSD, its maker asset, and a band of a resting SELL in
+      shares (`checkBandOrdering` item 4): a BUY's shares are not monotone
+      across the scenarios once every fill is floored. Each scenario carries
+      `collateralAfterCancelRequest` beside `fillsAfterCancelRequest` for that
+      check; the §12.4 `band` line does not print it, so no byte moved.
+
+    What this INFERS, stated in `base-units.ts`'s header: a recorded level is
+    ONE maker order signed at exactly its price (a level of several orders is
+    floored once per order at the venue — up to one base unit in the taker's
+    favour per additional order — so the model errs against us); and which maker-asset fill
+    a target selects is not documented, so each choice floors and none
+    exceeds its target. NOT done here, because the paths are outside this
+    package: the §12.4 fill line does not print `collateralAmount` (a new
+    field is grammar `v4`, and `apps/backtest-cli`'s suite pins `v3`); and the
+    trader's own cash (`packages/trading-core` `cashAfter`) and the ledger
+    (`toFillFact` → WP-200's `FillFact`, which has no field for it) still
+    compute `price × shares` — equal to `collateralAmount` whenever the sizes
+    are whole base units at the price.
+19. **FOK and FAK BUYs target COLLATERAL only when the composition root says
+    so** (V2-10; F-63: "CLOB GTC/GTD BUY targets are shares; FOK/FAK BUY
+    targets are collateral"). `SimulatedVenueOptions.fokFakBuyTarget`:
+    - `"COLLATERAL_AT_LIMIT_PRICE"` — the documented behaviour. At pre-flight,
+      before anything is booked, a FOK or FAK BUY's planned size is converted
+      ONCE to its target, `collateralTargetAtLimitPrice(shares, limitPrice)`:
+      shares × the order's LIMIT price, floored to whole base units (a target
+      that floors to zero refuses the plan). The walk spends up to that pUSD
+      before fees — "ExchangeV3 reduces a BUY's remaining collateral budget by
+      the amount actually spent" — buying, at each ask, the shares the budget
+      buys at that price, floored. A level the budget buys WHOLE — even
+      exactly, when F-63's floor leaves a base unit unspent — is exhausted, and
+      what is left goes on to the next level (V2-10 r1); a level it can buy
+      only part of ends the walk, since the later, dearer levels sit behind
+      the size still resting there. The shares follow from the fills: MORE than
+      planned when the asks are below the limit. The order record carries the
+      target as `collateralTarget`, and its `filledShares` may exceed
+      `requestedShares`. A FOK is FILLED when its budget is spent to the last
+      share base unit it can buy, and REJECTED when the limit or the ladder
+      leaves budget unspent — even the one base unit an exactly-bought last
+      level leaves; a FAK keeps what it bought and is CANCELLED in
+      that case. The fee is charged on top of the target ("BUY fees add to
+      collateral spend"). A GTC/GTD BUY and every SELL still target shares.
+    - `"SHARES_UNDOCUMENTED"` — this venue before V2-10, and what an ABSENT
+      option means (`DEFAULT_FOK_FAK_BUY_TARGET`): every order type targets its
+      planned shares. That is NOT the documented venue behaviour for FOK/FAK
+      BUYs. It stays the default only because every composition root and
+      golden outside this package was built on it — the shipped trader's
+      entries are FAK BUYs, and adopting the documented target moves the
+      `test/replay-golden/paper-e2e/` and backtest goldens' fills (the V2-10
+      handoff lists each). Adopting it is the composition root's change
+      (`packages/trading-core`'s venue builder), with its goldens.

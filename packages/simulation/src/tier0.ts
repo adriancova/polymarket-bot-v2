@@ -21,8 +21,9 @@
  * is the model's definition, and it is why its use is bounded.
  */
 
-import { compareDecimal, isCanonicalDecimalString } from "@polymarket-bot/decimal";
+import { compareDecimal, isCanonicalDecimalString, subDecimal } from "@polymarket-bot/decimal";
 
+import { makerFillForShares } from "./base-units.js";
 import { computeFee, type FeeScheduleSnapshot } from "./fees.js";
 import {
   consumeDepth,
@@ -33,7 +34,7 @@ import {
 } from "./fill-model.js";
 import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type { BookView, RecordedEventIdentity } from "./ports.js";
-import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
+import { describeForRefusal, simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 
 /** The identity every Tier-0 result carries. */
 export function tier0Model(input: {
@@ -58,8 +59,12 @@ export interface Tier0ImmediateOutcome {
   readonly remainingShares: string;
   readonly consumption: DepthConsumption;
   /**
-   * `false` whenever any size remains, so the caller applies the plan's
-   * partial-fill policy rather than assuming completion (§6 invariant 10).
+   * `false` whenever the order has a remainder — the limit price or the
+   * ladder ended the walk before its target did — so the caller applies the
+   * plan's partial-fill policy rather than assuming completion (§6 invariant
+   * 10). V2-10: it is the walk's {@link DepthConsumption.complete}, not
+   * `remainingShares === "0"`: a share target can end with a remainder F-63's
+   * floor leaves, and a collateral target has no share remainder at all.
    */
   readonly complete: boolean;
 }
@@ -80,6 +85,14 @@ export function tier0Immediate(input: {
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
   readonly shares: string;
+  /**
+   * V2-10 (F-63: "FOK/FAK BUY targets are collateral"): when present, the
+   * order is a BUY that spends up to this much pUSD before fees, and its
+   * shares follow from the fills; `shares` is then the planned size the
+   * target was converted from (`collateralTargetAtLimitPrice`), kept for the
+   * order's record and not matched. Absent: the order targets `shares`.
+   */
+  readonly collateralTarget?: string;
   readonly feeSnapshot: FeeScheduleSnapshot;
   readonly atEvent: RecordedEventIdentity;
 }): SimulationResult<Tier0ImmediateOutcome> {
@@ -95,6 +108,7 @@ function tier0ImmediateInner(input: {
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
   readonly shares: string;
+  readonly collateralTarget?: string;
   readonly feeSnapshot: FeeScheduleSnapshot;
   readonly atEvent: RecordedEventIdentity;
 }): SimulationResult<Tier0ImmediateOutcome> {
@@ -109,7 +123,7 @@ function tier0ImmediateInner(input: {
   // materializing it would delete the methods. What it HANDS BACK is data, and
   // `consumeDepth` materializes that.
   const { model: offeredModel, atEvent: offeredAtEvent, book, action, side } = input;
-  const { simulatedOrderId, marketId, limitPrice, shares, feeSnapshot } = input;
+  const { simulatedOrderId, marketId, limitPrice, shares, collateralTarget, feeSnapshot } = input;
 
   const readModel = readOwnPlainInput<FillModelIdentity>(offeredModel, "the fill model identity");
   if (!readModel.ok) return readModel;
@@ -129,7 +143,10 @@ function tier0ImmediateInner(input: {
   }
   const tokenId = book.tokenId;
   const ladder = book.ladder(action === "BUY" ? "ASK" : "BID");
-  const consumed = consumeDepth({ ladder, action, limitPrice, shares });
+  const consumed =
+    collateralTarget === undefined
+      ? consumeDepth({ ladder, action, limitPrice, shares })
+      : consumeDepth({ ladder, action, limitPrice, collateral: collateralTarget });
   if (!consumed.ok) return consumed;
   const consumption = consumed.value;
 
@@ -157,6 +174,7 @@ function tier0ImmediateInner(input: {
         action,
         price: level.price,
         shares: level.shares,
+        collateralAmount: level.collateral,
         feeAmount: fee.value.feeAmount,
         liquidityRole: "TAKER",
         model,
@@ -172,7 +190,7 @@ function tier0ImmediateInner(input: {
       filledShares: consumption.filledShares,
       remainingShares: consumption.remainingShares,
       consumption,
-      complete: compareDecimal(consumption.remainingShares, "0") === 0,
+      complete: consumption.complete,
     }),
   );
 }
@@ -262,6 +280,21 @@ function tier0MakerInner(input: {
       );
     }
   }
+  if (action !== "BUY" && action !== "SELL") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a resting order's action is BUY or SELL", {
+      offered: describeForRefusal(action),
+    });
+  }
+  // V2-10: the maker's signed ratio is its price, and F-63's counter divides
+  // by the maker's amount: a non-positive resting price has neither (the same
+  // bound `simulateResting` enforces at its own door).
+  if (compareDecimal(restingPrice, "0") <= 0) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a resting order's price is strictly positive; a maker fill's counter amount (F-63) is defined only at a strictly positive price",
+      { restingPrice },
+    );
+  }
   const comparison = compareDecimal(observedTradePrice, restingPrice);
   // A resting BUY sits on the bid: a trade at or BELOW its price consumed it.
   // A resting SELL sits on the ask: a trade at or ABOVE its price consumed it.
@@ -269,7 +302,18 @@ function tier0MakerInner(input: {
   const trigger: "TOUCH" | "TRADE_THROUGH" | "NONE" =
     comparison === 0 ? "TOUCH" : throughIt ? "TRADE_THROUGH" : "NONE";
 
-  if (trigger === "NONE" || compareDecimal(remainingShares, "0") <= 0) {
+  // V2-10: the resting order IS the maker, signed at its limit price, so the
+  // fill's legs are F-63's (`./base-units.js`): a resting SELL's shares fill
+  // whole and its pUSD is floored; a resting BUY's pUSD is what the shares are
+  // worth, floored, and its shares are the formula's counter of that.
+  const legs =
+    trigger === "NONE" || compareDecimal(remainingShares, "0") <= 0
+      ? undefined
+      : makerFillForShares(action, restingPrice, remainingShares);
+  if (legs !== undefined && !legs.ok) return legs;
+  if (legs === undefined || compareDecimal(legs.value.shares, "0") <= 0) {
+    // Nothing fills: no trigger, nothing left, or a remainder under one base
+    // unit (F-73) — which no fill can move.
     return simulationOk(
       ownFrozenTree<Tier0MakerOutcome>({
         model,
@@ -280,9 +324,10 @@ function tier0MakerInner(input: {
       }),
     );
   }
+  const filledShares = legs.value.shares;
 
   const fee = computeFee({
-    shares: remainingShares,
+    shares: filledShares,
     price: restingPrice,
     // ADR-012 §5.4 / venue report §6: "Makers pay no fees; only takers pay."
     // The rate still comes from the snapshot, so a future snapshot with a
@@ -304,15 +349,20 @@ function tier0MakerInner(input: {
           side,
           action,
           price: restingPrice,
-          shares: remainingShares,
+          shares: filledShares,
+          collateralAmount: legs.value.collateral,
           feeAmount: fee.value.feeAmount,
           liquidityRole: "MAKER",
           model,
           atEvent,
         }),
       ],
-      filledShares: remainingShares,
-      remainingShares: "0",
+      filledShares,
+      // `"0"` whenever the remainder is a whole number of base units whose
+      // value at the limit is too (every CLOB-sized order); otherwise the part
+      // F-63's floor could not move. Tier 0 grants the whole remainder, so the
+      // venue holds no record of that part (`venue.ts`).
+      remainingShares: subDecimal(remainingShares, filledShares),
       trigger,
     }),
   );

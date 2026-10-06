@@ -223,12 +223,22 @@ export {
 export type {
   DeploymentDecisionUse,
   DepthConsumption,
+  DepthTargetKind,
   FillModelIdentity,
   FillModelTier,
   MatchedLevel,
   PermittedUse,
   SimulatedFill,
 } from "./fill-model.js";
+
+// --- base units and the maker-fill formula (V2-10; F-63, F-73) --------------
+export {
+  BASE_UNITS_PER_WHOLE,
+  BASE_UNIT_DECIMAL_PLACES,
+  collateralTargetAtLimitPrice,
+  counterAmount,
+} from "./base-units.js";
+export type { MakerFillLegs, MakerSide } from "./base-units.js";
 
 export { tier0Immediate, tier0Maker, tier0Model } from "./tier0.js";
 export type { Tier0ImmediateOutcome, Tier0MakerOutcome } from "./tier0.js";
@@ -283,9 +293,15 @@ export { tokenBucketRateLimits, unmodeledRateLimits } from "./rate-limit.js";
 export type { RateLimitBudget, RateLimitDecision, RateLimitRequest } from "./rate-limit.js";
 
 // --- the simulated venue (§12.1) --------------------------------------------
-export { DEFAULT_VENUE_RETENTION, SimulatedVenue } from "./venue.js";
+export {
+  DEFAULT_FOK_FAK_BUY_TARGET,
+  DEFAULT_VENUE_RETENTION,
+  FOK_FAK_BUY_TARGETS,
+  SimulatedVenue,
+} from "./venue.js";
 export type {
   ExecutionPolicy,
+  FokFakBuyTarget,
   MarketBookProvider,
   SimulatedVenueOptions,
   VenueRetention,
