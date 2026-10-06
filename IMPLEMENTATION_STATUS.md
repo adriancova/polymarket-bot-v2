@@ -180,7 +180,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `V2-3` | Protocol V2 resolution via a journaled `/v2/resolutions` read, and not-yet-admissible windows (class A, PAPER; dual verifiers; due 2026-10-28) | **Running** (authorized 2026-10-06) | — | — |
 | `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER) | Complete (2026-10-06) | `9836ab0` | [V2-2](docs/handoffs/V2-2.md) |
 | `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | Complete (2026-10-06) | `9e28bc2` | [CI-7](docs/handoffs/CI-7.md) |
-| `RECORDS-W3` | Records hygiene after `CLOSEOUT-3`: the brief back under budget, ADR headers, the emergency-runbook correction, the records tooling (docs only; dual verifiers) | **Running** (authorized 2026-10-06) | — | — |
+| `RECORDS-W3` | Records hygiene after `CLOSEOUT-3` (brief under budget, ADR headers, runbook, tooling) | Complete (2026-10-06) | `b008a26` | [RECORDS-W3](docs/handoffs/RECORDS-W3.md) |
 | `CKPT-1` | ADR-027: checkpoint on change plus a 60 s heartbeat | Complete (2026-10-03) | `891ccdd` | [CKPT-1](docs/handoffs/CKPT-1.md) |
 | `TC-LOWS-1` | Pin the open trading-core and trader LOWs (residual round) | Complete (2026-10-04) | `9033743` | [TC-LOWS-1](docs/handoffs/TC-LOWS-1.md) |
 | `GOV-NOTES-1` | Dated corrections: ADR-028 Amendment 1 rule 6; `wal-format.md` §11.1 (docs only) | Complete (2026-10-04) | `1f99fcc` | [GOV-NOTES-1](docs/handoffs/GOV-NOTES-1.md) |
