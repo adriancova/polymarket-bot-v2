@@ -7,8 +7,9 @@
  * - `REPORT`: a dated verification report under `docs/venue/`. The quote
  *   appears there verbatim (whitespace-normalized).
  * - `PINNED_SDK`: the type declarations of the pinned official SDK,
- *   `@polymarket/client@0.11.0` (the only version `packages/polymarket-secure`
- *   may install). Used ONLY where the reports name a header but do not state
+ *   `@polymarket/client@0.12.0` (the only version `packages/polymarket-secure`
+ *   may install; V2-5 re-pinned it from 0.11.0, and `rate-limit.ts` and the
+ *   `RateLimitError` declaration are unchanged between the two). Used ONLY where the reports name a header but do not state
  *   its unit or meaning (the reports quote the header names; the SDK
  *   documents `reset` and `remaining`). The quote appears verbatim in the
  *   installed package's `.d.ts` once its JSDoc `*` prefixes are removed.
@@ -34,7 +35,7 @@ const REPORT_0824 = "docs/venue/verified-2026-08-24.md";
 const REPORT_0916 = "docs/venue/verified-2026-09-16.md";
 const REPORT_0930 = "docs/venue/verified-2026-09-30.md";
 /** The pinned SDK (`packages/polymarket-secure/package.json`). */
-export const PINNED_SDK = "@polymarket/client@0.11.0";
+export const PINNED_SDK = "@polymarket/client@0.12.0";
 
 export const RATE_LIMIT_VENUE_FACTS = Object.freeze({
   LIMITS_ARE_SNAPSHOTS: {

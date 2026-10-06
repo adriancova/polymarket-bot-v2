@@ -5,7 +5,9 @@
  * suite:
  *
  * - `fetch` is refused and recorded; a fixture responder answers and is
- *   recorded separately;
+ *   recorded separately (V2-5: it may answer with a promise, it sees the
+ *   request's method, and a responder that throws stands for a network
+ *   failure);
  * - `new WebSocket(...)` throws synchronously and is recorded;
  * - `net.connect` and `tls.connect` (both through `net.Socket.prototype.connect`)
  *   throw and are recorded;
@@ -48,6 +50,34 @@ describe("the network tripwire blocks and records every leg it claims", () => {
     tripwire = installNetworkTripwire({ responder: (url) => (url.endsWith("/fixture") ? new Response("ok") : undefined) });
     expect(await (await fetch("http://127.0.0.1/fixture")).text()).toBe("ok");
     expect(tripwire.answered()).toEqual([{ via: "fetch", target: "http://127.0.0.1/fixture" }]);
+    expect(tripwire.refused()).toEqual([]);
+  });
+
+  it("fetch (V2-5): a responder may answer with a promise, and sees the method of a Request input", async () => {
+    const methods: string[] = [];
+    tripwire = installNetworkTripwire({
+      responder: (_url, _init, method) => {
+        methods.push(method);
+        return Promise.resolve(new Response("later"));
+      },
+    });
+    expect(await (await fetch(new Request("http://127.0.0.1/a", { method: "DELETE" }))).text()).toBe("later");
+    expect(await (await fetch("http://127.0.0.1/b", { method: "post" })).text()).toBe("later");
+    expect(await (await fetch("http://127.0.0.1/c")).text()).toBe("later");
+    expect(methods).toEqual(["DELETE", "POST", "GET"]);
+    expect(tripwire.answered()).toHaveLength(3);
+    expect(tripwire.refused()).toEqual([]);
+  });
+
+  it("fetch (V2-5): a responder that throws stands for a network failure: the fetch rejects with it, recorded as answered, never delegated", async () => {
+    const failure = new TypeError("fetch failed");
+    tripwire = installNetworkTripwire({
+      responder: () => {
+        throw failure;
+      },
+    });
+    await expect(fetch("http://127.0.0.1/down")).rejects.toBe(failure);
+    expect(tripwire.answered()).toEqual([{ via: "fetch", target: "http://127.0.0.1/down" }]);
     expect(tripwire.refused()).toEqual([]);
   });
 

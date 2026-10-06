@@ -13,9 +13,12 @@
   Section 3 records the questions and the answers.
 - **Date:** 2026-10-01
 - **Recorded by:** `CO2-N1-ADR`. The ruling is recorded by `ADR031-ACCEPT`.
-- **Implemented by:** the `CO2-N1` round. Not yet implemented. The brief
-  queues it after `PROVENANCE-1`, before any settlement veto is lifted and
-  before `WP-270`.
+- **Implemented by:** the `CO2-N1` round, merged `9869e53` (2026-10-03),
+  after `PROVENANCE-1` (`71d8b80`) and before `WP-270` (`259c964`). Its
+  LOWs (`CO2N1-LOWS`) were closed by `TC-LOWS-1` (`9033743`).
+  Corrected 2026-10-06 (`RECORDS-W3`, `CLOSEOUT-3` L9): was 'the `CO2-N1`
+  round. Not yet implemented. The brief queues it after `PROVENANCE-1`,
+  before any settlement veto is lifted and before `WP-270`.'
 - **Supersedes / Superseded by:** none. It amends no handoff text. It re-reads
   two passages of ADR-026 and two code comments. It names three sentences of
   ADR-023 that it does not change (section 6).

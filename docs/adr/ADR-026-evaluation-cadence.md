@@ -3,8 +3,10 @@
 - **Status:** Accepted. The user ruled on 2026-09-30 (`LEAN-1`, ruling A1).
 - **Date:** 2026-09-30
 - **Recorded by:** `LEAN-GOV`
-- **Implemented by:** `CADENCE-1`, after `THROUGHPUT-1c` merges. Not yet
-  implemented.
+- **Implemented by:** `CADENCE-1`, merged `8d7086a` (2026-10-03), after
+  `THROUGHPUT-1c` (`0c270df`). Its open LOW is the brief's `CADENCE1-LOWS`.
+  Corrected 2026-10-06 (`RECORDS-W3`, `CLOSEOUT-3` L9): was '`CADENCE-1`,
+  after `THROUGHPUT-1c` merges. Not yet implemented.'
 - **Supersedes / Superseded by:** none. It **amends** ADR-024 D3 (its
   cadence clause and three sentences, named in "What it amends") and its
   Consequences, and handoff §8.1.

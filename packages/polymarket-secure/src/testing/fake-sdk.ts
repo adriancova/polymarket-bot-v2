@@ -66,6 +66,8 @@ let fixtureSalt = 1_000_000;
  * The amounts the pinned SDK would sign for a limit order at tick 0.01:
  * shares rounded DOWN to 2 decimals, the quote (price × shares) rounded DOWN
  * to 4 decimals, both in 6-decimal base units. Exact integer arithmetic.
+ * `test/contract/polymarket-secure/sdk-0-12.test.ts` checks these amounts
+ * against the REAL pinned SDK's at tick 0.01.
  */
 function fixtureAmounts(request: Parameters<Port["createLimitOrder"]>[0]): { makerAmount: string; takerAmount: string } {
   const rational = (value: unknown): { n: bigint; d: bigint } => {
@@ -83,7 +85,8 @@ function fixtureAmounts(request: Parameters<Port["createLimitOrder"]>[0]): { mak
 
 /**
  * The maker, signer and signature type the pinned SDK derives from its
- * account (`Tr` / `Ee` in `@polymarket/client@0.11.0`): signature type =
+ * account (`Tr` / `Ee` in `@polymarket/client@0.11.0`, `wallet.ts`, unchanged
+ * in 0.12.0): signature type =
  * wallet type, maker = wallet, signer = wallet for POLY_1271 (3) else signer.
  */
 function fixtureParties(account: Readonly<Record<string, unknown>>): { maker: string; signer: string; signatureType: number } {

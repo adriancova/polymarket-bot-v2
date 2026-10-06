@@ -8,7 +8,8 @@ Authority: handoff §0.2, §9.12, §11, §15; [ADR-010](../adr/ADR-010-run-mode-
 §3–§4; [ADR-007](../adr/ADR-007-signed-order-idempotency-and-unknown-submissions.md)
 §2–§7 and §11; `docs/contracts/dependency-direction.md` F5, F6, F7 and F12;
 `docs/venue/verified-2026-09-30.md` §2.2, §2.4, §2.5, §9, §11 (C-6, C-9,
-C-10, C-11, C-12) and §W.1–§W.3.
+C-10, C-11, C-12) and §W.1–§W.3; `docs/venue/verified-2026-10-05.md` §S,
+F-44, F-46, F-47 and F-53 (the `V2-5` re-pin).
 
 ---
 
@@ -16,14 +17,15 @@ C-10, C-11, C-12) and §W.1–§W.3.
 
 `@polymarket-bot/polymarket-secure` is the only package that may import the
 official unified SDK, `@polymarket/client` (handoff §9.12; F6). The version is
-pinned to **exactly `0.11.0`** (section 7). The package wraps the SDK behind a
+pinned to **exactly `0.12.0`** (section 7; `V2-5` re-pinned it from `0.11.0`,
+the floor Protocol V2 requires, F-37). The package wraps the SDK behind a
 narrow internal interface, `SecureVenueClient`, and puts every signer access
 behind one boundary.
 
 | Entry point | Contents |
 | --- | --- |
 | `@polymarket-bot/polymarket-secure` | The `SecureVenueClient` interface and its outcome types; the one factory, `createSecureVenueClient`; the run-mode gate (`evaluateSignerGate`, `assertSignerGate`, `signerGateContextFromSafetyFlags`); the redacted error types (`SecureVenueError`, `SignerBoundaryRefusal`); the opaque `SignerHandle` and `SignedOrderEnvelope`; and `redactForLog`. |
-| `@polymarket-bot/polymarket-secure/testing` | Test-only doubles: the mock signer (no key), a scripted I/O-free fake SDK, `createSecureVenueClientForTesting`, the network tripwire, and the SDK contract hooks. |
+| `@polymarket-bot/polymarket-secure/testing` | Test-only doubles: the mock signer (no key), a scripted I/O-free fake SDK, `createSecureVenueClientForTesting`, the network tripwire, and the SDK contract hooks (since `V2-5` among them a factory over the REAL SDK code with FAKE credentials, usable only with the test factory and the mock signer, behind the tripwire). |
 
 Neither entry point exports a way to build a signer handle, a signer, the SDK
 client, or SDK types. Neither exports any code that reads an environment
@@ -105,13 +107,40 @@ hands out an envelope, it checks the SDK's signed order against the request:
 - the quote amount must be price × shares rounded **down** by less than
   0.001 pUSD, the pinned SDK's coarsest quote precision.
 
+The rounding table these bounds come from is unchanged in `0.12.0`
+(`resolveRoundingConfig`, `actions/orders/context.ts` lines 14-31: shares to
+2 decimals for every tick; the quote to 3 decimals at tick 0.1, 4 at 0.01, 5
+at 0.005 and 0.001, 6 at 0.0025 and 0.0001). `V2-5` re-pinned it against the
+real SDK for all six ticks (`sdk-0-12.test.ts`, section 7). A size with more
+than 2 decimals is therefore still signed for less than was asked (10.129 is
+signed as 10.12 shares). That is the `CO3-N1` gap between the signed size and
+the OMS's unrounded size; it belongs to the pre-live OMS track, not to this
+package.
+
+**Asset ids are decimal strings (`V2-5`, plan row C6).** A CTF token id and a
+Polymarket V2 position id are both canonical decimal strings of at most 78
+digits (venue report 2026-10-05 F-39, F-44; U-13 is resolved). The `0x…` hex
+branch is gone from the request grammar, the signed order's `tokenId` and the
+user stream's `asset_id`: a hex id is `NOT_SENT` (or, on the stream, a
+malformed event that requests reconciliation).
+
+**The SDK picks the signing domain from the id (F-47).** A V2-shaped id
+(reserved bits 40-103 all zero) is signed against ExchangeV3
+(`0xe3333700cA9d93003F00f0F71f8515005F6c00Aa`) with EIP-712 domain version
+`"3"`; any other id against the CTF Exchange or, on a neg-risk market, the Neg
+Risk exchange, with `"2"`. Gamma's `version` is not consulted (U-46). Pinned
+through the real SDK in `sdk-0-12.test.ts`.
+
 These are exact integer comparisons, never floats. A mismatch is `FAILED`
 (`UNKNOWN`), and the order is not transmitted. A change in the SDK's rounding
 therefore fails closed.
 
 `createLimitOrder` never transmits the ORDER, but it is not free of I/O: the
-pinned SDK's `prepareLimitOrder` makes public, unauthenticated reads (market
-metadata and tick size, `actions/orders/cache.ts`). A `FAILED` sign outcome can
+pinned SDK's `prepareLimitOrder` makes public, unauthenticated reads
+(`actions/orders/cache.ts`): `GET /markets-by-token/{id}`, cached for the SDK
+client's life, and `GET /clob-markets/{condition}`, cached for **10 minutes**
+(lines 16-17); a price off the cached tick grid forces one fresh market read.
+A `FAILED` sign outcome can
 therefore carry an HTTP-derived kind (a transport failure, a 429). Whatever
 its kind or effect, a `FAILED` sign outcome means **no order exists**: nothing
 was signed that the caller holds, so nothing can have been posted.
@@ -128,7 +157,7 @@ was signed that the caller holds, so nothing can have been posted.
 | Outcome | Meaning | OMS consequence (ADR-007) |
 | --- | --- | --- |
 | `NOT_SENT` | Nothing left the process: local validation, SDK input validation or signing failed. | The attempt does not exist at the venue. |
-| `REFUSED` | The venue returned a documented refusal whose code the pinned SDK could only have kept because the venue sent it: 503 with `post_only_mode`. (401, 425 and 429 are always `UNKNOWN`; see §2.2.) | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
+| `REFUSED` | The venue returned a documented refusal whose code the pinned SDK could only have kept because the venue sent it: 503 with `post_only_mode` in its `code` field, never a code the SDK inferred from the `error` text (§2.2, rule 4c). (401, 425 and 429 are always `UNKNOWN`; see §2.2.) | Not placed. Retry only as §7 allows. Changing the order to post-only is a new order decision. |
 | `REJECTED` | The SDK classified a venue rejection. The reasons are the eight named `OrderResponseErrorCode` members. | Not placed. |
 | `UNKNOWN` | The order may exist. | `SUBMISSION_UNKNOWN`: reconcile by the signed identity before any new salt (§2 step 10, §3). |
 | `ACCEPTED` / `DELAYED` | The order was placed, but `DELAYED` is never a fill: its amounts are `"0"` (§5). | Track the order as pending. |
@@ -144,7 +173,8 @@ Errors are classified by HTTP status and **documented** code. The venue's
 | `SigningError`, `CancelledSigningError` | `SIGNING_FAILED` | `NOT_SENT` | — |
 | `RateLimitError` (429; the pinned SDK's ONLY 429) | `RATE_LIMITED` | **`UNKNOWN`** (the SDK discards the body) | — |
 | 425, with or without a code | `ENGINE_RESTARTING` | **`UNKNOWN`** (the SDK can drop the code) | `UNKNOWN` |
-| 503 + `code: "post_only_mode"` | `POST_ONLY_MODE` | `NOT_APPLIED` | `YES` (documented) |
+| 503 + `code: "post_only_mode"` sent by the venue | `POST_ONLY_MODE` | `NOT_APPLIED` | `YES` (documented) |
+| 503 + a `post_only_mode` the SDK may have inferred from the `error` text (rule 4c) | `TRADING_UNAVAILABLE` | `UNKNOWN` | `UNKNOWN` |
 | 503, any other or no code | `TRADING_UNAVAILABLE` | `UNKNOWN` | `UNKNOWN` (C-9) |
 | 401, with or without a code | `AUTHENTICATION_REJECTED` | **`UNKNOWN`** (the SDK can drop the code) | — |
 | 401, 425 or 429 with any code (documented or not), including a `code` that is an accessor (present but unreadable) | by status, as above | **`UNKNOWN`** (ADR-007 §6) | as above |
@@ -153,14 +183,36 @@ Errors are classified by HTTP status and **documented** code. The venue's
 | anything else, including an SDK look-alike that is not an instance, and any value whose reflection throws | `UNKNOWN` | `UNKNOWN` | — |
 
 `NOT_APPLIED` (outcome `REFUSED`) is given **only** to 503 with the
-documented `post_only_mode`. ADR-007 §6: "an unrecognized code is surfaced as
-UNKNOWN and never … silently treated as a rejection". The kind still follows
-the status, so a caller can back off.
+documented `post_only_mode`, sent by the venue. ADR-007 §6: "an unrecognized
+code is surfaced as UNKNOWN and never … silently treated as a rejection". The
+kind still follows the status, so a caller can back off.
+
+**Rule 4c: an inferred code is never a documented code (`V2-5`).** From
+`0.12.0` the SDK's `ServiceClient` INFERS a `code` from the body's `error`
+text when the body has no usable `code`, the status is not 400, and the text
+is a snake_case identifier (`ServiceClient.ts` lines 309-318). The 2026-09-30
+report already said this package "must not treat an inferred `code` as a
+venue-documented code" (§2.4). The error object does not say which kind of
+code it holds. An inferred code, though, *is* the `error` text, and the SDK
+builds its message as `${error} (${url})` (line 320; `mapTradingRestrictionError`
+keeps it verbatim when it re-wraps a 425 or 503). So a documented code is
+trusted only when the error's own data `message` is a string that does **not**
+begin with `${code} (`. Otherwise the code is unprovable: `venueCode` null,
+`undocumentedVenueCode` true. A 503 `{"error": "post_only_mode"}` is
+therefore `TRADING_UNAVAILABLE` / `UNKNOWN`, the kind and effect `0.11.0`
+produced for it (only `undocumentedVenueCode` differs: `0.11.0` carried no code
+at all, so it was `false`). The message is compared with that one prefix and dropped, never carried
+or matched against anything else, so it can only withdraw trust from a code,
+never grant it. A venue body whose `error` text is itself `post_only_mode`
+and that also sends the code is `UNKNOWN` too: the fail-closed direction. The
+documented post-only body (a sentence `error` and an explicit code) is
+unaffected. Pinned through the real SDK, on the public client and the
+authenticated `POST /order` path, in `v2-5.test.ts`.
 
 **401 and 425 are `UNKNOWN` even with no code (CX-R3-01).** The pinned SDK's
 `ServiceClient` keeps a JSON body's `code` only when the body's `error` is
-truthy and the code is a non-empty string (`if (error) return { message,
-...(typeof code === "string" && code !== "" ? { code } : {}) }`). A body such
+truthy and the code is a non-empty string (and, from `0.12.0`, infers one from
+an identifier-shaped `error`, rule 4c). A body such
 as `{"code": "x"}`, `{"error": "", "code": "x"}` or `{"error": null, "code":
 "x"}`, a non-string code, or a text or HTML body all reach this package with
 no code. So "no code" can never be established, and a code-less 401 or 425
@@ -205,15 +257,38 @@ undocumented codes, not cancel-only evidence.
 
 **U-4.** The only documented `code` value is `post_only_mode`. Any other code is
 recorded only as `undocumentedVenueCode: true`, and its value is not carried.
-A code inferred by the SDK head (after `0.11.0`) is not adopted.
+A code the pinned SDK may have inferred from the `error` text is never adopted
+as documented (rule 4c, above).
 
 **C-6, and what the pinned SDK does.** The venue documents `unmatched` as
-"placement still succeeded". `@polymarket/client@0.11.0` turns that response
+"placement still succeeded". `@polymarket/client@0.11.0` (and `0.12.0`, whose
+`post.ts` and `order-response.ts` are unchanged) turns that response
 into `{ ok: false, code: "unmatched", message: "Unknown order failure" }` and
 **drops the order id**. This is observed in the contract suite. The adapter maps
 it to `UNKNOWN` (`SDK_UNMATCHED`), never to `REJECTED`. The OMS must reconcile
 such an order by its signed identity (salt, maker, token), because it has no
 order id.
+
+### 2.3 The SDK's hidden transport behaviour (pinned by `V2-5`)
+
+The SDK sends every request through `ky` 1.14.3 with `throwHttpErrors: false`
+and no retry or timeout option of its own (`ServiceClient.ts` line 79; ky's
+defaults, `distribution/utils/normalize.js` lines 3-16 and `core/Ky.js` line
+153). For the ten port members that means:
+
+| Request | On a network error (a rejected `fetch`) | On an HTTP error status | Timeout |
+| --- | --- | --- | --- |
+| `DELETE` (every cancel) | retried **twice**, after 0.3 s and 0.6 s: up to 3 attempts | not retried | 10 s per attempt; a timeout is **not** retried |
+| `GET` (`fetchOrder`, the metadata reads of `createLimitOrder`) | retried twice | not retried | 10 s, not retried |
+| `POST` (`postOrder`, `postOrders`) | **never** retried: 1 attempt | not retried | 10 s, not retried |
+
+A cancel can therefore reach the venue up to three times, and a cancel's
+`UNKNOWN` may stand for three attempts (INF: a repeated cancel of the same
+order is expected to be harmless; no venue page states it). A placement is sent once per call; its `UNKNOWN` after a transport
+failure or a timeout is `SUBMISSION_UNKNOWN` (ADR-007 §3). The SDK's own
+rate-limit retry (`retry.ts`, `withRateLimitRetry`) is applied only to some
+public and Data API reads, none of which is a port member. All of this is
+pinned through the real SDK in `sdk-0-12.test.ts`.
 
 ## 3. Why no key can reach a paper process
 
@@ -240,14 +315,20 @@ Six independent layers stop it. Each is tested.
    runbook said the `0x00` byte alone made the signature invalid. That was
    wrong: `0x00` is a valid y-parity, and `ox` recovered an address from it.
    The safety conclusion did not depend on it (no key exists, and the mock
-   cannot reach the real SDK), but the claim is now true.
+   cannot reach the real SDK binding), but the claim is now true.
 3. **The gate refuses every non-live mode and the repository defaults.**
    `MAX_RUN_MODE=PAPER` and `ALLOW_REAL_ORDERS=false` fail two conditions at
    once. A test reads this test process's real environment and asserts the
    refusal.
-4. **The real SDK refuses the mock.** It refuses before unsealing, so even a
-   live-shaped context cannot put the mock in front of the real SDK. The
-   mock's call counters stay at zero.
+4. **The real SDK binding refuses the mock.** `createSecureVenueClient`
+   refuses it before unsealing, so even a live-shaped context cannot put the
+   mock in front of the real SDK through the production factory. The mock's
+   call counters stay at zero. (Since `V2-5` the contract suite does run the
+   real SDK CODE with the mock, through `createSecureVenueClientForTesting`
+   and a test-only factory that adds FAKE credentials, behind the network
+   tripwire. There the SDK asks the mock to sign a venue order domain, and the
+   mock refuses it, by layer 2: no order is signed. The mock records the
+   domain it was asked to sign, which is how the suite pins F-47.)
 5. **Paper processes do not depend on this package.** `packages/trading-core`
    is layer 1, and an edge from it into this layer-2 package fails `check:deps`
    (F12). `packages/simulation` may not import a signer (F5).
@@ -329,8 +410,8 @@ caught on every case.
 
 | Suite | Runs in | Contents |
 | --- | --- | --- |
-| `packages/polymarket-secure/src/**/*.test.ts` | root `pnpm test` (CI) | the gate, the boundary, the error mapping, redaction, the client, the repository-wide SDK import scan, source hygiene, the review pins (`hardening-r1.test.ts`, `hardening-r2.test.ts`), and the tripwire's own self-test (`testing/network-tripwire.test.ts`) |
-| `test/contract/polymarket-secure/*.test.ts` | `pnpm --filter @polymarket-bot/polymarket-secure test:contract` | the venue fixtures run through the pinned SDK's own response parser and HTTP error construction, then through the client |
+| `packages/polymarket-secure/src/**/*.test.ts` | root `pnpm test` (CI) | the gate, the boundary, the error mapping, redaction, the client, the repository-wide SDK import scan, source hygiene, the review pins (`hardening-r1.test.ts` to `hardening-r3.test.ts`), the `V2-5` pins (`v2-5.test.ts`: rule 4c, the decimal asset ids, the ten-member port, the loggable SDK error names), and the tripwire's own self-test (`testing/network-tripwire.test.ts`) |
+| `test/contract/polymarket-secure/*.test.ts` | root `pnpm test:contract` (CI), or `pnpm --filter @polymarket-bot/polymarket-secure test:contract` | the venue fixtures run through the pinned SDK's own response parser and HTTP error construction, then through the client; and (`V2-5`, `sdk-0-12.test.ts`) the pin's integrity, F-47 signing domains, F-53 `CONDITIONAL-V2`, no `place*`, the transport behaviour of §2.3, the 10-minute metadata cache and the rounding table, all through the real SDK code |
 
 Every test installs the **network tripwire**. It replaces `globalThis.fetch`,
 `globalThis.WebSocket` and `net.Socket.prototype.connect`, the path under
@@ -339,14 +420,17 @@ every Node TCP and TLS client. It also refuses DNS (every `lookup*`,
 the `Resolver` classes' methods) and UDP (`dgram.Socket` `send` and
 `connect`). Any attempt throws and is recorded, and the
 test fails in `afterEach` if the attempt list is not empty. The contract suite
-serves sanitized HTTP fixtures to the SDK from an in-memory responder. It uses
-only one unauthenticated public-client request, and every other request is
-refused. `testing/network-tripwire.test.ts` exercises every leg (fetch,
+serves sanitized HTTP fixtures to the SDK from an in-memory responder. Before
+`V2-5` it used only one unauthenticated public-client request. Since `V2-5` it
+also builds the real SDK's secure client with the FAKE L2 credential of the
+fake SDK (`fake-api-key-WP260-…`), so the SDK signs the HMAC headers of its
+requests with that fake secret; every such request is answered from memory,
+and anything the responder does not answer is refused. `testing/network-tripwire.test.ts` exercises every leg (fetch,
 WebSocket, TCP and TLS, DNS, UDP, and restoration), so removing a leg fails the root
 `pnpm test`.
 
-No test uses a real key, a credential, an authenticated endpoint or a
-WebSocket connection. No test places an order.
+No test uses a real key, a real credential, a real authenticated endpoint or
+a WebSocket connection. No test signs or places an order on a venue domain.
 
 ## 6. What a future live process must do (NOT enabled; for the record)
 
@@ -361,7 +445,48 @@ Nothing below is authorised. ADR-010 §1: human approval first, recorded in
 - Keep the startup deny-list and the four PAPER defaults in every non-live
   process.
 
-## 7. SDK pin and the §W.1 fresh check (2026-09-30)
+## 7. SDK pin and the §W.1 fresh check
+
+### 7.1 The current pin: `0.12.0` (`V2-5`, 2026-10-06)
+
+`V2-5` ran the five-step check of `docs/venue/verified-2026-09-30.md` §W.1 at
+2026-10-06T10:22:08Z-10:22:46Z, before it changed the dependency. The sources
+were read-only, unauthenticated GETs of `registry.npmjs.org` (metadata and
+attestations), `api.github.com` (commit and compare) and the documentation
+changelog; the raw bodies, their SHA-256 digests and the fetch log are in the
+round's scratch directory, mirrored to `~/pmb-rounds/v2-5/pin-check/`.
+
+| Step | Check | Result |
+| --- | --- | --- |
+| 1 | npm `dist-tags.latest` for `@polymarket/client` | **`0.12.0`** (published 2026-10-01T14:04:12.359Z). No `0.12.x` patch exists. The other tags were recorded and not adopted: `beta 0.3.0-beta.1`, `latestnpm 0.4.0`, `canary 0.0.0-canary-20261001190242`. |
+| 1 | GitHub `Polymarket/ts-sdk` `main` head | `d36b9df37b8562887aadad78b063bb84550eb343` (2026-10-01T18:58:58Z, "Merge pull request #380 from Polymarket/feature/dev-697-price-provider"). It is unreleased and **not pinned**. |
+| 2 | Integrity | `@polymarket/client@0.12.0`: `sha512-ZciRp/j0bLQYB3ownLtQDarBTgT3WwXuk/Gp+Ppt7bz/9U4X5EL6DlrLUMBKcYyvFJfK17dKUhe/YPZSngMhqw==` (npm shasum `f96f6ac7ead4c9b97d6e5be05ecc05c62d2149dc`). `@polymarket/bindings@0.12.0`: `sha512-x/7CA6+n20joFvjk0GpUYn01XNbARAe4UwnUsGp/LnE+xaCM1DJjAq6dhI/ZiMmVdgbyVn1ukNeXPrhQ8GhTIQ==` (shasum `e6180811be40028c9c9cb6d6ef2c492688332d9e`). Both equal `verified-2026-10-05.md` §S.1 and the lockfile; `pnpm install` verified the tarballs against them. |
+| 2 | The npm attestations `/-/npm/v1/attestations/@polymarket%2fclient@0.12.0` and `…%2fbindings@0.12.0` | Each SLSA provenance v1 names `git+https://github.com/Polymarket/ts-sdk@refs/heads/main`, workflow `.github/workflows/release.yml`, `gitCommit` **`71f9723f70f065af79670ac6269ab51729fcfb5e`** (2026-10-01T13:58:32Z, "Merge pull request #367 from Polymarket/changeset-release/main"). The subject sha512 digests, `65c891a7…9e0321ab` and `c7fec203…f0685321`, are the two integrities above in hex. |
+| 3 | `latest` moved, so: the changelog and the diff | The `0.12.0` entry of `https://docs.polymarket.com/changelog/sdks.md` contains neither "breaking" nor "removed". Its behaviour changes (account-trade hashes may be absent, cursors bound to their query, new position filters, split/merge/redeem by `version`, `CONDITIONAL-V2`) touch none of the ten port members. The compare `d527956f…71f9723f` is 88 commits and 66 files ahead, 0 behind. Of the §W.1 table's secure-client files, only these changed: `ServiceClient.ts` (+11/−1: the code inference, rule 4c), `errors.ts` (+77: `PaginationLimitError`, `OperationAbortedError`, `PerpsCancelRetryError`), `index.ts` (+4: `AssetType` and Perps exports), `decorators/subscriptions.ts` (+1: a type export), bindings `clob/account.ts` (+11/−2: `CONDITIONAL_V2`, optional `transactionHash`) and bindings `shared.ts` (+9: a helper). Unchanged: `post.ts`, `restrictions.ts`, `typed-data.ts`, `cancel.ts`, `orders.ts`, bindings `order-response.ts`, the four auth files, `websockets/clob/user.ts`, bindings `subscriptions/clob.ts`, `environments.ts`, `clients.ts`, the realtime and RTDS files; and, beyond the table, `limit.ts`, `amounts.ts`, `fixed.ts`, `context.ts`, `cache.ts`, `prepare.ts`, `protocol.ts`, `exchange.ts`, `wallet.ts`, `retry.ts`, `rate-limit.ts` and `decorators/trading.ts`. **Choice: `0.12.0`**, the documented floor (F-37). |
+| 4 | `engines.node` | `>=24` for both packages, unchanged. |
+| 5 | Has the E-11 legacy-topic removal landed in `0.12.0`? | No: `actions/subscriptions.ts` and `websockets/rtds.ts` are unchanged since `0.11.0`, which deprecated the legacy topics. This package does not use RTDS topics. |
+
+- **The lockfile change** touches only the `@polymarket/client` and
+  `@polymarket/bindings` entries (importer, packages and snapshots). The
+  dependency ranges of both are unchanged apart from the exact bindings pin,
+  so `ky` 1.14.3, `ox` 0.14.53 and `zod` 4.4.3 did not move (ADR-020 §7: no
+  `zod` change).
+- **What `V2-5` re-verified, the list WP-260 left for any re-pin:**
+  - the `ServiceClient` code-retention rule: **changed** (rule 4c, §2.2);
+  - the 429 throw order: unchanged (`ServiceClient.ts` lines 243-248);
+  - `Tr`/`Ee`/`Bo` (`wallet.ts`) and the `WalletType`/`SignatureType` enums:
+    unchanged;
+  - the rounding constants: unchanged (§2, pinned for all six ticks);
+  - `LOGGABLE_ERROR_NAMES`: the three new SDK error classes were added.
+- **Entry points:** production code imports only the SDK root. Since `V2-5`
+  the test-only hooks (`src/testing/sdk-contract.ts`) also import
+  `@polymarket/client/actions` (`fetchBalanceAllowance`). No signer adapter
+  (`/viem`, `/ethers-v5`, `/privy`) is imported, and the optional peers are
+  still not installed.
+- **Audit:** `pnpm audit --audit-level high` exits 0 after the change; see the
+  `V2-5` handoff for the counts.
+
+### 7.2 The earlier pin: `0.11.0` (`WP-260`, 2026-09-30; superseded)
 
 The check was run by `WP-260` at 2026-09-30T15:48:20Z, before the dependency
 was added. The sources were read-only, unauthenticated metadata GETs; no
@@ -388,7 +513,7 @@ tarball was downloaded before the install.
   every `@polymarket/bindings` symbol, but the runtime root exports only the
   enums. `OrderResponseSchema`, for example, is `undefined` at runtime. The
   adapter does not rely on any schema export. The contract hook finds the
-  schema from the SDK's own resolution root.
+  schema from the SDK's own resolution root. (`0.12.0` behaves the same.)
 
 ## 8. Open items owned elsewhere
 
@@ -405,7 +530,6 @@ tarball was downloaded before the install.
   and the signed fields.
 - **`WP-290`.** Reconciliation needs `listOpenOrders` and trade reads. They
   can be added to the interface in the same pattern.
-- **Wiring the contract suite into the root `test:contract` script.** That
-  script lives in the protected root `package.json`, outside `WP-260`'s
-  allowed paths. Until it is added, run the suite with the filter command in
-  section 5.
+- **Wiring the contract suite into the root `test:contract` script.** Done
+  since: the root `test:contract` runs this package's `test:contract`
+  (section 5).

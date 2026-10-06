@@ -97,3 +97,21 @@ Rounds 6–8 found the same class of defect at three new boundaries. Round 8 was
 
 ## commit_sha
 `d997d392496d7a25ab6531741b9423f579f508ae`. It was merged together with ADR-023's Accepted status (`a126ed1`) and main (`b086786`).
+
+## Moved from the brief (2026-10-06, `RECORDS-W3`)
+
+The brief carried this package's rulings and its authorization detail under "Authorized now" until `47549ac`. They moved here verbatim, to bring the brief within its budget. The brief keeps one line on the rulings and the user's open choice on the taint, under Human items.
+
+```markdown
+- `THROUGHPUT-1c` is Complete (2026-10-02, `0c270df`); ADR-023 is Accepted, ratified by the user as is. See [Work packages](#work-packages). Its rulings and evidence are below, kept for reference.
+  - **Rulings: made by the orchestrator on 2026-10-01, each the most conservative option, and confirmed by the user's ratification of ADR-023 on 2026-10-02:**
+    - **ADR-023 D7: option (a)**, the process-lag guard, as implemented. Not (b), narrowing criterion B, and not (c), deferring the opt-in.
+    - **The Clock-port reading:** the guard's use of the `Clock` port is NOT a clock-semantics change. Every age stays in event time; the process clock can only remove the extension ADR-023 adds, never make a book fresher (ADR-023 D7). `CO2-N1` is unchanged.
+    - **The epoch taint (O-I1(ii)): kept coarse and fail-closed.** Any market-less incident taints the gateway epoch, with no source filter. Narrowing it, for example ignoring reference-venue incidents, would LOOSEN a fail-closed rule, so it is left to the user. Consequence: with a Binance feed the rule changes nothing until narrowed (ADR-023 §5).
+  - **Test-path ownership (2026-10-01):** `THROUGHPUT-1c`'s test grant is narrowed to the paths it has touched: `test/integration/paper-trader/**` and `test/unit/strategies/**` (plus tests inside its packages). This lifts `STORAGE-1`'s dependency on it, per the work plan's own clause; their test paths are disjoint.
+  - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
+  - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
+  - Scope (2): end to end: a gateway liveness signal if one is needed, then features, strategy and risk freshness, with the strategy's parameter and version discipline.
+  - Evidence (3): a quiet but live book is fresh; a silent or disconnected feed is stale within its bound; every golden change is listed and explained.
+  - HARDENING LOOP; verifier: a Fable adversarial-reviewer. Gate: automated checks, the Fable adversarial review, the user's ADR-023 ratification, and a green CI run on GitHub.
+```

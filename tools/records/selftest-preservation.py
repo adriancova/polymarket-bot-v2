@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Show that check-preservation.py is not vacuous (LOGS-1).
 
-Usage: python3 tools/records/selftest-preservation.py [--base <rev>] [--repo .]
+Usage: python3 tools/records/selftest-preservation.py [--base <rev>] [--repo .] [--brief-only]
 
 Builds a scratch copy of the brief, the archive and the handoff index (everything
 else is symlinked), confirms the unmodified copy passes, then applies one
@@ -10,6 +10,10 @@ check-brief.py mutations, and a synthetic re-cut: a commit (in a shared scratch
 clone) that inserts a line above a rewritten region, re-split and re-mapped,
 must PASS once its new line is declared, and FAIL without the declaration. The
 repository itself is never modified. Exit 0 when every expectation holds.
+--brief-only runs only the check-brief.py half: the unmodified copy, BRIEF_MUTATIONS and
+BRIEF_ARG_CASES. It is the records round's test of check-brief.py on its own (RECORDS-W3): the
+preservation half compares the brief with REWRITES.md as of the cut, so it fails on any brief
+edited on main since, until the archive is re-cut.
 Stdlib only, no network.
 """
 
@@ -41,6 +45,9 @@ def shadow(repo, dst):
     os.mkdir(os.path.join(dst, "docs"))
     for name in os.listdir(os.path.join(repo, "docs")):
         if name in ("status-archive", "handoffs"):
+            continue
+        if name == "adr":  # copied: K36 reads ADR-024 from the checked tree, and a mutation edits it
+            shutil.copytree(os.path.join(repo, "docs", name), os.path.join(dst, "docs", name))
             continue
         os.symlink(os.path.join(repo, "docs", name), os.path.join(dst, "docs", name))
     shutil.copytree(os.path.join(repo, ARCH), os.path.join(dst, ARCH))
@@ -317,8 +324,10 @@ BRIEF_MUTATIONS = [
      lambda t: t.replace("| a tooling round |", "| — |", 1), "K5:"),
     ("a completed track in the residual table", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("| `§5 item 6` |", "| `H8 track` | Complete (B3 closed). | the user |\n| `§5 item 6` |", 1), "K9:"),
-    ("drop the green CI gate from THROUGHPUT-1c", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace(", the user's ADR-023 ratification, and a green CI run on GitHub.\n", ", and the user's ADR-023 ratification.\n", 1), "K13:"),
+    # RECORDS-W3: THROUGHPUT-1c's Authorized-now bullet moved to its handoff; an authorized bullet for it
+    # that omits its archived gate's green CI run is still refused.
+    ("an Authorized-now bullet without its gate's green CI run (THROUGHPUT-1c)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- **`HOST-BENCH`**: Ready;", "- **`THROUGHPUT-1c`**: Ready (authorized).\n- **`HOST-BENCH`**: Ready;", 1), "K13:"),
     ("AGENTS.md without 'frozen'", "AGENTS.md",
      lambda t: t.replace("archived, verbatim and frozen, under", "archived verbatim under", 1), "K11:"),
     ("README rule 10 back to 'add one line'", "docs/handoffs/README.md",
@@ -335,9 +344,10 @@ BRIEF_MUTATIONS = [
     ("a ruling that does not say what it ruled", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("- **H5**: ruled 2026-09-28: one demonstrated run.",
                          "- **H5**: Ruled by the user 2026-09-28.", 1), "K16:"),
-    ("B5 narrates the record", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("No test validates the scrape fragment (`infra/prometheus/control-api-scrape.yaml`).",
-                         "The row also records that no test validates the scrape fragment.", 1), "K17:"),
+    # RECORDS-W3: B5 is closed; the narration check runs on the H3 line, which carries B5's qualification.
+    ("H3 narrates the record", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("No real Grafana has rendered a non-empty Fills or PnL panel.",
+                         "The row also records that no real Grafana has rendered a non-empty Fills or PnL panel.", 1), "K17:"),
     ("the old coverage heading", f"{ARCH}/REWRITES.md",
      lambda t: t.replace("## Coverage: base lines not included in a rewrite pair\n", "## Coverage: lines no entry pairs\n", 1), "K18:"),
     ("the old Wave 3 intro", "IMPLEMENTATION_STATUS.md",
@@ -351,8 +361,8 @@ BRIEF_MUTATIONS = [
     ("the Wave 3 intro says 'starts' (a commitment) instead of 'may start'", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("The orchestrator may start `WP-260` first,", "The orchestrator starts `WP-260` first,", 1), "K19:"),
     ("the Archive intro back to 'Everything below was moved verbatim'", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("The whole file at `8fde4df` is archived verbatim in these files.",
-                         "Everything below was moved verbatim from this file at `8fde4df`.", 1), "K20:"),
+     lambda t: t.replace("The whole file at `8fde4df` is archived verbatim in [",
+                         "Everything below was moved verbatim from this file at `8fde4df`. See [", 1), "K20:"),
     ("REWRITES.md's intro without C11", f"{ARCH}/REWRITES.md",
      lambda t: t.replace("- each archive file named in a Facts account holds at least one of that entry's old or excerpt lines (C11);\n", "", 1), "K21:"),
     ("REWRITES.md's intro without C14 and C15", f"{ARCH}/REWRITES.md",
@@ -387,8 +397,10 @@ BRIEF_MUTATIONS = [
     ("REWRITES.md's coverage prose as one dense line again (CX-R5-04)", f"{ARCH}/REWRITES.md",
      lambda t: t.replace("\n\n**Dispositions.** ", " **Dispositions.** ", 1).replace("\n\n**Closed in the base.** ", " **Closed in the base.** ", 1)
      .replace("\n\nA row that is closed in part", " A row that is closed in part", 1), "K29:"),
-    ("the WP-040 obligation reads as a fact again (R5-01)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("`WP-320` must write the attempt row", "`WP-320` writes the attempt row", 1), "K28:"),
+    # RECORDS-W3: `WP-320` is Complete since 2026-10-05, so R5-01's sentence no longer reaches K28; a
+    # present-tense sentence about a package that is not Complete (`WP-360`) still fails.
+    ("an obligation of a package that is not Complete reads as a fact (R5-01's rule)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- `WP-060`: the 5 ms p99", "- `WP-060`: `WP-360` calibrates the fill model. The 5 ms p99", 1), "K28:"),
     ("the Complete-row intro promises every owner again (R5-02)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("Each bullet states them as the row does. Where a bullet names no owner, the owner is in the handoff linked from the package's row under Work packages.",
                          "Each bullet states them as the row does, with the owner the row or its handoff names.", 1), "K26:"),
@@ -462,19 +474,40 @@ BRIEF_MUTATIONS = [
      lambda t: t.replace("| `N3` |", "| `GATE1-R3` | The remaining unknown was the first real CI run's fresh install. | H2 |\n| `N3` |", 1), "K31:"),
     ("TRDR4-CITES pinned to another commit than its section (L2, LOGS-1-RECUT r1)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("At `8fde4df` they are `:301`", "At `f43efe6` they are `:301`", 1), "K37:"),
-    ("LOGS-1's gate without its Fable reviewer (CX-RECUT-01)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("  - Gate: a Fable review of the preservation,", "  - Gate: a review of the preservation,", 1), "K36:"),
+    # RECORDS-W3: K36's LOGS-1 rule is retired (the bullet left the brief at LOGS-1's completion); the
+    # reviewer-less gate wording is still refused by K37.
+    ("LOGS-1's gate without its Fable reviewer comes back (CX-RECUT-01)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- **`HOST-BENCH`**: Ready;", "  - Gate: a review of the preservation, and a green CI run on GitHub.\n- **`HOST-BENCH`**: Ready;", 1), "K37:"),
     ("RW-01 says LOGS-1 merged (CX-RECUT-02)", "docs/status-archive/REWRITES.md",
      lambda t: t.replace("re-cut at `8fde4df` for LOGS-1's pending merge.", "re-cut at `8fde4df` when LOGS-1 merged.", 1), "K37:"),
     ("the THROUGHPUT-2 bullet without the review's LOWs (L4)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace(", and so are the review's two LOWs, `TP2-R2-L1` and `TP2-R2-L2`.", ".", 1), "K36:"),
     ("exceed the 15% budget", "IMPLEMENTATION_STATUS.md",
      lambda t: t + ("filler " * 9000) + "\n", "K1:"),
+    # RECORDS-W3: one pin per changed rule
+    ("exceed the line budget alone (K1 counts lines too)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t + "\n" * 60, "K1:"),
+    ("a section pins its citations as of another commit than the cut (K33)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("File:line citations are as of `8fde4df`.", "File:line citations are as of `f43efe6`.", 1), "K33:"),
+    ("an unregistered file:line citation comes back (K33; `:906` is retired)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- **H6**, the authorization rows", "- **H6** (runbook §10, `:906` at `f43efe6`), the authorization rows", 1), "K33:"),
+    ("H1R1's closure says ADR-024 is accepted without the ratification (K36, re-anchored)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("ADR-024 is accepted (ratified by the user 2026-09-30)", "ADR-024 is accepted (2026-09-30)", 1), "K36:"),
+    ("ADR-024 loses its ratification in the tree (K36 reads the checked tree)", "docs/adr/ADR-024-evaluate-once-per-venue-frame.md",
+     lambda t: t.replace("Ratified by the user on 2026-09-30", "Pending the user's ratification", 1), "K36:"),
+    ("Wave 3's first condition no longer names the CLOSED grade (K36, re-anchored)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("- the fresh Wave 2 closeout audit grades Wave 2 CLOSED:", "- the fresh Wave 2 closeout audit has run:", 1), "K36:"),
+]
+
+# check-brief.py runs with other arguments: (name, extra arguments, the report line that must appear)
+BRIEF_ARG_CASES = [
+    # RECORDS-W3: K31-K36 read their evidence at the archive's cut, not at --base.
+    ("the unmodified copy, with the evidence read at the first cut instead of the archive's", ["--cut", "f43efe6"], "K33:"),
 ]
 
 
-def run(repo, root, base, only, tool=CHECK):
-    cmd = [sys.executable, tool, "--base", base, "--repo", repo, "--root", root]
+def run(repo, root, base, only, tool=CHECK, extra=()):
+    cmd = [sys.executable, tool, "--base", base, "--repo", repo, "--root", root, *extra]
     if tool == CHECK:
         cmd += ["--only", only]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -551,6 +584,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="non-vacuity self-test for check-preservation.py")
     ap.add_argument("--base", default=None, help="default: the cut recorded in the archive markers")
     ap.add_argument("--repo", default=".")
+    ap.add_argument("--brief-only", action="store_true", help="run only the check-brief.py half")
     args = ap.parse_args()
     repo = os.path.abspath(args.repo)
     base = args.base
@@ -562,10 +596,11 @@ def main() -> int:
         clean = os.path.join(tmp, "clean")
         os.mkdir(clean)
         shadow(repo, clean)
-        code, out = run(repo, clean, base, "A,B,C")
-        print(f"[{'ok' if code == 0 else 'UNEXPECTED'}] unmodified copy passes (exit {code})")
-        ok &= code == 0
-        for k, (name, rel, fn, only, expect) in enumerate(MUTATIONS, 1):
+        if not args.brief_only:
+            code, out = run(repo, clean, base, "A,B,C")
+            print(f"[{'ok' if code == 0 else 'UNEXPECTED'}] unmodified copy passes (exit {code})")
+            ok &= code == 0
+        for k, (name, rel, fn, only, expect) in enumerate([] if args.brief_only else MUTATIONS, 1):
             root = os.path.join(tmp, f"m{k}")
             os.mkdir(root)
             shadow(repo, root)
@@ -588,6 +623,15 @@ def main() -> int:
             ok &= hit
             detail = next((l.strip() for l in out.split("\n") if expect in l), "no matching line")
             print(f"[{'ok' if hit else 'UNEXPECTED'}] check-brief: {name}: exit {code}; {detail[:150]}")
+        for name, extra, expect in BRIEF_ARG_CASES:
+            code, out = run(repo, clean, base, "", tool=BRIEF, extra=extra)
+            hit = code == 1 and expect in out
+            ok &= hit
+            detail = next((l.strip() for l in out.split("\n") if expect in l), "no matching line")
+            print(f"[{'ok' if hit else 'UNEXPECTED'}] check-brief {' '.join(extra)}: {name}: exit {code}; {detail[:150]}")
+        if args.brief_only:
+            print("SELFTEST (check-brief.py only): " + ("PASS" if ok else "FAIL"))
+            return 0 if ok else 1
         code, out = recut(repo, tmp, base, declare=True)
         hit = code == 0 and "C6:" not in out
         ok &= hit

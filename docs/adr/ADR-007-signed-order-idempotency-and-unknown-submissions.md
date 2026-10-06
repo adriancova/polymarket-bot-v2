@@ -3,9 +3,19 @@
 - **Status:** Accepted
 - **Date:** 2026-08-26
 - **Recorded by:** `WP-030`
-- **Implemented by:** `WP-260` (secure adapter), `WP-270` (OMS and signed-order
-  persistence), `WP-280` (user stream), `WP-290` (reconciliation), `WP-310`
-  (rate limits and restricted modes) — **not yet implemented**
+- **Implemented by:** `WP-260` (secure adapter, merged `32d10be`), `WP-270`
+  (OMS and signed-order persistence, `259c964`), `WP-280` (user stream,
+  `065716f`), `WP-290` (reconciliation, `7a53988`) and `WP-310` (rate limits
+  and restricted modes, `fdf27ff`), all PAPER only. Two parts are not
+  implemented:
+  - §8's FAK and FOK: the OMS cannot carry either order type (`CO3-N2`);
+  - the signed-order store is a port with an in-memory store; the adapter on
+    migration `0005` and its AEAD cipher are composition duties (`CO3-N3`).
+
+  Corrected 2026-10-06 (`RECORDS-W3`, `CLOSEOUT-3` L9): was '`WP-260` (secure
+  adapter), `WP-270` (OMS and signed-order persistence), `WP-280` (user
+  stream), `WP-290` (reconciliation), `WP-310` (rate limits and restricted
+  modes) — **not yet implemented**'.
 - **Supersedes / Superseded by:** none
 
 ## Context

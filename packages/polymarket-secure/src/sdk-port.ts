@@ -1,15 +1,25 @@
 /**
  * The seam between this package and the pinned SDK (`@polymarket/client`,
- * exactly `0.11.0`; venue report §W.1).
+ * exactly `0.12.0`; V2-5 re-pinned it from `0.11.0`, with the fresh check of
+ * venue report 2026-09-30 §W.1 recorded in `docs/runbooks/signer.md` §7).
  *
  * {@link SdkSecureClientPort} is the SUBSET of the SDK's `SecureClient` this
  * package uses. Keeping it a `Pick` of the SDK's own type means a breaking
  * SDK change to any method used here fails `typecheck`, not production.
  *
- * {@link makeRealSdkClientFactory} is the only place this package calls
- * `createSecureClient`. It is not exported from the package entry points; the
- * public factory (`createSecureVenueClient`) reaches it only after the
- * run-mode gate and the signer checks have passed.
+ * {@link makeRealSdkClientFactory} is the only PRODUCTION place this package
+ * calls `createSecureClient`. It is not exported from the package entry
+ * points; the public factory (`createSecureVenueClient`) reaches it only after
+ * the run-mode gate and the signer checks have passed. The test-only contract
+ * hook `testing/sdk-contract.ts` wraps it (it adds FAKE credentials, so the
+ * real SDK code can run behind the network tripwire); the `./testing`
+ * subpath is importable by test files only (`sdk-import-boundary.test.ts`).
+ *
+ * THE PORT MUST NEVER GAIN A `place*` MEMBER: the SDK's `placeLimitOrder` /
+ * `placeMarketOrder` post the order AND, on a 400 "allowance is not enough",
+ * send ERC-20 / ERC-1155 approval transactions by themselves
+ * (`actions/orders/trade.ts`, `postOrderWithAllowanceRecovery`). V2-5 pins
+ * the ten members (`v2-5.test.ts`).
  */
 
 import { createSecureClient, type RateLimitUpdate, type SecureClient, type Signer } from "@polymarket/client";
