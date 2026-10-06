@@ -7,6 +7,9 @@
 - **Implemented by:** `ROLLOVER-1`, merged `ae11daa` (2026-10-05).
   [Amendment 1](#amendment-1-2026-10-05-rollover-1) (2026-10-05) records the
   admission policies it implemented, as the orchestrator's interim rulings.
+  [Amendment 2](#amendment-2-2026-10-05-venue-4) (2026-10-05) adapts
+  admission and resolution to Polymarket Protocol V2. `V2-1` and `V2-3`
+  implement it; not yet.
 - **Supersedes / Superseded by:** none. It **amends** handoff §9.2 for PAPER,
   the gateway's "no discovery" contract, and the run-boundary semantics. It
   does not amend ADR-009 §1 (see "What it amends"). It is **not**
@@ -462,3 +465,228 @@ window by window while exceeding it in sum. A held window that cannot be
 marked stops entries; it never lets one pass. Items 6 and 7 are the
 exceptions: item 6 for check 17, and item 7 for check 17 and check 16's
 resolution limit.
+
+## Amendment 2 (2026-10-05, VENUE-4)
+
+- **Recorded by:** `V2-0`.
+- **Source:** `VENUE-4`, merged `f925a43` after a joint ACCEPT at
+  `caf502d`. Its record is `docs/handoffs/VENUE-4.md`.
+  - The facts are `docs/venue/verified-2026-10-05.md`, cited here by id
+    (`F-nn`, `C-nn`, `U-nn`, `O.n`).
+  - The plan is `docs/venue/protocol-v2-migration-plan.md`. §5 item 1 lists
+    the five points this amendment decides.
+- **Standing:**
+  - Rules 1-4 are the orchestrator's, made 2026-10-05. Rule 1 follows the
+    venue's documented instruction (F-38 to F-40). Rules 2-4 apply
+    Decisions 1.4, 1.7 and 3.1 to it.
+  - Rule 5 is **the orchestrator's interim ruling for PAPER and BACKTEST**,
+    made 2026-10-05. The user may confirm or overrule it.
+- **User rulings:** none is changed. Ruling A5 (2026-09-30), rulings Q1-Q4
+  (2026-10-04) and the confirmation of Amendment 1 (2026-10-05) stand. The
+  user's SDK-scope ruling of 2026-10-05 keeps the reads below on our own
+  clients (ADR-010 §4, note of 2026-10-05).
+- **Mode:** PAPER and BACKTEST, the modes admission runs in (Decision 2.1).
+  It changes nothing above PAPER, and auto-approves nothing for live trading
+  (Decision 2).
+- **The handoff:** nothing in it is departed from. Rule 5 adds a venue
+  source for `MarketResolved`, and the handoff names none (§7.4, §9.3).
+- **Why now:**
+  - Our series is still all V1 (O.5). Its windows may become V2 from about
+    2026-11-02 (C-23, U-37).
+  - Today admission reads only `clobTokenIds`, so it would refuse every V2
+    window (plan A1).
+  - No V2 `market_resolved` frame has been observed (F-62, U-38).
+
+The rules are numbered within this amendment. From outside it, cite one as
+"ADR-030 Amendment 2, rule 3". Code is cited by symbol.
+
+### Rule 1. The trading ids are selected by Gamma `version`
+
+**Amends:** Decision 1.2, which names "the outcome token ids".
+
+1. A window's trading ids are taken from the field its Gamma market's
+   `version` selects (F-38):
+   - `"v2"`: `positionIds`, an array of decimal strings;
+   - `"v1"`: `clobTokenIds`, a JSON-encoded array of decimal strings, decoded
+     first.
+2. The selection holds "even when both fields are present" (F-38). Presence
+   never selects the protocol (F-40). The other field is never read as an
+   id.
+3. Each of these is refused by name, and fails closed with the existing
+   refusal incident (Decisions 1.4 and 1.5):
+   - a missing or null `version`, or any value but `"v1"` and `"v2"` (F-39,
+     F-40);
+   - a selected field that is absent or null: "the IDs are not yet
+     available" (F-40);
+   - an id that is not a decimal string (F-39);
+   - not exactly two ids, or two equal ids (plan `V2-1` acceptance 2);
+   - outcomes that do not match the reviewed labels and order, as today
+     (F-39; Decision 1.1).
+4. Index 0 is YES and index 1 is NO (F-40). The CLOB `t[]` pairing check
+   stays as merged. For a V2 market, `t[].t` carries the position ids
+   (O.3).
+5. Decision 1.2 now reads: "Some facts are new in every window: the outcome
+   trading ids, selected by the window's `version` (Amendment 2, rule 1),
+   the condition id, and the open and close times." The version is checked
+   against the review (rule 2).
+6. The ids travel in the existing contracts' token-id fields. A V2 position
+   id is a 75-digit decimal string (F-44), which the repository's token-id
+   schema accepts (plan A17). No event contract changes.
+7. The CLOB's `v` field is undocumented (C-21). It is never an authority,
+   and it can only refuse. A present `v` that differs from Gamma's `version`
+   refuses the window; an absent `v` refuses nothing (plan `V2-1`
+   acceptance 8).
+
+**Why it fails closed:** every unclear case is a refusal. A V2 window whose
+Gamma record also carries `clobTokenIds` can no longer be admitted with the
+CTF ids (plan A1).
+
+### Rule 2. The accepted protocol versions are a reviewed series parameter
+
+**Refines:** Decisions 1.1 and 1.4, and Decision 4.3.
+
+1. A reviewed series names `acceptedProtocolVersions`: a non-empty list of
+   distinct values, each `"v1"` or `"v2"`. The gateway never infers it.
+2. A window whose `version` is not in the list is refused, with the
+   existing incident. This is how Decision 1.4's "every reviewed parameter
+   exactly" applies to the version, as `allowedTickSizes` does for tick
+   size (Amendment 1, "Decision 1, as merged").
+3. The list is part of the review, so it is part of `seriesConfigHash`.
+   - The venue moving a series from `"v1"` to `"v2"` changes no hash.
+   - Only a review that changes the list does. That starts a new run
+     (§9.6; Decision 4.3).
+4. Both copies of the review schema carry it, so the gateway's and the
+   trader's hashes stay equal: `ReviewedSeriesSchema` in
+   `packages/universe` and its mirror in `packages/trading-core` (plan A6).
+5. `SeriesWindowAdmitted@1` carries no version, so the gateway alone judges
+   it. A version on an event would need a `packages/domain/**` grant
+   (Decision 3.3). This amendment asks for none.
+
+**Why it fails closed:** a series admits V2 windows only after a person has
+reviewed the switch. Until then its V2 windows are refused. The cost is
+liveness: a series meant to trade through the switchover needs a review that
+accepts `"v2"` before its first V2 window.
+
+### Rule 3. Gamma's condition id is the identity; the CLOB and the Data API get 32 bytes
+
+**Refines:** Decision 1.2 (the condition id) and the reads of Decision 3.1.
+
+1. Gamma's condition id, as Gamma serves it, stays the window's identity.
+   `windowInternalMarketId` hashes it, and the events carry it (plan A7).
+2. A V2 condition id is `bytes31`. Boundaries that take `bytes32` "use the
+   same values right-padded with zero bytes" (F-43).
+   - Gamma's documented V2 example is the 31-byte form (F-43).
+   - The width Gamma serves for our series is unobserved (U-36).
+3. So every condition-keyed CLOB or Data API read under this ADR sends the
+   32-byte form:
+   - a 31-byte id (62 hex digits) is right-padded with one zero byte;
+   - a 32-byte id (64 hex digits) is sent unchanged;
+   - any other width is refused, and no read is made.
+4. The reason: `/clob-markets` answers the 31-byte form with 404, and
+   `/v2/resolutions` with 400. Both answer the 32-byte form (F-70; C-19).
+5. A condition id in a CLOB or Data API answer is compared with the window's
+   padded form, never with Gamma's text.
+6. The user-stream filter and market-wide cancel are outside this ADR. Their
+   width is U-41.
+
+**Why it fails closed:** one identity is used throughout, so a window's id
+never depends on the boundary. An id of any other width is refused.
+
+### Rule 4. `GET /v2/resolutions` is a journaled public read
+
+**Refines:** Decision 3.1.
+
+1. The gateway may read Data API `GET /v2/resolutions` for an admitted
+   window, keyed by `condition` in the padded form (rule 3; F-57).
+   - The Data API v2 states "**Auth**: none" (F-67).
+   - The read is made only for a window past its scheduled close whose
+     resolution is neither published nor owed (Amendment 1, rule 2).
+   - It is requested within the §9.13 budget.
+2. The gateway journals the raw body of every response before it derives
+   anything (Decision 3.1). That includes a miss, `{ "data": [] }` (F-57),
+   an error, and a row it refuses.
+3. Replay reproduces what was derived from the journal. It never asks the
+   venue (Decision 3.4).
+4. The read stays on our own client in `packages/polymarket-public`, not on
+   the SDK. The SDK exposes no raw body, and it converts `payouts` to
+   collateral units (F-78; plan §7.1 S4(b)).
+
+**Why it fails closed:** a resolution derived from a row traces to the bytes
+the venue sent, and replays without the venue.
+
+### Rule 5. A resolution row may publish the resolution the market channel did not
+
+**Refines:** Decision 4.4, and Amendment 1, rules 1, 2 and 4.
+
+**Standing:** the orchestrator's interim ruling for PAPER and BACKTEST,
+made 2026-10-05. The user may confirm or overrule it.
+
+**The problem.**
+- The market channel's `market_resolved` names a `winning_asset_id`, which
+  the gateway matches against the window's ids (F-61).
+- V2 `market_resolved` frames are unobserved (U-38). A frame may never
+  arrive, or may name an id the window does not carry. Then nothing is
+  published.
+- The window then holds its cap slot until an operator retires it
+  (Amendment 1, rules 1 and 4). Every V2 window would do so, and PAPER on
+  the series would stall.
+
+**The ruling.** A journaled `/v2/resolutions` row MAY publish the window's
+resolution, as `MarketResolved@1`, when all of these hold:
+1. it is the response's only row, and its `condition_id` is the window's
+   padded condition id (rule 3);
+2. its `status` is `"resolved"`. The SDK guide: "Use payouts only from a
+   row whose `status` is `"resolved"`" (F-56);
+3. its raw wire `payouts` is exactly `[1000000,0]` or `[0,1000000]`, in
+   micro-USDC per share (F-57; observed, F-59).
+   - It is mapped by index, and index 0 is YES (F-40). So `[1000000,0]` is
+     `YES_WIN`, and `[0,1000000]` is `NO_WIN`.
+   - The vectors are compared by value, as fixed integer vectors, and no
+     amount is taken from them (ADR-009 §8, note of 2026-10-05).
+   - The SDK's collateral-unit form, `["1","0"]` (F-78), never reaches this
+     read. A tuple in that form is refused, never read a millionfold low;
+4. the row was journaled before anything was derived from it (rule 4);
+5. no `market_resolved` frame for the window maps to the other outcome.
+
+**Anything else publishes nothing.** It raises the existing unresolved-window
+incident, `GATEWAY_SERIES_WINDOW_UNRESOLVED` (Amendment 1, rule 1 item 5),
+with the reason. That covers:
+- any other `status`, such as `proposed` or `disputed` (F-57). A `disputed`
+  row publishes no resolution (ADR-009 §4);
+- missing `payouts`, any other vector, a split payout (F-73: "A binary
+  market can resolve to a split payout"; plan D18), and any other row shape;
+- any disagreement between the row and a `market_resolved` frame.
+
+**How it fits the rules already in force.**
+1. A resolution published from a row is recorded, owed and discharged like
+   one from the market channel. The window then retires `RESOLVED`
+   (Amendment 1, rule 2).
+2. A frame for the window that arrives after a row has published, and
+   disagrees, raises the incident. The row publishes nothing more. The
+   first resolution stands at the trader (Amendment 1, rule 3). A frame
+   that agrees is a repeat, which rule 3 makes harmless.
+3. Rule 5 applies to every admitted window, V1 or V2. Its conditions do not
+   depend on the version, and V1 rows are documented and observed (F-57,
+   "terminal CTF state"; F-59).
+4. Gamma's `resolutionStatus` (F-54) never publishes a resolution. The
+   Gamma OpenAPI and the SDK lack it (C-18), and it is unobserved (U-36).
+5. When no row qualifies, the operator's retirement (Amendment 1, rule 4)
+   stays the recovery. No timer retires a window (Amendment 1, rule 1
+   item 5).
+
+**Why it fails closed:** each condition narrows what may publish, and any
+doubt publishes nothing, which is today's behaviour. A wrong publication
+needs the venue's own resolved row to name the wrong outcome, with no frame
+saying otherwise. A disagreement is never settled by choosing a source.
+
+### What Amendment 2 amends
+
+| Text | As written | How it now reads |
+| --- | --- | --- |
+| Decision 1.2 | "the outcome token ids" | The outcome trading ids, selected by the window's `version` (rule 1) |
+| Decisions 1.1 and 1.4 | The reviewed parameters: outcome labels, tick size, minimum size, fee schedule, trading delay and settlement binding | Also `acceptedProtocolVersions` (rule 2) |
+| Decision 3.1 | The gateway journals every raw venue response it admits from | Also every `/v2/resolutions` response; condition-keyed reads send 32 bytes (rules 3 and 4) |
+| Decision 4.4; Amendment 1, rule 4 | A resolution comes from the market channel; otherwise an operator retires the window | A qualifying `/v2/resolutions` row may also publish it (rule 5, interim) |
+
+Not amended: Decision 2, Decision 3.3, Amendment 1's rules, every user
+ruling, and every live-mode rule.

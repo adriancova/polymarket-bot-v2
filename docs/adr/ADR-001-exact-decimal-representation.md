@@ -6,6 +6,9 @@
 - **Implemented by:** `WP-020` — implementation exists and is frozen
   (`packages/decimal`, `packages/domain`; see `docs/contracts/domain.md`)
 - **Supersedes / Superseded by:** none
+- **Amendments:** 2026-10-05 (`V2-0`): §8 gains item 6, the bounded binary64
+  rule for Data API v2 sizes read through the SDK, ruled by the user.
+  `V2-6` implements it; not yet.
 
 ## Context
 
@@ -253,6 +256,89 @@ Each cites the venue report; none is asserted on this ADR's own authority.
    That conflict is **unresolved** and is carried by ADR-006; no decimal helper
    may imply the two are interchangeable.
 
+**Amendment, 2026-10-05 (`V2-0`): item 6, ruled by the user.**
+- **The ruling.** The user ruled on 2026-10-05, in the session, on
+  `VENUE-4`'s plan: "ADR-001 §8: the bounded binary64 rule" for Data API v2
+  sizes read through the SDK. `docs/handoffs/VENUE-4.md` records it ("The
+  user's rulings on this plan (2026-10-05)", item 3).
+- **The rule** is the plan's (`docs/venue/protocol-v2-migration-plan.md`
+  §5 item 6 and §7.1 S4). Its facts are `docs/venue/verified-2026-10-05.md`,
+  cited by id.
+- **Its standing.** Unlike items 1-5, item 6 does not follow from §3 and §7.
+  It is a ruling, and the user's ruling is its authority.
+
+6. **Data API v2 sizes read through the SDK: the bounded binary64 rule.**
+   - **Why a rule is needed.**
+     - The Data API types sizes as JSON `number`, `format: double` (F-77).
+     - The SDK parses each body with `response.json()`, and turns each
+       number into `String(value)` (F-78). So `1e3` arrives as `"1000"`.
+     - The SDK offers no hook before that parse (F-78). The venue's lexeme is
+       gone before any adapter sees it, so no adapter on this path can check
+       it.
+   - **Scope.** The sizes of the Data API v2 account reads that
+     `packages/polymarket-secure` makes through the SDK: the `/v2/positions`
+     sizes reconciliation reads (plan `V2-6`). It does not cover:
+     - prices or other ratios, which the reconciliation port never reads;
+     - CLOB `/data/trades`, whose `price` and `size` are strings (F-78);
+     - our own doors, which read raw bodies;
+     - `/v2/resolutions` payouts, which ADR-009 §8 governs (note of
+       2026-10-05).
+   - **The domain D,** checked on the SDK's string: a canonical (§2)
+     non-negative decimal below 10^9, with at most 6 fractional digits.
+     Such a decimal has at most 15 significant digits. Six decimals is the
+     venue's base unit: "`1_000_000` is one pUSD or one share" (F-73).
+   - **The rule.**
+     - A size whose SDK string is in D is accepted as that string. It is
+       already canonical, so it crosses the boundary unchanged. The adapter
+       neither normalizes nor rounds it.
+     - Aliases and underflow are accepted as their double's string (F-78):
+       `1e3` and `1E3` give `"1000"`; `0.99999999999999999` gives `"1"`;
+       `1e-400`, `-1e-400` and `-0` give `"0"`.
+     - Every string outside D is refused, and the whole read with it, as a
+       rejection or as an answer the door refuses. The adapter never drops
+       the row. For example, `999999999999999.06` gives `"999999999999999"`,
+       and `1e400` gives `"Infinity"`: both are refused (F-78).
+   - **The bound, and its argument** (INF, checked by the probes in F-78).
+     - Each member m of D prints back unchanged from its nearest double x.
+       F-78's probe found 0 mismatches over 4 000 007 members, in four
+       spellings each.
+     - A lexeme L whose string is m therefore parses to the same x. L and m
+       each lie within half a unit in the last place (ulp) of x, so
+       |L − m| ≤ ulp(x).
+     - Below 10^9, ulp(x) is at most 2^-23 share, about 1.2 × 10^-7. That
+       is under half a base unit. F-78's probe found 0 violations over
+       1 500 000 seeded lexemes, in exact decimal arithmetic.
+     - So a whole number of base units below 10^9 shares is read exactly,
+       whatever its spelling. An on-chain balance is always one (F-73).
+     - A value more than 2^-23 share from every whole base unit is refused.
+     - A value nearer than that to a whole base unit may be read as that
+       base unit. This is the precision the rule gives up, and the ruling
+       accepts it.
+   - **Handoff §6 invariant 1** ("No binary floating point for
+     economics").
+     - Our code uses no binary floating point here. It receives a decimal
+       string; the binary64 step is inside the SDK, as under item 2. INF
+       (plan §5 item 6): the rule is consistent with the invariant's text.
+     - It still departs from exact venue amounts. The string may differ
+       from the venue's lexeme, within the bound above. The user's ruling
+       is the authority for that departure. It is an ADR because §1.3 gates
+       "Changing numeric representation".
+     - §2's grammar and §7 are unchanged. No domain schema accepts a
+       `number`.
+   - **The other branch is not taken.** An exact boundary before
+     `response.json()` would need its own ADR (plan §7.1 S4, "The
+     alternative"). The ruling does not need it.
+   - **Tests** (plan `V2-6` acceptance 2), through fake `fetch` bodies:
+     - every value of D round-trips unchanged;
+     - the aliases and underflow above are accepted as their double's
+       string;
+     - the plan's listed lexemes are refused;
+     - a seeded property test shows every accepted size within 2^-23 share
+       of its lexeme, in exact decimal arithmetic.
+   - **Mode.** It changes nothing above PAPER. It enables no mode, loosens
+     no default and adds no binding. No process in this repository binds
+     the read (plan `V2-6`, "Allowed paths").
+
 ## Consequences
 
 - **Persisted digests are load-bearing.** Any change to the domain tag, the
@@ -334,6 +420,16 @@ snapshot, must be re-verified at each phase start per handoff §1.2):
   reward settings get a canonical schema, accept BOTH forms on input (the SDK's
   own `DecimalishSchema` does) and normalize to a decimal string, rather than
   copying this catalog's parsed-layer-only strictness into a runtime parser."
+
+**The amendment of 2026-10-05 (§8 item 6):**
+
+- `docs/venue/verified-2026-10-05.md` F-73 (six-decimal base units), F-77
+  (Data API sizes are JSON doubles) and F-78 (the SDK's parse, and the two
+  probes).
+- `docs/venue/protocol-v2-migration-plan.md` §5 item 6, §7.1 S4, and
+  `V2-6` acceptance 2.
+- `docs/handoffs/VENUE-4.md`, "The user's rulings on this plan
+  (2026-10-05)", item 3.
 
 **Safety:** this ADR changes no run-mode default. `MAX_RUN_MODE=PAPER`,
 `ALLOW_REAL_ORDERS=false`, `LIVE_MICRO_MAX_ORDER_NOTIONAL=0`, and

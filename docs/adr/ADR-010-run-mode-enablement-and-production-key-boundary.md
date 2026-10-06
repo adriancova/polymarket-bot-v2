@@ -8,6 +8,8 @@
   `WP-240`, `WP-260`, and `WP-320` carry the enforcement points; `WP-350` and
   `WP-370` are the human-approval gates that could ever raise a cap.
 - **Supersedes / Superseded by:** none
+- **Notes:** 2026-10-05 (`V2-0`): §4 records the user's ruling on the SDK's
+  scope, per surface. It changes no rule.
 
 ## Context
 
@@ -128,6 +130,50 @@ Rules derived from that split:
   with a fresh check. Everything verified about the SDK is pinned to commit
   `7fdbed42484b5d279c71aa36d3757d18968260da` (venue report §1). No SDK dependency
   exists in this repository today.
+
+**Note, 2026-10-05 (`V2-0`): the SDK's scope, per surface, ruled by the
+user.**
+- **The ruling.** The user ruled on 2026-10-05, in the session: the SDK's
+  scope is the per-surface recommendation of
+  `docs/venue/protocol-v2-migration-plan.md` §7. `docs/handoffs/VENUE-4.md`
+  records it ("The user's rulings on this plan (2026-10-05)", item 1). The
+  facts are `docs/venue/verified-2026-10-05.md`, cited by id.
+- **Why it is recorded here.** This section owns the SDK boundary
+  (`docs/adr/README.md`, "Which change requires which ADR"). The plan names
+  this section as the one a change of scope would amend (§7.3).
+- **What it changes:** no rule above, and no handoff text. Under it, §9.12
+  and F6 need no change, because every read inside
+  `packages/polymarket-secure` stays on the SDK (plan §7.3). The one request
+  that package sends itself is ADR-033's D5 heartbeat, a separate named
+  exception on the user's ruling (ADR-033 Amendment 1).
+
+| Surface | Served by | The deciding reason (plan §7.1, §7.2) |
+| --- | --- | --- |
+| Trading: create, post, cancel and query orders | The SDK, inside `packages/polymarket-secure`, upgraded to 0.12.x | Protocol V2 needs 0.12.0: `CONDITIONAL-V2` and version-selected position operations (F-37, F-53, F-74) |
+| Account reads: positions and approvals (Data API v2) | The SDK, inside `packages/polymarket-secure` | The SDK handles the `data` envelope, the cursors and `snake_case` |
+| Account trades (CLOB `/data/trades`) | The SDK's `listAccountTrades`, never the Data API `listTrades` | The Data API `Trade` has no trade id, status, order id or role |
+| Public market data: Gamma, the public CLOB, the market WebSocket, `/v2/resolutions` | Our own clients, in `packages/polymarket-public` | The SDK gives no raw body to journal before deriving. It drops or defaults fields, drops WebSocket frames and hides reconnects (§S.4) |
+
+The account reads carry these conditions (plan §7.1 S4(a)):
+- position sizes are read under ADR-001 §8 item 6;
+- positions are reported incomplete until U-47 and U-48 settle;
+- condition ids are sent in the 32-byte form (F-43; ADR-030 Amendment 2,
+  rule 3);
+- the SDK's hidden 429 retries count against the §9.13 budget;
+- approvals are read only on a stable release that reads `/v2/approvals`.
+  Today only the canary does. In 0.11.0 and 0.12.0 the method of that name
+  reads on chain through a third-party RPC (§S.2, §S.3). If no such release
+  exists when `V2-6` starts, the plan's §5 item 5 ADR comes first.
+
+Also:
+- The SDK may serve as a test-only oracle for the public surfaces, through
+  the `testing` entry of `packages/polymarket-secure`. That needs no F6
+  change (plan §7.1 S1).
+- Moving a public surface onto the SDK would need an ADR amending §9.12,
+  F6 and this section (plan §7.3).
+- The pin has moved since this section was written: `WP-260` pinned
+  `0.11.0`, and `V2-5` moves it to 0.12.x (F-37; plan C3).
+- **Mode.** It changes nothing above PAPER.
 
 ### 5. Geographic eligibility, and the ordering of the live gate
 
