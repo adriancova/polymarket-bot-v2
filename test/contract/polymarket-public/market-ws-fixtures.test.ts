@@ -6,13 +6,33 @@
  * and must produce a domain event, not a problem. The suite additionally
  * asserts that the fixture catalogue still covers all seven modelled event
  * types, so "all fixtures parse" cannot become true by the fixtures shrinking.
+ *
+ * The last section (`V2-2`) drives `VENUE-4`'s Polymarket Protocol V2
+ * captures under `test/fixtures/venue/protocol-v2/` through the same entry
+ * points: the V2 REST book, the V2 `book` frame with its undocumented
+ * `"version":"v2"`, and the whole 60 s market-channel session on a V2
+ * position id, through the feed and its raw-frame hand-off.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import {
+  decodeInboundFrame,
   normalizeMarketEvents,
+  normalizeOrderBooks,
   parseMarketEvent,
+  parseVenueOrderBook,
+  PublicMarketFeed,
+  type NormalizedPublicEventAny,
+  type PublicMarketProblem,
+  type RawMarketFrame,
 } from "@polymarket-bot/polymarket-public";
 import {
+  fakeWebSocketFactory,
+  ManualScheduler,
+  sequentialConnectionIds,
   staticMarketDirectory,
   type StaticMarketDirectory,
   type TestMarketDefinition,
@@ -301,5 +321,295 @@ describe("the accounting unit is the venue's, not the frame element (L1)", () =>
     expect(problems).toHaveLength(1);
     expect(problems[0]).toMatchObject({ code: "INVALID_EVENT_PAYLOAD", observedIndex: 0 });
     expect(problems[0]).not.toHaveProperty("entryIndex");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Polymarket Protocol V2 (`V2-2`: plan rows A9-A12; acceptance 1 and 2)
+// ---------------------------------------------------------------------------
+//
+// The captures are `VENUE-4`'s (`test/fixtures/venue/protocol-v2/README.md`;
+// facts in `docs/venue/verified-2026-10-05.md`):
+//
+// - `book-v2.jsonc`: `GET /book` for a V2 position id (S-L03, O.2);
+// - `ws-market-v2-session.jsonl`: 60 s on the public market channel,
+//   subscribed to that id (S-W01, F-62). Its `data` is each frame's text
+//   exactly as received, so the first inbound frame keeps its trailing
+//   newline;
+// - `clob-markets-v2.jsonc`: the CLOB record of the same market (S-L01), which
+//   gives the outcome pair: `t[0]` "Up" and `t[1]` "Down"; index 0 is YES
+//   (F-40).
+//
+// Both book shapes carry an undocumented `"version":"v2"` (C-21). It is never
+// an authority: the decoders project their declared fields only (D3), so it
+// is stripped, and every V2 event below must equal the event of the same
+// input without it, which is the V1 shape (a V1 book has no such key: O.2,
+// F-62, and the frozen `market-ws/book-snapshot.json`).
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const PROTOCOL_V2 = resolve(repoRoot, "test/fixtures/venue/protocol-v2");
+
+function protocolV2Json(name: string): unknown {
+  // The README: "`.jsonc` files are strict JSON (RFC 8259) ... Read them with `JSON.parse`."
+  return JSON.parse(readFileSync(resolve(PROTOCOL_V2, name), "utf8")) as unknown;
+}
+
+interface SessionRecord {
+  readonly t: string;
+  readonly dir: string;
+  readonly data: unknown;
+}
+
+const V2_SESSION: readonly SessionRecord[] = readFileSync(
+  resolve(PROTOCOL_V2, "ws-market-v2-session.jsonl"),
+  "utf8",
+)
+  .split("\n")
+  .filter((line) => line.trim() !== "")
+  .map((line) => JSON.parse(line) as SessionRecord);
+
+/** Every inbound frame of the session, as the text the socket delivered. */
+const V2_INBOUND: readonly string[] = V2_SESSION.filter((record) => record.dir === "recv").map(
+  (record) => record.data as string,
+);
+
+const V2_CANARY = protocolV2Json("clob-markets-v2.jsonc") as {
+  readonly c: string;
+  readonly t: readonly { readonly t: string; readonly o: string }[];
+};
+
+/**
+ * The V2 market as the catalogue would hold it once admission selects
+ * `positionIds` (A1; `V2-1`). Its condition id is Gamma's documented 31-byte
+ * form (F-40, F-43) while every frame and book below names the 32-byte form,
+ * so these tests also pin that identity is resolved by `asset_id` alone
+ * (A12): the wire's `market` width never decides which market a book is.
+ */
+const V2_MARKET: TestMarketDefinition = {
+  internalMarketId: "0199f0a0-0000-7000-8000-000000000002",
+  conditionId: V2_CANARY.c.slice(0, -2),
+  yesTokenId: V2_CANARY.t[0]?.t ?? "",
+  noTokenId: V2_CANARY.t[1]?.t ?? "",
+};
+
+function v2Directory(): StaticMarketDirectory {
+  return staticMarketDirectory({ known: [V2_MARKET] });
+}
+
+/** The `BookSnapshot` payload both V2 book shapes must produce. */
+const V2_BOOK_PAYLOAD = {
+  internalMarketId: V2_MARKET.internalMarketId,
+  tokenId: V2_MARKET.yesTokenId,
+  bids: [],
+  asks: [],
+  venueBookHash: "fc3846cab0c35a0977b6e5f605a4e5ff0d0b2277",
+};
+
+function withoutVersion(value: unknown): Record<string, unknown> {
+  const copy = { ...(value as Record<string, unknown>) };
+  delete copy["version"];
+  return copy;
+}
+
+function v2BookFrameValue(): Record<string, unknown> {
+  const decoded = decodeInboundFrame(V2_INBOUND[0] ?? "");
+  if (decoded.kind !== "values" || decoded.values.length !== 1) {
+    throw new Error("the session's first inbound frame is not the one-element book array VENUE-4 recorded");
+  }
+  return decoded.values[0] as Record<string, unknown>;
+}
+
+describe("Protocol V2: the captures are the ones the facts describe (non-vacuity)", () => {
+  it("the market's position ids are the 75-digit decimal strings F-44 reports, YES at index 0", () => {
+    expect(V2_CANARY.t.map((entry) => entry.o)).toEqual(["Up", "Down"]);
+    expect(V2_MARKET.yesTokenId).toMatch(/^[1-9][0-9]{74}$/u);
+    expect(V2_MARKET.noTokenId).toMatch(/^[1-9][0-9]{74}$/u);
+    expect(V2_MARKET.conditionId).toMatch(/^0x[0-9a-f]{62}$/u);
+  });
+
+  it("the session holds one book frame for the V2 id with version v2, five PONGs and one unrelated new_market", () => {
+    expect(V2_INBOUND).toHaveLength(7);
+    expect(V2_INBOUND[0]?.endsWith("]\n")).toBe(true);
+    expect(V2_INBOUND.filter((text) => text === "PONG")).toHaveLength(5);
+    const book = v2BookFrameValue();
+    expect(book).toMatchObject({ event_type: "book", asset_id: V2_MARKET.yesTokenId, version: "v2" });
+    expect(book["market"]).toBe(V2_CANARY.c);
+    const restBook = protocolV2Json("book-v2.jsonc") as Record<string, unknown>;
+    expect(restBook).toMatchObject({ asset_id: V2_MARKET.yesTokenId, market: V2_CANARY.c, version: "v2" });
+  });
+
+  it("a V1 book carries no version key, REST or WebSocket (O.2, F-62)", () => {
+    expect(Object.hasOwn(protocolV2Json("book-v1.jsonc") as object, "version")).toBe(false);
+    expect(Object.hasOwn(loadMarketWsFixture("book-snapshot").examples[0]?.payload as object, "version")).toBe(false);
+  });
+});
+
+describe("Protocol V2: both book shapes normalize to the V1 shape's events (acceptance 1; A10, A11, A12)", () => {
+  const expectedWsEvent = {
+    eventType: "BookSnapshot",
+    schemaVersion: 1,
+    payload: V2_BOOK_PAYLOAD,
+    provenance: {
+      source: "polymarket",
+      sourceChannel: "polymarket:market-ws",
+      venueTimestamp: "2026-10-05T22:20:58.575Z",
+      observedIndex: 0,
+    },
+  };
+
+  it("the V2 `book` frame, exactly as received, is one BookSnapshot and no problem", () => {
+    const decoded = decodeInboundFrame(V2_INBOUND[0] ?? "");
+    expect(decoded.kind).toBe("values");
+    const values = decoded.kind === "values" ? decoded.values : [];
+    const parsed = parseMarketEvent(values[0]);
+    expect(parsed.status).toBe("parsed");
+    // D3: the decoder's output holds its declared fields only.
+    expect(parsed.status === "parsed" && Object.hasOwn(parsed.event, "version")).toBe(false);
+    const { events, problems } = normalizeMarketEvents(values, { directory: v2Directory() });
+    expect(problems).toEqual([]);
+    expect(events).toEqual([expectedWsEvent]);
+  });
+
+  it.each([
+    ["absent: the V1 shape", undefined],
+    ['"v1"', "v1"],
+    ['"v3"', "v3"],
+    ["null", null],
+    ["a number", 2],
+    ["an object", { v: "v2" }],
+  ] as const)("with `version` %s the frame gives the identical events: the key is never read (C-21)", (_label, version) => {
+    const value = version === undefined ? withoutVersion(v2BookFrameValue()) : { ...v2BookFrameValue(), version };
+    const asV2 = normalizeMarketEvents([v2BookFrameValue()], { directory: v2Directory() });
+    const asOther = normalizeMarketEvents([value], { directory: v2Directory() });
+    expect(asOther).toEqual(asV2);
+    expect(asOther.events).toEqual([expectedWsEvent]);
+  });
+
+  it("the V2 REST book decodes without its `version` and normalizes to the same payload as the frame", () => {
+    const body = protocolV2Json("book-v2.jsonc");
+    const parsed = parseVenueOrderBook(body);
+    expect(parsed.status).toBe("parsed");
+    if (parsed.status !== "parsed") return;
+    expect(Object.hasOwn(parsed.book, "version")).toBe(false);
+    // `last_trade_price: ""` is the wire's spelling of absence, never "0" (ADR-001 §8.1).
+    expect(parsed.book.last_trade_price).toBeNull();
+    const rest = normalizeOrderBooks([parsed.book], { directory: v2Directory() });
+    expect(rest.problems).toEqual([]);
+    expect(rest.events).toEqual([
+      {
+        eventType: "BookSnapshot",
+        schemaVersion: 1,
+        payload: V2_BOOK_PAYLOAD,
+        provenance: {
+          source: "polymarket",
+          sourceChannel: "polymarket:clob-book-rest",
+          venueTimestamp: "2026-10-05T22:20:58.575Z",
+          observedIndex: 0,
+        },
+      },
+    ]);
+    // The REST snapshot and the pushed snapshot are comparable value for value.
+    expect(rest.events[0]?.payload).toEqual(expectedWsEvent.payload);
+  });
+
+  it("the V2 REST book without `version` (its V1 shape) decodes and normalizes identically", () => {
+    const body = protocolV2Json("book-v2.jsonc");
+    const asV2 = parseVenueOrderBook(body);
+    const asV1 = parseVenueOrderBook(withoutVersion(body));
+    expect(asV1).toEqual(asV2);
+    if (asV1.status !== "parsed" || asV2.status !== "parsed") throw new Error("unreachable");
+    expect(normalizeOrderBooks([asV1.book], { directory: v2Directory() })).toEqual(
+      normalizeOrderBooks([asV2.book], { directory: v2Directory() }),
+    );
+  });
+
+  it("the V1 REST capture of the same round still decodes and normalizes (no V1 change)", () => {
+    const body = protocolV2Json("book-v1.jsonc") as { asset_id: string; market: string };
+    const v1Market: TestMarketDefinition = {
+      internalMarketId: "0199f0a0-0000-7000-8000-000000000003",
+      conditionId: body.market,
+      yesTokenId: body.asset_id,
+      noTokenId: "111614563957165270026378011809694313565736745512637881727398424401624030147043",
+    };
+    const parsed = parseVenueOrderBook(body);
+    expect(parsed.status).toBe("parsed");
+    if (parsed.status !== "parsed") return;
+    const { events, problems } = normalizeOrderBooks([parsed.book], {
+      directory: staticMarketDirectory({ known: [v1Market] }),
+    });
+    expect(problems).toEqual([]);
+    expect(events.map((event) => event.eventType)).toEqual(["BookSnapshot"]);
+    const payload = events[0]?.payload as { readonly tokenId: string; readonly bids: readonly unknown[] } | undefined;
+    expect(payload?.tokenId).toBe(body.asset_id);
+    expect(payload?.bids.length).toBeGreaterThan(0);
+  });
+});
+
+describe("Protocol V2: the feed on the recorded session (acceptance 2; A9, A12)", () => {
+  function replaySession() {
+    const scheduler = new ManualScheduler();
+    const sockets = fakeWebSocketFactory();
+    const events: NormalizedPublicEventAny[] = [];
+    const problems: PublicMarketProblem[] = [];
+    const frames: RawMarketFrame[] = [];
+    const feed = new PublicMarketFeed(
+      {
+        clock: scheduler.clock,
+        timers: scheduler.timers,
+        webSocketFactory: sockets.factory,
+        directory: v2Directory(),
+        connectionId: sequentialConnectionIds(),
+        randomFraction: () => 1,
+      },
+      {
+        onEvent: (event) => events.push(event),
+        onProblem: (problem) => problems.push(problem),
+        onRawFrame: (frame) => frames.push(frame),
+      },
+      // The session subscribed with `custom_feature_enabled: true` (S-W01).
+      { customFeatureEnabled: true },
+    );
+    feed.subscribe([V2_MARKET.yesTokenId]);
+    feed.start();
+    sockets.latest().emitOpen();
+    const sent = [...sockets.latest().sentFrames];
+    for (const text of V2_INBOUND) sockets.latest().emitMessage(text);
+    return { events, problems, frames, sent };
+  }
+
+  it("subscribes the market channel by the V2 position id, as the session did (A9; F-60, F-62)", () => {
+    const recorded = V2_SESSION.find((record) => record.dir === "send" && record.data !== "PING");
+    const sessionSubscription = JSON.parse(recorded?.data as string) as Record<string, unknown>;
+    expect(sessionSubscription["assets_ids"]).toEqual([V2_MARKET.yesTokenId]);
+    // The feed sends `initial_dump` explicitly too (`../../../packages/polymarket-public/src/venue/frames.ts`).
+    expect(replaySession().sent).toEqual([{ ...sessionSubscription, initial_dump: true }]);
+  });
+
+  it("hands every inbound frame to the raw recorder verbatim, in order, PONGs and the trailing newline included", () => {
+    const { frames } = replaySession();
+    expect(frames.map((frame) => frame.payload)).toEqual(V2_INBOUND);
+    for (const frame of frames) {
+      expect(frame).toMatchObject({
+        connectionId: "conn-1",
+        subscriptionGeneration: 2,
+        sourceChannel: "polymarket:market-ws",
+      });
+    }
+  });
+
+  it("publishes the V2 book as its BookSnapshot and reports the unrelated market, dropping nothing", () => {
+    const { events, problems } = replaySession();
+    expect(events.map((event) => event.eventType)).toEqual(["FeedConnected", "BookSnapshot"]);
+    expect(events[1]?.payload).toEqual(V2_BOOK_PAYLOAD);
+    expect(events[1]?.provenance).toMatchObject({
+      sourceChannel: "polymarket:market-ws",
+      connectionId: "conn-1",
+      subscriptionGeneration: 2,
+      venueTimestamp: "2026-10-05T22:20:58.575Z",
+    });
+    // The `new_market` frame names a market the catalogue did not register: a problem, not a silent drop (§8.3).
+    expect(problems.map((problem) => [problem.code, problem.venueEventType])).toEqual([
+      ["UNREGISTERED_MARKET", "new_market"],
+    ]);
   });
 });

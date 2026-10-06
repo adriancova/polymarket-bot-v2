@@ -111,7 +111,10 @@ TOKENS = ("1001", "1002")
 
 def synthetic_events(now: float) -> list[dict]:
     """A current and a next 5-minute window of one series, around `now`, in the
-    documented /events shape (clobTokenIds as a JSON-encoded string)."""
+    documented /events shape (clobTokenIds as a JSON-encoded string). Each
+    market carries `"version": "v1"`, as every V1 market the venue serves does
+    (V2-2: the recorder chooses the id field by it, and refuses a market
+    without it)."""
     start = now - 60
 
     def market(condition: str, begin: float, tokens: tuple[str, str]) -> dict:
@@ -123,6 +126,7 @@ def synthetic_events(now: float) -> list[dict]:
             "clobTokenIds": json.dumps(list(tokens)),
             "outcomes": json.dumps(["Up", "Down"]),
             "closed": False,
+            "version": "v1",
         }
 
     return [
@@ -455,6 +459,197 @@ class RawFrames(unittest.TestCase):
         writer.write(0.0, "s", "PONG")
         writer.close()
         self.assertIsNone(writer.report())
+
+
+# ---------------------------------------------------------------------------
+# Polymarket Protocol V2 (V2-2: plan row A15), end to end on stand-ins.
+# ---------------------------------------------------------------------------
+
+PROTOCOL_V2 = HERE.parents[3] / "test" / "fixtures" / "venue" / "protocol-v2"
+
+
+def v2_session_inbound() -> list[str]:
+    """Every inbound frame of VENUE-4's market-channel session on a V2 position
+    id (S-W01), as the text the socket delivered: the `book` frame (an array,
+    with its trailing newline), five `PONG`s and one `new_market`."""
+    lines = (PROTOCOL_V2 / "ws-market-v2-session.jsonl").read_text(encoding="utf-8").splitlines()
+    return [record["data"] for record in map(json.loads, filter(str.strip, lines)) if record["dir"] == "recv"]
+
+
+def v2_canary() -> tuple[str, tuple[str, str]]:
+    """The V2 canary's condition id in its 31-byte form, and its position ids
+    (S-L01: `t[0]` Up, `t[1]` Down; index 0 is YES, F-40)."""
+    record = json.loads((PROTOCOL_V2 / "clob-markets-v2.jsonc").read_text(encoding="utf-8"))
+    assert record["c"].endswith("00")
+    return record["c"][:-2], (record["t"][0]["t"], record["t"][1]["t"])
+
+
+def v2_events(now: float) -> list[dict]:
+    """A current V2 window of SERIES in the documented V2 Gamma shape (F-40):
+    `version` "v2", `clobTokenIds` null, `positionIds` an array, the condition
+    id in its 31-byte form. Gamma lists no canary market (O.1), so this record
+    is SYNTHETIC apart from the canary's ids."""
+    condition, ids = v2_canary()
+    return [
+        {
+            "seriesSlug": SERIES,
+            "slug": "btc-updown-5m-v2-canary",
+            "markets": [
+                {
+                    "id": "v2-canary",
+                    "version": "v2",
+                    "conditionId": condition,
+                    "eventStartTime": core.iso(now - 60),
+                    "endDate": core.iso(now + 240),
+                    "outcomes": json.dumps(["Up", "Down"]),
+                    "clobTokenIds": None,
+                    "positionIds": list(ids),
+                    "closed": False,
+                }
+            ],
+        }
+    ]
+
+
+class ReplaySocket:
+    """Delivers a fixed list of inbound frames once, after the first frame the
+    recorder sends (its subscription), then stays silent until closed."""
+
+    def __init__(self, frames: list[str]) -> None:
+        self.frames = list(frames)
+        self.sent: list[str] = []
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+
+    async def send(self, text: str) -> None:
+        self.sent.append(text)
+        if len(self.sent) == 1:
+            for frame in self.frames:
+                self.queue.put_nowait(frame)
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.queue.put_nowait(None)
+
+    def __aiter__(self) -> "ReplaySocket":
+        return self
+
+    async def __anext__(self) -> str:
+        item = await self.queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+
+class ReplayConnect:
+    def __init__(self, frames: list[str]) -> None:
+        self.frames = frames
+        self.sockets: list[ReplaySocket] = []
+
+    def __call__(self, url: str, **options):
+        socket = ReplaySocket(self.frames)
+        self.sockets.append(socket)
+        return _Context(socket)
+
+
+def raw_frames(directory: Path) -> list[str]:
+    texts: list[str] = []
+    for path in sorted(directory.glob("*.jsonl.gz")):
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            texts.extend(json.loads(line)["p"] for line in handle if line.strip())
+    return texts
+
+
+class ProtocolV2Recording(unittest.TestCase):
+    def test_a_v2_window_is_subscribed_by_its_position_ids_and_its_frames_journaled_verbatim(self) -> None:
+        inbound = v2_session_inbound()
+        self.assertEqual(len(inbound), 7)
+        self.assertTrue(inbound[0].endswith("]\n"))  # the frame text exactly as received, newline included
+        condition, ids = v2_canary()
+        connect = ReplayConnect(inbound)
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = rm.Recorder(recorder_args(tmp, raw=True, connect=connect, duration_seconds=1.5))
+            with mock.patch.object(rm, "fetch_events", side_effect=lambda *a: (v2_events(time.time()), False)):
+                status = asyncio.run(recorder.run())
+            # 2 would mean "Gamma lists no window of the wanted series": the V2 window was skipped.
+            self.assertEqual(status, 0)
+            out = Path(tmp)
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            journaled = raw_frames(out / "raw" / SERIES)
+            added = [json.loads(line) for line in (out / "windows.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(summary["outcome"], "complete")
+        self.assertEqual(summary["gamma"]["skipped"], {})
+        # Subscribed by the ids `version` selects: the V2 position ids (F-38).
+        self.assertEqual(len(connect.sockets), 1)
+        self.assertEqual(json.loads(connect.sockets[0].sent[0]), core.subscribe_frame(ids))
+        self.assertEqual(added[0]["tokenIds"], list(ids))
+        self.assertEqual(added[0]["conditionId"], condition)
+        # Journaled verbatim: every inbound frame, in order, character for character.
+        self.assertEqual(journaled, inbound)
+        self.assertEqual(summary["rawFrames"]["rawTextBytes"], sum(len(text.encode("utf-8")) for text in inbound))
+        # Counted against the window, though the frame names the 32-byte form of its condition (F-43, F-62).
+        rows = {row["conditionId"]: row for row in summary["windows"]}
+        self.assertEqual(rows[condition]["eventTypes"], {"book": 1})
+        self.assertEqual(summary["control"]["pongFrames"], 5)
+        self.assertEqual(summary["control"]["unparsableFrames"], 0)
+
+
+# ---------------------------------------------------------------------------
+# Historical, version-less input (V2-2 review finding V2-2-R1-02).
+# ---------------------------------------------------------------------------
+
+
+def unversioned(events: list[dict]) -> list[dict]:
+    """The same events in the shape `synthetic_events` had before V2-2: every
+    market without `version` (each carried it as "v1")."""
+    for event in events:
+        for market in event["markets"]:
+            assert market.pop("version") == "v1"
+    return events
+
+
+class HistoricalUnversionedInput(unittest.TestCase):
+    """A Gamma response without `version`, as this file's synthetic one was before
+    V2-2, is refused market by market, visibly, and nothing is subscribed.
+    Acceptance 4 refuses a missing `version` (F-39); V2-2 does not relax it for
+    old input. With the key present, the same response records as before
+    (`RecorderRun`, `GammaPolling`)."""
+
+    def test_a_version_less_response_subscribes_nothing_and_names_each_refusal(self) -> None:
+        connect = FakeConnect()
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = rm.Recorder(recorder_args(tmp, connect=connect))
+            try:
+                with mock.patch.object(rm, "fetch_events", side_effect=lambda *a: (unversioned(synthetic_events(time.time())), False)):
+                    status = asyncio.run(recorder.run())
+            finally:
+                close_files(recorder)
+            log = (Path(tmp) / "recorder.log").read_text(encoding="utf-8")
+        # 2: "Gamma lists no window of the wanted series". The poll itself succeeded.
+        self.assertEqual(status, 2)
+        self.assertEqual(recorder.gamma_polls, 1)
+        self.assertEqual(recorder.gamma_failures, 0)
+        self.assertEqual(recorder.known, {})
+        self.assertEqual(connect.calls, [])
+        reason = "no version, so the id field cannot be chosen (F-39)"
+        expected = {
+            f"{SERIES} btc-updown-5m-a market {CONDITION[-6:]!r}: {reason}": 1,
+            f"{SERIES} btc-updown-5m-b market {('0x' + 'cd' * 32)[-6:]!r}: {reason}": 1,
+        }
+        self.assertEqual(recorder.gamma_problems, expected)
+        for problem in expected:
+            self.assertIn(f"gamma: skipped: {problem}", log)
+        self.assertIn("Gamma lists no window of the wanted series", log)
+
+    def test_with_version_v1_the_same_response_gives_both_windows(self) -> None:
+        now = time.time()
+        windows, problems = core.parse_gamma_events(synthetic_events(now), [SERIES])
+        self.assertEqual(problems, [])
+        self.assertEqual(sorted(w.token_ids for w in windows), [TOKENS, ("2001", "2002")])
+        windows, problems = core.parse_gamma_events(unversioned(synthetic_events(now)), [SERIES])
+        self.assertEqual((windows, len(problems)), ([], 2))
 
 
 if __name__ == "__main__":
