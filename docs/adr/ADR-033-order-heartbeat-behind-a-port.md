@@ -224,6 +224,10 @@ Options 1 and 2 are the venue report's examples (C-12).
 **Recommendation, not a ruling:** option 1 if the SDK still has no method
 and exports the primitives publicly; otherwise option 2.
 
+**2026-10-05, the user:** run the venue round first, then rule D5 on its
+facts. The round is `VENUE-4`, combined with the Protocol V2 migration
+facts, since the SDK upgrade bears on the same questions.
+
 The ruling needs the user. It is recorded as an amendment to this ADR.
 
 ### D6. A lapsed heartbeat

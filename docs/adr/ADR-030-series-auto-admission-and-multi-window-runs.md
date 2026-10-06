@@ -182,11 +182,12 @@ invariant 9, and every live-mode rule.
   R2-FABLE-03.
 - **Source:** `ROLLOVER-1`, merged `ae11daa` (PR #68) after a joint ACCEPT
   at `61a0ab2`. Its record is `docs/handoffs/ROLLOVER-1.md`.
-- **Standing:** rules 1-8 are the orchestrator's interim rulings for PAPER
-  and BACKTEST, the modes admission runs in (Decision 2.1), made
-  2026-10-05. Each records a policy `ROLLOVER-1` implemented and its
-  verifiers accepted. The user may confirm or overrule any of them. None
-  reaches a live mode (Decision 2).
+- **Standing:** rules 1-8 are **confirmed by the user, 2026-10-05**. They
+  were recorded as the orchestrator's interim rulings for PAPER and
+  BACKTEST, the modes admission runs in (Decision 2.1). Each records a
+  policy `ROLLOVER-1` implemented and its verifiers accepted. None reaches
+  a live mode (Decision 2). Rule 8's stated item 6 (R8-FABLE-01) stays
+  open for the pre-live risk work.
 - **User rulings:** none is changed. Ruling A5 (2026-09-30) and rulings
   Q1-Q4 (2026-10-04) stand as ruled.
 - **Decision 1, as merged.** Ruling Q3 and `ROLLOVER-1` r7 shape two
