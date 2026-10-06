@@ -17,7 +17,7 @@
  *
  * | here | the gateway's |
  * | --- | --- |
- * | {@link ReviewedSeriesSchema} | `ReviewedSeriesSchema` (`outcomes` is a two-element array here: this door's arena copies no `tuple` node) |
+ * | {@link ReviewedSeriesSchema} | `ReviewedSeriesSchema` (`outcomes` is a two-element array here: this door's arena copies no `tuple` node; `parameters.acceptedProtocolVersions`, `V2-1`, is the same rule, its distinctness checked by index because the arena's empty array has no iterator) |
  * | {@link seriesConfigHash} | `seriesConfigHash` |
  * | {@link deriveWindowSchedule} | `deriveWindowSchedule` (`series-window-schedule.ts`) |
  * | {@link windowInternalMarketId} | `windowInternalMarketId` |
@@ -61,6 +61,37 @@ const Sha256Hex = z.string().regex(/^[0-9a-f]{64}$/u, "must be a sha256 digest: 
 const UnsignedIntegerString = z.string().regex(/^(?:0|[1-9][0-9]{0,17})$/u, "must be a canonical unsigned integer string");
 const GammaSeriesId = z.string().regex(/^[1-9][0-9]{0,17}$/u, "must be the Gamma series id: digits, no leading zero");
 
+/** The protocol versions a Gamma market may state (the gateway's `PROTOCOL_VERSIONS`; ADR-030 Amendment 2 rule 1). */
+export const PROTOCOL_VERSIONS = Object.freeze(["v1", "v2"] as const);
+
+/** The refusal of a review that does not state its accepted versions (the gateway's text, word for word). */
+export const ACCEPTED_PROTOCOL_VERSIONS_REQUIRED =
+  'acceptedProtocolVersions is required: a non-empty list of distinct protocol versions, each "v1" or "v2" ' +
+  '(ADR-030 Amendment 2 rule 2; e.g. ["v1"], or ["v1","v2"] once a review accepts V2 windows). It is never inferred';
+
+/**
+ * `parameters.acceptedProtocolVersions` (ADR-030 Amendment 2 rule 2, item 4:
+ * "Both copies of the review schema carry it, so the gateway's and the
+ * trader's hashes stay equal"). Required, never defaulted. The trader does
+ * not judge a window's version — `SeriesWindowAdmitted@1` carries none, so the
+ * gateway alone judges it (rule 2 item 5) — but the list is part of the review
+ * this trader pins, so it is part of {@link seriesConfigHash}.
+ */
+const AcceptedProtocolVersions = z
+  .array(z.enum(PROTOCOL_VERSIONS), { error: ACCEPTED_PROTOCOL_VERSIONS_REQUIRED })
+  .min(1)
+  .max(PROTOCOL_VERSIONS.length)
+  .superRefine((versions, ctx) => {
+    for (let left = 0; left < versions.length; left += 1) {
+      for (let right = left + 1; right < versions.length; right += 1) {
+        if (versions[left] === versions[right]) {
+          ctx.addIssue({ code: "custom", message: "the accepted protocol versions must be distinct" });
+          return;
+        }
+      }
+    }
+  });
+
 /** The only zone a reviewed title may name, and the label the titles carry. */
 export const SERIES_TITLE_TIME_ZONE = "America/New_York" as const;
 export const SERIES_TITLE_ZONE_LABEL = "ET" as const;
@@ -84,6 +115,8 @@ export const ReviewedSeriesSchema = z.strictObject({
   /** The outcome labels IN ORDER: index 0 is the YES outcome. */
   outcomes: z.array(NonEmpty).min(2).max(2),
   parameters: z.strictObject({
+    /** The Gamma `Market.version` values the review accepts (ADR-030 Amendment 2 rule 2). */
+    acceptedProtocolVersions: AcceptedProtocolVersions,
     allowedTickSizes: z.array(decimal("POSITIVE")).min(1).max(8),
     minimumOrderSize: decimal("POSITIVE"),
     /**

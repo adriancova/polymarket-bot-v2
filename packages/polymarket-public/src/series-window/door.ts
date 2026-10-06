@@ -13,10 +13,18 @@
  *   `seriesSlug`, `series[].id`, `negRisk` (S-O01 `Event.negRisk`: a
  *   cross-check only, see below), and `markets`;
  * - from its market: `id`, `question`, `conditionId`, `description`,
- *   `resolutionSource`, `outcomes`, `clobTokenIds`, `eventStartTime`,
- *   `endDate`, `orderPriceMinTickSize`, `orderMinSize`, `secondsDelay`,
- *   `feesEnabled`, `feeSchedule.{rate, exponent, takerOnly, rebateRate}`,
- *   `makerBaseFee`, `takerBaseFee`, and `negRisk`;
+ *   `resolutionSource`, `outcomes`, `version`, `clobTokenIds`, `positionIds`,
+ *   `eventStartTime`, `endDate`, `orderPriceMinTickSize`, `orderMinSize`,
+ *   `secondsDelay`, `feesEnabled`, `feeSchedule.{rate, exponent, takerOnly,
+ *   rebateRate}`, `makerBaseFee`, `takerBaseFee`, and `negRisk`;
+ * - **`version` and `positionIds`** (`V2-1`; ADR-030 Amendment 2 rule 1):
+ *   documented on the Gamma OpenAPI `Market` since 2026-10-04 as a nullable
+ *   string and a nullable array of strings (`docs/venue/verified-2026-10-05.md`
+ *   F-41). `version` selects the trading ids — `positionIds` for `"v2"`, the
+ *   JSON-encoded `clobTokenIds` for `"v1"` — "even when both fields are
+ *   present" (F-38, F-40). The door reads both fields AS STATED, absent, `null`
+ *   or of another type included (a JSON-encoded string in `positionIds` is not
+ *   an array, so it is UNREADABLE), and selects nothing: the judge does;
  * - **`negRisk` is read from the MARKET** (`ROLLOVER-1` r5, R5-ASTRA-01):
  *   the official market-details page S-D23 (sha256 `930dd605…`) lists
  *   `negRisk` among the fields read "from the Gamma response" for a market,
@@ -29,14 +37,18 @@
  *   flag was read, so a market whose own flag differed was never seen;
  * - from `KeysetEventsResponse`: `events`, `next_cursor` (S-D72 lines 295-300);
  * - from `ClobMarketDetails` (S-D65): `t[].{t, o}`, `mos`, `mts`, `mbf`,
- *   `tbf`, `itode`, `fd.{r, e, to}`.
+ *   `tbf`, `itode`, `fd.{r, e, to}`;
+ * - **one UNDOCUMENTED CLOB key, labelled as such: `v`** (C-21; observed
+ *   `"v1"` and `"v2"`, O.3), read into `undocumentedProtocolVersion` as
+ *   stated. It is a refusal-only cross-check of Gamma's `version` (ADR-030
+ *   Amendment 2 rule 1 item 7): never an authority, never alone.
  *
  * Every other key — `startDate` (not the open, F-15), `feeType`,
  * `cryptoMarketConfig`, `eventMetadata` (U-32), the event's `enableNegRisk`
  * and `negRiskAugmented` and the market's `negRiskOther` (augmented negative
- * risk, which S-D23 places on the event, is not a reviewed parameter), the
- * CLOB `c`, `ao`, `aot`, `v` — is left in the journaled raw body and read by
- * nothing.
+ * risk, which S-D23 places on the event, is not a reviewed parameter),
+ * `resolutionStatus` (C-18), the CLOB `c`, `ao`, `aot`, `cbos` — is left in
+ * the journaled raw body and read by nothing.
  *
  * ## A reading is not a verdict
  *
@@ -76,6 +88,13 @@ export type SeriesWindowBooleanReading = boolean | null | "ABSENT" | "UNREADABLE
 /** A string venue field: the string, or `null` when absent, `null` or not a string. */
 export type SeriesWindowStringReading = string | null;
 
+/** A venue field whose absence, `null` and wrong type are each reported, never defaulted (`V2-1`). */
+export type SeriesWindowFieldReading<T> =
+  | { readonly kind: "ABSENT" }
+  | { readonly kind: "NULL" }
+  | { readonly kind: "VALUE"; readonly value: T }
+  | { readonly kind: "UNREADABLE"; readonly detail: string };
+
 export interface SeriesWindowMarketReading {
   readonly marketId: SeriesWindowStringReading;
   readonly question: SeriesWindowStringReading;
@@ -83,7 +102,11 @@ export interface SeriesWindowMarketReading {
   readonly description: SeriesWindowStringReading;
   readonly resolutionSource: SeriesWindowStringReading;
   readonly outcomes: SeriesWindowStringReading;
+  /** `Market.version` as stated (F-41): it selects the trading ids (F-38). */
+  readonly version: SeriesWindowFieldReading<string>;
   readonly clobTokenIds: SeriesWindowStringReading;
+  /** `Market.positionIds` as stated (F-41): each element the string, or `null` when it is not one. */
+  readonly positionIds: SeriesWindowFieldReading<readonly SeriesWindowStringReading[]>;
   readonly eventStartTime: SeriesWindowStringReading;
   readonly endDate: SeriesWindowStringReading;
   readonly orderPriceMinTickSize: SeriesWindowDecimalReading;
@@ -128,6 +151,8 @@ export interface ClobMarketInfoBodyReading {
     readonly exponent: SeriesWindowDecimalReading;
     readonly takerOnly: SeriesWindowBooleanReading;
   } | null;
+  /** `v`: UNDOCUMENTED (C-21). A refusal-only cross-check of Gamma's `version`, as stated. */
+  readonly undocumentedProtocolVersion: SeriesWindowFieldReading<string>;
 }
 
 export type GammaSeriesEventsVerdict =
@@ -178,6 +203,27 @@ function decimalOf(record: OwnWireRecord, key: string): SeriesWindowDecimalReadi
   return { kind: "UNREADABLE", detail: normalized.reason };
 }
 
+function kindOf(value: unknown): string {
+  if (Array.isArray(value)) return "an array";
+  return typeof value === "object" ? "an object" : `a ${typeof value}`;
+}
+
+function textOf(record: OwnWireRecord, key: string): SeriesWindowFieldReading<string> {
+  const member = own(record, key);
+  if (!member.present) return { kind: "ABSENT" };
+  if (member.value === null) return { kind: "NULL" };
+  return typeof member.value === "string" ? { kind: "VALUE", value: member.value } : { kind: "UNREADABLE", detail: kindOf(member.value) };
+}
+
+/** `positionIds` (F-41): an array whose elements are read as strings, each `null` when it is not one. */
+function stringArrayOf(record: OwnWireRecord, key: string): SeriesWindowFieldReading<readonly SeriesWindowStringReading[]> {
+  const member = own(record, key);
+  if (!member.present) return { kind: "ABSENT" };
+  if (member.value === null) return { kind: "NULL" };
+  if (!Array.isArray(member.value)) return { kind: "UNREADABLE", detail: kindOf(member.value) };
+  return { kind: "VALUE", value: (member.value as readonly unknown[]).map((entry) => (typeof entry === "string" ? entry : null)) };
+}
+
 function recordOf(record: OwnWireRecord, key: string): OwnWireRecord | null {
   const member = own(record, key);
   return isOwnWireRecord(member.value) ? member.value : null;
@@ -209,7 +255,9 @@ function readMarket(market: OwnWireRecord): SeriesWindowMarketReading {
     description: stringOf(market, "description"),
     resolutionSource: stringOf(market, "resolutionSource"),
     outcomes: stringOf(market, "outcomes"),
+    version: textOf(market, "version"),
     clobTokenIds: stringOf(market, "clobTokenIds"),
+    positionIds: stringArrayOf(market, "positionIds"),
     eventStartTime: stringOf(market, "eventStartTime"),
     endDate: stringOf(market, "endDate"),
     orderPriceMinTickSize: decimalOf(market, "orderPriceMinTickSize"),
@@ -302,6 +350,7 @@ export function readClobMarketInfoBody(bodyUtf8: string): ClobMarketInfoVerdict 
         fees === null
           ? null
           : { rate: decimalOf(fees, "r"), exponent: decimalOf(fees, "e"), takerOnly: booleanOf(fees, "to") },
+      undocumentedProtocolVersion: textOf(record, "v"),
     },
   });
 }

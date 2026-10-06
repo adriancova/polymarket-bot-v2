@@ -111,6 +111,9 @@ export function unverifiedSettlementView(): SettlementActivationView {
 export {
   BTC_15M_RULES_SHA256,
   BTC_15M_RULES_TEXT,
+  PROTOCOL_V2_SAMPLES,
+  protocolV2ClobOverrides,
+  protocolV2WindowMarketOverrides,
   RECORDED_WINDOW,
   recordedClobReading,
   recordedWindowEventReading,

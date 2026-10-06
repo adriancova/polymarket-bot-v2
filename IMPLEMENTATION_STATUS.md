@@ -176,7 +176,8 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `VENUE-4` | Protocol V2 and Data API v2 venue facts, and the migration plan | Complete (2026-10-05) | `f925a43` | [VENUE-4](docs/handoffs/VENUE-4.md) |
 | `CLOSEOUT-3` | The fresh read-only Wave 3 closeout audit (runbook §10) | WAVE 3 IS COMPLETE WITH QUALIFICATIONS (2026-10-06) | — (an audit) | [CLOSEOUT-3](docs/handoffs/CLOSEOUT-3-wave-3-closeout.md) |
 | `V2-0` | Protocol V2 governance: the dated ADR amendments and the user's rulings (docs only) | Complete (2026-10-06) | `5f2b3c8` | [V2-0](docs/handoffs/V2-0.md) |
-| `V2-1` | Protocol V2 version-selected identifiers and series admission (class A, PAPER; dual verifiers; due 2026-10-20) | **Running** (authorized 2026-10-06) | — | — |
+| `V2-1` | Protocol V2 version-selected identifiers and series admission (class A, PAPER) | Complete (2026-10-06) | `8558053` | [V2-1](docs/handoffs/V2-1.md) |
+| `V2-3` | Protocol V2 resolution via a journaled `/v2/resolutions` read, and not-yet-admissible windows (class A, PAPER; dual verifiers; due 2026-10-28) | **Running** (authorized 2026-10-06) | — | — |
 | `V2-2` | Protocol V2 market-data path and recorded-data readers (class A, PAPER) | Complete (2026-10-06) | `9836ab0` | [V2-2](docs/handoffs/V2-2.md) |
 | `CI-7` | The ops-cli real-PostgreSQL suite in `test:integration` and CI, plus a chain-completeness drift rule (`CLOSEOUT-3` L1) | Complete (2026-10-06) | `9e28bc2` | [CI-7](docs/handoffs/CI-7.md) |
 | `RECORDS-W3` | Records hygiene after `CLOSEOUT-3`: the brief back under budget, ADR headers, the emergency-runbook correction, the records tooling (docs only; dual verifiers) | **Running** (authorized 2026-10-06) | — | — |

@@ -157,3 +157,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-06 | [V2-0.md](V2-0.md) | `V2-0`: Protocol V2 ADR amendments and the user's rulings | Governance | Complete (2026-10-06) | `5f2b3c8` | 4 KB |
 | 2026-10-06 | [CI-7.md](CI-7.md) | `CI-7`: the ops-cli real-PostgreSQL suite in the integration chain and CI | CI | Complete (2026-10-06) | `9e28bc2` | 2 KB |
 | 2026-10-06 | [V2-2.md](V2-2.md) | `V2-2`: Protocol V2 market-data path and recorded-data readers | WP | Complete (2026-10-06) | `9836ab0` | 3 KB |
+| 2026-10-06 | [V2-1.md](V2-1.md) | `V2-1`: Protocol V2 version-selected identifiers and series admission | WP | Complete (2026-10-06) | `8558053` | 3 KB |

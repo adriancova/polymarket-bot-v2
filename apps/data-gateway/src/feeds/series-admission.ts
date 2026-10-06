@@ -71,6 +71,10 @@
  *    receipt — is late and skipped; one whose `eventStartTime` is more than
  *    `admissionLeadSeconds` ahead is not yet due. A window whose condition id
  *    or token a configured market already holds is skipped (never shadowed).
+ *    `V2-1` (ADR-030 Amendment 2 rule 1; plan row A8): the tokens checked are
+ *    the trading ids the window's `version` selects (`selectTradingIds`), never
+ *    the other field's; a window whose ids cannot be selected is checked by its
+ *    condition id only, and the judge refuses it.
  * 4. **The cap** (Decision 1.8): with `maximumConcurrentWindows` live
  *    (ADMITTED, not retired) windows of the series — every one, including a
  *    window awaiting its resolution past its bound (step 1; `ROLLOVER-1` r2,
@@ -82,7 +86,14 @@
  *    most `maximumConcurrentWindows` are ATTEMPTED per series per cycle,
  *    whatever their outcome (`ROLLOVER-1` r1, R1-FABLE-04): the configuration
  *    door budgets exactly that figure, and a candidate past it waits for the
- *    next cycle (`windowsDeferredByReadBudget`).
+ *    next cycle (`windowsDeferredByReadBudget`). `V2-1` (ADR-030 Amendment 2
+ *    rule 3): the read sends the condition id's 32-byte form
+ *    (`paddedConditionId`): a 31-byte id (62 hex digits, Gamma's documented V2
+ *    form, F-43) right-padded with one zero byte, a 32-byte id unchanged —
+ *    `/clob-markets` answers the 31-byte form with 404 (F-70). An id of any
+ *    other width gets NO read (and spends no budget); the judge refuses it by
+ *    name. Gamma's text stays the window's identity everywhere else: the
+ *    ledger key, the incident scopes, the derived id and the events.
  * 6. **The judge** (`@polymarket-bot/universe` `judgeSeriesWindow`): exact
  *    match on the reviewed pattern and every reviewed parameter; per-window
  *    facts for presence and form only (Decision 1.2). A REFUSED window is
@@ -184,6 +195,8 @@ import {
   admissionRunModeProblem,
   epochMsOfInstant,
   judgeSeriesWindow,
+  paddedConditionId,
+  selectTradingIds,
   windowInternalMarketId,
   type AdmittedWindowFacts,
   type ReviewedSeries,
@@ -972,7 +985,7 @@ export class SeriesAdmissionFeedDriver {
     }
     const startMs = market?.eventStartTime === null || market === null ? undefined : epochMsOfInstant(market.eventStartTime);
     if (startMs !== undefined && startMs - nowMs > this.#options.admissionLeadSeconds * 1000) return; // not yet due
-    const tokens = market === null ? [] : parseTokenPair(market.clobTokenIds);
+    const tokens = market === null ? [] : selectedTokenPair(market);
     if (conditionId !== null && this.#options.windows.knows(conditionId, tokens)) {
       this.#skippedKnown += 1;
       return;
@@ -1004,10 +1017,13 @@ export class SeriesAdmissionFeedDriver {
     }
     this.#options.dispatcher.markIncidentClosed(capScope, "GATEWAY_SERIES_CAP_REACHED");
 
-    // The CLOB read — journaled first, like every response.
+    // The CLOB read — journaled first, like every response. It sends the
+    // condition id's 32-byte form (ADR-030 Amendment 2 rule 3); an id of any
+    // other width gets no read, and the judge refuses it by name.
     let clob: ReturnType<typeof readClobMarketInfoBody> | undefined;
     let clobFrame: CitedFrame | undefined;
-    if (conditionId !== null && conditionId !== "" && conditionId.length <= 200) {
+    const venueCondition = conditionId === null ? undefined : paddedConditionId(conditionId);
+    if (conditionId !== null && venueCondition?.ok === true) {
       // R1-FABLE-04: every ATTEMPTED read counts, whatever its outcome.
       if (budget.remaining <= 0) {
         this.#deferredByReadBudget += 1;
@@ -1015,27 +1031,28 @@ export class SeriesAdmissionFeedDriver {
       }
       budget.remaining -= 1;
       const clobScope = { scope: `${this.#options.feedId}:${conditionId}`, ids: derivedWindowIds(conditionId, startMs) };
-      const url = clobMarketInfoUrl(conditionId, this.#options.clobBaseUrl);
+      const sentAs = venueCondition.padded ? ` (sent right-padded to 32 bytes as ${venueCondition.conditionId}, ADR-030 Amendment 2 rule 3)` : "";
+      const url = clobMarketInfoUrl(venueCondition.conditionId, this.#options.clobBaseUrl);
       let response;
       try {
         response = await requestClobMarketInfo({
           http: this.#options.http,
-          conditionId,
+          conditionId: venueCondition.conditionId,
           ...(this.#options.clobBaseUrl === undefined ? {} : { baseUrl: this.#options.clobBaseUrl }),
         });
       } catch (error) {
-        this.#requestFailed("GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId} failed at the transport level: ${describe(error)}; the window is reconsidered next cycle`, clobScope);
+        this.#requestFailed("GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId}${sentAs} failed at the transport level: ${describe(error)}; the window is reconsidered next cycle`, clobScope);
         return;
       }
       clobFrame = this.#journal(url, response.bodyUtf8);
       if (clobFrame === undefined || this.#stopped) return;
       if (response.status < 200 || response.status >= 300) {
-        this.#requestFailed("GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId} returned HTTP ${String(response.status)}; the window is reconsidered next cycle`, clobScope);
+        this.#requestFailed("GATEWAY_SERIES_CLOB_READ_FAILED", `the CLOB market-info request for ${conditionId}${sentAs} returned HTTP ${String(response.status)}; the window is reconsidered next cycle`, clobScope);
         return;
       }
       clob = readClobMarketInfoBody(response.bodyUtf8);
       if (clob.status === "invalid") {
-        this.#requestFailed("GATEWAY_SERIES_CLOB_READ_INVALID", `the CLOB market-info body for ${conditionId} was not the documented ClobMarketDetails: ${clob.issues.join("; ")}; the window is reconsidered next cycle`, clobScope);
+        this.#requestFailed("GATEWAY_SERIES_CLOB_READ_INVALID", `the CLOB market-info body for ${conditionId}${sentAs} was not the documented ClobMarketDetails: ${clob.issues.join("; ")}; the window is reconsidered next cycle`, clobScope);
         return;
       }
       this.#clobReads += 1;
@@ -1467,15 +1484,14 @@ export class SeriesAdmissionFeedDriver {
   }
 }
 
-/** The JSON-encoded `clobTokenIds` pair, or `[]` when unreadable (for the collision check only). */
-function parseTokenPair(text: string | null): readonly string[] {
-  if (text === null) return [];
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
-  } catch {
-    return [];
-  }
+/**
+ * The trading ids the window's `version` selects (ADR-030 Amendment 2 rule 1;
+ * plan row A8), or `[]` when they cannot be selected — for the collision
+ * check only. The field the version does not select is never read as an id.
+ */
+function selectedTokenPair(market: NonNullable<SeriesWindowEventReading["market"]>): readonly string[] {
+  const selection = selectTradingIds(market);
+  return selection.ok ? [selection.yesTokenId, selection.noTokenId] : [];
 }
 
 function describe(error: unknown): string {
