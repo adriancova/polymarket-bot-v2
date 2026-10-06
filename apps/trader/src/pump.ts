@@ -38,6 +38,26 @@
  * seam is already at-most-once (`fills.ts`) and whose order views are
  * explicitly repeat-safe (`orders.ts`). Committing first would convert a crash
  * into a silent gap, which is the one thing §8.3 forbids.
+ *
+ * ## A requested stop (`TRADER-SIGNALS`)
+ *
+ * `stopRequested` is read at the top of every iteration, AFTER the halt
+ * check, so a latched halt always wins: a stop never turns a `HALTED` return
+ * into a `STOPPED` one. Once it answers `true` the pump reads NO new batch and
+ * returns `STOPPED`. The batch in hand when the request arrived — the signal
+ * reaches the process between two awaits, so a batch already polled is in
+ * hand — is not dropped: it was ingested, drained with every durable write
+ * awaited, and its position recorded, all in the iteration that read it,
+ * before the check runs. On the pipelined path the last batch's position is
+ * recorded (`settle`) once its rows are durable, before `STOPPED` is
+ * returned, exactly as at `MAX_POLLS`. The rule above holds either way: no
+ * position is recorded ahead of a durable decision.
+ *
+ * The feed's batches end on frame boundaries (`adapters/redis-feed.ts`), so
+ * the batch in hand is whole frames; the one exception, a frame longer than a
+ * batch, is handed out in parts, and its unread remainder was never
+ * delivered, so its position was never recorded and a consumer resuming
+ * reads it whole.
  */
 
 import type { HaltController } from "@polymarket-bot/trading-core";
@@ -56,7 +76,15 @@ export interface PumpResult {
     /** The feed answered no events and `untilIdle` was requested. */
     | "IDLE"
     /** A halt is latched; no further trading decision will be made. */
-    | "HALTED";
+    | "HALTED"
+    /**
+     * `TRADER-SIGNALS`: a stop was requested (`stopRequested`) with no halt
+     * latched; no batch was read after it, and the batch in hand finished its
+     * durable writes and recorded its position first. A new value of this
+     * union, not a new run status: the word is the one `strategy.runs.status`
+     * already uses for a run an operator ended (`internal.run_status`).
+     */
+    | "STOPPED";
 }
 
 export interface PumpOptions {
@@ -67,6 +95,12 @@ export interface PumpOptions {
   readonly maxPolls: number;
   /** Stop on the first empty batch. */
   readonly untilIdle?: boolean;
+  /**
+   * `TRADER-SIGNALS`: answers `true` once a stop is requested (SIGINT or
+   * SIGTERM). Read before every poll, after the halt check; see the module
+   * header. Absent: the pump never stops for a request.
+   */
+  readonly stopRequested?: () => boolean;
 }
 
 /**
@@ -86,6 +120,11 @@ export async function pump(options: PumpOptions): Promise<PumpResult> {
   for (let iteration = 0; iteration < options.maxPolls; iteration += 1) {
     if (options.halts.anyHalt) {
       return { polls, ingested, stopped: "HALTED" };
+    }
+    // `TRADER-SIGNALS`: every batch read so far was drained durably and its
+    // position recorded in its own iteration, so nothing is left in hand.
+    if (options.stopRequested?.() === true) {
+      return { polls, ingested, stopped: "STOPPED" };
     }
     polls += 1;
     const batch = await options.feed.poll();
@@ -205,6 +244,12 @@ async function pumpPipelined(options: PumpOptions): Promise<PumpResult> {
   for (let iteration = 0; iteration < options.maxPolls; iteration += 1) {
     if (halts.anyHalt) {
       return { polls, ingested, stopped: "HALTED" };
+    }
+    // `TRADER-SIGNALS`: the batch in hand was drained; its rows become durable
+    // and its position is recorded here, as at `MAX_POLLS`, before the stop.
+    if (options.stopRequested?.() === true) {
+      if (!(await settle())) return { polls, ingested, stopped: "HALTED" };
+      return { polls, ingested, stopped: "STOPPED" };
     }
     polls += 1;
     const batch = await feed.poll();

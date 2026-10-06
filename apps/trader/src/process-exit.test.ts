@@ -110,7 +110,7 @@ describe("exitAfterStartup, through its ports", () => {
   });
 
   it("every code startup() can return is the code the process exits with — 0 included", () => {
-    for (const code of [0, 69, 75, 78]) {
+    for (const code of [0, 69, 70, 75, 78]) {
       const { ports, calls, timers, pendingFlushes } = recordingPorts();
       exitAfterStartup(code, ports);
       timers[0]?.fire();

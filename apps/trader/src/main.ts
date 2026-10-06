@@ -2,28 +2,39 @@
  * The paper trader's process entry point.
  *
  * This is the ONLY file in the package that touches `process` — the
- * environment, the exit code, the signal handlers. Everything else takes what
- * it needs as an argument, which is what makes the whole system testable
- * without an ambient environment and what keeps §6 invariant 17's check
- * (`safety.ts`) a pure function of a record.
+ * environment, the exit code, the SIGINT and SIGTERM handlers. Everything
+ * else takes what it needs as an argument, which is what makes the whole
+ * system testable without an ambient environment and what keeps §6
+ * invariant 17's check (`safety.ts`) a pure function of a record. The
+ * handlers are installed by the process shell at the bottom of this file and
+ * live in `graceful-stop.ts`, which is handed `process` (`TRADER-SIGNALS`;
+ * before that round this sentence named "the signal handlers" and there were
+ * none, so Ctrl-C killed the process outright).
  *
  * ## The startup sequence, and why nothing may move ahead of step 1
  *
  * ```text
+ * 0. installGracefulStop(...)            ← TRADER-SIGNALS (the shell): SIGINT/SIGTERM request a stop
  * 1. checkPaperTraderSafety(env)        ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration    ← ADR-020 D1-D4
  * 2b. readHealthServerEnv(env)           ← TRDR-3: loopback-only, or no endpoint, stated
  * 2c. readRedisResponseTimeout(env)      ← OUTAGE-1: the Redis outage bound, stated
+ * 2d. readShutdownDeadline(env)          ← TRADER-SIGNALS: the stop's deadline, stated
  * 3. construct the infrastructure        ← Redis (refused with 69 if unreachable), PostgreSQL
  * 3b. verifyRegisteredRows(db, config)   ← BOOT-1: the rows every durable write references
  * 4. the simulated venue, then
  *    createPaperTrader(...)              ← the composition root
  * 4b. startTraderHealthServer(...)       ← TRDR-3: GET /health over the loopback, if configured
- * 5. pump                                ← §8.1's outer loop
+ * 5. pump                                ← §8.1's outer loop, until a halt or a requested stop
  * 5b. checkAccountingRebuild("SHUTDOWN") ← FOLD-1: §6 invariant 8's rebuild, run once the pump stops
  * 5c. recordHaltsBeforeExit(...)         ← PROVENANCE-1: every latched halt to ops.incidents, bounded
+ * 5d. close, in the reverse order of opening
  * 6. exitAfterStartup(code, ...)          ← TC-LOWS-1: the process exits with that code, bounded
  * ```
+ *
+ * Step 0 installs handlers and nothing else: it reads no environment and
+ * opens nothing, so step 1 is still the first thing that DECIDES anything.
+ * Steps 5 to 5d are {@link runUntilStopped}.
  *
  * Step 1 runs on the ENVIRONMENT RECORD before a configuration file is opened,
  * before a Redis connection is attempted and before a database pool exists. §6
@@ -140,6 +151,40 @@
  * final, so no acknowledged write and no halt record is lost by it (the
  * reasoning is in that module's header).
  *
+ * ## The graceful stop (`TRADER-SIGNALS`)
+ *
+ * SIGINT or SIGTERM REQUESTS a stop (`graceful-stop.ts`, whose header has the
+ * whole design). The pump reads no new batch, and the batch in hand finishes
+ * its durable writes and records its position (`pump.ts`); then steps 5b to
+ * 5d run exactly as after a halt: the SHUTDOWN rebuild check, reported as
+ * before; the halt record, when a halt is latched; and the closes, in the
+ * reverse order of opening — the transport-lag sampler, the event
+ * subscription, the health endpoint, the PostgreSQL pool, the Redis
+ * transport. There is no separate metrics listener: the health endpoint is
+ * this process's only HTTP surface. A close that fails is logged
+ * (`CLOSE FAILED: …`) and the next one still runs.
+ *
+ * The exit ({@link exitCodeAfterStop}): `0` only when no halt is latched and
+ * the check matched; {@link EXIT_CODES.halted} (75) when any halt is latched,
+ * the signal notwithstanding — a halt stays a halt; and
+ * {@link EXIT_CODES.shutdownCheckFailed} (70) when the check failed, whatever
+ * stopped the pump. A second signal exits
+ * {@link EXIT_CODES.shutdownForced} (130) at once, and a stop that has not
+ * finished within `TRADER_SHUTDOWN_DEADLINE_MS` (default 8,000 ms; why, in
+ * `graceful-stop.ts`) exits {@link EXIT_CODES.shutdownDeadlineExceeded}
+ * (124). Each of those says why, in one line.
+ *
+ * WHAT A STOP RECORDS. Nothing durable that a halt exit did not already
+ * record: the halt record when a halt is latched, and no row otherwise. In
+ * particular this process does not write its run's `strategy.runs.status`
+ * (`RUNNING` / `STOPPED` / `FAILED`) on any exit, before this round or after
+ * it: the row stays `RUNNING`, so a stop cannot mark a halted run as cleanly
+ * completed, and `BOOT-1` already refuses to resume a run that holds
+ * decisions, so the next start is a new run either way. The stop's outcome is
+ * its exit code and its log: `pump stopped: STOPPED` (a new value of the
+ * pump's result, not a new run status) and the last line,
+ * `trader stopped: exit <code> — …`.
+ *
  * ## The evaluation cadence (`CADENCE-1`, ADR-026)
  *
  * The trader evaluates each market's `onFeatures` at most once per 1,000 ms of
@@ -206,9 +251,19 @@ import {
 } from "./health-server.js";
 import { HALT_RECORD_DEADLINE_MS, recordHaltsBeforeExit } from "./halt-record.js";
 import { PROCESS_EXIT_GRACE_MS, exitAfterStartup, processExitPorts } from "./process-exit.js";
+import {
+  SHUTDOWN_DEADLINE_ENV,
+  SHUTDOWN_DEADLINE_EXIT_CODE,
+  SHUTDOWN_FORCED_EXIT_CODE,
+  gracefulStopPorts,
+  installGracefulStop,
+  readShutdownDeadline,
+  type StopRequest,
+  type StopSignal,
+} from "./graceful-stop.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
-import type { Clock } from "@polymarket-bot/trading-core";
-import { pump } from "./pump.js";
+import type { Clock, MarketEventFeed } from "@polymarket-bot/trading-core";
+import { pump, type PumpResult } from "./pump.js";
 import { TransportLagSampler } from "./transport-lag.js";
 import { checkPaperTraderSafety } from "@polymarket-bot/trading-core";
 import { createPaperTrader, type PaperTrader } from "@polymarket-bot/trading-core";
@@ -219,8 +274,22 @@ import { buildSimulatedVenue } from "@polymarket-bot/trading-core";
 
 export { createExecutionPolicy, type VenueWiring };
 
-/** What the process exits with, so an operator can script against it. */
+/**
+ * What the process exits with, so an operator can script against it.
+ *
+ * `TRADER-SIGNALS` added the last three. When more than one applies, the
+ * order is: a forced or late exit (130, 124) ends the process before
+ * `startup()` returns, so its code is the one reported, even when a halt is
+ * latched — its one line then names every latched halt, so a halt is never
+ * hidden and the exit is never 0; otherwise `shutdownCheckFailed` (70) over
+ * `halted` (75) over `ok` (0) ({@link exitCodeAfterStop}).
+ */
 export const EXIT_CODES = Object.freeze({
+  /**
+   * The pump stopped with no halt latched and the SHUTDOWN rebuild check
+   * matched: since `TRADER-SIGNALS`, a requested stop (SIGINT or SIGTERM)
+   * that finished in order.
+   */
   ok: 0,
   /** The environment is unsafe (§6 invariant 17, §15, ADR-010). */
   unsafeEnvironment: 78,
@@ -246,12 +315,49 @@ export const EXIT_CODES = Object.freeze({
    * remedy class.
    */
   infrastructureUnavailable: 69,
+  /**
+   * `TRADER-SIGNALS`: the `FOLD-1` SHUTDOWN rebuild check failed — the held
+   * ledger view (or a PnL stream) differs from its rebuild from zero, §6
+   * invariant 8. The check has latched a GLOBAL
+   * `ACCOUNTING_REBUILD_MISMATCH` halt, so this is a halt exit too, but a
+   * DISTINCT one: the run's in-memory accounting is not to be trusted, which
+   * is a defect to report, not an outage to wait out.
+   *
+   * `sysexits` EX_SOFTWARE ("an internal software error has been detected").
+   * It takes precedence over {@link EXIT_CODES.halted} whatever stopped the
+   * pump — a halt, or a requested stop — so a script that sees 75 knows the
+   * check matched. (Before this round a failed check exited 75; nothing
+   * pinned that.)
+   */
+  shutdownCheckFailed: 70,
+  /**
+   * `TRADER-SIGNALS`: a requested stop did not finish within
+   * `TRADER_SHUTDOWN_DEADLINE_MS` (default 8,000 ms), and the process exited
+   * without finishing it, after one `SHUTDOWN DEADLINE EXCEEDED: …` line
+   * naming where it was (`graceful-stop.ts`). 124 is the code `timeout(1)`
+   * exits with when its command times out.
+   */
+  shutdownDeadlineExceeded: SHUTDOWN_DEADLINE_EXIT_CODE,
+  /**
+   * `TRADER-SIGNALS`: a second SIGINT or SIGTERM arrived while a requested
+   * stop was under way, and the process exited at once without finishing it,
+   * after one `SHUTDOWN FORCED: …` line (`graceful-stop.ts`). 130 is 128 + 2
+   * (SIGINT): what a shell reports for a process Ctrl-C ended, used for a
+   * second SIGTERM too.
+   */
+  shutdownForced: SHUTDOWN_FORCED_EXIT_CODE,
 });
 
 export interface StartupPorts {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly readConfig: (path: string) => Promise<string>;
   readonly log: (line: string) => void;
+  /**
+   * `TRADER-SIGNALS`: the stop SIGINT and SIGTERM request (the shell's
+   * `installGracefulStop`). Absent, as in a test that calls `startup()`
+   * directly, no stop can be requested and the pump runs until a halt.
+   */
+  readonly stop?: StopRequest;
 }
 
 /**
@@ -338,6 +444,23 @@ export async function startup(ports: StartupPorts): Promise<number> {
       `${String(DEFAULT_CONNECTION_TIMEOUT_MS)} ms connection timeout, which the PostgreSQL close waits ` +
       "for. A process that a silent peer still holds open once that grace has passed is exited by " +
       "force, as soon as every line it logged has reached the log (§4.2)",
+  );
+
+  // --- 2d. the stop's deadline (TRADER-SIGNALS), before anything is opened ---
+  const stopDeadline = readShutdownDeadline(ports.env);
+  if (!stopDeadline.ok) {
+    ports.log(`REFUSING TO START: ${stopDeadline.refusal.code}: ${stopDeadline.refusal.detail}`);
+    return EXIT_CODES.configurationRefused;
+  }
+  ports.stop?.useDeadline(stopDeadline.deadlineMs);
+  ports.log(
+    "graceful stop: SIGINT or SIGTERM stops the trader in order — the pump reads no new batch, the batch in " +
+      "hand finishes its durable writes, the SHUTDOWN rebuild check runs, every latched halt is recorded and " +
+      `everything opened is closed — and it exits ${String(EXIT_CODES.ok)} (${String(EXIT_CODES.halted)} with a ` +
+      `halt latched, ${String(EXIT_CODES.shutdownCheckFailed)} if the check fails). A stop not finished within ` +
+      `${String(stopDeadline.deadlineMs)} ms (${SHUTDOWN_DEADLINE_ENV}${stopDeadline.defaulted ? " unset; the default" : ""}) ` +
+      `exits ${String(EXIT_CODES.shutdownDeadlineExceeded)}, and a second signal exits ` +
+      `${String(EXIT_CODES.shutdownForced)} at once`,
   );
 
   // --- 3. infrastructure ----------------------------------------------------
@@ -447,48 +570,200 @@ export async function startup(ports: StartupPorts): Promise<number> {
       "path; the health endpoint reports them with the event-time lag under `transport`",
   );
 
+  // --- 5 to 5d. the pump, until a halt or a requested stop, then the stop --
+  return await runUntilStopped({
+    trader,
+    config,
+    // In the order startup opened them; they are closed in the reverse order.
+    opened: { transport, store, healthServer, feed, transportLag },
+    log: ports.log,
+    ...(ports.stop === undefined ? {} : { stop: ports.stop }),
+  });
+}
+
+/**
+ * What `startup()` opened before the pump, named in the order it opened them
+ * (`TRADER-SIGNALS`). {@link runUntilStopped} closes them in the reverse
+ * order. Each is the narrowest surface the stop uses, so a test can hand in
+ * recording fakes.
+ */
+export interface OpenedResources {
+  /** 1 (step 3). The event transport's Redis connection. */
+  readonly transport: { close(): Promise<void> };
+  /** 2 (step 3b). The durable store, which owns the PostgreSQL pool and writes the halt record. */
+  readonly store: Pick<PostgresTraderStore, "recordHalts" | "close">;
+  /** 3 (step 4b). The health endpoint's listener, when one was configured. */
+  readonly healthServer: Pick<RunningTraderHealthServer, "close"> | undefined;
+  /** 4 (step 5). The feed the pump reads, which owns the subscription's Redis connection. */
+  readonly feed: MarketEventFeed;
+  /** 5 (step 5). The transport-lag sampler's timer. */
+  readonly transportLag: Pick<TransportLagSampler, "stop">;
+}
+
+export interface RunUntilStoppedOptions {
+  readonly trader: Pick<PaperTrader, "loop" | "halts">;
+  /** What the halt record names: the account and every instance. */
+  readonly config: Pick<TraderConfig, "accounting" | "instances" | "seriesInstances">;
+  readonly opened: OpenedResources;
+  readonly log: (line: string) => void;
+  /** The stop SIGINT and SIGTERM request; absent, the pump runs until a halt. */
+  readonly stop?: StopRequest;
+}
+
+/**
+ * Steps 5 to 5d: the pump, until a halt latches or a stop is requested; then
+ * the SHUTDOWN rebuild check, the halt record and the closes; then the exit
+ * code. The SAME sequence whatever stopped the pump (`TRADER-SIGNALS`; see
+ * the module header). Never throws: a close that throws is logged and the
+ * next close still runs.
+ *
+ * It tells `stop` which phase it is in, so a forced or late exit can say
+ * where the stop was (`graceful-stop.ts`).
+ */
+export async function runUntilStopped(options: RunUntilStoppedOptions): Promise<number> {
+  const { trader, config, opened, log, stop } = options;
+
+  // --- 5. the pump ----------------------------------------------------------
+  stop?.watchHalts(() => trader.halts.records().map((halt) => `${halt.scope.kind} ${halt.code}`));
+  stop?.enter("PUMP");
   const result = await pump({
     loop: trader.loop,
-    feed,
+    feed: opened.feed,
     halts: trader.halts,
     maxPolls: Number.MAX_SAFE_INTEGER,
+    ...(stop === undefined ? {} : { stopRequested: () => stop.signal !== undefined }),
   });
 
-  // `FOLD-1` (user ruling F2): the SHUTDOWN rebuild check. The loop's held
-  // ledger view is compared with `projectLedger(ledger)` on serialized bytes
-  // (it also ran every 50 posted fills). A mismatch latches a GLOBAL
+  // --- 5b. `FOLD-1` (user ruling F2): the SHUTDOWN rebuild check. The loop's
+  // held ledger view is compared with `projectLedger(ledger)` on serialized
+  // bytes (it also ran every 50 posted fills). A mismatch latches a GLOBAL
   // `ACCOUNTING_REBUILD_MISMATCH` halt — logged below with every other halt —
-  // and the process exits `halted`, never `ok`.
+  // and the process exits `shutdownCheckFailed`, never `ok`.
   const rebuild = trader.loop.checkAccountingRebuild("SHUTDOWN");
   const health = trader.loop.health();
-  ports.log(`pump stopped: ${result.stopped} after ${String(result.polls)} poll(s)`);
-  ports.log(
+  log(pumpStoppedLine(result, stop?.signal));
+  log(
     rebuild.matched
       ? "accounting rebuild check at shutdown: the held ledger view equals its rebuild from zero"
       : "accounting rebuild check at shutdown: MISMATCH — the held accounting state differs from " +
           "its rebuild from zero (see the ACCOUNTING_REBUILD_MISMATCH halt)",
   );
   for (const halt of health.halts) {
-    ports.log(`HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail}`);
+    log(`HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail}`);
   }
-  ports.log(`health: ${JSON.stringify(health)}`);
+  log(`health: ${JSON.stringify(health)}`);
 
-  // `PROVENANCE-1` (`OUT1-R1-HALT-NOT-DURABLE`): every latched halt, written
-  // to `ops.incidents` BEFORE anything is closed, bounded, and never changing
-  // the exit code below (`halt-record.ts`).
+  // --- 5c. `PROVENANCE-1` (`OUT1-R1-HALT-NOT-DURABLE`): every latched halt,
+  // written to `ops.incidents` BEFORE anything is closed, bounded, and never
+  // changing the exit code below (`halt-record.ts`).
+  stop?.enter("HALT_RECORD");
   await recordHaltsBeforeExit({
     halts: health.halts,
     config,
-    write: (rows, deadlineMs) => store.recordHalts(rows, deadlineMs),
-    log: ports.log,
+    write: (rows, deadlineMs) => opened.store.recordHalts(rows, deadlineMs),
+    log,
   });
 
-  transportLag.stop();
-  await healthServer?.close();
-  await feed.close();
-  await store.close();
-  await transport.close();
-  return result.stopped === "HALTED" || !rebuild.matched ? EXIT_CODES.halted : EXIT_CODES.ok;
+  // --- 5d. the closes, in the REVERSE order of opening (`TRADER-SIGNALS`).
+  const failedCloses: string[] = [];
+  const close = async (what: string, act: () => Promise<void> | void): Promise<void> => {
+    stop?.enter("CLOSING", what);
+    try {
+      await act();
+    } catch (cause) {
+      failedCloses.push(what);
+      log(`CLOSE FAILED: ${what}: ${describeError(cause)}; the stop goes on to the next close`);
+    }
+  };
+  await close("the transport-lag sampler", () => {
+    opened.transportLag.stop();
+  });
+  await close("the event subscription", () => opened.feed.close());
+  const healthServer = opened.healthServer;
+  if (healthServer !== undefined) await close("the health endpoint", () => healthServer.close());
+  await close("the PostgreSQL pool", () => opened.store.close());
+  await close("the Redis transport", () => opened.transport.close());
+
+  // A halt latched after the snapshot above (the pool's error handler can
+  // latch one while it closes) was not in the record; it still decides the
+  // exit, and is logged here so it is not silent.
+  const latched = trader.halts.records();
+  const recorded = new Set(health.halts.map(haltIdentity));
+  for (const halt of latched) {
+    if (recorded.has(haltIdentity(halt))) continue;
+    log(
+      `HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail} ` +
+        "(latched during the stop, after the halt record was written; it is not in ops.incidents)",
+    );
+  }
+  const code = exitCodeAfterStop({
+    pumpStopped: result.stopped,
+    rebuildMatched: rebuild.matched,
+    haltsLatched: latched.length,
+  });
+  log(traderStoppedLine(code, { signal: stop?.signal, haltsLatched: latched.length, failedCloses }));
+  return code;
+}
+
+/**
+ * The exit code once the pump has stopped and the stop has run
+ * (`TRADER-SIGNALS`): {@link EXIT_CODES.shutdownCheckFailed} over
+ * {@link EXIT_CODES.halted} over {@link EXIT_CODES.ok}. FAIL CLOSED: `ok`
+ * needs the check to have matched AND no halt latched AND the pump not to
+ * have stopped on a halt; a requested stop clears nothing.
+ */
+export function exitCodeAfterStop(outcome: {
+  readonly pumpStopped: PumpResult["stopped"];
+  readonly rebuildMatched: boolean;
+  readonly haltsLatched: number;
+}): number {
+  if (!outcome.rebuildMatched) return EXIT_CODES.shutdownCheckFailed;
+  if (outcome.pumpStopped === "HALTED" || outcome.haltsLatched > 0) return EXIT_CODES.halted;
+  return EXIT_CODES.ok;
+}
+
+/** One latched halt, by value: the controller keeps one record per scope. */
+function haltIdentity(halt: { readonly scope: unknown; readonly code: string }): string {
+  return JSON.stringify([halt.scope, halt.code]);
+}
+
+/** `pump stopped: …`, as before for a halt; with what the stop did for a requested one. */
+function pumpStoppedLine(result: PumpResult, signal: StopSignal | undefined): string {
+  const line = `pump stopped: ${result.stopped} after ${String(result.polls)} poll(s)`;
+  if (result.stopped !== "STOPPED") return line;
+  return (
+    `${line}, ${String(result.ingested)} event(s) ingested: ${signal ?? "a stop"} was requested, so no batch ` +
+    "was read after it, and the batch in hand finished its durable writes and recorded its position first"
+  );
+}
+
+/** The stop's last line: the exit code, and why. Exported for its test. */
+export function traderStoppedLine(
+  code: number,
+  context: { readonly signal: StopSignal | undefined; readonly haltsLatched: number; readonly failedCloses: readonly string[] },
+): string {
+  const closes =
+    context.failedCloses.length === 0
+      ? "everything opened was closed"
+      : `${String(context.failedCloses.length)} close(s) failed (${context.failedCloses.join(", ")}; logged above)`;
+  switch (code) {
+    case EXIT_CODES.ok:
+      return (
+        `trader stopped: exit ${String(code)} — a clean stop${context.signal === undefined ? "" : ` on ${context.signal}`}: ` +
+        `no halt is latched and the SHUTDOWN rebuild check matched; ${closes}`
+      );
+    case EXIT_CODES.shutdownCheckFailed:
+      return (
+        `trader stopped: exit ${String(code)} — the SHUTDOWN rebuild check FAILED (ACCOUNTING_REBUILD_MISMATCH, ` +
+        "§6 invariant 8): the held accounting state differs from its rebuild from zero, so this run's accounting " +
+        `is not to be trusted; ${String(context.haltsLatched)} halt(s) latched in all; ${closes}`
+      );
+    default:
+      return (
+        `trader stopped: exit ${String(code)} — halted: ${String(context.haltsLatched)} halt(s) latched (the HALT ` +
+        `lines above)${context.signal === undefined ? "" : `; the stop ${context.signal} requested clears no halt, so this is not a clean stop`}; ${closes}`
+      );
+  }
 }
 
 export interface DurableTraderOptions {
@@ -892,18 +1167,26 @@ export class SystemPaperClock implements Clock {
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url.endsWith("/main.mjs");
 if (invokedDirectly) {
+  // `TRADER-SIGNALS` (step 0): SIGINT and SIGTERM request a graceful stop from
+  // here on, instead of ending the process (`graceful-stop.ts`). Installed
+  // before `startup()` reads anything; it reads and opens nothing itself.
+  const stop = installGracefulStop(gracefulStopPorts(process));
   const code = await startup({
     env: process.env,
     readConfig: async (path) => await readFile(path, "utf8"),
     log: (line) => {
       process.stderr.write(`${line}\n`);
     },
+    stop,
   });
   // `TC-LOWS-1` (`PROV1-R2-L2`): the process EXITS with that code within a
   // bound, even when a peer that never answers holds a socket open, and never
   // ahead of a line already logged (`process-exit.ts`; see "The process exit"
   // above). `process` is handed over here, the one file that touches it.
-  exitAfterStartup(code, processExitPorts(process));
+  // `TRADER-SIGNALS`: `finish` cancels the stop's deadline and hands the
+  // signals back to Node; it answers `false` only when a forced exit (130 or
+  // 124) is already under way, which then exits on its own.
+  if (stop.finish()) exitAfterStartup(code, processExitPorts(process));
 }
 /* c8 ignore stop */
 
