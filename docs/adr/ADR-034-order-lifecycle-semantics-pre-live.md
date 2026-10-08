@@ -14,7 +14,7 @@
     refused, is put to the user (Open item 10). R3's D4 part waits for that
     ruling.
 - **Date:** 2026-10-06. Revised after review rounds 1 and 2 (2026-10-06)
-  and rounds 3 and 4 (2026-10-08).
+  and rounds 3 to 5 (2026-10-08).
 - **Recorded by:** the round `ADR-034` (docs only), authorized at `3294201`.
 - **Implemented by:** not yet. Three rounds are proposed under "Implementation
   plan", strictly in this order: `OMS-QTY` (D2), `OMS-VENUE-TIME` (D1), and
@@ -301,7 +301,14 @@
   makes it FILLED, and only a read fixes its final size. With the answer
   lost, a read that shows it terminal with a positive `size_matched`,
   `MATCHED` or `CANCELED`, makes it FILLED (`R4-L3`). So its T is the
-  FILLED row's C. C is PENDING until a read has fixed the final size and the
+  FILLED row's C. The one exception (`R5-L2`):
+  - **a `delayed` such order that a stream `CANCELED` observation ends
+    first** (D3.5's delayed arm; `order-manager.ts:2252-2256`) stays
+    CANCELED. Its T is that frame's `timestamp`, the table's first row, a
+    point. The read it requests fixes the final size and leaves the state
+    (`:2149-2154`), so T stays that point.
+
+  When it is FILLED, C is PENDING until a read has fixed the final size and the
   recorded fills sum to it. C is then the latest instant among those fills.
   - **What the read supplies.** The read fixes which fills make up the
     order, and never supplies an instant. Each fill's instant is still venue
@@ -901,8 +908,11 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
       are its fills.
     - The transition issues an `ORDER_STATE` reconciliation request at once,
       so that a read fixes the final size.
-    - Its T under D1 is the FILLED row's C (D1.3). CANCELED was rejected for
-      such an order (Alternatives).
+    - Its T under D1 is the FILLED row's C (D1.3). Ending such an order
+      CANCELED at its answer, or at a read, was rejected (Alternatives). The
+      one route that leaves it CANCELED is a stream `CANCELED` observation
+      that ends a `delayed` such order (the `delayed` bullet below;
+      `R5-L2`). Its T is then that frame's `timestamp` (D1.3).
   - The final size is fixed only by an authoritative read. That is the salt
     gate's rule, unchanged.
   - **A read's `MATCHED` is terminal for an immediate order** (`R3-M1`), and
@@ -955,9 +965,12 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
       repeat the very contradiction that raised it.
     - **A collateral-targeted FOK BUY** cannot be judged by shares: they
       differ from its signed share side whenever the book asks below the
-      limit (D4.2). Its analogue is the spend. Once a read has fixed its
-      final size and its fills sum to it, the OMS compares the spend `Σ eᵢ`
-      with the target. If the spend is below `target − n × 10⁻⁶`, where n is
+      limit (D4.2). Its analogue is the spend. Once a read has fixed a
+      positive final size and its fills sum to it, the OMS compares the
+      spend `Σ eᵢ` with the target, whatever the order's state, FILLED or
+      CANCELED (`R5-L2`). A FOK that filled nothing (final size 0, the
+      table's `CANCELED`, m = 0 row) spent nothing, as A F-80 allows, and
+      raises nothing. If the spend is below `target − n × 10⁻⁶`, where n is
       its distinct maker legs, the OMS raises the same conflict, and does not
       release. The threshold rests on labelled assumption **A13**: a FOK BUY
       that fills spends its target whole, up to F-63's per-leg floor. A13 is
@@ -1111,7 +1124,26 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
     - **the `delayed` arm:** a `delayed` answer, then fills, then a stream
       `MATCHED` observation. The observation requests a read at once, and
       that read makes the order FILLED. With no observation at all, the next
-      periodic run reads it by id and ends it in the same way.
+      periodic run reads it by id and ends it in the same way;
+    - **the `delayed` arm, ended by a stream `CANCELED` observation**
+      (`R5-L2`): a collateral-targeted FAK BUY with a target of 17.00, a
+      `delayed` answer, then fills spending 10.00 whose `MATCHED` events
+      were received, then a stream `CANCELED` observation stamped t:
+      - the order is CANCELED at once, its T is t (D1.3's first row, a
+        point), and a read is requested;
+      - a late `PLACEMENT` stamped t − 1 ms is STALE, with no halt; one
+        stamped t + 1 ms halts;
+      - the read, `MATCHED` or `CANCELED` with a positive `size_matched`,
+        fixes the final size and leaves the order CANCELED with T = t. The
+        gate opens and the reservation is released only once the fills sum
+        to that size: not at the observation, and not before the read;
+      - **as a collateral-targeted FOK BUY** (the A13 check): the same
+        spend of 10.00 raises the FOK fill conflict once the read fixes the
+        size, and nothing is released. A spend of 16.999999 over two legs
+        raises nothing, and releases. A FOK ended this way with
+        `size_matched` 0 raises nothing;
+      - **one mutation row** skips the A13 check for an order that is
+        CANCELED: the FOK's under-spend then releases, failing the test.
 
 **D3 is pre-live for the OMS and the adapter.** For PAPER it is plumbing only,
 with no change in output.
@@ -1360,31 +1392,55 @@ pUSD.
          collateral-targeted BUY, the coordinator passes the spend the OMS
          recorded for that fill (by trade id and venue order id), and the
          leg's collateral delta is minus that spend, plus the fee as today.
-         If the OMS recorded no fill for the leg (the fill was withheld for
-         want of legs, below), the leg's collateral delta is **not exact**.
-         Nothing is estimated. The fill is then neither recorded nor booked,
-         so what WP-290 judges depends on the balance (`R4-L1`;
-         `compareHolding` returns `MATCH` whenever `d` = 0, before it looks
-         at `exact`, `holdings.ts:111-119`):
-         - **while the balance has not moved,** A = P, so `d` = 0: `MATCH`.
-           Nothing is booked and nothing has moved, so there is nothing to
-           explain yet. The OMS still holds the order's reservation and its
-           salt gate (the no-legs rule below);
-         - **once the balance has moved and the trade is still in transit**
-           (`MATCHED`, `MINED` or `RETRYING`; `coordinator.ts:2122-2126`),
-           `d` ≠ 0 and the pending delta is not exact:
-           `IN_TRANSIT_AMBIGUOUS`, an account-scoped hold
-           (`coordinator.ts:2179-2184`);
-         - **once the trade is `CONFIRMED`,** it is no longer in transit, so
-           nothing is pending for the asset: `UNEXPLAINED`. The coordinator
-           then raises `HOLDING_DELTA_UNCONFIRMED`, and, once the delta has
-           persisted for `holdingConfirmationMs` with no unresolved attempt
-           that could explain it, `BALANCE_UNATTRIBUTED` (`:2313`).
+         **A leg whose fill the OMS did not record** (the fill was withheld
+         for want of legs, below; `R5-M1`, replacing round 4's `R4-L1`
+         sequence). Nothing is estimated: in `pendingDeltas`, the leg's
+         collateral delta is **not exact**. But the holding comparison never
+         sees this leg, because WP-290 defers it. Read from the code at
+         `3294201`:
+         - **while the venue's trades read shows the trade,** the trade's own
+           leg names our venue order id, so it joins the order's legs
+           (`legsByOrder`, `coordinator.ts:1137-1142`). The OMS holds no fill
+           for it, so its probe is `UNKNOWN` (`OMS_UNKNOWN_FILL`,
+           `:1644-1647`), and `#compareFills` raises, in every run that
+           compares the order:
+           - **with the leg's fee known,** `TRADE_MISSING_IN_OMS`, with a
+             delivery act (`:1966-1975`). The OMS refuses the legless
+             `FillReport` for such an order with `OMS_INVALID_INPUT` (the
+             no-legs rule below), so the delivery adds `FILL_REFUSED`
+             (`:2066-2080`). That refusal is not a contradiction, so the next
+             run offers the delivery again (`:2041-2045`);
+           - **with the leg's fee unknown,** `FILL_ECONOMICS_UNFIXED`, and no
+             delivery: nothing is booked with a guessed fee (`:1955-1965`);
+         - **those three classes defer holdings.** `TRADE_MISSING_IN_OMS`,
+           `FILL_ECONOMICS_UNFIXED` and `FILL_REFUSED` are all in
+           `DEFERS_HOLDINGS` (`:328-336`), so the run sets `holdingsDeferred`
+           and never calls `#compareHoldings` (`:950-958`). No `MATCH`, no
+           `IN_TRANSIT_AMBIGUOUS`, no `UNEXPLAINED` and no
+           `HOLDING_DELTA_UNCONFIRMED` is judged for the collateral, and
+           nothing is booked;
+         - **the run cannot pass.** `#resumeBlocker` refuses it ("holdings
+           were not judged", `:3076`), so submissions stay paused (the RESUME
+           rules, `:185-208`). A deferral asks for another run at once
+           (`:2905`), and that run defers again. The account holds, and the
+           OMS holds the order's reservation and its salt gate (the no-legs
+           rule below);
+         - **if a complete trades read omits the trade** while the evidence
+           holds it (a WP-280 request that named it, `streamRequestRecords`,
+           `:4024-4027`, or an earlier read that showed it), the trade's
+           verdict is a conflict and the view is unsound (`:1131-1133`).
+           Holdings are then not judged either (`:950`);
+         - **this lasts** until a read carries the legs, so that the delivery
+           is accepted and the fill is recorded and booked at its spend, or
+           until an operator resolves the order.
 
-         Every phase fails closed. Which of the first two a run sees depends
-         on when the balance read moves against the trade's status, which
-         is undocumented; the test sets each phase up explicitly (D4.7 item
-         4).
+         **`BALANCE_UNATTRIBUTED` is never reached for the spend of a
+         tracked order's fill that the OMS did not record.** The deferral is
+         the guard that prevents it: "a delta such an order explains is
+         never booked UNATTRIBUTED" (`:951-954`). No round may weaken that
+         guard to make a test pass (D4.7 item 4's mutation row). The
+         holding-break path below applies only to a fill the OMS recorded and
+         verified, whose booked spend differs from the venue's.
 
        On the three-leg fill below, at zero fee and a balance of 1000: P is
        982.500001, and the pending delta is −17.499999. Before settlement A
@@ -1619,11 +1675,16 @@ pUSD.
     is positive and at most price × shares. A fill whose every leg spends 0
     (`floor₆` below one base unit) is refused, as the ledger books no zero
     entry (`LEDGER_ENTRY_AMOUNT_ZERO`); that fails closed. A record's
-    `notional` is positive too. Every owner but the last holds at least
-    0.01 share, since attributions are on D2's grid, so its `floor₆` part is
-    about 0.01 × price. At the smallest tick, 0.0001 (A F-99's table), that
-    is about one base unit, and can floor to 0. A zero part is refused, and
-    that fails closed. It is not
+    `notional` is positive too. Although the attribution bands are on D2's
+    grid, an individual fill can allocate sub-grid shares to an owner when
+    it crosses a band boundary: `allocationsFor` allocates a fill as the
+    difference of cumulative band allocations (`order-manager.ts:3062-3075`).
+    That owner's `floor₆` part can therefore be 0, even at ordinary prices
+    (`CX034-R5-01`). Example (D4.7 item 9): bands of 30 and 20, with
+    29.999999 already filled; a next fill of 1 at 0.35 spends 0.350000 and
+    allocates 0.000001 share to the first owner, whose part is `floor₆(0.35
+    × 0.000001 ÷ 1)` = 0. A zero part is refused. That fails closed, and it
+    can stop the accounting of an otherwise valid fill. A part is not
     bounded by its own price × shares, because the last
     owner takes the split's remainder: owners of 1.000001 and 0.999999
     shares of a 0.70 spend at 0.35 get 0.350000 and 0.350000, and the second
@@ -1745,14 +1806,34 @@ STOPPED S1).
      - `pendingDeltas` prices the leg at shares × price:
        `IN_TRANSIT_AMBIGUOUS` before settlement.
 
-     **A leg whose fill the OMS did not record** (`R4-L1`; D4.2 item 6),
-     with the mock's reads set up for each phase: the trade `MATCHED` and
-     the balance 1000 judges the collateral `MATCH` (nothing booked, nothing
-     moved), and the order's reservation and gate stay held; the trade
-     `MINED` and the balance 982.500001 judges it `IN_TRANSIT_AMBIGUOUS`,
-     and the account holds; the trade `CONFIRMED` and the same balance
-     judges it `UNEXPLAINED`, with `HOLDING_DELTA_UNCONFIRMED`, then
-     `BALANCE_UNATTRIBUTED` after `holdingConfirmationMs`;
+     **A leg whose fill the OMS did not record** (`R5-M1`; D4.2 item 6).
+     The trade's stream event was withheld for want of maker legs, and the
+     trades read shows the trade, with no maker legs, in each of `MATCHED`,
+     `MINED` and `CONFIRMED`, against balances of 1000 and 982.500001:
+     - **the fee known:** every run raises `TRADE_MISSING_IN_OMS` and, on
+       the refused delivery (`OMS_INVALID_INPUT`), `FILL_REFUSED`. The
+       delivery is offered again by the next run;
+     - **the fee unknown:** every run raises `FILL_ECONOMICS_UNFIXED`, and
+       nothing is delivered;
+     - **in both branches,** in every run and whatever the trade's status
+       and the balance:
+       - the run's holdings are deferred (`holdingsDeferred`), and no
+         holding verdict is recorded for the collateral: no `MATCH`,
+         `IN_TRANSIT_AMBIGUOUS`, `UNEXPLAINED` or
+         `HOLDING_DELTA_UNCONFIRMED`;
+       - the run is not `PASSED`, and submissions stay paused;
+       - nothing is booked: no `BALANCE_UNATTRIBUTED`, and no call to the
+         holdings port's `bookUnattributed`, even after
+         `holdingConfirmationMs` has elapsed;
+       - the order's reservation and its salt gate stay held;
+     - **the way out:** a later trades read that carries the maker legs is
+       delivered and accepted, the fill is recorded and booked at its spend
+       of 17.499999, and the next run judges the collateral `MATCH`;
+     - **one mutation row** removes `TRADE_MISSING_IN_OMS`,
+       `FILL_ECONOMICS_UNFIXED` and `FILL_REFUSED` from `DEFERS_HOLDINGS`.
+       The holding comparison then runs and, once the trade is `CONFIRMED`
+       and `holdingConfirmationMs` has elapsed, books the spend as
+       `BALANCE_UNATTRIBUTED` (`#bookUnattributed`), failing the test;
    - **fills that cross `plannedShares` part-way through** (`R3-M1`), D4.2's
      example: 50 at 0.33, then 1.470588 at 0.34, against a target of 17.00
      whose signed share side is 50.0000. Both fills are recorded. Neither
@@ -1820,6 +1901,14 @@ STOPPED S1).
      owner's cost as `notional`;
    - the split: 10.499998 and 7.000001 for D4.5's example; a split that does
      not sum exactly is refused `LEDGER_PRINCIPAL_SPLIT_MISMATCH`;
+   - **a fill that crosses a band boundary** (`CX034-R5-01`; D4.5): bands of
+     30 and 20, with 29.999999 already filled, and a next fill of 1 at 0.35.
+     The OMS allocates 0.000001 and 0.999999 share (`allocationsFor`), and
+     the spend is 0.350000. The first owner's part is `floor₆(0.35 ×
+     0.000001 ÷ 1)` = 0, and the last owner's is 0.350000. The zero part is
+     refused (a `PnlTradeRecord` whose `notional` is 0 is refused
+     `PNL_INPUT_INVALID`), and the test asserts that the refusal is
+     reachable at this ordinary price and fails closed;
    - **the negative cases** (`CX034-R4-02`), each refused and booking
      nothing:
      - D4.2's three-leg fact under `COLLATERAL_SPEND` with its
@@ -2166,7 +2255,9 @@ and reports it.
 - **End a collateral-targeted BUY CANCELED at its answer.** Its T would stay
   PENDING until a `CANCELLATION` frame, which the venue may never emit for a
   fully spent order (U-50, U-54). Every late frame would then halt at the
-  horizon. Rejected for FILLED with T = C, which is sound (D1.3).
+  horizon. Rejected for FILLED with T = C, which is sound (D1.3). A
+  `delayed` such order that a stream `CANCELED` frame ends stays CANCELED
+  (D3.5; `R5-L2`): that frame fixes its T, so this objection does not apply.
 - **Read a FOK's partial read as a FAK's: CANCELED with its matched part**
   (`CX034-R4-01`). It contradicts A F-80 ("Fills the entire order
   immediately or does not fill any of it") and would raise nothing.
