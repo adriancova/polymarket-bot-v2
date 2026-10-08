@@ -13,7 +13,8 @@
     (D4.1). Whether they become plan-time caps for it, or such entries are
     refused, is put to the user (Open item 10). R3's D4 part waits for that
     ruling.
-- **Date:** 2026-10-06. Revised the same day (rounds 1 and 2 of the review).
+- **Date:** 2026-10-06. Revised after review rounds 1 and 2 (2026-10-06)
+  and rounds 3 and 4 (2026-10-08).
 - **Recorded by:** the round `ADR-034` (docs only), authorized at `3294201`.
 - **Implemented by:** not yet. Three rounds are proposed under "Implementation
   plan", strictly in this order: `OMS-QTY` (D2), `OMS-VENUE-TIME` (D1), and
@@ -297,7 +298,9 @@
   terminal fact, for the same venue order id: a `CANCELED` observation for a
   canceled order, or the fills' instants for a filled one.
 - **A collateral-targeted BUY** (`R3-M1`; D3.5, D4.2). Its `matched` answer
-  makes it FILLED, and only a read fixes its final size. So its T is the
+  makes it FILLED, and only a read fixes its final size. With the answer
+  lost, a read that shows it terminal with a positive `size_matched`,
+  `MATCHED` or `CANCELED`, makes it FILLED (`R4-L3`). So its T is the
   FILLED row's C. C is PENDING until a read has fixed the final size and the
   recorded fills sum to it. C is then the latest instant among those fills.
   - **What the read supplies.** The read fixes which fills make up the
@@ -881,9 +884,13 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
   - A FAK may fill fully or partly; "Any unfilled remainder is canceled" (A
     F-80). The order is terminal at the answer: FILLED if the answer's
     amounts complete it, otherwise CANCELED with its matched part.
-  - A FOK `matched` is FILLED.
+  - A FOK `matched` is FILLED. A later read decides whether it filled whole
+    (the FOK fill conflict, below).
   - **A collateral-targeted BUY** (`R3-M1`; FAK or FOK) is **FILLED at its
-    `matched` answer**, with its final size unknown (`finalSize` null).
+    `matched` answer**, with its final size unknown (`finalSize` null). When
+    the answer is lost, it is FILLED at the first read that shows it
+    terminal with a positive `size_matched`, `MATCHED` or `CANCELED`
+    (`R4-L3`; the table below).
     - Why FILLED. The venue ends the order at its answer: a FAK cancels any
       unspent remainder, and a FOK spends its amount whole (A F-80). What the
       answer's amounts hold is U-51, so the OMS cannot tell a full spend from
@@ -898,26 +905,92 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
       such an order (Alternatives).
   - The final size is fixed only by an authoritative read. That is the salt
     gate's rule, unchanged.
-  - **A read's `MATCHED` is terminal for an immediate order** (`R3-M1`). Today
-    `presentState` maps a `MATCHED` read whose `size_matched` differs from
-    its `original_size` to PARTIALLY_FILLED, a live state
-    (`order-manager.ts:2999-3011`). For a FAK or FOK that is wrong: the order
-    never rests (A F-80), so the read describes a terminal order. For a FAK
-    or FOK, `MATCHED` with a positive `size_matched` therefore maps to a
-    terminal state:
-    - FILLED for a collateral-targeted BUY, whatever `size_matched` is
-      against `original_size`;
-    - otherwise FILLED when `size_matched` equals `original_size`, and
-      CANCELED with its matched part when it is smaller, since the remainder
-      was canceled (A F-80).
+  - **A read's `MATCHED` is terminal for an immediate order** (`R3-M1`), and
+    so is its `CANCELED` (`CX034-R4-01`, `R4-L3`). Today `presentState` maps a `MATCHED` read whose
+    `size_matched` differs from its `original_size` to PARTIALLY_FILLED, a
+    live state (`order-manager.ts:2999-3011`). For a FAK or FOK that is
+    wrong: the order never rests (A F-80), so a `MATCHED` or `CANCELED` read
+    describes a terminal order. `presentState` therefore takes the order's
+    type and target kind. With m the read's `size_matched` and o its
+    `original_size`:
+
+    | Read | Share-targeted FAK | Share-targeted FOK | Collateral-targeted BUY (FAK or FOK) |
+    | --- | --- | --- | --- |
+    | `MATCHED`, m = o | FILLED | FILLED | FILLED |
+    | `MATCHED`, 0 < m < o | CANCELED with its matched part: "Any unfilled remainder is canceled" (A F-80) | **the FOK fill conflict** (below) | FILLED |
+    | `CANCELED`, 0 < m < o | CANCELED with its matched part, as today | **the FOK fill conflict** | FILLED (`R4-L3`) |
+    | `CANCELED`, m = o | CANCELED, as today | CANCELED, as today | FILLED (`R4-L3`) |
+    | `MATCHED` or `CANCELED`, m > o | the halting conflict, as today (`:2120`) | the same | FILLED: `:2120` is lifted for it (D4.2) |
+    | `CANCELED`, m = 0 | CANCELED, as today | CANCELED, as today | CANCELED: nothing was spent |
+    | `MATCHED`, m = 0 | unrecognised, as today | the same | the same |
+    | `LIVE` or `UNMATCHED` | the halting conflict: an immediate order never rests (the `live` bullet below) | the same | the same |
+    | `DELAYED` | DELAYED when m = 0, else unrecognised, as today | the same | the same |
 
     Otherwise every partial FAK, and every collateral BUY whose shares differ
     from its signed share side, would meet "an order believed terminal is
-    open at the venue" (`order-manager.ts:2155-2160`), a halt. A `LIVE` or
-    `UNMATCHED` read of a FAK or FOK still halts, as the `live` answer bullet
-    below says.
+    open at the venue" (`order-manager.ts:2155-2160`), a halt. When the
+    order is already terminal, a terminal read fixes its final size and
+    leaves its state, as today (`:2149-2154`). The FOK fill conflict is the
+    exception: it is raised whatever the order's state.
+  - **The FOK fill conflict** (`CX034-R4-01`). A FOK "Fills the entire order
+    immediately or does not fill any of it" (A F-80). A read that shows a
+    share-targeted FOK partly matched contradicts that, so it is never read
+    as a FAK's partial cancellation:
+    - **The genuine fills are kept.** Every fill is recorded, booked and
+      attributed as for any order: no rule can undo a fill. The read's
+      `size_matched` is recorded (`venueSizeMatched`), and a fill beyond it
+      is still a contradiction, as for every order (`:2300`'s rule, against
+      the read's value).
+    - **It fails closed.** The OMS raises the halting `EVIDENCE_CONFLICT`,
+      with the reason `FOK_PARTIAL_FILL`. The order goes to RECONCILING,
+      through the existing reopen when it was terminal (`:2155-2160`), with
+      `finalSize` null.
+    - **It is sticky and durable,** with a VENUE-ID CONFLICT's rules
+      (`order-manager.ts:78-90`): recorded in the order's event log,
+      re-raised on recovery, and never cleared by the OMS, not by a further
+      read, a cancel or abandonment. While it is open, the group's salt gate
+      stays closed and the order's reservation stays held. Resolving it is an
+      operator's act. A STATE conflict is not used, because an authoritative
+      read clears one (`:2149-2154`, `:2169-2172`), and a further read would
+      repeat the very contradiction that raised it.
+    - **A collateral-targeted FOK BUY** cannot be judged by shares: they
+      differ from its signed share side whenever the book asks below the
+      limit (D4.2). Its analogue is the spend. Once a read has fixed its
+      final size and its fills sum to it, the OMS compares the spend `Σ eᵢ`
+      with the target. If the spend is below `target − n × 10⁻⁶`, where n is
+      its distinct maker legs, the OMS raises the same conflict, and does not
+      release. The threshold rests on labelled assumption **A13**: a FOK BUY
+      that fills spends its target whole, up to F-63's per-leg floor. A13 is
+      a reading of A F-80 with F-63, and is part of U-51. If it is wrong, the
+      cost is a halt, which is a liveness cost, and the execution probe
+      observes it (Open item 3). Example: D4.2's crossing fill spends
+      16.999999 over two legs, at or above 17.00 − 0.000002, and raises
+      nothing.
+    - **A FAK stays normal.** Its partial read is CANCELED with its matched
+      part, or FILLED for a collateral-targeted BUY, and its under-spend is
+      expected, since the venue cancels its remainder (A F-80).
 - **`delayed`:** DELAYED, as today. A delayed market can delay an immediate
   order (A F-80).
+  - **How a delayed immediate order ends** (`R4-L3`). Its fills move it to
+    PARTIALLY_FILLED (`order-manager.ts:1275-1276`). For a
+    collateral-targeted BUY, no fill ends it (D4.2). It ends at the first
+    authoritative read that shows it terminal, mapped by the table above.
+    That read is requested by one of three events:
+    - **a stream `MATCHED` observation** of a FAK or FOK in a live state.
+      It issues an `ORDER_STATE` request at once. This is new: today such an
+      observation is only recorded (`:2249-2251`);
+    - **a stream `CANCELED` observation,** which already makes the order
+      CANCELED and requests a read (`:2252-2256`). Its T is that frame's
+      `timestamp` (D1.3), and the read fixes its final size. A
+      collateral-targeted BUY ended this way stays CANCELED: its T is
+      already known;
+    - otherwise **the next periodic run,** which reads by id every tracked
+      order that is not terminal (`coordinator.ts:1034-1037`).
+
+    A read that still shows the order `DELAYED` with a positive
+    `size_matched` is unrecognised, as today, and the next run reads again.
+    Until the order ends, its gate stays closed and its reservation stays
+    held. That is a liveness cost only.
 - **`live` or `unmatched`:** these contradict "A market order never rests on
   the book" (A F-80). The order goes to RECONCILING with a fresh read, and is
   never assumed filled or canceled. A read that finds it open raises the
@@ -1007,6 +1080,38 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
      the detector observes nothing for it.
    - **One mutation row** makes the fence's `createMarketOrder` call the venue
      without asking the gate, and fails the refusal test.
+10. **Paired partial reads, FAK against FOK** (`CX034-R4-01`). The same
+    share-targeted SELL of 50, with a `matched` answer, 20 shares of fills
+    received, and then the same read, run once as a FAK and once as a FOK:
+    - **read `MATCHED`, `size_matched` 20, `original_size` 50:**
+      - the FAK ends CANCELED with its matched part, final size 20, no
+        alert; the gate opens and the reservation is released;
+      - the FOK keeps its 20 shares of fills, booked and attributed, and
+        raises the halting `EVIDENCE_CONFLICT` `FOK_PARTIAL_FILL`. It is
+        RECONCILING with `finalSize` null, the gate closed and the
+        reservation held. A second identical read clears nothing, and a
+        restart re-raises the alert from the event log;
+    - **the same pair with a `CANCELED` read** of 20 out of 50: the same two
+      outcomes;
+    - **a collateral-targeted pair:** a target of 17.00, a read that fixes
+      the final size, and fills summing to it, spending 10.00 over one leg:
+      the FAK BUY is FILLED and releases; the FOK BUY raises the conflict
+      and releases nothing. D4.2's crossing fill (16.999999 over two legs)
+      as a FOK raises nothing;
+    - **one mutation row** maps the FOK's partial read as the FAK's, and
+      fails the test.
+11. **The terminal read of a collateral-targeted BUY** (`R4-L3`):
+    - **the lost-answer arm, read `CANCELED`:** the answer is lost; the
+      fills of 10.00 are received; a read shows `CANCELED` with a positive
+      `size_matched`. The order is FILLED, its T is C (D1.3), the gate
+      opens once the fills sum to the final size, and a late `PLACEMENT`
+      stamped one millisecond before the last fill is STALE, with no halt.
+      One mutation row keeps CANCELED, and the late frame halts at the
+      horizon;
+    - **the `delayed` arm:** a `delayed` answer, then fills, then a stream
+      `MATCHED` observation. The observation requests a read at once, and
+      that read makes the order FILLED. With no observation at all, the next
+      periodic run reads it by id and ends it in the same way.
 
 **D3 is pre-live for the OMS and the adapter.** For PAPER it is plumbing only,
 with no change in output.
@@ -1164,7 +1269,7 @@ pUSD.
   | "a fill beyond the order" (`#fillInconsistency`, `:2299`) | lifted (above) |
   | "a fill beyond the confirmed final size" (`:2300`) | **kept, against a final size a read fixed.** For such an order that is the only kind, since no fill fixes one. The read that fixes it is made after the venue has ended the order: after its answer, or, in the lost-answer arm, once quiescent (below). Its `size_matched` counts every match (A11). A fill beyond it contradicts the venue, as for every order. Before a read, the spend guard below is the bound |
   | `#applyPresent`'s "matched ≤ original" (`:2120`) | lifted (above). Its "matched ≥ the recorded fills" is kept |
-  | the read's state (`presentState`, `:2999-3011`) | `MATCHED` is terminal, FILLED (D3.5) |
+  | the read's state (`presentState`, `:2999-3011`) | `MATCHED`, or `CANCELED` with a positive `size_matched`, is terminal: FILLED (D3.5; `R4-L3`). For a FOK, an under-spend raises the FOK fill conflict (D3.5; `CX034-R4-01`) |
   | the final size | only from a read: `size_matched`, under A11 |
   | `remainingShares` on each order event (`:2468`, `:2576`) | `max(0, originalShares − filledShares)`, since the fills may exceed the signed share side and the column is non-negative (`0005_execution.up.sql:411`). The event's payload also carries the collateral remaining, the target less `Σ eᵢ` |
   | the reservation at the door (`#reservationProblem`, `:1481`: at least limit × shares) | at least the target. The fee bound is the planner's, on top (below) |
@@ -1256,10 +1361,30 @@ pUSD.
          recorded for that fill (by trade id and venue order id), and the
          leg's collateral delta is minus that spend, plus the fee as today.
          If the OMS recorded no fill for the leg (the fill was withheld for
-         want of legs, above), the leg's collateral delta is **not exact**.
-         The asset is then `IN_TRANSIT_AMBIGUOUS`, an account-scoped hold
-         (`coordinator.ts:2179-2184`), until the trade settles. Nothing is
-         estimated.
+         want of legs, below), the leg's collateral delta is **not exact**.
+         Nothing is estimated. The fill is then neither recorded nor booked,
+         so what WP-290 judges depends on the balance (`R4-L1`;
+         `compareHolding` returns `MATCH` whenever `d` = 0, before it looks
+         at `exact`, `holdings.ts:111-119`):
+         - **while the balance has not moved,** A = P, so `d` = 0: `MATCH`.
+           Nothing is booked and nothing has moved, so there is nothing to
+           explain yet. The OMS still holds the order's reservation and its
+           salt gate (the no-legs rule below);
+         - **once the balance has moved and the trade is still in transit**
+           (`MATCHED`, `MINED` or `RETRYING`; `coordinator.ts:2122-2126`),
+           `d` ≠ 0 and the pending delta is not exact:
+           `IN_TRANSIT_AMBIGUOUS`, an account-scoped hold
+           (`coordinator.ts:2179-2184`);
+         - **once the trade is `CONFIRMED`,** it is no longer in transit, so
+           nothing is pending for the asset: `UNEXPLAINED`. The coordinator
+           then raises `HOLDING_DELTA_UNCONFIRMED`, and, once the delta has
+           persisted for `holdingConfirmationMs` with no unresolved attempt
+           that could explain it, `BALANCE_UNATTRIBUTED` (`:2313`).
+
+         Every phase fails closed. Which of the first two a run sees depends
+         on when the balance read moves against the trade's status, which
+         is undocumented; the test sets each phase up explicitly (D4.7 item
+         4).
 
        On the three-leg fill below, at zero fee and a balance of 1000: P is
        982.500001, and the pending delta is −17.499999. Before settlement A
@@ -1451,13 +1576,13 @@ pUSD.
 
   | Site | Today | For such a fill |
   | --- | --- | --- |
-  | `FillFact` (`packages/ledger/src/allocation.ts:65`) | shares and price | gains an optional `collateralAmount`, present only for such a fill: a contract change for its owner, WP-200's package |
-  | `buildFillPosting` (`packages/ledger/src/fill-posting.ts:254`, `:269`, `:275`) | `TRADE_PRINCIPAL` and each owner's cost at price × shares | `TRADE_PRINCIPAL` books `collateralAmount`, and so does the actual-account PnL record's cost. Each owner's cost is its claim's share of it (below) |
-  | `PnlTradeRecord` (`packages/pnl/src/records.ts:162`), and `applyTrade` (`packages/pnl/src/state.ts:574-590`) | cost = price × shares | the record carries an optional `notional`, the owner's booked cost, and `applyTrade` uses it when present. So the PnL cost basis equals the ledger's principal. A reversal unwinds the logged effect, unchanged |
+  | `FillFact` (`packages/ledger/src/allocation.ts:65`) | shares and price | gains a **required** `principalBasis`, and a `collateralAmount` that is required under `COLLATERAL_SPEND` and refused otherwise (the basis, below; `CX034-R4-02`): a contract change for its owner, WP-200's package |
+  | `buildFillPosting` (`packages/ledger/src/fill-posting.ts:254`, `:269`, `:275`) | `TRADE_PRINCIPAL` and each owner's cost at price × shares | chosen by `principalBasis`, never by whether an amount is present. Under `COLLATERAL_SPEND`, `TRADE_PRINCIPAL` books `collateralAmount`, and so does the actual-account PnL record's cost; each owner's cost is its claim's share of it (below). Under `SHARES_AT_PRICE`, price × shares, as today |
+  | `PnlTradeRecord` (`packages/pnl/src/records.ts:162`), and `applyTrade` (`packages/pnl/src/state.ts:574-590`) | cost = price × shares | the record carries the same **required** `principalBasis`, copied from the fact, and a `notional`, the owner's booked cost, required under `COLLATERAL_SPEND` and refused otherwise. `applyTrade` uses `notional` under `COLLATERAL_SPEND` and price × shares under `SHARES_AT_PRICE`. So the PnL cost basis equals the ledger's principal. A reversal unwinds the logged effect, unchanged |
   | the OMS's `FillRecord.notional` and `#debitOf` (`order-manager.ts:1257`, `:2309`) | price × shares | the spend (D4.2) |
   | `pendingDeltas` (`packages/oms/src/reconciliation/holdings.ts:83`) | price × shares | the spend the OMS recorded (D4.2 item 6) |
   | trader cash, `cashAfter` (`packages/trading-core/src/loop.ts:5883-5887`) | price × shares, plus the fee | `collateralAmount`, plus the fee |
-  | `toFillFact` (`packages/simulation/src/fill-model.ts:517-545`) | no collateral | passes `collateralAmount` |
+  | `toFillFact` (`packages/simulation/src/fill-model.ts:517-545`) | no collateral | takes `principalBasis` from its caller, as a required argument, and passes `collateralAmount` only under `COLLATERAL_SPEND`. Every simulated fill carries a `collateralAmount` (`fill-model.ts:106`), share-targeted ones included, so its presence cannot say which basis applies |
 
 - **Kept at price × shares, because it is conservative there:**
   - the core's `CostBasisBook` (`packages/trading-core/src/allocation.ts:554`,
@@ -1471,19 +1596,67 @@ pUSD.
   rule holds for this principal:
   - with one owner, its cost is `collateralAmount`;
   - with more than one, each `AllocationClaim` carries its `collateralAmount`
-    explicitly. They must sum exactly to the fill's, else the new refusal
+    explicitly. A claim's `collateralAmount` is refused under
+    `SHARES_AT_PRICE`. They must sum exactly to the fill's, else the new refusal
     `LEDGER_PRINCIPAL_SPLIT_MISMATCH`, beside the fee's (`packages/ledger/src/refusals.ts:122-127`);
   - the caller computes them. Each owner but the last gets
     `floor₆(spend × ownerShares ÷ fillShares)`. The last band takes the rest,
     as it takes the share excess (D4.2), so no cost is negative. Example:
     50.000004 shares, a spend of 17.499999, and bands of 30 and 20.000004
     give 10.499998 and 7.000001.
+- **The principal's basis is explicit** (`CX034-R4-02`). An optional amount
+  alone cannot be enforced: a collateral-targeted fact that lost its
+  `collateralAmount` would look exactly like a valid share-targeted fact, and
+  would be booked at price × shares (17.5000014 instead of 17.499999 for the
+  three legs of D4.2). So the basis is an independent, required field of
+  both contracts, and nothing infers it from an amount:
+  - **`principalBasis`**, `SHARES_AT_PRICE` or `COLLATERAL_SPEND`, is
+    required on every `FillFact` and every `PnlTradeRecord`. A fact or
+    record without it is refused at the warmed door (`LEDGER_INPUT_INVALID`,
+    `allocation.ts:192-198`; `PNL_INPUT_INVALID`).
+  - **Under `COLLATERAL_SPEND`** the fact's `collateralAmount` and the
+    record's `notional` are required, and the side is BUY. The fact's amount
+    is positive and at most price × shares. A fill whose every leg spends 0
+    (`floor₆` below one base unit) is refused, as the ledger books no zero
+    entry (`LEDGER_ENTRY_AMOUNT_ZERO`); that fails closed. A record's
+    `notional` is positive too. Every owner but the last holds at least
+    0.01 share, since attributions are on D2's grid, so its `floor₆` part is
+    about 0.01 × price. At the smallest tick, 0.0001 (A F-99's table), that
+    is about one base unit, and can floor to 0. A zero part is refused, and
+    that fails closed. It is not
+    bounded by its own price × shares, because the last
+    owner takes the split's remainder: owners of 1.000001 and 0.999999
+    shares of a 0.70 spend at 0.35 get 0.350000 and 0.350000, and the second
+    exceeds 0.34999965. Anything else is refused at the door
+    (`PNL_INPUT_INVALID` from `PnlRecordDoor`, `packages/pnl/src/state.ts:480`).
+  - **Under `SHARES_AT_PRICE`** both are refused when present, and the
+    principal is price × shares, as today. This is the legacy rule,
+    qualified: it applies to a fact that **states** the share basis, never to
+    one that merely lacks an amount.
+  - **Who sets it.** The basis comes from the order's target kind, one
+    value per order: `COLLATERAL_SPEND` exactly when the plan and the ticket
+    carry a `collateralTarget` (D4.1), and `SHARES_AT_PRICE` otherwise.
+    In PAPER, `trading-core` passes it to `toFillFact` from the planned
+    order. Live, the fact's producer reads it from the order's persisted
+    target (Open item 4), never from a fill. A producer that states the
+    wrong basis is the one error the ledger cannot see. It is confined to
+    that one derivation, which is tested (D4.7 item 9), and it fails closed
+    downstream: in PAPER through D4.7 item 9's agreement case, and live as a
+    holding break after settlement (D4.2 item 6).
+  - **No version decoder is needed.** At `3294201` neither contract is read
+    back from storage: the only parsers are the warmed doors (`FillFactDoor`,
+    `allocation.ts:114`; `PnlRecordDoor`, `packages/pnl/src/records.ts:330`),
+    fed in-process by their producers. If R3 finds a stored reader, it
+    decodes a record written before D4 as `SHARES_AT_PRICE`. That is sound,
+    because no such record can be collateral-targeted. The round reports
+    the reader.
 - **Missing economics fail closed.** A live fill without maker legs is never
   recorded (D4.2), so nothing is booked for it. In PAPER every simulated fill
   carries a canonical `collateralAmount`
   (`packages/simulation/src/queue.ts:746-751` refuses one that is not). A
-  posting for such a fill without one is refused, never booked at price ×
-  shares.
+  `COLLATERAL_SPEND` fact without its `collateralAmount`, or a
+  `COLLATERAL_SPEND` record without its `notional`, is refused, never booked
+  at price × shares.
 - **Out of scope:** a share-targeted taker BUY against an off-grid maker also
   pays F-63's per-leg floor. Its m × p is not then exact in base units, so its
   booking can differ from its spend by under 10⁻⁶ per leg. That exists today,
@@ -1572,8 +1745,14 @@ STOPPED S1).
      - `pendingDeltas` prices the leg at shares × price:
        `IN_TRANSIT_AMBIGUOUS` before settlement.
 
-     And a leg whose fill the OMS did not record is not exact, so the
-     collateral is `IN_TRANSIT_AMBIGUOUS` and the account holds;
+     **A leg whose fill the OMS did not record** (`R4-L1`; D4.2 item 6),
+     with the mock's reads set up for each phase: the trade `MATCHED` and
+     the balance 1000 judges the collateral `MATCH` (nothing booked, nothing
+     moved), and the order's reservation and gate stay held; the trade
+     `MINED` and the balance 982.500001 judges it `IN_TRANSIT_AMBIGUOUS`,
+     and the account holds; the trade `CONFIRMED` and the same balance
+     judges it `UNEXPLAINED`, with `HOLDING_DELTA_UNCONFIRMED`, then
+     `BALANCE_UNATTRIBUTED` after `holdingConfirmationMs`;
    - **fills that cross `plannedShares` part-way through** (`R3-M1`), D4.2's
      example: 50 at 0.33, then 1.470588 at 0.34, against a target of 17.00
      whose signed share side is 50.0000. Both fills are recorded. Neither
@@ -1636,12 +1815,36 @@ STOPPED S1).
    is byte-identical.
 9. **The principal** (`R3-M2`; D4.5), in `packages/ledger` and
    `packages/pnl`:
-   - a collateral-targeted `FillFact` books `TRADE_PRINCIPAL` at its
-     `collateralAmount`, and its PnL records carry it as `notional`;
+   - a `COLLATERAL_SPEND` `FillFact` books `TRADE_PRINCIPAL` at its
+     `collateralAmount`, and its PnL records carry `COLLATERAL_SPEND` and the
+     owner's cost as `notional`;
    - the split: 10.499998 and 7.000001 for D4.5's example; a split that does
      not sum exactly is refused `LEDGER_PRINCIPAL_SPLIT_MISMATCH`;
-   - a fact without `collateralAmount` books price × shares exactly as today,
-     and every existing ledger and PnL test passes unchanged;
+   - **the negative cases** (`CX034-R4-02`), each refused and booking
+     nothing:
+     - D4.2's three-leg fact under `COLLATERAL_SPEND` with its
+       `collateralAmount` removed is refused `LEDGER_INPUT_INVALID`, and is
+       never booked at 17.5000014;
+     - a fact with no `principalBasis` is refused, with or without an amount;
+     - a `SHARES_AT_PRICE` fact, or an `AllocationClaim` of one, that
+       carries a `collateralAmount` is refused;
+     - a `COLLATERAL_SPEND` SELL, or an amount above price × shares, is
+       refused, and so is an amount of 0;
+     - a `COLLATERAL_SPEND` `PnlTradeRecord` without its `notional`, a
+       `SHARES_AT_PRICE` record with one, and a record with no
+       `principalBasis` are each refused `PNL_INPUT_INVALID`, and the PnL
+       state is unchanged;
+     - one mutation row lets `buildFillPosting` choose by the amount's
+       presence, and the first negative case books 17.5000014, failing the
+       test;
+   - **the legacy control:** a `SHARES_AT_PRICE` fact books price × shares
+     exactly as today. Every existing ledger and PnL test passes with only
+     `principalBasis: "SHARES_AT_PRICE"` added to its fixtures, and every
+     expected value unchanged;
+   - **the producer:** `toFillFact` called for a share-targeted fill whose
+     simulated `collateralAmount` is a floor below price × shares yields
+     `SHARES_AT_PRICE` with no amount; called for a collateral-targeted
+     order's fill, it yields `COLLATERAL_SPEND` with that amount;
    - in PAPER, trader cash, the ledger's actual collateral line and the PnL
      cost basis agree after D4.6's paper-e2e entry (19.428571 at 0.35 has a
      `collateralAmount` of 6.799999, not 6.79999985).
@@ -1660,7 +1863,7 @@ reconciliation and OMS fault suites; R2 and R3 share `packages/oms/**`,
 | --- | --- | --- | --- | --- | --- |
 | R1 `OMS-QTY` | D2 | `packages/execution-planner/**`, but not `src/probes/**` (WP-350's); `packages/oms/**`; `packages/polymarket-secure/src/venue-client.ts` and its tests; `packages/strategies/static-bracket/src/params.ts` and its tests; `test/unit/{execution-planner,oms,strategies}/**`; `test/contract/polymarket-secure/**`; `test/fault-injection/live/**`; `test/fault-injection/reconciliation/**`; and, test files only, `test/fault-injection/oms/**` and `test/fault-injection/live-safety/**`, which run on the OMS's shared test supports (`test/unit/oms/support/**`) whose signed amounts D2.4 checks | first | pre-live; a latent PAPER change, with no golden change | D2.6; all gates; the goldens byte-identical |
 | R2 `OMS-VENUE-TIME` | D1 | `packages/oms/**`, including `src/reconciliation/**`; `packages/polymarket-secure/src/user-stream/**`; `test/unit/oms/**`; `test/contract/user-stream/**`; `test/fault-injection/reconciliation/**`; `test/fault-injection/live/**`; `test/fault-injection/oms/**` (`crash-points.test.ts:148`'s observation gains a venue instant, D1.10 item 4; `NEW-M2`); `apps/ops-cli/src/emergency/**`, only where it builds the `ReconciliationPolicy` (the new `orderingHorizonMs`) and its tests; `docs/runbooks/reconciliation.md` (the policy table's new row); `docs/experiments/phase-3-verification.md` (§5's counts to 0, with a dated note) | after R1 is merged | pre-live only | D1.10; all gates |
-| R3 `TIF-COLLATERAL` | D3, then D4 | `packages/trading-core/**` (the bounded ADR-022 D10 grant of D3.6 and D4.5), its tests included; `packages/execution-planner/**`; `packages/oms/**`; `packages/polymarket-secure/**`; `packages/simulation/**`; `packages/strategies/static-bracket/**`; `packages/ledger/src/allocation.ts` (`FillFact` and `AllocationClaim`), `packages/ledger/src/fill-posting.ts` (the principal, D4.5; `R3-M2`) and `packages/ledger/src/refusals.ts` (the new refusal), with their tests (`packages/ledger/src/*.test.ts`), and `packages/pnl/src/records.ts` and `packages/pnl/src/state.ts` (`notional`), with their tests (`packages/pnl/src/*.test.ts`), all with WP-200's owner; `packages/risk/**`, only if the incident needs a new cause; the matching `test/unit/**`, `test/contract/polymarket-secure/**`, `test/fault-injection/live/**`, `test/fault-injection/reconciliation/**`, `test/e2e/**` and `test/replay-golden/**`. **The fence** (`NEW-H1`; WP-320's paths, with its owner's consent): `apps/trader/src/live-safety/fenced-venue.ts`; `apps/trader/src/live-safety/live-safety.ts` and `index.ts`, only to carry the new member through `fenceVenue`'s types and the module's exports (D3.1 item 4); and the test files `test/fault-injection/live-safety/**` (`port-conformance.test.ts:73-80`), `test/fault-injection/oms/**` (`support/crash-harness.ts:125-130`) and `test/integration/postgres/fencing-race.test.ts` (its port literal at `:373-374`, type-checked by `packages/storage-postgres`'s `typecheck`, inside the root `typecheck`). **The removed side table** (`CX034-R3-02`): `apps/trader/src/index.ts`, only to remove the `OrderTimeInForceBook` re-export (`:303`), and `apps/trader/README.md`, only its section "The `immediate_order_type` question, resolved" (`:177-191`), which names the table and says that `PlannedOrder` carries no time-in-force. No compatibility export is kept: the class goes away (D3.1 item 2), and no test names it. From the rest of `apps/**`, **test files only:** `apps/backtest-cli/src/**/*.test.ts` (`backtest.test.ts`, `run-command.test.ts`) and `apps/trader/src/**/*.test.ts` (`loop-folds.test.ts` included) (`MEDIUM-4`); and `test/integration/paper-trader/**`, test files only, where they fold PAPER fills' PnL records by shares × price (`trader-health-endpoint-postgres.test.ts:217-236`), which D4.5 changes for a collateral-targeted BUY. **Not** `db/migrations/**`, `packages/domain/**`, `packages/decimal/**`, or any other non-test `apps/**` file: if one must change, the round stops and reports it | after R2 is merged. D4 only after the user's ruling on Open item 10; D3 does not wait for it. D3 with D4: one round, or two rounds merged back to back before any PAPER run is cited as evidence | D3: pre-live, plumbing only for PAPER. **D4: changes PAPER fills and exits** | D3.7, D4.7 (for the ruled variant); each golden with a reason; all gates |
+| R3 `TIF-COLLATERAL` | D3, then D4 | `packages/trading-core/**` (the bounded ADR-022 D10 grant of D3.6 and D4.5), its tests included; `packages/execution-planner/**`; `packages/oms/**`; `packages/polymarket-secure/**`; `packages/simulation/**`; `packages/strategies/static-bracket/**`; `packages/ledger/src/allocation.ts` (`FillFact` and `AllocationClaim`), `packages/ledger/src/fill-posting.ts` (the principal, D4.5; `R3-M2`) and `packages/ledger/src/refusals.ts` (the new refusal), with their tests (`packages/ledger/src/*.test.ts`), and `packages/pnl/src/records.ts` and `packages/pnl/src/state.ts` (`principalBasis` and `notional`), with their tests (`packages/pnl/src/*.test.ts`) and the sample builders `packages/pnl/src/testing/**`, which build `PnlTradeRecord`s (`CX034-R4-02`), all with WP-200's owner; `packages/risk/**`, only if the incident needs a new cause; the matching `test/unit/**`, which includes, test files only, `test/unit/{ledger,pnl,simulation,trader}/**`, whose fixtures build a `FillFact` or a `PnlTradeRecord` (`CX034-R4-02`); `test/contract/polymarket-secure/**`, `test/fault-injection/live/**`, `test/fault-injection/reconciliation/**`, `test/e2e/**` and `test/replay-golden/**`. **The fence** (`NEW-H1`; WP-320's paths, with its owner's consent): `apps/trader/src/live-safety/fenced-venue.ts`; `apps/trader/src/live-safety/live-safety.ts` and `index.ts`, only to carry the new member through `fenceVenue`'s types and the module's exports (D3.1 item 4); and the test files `test/fault-injection/live-safety/**` (`port-conformance.test.ts:73-80`), `test/fault-injection/oms/**` (`support/crash-harness.ts:125-130`) and `test/integration/postgres/fencing-race.test.ts` (its port literal at `:373-374`, type-checked by `packages/storage-postgres`'s `typecheck`, inside the root `typecheck`). **The removed side table** (`CX034-R3-02`): `apps/trader/src/index.ts`, only to remove the `OrderTimeInForceBook` re-export (`:303`), and `apps/trader/README.md`, only its section "The `immediate_order_type` question, resolved" (`:177-191`), which names the table and says that `PlannedOrder` carries no time-in-force. No compatibility export is kept: the class goes away (D3.1 item 2), and no test names it. From the rest of `apps/**`, **test files only:** `apps/backtest-cli/src/**/*.test.ts` (`backtest.test.ts`, `run-command.test.ts`) and `apps/trader/src/**/*.test.ts` (`loop-folds.test.ts` included) (`MEDIUM-4`); and `test/integration/paper-trader/**`, test files only, where they fold PAPER fills' PnL records by shares × price (`trader-health-endpoint-postgres.test.ts:217-236`), which D4.5 changes for a collateral-targeted BUY. **Not** `db/migrations/**`, `packages/domain/**`, `packages/decimal/**`, or any other non-test `apps/**` file: if one must change, the round stops and reports it | after R2 is merged. D4 only after the user's ruling on Open item 10; D3 does not wait for it. D3 with D4: one round, or two rounds merged back to back before any PAPER run is cited as evidence | D3: pre-live, plumbing only for PAPER. **D4: changes PAPER fills and exits** | D3.7, D4.7 (for the ruled variant); each golden with a reason; all gates |
 
 **How the test grants were found** (`NEW-H1`, `NEW-M2`). At `3294201`, `grep
 -rln` over every `*.ts` file listed each file that names a port the round
@@ -1677,6 +1880,15 @@ does not find a decision path or a removed name:
   `.git`, including Markdown: for R3, `OrderTimeInForceBook`;
 - every site that prices a fill's principal: `grep -rn 'mulDecimal('` over
   the non-test sources of the packages D4 touches (D4.5's table).
+
+Round 4 added a third (`CX034-R4-02`), because a required member breaks
+every literal of its contract: every `*.ts` file that builds a `FillFact`
+(it names `denominationAssetId`, `fillId` and `shares`) or a
+`PnlTradeRecord` (it names `denominationAsset` and `"TRADE"`). The matches
+lie in `packages/{ledger,pnl,simulation,trading-core}/src/`, in
+`packages/pnl/src/testing/samples.ts`, in `test/e2e/support/`, in
+`test/unit/{ledger,simulation,trader}/` and in `test/integration/paper-trader/`,
+all inside R3's paths above.
 
 Each match was read, to see whether it builds such a value or passes such an
 input. Every one that does lies inside its round's paths above. Files that
@@ -1711,7 +1923,9 @@ and reports it.
     ever a halt.
   - §5: refined for FAK and FOK (D3.5). A collateral-targeted BUY is FILLED
     at its `matched` answer, with its final size from a read; a read's
-    `MATCHED` is terminal for an immediate order.
+    `MATCHED` is terminal for an immediate order. A share-targeted FOK read
+    as partly matched raises a sticky conflict, since a FOK fills whole or
+    not at all (A F-80; `CX034-R4-01`).
   - §8: implemented by D3.4, with an explicit escalation.
   - §2 step 9: a retransmission keeps the order type (D3.1, item 5). An
     ABSENT FAK or FOK is never retransmitted (D4.2).
@@ -1724,7 +1938,10 @@ and reports it.
   order, and remembers its scope (D3.1 item 4; `NEW-H1`).
 - **ADR-006:** unchanged in its rules. A collateral-targeted BUY's principal
   is booked at its spend, each transaction still balances per asset, and the
-  owners' split is explicit and machine-checked, like the fee's (D4.5).
+  owners' split is explicit and machine-checked, like the fee's (D4.5). The
+  principal's basis is a required field of WP-200's `FillFact` and
+  `PnlTradeRecord`, so a missing amount is refused, never defaulted
+  (`CX034-R4-02`).
 - **ADR-020:** every new port field is read as own data through the existing
   doors.
 - **ADR-022 D10:** D3's and D4's core hooks are a bounded grant (D3.6).
@@ -1833,6 +2050,12 @@ and reports it.
   - A collateral-targeted BUY is FILLED at its answer even when it spent
     part of its target. Consumers read its fills, never `plannedShares`, for
     what it bought (D3.5).
+  - A FOK read as partly matched, or a collateral-targeted FOK BUY that
+    under-spends beyond A13's bound, halts until an operator resolves it
+    (D3.5). A13 is an assumption: if it is wrong, the cost is a halt.
+  - `FillFact` and `PnlTradeRecord` gain a required member. Every producer
+    and fixture states the basis (D4.5), so R3 touches every literal of both
+    contracts (Implementation plan, the third search).
   - A12 (one clock and one rounding for every user-channel `timestamp`) is an
     assumption. If it is wrong, the cost is liveness (D1.7).
   - C-7 sets the `SUB_MINIMUM` threshold and the minimum check.
@@ -1944,6 +2167,24 @@ and reports it.
   PENDING until a `CANCELLATION` frame, which the venue may never emit for a
   fully spent order (U-50, U-54). Every late frame would then halt at the
   horizon. Rejected for FILLED with T = C, which is sound (D1.3).
+- **Read a FOK's partial read as a FAK's: CANCELED with its matched part**
+  (`CX034-R4-01`). It contradicts A F-80 ("Fills the entire order
+  immediately or does not fill any of it") and would raise nothing.
+  Rejected for the sticky FOK fill conflict, which keeps the fills and fails
+  closed (D3.5).
+- **Make that conflict a STATE conflict.** An authoritative read clears a
+  STATE conflict (`order-manager.ts:2149-2154`), and the next read would
+  repeat the contradiction and clear it. Rejected for a VENUE-ID CONFLICT's
+  sticky rules (D3.5).
+- **An optional `collateralAmount` alone, its absence meaning price ×
+  shares** (`CX034-R4-02`). The posting boundary could not tell a
+  collateral-targeted fact that lost its amount from a share-targeted one,
+  and would book 17.5000014 for 17.499999. Rejected for the required
+  `principalBasis` (D4.5).
+- **Always book the simulator's `collateralAmount`, whatever the target.**
+  It would change every PAPER share-targeted BUY's booking, and live
+  share-targeted fills carry no per-leg spend the OMS checks. It is out of
+  scope (D4.5's last bullet).
 - **Recover `q` from the target, as `target ÷ plannedShares`** (`R3-L1`).
   Sound but looser; rejected for carrying `q` on the ticket (D4.1).
 - **Exit the planned share count.** It leaves the extra shares behind, and is
@@ -1989,7 +2230,8 @@ and reports it.
    on the stream, and what the venue reports for a market order's
    `original_size`, `size_matched` and `price`, and whether its trades carry
    their maker legs. The first execution probe (`WP-350`/`WP-360`) observes
-   them. No FAK or FOK order runs above PAPER before then.
+   them. No FAK or FOK order runs above PAPER before then. It also observes
+   A13: what a filled FOK BUY spends against its target (D3.5).
    - **The D1 × D3 case** (`NEW-L4`). The probe also observes whether a FAK
      or FOK emits a `PLACEMENT` frame, and its value against the remainder's
      `CANCELLATION` and the `MATCHED` events. If equal values occur, they
@@ -2000,7 +2242,8 @@ and reports it.
    (`LOW-7`):
    - `execution.orders.time_in_force`, and the plan's time-in-force;
    - the collateral target, its conversion price `q` and its signed share
-     side, on the plan and the order (D4.1; `R3-L1`);
+     side, on the plan and the order (D4.1; `R3-L1`). A live fill's
+     `principalBasis` is derived from it (D4.5; `CX034-R4-02`);
    - D2.3's `unexecutableRemainder` and its reason, on the plan;
    - the intent-to-plan link's two quantities, requested and executable
      (`execution.intent_order_links` has one, `attributed_shares`);
