@@ -73,6 +73,16 @@
  *    `"version":"v2"` key, a 404, a derivation from a position id), each
  *    citing the report ids it illustrates. Every cited id must be defined in
  *    the report.
+ * 8. **Fail closed** (round 5, V2-9-R5-01): what the scanner cannot parse,
+ *    decode or read fails the gate with a named reason, never a fallback to
+ *    the raw text and never a skip: percent-encoding that is malformed or
+ *    nested deeper than `MAX_PERCENT_LAYERS` in sidecar text or in any text
+ *    a cursor scan reads (`textReadings`); an unparseable URL; a fragment or
+ *    credential in an `https` sidecar URL; a query parameter the gate does
+ *    not know for its route (`SIDECAR_QUERY_PARAMETERS`); a wallet key that
+ *    holds neither an address string nor `null`; a `.jsonl` data text that
+ *    is neither JSON nor a known control message; and a sidecar that is not
+ *    UTF-8.
  *
  * Offline: local files only. No network, no credential, no order.
  */
@@ -240,24 +250,37 @@ export const CLOB_PUBLIC_PATHS = [
  * `new URL(url).href`, is the URL itself: no `:443`, no `.` or `..` segment,
  * no capitalized or percent-encoded host) with no percent-encoding in its
  * path, so `/v2/%74rades` cannot stand for `/v2/trades`.
+ *
+ * Round 5, fail closed: every URL must parse, the market channel's
+ * included; an `https` URL carries no fragment and no credential, which the
+ * scanner does not interpret; and each query parameter is one
+ * `SIDECAR_QUERY_PARAMETERS` lists for the URL's route, so a parameter the
+ * gate does not know, or a query on a route it lists none for, is refused.
  */
 export function captureUrlErrors(url: string): string[] {
   if (!CAPTURE_URL_PREFIXES.some((prefix) => url.startsWith(prefix))) {
     return [`sidecar.url: not an official public Polymarket host: ${url}`];
   }
-  if (!url.startsWith("https://")) {
-    return [];
-  }
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    return ["sidecar.url: not a parseable URL"];
+    return [UNPARSEABLE_URL_ERROR];
+  }
+  if (!url.startsWith("https://")) {
+    // The market channel: its route is bound to the report's
+    // (`sourceRouteErrors`), and its subscription follows in prose.
+    return [];
   }
   const errors: string[] = [];
   if (parsed.href !== url || parsed.pathname.includes("%")) {
     errors.push(
       `sidecar.url: not in canonical form (the URL is its own WHATWG serialization, with no percent-encoding in the path): ${url}`,
+    );
+  }
+  if (parsed.hash !== "" || url.includes("#") || parsed.username !== "" || parsed.password !== "") {
+    errors.push(
+      "sidecar.url: a fragment or a credential, which the scanner does not interpret, so the gate fails closed (round 5)",
     );
   }
   if (
@@ -270,16 +293,78 @@ export function captureUrlErrors(url: string): string[] {
   }
   if (parsed.host === "data-api.polymarket.com") {
     for (const key of parsed.searchParams.keys()) {
-      if (WALLET_QUERY_KEYS.includes(key.toLowerCase())) {
+      const normalized = normalizedKey(key);
+      if (WALLET_QUERY_KEYS.includes(normalized) || normalized.includes("wallet")) {
         errors.push(`sidecar.url: a Data API read keyed by a wallet (${key}=) may not be committed`);
       }
     }
   }
+  errors.push(...queryParameterErrors(parsed));
   return errors;
 }
 
+/** The refusal of a sidecar URL that does not parse (round 5: named, never skipped). */
+export const UNPARSEABLE_URL_ERROR =
+  "sidecar.url: not a parseable URL, so the scanner cannot read it and the gate fails closed";
+
+/**
+ * The query parameters the gate knows, by route (`origin` and path), round 5.
+ * Fail closed: a parameter not listed for its route, or a query on a route
+ * not listed, is refused, because the scanner does not know what it holds.
+ * The package that commits a capture with a new parameter lists it here,
+ * with its source. Sources: the URLs the report's source index (§14)
+ * records, and the committed sidecars of VENUE-4 (`limit` and the
+ * `prices_history` `cursor` of S-A02 and S-A03, which the index cuts at
+ * `…`). The trade and activity feed routes are not listed: a URL on one is
+ * always a feed (`readsAsFeedRoute`), and `feedUrlErrors` refuses every
+ * parameter S-O06 does not document for them (`FEED_QUERY_PARAMETERS`).
+ */
+export const SIDECAR_QUERY_PARAMETERS: readonly {
+  readonly route: RegExp;
+  readonly parameters: readonly string[];
+}[] = [
+  { route: /^https:\/\/clob\.polymarket\.com\/book$/, parameters: ["token_id"] },
+  {
+    route: /^https:\/\/data-api\.polymarket\.com\/v2\/(?:oi|resolutions)$/,
+    parameters: ["condition"],
+  },
+  {
+    route: /^https:\/\/data-api\.polymarket\.com\/v2\/prices-history$/,
+    parameters: ["token_id", "interval", "bucket_seconds", "limit", "cursor"],
+  },
+  {
+    route: /^https:\/\/gamma-api\.polymarket\.com\/events\/keyset$/,
+    parameters: ["series_id", "closed", "limit"],
+  },
+];
+
+/** Round 5: each query parameter of an `https` URL is one its route lists. */
+function queryParameterErrors(parsed: URL): string[] {
+  const keys = [...new Set(parsed.searchParams.keys())];
+  if (keys.length === 0 && parsed.search === "") {
+    return [];
+  }
+  const route = `${parsed.origin}${parsed.pathname}`;
+  if (FEED_ROUTE_RE.test(`${route}?`) && FEED_URL_PATHS.includes(parsed.pathname)) {
+    // `feedUrlErrors` judges each parameter of a feed route.
+    return [];
+  }
+  const known = SIDECAR_QUERY_PARAMETERS.find((entry) => entry.route.test(route));
+  if (known === undefined) {
+    return [
+      `sidecar.url: the gate knows no query parameter of ${route} (SIDECAR_QUERY_PARAMETERS), so it cannot judge the query and fails closed (round 5)`,
+    ];
+  }
+  return keys
+    .filter((key) => !known.parameters.includes(key))
+    .map(
+      (key) =>
+        `sidecar url ${key}: not a query parameter the gate knows for ${route} (SIDECAR_QUERY_PARAMETERS), so it fails closed (round 5)`,
+    );
+}
+
 /** Query parameters that key a Data API read by an account. */
-const WALLET_QUERY_KEYS = ["user", "address", "proxy_wallet", "wallet"];
+const WALLET_QUERY_KEYS = ["user", "address", "proxywallet", "wallet"];
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const FETCHED_UTC_RE = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2}Z)$/;
@@ -625,7 +710,8 @@ export function redactionSubjects(redaction: string): readonly string[] {
 //   `name` for the wallet's display name in `Trade`, `Activity`, `Holder` and
 //   `Position`.
 // - **Personal values, anywhere in a capture or its sidecar's text** (keys
-//   included, after NFKC normalization): no email address, and no `0x` 40-hex
+//   included, after NFKC normalization, and in each percent-decoded layer,
+//   round 5): no email address, and no `0x` 40-hex
 //   address other than a labelled synthetic one or a documented public
 //   contract address (`CaptureContext.publicAddresses`).
 // - **Trade and activity pages** carry only the S-O06 fields
@@ -771,6 +857,24 @@ export function personalValueErrors(
 }
 
 /**
+ * `personalValueErrors` of every reading of a capture string (round 5,
+ * `textReadings`: also each percent-decoded layer), and the named failure
+ * when the string cannot be decoded. A string with no escape is read as
+ * before.
+ */
+function decodedValueErrors(
+  text: string,
+  where: string,
+  publicAddresses: ReadonlySet<string>,
+): string[] {
+  const { readings, failure } = textReadings(text);
+  return [
+    ...(failure === undefined ? [] : [undecodableError(where, failure)]),
+    ...errorsOfReadings(readings, (reading) => personalValueErrors(reading, where, publicAddresses)),
+  ];
+}
+
+/**
  * Rule 5: every personal key and every string (keys included) of a capture.
  * A value under a personal key is judged by its key's rule alone, so each
  * field is refused once.
@@ -782,7 +886,7 @@ function scanPersonalData(
   policy: PersonalDataPolicy,
 ): void {
   if (typeof value === "string") {
-    errors.push(...personalValueErrors(value, path, policy.publicAddresses));
+    errors.push(...decodedValueErrors(value, path, policy.publicAddresses));
     return;
   }
   if (Array.isArray(value)) {
@@ -801,12 +905,20 @@ function scanPersonalData(
   for (const [key, entry] of Object.entries(value)) {
     const where = `${path}.${key}`;
     const normalized = normalizedKey(key);
-    errors.push(...personalValueErrors(key, `${path} key`, policy.publicAddresses));
+    errors.push(...decodedValueErrors(key, `${path} key`, policy.publicAddresses));
     const rule =
       PERSONAL_KEY_RULES.find((candidate) => candidate.applies(normalized)) ??
       (personRow || (policy.dataApi && normalized === "name")
         ? PERSON_ROW_RULES.find((candidate) => candidate.applies(normalized))
         : undefined);
+    if (normalized.includes("wallet") && typeof entry !== "string" && entry !== null) {
+      // Round 5, fail closed: the scanner reads a wallet only as a string
+      // (an address) or null, not as a number, a boolean, a list or an
+      // object, whose contents it would not judge as an address.
+      errors.push(
+        `${where}: a wallet key holds ${Array.isArray(entry) ? "an array" : typeof entry === "object" ? "an object" : `a ${typeof entry}`}; the scanner reads only an address string or null, so the gate fails closed (round 5)`,
+      );
+    }
     if (rule !== undefined) {
       if (!rule.allows(entry)) {
         errors.push(`${where}: ${rule.message}`);
@@ -878,15 +990,122 @@ function personalAssignmentErrors(text: string, where: string): string[] {
   return errors;
 }
 
-/** Decodes every run of percent-escapes that decodes; leaves the rest. */
-function decodePercentEscapes(text: string): string {
-  return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+// --- fail closed: what the scanner cannot decode ------------------------------
+//
+// Round 5 (V2-9-R5-01, and the orchestrator's 2026-10-08 ruling): the scanner
+// is defense in depth against an accidental commit, and anything it cannot
+// parse, decode or normalize fails the gate with a named reason. It never
+// falls back to the raw text, and never skips. Each decode path of this
+// module does so: the percent-decoding of sidecar text and of every cursor
+// scan (`textReadings`), the feed classification (`readsAsFeedRoute`), the
+// URL parse (`captureUrlErrors`, `feedUrlErrors`), the query parameters
+// (`SIDECAR_QUERY_PARAMETERS`), a wallet key's type (`scanPersonalData`), a
+// `.jsonl` data text (`parseCapture`) and the sidecar's bytes
+// (`loadCapture`).
+
+/** The deepest nesting of percent-encoding the scanner decodes (round 5). */
+export const MAX_PERCENT_LAYERS = 4;
+
+/** Every reading of a text the scanner judges (round 5). */
+export interface TextReadings {
+  /**
+   * The text as written first, then its NFKC normalization and each
+   * percent-decoded layer, each once. When `failure` is set, a reading could
+   * not be decoded further, and the gate must fail.
+   */
+  readonly readings: readonly string[];
+  /** Why the scanner cannot decode the text; `undefined` when it can. */
+  readonly failure?: string;
+}
+
+/** Decodes every run of `%XX` escapes once; `undefined` when a run is not UTF-8. */
+function decodePercentRuns(text: string): string | undefined {
+  let failed = false;
+  const decoded = text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
     try {
       return decodeURIComponent(run);
     } catch {
+      failed = true;
       return run;
     }
   });
+  return failed ? undefined : decoded;
+}
+
+/**
+ * Every reading the scanner judges of one text (round 5): the text, and,
+ * layer by layer to a fixpoint, the NFKC normalization of each reading (so
+ * a full-width `％` is an escape, and a decoded full-width letter is
+ * folded) and its percent-decoding. `url`: the text is a URL, where a `%`
+ * that begins no `%XX` escape is malformed.
+ *
+ * Strict, so it fails closed: a run of `%XX` escapes that is not UTF-8,
+ * percent-encoding nested deeper than `MAX_PERCENT_LAYERS` layers, or such a
+ * malformed `%` in a URL sets `failure`, and the caller fails the gate with
+ * that reason. The raw text is never judged in place of its decoding.
+ * (Before round 5, one undecodable escape anywhere left a whole URL
+ * undecoded, and the scan read only the raw text.)
+ */
+export function textReadings(text: string, url = false): TextReadings {
+  const readings: string[] = [];
+  let failure: string | undefined;
+  let frontier = [text];
+  for (let depth = 0; frontier.length > 0; depth += 1) {
+    const next: string[] = [];
+    for (const reading of frontier) {
+      for (const form of [reading, reading.normalize("NFKC")]) {
+        if (readings.includes(form)) {
+          continue;
+        }
+        readings.push(form);
+        if (url && depth === 0 && /%(?![0-9A-Fa-f]{2})/.test(form)) {
+          failure ??= "a % that begins no %XX escape";
+          continue;
+        }
+        if (!/%[0-9A-Fa-f]{2}/.test(form)) {
+          continue;
+        }
+        if (depth === MAX_PERCENT_LAYERS) {
+          failure ??= `percent-encoding nested deeper than ${MAX_PERCENT_LAYERS} layers`;
+          continue;
+        }
+        const decoded = decodePercentRuns(form);
+        if (decoded === undefined) {
+          failure ??= "a run of %XX escapes that is not UTF-8";
+          continue;
+        }
+        next.push(decoded);
+      }
+    }
+    frontier = next;
+  }
+  return failure === undefined ? { readings } : { readings, failure };
+}
+
+/** The named refusal of a text the scanner cannot decode (round 5). */
+export function undecodableError(where: string, failure: string): string {
+  return `${where}: the scanner cannot decode it (${failure}), so the gate fails closed; write the value plainly, or as a labelled synthetic value`;
+}
+
+/**
+ * The errors of every reading of a text (`textReadings`), each once, in the
+ * order the readings first give them. A single reading gives exactly its
+ * own errors, duplicates included.
+ */
+function errorsOfReadings(
+  readings: readonly string[],
+  errorsOf: (reading: string) => readonly string[],
+): string[] {
+  const [first = "", ...rest] = readings;
+  const errors = [...errorsOf(first)];
+  for (const reading of rest) {
+    for (const error of errorsOf(reading)) {
+      if (!errors.includes(error)) {
+        errors.push(error);
+      }
+    }
+  }
+  return errors;
 }
 
 /**
@@ -967,12 +1186,31 @@ function runHidesJsonObject(run: string): boolean {
  *   assignment (`cursor=eyJ…`, `#cursor=eyJ…`, `cursor%3DeyJ…`) is a run of
  *   its own; a glued prefix or suffix is decoded through.
  *
+ * Round 5: the readings are `textReadings`' (every percent-decoded layer).
+ * Fail closed: a text whose percent-encoding does not decode yields the
+ * token `UNDECODABLE_TOKEN`, so no caller can read it as clean
+ * (`cursorScan` names the failure).
+ *
  * Not caught: a cursor split across tokens or otherwise transformed (the
  * README's "What the gate cannot check").
  */
 export function cursorLikeTokens(text: string): string[] {
-  const nfkc = text.normalize("NFKC");
-  const readings = new Set([text, nfkc, decodePercentEscapes(text), decodePercentEscapes(nfkc)]);
+  const scan = cursorScan(text);
+  return scan.failure === undefined ? [...scan.tokens] : [...scan.tokens, UNDECODABLE_TOKEN];
+}
+
+/** The token `cursorLikeTokens` yields for a text it cannot decode (round 5). */
+export const UNDECODABLE_TOKEN = "<undecodable percent-encoding>";
+
+/**
+ * The cursor scan of one text (round 5): the tokens that hide a JSON object
+ * (see `cursorLikeTokens`), and why the text could not be decoded, if so.
+ */
+export function cursorScan(text: string): {
+  readonly tokens: readonly string[];
+  readonly failure?: string;
+} {
+  const { readings, failure } = textReadings(text);
   const tokens = new Set<string>();
   for (const reading of readings) {
     if (embedsJsonObject(reading)) {
@@ -984,21 +1222,33 @@ export function cursorLikeTokens(text: string): string[] {
       }
     }
   }
-  return [...tokens];
+  return failure === undefined ? { tokens: [...tokens] } : { tokens: [...tokens], failure };
 }
 
-function safeDecodeUri(text: string): string {
-  try {
-    return decodeURIComponent(text);
-  } catch {
-    return text;
-  }
+/**
+ * The cursor refusals of one text at `where` (round 5): `message` when a
+ * token hides a JSON object, and the named failure when the text cannot be
+ * decoded.
+ */
+function cursorScanErrors(text: string, where: string, message: string): string[] {
+  const scan = cursorScan(text);
+  return [
+    ...(scan.failure === undefined ? [] : [undecodableError(`${where} (cursor scan)`, scan.failure)]),
+    ...(scan.tokens.length > 0 ? [message] : []),
+  ];
 }
 
 /**
  * Rule 5 for the sidecar: its free text (`url`, `notes`, each redaction,
  * `extract.rule`); see the policy above. A redaction's subject list, before
  * its first colon, names fields and is not a value.
+ *
+ * Round 5 (V2-9-R5-01): each text is judged in every reading
+ * (`textReadings`: as written, NFKC-normalized, and each percent-decoded
+ * layer), and a text the scanner cannot decode fails the gate with a named
+ * reason. Before round 5, one malformed escape anywhere in the URL (an
+ * unrelated `&unused=%FF`) left the whole URL undecoded, so a
+ * percent-encoded email or wallet in it passed.
  */
 export function sidecarPersonalDataErrors(
   sidecar: CaptureSidecar,
@@ -1009,10 +1259,15 @@ export function sidecarPersonalDataErrors(
   const errors: string[] = [];
   const url = sidecar.url.toLowerCase();
   const capture = captureText.toLowerCase();
-  const decodedUrl = safeDecodeUri(sidecar.url);
+  const urlReadings = textReadings(sidecar.url, true);
+  if (urlReadings.failure !== undefined) {
+    errors.push(undecodableError("sidecar.url", urlReadings.failure));
+  }
   errors.push(
-    ...personalValueErrors(decodedUrl, "sidecar.url", publicAddresses),
-    ...personalAssignmentErrors(decodedUrl, "sidecar.url"),
+    ...errorsOfReadings(urlReadings.readings, (reading) => [
+      ...personalValueErrors(reading, "sidecar.url", publicAddresses),
+      ...personalAssignmentErrors(reading, "sidecar.url"),
+    ]),
   );
   const prose: { readonly where: string; readonly text: string; readonly values: string }[] = [
     { where: "sidecar.notes", text: sidecar.notes, values: sidecar.notes },
@@ -1026,7 +1281,15 @@ export function sidecarPersonalDataErrors(
       : [{ where: "sidecar.extract.rule", text: sidecar.extract.rule, values: sidecar.extract.rule }]),
   ];
   for (const { where, text, values } of prose) {
-    errors.push(...personalValueErrors(text, where, publicAddresses));
+    const readings = textReadings(text);
+    if (readings.failure !== undefined) {
+      errors.push(undecodableError(where, readings.failure));
+    }
+    errors.push(
+      ...errorsOfReadings(readings.readings, (reading) =>
+        personalValueErrors(reading, where, publicAddresses),
+      ),
+    );
     for (const [token] of text.normalize("NFKC").matchAll(LONG_ID_TOKEN_RE)) {
       const lower = token.toLowerCase();
       if (
@@ -1042,8 +1305,13 @@ export function sidecarPersonalDataErrors(
         break;
       }
     }
-    errors.push(...personalAssignmentErrors(values, where));
-    if (feed && cursorLikeTokens(text).length > 0) {
+    errors.push(
+      ...errorsOfReadings(textReadings(values).readings, (reading) =>
+        personalAssignmentErrors(reading, where),
+      ),
+    );
+    // The text's decode failure, if any, is named above, once.
+    if (feed && cursorScan(text).tokens.length > 0) {
       errors.push(
         `${where}: a token decodes to a venue cursor, which carries the seek anchor of the last row (S-O06); name a cursor by its labelled synthetic value`,
       );
@@ -1058,27 +1326,35 @@ const FEED_ROUTE_RE =
 /**
  * Whether a URL reads as a Data API feed route under any spelling (round 4):
  * parsed by WHATWG (which lowercases and percent-decodes the host and drops
- * a default port), its path percent-decoded, NFKC-normalized, lowercased,
- * with repeated slashes collapsed. Fail closed: a URL that does not parse is
- * read as text the same way.
+ * a default port), its host and path in every reading (`textReadings`:
+ * NFKC-normalized and each percent-decoded layer), lowercased, with
+ * repeated slashes collapsed.
+ *
+ * Fail closed (round 5): a URL that does not parse, or whose host or path
+ * cannot be decoded, reads as a feed, so it answers to every feed rule; it
+ * is never read as raw text instead. `captureUrlErrors` and
+ * `sidecarPersonalDataErrors` name the failure.
  */
 export function readsAsFeedRoute(url: string): boolean {
   if (FEED_ROUTE_RE.test(url)) {
     return true;
   }
-  const fold = (text: string): string =>
-    safeDecodeUri(safeDecodeUri(text)).normalize("NFKC").toLowerCase().replace(/\/{2,}/g, "/");
-  let host: string;
-  let path: string;
+  let parsed: URL;
   try {
-    const parsed = new URL(url);
-    host = fold(parsed.hostname);
-    path = fold(parsed.pathname);
+    parsed = new URL(url);
   } catch {
-    const folded = fold(url);
-    return /data-api\.polymarket\.com(?::\d*)?\/v2\/(?:trades|activity)(?![a-z0-9_])/.test(folded);
+    return true;
   }
-  return host === "data-api.polymarket.com" && /^\/v2\/(?:trades|activity)(?![a-z0-9_])/.test(path);
+  const host = textReadings(parsed.hostname, true);
+  const path = textReadings(parsed.pathname, true);
+  if (host.failure !== undefined || path.failure !== undefined) {
+    return true;
+  }
+  const fold = (text: string): string => text.toLowerCase().replace(/\/{2,}/g, "/");
+  return (
+    host.readings.some((reading) => fold(reading) === "data-api.polymarket.com") &&
+    path.readings.some((reading) => /^\/v2\/(?:trades|activity)(?![a-z0-9_])/.test(fold(reading)))
+  );
 }
 
 /**
@@ -1448,15 +1724,27 @@ const FEED_PARAMETER_TYPES: Readonly<Record<string, FeedParameterType>> = {
  * - no other query value carries a hash-shaped run that is not a market id
  *   the report read (round 3), and none, nor the path or fragment, hides a
  *   venue cursor.
+ *
+ * Round 5, fail closed: a URL that does not parse is refused by name (it was
+ * skipped), and so is a query key or value whose percent-encoding does not
+ * decode strictly (WHATWG's `searchParams` decodes leniently, replacing a
+ * malformed escape by U+FFFD), or whose cursor scan cannot decode it.
  */
 export function feedUrlErrors(url: string, ids: FeedMarketIds = NO_MARKET_IDS): string[] {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    return [];
+    return [UNPARSEABLE_URL_ERROR];
   }
   const errors: string[] = [];
+  for (const pair of parsed.search.slice(1).split("&")) {
+    const failure = textReadings(pair.replace(/\+/g, " "), true).failure;
+    if (failure !== undefined) {
+      errors.push(undecodableError("sidecar.url query", failure));
+      break;
+    }
+  }
   if (
     parsed.origin !== "https://data-api.polymarket.com" ||
     !FEED_URL_PATHS.includes(parsed.pathname) ||
@@ -1495,8 +1783,11 @@ export function feedUrlErrors(url: string, ids: FeedMarketIds = NO_MARKET_IDS): 
     if (isCursorParameter(key)) {
       errors.push(...feedCursorErrors(value, `sidecar url ${key}`));
     } else if (decodeFeedCursor(value) !== undefined || cursorLikeTokens(value).length > 0) {
+      const failure = cursorScan(value).failure;
       errors.push(
-        `sidecar url ${key}: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter`,
+        failure === undefined
+          ? `sidecar url ${key}: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter`
+          : undecodableError(`sidecar url ${key} (cursor scan)`, failure),
       );
     } else if (type !== undefined && !type.accepts(value, ids)) {
       errors.push(
@@ -1510,11 +1801,13 @@ export function feedUrlErrors(url: string, ids: FeedMarketIds = NO_MARKET_IDS): 
       );
     }
   }
-  if (cursorLikeTokens(`${parsed.pathname} ${parsed.hash}`).length > 0) {
-    errors.push(
+  errors.push(
+    ...cursorScanErrors(
+      `${parsed.pathname} ${parsed.hash}`,
+      "sidecar.url path or fragment",
       "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
-    );
-  }
+    ),
+  );
   return errors;
 }
 
@@ -1578,8 +1871,10 @@ export function feedErrors(
       if (!type.accepts(entry, ids)) {
         errors.push(`${where}.${key}: not ${type.description} (S-O06 types the field so)`);
       }
-      if (typeof entry === "string" && cursorLikeTokens(entry).length > 0) {
-        errors.push(`${where}.${key}: a token decodes to a venue cursor (S-O06)`);
+      if (typeof entry === "string") {
+        errors.push(
+          ...cursorScanErrors(entry, `${where}.${key}`, `${where}.${key}: a token decodes to a venue cursor (S-O06)`),
+        );
       }
     }
     // The row's wallet, pseudonym, profile, name and transaction hash are
@@ -1605,8 +1900,14 @@ export function feedErrors(
         errors.push(`$.pagination.${key}: not ${type.description} (S-O06 types the field so)`);
       }
       // `next_cursor` has its own rules (`feedCursorErrors`, below).
-      if (key !== "next_cursor" && typeof entry === "string" && cursorLikeTokens(entry).length > 0) {
-        errors.push(`$.pagination.${key}: a token decodes to a venue cursor (S-O06)`);
+      if (key !== "next_cursor" && typeof entry === "string") {
+        errors.push(
+          ...cursorScanErrors(
+            entry,
+            `$.pagination.${key}`,
+            `$.pagination.${key}: a token decodes to a venue cursor (S-O06)`,
+          ),
+        );
       }
     }
   }
@@ -1880,6 +2181,28 @@ export function duplicateKeys(jsonText: string): string[] {
 }
 
 /**
+ * The `.jsonl` data texts that are not JSON and that the scanner knows
+ * (round 5; `protocol-v2/README.md`: `data` is the frame text as received,
+ * `PING` and `PONG` included): a `PING` or `PONG` heartbeat sent or
+ * received, the market channel's URL on the `open` record, and a
+ * `local-close` reason word (`timer`). Any other text that is not JSON
+ * fails closed: it was scanned only as raw text.
+ */
+function isKnownControlText(dir: unknown, data: string): boolean {
+  switch (dir) {
+    case "send":
+    case "recv":
+      return data === "PING" || data === "PONG";
+    case "open":
+      return data === "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    case "local-close":
+      return /^[a-z]{1,16}(?:-[a-z]{1,16}){0,3}$/.test(data);
+    default:
+      return false;
+  }
+}
+
+/**
  * Parses a capture's bytes into the view its pins read: the JSON document,
  * or the array of `.jsonl` records, each with `frame` when its `data` text is
  * JSON. Every parse uses `JSON.parse`, so a comment or a trailing comma is
@@ -1959,6 +2282,10 @@ export function parseCapture(
       }
       if (frame !== undefined) {
         refuseDuplicates(data, `line ${index + 1} frame`);
+      } else if (!isKnownControlText(record["dir"], data)) {
+        errors.push(
+          `line ${index + 1}: the data text is neither a JSON frame nor a known control message (PING or PONG; the open record's market-channel URL; a local-close reason word), so the scanner cannot parse it and the gate fails closed (round 5)`,
+        );
       }
     }
     records.push(frame === undefined ? { ...record } : { ...record, frame });
@@ -2187,13 +2514,24 @@ export function loadCapture(
     }
   }
   let bytes: Uint8Array;
-  let sidecarText: string;
+  let sidecarBytes: Uint8Array;
   try {
     bytes = readFileSync(resolve(root, spec.fixture));
-    sidecarText = readFileSync(resolve(root, sidecarPath), "utf8");
+    sidecarBytes = readFileSync(resolve(root, sidecarPath));
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return failed(`failed to read the capture or its sidecar: ${message}`);
+  }
+  // Round 5, fail closed: the sidecar is decoded strictly (a lenient read
+  // replaced an invalid byte by U+FFFD, which no rule judges); a byte-order
+  // mark is kept, so `JSON.parse` refuses it as before.
+  let sidecarText: string;
+  try {
+    sidecarText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(sidecarBytes);
+  } catch {
+    return failed(
+      `${sidecarPath}: the sidecar is not valid UTF-8, so the scanner cannot decode it and the gate fails closed (round 5)`,
+    );
   }
   return validateCapture(spec, bytes, sidecarText, context);
 }

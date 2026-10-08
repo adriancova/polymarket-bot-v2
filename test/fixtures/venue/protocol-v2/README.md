@@ -111,6 +111,9 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
     hash or a personal key; round 4 binds each sidecar URL to the route the
     report's source index records, in canonical form, and lets that report
     URL, not the sidecar's spelling, decide which captures are trade pages;
+    round 5 fails closed on what the scanner cannot decode, parse or read
+    (malformed percent-encoding, an unknown query parameter, a non-JSON
+    frame text other than a control message), naming the reason;
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no

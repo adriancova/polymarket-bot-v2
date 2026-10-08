@@ -291,8 +291,9 @@ this from the payload to the sidecars and to every field; the policy is set
 out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
 
 - **Personal keys, at any depth of any capture.** Keys compare without case
-  or separators (`proxy_wallet`, `proxyWallet`). A key containing `wallet`,
-  when it holds a string, holds a labelled synthetic address; `pseudonym` a labelled synthetic value;
+  or separators (`proxy_wallet`, `proxyWallet`). A key containing `wallet`
+  holds a labelled synthetic address or `null` (round 5: a number, a
+  boolean, a list or an object is refused); `pseudonym` a labelled synthetic value;
   `bio`, `profile_image…`, any key containing `email`, and a user name or
   handle (`user_name`, `x_username`, `display_name`, `handle`) are empty or a
   labelled synthetic value.
@@ -302,7 +303,8 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   is, because S-O06 uses `name` for the wallet's display name in `Trade`,
   `Activity`, `Holder` and `Position`.
 - **Personal values, anywhere in a capture or in its sidecar's text**,
-  after NFKC normalization: no email address; no `0x` 40-hex address other
+  after NFKC normalization and in each percent-decoded layer (round 5): no
+  email address; no `0x` 40-hex address other
   than a labelled synthetic one or a documented V2 contract address
   (`PUBLIC_CONTRACT_ADDRESSES`, F-71). A label glued to the address
   (`wallet_0x…`, `maker0x…`) does not hide it (round 3); only more hex
@@ -383,6 +385,28 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   sidecar URL is in canonical form (its own WHATWG serialization, so no
   `:443`, no `.` segment and no capitalized host), with no percent-encoding
   in its path.
+- **What the scanner cannot read fails the gate** (round 5, V2-9-R5-01). The
+  scanner is defense in depth against an accidental commit, so it fails
+  closed, with a named reason, and never falls back to the raw text:
+  - sidecar text (`url`, `notes`, each redaction, `extract.rule`) and
+    every capture string (keys included) are judged as written,
+    NFKC-normalized and in each percent-decoded layer (to four layers); a
+    run of `%XX` escapes that is not UTF-8, deeper nesting, or,
+    in the URL, a `%` that begins no escape fails the gate. One malformed
+    escape (`&unused=%FF`) no longer leaves the rest of the URL undecoded;
+  - so does such an escape in any text a cursor scan reads (a trade row, a
+    pagination value, a trade URL's query, path or fragment);
+  - a URL that does not parse fails, and reads as a trade page, so it
+    answers to every rule; an `https` sidecar URL carries no fragment and
+    no credential; each query parameter is one the gate lists for the
+    URL's route (`SIDECAR_QUERY_PARAMETERS`, with its source; the trade
+    and activity routes keep `FEED_QUERY_PARAMETERS`), and a query on a
+    route with no list fails;
+  - a key containing `wallet` holds an address string or `null`;
+  - a `.jsonl` data text that is not JSON is a known control message:
+    `PING` or `PONG` sent or received, the market channel URL on the
+    `open` record, or a `local-close` reason word;
+  - a sidecar that is not valid UTF-8 fails.
 - A sidecar of a trade or activity page with rows or a cursor lists
   `timestamp` and `next_cursor` among its redactions.
 - **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`). A
@@ -420,7 +444,10 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   (`maker1wallet: …`): it reads as another word, as `filename:` does;
 - the long ids in the URL of a capture that is not a trade or activity page:
   its condition and token ids are public, and the gate does not type that
-  URL's values;
+  URL's values (round 5: it does refuse a parameter it does not know);
+- a personal value hidden by a deliberate re-encoding other than
+  percent-encoding (round 5: per the 2026-10-08 ruling, such a bypass is a
+  follow-up, not a gap of this gate);
 - outside the Data API, a name under a generic key (`name`, `title`) of an
   object with no personal key: Gamma's `name` is market metadata;
 - an address without its `0x` under a generic key of a non-feed capture: the

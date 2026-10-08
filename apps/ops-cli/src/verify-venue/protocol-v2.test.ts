@@ -20,6 +20,7 @@ import {
   decodeFeedCursor,
   duplicateKeys,
   evaluatePins,
+  feedUrlErrors,
   isFeedCapture,
   isLabelledSyntheticHex,
   isLabelledSyntheticText,
@@ -33,6 +34,7 @@ import {
   reportDefinesId,
   resolvePath,
   sidecarPathOf,
+  sidecarPersonalDataErrors,
   sourceRouteErrors,
   unexplainedHashRuns,
   urlRouteOf,
@@ -41,6 +43,7 @@ import {
 import type {
   CaptureContext,
   CapturePin,
+  CaptureSidecar,
   CaptureSpec,
   CaptureValidationResult,
 } from "./captures.js";
@@ -140,6 +143,20 @@ function validateEdited(
 function hasError(result: { readonly errors: readonly string[] }, fragment: string): boolean {
   return result.errors.some((error) => error.includes(fragment));
 }
+
+/** Round 5: a query parameter the gate does not know for its route. */
+function unknownParameterError(key: string, route: string): string {
+  return `sidecar url ${key}: not a query parameter the gate knows for ${route} (SIDECAR_QUERY_PARAMETERS), so it fails closed (round 5)`;
+}
+
+/** Round 5: a query on a route for which the gate knows no parameter. */
+function unknownRouteError(route: string): string {
+  return `sidecar.url: the gate knows no query parameter of ${route} (SIDECAR_QUERY_PARAMETERS), so it cannot judge the query and fails closed (round 5)`;
+}
+
+/** Round 5: a fragment or a credential in an `https` sidecar URL. */
+const FRAGMENT_ERROR =
+  "sidecar.url: a fragment or a credential, which the scanner does not interpret, so the gate fails closed (round 5)";
 
 /** A JSON edit of a `json` capture, re-serialized compactly. */
 function editJson(mutate: (body: Record<string, unknown>) => void): (text: string) => string {
@@ -709,6 +726,9 @@ describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1
       sidecar["url"] = `${sidecar["url"] as string}&market=${PROBE_WALLET}&note=${PROBE_EMAIL}`;
     });
     expect(url.errors).toEqual([
+      // Round 5: neither parameter is one the gate knows for the route.
+      unknownParameterError("market", "https://data-api.polymarket.com/v2/oi"),
+      unknownParameterError("note", "https://data-api.polymarket.com/v2/oi"),
       "sidecar.url: an email address may not be committed (personal data)",
       "sidecar.url: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet",
     ]);
@@ -857,18 +877,24 @@ describe("V2-9 r1: personal data in sidecars and in every capture field (V2-9-R1
       sidecar["url"] = `${sidecar["url"] as string}&name=Reviewer%20Probe`;
     });
     expect(named.errors).toEqual([
+      unknownParameterError("name", "https://gamma-api.polymarket.com/events/keyset"),
       "sidecar.url: name is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
     ]);
     const encoded = validateEdited("gamma-events-keyset-series10192.jsonc", undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}&pseudo%6Eym=Real-Handle`;
     });
     expect(encoded.errors).toEqual([
+      unknownParameterError("pseudonym", "https://gamma-api.polymarket.com/events/keyset"),
       "sidecar.url: pseudonym is written with a value that is not a labelled synthetic value, a <placeholder> or empty",
     ]);
+    // The personal scan passes a labelled synthetic value; round 5 refuses
+    // the parameter alone, which the gate does not know for the route.
     const synthetic = validateEdited("gamma-events-keyset-series10192.jsonc", undefined, (sidecar) => {
       sidecar["url"] = `${sidecar["url"] as string}&name=synthetic-name-p1-r1`;
     });
-    expect(synthetic.errors).toEqual([]);
+    expect(synthetic.errors).toEqual([
+      unknownParameterError("name", "https://gamma-api.polymarket.com/events/keyset"),
+    ]);
     const fullWidth = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
       sidecar["notes"] = `${sidecar["notes"] as string} Contact reviewer-probe\uFF20example.invalid.`;
     });
@@ -976,6 +1002,8 @@ describe("V2-9 r1: every cursor in a trade or activity sidecar URL (V2-9-R1-02)"
       sidecar["url"] = `${sidecar["url"] as string}#${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
     });
     expect(fragment.errors).toEqual([
+      // Round 5: no https sidecar URL carries a fragment.
+      FRAGMENT_ERROR,
       // Round 2: a trade or activity URL carries no fragment at all.
       "sidecar.url: a trade or activity URL is exactly https://data-api.polymarket.com, one of /v2/trades, /v2/activity or /v2/activity/combos, and a query, in canonical form: no other path segment, no fragment, no credential, no port",
       "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
@@ -1086,6 +1114,7 @@ describe("V2-9 r2: a cursor in any written form in a trade or activity sidecar (
       sidecar["url"] = `${sidecar["url"] as string}#cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
     });
     expect(result.errors).toEqual([
+      FRAGMENT_ERROR,
       FEED_URL_SHAPE_ERROR,
       "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
     ]);
@@ -1641,6 +1670,7 @@ describe("V2-9 r4: the report's source index, not the sidecar's spelling, select
     });
     expect(result.errors).toEqual([
       canonicalError(url),
+      unknownRouteError("https://data-api.polymarket.com/v2/%74rades"),
       routeError("S-A07", EMPTY_PAGE_ROUTE, "https://data-api.polymarket.com/v2/%74rades"),
       FEED_URL_SHAPE_ERROR,
       "sidecar url cursor: the cursor decodes to a venue feed cursor (params l, ts, sq, d), which carries the seek anchor of the last row (S-O06) and re-fetches the unredacted page; replace it with a labelled synthetic value",
@@ -1657,6 +1687,7 @@ describe("V2-9 r4: the report's source index, not the sidecar's spelling, select
     });
     expect(result.errors).toEqual([
       canonicalError(url),
+      unknownRouteError("https://data-api.polymarket.com/v2/%74rades"),
       routeError("S-A07", EMPTY_PAGE_ROUTE, "https://data-api.polymarket.com/v2/%74rades"),
       NOTES_CURSOR_ERROR,
       FEED_URL_SHAPE_ERROR,
@@ -1748,6 +1779,302 @@ describe("V2-9 r4: the report's source index, not the sidecar's spelling, select
       expect(isFeedCapture(url, null, row?.url), spec.fixture).toBe(
         spec.fixture.startsWith("protocol-v2/data-v2-trades-"),
       );
+    }
+  });
+});
+
+// --- round 5: fail closed --------------------------------------------------
+
+/** The round-5 named refusal of a text the scanner cannot decode. */
+function undecodable(where: string, failure: string): string {
+  return `${where}: the scanner cannot decode it (${failure}), so the gate fails closed; write the value plainly, or as a labelled synthetic value`;
+}
+
+const NOT_UTF8 = "a run of %XX escapes that is not UTF-8";
+const LONE_PERCENT = "a % that begins no %XX escape";
+const TOO_DEEP = "percent-encoding nested deeper than 4 layers";
+const UNPARSEABLE_URL =
+  "sidecar.url: not a parseable URL, so the scanner cannot read it and the gate fails closed";
+const URL_EMAIL_ERROR = "sidecar.url: an email address may not be committed (personal data)";
+const URL_ADDRESS_ERROR =
+  "sidecar.url: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet";
+
+/** The CLOB book read's route (S-L11's report row; `book-v2.jsonc`). */
+const BOOK_ROUTE = "https://clob.polymarket.com/book";
+const BOOK_V2 = "book-v2.jsonc";
+
+/** The verifier's round-5 probes: an invented email, and an invented 40-hex value written `%30%78…`. */
+const R5_EMAIL_PROBE = "&memo=probe%40example.test";
+const R5_WALLET_PROBE = `&memo=%30%78${"1a".repeat(20)}`;
+const R5_MALFORMED = "&unused=%FF";
+
+/** The sidecar of a capture, with its URL replaced, as `validateCapture` reads it. */
+function sidecarWithUrl(name: string, edit: (url: string) => string): CaptureSidecar {
+  const sidecar = sidecarOf(captureSpec(name));
+  sidecar["url"] = edit(sidecar["url"] as string);
+  return sidecar as unknown as CaptureSidecar;
+}
+
+describe("V2-9 r5: what the scanner cannot decode, parse or read fails the gate by name (V2-9-R5-01)", () => {
+  it("MUTANT (verifier probe): a percent-encoded email beside an unrelated malformed escape is refused", () => {
+    const result = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}${R5_EMAIL_PROBE}${R5_MALFORMED}`;
+    });
+    expect(result.errors).toEqual([
+      unknownParameterError("memo", BOOK_ROUTE),
+      unknownParameterError("unused", BOOK_ROUTE),
+      undecodable("sidecar.url", NOT_UTF8),
+    ]);
+    // The decode path alone: the personal-data scan of the URL names the
+    // failure; it no longer falls back to the raw URL and passes.
+    const probe = sidecarWithUrl(BOOK_V2, (url) => `${url}${R5_EMAIL_PROBE}${R5_MALFORMED}`);
+    expect(sidecarPersonalDataErrors(probe, "", false)).toEqual([undecodable("sidecar.url", NOT_UTF8)]);
+    const control = sidecarWithUrl(BOOK_V2, (url) => `${url}${R5_EMAIL_PROBE}`);
+    expect(sidecarPersonalDataErrors(control, "", false)).toEqual([URL_EMAIL_ERROR]);
+  });
+
+  it("MUTANT (verifier probe): a percent-encoded wallet beside an unrelated malformed escape is refused", () => {
+    const result = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}${R5_WALLET_PROBE}${R5_MALFORMED}`;
+    });
+    expect(result.errors).toEqual([
+      unknownParameterError("memo", BOOK_ROUTE),
+      unknownParameterError("unused", BOOK_ROUTE),
+      undecodable("sidecar.url", NOT_UTF8),
+    ]);
+    const probe = sidecarWithUrl(BOOK_V2, (url) => `${url}${R5_WALLET_PROBE}${R5_MALFORMED}`);
+    expect(sidecarPersonalDataErrors(probe, "", false)).toEqual([undecodable("sidecar.url", NOT_UTF8)]);
+    const control = sidecarWithUrl(BOOK_V2, (url) => `${url}${R5_WALLET_PROBE}`);
+    expect(sidecarPersonalDataErrors(control, "", false)).toEqual([URL_ADDRESS_ERROR]);
+  });
+
+  it("MUTANT: a malformed escape in a known parameter's value fails the gate on its own, by name", () => {
+    for (const [suffix, failure] of [
+      ["%FF", NOT_UTF8],
+      ["%E2%82", NOT_UTF8],
+      ["%", LONE_PERCENT],
+      ["%G1", LONE_PERCENT],
+    ] as const) {
+      const result = validateEdited(BOOK_V2, undefined, (sidecar) => {
+        sidecar["url"] = `${sidecar["url"] as string}${suffix}`;
+      });
+      expect(result.errors, suffix).toEqual([undecodable("sidecar.url", failure)]);
+    }
+  });
+
+  it("MUTANT: nested percent-encoding is decoded to the end, and nesting deeper than 4 layers fails by name", () => {
+    const twice = sidecarWithUrl(BOOK_V2, (url) => `${url}&memo=probe%2540example.test`);
+    expect(sidecarPersonalDataErrors(twice, "", false)).toEqual([URL_EMAIL_ERROR]);
+    const fourTimes = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Contact probe%25252540example.test.`;
+    });
+    expect(fourTimes.errors).toEqual(["sidecar.notes: an email address may not be committed (personal data)"]);
+    const fiveTimes = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Contact probe%2525252540example.test.`;
+    });
+    expect(fiveTimes.errors).toEqual([undecodable("sidecar.notes", TOO_DEEP)]);
+  });
+
+  it("MUTANT: sidecar prose is read percent-decoded, and a malformed escape in it fails by name", () => {
+    const email = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Contact probe%40example.test.`;
+    });
+    expect(email.errors).toEqual(["sidecar.notes: an email address may not be committed (personal data)"]);
+    const fullWidth = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Contact probe％40example.test.`;
+    });
+    expect(fullWidth.errors).toEqual(["sidecar.notes: an email address may not be committed (personal data)"]);
+    const malformed = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Scraped at 100%FF.`;
+    });
+    expect(malformed.errors).toEqual([undecodable("sidecar.notes", NOT_UTF8)]);
+    const redaction = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["redactions"] = [
+        ...(sidecar["redactions"] as string[]),
+        `probe: the original wallet was %30%78${"1a".repeat(20)}`,
+      ];
+    });
+    expect(hasError(redaction, "sidecar.redactions[")).toBe(true);
+    expect(redaction.errors.some((error) => error.endsWith("it may be a wallet"))).toBe(true);
+    const rule = validateEdited("gamma-market-v2-docs-example.jsonc", undefined, (sidecar) => {
+      const extract = sidecar["extract"] as Record<string, unknown>;
+      extract["rule"] = `${extract["rule"] as string}; %C3`;
+    });
+    expect(rule.errors).toEqual([undecodable("sidecar.extract.rule", NOT_UTF8)]);
+    // A literal percent sign that begins no escape is prose, not a failure.
+    const percent = validateEdited("book-v1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} 100% of the book was kept.`;
+    });
+    expect(percent.errors).toEqual([]);
+  });
+
+  it("MUTANT: a capture string is read percent-decoded too, and one that cannot be decoded fails by name", () => {
+    const email = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      editJson((body) => {
+        body["probe"] = "https://example.invalid/avatar/probe%40example.test.png";
+      }),
+      asRedacted,
+    );
+    expect(email.errors).toEqual(["$.probe: an email address may not be committed (personal data)"]);
+    const malformed = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      editJson((body) => {
+        body["probe%FF"] = "kept";
+      }),
+      asRedacted,
+    );
+    expect(malformed.errors).toEqual([undecodable("$ key", NOT_UTF8)]);
+  });
+
+  it("MUTANT: every cursor scan that cannot decode its text fails by name (row, pagination, URL value, path)", () => {
+    expect(cursorLikeTokens("Will it rise %FF")).toEqual(["<undecodable percent-encoding>"]);
+    expect(cursorLikeTokens("Will it rise 5%?")).toEqual([]);
+    const row = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        const first = firstRow(body);
+        first["title"] = `${first["title"] as string} %FF`;
+      }),
+    );
+    // The personal-data scan of the capture string, and the row's cursor scan, each name it.
+    expect(row.errors).toEqual([
+      undecodable("$.data[0].title", NOT_UTF8),
+      undecodable("$.data[0].title (cursor scan)", NOT_UTF8),
+    ]);
+    expect(feedUrlErrors("https://data-api.polymarket.com/v2/trades?limit=2&side=%FF")).toContain(
+      undecodable("sidecar.url query", NOT_UTF8),
+    );
+    // Escaped twice: WHATWG decodes the value once, and the cursor scan of the result fails.
+    const twice = feedUrlErrors("https://data-api.polymarket.com/v2/trades?limit=2&side=%25FF");
+    expect(twice).toContain(undecodable("sidecar.url query", NOT_UTF8));
+    expect(twice).toContain(undecodable("sidecar url side (cursor scan)", NOT_UTF8));
+    const offset = validateEdited(
+      "data-v2-trades-v1-page2.jsonc",
+      editJson((body) => {
+        pagination(body)["offset"] = "%FF";
+      }),
+    );
+    expect(offset.errors).toContain(undecodable("$.pagination.offset (cursor scan)", NOT_UTF8));
+    expect(feedUrlErrors("https://data-api.polymarket.com/v2/trades%FF?limit=2")).toContain(
+      undecodable("sidecar.url path or fragment (cursor scan)", NOT_UTF8),
+    );
+  });
+
+  it("MUTANT: an unparseable URL is refused by name, and reads as a feed, never as raw text", () => {
+    expect(feedUrlErrors("https://[data-api.polymarket.com/v2/trades")).toEqual([UNPARSEABLE_URL]);
+    expect(readsAsFeedRoute("https://[clob.polymarket.com/book")).toBe(true);
+    // A path the scanner cannot decode reads as a feed (more rules, never fewer).
+    expect(readsAsFeedRoute("https://data-api.polymarket.com/v2/%FFtrades")).toBe(true);
+    expect(readsAsFeedRoute("https://clob.polymarket.com/b%FFook?token_id=1")).toBe(true);
+    // Every reading is folded: a percent-encoded full-width letter still reads as the route.
+    expect(readsAsFeedRoute("https://data-api.polymarket.com/v2/%EF%BD%94rades")).toBe(true);
+    expect(readsAsFeedRoute("https://data-api.polymarket.com/v2/%25EF%25BD%2594rades")).toBe(true);
+    const book = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace("/book", "/b%FFook");
+    });
+    expect(hasError(book, "$.data: a trade or activity capture must carry its data[] rows")).toBe(true);
+    expect(book.errors).toContain(undecodable("sidecar.url", NOT_UTF8));
+  });
+
+  it("MUTANT: a fragment, an unknown query parameter, a query on a route with no known parameter, or a wallet key in any spelling is refused", () => {
+    const fragment = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}#bids`;
+    });
+    expect(fragment.errors).toEqual([FRAGMENT_ERROR]);
+    const parameter = validateEdited(BOOK_V2, undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&memo=synthetic-memo`;
+    });
+    expect(parameter.errors).toEqual([unknownParameterError("memo", BOOK_ROUTE)]);
+    const route = validateEdited("gamma-market-v1-btc15m.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}?include_tag=true`;
+    });
+    expect(route.errors).toEqual([unknownRouteError("https://gamma-api.polymarket.com/markets/5308512")]);
+    const wallet = validateEdited("data-v2-oi-v2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&proxyWallet=0x${"0".repeat(36)}0101`;
+    });
+    expect(wallet.errors).toEqual([
+      "sidecar.url: a Data API read keyed by a wallet (proxyWallet=) may not be committed",
+      unknownParameterError("proxyWallet", "https://data-api.polymarket.com/v2/oi"),
+    ]);
+  });
+
+  it("MUTANT: a wallet key that holds a number, a boolean, a list or an object is refused by name", () => {
+    for (const [value, kind] of [
+      [1234567890, "a number"],
+      [true, "a boolean"],
+      [["synthetic-entry"], "an array"],
+      [{ chain: "polygon" }, "an object"],
+    ] as const) {
+      const result = validateEdited(
+        "gamma-market-v1-btc15m.jsonc",
+        editJson((body) => {
+          body["probe"] = { wallet: value };
+        }),
+        asRedacted,
+      );
+      expect(result.errors, kind).toEqual([
+        `$.probe.wallet: a wallet key holds ${kind}; the scanner reads only an address string or null, so the gate fails closed (round 5)`,
+      ]);
+    }
+    const nullWallet = validateEdited(
+      "gamma-market-v1-btc15m.jsonc",
+      editJson((body) => {
+        body["probe"] = { wallet: null };
+      }),
+      asRedacted,
+    );
+    expect(nullWallet.errors).toEqual([]);
+  });
+
+  it("MUTANT: a .jsonl data text that is neither JSON nor a known control message is refused by name", () => {
+    const session = "ws-market-v2-session.jsonl";
+    const lines = fixtureText(captureSpec(session).fixture).split("\n").filter((line) => line !== "").length;
+    const named = (line: number): string =>
+      `line ${line}: the data text is neither a JSON frame nor a known control message (PING or PONG; the open record's market-channel URL; a local-close reason word), so the scanner cannot parse it and the gate fails closed (round 5)`;
+    for (const text of ["pseudonym: Real Handle", "{\"pseudonym\":\"Real Handle\"} trailing", "PONG "]) {
+      const result = validateEdited(session, appendRecord(text));
+      expect(result.errors, text).toEqual([named(lines + 1)]);
+    }
+    // The committed control messages, and a PING received, are known.
+    expect(validateEdited(session, appendRecord("PING")).errors).toEqual([]);
+    const misplaced = validateEdited(session, (text) =>
+      `${text}${JSON.stringify({ t: "2026-10-05T23:16:26.000Z", dir: "local-close", data: "PING PONG" })}\n`,
+    );
+    expect(misplaced.errors).toEqual([named(lines + 1)]);
+  });
+
+  it("MUTANT: a sidecar that is not valid UTF-8 is refused by name", () => {
+    const scratch = mkdtempSync(join(tmpdir(), "v2-9-r5-utf8-"));
+    try {
+      const spec = captureSpec("book-v1.jsonc");
+      mkdirSync(join(scratch, "protocol-v2"));
+      writeFileSync(join(scratch, spec.fixture), readFileSync(join(VENUE_FIXTURE_ROOT, spec.fixture)));
+      const sidecarPath = sidecarPathOf(spec.fixture);
+      const sidecar = readFileSync(join(VENUE_FIXTURE_ROOT, sidecarPath));
+      writeFileSync(join(scratch, sidecarPath), sidecar);
+      expect(loadCapture(spec, CONTEXT, scratch).errors).toEqual([]);
+      const notes = sidecar.indexOf(Buffer.from('"notes": "'));
+      expect(notes).toBeGreaterThan(0);
+      const at = notes + '"notes": "'.length;
+      writeFileSync(
+        join(scratch, sidecarPath),
+        Buffer.concat([sidecar.subarray(0, at), Buffer.from([0xff]), sidecar.subarray(at)]),
+      );
+      expect(loadCapture(spec, CONTEXT, scratch).errors).toEqual([
+        `${sidecarPath}: the sidecar is not valid UTF-8, so the scanner cannot decode it and the gate fails closed (round 5)`,
+      ]);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("the committed tree decodes everywhere: every sidecar text, URL query and data text", () => {
+    for (const spec of PROTOCOL_V2_CAPTURES) {
+      const sidecar = sidecarOf(spec) as unknown as CaptureSidecar;
+      const feed = spec.fixture.startsWith("protocol-v2/data-v2-trades-");
+      expect(sidecarPersonalDataErrors(sidecar, fixtureText(spec.fixture), feed), spec.fixture).toEqual([]);
+      expect(loadCapture(spec, CONTEXT).errors, spec.fixture).toEqual([]);
     }
   });
 });
@@ -2125,6 +2452,25 @@ describe("V2-9 parent fixture rules: the dated, scoped exception", () => {
     }
     expect(fixtureText("protocol-v2/README.md")).toContain(
       "round 4 binds each sidecar URL to the route the\n    report's source index records",
+    );
+  });
+
+  it("round 5: the exception states that what the scanner cannot read fails the gate (V2-9-R5-01)", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "**What the scanner cannot read fails the gate** (round 5, V2-9-R5-01)",
+      "never falls back to the raw text",
+      "One malformed\n    escape (`&unused=%FF`) no longer leaves the rest of the URL undecoded",
+      "`SIDECAR_QUERY_PARAMETERS`",
+      "a key containing `wallet` holds an address string or `null`",
+      "a `.jsonl` data text that is not JSON is a known control message",
+      "a sidecar that is not valid UTF-8 fails",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    expect(readme).not.toContain("A key containing `wallet`,\n  when it holds a string,");
+    expect(fixtureText("protocol-v2/README.md")).toContain(
+      "round 5 fails closed on what the scanner cannot decode, parse or read",
     );
   });
 });
