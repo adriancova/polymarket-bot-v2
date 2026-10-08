@@ -15,7 +15,10 @@
  *    entry and the check's report; `authenticated` is exactly `false`; the
  *    URL is on an official public host (a CLOB URL on a public market read,
  *    a WebSocket on the market channel), and no Data API URL is keyed by a
- *    wallet.
+ *    wallet. An `https` URL is in canonical form, with no percent-encoding
+ *    in its path, and its route (scheme, host, path) is the route of the
+ *    URL the report's source index records for the catalogue's source id
+ *    (round 4).
  * 2. **The bytes.** Size and sha256 equal `fixture_bytes` and
  *    `fixture_sha256`. A `live-capture` lists no redaction and IS the raw
  *    response (`fixture_*` equal `raw_*`); a `live-capture-redacted` lists its
@@ -41,8 +44,10 @@
  *    synthetic name and transaction hash; and sidecar text writes no
  *    personal field with a live value and no unlabelled long id that the
  *    capture or URL does not carry.
- * 6. **Trade and activity feeds** (Data API `/v2/trades`, `/v2/activity…`,
- *    or any capture whose `data` rows carry a wallet), report §15:
+ * 6. **Trade and activity feeds** (the report's source-index URL is Data
+ *    API `/v2/trades` or `/v2/activity…`, the sidecar URL reads as one under
+ *    any spelling, or the `data` rows carry a wallet; round 4: the
+ *    sidecar's spelling cannot opt out), report §15:
  *    - a cursor (the page's `next_cursor`, or any cursor parameter of the
  *      sidecar URL, every occurrence) that decodes to a venue feed cursor is
  *      refused, because a feed cursor carries the seek anchor of the last
@@ -229,7 +234,13 @@ export const CLOB_PUBLIC_PATHS = [
   "/midpoint",
 ] as const;
 
-/** The refusals of a sidecar URL's host and route. */
+/**
+ * The refusals of a sidecar URL's host and route. Round 4: an `https` URL is
+ * also written in its one canonical spelling (the WHATWG serialization,
+ * `new URL(url).href`, is the URL itself: no `:443`, no `.` or `..` segment,
+ * no capitalized or percent-encoded host) with no percent-encoding in its
+ * path, so `/v2/%74rades` cannot stand for `/v2/trades`.
+ */
 export function captureUrlErrors(url: string): string[] {
   if (!CAPTURE_URL_PREFIXES.some((prefix) => url.startsWith(prefix))) {
     return [`sidecar.url: not an official public Polymarket host: ${url}`];
@@ -244,6 +255,11 @@ export function captureUrlErrors(url: string): string[] {
     return ["sidecar.url: not a parseable URL"];
   }
   const errors: string[] = [];
+  if (parsed.href !== url || parsed.pathname.includes("%")) {
+    errors.push(
+      `sidecar.url: not in canonical form (the URL is its own WHATWG serialization, with no percent-encoding in the path): ${url}`,
+    );
+  }
   if (
     parsed.host === "clob.polymarket.com" &&
     !CLOB_PUBLIC_PATHS.some(
@@ -277,11 +293,49 @@ export function sidecarPathOf(fixture: string): string {
   return fixture.replace(/\.(?:jsonc|jsonl|json)$/, ".provenance.jsonc");
 }
 
+/**
+ * A URL's route: its scheme, host and path, the text before its first `?`,
+ * `#`, space or `…` (round 4). A report's source-index URL may cut a long
+ * query with `…` or follow a WebSocket URL with its subscription in prose;
+ * its route is still whole.
+ */
+export function urlRouteOf(url: string): string {
+  const end = url.search(/[?# \u2026]/);
+  return end === -1 ? url : url.slice(0, end);
+}
+
+/**
+ * Round 4: a sidecar URL's route must be the route of the URL the report's
+ * source index records for the catalogue's source id. The sidecar may
+ * redact or replace a query value (a feed cursor, for example), but not
+ * respell the route: so the report, not the sidecar, decides which rules
+ * the capture answers to (`isFeedCapture`).
+ */
+export function sourceRouteErrors(url: string, row: SourceIndexRow | undefined): string[] {
+  if (row === undefined) {
+    return [];
+  }
+  const expected = urlRouteOf(row.url);
+  if (expected.length === 0 || urlRouteOf(url) !== expected) {
+    return [
+      `sidecar.url: the route (scheme, host and path) must be ${row.id}'s in the report's source index, ${expected}; the sidecar's is ${urlRouteOf(url)}`,
+    ];
+  }
+  return [];
+}
+
 // --- the report -------------------------------------------------------------
 
 /** One row of the report's source index (§14). */
 export interface SourceIndexRow {
   readonly id: string;
+  /**
+   * The URL column, as the report writes it (a long query may be cut by
+   * `…`; a WebSocket row adds its subscription in prose). Round 4: a
+   * sidecar URL's route must equal this URL's route (`urlRouteOf`), and
+   * this URL, not the sidecar's, decides whether the capture is a feed.
+   */
+  readonly url: string;
   readonly time: string;
   readonly http: string;
   readonly bytes: number;
@@ -289,7 +343,7 @@ export interface SourceIndexRow {
 }
 
 const SOURCE_INDEX_ROW_RE =
-  /^\| (S-[A-Z]+\d+) \| `[^`]*` \| (\d{2}:\d{2}:\d{2}Z) \| (\d{3}|WS) \| (\d+) \| `([0-9a-f]{64})` \|/gm;
+  /^\| (S-[A-Z]+\d+) \| `([^`]*)` \| (\d{2}:\d{2}:\d{2}Z) \| (\d{3}|WS) \| (\d+) \| `([0-9a-f]{64})` \|/gm;
 
 /**
  * Parses the HTTP and WebSocket rows of a report's source index: `| id |
@@ -304,10 +358,11 @@ export function parseSourceIndex(
   for (const match of sectionText.matchAll(SOURCE_INDEX_ROW_RE)) {
     const row: SourceIndexRow = {
       id: match[1] as string,
-      time: match[2] as string,
-      http: match[3] as string,
-      bytes: Number(match[4]),
-      sha256: match[5] as string,
+      url: match[2] as string,
+      time: match[3] as string,
+      http: match[4] as string,
+      bytes: Number(match[5]),
+      sha256: match[6] as string,
     };
     const earlier = rows.get(row.id);
     if (earlier !== undefined && JSON.stringify(earlier) !== JSON.stringify(row)) {
@@ -1001,12 +1056,42 @@ const FEED_ROUTE_RE =
   /^https:\/\/data-api\.polymarket\.com\/v2\/(?:trades|activity)(?:[/?]|$)/;
 
 /**
- * A trade or activity feed capture: its URL is a Data API feed route
- * (S-D26 lines 80-82: `/v2/trades`, `/v2/activity`, `/v2/activity/combos`),
- * or its `data` rows carry a wallet or pseudonym, as feed rows do.
+ * Whether a URL reads as a Data API feed route under any spelling (round 4):
+ * parsed by WHATWG (which lowercases and percent-decodes the host and drops
+ * a default port), its path percent-decoded, NFKC-normalized, lowercased,
+ * with repeated slashes collapsed. Fail closed: a URL that does not parse is
+ * read as text the same way.
  */
-export function isFeedCapture(url: string, view: unknown): boolean {
+export function readsAsFeedRoute(url: string): boolean {
   if (FEED_ROUTE_RE.test(url)) {
+    return true;
+  }
+  const fold = (text: string): string =>
+    safeDecodeUri(safeDecodeUri(text)).normalize("NFKC").toLowerCase().replace(/\/{2,}/g, "/");
+  let host: string;
+  let path: string;
+  try {
+    const parsed = new URL(url);
+    host = fold(parsed.hostname);
+    path = fold(parsed.pathname);
+  } catch {
+    const folded = fold(url);
+    return /data-api\.polymarket\.com(?::\d*)?\/v2\/(?:trades|activity)(?![a-z0-9_])/.test(folded);
+  }
+  return host === "data-api.polymarket.com" && /^\/v2\/(?:trades|activity)(?![a-z0-9_])/.test(path);
+}
+
+/**
+ * A trade or activity feed capture (round 4: the report decides, not the
+ * sidecar's spelling):
+ * - the report's source-index URL for the catalogue's source id
+ *   (`reportUrl`) is a Data API feed route (S-D26 lines 80-82: `/v2/trades`,
+ *   `/v2/activity`, `/v2/activity/combos`);
+ * - or the sidecar URL reads as one under any spelling (`readsAsFeedRoute`);
+ * - or its `data` rows carry a wallet or pseudonym, as feed rows do.
+ */
+export function isFeedCapture(url: string, view: unknown, reportUrl = ""): boolean {
+  if (FEED_ROUTE_RE.test(reportUrl) || readsAsFeedRoute(url)) {
     return true;
   }
   const rows = isRecord(view) ? view["data"] : undefined;
@@ -1943,6 +2028,10 @@ export function validateCapture(
     errors.push("sidecar.authenticated: must be exactly false (public, unauthenticated reads only)");
   }
   errors.push(...captureUrlErrors(sidecar.url));
+  // Round 4: the catalogue's source id, not the sidecar's, names the report
+  // row whose URL binds the route and selects the feed rules.
+  const reportRow = context.sourceIndex.get(spec.sourceId);
+  errors.push(...sourceRouteErrors(sidecar.url, reportRow));
   if (!SHA256_RE.test(sidecar.raw_sha256) || !SHA256_RE.test(sidecar.fixture_sha256)) {
     errors.push("sidecar: raw_sha256 and fixture_sha256 must be 64 lowercase hex digits");
   }
@@ -2022,14 +2111,16 @@ export function validateCapture(
 
   // 5. Credentials and personal data, everywhere: the capture and the
   //    sidecar's text.
-  const feed = isFeedCapture(sidecar.url, view);
+  const feed = isFeedCapture(sidecar.url, view, reportRow?.url);
   const feedRows = isRecord(view) && Array.isArray(view["data"]) ? view["data"] : [];
   const policy: PersonalDataPolicy = {
     publicAddresses: new Set(
       (context.publicAddresses ?? []).map((address) => address.toLowerCase()),
     ),
     feedRows: new Set<unknown>(feed ? feedRows : []),
-    dataApi: sidecar.url.startsWith("https://data-api.polymarket.com/"),
+    dataApi: [sidecar.url, reportRow?.url ?? ""].some((url) =>
+      url.startsWith("https://data-api.polymarket.com/"),
+    ),
   };
   scanForCredentials(view, "$", errors);
   scanPersonalData(personalScanTarget(view, spec.format), "$", errors, policy);

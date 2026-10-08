@@ -15,10 +15,12 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import {
   catalogueTokenIds,
+  captureUrlErrors,
   cursorLikeTokens,
   decodeFeedCursor,
   duplicateKeys,
   evaluatePins,
+  isFeedCapture,
   isLabelledSyntheticHex,
   isLabelledSyntheticText,
   loadCapture,
@@ -26,11 +28,14 @@ import {
   marketReadTokenIds,
   parseSourceIndex,
   personalValueErrors,
+  readsAsFeedRoute,
   redactionSubjects,
   reportDefinesId,
   resolvePath,
   sidecarPathOf,
+  sourceRouteErrors,
   unexplainedHashRuns,
+  urlRouteOf,
   validateCapture,
 } from "./captures.js";
 import type {
@@ -286,6 +291,8 @@ describe("V2-9 captures: each committed capture passes against its sidecar and t
   it("the source index parses one row per HTTP or WebSocket source", () => {
     expect(CONTEXT.sourceIndex.get("S-W01")).toEqual({
       id: "S-W01",
+      // Round 4: the URL column, as the report writes it.
+      url: "wss://ws-subscriptions-clob.polymarket.com/ws/market (assets_ids=[663574…625152], custom_feature_enabled=true, 60 s)",
       time: "23:15:25Z",
       http: "WS",
       bytes: 35316,
@@ -1598,6 +1605,153 @@ describe("V2-9 r3: a label glued to an address, a hash or a personal key does no
   });
 });
 
+/** The empty V2 trade page (S-A07): no row and no cursor, so no redaction. */
+const EMPTY_PAGE = "data-v2-trades-v2-empty.jsonc";
+
+/** S-A07's route in the report's source index. */
+const EMPTY_PAGE_ROUTE = "https://data-api.polymarket.com/v2/trades";
+
+/** The round-4 route refusal for a capture whose report row is `id`. */
+function routeError(id: string, expected: string, actual: string): string {
+  return `sidecar.url: the route (scheme, host and path) must be ${id}'s in the report's source index, ${expected}; the sidecar's is ${actual}`;
+}
+
+/** The round-4 canonical-spelling refusal. */
+function canonicalError(url: string): string {
+  return `sidecar.url: not in canonical form (the URL is its own WHATWG serialization, with no percent-encoding in the path): ${url}`;
+}
+
+/** Respellings of `/v2/trades` (round 4): each reads as the feed route. */
+const RESPELLED_TRADE_PATHS = [
+  "/v2/%74rades",
+  "/v2/tr%61des",
+  "/v2/%2574rades",
+  "/V2/Trades",
+  "/v2//trades",
+  "/v2/trades/",
+  "/v2/ｔrades",
+] as const;
+
+describe("V2-9 r4: the report's source index, not the sidecar's spelling, selects the feed rules and binds the route (V2-9-R4-01)", () => {
+  it("MUTANT (verifier probe): the empty page's URL respelled /%74rades, with a seek-anchor cursor, is refused", () => {
+    let url = "";
+    const result = validateEdited(EMPTY_PAGE, undefined, (sidecar) => {
+      url = `${(sidecar["url"] as string).replace("/trades", "/%74rades")}&cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+      sidecar["url"] = url;
+    });
+    expect(result.errors).toEqual([
+      canonicalError(url),
+      routeError("S-A07", EMPTY_PAGE_ROUTE, "https://data-api.polymarket.com/v2/%74rades"),
+      FEED_URL_SHAPE_ERROR,
+      "sidecar url cursor: the cursor decodes to a venue feed cursor (params l, ts, sq, d), which carries the seek anchor of the last row (S-O06) and re-fetches the unredacted page; replace it with a labelled synthetic value",
+      `sidecar url cursor: a trade or activity cursor must be a labelled synthetic value (synthetic-cursor-…), got ${JSON.stringify(SYNTHETIC_SEEK_ANCHOR_CURSOR.slice(0, 24))}…`,
+    ]);
+  });
+
+  it("MUTANT (verifier probe): the empty page's URL respelled /%74rades, with a seek-anchor cursor in the notes, is refused", () => {
+    let url = "";
+    const result = validateEdited(EMPTY_PAGE, undefined, (sidecar) => {
+      url = (sidecar["url"] as string).replace("/trades", "/%74rades");
+      sidecar["url"] = url;
+      sidecar["notes"] = `${sidecar["notes"] as string} Original cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(result.errors).toEqual([
+      canonicalError(url),
+      routeError("S-A07", EMPTY_PAGE_ROUTE, "https://data-api.polymarket.com/v2/%74rades"),
+      NOTES_CURSOR_ERROR,
+      FEED_URL_SHAPE_ERROR,
+    ]);
+  });
+
+  it("MUTANT: every respelling of the route still reads as a feed, so a cursor in the notes is refused", () => {
+    for (const path of RESPELLED_TRADE_PATHS) {
+      const result = validateEdited(EMPTY_PAGE, undefined, (sidecar) => {
+        sidecar["url"] = (sidecar["url"] as string).replace("/v2/trades", path);
+        sidecar["notes"] = `${sidecar["notes"] as string} Original cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+      });
+      expect(result.errors, path).toContain(NOTES_CURSOR_ERROR);
+      expect(hasError(result, "sidecar.url: the route (scheme, host and path) must be S-A07's"), path).toBe(true);
+      expect(readsAsFeedRoute(`https://data-api.polymarket.com${path}?limit=3`), path).toBe(true);
+    }
+    for (const url of [
+      "https://data-api.polymarket.com:443/v2/trades?limit=3",
+      "https://DATA-API.polymarket.com/v2/activity?limit=3",
+      "https://data-api.polymarket.%63om/v2/activity/combos",
+      "not a URL: data-api.polymarket.com/v2/%74rades",
+    ]) {
+      expect(readsAsFeedRoute(url), url).toBe(true);
+    }
+    for (const url of [
+      "https://data-api.polymarket.com/v2/oi?condition=0x01",
+      "https://data-api.polymarket.com/v2/tradesx",
+      "https://clob.polymarket.com/book?token_id=1",
+      "https://docs.polymarket.com/api-reference/data-api/overview.md",
+    ]) {
+      expect(readsAsFeedRoute(url), url).toBe(false);
+    }
+  });
+
+  it("MUTANT: a sidecar that claims a non-feed route still answers to the feed rules the report selects", () => {
+    const oi = "https://data-api.polymarket.com/v2/oi?condition=0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000";
+    const result = validateEdited(EMPTY_PAGE, undefined, (sidecar) => {
+      sidecar["url"] = oi;
+      sidecar["notes"] = `${sidecar["notes"] as string} Original cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(result.errors).toEqual([
+      routeError("S-A07", EMPTY_PAGE_ROUTE, "https://data-api.polymarket.com/v2/oi"),
+      NOTES_CURSOR_ERROR,
+      FEED_URL_SHAPE_ERROR,
+    ]);
+    // The classification alone: the report's URL decides, whatever the sidecar says.
+    const reportUrl = CONTEXT.sourceIndex.get("S-A07")?.url ?? "";
+    expect(isFeedCapture(oi, { data: [] }, reportUrl)).toBe(true);
+    expect(isFeedCapture(oi, { data: [] }, CONTEXT.sourceIndex.get("S-A06")?.url ?? "")).toBe(false);
+  });
+
+  it("MUTANT: a non-feed capture's route swapped, or respelled, is refused", () => {
+    const swapped = validateEdited("data-v2-oi-v2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace("/v2/oi", "/v2/resolutions");
+    });
+    expect(swapped.errors).toEqual([
+      routeError("S-A06", "https://data-api.polymarket.com/v2/oi", "https://data-api.polymarket.com/v2/resolutions"),
+    ]);
+    let respelledUrl = "";
+    const respelled = validateEdited("gamma-market-v1-btc15m.jsonc", undefined, (sidecar) => {
+      respelledUrl = (sidecar["url"] as string).replace("/markets/", "/m%61rkets/");
+      sidecar["url"] = respelledUrl;
+    });
+    expect(respelled.errors).toEqual([
+      canonicalError(respelledUrl),
+      routeError("S-G04", "https://gamma-api.polymarket.com/markets/5308512", "https://gamma-api.polymarket.com/m%61rkets/5308512"),
+    ]);
+    for (const url of [
+      "https://clob.polymarket.com/./book?token_id=1",
+      "https://clob.polymarket.com/b%6Fok?token_id=1",
+      "https://gamma-api.polymarket.com/markets/%35308512",
+    ]) {
+      expect(captureUrlErrors(url), url).toContain(canonicalError(url));
+    }
+  });
+
+  it("every committed sidecar URL is canonical and on its report row's route", () => {
+    expect(urlRouteOf("https://h.example/p?q=1#f")).toBe("https://h.example/p");
+    expect(urlRouteOf("https://h.example/p…")).toBe("https://h.example/p");
+    expect(urlRouteOf("wss://h.example/ws/market (assets_ids=[1])")).toBe("wss://h.example/ws/market");
+    expect(sourceRouteErrors("https://h.example/p", undefined)).toEqual([]);
+    for (const spec of PROTOCOL_V2_CAPTURES) {
+      const url = sidecarOf(spec)["url"] as string;
+      const row = CONTEXT.sourceIndex.get(spec.sourceId);
+      expect(row, spec.fixture).toBeDefined();
+      expect(sourceRouteErrors(url, row), spec.fixture).toEqual([]);
+      expect(captureUrlErrors(url), spec.fixture).toEqual([]);
+      // The report's own URL classifies exactly the three trade pages.
+      expect(isFeedCapture(url, null, row?.url), spec.fixture).toBe(
+        spec.fixture.startsWith("protocol-v2/data-v2-trades-"),
+      );
+    }
+  });
+});
+
 describe("V2-9 pins: each capture's pinned V2 facts", () => {
   for (const spec of PROTOCOL_V2_CAPTURES) {
     for (const pin of spec.pins) {
@@ -1957,5 +2111,20 @@ describe("V2-9 parent fixture rules: the dated, scoped exception", () => {
     expect(readme).not.toContain("So no hash rides on the URL.");
     expect(readme).not.toContain("that a row carries as\n  `condition_id`");
     expect(fixtureText("protocol-v2/README.md")).toContain("round 3 added the S-O06 type of every field of a trade page");
+  });
+
+  it("round 4: the exception states that the report selects the trade pages and binds the route (V2-9-R4-01)", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "**Which captures are trade or activity pages** (round 4). The report\n  decides, not the sidecar's spelling",
+      "An empty page is one too",
+      "**The sidecar URL keeps the report's route** (round 4)",
+      "with no percent-encoding\n  in its path",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    expect(fixtureText("protocol-v2/README.md")).toContain(
+      "round 4 binds each sidecar URL to the route the\n    report's source index records",
+    );
   });
 });

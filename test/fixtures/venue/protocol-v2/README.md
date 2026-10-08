@@ -108,7 +108,9 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
     re-encoded) and the documented type of every value on a trade URL;
     round 3 added the S-O06 type of every field of a trade page, market ids
     that the report alone corroborates, and labels glued to an address, a
-    hash or a personal key;
+    hash or a personal key; round 4 binds each sidecar URL to the route the
+    report's source index records, in canonical form, and lets that report
+    URL, not the sidecar's spelling, decide which captures are trade pages;
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no

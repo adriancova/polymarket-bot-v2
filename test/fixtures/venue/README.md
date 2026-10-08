@@ -369,6 +369,20 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   synthetic (round 3: a row's `condition_id` no longer vouches for it). So
   no documented value holds a hash-shaped run other than such a condition,
   and the gate refuses one (round 3).
+- **Which captures are trade or activity pages** (round 4). The report
+  decides, not the sidecar's spelling: a capture is one when the URL that
+  the report's source index records for its catalogue source id is a feed
+  route, when its sidecar URL reads as one under any spelling
+  (percent-encoded, capitalized, with repeated slashes, a port or full-width
+  letters), or when its rows carry a wallet. An empty page is one too, so
+  its sidecar URL and prose answer to every cursor rule above.
+- **The sidecar URL keeps the report's route** (round 4): its scheme, host
+  and path are those of the URL the report's source index records for the
+  catalogue source id. A sidecar may replace a query value (a cursor, by a
+  labelled synthetic one) but not respell or swap the route. Every `https`
+  sidecar URL is in canonical form (its own WHATWG serialization, so no
+  `:443`, no `.` segment and no capitalized host), with no percent-encoding
+  in its path.
 - A sidecar of a trade or activity page with rows or a cursor lists
   `timestamp` and `next_cursor` among its redactions.
 - **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`). A
