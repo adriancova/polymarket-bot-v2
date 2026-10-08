@@ -296,6 +296,19 @@
 - **A PENDING T is fixed** by the first later venue-timed evidence of the same
   terminal fact, for the same venue order id: a `CANCELED` observation for a
   canceled order, or the fills' instants for a filled one.
+- **A collateral-targeted BUY** (`R3-M1`; D3.5, D4.2). Its `matched` answer
+  makes it FILLED, and only a read fixes its final size. So its T is the
+  FILLED row's C. C is PENDING until a read has fixed the final size and the
+  recorded fills sum to it. C is then the latest instant among those fills.
+  - **What the read supplies.** The read fixes which fills make up the
+    order, and never supplies an instant. Each fill's instant is still venue
+    time (a `MATCHED` event's `timestamp`, or `match_time`).
+  - **Why C, and not a `CANCELLATION`, is sound here.** A match needs a live
+    order, so every fill's instant is no later than the instant the order
+    became terminal, and neither is C. So STALE against C (D1.4, a point or
+    an interval) still proves that L is older than the order's end. The venue may emit no `CANCELLATION` for a fully
+    spent order (U-50, U-54). Waiting for one would hold every late frame of
+    such an order until the horizon read halts it.
 - **T is recorded.** T, its unit and the kind of evidence that fixed it are
   recorded in the payload of the order event that fixed it
   (`execution.order_events.payload` is `jsonb`).
@@ -355,8 +368,11 @@ milliseconds are ordered. Ties are never STALE and never NEWER.
     order in RECONCILING, so no run resumes the account.
 - **The hold resolves by venue time, or it halts** (`CX034-R1-01`):
   1. **Venue-timed terminal evidence arrives:** a `CANCELED` observation, or a
-     fill or `MATCHED` event that fixes or narrows a fill instant. Every open
-     hold on the order is compared again:
+     fill or `MATCHED` event that fixes or narrows a fill instant. It also
+     arrives when a read fixes the final size of a FILLED order whose
+     recorded fills then sum to it, since that makes C known from those
+     fills' venue instants (D1.3). Every open hold on the order is compared
+     again:
      - STALE closes it (`rule: "VENUE_TIME"`). When no other hold on the
        order remains open, the OMS supersedes its `ORDERING` request with an
        `ORDER_STATE` request for the same attempt, which the coordinator
@@ -381,12 +397,17 @@ milliseconds are ordered. Ties are never STALE and never NEWER.
        (`coordinator.ts` header, "Quiescence"). Once the answer is given, a
        hold that venue time has still not closed raises the halting conflict:
        "venue time could not order a LIVE-class observation of a terminal
-       order".
+       order". If that answer itself fixes the order's final size, the final
+       size is applied first. The holds are then compared again against the C
+       it makes known (item 1). Only a hold still open after that halts.
 - **The read never classifies STALE.** Round 0 let a terminal read close a
   hold as STALE ("READ_AFTER"). Then the same evidence (a cancel at 100 whose
   answer left T PENDING, and a `LIVE` at 200) cleared or halted according to
   which arrived first: the read, or the `CANCELED` frame. That rule is
-  withdrawn.
+  withdrawn. A read that fixes a FILLED order's final size does not break
+  this rule: it supplies no instant, and what it lets classify is ordered by
+  the fills' venue instants (D1.3). Whether the read or the horizon comes
+  first, the same fills give the same C.
 - **`orderingHorizonMs`** is configured, beside `quiescenceHorizonMs`. It must
   exceed how long a terminal frame can lag its cause. No venue fact bounds
   that lag (U-52). Its live value needs the same decision as
@@ -712,8 +733,11 @@ golden moves in this round.
 2. **Carried on the plan.**
    - `PlannedOrder` gains `timeInForce`, plus `expirationUnixSeconds` for GTD
      and `deadlineAt` for a deadline-bounded GTC.
-   - The `OrderTimeInForceBook` side table goes away. The simulator's
-     `ExecutionPolicy.timeInForceFor` reads the plan.
+   - The `OrderTimeInForceBook` side table goes away, with the trader
+     facade's re-export of it (`apps/trader/src/index.ts:303`); the README's
+     section on it (`apps/trader/README.md:177-191`) is updated. Both are in
+     R3's grant (`CX034-R3-02`). The simulator's `ExecutionPolicy.timeInForceFor`
+     reads the plan.
    - PAPER and live then read one value from one core.
 3. **Carried on the OMS ticket.**
    - `OrderTicket.timeInForce` is required, and nothing is inferred from the
@@ -858,10 +882,40 @@ second kind, and so is a GTC limited by the example's `order_validity_ms`.
     F-80). The order is terminal at the answer: FILLED if the answer's
     amounts complete it, otherwise CANCELED with its matched part.
   - A FOK `matched` is FILLED.
-  - For a collateral-targeted BUY, what the answer's amounts hold is U-51. The
-    OMS holds it terminal, with its final size unknown until the read.
+  - **A collateral-targeted BUY** (`R3-M1`; FAK or FOK) is **FILLED at its
+    `matched` answer**, with its final size unknown (`finalSize` null).
+    - Why FILLED. The venue ends the order at its answer: a FAK cancels any
+      unspent remainder, and a FOK spends its amount whole (A F-80). What the
+      answer's amounts hold is U-51, so the OMS cannot tell a full spend from
+      a partial one. Neither can a share count: such an order has no share
+      size to complete (D4.2).
+    - So, for such an order, FILLED means "matched, and ended by the venue".
+      It does not mean that `plannedShares` were bought. The shares bought
+      are its fills.
+    - The transition issues an `ORDER_STATE` reconciliation request at once,
+      so that a read fixes the final size.
+    - Its T under D1 is the FILLED row's C (D1.3). CANCELED was rejected for
+      such an order (Alternatives).
   - The final size is fixed only by an authoritative read. That is the salt
     gate's rule, unchanged.
+  - **A read's `MATCHED` is terminal for an immediate order** (`R3-M1`). Today
+    `presentState` maps a `MATCHED` read whose `size_matched` differs from
+    its `original_size` to PARTIALLY_FILLED, a live state
+    (`order-manager.ts:2999-3011`). For a FAK or FOK that is wrong: the order
+    never rests (A F-80), so the read describes a terminal order. For a FAK
+    or FOK, `MATCHED` with a positive `size_matched` therefore maps to a
+    terminal state:
+    - FILLED for a collateral-targeted BUY, whatever `size_matched` is
+      against `original_size`;
+    - otherwise FILLED when `size_matched` equals `original_size`, and
+      CANCELED with its matched part when it is smaller, since the remainder
+      was canceled (A F-80).
+
+    Otherwise every partial FAK, and every collateral BUY whose shares differ
+    from its signed share side, would meet "an order believed terminal is
+    open at the venue" (`order-manager.ts:2155-2160`), a halt. A `LIVE` or
+    `UNMATCHED` read of a FAK or FOK still halts, as the `live` answer bullet
+    below says.
 - **`delayed`:** DELAYED, as today. A delayed market can delay an immediate
   order (A F-80).
 - **`live` or `unmatched`:** these contradict "A market order never rests on
@@ -1048,9 +1102,18 @@ pUSD.
 - **Why 0.01.** The SDK floors a market BUY's amount to "Size decimals" (A
   F-101), and the documentation says "Round the price and input amount down …
   to the table's … Size decimals" (A F-99).
-- **Recorded.** The target is recorded on the planned order and on the OMS
-  ticket, and it is exactly the signed `makerAmount`. `plannedShares` stays
-  on the plan as the strategy's intended size.
+- **Recorded.** Three values are recorded on the planned order and on the
+  OMS ticket:
+  - the target, which is exactly the signed `makerAmount`;
+  - **the conversion price `q`**, `conversionPrice` (`R3-L1`). The OMS needs
+    it for D4.2's alert threshold, and cannot recover it from the target:
+    5 shares at a `q` of 0.340 or of 0.341 both give 1.70;
+  - **the signed share side**, `signedShares`: D2.4's `takerAmount` rule
+    applied to the target and the limit. The planner already computes it for
+    the minimum check (D2.3).
+
+  `plannedShares` stays on the plan, and in the ticket's `shares`, as the
+  strategy's intended size: the attributions sum to it.
 - **Only FAK and FOK entry BUYs convert.** GTC and GTD BUYs, and every SELL,
   target shares (F-63; A F-82). A BUY-to-close never converts: it is
   share-targeted (D4.3), and the planner refuses a FAK or FOK BUY-to-close
@@ -1073,8 +1136,11 @@ pUSD.
     shares reach the stationary-book bound `plannedShares + n × 10⁻⁶ ÷ q`
     (D4.1), at least one leg was below `q`. The OMS then raises a non-halting
     `ENTRY_SHARE_BOUND_EXCEEDED` alert, with a metric. The rounding excess
-    alone, below that bound, is a valid fill and raises nothing. PAPER runs
-    no OMS and raises no alert; the excess shows in its fills;
+    alone, below that bound, is a valid fill and raises nothing. `q` is the
+    ticket's `conversionPrice` (D4.1; `R3-L1`), and `n` counts the order's
+    distinct maker legs. The substitute `target ÷ plannedShares` is sound,
+    since it is at most `q`, but looser, so it is not used. PAPER runs no OMS
+    and raises no alert; the excess shows in its fills;
   - the strategy's caps count the actual position at once, rounding excess
     included, so the next entry is trimmed to the headroom or refused (D4.3);
   - the exit sells the actual position, floored to the grid (D4.3).
@@ -1086,6 +1152,47 @@ pUSD.
   order. Its fills exceed the signed `takerAmount` whenever the book asks
   less than the limit: "ExchangeV3 reduces a BUY's remaining collateral budget
   by the amount actually spent" (F-63).
+- **The order's share quantities, and how it ends** (`R3-M1`). Every share
+  rule of the OMS is listed here for such an order. Round 2 lifted only two
+  of them, and left two that halt a valid fill.
+
+  | Quantity or rule | For a collateral-targeted BUY |
+  | --- | --- |
+  | `shares` on the ticket | `plannedShares`. The attributions sum to it (`order-manager.ts:294-295`), as today |
+  | `originalShares` on the order (`:2434`), and on the attempt's facts (`:2055`) | the ticket's `signedShares`: the signed share side, which is what the read's `original_size` carries under A11. `#applyPresent`'s `original_size` check (`:2116`) and `matchesExactly` (`identity.ts:64-71`) compare it, unchanged in form. The OMS also checks at signing that the signed `takerAmount` equals it exactly, and the `makerAmount` the target (D2.4) |
+  | **Completion by share equality** (`#recordFill`, `:1268-1272`: FILLED, `finalSize = originalShares`) | **does not apply.** No fill makes such an order FILLED or fixes its final size, whatever its running total. It ends at its answer (D3.5) |
+  | "a fill beyond the order" (`#fillInconsistency`, `:2299`) | lifted (above) |
+  | "a fill beyond the confirmed final size" (`:2300`) | **kept, against a final size a read fixed.** For such an order that is the only kind, since no fill fixes one. The read that fixes it is made after the venue has ended the order: after its answer, or, in the lost-answer arm, once quiescent (below). Its `size_matched` counts every match (A11). A fill beyond it contradicts the venue, as for every order. Before a read, the spend guard below is the bound |
+  | `#applyPresent`'s "matched ≤ original" (`:2120`) | lifted (above). Its "matched ≥ the recorded fills" is kept |
+  | the read's state (`presentState`, `:2999-3011`) | `MATCHED` is terminal, FILLED (D3.5) |
+  | the final size | only from a read: `size_matched`, under A11 |
+  | `remainingShares` on each order event (`:2468`, `:2576`) | `max(0, originalShares − filledShares)`, since the fills may exceed the signed share side and the column is non-negative (`0005_execution.up.sql:411`). The event's payload also carries the collateral remaining, the target less `Σ eᵢ` |
+  | the reservation at the door (`#reservationProblem`, `:1481`: at least limit × shares) | at least the target. The fee bound is the planner's, on top (below) |
+  | `FillRecord.notional` (`:1257`, shares × price) | the fill's spend `Σ eᵢ`, the principal the ledger books (D4.5) |
+  | the group's `remaining` (`#saltGate`) | in collateral (below) |
+
+  - **The ticket door** refuses, with `OMS_INVALID_INPUT`, a
+    collateral-targeted ticket:
+    - whose target is not `floor₀.₀₁(shares × conversionPrice)`;
+    - whose `conversionPrice` is above its limit;
+    - or that lacks the target, the conversion price or the signed share
+      side.
+
+    The door has no tick size, so the signed share side is checked at signing,
+    against the signed `takerAmount`.
+  - **Example** (D4.7 item 4). `plannedShares` 50, a limit and a best ask of
+    0.34, so a target of 17.00 and a signed share side of 50.0000 (`17.00 ÷
+    0.34`, exactly). An ask of 0.33 × 50 appears after the snapshot. The fills
+    are 50 at 0.33 (a spend of 16.50) and then 1.470588 at 0.34
+    (`floor₆(0.49999992)` = 0.499999). The spend is 16.999999, within
+    17.00. After the first fill the running total equals `originalShares`.
+    Today that completes the order at 50, and the second fill is refused
+    `FILL_INCONSISTENT`, a halt. Under this rule the order stays open to
+    fills. The `matched` answer makes it FILLED. A read with `size_matched`
+    51.470588 fixes the final size. The fills sum to it, so the gate opens and
+    0.000001 plus the unused fee bound is released. With one maker leg per
+    fill, the bound is 50 + 2 × 10⁻⁶ ÷ 0.34 ≈ 50.0000059, so `ENTRY_SHARE_BOUND_EXCEEDED` is raised,
+    without a halt, and the 51.470588 shares are attributed to the intent.
 - **The collateral spent, per maker leg** (`CX034-R1-05`, `CX034-R2-03`).
   - F-63 floors each maker fill: `counterAmount = floor(makerAssetFill ×
     takerAmount / makerAmount)`. For a maker SELL that is the collateral it
@@ -1132,13 +1239,42 @@ pUSD.
        every consume succeeded. The remainder released is the reservation
        less the debits: 0.000001 in the example, plus any unused fee bound.
     6. **Reconcile** the order's shares as today: the read's `size_matched`
-       against the fills, under A11. No read carries the spend (A F-106), so
-       the spend is reconciled at the account. WP-290 compares the collateral
-       balance with its projection (`compareHolding`, `coordinator.ts:2172`).
-       A debit that differs from the venue's real spend, as an off-ratio
-       maker could cause, shows there as a collateral delta. The existing
-       holding-break rules handle it (`HOLDING_DELTA_UNCONFIRMED`, then
-       `BALANCE_UNATTRIBUTED`, `:2313`). Nothing adjusts it silently.
+       against the fills, under A11. No order read carries the spend (A
+       F-106), so the spend is reconciled at the account. WP-290 compares the
+       collateral balance A with the ledger's projection P, allowing for the
+       trades still in transit (`compareHolding`, `coordinator.ts:2172`;
+       defined at `packages/oms/src/reconciliation/holdings.ts:111-119`).
+       That comparison is exact, so **both of its
+       inputs carry the spend** (`R3-M2`, `CX034-R3-01`):
+       - **the projection P.** The ledger books the fill's principal at the
+         spend `Σ eᵢ`, never at shares × price (D4.5;
+         `packages/ledger/src/fill-posting.ts:254`, `:269`, `:275` today);
+       - **the pending delta.** `pendingDeltas`
+         (`holdings.ts:60-108`) prices a leg's collateral at shares × price
+         (`:83`). For a leg of an order the OMS tracks as a
+         collateral-targeted BUY, the coordinator passes the spend the OMS
+         recorded for that fill (by trade id and venue order id), and the
+         leg's collateral delta is minus that spend, plus the fee as today.
+         If the OMS recorded no fill for the leg (the fill was withheld for
+         want of legs, above), the leg's collateral delta is **not exact**.
+         The asset is then `IN_TRANSIT_AMBIGUOUS`, an account-scoped hold
+         (`coordinator.ts:2179-2184`), until the trade settles. Nothing is
+         estimated.
+
+       On the three-leg fill below, at zero fee and a balance of 1000: P is
+       982.500001, and the pending delta is −17.499999. Before settlement A
+       is 1000, so `d` = 17.499999 = −(the pending delta): `MATCH_IN_TRANSIT`.
+       After settlement A is 982.500001: `MATCH`. With the booking at shares
+       × price (17.5000014), the result after settlement is `UNEXPLAINED`
+       (`d` = 0.0000024), then `HOLDING_DELTA_UNCONFIRMED`. With only the
+       pending delta at shares × price, it is `IN_TRANSIT_AMBIGUOUS` before
+       settlement.
+
+       After settlement, a booked spend that differs from the venue's real
+       spend, as an off-ratio maker could cause, shows as a collateral delta.
+       The existing holding-break rules handle it
+       (`HOLDING_DELTA_UNCONFIRMED`, then `BALANCE_UNATTRIBUTED`, `:2313`).
+       **No balance tolerance is added.** Nothing adjusts a delta silently.
 - **A fill with no maker legs** (`NEW-L3`). The stream's `maker_orders` is
   optional, and the REST examples show an empty array (A F-106). Without legs,
   the OMS can neither compute nor bound a collateral-targeted BUY's spend:
@@ -1302,11 +1438,57 @@ pUSD.
 - `"COLLATERAL_AT_LIMIT_PRICE"` and `"SHARES_UNDOCUMENTED"` stay selectable,
   only to replay old runs.
 
-**D4.5 PAPER economics.**
-- Trader cash and the allocation debits use each fill's `collateralAmount`,
-  not price × shares (`V2-10` round-0 handoff, known risk 2).
-- The ledger's `FillFact` (`packages/ledger/src/allocation.ts:65`) gains the
-  pUSD leg. That is a contract change for its owner, WP-200's package.
+**D4.5 One principal, in PAPER and live** (`R3-M2`).
+- **The principal of a collateral-targeted BUY's fill is its spend.** Live,
+  that is `Σ eᵢ`, validated by D4.2's guard. In PAPER it is the simulator's
+  `collateralAmount`, F-63's per-level floor (`V2-10` round-0 handoff, known
+  risk 2). Both are at most price × shares, because every leg of one fill has
+  the fill's price (D4.2) and a floor never rounds up.
+- **Every site that prices a fill's principal uses it.** The sites were found
+  by `grep -rn 'mulDecimal('` over the non-test sources of `packages/oms`,
+  `packages/ledger`, `packages/pnl`, `packages/trading-core` and
+  `packages/simulation` at `3294201`, and each match was read:
+
+  | Site | Today | For such a fill |
+  | --- | --- | --- |
+  | `FillFact` (`packages/ledger/src/allocation.ts:65`) | shares and price | gains an optional `collateralAmount`, present only for such a fill: a contract change for its owner, WP-200's package |
+  | `buildFillPosting` (`packages/ledger/src/fill-posting.ts:254`, `:269`, `:275`) | `TRADE_PRINCIPAL` and each owner's cost at price × shares | `TRADE_PRINCIPAL` books `collateralAmount`, and so does the actual-account PnL record's cost. Each owner's cost is its claim's share of it (below) |
+  | `PnlTradeRecord` (`packages/pnl/src/records.ts:162`), and `applyTrade` (`packages/pnl/src/state.ts:574-590`) | cost = price × shares | the record carries an optional `notional`, the owner's booked cost, and `applyTrade` uses it when present. So the PnL cost basis equals the ledger's principal. A reversal unwinds the logged effect, unchanged |
+  | the OMS's `FillRecord.notional` and `#debitOf` (`order-manager.ts:1257`, `:2309`) | price × shares | the spend (D4.2) |
+  | `pendingDeltas` (`packages/oms/src/reconciliation/holdings.ts:83`) | price × shares | the spend the OMS recorded (D4.2 item 6) |
+  | trader cash, `cashAfter` (`packages/trading-core/src/loop.ts:5883-5887`) | price × shares, plus the fee | `collateralAmount`, plus the fee |
+  | `toFillFact` (`packages/simulation/src/fill-model.ts:517-545`) | no collateral | passes `collateralAmount` |
+
+- **Kept at price × shares, because it is conservative there:**
+  - the core's `CostBasisBook` (`packages/trading-core/src/allocation.ts:554`,
+    `:563`), the capital a held position consumes from the caps. It
+    over-counts by under 10⁻⁶ per maker leg, and it keeps its rule of no
+    division;
+  - `allocation.ts:862` and `:1078`, which price planned parts not yet
+    filled at the limit. That is at least the target.
+- **The owners' split.** The ledger never prorates by silent division
+  (`LEDGER_FEE_SPLIT_MISMATCH`, `allocation.ts:97-102`, `:298`), and the same
+  rule holds for this principal:
+  - with one owner, its cost is `collateralAmount`;
+  - with more than one, each `AllocationClaim` carries its `collateralAmount`
+    explicitly. They must sum exactly to the fill's, else the new refusal
+    `LEDGER_PRINCIPAL_SPLIT_MISMATCH`, beside the fee's (`packages/ledger/src/refusals.ts:122-127`);
+  - the caller computes them. Each owner but the last gets
+    `floor₆(spend × ownerShares ÷ fillShares)`. The last band takes the rest,
+    as it takes the share excess (D4.2), so no cost is negative. Example:
+    50.000004 shares, a spend of 17.499999, and bands of 30 and 20.000004
+    give 10.499998 and 7.000001.
+- **Missing economics fail closed.** A live fill without maker legs is never
+  recorded (D4.2), so nothing is booked for it. In PAPER every simulated fill
+  carries a canonical `collateralAmount`
+  (`packages/simulation/src/queue.ts:746-751` refuses one that is not). A
+  posting for such a fill without one is refused, never booked at price ×
+  shares.
+- **Out of scope:** a share-targeted taker BUY against an off-grid maker also
+  pays F-63's per-leg floor. Its m × p is not then exact in base units, so its
+  booking can differ from its spend by under 10⁻⁶ per leg. That exists today,
+  and fails closed as a holding break (D4.2 item 6). It is a follow-up, not
+  decided here.
 
 **D4.6 Golden and replay changes.** Each is regenerated with a recorded
 reason. The list assumes variant P of D4.1; under variant H, the FAK entries
@@ -1379,6 +1561,48 @@ STOPPED S1).
      `RESERVATION_SHORTFALL`, and, once a read fixes the final size, releases
      0.000001. One mutation row debits shares × price (17.5000014) instead,
      and fails it with the shortfall;
+   - **the same case, through reconciliation** (`R3-M2`, `CX034-R3-01`). The
+     fill is posted through `buildFillPosting`, and the ledger's principal is
+     17.499999. A WP-290 run with the trade `MATCHED` and a collateral
+     balance of 1000 judges the collateral `MATCH_IN_TRANSIT`. A run after
+     the trade is `CONFIRMED`, with a balance of 982.500001, judges it
+     `MATCH`. The token is `MATCH_IN_TRANSIT`, then `MATCH`. No holding
+     break is raised. Two mutation rows each fail it:
+     - the posting books shares × price: `UNEXPLAINED` after settlement;
+     - `pendingDeltas` prices the leg at shares × price:
+       `IN_TRANSIT_AMBIGUOUS` before settlement.
+
+     And a leg whose fill the OMS did not record is not exact, so the
+     collateral is `IN_TRANSIT_AMBIGUOUS` and the account holds;
+   - **fills that cross `plannedShares` part-way through** (`R3-M1`), D4.2's
+     example: 50 at 0.33, then 1.470588 at 0.34, against a target of 17.00
+     whose signed share side is 50.0000. Both fills are recorded. Neither
+     raises `FILL_INCONSISTENT`, and the order is not FILLED before its
+     answer. The `matched` answer makes it FILLED, with no final size, and
+     requests a read. A read whose `size_matched` is 51.470588 and whose
+     status is `MATCHED` fixes the final size. The gate opens, 0.000001 is
+     released, and `ENTRY_SHARE_BOUND_EXCEEDED` is raised without a halt.
+     Two mutation rows each fail it:
+     - keep the share-equality completion (`order-manager.ts:1268-1272`) for
+       such an order: the second fill halts;
+     - keep `presentState`'s PARTIALLY_FILLED for a `MATCHED` read of an
+       immediate order: the read halts with "an order believed terminal is
+       open at the venue";
+   - **a walk that never reaches `plannedShares`** (D4.6: 30 at 0.34, then
+     19.428571 at 0.35, 49.428571 in all): FILLED at the answer, the final
+     size 49.428571 from the read, and D1's T is the latest of its fills'
+     instants (D1.3);
+   - **a late `PLACEMENT` frame** for such an order (D1), against fills whose
+     `MATCHED` events were received. Stamped one millisecond before the last
+     of them, it is held until the read fixes the final size, and is then
+     STALE, with no halt. Stamped one millisecond after it, it halts. Both hold
+     whether the read answers an `ORDER_STATE` or the `ORDERING` request;
+   - **the ticket door:** a target that is not `floor₀.₀₁(shares ×
+     conversionPrice)`, or a `conversionPrice` above the limit, is refused
+     before any reservation. `ENTRY_SHARE_BOUND_EXCEEDED`'s threshold is
+     computed from the ticket's `conversionPrice` (`R3-L1`): with the
+     three-leg fill and a `conversionPrice` of 0.35, 50.000004 raises
+     nothing;
    - a `FillReport` without maker legs for such an order is refused, and the
      order's reservation stays held (`NEW-L3`);
    - the group's remaining is in collateral, and never trips the gate's
@@ -1410,6 +1634,17 @@ STOPPED S1).
    `allow_resolution_hold: false`, and counted by the caps.
 8. **The D4.6 goldens are regenerated,** and a determinism run, made twice,
    is byte-identical.
+9. **The principal** (`R3-M2`; D4.5), in `packages/ledger` and
+   `packages/pnl`:
+   - a collateral-targeted `FillFact` books `TRADE_PRINCIPAL` at its
+     `collateralAmount`, and its PnL records carry it as `notional`;
+   - the split: 10.499998 and 7.000001 for D4.5's example; a split that does
+     not sum exactly is refused `LEDGER_PRINCIPAL_SPLIT_MISMATCH`;
+   - a fact without `collateralAmount` books price × shares exactly as today,
+     and every existing ledger and PnL test passes unchanged;
+   - in PAPER, trader cash, the ledger's actual collateral line and the PnL
+     cost basis agree after D4.6's paper-e2e entry (19.428571 at 0.35 has a
+     `collateralAmount` of 6.799999, not 6.79999985).
 
 **D4 changes PAPER fills and exits.**
 
@@ -1425,7 +1660,7 @@ reconciliation and OMS fault suites; R2 and R3 share `packages/oms/**`,
 | --- | --- | --- | --- | --- | --- |
 | R1 `OMS-QTY` | D2 | `packages/execution-planner/**`, but not `src/probes/**` (WP-350's); `packages/oms/**`; `packages/polymarket-secure/src/venue-client.ts` and its tests; `packages/strategies/static-bracket/src/params.ts` and its tests; `test/unit/{execution-planner,oms,strategies}/**`; `test/contract/polymarket-secure/**`; `test/fault-injection/live/**`; `test/fault-injection/reconciliation/**`; and, test files only, `test/fault-injection/oms/**` and `test/fault-injection/live-safety/**`, which run on the OMS's shared test supports (`test/unit/oms/support/**`) whose signed amounts D2.4 checks | first | pre-live; a latent PAPER change, with no golden change | D2.6; all gates; the goldens byte-identical |
 | R2 `OMS-VENUE-TIME` | D1 | `packages/oms/**`, including `src/reconciliation/**`; `packages/polymarket-secure/src/user-stream/**`; `test/unit/oms/**`; `test/contract/user-stream/**`; `test/fault-injection/reconciliation/**`; `test/fault-injection/live/**`; `test/fault-injection/oms/**` (`crash-points.test.ts:148`'s observation gains a venue instant, D1.10 item 4; `NEW-M2`); `apps/ops-cli/src/emergency/**`, only where it builds the `ReconciliationPolicy` (the new `orderingHorizonMs`) and its tests; `docs/runbooks/reconciliation.md` (the policy table's new row); `docs/experiments/phase-3-verification.md` (§5's counts to 0, with a dated note) | after R1 is merged | pre-live only | D1.10; all gates |
-| R3 `TIF-COLLATERAL` | D3, then D4 | `packages/trading-core/**` (the bounded ADR-022 D10 grant of D3.6 and D4.5), its tests included; `packages/execution-planner/**`; `packages/oms/**`; `packages/polymarket-secure/**`; `packages/simulation/**`; `packages/strategies/static-bracket/**`; `packages/ledger/src/allocation.ts` (`FillFact`, with WP-200's owner); `packages/risk/**`, only if the incident needs a new cause; the matching `test/unit/**`, `test/contract/polymarket-secure/**`, `test/fault-injection/live/**`, `test/fault-injection/reconciliation/**`, `test/e2e/**` and `test/replay-golden/**`. **The fence** (`NEW-H1`; WP-320's paths, with its owner's consent): `apps/trader/src/live-safety/fenced-venue.ts`; `apps/trader/src/live-safety/live-safety.ts` and `index.ts`, only to carry the new member through `fenceVenue`'s types and the module's exports (D3.1 item 4); and the test files `test/fault-injection/live-safety/**` (`port-conformance.test.ts:73-80`), `test/fault-injection/oms/**` (`support/crash-harness.ts:125-130`) and `test/integration/postgres/fencing-race.test.ts` (its port literal at `:373-374`, type-checked by `packages/storage-postgres`'s `typecheck`, inside the root `typecheck`). From the rest of `apps/**`, **test files only:** `apps/backtest-cli/src/**/*.test.ts` (`backtest.test.ts`, `run-command.test.ts`) and `apps/trader/src/**/*.test.ts` (`loop-folds.test.ts` included) (`MEDIUM-4`). **Not** `db/migrations/**`, `packages/domain/**`, `packages/decimal/**`, or any other non-test `apps/**` file: if one must change, the round stops and reports it | after R2 is merged. D4 only after the user's ruling on Open item 10; D3 does not wait for it. D3 with D4: one round, or two rounds merged back to back before any PAPER run is cited as evidence | D3: pre-live, plumbing only for PAPER. **D4: changes PAPER fills and exits** | D3.7, D4.7 (for the ruled variant); each golden with a reason; all gates |
+| R3 `TIF-COLLATERAL` | D3, then D4 | `packages/trading-core/**` (the bounded ADR-022 D10 grant of D3.6 and D4.5), its tests included; `packages/execution-planner/**`; `packages/oms/**`; `packages/polymarket-secure/**`; `packages/simulation/**`; `packages/strategies/static-bracket/**`; `packages/ledger/src/allocation.ts` (`FillFact` and `AllocationClaim`), `packages/ledger/src/fill-posting.ts` (the principal, D4.5; `R3-M2`) and `packages/ledger/src/refusals.ts` (the new refusal), with their tests (`packages/ledger/src/*.test.ts`), and `packages/pnl/src/records.ts` and `packages/pnl/src/state.ts` (`notional`), with their tests (`packages/pnl/src/*.test.ts`), all with WP-200's owner; `packages/risk/**`, only if the incident needs a new cause; the matching `test/unit/**`, `test/contract/polymarket-secure/**`, `test/fault-injection/live/**`, `test/fault-injection/reconciliation/**`, `test/e2e/**` and `test/replay-golden/**`. **The fence** (`NEW-H1`; WP-320's paths, with its owner's consent): `apps/trader/src/live-safety/fenced-venue.ts`; `apps/trader/src/live-safety/live-safety.ts` and `index.ts`, only to carry the new member through `fenceVenue`'s types and the module's exports (D3.1 item 4); and the test files `test/fault-injection/live-safety/**` (`port-conformance.test.ts:73-80`), `test/fault-injection/oms/**` (`support/crash-harness.ts:125-130`) and `test/integration/postgres/fencing-race.test.ts` (its port literal at `:373-374`, type-checked by `packages/storage-postgres`'s `typecheck`, inside the root `typecheck`). **The removed side table** (`CX034-R3-02`): `apps/trader/src/index.ts`, only to remove the `OrderTimeInForceBook` re-export (`:303`), and `apps/trader/README.md`, only its section "The `immediate_order_type` question, resolved" (`:177-191`), which names the table and says that `PlannedOrder` carries no time-in-force. No compatibility export is kept: the class goes away (D3.1 item 2), and no test names it. From the rest of `apps/**`, **test files only:** `apps/backtest-cli/src/**/*.test.ts` (`backtest.test.ts`, `run-command.test.ts`) and `apps/trader/src/**/*.test.ts` (`loop-folds.test.ts` included) (`MEDIUM-4`); and `test/integration/paper-trader/**`, test files only, where they fold PAPER fills' PnL records by shares × price (`trader-health-endpoint-postgres.test.ts:217-236`), which D4.5 changes for a collateral-targeted BUY. **Not** `db/migrations/**`, `packages/domain/**`, `packages/decimal/**`, or any other non-test `apps/**` file: if one must change, the round stops and reports it | after R2 is merged. D4 only after the user's ruling on Open item 10; D3 does not wait for it. D3 with D4: one round, or two rounds merged back to back before any PAPER run is cited as evidence | D3: pre-live, plumbing only for PAPER. **D4: changes PAPER fills and exits** | D3.7, D4.7 (for the ruled variant); each golden with a reason; all gates |
 
 **How the test grants were found** (`NEW-H1`, `NEW-M2`). At `3294201`, `grep
 -rln` over every `*.ts` file listed each file that names a port the round
@@ -1435,6 +1670,13 @@ changes, or calls a method whose input it changes:
 - for R2, `applyOrderObservation`, `OrderObservation` and
   `quiescenceHorizonMs`;
 - for R1, the OMS's ticket and its test venues.
+
+Round 3 added two searches (`R3-M2`, `CX034-R3-02`), because a port search
+does not find a decision path or a removed name:
+- every symbol a round removes, over every file outside `node_modules` and
+  `.git`, including Markdown: for R3, `OrderTimeInForceBook`;
+- every site that prices a fill's principal: `grep -rn 'mulDecimal('` over
+  the non-test sources of the packages D4 touches (D4.5's table).
 
 Each match was read, to see whether it builds such a value or passes such an
 input. Every one that does lies inside its round's paths above. Files that
@@ -1467,7 +1709,9 @@ and reports it.
   - §3: a hold resolves only by venue evidence or an authoritative read.
     The horizon delays when a read may decide, and what it decides is only
     ever a halt.
-  - §5: refined for FAK and FOK (D3.5).
+  - §5: refined for FAK and FOK (D3.5). A collateral-targeted BUY is FILLED
+    at its `matched` answer, with its final size from a read; a read's
+    `MATCHED` is terminal for an immediate order.
   - §8: implemented by D3.4, with an explicit escalation.
   - §2 step 9: a retransmission keeps the order type (D3.1, item 5). An
     ABSENT FAK or FOK is never retransmitted (D4.2).
@@ -1478,6 +1722,9 @@ and reports it.
   releases it; it does not rely on a lapse. The submission fence judges a
   market order at signing and at every transmission, exactly as a limit
   order, and remembers its scope (D3.1 item 4; `NEW-H1`).
+- **ADR-006:** unchanged in its rules. A collateral-targeted BUY's principal
+  is booked at its spend, each transaction still balances per asset, and the
+  owners' split is explicit and machine-checked, like the fee's (D4.5).
 - **ADR-020:** every new port field is read as own data through the existing
   doors.
 - **ADR-022 D10:** D3's and D4's core hooks are a bounded grant (D3.6).
@@ -1580,8 +1827,12 @@ and reports it.
     contains the excess, but cannot prevent it. The money caps hold.
   - The OMS's spend of a collateral-targeted BUY is `Σ floor₆(mᵢ × pᵢ)`. It
     is exact for makers whose signed amounts equal their price, and an
-    inference for any other. A wrong spend surfaces as a collateral balance
-    break in reconciliation (D4.2).
+    inference for any other. The ledger books, and reconciliation expects,
+    that spend (D4.5), so a valid fill matches exactly, and a wrong spend
+    surfaces as a collateral balance break after settlement (D4.2).
+  - A collateral-targeted BUY is FILLED at its answer even when it spent
+    part of its target. Consumers read its fills, never `plannedShares`, for
+    what it bought (D3.5).
   - A12 (one clock and one rounding for every user-channel `timestamp`) is an
     assumption. If it is wrong, the cost is liveness (D1.7).
   - C-7 sets the `SUB_MINIMUM` threshold and the minimum check.
@@ -1679,6 +1930,22 @@ and reports it.
   `#debitOf`). It over-debits by up to the rounding excess, and halts a
   valid fill with `RESERVATION_SHORTFALL` (`CX034-R2-03`). Rejected for the
   per-leg spend (D4.2).
+- **Book and reconcile the principal at shares × price, and allow a small
+  tolerance in the holding comparison** (`R3-M2`). A valid fill would
+  otherwise break the exact comparison by under 10⁻⁶ per leg. Rejected: a
+  tolerance would also hide real differences of that size, and none is
+  needed when the booking and the pending delta carry the spend (D4.2 item
+  6, D4.5).
+- **Complete a collateral-targeted BUY when its fills reach `plannedShares`,
+  or its signed share side** (today's `#recordFill`). Such an order's fills
+  can cross either part-way through, and the next fill then halts (`R3-M1`).
+  Rejected: such an order ends at its answer (D3.5).
+- **End a collateral-targeted BUY CANCELED at its answer.** Its T would stay
+  PENDING until a `CANCELLATION` frame, which the venue may never emit for a
+  fully spent order (U-50, U-54). Every late frame would then halt at the
+  horizon. Rejected for FILLED with T = C, which is sound (D1.3).
+- **Recover `q` from the target, as `target ÷ plannedShares`** (`R3-L1`).
+  Sound but looser; rejected for carrying `q` on the ticket (D4.1).
 - **Exit the planned share count.** It leaves the extra shares behind, and is
   contrary to §6 invariant 10.
 - **Clamp every exit to the held inventory.** It sizes a complement leg's
@@ -1732,7 +1999,8 @@ and reports it.
 4. **A migration, before any PostgreSQL OMS store** (`CO3-N3`), for
    (`LOW-7`):
    - `execution.orders.time_in_force`, and the plan's time-in-force;
-   - the collateral target, on the plan and the order;
+   - the collateral target, its conversion price `q` and its signed share
+     side, on the plan and the order (D4.1; `R3-L1`);
    - D2.3's `unexecutableRemainder` and its reason, on the plan;
    - the intent-to-plan link's two quantities, requested and executable
      (`execution.intent_order_links` has one, `attributed_shares`);
@@ -1798,11 +2066,23 @@ and reports it.
     `~/pmb-rounds/`.
 - **Code, at `3294201`:**
   - `packages/oms/src/order-manager.ts:285-296, 320-323, 631-646,
-    1159-1168, 1243-1276, 2114-2181, 2217-2288, 2307-2339, 2346-2379, 2384,
-    2434, 2905-2909, 3028-3037, 3062-3075, 3674`;
+    1159-1168, 1243-1276, 1477-1489, 2055, 2114-2181, 2217-2288, 2292-2339,
+    2346-2379, 2384-2419, 2434, 2468, 2576, 2905-2909, 2978-3015, 3028-3037,
+    3062-3075, 3674`;
+  - `packages/oms/src/reconciliation/holdings.ts:1-119`;
+  - `packages/ledger/src/fill-posting.ts:221-275, 380-388`,
+    `allocation.ts:65-103, 298`, `refusals.ts:122-127`;
+  - `packages/pnl/src/records.ts:162`, `state.ts:574-600, 659-740`;
+  - `packages/trading-core/src/allocation.ts:512-565, 862, 1078`,
+    `loop.ts:5879-5887`;
+  - `packages/simulation/src/fill-model.ts:517-545`, `queue.ts:746-751`;
+  - `apps/trader/src/index.ts:303`, `apps/trader/README.md:177-191`;
+  - `test/integration/paper-trader/trader-health-endpoint-postgres.test.ts:217-236`;
+  - `db/migrations/0005_execution.up.sql:411` (`remaining_shares` is
+    non-negative);
   - `packages/oms/src/reconciliation/identity.ts:28-34, 64-71`;
   - `packages/oms/src/reconciliation/coordinator.ts:679-684, 1021-1044,
-    2172, 2313, 3334-3338`, and its header's "Quiescence";
+    2091-2184, 2313, 3334-3338`, and its header's "Quiescence";
   - `packages/oms/src/ports.ts:30-116, 343`;
   - `packages/oms/src/restricted-mode/venue-port.ts:60-90`;
   - `packages/oms/package.json:13` (`test:fault`); the root `package.json:18`
