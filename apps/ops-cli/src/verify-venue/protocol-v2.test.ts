@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  catalogueTokenIds,
   cursorLikeTokens,
   decodeFeedCursor,
   duplicateKeys,
@@ -22,11 +23,14 @@ import {
   isLabelledSyntheticText,
   loadCapture,
   marketReadConditionIds,
+  marketReadTokenIds,
   parseSourceIndex,
+  personalValueErrors,
   redactionSubjects,
   reportDefinesId,
   resolvePath,
   sidecarPathOf,
+  unexplainedHashRuns,
   validateCapture,
 } from "./captures.js";
 import type {
@@ -54,6 +58,7 @@ import {
 } from "./fixtures.js";
 import type { FixtureFile } from "./fixtures.js";
 import {
+  captureContextOf,
   claimedFixturePaths,
   fixtureCoverage,
   formatVenueVerificationReport,
@@ -66,14 +71,15 @@ import {
 const V2_REPORT = readFileSync(join(REPO_ROOT, PROTOCOL_V2_REPORT_PATH), "utf8");
 const V2_SOURCE_INDEX = reportSectionText(V2_REPORT, "14") ?? "";
 
-/** The context the gate passes (`index.ts` `runVenueVerification`). */
-const CONTEXT: CaptureContext = {
-  report: PROTOCOL_V2_REPORT_PATH,
-  reportContent: V2_REPORT,
-  sourceIndex: parseSourceIndex(V2_SOURCE_INDEX),
-  publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
-  marketConditionIds: marketReadConditionIds(V2_SOURCE_INDEX),
-};
+/**
+ * The context the gate passes (`index.ts` `runVenueVerification`, through
+ * `captureContextOf`, round 3: the report-anchored token ids included).
+ */
+const CONTEXT: CaptureContext = captureContextOf(
+  PROTOCOL_V2_REPORT_PATH,
+  V2_REPORT,
+  PROTOCOL_V2_CAPTURES,
+);
 
 function checkById(id: string): VenueCheck {
   const check = VENUE_CHECKS.find((candidate) => candidate.id === id);
@@ -1196,12 +1202,12 @@ describe("V2-9 r2: every value on a trade or activity URL has its documented typ
     expect(sentinels.errors).toEqual([]);
   });
 
-  it("MUTANT: a condition that no market read and no row carries is refused; a known or labelled synthetic one is not", () => {
+  it("MUTANT: a condition that no market read carries is refused; a known or labelled synthetic one is not", () => {
     const unknown = validateEdited("data-v2-trades-v2-empty.jsonc", undefined, (sidecar) => {
       sidecar["url"] = (sidecar["url"] as string).replace(CANARY_CONDITION, PROBE_HASH);
     });
     expect(unknown.errors.filter((error) => error.startsWith("sidecar url"))).toEqual([
-      "sidecar url condition: the value is not condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, one a row carries as condition_id, or a labelled synthetic value (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL",
+      "sidecar url condition: the value is not condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, or a labelled synthetic value (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL",
     ]);
     const listed = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
       sidecar["url"] = (sidecar["url"] as string).replace("&limit=2", `,${PROBE_HASH}&limit=2`);
@@ -1214,11 +1220,16 @@ describe("V2-9 r2: every value on a trade or activity URL has its documented typ
       marketConditionIds: [],
     });
     expect(hasError(noMarketRead, typeError("condition"))).toBe(true);
-    // A page-1 condition its rows carry passes with no market read.
-    expect(
-      validateEdited("data-v2-trades-v1-page1.jsonc", undefined, undefined, { ...CONTEXT, marketConditionIds: [] })
-        .errors,
-    ).toEqual([]);
+    // Round 3 (V2-9-R3-02): a row no longer corroborates its own page. With
+    // no market read in the context, page 1's condition is refused on the URL
+    // and in each row, although the rows carry it.
+    const rowsOnly = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, undefined, {
+      ...CONTEXT,
+      marketConditionIds: [],
+    });
+    expect(hasError(rowsOnly, typeError("condition"))).toBe(true);
+    expect(hasError(rowsOnly, "$.data[0].condition_id: not a condition id")).toBe(true);
+    expect(hasError(rowsOnly, "$.data[1].condition_id: not a condition id")).toBe(true);
     const known = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
       sidecar["url"] = (sidecar["url"] as string).replace("&limit=2", `,${CANARY_CONDITION},0x${"0".repeat(61)}abc&limit=2`);
     });
@@ -1278,6 +1289,314 @@ function setPath(root: unknown, path: string, value: unknown): unknown {
   current[segments.at(-1) as string | number] = value;
   return clone;
 }
+
+/** The address refusal (rule 5), for one place. */
+function addressError(where: string): string {
+  return `${where}: a 0x 40-hex address that is neither a labelled synthetic value (0x00…) nor a documented public contract address; it may be a wallet`;
+}
+
+/** The long-id prose refusal (rule 5), for one place. */
+function longIdError(where: string): string {
+  return `${where}: a hex id, hash or number of 40 or more digits that is not a labelled synthetic value and that neither the capture nor the URL carries; name it by placeholder (<V1 window>)`;
+}
+
+/** A feed field's type refusal (round 3). */
+function fieldTypeError(where: string, description: string): string {
+  return `${where}: not ${description} (S-O06 types the field so)`;
+}
+
+/** The probe hash written as a decimal uint256 (as a token id is). */
+const PROBE_HASH_DECIMAL = BigInt(PROBE_HASH).toString(10);
+
+/** Page 1's condition, which the report reads as a market (S-L10, S-A05). */
+const V1_CONDITION = "0xcd5f9f505e0c0182746aa65963f72f01e7463259e5ea9f56672c0fe3a37f348a";
+
+/** The canary's Up token, which the report reads (the book read S-L03; S-L01's CLOB market capture). */
+const CANARY_UP_TOKEN = "663574927012476832975694178961957910328055987427402067619466963999000625152";
+
+describe("V2-9 r3: every feed field has its S-O06 type, and no feed string hides a cursor (V2-9-R3-01)", () => {
+  it("MUTANT (verifier probe): a seek anchor under pagination.limit is refused", () => {
+    const result = validateEdited(
+      "data-v2-trades-v1-page2.jsonc",
+      editJson((body) => {
+        (body["pagination"] as Record<string, unknown>)["limit"] = SYNTHETIC_SEEK_ANCHOR_CURSOR;
+      }),
+    );
+    expect(result.errors).toEqual([
+      fieldTypeError("$.pagination.limit", "a non-negative integer (int32)"),
+      "$.pagination.limit: a token decodes to a venue cursor (S-O06)",
+    ]);
+  });
+
+  it("MUTANT (verifier probe): a 64-hex hash under data[0].size is refused", () => {
+    const result = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["size"] = PROBE_HASH;
+      }),
+    );
+    expect(result.errors).toEqual([fieldTypeError("$.data[0].size", "a number (double)")]);
+  });
+
+  it("MUTANT: each row and pagination field refuses a value of another type", () => {
+    const cases: readonly (readonly [string, (body: Record<string, unknown>) => void, string])[] = [
+      ["timestamp", (body) => (firstRow(body)["timestamp"] = "1700000003"), fieldTypeError("$.data[0].timestamp", "a non-negative integer (int64, epoch seconds)")],
+      ["timestamp", (body) => (firstRow(body)["timestamp"] = 1700000003.5), fieldTypeError("$.data[0].timestamp", "a non-negative integer (int64, epoch seconds)")],
+      ["outcome_index", (body) => (firstRow(body)["outcome_index"] = -1), fieldTypeError("$.data[0].outcome_index", "a non-negative integer (int32)")],
+      ["price", (body) => (firstRow(body)["price"] = "0.95"), fieldTypeError("$.data[0].price", "a number (double)")],
+      ["usdc_size", (body) => (firstRow(body)["usdc_size"] = true), fieldTypeError("$.data[0].usdc_size", "a number (double)")],
+      ["is_combo", (body) => (firstRow(body)["is_combo"] = "true"), fieldTypeError("$.data[0].is_combo", "a boolean")],
+      ["side", (body) => (firstRow(body)["side"] = "buy"), fieldTypeError("$.data[0].side", "BUY, SELL, IN, OUT or empty")],
+      ["type", (body) => (firstRow(body)["type"] = "ABCDEFAB".repeat(8)), fieldTypeError("$.data[0].type", "an activity type (TRADE, SPLIT, MERGE, REDEEM, REWARD, CONVERSION, TIP)")],
+      ["name", (body) => (firstRow(body)["name"] = 7), fieldTypeError("$.data[0].name", "a string")],
+      ["has_more", (body) => ((body["pagination"] as Record<string, unknown>)["has_more"] = "true"), fieldTypeError("$.pagination.has_more", "a boolean")],
+      ["offset", (body) => ((body["pagination"] as Record<string, unknown>)["offset"] = -2), fieldTypeError("$.pagination.offset", "a non-negative integer (int32)")],
+      ["next_cursor", (body) => ((body["pagination"] as Record<string, unknown>)["next_cursor"] = 5), fieldTypeError("$.pagination.next_cursor", "a string or null")],
+    ];
+    for (const [field, mutate, expected] of cases) {
+      const result = validateEdited("data-v2-trades-v1-page1.jsonc", editJson(mutate));
+      expect(result.errors, field).toContain(expected);
+    }
+    const noPagination = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        delete body["pagination"];
+      }),
+    );
+    expect(hasError(noPagination, "$.pagination: a trade or activity page carries its pagination object (S-O06: required)")).toBe(true);
+  });
+
+  it("MUTANT: a hash in a free-text field, glued or full width, or a 20-digit number in the bytes, is refused", () => {
+    const text = (where: string): string =>
+      fieldTypeError(
+        where,
+        "a string with no hash-shaped run (0x and 20 or more hex digits, or 20 or more bare hex or decimal digits) other than a labelled synthetic value or a market id the report read",
+      );
+    const fullWidthHash = [...PROBE_HASH].map((char) => String.fromCharCode(char.charCodeAt(0) + 0xfee0)).join("");
+    const cases: readonly (readonly [string, string, string])[] = [
+      ["title", `Bitcoin Up or Down ${PROBE_HASH}`, text("$.data[0].title")],
+      ["slug", `btc-updown-15m-tx${PROBE_HASH.slice(2)}`, text("$.data[0].slug")],
+      ["event_slug", `btc-${PROBE_HASH_DECIMAL}`, text("$.data[0].event_slug")],
+      ["icon", `https://polymarket-upload.s3.us-east-2.amazonaws.com/${PROBE_HASH}.png`, text("$.data[0].icon")],
+      ["outcome", fullWidthHash, text("$.data[0].outcome")],
+      ["title", `short ${"ab".repeat(10)}`, text("$.data[0].title")],
+    ];
+    for (const [field, value, expected] of cases) {
+      const result = validateEdited(
+        "data-v2-trades-v1-page1.jsonc",
+        editJson((body) => {
+          firstRow(body)[field] = value;
+        }),
+      );
+      expect(result.errors, `${field} ${value}`).toEqual([expected]);
+    }
+    const number = validateEdited("data-v2-trades-v1-page1.jsonc", (raw) =>
+      raw.replace('"size":10,', '"size":123456789012345678901234,'),
+    );
+    expect(number.errors).toEqual([
+      "bytes: a hash-shaped run (20 or more hex or decimal digits) outside every string or behind an escape, which no S-O06 field type admits",
+    ]);
+  });
+
+  it("documented values of every type pass, and the committed pages carry only corroborated market ids", () => {
+    const activity = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        const row = firstRow(body);
+        row["type"] = "REDEEM";
+        row["side"] = "";
+        row["is_combo"] = false;
+        row["usdc_size"] = 1.5;
+        row["outcome_index"] = 999;
+        row["token_id"] = CANARY_UP_TOKEN;
+        // 19 digits: below the 20-digit hash-shaped run.
+        row["title"] = "Will 1234567890123456789 shares trade?";
+      }),
+    );
+    expect(activity.errors).toEqual([]);
+    for (const name of ["data-v2-trades-v1-page1.jsonc", "data-v2-trades-v1-page2.jsonc", "data-v2-trades-v2-empty.jsonc"]) {
+      expect(validateEdited(name).errors, name).toEqual([]);
+    }
+    expect(unexplainedHashRuns(`synthetic 0x${"0".repeat(60)}0101 and ${V1_CONDITION}`, {
+      conditionIds: new Set([V1_CONDITION]),
+      tokenIds: new Set(),
+    })).toEqual([]);
+  });
+});
+
+describe("V2-9 r3: no unexplained hash on a trade URL; market ids corroborated by the report alone (V2-9-R3-02)", () => {
+  it("MUTANT (verifier probe): a hash written in capitals under type is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&type=${"ABCDEFAB".repeat(8)}`;
+    });
+    expect(result.errors).toEqual([
+      "sidecar url type: the value is not activity types S-O06 names (TRADE, SPLIT, MERGE, REDEEM, REWARD, CONVERSION, TIP; at most 20, comma-separated) (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL",
+    ]);
+    const unnamed = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&type=TRADE,DEADBEEF`;
+    });
+    expect(hasError(unnamed, typeError("type"))).toBe(true);
+  });
+
+  it("MUTANT (verifier probe): one invented hash as both the rows' condition_id and the URL's condition is refused", () => {
+    const result = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      (raw) => raw.split(V1_CONDITION).join(PROBE_HASH),
+      (sidecar) => {
+        sidecar["url"] = (sidecar["url"] as string).replace(V1_CONDITION, PROBE_HASH);
+      },
+    );
+    const conditionError = (where: string): string =>
+      fieldTypeError(
+        where,
+        "a condition id (0x and 62 or 64 lowercase hex digits) that the report's source index read as a market, or a labelled synthetic one",
+      );
+    expect(result.errors).toEqual([
+      conditionError("$.data[0].condition_id"),
+      conditionError("$.data[1].condition_id"),
+      "sidecar url condition: the value is not condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, or a labelled synthetic value (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL",
+    ]);
+  });
+
+  it("MUTANT: a token id the report did not read is refused; an anchored or labelled synthetic one is not", () => {
+    const tokenError = (where: string): string =>
+      fieldTypeError(where, "a token id (a decimal uint256) that the report read as a market, or a labelled synthetic value");
+    const invented = validateEdited(
+      "data-v2-trades-v1-page2.jsonc",
+      editJson((body) => {
+        firstRow(body)["token_id"] = PROBE_HASH_DECIMAL;
+      }),
+    );
+    expect(invented.errors).toEqual([tokenError("$.data[0].token_id")]);
+    const hex = validateEdited(
+      "data-v2-trades-v1-page2.jsonc",
+      editJson((body) => {
+        firstRow(body)["token_id"] = PROBE_HASH;
+      }),
+    );
+    expect(hex.errors).toEqual([tokenError("$.data[0].token_id")]);
+    // Without the report's market reads, the committed page's tokens are refused.
+    const noReads = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, undefined, {
+      ...CONTEXT,
+      marketTokenIds: [],
+    });
+    expect(noReads.errors).toEqual([tokenError("$.data[0].token_id"), tokenError("$.data[1].token_id")]);
+    const synthetic = validateEdited(
+      "data-v2-trades-v1-page2.jsonc",
+      editJson((body) => {
+        firstRow(body)["token_id"] = "synthetic-token-p2-r1";
+      }),
+    );
+    expect(synthetic.errors).toEqual([]);
+  });
+
+  it("the token ids come from the source index and from report-anchored CLOB market captures only", () => {
+    const pageOneToken = "25070934348813416902477876984955073880416401960631253331845590271167412497744";
+    // The report's book and price-history reads: the canary's Up token and page 1's.
+    expect(marketReadTokenIds(V2_SOURCE_INDEX)).toEqual([CANARY_UP_TOKEN, pageOneToken]);
+    expect(
+      marketReadTokenIds(
+        [
+          `| S-X01 | \`https://data-api.polymarket.com/v2/trades?token_id=${PROBE_HASH_DECIMAL}\` | 00:00:01Z | 200 | 1 | \`${"a".repeat(64)}\` |  |`,
+          `| S-X02 | \`https://clob.polymarket.com/book?token_id=12345…\` | 00:00:02Z | 200 | 1 | \`${"b".repeat(64)}\` |  |`,
+          `| S-X03 | \`https://clob.polymarket.com/book?token_id=${CANARY_UP_TOKEN}\` | 00:00:03Z | 200 | 1 | \`${"c".repeat(64)}\` |  |`,
+        ].join("\n"),
+      ),
+    ).toEqual([CANARY_UP_TOKEN]);
+    const anchored = validateEdited("clob-markets-v1.jsonc");
+    expect(anchored.ok).toBe(true);
+    expect(catalogueTokenIds([anchored])).toEqual([
+      pageOneToken,
+      "111614563957165270026378011809694313565736745512637881727398424401624030147043",
+    ]);
+    // An edited market capture no longer matches the report's digest, fails,
+    // and lends no token.
+    const edited = validateEdited(
+      "clob-markets-v1.jsonc",
+      (raw) => raw.replace('"o":"Down"}]', `"o":"Down"},{"t":"${PROBE_HASH_DECIMAL}","o":"X"}]`),
+    );
+    expect(edited.ok).toBe(false);
+    expect(catalogueTokenIds([edited])).toEqual([]);
+    // A feed capture lends none, though it passes.
+    expect(catalogueTokenIds([validateEdited("data-v2-trades-v1-page1.jsonc")])).toEqual([]);
+    expect(CONTEXT.marketTokenIds).toContain("111614563957165270026378011809694313565736745512637881727398424401624030147043");
+  });
+
+  it("MUTANT: a repeated query parameter is refused", () => {
+    const limit = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&limit=3`;
+    });
+    expect(limit.errors).toEqual([
+      "sidecar url limit: occurs 2 times; a trade or activity URL carries each parameter once",
+    ]);
+    const type = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&type=TRADE&type=TIP`;
+    });
+    expect(type.errors).toEqual([
+      "sidecar url type: occurs 2 times; a trade or activity URL carries each parameter once",
+    ]);
+  });
+});
+
+describe("V2-9 r3: a label glued to an address, a hash or a personal key does not hide it (V2-9-R3-03)", () => {
+  it("MUTANT (verifier probe): 'Retained wallet_0x…' in a trade sidecar's notes is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Retained wallet_0x${"1a".repeat(20)}`;
+    });
+    expect(result.errors).toEqual([addressError("sidecar.notes")]);
+  });
+
+  it("MUTANT: an address glued to any label, in a sidecar or a capture, is refused", () => {
+    for (const glued of [`wallet0x${"1a".repeat(20)}`, `maker-0X${"1A".repeat(20)}`, `id_${PROBE_WALLET}`, `${"9".repeat(3)}0x${"1a".repeat(20)}`]) {
+      expect(personalValueErrors(glued, "probe"), glued).toEqual([addressError("probe")]);
+      const redaction = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+        (sidecar["redactions"] as string[]).push(`url: the original was ${glued}`);
+      });
+      expect(redaction.errors, glued).toEqual([addressError("sidecar.redactions[9]")]);
+    }
+    const capture = validateEdited(
+      "data-v2-resolutions-v2-active.jsonc",
+      editJson((body) => {
+        firstRow(body)["note"] = `maker_${PROBE_WALLET}`;
+      }),
+      asRedacted,
+    );
+    expect(capture.errors).toContain(addressError("$.data[0].note"));
+  });
+
+  it("MUTANT: a hash glued to a label in sidecar prose is refused", () => {
+    for (const glued of [`tx_hash_${PROBE_HASH}`, `hash${PROBE_HASH}`, `id-${PROBE_HASH.slice(2)}`]) {
+      const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+        sidecar["notes"] = `${sidecar["notes"] as string} Original ${glued}`;
+      });
+      expect(result.errors, glued).toEqual([longIdError("sidecar.notes")]);
+    }
+  });
+
+  it("MUTANT: a personal key glued to a label by _ or - is read with its value", () => {
+    for (const [glued, key] of [
+      ["the_name: Jane", "name"],
+      ["x-wallet=abc", "wallet"],
+      ["maker_address: somewhere", "address"],
+    ] as const) {
+      const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+        sidecar["notes"] = `${sidecar["notes"] as string} ${glued}`;
+      });
+      expect(result.errors, glued).toEqual([
+        `sidecar.notes: ${key} is written with a value that is not a labelled synthetic value, a <placeholder> or empty`,
+      ]);
+    }
+  });
+
+  it("a longer id, a synthetic address, and a key inside a word are not taken for an address or a field", () => {
+    expect(personalValueErrors(`0x${"1a".repeat(32)}`, "probe")).toEqual([]);
+    expect(personalValueErrors(`wallet_0x${"0".repeat(36)}0101`, "probe")).toEqual([]);
+    const prose = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} The filename: page1.jsonc; the rename: none; condition_${V1_CONDITION}.`;
+    });
+    expect(prose.errors).toEqual([]);
+  });
+});
 
 describe("V2-9 pins: each capture's pinned V2 facts", () => {
   for (const spec of PROTOCOL_V2_CAPTURES) {
@@ -1616,5 +1935,27 @@ describe("V2-9 parent fixture rules: the dated, scoped exception", () => {
       expect(readme, statement).toContain(statement);
     }
     expect(fixtureText("protocol-v2/README.md")).toContain("round 2 added a\n    cursor in any written form");
+  });
+
+  it("round 3: the exception states the typed page, the report's market ids, glued labels, and no longer overstates the URL rule (V2-9-R3-01..03)", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "**Each field has the type S-O06 declares** (round 3,\n  `FEED_ROW_FIELD_TYPES`)",
+      "**Market ids the report read** (round 3)",
+      "a row does not\n  vouch for itself",
+      "a number of 20 or more digits is refused",
+      "pagination value (round 3)",
+      "`type` the activity types S-O06 names (round 3: a closed list",
+      "and each parameter once\n  (round 3)",
+      "A label glued to the address\n  (`wallet_0x…`, `maker0x…`) does not hide it (round 3)",
+      "`the_name: …`, round 3",
+      "a hash split into runs of fewer than\n  20 digits",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    // Round 2's unqualified claim, and the row-vouched condition, are gone.
+    expect(readme).not.toContain("So no hash rides on the URL.");
+    expect(readme).not.toContain("that a row carries as\n  `condition_id`");
+    expect(fixtureText("protocol-v2/README.md")).toContain("round 3 added the S-O06 type of every field of a trade page");
   });
 });

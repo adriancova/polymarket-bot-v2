@@ -329,9 +329,10 @@ const SOURCE_INDEX_URL_RE = /^\| (S-[A-Z]+\d+) \| `([^`]*)` \|/gm;
  * `0x` 62- or 64-hex token in the URL of a row that is not a trade or
  * activity feed read (`/clob-markets/<id>`, `/v2/resolutions?condition=`,
  * `/v2/oi?condition=`, Gamma `condition_ids=`). A feed URL's `condition`
- * value must be one of these, a labelled synthetic value, or a row's
- * `condition_id` (V2-9 round 2): so a hash of another kind, a transaction
- * hash for example, cannot ride on the URL as a condition. Lowercased.
+ * value and a feed row's `condition_id` must be one of these or a labelled
+ * synthetic value (V2-9 rounds 2 and 3; a feed row no longer corroborates
+ * itself): so a hash of another kind, a transaction hash for example, cannot
+ * pose as a condition. Lowercased.
  */
 export function marketReadConditionIds(sectionText: string): readonly string[] {
   const ids = new Set<string>();
@@ -345,6 +346,67 @@ export function marketReadConditionIds(sectionText: string): readonly string[] {
     }
   }
   return [...ids];
+}
+
+/**
+ * The token ids the report's source index (§14) read as a market: every
+ * whole decimal `token_id=` value in the URL of a row that is not a trade or
+ * activity feed read (`/book?token_id=`, `/v2/prices-history?token_id=`). A
+ * value the index truncates (`…`) is not taken. With the tokens of the
+ * report's CLOB market reads (`catalogueTokenIds`), a feed row's `token_id`
+ * must be one of these or labelled synthetic (V2-9 round 3).
+ */
+export function marketReadTokenIds(sectionText: string): readonly string[] {
+  const ids = new Set<string>();
+  for (const match of sectionText.matchAll(SOURCE_INDEX_URL_RE)) {
+    const url = match[2] ?? "";
+    if (FEED_ROUTE_RE.test(url)) {
+      continue;
+    }
+    for (const [, token] of url.matchAll(/[?&]token_id=([0-9]{1,78})(?=[&#]|$)/g)) {
+      if (token !== undefined) {
+        ids.add(token);
+      }
+    }
+  }
+  return [...ids];
+}
+
+/** A CLOB market read: `https://clob.polymarket.com/clob-markets/<condition>`. */
+const CLOB_MARKET_URL_RE = /^https:\/\/clob\.polymarket\.com\/clob-markets\/(0x[0-9a-f]{62}(?:[0-9a-f]{2})?)$/;
+
+/**
+ * The token ids of one validated capture that the report anchors (V2-9
+ * round 3): a CLOB market read (`/clob-markets/<condition>`, a condition the
+ * source index read) kept as a `live-capture`, whose bytes are the raw
+ * response, whose digest is the one the report's source index records. Its
+ * tokens (`t[].t`, the compact market shape) are then the report's own.
+ * Anything else contributes none.
+ */
+function anchoredMarketTokenIds(
+  sidecar: CaptureSidecar,
+  view: unknown,
+  conditionIds: ReadonlySet<string>,
+): readonly string[] {
+  const condition = CLOB_MARKET_URL_RE.exec(sidecar.url)?.[1];
+  if (sidecar.kind !== "live-capture" || condition === undefined || !conditionIds.has(condition)) {
+    return [];
+  }
+  const tokens = isRecord(view) ? view["t"] : undefined;
+  if (!Array.isArray(tokens)) {
+    return [];
+  }
+  return tokens
+    .map((token: unknown) => (isRecord(token) ? token["t"] : undefined))
+    .filter((token): token is string => typeof token === "string" && TOKEN_ID_RE.test(token));
+}
+
+/**
+ * The token ids a check's validated captures carry as report-anchored CLOB
+ * market reads (`CaptureValidationResult.marketTokenIds`).
+ */
+export function catalogueTokenIds(results: readonly CaptureValidationResult[]): readonly string[] {
+  return [...new Set(results.flatMap((result) => result.marketTokenIds ?? []))];
 }
 
 function escapeRegExp(text: string): string {
@@ -530,16 +592,25 @@ export function redactionSubjects(redaction: string): readonly string[] {
 /** An email address, anywhere in a string. */
 const EMAIL_RE = /[\w.%+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}/;
 
-/** A `0x` 40-hex token (an address), not part of a longer hex run. */
-const ADDRESS_TOKEN_RE = /(?<![0-9A-Za-z_])0[xX][0-9a-fA-F]{40}(?![0-9a-fA-F])/g;
+/**
+ * A `0x` 40-hex token (an address), not the prefix of a longer hex run (the
+ * lookahead). Round 3 (V2-9-R3-03): nothing is required before the `0x`, so
+ * a label glued to it (`wallet_0x…`, `retained0x…`) does not hide the
+ * address. No longer identifier ends in an address literal: `x` is not a hex
+ * digit, so a `0x` never sits inside a hex run.
+ */
+const ADDRESS_TOKEN_RE = /0[xX][0-9a-fA-F]{40}(?![0-9a-fA-F])/g;
 
 /**
  * A long id in prose: `0x` and more than 40 hex digits (an id or a hash), or
  * 40 or more bare hex or decimal digits (an unprefixed address or hash, a
- * position id).
+ * position id). Round 3 (V2-9-R3-03): a glued label (`hash_0x…`, `id…`) does
+ * not hide it. A match is leftmost and greedy, so it takes a whole hex run;
+ * the bare form is not read after a `0x`, which leaves an address (`0x` and
+ * exactly 40 hex digits) to `ADDRESS_TOKEN_RE`.
  */
 const LONG_ID_TOKEN_RE =
-  /(?<![0-9A-Za-z_])(?:0[xX][0-9a-fA-F]{41,}|[0-9a-fA-F]{40,})(?![0-9a-fA-F])/g;
+  /(?:0[xX][0-9a-fA-F]{41,}|(?<!0[xX])[0-9a-fA-F]{40,})(?![0-9a-fA-F])/g;
 
 /** A key compared without case or separators. */
 function normalizedKey(key: string): string {
@@ -713,10 +784,12 @@ function personalScanTarget(view: unknown, format: CaptureSpec["format"]): unkno
 /**
  * Personal keys written with a value in sidecar text: `name: v`, `name=v`,
  * `"name":"v"` (case-insensitive, `_` or `-` optional). Group 1 is the key,
- * group 2 the value token.
+ * group 2 the value token. Round 3 (V2-9-R3-03): a key glued to a label by
+ * `_` or `-` (`x_wallet=`, `the-name:`) is still read; only a letter or a
+ * digit before it (`filename:`) makes it part of another word.
  */
 const PERSONAL_ASSIGNMENT_RE = new RegExp(
-  `(?<![\\w-])(proxy[_-]?wallet|wallet|x[_-]?user[_-]?name|user[_-]?name|display[_-]?name|screen[_-]?name|handle|user|address|name|pseudonym|bio|profile[_-]?image(?:[_-]?optimized)?|e-?mail|transaction[_-]?hash|tx[_-]?hash)["']?\\s*[:=]\\s*("(?:[^"\\\\]|\\\\.)*"|'[^']*'|[^\\s,;)\\]}&#]*)`,
+  `(?<![A-Za-z0-9])(proxy[_-]?wallet|wallet|x[_-]?user[_-]?name|user[_-]?name|display[_-]?name|screen[_-]?name|handle|user|address|name|pseudonym|bio|profile[_-]?image(?:[_-]?optimized)?|e-?mail|transaction[_-]?hash|tx[_-]?hash)["']?\\s*[:=]\\s*("(?:[^"\\\\]|\\\\.)*"|'[^']*'|[^\\s,;)\\]}&#]*)`,
   "gi",
 );
 
@@ -950,14 +1023,14 @@ export function isFeedCapture(url: string, view: unknown): boolean {
 /**
  * The fields a trade or activity row may carry: S-O06
  * `components.schemas.Trade` and `components.schemas.Activity` (the Data API
- * v2 OpenAPI, report §14), every one a scalar. Their personal fields
- * (`proxy_wallet`, `name`, `pseudonym`, `bio`, `profile_image`,
- * `profile_image_optimized`, `transaction_hash`) must hold labelled synthetic
- * values (rules 5 and 6). A field outside this list is refused: it may carry
- * personal data (an email, a nested profile). Fail closed: the package that
- * captures a new field classifies it here, with its source. `ComboActivity`
- * rows (`/v2/activity/combos`, nested legs) are not classified, so are
- * refused.
+ * v2 OpenAPI, report §14), every one a scalar of the type S-O06 declares
+ * (`FEED_ROW_FIELD_TYPES`, round 3). Their personal fields (`proxy_wallet`,
+ * `name`, `pseudonym`, `bio`, `profile_image`, `profile_image_optimized`,
+ * `transaction_hash`) must hold labelled synthetic values (rules 5 and 6). A
+ * field outside this list is refused: it may carry personal data (an email,
+ * a nested profile). Fail closed: the package that captures a new field
+ * classifies it here, with its source. `ComboActivity` rows
+ * (`/v2/activity/combos`, nested legs) are not classified, so are refused.
  */
 export const FEED_ROW_FIELDS = [
   "bio",
@@ -984,11 +1057,188 @@ export const FEED_ROW_FIELDS = [
   "usdc_size",
 ] as const;
 
-/** S-O06 `TradesPage`, `ActivityPage`: `{ data, pagination }`. */
+/** S-O06 `TradesPage`, `ActivityPage`: `{ data, pagination }`, both required. */
 const FEED_PAGE_FIELDS = ["data", "pagination"];
 
-/** S-O06 `components.schemas.Pagination`. */
-const FEED_PAGINATION_FIELDS = ["limit", "offset", "has_more", "next_cursor"];
+/**
+ * The activity types S-O06 names: the `/v2/activity` `type` parameter
+ * ("TRADE, SPLIT, MERGE, REDEEM, …", and the opt-in `TIP`) and
+ * `Activity.type` ("TRADE, SPLIT, MERGE, REDEEM, REWARD, CONVERSION, …").
+ * Closed (round 3, V2-9-R3-02): another upper-case word, a hash written in
+ * capitals for example, is refused. The package that captures another type
+ * adds it here, with its source.
+ */
+export const ACTIVITY_TYPES = [
+  "TRADE",
+  "SPLIT",
+  "MERGE",
+  "REDEEM",
+  "REWARD",
+  "CONVERSION",
+  "TIP",
+] as const;
+
+/**
+ * The market identifiers a trade or activity capture may carry, each
+ * corroborated by the report, independently of the capture (round 3,
+ * V2-9-R3-02): a row's `condition_id` and `token_id`, a URL's `condition`.
+ */
+export interface FeedMarketIds {
+  /** Lowercased condition ids the report's source index read as a market. */
+  readonly conditionIds: ReadonlySet<string>;
+  /** Decimal token ids the report read as a market (`CaptureContext.marketTokenIds`). */
+  readonly tokenIds: ReadonlySet<string>;
+}
+
+const NO_MARKET_IDS: FeedMarketIds = { conditionIds: new Set(), tokenIds: new Set() };
+
+/** A condition id: `0x` and 62 hex digits (bytes31), or 64 (padded). */
+const CONDITION_ID_RE = /^0x[0-9a-f]{62}(?:[0-9a-f]{2})?$/;
+
+/** A token id: a decimal uint256 (S-O06: "CLOB asset id"), no leading zero. */
+const TOKEN_ID_RE = /^(?:0|[1-9][0-9]{0,77})$/;
+
+/** A condition id the report read as a market, or a labelled synthetic one. */
+function isCorroboratedConditionId(value: string, ids: FeedMarketIds): boolean {
+  return (
+    CONDITION_ID_RE.test(value) &&
+    (isLabelledSyntheticHex(value, value.length - 2) || ids.conditionIds.has(value))
+  );
+}
+
+/** A token id the report read as a market, or a labelled synthetic text. */
+function isCorroboratedTokenId(value: string, ids: FeedMarketIds): boolean {
+  return isLabelledSyntheticText(value) || (TOKEN_ID_RE.test(value) && ids.tokenIds.has(value));
+}
+
+/**
+ * A hash-shaped run (round 3): `0x` and 20 or more hex digits, or 20 or more
+ * bare hex or decimal digits. Twenty hex digits are 80 bits, more than a
+ * double carries, so no price, size, time, slug, title or documented query
+ * value of a feed needs one; only a market identifier does, and it is
+ * corroborated (`FeedMarketIds`). A match is leftmost and greedy, so it takes
+ * a whole run, glued label or not; the bare form is not read after a `0x`.
+ */
+const HASH_RUN_RE = /0[xX][0-9a-fA-F]{20,}|(?<!0[xX])[0-9a-fA-F]{20,}/g;
+
+/**
+ * The hash-shaped runs of a text (NFKC-normalized, so full-width digits
+ * count) that are neither a labelled synthetic hex value nor a market
+ * identifier the report corroborates.
+ */
+export function unexplainedHashRuns(text: string, ids: FeedMarketIds = NO_MARKET_IDS): string[] {
+  return [...text.normalize("NFKC").matchAll(HASH_RUN_RE)]
+    .map(([run]) => run)
+    .filter(
+      (run) =>
+        !isLabelledSyntheticHex(run, run.length - 2) &&
+        !ids.conditionIds.has(run.toLowerCase()) &&
+        !ids.tokenIds.has(run),
+    );
+}
+
+/** One documented field type: a test, and its description for the refusal. */
+interface FeedFieldType {
+  readonly accepts: (value: unknown, ids: FeedMarketIds) => boolean;
+  readonly description: string;
+}
+
+const INT32_MAX = 2_147_483_647;
+
+/** A string judged by the personal-data rules (rule 5), not here. */
+const FEED_STRING: FeedFieldType = {
+  accepts: (value) => typeof value === "string",
+  description: "a string",
+};
+
+/** Free text: a string with no hash-shaped run the report does not corroborate. */
+const FEED_TEXT: FeedFieldType = {
+  accepts: (value, ids) => typeof value === "string" && unexplainedHashRuns(value, ids).length === 0,
+  description:
+    "a string with no hash-shaped run (0x and 20 or more hex digits, or 20 or more bare hex or decimal digits) other than a labelled synthetic value or a market id the report read",
+};
+
+const FEED_NUMBER: FeedFieldType = {
+  accepts: (value) => typeof value === "number" && Number.isFinite(value),
+  description: "a number (double)",
+};
+
+const FEED_INT32: FeedFieldType = {
+  accepts: (value) => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= INT32_MAX,
+  description: "a non-negative integer (int32)",
+};
+
+const FEED_INT64: FeedFieldType = {
+  accepts: (value) => Number.isSafeInteger(value) && (value as number) >= 0,
+  description: "a non-negative integer (int64, epoch seconds)",
+};
+
+const FEED_BOOLEAN: FeedFieldType = {
+  accepts: (value) => typeof value === "boolean",
+  description: "a boolean",
+};
+
+const feedEnum = (description: string, ...values: readonly string[]): FeedFieldType => ({
+  accepts: (value) => typeof value === "string" && values.includes(value),
+  description,
+});
+
+/**
+ * The type S-O06 declares for each row field (`components.schemas.Trade` and
+ * `Activity`, `properties.*.type`, `format` and description), narrowed where
+ * the description states a shape (round 3, V2-9-R3-01):
+ *
+ * - `condition_id` and `token_id` are market ids that the report read
+ *   (`FeedMarketIds`), or labelled synthetic: so no hash poses as one;
+ * - `side`: `BUY` or `SELL`, empty where a side does not apply, `IN` or
+ *   `OUT` on a tip (the `/v2/activity` `type` parameter's description);
+ * - `type`: `ACTIVITY_TYPES`;
+ * - the personal fields: a string, whose value rule 5 judges;
+ * - the other strings: free text with no unexplained hash-shaped run.
+ */
+const FEED_ROW_FIELD_TYPES: Readonly<Record<(typeof FEED_ROW_FIELDS)[number], FeedFieldType>> = {
+  bio: FEED_STRING,
+  condition_id: {
+    accepts: (value, ids) => typeof value === "string" && isCorroboratedConditionId(value, ids),
+    description:
+      "a condition id (0x and 62 or 64 lowercase hex digits) that the report's source index read as a market, or a labelled synthetic one",
+  },
+  event_slug: FEED_TEXT,
+  icon: FEED_TEXT,
+  is_combo: FEED_BOOLEAN,
+  name: FEED_STRING,
+  outcome: FEED_TEXT,
+  outcome_index: FEED_INT32,
+  price: FEED_NUMBER,
+  profile_image: FEED_STRING,
+  profile_image_optimized: FEED_STRING,
+  proxy_wallet: FEED_STRING,
+  pseudonym: FEED_STRING,
+  side: feedEnum("BUY, SELL, IN, OUT or empty", "BUY", "SELL", "IN", "OUT", ""),
+  size: FEED_NUMBER,
+  slug: FEED_TEXT,
+  timestamp: FEED_INT64,
+  title: FEED_TEXT,
+  token_id: {
+    accepts: (value, ids) => typeof value === "string" && isCorroboratedTokenId(value, ids),
+    description:
+      "a token id (a decimal uint256) that the report read as a market, or a labelled synthetic value",
+  },
+  transaction_hash: FEED_STRING,
+  type: feedEnum(`an activity type (${ACTIVITY_TYPES.join(", ")})`, ...ACTIVITY_TYPES),
+  usdc_size: FEED_NUMBER,
+};
+
+/** S-O06 `components.schemas.Pagination`, typed (round 3). */
+const FEED_PAGINATION_TYPES: Readonly<Record<string, FeedFieldType>> = {
+  limit: FEED_INT32,
+  offset: FEED_INT32,
+  has_more: FEED_BOOLEAN,
+  next_cursor: {
+    accepts: (value) => value === null || typeof value === "string",
+    description: "a string or null",
+  },
+};
 
 /**
  * The query parameters S-O06 documents for `/v2/trades`, `/v2/activity` and
@@ -1023,28 +1273,19 @@ function isCursorParameter(key: string): boolean {
 /** The feed routes (S-D26 lines 80-82), exactly. */
 const FEED_URL_PATHS = ["/v2/trades", "/v2/activity", "/v2/activity/combos"];
 
-/** A condition id: `0x` and 62 hex digits (bytes31), or 64 (padded). */
-const CONDITION_ID_RE = /^0x[0-9a-f]{62}(?:[0-9a-f]{2})?$/;
-
-/** What a feed URL's `condition` value may be checked against. */
-interface FeedUrlContext {
-  /** Lowercased condition ids the report read as a market, or a row carries. */
-  readonly knownConditionIds: ReadonlySet<string>;
-}
-
 /** One documented value type: a test, and its description for the refusal. */
 interface FeedParameterType {
-  readonly accepts: (value: string, context: FeedUrlContext) => boolean;
+  readonly accepts: (value: string, ids: FeedMarketIds) => boolean;
   readonly description: string;
 }
 
 /** A comma-separated list of at most 20 distinct values, each accepted. */
 function commaList(
-  accepts: (item: string, context: FeedUrlContext) => boolean,
-): (value: string, context: FeedUrlContext) => boolean {
-  return (value, context) => {
+  accepts: (item: string, ids: FeedMarketIds) => boolean,
+): (value: string, ids: FeedMarketIds) => boolean {
+  return (value, ids) => {
     const items = value.split(",");
-    return new Set(items).size <= 20 && items.every((item) => accepts(item, context));
+    return new Set(items).size <= 20 && items.every((item) => accepts(item, ids));
   };
 }
 
@@ -1054,13 +1295,9 @@ const enumOf =
     values.includes(value);
 
 const CONDITION_PARAMETER: FeedParameterType = {
-  accepts: commaList(
-    (item, context) =>
-      CONDITION_ID_RE.test(item) &&
-      (isLabelledSyntheticHex(item, item.length - 2) || context.knownConditionIds.has(item)),
-  ),
+  accepts: commaList(isCorroboratedConditionId),
   description:
-    "condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, one a row carries as condition_id, or a labelled synthetic value",
+    "condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, or a labelled synthetic value",
 };
 
 /**
@@ -1068,7 +1305,8 @@ const CONDITION_PARAMETER: FeedParameterType = {
  * `paths./v2/trades|/v2/activity|/v2/activity/combos.get.parameters`, schema
  * and description), so that no value of another shape, a transaction hash
  * for example, rides on an allowed parameter (V2-9-R2-02). Fail closed: the
- * shapes are the narrowest the documentation states. `cursor` is checked by
+ * shapes are the narrowest the documentation states, and none admits a
+ * hash-shaped run but a corroborated condition. `cursor` is checked by
  * `feedCursorErrors`; `user` is refused by `captureUrlErrors`.
  *
  * `start` and `end` are epoch seconds (`int64`), but S-O06 says the trades
@@ -1104,8 +1342,8 @@ const FEED_PARAMETER_TYPES: Readonly<Record<string, FeedParameterType>> = {
   start: { accepts: enumOf("0", "1"), description: "a documented sentinel, 0 or 1 (a committed bound is ignored on every URL this gate admits)" },
   taker_only: { accepts: enumOf("true", "false"), description: "a boolean, true or false" },
   type: {
-    accepts: commaList((item) => /^[A-Z]+(?:_[A-Z]+)*$/.test(item)),
-    description: "activity type names (upper-case words such as TRADE or REDEEM, at most 20, comma-separated)",
+    accepts: commaList((item) => (ACTIVITY_TYPES as readonly string[]).includes(item)),
+    description: `activity types S-O06 names (${ACTIVITY_TYPES.join(", ")}; at most 20, comma-separated)`,
   },
 };
 
@@ -1118,16 +1356,15 @@ const FEED_PARAMETER_TYPES: Readonly<Record<string, FeedParameterType>> = {
  *   a documented one must hold a value of its documented type
  *   (`FEED_PARAMETER_TYPES`, round 2), so no other value, a transaction hash
  *   for example, rides on the URL;
- * - every cursor parameter (any name containing `cursor`, every occurrence),
- *   at most one of them, is checked by `feedCursorErrors`;
- * - no other query value, path segment or fragment hides a venue cursor.
- *
- * A server's handling of a repeated parameter is not assumed.
+ * - each parameter occurs once (round 3; a server's handling of a repeated
+ *   parameter is not assumed): every cursor parameter (any name containing
+ *   `cursor`, every occurrence), at most one of them, is checked by
+ *   `feedCursorErrors`;
+ * - no other query value carries a hash-shaped run that is not a market id
+ *   the report read (round 3), and none, nor the path or fragment, hides a
+ *   venue cursor.
  */
-export function feedUrlErrors(
-  url: string,
-  knownConditionIds: ReadonlySet<string> = new Set(),
-): string[] {
+export function feedUrlErrors(url: string, ids: FeedMarketIds = NO_MARKET_IDS): string[] {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -1148,11 +1385,20 @@ export function feedUrlErrors(
       "sidecar.url: a trade or activity URL is exactly https://data-api.polymarket.com, one of /v2/trades, /v2/activity or /v2/activity/combos, and a query, in canonical form: no other path segment, no fragment, no credential, no port",
     );
   }
-  const cursorKeys = [...parsed.searchParams.keys()].filter(isCursorParameter);
+  const keys = [...parsed.searchParams.keys()];
+  const cursorKeys = keys.filter(isCursorParameter);
   if (cursorKeys.length > 1) {
     errors.push(
       `sidecar.url: ${cursorKeys.length} cursor parameters (${cursorKeys.join(", ")}); a trade or activity URL carries at most one`,
     );
+  }
+  for (const key of new Set(keys)) {
+    const count = keys.filter((candidate) => candidate === key).length;
+    if (count > 1 && !isCursorParameter(key)) {
+      errors.push(
+        `sidecar url ${key}: occurs ${count} times; a trade or activity URL carries each parameter once`,
+      );
+    }
   }
   for (const [key, value] of parsed.searchParams) {
     if (!(FEED_QUERY_PARAMETERS as readonly string[]).includes(key)) {
@@ -1167,9 +1413,15 @@ export function feedUrlErrors(
       errors.push(
         `sidecar url ${key}: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter`,
       );
-    } else if (type !== undefined && !type.accepts(value, { knownConditionIds })) {
+    } else if (type !== undefined && !type.accepts(value, ids)) {
       errors.push(
         `sidecar url ${key}: the value is not ${type.description} (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL`,
+      );
+    } else if (type !== undefined && unexplainedHashRuns(value, ids).length > 0) {
+      // Defense in depth: no documented type admits one. An undocumented
+      // parameter is refused above whatever its value.
+      errors.push(
+        `sidecar url ${key}: the value carries a hash-shaped run (0x and 20 or more hex digits, or 20 or more bare hex or decimal digits) that is not a market id the report read`,
       );
     }
   }
@@ -1181,22 +1433,41 @@ export function feedUrlErrors(
   return errors;
 }
 
+/** Every string of a parsed JSON value (keys included). */
+function collectStrings(value: unknown, into: string[]): string[] {
+  if (typeof value === "string") {
+    into.push(value);
+  } else if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectStrings(entry, into);
+    }
+  } else if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      into.push(key);
+      collectStrings(entry, into);
+    }
+  }
+  return into;
+}
+
 /**
- * Rule 6: the trade and activity feed refusals. `marketConditionIds`: the
- * condition ids the report's source index read as a market
- * (`CaptureContext.marketConditionIds`).
+ * Rule 6: the trade and activity feed refusals. `ids`: the market ids the
+ * report corroborates (`CaptureContext.marketConditionIds` and
+ * `marketTokenIds`). `captureText`: the capture's bytes as text, whose
+ * numbers and escapes the parsed view no longer shows.
  */
 export function feedErrors(
   view: unknown,
   sidecar: CaptureSidecar,
-  marketConditionIds: readonly string[] = [],
+  ids: FeedMarketIds = NO_MARKET_IDS,
+  captureText = "",
 ): string[] {
   const errors: string[] = [];
   const rows = isRecord(view) ? view["data"] : undefined;
-  if (!Array.isArray(rows)) {
+  if (!isRecord(view) || !Array.isArray(rows)) {
     return ["$.data: a trade or activity capture must carry its data[] rows"];
   }
-  for (const key of Object.keys(view as Record<string, unknown>)) {
+  for (const key of Object.keys(view)) {
     if (!FEED_PAGE_FIELDS.includes(key)) {
       errors.push(`$.${key}: not a field of a trade or activity page (S-O06: data, pagination)`);
     }
@@ -1212,9 +1483,17 @@ export function feedErrors(
         errors.push(
           `${where}.${key}: not a Trade or Activity field (S-O06); an unrecognized field may carry personal data, so classify it in FEED_ROW_FIELDS, with its source, before committing it`,
         );
-      } else if (entry !== null && typeof entry === "object") {
+        continue;
+      }
+      if (entry !== null && typeof entry === "object") {
         errors.push(`${where}.${key}: a feed-row field must be a scalar (S-O06 rows are flat)`);
-      } else if (typeof entry === "string" && cursorLikeTokens(entry).length > 0) {
+        continue;
+      }
+      const type = FEED_ROW_FIELD_TYPES[key as (typeof FEED_ROW_FIELDS)[number]];
+      if (!type.accepts(entry, ids)) {
+        errors.push(`${where}.${key}: not ${type.description} (S-O06 types the field so)`);
+      }
+      if (typeof entry === "string" && cursorLikeTokens(entry).length > 0) {
         errors.push(`${where}.${key}: a token decodes to a venue cursor (S-O06)`);
       }
     }
@@ -1223,26 +1502,45 @@ export function feedErrors(
     // row. `name` and `transaction_hash` are generic keys elsewhere (a
     // resolution's transaction is public).
   });
-  const pagination = isRecord(view) ? view["pagination"] : undefined;
-  if (isRecord(pagination)) {
+  const pagination = view["pagination"];
+  if (!isRecord(pagination)) {
+    errors.push("$.pagination: a trade or activity page carries its pagination object (S-O06: required)");
+  } else {
     for (const [key, entry] of Object.entries(pagination)) {
-      if (!FEED_PAGINATION_FIELDS.includes(key)) {
+      const type = Object.hasOwn(FEED_PAGINATION_TYPES, key) ? FEED_PAGINATION_TYPES[key] : undefined;
+      if (type === undefined) {
         errors.push(`$.pagination.${key}: not a Pagination field (S-O06: limit, offset, has_more, next_cursor)`);
-      } else if (entry !== null && typeof entry === "object") {
+        continue;
+      }
+      if (entry !== null && typeof entry === "object") {
         errors.push(`$.pagination.${key}: a Pagination field must be a scalar (S-O06)`);
+        continue;
+      }
+      if (!type.accepts(entry, ids)) {
+        errors.push(`$.pagination.${key}: not ${type.description} (S-O06 types the field so)`);
+      }
+      // `next_cursor` has its own rules (`feedCursorErrors`, below).
+      if (key !== "next_cursor" && typeof entry === "string" && cursorLikeTokens(entry).length > 0) {
+        errors.push(`$.pagination.${key}: a token decodes to a venue cursor (S-O06)`);
       }
     }
   }
   const cursor = isRecord(pagination) ? pagination["next_cursor"] : undefined;
   errors.push(...feedCursorErrors(cursor, "$.pagination.next_cursor"));
-  const knownConditionIds = new Set(marketConditionIds.map((id) => id.toLowerCase()));
-  for (const row of rows) {
-    const conditionId = isRecord(row) ? row["condition_id"] : undefined;
-    if (typeof conditionId === "string") {
-      knownConditionIds.add(conditionId.toLowerCase());
-    }
+  // The bytes: a hash-shaped run outside every string (a number of 20 or
+  // more digits) or written with escapes, which the typed fields above do
+  // not see.
+  const stringRuns = new Set(
+    collectStrings(view, []).flatMap((text) =>
+      [...text.normalize("NFKC").matchAll(HASH_RUN_RE)].map(([run]) => run),
+    ),
+  );
+  if (unexplainedHashRuns(captureText, ids).some((run) => !stringRuns.has(run))) {
+    errors.push(
+      "bytes: a hash-shaped run (20 or more hex or decimal digits) outside every string or behind an escape, which no S-O06 field type admits",
+    );
   }
-  errors.push(...feedUrlErrors(sidecar.url, knownConditionIds));
+  errors.push(...feedUrlErrors(sidecar.url, ids));
   // A page with nothing to replace (no row, no cursor) may be the raw body;
   // the kind rules then require it to equal the raw response byte for byte.
   if (rows.length > 0 || typeof cursor === "string") {
@@ -1419,9 +1717,16 @@ export interface CaptureContext {
    * The condition ids the report's source index read as a market
    * (`marketReadConditionIds`): a trade or activity URL's `condition` value
    * must be one of these, a row's `condition_id`, or labelled synthetic
-   * (rule 6, round 2). Absent: none.
+   * (rule 6, round 2). Round 3: a trade or activity row's `condition_id`
+   * too, and a row no longer corroborates the URL. Absent: none.
    */
   readonly marketConditionIds?: readonly string[];
+  /**
+   * The token ids the report read as a market (`marketReadTokenIds` and
+   * `catalogueTokenIds`): a trade or activity row's `token_id` must be one of
+   * these or labelled synthetic (rule 6, round 3). Absent: none.
+   */
+  readonly marketTokenIds?: readonly string[];
 }
 
 export interface CaptureValidationResult {
@@ -1431,6 +1736,11 @@ export interface CaptureValidationResult {
   readonly errors: readonly string[];
   /** The parsed view the pins read (`null` when the capture did not parse). */
   readonly view: unknown;
+  /**
+   * The token ids this capture carries as a report-anchored CLOB market read
+   * (`anchoredMarketTokenIds`), when it passed every check (round 3).
+   */
+  readonly marketTokenIds?: readonly string[];
 }
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -1583,12 +1893,16 @@ export function validateCapture(
 ): CaptureValidationResult {
   const errors: string[] = [];
   const sidecarPath = sidecarPathOf(spec.fixture);
-  const result = (view: unknown): CaptureValidationResult => ({
+  const result = (
+    view: unknown,
+    marketTokenIds: readonly string[] = [],
+  ): CaptureValidationResult => ({
     relativePath: spec.fixture,
     sidecarPath,
     ok: errors.length === 0,
     errors,
     view,
+    marketTokenIds: errors.length === 0 ? marketTokenIds : [],
   });
 
   if ((spec.format === "jsonl") !== spec.fixture.endsWith(".jsonl")) {
@@ -1729,8 +2043,14 @@ export function validateCapture(
   );
 
   // 6. Trade and activity feeds.
+  const marketIds: FeedMarketIds = {
+    conditionIds: new Set((context.marketConditionIds ?? []).map((id) => id.toLowerCase())),
+    tokenIds: new Set(context.marketTokenIds ?? []),
+  };
   if (feed) {
-    errors.push(...feedErrors(view, sidecar, context.marketConditionIds));
+    errors.push(
+      ...feedErrors(view, sidecar, marketIds, new TextDecoder("utf-8").decode(fixtureBytes)),
+    );
   }
 
   // 7. The pins, and the ids they cite.
@@ -1749,7 +2069,7 @@ export function validateCapture(
       }
     }
   }
-  return result(view);
+  return result(view, anchoredMarketTokenIds(sidecar, view, marketIds.conditionIds));
 }
 
 /**

@@ -40,13 +40,15 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 import {
+  catalogueTokenIds,
   loadCapture,
   marketReadConditionIds,
+  marketReadTokenIds,
   parseSourceIndex,
   reportDefinesId,
   sidecarPathOf,
 } from "./captures.js";
-import type { CaptureValidationResult } from "./captures.js";
+import type { CaptureContext, CaptureSpec, CaptureValidationResult } from "./captures.js";
 import {
   PUBLIC_CONTRACT_ADDRESSES,
   SDK_PERMALINK_PREFIX,
@@ -441,6 +443,37 @@ function readReport(reportPath: string): string | null {
   }
 }
 
+/**
+ * The context a capture-kind check validates its captures in: its report,
+ * that report's source index (§14), the documented public contract
+ * addresses, and the market ids the report corroborates. The token ids come
+ * in two passes (V2-9 round 3): the source index's own `token_id=` reads,
+ * then the tokens of each capture that passes as a report-anchored CLOB
+ * market read (`catalogueTokenIds`). A CLOB market read is not a feed, so
+ * the first pass does not depend on the token ids it yields.
+ */
+export function captureContextOf(
+  reportPath: string,
+  reportContent: string | null,
+  captures: readonly CaptureSpec[],
+): CaptureContext {
+  const sourceIndexText =
+    reportContent === null ? "" : (reportSectionText(reportContent, "14") ?? "");
+  const base: CaptureContext = {
+    report: reportPath,
+    reportContent,
+    sourceIndex: parseSourceIndex(sourceIndexText),
+    publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
+    marketConditionIds: marketReadConditionIds(sourceIndexText),
+    marketTokenIds: marketReadTokenIds(sourceIndexText),
+  };
+  const anchored = catalogueTokenIds(captures.map((capture) => loadCapture(capture, base)));
+  return {
+    ...base,
+    marketTokenIds: [...new Set([...(base.marketTokenIds ?? []), ...anchored])],
+  };
+}
+
 /** Runs every check against local fixtures and the dated reports only. */
 export function runVenueVerification(): VenueVerificationReport {
   const { content, validation } = loadAndValidateReport();
@@ -476,18 +509,8 @@ export function runVenueVerification(): VenueVerificationReport {
     }
     if (check.kind === "capture") {
       const captures = check.captures ?? [];
-      const sourceIndexText =
-        checkReport === null ? "" : (reportSectionText(checkReport, "14") ?? "");
-      const sourceIndex = parseSourceIndex(sourceIndexText);
-      const captureResults = captures.map((capture) =>
-        loadCapture(capture, {
-          report: reportOf(check),
-          reportContent: checkReport,
-          sourceIndex,
-          publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
-          marketConditionIds: marketReadConditionIds(sourceIndexText),
-        }),
-      );
+      const context = captureContextOf(reportOf(check), checkReport, captures);
+      const captureResults = captures.map((capture) => loadCapture(capture, context));
       const errors = [
         ...reportErrors,
         ...(captures.length === 0

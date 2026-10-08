@@ -304,13 +304,36 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
 - **Personal values, anywhere in a capture or in its sidecar's text**,
   after NFKC normalization: no email address; no `0x` 40-hex address other
   than a labelled synthetic one or a documented V2 contract address
-  (`PUBLIC_CONTRACT_ADDRESSES`, F-71).
+  (`PUBLIC_CONTRACT_ADDRESSES`, F-71). A label glued to the address
+  (`wallet_0x…`, `maker0x…`) does not hide it (round 3); only more hex
+  digits after it, which make it a longer id, do.
 - **A trade or activity page** carries only the S-O06 fields: `data` and
-  `pagination`; in a row only the `Trade` and `Activity` fields, each a
-  scalar; in `pagination` only `limit`, `offset`, `has_more` and
+  `pagination`, both present; in a row only the `Trade` and `Activity`
+  fields; in `pagination` only `limit`, `offset`, `has_more` and
   `next_cursor`. An unrecognized field (an email, a nested profile) is
   refused, since it may carry personal data. A package that captures a new
   field classifies it, with its source.
+- **Each field has the type S-O06 declares** (round 3,
+  `FEED_ROW_FIELD_TYPES`): integers (`timestamp`, `outcome_index`,
+  `limit`, `offset`, non-negative), numbers (`size`, `price`,
+  `usdc_size`), booleans (`is_combo`, `has_more`), `next_cursor` a string or
+  `null`; `side` is `BUY`, `SELL`, `IN`, `OUT` or empty; `type` one of the
+  activity types S-O06 names (`ACTIVITY_TYPES`). A row's `condition_id` is a
+  condition id and its `token_id` a decimal token id, each one the report
+  read as a market (below) or a labelled synthetic value: a row does not
+  vouch for itself. The free text (`title`, `slug`, `event_slug`, `icon`,
+  `outcome`) carries no hash-shaped run: `0x` and 20 or more hex digits, or
+  20 or more bare hex or decimal digits (80 bits, more than any price,
+  size, time or slug needs), other than a labelled synthetic value or a
+  market id the report read. Nor do the capture's bytes outside its strings:
+  a number of 20 or more digits is refused. The personal fields are strings
+  whose values the rules above judge.
+- **Market ids the report read** (round 3): a condition id in the URL of a
+  source-index row (§14) that is not a feed read; a whole `token_id=` value
+  in such a URL; and the tokens of a CLOB market read (`/clob-markets/…`)
+  kept as a `live-capture`, whose bytes are the raw response the report's
+  source index records, so that they are the report's own and not the
+  capture author's.
 - **Labelled synthetic** means: `synthetic-` and lowercase letters, digits and
   hyphens (so no email, spaced name or base64url cursor fits); or `0x`, zeros
   and at most eight significant hex digits; or, for a cursor,
@@ -324,33 +347,40 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   value, and one that decodes to a venue cursor is refused. The URL carries
   at most one cursor parameter, and only the query parameters S-O06 documents
   for the feeds (`FEED_QUERY_PARAMETERS`). No other query value, path,
-  fragment, row value or sidecar prose token of a trade or activity capture
-  may hide a cursor, in whatever written form (round 2): as plain JSON text;
+  fragment, row value, pagination value (round 3) or sidecar prose token of
+  a trade or activity capture may hide a cursor, in whatever written form
+  (round 2): as plain JSON text;
   as the value of an assignment (`cursor=…`, `#cursor=…`, `cursor%3D…`);
   glued to a word; in base64, base64url or hex; percent-encoded or in full
   width.
 - **Trade and activity URLs** (round 2) are exactly the Data API host and one
   feed route (`/v2/trades`, `/v2/activity`, `/v2/activity/combos`) with a
-  query, in canonical form, with no fragment. Each query value has the type
-  S-O06 documents for its parameter (`FEED_PARAMETER_TYPES`): `limit` an
-  integer to 1000; booleans; `side`, `filter_type`, `sort_by` and
-  `sort_direction` their documented values; `type` upper-case names;
-  `event_id` decimal ids; `filter_amount` a short decimal. `start` and `end`
+  query, in canonical form, with no fragment, and each parameter once
+  (round 3). Each query value has the type S-O06 documents for its
+  parameter (`FEED_PARAMETER_TYPES`): `limit` an integer to 1000; booleans;
+  `side`, `filter_type`, `sort_by` and `sort_direction` their documented
+  values; `type` the activity types S-O06 names (round 3: a closed list, so
+  no other capital-letter word); `event_id` decimal ids of at most 19
+  digits; `filter_amount` a short decimal. `start` and `end`
   are only the documented sentinels `0` and `1`: the bounds are ignored on
   every URL the gate admits, so any other value could only be a real block
   timestamp. A `condition` is a `0x` 62- or 64-hex condition id that the
-  report's source index (§14) read as a market, that a row carries as
-  `condition_id`, or that is labelled synthetic. So no hash rides on the URL.
+  report's source index (§14) read as a market, or that is labelled
+  synthetic (round 3: a row's `condition_id` no longer vouches for it). So
+  no documented value holds a hash-shaped run other than such a condition,
+  and the gate refuses one (round 3).
 - A sidecar of a trade or activity page with rows or a cursor lists
   `timestamp` and `next_cursor` among its redactions.
 - **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`). A
   personal field written with a value (`name: …`, `name=…`, `"name":"…"`, or
-  a URL query parameter such as `name=`) holds a labelled synthetic value, a
+  a URL query parameter such as `name=`), also when a label is glued to it by
+  `_` or `-` (`the_name: …`, round 3), holds a labelled synthetic value, a
   `<placeholder>`, `null` or nothing; a redaction's subject list before its
   first colon names fields and is not a value. Prose carries no hex id, hash
-  or number of 40 or more digits that is not labelled synthetic, unless the
-  capture or the URL carries it or it is the sidecar's own digest: a market is
-  named by placeholder (`<V1 window>`), as the committed sidecars do.
+  or number of 40 or more digits that is not labelled synthetic, glued to a
+  label or not (round 3), unless the capture or the URL carries it or it is
+  the sidecar's own digest: a market is named by placeholder
+  (`<V1 window>`), as the committed sidecars do.
 - **No repeated key** in any object of a capture, a WebSocket frame or a
   sidecar: `JSON.parse` keeps only the last value, so an earlier one (a live
   wallet, a venue cursor) would sit in the committed bytes and escape every
@@ -369,6 +399,11 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
 - a personal value encoded (base64, for example), other than a venue cursor;
 - a venue cursor split across tokens or otherwise transformed (reversed,
   chunked, encrypted);
+- in a trade or activity page or URL, a hash split into runs of fewer than
+  20 digits (across fields, list items or a free text), or re-encoded other
+  than in hex or decimal (in base64, for example);
+- a personal key glued to a label by a letter or a digit
+  (`maker1wallet: …`): it reads as another word, as `filename:` does;
 - the long ids in the URL of a capture that is not a trade or activity page:
   its condition and token ids are public, and the gate does not type that
   URL's values;

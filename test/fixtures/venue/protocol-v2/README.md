@@ -106,6 +106,9 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
     including every cursor parameter of the sidecar URL; round 2 added a
     cursor in any written form (an assignment, plain JSON, glued or
     re-encoded) and the documented type of every value on a trade URL;
+    round 3 added the S-O06 type of every field of a trade page, market ids
+    that the report alone corroborates, and labels glued to an address, a
+    hash or a personal key;
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no
