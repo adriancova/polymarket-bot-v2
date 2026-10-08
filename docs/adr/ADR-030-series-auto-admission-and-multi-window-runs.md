@@ -479,8 +479,8 @@ resolution limit.
   - Rules 1-4 are the orchestrator's, made 2026-10-05. Rule 1 follows the
     venue's documented instruction (F-38 to F-40). Rules 2-4 apply
     Decisions 1.4, 1.7 and 3.1 to it.
-  - Rule 5 is **the orchestrator's interim ruling for PAPER and BACKTEST**,
-    made 2026-10-05. The user may confirm or overrule it.
+  - Rule 5 is **confirmed by the user, 2026-10-06**. It was the
+    orchestrator's interim ruling for PAPER and BACKTEST, made 2026-10-05.
 - **User rulings:**
   - Ruling A5 (2026-09-30) and rulings Q1-Q4 (2026-10-04) stand unchanged.
   - The user confirmed Amendment 1's rules on 2026-10-05. Rule 5 below
@@ -559,9 +559,9 @@ Gamma record also carries `clobTokenIds` can no longer be admitted with the
 CTF ids (plan A1).
 
 **Note, 2026-10-06 (`V2-3` item 7): ids not yet available.**
-- **Standing:** the orchestrator's interim ruling for PAPER and BACKTEST,
-  made 2026-10-06, on `V2-1`'s known risk V21-FABLE-03. The user may confirm
-  or overrule it. It refines item 3's second bullet only, and for `"v2"`
+- **Standing:** **confirmed by the user, 2026-10-06**, together with its
+  narrowing to `"v2"` (below). It was the orchestrator's interim ruling for
+  PAPER and BACKTEST, made the same day on `V2-1`'s known risk V21-FABLE-03. It refines item 3's second bullet only, and for `"v2"`
   only: ruling 1 was narrowed the same day (below).
 - **The problem.** The gateway judges a window once, and a refusal is final
   (Decision 1.4). Gamma lists a series' windows up to about a day ahead.
@@ -589,8 +589,8 @@ CTF ids (plan A1).
      has another mismatch beside its missing ids is refused at once.
 - **Ruling 1 is narrowed to `"v2"`** (2026-10-06, `V2-3` r3; finding I-1,
   V23-R2-CODEX-01, FABLE-R2-03).
-  - **Authority:** the orchestrator's interim ruling for PAPER and BACKTEST,
-    2026-10-06. The user may confirm or overrule it.
+  - **Authority:** confirmed by the user, 2026-10-06. It was the
+    orchestrator's interim ruling for PAPER and BACKTEST, made the same day.
   - **Reason:** item 7 exists for V2 position ids that appear after listing.
     V1 windows have always been listed with `clobTokenIds`, and V1 ends at
     the switchover. Holding a `"v1"` window would need the series-window door
@@ -712,9 +712,9 @@ confirmed on 2026-10-05:
 - rule 2: a second source of the resolution that retires a window;
 - rule 4: a recovery that comes before the operator's.
 
-**Standing:** the orchestrator's interim ruling for PAPER and BACKTEST,
-made 2026-10-05. The user may confirm or overrule it, in whole or in part.
-Every part of this rule belongs to it: the conditions, the resolution
+**Standing:** **confirmed by the user, 2026-10-06**, as recommended. It was
+the orchestrator's interim ruling for PAPER and BACKTEST, made 2026-10-05.
+Every part of this rule belongs to the confirmation: the conditions, the resolution
 instant, what a read finds, the polling and the incident, and its
 refinement of the confirmed rules above.
 
