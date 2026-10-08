@@ -325,7 +325,22 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   at most one cursor parameter, and only the query parameters S-O06 documents
   for the feeds (`FEED_QUERY_PARAMETERS`). No other query value, path,
   fragment, row value or sidecar prose token of a trade or activity capture
-  may decode to a cursor.
+  may hide a cursor, in whatever written form (round 2): as plain JSON text;
+  as the value of an assignment (`cursor=…`, `#cursor=…`, `cursor%3D…`);
+  glued to a word; in base64, base64url or hex; percent-encoded or in full
+  width.
+- **Trade and activity URLs** (round 2) are exactly the Data API host and one
+  feed route (`/v2/trades`, `/v2/activity`, `/v2/activity/combos`) with a
+  query, in canonical form, with no fragment. Each query value has the type
+  S-O06 documents for its parameter (`FEED_PARAMETER_TYPES`): `limit` an
+  integer to 1000; booleans; `side`, `filter_type`, `sort_by` and
+  `sort_direction` their documented values; `type` upper-case names;
+  `event_id` decimal ids; `filter_amount` a short decimal. `start` and `end`
+  are only the documented sentinels `0` and `1`: the bounds are ignored on
+  every URL the gate admits, so any other value could only be a real block
+  timestamp. A `condition` is a `0x` 62- or 64-hex condition id that the
+  report's source index (§14) read as a market, that a row carries as
+  `condition_id`, or that is labelled synthetic. So no hash rides on the URL.
 - A sidecar of a trade or activity page with rows or a cursor lists
   `timestamp` and `next_cursor` among its redactions.
 - **Sidecar text** (`url`, `notes`, each redaction, `extract.rule`). A
@@ -352,6 +367,11 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
 - a person's name written as plain prose with no field label ("traded by
   Jane Doe");
 - a personal value encoded (base64, for example), other than a venue cursor;
+- a venue cursor split across tokens or otherwise transformed (reversed,
+  chunked, encrypted);
+- the long ids in the URL of a capture that is not a trade or activity page:
+  its condition and token ids are public, and the gate does not type that
+  URL's values;
 - outside the Data API, a name under a generic key (`name`, `title`) of an
   object with no personal key: Gamma's `name` is market metadata;
 - an address without its `0x` under a generic key of a non-feed capture: the

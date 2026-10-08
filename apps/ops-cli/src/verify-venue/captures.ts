@@ -48,7 +48,14 @@
  *      refused, because a feed cursor carries the seek anchor of the last
  *      row (S-O06) and re-fetches the unredacted page; any other cursor must
  *      be a labelled synthetic value; the URL carries at most one cursor, and
- *      no other URL part, row value or sidecar prose token may decode to one;
+ *      no other URL part, row value or sidecar prose token may hide one: a
+ *      plain JSON object, or an encoded run however it is glued, assigned
+ *      (`cursor=…`) or escaped (round 2, `cursorLikeTokens`);
+ *    - the sidecar URL is exactly a feed route on the Data API host, with no
+ *      fragment, in canonical form, and each query parameter is one S-O06
+ *      documents, holding a value of its documented type; a `condition` is
+ *      one the report read as a market, a row's `condition_id`, or labelled
+ *      synthetic (round 2, `FEED_PARAMETER_TYPES`);
  *    - the page carries only the S-O06 fields (`data`, `pagination`; the
  *      `Trade` and `Activity` row fields, flat; the `Pagination` fields), so
  *      an unrecognized field is refused;
@@ -312,6 +319,32 @@ export function parseSourceIndex(
     rows.delete(id);
   }
   return rows;
+}
+
+/** A source-index row's id and URL (the second column). */
+const SOURCE_INDEX_URL_RE = /^\| (S-[A-Z]+\d+) \| `([^`]*)` \|/gm;
+
+/**
+ * The condition ids the report's source index (§14) read as a market: every
+ * `0x` 62- or 64-hex token in the URL of a row that is not a trade or
+ * activity feed read (`/clob-markets/<id>`, `/v2/resolutions?condition=`,
+ * `/v2/oi?condition=`, Gamma `condition_ids=`). A feed URL's `condition`
+ * value must be one of these, a labelled synthetic value, or a row's
+ * `condition_id` (V2-9 round 2): so a hash of another kind, a transaction
+ * hash for example, cannot ride on the URL as a condition. Lowercased.
+ */
+export function marketReadConditionIds(sectionText: string): readonly string[] {
+  const ids = new Set<string>();
+  for (const match of sectionText.matchAll(SOURCE_INDEX_URL_RE)) {
+    const url = match[2] ?? "";
+    if (FEED_ROUTE_RE.test(url)) {
+      continue;
+    }
+    for (const [token] of url.matchAll(/(?<![0-9A-Za-z_])0x[0-9a-fA-F]{62}(?:[0-9a-fA-F]{2})?(?![0-9a-fA-F])/g)) {
+      ids.add(token.toLowerCase());
+    }
+  }
+  return [...ids];
 }
 
 function escapeRegExp(text: string): string {
@@ -717,14 +750,113 @@ function personalAssignmentErrors(text: string, where: string): string[] {
   return errors;
 }
 
+/** Decodes every run of percent-escapes that decodes; leaves the rest. */
+function decodePercentEscapes(text: string): string {
+  return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+    try {
+      return decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+  });
+}
+
 /**
- * The tokens of a text that decode to a JSON object, as a venue cursor does
- * (`decodeFeedCursor`): base64url, base64 or plain JSON, 16 characters or
- * more.
+ * Whether a text embeds a non-empty JSON object anywhere in it: a `{`, and a
+ * later `}`, whose span `JSON.parse` reads as an object with a key. Garbage
+ * before or after the object (a glued prefix, the tail of a decoded run) does
+ * not hide it. `{}` is not counted, so random decoded bytes do not match.
+ */
+function embedsJsonObject(text: string): boolean {
+  const opens: number[] = [];
+  const closes: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "{") {
+      opens.push(index);
+    } else if (text[index] === "}") {
+      closes.push(index);
+    }
+  }
+  for (const open of opens) {
+    for (const close of closes) {
+      if (close <= open) {
+        continue;
+      }
+      try {
+        const value: unknown = JSON.parse(text.slice(open, close + 1));
+        if (isRecord(value) && Object.keys(value).length > 0) {
+          return true;
+        }
+      } catch {
+        // not one JSON object at this span
+      }
+    }
+  }
+  return false;
+}
+
+/** A run of base64 or base64url characters; `=` (padding, assignment) ends it. */
+const BASE64_RUN_RE = /[A-Za-z0-9+/_-]{16,}/g;
+
+/** A run of hex digits long enough to hold an encoded JSON object. */
+const HEX_RUN_RE = /[0-9a-fA-F]{32,}/g;
+
+/**
+ * Whether one run of encoded characters hides a JSON object: decoded whole
+ * (`decodeFeedCursor`), or decoded as base64 from each of its first four
+ * offsets (so a glued prefix such as `cursor` in `cursoreyJ…` cannot shift
+ * the alignment) or as hex from each of its first two, with the object
+ * anywhere in the decoded text (so a glued suffix cannot hide it either).
+ */
+function runHidesJsonObject(run: string): boolean {
+  if (decodeFeedCursor(run) !== undefined) {
+    return true;
+  }
+  for (let offset = 0; offset < 4; offset += 1) {
+    if (embedsJsonObject(Buffer.from(run.slice(offset), "base64").toString("utf8"))) {
+      return true;
+    }
+  }
+  for (const [hexRun] of run.matchAll(HEX_RUN_RE)) {
+    for (let offset = 0; offset < 2; offset += 1) {
+      if (embedsJsonObject(Buffer.from(hexRun.slice(offset), "hex").toString("utf8"))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * The tokens of a text that hide a JSON object, as a venue cursor does
+ * (`decodeFeedCursor`: base64url of `{"data":{…},"sig":…}`), wherever the
+ * cursor sits (round 2, V2-9-R2-01). The text is read as is, NFKC-normalized
+ * and with its percent-escapes decoded; in each reading:
+ *
+ * - a JSON object written as plain text is a token;
+ * - so is every run of 16 or more base64 or base64url characters that hides
+ *   a JSON object (`runHidesJsonObject`). `=` ends a run, so the value of an
+ *   assignment (`cursor=eyJ…`, `#cursor=eyJ…`, `cursor%3DeyJ…`) is a run of
+ *   its own; a glued prefix or suffix is decoded through.
+ *
+ * Not caught: a cursor split across tokens or otherwise transformed (the
+ * README's "What the gate cannot check").
  */
 export function cursorLikeTokens(text: string): string[] {
-  const tokens = text.match(/[A-Za-z0-9+/_=-]{16,}/g) ?? [];
-  return tokens.filter((token) => decodeFeedCursor(token) !== undefined);
+  const nfkc = text.normalize("NFKC");
+  const readings = new Set([text, nfkc, decodePercentEscapes(text), decodePercentEscapes(nfkc)]);
+  const tokens = new Set<string>();
+  for (const reading of readings) {
+    if (embedsJsonObject(reading)) {
+      tokens.add("<a JSON object written as text>");
+    }
+    for (const [run] of reading.matchAll(BASE64_RUN_RE)) {
+      if (runHidesJsonObject(run)) {
+        tokens.add(run);
+      }
+    }
+  }
+  return [...tokens];
 }
 
 function safeDecodeUri(text: string): string {
@@ -888,15 +1020,114 @@ function isCursorParameter(key: string): boolean {
   return /cursor/i.test(key);
 }
 
+/** The feed routes (S-D26 lines 80-82), exactly. */
+const FEED_URL_PATHS = ["/v2/trades", "/v2/activity", "/v2/activity/combos"];
+
+/** A condition id: `0x` and 62 hex digits (bytes31), or 64 (padded). */
+const CONDITION_ID_RE = /^0x[0-9a-f]{62}(?:[0-9a-f]{2})?$/;
+
+/** What a feed URL's `condition` value may be checked against. */
+interface FeedUrlContext {
+  /** Lowercased condition ids the report read as a market, or a row carries. */
+  readonly knownConditionIds: ReadonlySet<string>;
+}
+
+/** One documented value type: a test, and its description for the refusal. */
+interface FeedParameterType {
+  readonly accepts: (value: string, context: FeedUrlContext) => boolean;
+  readonly description: string;
+}
+
+/** A comma-separated list of at most 20 distinct values, each accepted. */
+function commaList(
+  accepts: (item: string, context: FeedUrlContext) => boolean,
+): (value: string, context: FeedUrlContext) => boolean {
+  return (value, context) => {
+    const items = value.split(",");
+    return new Set(items).size <= 20 && items.every((item) => accepts(item, context));
+  };
+}
+
+const enumOf =
+  (...values: readonly string[]) =>
+  (value: string): boolean =>
+    values.includes(value);
+
+const CONDITION_PARAMETER: FeedParameterType = {
+  accepts: commaList(
+    (item, context) =>
+      CONDITION_ID_RE.test(item) &&
+      (isLabelledSyntheticHex(item, item.length - 2) || context.knownConditionIds.has(item)),
+  ),
+  description:
+    "condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, one a row carries as condition_id, or a labelled synthetic value",
+};
+
 /**
- * The URL refusals of a trade or activity sidecar: a query parameter S-O06
- * does not document for the feeds (so no other value, a transaction hash for
- * example, rides on the URL); every cursor parameter (any name containing
- * `cursor`, every occurrence), at most one of them; and no other query value,
- * path segment or fragment that decodes to a venue cursor. A server's
- * handling of a repeated parameter is not assumed.
+ * The documented value type of each feed query parameter (S-O06
+ * `paths./v2/trades|/v2/activity|/v2/activity/combos.get.parameters`, schema
+ * and description), so that no value of another shape, a transaction hash
+ * for example, rides on an allowed parameter (V2-9-R2-02). Fail closed: the
+ * shapes are the narrowest the documentation states. `cursor` is checked by
+ * `feedCursorErrors`; `user` is refused by `captureUrlErrors`.
+ *
+ * `start` and `end` are epoch seconds (`int64`), but S-O06 says the trades
+ * feed honors them "on the `user` shape only" and the activity feed is
+ * user-anchored ("Required"), and this gate refuses every `user` read. So a
+ * committed bound changes no response, and any value but the documented
+ * sentinels `0` ("floors to three years back" / "now plus one day") and
+ * `1` ("full history") could only be a real block timestamp, which rule 6
+ * replaces in the rows.
  */
-export function feedUrlErrors(url: string): string[] {
+const FEED_PARAMETER_TYPES: Readonly<Record<string, FeedParameterType>> = {
+  condition: CONDITION_PARAMETER,
+  condition_id: CONDITION_PARAMETER,
+  conditionId: CONDITION_PARAMETER,
+  end: { accepts: enumOf("0", "1"), description: "a documented sentinel, 0 or 1 (a committed bound is ignored on every URL this gate admits)" },
+  event_id: {
+    accepts: commaList((item) => /^[1-9][0-9]{0,18}$/.test(item)),
+    description: "Gamma event ids (decimal integers of at most 19 digits, at most 20, comma-separated)",
+  },
+  exclude_deposits_withdrawals: { accepts: enumOf("true", "false"), description: "a boolean, true or false" },
+  filter_amount: {
+    accepts: (value) => /^(?:0|[1-9][0-9]{0,14})(?:\.[0-9]{1,6})?$/.test(value),
+    description: "a decimal amount (at most 15 integer and 6 fraction digits)",
+  },
+  filter_type: { accepts: enumOf("CASH", "TOKENS"), description: "CASH or TOKENS" },
+  limit: {
+    accepts: (value) => /^(?:0|[1-9][0-9]{0,3})$/.test(value) && Number(value) <= 1000,
+    description: "an integer from 0 to 1000",
+  },
+  side: { accepts: enumOf("BUY", "SELL"), description: "BUY or SELL" },
+  sort_by: { accepts: enumOf("TIMESTAMP"), description: "TIMESTAMP (the only supported value)" },
+  sort_direction: { accepts: enumOf("ASC", "DESC"), description: "ASC or DESC" },
+  start: { accepts: enumOf("0", "1"), description: "a documented sentinel, 0 or 1 (a committed bound is ignored on every URL this gate admits)" },
+  taker_only: { accepts: enumOf("true", "false"), description: "a boolean, true or false" },
+  type: {
+    accepts: commaList((item) => /^[A-Z]+(?:_[A-Z]+)*$/.test(item)),
+    description: "activity type names (upper-case words such as TRADE or REDEEM, at most 20, comma-separated)",
+  },
+};
+
+/**
+ * The URL refusals of a trade or activity sidecar:
+ *
+ * - the URL is exactly `https://data-api.polymarket.com` and one feed route,
+ *   in canonical form, with no fragment, credential or port (round 2);
+ * - a query parameter S-O06 does not document for the feeds is refused, and
+ *   a documented one must hold a value of its documented type
+ *   (`FEED_PARAMETER_TYPES`, round 2), so no other value, a transaction hash
+ *   for example, rides on the URL;
+ * - every cursor parameter (any name containing `cursor`, every occurrence),
+ *   at most one of them, is checked by `feedCursorErrors`;
+ * - no other query value, path segment or fragment hides a venue cursor.
+ *
+ * A server's handling of a repeated parameter is not assumed.
+ */
+export function feedUrlErrors(
+  url: string,
+  knownConditionIds: ReadonlySet<string> = new Set(),
+): string[] {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -904,6 +1135,19 @@ export function feedUrlErrors(url: string): string[] {
     return [];
   }
   const errors: string[] = [];
+  if (
+    parsed.origin !== "https://data-api.polymarket.com" ||
+    !FEED_URL_PATHS.includes(parsed.pathname) ||
+    parsed.hash !== "" ||
+    url.includes("#") ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    parsed.href !== url
+  ) {
+    errors.push(
+      "sidecar.url: a trade or activity URL is exactly https://data-api.polymarket.com, one of /v2/trades, /v2/activity or /v2/activity/combos, and a query, in canonical form: no other path segment, no fragment, no credential, no port",
+    );
+  }
   const cursorKeys = [...parsed.searchParams.keys()].filter(isCursorParameter);
   if (cursorKeys.length > 1) {
     errors.push(
@@ -916,11 +1160,16 @@ export function feedUrlErrors(url: string): string[] {
         `sidecar url ${key}: not a query parameter S-O06 documents for /v2/trades or /v2/activity`,
       );
     }
+    const type = Object.hasOwn(FEED_PARAMETER_TYPES, key) ? FEED_PARAMETER_TYPES[key] : undefined;
     if (isCursorParameter(key)) {
       errors.push(...feedCursorErrors(value, `sidecar url ${key}`));
-    } else if (decodeFeedCursor(value) !== undefined) {
+    } else if (decodeFeedCursor(value) !== undefined || cursorLikeTokens(value).length > 0) {
       errors.push(
         `sidecar url ${key}: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter`,
+      );
+    } else if (type !== undefined && !type.accepts(value, { knownConditionIds })) {
+      errors.push(
+        `sidecar url ${key}: the value is not ${type.description} (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL`,
       );
     }
   }
@@ -932,8 +1181,16 @@ export function feedUrlErrors(url: string): string[] {
   return errors;
 }
 
-/** Rule 6: the trade and activity feed refusals. */
-export function feedErrors(view: unknown, sidecar: CaptureSidecar): string[] {
+/**
+ * Rule 6: the trade and activity feed refusals. `marketConditionIds`: the
+ * condition ids the report's source index read as a market
+ * (`CaptureContext.marketConditionIds`).
+ */
+export function feedErrors(
+  view: unknown,
+  sidecar: CaptureSidecar,
+  marketConditionIds: readonly string[] = [],
+): string[] {
   const errors: string[] = [];
   const rows = isRecord(view) ? view["data"] : undefined;
   if (!Array.isArray(rows)) {
@@ -978,7 +1235,14 @@ export function feedErrors(view: unknown, sidecar: CaptureSidecar): string[] {
   }
   const cursor = isRecord(pagination) ? pagination["next_cursor"] : undefined;
   errors.push(...feedCursorErrors(cursor, "$.pagination.next_cursor"));
-  errors.push(...feedUrlErrors(sidecar.url));
+  const knownConditionIds = new Set(marketConditionIds.map((id) => id.toLowerCase()));
+  for (const row of rows) {
+    const conditionId = isRecord(row) ? row["condition_id"] : undefined;
+    if (typeof conditionId === "string") {
+      knownConditionIds.add(conditionId.toLowerCase());
+    }
+  }
+  errors.push(...feedUrlErrors(sidecar.url, knownConditionIds));
   // A page with nothing to replace (no row, no cursor) may be the raw body;
   // the kind rules then require it to equal the raw response byte for byte.
   if (rows.length > 0 || typeof cursor === "string") {
@@ -1151,6 +1415,13 @@ export interface CaptureContext {
    * synthetic value. Absent: none.
    */
   readonly publicAddresses?: readonly string[];
+  /**
+   * The condition ids the report's source index read as a market
+   * (`marketReadConditionIds`): a trade or activity URL's `condition` value
+   * must be one of these, a row's `condition_id`, or labelled synthetic
+   * (rule 6, round 2). Absent: none.
+   */
+  readonly marketConditionIds?: readonly string[];
 }
 
 export interface CaptureValidationResult {
@@ -1459,7 +1730,7 @@ export function validateCapture(
 
   // 6. Trade and activity feeds.
   if (feed) {
-    errors.push(...feedErrors(view, sidecar));
+    errors.push(...feedErrors(view, sidecar, context.marketConditionIds));
   }
 
   // 7. The pins, and the ids they cite.

@@ -41,6 +41,7 @@ import { join, relative, sep } from "node:path";
 
 import {
   loadCapture,
+  marketReadConditionIds,
   parseSourceIndex,
   reportDefinesId,
   sidecarPathOf,
@@ -475,15 +476,16 @@ export function runVenueVerification(): VenueVerificationReport {
     }
     if (check.kind === "capture") {
       const captures = check.captures ?? [];
-      const sourceIndex = parseSourceIndex(
-        checkReport === null ? "" : (reportSectionText(checkReport, "14") ?? ""),
-      );
+      const sourceIndexText =
+        checkReport === null ? "" : (reportSectionText(checkReport, "14") ?? "");
+      const sourceIndex = parseSourceIndex(sourceIndexText);
       const captureResults = captures.map((capture) =>
         loadCapture(capture, {
           report: reportOf(check),
           reportContent: checkReport,
           sourceIndex,
           publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
+          marketConditionIds: marketReadConditionIds(sourceIndexText),
         }),
       );
       const errors = [

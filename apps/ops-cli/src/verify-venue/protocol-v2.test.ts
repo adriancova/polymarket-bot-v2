@@ -14,12 +14,14 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
+  cursorLikeTokens,
   decodeFeedCursor,
   duplicateKeys,
   evaluatePins,
   isLabelledSyntheticHex,
   isLabelledSyntheticText,
   loadCapture,
+  marketReadConditionIds,
   parseSourceIndex,
   redactionSubjects,
   reportDefinesId,
@@ -62,13 +64,15 @@ import {
 } from "./index.js";
 
 const V2_REPORT = readFileSync(join(REPO_ROOT, PROTOCOL_V2_REPORT_PATH), "utf8");
+const V2_SOURCE_INDEX = reportSectionText(V2_REPORT, "14") ?? "";
 
 /** The context the gate passes (`index.ts` `runVenueVerification`). */
 const CONTEXT: CaptureContext = {
   report: PROTOCOL_V2_REPORT_PATH,
   reportContent: V2_REPORT,
-  sourceIndex: parseSourceIndex(reportSectionText(V2_REPORT, "14") ?? ""),
+  sourceIndex: parseSourceIndex(V2_SOURCE_INDEX),
   publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
+  marketConditionIds: marketReadConditionIds(V2_SOURCE_INDEX),
 };
 
 function checkById(id: string): VenueCheck {
@@ -959,6 +963,8 @@ describe("V2-9 r1: every cursor in a trade or activity sidecar URL (V2-9-R1-02)"
       sidecar["url"] = `${sidecar["url"] as string}#${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
     });
     expect(fragment.errors).toEqual([
+      // Round 2: a trade or activity URL carries no fragment at all.
+      "sidecar.url: a trade or activity URL is exactly https://data-api.polymarket.com, one of /v2/trades, /v2/activity or /v2/activity/combos, and a query, in canonical form: no other path segment, no fragment, no credential, no port",
       "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
     ]);
     const prose = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
@@ -1025,6 +1031,235 @@ describe("V2-9 r1: every cursor in a trade or activity sidecar URL (V2-9-R1-02)"
     const sidecar = sidecarOf(captureSpec("data-v2-prices-history-page2.jsonc"));
     expect(decodeFeedCursor(new URL(sidecar["url"] as string).searchParams.get("cursor") ?? "")).toBeDefined();
     expect(validateEdited("data-v2-prices-history-page2.jsonc").errors).toEqual([]);
+  });
+});
+
+// --- round 2: cursors in any written form, typed URL values (V2-9-R2-01, -02) -------
+
+/** The trade sidecars' notes refusal (rule 6, prose). */
+const NOTES_CURSOR_ERROR =
+  "sidecar.notes: a token decodes to a venue cursor, which carries the seek anchor of the last row (S-O06); name a cursor by its labelled synthetic value";
+
+/** The feed URL shape refusal (round 2). */
+const FEED_URL_SHAPE_ERROR =
+  "sidecar.url: a trade or activity URL is exactly https://data-api.polymarket.com, one of /v2/trades, /v2/activity or /v2/activity/combos, and a query, in canonical form: no other path segment, no fragment, no credential, no port";
+
+/** The synthetic seek anchor's JSON text, and other encodings of it. */
+const SEEK_ANCHOR_JSON = Buffer.from(SYNTHETIC_SEEK_ANCHOR_CURSOR, "base64url").toString("utf8");
+const SEEK_ANCHOR_BASE64 = Buffer.from(SEEK_ANCHOR_JSON, "utf8").toString("base64");
+const SEEK_ANCHOR_HEX = Buffer.from(SEEK_ANCHOR_JSON, "utf8").toString("hex");
+const SEEK_ANCHOR_FULL_WIDTH = [...SYNTHETIC_SEEK_ANCHOR_CURSOR]
+  .map((char) => String.fromCharCode(char.charCodeAt(0) + 0xfee0))
+  .join("");
+
+/** The type refusal of one feed URL parameter (round 2). */
+function typeError(key: string): string {
+  return `sidecar url ${key}: the value is not`;
+}
+
+/** The V2 canary condition, which the report's source index reads as a market (S-L01, S-L04). */
+const CANARY_CONDITION = "0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000";
+
+describe("V2-9 r2: a cursor in any written form in a trade or activity sidecar (V2-9-R2-01)", () => {
+  it("MUTANT (verifier probe): an assignment-form cursor in the notes is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} Original cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(result.errors).toEqual([NOTES_CURSOR_ERROR]);
+  });
+
+  it("MUTANT (verifier probe): an assignment-form cursor in the URL fragment is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}#cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(result.errors).toEqual([
+      FEED_URL_SHAPE_ERROR,
+      "sidecar.url: a path segment or fragment decodes to a venue cursor (S-O06); a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
+    ]);
+  });
+
+  it("MUTANT (verifier probe): a cursor written as plain JSON in the notes is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["notes"] = `${sidecar["notes"] as string} The real cursor decoded: ${SEEK_ANCHOR_JSON}.`;
+    });
+    expect(result.errors).toEqual([NOTES_CURSOR_ERROR]);
+  });
+
+  it("MUTANT: a cursor percent-encoded, glued to a word, in standard base64, hex or full width, or after a colon, is refused", () => {
+    for (const written of [
+      `cursor%3D${SYNTHETIC_SEEK_ANCHOR_CURSOR}`,
+      `cursor%3d${SYNTHETIC_SEEK_ANCHOR_CURSOR}&limit=2`,
+      `cursor${SYNTHETIC_SEEK_ANCHOR_CURSOR}`,
+      `x${SYNTHETIC_SEEK_ANCHOR_CURSOR}`,
+      `xyz${SYNTHETIC_SEEK_ANCHOR_CURSOR}`,
+      `${SYNTHETIC_SEEK_ANCHOR_CURSOR}trailing`,
+      `next_cursor:${SYNTHETIC_SEEK_ANCHOR_CURSOR}`,
+      `"next_cursor":"${SYNTHETIC_SEEK_ANCHOR_CURSOR}"`,
+      `cursor=${SEEK_ANCHOR_BASE64}`,
+      `cursor=${SEEK_ANCHOR_HEX}`,
+      `cursor＝${SEEK_ANCHOR_FULL_WIDTH}`,
+      `cursor=${encodeURIComponent(SEEK_ANCHOR_JSON)}`,
+    ]) {
+      const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+        sidecar["notes"] = `${sidecar["notes"] as string} Original ${written}.`;
+      });
+      expect(result.errors, written).toContain(NOTES_CURSOR_ERROR);
+    }
+  });
+
+  it("MUTANT: an assignment-form cursor in a redaction, in a row value, or as a query value, is refused", () => {
+    const redaction = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      (sidecar["redactions"] as string[]).push(`url: the original was ?cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`);
+    });
+    expect(redaction.errors).toEqual([
+      "sidecar.redactions[9]: a token decodes to a venue cursor, which carries the seek anchor of the last row (S-O06); name a cursor by its labelled synthetic value",
+    ]);
+    const row = validateEdited(
+      "data-v2-trades-v1-page1.jsonc",
+      editJson((body) => {
+        firstRow(body)["title"] = `Bitcoin Up or Down cursor=${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+      }),
+    );
+    expect(row.errors).toEqual(["$.data[0].title: a token decodes to a venue cursor (S-O06)"]);
+    const queryValue = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&type=x${SYNTHETIC_SEEK_ANCHOR_CURSOR}`;
+    });
+    expect(queryValue.errors).toEqual([
+      "sidecar url type: the value decodes to a JSON object, as a venue cursor does; a trade or activity URL carries a cursor only as a labelled synthetic cursor parameter",
+    ]);
+  });
+
+  it("labelled synthetic cursors, public ids and prose are not taken for cursors", () => {
+    expect(cursorLikeTokens(`cursor=synthetic-cursor-trades-p1-next`)).toEqual([]);
+    expect(cursorLikeTokens(`next_cursor:synthetic-cursor-trades-p1-next; {data, pagination}; {}`)).toEqual([]);
+    expect(cursorLikeTokens(CANARY_CONDITION)).toEqual([]);
+    expect(
+      cursorLikeTokens("25070934348813416902477876984955073880416401960631253331845590271167412497744"),
+    ).toEqual([]);
+    // The committed trade sidecars' text (the feed captures; a non-feed
+    // sidecar may quote a JSON body, a 404 for example, in its notes).
+    for (const name of ["data-v2-trades-v1-page1.jsonc", "data-v2-trades-v1-page2.jsonc", "data-v2-trades-v2-empty.jsonc"]) {
+      const sidecar = sidecarOf(captureSpec(name));
+      for (const text of [sidecar["url"], sidecar["notes"], ...(sidecar["redactions"] as string[])]) {
+        expect(cursorLikeTokens(text as string), `${name}: ${String(text).slice(0, 60)}`).toEqual([]);
+      }
+    }
+  });
+});
+
+describe("V2-9 r2: every value on a trade or activity URL has its documented type (V2-9-R2-02)", () => {
+  it("MUTANT (verifier probe): a 64-hex value under start is refused", () => {
+    const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&start=0x${"a".repeat(64)}`;
+    });
+    expect(result.errors).toEqual([
+      "sidecar url start: the value is not a documented sentinel, 0 or 1 (a committed bound is ignored on every URL this gate admits) (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL",
+    ]);
+  });
+
+  it("MUTANT: a hash under any other documented parameter is refused", () => {
+    for (const key of [
+      "end",
+      "event_id",
+      "exclude_deposits_withdrawals",
+      "filter_amount",
+      "filter_type",
+      "limit",
+      "side",
+      "sort_by",
+      "sort_direction",
+      "taker_only",
+      "type",
+      "condition",
+      "condition_id",
+      "conditionId",
+    ]) {
+      for (const value of [PROBE_HASH, PROBE_HASH.slice(2), `0X${PROBE_HASH.slice(2).toUpperCase()}`]) {
+        const result = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+          sidecar["url"] = `${sidecar["url"] as string}&${key}=${value}`;
+        });
+        expect(hasError(result, typeError(key)), `${key}=${value}`).toBe(true);
+      }
+    }
+  });
+
+  it("MUTANT: a real-looking block timestamp under start or end is refused; the documented sentinels are not", () => {
+    for (const bound of ["start=1700000001", "end=1791241200", "start=2", "end=01"]) {
+      const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+        sidecar["url"] = `${sidecar["url"] as string}&${bound}`;
+      });
+      expect(hasError(result, typeError(bound.split("=")[0] as string)), bound).toBe(true);
+    }
+    const sentinels = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&start=1&end=0`;
+    });
+    expect(sentinels.errors).toEqual([]);
+  });
+
+  it("MUTANT: a condition that no market read and no row carries is refused; a known or labelled synthetic one is not", () => {
+    const unknown = validateEdited("data-v2-trades-v2-empty.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace(CANARY_CONDITION, PROBE_HASH);
+    });
+    expect(unknown.errors.filter((error) => error.startsWith("sidecar url"))).toEqual([
+      "sidecar url condition: the value is not condition ids (0x and 62 or 64 lowercase hex digits, at most 20, comma-separated), each one the report's source index read as a market, one a row carries as condition_id, or a labelled synthetic value (S-O06); a value of another shape, a hash for example, may not ride on a trade or activity URL",
+    ]);
+    const listed = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace("&limit=2", `,${PROBE_HASH}&limit=2`);
+    });
+    expect(hasError(listed, typeError("condition"))).toBe(true);
+    // The empty page's condition is read as a market by S-L01 and S-L04; with
+    // no market read in the context it is refused (the page has no row).
+    const noMarketRead = validateEdited("data-v2-trades-v2-empty.jsonc", undefined, undefined, {
+      ...CONTEXT,
+      marketConditionIds: [],
+    });
+    expect(hasError(noMarketRead, typeError("condition"))).toBe(true);
+    // A page-1 condition its rows carry passes with no market read.
+    expect(
+      validateEdited("data-v2-trades-v1-page1.jsonc", undefined, undefined, { ...CONTEXT, marketConditionIds: [] })
+        .errors,
+    ).toEqual([]);
+    const known = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = (sidecar["url"] as string).replace("&limit=2", `,${CANARY_CONDITION},0x${"0".repeat(61)}abc&limit=2`);
+    });
+    expect(known.errors).toEqual([]);
+    expect(marketReadConditionIds(V2_SOURCE_INDEX)).toContain(CANARY_CONDITION);
+    expect(
+      marketReadConditionIds(
+        [
+          `| S-X01 | \`https://data-api.polymarket.com/v2/trades?condition=${PROBE_HASH}\` | 00:00:01Z | 200 | 1 | \`${"a".repeat(64)}\` |  |`,
+          `| S-X02 | \`https://clob.polymarket.com/clob-markets/${CANARY_CONDITION}\` | 00:00:02Z | 200 | 1 | \`${"b".repeat(64)}\` |  |`,
+        ].join("\n"),
+      ),
+    ).toEqual([CANARY_CONDITION]);
+  });
+
+  it("every documented parameter accepts a value of its documented type", () => {
+    const result = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+      sidecar["url"] = `${sidecar["url"] as string}&limit=1000&taker_only=false&filter_type=CASH&filter_amount=0.01&side=BUY&event_id=16085,16086&sort_by=TIMESTAMP&sort_direction=ASC&type=TRADE,REDEEM,TIP&exclude_deposits_withdrawals=true`;
+    });
+    expect(result.errors).toEqual([]);
+    for (const bad of ["limit=1001", "side=buy", "filter_amount=1e9", "event_id=0", "type=TRADE,", `type=${[..."ABCDEFGHIJKLMNOPQRSTU"].map((letter) => `TYPE_${letter}`).join(",")}`]) {
+      const refused = validateEdited("data-v2-trades-v1-page2.jsonc", undefined, (sidecar) => {
+        sidecar["url"] = `${sidecar["url"] as string}&${bad}`;
+      });
+      expect(hasError(refused, typeError(bad.split("=")[0] as string)), bad).toBe(true);
+    }
+  });
+
+  it("MUTANT: a hash in an extra path segment or the fragment, and a non-canonical URL, are refused", () => {
+    for (const edit of [
+      (url: string) => url.replace("/v2/trades?", `/v2/trades/${PROBE_HASH}?`),
+      (url: string) => `${url}#${PROBE_HASH}`,
+      (url: string) => `${url}#`,
+      (url: string) => url.replace("/v2/trades?", `/v2/${PROBE_HASH}/../trades?`),
+      (url: string) => url.replace("/v2/trades?", "/v2/./trades?"),
+    ]) {
+      const result = validateEdited("data-v2-trades-v1-page1.jsonc", undefined, (sidecar) => {
+        sidecar["url"] = edit(sidecar["url"] as string);
+      });
+      expect(result.errors, edit("U")).toContain(FEED_URL_SHAPE_ERROR);
+    }
   });
 });
 
@@ -1367,5 +1602,19 @@ describe("V2-9 parent fixture rules: the dated, scoped exception", () => {
       expect(readme, statement).toContain(statement);
     }
     expect(readme).not.toContain("The trade size and\n  block timestamp are replaced too.");
+  });
+
+  it("round 2: the exception states the cursor forms, the typed trade URL and the new limits (V2-9-R2-01, -02)", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "as the value of an assignment (`cursor=…`, `#cursor=…`, `cursor%3D…`)",
+      "**Trade and activity URLs** (round 2)",
+      "`FEED_PARAMETER_TYPES`",
+      "`start` and `end`\n  are only the documented sentinels `0` and `1`",
+      "a venue cursor split across tokens or otherwise transformed",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    expect(fixtureText("protocol-v2/README.md")).toContain("round 2 added a\n    cursor in any written form");
   });
 });
