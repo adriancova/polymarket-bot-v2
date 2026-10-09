@@ -16,11 +16,15 @@
  *    scanner decodes (`textReadings`: as written, NFKC-normalized, and each
  *    percent-decoded layer; what it cannot decode fails by name). A string
  *    that is itself JSON text (a WebSocket frame, Gamma's `outcomes`) is also
- *    parsed strictly and walked. Every URL in a string must parse, and is
+ *    parsed strictly and walked. Round 8 (V2-9-R8-02): so is JSON text
+ *    quoted inside prose; and every JSON text that opens in any reading or
+ *    URL part (`readingJsonTexts`) must parse strictly, or the gate fails by
+ *    name, never reading it as prose. Every URL in a string must parse, and is
  *    split into its user information, host, path, each query name and value,
  *    and fragment; each part is read strictly (`textReadings(part, true)`)
  *    and scanned. Each reading answers to every rule:
- *    - `email`: an email address;
+ *    - `email`: an email address, in every raw mailbox spelling (round 8,
+ *      V2-9-R8-01: any script, quoted, commented, address literal);
  *    - `wallet`: a `0x` 40-hex address that is not labelled synthetic;
  *    - `hash`: `0x` and more than 40 hex digits, or 40 or more bare hex
  *      digits with a letter, not labelled synthetic;
@@ -69,7 +73,8 @@ import {
 } from "./fixtures.js";
 import { SCAN_ALLOWLIST } from "./scan-allowlist.js";
 import type { ScanAllowlistEntry, ScanRule } from "./scan-allowlist.js";
-import { StrictJsonError, memberPath, parseStrictJson, readStrictJsonFile } from "./strict-json.js";
+import { StrictJsonError, memberPath, parseStrictJsonPrefix, readStrictJsonFile } from "./strict-json.js";
+import type { StrictJson } from "./strict-json.js";
 
 export type { ScanAllowlistEntry, ScanRule } from "./scan-allowlist.js";
 export { SCAN_RULES } from "./scan-allowlist.js";
@@ -127,10 +132,22 @@ export interface TreeScan {
 
 // --- the readings of one text ---------------------------------------------------
 
-/** A text's rule matches and decode failures, memoized (the rules are pure). */
+/** A JSON text a string holds as written, parsed strictly, to be walked at `<json…>`. */
+interface EmbeddedJson {
+  /** The path suffix: `<json>` when the whole string is one JSON value, `<json@N>` for the value opening at offset `N`. */
+  readonly at: string;
+  readonly value: StrictJson;
+}
+
+/**
+ * A text's rule matches, decode and parse failures, and the JSON texts it
+ * holds as written; memoized (the rules are pure). Each failure is a suffix
+ * of the string's path: `: …`, or `<json…>…: …`.
+ */
 interface TextAnalysis {
   readonly matches: readonly (readonly [ScanRule, string])[];
   readonly failures: readonly string[];
+  readonly embedded: readonly EmbeddedJson[];
 }
 
 const ANALYSES = new Map<string, TextAnalysis>();
@@ -178,6 +195,58 @@ export function urlParts(url: string): { readonly name: string; readonly text: s
   return parts;
 }
 
+/**
+ * Where JSON text opens in a reading (round 8, V2-9-R8-02): any `{` or `[`
+ * that begins the text (after whitespace), and, anywhere, a `{` before a key
+ * string or `}`, or a `[` before a string, an object, an array or `]`.
+ */
+const JSON_START_RE = /^[ \t\n\r]*[[{]/;
+const JSON_OPENING_RE = /\{(?=[ \t\n\r]*["}])|\[(?=[ \t\n\r]*["{[\]])/g;
+
+/** The JSON texts of one reading, parsed strictly, or why the first that does not parse fails. */
+interface ReadingJson {
+  readonly texts: readonly { readonly offset: number; readonly end: number; readonly value: StrictJson }[];
+  /** The first opening that does not parse, by name: its offset and the parser's reason. */
+  readonly failure?: string;
+}
+
+/**
+ * Round 8 (V2-9-R8-02, the 2026-10-08 fail-closed ruling): every JSON text a
+ * reading holds must parse strictly. Each opening (`JSON_START_RE`,
+ * `JSON_OPENING_RE`) that no earlier parsed text covers is parsed as one
+ * strict JSON value from there; a truncated value, a trailing comma, a
+ * repeated key, a lone surrogate or any other syntax error is a named
+ * failure, never prose. Until round 8 a string that opened with `{` or `[`
+ * and did not parse was judged as prose, and a JSON text inside prose was not
+ * parsed at all.
+ */
+function readingJsonTexts(reading: string): ReadingJson {
+  const openings = new Set<number>();
+  const start = JSON_START_RE.exec(reading);
+  if (start !== null) {
+    openings.add(start[0].length - 1);
+  }
+  for (const match of reading.matchAll(JSON_OPENING_RE)) {
+    openings.add(match.index);
+  }
+  const texts: { offset: number; end: number; value: StrictJson }[] = [];
+  let covered = 0;
+  for (const offset of [...openings].sort((a, b) => a - b)) {
+    if (offset < covered) {
+      continue;
+    }
+    try {
+      const { value, end } = parseStrictJsonPrefix(reading, offset);
+      texts.push({ offset, end, value });
+      covered = end;
+    } catch (error: unknown) {
+      const reason = error instanceof StrictJsonError ? error.message : String(error);
+      return { texts, failure: `the JSON text at offset ${offset} does not parse strictly (${reason})` };
+    }
+  }
+  return { texts };
+}
+
 /** The token rules of one reading. */
 function readingMatches(reading: string): (readonly [ScanRule, string])[] {
   return [
@@ -200,40 +269,65 @@ export function analyzeText(text: string): TextAnalysis {
   }
   const matches = new Map<string, readonly [ScanRule, string]>();
   const failures: string[] = [];
-  const addReadings = (readings: readonly string[]): void => {
-    for (const reading of readings) {
+  const embedded: EmbeddedJson[] = [];
+  /** `where`: how a failure names the reading (empty for the text as written). */
+  const addReadings = (readings: readonly string[], where: string): void => {
+    let failed = false;
+    for (const [index, reading] of readings.entries()) {
       for (const match of readingMatches(reading)) {
         matches.set(`${match[0]}\u0000${match[1]}`, match);
+      }
+      const json = readingJsonTexts(reading);
+      // One named failure per text (or URL part): a decoded reading of a text
+      // that already failed as written adds nothing.
+      if (json.failure !== undefined && !failed) {
+        failed = true;
+        const which = index === 0 ? "" : "a decoded reading: ";
+        failures.push(`: ${where}${which}${json.failure}, so the gate fails closed`);
+      }
+      if (where === "" && index === 0) {
+        // The JSON texts of the string as written are walked: a key and a
+        // string inside one answer to every rule at their own path.
+        for (const { offset, end, value } of json.texts) {
+          const whole = reading.slice(0, offset).trim() === "" && reading.slice(end).trim() === "";
+          embedded.push({ at: whole ? "<json>" : `<json@${offset}>`, value });
+        }
       }
     }
   };
   const { readings, failure } = textReadings(text);
   if (failure !== undefined) {
-    failures.push(`the scanner cannot decode it (${failure}), so the gate fails closed`);
+    failures.push(`: the scanner cannot decode it (${failure}), so the gate fails closed`);
   }
-  addReadings(readings);
-  const urls = new Set(readings.flatMap((reading) => [...reading.matchAll(URL_CANDIDATE_RE)].map(([url]) => url)));
+  addReadings(readings, "");
+  // `://` first: a long run of scheme characters with none is not tried from each of its characters.
+  const urls = new Set(
+    readings.flatMap((reading) =>
+      reading.includes("://") ? [...reading.matchAll(URL_CANDIDATE_RE)].map(([url]) => url) : [],
+    ),
+  );
   for (const url of urls) {
     try {
       new URL(url);
     } catch {
-      failures.push("a URL in it does not parse, so the scanner cannot split it and the gate fails closed");
+      failures.push(": a URL in it does not parse, so the scanner cannot split it and the gate fails closed");
       continue;
     }
     for (const part of urlParts(url)) {
       const forms = part.name.startsWith("query") ? [part.text, part.text.replace(/\+/g, " ")] : [part.text];
       for (const form of forms) {
         const partReadings = textReadings(form, true);
+        const partName = part.name.replace(/ \d+$/, "");
         if (partReadings.failure !== undefined) {
           failures.push(
-            `the URL's ${part.name.replace(/ \d+$/, "")}: the scanner cannot decode it (${partReadings.failure}), so the gate fails closed`,
+            `: the URL's ${partName}: the scanner cannot decode it (${partReadings.failure}), so the gate fails closed`,
           );
         }
-        addReadings(partReadings.readings);
+        addReadings(partReadings.readings, `the URL's ${partName}: `);
       }
     }
   }
-  const analysis: TextAnalysis = { matches: [...matches.values()], failures: [...new Set(failures)] };
+  const analysis: TextAnalysis = { matches: [...matches.values()], failures: [...new Set(failures)], embedded };
   if (ANALYSES.size >= MAX_ANALYSES) {
     ANALYSES.clear();
   }
@@ -256,38 +350,28 @@ function addFinding(state: WalkState, path: string, rule: ScanRule, token: strin
   }
 }
 
+/**
+ * Scans one string or key at `path`, and walks the JSON texts it holds as
+ * written (a WebSocket frame, Gamma's `outcomes`, a JSON object quoted in
+ * prose), so their escapes cannot hide a value from the rules.
+ */
 function scanText(state: WalkState, path: string, text: string): void {
   const analysis = analyzeText(text);
   for (const failure of analysis.failures) {
-    state.failures.push(`${path}: ${failure}`);
+    state.failures.push(`${path}${failure}`);
   }
   for (const [rule, token] of analysis.matches) {
     addFinding(state, path, rule, token);
   }
+  for (const { at, value } of analysis.embedded) {
+    walkValue(state, `${path}${at}`, value);
+  }
 }
-
-/** A string that may be JSON text: its first non-space character opens an object or an array. */
-const JSON_TEXT_RE = /^\s*[[{]/;
 
 function walkValue(state: WalkState, path: string, value: unknown): void {
   if (typeof value === "string") {
     state.strings += 1;
     scanText(state, path, value);
-    if (JSON_TEXT_RE.test(value)) {
-      // A string that is JSON text is also walked as JSON, so its escapes
-      // (`@`) and repeated keys cannot hide a value.
-      let embedded: unknown;
-      try {
-        embedded = parseStrictJson(value);
-      } catch (error: unknown) {
-        if (error instanceof StrictJsonError && error.kind !== "syntax") {
-          state.failures.push(`${path}<json>${error.message.replace(/^\$/, "")}`);
-        }
-        // Not JSON: prose that opens with a bracket, judged as text above.
-        return;
-      }
-      walkValue(state, `${path}<json>`, embedded);
-    }
     return;
   }
   if (Array.isArray(value)) {

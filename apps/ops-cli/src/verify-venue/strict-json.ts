@@ -74,7 +74,26 @@ const ESCAPES: Readonly<Record<string, string>> = {
  * ill-formed string. Throws `StrictJsonError` with the path of the failure.
  */
 export function parseStrictJson(text: string): StrictJson {
-  let index = 0;
+  return parseStrictJsonFrom(text, 0, true).value;
+}
+
+/**
+ * Round 8 (V2-9-R8-02): parses one strict JSON value that opens at `start`
+ * of a longer text (JSON text inside prose), and returns it with the offset
+ * just past it; the text after it is not read. The same strictness as
+ * `parseStrictJson`: a truncated value, a trailing comma, a repeated key or
+ * a lone surrogate throws `StrictJsonError`.
+ */
+export function parseStrictJsonPrefix(text: string, start: number): { readonly value: StrictJson; readonly end: number } {
+  return parseStrictJsonFrom(text, start, false);
+}
+
+function parseStrictJsonFrom(
+  text: string,
+  start: number,
+  wholeText: boolean,
+): { readonly value: StrictJson; readonly end: number } {
+  let index = start;
   const fail = (kind: StrictJsonError["kind"], message: string): never => {
     throw new StrictJsonError(kind, message);
   };
@@ -229,11 +248,14 @@ export function parseStrictJson(text: string): StrictJson {
     return Number(number[0]);
   };
   const value = parseValue("$");
+  if (!wholeText) {
+    return { value, end: index };
+  }
   skipWhitespace();
   if (index < text.length) {
     syntax("the end of the document");
   }
-  return value;
+  return { value, end: index };
 }
 
 /**

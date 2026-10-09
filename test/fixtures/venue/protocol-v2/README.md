@@ -123,6 +123,10 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
     every key and string at any depth in every reading, every URL split into
     its parts, and an explicit, sourced allowlist of (file, JSON path, exact
     value) exceptions (`scan-allowlist.ts`);
+    round 8 reads every raw mailbox spelling (any script, quoted,
+    commented, address literal), and fails by name on JSON text in any
+    string, reading or URL part that does not parse strictly, never reading
+    it as prose;
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no

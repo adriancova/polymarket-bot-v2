@@ -842,8 +842,32 @@ export function redactionSubjects(redaction: string): readonly string[] {
 // machine-detectable. Sidecar prose names personal values by placeholder or
 // synthetic label only, and the reviewer reads it.
 
-/** An email address, anywhere in a string. */
-const EMAIL_RE = /[\w.%+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}/;
+/**
+ * An email address, anywhere in a string. Round 8 (V2-9-R8-01): every raw
+ * mailbox spelling a paste can carry, not only an ASCII dot-atom:
+ *
+ * - the local part is a dot-atom over RFC 6531 `atext` (RFC 5322's ASCII
+ *   `atext`, and any Unicode letter, mark or digit: `josé@…`), or an RFC 5321
+ *   quoted string (`"Jane Doe"@…`), optionally followed by an RFC 5322
+ *   comment (`jane(work)@…`);
+ * - the domain is dot-separated labels of Unicode letters, marks, digits,
+ *   `-` or `_`, ending in a label of two or more letters or an IDNA A-label
+ *   (`xn--…`); or an RFC 5321 address literal (`probe@[192.0.2.1]`).
+ *
+ * The local part is read as a run of `atext` and dots (a typo's `..` or a
+ * leading dot included), and starts only where such a run starts (the
+ * lookbehind), so a long run is tried once, not from each of its characters:
+ * the match is linear in the text. Callers skip a text with no `@`
+ * (`hasEmailAddress`, `emailTokens`).
+ */
+const EMAIL_ATEXT_CHARS = String.raw`\p{L}\p{M}\p{N}!#$%&'*+\-/=?^_\x60{|}~`;
+const EMAIL_DOMAIN_LABEL = String.raw`[\p{L}\p{M}\p{N}_-]+`;
+const EMAIL_SOURCE = String.raw`(?:"[^"\r\n]*"|(?<![.${EMAIL_ATEXT_CHARS}])[.${EMAIL_ATEXT_CHARS}]+)(?:\([^()\r\n]*\))?@(?:${EMAIL_DOMAIN_LABEL}(?:\.${EMAIL_DOMAIN_LABEL})*\.(?:[xX][nN]--[A-Za-z0-9-]+|[\p{L}\p{M}]{2,})|\[[^\]\s@]+\])`;
+
+/** Whether a reading holds an email address (round 8: `EMAIL_SOURCE`). */
+function hasEmailAddress(reading: string): boolean {
+  return reading.includes("@") && new RegExp(EMAIL_SOURCE, "u").test(reading);
+}
 
 /**
  * A `0x` 40-hex token (an address), not the prefix of a longer hex run (the
@@ -954,7 +978,7 @@ export function personalValueErrors(
 ): string[] {
   const normalized = text.normalize("NFKC");
   const errors: string[] = [];
-  if (EMAIL_RE.test(normalized)) {
+  if (hasEmailAddress(normalized)) {
     errors.push(`${where}: an email address may not be committed (personal data)`);
   }
   for (const [token] of normalized.matchAll(ADDRESS_TOKEN_RE)) {
@@ -2214,7 +2238,10 @@ export function fixturePersonalDataErrors(
 
 /** Every email address in one reading. */
 export function emailTokens(reading: string): string[] {
-  return [...reading.matchAll(new RegExp(EMAIL_RE.source, "g"))].map(([token]) => token);
+  if (!reading.includes("@")) {
+    return [];
+  }
+  return [...reading.matchAll(new RegExp(EMAIL_SOURCE, "gu"))].map(([token]) => token);
 }
 
 /**

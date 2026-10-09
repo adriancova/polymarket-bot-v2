@@ -10,7 +10,12 @@
  *   JSON text too), and the walk must refuse it at that path;
  * - invalid UTF-8 and a repeated key are planted into every committed file;
  * - the verifier's round-7 probes (V2-9-R7-01, -02, -03), byte for byte;
- * - every fail-closed path of the walk, and the allowlist's exactness.
+ * - every fail-closed path of the walk, and the allowlist's exactness;
+ * - round 8 (V2-9-R8-01, -02): every raw mailbox spelling (a Unicode, a
+ *   quoted, a commented and an address-literal one) and a JSON text that does
+ *   not parse (truncated, a trailing comma) are planted into every JSON path
+ *   of every committed file too, and the verifier's round-8 probes, byte for
+ *   byte. A JSON text quoted inside prose is a site of its own.
  *
  * Every mutant is built in memory or in a temporary directory; no committed
  * fixture is written. All planted values are invented. Offline.
@@ -19,6 +24,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { emailTokens } from "./captures.js";
 import { VENUE_FIXTURE_ROOT } from "./fixtures.js";
 import { SCAN_ALLOWLIST } from "./scan-allowlist.js";
 import type { ScanAllowlistEntry, ScanRule } from "./scan-allowlist.js";
@@ -68,7 +74,8 @@ function refusedAt(scan: FileScan, path: string, rule: ScanRule): boolean {
 type Segment =
   | { readonly kind: "key"; readonly key: string }
   | { readonly kind: "index"; readonly index: number }
-  | { readonly kind: "json" };
+  | { readonly kind: "json" }
+  | { readonly kind: "jsonAt"; readonly offset: number; readonly end: number };
 
 /** One place to plant a value, and the path where the walk must refuse it. */
 interface Site {
@@ -87,6 +94,11 @@ function editAt(root: StrictJson, at: readonly Segment[], edit: (node: StrictJso
   if (head.kind === "json") {
     return JSON.stringify(editAt(parseStrictJson(root as string), rest, edit));
   }
+  if (head.kind === "jsonAt") {
+    const text = root as string;
+    const edited = JSON.stringify(editAt(parseStrictJson(text.slice(head.offset, head.end)), rest, edit));
+    return `${text.slice(0, head.offset)}${edited}${text.slice(head.end)}`;
+  }
   if (head.kind === "index") {
     const array = [...(root as StrictJson[])];
     array[head.index] = editAt(array[head.index] as StrictJson, rest, edit);
@@ -100,20 +112,49 @@ function editAt(root: StrictJson, at: readonly Segment[], edit: (node: StrictJso
   return copy;
 }
 
+/**
+ * The JSON texts a committed string holds (found here independently of the
+ * walk): the whole string, or, round 8, each `{"…}` or `["…]` span quoted in
+ * prose, the shortest that parses strictly.
+ */
+function jsonTextsOf(text: string): { readonly offset: number; readonly end: number; readonly whole: boolean }[] {
+  if (/^\s*[[{]/.test(text)) {
+    try {
+      parseStrictJson(text);
+      return [{ offset: 0, end: text.length, whole: true }];
+    } catch {
+      return [];
+    }
+  }
+  const found: { offset: number; end: number; whole: boolean }[] = [];
+  for (let offset = text.search(/[{[]["{[]/); offset !== -1 && offset < text.length; ) {
+    let end = -1;
+    for (let close = offset + 1; close < text.length && end === -1; close += 1) {
+      if (text[close] === "}" || text[close] === "]") {
+        try {
+          parseStrictJson(text.slice(offset, close + 1));
+          end = close + 1;
+        } catch {
+          // Not yet a whole value.
+        }
+      }
+    }
+    if (end !== -1) {
+      found.push({ offset, end, whole: false });
+    }
+    const next = text.slice(end === -1 ? offset + 1 : end).search(/[{[]["{[]/);
+    offset = next === -1 ? -1 : (end === -1 ? offset + 1 : end) + next;
+  }
+  return found;
+}
+
 /** Every plant site of a document: every value, member, key and item, at any depth. */
 function sitesOf(node: StrictJson, path: string, at: readonly Segment[], into: Site[] = []): Site[] {
   if (typeof node === "string") {
     into.push({ description: `${path} (the string, replaced)`, at, plant: (_, value) => value, expected: () => path });
-    let embedded: StrictJson | undefined;
-    if (/^\s*[[{]/.test(node)) {
-      try {
-        embedded = parseStrictJson(node);
-      } catch {
-        embedded = undefined;
-      }
-    }
-    if (embedded !== undefined) {
-      sitesOf(embedded, `${path}<json>`, [...at, { kind: "json" }], into);
+    for (const { offset, end, whole } of jsonTextsOf(node)) {
+      const segment: Segment = whole ? { kind: "json" } : { kind: "jsonAt", offset, end };
+      sitesOf(parseStrictJson(node.slice(offset, end)), `${path}<json${whole ? "" : `@${offset}`}>`, [...at, segment], into);
     }
     return into;
   }
@@ -221,20 +262,22 @@ describe("V2-9 r7 CLASS PIN: each rule's offending value, planted into every JSO
   }
 
   it("covers every kind of site: the plant counts are pinned for the committed tree", () => {
-    const counts = { files: 0, sites: 0, embedded: 0 };
+    const counts = { files: 0, sites: 0, embedded: 0, quoted: 0 };
     for (const file of FILES) {
       counts.files += 1;
       for (const document of documentsOf(file)) {
         const sites = sitesOf(document.value, document.path, []);
         counts.sites += sites.length;
         counts.embedded += sites.filter((site) => site.at.some((segment) => segment.kind === "json")).length;
+        counts.quoted += sites.filter((site) => site.at.some((segment) => segment.kind === "jsonAt")).length;
       }
     }
     expect(counts.files).toBe(59);
-    // 1649 strings, 524 other scalars, 436 objects (a member and a key each),
-    // 126 arrays, 2338 keys; the embedded JSON texts' sites included.
+    // 1650 strings, 524 other scalars, 437 objects (a member and a key each),
+    // 126 arrays, 2339 keys; the embedded JSON texts' sites included.
     expect(counts.sites).toBeGreaterThan(5000);
     expect(counts.embedded).toBeGreaterThan(0);
+    expect(counts.quoted).toBeGreaterThan(0);
   });
 });
 
@@ -275,8 +318,9 @@ describe("V2-9 r7: invalid UTF-8 and a repeated key fail the walk in every commi
     record.data = record.data.replace('{"market":', `{"market":"${PROBE_EMAIL}","market":`);
     lines[2] = JSON.stringify(record);
     const scan = scanFixtureFile(file, Buffer.from(lines.join("\n")));
+    // Round 8: one named failure for each JSON text, whatever the parser's reason.
     expect(scan.failures).toEqual([
-      '$[2].data<json>[0].market: the key "market" occurs twice in one object; a lenient parse keeps only the last value, so an earlier one would escape every rule',
+      '$[2].data: the JSON text at offset 0 does not parse strictly ($[0].market: the key "market" occurs twice in one object; a lenient parse keeps only the last value, so an earlier one would escape every rule), so the gate fails closed',
     ]);
   });
 
@@ -473,4 +517,153 @@ describe("V2-9 r7: the allowlist is (file, JSON path, exact value), sourced, and
     expect(failing).toEqual(FILES.filter((file) => listed.has(file)));
   });
 
+});
+
+// --- round 8: every raw mailbox spelling, and JSON text that does not parse ------------
+
+/** Round 8 (V2-9-R8-01): raw mailbox spellings a paste can carry (invented). */
+const R8_EMAILS: readonly string[] = [
+  "josé@example.test",
+  '"Jane Doe"@example.test',
+  "probe(work)@example.test",
+  "probe@[192.0.2.1]",
+];
+
+/** Round 8 (V2-9-R8-02): JSON texts that do not parse (the verifier's two notes). */
+const R8_UNPARSEABLE: readonly string[] = ['{"capture":"partial"', '{"capture":"partial",}'];
+
+/** Whether the walk fails at `path` because a JSON text there does not parse, by name. */
+function unparseableAt(scan: FileScan, path: string): boolean {
+  return scan.failures.some(
+    (failure) => failure.startsWith(`${path}: the JSON text at offset 0 does not parse strictly (`) && failure.endsWith(", so the gate fails closed"),
+  );
+}
+
+describe("V2-9 r8 CLASS PIN: a raw mailbox in every spelling, and a JSON text that does not parse, planted into every JSON path of every committed file", () => {
+  for (const file of FILES) {
+    it(`MUTANT: ${file}: every path, one at a time, for a Unicode, quoted, commented and literal email, a truncated and a trailing-comma JSON text`, () => {
+      const documents = documentsOf(file);
+      const misses: string[] = [];
+      let planted = 0;
+      documents.forEach((document, documentIndex) => {
+        for (const site of sitesOf(document.value, document.path, [])) {
+          const mutantOf = (value: string): FileScan =>
+            scanFixtureFile(
+              file,
+              serialize(
+                file,
+                documents.map((other, index) =>
+                  index === documentIndex ? editAt(other.value, site.at, (node) => site.plant(node, value)) : other.value,
+                ),
+              ),
+            );
+          for (const value of R8_EMAILS) {
+            const scan = mutantOf(value);
+            planted += 1;
+            if (scan.ok || !refusedAt(scan, site.expected(value), "email")) {
+              misses.push(`${site.description}: email ${value}`);
+            }
+          }
+          for (const value of R8_UNPARSEABLE) {
+            const scan = mutantOf(value);
+            planted += 1;
+            if (scan.ok || !unparseableAt(scan, site.expected(value))) {
+              misses.push(`${site.description}: unparseable ${value}`);
+            }
+          }
+        }
+      });
+      expect(misses).toEqual([]);
+      expect(planted).toBeGreaterThan(0);
+    }, 120_000);
+  }
+});
+
+describe("V2-9 r8: the verifier's probes, byte for byte (V2-9-R8-01, -02), and the email and JSON-text rules", () => {
+  const notesScan = (edit: (notes: string) => string): FileScan =>
+    plantJson(ROUTER, (o) => (o["notes"] = edit(String(o["notes"]))));
+
+  it("MUTANT (R8-01): a quoted and an internationalized mailbox appended to the Router notes", () => {
+    for (const contact of [' Contact: "Jane Doe"@example.test', " Contact: josé@example.test"]) {
+      const scan = notesScan((notes) => notes + contact);
+      expect(scan.ok, contact).toBe(false);
+      expect(refusedAt(scan, "$.notes", "email"), contact).toBe(true);
+    }
+  });
+
+  it("MUTANT (R8-02): the Router notes set to a truncated and to a trailing-comma JSON text fail by name", () => {
+    expect(notesScan(() => '{"capture":"partial"').failures).toEqual([
+      '$.notes: the JSON text at offset 0 does not parse strictly (expected "," or "}" at the end of the text), so the gate fails closed',
+    ]);
+    expect(notesScan(() => '{"capture":"partial",}').failures).toEqual([
+      '$.notes: the JSON text at offset 0 does not parse strictly (expected a key string at offset 21, found "}"), so the gate fails closed',
+    ]);
+  });
+
+  it("MUTANT (the verifier's other round-8 probes): a truncated JSON text before the notes, a trailing-comma one after them, an address literal, a JSON text in the source fragment", () => {
+    expect(unparseableAt(notesScan((notes) => `{"capture": ${notes}`), "$.notes")).toBe(true);
+    const after = notesScan((notes) => `${notes} ${JSON.stringify({ capture: "partial" }).replace("}", ",}")}`);
+    expect(after.failures.some((failure) => /^\$\.notes: the JSON text at offset \d+ does not parse strictly \(expected a key string/.test(failure))).toBe(true);
+    expect(refusedAt(notesScan((notes) => `${notes} Contact: probe@[192.0.2.1]`), "$.notes", "email")).toBe(true);
+    const fragment = plantJson(ROUTER, (o) => (o["source"] = `${String(o["source"])}#${encodeURIComponent('{"capture":')}`));
+    expect(fragment.failures).toContain(
+      "$.source: the URL's fragment: the JSON text at offset 0 does not parse strictly (expected a key string at the end of the text), so the gate fails closed",
+    );
+  });
+
+  it("MUTANT: a JSON text quoted inside prose is walked: an escape cannot hide a value in it, and a repeated key in it fails; a percent-encoded one in prose, and a bracket that opens no JSON, fail too", () => {
+    const hidden = notesScan((notes) => `${notes} frame {"contact":"probe\\u0040example.test"} seen`);
+    const at = `$.notes<json@${String(JSON.parse(bytesOf(ROUTER).toString("utf8")).notes).length + 7}>.contact`;
+    expect(refusedAt(hidden, at, "email")).toBe(true);
+    expect(notesScan((notes) => `${notes} frame {"a":1,"a":2} seen`).failures.join("\n")).toContain('the key "a" occurs twice in one object');
+    expect(notesScan((notes) => `${notes} see ${encodeURIComponent('{"capture":')}`).failures).toEqual([
+      `$.notes: a decoded reading: the JSON text at offset ${String(JSON.parse(bytesOf(ROUTER).toString("utf8")).notes).length + 5} does not parse strictly (expected a JSON value at the end of the text), so the gate fails closed`,
+    ]);
+    expect(notesScan((notes) => `[synthetic] ${notes}`).failures.join("\n")).toContain(
+      "the JSON text at offset 0 does not parse strictly (expected a JSON value at offset 1",
+    );
+  });
+
+  it("the email rule reads every raw mailbox spelling, and not a package scope, a version or a bare host", () => {
+    const emails = (text: string): string[] =>
+      analyzeText(text)
+        .matches.filter(([rule]) => rule === "email")
+        .map(([, token]) => token);
+    for (const [text, token] of [
+      ["Contact: josé@example.test", "josé@example.test"],
+      ['Contact: "Jane Doe"@example.test', '"Jane Doe"@example.test'],
+      ["Contact: probe@[192.0.2.1]", "probe@[192.0.2.1]"],
+      ["Contact: probe(work)@example.test", "probe(work)@example.test"],
+      ["probe@例え.テスト", "probe@例え.テスト"],
+      ["probe@xn--r8jz45g.xn--zckzah", "probe@xn--r8jz45g.xn--zckzah"],
+      ["Contact: josé@example.test", "josé@example.test"],
+      ["PROBE＠EXAMPLE.TEST", "PROBE@EXAMPLE.TEST"],
+      ["first.last+tag@sub.example.test", "first.last+tag@sub.example.test"],
+    ] as const) {
+      expect(emails(text), text).toContain(token);
+    }
+    for (const text of ["@polymarket/clob-client", "clob-client@5.2.0", "user@localhost", "no address here"]) {
+      expect(emails(text), text).toEqual([]);
+    }
+  });
+
+  it("the READMEs state round 8", () => {
+    expect(readFileSync(join(VENUE_FIXTURE_ROOT, "README.md"), "utf8")).toContain(
+      "- **Every raw mailbox, and JSON text that parses** (round 8, V2-9-R8-01 and\n  -02).",
+    );
+    expect(readFileSync(join(VENUE_FIXTURE_ROOT, "protocol-v2", "README.md"), "utf8")).toContain(
+      "round 8 reads every raw mailbox spelling",
+    );
+  });
+
+  it("the email rule is linear: a long run with an @ and no address is read at once, and so is the walk", () => {
+    const started = Date.now();
+    for (const text of [`${"a.".repeat(50_000)}@x`, `a@${"b.".repeat(50_000)}`, `${'"a"'.repeat(20_000)}@`, `${"a(".repeat(30_000)})@x`]) {
+      expect(emailTokens(text)).toEqual([]);
+    }
+    expect(Date.now() - started).toBeLessThan(2_000);
+    const walked = Date.now();
+    expect(analyzeText(`${"a.".repeat(50_000)}@x`).failures).toEqual([]);
+    expect(Date.now() - walked).toBeLessThan(2_000);
+  });
 });

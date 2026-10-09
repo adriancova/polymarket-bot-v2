@@ -508,6 +508,17 @@ exempt by name:
 - **Closed envelopes.** A fixture's envelope holds exactly `fixture`,
   `source`, `retrieved`, `sanitized`, `notes` and `examples`, and an example
   exactly `name` and `payload` (a sidecar's keys were already closed).
+- **Every raw mailbox, and JSON text that parses** (round 8, V2-9-R8-01 and
+  -02). The email rule reads every raw mailbox spelling a paste can carry:
+  a local part in any script (`josé@…`, RFC 6531), a quoted one
+  (`"Jane Doe"@…`, RFC 5321), one followed by a comment (`jane(work)@…`),
+  and a domain in any script, an IDNA A-label or an address literal
+  (`…@[192.0.2.1]`). JSON text opens wherever a string starts with `{` or
+  `[`, and wherever a `{` precedes a key or a `[` precedes a string, an
+  object or an array; each must parse strictly as one JSON value from there,
+  or the gate fails by name (a truncated value, a trailing comma, a repeated
+  key). It is never read as prose instead. That holds in every reading, and
+  in every URL part. A JSON text quoted in prose is walked like a whole one.
 
 **What the gate cannot check.** These are not machine-detectable:
 
@@ -526,6 +537,9 @@ exempt by name:
   the trade-page rules above refuse a long one (round 7; until round 7 a
   whole-value hex id in a fixture payload was not judged either, and now it
   is, by path);
+- an email address deliberately disguised ("jane at example dot com",
+  spaces around the `@`, an address with no dot in its domain such as
+  `jane@localhost`) (round 8: per the 2026-10-08 ruling, not a raw paste);
 - a personal value hidden by a deliberate re-encoding other than
   percent-encoding (round 5: per the 2026-10-08 ruling, such a bypass is a
   follow-up, not a gap of this gate);
