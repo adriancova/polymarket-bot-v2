@@ -22,7 +22,7 @@
 # NAME (ADR-010 §3). The four run-mode defaults (MAX_RUN_MODE=PAPER,
 # ALLOW_REAL_ORDERS=false, LIVE_MICRO_MAX_ORDER_NOTIONAL=0,
 # LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0) are not set by this file; the processes
-# run on the host, and each one's startup check enforces them. Every published
+# run on the host; the trader's and the control API's startup checks enforce them. Every published
 # port binds to 127.0.0.1 (handoff §15).
 name: polymarket-bot-paper
 

@@ -5,8 +5,9 @@ consumes it and writes PostgreSQL, and the control API reads. Details stay where
 they are owned; this page gives the order and links to them.
 
 **Safety.** `MAX_RUN_MODE=PAPER`, `ALLOW_REAL_ORDERS=false`,
-`LIVE_MICRO_MAX_ORDER_NOTIONAL=0`, `LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0`. Every
-process checks these at startup and refuses a weakened value. Nothing here
+`LIVE_MICRO_MAX_ORDER_NOTIONAL=0`, `LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0`. The
+trader and the control API check them at startup and refuse a weakened value;
+the data gateway places no orders and only reads its run mode. Nothing here
 needs or accepts a credential, signer or wallet.
 
 ## 1. Start, in this order
