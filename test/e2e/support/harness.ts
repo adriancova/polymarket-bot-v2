@@ -171,8 +171,8 @@ export function assemble(options: AssembleOptions = {}): {
       fillModelVersion: readString(simulation["fillModelVersion"], "tier0.unconfigured"),
       fillModelParametersHash: readString(simulation["fillModelParametersHash"], "0".repeat(64)),
       feeSchedule: fees.value,
-      startingCash: readString(simulation["startingCash"], "0"),
     },
+    startingCash: readString(((document["accounting"] ?? {}) as Record<string, unknown>)["startingCash"], "0"),
     ...(options.venueRetention === undefined ? {} : { retention: options.venueRetention }),
   });
   if (!built.ok) {

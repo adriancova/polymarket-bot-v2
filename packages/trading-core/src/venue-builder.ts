@@ -24,7 +24,7 @@
  * | `runMode` | `TRADER_RUN_MODE` (`"PAPER"`): the one mode the core starts in; the plan carries it and the venue refuses a plan naming another | — |
  * | `model` | Tier 0 over the settings' fill-model version and parameters hash | `settings` |
  * | `feeSnapshot` | read through `packages/simulation`'s own door; a refused snapshot is this function's refusal | `settings.feeSchedule` |
- * | `startingCash` | — | `settings.startingCash` |
+ * | `startingCash` | — | `startingCash` (the configuration's `accounting.startingCash`, the one statement of the opening balance) |
  * | `policy` | `createExecutionPolicy` over the clock (`venue-policy.ts`): it reads the planned order's own time-in-force | `log` (where an order without a time-in-force is logged; nothing when absent) |
  * | `books` | a live lookup through the holder's trader on every read | — |
  * | `rateLimits` | `unmodeledRateLimits` with {@link UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE} | `rateLimits` (a test that needs a REAL venue refusal passes a token bucket) |
@@ -108,8 +108,6 @@ export interface SimulatedVenueSettings {
   readonly fillModelParametersHash: string;
   /** §6 invariant 9: the fee schedule the run books against. Validated here. */
   readonly feeSchedule: FeeScheduleSnapshot;
-  /** The venue's opening simulated cash. */
-  readonly startingCash: string;
 }
 
 /** Inputs to {@link buildSimulatedVenue}. Only these vary between callers. */
@@ -117,6 +115,8 @@ export interface SimulatedVenueBuildOptions {
   /** The §12.1 clock the trader is built with — the SAME one. */
   readonly clock: Clock;
   readonly settings: SimulatedVenueSettings;
+  /** The venue's opening simulated cash: the configuration's `accounting.startingCash`. */
+  readonly startingCash: string;
   /**
    * Where the execution policy logs a planned order it cannot resolve a
    * time-in-force for, before refusing it. Absent: not logged (the refusal
@@ -183,7 +183,7 @@ export function buildSimulatedVenue(options: SimulatedVenueBuildOptions): Simula
     feeSnapshot: fees.value,
     rateLimits: options.rateLimits ?? unmodeledRateLimits(UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE),
     policy: createExecutionPolicy(options.clock, options.log ?? discard),
-    startingCash: settings.startingCash,
+    startingCash: options.startingCash,
     ...(options.retention === undefined ? {} : { retention: options.retention }),
     books: {
       book(input): BookView | undefined {

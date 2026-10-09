@@ -87,7 +87,6 @@ export function traderHealthSamples(
       scope: labels.scope,
       scope_ref: labels.scope_ref,
       code: halt.code,
-      action: halt.action,
     });
   }
 

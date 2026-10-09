@@ -659,9 +659,9 @@ async function faultBoundaryBeforeAnyHalt(context: TestContext, healthUrl: strin
   return boundary;
 }
 
-/** The exit snapshot's halts, as [scope, code, action] triples. */
+/** The exit snapshot's halts, as [scope, code] pairs. */
 function haltTriples(run: ProcessRun): string[][] {
-  return exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code, halt.action]);
+  return exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code]);
 }
 
 // ---------------------------------------------------------------------------
@@ -747,8 +747,8 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           expect(pumpStopped.line).toMatch(/^pump stopped: HALTED after \d+ poll\(s\)$/u);
           const after = exitHealth(run);
           expect(after.healthy).toBe(false);
-          expect(after.halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-            ["GLOBAL", "TRANSPORT_UNAVAILABLE", "FULL_HALT"],
+          expect(after.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([
+            ["GLOBAL", "TRANSPORT_UNAVAILABLE"],
           ]);
           const halt = after.halts[0];
           expect(halt?.detail).toContain("the event transport is unavailable");
@@ -844,8 +844,8 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
         // The stated split: at most one bound per connection's courtesy QUIT after the halt.
         expect(exitLatency - haltLatency).toBeLessThanOrEqual(2 * bound + MARGIN_MS);
         expect(exited.value).toBe(EXIT_CODES.halted);
-        expect(exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-          ["GLOBAL", "TRANSPORT_UNAVAILABLE", "FULL_HALT"],
+        expect(exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([
+          ["GLOBAL", "TRANSPORT_UNAVAILABLE"],
         ]);
         // Nothing was written after the halt but its own record, nor at any
         // point before it: the stream never carried an event.
@@ -926,7 +926,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           expect(exitLatency - haltLatency).toBeLessThanOrEqual(2 * bound + MARGIN_MS);
 
           expect(exited.value).toBe(EXIT_CODES.halted);
-          expect(haltTriples(run)).toEqual([["GLOBAL", "TRANSPORT_UNAVAILABLE", "FULL_HALT"]]);
+          expect(haltTriples(run)).toEqual([["GLOBAL", "TRANSPORT_UNAVAILABLE"]]);
           const detail = exitHealth(run).halts[0]?.detail ?? "";
           // The operator reads WHY: the transport's own deadline, not only the wrapper.
           expect(detail).toMatch(/Command timed out|no reply to a read within/u);

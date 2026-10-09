@@ -219,7 +219,6 @@ function traderConfig(perStrategyCap = "1000", globalAccountCap = "10000"): Reco
       fillModelVersion: "tier0.cadence1",
       fillModelParametersHash: "c".repeat(64),
       feeSchedule: { ...feeSnapshot() },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 1_000_000, windowMs: 60_000 },
     scenarios: [

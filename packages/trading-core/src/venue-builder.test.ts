@@ -41,7 +41,6 @@ function settings(overrides: Partial<SimulatedVenueSettings> = {}): SimulatedVen
       minimumChargedFee: "0",
       feeCurrency: "pUSD",
     },
-    startingCash: "1000",
     ...overrides,
   };
 }
@@ -90,6 +89,7 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
   it("refuses a fee snapshot the simulator's own door refuses, and builds nothing", () => {
     const built = buildSimulatedVenue({
       clock: CLOCK,
+      startingCash: "1000",
       settings: settings({ feeSchedule: { ...settings().feeSchedule, takerFeeRate: "-0.01" } }),
     });
     expect(built.ok).toBe(false);
@@ -97,9 +97,15 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
     expect(built.refusal.code).toBe("FILL_MODEL_FEE_SNAPSHOT_MISSING");
   });
 
+  it("the venue opens with the startingCash it is handed (the configuration's accounting.startingCash)", async () => {
+    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings(), startingCash: "777.5" });
+    if (!built.ok) throw new Error(built.refusal.code);
+    expect((await built.venue.queryAccountState()).cashBalance).toBe("777.5");
+  });
+
   it("an order that carries no time-in-force: the policy refuses to assume one, logs the order, and the venue contains it", async () => {
     const lines: string[] = [];
-    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings(), log: (line) => lines.push(line) });
+    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings(), startingCash: "1000", log: (line) => lines.push(line) });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
     expect(built.wiring.trader).toBeUndefined();
@@ -114,7 +120,7 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
   });
 
   it("a FILLED holder: the book is read through the trader, the time-in-force from the plan, and the order fills at its ask", async () => {
-    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings() });
+    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings(), startingCash: "1000" });
     if (!built.ok) throw new Error(built.refusal.code);
     built.wiring.trader = traderStub();
     const result = await submitOne(built.venue, "PAPER", "FAK");
@@ -126,7 +132,7 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
   });
 
   it("the venue runs in the core's run mode, PAPER: a plan naming BACKTEST is refused", async () => {
-    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings() });
+    const built = buildSimulatedVenue({ clock: CLOCK, settings: settings(), startingCash: "1000" });
     if (!built.ok) throw new Error(built.refusal.code);
     built.wiring.trader = traderStub();
     const result = await submitOne(built.venue, "BACKTEST", "FAK");
@@ -139,6 +145,7 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
     const built = buildSimulatedVenue({
       clock: CLOCK,
       settings: settings(),
+      startingCash: "1000",
       rateLimits: tokenBucketRateLimits({
         orderTokensPerWindow: 0,
         cancelTokensPerWindow: 10,
@@ -157,7 +164,7 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
     expect(result.rateLimitDisclosure).toContain("builder-test/rate-limits/v1");
     expect(built.venue.retention().orders.maximumRetained).toBe(7);
     // A bound the venue refuses is the venue constructor's own RangeError, unchanged.
-    expect(() => buildSimulatedVenue({ clock: CLOCK, settings: settings(), retention: { orders: 0 } })).toThrow(
+    expect(() => buildSimulatedVenue({ clock: CLOCK, settings: settings(), startingCash: "1000", retention: { orders: 0 } })).toThrow(
       RangeError,
     );
   });

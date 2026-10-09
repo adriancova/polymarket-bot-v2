@@ -53,7 +53,6 @@ export interface TraderHaltInput {
   readonly code: string;
   readonly detail: string;
   readonly at: string;
-  readonly action: string;
 }
 
 /** Mirrors `apps/trader/src/health.ts` `LoopHealth`. */

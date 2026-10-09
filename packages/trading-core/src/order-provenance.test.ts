@@ -135,7 +135,6 @@ function traderConfig(): Record<string, unknown> {
       fillModelVersion: "tier0.wp250",
       fillModelParametersHash: "b".repeat(64),
       feeSchedule: { ...fees },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 100, windowMs: 60_000 },
     scenarios: [

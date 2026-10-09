@@ -71,8 +71,7 @@
       "roundingMode": "HALF_UP",
       "minimumChargedFee": "0",
       "feeCurrency": "pUSD"
-    },
-    "startingCash": "1000"
+    }
   },
   "requestBudget": {
     "capacity": 100,

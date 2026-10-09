@@ -289,7 +289,7 @@ export function dryAssemble(
     now: () => formatStrictUtc(nowMs()),
     monotonicNs: () => process.hrtime.bigint(),
   };
-  const built = buildSimulatedVenue({ clock, settings: door.config.simulation });
+  const built = buildSimulatedVenue({ clock, settings: door.config.simulation, startingCash: door.config.accounting.startingCash });
   if (!built.ok) {
     return refuse(
       "REGISTER_TEMPLATE_REFUSED_BY_TRADER",

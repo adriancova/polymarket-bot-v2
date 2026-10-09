@@ -159,8 +159,8 @@ describe("FOLD1-R1-3 — a real-core backtest, handed ONLY the driver's coreLoop
     expect(outcome.ok).toBe(true);
     expect(corruptedAtFill).toBeDefined();
     const health = loop.health();
-    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-      ["GLOBAL", "ACCOUNTING_REBUILD_MISMATCH", "FULL_HALT"],
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([
+      ["GLOBAL", "ACCOUNTING_REBUILD_MISMATCH"],
     ]);
     expect(health.halts[0]?.detail).toContain("at the end of the run");
     expect(health.seams.folds).toMatchObject({ ledgerChecks: 1, ledgerMismatches: 1 });

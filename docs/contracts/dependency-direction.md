@@ -575,6 +575,7 @@ The distinction is per **binding**, not per module, and the table names bindings
 | `packages/risk` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:171` (used at `:201`). A pure-JS proxy probe *runs a trap*, i.e. executes caller code inside the door that exists to stop caller code running (`plain-data.ts:92-97`) | `WP-180` R6-1 |
 | `packages/execution-planner` | 1 | `node:util` | `types.isProxy` | `src/pluck.ts:28` (used at `:58`) — the §6 invariant 13 minimal-read cancel path | `WP-190` R1-N2 |
 | `packages/features` | 1 | `node:crypto` | `createHash` | `src/hash.ts:14`. Content addressing needs SHA-256; a hand-rolled FIPS 180-4 implementation in production code is a correctness liability, and `WP-160`'s review used exactly that as an independent *oracle* rather than as the shipped path | `WP-160` R1-N1 |
+| `packages/universe` | 1 | `node:crypto` | `createHash` | `src/series-admission.ts:89` (used at `:383`). The reviewed series' configuration hash is SHA-256 over its canonical JSON, pure and clock-free; a hand-rolled digest in production code is a correctness liability. Consumed by `packages/trading-core` over S19 (`C1-UNIV`), which is why the core's closure reaches `node:crypto` | `C1-UNIV` follow-up 2 |
 
 **The table is exhaustive for the layer-0 and layer-1 PRODUCTION import
 surface**, and a package outside it importing any built-in *in a production

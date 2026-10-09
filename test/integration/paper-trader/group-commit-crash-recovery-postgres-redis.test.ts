@@ -358,7 +358,7 @@ async function freshRunSources(
   const parsed = parseTraderConfig(document);
   if (!parsed.ok) throw new Error(`${parsed.refusal.code}: ${parsed.refusal.issues.join("; ")}`);
   const clock = new ManualClock(envelopes[0]?.receivedAt ?? "2026-09-29T21:00:00Z");
-  const built = buildSimulatedVenue({ clock, settings: parsed.config.simulation });
+  const built = buildSimulatedVenue({ clock, settings: parsed.config.simulation, startingCash: parsed.config.accounting.startingCash });
   if (!built.ok) throw new Error(built.refusal.message);
   const created = createPaperTrader({
     env: benchEnvironment("postgres://unused"),
