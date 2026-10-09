@@ -130,5 +130,8 @@ describe("C1-RISK: check 16 dominates check 17 when maxScenarioLoss >= maxWorstC
     // The pin is only as good as the cases it reached.
     expect(checked).toBeGreaterThan(100);
     expect(checkedWithUnmarked).toBeGreaterThan(50);
-  });
+    // An explicit budget, as the repo's other generated-case loops set: 1,500
+    // cases take 1.3-3 s, and a loaded host pushed one full run past vitest's
+    // 5 s default (C1-RISK r1, A-TIMEOUT).
+  }, 60_000);
 });

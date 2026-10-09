@@ -262,6 +262,18 @@ describe("the allocator gate", () => {
     expect(atEdge.verdict?.permitted).toBe(true);
   });
 
+  it("C1-RISK r1: perResolutionWindowCap binds on the market's resolution window, at its edge", () => {
+    // Risk's copy of this cap (check 15) was deleted by C1-RISK; this is now
+    // its only pin. The BUY commits 50 x 0.35 = 17.5 in SCOPE's window.
+    const atCap = evaluate(gate({ perResolutionWindowCap: "17.5" }), buyIntent());
+    expect(atCap.verdict?.permitted).toBe(true);
+    const over = evaluate(gate({ perResolutionWindowCap: "17.49" }), buyIntent());
+    expect(over.verdict?.permitted).toBe(false);
+    expect(over.verdict?.refusals.map((refusal) => refusal.code)).toEqual([
+      "CAPITAL_RESOLUTION_WINDOW_CAP_EXCEEDED",
+    ]);
+  });
+
   it("REFUSES a LIVE commitment on a market with no recorded owner (ADR-011)", () => {
     const outcome = evaluate(gate(), buyIntent(), { owners: [] });
     expect(outcome.verdict?.permitted).toBe(false);

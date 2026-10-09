@@ -704,6 +704,19 @@ describe("C1-RISK: check 17 values an unmarked market at 0 (ADR-030 Rule 8 item 
   });
 });
 
+describe("C1-RISK r1: check 15 refuses only ABOVE maxOrderNotional", () => {
+  it("an entry whose bounded cost equals the limit is admitted; one cent over is refused", () => {
+    // The baseline entry bounds a cost of exactly 50 (100 YES at 0.5).
+    const limits = (maxOrderNotional: string): Record<string, unknown> => ({
+      limits: { maxWorstCaseContractualLoss: "10000", maxOrderNotional },
+    });
+    expect(codesOf(evaluateIntent(riskPolicy(limits("50")), entryInput()))).toEqual([]);
+    const over = evaluateIntent(riskPolicy(limits("49.99")), entryInput());
+    expect(codesOf(over)).toEqual(["RISK_PER_ORDER_NOTIONAL_EXCEEDED"]);
+    expect(over.refusals[0]?.details).toMatchObject({ boundedCost: "50", maxOrderNotional: "49.99" });
+  });
+});
+
 describe("refusals accumulate rather than short-circuit", () => {
   it("reports every independent failure in §9.8 order, not just the first", () => {
     const input = entryInput();
@@ -1977,7 +1990,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
     }
   });
 
-  it("every emitted record is frozen BY the boundary — the resize path included", () => {
+  it("every emitted record is frozen BY the boundary", () => {
     const resized = sealApprovedIntentRecord(positionRecord());
     expect(resized.ok).toBe(true);
     if (!resized.ok) return;
