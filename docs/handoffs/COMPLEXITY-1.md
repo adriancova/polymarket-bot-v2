@@ -38,7 +38,7 @@
 |---|---|---|---|
 | C1-V29 | V2-9's scanner cut from about 6,150 to about 1,540 production lines; no fixture byte changed | astra ACCEPT, round 1 (`726bc19`) | V2-9, `636536a` (PR #90) |
 | C1-PROC | The brief from 82 KB to 18 KB, with RESIDUALS.md (127 rows, moved verbatim and proven); check-brief from 41 rules to 7; the preservation tools deleted (`tools/records` from 3,281 to 447 lines); status in the PR; the runbook's current loop; the ADR budget; the lighter reading list | astra ACCEPT, round 1; LOWs R1-01 and R1-02 fixed (`80fc9bb`) | via PR #91 |
-| C1-HALTS | Honest halts; the book waits; the taint narrowed; incidents close; infrastructure halt pages resolve; `register --new-run` | dual, running | — |
+| C1-HALTS | Honest halts (`ACTION_FOR`, `release()` and `OPERATOR_HALT` deleted; every halt ends the run); a book divergence clears its baseline and waits for the next snapshot (benign drops counted, faults still halt); the ADR-023 taint narrowed (note appended); data-quality incidents close at the trader; infrastructure halt pages resolve on the next run; `register --new-run` | dual (Opus + astra) ACCEPT on substance in round 1 (`919ec24`); the round-1 LOWs fixed (`084bd46`); the round cap was reached only on SCOPE-1, a forced 2-literal test edit that the orchestrator ratified | via PR #93 |
 | C1-RISK | The allocator as the only exposure authority; check 17; the dead resize path and knobs | dual, queued | — |
 | C1-TIF | The ADR-034 re-sequence | queued | — |
 | C1-UNIV | Import universe's series code | queued | — |
@@ -55,3 +55,14 @@
   - a unit pin of the NOT_WIRED record;
   - the stale header in `engage-reserve.test.ts`;
   - the old trader stack's PostgreSQL 17.5 volume is not migrated: start the PAPER stack fresh.
+
+## C1-HALTS notes
+- **The orchestrator's grants.**
+  - `apps/backtest-cli/src/assembly.test.ts` is ratified (SCOPE-1). Deleting `OPERATOR_HALT` forces its two literals.
+  - The two STOPPED sub-parts were accepted in interim form: the health and metrics `action` is the constant `"FULL_HALT"`, and the book-refusal counts are logged at stop.
+- **Follow-ups:**
+  - Remove `action` from the control-api health door and from `packages/observability`, and expose the refusal counts on health (a small health round).
+  - L1: risk check 8 judges the configured direction's book, not the intent's. This only matters with complement inventory; the shipped configs are DIRECT_ONLY.
+  - L6: the stale "until an operator resolves its row" text in the Grafana operations dashboard.
+  - OPS-03 (b): key the consumer by run id.
+- `FOLD-RELATCH` is moot (RESIDUALS.md).
