@@ -2462,3 +2462,76 @@ and reports it.
   behaviour that cannot be reached today: `ALLOW_REAL_ORDERS=false`, both
   live-micro caps are 0, no signer is configured, and no live gate has been
   requested.
+
+## Note (2026-10-08, COMPLEXITY-1)
+
+**The ruling.** On 2026-10-08 the user re-sequenced this ADR's implementation,
+on `COMPLEXITY-1`'s audit findings `OMS-01`, `OMS-02`, `OMS-07` and
+`TRADE-11`. **Build now only what PAPER uses: time-in-force carried on the
+plan.** The Decision text above is unchanged; this note records what is built,
+what is parked, and the form a parked part takes when it is built.
+
+**Built now (round `C1-TIF`): D3.1 item 2 only.**
+
+- `PlanningInputs.timeInForce` carries the value resolved as D3.1 item 1 says
+  (the tag, else the instance's configuration). The planner refuses a
+  placement's inputs without one and never defaults it.
+- Every `PlannedOrder` carries `timeInForce`. A GTD order also carries
+  `expirationUnixSeconds`: its plan's deadline, rounded up to the second, plus
+  60 s, so the venue's one-minute early expiry ends it at the deadline (D3.3).
+  The seal refuses a GTD order without one and any other order with one.
+- `OrderTimeInForceBook` is deleted, with the trader facade's re-export. The
+  simulator's `ExecutionPolicy` reads the planned order, and converts a GTD
+  expiration to the clock's monotonic scale.
+- Not built: `deadlineAt` for a deadline-bounded GTC, and D3.4's deadline
+  cancel. No shipped entry is GTC. Not built either: D3.3's GTD-floor refusal.
+  The simulated venue does not enforce the floor, and no GTD order runs above
+  PAPER.
+
+**Parked until the execution probe.**
+
+- **D1's venue-time machinery** (round R2, `OMS-VENUE-TIME`).
+- **D4**, the collateral-targeted FAK and FOK BUYs, with their OMS, adapter and
+  ledger halves (round R3, `TIF-COLLATERAL`).
+- **D3's `createMarketOrder`, fence and SDK-port additions** (D3.1 items 3 to
+  5, and D3.2's FAK and FOK rows), with the rest of D3 that only the OMS and
+  the adapter read. `OMS-01`'s review noted that the probe cannot observe a FAK
+  or FOK order unless these exist. When they are built relative to the probe is
+  decided when the probe is planned.
+
+**Meanwhile: immediate entries are share-sized GTC or GTD orders with a
+deadline,** so the share caps stay hard.
+
+- Static Bracket refuses a FAK or FOK `immediate_order_type` at validation,
+  named `SB_IMMEDIATE_ORDER_TYPE_PARKED_UNTIL_EXECUTION_PROBE`, until D4 is
+  built. Every Static Bracket entry can be a BUY (its direct leg always is),
+  so the value is refused outright.
+- The shipped example configuration's entry is GTD, with an explicit
+  `order_validity_ms` of 30 000. The simulated venue expires it at its plan's
+  deadline. GTD was chosen over GTC because the simulated venue already
+  expires a GTD order, while nothing in PAPER cancels a GTC order at its plan's
+  deadline.
+- **The trade-off.** A GTD entry that fills in part RESTS its remainder until
+  its deadline, where a FAK cancelled it at once.
+- Exits are unchanged: Static Bracket's exits are GTC; none is FAK or FOK.
+- **Before any GTD entry runs above PAPER:** a 30 s GTD states an expiration
+  about 90 s ahead, below the venue's floor of 180 s plus a margin (D3.3; A
+  F-79, F-83). Either D3.3's floor refusal is built and the configuration's
+  lifetime is lengthened, or the entry becomes a deadline-bounded GTC with
+  D3.4's cancel.
+
+**Variant P is superseded for now** by these share-sized entries (`OMS-07`).
+The user's ruling of variant P (Open item 10) applies again only if D4 is
+built.
+
+**When D1 is built, it takes the self-clearing form** (`OMS-02`). A late
+LIVE-class frame on a terminal order triggers an authoritative read. Only a
+read that contradicts the terminal state halts; a read that confirms it clears
+the hold by itself, with no operator release. Intervals, spans, the hull,
+`PENDING`, the durable hold marker, the `ORDERING` purpose and
+`orderingHorizonMs` are not built. **The residual risk, in this ADR's terms:
+a newer LIVE that the read contradicts as terminal resumes instead of
+halting.** This revisits the 2026-10-05 wording that a newer one still halts
+(D1.5's NEWER row). A cheap middle ground stays open: judge a frame STALE
+without a read only when `L < T`, for a point `T` from a CANCELED or MATCHED
+stamp.

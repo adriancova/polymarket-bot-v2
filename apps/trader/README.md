@@ -214,18 +214,22 @@ into a typed outcome.
 ### The `immediate_order_type` question, resolved
 
 `WP-220` recorded it open: the strategy tags its entry intent
-`sb.order-type:FAK`, `packages/risk` never reads tags, and the planner's
-`PlannedOrder` carries no time-in-force. The seam that needs one is
-`packages/simulation`'s `ExecutionPolicy.timeInForceFor`, whose own comment
-forbids a default — "a silently assumed `FAK` would change every unfilled
-remainder's fate".
+`sb.order-type:<value>`, `packages/risk` never reads tags, and
+`packages/simulation`'s `ExecutionPolicy.timeInForceFor` forbids a default —
+"a silently assumed `FAK` would change every unfilled remainder's fate".
 
 **The resolution: read the tag; fall back to the emitting instance's configured
-`immediate_order_type`; never default.** `src/pipeline.ts`'s
-`OrderTimeInForceBook` records the answer per planned order at plan time, when
-both the intent's tags and the emitting instance are still in hand, and the
-venue policy reads that book. An order whose value cannot be resolved is
-refused rather than submitted.
+`immediate_order_type`; never default.** Since `C1-TIF` (ADR-034 D3.1 item 2)
+the loop resolves it BEFORE planning, and the planner carries it on every
+planned order (`PlannedOrder.timeInForce`, with `expirationUnixSeconds` for
+GTD: the plan's deadline plus the venue's 60 s threshold). The venue policy
+reads the planned order; there is no side table. An intent whose value cannot
+be resolved is refused rather than planned.
+
+Static Bracket refuses a `FAK` or `FOK` `immediate_order_type` until ADR-034
+D4 is built after the execution probe (COMPLEXITY-1, 2026-10-08); the example
+configuration's entry is `GTD`, which the simulated venue expires at the plan's
+deadline.
 
 ## Configuration changes in `C1-RISK` (`COMPLEXITY-1`, 2026-10-08)
 

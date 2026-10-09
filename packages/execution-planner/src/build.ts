@@ -47,6 +47,7 @@ import type {
 } from "./inputs.js";
 import { marketInputFor, readCancelPlanningInputs, readPlanningInputs } from "./inputs.js";
 import {
+  GTD_SECURITY_THRESHOLD_SECONDS,
   sealExecutionPlan,
   type BasketPlan,
   type CancelPlan,
@@ -108,7 +109,24 @@ function assemble(
   legs: readonly PricedLeg[],
   view: ApprovedIntentView,
   inputs: PlanningInputs,
+  deadline: string,
 ): PlannerResult<AssembledGroups> {
+  // ADR-034 D3.1 item 2: the plan's ONE time-in-force, on every order. A GTD
+  // order states `deadline + 60 s` (D3.3), so the venue's one-minute early
+  // expiry ends it at the plan's deadline.
+  const deadlineMs = instantMilliseconds(deadline);
+  if (deadlineMs === undefined) {
+    return plannerFailure(
+      plannerRefusal("PLAN_INPUT_INVALID", "the plan deadline could not be read while stating a GTD expiration", { deadline }),
+    );
+  }
+  const timeInForce =
+    inputs.timeInForce === "GTD"
+      ? {
+          timeInForce: inputs.timeInForce,
+          expirationUnixSeconds: Math.ceil(deadlineMs / 1000) + GTD_SECURITY_THRESHOLD_SECONDS,
+        }
+      : { timeInForce: inputs.timeInForce };
   const groups: Array<{
     readonly executionGroupId: string;
     readonly marketId: string;
@@ -160,6 +178,7 @@ function assemble(
         shares,
         postOnly,
         executionStyle: leg.posture,
+        ...timeInForce,
         reservationId,
         ...remainder,
       });
@@ -361,6 +380,7 @@ function buildPositionPlan(
     ],
     view,
     inputs,
+    deadline.value,
   );
   if (!assembled.ok) return assembled;
 
@@ -454,7 +474,7 @@ function buildReductionPlan(
     );
   }
 
-  const assembled = assemble(legs, view, inputs);
+  const assembled = assemble(legs, view, inputs, deadline.value);
   if (!assembled.ok) return assembled;
 
   const draft: PlacementPlan = {
@@ -603,7 +623,7 @@ function buildBasketPlan(
     );
   }
 
-  const assembled = assemble(legs, view, inputs);
+  const assembled = assemble(legs, view, inputs, deadline.value);
   if (!assembled.ok) return assembled;
 
   const draft: BasketPlan = {

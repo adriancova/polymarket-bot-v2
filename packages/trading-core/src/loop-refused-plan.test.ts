@@ -67,13 +67,14 @@
  * real `SimulatedVenue` and answers the whole plan REFUSED, listing nothing:
  *
  * 5. the nine slices the venue never booked are released, counted;
- * 6. the RESTING slice keeps all three entries, across later harvests, while
- *    it is working;
+ * 6. the RESTING slice keeps its entries, across later harvests, while it is
+ *    working (its reservation and allocator commitment; since `C1-TIF` its
+ *    time-in-force is on the plan, not in a third table);
  * 7. its market is halted `UNATTRIBUTED_ACTIVITY` / `RECONCILE_ACCOUNT` at the
  *    refusal, naming the plan, the order and its state;
  * 8. no instance owns it: never delivered, never in `ctx.orders()`;
  * 9. when an OBSERVED trade fills it (terminal evidence), the fill is booked
- *    UNATTRIBUTED and counted, and only then are the three entries released.
+ *    UNATTRIBUTED and counted, and only then are its entries released.
  *
  * WHAT IS REAL: the `CoreLoop`, strategy runtime, feature engine, books,
  * allocator, risk engine, execution planner, `SimulatedVenue` (Tier 0; Tier 1
@@ -690,7 +691,6 @@ function assemble(
 
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("fees refused");
-  const wiring: { loop: CoreLoop | undefined } = { loop: undefined };
   const books: MarketBookProvider = {
     book(request): BookView | undefined {
       const market = markets.get(request.marketId);
@@ -720,11 +720,12 @@ function assemble(
     runMode: "PAPER" as const,
     feeSnapshot: fees.value,
     rateLimits: input.rateLimits ?? unmodeledRateLimits("no venue budget is modelled for this case"),
-    // `main.ts`'s `createExecutionPolicy` semantics: the loop's recorded
-    // time-in-force, and a refusal (throw, contained by the venue) otherwise.
+    // `createExecutionPolicy`'s semantics: the planned order's own
+    // time-in-force (ADR-034 D3.1 item 2), and a refusal (throw, contained by
+    // the venue) otherwise.
     policy: {
-      timeInForceFor(order: { readonly plannedOrderId: string }) {
-        const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
+      timeInForceFor(order: { readonly plannedOrderId: string; readonly timeInForce?: "GTC" | "GTD" | "FAK" | "FOK" }) {
+        const resolved = order.timeInForce;
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
       },
@@ -805,7 +806,6 @@ function assemble(
     // production cadence say where and why.
     evaluationCadence: cadence.option,
   });
-  wiring.loop = loop;
 
   const harness: Harness = { loop, clock, venue, evaluations: [], submitted: [], answers: [] };
   const evaluate = created.runtime.evaluate.bind(created.runtime);
@@ -885,6 +885,20 @@ function plannedOrderIds(harness: Harness): readonly string[] {
   return plan.groups.flatMap((group) => group.orders.map((order) => order.plannedOrderId));
 }
 
+/**
+ * `C1-TIF` (ADR-034 D3.1 item 2): the time-in-force a planned order CARRIES on
+ * the plan the loop offered the venue. It replaces the loop's side table,
+ * which these tests used to read while an order was working.
+ */
+function planTimeInForce(harness: Harness, plannedOrderId: string): string | undefined {
+  for (const plan of harness.submitted as readonly { readonly groups?: readonly { readonly orders: readonly { readonly plannedOrderId: string; readonly timeInForce?: string }[] }[] }[]) {
+    for (const group of plan.groups ?? []) {
+      for (const order of group.orders) if (order.plannedOrderId === plannedOrderId) return order.timeInForce;
+    }
+  }
+  return undefined;
+}
+
 /** A modelled per-signer order budget of `orderTokensPerWindow` per hour. */
 function orderBudget(orderTokensPerWindow: number): RateLimitBudget {
   return tokenBucketRateLimits({
@@ -929,10 +943,9 @@ describeAtEachCadence("SIM-1 R3 — the REAL venue reports what it booked, and t
 
     // --- the REFUSED slices are released, counted --------------------------
     expect(health.execution.reservationsReleasedOnRefusal).toBe(5);
-    for (const plannedOrderId of refusedIds) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
 
     // --- the BOOKED slices keep theirs — 15 × 5 × 0.2 = 15 pUSD ---------------
-    for (const plannedOrderId of bookedIds) expect(loop.timeInForceFor(plannedOrderId)).toBe("GTC");
+    for (const plannedOrderId of bookedIds) expect(planTimeInForce(harness, plannedOrderId)).toBe("GTC");
     expect(health.seams.reservations).toMatchObject({ open: 15, taken: 20, released: 5, reservedCollateral: "15" });
     expect(health.seams.allocator).toMatchObject({ open: 15, applied: 20, released: 5, reservedCollateral: "15" });
 
@@ -983,7 +996,6 @@ describeAtEachCadence("SIM-1 R3 — the REAL venue reports what it booked, and t
     );
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 20, released: 20, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 20, released: 20, reservedCollateral: "0" });
-    for (const plannedOrderId of bookedIds) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
     expect(health.halts).toEqual([]);
   });
 
@@ -1009,7 +1021,6 @@ describeAtEachCadence("SIM-1 R3 — the REAL venue reports what it booked, and t
     expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
     expect(health.seams.orders.tracked).toBe(0);
     expect(health.halts).toEqual([]);
   });
@@ -1027,7 +1038,6 @@ describeAtEachCadence("SIM-1 R3 — the REAL venue reports what it booked, and t
     expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
     expect(health.halts).toEqual([]);
   });
 });
@@ -1190,7 +1200,6 @@ describeAtEachCadence("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcom
     expect(health.execution.reservationsReleasedOnRefusal).toBe(0);
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
 
     // The halt was raised AT the answer — before the harvest delivered
     // anything — so the strategy was never handed the half-built basket.
@@ -1243,7 +1252,7 @@ describeAtEachCadence("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcom
     expect(loop.health().halts).toEqual([]);
     expect(loop.retainedOrderState().basketWatches).toBe(1);
     expect(loop.health().seams.reservations).toMatchObject({ open: 4, taken: 4, released: 0 });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBe("FOK");
+    for (const plannedOrderId of planned) expect(planTimeInForce(harness, plannedOrderId)).toBe("FOK");
     await feed(harness, yesBook(5));
     expect(loop.health().halts).toEqual([]);
     expect(loop.retainedOrderState().basketWatches).toBe(1);
@@ -1271,7 +1280,6 @@ describeAtEachCadence("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcom
     expect(health.execution.fillsObserved).toBe(2);
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
     expect(loop.retainedOrderState().basketWatches).toBe(0);
   });
 
@@ -1694,7 +1702,7 @@ describeAtEachCadence("SIM1-R3-1 — a basket a DELIVERY callback leaves short h
 });
 
 describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOLDING part of it (scripted double)", () => {
-  it("the RESTING first slice keeps its reservation, allocator commitment and time-in-force until it is terminal; the market halts for reconciliation", async () => {
+  it("the RESTING first slice keeps its reservation and allocator commitment until it is terminal; the market halts for reconciliation", async () => {
     const harness = assemble({ venueDouble: (inner) => new RefusesWhileHoldingVenue(inner) });
     await open(harness);
     const loop = harness.loop;
@@ -1715,10 +1723,10 @@ describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a p
 
     // (1) The nine slices the venue never booked are released, counted.
     expect(health.execution.reservationsReleasedOnRefusal).toBe(9);
-    for (const plannedOrderId of planned.slice(1)) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
 
-    // (2) The RESTING slice keeps all three entries — 5 × 0.2 = 1 pUSD.
-    expect(loop.timeInForceFor(resting.plannedOrderId)).toBe("GTC");
+    // (2) The RESTING slice keeps its entries — 5 × 0.2 = 1 pUSD — and its
+    // plan carries its time-in-force (`C1-TIF`).
+    expect(planTimeInForce(harness, resting.plannedOrderId)).toBe("GTC");
     expect(health.seams.reservations).toMatchObject({ open: 1, taken: 10, released: 9, reservedCollateral: "1" });
     expect(health.seams.allocator).toMatchObject({ open: 1, applied: 10, released: 9, reservedCollateral: "1" });
 
@@ -1743,7 +1751,7 @@ describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a p
     await feed(harness, yesBook(6));
     health = loop.health();
     expect(harness.venue.ordersSnapshot()[0]?.state).toBe("RESTING");
-    expect(loop.timeInForceFor(resting.plannedOrderId)).toBe("GTC");
+    expect(planTimeInForce(harness, resting.plannedOrderId)).toBe("GTC");
     expect(health.seams.reservations).toMatchObject({ open: 1, released: 9, reservedCollateral: "1" });
     expect(health.seams.allocator).toMatchObject({ open: 1, released: 9, reservedCollateral: "1" });
     expect(loop.retainedOrderState().heldUnowned).toBe(1);
@@ -1770,9 +1778,8 @@ describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a p
       (record) => record.activityKind === "ACTUAL_ARRIVAL",
     );
     expect(arrivals.length).toBeGreaterThan(0);
-    // …and only NOW, at the harvest that saw it terminal, are the three
-    // entries released.
-    expect(loop.timeInForceFor(resting.plannedOrderId)).toBeUndefined();
+    // …and only NOW, at the harvest that saw it terminal, are its entries
+    // released.
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
     // `CAP-1`: the allocator releases only the unused remainder (none: the
     // order FILLED 5/5 at its 0.2 limit). Its fill was booked UNATTRIBUTED, so

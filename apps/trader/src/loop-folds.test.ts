@@ -450,7 +450,6 @@ function assemble(
 
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("fees refused");
-  const wiring: { loop: CoreLoop | undefined } = { loop: undefined };
   const venue = new SimulatedVenue({
     clock,
     runMode: "PAPER",
@@ -458,8 +457,8 @@ function assemble(
     feeSnapshot: fees.value,
     rateLimits: unmodeledRateLimits("no venue rate-limit budget is modelled in this synthetic run"),
     policy: {
-      timeInForceFor(order) {
-        const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
+      timeInForceFor(order: { readonly plannedOrderId: string; readonly timeInForce?: "GTC" | "GTD" | "FAK" | "FOK" }) {
+        const resolved = order.timeInForce;
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
       },
@@ -544,7 +543,6 @@ function assemble(
     // production cadence, the test says where and why.
     evaluationCadence: cadence.option,
   });
-  wiring.loop = loop;
   return { loop, store, book, ordinal: 0, lastTick: undefined };
 }
 

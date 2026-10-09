@@ -156,6 +156,8 @@ function planningInputs(inventory: Inventory): Record<string, unknown> {
       cancelDeadlineMs: 30000,
       maxPlanLifetimeMs: 600000,
     },
+    // `C1-TIF` (ADR-034 D3.1 item 2): a placement's inputs carry its time-in-force.
+    timeInForce: "GTC",
     scope: { seriesKey: "btc-15m", underlyingKey: "BTC", resolutionWindowKey: "w1" },
   };
 }

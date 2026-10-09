@@ -3,70 +3,88 @@
  * the `VenueWiring` holder and `createExecutionPolicy`.
  *
  * Moved by `CORE-MOVE` (ADR-022 D8) out of `apps/trader/src/main.ts`, where it
- * was lines 155-217 at `ac0b12f`. Everything below the imports is those lines,
- * byte for byte, comments included. So "the module header" the first comment
- * points at is `apps/trader/src/main.ts`'s, which explains why the venue is
- * built against a holder that the trader fills right after construction.
- * `main.ts` imports both names from this package and re-exports them.
+ * was lines 155-217 at `ac0b12f`; `main.ts` imports both names from this
+ * package and re-exports them. Since `C1-TIF` (ADR-034 D3.1 item 2) the policy
+ * reads the time-in-force from the planned order itself, so it no longer reads
+ * the holder: only the venue's book provider does (`venue-builder.ts`).
  */
 
-import type { PlannedOrderView, TimeInForce } from "@polymarket-bot/simulation";
+import type { Clock, PlannedOrderView, TimeInForce } from "@polymarket-bot/simulation";
 
 import type { PaperTrader } from "./trader.js";
 
-/** The holder the venue's policy reads. See the module header. */
+/** The holder the venue's book provider reads. See `venue-builder.ts`. */
 export interface VenueWiring {
   trader: PaperTrader | undefined;
 }
 
+const TIME_IN_FORCE_VALUES: readonly unknown[] = Object.freeze(["GTC", "GTD", "FAK", "FOK"]);
+
+/**
+ * What the policy reads of a planned order beyond {@link PlannedOrderView}: the
+ * planner's `PlannedOrder.timeInForce` and, for GTD, `expirationUnixSeconds`
+ * (ADR-034 D3.1 item 2). Read defensively: the venue hands the policy its own
+ * materialized copy of the plan.
+ */
+type PlannedOrderWithTimeInForce = PlannedOrderView & {
+  readonly timeInForce?: unknown;
+  readonly expirationUnixSeconds?: unknown;
+};
+
 /**
  * The §12.1 `ExecutionPolicy` this process gives the simulated venue.
  *
- * Extracted and exported so its ONE unresolvable case can be driven directly
- * (review round 1, MEDIUM-3): the reviewed tip left a bare `throw` here under a
- * `startup()` docstring that says "Never throws", with a comment asserting the
- * branch was unreachable and nothing exercising it either way.
+ * ADR-034 D3.1 item 2: the time-in-force is carried ON THE PLAN, so the policy
+ * reads the planned order and nothing else. An order that carries none (or an
+ * unknown value) is refused, never defaulted — "a silently assumed FAK would
+ * change every unfilled remainder's fate" is the seam's own rule.
  *
  * THE THROW STAYS, AND IT IS CONTAINED. `timeInForceFor` must answer a
- * `TimeInForce`; there is no refusal channel and no safe value — "a silently
- * assumed FAK would change every unfilled remainder's fate" is the seam's own
- * rule. The containment is `SimulatedVenue.submit`'s: it runs the policy inside
+ * `TimeInForce`; there is no refusal channel and no safe value. The
+ * containment is `SimulatedVenue.submit`'s: it runs the policy inside
  * `totallyResult`, so a throw becomes a REFUSED `ExecutionResult` carrying a
- * `SIMULATION_*` code, which the loop counts as `submissionsRefused`. It never
- * reaches `startup`, and `apps/trader/src/main.test.ts` drives exactly that
- * path through a real `SimulatedVenue` rather than asserting it.
+ * `SIMULATION_*` code, which the loop counts as `submissionsRefused`. The
+ * process LOGS the order first, so a refusal an operator sees on the venue seam
+ * has a line naming the planned order that caused it.
  *
- * What was genuinely missing is now here too: the process LOGS the unresolved
- * order, so a refusal an operator sees on the venue seam has a line naming the
- * planned order that caused it.
+ * A GTD order's stated expiry is its `expirationUnixSeconds`, converted to the
+ * clock's recorded monotonic nanoseconds at the instant the venue asks (the
+ * submission instant): `monotonicNs() + (expiration − now())`. The venue then
+ * expires it 60 s early, at the plan's deadline (ADR-034 D3.3).
  */
 export function createExecutionPolicy(
-  wiring: VenueWiring,
+  clock: Clock,
   log: (line: string) => void,
 ): {
-  timeInForceFor: (order: PlannedOrderView) => TimeInForce;
-  statedExpiryNsFor: () => bigint | undefined;
+  timeInForceFor: (order: PlannedOrderWithTimeInForce) => TimeInForce;
+  statedExpiryNsFor: (order: PlannedOrderWithTimeInForce) => bigint | undefined;
   sameInstantAdditionsFor: () => "NOT_OBSERVED";
 } {
+  const refuse = (order: PlannedOrderView, what: string): never => {
+    log(
+      `SUBMISSION REFUSED: planned order ${order.plannedOrderId} ${what}. The composition root ` +
+        "refuses to assume one (§12.1 ExecutionPolicy); the venue contains this into a refused " +
+        "ExecutionResult and nothing was submitted.",
+    );
+    throw new Error(
+      `planned order ${order.plannedOrderId} ${what}; the composition root refuses to assume one (§12.1 ExecutionPolicy)`,
+    );
+  };
   return {
-    timeInForceFor(order: PlannedOrderView): TimeInForce {
-      const resolved = wiring.trader?.loop.timeInForceFor(order.plannedOrderId);
-      if (resolved === undefined) {
-        log(
-          `SUBMISSION REFUSED: no time-in-force was recorded for planned order ` +
-            `${order.plannedOrderId}. The composition root refuses to assume one (§12.1 ` +
-            "ExecutionPolicy); the venue contains this into a refused ExecutionResult and " +
-            "nothing was submitted.",
-        );
-        throw new Error(
-          `no time-in-force was recorded for planned order ${order.plannedOrderId}; the ` +
-            "composition root refuses to assume one (§12.1 ExecutionPolicy)",
-        );
+    timeInForceFor(order: PlannedOrderWithTimeInForce): TimeInForce {
+      if (!TIME_IN_FORCE_VALUES.includes(order.timeInForce)) {
+        return refuse(order, "carries no time-in-force the venue knows");
       }
-      return resolved;
+      return order.timeInForce as TimeInForce;
     },
-    statedExpiryNsFor(): bigint | undefined {
-      return undefined;
+    statedExpiryNsFor(order: PlannedOrderWithTimeInForce): bigint | undefined {
+      if (order.timeInForce !== "GTD") return undefined;
+      const expiration = order.expirationUnixSeconds;
+      const nowMs = Date.parse(clock.now());
+      if (typeof expiration !== "number" || !Number.isSafeInteger(expiration) || !Number.isFinite(nowMs)) {
+        return refuse(order, "is GTD without a readable expiration");
+      }
+      return clock.monotonicNs() + BigInt(expiration * 1000 - nowMs) * 1_000_000n;
     },
     sameInstantAdditionsFor() {
       // §12.2's CONSERVATIVE queue arm assumes we sit behind size added at our

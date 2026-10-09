@@ -310,7 +310,7 @@ function singleMarketConfig(options: ConfigOptions = {}): Record<string, unknown
               passive_price: "0.34",
               convert_to_aggressive_after_ms: 0,
               maximum_buy_price: "0.35",
-              immediate_order_type: "FAK",
+              immediate_order_type: "GTD",
               partial_fill_policy: "ACCEPT_ANY",
               minimum_fill_shares: "10",
               submission_unknown_after_ms: 5000,
@@ -560,7 +560,7 @@ function assemble(options: ConfigOptions): Run {
     model: tier0Model({ fillModelVersion: "tier0.tp1c", fillModelParametersHash: "c".repeat(64) }),
     feeSnapshot: fees.value,
     rateLimits: unmodeledRateLimits("no venue rate-limit budget is modelled in this unit test"),
-    policy: createExecutionPolicy(wiring, () => undefined),
+    policy: createExecutionPolicy(clock, () => undefined),
     startingCash: "1000",
     books: {
       book(input): BookView | undefined {

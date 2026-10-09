@@ -20,8 +20,8 @@
  *
  * `apps/trader/src/main.ts` gives the `SimulatedVenue` a `books` provider that
  * looks the market up through the trader on every read, and an `ExecutionPolicy`
- * whose `timeInForceFor` asks the trader for the value it recorded at plan time
- * and THROWS when there is none. Since `BACKTEST-2` this harness does not
+ * whose `timeInForceFor` reads the value the planned order carries (`C1-TIF`,
+ * ADR-034 D3.1 item 2) and THROWS when there is none. Since `BACKTEST-2` this harness does not
  * reproduce either shape: it calls the core's ONE venue builder,
  * `buildSimulatedVenue` (ADR-022 D5), the call `main.ts` makes, so the seam
  * under test is the shipped one — a venue that answered either question itself

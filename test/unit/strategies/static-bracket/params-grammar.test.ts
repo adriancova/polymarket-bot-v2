@@ -50,6 +50,14 @@ const DISCLOSED_ADDITIONS = [
   "data_quality.on_incident",
 ];
 
+/**
+ * §13.2's example VALUES this grammar refuses, each with its ruling. `C1-TIF`
+ * (COMPLEXITY-1, the user's ruling of 2026-10-08): `immediate_order_type: FAK`
+ * is refused until ADR-034 D4 is built after the execution probe, so the
+ * fixture states `GTD`. The key itself is still modelled.
+ */
+const REFUSED_EXAMPLE_VALUES: ReadonlyMap<string, unknown> = new Map([["entry.execution.immediate_order_type", "GTD"]]);
+
 describe("§13.2 configuration grammar", () => {
   it("reads the §13.2 block out of the handoff as a nested mapping", () => {
     const config = handoffConfig();
@@ -68,6 +76,11 @@ describe("§13.2 configuration grammar", () => {
     const fixture = flatten(baseConfig() as never);
     for (const [path, value] of specified) {
       expect(fixture.has(path), `§13.2 field ${path} is missing from the grammar`).toBe(true);
+      if (REFUSED_EXAMPLE_VALUES.has(path)) {
+        expect(value, `§13.2's ${path} no longer differs from the stated departure`).not.toEqual(REFUSED_EXAMPLE_VALUES.get(path));
+        expect(fixture.get(path)).toEqual(REFUSED_EXAMPLE_VALUES.get(path));
+        continue;
+      }
       expect(fixture.get(path), `§13.2 field ${path} was modeled with a different value`).toEqual(
         value,
       );

@@ -49,6 +49,13 @@ exception is never one of this package's answers.
   under `basis: "ESTIMATE"`;
 - **priority** (§6 invariant 13): cancels are `SAFETY_CANCEL`, placements
   `PLACEMENT`, coupled in both directions at the seal;
+- **time-in-force on the plan** (ADR-034 D3.1 item 2, `C1-TIF`): every planned
+  order carries `timeInForce` (`GTC`, `GTD`, `FAK` or `FOK`), which the caller
+  resolves and hands in as `PlanningInputs.timeInForce` — never defaulted; a
+  placement's inputs without one are refused. A GTD order also carries
+  `expirationUnixSeconds`: its plan's deadline, rounded up to the second, plus
+  the venue's 60 s security threshold, so the venue ends it at the deadline.
+  Only a GTD order carries one;
 - **immutability**: the sealed value is a deeply frozen materialized tree
   sharing no object with the draft.
 

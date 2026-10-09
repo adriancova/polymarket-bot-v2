@@ -25,7 +25,7 @@
  * | `model` | Tier 0 over the settings' fill-model version and parameters hash | `settings` |
  * | `feeSnapshot` | read through `packages/simulation`'s own door; a refused snapshot is this function's refusal | `settings.feeSchedule` |
  * | `startingCash` | — | `settings.startingCash` |
- * | `policy` | `createExecutionPolicy` over the {@link VenueWiring} holder (`venue-policy.ts`) | `log` (where an unresolvable time-in-force is logged; nothing when absent) |
+ * | `policy` | `createExecutionPolicy` over the clock (`venue-policy.ts`): it reads the planned order's own time-in-force | `log` (where an order without a time-in-force is logged; nothing when absent) |
  * | `books` | a live lookup through the holder's trader on every read | — |
  * | `rateLimits` | `unmodeledRateLimits` with {@link UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE} | `rateLimits` (a test that needs a REAL venue refusal passes a token bucket) |
  * | `retention` | the venue's own defaults | `retention` (a test that must make the venue evict) |
@@ -40,11 +40,12 @@
  *
  * ## The two-phase wiring
  *
- * The venue asks two questions only the trader can answer — the BOOK a market
- * has (§12.2's Tier-0 depth) and the TIME-IN-FORCE a planned order carries
- * (§12.1 `ExecutionPolicy`) — and the trader takes the venue as a constructor
+ * The venue asks one question only the trader can answer — the BOOK a market
+ * has (§12.2's Tier-0 depth) — and the trader takes the venue as a constructor
  * argument. So the venue is built against a HOLDER ({@link VenueWiring}) that
- * the caller fills with the trader the instant it exists:
+ * the caller fills with the trader the instant it exists. (The TIME-IN-FORCE a
+ * planned order carries is on the plan itself since `C1-TIF`, ADR-034 D3.1
+ * item 2, so the §12.1 `ExecutionPolicy` reads the order, not the holder.)
  *
  * ```ts
  * const built = buildSimulatedVenue({ clock, settings: config.simulation, log });
@@ -53,11 +54,10 @@
  * if (created.ok) built.wiring.trader = created.trader;
  * ```
  *
- * Until it is filled, every book read answers `undefined` and every
- * time-in-force question throws (contained by `SimulatedVenue.submit` into a
- * REFUSED `ExecutionResult`), and neither can happen: no event has been
- * processed, so no plan exists. A venue that answered either question itself
- * would be a second authority, which `packages/simulation` refuses to be.
+ * Until it is filled, every book read answers `undefined`, which cannot
+ * happen: no event has been processed, so no plan exists. A venue that
+ * answered the question itself would be a second authority, which
+ * `packages/simulation` refuses to be.
  *
  * ## Layer and safety
  *
@@ -169,7 +169,7 @@ export function buildSimulatedVenue(options: SimulatedVenueBuildOptions): Simula
   });
   if (!fees.ok) return { ok: false, refusal: fees.refusal };
 
-  // The holder the venue's policy and book provider read. The caller fills it
+  // The holder the venue's book provider reads. The caller fills it
   // the instant the trader exists; see the module header.
   const wiring: VenueWiring = { trader: undefined };
 
@@ -182,7 +182,7 @@ export function buildSimulatedVenue(options: SimulatedVenueBuildOptions): Simula
     }),
     feeSnapshot: fees.value,
     rateLimits: options.rateLimits ?? unmodeledRateLimits(UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE),
-    policy: createExecutionPolicy(wiring, options.log ?? discard),
+    policy: createExecutionPolicy(options.clock, options.log ?? discard),
     startingCash: settings.startingCash,
     ...(options.retention === undefined ? {} : { retention: options.retention }),
     books: {

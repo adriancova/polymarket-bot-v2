@@ -114,6 +114,23 @@ export interface UnexecutableRemainder {
   readonly executable: string;
 }
 
+/**
+ * The venue's four order types (venue report §2.3), as a planned order carries
+ * them (ADR-034 D3.1 item 2). The planner chooses none: the caller resolves one
+ * per plan (`PlanningInputs.timeInForce`), and the planner stamps it on every
+ * order it plans, so PAPER and live read one value from the plan.
+ */
+export const TIME_IN_FORCE_VALUES = Object.freeze(["GTC", "GTD", "FAK", "FOK"] as const);
+export type TimeInForce = (typeof TIME_IN_FORCE_VALUES)[number];
+
+/**
+ * "GTD orders expire one minute before their stated expiration as a security
+ * threshold" (venue report §2.3; ADR-012 §5.2). A GTD order states
+ * `deadline + 60 s`, so the venue expires it at its plan's deadline
+ * (ADR-034 D3.3).
+ */
+export const GTD_SECURITY_THRESHOLD_SECONDS = 60;
+
 export interface PlannedOrder {
   readonly plannedOrderId: string;
   readonly marketId: string;
@@ -129,6 +146,14 @@ export interface PlannedOrder {
   readonly shares: string;
   readonly postOnly: boolean;
   readonly executionStyle: "REST" | "MARKETABLE_LIMIT";
+  /** ADR-034 D3.1 item 2: the plan's time-in-force, as the caller resolved it. Never defaulted. */
+  readonly timeInForce: TimeInForce;
+  /**
+   * GTD only, and required there: the stated expiration in Unix seconds, the
+   * plan's deadline rounded up to the second plus
+   * {@link GTD_SECURITY_THRESHOLD_SECONDS}.
+   */
+  readonly expirationUnixSeconds?: number;
   /** The reservation that must be APPLIED before this order is submitted. */
   readonly reservationId: string;
   /** ADR-034 D2.3: only on a leg's last order, only when its request was off the grid. */
@@ -501,6 +526,8 @@ function validateOrder(
       "shares",
       "postOnly",
       "executionStyle",
+      "timeInForce",
+      "expirationUnixSeconds",
       "reservationId",
       "unexecutableRemainder",
     ]),
@@ -558,6 +585,17 @@ function validateOrder(
       `${path}.executionStyle`,
       "a resting order is post-only and a marketable limit is not; any other combination is incoherent",
     );
+  }
+  // ADR-034 D3.1 item 2 and D3.3: every order carries one of the four values,
+  // and an expiration exactly when it is GTD.
+  const timeInForce = asMember(data["timeInForce"], `${path}.timeInForce`, TIME_IN_FORCE_VALUES, problems);
+  const expiration = data["expirationUnixSeconds"];
+  if (timeInForce === "GTD") {
+    if (typeof expiration !== "number" || !Number.isSafeInteger(expiration) || expiration <= 0) {
+      problem(problems, `${path}.expirationUnixSeconds`, "a GTD order states its expiration in positive whole Unix seconds (ADR-034 D3.3)");
+    }
+  } else if (expiration !== undefined) {
+    problem(problems, `${path}.expirationUnixSeconds`, "only a GTD order states an expiration (ADR-034 D3.3)");
   }
   const reservationId = asIdentifier(data["reservationId"], `${path}.reservationId`, problems);
   if (

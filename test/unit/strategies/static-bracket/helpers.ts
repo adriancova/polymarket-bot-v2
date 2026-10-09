@@ -88,7 +88,7 @@ export function baseConfig(): Record<string, unknown> {
         passive_price: "0.35",
         convert_to_aggressive_after_ms: 0,
         maximum_buy_price: "0.35",
-        immediate_order_type: "FAK",
+        immediate_order_type: "GTD",
         partial_fill_policy: "ACCEPT_MINIMUM",
         minimum_fill_shares: "10",
         submission_unknown_after_ms: 5000,

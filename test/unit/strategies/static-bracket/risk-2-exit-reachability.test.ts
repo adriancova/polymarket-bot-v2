@@ -82,9 +82,11 @@ describe("RISK-2 defect 1 — every exit names the venue order type it needs", (
     expect(exits).toHaveLength(1);
     expect(tagsOf(exits[0] as Intent)).toContain(TAGS.takeProfit);
     // A `MAKER_ONLY` take-profit is planned REST, and FAK — the value the
-    // entry's `immediate_order_type` would have supplied — cannot rest.
+    // entry's `immediate_order_type` would have supplied before `C1-TIF`
+    // refused it — cannot rest. The exit never takes the entry's value
+    // (`baseConfig()` configures `GTD` since `C1-TIF`).
     expect(tagsOf(exits[0] as Intent)).toContain(orderTypeTag("GTC"));
-    expect(tagsOf(exits[0] as Intent)).not.toContain(orderTypeTag("FAK"));
+    expect(tagsOf(exits[0] as Intent)).not.toContain(orderTypeTag("GTD"));
   });
 
   it("the protected reduction carries sb.order-type:GTC", () => {
@@ -105,13 +107,14 @@ describe("RISK-2 defect 1 — every exit names the venue order type it needs", (
 
   it("the ENTRY still names the CONFIGURED immediate order type — unchanged", () => {
     // The fix is that an exit states its OWN order type, not that the entry's
-    // configuration stopped mattering. `baseConfig()` configures `FAK`.
+    // configuration stopped mattering. `baseConfig()` configures `GTD`
+    // (`FAK` before `C1-TIF` refused it at validation).
     const decision = staticBracketStrategy.onFeatures(context(params(), ARMED, {}));
     expect(decision.decisionType).toBe("enter");
     const entries = positionIntents(decision);
     expect(entries).toHaveLength(1);
     expect(tagsOf(entries[0] as Intent)).toContain(TAGS.entry);
-    expect(tagsOf(entries[0] as Intent)).toContain(orderTypeTag("FAK"));
+    expect(tagsOf(entries[0] as Intent)).toContain(orderTypeTag("GTD"));
   });
 
   it("the order-type tag is not a disposition signal: it rides beside the existing tags", () => {

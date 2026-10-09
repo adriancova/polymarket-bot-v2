@@ -424,18 +424,18 @@ function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Har
 
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("fees refused");
-  const wiring: { loop: CoreLoop | undefined } = { loop: undefined };
   const venue = new SimulatedVenue({
     clock,
     runMode: "PAPER",
     model: tier0Model({ fillModelVersion: "tier0.trdr4", fillModelParametersHash: "c".repeat(64) }),
     feeSnapshot: fees.value,
     rateLimits: unmodeledRateLimits("no venue rate-limit budget is modelled in this synthetic run"),
-    // `main.ts`'s `createExecutionPolicy` semantics: the loop's recorded
-    // time-in-force, and a refusal (throw, contained by the venue) otherwise.
+    // `createExecutionPolicy`'s semantics: the planned order's own
+    // time-in-force (ADR-034 D3.1 item 2), and a refusal (throw, contained by
+    // the venue) otherwise.
     policy: {
-      timeInForceFor(order) {
-        const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
+      timeInForceFor(order: { readonly plannedOrderId: string; readonly timeInForce?: "GTC" | "GTD" | "FAK" | "FOK" }) {
+        const resolved = order.timeInForce;
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
       },
@@ -507,7 +507,6 @@ function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Har
     // cadence, the test says where and why.
     evaluationCadence: cadence.option,
   });
-  wiring.loop = loop;
 
   const harness: Harness = { loop, venue, store, evaluations: [], event: 0 };
   const original = created.runtime.evaluate.bind(created.runtime);

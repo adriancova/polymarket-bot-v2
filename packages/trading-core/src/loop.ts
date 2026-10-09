@@ -196,7 +196,6 @@ import {
   resolveTimeInForce,
   runPlanner,
   runRiskCheck,
-  OrderTimeInForceBook,
   type RiskInputContext,
 } from "./pipeline.js";
 import { pnlSnapshotKey } from "./pnl-snapshot-key.js";
@@ -705,8 +704,6 @@ export class CoreLoop {
   readonly #cancels = new CancelLedger();
   /** Keyed by PLANNED order id (`reservations.ts`). */
   readonly #reservations = new ReservationBook();
-  /** Keyed by PLANNED order id (`pipeline.ts`). */
-  readonly #timeInForce = new OrderTimeInForceBook();
   readonly #reference: ReferenceState;
   /**
    * `THROUGHPUT-1c` (ADR-023): the configured book-freshness basis and, under
@@ -738,8 +735,8 @@ export class CoreLoop {
   //
   // TWO KEYS, and each map uses its own. The maps below are keyed by the
   // VENUE's order id — for `SimulatedVenue`, `SimulatedOrder.simulatedOrderId`
-  // — because that is what a fill and an order view name. The three RELEASE
-  // books (`#reservations`, the allocator, `#timeInForce`) are keyed by the
+  // — because that is what a fill and an order view name. The two RELEASE
+  // books (`#reservations` and the allocator) are keyed by the
   // PLANNER's `plannedOrderId`, because they are taken before the venue has
   // assigned anything. The simulator happens to make the two equal
   // (`venue.ts`), a real venue will not, and nothing here relies on it.
@@ -1085,19 +1082,6 @@ export class CoreLoop {
    */
   costBasisOf(instanceId: string, marketId: string, side: "YES" | "NO"): string {
     return this.#options.allocator.costBasisOf(instanceId, marketId, side);
-  }
-
-  /**
-   * The venue's `ExecutionPolicy.timeInForceFor` answer for one planned order.
-   *
-   * Published because the venue asks the COMPOSITION ROOT for it — "a silently
-   * assumed FAK would change every unfilled remainder's fate" — and the answer
-   * is recorded here, at plan time, from the emitting intent's own tag. A venue
-   * policy that reads this cannot invent one: an order whose value was never
-   * recorded answers `undefined`, and the policy must refuse rather than guess.
-   */
-  timeInForceFor(plannedOrderId: string): TimeInForce | undefined {
-    return this.#timeInForce.get(plannedOrderId);
   }
 
   ledger(): Ledger {
@@ -2984,6 +2968,20 @@ export class CoreLoop {
     if (rememberableIntentId !== "") this.#rememberIntentId(rememberableIntentId);
 
     // --- step 8: create execution plans -----------------------------------
+    // The time-in-force (`immediate_order_type`), resolved BEFORE planning so
+    // the planner stamps it on every order (ADR-034 D3.1 item 2). An intent
+    // whose value cannot be resolved is not planned or submitted at all. A
+    // CANCEL places nothing and resolves none: nothing may block it (§6
+    // invariant 13).
+    let timeInForce: TimeInForce | undefined;
+    if (input.intent.type !== "CANCEL") {
+      const resolved = resolveTimeInForce(input.intent, input.instance.immediateOrderType);
+      if (!resolved.ok) {
+        this.#options.health.countExecution("submissionsRefused");
+        return;
+      }
+      timeInForce = resolved.timeInForce;
+    }
     const executionPlanId = this.#options.ids.next();
     const planInputs = buildPlanningInputs({
       config: this.#options.config,
@@ -2998,6 +2996,7 @@ export class CoreLoop {
       yesBestAsk: input.market.bookFor("YES").topOfBook().bestAskPrice,
       noBestBid: input.market.bookFor("NO").topOfBook().bestBidPrice,
       noBestAsk: input.market.bookFor("NO").topOfBook().bestAskPrice,
+      timeInForce,
     });
     const planned = runPlanner(evaluation.record, planInputs);
     if (!planned.ok) {
@@ -3047,21 +3046,8 @@ export class CoreLoop {
       });
     }
 
-    // The time-in-force resolution (`immediate_order_type`), recorded per
-    // planned order BEFORE submission. An order whose value cannot be resolved
-    // is not submitted at all.
     const placement = input.plan as PlacementPlan;
     if (input.plan.planKind !== "CANCEL") {
-      const resolved = resolveTimeInForce(input.intent, input.instance.immediateOrderType);
-      if (!resolved.ok) {
-        this.#options.health.countExecution("submissionsRefused");
-        return;
-      }
-      for (const group of placement.groups) {
-        for (const order of group.orders) {
-          this.#timeInForce.record(order.plannedOrderId, resolved.timeInForce);
-        }
-      }
       // --- §9.10: RESERVE BEFORE SUBMISSION, in BOTH books -----------------
       // `ReservationBook` holds the inventory the next PLAN may not use
       // (`WP-220` obligation 9, so the next evaluation's reduction plans
@@ -3098,18 +3084,6 @@ export class CoreLoop {
         // releasing. The refusal CODES are counted by the gate itself
         // (`seams.allocator.refusalsByCode`), so this process has exactly one
         // authority on what the allocator said.
-        //
-        // `TRDR-4`: the TIME-IN-FORCE entries recorded above DO need releasing.
-        // They were recorded per planned order before the allocator was asked,
-        // and these planned orders never reach the venue — so no terminal view
-        // will ever release them, and every refused plan used to leak one
-        // entry per planned order into `#timeInForce` for the life of the
-        // process. Keyed by the PLANNED order id, as they were recorded.
-        for (const group of placement.groups) {
-          for (const order of group.orders) {
-            this.#timeInForce.release(order.plannedOrderId);
-          }
-        }
         this.#options.health.countExecution("allocationsRefused");
         return;
       }
@@ -3384,7 +3358,6 @@ export class CoreLoop {
         this.#options.health.countExecution("reservationsReleasedOnRefusal");
       }
       this.#options.allocator.release(plannedOrderId);
-      this.#timeInForce.release(plannedOrderId);
     }
 
     const refusal = `${result.refusalCode ?? "VENUE_REFUSED"}: ${result.refusalMessage ?? "the venue refused the plan"}`;
@@ -3781,7 +3754,6 @@ export class CoreLoop {
       if (order === undefined || !this.#isTerminalOrder(order) || !this.#fullyBooked(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
       this.#settleCapital(order);
-      this.#timeInForce.release(order.plannedOrderId);
     }
   }
 
@@ -4335,7 +4307,6 @@ export class CoreLoop {
       if (order === undefined || !this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
       this.#settleCapital(order);
-      this.#timeInForce.release(order.plannedOrderId);
     }
     for (const plannedOrderId of inVenueOrder(this.#heldUnowned.keys())) {
       const venueOrderId = this.#heldUnowned.get(plannedOrderId);
@@ -4369,7 +4340,6 @@ export class CoreLoop {
       // against the instance that reserved it (fail closed; the market is
       // halted `UNATTRIBUTED_ACTIVITY` for reconciliation).
       this.#settleCapital(order);
-      this.#timeInForce.release(order.plannedOrderId);
       this.#heldUnowned.delete(plannedOrderId);
       this.#acknowledgeIfDone(order.simulatedOrderId);
     }
@@ -4649,7 +4619,6 @@ export class CoreLoop {
         // the cap check until the harvest that books it.
         this.#reservations.releaseForOrder(order.plannedOrderId);
         this.#settleCapital(order);
-        this.#timeInForce.release(order.plannedOrderId);
       }
       if (this.#options.halts.isInstanceHalted(instance.instanceId, instance.marketId)) {
         // Suppressed, so NOT an evaluation: a terminal view comes again.

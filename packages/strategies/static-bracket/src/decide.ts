@@ -428,11 +428,17 @@ function entryExecutionUnfolded(state: StaticBracketState): boolean {
  *   intent's `validUntil` as its deadline, under `escalation.atDeadline:
  *   CANCEL_REMAINING`.
  *
- * NOT IN SCOPE, AND REPORTED RATHER THAN FIXED HERE: {@link planEntry} tags
- * `immediate_order_type` unconditionally, so a PASSIVE entry
- * (`convert_to_aggressive_after_ms > 0`, planned `REST`) collides the same way.
- * That path is not the one B2 blocked, and choosing a passive entry's order
- * type is an entry-side decision this round does not own.
+ * {@link planEntry} tags `immediate_order_type` unconditionally, so a PASSIVE
+ * entry (`convert_to_aggressive_after_ms > 0`, planned `REST`) used to collide
+ * the same way under `FAK`. Since `C1-TIF` (2026-10-08) `FAK` and `FOK` are
+ * refused at validation (`IMMEDIATE_ORDER_TYPE_PARKED`), and `GTD` and `GTC`
+ * both rest, so a passive entry no longer collides.
+ *
+ * CORRECTION (`C1-TIF`): "the plan carries the intent's `validUntil` as its
+ * deadline" is true, but neither `packages/trading-core` nor the simulated
+ * venue cancels a GTC order at its plan's deadline: only a cancel this
+ * strategy emits (or a fill) ends it. A GTD entry is expired by the venue at
+ * that deadline.
  */
 const EXIT_ORDER_TYPE = "GTC";
 
