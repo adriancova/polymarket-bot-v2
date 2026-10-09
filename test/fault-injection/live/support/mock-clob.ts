@@ -34,6 +34,7 @@
  * | D-21: a cancel-all or cancel-market request first consumes one cancel token, then one more per order canceled once the result is known, which may put the Standard tier's bucket in debt; later cancel requests stay blocked until the bucket holds enough tokens for the next one | `verified-2026-09-16.md` §8 D-21 |
  * | User channel: `order` events (`PLACEMENT`/`UPDATE`/`CANCELLATION`) and `trade` events (`MATCHED` … `CONFIRMED`), no replay of missed events | §4, §W.4 |
  * | Reads: open orders (an absent order is not proof of cancellation), by id "regardless of status", trades, `/v2/positions`, on-chain collateral, `/v2/approvals` | §W.9 E-14, E-15; `ReconWorld` |
+ * | Signing rounds a limit order's share quantity DOWN to 2 decimals and its quote down to the tick's Amount decimals (0.01: 4), in 6-decimal base units; an order's original size is its SIGNED share amount, never the request's (ADR-034 D2.5) | `verified-2026-10-06.md` F-99, F-101, F-102 |
  *
  * ## What it ASSUMES (undocumented; every one is a labelled test assumption in the report)
  *
@@ -219,6 +220,11 @@ export class MockClob extends ReconWorld {
   restartRetryAfter = false;
   /** A cancel the venue never answers (it stays pending; nothing is canceled). */
   readonly hangCancels = new Set<string>();
+  /**
+   * A FAULT in the signer, for ADR-034 D2.6 item 3: when set, the "SDK" signs these amounts instead of the pinned
+   * SDK's own (`fixtureAmounts`), e.g. a share amount one base unit away from the ticket. `null`: the SDK's amounts.
+   */
+  signingSkew: ((amounts: { readonly makerAmount: string; readonly takerAmount: string }, side: "BUY" | "SELL") => { readonly makerAmount: string; readonly takerAmount: string }) | null = null;
   #mode: { readonly kind: EngineMode; readonly untilMs: number | null } = { kind: "NORMAL", untilMs: null };
   readonly #buckets = new Map<string, { order: Bucket; cancel: Bucket }>();
   readonly #chains = new Map<string, HeartbeatChain>();
@@ -373,13 +379,14 @@ export class MockClob extends ReconWorld {
     }
     this.#salt += 1;
     const salt = String(this.#salt);
+    const amounts = this.signingSkew === null ? fixtureAmounts(side, price, size) : this.signingSkew(fixtureAmounts(side, price, size), side);
     const message = {
       salt,
       maker: DEFAULT_FAKE_ACCOUNT.wallet,
       signer: DEFAULT_FAKE_ACCOUNT.signer,
       signatureType: DEFAULT_FAKE_ACCOUNT.walletType,
       tokenId,
-      ...fixtureAmounts(side, price, size),
+      ...amounts,
       side,
       timestamp: "1790000000000",
       metadata: `0x${"0".repeat(64)}`,
@@ -393,7 +400,8 @@ export class MockClob extends ReconWorld {
         types: { FixtureOrder: [{ name: "salt", type: "uint256" }] },
         message,
       });
-      this.signed.set(salt, { tokenId, side, price, size });
+      // ADR-034 D2.6 item 2: the venue books the SIGNED share amount, never the request's size.
+      this.signed.set(salt, { tokenId, side, price, size: sharesOf(side, amounts) });
       this.signatures.set(salt, String(made));
       return made;
     });
@@ -880,10 +888,12 @@ function liveAnswer(orderId: string): unknown {
 }
 
 /**
- * The amounts the pinned SDK signs for a limit order at tick 0.01 (WP-260's fake SDK, `fixtureAmounts`): shares
- * rounded DOWN to 2 decimals, the quote rounded DOWN to 4 decimals, both in 6-decimal base units. Exact integers.
+ * The amounts the pinned SDK signs for a limit order at tick 0.01 (WP-260's fake SDK, `fixtureAmounts`;
+ * `docs/venue/verified-2026-10-06.md` F-99's row "0.01 | 2 | 2 | 4" and F-101's `computeLimitOrderAmounts`): shares
+ * rounded DOWN to 2 decimals ("Size decimals"), the quote rounded DOWN to 4 decimals ("Amount decimals"), both in
+ * 6-decimal base units. Exact integers. `mock-venue-facts.test.ts` pins it against F-101.
  */
-function fixtureAmounts(side: "BUY" | "SELL", priceText: string, sizeText: string): { readonly makerAmount: string; readonly takerAmount: string } {
+export function fixtureAmounts(side: "BUY" | "SELL", priceText: string, sizeText: string): { readonly makerAmount: string; readonly takerAmount: string } {
   const rational = (text: string): { readonly n: bigint; readonly d: bigint } => {
     const [whole = "0", fraction = ""] = text.split(".");
     return { n: BigInt(`${whole}${fraction}`), d: 10n ** BigInt(fraction.length) };
@@ -894,4 +904,15 @@ function fixtureAmounts(side: "BUY" | "SELL", priceText: string, sizeText: strin
   const quote = ((price.n * shares) / price.d / 100n) * 100n;
   const [maker, taker] = side === "BUY" ? [quote, shares] : [shares, quote];
   return { makerAmount: maker.toString(10), takerAmount: taker.toString(10) };
+}
+
+/**
+ * The share quantity a signed limit order carries (a BUY's `takerAmount`, a SELL's `makerAmount`), as a canonical
+ * decimal: what the venue books as the order's original size (ADR-034 D2.5, D2.6 item 2).
+ */
+export function sharesOf(side: "BUY" | "SELL", amounts: { readonly makerAmount: string; readonly takerAmount: string }): string {
+  const units = BigInt(side === "BUY" ? amounts.takerAmount : amounts.makerAmount);
+  const whole = (units / 1_000_000n).toString(10);
+  const fraction = (units % 1_000_000n).toString(10).padStart(6, "0").replace(/0+$/u, "");
+  return fraction === "" ? whole : `${whole}.${fraction}`;
 }

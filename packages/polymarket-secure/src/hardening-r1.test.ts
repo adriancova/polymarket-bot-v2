@@ -497,12 +497,14 @@ describe("L5: the SDK's signed order must say what was asked", () => {
     expect(await client.createLimitOrder(request)).toMatchObject({ kind: "FAILED", error: { kind: "UNKNOWN" } });
   });
 
-  it("a SELL's proceeds may be rounded down only within the SDK's quote precision", async () => {
+  it("a SELL's proceeds must be exactly price × shares: no rounding is tolerated (ADR-034 D2.4)", async () => {
     const sell = { ...request, side: "SELL" } as const;
-    // 0.52 × 10 shares = 5.2 pUSD = 5,200,000 base units.
+    // 0.52 × 10 shares = 5.2 pUSD = 5,200,000 base units. Before ADR-034 D2.4 a quote rounded down by less than
+    // 10^3 base units was SIGNED (5199001); on-grid inputs need no rounding (A F-102), so any deviation fails closed.
     for (const [takerAmount, kind] of [
       ["5200000", "SIGNED"],
-      ["5199001", "SIGNED"],
+      ["5199999", "FAILED"],
+      ["5199001", "FAILED"],
       ["5199000", "FAILED"],
       ["5200001", "FAILED"],
     ] as const) {

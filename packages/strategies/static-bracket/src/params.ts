@@ -358,6 +358,30 @@ function readNonNegativeField(parent: PlainRecord, key: string, path: string): O
   return readConfigDecimal(value.value, `${path}.${key}`, "NON_NEGATIVE");
 }
 
+/**
+ * Decimals of a share quantity the venue can execute: "Size decimals" is 2
+ * for every tick size (`docs/venue/verified-2026-10-06.md` F-99, F-101).
+ */
+export const SHARE_QUANTITY_DECIMALS = 2;
+
+/**
+ * A configured SHARE quantity (ADR-034 D2.4): read as a decimal, then refused
+ * when it is off the venue's 0.01 grid. An operator cannot configure a size
+ * the venue cannot execute; the configuration is never rounded.
+ */
+function readShareField(parent: PlainRecord, key: string, path: string, range: "POSITIVE" | "NON_NEGATIVE"): Outcome<string> {
+  const read = range === "POSITIVE" ? readPositiveField(parent, key, path) : readNonNegativeField(parent, key, path);
+  if (!read.ok) return read;
+  const dot = read.value.indexOf(".");
+  if (dot !== -1 && read.value.length - dot - 1 > SHARE_QUANTITY_DECIMALS) {
+    return bad(
+      `${path}.${key} ${read.value} is off the venue's 0.01 share grid ("Size decimals" is 2 for every tick ` +
+        "size); a share quantity the venue cannot execute is refused at load, never rounded (ADR-034 D2.4)",
+    );
+  }
+  return read;
+}
+
 function readFeatureKeyField(
   parent: PlainRecord,
   key: string,
@@ -544,7 +568,7 @@ function parseEntry(root: PlainRecord): Outcome<EntryParams> {
   if (!triggerFeatureKey.ok) return triggerFeatureKey;
   const triggerPriceLte = readPriceField(record.value, "trigger_price_lte", "params.entry");
   if (!triggerPriceLte.ok) return triggerPriceLte;
-  const sizeShares = readPositiveField(record.value, "size_shares", "params.entry");
+  const sizeShares = readShareField(record.value, "size_shares", "params.entry", "POSITIVE");
   if (!sizeShares.ok) return sizeShares;
   const maximumTotalCost = readNonNegativeField(record.value, "maximum_total_cost", "params.entry");
   if (!maximumTotalCost.ok) return maximumTotalCost;
@@ -612,7 +636,7 @@ function parseExecution(entry: PlainRecord): Outcome<EntryExecutionParams> {
   if (!immediateOrderType.ok) return immediateOrderType;
   const partialFillPolicy = readEnum(record.value, "partial_fill_policy", path, PARTIAL_FILL_POLICIES);
   if (!partialFillPolicy.ok) return partialFillPolicy;
-  const minimumFillShares = readNonNegativeField(record.value, "minimum_fill_shares", path);
+  const minimumFillShares = readShareField(record.value, "minimum_fill_shares", path, "NON_NEGATIVE");
   if (!minimumFillShares.ok) return minimumFillShares;
   const submissionUnknownAfterMs = readInteger(
     record.value,
@@ -835,10 +859,11 @@ function parseRisk(root: PlainRecord): Outcome<RiskParams> {
   if (!record.ok) return record;
   const unknown = refuseUnknownKeys(record.value, RISK_KEYS, "params.risk");
   if (!unknown.ok) return unknown;
-  const maximumPositionShares = readPositiveField(
+  const maximumPositionShares = readShareField(
     record.value,
     "maximum_position_shares",
     "params.risk",
+    "POSITIVE",
   );
   if (!maximumPositionShares.ok) return maximumPositionShares;
   const maximumContractualLoss = readNonNegativeField(

@@ -64,6 +64,12 @@ export type PlannerRefusalCode =
   | "PLAN_BELOW_MINIMUM_ORDER_SIZE"
   /** The slicing policy cannot produce venue-acceptable slices for this market. */
   | "PLAN_SLICING_INCOHERENT"
+  /**
+   * The market's tick size is not in the venue's documented precision table
+   * (ADR-034 D2.1; `docs/venue/verified-2026-10-06.md` F-99), so its order
+   * grid is unknown. The SDK refuses it too ("Unsupported tick size", F-101).
+   */
+  | "PLAN_TICK_SIZE_UNSUPPORTED"
 
   // --- coordinated baskets (workplan acceptance 3; §9.10) ---------------------
   /** A buying basket leg carries no price ceiling and no book to derive one from. */
@@ -105,6 +111,7 @@ export const PLANNER_REFUSAL_CODES = [
   "PLAN_EXCEEDS_MAXIMUM_TOTAL_COST",
   "PLAN_BELOW_MINIMUM_ORDER_SIZE",
   "PLAN_SLICING_INCOHERENT",
+  "PLAN_TICK_SIZE_UNSUPPORTED",
   "PLAN_BASKET_LEG_UNBOUNDED",
   "PLAN_BASKET_LEG_RISK_EXCEEDED",
   "PLAN_BASKET_COMBINED_COST_EXCEEDED",
@@ -113,7 +120,7 @@ export const PLANNER_REFUSAL_CODES = [
 ] as const satisfies readonly PlannerRefusalCode[];
 
 /** The published cardinality of {@link PLANNER_REFUSAL_CODES}. */
-export const PLANNER_REFUSAL_CODE_COUNT = 20;
+export const PLANNER_REFUSAL_CODE_COUNT = 21;
 
 /**
  * Compile-time proof that {@link PLANNER_REFUSAL_CODES} covers the whole

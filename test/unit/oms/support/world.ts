@@ -72,7 +72,7 @@ import type {
   SignedOrderHandle,
 } from "../../../../packages/oms/src/index.js";
 
-import { FakeSignedOrder, MAKER, SIGNER, accepted, signatureFor, venueError, venueIdFor } from "./fake-venue.js";
+import { FakeSignedOrder, MAKER, SIGNER, accepted, limitOrderAmounts, signatureFor, venueError, venueIdFor } from "./fake-venue.js";
 
 export type Behavior =
   | "ACCEPT_LIVE"
@@ -227,7 +227,7 @@ export class SimWorld {
       builder: `0x${"0".repeat(64)}`,
       expiration: request.expirationUnixSeconds ?? 0,
       maker: MAKER,
-      makerAmount: "1000000",
+      ...limitOrderAmounts(request.side, request.price, request.size),
       metadata: `0x${"0".repeat(64)}`,
       orderType: request.expirationUnixSeconds === undefined ? "GTC" : "GTD",
       postOnly: request.postOnly === true,
@@ -236,7 +236,6 @@ export class SimWorld {
       signature: signatureFor(salt),
       signatureType: 3,
       signer: SIGNER,
-      takerAmount: "2000000",
       timestamp: "1790000000000",
       tokenId: request.assetId,
     };

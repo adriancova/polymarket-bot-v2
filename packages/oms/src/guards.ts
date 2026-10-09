@@ -135,6 +135,37 @@ export function isOpenUnitPrice(value: unknown): value is DecimalString {
   return typeof value === "string" && /^0\.[0-9]*[1-9]$/u.test(value) && isCanonicalDecimalString(value, { range: "UNIT_INTERVAL" });
 }
 
+/**
+ * ADR-034 D2.4: a positive share quantity on the venue's grid (`decimals`
+ * fractional digits at most; 2 for every tick size, `VENUE_FACTS.SHARE_GRID`).
+ * A CHECK, never a rounding: an off-grid value is refused, not floored.
+ */
+export function isOnShareGrid(value: unknown, decimals: number): value is DecimalString {
+  if (!isPositiveAmount(value)) return false;
+  const dot = value.indexOf(".");
+  return dot === -1 || value.length - dot - 1 <= decimals;
+}
+
+/**
+ * A canonical non-negative decimal as an exact integer count of `10^-decimals`
+ * units, or `undefined` when it is not a whole number of them (or unreadable).
+ * Exact: string digits to `BigInt`; never a `number`.
+ */
+export function wholeUnits(value: unknown, decimals: number): bigint | undefined {
+  if (!isNonNegativeAmount(value)) return undefined;
+  const dot = value.indexOf(".");
+  const whole = dot === -1 ? value : value.slice(0, dot);
+  const fraction = dot === -1 ? "" : value.slice(dot + 1);
+  if (fraction.length > decimals) return undefined;
+  return BigInt(`${whole}${fraction.padEnd(decimals, "0")}`);
+}
+
+/** A signed amount (`makerAmount`, `takerAmount`): a non-negative base-unit integer as a canonical digit string. */
+export function readBaseUnitInteger(value: unknown): bigint | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 78 || !/^(?:0|[1-9][0-9]*)$/u.test(value)) return undefined;
+  return BigInt(value);
+}
+
 /** A fill price in the closed unit interval (a venue fact about a trade, validated against the limit separately). */
 export function isUnitPrice(value: unknown): value is DecimalString {
   return isCanonicalDecimalString(value, { range: "UNIT_INTERVAL" });

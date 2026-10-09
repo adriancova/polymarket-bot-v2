@@ -71,6 +71,7 @@ import {
   type PlannerRefusal,
   type PlannerResult,
 } from "./refusals.js";
+import { quantizeOrderQuantity, type QuantizedQuantity } from "./quantity.js";
 import { sliceShares } from "./slice.js";
 import { instantMilliseconds, instantPlusMilliseconds } from "./time.js";
 
@@ -80,8 +81,20 @@ interface PricedLeg {
   readonly side: OutcomeSide;
   readonly action: "BUY" | "SELL";
   readonly limitPrice: string;
-  readonly totalShares: string;
+  /** The leg's quantity, quantized ONCE (ADR-034 D2.2): `quantity.executable` is what is sliced and reserved. */
+  readonly quantity: QuantizedQuantity;
   readonly posture: ExecutionPosture;
+}
+
+/**
+ * THE ONE QUANTIZATION of a leg (ADR-034 D2.2): the requested share quantity,
+ * floored to the venue's grid for the market's tick size, with its remainder.
+ * Every builder calls this as soon as a leg's requested quantity is known, so
+ * leg selection, the cost ceilings, slicing, the reservations and the
+ * estimates all see the executable number, never the requested one.
+ */
+function quantizeLeg(market: MarketPlanningInput, requested: string): PlannerResult<QuantizedQuantity> {
+  return quantizeOrderQuantity({ requested, unit: "SHARES", tickSize: market.tickSize });
 }
 
 interface AssembledGroups {
@@ -111,15 +124,33 @@ function assemble(
   let orderIndex = 0;
 
   for (const [groupIndex, leg] of legs.entries()) {
-    const sliced = sliceShares(leg.totalShares, inputs.policy.maxSliceShares, leg.market.minimumOrderSize);
+    const sliced = sliceShares(
+      leg.quantity.executable,
+      inputs.policy.maxSliceShares,
+      leg.market.minimumOrderSize,
+      leg.market.tickSize,
+    );
     if (!sliced.ok) return plannerFailure(sliced.refusal);
     const executionGroupId = `${inputs.executionPlanId}:g${String(groupIndex)}`;
     const orders: PlannedOrder[] = [];
-    for (const shares of sliced.sizes) {
+    for (const [sliceIndex, shares] of sliced.sizes.entries()) {
       const plannedOrderId = `${executionGroupId}:o${String(orderIndex)}`;
       const reservationId = `${inputs.executionPlanId}:r${String(orderIndex)}`;
       orderIndex += 1;
       const postOnly = leg.posture === "REST";
+      // ADR-034 D2.3: the leg's remainder, with both numbers, on its LAST order.
+      const remainder =
+        leg.quantity.reason === "SUB_GRID" && sliceIndex === sliced.sizes.length - 1
+          ? {
+              unexecutableRemainder: {
+                reason: leg.quantity.reason,
+                unit: "SHARES" as const,
+                quantity: leg.quantity.unexecutableRemainder,
+                requested: leg.quantity.requested,
+                executable: leg.quantity.executable,
+              },
+            }
+          : {};
       orders.push({
         plannedOrderId,
         marketId: leg.market.marketId,
@@ -130,6 +161,7 @@ function assemble(
         postOnly,
         executionStyle: leg.posture,
         reservationId,
+        ...remainder,
       });
       reservations.push({
         reservationId,
@@ -264,7 +296,9 @@ function buildPositionPlan(
     );
   }
   const increasing = compareDecimal(delta, "0") > 0;
-  const shares = increasing ? delta : subDecimal("0", delta);
+  const quantity = quantizeLeg(market.value, increasing ? delta : subDecimal("0", delta));
+  if (!quantity.ok) return quantity;
+  const shares = quantity.value.executable;
   const posture = positionPosture(intent.liquidityPreference, intent.urgency);
 
   const deadline = placementDeadline(intent.validUntil, inputs);
@@ -321,7 +355,7 @@ function buildPositionPlan(
         side: selection.side,
         action: selection.action,
         limitPrice,
-        totalShares: shares,
+        quantity: quantity.value,
         posture,
       },
     ],
@@ -381,7 +415,12 @@ function buildReductionPlan(
   for (const side of ["YES", "NO"] as const) {
     const held = (side === "YES" ? market.value.inventory.yes : market.value.inventory.no).held;
     if (compareDecimal(held, target) <= 0) continue;
-    const excess = subDecimal(held, target);
+    const quantity = quantizeLeg(market.value, subDecimal(held, target));
+    if (!quantity.ok) {
+      refusals.push(...quantity.refusals);
+      continue;
+    }
+    const excess = quantity.value.executable;
     const leg = selectDecreaseLeg({
       market: market.value,
       direction: side,
@@ -400,7 +439,7 @@ function buildReductionPlan(
       side,
       action: "SELL",
       limitPrice: leg.value.limitPrice,
-      totalShares: excess,
+      quantity: quantity.value,
       posture,
     });
   }
@@ -458,15 +497,21 @@ function buildBasketPlan(
   const refusals: PlannerRefusal[] = [];
   let combinedCost = "0";
   for (const [index, leg] of intent.legs.entries()) {
-    const shares = compareDecimal(leg.targetShares, "0") < 0
+    const requested = compareDecimal(leg.targetShares, "0") < 0
       ? subDecimal("0", leg.targetShares)
       : leg.targetShares;
-    if (compareDecimal(shares, "0") === 0) continue;
+    if (compareDecimal(requested, "0") === 0) continue;
     const market = marketInputFor(inputs, leg.marketId);
     if (!market.ok) {
       refusals.push(...market.refusals);
       continue;
     }
+    const quantity = quantizeLeg(market.value, requested);
+    if (!quantity.ok) {
+      refusals.push(...quantity.refusals);
+      continue;
+    }
+    const shares = quantity.value.executable;
     const buying = compareDecimal(leg.targetShares, "0") > 0;
     if (buying) {
       // A buying basket leg must carry its own ceiling — the same rule the
@@ -516,7 +561,7 @@ function buildBasketPlan(
         side: increase.value.selection.side,
         action: increase.value.selection.action,
         limitPrice: increase.value.limitPrice,
-        totalShares: shares,
+        quantity: quantity.value,
         posture: "MARKETABLE_LIMIT",
       });
       continue;
@@ -538,7 +583,7 @@ function buildBasketPlan(
       side: leg.direction,
       action: "SELL",
       limitPrice: decrease.value.limitPrice,
-      totalShares: shares,
+      quantity: quantity.value,
       posture: "MARKETABLE_LIMIT",
     });
   }

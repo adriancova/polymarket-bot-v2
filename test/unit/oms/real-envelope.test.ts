@@ -19,7 +19,7 @@ import { describe, expect, it } from "vitest";
 import type { LimitOrderRequest, PlacementOutcome, SignedOrderHandle } from "../../../packages/oms/src/index.js";
 import { SignedOrderEnvelope } from "../../../packages/polymarket-secure/src/signed-order.js";
 
-import { MAKER, SIGNER, accepted, restoreFakeSignedOrder, signatureFor, venueError, venueIdFor } from "./support/fake-venue.js";
+import { MAKER, SIGNER, accepted, limitOrderAmounts, restoreFakeSignedOrder, signatureFor, venueError, venueIdFor } from "./support/fake-venue.js";
 import { group, openHarness, reopen, ticket, type Harness } from "./support/harness.js";
 
 type PostOnlyKey = "absent" | boolean;
@@ -34,7 +34,8 @@ function realEnvelopes(h: Harness, postOnlyKey: PostOnlyKey): Map<string, Readon
       builder: `0x${"0".repeat(64)}`,
       expiration: request.expirationUnixSeconds ?? 0,
       maker: MAKER,
-      makerAmount: "1000000",
+      // ADR-034 D2.4: the OMS checks that the signed amounts are the ticket's quantities, exactly.
+      ...limitOrderAmounts(request.side, request.price, request.size),
       metadata: `0x${"0".repeat(64)}`,
       orderType: request.expirationUnixSeconds === undefined ? "GTC" : "GTD",
       salt,
@@ -42,7 +43,6 @@ function realEnvelopes(h: Harness, postOnlyKey: PostOnlyKey): Map<string, Readon
       signature: signatureFor(salt),
       signatureType: 3,
       signer: SIGNER,
-      takerAmount: "2000000",
       timestamp: "1790000000000",
       tokenId: request.assetId,
     };

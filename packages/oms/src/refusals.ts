@@ -11,6 +11,8 @@
 export const OMS_REFUSAL_CODES = [
   // Input shape and identity.
   "OMS_INVALID_INPUT",
+  // ADR-034 D2.4: a ticket's shares are off the venue's 0.01 grid. The OMS never rounds; the planner quantizes.
+  "OMS_SIZE_OFF_GRID",
   "OMS_DUPLICATE_ORDER",
   "OMS_UNKNOWN_ORDER",
   "OMS_UNKNOWN_ATTEMPT",
