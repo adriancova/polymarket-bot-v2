@@ -30,18 +30,32 @@ Before planning, editing, or delegating:
 - The implementing agent may not perform the final adversarial review.
 - Report conflicts or missing information; never silently invent venue behavior.
 
-## Design philosophy: less is more
+## Design principle: proportionality (every mechanism earns its place)
 
-Complexity is a cost, not a safety margin. Guards, states, retries, holds and checks are welcome when they pay for themselves. Before adding one, weigh:
-- **The risk:** what concrete failure it prevents, how likely that failure is (in PAPER today, and live later), and how bad it would be.
-- **The cost:** code, states and knobs an operator must understand, new failure modes, valid trades it may block, and recovery it complicates.
-- **Overlap:** whether something else already handles that failure.
+The complexity a mechanism adds must be proportionate to the risk it removes. This applies to every guard, state, retry, hold, check, knob and abstraction.
 
-Add it only when the risk justifies the cost. Prefer the smallest mechanism that covers the risk: narrow a guard to the cases that need it, let a temporary block clear itself when its condition recovers, and put speculative edge cases on a follow-up list instead of building for them.
+**The test.** Answer these before adding one. Reviewers ask them of every addition.
+1. **Failure:** what concrete failure does it prevent? Give a scenario with steps, not "it might matter".
+2. **Likelihood:** how often would that happen here, in PAPER now and live later?
+3. **Impact:** what happens when it does: lost money, a stuck or unexitable position, a wrong record, or only a nuisance?
+4. **Coverage:** does something else already catch it?
+5. **Cost:** what does it add? Count code, the states or knobs an operator must learn, new failure modes, valid trades it may block, and recovery it makes harder.
 
-Protections around ambiguous submissions, duplicate orders, position sizing, reliable exits, and the safety defaults below always justify their cost.
+**Decide.**
+- **Build it** when likelihood × impact, net of existing coverage, outweighs the cost. Then choose the smallest form that covers the risk:
+  - scope it to the cases that need it;
+  - make a temporary block clear itself when its condition recovers;
+  - keep one mechanism, not two that overlap.
+- **Otherwise, do not build it.** Record it as a follow-up with its trigger: the evidence that would make it worth building.
 
-Reviewers apply the same test. A finding states its failure scenario, its likelihood and its impact. A gap that needs a contrived or implausible scenario is LOW or a follow-up, not blocking. Unjustified complexity in the change is itself a finding.
+**Symmetry.** Removing a mechanism needs the same evidence as adding one. Proportionality is not minimalism.
+
+**Always proportionate:** the protections around ambiguous submissions, duplicate orders, position sizing and reliable exits, and the safety defaults below.
+
+**For reviewers:**
+- A finding states its scenario, its likelihood and its impact. Its severity follows from those, not from how clever the gap is.
+- A gap that needs a contrived or implausible scenario is LOW or a follow-up.
+- Unjustified complexity in a change is itself a finding.
 
 ## Safety
 
