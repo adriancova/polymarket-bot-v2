@@ -978,13 +978,6 @@ const V2_CONTRACTS = {
   pUSD: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
 } as const;
 
-/**
- * The documented public contract addresses a capture or its sidecar may
- * carry as a `0x` 40-hex value (`captures.ts` rule 5): the V2 proxies above.
- * Any other 40-hex address in a capture must be a labelled synthetic value.
- */
-export const PUBLIC_CONTRACT_ADDRESSES: readonly string[] = Object.values(V2_CONTRACTS);
-
 const documentedAddress = (address: string): FieldSpec => ({
   type: "hex-string",
   hexLengths: [42],

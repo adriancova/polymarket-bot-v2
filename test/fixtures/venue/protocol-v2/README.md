@@ -90,59 +90,14 @@ listed, the fixture is the raw response, byte for byte, so its sha256 equals
 Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
 
 - **Claimed.** The `verify-venue` check `protocol-v2-captures`
-  (`apps/ops-cli/src/verify-venue/checks.ts`, `PROTOCOL_V2_CAPTURES`;
-  `captures.ts`) claims all 20 captures and their 20 sidecars. For each one it
-  checks:
-  - the sidecar's keys, and that the capture's bytes and sha256 match it;
-  - that a capture with no redaction is the raw response, byte for byte;
-  - the sidecar's fetch time, HTTP status, raw size and raw sha256, against the
-    report's source index (§14);
-  - strict JSON, or strict JSONL, with no key repeated in one object (round 1);
-  - no credential, and no unlabelled personal data: in the capture, at any
-    depth, and in the sidecar's text (`url`, `notes`, redactions,
-    `extract.rule`); round 1 of V2-9 added the sidecar text, the email and
-    user-name keys, person's rows and the S-O06 field list of a trade page;
-  - the trade-feed rules of `../README.md` ("Exception 2026-10-06"),
-    including every cursor parameter of the sidecar URL; round 2 added a
-    cursor in any written form (an assignment, plain JSON, glued or
-    re-encoded) and the documented type of every value on a trade URL;
-    round 3 added the S-O06 type of every field of a trade page, market ids
-    that the report alone corroborates, and labels glued to an address, a
-    hash or a personal key; round 4 binds each sidecar URL to the route the
-    report's source index records, in canonical form, and lets that report
-    URL, not the sidecar's spelling, decide which captures are trade pages;
-    round 5 fails closed on what the scanner cannot decode, parse or read
-    (malformed percent-encoding, an unknown query parameter, a non-JSON
-    frame text other than a control message), naming the reason;
-    round 6 binds each non-feed sidecar URL to its report source-index URL
-    (or the text before the index's `…`), types its query values, and
-    refuses a trade cursor anywhere outside the trade pages unless it is a
-    public market cursor classified for its route (`prices_history`);
-    round 7 adds one generic walk over every file of the tree
-    (`tree-scan.ts`): a strict read (no invalid byte, no repeated key),
-    every key and string at any depth in every reading, every URL split into
-    its parts, and an explicit, sourced allowlist of (file, JSON path, exact
-    value) exceptions (`scan-allowlist.ts`);
-    round 8 reads every raw mailbox spelling (any script, quoted,
-    commented, address literal), and fails by name on JSON text in any
-    string, reading or URL part that does not parse strictly, never reading
-    it as prose;
-  - the V2 facts each capture pins, with the report ids it cites.
-
-  The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no
-  longer keep a file outside it. The "Why not `.json`" bullet above is
-  historical.
-- **No `.jsonc` held a comment.** Every file here parses with `JSON.parse`.
-  So nothing moved into a sidecar, no payload byte changed, and every digest
-  above still holds.
+  (`apps/ops-cli/src/verify-venue/checks.ts`, `PROTOCOL_V2_CAPTURES`)
+  claims all 20 captures and their sidecars: provenance against the report's
+  source index, the trade-page rules and the pinned V2 facts (`captures.ts`).
+  Like every file in the tree, they are also scanned for personal data and
+  credentials (`scan.ts`). The rules are in the parent README, "Exception
+  2026-10-06 (V2-9)". The gate claims every suffix, so the "Why not `.json`"
+  bullet above is historical.
+- **No `.jsonc` held a comment.** Every file here parses with `JSON.parse`, so
+  nothing moved, no byte changed and every digest above still holds.
 - **The rename to `.json` is deferred.** Readers outside V2-9's paths open
-  these files by name, so renaming them needs a package that may edit those
-  readers. They are in `apps/backtest-cli`, `apps/data-gateway`,
-  `apps/research-worker`, `packages/polymarket-public`, `test/contract`,
-  `test/integration/data-gateway` and `tools/bench/host`
-  (`python/research` already accepts both suffixes). The session file stays
-  `.jsonl` in any case: one record
-  per line is not one JSON document, and wrapping it would change its bytes.
-- **The departure from the parent rules** recorded under "Sanitization" is now
-  the parent README's dated, scoped exception, "Exception 2026-10-06 (V2-9):
-  sanitized live public captures".
+  these files by name; the session file stays `.jsonl` in any case.

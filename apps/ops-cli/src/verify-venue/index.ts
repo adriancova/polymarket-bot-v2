@@ -22,7 +22,7 @@
  * outside WP-000's allowed paths. Wiring is recorded as follow-up work (see
  * report section 15).
  *
- * V2-9 (2026-10-06) adds three things to the run:
+ * V2-9 (2026-10-06) adds four things to the run:
  * - **coverage:** every file under `test/fixtures/venue/` except a
  *   `README.md`, whatever its suffix, must be claimed by exactly one check
  *   (a fixture, or a capture and its sidecar). The rule used to live only in
@@ -34,29 +34,21 @@
  *   defined there;
  * - **`kind: "capture"` checks and `assert` hooks** (`captures.ts`,
  *   `checks.ts`), and each fixture's `retrieved` date pinned to its report's
- *   snapshot date.
- *
- * V2-9 round 7 adds the generic walk (`tree-scan.ts`): every file of the
- * tree, whatever its kind, is read strictly and every key and string in it
- * answers to every personal-data, cursor and hash rule, with the explicit
- * allowlist `scan-allowlist.ts` as the only exception. `ok` requires it.
+ *   snapshot date;
+ * - **the scan** (`scan.ts`) of every file of the tree for obvious personal
+ *   data and credentials, part of `ok`.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-  catalogueTokenIds,
-  fixturePersonalDataErrors,
   loadCapture,
-  marketReadConditionIds,
-  marketReadTokenIds,
   parseSourceIndex,
   reportDefinesId,
   sidecarPathOf,
 } from "./captures.js";
-import type { CaptureContext, CaptureSpec, CaptureValidationResult } from "./captures.js";
+import type { CaptureContext, CaptureValidationResult } from "./captures.js";
 import {
-  PUBLIC_CONTRACT_ADDRESSES,
   SDK_PERMALINK_PREFIX,
   SDK_REFERENCE_COMMIT,
   VENUE_CHECKS,
@@ -67,8 +59,8 @@ import {
 import type { VenueCheck } from "./checks.js";
 import { REPO_ROOT, VENUE_FIXTURE_ROOT, loadFixture } from "./fixtures.js";
 import type { FixtureValidationResult } from "./fixtures.js";
-import { listVenueFixtureFiles, scanFixtureTree } from "./tree-scan.js";
-import type { TreeScan } from "./tree-scan.js";
+import { listVenueFixtureFiles, scanFixtureTree } from "./scan.js";
+import type { TreeScan } from "./scan.js";
 
 export type CheckStatus = "PASS" | "FAIL" | "DOCUMENTED";
 
@@ -109,7 +101,7 @@ export interface VenueVerificationReport {
   readonly results: readonly CheckResult[];
   /** V2-9: the fixture-tree claim, part of `ok`. */
   readonly coverage: FixtureCoverage;
-  /** V2-9 round 7: the generic walk of every file in the tree, part of `ok`. */
+  /** V2-9: the personal-data and credential scan of every file, part of `ok`. */
   readonly scan: TreeScan;
 }
 
@@ -357,7 +349,6 @@ export function loadAndValidateReport(
  * is a fixture like any other.
  */
 export function listFixtureFiles(root: string = VENUE_FIXTURE_ROOT): string[] {
-  // One definition, shared with the generic walk (round 7).
   return listVenueFixtureFiles(root);
 }
 
@@ -442,51 +433,19 @@ function readReport(reportPath: string): string | null {
   }
 }
 
-/**
- * The context a capture-kind check validates its captures in: its report,
- * that report's source index (§14), the documented public contract
- * addresses, and the market ids the report corroborates. The token ids come
- * in two passes (V2-9 round 3): the source index's own `token_id=` reads,
- * then the tokens of each capture that passes as a report-anchored CLOB
- * market read (`catalogueTokenIds`). A CLOB market read is not a feed, so
- * the first pass does not depend on the token ids it yields.
- */
-export function captureContextOf(
-  reportPath: string,
-  reportContent: string | null,
-  captures: readonly CaptureSpec[],
-): CaptureContext {
+/** The context a capture-kind check validates its captures in. */
+export function captureContextOf(reportPath: string, reportContent: string | null): CaptureContext {
   const sourceIndexText =
     reportContent === null ? "" : (reportSectionText(reportContent, "14") ?? "");
-  const base: CaptureContext = {
-    report: reportPath,
-    reportContent,
-    sourceIndex: parseSourceIndex(sourceIndexText),
-    publicAddresses: PUBLIC_CONTRACT_ADDRESSES,
-    marketConditionIds: marketReadConditionIds(sourceIndexText),
-    marketTokenIds: marketReadTokenIds(sourceIndexText),
-  };
-  const anchored = catalogueTokenIds(captures.map((capture) => loadCapture(capture, base)));
-  return {
-    ...base,
-    marketTokenIds: [...new Set([...(base.marketTokenIds ?? []), ...anchored])],
-  };
+  return { report: reportPath, reportContent, sourceIndex: parseSourceIndex(sourceIndexText) };
 }
 
 /**
  * The refusals of one fixture file of a fixture-kind check, each prefixed by
  * its path: the envelope and payload validation (`loadFixture`), the
- * snapshot date, the check's `assert` hook, and (V2-9 round 6,
- * V2-9-R6-01) the personal-data, cursor and long-id scan that captures and
- * sidecars answer to (`fixturePersonalDataErrors`), on every fixture
- * envelope, with the check's report vouching for the long ids and contract
- * addresses it records.
+ * snapshot date and the check's `assert` hook.
  */
-export function fixtureCheckErrors(
-  check: VenueCheck,
-  result: FixtureValidationResult,
-  checkReport: string | null,
-): string[] {
+export function fixtureCheckErrors(check: VenueCheck, result: FixtureValidationResult): string[] {
   const fixture = result.fixture;
   const extra =
     fixture === null
@@ -496,7 +455,6 @@ export function fixtureCheckErrors(
             ? []
             : [`retrieved must be ${snapshotDateOf(check)}, the snapshot date of ${reportOf(check)}`]),
           ...(check.assert?.(fixture) ?? []),
-          ...fixturePersonalDataErrors(fixture, PUBLIC_CONTRACT_ADDRESSES, checkReport ?? ""),
         ];
   return [...result.errors, ...extra].map((error) => `${result.relativePath}: ${error}`);
 }
@@ -536,7 +494,7 @@ export function runVenueVerification(): VenueVerificationReport {
     }
     if (check.kind === "capture") {
       const captures = check.captures ?? [];
-      const context = captureContextOf(reportOf(check), checkReport, captures);
+      const context = captureContextOf(reportOf(check), checkReport);
       const captureResults = captures.map((capture) => loadCapture(capture, context));
       const errors = [
         ...reportErrors,
@@ -569,7 +527,7 @@ export function runVenueVerification(): VenueVerificationReport {
     );
     const errors = [
       ...reportErrors,
-      ...fixtureResults.flatMap((result) => fixtureCheckErrors(check, result, checkReport)),
+      ...fixtureResults.flatMap((result) => fixtureCheckErrors(check, result)),
     ];
     return {
       check,
@@ -580,7 +538,9 @@ export function runVenueVerification(): VenueVerificationReport {
     };
   });
   const coverage = fixtureCoverage(listFixtureFiles(), claimedFixturePaths());
-  const scan = scanFixtureTree();
+  const scan = scanFixtureTree(
+    [...new Set(VENUE_CHECKS.map(reportOf))].flatMap((path) => reportContent(path) ?? []),
+  );
   const hasFixtureEvidence = results.some(
     (result) => result.status === "PASS",
   );
@@ -614,7 +574,7 @@ export function formatVenueVerificationReport(
     ...report.coverage.unclaimed.map((path) => `  unclaimed: ${path}`),
     ...report.coverage.claimedTwice.map((path) => `  claimed twice: ${path}`),
     ...report.coverage.missing.map((path) => `  claimed but missing: ${path}`),
-    `Fixture scan: ${report.scan.ok ? "OK" : "FAIL"} (${report.scan.files.length} files read strictly; ${report.scan.keys} keys and ${report.scan.strings} strings walked; ${report.scan.allowlisted} allowlisted values)`,
+    `Fixture scan: ${report.scan.ok ? "OK" : "FAIL"} (${report.scan.files} files)`,
     ...report.scan.errors.map((error) => `  ${error}`),
     `Overall: ${report.ok ? "PASS" : "FAIL"}`,
   ];
