@@ -112,7 +112,7 @@ Redis feed, the PostgreSQL store and registration check, the health server,
 the pump, and the process entry point. The trader application builds the
 core, and `apps/backtest-cli` builds it from `BACKTEST-2` on; both are
 composition roots depending on it downward. Its same-layer dependencies are
-§2.1 rows S8-S18, and it needs no §2.2 row. Because it is layer 1, F12 fails
+§2.1 rows S8-S19, and it needs no §2.2 row. Because it is layer 1, F12 fails
 any edge its manifest declares to a layer-2 package. §3's F8, F6 and F7 also
 apply here: they fail an import of a Redis client, of the venue SDK, or of an
 archived Polymarket client. That was all the gate enforced at `a8a3a63` of "a
