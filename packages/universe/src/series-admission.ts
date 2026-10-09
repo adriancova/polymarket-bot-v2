@@ -134,9 +134,10 @@ export const ACCEPTED_PROTOCOL_VERSIONS_REQUIRED =
  * versions a window may carry, a REVIEWED parameter like `allowedTickSizes`.
  * Required — a review written before the field existed is REFUSED at parse,
  * never read as some default (rule 2 item 1: "The gateway never infers it").
- * Distinctness is checked by index, not by iteration: the trader's mirror runs
- * this rule through a prototype-free parsing arena, whose empty array has no
- * iterator (`@polymarket-bot/trading-core` `series.ts`).
+ * Distinctness is checked by index, not by iteration: the trader parses this
+ * schema itself, through its configuration door's prototype-free parsing
+ * arena (`@polymarket-bot/trading-core` `config.ts`), whose empty array has no
+ * iterator.
  */
 const AcceptedProtocolVersions = z
   .array(z.enum(PROTOCOL_VERSIONS), { error: ACCEPTED_PROTOCOL_VERSIONS_REQUIRED })
@@ -193,8 +194,13 @@ export const ReviewedSeriesSchema = z.strictObject({
     /** `Market.resolutionSource`, verbatim. */
     resolutionSource: NonEmptyStringSchema,
   }),
-  /** The outcome labels IN ORDER: index 0 is the YES outcome (F-01). */
-  outcomes: z.tuple([NonEmptyStringSchema, NonEmptyStringSchema]),
+  /**
+   * The outcome labels IN ORDER: index 0 is the YES outcome (F-01). Exactly
+   * two, as an array rather than a tuple: the trader's configuration door
+   * parses this schema through a prototype-free arena that copies no `tuple`
+   * node (`@polymarket-bot/risk` `schema-arena.ts`).
+   */
+  outcomes: z.array(NonEmptyStringSchema).min(2).max(2),
   /** Every market parameter the review accepted (Decision 1.1). */
   parameters: z.strictObject({
     /**

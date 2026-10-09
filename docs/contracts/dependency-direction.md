@@ -182,6 +182,7 @@ establishes the edge; "it compiles more easily this way" is not a basis.
 | S16 | `packages/trading-core` → `packages/strategy-runtime` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-runtime`. Consumed surface, measured at `a8a3a63`: `createStrategyInstanceRuntime` and the checkpoint, decision-sink, telemetry, evaluation and clock types it takes. Acyclic on the S8 terms. |
 | S17 | `packages/trading-core` → `packages/strategy-sdk` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-sdk`. Consumed surface, measured at `a8a3a63`: **types only** (the strategy-facing views `MarketView`, `OrderBookView`, `StrategyOrderView`, `StrategyFill`, `VirtualPositionView`, `RiskBudgetView`, `FeatureSnapshot`, `StrategyOrderStatus`); no value is imported. Acyclic on the S8 terms. |
 | S18 | `packages/trading-core` → `packages/strategies/static-bracket` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-220`, the owner of `packages/strategies/static-bracket`. Consumed surface, measured at `a8a3a63`: `staticBracketStrategy`, `validateStaticBracketParams`, `staticBracketParamsSchema`. The core runs one strategy today. If a later round makes the core strategy-agnostic (ADR-022 D9; deferred by the user's H8 ruling of 2026-09-28 until a second strategy exists), **this row is removed in that change**. The removal is an obligation on that round. At `a8a3a63` the check did not flag a row that matches no declared edge, so the removal is not a gate result unless the check later gains that `CHK`. The row names the concrete package, not the `packages/strategies/*` class, so a second strategy needs its own cited row and never gets an implicit one. The edge is acyclic on the S8 terms. F3 and F11 still bind the strategy, not the core. |
+| S19 | `packages/trading-core` → `packages/universe` | 1 | ADR-030 Decision 4.2 (the run record pins the reviewed series) and the trader's re-judge of every `SeriesWindowAdmitted@1` against that pinned review (`packages/trading-core/src/series-admission.ts`: the configuration hash, the window's schedule and its derived identity); the GOV-2A mirror-collapse ruling in the subsection below, whose §5 item 5 states that a later consumer "consumes one implementation instead of copying a fourth". Added by `C1-UNIV` (`COMPLEXITY-1`, the user's ruling of 2026-10-08, option (a)), which deleted the trader's line-for-line copy of these rules (`packages/trading-core/src/series.ts`, written only because the `ROLLOVER-1` round could not edit the lockfile) and the test that held the copy equal to the gateway's. Consumed surface: `ReviewedSeriesSchema` (parsed through the configuration door's prototype-free arena, so it must stay inside `ARENA_NODE_TYPES`: a node outside it fails the core's module load), `seriesConfigHash`, `deriveWindowSchedule`, `epochMsOfInstant`, `windowInternalMarketId`, `admissionRunModeProblem`, and the `ReviewedSeries` type; re-exported unchanged from the core's root for `apps/trader`: `canonicalSeriesJson`, `SERIES_TITLE_TIME_ZONE`, `SERIES_TITLE_ZONE_LABEL` and the `WindowScheduleResult` type; from `./testing`, only the sample review `reviewedBtc15mSeriesDocument`. The trader's re-judge (its refusal codes and checks) stays in the core and is unchanged; only the shared rules travel this edge, never the gateway's judge (`judgeSeriesWindow`). Acyclic: `packages/universe` declares only `@polymarket-bot/decimal`, `@polymarket-bot/domain` and `zod`, so the reverse edge does not and may not exist. |
 
 #### DONE 2026-09-28: the shared trading core's rows (staged by `H8-GOV`, activated by `CORE-MOVE`)
 
@@ -890,6 +891,17 @@ names, in `packages/trading-core/src/venue-builder.ts`: `SimulatedVenue`,
 type, and the types of those calls' own inputs and results
 (`FeeScheduleSnapshot`, `RateLimitBudget`, `SimulatedVenueOptions`,
 `SimulationRefusal`).
+
+**The graph as of 2026-10-09, after `C1-UNIV`** (recorded by `C1-UNIV`;
+measured by running the check on the round's tree, base `main` `8589174`):
+**35 workspace packages, 106 declared workspace edges**, and it passes, with
+the §2.1 allowlist now exactly S0..S19 and every row matching a declared edge.
+The check reported 35 packages and 105 edges at the base. The one change is
+`packages/trading-core` → `packages/universe` (layer 1 → layer 1, a
+`dependencies` entry), the same-layer edge row **S19** lists. No other edge was
+added or removed. The core's own source still imports no `node:` module; its
+closure reaches `node:crypto` through `packages/universe`'s `createHash`, as it
+already did through `packages/features` (S10), so the core needs no §2.2 row.
 
 1. **Cycle detection.** Fail on any cycle in that graph. Non-zero exit, named
    cycle in the output. This is the rule §5.2 states literally, and it is what

@@ -51,6 +51,7 @@ import {
   staticBracketStrategy,
   validateStaticBracketParams,
 } from "@polymarket-bot/strategy-static-bracket";
+import { admissionRunModeProblem } from "@polymarket-bot/universe";
 
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
@@ -76,7 +77,6 @@ import {
   TRADER_RUN_MODE,
   type Environment,
 } from "./safety.js";
-import { admissionRunModeProblem } from "./series.js";
 import { SeriesWindowAdmissions, type AdmissionNotice } from "./series-admission.js";
 import { normalizeToStrictUtc } from "./time.js";
 

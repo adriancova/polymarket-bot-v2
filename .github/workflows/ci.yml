@@ -285,7 +285,7 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/data-gateway test:integration
 
-      - name: Integration tests 5/9 - trader paper-trader (Testcontainers PostgreSQL and Redis in 22 of its 50 files)
+      - name: Integration tests 5/9 - trader paper-trader (Testcontainers PostgreSQL and Redis in 23 of its 50 files)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm --filter @polymarket-bot/trader test:integration
 

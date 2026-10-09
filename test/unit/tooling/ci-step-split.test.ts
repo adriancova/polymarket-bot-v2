@@ -426,7 +426,7 @@ describe("ci.yml runs each command of package.json's && chains as its own gated 
         "pnpm --filter @polymarket-bot/data-gateway test:integration",
       ],
       [
-        "Integration tests 5/9 - trader paper-trader (Testcontainers PostgreSQL and Redis in 22 of its 50 files)",
+        "Integration tests 5/9 - trader paper-trader (Testcontainers PostgreSQL and Redis in 23 of its 50 files)",
         "pnpm --filter @polymarket-bot/trader test:integration",
       ],
       ["Integration tests 6/9 - control-api (no container)", "pnpm --filter @polymarket-bot/control-api test:integration"],

@@ -76,8 +76,9 @@
  * envelopes admits and tears down the same windows (acceptance 3).
  */
 
+import { deriveWindowSchedule, epochMsOfInstant, windowInternalMarketId } from "@polymarket-bot/universe";
+
 import type { MarketConfig, ConfiguredSeries } from "./config.js";
-import { deriveWindowSchedule, epochMsOfInstant, windowInternalMarketId } from "./series.js";
 
 /** Why the trader did not admit a window. */
 export type AdmissionRefusalCode =

@@ -61,7 +61,11 @@ export {
   type TraderConfig,
 } from "./config.js";
 
-/** `ROLLOVER-1` (ADR-030): the trader's half of series auto-admission. */
+/**
+ * `ROLLOVER-1` (ADR-030): the reviewed-series rules the trader re-judges each
+ * admission with — `@polymarket-bot/universe`'s, the gateway's own (§2.1 row
+ * S19), re-exported so this package's API is unchanged.
+ */
 export {
   ReviewedSeriesSchema,
   SERIES_TITLE_TIME_ZONE,
@@ -74,7 +78,7 @@ export {
   windowInternalMarketId,
   type ReviewedSeries,
   type WindowScheduleResult,
-} from "./series.js";
+} from "@polymarket-bot/universe";
 export {
   SeriesWindowAdmissions,
   type AdmissionMetrics,
