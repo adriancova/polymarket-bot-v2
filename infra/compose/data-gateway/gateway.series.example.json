@@ -1,0 +1,106 @@
+{
+  "streamName": "market-events",
+  "tickIntervalMs": 1000,
+  "wal": {
+    "rootPath": "./wal",
+    "maxSegmentBytes": 67108864,
+    "maxSegmentAgeMs": 900000,
+    "fsyncIntervalMs": 1000,
+    "maxTotalBytes": 100000000000
+  },
+  "markets": [],
+  "polymarket": {
+    "feedId": "polymarket-market",
+    "customFeatureEnabled": true
+  },
+  "lifecycle": {
+    "feedId": "polymarket-lifecycle",
+    "pollIntervalMs": 10000,
+    "consecutiveFailureThreshold": 3
+  },
+  "binance": {
+    "feedId": "binance-reference",
+    "symbols": [
+      "BTCUSDT"
+    ],
+    "stalenessThresholdMs": 30000
+  },
+  "coinbase": {
+    "feedId": "coinbase-reference",
+    "productIds": [
+      "BTC-USD"
+    ]
+  },
+  "seriesAdmission": {
+    "feedId": "polymarket-series-admission",
+    "pollIntervalMs": 30000,
+    "admissionLeadSeconds": 120,
+    "series": [
+      {
+        "seriesId": "btc-15m-updown",
+        "review": {
+          "reviewedBy": "sample-reviewer",
+          "reviewedAt": "2026-10-04T23:00:00Z",
+          "reference": "docs/venue/verified-2026-10-04.md"
+        },
+        "venue": {
+          "gammaSeriesId": "10192",
+          "seriesSlug": "btc-up-or-down-15m"
+        },
+        "window": {
+          "titlePrefix": "Bitcoin Up or Down - ",
+          "titleTimeZone": "America/New_York",
+          "titleZoneLabel": "ET",
+          "durationSeconds": 900
+        },
+        "rules": {
+          "descriptionSha256": "485ceb1dabc4aa12fb42c76184563b7378f01e5de9ded73df049c0d191cd5ad1",
+          "resolutionSource": "https://data.chain.link/streams/btc-usd-twap-60s-streams"
+        },
+        "outcomes": [
+          "Up",
+          "Down"
+        ],
+        "parameters": {
+          "acceptedProtocolVersions": [
+            "v1",
+            "v2"
+          ],
+          "allowedTickSizes": [
+            "0.01",
+            "0.001"
+          ],
+          "minimumOrderSize": "5",
+          "negRisk": false,
+          "fees": {
+            "feesEnabled": true,
+            "rate": "0.07",
+            "exponent": "1",
+            "takerOnly": true,
+            "rebateRate": "0.2",
+            "makerBaseFee": "1000",
+            "takerBaseFee": "1000"
+          },
+          "tradingDelay": {
+            "takerOrderDelayEnabled": true,
+            "gammaSecondsDelay": "NOT_STATED"
+          },
+          "catalogTradingDelaySeconds": 0
+        },
+        "settlement": {
+          "specRef": "btc-15m-updown",
+          "modelDependentActivationAllowed": false
+        },
+        "trading": {
+          "makerFeeRate": "0",
+          "takerFeeRate": "0",
+          "seriesKey": "btc-15m-updown",
+          "underlyingKey": "btc.usd",
+          "resolutionWindowKey": "btc-15m-window"
+        },
+        "maximumConcurrentWindows": 2,
+        "unresolvedTeardownSeconds": 3600
+      }
+    ]
+  }
+}
