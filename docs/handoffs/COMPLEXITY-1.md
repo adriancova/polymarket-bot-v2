@@ -42,8 +42,16 @@
 | C1-RISK | The allocator as the only exposure authority; check 17; the dead resize path and knobs | dual, queued | — |
 | C1-TIF | The ADR-034 re-sequence | queued | — |
 | C1-UNIV | Import universe's series code | queued | — |
-| C1-OPS | The control API answers 501; compose separation; dead recorder alerts; runbooks; stale messages | queued | — |
+| C1-OPS | The control API answers an audited 501 CONTROL_NOT_WIRED in PAPER; one PAPER compose stack (`infra/compose/paper`, its own project and ports); RecorderRtdsHalted deleted and the recorder fragments marked not deployable; `docs/runbooks/paper-operations.md`; the series messages corrected; the brief check and self-test in CI | astra ACCEPT on the second attempt (`a645c6d`) after the orchestrator widened a too-narrow grant and reverted a scope retreat; LOW R1-01 fixed (`b1db4f8`) | via PR #92 |
 
 ## C1-PROC notes
 - **The orchestrator granted one STOPPED item:** the status archive's README now names the removed tools instead of documenting them (`2ad210f`).
 - **A process incident:** an implementer command briefly ran read-only gates in the main checkout. Only that process tree was killed, by PID, and the checkout stayed clean.
+
+## C1-OPS notes
+- **The packet's mistake.** The allowed paths left out the tests that pin the changed behaviour: the control-api integration tests and the recorder alert-count test. Review failed on scope, and a remediation reverted the 501 to satisfy scope. The orchestrator granted the paths, reverted that commit (`d24b247`) and re-reviewed.
+- **Follow-ups:**
+  - Redis `restart: unless-stopped` (optional);
+  - a unit pin of the NOT_WIRED record;
+  - the stale header in `engage-reserve.test.ts`;
+  - the old trader stack's PostgreSQL 17.5 volume is not migrated: start the PAPER stack fresh.
