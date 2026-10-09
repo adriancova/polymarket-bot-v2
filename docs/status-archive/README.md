@@ -50,4 +50,4 @@ every archived link resolves from the root and has a working counterpart.
 
 ## Tools (removed)
 
-The one-time tools that cut and proved this archive (`split-status.py`, `move-map.py`, `check-preservation.py`, `selftest-preservation.py`) were removed at `b8927d2` (COMPLEXITY-1, 2026-10-08). The archive is frozen, so no re-cut is needed. The base is `f43efe6` and the cut is `8fde4df`. To inspect a tool, run `git show f43efe6:tools/records/<name>`. `check-brief.py` remains, and checks the current brief only.
+The one-time tools that cut and proved this archive (`split-status.py`, `move-map.py`, `check-preservation.py`, `selftest-preservation.py`) were removed at `b8927d2` (COMPLEXITY-1, 2026-10-08). The archive is frozen, so no re-cut is needed. The base is `f43efe6` and the cut is `8fde4df`. To inspect a tool, run `git show 5129b98:tools/records/<name>`. `check-brief.py` remains, and checks the current brief only.
