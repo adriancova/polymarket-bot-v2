@@ -7,7 +7,7 @@
  * `ioredis`, a CommonJS-only dependency reached through
  * `packages/event-bus`, whose `require()` of Node builtins esbuild cannot turn
  * into ESM imports. So `pnpm --filter @polymarket-bot/trader start`, the
- * command `infra/compose/trader/compose.yaml` documents, could not start. It
+ * documented start command (`docs/runbooks/paper-operations.md`), could not start. It
  * passed every gate: typecheck, lint and all tests read SOURCE, and nothing
  * ran the artefact. This file runs the artefact of every app that ships one.
  *

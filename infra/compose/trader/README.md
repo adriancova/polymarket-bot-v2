@@ -1,28 +1,10 @@
 # Local operation of the PAPER trader
 
-`compose.yaml` is a **fragment**, not a second stack. It declares the two
-dependencies handoff §4.2 names as the trader's failure boundaries — Redis (the
-`WP-060` event-bus transport) and PostgreSQL (the `WP-040` schema) — pinned to
-the same images the root `docker-compose.yml` uses.
-
-## Nothing here is required by any test
-
-`pnpm --filter @polymarket-bot/trader test:integration` runs **entirely
-offline**. §4.2's Redis and PostgreSQL boundaries are exercised against the
-trader's PORTS with failure injection, which is the `WP-120` precedent for the
-same class of claim:
-
-> "Acceptance 4 ('Redis outage stops publication but not WAL recording') is
-> exercised against the WP-060 transport INTERFACE via an in-memory
-> implementation with failure injection."
-
-**No PostgreSQL and no Redis were reached while building this package** (Docker
-is absent from the development environment, as `WP-210` recorded for its own
-migration work). The adapters in `apps/trader/src/adapters/` are
-**typecheck-pinned only** — the column names and types come from
-`packages/storage-postgres`'s shipped table types and `createLedgerRepository`,
-so a rename upstream fails `pnpm typecheck` — and **no integration evidence is
-claimed for them**.
+This directory holds the trader's example configuration. The Redis and
+PostgreSQL a PAPER run uses come from the PAPER operations stack,
+[`../paper/compose.yaml`](../paper/compose.yaml), shared with the data gateway.
+**The procedure** (start order, stop, exit codes, halt response, restart after
+an outage) is [`docs/runbooks/paper-operations.md`](../../../docs/runbooks/paper-operations.md).
 
 ## Safety
 
@@ -30,7 +12,7 @@ claimed for them**.
   under a raised `MAX_RUN_MODE`, under a run mode that places real orders or
   needs a live signer, or in an environment that so much as **references** a
   production secret name (§15, ADR-010 §3, venue report §16.1–§16.3).
-- **No credential, signer, wallet or API key** appears in `compose.yaml` or in
+- **No credential, signer, wallet or API key** appears in
   `trader.config.example.json`, and none is representable in the trader's
   configuration schema. Execution is **simulated**: the only `ExecutionVenue`
   the process can be handed is `packages/simulation`'s, which refuses
@@ -38,77 +20,7 @@ claimed for them**.
 - The four `AGENTS.md` defaults are set **explicitly** in the usage below rather
   than left to a default, so an operator sees the boundary rather than having to
   know it.
-- **No public network exposure** (§15): every published port binds to
-  `127.0.0.1`.
-
-The PostgreSQL credentials in `compose.yaml` (`devlocal` / `devlocal`) open a
-throwaway container on the loopback interface. They are not a production secret
-NAME — ADR-010 §3 enumerates those, none appears here, and the trader's own
-startup check would refuse the process if one did.
-
-## Running it
-
-From the repository root:
-
-```bash
-docker compose -f infra/compose/trader/compose.yaml up -d
-
-# The WP-040 schema the trader writes decisions, checkpoints, ledger
-# transactions and PnL snapshots into.
-DATABASE_URL=postgres://devlocal:devlocal@127.0.0.1:5432/polymarket_bot_dev \
-  pnpm --filter @polymarket-bot/storage-postgres db:migrate
-
-MAX_RUN_MODE=PAPER \
-ALLOW_REAL_ORDERS=false \
-LIVE_MICRO_MAX_ORDER_NOTIONAL=0 \
-LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 \
-TRADER_CONFIG_PATH=infra/compose/trader/trader.config.example.json \
-REDIS_URL=redis://127.0.0.1:6379 \
-DATABASE_URL=postgres://devlocal:devlocal@127.0.0.1:5432/polymarket_bot_dev \
-  pnpm --filter @polymarket-bot/trader start
-```
-
-The trader **consumes** the normalized event stream; it does not produce one. A
-useful local run therefore also needs `apps/data-gateway` publishing into the
-same Redis — see [`../data-gateway/README.md`](../data-gateway/README.md). With
-no publisher, the trader starts, reports its §8.2 run manifest, polls an empty
-stream and decides nothing, which is the correct behaviour and not a fault.
-
-## Stopping it (`TRADER-SIGNALS`)
-
-Press **Ctrl-C** (SIGINT), or send **SIGTERM**. Either one **requests** a stop,
-and the trader logs `STOP REQUESTED: …`. It then stops in order:
-
-1. the pump reads no new batch, and the batch in hand finishes its durable
-   writes and records its stream position;
-2. the `FOLD-1` SHUTDOWN rebuild check runs, and its line says whether the
-   held ledger view equals its rebuild from zero;
-3. every latched halt is written to `ops.incidents`;
-4. everything the trader opened is closed, in the reverse order of opening;
-5. the last line, `trader stopped: exit <code> — …`, says how it ended.
-
-| Exit | Meaning |
-| --- | --- |
-| `0` | A clean stop: no halt is latched and the SHUTDOWN check matched. |
-| `75` | Halted. A stop never clears a halt: a halt latched before or during the stop keeps this code. |
-| `70` | The SHUTDOWN rebuild check **failed** (`ACCOUNTING_REBUILD_MISMATCH`). It takes precedence over `75`. |
-| `124` | The stop did not finish within `TRADER_SHUTDOWN_DEADLINE_MS` (default `8000`; accepted `1000`…`60000`). One `SHUTDOWN DEADLINE EXCEEDED` line says where it was. |
-| `130` | A **second** Ctrl-C or SIGTERM forced the exit before the stop finished. One `SHUTDOWN FORCED` line says where it was. |
-
-The other codes are startup refusals (`78`, `69`), as before.
-
-**A stop records nothing new.** The trader does not update its run's
-`strategy.runs.status` on any exit; the row stays `RUNNING`. The next start
-must use a new run in any case: `BOOT-1` refuses to resume a run that holds
-decisions.
-
-**Under `pnpm … start`**, Ctrl-C reaches pnpm, its shell and the trader
-together. Measured with pnpm 11.17: the trader receives it once and stops as
-above, and pnpm waits for it. pnpm then reports
-`Command failed with signal "SIGINT"`, because its shell was interrupted; that
-is not the trader's exit code. To read the trader's own
-code, run the built bundle directly: `node apps/trader/dist/main.mjs`, with the
-same environment.
+- **No public network exposure** (§15): the stack's ports bind to `127.0.0.1`.
 
 ## Registering the run first (`REGISTER-1`)
 
@@ -131,7 +43,7 @@ MAX_RUN_MODE=PAPER \
 ALLOW_REAL_ORDERS=false \
 LIVE_MICRO_MAX_ORDER_NOTIONAL=0 \
 LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 \
-DATABASE_URL=postgres://devlocal:devlocal@127.0.0.1:5432/polymarket_bot_dev \
+DATABASE_URL=postgres://devlocal:devlocal-only-not-a-secret@127.0.0.1:55432/polymarket_bot_paper \
   pnpm --filter @polymarket-bot/trader run register -- \
     --template /path/to/template.json --out /path/to/trader.config.json \
     --instance-name static-bracket-h1 --question-title "<the market's question>" \
@@ -145,8 +57,8 @@ ALLOW_REAL_ORDERS=false \
 LIVE_MICRO_MAX_ORDER_NOTIONAL=0 \
 LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 \
 TRADER_CONFIG_PATH=/path/to/trader.config.json \
-REDIS_URL=redis://127.0.0.1:6379 \
-DATABASE_URL=postgres://devlocal:devlocal@127.0.0.1:5432/polymarket_bot_dev \
+REDIS_URL=redis://127.0.0.1:56379 \
+DATABASE_URL=postgres://devlocal:devlocal-only-not-a-secret@127.0.0.1:55432/polymarket_bot_paper \
   pnpm --filter @polymarket-bot/trader start
 ```
 
