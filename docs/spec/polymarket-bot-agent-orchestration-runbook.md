@@ -27,6 +27,8 @@
   its original model): launch a FRESH agent with the same packet plus a progress
   summary, pointed at the dead agent's worktree only if it left committed work.
 
+Where this block differs from §3, "The current loop", §3 controls.
+
 The agent conversation is disposable. The repository is the memory.
 
 ---
@@ -77,184 +79,50 @@ For a very small correction inside the same unmerged work package, continuing th
 
 ---
 
-## 3. Standard lifecycle for every work package
+## 3. The current loop
 
-Use this workflow unless a package explicitly requires external evidence or human approval.
+Adopted 2026-10-08 under the user's rulings on `COMPLEXITY-1`. It replaces the wave 0-2 lifecycle, the `WP-010` audit and the reusable prompts; their text is in [`archive/runbook-waves-0-2.md`](archive/runbook-waves-0-2.md). Where this section and the rest of this runbook differ, this section controls.
 
-### Step 1 — Preflight
+**Protected areas:** code for ambiguous submissions, duplicate orders, position sizing, reliable exits, persistence ordering, risk and halts.
 
-From the main repository:
+### 3.1 One round
 
-```bash
-git checkout main
-git pull --ff-only
-git status --short
-git log --oneline --decorate -8
-```
+1. **Packet.** The orchestrator writes a complete packet: the package, the allowed and forbidden paths, the gates, the review and the round cap. A class-D packet (fixtures or sanitization) states its threat model. Every packet says:
+   - kill only the PIDs you started; never `pkill -f` a pattern that can match another worktree;
+   - never prune Docker host-wide (`docker system prune`, `docker volume prune` and the like).
+2. **Round 0.** A Claude Opus implementer works in its own worktree and branch, and commits. The orchestrator opens a draft PR at once, so CI runs on every candidate.
+3. **STOPPED items.** An item the implementer cannot do inside its grant is STOPPED and listed in its handoff's `deviations`. The orchestrator rules on each before round 1: grant the path, defer it to an owned residual, or put it to the user.
+4. **Review.**
+   - **Dual review** (Claude Opus and Codex, reconciled) only for code in the protected areas, and for edits to a safety section: `AGENTS.md` "Safety", the brief's safety state, or an ADR Decision section in a protected area.
+   - **One verifier** for everything else: Codex `gpt-6-astra` by default; a Claude adversarial reviewer when the evidence spawns processes, uses containers or runs benchmarks.
+   - Reviewers run only the changed packages' suites and their mutants. A docs round also runs the tests that `git grep -l <doc path> -- '*.test.ts'` finds, with their suites. CI runs the rest.
+   - "Pins fail at base" and named-mutant proofs are required only in the protected areas.
+5. **Remediation.** A fresh implementer commits on top of the candidate, and the round is reviewed again.
+6. **Merge.** If `main` moved since the PR's last green run, update the branch or re-run CI. Merge only on a green run against current `main`, with `--no-ff`, then delete the branch.
 
-Requirements:
+### 3.2 Severity, acceptance and the round cap
 
-- Working tree is clean.
-- Dependencies in the YAML are merged.
-- No other active package owns overlapping paths.
-- `IMPLEMENTATION_STATUS.md` is current.
-- Maximum run mode and safety defaults remain unchanged.
+- A finding states its scenario, likelihood and impact (`AGENTS.md`, "Design principle").
+- MEDIUM and above need a trading, safety-state, authorization or path-grant consequence. Prose, wording and citation findings are at most LOW. A factual error in operator-facing, safety or authorization text is graded by its consequence.
+- Outside the protected areas, a surviving mutant behind a pinned second guard is LOW. Inside them, it is recorded as a residual that names the second guard, so removing that guard reopens it.
+- A finding outside a class-D packet's threat model is a follow-up.
+- A round is accepted when no BLOCKER, HIGH or MEDIUM finding is open.
+- **Round cap:** 3 review rounds for code, 2 for docs-only. After the cap, the orchestrator rules on each open item: fix it now, defer it to an owned residual, or put it to the user. Nothing is auto-accepted.
+- Inside the protected areas, an open MEDIUM or higher may only be fixed or put to the user.
 
-### Step 2 — Start a fresh Claude Code session
+### 3.3 Records
 
-Authorize exactly one work package, or a named set of genuinely independent packages.
-
-Claude must:
-
-1. Read `CLAUDE.md`, `AGENTS.md`, the implementation handoff, YAML work plan, and status file.
-2. Verify dependencies and allowed/forbidden paths.
-3. Render a complete work-package task packet.
-4. Delegate implementation to the appropriate worktree-isolated subagent.
-5. Require tests, a commit, and the structured handoff.
-6. Stop before merging.
-
-### Step 3 — Inspect Claude's candidate
-
-Record:
-
-- Work-package ID
-- Candidate branch
-- Commit SHA
-- Base SHA
-- Files changed
-- Tests run
-- Assumptions
-- Deviations
-- Known risks
-
-Do not review only the prose handoff. Inspect the actual Git diff.
-
-### Step 4 — Start a fresh Codex review session
-
-Codex should be read-only and review:
-
-- Candidate commit versus its base
-- Task packet
-- YAML acceptance criteria
-- Relevant handoff invariants
-- Tests and failure cases
-- Path ownership
-- Security and live-mode defaults
-
-Codex returns findings by severity:
-
-- `BLOCKER`
-- `HIGH`
-- `MEDIUM`
-- `LOW`
-- `NOTE`
-
-A package cannot be accepted with unresolved `BLOCKER`, `HIGH`, or `MEDIUM` findings.
-
-### Step 5 — Remediation loop
-
-When findings exist:
-
-1. Keep the package unmerged.
-2. Start a fresh Claude repair session on the same branch/worktree, or create a dedicated fix branch.
-3. Give Claude only:
-   - exact package,
-   - exact commit,
-   - Codex review report,
-   - allowed paths,
-   - unresolved findings.
-4. Require new tests and a new commit.
-5. Start a fresh Codex re-review.
-6. Repeat until accepted.
-
-Codex remains reviewer-only. Claude remains implementer.
-
-### Step 6 — Human merge decision
-
-Before merging, verify:
-
-```bash
-git diff --stat <base-sha>..<candidate-sha>
-git diff --name-only <base-sha>..<candidate-sha>
-```
-
-Confirm:
-
-- Acceptance criteria pass.
-- Review findings are resolved or explicitly accepted as low-risk.
-- No protected or forbidden paths changed unexpectedly.
-- No credentials or live-enablement changes exist.
-- Handoff and status data are complete.
-
-Then merge.
-
-### Step 7 — Post-merge integration check
-
-On `main`:
-
-```bash
-git checkout main
-git pull --ff-only
-pnpm install --frozen-lockfile
-pnpm typecheck
-pnpm lint
-pnpm test
-```
-
-Also run the relevant package-specific integration commands.
-
-### Step 8 — Update durable state
-
-Update and commit `IMPLEMENTATION_STATUS.md` with:
-
-- Package state: merged and verified
-- Merge SHA
-- Review report reference
-- Tests run
-- Deviations
-- Newly unblocked packages
-- Evidence still pending
-- Current maximum run mode
-
-### Step 9 — Close contexts
-
-End the Claude and Codex sessions. Begin the next package from a fresh context.
+- The round's handoff, its `INDEX.md` row and its brief change are written in the round's own branch. They cite the PR number and the candidate SHA ("merged via PR #N"). See [`docs/handoffs/README.md`](../handoffs/README.md).
+- Residuals go to [`docs/handoffs/RESIDUALS.md`](../handoffs/RESIDUALS.md), one row each, with an owner.
+- A direct `governance:` commit on `main` is only for user rulings and authorizations.
+- Do not encode review rounds into code or test names, such as "r4" in a `describe` block.
+- A round may append a dated note to an ADR it implements ([`docs/adr/README.md`](../adr/README.md)). New ADRs follow its budget and template.
 
 ---
 
-## 4. Immediate action: audit the already-merged WP-010
+## 4. Retired: the `WP-010` audit
 
-### 4.1 Identify the commit
-
-If `WP-010` is the latest merge:
-
-```bash
-git checkout main
-git status --short
-git log --oneline --decorate -10
-git rev-parse HEAD
-git rev-parse HEAD^1
-```
-
-Record:
-
-```text
-WP010_MERGE_SHA=<HEAD>
-WP010_BASE_SHA=<HEAD^1>
-```
-
-If Claude used a squash or fast-forward merge, identify the exact first and last commit belonging to `WP-010` from the log.
-
-### 4.2 Run a fresh Codex review
-
-Use the prompt in section 11.2 and tell Codex this is a **post-merge audit**.
-
-### 4.3 Handle the result
-
-- No material findings: mark `WP-010` verified.
-- Findings: create `fix/wp-010-review`, run a fresh Claude repair session, re-review with a fresh Codex session, then merge the fix.
-
-Do not rewrite published history unless the repository is private, unshared, and you intentionally choose to do so. A normal corrective commit is simpler.
+Done in Wave 0. Its text is in [`archive/runbook-waves-0-2.md`](archive/runbook-waves-0-2.md).
 
 ---
 
@@ -719,125 +587,9 @@ Preferably use Codex for the first wave-level audit and Claude for a second arch
 
 ---
 
-# 11. Reusable prompts
+# 11. Retired: reusable prompts
 
-## 11.1 Claude implementation prompt
-
-```text
-Act as the implementation orchestrator for exactly <WP-ID>.
-
-Start from a fresh context. Read completely:
-
-- CLAUDE.md
-- AGENTS.md
-- docs/spec/polymarket-bot-orchestrator-handoff.md
-- docs/spec/polymarket-bot-workplan.yaml
-- IMPLEMENTATION_STATUS.md
-
-Inspect Git status and recent commits.
-
-Only <WP-ID> is authorized. Do not begin any other package.
-
-1. Verify dependencies are merged and the working tree is clean.
-2. Extract the exact goal, allowed paths, forbidden paths, deliverables,
-   acceptance criteria, and gate for <WP-ID>.
-3. Check for active path-ownership conflicts.
-4. Produce a complete task packet.
-5. Delegate implementation to the appropriate project-scoped worktree-isolated
-   subagent.
-6. Require tests, a commit, and the complete handoff:
-   summary, files changed, tests run, assumptions, deviations, known risks,
-   follow-up, and commit SHA.
-7. Review the returned diff and test evidence.
-8. Do not merge.
-9. Present the candidate branch, base SHA, candidate SHA, acceptance matrix,
-   deviations, and exact command needed for independent review.
-10. Keep all live-order defaults unchanged and do not request credentials.
-```
-
-## 11.2 Codex review prompt
-
-```text
-Perform an independent, read-only adversarial review of <WP-ID>.
-
-Read:
-
-- AGENTS.md
-- docs/spec/polymarket-bot-orchestrator-handoff.md
-- docs/spec/polymarket-bot-workplan.yaml
-- IMPLEMENTATION_STATUS.md
-- the <WP-ID> task packet and implementer handoff, if present
-
-Review candidate commit <CANDIDATE-SHA> against base <BASE-SHA>.
-
-Do not modify files and do not create a fix.
-
-Verify:
-
-1. Every acceptance criterion.
-2. Allowed, forbidden, and protected paths.
-3. Architecture and dependency-direction invariants.
-4. Tests, including whether they exercise the central behavior and failures.
-5. Exact-decimal rules and deterministic behavior where applicable.
-6. Security, credential, signer, and run-mode defaults.
-7. Whether the handoff accurately reports assumptions and deviations.
-8. Whether implementation claims rely on evidence that did not actually occur.
-
-Run safe read-only inspection and test commands as needed.
-
-Return:
-
-- Verdict: ACCEPT / CHANGES REQUIRED
-- Findings grouped as BLOCKER, HIGH, MEDIUM, LOW, NOTE
-- File and symbol references
-- Failed or unproven acceptance criteria
-- Missing tests
-- Required remediation
-- Commands run and results
-```
-
-## 11.3 Claude remediation prompt
-
-```text
-Repair only the unresolved findings for <WP-ID> on branch <BRANCH>.
-
-Read the original task packet, implementer handoff, and Codex review report.
-Do not broaden scope or redesign adjacent modules.
-
-For each finding:
-
-1. Confirm it against the current code.
-2. Implement the smallest correct fix within the package's allowed paths.
-3. Add or strengthen tests that would have caught it.
-4. Run the full package acceptance suite.
-5. Commit the repair.
-6. Return a finding-by-finding resolution matrix and new commit SHA.
-
-Do not merge and do not begin another package.
-```
-
-## 11.4 Wave closeout prompt
-
-```text
-Perform a read-only closeout audit for Wave <N>.
-
-Read the implementation handoff, YAML work plan, status file, all wave package
-handoffs, review reports, and Git history.
-
-Do not edit code.
-
-Produce:
-
-- package-by-package acceptance matrix,
-- merge SHA verification,
-- unresolved findings,
-- full CI and integration results,
-- architecture drift findings,
-- external/human evidence still pending,
-- current run-mode verification,
-- exact list of newly unblocked packages,
-- verdict: WAVE COMPLETE / WAVE INCOMPLETE.
-```
+The wave 0-2 prompts are in [`archive/runbook-waves-0-2.md`](archive/runbook-waves-0-2.md). A round's packet follows §3.
 
 ---
 
@@ -899,7 +651,7 @@ The YAML's maximum of four is a ceiling, not a target.
 
 For every package:
 
-> Fresh Claude implementation context, isolated candidate commit, fresh read-only Codex review, Claude repair loop if needed, human merge, post-merge CI, status update, then discard both contexts.
+> A fresh implementer in its own worktree, a draft PR from round 0, review sized to the risk, a capped repair loop, records in the same PR, and a merge on green CI against current `main` (§3).
 
 For every wave:
 
