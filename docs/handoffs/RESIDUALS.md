@@ -162,7 +162,7 @@ Each section's intro is under [Where the rows came from](#where-the-rows-came-fr
 - U-17 and U-16: the semantics of `feeSchedule.exponent ≠ 1` and the rounding direction are still undocumented. Owner: as D-13; `roundingMode` stays caller-declared.
 - U-15: resolved. Protocol V2 is documented by S-D01 to S-D04, S-D07, S-D10, S-D11 and S-D12 (`verified-2026-10-05.md` §12, "Earlier register items, updated"; register row U-15, `V2-11`).
 - Handoff §24 has three redirecting links (D-07, D-11, D-25). Owner: the orchestrator or register owner (update or annotate them).
-- The phase-3 report, `docs/venue/verified-2026-09-30.md` (`VENUE-3`), has its own drift rows E-01…E-17, conflicts C-9…C-14 and unverified items U-18…U-22, each with an owner in the report. The four with a residual row are the `V3-*` rows above. C-4 is still not reproduced.
+- The phase-3 report, `docs/venue/verified-2026-09-30.md` (`VENUE-3`), has its own drift rows E-01…E-17, conflicts C-9…C-14 and unverified items U-18…U-22, each with an owner in the report. Those with a residual row are the `V3-*` rows above. C-4 is still not reproduced.
 
 ## Schema boundary (still live)
 

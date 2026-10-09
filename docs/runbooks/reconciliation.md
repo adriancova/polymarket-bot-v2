@@ -843,7 +843,7 @@ for the retransmission decision, or abandons it.
 | trades | CLOB `GET /data/trades`, every page | both status spellings (E-13, C-5); the adapter splits out the account's own legs and states when it cannot |
 | positions | Data API **`GET /v2/positions`**, every status | v1 is retired on 2026-10-24 (E-15) |
 | approvals | Data API `GET /v2/approvals` | |
-| collateral | the pUSD ERC-20 balance on chain | The CLOB balance-allowance read is refused: its response is undocumented (U-22), and its cache is stale until an L2-authenticated refresh (§W.9). |
+| collateral | the pUSD ERC-20 balance on chain | The CLOB balance-allowance read is refused: its cache is stale until an L2-authenticated refresh (§W.9). Its response shape is now documented (U-22 resolved, venue report 2026-10-05 §12, F-52), but that does not change the refusal. |
 | a wallet transaction | a chain receipt, by hash | No relayer status read is documented, so a relayer id is unreadable and stays held. |
 
 Reads are per credential (E-16). Read with the credential that placed the
