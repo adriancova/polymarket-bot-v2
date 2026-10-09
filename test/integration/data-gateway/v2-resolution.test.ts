@@ -455,6 +455,8 @@ describe("V2-3 acceptance 4: pending, failed and refused reads", () => {
     expect(incidents).toHaveLength(1);
     expect(incidents[0]?.ids).toEqual([V2_WINDOW.id]);
     expect(incidents[0]?.detail).toMatch(/The latest \/v2\/resolutions read \(at 2026-10-04T22:3\d:\d\d\.000Z, journaled as ingestSeq \d+\) was PENDING: the row's status is "proposed", not "resolved"/u);
+    // C1-OPS (COMPLEXITY-1 SERIES-SLOT): the operator is not sent to retire a window the reads can still resolve.
+    expect(incidents[0]?.detail).toMatch(/Until its row path ends, the window is read every cycle.* only if its row path has ended or its reads keep failing; that frees the gateway's slot only, and a trader holding the window stays at its cap until a new run$/u);
     await cycleAfter(harness, 0);
     expect(unresolvedIncidents(harness)).toHaveLength(1);
     // Still read, once per cycle (rule 5, "Polling and the incident", item 1): four cycles past the close, four reads.
