@@ -899,6 +899,8 @@ describe("V2-10 r1 (R1-01): a resting BUY's maker fills spend, TOGETHER, at most
     }
   });
 
+  // An exhaustive grid: about 1.5 s alone and over 5 s on a loaded CI runner
+  // (CI run 37937579843), so it gets its own timeout instead of vitest's 5 s.
   it("CONSERVES the signed collateral over a grid of prices, sizes, queues and partial-fill sequences", () => {
     // The budget is floor(size in whole base units × price). For every band:
     // every arm's fills spend at most it, and a final trade THROUGH the price
@@ -941,7 +943,7 @@ describe("V2-10 r1 (R1-01): a resting BUY's maker fills spend, TOGETHER, at most
       }
     }
     expect(bands).toBe(432);
-  });
+  }, 30_000);
 
   it("reaches the venue: a Tier-1 resting BUY's band never spends more than the order signed", async () => {
     // GTC BUY 10 at 0.6 against asks at 0.7: nothing crosses, so it rests, with

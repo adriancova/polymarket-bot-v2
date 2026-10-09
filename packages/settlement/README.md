@@ -79,7 +79,9 @@ orchestrator's to close; this package does not edit
   \$750-bond proposal, a 2-hour challenge period, a debate period, a UMA DVM
   vote). The Gamma market schema exposes a nullable `umaResolutionStatus`
   string, but its value vocabulary is not documented anywhere retrieved, so
-  nothing here parses it. ADR-009 §4's condition for adding a `MarketDisputed`
+  nothing here parses it. (V2 markets use other fields: Gamma
+  `resolutionStatus` (F-54) and the Data API row's `status`, `reporter` and
+  `payouts` (F-57, F-59), venue report 2026-10-05; see register row U-11.) ADR-009 §4's condition for adding a `MarketDisputed`
   event ("if the venue publishes an explicit dispute transition") is therefore
   NOT met, and `DISPUTED` stays an operator-recorded state in
   `@polymarket-bot/universe`.

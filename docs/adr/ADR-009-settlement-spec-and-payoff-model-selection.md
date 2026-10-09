@@ -197,6 +197,15 @@ uses other fields:
 
 This note adds no rule of its own, and changes nothing above PAPER.
 
+**Note, 2026-10-09 (`V2-11`): the register and the report ids.** The note
+above names the V2 fields. The register row U-11
+(`docs/contracts/protected-contracts.md` §8) now carries the same pointer, and
+rows C-18 and U-36 hold what is still unconfirmed about `resolutionStatus`.
+In `/v2/resolutions` the `reporter` is `UMA_OO`, `CHAINLINK` or `EOA`, and a
+resolved up/down canary row carried `CHAINLINK` and `payouts` `[1000000,0]`
+(F-57, F-59, `docs/venue/verified-2026-10-05.md`). Nothing above is edited,
+and this note adds no rule.
+
 ### 6. TWAP specs must name a window the feed actually publishes
 
 Verified (venue report §10.3): Chainlink TWAP arrives over RTDS at

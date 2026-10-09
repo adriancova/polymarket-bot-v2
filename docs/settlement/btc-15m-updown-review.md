@@ -219,6 +219,11 @@ versioned." In code:
 - The venue publishes no rules-version identifier. Gamma's `version` field is
   `"v1"` on every window, before and after the 2026-08-07 change, so it is
   not a rules version.
+  - *Dated note, 2026-10-09 (`V2-11`).* This observation is stale at the
+    switchover. `version` is now documented (venue report 2026-10-05, E-23,
+    F-38): it selects the protocol and the id field, `"v1"` or `"v2"`. All 96
+    windows of the series were `v1` on 2026-10-05, and when the series moves
+    to V2 is open (U-37). It is still not a rules version.
 - The only identity the evidence supports is **the content**: the sha256 of
   the `description` bytes, `485ceb1d…` today. The text changed once under the
   same series and title pattern (§1.3). A check by hash catches such a change;
@@ -533,6 +538,20 @@ Two limits, for the owners:
 R1 would also be expressible (`windowSeconds: 900`), so the vocabulary does not
 force the choice.
 
+### 4.4 The documented split payout (dated 2026-10-09, `V2-11`; a record, not a ruling)
+
+- **What the venue page says.** "A binary market can resolve to a split payout
+  instead of a full `$1` or `$0`, in which case each side redeems for its
+  share" (venue report 2026-10-05, F-73, E-22; S-D13 line 92). The page states
+  no ratio.
+- **What is open.** Whether a split other than 50/50 exists for this series.
+  The 50/50 payout is stated by the resolution page (register row U-6); this
+  page does not say the split is always 50/50.
+- **What the code does until it is settled.** `V2-3` accepts only the payout
+  vectors `[1000000,0]` and `[0,1000000]` from a `/v2/resolutions` row, and
+  refuses every other vector (`apps/data-gateway/src/feeds/resolution-check.ts`).
+  This section infers no ratio and changes no code.
+
 ## 5. The sign-off path
 
 ### 5.1 What the code does, step by step
@@ -701,7 +720,7 @@ about any deployed database.
 | **O1** Legacy RTDS `crypto_prices_twap_sixty` | Public, unauthenticated; the repository's RTDS adapter already handles a 60 s window (`RTDS_TWAP_WINDOWS = [30, 60]`) | Lasts only until the removal, then nothing. Legacy wire (E18 fixed point). "No snapshot, history, or replay after a disconnect" (the frozen report §10.3). That it is the same Chainlink series as `price.crypto.twap` is not stated. No credential |
 | **O2** PolyBolt `price.crypto.twap` | The documented "used by crypto up/down market resolution" series: 60 s, exact decimal `full_accuracy_value`, a two-minute snapshot on subscribe | Needs **CLOB API credentials**, which the PAPER rules forbid (AGENTS.md; handoff §0.2). It would need a user ruling and an ADR: the secure-boundary rule (§9.12), and the undocumented "readonly" key (U-19) |
 | **O3** Chainlink Data Streams directly | The stream the rules name | Needs a **Chainlink account** (S-C13: "Sign up … to get started"). That is a credential too, so it needs the same kind of ruling. The public stream page cannot be read without JavaScript (F-27); Chainlink's public directory gives the stream's feed ID, not its values (F-32) |
-| **O4** Do not observe the value; use the venue's outcome | The `market_resolved` push (documented); Gamma `closed` and `outcomePrices`; CLOB `tokens[].winner` (documented schema) | Public, no credential, and **what the trader does today**. No independent check of the venue's settlement, and no reference value for strategy inputs. Activation still needs a reviewed spec (check 6) |
+| **O4** Do not observe the value; use the venue's outcome | The `market_resolved` push (documented); Gamma `closed` and `outcomePrices`; CLOB `tokens[].winner` (documented schema) | Public, no credential, and **what the trader does today**. For a V2 window the venue's outcome can also be read from the Data API `/v2/resolutions` row: `status` `resolved`, `payouts`, and `reporter` (`CHAINLINK` on the one resolved canary row observed, venue report 2026-10-05 F-57, F-59). Dated 2026-10-09 (`V2-11`). No independent check of the venue's settlement, and no reference value for strategy inputs. Activation still needs a reviewed spec (check 6) |
 | **O5** Record Gamma `eventMetadata` | `priceToBeat` once a window opens, and `finalPrice` after it resolves | Public, but **undocumented** and binary floats (U-32). May change without notice. Never a settlement value. Informational only |
 | **O6** A proxy from the trader's reference venue (Binance today) | A 60 s average of a spot feed the trader already has | Strategy inputs only. The rules exclude "any other sources or spot markets", and ADR-009 §2 forbids approximating. Carries basis risk against Chainlink's price |
 
