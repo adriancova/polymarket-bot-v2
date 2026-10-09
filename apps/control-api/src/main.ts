@@ -678,9 +678,9 @@ export async function startup(
 
   ports.log(
     `control API configuration accepted: ${String(config.operators.length)} operator(s), ` +
-      `audit bound ${String(config.auditCapacity)} (the last ${String(config.auditSafetyReserve)} ` +
-      `for kill-switch engages, the ${String(config.auditSafetyReserve)} before them for ` +
-      `safety-direction actions), trader health source ${config.traderHealth.kind}, trader halt source ` +
+      `audit bound ${String(config.auditCapacity)}, safety reserve ${String(config.auditSafetyReserve)} ` +
+      "(unused here: this PAPER process applies no mutation, so every record is an ordinary refusal), " +
+      `trader health source ${config.traderHealth.kind}, trader halt source ` +
       config.traderHalts.kind,
   );
 
@@ -696,6 +696,7 @@ export async function startup(
   // strategies yet, so the control plane knows none and refuses a pause or
   // resume of any id `CONTROL_UNKNOWN_INSTANCE` rather than answering for an
   // instance it cannot control (M-1; README, "the composition obligation").
+  // Since `C1-OPS` no mutation reaches the plane here at all (below).
   const { log: audit, sink } = createBudgetedAuditLog({
     capacity: config.auditCapacity,
     safetyReserve: config.auditSafetyReserve,
@@ -732,6 +733,10 @@ export async function startup(
     // `CONTROL-2`: always stated, so the `control_trader_halts_state` lines
     // and the `traderHalts` section are always there.
     traderHalts: halts.cache,
+    // `C1-OPS`: no trader reads this process's controls (no durable audit sink
+    // and no trader-side reader are composed), so every mutating route answers
+    // an audited `501 CONTROL_NOT_WIRED`. A PAPER trader stops on SIGINT/SIGTERM.
+    mutationsReachTrader: false,
   });
 
   let server: Awaited<ReturnType<typeof startControlHttpServer>>;
@@ -756,8 +761,8 @@ export async function startup(
   ports.log(
     `server timeouts: headers ${String(server.timeouts.headersTimeoutMs)}ms, request ` +
       `${String(server.timeouts.requestTimeoutMs)}ms, keep-alive ${String(server.timeouts.keepAliveTimeoutMs)}ms; ` +
-      "no strategy instance is registered (no seam reaches a running trader's strategies), so a " +
-      "pause or resume is refused CONTROL_UNKNOWN_INSTANCE",
+      "no trader observes this process's controls, so pause, resume, kill-switch engage and release answer " +
+      "501 CONTROL_NOT_WIRED (audited); stop a PAPER trader with Ctrl-C or SIGTERM",
   );
   // `CONTROL-1b` r1 (closing `CONTROL1B-R1-J-L1`): read from the control plane
   // this process composed, so a composition that drops the void-record source

@@ -111,7 +111,7 @@ describe("WP-340 acceptance 4, from the shipped configurations: the four default
   });
 
   it("no compose fragment and no CI workflow SETS any of the four (comments may name them)", () => {
-    for (const file of ["infra/compose/trader/compose.yaml", "infra/compose/data-gateway/compose.yaml", "docker-compose.yml", ".github/workflows/ci.yml"]) {
+    for (const file of ["infra/compose/paper/compose.yaml", "docker-compose.yml", ".github/workflows/ci.yml"]) {
       const code = read(file)
         .split("\n")
         .filter((line) => !line.trimStart().startsWith("#"));

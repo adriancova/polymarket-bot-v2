@@ -290,9 +290,11 @@ export type RefusalAuditOutcome = ModeRaiseAuditOutcome;
  *
  * - `TRANSPORT` — `http.ts`'s `413`, `415` or `400` (not JSON);
  * - `ROUTE_PARAMETER` — the `:instanceId` door (`instance-id.ts`);
- * - `REQUEST_BODY` — the route's body door (`api.ts`, `doors.ts`).
+ * - `REQUEST_BODY` — the route's body door (`api.ts`, `doors.ts`);
+ * - `NOT_WIRED` — `C1-OPS`: no trader observes this process's mutations
+ *   (`ControlApiOptions.mutationsReachTrader` false), answered `501`.
  */
-export type RequestRefusalStage = "TRANSPORT" | "ROUTE_PARAMETER" | "REQUEST_BODY";
+export type RequestRefusalStage = "TRANSPORT" | "ROUTE_PARAMETER" | "REQUEST_BODY" | "NOT_WIRED";
 
 /** What {@link ControlPlane.refuseRequest} records about one such refusal. */
 export interface RequestRefusal {

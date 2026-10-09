@@ -750,10 +750,12 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
   it("RES-PY: a python gate after sync that loses its if: — each in turn", async () => {
     const { workflow, packageJson } = await readRealTexts();
     const pythonGates = gatesAfter(workflow, "python", "sync");
-    // Non-vacuity, and the real file's state: both gates carry the sync condition.
+    // Non-vacuity, and the real file's state: every gate carries the sync condition.
     expect(pythonGates.map(({ name, condition }) => [name, condition])).toEqual([
       ["Pytest", SYNC_GATE_IF],
       ["Dependency vulnerability scan (uv lockfile)", SYNC_GATE_IF],
+      ["Brief records check", SYNC_GATE_IF],
+      ["Brief records self-test", SYNC_GATE_IF],
     ]);
     for (const { number, name } of pythonGates) {
       expect(splitStepDrift(setStepKey(workflow, name, "if", undefined), packageJson), name).toEqual([

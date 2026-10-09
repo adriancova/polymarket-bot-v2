@@ -10,9 +10,10 @@ Authority for venue facts: current official Polymarket documentation. For
 architecture: `docs/spec/polymarket-bot-orchestrator-handoff.md` (§9.1, §14).
 This runbook **subsumes** the operator restart procedure previously written in
 `infra/compose/data-gateway/README.md` (per the WP-120 hand-off's follow-up:
-fold, do not duplicate); that README remains authoritative for the compose
-fragment's environment table and configuration notes and should shrink to
-point here (its owner is `WP-120`; noted in `docs/handoffs/WP-140.md`).
+fold, do not duplicate); that README keeps the environment table and
+configuration notes and points here (`C1-OPS`). The PAPER run as a whole —
+start order, stop, the trader's exit codes, restart after an outage — is
+[`paper-operations.md`](paper-operations.md).
 
 **Safety.** The recorder consumes public, unauthenticated market data only.
 No credential, signer, wallet, or order path exists in any covered process.
@@ -106,7 +107,7 @@ in the stream):
 | `GATEWAY_PUBLISH_QUEUE_FULL` | WP-060's producer queue saturated | find why the bus stopped draining; restart after |
 | `GATEWAY_PUBLISH_ADMISSION_OVERFLOW` | this gateway's admission queue filled (`publisher.maxQueueDepth` / `maxQueueBytes`) | same; raise bounds only with a reason (§5) |
 | `GATEWAY_PUBLISH_REJECTED` | transport refused an envelope for a non-outage reason | **gateway-side defect** — capture detail + WAL segment, then restart |
-| `RTDS_UNRECOVERABLE_GAP` | RTDS TWAP stream broke; venue offers no replay; normalized RTDS publication halted for the epoch | restart for a new observation window; the unobserved interval is permanently unobserved; TWAP-dependent consumers must halt (ADR-009 §6) |
+| `RTDS_UNRECOVERABLE_GAP` | **retired** (`RTDS-RETIRE`, 2026-10-05): a current gateway cannot raise it, because it refuses an `rtds` block. Kept for epochs recorded before then: the RTDS TWAP stream broke; the venue offers no replay, so normalized RTDS publication halted for the epoch | for such an old epoch: the unobserved interval is permanently unobserved and TWAP-dependent consumers must halt (ADR-009 §6); a restart now starts a gateway without RTDS |
 
 The procedure, in order:
 
@@ -128,8 +129,10 @@ The procedure, in order:
 6. **Nothing recorded during the halt is lost.** Those segments are complete
    and manifested; `WP-130` compacts them like any others.
 
-Local operation (compose fragment, environment table, configuration notes):
-`infra/compose/data-gateway/README.md`.
+Local operation (environment table, configuration notes):
+`infra/compose/data-gateway/README.md`. A Redis outage also ends the trader
+run; the restart order, gateway first, is
+[`paper-operations.md`](paper-operations.md) §5.
 
 ## 4. Metrics, dashboard, and alerts
 
@@ -143,7 +146,15 @@ Local operation (compose fragment, environment table, configuration notes):
   acceptance-1 set), plus liveness, feeds, validation, and soak panels.
 - **Alerts**: `infra/prometheus/recorder-alerts.yaml`; scrape fragment
   `infra/prometheus/recorder-scrape.yaml`. Meanings are annotated on each
-  rule; the two deliberately log-based alarms are in §2.
+  rule; the two deliberately log-based alarms are in §2. **Both fragments are
+  NOT DEPLOYABLE** until a gateway `/metrics` listener exists (`C1-OPS`,
+  COMPLEXITY-1 OPS-12): deployed today, `RecorderExited` pages permanently and
+  every other rule evaluates nothing. When the exporter is wired, keep about six
+  paging rules — `RecorderExited`, `RecorderPublicationHalted`,
+  `RecorderWalFaulted`, `RecorderWalDroppedMessages`, `RecorderFsyncOverdue`
+  and `RecorderFeedStalls` — and turn the batch-job outcomes (compaction,
+  upload, retention, validation, soak evidence) into job exit codes rather than
+  pages. `RecorderRtdsHalted` was deleted with RTDS's retirement (§3).
 - **Wiring status, disclosed**: no process serves `/metrics` yet. The
   exporter is wired into the apps by a follow-up recorded in
   `docs/handoffs/WP-140.md` (the apps are outside WP-140's paths). Until
@@ -365,6 +376,3 @@ pipeline, not the soak.
 - **Log-based alarms** (§2) need a log pipeline; Prometheus alone cannot see
   a wedged process's last words.
 - **Bounds and latency are unmeasured** until the first real soak (§5).
-- **`infra/compose/data-gateway/README.md`** still contains the restart
-  procedure this runbook subsumed; trimming it to a pointer is a WP-120-path
-  edit.
