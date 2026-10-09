@@ -624,7 +624,8 @@ async function expectOnlyTheHaltRecordAfter(
     severity: "PAGE",
     status: "OPEN",
     failure_class: "TRANSPORT_UNAVAILABLE",
-    action: "FULL_HALT",
+    // C1-HALTS: no §9.9 rung is selected; every halt ends the run.
+    action: null,
     market_id: null,
     instance_id: registered.instanceId,
     data_quality_incident_id: null,

@@ -338,7 +338,7 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
         expect(rows[0]).toMatchObject({
           incident_key: "TRADER_HALT:GLOBAL",
           failure_class: "STORE_UNAVAILABLE",
-          action: "FULL_HALT",
+          action: null,
           instance_id: registered.instanceId,
           market_id: null,
         });
