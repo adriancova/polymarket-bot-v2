@@ -120,6 +120,86 @@ describe("createLimitOrder signs locally", () => {
   });
 });
 
+describe("ADR-034 D2.4: the share grid, and the EXACT cross-check of the signed amounts", () => {
+  it.each(["10.129", "0.001", "5.009", "1.000001", "49.995"])("an off-grid size %s is INVALID_REQUEST before the SDK runs: nothing is rounded or signed", async (size) => {
+    const { client, recorder, probe } = await setup();
+    expect(await client.createLimitOrder({ assetId: "12345", side: "BUY", price: "0.52", size })).toMatchObject({
+      kind: "FAILED",
+      error: { kind: "INVALID_REQUEST", effect: "NOT_SENT" },
+    });
+    expect(calls(recorder, "createLimitOrder")).toBe(0);
+    expect(probe.signTypedDataCalls).toBe(0);
+  });
+
+  it.each([
+    ["10", "10000000"],
+    ["10.1", "10100000"],
+    ["10.12", "10120000"],
+    ["0.01", "10000"],
+  ])("an on-grid size %s is signed for exactly that many shares (%s base units)", async (size, baseUnits) => {
+    const { client } = await setup();
+    const outcome = await client.createLimitOrder({ assetId: "12345", side: "BUY", price: "0.52", size });
+    expect(outcome.kind).toBe("SIGNED");
+    if (outcome.kind === "SIGNED") expect(outcome.order.identity.takerAmount).toBe(baseUnits);
+  });
+
+  /** A fake SDK whose signed order is the default one with `patch` applied. */
+  function tampered(patch: (order: Record<string, unknown>) => Record<string, unknown>): FakeSdkScript {
+    return {
+      createLimitOrder: async (request, signer) => {
+        const { factory } = createFakeSdkFactory();
+        const port = await factory({ signer });
+        return patch((await port.createLimitOrder(request)) as unknown as Record<string, unknown>) as never;
+      },
+    };
+  }
+
+  const nudge = (value: unknown, delta: bigint): string => (BigInt(String(value)) + delta).toString();
+
+  // D2.4's table, one row each (shares 12.34 at 0.37: quote 4.5658 pUSD = 4,565,800 base units; shares 12,340,000).
+  for (const [row, side, expiration, maker, taker] of [
+    ["GTC BUY", "BUY", undefined, "4565800", "12340000"],
+    ["GTC SELL", "SELL", undefined, "12340000", "4565800"],
+    ["GTD BUY", "BUY", 1_900_000_000, "4565800", "12340000"],
+    ["GTD SELL", "SELL", 1_900_000_000, "12340000", "4565800"],
+  ] as const) {
+    const request = { assetId: "12345", side, price: "0.37", size: "12.34", ...(expiration === undefined ? {} : { expirationUnixSeconds: expiration }) };
+
+    it(`${row}: makerAmount ${maker}, takerAmount ${taker}, exactly: SIGNED`, async () => {
+      const { client } = await setup(tampered((order) => order));
+      const outcome = await client.createLimitOrder(request);
+      expect(outcome.kind).toBe("SIGNED");
+      if (outcome.kind === "SIGNED") expect(outcome.order.identity).toMatchObject({ makerAmount: maker, takerAmount: taker, orderType: expiration === undefined ? "GTC" : "GTD" });
+    });
+
+    for (const [label, patch] of [
+      ["makerAmount + 1", (order: Record<string, unknown>) => ({ ...order, makerAmount: nudge(order["makerAmount"], 1n) })],
+      ["makerAmount − 1", (order: Record<string, unknown>) => ({ ...order, makerAmount: nudge(order["makerAmount"], -1n) })],
+      ["takerAmount + 1", (order: Record<string, unknown>) => ({ ...order, takerAmount: nudge(order["takerAmount"], 1n) })],
+      ["takerAmount − 1", (order: Record<string, unknown>) => ({ ...order, takerAmount: nudge(order["takerAmount"], -1n) })],
+      ["amounts swapped", (order: Record<string, unknown>) => ({ ...order, makerAmount: order["takerAmount"], takerAmount: order["makerAmount"] })],
+    ] as const) {
+      it(`${row}: ${label} → FAILED, never an envelope`, async () => {
+        const { client } = await setup(tampered(patch));
+        expect(await client.createLimitOrder(request)).toMatchObject({ kind: "FAILED", error: { kind: "UNKNOWN" } });
+      });
+    }
+  }
+
+  it.each(["FAK", "FOK"])("a signed %s order is still refused: those rows arrive with ADR-034 R3", async (orderType) => {
+    const { client } = await setup(tampered((order) => ({ ...order, orderType })));
+    expect(await client.createLimitOrder({ assetId: "12345", side: "BUY", price: "0.37", size: "12.34" })).toMatchObject({
+      kind: "FAILED",
+      error: { kind: "UNKNOWN" },
+    });
+  });
+
+  it("a price whose quote is not a whole number of base units can match no signed order: FAILED, never rounded", async () => {
+    const { client } = await setup();
+    expect((await client.createLimitOrder({ assetId: "12345", side: "BUY", price: "0.1234567", size: "1" })).kind).toBe("FAILED");
+  });
+});
+
 describe("postOrder maps without optimism (ADR-007 §5–§6)", () => {
   const accepted = (status: string, extra: Record<string, unknown> = {}) => ({
     ok: true,

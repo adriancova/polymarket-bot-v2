@@ -56,6 +56,7 @@ export type {
   PlannedOrder,
   ReplaceHysteresis,
   ReservationRequirement,
+  UnexecutableRemainder,
 } from "./plan.js";
 
 export { buildExecutionPlan } from "./build.js";
@@ -95,6 +96,23 @@ export {
   sellLimitPrice,
 } from "./price.js";
 export type { BuyPriceInputs, ExecutionPosture, PriceOutcome, SellPriceInputs } from "./price.js";
+
+export {
+  VENUE_PRECISION_TABLE,
+  checkMinimumOrderSize,
+  collateralBuySignedShares,
+  isOnSizeGrid,
+  quantizeOrderQuantity,
+  sizeGridFor,
+  venuePrecisionFor,
+} from "./quantity.js";
+export type {
+  MinimumBasis,
+  QuantityUnit,
+  QuantizedQuantity,
+  UnexecutableReason,
+  VenuePrecision,
+} from "./quantity.js";
 
 export { MAX_PLAN_SLICES, sliceShares } from "./slice.js";
 export type { SliceResult } from "./slice.js";

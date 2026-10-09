@@ -130,11 +130,16 @@ export interface SecureVenueClient {
    * version `"3"` for a V2-shaped id, the CTF or Neg Risk exchange and `"2"`
    * otherwise.
    *
+   * The request's `size` must be on the venue's 0.01 share grid (ADR-034
+   * D2.4: the planner quantizes, nothing downstream rounds); an off-grid size
+   * is `FAILED` with `INVALID_REQUEST`, before the SDK is called.
+   *
    * The SDK's signed order is checked against the request (token, side,
-   * post-only, expiration and order type, and amounts within the pinned
-   * SDK's round-down precision) and against the client's account (maker,
-   * signer and signature type as the pinned SDK derives them, and zero
-   * `builder` and `metadata`) before it is wrapped; a mismatch is `FAILED`.
+   * post-only, expiration and order type, and amounts EXACTLY equal to the
+   * request's shares and shares × price in base units, ADR-034 D2.4) and
+   * against the client's account (maker, signer and signature type as the
+   * pinned SDK derives them, and zero `builder` and `metadata`) before it is
+   * wrapped; a mismatch is `FAILED`.
    */
   createLimitOrder(request: LimitOrderRequest): Promise<SignOutcome>;
   /** Transmit a previously signed order (ADR-007 §2 step 5). */
@@ -274,6 +279,8 @@ function readLimitOrderUncontained(request: unknown): ValidatedLimitOrder | unde
   if (typeof assetId !== "string" || !ASSET_ID.test(assetId)) return undefined;
   if (side !== "BUY" && side !== "SELL") return undefined;
   if (!isPositiveDecimal(price) || !UNIT_PRICE.test(price) || !isPositiveDecimal(size)) return undefined;
+  // ADR-034 D2.4: a share quantity off the venue's grid is refused, never rounded (the SDK would floor it).
+  if (!isOnShareGrid(size)) return undefined;
   if (postOnly !== undefined && typeof postOnly !== "boolean") return undefined;
   if (expiration !== undefined && !(typeof expiration === "number" && Number.isSafeInteger(expiration) && expiration > 0)) {
     return undefined;
@@ -295,22 +302,22 @@ function toSdkLimitOrder(order: ValidatedLimitOrder): PrepareLimitOrderRequest {
 // ---------------------------------------------------------------------------
 // The signed-order cross-check (exact integer arithmetic; never a float).
 
-/** Base units per share and per pUSD/USDC unit: both have 6 decimals. */
+/** Base units per share and per pUSD/USDC unit: both have 6 decimals ("convert both amounts to six-decimal integers", A F-99). */
 const BASE_UNITS = 1_000_000n;
 /**
- * The pinned SDK's limit-order rounding (`@polymarket/client@0.12.0`,
- * `resolveRoundingConfig` in `actions/orders/context.ts` lines 14-31 and
- * `computeLimitOrderAmounts` in `actions/orders/amounts.ts` lines 34-71; both
- * unchanged from 0.11.0, re-pinned by V2-5 against the real SDK in
- * `test/contract/polymarket-secure/sdk-0-12.test.ts`): the share amount is
- * rounded DOWN to 2 decimals (10^4 base units) for every tick size, and the
- * quote amount is rounded DOWN to 3 (tick 0.1), 4 (0.01), 5 (0.005, 0.001) or
- * 6 (0.0025, 0.0001) decimals, so at most 10^3 base units.
- * A signed order is accepted only within these bounds; a change in the SDK's
- * rounding therefore fails closed (`FAILED`), never open.
+ * "Size decimals" is 2 for every tick size (`docs/venue/verified-2026-10-06.md`
+ * F-99; the pinned SDK's `resolveRoundingConfig` has `size: 2` for all six
+ * ticks, F-101). A limit order's share quantity must already be on this grid
+ * (ADR-034 D2.4): the SDK would floor anything finer, and the order it signed
+ * would then differ from the one the OMS records (`CO3-N1`).
  */
-const SHARE_ROUNDING_BASE_UNITS = 10_000n;
-const QUOTE_ROUNDING_MAX_BASE_UNITS = 1_000n;
+const SHARE_SIZE_DECIMALS = 2;
+
+/** True when `size` (a pre-validated positive decimal) has at most {@link SHARE_SIZE_DECIMALS} fractional digits. */
+function isOnShareGrid(size: string): boolean {
+  const dot = size.indexOf(".");
+  return dot === -1 || size.length - dot - 1 <= SHARE_SIZE_DECIMALS;
+}
 
 /** An exact decimal string as `numerator / 10^scale`. The input is pre-validated. */
 function rational(decimal: string): { readonly numerator: bigint; readonly denominator: bigint } {
@@ -318,13 +325,10 @@ function rational(decimal: string): { readonly numerator: bigint; readonly denom
   return { numerator: BigInt(`${whole}${fraction}`), denominator: 10n ** BigInt(fraction.length) };
 }
 
-/**
- * True when `actual` (base units) is `exact` rounded DOWN by less than
- * `granularity` base units, where `exact = numerator / denominator` base units.
- */
-function roundedDownFrom(actual: bigint, numerator: bigint, denominator: bigint, granularity: bigint): boolean {
-  const scaled = actual * denominator;
-  return scaled <= numerator && numerator - scaled < granularity * denominator;
+/** `value × 10^6` as an exact integer, or `undefined` when it is not a whole number of base units. */
+function exactBaseUnits(numerator: bigint, denominator: bigint): bigint | undefined {
+  const scaled = numerator * BASE_UNITS;
+  return scaled % denominator === 0n ? scaled / denominator : undefined;
 }
 
 /** `bytes32(0)`: the pinned SDK's `builder` and `metadata` when no builder code is given (this package never gives one). */
@@ -365,23 +369,36 @@ function signedOrderHasNoAttribution(envelope: SignedOrderEnvelope): boolean {
   );
 }
 
-/** Does the SDK's signed order say what the caller asked for? */
+/**
+ * Does the SDK's signed order say EXACTLY what the caller asked for (ADR-034
+ * D2.4, `LOW-2`)? The amounts are recomputed from the request, by order kind,
+ * in base units:
+ *
+ * | Order | `makerAmount` | `takerAmount` |
+ * | --- | --- | --- |
+ * | GTC or GTD BUY | shares × price, exactly | shares, exactly |
+ * | GTC or GTD SELL | shares, exactly | shares × price, exactly |
+ *
+ * "Exactly" holds because on-grid inputs need no rounding: Price decimals + 2
+ * equals Amount decimals in every row of the venue's table (A F-102), and the
+ * size is on the 0.01 grid ({@link readLimitOrder}). Anything else is `FAILED`,
+ * so no order exists (WP-260), and a later change in the SDK's rounding fails
+ * closed at signing. FAK and FOK cannot be requested here (the SDK port has
+ * only `createLimitOrder`), and a signed order of either type is refused by
+ * the order-type check; their rows arrive with ADR-034 round R3.
+ */
 function signedOrderMatchesRequest(identity: SignedOrderEnvelope["identity"], request: ValidatedLimitOrder): boolean {
   if (identity.tokenId !== request.assetId || identity.side !== request.side) return false;
   if (identity.postOnly !== (request.postOnly === true)) return false;
   if (identity.expiration !== (request.expiration ?? 0)) return false;
   if (identity.orderType !== (request.expiration === undefined ? "GTC" : "GTD")) return false;
-  const makerAmount = BigInt(identity.makerAmount);
-  const takerAmount = BigInt(identity.takerAmount);
-  const [shares, quote] = request.side === "BUY" ? [takerAmount, makerAmount] : [makerAmount, takerAmount];
   const size = rational(request.size);
   const price = rational(request.price);
-  if (shares <= 0n) return false;
-  // shares ≈ size × 10^6, rounded down to the share precision.
-  if (!roundedDownFrom(shares, size.numerator * BASE_UNITS, size.denominator, SHARE_ROUNDING_BASE_UNITS)) return false;
-  // quote ≈ price × shares, rounded down to the quote precision. For a BUY
-  // this bounds what is paid; for a SELL it bounds what is received.
-  return roundedDownFrom(quote, price.numerator * shares, price.denominator, QUOTE_ROUNDING_MAX_BASE_UNITS);
+  const shares = exactBaseUnits(size.numerator, size.denominator);
+  const quote = exactBaseUnits(size.numerator * price.numerator, size.denominator * price.denominator);
+  if (shares === undefined || quote === undefined || shares <= 0n) return false;
+  const [maker, taker] = request.side === "BUY" ? [quote, shares] : [shares, quote];
+  return BigInt(identity.makerAmount) === maker && BigInt(identity.takerAmount) === taker;
 }
 
 function isOrderId(value: unknown): value is string {

@@ -146,7 +146,39 @@ reads, destructuring, `JSON.stringify` and `toEqual` all work;
 `structuredClone` or JSON round trip restores `Object.prototype`, so a copy
 must be re-validated before optional fields are read off it.
 
-## 6. Refusal vocabulary (20 codes)
+## 5a. One executable quantity (ADR-034 D2, `CO3-N1`)
+
+The venue signs an order's input quantity on a 0.01 grid for every tick
+size (`docs/venue/verified-2026-10-06.md` F-99, F-101). This package
+quantizes **once**, in `src/quantity.ts`, and nothing downstream rounds:
+
+- **The grid** comes from the documented precision table
+  (`VENUE_PRECISION_TABLE`), keyed by the market's tick size. An unknown
+  tick size is refused `PLAN_TICK_SIZE_UNSUPPORTED`.
+- **Each leg's requested shares are floored** to the grid as soon as they
+  are known (`quantizeOrderQuantity`), so leg selection, the cost ceilings,
+  slicing, the reservations and the estimates all see the executable
+  number. A quantity that floors to 0 is refused
+  `PLAN_BELOW_MINIMUM_ORDER_SIZE`; nothing is ever rounded up.
+- **The remainder is recorded** on the leg's last planned order as
+  `unexecutableRemainder: { reason: "SUB_GRID", unit: "SHARES", quantity,
+  requested, executable }`, present only when the request was off the grid
+  (an on-grid plan is unchanged). The seal checks that it is the group's
+  last order, that `requested − executable = quantity < 0.01`, and that
+  `executable` is the group's total.
+- **Slicing is on the grid**: an off-grid `maxSliceShares`, or an off-grid
+  total, is `PLAN_SLICING_INCOHERENT`. The seal refuses any order whose
+  `shares` are off the grid of its group's tick size.
+- **The minimum** (D2.3, C-7's share reading) is `checkMinimumOrderSize`:
+  executable shares for a limit order, and for a FAK/FOK BUY the signed
+  share side, `ceil` at Amount decimals of `collateralTarget ÷ limitPrice`
+  (`collateralBuySignedShares`). The collateral path is built and tested,
+  but no plan produces a collateral target until ADR-034 round R3.
+
+The OMS ticket door (`OMS_SIZE_OFF_GRID`), Static Bracket's configuration
+door and the signing adapter's exact cross-check only CHECK the grid.
+
+## 6. Refusal vocabulary (21 codes)
 
 `PLAN_INPUT_INVALID`, `PLAN_RECORD_INVALID`, `PLAN_UUID_NOT_CANONICAL`,
 `PLAN_MARKET_INPUT_MISSING`, `PLAN_BOOK_INVALID`, `PLAN_INTENT_EXPIRED`,
@@ -154,7 +186,7 @@ must be re-validated before optional fields are read off it.
 `PLAN_PRICE_PROTECTION_UNAVAILABLE`, `PLAN_PRICE_OUT_OF_RANGE`,
 `PLAN_INVENTORY_INSUFFICIENT`, `PLAN_COLLATERAL_INSUFFICIENT`,
 `PLAN_EXCEEDS_MAXIMUM_TOTAL_COST`, `PLAN_BELOW_MINIMUM_ORDER_SIZE`,
-`PLAN_SLICING_INCOHERENT`, `PLAN_BASKET_LEG_UNBOUNDED`,
+`PLAN_SLICING_INCOHERENT`, `PLAN_TICK_SIZE_UNSUPPORTED`, `PLAN_BASKET_LEG_UNBOUNDED`,
 `PLAN_BASKET_LEG_RISK_EXCEEDED`, `PLAN_BASKET_COMBINED_COST_EXCEEDED`,
 `PLAN_ATOMIC_LABEL_FORBIDDEN`, `PLAN_SEAL_INVALID`.
 

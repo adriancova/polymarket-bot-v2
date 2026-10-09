@@ -88,7 +88,7 @@ export {
   type SignClass,
 } from "./outcomes.js";
 
-export { MAX_ORDERS_PER_BATCH, VENUE_FACTS, type VenueFact } from "./venue-facts.js";
+export { AMOUNT_BASE_DECIMALS, MAX_ORDERS_PER_BATCH, SHARE_SIZE_DECIMALS, VENUE_FACTS, type VenueFact } from "./venue-facts.js";
 
 export {
   conditionOfCancelOutcome,

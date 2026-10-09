@@ -37,7 +37,7 @@
  *   materialized tree that shares no object with the draft.
  */
 
-import { compareDecimal } from "@polymarket-bot/decimal";
+import { addDecimal, compareDecimal, subDecimal } from "@polymarket-bot/decimal";
 import { RUN_MODES, type RunMode } from "@polymarket-bot/domain";
 import { readPlainData } from "@polymarket-bot/risk/plain-data";
 
@@ -51,6 +51,7 @@ import {
   type PlannerRefusal,
   type PlannerResult,
 } from "./refusals.js";
+import { isOnSizeGrid, sizeGridFor } from "./quantity.js";
 import { isOnTick } from "./tick.js";
 import { instantMilliseconds } from "./time.js";
 import {
@@ -94,6 +95,25 @@ export interface PlanEstimates {
   readonly slippage: string;
 }
 
+/**
+ * What the quantizer could not execute of a leg (ADR-034 D2.3), recorded on
+ * the leg's LAST planned order. It keeps both numbers of the intent-to-plan
+ * link: the leg's requested quantity and its executable one (the sum of the
+ * group's orders). Present only when the request was off the venue's grid,
+ * so an on-grid plan is byte-identical to what it was before D2.
+ */
+export interface UnexecutableRemainder {
+  readonly reason: "SUB_GRID";
+  /** The remainder's unit. Shares only, until a collateral-targeted order exists (ADR-034 D4, round R3). */
+  readonly unit: "SHARES";
+  /** `requested − executable`: strictly between 0 and the grid. */
+  readonly quantity: string;
+  /** What the intent asked of this leg. */
+  readonly requested: string;
+  /** The leg's executable quantity: the requested one floored to the grid; the sum of its group's orders. */
+  readonly executable: string;
+}
+
 export interface PlannedOrder {
   readonly plannedOrderId: string;
   readonly marketId: string;
@@ -101,11 +121,18 @@ export interface PlannedOrder {
   readonly action: "BUY" | "SELL";
   /** REQUIRED: every planned order is a capped limit order (acceptance 2). */
   readonly limitPrice: string;
+  /**
+   * The ONE executable quantity (ADR-034 D2.5): on the venue's grid for the
+   * group's tick size, and exactly the reservation basis, the OMS ticket,
+   * the signed share amount and the size the venue books.
+   */
   readonly shares: string;
   readonly postOnly: boolean;
   readonly executionStyle: "REST" | "MARKETABLE_LIMIT";
   /** The reservation that must be APPLIED before this order is submitted. */
   readonly reservationId: string;
+  /** ADR-034 D2.3: only on a leg's last order, only when its request was off the grid. */
+  readonly unexecutableRemainder?: UnexecutableRemainder;
 }
 
 export interface ExecutionGroup {
@@ -404,6 +431,56 @@ interface OrderFacts {
   readonly shares: string;
 }
 
+/**
+ * ADR-034 D2.3: an order's `unexecutableRemainder`, if present, is the
+ * quantizer's record of its leg and nothing else. It sits on the group's last
+ * order only, names `SUB_GRID` and shares, and its numbers agree exactly: the
+ * remainder is positive and below the grid, `requested − executable` equals
+ * it, and `executable` is the group's total.
+ */
+function validateRemainders(
+  orders: readonly unknown[],
+  groupPath: string,
+  tickSize: string | undefined,
+  problems: Problem[],
+): void {
+  let total = "0";
+  let totalReadable = true;
+  for (const order of orders) {
+    const shares = order !== null && typeof order === "object" ? (order as Readonly<Record<string, unknown>>)["shares"] : undefined;
+    if (typeof shares === "string" && isOnSizeGrid(shares, tickSize ?? "")) total = addDecimal(total, shares);
+    else totalReadable = false;
+  }
+  for (const [index, order] of orders.entries()) {
+    if (order === null || typeof order !== "object") continue;
+    const value = (order as Readonly<Record<string, unknown>>)["unexecutableRemainder"];
+    if (value === undefined) continue;
+    const path = `${groupPath}.orders[${String(index)}].unexecutableRemainder`;
+    if (index !== orders.length - 1) {
+      problem(problems, path, "a leg's unexecutable remainder is recorded on its last order only (ADR-034 D2.3)");
+    }
+    const data = asRecord(value, path, problems);
+    if (data === undefined) continue;
+    requireKnownKeys(data, path, new Set(["reason", "unit", "quantity", "requested", "executable"]), problems);
+    if (data["reason"] !== "SUB_GRID") problem(problems, `${path}.reason`, 'must be exactly "SUB_GRID" (ADR-034 D2.3)');
+    if (data["unit"] !== "SHARES") problem(problems, `${path}.unit`, 'must be exactly "SHARES"');
+    const quantity = asDecimal(data["quantity"], `${path}.quantity`, problems, "POSITIVE");
+    const requested = asDecimal(data["requested"], `${path}.requested`, problems, "POSITIVE");
+    const executable = asDecimal(data["executable"], `${path}.executable`, problems, "POSITIVE");
+    const grid = tickSize === undefined ? undefined : sizeGridFor(tickSize);
+    if (quantity === undefined || requested === undefined || executable === undefined || grid === undefined) continue;
+    if (compareDecimal(quantity, grid) >= 0) {
+      problem(problems, `${path}.quantity`, `a sub-grid remainder is below the grid "${grid}"`);
+    }
+    if (compareDecimal(subDecimal(requested, executable), quantity) !== 0) {
+      problem(problems, path, "requested − executable must equal the remainder exactly");
+    }
+    if (!totalReadable || compareDecimal(executable, total) !== 0) {
+      problem(problems, `${path}.executable`, "the leg's executable quantity must equal the sum of its group's orders exactly (ADR-034 D2.5)");
+    }
+  }
+}
+
 function validateOrder(
   value: unknown,
   path: string,
@@ -425,6 +502,7 @@ function validateOrder(
       "postOnly",
       "executionStyle",
       "reservationId",
+      "unexecutableRemainder",
     ]),
     problems,
   );
@@ -450,6 +528,14 @@ function validateOrder(
     );
   }
   const shares = asDecimal(data["shares"], `${path}.shares`, problems, "POSITIVE");
+  // ADR-034 D2.5: the one executable quantity is on the venue's grid for the group's tick size.
+  if (shares !== undefined && group.tickSize !== undefined && !isOnSizeGrid(shares, group.tickSize)) {
+    problem(
+      problems,
+      `${path}.shares`,
+      `not on the venue's order grid "${sizeGridFor(group.tickSize) ?? "unknown"}" for tick size "${group.tickSize}" (ADR-034 D2)`,
+    );
+  }
   if (
     shares !== undefined &&
     group.minimumOrderSize !== undefined &&
@@ -614,6 +700,13 @@ function validateGroups(
     if (tickSize !== undefined && compareDecimal(tickSize, "1") >= 0) {
       problem(problems, `${groupPath}.tickSize`, "a price tick must be smaller than 1");
     }
+    if (tickSize !== undefined && sizeGridFor(tickSize) === undefined) {
+      problem(
+        problems,
+        `${groupPath}.tickSize`,
+        "not in the venue's documented precision table, so the order grid is unknown (ADR-034 D2.1; PLAN_TICK_SIZE_UNSUPPORTED)",
+      );
+    }
     const minimumOrderSize = asDecimal(data["minimumOrderSize"], `${groupPath}.minimumOrderSize`, problems, "POSITIVE");
     const orders = asArray(data["orders"], `${groupPath}.orders`, problems);
     if (orders === undefined) continue;
@@ -621,6 +714,7 @@ function validateGroups(
       problem(problems, `${groupPath}.orders`, "an execution group with no orders plans nothing");
       continue;
     }
+    validateRemainders(orders, groupPath, tickSize, problems);
     for (const [orderIndex, order] of orders.entries()) {
       const orderFacts = validateOrder(
         order,

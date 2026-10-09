@@ -154,6 +154,17 @@
  * duplicate pending id, which reads as done); `release` precedes its durable
  * `RESERVATION_RELEASED` event (a replayed release reads as done).
  *
+ * ## ONE EXECUTABLE QUANTITY (ADR-034 D2; `CO3-N1`)
+ *
+ * The planner floors every share quantity to the venue's 0.01 grid once; the
+ * OMS never rounds. The ticket door refuses an off-grid `shares` with
+ * `OMS_SIZE_OFF_GRID` before the PLANNED row and before `reserve` (and a
+ * staged replacement before it is staged), and `identityMismatch` requires the
+ * signed `makerAmount` and `takerAmount` to be the order's shares and shares ×
+ * price, exactly, in base units. So the ticket, `originalShares`, the
+ * reservation basis, the signed share amount and the venue's original size
+ * that reconciliation compares are one number.
+ *
  * ## RESERVATIONS (§9.10; work-plan acceptance 3; ADR-006 §9)
  *
  * A fill consumes exactly its debit of the reserved asset (BUY: shares x fill
@@ -176,6 +187,7 @@ import {
   isCode,
   isIdentifier,
   isNonNegativeAmount,
+  isOnShareGrid,
   isOpenUnitPrice,
   isPositiveAmount,
   isTokenId,
@@ -183,8 +195,10 @@ import {
   isUuidV7,
   parseFlatJson,
   readArray,
+  readBaseUnitInteger,
   readField,
   readFields,
+  wholeUnits,
 } from "./guards.js";
 import {
   classifyBatch,
@@ -235,7 +249,7 @@ import {
   type OrderState,
   type SettlementState,
 } from "./states.js";
-import { MAX_ORDERS_PER_BATCH } from "./venue-facts.js";
+import { AMOUNT_BASE_DECIMALS, MAX_ORDERS_PER_BATCH, SHARE_SIZE_DECIMALS } from "./venue-facts.js";
 
 // ---------------------------------------------------------------------------
 // Public input and view types.
@@ -1109,6 +1123,9 @@ export class OrderManager {
       if (order === undefined) return refuse("OMS_UNKNOWN_ORDER", "no such order", { orderId });
       const ticket = readTicket(replacement);
       if (ticket === undefined) return refuse("OMS_INVALID_INPUT", "the replacement is not a valid order ticket");
+      // ADR-034 D2.4: an off-grid replacement is refused before it is staged, so nothing is canceled for it.
+      const offGrid = offGridRefusal(ticket);
+      if (offGrid !== undefined) return offGrid;
       if (ticket.groupId !== order.groupId) {
         return refuse("OMS_GROUP_MISMATCH", "a replacement belongs to the replaced order's group", { executionGroupId: order.groupId });
       }
@@ -1419,6 +1436,9 @@ export class OrderManager {
           "a ticket needs a UUIDv7 orderId, a registered group, a limit price in (0,1), positive shares, a reservation and attributions summing to the shares",
         );
       }
+      // ADR-034 D2.4: before the PLANNED row and before `reserve`, so nothing is recorded, reserved, signed or sent.
+      const offGrid = offGridRefusal(ticket);
+      if (offGrid !== undefined) return offGrid;
       tickets.push(ticket);
     }
     const orderIds = new Set<string>();
@@ -3025,6 +3045,40 @@ function signRequest(order: OrderModel): { assetId: string; side: Side; price: s
   });
 }
 
+/**
+ * The ticket door's grid check (ADR-034 D2.4): the OMS never rounds a share
+ * quantity. The planner floors it once; an off-grid ticket is refused here,
+ * before the PLANNED row and before `reserve`.
+ */
+function offGridRefusal(ticket: ValidatedTicket): OmsResult<never> | undefined {
+  if (isOnShareGrid(ticket.shares, SHARE_SIZE_DECIMALS)) return undefined;
+  return refuse("OMS_SIZE_OFF_GRID", "the ticket's shares are off the venue's 0.01 grid; the OMS never rounds, the planner quantizes (ADR-034 D2.4)", {
+    orderId: ticket.orderId,
+    shares: ticket.shares,
+  });
+}
+
+/**
+ * The amounts a GTC or GTD limit order signs for the order's quantities, in
+ * base units, EXACTLY (ADR-034 D2.4's table; on-grid inputs need no rounding,
+ * `docs/venue/verified-2026-10-06.md` F-102):
+ *
+ * | Order | `makerAmount` | `takerAmount` |
+ * | --- | --- | --- |
+ * | GTC or GTD BUY | shares × price | shares |
+ * | GTC or GTD SELL | shares | shares × price |
+ *
+ * `undefined` when either is not a whole number of base units: no signed
+ * order can then match, and the order is refused. FAK and FOK rows arrive
+ * with ADR-034 R3; their order type is refused before this is reached.
+ */
+function expectedLimitAmounts(order: OrderModel): { readonly maker: bigint; readonly taker: bigint } | undefined {
+  const shares = wholeUnits(order.originalShares, AMOUNT_BASE_DECIMALS);
+  const quote = wholeUnits(mulDecimal(order.originalShares, order.limitPrice), AMOUNT_BASE_DECIMALS);
+  if (shares === undefined || quote === undefined) return undefined;
+  return order.side === "BUY" ? { maker: quote, taker: shares } : { maker: shares, taker: quote };
+}
+
 function identityMismatch(order: OrderModel, identity: SignedOrderIdentity): string | undefined {
   if (identity.tokenId !== order.tokenId) return "the signed order's token differs from the order's";
   if (identity.side !== order.side) return "the signed order's side differs from the order's";
@@ -3033,6 +3087,15 @@ function identityMismatch(order: OrderModel, identity: SignedOrderIdentity): str
   if (identity.expiration !== expiration) return "the signed order's expiration differs from the order's";
   const orderType = order.expirationUnixSeconds === null ? "GTC" : "GTD";
   if (identity.orderType !== orderType) return "the signed order's type differs from the order's (GTC without expiration, GTD with)";
+  // ADR-034 D2.4: the signed amounts are the order's quantities, exactly (one number: D2.5).
+  const expected = expectedLimitAmounts(order);
+  if (expected === undefined) return "the order's shares and price have no exact signed amounts in base units";
+  if (readBaseUnitInteger(identity.makerAmount) !== expected.maker) {
+    return "the signed makerAmount differs from the order's quantities (ADR-034 D2.4: exact, in base units)";
+  }
+  if (readBaseUnitInteger(identity.takerAmount) !== expected.taker) {
+    return "the signed takerAmount differs from the order's quantities (ADR-034 D2.4: exact, in base units)";
+  }
   return undefined;
 }
 

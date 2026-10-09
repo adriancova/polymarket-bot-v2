@@ -24,7 +24,10 @@ import { DOCUMENTED_NOT_CANCELED_REASONS } from "../../../packages/polymarket-se
 import { installNetworkTripwire, type NetworkTripwire } from "../../../packages/polymarket-secure/src/testing/index.js";
 import { PING_INTERVAL_MS } from "../../../packages/polymarket-secure/src/user-stream/index.js";
 
-import { CANCELLATION_CHECK_MS, HEARTBEAT_TIMEOUT_MS, MAX_BATCH_ORDERS, MAX_CANCEL_IDS, POST_ONLY_AFTER_RESTART_MS, STANDARD_TIER } from "./support/mock-clob.js";
+import { VENUE_PRECISION_TABLE } from "../../../packages/execution-planner/src/index.js";
+import { SHARE_SIZE_DECIMALS } from "../../../packages/oms/src/index.js";
+
+import { CANCELLATION_CHECK_MS, HEARTBEAT_TIMEOUT_MS, MAX_BATCH_ORDERS, MAX_CANCEL_IDS, POST_ONLY_AFTER_RESTART_MS, STANDARD_TIER, fixtureAmounts, sharesOf } from "./support/mock-clob.js";
 
 let tripwire: NetworkTripwire;
 beforeEach(() => {
@@ -40,6 +43,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const normalized = (relative: string): string => readFileSync(path.join(REPO_ROOT, relative), "utf8").replace(/\s+/gu, " ");
 const R0916 = normalized("docs/venue/verified-2026-09-16.md");
 const R0930 = normalized("docs/venue/verified-2026-09-30.md");
+const R1006 = normalized("docs/venue/verified-2026-10-06.md");
 const quote = (text: string): string => text.replace(/\s+/gu, " ");
 
 describe("WP-340: every behaviour the mock CLOB acts on is documented, and agrees with the product's own constant", () => {
@@ -124,6 +128,26 @@ describe("WP-340: every behaviour the mock CLOB acts on is documented, and agree
     expect(R0916).toContain(quote("`Poly-RateLimit-Remaining` can be negative after `DELETE /cancel-all` or `DELETE /cancel-market-orders` for tiers that allow a negative cancel balance."));
     // The mock's tier is one that allows the debt.
     expect(STANDARD_TIER.tier).toBe("Standard");
+  });
+
+  it("signing (ADR-034 D2.6 item 2): shares floored to 2 decimals and the quote to tick 0.01's 4, in base units, as A F-99 and F-101 say; the venue books the SIGNED shares", () => {
+    expect(R1006).toContain(quote("| `0.01` | 2 | 2 | 4 |"));
+    expect(R1006).toContain(quote("`size: 2` for each of the six ticks; `amount` 3, 4, 5, 6, 5, 6."));
+    expect(R1006).toContain(quote("So the SDK's 2-decimal share rounding is the documented \"Size decimals\" column, and it is the same for every tick size."));
+    expect(R1006).toContain(quote("verify that the rounded share quantity still meets `min_order_size`, then convert both amounts to six-decimal integers."));
+    // The mock's tick (0.01) row agrees with the product's own constants (the planner's table, the OMS's share grid).
+    expect(VENUE_PRECISION_TABLE.find((row) => row.tickSize === "0.01")).toEqual({ tickSize: "0.01", priceDecimals: 2, sizeDecimals: 2, amountDecimals: 4 });
+    expect(SHARE_SIZE_DECIMALS).toBe(2);
+    // The closeout's E01: BUY 5.009 at 0.5 signs 5.00 shares for 2.5 pUSD; the venue books 5.
+    expect(fixtureAmounts("BUY", "0.5", "5.009")).toEqual({ makerAmount: "2500000", takerAmount: "5000000" });
+    expect(sharesOf("BUY", fixtureAmounts("BUY", "0.5", "5.009"))).toBe("5");
+    // A SELL: 10.129 at 0.52 signs 10.12 shares for 5.2624 pUSD.
+    expect(fixtureAmounts("SELL", "0.52", "10.129")).toEqual({ makerAmount: "10120000", takerAmount: "5262400" });
+    expect(sharesOf("SELL", fixtureAmounts("SELL", "0.52", "10.129"))).toBe("10.12");
+    // On the grid nothing is rounded (A F-102): shares × 10^6 and shares × price × 10^6, exactly.
+    expect(fixtureAmounts("BUY", "0.37", "12.34")).toEqual({ makerAmount: "4565800", takerAmount: "12340000" });
+    // The quote floors to 4 decimals at tick 0.01 (A F-101: "rounded down"); a price off that tick shows it.
+    expect(fixtureAmounts("BUY", "0.333", "1.11")).toEqual({ makerAmount: "369600", takerAmount: "1110000" });
   });
 
   it("every undocumented behaviour the mock assumes (A1–A9) is listed, by id, in the security and recovery report", () => {
