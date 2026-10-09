@@ -27,7 +27,7 @@ import type {
   SignOutcome,
   SignedOrderHandle,
 } from "../../../../packages/oms/src/index.js";
-import { FakeSignedOrder, MAKER, SIGNER, accepted, signatureFor, venueError, venueIdFor } from "../../../unit/oms/support/fake-venue.js";
+import { FakeSignedOrder, MAKER, SIGNER, accepted, limitOrderAmounts, signatureFor, signedShares, venueError, venueIdFor } from "../../../unit/oms/support/fake-venue.js";
 
 export type Transmission =
   | "ACCEPT_LIVE"
@@ -95,7 +95,7 @@ export class ReconWorld {
   readonly violations: string[] = [];
   readonly approvals = new Map<string, boolean>([[EXCHANGE, true]]);
   readonly walletMembers = new Map<string, { state: string; transactionHash: string | null; credited: string | null }>();
-  /** Signed facts by salt. */
+  /** Signed facts by salt: `size` is the SIGNED share amount (ADR-034 D2.5), which the venue books. */
   readonly signed = new Map<string, { readonly tokenId: string; readonly side: "BUY" | "SELL"; readonly price: string; readonly size: string }>();
   readonly pending: { readonly salt: string; readonly atMs: number }[] = [];
   nextTransmission: () => Transmission = () => "ACCEPT_LIVE";
@@ -172,12 +172,14 @@ export class ReconWorld {
     }
     this.#salt += 1;
     const salt = String(this.#salt);
-    this.signed.set(salt, { tokenId: request.assetId, side: request.side, price: request.price, size: request.size });
+    const amounts = limitOrderAmounts(request.side, request.price, request.size);
+    // ADR-034 D2.6 item 2: the venue books what was SIGNED, never what was requested.
+    this.signed.set(salt, { tokenId: request.assetId, side: request.side, price: request.price, size: signedShares({ side: request.side, ...amounts }) });
     const payload = {
       builder: `0x${"0".repeat(64)}`,
       expiration: request.expirationUnixSeconds ?? 0,
       maker: MAKER,
-      makerAmount: "1000000",
+      ...amounts,
       metadata: `0x${"0".repeat(64)}`,
       orderType: request.expirationUnixSeconds === undefined ? "GTC" : "GTD",
       postOnly: request.postOnly === true,
@@ -186,7 +188,6 @@ export class ReconWorld {
       signature: signatureFor(salt),
       signatureType: 3,
       signer: SIGNER,
-      takerAmount: "2000000",
       timestamp: "1790000000000",
       tokenId: request.assetId,
     };

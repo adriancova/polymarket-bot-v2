@@ -21,6 +21,7 @@ export interface VenueFact {
 
 const REPORT_0930 = "docs/venue/verified-2026-09-30.md";
 const REPORT_0916 = "docs/venue/verified-2026-09-16.md";
+const REPORT_1006 = "docs/venue/verified-2026-10-06.md";
 
 export const VENUE_FACTS = Object.freeze({
   BATCH_LIMIT: {
@@ -119,6 +120,22 @@ export const VENUE_FACTS = Object.freeze({
     section: "§2.2",
     quote: "a batch entry's `status` is not meaningful when `success` is false or `errorMsg` is non-empty",
   },
+  SHARE_GRID: {
+    id: "SHARE_GRID",
+    consequence:
+      "A limit order's share quantity is on the venue's 0.01 grid for every tick size. The OMS never rounds one: an off-grid ticket is refused (OMS_SIZE_OFF_GRID) before anything is recorded, reserved or signed, and a signed order whose amounts are not exactly the ticket's is refused (ADR-034 D2.4).",
+    source: REPORT_1006,
+    section: "§3, F-99 and F-101",
+    quote: "So the SDK's 2-decimal share rounding is the documented \"Size decimals\" column, and it is the same for every tick size.",
+  },
+  BASE_UNITS: {
+    id: "BASE_UNITS",
+    consequence:
+      "A signed order's maker and taker amounts are six-decimal integers: the OMS compares them with the ticket's shares and shares × price, exactly, in base units (ADR-034 D2.4).",
+    source: REPORT_1006,
+    section: "§3, F-99",
+    quote: "verify that the rounded share quantity still meets `min_order_size`, then convert both amounts to six-decimal integers.",
+  },
   NO_CLIENT_ORDER_ID: {
     id: "NO_CLIENT_ORDER_ID",
     consequence: "Idempotency is keyed on the persisted signed order (salt and signed fields), never on an invented client order id (handoff §9.11).",
@@ -130,3 +147,9 @@ export const VENUE_FACTS = Object.freeze({
 
 /** The venue's batch placement limit (VENUE_FACTS.BATCH_LIMIT). */
 export const MAX_ORDERS_PER_BATCH = 15;
+
+/** Decimals of a limit order's share quantity, for every tick size (VENUE_FACTS.SHARE_GRID; "Size decimals" is 2). */
+export const SHARE_SIZE_DECIMALS = 2;
+
+/** Decimals of a signed amount: maker and taker amounts are six-decimal integers (VENUE_FACTS.BASE_UNITS). */
+export const AMOUNT_BASE_DECIMALS = 6;

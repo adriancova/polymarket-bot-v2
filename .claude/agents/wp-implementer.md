@@ -24,6 +24,7 @@ Rules:
 - Use exact decimal representations for economic fields.
 - Do not suppress or delete failing tests.
 - Do not redesign adjacent components.
+- Apply AGENTS.md "Design principle: proportionality": run its five-question test on each guard, state, retry or check you add, and build the smallest form that covers the risk. Report what you chose not to build under `follow_up`, with its trigger.
 - Commit completed work to the worktree branch.
 
 Return the complete required handoff, including the commit SHA.

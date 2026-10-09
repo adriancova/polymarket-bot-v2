@@ -457,7 +457,7 @@ describe("6. createLimitOrder's metadata cache: 10 minutes for the market, the c
 
 // ---------------------------------------------------------------------------
 
-describe("7. rounding: the real SDK's signed amounts, per tick size, and the venue client's cross-check", () => {
+describe("7. rounding: the real SDK's signed amounts, per tick size, and the venue client's exact cross-check (ADR-034 D2.4)", () => {
   /** The SDK's quote decimals per tick (`resolveRoundingConfig`, `actions/orders/context.ts` lines 14-31); size is 2 for every tick. */
   const AMOUNT_DECIMALS: Readonly<Record<string, number>> = { "0.1": 3, "0.01": 4, "0.005": 5, "0.0025": 6, "0.001": 5, "0.0001": 6 };
   const CASES = [
@@ -468,7 +468,9 @@ describe("7. rounding: the real SDK's signed amounts, per tick size, and the ven
     { tick: 0.001, price: "0.523" },
     { tick: 0.0001, price: "0.5237" },
   ] as const;
-  const SIZES = ["10", "10.129", "0.999", "123.456789", "7.5"] as const;
+  /** On the 0.01 grid: "10", "12.34", "7.5". Off it: "10.129", "0.999", "123.456789". */
+  const SIZES = ["10", "10.129", "0.999", "123.456789", "7.5", "12.34"] as const;
+  const ON_GRID = /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,2})?$/u;
 
   /** `decimal` × 10^6, exactly (at most 6 fraction digits here). */
   function baseUnits(decimal: string): bigint {
@@ -512,32 +514,94 @@ describe("7. rounding: the real SDK's signed amounts, per tick size, and the ven
     }).factory;
   }
 
+  /**
+   * A venue client over the REAL SDK, plus the real SDK port beneath it: the port is asked directly for what the
+   * client itself now refuses to ask (an off-grid size), so the SDK's own rounding (A F-101) stays pinned.
+   */
+  async function realSdkClientWithPort(markets: readonly ContractMarket[]): Promise<{
+    client: SecureVenueClient;
+    probe: MockSignerProbe;
+    signDirectly: (request: { assetId: string; side: "BUY" | "SELL"; price: string; size: string }) => Promise<void>;
+  }> {
+    const real = createPinnedSdkFactoryForContract();
+    let port: Awaited<ReturnType<typeof real>> | undefined;
+    const { client, probe } = await realSdkClient(markets, undefined, async (args) => {
+      port = await real(args);
+      return port;
+    });
+    return {
+      client,
+      probe,
+      signDirectly: async (request) => {
+        if (port === undefined) throw new Error("the SDK port was never built");
+        // The SDK's OrderSide is the string enum {BUY: "BUY", SELL: "SELL"}; the request is the SDK's own shape.
+        await port.createLimitOrder(request as never).catch(() => undefined);
+      },
+    };
+  }
+
+  /** `amount` moved by `delta` base units. */
+  function nudged(amount: string, delta: bigint): string {
+    return (BigInt(amount) + delta).toString();
+  }
+
   for (const { tick, price } of CASES) {
-    it(`tick ${String(tick)}: shares rounded down to 2 decimals, the quote to ${String(AMOUNT_DECIMALS[String(tick)])}; the cross-check accepts them`, async () => {
+    it(`tick ${String(tick)}: the SDK floors shares to 2 decimals and the quote to ${String(AMOUNT_DECIMALS[String(tick)])}; the client asks only on-grid sizes and accepts exactly the SDK's amounts, never one base unit off`, async () => {
       const condition = `0x${"c".repeat(63)}${String(CASES.findIndex((entry) => entry.tick === tick))}`;
-      const { client, probe } = await realSdkClient([market(condition, tick, false, [V2_UP, V2_DOWN])]);
+      const { client, probe, signDirectly } = await realSdkClientWithPort([market(condition, tick, false, [V2_UP, V2_DOWN])]);
+      // Warm the port (the client builds it on its first call), with an on-grid order.
+      await client.createLimitOrder({ assetId: V2_UP, side: "BUY", price, size: "10" });
       for (const side of ["BUY", "SELL"] as const) {
         for (const size of SIZES) {
-          const before = probe.signTypedDataRequests.length;
-          expect(await client.createLimitOrder({ assetId: V2_UP, side, price, size })).toMatchObject({ kind: "FAILED" });
-          const signed = probe.signTypedDataRequests[before]?.message;
           const want = expected(price, size, tick, side);
-          expect({ makerAmount: signed?.["makerAmount"], takerAmount: signed?.["takerAmount"] }, `${side} ${size} @ ${price}`).toEqual(want);
-          // The venue client accepts exactly these amounts (its cross-check bounds them).
-          const accepting = await createSecureVenueClientForTesting(
-            { runModeContext: LIVE_SHAPED_CONTEXT, signer: createMockSignerHandle().handle },
-            fakeSigning(want),
-          );
-          expect(await accepting.createLimitOrder({ assetId: V2_UP, side, price, size }), `${side} ${size} @ ${price}`).toMatchObject({ kind: "SIGNED" });
+          // 1. The real SDK's own rounding, asked directly (A F-101): shares floored to 0.01, the quote to Amount decimals.
+          const before = probe.signTypedDataRequests.length;
+          await signDirectly({ assetId: V2_UP, side, price, size });
+          const direct = probe.signTypedDataRequests[before]?.message;
+          expect({ makerAmount: direct?.["makerAmount"], takerAmount: direct?.["takerAmount"] }, `SDK ${side} ${size} @ ${price}`).toEqual(want);
+          // 2. The venue client.
+          const viaClient = await client.createLimitOrder({ assetId: V2_UP, side, price, size });
+          if (!ON_GRID.test(size)) {
+            // ADR-034 D2.4: an off-grid size is refused before the SDK is called; nothing more is signed.
+            expect(viaClient, `${side} ${size}`).toMatchObject({ kind: "FAILED", error: { kind: "INVALID_REQUEST", effect: "NOT_SENT" } });
+            expect(probe.signTypedDataRequests.length, `${side} ${size}`).toBe(before + 1);
+            continue;
+          }
+          // On the grid, the SDK needs no rounding (A F-102): the amounts are shares and shares × price, exactly.
+          const signed = probe.signTypedDataRequests[before + 1]?.message;
+          expect({ makerAmount: signed?.["makerAmount"], takerAmount: signed?.["takerAmount"] }, `client ${side} ${size} @ ${price}`).toEqual(want);
+          const exactShares = baseUnits(size).toString();
+          expect(side === "BUY" ? want.takerAmount : want.makerAmount).toBe(exactShares);
+          // The cross-check accepts exactly these amounts, and refuses each one moved by one base unit.
+          for (const [label, amounts, kind] of [
+            ["exact", want, "SIGNED"],
+            ["makerAmount + 1", { ...want, makerAmount: nudged(want.makerAmount, 1n) }, "FAILED"],
+            ["makerAmount − 1", { ...want, makerAmount: nudged(want.makerAmount, -1n) }, "FAILED"],
+            ["takerAmount + 1", { ...want, takerAmount: nudged(want.takerAmount, 1n) }, "FAILED"],
+            ["takerAmount − 1", { ...want, takerAmount: nudged(want.takerAmount, -1n) }, "FAILED"],
+          ] as const) {
+            const checking = await createSecureVenueClientForTesting(
+              { runModeContext: LIVE_SHAPED_CONTEXT, signer: createMockSignerHandle().handle },
+              fakeSigning(amounts),
+            );
+            expect((await checking.createLimitOrder({ assetId: V2_UP, side, price, size })).kind, `${label}: ${side} ${size} @ ${price}`).toBe(kind);
+          }
         }
       }
       await client.close();
     });
   }
 
-  it("CO3-N1 still holds: an off-grid size is signed for less than was asked (10.129 → 10.12 shares)", async () => {
-    const { client, probe } = await realSdkClient(await capturedMarkets());
-    await client.createLimitOrder({ assetId: V2_UP, side: "BUY", price: "0.52", size: "10.129" });
-    expect(probe.signTypedDataRequests[0]?.message["takerAmount"]).toBe("10120000");
+  it("CO3-N1 at the adapter (ADR-034 D2.4): the SDK would sign 10.129 as 10.12 shares, so the client refuses 10.129 before the SDK runs", async () => {
+    const { client, probe, signDirectly } = await realSdkClientWithPort(await capturedMarkets());
+    await client.createLimitOrder({ assetId: V2_UP, side: "BUY", price: "0.52", size: "10" });
+    const before = probe.signTypedDataRequests.length;
+    await signDirectly({ assetId: V2_UP, side: "BUY", price: "0.52", size: "10.129" });
+    expect(probe.signTypedDataRequests[before]?.message["takerAmount"]).toBe("10120000");
+    expect(await client.createLimitOrder({ assetId: V2_UP, side: "BUY", price: "0.52", size: "10.129" })).toMatchObject({
+      kind: "FAILED",
+      error: { kind: "INVALID_REQUEST", effect: "NOT_SENT" },
+    });
+    expect(probe.signTypedDataRequests.length).toBe(before + 1);
   });
 });

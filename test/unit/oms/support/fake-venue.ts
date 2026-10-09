@@ -19,6 +19,37 @@ import type {
 export const MAKER = "0x1111111111111111111111111111111111111111";
 export const SIGNER = "0x2222222222222222222222222222222222222222";
 
+/**
+ * The amounts the pinned SDK signs for a GTC or GTD limit order (ADR-034
+ * D2.4; `docs/venue/verified-2026-10-06.md` F-101 `computeLimitOrderAmounts`):
+ * the share quantity floored to 2 decimals, the quote (price × shares)
+ * floored to the tick's Amount decimals, both in 6-decimal base units. The
+ * fakes have no tick size, so the quote is floored at the finest documented
+ * Amount decimals (6: ticks 0.0025 and 0.0001); for an on-grid size and a
+ * tick-grid price the quote is exact at every tick (F-102), so the result is
+ * the SDK's. Exact integers; never a `number`.
+ */
+export function limitOrderAmounts(side: "BUY" | "SELL", priceText: string, sizeText: string): { readonly makerAmount: string; readonly takerAmount: string } {
+  const rational = (text: string): { readonly n: bigint; readonly d: bigint } => {
+    const [whole = "0", fraction = ""] = text.split(".");
+    return { n: BigInt(`${whole}${fraction}`), d: 10n ** BigInt(fraction.length) };
+  };
+  const size = rational(sizeText);
+  const price = rational(priceText);
+  const shares = ((size.n * 1_000_000n) / size.d / 10_000n) * 10_000n;
+  const quote = (price.n * shares) / price.d;
+  const [maker, taker] = side === "BUY" ? [quote, shares] : [shares, quote];
+  return { makerAmount: maker.toString(10), takerAmount: taker.toString(10) };
+}
+
+/** The share quantity a signed limit order carries (its BUY `takerAmount` or SELL `makerAmount`), as a canonical decimal. */
+export function signedShares(identity: { readonly side: "BUY" | "SELL"; readonly makerAmount: string; readonly takerAmount: string }): string {
+  const units = BigInt(identity.side === "BUY" ? identity.takerAmount : identity.makerAmount);
+  const whole = (units / 1_000_000n).toString(10);
+  const fraction = (units % 1_000_000n).toString(10).padStart(6, "0").replace(/0+$/u, "");
+  return fraction === "" ? whole : `${whole}.${fraction}`;
+}
+
 /** The synthetic signature for a salt. Distinctive, so a leak is easy to find. */
 export function signatureFor(salt: string): string {
   return `0x5157${salt.padStart(8, "0")}c0ffee${salt.padStart(8, "0")}`;
@@ -132,7 +163,7 @@ export class FakeVenue implements OmsVenuePort {
       builder: `0x${"0".repeat(64)}`,
       expiration: request.expirationUnixSeconds ?? 0,
       maker: MAKER,
-      makerAmount: "1000000",
+      ...limitOrderAmounts(request.side, request.price, request.size),
       metadata: `0x${"0".repeat(64)}`,
       orderType: request.expirationUnixSeconds === undefined ? "GTC" : "GTD",
       postOnly: request.postOnly === true,
@@ -141,7 +172,6 @@ export class FakeVenue implements OmsVenuePort {
       signature: signatureFor(salt),
       signatureType: 3,
       signer: SIGNER,
-      takerAmount: "2000000",
       timestamp: "1790000000000",
       tokenId: request.assetId,
     };
