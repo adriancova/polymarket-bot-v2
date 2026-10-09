@@ -103,15 +103,16 @@ Not every invocation reaches a command:
 it. A `0x` id is refused as a usage error. The verification compares
 `--asset`, as text, with the token of every order the open-orders read lists,
 and that read lists decimal token ids only. The venue documents no hex token
-lexeme: its one hex example is a placeholder, and the wire lexeme of a V2
-position id is undocumented (`docs/venue/verified-2026-09-30.md` §2.1 and §12,
-U-13). A hex `--asset` would select nothing in that read, so `cancel-market`
+lexeme: its one hex example is a placeholder, and a V2 position id is a decimal
+string on the wire (`docs/venue/verified-2026-10-05.md` §12, U-13 resolved:
+"Keep the selected ID as a decimal string", S-D02). A hex `--asset` would
+select nothing in that read, so `cancel-market`
 could report `COMPLETED` while an order in that token was still open. Convert
 a hex id to decimal before you pass it.
 
 The facts behind each endpoint are in `venue-facts.ts`, and every quote there
 is checked against its dated report:
-- `docs/venue/verified-2026-09-30.md` §2.1, §2.5, C-11, E-05, E-14, E-15, E-16, §W.3, U-13;
+- `docs/venue/verified-2026-09-30.md` §2.1, §2.5, C-11, E-05, E-14, E-15, E-16, §W.3, U-13 (U-13 is resolved by `docs/venue/verified-2026-10-05.md` §12: decimal);
 - `docs/venue/verified-2026-09-16.md` §5 and D-21.
 
 ## Confirmation (destructive commands)
