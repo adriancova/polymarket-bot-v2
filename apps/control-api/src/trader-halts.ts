@@ -16,9 +16,12 @@
  *
  * - **Open** is `status <> 'RESOLVED'`: the predicate of the table's own partial
  *   index `incidents_open_idx` (`db/migrations/0007_ops.up.sql`). `OPEN` and
- *   `MITIGATING` both count. Only an operator's resolution — `RESOLVED`, which
- *   the table's checks tie to a `resolved_at` and a `resolution` — removes a
- *   row. This process never resolves one: it is READ-ONLY toward the trader and
+ *   `MITIGATING` both count. Only a resolution — `RESOLVED`, which the table's
+ *   checks tie to a `resolved_at` and a `resolution` — removes a row: since
+ *   `C1-HALTS` a NEW RUN of the same instance resolves its earlier
+ *   infrastructure halts when it starts (`apps/trader/src/halt-record.ts`,
+ *   `SUPERSEDED_BY_A_NEW_RUN`), and an operator resolves every other one. This
+ *   process never resolves one: it is READ-ONLY toward the trader and
  *   toward `ops.incidents` (the read runs in a `READ ONLY` transaction), and
  *   closing an incident is not its job.
  * - **The trader's rows** are every row whose `incident_key`, upper-cased,
@@ -183,6 +186,12 @@ const IncidentRow = z.strictObject({
   severity: text(16),
   status: text(16),
   failure_class: text(64),
+  /**
+   * Read (the adapter selects the column, and the door refuses a missing or
+   * extra one) and NOT shown: `C1-HALTS` — every halt ends the run, so the
+   * §9.9 rung the trader used to write was never acted on, and since then it
+   * writes `NULL`. Older rows may still carry one.
+   */
   action: nullable(text(64)),
   market_id: nullable(text(64)),
   instance_id: nullable(text(64)),
@@ -223,7 +232,6 @@ export interface OpenTraderHaltRow {
   readonly environment: string;
   readonly accountRef: string | null;
   readonly failureClass: string;
-  readonly action: string | null;
   readonly marketId: string | null;
   readonly instanceId: string | null;
   readonly detail: string;
@@ -374,7 +382,6 @@ export function readTraderHaltFetch(input: unknown): TraderHaltReadResult {
           environment: shown(row.environment),
           accountRef: shown(row.account_ref),
           failureClass: shown(row.failure_class),
-          action: shown(row.action),
           marketId: shown(row.market_id),
           instanceId: shown(row.instance_id),
           detail: shown(row.detail),
@@ -612,8 +619,9 @@ export class TraderHaltCache {
 
 const STATE_NOTES: Readonly<Record<TraderHaltState, string>> = Object.freeze({
   OPEN:
-    "A trader halted and no operator has resolved its ops.incidents row: every TRADER_HALT row whose status is " +
-    "not RESOLVED is counted here, read on this request. This process never resolves one.",
+    "A trader halted and its ops.incidents row is not resolved: every TRADER_HALT row whose status is not " +
+    "RESOLVED is counted here, read on this request. Every halt ended its run. A later run of the same instance " +
+    "resolves the infrastructure halts when it starts; an operator resolves the rest. This process never resolves one.",
   NONE_OPEN:
     "This request's read of ops.incidents found no open TRADER_HALT row. That is not proof of no halt: a halt " +
     "whose record could not land (the trader logged HALT RECORD NOT DURABLE or HALT RECORD UNCONFIRMED) has no row.",

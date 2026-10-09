@@ -123,20 +123,18 @@ async function traderRecords(halts: TraderHalts): Promise<void> {
 
 function halts(): TraderHalts {
   return [
-    { scope: { kind: "GLOBAL" }, code: "TRANSPORT_UNAVAILABLE", detail: "redis did not answer", at: "2026-10-04T00:00:01.000Z", action: "FULL_HALT" },
+    { scope: { kind: "GLOBAL" }, code: "TRANSPORT_UNAVAILABLE", detail: "redis did not answer", at: "2026-10-04T00:00:01.000Z" },
     {
       scope: { kind: "MARKET", marketId: seeded().marketId },
       code: "BOOK_DESYNCHRONIZED",
       detail: "book hash mismatch",
       at: "2026-10-04T00:00:02.000Z",
-      action: "CANCEL_RESTING_ORDERS",
     },
     {
       scope: { kind: "STRATEGY_INSTANCE", instanceId: seeded().instanceId },
       code: "LEDGER_POSTING_REFUSED",
       detail: "posting refused",
       at: "2026-10-04T00:00:03.250Z",
-      action: "MANAGE_KNOWN_POSITIONS_ONLY",
     },
   ];
 }
@@ -231,15 +229,17 @@ describe("a trader's halts, written by its own writer, read back through the con
           environment: "PAPER",
           accountRef: "paper-account",
           failureClass: "LEDGER_POSTING_REFUSED",
-          action: "MANAGE_KNOWN_POSITIONS_ONLY",
           marketId: null,
           instanceId: seeded().instanceId,
           detail: "posting refused",
           openedAt: "2026-10-04T00:00:03.250000Z",
           irregularities: [],
         });
-        expect(section.listed?.[1]).toMatchObject({ marketId: seeded().marketId, instanceId: null, action: "CANCEL_RESTING_ORDERS" });
-        expect(section.listed?.[2]).toMatchObject({ incidentKey: "TRADER_HALT:GLOBAL", instanceId: seeded().instanceId, action: "FULL_HALT" });
+        expect(section.listed?.[1]).toMatchObject({ marketId: seeded().marketId, instanceId: null });
+        expect(section.listed?.[2]).toMatchObject({ incidentKey: "TRADER_HALT:GLOBAL", instanceId: seeded().instanceId });
+        // C1-HALTS: the trader writes `action` NULL, and the API shows no action.
+        expect(section.listed?.every((row) => !("action" in row))).toBe(true);
+        expect((await snapshot()).map((row) => (row as { action: unknown }).action)).toEqual([null, null, null]);
 
         const body = await metrics(served);
         expect(body).toContain('control_trader_halts_state{state="OPEN"} 1');

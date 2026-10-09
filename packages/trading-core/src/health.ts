@@ -15,28 +15,17 @@
  * | --- | --- |
  * | run mode | `runMode`, `maximumRunMode` |
  * | queue depths | `queues` (the full §8.3 metric set per queue) |
- * | halt reason | `halts` (every latched record: scope, code, action, detail, instant) |
+ * | halt reason | `halts` (every latched record: scope, code, detail, instant, and `action`, which is always `FULL_HALT`: every halt ends the run) |
  * | risk-refusal counts | `risk.refusalsByCode`, `risk.refusedExits`, `risk.approvals` |
  *
- * ## The risk-refusal counts are the risk-seam caveat made visible
+ * ## The risk-refusal counts make a refused exit visible
  *
- * This section used to open: "`WP-220`'s accepted residual: every exit the
- * static-bracket strategy emits is a `POSITION` intent, and `packages/risk`
- * derives its disposition from the intent TYPE alone, so a protective
- * reduction is classified `ENTRY` … That is the accepted posture … until the
- * risk-side follow-up lands" — and that follow-up landed as `RISK-2`
- * (`133eac1`), so the sentence is superseded: the current caveat, what it
- * says and why, is {@link RISK_SEAM_CAVEAT} below. What has not changed is the
- * rule: this process must NOT weaken risk policy, re-tag the intent or bypass
- * the engine to compensate for anything the seam does.
- *
- * What it CAN do — and does — is refuse to let the consequence be invisible.
+ * This process must NOT weaken risk policy, re-tag an intent or bypass the
+ * engine. What it does instead is refuse to let a refused exit be invisible:
  * `refusedExits` counts refusals of intents the emitting strategy tagged as
  * protective (`sb.protected-reduce` / `sb.take-profit`), broken down by the
- * risk reason code that refused them, so an operator sees "the exits are being
- * refused, and here is the code that did it" on the health surface rather than
- * discovering it in an incident. `riskSeamCaveat` states the whole thing in
- * one string that travels with the snapshot.
+ * risk reason code that refused them, and `riskSeamCaveat`
+ * ({@link RISK_SEAM_CAVEAT}) says in one sentence what that counter means.
  *
  * DETERMINISM. Counters are integers, maps are emitted in sorted key order, and
  * no method reads a clock: every instant is supplied. Two identical runs
@@ -81,45 +70,15 @@ import type { QueueMetrics } from "./queue.js";
 import type { ReservationMetrics } from "./reservations.js";
 
 /**
- * The disclosure that travels with every health snapshot.
- *
- * It is a constant rather than prose in a comment because an operator reading
- * the health surface is exactly the person who needs it, and a caveat that only
- * exists in a README is a caveat nobody reads during an incident.
- *
- * CORRECTED by `BOOT-1` (`RISK-2` residual R2). Until then this constant
- * shipped, on every `HealthSnapshot.riskSeamCaveat` and through the control
- * API, the text quoted in its first sentence below — a statement `RISK-2`
- * (`133eac1`) made false. The superseded wording is kept inside the constant,
- * quoted, so an operator who saw the old caveat can recognise what changed.
- *
- * CORRECTED AGAIN by `BRACKET-1a`, the same way. `BOOT-1`'s text went on to
- * name `RISK-2` residual 5 as "THE CAVEAT NOW" — the strategy's protective
- * reduction had no order track, so the instance paused on its own exit. That
- * round gave the reduction a track, so the claim is quoted as superseded too,
- * and the constant now states only what the health surface still has to warn
- * about. The quotation deliberately omits the old present-tense marker, so a
- * pin can prove the caveat no longer makes the claim.
+ * The one sentence that travels with every health snapshot, saying what
+ * `refusedExits` counts. The field's shape is the control API's (its health
+ * door requires the string); `C1-HALTS` (TRADE-09) cut the text to the present
+ * tense — until then it quoted two superseded claims (`RISK-2`, `BRACKET-1a`).
  */
 export const RISK_SEAM_CAVEAT =
-  'SUPERSEDED (RISK-2, 133eac1): this caveat used to read "WP-220 accepted residual: every ' +
-  "exit the static-bracket strategy emits is a §7.7 POSITION intent, and packages/risk derives " +
-  "the disposition from the intent TYPE alone, so a protective reduction is classified ENTRY. " +
-  'Protective reductions are therefore refused …" — that is no longer true: packages/risk ' +
-  "decides disposition from the intent SHAPE and the supplied portfolio, never from a tag — " +
-  "a POSITION resolving to a SELL fully covered by the instance's confirmed holding is an " +
-  "EXIT and clears the seam; anything with a BUY leg, an over-held sell and every QUOTE/BASKET " +
-  "stays ENTRY — so refusedExits reads 0 in a healthy run. SUPERSEDED (BRACKET-1a): it then " +
-  'read "RISK-2 residual 5 — planProtectedReduce creates no order track, so when the ' +
-  "instance's own exit FILLS the strategy cannot attribute it (SB.UNATTRIBUTED_FILL → " +
-  "SB.POSITION_MISMATCH → SB.NO_BLIND_FLATTEN → SB.PAUSED) and the instance ends PAUSED after " +
-  'its round trip …" — that is no longer true either: the static-bracket protective reduction ' +
-  "carries its own order track, its fill closes the bracket (SB.EXIT_FILLED, SB.CLOSED), and " +
-  "the instance re-arms under its configured reentry limits. What this surface still counts: " +
-  "refusedExits is the number of refusals of intents the strategy TAGGED protective — a tag " +
-  "read for this counter only, never for disposition — and a covered sell that establishes " +
-  "complement-leg exposure is an EXIT at the seam. The trader does not weaken risk policy, " +
-  "re-tag intents or bypass the engine to compensate; it counts refusals here.";
+  "refusedExits counts risk refusals of intents the strategy tagged protective; a sell covered " +
+  "by the instance's confirmed holding is an EXIT at the risk seam, and the trader does not " +
+  "weaken risk policy, re-tag intents or bypass the engine to compensate.";
 
 /** Counters for the §14.3 `risk` family plus the seam's own visibility. */
 export interface RiskHealth {
@@ -502,7 +461,7 @@ export interface HealthSnapshot {
   readonly maximumRunMode: string;
   /** `true` while no scope is halted and the loop may make decisions. */
   readonly healthy: boolean;
-  readonly halts: readonly HaltRecord[];
+  readonly halts: readonly HealthHalt[];
   readonly queues: readonly QueueMetrics[];
   readonly loop: LoopHealth;
   readonly risk: RiskHealth;
@@ -516,6 +475,16 @@ export interface HealthSnapshot {
   /** The instant this snapshot was taken, from the injected clock. */
   readonly asOf: string;
 }
+
+/**
+ * One latched halt on the health surface. `C1-HALTS` removed the §9.9 action
+ * rung from {@link HaltRecord}: every halt ends the run, so no rung was ever
+ * acted on. The control API's health door and `@polymarket-bot/observability`'s
+ * `trader_halt_info` label still REQUIRE an `action` (both outside that round's
+ * paths), so the surface states the one action that happens, `FULL_HALT`,
+ * until a round granted those paths drops the field.
+ */
+export type HealthHalt = HaltRecord & { readonly action: "FULL_HALT" };
 
 function sortedCounts(counts: ReadonlyMap<string, number>): Readonly<Record<string, number>> {
   const out: Record<string, number> = Object.create(null) as Record<string, number>;
@@ -695,7 +664,7 @@ export class HealthState {
       runMode: this.runMode,
       maximumRunMode: this.maximumRunMode,
       healthy: input.halts.length === 0,
-      halts: input.halts,
+      halts: Object.freeze(input.halts.map((halt): HealthHalt => Object.freeze({ ...halt, action: "FULL_HALT" }))),
       queues: input.queues,
       loop: Object.freeze({ ...this.#loop }),
       risk: Object.freeze({

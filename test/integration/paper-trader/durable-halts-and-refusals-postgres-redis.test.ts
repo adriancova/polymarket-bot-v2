@@ -276,6 +276,15 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
       // One row per run's halt: run 1's outage, then run 2's resync.
       const rows = await incidents(context);
       expect(rows.map((row) => row.failure_class)).toEqual(["TRANSPORT_UNAVAILABLE", "TRANSPORT_RESYNC_REQUIRED"]);
+      // `C1-HALTS` (HALT-PAGES): run 2's start superseded run 1's
+      // infrastructure halt, so it no longer pages; run 2's own halt is open.
+      expect(rows[0]).toMatchObject({
+        failure_class: "TRANSPORT_UNAVAILABLE",
+        status: "RESOLVED",
+        resolution: `superseded by run ${registered.runId}`,
+      });
+      expect(rows[0]?.resolved_at).not.toBeNull();
+      expect(run.text()).toContain("halt rows: 1 earlier OPEN infrastructure halt row(s) of this run's instance(s) marked RESOLVED");
       expect(rows[1]).toMatchObject({
         incident_key: "TRADER_HALT:GLOBAL",
         environment: "PAPER",
@@ -283,7 +292,7 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
         severity: "PAGE",
         status: "OPEN",
         failure_class: "TRANSPORT_RESYNC_REQUIRED",
-        action: "FULL_HALT",
+        action: null,
         market_id: null,
         instance_id: registered.instanceId,
         detail: halts[0]?.detail,

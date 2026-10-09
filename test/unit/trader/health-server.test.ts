@@ -43,7 +43,6 @@ function snapshotWithPnl(): HealthSnapshot {
         code: "BOOK_DESYNCHRONIZED",
         detail: "a book refused an update",
         at: "2026-09-16T00:00:00Z",
-        action: "CANCEL_RESTING_ORDERS",
       },
     ],
     queues: [

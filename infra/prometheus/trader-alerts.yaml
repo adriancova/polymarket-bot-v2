@@ -46,7 +46,9 @@ groups:
     rules:
       # CONTROL-2 (H1R1-HALT-INVISIBLE): a halted trader exits 75, often before
       # a scrape; its OPEN TRADER_HALT row in ops.incidents outlives it, and
-      # the control API reads it on every authorized scrape. Pages on an open
+      # the control API reads it on every authorized scrape. C1-HALTS: the next
+      # run's start resolves the instance's infrastructure halt rows, so the
+      # page stops; accounting and order-state rows stay open for an operator. Pages on an open
       # halt AND on a read that failed (UNKNOWN is never "no halts").
       # NOT_CONFIGURED does not page: it is a deployment that reads nothing,
       # which the operations panel shows.
@@ -57,4 +59,4 @@ groups:
           severity: page
         annotations:
           summary: "A trader halt is open in ops.incidents, or the control API cannot tell"
-          description: "control_trader_halts_state is OPEN (an unresolved TRADER_HALT row; control_trader_halts_open says which scope) or UNKNOWN (the control API's read of ops.incidents failed, timed out or was refused). Read GET /v1/health's traderHalts section for the rows or the reason. Only an operator resolves a halt row; the control API never does."
+          description: "control_trader_halts_state is OPEN (an unresolved TRADER_HALT row; control_trader_halts_open says which scope) or UNKNOWN (the control API's read of ops.incidents failed, timed out or was refused). Read GET /v1/health's traderHalts section for the rows or the reason. Every halt ended its run. A new run of the same instance resolves its infrastructure halt rows when it starts (C1-HALTS); an operator resolves every other row (apps/trader/README.md, Halts). The control API never resolves one."

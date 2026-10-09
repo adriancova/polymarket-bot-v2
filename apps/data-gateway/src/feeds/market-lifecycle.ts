@@ -212,7 +212,8 @@
  * `feeds/polymarket.ts` rule). A poll failure — transport, non-2xx, or a
  * body the door refuses — opens a NOTIFY incident scoped to the market
  * (`GATEWAY_LIFECYCLE_POLL_FAILED` / `GATEWAY_LIFECYCLE_STATE_INVALID`) and
- * derives nothing; `consecutiveFailureThreshold` failed polls in a row is a
+ * derives nothing, and that market's next valid poll closes both
+ * (`C1-HALTS`: the close is published, so a consumer un-pauses); `consecutiveFailureThreshold` failed polls in a row is a
  * STALL: `FeedStale` is published and the gateway's `GATEWAY_FEED_STALL`
  * incident opens exactly as it does for a silent socket (acceptance 2), and
  * the next successful poll closes the episode. A poll cycle that would
@@ -701,6 +702,10 @@ export class MarketLifecycleFeedDriver {
       return;
     }
     this.#pollSucceeded(receipt);
+    // `C1-HALTS` (DQ-CLOSE): THIS market's own poll answered with a valid
+    // state, so its own poll-failure incidents end here — and only its own:
+    // another market's failure is not cleared by this market's success.
+    this.#closeMarketPollIncidents(market);
     const frame: CitedFrame = { receipt, rawFrameIngestSeq: outcome.ingestSeq, connectionId };
     if (market.replayOwed) {
       const replayed = await this.#replay(market, frame);
@@ -1085,6 +1090,18 @@ export class MarketLifecycleFeedDriver {
       this.#options.dispatcher.markIncidentClosed(this.#options.feedId, "GATEWAY_FEED_STALL");
     }
     this.#consecutiveFailures = 0;
+  }
+
+  /**
+   * `C1-HALTS` (DQ-CLOSE): closes one market's `GATEWAY_LIFECYCLE_POLL_FAILED`
+   * and `GATEWAY_LIFECYCLE_STATE_INVALID` keys after its own valid poll. The
+   * dispatcher publishes a close only for a key that was open, so a healthy
+   * market's every poll publishes nothing.
+   */
+  #closeMarketPollIncidents(market: MarketState): void {
+    const scope = `${this.#options.feedId}:${market.config.internalMarketId}`;
+    this.#options.dispatcher.markIncidentClosed(scope, "GATEWAY_LIFECYCLE_POLL_FAILED");
+    this.#options.dispatcher.markIncidentClosed(scope, "GATEWAY_LIFECYCLE_STATE_INVALID");
   }
 
   #pollFailed(market: MarketState, reasonCode: string, detail: string): void {

@@ -194,7 +194,7 @@ describe("BT1-R3 — on the REAL core, a latched halt stops the replay where the
     const assembled = assemble();
     if (!assembled.ok) throw new Error(assembled.refusal.detail);
     const core = assembled.core;
-    core.trader.halts.halt({ kind: "GLOBAL" }, "OPERATOR_HALT", "latched before the run", FIRST_INSTANT.receivedAt);
+    core.trader.halts.halt({ kind: "GLOBAL" }, "RUNTIME_PERSISTENCE_FAILED", "latched before the run", FIRST_INSTANT.receivedAt);
     const outcome = await runBacktest({
       datasetDirectory: FIXTURE,
       normalizer: normalizedEnvelopeNormalizer(sha256Hex),
@@ -206,7 +206,7 @@ describe("BT1-R3 — on the REAL core, a latched halt stops the replay where the
     expect(outcome.ok).toBe(false);
     if (outcome.ok || !("refusal" in outcome)) return;
     expect(outcome.refusal.details).toMatchObject({
-      halts: "OPERATOR_HALT@GLOBAL",
+      halts: "RUNTIME_PERSISTENCE_FAILED@GLOBAL",
       stoppedAt: "BEFORE_INGEST",
       ingestSeq: "1",
     });

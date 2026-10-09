@@ -44,9 +44,8 @@ import {
   ingested,
   recordedEvents,
   restingEntryConfig,
-  restingEntryTradeEvent,
 } from "./support/fixture.js";
-import { assembleOrThrow, driveRecordedRun } from "./support/run.js";
+import { assembleOrThrow, driveRecordedRun, pauseInstanceByWatchdog, restingTradeAfterPause } from "./support/run.js";
 
 describe("WP-220 composition-root obligations", () => {
   it("OBLIGATION 1 — timestamps are strict UTC: offsets normalised HERE, refused by the strategy", async () => {
@@ -296,37 +295,22 @@ describe("WP-220 composition-root obligations", () => {
     // asserted the constant and a ledger length that any successful run has).
     expect(FILLS_ARE_DELIVERED_WHILE_PAUSED).toBe(true);
 
-    // 1. PAUSE THE INSTANCE FOR REAL. A one-deep outbox cannot take the second
-    //    decision of an iteration, `packages/strategy-runtime` answers HALTED
-    //    and pauses the instance, and the loop latches its halt.
-    const run = assembleOrThrow({
-      config: restingEntryConfig({
-        queues: { ingestMaximumDepth: 1024, outboxMaximumDepth: 1 },
-      }),
-    });
+    // 1. PAUSE THE INSTANCE FOR REAL, with no halt: its watchdog contains an
+    //    overrunning evaluation (C1-HALTS: the old route — a persistence
+    //    failure's halt, then a release — is gone; every halt ends the run).
+    const run = assembleOrThrow({ config: restingEntryConfig() });
     for (const event of recordedEvents()) run.trader.loop.ingest(event);
     await run.trader.loop.drain();
+    await pauseInstanceByWatchdog(run);
     const instance = run.trader.registry.get(INSTANCE_ID);
     expect(instance?.runtime.instanceStatus()).toBe("PAUSED");
-
-    // 2. §4.2 outranks obligation 8 while the scope is HALTED, and
-    //    `RUNTIME_PERSISTENCE_FAILED` halts as well as pauses — so the operator
-    //    reconciles and releases the latch against the §7.1 evidence the
-    //    controller demands. The instance is now PAUSED and NOT halted, which
-    //    is the state this obligation is about.
-    expect(
-      run.trader.halts.release(
-        { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_ID },
-        { authoritativeSnapshotApplied: true, reason: "decision store reconciled" },
-      ),
-    ).toBe(true);
-    expect(instance?.runtime.instanceStatus()).toBe("PAUSED");
+    expect(run.trader.loop.health().halts).toEqual([]);
 
     const ledgerBefore = run.trader.loop.ledger().length;
     const refusedBefore = run.trader.loop.health().loop.refusedEvaluations;
 
-    // 3. The resting entry fills.
-    run.trader.loop.ingest(restingEntryTradeEvent());
+    // 2. The resting entry fills.
+    run.trader.loop.ingest(restingTradeAfterPause());
     await run.trader.loop.drain();
 
     // BOOKED — "the half a paused strategy would otherwise lose".

@@ -17,16 +17,11 @@
  *
  * ## Two things it deliberately does NOT do
  *
- * 1. **It does not compensate for the risk-seam caveat.** `WP-220`'s accepted
- *    residual is that every exit the static-bracket strategy emits is a
- *    `POSITION` intent, which `packages/risk` classifies `ENTRY`, so protective
- *    reductions are refused inside the entry cutoff, on `CLOSE_ONLY` markets,
- *    and — under the default `requirePositiveNetEdgeForEntries` — for want of an
- *    `expectedNetEdge`. This pipeline does not re-tag the intent, does not
- *    resize it, does not lower a policy bound and does not bypass
- *    `evaluateIntent`. It counts the refusal on the health surface
- *    (`health.ts`) and lets it stand. A refused exit is the accepted posture; a
- *    wrong order is not.
+ * 1. **It does not compensate for a risk refusal.** This pipeline does not
+ *    re-tag an intent, does not resize it, does not lower a policy bound and
+ *    does not bypass `evaluateIntent`. A refused protective exit is counted on
+ *    the health surface (`health.ts`, `refusedExits`) and stands. A refused
+ *    exit is visible; a wrong order is not acceptable.
  * 2. **It does not invent a value a package refused to default.** Where §9.8
  *    fails closed on an absent input — an absent `exposures` with a configured
  *    cap, an absent `allocation` verdict, an absent freshness measurement — this

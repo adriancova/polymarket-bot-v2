@@ -65,12 +65,14 @@ export function remapMarketId(
  * Where the replayable part of a mid-stream burst begins.
  *
  * `packages/order-book` refuses a `BookLevelChanged` for a token whose book has
- * no authoritative baseline yet (`ORDER_BOOK_NO_BASELINE_SNAPSHOT`), and the
- * trader halts that market (`BOOK_DESYNCHRONIZED`, fail-closed) — which stops
- * the pump. A burst cut from the middle of a live stream opens with level
- * changes whose baseline snapshot lies before the cut (H1's burst: 334 of
- * them, before the first `BookSnapshot` at 21:02:07.125Z), so no trader could
- * replay it from its first line.
+ * no authoritative baseline yet (`ORDER_BOOK_NO_BASELINE_SNAPSHOT`). Until
+ * `C1-HALTS` the trader halted that market (`BOOK_DESYNCHRONIZED`), which
+ * stopped the pump; since then the book waits for its first snapshot instead,
+ * and the refusal is only counted. A burst cut from the middle of a live
+ * stream opens with level changes whose baseline snapshot lies before the cut
+ * (H1's burst: 334 of them, before the first `BookSnapshot` at
+ * 21:02:07.125Z). The benchmark still replays from the first index at which
+ * every change has its baseline, so its measured workload is unchanged.
  *
  * Answers the smallest index `c` such that, in `burst[c..]`, no token has a
  * `BookLevelChanged` before its first `BookSnapshot`. The benchmark replays

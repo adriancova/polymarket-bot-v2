@@ -1096,7 +1096,6 @@ describeAtEachCadence("SIM-1 R3 — a BASKET the venue executed only IN PART hal
     const halt = health.halts[0];
     expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
     expect(halt?.code).toBe("BASKET_PARTIALLY_EXECUTED");
-    expect(halt?.action).toBe("MANAGE_KNOWN_POSITIONS_ONLY");
     expect(halt?.detail).toContain(`basket plan ${plan.executionPlanId} (failurePolicy HOLD_FILLED_LEGS)`);
     expect(halt?.detail).toContain("booked 2 of its 4 planned orders");
     expect(halt?.detail).toContain("(SIMULATED_VENUE_NO_BOOK)");
@@ -1167,7 +1166,6 @@ describeAtEachCadence("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcom
     expect(halts).toHaveLength(1);
     const halt = halts[0];
     expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
-    expect(halt?.action).toBe("MANAGE_KNOWN_POSITIONS_ONLY");
     expect(halt?.detail).toContain(`basket plan ${plan.executionPlanId} (failurePolicy HOLD_FILLED_LEGS)`);
     expect(halt?.detail).toContain("booked 4 of its 4 planned orders");
     expect(halt?.detail).toContain("2 booked order(s) ended short of their size");
@@ -1730,7 +1728,6 @@ describeAtEachCadence("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a p
     expect(halts).toHaveLength(1);
     const halt = halts[0];
     expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
-    expect(halt?.action).toBe("RECONCILE_ACCOUNT");
     expect(halt?.detail).toContain("partly executed and then refused");
     expect(halt?.detail).toContain(`${resting.simulatedOrderId} (planned ${resting.plannedOrderId}) RESTING 0/5`);
     expect(halt?.detail).toContain("1 of its 10 planned orders");

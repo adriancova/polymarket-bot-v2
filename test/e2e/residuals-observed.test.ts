@@ -150,34 +150,11 @@ describe("residual 2 — a protective reduction at the risk seam, RESOLVED", () 
     // Pinned BY IDENTITY against the exported constant, not by copying its
     // text: a wording improvement upstream must not read as a failure here.
     expect(run.trader.loop.health().riskSeamCaveat).toBe(RISK_SEAM_CAVEAT);
-    // `BOOT-1` corrected the constant's TEXT (`RISK-2` residual R2). This pin
-    // used to read `expect(RISK_SEAM_CAVEAT).toContain("WP-220 accepted
-    // residual")` with a note that the wording was stale; the caveat now says
-    // what is true — the seam no longer classifies a covered sell as ENTRY —
-    // and QUOTES the superseded text rather than deleting it, which is why the
-    // old phrase is still found.
-    expect(RISK_SEAM_CAVEAT).toContain("SUPERSEDED (RISK-2, 133eac1)");
-    expect(RISK_SEAM_CAVEAT).toContain('used to read "WP-220 accepted residual');
-    expect(RISK_SEAM_CAVEAT).toContain("never from a tag");
-    expect(RISK_SEAM_CAVEAT).not.toMatch(/^WP-220 accepted residual/u);
-    // `BRACKET-1a` corrected it AGAIN. These pins used to read
-    // `toContain("residual 5")` and `toContain("ends PAUSED")`, when the caveat
-    // named residual 5 as "THE CAVEAT NOW". Kept as they were they would pass
-    // VACUOUSLY on the quotation below — the RISK2-R2 class, a false caveat no
-    // test notices — so they now assert the closure marker, the quotation, and
-    // the ABSENCE of the present-tense claim.
-    expect(RISK_SEAM_CAVEAT).toContain("SUPERSEDED (BRACKET-1a)");
-    expect(RISK_SEAM_CAVEAT).not.toMatch(/THE CAVEAT NOW/u);
-    // "residual 5" and "ends PAUSED" are still found — INSIDE the quotation of
-    // the superseded text, and only there…
-    const [, quoted = ""] = RISK_SEAM_CAVEAT.split('SUPERSEDED (BRACKET-1a): it then read "');
-    const [quotation = "", presentTense = ""] = quoted.split('" — that is no longer true either:');
-    expect(quotation.startsWith("RISK-2 residual 5")).toBe(true);
-    expect(quotation).toContain("ends PAUSED");
-    // …and what the caveat says AFTER it, its present tense, names the closing
-    // codes and no pause.
-    expect(presentTense).toContain("SB.CLOSED");
-    expect(presentTense).not.toMatch(/PAUSED/u);
+    // `C1-HALTS` (TRADE-09) cut the constant to one present-tense sentence:
+    // the superseded `RISK-2` and `BRACKET-1a` quotations it carried are gone,
+    // and none of their claims may come back.
+    expect(RISK_SEAM_CAVEAT).toContain("a sell covered by the instance's confirmed holding is an EXIT");
+    expect(RISK_SEAM_CAVEAT).not.toMatch(/SUPERSEDED|WP-220 accepted residual|classified ENTRY|ends PAUSED/u);
   });
 
   it("the exit is EXECUTED, and it is the intent the strategy emitted — not a re-tag", async () => {

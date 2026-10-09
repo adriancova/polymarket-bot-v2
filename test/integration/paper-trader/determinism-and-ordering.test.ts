@@ -178,9 +178,11 @@ describe("§8.4 replay ordering", () => {
     await run.trader.loop.drain();
 
     // A level change carrying an ingestSeq the book has already passed is
-    // REFUSED by `packages/order-book`'s epoch/sequence gating, and the loop
-    // turns that refusal into a market halt rather than applying it out of
-    // order (§8.4: replay follows information arrival order).
+    // REFUSED by `packages/order-book`'s epoch/sequence gating and never
+    // applied out of order (§8.4: replay follows information arrival order).
+    // `C1-HALTS`: a replayed or reordered sequence is a BENIGN drop — the book
+    // already holds newer state — so it is counted, not halted on.
+    const processedBefore = run.trader.loop.health().loop.eventsProcessed;
     const { ingested } = await import("./support/fixture.js");
     run.trader.loop.ingest(
       ingested(
@@ -196,11 +198,11 @@ describe("§8.4 replay ordering", () => {
       ),
     );
     await run.trader.loop.drain();
-    expect(run.trader.halts.isMarketHalted(MARKET_ID)).toBe(true);
-    const halt = run.trader.halts
-      .records()
-      .find((record) => record.code === "BOOK_DESYNCHRONIZED");
-    expect(halt).toBeDefined();
-    expect(halt?.action).toBe("CANCEL_RESTING_ORDERS");
+    expect(run.trader.loop.health().loop.eventsProcessed).toBe(processedBefore + 1);
+    expect(run.trader.halts.anyHalt).toBe(false);
+    expect(run.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 1, divergence: 0, waiting: [] });
+    // Not applied: the YES ask at 0.34 still holds the fixture's 150.
+    const market = run.trader.markets.get(MARKET_ID);
+    expect(market?.bookFor("YES").levels("ASK")[0]).toEqual({ price: "0.34", size: "150" });
   });
 });

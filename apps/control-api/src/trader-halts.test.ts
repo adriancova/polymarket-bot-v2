@@ -87,6 +87,8 @@ describe("the door: a self-consistent fetch is classified, every scope counted",
     expect({ ...read.halts.byScope }).toEqual({ GLOBAL: 1, MARKET: 1, STRATEGY_INSTANCE: 1, UNRECOGNIZED: 0 });
     expect(read.halts.listed.map((row) => row.scope)).toEqual(["MARKET", "STRATEGY_INSTANCE", "GLOBAL"]);
     expect(read.halts.listed.every((row) => row.irregularities.length === 0)).toBe(true);
+    // C1-HALTS: the `action` column is read through the door, never shown.
+    expect(read.halts.listed.every((row) => !("action" in row))).toBe(true);
     expect(read.halts.irregular).toBe(0);
     expect(read.halts.truncated).toBe(false);
     expect(read.halts.listed[0]).toMatchObject({
@@ -94,7 +96,6 @@ describe("the door: a self-consistent fetch is classified, every scope counted",
       marketId: MARKET["market_id"],
       instanceId: null,
       failureClass: "STALE_BOOK",
-      action: "HALT_NEW_ENTRIES",
       detail: "market book is stale",
       openedAt: "2026-10-04T00:00:00.000000Z",
       status: "OPEN",
@@ -436,7 +437,7 @@ describe("through the API: the health answer and the metrics carry the halts, re
     expect(halts["openTotal"]).toBe(2);
     expect(halts["openByScope"]).toEqual({ GLOBAL: 0, MARKET: 1, STRATEGY_INSTANCE: 1, UNRECOGNIZED: 0 });
     expect((halts["listed"] as unknown[]).length).toBe(2);
-    expect(String(halts["note"])).toContain("no operator has resolved");
+    expect(String(halts["note"])).toContain("row is not resolved");
     expect(halts["reads"]).toEqual({ OK: 1 });
   });
 

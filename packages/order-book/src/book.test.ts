@@ -547,3 +547,22 @@ describe("queries (§9.4 tracked values)", () => {
     expect(book.stalenessMs(0)).toEqual({ known: false, reason: "NO_RECEIVED_AT" });
   });
 });
+
+describe("clearBaseline (C1-HALTS: a consumer makes a diverged book wait for its next snapshot)", () => {
+  it("forgets the baseline: a later level change is refused NO_BASELINE, the levels are kept, and the next snapshot re-baselines", () => {
+    const book = seededBook();
+    book.clearBaseline();
+    expect(book.baseline()).toBeUndefined();
+    expect(book.levels("BID")).toEqual([
+      { price: "0.08", size: "33343.4" },
+      { price: "0.07", size: "5000" },
+    ]);
+    const change = book.applyLevelChange({ payload: levelChangePayload(), meta: meta({ ingestSeq: "11" }) });
+    expect(change.applied ? undefined : change.refusal.code).toBe("ORDER_BOOK_NO_BASELINE_SNAPSHOT");
+    // Any well-formed snapshot of the epoch re-baselines it, whatever its sequence.
+    const snapshot = book.applySnapshot({ payload: snapshotPayload(), meta: meta({ ingestSeq: "12", subscriptionGeneration: 2 }) });
+    expect(snapshot.applied).toBe(true);
+    expect(book.baseline()).toEqual({ gatewayEpoch: EPOCH_A, subscriptionGeneration: 2 });
+    expect(book.applyLevelChange({ payload: levelChangePayload(), meta: meta({ ingestSeq: "13", subscriptionGeneration: 2 }) }).applied).toBe(true);
+  });
+});

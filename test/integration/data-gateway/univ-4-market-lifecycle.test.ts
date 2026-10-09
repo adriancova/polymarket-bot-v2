@@ -1582,6 +1582,50 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     ]);
   });
 
+  it("C1-HALTS DQ-CLOSE: a market's OWN valid poll closes its own poll-failure incidents — published, naming their ids — and another market's does not", async () => {
+    const second = {
+      ...LIFECYCLE_MARKET,
+      internalMarketId: "01990000-0000-7000-8000-000000000002",
+      conditionId: "0x" + "cd".repeat(31),
+      yesTokenId: "33333",
+      noTokenId: "44444",
+      gammaMarketId: "900002",
+    } as const;
+    // Each cycle polls the two markets in order: [first, second].
+    const stub = gammaStub([
+      { status: 503, body: '{"error":"maintenance"}' }, // first: fails
+      { status: 503, body: '{"error":"maintenance"}' }, // second: fails
+      { body: READY }, // first: its own valid poll
+      { body: gammaMarket({ active: "true" }) }, // second: still failing (an undocumented body)
+    ]);
+    const harness = await buildHarness({
+      config: lifecycleConfig({ markets: [LIFECYCLE_MARKET, second] }),
+      http: stub.route,
+    });
+    harness.gateway.start();
+    await harness.settle();
+    const opened = harness.publishedOfType("DataQualityIncidentOpened").map(payloadOf);
+    const idOf = (marketId: string, reasonCode: string): unknown =>
+      opened.find(
+        (payload) =>
+          payload["reasonCode"] === reasonCode && (payload["affectedMarketIds"] as readonly string[] | undefined)?.[0] === marketId,
+      )?.["incidentId"];
+    const firstFailed = idOf(MARKET.internalMarketId, "GATEWAY_LIFECYCLE_POLL_FAILED");
+    expect(firstFailed).toBeDefined();
+    expect(harness.publishedOfType("DataQualityIncidentClosed")).toEqual([]);
+
+    await pollOnce(harness);
+    await harness.gateway.stop();
+    // The first market's valid poll closed ITS incident, and only it.
+    const closes = harness.publishedOfType("DataQualityIncidentClosed").map(payloadOf);
+    expect(closes.map((payload) => [payload["incidentId"], payload["resolutionCode"]])).toEqual([
+      [firstFailed, "GATEWAY_CONDITION_CLEARED"],
+    ]);
+    // The second market's incidents stay open: its own poll has not succeeded.
+    expect(idOf(second.internalMarketId, "GATEWAY_LIFECYCLE_POLL_FAILED")).toBeDefined();
+    expect(harness.gateway.metrics().lifecycle?.pollFailures).toBe(3);
+  });
+
   it("a WAL refusal suppresses the derivation and opens a PAGE incident (acceptance 1, the other half)", async () => {
     const harness = await buildHarness({
       config: lifecycleConfig({ wal: { rootPath: "/wal", maxTotalBytes: 1 } }),

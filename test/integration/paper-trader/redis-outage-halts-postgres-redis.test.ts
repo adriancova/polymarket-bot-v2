@@ -752,7 +752,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           const halt = after.halts[0];
           expect(halt?.detail).toContain("the event transport is unavailable");
           expect(halt?.detail).toContain("caused by");
-          expect(run.text()).toContain("HALT GLOBAL TRANSPORT_UNAVAILABLE (FULL_HALT): ");
+          expect(run.text()).toContain("HALT GLOBAL TRANSPORT_UNAVAILABLE: ");
 
           // --- nothing traded after it, nothing written; the last writes read back -
           await expectNothingTradedOrWrittenAfter(run, context, registered, before, boundary);

@@ -26,7 +26,11 @@
  * identical runtime string and a readable diff.
  */
 
-import type { DataQualityIncidentOpenedPayload, IncidentSeverity } from "@polymarket-bot/domain";
+import type {
+  DataQualityIncidentClosedPayload,
+  DataQualityIncidentOpenedPayload,
+  IncidentSeverity,
+} from "@polymarket-bot/domain";
 
 import type { EnvelopeDraft } from "./envelope.js";
 import { GatewayConfigurationError } from "./errors.js";
@@ -34,6 +38,9 @@ import { isoFromMs } from "./ports.js";
 
 /** `sourceChannel` for gateway-internal events. */
 export const GATEWAY_INTERNAL_CHANNEL = "gateway:internal";
+
+/** `C1-HALTS`: the `resolutionCode` of every close the gateway publishes — the condition its key named cleared. */
+export const INCIDENT_CONDITION_CLEARED = "GATEWAY_CONDITION_CLEARED";
 
 export interface OpenIncidentInput {
   /** Bounded scope key: a feed id, or a gateway subsystem name. */
@@ -133,12 +140,44 @@ export class IncidentRegistry {
     };
   }
 
-  /** Marks the incident for a key closed, so a recurrence opens a fresh one. */
-  markClosed(scope: string, reasonCode: string): void {
+  /**
+   * Marks the incident for a key closed, so a recurrence opens a fresh one.
+   * Answers the incident's id when THIS call closed an OPEN incident
+   * (`C1-HALTS`: the dispatcher then publishes its close), `undefined` when
+   * the key was unknown or already closed.
+   */
+  markClosed(scope: string, reasonCode: string): string | undefined {
     const state = this.#states.get(`${scope}\u0000${reasonCode}`);
-    if (state !== undefined) {
-      state.open = false;
-    }
+    if (state === undefined || !state.open) return undefined;
+    state.open = false;
+    return state.incidentId;
+  }
+
+  /**
+   * `C1-HALTS` (DQ-CLOSE): the `DataQualityIncidentClosed` draft for an
+   * incident {@link markClosed} just closed, under `source: "internal"`. The
+   * frozen contract carries only the `incidentId`; a consumer routes the close
+   * to whatever holds that id (the trader: every market whose active set does).
+   */
+  closedDraft(input: {
+    readonly incidentId: string;
+    readonly scope: string;
+    readonly reasonCode: string;
+    readonly atMs: number;
+  }): EnvelopeDraft {
+    const payload: DataQualityIncidentClosedPayload = {
+      incidentId: input.incidentId,
+      closedAt: isoFromMs(input.atMs),
+      resolutionCode: INCIDENT_CONDITION_CLEARED,
+      detail: `the ${input.reasonCode} condition for ${input.scope} cleared`.slice(0, 2000),
+    };
+    return {
+      eventType: "DataQualityIncidentClosed",
+      schemaVersion: 1,
+      source: "internal",
+      sourceChannel: GATEWAY_INTERNAL_CHANNEL,
+      payload,
+    };
   }
 
   /** Whether an incident is currently open for the key. */

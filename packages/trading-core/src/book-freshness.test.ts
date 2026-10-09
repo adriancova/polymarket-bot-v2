@@ -45,7 +45,7 @@ import {
   sessionKeyOf,
 } from "./book-freshness.js";
 import { PAPER_EVALUATION_CADENCE, PER_FRAME_EVALUATION_CADENCE, type EvaluationCadenceOption } from "./cadence.js";
-import { bookFreshnessBasisOf, bookFreshnessCeilingMsOf, parseTraderConfig } from "./config.js";
+import { bookFreshnessBasisOf, bookFreshnessCeilingMsOf, marketChannelFeedIdOf, parseTraderConfig } from "./config.js";
 import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import type { IngestedEvent } from "./ports.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
@@ -63,6 +63,13 @@ const RUN_ID = "018f5c20-3000-7a30-8b00-0000000001c3";
 const CONFIG_ID = "018f5c20-4000-7a40-8b00-0000000001c4";
 const EPOCH_A = "018f5c20-5000-7a50-8b00-0000000001c5";
 const EPOCH_B = "018f5c20-5000-7a50-8b00-0000000001c6";
+/** `C1-HALTS`: a second TRADED market (unlike {@link OTHER_MARKET_ID}, which no instance runs). */
+const MARKET_2 = "018f5c20-1000-7a10-8b00-0000000002c1";
+const YES_TOKEN_2 = "9201";
+const NO_TOKEN_2 = "9202";
+const INSTANCE_2 = "e18f5c20-2000-7a20-8b00-0000000002c2";
+const RUN_2 = "018f5c20-3000-7a30-8b00-0000000002c3";
+const CONFIG_2 = "018f5c20-4000-7a40-8b00-0000000002c4";
 const T_OPEN = "2026-05-01T09:00:00.000Z";
 const T_CLOSE = "2026-05-01T10:00:00.000Z";
 const BOOK_AGE_KEY = "quality.input_feed_ages@polymarket.book";
@@ -156,9 +163,31 @@ interface ConfigOptions {
    */
   readonly processClockAt?: string;
   readonly processLagMs?: number;
+  /** `C1-HALTS`: the CONNECTION_CONFIRMED arm's optional market-channel feed id (absent: the default). */
+  readonly marketChannelFeedId?: string;
+  /** `C1-HALTS`: a SECOND traded market ({@link MARKET_2}) with its own OWNER instance. */
+  readonly secondMarket?: boolean;
 }
 
 function traderConfig(options: ConfigOptions = {}): Record<string, unknown> {
+  const base = singleMarketConfig(options);
+  if (options.secondMarket !== true) return base;
+  const [market] = base["markets"] as Record<string, unknown>[];
+  const [instance] = base["instances"] as Record<string, unknown>[];
+  return {
+    ...base,
+    markets: [
+      market,
+      { ...market, marketId: MARKET_2, conditionId: `${CONDITION_ID}-2`, yesTokenId: YES_TOKEN_2, noTokenId: NO_TOKEN_2, resolutionWindowKey: "w2026-05-01T10.00-2" },
+    ],
+    instances: [
+      instance,
+      { ...instance, instanceId: INSTANCE_2, runId: RUN_2, configId: CONFIG_2, marketId: MARKET_2, evaluationPriority: 1 },
+    ],
+  };
+}
+
+function singleMarketConfig(options: ConfigOptions = {}): Record<string, unknown> {
   const fees = feeSnapshot();
   const paramsVersion = options.paramsVersion ?? 2;
   return {
@@ -224,7 +253,11 @@ function traderConfig(options: ConfigOptions = {}): Record<string, unknown> {
       : {
           bookFreshness:
             options.basis === "CONNECTION_CONFIRMED"
-              ? { basis: options.basis, maximumLastChangeAgeMs: options.ceilingMs ?? 30_000 }
+              ? {
+                  basis: options.basis,
+                  maximumLastChangeAgeMs: options.ceilingMs ?? 30_000,
+                  ...(options.marketChannelFeedId === undefined ? {} : { marketChannelFeedId: options.marketChannelFeedId }),
+                }
               : { basis: options.basis },
         }),
     infrastructure: {
@@ -1812,5 +1845,353 @@ describe("book-freshness.ts", () => {
     }
     expect(liveness.size).toBe(MAXIMUM_TRACKED_SESSIONS);
     expect(liveness.confirmation(sessionKeyOf(bookEvent(first)) as string)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `C1-HALTS` (the user's rulings of 2026-10-08)
+// ---------------------------------------------------------------------------
+
+const CHEAP_YES_ASKS = [
+  { price: "0.34", size: "100" },
+  { price: "0.35", size: "100" },
+];
+
+/** A YES snapshot carrying NO subscription generation: refused `ORDER_BOOK_MISSING_SUBSCRIPTION_GENERATION` (a DIVERGENCE). */
+function unstampedYesSnapshot(at: number): Recorded {
+  return {
+    eventType: "BookSnapshot",
+    payload: { internalMarketId: MARKET_ID, tokenId: YES_TOKEN, bids: [{ price: "0.32", size: "200" }], asks: CHEAP_YES_ASKS },
+    at,
+    epoch: EPOCH_A,
+  };
+}
+
+function yesChange(at: number, session: Session, price: string, size: string, market = MARKET_ID, token = YES_TOKEN): Recorded {
+  return { eventType: "BookLevelChanged", payload: { internalMarketId: market, tokenId: token, side: "ASK", price, size }, at, session };
+}
+
+function bookFor(market: string, token: string, at: number, session: Session, asks: readonly { price: string; size: string }[]): Recorded {
+  return {
+    eventType: "BookSnapshot",
+    payload: { internalMarketId: market, tokenId: token, bids: [{ price: "0.32", size: "200" }], asks },
+    at,
+    session,
+  };
+}
+
+function marketTwoOpened(at: number): Recorded {
+  return {
+    eventType: "MarketOpened",
+    payload: { internalMarketId: MARKET_2, conditionId: `${CONDITION_ID}-2`, openedAt: T_OPEN },
+    at,
+  };
+}
+
+/** The markets that placed orders, in the order each first placed one (by its instance's run). */
+function entryMarkets(parts: Run): readonly string[] {
+  const marketOfRun = new Map([
+    [RUN_ID, MARKET_ID],
+    [RUN_2, MARKET_2],
+  ]);
+  return [...new Set(parts.trader.loop.orderProvenance().map((link) => marketOfRun.get(link.runId) ?? link.runId))];
+}
+
+function bookNotSynchronizedRefusals(parts: Run): number {
+  return parts.trader.loop.health().risk.refusalsByCode["RISK_BOOK_NOT_SYNCHRONIZED"] ?? 0;
+}
+
+/** The strategy's own freshness gate out of the way: the gate under test is risk check 8. */
+const CHECK_8_ONLY: ConfigOptions = { paramsVersion: 1, strategyMaxAgeMs: 600_000 };
+
+describe("C1-HALTS BOOK-WAITS: a desynchronized book waits for its next snapshot instead of halting", () => {
+  beforeAll(() => {
+    cadence = REPRODUCTION;
+  });
+
+  it("a refused snapshot after a good one: no halt; the book waits, and risk check 8 refuses the entry it would have placed", async () => {
+    const parts = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      // The venue's next authoritative state, which this book cannot take.
+      unstampedYesSnapshot(1.5),
+      // Both books now exist and the YES ask satisfies the trigger: the
+      // strategy enters — and check 8 refuses, because the YES book waits.
+      noSnapshot(2, A1),
+    ]);
+    expect(parts.trader.halts.anyHalt).toBe(false);
+    expect(entryMarkets(parts)).toEqual([]);
+    expect(bookNotSynchronizedRefusals(parts)).toBe(1);
+    expect(parts.trader.markets.get(MARKET_ID)?.bookFor("YES").baseline()).toBeUndefined();
+    expect(parts.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 0, divergence: 1, waiting: ["YES"] });
+    // While it waits, a later level change is refused too (no baseline), and
+    // the book still waits: only a snapshot re-arms it.
+    const still = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      unstampedYesSnapshot(1.5),
+      yesChange(1.7, A1, "0.34", "120"),
+    ]);
+    // (The NO book has had no snapshot yet, so it waits too.)
+    expect(still.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 0, divergence: 2, waiting: ["NO", "YES"] });
+    expect(still.trader.markets.get(MARKET_ID)?.bookFor("YES").levels("ASK")[0]).toEqual({ price: "0.34", size: "100" });
+  });
+
+  it("the next applied snapshot re-arms a waiting book on its own, and the market trades", async () => {
+    const parts = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      unstampedYesSnapshot(1.5),
+      // Re-armed here: nothing but this snapshot does it.
+      yesSnapshot(2, A1, CHEAP_YES_ASKS),
+      noSnapshot(2.5, A1),
+    ]);
+    expect(parts.trader.halts.anyHalt).toBe(false);
+    expect(parts.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 0, divergence: 1, waiting: [] });
+    expect(bookNotSynchronizedRefusals(parts)).toBe(0);
+    expect(entryMarkets(parts)).toEqual([MARKET_ID]);
+  });
+
+  it("REDUCTIONS are refused too: a held position's protective exit, while its book waits, is refused by check 8 (cancels still go out)", async () => {
+    // The entry fills at 2.000 s and its take-profit rests. The YES book is
+    // refused an update at 10 s and waits. Past the maximum holding time
+    // (180 s) the strategy cancels the take-profit (210 s) and then emits its
+    // protected reduction (240 s) — which check 8 refuses.
+    const events: Recorded[] = [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      noSnapshot(2, A1),
+      unstampedYesSnapshot(10),
+    ];
+    for (let at = 30; at <= 270; at += 30) events.push(tick(at, String(64_000 + at)));
+    const parts = await run(CHECK_8_ONLY, events);
+    expect(parts.trader.halts.anyHalt).toBe(false);
+    expect(entryMarkets(parts)).toEqual([MARKET_ID]);
+    const health = parts.trader.loop.health();
+    // The cancel of the resting take-profit went out and was confirmed…
+    expect(health.execution.cancelsConfirmed).toBe(1);
+    // …and the protected reduction after it was refused by check 8.
+    expect(health.risk.refusedExitsByCode).toEqual({ RISK_BOOK_NOT_SYNCHRONIZED: 1 });
+    expect(health.risk.refusalsByCode).toEqual({ RISK_BOOK_NOT_SYNCHRONIZED: 1 });
+  });
+
+  it("the restart case: a run that starts mid-stream with level changes before any snapshot does NOT halt, and trades once the snapshots arrive", async () => {
+    const parts = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      // THROUGHPUT-1a deviation 3: the stream's first book events are changes
+      // with no baseline in this process (ORDER_BOOK_NO_BASELINE_SNAPSHOT).
+      yesChange(0.2, A1, "0.36", "50"),
+      { eventType: "BookLevelChanged", payload: { internalMarketId: MARKET_ID, tokenId: NO_TOKEN, side: "BID", price: "0.58", size: "150" }, at: 0.3, session: A1 },
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      noSnapshot(1.1, A1),
+    ]);
+    expect(parts.trader.halts.records()).toEqual([]);
+    expect(parts.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 0, divergence: 2, waiting: [] });
+    expect(entryMarkets(parts)).toEqual([MARKET_ID]);
+  });
+
+  it("another market keeps trading while one waits: market 1's book waits and its entry is refused, market 2 enters; market 1's next snapshot re-arms it", async () => {
+    const options: ConfigOptions = { ...CHECK_8_ONLY, secondMarket: true };
+    const waiting: Recorded[] = [
+      tick(-2),
+      marketOpened(0),
+      marketTwoOpened(0.1),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      unstampedYesSnapshot(1.2),
+      noSnapshot(1.3, A1),
+      bookFor(MARKET_2, YES_TOKEN_2, 1.4, A1, CHEAP_YES_ASKS),
+      bookFor(MARKET_2, NO_TOKEN_2, 1.5, A1, [{ price: "0.6", size: "200" }]),
+      tick(2, "64001"),
+    ];
+    const during = await run(options, waiting);
+    expect(during.trader.halts.anyHalt).toBe(false);
+    expect(entryMarkets(during)).toEqual([MARKET_2]);
+    expect(bookNotSynchronizedRefusals(during)).toBe(1);
+    expect(during.trader.loop.bookRefusals()).toEqual({
+      [MARKET_ID]: { benign: 0, divergence: 1, waiting: ["YES"] },
+      [MARKET_2]: { benign: 0, divergence: 0, waiting: [] },
+    });
+    const after = await run(options, [...waiting, yesSnapshot(3, A1, CHEAP_YES_ASKS)]);
+    expect(after.trader.loop.bookRefusals()[MARKET_ID]?.waiting).toEqual([]);
+    expect(after.trader.halts.anyHalt).toBe(false);
+  });
+
+  it("a BENIGN drop (a stale subscription generation) is counted only: the book stays synchronized and the entry goes out", async () => {
+    const parts = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1_GEN2, CHEAP_YES_ASKS),
+      // A late update from the superseded generation 1: rejected (§9.4), harmless.
+      yesChange(1.2, A1, "0.34", "1"),
+      noSnapshot(2, A1_GEN2),
+    ]);
+    expect(parts.trader.halts.anyHalt).toBe(false);
+    expect(parts.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 1, divergence: 0, waiting: [] });
+    expect(parts.trader.markets.get(MARKET_ID)?.bookFor("YES").levels("ASK")[0]).toEqual({ price: "0.34", size: "100" });
+    expect(entryMarkets(parts)).toEqual([MARKET_ID]);
+  });
+
+  it("a FAULT (a token that is neither of the market's two) still halts, as BOOK_DESYNCHRONIZED, and ends the run", async () => {
+    const parts = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      yesChange(1.2, A1, "0.34", "1", MARKET_ID, "9999"),
+      noSnapshot(2, A1),
+    ]);
+    expect(parts.trader.halts.records().map((halt) => [halt.scope, halt.code])).toEqual([
+      [{ kind: "MARKET", marketId: MARKET_ID }, "BOOK_DESYNCHRONIZED"],
+    ]);
+    expect(parts.trader.halts.records()[0]?.detail).toContain("ORDER_BOOK_UNKNOWN_TOKEN");
+    expect(entryMarkets(parts)).toEqual([]);
+  });
+
+  it("CONNECTION_CONFIRMED: a waiting book keeps no session, so sibling frames cannot vouch for it — it reads stale within its bound", async () => {
+    // The quiet-YES timeline (NO changes on A1 every 500 ms keep A1 alive),
+    // with the YES book refused an update at 1.200 s: from then on its age is
+    // its last APPLIED change (1.000 s), however busy A1 stays.
+    const events = [...quietYesTimeline()];
+    events.splice(4, 0, unstampedYesSnapshot(1.2));
+    const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    expect(parts.trader.halts.anyHalt).toBe(false);
+    expect(evaluationAt(parts, 2.5).stale).toBe(false);
+    expect(evaluationAt(parts, 3.5)).toMatchObject({ stale: true, bookAgeMs: "2500" });
+    expect(evaluationAt(parts, 6.2)).toMatchObject({ stale: true, bookAgeMs: "5200" });
+  });
+});
+
+/** A market-less incident as the gateway or an adapter publishes it. */
+function feedIncident(at: number, input: { readonly reasonCode: string; readonly source: string; readonly feedId?: string }): Recorded {
+  return {
+    eventType: "DataQualityIncidentOpened",
+    payload: {
+      incidentId: `incident-${input.reasonCode}`,
+      openedAt: iso(at),
+      reasonCode: input.reasonCode,
+      severity: "NOTIFY",
+      ...(input.feedId === undefined ? {} : { feedId: input.feedId }),
+    },
+    at,
+    source: input.source,
+    epoch: EPOCH_A,
+  };
+}
+
+/** The quiet-YES timeline with one market-less incident before the 6.200 s tick: is the book stale at 6.200 s? */
+async function staleAfter(incident: Recorded, options: ConfigOptions = {}): Promise<boolean> {
+  const events = [...quietYesTimeline()];
+  events.splice(events.length - 1, 0, incident, noChange(6.1, A1, "999"));
+  const parts = await run({ basis: "CONNECTION_CONFIRMED", ...options }, events);
+  expect(evaluationAt(parts, 6).stale).toBe(false);
+  return evaluationAt(parts, 6.2).stale;
+}
+
+describe("C1-HALTS TAINT: only the market channel's market-less incidents, or gateway-wide faults, taint the epoch (ruled NARROW 2026-10-08)", () => {
+  beforeAll(() => {
+    cadence = REPRODUCTION;
+  });
+
+  it("a Binance start notice (source binance, feedId binance-reference) does NOT taint", async () => {
+    expect(
+      await staleAfter(feedIncident(6.05, { reasonCode: "BINANCE_SUBSCRIPTION_START_NO_REPLAY", source: "binance", feedId: "binance-reference" })),
+    ).toBe(false);
+  });
+
+  it("a Coinbase notice (source coinbase, no feedId) does NOT taint: the reference venue's source alone excludes it", async () => {
+    expect(await staleAfter(feedIncident(6.05, { reasonCode: "COINBASE_TOP_OF_BOOK_UNCHANGED", source: "coinbase" }))).toBe(false);
+  });
+
+  it("an internal incident naming a REFERENCE feed (a Binance stall) does NOT taint", async () => {
+    expect(await staleAfter(feedIncident(6.05, { reasonCode: "GATEWAY_FEED_STALL", source: "internal", feedId: "binance-reference" }))).toBe(false);
+  });
+
+  it("the routine no-op tick-size pair (UNASSIGNED_PARAMETER_VERSION on the market channel) does NOT taint", async () => {
+    expect(
+      await staleAfter(feedIncident(6.05, { reasonCode: "UNASSIGNED_PARAMETER_VERSION", source: "polymarket", feedId: "polymarket-market" })),
+    ).toBe(false);
+  });
+
+  it("UNKNOWN_EVENT_TYPE on the Polymarket market channel DOES taint", async () => {
+    expect(await staleAfter(feedIncident(6.05, { reasonCode: "UNKNOWN_EVENT_TYPE", source: "polymarket", feedId: "polymarket-market" }))).toBe(true);
+  });
+
+  it("an internal WAL refusal on the market channel DOES taint", async () => {
+    expect(
+      await staleAfter(feedIncident(6.05, { reasonCode: "GATEWAY_WAL_FRAME_REFUSED", source: "internal", feedId: "polymarket-market" })),
+    ).toBe(true);
+  });
+
+  it("a gateway-wide fault with no feedId (a refused envelope) DOES taint", async () => {
+    expect(await staleAfter(feedIncident(6.05, { reasonCode: "GATEWAY_ENVELOPE_REJECTED", source: "internal" }))).toBe(true);
+  });
+
+  it("the market-channel feed id is configurable: under another id, polymarket-market no longer taints and that id does", async () => {
+    const options = { marketChannelFeedId: "polymarket-market-2" };
+    expect(
+      await staleAfter(feedIncident(6.05, { reasonCode: "UNKNOWN_EVENT_TYPE", source: "polymarket", feedId: "polymarket-market" }), options),
+    ).toBe(false);
+    expect(
+      await staleAfter(feedIncident(6.05, { reasonCode: "UNKNOWN_EVENT_TYPE", source: "polymarket", feedId: "polymarket-market-2" }), options),
+    ).toBe(true);
+  });
+
+  it("the configuration: the id defaults to polymarket-market, and a configured one is read as an own property", () => {
+    const absent = parseTraderConfig(traderConfig({ basis: "CONNECTION_CONFIRMED" }));
+    const configured = parseTraderConfig(traderConfig({ basis: "CONNECTION_CONFIRMED", marketChannelFeedId: "custom-market" }));
+    const lastChange = parseTraderConfig(traderConfig({ basis: "LAST_CHANGE" }));
+    expect(absent.ok && configured.ok && lastChange.ok).toBe(true);
+    if (!absent.ok || !configured.ok || !lastChange.ok) return;
+    expect(marketChannelFeedIdOf(absent.config)).toBe("polymarket-market");
+    expect(marketChannelFeedIdOf(configured.config)).toBe("custom-market");
+    expect(marketChannelFeedIdOf(lastChange.config)).toBe("polymarket-market");
+    const malformed = parseTraderConfig(traderConfig({ basis: "CONNECTION_CONFIRMED", marketChannelFeedId: "not a code" }));
+    expect(malformed.ok).toBe(false);
+  });
+});
+
+describe("C1-HALTS DQ-CLOSE: a DataQualityIncidentClosed reaches the markets that hold it, and the strategy un-pauses", () => {
+  beforeAll(() => {
+    cadence = REPRODUCTION;
+  });
+
+  function closed(at: number, incidentId: string): Recorded {
+    return {
+      eventType: "DataQualityIncidentClosed",
+      payload: { incidentId, closedAt: iso(at), resolutionCode: "GATEWAY_CONDITION_CLEARED" },
+      at,
+      source: "internal",
+      epoch: EPOCH_A,
+    };
+  }
+
+  const pausedByIncident = (): Recorded[] => [
+    tick(-2),
+    marketOpened(0),
+    // A lifecycle poll failed: the gateway's market-scoped incident.
+    { ...incident(0.5, "gw-lifecycle-1", [MARKET_ID]), payload: { incidentId: "gw-lifecycle-1", openedAt: iso(0.5), reasonCode: "GATEWAY_LIFECYCLE_POLL_FAILED", severity: "NOTIFY", feedId: "polymarket-lifecycle", affectedMarketIds: [MARKET_ID] } },
+    yesSnapshot(1, A1, CHEAP_YES_ASKS),
+    noSnapshot(1.1, A1),
+    tick(1.5, "64001"),
+  ];
+
+  it("while the incident is open the market does not enter; the close (routed by incidentId) un-pauses it and the entry goes out", async () => {
+    const open = await run(CHECK_8_ONLY, pausedByIncident());
+    expect(entryMarkets(open)).toEqual([]);
+    expect(open.trader.markets.get(MARKET_ID)?.activeIncidents().map((held) => held.incidentId)).toEqual(["gw-lifecycle-1"]);
+
+    const after = await run(CHECK_8_ONLY, [...pausedByIncident(), closed(2, "gw-lifecycle-1"), noChange(2.5, A1, "201"), tick(3, "64002")]);
+    expect(after.trader.markets.get(MARKET_ID)?.activeIncidents()).toEqual([]);
+    expect(entryMarkets(after)).toEqual([MARKET_ID]);
+  });
+
+  it("a close for an incident no market holds changes nothing", async () => {
+    const parts = await run(CHECK_8_ONLY, [...pausedByIncident(), closed(2, "gw-other-7"), noChange(2.5, A1, "201"), tick(3, "64002")]);
+    expect(parts.trader.markets.get(MARKET_ID)?.activeIncidents().map((held) => held.incidentId)).toEqual(["gw-lifecycle-1"]);
+    expect(entryMarkets(parts)).toEqual([]);
   });
 });

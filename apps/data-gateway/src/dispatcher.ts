@@ -398,9 +398,21 @@ export class GatewayDispatcher {
     );
   }
 
-  /** Closes the registry key so a recurrence opens a fresh incident. */
+  /**
+   * Closes the registry key so a recurrence opens a fresh incident, and —
+   * `C1-HALTS` (DQ-CLOSE) — when that closed an OPEN incident, publishes its
+   * `DataQualityIncidentClosed` through the ordinary funnel. Until then no
+   * producer published a close, so a consumer's active set only grew: the
+   * trader paused a market for its life on one transient poll failure. A key
+   * that was not open publishes nothing, so a caller may call this on every
+   * success.
+   */
   markIncidentClosed(scope: string, reasonCode: string): void {
-    this.#incidents.markClosed(scope, reasonCode);
+    const incidentId = this.#incidents.markClosed(scope, reasonCode);
+    if (incidentId === undefined) return;
+    void this.dispatch(
+      this.#incidents.closedDraft({ incidentId, scope, reasonCode, atMs: this.#clock.nowMs() }),
+    );
   }
 
   get incidents(): IncidentRegistry {

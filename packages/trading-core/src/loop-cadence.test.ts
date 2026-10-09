@@ -1263,7 +1263,7 @@ describe("ADR-026 D2.11 (corrected 2026-10-03): a halted market is not evaluated
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
     await feed(harness, ...opening(), level(S + 300, MARKET_A, "0.31"));
     const coalesced = harness.loop.health().loop.evaluationsCoalesced;
-    harness.halts.halt({ kind: "MARKET", marketId: MARKET_A }, "OPERATOR_HALT", "test", iso(S + 400));
+    harness.halts.halt({ kind: "MARKET", marketId: MARKET_A }, "RUNTIME_PERSISTENCE_FAILED", "test", iso(S + 400));
     const start = harness.seen.length;
     const first = level(S + 1_000, MARKET_B, "0.31");
     const second = level(S + 6_000, MARKET_B, "0.3");
@@ -1392,47 +1392,34 @@ describe("r1 (J2), ADR-026 D2.3-D2.6: a market's `last` moves only when the loop
     expect(featureCalls(harness)).toEqual([["A", idOf(bookA), iso(10)]]);
   });
 
-  it("a market whose ONLY instance is halted is not evaluated: `last` stays, the owed evaluation is dropped, and after the release its next owed close evaluates it", async () => {
+  it("a market whose ONLY instance is halted is not evaluated, and the owed evaluation is dropped (C1-HALTS: no release exists; the run ends)", async () => {
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
     await feed(harness, ...opening());
     const start = harness.seen.length;
     const coalesced = harness.loop.health().loop.evaluationsCoalesced;
     const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
-    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 400));
+    harness.halts.halt(scope, "RUNTIME_PERSISTENCE_FAILED", "test", iso(S + 400));
     // A owed and due by the cadence, but its one instance is halted: no runtime is asked.
     await feed(harness, level(S + 1_000, MARKET_A, "0.31"));
     expect(featureCalls(harness, start)).toEqual([]);
-    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
     // Dropped, not carried: an event for no configured market evaluates nothing.
     await feed(harness, snapshot(S + 1_100, MARKET_X, "yes"));
     expect(featureCalls(harness, start)).toEqual([]);
-    // `last` is still S, so A's next owed close — 200 ms after the halted one — evaluates it.
-    const next = level(S + 1_200, MARKET_A, "0.3");
-    await feed(harness, next);
-    expect(featureCalls(harness, start)).toEqual([["A", idOf(next), iso(S + 1_200)]]);
     expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
   });
 
-  it("a HEARTBEAT that finds A's only instance halted is no evaluation either: `last` stays, so after the release A's heartbeat comes at the next close (r2)", async () => {
+  it("a HEARTBEAT that finds A's only instance halted is no evaluation either (C1-HALTS: no release exists; the run ends)", async () => {
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
     await feed(harness, ...opening());
     const start = harness.seen.length;
     const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
-    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 4_000));
+    harness.halts.halt(scope, "RUNTIME_PERSISTENCE_FAILED", "test", iso(S + 4_000));
     // Both heartbeats due; A's one instance is halted, so only B is evaluated.
     const first = snapshot(S + 5_000, MARKET_X, "yes");
     await feed(harness, first);
     expect(featureCalls(harness, start)).toEqual([["B", idOf(first), iso(S + 5_000)]]);
-    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
-    // `last` is still S for A: its heartbeat is due at once.
-    const next = snapshot(S + 5_100, MARKET_X, "yes");
-    await feed(harness, next);
-    expect(featureCalls(harness, start)).toEqual([
-      ["B", idOf(first), iso(S + 5_000)],
-      ["A", idOf(next), iso(S + 5_100)],
-    ]);
   });
 
   it("with A's OWNER instance halted and its SHADOW instance evaluated, the market WAS evaluated: `last` moves", async () => {
@@ -1440,7 +1427,7 @@ describe("r1 (J2), ADR-026 D2.3-D2.6: a market's `last` moves only when the loop
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, shadowOnA: true });
     await feed(harness, ...opening());
     const start = harness.seen.length;
-    harness.halts.halt({ kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A }, "OPERATOR_HALT", "test", iso(S + 400));
+    harness.halts.halt({ kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A }, "RUNTIME_PERSISTENCE_FAILED", "test", iso(S + 400));
     const owed = level(S + 1_000, MARKET_A, "0.31");
     await feed(harness, owed);
     expect(featureCalls(harness, start)).toEqual([["A2", idOf(owed), iso(S + 1_000)]]);
@@ -1943,24 +1930,23 @@ describe("r2 (RB), ADR-026 D2.3 with D5.4-D5.5: a runtime refusal for a cause th
 });
 
 describe("r2 (RC), ADR-026 D2.11 as corrected: a market whose every instance is halted has its owed evaluation dropped before the cadence is asked", () => {
-  it("an owed evaluation NOT YET DUE, while A's only instance is halted, is dropped: after the release, nothing is evaluated for it", async () => {
+  it("an owed evaluation NOT YET DUE, while A's only instance is halted, is dropped: nothing is evaluated for it", async () => {
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
     await feed(harness, ...opening());
     const start = harness.seen.length;
     const before = harness.loop.health().loop.evaluationsCoalesced;
     const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
-    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 100));
+    harness.halts.halt(scope, "RUNTIME_PERSISTENCE_FAILED", "test", iso(S + 100));
     await feed(harness, snapshot(S + 200, MARKET_A, "yes"));
     expect(harness.seen.slice(start)).toEqual([]);
-    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
     await feed(harness, snapshot(S + 1_000, MARKET_X, "yes"));
     expect(featureCalls(harness, start)).toEqual([]);
     // Dropped, not coalesced: nothing was owed any more.
     expect(harness.loop.health().loop.evaluationsCoalesced).toBe(before);
   });
 
-  it("a CARRIED evaluation, not yet due, of a market whose only instance is then halted is dropped by the carried pass: after the release, nothing is evaluated for it", async () => {
+  it("a CARRIED evaluation, not yet due, of a market whose only instance is then halted is dropped by the carried pass: nothing is evaluated for it", async () => {
     ordinal = 0;
     const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE });
     await feed(harness, ...opening());
@@ -1969,11 +1955,10 @@ describe("r2 (RC), ADR-026 D2.11 as corrected: a market whose every instance is 
     await feed(harness, snapshot(S + 200, MARKET_A, "yes"));
     const coalesced = harness.loop.health().loop.evaluationsCoalesced;
     const scope = { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A } as const;
-    harness.halts.halt(scope, "OPERATOR_HALT", "test", iso(S + 250));
+    harness.halts.halt(scope, "RUNTIME_PERSISTENCE_FAILED", "test", iso(S + 250));
     // A close that owes A nothing, still inside the interval: the carried pass drops A's debt.
     await feed(harness, snapshot(S + 300, MARKET_X, "yes"));
     expect(harness.loop.health().loop.evaluationsCoalesced).toBe(coalesced);
-    expect(harness.halts.release(scope, { authoritativeSnapshotApplied: true, reason: "test" })).toBe(true);
     await feed(harness, snapshot(S + 1_000, MARKET_X, "yes"));
     expect(featureCalls(harness, start)).toEqual([]);
   });

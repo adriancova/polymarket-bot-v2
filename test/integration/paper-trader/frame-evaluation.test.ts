@@ -275,16 +275,20 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
     expect(trader.loop.health().loop.eventsProcessed).toBe(opening().length + trades.length);
   });
 
-  it("a frame whose first event halts its market (desynchronized book) is not evaluated at its close", async () => {
+  it("a frame whose first event halts its market (a book FAULT) is not evaluated at its close", async () => {
     const { trader } = assembleOrThrow({ evaluationCadence: PER_FRAME });
+    await drive(trader, opening());
+    const opened = trader.loop.decisions().length;
     const frame = [
-      // A level change for a token with no baseline in this run: BOOK_DESYNCHRONIZED.
-      inFrame("400", level(YES_TOKEN, "ASK", "0.39", "150", 1, "2026-03-04T12:00:01.000Z")),
-      inFrame("400", level(NO_TOKEN, "BID", "0.6", "150", 2, "2026-03-04T12:00:01.000Z")),
+      // `C1-HALTS`: a level change naming a token that is neither of this
+      // market's two is a contract fault, which halts (BOOK_DESYNCHRONIZED).
+      // A book that merely has no baseline waits instead (book-waits.test.ts).
+      inFrame("400", level("999", "ASK", "0.39", "150", 5, "2026-03-04T12:00:01.000Z")),
+      inFrame("400", level(NO_TOKEN, "BID", "0.6", "150", 6, "2026-03-04T12:00:01.000Z")),
     ];
     await drive(trader, frame);
     expect(trader.halts.isMarketHalted(MARKET_ID)).toBe(true);
-    expect(trader.loop.decisions()).toHaveLength(0);
+    expect(trader.loop.decisions().length - opened).toBe(0);
   });
 
   it("a REPLAYED raw record — several envelopes carrying the record's own identity, no causationId — is one frame", async () => {

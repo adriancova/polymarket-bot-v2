@@ -22,12 +22,11 @@ import {
   recordedEvents,
   restingEntryConfig,
   restingEntryEvents,
-  restingEntryTradeEvent,
   traderConfig,
   twoMarketConfig,
   twoMarketEvents,
 } from "./support/fixture.js";
-import { assembleOrThrow, driveRecordedRun } from "./support/run.js";
+import { assembleOrThrow, driveRecordedRun, pauseInstanceByWatchdog, restingTradeAfterPause } from "./support/run.js";
 
 describe("MEDIUM-1 — a halt latched in this iteration stops the STRATEGY, not the books", () => {
   it("a fill whose own iteration halts is BOOKED and NOT delivered", async () => {
@@ -46,7 +45,6 @@ describe("MEDIUM-1 — a halt latched in this iteration stops the STRATEGY, not 
 
     const halt = run.trader.halts.globalHalt();
     expect(halt?.code).toBe("STORE_UNAVAILABLE");
-    expect(halt?.action).toBe("FULL_HALT");
 
     // THE BOOKS ARE TRUTHFUL. The money moved, so the ledger holds it and the
     // §6 invariant 4 chain is complete — none of that is gated on the halt.
@@ -90,11 +88,12 @@ describe("MEDIUM-1 — a halt latched in this iteration stops the STRATEGY, not 
 
 describe("M10 — `runStatePermitsIntent` is the run's REAL state", () => {
   it("a latched halt elsewhere blocks an intent this market would otherwise submit", async () => {
-    // Market 2's book desynchronizes: a level change with no baseline is
-    // REFUSED by `packages/order-book`, and the loop halts THAT market. Market 1
-    // is untouched, so its instance still evaluates and still emits an entry —
-    // and §9.8 check 1 must refuse it, because the RUN is no longer in a state
-    // that permits new orders.
+    // Market 2's book refuses an update for a FAULT reason (`C1-HALTS`): a
+    // level change naming a token that is neither of its two — a contract or
+    // programming fault, so the loop halts. Market 1 is untouched, so its
+    // instance still evaluates and still emits an entry — and §9.8 check 1
+    // must refuse it, because the RUN is no longer in a state that permits
+    // new orders (every halt ends the run).
     // `CADENCE-1` (ADR-026 D1.6): the desync below is injected FIRST with the
     // instant of a LATER event (:03 before :01), which under the PAPER cadence
     // moves the event clock ahead and coalesces market 1's second book
@@ -117,7 +116,7 @@ describe("M10 — `runStatePermitsIntent` is the run's REAL state", () => {
         eventType: "BookLevelChanged",
         payload: {
           internalMarketId: "018f4a7e-7777-7abc-8def-0123456789ab",
-          tokenId: "333",
+          tokenId: "999",
           side: "ASK",
           price: "0.34",
           size: "10",
@@ -237,43 +236,28 @@ describe("L3 — the reservation books, taken and released on the RIGHT events",
 });
 
 describe("L2 — a GENUINELY PAUSED instance is offered its fill", () => {
-  it("paused by a persistence failure, released by an operator, then offered a fill", async () => {
-    // 1. The outbox is one deep, so the SECOND decision of an iteration cannot
-    //    be appended. `packages/strategy-runtime` answers HALTED and PAUSES the
-    //    instance (`RUNTIME.DECISION_PERSIST_FAILED`), and the loop latches the
-    //    instance's own halt. This is the real §6-invariant-3 failure, not a
-    //    flag a test set.
-    const run = assembleOrThrow({
-      config: restingEntryConfig({
-        queues: { ingestMaximumDepth: 1024, outboxMaximumDepth: 1 },
-      }),
-    });
+  it("paused by its watchdog (no halt), then offered a fill", async () => {
+    // 1. A real pause with no halt (C1-HALTS: a halt ends the run, and nothing
+    //    releases one, so the old route — a persistence failure's halt, then a
+    //    release — no longer exists). The runtime's watchdog contains an
+    //    overrunning evaluation and pauses the instance.
+    const run = assembleOrThrow({ config: restingEntryConfig() });
     for (const event of recordedEvents()) run.trader.loop.ingest(event);
     await run.trader.loop.drain();
+    expect(run.parts.venue.ordersSnapshot()[0]?.state).toBe("RESTING");
+    await pauseInstanceByWatchdog(run);
 
     const instance = run.trader.registry.get(INSTANCE_ID);
     expect(instance?.runtime.instanceStatus()).toBe("PAUSED");
-    expect(run.trader.loop.health().halts.map((halt) => halt.code)).toContain(
-      "RUNTIME_PERSISTENCE_FAILED",
-    );
+    expect(run.trader.loop.health().loop.containedEvaluations).toBe(1);
+    expect(run.trader.loop.health().halts).toEqual([]);
     expect(run.parts.venue.ordersSnapshot()[0]?.state).toBe("RESTING");
-
-    // 2. The operator reconciles and releases the INSTANCE's halt against the
-    //    §7.1 evidence the controller demands. The instance stays PAUSED —
-    //    `release` clears a §4.2 latch, not a runtime state.
-    expect(
-      run.trader.halts.release(
-        { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_ID },
-        { authoritativeSnapshotApplied: true, reason: "decision store reconciled by operator" },
-      ),
-    ).toBe(true);
-    expect(instance?.runtime.instanceStatus()).toBe("PAUSED");
 
     const ledgerBefore = run.trader.loop.ledger().length;
     const refusedBefore = run.trader.loop.health().loop.refusedEvaluations;
 
-    // 3. A trade touches the resting order and it fills.
-    run.trader.loop.ingest(restingEntryTradeEvent());
+    // 2. A trade touches the resting order and it fills.
+    run.trader.loop.ingest(restingTradeAfterPause());
     await run.trader.loop.drain();
 
     const health = run.trader.loop.health();

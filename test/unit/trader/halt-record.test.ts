@@ -5,7 +5,8 @@
  * 1. `haltIncidentRows`: every halt scope maps to `ops.incidents` rows the
  *    research worker's reader matches (`market_id` = the window's market, or
  *    `market_id` NULL with an `instance_id` of the window's), with the halt's
- *    own code, §9.9 action, instant and (bounded) detail. Every
+ *    own code, instant and (bounded) detail, and `action` NULL (`C1-HALTS`:
+ *    every halt ends the run, so no §9.9 rung is selected). Every
  *    `HaltReasonCode` maps.
  * 2. `PostgresTraderStore.recordHalts`: one transaction, on ONE connection it
  *    checks out of the pool itself, that first bounds its own
@@ -56,7 +57,7 @@ function latched(...entries: readonly [HaltRecord["scope"], HaltReasonCode, stri
 const CONTEXT = { accountRef: "paper-account", instanceIds: [INSTANCE_A, INSTANCE_B] } as const;
 
 describe("haltIncidentRows: every halt becomes ops.incidents rows the window classifier reads (PROVENANCE-1)", () => {
-  it("a GLOBAL halt: one market-less row per configured instance, each naming the halt's code, action, instant and detail", () => {
+  it("a GLOBAL halt: one market-less row per configured instance, each naming the halt's code, instant and detail, action NULL", () => {
     const rows = haltIncidentRows(latched([{ kind: "GLOBAL" }, "TRANSPORT_UNAVAILABLE", "the event transport is unavailable"]), CONTEXT);
     expect(rows).toEqual([
       {
@@ -66,7 +67,7 @@ describe("haltIncidentRows: every halt becomes ops.incidents rows the window cla
         severity: "PAGE",
         status: "OPEN",
         failure_class: "TRANSPORT_UNAVAILABLE",
-        action: "FULL_HALT",
+        action: null,
         market_id: null,
         instance_id: INSTANCE_A,
         detail: "the event transport is unavailable",
@@ -79,7 +80,7 @@ describe("haltIncidentRows: every halt becomes ops.incidents rows the window cla
         severity: "PAGE",
         status: "OPEN",
         failure_class: "TRANSPORT_UNAVAILABLE",
-        action: "FULL_HALT",
+        action: null,
         market_id: null,
         instance_id: INSTANCE_B,
         detail: "the event transport is unavailable",
@@ -97,12 +98,12 @@ describe("haltIncidentRows: every halt becomes ops.incidents rows the window cla
       CONTEXT,
     );
     expect(rows.map((row) => [row.incident_key, row.failure_class, row.action, row.market_id, row.instance_id])).toEqual([
-      [HALT_INCIDENT_KEYS.MARKET, "BOOK_DESYNCHRONIZED", "CANCEL_RESTING_ORDERS", MARKET, null],
-      [HALT_INCIDENT_KEYS.STRATEGY_INSTANCE, "RUNTIME_PERSISTENCE_FAILED", "FULL_HALT", null, INSTANCE_B],
+      [HALT_INCIDENT_KEYS.MARKET, "BOOK_DESYNCHRONIZED", null, MARKET, null],
+      [HALT_INCIDENT_KEYS.STRATEGY_INSTANCE, "RUNTIME_PERSISTENCE_FAILED", null, null, INSTANCE_B],
     ]);
   });
 
-  it("EVERY halt code maps, with the controller's own §9.9 action — TRANSPORT_RESYNC_REQUIRED and STORE_UNAVAILABLE among them", () => {
+  it("EVERY halt code maps, action NULL — TRANSPORT_RESYNC_REQUIRED and STORE_UNAVAILABLE among them", () => {
     const codes: readonly HaltReasonCode[] = [
       "TRANSPORT_UNAVAILABLE",
       "TRANSPORT_RESYNC_REQUIRED",
@@ -118,13 +119,12 @@ describe("haltIncidentRows: every halt becomes ops.incidents rows the window cla
       "RUNTIME_PERSISTENCE_FAILED",
       "EVENT_UNREADABLE",
       "BOOK_DESYNCHRONIZED",
-      "OPERATOR_HALT",
     ];
     for (const code of codes) {
       const halts = latched([{ kind: "MARKET", marketId: MARKET }, code, `detail of ${code}`]);
       const [row] = haltIncidentRows(halts, CONTEXT);
       expect(row?.failure_class).toBe(code);
-      expect(row?.action).toBe(halts[0]?.action);
+      expect(row?.action).toBeNull();
       expect(row?.opened_at).toBe(AT);
     }
   });
@@ -318,7 +318,7 @@ describe("PostgresTraderStore.recordHalts: one bounded transaction on ONE connec
     expect([...columns].sort()).toEqual(
       ["account_ref", "action", "detail", "environment", "failure_class", "incident_key", "instance_id", "market_id", "opened_at", "severity", "status"],
     );
-    expect(seen.parameters[2]).toEqual(expect.arrayContaining(["TRADER_HALT:GLOBAL", "TRANSPORT_RESYNC_REQUIRED", "FULL_HALT", INSTANCE_A]));
+    expect(seen.parameters[2]).toEqual(expect.arrayContaining(["TRADER_HALT:GLOBAL", "TRANSPORT_RESYNC_REQUIRED", null, INSTANCE_A]));
     expect(seen.statements[3]).toBe("commit");
     expect(seen.statements).toHaveLength(4);
     // Given back plainly (to be reused), once; its `error` events were the

@@ -50,6 +50,7 @@ export function asksForHelp(argv: readonly string[]): boolean {
 export interface RegisterArguments {
   /** Absent in the market mode (the discriminant of {@link ParsedRegisterArguments}). */
   readonly series?: undefined;
+  readonly newRun?: undefined;
   readonly template: string;
   readonly out: string;
   readonly instanceName: string;
@@ -66,6 +67,7 @@ export interface RegisterArguments {
 /** `ROLLOVER-1`: the arguments of the SERIES mode (`--series`): one series-bound instance and run. */
 export interface SeriesRegisterArguments {
   readonly series: true;
+  readonly newRun?: undefined;
   readonly template: string;
   readonly out: string;
   readonly instanceName: string;
@@ -73,7 +75,19 @@ export interface SeriesRegisterArguments {
   readonly createdBy: string;
 }
 
-export type ParsedRegisterArguments = RegisterArguments | SeriesRegisterArguments;
+/**
+ * `C1-HALTS` (NEW-RUN): the arguments of `--new-run <instanceId>`: one new run
+ * of an instance a completed document already names (`new-run.ts`).
+ */
+export interface NewRunArguments {
+  readonly series?: undefined;
+  readonly newRun: string;
+  readonly template: string;
+  readonly out: string;
+  readonly codeCommit: string;
+}
+
+export type ParsedRegisterArguments = RegisterArguments | SeriesRegisterArguments | NewRunArguments;
 
 export type ParsedArguments =
   | { readonly ok: true; readonly arguments: ParsedRegisterArguments }
@@ -92,6 +106,7 @@ const OPTIONS = {
   "no-label": { type: "string" },
   "code-commit": { type: "string" },
   "created-by": { type: "string" },
+  "new-run": { type: "string" },
   series: { type: "boolean" },
 } as const;
 
@@ -119,6 +134,7 @@ const STRING_FLAGS: readonly StringFlag[] = [
   "no-label",
   "code-commit",
   "created-by",
+  "new-run",
 ];
 
 /** The largest `integer` column value (`trading_delay_seconds`). */
@@ -163,6 +179,22 @@ export function parseRegisterArguments(argv: readonly string[]): ParsedArguments
     if (value.trim() === "") problems.push(`--${flag} must not be empty`);
     return value;
   };
+
+  if (values["new-run"] !== undefined) {
+    // `C1-HALTS`: a new run of a registered instance registers no market, no
+    // instance and no config, so every flag describing one is a mistake about
+    // what is being registered — refused, never ignored.
+    if (series) problems.push("--series registers a new instance, and --new-run registers none");
+    for (const flag of [...MARKET_FLAGS, "instance-name", "created-by"] as const) {
+      if (values[flag] !== undefined) problems.push(`--${flag} describes what --new-run reuses, and it registers none`);
+    }
+    const newRun = required("new-run");
+    const template = required("template");
+    const out = required("out");
+    const codeCommit = required("code-commit");
+    if (problems.length > 0) return { ok: false, problems };
+    return { ok: true, arguments: { newRun, template, out, codeCommit } };
+  }
 
   if (series) {
     // `ROLLOVER-1`: the series mode registers no market, so a market flag is

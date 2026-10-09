@@ -590,6 +590,22 @@ export class OutcomeTokenBook {
     return this.#lastVenueBookHash;
   }
 
+  /**
+   * `C1-HALTS`: forgets the baseline, so the book is NOT synchronized until
+   * the next applied snapshot re-baselines it. A consumer calls this when an
+   * update was refused for a reason that means the book may have diverged
+   * from the venue (a newer generation, another epoch, a refused snapshot):
+   * the refusal alone leaves the PRIOR baseline in place, which would still
+   * vouch for a superseded book. From here every level change is refused
+   * `ORDER_BOOK_NO_BASELINE_SNAPSHOT` and any well-formed snapshot applies.
+   * The levels and the last update are kept: they are what the book last
+   * knew, and they age (`stalenessMs`) like any book nothing updates.
+   */
+  clearBaseline(): void {
+    this.#baseline = undefined;
+    this.#lastIngestSeqValue = undefined;
+  }
+
   /** The freshness identity level changes are currently accepted under. */
   baseline(): BookBaseline | undefined {
     return this.#baseline === undefined ? undefined : { ...this.#baseline };

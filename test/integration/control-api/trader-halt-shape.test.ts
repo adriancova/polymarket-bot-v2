@@ -107,21 +107,18 @@ const HALTS: TraderHalts = [
     code: "TRANSPORT_UNAVAILABLE",
     detail: "redis did not answer",
     at: "2026-10-04T00:00:01.000Z",
-    action: "FULL_HALT",
   },
   {
     scope: { kind: "MARKET", marketId: MARKET_ID },
     code: "BOOK_DESYNCHRONIZED",
     detail: "book hash mismatch",
     at: "2026-10-04T00:00:02.000Z",
-    action: "CANCEL_RESTING_ORDERS",
   },
   {
     scope: { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_A },
     code: "LEDGER_POSTING_REFUSED",
     detail: "posting refused",
     at: "2026-10-04T00:00:03.000Z",
-    action: "MANAGE_KNOWN_POSITIONS_ONLY",
   },
 ];
 
@@ -169,7 +166,10 @@ describe("the trader's REAL halt rows, through the control API's door (CONTROL-2
     expect(read.halts.irregular).toBe(0);
     for (const row of read.halts.listed) expect(row.irregularities, row.incidentKey).toEqual([]);
     const market = read.halts.listed.find((row) => row.scope === "MARKET");
-    expect(market).toMatchObject({ marketId: MARKET_ID, instanceId: null, failureClass: "BOOK_DESYNCHRONIZED", action: "CANCEL_RESTING_ORDERS" });
+    expect(market).toMatchObject({ marketId: MARKET_ID, instanceId: null, failureClass: "BOOK_DESYNCHRONIZED" });
+    // C1-HALTS: the trader writes `action` NULL; the door reads it and shows none.
+    expect(rows.every((row) => row["action"] === null)).toBe(true);
+    expect(market !== undefined && "action" in market).toBe(false);
     const instance = read.halts.listed.find((row) => row.scope === "STRATEGY_INSTANCE");
     expect(instance).toMatchObject({ marketId: null, instanceId: INSTANCE_A, detail: "posting refused" });
     expect(read.halts.listed.filter((row) => row.scope === "GLOBAL").map((row) => row.instanceId).sort()).toEqual([INSTANCE_A, INSTANCE_B]);
