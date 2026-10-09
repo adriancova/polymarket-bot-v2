@@ -48,42 +48,6 @@ were. `split-status.py` writes a note after each such region with the working
 links; Proof A checks the note is exactly the generated one, and C4 checks that
 every archived link resolves from the root and has a working counterpart.
 
-## Tools
+## Tools (removed)
 
-All are Python 3 standard library, deterministic and offline. Run them from the
-repository root.
-
-- `python3 tools/records/split-status.py --base <rev>` writes the archive files from `<rev>:IMPLEMENTATION_STATUS.md`. The split keys on headings and row ids, not line numbers.
-- `python3 tools/records/move-map.py --base <rev>` writes `MOVE-MAP.md`. Re-run it after editing the brief or `REWRITES.md`. C5 checks that the map is exactly its output, and that the line for each carried completion record or Complete row names its entry.
-- `python3 tools/records/check-preservation.py --base <rev>` runs three proofs:
-  - A: the archive regions partition the base file exactly.
-  - B: every non-blank base line is present, counted with multiplicity.
-  - C: the brief names every package and open item, its SHAs exist, its links resolve, and the move map is complete.
-  - C also checks `REWRITES.md` against the base and the brief: old blocks are verbatim, every base line is paired or declared, and each declaration's kind and disposition are checked (C6, C8-C16). [`REWRITES.md`](REWRITES.md) lists each check.
-  - A declared kind can still pass while partly wrong: a partly closed row can pass as closed, and `REWRITES.md` says which.
-  - C15 checks that each residual clause holds a marker, not that the marker covers the whole clause, so reviewers must check the rest of each clause.
-  - C authenticates what `REWRITES.md` says. It cannot tell whether a rewrite kept every fact, or whether a drop reason is true; that is a review question.
-- `python3 tools/records/check-brief.py --base <rev>` checks the brief's budget (15% of the base file) and the measurable parts of the writing standard. For example: no sentence over 45 words (K23), and a commit pin in every section that cites a file line (K25).
-  - K31 is a set of regression checks for 17 specific closures that review found. Each rule reads its evidence at the cut. K31 is not a detector: an item closed before the cut that no rule names still passes.
-  - K32 checks the pending dashboard panels against the code. K33 checks every file:line citation in the brief against the file at the cut. K34 checks that the brief names every id still in `BINANCE_UNVERIFIED`.
-  - K36 checks that facts review found dropped are carried: each rule names a brief row or bullet, the words it must hold, and the source text at the cut.
-  - K37 checks that a section's file:line citations are pinned to the commit its intro names, unless a line says the file is unchanged there. It also refuses a fixed list of wordings that review refused at the re-cut.
-- `python3 tools/records/selftest-preservation.py` shows the proofs are not vacuous: it mutates a scratch copy, including a synthetic re-cut, and checks that each mutation fails and each re-cut passes.
-
-## Re-cutting after edits on `main`
-
-Edits made to the old file on `main` after the cut (new rows, status flips) are
-re-applied like this. `REWRITES.md` stays pinned to its `rewrites-base`
-(`f43efe6`), so its existing line numbers never change.
-
-1. Merge `main`. Resolve the conflict in `IMPLEMENTATION_STATUS.md` by keeping the brief.
-2. Run `python3 tools/records/split-status.py --base <main tip>`. The archive now holds those edits verbatim.
-3. For each id in `git diff f43efe6 <main tip> -- IMPLEMENTATION_STATUS.md`, update its one line in the brief.
-4. In `REWRITES.md`, cover every line inserted or changed since `f43efe6`. Do not renumber existing blocks.
-   - Blocks that name an earlier re-cut (`base=<sha>`, first used at `8fde4df`) are the exception: the check knows only the rewrites-base and the current cut, so move them to the new cut and renumber their lines. The self-test's synthetic re-cut does this.
-   - Changed lines: add an entry whose old block names the cut (`~~~old base=<main tip sha> lines=a-b`), with keep phrases for an open or live row; or add a declaration to a `~~~unpaired base=<main tip sha>` block.
-   - A new Complete row that mentions a residual or follow-up needs a disposition (C12). Its live residuals go in the brief's "Residuals recorded in Complete package rows", with an excerpt entry. Each residual clause it does not carry gets a drop line (C15).
-   - A new completion-record item that names an obligation is declared `record-item` (C14). Its live part goes in "Obligations in completion records".
-   - Before carrying an item as owed, check that no later record or contract commit closed it (`git log <cut> -- docs/contracts docs/adr`, the later handoffs, the code comment). If one did, write a drop line with the evidence instead.
-5. Run `python3 tools/records/move-map.py --base <main tip>`, then `check-preservation.py --base <main tip>`, `check-brief.py --base <main tip>` and `selftest-preservation.py`. All must pass.
-6. Update the cut line above.
+The one-time tools that cut and proved this archive (`split-status.py`, `move-map.py`, `check-preservation.py`, `selftest-preservation.py`) were removed at `b8927d2` (COMPLEXITY-1, 2026-10-08). The archive is frozen, so no re-cut is needed. The base is `f43efe6` and the cut is `8fde4df`. To inspect a tool, run `git show f43efe6:tools/records/<name>`. `check-brief.py` remains, and checks the current brief only.
