@@ -347,7 +347,6 @@ a port that refuses and records:
 | An empty, read-only OMS view (this CLI holds no trader memory) | `resume()` is refused (`OMS_RESUME_BLOCKED`) |
 | A journal in memory | Nothing reaches the trader's journal |
 | A holdings port | Bookings are refused |
-| A halt port | Halts are recorded, not delivered |
 
 `releaseQuarantine` is never called. Every venue order reads as unattributed
 here by construction. Without a ledger projection source (none is bound yet),

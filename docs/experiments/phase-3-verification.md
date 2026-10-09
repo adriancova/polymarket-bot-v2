@@ -337,16 +337,18 @@ Two positive controls show a genuine F1, live and recovered after a crash, is st
 | Population | File | Releases |
 | --- | --- | --- |
 | Crash matrix, no-crash baselines | `mid-order-crash.test.ts` | 1 |
-| Crash matrix, kill runs | `mid-order-crash.test.ts` | 151 |
+| Crash matrix, kill runs | `mid-order-crash.test.ts` | 139 |
 | Crash named pins (one baseline) | `mid-order-crash.test.ts` | 1 |
-| Crash property | `mid-order-crash.property.test.ts` | 71 |
+| Crash property | `mid-order-crash.property.test.ts` | 70 |
 | Stream named (route 2) | `lost-stream-events.test.ts` | 1 |
 | Stream property | `lost-stream-events.property.test.ts` | 59 |
-| **The r0 suites** | | **284** |
+| **The r0 suites** | | **271** |
 | Release-driver pins (r1) | `release-driver.test.ts` | 3 |
-| **Total** | | **287** |
+| **Total** | | **274** |
 
 The r0 report gave 151 + 71 + 59 (+1) = 282; it missed the two baselines (J3). The four TODAY tests of `findings.test.ts` release their quarantine by hand and are not counted.
+
+**Note (2026-10-09, C1-OMS06).** The table above is the current pins. When this report was written, the suites pinned 151 kill-run releases, 71 property releases, 284 on the r0 suites and 287 in total. C1-OMS06 deleted WP-290's halt port: the live gate now reads the quarantines from the coordinator's journal. The coordinator's `halt.market` calls were kill points, so they are gone. MID-ANSWER has 101 port calls instead of 106, and its kill runs release 139 times instead of 151. The seeded crash property's kills land elsewhere and release 70 times instead of 71. §4.1's call and kill figures predate the change.
 
 **Owner, and the ruling.** The user ruled on 2026-10-05: venue-time ordering. The venue timestamp is passed into the OMS. A `LIVE` older than the evidence that made the order terminal is recorded as stale, with no halt; a newer one still halts. Before live: a short ADR, then a `packages/oms` round, with a venue check of the stream timestamps' ordering and precision. Until then, every `LIVE` after a terminal state needs an operator. When that round lands, the `it.fails` markers fail, and every count above drops to 0.
 
