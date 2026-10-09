@@ -84,8 +84,10 @@ to each.
 **Every halt ends the run.** The trader makes no further decision and exits
 `75`; nothing resumes a halted run.
 
-1. **Read the halt**: on stderr, and as an open `TRADER_HALT:*` row in
-   `ops.incidents` (§6).
+1. **Read the halt** on stderr first. It is also an open `TRADER_HALT:*` row in
+   `ops.incidents` (§6) when the record landed. If stderr says `HALT RECORD NOT
+   DURABLE` or `UNCONFIRMED` (for example, PostgreSQL was down), keep the logs:
+   they are the only record.
 2. **Fix the cause** the halt names.
 3. **Register a new run and start it** (§1, steps 4-5).
 
@@ -121,7 +123,7 @@ halt again right after it starts. If it does, read that halt (§4) first.
 | What | Where |
 | --- | --- |
 | Trader halts and exit | Trader stderr: the halt lines and the final `trader stopped: exit <code> — …`. |
-| Halts that outlive the trader | `ops.incidents`, the open `TRADER_HALT:*` rows. The control API reads them on `GET /v1/health` and `/v1/metrics` (`control_trader_halts_state`; the alert is `TraderHaltOpenOrUnknown`). |
+| Halts that outlive the trader | `ops.incidents`, the open `TRADER_HALT:*` rows, when the record landed (stderr says otherwise). The control API reads them on `GET /v1/health` and `/v1/metrics` (`control_trader_halts_state`; the alert is `TraderHaltOpenOrUnknown`). |
 | Trader health | `GET /health` on `TRADER_HEALTH_BIND:TRADER_HEALTH_PORT`, which the control API relays. |
 | Gateway incidents and halts | Gateway stderr: `[incident]`, `[halt]` and `[wal]` lines ([`recorder.md`](recorder.md) §2). The gateway serves no `/metrics` yet. |
 | Dashboards | `infra/grafana/control/`, through the control API scrape (`infra/prometheus/control-api-scrape.yaml`). |
