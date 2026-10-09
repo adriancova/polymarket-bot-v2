@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-10-08 (residuals moved to `docs/handoffs/RESIDUALS.md` by `COMPLEXITY-1`)  
+Last updated: 2026-10-09 (`COMPLEXITY-1` complete; its residuals are in `docs/handoffs/RESIDUALS.md`)  
 Specification version: 2.0.0  
 Maximum permitted run mode: `PAPER`
 
@@ -38,7 +38,6 @@ This file is the brief: current state only, one entry per item. It holds the saf
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id). Completed packages are in [`docs/handoffs/INDEX.md`](docs/handoffs/INDEX.md); what each closed is under [Open blockers](#open-blockers).
 
 - **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
-- **`COMPLEXITY-1`**: Ready (authorized 2026-10-08 by the user). A complexity audit with fixes in one go. Its scope is everything, process included; debatable removals go to the user, and `AGENTS.md` changes need the user's approval. `V2-9`'s scanner was cut down in its round C1-V29 and merged (`636536a`). It runs before `OMS-VENUE-TIME` and `TIF-COLLATERAL`.
 - **`OMS-VENUE-TIME`** and **`TIF-COLLATERAL`**: parked until the execution probe (COMPLEXITY-1, 2026-10-08; ADR-034's dated note). Only D3.1 item 2, time-in-force on the plan, was built (round C1-TIF).
 - Wave 3 is authorized, and both conditions hold ([Wave 3 authorization](#wave-3-authorization-conditional)).
 
@@ -53,7 +52,6 @@ Completed packages are listed in [`docs/handoffs/INDEX.md`](docs/handoffs/INDEX.
 | `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
 | `OMS-VENUE-TIME` | ADR-034 R2 (D1, `WP340-F1`): venue-time ordering of late order observations, with the user-confirmed hold, halt at once and `DELAYED`/`UNMATCHED` extension | Parked until the execution probe (COMPLEXITY-1, 2026-10-08). When built, D1 takes the self-clearing form (ADR-034's dated note) | — | — |
 | `TIF-COLLATERAL` | ADR-034 R3 (D3 `CO3-N2`, D4 `V2-10B`): time-in-force end to end; collateral-targeted FAK/FOK BUYs with plan-time share caps (variant P) | Parked until the execution probe (COMPLEXITY-1, 2026-10-08). D3.1 item 2 was built by C1-TIF; FAK/FOK entries are refused at configuration until D4 is built | — | — |
-| `COMPLEXITY-1` | Complexity audit with fixes (scope: everything, process included) | **Running** (authorized 2026-10-08, user): C1-V29 merged with V2-9; C1-PROC merged via PR #91; C1-OPS merged via PR #92; C1-HALTS merged via PR #93; C1-RISK merged via PR #94; C1-UNIV merged via PR #95; C1-TIF merged via PR #96. All seven rounds are merged; follow-ups: C1-TIDY merged via PR #97, C1-OMS06 in flight | — | [COMPLEXITY-1](docs/handoffs/COMPLEXITY-1.md) |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>`. The user starts it later on 2026-10-05 and reports back | — | — |
 | All other packages not in `docs/handoffs/INDEX.md` | — | Blocked | — | See work plan |
 

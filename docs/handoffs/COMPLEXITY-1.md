@@ -1,6 +1,6 @@
 # COMPLEXITY-1: complexity audit with fixes
 
-**Status:** Running (authorized by the user, 2026-10-08). This handoff is updated as each round merges.
+**Status:** Complete (2026-10-09). Authorized by the user on 2026-10-08. Seven rounds and two follow-up rounds merged via PRs #91-#98 (C1-V29 merged with V2-9).
 **Principle:** AGENTS.md "Design principle: proportionality", adopted 2026-10-08 (`3a2a77a`, formalized `5129b98`).
 **Scope (user):** everything, process included, as an audit and fixes in one go. Debatable items go to the user.
 
