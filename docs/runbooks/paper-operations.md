@@ -44,8 +44,7 @@ GATEWAY_REDIS_URL=$REDIS_URL GATEWAY_CONFIG_PATH=/path/to/gateway.json \
 
 6. **Optionally, the control API** ([`apps/control-api/README.md`](../../apps/control-api/README.md),
    "Running it"), with `traderHalts` `postgres` and `traderHealth` at the
-   trader's health port. Read it only: no trader reads its controls, so a
-   pause or kill-switch engage there stops nothing (stop with §2).
+   trader's health port. It only reads: its `POST` routes answer `501`.
 
 Gateway configuration: [`infra/compose/data-gateway/README.md`](../../infra/compose/data-gateway/README.md).
 A gateway banner ending `PUBLICATION HALTED, RECORDING ONLY` means Redis was
