@@ -466,12 +466,6 @@ export const BREAK_TAXONOMY = Object.freeze({
     meaning: "the OMS refused an answer the coordinator delivered",
     handling: "held; a later run reads again",
   },
-  HALT_DELIVERY_FAILED: {
-    family: "CONTROL",
-    rule: HOLD,
-    meaning: "a market or account halt could not be handed to the halt port",
-    handling: "held; the halt is delivered again by every run",
-  },
   REQUEST_MALFORMED: {
     family: "CONTROL",
     rule: HOLD,

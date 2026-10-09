@@ -255,7 +255,7 @@ describe("WP-340 acceptance 2: unmatched activity becomes UNATTRIBUTED, with its
     const view = r.node.journal.unresolvedBreaks().find((entry) => entry.breakClass === "ORDER_UNATTRIBUTED");
     expect(view).toMatchObject({ status: "QUARANTINED", scope: "MARKET", marketId: MARKET });
     expect(view?.detail).toContain(foreign.venueOrderId);
-    expect(r.world.u.halts.some((halt) => halt.breakId === view?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(r.node.coordinator.quarantinedBreaks().some((halt) => halt.breakId === view?.breakId && halt.scope === "MARKET" && halt.marketId === MARKET)).toBe(true);
     expect((await r.oms.submit(ticket(G, { n: 70, shares: "1" }))).ok).toBe(false);
     // The driver does not release an UNATTRIBUTED quarantine: only WP340-F1 is its to release (J1).
     expect(r.world.findings).toEqual([]);

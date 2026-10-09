@@ -50,7 +50,7 @@ describe("WP-290: reconcile runs the real coordinator, read-only", () => {
     expect(h.audit.records.at(-1)?.detail["resumed"]).toBe(false);
   });
 
-  it("an open order the trader's memory would own is UNATTRIBUTED here: a quarantine and a halt are REPORTED, none delivered, none released", async () => {
+  it("an open order the trader's memory would own is UNATTRIBUTED here: a quarantine is REPORTED, none released", async () => {
     const release = vi.spyOn(ReconciliationCoordinator.prototype, "releaseQuarantine");
     const h = harness({ projection: matchingProjection() });
     h.venue.add(order("o-1", { tokenId: TOKEN_YES }));
@@ -58,7 +58,6 @@ describe("WP-290: reconcile runs the real coordinator, read-only", () => {
     expect(outcome.exitName).toBe("RECONCILE_BREAKS");
     expect(outcome.exitCode).toBe(EXIT_CODES.RECONCILE_BREAKS);
     expect(h.text()).toContain("break ORDER_UNATTRIBUTED");
-    expect(h.text()).toMatch(/halt requested, NOT delivered: account/u);
     expect(h.text()).toContain("quarantines released: none (never called)");
     expect(release).not.toHaveBeenCalled();
     // Nothing was cancelled or written at the venue: reads only.

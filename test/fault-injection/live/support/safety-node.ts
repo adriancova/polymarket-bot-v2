@@ -187,7 +187,6 @@ export async function bootSafetyNode(world: LiveWorld, options: SafetyNodeOption
       return {
         wrapVenue: (venue) => composed.fenceVenue(venue, REFUSALS, CLASSIFIER),
         wrapDependencies: (deps) => omsProgress.dependencies(deps),
-        halts: { haltMarket: (request) => composed.halts.haltMarket(request), haltAccount: (request) => composed.halts.haltAccount(request) },
       };
     },
   });

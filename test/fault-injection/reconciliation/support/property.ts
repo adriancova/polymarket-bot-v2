@@ -65,7 +65,7 @@ import { decodeCompositeKey } from "../../../../packages/oms/src/reconciliation/
 import { venueIdFor } from "../../../unit/oms/support/fake-venue.js";
 import { uuid7 } from "../../../unit/oms/support/ids.js";
 
-import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, bookReversal, boot, reopenOms, streamTrade, universe, type Process, type Universe } from "./harness.js";
+import { ACCOUNT, Killed, MARKET, MARKET_NO, NO, PUSD, YES, bookReversal, boot, halted, reopenOms, streamTrade, universe, type Process, type Universe } from "./harness.js";
 import { readApprovals, readCollateral, readOpenOrders, readOrderById, readPositions, readTrades } from "../../../../packages/oms/src/reconciliation/door.js";
 import { isLegalSettlementTransition } from "../../../../packages/oms/src/states.js";
 
@@ -1314,9 +1314,10 @@ class Sim {
       const tail = compositeKey(String(ordinal), alert.kind, alert.orderId ?? "", alert.submissionAttemptId ?? "", alert.venueOrderId ?? "");
       if (!alertBreaks.some((view) => view.subjectKey.endsWith(tail))) this.violations.push(`lost halt obligation: OMS halting alert ${String(ordinal)} (${alert.kind}) has no break`);
     }
-    // Every quarantine standing now had its halt delivered.
+    // Every quarantine standing now is a halt the live entry gate reads (C1-OMS06: `quarantinedBreaks`).
+    const halts = halted(this.p);
     for (const view of journal.unresolvedBreaks().filter((entry) => entry.status === "QUARANTINED")) {
-      if (!this.u.halts.some((halt) => halt.breakId === view.breakId)) this.violations.push(`quarantine ${view.breakId} (${view.breakClass}) was never halted`);
+      if (!halts.some((halt) => halt.breakId === view.breakId)) this.violations.push(`quarantine ${view.breakId} (${view.breakClass}) is not halted`);
     }
     this.#checkOracle();
   }

@@ -6,7 +6,7 @@
 
 import { expect, it } from 'vitest';
 import { ready, submitOne, reconcileRounds, type Ready } from '../support/scenario.js';
-import { boot } from '../support/harness.js';
+import { boot, halted } from '../support/harness.js';
 import { trace, type Loose } from "../support/loose.js";
 
 const ev = (r: Ready) => r.p.journal.events() as Loose[];
@@ -100,7 +100,7 @@ it('P-F a second halting alert of the same kind on the same order, after the fir
   const alertBreak = r.p.journal.unresolvedBreaks().find((v) => v.breakClass === 'OMS_HALTING_ALERT');
   const rel = alertBreak ? await r.p.coordinator.releaseQuarantine({ breakId: alertBreak.breakId, operatorRef: 'op', reason: 'reversal booked' }) : null;
   const afterRelease = await reconcileRounds(r, 4);
-  const haltsBefore = r.u.halts.length;
+  const haltsBefore = halted(r.p).length;
   t2.status = 'FAILED';
   r.p.coordinator.trigger('PERIODIC_TIMER');
   const b = await r.p.coordinator.reconcile();
@@ -111,7 +111,7 @@ it('P-F a second halting alert of the same kind on the same order, after the fir
     runB: b.runs.map((x) => [x.status, x.resumed, x.detections.map((d) => d.breakClass)]),
     alerts: r.oms.alerts().map((x) => [x.kind, x.haltMarket, x.detail]),
     settlements: r.u.store.snapshotSync().settlements.map((s: Loose) => [s.venueTradeId, s.state]),
-    newHalts: r.u.halts.length - haltsBefore, paused: r.oms.paused,
+    newHalts: halted(r.p).length - haltsBefore, paused: r.oms.paused,
   }));
 });
 

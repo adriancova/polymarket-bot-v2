@@ -142,7 +142,6 @@ describe("the coordinator's ports and mirrors", () => {
       reads: {} as never,
       journal: p.journal,
       holdings: {} as never,
-      halts: {} as never,
       clock: { now: () => 0 },
       newId: () => "",
       marketOfToken: () => null,

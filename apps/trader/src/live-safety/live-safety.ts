@@ -45,7 +45,7 @@
  * });
  * safety.attachHeartbeat(controller);
  * safety.start(); controller.start();                      // starts lapsed (D6)
- * // WP-290's halt port: safety.halts
+ * // WP-290's halts: read from `coordinator.quarantinedBreaks()` by the gate at every ask (C1-OMS06)
  * // every decision: safety.gate({ kind: "NEW_ENTRY" | "REDUCTION", marketId, instanceId })
  * // every budget poll's events: controller.onBudgetEvents(events)
  * // every periodic reconcile: safety.recordReconcileReport(report, calledAtMs)
@@ -361,6 +361,22 @@ export interface LiveSafetyStatus {
   readonly reconciliationHalts: { readonly account: boolean; readonly markets: readonly string[] };
 }
 
+/**
+ * The live gate's reconciliation halts (C1-OMS06), derived from WP-290's journal at every ask, never latched here: a
+ * QUARANTINED break of MARKET scope with a market halts new entries in that market; any other halts them in the whole
+ * account. So an operator's `releaseQuarantine` lifts exactly that break's halt. A coordinator that cannot read its
+ * journal throws, and the throw reaches the gate, which refuses the entry (`HALTS_UNREADABLE`).
+ */
+function reconciliationHaltsOf(breaks: ReturnType<SafetyCoordinator["quarantinedBreaks"]>): { readonly account: boolean; readonly markets: ReadonlySet<string> } {
+  const markets = new Set<string>();
+  let account = false;
+  for (const view of breaks) {
+    if (view.scope === "MARKET" && typeof view.marketId === "string") markets.add(view.marketId);
+    else account = true;
+  }
+  return { account, markets };
+}
+
 export class LiveSafetyConfigurationError extends Error {
   override readonly name = "LiveSafetyConfigurationError";
   constructor(readonly field: string) {
@@ -384,7 +400,6 @@ export class LiveSafety {
   readonly #eligibility: VenueEligibility;
   readonly #recovery: LapseRecovery;
   readonly #stops = new Map<HeartbeatStopSource, string>();
-  readonly #haltedMarkets = new Set<string>();
   /** Per cancel key (switch event and directive): its obligation, once the port has first accepted it. */
   readonly #cancels = new Map<string, CancelObligation>();
   /** Per cancel key: the one attempt its obligation is waiting on (r3 J2). */
@@ -409,7 +424,6 @@ export class LiveSafety {
   readonly #lastSettleByMarket = new Map<string, number>();
   readonly #lastSettleByInstance = new Map<string, number>();
   readonly #tracker: PlacementTracker;
-  #accountHalted = false;
   /** Whether the latest kill-switch read succeeded (true before the first: the first failure pages). */
   #killSwitchReadable = true;
   #heartbeat: HeartbeatView | null = null;
@@ -422,8 +436,6 @@ export class LiveSafety {
   readonly heartbeatIdSink: { persist(heartbeatId: string): Promise<boolean> };
   /** The controller's event listener. */
   readonly onHeartbeatEvent: (event: unknown) => void;
-  /** WP-290's `HaltPort`, routed into the live gate (`WP290-RESIDUALS`: "route the halt port"). Latched until an operator releases them. */
-  readonly halts: { haltMarket(request: { readonly marketId: string }): void; haltAccount(request: unknown): void };
 
   private constructor(options: LiveSafetyOptions) {
     this.#options = options;
@@ -529,15 +541,6 @@ export class LiveSafety {
     this.onHeartbeatEvent = (event: unknown): void => {
       this.#onHeartbeatEvent(event);
     };
-    this.halts = Object.freeze({
-      haltMarket: (request: { readonly marketId: string }): void => {
-        if (typeof request === "object" && request !== null && typeof request.marketId === "string") this.#haltedMarkets.add(request.marketId);
-        else this.#accountHalted = true;
-      },
-      haltAccount: (): void => {
-        this.#accountHalted = true;
-      },
-    });
   }
 
   /**
@@ -602,7 +605,7 @@ export class LiveSafety {
         },
         recoveryBlocksEntries: () => this.#recovery.blocksNewEntries(),
         eligibility: () => this.#eligibility.verdict(),
-        reconciliationHalts: () => ({ account: this.#accountHalted, markets: this.#haltedMarkets }),
+        reconciliationHalts: () => reconciliationHaltsOf(this.#options.coordinator.quarantinedBreaks()),
       },
       request,
     );
@@ -643,12 +646,6 @@ export class LiveSafety {
     if (!this.#stops.delete(source)) return false;
     this.#record({ kind: "HEARTBEAT_STOP_RELEASED", source, operatorRef, atMs: this.#now() ?? 0 });
     return true;
-  }
-
-  /** An operator's release of the reconciliation halts routed through {@link LiveSafety.halts}. */
-  releaseReconciliationHalts(): void {
-    this.#accountHalted = false;
-    this.#haltedMarkets.clear();
   }
 
   /** Positive evidence for an input the composition proves (MARKET_DATA, USER_DATA, DATABASE), at `atMs` (monotonic). */
@@ -711,11 +708,21 @@ export class LiveSafety {
       explicitStops: Object.freeze([...this.#stops.keys()]),
       heartbeatAttached: this.#heartbeat !== null,
       recoveryBlocksEntries: this.#recovery.blocksNewEntries(),
-      reconciliationHalts: Object.freeze({ account: this.#accountHalted, markets: Object.freeze([...this.#haltedMarkets]) }),
+      reconciliationHalts: this.#reconciliationHaltsStatus(),
     });
   }
 
   // -------------------------------------------------------------------------
+
+  /** The reconciliation halts for {@link LiveSafety.status}: an unreadable journal reads as the account halted, as the gate refuses. */
+  #reconciliationHaltsStatus(): LiveSafetyStatus["reconciliationHalts"] {
+    try {
+      const halts = reconciliationHaltsOf(this.#options.coordinator.quarantinedBreaks());
+      return Object.freeze({ account: halts.account, markets: Object.freeze([...halts.markets]) });
+    } catch {
+      return Object.freeze({ account: true, markets: Object.freeze([]) });
+    }
+  }
 
   #heartbeatGate(): { readonly permitted: true } | { readonly permitted: false; readonly reasons: readonly string[] } {
     const reasons: string[] = [];

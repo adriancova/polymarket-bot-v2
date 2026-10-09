@@ -6,7 +6,7 @@
 
 import { it, expect } from 'vitest';
 import { ready, submitOne, sequence, reconcileRounds } from '../support/scenario.js';
-import { boot, YES } from '../support/harness.js';
+import { boot, halted, YES } from '../support/harness.js';
 import { trace, type Loose } from "../support/loose.js";
 
 for (const corruption of ['INCOMPLETE','MALFORMED_SIBLING','DUPLICATE']) {
@@ -41,6 +41,6 @@ it('R4-B an incomplete list must not lose an unmatched canceled order across res
  expect((await r.p.coordinator.reconcile()).resumed).toBe(false);
  r.u.world.cancel(foreign.venueOrderId);r.u.world.faults={};
  const p=await boot(r.u);const result=await p.coordinator.reconcile();
- trace('R4-B',JSON.stringify({result,breaks:p.journal.breaks(),halts:r.u.halts}));
+ trace('R4-B',JSON.stringify({result,breaks:p.journal.breaks(),halts:halted(p)}));
  expect(result.resumed).toBe(false);expect(p.journal.breaks().some(b=>b.breakClass==='ORDER_UNATTRIBUTED')).toBe(true);
 });

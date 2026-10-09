@@ -526,6 +526,8 @@ export class FakeCoordinator implements SafetyCoordinator {
   reconciles = 0;
   running = false;
   outcome: { readonly status: string; readonly resumed: boolean } = { status: "PASSED", resumed: true };
+  /** The journal's QUARANTINED breaks (C1-OMS06); `null`: the journal cannot be read, and `quarantinedBreaks` throws. */
+  quarantined: readonly { readonly scope: string; readonly marketId: string | null }[] | null = [];
   trigger(trigger: "POSITION_BALANCE_DISCREPANCY"): void {
     this.triggers.push(trigger);
   }
@@ -536,6 +538,10 @@ export class FakeCoordinator implements SafetyCoordinator {
   }
   status(): { readonly running: boolean } {
     return { running: this.running };
+  }
+  quarantinedBreaks(): readonly { readonly scope: string; readonly marketId: string | null }[] {
+    if (this.quarantined === null) throw new Error("the journal's unresolved breaks could not be read");
+    return this.quarantined;
   }
 }
 

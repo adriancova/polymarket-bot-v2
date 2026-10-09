@@ -14,7 +14,6 @@
  * | {@link ReconciledUserStream} | `UserStreamManager` (`packages/polymarket-secure`, WP-280) | its request backlog |
  * | {@link ReconciliationJournalPort} | `ReconciliationJournal` (`packages/ledger`, this package's other half) | the journal |
  * | {@link HoldingsPort} | the ledger projection and `buildUnattributedCorrection` (`packages/ledger`) | — |
- * | {@link HaltPort} | the incident controller (§9.9) | — |
  * | `tokenOfGroup` | the execution groups the composition registered with the OMS (`execution.groups`) | — |
  * | {@link ReconciliationClock} | a MONOTONIC epoch-millisecond clock | — |
  *
@@ -357,7 +356,6 @@ export type BreakClass =
   | "OMS_EVIDENCE_RETAINED"
   | "COMPONENT_UNAVAILABLE"
   | "ANSWER_REFUSED"
-  | "HALT_DELIVERY_FAILED"
   | "REQUEST_MALFORMED";
 
 export type BreakRule = "RESOLVE_IN_RUN" | "HOLD_UNTIL_CONSISTENT" | "QUARANTINE_UNTIL_RELEASED" | "UNATTRIBUTED_HALT";
@@ -568,22 +566,6 @@ export interface UnattributedBooking {
 }
 
 // ---------------------------------------------------------------------------
-// Halts (§9.9; the OMS halts nothing itself, nor does the coordinator).
-
-export interface HaltRequest {
-  readonly breakId: string;
-  readonly breakClass: BreakClass;
-  readonly detail: string;
-}
-
-export interface HaltPort {
-  /** Halt new entries in one market. Must be idempotent: every run re-delivers the halts of open quarantines. */
-  haltMarket(request: HaltRequest & { readonly marketId: string }): void;
-  /** Halt new entries in the whole account. Idempotent. */
-  haltAccount(request: HaltRequest): void;
-}
-
-// ---------------------------------------------------------------------------
 // Policy.
 
 /**
@@ -615,7 +597,6 @@ export interface ReconciliationCoordinatorDependencies {
   readonly reads: AccountReadPort;
   readonly journal: ReconciliationJournalPort;
   readonly holdings: HoldingsPort;
-  readonly halts: HaltPort;
   readonly clock: ReconciliationClock;
   /** UUIDv7 ids for runs, breaks and ledger corrections (a composition binds a UUIDv7 generator). */
   readonly newId: () => string;

@@ -26,7 +26,7 @@ import { describe, expect, it } from "vitest";
 import type { ReconciliationJournal, ReconciliationJournalEvent } from "../../../packages/ledger/src/index.js";
 import type { OmsAlert, OrderManager, ReconciliationJournalPort } from "../../../packages/oms/src/index.js";
 
-import { MARKET, boot, bookReversal } from "./support/harness.js";
+import { MARKET, boot, bookReversal, halted } from "./support/harness.js";
 import type { VenueTrade } from "./support/world.js";
 import { expectPaused, ready, reconcileRounds, sequence, submitOne, type Ready } from "./support/scenario.js";
 
@@ -241,7 +241,6 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     expect(await reconcileRounds(r, 2)).toBe(false); // released, but the ledger still books the FAILED fill (r4)
     reverse(r, first);
     expect(await reconcileRounds(r, 4)).toBe(true);
-    const haltsBefore = r.u.halts.length;
     r.u.world.failTrade(second); // the same kind of alert, on the same order: another reversal is owed
     r.p.coordinator.trigger("PERIODIC_TIMER");
     await expectPaused(r, (await r.p.coordinator.reconcile()).resumed, "OMS_HALTING_ALERT");
@@ -250,7 +249,7 @@ describe("WP-290 deliverable 3: each OMS halting alert is its own quarantine (r2
     expect(secondAlert).toHaveLength(1);
     expect(secondAlert[0]?.breakId).not.toBe(firstAlert[0]?.breakId);
     expect(secondAlert[0]?.status).toBe("QUARANTINED");
-    expect(r.u.halts.slice(haltsBefore).some((halt) => halt.breakId === secondAlert[0]?.breakId && halt.marketId === MARKET)).toBe(true);
+    expect(halted(r.p).some((halt) => halt.breakId === secondAlert[0]?.breakId && halt.marketId === MARKET)).toBe(true);
     // Released in turn (the alert, and the second trade's own quarantine), and reversed, the account resumes.
     await release(r, secondAlert[0]?.breakId);
     await releaseFailed(r, 1);

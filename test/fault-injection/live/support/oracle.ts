@@ -80,10 +80,12 @@ export function recoveryProblems(world: LiveWorld, node: LiveNode, resumed: bool
   if (!replay.ok) problems.push("the journal's durable history does not replay");
   if (expectations.truthful !== false) {
     if (projectedHoldings(projectLedger(u.ledger), ACCOUNT).unattributedArrivals.length > 0) problems.push("UNATTRIBUTED bookings in a truthful world");
-    // A halt is excused only when its break is a WP340-F1 quarantine the recovery driver released (`releaseKnownFindings`).
+    // A halt is a quarantine (C1-OMS06: the live gate reads the QUARANTINED breaks), and one ever recorded is a halt the
+    // world saw. It is excused only when it is a WP340-F1 quarantine the recovery driver released (`releaseKnownFindings`).
     const excused = new Set(world.findings.map((entry) => entry.breakId));
-    const halts = u.halts.filter((halt) => !excused.has(halt.breakId));
-    if (halts.length > 0) problems.push(`halts in a truthful world: ${JSON.stringify(halts.map((halt) => halt.marketId))}`);
+    const quarantines = replay.ok ? replay.value.breaks().filter((view) => view.status === "QUARANTINED" || view.resolution === "OPERATOR_RELEASED") : [];
+    const halts = quarantines.filter((view) => !excused.has(view.breakId));
+    if (halts.length > 0) problems.push(`halts in a truthful world: ${JSON.stringify(halts.map((view) => (view.scope === "MARKET" ? view.marketId : null)))}`);
     if (replay.ok && replay.value.unresolvedBreaks().length > 0) problems.push(`unresolved breaks: ${replay.value.unresolvedBreaks().map((view) => view.breakClass).join(", ")}`);
   }
   return problems;

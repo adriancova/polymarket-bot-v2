@@ -50,6 +50,7 @@ import {
   boot,
   bookReversal,
   consistencyProblems,
+  halted,
   reconcileUntilResumed,
   streamTrade,
   universe,
@@ -183,9 +184,10 @@ function check(label: string, run: Execution): void {
   // Nothing lost: every salt the venue received is known to the OMS.
   const known = new Set(oms.attempts().map((attempt) => attempt.salt));
   for (const salt of new Set(u.world.receipts)) expect(known.has(salt), `${label}: salt ${salt} forgotten`).toBe(true);
-  // Nothing double-counted: no UNATTRIBUTED correction was owed or booked, and no market was halted.
+  // Nothing double-counted: no UNATTRIBUTED correction was owed or booked, and no market is halted (a quarantine
+  // clears only by an operator's release, and none is made here).
   expect(projectedHoldings(projectLedger(u.ledger), ACCOUNT).unattributedArrivals, `${label}: unattributed bookings`).toEqual([]);
-  expect(u.halts, `${label}: halts`).toEqual([]);
+  expect(halted(last), `${label}: halts`).toEqual([]);
   // The journal: durable history replays; nothing is left unresolved.
   const replay = ReconciliationJournal.open({ accountRef: ACCOUNT, sink: { append: async () => undefined }, history: u.journalEvents });
   expect(replay.ok, `${label}: the journal history replays`).toBe(true);
@@ -289,7 +291,7 @@ async function checkFailed(label: string, run: FailedRun): Promise<void> {
   expect(failed[0], label).toMatchObject({ status: "QUARANTINED", scope: "MARKET", marketId: MARKET, assetId: YES });
   expect(failed[0]?.subjectKey, label).toContain(trade?.venueTradeId ?? "?");
   expect(
-    u.halts.some((halt) => halt.breakId === failed[0]?.breakId && halt.marketId === MARKET),
+    halted(last).some((halt) => halt.breakId === failed[0]?.breakId && halt.marketId === MARKET),
     `${label}: the market is halted`,
   ).toBe(true);
   // r4 (WP290-CX-R4-02): the operator releases every quarantine, but a release is not a booking: while the ledger
