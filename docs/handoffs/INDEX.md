@@ -2,7 +2,7 @@
 
 One line per handoff in this directory, oldest first. "Added" is the date git first recorded the file. A Complete package's row here is its only status row: the brief, `IMPLEMENTATION_STATUS.md`, lists open packages only ([`README.md`](README.md) rules 1 and 10). A completed package with no handoff (`DEPS-1`) has a row that links its archived row; its "Added" is its merge date. Kinds: WP (a work package), FU (a follow-up to one), Governance, Audit, Round (a bounded round), Operational, Session.
 
-After a merge, add or update the handoff's single row here (see [`README.md`](README.md)).
+In the round's own branch, before the merge, add or update the handoff's single row here ([`README.md`](README.md) rule 10). From 2026-10-08 the Merge cell reads "merged via PR #N" with the candidate SHA; older rows give the merge SHA. `RESIDUALS.md` and `README.md` are not handoffs and have no row.
 
 | Added | Handoff | Package or round | Kind | Outcome | Merge | Size |
 | --- | --- | --- | --- | --- | --- | --- |
