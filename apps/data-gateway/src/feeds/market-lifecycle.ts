@@ -213,7 +213,8 @@
  * body the door refuses — opens a NOTIFY incident scoped to the market
  * (`GATEWAY_LIFECYCLE_POLL_FAILED` / `GATEWAY_LIFECYCLE_STATE_INVALID`) and
  * derives nothing, and that market's next valid poll closes both
- * (`C1-HALTS`: the close is published, so a consumer un-pauses); `consecutiveFailureThreshold` failed polls in a row is a
+ * (`C1-HALTS`: the close is published, so a consumer un-pauses);
+ * `consecutiveFailureThreshold` failed polls in a row is a
  * STALL: `FeedStale` is published and the gateway's `GATEWAY_FEED_STALL`
  * incident opens exactly as it does for a silent socket (acceptance 2), and
  * the next successful poll closes the episode. A poll cycle that would

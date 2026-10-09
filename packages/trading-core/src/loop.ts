@@ -5823,14 +5823,6 @@ function readString(payload: unknown, key: string): string | undefined {
 }
 
 /**
- * Every market an event affects.
- *
- * Most §7.4 events name exactly one (`internalMarketId`). A data-quality
- * incident names a LIST (`affectedMarketIds`) because one stale feed affects
- * every market that reads it — and an incident with an EMPTY list affects none,
- * which is a different statement from "affects all" and is treated as such.
- */
-/**
  * `C1-HALTS` (TAINT; the user's ruling of 2026-10-08, NARROW — reversing the
  * coarse interim ruling of 2026-10-02; ADR-023's dated note): whether one
  * consumed event taints its gateway epoch (rule 4). Only a data-quality
@@ -5861,6 +5853,14 @@ function taintsEpoch(envelope: EventEnvelopeOf, marketChannelFeedId: string): bo
   return feedId === undefined || feedId === marketChannelFeedId;
 }
 
+/**
+ * Every market an event affects.
+ *
+ * Most §7.4 events name exactly one (`internalMarketId`). A data-quality
+ * incident names a LIST (`affectedMarketIds`) because one stale feed affects
+ * every market that reads it — and an incident with an EMPTY list affects none,
+ * which is a different statement from "affects all" and is treated as such.
+ */
 function affectedMarketIds(payload: unknown): readonly string[] {
   const direct = readString(payload, "internalMarketId") ?? readString(payload, "marketId");
   if (direct !== undefined) return Object.freeze([direct]);

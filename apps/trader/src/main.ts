@@ -901,16 +901,6 @@ export async function assembleDurableTrader(
       `${String(config.instances.length + (config.seriesInstances?.length ?? 0))} instance(s) and their run(s) exist and agree with ` +
       "the configuration",
   );
-  // `C1-HALTS` (HALT-PAGES): this start is a new run of each instance, so it
-  // supersedes their earlier infrastructure halt rows. Never refuses the start.
-  await resolveSupersededHalts(
-    database,
-    [...config.instances, ...(config.seriesInstances ?? [])].map((instance) => ({
-      instanceId: instance.instanceId,
-      runId: instance.runId,
-    })),
-    log,
-  );
   // `C1-HALTS` (TAINT): the feed whose market-less incidents switch the
   // CONNECTION_CONFIRMED extension off for an epoch (ADR-023 rule 4).
   log(
@@ -1016,6 +1006,17 @@ export async function assembleDurableTrader(
         "point a control API's traderHealth.http at this URL",
     );
   }
+  // `C1-HALTS` (HALT-PAGES): the run has started — every refusal above has
+  // passed — and it is a new run of each instance (BOOT-1), so it supersedes
+  // their earlier infrastructure halt rows. Never refuses the start.
+  await resolveSupersededHalts(
+    database,
+    [...config.instances, ...(config.seriesInstances ?? [])].map((instance) => ({
+      instanceId: instance.instanceId,
+      runId: instance.runId,
+    })),
+    log,
+  );
   return { ok: true, trader: created.trader, store, healthServer };
 }
 
