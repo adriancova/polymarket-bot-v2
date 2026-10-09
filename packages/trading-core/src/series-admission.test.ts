@@ -7,9 +7,6 @@
  * mutation table). The windows are recorded venue data (`testing/series.ts`).
  */
 
-import { describe, expect, it } from "vitest";
-
-import type { ConfiguredSeries } from "./config.js";
 import {
   admissionRunModeProblem,
   canonicalSeriesJson,
@@ -17,7 +14,10 @@ import {
   ReviewedSeriesSchema,
   seriesConfigHash,
   windowInternalMarketId,
-} from "./series.js";
+} from "@polymarket-bot/universe";
+import { describe, expect, it } from "vitest";
+
+import type { ConfiguredSeries } from "./config.js";
 import { SeriesWindowAdmissions, type AdmittedWindow } from "./series-admission.js";
 import { RECORDED_SERIES_WINDOWS, reviewedSeriesDocument, seriesWindowPayloads } from "./testing/series.js";
 
