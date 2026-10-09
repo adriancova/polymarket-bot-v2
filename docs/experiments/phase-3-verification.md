@@ -453,7 +453,7 @@ Nothing here can verify the following. Each needs real infrastructure, a credent
 - **Composition duties** WP-290 and WP-320 name:
   - deliver WP-280's outputs in order;
   - restart the coordinator, never rebind it;
-  - route the halt port, the pages and `cancelTimeoutMs`.
+  - route the pages and `cancelTimeoutMs` (the halt port was deleted by C1-OMS06, 2026-10-09; see §5's note).
 - **The venue's real behaviour:**
   - the timing is documentary only;
   - the venue's deduplication of a same-salt resend after a 425 is undocumented (WP270-DECISIONS);
