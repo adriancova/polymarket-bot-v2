@@ -370,9 +370,9 @@ The pins:
   with an independent check that only a strengthening sits in the reserved
   band.
 - `engage-reserve.test.ts` is the verifiers' three `CONTROL1-J-M1` sequences,
-  over HTTP; it fails at the round-0 commit. (Its shipped-root twin became
-  `shipped-root-not-wired.test.ts` at `C1-OPS`: the shipped process applies no
-  mutation.)
+  over HTTP; it fails at the round-0 commit. (Its shipped-root twin was
+  replaced at `C1-OPS` by `src/main.not-wired.test.ts`: the shipped process
+  applies no mutation.)
 - `authorized-refusals-audited.test.ts` is `CONTROL1-J-M2`: every refusal of
   an authorized request is audited, and nothing else is — save the gated
   refusal, write-nothing item 7, which it pins as writing nothing

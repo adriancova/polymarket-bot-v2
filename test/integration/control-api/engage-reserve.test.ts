@@ -2,9 +2,9 @@
  * `CONTROL-1` r1 — `CONTROL1-J-M1`: a repeated or weakening kill-switch engage
  * cannot spend the audit reserve, and so cannot block a stronger halt. Over
  * REAL HTTP, through `support/client.ts` (the composition `main.ts` builds,
- * with registered instances so pauses can be measured too). Since `C1-OPS` the
- * shipped `main.ts` answers every mutating route `501 CONTROL_NOT_WIRED`
- * (`shipped-root-not-wired.test.ts`), so these sequences are driven here only.
+ * with registered instances so pauses can be measured too);
+ * `shipped-root-engage-reserve.test.ts` drives the same sequences through
+ * `main.ts`'s `startup()` itself.
  *
  * ## The finding (both verifiers, over real HTTP, at round-0 commit `3097d39`)
  *

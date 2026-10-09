@@ -8,7 +8,7 @@
  *
  * - puts its audit log behind the budget, with the CONFIGURED reserve (M-3);
  * - answers a pause and an engage `501 CONTROL_NOT_WIRED`, since `C1-OPS`: no
- *   trader reads this process's controls (`shipped-root-not-wired.test.ts`
+ *   trader reads this process's controls (`apps/control-api/src/main.not-wired.test.ts`
  *   pins all four mutating routes);
  * - serves on this package's explicit timeouts (L-9).
  *

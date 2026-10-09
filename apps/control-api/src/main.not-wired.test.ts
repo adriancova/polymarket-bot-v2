@@ -15,13 +15,15 @@
  * - the by-name mode-raise refusal still comes first: `403
  *   CONTROL_MODE_RAISE_REFUSED`, audited as a mode-raise attempt.
  *
- * The engage and release sequences this file used to drive through the shipped
- * root (`CONTROL1-J-M1`) are unreachable there now; `engage-reserve.test.ts`
- * keeps driving them over HTTP through `support/client.ts`, which composes
+ * The engage and release sequences `test/integration/control-api/
+ * shipped-root-engage-reserve.test.ts` drove through the shipped root
+ * (`CONTROL1-J-M1`) are unreachable there now; `engage-reserve.test.ts` keeps
+ * driving them over HTTP through `support/client.ts`, which composes
  * `mutationsReachTrader: true`.
  *
- * Shutdown follows `shipped-root-control-1.test.ts`: `startup()` installs
- * `process.once("SIGINT", …)` and returns no handle, so the test emits SIGINT.
+ * Shutdown follows `test/integration/control-api/shipped-root-control-1.test.ts`:
+ * `startup()` installs `process.once("SIGINT", …)` and returns no handle, so
+ * the test emits SIGINT.
  */
 
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -31,7 +33,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { startup } from "../../../apps/control-api/src/main.js";
+import { startup } from "./main.js";
 
 const READER = "fake-paper-reader-token-not-a-credential-c1ops-0001";
 const HOLDER = "fake-paper-holder-token-not-a-credential-c1ops-0002";
