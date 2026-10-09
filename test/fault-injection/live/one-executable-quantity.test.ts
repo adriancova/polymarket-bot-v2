@@ -168,6 +168,12 @@ describe("ADR-034 D2.6 item 2: the mock venue books the SIGNED amounts, never th
 
 describe("ADR-034 D2.6 item 3: a share amount signed one base unit away from the ticket is FAILED, and nothing is sent", () => {
   for (const [label, skew] of [
+    // A consistent signed order for one base unit FEWER shares: the quote is what the SDK signs for 4.999999 shares
+    // at 0.5 (floored to tick 0.01's 4 decimals: 2.4999). Before D2.4 the adapter's tolerance accepted it.
+    ["one base unit fewer shares, with the SDK's own quote for them", (amounts: { readonly makerAmount: string; readonly takerAmount: string }) => {
+      const shares = BigInt(amounts.takerAmount) - 1n;
+      return { makerAmount: String(((shares * 5n) / 10n / 100n) * 100n), takerAmount: String(shares) };
+    }],
     ["takerAmount (shares) one base unit short", (amounts: { readonly makerAmount: string; readonly takerAmount: string }) => ({ ...amounts, takerAmount: String(BigInt(amounts.takerAmount) - 1n) })],
     ["takerAmount (shares) one base unit over", (amounts: { readonly makerAmount: string; readonly takerAmount: string }) => ({ ...amounts, takerAmount: String(BigInt(amounts.takerAmount) + 1n) })],
     ["makerAmount (quote) one base unit short", (amounts: { readonly makerAmount: string; readonly takerAmount: string }) => ({ ...amounts, makerAmount: String(BigInt(amounts.makerAmount) - 1n) })],

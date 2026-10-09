@@ -178,6 +178,15 @@ describe("ADR-034 D2.4: the share grid, and the EXACT cross-check of the signed 
       ["takerAmount + 1", (order: Record<string, unknown>) => ({ ...order, takerAmount: nudge(order["takerAmount"], 1n) })],
       ["takerAmount − 1", (order: Record<string, unknown>) => ({ ...order, takerAmount: nudge(order["takerAmount"], -1n) })],
       ["amounts swapped", (order: Record<string, unknown>) => ({ ...order, makerAmount: order["takerAmount"], takerAmount: order["makerAmount"] })],
+      // A CONSISTENT order for one base unit fewer shares: the quote is the SDK's own for 12.339999 shares at 0.37,
+      // floored to tick 0.01's 4 decimals (4.5657). Before ADR-034 D2.4 the adapter's rounding tolerance signed it.
+      ["one base unit fewer shares, with the SDK's own quote for them", (order: Record<string, unknown>) => {
+        const shares = 12_339_999n;
+        const quote = ((shares * 37n) / 100n / 100n) * 100n;
+        return side === "BUY"
+          ? { ...order, makerAmount: quote.toString(), takerAmount: shares.toString() }
+          : { ...order, makerAmount: shares.toString(), takerAmount: quote.toString() };
+      }],
     ] as const) {
       it(`${row}: ${label} → FAILED, never an envelope`, async () => {
         const { client } = await setup(tampered(patch));
