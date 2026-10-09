@@ -182,6 +182,12 @@ supersession — needs orchestrator approval and a work package that owns the
 path. See
 [`docs/contracts/protected-contracts.md`](../contracts/protected-contracts.md).
 
+**One exception: dated notes** (the user's ruling, 2026-10-08). A round granted
+to implement an ADR may append a dated, append-only note to that ADR, headed
+`Note (<date>, <round>)`. The note records what the round found or did. It may
+not change a Decision section or any existing text; that stays protected.
+Reviewers see the note in the round's diff.
+
 ---
 
 ## Numbering
@@ -194,33 +200,42 @@ it.
 
 ---
 
-## Template
+## Budget and template
+
+The user's ruling, 2026-10-08. A new ADR holds the decision only, in about 300
+lines or 30 KB. Context, alternatives and evidence go to the round's handoff or
+the venue addendum, and the ADR cites them. ADRs written before this ruling keep
+their form.
 
 ```markdown
 # ADR-NNN: <Title>
 
 - **Status:** Accepted
 - **Date:** YYYY-MM-DD
-- **Recorded by:** WP-NNN
-- **Implemented by:** WP-NNN (state whether the implementation exists yet)
+- **Recorded by:** <round>
+- **Implemented by:** <round> (state whether the implementation exists yet)
 - **Supersedes / Superseded by:** none
-
-## Context
-
-Why the decision exists, and what the primary specification already locks.
+- **Context and evidence:** docs/handoffs/<round>.md; docs/venue/verified-YYYY-MM-DD.md §n
 
 ## Decision
 
 Numbered, testable statements. Each one is something an implementation can
 conform to or violate.
 
-## Consequences
+## Invariants
 
-What this costs, what it forecloses, and what breaks if it is changed later.
+What must always hold once the decision is implemented.
 
-## Evidence
+## Refusal and halt codes
 
-Every claim's source: handoff section, `docs/venue/verified-YYYY-MM-DD.md`
-section, `docs/contracts/*.md` section, or `docs/handoffs/WP-NNN.md`.
-Unverified venue items are listed here explicitly as unverified.
+Each code, when it is raised, and what it stops.
+
+## Test obligations
+
+The tests an implementing round must add, one line each.
+
+## Open items
+
+What is not decided yet, with an owner. Unverified venue items are listed
+here explicitly as unverified.
 ```
