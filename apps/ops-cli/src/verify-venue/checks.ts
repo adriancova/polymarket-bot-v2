@@ -63,10 +63,63 @@
  * example the SDK ruling); they are validated against the frozen report file
  * (section presence WITH its own official citation) and are reported as
  * DOCUMENTED, never as vacuous PASS.
+ *
+ * PROTOCOL V2 (V2-9, 2026-10-06). Three checks are validated against
+ * `PROTOCOL_V2_REPORT_PATH` (`VENUE-4`'s report) instead of the frozen
+ * baseline: `market-ws-book-v2`, `position-operations-v2` and
+ * `protocol-v2-captures`. `kind: "capture"` checks validate the raw public
+ * captures under `protocol-v2/` against their provenance sidecars
+ * (`captures.ts`). Each V2 check names the report ids it pins (`facts`), and
+ * the gate requires every id to be defined in that report. An `assert` hook
+ * carries a fixture's cross-field facts (a derivation, a verbatim copy from a
+ * committed capture, a note that must cite a conflict).
  */
-import type { FieldSpec, ObjectSpec, PayloadSpec } from "./fixtures.js";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
+import type { CaptureSpec } from "./captures.js";
+import {
+  decodePositionId,
+  jsonEqual,
+  narrowConditionId,
+  parseCapture,
+  resolvePath,
+} from "./captures.js";
+import type {
+  FieldSpec,
+  FixtureFile,
+  ObjectSpec,
+  PayloadSpec,
+} from "./fixtures.js";
+import { VENUE_FIXTURE_ROOT, isRecord } from "./fixtures.js";
+
+/**
+ * The frozen §1.2 report every baseline check is validated against.
+ *
+ * WHY IT STAYS (V2-9, CLOSEOUT-3 L11). `verified-2026-10-05.md` is a Protocol
+ * V2 delta report, "not a handoff §1.2 phase-gate re-verification" (its own
+ * header); its lettered sections (O, S, H, D) do not fit the numbered-section
+ * evidence gate below. So V2-9 adds its V2 facts beside this baseline
+ * (`PROTOCOL_V2_REPORT_PATH`) rather than re-pointing it. Re-pointing the
+ * baseline to a later phase-gate report (2026-09-30) means re-auditing every
+ * WP-000 fixture against its drift rows (E-04, E-05, E-09, E-10), two of
+ * which wait on rulings (C-9, C-13); that is outside V2-9's Protocol V2
+ * scope and stays with L11's owner.
+ */
 export const VERIFICATION_REPORT_PATH = "docs/venue/verified-2026-08-24.md";
+
+/** The baseline's snapshot date (`retrieved`, `effective_date`). */
+export const BASELINE_SNAPSHOT_DATE = "2026-08-24";
+
+/**
+ * V2-9: `VENUE-4`'s Protocol V2 and Data API v2 report. The V2 checks and the
+ * `protocol-v2/` captures are validated against it: each cited id must be
+ * defined in it, and each capture's sidecar must match its source index.
+ */
+export const PROTOCOL_V2_REPORT_PATH = "docs/venue/verified-2026-10-05.md";
+
+/** The V2 snapshot date (`retrieved`, `effective_date`). */
+export const PROTOCOL_V2_SNAPSHOT_DATE = "2026-10-05";
 
 /** Official SDK reference commit the raw schemas were verified against. */
 export const SDK_REFERENCE_COMMIT =
@@ -78,12 +131,42 @@ export const SDK_PERMALINK_PREFIX = `https://github.com/Polymarket/ts-sdk/blob/$
 export interface VenueCheck {
   readonly id: string;
   readonly title: string;
+  /** The section of `report` that records the check's facts. */
   readonly reportSection: string;
-  readonly kind: "fixture" | "documented";
+  readonly kind: "fixture" | "documented" | "capture";
   /** Fixture paths relative to test/fixtures/venue. */
   readonly fixtures: readonly string[];
   /** Source-specific spec every example in each fixture must meet. */
   readonly payloadSpec: PayloadSpec;
+  /**
+   * V2-9. The dated report the check is validated against; absent means the
+   * frozen baseline, `VERIFICATION_REPORT_PATH`.
+   */
+  readonly report?: string;
+  /**
+   * V2-9. The ids of `report` the check pins (`F-62`, `C-21`, `O.2`); each
+   * must be defined in it. Required on every check of a non-baseline report.
+   */
+  readonly facts?: readonly string[];
+  /** V2-9. `kind: "capture"`: the committed captures, each with a sidecar. */
+  readonly captures?: readonly CaptureSpec[];
+  /**
+   * V2-9. Cross-field facts a `kind: "fixture"` fixture must meet beyond its
+   * payload spec; returns the refusals.
+   */
+  readonly assert?: (fixture: FixtureFile) => readonly string[];
+}
+
+/** The report a check is validated against. */
+export function reportOf(check: VenueCheck): string {
+  return check.report ?? VERIFICATION_REPORT_PATH;
+}
+
+/** The `retrieved` date a check's fixtures must carry. */
+export function snapshotDateOf(check: VenueCheck): string {
+  return reportOf(check) === PROTOCOL_V2_REPORT_PATH
+    ? PROTOCOL_V2_SNAPSHOT_DATE
+    : BASELINE_SNAPSHOT_DATE;
 }
 
 const SIDE = ["BUY", "SELL"] as const;
@@ -769,6 +852,653 @@ const HEARTBEAT_SPEC: PayloadSpec = {
   },
 };
 
+/**
+ * V2-9 (plan acceptance 3). The heartbeat fixture records the guide's
+ * `POST /v1/heartbeats` and its `400` keyed `error_msg`. Conflict C-20
+ * (`verified-2026-10-05.md` §11, §H-3): the CLOB OpenAPI keys that `400`
+ * `error`, and documents a second route, `POST /heartbeats`. The payloads
+ * stay as the guide gives them; the notes must cite C-20 and its report, so
+ * no consumer reads the fixture as settling the key.
+ */
+export function assertHeartbeatNotesCiteC20(
+  fixture: FixtureFile,
+): readonly string[] {
+  const errors: string[] = [];
+  if (!/\bC-20\b/.test(fixture.notes)) {
+    errors.push(
+      "notes: must cite conflict C-20 (the 400 key is error_msg in the guide and error in the CLOB OpenAPI; POST /heartbeats is a second documented route)",
+    );
+  }
+  if (!fixture.notes.includes(PROTOCOL_V2_REPORT_PATH)) {
+    errors.push(`notes: must name the report that records C-20 (${PROTOCOL_V2_REPORT_PATH})`);
+  }
+  return errors;
+}
+
+// --- Protocol V2 (V2-9) ------------------------------------------------------
+
+/** Reads and parses a committed `protocol-v2/` capture (strict JSON or JSONL). */
+function readCaptureView(
+  fixture: string,
+  format: "json" | "jsonl",
+  errors: string[],
+): unknown {
+  let bytes: Uint8Array;
+  try {
+    bytes = readFileSync(resolve(VENUE_FIXTURE_ROOT, fixture));
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    errors.push(`${fixture}: unreadable: ${message}`);
+    return null;
+  }
+  const parseErrors: string[] = [];
+  const view = parseCapture(bytes, format, parseErrors);
+  errors.push(...parseErrors.map((error) => `${fixture}: ${error}`));
+  return view;
+}
+
+/**
+ * The market channel `book` frame for a V2 position id, as observed. SDK
+ * `MarketBookEventSchema`'s field list (as `market-ws-book`), plus the
+ * undocumented `version` (C-21), REQUIRED here and pinned to `"v2"`: this is
+ * the check that a V2 frame carries it, never an authority for it.
+ * NARROWING: `market` is the 32-byte, right-padded condition the CLOB serves
+ * for V2 (C-19, F-43), and `asset_id` is a decimal string (U-13 resolved;
+ * F-44).
+ */
+const MARKET_WS_BOOK_V2_SPEC: PayloadSpec = {
+  strict: true,
+  fields: {
+    event_type: { type: "string", enum: ["book"] },
+    market: { type: "hex-string", hexLengths: [66] },
+    asset_id: { type: "digit-string" },
+    bids: ORDER_BOOK_LEVELS,
+    asks: ORDER_BOOK_LEVELS,
+    hash: { type: "string", optional: true },
+    timestamp: { type: "digit-string", optional: true },
+    min_order_size: { type: "empty-or-decimal-string", optional: true },
+    tick_size: { type: "empty-or-price-string", optional: true },
+    neg_risk: { type: "boolean", optional: true },
+    last_trade_price: { type: "empty-or-price-string", optional: true },
+    version: { type: "string", enum: ["v2"] },
+  },
+};
+
+/**
+ * Where each V2 book example was copied from: a line of the committed S-W01
+ * session (1-based) and the index of the object in that frame's array.
+ */
+const MARKET_WS_BOOK_V2_ORIGINS: Readonly<
+  Record<string, { readonly capture: string; readonly line: number; readonly element: number }>
+> = {
+  "book-snapshot-v2-position-id": {
+    capture: "protocol-v2/ws-market-v2-session.jsonl",
+    line: 3,
+    element: 0,
+  },
+};
+
+/**
+ * Each V2 book example must (a) be the committed capture's frame, value for
+ * value (plan acceptance 2: "from committed public captures"), and (b) carry a
+ * position id whose condition (`asset_id >> 8`) is the frame's `market`
+ * narrowed to 31 bytes (F-42, F-44).
+ */
+export function assertBookV2(fixture: FixtureFile): readonly string[] {
+  const errors: string[] = [];
+  for (const example of fixture.examples) {
+    const where = `examples ${example.name}`;
+    const origin = MARKET_WS_BOOK_V2_ORIGINS[example.name];
+    if (origin === undefined) {
+      errors.push(`${where}: not traced to a committed capture line`);
+      continue;
+    }
+    const view = readCaptureView(origin.capture, "jsonl", errors);
+    const frame = resolvePath(view, `[${origin.line - 1}].frame[${origin.element}]`);
+    if (!frame.found || !jsonEqual(frame.value, example.payload)) {
+      errors.push(
+        `${where}: must equal element ${origin.element} of the frame on line ${origin.line} of ${origin.capture}, value for value`,
+      );
+    }
+    const decoded = decodePositionId(example.payload["asset_id"]);
+    const condition = narrowConditionId(example.payload["market"]);
+    if (decoded === null || condition === null || decoded.conditionBytes31 !== condition) {
+      errors.push(`${where}: asset_id >> 8 must be the market's condition narrowed to 31 bytes (F-42, F-44)`);
+    }
+  }
+  return errors;
+}
+
+/** Protocol V2 proxy addresses (F-71; S-D07 lines 32-33, 37-38, 48). */
+const V2_CONTRACTS = {
+  ExchangeV3: "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa",
+  PositionManager: "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF",
+  Router: "0x12121212006e4CD160D18e3f00711DA5c3372600",
+  AutoRedeemer: "0xa1200000d0002264C9a1698e001292D00E1b00af",
+  pUSD: "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+} as const;
+
+const documentedAddress = (address: string): FieldSpec => ({
+  type: "hex-string",
+  hexLengths: [42],
+  enum: [address],
+});
+
+/** A V2 `bytes31` condition id: `0x` and 62 hex digits (F-43). */
+const CONDITION_ID_BYTES31: FieldSpec = { type: "hex-string", hexLengths: [64] };
+
+/** Six-decimal base units, an unsigned integer (F-73; S-D04 line 55). */
+const BASE_UNITS: FieldSpec = { type: "digit-string" };
+
+const operationOf = (operation: string): FieldSpec => ({
+  type: "string",
+  enum: [operation],
+});
+
+/** A Router call: the documented ABI signature and its `request` (F-73). */
+const ROUTER_CALL = (
+  operation: "split" | "merge" | "redeem",
+  signature: string,
+): ObjectSpec => ({
+  strict: true,
+  fields: {
+    operation: operationOf(operation),
+    description: { type: "string" },
+    target: documentedAddress(V2_CONTRACTS.Router),
+    onchain_function: { type: "string", enum: [signature] },
+    request: {
+      type: "object",
+      strict: true,
+      fields: {
+        conditionId: CONDITION_ID_BYTES31,
+        ...(operation === "redeem" ? { outcomeIndex: { type: "integer" } } : {}),
+        amount: BASE_UNITS,
+      },
+    },
+  },
+});
+
+/**
+ * Polymarket Protocol V2 position operations (plan row D7, the V2 half):
+ * Router `split`, `merge` and `redeem`, the approvals they need, the
+ * PositionManager payout read, and the id derivations, all from the official
+ * pages (S-D04, S-D07, S-D10, S-D12, S-D16, S-D17). Discriminated by
+ * `operation`.
+ */
+const POSITIONS_V2_SPEC: PayloadSpec = {
+  discriminant: { field: "operation" },
+  variants: {
+    "contract-addresses-v2": {
+      strict: true,
+      fields: {
+        operation: operationOf("contract-addresses-v2"),
+        description: { type: "string" },
+        effective_date: { type: "string", enum: [PROTOCOL_V2_SNAPSHOT_DATE] },
+        contracts: {
+          type: "object",
+          strict: true,
+          fields: Object.fromEntries(
+            Object.entries(V2_CONTRACTS).map(([name, address]) => [
+              name,
+              documentedAddress(address),
+            ]),
+          ),
+        },
+      },
+    },
+    approve: {
+      strict: true,
+      fields: {
+        operation: operationOf("approve"),
+        description: { type: "string" },
+        for_operations: { type: "array", items: { type: "string", enum: ["split"] } },
+        token_contract: documentedAddress(V2_CONTRACTS.pUSD),
+        onchain_function: {
+          type: "string",
+          enum: ["approve(address spender, uint256 amount)"],
+        },
+        spender: documentedAddress(V2_CONTRACTS.Router),
+        amount: BASE_UNITS,
+      },
+    },
+    setApprovalForAll: {
+      strict: true,
+      fields: {
+        operation: operationOf("setApprovalForAll"),
+        description: { type: "string" },
+        for_operations: {
+          type: "array",
+          items: { type: "string", enum: ["merge", "redeem"] },
+        },
+        token_contract: documentedAddress(V2_CONTRACTS.PositionManager),
+        onchain_function: {
+          type: "string",
+          enum: ["setApprovalForAll(address operator, bool approved)"],
+        },
+        operator: documentedAddress(V2_CONTRACTS.Router),
+        approved: { type: "boolean" },
+      },
+    },
+    split: ROUTER_CALL("split", "split(bytes31 conditionId, uint256 amount)"),
+    merge: ROUTER_CALL("merge", "merge(bytes31 conditionId, uint256 amount)"),
+    redeem: ROUTER_CALL(
+      "redeem",
+      "redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount)",
+    ),
+    "get-payout": {
+      strict: true,
+      fields: {
+        operation: operationOf("get-payout"),
+        description: { type: "string" },
+        target: documentedAddress(V2_CONTRACTS.PositionManager),
+        onchain_function: {
+          type: "string",
+          enum: [
+            "getPayout(uint256 positionId, uint256 amount) view returns (uint256)",
+          ],
+        },
+        request: {
+          type: "object",
+          strict: true,
+          fields: {
+            positionId: { type: "digit-string" },
+            amount: BASE_UNITS,
+          },
+        },
+      },
+    },
+    "derive-from-position-id": {
+      strict: true,
+      fields: {
+        operation: operationOf("derive-from-position-id"),
+        description: { type: "string" },
+        position_id: { type: "digit-string" },
+        condition_id: CONDITION_ID_BYTES31,
+        outcome_index: { type: "integer" },
+      },
+    },
+    "narrow-padded-condition-id": {
+      strict: true,
+      fields: {
+        operation: operationOf("narrow-padded-condition-id"),
+        description: { type: "string" },
+        condition_id_bytes32: { type: "hex-string", hexLengths: [66] },
+        condition_id_bytes31: CONDITION_ID_BYTES31,
+      },
+    },
+  },
+};
+
+/** The documentation examples the Router fixture's ids must come from. */
+const V2_DOCS_MARKET = "protocol-v2/gamma-market-v2-docs-example.jsonc"; // S-D16
+const V2_DOCS_EVENT = "protocol-v2/gamma-event-v2-docs-example.jsonc"; // S-D17
+
+const positive = (value: unknown): boolean =>
+  typeof value === "string" && /^\d+$/.test(value) && BigInt(value) > 0n;
+
+/**
+ * The Router fixture's cross-field facts:
+ * - every condition id, position id and derivation is the documentation's
+ *   (S-D16's `positionIds`, S-D17's `conditionId`), so nothing live or
+ *   invented enters `positions/`;
+ * - `positionId >> 8` is the condition and `positionId & 255` the outcome
+ *   (S-D12 lines 659-665), and a padded `bytes32` narrows only when its final
+ *   byte is zero (S-D04 line 54);
+ * - redeem takes outcome `0` (YES) or `1` (NO), one call per outcome, both
+ *   present (S-D04 line 56; S-D12 lines 625, 754);
+ * - merge and redeem need `setApprovalForAll(Router, true)` (S-D04 line 40);
+ * - every amount is positive base units.
+ */
+export function assertRouterV2(fixture: FixtureFile): readonly string[] {
+  const errors: string[] = [];
+  const market = readCaptureView(V2_DOCS_MARKET, "json", errors);
+  const event = readCaptureView(V2_DOCS_EVENT, "json", errors);
+  const positionIds = resolvePath(market, "positionIds").value;
+  const docsCondition = resolvePath(event, "markets[0].conditionId").value;
+  if (!Array.isArray(positionIds) || typeof docsCondition !== "string") {
+    errors.push("the documentation examples (S-D16, S-D17) are unreadable");
+    return errors;
+  }
+  const docsIds: readonly unknown[] = positionIds;
+  const redeemed: number[] = [];
+  const seen = new Set<string>();
+  for (const example of fixture.examples) {
+    const payload = example.payload;
+    const operation = payload["operation"];
+    const where = `examples ${example.name}`;
+    if (typeof operation === "string") {
+      seen.add(operation);
+    }
+    const request = isRecord(payload["request"]) ? payload["request"] : {};
+    switch (operation) {
+      case "split":
+      case "merge":
+      case "redeem": {
+        if (request["conditionId"] !== docsCondition) {
+          errors.push(`${where}: conditionId must be the documentation's V2 condition (S-D17 line 281)`);
+        }
+        if (!positive(request["amount"])) {
+          errors.push(`${where}: amount must be positive base units`);
+        }
+        if (operation === "redeem") {
+          const outcome = request["outcomeIndex"];
+          if (outcome !== 0 && outcome !== 1) {
+            errors.push(`${where}: outcomeIndex must be 0 (YES) or 1 (NO) (S-D04 line 56)`);
+          } else {
+            redeemed.push(outcome);
+          }
+        }
+        break;
+      }
+      case "approve":
+        if (!positive(payload["amount"])) {
+          errors.push(`${where}: amount must be positive base units`);
+        }
+        break;
+      case "setApprovalForAll":
+        if (payload["approved"] !== true) {
+          errors.push(`${where}: approved must be true (S-D04 line 40)`);
+        }
+        break;
+      case "get-payout":
+        if (!docsIds.includes(request["positionId"])) {
+          errors.push(`${where}: positionId must be one of the documentation's (S-D16)`);
+        }
+        if (!positive(request["amount"])) {
+          errors.push(`${where}: amount must be positive base units`);
+        }
+        break;
+      case "derive-from-position-id": {
+        const decoded = decodePositionId(payload["position_id"]);
+        if (!docsIds.includes(payload["position_id"]) || decoded === null) {
+          errors.push(`${where}: position_id must be one of the documentation's (S-D16)`);
+          break;
+        }
+        if (
+          decoded.conditionBytes31 !== payload["condition_id"] ||
+          payload["condition_id"] !== docsCondition
+        ) {
+          errors.push(`${where}: condition_id must be position_id >> 8, the documentation's condition (S-D12 lines 659-665)`);
+        }
+        if (decoded.outcomeIndex !== payload["outcome_index"]) {
+          errors.push(`${where}: outcome_index must be position_id & 255`);
+        }
+        break;
+      }
+      case "narrow-padded-condition-id": {
+        const narrowed = narrowConditionId(payload["condition_id_bytes32"]);
+        if (narrowed === null || narrowed !== payload["condition_id_bytes31"]) {
+          errors.push(`${where}: a bytes32 condition narrows only when its final byte is zero, to its first 31 bytes (S-D04 line 54)`);
+        }
+        if (payload["condition_id_bytes31"] !== docsCondition) {
+          errors.push(`${where}: condition_id_bytes31 must be the documentation's condition (S-D17 line 281)`);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  if (
+    redeemed.length !== 2 ||
+    !redeemed.includes(0) ||
+    !redeemed.includes(1)
+  ) {
+    errors.push("redeem: one call per outcome, outcomes 0 and 1 each once (S-D12 lines 625, 754)");
+  }
+  for (const required of [
+    "contract-addresses-v2",
+    "approve",
+    "setApprovalForAll",
+    "split",
+    "merge",
+    "redeem",
+    "get-payout",
+    "derive-from-position-id",
+    "narrow-padded-condition-id",
+  ]) {
+    if (!seen.has(required)) {
+      errors.push(`examples: no ${required} example`);
+    }
+  }
+  return errors;
+}
+
+/** The V2 condition and position id shapes pins use. */
+const HEX_66: FieldSpec = { type: "hex-string", hexLengths: [66] };
+const DECIMAL_ID: FieldSpec = { type: "digit-string" };
+
+/**
+ * `VENUE-4`'s 20 public captures and the facts each is committed to show
+ * (`protocol-v2/README.md` index; `verified-2026-10-05.md` §O, §2, §6, §7,
+ * §9). The paths keep their `.jsonc` and `.jsonl` suffixes: renaming them
+ * needs the readers outside V2-9's paths changed too (V2-9 handoff,
+ * `stopped_items`). The claim gate now covers every suffix, so the suffix no
+ * longer keeps a file outside the gate.
+ */
+export const PROTOCOL_V2_CAPTURES: readonly CaptureSpec[] = [
+  {
+    fixture: "protocol-v2/gamma-market-v2-docs-example.jsonc",
+    format: "json",
+    sourceId: "S-D16",
+    pins: [
+      { path: "version", equals: "v2", facts: ["F-40"] },
+      { path: "clobTokenIds", equals: null, facts: ["F-40"] },
+      { path: "positionIds[0]", spec: DECIMAL_ID, facts: ["F-40", "F-38"] },
+      { path: "positionIds[1]", spec: DECIMAL_ID, facts: ["F-40", "F-38"] },
+      { path: "positionIds[2]", absent: true, facts: ["F-40"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/gamma-event-v2-docs-example.jsonc",
+    format: "json",
+    sourceId: "S-D17",
+    pins: [
+      { path: "markets[0].version", equals: "v2", facts: ["F-40"] },
+      { path: "markets[0].conditionId", spec: CONDITION_ID_BYTES31, facts: ["F-43"] },
+      { path: "markets[0].positionIds[0]", positionIdOf: "markets[0].conditionId", outcomeIndex: 0, facts: ["F-42", "F-44"] },
+      { path: "markets[0].positionIds[1]", positionIdOf: "markets[0].conditionId", outcomeIndex: 1, facts: ["F-42", "F-44"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/gamma-market-v1-btc15m.jsonc",
+    format: "json",
+    sourceId: "S-G04",
+    pins: [
+      { path: "version", equals: "v1", facts: ["F-38", "O.1"] },
+      { path: "clobTokenIds", spec: { type: "string" }, facts: ["F-38"] },
+      { path: "positionIds", absent: true, facts: ["O.1"] },
+      { path: "resolutionStatus", absent: true, facts: ["O.1"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/gamma-events-keyset-series10192.jsonc",
+    format: "json",
+    sourceId: "S-G05",
+    pins: [
+      { path: "events[0].markets[0].version", equals: "v1", facts: ["O.5"] },
+      { path: "events[1].markets[0].version", equals: "v1", facts: ["O.5"] },
+      { path: "events[0].markets[0].positionIds", absent: true, facts: ["O.5"] },
+      { path: "events[0].markets[0].conditionId", spec: HEX_66, facts: ["O.5"] },
+      { path: "next_cursor", spec: { type: "string" }, facts: ["O.5"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/clob-markets-v2.jsonc",
+    format: "json",
+    sourceId: "S-L01",
+    pins: [
+      { path: "v", equals: "v2", facts: ["O.3", "C-21"] },
+      { path: "c", spec: HEX_66, facts: ["O.3", "C-19"] },
+      { path: "t[0].o", equals: "Up", facts: ["O.3"] },
+      { path: "t[1].o", equals: "Down", facts: ["O.3"] },
+      { path: "t[0].t", positionIdOf: "c", outcomeIndex: 0, facts: ["F-44"] },
+      { path: "t[1].t", positionIdOf: "c", outcomeIndex: 1, facts: ["F-44"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/clob-markets-v2-62hex-not-found.jsonc",
+    format: "json",
+    sourceId: "S-L02",
+    pins: [{ path: "error", equals: "market not found", facts: ["F-70", "C-19"] }],
+  },
+  {
+    fixture: "protocol-v2/clob-markets-v1.jsonc",
+    format: "json",
+    sourceId: "S-L10",
+    pins: [
+      { path: "v", equals: "v1", facts: ["O.3"] },
+      { path: "c", spec: HEX_66, facts: ["O.3"] },
+      { path: "t[0].o", equals: "Up", facts: ["O.3"] },
+      { path: "t[1].o", equals: "Down", facts: ["O.3"] },
+      { path: "cbos", absent: true, facts: ["O.3"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/book-v2.jsonc",
+    format: "json",
+    sourceId: "S-L03",
+    pins: [
+      { path: "version", equals: "v2", facts: ["O.2", "C-21"] },
+      { path: "asset_id", spec: DECIMAL_ID, facts: ["O.2", "F-76"] },
+      { path: "market", spec: HEX_66, facts: ["O.2", "C-19"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/book-v1.jsonc",
+    format: "json",
+    sourceId: "S-L11",
+    pins: [
+      { path: "version", absent: true, facts: ["O.2", "C-21"] },
+      { path: "asset_id", spec: DECIMAL_ID, facts: ["O.2"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/ws-market-v2-session.jsonl",
+    format: "jsonl",
+    sourceId: "S-W01",
+    pins: [
+      { path: "[0].dir", equals: "open", facts: ["F-76"] },
+      { path: "[0].data", equals: "wss://ws-subscriptions-clob.polymarket.com/ws/market", facts: ["F-76"] },
+      { path: "[1].frame.type", equals: "market", facts: ["F-60"] },
+      { path: "[1].frame.assets_ids[0]", spec: DECIMAL_ID, facts: ["F-60"] },
+      { path: "[2].frame[0].event_type", equals: "book", facts: ["F-62"] },
+      { path: "[2].frame[0].version", equals: "v2", facts: ["F-62", "C-21"] },
+      { path: "[2].frame[0].asset_id", sameAs: "[1].frame.assets_ids[0]", facts: ["F-60", "F-62"] },
+      { path: "[11].frame.event_type", equals: "new_market", facts: ["F-62"] },
+      { path: "[11].frame.version", absent: true, facts: ["F-62"] },
+      { path: "[15].dir", equals: "close", facts: ["F-62"] },
+      { path: "[15].data.code", equals: 1000, facts: ["F-62"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-resolutions-v2-active.jsonc",
+    format: "json",
+    sourceId: "S-L04",
+    pins: [
+      { path: "data[0].status", equals: "active", facts: ["F-59"] },
+      { path: "data[0].market_type", equals: "BINARY", facts: ["F-59"] },
+      { path: "data[0].payouts", absent: true, facts: ["F-59"] },
+      { path: "data[0].condition_id", spec: HEX_66, facts: ["F-65", "C-19"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-resolutions-v2-resolved.jsonc",
+    format: "json",
+    sourceId: "S-A11",
+    pins: [
+      { path: "data[0].status", equals: "resolved", facts: ["F-59", "F-57"] },
+      { path: "data[0].reporter", equals: "CHAINLINK", facts: ["F-59"] },
+      { path: "data[0].payouts", equals: [1000000, 0], facts: ["F-59", "F-57"] },
+      { path: "data[0].market_type", equals: "BINARY", facts: ["F-59"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-resolutions-v1-resolved.jsonc",
+    format: "json",
+    sourceId: "S-A10",
+    pins: [
+      { path: "data[0].status", equals: "resolved", facts: ["F-59"] },
+      { path: "data[0].payouts", equals: [0, 1000000], facts: ["F-59"] },
+      { path: "data[0].reporter", absent: true, facts: ["F-59"] },
+      { path: "data[0].market_type", absent: true, facts: ["F-59"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-resolutions-62hex-invalid.jsonc",
+    format: "json",
+    sourceId: "S-L05",
+    pins: [
+      { path: "code", equals: "invalid_request", facts: ["F-70", "C-19"] },
+      { path: "parameter", equals: "condition", facts: ["F-70"] },
+      { path: "retryable", equals: false, facts: ["F-70", "F-66"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-prices-history-page1.jsonc",
+    format: "json",
+    sourceId: "S-A02",
+    pins: [
+      { path: "pagination.offset", equals: 0, facts: ["F-68"] },
+      { path: "pagination.limit", equals: 3, facts: ["F-68"] },
+      { path: "pagination.has_more", equals: true, facts: ["F-68", "F-66"] },
+      { path: "pagination.next_cursor", spec: { type: "string" }, facts: ["F-68", "F-66"] },
+      { path: "data[2]", spec: { type: "object", values: { type: "number" } }, facts: ["F-65"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-prices-history-page2.jsonc",
+    format: "json",
+    sourceId: "S-A03",
+    pins: [
+      { path: "pagination.offset", equals: 3, facts: ["F-68"] },
+      { path: "pagination.limit", equals: 3, facts: ["F-68", "F-66"] },
+      { path: "pagination.next_cursor", spec: { type: "string" }, facts: ["F-68"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-trades-v1-page1.jsonc",
+    format: "json",
+    sourceId: "S-A08",
+    pins: [
+      { path: "pagination.offset", equals: 0, facts: ["F-69"] },
+      { path: "pagination.limit", equals: 2, facts: ["F-69"] },
+      { path: "pagination.has_more", equals: true, facts: ["F-69"] },
+      { path: "data[1].condition_id", spec: HEX_66, facts: ["F-69", "F-65"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-trades-v1-page2.jsonc",
+    format: "json",
+    sourceId: "S-A09",
+    pins: [
+      { path: "pagination.offset", equals: 2, facts: ["F-69"] },
+      { path: "pagination.has_more", equals: true, facts: ["F-69"] },
+      { path: "data[1].condition_id", spec: HEX_66, facts: ["F-69"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-trades-v2-empty.jsonc",
+    format: "json",
+    sourceId: "S-A07",
+    pins: [
+      { path: "data", equals: [], facts: ["F-69"] },
+      { path: "pagination.has_more", equals: false, facts: ["F-69", "F-66"] },
+      { path: "pagination.next_cursor", equals: null, facts: ["F-69", "F-66"] },
+    ],
+  },
+  {
+    fixture: "protocol-v2/data-v2-oi-v2.jsonc",
+    format: "json",
+    sourceId: "S-A06",
+    pins: [
+      { path: "data[0].value", equals: 0, facts: ["F-69"] },
+      { path: "data[0].condition_id", spec: HEX_66, facts: ["F-69"] },
+      { path: "pagination", absent: true, facts: ["F-69"] },
+    ],
+  },
+];
+
 export const VENUE_CHECKS: readonly VenueCheck[] = [
   {
     id: "sdk-and-runtime",
@@ -1122,6 +1852,8 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     kind: "fixture",
     fixtures: ["heartbeat/heartbeat.json"],
     payloadSpec: HEARTBEAT_SPEC,
+    // V2-9 (plan acceptance 3): the notes cite C-20.
+    assert: assertHeartbeatNotesCiteC20,
   },
   {
     id: "fees-and-rewards",
@@ -1191,5 +1923,42 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     kind: "fixture",
     fixtures: ["rtds/twap-update.json"],
     payloadSpec: RTDS_SPEC,
+  },
+  // --- Protocol V2 (V2-9), validated against PROTOCOL_V2_REPORT_PATH ---------
+  {
+    id: "market-ws-book-v2",
+    title:
+      "Market channel book snapshot for a V2 position id, with the undocumented \"version\":\"v2\" (C-21; plan row D8)",
+    reportSection: "7",
+    kind: "fixture",
+    fixtures: ["market-ws/book-snapshot-v2.json"],
+    payloadSpec: MARKET_WS_BOOK_V2_SPEC,
+    report: PROTOCOL_V2_REPORT_PATH,
+    facts: ["F-62", "C-21", "F-44", "S-W01"],
+    assert: assertBookV2,
+  },
+  {
+    id: "position-operations-v2",
+    title:
+      "Polymarket Protocol V2 Router split/merge/redeem, approvals, PositionManager payout read and id derivations (plan row D7, V2 half)",
+    reportSection: "11",
+    kind: "fixture",
+    fixtures: ["positions/router-v2.json"],
+    payloadSpec: POSITIONS_V2_SPEC,
+    report: PROTOCOL_V2_REPORT_PATH,
+    facts: ["F-71", "F-73", "F-49", "F-43", "F-42", "S-D04", "S-D12"],
+    assert: assertRouterV2,
+  },
+  {
+    id: "protocol-v2-captures",
+    title:
+      "Protocol V2 and Data API v2 public captures: sidecar provenance, digests, report source index, personal-data rules, pinned facts (plan row D9)",
+    reportSection: "15",
+    kind: "capture",
+    fixtures: [],
+    payloadSpec: {},
+    report: PROTOCOL_V2_REPORT_PATH,
+    facts: ["F-69", "C-21"],
+    captures: PROTOCOL_V2_CAPTURES,
   },
 ] as const;

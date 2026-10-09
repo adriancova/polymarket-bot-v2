@@ -84,3 +84,20 @@ listed, the fixture is the raw response, byte for byte, so its sha256 equals
   No credential existed in the environment.
 - **The raw responses** are kept outside the repository, in the round's scratch
   directory. Their digests are in the sidecars and in the report's source index.
+
+## V2-9 (2026-10-06): under the gate, names kept
+
+Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
+
+- **Claimed.** The `verify-venue` check `protocol-v2-captures`
+  (`apps/ops-cli/src/verify-venue/checks.ts`, `PROTOCOL_V2_CAPTURES`)
+  claims all 20 captures and their sidecars: provenance against the report's
+  source index, the trade-page rules and the pinned V2 facts (`captures.ts`).
+  Like every file in the tree, they are also scanned for personal data and
+  credentials (`scan.ts`). The rules are in the parent README, "Exception
+  2026-10-06 (V2-9)". The gate claims every suffix, so the "Why not `.json`"
+  bullet above is historical.
+- **No `.jsonc` held a comment.** Every file here parses with `JSON.parse`, so
+  nothing moved, no byte changed and every digest above still holds.
+- **The rename to `.json` is deferred.** Readers outside V2-9's paths open
+  these files by name; the session file stays `.jsonl` in any case.

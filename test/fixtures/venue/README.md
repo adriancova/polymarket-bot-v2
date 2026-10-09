@@ -239,3 +239,60 @@ The payloads remain true records of what the venue documented on
 | `fees/fee-reward-parameters.json` | **stale field** | `liquidity-rewards-market-settings.samples_per_epoch: 10080` — the page now says "An epoch is one UTC day … up to 1,440 samples" (E-04). All fee rates, rebate shares and tiers are unchanged. |
 | `orders/restricted-modes.json` | **contested** | `http-503-cancel-only`: the matching-engine guide now shows `{"error": "trading is disabled"}` for both cancel-only and fully disabled trading and says the response "does not establish whether cancels are available" (E-05); the CLOB OpenAPI still shows this fixture's string (conflict C-9). The post-only example's `Retry-After: 79`, marked illustrative above, now matches the guide's own example. The 425 example stays valid; a `Retry-After` header is now documented as optional on 425 (E-06). |
 | every other fixture | valid, unchanged | The market-stream section, both AsyncAPI pages, manage-orders, rate-limit, geoblock (response shape), positions and contracts pages are byte-identical or identical after table-format normalization; the SDK's `subscriptions/clob.ts`, `shared.ts`, `clob/account.ts` and `clob/order-response.ts` are byte-identical to VENUE-2's. `orders/rest-trades.json`'s prefixed statuses are now also what the CLOB OpenAPI enumerates for `GET /data/trades` (E-13). |
+
+## Exception 2026-10-06 (V2-9): sanitized live public captures
+
+Added by `V2-9` (`docs/venue/protocol-v2-migration-plan.md`, acceptance 4);
+everything above this heading is unchanged. It answers
+`docs/venue/verified-2026-10-05.md` §15, which recorded that `protocol-v2/`
+departs from the "Sanitization rules" above.
+
+**The decision: a dated, scoped exception, not replacement.** `protocol-v2/`
+keeps live public identifiers and observed prices and times, because:
+
+1. **They are the evidence.** They pin live V2 shapes no documentation example
+   shows: position ids whose `>> 8` is the condition (F-44), the right-padded
+   32-byte condition the CLOB serves (C-19), the 404 and 400 on the 31-byte
+   form (F-70), the undocumented `"version":"v2"` (C-21).
+2. **Replacing them changes the payload bytes and digests**, which must equal
+   the report's source index (§14).
+3. **They name no person or account**: public market data, served without
+   credentials.
+4. **Readers outside this tree rely on them**, for example
+   `test/contract/polymarket-secure/sdk-0-12.test.ts`.
+
+**Scope.** Only the captures under `protocol-v2/` that the
+`protocol-v2-captures` check claims, each with its provenance sidecar, and
+fixtures copied value for value from one (today `market-ws/book-snapshot-v2.json`,
+from `protocol-v2/ws-market-v2-session.jsonl` line 3). Within it, these may be
+live: public market ids, slugs, questions and titles; documented contract
+addresses; observed prices, sizes and times; public venue metadata as served.
+Personal data, credentials and trade or activity cursors stay replaced by
+labelled synthetic values (`synthetic-…`, `0x00…`). Every other fixture keeps
+the rules above.
+
+**The gate** (`pnpm ops:verify-venue`, `apps/ops-cli/src/verify-venue/`):
+
+- **Coverage:** every file here except a `README.md`, whatever its suffix, is
+  claimed by exactly one check.
+- **Provenance:** each capture's bytes match its sidecar, and the sidecar's
+  fetch time, status, size and raw sha256 match the report's §14 row. This
+  proves provenance (the bytes are the report's fetch), not privacy.
+- **Closed schemas:** the sidecar's keys; the fixture envelope and example
+  keys; a trade or activity page (as the report's §14 URL selects it) has only
+  the S-O06 fields, a labelled synthetic cursor or none, and redactions that
+  list `timestamp` and `next_cursor`.
+- **The sidecar URL** is on a public host and route, never keyed by a wallet,
+  on its §14 row's route, and outside the trade pages the §14 URL itself.
+- **The scan of every file**, live captures included (`scan.ts`): valid UTF-8,
+  JSON with no repeated key; no email address; no 40-or-more-digit hex value
+  unless labelled synthetic, a whole public id under its key, in the report,
+  or in `PUBLIC_VALUES`; no trade or activity cursor (`eyJ…`); no credential
+  key with a live value; personal keys (`…wallet…`, `pseudonym`, `bio`,
+  `profile_image…`, `…email…`, user names) and a person's row's `name` and
+  transaction hash hold labelled synthetic or empty values.
+- **The pins:** each capture's V2 facts, citing ids the report defines.
+
+**Not checked:** anything beyond these obvious patterns (a name in plain prose,
+a deliberately encoded or disguised value). PR review covers it: the reviewer
+of a new capture reads its keys and its sidecar prose.

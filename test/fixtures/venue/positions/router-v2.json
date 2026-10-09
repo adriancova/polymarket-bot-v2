@@ -1,0 +1,149 @@
+{
+  "fixture": "positions/router-v2",
+  "source": "https://docs.polymarket.com/migrate/polymarket-v2/contract-integrations",
+  "retrieved": "2026-10-05",
+  "sanitized": true,
+  "notes": "V2-9 (2026-10-06). Polymarket Protocol V2 position operations (migration plan row D7, the V2 half; report docs/venue/verified-2026-10-05.md F-71, F-73, F-49, F-42, F-43, F-44). Every value is a documentation example, computed from one by a documented rule, or labelled SYNTHETIC. Nothing is live and nothing names an account. SOURCES (fetched 2026-10-05, VENUE-4 source index §14): S-D04 = the source, docs.polymarket.com/migrate/polymarket-v2/contract-integrations (lines 37-40 the approvals: split approve(ROUTER, amount) on pUSD, merge or redeem setApprovalForAll(ROUTER, true) on PositionManager; lines 46-50 the Router ABI; line 54 bytes31 and the final-byte check; lines 55-56 six-decimal base units, 1_000_000 is one pUSD or one share, outcomeIndex 0 YES and 1 NO; lines 68-73 getPayout); S-D12 = docs.polymarket.com/trading/positions/manage (line 122 a version v2 market uses the Router; lines 142-143 pUSD and PositionManager; line 171 the split example amount 1_000_000n; lines 488-490 the operator approval; line 625 one redeem call per outcome; lines 659-665 the derivation conditionId = encodeBytes31(positionId >> 8), outcomeIndex = positionId & 255); S-D07 = docs.polymarket.com/resources/contracts (lines 32-33, 37-38, 48 the proxy addresses, F-71); S-D16 lines 168-177 = the documented V2 market positionIds (committed as protocol-v2/gamma-market-v2-docs-example.jsonc); S-D17 line 281 = the documented V2 conditionId, 62 hex (protocol-v2/gamma-event-v2-docs-example.jsonc); S-D10 lines 152-155 = bytes32 boundaries right-pad bytes31 with zero bytes. COMPUTED: the derive-from-position-id examples apply the S-D12 pseudocode to the S-D16 ids and give exactly the S-D17 conditionId with outcomes 0 and 1 (F-44); the narrow-padded-condition-id example right-pads that conditionId with one zero byte (S-D10) and narrows it back (S-D04 line 54). verify-venue (check position-operations-v2) recomputes both and refuses any id that is not the documentation example. SYNTHETIC: the merge, redeem, approve and getPayout amounts (1000000) are the documented unit (S-D04 line 55) used as a value; the pages give no concrete amount for those calls. Only the split amount is a documentation example value (S-D12 line 171). No transaction receipt, relayer id or payout result is recorded: none is documented for V2 (getPayout: unresolved positions can revert, zero is a valid losing payout). Calldata is not encoded here. The CTF (V1) operations stay in positions/split-merge-redeem.json, unchanged.",
+  "examples": [
+    {
+      "name": "contract-addresses-v2-proxies",
+      "payload": {
+        "operation": "contract-addresses-v2",
+        "description": "Polymarket Protocol V2 proxy addresses on Polygon (chain 137) published by the official contracts page on 2026-10-05 (S-D07; F-71: use the proxy address). Public on-chain addresses, not credentials. Re-verify before any use above PAPER.",
+        "effective_date": "2026-10-05",
+        "contracts": {
+          "ExchangeV3": "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa",
+          "PositionManager": "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF",
+          "Router": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+          "AutoRedeemer": "0xa1200000d0002264C9a1698e001292D00E1b00af",
+          "pUSD": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+        }
+      }
+    },
+    {
+      "name": "approve-pusd-for-split",
+      "payload": {
+        "operation": "approve",
+        "description": "Before a V2 split, approve the Router to spend pUSD (S-D04 line 39; S-D12 line 294). Existing CTF approvals do not carry over (S-D04 line 35). The amount is SYNTHETIC: the documented unit, one pUSD.",
+        "for_operations": [
+          "split"
+        ],
+        "token_contract": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+        "onchain_function": "approve(address spender, uint256 amount)",
+        "spender": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+        "amount": "1000000"
+      }
+    },
+    {
+      "name": "operator-approval-for-merge-and-redeem",
+      "payload": {
+        "operation": "setApprovalForAll",
+        "description": "Before a V2 merge or redeem, approve the Router as a PositionManager operator (S-D04 line 40; S-D12 lines 488-490).",
+        "for_operations": [
+          "merge",
+          "redeem"
+        ],
+        "token_contract": "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF",
+        "onchain_function": "setApprovalForAll(address operator, bool approved)",
+        "operator": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+        "approved": true
+      }
+    },
+    {
+      "name": "split-documented-amount",
+      "payload": {
+        "operation": "split",
+        "description": "Split pUSD into one YES and one NO position on the Router (S-D04 line 47). conditionId is the documented bytes31 V2 condition (S-D17 line 281); amount is the documented example, 1_000_000 base units = one pUSD (S-D12 line 171).",
+        "target": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+        "onchain_function": "split(bytes31 conditionId, uint256 amount)",
+        "request": {
+          "conditionId": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+          "amount": "1000000"
+        }
+      }
+    },
+    {
+      "name": "merge-synthetic-amount",
+      "payload": {
+        "operation": "merge",
+        "description": "Merge one YES and one NO back into pUSD; merge spends this amount of each outcome (S-D04 lines 48, 55). The amount is SYNTHETIC: the documented unit, one share.",
+        "target": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+        "onchain_function": "merge(bytes31 conditionId, uint256 amount)",
+        "request": {
+          "conditionId": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+          "amount": "1000000"
+        }
+      }
+    },
+    {
+      "name": "redeem-yes-synthetic-amount",
+      "payload": {
+        "operation": "redeem",
+        "description": "Redeem the YES outcome (outcomeIndex 0) with an explicit amount: V2 redeems one outcome per call (S-D04 lines 49, 56; S-D12 lines 625, 754). The amount is SYNTHETIC: the documented unit, one share.",
+        "target": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+        "onchain_function": "redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount)",
+        "request": {
+          "conditionId": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+          "outcomeIndex": 0,
+          "amount": "1000000"
+        }
+      }
+    },
+    {
+      "name": "redeem-no-synthetic-amount",
+      "payload": {
+        "operation": "redeem",
+        "description": "Redeem the NO outcome (outcomeIndex 1) in its own call; both calls may share one transaction (S-D12 lines 625, 754). The amount is SYNTHETIC: the documented unit, one share.",
+        "target": "0x12121212006e4CD160D18e3f00711DA5c3372600",
+        "onchain_function": "redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount)",
+        "request": {
+          "conditionId": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+          "outcomeIndex": 1,
+          "amount": "1000000"
+        }
+      }
+    },
+    {
+      "name": "payout-read-synthetic-amount",
+      "payload": {
+        "operation": "get-payout",
+        "description": "Read redemption proceeds from PositionManager: the pUSD payout in base units for the amount; unresolved positions can revert and zero is a valid losing payout (S-D04 lines 68-73). positionId is the documented YES id (S-D16). The amount is SYNTHETIC; no result is documented, so none is recorded.",
+        "target": "0x006F54F7f9A22e0000CC2AB60031000000ae9fEF",
+        "onchain_function": "getPayout(uint256 positionId, uint256 amount) view returns (uint256)",
+        "request": {
+          "positionId": "651150819117105875331414918119047680898421632356043490229292782433651916800",
+          "amount": "1000000"
+        }
+      }
+    },
+    {
+      "name": "derive-yes-from-documented-position-id",
+      "payload": {
+        "operation": "derive-from-position-id",
+        "description": "COMPUTED by the documented pseudocode (S-D12 lines 659-665) from the documented YES position id (S-D16): conditionId = encodeBytes31(positionId >> 8), outcomeIndex = positionId & 255. The result is the documented V2 condition (S-D17 line 281; F-44).",
+        "position_id": "651150819117105875331414918119047680898421632356043490229292782433651916800",
+        "condition_id": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+        "outcome_index": 0
+      }
+    },
+    {
+      "name": "derive-no-from-documented-position-id",
+      "payload": {
+        "operation": "derive-from-position-id",
+        "description": "COMPUTED as above from the documented NO position id (S-D16): the same condition, outcome 1.",
+        "position_id": "651150819117105875331414918119047680898421632356043490229292782433651916801",
+        "condition_id": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000",
+        "outcome_index": 1
+      }
+    },
+    {
+      "name": "narrow-padded-documented-condition",
+      "payload": {
+        "operation": "narrow-padded-condition-id",
+        "description": "A bytes32 boundary carries the bytes31 condition right-padded with a zero byte (S-D10 lines 152-155); validate the final byte is zero, then narrow (S-D04 line 54). COMPUTED from the documented condition (S-D17 line 281).",
+        "condition_id_bytes32": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb000000000000000000000000000000",
+        "condition_id_bytes31": "0x017089ce3ba22aaa0a4cba8250b8c8e1eb0000000000000000000000000000"
+      }
+    }
+  ]
+}
