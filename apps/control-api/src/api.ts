@@ -46,12 +46,8 @@
  * 4. **Resolve the route** in {@link CONTROL_API_ROUTE_TABLE}: an unknown path
  *    is `404`, a known path under the wrong method is `405` with an `Allow`
  *    header (`CONTROL-1`, L-4).
- * 5. **Authorize** against the route's explicit grant (§15). Then, in a
- *    composition where no trader observes a mutation
- *    ({@link ControlApiOptions.mutationsReachTrader} `false`, the shipped PAPER
- *    process; `C1-OPS`), a mutating route is refused `501 CONTROL_NOT_WIRED`,
- *    audited as in step 6, before anything below runs.
- * 6.**Answer the transport's refusal, read the route parameter and the body
+ * 5. **Authorize** against the route's explicit grant (§15).
+ * 6. **Answer the transport's refusal, read the route parameter and the body
  *    through their doors**, then **act**, through the control plane, which
  *    audits before it applies. On a MUTATING route every refusal from here on
  *    is AUDITED (`CONTROL-1` r1, closing `CONTROL1-J-M2`) — save the control
@@ -327,33 +323,7 @@ export interface ControlApiOptions {
    * one; nothing may pass a longer one (the constructor throws `RangeError`).
    */
   readonly refreshDeadlineMs?: number;
-  /**
-   * `C1-OPS` (COMPLEXITY-1, CONTROL-API option (a)): whether a running trader
-   * observes this process's mutations. REQUIRED and never defaulted, so every
-   * composition states it. `false` — the shipped PAPER `main.ts` — answers
-   * every AUTHORIZED request to a mutating route `501 CONTROL_NOT_WIRED`,
-   * audited as a refusal, after the mode-raise refusal (step 3) and
-   * authorization (step 5) and before anything else: an engage answered `200`
-   * would tell the operator a halt took effect that no trader reads. The test
-   * harnesses pass `true`, so the control plane the live composition will use
-   * stays measured. Set it `true` only in a composition that binds a durable
-   * audit sink AND a trader that reads it.
-   */
-  readonly mutationsReachTrader: boolean;
 }
-
-/** `C1-OPS`: the audit action each mutating route's `501 CONTROL_NOT_WIRED` refusal records. */
-const NOT_WIRED_ACTION: Readonly<Partial<Record<RouteKind, MutatingAuditAction>>> = Object.freeze({
-  STRATEGY_PAUSE: "STRATEGY_PAUSE",
-  STRATEGY_RESUME: "STRATEGY_RESUME",
-  KILL_SWITCH_ENGAGE: "KILL_SWITCH_ENGAGE",
-  KILL_SWITCH_RELEASE: "KILL_SWITCH_RELEASE",
-});
-
-const NOT_WIRED_DETAIL =
-  "no running trader observes this process's controls, so nothing was paused, resumed, engaged or released. " +
-  "To stop a PAPER trader, press Ctrl-C or send it SIGTERM; a second signal forces exit 130 " +
-  "(docs/runbooks/paper-operations.md)";
 
 // --- the request doors ------------------------------------------------------
 
@@ -731,21 +701,6 @@ export class ControlApi {
     //    reaches no door, no trader refresh and no control plane.
     const refusal = this.#authorize(operator, route.grant);
     if (refusal !== undefined) return refusal;
-
-    // `C1-OPS`: no trader observes a mutation here, so none is acted on.
-    const notWired = route.mutates && !this.#options.mutationsReachTrader ? NOT_WIRED_ACTION[route.kind] : undefined;
-    if (notWired !== undefined) {
-      const refused = { code: "CONTROL_NOT_WIRED", detail: NOT_WIRED_DETAIL, issues: [] };
-      return this.#refusedBeforePlane(
-        operator,
-        route,
-        notWired,
-        { scope: "CONTROL_PLANE", scopeRef: null },
-        "NOT_WIRED",
-        refused,
-        problem(501, refused.code, refused.detail),
-      );
-    }
 
     // 6. Read and act. A READ route answers a transport refusal as it stands —
     //    a read is never audited — and every MUTATING handler below answers it

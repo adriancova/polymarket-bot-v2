@@ -154,7 +154,8 @@ run; the restart order, gateway first, is
   `RecorderWalFaulted`, `RecorderWalDroppedMessages`, `RecorderFsyncOverdue`
   and `RecorderFeedStalls` — and turn the batch-job outcomes (compaction,
   upload, retention, validation, soak evidence) into job exit codes rather than
-  pages. `RecorderRtdsHalted` was deleted with RTDS's retirement (§3).
+  pages. `RecorderRtdsHalted` is retired with RTDS (§3) and is not one of
+  them, though the rule file still declares it.
 - **Wiring status, disclosed**: no process serves `/metrics` yet. The
   exporter is wired into the apps by a follow-up recorded in
   `docs/handoffs/WP-140.md` (the apps are outside WP-140's paths). Until

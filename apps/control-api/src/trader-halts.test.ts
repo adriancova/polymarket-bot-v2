@@ -630,7 +630,6 @@ describe("CTL2-F1: an authorized health or metrics read ANSWERS by the answer de
       refreshHealthOnRead: true,
       traderHalts: harness.traderHalts,
       refreshDeadlineMs: DEADLINE_MS,
-      mutationsReachTrader: true,
     };
     const api = new ControlApi(options);
     const reader = { authorization: bearer(FAKE_READER_TOKEN) };
@@ -669,7 +668,6 @@ describe("CTL2-F1: an authorized health or metrics read ANSWERS by the answer de
       auditSize: () => harness.audit.size,
       traderHalts: harness.traderHalts,
       refreshDeadlineMs,
-      mutationsReachTrader: true,
     });
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, READ_REFRESH_DEADLINE_MS + 1, 60_000]) {
       expect(() => new ControlApi(options(bad)), String(bad)).toThrow(RangeError);

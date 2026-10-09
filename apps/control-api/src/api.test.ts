@@ -738,7 +738,6 @@ describe("CONTROL-1b (follow-up 3b): a mode-raise attempt's audit record is boun
       auditCapacity: 8,
       auditSize: () => 0,
       traderHalts: new TraderHaltCache(new AbsentTraderHaltSource()),
-      mutationsReachTrader: true,
     });
     const response = await api.handle(request({ method: "POST", path: "/v1/kill-switch", body: { runMode: "LIVE", reason: "x" } }));
     expect(response.status).toBe(403);

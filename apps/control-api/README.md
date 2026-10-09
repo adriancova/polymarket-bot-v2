@@ -26,16 +26,6 @@ requires of it.
 Every mutating route takes a `reason`, because §14.1 requires one in the audit
 record and a reason the API could invent would be a reason nobody gave.
 
-**In the shipped PAPER process the four `POST` routes answer `501
-CONTROL_NOT_WIRED`** (`C1-OPS`). No trader reads this process's controls (see
-"the composition obligation" below), so an engage answered `200` would report
-a halt nobody observes. The refusal comes after authentication, the
-mode-raise refusal and authorization, and it is audited like any other refused
-mutation. Stop a PAPER trader with Ctrl-C or SIGTERM
-([`docs/runbooks/paper-operations.md`](../../docs/runbooks/paper-operations.md)).
-`ControlApiOptions.mutationsReachTrader` is required: `main.ts` passes `false`,
-and the test harnesses pass `true` so the control plane below stays measured.
-
 **This table is the router's own** (`CONTROL-1`). `api.ts` dispatches through
 `CONTROL_API_ROUTE_TABLE` and nothing else, `CONTROL_API_ROUTES` is derived
 from it, and `example-config-and-startup.test.ts` checks the rows above against
@@ -53,9 +43,6 @@ running trader's strategies yet (see "the composition obligation" below):
 answering `200 PAUSED` for an instance this process cannot control would let an
 operator read a halt that never took effect. `ControlPlane.register` remains the
 composition seam for the future wiring that knows the trader's instance set.
-(Since `C1-OPS` the shipped process answers `501 CONTROL_NOT_WIRED` before a
-pause reaches the plane; the `409` is what a composition with
-`mutationsReachTrader: true` and no registered instance answers.)
 
 ### What a request must look like (`CONTROL-1`)
 
@@ -369,10 +356,9 @@ The pins:
   since `CONTROL-1` r1, a `KILL_SWITCH` holder's random engages and releases,
   with an independent check that only a strengthening sits in the reserved
   band.
-- `engage-reserve.test.ts` is the verifiers' three `CONTROL1-J-M1` sequences,
-  over HTTP; it fails at the round-0 commit. (Its shipped-root twin was
-  replaced at `C1-OPS` by `src/main.not-wired.test.ts`: the shipped process
-  applies no mutation.)
+- `engage-reserve.test.ts` and `shipped-root-engage-reserve.test.ts` are the
+  verifiers' three `CONTROL1-J-M1` sequences, over HTTP and through the shipped
+  `main.ts`; each fails at the round-0 commit.
 - `authorized-refusals-audited.test.ts` is `CONTROL1-J-M2`: every refusal of
   an authorized request is audited, and nothing else is — save the gated
   refusal, write-nothing item 7, which it pins as writing nothing
@@ -615,13 +601,15 @@ process calls `refresh()`; no poller exists yet — both halves are owed by the
 same future wiring) — `control_trader_health_available` reads `0` and the
 operations dashboard's first stat panel says so.
 
-Likewise, no running trader observes this process's kill switches or pauses:
-the shipped process composes no durable audit sink, and the PAPER trader reads
-no control table. So the shipped process answers every mutating route `501
-CONTROL_NOT_WIRED` (`C1-OPS`), and the operations dashboard's "Kill switches
-engaged" panel stays `0`. Set `mutationsReachTrader` to `true` only in a
-composition that binds a durable sink AND a trader that reads it; that wiring is
-a documented composition obligation, not something this package claims.
+Likewise, engaging a kill switch here changes **this process's** authoritative
+record and writes the §10.6 audit row. Whether a running trader observes it
+depends on a seam that does not exist in this repository yet: the PAPER
+trader reads no control table, and a trader halt ends its run rather than
+waiting for a release. So in PAPER an engage or a pause here stops nothing;
+stop a PAPER trader with Ctrl-C or SIGTERM
+([`docs/runbooks/paper-operations.md`](../../docs/runbooks/paper-operations.md)).
+That wiring is a documented composition obligation, not something this
+package claims.
 
 ## Open trader halts (`CONTROL-2`)
 

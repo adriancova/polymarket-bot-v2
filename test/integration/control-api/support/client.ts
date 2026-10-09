@@ -129,8 +129,6 @@ export async function serveControlApi(options: ServeOptions = {}): Promise<Serve
     auditCapacity: options.auditCapacity ?? 64,
     auditSize: () => audit.size,
     traderHalts,
-    // `C1-OPS`: the client measures the control plane the live composition will use.
-    mutationsReachTrader: true,
   });
 
   const server = await startControlHttpServer({

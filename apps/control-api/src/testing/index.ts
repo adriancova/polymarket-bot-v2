@@ -150,8 +150,6 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     auditSize: () => audit.size,
     traderHalts,
     ...(options.refreshDeadlineMs === undefined ? {} : { refreshDeadlineMs: options.refreshDeadlineMs }),
-    // `C1-OPS`: the harness measures the control plane the live composition will use.
-    mutationsReachTrader: true,
   });
 
   return { api, controlPlane, audit, auditBudget, health, healthSource, environment, traderHalts, traderHaltSource };
