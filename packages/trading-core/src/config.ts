@@ -108,14 +108,6 @@ const BoundedDepth = z.number().int().positive().max(1_000_000);
  * SAME authority, exactly as `packages/domain`'s `decimalStringSchema` and
  * `packages/execution-planner`'s `validate.ts` already do.
  *
- * A second property falls out of it, and {@link crossFieldRefusal} depends on
- * it: two canonical spellings of one value are the same STRING, so comparing
- * `accounting.startingCash` with `simulation.startingCash` by `===` is exact.
- * Under the old regex `"1000"` and `"1000.00"` were both accepted and compared
- * UNEQUAL, so a document stating one value twice could be refused as
- * inconsistent — or, worse, accepted as consistent in the `"1000.00"`/`"1000.00"`
- * case and then thrown out of `drain()`.
- *
  * Layer note: `@polymarket-bot/decimal` is layer 0 and `apps/trader` is layer 3
  * (`docs/contracts/dependency-direction.md` §2), so the edge is downward and
  * permitted; the package is already a declared dependency of this app.
@@ -499,8 +491,13 @@ const SimulationConfigSchema = z.strictObject({
     minimumChargedFee: NonNegativeDecimal,
     feeCurrency: CodeString,
   }),
-  /** Starting simulated cash. The venue books against it (§12.1). */
-  startingCash: NonNegativeDecimal,
+}, {
+  // `C1-TIDY`: `simulation.startingCash` is gone (the venue opens with
+  // `accounting.startingCash`). An old document is refused, saying where it went.
+  error: (issue) =>
+    issue.code === "unrecognized_keys" && issue.keys.includes("startingCash")
+      ? "simulation.startingCash was removed: the simulated venue opens with accounting.startingCash; delete this key"
+      : undefined,
 });
 
 /** The infrastructure endpoints. Names only — no credential is representable. */
@@ -702,49 +699,9 @@ function parseTraderConfigInner(input: unknown): ParseConfigResult {
   return { ok: true, config };
 }
 
-/**
- * Cross-field consistency, checked after the grammar (review round 1, L5).
- *
- * `accounting.startingCash` is the balance the LOOP books against — the number
- * `#cash` starts at and every §9.7 `availableCollateral` is derived from — and
- * `simulation.startingCash` is the balance the VENUE opens its own simulated
- * account with. They describe the same pUSD, from two sides of the §12.1 seam.
- *
- * WHY A REFUSAL RATHER THAN A DERIVATION. Deriving one from the other would
- * pick a winner silently, and the two are read by different components at
- * different times: an operator who set one and forgot the other would get a run
- * whose ledger and whose venue disagree about how much money exists, with no
- * event marking the divergence. §6 invariant 1's discipline is that an economic
- * value is exact and stated; two statements of one value that differ is a
- * document nobody can act on, and BOTH PATHS ARE NAMED so the operator does not
- * have to guess which one to change.
- *
- * WHY `===` IS THE RIGHT COMPARISON, and what makes it so. Both fields are
- * parsed through {@link canonicalDecimalSchema}, and the canonical form is
- * UNIQUE: two canonical strings denoting the same number are identical strings.
- * So `===` here is numeric equality, not a spelling comparison — no
- * `compareDecimal` is needed and none is hidden. That was NOT true at the r1
- * tip, where the grammar was a wider regex: `"1000"` and `"1000.00"` were both
- * accepted, and this function called them inconsistent (review round 2,
- * MEDIUM-2). The canonical door is what makes the cheap comparison sound.
- */
+/** Cross-field consistency, checked after the grammar. */
 function crossFieldRefusal(config: TraderConfig): ConfigRefusal | undefined {
-  const series = seriesRefusal(config);
-  if (series !== undefined) return series;
-  if (config.accounting.startingCash === config.simulation.startingCash) return undefined;
-  return {
-    code: "TRADER_CONFIG_INCONSISTENT",
-    detail:
-      "accounting.startingCash and simulation.startingCash state the same opening pUSD balance " +
-      "and disagree; the loop books against the first and the simulated venue opens its account " +
-      "with the second, so a run under this document would have a ledger and a venue that " +
-      "disagree about how much money exists. Refused rather than derived: choosing a winner " +
-      "here would silently discard the value the operator did set",
-    issues: [
-      `accounting.startingCash: ${config.accounting.startingCash}`,
-      `simulation.startingCash: ${config.simulation.startingCash}`,
-    ],
-  };
+  return seriesRefusal(config);
 }
 
 /**

@@ -65,8 +65,12 @@ const Halt = z.strictObject({
   code: z.string().min(1).max(128),
   detail: z.string().max(4096),
   at: z.string().min(1).max(64),
-  action: z.string().min(1).max(64),
 });
+
+const BookRefusals = z.record(
+  z.string().min(1).max(256),
+  z.strictObject({ benign: Counter, divergence: Counter }),
+);
 
 const Queue = z.strictObject({
   name: z.string().min(1).max(128),
@@ -173,6 +177,8 @@ const TransportSection = z.strictObject({
  * `TRDR-4` and `FOLD-1`, additions only.
  */
 export type TraderHealthDocument = TraderHealthReportInput & {
+  /** Per market, the trader's book-refusal counts (`C1-TIDY`); this door passes them through. */
+  readonly bookRefusals: z.output<typeof BookRefusals>;
   readonly seams: TraderHealthReportInput["seams"] & {
     readonly orders: z.output<typeof OrderLifecycleSeam>;
     readonly retention: z.output<typeof RetentionSeam>;
@@ -186,6 +192,7 @@ const TraderHealthSchema = z.strictObject({
   maximumRunMode: z.string().min(1).max(64),
   healthy: z.boolean(),
   halts: z.array(Halt).max(4096),
+  bookRefusals: BookRefusals,
   queues: z.array(Queue).max(256),
   loop: z.strictObject({
     eventsAccepted: Counter,

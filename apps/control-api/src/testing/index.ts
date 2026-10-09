@@ -178,6 +178,7 @@ export function healthDocument(
     maximumRunMode: "PAPER",
     healthy: true,
     halts: [],
+    bookRefusals: { "market-1": { benign: 2, divergence: 1 } },
     queues: [
       {
         name: "market-events",

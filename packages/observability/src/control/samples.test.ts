@@ -41,18 +41,16 @@ describe("traderHealthSamples", () => {
     );
     expect(halts).toHaveLength(3);
     expect(halts.map((entry) => entry.labels)).toEqual([
-      { scope: "GLOBAL", scope_ref: "", code: "STORE_UNAVAILABLE", action: "FULL_HALT" },
+      { scope: "GLOBAL", scope_ref: "", code: "STORE_UNAVAILABLE" },
       {
         scope: "MARKET",
         scope_ref: "market-1",
         code: "UNATTRIBUTED_ACTIVITY",
-        action: "RECONCILE_ACCOUNT",
       },
       {
         scope: "STRATEGY_INSTANCE",
         scope_ref: "sb-1",
         code: "OPERATOR_HALT",
-        action: "FULL_HALT",
       },
     ]);
     expect(sample("trader_halt_count")?.value).toBe(3);

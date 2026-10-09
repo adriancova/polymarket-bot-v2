@@ -306,7 +306,6 @@ function traderConfig(perStrategyCap: string, globalAccountCap: string, risk: Ri
       fillModelVersion: "tier0.cap1",
       fillModelParametersHash: "e".repeat(64),
       feeSchedule: { ...feeSnapshot() },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 1_000_000, windowMs: 60_000 },
     scenarios: [
@@ -1761,8 +1760,8 @@ describe("CAP-1 r2 regression (CAP1-ASTRA-R2-01, the ordinary page): a fill the 
   it("the refused posting: the account counts B at 3.40, exactly as the booked control, and A's entry is refused by the run state alone", async () => {
     const pending = await run(true);
     const control = await run(false);
-    expect(pending.harness.loop.health().halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-      ["MARKET", "LEDGER_POSTING_REFUSED", "FULL_HALT"],
+    expect(pending.harness.loop.health().halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([
+      ["MARKET", "LEDGER_POSTING_REFUSED"],
     ]);
     expect(control.harness.halts.records()).toEqual([]);
     for (const current of [pending, control]) expect(current.before).toEqual({ A: "0", B: "3.4", global: "3.4" });

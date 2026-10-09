@@ -68,7 +68,6 @@ function validConfig(): Record<string, unknown> {
         minimumChargedFee: "0",
         feeCurrency: "pUSD",
       },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 100, windowMs: 60000 },
     scenarios: [{ scenarioId: "spot.down", kind: "SPOT", yesPriceShock: "-0.1" }],
@@ -319,14 +318,12 @@ describe("parseTraderConfig", () => {
     it("REFUSES a non-canonical `accounting.startingCash`, naming the field", () => {
       const config = validConfig();
       (config["accounting"] as Record<string, unknown>)["startingCash"] = "1000.00";
-      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000.00";
       const parsed = parseTraderConfig(config);
       expect(parsed.ok).toBe(false);
       if (parsed.ok) return;
       expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
       const issues = parsed.refusal.issues.join("\n");
       expect(issues).toContain("accounting.startingCash");
-      expect(issues).toContain("simulation.startingCash");
       // The message is the DECIMAL package's own, so the door and the
       // arithmetic cannot state different rules.
       expect(issues).toContain("canonical");
@@ -344,7 +341,6 @@ describe("parseTraderConfig", () => {
       for (const [value] of cases) {
         const config = validConfig();
         (config["accounting"] as Record<string, unknown>)["startingCash"] = value;
-        (config["simulation"] as Record<string, unknown>)["startingCash"] = value;
         expect(parseTraderConfig(config).ok).toBe(false);
       }
       const negativeZero = validConfig();
@@ -356,7 +352,6 @@ describe("parseTraderConfig", () => {
     it("REFUSES a NEGATIVE value where the field is non-negative", () => {
       const config = validConfig();
       (config["accounting"] as Record<string, unknown>)["startingCash"] = "-1";
-      (config["simulation"] as Record<string, unknown>)["startingCash"] = "-1";
       const parsed = parseTraderConfig(config);
       expect(parsed.ok).toBe(false);
       if (parsed.ok) return;
@@ -370,28 +365,16 @@ describe("parseTraderConfig", () => {
       expect(parseTraderConfig(config).ok).toBe(true);
     });
 
-    it("the canonical door is what makes the cross-field `===` sound", () => {
-      // Two spellings of ONE number can no longer reach `crossFieldRefusal`: the
-      // grammar refuses the non-canonical one first, so a document that passes
-      // it compares two strings that are equal exactly when the numbers are.
+    it("REFUSES an old document that still carries `simulation.startingCash`, naming `accounting.startingCash` (C1-TIDY)", () => {
       const config = validConfig();
-      (config["accounting"] as Record<string, unknown>)["startingCash"] = "1000";
-      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000.00";
+      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000";
       const parsed = parseTraderConfig(config);
       expect(parsed.ok).toBe(false);
       if (parsed.ok) return;
-      // Refused by the GRAMMAR, not by the cross-field check — the two values
-      // are numerically equal, and calling that "inconsistent" would be wrong.
       expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
-    });
-
-    it("still REFUSES two genuinely different balances as INCONSISTENT", () => {
-      const config = validConfig();
-      (config["simulation"] as Record<string, unknown>)["startingCash"] = "999";
-      const parsed = parseTraderConfig(config);
-      expect(parsed.ok).toBe(false);
-      if (parsed.ok) return;
-      expect(parsed.refusal.code).toBe("TRADER_CONFIG_INCONSISTENT");
+      const issues = parsed.refusal.issues.join("\n");
+      expect(issues).toContain("simulation.startingCash was removed");
+      expect(issues).toContain("accounting.startingCash");
     });
 
     it("the canonical check is a CUSTOM check, and pollution does not skip it", () => {
@@ -400,7 +383,6 @@ describe("parseTraderConfig", () => {
       // `when: () => false`. Permission must not vary.
       const config = validConfig();
       (config["accounting"] as Record<string, unknown>)["startingCash"] = "1000.00";
-      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000.00";
       expect(parseTraderConfig(config).ok).toBe(false);
       cleanups.push(pollute("when", () => false));
       expect(parseTraderConfig(config).ok).toBe(false);

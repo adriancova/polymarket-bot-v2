@@ -50,6 +50,18 @@ describe("a complete report", () => {
     expect(result.value.queues[0]?.oldestMessageAgeMs).toBeNull();
   });
 
+  it("passes the book-refusal counts through, and refuses a halt that still carries an action (C1-TIDY)", () => {
+    const result = readTraderHealthReport(healthDocument());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect((result.value as unknown as { bookRefusals: unknown }).bookRefusals).toEqual({ "market-1": { benign: 2, divergence: 1 } });
+    expect(
+      readTraderHealthReport(
+        mutate(["halts"], [{ scope: { kind: "GLOBAL" }, code: "X", detail: "", at: "t", action: "FULL_HALT" }]),
+      ).ok,
+    ).toBe(false);
+  });
+
   it("carries the riskSeamCaveat verbatim", () => {
     const result = readTraderHealthReport(healthDocument());
     expect(result.ok).toBe(true);
@@ -62,20 +74,18 @@ describe("a complete report", () => {
       mutate(
         ["halts"],
         [
-          { scope: { kind: "GLOBAL" }, code: "STORE_UNAVAILABLE", detail: "", at: "t", action: "FULL_HALT" },
+          { scope: { kind: "GLOBAL" }, code: "STORE_UNAVAILABLE", detail: "", at: "t" },
           {
             scope: { kind: "MARKET", marketId: "m" },
             code: "BOOK_DESYNCHRONIZED",
             detail: "",
             at: "t",
-            action: "CANCEL_RESTING_ORDERS",
           },
           {
             scope: { kind: "STRATEGY_INSTANCE", instanceId: "sb-1" },
             code: "OPERATOR_HALT",
             detail: "",
             at: "t",
-            action: "FULL_HALT",
           },
         ],
       ),
@@ -138,7 +148,7 @@ describe("no counter is defaulted", () => {
       readTraderHealthReport(
         mutate(
           ["halts"],
-          [{ scope: { kind: "ACCOUNT" }, code: "X", detail: "", at: "t", action: "FULL_HALT" }],
+          [{ scope: { kind: "ACCOUNT" }, code: "X", detail: "", at: "t" }],
         ),
       ).ok,
     ).toBe(false);

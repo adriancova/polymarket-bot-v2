@@ -15,7 +15,7 @@
  * | --- | --- |
  * | run mode | `runMode`, `maximumRunMode` |
  * | queue depths | `queues` (the full §8.3 metric set per queue) |
- * | halt reason | `halts` (every latched record: scope, code, detail, instant, and `action`, which is always `FULL_HALT`: every halt ends the run) |
+ * | halt reason | `halts` (every latched record: scope, code, detail, instant; every halt ends the run) |
  * | risk-refusal counts | `risk.refusalsByCode`, `risk.refusedExits`, `risk.approvals` |
  *
  * ## The risk-refusal counts make a refused exit visible
@@ -468,7 +468,13 @@ export interface HealthSnapshot {
   readonly maximumRunMode: string;
   /** `true` while no scope is halted and the loop may make decisions. */
   readonly healthy: boolean;
-  readonly halts: readonly HealthHalt[];
+  readonly halts: readonly HaltRecord[];
+  /**
+   * Per market, the book refusals counted (`benign`) or waited out
+   * (`divergence`): `CoreLoop.bookRefusals()`, so an operator sees them
+   * without waiting for the stop log.
+   */
+  readonly bookRefusals: Readonly<Record<string, { readonly benign: number; readonly divergence: number }>>;
   readonly queues: readonly QueueMetrics[];
   readonly loop: LoopHealth;
   readonly risk: RiskHealth;
@@ -482,16 +488,6 @@ export interface HealthSnapshot {
   /** The instant this snapshot was taken, from the injected clock. */
   readonly asOf: string;
 }
-
-/**
- * One latched halt on the health surface. `C1-HALTS` removed the §9.9 action
- * rung from {@link HaltRecord}: every halt ends the run, so no rung was ever
- * acted on. The control API's health door and `@polymarket-bot/observability`'s
- * `trader_halt_info` label still REQUIRE an `action` (both outside that round's
- * paths), so the surface states the one action that happens, `FULL_HALT`,
- * until a round granted those paths drops the field.
- */
-export type HealthHalt = HaltRecord & { readonly action: "FULL_HALT" };
 
 function sortedCounts(counts: ReadonlyMap<string, number>): Readonly<Record<string, number>> {
   const out: Record<string, number> = Object.create(null) as Record<string, number>;
@@ -657,6 +653,8 @@ export class HealthState {
   snapshot(input: {
     readonly asOf: string;
     readonly halts: readonly HaltRecord[];
+    /** Omitted: no market has refused a book. See {@link HealthSnapshot.bookRefusals}. */
+    readonly bookRefusals?: HealthSnapshot["bookRefusals"];
     readonly queues: readonly QueueMetrics[];
     /**
      * The seams' own counters, read from the seams by the caller.
@@ -671,7 +669,8 @@ export class HealthState {
       runMode: this.runMode,
       maximumRunMode: this.maximumRunMode,
       healthy: input.halts.length === 0,
-      halts: Object.freeze(input.halts.map((halt): HealthHalt => Object.freeze({ ...halt, action: "FULL_HALT" }))),
+      halts: Object.freeze(input.halts.map((halt): HaltRecord => Object.freeze({ ...halt }))),
+      bookRefusals: input.bookRefusals ?? Object.freeze({}),
       queues: input.queues,
       loop: Object.freeze({ ...this.#loop }),
       risk: Object.freeze({

@@ -309,6 +309,7 @@ export function assembleBacktestCore(options: BacktestCoreOptions): BacktestCore
   const built = buildSimulatedVenue({
     clock: clock.value,
     settings: config.simulation,
+    startingCash: config.accounting.startingCash,
     ...(options.log === undefined ? {} : { log: options.log }),
   });
   if (!built.ok) {

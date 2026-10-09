@@ -269,8 +269,8 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
       const exited = await settleWithin(run.exit, 60_000);
       expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
       const halts = exitHealth(run).halts;
-      expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-        ["GLOBAL", "TRANSPORT_RESYNC_REQUIRED", "FULL_HALT"],
+      expect(halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([
+        ["GLOBAL", "TRANSPORT_RESYNC_REQUIRED"],
       ]);
       expect(halts[0]?.detail).toContain("retention removed 50 event(s)");
       // One row per run's halt: run 1's outage, then run 2's resync.
@@ -370,7 +370,7 @@ describe("every halt is written to ops.incidents before the process exits (PROVE
         expect(exited === undefined ? "STILL RUNNING" : "returned", run.text()).toBe("returned");
         expect(exited?.value, run.text()).toBe(EXIT_CODES.halted);
         const halts = exitHealth(run).halts;
-        expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT"]]);
+        expect(halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
         expect(halts[0]?.detail).toContain("the PostgreSQL connection pool lost an idle connection");
         expect(halts[0]?.detail).toContain("terminating connection due to administrator command");
         expect(run.text()).toContain("STORE CONNECTION LOST: ");

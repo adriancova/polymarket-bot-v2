@@ -239,7 +239,6 @@ function singleMarketConfig(options: ConfigOptions = {}): Record<string, unknown
       fillModelVersion: "tier0.tp1c",
       fillModelParametersHash: "c".repeat(64),
       feeSchedule: { ...fees },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 100, windowMs: 60_000 },
     scenarios: [
@@ -1924,6 +1923,8 @@ describe("C1-HALTS BOOK-WAITS: a desynchronized book waits for its next snapshot
     expect(bookNotSynchronizedRefusals(parts)).toBe(1);
     expect(parts.trader.markets.get(MARKET_ID)?.bookFor("YES").baseline()).toBeUndefined();
     expect(parts.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 0, divergence: 1, waiting: ["YES"] });
+    // C1-TIDY: the health snapshot carries the same counts (without `waiting`).
+    expect(parts.trader.loop.health().bookRefusals).toEqual({ [MARKET_ID]: { benign: 0, divergence: 1 } });
     // While it waits, a later level change is refused too (no baseline), and
     // the book still waits: only a snapshot re-arms it.
     const still = await run(CHECK_8_ONLY, [
