@@ -21,19 +21,46 @@
  * `ops:verify-venue` script: the CLI entry point and root package.json are
  * outside WP-000's allowed paths. Wiring is recorded as follow-up work (see
  * report section 15).
+ *
+ * V2-9 (2026-10-06) adds four things to the run:
+ * - **coverage:** every file under `test/fixtures/venue/` except a
+ *   `README.md`, whatever its suffix, must be claimed by exactly one check
+ *   (a fixture, or a capture and its sidecar). The rule used to live only in
+ *   the unit test and saw `.json` only, which is how the `protocol-v2/`
+ *   `.jsonc` and `.jsonl` captures sat outside the gate (plan row D9,
+ *   `CLOSEOUT-3` L11);
+ * - **V2-report checks:** a check validated against a report other than the
+ *   frozen baseline needs that report's section, and every id it cites
+ *   defined there;
+ * - **`kind: "capture"` checks and `assert` hooks** (`captures.ts`,
+ *   `checks.ts`), and each fixture's `retrieved` date pinned to its report's
+ *   snapshot date;
+ * - **the scan** (`scan.ts`) of every file of the tree for obvious personal
+ *   data and credentials, part of `ok`.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  loadCapture,
+  parseSourceIndex,
+  reportDefinesId,
+  sidecarPathOf,
+} from "./captures.js";
+import type { CaptureContext, CaptureValidationResult } from "./captures.js";
+import {
   SDK_PERMALINK_PREFIX,
   SDK_REFERENCE_COMMIT,
   VENUE_CHECKS,
   VERIFICATION_REPORT_PATH,
+  reportOf,
+  snapshotDateOf,
 } from "./checks.js";
 import type { VenueCheck } from "./checks.js";
-import { REPO_ROOT, loadFixture } from "./fixtures.js";
+import { REPO_ROOT, VENUE_FIXTURE_ROOT, loadFixture } from "./fixtures.js";
 import type { FixtureValidationResult } from "./fixtures.js";
+import { listVenueFixtureFiles, scanFixtureTree } from "./scan.js";
+import type { TreeScan } from "./scan.js";
 
 export type CheckStatus = "PASS" | "FAIL" | "DOCUMENTED";
 
@@ -42,6 +69,8 @@ export interface CheckResult {
   readonly status: CheckStatus;
   readonly errors: readonly string[];
   readonly fixtureResults: readonly FixtureValidationResult[];
+  /** V2-9: one result per capture of a `kind: "capture"` check. */
+  readonly captureResults: readonly CaptureValidationResult[];
 }
 
 export interface ReportValidationResult {
@@ -49,11 +78,31 @@ export interface ReportValidationResult {
   readonly errors: readonly string[];
 }
 
+/**
+ * V2-9: whether every file in the fixture tree is claimed by exactly one
+ * check, and every claimed file exists.
+ */
+export interface FixtureCoverage {
+  readonly ok: boolean;
+  /** Files on disk that no check claims. */
+  readonly unclaimed: readonly string[];
+  /** Files claimed more than once. */
+  readonly claimedTwice: readonly string[];
+  /** Claimed files that are not on disk. */
+  readonly missing: readonly string[];
+  /** How many files are claimed. */
+  readonly claimed: number;
+}
+
 export interface VenueVerificationReport {
   readonly reportPath: string;
   readonly reportValidation: ReportValidationResult;
   readonly ok: boolean;
   readonly results: readonly CheckResult[];
+  /** V2-9: the fixture-tree claim, part of `ok`. */
+  readonly coverage: FixtureCoverage;
+  /** V2-9: the personal-data and credential scan of every file, part of `ok`. */
+  readonly scan: TreeScan;
 }
 
 /**
@@ -75,7 +124,13 @@ export interface VenueVerificationReport {
  * list cannot silently fall behind the report again.
  */
 export const REQUIRED_REPORT_SECTIONS: readonly string[] = [
-  ...new Set(VENUE_CHECKS.map((check) => check.reportSection)),
+  // Only the baseline's checks: a V2 check's section is in the V2 report
+  // (`validateCheckReport`), not in this one (V2-9).
+  ...new Set(
+    VENUE_CHECKS.filter(
+      (check) => reportOf(check) === VERIFICATION_REPORT_PATH,
+    ).map((check) => check.reportSection),
+  ),
   "2.1",
   "2.2",
   "2.3",
@@ -288,14 +343,142 @@ export function loadAndValidateReport(
   return { content, validation: validateVerificationReport(content) };
 }
 
-/** Runs every check against local fixtures and the frozen report only. */
+/**
+ * V2-9: every file in the fixture tree, relative and `/`-separated, sorted,
+ * except `README.md` files. Whatever the suffix: a `.jsonc` or `.jsonl` file
+ * is a fixture like any other.
+ */
+export function listFixtureFiles(root: string = VENUE_FIXTURE_ROOT): string[] {
+  return listVenueFixtureFiles(root);
+}
+
+/** V2-9: the files each check claims: its fixtures, or its captures and sidecars. */
+export function claimedFixturePaths(
+  checks: readonly VenueCheck[] = VENUE_CHECKS,
+): string[] {
+  return checks.flatMap((check) => {
+    if (check.kind === "capture") {
+      return (check.captures ?? []).flatMap((capture) => [
+        capture.fixture,
+        sidecarPathOf(capture.fixture),
+      ]);
+    }
+    return check.kind === "fixture" ? [...check.fixtures] : [];
+  });
+}
+
+/** V2-9: compares the files on disk with the files the checks claim. */
+export function fixtureCoverage(
+  onDisk: readonly string[],
+  claimed: readonly string[],
+): FixtureCoverage {
+  const counts = new Map<string, number>();
+  for (const path of claimed) {
+    counts.set(path, (counts.get(path) ?? 0) + 1);
+  }
+  const disk = new Set(onDisk);
+  const unclaimed = onDisk.filter((path) => !counts.has(path));
+  const claimedTwice = [...counts]
+    .filter(([, count]) => count > 1)
+    .map(([path]) => path)
+    .sort();
+  const missing = [...counts.keys()].filter((path) => !disk.has(path)).sort();
+  return {
+    ok: unclaimed.length === 0 && claimedTwice.length === 0 && missing.length === 0,
+    unclaimed,
+    claimedTwice,
+    missing,
+    claimed: counts.size,
+  };
+}
+
+/**
+ * V2-9: a check validated against a report other than the frozen baseline
+ * needs the report, its section, at least one cited id, and every cited id
+ * defined there (`reportDefinesId`). The baseline's checks are covered by
+ * `validateVerificationReport` instead.
+ */
+export function validateCheckReport(
+  check: VenueCheck,
+  reportContent: string | null,
+): string[] {
+  const reportPath = reportOf(check);
+  if (reportPath === VERIFICATION_REPORT_PATH) {
+    return [];
+  }
+  if (reportContent === null) {
+    return [`report ${reportPath} is unavailable`];
+  }
+  const errors: string[] = [];
+  if (!reportHasSection(reportContent, check.reportSection)) {
+    errors.push(`report ${reportPath} has no section ${check.reportSection}`);
+  }
+  const facts = check.facts ?? [];
+  if (facts.length === 0) {
+    errors.push(`a check of ${reportPath} must cite the ids it pins (facts)`);
+  }
+  for (const id of facts) {
+    if (!reportDefinesId(reportContent, id)) {
+      errors.push(`${id} is not defined in ${reportPath}`);
+    }
+  }
+  return errors;
+}
+
+function readReport(reportPath: string): string | null {
+  try {
+    return readFileSync(join(REPO_ROOT, reportPath), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** The context a capture-kind check validates its captures in. */
+export function captureContextOf(reportPath: string, reportContent: string | null): CaptureContext {
+  const sourceIndexText =
+    reportContent === null ? "" : (reportSectionText(reportContent, "14") ?? "");
+  return { report: reportPath, reportContent, sourceIndex: parseSourceIndex(sourceIndexText) };
+}
+
+/**
+ * The refusals of one fixture file of a fixture-kind check, each prefixed by
+ * its path: the envelope and payload validation (`loadFixture`), the
+ * snapshot date and the check's `assert` hook.
+ */
+export function fixtureCheckErrors(check: VenueCheck, result: FixtureValidationResult): string[] {
+  const fixture = result.fixture;
+  const extra =
+    fixture === null
+      ? []
+      : [
+          ...(fixture.retrieved === snapshotDateOf(check)
+            ? []
+            : [`retrieved must be ${snapshotDateOf(check)}, the snapshot date of ${reportOf(check)}`]),
+          ...(check.assert?.(fixture) ?? []),
+        ];
+  return [...result.errors, ...extra].map((error) => `${result.relativePath}: ${error}`);
+}
+
+/** Runs every check against local fixtures and the dated reports only. */
 export function runVenueVerification(): VenueVerificationReport {
   const { content, validation } = loadAndValidateReport();
+  const reports = new Map<string, string | null>([
+    [VERIFICATION_REPORT_PATH, content],
+  ]);
+  const reportContent = (reportPath: string): string | null => {
+    if (!reports.has(reportPath)) {
+      reports.set(reportPath, readReport(reportPath));
+    }
+    return reports.get(reportPath) ?? null;
+  };
   const results: CheckResult[] = VENUE_CHECKS.map((check) => {
+    const checkReport = reportContent(reportOf(check));
+    const reportErrors = validateCheckReport(check, checkReport);
     if (check.kind === "documented") {
       const documented =
-        content !== null &&
-        reportSectionHasOfficialCitation(content, check.reportSection);
+        reportErrors.length === 0 &&
+        checkReport !== null &&
+        reportSectionHasOfficialCitation(checkReport, check.reportSection);
       return {
         check,
         status: documented ? ("DOCUMENTED" as const) : ("FAIL" as const),
@@ -303,31 +486,61 @@ export function runVenueVerification(): VenueVerificationReport {
           ? []
           : [
               `documented-only check has no evidence: report section ${check.reportSection} is missing or lacks its own official citation`,
+              ...reportErrors,
             ],
         fixtureResults: [],
+        captureResults: [],
+      };
+    }
+    if (check.kind === "capture") {
+      const captures = check.captures ?? [];
+      const context = captureContextOf(reportOf(check), checkReport);
+      const captureResults = captures.map((capture) => loadCapture(capture, context));
+      const errors = [
+        ...reportErrors,
+        ...(captures.length === 0
+          ? ["capture-kind check declares no captures"]
+          : []),
+        ...captureResults.flatMap((result) =>
+          result.errors.map((error) => `${result.relativePath}: ${error}`),
+        ),
+      ];
+      return {
+        check,
+        status: errors.length === 0 ? ("PASS" as const) : ("FAIL" as const),
+        errors,
+        fixtureResults: [],
+        captureResults,
       };
     }
     if (check.fixtures.length === 0) {
       return {
         check,
         status: "FAIL" as const,
-        errors: ["fixture-kind check declares no fixture files"],
+        errors: ["fixture-kind check declares no fixture files", ...reportErrors],
         fixtureResults: [],
+        captureResults: [],
       };
     }
     const fixtureResults = check.fixtures.map((relativePath) =>
       loadFixture(relativePath, check.payloadSpec),
     );
-    const ok = fixtureResults.every((result) => result.ok);
+    const errors = [
+      ...reportErrors,
+      ...fixtureResults.flatMap((result) => fixtureCheckErrors(check, result)),
+    ];
     return {
       check,
-      status: ok ? ("PASS" as const) : ("FAIL" as const),
-      errors: fixtureResults.flatMap((result) =>
-        result.errors.map((error) => `${result.relativePath}: ${error}`),
-      ),
+      status: errors.length === 0 ? ("PASS" as const) : ("FAIL" as const),
+      errors,
       fixtureResults,
+      captureResults: [],
     };
   });
+  const coverage = fixtureCoverage(listFixtureFiles(), claimedFixturePaths());
+  const scan = scanFixtureTree(
+    [...new Set(VENUE_CHECKS.map(reportOf))].flatMap((path) => reportContent(path) ?? []),
+  );
   const hasFixtureEvidence = results.some(
     (result) => result.status === "PASS",
   );
@@ -335,8 +548,10 @@ export function runVenueVerification(): VenueVerificationReport {
   return {
     reportPath: VERIFICATION_REPORT_PATH,
     reportValidation: validation,
-    ok: validation.ok && noFailures && hasFixtureEvidence,
+    ok: validation.ok && noFailures && hasFixtureEvidence && coverage.ok && scan.ok,
     results,
+    coverage,
+    scan,
   };
 }
 
@@ -355,15 +570,27 @@ export function formatVenueVerificationReport(
     `Venue verification report: ${report.reportPath}`,
     `Report validation: ${report.reportValidation.ok ? "OK" : "INVALID"}`,
     ...report.reportValidation.errors.map((error) => `  ${error}`),
+    `Fixture coverage: ${report.coverage.ok ? "OK" : "INCOMPLETE"} (${report.coverage.claimed} files claimed)`,
+    ...report.coverage.unclaimed.map((path) => `  unclaimed: ${path}`),
+    ...report.coverage.claimedTwice.map((path) => `  claimed twice: ${path}`),
+    ...report.coverage.missing.map((path) => `  claimed but missing: ${path}`),
+    `Fixture scan: ${report.scan.ok ? "OK" : "FAIL"} (${report.scan.files} files)`,
+    ...report.scan.errors.map((error) => `  ${error}`),
     `Overall: ${report.ok ? "PASS" : "FAIL"}`,
   ];
   for (const result of report.results) {
     const coverage =
       result.check.kind === "fixture"
         ? result.check.fixtures.join(", ")
-        : "report-documented only (no fixture evidence)";
+        : result.check.kind === "capture"
+          ? `${result.check.captures?.length ?? 0} captures with sidecars`
+          : "report-documented only (no fixture evidence)";
+    const reportNote =
+      reportOf(result.check) === VERIFICATION_REPORT_PATH
+        ? ""
+        : ` of ${reportOf(result.check)}`;
     lines.push(
-      `[${result.status}] ${result.check.id} (report section ${result.check.reportSection}): ${coverage}`,
+      `[${result.status}] ${result.check.id} (report section ${result.check.reportSection}${reportNote}): ${coverage}`,
     );
     for (const error of result.errors) {
       lines.push(`       ${error}`);

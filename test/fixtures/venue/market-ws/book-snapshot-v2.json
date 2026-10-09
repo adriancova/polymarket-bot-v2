@@ -1,0 +1,24 @@
+{
+  "fixture": "market-ws/book-snapshot-v2",
+  "source": "https://docs.polymarket.com/api-reference/wss/market",
+  "retrieved": "2026-10-05",
+  "sanitized": true,
+  "notes": "V2-9 (2026-10-06). The public market channel book snapshot for a Polymarket Protocol V2 position id, AS OBSERVED, not a documentation example: no fetched page shows a V2 frame, and the market-channel reference (source, S-D24, byte-identical on 2026-10-05) documents no version key. PROVENANCE: the payload is element 0 of the JSON array in the data text of line 3 of the committed capture test/fixtures/venue/protocol-v2/ws-market-v2-session.jsonl (VENUE-4 source S-W01: wss://ws-subscriptions-clob.polymarket.com/ws/market, subscribed to one V2 position id with custom_feature_enabled, received 2026-10-05T23:15:25.847Z; raw session 35316 bytes, sha256 3024eabbb25ef7f514bba9b93deee7b5b96690f72fc4cf3a8eba41f2a5293445; docs/venue/verified-2026-10-05.md F-62, O.4, §14). Parsed and re-serialized with key order kept; no value changed. verify-venue (check market-ws-book-v2) refuses the fixture unless it equals that element value for value. WHAT IT PINS: the frame carries an undocumented \"version\":\"v2\" (conflict C-21: never an authority; plan row D8 asks for the V2 book frame with version). market is the 32-byte, right-padded condition id (C-19, F-43); asset_id is the 75-digit decimal position id, and asset_id >> 8 is market narrowed to 31 bytes (F-42, F-44; checked by verify-venue). The book is empty (no trade occurred, U-38); last_trade_price is the wire empty string. SANITIZATION: the condition id, position id, hash and timestamp are LIVE PUBLIC MARKET VALUES of a V2 canary market, kept under the dated exception for sanitized live public captures in ../README.md (V2-9, 2026-10-06). They name no person or account. Nothing here came from an authenticated call, a wallet query or an order; no credential existed in the environment.",
+  "examples": [
+    {
+      "name": "book-snapshot-v2-position-id",
+      "payload": {
+        "market": "0x017791f201d5a788e0039e511fc1900e5f000000000000000000000000000000",
+        "asset_id": "663574927012476832975694178961957910328055987427402067619466963999000625152",
+        "timestamp": "1791238858575",
+        "hash": "fc3846cab0c35a0977b6e5f605a4e5ff0d0b2277",
+        "bids": [],
+        "asks": [],
+        "tick_size": "0.01",
+        "event_type": "book",
+        "last_trade_price": "",
+        "version": "v2"
+      }
+    }
+  ]
+}

@@ -166,3 +166,4 @@ In the round's own branch, before the merge, add or update the handoff's single 
 | 2026-10-06 | [RECORDS-W3B.md](RECORDS-W3B.md) | `RECORDS-W3B`: completed packages live in the INDEX, not the brief | Records | Complete (2026-10-06) | `e1915c6` | 3 KB |
 | 2026-10-08 | [ADR-034.md](ADR-034.md) | `ADR-034`: pre-live order-lifecycle design (Accepted 2026-10-08) and the 2026-10-06 venue addendum | Governance | Complete (2026-10-08): the user confirmed D1's additions and ruled variant P share caps; implementation rounds `OMS-QTY`, `OMS-VENUE-TIME`, `TIF-COLLATERAL` | `e1b62c1` | 4 KB |
 | 2026-10-08 | [OMS-QTY.md](OMS-QTY.md) | `OMS-QTY`: one executable quantity on the 0.01 grid (ADR-034 R1, D2; `CO3-N1`) | Round | Complete (2026-10-08) | `9df10c7` | 4 KB |
+| 2026-10-08 | [V2-9.md](V2-9.md) | `V2-9`: Protocol V2 venue fixture catalogue (scanner cut down by COMPLEXITY-1) | WP | Complete (2026-10-08) | `636536a` | 3 KB |
