@@ -165,6 +165,7 @@ export interface PlanningInputsFixture {
   availableCollateral: string;
   markets: Array<Record<string, unknown>>;
   policy: Record<string, unknown>;
+  timeInForce?: string;
   scope?: Record<string, unknown>;
 }
 
@@ -202,6 +203,7 @@ export function planningInputs(overrides: Partial<PlanningInputsFixture> = {}): 
       cancelDeadlineMs: 30000,
       maxPlanLifetimeMs: 600000,
     },
+    timeInForce: "GTC",
     scope: { seriesKey: "btc-15m", underlyingKey: "BTC", resolutionWindowKey: "w1" },
     ...overrides,
   };

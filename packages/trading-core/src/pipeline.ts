@@ -38,25 +38,18 @@
  *
  * ## Where `immediate_order_type` is consumed (the `WP-220` open question)
  *
- * `WP-220` records the question and does not answer it: the strategy tags its
- * entry intent `sb.order-type:FAK`, `packages/risk` never reads tags, and
- * `packages/execution-planner`'s `PlannedOrder` carries `executionStyle` and
- * `postOnly` but no time-in-force. The seam that needs one is
- * `packages/simulation`'s `ExecutionPolicy.timeInForceFor(order)`, whose own
- * comment states the rule this module follows:
- *
- * > "WP-190's `PlannedOrder` carries `executionStyle` and `postOnly` but no
- * > time-in-force — the planner does not choose one. So the venue asks the
- * > composition root rather than assuming a default: **a silently assumed `FAK`
- * > would change every unfilled remainder's fate.**"
+ * The strategy tags its entry intent `sb.order-type:<value>`, and
+ * `packages/risk` never reads tags. The rule this module follows is the one
+ * `packages/simulation`'s `ExecutionPolicy.timeInForceFor` states: **a silently
+ * assumed `FAK` would change every unfilled remainder's fate.**
  *
  * So the resolution is here, and it is: **read the tag; fall back to the
- * emitting instance's configured `immediate_order_type`; never default.**
- * {@link OrderTimeInForceBook} records the answer per planned order at plan
- * time, when both the intent's tags and the emitting instance are still in
- * hand, and the venue policy reads that book. An order whose time-in-force
- * cannot be resolved is REFUSED rather than submitted, because "FAK" chosen by
- * accident is a different order from the one the operator configured.
+ * emitting instance's configured `immediate_order_type`; never default.** The
+ * loop resolves it before planning, and the planner stamps it on every planned
+ * order (`PlannedOrder.timeInForce`, ADR-034 D3.1 item 2), so the venue policy
+ * reads the plan and nothing else. An intent whose time-in-force cannot be
+ * resolved is REFUSED rather than planned, because "FAK" chosen by accident is
+ * a different order from the one the operator configured.
  */
 
 import {
@@ -142,33 +135,6 @@ export function resolveTimeInForce(
       "the composition root precisely so that none is assumed — a silently assumed FAK would " +
       "change every unfilled remainder's fate — so the order is REFUSED",
   };
-}
-
-/**
- * `plannedOrderId -> TimeInForce`, recorded at plan time.
- *
- * The venue's `ExecutionPolicy` reads this and nothing else, so an order whose
- * time-in-force was never recorded cannot be submitted with a guessed one: the
- * policy's lookup misses and the submission is refused upstream.
- */
-export class OrderTimeInForceBook {
-  readonly #byOrder = new Map<string, TimeInForce>();
-
-  record(plannedOrderId: string, timeInForce: TimeInForce): void {
-    this.#byOrder.set(plannedOrderId, timeInForce);
-  }
-
-  get(plannedOrderId: string): TimeInForce | undefined {
-    return this.#byOrder.get(plannedOrderId);
-  }
-
-  release(plannedOrderId: string): void {
-    this.#byOrder.delete(plannedOrderId);
-  }
-
-  get size(): number {
-    return this.#byOrder.size;
-  }
 }
 
 /** One virtual position, as the risk engine's portfolio view carries it. */
@@ -415,7 +381,9 @@ export function buildPlanningInputs(input: {
   readonly yesBestAsk: string | undefined;
   readonly noBestBid: string | undefined;
   readonly noBestAsk: string | undefined;
-}): PlanningInputs {
+  /** The resolved time-in-force ({@link resolveTimeInForce}); absent only for a CANCEL, which plans no order. */
+  readonly timeInForce: TimeInForce | undefined;
+}): PlanningInputsDocument {
   const marketId = input.marketConfig.marketId;
   return {
     executionPlanId: input.executionPlanId,
@@ -459,6 +427,9 @@ export function buildPlanningInputs(input: {
       cancelDeadlineMs: input.config.planning.cancelDeadlineMs,
       maxPlanLifetimeMs: input.config.planning.maxPlanLifetimeMs,
     },
+    // A CANCEL's inputs carry none, and the cancel door never reads one; a
+    // placement's inputs without one are refused by the planner (never defaulted).
+    ...(input.timeInForce === undefined ? {} : { timeInForce: input.timeInForce }),
     scope: {
       seriesKey: input.marketConfig.seriesKey,
       underlyingKey: input.marketConfig.underlyingKey,
@@ -467,7 +438,16 @@ export function buildPlanningInputs(input: {
   };
 }
 
+/**
+ * The planning-inputs document the loop hands the planner: `PlanningInputs`,
+ * whose `timeInForce` is absent for a CANCEL (the cancel door reads none, and
+ * the placement door refuses a document without one).
+ */
+export type PlanningInputsDocument = Omit<PlanningInputs, "timeInForce"> & {
+  readonly timeInForce?: PlanningInputs["timeInForce"];
+};
+
 /** Runs the §9.10 planner. One call site, no policy applied around it. */
-export function runPlanner(record: unknown, inputs: PlanningInputs): PlannerResult<ExecutionPlan> {
+export function runPlanner(record: unknown, inputs: PlanningInputsDocument): PlannerResult<ExecutionPlan> {
   return buildExecutionPlan(record, inputs);
 }

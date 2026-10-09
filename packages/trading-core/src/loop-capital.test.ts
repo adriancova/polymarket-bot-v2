@@ -465,6 +465,8 @@ interface Harness {
   readonly loop: CoreLoop;
   readonly venue: SimulatedVenue;
   readonly gate: AllocatorGate;
+  /** `C1-TIF`: the planned orders whose capital the loop has settled. */
+  readonly settled: ReadonlySet<string>;
   readonly clock: ManualClock;
   readonly halts: HaltController;
   readonly perStrategyCap: string;
@@ -549,7 +551,7 @@ function assemble(options: HarnessOptions): Harness {
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const registry = new InstanceRegistry();
   const calls: [Label, string, string, string][] = [];
-  const wiring: { harness: Harness | undefined; loop: CoreLoop | undefined } = { harness: undefined, loop: undefined };
+  const wiring: { harness: Harness | undefined } = { harness: undefined };
   const windows = options.windows === true;
   // `ROLLOVER-1` r7: one run's windows share ONE evaluation sequence (ruling Q2).
   const sequence = windows ? createRunEvaluationSequence() : undefined;
@@ -621,8 +623,8 @@ function assemble(options: HarnessOptions): Harness {
     feeSnapshot: fees.value,
     rateLimits: unmodeledRateLimits("no venue rate-limit budget is modelled in this test"),
     policy: {
-      timeInForceFor(order: { readonly plannedOrderId: string }) {
-        const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
+      timeInForceFor(order: { readonly plannedOrderId: string; readonly timeInForce?: "GTC" | "GTD" | "FAK" | "FOK" }) {
+        const resolved = order.timeInForce;
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
       },
@@ -672,6 +674,15 @@ function assemble(options: HarnessOptions): Harness {
   };
   const halts = new HaltController();
   const gate = new AllocatorGate({ caps: caps.value, markets: allocationMarkets, tokenAssetIds });
+  // `C1-TIF`: the planned orders the loop has SETTLED. The loop's time-in-force
+  // side table, which this harness used to read, was released exactly where the
+  // loop settles an order's capital (`#settleCapital`), so this is that signal.
+  const settled = new Set<string>();
+  const settle = gate.settle.bind(gate);
+  gate.settle = (plannedOrderId, final) => {
+    settled.add(plannedOrderId);
+    return settle(plannedOrderId, final);
+  };
   const loop = new CoreLoop({
     config,
     riskPolicy: policy.value,
@@ -693,9 +704,8 @@ function assemble(options: HarnessOptions): Harness {
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
     evaluationCadence: options.cadence,
   });
-  wiring.loop = loop;
   const risks: Harness["risks"] = [];
-  const harness: Harness = { loop, venue, gate, clock, halts, perStrategyCap: options.perStrategyCap, globalAccountCap, calls, risks };
+  const harness: Harness = { loop, venue, gate, settled, clock, halts, perStrategyCap: options.perStrategyCap, globalAccountCap, calls, risks };
   wiring.harness = harness;
   riskSeam.observe = (context, document, evaluation) => {
     const built = context as RiskInputContext;
@@ -2484,7 +2494,7 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
         if (
           current.venue
             .ordersSnapshot()
-            .some((order) => order.action === "BUY" && TERMINAL.has(order.state) && current.loop.timeInForceFor(order.plannedOrderId) !== undefined)
+            .some((order) => order.action === "BUY" && TERMINAL.has(order.state) && !current.settled.has(order.plannedOrderId))
         ) {
           coverage.terminalUnsettledAtEvaluation += 1;
         }

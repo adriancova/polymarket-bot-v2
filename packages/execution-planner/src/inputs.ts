@@ -25,6 +25,7 @@
 import { compareDecimal } from "@polymarket-bot/decimal";
 
 import { InternalMarketIdDoor, IsoTimestampDoor } from "./doors.js";
+import { TIME_IN_FORCE_VALUES, type TimeInForce } from "./plan.js";
 import { isOnTick } from "./tick.js";
 import { pluck } from "./pluck.js";
 import {
@@ -96,6 +97,13 @@ export interface PlanningInputs {
   readonly availableCollateral: string;
   readonly markets: readonly MarketPlanningInput[];
   readonly policy: PlanningPolicy;
+  /**
+   * ADR-034 D3.1: the time-in-force every order of this plan carries. The
+   * caller resolves it (the intent's tag, else the instance's configuration);
+   * the planner never defaults it, so a placement input without one is
+   * refused. A cancel plan does not read it.
+   */
+  readonly timeInForce: TimeInForce;
   readonly scope?: ScopeAttribution;
 }
 
@@ -113,6 +121,7 @@ const INPUT_KEYS: ReadonlySet<string> = new Set([
   "availableCollateral",
   "markets",
   "policy",
+  "timeInForce",
   "scope",
 ]);
 const MARKET_KEYS: ReadonlySet<string> = new Set([
@@ -402,6 +411,7 @@ export function readPlanningInputs(inputs: unknown): PlannerResult<PlanningInput
     "NON_NEGATIVE",
   );
   const policy = planningPolicy(data["policy"], "inputs.policy", problems);
+  const timeInForce = asMember(data["timeInForce"], "inputs.timeInForce", TIME_IN_FORCE_VALUES, problems);
   const scope = data["scope"] === undefined ? undefined : scopeAttribution(data["scope"], "inputs.scope", problems);
 
   const marketsValue = asArray(data["markets"], "inputs.markets", problems);
@@ -429,7 +439,8 @@ export function readPlanningInputs(inputs: unknown): PlannerResult<PlanningInput
     head === undefined ||
     accountingMode === undefined ||
     availableCollateral === undefined ||
-    policy === undefined
+    policy === undefined ||
+    timeInForce === undefined
   ) {
     return refuseProblems(problems);
   }
@@ -442,6 +453,7 @@ export function readPlanningInputs(inputs: unknown): PlannerResult<PlanningInput
       availableCollateral,
       markets,
       policy,
+      timeInForce,
       ...(scope === undefined ? {} : { scope }),
     },
   };

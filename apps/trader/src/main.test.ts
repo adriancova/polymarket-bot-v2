@@ -21,15 +21,18 @@ import {
 } from "@polymarket-bot/simulation";
 import { describe, expect, it } from "vitest";
 
-import { EXIT_CODES, cadenceAlarmLine, createExecutionPolicy, type VenueWiring } from "./main.js";
+import { EXIT_CODES, cadenceAlarmLine, createExecutionPolicy } from "./main.js";
 
 const MARKET = "018f4a7e-1111-7abc-8def-0123456789ab";
 const EPOCH = "018f4a7e-5555-7abc-8def-0123456789ab";
 const AT = "2026-03-04T12:00:01.000Z";
 
-function plannedOrderView(): PlannedOrderView {
-  return { plannedOrderId: "planned-1" } as unknown as PlannedOrderView;
+function plannedOrderView(timeInForce?: string): PlannedOrderView {
+  return { plannedOrderId: "planned-1", ...(timeInForce === undefined ? {} : { timeInForce }) } as unknown as PlannedOrderView;
 }
+
+/** `C1-TIF`: the policy reads the planned order and the clock; it holds no trader. */
+const CLOCK = { now: () => AT, monotonicNs: () => 0n };
 
 function venueWith(policy: ReturnType<typeof createExecutionPolicy>): SimulatedVenue {
   const fees = readFeeScheduleSnapshot({
@@ -71,17 +74,14 @@ function venueWith(policy: ReturnType<typeof createExecutionPolicy>): SimulatedV
 }
 
 describe("the process entry point's execution policy", () => {
-  it("answers the TRADER's recorded time-in-force, never a default", () => {
-    const wiring = {
-      trader: { loop: { timeInForceFor: () => "GTC" } },
-    } as unknown as VenueWiring;
-    const policy = createExecutionPolicy(wiring, () => undefined);
-    expect(policy.timeInForceFor(plannedOrderView())).toBe("GTC");
+  it("answers the time-in-force the PLANNED ORDER carries (ADR-034 D3.1 item 2), never a default", () => {
+    const policy = createExecutionPolicy(CLOCK, () => undefined);
+    expect(policy.timeInForceFor(plannedOrderView("GTC"))).toBe("GTC");
   });
 
-  it("LOGS and throws when no answer was recorded — there is no safe value here", () => {
+  it("LOGS and throws when the order carries none — there is no safe value here", () => {
     const lines: string[] = [];
-    const policy = createExecutionPolicy({ trader: undefined }, (line) => lines.push(line));
+    const policy = createExecutionPolicy(CLOCK, (line) => lines.push(line));
     expect(() => policy.timeInForceFor(plannedOrderView())).toThrow(
       /refuses to assume one/u,
     );
@@ -92,7 +92,7 @@ describe("the process entry point's execution policy", () => {
   });
 
   it("the throw is CONTAINED by the real venue: a refused result, not a rejected promise", async () => {
-    const policy = createExecutionPolicy({ trader: undefined }, () => undefined);
+    const policy = createExecutionPolicy(CLOCK, () => undefined);
     const venue = venueWith(policy);
     venue.observe({
       gatewayEpoch: EPOCH,
@@ -135,9 +135,9 @@ describe("the process entry point's execution policy", () => {
   });
 
   it("states NOT_OBSERVED for same-instant additions, because it observed nothing", () => {
-    const policy = createExecutionPolicy({ trader: undefined }, () => undefined);
+    const policy = createExecutionPolicy(CLOCK, () => undefined);
     expect(policy.sameInstantAdditionsFor()).toBe("NOT_OBSERVED");
-    expect(policy.statedExpiryNsFor()).toBeUndefined();
+    expect(policy.statedExpiryNsFor(plannedOrderView("GTC"))).toBeUndefined();
   });
 
   it("the exit codes an operator scripts against are stable", () => {

@@ -293,7 +293,6 @@ export {
 
 export {
   ORDER_TYPE_TAG_PREFIX,
-  OrderTimeInForceBook,
   PROTECTIVE_EXIT_TAGS,
   buildPlanningInputs,
   buildRiskEvaluationInput,

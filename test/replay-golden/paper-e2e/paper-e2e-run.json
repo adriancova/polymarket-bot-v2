@@ -51,7 +51,7 @@
             "static-bracket",
             "sb.entry",
             "sb.leg:YES",
-            "sb.order-type:FAK"
+            "sb.order-type:GTD"
           ],
           "targetShares": "50",
           "type": "POSITION",

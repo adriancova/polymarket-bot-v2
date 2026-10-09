@@ -577,7 +577,6 @@ function assemble(options: HarnessOptions): Harness {
   }
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("fees refused");
-  const wiring: { loop: CoreLoop | undefined } = { loop: undefined };
   const venue = new SimulatedVenue({
     clock,
     runMode: "PAPER",
@@ -585,8 +584,8 @@ function assemble(options: HarnessOptions): Harness {
     feeSnapshot: fees.value,
     rateLimits: options.rateLimits ?? unmodeledRateLimits("no venue rate-limit budget is modelled in this test"),
     policy: {
-      timeInForceFor(order) {
-        const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
+      timeInForceFor(order: { readonly plannedOrderId: string; readonly timeInForce?: "GTC" | "GTD" | "FAK" | "FOK" }) {
+        const resolved = order.timeInForce;
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
       },
@@ -652,7 +651,6 @@ function assemble(options: HarnessOptions): Harness {
     evaluationCadence: options.cadence,
     onCadenceAlarm: (alarm) => alarms.push(alarm),
   });
-  wiring.loop = loop;
   return { loop, venue, store, halts, seen, shown, alarms };
 }
 

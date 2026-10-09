@@ -36,6 +36,32 @@ information §13.2 does not carry (feature keys, a fee estimate, a
 submission-silence bound, an order validity horizon, a staleness bound and its
 policy). Each is listed with its basis in the `src/params.ts` header.
 
+### `immediate_order_type`: GTD only; FAK, FOK and GTC are refused (`C1-TIF`, 2026-10-08)
+
+The venue's FAK and FOK BUY is collateral-targeted (ADR-034 D4), so a fill can
+buy more shares than were planned and the share caps are not hard. The user
+parked D4 until the execution probe (COMPLEXITY-1, 2026-10-08). Until then
+`entry.execution.immediate_order_type` `FAK` or `FOK` is refused at
+validation, named `SB_IMMEDIATE_ORDER_TYPE_PARKED_UNTIL_EXECUTION_PROBE`. Every
+entry can be a BUY (its direct leg always is), so the value is refused
+outright. The shipped example uses `GTD`: the entry is share-sized, and the
+venue expires it at the plan's deadline (`order_validity_ms`, bounded by the
+trader's `maxPlanLifetimeMs`). **The trade-off:** a marketable GTD entry that
+fills in part RESTS its remainder until that deadline, where a FAK would have
+cancelled it at once. Exits are GTC, whatever this key says.
+
+`GTC` is refused too, named `SB_IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL`
+(`C1-TIF` r1). The ruling admits a GTC entry only with ADR-034 D3.4's deadline
+cancel, and that cancel is not built.
+
+**While the entry rests, the bracket is not finished** (`C1-TIF` r1, finding
+C1-TIF-01). The exits are sized from the folded fills, so the take-profit can
+sell everything folded while the remainder still rests. The bracket then waits
+in its exit state (`SB.ENTRY_ORDER_WORKING`) instead of certifying `CLOSED` or
+falling back to `OPEN`. A later fill of the remainder folds from there and is
+exited like any other. The remainder's expiry clears the entry, and the next
+evaluation closes the bracket.
+
 ### Grammar versions 1 and 2 (`THROUGHPUT-1c`, ADR-023)
 
 `version: 1` is the original grammar, and it loads and behaves exactly as it
@@ -284,7 +310,10 @@ are:
   fail-closed, the fill unfolded — because `OPEN --ENTRY_*-->` is not a §13.3
   edge and this round adds none. (With `convert_to_aggressive_after_ms: 0`, as
   in §13.2's example, the entry is emitted as an immediate order of the
-  configured `immediate_order_type`, `FAK` there, which does not rest.)
+  configured `immediate_order_type`. §13.2 says `FAK`, which does not rest; since
+  `C1-TIF` that value is refused and a `GTD` or `GTC` entry's unfilled remainder
+  DOES rest, until its deadline or a cancel, so this race is reachable from an
+  immediate entry too.)
 - **Nobody answers (R2).** A reduction still `PENDING` after
   `submission_unknown_after_ms` becomes `SUBMISSION_UNKNOWN`
   (`PENDING --SILENCE_EXCEEDED-->`), reported exactly as the entry reports it —

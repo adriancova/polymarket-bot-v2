@@ -36,7 +36,9 @@ export type {
 } from "./refusals.js";
 
 export {
+  GTD_SECURITY_THRESHOLD_SECONDS,
   PLAN_PRIORITY_RANK,
+  TIME_IN_FORCE_VALUES,
   comparePlanPriority,
   sealExecutionPlan,
 } from "./plan.js";
@@ -56,6 +58,7 @@ export type {
   PlannedOrder,
   ReplaceHysteresis,
   ReservationRequirement,
+  TimeInForce,
   UnexecutableRemainder,
 } from "./plan.js";
 

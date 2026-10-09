@@ -565,7 +565,6 @@ function assemble(script: Script, options: Options = {}): Harness {
 
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("fees refused");
-  const wiring: { loop: CoreLoop | undefined } = { loop: undefined };
   const books: MarketBookProvider = {
     book(request): BookView | undefined {
       const market = markets.get(request.marketId);
@@ -596,8 +595,8 @@ function assemble(script: Script, options: Options = {}): Harness {
     feeSnapshot: fees.value,
     rateLimits: unmodeledRateLimits("no venue rate-limit budget is modelled in this unit test"),
     policy: {
-      timeInForceFor(order: { readonly plannedOrderId: string }) {
-        const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
+      timeInForceFor(order: { readonly plannedOrderId: string; readonly timeInForce?: "GTC" | "GTD" | "FAK" | "FOK" }) {
+        const resolved = order.timeInForce;
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
       },
@@ -636,7 +635,6 @@ function assemble(script: Script, options: Options = {}): Harness {
     outbox,
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
-  wiring.loop = loop;
 
   // A harness's admissions are the seam's records from its creation until the
   // NEXT harness is created (the cases run their harnesses one after another).

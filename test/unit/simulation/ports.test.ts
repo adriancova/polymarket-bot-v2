@@ -153,6 +153,7 @@ describe("the WP-190 plan mirror is the real plan", () => {
       shares: "10",
       postOnly: false,
       executionStyle: "MARKETABLE_LIMIT",
+      timeInForce: "GTC",
       reservationId: "res-1",
     } as const satisfies PlannedOrder;
     const mirrored: PlannedOrderView = real;

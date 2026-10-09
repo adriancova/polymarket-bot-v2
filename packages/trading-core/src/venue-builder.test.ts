@@ -46,19 +46,18 @@ function settings(overrides: Partial<SimulatedVenueSettings> = {}): SimulatedVen
   };
 }
 
-/** A trader as far as the holder is read: one market's book and a recorded time-in-force. */
-function traderStub(timeInForce: string | undefined): PaperTrader {
+/** A trader as far as the holder is read: one market's book (`C1-TIF`: the time-in-force is on the plan). */
+function traderStub(): PaperTrader {
   const book = {
     topOfBook: () => ({ bestAskPrice: "0.34", bestAskSize: "200" }),
     levels: (side: string) => (side === "ASK" || side === "asks" ? [{ price: "0.34", size: "200" }] : []),
   };
   return {
     markets: new Map([[MARKET, { config: { yesTokenId: "111", noTokenId: "222" }, bookFor: () => book }]]),
-    loop: { timeInForceFor: () => timeInForce },
   } as unknown as PaperTrader;
 }
 
-async function submitOne(venue: SimulatedVenue, runMode = "PAPER") {
+async function submitOne(venue: SimulatedVenue, runMode = "PAPER", timeInForce?: string) {
   venue.observe({ gatewayEpoch: EPOCH, ingestSeq: "1", receivedAt: AT, datasetRowOrdinal: 1 });
   return await venue.submit({
     executionPlanId: "018f4a7e-6666-7abc-8def-000000000001",
@@ -78,6 +77,7 @@ async function submitOne(venue: SimulatedVenue, runMode = "PAPER") {
             shares: "10",
             executionStyle: "MARKETABLE_LIMIT",
             postOnly: false,
+            ...(timeInForce === undefined ? {} : { timeInForce }),
           },
         ],
       },
@@ -97,7 +97,7 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
     expect(built.refusal.code).toBe("FILL_MODEL_FEE_SNAPSHOT_MISSING");
   });
 
-  it("an UNFILLED holder: the policy refuses to assume a time-in-force, logs the order, and the venue contains it", async () => {
+  it("an order that carries no time-in-force: the policy refuses to assume one, logs the order, and the venue contains it", async () => {
     const lines: string[] = [];
     const built = buildSimulatedVenue({ clock: CLOCK, settings: settings(), log: (line) => lines.push(line) });
     expect(built.ok).toBe(true);
@@ -113,11 +113,11 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
     expect(result.rateLimitDisclosure).toBe(UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE);
   });
 
-  it("a FILLED holder: the book and the time-in-force are read through the trader, and the order fills at its ask", async () => {
+  it("a FILLED holder: the book is read through the trader, the time-in-force from the plan, and the order fills at its ask", async () => {
     const built = buildSimulatedVenue({ clock: CLOCK, settings: settings() });
     if (!built.ok) throw new Error(built.refusal.code);
-    built.wiring.trader = traderStub("FAK");
-    const result = await submitOne(built.venue);
+    built.wiring.trader = traderStub();
+    const result = await submitOne(built.venue, "PAPER", "FAK");
     expect(result.accepted, JSON.stringify(result)).toBe(true);
     expect(result.fills.map((fill) => `${fill.action} ${fill.shares}@${fill.price}`)).toEqual(["BUY 10@0.34"]);
     // The fill carries the settings' fill model and the venue's evidence class.
@@ -128,8 +128,8 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
   it("the venue runs in the core's run mode, PAPER: a plan naming BACKTEST is refused", async () => {
     const built = buildSimulatedVenue({ clock: CLOCK, settings: settings() });
     if (!built.ok) throw new Error(built.refusal.code);
-    built.wiring.trader = traderStub("FAK");
-    const result = await submitOne(built.venue, "BACKTEST");
+    built.wiring.trader = traderStub();
+    const result = await submitOne(built.venue, "BACKTEST", "FAK");
     expect(result.accepted).toBe(false);
     expect(result.fills).toEqual([]);
     expect(result.refusalMessage).toContain("this venue serves PAPER and the plan names BACKTEST");
@@ -148,8 +148,8 @@ describe("buildSimulatedVenue — the one place the simulated venue is construct
       retention: { orders: 7 },
     });
     if (!built.ok) throw new Error(built.refusal.code);
-    built.wiring.trader = traderStub("FAK");
-    const result = await submitOne(built.venue);
+    built.wiring.trader = traderStub();
+    const result = await submitOne(built.venue, "PAPER", "FAK");
     // A budget with no order token: the REAL venue refuses the placement.
     expect(result.accepted).toBe(false);
     expect(result.refusalCode).toBe("SIMULATED_VENUE_RATE_LIMITED");
