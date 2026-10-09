@@ -16,10 +16,13 @@
  *    and W2 0.22 (its bid 0.32), so the instance's loss is 17 + 17.5 − 11 =
  *    23.5; W2 is refused at 23.49 and admitted at 23.5. At `95a0b76` it was
  *    measured on W2 alone, 6.5.
- * 3. **Fail closed on a missing mark.** A held window whose YES book has no
- *    bid cannot be marked, so another window's entry is refused
- *    `RISK_SCENARIO_MARKS_INCOMPLETE`: never judged on a partly marked
- *    portfolio. With the bid present, the same entry is admitted.
+ * 3. **A missing mark is valued at 0** (C1-RISK; ADR-030 Rule 8 item 2, note
+ *    of 2026-10-08). A held window whose YES book has no bid cannot be
+ *    marked, so it counts at its whole committed cost: the floor check 16
+ *    uses. Until C1-RISK another window's entry was refused
+ *    `RISK_SCENARIO_MARKS_INCOMPLETE`; now it is judged on that floor, so it
+ *    is admitted under the shipped limit and refused by a limit the floor
+ *    exceeds.
  * 4. **R7-FABLE-03.** A commitment that never closes — W1's entry was booked
  *    by a venue that answered it refused (`TRDR-4`'s defensive path), so its
  *    fill is booked UNATTRIBUTED and the allocator keeps its capital for the
@@ -195,14 +198,20 @@ describe("ROLLOVER-1 r7 (R7-FABLE-01): §9.8 check 17 — scenario loss — mark
     expect(at.refusals).toEqual([]);
   });
 
-  it("FAIL CLOSED: a held W1 whose YES book has NO bid cannot be marked, so W2's entry is refused RISK_SCENARIO_MARKS_INCOMPLETE — never judged on a partly marked portfolio", async () => {
-    const unmarked = await drive(configWith({ exit: HOLD_TO_RESOLUTION }), twoWindows({ bids: [], asks: [["0.9", "200"]] }));
-    expect(unmarked.fills).toEqual(["W1 BUY 50@0.34"]);
-    expect(unmarked.refusals).toEqual(["W2 RISK_SCENARIO_MARKS_INCOMPLETE"]);
-    // Control: the same run with W1's bid present admits W2.
-    const marked = await drive(configWith({ exit: HOLD_TO_RESOLUTION }), twoWindows());
-    expect(marked.fills).toEqual(["W1 BUY 50@0.34", "W2 BUY 50@0.34"]);
-    expect(marked.refusals).toEqual([]);
+  it("C1-RISK: a held W1 whose YES book has NO bid is valued at 0 — its full cost 17 — so W2 is admitted under the shipped limit, refused RISK_SCENARIO_LOSS_EXCEEDED at 23.49 and admitted at 23.5", async () => {
+    const noBid = { bids: [], asks: [["0.9", "200"]] } as const;
+    // The shipped limit: W2 is admitted (until C1-RISK: refused MARKS_INCOMPLETE).
+    const shipped = await drive(configWith({ exit: HOLD_TO_RESOLUTION }), twoWindows(noBid));
+    expect(shipped.fills).toEqual(["W1 BUY 50@0.34", "W2 BUY 50@0.34"]);
+    expect(shipped.refusals).toEqual([]);
+    // spot.down: W1 unmarked → 17 counted in full; W2 marked 0.22 → 17.5 − 11.
+    // 17 + 6.5 = 23.5. Valuing W1 at anything above 0 would admit at 23.49.
+    const under = await drive(configWith({ scenario: { maxScenarioLoss: "23.49" }, exit: HOLD_TO_RESOLUTION }), twoWindows(noBid));
+    expect(under.fills).toEqual(["W1 BUY 50@0.34"]);
+    expect(under.refusals).toEqual(["W2 RISK_SCENARIO_LOSS_EXCEEDED"]);
+    const at = await drive(configWith({ scenario: { maxScenarioLoss: "23.5" }, exit: HOLD_TO_RESOLUTION }), twoWindows(noBid));
+    expect(at.fills).toEqual(["W1 BUY 50@0.34", "W2 BUY 50@0.34"]);
+    expect(at.refusals).toEqual([]);
   });
 });
 

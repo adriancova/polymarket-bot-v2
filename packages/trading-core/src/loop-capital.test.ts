@@ -319,7 +319,6 @@ function traderConfig(perStrategyCap: string, globalAccountCap: string, risk: Ri
       eventStream: "polymarket.normalized",
       consumerId: "cap-1",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [marketDocument(MARKET_A, TOKENS[MARKET_A]), marketDocument(MARKET_B, TOKENS[MARKET_B])],
     instances: [
@@ -905,30 +904,37 @@ const OWNERS = [
 
 /**
  * What the cap check counts for each strategy and for the account RIGHT NOW,
- * asked through the gate's own `evaluate` with an intent that commits nothing
- * (a CANCEL: no request, so no verdict is recorded) — exactly the snapshot a
- * placement evaluated now would be judged against (§9.8 checks 14 and 15).
+ * read through the gate's own `countedExposure` — exactly the account a
+ * placement evaluated now would be judged against (§9.8 check 14). Until
+ * C1-RISK this asked `evaluate` with a CANCEL and read the snapshot it carried.
  */
 function counted(harness: Harness): { readonly A: string; readonly B: string; readonly global: string } {
-  const outcome = AllocatorGate.prototype.evaluate.call(harness.gate, {
-    intent: { type: "CANCEL", marketId: MARKET_A, reason: "cap1: a read of the cap check's account" },
-    instanceId: INSTANCE_A,
-    accountingMode: "LIVE",
+  const outcome = AllocatorGate.prototype.countedExposure.call(harness.gate, {
     liveOwners: OWNERS,
     projection: harness.loop.ledgerView(),
     // The read only: collateral moves no exposure entry. The real questions
     // (`evaluate` and `applyForPlan` in the loop) carry the real balance.
     availableCollateral: "1000000",
-    approvedIntentId: "cap1-read",
-    heldShares: () => "0",
     // `CAP-1` r1: the venue's own view of each order, as the loop's questions read it.
     viewOf: (plannedOrderId) => venueViewOf(harness, plannedOrderId),
   });
+  if (outcome === undefined) throw new Error("the cap check's account could not be built");
   return {
-    A: combinedOf(outcome.exposures.byStrategyInstance, INSTANCE_A),
-    B: combinedOf(outcome.exposures.byStrategyInstance, INSTANCE_B),
-    global: outcome.exposures.global.combined,
+    A: combinedOf(outcome.byStrategyInstance, INSTANCE_A),
+    B: combinedOf(outcome.byStrategyInstance, INSTANCE_B),
+    global: outcome.global.combined,
   };
+}
+
+/**
+ * What the cap check counted for one instance at the `evaluate` it just
+ * answered: the gate's `countedExposure` over the same inputs (`evaluate`
+ * changes nothing, so the account is the one it judged).
+ */
+function countedAt(gate: Harness["gate"], input: Parameters<AllocatorGate["evaluate"]>[0], instanceId: string): string {
+  const snapshot = gate.countedExposure(input);
+  if (snapshot === undefined) return "unbuildable";
+  return combinedOf(snapshot.byStrategyInstance, instanceId);
 }
 
 /** `CAP-1` r1: one planned order as the VENUE shows it now (its state and filled size), read without the loop. */
@@ -1113,7 +1119,7 @@ describe("CAP-1 regression — the CADENCE-1 R4-CAP probe (O-R3-01's capital sid
     const original = harness.gate.evaluate.bind(harness.gate);
     vi.spyOn(harness.gate, "evaluate").mockImplementation((input) => {
       const outcome = original(input);
-      if (input.instanceId === INSTANCE_B) judged.push(combinedOf(outcome.exposures.byStrategyInstance, INSTANCE_B));
+      if (input.instanceId === INSTANCE_B) judged.push(countedAt(harness.gate, input, INSTANCE_B));
       return outcome;
     });
     await feed(harness, ...opening(), opened(S + 150, MARKET_B));
@@ -1439,7 +1445,7 @@ describe("CAP-1 r1 regression (CAP1-ASTRA-R1-01, -03) — an order the venue END
     const original = harness.gate.evaluate.bind(harness.gate);
     vi.spyOn(harness.gate, "evaluate").mockImplementation((input) => {
       const outcome = original(input);
-      if (input.instanceId === INSTANCE_B) judged.push(combinedOf(outcome.exposures.byStrategyInstance, INSTANCE_B));
+      if (input.instanceId === INSTANCE_B) judged.push(countedAt(harness.gate, input, INSTANCE_B));
       return outcome;
     });
     await feed(harness, ...opening(), opened(S + 150, MARKET_B), askLevel(S + 200, MARKET_B, "0.4", "500"), askLevel(S + 210, MARKET_B, "0.34", "5"));
@@ -2310,11 +2316,14 @@ function expectRiskFloor(
   expect(countedCost, `${where}: check 16 counts the floor's cost exactly (+ ${excess} unhanded)`).toBe(addDecimal(floor.cost, excess));
   expect(countedShares, `${where}: check 16 counts the floor's shares exactly`).toBe(floor.shares);
   for (const outcome of risk.evaluation.scenario?.outcomes ?? []) {
-    if (outcome.unmarkedMarketIds.length > 0) continue;
-    const mark = risk.document.scenarios
-      .find((scenario) => scenario.scenarioId === outcome.scenarioId)
-      ?.marks.find((entry) => entry.marketId === marketId)?.yesPrice;
-    if (mark === undefined) continue;
+    // C1-RISK: a market the scenario does not mark (an empty YES bid) is
+    // valued at 0 — its full committed cost is loss (ADR-030 Rule 8 item 2,
+    // note of 2026-10-08). So the oracle reads a missing mark as "0" rather
+    // than skipping the outcome, and the floored outcome is checked exactly.
+    const mark =
+      risk.document.scenarios
+        .find((scenario) => scenario.scenarioId === outcome.scenarioId)
+        ?.marks.find((entry) => entry.marketId === marketId)?.yesPrice ?? "0";
     coverage.scenarioOutcomesChecked += 1;
     const countedLoss = subDecimal(outcome.loss, subDecimal(bought.cost, mulDecimal(bought.shares, mark)));
     const floorLoss = subDecimal(floor.cost, mulDecimal(floor.shares, mark));
@@ -2508,7 +2517,7 @@ async function propertyRun(seed: number, cadence: EvaluationCadenceOption, steps
       coverage.capChecks += 1;
       const label: Label = input.instanceId === INSTANCE_A ? "A" : "B";
       expect(
-        combinedOf(outcome.exposures.byStrategyInstance, input.instanceId),
+        countedAt(harness.gate, input, input.instanceId),
         `seed ${String(seed)}: the cap check's own snapshot for ${label}`,
       ).toBe(addDecimal(committed(harness)[label].exact, excessNow(harness, true).excess[label]));
       if (outcome.verdict?.permitted === false && outcome.verdict.refusals.some((refusal) => refusal.code === "CAPITAL_STRATEGY_CAP_EXCEEDED")) {

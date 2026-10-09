@@ -183,6 +183,7 @@ export interface TraderTransportHealthInput {
   readonly consumerPosition: number | null;
   readonly committedPosition: number | null;
   readonly entriesBehindHead: number | null;
+  /** Not exported as a metric since C1-RISK (OPS-07); the trader reports `null`. */
   readonly retentionMaxEvents: number | null;
   readonly lastEventAt: string | null;
   readonly eventTimeLagMs: number | null;

@@ -148,7 +148,6 @@ function traderConfig(): Record<string, unknown> {
       eventStream: "polymarket.normalized",
       consumerId: "recon-2-order-provenance",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

@@ -4,7 +4,7 @@
  *
  * The table below drives ONE mutation of the fully-passing baseline per case
  * and asserts the code that mutation must produce. The final test then asserts
- * that the table (plus the four resize codes and three approval codes proven in
+ * that the table (plus the three approval codes proven in
  * `acceptance.test.ts`) covers `RISK_REASON_CODES` exactly. A code that is
  * declared but unreachable, or emitted but undeclared, fails the suite — which
  * is what keeps a published vocabulary honest as an alerting surface (§14.3).
@@ -22,7 +22,6 @@ import {
   evaluateIntent,
   isRiskReasonCode,
   parseRiskPolicy,
-  resizeApprovedIntent,
   validateEvaluationInput,
   type ApprovedIntentRecord,
   type RiskPolicy,
@@ -31,9 +30,10 @@ import {
 // The data-record boundary is INTERNAL (round 3's stance on new public surface
 // stands), so the one case that must observe it directly imports the module.
 import { readPlainData } from "../../../packages/risk/src/plain-data.js";
+// C1-RISK: the emission boundary is internal too. Its hand-built-record cases
+// below drove it through `resizeApprovedIntent` until that path was deleted.
+import { sealApprovedIntentRecord } from "../../../packages/risk/src/approved-intent.js";
 import {
-  FIXTURE_MEASURING,
-  INSTANCE,
   MARKET_A,
   MARKET_B,
   VALID_UNTIL,
@@ -42,8 +42,6 @@ import {
   codesOf,
   entryInput,
   exitInput,
-  exposureEntry,
-  exposureSnapshot,
   market,
   openOrder,
   position,
@@ -456,102 +454,6 @@ const CASES: readonly Case[] = [
       riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", maxOrderNotional: "10" } }),
     build: withEntry(() => {}),
   },
-  {
-    code: "RISK_GLOBAL_EXPOSURE_EXCEEDED",
-    name: "check 15: the global exposure cap",
-    policy: () =>
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", globalExposureCap: "10" } }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ global: exposureEntry("5", "0") });
-    }),
-  },
-  {
-    code: "RISK_INSTANCE_EXPOSURE_EXCEEDED",
-    name: "check 15: the per-strategy-instance cap",
-    policy: () =>
-      riskPolicy({
-        limits: { maxWorstCaseContractualLoss: "10000", perInstanceExposureCap: "10" },
-      }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
-    }),
-  },
-  {
-    code: "RISK_MARKET_EXPOSURE_EXCEEDED",
-    name: "check 15: the per-market cap",
-    policy: () =>
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10" } }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
-    }),
-  },
-  {
-    code: "RISK_SERIES_EXPOSURE_EXCEEDED",
-    name: "check 15: the per-series cap",
-    policy: () =>
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "10" } }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
-    }),
-  },
-  {
-    code: "RISK_UNDERLYING_EXPOSURE_EXCEEDED",
-    name: "check 15: the per-underlying cap",
-    policy: () =>
-      riskPolicy({
-        limits: { maxWorstCaseContractualLoss: "10000", perUnderlyingExposureCap: "10" },
-      }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
-    }),
-  },
-  {
-    code: "RISK_RESOLUTION_WINDOW_EXPOSURE_EXCEEDED",
-    name: "check 15: the per-resolution-window cap",
-    policy: () =>
-      riskPolicy({
-        limits: { maxWorstCaseContractualLoss: "10000", perResolutionWindowExposureCap: "10" },
-      }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
-    }),
-  },
-  {
-    code: "RISK_EXPOSURE_SNAPSHOT_MISSING",
-    name: "check 15: a configured cap with no snapshot is not a passed cap",
-    policy: () =>
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", globalExposureCap: "10000" } }),
-    build: withEntry((input) => {
-      delete input.exposures;
-    }),
-  },
-  {
-    code: "RISK_EXPOSURE_ENTRY_MISSING",
-    name: "check 15: a configured cap whose queried scope the snapshot omits is not a passed cap",
-    policy: () =>
-      riskPolicy({
-        // Deliberately roomy: if the omitted entry really were zero the intent
-        // would PASS. It must not — an absent entry is unknown, not zero.
-        limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10000" },
-      }),
-    build: withEntry((input) => {
-      input.exposures = exposureSnapshot({ byMarket: {} });
-    }),
-  },
-  {
-    code: "RISK_SCOPE_KEY_MISSING",
-    name: "check 15: a scope cap the request cannot be attributed to (fail closed)",
-    policy: () =>
-      riskPolicy({
-        limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "10000" },
-      }),
-    build: withEntry((input) => {
-      const context = market();
-      delete context.scope;
-      input.markets = [context];
-      input.exposures = exposureSnapshot({});
-    }),
-  },
 
   // --- §9.8 check 16: the PRIMARY measure ----------------------------------
   {
@@ -610,8 +512,10 @@ const CASES: readonly Case[] = [
     }),
   },
   {
-    code: "RISK_SCENARIO_MARKS_INCOMPLETE",
-    name: "check 17: a scenario that does not mark every held market",
+    code: "RISK_SCENARIO_LOSS_EXCEEDED",
+    name: "check 17 (C1-RISK): a market no scenario marks counts at its full committed cost",
+    // The entry's 50 on MARKET_A is unmarked: valued at 0, a loss of 50.
+    policy: () => riskPolicy({ scenario: { maxScenarioLoss: "49.99" } }),
     build: withEntry((input) => {
       input.scenarios = allScenarios("0.4", [MARKET_B]);
     }),
@@ -690,17 +594,12 @@ describe("§9.8 pipeline — every check refuses with its own code", () => {
 describe("the reason-code vocabulary", () => {
   /**
    * Proven in `acceptance.test.ts` rather than by the table above: the three
-   * APPROVAL reasons (which appear on a record, not on a refusal) and the four
-   * RESIZE codes (which `resizeApprovedIntent` emits, not the pipeline).
+   * APPROVAL reasons (which appear on a record, not on a refusal).
    */
   const PROVEN_ELSEWHERE: readonly RiskReasonCode[] = [
     "RISK_APPROVED",
     "RISK_CANCEL_ALWAYS_PERMITTED",
     "RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE",
-    "RISK_RESIZE_NOT_A_REDUCTION",
-    "RISK_RESIZE_ID_REUSED",
-    "RISK_RESIZE_UNSUPPORTED_TYPE",
-    "RISK_RESIZE_INCOHERENT",
   ];
 
   it("has no dead entries: every declared code is reachable", () => {
@@ -753,7 +652,8 @@ describe("the reason-code vocabulary", () => {
    */
   it("matches its documented cardinality exactly (list, constant, README §5)", () => {
     expect(RISK_REASON_CODES.length).toBe(RISK_REASON_CODE_COUNT);
-    expect(RISK_REASON_CODE_COUNT).toBe(62);
+    // C1-RISK (2026-10-08): 62 − 9 exposure/scope − MARKS_INCOMPLETE − 4 RESIZE.
+    expect(RISK_REASON_CODE_COUNT).toBe(48);
   });
 
   it("the README documents every declared code, and declares every documented one", () => {
@@ -775,6 +675,32 @@ describe("the reason-code vocabulary", () => {
     expect(RISK_REASON_CODES.filter((code) => !documented.has(code))).toEqual([]);
     expect([...documented].filter((code) => !isRiskReasonCode(code))).toEqual([]);
     expect(documented.size).toBe(RISK_REASON_CODE_COUNT);
+  });
+});
+
+describe("C1-RISK: check 17 values an unmarked market at 0 (ADR-030 Rule 8 item 2, note 2026-10-08)", () => {
+  it("no longer refuses for a missing mark; it counts that market's whole committed cost as loss", () => {
+    const input = entryInput();
+    // Only MARKET_B is marked; the entry's 100 YES on MARKET_A (cost 50) is not.
+    input.scenarios = allScenarios("0.4", [MARKET_B]);
+    const atLimit = evaluateIntent(riskPolicy({ scenario: { maxScenarioLoss: "50" } }), input);
+    expect(codesOf(atLimit)).toEqual([]);
+    expect(atLimit.scenario?.worstLoss).toBe("50");
+    expect(atLimit.scenario?.outcomes.map((outcome) => outcome.loss)).toEqual(["50", "50", "50", "50"]);
+
+    const under = evaluateIntent(riskPolicy({ scenario: { maxScenarioLoss: "49.99" } }), input);
+    expect(codesOf(under)).toEqual(["RISK_SCENARIO_LOSS_EXCEEDED"]);
+    expect(under.refusals[0]?.details).toMatchObject({ worstLoss: "50", limit: "49.99" });
+  });
+
+  it("a held market alongside a marked entry: the marked part is valued, the unmarked part is floored", () => {
+    const input = entryInput();
+    input.portfolio.positions = [position({ marketId: MARKET_B, side: "NO", shares: "20", costBasis: "7" })];
+    input.scenarios = allScenarios("0.4", [MARKET_A]);
+    // (50 + 7) − 100 × 0.4 = 17: MARKET_B's 20 NO add no value.
+    const result = evaluateIntent(riskPolicy(), input);
+    expect(codesOf(result)).toEqual([]);
+    expect(result.scenario?.worstLoss).toBe("17");
   });
 });
 
@@ -829,7 +755,7 @@ describe("run-mode safety floors", () => {
 describe("disposition matrix", () => {
   it("an EXIT is not gated by capacity, edge, participation, or time-to-close", () => {
     const policy = riskPolicy({
-      limits: { maxWorstCaseContractualLoss: "1", globalExposureCap: "1", maxOrderNotional: "1" },
+      limits: { maxWorstCaseContractualLoss: "1", maxOrderNotional: "1" },
       participation: { maxOrderShares: "1" },
       economics: { minOrderNotional: "1000" },
       scenario: { maxScenarioLoss: "0" },
@@ -1155,9 +1081,6 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
     const policy = riskPolicy({
       limits: {
         maxWorstCaseContractualLoss: "0",
-        globalExposureCap: "0",
-        perInstanceExposureCap: "0",
-        perMarketExposureCap: "0",
         maxOrderNotional: "0",
       },
       scenario: { maxScenarioLoss: "0" },
@@ -1182,7 +1105,6 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
       permitted: false,
       refusals: [{ code: "CAPITAL_COLLATERAL_INSUFFICIENT" }],
     };
-    delete input.exposures;
     input.scenarios = [];
     input.guards.recentIntentIds = ["intent-1"];
     input.rateLimit = {};
@@ -1705,7 +1627,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     expect(seen).not.toContain(CANONICAL);
   });
 
-  it("resizeApprovedIntent refuses a non-canonical identity INHERITED from a hand-built record", () => {
+  it("the emission boundary refuses a non-canonical identity in a hand-built record", () => {
     const approved = evaluateIntent(riskPolicy(), entryInput());
     expect(approved.approved).toBe(true);
     if (!approved.approved) return;
@@ -1717,12 +1639,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
       "strategyInstanceId",
     ] as const) {
       const handBuilt = { ...approved.record, [field]: NON_CANONICAL } as ApprovedIntentRecord;
-      const resized = resizeApprovedIntent(handBuilt, {
-        approvedIntentId: CANONICAL,
-        resizedAt: "2026-09-03T12:00:01.000Z",
-        newTargetShares: "50",
-        reason: "shrink",
-      });
+      const resized = sealApprovedIntentRecord(handBuilt);
       expect(resized.ok).toBe(false);
       if (resized.ok) return;
       expect(resized.refusals.map((r) => r.code)).toContain("RISK_UUID_NOT_CANONICAL");
@@ -1794,21 +1711,6 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
             (s) => nonCanonicalUuid(s.value) && !VENUE_ID_PATH.test(s.path),
           ),
         );
-
-        // The resize path emits records too, and inherits identity fields.
-        const resized = resizeApprovedIntent(result.record, {
-          approvedIntentId: CANONICAL,
-          resizedAt: "2026-09-03T12:00:01.000Z",
-          newTargetShares: "50",
-          reason: "shrink",
-        });
-        if (!resized.ok) continue;
-        recordsEmitted += 1;
-        offending.push(
-          ...stringsIn(resized.value).filter(
-            (s) => nonCanonicalUuid(s.value) && !VENUE_ID_PATH.test(s.path),
-          ),
-        );
       }
     }
 
@@ -1877,12 +1779,6 @@ describe("the emission boundary — a record is never built from an unvalidated 
    */
   const EXCLUDED_KEY = /(^|\.)(orderIds\[\d+\]|reason|resizeReason|rationale|tags\[\d+\])$/u;
 
-  const REQUEST = {
-    approvedIntentId: CANONICAL,
-    resizedAt: "2026-09-03T12:00:01.000Z",
-    newTargetShares: "50",
-    reason: "shrink",
-  };
 
   function approvedRecord(mutate: (input: EvaluationInputFixture) => void): ApprovedIntentRecord {
     const input = entryInput();
@@ -1943,7 +1839,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
   it("REVIEWER'S PROBE (round 3): a POSITION resize refuses a non-canonical INHERITED intent.marketId", () => {
     const handBuilt = withStringAt(positionRecord(), "intent.marketId", NON_CANONICAL);
 
-    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+    const resized = sealApprovedIntentRecord(handBuilt);
 
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
@@ -1958,7 +1854,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
   it("the same for a REDUCE_POSITION resize (the §7.7 shape with no intentId)", () => {
     const handBuilt = withStringAt(reductionRecord(), "intent.marketId", NON_CANONICAL);
 
-    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+    const resized = sealApprovedIntentRecord(handBuilt);
 
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
@@ -1972,7 +1868,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
       NON_CANONICAL,
     );
 
-    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+    const resized = sealApprovedIntentRecord(handBuilt);
 
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
@@ -1983,7 +1879,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
 
   it("recommendations[].marketId is refused; its free-text rationale is not an identifier", () => {
     const hostileId = withStringAt(recommendingRecord(), "recommendations[0].marketId", NON_CANONICAL);
-    const refused = resizeApprovedIntent(hostileId, REQUEST);
+    const refused = sealApprovedIntentRecord(hostileId);
     expect(refused.ok).toBe(false);
     if (refused.ok) return;
     expect(refused.refusals.map((r) => r.details["field"])).toContain(
@@ -1995,7 +1891,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
       "recommendations[0].rationale",
       NON_CANONICAL,
     );
-    const allowed = resizeApprovedIntent(hostileProse, REQUEST);
+    const allowed = sealApprovedIntentRecord(hostileProse);
     expect(allowed.ok).toBe(true);
   });
 
@@ -2004,7 +1900,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
     // of a function whose entire contract is to return a typed result.
     const handBuilt = withStringAt(positionRecord(), "intent.targetShares", "not-a-decimal");
 
-    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+    const resized = sealApprovedIntentRecord(handBuilt);
 
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
@@ -2022,7 +1918,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
       for (const site of stringsIn(base)) {
         const handBuilt = withStringAt(base, site.path, NON_CANONICAL_CODE);
         // A typed result, ALWAYS: identity validation may not throw.
-        const resized = resizeApprovedIntent(handBuilt, REQUEST);
+        const resized = sealApprovedIntentRecord(handBuilt);
 
         if (EXCLUDED_KEY.test(site.path)) {
           excludedPositions += 1;
@@ -2082,7 +1978,7 @@ describe("the emission boundary — a record is never built from an unvalidated 
   });
 
   it("every emitted record is frozen BY the boundary — the resize path included", () => {
-    const resized = resizeApprovedIntent(positionRecord(), REQUEST);
+    const resized = sealApprovedIntentRecord(positionRecord());
     expect(resized.ok).toBe(true);
     if (!resized.ok) return;
     expect(Object.isFrozen(resized.value)).toBe(true);
@@ -2142,12 +2038,6 @@ describe("the data-record boundary — a caller's object is not a record", () =>
   /** As in the block above, written independently of `NON_IDENTITY_KEYS`. */
   const EXCLUDED_KEY = /(^|\.)(orderIds\[\d+\]|reason|resizeReason|rationale|tags\[\d+\])$/u;
 
-  const REQUEST = {
-    approvedIntentId: CANONICAL,
-    resizedAt: "2026-09-03T12:00:01.000Z",
-    newTargetShares: "50",
-    reason: "shrink",
-  };
 
   /** A MUTABLE record, as a caller would hand one in (deserialized, rebuilt). */
   function handBuiltRecord(
@@ -2169,7 +2059,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     >;
   }
 
-  function codes(result: ReturnType<typeof resizeApprovedIntent>): string[] {
+  function codes(result: ReturnType<typeof sealApprovedIntentRecord>): string[] {
     return result.ok ? [] : result.refusals.map((refusal) => refusal.code);
   }
 
@@ -2182,7 +2072,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       configurable: true,
     });
 
-    const resized = resizeApprovedIntent(record, REQUEST);
+    const resized = sealApprovedIntentRecord(record);
 
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
@@ -2202,7 +2092,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       const prototype: Record<string, unknown> = { marketId: inheritedValue };
       Object.setPrototypeOf(lot, prototype);
 
-      const resized = resizeApprovedIntent(record, REQUEST);
+      const resized = sealApprovedIntentRecord(record);
 
       // Refused whether the inherited value is hostile or benign: the defect is
       // the SHAPE. A record that reports a value it does not own cannot be
@@ -2230,7 +2120,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     });
 
     // Round 4: `Error("getter-fired")` escaped this call.
-    const resized = resizeApprovedIntent(record, REQUEST);
+    const resized = sealApprovedIntentRecord(record);
 
     expect(resized.ok).toBe(false);
     expect(codes(resized)).toContain("RISK_INPUT_INVALID");
@@ -2253,7 +2143,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       configurable: true,
     });
 
-    const resized = resizeApprovedIntent(record, REQUEST);
+    const resized = sealApprovedIntentRecord(record);
 
     expect(resized.ok).toBe(false);
     expect(reads).toBe(0);
@@ -2270,7 +2160,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       configurable: true,
     });
 
-    expect(resizeApprovedIntent(record, REQUEST).ok).toBe(false);
+    expect(sealApprovedIntentRecord(record).ok).toBe(false);
   });
 
   it("THE STRUCTURAL PROPERTY: every emitted record is plain, own-data and deeply frozen", () => {
@@ -2294,7 +2184,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       expect(result.approved).toBe(true);
       if (!result.approved) continue;
       emitted.push(result.record);
-      const resized = resizeApprovedIntent(structuredClone(result.record), REQUEST);
+      const resized = sealApprovedIntentRecord(structuredClone(result.record));
       if (resized.ok) emitted.push(resized.value);
     }
 
@@ -2318,7 +2208,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
 
   it("an emitted record shares no object with the argument it was built from", () => {
     const caller = handBuiltRecord();
-    const resized = resizeApprovedIntent(caller, REQUEST);
+    const resized = sealApprovedIntentRecord(caller);
     expect(resized.ok).toBe(true);
     if (!resized.ok) return;
 
@@ -2368,7 +2258,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     const record = handBuiltRecord() as unknown as Record<string, unknown>;
     record["orderId"] = NON_CANONICAL;
 
-    const resized = resizeApprovedIntent(record as unknown as ApprovedIntentRecord, REQUEST);
+    const resized = sealApprovedIntentRecord(record as unknown as ApprovedIntentRecord);
 
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
@@ -2392,7 +2282,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     const tagged = handBuiltRecord((withTag) => {
       withTag.intent = positionIntent({ tags: ["f1890000-0000-7000-8000-0000000000AB"] });
     });
-    const resized = resizeApprovedIntent(tagged, REQUEST);
+    const resized = sealApprovedIntentRecord(tagged);
     expect(resized.ok).toBe(true);
     if (!resized.ok) return;
     expect(resized.value.intent).toMatchObject({
@@ -2405,7 +2295,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     // from the IDENTITY check…
     const badTag = handBuiltRecord() as unknown as { intent: { tags: string[] } };
     badTag.intent.tags = ["not a code"];
-    expect(codes(resizeApprovedIntent(badTag as unknown as ApprovedIntentRecord, REQUEST))).toEqual(
+    expect(codes(sealApprovedIntentRecord(badTag as unknown as ApprovedIntentRecord))).toEqual(
       ["RISK_INPUT_INVALID"],
     );
 
@@ -2425,7 +2315,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       } as unknown as { rationale: string },
     ];
     expect(
-      codes(resizeApprovedIntent(badProse as unknown as ApprovedIntentRecord, REQUEST)),
+      codes(sealApprovedIntentRecord(badProse as unknown as ApprovedIntentRecord)),
     ).toEqual(["RISK_INPUT_INVALID"]);
   });
 
@@ -2440,7 +2330,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
       { ...handBuiltRecord(), extraKey: "surprise" },
     ];
     for (const notRecord of notRecords) {
-      const resized = resizeApprovedIntent(notRecord as ApprovedIntentRecord, REQUEST);
+      const resized = sealApprovedIntentRecord(notRecord as ApprovedIntentRecord);
       expect(resized.ok).toBe(false);
       expect(codes(resized)).toContain("RISK_INPUT_INVALID");
     }
@@ -2448,7 +2338,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     // A required field that is missing is named, not defaulted.
     const missing = handBuiltRecord() as unknown as Record<string, unknown>;
     delete missing["rootApprovedIntentId"];
-    const resized = resizeApprovedIntent(missing as unknown as ApprovedIntentRecord, REQUEST);
+    const resized = sealApprovedIntentRecord(missing as unknown as ApprovedIntentRecord);
     expect(resized.ok).toBe(false);
     if (resized.ok) return;
     expect(JSON.stringify(resized.refusals)).toContain("rootApprovedIntentId");
@@ -2458,7 +2348,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     const cyclic = handBuiltRecord() as unknown as { worstCase: Record<string, unknown> };
     cyclic.worstCase["self"] = cyclic.worstCase;
     expect(
-      codes(resizeApprovedIntent(cyclic as unknown as ApprovedIntentRecord, REQUEST)),
+      codes(sealApprovedIntentRecord(cyclic as unknown as ApprovedIntentRecord)),
     ).toContain("RISK_INPUT_INVALID");
 
     const sparse = handBuiltRecord() as unknown as { reasons: unknown };
@@ -2466,7 +2356,7 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     holes.length = 3;
     sparse.reasons = holes;
     expect(
-      codes(resizeApprovedIntent(sparse as unknown as ApprovedIntentRecord, REQUEST)),
+      codes(sealApprovedIntentRecord(sparse as unknown as ApprovedIntentRecord)),
     ).toContain("RISK_INPUT_INVALID");
   });
 });
@@ -2505,14 +2395,6 @@ describe("the data-record boundary — a caller's object is not a record", () =>
  */
 describe("a hostile value at the boundary — review round 5", () => {
   const NON_CANONICAL = "01890000-0000-7000-8000-0000000000AB";
-  const CANONICAL = "01890000-0000-7000-8000-0000000000ab";
-
-  const REQUEST = {
-    approvedIntentId: CANONICAL,
-    resizedAt: "2026-09-03T12:00:01.000Z",
-    newTargetShares: "50",
-    reason: "shrink",
-  };
 
   function handBuilt(): ApprovedIntentRecord {
     const input = entryInput();
@@ -2529,7 +2411,7 @@ describe("a hostile value at the boundary — review round 5", () => {
     >;
   }
 
-  function codes(result: ReturnType<typeof resizeApprovedIntent>): string[] {
+  function codes(result: ReturnType<typeof sealApprovedIntentRecord>): string[] {
     return result.ok ? [] : result.refusals.map((refusal) => refusal.code);
   }
 
@@ -2564,7 +2446,7 @@ describe("a hostile value at the boundary — review round 5", () => {
       configurable: true,
     });
 
-    const resized = resizeApprovedIntent(record as unknown as ApprovedIntentRecord, REQUEST);
+    const resized = sealApprovedIntentRecord(record as unknown as ApprovedIntentRecord);
 
     // Refused, and refused BY NAME — the reviewer's draft was accepted with
     // `plainPrototype:false`, which is what let a post-return prototype edit
@@ -2591,7 +2473,7 @@ describe("a hostile value at the boundary — review round 5", () => {
     const record = handBuilt();
     let setterInvoked = 0;
     let read: ReturnType<typeof readPlainData> | undefined;
-    let resized: ReturnType<typeof resizeApprovedIntent> | undefined;
+    let resized: ReturnType<typeof sealApprovedIntentRecord> | undefined;
     Object.defineProperty(Object.prototype, "marketId", {
       set() {
         setterInvoked += 1;
@@ -2605,7 +2487,7 @@ describe("a hostile value at the boundary — review round 5", () => {
     try {
       read = readPlainData({ marketId: MARKET_A, lot: { marketId: MARKET_B } }, "value");
       invokedByTheMaterializer = setterInvoked;
-      resized = resizeApprovedIntent(record, REQUEST);
+      resized = sealApprovedIntentRecord(record);
     } finally {
       delete (Object.prototype as unknown as Record<string, unknown>)["marketId"];
     }
@@ -2647,7 +2529,7 @@ describe("a hostile value at the boundary — review round 5", () => {
             configurable: true,
           });
 
-          const resized = resizeApprovedIntent(record, REQUEST);
+          const resized = sealApprovedIntentRecord(record);
           const where = `${key}${nested ? " (nested)" : " (root)"}${enumerable ? "" : " hidden"}`;
           expect(resized.ok, where).toBe(false);
           // Either shape refusal or identity refusal is acceptable; what is not
@@ -2664,7 +2546,7 @@ describe("a hostile value at the boundary — review round 5", () => {
 
   it("an emitted record is plain own frozen data, and no post-return edit reaches it", () => {
     const caller = handBuilt();
-    const resized = resizeApprovedIntent(caller, REQUEST);
+    const resized = sealApprovedIntentRecord(caller);
     expect(resized.ok).toBe(true);
     if (!resized.ok) return;
 
@@ -2690,7 +2572,7 @@ describe("a hostile value at the boundary — review round 5", () => {
     const counts = { value: 0 };
     const { proxy } = countingProxy(handBuilt() as object, counts);
 
-    const resized = resizeApprovedIntent(proxy as ApprovedIntentRecord, REQUEST);
+    const resized = sealApprovedIntentRecord(proxy as ApprovedIntentRecord);
 
     expect(resized.ok).toBe(false);
     expect(codes(resized)).toContain("RISK_INPUT_INVALID");
@@ -2707,7 +2589,7 @@ describe("a hostile value at the boundary — review round 5", () => {
     const { proxy } = countingProxy(perMarket[0] as object, counts);
     perMarket[0] = proxy as Record<string, unknown>;
 
-    const resized = resizeApprovedIntent(record, REQUEST);
+    const resized = sealApprovedIntentRecord(record);
 
     expect(resized.ok).toBe(false);
     // Round 5 recorded NINE trap invocations here, and an accepted record.
@@ -2752,7 +2634,7 @@ describe("a hostile value at the boundary — review round 5", () => {
       },
     }) as Record<string, unknown>;
 
-    const resized = resizeApprovedIntent(record, REQUEST);
+    const resized = sealApprovedIntentRecord(record);
 
     expect(resized.ok).toBe(false);
     expect(getters).toBe(0);
@@ -2775,7 +2657,7 @@ describe("a hostile value at the boundary — review round 5", () => {
       const record = handBuilt();
       const perMarket = record.worstCase.perMarket as unknown as Record<string, unknown>[];
       perMarket[0] = new Proxy(perMarket[0] as object, handler) as Record<string, unknown>;
-      expect(resizeApprovedIntent(record, REQUEST).ok).toBe(false);
+      expect(sealApprovedIntentRecord(record).ok).toBe(false);
     }
   });
 
@@ -2801,7 +2683,7 @@ describe("a hostile value at the boundary — review round 5", () => {
 
     // Round 5: this call threw `Error("coerce-from-caller")` — from the code
     // that BUILT the refusal (`String(reported)`), not from the check.
-    const resized = resizeApprovedIntent(record, REQUEST);
+    const resized = sealApprovedIntentRecord(record);
 
     expect(resized.ok).toBe(false);
     expect(coerced).toBe(0);
@@ -2813,7 +2695,7 @@ describe("a hostile value at the boundary — review round 5", () => {
     const { proxy, revoke } = Proxy.revocable(perMarket[0] as object, {});
     revoke();
     perMarket[0] = proxy as Record<string, unknown>;
-    expect(codes(resizeApprovedIntent(record, REQUEST))).toContain("RISK_INPUT_INVALID");
+    expect(codes(sealApprovedIntentRecord(record))).toContain("RISK_INPUT_INVALID");
 
     const second = handBuilt();
     const lots = second.worstCase.perMarket as unknown as Record<string, unknown>[];
@@ -2822,7 +2704,7 @@ describe("a hostile value at the boundary — review round 5", () => {
         throw new Error("descriptor-trap");
       },
     }) as Record<string, unknown>;
-    expect(codes(resizeApprovedIntent(second, REQUEST))).toContain("RISK_INPUT_INVALID");
+    expect(codes(sealApprovedIntentRecord(second))).toContain("RISK_INPUT_INVALID");
   });
 
   it("REVIEWER'S PROBE (round 5f): a CANCEL with a throwing accessor is REFUSED, not thrown", () => {
@@ -2900,75 +2782,9 @@ describe("a hostile value at the boundary — review round 5", () => {
     expect(traps).toBe(0);
   });
 
-  // WHICH SCOPE KEY CARRIES THIS PAIR, AND WHY IT MOVED (`WP-180-FU3`).
-  //
-  // Both tests used `context.strategyInstanceId = "constructor"` until ADR-021
-  // re-typed that field `Uuidv7Schema`, which makes `"constructor"` inadmissible
-  // AT THE DOOR — the hazard would have been "tested" through an input the door
-  // now refuses before any lookup happens, which is a vacuous test, not a
-  // stronger one. The class itself is untouched and still reachable: the OTHER
-  // scope dimensions take their keys from `MarketContext.scope`, whose three
-  // members are `CodeStringSchema` (`inputs.ts` `ScopeAttributionSchema`), and
-  // `"constructor"` is an admissible `CodeString`. So the pair now runs on
-  // `bySeries["constructor"]`, which answers the `Object` CONSTRUCTOR — not
-  // `undefined` — exactly as `byStrategyInstance["constructor"]` did.
-  //
-  // Reproduced before it was moved. What these two rows actually exercise
-  // (review round 1 correction): they go through `evaluateIntent`, whose
-  // arena-parsed input is prototype-free BEFORE `checkExposureLimits` runs, so
-  // on this path the intrinsic never reaches the lookup at all. `ownEntry`'s
-  // own-property refusal is defence in depth for direct callers of
-  // `checkExposureLimits` — it is not what these rows pin, and it currently
-  // has no test of its own (review r1 N1, owned by the risk package).
-
-  it("an INHERITED scope entry is not a measurement — RISK_EXPOSURE_ENTRY_MISSING still fires", () => {
-    // `MarketContext.scope.seriesKey` is a `CodeString`, so `"constructor"` is
-    // admissible input. `exposures.bySeries["constructor"]` answers the `Object`
-    // constructor — not `undefined` — so the round-1 BLOCKER-2 fix ("an omitted
-    // entry is unknown exposure, not zero") read an intrinsic as a measurement
-    // and then fed `undefined` to decimal arithmetic.
-    const input = entryInput();
-    input.markets = [
-      market({ scope: { seriesKey: "constructor", underlyingKey: "BTC", resolutionWindowKey: "w1" } }),
-    ];
-    input.exposures = exposureSnapshot({
-      measuring: { strategyInstanceIds: [INSTANCE], marketIds: [MARKET_A, MARKET_B] },
-    });
-
-    const result = evaluateIntent(
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "500" } }),
-      input,
-    );
-
-    expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_EXPOSURE_ENTRY_MISSING");
-    // Named, with the offending scope key — not a decimal exception.
-    expect(JSON.stringify(result.refusals)).toContain("constructor");
-  });
-
-  it("an inherited member is not an exposure entry for a MEASURED scope either", () => {
-    // The mirror case: the snapshot genuinely measures `"constructor"` at zero,
-    // so the evaluation must proceed and compare against that zero.
-    const input = entryInput();
-    input.markets = [
-      market({ scope: { seriesKey: "constructor", underlyingKey: "BTC", resolutionWindowKey: "w1" } }),
-    ];
-    input.exposures = exposureSnapshot({
-      measuring: {
-        strategyInstanceIds: [INSTANCE],
-        marketIds: [MARKET_A, MARKET_B],
-        seriesKeys: ["constructor"],
-      },
-    });
-
-    const result = evaluateIntent(
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "500" } }),
-      input,
-    );
-
-    expect(codesOf(result)).toEqual([]);
-    expect(result.approved).toBe(true);
-  });
+  // C1-RISK deleted the pair of `"constructor"` scope-key cases that stood
+  // here with `exposure-limits.ts`: the scope tables they probed no longer
+  // exist on this side (the capital allocator owns the exposure caps).
 
   it("the outer containment guard answers with a REJECTION, never an approval or a throw", () => {
     // `policy` is TYPED `RiskPolicy` and never parsed at runtime, so it is the

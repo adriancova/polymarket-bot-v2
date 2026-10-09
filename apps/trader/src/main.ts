@@ -233,6 +233,7 @@ import {
   DEFAULT_RESPONSE_TIMEOUT_MS,
   EventBusConfigurationError,
   EventBusUnavailableError,
+  MAX_RETENTION_EVENTS,
   RedisStreamsEventTransport,
   type EventSubscription,
 } from "@polymarket-bot/event-bus";
@@ -480,10 +481,17 @@ export async function startup(ports: StartupPorts): Promise<number> {
     return EXIT_CODES.configurationRefused;
   }
 
-  // `connect` rather than a constructor: the transport validates its retention
-  // bound and opens its connection in one act, so a bad bound is a startup
-  // refusal rather than a first-publish surprise (ADR-003: "Retention size is a
-  // safety parameter, not a tuning knob").
+  // `connect` rather than a constructor: the transport validates its settings
+  // and opens its connection in one act, so a bad setting is a startup
+  // refusal rather than a first-read surprise.
+  //
+  // CONSUMER ONLY (C1-RISK, OPS-07, 2026-10-08). The transport requires a
+  // retention bound and applies it only when it PUBLISHES, which this process
+  // never does: the stream's retention is the data gateway's
+  // (`GATEWAY_RETENTION_EVENTS`). So the event bus's own ceiling is passed —
+  // a number that trims nothing here — and nothing reports it as the stream's
+  // retention. The trader's `infrastructure.retentionMaxEvents` knob, which
+  // did both, is gone.
   //
   // `OUTAGE-1` (`B1-R1-REDIS-UNCAUGHT`): contained. An unreachable Redis used
   // to escape this function as an uncaught `EventBusUnavailableError`.
@@ -492,14 +500,13 @@ export async function startup(ports: StartupPorts): Promise<number> {
   try {
     transport = await RedisStreamsEventTransport.connect({
       connection: { url: redisUrl, responseTimeoutMs },
-      retention: { maxEvents: config.infrastructure.retentionMaxEvents },
+      retention: { maxEvents: MAX_RETENTION_EVENTS },
     });
   } catch (cause) {
     if (cause instanceof EventBusConfigurationError) {
       ports.log(
         `REFUSING TO START: TRADER_REDIS_URL_REFUSED: the event transport refused its settings ` +
-          `(REDIS_URL ${redisEndpoint}, retentionMaxEvents ` +
-          `${String(config.infrastructure.retentionMaxEvents)}); nothing was connected`,
+          `(REDIS_URL ${redisEndpoint}); nothing was connected`,
       );
       ports.log(`  ${describeError(cause)}`);
       return EXIT_CODES.configurationRefused;

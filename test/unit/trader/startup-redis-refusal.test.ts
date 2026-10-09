@@ -100,7 +100,8 @@ describe("an unreachable Redis at startup is a documented refusal (OUTAGE-1, B1-
     expect(outcome.code).toBe(EXIT_CODES.configurationRefused);
     expect(outcome.text).toContain(
       "REFUSING TO START: TRADER_REDIS_URL_REFUSED: the event transport refused its settings " +
-        "(REDIS_URL http://127.0.0.1:1,",
+        // C1-RISK (OPS-07): the trader states no retention bound, so none is echoed.
+        "(REDIS_URL http://127.0.0.1:1); nothing was connected",
     );
     expect(outcome.text).toContain("EventBusConfigurationError: connection url must use the `redis:` or `rediss:` scheme");
     expect(outcome.text).not.toContain("TRADER_REDIS_UNAVAILABLE");
@@ -115,7 +116,7 @@ describe("an unreachable Redis at startup is a documented refusal (OUTAGE-1, B1-
 
     expect(outcome.code).toBe(EXIT_CODES.configurationRefused);
     expect(outcome.text).toContain("REFUSING TO START: TRADER_REDIS_URL_REFUSED");
-    expect(outcome.text).toContain("(REDIS_URL (a value that is not a URL),");
+    expect(outcome.text).toContain("(REDIS_URL (a value that is not a URL));");
     expect(outcome.text).not.toContain(SECRET);
     expectNoStack(outcome.lines);
   });

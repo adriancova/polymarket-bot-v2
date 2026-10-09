@@ -131,7 +131,6 @@ function realSnapshot(): HealthSnapshot {
           consumerPosition: 1_000,
           committedPosition: 990,
           entriesBehindHead: 250,
-          retentionMaxEvents: 100_000,
         },
         lastEventAt,
         nowMs: Date.parse("2026-09-05T00:00:12.000Z"),
@@ -393,7 +392,8 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     expect(exposition).toContain('trader_halt_info{scope="MARKET",scope_ref="market-1"');
     // `THROUGHPUT-1a`: the input stream's lag, exactly as the section states it.
     expect(exposition).toContain("\ntrader_transport_lag_entries 250\n");
-    expect(exposition).toContain("\ntrader_transport_retention_max_events 100000\n");
+    // C1-RISK (OPS-07): the trader's retention setting is no longer a series.
+    expect(exposition).not.toContain("trader_transport_retention_max_events");
     expect(exposition).toContain("\ntrader_transport_sample_age_seconds 2.5\n");
     expect(exposition).toContain("\ntrader_event_time_lag_seconds 2\n");
     expect(exposition).toContain('trader_queue_oldest_message_age_ms{queue="market-events"} 17');

@@ -5,15 +5,18 @@
  * direction that matters here — **risk consuming the allocator** — has no
  * `docs/contracts/dependency-direction.md` §2.1 row and never will, because it
  * would close a cycle (F9). So the risk engine consumes the allocator's
- * exposure snapshot and reservation verdict STRUCTURALLY — by shape, not by
- * import.
+ * reservation verdict STRUCTURALLY — by shape, not by import.
  *
  * A structural port rots silently, so this file pins it three ways:
  *
  * 1. `tsc`-checked field names (`satisfies readonly (keyof …)[]`): renaming a
  *    field on the allocator side fails `pnpm typecheck`, not just this suite;
- * 2. a RUNTIME parse of real allocator output against the risk schemas;
- * 3. an END-TO-END pass: the allocator's own snapshot driving a risk refusal.
+ * 2. a RUNTIME parse of real allocator output against the risk schema;
+ * 3. an END-TO-END pass: the allocator's own verdict driving a risk refusal.
+ *
+ * C1-RISK (2026-10-08): the exposure-snapshot half of this port is gone. The
+ * capital allocator is the only exposure-cap authority, so its cap refusals
+ * reach risk through the verdict (`RISK_ALLOCATION_REFUSED`), pinned below.
  *
  * A test tree is not a workspace package, so importing both here declares no
  * dependency edge — and the last describe asserts what the manifests and the
@@ -40,29 +43,11 @@ import {
   applyReservation,
   createAllocatorState,
   evaluateReservation,
-  exposureSnapshot,
-  exposureSnapshotCovering,
   parseAllocatorCaps,
-  type ExposureEntry,
   type ReservationVerdict,
 } from "../../../packages/capital-allocator/src/index.js";
-import {
-  AllocationVerdictViewSchema,
-  ExposureSnapshotViewSchema,
-  evaluateIntent,
-} from "../../../packages/risk/src/index.js";
-import {
-  INSTANCE,
-  MARKET_A,
-  MARKET_B,
-  allScenarios,
-  codesOf,
-  entryInput,
-  freshObservations,
-  market,
-  positionIntent,
-  riskPolicy,
-} from "./fixtures.js";
+import { AllocationVerdictViewSchema, evaluateIntent } from "../../../packages/risk/src/index.js";
+import { INSTANCE, MARKET_A, entryInput, riskPolicy } from "./fixtures.js";
 // The one recursive source scan, shared with the three other guards that read
 // this repository's sources; see that module's header for why there is only
 // one. A test tree is not a workspace package, so importing across it declares
@@ -70,21 +55,11 @@ import {
 // directory's fixtures in the other direction.
 import { packageSourceFiles, readSource, repoRoot } from "../execution-planner/source-scan.js";
 
-/**
- * COMPILE-TIME PIN. The risk engine reads exactly these two components of an
- * exposure entry and recomputes their sum; `satisfies` makes a rename on the
- * allocator side a type error here.
- */
-const EXPOSURE_COMPONENTS = [
-  "openOrderCommitted",
-  "positionCommitted",
-] as const satisfies readonly (keyof ExposureEntry)[];
-
 /** COMPILE-TIME PIN. The risk engine reads these fields of a verdict. */
 const VERDICT_FIELDS = ["permitted", "refusals"] as const satisfies readonly (keyof ReservationVerdict)[];
 
-function allocatorFixture() {
-  const caps = parseAllocatorCaps({ globalAccountCap: "1000", perStrategyCap: "1000" });
+function allocatorFixture(extraCaps: Record<string, string> = {}) {
+  const caps = parseAllocatorCaps({ globalAccountCap: "1000", perStrategyCap: "1000", ...extraCaps });
   if (!caps.ok) throw new Error(JSON.stringify(caps.refusals));
   const state = createAllocatorState({
     accountEquity: "1000",
@@ -119,27 +94,12 @@ function allocatorFixture() {
 }
 
 describe("compile-time field pin", () => {
-  it("names the two exposure components the risk side recomputes from", () => {
-    expect([...EXPOSURE_COMPONENTS]).toEqual(["openOrderCommitted", "positionCommitted"]);
-  });
-
   it("names the verdict fields the risk side reads", () => {
     expect([...VERDICT_FIELDS]).toEqual(["permitted", "refusals"]);
   });
 });
 
 describe("runtime parse pin", () => {
-  it("a real allocator exposure snapshot satisfies the risk view schema", () => {
-    const { state } = allocatorFixture();
-    const snapshot = exposureSnapshot(state);
-    const parsed = ExposureSnapshotViewSchema.safeParse(snapshot);
-    expect(parsed.success).toBe(true);
-    // Both components survive the port, separately (acceptance 1).
-    expect(snapshot.global.openOrderCommitted).toBe("60");
-    expect(snapshot.global.positionCommitted).toBe("40");
-    expect(snapshot.global.combined).toBe("100");
-  });
-
   it("a real allocator reservation verdict satisfies the risk view schema", () => {
     const { caps, state } = allocatorFixture();
     const permitted = evaluateReservation(state, caps, {
@@ -187,18 +147,30 @@ describe("runtime parse pin", () => {
 });
 
 describe("end-to-end: the allocator's own numbers drive the risk limit", () => {
-  it("a per-market cap breach is detected from a real allocator snapshot", () => {
-    const { state } = allocatorFixture();
-    const input = entryInput();
-    input.exposures = exposureSnapshot(state) as unknown as Record<string, unknown>;
-
-    const policy = riskPolicy({
-      limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "100" },
+  it("C1-RISK: a per-market cap breach is the ALLOCATOR's refusal, carried as RISK_ALLOCATION_REFUSED", () => {
+    // The fixture commits 100 on MARKET_A (a position at 40, an open BUY at 60).
+    // A 10-share BUY at 0.5 adds 5: over a per-market cap of 100.
+    const { caps, state } = allocatorFixture({ perMarketCap: "100" });
+    const refused = evaluateReservation(state, caps, {
+      reservationId: "res-cap",
+      strategyInstanceId: INSTANCE,
+      runMode: "PAPER",
+      accountingMode: "LIVE",
+      marketId: MARKET_A,
+      side: "YES",
+      action: "BUY",
+      price: "0.5",
+      shares: "10",
     });
-    const result = evaluateIntent(policy, input);
+    expect(refused.refusals.map((refusal) => refusal.code)).toEqual(["CAPITAL_MARKET_CAP_EXCEEDED"]);
+
+    const input = entryInput();
+    input.allocation = refused as unknown as Record<string, unknown>;
+    const result = evaluateIntent(riskPolicy(), input);
 
     expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_MARKET_EXPOSURE_EXCEEDED");
+    const refusal = result.refusals.find((r) => r.code === "RISK_ALLOCATION_REFUSED");
+    expect(refusal?.details["allocatorCodes"]).toEqual(["CAPITAL_MARKET_CAP_EXCEEDED"]);
   });
 
   it("a real allocator REFUSAL is carried through as RISK_ALLOCATION_REFUSED with its codes", () => {
@@ -226,59 +198,9 @@ describe("end-to-end: the allocator's own numbers drive the risk limit", () => {
     expect(refusal?.details["allocatorCodes"]).toContain("CAPITAL_INVENTORY_INSUFFICIENT");
   });
 
-  /**
-   * REVIEW ROUND 1, BLOCKER 2 — the two sides of the fix, end to end.
-   *
-   * `exposureSnapshot` is sparse: a market with no commitments has no row. The
-   * risk side now REFUSES that gap instead of reading it as zero, and
-   * `exposureSnapshotCovering` is how a composition root closes it honestly.
-   */
-  it("a sparse allocator snapshot blocks a cap on an unmentioned market", () => {
-    const { state } = allocatorFixture();
-    const input = entryInput();
-    // MARKET_B has no commitments, so the sparse snapshot has no row for it.
-    input.intent = { ...positionIntent(), marketId: MARKET_B };
-    input.markets = [market({ marketId: MARKET_B })];
-    input.freshness = freshObservations(MARKET_B);
-    input.scenarios = allScenarios("0.4", [MARKET_B]);
-    input.exposures = exposureSnapshot(state) as unknown as Record<string, unknown>;
-
-    const policy = riskPolicy({
-      // Roomy: if the absent row really meant zero, this would pass.
-      limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10000" },
-    });
-    const result = evaluateIntent(policy, input);
-
-    expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_EXPOSURE_ENTRY_MISSING");
-  });
-
-  it("the SAME evaluation passes once the allocator covers the queried scope", () => {
-    const { state } = allocatorFixture();
-    const input = entryInput();
-    input.intent = { ...positionIntent(), marketId: MARKET_B };
-    input.markets = [market({ marketId: MARKET_B })];
-    input.freshness = freshObservations(MARKET_B);
-    input.scenarios = allScenarios("0.4", [MARKET_B]);
-    const covering = exposureSnapshotCovering(state, { marketIds: [MARKET_B] });
-    input.exposures = covering as unknown as Record<string, unknown>;
-
-    // The covering snapshot is still a valid structural port.
-    expect(ExposureSnapshotViewSchema.safeParse(covering).success).toBe(true);
-    expect(covering.byMarket[MARKET_B]?.combined).toBe("0");
-
-    const policy = riskPolicy({
-      limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10000" },
-    });
-    const result = evaluateIntent(policy, input);
-
-    expect(codesOf(result)).toEqual([]);
-    expect(result.approved).toBe(true);
-  });
-
-  it("an applied reservation raises the allocator exposure the risk engine then sees", () => {
-    const { caps, state } = allocatorFixture();
-    const applied = applyReservation(state, caps, {
+  it("an applied reservation counts toward the next verdict's cap, and risk refuses on it", () => {
+    const { caps, state } = allocatorFixture({ perMarketCap: "150" });
+    const request = {
       reservationId: "res-4",
       strategyInstanceId: INSTANCE,
       runMode: "PAPER",
@@ -288,13 +210,20 @@ describe("end-to-end: the allocator's own numbers drive the risk limit", () => {
       action: "BUY",
       price: "0.5",
       shares: "100",
-    });
+    };
+    // 100 committed + 50 = 150: at the cap, admitted and applied.
+    const applied = applyReservation(state, caps, request);
     expect(applied.ok).toBe(true);
     if (!applied.ok) return;
-    const before = exposureSnapshot(state).global.combined;
-    const after = exposureSnapshot(applied.value.state).global.combined;
-    expect(before).toBe("100");
-    expect(after).toBe("150");
+    // The same 50 again would make 200: the allocator refuses, and so does risk.
+    const second = evaluateReservation(applied.value.state, caps, { ...request, reservationId: "res-5" });
+    expect(second.permitted).toBe(false);
+    const input = entryInput();
+    input.allocation = second as unknown as Record<string, unknown>;
+    const result = evaluateIntent(riskPolicy(), input);
+    expect(result.refusals.find((r) => r.code === "RISK_ALLOCATION_REFUSED")?.details["allocatorCodes"]).toEqual([
+      "CAPITAL_MARKET_CAP_EXCEEDED",
+    ]);
   });
 });
 

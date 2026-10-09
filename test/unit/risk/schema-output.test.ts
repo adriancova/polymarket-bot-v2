@@ -15,7 +15,8 @@
  * the input, and a door that ignored the output would then silently drop that
  * contribution. So the property is machine-checked here rather than assumed:
  *
- * - for the five doors that take the read directly, every node of the schema
+ * - for the four doors that take the read directly (five until C1-RISK deleted
+ *   the resize request), every node of the schema
  *   must be NON-PRODUCING. One `.transform()` added anywhere fails this test;
  * - for the two doors whose schemas do declare defaults, the declared default
  *   PATHS AND VALUES must equal the door's own table, which is what
@@ -44,10 +45,7 @@ import {
   createAllocatorState,
 } from "../../../packages/capital-allocator/src/state.js";
 import { ReservationRequestSchema } from "../../../packages/capital-allocator/src/reserve.js";
-import {
-  ApprovedIntentRecordSchema,
-  ResizeRequestSchema,
-} from "../../../packages/risk/src/approved-intent.js";
+import { ApprovedIntentRecordSchema } from "../../../packages/risk/src/approved-intent.js";
 import { RiskEvaluationInputSchema } from "../../../packages/risk/src/inputs.js";
 import { readPlainData } from "../../../packages/risk/src/plain-data.js";
 import { RISK_POLICY_DEFAULTS, RiskPolicySchema } from "../../../packages/risk/src/policy.js";
@@ -205,10 +203,9 @@ function classify(nodes: readonly SchemaNode[]): {
 // the doors
 // ---------------------------------------------------------------------------
 
-/** The five doors whose validated value IS the materialized read, verbatim. */
+/** The four doors whose validated value IS the materialized read, verbatim. */
 const READ_IS_THE_VALUE: readonly { readonly name: string; readonly schema: unknown }[] = [
   { name: "RiskEvaluationInputSchema (validateEvaluationInput / evaluateIntent)", schema: RiskEvaluationInputSchema },
-  { name: "ResizeRequestSchema (resizeApprovedIntent)", schema: ResizeRequestSchema },
   { name: "ApprovedIntentRecordSchema (sealApprovedIntentRecord)", schema: ApprovedIntentRecordSchema },
   { name: "AllocatorStateInputSchema (createAllocatorState)", schema: AllocatorStateInputSchema },
   { name: "ReservationRequestSchema (evaluateReservation)", schema: ReservationRequestSchema },

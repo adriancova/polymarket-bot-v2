@@ -14,7 +14,6 @@
  */
 
 import { parseRiskPolicy, type RiskPolicy } from "../../../packages/risk/src/index.js";
-import { ownDataDescriptor } from "../../../packages/risk/src/plain-data.js";
 
 /** Canonical lowercase UUIDv7 market ids (§7.2 / ADR-016). */
 export const MARKET_A = "01890000-0000-7000-8000-000000000001";
@@ -88,7 +87,6 @@ export interface EvaluationInputFixture {
     positions: Record<string, unknown>[];
     openOrders: Record<string, unknown>[];
   };
-  exposures?: Record<string, unknown>;
   allocation?: Record<string, unknown>;
   scenarios: ScenarioFixture[];
   guards: { recentIntentIds: string[] };
@@ -210,109 +208,6 @@ export function openOrder(overrides: Record<string, unknown> = {}): Record<strin
     ...overrides,
   };
 }
-
-/**
- * One allocator-shaped exposure entry. The extra-key index signature mirrors
- * the risk side's LOOSE view schema: the allocator also publishes a derived
- * `combined`, and a test must be able to supply it — including a drifted one —
- * to prove the risk engine recomputes rather than trusts it.
- */
-export interface ExposureEntryFixture {
-  openOrderCommitted: string;
-  positionCommitted: string;
-  [key: string]: string;
-}
-
-export function exposureEntry(
-  openOrderCommitted: string,
-  positionCommitted: string,
-): ExposureEntryFixture {
-  return { openOrderCommitted, positionCommitted };
-}
-
-/**
- * Scope keys a snapshot MEASURES at zero, mirroring the allocator's
- * `exposureSnapshotCovering`.
- */
-export interface ExposureMeasuringFixture {
-  strategyInstanceIds?: readonly string[];
-  marketIds?: readonly string[];
-  seriesKeys?: readonly string[];
-  underlyingKeys?: readonly string[];
-  resolutionWindowKeys?: readonly string[];
-}
-
-/**
- * OWN test, OWN definition (review round 5). `out[key] ??= …` reads through the
- * prototype chain, so a scope key of `"constructor"` — an admissible
- * `CodeString` — found `Object` and skipped the write, and the fixture then
- * silently failed to MEASURE a scope it said it measured. The product had the
- * same defect at `packages/capital-allocator/src/exposure.ts`; this fixture is
- * the mirror of `exposureSnapshotCovering`, so it carries the mirror fix.
- */
-function zeroFilled(
-  table: Record<string, ExposureEntryFixture>,
-  keys: readonly string[] | undefined,
-): Record<string, ExposureEntryFixture> {
-  const out = { ...table };
-  for (const key of keys ?? []) {
-    if (Object.hasOwn(out, key)) continue;
-    // The DESCRIPTOR is prototype-free too (review round 8): a descriptor
-    // literal inherits, so `Object.prototype.get` alone makes every
-    // `defineProperty` in the process throw — including this fixture's.
-    Object.defineProperty(out, key, ownDataDescriptor(exposureEntry("0", "0")));
-  }
-  return out;
-}
-
-/**
- * An allocator-shaped exposure snapshot.
- *
- * SPARSE BY DEFAULT, AND SPARSE IS NOT ZERO. The scope tables default to `{}`,
- * which the risk side refuses (`RISK_EXPOSURE_ENTRY_MISSING`) whenever a cap
- * for that dimension is configured — an omitted entry is unknown exposure, not
- * zero exposure (review round 1, BLOCKER 2). A test that means "this scope is
- * MEASURED and holds nothing" lists the key under `measuring`, which is what
- * `exposureSnapshotCovering` produces in production.
- */
-export function exposureSnapshot(overrides: {
-  global?: ExposureEntryFixture;
-  byStrategyInstance?: Record<string, ExposureEntryFixture>;
-  byMarket?: Record<string, ExposureEntryFixture>;
-  bySeries?: Record<string, ExposureEntryFixture>;
-  byUnderlying?: Record<string, ExposureEntryFixture>;
-  byResolutionWindow?: Record<string, ExposureEntryFixture>;
-  measuring?: ExposureMeasuringFixture;
-} = {}): Record<string, unknown> {
-  const measuring = overrides.measuring ?? {};
-  return {
-    global: overrides.global ?? exposureEntry("0", "0"),
-    byStrategyInstance: zeroFilled(
-      overrides.byStrategyInstance ?? {},
-      measuring.strategyInstanceIds,
-    ),
-    byMarket: zeroFilled(overrides.byMarket ?? {}, measuring.marketIds),
-    bySeries: zeroFilled(overrides.bySeries ?? {}, measuring.seriesKeys),
-    byUnderlying: zeroFilled(overrides.byUnderlying ?? {}, measuring.underlyingKeys),
-    byResolutionWindow: zeroFilled(
-      overrides.byResolutionWindow ?? {},
-      measuring.resolutionWindowKeys,
-    ),
-  };
-}
-
-/**
- * The scope keys the standard fixtures query: the baseline instance, both
- * markets, and the attribution `market()` carries. Handy shorthand for
- * "everything the evaluation will look up is measured at zero".
- */
-export const FIXTURE_MEASURING: ExposureMeasuringFixture = {
-  strategyInstanceIds: [INSTANCE],
-  marketIds: [MARKET_A, MARKET_B],
-  seriesKeys: ["btc-15m"],
-  underlyingKeys: ["BTC"],
-  resolutionWindowKeys: ["w1"],
-};
 
 /** The fully-passing ENTRY baseline. Mutate one field per test. */
 export function entryInput(): EvaluationInputFixture {

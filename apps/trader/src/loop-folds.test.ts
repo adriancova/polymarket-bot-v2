@@ -278,7 +278,6 @@ function traderConfig(): Record<string, unknown> {
       eventStream: "polymarket.normalized",
       consumerId: "fold-1",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

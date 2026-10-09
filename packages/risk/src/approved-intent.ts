@@ -1,38 +1,23 @@
 /**
- * Approved-intent records and RISK RESIZE — handoff §7.7, final paragraph:
+ * Approved-intent records — handoff §7.7, final paragraph:
  *
  * > "A risk veto never silently mutates an intent. A resize creates a new
  * > approved-intent record linked to the original."
  *
- * Workplan WP-180 acceptance 4: "Risk resize creates a new approved-intent
- * record." Both halves are structural here, not conventional:
+ * The ORIGINAL intent and the record are deeply frozen, so an attempted
+ * in-place edit THROWS rather than succeeding quietly.
  *
- * - the ORIGINAL intent and the ORIGINAL record are deeply frozen, so an
- *   attempted in-place edit THROWS rather than succeeding quietly;
- * - {@link resizeApprovedIntent} returns a NEW record with a new
- *   `approvedIntentId`, `lineage: "RESIZED"`, and `supersedesApprovedIntentId`
- *   / `rootApprovedIntentId` naming the chain it descends from. Reusing the
- *   original id is a typed refusal (`RISK_RESIZE_ID_REUSED`), because a reused
- *   id is how "a new record" quietly becomes "an edited record" in storage.
- *
- * A RESIZE MAY ONLY REDUCE. `|newTargetShares| < |originalTargetShares|`,
- * strictly, and the sign may not flip (`RISK_RESIZE_NOT_A_REDUCTION`,
- * `RISK_RESIZE_INCOHERENT`). Risk shrinks exposure; it does not re-aim a
- * strategy's intent, and a "resize" that grew or reversed a position would be
- * this package originating a trading decision it has no authority to make.
- *
- * WHAT IS NOT RESIZED. Ceilings the strategy set (`maximumTotalCost`,
- * `maximumBuyPrice`, `minimumSellPrice`, `validUntil`) are copied unchanged: a
- * ceiling stays valid under a smaller size, and scaling one would be this
- * package inventing a number the strategy did not supply.
- *
- * WORST-CASE BASIS. The resized record inherits the original's assessment and
- * says so (`worstCaseBasis: "INHERITED_UPPER_BOUND"`). That is a genuine upper
- * bound — a strict share reduction cannot raise committed cost, and
- * `maximumContractualLoss` IS committed cost — but it is not a fresh
- * evaluation, so the field states which it is rather than letting a consumer
- * assume. Re-running {@link evaluateIntent} on the resized intent produces an
- * `"EVALUATED"` record.
+ * NO RESIZE PATH EXISTS (C1-RISK, TRADE-08, 2026-10-08). This package used to
+ * export `resizeApprovedIntent`, which nothing outside its own tests called:
+ * the execution planner refuses an intent it cannot fill
+ * (`PLAN_INVENTORY_INSUFFICIENT`) rather than downsizing it, and a refusal
+ * never mutates an intent. It was deleted with its request schema and its four
+ * `RISK_RESIZE_*` codes, so WP-180's "risk resize creates a new approved-intent
+ * record" now holds vacuously. The record keeps its stored lineage fields
+ * (`lineage`, `supersedesApprovedIntentId`, `rootApprovedIntentId`,
+ * `worstCaseBasis`, `resizeReason`): they are a stored contract the execution
+ * planner reads, and every record this package emits today is an `ORIGINAL`
+ * with an `EVALUATED` worst case.
  *
  * THE EMISSION BOUNDARY (adversarial review round 3). Every path in this
  * package that returns an `ApprovedIntentRecord` goes through
@@ -78,24 +63,22 @@
  *    predicate, and `plain-data.ts` states the resulting claim with its
  *    assumptions attached instead of as an absolute.
  * 2. It said the package had "exactly one traversal primitive". Also false:
- *    `deepFreeze` and `exposure-limits.ts` traverse too. What is true is the
+ *    `deepFreeze` and (until C1-RISK) `exposure-limits.ts` traversed too. What is true is the
  *    thing that matters here — the ADR-016 §2 IDENTITY check walks nothing of
  *    its own; it consumes the inventory the read produced.
  *
- * TOTALITY IS NOW STRUCTURAL. Both public functions below run inside
+ * TOTALITY IS NOW STRUCTURAL. The public function below runs inside
  * {@link contained}, so an exception cannot leave a function whose contract is a
  * typed result — however wrong an assumption above turns out to be. Three
  * rounds running, the escape was a site nobody had thought of.
  */
 
-import { absDecimal, compareDecimal } from "@polymarket-bot/decimal";
 import {
   DetailStringSchema,
   IntentSchema,
   IsoTimestampSchema,
   NonEmptyStringSchema,
   RunModeSchema,
-  SharesStringSchema,
   type Intent,
   type RunMode,
 } from "@polymarket-bot/domain";
@@ -153,16 +136,15 @@ export interface ApprovedIntentRecord {
   readonly worstCaseBasis: WorstCaseBasis;
   /** Recommendations the §9.9 controller may act on. Never actions. */
   readonly recommendations: readonly IncidentActionRecommendation[];
-  /** Present only on a `RESIZED` record. */
+  /** Present only on a `RESIZED` record (none is produced since C1-RISK). */
   readonly resizeReason?: string;
 }
 
 /**
  * THE COMPLETE RUNTIME SHAPE of {@link ApprovedIntentRecord} (review round 4).
  *
- * `resizeApprovedIntent` takes a `record` argument that TypeScript types but
- * nothing parsed, and almost all of it is copied into the record that comes
- * back out. A type annotation is not a runtime guarantee, so the emission
+ * A draft is built from values TypeScript types but nothing parsed. A type
+ * annotation is not a runtime guarantee, so the emission
  * boundary checks the record it is about to emit against this schema: a draft
  * that is not an approved-intent record is a typed refusal, not an emission.
  *
@@ -217,8 +199,8 @@ export const ApprovedIntentRecordSchema = z.strictObject({
  *   human-readable text (never parsed, only displayed or logged)"
  *   (`packages/domain/src/primitives.ts`). Also on the cancel path.
  * - `resizeReason` — `ApprovedIntentRecordSchema.resizeReason` above is
- *   `DetailStringSchema`, and its only producer is `ResizeRequestSchema.reason`,
- *   which is the same type.
+ *   `DetailStringSchema` (its producer, the resize request, was deleted by
+ *   C1-RISK; a stored `RESIZED` record may still carry it).
  * - `rationale` — `IncidentActionRecommendationSchema.rationale`
  *   (`recommendations.ts`) is `DetailStringSchema`. THAT ANNOTATION IS NEW IN
  *   ROUND 4: review round 4 found the field was an unconstrained `string`, so
@@ -314,8 +296,8 @@ const ApprovedIntentRecordParser = prototypeFreeParser(ApprovedIntentRecordSchem
 /**
  * THE SINGLE EMISSION BOUNDARY for approved-intent records.
  *
- * Every path that returns a record — `evaluateIntent`'s two arms and
- * {@link resizeApprovedIntent} — builds a draft and hands it here. This
+ * Every path that returns a record — `evaluateIntent`'s two arms — builds a
+ * draft and hands it here. This
  * function READS the draft into plain own data, checks every string it read
  * (see {@link NON_IDENTITY_KEYS}) and the record's complete runtime shape (see
  * {@link ApprovedIntentRecordSchema}), and then either refuses with the raw
@@ -375,274 +357,5 @@ export function sealApprovedIntentRecord(
           { thrown },
         ),
       ),
-  );
-}
-
-export const ResizeRequestSchema = z.strictObject({
-  /** The NEW record's identity. Must differ from the record being resized. */
-  approvedIntentId: NonEmptyStringSchema,
-  /** Caller-supplied instant. */
-  resizedAt: IsoTimestampSchema,
-  newTargetShares: SharesStringSchema,
-  reason: DetailStringSchema,
-});
-export type ResizeRequest = z.infer<typeof ResizeRequestSchema>;
-
-/**
- * The door's parsing copy of {@link ResizeRequestSchema} (review round 8).
- *
- * Same validation, node for node — see `schema-arena.ts` — assembled onto
- * containers with NO PROTOTYPE, with a parse context that has none either. An
- * inherited SETTER can no longer be invoked while the library builds an output
- * this door discards, and an inherited `skipChecks` can no longer turn the
- * library's format checks into no-ops.
- */
-const ResizeRequestParser = prototypeFreeParser(ResizeRequestSchema);
-
-/** The intent shapes a risk resize can act on. */
-function resizableTargetShares(intent: Intent): string | undefined {
-  return intent.type === "POSITION" || intent.type === "REDUCE_POSITION"
-    ? intent.targetShares
-    : undefined;
-}
-
-function signOf(value: string): -1 | 0 | 1 {
-  const comparison = compareDecimal(value, "0");
-  return comparison < 0 ? -1 : comparison > 0 ? 1 : 0;
-}
-
-/**
- * Creates a NEW approved-intent record that resizes `record` downward.
- *
- * NEVER MUTATES, NEVER ALIASES, `record`. The returned value is a distinct,
- * deeply-frozen tree that shares no object with the argument: since review
- * round 4 the argument is READ into plain own data before it is used, so the
- * caller cannot reach into an emitted record afterwards — not by editing a
- * sub-object it still holds, not by editing a prototype, not through a getter.
- * `record` itself is never written to.
- */
-export function resizeApprovedIntent(
-  record: ApprovedIntentRecord,
-  request: unknown,
-): RiskResult<ApprovedIntentRecord> {
-  return contained(
-    () => resizeApprovedIntentInner(record, request),
-    (thrown) =>
-      riskFailure(
-        riskRefusal(
-          "RISK_INPUT_INVALID",
-          "the resize failed unexpectedly; a resize that cannot be computed does not produce a record (fail closed)",
-          { thrown },
-        ),
-      ),
-  );
-}
-
-function resizeApprovedIntentInner(
-  record: ApprovedIntentRecord,
-  request: unknown,
-): RiskResult<ApprovedIntentRecord> {
-  // --- THE REQUEST IS READ AS DATA BEFORE IT IS PARSED (review round 5) -----
-  //
-  // `request` is a caller-supplied `unknown`, and `safeParse` READS it — so a
-  // throwing getter on `reason` or `newTargetShares` escaped this function as
-  // an exception rather than becoming a refusal. Round 4 already read the
-  // request, but read the zod OUTPUT, which is downstream of the very property
-  // reads that were the problem. The read now comes first.
-  const requestData = readRecordData(request, "request");
-  if (!requestData.ok) return riskFailure(requestData.refusal);
-
-  const parsed = ResizeRequestParser.safeParse(requestData.value);
-  if (!parsed.success) {
-    return riskFailure(
-      riskRefusal("RISK_INPUT_INVALID", "resize request failed validation", {
-        issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
-      }),
-    );
-  }
-  // THE VALIDATED REQUEST IS THE MATERIALIZED TREE (review round 7), and the
-  // reason this line matters is not hypothetical: `zod` assembles its output by
-  // ASSIGNMENT, so an inherited GET-ONLY accessor named `approvedIntentId` made
-  // the assignment fail, the field vanish from the output, and the following
-  // read fall through to the PROTOTYPE — the emitted record's own identity came
-  // back as the inherited getter's answer (`"0"`), with the parse still
-  // reporting success. Round 6 detected that as a LOSS and refused; round 7
-  // removes the exposure instead. `requestData.value` is this package's own
-  // tree, and `ResizeRequestSchema` contributes no value of its own (pinned by
-  // `test/unit/risk/schema-output.test.ts`), so the validated request and the
-  // read request are the same value.
-  const req = requestData.value as ResizeRequest;
-  const refusals: RiskRefusal[] = [];
-
-  // --- THE INHERITED BOUNDARY — read and validated BEFORE anything is built --
-  //
-  // Both arguments are input. `request` is caller data; `record` is TYPED as an
-  // `ApprovedIntentRecord` but is NOT parsed at runtime, so a hand-built one can
-  // carry anything — and almost all of it is copied INTO the new record.
-  //
-  // Round 2 validated a LIST of seven identity fields here. Review round 3
-  // found the list still incomplete (`record.intent.marketId`) and its probe
-  // found 43 further positions at which a hand-built record reached an emitted
-  // record uninspected, so the list became a walk. Review round 4 then found
-  // the walk's `Object.entries` blind to a non-enumerable, inherited, or
-  // accessor-backed identity, and liable to THROW on one — the enumeration
-  // primitive had become the new list.
-  //
-  // So the record is now READ into plain own data first, and every line below
-  // reads `inherited` rather than `record`. That is what closes the class: the
-  // value this function validates, computes on, and copies into the new record
-  // is one immutable snapshot, taken once, with nothing hidden behind
-  // enumerability, a prototype, a getter, or a `Proxy` trap. `request` goes
-  // through the same door ABOVE the schema (round 5), so that no value in this
-  // function has been trusted on the strength of where it came from.
-  const inheritedData = readRecordData(record, "record");
-  if (!inheritedData.ok) return riskFailure(inheritedData.refusal);
-  // A `record` that is not an object at all reads cleanly AS DATA (`null` and
-  // `"x"` are data), so the read cannot be what rejects it — and every line
-  // below dereferences it. Round 4 found the unguarded version threw a
-  // `TypeError` here, which is the same defect class as the throwing getter:
-  // an exception out of a function whose contract is a typed result.
-  const inheritedValue: unknown = inheritedData.value;
-  if (inheritedValue === null || typeof inheritedValue !== "object") {
-    return riskFailure(
-      riskRefusal(
-        "RISK_INPUT_INVALID",
-        "the record to resize is not an approved-intent record (fail closed)",
-        { received: inheritedValue === null ? "null" : typeof inheritedValue },
-      ),
-    );
-  }
-  const inherited = inheritedValue as ApprovedIntentRecord;
-
-  // Refuse, never case-fold; the raw value rides out on the refusal.
-  for (const refusal of identityRefusalsFor(inheritedData.strings)) appendData(refusals, refusal);
-  for (const refusal of identityRefusalsFor(requestData.strings)) appendData(refusals, refusal);
-
-  // THE INHERITED RECORD IS PARSED IN FULL, not just walked. Round 3 parsed
-  // only `record.intent`, because that is what the arithmetic below reads.
-  // Review round 4 named the wider hole: this function "accepts the record
-  // directly without parsing its complete runtime shape", so a value that was
-  // not an approved-intent record at all — a missing lineage root, an extra
-  // field, an `approvedAt` that is not a timestamp — was resized anyway, and
-  // whatever of it the new record copies rode along unexamined.
-  //
-  // Two things this buys beyond shape, both found by probes rather than by
-  // reading: a hand-built `targetShares` of `"f1890000-…"` is a typed refusal
-  // rather than an `InvalidDecimalStringError` THROWN out of a function whose
-  // whole contract is to return one, and a non-canonical `marketId` anywhere in
-  // the intent is refused before anything is constructed. The parse OUTPUT is
-  // deliberately discarded: the record is built from the values as they were
-  // read, so nothing can be normalized on the way through.
-  const parsedRecord = ApprovedIntentRecordParser.safeParse(inherited);
-  if (!parsedRecord.success) {
-    appendData(
-      refusals,
-      riskRefusal(
-        "RISK_INPUT_INVALID",
-        "the record to resize does not satisfy the approved-intent record contract; a resize computes on it and copies most of it forward, so it is parsed before it is used (fail closed)",
-        {
-          issues: parsedRecord.error.issues.map(
-            (issue) => `record.${issue.path.join(".")}: ${issue.message}`,
-          ),
-        },
-      ),
-    );
-    // Every check below reads `inherited`; with it unparsed there is nothing
-    // safe to compute, so report what is known and stop.
-    return riskFailure(...refusals);
-  }
-
-  if (
-    req.approvedIntentId === inherited.approvedIntentId ||
-    req.approvedIntentId === inherited.rootApprovedIntentId
-  ) {
-    appendData(
-      refusals,
-      riskRefusal(
-        "RISK_RESIZE_ID_REUSED",
-        "a resize must create a NEW approved-intent record; reusing an id in the lineage would edit the original in storage (§7.7)",
-        {
-          requested: req.approvedIntentId,
-          approvedIntentId: inherited.approvedIntentId,
-          rootApprovedIntentId: inherited.rootApprovedIntentId,
-        },
-      ),
-    );
-  }
-
-  const originalShares = resizableTargetShares(inherited.intent);
-  if (originalShares === undefined) {
-    appendData(
-      refusals,
-      riskRefusal(
-        "RISK_RESIZE_UNSUPPORTED_TYPE",
-        "only POSITION and REDUCE_POSITION intents carry a single resizable targetShares; a QUOTE ladder or BASKET leg set is re-proposed by the strategy, not resized here (fail closed)",
-        { intentType: inherited.intent.type },
-      ),
-    );
-  } else {
-    const originalSign = signOf(originalShares);
-    const newSign = signOf(req.newTargetShares);
-    if (newSign !== 0 && originalSign !== 0 && newSign !== originalSign) {
-      appendData(
-        refusals,
-        riskRefusal(
-          "RISK_RESIZE_INCOHERENT",
-          "a resize may not flip the side of the original intent; risk shrinks exposure, it does not re-aim a strategy's decision (§7.7)",
-          { originalTargetShares: originalShares, newTargetShares: req.newTargetShares },
-        ),
-      );
-    }
-    if (compareDecimal(absDecimal(req.newTargetShares), absDecimal(originalShares)) >= 0) {
-      appendData(
-        refusals,
-        riskRefusal(
-          "RISK_RESIZE_NOT_A_REDUCTION",
-          "a risk resize must strictly reduce the magnitude of targetShares",
-          { originalTargetShares: originalShares, newTargetShares: req.newTargetShares },
-        ),
-      );
-    }
-  }
-
-  if (refusals.length > 0) {
-    return riskFailure(...refusals);
-  }
-
-  // Narrowed by `resizableTargetShares` above; rebuilt rather than mutated.
-  const resizedIntent: Intent =
-    inherited.intent.type === "POSITION"
-      ? { ...inherited.intent, targetShares: req.newTargetShares }
-      : inherited.intent.type === "REDUCE_POSITION"
-        ? { ...inherited.intent, targetShares: req.newTargetShares }
-        : inherited.intent;
-
-  // The draft goes out through the emission boundary like every other record;
-  // the boundary is what freezes it, and — since round 4 — what re-reads it into
-  // the plain own data that is actually emitted. Nothing here is copied by
-  // spread from an unread value: `[...inherited.reasons]` would THROW on a
-  // hand-built record whose `reasons` is not iterable, and the emission boundary
-  // exists precisely so that a malformed inherited field becomes a typed refusal
-  // instead. Every inherited field is passed through as it was read and refused
-  // there if it is not what the contract says.
-  return sealApprovedIntentRecord(
-    {
-      approvedIntentId: req.approvedIntentId,
-      lineage: "RESIZED" as const,
-      supersedesApprovedIntentId: inherited.approvedIntentId,
-      rootApprovedIntentId: inherited.rootApprovedIntentId,
-      ...(inherited.sourceIntentId === undefined
-        ? {}
-        : { sourceIntentId: inherited.sourceIntentId }),
-      intent: resizedIntent,
-      approvedAt: req.resizedAt,
-      runMode: inherited.runMode,
-      strategyInstanceId: inherited.strategyInstanceId,
-      reasons: inherited.reasons,
-      worstCase: inherited.worstCase,
-      worstCaseBasis: "INHERITED_UPPER_BOUND" as const,
-      recommendations: inherited.recommendations,
-      resizeReason: req.reason,
-    },
   );
 }

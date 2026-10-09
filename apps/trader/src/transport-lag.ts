@@ -15,9 +15,11 @@
  *
  * It reads the subscription's own §8.3 metric set (`EventSubscription.metrics`,
  * `packages/event-bus`): the stream's publication total (the HEAD), this
- * consumer's lag behind it (delivered position), its uncheckpointed count
- * (committed position) and the retention bound. No new transport surface, no
- * checkpoint token parsed.
+ * consumer's lag behind it (delivered position) and its uncheckpointed count
+ * (committed position). No new transport surface, no checkpoint token parsed.
+ * (It also reported the retention bound until C1-RISK; that number was the
+ * trader's own inert setting, not the stream's, and the section's
+ * `retentionMaxEvents` is now always `null`.)
  *
  * - **Cadence: bounded, not per event.** One sample every `intervalMs`
  *   ({@link TRANSPORT_SAMPLE_INTERVAL_MS}, 1 s, by default), on an `unref`'d
@@ -78,7 +80,6 @@ interface Sample {
   readonly consumerPosition: number;
   readonly committedPosition: number;
   readonly entriesBehindHead: number;
-  readonly retentionMaxEvents: number;
 }
 
 /**
@@ -97,7 +98,6 @@ export function sampleFromMetrics(metrics: ConsumerMetrics, atMs: number): Sampl
     consumerPosition,
     committedPosition: Math.max(0, consumerPosition - metrics.uncheckpointedCount),
     entriesBehindHead: metrics.consumerLag,
-    retentionMaxEvents: metrics.queue.maximumDepth,
   };
 }
 
@@ -128,7 +128,10 @@ export function transportHealthOf(input: {
     consumerPosition: latest?.consumerPosition ?? null,
     committedPosition: latest?.committedPosition ?? null,
     entriesBehindHead: latest?.entriesBehindHead ?? null,
-    retentionMaxEvents: latest?.retentionMaxEvents ?? null,
+    // C1-RISK (OPS-07): the trader owns no retention bound, and the queue's
+    // `maximumDepth` is only the inert ceiling it connects with (`main.ts`).
+    // The stream's retention is the gateway's, which this process cannot read.
+    retentionMaxEvents: null,
     lastEventAt: input.lastEventAt,
     eventTimeLagMs: Number.isFinite(lastEventMs) ? Math.max(0, input.nowMs - lastEventMs) : null,
   });

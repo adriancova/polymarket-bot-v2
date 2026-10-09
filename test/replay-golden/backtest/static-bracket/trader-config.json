@@ -103,8 +103,7 @@
   "infrastructure": {
     "eventStream": "polymarket.normalized",
     "consumerId": "backtest1-replay",
-    "receiveBatchSize": 128,
-    "retentionMaxEvents": 100000
+    "receiveBatchSize": 128
   },
   "markets": [
     {

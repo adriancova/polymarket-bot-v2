@@ -2,9 +2,11 @@
  * `THROUGHPUT-1a` — the trader's INPUT STREAM lag through the control API: the
  * door requires the `transport` section (every measured field a union with
  * `null`, never an optional key), and the metrics surface renders it as
- * `trader_transport_lag_entries`, `trader_transport_retention_max_events`,
- * `trader_transport_sample_age_seconds` and `trader_event_time_lag_seconds` —
- * each OMITTED, not zeroed, while the trader has no measurement.
+ * `trader_transport_lag_entries`, `trader_transport_sample_age_seconds` and
+ * `trader_event_time_lag_seconds` — each OMITTED, not zeroed, while the trader
+ * has no measurement. C1-RISK (OPS-07) dropped
+ * `trader_transport_retention_max_events`: it was the trader's own inert
+ * setting, not the stream's bound, and the section now always carries `null`.
  */
 
 import { describe, expect, it } from "vitest";
@@ -77,11 +79,12 @@ describe("the door's transport section", () => {
 });
 
 describe("the metrics surface renders the input stream's lag", () => {
-  it("exports the lag in entries, the retention bound, the sample age and the event-time lag", async () => {
+  it("exports the lag in entries, the sample age and the event-time lag — and no retention series", async () => {
     const body = await metricsFor(healthDocument());
     expect(body).toContain("# TYPE trader_transport_lag_entries gauge");
     expect(body).toContain("\ntrader_transport_lag_entries 250\n");
-    expect(body).toContain("\ntrader_transport_retention_max_events 100000\n");
+    // C1-RISK: not rendered even when a document still carries a number.
+    expect(body).not.toContain("trader_transport_retention_max_events");
     expect(body).toContain("\ntrader_transport_sample_age_seconds 0.6\n");
     expect(body).toContain("# TYPE trader_event_time_lag_seconds gauge");
     expect(body).toContain("\ntrader_event_time_lag_seconds 1.5\n");

@@ -30,7 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
-import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
+import { EventBusUnavailableError, MAX_RETENTION_EVENTS, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 import { uniqueStreamName } from "@polymarket-bot/event-bus/testing";
 import { createDatabase, createPostgresPool, migrateUp, type PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
 import { createIsolatedDatabase } from "@polymarket-bot/storage-postgres/testing";
@@ -137,7 +137,6 @@ async function scenario(label: string, retentionMaxEvents: number): Promise<Scen
       ...(completed["infrastructure"] as Record<string, unknown>),
       eventStream: stream,
       consumerId: "trader-lag",
-      retentionMaxEvents,
     },
   };
   const parsed = parseTraderConfig(document);
@@ -158,9 +157,12 @@ async function scenario(label: string, retentionMaxEvents: number): Promise<Scen
     connection: { url: redisUrl },
     retention: { maxEvents: retentionMaxEvents },
   });
+  // C1-RISK (OPS-07): the trader connects as a consumer, with the event bus's
+  // own inert ceiling, exactly as `main.ts` does. The stream's retention is
+  // the PUBLISHER's (`retentionMaxEvents` above, the gateway's role).
   const transportForTrader = await RedisStreamsEventTransport.connect({
     connection: { url: redisUrl },
-    retention: { maxEvents: config.infrastructure.retentionMaxEvents },
+    retention: { maxEvents: MAX_RETENTION_EVENTS },
   });
   const assembled = await assembleDurableTrader({
     env: benchEnvironment(isolated.connectionString),
@@ -244,7 +246,8 @@ describe("the input stream's lag on the health surface", () => {
       expect(caughtUp.headPosition).toBe(201);
       expect(caughtUp.consumerPosition).toBe(201);
       expect(caughtUp.committedPosition).toBe(201);
-      expect(caughtUp.retentionMaxEvents).toBe(100_000);
+      // C1-RISK (OPS-07): the trader owns no retention bound and reports none.
+      expect(caughtUp.retentionMaxEvents).toBeNull();
 
       // 2. Paused: the stream grows by 500 and the trader reads nothing.
       await run.publish(201, 701);
@@ -294,9 +297,10 @@ describe("the input stream's lag on the health surface", () => {
       expect(await run.pumpUntil(21)).toBe("COMPLETE");
       await run.publish(21, 221);
       const behind = await nextSample(run);
-      // The lag the operator now sees, past the retention bound it is measured against.
+      // The lag the operator now sees, past the stream's retention bound (the
+      // publisher's 50). C1-RISK: the trader reports no bound of its own.
       expect(behind.entriesBehindHead).toBe(200);
-      expect(behind.retentionMaxEvents).toBe(50);
+      expect(behind.retentionMaxEvents).toBeNull();
 
       const count = async (table: "strategy.decisions" | "strategy.state_checkpoints"): Promise<number> => {
         const row = await run.db

@@ -21,31 +21,6 @@ export function uuidShapedNotCanonical(value: string): boolean {
 }
 
 /**
- * The OWN entry of a keyed table, or `undefined` — never an INHERITED one.
- *
- * THE SWEEP HALF OF ROUND 5'S FIRST BLOCKER. That BLOCKER was about writing a
- * caller-supplied key with `[]=`, which consults inherited setters; the mirror
- * defect is READING a caller-supplied key with `[]`, which consults inherited
- * values. `table[key]` for `key === "__proto__"` answers `Object.prototype` —
- * an object, not `undefined` — and every "is this scope measured?" test in this
- * package is written as `entry === undefined`. A scope key of `"__proto__"`
- * would therefore have LOOKED MEASURED while carrying no numbers at all,
- * bypassing `RISK_EXPOSURE_ENTRY_MISSING` (review round 1, BLOCKER 2 — a fix
- * this round may not weaken) and then feeding `undefined` to decimal
- * arithmetic. Scope keys are bounded non-empty strings, not UUIDs, so
- * `"__proto__"` is admissible input rather than a hypothetical.
- *
- * `Object.hasOwn` first, so absence stays absence.
- */
-export function ownEntry<T>(
-  table: Readonly<Record<string, T>> | undefined,
-  key: string,
-): T | undefined {
-  if (table === undefined) return undefined;
-  return Object.hasOwn(table, key) ? table[key] : undefined;
-}
-
-/**
  * One OWN property of `container`, with an explicit PRESENCE flag.
  *
  * Never inherited, and never an accessor invocation: the value comes from the

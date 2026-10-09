@@ -233,14 +233,12 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     "trader_transport_lag_entries",
     "gauge",
     "queues",
-    "Events published to the trader's input stream and not yet delivered to it: the stream head minus this consumer's position, at the trader's latest transport sample. At trader_transport_retention_max_events, retention starts removing unread events and the trader halts TRANSPORT_RESYNC_REQUIRED (ADR-003 §3.3). Omitted (not zero) before the first sample.",
+    "Events published to the trader's input stream and not yet delivered to it: the stream head minus this consumer's position, at the trader's latest transport sample. At the stream's retention bound (the data gateway's GATEWAY_RETENTION_EVENTS), retention starts removing unread events and the trader halts TRANSPORT_RESYNC_REQUIRED (ADR-003 §3.3). Omitted (not zero) before the first sample.",
   ),
-  family(
-    "trader_transport_retention_max_events",
-    "gauge",
-    "queues",
-    "The input stream's retention bound, in events: the ceiling trader_transport_lag_entries must stay under. Omitted before the first sample.",
-  ),
+  // `trader_transport_retention_max_events` was dropped by C1-RISK (OPS-07,
+  // 2026-10-08): it reported the trader's own retention setting, which trimmed
+  // nothing (the trader only consumes) and could differ from the stream's real
+  // bound, the data gateway's.
   family(
     "trader_transport_sample_age_seconds",
     "gauge",

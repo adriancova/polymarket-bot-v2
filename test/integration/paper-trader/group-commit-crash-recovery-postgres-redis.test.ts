@@ -205,7 +205,6 @@ async function scenario(label: string): Promise<Scenario> {
       ...(completed["infrastructure"] as Record<string, unknown>),
       eventStream: stream,
       consumerId: "trader-gc",
-      retentionMaxEvents: 100_000,
     },
   };
   const marketId = ((document["markets"] as Record<string, unknown>[])[0] ?? {})["marketId"] as string;

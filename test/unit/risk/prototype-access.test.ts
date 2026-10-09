@@ -67,10 +67,6 @@ const OWN_PRIMITIVE =
 const OWN_LITERAL =
   "a conditional spread of an object literal built in this expression (`{}` or a one-field literal); no caller-derived object is read";
 
-/** A spread that copies own enumerable properties of a value we materialized. */
-const OWN_COPY_OF_MATERIALIZED =
-  "an own-only copy of a value this package MATERIALIZED (`readPlainData` / `readRecordData`), whose objects carry no prototype at all since review round 6";
-
 /** A spread of a package-built table whose reads are all own-property reads. */
 const OWN_COPY_OF_OUR_TABLE =
   "an own-only copy of a table this package built; every read of the result goes through `ownEntry` and every write through `setOwn`, so the copy's `Object.prototype` is not reachable by any lookup";
@@ -94,10 +90,6 @@ const OWN_ENUMERATION_PRIMITIVE =
 /** `Object.entries` over a table this package built itself. */
 const ENTRIES_OF_OUR_TABLE =
   "`Object.entries` is own-only but INVOKES every own getter, so it may run only on a value this package built. This table is constructed in this module from validated data, with `setOwn`, and never holds an accessor";
-
-/** `Object.entries` over a value a door already materialized. */
-const ENTRIES_OF_MATERIALIZED =
-  "`Object.entries` is own-only but INVOKES every own getter, so it may run only on a value this package materialized. This one is a validated policy's own limits object, which came out of `readPlainData` as prototype-free own data with no accessor anywhere in it";
 
 /** `Object.create(null)` / `Object.setPrototypeOf(x, null)` — the chain REMOVED. */
 const PROTOTYPE_REMOVED =
@@ -135,14 +127,6 @@ interface Registration {
 
 const REGISTERED: readonly Registration[] = [
   // --- the own-property primitives ------------------------------------------
-  {
-    file: "packages/risk/src/guards.ts",
-    enclosing: "ownEntry",
-    kind: "element-read",
-    text: "table[key]",
-    count: 1,
-    reason: OWN_PRIMITIVE,
-  },
   {
     file: "packages/risk/src/guards.ts",
     enclosing: "ownFlag",
@@ -348,14 +332,6 @@ const REGISTERED: readonly Registration[] = [
 
   // --- `Object.entries`, which INVOKES own getters (review round 7) ---------
   {
-    file: "packages/risk/src/exposure-limits.ts",
-    enclosing: "checkExposureLimits",
-    kind: "object-entries",
-    text: "Object.entries(limits)",
-    count: 1,
-    reason: ENTRIES_OF_MATERIALIZED,
-  },
-  {
     file: "packages/capital-allocator/src/exposure.ts",
     enclosing: "finalize",
     kind: "object-entries",
@@ -383,22 +359,6 @@ const REGISTERED: readonly Registration[] = [
   },
 
   // --- risk -----------------------------------------------------------------
-  {
-    file: "packages/risk/src/approved-intent.ts",
-    enclosing: "resizeApprovedIntentInner",
-    kind: "object-spread",
-    text: "...inherited.intent",
-    count: 2,
-    reason: OWN_COPY_OF_MATERIALIZED,
-  },
-  {
-    file: "packages/risk/src/approved-intent.ts",
-    enclosing: "resizeApprovedIntentInner",
-    kind: "object-spread",
-    text: "...(inherited.sourceIntentId === undefined ? {} : { sourceIntentId: inherited.sourceIntentId })",
-    count: 1,
-    reason: OWN_LITERAL,
-  },
   {
     file: "packages/risk/src/engine.ts",
     enclosing: "evaluateIntentInner",
@@ -501,15 +461,6 @@ const REGISTERED: readonly Registration[] = [
     count: 1,
     reason: FIXTURE_OVERRIDES,
   })),
-  {
-    file: "test/unit/risk/fixtures.ts",
-    enclosing: "zeroFilled",
-    kind: "object-spread",
-    text: "...table",
-    count: 1,
-    reason:
-      "the round-5 fix in the fixture: an own-only copy, then `Object.hasOwn` + `defineProperty` for every measured key, so a coverage key of `\"constructor\"` cannot read as already present",
-  },
 ];
 
 /**
@@ -555,11 +506,12 @@ describe("THE MECHANISM: every prototype-consulting construct is classified", ()
     expect(files.some((file) => file.endsWith("/risk/src/plain-data.ts"))).toBe(true);
     expect(files.some((file) => file.endsWith("/capital-allocator/src/reserve.ts"))).toBe(true);
     expect(files.some((file) => file.endsWith("/test/unit/risk/fixtures.ts"))).toBe(true);
-    // The own-property primitive is a site, in both copies. If the census
-    // stopped seeing element accesses at all, this is what would say so.
+    // The own-property primitive is a site (in the allocator's copy only since
+    // C1-RISK deleted the risk copy with its last caller, `exposure-limits.ts`).
+    // If the census stopped seeing element accesses at all, this would say so.
     expect(
       census.filter((site) => site.enclosing === "ownEntry" && site.kind === "element-read"),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(census.length).toBeGreaterThan(50);
   });
 
@@ -655,7 +607,6 @@ const ARENA_PARSERS: readonly { readonly file: string; readonly receiver: string
   { file: "packages/risk/src/inputs.ts", receiver: "RiskEvaluationInputParser" },
   { file: "packages/risk/src/policy.ts", receiver: "RiskPolicyParser" },
   { file: "packages/risk/src/approved-intent.ts", receiver: "ApprovedIntentRecordParser" },
-  { file: "packages/risk/src/approved-intent.ts", receiver: "ResizeRequestParser" },
   { file: "packages/capital-allocator/src/state.ts", receiver: "AllocatorStateInputParser" },
   { file: "packages/capital-allocator/src/reserve.ts", receiver: "ReservationRequestParser" },
   { file: "packages/capital-allocator/src/caps.ts", receiver: "AllocatorCapsShapeParser" },

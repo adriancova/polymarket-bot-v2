@@ -152,7 +152,6 @@ export {
   allocationMarketOf,
   intentLegs,
   requestFor,
-  type AllocationCoverage,
   type AllocationMarket,
   type AllocationOutcome,
   type AllocationVerdict,

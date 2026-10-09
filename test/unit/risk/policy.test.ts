@@ -48,8 +48,28 @@ describe("parseRiskPolicy", () => {
     // No invented economic caps.
     expect(parsed.value.economics.minOrderNotional).toBeUndefined();
     expect(parsed.value.participation.maxOrderShares).toBeUndefined();
-    expect(parsed.value.limits.globalExposureCap).toBeUndefined();
     expect(parsed.value.limits.maxOrderNotional).toBeUndefined();
+  });
+
+  it("C1-RISK: REFUSES each of the six retired *ExposureCap fields — the capital allocator owns those caps", () => {
+    // `limits` is strict, so an old configuration fails loudly at startup
+    // rather than silently losing a cap (the user's ruling, 2026-10-08).
+    for (const name of [
+      "globalExposureCap",
+      "perInstanceExposureCap",
+      "perMarketExposureCap",
+      "perSeriesExposureCap",
+      "perUnderlyingExposureCap",
+      "perResolutionWindowExposureCap",
+    ]) {
+      const parsed = parseRiskPolicy({ ...minimal, limits: { ...minimal.limits, [name]: "100" } });
+      expect(parsed.ok, name).toBe(false);
+      if (parsed.ok) continue;
+      expect(parsed.refusals.map((refusal) => refusal.code)).toEqual(["RISK_INPUT_INVALID"]);
+      expect(JSON.stringify(parsed.refusals[0]?.details), name).toContain(`Unrecognized key: \\"${name}\\"`);
+    }
+    // The fields that remain are accepted.
+    expect(parseRiskPolicy({ ...minimal, limits: { ...minimal.limits, maxOrderNotional: "25" } }).ok).toBe(true);
   });
 
   it("requires ALL FOUR shock kinds by default (§9.8 primary measures)", () => {

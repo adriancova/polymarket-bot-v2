@@ -31,7 +31,7 @@
  * | Book | Owner | Answers | Consumed by |
  * | --- | --- | --- | --- |
  * | `ReservationBook` (`reservations.ts`) | this app | "how many SHARES and how much pUSD may the next PLAN still use" | `packages/execution-planner` (`WP-220` obligation 9) |
- * | the allocator's applied reservations (here) | `packages/capital-allocator` | "how much of every §9.7 CAP is already committed" | `packages/risk` §9.8 checks 14 and 15 |
+ * | the allocator's applied reservations (here) | `packages/capital-allocator` | "how much of every §9.7 CAP is already committed" | `packages/risk` §9.8 check 14 (the only exposure-cap authority since C1-RISK) |
  *
  * They are not the same book and neither can stand in for the other: the first
  * is per-`(market, side)` inventory for a planner that plans one market, the
@@ -58,7 +58,7 @@
  *
  * THE INVARIANT, held at ONE choke point ({@link AllocatorGate}'s
  * `#buildState`, which builds the account for every `evaluate` — the §9.8
- * check-14 verdict AND the check-15 snapshot — and every `applyForPlan`): the
+ * check-14 verdict — and every `applyForPlan`): the
  * capital the cap check counts for a strategy is at least the exact sum of its
  * open reservations plus its booked and unbooked filled exposure.
  *
@@ -171,16 +171,12 @@ import {
   subDecimal,
 } from "@polymarket-bot/decimal";
 import {
-  EXPOSURE_ZERO,
   applyReservation,
   createAllocatorState,
-  evaluateReservation,
-  exposureSnapshotCovering,
-  shadowExposureSnapshot,
+  exposureSnapshot,
   type AllocatorCaps,
   type AllocatorState,
   type CapitalRefusal,
-  type ExposureEntry,
   type ExposureSnapshot,
   type ReservationRequest,
 } from "@polymarket-bot/capital-allocator";
@@ -207,8 +203,6 @@ export interface AllocationOutcome {
    * the entry, which is the fail-closed direction.
    */
   readonly verdict: AllocationVerdict | undefined;
-  /** The §9.8 check-15 snapshot, covering every scope this evaluation queries. */
-  readonly exposures: ExposureSnapshot;
   /** The requests the verdict was computed over, in leg order. */
   readonly requests: readonly ReservationRequest[];
 }
@@ -574,15 +568,6 @@ export interface AllocationMarket {
   readonly resolutionWindowKey: string;
 }
 
-/** The scope keys one evaluation will query. */
-export interface AllocationCoverage {
-  readonly strategyInstanceIds: readonly string[];
-  readonly marketIds: readonly string[];
-  readonly seriesKeys: readonly string[];
-  readonly underlyingKeys: readonly string[];
-  readonly resolutionWindowKeys: readonly string[];
-}
-
 /** One BUY or SELL leg of an intent, bounded by the intent's own price. */
 export interface IntentLeg {
   readonly marketId: string;
@@ -929,9 +914,17 @@ export class AllocatorGate {
   /**
    * §8.1's "allocate capital", for one intent.
    *
-   * Answers the allocator's OWN verdict and the exposure snapshot §9.8 check 15
-   * queries. It changes nothing: `evaluateReservation` is the question, and
-   * {@link applyForPlan} is the commitment.
+   * Answers the allocator's OWN verdict. It changes nothing: the legs are
+   * judged on a scratch state, and {@link applyForPlan} is the commitment.
+   *
+   * C1-RISK (the user's ruling, 2026-10-08): the capital allocator is the only
+   * exposure-cap authority, so a multi-leg intent is judged on the SUM of its
+   * legs, exactly as {@link applyForPlan} will apply them: each leg is judged
+   * against the state with the earlier admitted legs applied. Judging every leg
+   * against the same base state let a basket whose legs each fit, and whose
+   * sum did not, reach the plan as an approved intent. A refused leg is not
+   * applied, and the later legs are still judged, so the verdict names every
+   * refusal.
    */
   evaluate(input: {
     readonly intent: Intent;
@@ -971,32 +964,46 @@ export class AllocatorGate {
   }): AllocationOutcome {
     const built = this.#buildState(input.liveOwners, input.projection, input.availableCollateral, input.viewOf);
     const requests = this.#requestsFor(input);
-    const coverage = this.#coverageFor(input.instanceId, requests);
 
     if (!built.ok) {
       // The state itself could not be built. A cap cannot be shown to hold
       // against an account this process cannot describe, so the answer is a
       // REFUSAL carrying the allocator's own codes — never an absent verdict,
-      // which check 14 would read as "the allocator was not asked", and never
-      // an absent exposure snapshot, which check 15 would read the same way.
-      return {
-        verdict: this.#record(false, built.refusals),
-        exposures: covering(EMPTY_SNAPSHOT, coverage),
-        requests,
-      };
+      // which check 14 would read as "the allocator was not asked".
+      return { verdict: this.#record(false, built.refusals), requests };
     }
-    const exposures =
-      input.accountingMode === "LIVE"
-        ? exposureSnapshotCovering(built.state, coverage)
-        : covering(shadowExposureSnapshot(built.state, input.instanceId), coverage);
-    if (requests.length === 0) return { verdict: undefined, exposures, requests };
+    if (requests.length === 0) return { verdict: undefined, requests };
 
     const refusals: CapitalRefusal[] = [];
+    let scratch = built.state;
     for (const request of requests) {
-      const verdict = evaluateReservation(built.state, this.#caps, request);
-      if (!verdict.permitted) refusals.push(...verdict.refusals);
+      const applied = applyReservation(scratch, this.#caps, request);
+      if (applied.ok) scratch = applied.value.state;
+      else refusals.push(...applied.refusals);
     }
-    return { verdict: this.#record(refusals.length === 0, refusals), exposures, requests };
+    return { verdict: this.#record(refusals.length === 0, refusals), requests };
+  }
+
+  /**
+   * The allocator's exposure snapshot of the account {@link evaluate} and
+   * {@link applyForPlan} judge — sparse: a scope with no commitment has no row
+   * — or `undefined` when that account cannot be built. It changes nothing,
+   * and no decision reads it: the suites use it to pin what the cap check
+   * counts (`CAP-1`). Until C1-RISK a padded copy rode on every `evaluate`
+   * answer for §9.8 check 15's scope caps, which the allocator alone enforces
+   * now.
+   */
+  countedExposure(input: {
+    readonly liveOwners: readonly {
+      readonly marketId: string;
+      readonly strategyInstanceId: string;
+    }[];
+    readonly projection: LedgerProjection;
+    readonly availableCollateral: string;
+    readonly viewOf: OrderViewOf;
+  }): ExposureSnapshot | undefined {
+    const built = this.#buildState(input.liveOwners, input.projection, input.availableCollateral, input.viewOf);
+    return built.ok ? exposureSnapshot(built.state) : undefined;
   }
 
   /**
@@ -1113,7 +1120,7 @@ export class AllocatorGate {
    * carrying every commitment this process still holds.
    *
    * THE CHOKE POINT (`CAP-1`). Every question the cap check is asked —
-   * `evaluate` (the §9.8 check-14 verdict and the check-15 snapshot) and
+   * `evaluate` (the §9.8 check-14 verdict) and
    * `applyForPlan` — is answered from the account built HERE, and only here:
    * the booked positions at their FIFO cost basis, plus what each commitment
    * adds now (`commitmentRequests`). So at every evaluation the capital
@@ -1229,26 +1236,6 @@ export class AllocatorGate {
         }),
       ),
     );
-  }
-
-  /** Every scope this evaluation will query, so the snapshot ANSWERS for it. */
-  #coverageFor(
-    instanceId: string,
-    requests: readonly ReservationRequest[],
-  ): AllocationCoverage {
-    const marketIds = [...new Set(requests.map((request) => request.marketId))].sort();
-    const scopes = marketIds
-      .map((marketId) => this.#markets.get(marketId))
-      .filter((market): market is AllocationMarket => market !== undefined);
-    return {
-      strategyInstanceIds: [instanceId],
-      marketIds,
-      seriesKeys: [...new Set(scopes.map((market) => market.seriesKey))].sort(),
-      underlyingKeys: [...new Set(scopes.map((market) => market.underlyingKey))].sort(),
-      resolutionWindowKeys: [
-        ...new Set(scopes.map((market) => market.resolutionWindowKey)),
-      ].sort(),
-    };
   }
 }
 
@@ -1371,50 +1358,4 @@ export function allocationMarketOf(market: MarketConfig): AllocationMarket {
 
 function absolute(value: string): string {
   return compareDecimal(value, "0") < 0 ? subDecimal("0", value) : value;
-}
-
-/** An account with nothing in it — used only when the state could not be built. */
-const EMPTY_SNAPSHOT: ExposureSnapshot = Object.freeze({
-  global: EXPOSURE_ZERO,
-  byStrategyInstance: Object.freeze({}),
-  byMarket: Object.freeze({}),
-  bySeries: Object.freeze({}),
-  byUnderlying: Object.freeze({}),
-  byResolutionWindow: Object.freeze({}),
-});
-
-/**
- * {@link exposureSnapshotCovering} for a snapshot the package does not build a
- * covering form of.
- *
- * `packages/capital-allocator` publishes the covering builder for the LIVE
- * snapshot only, and an uncovered snapshot is exactly what
- * `RISK_EXPOSURE_ENTRY_MISSING` refuses. The zeros this adds are honest for the
- * same reason the package's are: a shadow book is that instance's COMPLETE
- * record of its own commitments, so a scope it does not mention holds nothing.
- * The entry written is the package's own {@link EXPOSURE_ZERO}.
- *
- * On the refused-state path it covers the EMPTY snapshot, which is honest in a
- * different way: the verdict travelling with it is a refusal, so nothing is
- * approved against those zeros.
- */
-function covering(snapshot: ExposureSnapshot, coverage: AllocationCoverage): ExposureSnapshot {
-  const fill = (
-    table: Readonly<Record<string, ExposureEntry>>,
-    keys: readonly string[],
-  ): Readonly<Record<string, ExposureEntry>> => {
-    const out: Record<string, ExposureEntry> = { ...table };
-    for (const key of keys) {
-      if (!Object.hasOwn(out, key)) out[key] = EXPOSURE_ZERO;
-    }
-    return Object.freeze(out);
-  };
-  return Object.freeze({
-    global: snapshot.global,
-    byStrategyInstance: fill(snapshot.byStrategyInstance, coverage.strategyInstanceIds),
-    byMarket: fill(snapshot.byMarket, coverage.marketIds),
-    bySeries: fill(snapshot.bySeries, coverage.seriesKeys),
-    byUnderlying: fill(snapshot.byUnderlying, coverage.underlyingKeys),
-    byResolutionWindow: fill(snapshot.byResolutionWindow, coverage.resolutionWindowKeys),
-  });
 }

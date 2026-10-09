@@ -36,10 +36,8 @@ import { describe, expect, it } from "vitest";
 import { AllocatorCapsSchema } from "../../../packages/capital-allocator/src/caps.js";
 import { ReservationRequestSchema } from "../../../packages/capital-allocator/src/reserve.js";
 import { AllocatorStateInputSchema } from "../../../packages/capital-allocator/src/state.js";
-import {
-  ApprovedIntentRecordSchema,
-  ResizeRequestSchema,
-} from "../../../packages/risk/src/approved-intent.js";
+import { ApprovedIntentRecordSchema } from "../../../packages/risk/src/approved-intent.js";
+import { PnlSnapshotInputSchema } from "../../../packages/pnl/src/snapshot.js";
 import { RiskEvaluationInputSchema } from "../../../packages/risk/src/inputs.js";
 import { readPlainData } from "../../../packages/risk/src/plain-data.js";
 import { RiskPolicySchema } from "../../../packages/risk/src/policy.js";
@@ -175,13 +173,6 @@ const POLICY_VALUE = {
   timeToClose: { entryCutoffSeconds: 60 },
 };
 
-const RESIZE_VALUE = {
-  approvedIntentId: "approved-2",
-  resizedAt: "2026-09-02T12:00:00.000Z",
-  newTargetShares: "50",
-  reason: "risk resize",
-};
-
 /**
  * One door schema with the values the differential test parses through it.
  *
@@ -232,18 +223,6 @@ const CORPUS: readonly {
       { ...POLICY_VALUE, maxRunMode: "NOT_A_MODE" },
       { ...POLICY_VALUE, scenario: { maxScenarioLoss: "-1" } },
       { ...POLICY_VALUE, unexpected: true },
-      {},
-    ],
-  },
-  {
-    name: "ResizeRequestSchema",
-    schema: ResizeRequestSchema as unknown as Parseable,
-    copy: prototypeFreeParser(ResizeRequestSchema) as unknown as Parseable,
-    values: [
-      RESIZE_VALUE,
-      { ...RESIZE_VALUE, newTargetShares: "abc" },
-      { ...RESIZE_VALUE, resizedAt: "yesterday" },
-      { ...RESIZE_VALUE, extra: 1 },
       {},
     ],
   },
@@ -423,10 +402,14 @@ describe("the arena's walk is closed, and fails the build rather than parsing un
     RiskEvaluationInputSchema,
     RiskPolicySchema,
     ApprovedIntentRecordSchema,
-    ResizeRequestSchema,
     AllocatorStateInputSchema,
     ReservationRequestSchema,
     AllocatorCapsSchema,
+    // C1-RISK deleted the risk input's exposure snapshot, the last `record`
+    // node in a risk or allocator door. `packages/pnl`'s snapshot door still
+    // parses one through this arena, so it is listed here to keep the type's
+    // presence MEASURED rather than forward-declared.
+    PnlSnapshotInputSchema,
   ];
 
   it("ARENA_NODE_TYPES covers every type the door schemas contain", () => {
@@ -452,7 +435,7 @@ describe("the arena's walk is closed, and fails the build rather than parsing un
     // `.transform()` is the shape round 7 pinned as value-producing and round 8
     // cannot protect: it is a `pipe` of a `transform`, neither of which the
     // arena knows how to copy.
-    const transformed = ResizeRequestSchema.transform((value) => value);
+    const transformed = ApprovedIntentRecordSchema.transform((value) => value);
     expect(() => prototypeFreeParser(transformed)).toThrowError(
       new RegExp(`${SCHEMA_ARENA_ERROR}.*(pipe|transform)`, "u"),
     );

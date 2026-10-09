@@ -8,10 +8,7 @@
     },
     "limits": {
       "maxWorstCaseContractualLoss": "100",
-      "maxOrderNotional": "25",
-      "globalExposureCap": "500",
-      "perInstanceExposureCap": "100",
-      "perMarketExposureCap": "100"
+      "maxOrderNotional": "25"
     },
     "scenario": { "maxScenarioLoss": "100" },
     "economics": { "minOrderNotional": "1" },
@@ -75,8 +72,7 @@
   "infrastructure": {
     "eventStream": "polymarket.normalized",
     "consumerId": "trader-local-1",
-    "receiveBatchSize": 128,
-    "retentionMaxEvents": 100000
+    "receiveBatchSize": 128
   },
   "markets": [
     {

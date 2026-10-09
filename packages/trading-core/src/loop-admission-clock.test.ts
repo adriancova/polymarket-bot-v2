@@ -242,7 +242,6 @@ function traderConfig(options: Options): Record<string, unknown> {
       eventStream: "polymarket.normalized",
       consumerId: "co2-n1-admission",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

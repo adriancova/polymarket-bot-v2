@@ -10,22 +10,26 @@
  *
  * Each block states its probe in the test name so a reviewer can match the
  * criterion to the assertion without reading the body.
+ *
+ * C1-RISK (COMPLEXITY-1, 2026-10-08), the user's rulings:
+ * - criterion 1's EXPOSURE half is the capital allocator's now (the only
+ *   exposure-cap authority). Its probes moved with the caps: the allocator
+ *   counts open orders, positions, reservations and unbooked fills
+ *   (`packages/trading-core/src/loop-capital.test.ts`, `allocation.test.ts`).
+ *   The worst-case half (probes C and D) stays here.
+ * - criterion 4 holds VACUOUSLY: the resize path had no caller and was deleted
+ *   (the execution planner refuses rather than downsizes). What remains to pin
+ *   is the other half of §7.7's rule: a record is never edited in place.
  */
 
 import { describe, expect, it } from "vitest";
 
-import {
-  evaluateIntent,
-  isPrimaryRiskReasonCode,
-  resizeApprovedIntent,
-} from "../../../packages/risk/src/index.js";
+import { evaluateIntent, isPrimaryRiskReasonCode } from "../../../packages/risk/src/index.js";
 import {
   MARKET_A,
   codesOf,
   entryInput,
   exitInput,
-  exposureEntry,
-  exposureSnapshot,
   freshObservations,
   openOrder,
   position,
@@ -33,57 +37,6 @@ import {
 } from "./fixtures.js";
 
 describe("acceptance 1 — open orders and positions BOTH consume limits", () => {
-  const policy = riskPolicy({
-    limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "100" },
-  });
-
-  it("PROBE A (exposure): a limit fully consumed by OPEN ORDERS blocks a new intent with ZERO positions", () => {
-    const input = entryInput();
-    input.portfolio.positions = [];
-    input.exposures = exposureSnapshot({
-      byMarket: { [MARKET_A]: exposureEntry("100", "0") },
-    });
-
-    const result = evaluateIntent(policy, input);
-
-    expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_MARKET_EXPOSURE_EXCEEDED");
-  });
-
-  it("PROBE B (exposure): a limit fully consumed by POSITIONS blocks a new intent with ZERO open orders", () => {
-    const input = entryInput();
-    input.portfolio.openOrders = [];
-    input.exposures = exposureSnapshot({
-      byMarket: { [MARKET_A]: exposureEntry("0", "100") },
-    });
-
-    const result = evaluateIntent(policy, input);
-
-    expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_MARKET_EXPOSURE_EXCEEDED");
-  });
-
-  it("permits the same intent when neither component consumes the limit", () => {
-    const input = entryInput();
-    input.exposures = exposureSnapshot({ byMarket: { [MARKET_A]: exposureEntry("0", "0") } });
-
-    expect(evaluateIntent(policy, input).approved).toBe(true);
-  });
-
-  it("recomputes each entry from its two components and ignores a peer-supplied 'combined'", () => {
-    const input = entryInput();
-    input.exposures = exposureSnapshot({
-      // A snapshot whose derived field has drifted from its parts: the check
-      // must read the parts, or a stale/incorrect `combined` would pass it.
-      byMarket: { [MARKET_A]: { ...exposureEntry("60", "40"), combined: "0" } },
-    });
-
-    const result = evaluateIntent(policy, input);
-
-    expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_MARKET_EXPOSURE_EXCEEDED");
-  });
-
   const worstCasePolicy = riskPolicy({
     limits: { maxWorstCaseContractualLoss: "60" },
   });
@@ -308,43 +261,14 @@ describe("acceptance 3 — stale data blocks entries", () => {
   });
 });
 
-describe("acceptance 4 — a risk resize creates a NEW approved-intent record", () => {
+describe("acceptance 4 — no record is edited in place (the resize path was deleted by C1-RISK)", () => {
   function approvedRecord() {
     const result = evaluateIntent(riskPolicy(), entryInput());
     if (!result.approved) throw new Error(JSON.stringify(result.refusals));
     return result.record;
   }
 
-  it("PROBE: the resize returns a NEW record and never mutates the original", () => {
-    const original = approvedRecord();
-    const before = JSON.parse(JSON.stringify(original)) as unknown;
-
-    const resized = resizeApprovedIntent(original, {
-      approvedIntentId: "approved-2",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "50",
-      reason: "worst-case headroom",
-    });
-
-    expect(resized.ok).toBe(true);
-    if (!resized.ok) return;
-
-    // A NEW record …
-    expect(resized.value).not.toBe(original);
-    expect(resized.value.approvedIntentId).toBe("approved-2");
-    expect(resized.value.lineage).toBe("RESIZED");
-    // … LINKED to the original (§7.7) …
-    expect(resized.value.supersedesApprovedIntentId).toBe("approved-1");
-    expect(resized.value.rootApprovedIntentId).toBe("approved-1");
-    expect(resized.value.sourceIntentId).toBe("intent-1");
-    // … carrying the resized intent …
-    expect(resized.value.intent).toMatchObject({ targetShares: "50" });
-    // … while the ORIGINAL is untouched, field for field.
-    expect(original.intent).toMatchObject({ targetShares: "100" });
-    expect(JSON.parse(JSON.stringify(original))).toEqual(before);
-  });
-
-  it("the original record is deeply frozen, so an in-place edit THROWS", () => {
+  it("the record is deeply frozen, so an in-place edit THROWS", () => {
     const original = approvedRecord();
     expect(Object.isFrozen(original)).toBe(true);
     expect(() => {
@@ -353,105 +277,12 @@ describe("acceptance 4 — a risk resize creates a NEW approved-intent record", 
     expect(original.intent).toMatchObject({ targetShares: "100" });
   });
 
-  it("reusing an id in the lineage is refused — that would edit, not create", () => {
+  it("every record emitted is an ORIGINAL with an EVALUATED worst case", () => {
     const original = approvedRecord();
-    const resized = resizeApprovedIntent(original, {
-      approvedIntentId: "approved-1",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "50",
-      reason: "worst-case headroom",
-    });
-    expect(resized.ok).toBe(false);
-    if (resized.ok) return;
-    expect(resized.refusals.map((r) => r.code)).toContain("RISK_RESIZE_ID_REUSED");
-  });
-
-  it("a chain of resizes keeps naming the ROOT record", () => {
-    const original = approvedRecord();
-    const first = resizeApprovedIntent(original, {
-      approvedIntentId: "approved-2",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "50",
-      reason: "step one",
-    });
-    expect(first.ok).toBe(true);
-    if (!first.ok) return;
-    const second = resizeApprovedIntent(first.value, {
-      approvedIntentId: "approved-3",
-      resizedAt: "2026-09-02T12:00:02.000Z",
-      newTargetShares: "25",
-      reason: "step two",
-    });
-    expect(second.ok).toBe(true);
-    if (!second.ok) return;
-    expect(second.value.supersedesApprovedIntentId).toBe("approved-2");
-    expect(second.value.rootApprovedIntentId).toBe("approved-1");
-    expect(first.value.intent).toMatchObject({ targetShares: "50" });
-  });
-
-  it("a resize may only REDUCE: growing or flipping the intent is refused", () => {
-    const original = approvedRecord();
-    const grown = resizeApprovedIntent(original, {
-      approvedIntentId: "approved-2",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "200",
-      reason: "grow",
-    });
-    expect(grown.ok).toBe(false);
-    if (grown.ok) return;
-    expect(grown.refusals.map((r) => r.code)).toContain("RISK_RESIZE_NOT_A_REDUCTION");
-
-    const flipped = resizeApprovedIntent(original, {
-      approvedIntentId: "approved-3",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "-50",
-      reason: "flip",
-    });
-    expect(flipped.ok).toBe(false);
-    if (flipped.ok) return;
-    expect(flipped.refusals.map((r) => r.code)).toContain("RISK_RESIZE_INCOHERENT");
-  });
-
-  it("the resized record states that its worst case is INHERITED, not re-evaluated", () => {
-    const original = approvedRecord();
+    expect(original.lineage).toBe("ORIGINAL");
     expect(original.worstCaseBasis).toBe("EVALUATED");
-    const resized = resizeApprovedIntent(original, {
-      approvedIntentId: "approved-2",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "50",
-      reason: "shrink",
-    });
-    expect(resized.ok).toBe(true);
-    if (!resized.ok) return;
-    expect(resized.value.worstCaseBasis).toBe("INHERITED_UPPER_BOUND");
-    // The inherited bound is a genuine UPPER bound: re-evaluating the smaller
-    // intent produces a strictly smaller measure.
-    const input = entryInput();
-    input.intent = { ...input.intent, targetShares: "50" };
-    input.identifiers.approvedIntentId = "approved-2";
-    const reevaluated = evaluateIntent(riskPolicy(), input);
-    expect(reevaluated.approved).toBe(true);
-    if (!reevaluated.approved) return;
-    expect(reevaluated.record.worstCaseBasis).toBe("EVALUATED");
-    expect(reevaluated.record.worstCase.maximumContractualLoss).toBe("25");
-    expect(original.worstCase.maximumContractualLoss).toBe("50");
-  });
-
-  it("a QUOTE or BASKET is not resizable here — fail closed rather than guess a ladder", () => {
-    const original = approvedRecord();
-    const notResizable = {
-      ...original,
-      intent: { type: "CANCEL", marketId: MARKET_A, reason: "x" },
-    } as typeof original;
-    const resized = resizeApprovedIntent(notResizable, {
-      approvedIntentId: "approved-2",
-      resizedAt: "2026-09-02T12:00:01.000Z",
-      newTargetShares: "50",
-      reason: "shrink",
-    });
-    expect(resized.ok).toBe(false);
-    if (resized.ok) return;
-    expect(resized.refusals.map((r) => r.code)).toContain("RISK_RESIZE_UNSUPPORTED_TYPE");
+    expect(original.rootApprovedIntentId).toBe(original.approvedIntentId);
+    expect("supersedesApprovedIntentId" in original).toBe(false);
   });
 });
 

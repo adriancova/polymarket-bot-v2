@@ -223,7 +223,6 @@ export function traderConfig(overrides: Record<string, unknown> = {}): Record<st
       eventStream: "polymarket.normalized",
       consumerId: "trader-1",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

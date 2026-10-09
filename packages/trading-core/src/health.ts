@@ -419,7 +419,14 @@ export interface TransportHealth {
   readonly committedPosition: number | null;
   /** `headPosition − consumerPosition`: events published and not yet delivered to this consumer. */
   readonly entriesBehindHead: number | null;
-  /** The stream's retention bound: an `entriesBehindHead` past it is a hard resync. */
+  /**
+   * ALWAYS `null` since C1-RISK (OPS-07, 2026-10-08). It reported the trader's
+   * own `infrastructure.retentionMaxEvents`, which trimmed nothing (this
+   * process only consumes) and could differ from the stream's real bound, the
+   * data gateway's `GATEWAY_RETENTION_EVENTS`. The knob is gone; the key stays
+   * because `apps/control-api`'s health door requires it (a follow-up removes
+   * both).
+   */
   readonly retentionMaxEvents: number | null;
   /** `receivedAt` (strict UTC) of the last event the loop processed; `null` before the first. */
   readonly lastEventAt: string | null;

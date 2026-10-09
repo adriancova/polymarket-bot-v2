@@ -105,7 +105,7 @@ export interface ThroughputRunOptions {
   readonly mode: PublishMode;
   readonly stream: string;
   readonly consumerId: string;
-  /** The stream's retention bound, for the publisher and the trader's document. */
+  /** The stream's retention bound, for the publisher (the trader's document has none since C1-RISK). */
   readonly retentionMaxEvents: number;
   /** Index of the first paced envelope (1: after the prepended `MarketOpened`). */
   readonly paceFrom: number;
@@ -358,7 +358,6 @@ export async function runTraderThroughput(options: ThroughputRunOptions): Promis
       ...(completed["infrastructure"] as Record<string, unknown>),
       eventStream: options.stream,
       consumerId: options.consumerId,
-      retentionMaxEvents: options.retentionMaxEvents,
     },
   };
   const parsed = parseTraderConfig(document);
@@ -372,9 +371,12 @@ export async function runTraderThroughput(options: ThroughputRunOptions): Promis
   );
 
   // --- the process's own infrastructure --------------------------------------
+  // This transport also PUBLISHES (catch-up mode, and the in-process paced
+  // publisher), so it carries the stream's bound, the gateway's role. The
+  // trader's document states none (C1-RISK, OPS-07).
   const transport = await RedisStreamsEventTransport.connect({
     connection: { url: options.redisUrl },
-    retention: { maxEvents: config.infrastructure.retentionMaxEvents },
+    retention: { maxEvents: options.retentionMaxEvents },
   });
   const stats = createPostgresPool({ connectionString: options.databaseUrl, maxConnections: 1 });
 

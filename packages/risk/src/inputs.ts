@@ -6,8 +6,8 @@
  * nothing. A required view that is absent makes the affected check FAIL
  * CLOSED — unknown blocks, never permits.
  *
- * Two views are STRUCTURAL PORTS from `@polymarket-bot/capital-allocator`
- * (`allocation`, `exposures`): the two packages share layer 1 and
+ * One view is a STRUCTURAL PORT from `@polymarket-bot/capital-allocator`
+ * (`allocation`): the two packages share layer 1 and
  * `docs/contracts/dependency-direction.md` §2.1 lists no edge between them,
  * so the shapes are mirrored structurally (loose objects — this package reads
  * the named fields and ignores the rest) and pinned by the compile-time
@@ -47,7 +47,13 @@ import { SCENARIO_KINDS } from "./policy.js";
 import { contained, riskRefusal, type RiskRefusal } from "./result.js";
 import { prototypeFreeParser } from "./schema-arena.js";
 
-/** Scope attribution for the §9.7 exposure dimensions (from the universe layer). */
+/**
+ * Scope attribution for the §9.7 exposure dimensions (from the universe layer).
+ *
+ * NOT READ by this package since C1-RISK: the per-scope caps it served are the
+ * capital allocator's, which takes the scope from its own reservation
+ * requests. Still accepted, so a caller that states it stays valid.
+ */
 export const ScopeAttributionSchema = z.strictObject({
   seriesKey: CodeStringSchema.optional(),
   underlyingKey: CodeStringSchema.optional(),
@@ -173,44 +179,6 @@ export const UnbookedFillExposureSchema = z.strictObject({
 export type UnbookedFillExposure = z.infer<typeof UnbookedFillExposureSchema>;
 
 /**
- * STRUCTURAL PORT — one exposure entry as
- * `@polymarket-bot/capital-allocator` publishes it. Loose: the allocator adds
- * `combined`, which this package deliberately RECOMPUTES from the two
- * components rather than trusting.
- */
-export const ExposureEntryViewSchema = z.looseObject({
-  openOrderCommitted: NonNegativeMoneyStringSchema,
-  positionCommitted: NonNegativeMoneyStringSchema,
-});
-export type ExposureEntryView = z.infer<typeof ExposureEntryViewSchema>;
-
-/**
- * STRUCTURAL PORT — the allocator's whole exposure snapshot.
- *
- * THE SCOPE MAPS MAY BE SPARSE, AND SPARSE IS NOT ZERO. This schema cannot
- * express "complete for the scopes this evaluation will query" — the query set
- * is not known until the intent is normalized — so completeness is enforced
- * where it can be: `exposure-limits.ts` refuses
- * (`RISK_EXPOSURE_ENTRY_MISSING`) when a configured cap's queried key is absent
- * from its table, rather than reading the absence as zero exposure (review
- * round 1, BLOCKER 2). A caller states "this scope holds nothing" with an
- * EXPLICIT zero entry; `@polymarket-bot/capital-allocator`'s
- * `exposureSnapshotCovering` produces exactly that for a declared key set.
- *
- * `global` is REQUIRED: an account-wide total is always well defined, so its
- * absence is a malformed snapshot rather than an unqueried scope.
- */
-export const ExposureSnapshotViewSchema = z.looseObject({
-  global: ExposureEntryViewSchema,
-  byStrategyInstance: z.record(z.string(), ExposureEntryViewSchema),
-  byMarket: z.record(z.string(), ExposureEntryViewSchema),
-  bySeries: z.record(z.string(), ExposureEntryViewSchema),
-  byUnderlying: z.record(z.string(), ExposureEntryViewSchema),
-  byResolutionWindow: z.record(z.string(), ExposureEntryViewSchema),
-});
-export type ExposureSnapshotView = z.infer<typeof ExposureSnapshotViewSchema>;
-
-/**
  * STRUCTURAL PORT — the allocator's reservation verdict (§9.8 check 14:
  * balance, allowance, inventory, and reservations). Loose: the permitted arm
  * carries the reservation, which this package does not read.
@@ -305,9 +273,6 @@ export const RiskEvaluationInputSchema = z.strictObject({
    * `packages/trading-core` always states it, an empty list included.
    */
   unbookedFills: z.array(UnbookedFillExposureSchema).readonly().optional(),
-
-  /** §9.8 check 15 input; absent + configured cap = fail closed. */
-  exposures: ExposureSnapshotViewSchema.optional(),
 
   /** §9.8 check 14 input; absent = fail closed. */
   allocation: AllocationVerdictViewSchema.optional(),

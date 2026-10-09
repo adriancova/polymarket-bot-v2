@@ -510,15 +510,12 @@ const InfrastructureConfigSchema = z.strictObject({
   consumerId: Identifier,
   /** Maximum events per `poll`. Bounded (§8.3). */
   receiveBatchSize: z.number().int().positive().max(10_000),
-  /**
-   * §9.1's bounded retention, in events.
-   *
-   * ADR-003's Consequences: "Retention size is a **safety parameter**, not a
-   * tuning knob. Retention shorter than the worst tolerated trader restart
-   * converts an ordinary restart into a hard resync plus an
-   * authoritative-snapshot cycle." Required, therefore, and undefaulted.
-   */
-  retentionMaxEvents: z.number().int().positive().max(10_000_000),
+  // NO retention bound (C1-RISK, OPS-07, 2026-10-08). §9.1's bounded retention
+  // (ADR-003: "a safety parameter, not a tuning knob") is the PUBLISHER's: the
+  // data gateway trims the stream (`GATEWAY_RETENTION_EVENTS`). This process
+  // only consumes, so a bound stated here was applied to nothing, and it was
+  // reported as the stream's retention when it could differ from the
+  // gateway's. The strict schema refuses a document that still states one.
 });
 
 export const TraderConfigSchema = z.strictObject({

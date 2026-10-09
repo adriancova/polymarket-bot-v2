@@ -232,7 +232,6 @@ function traderConfig(perStrategyCap = "1000", globalAccountCap = "10000"): Reco
       eventStream: "polymarket.normalized",
       consumerId: "cadence-1",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [marketDocument(MARKET_A, TOKENS[MARKET_A]), marketDocument(MARKET_B, TOKENS[MARKET_B])],
     instances: [

@@ -315,7 +315,6 @@ function traderConfig(): Record<string, unknown> {
       eventStream: "polymarket.normalized",
       consumerId: "trdr-4-refused-plan",
       receiveBatchSize: 128,
-      retentionMaxEvents: 100_000,
     },
     markets: [
       {

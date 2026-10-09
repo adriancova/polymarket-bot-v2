@@ -2,8 +2,9 @@
  * Fixtures for the WP-190 execution-planner suite.
  *
  * THE APPROVED-INTENT RECORDS ARE REAL: every record fed to the planner here
- * is minted by `packages/risk`'s own `evaluateIntent` (or descended from one
- * via `resizeApprovedIntent`) over WP-180's own test fixtures — so the suite
+ * is minted by `packages/risk`'s own `evaluateIntent` over WP-180's own test
+ * fixtures (the one exception, {@link resizedPosition}, is a literal descended
+ * from such a record: C1-RISK deleted the resize path) — so the suite
  * consumes WP-180's output exactly as it is shaped at `98a6cc1`, and a drift
  * in that shape fails THIS suite rather than being papered over by a private
  * copy. Importing both packages from the test tree declares no workspace
@@ -16,11 +17,7 @@
  * [60, 40] under `maxSliceShares: "60"` with minimum order size 5.
  */
 
-import {
-  evaluateIntent,
-  resizeApprovedIntent,
-  type ApprovedIntentRecord,
-} from "../../../packages/risk/src/index.js";
+import { evaluateIntent, type ApprovedIntentRecord } from "../../../packages/risk/src/index.js";
 import {
   EVALUATED_AT,
   VALID_UNTIL,
@@ -137,19 +134,28 @@ export function approvedBasket(
   return approvedRecordFor(input);
 }
 
-/** A real RESIZED record descended from an approved POSITION record. */
+/**
+ * A RESIZED record descended from an approved POSITION record, as a LITERAL.
+ *
+ * C1-RISK (TRADE-08) deleted `resizeApprovedIntent`, which had no production
+ * caller. The record's lineage fields remain a stored contract the planner
+ * reads, so the planner's RESIZED handling stays pinned on a record built the
+ * way that function built one: a new id, `lineage: "RESIZED"`, linked to the
+ * original, the intent's `targetShares` reduced, the worst case inherited.
+ */
 export function resizedPosition(newTargetShares = "40"): ApprovedIntentRecord {
-  const original = approvedPosition();
-  const resized = resizeApprovedIntent(original, {
+  const original = structuredClone(approvedPosition());
+  return Object.freeze({
+    ...original,
     approvedIntentId: "approved-1-resized",
-    resizedAt: EVALUATED_AT,
-    newTargetShares,
-    reason: "risk reduction",
+    lineage: "RESIZED",
+    supersedesApprovedIntentId: original.approvedIntentId,
+    rootApprovedIntentId: original.rootApprovedIntentId,
+    intent: { ...original.intent, targetShares: newTargetShares } as ApprovedIntentRecord["intent"],
+    approvedAt: EVALUATED_AT,
+    worstCaseBasis: "INHERITED_UPPER_BOUND",
+    resizeReason: "risk reduction",
   });
-  if (!resized.ok) {
-    throw new Error(`fixture resize refused: ${JSON.stringify(resized.refusals.map((r) => r.code))}`);
-  }
-  return resized.value;
 }
 
 export interface PlanningInputsFixture {

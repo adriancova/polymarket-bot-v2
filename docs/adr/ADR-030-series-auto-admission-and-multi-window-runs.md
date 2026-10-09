@@ -435,6 +435,18 @@ windows, never more.
      (`#scenariosFor`).
 2. A held window whose YES book has no bid has no mark. Check 17 then
    refuses the entry `RISK_SCENARIO_MARKS_INCOMPLETE`.
+
+   Note (2026-10-08, COMPLEXITY-1): the user approved replacing this
+   refusal. An unmarked window is now valued at `0`: its whole committed cost
+   counts as scenario loss, the contractual floor check 16 already uses. So a
+   missing mark never understates the loss, and it no longer refuses the entry
+   on its own. `RISK_SCENARIO_MARKS_INCOMPLETE` is deleted;
+   `RISK_SCENARIO_MISSING` and `RISK_SCENARIO_LOSS_EXCEEDED` remain. No rule
+   orders `maxScenarioLoss` and `maxWorstCaseContractualLoss`. Whenever the
+   first is at least the second, check 17 refuses nothing check 16 admits. A
+   guard against entering with no exit liquidity, if wanted, belongs in the
+   strategy (a minimum trigger price, or bid depth at the stop's floor), not in
+   check 17.
 3. Checks 16 and 17 refuse entries only (`evaluateIntent`,
    `packages/risk/src/engine.ts`). So another window's holdings never block
    an exit through them.
