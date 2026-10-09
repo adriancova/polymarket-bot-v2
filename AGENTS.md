@@ -30,6 +30,19 @@ Before planning, editing, or delegating:
 - The implementing agent may not perform the final adversarial review.
 - Report conflicts or missing information; never silently invent venue behavior.
 
+## Design philosophy: less is more
+
+Complexity is a cost, not a safety margin. Guards, states, retries, holds and checks are welcome when they pay for themselves. Before adding one, weigh:
+- **The risk:** what concrete failure it prevents, how likely that failure is (in PAPER today, and live later), and how bad it would be.
+- **The cost:** code, states and knobs an operator must understand, new failure modes, valid trades it may block, and recovery it complicates.
+- **Overlap:** whether something else already handles that failure.
+
+Add it only when the risk justifies the cost. Prefer the smallest mechanism that covers the risk: narrow a guard to the cases that need it, let a temporary block clear itself when its condition recovers, and put speculative edge cases on a follow-up list instead of building for them.
+
+Protections around ambiguous submissions, duplicate orders, position sizing, reliable exits, and the safety defaults below always justify their cost.
+
+Reviewers apply the same test. A finding states its failure scenario, its likelihood and its impact. A gap that needs a contrived or implausible scenario is LOW or a follow-up, not blocking. Unjustified complexity in the change is itself a finding.
+
 ## Safety
 
 These defaults may not be weakened:

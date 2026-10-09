@@ -24,6 +24,7 @@ Rules:
 - Use exact decimal representations for economic fields.
 - Do not suppress or delete failing tests.
 - Do not redesign adjacent components.
+- Follow AGENTS.md "Design philosophy: less is more": weigh each guard, state or check you add against the likelihood and impact of the failure it prevents, and prefer the smallest mechanism that covers the risk. Report any complexity you chose not to add under `follow_up`.
 - Commit completed work to the worktree branch.
 
 Return the complete required handoff, including the commit SHA.
