@@ -354,3 +354,12 @@ jobs:
         run: |
           uv export --frozen --no-emit-project --format requirements-txt > /tmp/requirements-audit.txt
           uvx pip-audit --strict -r /tmp/requirements-audit.txt
+
+      # COMPLEXITY-1 (C1-OPS): the brief's records rules are a real gate.
+      - name: Brief records check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: python3 ../tools/records/check-brief.py --root ..
+
+      - name: Brief records self-test
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: python3 ../tools/records/selftest-brief.py --repo ..
