@@ -168,7 +168,7 @@
       },
       "settlement": {
         "specRef": "btc-15m-updown",
-        "modelDependentActivationAllowed": false
+        "modelDependentActivationAllowed": true
       },
       "trading": {
         "makerFeeRate": "0",

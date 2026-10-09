@@ -31,12 +31,29 @@
 - `parseTraderConfig` does not refuse a FAK entry. That refusal is the strategy validator's, at composition. The test therefore pins GTD and `order_validity_ms` directly.
 
 ## known_risks
-- The review's `reviewedBy` is `sample-reviewer` and `modelDependentActivationAllowed` is `false`. No human has reviewed the series' settlement (`CLOSEOUT-2` N2). The runbook says so. Static Bracket reads no review.
+- The review's `reviewedBy` is `sample-reviewer`; `modelDependentActivationAllowed` is `true` (r1, PAPER-only owner ruling 2026-10-05) because `false` makes the risk engine refuse every entry (`RISK_SETTLEMENT_UNVERIFIED`). No human has reviewed the series' settlement. The runbook says so.
 - The example is not run end to end against the live venue here.
 
 ## follow_up
 - Not built: a test that runs `register --series` on the example. It needs PostgreSQL. Trigger: the first burn-in that fails at registration.
 - Not built: a second test for the gateway to trader feed-id agreement on the series pair. The existing `market-channel-feed-id.test.ts` covers the market-list pair, and the new test asserts the gateway's `polymarket-market` id.
+
+## commit_sha
+r0 `58e1e9f`; r1 is the next commit on `burnin-prep` (`git log burnin-prep -- docs/handoffs/BURNIN-PREP.md`).
+
+## Remediation r1
+| Finding | Result | Pin |
+| --- | --- | --- |
+| M1 | fixed: flag `true` in both reviews, documented in the runbook | test "both reviews assert modelDependentActivationAllowed" |
+| L1 | fixed: runbook names the GTC code | none (prose) |
+| L2 | fixed: runbook no longer claims the READMEs document `register --series`; points at `register --help` | none (prose) |
+| L3 | fixed: manual/node alternative first, jq second | none (prose) |
+| L4 | fixed: `infrastructure.retentionMaxEvents` listed | none (prose) |
+| L5 | fixed: `commit_sha` section | check-brief |
+| L6 | fixed: `readSeriesTemplate` run on the example with ids removed | test "passes register --series (readSeriesTemplate)" |
+| L7 | argued: pre-existing, values copied from the universe sample and market example; changing fee rates would invent venue facts. Trigger: a burn-in whose PnL is compared with venue fees. | none |
+
+The runbook section is 28 lines (was 25); the added lines carry M1, L1 and L4.
 
 ## Outcome
 Reviewer: pending.
