@@ -260,6 +260,8 @@ interface PlaceOnFeatures {
   readonly at: string | readonly string[];
   readonly immediate: boolean;
   readonly slices?: number;
+  /** `C1-HALTS` r1 (L1): the leg the buy is placed on (default `YES`, the instances' configured direction). */
+  readonly direction?: "YES" | "NO";
 }
 
 /**
@@ -300,11 +302,18 @@ function recordingStrategy(
   } = {},
 ): Strategy<unknown, Record<string, never>> {
   const placeAt = onFeaturesAt === undefined ? [] : typeof onFeaturesAt.at === "string" ? [onFeaturesAt.at] : onFeaturesAt.at;
-  const buy = (ctx: StrategyContext, intentId: string, immediate: boolean, restsRemainder = false, slices = 1): Intent => ({
+  const buy = (
+    ctx: StrategyContext,
+    intentId: string,
+    immediate: boolean,
+    restsRemainder = false,
+    slices = 1,
+    direction: "YES" | "NO" = "YES",
+  ): Intent => ({
     type: "POSITION",
     intentId,
     marketId,
-    direction: "YES",
+    direction,
     targetMode: "DELTA",
     targetShares: String(10 * slices),
     maximumBuyPrice: immediate ? "0.35" : "0.3",
@@ -349,6 +358,7 @@ function recordingStrategy(
             onFeaturesAt.immediate,
             false,
             onFeaturesAt.slices,
+            onFeaturesAt.direction,
           ),
         ],
       };
@@ -2385,5 +2395,35 @@ describe("TC-LOWS-1 (CAD1-R4-01): each round-3 guard of the carried harvest is p
     expect(carried.reservations).toMatchObject({ open: 0, taken: 3, released: 3, reservedCollateral: "0" });
     expect(carried.allocator).toEqual({ open: 0, reservedCollateral: "0" });
     expect(carried).toEqual(ordinary);
+  });
+});
+
+// `C1-HALTS` r1 (L1): risk check 8 judged the CONFIGURED direction's book,
+// while the intent is placed on, and priced from, its OWN direction's book.
+describe("C1-HALTS r1 (L1): risk check 8 judges the book the intent is placed on", () => {
+  it("a YES-configured instance's NO-leg buy is refused while the NO book waits for its snapshot; the same buy on the YES leg goes out", async () => {
+    for (const [direction, fills] of [
+      ["NO", 0],
+      ["YES", 1],
+    ] as const) {
+      ordinal = 0;
+      const at = iso(S + 5_000);
+      const harness = assemble({ cadence: PAPER_EVALUATION_CADENCE, placeOnFeatures: { market: MARKET_B, at, immediate: true, direction } });
+      // A generation-2 change on B's NO book: a newer subscription, so that
+      // book waits for its snapshot. B's YES book stays synchronized.
+      const change = event(S + 200, "BookLevelChanged", {
+        internalMarketId: MARKET_B,
+        tokenId: TOKENS[MARKET_B].no,
+        side: "BID",
+        price: "0.31",
+        size: "100",
+      });
+      const ahead: IngestedEvent = { ...change, envelope: { ...(change.envelope as EventEnvelope<unknown>), subscriptionGeneration: 2 } };
+      await feed(harness, ...opening(), opened(S + 150, MARKET_B), ahead, snapshot(S + 5_000, MARKET_X, "yes"));
+      expect(harness.halts.anyHalt).toBe(false);
+      expect(harness.loop.bookRefusals()[MARKET_B]).toEqual({ benign: 0, divergence: 1, waiting: ["NO"] });
+      expect(harness.venue.fills, direction).toHaveLength(fills);
+      expect(harness.loop.health().risk.refusalsByCode["RISK_BOOK_NOT_SYNCHRONIZED"] ?? 0, direction).toBe(1 - fills);
+    }
   });
 });

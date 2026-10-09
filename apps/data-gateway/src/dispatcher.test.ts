@@ -228,6 +228,34 @@ describe("GatewayDispatcher.markIncidentClosed publishes the close of an OPEN in
     await publisher.settle();
     expect(transport.published("market")).toEqual([]);
   });
+
+  it("r1 (L4): replaceIncident publishes the NEW incident's open BEFORE the old one's close, so the key is never without an active incident", async () => {
+    const { transport, publisher, dispatcher } = build();
+    const input = {
+      scope: "polymarket-lifecycle:m-1",
+      reasonCode: "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
+      severity: "PAGE" as const,
+      feedId: "polymarket-lifecycle",
+    };
+    // Nothing open: a replacement is an open.
+    dispatcher.replaceIncident({ ...input, detail: "1 lifecycle event(s) owed" });
+    await publisher.settle();
+    const first = (transport.published("market")[0]?.payload as { incidentId: string }).incidentId;
+    dispatcher.replaceIncident({ ...input, detail: "2 lifecycle event(s) owed" });
+    await publisher.settle();
+    const published = transport.published("market").map((envelope) => [envelope.eventType, (envelope.payload as { incidentId: string; detail?: string }).incidentId]);
+    expect(published).toHaveLength(3);
+    const second = published[1]?.[1];
+    expect(second).not.toBe(first);
+    expect(published).toEqual([
+      ["DataQualityIncidentOpened", first],
+      ["DataQualityIncidentOpened", second],
+      ["DataQualityIncidentClosed", first],
+    ]);
+    expect((transport.published("market")[1]?.payload as { detail: string }).detail).toBe("2 lifecycle event(s) owed");
+    // The key stays OPEN, under the new id.
+    expect(dispatcher.incidents.isOpen(input.scope, input.reasonCode)).toBe(true);
+  });
 });
 
 // `THROUGHPUT-1c` r6 (R6-H1): a frame's loss is published BEFORE the frame.

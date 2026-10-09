@@ -415,6 +415,31 @@ export class GatewayDispatcher {
     );
   }
 
+  /**
+   * `C1-HALTS` r1 (L4): replaces the OPEN incident for a key with a fresh one
+   * (a new id and detail), publishing the new incident's open BEFORE the old
+   * one's close, so a consumer never sees the key's condition with no active
+   * incident between them. Closing first, then opening, left that gap: the
+   * trader un-paused the market at the close. With no open incident for the
+   * key this is {@link openIncident}.
+   */
+  replaceIncident(
+    input: Parameters<GatewayDispatcher["openIncident"]>[0],
+    buildDraft?: (incidentId: string) => EnvelopeDraft,
+  ): void {
+    const previous = this.#incidents.markClosed(input.scope, input.reasonCode);
+    this.openIncident(input, buildDraft);
+    if (previous === undefined) return;
+    void this.dispatch(
+      this.#incidents.closedDraft({
+        incidentId: previous,
+        scope: input.scope,
+        reasonCode: input.reasonCode,
+        atMs: this.#clock.nowMs(),
+      }),
+    );
+  }
+
   get incidents(): IncidentRegistry {
     return this.#incidents;
   }

@@ -26,6 +26,8 @@ import { resolveSupersededHalts } from "../../../apps/trader/src/halt-record.js"
 import { REGISTER_EXIT_CODES } from "../../../apps/trader/src/register/main.js";
 import { recordedEvents } from "./support/fixture.js";
 import {
+  CODE_COMMIT,
+  CREATED_BY,
   Scratch,
   assemble,
   conditionFor,
@@ -38,6 +40,7 @@ import {
 } from "./support/register-command.js";
 import { registerThroughTheRepositories, withFreshDatabase as withFreshDatabaseOn, type Fresh } from "./support/registration.js";
 import { startReadyPostgresContainer } from "./support/containers.js";
+import { seriesConfig } from "./support/series-windows.js";
 
 let container: Awaited<ReturnType<typeof startReadyPostgresContainer>>;
 const scratch = new Scratch("c1-halts");
@@ -187,6 +190,54 @@ describe("C1-HALTS NEW-RUN: register --new-run <instanceId>", () => {
       expect(refused.log).toContain("TRADER_REGISTRATION_MISMATCH");
       expect(await exists(disagreeing)).toBe(false);
       expect(await registrationRowCounts(context.db)).toEqual(before);
+    });
+  }, 180_000);
+});
+
+describe("C1-HALTS r1 (L5): register --new-run for a SERIES-bound instance", () => {
+  it("mints one run for the seriesInstances entry, replaces only its runId, and BOOT-1 accepts the result", async () => {
+    await withFreshDatabase("c1-new-run-series", async ({ connectionString, context }) => {
+      const directory = await scratch.directory("new-run-series");
+      // The series configuration as a `register --series` template: its three identities removed.
+      const document = seriesConfig();
+      const [seriesInstance] = document["seriesInstances"] as Record<string, unknown>[];
+      const minted = new Set(["instanceId", "runId", "configId"]);
+      const template = await scratch.write(directory, "template.json", {
+        ...document,
+        seriesInstances: [Object.fromEntries(Object.entries(seriesInstance ?? {}).filter(([key]) => !minted.has(key)))],
+      });
+      const first = path.join(directory, "first.json");
+      const registered = await runRegister(
+        ["--series", "--template", template, "--out", first, "--instance-name", "btc-15m-c1-new-run", "--code-commit", CODE_COMMIT, "--created-by", CREATED_BY],
+        registerEnvironment(connectionString),
+      );
+      expect(registered.code, registered.log).toBe(REGISTER_EXIT_CODES.registered);
+      const ids = printedIdentities(registered);
+      expect(ids.marketId).toBeNull();
+      const firstDocument = JSON.parse(await readFile(first, "utf8")) as Record<string, unknown>;
+
+      const before = await registrationRowCounts(context.db);
+      const second = path.join(directory, "second.json");
+      const run = await runRegister(newRunArgv({ instanceId: ids.instanceId, template: first, out: second }), registerEnvironment(connectionString));
+      expect(run.code, run.log).toBe(REGISTER_EXIT_CODES.registered);
+      const printed = JSON.parse(run.printed.trim()) as Record<string, unknown>;
+      expect(printed).toMatchObject({ registered: true, newRun: true, instanceId: ids.instanceId, previousRunId: ids.runId });
+      const newRunId = String(printed["runId"]);
+      expect(newRunId).not.toBe(ids.runId);
+      // One new strategy.runs row, and no market row (a series registers none).
+      expect(await registrationRowCounts(context.db)).toEqual({ ...before, "strategy.runs": before["strategy.runs"] + 1 });
+
+      // Only the series instance's runId changed.
+      const secondDocument = JSON.parse(await readFile(second, "utf8")) as Record<string, unknown>;
+      const [instance] = secondDocument["seriesInstances"] as Record<string, unknown>[];
+      expect(instance?.["runId"]).toBe(newRunId);
+      expect({ ...secondDocument, seriesInstances: [{ ...instance, runId: ids.runId }] }).toEqual(firstDocument);
+
+      // BOOT-1, at a start, accepts the document with the new run.
+      const started = await assemble(secondDocument, connectionString);
+      if (started.result.ok) await started.result.store.close();
+      expect(started.result.ok ? "ok" : started.log).toBe("ok");
+      expect(started.log).toContain("registration: OK");
     });
   }, 180_000);
 });

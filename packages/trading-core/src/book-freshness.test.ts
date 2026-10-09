@@ -2021,6 +2021,28 @@ describe("C1-HALTS BOOK-WAITS: a desynchronized book waits for its next snapshot
     expect(after.trader.halts.anyHalt).toBe(false);
   });
 
+  it("r1 (L3): while a book waits, a superseded-generation REST snapshot does NOT re-arm it (a BENIGN drop); the current generation's snapshot does", async () => {
+    const waiting: Recorded[] = [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      // A generation-2 change: a newer subscription, so the book waits.
+      yesChange(1.2, A1_GEN2, "0.34", "120"),
+      // The REST fetch for generation 1's gap, in flight before generation 2
+      // began, lands now (the gateway publishes it before markResynchronized).
+      yesSnapshot(1.5, undefined, CHEAP_YES_ASKS),
+      noSnapshot(2, A1_GEN2),
+    ];
+    const during = await run(CHECK_8_ONLY, waiting);
+    expect(during.trader.halts.anyHalt).toBe(false);
+    expect(during.trader.loop.bookRefusals()[MARKET_ID]).toEqual({ benign: 1, divergence: 1, waiting: ["YES"] });
+    expect(entryMarkets(during)).toEqual([]);
+    expect(bookNotSynchronizedRefusals(during)).toBe(1);
+    const after = await run(CHECK_8_ONLY, [...waiting, yesSnapshot(3, A1_GEN2, CHEAP_YES_ASKS)]);
+    expect(after.trader.loop.bookRefusals()[MARKET_ID]?.waiting).toEqual([]);
+    expect(after.trader.halts.anyHalt).toBe(false);
+  });
+
   it("a BENIGN drop (a stale subscription generation) is counted only: the book stays synchronized and the entry goes out", async () => {
     const parts = await run(CHECK_8_ONLY, [
       tick(-2),
@@ -2048,6 +2070,27 @@ describe("C1-HALTS BOOK-WAITS: a desynchronized book waits for its next snapshot
       [{ kind: "MARKET", marketId: MARKET_ID }, "BOOK_DESYNCHRONIZED"],
     ]);
     expect(parts.trader.halts.records()[0]?.detail).toContain("ORDER_BOOK_UNKNOWN_TOKEN");
+    expect(entryMarkets(parts)).toEqual([]);
+  });
+
+  it("r1 (L2): a FAULT on one of the market's OWN tokens halts too — the class alone decides, not an unknown outcome", async () => {
+    // Generation 0 passes the envelope's door (a non-negative integer) but not
+    // the book's (generations start at 1): ORDER_BOOK_INGEST_META_INVALID, a
+    // FAULT, on the YES token — so the outcome IS known.
+    const generationZero: Session = { epoch: EPOCH_A, connectionId: "polymarket-market-a1", generation: 0 };
+    const parts = await run(CHECK_8_ONLY, [
+      tick(-2),
+      marketOpened(0),
+      yesSnapshot(1, A1, CHEAP_YES_ASKS),
+      yesChange(1.2, generationZero, "0.34", "1"),
+      noSnapshot(2, A1),
+    ]);
+    expect(parts.trader.halts.records().map((halt) => [halt.scope, halt.code])).toEqual([
+      [{ kind: "MARKET", marketId: MARKET_ID }, "BOOK_DESYNCHRONIZED"],
+    ]);
+    expect(parts.trader.halts.records()[0]?.detail).toContain("ORDER_BOOK_INGEST_META_INVALID");
+    // Not treated as a divergence: the YES book was not cleared to wait.
+    expect(parts.trader.loop.bookRefusals()[MARKET_ID]).toMatchObject({ divergence: 0 });
     expect(entryMarkets(parts)).toEqual([]);
   });
 

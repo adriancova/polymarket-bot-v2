@@ -108,7 +108,7 @@ import {
   subDecimal,
 } from "@polymarket-bot/decimal";
 import { computeFeatureSnapshot } from "@polymarket-bot/features";
-import { executablePrice, type OrderBookRefusal } from "@polymarket-bot/order-book";
+import { executablePrice, type BookIngestMeta, type OrderBookRefusal } from "@polymarket-bot/order-book";
 import type { Intent } from "@polymarket-bot/domain";
 import type {
   EvaluationInput,
@@ -2205,13 +2205,13 @@ export class CoreLoop {
       }
       case "BookSnapshot": {
         const applied = market.books.applySnapshot({ payload: envelope.payload, meta });
-        if (!applied.applied) return this.#bookRefused(market, envelope.payload, applied.refusal, instant);
+        if (!applied.applied) return this.#bookRefused(market, envelope.payload, meta, applied.refusal, instant);
         this.#noteBookSession(market, envelope);
         return { kind: "onFeatures" };
       }
       case "BookLevelChanged": {
         const applied = market.books.applyLevelChange({ payload: envelope.payload, meta });
-        if (!applied.applied) return this.#bookRefused(market, envelope.payload, applied.refusal, instant);
+        if (!applied.applied) return this.#bookRefused(market, envelope.payload, meta, applied.refusal, instant);
         this.#noteBookSession(market, envelope);
         return { kind: "onFeatures" };
       }
@@ -2311,7 +2311,13 @@ export class CoreLoop {
    * ({@link MarketState.noteBookRefusal}). Either way no callback fires: the
    * book did not change.
    */
-  #bookRefused(market: MarketState, payload: unknown, refusal: OrderBookRefusal, instant: string): undefined {
+  #bookRefused(
+    market: MarketState,
+    payload: unknown,
+    meta: BookIngestMeta,
+    refusal: OrderBookRefusal,
+    instant: string,
+  ): undefined {
     const refusalClass = classifyBookRefusal(refusal.code);
     // The book routed the payload to one of this market's two tokens before
     // any non-FAULT refusal, so the outcome is known; were it ever not, the
@@ -2326,7 +2332,7 @@ export class CoreLoop {
       );
       return undefined;
     }
-    market.noteBookRefusal(refusalClass, outcome);
+    market.noteBookRefusal(refusalClass, outcome, meta);
     return undefined;
   }
 
@@ -2884,7 +2890,11 @@ export class CoreLoop {
       // ADR-031 R4: from the later of the event instant and the process
       // instant (the event instant for a CANCEL, or an unreadable reading).
       secondsToClose: this.#secondsToClose(marketConfig, admission?.closeFromEpochMs ?? input.epochMs),
-      bookSynchronized: input.market.bookFor(input.instance.direction).baseline() !== undefined,
+      // `C1-HALTS` r1 (L1): the book the intent is placed on and priced from
+      // (`#economicsFor` reads `intent.direction`'s book). A complement-leg
+      // intent trades the configured direction's complement, so judging the
+      // configured book would let it through while ITS book waits.
+      bookSynchronized: input.market.bookFor(placedDirection(input.intent, input.instance.direction)).baseline() !== undefined,
       venueBookAgeMs: bookAgeMs,
       // ADR-031 R3/R5: the feature snapshot's age at admission is the lag;
       // `undefined` (an unreadable reading) is OMITTED, so check 7 refuses an
@@ -5903,6 +5913,15 @@ function affectedMarketIds(payload: unknown): readonly string[] {
  * `CAPITAL_LIVE_OWNERSHIP_CONFLICT` rather than a book of its own.
  */
 const SHARED_BOOK_ACCOUNTING_MODE = "LIVE" as const;
+
+/**
+ * `C1-HALTS` r1 (L1): the outcome whose book a placement trades: a POSITION
+ * intent's own `direction` (a complement-leg entry trades the configured
+ * direction's complement), otherwise the instance's configured direction.
+ */
+function placedDirection(intent: Intent, configured: "YES" | "NO"): "YES" | "NO" {
+  return intent.type === "POSITION" ? intent.direction : configured;
+}
 
 function intentIdOf(intent: Intent): string {
   return "intentId" in intent && typeof intent.intentId === "string" ? intent.intentId : "";

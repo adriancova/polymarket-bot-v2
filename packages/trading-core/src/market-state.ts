@@ -45,7 +45,7 @@
  * UTC by `time.ts`.
  */
 
-import { MarketOutcomeBooks, serializeBook, type OutcomeTokenBook } from "@polymarket-bot/order-book";
+import { MarketOutcomeBooks, serializeBook, type BookIngestMeta, type OutcomeTokenBook } from "@polymarket-bot/order-book";
 import { prepareEvaluationView } from "@polymarket-bot/strategy-runtime";
 import type { MarketView, OrderBookView } from "@polymarket-bot/strategy-sdk";
 
@@ -249,13 +249,15 @@ export class MarketState {
    * APPLIED change). The next applied `BookSnapshot` re-baselines the book and
    * notes its session again: nothing else re-arms it, and nothing needs to.
    */
-  noteBookRefusal(refusalClass: Exclude<BookRefusalClass, "FAULT">, outcome: "YES" | "NO"): void {
+  noteBookRefusal(refusalClass: Exclude<BookRefusalClass, "FAULT">, outcome: "YES" | "NO", refused: BookIngestMeta): void {
     if (refusalClass === "BENIGN") {
       this.#bookRefusals.benign += 1;
       return;
     }
     this.#bookRefusals.divergence += 1;
-    this.bookFor(outcome).clearBaseline();
+    // r1 (L3): the refused update's meta raises the book's floor, so a
+    // superseded or replayed snapshot cannot re-arm it.
+    this.bookFor(outcome).clearBaseline(refused);
     this.#bookSessions[outcome] = undefined;
   }
 

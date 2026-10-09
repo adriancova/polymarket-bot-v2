@@ -203,6 +203,14 @@ export class OutcomeTokenBook {
   #baseline: BookBaseline | undefined;
   /** Last applied `ingestSeq`, valid within `#baseline.gatewayEpoch` only. */
   #lastIngestSeqValue: bigint | undefined;
+  /**
+   * `C1-HALTS` r1 (L3): set only by {@link clearBaseline} — the newest
+   * `(gatewayEpoch, subscriptionGeneration, ingestSeq)` this book had seen when
+   * it forgot its baseline, so a waiting book still refuses a snapshot its
+   * baseline would have refused. Read only while there is no baseline; the
+   * next clear rebuilds it from the baseline then in place.
+   */
+  #floor: { readonly gatewayEpoch: string; readonly subscriptionGeneration: number; readonly ingestSeqValue: bigint } | undefined;
   #lastVenueBookHash: string | undefined;
   #lastUpdate: BookLastUpdate | undefined;
   /** Local diagnostic counter. NOT an ordinal, NOT a venue sequence (§9.4). */
@@ -309,6 +317,17 @@ export class OutcomeTokenBook {
         return this.#staleGeneration(generation);
       }
       const ordering = this.#checkIngestOrder(meta.meta);
+      if (ordering !== undefined) {
+        return ordering;
+      }
+    } else if (this.#baseline === undefined && this.#floor?.gatewayEpoch === meta.meta.gatewayEpoch) {
+      // `C1-HALTS` r1 (L3): a book waiting for its snapshot refuses, exactly as
+      // its baseline did, a snapshot of a superseded generation (an in-flight
+      // REST fetch for an older gap) or a replayed sequence.
+      if (generation < this.#floor.subscriptionGeneration) {
+        return this.#staleGeneration(generation, this.#floor.subscriptionGeneration);
+      }
+      const ordering = this.#checkIngestOrder(meta.meta, this.#floor.ingestSeqValue);
       if (ordering !== undefined) {
         return ordering;
       }
@@ -597,11 +616,39 @@ export class OutcomeTokenBook {
    * from the venue (a newer generation, another epoch, a refused snapshot):
    * the refusal alone leaves the PRIOR baseline in place, which would still
    * vouch for a superseded book. From here every level change is refused
-   * `ORDER_BOOK_NO_BASELINE_SNAPSHOT` and any well-formed snapshot applies.
+   * `ORDER_BOOK_NO_BASELINE_SNAPSHOT`, and a snapshot applies unless it is
+   * older than what the book has seen in its epoch.
    * The levels and the last update are kept: they are what the book last
    * knew, and they age (`stalenessMs`) like any book nothing updates.
+   *
+   * r1 (L3): `refused` is the ingest meta of the update that was refused. The
+   * book keeps a floor — the newest generation and `ingestSeq` of its epoch
+   * among its baseline, any earlier floor and `refused` — so a superseded or
+   * replayed snapshot cannot re-arm it. A `refused` update from ANOTHER epoch
+   * starts the floor afresh (epochs are identity, not chronology).
    */
-  clearBaseline(): void {
+  clearBaseline(refused?: BookIngestMeta): void {
+    let floor =
+      this.#baseline === undefined
+        ? this.#floor
+        : {
+            gatewayEpoch: this.#baseline.gatewayEpoch,
+            subscriptionGeneration: this.#baseline.subscriptionGeneration,
+            ingestSeqValue: this.#lastIngestSeqValue ?? 0n,
+          };
+    const seen = refused === undefined ? undefined : validateIngestMeta(refused);
+    if (seen?.ok === true) {
+      const generation = seen.meta.subscriptionGeneration ?? 0;
+      floor =
+        floor?.gatewayEpoch === seen.meta.gatewayEpoch
+          ? {
+              gatewayEpoch: floor.gatewayEpoch,
+              subscriptionGeneration: Math.max(floor.subscriptionGeneration, generation),
+              ingestSeqValue: floor.ingestSeqValue > seen.meta.ingestSeqValue ? floor.ingestSeqValue : seen.meta.ingestSeqValue,
+            }
+          : { gatewayEpoch: seen.meta.gatewayEpoch, subscriptionGeneration: generation, ingestSeqValue: seen.meta.ingestSeqValue };
+    }
+    this.#floor = floor;
     this.#baseline = undefined;
     this.#lastIngestSeqValue = undefined;
   }
@@ -665,8 +712,7 @@ export class OutcomeTokenBook {
     return undefined;
   }
 
-  #staleGeneration(incoming: number): Refused {
-    const current = this.#baseline?.subscriptionGeneration;
+  #staleGeneration(incoming: number, current = this.#baseline?.subscriptionGeneration): Refused {
     return refuse(
       "ORDER_BOOK_STALE_SUBSCRIPTION_GENERATION",
       "the update's subscriptionGeneration is older than the accepted baseline's (§9.4: reject updates from a stale subscription generation)",
@@ -674,14 +720,14 @@ export class OutcomeTokenBook {
     );
   }
 
-  #checkIngestOrder(meta: ValidatedIngestMeta): Refused | undefined {
-    if (this.#lastIngestSeqValue !== undefined && meta.ingestSeqValue <= this.#lastIngestSeqValue) {
+  #checkIngestOrder(meta: ValidatedIngestMeta, last = this.#lastIngestSeqValue): Refused | undefined {
+    if (last !== undefined && meta.ingestSeqValue <= last) {
       return refuse(
         "ORDER_BOOK_OUT_OF_ORDER_INGEST",
         "ingestSeq did not strictly increase within the epoch (§7.1: gatewayEpoch + ingestSeq defines the exact order consumed); a replayed or reordered update is refused",
         {
           incomingIngestSeq: meta.ingestSeq,
-          lastIngestSeq: this.#lastIngestSeqValue.toString(),
+          lastIngestSeq: last.toString(),
         },
       );
     }
