@@ -1,5 +1,14 @@
 # Recorder alert rules (WP-140).
 #
+# NOT DEPLOYABLE until a gateway /metrics listener exists (C1-OPS,
+# COMPLEXITY-1 OPS-12). No process serves the recorder_* series these rules
+# read (recorder-scrape.yaml's header), so deployed today RecorderExited pages
+# permanently and every other rule evaluates nothing. Do not add this file to
+# a Prometheus `rule_files` until the exporter is wired; at that point keep the
+# paging rules docs/runbooks/recorder.md §4 lists and turn the batch-job rules
+# into job exit codes. RecorderRtdsHalted was deleted with RTDS's retirement
+# (RTDS-RETIRE, 2026-10-05).
+#
 # Severities follow handoff §14.4: `page` and `notify`. Every rule's meaning
 # and operator action is in docs/runbooks/recorder.md ("Alarms").
 #
@@ -8,7 +17,7 @@
 # and that the declared alert-name set matches this file EXACTLY in both
 # directions (a rename shows up as missing AND unexpected) — covering the
 # WP-120-obligated alarms (recorder EXIT; best-effort early queue-age
-# warning; WAL refusals; RTDS halt; publication halt; compaction lag;
+# warning; WAL refusals; publication halt; compaction lag;
 # upload failure) and every other rule here.
 #
 # TWO ALARMS ARE LOG-BASED, NOT METRIC-BASED, and are deliberately NOT faked
@@ -146,14 +155,6 @@ groups:
         annotations:
           summary: "Feed staleness detected ({{ $labels.feed }})"
           description: "Stall detection, resubscription, and (Polymarket) authoritative snapshot recovery are automatic; repeated stalls are a venue or network problem."
-
-      - alert: RecorderRtdsHalted
-        expr: recorder_rtds_halted == 1
-        labels:
-          severity: page
-        annotations:
-          summary: "RTDS TWAP publication halted for this epoch (unrecoverable gap)"
-          description: "The venue offers no replay; the unobserved interval is permanently unobserved. TWAP-dependent consumers must halt (ADR-009 §6). Restart to begin a new observation window."
 
       - alert: RecorderPolymarketSnapshotFailures
         expr: increase(recorder_polymarket_snapshot_fetch_failures_total[15m]) > 2

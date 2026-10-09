@@ -1,5 +1,11 @@
 # Recorder scrape configuration fragment (WP-140).
 #
+# NOT DEPLOYABLE until a gateway /metrics listener exists (C1-OPS,
+# COMPLEXITY-1 OPS-12): see the wiring status below. Merging it today gives
+# two targets that are always DOWN and a permanently firing RecorderExited.
+# docs/runbooks/recorder.md §4 says which rules to keep once the exporter is
+# wired.
+#
 # Merge the `scrape_configs` entries below into the deployment's
 # prometheus.yml, and add `recorder-alerts.yaml` to its `rule_files`.
 #

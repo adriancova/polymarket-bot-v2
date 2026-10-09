@@ -356,7 +356,7 @@ describe("the recorder alert rules", () => {
       "RecorderFsyncOverdue",
       // Feed halts.
       "RecorderFeedStalls",
-      "RecorderRtdsHalted",
+      // C1-OPS: RecorderRtdsHalted deleted with RTDS's retirement (RTDS-RETIRE).
       "RecorderPolymarketSnapshotFailures",
       // WP-130 signals.
       "RecorderCompactionLagHigh",
@@ -379,7 +379,7 @@ describe("the recorder alert rules", () => {
     ).toEqual([]);
   });
 
-  it("declares exactly 20 alerts in 7 groups (the count docs/handoffs/WP-140.md cites)", () => {
+  it("declares exactly 19 alerts in 7 groups (WP-140's 20, less C1-OPS's RecorderRtdsHalted)", () => {
     // Remediation round 2, LOW-1: the hand-off originally claimed "16 alerts
     // in 7 groups"; direct parsing finds 20. The count is asserted HERE so
     // the document can cite this test instead of a hand count — changing the
@@ -387,7 +387,7 @@ describe("the recorder alert rules", () => {
     // the hand-off together. Round 3, M-1: like the set test, this count is
     // meaningful only under the fail-closed subset enforced above.
     const declared = [...alertsSource.matchAll(/^\s*-\s*alert:\s*\S+\s*$/gmu)];
-    expect(declared.length, "alert-rule count drifted — update docs/handoffs/WP-140.md").toBe(20);
+    expect(declared.length, "alert-rule count drifted — update docs/handoffs/WP-140.md").toBe(19);
     const groups = [...alertsSource.matchAll(/^\s{2}-\s*name:\s*\S+\s*$/gmu)];
     expect(groups.length, "rule-group count drifted — update docs/handoffs/WP-140.md").toBe(7);
   });
