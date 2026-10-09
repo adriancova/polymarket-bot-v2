@@ -35,9 +35,14 @@
  * - **`kind: "capture"` checks and `assert` hooks** (`captures.ts`,
  *   `checks.ts`), and each fixture's `retrieved` date pinned to its report's
  *   snapshot date.
+ *
+ * V2-9 round 7 adds the generic walk (`tree-scan.ts`): every file of the
+ * tree, whatever its kind, is read strictly and every key and string in it
+ * answers to every personal-data, cursor and hash rule, with the explicit
+ * allowlist `scan-allowlist.ts` as the only exception. `ok` requires it.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   catalogueTokenIds,
@@ -62,6 +67,8 @@ import {
 import type { VenueCheck } from "./checks.js";
 import { REPO_ROOT, VENUE_FIXTURE_ROOT, loadFixture } from "./fixtures.js";
 import type { FixtureValidationResult } from "./fixtures.js";
+import { listVenueFixtureFiles, scanFixtureTree } from "./tree-scan.js";
+import type { TreeScan } from "./tree-scan.js";
 
 export type CheckStatus = "PASS" | "FAIL" | "DOCUMENTED";
 
@@ -102,6 +109,8 @@ export interface VenueVerificationReport {
   readonly results: readonly CheckResult[];
   /** V2-9: the fixture-tree claim, part of `ok`. */
   readonly coverage: FixtureCoverage;
+  /** V2-9 round 7: the generic walk of every file in the tree, part of `ok`. */
+  readonly scan: TreeScan;
 }
 
 /**
@@ -348,19 +357,8 @@ export function loadAndValidateReport(
  * is a fixture like any other.
  */
 export function listFixtureFiles(root: string = VENUE_FIXTURE_ROOT): string[] {
-  const files: string[] = [];
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir)) {
-      const absolute = join(dir, entry);
-      if (statSync(absolute).isDirectory()) {
-        walk(absolute);
-      } else if (entry !== "README.md") {
-        files.push(relative(root, absolute).split(sep).join("/"));
-      }
-    }
-  };
-  walk(root);
-  return files.sort();
+  // One definition, shared with the generic walk (round 7).
+  return listVenueFixtureFiles(root);
 }
 
 /** V2-9: the files each check claims: its fixtures, or its captures and sidecars. */
@@ -582,6 +580,7 @@ export function runVenueVerification(): VenueVerificationReport {
     };
   });
   const coverage = fixtureCoverage(listFixtureFiles(), claimedFixturePaths());
+  const scan = scanFixtureTree();
   const hasFixtureEvidence = results.some(
     (result) => result.status === "PASS",
   );
@@ -589,9 +588,10 @@ export function runVenueVerification(): VenueVerificationReport {
   return {
     reportPath: VERIFICATION_REPORT_PATH,
     reportValidation: validation,
-    ok: validation.ok && noFailures && hasFixtureEvidence && coverage.ok,
+    ok: validation.ok && noFailures && hasFixtureEvidence && coverage.ok && scan.ok,
     results,
     coverage,
+    scan,
   };
 }
 
@@ -614,6 +614,8 @@ export function formatVenueVerificationReport(
     ...report.coverage.unclaimed.map((path) => `  unclaimed: ${path}`),
     ...report.coverage.claimedTwice.map((path) => `  claimed twice: ${path}`),
     ...report.coverage.missing.map((path) => `  claimed but missing: ${path}`),
+    `Fixture scan: ${report.scan.ok ? "OK" : "FAIL"} (${report.scan.files.length} files read strictly; ${report.scan.keys} keys and ${report.scan.strings} strings walked; ${report.scan.allowlisted} allowlisted values)`,
+    ...report.scan.errors.map((error) => `  ${error}`),
     `Overall: ${report.ok ? "PASS" : "FAIL"}`,
   ];
   for (const result of report.results) {

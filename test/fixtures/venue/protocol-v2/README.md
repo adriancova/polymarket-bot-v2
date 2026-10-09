@@ -118,6 +118,11 @@ Added by `V2-9`; the text above is `VENUE-4`'s and is unchanged.
     (or the text before the index's `…`), types its query values, and
     refuses a trade cursor anywhere outside the trade pages unless it is a
     public market cursor classified for its route (`prices_history`);
+    round 7 adds one generic walk over every file of the tree
+    (`tree-scan.ts`): a strict read (no invalid byte, no repeated key),
+    every key and string at any depth in every reading, every URL split into
+    its parts, and an explicit, sourced allowlist of (file, JSON path, exact
+    value) exceptions (`scan-allowlist.ts`);
   - the V2 facts each capture pins, with the report ids it cites.
 
   The gate now claims files of every suffix, so `.jsonc` and `.jsonl` no

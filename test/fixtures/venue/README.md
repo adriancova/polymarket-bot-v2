@@ -472,6 +472,43 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   Data API URL is keyed by a wallet (`user`, `address`, `proxy_wallet`,
   `wallet`).
 
+**One walk over every file** (round 7, V2-9-R7-01, -02 and -03; the
+orchestrator's 2026-10-08 directive). The rules above name fields, and each
+review round found a field they missed: an envelope or example property, a
+repeated key, an invalid byte, a source URL. So every file in this tree but a
+`README.md` (capture, sidecar, fixture and example alike) also goes through one
+generic walk (`apps/ops-cli/src/verify-venue/tree-scan.ts`), and no field is
+exempt by name:
+
+- **A strict read.** UTF-8 with no invalid byte, and RFC 8259 JSON (one
+  document, or one per `.jsonl` line) with no comment, no trailing comma, no
+  byte-order mark, no repeated key and no lone surrogate. A failure fails the
+  gate, by name. `loadFixture` reads a fixture the same way.
+- **Every key and every string, at any depth**, in every reading the scanner
+  decodes (as written, NFKC-normalized and each percent-decoded layer); a
+  string that is itself JSON text (a WebSocket frame, Gamma's `outcomes`) is
+  also parsed strictly and walked; every URL in a string must parse, and its
+  user information, host, path, each query name and value, and fragment are
+  read and scanned one by one. Each answers to every rule: an email address;
+  a `0x` 40-hex address; a hash (`0x` and more than 40 hex digits, or 40 or
+  more bare hex digits with a letter); a token that decodes to a venue
+  cursor; a personal field written with a value. Each object answers to the
+  personal-key, person's-row and credential rules, and may not itself be
+  shaped as a venue cursor. Labelled synthetic values pass.
+- **The only exceptions** are explicit: `scan-allowlist.ts` lists each
+  (file, JSON path, exact value) the rules refuse but the tree may hold, with
+  its rule, a report id that the report defines (the gate checks it) and a
+  reason. Today: public market condition and question ids, book hashes, raw
+  and capture digests, the pinned SDK commit, documented contract addresses,
+  the two public `prices_history` cursors, one market's resolution
+  transaction, the trade sidecars' redaction subjects and one documentation
+  type annotation. A value moved to another path, another value at a listed
+  path, and a listed value no longer there (stale) each fail the gate. A
+  package that commits a new public value adds its entry, with its source.
+- **Closed envelopes.** A fixture's envelope holds exactly `fixture`,
+  `source`, `retrieved`, `sanitized`, `notes` and `examples`, and an example
+  exactly `name` and `payload` (a sidecar's keys were already closed).
+
 **What the gate cannot check.** These are not machine-detectable:
 
 - a person's name written as plain prose with no field label ("traded by
@@ -484,17 +521,19 @@ out in `apps/ops-cli/src/verify-venue/captures.ts`, "personal data"):
   than in hex or decimal (in base64, for example);
 - a personal key glued to a label by a letter or a digit
   (`maker1wallet: …`): it reads as another word, as `filename:` does;
-- a whole-value id in a fixture payload (a `condition_id`, a `hash`): the
-  check's payload spec and `assert` hook judge it (the V2 book frame equals
-  its capture, the Router ids are the documentation's), not the envelope
-  scan, which reads long ids in prose only (round 6);
+- a hash written in decimal digits alone: the walk reads a run of decimal
+  digits as an id or a number (token and position ids are decimal), so only
+  the trade-page rules above refuse a long one (round 7; until round 7 a
+  whole-value hex id in a fixture payload was not judged either, and now it
+  is, by path);
 - a personal value hidden by a deliberate re-encoding other than
   percent-encoding (round 5: per the 2026-10-08 ruling, such a bypass is a
   follow-up, not a gap of this gate);
 - outside the Data API, a name under a generic key (`name`, `title`) of an
   object with no personal key: Gamma's `name` is market metadata;
-- an address without its `0x` under a generic key of a non-feed capture: the
-  market channel's book `hash` is a bare 40-hex value.
+- an address without its `0x` written in decimal digits alone (round 7: with
+  a hex letter, it is a bare 40-hex run, which the walk refuses as a hash
+  unless listed; the market channel's book `hash` is one, listed by path).
 
 So the capture author writes personal values in a sidecar only as labelled
 synthetic values or `<placeholders>`, and the reviewer of a new capture reads

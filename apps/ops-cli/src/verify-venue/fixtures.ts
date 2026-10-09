@@ -27,6 +27,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readStrictJsonFile } from "./strict-json.js";
+
 /** Absolute path to the repository root (four levels above this file). */
 export const REPO_ROOT: string = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -625,6 +627,13 @@ export function validatePayload(
 }
 
 /**
+ * The WP-000 envelope's properties, and an example's (V2-9 round 7): closed,
+ * so an unknown property fails the gate.
+ */
+export const ENVELOPE_KEYS = ["fixture", "source", "retrieved", "sanitized", "notes", "examples"] as const;
+export const EXAMPLE_KEYS = ["name", "payload"] as const;
+
+/**
  * Validates the common fixture envelope and each example payload against a
  * source-specific spec (recursively: types, enums, optionality, nullability,
  * canonical decimal/price form, map values, unions, strict key sets, and
@@ -638,6 +647,16 @@ export function validateFixtureDocument(
   const errors: string[] = [];
   if (!isRecord(raw)) {
     return { fixture: null, errors: ["document is not a JSON object"] };
+  }
+  // V2-9 round 7 (V2-9-R7-01): the envelope is a closed schema, so a pasted
+  // property (`contact`, `original_cursor`) is refused by name; the generic
+  // walk (`tree-scan.ts`) also scans its value, as it scans every value.
+  for (const key of Object.keys(raw)) {
+    if (!(ENVELOPE_KEYS as readonly string[]).includes(key)) {
+      errors.push(
+        `envelope property ${JSON.stringify(key)} is not one of ${ENVELOPE_KEYS.join(", ")} (closed schema, round 7)`,
+      );
+    }
   }
   if (raw["fixture"] !== expectedFixtureName) {
     errors.push(
@@ -670,6 +689,13 @@ export function validateFixtureDocument(
         errors.push(`examples[${index}] is not an object`);
         return;
       }
+      for (const key of Object.keys(example)) {
+        if (!(EXAMPLE_KEYS as readonly string[]).includes(key)) {
+          errors.push(
+            `examples[${index}] property ${JSON.stringify(key)} is not one of ${EXAMPLE_KEYS.join(", ")} (closed schema, round 7)`,
+          );
+        }
+      }
       const name = example["name"];
       if (typeof name !== "string" || name.length === 0) {
         errors.push(`examples[${index}].name must be a non-empty string`);
@@ -698,13 +724,19 @@ export function validateFixtureDocument(
 /**
  * Loads and validates a single fixture file relative to the fixture root.
  * Rejects any path that escapes the fixture tree (path traversal).
+ *
+ * V2-9 round 7 (V2-9-R7-02): the bytes are read strictly
+ * (`readStrictJsonFile`): invalid UTF-8, a repeated key or an ill-formed
+ * string fails by name, where a lenient read replaced the byte by U+FFFD and
+ * kept only a repeated key's last value. `root`: the fixture root (tests).
  */
 export function loadFixture(
   relativePath: string,
   spec: PayloadSpec,
+  root: string = VENUE_FIXTURE_ROOT,
 ): FixtureValidationResult {
-  const absolutePath = resolve(VENUE_FIXTURE_ROOT, relativePath);
-  const rel = relative(VENUE_FIXTURE_ROOT, absolutePath);
+  const absolutePath = resolve(root, relativePath);
+  const rel = relative(root, absolutePath);
   if (rel.startsWith("..") || rel.includes("..")) {
     return {
       relativePath,
@@ -715,7 +747,11 @@ export function loadFixture(
   }
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(absolutePath, "utf8"));
+    const read = readStrictJsonFile(relativePath, readFileSync(absolutePath));
+    if (!read.ok) {
+      throw new Error(read.reason);
+    }
+    raw = read.documents.length === 1 ? read.documents[0]?.value : read.documents.map((document) => document.value);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return {

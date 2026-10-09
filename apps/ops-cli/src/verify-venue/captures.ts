@@ -92,6 +92,13 @@
  *    `venueCursorAnchorErrors`; V2-9-R6-02). Every WP-000 fixture envelope
  *    answers to the personal-data, cursor and long-id scan
  *    (`fixturePersonalDataErrors`, wired by `index.ts`; V2-9-R6-01).
+ * 10. **One walk over every file** (round 7, V2-9-R7-01..03): the rules
+ *    above name fields; `tree-scan.ts` also reads every file of the tree
+ *    strictly and runs the token rules below (`emailTokens`,
+ *    `unlabelledAddressTokens`, `hashTokens`, `venueCursorTokens`,
+ *    `personalAssignmentTokens`, `personalKeyFindings`) on every key and
+ *    string at any depth, with the explicit allowlist `scan-allowlist.ts`
+ *    as the only exception.
  *
  * Offline: local files only. No network, no credential, no order.
  */
@@ -2195,6 +2202,152 @@ export function fixturePersonalDataErrors(
     errors.push(...unclassifiedCursorErrors(text, where, ""));
   }
   return errors;
+}
+
+// --- the token rules of the generic walk (round 7) ------------------------------
+//
+// The orchestrator's 2026-10-08 directive: one generic walk (`tree-scan.ts`)
+// reads every key and every string of every file in the fixture tree, at any
+// depth, and runs each rule below on every reading of it. Each rule returns
+// the exact tokens it refuses, so that the walk's allowlist can name a
+// (file, JSON path, exact value) exception.
+
+/** Every email address in one reading. */
+export function emailTokens(reading: string): string[] {
+  return [...reading.matchAll(new RegExp(EMAIL_RE.source, "g"))].map(([token]) => token);
+}
+
+/**
+ * Every `0x` 40-hex address in one reading that is not a labelled synthetic
+ * one (rule 5; a label glued before it does not hide it).
+ */
+export function unlabelledAddressTokens(reading: string): string[] {
+  return [...reading.matchAll(ADDRESS_TOKEN_RE)]
+    .map(([token]) => token)
+    .filter((token) => !isLabelledSyntheticHex(token, 40));
+}
+
+/**
+ * Every hash in one reading (round 7): `0x` and more than 40 hex digits (a
+ * transaction hash, a condition id, a signature), or a bare run of 40 or more
+ * hex digits holding a letter (a digest written without `0x`), that is not a
+ * labelled synthetic value. A run of decimal digits alone is a decimal id or
+ * a number, not a hash. Glued labels do not hide a hash.
+ */
+export function hashTokens(reading: string): string[] {
+  const prefixed = [...reading.matchAll(/0[xX][0-9a-fA-F]{41,}(?![0-9a-fA-F])/g)]
+    .map(([token]) => token)
+    .filter((token) => !isLabelledSyntheticHex(token, token.length - 2));
+  const bare = [...reading.matchAll(/(?<![0-9a-fA-F])(?<!0[xX])[0-9a-fA-F]{40,}(?![0-9a-fA-F])/g)]
+    .map(([token]) => token)
+    .filter((token) => /[a-fA-F]/.test(token) && !isLabelledSyntheticHex(`0x${token}`, token.length));
+  return [...prefixed, ...bare];
+}
+
+/**
+ * Every token of one reading that decodes to a venue cursor (`venueCursorType`:
+ * a `sig`, or a `data` object with a `type` or `params`), whatever its type:
+ * a JSON object written as text (the token is its span), or a base64,
+ * base64url or hex run, decoded through a glued prefix or suffix (the token
+ * is the run), as `cursorScan` reads them. The walk refuses each one unless
+ * it is allowlisted (the committed `prices_history` cursors of S-A02, S-A03).
+ */
+export function venueCursorTokens(reading: string): string[] {
+  const tokens = new Set<string>();
+  if (reading.includes("{")) {
+    for (const [span, object] of embeddedJsonSpans(reading)) {
+      if (venueCursorType(object) !== undefined) {
+        tokens.add(span);
+      }
+    }
+  }
+  for (const [run] of reading.matchAll(BASE64_RUN_RE)) {
+    if (runJsonObjects(run).some((object) => venueCursorType(object) !== undefined)) {
+      tokens.add(run);
+    }
+  }
+  return [...tokens];
+}
+
+/** Whether a parsed object has the shape of a venue cursor (round 7, the walk). */
+export function isVenueCursorShaped(value: unknown): boolean {
+  return venueCursorType(value) !== undefined;
+}
+
+/**
+ * Every personal field written with a value in one reading that is not a
+ * labelled synthetic value, a `<placeholder>`, `null` or empty (the sidecar
+ * prose rule, `PERSONAL_ASSIGNMENT_RE`): the whole assignment, as written.
+ */
+export function personalAssignmentTokens(reading: string): string[] {
+  return [...reading.matchAll(PERSONAL_ASSIGNMENT_RE)]
+    .filter((match) => !isProsePlaceholder(match[2] ?? ""))
+    .map(([token]) => token);
+}
+
+/**
+ * The personal-key refusals of one object (rule 5, without the Data API
+ * `name` rule, which only a capture's route can apply): a personal key whose
+ * value its rule does not allow, a wallet key that holds neither a string nor
+ * `null`, and, when the object carries a personal key, a `name` or a
+ * transaction hash that is not labelled synthetic. Each names the key.
+ */
+export function personalKeyFindings(
+  record: Readonly<Record<string, unknown>>,
+): { readonly key: string; readonly message: string }[] {
+  const findings: { key: string; message: string }[] = [];
+  const keys = Object.keys(record).map(normalizedKey);
+  const personRow = keys.some((key) => PERSONAL_KEY_RULES.some((rule) => rule.applies(key)));
+  for (const [key, entry] of Object.entries(record)) {
+    const normalized = normalizedKey(key);
+    const rule =
+      PERSONAL_KEY_RULES.find((candidate) => candidate.applies(normalized)) ??
+      (personRow ? PERSON_ROW_RULES.find((candidate) => candidate.applies(normalized)) : undefined);
+    if (normalized.includes("wallet") && typeof entry !== "string" && entry !== null) {
+      findings.push({
+        key,
+        message: "a wallet key holds neither an address string nor null, so the scanner cannot judge it",
+      });
+    }
+    if (rule !== undefined && !rule.allows(entry)) {
+      findings.push({ key, message: rule.message });
+    }
+  }
+  return findings;
+}
+
+/**
+ * The JSON objects a text embeds with their spans (see `embeddedJsonObjects`):
+ * every `{…}` span `JSON.parse` reads as an object with a key.
+ */
+function embeddedJsonSpans(text: string): [string, Record<string, unknown>][] {
+  const found: [string, Record<string, unknown>][] = [];
+  const opens: number[] = [];
+  const closes: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "{") {
+      opens.push(index);
+    } else if (text[index] === "}") {
+      closes.push(index);
+    }
+  }
+  for (const open of opens) {
+    for (const close of closes) {
+      if (close <= open) {
+        continue;
+      }
+      const span = text.slice(open, close + 1);
+      try {
+        const value: unknown = JSON.parse(span);
+        if (isRecord(value) && Object.keys(value).length > 0) {
+          found.push([span, value]);
+        }
+      } catch {
+        // not one JSON object at this span
+      }
+    }
+  }
+  return found;
 }
 
 /** Every string of a parsed JSON value (keys included), with its path (round 6). */

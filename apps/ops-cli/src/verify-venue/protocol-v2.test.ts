@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import {
@@ -2894,5 +2894,86 @@ describe("V2-9 r6: outside the feeds, the report vouches for the URL, and a trad
     }
     expect(readme).not.toContain("the gate does not type that\n  URL's values");
     expect(fixtureText("protocol-v2/README.md")).toContain("round 6 binds each non-feed sidecar URL to its report");
+  });
+});
+
+// --- round 7 -------------------------------------------------------------------
+
+/** An invented email (round 7 probes). */
+const R7_EMAIL = "probe@example.test";
+
+function r7BytesOf(relativePath: string): Buffer {
+  return readFileSync(join(VENUE_FIXTURE_ROOT, relativePath));
+}
+
+describe("V2-9 r7: fixtures are read strictly, with closed envelopes, and the gate runs the generic walk (V2-9-R7-01, -02, -03)", () => {
+  it("round 7: the exception states the one walk, its strict read, its allowlist and the closed envelopes", () => {
+    const readme = fixtureText("README.md");
+    for (const statement of [
+      "**One walk over every file** (round 7, V2-9-R7-01, -02 and -03",
+      "`apps/ops-cli/src/verify-venue/tree-scan.ts`), and no field is\nexempt by name",
+      "- **A strict read.**",
+      "no repeated key and no lone surrogate",
+      "**Every key and every string, at any depth**",
+      "each query name and value, and fragment are\n  read and scanned one by one",
+      "- **The only exceptions** are explicit: `scan-allowlist.ts`",
+      "- **Closed envelopes.**",
+      "a hash written in decimal digits alone",
+    ]) {
+      expect(readme, statement).toContain(statement);
+    }
+    expect(readme).not.toContain("not the envelope\n  scan, which reads long ids in prose only (round 6)");
+    expect(fixtureText("protocol-v2/README.md")).toContain("round 7 adds one generic walk over every file of the tree");
+  });
+
+  it("the gate runs it: the report carries the walk, and its summary line", () => {
+    const report = runVenueVerification();
+    expect(report.scan.ok).toBe(true);
+    expect(report.scan.files.length).toBe(listFixtureFiles().length);
+    expect(report.ok).toBe(true);
+    const text = formatVenueVerificationReport(report);
+    expect(text).toContain(
+      `Fixture scan: OK (${listFixtureFiles().length} files read strictly; ${report.scan.keys} keys and ${report.scan.strings} strings walked; ${report.scan.allowlisted} allowlisted values)`,
+    );
+    const failing = formatVenueVerificationReport({
+      ...report,
+      ok: false,
+      scan: { ...report.scan, ok: false, errors: ["positions/router-v2.json $.source: [hash] planted"] },
+    });
+    expect(failing).toContain("Fixture scan: FAIL");
+    expect(failing).toContain("  positions/router-v2.json $.source: [hash] planted");
+  });
+
+  it("loadFixture reads strictly too: an invalid byte and a repeated key fail by name (the verifier's probes)", () => {
+    const root = mkdtempSync(join(tmpdir(), "v2-9-r7-load-"));
+    try {
+      const book = "market-ws/book-snapshot-v2.json";
+      mkdirSync(join(root, dirname(book)), { recursive: true });
+      const bytes = Buffer.from(r7BytesOf(book));
+      const at = bytes.indexOf(Buffer.from("V2-9 (2026"));
+      expect(at).toBeGreaterThan(0);
+      bytes[at] = 0xff;
+      writeFileSync(join(root, book), bytes);
+      expect(loadFixture(book, {}, root).errors).toEqual([
+        "failed to read/parse: not valid UTF-8, so the scanner cannot decode it and the gate fails closed (round 7)",
+      ]);
+      writeFileSync(
+        join(root, book),
+        r7BytesOf(book).toString("utf8").replace('"notes":', '"notes":"Contact probe@example.test", "notes":'),
+      );
+      expect(loadFixture(book, {}, root).errors.join("\n")).toContain('$.notes: the key "notes" occurs twice in one object');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("MUTANT (R7-01): the closed envelope and example schemas refuse each unknown property by name", () => {
+    const fixture = JSON.parse(r7BytesOf(BOOK_FIXTURE).toString("utf8")) as Record<string, unknown>;
+    fixture["contact"] = R7_EMAIL;
+    ((fixture["examples"] as Record<string, unknown>[])[0] as Record<string, unknown>)["wallet"] = R6_WALLET;
+    expect(validateFixtureDocument(fixture, "market-ws/book-snapshot-v2", {}).errors).toEqual([
+      'envelope property "contact" is not one of fixture, source, retrieved, sanitized, notes, examples (closed schema, round 7)',
+      'examples[0] property "wallet" is not one of name, payload (closed schema, round 7)',
+    ]);
   });
 });
