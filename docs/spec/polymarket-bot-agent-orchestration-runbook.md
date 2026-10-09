@@ -9,7 +9,7 @@
 - **Codex CLI:** independent, preferably read-only, adversarial reviewer.
 - **Git + CI:** durable source of truth and mechanical acceptance gate.
 
-**Model roles (operator policy, 2026-09-04)**
+**Model roles (operator policy, 2026-09-04; superseded for implementers and reviewers by §3's tiers, 2026-10-09)**
 
 - The orchestrator (main Claude Code session) runs on **Fable 5**.
 - Every Claude subagent (wp-implementer, adversarial-reviewer, governance rounds, etc.)
@@ -90,11 +90,13 @@ Adopted 2026-10-08 under the user's rulings on `COMPLEXITY-1`. It replaces the w
 1. **Packet.** The orchestrator writes a complete packet: the package, the allowed and forbidden paths, the gates, the review and the round cap. A class-D packet (fixtures or sanitization) states its threat model. Every packet says:
    - kill only the PIDs you started; never `pkill -f` a pattern that can match another worktree;
    - never prune Docker host-wide (`docker system prune`, `docker volume prune` and the like).
-2. **Round 0.** A Claude Opus implementer works in its own worktree and branch, and commits. The orchestrator opens a draft PR at once, so CI runs on every candidate.
+2. **Round 0.** An implementer works in its own worktree and branch, and commits. The orchestrator opens a draft PR at once, so CI runs on every candidate. **The tier is set by risk (user, 2026-10-09):**
+   - **Standard (most rounds):** a Claude **Sonnet 5.5** implementer and remediator; one **Claude Opus 5.5** reviewer.
+   - **Critical** (code in the protected areas listed under Review, or an edit to a safety section): a Claude **Opus 5.5** implementer and remediator; dual review as below.
 3. **STOPPED items.** An item the implementer cannot do inside its grant is STOPPED and listed in its handoff's `deviations`. The orchestrator rules on each before round 1: grant the path, defer it to an owned residual, or put it to the user.
 4. **Review.**
    - **Dual review** (Claude Opus and Codex, reconciled) only for code in the protected areas, and for edits to a safety section: `AGENTS.md` "Safety", the brief's safety state, or an ADR Decision section in a protected area.
-   - **One verifier** for everything else: Codex `gpt-6-astra` by default; a Claude adversarial reviewer when the evidence spawns processes, uses containers or runs benchmarks.
+   - **One verifier** for everything else: a Claude Opus 5.5 adversarial reviewer (user, 2026-10-09; previously Codex `gpt-6-astra`).
    - Reviewers run only the changed packages' suites and their mutants. A docs round also runs the tests that `git grep -l <doc path> -- '*.test.ts'` finds, with their suites. CI runs the rest.
    - "Pins fail at base" and named-mutant proofs are required only in the protected areas.
 5. **Remediation.** A fresh implementer commits on top of the candidate, and the round is reviewed again.

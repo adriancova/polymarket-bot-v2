@@ -803,6 +803,9 @@ importers:
       '@polymarket-bot/strategy-static-bracket':
         specifier: workspace:*
         version: link:../strategies/static-bracket
+      '@polymarket-bot/universe':
+        specifier: workspace:*
+        version: link:../universe
       zod:
         specifier: ^4.4.3
         version: 4.4.3

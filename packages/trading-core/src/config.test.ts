@@ -20,6 +20,7 @@
  * that is not the only reason it holds.
  */
 
+import { parseReviewedSeries } from "@polymarket-bot/universe";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { configuredFeatureKeys, configuredSeries, parseTraderConfig } from "./config.js";
@@ -632,13 +633,40 @@ describe("the series fields (ROLLOVER-1)", () => {
   it("refuses a series the reviewed-series schema refuses", () => {
     expect(parseTraderConfig(seriesOnly({ series: [{ ...reviewedSeriesDocument(), approved: true }] })).ok).toBe(false);
   });
+
+  /**
+   * `C1-UNIV`: the door parses `@polymarket-bot/universe`'s schema — the
+   * gateway's — through its prototype-free arena, so the hash it pins is the
+   * one `SeriesWindowAdmitted@1` carries.
+   */
+  it("hashes a series exactly as the gateway's parse does", () => {
+    const gateway = parseReviewedSeries(reviewedSeriesDocument());
+    if (!gateway.ok) throw new Error(gateway.issues.join("; "));
+    const parsed = parseTraderConfig(seriesOnly());
+    if (!parsed.ok) throw new Error(parsed.refusal.issues.join("; "));
+    expect(configuredSeries(parsed.config).map((entry) => entry.configHash)).toEqual([gateway.configHash]);
+  });
+
+  it("refuses a review stating negRisk true, naming it (ROLLOVER-1 r7, R6-FABLE-01)", () => {
+    const document = reviewedSeriesDocument();
+    const negRisk = { ...document, parameters: { ...(document["parameters"] as Record<string, unknown>), negRisk: true } };
+    expect(issuesOf(seriesOnly({ series: [negRisk] })).join("\n")).toMatch(/negRisk/u);
+  });
+
+  it("refuses one outcome or three: the outcomes array holds exactly two through the arena", () => {
+    for (const outcomes of [["Up"], ["Up", "Down", "Flat"]]) {
+      const issues = issuesOf(seriesOnly({ series: [{ ...reviewedSeriesDocument(), outcomes }] }));
+      expect(issues.join("\n"), JSON.stringify(outcomes)).toMatch(/^series\.0\.outcomes: /mu);
+    }
+  });
 });
 
 /**
  * `V2-1` (ADR-030 Amendment 2 rule 2): the review's `acceptedProtocolVersions`
  * is required at the trader's configuration door too. A configuration written
  * before the field existed is REFUSED, naming the field and what to add —
- * never read as a default. The schema rule itself is pinned in `series.test.ts`.
+ * never read as a default. The schema rule itself is pinned in
+ * `@polymarket-bot/universe`'s `series-admission-v2.test.ts`.
  */
 describe("the series' acceptedProtocolVersions at the configuration door (V2-1)", () => {
   const REFUSAL =

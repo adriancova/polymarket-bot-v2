@@ -26,6 +26,7 @@
     "@polymarket-bot/strategy-static-bracket": "workspace:*",
     "@polymarket-bot/strategy-runtime": "workspace:*",
     "@polymarket-bot/strategy-sdk": "workspace:*",
+    "@polymarket-bot/universe": "workspace:*",
     "zod": "^4.4.3"
   },
   "devDependencies": {

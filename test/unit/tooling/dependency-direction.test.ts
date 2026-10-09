@@ -1039,6 +1039,7 @@ describe("dependency-direction check — round-1 review regressions", () => {
         "S16",
         "S17",
         "S18",
+        "S19",
       ]);
       for (const row of report.allowlist) expect(row.layer).not.toBeNull();
     }, REPOSITORY_READER_TIMEOUT_MS);

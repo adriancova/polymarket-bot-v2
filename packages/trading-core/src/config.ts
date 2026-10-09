@@ -70,13 +70,13 @@ import { explainCanonicalDecimalString } from "@polymarket-bot/decimal";
 import { Uuidv7Schema } from "@polymarket-bot/domain";
 import { readPlainData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
+import { ReviewedSeriesSchema, seriesConfigHash, type ReviewedSeries } from "@polymarket-bot/universe";
 
 import {
   BOOK_FRESHNESS_BASES,
   DEFAULT_BOOK_FRESHNESS_BASIS,
   type BookFreshnessBasis,
 } from "./book-freshness.js";
-import { ReviewedSeriesSchema, seriesConfigHash, type ReviewedSeries } from "./series.js";
 
 /** A positive integer bound in milliseconds, small enough to be a real bound. */
 const BoundedMs = z.number().int().positive().max(86_400_000);
