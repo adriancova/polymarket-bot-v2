@@ -221,7 +221,6 @@ function traderConfig(options: Options): Record<string, unknown> {
       fillModelVersion: "tier0.co2n1",
       fillModelParametersHash: "f".repeat(64),
       feeSchedule: { ...fees },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 1_000_000, windowMs: 60_000 },
     scenarios: [

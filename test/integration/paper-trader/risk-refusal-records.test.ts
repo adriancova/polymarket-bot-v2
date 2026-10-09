@@ -286,7 +286,7 @@ describe("a risk refusal is recorded at the store port (PROVENANCE-1)", () => {
     run.parts.store.failOnly(["persistRiskRefusal"], "UNAVAILABLE", "provenance-1: ops.risk_events is unavailable");
     await drive(run);
     const halts = run.trader.loop.health().halts;
-    expect(halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT"]]);
+    expect(halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
     expect(halts[0]?.detail).toContain("a risk refusal could not be persisted");
     expect(halts[0]?.detail).toContain("ops.risk_events is unavailable");
     expect(run.parts.store.riskRefusals).toEqual([]);

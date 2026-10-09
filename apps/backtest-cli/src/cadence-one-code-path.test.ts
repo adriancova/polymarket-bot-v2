@@ -108,7 +108,7 @@ function liveCore(): { readonly trader: PaperTrader; readonly store: InMemoryTra
   const parsed = parseTraderConfig(CONFIG);
   if (!parsed.ok) throw new Error(parsed.refusal.detail);
   const clock = new ManualClock(START);
-  const built = buildSimulatedVenue({ clock, settings: parsed.config.simulation });
+  const built = buildSimulatedVenue({ clock, settings: parsed.config.simulation, startingCash: parsed.config.accounting.startingCash });
   if (!built.ok) throw new Error(built.refusal.message);
   const store = new InMemoryTraderStore();
   const created = createPaperTrader({

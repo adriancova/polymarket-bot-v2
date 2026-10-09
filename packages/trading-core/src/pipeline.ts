@@ -54,6 +54,7 @@
 
 import {
   buildExecutionPlan,
+  TIME_IN_FORCE_VALUES as PLANNER_TIME_IN_FORCE_VALUES,
   type ExecutionPlan,
   type PlannerResult,
   type PlanningInputs,
@@ -79,7 +80,8 @@ export const PROTECTIVE_EXIT_TAGS: readonly string[] = Object.freeze([
   "sb.take-profit",
 ]);
 
-const TIME_IN_FORCE_VALUES: readonly string[] = Object.freeze(["GTC", "GTD", "FAK", "FOK"]);
+/** The execution-planner's list, widened to `string` so a tag value can be looked up in it. */
+const TIME_IN_FORCE_VALUES: readonly string[] = PLANNER_TIME_IN_FORCE_VALUES;
 
 /**
  * True when the intent's own tags mark it as a protective exit.

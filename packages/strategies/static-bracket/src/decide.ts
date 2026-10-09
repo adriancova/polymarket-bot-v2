@@ -390,6 +390,12 @@ function entryExecutionUnfolded(state: StaticBracketState): boolean {
  * added. The wait is bounded by the entry's own deadline: the venue expires a
  * GTD entry there, its terminal view clears the track
  * ({@link settleTerminalOrder}), and the next evaluation closes.
+ *
+ * Scope: this guards the closing paths that follow a fold (the exit-state and
+ * flat-close sites). It is NOT consulted by `planTick`'s market-closed
+ * shortcut, which checks only {@link entryExecutionUnfolded}: a bracket with no
+ * allocation, whose entry is live but has reported no fill, closes there at the
+ * market's end (`C1-TIF` r2, R2-L3).
  */
 function entryMayStillFill(state: StaticBracketState): boolean {
   const entry = state.entryOrder;

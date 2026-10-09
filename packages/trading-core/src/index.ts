@@ -138,7 +138,6 @@ export {
   type AccountingCounters,
   type AccountingHealth,
   type ExecutionHealth,
-  type HealthHalt,
   type HealthSnapshot,
   type LoopHealth,
   type RealizedPnlHealth,

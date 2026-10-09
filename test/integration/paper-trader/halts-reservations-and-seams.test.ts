@@ -376,43 +376,31 @@ describe("MEDIUM-2 — every seam reports on the health surface", () => {
   });
 });
 
-describe("L5 — the two startingCash fields are cross-checked at the door", () => {
-  it("a document whose two balances disagree is REFUSED, naming both paths", () => {
+describe("L5 — the opening balance is stated once (C1-TIDY)", () => {
+  it("a document that still carries simulation.startingCash is REFUSED, naming accounting.startingCash", () => {
     const base = traderConfig();
     const config = {
       ...base,
-      accounting: { ...(base["accounting"] as Record<string, unknown>), startingCash: "1000" },
       simulation: { ...(base["simulation"] as Record<string, unknown>), startingCash: "500" },
     };
-
-    // The DOOR's own code: not a grammar failure — both values are valid
-    // decimals — so it carries its own name.
     const parsed = parseTraderConfig(config);
     expect(parsed.ok).toBe(false);
     if (parsed.ok) return;
-    expect(parsed.refusal.code).toBe("TRADER_CONFIG_INCONSISTENT");
-    expect(parsed.refusal.issues).toEqual([
-      "accounting.startingCash: 1000",
-      "simulation.startingCash: 500",
-    ]);
+    expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
+    expect(parsed.refusal.issues.join("\n")).toContain("accounting.startingCash");
 
-    // …and the process refuses to assemble, with both paths in the message an
-    // operator reads.
     let message = "";
     try {
       assembleOrThrow({ config });
     } catch (cause) {
       message = cause instanceof Error ? cause.message : String(cause);
     }
-    expect(message).toContain("accounting.startingCash: 1000");
-    expect(message).toContain("simulation.startingCash: 500");
+    expect(message).toContain("accounting.startingCash");
   });
 
-  it("the shipped fixture and the shipped example agree, so the check is not vacuous", async () => {
+  it("the venue opens with accounting.startingCash", async () => {
     const run = await driveRecordedRun();
-    expect(run.trader.config.accounting.startingCash).toBe(
-      run.trader.config.simulation.startingCash,
-    );
+    expect(run.trader.config.accounting.startingCash).toBe("1000");
     expect(run.trader.loop.health().healthy).toBe(true);
     expect(MARKET_ID).toBe(run.trader.config.markets[0]?.marketId);
   });

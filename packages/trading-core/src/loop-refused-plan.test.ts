@@ -303,7 +303,6 @@ function traderConfig(): Record<string, unknown> {
       fillModelVersion: "tier0.trdr4r1",
       fillModelParametersHash: "d".repeat(64),
       feeSchedule: { ...fees },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 1_000_000, windowMs: 60_000 },
     scenarios: [

@@ -218,7 +218,6 @@ function traderConfig(options: HarnessOptions = {}): Record<string, unknown> {
       fillModelVersion: "tier0.trdr4",
       fillModelParametersHash: "c".repeat(64),
       feeSchedule: { ...fees },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 1_000_000, windowMs: 60_000 },
     scenarios: [

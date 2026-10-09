@@ -36,21 +36,18 @@ export function fullTraderHealthReport(
         code: "STORE_UNAVAILABLE",
         detail: "the durable store failed",
         at: "2026-09-05T00:00:01.000Z",
-        action: "FULL_HALT",
       },
       {
         scope: { kind: "MARKET", marketId: "market-1" },
         code: "UNATTRIBUTED_ACTIVITY",
         detail: "unattributed actual activity",
         at: "2026-09-05T00:00:02.000Z",
-        action: "RECONCILE_ACCOUNT",
       },
       {
         scope: { kind: "STRATEGY_INSTANCE", instanceId: "sb-1" },
         code: "OPERATOR_HALT",
         detail: "operator requested",
         at: "2026-09-05T00:00:03.000Z",
-        action: "FULL_HALT",
       },
     ],
     queues: [

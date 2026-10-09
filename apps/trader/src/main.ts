@@ -928,6 +928,7 @@ export async function assembleDurableTrader(
   const built = buildSimulatedVenue({
     clock: options.clock,
     settings: config.simulation,
+    startingCash: config.accounting.startingCash,
     log,
   });
   if (!built.ok) {

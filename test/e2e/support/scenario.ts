@@ -381,7 +381,6 @@ export function traderConfig(
         minimumChargedFee: fees.minimumChargedFee,
         feeCurrency: fees.feeCurrency,
       },
-      startingCash: STARTING_CASH,
     },
     requestBudget: { capacity: 100, windowMs: 60_000 },
     scenarios: [

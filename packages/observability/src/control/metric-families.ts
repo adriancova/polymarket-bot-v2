@@ -150,8 +150,8 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     "trader_halt_info",
     "gauge",
     "halts",
-    "One series per latched halt. Value is always 1; the scope, reason code and §9.9 action are the labels.",
-    ["scope", "scope_ref", "code", "action"],
+    "One series per latched halt. Value is always 1; the scope and reason code are the labels.",
+    ["scope", "scope_ref", "code"],
     true,
   ),
   // `CONTROL-2` (closing `H1R1-HALT-INVISIBLE`): the OPEN trader halts in

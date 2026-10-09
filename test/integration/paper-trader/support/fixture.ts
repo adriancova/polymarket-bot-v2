@@ -210,7 +210,6 @@ export function traderConfig(overrides: Record<string, unknown> = {}): Record<st
         minimumChargedFee: "0",
         feeCurrency: "pUSD",
       },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 100, windowMs: 60_000 },
     scenarios: [
@@ -397,8 +396,8 @@ export function recordedEvents(
  * entry outlives `pauseInstanceByWatchdog`'s clock jump (about 1,000 s of
  * monotonic time); a 30 s GTD expires inside it.
  *
- * WHY IT EXISTS. The shipped fixture's entry is a `FAK` taker that fills and
- * goes terminal in the same instant, so three properties have no observable
+ * WHY IT EXISTS. The shipped fixture's entry is a `GTD` entry (`C1-TIF`) that fills
+ * in full and goes terminal in the same instant, so three properties have no observable
  * moment in it: a reservation RISING on submission, a reservation SURVIVING a
  * non-terminal order view, and a fill arriving at an instance that is already
  * PAUSED. Review round 1's L2 and L3 name all three. This variant gives each of
@@ -506,7 +505,6 @@ export function twoMarketConfig(
   return {
     ...base,
     accounting: { ...(base["accounting"] as Record<string, unknown>), startingCash },
-    simulation: { ...(base["simulation"] as Record<string, unknown>), startingCash },
     markets: [
       market,
       {
@@ -699,12 +697,9 @@ export function assemble(
       fillModelVersion: "tier0/fixture",
       fillModelParametersHash: "a".repeat(64),
       feeSchedule: feeSnapshot(),
-      // The venue's cash comes from the SAME document the trader parses, so the
-      // two `startingCash` fields the configuration carries cannot silently
-      // disagree here (review round 1, L5 — `parseTraderConfig` refuses a
-      // document in which they do).
-      startingCash: simulationStartingCash(document),
     },
+    // The venue's cash comes from the SAME document the trader parses.
+    startingCash: accountingStartingCash(document),
     ...(options.rateLimits === undefined ? {} : { rateLimits: options.rateLimits }),
   });
   if (!built.ok) throw new Error("the fixture fee snapshot was refused");
@@ -729,11 +724,11 @@ export function assemble(
   return { result, parts: { trader: result.trader, venue, store, feed, clock } };
 }
 
-/** `simulation.startingCash` from an UNPARSED document, or the fixture's own. */
-function simulationStartingCash(document: Record<string, unknown>): string {
-  const simulation = document["simulation"];
-  if (typeof simulation !== "object" || simulation === null) return "1000";
-  if (!Object.hasOwn(simulation, "startingCash")) return "1000";
-  const cash = (simulation as Record<string, unknown>)["startingCash"];
+/** `accounting.startingCash` from an UNPARSED document, or the fixture's own. */
+function accountingStartingCash(document: Record<string, unknown>): string {
+  const accounting = document["accounting"];
+  if (typeof accounting !== "object" || accounting === null) return "1000";
+  if (!Object.hasOwn(accounting, "startingCash")) return "1000";
+  const cash = (accounting as Record<string, unknown>)["startingCash"];
   return typeof cash === "string" ? cash : "1000";
 }

@@ -265,7 +265,6 @@ function traderConfig(): Record<string, unknown> {
       fillModelVersion: "tier0.fold1",
       fillModelParametersHash: "d".repeat(64),
       feeSchedule: { ...fees },
-      startingCash: "1000",
     },
     requestBudget: { capacity: 1_000_000, windowMs: 60_000 },
     scenarios: [
@@ -833,9 +832,11 @@ describeAtEachCadence("FOLD-1: a held state that diverges from its rebuild is CA
 
     await tick(harness);
     const health = harness.loop.health();
-    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
-      ["GLOBAL", "ACCOUNTING_REBUILD_MISMATCH", "FULL_HALT"],
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([
+      ["GLOBAL", "ACCOUNTING_REBUILD_MISMATCH"],
     ]);
+    // C1-TIDY: a halt on the health surface carries no `action`.
+    expect(Object.keys(health.halts[0] ?? {})).not.toContain("action");
     expect(health.halts[0]?.detail).toContain("the held ledger view differs from projectLedger(ledger)");
     expect(health.halts[0]?.detail).toContain(`after posted fill ${String(posted + 1)}`);
     expect(health.halts[0]?.detail).toContain("first difference at byte");
@@ -955,7 +956,6 @@ describeAtEachCadence("FOLD1-R1-2: EVERY due posted fill runs every enabled chec
     });
     const global = health.halts.find((halt) => halt.scope.kind === "GLOBAL");
     expect(global?.code).toBe("ACCOUNTING_REBUILD_MISMATCH");
-    expect(global?.action).toBe("FULL_HALT");
     expect(global?.detail).toContain(`instance ${INSTANCE_ID}'s held PnL state differs from foldPnlRecords`);
     expect(global?.detail).toContain("after posted fill 11");
     // The unattributed-fill halt still latches exactly as before (TRDR-4).
@@ -1444,8 +1444,8 @@ describeAtEachCadence("SNAP-1: a halt latched mid-harvest, and the staged row", 
     harness.store.failOnly(["writePnlSnapshot"], "UNAVAILABLE", "SNAP-1 test: the snapshot store refuses");
     await tick(harness);
     const health = harness.loop.health();
-    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.action, halt.at])).toEqual([
-      ["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT", instantOf(4)],
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.at])).toEqual([
+      ["GLOBAL", "STORE_UNAVAILABLE", instantOf(4)],
     ]);
     expect(health.halts[0]?.detail).toBe(
       "a PnL snapshot could not be persisted: SNAP-1 test: the snapshot store refuses",
@@ -1479,8 +1479,8 @@ describeAtEachCadence("SNAP-1: a halt latched mid-harvest, and the staged row", 
       await tick(harness, shared); // event 5, SAME instant: SELL — its flush must REPLACE, and is refused
     }
     const health = harness.loop.health();
-    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.action, halt.at])).toEqual([
-      ["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT", shared],
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.at])).toEqual([
+      ["GLOBAL", "STORE_UNAVAILABLE", shared],
     ]);
     expect(health.halts[0]?.detail).toBe(
       "a PnL snapshot could not be persisted: SNAP-1 r1 test: the replacement is refused",

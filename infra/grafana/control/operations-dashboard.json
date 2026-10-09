@@ -61,11 +61,11 @@
       "id": 4,
       "type": "table",
       "title": "Halt detail",
-      "description": "One row per latched halt: the §14.1 scope, the reason code that raised it and the §9.9 action it selects. An action is what the process recommends; only the scope-level latch is what it enforces.",
+      "description": "One row per latched halt: the §14.1 scope, and the reason code that raised it. Every halt ends the run.",
       "gridPos": { "h": 6, "w": 16, "x": 8, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
-        { "refId": "A", "expr": "trader_halt_info", "instant": true, "legendFormat": "{{scope}} {{scope_ref}} {{code}} {{action}}" }
+        { "refId": "A", "expr": "trader_halt_info", "instant": true, "legendFormat": "{{scope}} {{scope_ref}} {{code}}" }
       ]
     },
     {
@@ -327,7 +327,7 @@
       "id": 25,
       "type": "stat",
       "title": "Open trader halts (ops.incidents)",
-      "description": "CONTROL-2 (H1R1-HALT-INVISIBLE). Open (not RESOLVED) TRADER_HALT rows in ops.incidents, read by the control API on every authorized scrape: a halt stays here after the trader has exited, until an operator resolves its row. The state is OPEN, NONE_OPEN, UNKNOWN (the read failed, timed out or was refused: NOT 'no halts') or NOT_CONFIGURED (this control API reads no ops.incidents: traderHalts.kind is none). The per-scope counts are present only after a read that succeeded. Pages on OPEN and on UNKNOWN: TraderHaltOpenOrUnknown (infra/prometheus/trader-alerts.yaml). Rows and reasons: GET /v1/health, traderHalts. Every target is an instant query (CTL2-L1): each tile is the latest scrape, so a target Prometheus is not scraping shows no value, never an earlier NONE_OPEN or a per-scope 0 beside UNKNOWN.",
+      "description": "CONTROL-2 (H1R1-HALT-INVISIBLE). Open (not RESOLVED) TRADER_HALT rows in ops.incidents, read by the control API on every authorized scrape: a halt stays here after the trader has exited, until the next run resolves an infrastructure halt's row (any other halt ends the run and stays open). The state is OPEN, NONE_OPEN, UNKNOWN (the read failed, timed out or was refused: NOT 'no halts') or NOT_CONFIGURED (this control API reads no ops.incidents: traderHalts.kind is none). The per-scope counts are present only after a read that succeeded. Pages on OPEN and on UNKNOWN: TraderHaltOpenOrUnknown (infra/prometheus/trader-alerts.yaml). Rows and reasons: GET /v1/health, traderHalts. Every target is an instant query (CTL2-L1): each tile is the latest scrape, so a target Prometheus is not scraping shows no value, never an earlier NONE_OPEN or a per-scope 0 beside UNKNOWN.",
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 67 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [

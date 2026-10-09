@@ -118,16 +118,16 @@ Evidence:
 **Every halt ends the run**, whatever its scope: the pump stops and the process
 exits `75`. The scope and its market or instance id say what tripped; they do
 not narrow the stop, and nothing in the process releases a halt. The halt's
-`ops.incidents` rows carry `action` `NULL` (the trader health surface still
-shows `action: "FULL_HALT"`, the one action that happens, because the control
-API's health door requires the field).
+`ops.incidents` rows carry `action` `NULL`, and the trader health surface
+carries no `action` either (`C1-TIDY`).
 
 A book that falls out of step with the venue is **not** a halt: it waits for
 its next snapshot, and risk check 8 refuses that market's entries and
 reductions meanwhile (cancels still go out). Only a book refusal that signals
 a contract or programming fault — an unknown token, a payload that fails its
-contract — halts, as `BOOK_DESYNCHRONIZED`. The per-market counts are logged at
-the stop (`book refusals: …`).
+contract — halts, as `BOOK_DESYNCHRONIZED`. The per-market counts are on the
+health snapshot (`bookRefusals`: `{ [marketId]: { benign, divergence } }`) and
+logged at the stop (`book refusals: …`).
 
 To continue after a halt, register a new run for the instance and start the
 trader with the document it writes:
@@ -263,9 +263,10 @@ or burn-in configuration before the next start.
   `trader_transport_retention_max_events` metric and its dashboard series are
   gone. The refusal is `TRADER_CONFIG_INVALID`.
 
-Not changed: `simulation.startingCash` and `accounting.startingCash` must still
-agree (`TRADER_CONFIG_INCONSISTENT`). Folding them into one field needs an edit
-outside this round's paths (`apps/backtest-cli`), and is recorded as a follow-up.
+`simulation.startingCash` is gone (`C1-TIDY`). The simulated venue opens with
+`accounting.startingCash`, the one statement of the opening balance. A
+configuration that still carries the old key is refused `TRADER_CONFIG_INVALID`,
+naming `accounting.startingCash`.
 
 ## A refused exit is counted, never compensated for
 

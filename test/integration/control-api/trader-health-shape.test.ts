@@ -188,6 +188,7 @@ function realSnapshot(): HealthSnapshot {
         at: "2026-09-05T00:00:09.000Z",
       },
     ],
+    bookRefusals: { "market-1": { benign: 3, divergence: 1 } },
     queues: [
       {
         name: "market-events",
@@ -249,10 +250,12 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     expect(report.maximumRunMode).toBe("PAPER");
     expect(report.healthy).toBe(false);
     expect(report.halts).toHaveLength(1);
-    // C1-HALTS: the record carries no rung; the surface states the one action
-    // that happens, because this door (and the `trader_halt_info` label)
-    // still require the field.
-    expect(report.halts[0]?.action).toBe("FULL_HALT");
+    // C1-TIDY: a halt carries no action (every halt ends the run), and the
+    // snapshot carries the book-refusal counts.
+    expect(Object.keys(report.halts[0] ?? {}).sort()).toEqual(["at", "code", "detail", "scope"]);
+    expect((report as unknown as { bookRefusals: unknown }).bookRefusals).toEqual({
+      "market-1": { benign: 3, divergence: 1 },
+    });
     expect(report.queues).toHaveLength(2);
     expect(report.execution.observeOnlyIntents).toBe(2);
     expect(report.loop.deliveriesSuppressedByHalt).toBe(2);

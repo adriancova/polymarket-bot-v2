@@ -1184,6 +1184,9 @@ export class CoreLoop {
     return this.#options.health.snapshot({
       asOf: this.#lastInstant,
       halts: this.#options.halts.records(),
+      bookRefusals: Object.fromEntries(
+        Object.entries(this.bookRefusals()).map(([marketId, { benign, divergence }]) => [marketId, { benign, divergence }]),
+      ),
       queues: this.queueMetrics(),
       seams: {
         fills: this.#fills.metrics(),

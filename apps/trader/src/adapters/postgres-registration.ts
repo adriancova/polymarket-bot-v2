@@ -15,7 +15,7 @@
  *
  * ```text
  * pump stopped: HALTED after 1 poll(s)
- * HALT GLOBAL STORE_UNAVAILABLE (FULL_HALT): a decision record could not be
+ * HALT GLOBAL STORE_UNAVAILABLE: a decision record could not be
  *   persisted (UNAVAILABLE): the durable store could not persist a decision:
  *   error: insert or update on table "decisions" violates foreign key
  *   constraint "decisions_run_id_fkey"; …
