@@ -6,6 +6,8 @@ PostgreSQL a PAPER run uses come from the PAPER operations stack,
 **The procedure** (start order, stop, exit codes, halt response, restart after
 an outage) is [`docs/runbooks/paper-operations.md`](../../../docs/runbooks/paper-operations.md).
 
+For a rolling-series burn-in, start from `trader.series.example.json` with `../data-gateway/gateway.series.example.json` ("Before a burn-in" in the runbook above).
+
 ## Safety
 
 - The trader is **PAPER only**. `apps/trader/src/safety.ts` refuses to start

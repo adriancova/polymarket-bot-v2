@@ -10,6 +10,35 @@ trader and the control API check them at startup and refuse a weakened value;
 the data gateway places no orders and only reads its run mode. Nothing here
 needs or accepts a credential, signer or wallet.
 
+## Before a burn-in
+
+A rolling-series burn-in starts from two shipped examples, not from the market-list ones:
+[`trader.series.example.json`](../../infra/compose/trader/trader.series.example.json) and
+[`gateway.series.example.json`](../../infra/compose/data-gateway/gateway.series.example.json).
+Both carry the same reviewed `btc-15m-updown` document; a test pins that they agree.
+
+- **Copy both.** Mint the instance's ids with `register --series`, whose template has no `instanceId`,
+  `runId` or `configId`. Delete those three keys from the copy by hand (or
+  `node -e` / `jq 'del(.seriesInstances[0].instanceId, .seriesInstances[0].runId, .seriesInstances[0].configId)'`).
+  Every later start needs a new run: `register --new-run <instanceId>`
+  ([`apps/trader/README.md`](../../apps/trader/README.md); the series form is in `register --help`).
+- **An older config is refused at startup (exit 78).** The `COMPLEXITY-1` changes are:
+  - Static Bracket entry: `FAK` and `FOK` are refused, `SB_IMMEDIATE_ORDER_TYPE_PARKED_UNTIL_EXECUTION_PROBE`;
+    `GTC` too, `SB_IMMEDIATE_ORDER_TYPE_GTC_NEEDS_DEADLINE_CANCEL`. Use `GTD` with an explicit `order_validity_ms`.
+  - `riskPolicy.limits.*ExposureCap`: refused `TRADER_RISK_POLICY_REFUSED`. State each cap in `allocatorCaps`.
+  - `simulation.startingCash` and `infrastructure.retentionMaxEvents`: refused `TRADER_CONFIG_INVALID`.
+    The venue opens with `accounting.startingCash`.
+  - The halt `action` field: a halt record or health snapshot that carries one is refused. No config states it.
+  - Details: [`apps/trader/README.md`](../../apps/trader/README.md), "Configuration changes in `C1-RISK`".
+- **Protocol V2.** New markets switch to V2 about 2026-11-02. Keep `acceptedProtocolVersions`
+  `["v1","v2"]` in the review (both examples do), or the gateway refuses V2 windows
+  (`docs/handoffs/V2-3.md`, item 3).
+- **The stack.** Start Redis and PostgreSQL from [`infra/compose/paper`](../../infra/compose/paper/compose.yaml) (section 1).
+- **The review is a sample.** Its `reviewedBy` is `sample-reviewer`; no human has reviewed the series' settlement.
+  Both reviews set `modelDependentActivationAllowed: true`, the owner's PAPER-only ruling of 2026-10-05
+  ([why](../../infra/compose/trader/README.md)). With `false` the risk engine refuses every entry,
+  `RISK_SETTLEMENT_UNVERIFIED`, and the burn-in places no order.
+
 ## 1. Start, in this order
 
 From the repository root. One stack serves every process,

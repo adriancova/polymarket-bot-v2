@@ -15,6 +15,8 @@ scripted sockets, except `publish-throughput.test.ts`, which starts its own
 throwaway Redis (Testcontainers) to drive the real publisher over the real
 transport (`THROUGHPUT-1b`).
 
+For a rolling-series burn-in, use `gateway.series.example.json` with `../trader/trader.series.example.json`; a test pins that the two agree: `test/unit/trader/series-burn-in-examples.test.ts`.
+
 ## What runs where
 
 | Concern | Local operation | Tests |
