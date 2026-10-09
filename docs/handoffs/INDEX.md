@@ -164,3 +164,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-10-06 | [V2-3.md](V2-3.md) | `V2-3`: V2 resolution via /v2/resolutions; not-yet-admissible V2 windows | WP | Complete (2026-10-06) | `3ee3e1d` | 5 KB |
 | 2026-10-06 | [V2-10.md](V2-10.md) | `V2-10`: simulation fill fidelity (F-63 floor; opt-in collateral target) | WP | Complete (2026-10-06) | `fd794dd` | 3 KB |
 | 2026-10-06 | [RECORDS-W3B.md](RECORDS-W3B.md) | `RECORDS-W3B`: completed packages live in the INDEX, not the brief | Records | Complete (2026-10-06) | `e1915c6` | 3 KB |
+| 2026-10-08 | [ADR-034.md](ADR-034.md) | `ADR-034`: pre-live order-lifecycle design (Accepted 2026-10-08) and the 2026-10-06 venue addendum | Governance | Complete (2026-10-08): the user confirmed D1's additions and ruled variant P share caps; implementation rounds `OMS-QTY`, `OMS-VENUE-TIME`, `TIF-COLLATERAL` | `e1b62c1` | 4 KB |

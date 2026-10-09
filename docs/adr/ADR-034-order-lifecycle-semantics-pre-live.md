@@ -1,25 +1,27 @@
 # ADR-034: Order-lifecycle semantics before live: venue-time ordering, one executable quantity, time-in-force end to end, and collateral-targeted immediate BUYs
 
-- **Status:** **Proposed** (2026-10-06). Nothing is implemented.
+- **Status:** **Accepted** (2026-10-08). Proposed 2026-10-06; merged
+  `e1b62c1` after a joint Opus and gpt-6-astra ACCEPT at review round 6.
+  - **The user's rulings, 2026-10-08:** D1's additions are confirmed: the
+    hold, the halt at once, and the extension to `DELAYED` and `UNMATCHED`
+    (Open item 1). The share caps of a collateral-targeted FAK or FOK BUY
+    are plan-time caps, **variant P** (Open item 10). The user also accepted
+    the ADR.
+  - **The orchestrator's ruling, 2026-10-08:** D4.1's conversion basis,
+    `min(limitPrice, bestAsk)`, is confirmed (Open item 9). D2 to D4 are
+    accepted.
   - D1 records the user's ruling on `WP340-F1` (2026-10-05: venue-time
-    ordering) and settles its details. Two of D1's outcomes go beyond the
-    ruling's two cases: the hold for pairs that venue-timed evidence may
-    still order, and the halt at once for pairs it never can (D1.5). Both
-    are put to the user (Open item 1).
-  - D2 to D4 are for the orchestrator to accept after the joint review.
-    D4.1's conversion basis departs from the round's packet ("at the limit
-    price") and is put to the orchestrator (Open item 9).
-  - The share caps cannot be hard for a collateral-targeted FAK or FOK BUY
-    (D4.1). Whether they become plan-time caps for it, or such entries are
-    refused, is put to the user (Open item 10). R3's D4 part waits for that
-    ruling.
+    ordering) and settles its details.
+  - Nothing is implemented. The venue unknowns (Open items 2, 3 and 5) stay
+    open until the execution probe; no FAK or FOK runs above PAPER before
+    then.
 - **Date:** 2026-10-06. Revised after review rounds 1 and 2 (2026-10-06)
   and rounds 3 to 5 (2026-10-08).
 - **Recorded by:** the round `ADR-034` (docs only), authorized at `3294201`.
-- **Implemented by:** not yet. Three rounds are proposed under "Implementation
-  plan", strictly in this order: `OMS-QTY` (D2), `OMS-VENUE-TIME` (D1), and
-  `TIF-COLLATERAL` (D3, D4). The names are proposals; the orchestrator
-  assigns them.
+- **Implemented by:** not yet. Three rounds, under "Implementation plan",
+  strictly in this order: `OMS-QTY` (D2), `OMS-VENUE-TIME` (D1), and
+  `TIF-COLLATERAL` (D3, D4). The orchestrator assigned these names on
+  2026-10-08.
 - **Findings it disposes of:**
   - `WP340-F1` (`docs/handoffs/WP-340.md`;
     `docs/experiments/phase-3-verification.md` §5);
@@ -2288,7 +2290,8 @@ and reports it.
 
 ## Open items
 
-1. **The user confirms D1's additions.** The ruling names two outcomes. D1
+1. **Resolved 2026-10-08: the user confirmed all three of D1's additions.**
+   **The user confirms D1's additions.** The ruling names two outcomes. D1
    adds:
    - **a hold** for pairs that venue-timed evidence may still order: a
      PENDING terminal instant, or one in seconds. It pauses every submission
@@ -2356,12 +2359,14 @@ and reports it.
    D3's port changes are exercised against mocks only. The live root must
    map D3.4's `ACCOUNT_STATE_UNKNOWN` incident to the explicit heartbeat stop,
    with D3.7 item 8's test, before any deadline-bounded GTC runs above PAPER.
-9. **The orchestrator confirms D4.1's conversion basis,** `min(limitPrice,
+9. **Resolved 2026-10-08: the orchestrator confirmed `min(limitPrice, bestAsk)`.**
+   **The orchestrator confirms D4.1's conversion basis,** `min(limitPrice,
    bestAsk)`. The round's packet said "at the limit price", which buys beyond
    `plannedShares` on every book that asks below the limit (D4.1). If the
    orchestrator keeps the limit price, D4 needs another answer to
    `CX034-R1-02`: wider caps in the configurations, or variant H.
-10. **The user rules on the share caps of a collateral-targeted FAK or FOK BUY
+10. **Resolved 2026-10-08: the user ruled variant P (plan-time share caps).**
+    **The user rules on the share caps of a collateral-targeted FAK or FOK BUY
     entry** (`SHARE-CAP`). This ruling is a precondition of R3's D4 part.
     - **The facts** (D4.1). The venue targets such a BUY in collateral (F-63),
       so no share count can be signed. Three share caps are judged on
